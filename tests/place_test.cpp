@@ -1456,6 +1456,156 @@ TEST(the_file_stager_reads_each_routed_layer_from_the_container) {
     std::remove(path.c_str());
 }
 
+TEST(the_file_stager_reads_only_the_experts_a_small_pass_routes_to) {
+    /* The fixture above: three routed layers of four experts, 1 and 3 of each on the file tier.
+     * A one-token pass at top_k 2 routes, per layer, to the counts below. Layer 0 routes to
+     * expert 1 and is then sliced (its first op issued again), so the whole layer is read
+     * behind it; layer 1 routes to 3; layer 2's counts do not add up to the pass, so it is read
+     * whole. */
+    Fixture f;
+    const int64_t gu = 14 * MiB + 1000, dn = 6 * MiB + 24;
+    const int L = 3;
+    build_moe_layers(f, L, 4, gu, dn);
+
+    int64_t off = 4 * (int64_t)RAD_ALIGN_UNIT;
+    int32_t prev = -1;
+    for (rad_weight w = 1; (size_t)w < f.prog.weights.size(); ++w) {
+        WeightInfo& wi = f.prog.weights[w];
+        if (prev >= 0 && wi.decl.group.layer != prev) off += 2 * MiB;
+        prev = wi.decl.group.layer;
+        wi.stored_bytes = wi.logical_bytes;
+        wi.file_offset = (uint64_t)off;
+        off = align_up(off + wi.stored_bytes, RAD_ALIGN_UNIT);
+    }
+    std::vector<uint8_t> img((size_t)off);
+    for (int64_t i = 0; i < off; ++i) img[(size_t)i] = container_byte(i);
+    const std::string path = "place_test_file_routed.rad";
+    {
+        FILE* fp = std::fopen(path.c_str(), "wb");
+        CHECK(fp != nullptr);
+        if (!fp) return;
+        CHECK_EQ(std::fwrite(img.data(), 1, img.size(), fp), img.size());
+        std::fclose(fp);
+    }
+    {
+        DirectFile probe;
+        if (probe.open(path.c_str(), RAD_DIO_READ) < 0) {
+            std::printf("  SKIP the working directory has no O_DIRECT\n");
+            std::remove(path.c_str());
+            return;
+        }
+    }
+
+    std::vector<RadFileProfile> prof;
+    for (int l = 0; l < L; ++l)
+        for (int e = 0; e < 4; ++e)
+            prof.push_back(RadFileProfile{l, e, e == 0 ? 0.5f : e == 2 ? 0.4f : 0.01f, 0.0f});
+    Config c = base_config();
+    c.placement = "expert_tiered";
+    c.deterministic = true;
+    c.vram_weights_mib = 210;
+    c.host_pool_mib = (4 * 21 * MiB + RAD_PLACE_FILE_WINDOWS * RAD_PLACE_FILE_WINDOW_BYTES) / MiB + 1;
+    c.weights_disk_tier = true;
+    PlannerInput in{&f.prog, &c, 0, 1, prof.data(), (int64_t)prof.size()};
+    Plan p;
+    CHECK_OK(Planner(in).plan(&p));
+    /* file_w[l][e]: the file-tier weights of expert e of layer l. */
+    std::vector<std::vector<std::vector<rad_weight>>> file_w(
+        (size_t)L, std::vector<std::vector<rad_weight>>(4));
+    for (const MoveUnit& mu : p.units)
+        if (mu.expert >= 0 && mu.tier == Tier::SSD)
+            for (rad_weight w : mu.weights) file_w[(size_t)mu.layer][(size_t)mu.expert].push_back(w);
+
+    Mover m;
+    MoverConfig mc;
+    mc.container_path = path;
+    CHECK_OK(m.init(f.prog, p, mc));
+    RadStream s = nullptr;
+    CHECK_OK(rad_stream_create(&s, 0));
+    CHECK_OK(m.bind_compute_stream(s));
+
+    int32_t counts[L][4] = { { 1, 1, 0, 0 }, { 0, 0, 1, 1 }, { 1, 0, 0, 0 } };
+    FileStager fs;
+    CHECK_OK(fs.init(f.prog, p, &m, [&](int32_t layer, int64_t* ne, int64_t* top_k) {
+        *ne = 4;
+        *top_k = 2;
+        return (layer >= 0 && layer < L) ? (const int32_t*)counts[layer] : nullptr;
+    }));
+    CHECK(fs.enabled());
+    CHECK(fs.routed_reads());
+
+    /* 0: no address; 1: its container bytes; 2: an alias into the layer's file buffer. */
+    auto state = [&](int l, int e) {
+        int got = -1;
+        for (rad_weight w : file_w[(size_t)l][(size_t)e]) {
+            const WeightSlot* slot = m.residency()->lookup(w);
+            int st = 0;
+            if (slot && slot->ptr) {
+                if (published_matches(m, f.prog, w, img, s)) st = 1;
+                else if (slot->ptr == m.file_buffer(l & 1)) st = 2;
+                else st = 3;
+            }
+            if (got >= 0 && st != got) return 4;          /* the unit's weights disagree */
+            got = st;
+        }
+        return got;
+    };
+
+    RadBatch b{};
+    b.n_tok = 1;
+    CHECK(fs.begin_pass(&b));
+    bool resync = false;
+    CHECK_OK(fs.before_op(0, s, &resync));     /* no read before layer 0's router has run */
+    CHECK(!resync);
+    CHECK_EQ(state(0, 1), 0);
+    CHECK_OK(fs.before_op(1, s, &resync));     /* layer 0: expert 1 read, 3 aliased, no read-ahead */
+    CHECK(resync);
+    CHECK_EQ(state(0, 1), 1);
+    CHECK_EQ(state(0, 3), 2);
+    CHECK_EQ(state(1, 1), 0);
+    CHECK_OK(fs.after_op(1, s));
+    CHECK_OK(fs.before_op(1, s, &resync));     /* a second slice: the whole layer */
+    CHECK(resync);
+    CHECK_EQ(state(0, 1), 1);
+    CHECK_EQ(state(0, 3), 1);
+    CHECK_OK(fs.before_op(2, s, &resync));
+    CHECK_OK(fs.before_op(3, s, &resync));     /* layer 1: 0 released, expert 3 read, 1 aliased */
+    CHECK_EQ(state(0, 1), 0);
+    CHECK_EQ(state(0, 3), 0);
+    CHECK_EQ(state(1, 3), 1);
+    CHECK_EQ(state(1, 1), 2);
+    CHECK_OK(fs.before_op(4, s, &resync));
+    CHECK_OK(fs.before_op(5, s, &resync));     /* layer 2: counts sum to 1, not 2: read whole */
+    CHECK_EQ(state(1, 1), 0);
+    CHECK_EQ(state(2, 1), 1);
+    CHECK_EQ(state(2, 3), 1);
+    CHECK_OK(fs.before_op(6, s, &resync));
+    CHECK_OK(fs.end_pass(s));
+    for (int l = 0; l < L; ++l) {
+        CHECK_EQ(state(l, 1), 0);
+        CHECK_EQ(state(l, 3), 0);
+    }
+    /* Units read: 1 + 2 (layer 0, routed then whole) + 1 + 2; aliased: one each in layers 0, 1. */
+    CHECK_EQ(m.stats().file_units, (uint64_t)6);
+    CHECK_EQ(m.stats().file_aliased, (uint64_t)2);
+
+    /* A prefill-sized pass keeps the whole-layer read and its read-ahead. */
+    RadBatch big{};
+    big.n_tok = FileStager::kRoutedRows + 1;
+    CHECK(fs.begin_pass(&big));
+    CHECK_OK(fs.before_op(0, s, &resync));
+    CHECK(resync);
+    CHECK_EQ(state(0, 1), 1);
+    CHECK_EQ(state(0, 3), 1);
+    CHECK_OK(fs.before_op(1, s, &resync));
+    CHECK_EQ(state(1, 1), 1);
+    CHECK_OK(fs.end_pass(s));
+
+    rad_stream_sync(m.transfer_stream());
+    rad_stream_destroy(s);
+    std::remove(path.c_str());
+}
+
 TEST(mover_promotes_and_demotes_through_the_shadow_slots) {
     HeatFixture hf;
     HeatEngine h;

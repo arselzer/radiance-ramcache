@@ -427,7 +427,8 @@ int FileStager::init(const Program& prog, const Plan& plan, Mover* mover, Counts
                 most = std::max<int64_t>(most, (int64_t)plan.units[(size_t)u].expert + 1);
         counts_host_ = (int32_t*)rad_dev_alloc(most * (int64_t)sizeof(int32_t),
                                                RAD_MEM_HOST_PINNED);
-        if (counts_host_ && rad_event_create_local(&counts_ev_) >= 0) {
+        /* The host waits on it (rad_event_sync), which a local event refuses. */
+        if (counts_host_ && rad_event_create(&counts_ev_) >= 0) {
             counts_cap_ = most;
             counts_ = std::move(counts);
         } else {

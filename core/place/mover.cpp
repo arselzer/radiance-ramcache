@@ -628,6 +628,20 @@ void Mover::unstage_units(const std::vector<int32_t>& staged) {
     for (int32_t u : staged) republish(u);
 }
 
+void Mover::alias_file_units(const std::vector<int32_t>& units, char* base,
+                             std::vector<int32_t>* staged) {
+    if (!plan_ || !base || !staged) return;
+    for (int32_t u : units) {
+        if (u < 0 || (size_t)u >= unit_.size()) continue;
+        const UnitState& us = unit_[(size_t)u];
+        if (us.tier != Tier::SSD || us.slab_slot >= 0 || us.klass < 0) continue;
+        const MoveUnit& mu = plan_->units[(size_t)u];
+        for (rad_weight w : mu.weights) res_.publish(w, base);
+        staged->push_back(u);
+        ++stats_.file_aliased;
+    }
+}
+
 /* The same choice of units as stage_units, without a cap. */
 int64_t Mover::stage_need(const std::vector<int32_t>& units, int64_t* largest) const {
     int64_t total = 0, most = 0;

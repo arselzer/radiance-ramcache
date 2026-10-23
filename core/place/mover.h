@@ -347,6 +347,8 @@ struct MoverStats {
      * for a window's copies to drain. */
     uint64_t file_layers = 0, file_units = 0, file_bytes = 0, file_preads = 0;
     uint64_t file_read_ns = 0, file_wait_ns = 0;
+    /* Units a routed-only read left unread (alias_file_units): the pass did not route to them. */
+    uint64_t file_aliased = 0;
 };
 
 /* ------------------------------------------------------------------ the mover */
@@ -538,6 +540,14 @@ public:
      * file_buffer       buffer 0 or 1 of the plan's two, or null when the plan has none. */
     int   stage_file_units(const std::vector<int32_t>& units, char* dst, int64_t cap,
                            RadEvent after, RadEvent done, std::vector<int32_t>* staged);
+    /* alias_file_units  publishes every file-tier weight of `units` at `base` without reading
+     *                   it, for experts a pass does not route to: the grouped GEMM is handed
+     *                   every expert's pointer and reads none of a zero-row expert's bytes, so
+     *                   the pointer only has to name memory the card owns (the file buffer, at
+     *                   least one unit long). Appends them to `staged`; unstage_units takes them
+     *                   back like read ones. */
+    void  alias_file_units(const std::vector<int32_t>& units, char* base,
+                           std::vector<int32_t>* staged);
     char* file_buffer(int i) const {
         return (file_vram_ && (i == 0 || i == 1)) ? file_vram_ + i * file_buf_bytes_ : nullptr;
     }

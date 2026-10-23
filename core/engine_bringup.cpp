@@ -3535,13 +3535,21 @@ int Engine::start() {
                          r->stager.n_layers(), (int)PrefillStager::lead());
         }
         /* The file stager, wherever a routed expert is on the file tier (static or dynamic plan;
-         * such a unit has no other address). */
-        RAD_TRY(r->fstager.init(r->program, r->plan, &r->mover));
+         * such a unit has no other address). A small pass reads only the experts its router
+         * picked, from the core's counts row (Ctx::route_counts_live). */
+        Ctx* const rctx = &r->ctx;
+        RAD_TRY(r->fstager.init(r->program, r->plan, &r->mover,
+                                [rctx](int32_t layer, int64_t* ne, int64_t* top_k) {
+                                    return rctx->route_counts_live(layer, ne, top_k);
+                                }));
         if (r->fstager.enabled() && r->index == 0)
             RAD_INFO("file stager: %zu routed layers hold experts read from the container; each "
                      "pass reads a layer's (up to %s) into one of two VRAM buffers before its "
-                     "first expert op, so every step is paced by the drive",
-                     r->fstager.n_layers(), humanb(r->plan.file_layer_max).c_str());
+                     "first expert op, so every step is paced by the drive%s",
+                     r->fstager.n_layers(), humanb(r->plan.file_layer_max).c_str(),
+                     r->fstager.routed_reads() ? "; a pass of at most 64 tokens reads only the "
+                                                 "experts it routes to"
+                                               : "");
         if (r->stager.enabled() && r->fstager.enabled()) {
             r->stagers.set(&r->stager, &r->fstager);
             r->ctx.set_stager(&r->stagers);

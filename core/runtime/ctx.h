@@ -299,6 +299,21 @@ public:
     /* How many layers report routing (the heat engine's sweep). Zero on a dense model. */
     int               n_route_layers() const { return (int)route_.size(); }
     int64_t           route_n_expert() const { return route_n_expert_; }
+    /* Layer `layer`'s card-side counts row when the layer's last report named that row, i.e. its
+     * router writes this pass's counts there in stream order (rad_route_counts); null otherwise,
+     * including before the layer's first report. `n_expert` and `top_k` are that report's. The
+     * file stager reads it to fetch only the experts a small pass routes to. */
+    const int32_t* route_counts_live(int layer, int64_t* n_expert, int64_t* top_k) const {
+        if (!route_dev_ || layer < 0 || (size_t)layer >= route_.size()) return nullptr;
+        const int32_t* row = route_dev_ + (int64_t)layer * route_n_expert_;
+        const RadRouting& r = route_[(size_t)layer].routing;
+        if (r.expert_count != row || r.n_expert <= 0 || r.n_expert > route_n_expert_ ||
+            r.top_k <= 0)
+            return nullptr;
+        if (n_expert) *n_expert = r.n_expert;
+        if (top_k) *top_k = r.top_k;
+        return row;
+    }
 
     /* ---------------------------------------------------- the next-layer expert prefetch
      * (xprefetch.h). xp_open at bringup, after placement has made its pinned pools, with their

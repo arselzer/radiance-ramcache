@@ -87,6 +87,7 @@
 #include "planner.h"
 
 #include <deque>
+#include <functional>
 #include <map>
 #include <vector>
 
@@ -238,15 +239,33 @@ class FileStager final : public OpStager {
 public:
     ~FileStager() override;
 
-    /* Binds the routed layers with file-tier units and the ops that read them, over the mover's
-     * two file buffers. Leaves enabled() false when no routed unit is on the file tier. Refuses a
-     * plan whose routed layers are read by interleaved ops, since a file-tier unit has no other
-     * address to fall back on. */
-    int init(const Program& prog, const Plan& plan, Mover* mover);
+    /* A routed layer's card-side counts row for the pass being issued, as Ctx::route_counts_live
+     * gives it: the row, the layer's expert count and its top_k, or null when the layer has no
+     * row its router writes in stream order. */
+    using CountsRow = std::function<const int32_t*(int32_t layer, int64_t* n_expert,
+                                                   int64_t* top_k)>;
+
+    /* The routed layers of `plan` that hold a unit on the file tier and the ops that read them,
+     * over the mover's two file buffers. Leaves it disabled -- enabled() false -- when the plan
+     * puts no routed unit there; refuses a plan whose routed layers are read by interleaved ops,
+     * because a file-tier unit has no other address to fall back on.
+     *
+     * With `counts`, a pass of at most kRoutedRows tokens reads only the experts it routes to:
+     * at a layer's first expert op the stager copies the layer's counts row to the host behind
+     * the router (same stream), waits for it, reads the routed units and aliases the rest
+     * (Mover::alias_file_units). A counts row that does not add up to the pass's tokens times
+     * top_k, a layer with no live row, or a second issue of the layer's first op (a block that
+     * slices the pass) falls back to reading the whole layer. */
+    int init(const Program& prog, const Plan& plan, Mover* mover, CountsRow counts = nullptr);
 
     bool    enabled() const { return !layers_.empty(); }
     size_t  n_layers() const { return layers_.size(); }
     int64_t buffer_bytes() const { return cap_; }
+    bool    routed_reads() const { return counts_host_ != nullptr; }
+    /* The largest pass that reads only its routed experts. A decode step or a short prompt
+     * routes to a fraction of a layer; a prefill chunk routes to nearly all of it and keeps the
+     * whole-layer read with its read-ahead. */
+    static constexpr int64_t kRoutedRows = 64;
 
     bool begin_pass(const RadBatch* b) override;
     int  before_op(rad_op h, RadStream s, bool* resync) override;
@@ -257,6 +276,7 @@ private:
     std::vector<Layer>   layers_;      /* the routed layers with file-tier units, in first-op order */
     std::vector<int32_t> first_of_;    /* by op: the layer whose first op it is, or -1 */
 
+    const Plan* plan_ = nullptr;
     Mover*   mover_ = nullptr;
     char*    buf_[2] = { nullptr, nullptr };
     int64_t  cap_ = 0;
@@ -265,7 +285,19 @@ private:
     bool     free_rec_[2] = { false, false };
     std::vector<int32_t> staged_[2];
     int32_t  holds_[2] = { -1, -1 };             /* the layer a buffer holds, or -1 */
+    bool     partial_[2] = { false, false };     /* its routed experts only, the rest aliased */
+    bool     pending_[2] = { false, false };     /* `done_` was recorded for its read */
     int32_t  cur_ = -1;                          /* the layer whose ops are being issued */
+
+    /* Routed-only reads (init's `counts`). */
+    CountsRow counts_;
+    int32_t*  counts_host_ = nullptr;            /* pinned, one row */
+    int64_t   counts_cap_ = 0;                   /* entries it holds */
+    RadEvent  counts_ev_ = nullptr;
+    bool      routed_ = false;                   /* this pass reads routed experts only */
+    int64_t   pass_tok_ = 0;
+    bool      warned_sum_ = false, told_ = false;
+    std::vector<int32_t> want_, skip_;
 
     bool     armed_ = false;
     bool     first_op_ = false;
@@ -275,6 +307,9 @@ private:
 
     bool will_issue(int32_t li) const;
     int  start(int32_t li);
+    /* Reads layer `li`'s routed units into its buffer and aliases the rest; *read false when the
+     * counts cannot be trusted and nothing was staged (the caller reads the whole layer). */
+    int  start_routed(int32_t li, RadStream s, bool* read);
     int  finish(int32_t b, RadStream s);
 };
 

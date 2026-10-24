@@ -1810,6 +1810,7 @@ int Engine::plan() {
         }
         in.container = file_ != nullptr;
         in.host_backend = device_is_host();
+        in.file_relayout = true;    /* the mover relays on the read (Mover::set_file_relayout) */
         Planner planner(in);
         s = planner.plan(&r->plan);
         if (cfg_.debug_placement || s < 0)
@@ -2624,6 +2625,20 @@ int Engine::load_weights() {
          * aligned (rad_format.h), DirectFile's alignment, so stages take the no-bounce path. */
         MoverConfig mc{};
         mc.container_path = file_ ? cfg_.model : std::string();
+        /* A file-tier weight the kernel relayouts is relaid on every read, by the kernel's own
+         * relayout, as the relayout pool does once for a resident one. */
+        {
+            const Program* prog = &r->program;
+            r->mover.set_file_relayout([prog](const WeightInfo& w, const RadTensor* planes,
+                                              void* dst, int64_t dst_bytes) {
+                const RadKernelInfo* ki = weight_layout_kernel(*prog, w);
+                if (!ki || !ki->relayout) return (int)RAD_E_STATE;
+                const Resolved& rs =
+                    prog->ops[(size_t)w.lay_op].bands[(size_t)w.lay_band].dom[w.lay_dom];
+                return ki->relayout(rs.geom.params(), rs.geom.n_params(), w.lay_operand, &w.enc,
+                                    w.sel, planes, w.n_sel, dst, dst_bytes);
+            });
+        }
         RAD_TRY(r->mover.init(r->program, r->plan, mc, &r->pools));
         /* What the mover took, before the first copy. Its slabs are allocated in init, so the pool
          * is as full as it will get; a load stopping with zero free is a placement failure, not
@@ -2704,8 +2719,26 @@ int Engine::load_weights() {
             w.site        = r->plan.weight[i].site;
             w.slab_slot   = r->plan.weight[i].slab_slot;
             w.file_offset = e ? file_->plane(*e, w.sel[0]).offset : 0;
+            for (int k = 0; k < w.n_sel && e; ++k)
+                w.file_plane_offset[k] = file_->plane(*e, w.sel[k]).offset;
             const bool direct = weight_file_direct(w, cfg_.tp);
-            if ((w.tier == Tier::Mapped || w.tier == Tier::SSD) && (!direct || !e)) {
+            /* The file tier also serves a weight it relays on every read (weight_file_relaid):
+             * each selected plane whole in the container, as many bytes as the plane holds. */
+            const bool relaid = w.tier == Tier::SSD && e && weight_file_relaid(r->program, w, cfg_.tp);
+            if (relaid)
+                for (int k = 0; k < w.n_sel; ++k) {
+                    const RadFilePlane& pk = file_->plane(*e, w.sel[k]);
+                    const int64_t want = w.sel_rows[k] *
+                        rad_dtype_bytes(file_->encoding(*e).plane[w.sel[k]].dtype, w.sel_cols[k]);
+                    if ((int64_t)pk.bytes != want) {
+                        RAD_ERR("rank %d: '%s' is relaid from the file tier, and its '%s' plane "
+                                "holds %lld bytes where the whole plane is %lld", r->index,
+                                w.name.c_str(), file_->encoding(*e).plane[w.sel[k]].role,
+                                (long long)pk.bytes, (long long)want);
+                        return RAD_E_FORMAT;
+                    }
+                }
+            if ((w.tier == Tier::Mapped || w.tier == Tier::SSD) && (!direct || !e) && !relaid) {
                 RAD_ERR("rank %d: '%s' was placed on the %s tier, which reads the container where "
                         "it lies, and its stored form is not the container's (%s)", r->index,
                         w.name.c_str(), tier_name(w.tier),

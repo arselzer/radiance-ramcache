@@ -212,6 +212,9 @@ struct WeightInfo {
     void*          ptr = nullptr;
     void*          host_ptr = nullptr;
     uint64_t       file_offset = 0;
+    /* Each selected plane's offset in the container (file_offset is plane_offset[0]), for a
+     * file-tier weight the loader relayouts on every read (weight_file_relaid). */
+    uint64_t       file_plane_offset[RAD_ENC_MAX_PLANES] = {0};
 
     /* First and last op index that read the weight. Prefetch runs off these, so layer offload is
      * scheduling rather than prediction (spec §5). */
@@ -519,6 +522,30 @@ public:
     OpInfo*     op(rad_op h)         { return h && h < ops.size()     ? &ops[h] : nullptr; }
 
 };
+
+/* The kernel whose layout hook settled `w`'s stored form, or null when it is stored as is or
+ * widened. */
+inline const RadKernelInfo* weight_layout_kernel(const Program& prog, const WeightInfo& w) {
+    if (w.identity || w.widen || w.lay_op < 0 || (size_t)w.lay_op >= prog.ops.size()) return nullptr;
+    const OpInfo& op = prog.ops[(size_t)w.lay_op];
+    if (w.lay_band < 0 || (size_t)w.lay_band >= op.bands.size() || w.lay_dom < 0 ||
+        w.lay_dom >= RAD_N_DOMAINS)
+        return nullptr;
+    const KernelRow* row = op.bands[(size_t)w.lay_band].dom[w.lay_dom].row;
+    return row ? row->info : nullptr;
+}
+
+/* Whether the file tier can serve `w` by relayouting it on every read, as the loader does once
+ * for a resident weight: whole planes (no shard at a world above one, so each plane is one range
+ * of the container), not widened, and a kernel that relayouts. The selected planes are read from
+ * the container and the kernel's relayout writes the stored form into the pinned stage the copy
+ * to the card reads. The mapped tier cannot do this: it hands kernels the container's bytes. */
+inline bool weight_file_relaid(const Program& prog, const WeightInfo& w, int world_size) {
+    if (w.identity || w.widen) return false;
+    if (w.decl.shard != RAD_SHARD_NONE && world_size > 1) return false;
+    const RadKernelInfo* ki = weight_layout_kernel(prog, w);
+    return ki && ki->relayout;
+}
 
 /* ================================================================== requests */
 

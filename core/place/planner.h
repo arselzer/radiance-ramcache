@@ -98,8 +98,10 @@ struct MoveUnit {
      * report still attributes `bytes`, since padding is not weight. */
     int64_t slot_bytes = 0;
 
-    /* Every weight lies in the container exactly as its kernel reads it (weight_file_direct), so
-     * the file tier can stage it with a read. A unit that is not never goes to the file tier. */
+    /* Every weight lies in the container exactly as its kernel reads it (weight_file_direct), or
+     * the file tier relayouts it on each read (weight_file_relaid, PlannerInput::file_relayout), so
+     * the file tier can stage it with a read (and the relayout). A unit that is neither never
+     * goes to the file tier. */
     bool    file_direct = true;
 };
 
@@ -281,6 +283,10 @@ struct PlannerInput {
     /* No card is visible and the device backend is host memory (device_is_host()), so a host
      * kernel can read the weights pool as well as the mapping. See mapped_unit(). */
     bool                  host_backend = false;
+    /* The file tier relayouts a weight on every read when its kernel has a relayout
+     * (weight_file_relaid), so such a unit may go there too, not only one stored as it is read.
+     * The engine's mover does; a caller whose mover has no relayout leaves it false. */
+    bool                  file_relayout = false;
 };
 
 /* Whether a host-only unit stays in the container's mapping. On a card, always: a host kernel

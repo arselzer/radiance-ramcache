@@ -8,10 +8,12 @@
 #include "../device/device.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <map>
 #include <queue>
+#include <thread>
 #include <unordered_map>
 
 namespace rad {
@@ -254,6 +256,32 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
             return RAD_E_INVAL;
         }
         RAD_TRY(file_.open(cfg_.container_path));
+        /* A weight the file tier relays on each read needs the relayout (set_file_relayout). */
+        int64_t relaid = 0;
+        for (const MoveUnit& mu : plan.units) {
+            if (mu.tier != Tier::SSD) continue;
+            for (rad_weight w : mu.weights) {
+                const WeightInfo& wi = prog.weights[w];
+                if (wi.widen) {
+                    RAD_ERR("mover: '%s' is on the file tier and widened at load, which a file "
+                            "read does not do", wi.name.c_str());
+                    return RAD_E_STATE;
+                }
+                if (!wi.identity) ++relaid;
+            }
+        }
+        if (relaid && !relayout_) {
+            RAD_ERR("mover: the plan puts %lld weight(s) whose stored form is a relayout on the "
+                    "file tier, and the mover was given no relayout to make it on a read",
+                    (long long)relaid);
+            return RAD_E_STATE;
+        }
+        if (relaid) {
+            const unsigned hw = std::thread::hardware_concurrency();
+            relay_threads_ = (int)std::max(1u, std::min(8u, hw / 2));
+            relay_in_.clear();
+            relay_in_.resize((size_t)relay_threads_);
+        }
         /* Staging slots are sized by the widest unit actually on the file tier, not the widest
          * class. The widest class is usually the embedding table (gigabytes, and never on the
          * file tier), and sizing on it would reserve pinned memory for a weight that never
@@ -514,6 +542,14 @@ int Mover::start_stage(int32_t unit, int64_t slab_slot) {
         const MoveUnit& mu = plan_->units[(size_t)unit];
         for (size_t k = 0; k < mu.weights.size(); ++k) {
             const WeightInfo& w = prog_->weights[mu.weights[k]];
+            if (!w.identity) {      /* relaid on the read, straight into the pinned slot */
+                if (relay_in_.empty()) relay_in_.resize(1);
+                RAD_TRY(read_relaid(w, stage + mu.offset[k], stage_stride_ - mu.offset[k],
+                                    &relay_in_[0]));
+                ++stats_.file_relaid;
+                stats_.file_relaid_bytes += (uint64_t)w.stored_bytes;
+                continue;
+            }
             RAD_TRY(file_.read(w.file_offset, w.stored_bytes, stage + mu.offset[k],
                                stage_stride_ - mu.offset[k]));
         }
@@ -673,14 +709,119 @@ constexpr int64_t kReadThrough = (int64_t)256 << 10;
 
 }  /* namespace */
 
+/* One weight relaid on the read: its selected planes' span, aligned out to the O_DIRECT block,
+ * read into this thread's host input in one pread (the aligned path, which touches no shared
+ * bounce, so threads read at once), then the relayout writes the stored form to `dst`. Each plane
+ * is whole (weight_file_relaid), so it is one range of the container. */
+int Mover::read_relaid(const WeightInfo& w, void* dst, int64_t dst_cap, RelayIn* in) {
+    if (!relayout_ || !in || w.n_sel <= 0) return RAD_E_STATE;
+    if (w.stored_bytes > dst_cap) {
+        RAD_ERR("file tier: '%s' relays to %s and the pinned space for it is %s", w.name.c_str(),
+                humanb(w.stored_bytes).c_str(), humanb(dst_cap).c_str());
+        return RAD_E_SCRATCH;
+    }
+    RadTensor pt[RAD_ENC_MAX_PLANES];
+    weight_planes(w, pt);
+    int64_t lo = INT64_MAX, hi = 0;
+    for (int k = 0; k < w.n_sel; ++k) {
+        const int64_t len = pt[k].shape[0] * rad_dtype_bytes(pt[k].dtype, pt[k].shape[1]);
+        lo = std::min(lo, (int64_t)w.file_plane_offset[k]);
+        hi = std::max(hi, (int64_t)w.file_plane_offset[k] + len);
+    }
+    const int64_t A = DirectFile::alignment();
+    const int64_t a0 = lo / A * A, n = align_up(hi - a0, A);
+    if (in->cap < n) {
+        std::free(in->p);
+        in->p = (uint8_t*)std::aligned_alloc((size_t)A, (size_t)n);
+        in->cap = in->p ? n : 0;
+        if (!in->p) return RAD_E_NOMEM;
+    }
+    RAD_TRY(file_.read((uint64_t)a0, n, in->p, in->cap));
+    for (int k = 0; k < w.n_sel; ++k) pt[k].data = in->p + ((int64_t)w.file_plane_offset[k] - a0);
+    const int st = relayout_(w, pt, dst, w.stored_bytes);
+    if (st < 0)
+        RAD_ERR("file tier: relaying '%s' (%s) on the read failed: %s", w.name.c_str(),
+                w.layout_tag.c_str(), rad_strerror(st));
+    return st;
+}
+
+/* The file stager's relaid weights (stage_file_units): packed into the read windows, each
+ * window's weights read and relaid on up to relay_threads_ threads at once, then copied to the
+ * layer buffer on the mover's stream like the direct runs, the window's event recorded behind
+ * them. A window comes round again only after its copies drained, as for the direct runs. */
+int Mover::stage_relaid(const std::vector<Relaid>& rl) {
+    const int64_t W = RAD_PLACE_FILE_WINDOW_BYTES;
+    if (!windows_ || n_windows_ <= 0) return RAD_E_STATE;
+    if ((int)relay_in_.size() < relay_threads_) relay_in_.resize((size_t)relay_threads_);
+    const auto t_all = std::chrono::steady_clock::now();
+    struct Job { size_t r; int64_t wo; };
+    std::vector<Job> jobs;
+    size_t i = 0;
+    while (i < rl.size()) {
+        const int w = win_next_;
+        win_next_ = (win_next_ + 1) % n_windows_;
+        char* win = windows_ + (int64_t)w * W;
+        if (win_rec_[(size_t)w]) {
+            const auto t0 = std::chrono::steady_clock::now();
+            RAD_TRY(rad_event_sync(win_ev_[(size_t)w]));
+            stats_.file_wait_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                       std::chrono::steady_clock::now() - t0).count();
+            win_rec_[(size_t)w] = 0;
+        }
+        jobs.clear();
+        int64_t used = 0;
+        while (i < rl.size()) {
+            const WeightInfo& wi = *rl[i].w;
+            const int64_t a = std::max<int64_t>(wi.align > 0 ? wi.align : RAD_ALIGN_UNIT, 256);
+            const int64_t wo = align_up(used, a);
+            if (wo + wi.stored_bytes > W) break;
+            jobs.push_back(Job{ i, wo });
+            used = wo + wi.stored_bytes;
+            ++i;
+        }
+        if (jobs.empty()) {
+            RAD_ERR("file tier: '%s' relays to %s, more than a %s read window", rl[i].w->name.c_str(),
+                    humanb(rl[i].w->stored_bytes).c_str(), humanb(W).c_str());
+            return RAD_E_SCRATCH;
+        }
+        std::vector<int> rc(jobs.size(), RAD_OK);
+        std::atomic<size_t> next{ 0 };
+        auto work = [&](int t) {
+            for (size_t j; (j = next.fetch_add(1)) < jobs.size();) {
+                const Job& jb = jobs[j];
+                rc[j] = read_relaid(*rl[jb.r].w, win + jb.wo, W - jb.wo, &relay_in_[(size_t)t]);
+            }
+        };
+        const int nt = (int)std::min<size_t>((size_t)relay_threads_, jobs.size());
+        std::vector<std::thread> th;
+        for (int t = 1; t < nt; ++t) th.emplace_back(work, t);
+        work(0);
+        for (std::thread& x : th) x.join();
+        for (size_t j = 0; j < jobs.size(); ++j) RAD_TRY(rc[j]);
+        for (const Job& jb : jobs) {
+            const WeightInfo& wi = *rl[jb.r].w;
+            RAD_TRY(rad_memcpy_async(rl[jb.r].dst, win + jb.wo, wi.stored_bytes, mover_));
+            ++stats_.file_relaid;
+            stats_.file_relaid_bytes += (uint64_t)wi.stored_bytes;
+        }
+        RAD_TRY(rad_event_record(win_ev_[(size_t)w], mover_));
+        win_rec_[(size_t)w] = 1;
+    }
+    stats_.file_relayout_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   std::chrono::steady_clock::now() - t_all).count();
+    return RAD_OK;
+}
+
 int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_t cap,
                             RadEvent after, RadEvent done, std::vector<int32_t>* staged) {
     if (!plan_ || !dst || !staged || !done) return RAD_E_INVAL;
     staged->clear();
     if (!file_.ok() || !windows_ || n_windows_ <= 0) return RAD_E_STATE;
 
-    /* The layout in `dst`, unit by unit in the order given, and every weight's extent. */
+    /* The layout in `dst`, unit by unit in the order given, and every weight's extent; a weight
+     * the read relays goes through stage_relaid instead of the windows' direct copies. */
     std::vector<FileExt> ext;
+    std::vector<Relaid>  relaid;
     std::vector<int64_t> at;
     int64_t off = 0;
     for (int32_t u : units) {
@@ -697,6 +838,10 @@ int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_
         for (size_t k = 0; k < mu.weights.size(); ++k) {
             const WeightInfo& w = prog_->weights[mu.weights[k]];
             if (w.stored_bytes <= 0) continue;          /* nothing to read, and nothing to place */
+            if (!w.identity) {
+                relaid.push_back(Relaid{ &w, dst + off + mu.offset[k] });
+                continue;
+            }
             ext.push_back(FileExt{ (int64_t)w.file_offset, w.stored_bytes, dst + off + mu.offset[k] });
         }
         staged->push_back(u);
@@ -772,6 +917,7 @@ int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_
         RAD_TRY(rad_event_record(win_ev_[(size_t)w], mover_));
         win_rec_[(size_t)w] = 1;
     }
+    if (!relaid.empty()) RAD_TRY(stage_relaid(relaid));
     RAD_TRY(rad_event_record(done, mover_));
 
     for (size_t k = 0; k < staged->size(); ++k) {
@@ -1633,6 +1779,11 @@ std::string Mover::report() const {
                  rs > 0 ? (double)stats_.file_bytes / rs * 1e-9 : 0.0,
                  (double)stats_.file_wait_ns * 1e-9);
     }
+    if (stats_.file_relaid)
+        s += fmt("  file tier relayout: %llu weights relaid on the read (%.2f GiB), %.2f s of the "
+                 "issuing thread in the file stager's read+relayout\n",
+                 (unsigned long long)stats_.file_relaid, (double)stats_.file_relaid_bytes * gib,
+                 (double)stats_.file_relayout_ns * 1e-9);
     return s;
 }
 

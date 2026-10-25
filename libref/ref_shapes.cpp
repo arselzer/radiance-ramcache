@@ -1722,6 +1722,29 @@ int ref_entry_store_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* o
     return o.finish("entry_store", operand, out);
 }
 
+int ref_token_map_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), nv = gi(p, n_p, "n_vocab", 0);
+    if (M <= 0 || nv < 1) return RAD_E_UNSUPPORTED;
+    Opd o;
+    o.t_idx({ M }, nv, -1, 0);                          /* ids */
+    o.t_idx({ nv }, nv, -1, 0);                         /* table */
+    o.t((uint32_t)RAD_I32, { M });                      /* mapped */
+    return o.finish("token_map", operand, out);
+}
+
+int ref_stream_gate_add_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0), hc = gi(p, n_p, "hc", 0);
+    if (M <= 0 || n < 1 || hc < 1 || hc > 16) return RAD_E_UNSUPPORTED;
+    const uint32_t D = act_dt(p, n_p);
+    Opd o;
+    o.t(D, { M, hc * n });                              /* h */
+    o.t(D, { M, hc * n });                              /* k */
+    o.t(D, { M, n });                                   /* v */
+    o.t((uint32_t)RAD_F32, { hc * n });                 /* w */
+    o.t(D, { M, hc * n });                              /* out */
+    return o.finish("stream_gate_add", operand, out);
+}
+
 int ref_qsa_block_key_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = gi(p, n_p, "M", 0);
     const int64_t n = gi(p, n_p, "n", 0);

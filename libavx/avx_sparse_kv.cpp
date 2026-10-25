@@ -7,6 +7,8 @@
  *   index_candidates   level one of the two-level top-k: the kept blocks
  *   index_topk         level two: the selected positions, in position order
  *   entry_store        one compressed entry a paged block
+ *   token_map          ids through an id table (Engram's compressed vocabulary)
+ *   stream_gate_add    Engram's normalised-dot gate into the hc residual streams
  *
  * Each kernel computes libref's expression. Where libref's result is exact (a selection's ids, the
  * round trip's codes and scales) this one is the same bits; elsewhere it differs from libref only
@@ -469,6 +471,84 @@ AVX_KERNEL(entry_store) {
         float* row = scratch_f32((size_t)n);
         const float* in = in_row(&x, rowoff(&x, w, n), n, row);
         row_from_f32(cache.dtype, in, (void*)byte_at(cache.data, cache.dtype, pg * n), n);
+    }
+    return RAD_OK;
+}
+
+/* mapped[m] = table[ids[m]], -1 outside [0, n_vocab) (libref's token_map). */
+AVX_KERNEL(token_map) {
+    if (!rad_args_have(a, 3)) return RAD_E_INVAL;
+    const RadTensor &x = a->t[0], &tab = a->t[1], &y = a->t[2];
+    const int64_t nv = p_int(a, "n_vocab", 0);
+    if (nv < 1 || numel(&tab) != nv || numel(&x) < 1 || numel(&y) != numel(&x)) return RAD_E_SHAPE;
+    const int64_t M = numel(&x);
+    for (int64_t m = 0; m < M; ++m) {
+        const int64_t id = ldi(&x, offlin(&x, m));
+        const int64_t v = id < 0 || id >= nv ? -1 : ldi(&tab, offlin(&tab, id));
+        st_int_dt(y.dtype, y.data, offlin(&y, m), v);
+    }
+    return RAD_OK;
+}
+
+/* Engram's gate (libref's stream_gate_add): per row and stream the three sums in one vector pass
+ * over the widened rows, the gate as libref computes it, then out = h + gate v. */
+AVX_KERNEL(stream_gate_add) {
+    if (!rad_args_have(a, 5)) return RAD_E_INVAL;
+    const RadTensor &h = a->t[0], &k = a->t[1], &v = a->t[2], &w = a->t[3], &out = a->t[4];
+    const int64_t n = p_int(a, "n", 0), hc = p_int(a, "hc", 0);
+    const float eps = p_f32(a, "eps", -1.0f), ge = p_f32(a, "gate_eps", -1.0f);
+    if (n < 1 || hc < 1 || hc > 16 || !(eps >= 0) || !(ge >= 0) || h.rank != 2 || h.shape[0] < 1 ||
+        h.shape[1] != hc * n || k.rank != 2 || k.shape[0] != h.shape[0] || k.shape[1] != hc * n ||
+        v.rank != 2 || v.shape[0] != h.shape[0] || v.shape[1] != n || numel(&w) != hc * n ||
+        w.dtype != RAD_F32 || out.rank != 2 || out.shape[0] != h.shape[0] || out.shape[1] != hc * n)
+        return RAD_E_SHAPE;
+    const int64_t M = h.shape[0], width = hc * n;
+    const bool wdense = laststride(&w) == 1;
+    AVX_PARALLEL_FOR_IF(M * width >= AVX_PAR_MIN)
+    for (int64_t m = 0; m < M; ++m) {
+        float* buf = scratch_f32((size_t)(4 * width + n + 16));
+        float* hv = buf;
+        float* kv = hv + width;
+        float* vv = kv + width;
+        float* wv = vv + n;
+        float* ov = wv + width;
+        const float* hr = in_row(&h, rowoff(&h, m, width), width, hv);
+        const float* kr = in_row(&k, rowoff(&k, m, width), width, kv);
+        const float* vr = in_row(&v, rowoff(&v, m, n), n, vv);
+        const float* wr = wdense ? (const float*)w.data : wv;
+        if (!wdense)
+            for (int64_t i = 0; i < width; ++i) wv[i] = ldt(&w, i * laststride(&w));
+        for (int64_t s = 0; s < hc; ++s) {
+            const float* hs = hr + s * n;
+            const float* ks = kr + s * n;
+            const float* ws = wr + s * n;
+            vf ah = vf_zero(), ak = vf_zero(), ad = vf_zero();
+            int64_t i = 0;
+            for (; i + VF_N <= n; i += VF_N) {
+                const vf x = vf_loadu(hs + i), y = vf_loadu(ks + i);
+                ah = vf_fma(x, x, ah);
+                ak = vf_fma(y, y, ak);
+                ad = vf_fma(vf_mul(x, vf_loadu(ws + i)), y, ad);
+            }
+            float sh = vf_hsum(ah), sk = vf_hsum(ak), dot = vf_hsum(ad);
+            for (; i < n; ++i) {
+                sh += hs[i] * hs[i];
+                sk += ks[i] * ks[i];
+                dot += hs[i] * ws[i] * ks[i];
+            }
+            const float rstd = (1.0f / std::sqrt(sh / (float)n + eps)) *
+                               (1.0f / std::sqrt(sk / (float)n + eps));
+            dot = dot * rstd * (1.0f / std::sqrt((float)n));
+            const float gate =
+                1.0f / (1.0f + std::exp(-std::copysign(std::sqrt(std::max(std::fabs(dot), ge)), dot)));
+            const vf vg = vf_set1(gate);
+            float* os = ov + s * n;
+            i = 0;
+            for (; i + VF_N <= n; i += VF_N)
+                vf_storeu(os + i, vf_fma(vg, vf_loadu(vr + i), vf_loadu(hs + i)));
+            for (; i < n; ++i) os[i] = hs[i] + gate * vr[i];
+        }
+        out_row(&out, rowoff(&out, m, width), width, ov);
     }
     return RAD_OK;
 }

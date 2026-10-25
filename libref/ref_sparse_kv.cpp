@@ -378,3 +378,61 @@ int ref_entry_store(const RadArgs* a, RadStream) {
     }
     return RAD_OK;
 }
+
+/* y[m] = table[x[m]]: token ids through a [n_vocab] id table (DeepSeek-V4's Engram looks n-grams
+ * up in a compressed vocabulary). An id outside [0, n_vocab) maps to -1. */
+int ref_token_map(const RadArgs* a, RadStream) {
+    if (!have(a, 3)) return RAD_E_INVAL;
+    const RadTensor &x = a->t[0], &tab = a->t[1], &y = a->t[2];
+    const int64_t nv = p_int(a, "n_vocab", 0);
+    if (nv < 1 || numel(&tab) != nv || numel(&x) < 1 || numel(&y) != numel(&x)) return RAD_E_SHAPE;
+    for (int64_t m = 0; m < numel(&x); ++m) {
+        const int64_t id = ld_int(x.dtype, x.data, offlin(&x, m));
+        const int64_t v = id < 0 || id >= nv ? -1 : ld_int(tab.dtype, tab.data, offlin(&tab, id));
+        st_int(y.dtype, y.data, offlin(&y, m), v);
+    }
+    return RAD_OK;
+}
+
+/* A gated write into each of hc residual streams, DeepSeek-V4's Engram gate: per row and stream
+ * s, dot = sum_i h[s,i] w[s,i] k[s,i] * rsqrt(mean h[s]^2 + eps) * rsqrt(mean k[s]^2 + eps) /
+ * sqrt(n), gate = sigmoid(copysign(sqrt(max(|dot|, gate_eps)), dot)), out[s] = h[s] + gate v,
+ * all in f32 and rounded once to dtype. w is f32 [hc*n]; v is one [n] row a token shared by the
+ * streams. */
+int ref_stream_gate_add(const RadArgs* a, RadStream) {
+    if (!have(a, 5)) return RAD_E_INVAL;
+    const RadTensor &h = a->t[0], &k = a->t[1], &v = a->t[2], &w = a->t[3], &out = a->t[4];
+    const int64_t n = p_int(a, "n", 0), hc = p_int(a, "hc", 0);
+    const float eps = p_f32(a, "eps", -1.0f), ge = p_f32(a, "gate_eps", -1.0f);
+    if (n < 1 || hc < 1 || hc > 16 || !(eps >= 0) || !(ge >= 0) || h.rank != 2 || h.shape[0] < 1 ||
+        h.shape[1] != hc * n || k.rank != 2 || k.shape[0] != h.shape[0] || k.shape[1] != hc * n ||
+        v.rank != 2 || v.shape[0] != h.shape[0] || v.shape[1] != n || numel(&w) != hc * n ||
+        w.dtype != RAD_F32 || out.rank != 2 || out.shape[0] != h.shape[0] || out.shape[1] != hc * n)
+        return RAD_E_SHAPE;
+#pragma omp parallel for schedule(static)
+    for (int64_t m = 0; m < h.shape[0]; ++m) {
+        const int64_t hb = rowoff(&h, m, hc * n), kb = rowoff(&k, m, hc * n);
+        const int64_t vb = rowoff(&v, m, n), ob = rowoff(&out, m, hc * n);
+        for (int64_t s = 0; s < hc; ++s) {
+            float sh = 0, sk = 0, dot = 0;
+            for (int64_t i = 0; i < n; ++i) {
+                const float hv = ldt(&h, hb + (s * n + i) * laststride(&h));
+                const float kv = ldt(&k, kb + (s * n + i) * laststride(&k));
+                sh += hv * hv;
+                sk += kv * kv;
+                dot += hv * ldt(&w, (s * n + i) * laststride(&w)) * kv;
+            }
+            const float rstd = (1.0f / std::sqrt(sh / (float)n + eps)) *
+                               (1.0f / std::sqrt(sk / (float)n + eps));
+            dot = dot * rstd * (1.0f / std::sqrt((float)n));
+            const float gate =
+                1.0f / (1.0f + std::exp(-std::copysign(std::sqrt(std::max(std::fabs(dot), ge)), dot)));
+            for (int64_t i = 0; i < n; ++i) {
+                const float hv = ldt(&h, hb + (s * n + i) * laststride(&h));
+                stt(&out, ob + (s * n + i) * laststride(&out),
+                    hv + gate * ldt(&v, vb + i * laststride(&v)));
+            }
+        }
+    }
+    return RAD_OK;
+}

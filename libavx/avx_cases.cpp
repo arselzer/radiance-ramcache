@@ -1192,6 +1192,8 @@ std::vector<Case> build_cases() {
         add("index_score", { HI("M", 9), HI("heads", 4), HI("dim", 64), HI("ratio", 4),
                              HI("width", 13), HS("dtype", dt) });
         add("entry_store", { HI("M", 5), HI("n", 128), HI("block_size", 4), HS("dtype", dt) });
+        add("stream_gate_add", { HI("M", 5), HI("n", 129), HI("hc", 4), HF("eps", 1e-6),
+                                 HF("gate_eps", 1e-6), HS("dtype", dt) });
     }
     add("index_candidates", { HI("M", 9), HI("width", 40), HI("block", 8), HI("topk_blocks", 2),
                               HI("ratio", 1) });
@@ -1199,6 +1201,7 @@ std::vector<Case> build_cases() {
                               HI("ratio", 1) });
     add("index_topk", { HI("M", 9), HI("width", 17), HI("topk", 4), HI("ratio", 1) });
     add("index_topk", { HI("M", 9), HI("width", 9), HI("topk", 4), HI("ratio", 2) });
+    add("token_map", { HI("M", 9), HI("n_vocab", 50) });
 
     /* ================================================================== speed-only, at model size
      *

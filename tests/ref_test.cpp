@@ -651,6 +651,41 @@ TEST(entry_store_writes_one_entry_a_block) {
     for (int i = 0; i < 12; ++i) CHECK_EQ(cache.at(i), e[i]);
 }
 
+/* token_map: ids through a table, -1 outside it. stream_gate_add against Engram.forward worked in
+ * double: each stream's own normalized dot gates the shared value row. */
+TEST(token_map_and_stream_gate_add) {
+    T ids(RAD_I32, {4}); ids.n({0, 3, 7, 2});
+    T tab(RAD_I32, {5}); tab.n({10, 11, 2, 2, 14});
+    T y(RAD_I32, {4});
+    A a; a.t(ids).t(tab).t(y).i("M", 4).i("n_vocab", 5);
+    REQUIRE_EQ(run("token_map", a), RAD_OK);
+    const int64_t e[4] = {10, 2, -1, 2};
+    for (int i = 0; i < 4; ++i) CHECK_EQ(y.iat(i), e[i]);
+
+    const int64_t M = 2, n = 6, hc = 3;
+    T h(RAD_F32, {M, hc * n}), k(RAD_F32, {M, hc * n}), v(RAD_F32, {M, n}), w(RAD_F32, {hc * n});
+    T out(RAD_F32, {M, hc * n});
+    for (int64_t i = 0; i < M * hc * n; ++i) { h.set(i, std::sin(0.9f * (float)i)); k.set(i, std::cos(0.4f * (float)i)); }
+    for (int64_t i = 0; i < M * n; ++i) v.set(i, 0.1f * (float)i - 0.3f);
+    for (int64_t i = 0; i < hc * n; ++i) w.set(i, 0.5f + 0.05f * (float)i);
+    A g; g.t(h).t(k).t(v).t(w).t(out).i("M", M).i("n", n).i("hc", hc).d("eps", 1e-20).d("gate_eps", 1e-6)
+        .s("dtype", "f32");
+    REQUIRE_EQ(run("stream_gate_add", g), RAD_OK);
+    for (int64_t m = 0; m < M; ++m)
+        for (int64_t s = 0; s < hc; ++s) {
+            double sh = 0, sk = 0, dot = 0;
+            for (int64_t i = 0; i < n; ++i) {
+                const double hv = h.at(m * hc * n + s * n + i), kv = k.at(m * hc * n + s * n + i);
+                sh += hv * hv; sk += kv * kv; dot += hv * w.at(s * n + i) * kv;
+            }
+            dot *= 1.0 / std::sqrt(sh / n + 1e-20) / std::sqrt(sk / n + 1e-20) / std::sqrt((double)n);
+            const double gate = 1.0 / (1.0 + std::exp(-std::copysign(std::sqrt(std::max(std::fabs(dot), 1e-6)), dot)));
+            for (int64_t i = 0; i < n; ++i)
+                CHECK(std::fabs(out.at(m * hc * n + s * n + i) -
+                                (h.at(m * hc * n + s * n + i) + gate * v.at(m * n + i))) < 1e-5);
+        }
+}
+
 TEST(manifold_sinkhorn_first_pass_and_epsilon_are_distinct) {
     T h(RAD_F32, {1, 2}); h.f({1, 3});
     T fn(RAD_F32, {8, 2}), scale(RAD_F32, {3}); scale.f({1, 1, 1});
@@ -1299,7 +1334,7 @@ TEST(op_vocabulary) {
         "rmsnorm", "rmsnorm_p", "rmsnorm_add", "hc_enter", "hc_read", "hc_write", "hc_project",
         "mtp_enter",
         "mhc_pre", "mhc_pre_partial", "mhc_pre_finish", "mhc_post", "mhc_contract",
-        "mhc_mix", "mhc_collapse", "swiglu_clamped", "router_sigmoid_topk", "router_scored_topk", "rope_rows", "quant_roundtrip", "softmax_pool", "attn_sparse_sink", "index_score", "index_candidates", "index_topk", "entry_store", "dsa_pool", "dsa_query", "dsa_score", "mla_attn", "mla_project", "gemm_nt_f32",
+        "mhc_mix", "mhc_collapse", "swiglu_clamped", "router_sigmoid_topk", "router_scored_topk", "rope_rows", "quant_roundtrip", "softmax_pool", "attn_sparse_sink", "index_score", "index_candidates", "index_topk", "entry_store", "token_map", "stream_gate_add", "dsa_pool", "dsa_query", "dsa_score", "mla_attn", "mla_project", "gemm_nt_f32",
         "kda_update",
         "layernorm", "add", "mul", "mul_weight", "silu_mul", "gelu_mul", "act_mul", "seg_mean",
         "pool_rows", "relu", "clamp", "conv2d", "conv2d_unfold", "conv1d_dw", "rel_sinusoid",
@@ -8881,6 +8916,9 @@ std::vector<Geo> geometries() {
                                       .i("ratio", 1)),
         G("index_topk", "M", 3, a.i("M", R).i("width", 9).i("topk", 4).i("ratio", 2)),
         G("entry_store", "M", 3, a.i("M", R).i("n", 8).i("block_size", 2).s("dtype", "bf16")),
+        G("token_map", "M", 3, a.i("M", R).i("n_vocab", 11)),
+        G("stream_gate_add", "M", 3, a.i("M", R).i("n", 8).i("hc", 4).d("eps", 1e-6).d("gate_eps", 1e-6)
+                                     .s("dtype", "bf16")),
         G("rope_rows", "M", 3, a.i("M", R).i("n_head", 2).i("head_dim", 12).i("rot", 8).i("off", 4)
                                .s("mode", "gptj").i("inverse", 0).s("dtype", "f32")),
         G("qsa_block_key", "M", 2, a.i("M", R).i("n", 32).i("ratio", 4).i("rotary_dim", 8)

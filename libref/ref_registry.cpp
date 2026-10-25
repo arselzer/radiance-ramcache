@@ -459,6 +459,11 @@ static const RadOperandSpec oIndexScore[] = { OPD("q"), OPD("w"), OPD("index_cac
 static const RadParamSpec pIndexCand[] = { P_INT("M"), P_INT("width"), P_INT("block"),
     P_INT("topk_blocks"), P_INT("ratio") };
 static const RadOperandSpec oIndexCand[] = { OPD("score"), OPD("positions"), OUT("keep") };
+static const RadParamSpec pTokenMap[] = { P_INT("M"), P_INT("n_vocab") };
+static const RadOperandSpec oTokenMap[] = { OPD("ids"), WGT("table"), OUT("mapped") };
+static const RadParamSpec pStreamGate[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_F64("eps"),
+    P_F64("gate_eps"), P_STR("dtype") };
+static const RadOperandSpec oStreamGate[] = { OPD("h"), OPD("k"), OPD("v"), WGT("w"), OUT("out") };
 static const RadParamSpec pEntryStore[] = { P_INT("M"), P_INT("n"), P_INT("block_size"), P_STR("dtype") };
 static const RadOperandSpec oEntryStore[] = { OPD("x"), OPD("page"), INOUT("cache") };
 static const RadParamSpec pIndexTopk[] = { P_INT("M"), P_INT("width"), P_INT("topk"), P_INT("ratio") };
@@ -1478,6 +1483,12 @@ static const RadOpSchema kSchemas[] = {
   "x[w] (n values) into the whole of block page[w] of a paged cache [blocks, heads, block_size, "
   "slot], heads*block_size*slot == n, rounded once to the cache dtype; a negative page writes "
   "nothing. Declared right after its group, its block_size sets the group's." },
+{ "token_map", ARR(pTokenMap), ARR(oTokenMap),
+  "mapped[m] = table[ids[m]], -1 for an id outside [0, n_vocab): ids through an id table." },
+{ "stream_gate_add", ARR(pStreamGate), ARR(oStreamGate),
+  "Per row and stream s: dot = sum h w k * rsqrt(mean h^2 + eps) rsqrt(mean k^2 + eps) / sqrt(n), "
+  "gate = sigmoid(copysign(sqrt(max(|dot|, gate_eps)), dot)), out = h + gate v; f32, rounded "
+  "once. v is one [n] row a token shared by the hc streams; w is f32 [hc*n]." },
 { "rope_rows", ARR(pRopeRows), ARR(oRopeRows),
   "rope from a rope_table plane over columns [off, off+rot) of each head_dim-wide head of x, in "
   "place: gptj pairs adjacent columns, neox i with i+rot/2; (a,b)(c+is) in f32, rounded once; "
@@ -2405,6 +2416,8 @@ SIMPLE("ref_rope_table", "rope_table", "attn", "cos/sin at each position's own r
 SIMPLE("ref_rope_rows", "rope_rows", "attn", "rope from a cos/sin plane over a window of each head", DT_FLOAT, ref_rope_rows),
 SIMPLE("ref_quant_roundtrip", "quant_roundtrip", "quant", "block-scaled fp8/fp4 quantise-dequantise in place", DT_FLOAT, ref_quant_roundtrip),
 SIMPLE("ref_softmax_pool", "softmax_pool", "attn", "channel-wise softmax pooling of ratio rows", DT_FLOAT, ref_softmax_pool),
+SIMPLE("ref_token_map", "token_map", "embed", "ids through an id table", DT_ANY, ref_token_map),
+SIMPLE("ref_stream_gate_add", "stream_gate_add", "norm", "normalized-dot gated write into hc streams", DT_FLOAT, ref_stream_gate_add),
 SIMPLE("ref_entry_store", "entry_store", "attn", "one entry a block into a paged cache", DT_FLOAT, ref_entry_store),
 SIMPLE("ref_index_score", "index_score", "attn", "indexer relu-gated head scores over a paged index cache", DT_FLOAT, ref_index_score),
 SIMPLE("ref_index_candidates", "index_candidates", "attn", "two-level top-k: kept candidate blocks", DT_ANY, ref_index_candidates),

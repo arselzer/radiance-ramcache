@@ -394,6 +394,11 @@ static const RadParamSpec pIndexTopk[] = { P_INT("M"), P_INT("width"), P_INT("to
 static const RadOperandSpec oIndexTopk[] = { OPD("score"), OPD_O("keep"), OPD("positions"), OUT("sel") };
 static const RadParamSpec pEntryStore[] = { P_INT("M"), P_INT("n"), P_INT("block_size"), P_STR("dtype") };
 static const RadOperandSpec oEntryStore[] = { OPD("x"), OPD("page"), INOUT("cache") };
+static const RadParamSpec pTokenMap[] = { P_INT("M"), P_INT("n_vocab") };
+static const RadOperandSpec oTokenMap[] = { OPD("ids"), WGT("table"), OUT("mapped") };
+static const RadParamSpec pStreamGate[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_F64("eps"),
+    P_F64("gate_eps"), P_STR("dtype") };
+static const RadOperandSpec oStreamGate[] = { OPD("h"), OPD("k"), OPD("v"), WGT("w"), OUT("out") };
 
 /* QSA's compressed key, libr4d's schema (libr4d/r4d_rows.cpp): `block_size` is `ratio` under the
  * name the block-key store's KV group uses; `page` and `pos` are optional. */
@@ -1115,6 +1120,10 @@ static const RadOpSchema kSchemas[] = {
   "the topk best passed positions inside keep, in position order, then -1." },
 { "entry_store", ARR(pEntryStore), ARR(oEntryStore),
   "x[w] into the whole of block page[w] of a paged cache; a negative page writes nothing." },
+{ "token_map", ARR(pTokenMap), ARR(oTokenMap),
+  "mapped[m] = table[ids[m]], -1 for an id outside [0, n_vocab)." },
+{ "stream_gate_add", ARR(pStreamGate), ARR(oStreamGate),
+  "a normalised-dot sigmoid gate per row and stream, out = h + gate v." },
 { "qsa_block_key", ARR(pQsaBlockKey), ARR(oQsaBlockKey),
   "QSA's compressed key: the mean of a block's `ratio` rows rounded to k's dtype, RMS-normed with "
   "gain (wadd + w), rotated at the block's position with `rope`'s ladder and YaRN; libref's "
@@ -1720,6 +1729,9 @@ SIMPLE("avx_index_topk", "index_topk", "attn", "top-k passed positions in positi
        L(index_topk)),
 SIMPLE("avx_entry_store", "entry_store", "attn", "one entry a block into a paged cache", DT_FLOAT,
        L(entry_store)),
+SIMPLE("avx_token_map", "token_map", "embed", "ids through an id table", DT_ANY, L(token_map)),
+SIMPLE("avx_stream_gate_add", "stream_gate_add", "norm", "normalized-dot gated write into hc streams",
+       DT_FLOAT, L(stream_gate_add)),
 SIMPLE("avx_qsa_block_key", "qsa_block_key", "attn",
        "QSA compressed key: pooled, normed and rotated at the block's position", DT_FLOAT,
        L(qsa_block_key)),

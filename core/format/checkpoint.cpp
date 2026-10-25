@@ -1790,8 +1790,12 @@ const SrcTensor* Checkpoint::slice(const SrcTensor& st, int index, const char* d
 }
 
 const SrcTensor* Checkpoint::rows(const SrcTensor& st, int64_t r0, int64_t n, const char* declared) {
-    if (st.shape.empty() || st.rad_dtype == RAD_DT_INVALID || st.gptq_bits || st.ct_group ||
-        st.pbits) {
+    /* A GGUF block tensor's rows are whole: GGUF stores each row as its own run of blocks (a block
+     * never spans rows), so a row range is a byte range as for a plain tensor, and the piece keeps
+     * the type the import reads it by. */
+    const bool blocks = st.rad_dtype == RAD_DT_INVALID && lq::ggml::plane_kind(st.ggml) != nullptr;
+    if (st.shape.empty() || (st.rad_dtype == RAD_DT_INVALID && !blocks) || st.gptq_bits ||
+        st.ct_group || st.pbits) {
         RAD_ERR("'%s' asks for rows of '%s', which is not a plainly stored tensor of rows",
                 declared, st.name.c_str());
         return nullptr;

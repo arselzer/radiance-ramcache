@@ -3250,6 +3250,24 @@ TEST(ggml_pack_inverts_unpack_for_every_block) {
     }
 }
 
+/* Each GGUF type's encoding is its own (arch/common/rad_ggml.h names a weight's type by its encoding,
+ * so two types with one encoding would be read as whichever comes first). Every pair of types the
+ * import reads differs. */
+TEST(ggml_encodings_are_distinct) {
+    std::vector<const lq::ggml::PlaneKind*> kinds;
+    for (uint32_t t = 0; t < 64; ++t)
+        if (const lq::ggml::PlaneKind* k = lq::ggml::plane_kind(t)) kinds.push_back(k);
+    CHECK(kinds.size() >= 6);
+    for (size_t i = 0; i < kinds.size(); ++i)
+        for (size_t j = i + 1; j < kinds.size(); ++j) {
+            const RadEncoding a = lq::ggml::encoding_of(kinds[i]->type);
+            const RadEncoding b = lq::ggml::encoding_of(kinds[j]->type);
+            if (rad_enc_equal(&a, &b))
+                fprintf(stderr, "  %s and %s share an encoding\n", kinds[i]->name, kinds[j]->name);
+            CHECK(!rad_enc_equal(&a, &b));
+        }
+}
+
 /* dequant_of (llama.cpp's dequantize_row_<type>) over native blocks equals the core's decode of the
  * same blocks' planes, bit for bit: the native reader's values are the container's. Random blocks
  * with each f16 super-scale set to a finite value (a NaN scale compares unequal to itself). */

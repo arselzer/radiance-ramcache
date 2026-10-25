@@ -10,6 +10,7 @@
 #include "format/checkpoint.h"
 #include "format/encoding.h"
 #include "../libquant/lq_ggml_planes.h"
+#include "../libquant/lq_ggml_dequant.h"
 #include "rad_plugin.h"
 
 #include <cmath>
@@ -3246,5 +3247,69 @@ TEST(ggml_pack_inverts_unpack_for_every_block) {
                         k->name, (long long)nb, at, blocks.size(), blocks[at], back[at]);
             }
         }
+    }
+}
+
+/* dequant_of (llama.cpp's dequantize_row_<type>) over native blocks equals the core's decode of the
+ * same blocks' planes, bit for bit: the native reader's values are the container's. Random blocks
+ * with each f16 super-scale set to a finite value (a NaN scale compares unequal to itself). */
+TEST(ggml_native_dequant_equals_the_plane_decode) {
+    struct T { uint32_t type; std::vector<size_t> f16_at; };
+    const T types[] = {
+        { 8,  { offsetof(lq::ggml::block_q8_0, d) } },
+        { 13, { offsetof(lq::ggml::block_q5_K, d), offsetof(lq::ggml::block_q5_K, dmin) } },
+        { 14, { offsetof(lq::ggml::block_q6_K, d) } },
+        { 20, { offsetof(lq::ggml::block_iq4_nl, d) } },
+        { 16, { offsetof(lq::ggml::block_iq2_xxs, d) } },
+        { 19, { offsetof(lq::ggml::block_iq1_s, d) } },
+    };
+    uint64_t seed = 0xD1B54A32D192ED03ull;
+    auto rnd = [&]() { seed = seed * 6364136223846793005ull + 1442695040888963407ull; return seed >> 33; };
+    for (const T& ty : types) {
+        const lq::ggml::PlaneKind* k = lq::ggml::plane_kind(ty.type);
+        REQUIRE(k != nullptr);
+        const lq::ggml::DequantFn dq = lq::ggml::dequant_of(ty.type);
+        REQUIRE(dq != nullptr);
+        const RadEncoding e = lq::ggml::encoding_of(k->type);
+        const int64_t nb = 5, cols = nb * k->block;
+        std::vector<uint8_t> blocks((size_t)(nb * (int64_t)k->block_bytes));
+        for (uint8_t& b : blocks) b = (uint8_t)rnd();
+        for (int64_t i = 0; i < nb; ++i)
+            for (size_t off : ty.f16_at) {
+                /* sign, exponent 1..30 (normal), any mantissa; small exponents keep the
+                 * products away from overflow */
+                const uint16_t h = (uint16_t)((rnd() & 0x8000u) | ((5u + rnd() % 14u) << 10) | (rnd() & 0x3FFu));
+                std::memcpy(blocks.data() + i * (int64_t)k->block_bytes + off, &h, 2);
+            }
+        std::vector<std::vector<uint8_t>> planes((size_t)e.n_planes);
+        std::vector<uint8_t*> row((size_t)e.n_planes, nullptr);
+        std::vector<void*> all((size_t)e.n_planes, nullptr);
+        for (int i = 0; i < e.n_planes; ++i) {
+            const RadEncPlane& pl = e.plane[i];
+            int64_t pr = 0, pc = 0;
+            rad_enc_plane_dims(&pl, 1, cols, &pr, &pc);
+            planes[(size_t)i].assign((size_t)(pr * rad_enc_row_bytes(pl.dtype, pc) + 8), 0);
+            all[(size_t)i] = planes[(size_t)i].data();
+            if (pl.kind != RAD_PLANE_TABLE && !(pl.block[0] == 0 && pl.block[1] == 0))
+                row[(size_t)i] = planes[(size_t)i].data();
+        }
+        k->unpack(blocks.data(), nb, row.data());
+        lq::ggml::write_shared(k->type, e, all.data());
+        EncodedView v;
+        enc_view(e, 1, cols, (const void* const*)all.data(), &v);
+        std::vector<float> a((size_t)cols), b((size_t)cols);
+        std::string why;
+        REQUIRE_EQ(enc_decode_rows(v, 0, 1, a.data(), &why), RAD_OK);
+        dq(blocks.data(), b.data(), cols);
+        int64_t bad = 0, first = -1;
+        for (int64_t j = 0; j < cols; ++j) {
+            uint32_t x, y;
+            std::memcpy(&x, &a[(size_t)j], 4);
+            std::memcpy(&y, &b[(size_t)j], 4);
+            if (x != y) { ++bad; if (first < 0) first = j; }
+        }
+        CHECK_EQ(bad, (int64_t)0);
+        if (bad) fprintf(stderr, "  %s: %lld of %lld differ, first at %lld (%.9g vs %.9g)\n", k->name,
+                         (long long)bad, (long long)cols, (long long)first, a[(size_t)first], b[(size_t)first]);
     }
 }

@@ -23,6 +23,7 @@ list(APPEND RAD_CORE_SRC ${_top})
 # blocks import as the same planes that quantiser writes (format/checkpoint.cpp). Compiled from
 # libquant's own sources: the plugin stays buildable out of tree, and both read one definition.
 list(APPEND RAD_CORE_SRC ${CMAKE_SOURCE_DIR}/libquant/lq_ggml_planes.cpp
+                         ${CMAKE_SOURCE_DIR}/libquant/lq_ggml_dequant.cpp
                          ${CMAKE_SOURCE_DIR}/libquant/lq_ggml_tables.cpp)
 
 add_library(rad_core STATIC ${RAD_CORE_SRC})

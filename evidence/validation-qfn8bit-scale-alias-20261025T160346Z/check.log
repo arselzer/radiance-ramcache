@@ -1,0 +1,20 @@
+CONVERTER call=1 exit=0 logBytes=418
+CONVERTER call=2 exit=0 logBytes=1081
+CONVERTER call=3 exit=0 logBytes=1083
+CONVERTER call=4 exit=1 logBytes=286
+I source   /tmp/qfn8bit-alias-tablZx/good (13 tensors)
+I arch     qfn8bitfixture
+I device: built with HIP but no device is visible -- using the host backend
+I device: host backend, 1 device(s) [0:host]
+E qfn8bit_alias_fixture: rad_arch_declare returned dtype this kernel does not serve
+CONVERTER call=5 exit=1 logBytes=634
+I source   /tmp/qfn8bit-alias-tablZx/good (13 tensors)
+I arch     qfn8bitfixture
+I device: built with HIP but no device is visible -- using the host backend
+I device: host backend, 1 device(s) [0:host]
+I recipe   1 rule(s)
+libquant: blk.0.ple_ngram.weight: rule=fixed needs scale_value= greater than zero
+E qfn8bit_alias_fixture: rad_arch_declare returned shape this kernel does not serve
+E   'blk.0.ple_ngram.weight': /tmp/qfn8bit-alias-tablZx/invalid-rule.rad.recipe:1 (rtn) refuses it: invalid argument
+E the weights above could not be planned, and declare saw each of them as the plain dtype it was declared at -- fix those first
+PASS synthetic CPU converter groups=3 checks=234 calls=5 overlayRefusals=7 finiteFP8Codes=254 payload=2400B no inference

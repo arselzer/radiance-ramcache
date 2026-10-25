@@ -1,0 +1,23 @@
+{
+  "schema": "qfn-explicit-fp8-hybrid-reuse-source-review-v1",
+  "created_utc": "2026-10-25T16:15:17.966316+00:00",
+  "source_only": true,
+  "compiler_converter_numerics_or_device_execution": false,
+  "files_sha256": {
+    "radiance-src/tools/rad_convert.cpp": "9eaa52f8ad2c840baf20b96792fb7e97d1ecabe3e172cde0858618186c85db8c",
+    "radiance-src/core/format/recipe.cpp": "de8a282973b4e8cd1f12f58dcb7a5547a7f3a7ac21cbcd398ced466b46167aa3",
+    "radiance-src/core/format/recipe.h": "33b98f4f96df94cd4348f1827a032faa19cf007f94a3d1a915e79f9ed0c8ddf5",
+    "radiance-src/core/format/checkpoint.cpp": "a9f1ff3e938e0ff9ef1d80d8dac9dc159f7e541ca59b39e4ba1e39d7a78450aa",
+    "radiance-src/data/recipes/qwen4exp-w4nl64-i8-hc8m.recipe": "65712a6fefa12c11bcbcaf47baf20030ca056465e9111b7e7b8f0eea62b270bc",
+    "radiance-src/arch/qwen4exp_fp8/qwen4exp_fp8.cpp": "0e63d8f02ac85dde132ca753117d47389dcac423977e864287ac712517ca2908",
+    "qfn8bit-model-header-review/config.json": "c22eb0a053eed62e18f0184d3ca62d3798f208c3e00b9feee939fc3dbacdc8ca",
+    "qfn8bit-model-header-review/model.safetensors.index.json": "0419e2c2dfbb925257d7409405433a793cf7ff7d96f3eba882a815ec6d9fe7a6",
+    "qfn8bit-model-header-review/metadata-receipt.json": "ab27ee0d45e56bf70fdb47b78bebad2064b67cfa9b9e002f7455af285e198f47",
+    "qfn8bit-official-scale-overlay-prototype/SOURCE_RECEIPT.json": "ba49bcbe9e08ac356cb41a0abb6a80abafe976ed957faadb2692438f5d05beae",
+    "qfn8bit-scale-alias-converter-prototype/SOURCE_RECEIPT.json": "664aac9d90a8886554d78f2938954cbb29ea77b4e606f47efc020c0d96f73777",
+    "qfn8bit-scale-alias-converter-v2-prototype/SOURCE_RECEIPT.json": "cd8e86dc2aab94d51b4b02cfe11bcdd36cba8520cdf53d264799de4a0fbe18cf",
+    "QFN_SCALE_RECIPE_BYPASS_CORRECTION.txt": "5b10270ae19318d3f62590516795689f1360fd4b4c6aebf5c21e783b6fb4b766",
+    "QFN_EXPLICIT_FP8_HYBRID_REUSE_REVIEW.txt": "a512eedefcb17993726d270c36c1a2469eee2514a41c94919c60b8dd9a6c4ab9"
+  },
+  "production_payload_read_by_author": false
+}

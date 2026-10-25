@@ -1,0 +1,254 @@
+{
+  "schema": "qfn8bit-hypothetical-postconversion-TP4-layout-v1",
+  "HYPOTHETICAL_ONLY": true,
+  "source_model": "/home/as/models/rad/qwen3.8-next-flash-fp8-iq4r-moe.rad",
+  "source_container_bytes": 121969901568,
+  "source_payload_hash_verified": false,
+  "hypothesis": "Replace ONLY production W4NL expert source encodings by E4M3/BF16[128,128]; ten BF16 experts and all nonexperts unchanged",
+  "home": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/shipped-radiance-1.12.0-home",
+  "ctx": 512,
+  "max_tok": 128,
+  "max_seqs": 1,
+  "mtp_depth": 0,
+  "kv_dtype": "fp8",
+  "state_dtype": "f32",
+  "TP": 4,
+  "tp_wire": "exact",
+  "P2P": "off",
+  "deterministic": true,
+  "vision": false,
+  "embedding": "vram",
+  "prefix_cache": false,
+  "checkpoint_slots": 0,
+  "future_container_assumption": true,
+  "weights_disk_tier": false,
+  "payload_read_or_conversion": false,
+  "kernel_init_or_launch": false,
+  "Pools_Ctx_Engine_or_sampler_instance": false,
+  "visible_devices_reported": 1,
+  "eligibility_card_queried": 0,
+  "four_card_geometry_assumption": "All4 logical ranks use visible card0 ISA/capacity; parent separately verifies boards; no peer mapping or device binding",
+  "ranks": [],
+  "scenarios": [],
+  "plugins": [
+    {
+      "name": "libavx",
+      "version": "0.1.0",
+      "path": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/shipped-radiance-1.12.0-home/kernels/libavx.so",
+      "kind": 1,
+      "device_code_absent": false
+    },
+    {
+      "name": "libr4d",
+      "version": "0.5.0",
+      "path": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/shipped-radiance-1.12.0-home/kernels/libr4d.so",
+      "kind": 1,
+      "device_code_absent": false
+    },
+    {
+      "name": "spechub",
+      "version": "0.1.0",
+      "path": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/shipped-radiance-1.12.0-home/kernels/spechub.so",
+      "kind": 1,
+      "device_code_absent": false
+    },
+    {
+      "name": "libref",
+      "version": "0.1.0",
+      "path": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/shipped-radiance-1.12.0-home/kernels/libref.so",
+      "kind": 1,
+      "device_code_absent": false
+    },
+    {
+      "name": "anima",
+      "version": "0.1.0",
+      "path": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/shipped-radiance-1.12.0-home/architectures/anima.so",
+      "kind": 2,
+      "device_code_absent": false
+    },
+    {
+      "name": "breeze",
+      "version": "0.1.0",
+      "path": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/shipped-radiance-1.12.0-home/architectures/breeze.so",
+      "kind": 2,
+      "device_code_absent": false
+    },
+    {
+      "name": "embgemma2",
+      "version": "0.1.0",
+      "path": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/shipped-radiance-1.12.0-home/architectures/embgemma2.so",
+      "kind": 2,
+      "device_code_absent": false
+    },
+    {
+      "name": "fishomni",
+      "version": "0.1.0",
+      "path": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/shipped-radiance-1.12.0-home/architectures/fishomni.so",
+      "kind": 2,
+      "device_code_absent": false
+    },
+    {
+      "name": "flux3",
+      "version": "0.1.0",
+      "path": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/shipped-radiance-1.12.0-home/architectures/flux3.so",
+      "kind": 2,
+      "device_code_absent": false
+    },
+    {
+      "name": "flux3distilled",
+      "version": "0.1.0",
+      "path": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/shipped-radiance-1.12.0-home/architectures/flux3distilled.so",
+      "kind": 2,
+      "device_code_absent": false
+    },
+    {
+      "name": "gemma3",
+      "version": "0.1.0",
+      "path": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/shipped-radiance-1.12.0-home/architectures/gemma3.so",
+      "kind": 2,
+      "device_code_absent": false
+    },
+    {
+      "name": "gemma4",
+      "version": "0.1.0",
+      "path": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/shipped-radiance-1.12.0-home/architectures/gemma4.so",
+      "kind": 2,
+      "device_code_absent": false
+    },
+    {
+      "name": "gemma4_bf16",
+      "version": "0.1.0",
+      "path": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/shipped-radiance-1.12.0-home/architectures/gemma4_bf16.so",
+      "kind": 2,
+      "device_code_absent": false
+    },
+    {
+      "name": "glm5next",
+      "version": "0.1.0",
+      "path": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/shipped-radiance-1.12.0-home/architectures/glm5next.so",
+      "kind": 2,
+      "device_code_absent": false
+    },
+    {
+      "name": "krea2",
+      "version": "0.1.0",
+      "path": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/shipped-radiance-1.12.0-home/architectures/krea2.so",
+      "kind": 2,
+      "device_code_absent": false
+    },
+    {
+      "name": "lfm2_bf16",
+      "version": "0.1.0",
+      "path": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/shipped-radiance-1.12.0-home/architectures/lfm2_bf16.so",
+      "kind": 2,
+      "device_code_absent": false
+    },
+    {
+      "name": "llama_dense_fp8",
+      "version": "0.1.0",
+      "path": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/shipped-radiance-1.12.0-home/architectures/llama_dense_fp8.so",
+      "kind": 2,
+      "device_code_absent": false
+    },
+    {
+      "name": "llama_fp8",
+      "version": "0.1.0",
+      "path": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/shipped-radiance-1.12.0-home/architectures/llama_fp8.so",
+      "kind": 2,
+      "device_code_absent": false
+    },
+    {
+      "name": "ltx2",
+      "version": "0.1.0",
+      "path": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/shipped-radiance-1.12.0-home/architectures/ltx2.so",
+      "kind": 2,
+      "device_code_absent": false
+    },
+    {
+      "name": "minimaxh3",
+      "version": "0.1.0",
+      "path": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/shipped-radiance-1.12.0-home/architectures/minimaxh3.so",
+      "kind": 2,
+      "device_code_absent": false
+    },
+    {
+      "name": "minimaxmusic3",
+      "version": "0.1.0",
+      "path": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/shipped-radiance-1.12.0-home/architectures/minimaxmusic3.so",
+      "kind": 2,
+      "device_code_absent": false
+    },
+    {
+      "name": "qwen35_bf16",
+      "version": "0.1.0",
+      "path": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/shipped-radiance-1.12.0-home/architectures/qwen35_bf16.so",
+      "kind": 2,
+      "device_code_absent": false
+    },
+    {
+      "name": "qwen35_fp8",
+      "version": "0.1.0",
+      "path": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/shipped-radiance-1.12.0-home/architectures/qwen35_fp8.so",
+      "kind": 2,
+      "device_code_absent": false
+    },
+    {
+      "name": "qwen35_w8a8",
+      "version": "0.1.0",
+      "path": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/shipped-radiance-1.12.0-home/architectures/qwen35_w8a8.so",
+      "kind": 2,
+      "device_code_absent": false
+    },
+    {
+      "name": "qwen35moe_fp8",
+      "version": "0.1.0",
+      "path": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/shipped-radiance-1.12.0-home/architectures/qwen35moe_fp8.so",
+      "kind": 2,
+      "device_code_absent": false
+    },
+    {
+      "name": "qwen3asr_bf16",
+      "version": "0.1.0",
+      "path": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/shipped-radiance-1.12.0-home/architectures/qwen3asr_bf16.so",
+      "kind": 2,
+      "device_code_absent": false
+    },
+    {
+      "name": "qwen4exp_fp8",
+      "version": "0.1.0",
+      "path": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/shipped-radiance-1.12.0-home/architectures/qwen4exp_fp8.so",
+      "kind": 2,
+      "device_code_absent": false
+    },
+    {
+      "name": "qwenimage21",
+      "version": "0.1.0",
+      "path": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/shipped-radiance-1.12.0-home/architectures/qwenimage21.so",
+      "kind": 2,
+      "device_code_absent": false
+    },
+    {
+      "name": "sdxl",
+      "version": "0.1.0",
+      "path": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/shipped-radiance-1.12.0-home/architectures/sdxl.so",
+      "kind": 2,
+      "device_code_absent": false
+    },
+    {
+      "name": "unlimitedocr_bf16",
+      "version": "0.1.0",
+      "path": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/shipped-radiance-1.12.0-home/architectures/unlimitedocr_bf16.so",
+      "kind": 2,
+      "device_code_absent": false
+    },
+    {
+      "name": "libquant",
+      "version": "0.2.0",
+      "path": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/shipped-radiance-1.12.0-home/quantizers/libquant.so",
+      "kind": 3,
+      "device_code_absent": false
+    }
+  ],
+  "completed": false,
+  "error": "actual FP8 PLE code table and HOST reader; DEVICE capability is diagnostic only"
+}

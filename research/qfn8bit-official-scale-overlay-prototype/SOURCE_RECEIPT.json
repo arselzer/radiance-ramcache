@@ -1,0 +1,20 @@
+{
+  "schema": "qfn-pinned-official-scale-overlay-source-v1",
+  "created_utc": "2026-10-25T16:06:57.960087+00:00",
+  "source_only": true,
+  "author_import_tests_converter_network_gpu_execution": false,
+  "source_paths": {
+    "PINNED_UPSTREAM_MODEL_INFO.json": "47f5198bad950052f4e8e9c8af2dcac17d1dcb5fedc64831df1037bc695de593",
+    "README.txt": "1fc15aa82575fae29a0197c4ae1ec1f1387a5af9a55507c8dfca2ccdbb77b065",
+    "overlay.py": "fb43664717e844907b3cf5de8207a0e67bcbd6ac2d88132c15a3365f026f43dd",
+    "test_overlay.py": "0eba055fd73825b2489918078a40c03b257cf665af0e97572a8a5edf7f965fed"
+  },
+  "pinned_source_repo": "Qwen/Qwen3.8-Flash-Next-FP8",
+  "pinned_revision": "236dfdf285828023ca3bcd3f37366c58a3469b13",
+  "official_profile": "144 artifacts/131 shards/152089 tensor headers; payload hashes expected but NOT computed;2B parent scalar only",
+  "unit_tests_authored": 8,
+  "full_model_or_conversion_present": false,
+  "derived_output": "NEW dir/index256B scalar sidecar, original source symlinks, recipe and provenance; no original writes",
+  "validation_pending": true,
+  "source_AST_only_parsed": true
+}

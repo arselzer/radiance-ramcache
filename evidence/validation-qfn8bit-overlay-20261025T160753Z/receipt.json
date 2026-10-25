@@ -1,0 +1,16 @@
+{
+  "passed": true,
+  "production_changes": false,
+  "device_queries": false,
+  "scope": "Small synthetic overlay CPU unit tests; no real QFN payload verification",
+  "source_receipt_sha256": "ba49bcbe9e08ac356cb41a0abb6a80abafe976ed957faadb2692438f5d05beae",
+  "command": [
+    "python3",
+    "-B",
+    "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/qfn8bit-official-scale-overlay-prototype/test_overlay.py"
+  ],
+  "returncode": 0,
+  "logs_sha256": {
+    "test.log": "1327f170732ee47f216ae8aa32ed702ca689d7d7ecc0a8c9e1ed4592ceb31670"
+  }
+}

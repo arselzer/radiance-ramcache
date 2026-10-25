@@ -1,0 +1,27 @@
+CONVERTER call=1 exit=0 logBytes=418
+CONVERTER call=2 exit=0 logBytes=1081
+CONVERTER call=3 exit=0 logBytes=1083
+CONVERTER call=4 exit=1 logBytes=286
+I source   /tmp/qfn8bit-alias-ThUkrN/good (13 tensors)
+I arch     qfn8bitfixture
+I device: built with HIP but no device is visible -- using the host backend
+I device: host backend, 1 device(s) [0:host]
+E qfn8bit_alias_fixture: rad_arch_declare returned dtype this kernel does not serve
+CONVERTER call=5 exit=1 logBytes=634
+I source   /tmp/qfn8bit-alias-ThUkrN/good (13 tensors)
+I arch     qfn8bitfixture
+I device: built with HIP but no device is visible -- using the host backend
+I device: host backend, 1 device(s) [0:host]
+I recipe   1 rule(s)
+libquant: blk.0.ple_ngram.weight: rule=fixed needs scale_value= greater than zero
+E qfn8bit_alias_fixture: rad_arch_declare returned shape this kernel does not serve
+E   'blk.0.ple_ngram.weight': /tmp/qfn8bit-alias-ThUkrN/invalid-rule.rad.recipe:1 (rtn) refuses it: invalid argument
+E the weights above could not be planned, and declare saw each of them as the plain dtype it was declared at -- fix those first
+CONVERTER call=6 exit=1 logBytes=689
+I source   /tmp/qfn8bit-alias-ThUkrN/good (13 tensors)
+I arch     qfn8bitfixture, quant fp8
+I device: built with HIP but no device is visible -- using the host backend
+I device: host backend, 1 device(s) [0:host]
+E no architecture plugin claims 'qfn8bitfixture' at quantisation 'fp8'. 'qfn8bitfixture' is served at: (unquantised). Either the container's quantisation descriptor is not one this project has a plugin for, or the container was written before the descriptor was recorded -- rad-info prints it.
+E rad-convert runs the architecture plugin's declare: its name map says which checkpoint tensors make each weight, and the kernels it resolves are what the recipe is checked against
+PASS synthetic CPU converter groups=5 checks=350 calls=6 overlayRefusals=7 finiteFP8Codes=254 payload=2400B no inference

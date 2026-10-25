@@ -93,5 +93,55 @@
     "directory": "validation-glm53-tiny-engine-startup-contract-tsan-20261025T132036Z",
     "passed": true,
     "scope": "Actual synthetic checkpoint/importer320tokenizer/source authority/sharedFFN+Sampler declaration/purePlanner/compactquote only; noPools/NativeSource/Owner/Ctx/streams/Engine/model orsamplerexecution"
+  },
+  {
+    "directory": "qfn8bit-metadata-minimal-20261025T154956Z",
+    "passed": false,
+    "scope": "Hypothetical native FP8 expert layout and placement only"
+  },
+  {
+    "directory": "qfn8bit-metadata-minimal-20261025T155917Z",
+    "passed": true,
+    "scope": "Hypothetical native FP8 expert layout and placement only"
+  },
+  {
+    "directory": "qfn8bit-metadata-262k-20261025T160316Z",
+    "passed": true,
+    "scope": "Hypothetical native FP8 expert layout and placement only"
+  },
+  {
+    "directory": "qfn8bit-metadata-262k-mtp3-20261025T160448Z",
+    "passed": true,
+    "scope": "Hypothetical native FP8 expert layout and placement only"
+  },
+  {
+    "directory": "validation-qfn8bit-scale-alias-20261025T160346Z",
+    "passed": true,
+    "scope": "Synthetic finite FP8 code preservation through original converter; explicit alias preflight; no full model"
+  },
+  {
+    "directory": "validation-qfn8bit-scale-alias-v2-20261025T161708Z",
+    "passed": true,
+    "scope": "Synthetic official-style FP8 selector, explicit scale preflight, and finite code preservation; no full model"
+  },
+  {
+    "directory": "validation-qfn8bit-overlay-20261025T160753Z",
+    "passed": true,
+    "scope": "Small synthetic overlay CPU unit tests; no real QFN payload verification"
+  },
+  {
+    "directory": "validation-glm53-tp4-prepare-lookahead-release-20261025T155859Z",
+    "passed": true,
+    "scope": "Standalone HOST coordinator; no Core integration"
+  },
+  {
+    "directory": "validation-glm53-tp4-prepare-lookahead-asan-20261025T160052Z",
+    "passed": true,
+    "scope": "Standalone HOST coordinator; no Core integration"
+  },
+  {
+    "directory": "validation-glm53-tp4-prepare-lookahead-tsan-20261025T160106Z",
+    "passed": true,
+    "scope": "Standalone HOST coordinator; no Core integration"
   }
 ]

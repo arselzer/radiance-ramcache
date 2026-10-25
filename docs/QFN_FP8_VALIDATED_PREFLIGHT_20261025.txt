@@ -1,0 +1,109 @@
+QFN FP8 experts: validated preparation and remaining gates, 2026-10-25
+
+The official Qwen/Qwen3.8-Flash-Next-FP8 checkpoint is a usable source candidate:
+https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8
+Pinned revision: 236dfdf285828023ca3bcd3f37366c58a3469b13.
+It is about172.82GiB, including its other weights. Radiance already has E4M3
+expert kernels with BF16 scales in128x128blocks on gfx1201. No new expert GEMM
+is needed for that format. INT8 experts are a different, unsupported proposal.
+The linked StillDeadcode fp8-iq4r-moe.rad instead has four-bit experts, an INT8
+trunk and ten BF16 exceptions. No ready eight-bit-expert.rad was found among
+the inspected upstream links and targeted searches; this is not universal absence.
+
+Source evidence is deliberately bounded: pinned config/index/model-info, three
+actual safetensors headers and two bytes of the global PLE scale. No full QFN
+checkpoint was downloaded or converted. The exact BF16 scale is0x3951, or
+0.00019931793212890625. Expert code/scale shapes match128x128blocks. TP4 uses
+ragged256/128/128/128expert cuts, rotated byexpert ID; it does not split640
+uniformly into160-column cuts.
+
+Three different conversion choices must stay distinct:
+1. Original BF16 source, existing nonexpert rules, new FP8 expert RTN rule:
+   research/qfn-fp8-conversion/qwen4exp-fp8-experts-i8-hc8m.recipe.
+   This is a controlled expert-only recipe proposal, with the ten BF16
+   exceptions retained. It needs the roughly335GiB BF16 source. Expanding
+   today's four-bit expert values into FP8 cannot recover lost precision.
+2. Official FP8 source, preserving its native experts and other stored forms.
+   Requires the PLE scale overlay and model-selector override below. Its other
+   weights differ from today's model; the placement table below does NOT
+   describe this entire official checkpoint.
+3. Explicit hybrid: official FP8 experts plus byte-identical retained weights
+   from today's.rad, including its ten protected BF16 experts. Source review
+   finds a possible --reuse route, but every retained entry must pass the
+   converter's exact reuse predicate and final byte equality. Stock reuse
+   silently falls back to recalculating mismatches. This intentionally mixes
+   provenance; it is not a claim that both releases are identical. A bounded
+   hybrid fixture is in progress. See QFN_EXPLICIT_FP8_HYBRID_REUSE_REVIEW.txt.
+
+Validated native placement hypothesis
+The actual stock QFN graph/layout/Planner was queried with only expert encodings
+changed to E4M3/BF16block128. Current nonexperts and ten BF16 experts were retained.
+Actual gfx1201 selection, TP4 rectangles and n-gram accounting passed; no model
+payload was loaded, no queue/kernel was created, and no inference was run.
+
+Profile                           KV per GPU      Candidate host pool per rank
+512ctx,1seq,MTP0,batch128           0.03125GiB      16GiB with disk n-gram
+262144ctx,1seq,MTP0,batch2048       1.71484375GiB   20GiB with disk n-gram
+262144ctx,1seq,MTP3,batch2048       1.8828125GiB    20GiB with disk n-gram
+
+Both262K rows fit the checked four-card weight plans even with an assumed2GiB
+per GPU reserved for runtime/driver/collectives, plus separate computed arena,
+KV and Batch storage and16MiB sampler allowance. They use exactwire,
+deterministic placement, no prefix cache/checkpoint slots and GPU embeddings.
+The20GiB/rank host pools sum to80GiB. Host arenas/sampler,96MiB shared disk
+n-gram cache allowance and an assumed8GiB margin bring the quote to88.196GiB.
+Post-stop available RAM is estimated113.6GiB, not measured by stopping service.
+This remains conditional placement, not startup/loader-peak/performance proof.
+The8GiB margin may partly overlap OS memory already excluded by that estimate.
+No candidate with the whole47.68GiB n-gram table in RAM passed the checked
+pool/margin grid; that is not a proof that every possible RAM configuration fails.
+Only one full-length sequence is covered here. Do not infer c8 capacity/speed.
+
+Validated bounded import preparation
+The official PLE table is split over128shards but has one parent scale. The
+overlay builder adds128per-shard BF16 scale aliases in a256-byte sidecar, copies
+and extends the index, and symlinks the immutable source files. It changes no
+source payload. It checks complete index/header ownership and expert schemas,
+rejects scale_inv precedence collisions, and rechecks source identity before
+atomic publication. Eight small CPU tests passed. Real full-source invocation
+has not happened. Expected LFS hashes are recorded, not computed by this helper;
+a separate complete trusted download/hash verification is required.
+
+The actual stock converter passed a synthetic five-group350-check fixture:
+six converter invocations, seven explicit input-scale preflight refusals,
+all254finite FP8 codes including signed zeros/subnormals preserved, and exact
+expert code/scale preservation. It uses a converter-only test architecture,
+not the full QFN graph. It does not establish arbitrary rounding-tie behavior
+or model quality. A separate child-deadline case checks bounded process cleanup.
+
+Official config quant_method=fp8 selects a descriptor that the QFN architecture
+does not register. The explicit override below clears that descriptor before
+selection while keeping block import metadata. Its success and the refusal
+without it were tested in the bounded fixture. A recipe alone is insufficient:
+it can bypass missing input scales. Always validate every input alias first.
+
+Prepared official-source workflow; full commands have NOT been run:
+  python3 research/qfn8bit-official-scale-overlay-prototype/overlay.py build \
+    --source ABS_COMPLETE_VERIFIED_FP8_SOURCE --output ABS_NEW_OVERLAY
+  python3 research/qfn8bit-official-scale-overlay-prototype/overlay.py verify \
+    --overlay ABS_NEW_OVERLAY
+  rad-convert ABS_NEW_OVERLAY -o ABS_NEW_OFFICIAL_FP8_RAD \
+    --set quantization_config.quant_method= \
+    --recipe ABS_OVERLAY_PLE_RECIPE --home ABS_MATCHING_RADIANCE_HOME \
+    --plan-only -v
+Use the exact recipe path emitted by the overlay. Conversion would follow only
+after the full real-source plan and retained/native plane verification gates.
+This command is option2, not the BF16-source recipe or the hybrid option3.
+
+Receipts and exact report hashes are indexed by
+QFN8BIT_VALIDATED_PREFLIGHT_INDEX_20261025.json. The frozen source READMEs retain
+their source-time pending labels; later parent evidence supplies runtime results.
+Original CMake/pin checks for archived stock-Core fixtures require the original
+matching Core, not the changed private Core exported in this repository. The
+Python overlay and its small tests use only the standard library.
+
+No production changes, restart, QFN inference, quality comparison or performance
+claim follows from this work. FP8 expert transfers are roughly twice the four-bit
+payload; disk-backed n-gram latency needs real-prompt measurement. The useful
+next experiment is a verified conversion followed by matched-context, exactwire,
+matched-MTP/cold-cache quality and speed tests in an approved serving window.

@@ -1,0 +1,1 @@
+PASS hash-only truthful-lookahead source 5 files; 11 inputs; exact declared arithmetic delta only

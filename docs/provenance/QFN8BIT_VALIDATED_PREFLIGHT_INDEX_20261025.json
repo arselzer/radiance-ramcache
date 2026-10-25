@@ -1,0 +1,415 @@
+{
+  "updated_utc": "2026-10-25T16:18:13.893867+00:00",
+  "hypothesis": "Replace production W4NL experts with native E4M3/BF16block128, retain all nonexperts and ten protected BF16 experts. Not wholesale officialFP8 import.",
+  "profiles": [
+    {
+      "report": "qfn8bit-metadata-minimal-20261025T155917Z/plan.json",
+      "report_sha256": "a5f042497056066166ec209782dfb8cbed18d995b63725d22af3736708d91d5a",
+      "ctx": 512,
+      "batch_tokens": 128,
+      "max_seqs": 1,
+      "mtp_depth": 0,
+      "RAM_candidates": 0,
+      "disk_candidates": 14,
+      "20GiB_per_rank_2GiB_runtime_scenario": [
+        {
+          "ngram": "disk",
+          "host_pool_mib_PER_RANK": 20480,
+          "runtime_driver_collective_headroom_mib_ASSUMED": 2048,
+          "ranks": [
+            {
+              "status": 0,
+              "fits": true,
+              "notes": [],
+              "unfit": [],
+              "tier_bytes": {
+                "vram": 14779527752,
+                "pinned": 17566119720,
+                "pageable": 0,
+                "ssd": 0,
+                "mapped": 51200245762
+              },
+              "weight_budget": 14863564800,
+              "host_budget_after_staging": 21474836480,
+              "slab_overhead": 0,
+              "file_stage_vram": 0,
+              "file_stage_host": 0,
+              "ngram_copy_bytes": 0,
+              "units": 25014,
+              "classes": 15,
+              "SSD_in_failed_plan_is_not_successful_backing": false,
+              "rank": 0,
+              "nonweight_device_budget": 2232339968,
+              "derived_weights_mib": 14175
+            },
+            {
+              "status": 0,
+              "fits": true,
+              "notes": [],
+              "unfit": [],
+              "tier_bytes": {
+                "vram": 14779527752,
+                "pinned": 17566119720,
+                "pageable": 0,
+                "ssd": 0,
+                "mapped": 51200245762
+              },
+              "weight_budget": 14863564800,
+              "host_budget_after_staging": 21474836480,
+              "slab_overhead": 0,
+              "file_stage_vram": 0,
+              "file_stage_host": 0,
+              "ngram_copy_bytes": 0,
+              "units": 25014,
+              "classes": 15,
+              "SSD_in_failed_plan_is_not_successful_backing": false,
+              "rank": 1,
+              "nonweight_device_budget": 2232339968,
+              "derived_weights_mib": 14175
+            },
+            {
+              "status": 0,
+              "fits": true,
+              "notes": [],
+              "unfit": [],
+              "tier_bytes": {
+                "vram": 14778294152,
+                "pinned": 17602496640,
+                "pageable": 0,
+                "ssd": 0,
+                "mapped": 51200245762
+              },
+              "weight_budget": 14862516224,
+              "host_budget_after_staging": 21474836480,
+              "slab_overhead": 0,
+              "file_stage_vram": 0,
+              "file_stage_host": 0,
+              "ngram_copy_bytes": 0,
+              "units": 25014,
+              "classes": 15,
+              "SSD_in_failed_plan_is_not_successful_backing": false,
+              "rank": 2,
+              "nonweight_device_budget": 2232471040,
+              "derived_weights_mib": 14174
+            },
+            {
+              "status": 0,
+              "fits": true,
+              "notes": [],
+              "unfit": [],
+              "tier_bytes": {
+                "vram": 14779528952,
+                "pinned": 17553338640,
+                "pageable": 0,
+                "ssd": 0,
+                "mapped": 51200245762
+              },
+              "weight_budget": 14863564800,
+              "host_budget_after_staging": 21474836480,
+              "slab_overhead": 0,
+              "file_stage_vram": 0,
+              "file_stage_host": 0,
+              "ngram_copy_bytes": 0,
+              "units": 25014,
+              "classes": 15,
+              "SSD_in_failed_plan_is_not_successful_backing": false,
+              "rank": 3,
+              "nonweight_device_budget": 2232339968,
+              "derived_weights_mib": 14175
+            }
+          ],
+          "all_weight_plans_fit": true,
+          "ngram_host_shared_ONCE_outside_pools": 100663296,
+          "all_host_bytes_under_ASSUMED_allowances": 94659739648,
+          "within_MemTotal_under_ASSUMED_allowances": true,
+          "within_current_MemAvailable": false,
+          "within_parent_estimated_poststop113_6GiB": true,
+          "hypothetical_planning_candidate_only": true
+        }
+      ],
+      "per_rank_KV_pool_bytes": [
+        33554432,
+        33554432,
+        33554432,
+        33554432
+      ]
+    },
+    {
+      "report": "qfn8bit-metadata-262k-20261025T160316Z/plan.json",
+      "report_sha256": "06eed9614ed878b18a3d4f0c0acb7421774db3906291a1da273e1a662a71a793",
+      "ctx": 262144,
+      "batch_tokens": 2048,
+      "max_seqs": 1,
+      "mtp_depth": 0,
+      "RAM_candidates": 0,
+      "disk_candidates": 9,
+      "20GiB_per_rank_2GiB_runtime_scenario": [
+        {
+          "ngram": "disk",
+          "host_pool_mib_PER_RANK": 20480,
+          "runtime_driver_collective_headroom_mib_ASSUMED": 2048,
+          "ranks": [
+            {
+              "status": 0,
+              "fits": true,
+              "notes": [],
+              "unfit": [],
+              "tier_bytes": {
+                "vram": 12019797632,
+                "pinned": 20325849840,
+                "pageable": 0,
+                "ssd": 0,
+                "mapped": 51200245762
+              },
+              "weight_budget": 12085886976,
+              "host_budget_after_staging": 21474836480,
+              "slab_overhead": 0,
+              "file_stage_vram": 0,
+              "file_stage_host": 0,
+              "ngram_copy_bytes": 0,
+              "units": 25014,
+              "classes": 15,
+              "SSD_in_failed_plan_is_not_successful_backing": false,
+              "rank": 0,
+              "nonweight_device_budget": 5009922048,
+              "derived_weights_mib": 11526
+            },
+            {
+              "status": 0,
+              "fits": true,
+              "notes": [],
+              "unfit": [],
+              "tier_bytes": {
+                "vram": 12019797632,
+                "pinned": 20325849840,
+                "pageable": 0,
+                "ssd": 0,
+                "mapped": 51200245762
+              },
+              "weight_budget": 12085886976,
+              "host_budget_after_staging": 21474836480,
+              "slab_overhead": 0,
+              "file_stage_vram": 0,
+              "file_stage_host": 0,
+              "ngram_copy_bytes": 0,
+              "units": 25014,
+              "classes": 15,
+              "SSD_in_failed_plan_is_not_successful_backing": false,
+              "rank": 1,
+              "nonweight_device_budget": 5009922048,
+              "derived_weights_mib": 11526
+            },
+            {
+              "status": 0,
+              "fits": true,
+              "notes": [],
+              "unfit": [],
+              "tier_bytes": {
+                "vram": 12025446152,
+                "pinned": 20355344640,
+                "pageable": 0,
+                "ssd": 0,
+                "mapped": 51200245762
+              },
+              "weight_budget": 12091129856,
+              "host_budget_after_staging": 21474836480,
+              "slab_overhead": 0,
+              "file_stage_vram": 0,
+              "file_stage_host": 0,
+              "ngram_copy_bytes": 0,
+              "units": 25014,
+              "classes": 15,
+              "SSD_in_failed_plan_is_not_successful_backing": false,
+              "rank": 2,
+              "nonweight_device_budget": 5004171264,
+              "derived_weights_mib": 11531
+            },
+            {
+              "status": 0,
+              "fits": true,
+              "notes": [],
+              "unfit": [],
+              "tier_bytes": {
+                "vram": 12027664112,
+                "pinned": 20305203480,
+                "pageable": 0,
+                "ssd": 0,
+                "mapped": 51200245762
+              },
+              "weight_budget": 12093227008,
+              "host_budget_after_staging": 21474836480,
+              "slab_overhead": 0,
+              "file_stage_vram": 0,
+              "file_stage_host": 0,
+              "ngram_copy_bytes": 0,
+              "units": 25014,
+              "classes": 15,
+              "SSD_in_failed_plan_is_not_successful_backing": false,
+              "rank": 3,
+              "nonweight_device_budget": 5002057728,
+              "derived_weights_mib": 11533
+            }
+          ],
+          "all_weight_plans_fit": true,
+          "ngram_host_shared_ONCE_outside_pools": 100663296,
+          "all_host_bytes_under_ASSUMED_allowances": 94700044288,
+          "within_MemTotal_under_ASSUMED_allowances": true,
+          "within_current_MemAvailable": false,
+          "within_parent_estimated_poststop113_6GiB": true,
+          "hypothetical_planning_candidate_only": true
+        }
+      ],
+      "per_rank_KV_pool_bytes": [
+        1841299456,
+        1841299456,
+        1841299456,
+        1841299456
+      ]
+    },
+    {
+      "report": "qfn8bit-metadata-262k-mtp3-20261025T160448Z/plan.json",
+      "report_sha256": "1bce7abe0d4355c8919dcf04d50418cb86b1b9434abc2f4be32c7e95ee82a37b",
+      "ctx": 262144,
+      "batch_tokens": 2048,
+      "max_seqs": 1,
+      "mtp_depth": 3,
+      "RAM_candidates": 0,
+      "disk_candidates": 8,
+      "20GiB_per_rank_2GiB_runtime_scenario": [
+        {
+          "ngram": "disk",
+          "host_pool_mib_PER_RANK": 20480,
+          "runtime_driver_collective_headroom_mib_ASSUMED": 2048,
+          "ranks": [
+            {
+              "status": 0,
+              "fits": true,
+              "notes": [],
+              "unfit": [],
+              "tier_bytes": {
+                "vram": 11839808864,
+                "pinned": 21234289680,
+                "pageable": 0,
+                "ssd": 0,
+                "mapped": 51200245762
+              },
+              "weight_budget": 11903434752,
+              "host_budget_after_staging": 21474836480,
+              "slab_overhead": 0,
+              "file_stage_vram": 0,
+              "file_stage_host": 0,
+              "ngram_copy_bytes": 0,
+              "units": 25538,
+              "classes": 16,
+              "SSD_in_failed_plan_is_not_successful_backing": false,
+              "rank": 0,
+              "nonweight_device_budget": 5192505344,
+              "derived_weights_mib": 11352
+            },
+            {
+              "status": 0,
+              "fits": true,
+              "notes": [],
+              "unfit": [],
+              "tier_bytes": {
+                "vram": 11839808864,
+                "pinned": 21234289680,
+                "pageable": 0,
+                "ssd": 0,
+                "mapped": 51200245762
+              },
+              "weight_budget": 11903434752,
+              "host_budget_after_staging": 21474836480,
+              "slab_overhead": 0,
+              "file_stage_vram": 0,
+              "file_stage_host": 0,
+              "ngram_copy_bytes": 0,
+              "units": 25538,
+              "classes": 16,
+              "SSD_in_failed_plan_is_not_successful_backing": false,
+              "rank": 1,
+              "nonweight_device_budget": 5192505344,
+              "derived_weights_mib": 11352
+            },
+            {
+              "status": 0,
+              "fits": true,
+              "notes": [],
+              "unfit": [],
+              "tier_bytes": {
+                "vram": 11846455784,
+                "pinned": 21263784480,
+                "pageable": 0,
+                "ssd": 0,
+                "mapped": 51200245762
+              },
+              "weight_budget": 11910774784,
+              "host_budget_after_staging": 21474836480,
+              "slab_overhead": 0,
+              "file_stage_vram": 0,
+              "file_stage_host": 0,
+              "ngram_copy_bytes": 0,
+              "units": 25538,
+              "classes": 16,
+              "SSD_in_failed_plan_is_not_successful_backing": false,
+              "rank": 2,
+              "nonweight_device_budget": 5184526336,
+              "derived_weights_mib": 11359
+            },
+            {
+              "status": 0,
+              "fits": true,
+              "notes": [],
+              "unfit": [],
+              "tier_bytes": {
+                "vram": 11848658504,
+                "pinned": 21212660160,
+                "pageable": 0,
+                "ssd": 0,
+                "mapped": 51200245762
+              },
+              "weight_budget": 11912871936,
+              "host_budget_after_staging": 21474836480,
+              "slab_overhead": 0,
+              "file_stage_vram": 0,
+              "file_stage_host": 0,
+              "ngram_copy_bytes": 0,
+              "units": 25538,
+              "classes": 16,
+              "SSD_in_failed_plan_is_not_successful_backing": false,
+              "rank": 3,
+              "nonweight_device_budget": 5182412800,
+              "derived_weights_mib": 11361
+            }
+          ],
+          "all_weight_plans_fit": true,
+          "ngram_host_shared_ONCE_outside_pools": 100663296,
+          "all_host_bytes_under_ASSUMED_allowances": 94700044288,
+          "within_MemTotal_under_ASSUMED_allowances": true,
+          "within_current_MemAvailable": false,
+          "within_parent_estimated_poststop113_6GiB": true,
+          "hypothetical_planning_candidate_only": true
+        }
+      ],
+      "per_rank_KV_pool_bytes": [
+        2021654528,
+        2021654528,
+        2021654528,
+        2021654528
+      ]
+    }
+  ],
+  "finite_converter_receipt": "validation-qfn8bit-scale-alias-20261025T160346Z/receipt.json",
+  "overlay_builder_receipt": "validation-qfn8bit-overlay-20261025T160753Z/receipt.json",
+  "actual_full_QFN_model_download_or_conversion": false,
+  "inference_or_performance_tested": false,
+  "selector_gate": "PASS: bounded official-style fp8 descriptor refuses without override; --set quantization_config.quant_method= admits tested architecture, preserves exact finite FP8 codes/scales, with output descriptor empty. Not complete real-model import.",
+  "limits": [
+    "Metadata source/layout/placement check only, no model loading or kernels.",
+    "Host post-stop113.6GiB is an estimate;8GiB overhead andper-card512..2048MiB runtime are explicit assumptions.",
+    "NoRAM candidates refers to inspected grids/allowances, not a proof no RAM configuration can ever fit.",
+    "KV figures reserve all declared sequences at fullcontext; shown profiles use1sequence."
+  ],
+  "finite_converter_v2_receipt": "validation-qfn8bit-scale-alias-v2-20261025T161708Z/receipt.json",
+  "hybrid_reuse_review": "QFN_EXPLICIT_FP8_HYBRID_REUSE_REVIEW.txt"
+}

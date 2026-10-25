@@ -1,0 +1,2 @@
+RAM_ADMISSION MemAvailable=9581445120
+PASS TP4 cache truthful-lookahead HOST coordinator cases=11 checks=123 refusalGroups=27 twoSuccessPassGUCount=336 threeLookaheadPassGUCount=504 sizeofCoordinator=16632; no Core, GPU, model, collectives or recovery proof

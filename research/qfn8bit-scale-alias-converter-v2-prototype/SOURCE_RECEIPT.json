@@ -1,0 +1,51 @@
+{
+  "schema": "qfn-scale-alias-converter-source-v2",
+  "created_utc": "2026-10-25T16:12:55.796877+00:00",
+  "source_only": true,
+  "author_compiler_import_converter_numerics_or_device_execution": false,
+  "source_paths": {
+    "CMakeLists.txt": "b2da633942f22028a68a8924f5ab82b7746b8622453d79af226488b7b7cd3d48",
+    "CORE_SOURCE_PINS.json": "149148daf5656cbd54bdf3542ea250c591f321886e0e45e358fed597abf7a6b8",
+    "README.txt": "1f504f3e59178128afde017c780618ce26929b3902bf1fc9b222a4e42390cc23",
+    "alias_arch.cpp": "09ceab563d91288eb6555016d2c8b51190a74d1adc69fdda7a77b095e01190f1",
+    "checker.cpp": "3b1395bd5f0ef6e13063084c342c2fb7960389e6a8230b8e8ef0eee411088b30"
+  },
+  "Core_source": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/radiance-src",
+  "Core_pins_count": 316,
+  "Core_pins_sha256": "149148daf5656cbd54bdf3542ea250c591f321886e0e45e358fed597abf7a6b8",
+  "required_correction_report": {
+    "path": "QFN_SCALE_RECIPE_BYPASS_CORRECTION.txt",
+    "sha256": "5b10270ae19318d3f62590516795689f1360fd4b4c6aebf5c21e783b6fb4b766"
+  },
+  "actual_converter_subprocesses_authored": 6,
+  "preflight_refusals_authored": 7,
+  "groups_authored": 5,
+  "model_or_gpu_execution": false,
+  "scope": "synthetic finite FP8 codes/global BF16 scale alias import with official-style FP8 selector; real unchanged rad-convert/libquant; no production QFN inference",
+  "previous_frozen_source": {
+    "path": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/qfn8bit-scale-alias-converter-prototype",
+    "receipt_sha256": "664aac9d90a8886554d78f2938954cbb29ea77b4e606f47efc020c0d96f73777"
+  },
+  "nonconverter_timeout_children_authored": 1,
+  "official_style_quantization_config": {
+    "quant_method": "fp8",
+    "activation_scheme": "dynamic",
+    "weight_block_size": [
+      128,
+      128
+    ]
+  },
+  "positive_converter_override": [
+    "--set",
+    "quantization_config.quant_method="
+  ],
+  "official_selector_without_override_expected": "nonzero with exact no architecture plugin claims diagnostic",
+  "numerical_execution_pending": true,
+  "selector_source_pins": {
+    "tools/rad_convert.cpp": "9eaa52f8ad2c840baf20b96792fb7e97d1ecabe3e172cde0858618186c85db8c",
+    "core/format/checkpoint.cpp": "a9f1ff3e938e0ff9ef1d80d8dac9dc159f7e541ca59b39e4ba1e39d7a78450aa",
+    "core/format/checkpoint.h": "708ca4a2ed27c218452fe67f1f6a45e010eccab16a70d9a19fa3094392d4410a",
+    "core/build/startup.cpp": "9ee1a78a2defd38375c5d67b8653ba54447f3c2b1020bed15d53bde75f9fcfbd",
+    "arch/qwen4exp_fp8/qwen4exp_fp8.cpp": "0e63d8f02ac85dde132ca753117d47389dcac423977e864287ac712517ca2908"
+  }
+}

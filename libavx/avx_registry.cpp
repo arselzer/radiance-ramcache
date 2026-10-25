@@ -406,6 +406,12 @@ static const RadParamSpec pMoeGemmGgml[] = { P_INT("M"), P_INT("N"), P_INT("K"),
     P_INT("top_k"), P_STR("a_order"), P_STR("type"), P_STR("dtype") };
 static const RadOperandSpec oMoeGemmGgml[] = { OPD("a"), WTAB("w"), OPD("sorted_tok"),
                                                OPD("expert_offset"), OUT("y") };
+static const RadParamSpec pLogitsGgml[] = { P_INT("M"), P_INT("n_vocab"), P_INT("n_embd"),
+    P_STR("type"), P_STR("dtype") };
+static const RadOperandSpec oLogitsGgml[] = { OPD("x"), WGT("lm_head"), OUT("logits") };
+static const RadParamSpec pEmbedGgml[] = { P_INT("M"), P_INT("n_embd"), P_INT("n_vocab"),
+    P_STR("type"), P_STR("dtype"), P_INTO("vocab_offset"), P_F64O("mult") };
+static const RadOperandSpec oEmbedGgml[] = { OPD("tokens"), WGT("wte"), OUT("x") };
 
 /* QSA's compressed key, libr4d's schema (libr4d/r4d_rows.cpp): `block_size` is `ratio` under the
  * name the block-key store's KV group uses; `page` and `pos` are optional. */
@@ -1135,6 +1141,10 @@ static const RadOpSchema kSchemas[] = {
   "y = a . w^T with w llama.cpp's own blocks of GGUF type `type`, or the float [N, K] form." },
 { "moe_gemm_ggml", ARR(pMoeGemmGgml), ARR(oMoeGemmGgml),
   "moe_gemm with each expert's weight in llama.cpp's blocks of GGUF type `type`." },
+{ "logits_gemm_ggml", ARR(pLogitsGgml), ARR(oLogitsGgml),
+  "logits_gemm with lm_head in llama.cpp's blocks of GGUF type `type`." },
+{ "embed_lookup_ggml", ARR(pEmbedGgml), ARR(oEmbedGgml),
+  "embed_lookup from a table in llama.cpp's blocks of GGUF type `type`." },
 { "qsa_block_key", ARR(pQsaBlockKey), ARR(oQsaBlockKey),
   "QSA's compressed key: the mean of a block's `ratio` rows rounded to k's dtype, RMS-normed with "
   "gain (wadd + w), rotated at the block's position with `rope`'s ladder and YaRN; libref's "
@@ -1538,8 +1548,11 @@ static int64_t ggml_pint(const RadParam* p, int n_p, const char* key) {
     if (q->kind == RAD_P_RANGE) return (int64_t)q->ihi;
     return q->kind == RAD_P_INT ? (int64_t)q->ival : 0;
 }
-/* The values a weight row holds: `K`. */
-static int64_t ggml_row_len(const RadParam* p, int n_p) { return ggml_pint(p, n_p, "K"); }
+/* The values a weight row holds: `K` for the GEMMs, `n_embd` for the vocabulary ops. */
+static int64_t ggml_row_len(const RadParam* p, int n_p) {
+    const int64_t K = ggml_pint(p, n_p, "K");
+    return K > 0 ? K : ggml_pint(p, n_p, "n_embd");
+}
 static int ggml_check(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
                       const int* sel, int n_planes, const lq::ggml::PlaneKind** out) {
     const RadParam* t = rad_param_find(p, n_p, "type");
@@ -1858,6 +1871,10 @@ ROW_GGML("avx_gemm_nt_ggml", "gemm_nt_ggml", "gemm", "llama.cpp native-block lin
          L(gemm_nt_ggml)),
 ROW_GGML("avx_moe_gemm_ggml", "moe_gemm_ggml", "moe", "grouped GEMM over llama.cpp native-block experts",
          DT_FLOAT, L(moe_gemm_ggml)),
+ROW_GGML("avx_logits_gemm_ggml", "logits_gemm_ggml", "vocab", "lm_head over llama.cpp native blocks",
+         DT_FLOAT, L(logits_gemm_ggml)),
+ROW_GGML("avx_embed_lookup_ggml", "embed_lookup_ggml", "vocab",
+         "embedding gather from llama.cpp native blocks", DT_FLOAT, L(embed_lookup_ggml)),
 #endif  /* AVX_HAVE_GGML: the native-block rows */
 SIMPLE("avx_qsa_block_key", "qsa_block_key", "attn",
        "QSA compressed key: pooled, normed and rotated at the block's position", DT_FLOAT,

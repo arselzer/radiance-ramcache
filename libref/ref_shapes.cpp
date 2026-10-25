@@ -2039,6 +2039,37 @@ int ref_moe_gemm_ggml_shape(const RadParam* p, int n_p, int operand, RadOpdDesc*
     o.t(D, { M * k, N });                            /* y -- in sorted order */
     return o.finish("moe_gemm_ggml", operand, out);
 }
+
+/* logits_gemm's and embed_lookup's operands with the table in gemm_nt_ggml's logical form. */
+static int64_t ggml_blk_of(const RadParam* p, int n_p) {
+    const RadParam* t = rad_param_find(p, n_p, "type");
+    return ref_ggml_block(t && t->kind == RAD_P_STR ? t->sval : nullptr);
+}
+int ref_logits_gemm_ggml_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t blk = ggml_blk_of(p, n_p);
+    const int64_t M  = gi(p, n_p, "M", 0);
+    const int64_t nv = gi(p, n_p, "n_vocab", 0), ne = gi(p, n_p, "n_embd", 0);
+    if (blk <= 0 || M <= 0 || nv <= 0 || ne <= 0 || ne % blk) return RAD_E_UNSUPPORTED;
+    const uint32_t D = act_dt(p, n_p);
+    Opd o;
+    o.t(D, { M, ne });                               /* x */
+    o.t((uint32_t)RAD_F32, { nv, ne });              /* lm_head, the logical form */
+    o.t((uint32_t)RAD_F32, { M, nv });               /* logits */
+    return o.finish("logits_gemm_ggml", operand, out);
+}
+int ref_embed_lookup_ggml_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t blk = ggml_blk_of(p, n_p);
+    const int64_t M  = gi(p, n_p, "M", 0);
+    const int64_t ne = gi(p, n_p, "n_embd", 0), nv = gi(p, n_p, "n_vocab", 0);
+    const int64_t vo = gi(p, n_p, "vocab_offset", 0);
+    if (blk <= 0 || M <= 0 || ne <= 0 || nv <= 0 || vo < 0 || ne % blk) return RAD_E_UNSUPPORTED;
+    const uint32_t D = act_dt(p, n_p);
+    Opd o;
+    o.t_idx({ M }, vo + nv, -1, 0);                  /* tokens */
+    o.t((uint32_t)RAD_F32, { nv, ne });              /* wte, the logical form */
+    o.t(D, { M, ne });                               /* x */
+    return o.finish("embed_lookup_ggml", operand, out);
+}
 #endif
 
 /* The weight scale grid `dtype` names, as weight rows and K elements per scale. Block-fp8 experts

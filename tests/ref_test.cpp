@@ -855,6 +855,60 @@ TEST(moe_gemm_ggml_routes_rows_to_native_block_experts) {
     }
 }
 
+/* The vocabulary ops over native blocks, in the engine's form (relayouted bytes at the declared
+ * shape): logits_gemm_ggml equals gemm_nt_ggml over the same head bit for bit (f32 logits), and
+ * embed_lookup_ggml writes each id's dequantised row times `mult`, zeros for padding and for ids
+ * outside a vocab-parallel slice, and refuses an id past a whole vocabulary. */
+TEST(vocab_ggml_ops_read_native_blocks) {
+    const uint32_t type = 14;                                  /* q6_K */
+    const lq::ggml::PlaneKind* k = lq::ggml::plane_kind(type);
+    REQUIRE(k != nullptr);
+    uint64_t seed = 0x51AB7E5u;
+    auto rnd = [&]() { seed = seed * 6364136223846793005ull + 1442695040888963407ull; return seed >> 33; };
+    const int64_t V = 6, E = k->block, M = 4, rb = (int64_t)k->block_bytes;
+    std::vector<uint8_t> blocks((size_t)(V * rb));
+    for (uint8_t& b : blocks) b = (uint8_t)rnd();
+    for (int64_t r = 0; r < V; ++r) {
+        const uint16_t h = (uint16_t)((rnd() & 0x8000u) | ((8u + rnd() % 8u) << 10) | (rnd() & 0x3FFu));
+        std::memcpy(blocks.data() + r * rb + offsetof(lq::ggml::block_q6_K, d), &h, 2);
+    }
+    std::vector<float> deq((size_t)(V * E));
+    for (int64_t r = 0; r < V; ++r) lq::ggml::dequant_of(type)(blocks.data() + r * rb, deq.data() + r * E, E);
+    T w(RAD_U8, {V, rb}); w.raw(blocks); w.t.shape[1] = E; w.t.stride[0] = E;
+    T x(RAD_F32, {M, E});
+    for (int64_t i = 0; i < M * E; ++i) x.set(i, std::cos(0.13f * (float)i));
+    T lg(RAD_F32, {M, V}), y(RAD_F32, {M, V});
+    A a; a.t(x).t(w).t(lg).i("M", M).i("n_vocab", V).i("n_embd", E).s("type", "q6_K").s("dtype", "f32");
+    REQUIRE_EQ(run("logits_gemm_ggml", a), RAD_OK);
+    A g; g.t(x).t(w).t(y).i("M", M).i("N", V).i("K", E).s("type", "q6_K").s("dtype", "f32");
+    REQUIRE_EQ(run("gemm_nt_ggml", g), RAD_OK);
+    for (int64_t i = 0; i < M * V; ++i) CHECK_EQ(lg.at(i), y.at(i));
+    /* the gather: ids 4, -1 (padding), 0, 5 on the whole vocabulary, mult 0.5 */
+    T tok(RAD_I32, {M}); tok.n({4, -1, 0, 5});
+    T e(RAD_F32, {M, E});
+    A b; b.t(tok).t(w).t(e).i("M", M).i("n_embd", E).i("n_vocab", V).s("type", "q6_K").s("dtype", "f32").d("mult", 0.5);
+    REQUIRE_EQ(run("embed_lookup_ggml", b), RAD_OK);
+    const int64_t ids[] = {4, -1, 0, 5};
+    for (int64_t m = 0; m < M; ++m)
+        for (int64_t i = 0; i < E; ++i)
+            CHECK_EQ(e.at(m * E + i), ids[m] < 0 ? 0.0f : deq[(size_t)(ids[m] * E + i)] * 0.5f);
+    /* a slice [3, 6) of a larger vocabulary: id 4 is its row 1, ids 0 and -1 zeros */
+    T e2(RAD_F32, {M, E});
+    A c; c.t(tok).t(w).t(e2).i("M", M).i("n_embd", E).i("n_vocab", 3).i("vocab_offset", 3)
+           .s("type", "q6_K").s("dtype", "f32");
+    REQUIRE_EQ(run("embed_lookup_ggml", c, 0, 2), RAD_OK);
+    for (int64_t i = 0; i < E; ++i) {
+        CHECK_EQ(e2.at(0 * E + i), deq[(size_t)(1 * E + i)]);
+        CHECK_EQ(e2.at(1 * E + i), 0.0f);
+        CHECK_EQ(e2.at(2 * E + i), 0.0f);
+        CHECK_EQ(e2.at(3 * E + i), deq[(size_t)(2 * E + i)]);
+    }
+    /* an id past a whole vocabulary fails */
+    T bad(RAD_I32, {M}); bad.n({0, 1, 6, 2});
+    A d; d.t(bad).t(w).t(e).i("M", M).i("n_embd", E).i("n_vocab", V).s("type", "q6_K").s("dtype", "f32");
+    CHECK(run("embed_lookup_ggml", d) < 0);
+}
+
 TEST(manifold_sinkhorn_first_pass_and_epsilon_are_distinct) {
     T h(RAD_F32, {1, 2}); h.f({1, 3});
     T fn(RAD_F32, {8, 2}), scale(RAD_F32, {3}); scale.f({1, 1, 1});
@@ -1503,7 +1557,7 @@ TEST(op_vocabulary) {
         "rmsnorm", "rmsnorm_p", "rmsnorm_add", "hc_enter", "hc_read", "hc_write", "hc_project",
         "mtp_enter",
         "mhc_pre", "mhc_pre_partial", "mhc_pre_finish", "mhc_post", "mhc_contract",
-        "mhc_mix", "mhc_collapse", "swiglu_clamped", "router_sigmoid_topk", "router_scored_topk", "rope_rows", "quant_roundtrip", "softmax_pool", "attn_sparse_sink", "index_score", "index_candidates", "index_topk", "entry_store", "token_map", "stream_gate_add", "gemm_nt_ggml", "moe_gemm_ggml", "dsa_pool", "dsa_query", "dsa_score", "mla_attn", "mla_project", "gemm_nt_f32",
+        "mhc_mix", "mhc_collapse", "swiglu_clamped", "router_sigmoid_topk", "router_scored_topk", "rope_rows", "quant_roundtrip", "softmax_pool", "attn_sparse_sink", "index_score", "index_candidates", "index_topk", "entry_store", "token_map", "stream_gate_add", "gemm_nt_ggml", "moe_gemm_ggml", "logits_gemm_ggml", "embed_lookup_ggml", "dsa_pool", "dsa_query", "dsa_score", "mla_attn", "mla_project", "gemm_nt_f32",
         "kda_update",
         "layernorm", "add", "mul", "mul_weight", "silu_mul", "gelu_mul", "act_mul", "seg_mean",
         "pool_rows", "relu", "clamp", "conv2d", "conv2d_unfold", "conv1d_dw", "rel_sinusoid",
@@ -9150,6 +9204,8 @@ std::vector<Geo> geometries() {
         G("embed_lookup_q", "M", 3, a.i("M", R).i("n_embd", 8).i("n_vocab", 20)
                                     .s("dtype", "fp8_e4m3")),
         G("logits_gemm", "M", 3, a.i("M", R).i("n_vocab", 20).i("n_embd", 8).s("dtype", "f32")),
+        G("logits_gemm_ggml", "M", 3, a.i("M", R).i("n_vocab", 20).i("n_embd", 64).s("type", "q8_0").s("dtype", "f32")),
+        G("embed_lookup_ggml", "M", 3, a.i("M", R).i("n_embd", 64).i("n_vocab", 20).s("type", "q8_0").s("dtype", "f32")),
         G("sample_penalties", "M", 2, a.i("M", R).i("n_vocab", 64)),
         G("sample_dry", "M", 2, a.i("M", R).i("n_vocab", 64)),
         G("sample_ngram_ban", "M", 2, a.i("M", R).i("n_vocab", 64)),

@@ -4844,6 +4844,29 @@ void ds41_cases(std::vector<Hand>& hs) {
                 hs.push_back(std::move(h));
             }
             {
+                /* The engine's form: the stored bytes at the declared shape [N, K]. */
+                const std::vector<uint8_t> w = blocks(ty, N, K);
+                std::string nm = std::string("native ") + ty.name + " blocks at the declared shape, " + dt;
+                Hand h(nm.c_str(), "logits_gemm_ggml", tol);
+                h.dense(D, { 1, K }, hfill(53))
+                 .bytes(RAD_U8, { N, K }, { K, 1 }, N * rb, w, false)
+                 .dense(RAD_F32, { 1, N }, hfill(54), true)
+                 .pi("M", 1).pi("n_vocab", N).pi("n_embd", K).ps("type", ty.name).ps("dtype", dt);
+                hs.push_back(std::move(h));
+            }
+            {
+                const int64_t V = 11;
+                const std::vector<uint8_t> w = blocks(ty, V, K);
+                std::string nm = std::string("native ") + ty.name + " rows, a padded id, mult, " + dt;
+                Hand h(nm.c_str(), "embed_lookup_ggml", D == RAD_F32 ? 0.0 : 4e-3);
+                h.idx({ 3, 10, -1, 0, 7, 3 })
+                 .raw(RAD_U8, { V, rb }, w.data())
+                 .dense(D, { 6, K }, hfill(55), true)
+                 .pi("M", 6).pi("n_embd", K).pi("n_vocab", V).ps("type", ty.name).ps("dtype", dt)
+                 .pf("mult", 1.75);
+                hs.push_back(std::move(h));
+            }
+            {
                 /* Five tokens, top 2, four experts stacked; one dropped slot, one expert idle. */
                 const int64_t NE = 4, TK = 2, T = M * TK, NN = 24;
                 const std::vector<uint8_t> w = blocks(ty, NE * NN, K);

@@ -1198,6 +1198,10 @@ std::vector<Case> build_cases() {
         for (const char* ty : { "q8_0", "q6_K", "iq4_nl" }) {
             const int K = std::strcmp(ty, "q6_K") ? 96 : 256;
             add("gemm_nt_ggml", { HI("M", 4), HI("N", 33), HI("K", K), HS("type", ty), HS("dtype", dt) });
+            add("logits_gemm_ggml", { HI("M", 3), HI("n_vocab", 40), HI("n_embd", K), HS("type", ty),
+                                      HS("dtype", dt) });
+            add("embed_lookup_ggml", { HI("M", 7), HI("n_embd", K), HI("n_vocab", 20), HS("type", ty),
+                                       HS("dtype", dt) });
         }
         for (const char* order : { "token", "sorted" })
             add("moe_gemm_ggml", { HI("M", 5), HI("N", 16), HI("K", 64), HI("n_expert", 4),

@@ -1,5 +1,5 @@
-/* avx_ggml.cpp -- gemm_nt_ggml and moe_gemm_ggml over llama.cpp's own blocks
- * (libref/ref_ggml.cpp), at this level.
+/* avx_ggml.cpp -- gemm_nt_ggml, moe_gemm_ggml, logits_gemm_ggml and embed_lookup_ggml over
+ * llama.cpp's own blocks (libref/ref_ggml.cpp), at this level.
  *
  * The weight reaches the kernel as the native blocks this library's layout hook packed from the
  * type's planes (avx_registry.cpp, the same bytes as libref's hook), [N, K / block * block_bytes]
@@ -84,7 +84,7 @@ void product(const Mat& ma, const Mat& mb, const RadTensor& w, const GgmlDec* de
     }
 }
 
-/* gemm_nt_ggml with N and K under the names the caller gives. */
+/* gemm_nt_ggml with N and K under their own names (logits_gemm_ggml's n_vocab and n_embd). */
 int gemm_ggml_impl(const RadArgs* a, const char* nN, const char* nK) {
     if (!rad_args_have(a, 3)) return RAD_E_INVAL;
     const RadTensor &x = a->t[0], &w = a->t[1], &y = a->t[2];
@@ -109,6 +109,49 @@ int gemm_ggml_impl(const RadArgs* a, const char* nN, const char* nK) {
 }  // namespace
 
 AVX_KERNEL(gemm_nt_ggml) { return gemm_ggml_impl(a, "N", "K"); }
+
+/* logits_gemm over a head in llama.cpp's blocks: gemm_nt_ggml with N and K spelled n_vocab and
+ * n_embd, the logits f32. */
+AVX_KERNEL(logits_gemm_ggml) { return gemm_ggml_impl(a, "n_vocab", "n_embd"); }
+
+/* embed_lookup from a table in llama.cpp's blocks (libref's embed_lookup_ggml): the id's row
+ * dequantised, times `mult`, rounded once; a padded id or one outside the rank's slice is a zero
+ * row, and on a rank holding the whole vocabulary an id at or past n_vocab refuses the call. */
+AVX_KERNEL(embed_lookup_ggml) {
+    if (!rad_args_have(a, 3)) return RAD_E_INVAL;
+    const RadTensor &tok = a->t[0], &w = a->t[1], &x = a->t[2];
+    const lq::ggml::PlaneKind* k = kind_of(a);
+    const int64_t E = p_int(a, "n_embd", 0), V = p_int(a, "n_vocab", 0);
+    const int64_t voff = p_int(a, "vocab_offset", 0);
+    const float mult = p_f32(a, "mult", 1.0f);
+    if (!k || E <= 0 || V <= 0 || voff < 0 || E % k->block || w.rank != 2 || w.shape[0] < V)
+        return RAD_E_SHAPE;
+    const int64_t rb = E / k->block * (int64_t)k->block_bytes;
+    const bool native = w.dtype == RAD_U8;
+    if (native ? (w.shape[1] != rb && w.shape[1] != E) : w.shape[1] != E) return RAD_E_SHAPE;
+    const int64_t M = numel(&x) / E;
+    if (M <= 0 || numel(&tok) < M) return RAD_E_SHAPE;
+    if (voff == 0 && a->world_size <= 1)
+        for (int64_t m = 0; m < M; ++m)
+            if (ldi(&tok, offlin(&tok, m)) >= V) return RAD_E_INVAL;
+    const GgmlDec dec = make_dec(k, w.data, E);
+    const vf vm = vf_set1(mult);
+    AVX_PARALLEL_FOR_IF(M * E >= AVX_PAR_MIN)
+    for (int64_t m = 0; m < M; ++m) {
+        float* row = scratch_f32((size_t)E);
+        const int64_t id = ldi(&tok, offlin(&tok, m)) - voff;
+        if (id < 0 || id >= V) {
+            std::memset(row, 0, (size_t)E * sizeof(float));
+        } else {
+            weight_row(w, native ? &dec : nullptr, id, E, row);
+            int64_t i = 0;
+            for (; i + VF_N <= E; i += VF_N) vf_storeu(row + i, vf_mul(vf_loadu(row + i), vm));
+            for (; i < E; ++i) row[i] = row[i] * mult;
+        }
+        out_row(&x, rowoff(&x, m, E), E, row);
+    }
+    return RAD_OK;
+}
 
 namespace {
 
@@ -233,6 +276,8 @@ AVX_KERNEL(moe_gemm_ggml) {
 #else  /* !AVX_HAVE_GGML: the ops have no row (avx_registry.cpp), so these never run. */
 
 AVX_KERNEL(gemm_nt_ggml)      { (void)a; return RAD_E_UNSUPPORTED; }
+AVX_KERNEL(logits_gemm_ggml)  { (void)a; return RAD_E_UNSUPPORTED; }
+AVX_KERNEL(embed_lookup_ggml) { (void)a; return RAD_E_UNSUPPORTED; }
 AVX_KERNEL(moe_gemm_ggml)     { (void)a; return RAD_E_UNSUPPORTED; }
 
 #endif /* AVX_HAVE_GGML */

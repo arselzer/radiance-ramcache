@@ -1,5 +1,6 @@
-/* ref_ggml.cpp -- gemm_nt_ggml and moe_gemm_ggml: linears and grouped expert GEMMs over
- * llama.cpp's own blocks, read at native density.
+/* ref_ggml.cpp -- gemm_nt_ggml, moe_gemm_ggml, logits_gemm_ggml and embed_lookup_ggml: linears,
+ * grouped expert GEMMs, the head and the embedding over llama.cpp's own blocks, read at native
+ * density.
  *
  * The weight is stored in the container as the affine planes of its GGUF type
  * (libquant/lq_ggml_planes: every block field in a plane, exactly). This row's layout hook asks for
@@ -76,6 +77,12 @@ uint8_t* plane_row(const RadEncoding* enc, const RadTensor* planes, int i, int64
 
 int64_t logical_rows(const RadTensor* planes) { return planes[0].rank >= 1 ? planes[0].shape[0] : 0; }
 
+/* The values a weight row holds: `K` for the GEMMs, `n_embd` for the vocabulary ops. */
+int64_t row_len(const RadParam* p, int n_p) {
+    const int64_t K = pint(p, n_p, "K");
+    return K > 0 ? K : pint(p, n_p, "n_embd");
+}
+
 }  // namespace
 
 extern "C" int ref_ggml_layout(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
@@ -84,7 +91,7 @@ extern "C" int ref_ggml_layout(const RadParam* p, int n_p, int operand, const Ra
     const lq::ggml::PlaneKind* k = nullptr;
     const int rc = ggml_check(p, n_p, operand, enc, sel, n_planes, &k);
     if (rc < 0) return rc;
-    const int64_t K = pint(p, n_p, "K"), rows = logical_rows(planes);
+    const int64_t K = row_len(p, n_p), rows = logical_rows(planes);
     if (K <= 0 || K % k->block || rows <= 0) return RAD_E_SHAPE;
     static thread_local char tag[32];
     snprintf(tag, sizeof tag, "ggml_%s", k->name);
@@ -106,7 +113,7 @@ extern "C" int ref_ggml_relayout(const RadParam* p, int n_p, int operand, const 
     const lq::ggml::PlaneKind* k = nullptr;
     const int rc = ggml_check(p, n_p, operand, enc, sel, n_planes, &k);
     if (rc < 0) return rc;
-    const int64_t K = pint(p, n_p, "K"), rows = logical_rows(planes);
+    const int64_t K = row_len(p, n_p), rows = logical_rows(planes);
     const int64_t nb = K / k->block, rb = nb * (int64_t)k->block_bytes;
     if (K <= 0 || K % k->block || rows <= 0 || dst_bytes < rows * rb) return RAD_E_SHAPE;
     const lq::ggml::PackFn pack = lq::ggml::pack_of(k->type);
@@ -125,7 +132,7 @@ extern "C" int ref_ggml_unrelayout(const RadParam* p, int n_p, int operand, cons
     const lq::ggml::PlaneKind* k = nullptr;
     const int rc = ggml_check(p, n_p, operand, enc, sel, n_planes, &k);
     if (rc < 0) return rc;
-    const int64_t K = pint(p, n_p, "K"), rows = logical_rows(planes);
+    const int64_t K = row_len(p, n_p), rows = logical_rows(planes);
     const int64_t nb = K / k->block, rb = nb * (int64_t)k->block_bytes;
     if (K <= 0 || K % k->block || rows <= 0 || src_bytes < rows * rb) return RAD_E_SHAPE;
     std::vector<uint8_t*> row((size_t)n_planes);
@@ -147,12 +154,12 @@ extern "C" int ref_ggml_unrelayout(const RadParam* p, int n_p, int operand, cons
  * [N, K] (core/runtime/ctx.cpp: a re-laying kernel derives its own stride), so the row stride is
  * computed here, never read from the operand; [N, row bytes] (a tool holding the stored bytes) is
  * read the same way. */
-int ref_gemm_nt_ggml(const RadArgs* a, RadStream) {
+static int gemm_ggml_impl(const RadArgs* a, const char* nN, const char* nK) {
     if (!have(a, 3)) return RAD_E_INVAL;
     const RadTensor &x = a->t[0], &w = a->t[1], &y = a->t[2];
     const lq::ggml::PlaneKind* k = kind_of(a->p, a->n_p);
     const int64_t M = band_rows(x.rank >= 1 ? x.shape[0] : 0, p_int(a, "M", 0));
-    const int64_t N = p_int(a, "N", 0), K = p_int(a, "K", 0);
+    const int64_t N = p_int(a, nN, 0), K = p_int(a, nK, 0);
     if (!k || M <= 0 || N <= 0 || K <= 0 || K % k->block || x.rank != 2 || x.shape[1] != K ||
         y.rank != 2 || y.shape[1] != N || y.shape[0] < M || w.rank != 2 || w.shape[0] != N)
         return RAD_E_SHAPE;
@@ -175,6 +182,58 @@ int ref_gemm_nt_ggml(const RadArgs* a, RadStream) {
                 for (int64_t i = 0; i < K; ++i) acc += ldt(&x, xb + i * xs) * wr[(size_t)i];
                 stt(&y, rowoff(&y, m, N) + n * laststride(&y), acc);
             }
+        }
+    }
+    return RAD_OK;
+}
+
+int ref_gemm_nt_ggml(const RadArgs* a, RadStream s) { (void)s; return gemm_ggml_impl(a, "N", "K"); }
+
+/* logits_gemm over a head in llama.cpp's blocks: gemm_nt_ggml's arithmetic with N and K spelled
+ * n_vocab and n_embd, the logits f32 (the head is its own access class, so its own op). */
+int ref_logits_gemm_ggml(const RadArgs* a, RadStream s) {
+    (void)s;
+    return gemm_ggml_impl(a, "n_vocab", "n_embd");
+}
+
+/* embed_lookup from a table in llama.cpp's blocks: the token's row dequantised as llama.cpp does,
+ * times `mult` when given, rounded once. Ids, padding and a vocab-parallel slice behave as
+ * embed_lookup's: a negative id or one outside [vocab_offset, vocab_offset + n_vocab) writes a
+ * zero row, and on a rank holding the whole vocabulary an id at or above n_vocab fails. */
+int ref_embed_lookup_ggml(const RadArgs* a, RadStream) {
+    if (!have(a, 3)) return RAD_E_INVAL;
+    const RadTensor &tok = a->t[0], &w = a->t[1], &x = a->t[2];
+    const lq::ggml::PlaneKind* k = kind_of(a->p, a->n_p);
+    const int64_t E = p_int(a, "n_embd", 0), V = p_int(a, "n_vocab", 0);
+    const int64_t voff = p_int(a, "vocab_offset", 0);
+    const float mult = p_f32(a, "mult", 1.0f);
+    if (!k || E <= 0 || V <= 0 || voff < 0 || E % k->block || w.rank != 2 || w.shape[0] < V)
+        return RAD_E_SHAPE;
+    const int64_t rb = E / k->block * (int64_t)k->block_bytes;
+    const bool native = w.dtype == RAD_U8;
+    if (native ? (w.shape[1] != rb && w.shape[1] != E) : w.shape[1] != E) return RAD_E_SHAPE;
+    const int64_t M = numel(&x) / E;
+    if (M <= 0 || numel(&tok) < M) return RAD_E_SHAPE;
+    if (voff == 0 && a->world_size <= 1)
+        for (int64_t m = 0; m < M; ++m)
+            if (ld_int(tok.dtype, tok.data, offlin(&tok, m)) >= V) return RAD_E_INVAL;
+    const lq::ggml::DequantFn dq = lq::ggml::dequant_of(k->type);
+#pragma omp parallel
+    {
+        std::vector<float> wr((size_t)E);
+#pragma omp for schedule(static)
+        for (int64_t m = 0; m < M; ++m) {
+            const int64_t id = ld_int(tok.dtype, tok.data, offlin(&tok, m)) - voff;
+            const int64_t xb = rowoff(&x, m, E), xs = laststride(&x);
+            if (id < 0 || id >= V) {
+                for (int64_t i = 0; i < E; ++i) stt(&x, xb + i * xs, 0.0f);
+                continue;
+            }
+            if (native)
+                dq((const uint8_t*)w.data + id * rb, wr.data(), E);
+            else
+                for (int64_t i = 0; i < E; ++i) wr[(size_t)i] = ldt(&w, rowoff(&w, id, E) + i * laststride(&w));
+            for (int64_t i = 0; i < E; ++i) stt(&x, xb + i * xs, wr[(size_t)i] * mult);
         }
     }
     return RAD_OK;

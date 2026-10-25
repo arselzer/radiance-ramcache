@@ -471,6 +471,12 @@ static const RadParamSpec pMoeGemmGgml[] = { P_INT("M"), P_INT("N"), P_INT("K"),
     P_INT("top_k"), P_STR("a_order"), P_STR("type"), P_STR("dtype") };
 static const RadOperandSpec oMoeGemmGgml[] = { OPD("a"), WTAB("w"), OPD("sorted_tok"),
                                                OPD("expert_offset"), OUT("y") };
+static const RadParamSpec pLogitsGgml[] = { P_INT("M"), P_INT("n_vocab"), P_INT("n_embd"), P_STR("type"),
+    P_STR("dtype") };
+static const RadOperandSpec oLogitsGgml[] = { OPD("x"), WGT("lm_head"), OUT("logits") };
+static const RadParamSpec pEmbedGgml[] = { P_INT("M"), P_INT("n_embd"), P_INT("n_vocab"), P_STR("type"),
+    P_STR("dtype"), P_INTO("vocab_offset"), P_F64O("mult") };
+static const RadOperandSpec oEmbedGgml[] = { OPD("tokens"), WGT("wte"), OUT("x") };
 static const RadParamSpec pEntryStore[] = { P_INT("M"), P_INT("n"), P_INT("block_size"), P_STR("dtype") };
 static const RadOperandSpec oEntryStore[] = { OPD("x"), OPD("page"), INOUT("cache") };
 static const RadParamSpec pIndexTopk[] = { P_INT("M"), P_INT("width"), P_INT("topk"), P_INT("ratio") };
@@ -1498,6 +1504,13 @@ static const RadOpSchema kSchemas[] = {
   "WEIGHT TABLE of n_expert entries, each read as gemm_nt_ggml reads its weight (native blocks, or "
   "the float [N, K] logical form), so each output row equals gemm_nt_ggml's for its row and "
   "expert." },
+{ "logits_gemm_ggml", ARR(pLogitsGgml), ARR(oLogitsGgml),
+  "logits_gemm with lm_head in llama.cpp's blocks of GGUF type `type`, read as gemm_nt_ggml reads its "
+  "weight: logits[M, n_vocab] (f32) = x[M, n_embd] . lm_head^T." },
+{ "embed_lookup_ggml", ARR(pEmbedGgml), ARR(oEmbedGgml),
+  "embed_lookup from a table in llama.cpp's blocks of GGUF type `type`: the id's row dequantised as "
+  "llama.cpp does, times `mult` when given, rounded once. Padding, bounds and vocab_offset behave as "
+  "embed_lookup's. A float [n_vocab, n_embd] wte is the logical form." },
 { "entry_store", ARR(pEntryStore), ARR(oEntryStore),
   "x[w] (n values) into the whole of block page[w] of a paged cache [blocks, heads, block_size, "
   "slot], heads*block_size*slot == n, rounded once to the cache dtype; a negative page writes "
@@ -2456,6 +2469,8 @@ SIMPLE("ref_stream_gate_add", "stream_gate_add", "norm", "normalized-dot gated w
 #ifdef REF_HAVE_GGML
 ROW_GGML("ref_gemm_nt_ggml", "gemm_nt_ggml", "gemm", "llama.cpp native-block linear", DT_FLOAT, ref_gemm_nt_ggml),
 ROW_GGML("ref_moe_gemm_ggml", "moe_gemm_ggml", "moe", "grouped GEMM over llama.cpp native-block experts", DT_FLOAT, ref_moe_gemm_ggml),
+ROW_GGML("ref_logits_gemm_ggml", "logits_gemm_ggml", "vocab", "lm_head over llama.cpp native blocks", DT_FLOAT, ref_logits_gemm_ggml),
+ROW_GGML("ref_embed_lookup_ggml", "embed_lookup_ggml", "vocab", "embedding gather from llama.cpp native blocks", DT_FLOAT, ref_embed_lookup_ggml),
 #endif
 SIMPLE("ref_entry_store", "entry_store", "attn", "one entry a block into a paged cache", DT_FLOAT, ref_entry_store),
 SIMPLE("ref_index_score", "index_score", "attn", "indexer relu-gated head scores over a paged index cache", DT_FLOAT, ref_index_score),

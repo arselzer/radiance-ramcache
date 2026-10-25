@@ -5,7 +5,7 @@
     ".gitignore": "5b6b7c23165a945f1c3ffe5c4855c472a807e34a750a14dc3a4655c68a7dbca4",
     "LICENSE": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
     "README.md": "adf7f17a49e8409109599eb54a94f6fa5deddda8a0335f5c67b582e0dc236f78",
-    "STATUS.md": "c137690e3b094032b03200c3dc1e9cf1681dd75439d137e57f15a3cb10268998",
+    "STATUS.md": "75ebdcfef94c23ffe9ebfbca65cb25d3bc873426538577680539654dc19af631",
     "docs/GLM53_ACTUAL_ENGINE_TRANSPORT_V2_LIFETIME_REVIEW.txt": "d974145a84e9cfc26d76fee8fe052f90003adec0e841b3840b20daa124b269fd",
     "docs/GLM53_ENGINE_NATIVE_PATCH_B_SOURCE_AUDIT_V1.txt": "cfb8e770e8cc9771aeb03a89dec06a206c5744d318ff16de10d4f0a55daac219",
     "docs/GLM53_FOUNDATION_BACKEND_LOADER_INDEPENDENT_REVIEW.txt": "df383853dfe69b2eb48220226f83bae3eadc698adfe43b1d726db69259d46e6e",
@@ -24,6 +24,7 @@
     "docs/QFN_OFFICIAL_FP8_GLOBAL_PLE_IMPORT_REVIEW.txt": "73c94550a6d5255c88cbafed7c6f4a85a688d063e5b68169ceaefebde167e6b2",
     "docs/QFN_SCALE_ALIAS_CONVERTER_INDEPENDENT_REVIEW.txt": "db7e27b36bf8755f206f86e4fcad3ece5af3fbc670747e0eab103540509727d0",
     "docs/QFN_SCALE_RECIPE_BYPASS_CORRECTION.txt": "5b10270ae19318d3f62590516795689f1360fd4b4c6aebf5c21e783b6fb4b766",
+    "docs/QFN_SINGLE_SOURCE_FP8_CONVERSION_ALTERNATIVE.txt": "f54c70bab6d8acebcfb69a3ede1412f7a509ecc0f011eb5dd0c625da0f19a416",
     "docs/provenance/GLM53_CHECKPOINT_DOWNLOAD_STATUS.json": "391d72138be12300ab5f646aaed9bd2b2a871b2697f7a705d8d667c73f0b0b6a",
     "docs/provenance/GLM53_FOUNDATION_PHASE3_PROOF_INDEX.json": "9993e6cbf2361a8d29e40d9d581598a92cbd22a6494cceaa6643c5eb5e16f57e",
     "docs/provenance/QFN8BIT_VALIDATED_PREFLIGHT_INDEX_20261025.json": "e47705c41d5ae727f6be6ff09627bc87d40097173fb584af8a245a6c783409bc",
@@ -2137,7 +2138,9 @@
     "research/qfn-fp8-conversion/hybrid-recipe-proposal.json": "7761c0e8418bd20609efb3f5e211c5044cff46d05e2307829978cdb631b2ae51",
     "research/qfn-fp8-conversion/qwen4exp-fp8-experts-i8-hc8m.recipe": "9183b5e9c2b3a1d92de0933ce393ba9318522abf9b56f82e92f4c86704697d76",
     "research/qfn-fp8-conversion/qwen4exp-official-fp8-experts-retained-trunk-hybrid.recipe": "74dc94573c6862954db76c0333ef900a514b4956c5efc709176b7758965a0bbd",
+    "research/qfn-fp8-conversion/qwen4exp-official-fp8-experts-single-source.recipe": "8511c79283fa0c0eee82a9f7c21b17efe9fb01fe80eca17022974fb78c3bcd51",
     "research/qfn-fp8-conversion/recipe-proposal.json": "457cd02e791a11c1714caee10949835e38639b899a65d509253630b1d47b6a86",
+    "research/qfn-fp8-conversion/single-source-recipe-proposal.json": "14fe881900160069f8ea804aa1050d167899e6feb24eaa4a0ce47de179bba9f8",
     "research/qfn8bit-full-graph-plan-v3-prototype/CMakeLists.txt": "20dd0ce9a933241e616ebfb0f19b25366f6957c6d4ef5c185a67d20682f63abd",
     "research/qfn8bit-full-graph-plan-v3-prototype/CORE_SOURCE_PINS.json": "0e9581ff0e2cbc4a8ac8fce89bbc2111fe313921bdcda0fc3f3de69d6e74b022",
     "research/qfn8bit-full-graph-plan-v3-prototype/PARENT_SOURCE_RECEIPT.json": "f9dd5797dcd0989dc97375401289ded547ffdc39b28235b0559ac03df1162007",
@@ -2168,5 +2171,5 @@
     "tools/build_host.py": "966219abd9ea38be4bd1a8246454947e5507da7cbec09a2376458d79d24fb568",
     "tools/verify_snapshot.py": "97bf80261ae522bf8b73db7c06d81aef10e628ca88540e0e134b60f1836760a7"
   },
-  "updated_utc": "2026-10-25T16:37:35.197167+00:00"
+  "updated_utc": "2026-10-25T17:04:15.290956+00:00"
 }

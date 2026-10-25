@@ -756,6 +756,85 @@ TEST(gemm_nt_ggml_reads_native_blocks_as_llama_cpp_dequantises) {
     }
 }
 
+/* moe_gemm_ggml over native blocks of every type it reads: real routing from moe_scatter (one slot
+ * then dropped), both activation orders, and the float logical form. Each live row must equal the
+ * f32 index-order dot of its activation row with its expert's dequantised weight row, bit for bit;
+ * a dropped row is zeros. */
+TEST(moe_gemm_ggml_routes_rows_to_native_block_experts) {
+    struct Ty { const char* name; uint32_t type; std::vector<size_t> f16_at; };
+    const Ty types[] = {
+        { "q8_0",    8,  { offsetof(lq::ggml::block_q8_0, d) } },
+        { "q6_K",    14, { offsetof(lq::ggml::block_q6_K, d) } },
+        { "iq2_xxs", 16, { offsetof(lq::ggml::block_iq2_xxs, d) } },
+        { "iq1_s",   19, { offsetof(lq::ggml::block_iq1_s, d) } },
+    };
+    uint64_t seed = 0x9E3779B97F4A7C15ull;
+    auto rnd = [&]() { seed = seed * 6364136223846793005ull + 1442695040888963407ull; return seed >> 33; };
+    const int64_t M = 3, TK = 2, NE = 3, NR = M * TK;
+    /* token 0 -> experts 2, 0; token 1 -> 0, 1; token 2 -> 2, 1 */
+    T ids(RAD_I32, {M, TK}); ids.n({2, 0, 0, 1, 2, 1});
+    T sorted(RAD_I32, {NR}), off(RAD_I32, {NE + 1}), cnt(RAD_I32, {NE});
+    A sc; sc.t(ids).t(sorted).t(off).t(cnt).i("M", M).i("n_expert", NE).i("top_k", TK);
+    REQUIRE_EQ(run("moe_scatter", sc), RAD_OK);
+    const int64_t dropped = 3;                       /* a sorted position whose slot is dropped */
+    st_int(sorted.t.dtype, sorted.t.data, dropped, -1);
+    for (const Ty& ty : types) {
+        const lq::ggml::PlaneKind* k = lq::ggml::plane_kind(ty.type);
+        REQUIRE(k != nullptr);
+        const int64_t N = 4, K = 2 * k->block, nb = K / k->block;
+        const int64_t rb = nb * (int64_t)k->block_bytes;
+        std::vector<uint8_t> blocks((size_t)(NE * N * rb));
+        for (uint8_t& b : blocks) b = (uint8_t)rnd();
+        for (int64_t i = 0; i < NE * N * nb; ++i)
+            for (size_t o : ty.f16_at) {
+                const uint16_t h = (uint16_t)((rnd() & 0x8000u) | ((8u + rnd() % 8u) << 10) | (rnd() & 0x3FFu));
+                std::memcpy(blocks.data() + i * (int64_t)k->block_bytes + o, &h, 2);
+            }
+        T w(RAD_U8, {NE, N, rb}); w.raw(blocks);
+        std::vector<float> deq((size_t)(NE * N * K));
+        for (int64_t r = 0; r < NE * N; ++r)
+            lq::ggml::dequant_of(ty.type)(blocks.data() + r * rb, deq.data() + r * K, K);
+        T wl(RAD_F32, {NE, N, K});
+        for (int64_t i = 0; i < NE * N * K; ++i) wl.set(i, deq[(size_t)i]);
+        for (const char* order : { "token", "sorted" }) {
+            const bool srt = !std::strcmp(order, "sorted");
+            const int64_t AR = srt ? NR : M;
+            T x(RAD_F32, {AR, K});
+            for (int64_t i = 0; i < AR * K; ++i) x.set(i, std::sin(0.29f * (float)i + 0.3f));
+            T y(RAD_F32, {NR, N}), yl(RAD_F32, {NR, N});
+            for (int64_t i = 0; i < NR * N; ++i) { y.set(i, 7.0f); yl.set(i, 7.0f); }  /* stale bytes */
+            A a; a.t(x).t(w).t(sorted).t(off).t(y).i("M", M).i("N", N).i("K", K).i("n_expert", NE)
+                 .i("top_k", TK).s("a_order", order).s("type", ty.name).s("dtype", "f32");
+            REQUIRE_EQ(run("moe_gemm_ggml", a), RAD_OK);
+            A b; b.t(x).t(wl).t(sorted).t(off).t(yl).i("M", M).i("N", N).i("K", K).i("n_expert", NE)
+                 .i("top_k", TK).s("a_order", order).s("type", ty.name).s("dtype", "f32");
+            REQUIRE_EQ(run("moe_gemm_ggml", b), RAD_OK);
+            for (int64_t i = 0; i < NR; ++i) {
+                const int64_t flat = sorted.iat(i);
+                int64_t e = 0;
+                while (e + 1 < NE && off.iat(e + 1) <= i) ++e;
+                const int64_t row = srt ? i : flat / TK;
+                for (int64_t n = 0; n < N; ++n) {
+                    float want = 0.0f;
+                    if (flat >= 0)
+                        for (int64_t c = 0; c < K; ++c) want += x.at(row * K + c) * deq[(size_t)((e * N + n) * K + c)];
+                    CHECK_EQ(y.at(i * N + n), want);
+                    CHECK_EQ(yl.at(i * N + n), want);
+                }
+            }
+        }
+        /* a K that is not whole blocks, or a table narrower than N, is refused */
+        T x(RAD_F32, {M, K}), y(RAD_F32, {NR, N});
+        A c; c.t(x).t(w).t(sorted).t(off).t(y).i("M", M).i("N", N).i("K", K - 1).i("n_expert", NE)
+             .i("top_k", TK).s("a_order", "token").s("type", ty.name).s("dtype", "f32");
+        CHECK(run("moe_gemm_ggml", c) < 0);
+        T y5(RAD_F32, {NR, N + 1});
+        A d; d.t(x).t(w).t(sorted).t(off).t(y5).i("M", M).i("N", N + 1).i("K", K).i("n_expert", NE)
+             .i("top_k", TK).s("a_order", "token").s("type", ty.name).s("dtype", "f32");
+        CHECK(run("moe_gemm_ggml", d) < 0);
+    }
+}
+
 TEST(manifold_sinkhorn_first_pass_and_epsilon_are_distinct) {
     T h(RAD_F32, {1, 2}); h.f({1, 3});
     T fn(RAD_F32, {8, 2}), scale(RAD_F32, {3}); scale.f({1, 1, 1});
@@ -1404,7 +1483,7 @@ TEST(op_vocabulary) {
         "rmsnorm", "rmsnorm_p", "rmsnorm_add", "hc_enter", "hc_read", "hc_write", "hc_project",
         "mtp_enter",
         "mhc_pre", "mhc_pre_partial", "mhc_pre_finish", "mhc_post", "mhc_contract",
-        "mhc_mix", "mhc_collapse", "swiglu_clamped", "router_sigmoid_topk", "router_scored_topk", "rope_rows", "quant_roundtrip", "softmax_pool", "attn_sparse_sink", "index_score", "index_candidates", "index_topk", "entry_store", "token_map", "stream_gate_add", "gemm_nt_ggml", "dsa_pool", "dsa_query", "dsa_score", "mla_attn", "mla_project", "gemm_nt_f32",
+        "mhc_mix", "mhc_collapse", "swiglu_clamped", "router_sigmoid_topk", "router_scored_topk", "rope_rows", "quant_roundtrip", "softmax_pool", "attn_sparse_sink", "index_score", "index_candidates", "index_topk", "entry_store", "token_map", "stream_gate_add", "gemm_nt_ggml", "moe_gemm_ggml", "dsa_pool", "dsa_query", "dsa_score", "mla_attn", "mla_project", "gemm_nt_f32",
         "kda_update",
         "layernorm", "add", "mul", "mul_weight", "silu_mul", "gelu_mul", "act_mul", "seg_mean",
         "pool_rows", "relu", "clamp", "conv2d", "conv2d_unfold", "conv1d_dw", "rel_sinusoid",
@@ -9014,6 +9093,8 @@ std::vector<Geo> geometries() {
         G("moe_scatter", "M", 3, a.i("M", R).i("n_expert", 6).i("top_k", 2)),
         G("moe_gemm", "M", 3, a.i("M", R).i("N", 16).i("K", 32).i("n_expert", 4).i("top_k", 2)
                               .s("a_order", "token").s("dtype", "f32")),
+        G("moe_gemm_ggml", "M", 3, a.i("M", R).i("N", 16).i("K", 64).i("n_expert", 4).i("top_k", 2)
+                                   .s("a_order", "token").s("type", "q8_0").s("dtype", "f32")),
         G("moe_gemm_q", "M", 3, a.i("M", R).i("N", 16).i("K", 128).i("n_expert", 4).i("top_k", 2)
                                 .i("group", 128).s("a_order", "token").s("dtype", "fp8a8")),
         G("moe_gemm_q_mod4", "M", 3, a.i("M", R).i("N", 16).i("K", 128).i("n_expert", 5)

@@ -170,6 +170,7 @@ int ref_index_topk         (const RadArgs*, RadStream);
 int ref_entry_store        (const RadArgs*, RadStream);
 #ifdef REF_HAVE_GGML
 int ref_gemm_nt_ggml       (const RadArgs*, RadStream);
+int ref_moe_gemm_ggml      (const RadArgs*, RadStream);
 #endif
 int ref_token_map          (const RadArgs*, RadStream);
 int ref_stream_gate_add    (const RadArgs*, RadStream);
@@ -442,6 +443,7 @@ REF_SHAPE_FN(ref_index_topk);
 REF_SHAPE_FN(ref_entry_store);
 #ifdef REF_HAVE_GGML
 REF_SHAPE_FN(ref_gemm_nt_ggml);
+REF_SHAPE_FN(ref_moe_gemm_ggml);
 #endif
 REF_SHAPE_FN(ref_token_map);
 REF_SHAPE_FN(ref_stream_gate_add);

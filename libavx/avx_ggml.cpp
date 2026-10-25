@@ -1,5 +1,5 @@
-/* avx_ggml.cpp -- gemm_nt_ggml over llama.cpp's own blocks (libref/ref_ggml.cpp), at this
- * level.
+/* avx_ggml.cpp -- gemm_nt_ggml and moe_gemm_ggml over llama.cpp's own blocks
+ * (libref/ref_ggml.cpp), at this level.
  *
  * The weight reaches the kernel as the native blocks this library's layout hook packed from the
  * type's planes (avx_registry.cpp, the same bytes as libref's hook), [N, K / block * block_bytes]
@@ -108,8 +108,127 @@ int gemm_ggml_impl(const RadArgs* a, const char* nN, const char* nK) {
 
 AVX_KERNEL(gemm_nt_ggml) { return gemm_ggml_impl(a, "N", "K"); }
 
+namespace {
+
+/* The s with off[s] <= i < off[s+1], as libref's binary search over the expert offsets. */
+int64_t expert_of(const RadTensor& off, int64_t ne, int64_t i) {
+    int64_t lo = 0, hi = ne;
+    while (lo + 1 < hi) {
+        const int64_t mid = (lo + hi) / 2;
+        if (ldi(&off, offlin(&off, mid)) <= i) lo = mid; else hi = mid;
+    }
+    return lo;
+}
+
+/* Expert e of a RAD_OPD_WTAB operand (avx_moe.cpp's reading): an entry of the pointer table, or a
+ * slab of a stacked tensor. */
+RadTensor expert_entry(const RadTensor* w, int64_t e) {
+    RadTensor t{};
+    if (!w || !w->data || w->rank < 2 || e < 0 || e >= w->shape[0]) return t;
+    t.dtype = w->dtype;
+    t.rank = w->rank - 1;
+    for (uint32_t d = 0; d + 1 < w->rank; ++d) {
+        t.shape[d] = w->shape[d + 1];
+        t.stride[d] = w->stride[d + 1];
+    }
+    if (w->stride[0] == 0) {
+        t.data = ((void* const*)w->data)[e];
+    } else {
+        const int64_t bits = rad_dtype_bits(w->dtype);
+        const int64_t nbits = bits * w->stride[0] * e;
+        if (bits <= 0 || (nbits & 7)) return t;
+        t.data = (void*)((const char*)w->data + (nbits >> 3));
+    }
+    return t;
+}
+
+}  // namespace
+
+/* moe_gemm over llama.cpp's blocks (libref's moe_gemm_ggml): y[i] = a[row(i)] . w[e]^T in sorted
+ * order, e the expert whose offset range holds i, row(i) per `a_order`; a dropped slot or a token
+ * past `a` is a row of zeros. Each run of an expert's rows is one job of the tile driver, the
+ * expert's weight read through its own row decoder. */
+AVX_KERNEL(moe_gemm_ggml) {
+    if (!rad_args_have(a, 5)) return RAD_E_INVAL;
+    const RadTensor &A = a->t[0], &W = a->t[1], &sorted = a->t[2], &off = a->t[3], &Y = a->t[4];
+    const lq::ggml::PlaneKind* k = kind_of(a);
+    const int64_t N = p_int(a, "N", 0), K = p_int(a, "K", 0);
+    const int64_t ne = p_int(a, "n_expert", 0), top_k = p_int(a, "top_k", 0);
+    const char* ord = p_str(a, "a_order", "token");
+    const bool sorted_a = ord && !std::strcmp(ord, "sorted");
+    if (ord && !sorted_a && std::strcmp(ord, "token")) return RAD_E_UNSUPPORTED;
+    if (!k || N <= 0 || K <= 0 || K % k->block || ne <= 0 || top_k <= 0 || A.rank != 2 ||
+        A.shape[1] != K || Y.rank != 2 || Y.shape[1] != N || W.rank != 3 || W.shape[0] < ne ||
+        W.shape[1] != N)
+        return RAD_E_SHAPE;
+    const int64_t T = Y.shape[0], AR = A.shape[0];
+    if (T <= 0 || numel(&sorted) < T || numel(&off) < ne + 1) return RAD_E_SHAPE;
+    const int64_t rb = K / k->block * (int64_t)k->block_bytes;
+    const bool native = W.dtype == RAD_U8;
+    if (native ? W.shape[2] != rb : W.shape[2] != K) return RAD_E_SHAPE;
+    /* Each expert's weight: a table entry, or a slab of a stacked tensor. */
+    std::vector<RadTensor> we((size_t)ne);
+    std::vector<GgmlDec> dec((size_t)ne);
+    std::vector<Mat> mw((size_t)ne);
+    for (int64_t e = 0; e < ne; ++e) {
+        we[(size_t)e] = expert_entry(&W, e);
+        if (!we[(size_t)e].data) return RAD_E_STRIDE;
+    }
+    for (int64_t e = 0; e < ne; ++e) {
+        dec[(size_t)e] = make_dec(k, we[(size_t)e].data, K);
+        mw[(size_t)e] = native ? Mat{ &we[(size_t)e], K, 1, &dec[(size_t)e] } : as_mat(&we[(size_t)e], K);
+    }
+    /* Each row's activation row (-1: zeros) and expert. */
+    std::vector<int64_t> atok((size_t)T), aexp((size_t)T);
+    for (int64_t i = 0; i < T; ++i) {
+        const int64_t flat = ldi(&sorted, offlin(&sorted, i));
+        aexp[(size_t)i] = expert_of(off, ne, i);
+        const int64_t tok = flat < 0 ? -1 : (sorted_a ? i : flat / top_k);
+        atok[(size_t)i] = tok >= 0 && tok < AR ? tok : -1;
+    }
+    const Mat ma = as_mat(&A, K);
+    std::vector<TileJob> jobs;
+    for (int64_t i0 = 0; i0 < T;) {
+        int64_t i1 = i0 + 1;
+        while (i1 < T && aexp[(size_t)i1] == aexp[(size_t)i0]) ++i1;
+        TileJob jb{};
+        jb.mb = mw[(size_t)aexp[(size_t)i0]];
+        jb.a0 = i0; jb.M = i1 - i0; jb.N = N; jb.K = K;
+        jb.y0 = i0; jb.yc0 = 0;
+        jobs.push_back(jb);
+        i0 = i1;
+    }
+    const int64_t y_rs = row_stride(&Y, N), y_cs = laststride(&Y);
+    if (!gemm_tile_f32_jobs(ma, atok.data(), T, nullptr, jobs.data(), (int64_t)jobs.size(), &Y, N)) {
+        /* The driver declined: a dot per output, each weight row decoded once per expert run. */
+        float* apack = (float*)scratch_raw((size_t)(T * K) * sizeof(float) + 64);
+        for (int64_t i = 0; i < T; ++i)
+            if (atok[(size_t)i] >= 0) widen_cols(ma, atok[(size_t)i], 0, K, apack + i * K);
+        AVX_PARALLEL_FOR_IF(T * N * K >= AVX_PAR_MIN)
+        for (int64_t n = 0; n < N; ++n) {
+            float* wr = scratch_f32((size_t)K);
+            int64_t have = -1;
+            for (int64_t i = 0; i < T; ++i) {
+                if (atok[(size_t)i] < 0) continue;
+                const int64_t e = aexp[(size_t)i];
+                if (e != have) {
+                    weight_row(we[(size_t)e], native ? &dec[(size_t)e] : nullptr, n, K, wr);
+                    have = e;
+                }
+                stt(&Y, i * y_rs + n * y_cs, dotf(apack + i * K, wr, K));
+            }
+        }
+    }
+    /* A dropped row is exactly zero, as libref writes it, whatever the weight holds. */
+    for (int64_t i = 0; i < T; ++i)
+        if (atok[(size_t)i] < 0)
+            for (int64_t n = 0; n < N; ++n) stt(&Y, i * y_rs + n * y_cs, 0.0f);
+    return RAD_OK;
+}
+
 #else  /* !AVX_HAVE_GGML: the ops have no row (avx_registry.cpp), so these never run. */
 
 AVX_KERNEL(gemm_nt_ggml)      { (void)a; return RAD_E_UNSUPPORTED; }
+AVX_KERNEL(moe_gemm_ggml)     { (void)a; return RAD_E_UNSUPPORTED; }
 
 #endif /* AVX_HAVE_GGML */

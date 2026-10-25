@@ -4843,6 +4843,21 @@ void ds41_cases(std::vector<Hand>& hs) {
                  .pi("M", M).pi("N", N).pi("K", K).ps("type", ty.name).ps("dtype", dt);
                 hs.push_back(std::move(h));
             }
+            {
+                /* Five tokens, top 2, four experts stacked; one dropped slot, one expert idle. */
+                const int64_t NE = 4, TK = 2, T = M * TK, NN = 24;
+                const std::vector<uint8_t> w = blocks(ty, NE * NN, K);
+                std::string nm = std::string("native ") + ty.name + " experts stacked, " + dt;
+                Hand h(nm.c_str(), "moe_gemm_ggml", tol);
+                h.dense(D, { M, K }, hfill(56))
+                 .raw(RAD_U8, { NE, NN, rb }, w.data())
+                 .idx({ 7, 0, 4, 9, -1, 2, 5, 1, 8, 3 })
+                 .idx({ 0, 4, 4, 7, T })
+                 .dense(D, { T, NN }, hfill(57), true)
+                 .pi("M", M).pi("N", NN).pi("K", K).pi("n_expert", NE).pi("top_k", TK)
+                 .ps("a_order", "token").ps("type", ty.name).ps("dtype", dt);
+                hs.push_back(std::move(h));
+            }
         }
     }
 

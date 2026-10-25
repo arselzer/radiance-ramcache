@@ -402,6 +402,10 @@ static const RadOperandSpec oStreamGate[] = { OPD("h"), OPD("k"), OPD("v"), WGT(
 static const RadParamSpec pGemmGgml[] = { P_INT("M"), P_INT("N"), P_INT("K"), P_STR("type"),
     P_STR("dtype") };
 static const RadOperandSpec oGemmGgml[] = { OPD("a"), WGT("w"), OUT("y") };
+static const RadParamSpec pMoeGemmGgml[] = { P_INT("M"), P_INT("N"), P_INT("K"), P_INT("n_expert"),
+    P_INT("top_k"), P_STR("a_order"), P_STR("type"), P_STR("dtype") };
+static const RadOperandSpec oMoeGemmGgml[] = { OPD("a"), WTAB("w"), OPD("sorted_tok"),
+                                               OPD("expert_offset"), OUT("y") };
 
 /* QSA's compressed key, libr4d's schema (libr4d/r4d_rows.cpp): `block_size` is `ratio` under the
  * name the block-key store's KV group uses; `page` and `pos` are optional. */
@@ -1129,6 +1133,8 @@ static const RadOpSchema kSchemas[] = {
   "a normalised-dot sigmoid gate per row and stream, out = h + gate v." },
 { "gemm_nt_ggml", ARR(pGemmGgml), ARR(oGemmGgml),
   "y = a . w^T with w llama.cpp's own blocks of GGUF type `type`, or the float [N, K] form." },
+{ "moe_gemm_ggml", ARR(pMoeGemmGgml), ARR(oMoeGemmGgml),
+  "moe_gemm with each expert's weight in llama.cpp's blocks of GGUF type `type`." },
 { "qsa_block_key", ARR(pQsaBlockKey), ARR(oQsaBlockKey),
   "QSA's compressed key: the mean of a block's `ratio` rows rounded to k's dtype, RMS-normed with "
   "gain (wadd + w), rotated at the block's position with `rope`'s ladder and YaRN; libref's "
@@ -1850,6 +1856,8 @@ SIMPLE("avx_stream_gate_add", "stream_gate_add", "norm", "normalized-dot gated w
 #ifdef AVX_HAVE_GGML
 ROW_GGML("avx_gemm_nt_ggml", "gemm_nt_ggml", "gemm", "llama.cpp native-block linear", DT_FLOAT,
          L(gemm_nt_ggml)),
+ROW_GGML("avx_moe_gemm_ggml", "moe_gemm_ggml", "moe", "grouped GEMM over llama.cpp native-block experts",
+         DT_FLOAT, L(moe_gemm_ggml)),
 #endif  /* AVX_HAVE_GGML: the native-block rows */
 SIMPLE("avx_qsa_block_key", "qsa_block_key", "attn",
        "QSA compressed key: pooled, normed and rotated at the block's position", DT_FLOAT,

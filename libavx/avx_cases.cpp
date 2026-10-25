@@ -1199,6 +1199,10 @@ std::vector<Case> build_cases() {
             const int K = std::strcmp(ty, "q6_K") ? 96 : 256;
             add("gemm_nt_ggml", { HI("M", 4), HI("N", 33), HI("K", K), HS("type", ty), HS("dtype", dt) });
         }
+        for (const char* order : { "token", "sorted" })
+            add("moe_gemm_ggml", { HI("M", 5), HI("N", 16), HI("K", 64), HI("n_expert", 4),
+                                   HI("top_k", 2), HS("a_order", order), HS("type", "q8_0"),
+                                   HS("dtype", dt) });
     }
     add("index_candidates", { HI("M", 9), HI("width", 40), HI("block", 8), HI("topk_blocks", 2),
                               HI("ratio", 1) });

@@ -1,4 +1,5 @@
-/* ref_ggml.cpp -- gemm_nt_ggml: a linear over llama.cpp's own blocks, read at native density.
+/* ref_ggml.cpp -- gemm_nt_ggml and moe_gemm_ggml: linears and grouped expert GEMMs over
+ * llama.cpp's own blocks, read at native density.
  *
  * The weight is stored in the container as the affine planes of its GGUF type
  * (libquant/lq_ggml_planes: every block field in a plane, exactly). This row's layout hook asks for
@@ -17,6 +18,7 @@
  * has no ggml row.
  */
 #include "ref_common.h"
+#include "ref_gemm.h"
 #include "ref_ops.h"
 
 #ifdef REF_HAVE_GGML
@@ -166,6 +168,83 @@ int ref_gemm_nt_ggml(const RadArgs* a, RadStream) {
                 float acc = 0.0f;
                 for (int64_t i = 0; i < K; ++i) acc += ldt(&x, xb + i * xs) * wr[(size_t)i];
                 stt(&y, rowoff(&y, m, N) + n * laststride(&y), acc);
+            }
+        }
+    }
+    return RAD_OK;
+}
+
+/* moe_gemm over llama.cpp's blocks: y[i] = a[row(i)] . w[e]^T in sorted order, e the expert whose
+ * offset range holds i, row(i) as moe_gemm's `a_order` says ("token": a[sorted_tok[i] / top_k];
+ * "sorted": a[i]); a dropped slot (sorted_tok < 0) or a token past `a` is a row of zeros. `w` is a
+ * table of n_expert entries, each [N, K] read as gemm_nt_ggml reads its weight (native blocks of
+ * `type`, or the float logical form), so every output equals gemm_nt_ggml's for that row and
+ * expert bit for bit. Each expert's rows are dequantised once a call, only for an expert with a
+ * live row. */
+int ref_moe_gemm_ggml(const RadArgs* a, RadStream) {
+    if (!have(a, 5)) return RAD_E_INVAL;
+    const RadTensor &A = a->t[0], &W = a->t[1], &sorted = a->t[2], &off = a->t[3], &Y = a->t[4];
+    const lq::ggml::PlaneKind* k = kind_of(a->p, a->n_p);
+    const int64_t N = p_int(a, "N", 0), K = p_int(a, "K", 0);
+    const int64_t ne = p_int(a, "n_expert", 0), top_k = p_int(a, "top_k", 0);
+    const char* ord = p_str(a, "a_order", "token");
+    const bool sorted_a = ord && !std::strcmp(ord, "sorted");
+    if (ord && !sorted_a && std::strcmp(ord, "token")) return RAD_E_UNSUPPORTED;
+    if (!k || N <= 0 || K <= 0 || K % k->block || ne <= 0 || top_k <= 0 || A.rank != 2 ||
+        A.shape[1] != K || Y.rank != 2 || Y.shape[1] != N || W.rank != 3 || W.shape[0] < ne ||
+        W.shape[1] != N)
+        return RAD_E_SHAPE;
+    const int64_t T = Y.shape[0], AR = A.shape[0];
+    if (T <= 0 || numel(&sorted) < T || numel(&off) < ne + 1) return RAD_E_SHAPE;
+    const int64_t rb = K / k->block * (int64_t)k->block_bytes;
+    const bool native = W.dtype == RAD_U8;
+    if (native ? W.shape[2] != rb : W.shape[2] != K) return RAD_E_SHAPE;
+    std::vector<RadTensor> we((size_t)ne);
+    for (int64_t e = 0; e < ne; ++e) {
+        we[(size_t)e] = expert_entry(&W, e);
+        if (!we[(size_t)e].data) return RAD_E_STRIDE;
+    }
+    /* Each row's expert and activation row, or -1 for a row of zeros; then the live rows grouped
+     * by expert in ascending row order. */
+    std::vector<int64_t> ex((size_t)T, -1), tk((size_t)T, 0);
+    for (int64_t i = 0; i < T; ++i) {
+        const int64_t flat = ld_int(sorted.dtype, sorted.data, offlin(&sorted, i));
+        if (flat < 0) continue;
+        int64_t lo = 0, hi = ne;
+        while (lo + 1 < hi) {
+            const int64_t mid = (lo + hi) / 2;
+            if (ld_int(off.dtype, off.data, offlin(&off, mid)) <= i) lo = mid; else hi = mid;
+        }
+        const int64_t tok = sorted_a ? i : flat / top_k;
+        if (tok < AR) { ex[(size_t)i] = lo; tk[(size_t)i] = tok; }
+    }
+    std::vector<std::vector<int64_t>> rows((size_t)ne);
+    for (int64_t i = 0; i < T; ++i) {
+        if (ex[(size_t)i] >= 0) rows[(size_t)ex[(size_t)i]].push_back(i);
+        else for (int64_t n = 0; n < N; ++n) stt(&Y, rowoff(&Y, i, N) + n * laststride(&Y), 0.0f);
+    }
+    /* One item per (expert, weight row): the row dequantised, dotted with each of its rows. */
+    std::vector<std::pair<int64_t, int64_t>> items;
+    for (int64_t e = 0; e < ne; ++e)
+        if (!rows[(size_t)e].empty())
+            for (int64_t n = 0; n < N; ++n) items.push_back({ e, n });
+    const lq::ggml::DequantFn dq = lq::ggml::dequant_of(k->type);
+#pragma omp parallel
+    {
+        std::vector<float> wr((size_t)K);
+#pragma omp for schedule(dynamic, 16)
+        for (int64_t it = 0; it < (int64_t)items.size(); ++it) {
+            const int64_t e = items[(size_t)it].first, n = items[(size_t)it].second;
+            const RadTensor& w = we[(size_t)e];
+            if (native)
+                dq((const uint8_t*)w.data + n * w.stride[0], wr.data(), K);
+            else
+                for (int64_t c = 0; c < K; ++c) wr[(size_t)c] = ldt(&w, rowoff(&w, n, K) + c * laststride(&w));
+            for (int64_t i : rows[(size_t)e]) {
+                const int64_t xb = rowoff(&A, tk[(size_t)i], K), xs = laststride(&A);
+                float acc = 0.0f;
+                for (int64_t c = 0; c < K; ++c) acc += ldt(&A, xb + c * xs) * wr[(size_t)c];
+                stt(&Y, rowoff(&Y, i, N) + n * laststride(&Y), acc);
             }
         }
     }

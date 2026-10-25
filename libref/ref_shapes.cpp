@@ -2018,6 +2018,29 @@ int ref_moe_gemm_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out)
     return o.finish("moe_gemm", operand, out);
 }
 
+#ifdef REF_HAVE_GGML
+/* moe_gemm's operands with each expert's weight in gemm_nt_ggml's logical form. */
+int ref_moe_gemm_ggml_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const RadParam* t = rad_param_find(p, n_p, "type");
+    const int64_t blk = ref_ggml_block(t && t->kind == RAD_P_STR ? t->sval : nullptr);
+    const int64_t M  = gi(p, n_p, "M", 0);
+    const int64_t N  = gi(p, n_p, "N", 0), K = gi(p, n_p, "K", 0);
+    const int64_t ne = gi(p, n_p, "n_expert", 0);
+    const int64_t k  = gi(p, n_p, "top_k", 0);
+    if (blk <= 0 || M <= 0 || N <= 0 || K <= 0 || K % blk || ne <= 0 || k <= 0)
+        return RAD_E_UNSUPPORTED;
+    const uint32_t D = act_dt(p, n_p);
+    Opd o;
+    const int64_t AR = sorted_a_order(p, n_p) ? M * k : M;
+    o.t(D, { AR, K });                               /* a -- see `a_order` */
+    o.t((uint32_t)RAD_F32, { ne, N, K });            /* w, the logical form */
+    o.t_idx({ M * k }, M * k, -1, (uint32_t)RAD_OPD_F_IDX_UNIQUE);   /* sorted_tok */
+    o.t_idx({ ne + 1 }, M * k + 1, -1, (uint32_t)RAD_OPD_F_IDX_PREFIX);   /* expert_offset */
+    o.t(D, { M * k, N });                            /* y -- in sorted order */
+    return o.finish("moe_gemm_ggml", operand, out);
+}
+#endif
+
 /* The weight scale grid `dtype` names, as weight rows and K elements per scale. Block-fp8 experts
  * (fp8a8) carry the checkpoint's one scale per 128x128 tile (`group` = 128). The 4-bit formats
  * (docs/MOE-W4.md) carry one per row per K group: all of `group` for w4a8, w4a8h and w4nla8h, half

@@ -467,6 +467,10 @@ static const RadOperandSpec oStreamGate[] = { OPD("h"), OPD("k"), OPD("v"), WGT(
 static const RadParamSpec pGemmGgml[] = { P_INT("M"), P_INT("N"), P_INT("K"), P_STR("type"),
     P_STR("dtype") };
 static const RadOperandSpec oGemmGgml[] = { OPD("a"), WGT("w"), OUT("y") };
+static const RadParamSpec pMoeGemmGgml[] = { P_INT("M"), P_INT("N"), P_INT("K"), P_INT("n_expert"),
+    P_INT("top_k"), P_STR("a_order"), P_STR("type"), P_STR("dtype") };
+static const RadOperandSpec oMoeGemmGgml[] = { OPD("a"), WTAB("w"), OPD("sorted_tok"),
+                                               OPD("expert_offset"), OUT("y") };
 static const RadParamSpec pEntryStore[] = { P_INT("M"), P_INT("n"), P_INT("block_size"), P_STR("dtype") };
 static const RadOperandSpec oEntryStore[] = { OPD("x"), OPD("page"), INOUT("cache") };
 static const RadParamSpec pIndexTopk[] = { P_INT("M"), P_INT("width"), P_INT("topk"), P_INT("ratio") };
@@ -1488,6 +1492,12 @@ static const RadOpSchema kSchemas[] = {
   "y = a . w^T with w llama.cpp's own blocks of GGUF type `type` (\"iq1_s\", \"q6_K\", ...), "
   "relayouted from the type's planes at load: each row dequantised as llama.cpp does, f32 dot in "
   "index order, rounded once to dtype. A float [N, K] w is the logical form." },
+{ "moe_gemm_ggml", ARR(pMoeGemmGgml), ARR(oMoeGemmGgml),
+  "moe_gemm with each expert's weight in llama.cpp's blocks of GGUF type `type`: y[i] = a[row(i)] . "
+  "w[e]^T in sorted order, row(i) per `a_order` as moe_gemm, a dropped slot a row of zeros. `w` is a "
+  "WEIGHT TABLE of n_expert entries, each read as gemm_nt_ggml reads its weight (native blocks, or "
+  "the float [N, K] logical form), so each output row equals gemm_nt_ggml's for its row and "
+  "expert." },
 { "entry_store", ARR(pEntryStore), ARR(oEntryStore),
   "x[w] (n values) into the whole of block page[w] of a paged cache [blocks, heads, block_size, "
   "slot], heads*block_size*slot == n, rounded once to the cache dtype; a negative page writes "
@@ -2445,6 +2455,7 @@ SIMPLE("ref_token_map", "token_map", "embed", "ids through an id table", DT_ANY,
 SIMPLE("ref_stream_gate_add", "stream_gate_add", "norm", "normalized-dot gated write into hc streams", DT_FLOAT, ref_stream_gate_add),
 #ifdef REF_HAVE_GGML
 ROW_GGML("ref_gemm_nt_ggml", "gemm_nt_ggml", "gemm", "llama.cpp native-block linear", DT_FLOAT, ref_gemm_nt_ggml),
+ROW_GGML("ref_moe_gemm_ggml", "moe_gemm_ggml", "moe", "grouped GEMM over llama.cpp native-block experts", DT_FLOAT, ref_moe_gemm_ggml),
 #endif
 SIMPLE("ref_entry_store", "entry_store", "attn", "one entry a block into a paged cache", DT_FLOAT, ref_entry_store),
 SIMPLE("ref_index_score", "index_score", "attn", "indexer relu-gated head scores over a paged index cache", DT_FLOAT, ref_index_score),

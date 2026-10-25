@@ -268,6 +268,7 @@ struct Dsp {
     bool on = false;
     int base = 0, n_stage = 0;            /* stages at absolute layers base .. base + n_stage - 1 */
     int64_t block = 0, noise = -1, rank = 0, n_expert = 0, top_k = 0, cand = 0, Q = 0;
+    int64_t ne_rank = 0, ne_base = 0;     /* this rank's routed experts [ne_base, ne_base + ne_rank) */
     std::vector<int64_t> taps;            /* target layers, ascending (main_hiddens' order) */
     rad_kvgroup kv = 0;
     int64_t kv_bs = 0;
@@ -953,7 +954,9 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
 /* Whether this checkpoint and deployment get the drafter (m.dsp.on); an error only for a serve the
  * drafter cannot run as asked. The checkpoint states it by `nextn_predict_layers` (the stages ship as
  * blk.{n_layer}.. ) beside the 1017's `dspark.*` keys; the published UD GGUFs carry the keys but no
- * stages, and get no drafter. */
+ * stages, and get no drafter. The official checkpoint's own stages (mtp.*, fp8 / MXFP4) reach a GGUF
+ * trunk as one more split shard in these names, re-spelled value for value (BF16 linears, Q8_0 experts)
+ * by a graft outside the tree, so they arrive here as any GGUF weight does. */
 static int dsp_config(RadBuilder* b, Model& m, const RadModelMeta* meta, const RadBuildCtx* ctx) {
     auto& d = m.dsp;
     const auto& c = m.c;
@@ -991,8 +994,24 @@ static int dsp_config(RadBuilder* b, Model& m, const RadModelMeta* meta, const R
                 (long long)d.n_expert, (long long)d.top_k);
         return RAD_E_UNSUPPORTED;
     }
-    /* Experts are expert-parallel as in the trunk (an even count of whole experts a rank). */
-    if (d.n_expert % g.world || (d.n_expert / g.world) % 2) {
+    /* Experts are expert-parallel as in the trunk, an even count of whole experts a rank (the grouped GEMM
+     * takes two parity tables), but not necessarily the same count: the 1017's 128 over three ranks are
+     * 44 / 42 / 42 (the even floor of the share each, then two more to the first ranks until all are
+     * placed). The router is replicated, so routing needs no agreement on the split. */
+    {
+        const int64_t per = (d.n_expert / g.world) & ~(int64_t)1;
+        int64_t rem = d.n_expert - per * g.world, base = 0;
+        for (int r = 0; r <= g.rank; ++r) {
+            const int64_t n = per + (rem >= 2 ? 2 : 0);
+            rem -= rem >= 2 ? 2 : 0;
+            if (r == g.rank) {
+                d.ne_rank = n;
+                d.ne_base = base;
+            }
+            base += n;
+        }
+    }
+    if (d.n_expert % 2 || d.ne_rank < 2) {
         fprintf(stderr, "radiance: deepseek41: the DSpark drafter's %lld experts do not split over %d ranks "
                         "(an even count of whole experts each); serving without it\n",
                 (long long)d.n_expert, g.world);
@@ -1000,6 +1019,9 @@ static int dsp_config(RadBuilder* b, Model& m, const RadModelMeta* meta, const R
         d.taps.clear();
         return RAD_OK;
     }
+    if (d.ne_rank * g.world != d.n_expert)
+        rad_note(b, "DSpark drafter experts split unevenly: rank %d holds %lld of %lld from %lld", g.rank,
+                 (long long)d.ne_rank, (long long)d.n_expert, (long long)d.ne_base);
     d.block = blk;
     d.base = (int)c.n_layer;
     d.n_stage = (int)ns;
@@ -1125,8 +1147,8 @@ static int dsp_stage_ops(RadBuilder* b, Model& m, Layer& L) {
     s.shared_mlp_up = nm.f("blk.%d.ffn_up_shexp.weight", l);
     s.shared_mlp_down = nm.f("blk.%d.ffn_down_shexp.weight", l);
     s.cfg.n_expert_all = d.n_expert;
-    s.cfg.n_expert = d.n_expert / g.world;
-    s.cfg.expert_base = g.rank * s.cfg.n_expert;
+    s.cfg.n_expert = d.ne_rank;
+    s.cfg.expert_base = d.ne_base;
     s.cfg.probed_expert = s.cfg.expert_base;
     s.cfg.top_k = d.top_k;
     s.cfg.n_ff_exp = c.n_ff;

@@ -181,6 +181,8 @@ static const RadOperandSpec oDsaPool[] = { OPD("kg"), WGT("ape"), OUT("q"), OUT(
 static const RadParamSpec pRouterSigmoid[] = { P_INT("M"), P_INT("n_expert"), P_INT("top_k"),
     P_INT("norm"), P_F64("route_scale"), P_STR("dtype") };
 static const RadOperandSpec oRouterSigmoid[] = { OPD("logits"), WGT("bias"), OUT("ids"), OUT("weights") };
+static const RadParamSpec pRouterScored[] = { P_INT("M"), P_INT("n_expert"), P_INT("top_k"),
+    P_INT("norm"), P_F64("route_scale"), P_STR("score"), P_STR("dtype") };
 static const RadParamSpec pMnD[] = { P_INT("M"), P_INT("n"), P_STR("dtype") };
 /* `div` divides the rounded sum, rounded again (default 1, the plain sum): a mean of branches
  * summed pairwise, as a vocoder averages its residual blocks. */
@@ -1486,6 +1488,9 @@ static const RadOpSchema kSchemas[] = {
   "is what makes the fused form bit-identical to the pair it replaces." },
 { "router_sigmoid_topk", ARR(pRouterSigmoid), ARR(oRouterSigmoid),
   "Single-group sigmoid routing; correction bias selects experts, original scores weight them." },
+{ "router_scored_topk", ARR(pRouterScored), ARR(oRouterSigmoid),
+  "router_sigmoid_topk with the score function a required name: sigmoid, sqrtsoftplus "
+  "(sqrt(softplus(logit)), softplus linear above 20) or softmax over all n_expert logits." },
 { "router_topk", ARR(pRouter), ARR(oRouter),
   "Softmax over ALL n_expert logits, then the top_k by probability with ties to the lower expert "
   "id, then -- if `norm` -- renormalise the kept weights to sum to one." },
@@ -2315,6 +2320,8 @@ SIMPLE("ref_scale_rows", "scale_rows", "elem", "one scalar per row, broadcast ac
        DT_FLOAT, ref_scale_rows),
 SIMPLE("ref_router_sigmoid_topk", "router_sigmoid_topk", "moe", "sigmoid correction-bias routing", DT_FLOAT,
        ref_router_sigmoid_topk),
+SIMPLE("ref_router_scored_topk", "router_scored_topk", "moe", "correction-bias routing over named scores", DT_FLOAT,
+       ref_router_scored_topk),
 SIMPLE("ref_router_topk", "router_topk", "moe", "softmax then exact top-k routing", DT_FLOAT,
        ref_router_topk),
 SIMPLE("ref_moe_scatter", "moe_scatter", "moe", "stable counting sort of routing slots by expert",

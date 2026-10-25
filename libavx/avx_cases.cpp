@@ -1163,6 +1163,10 @@ std::vector<Case> build_cases() {
         add("mhc_mix", { HI("M", 3), HI("n", 129), HI("hc", 4), HI("iterations", 20),
                          HF("eps", 1e-5), HF("hc_eps", 1e-6), HS("dtype", dt) });
         add("mhc_collapse", { HI("M", 3), HI("n", 129), HI("hc", 4), HS("dtype", dt) });
+        for (const char* score : { "sigmoid", "sqrtsoftplus", "softmax" })
+            add("router_scored_topk",
+                { HI("M", 5), HI("n_expert", 256), HI("top_k", 6), HI("norm", 1),
+                  HF("route_scale", 1.5), HS("score", score), HS("dtype", dt) });
     }
 
     /* ================================================================== speed-only, at model size

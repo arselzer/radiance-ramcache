@@ -1897,6 +1897,7 @@ The VAEs' convolutions are `conv3d_ndhwc` with `tpad` and the audio VAE's `conv2
 | `router_gemm_topk_scatter` | `M`(range) `K` `n_expert` `n_local`/opt `top_k` `norm` `dtype` `expert_base`/opt `protect`:str/opt | `a`, `b`w, `gate_b`w? → `logits`, `expert_ids`, `expert_w`, `sorted_tok`, `expert_offset`, `expert_count`, `gate`? |
 | `moe_gemm` | `M`(range) `N` `K` `n_expert` `top_k` `a_order` `dtype` | `a`, `w`wt, `sorted_tok`, `expert_offset` → `y` |
 | `router_sigmoid_topk` | `M`(range) `n_expert` `top_k` `norm` `route_scale`:f64 `dtype` | `logits`, `bias`w → `ids`, `weights` |
+| `router_scored_topk` | `M`(range) `n_expert` `top_k` `norm` `route_scale`:f64 `score`:str `dtype` | `logits`, `bias`w → `ids`, `weights` |
 | `router_sigmoid_topk_scatter` | `M`(range) `n_expert` `n_local`/opt `top_k` `norm` `route_scale`:f64 `dtype` `expert_base`/opt `protect`:str/opt | `logits`, `bias`w → `ids`, `weights`, `sorted_tok`, `expert_offset`, `expert_count`, `gate`?, `inverse`? |
 | `moe_scatter_inv` | `M`(range) `n_expert` `top_k` `expert_base`/opt `protect`:str/opt | `expert_ids` → `sorted_tok`, `expert_offset`, `expert_count`, `inverse` |
 | `moe_gather_inv` | `M`(range) `n` `top_k` `dtype` `act`:str/opt | `y_expert`, `expert_w`, `inverse`, `shared`?, `shared_gate`? → `y` |
@@ -2035,6 +2036,13 @@ holds its experts as order-preserving keys (`-0` as `+0`, ties to the lower expe
 takes the largest key below round `j-1`'s winner. A row without NaN ranks gives the bytes of a
 serial scan with a strict `>`. A NaN rank is never selected, and a row with fewer than `top_k`
 other ranks names expert 0 in its empty slots, weighted by expert 0's `p`.
+
+**`router_scored_topk`** is `router_sigmoid_topk` with the score function named, and required so
+that a kernel compiled for one function never resolves for another: `sigmoid` is
+`router_sigmoid_topk`, `sqrtsoftplus` is `sqrt(softplus(logit))` with softplus linear above 20
+(torch's default threshold; DeepSeek-V4 routes 6 of 384 this way with `route_scale` 1.5), and
+`softmax` is over all `n_expert` logits. Selection, ties, weights and `norm` are
+`router_sigmoid_topk`'s.
 
 **`router_sigmoid_topk_scatter`** (device-only) is `router_sigmoid_topk` and `moe_scatter` over its
 `ids` in one launch, and with `gate` `[M, 1]` also the `fill` of an ungated shared arm's gate with

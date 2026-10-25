@@ -153,6 +153,8 @@ static const RadOperandSpec oDsaPool[] = { OPD("kg"), WGT("ape"), OUT("q"), OUT(
 static const RadParamSpec pRouterSigmoid[] = { P_INT("M"), P_INT("n_expert"), P_INT("top_k"),
     P_INT("norm"), P_F64("route_scale"), P_STR("dtype") };
 static const RadOperandSpec oRouterSigmoid[] = { OPD("logits"), WGT("bias"), OUT("ids"), OUT("weights") };
+static const RadParamSpec pRouterScored[] = { P_INT("M"), P_INT("n_expert"), P_INT("top_k"),
+    P_INT("norm"), P_F64("route_scale"), P_STR("score"), P_STR("dtype") };
 static const RadParamSpec pMnD[]      = { P_INT("M"), P_INT("n"), P_STR("dtype") };
 /* `add`'s `div` divides the rounded sum (libref's pAdd). */
 static const RadParamSpec pAdd[]      = { P_INT("M"), P_INT("n"), P_STR("dtype"), P_F64O("div") };
@@ -1096,6 +1098,8 @@ static const RadOpSchema kSchemas[] = {
   "one scalar per row, optionally through an activation, broadcast across the row." },
 { "router_sigmoid_topk", ARR(pRouterSigmoid), ARR(oRouterSigmoid),
   "Single-group sigmoid routing; correction bias selects experts, original scores weight them." },
+{ "router_scored_topk", ARR(pRouterScored), ARR(oRouterSigmoid),
+  "router_sigmoid_topk with the score function named: sigmoid, sqrtsoftplus or softmax." },
 { "router_topk", ARR(pRouter), ARR(oRouter), "softmax then exact top-k routing." },
 { "router_topk_scatter", ARR(pRouterTopkScatter), ARR(oRouterTopkScatter),
   "the selection and the sort in one op, run as exactly the pair." },
@@ -1678,6 +1682,8 @@ SIMPLE("avx_router_topk", "router_topk", "moe", "softmax then exact top-k routin
        L(router_topk)),
 SIMPLE("avx_router_sigmoid_topk", "router_sigmoid_topk", "moe", "sigmoid correction-bias routing", DT_FLOAT,
        L(router_sigmoid_topk)),
+SIMPLE("avx_router_scored_topk", "router_scored_topk", "moe",
+       "correction-bias routing over a named score", DT_FLOAT, L(router_scored_topk)),
 SIMPLE("avx_router_topk_scatter", "router_topk_scatter", "moe",
        "the selection and the sort in one op, run as exactly the pair", DT_FLOAT,
        L(router_topk_scatter)),

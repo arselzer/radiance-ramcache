@@ -119,6 +119,72 @@ AVX_KERNEL(router_sigmoid_topk) {
     return RAD_OK;
 }
 
+/* router_sigmoid_topk with the score function named (libref's router_scored_topk): "sigmoid",
+ * "sqrtsoftplus" (sqrt(softplus(logit)), softplus linear above 20) or "softmax" over all n_expert
+ * logits. The scores are libref's expressions, transcendentals included, so the biased ranking and
+ * the ids are libref's exactly. */
+namespace {
+enum class Score { Sigmoid, SqrtSoftplus, Softmax };
+float softplus20(float x) { return x > 20.0f ? x : std::log1p(std::exp(x)); }
+}
+
+AVX_KERNEL(router_scored_topk) {
+    if (!rad_args_have(a, 4)) return RAD_E_INVAL;
+    const char* name = p_str(a, "score", "");
+    Score score;
+    if (!std::strcmp(name, "sigmoid")) score = Score::Sigmoid;
+    else if (!std::strcmp(name, "sqrtsoftplus")) score = Score::SqrtSoftplus;
+    else if (!std::strcmp(name, "softmax")) score = Score::Softmax;
+    else return RAD_E_UNSUPPORTED;
+    const auto &lg = a->t[0], &bias = a->t[1], &ids = a->t[2], &w = a->t[3];
+    const int64_t ne = p_int(a, "n_expert", 0), k = p_int(a, "top_k", 0);
+    const float factor = p_f32(a, "route_scale", 0);
+    const bool norm = p_int(a, "norm", 0) != 0;
+    if (ne < 1 || ne > 512 || k < 1 || k > ne || !std::isfinite(factor) || factor <= 0 ||
+        lg.rank != 2 || lg.shape[0] < 1 || lg.shape[1] != ne || bias.rank != 1 ||
+        bias.shape[0] != ne || bias.dtype != RAD_F32 || ids.dtype != RAD_I32 ||
+        !matrix(ids, lg.shape[0], k) || !matrix(w, lg.shape[0], k) || !lg.data || !bias.data)
+        return RAD_E_SHAPE;
+    /* Serial, as router_sigmoid_topk: a row with fewer than top_k rankable experts refuses the
+     * call where libref does, after the rows before it. */
+    for (int64_t r = 0; r < lg.shape[0]; ++r) {
+        float scores[512], ranked[512], chosen[512];
+        int index[512];
+        float mx = -INFINITY, den = 0;
+        for (int64_t e = 0; e < ne; ++e) {
+            scores[e] = ldt(&lg, rowoff(&lg, r, ne) + e * laststride(&lg));
+            mx = std::max(mx, scores[e]);
+        }
+        for (int64_t e = 0; e < ne; ++e) {
+            if (score == Score::Sigmoid) scores[e] = 1.0f / (1.0f + sc_exp(-scores[e]));
+            else if (score == Score::SqrtSoftplus) scores[e] = std::sqrt(softplus20(scores[e]));
+            else { scores[e] = std::exp(scores[e] - mx); den += scores[e]; }
+        }
+        for (int64_t e = 0; e < ne; ++e) {
+            if (score == Score::Softmax) scores[e] /= den;
+            ranked[e] = scores[e] + ldt(&bias, e * laststride(&bias));
+        }
+        float total = 0;
+        for (int64_t j = 0; j < k; ++j) {
+            int winner = -1;
+            for (int64_t e = 0; e < ne; ++e)
+                if (ranked[e] > -INFINITY && (winner < 0 || ranked[e] > ranked[winner]))
+                    winner = (int)e;
+            if (winner < 0) return RAD_E_SHAPE;
+            index[j] = winner;
+            chosen[j] = scores[winner];
+            total += chosen[j];
+            ranked[winner] = -INFINITY;
+        }
+        const float mult = norm ? factor / (total + 1e-20f) : factor;
+        for (int64_t j = 0; j < k; ++j) {
+            st_int_dt(ids.dtype, ids.data, rowoff(&ids, r, k) + j * laststride(&ids), index[j]);
+            stt(&w, rowoff(&w, r, k) + j * laststride(&w), chosen[j] * mult);
+        }
+    }
+    return RAD_OK;
+}
+
 AVX_KERNEL(swiglu_clamped) {
     if (!rad_args_have(a, 2)) return RAD_E_INVAL;
     const auto &gu = a->t[0], &y = a->t[1];

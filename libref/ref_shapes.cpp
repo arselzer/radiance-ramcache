@@ -712,6 +712,18 @@ int ref_router_sigmoid_topk_shape(const RadParam* p, int n_p, int operand, RadOp
     o.t(D, { M, k });
     return o.finish("router_sigmoid_topk", operand, out);
 }
+int ref_router_scored_topk_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), ne = gi(p, n_p, "n_expert", 0),
+                  k = gi(p, n_p, "top_k", 0);
+    if (M < 1 || ne < 1 || ne > 512 || k < 1 || k > ne) return RAD_E_UNSUPPORTED;
+    const uint32_t D = act_dt(p, n_p);
+    Opd o;
+    o.t(D, { M, ne });
+    o.t(RAD_F32, { ne });
+    o.t_idx({ M, k }, ne, -1, 0);
+    o.t(D, { M, k });
+    return o.finish("router_scored_topk", operand, out);
+}
 int ref_mla_project_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = gi(p, n_p, "M", 0), h = gi(p, n_p, "heads", 0), d = gi(p, n_p, "head_dim", 0),
                   l = gi(p, n_p, "latent_dim", 0);

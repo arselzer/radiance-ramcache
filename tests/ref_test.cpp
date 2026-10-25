@@ -357,6 +357,45 @@ TEST(manifold_mix_and_collapse_are_mhc_pre_split_in_two) {
     CHECK_EQ(run("mhc_collapse", f), RAD_E_SHAPE);
 }
 
+/* router_scored_topk: "sigmoid" is router_sigmoid_topk byte for byte; "sqrtsoftplus" weights the
+ * picks by sqrt(softplus(logit)) while the bias alone moves the pick; an unknown name is refused. */
+TEST(router_scored_topk_names_its_score_function) {
+    T lg(RAD_F32, {2, 5}); lg.f({0.3f, -1.0f, 2.0f, 25.0f, -30.0f, 1.0f, 1.0f, -2.0f, 0.5f, 0.0f});
+    T bias(RAD_F32, {5}); bias.f({0, 0.5f, 0, 0, 0});
+    T ids(RAD_I32, {2, 3}), w(RAD_F32, {2, 3}), ids2(RAD_I32, {2, 3}), w2(RAD_F32, {2, 3});
+    A a; a.t(lg).t(bias).t(ids).t(w).i("M", 2).i("n_expert", 5).i("top_k", 3).i("norm", 1)
+        .d("route_scale", 1.5).s("score", "sigmoid").s("dtype", "f32");
+    REQUIRE_EQ(run("router_scored_topk", a), RAD_OK);
+    A b; b.t(lg).t(bias).t(ids2).t(w2).i("M", 2).i("n_expert", 5).i("top_k", 3).i("norm", 1)
+        .d("route_scale", 1.5).s("dtype", "f32");
+    REQUIRE_EQ(run("router_sigmoid_topk", b), RAD_OK);
+    for (int i = 0; i < 6; ++i) { CHECK_EQ(ids.iat(i), ids2.iat(i)); CHECK_EQ(w.at(i), w2.at(i)); }
+    A c; c.t(lg).t(bias).t(ids).t(w).i("M", 2).i("n_expert", 5).i("top_k", 3).i("norm", 1)
+        .d("route_scale", 1.5).s("score", "sqrtsoftplus").s("dtype", "f32");
+    REQUIRE_EQ(run("router_scored_topk", c), RAD_OK);
+    auto sp = [](double x) { return x > 20 ? x : std::log1p(std::exp(x)); };
+    /* Row 0: sqrt(softplus): 25 -> 5, 2 -> 1.46, .3 -> .92, -1 -> .56 (+.5 bias = 1.06). */
+    const int e0[3] = {3, 2, 1};
+    double s0[3], sum0 = 0;
+    for (int j = 0; j < 3; ++j) { s0[j] = std::sqrt(sp(lg.at(e0[j]))); sum0 += s0[j]; }
+    for (int j = 0; j < 3; ++j) {
+        CHECK_EQ(ids.iat(j), e0[j]);
+        CHECK(std::fabs(w.at(j) - s0[j] * 1.5 / sum0) < 1e-6);
+    }
+    /* Row 1: scores 1.15, 1.15, .36, .99, .83; the +.5 bias puts expert 1 first, ahead of its tie
+     * with expert 0, yet it is weighted by its own unbiased score. */
+    const int e1[3] = {1, 0, 3};
+    double s1[3], sum1 = 0;
+    for (int j = 0; j < 3; ++j) { s1[j] = std::sqrt(sp(lg.at(5 + e1[j]))); sum1 += s1[j]; }
+    for (int j = 0; j < 3; ++j) {
+        CHECK_EQ(ids.iat(3 + j), e1[j]);
+        CHECK(std::fabs(w.at(3 + j) - s1[j] * 1.5 / sum1) < 1e-6);
+    }
+    A d; d.t(lg).t(bias).t(ids).t(w).i("M", 2).i("n_expert", 5).i("top_k", 3).i("norm", 1)
+        .d("route_scale", 1.5).s("score", "relu").s("dtype", "f32");
+    CHECK_EQ(run("router_scored_topk", d), RAD_E_UNSUPPORTED);
+}
+
 TEST(manifold_sinkhorn_first_pass_and_epsilon_are_distinct) {
     T h(RAD_F32, {1, 2}); h.f({1, 3});
     T fn(RAD_F32, {8, 2}), scale(RAD_F32, {3}); scale.f({1, 1, 1});
@@ -1005,7 +1044,7 @@ TEST(op_vocabulary) {
         "rmsnorm", "rmsnorm_p", "rmsnorm_add", "hc_enter", "hc_read", "hc_write", "hc_project",
         "mtp_enter",
         "mhc_pre", "mhc_pre_partial", "mhc_pre_finish", "mhc_post", "mhc_contract",
-        "mhc_mix", "mhc_collapse", "swiglu_clamped", "router_sigmoid_topk", "dsa_pool", "dsa_query", "dsa_score", "mla_attn", "mla_project", "gemm_nt_f32",
+        "mhc_mix", "mhc_collapse", "swiglu_clamped", "router_sigmoid_topk", "router_scored_topk", "dsa_pool", "dsa_query", "dsa_score", "mla_attn", "mla_project", "gemm_nt_f32",
         "kda_update",
         "layernorm", "add", "mul", "mul_weight", "silu_mul", "gelu_mul", "act_mul", "seg_mean",
         "pool_rows", "relu", "clamp", "conv2d", "conv2d_unfold", "conv1d_dw", "rel_sinusoid",
@@ -8704,6 +8743,9 @@ std::vector<Geo> geometries() {
         G("swiglu_clamped", "M", 3, a.i("M", R).i("n", 8).d("limit", 0.5).s("dtype", "f32")),
         G("router_sigmoid_topk", "M", 3, a.i("M", R).i("n_expert", 6).i("top_k", 2).i("norm", 1)
                                          .d("route_scale", 2.5).s("dtype", "f32")),
+        G("router_scored_topk", "M", 3, a.i("M", R).i("n_expert", 6).i("top_k", 2).i("norm", 1)
+                                        .d("route_scale", 1.5).s("score", "sqrtsoftplus")
+                                        .s("dtype", "f32")),
         G("conv1d", "M", 8, a.i("M", R).i("cin", 2).i("cout", 3).i("k", 3).i("dil", 1)
                             .s("dtype", "f32")),
         G("conv_t1d", "M", 8, a.i("M", R).i("cin", 2).i("cout", 3).i("stride", 2).s("dtype", "f32")),

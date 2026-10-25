@@ -1,0 +1,57 @@
+{
+  "passed": false,
+  "production_changes": false,
+  "GPU_execution": false,
+  "source_receipt_sha256": "052fbc765443eb6865b838a5605af558675ab6d730f0f089fc8c8fe03c432b2e",
+  "commands": [
+    {
+      "command": [
+        "python3",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-real-main-record-packer-prototype/verify_source_pins.py"
+      ],
+      "log": "pins-before.log",
+      "returncode": 0
+    },
+    {
+      "command": [
+        "flock",
+        "--no-fork",
+        "--exclusive",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/research-compiler.lock",
+        "nice",
+        "-n19",
+        "cmake",
+        "-S",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-real-main-record-packer-prototype",
+        "-B",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/build-glm53-real-main-record-packer",
+        "-DCMAKE_BUILD_TYPE=Release",
+        "-DCMAKE_CXX_COMPILER=/usr/bin/c++"
+      ],
+      "log": "configure.log",
+      "returncode": 0
+    },
+    {
+      "command": [
+        "flock",
+        "--no-fork",
+        "--exclusive",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/research-compiler.lock",
+        "nice",
+        "-n19",
+        "cmake",
+        "--build",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/build-glm53-real-main-record-packer",
+        "-j2"
+      ],
+      "log": "build.log",
+      "returncode": 2
+    }
+  ],
+  "error": "RuntimeError('build.log')",
+  "logs_sha256": {
+    "build.log": "75c275d36312864a054903fb40d2c5c10a717b78019c33f3d15407823aff03b3",
+    "configure.log": "1995f75f9caad6d0a6d91435230dcf1a97b045a23046891094d1a59a0f940b09",
+    "pins-before.log": "35edc67778e352c8fd05600c84cfb01cec5f78df9d507ea865be67dd08ce8833"
+  }
+}

@@ -1,0 +1,76 @@
+--- FROZEN_STOCK_V4/stock_plan.cpp
++++ MAIN_METADATA/stock_plan.cpp
+@@ -1,6 +1,8 @@
+ // Standalone planning only. No Engine, Pools, Ctx, sampler instance, queue,
+ // kernel init/launch, upload, conversion, model allocation or source payload copy.
+ #include "build/startup.h"
++#include "main_metadata.h"
++#include "metadata_contract.h"
+ #include "device/device.h"
+ #include "format/checkpoint.h"
+ #include "format/encoding.h"
+@@ -73,7 +75,7 @@
+ struct RankQuote {
+     Json json;std::unique_ptr<Builder> builder;WeightFootprint weights{};
+     int64_t arena=0,host_arena=0,kv=0,batch=0,checkpoint=0,capacity=0;
+-    bool device_complete=false;
++    bool device_complete=false,main_metadata_done=false;
+ };
+ RankQuote declare_rank(Registry& registry,const Plugin& architecture,Checkpoint& checkpoint,CheckpointSources& sources,
+                        const RadModelMeta& meta,const RadDeviceProps& device,int rank,const Options& o){
+@@ -168,7 +170,7 @@
+         need(architecture&&architecture->arch_declare&&architecture->arch_id=="glm5next","actual stock glm5next plugin selected");
+         auto meta=checkpoint.meta();if(checkpoint.imports()!=Checkpoint::Import::None){meta.quant=plugins.arch_quant;meta.finish();}
+         CheckpointSources sources(checkpoint);std::array<RankQuote,world> quotes;
+-        bool selection=true;int64_t total_host_arenas=0,total_physical=0,total_selected=0;
++        bool selection=true,main_metadata_complete=true;int64_t total_host_arenas=0,total_physical=0,total_selected=0;
+         report={{"schema","glm53-stock-fullgraph-tp4-planning-v1"},{"checkpoint",o.checkpoint},{"home",o.home},
+           {"mode","actual DEVICE metadata selection; no kernel instances or inference"},{"ctx",o.ctx},{"max_tok",o.batch},{"max_seqs",1},{"mtp_depth",0},{"deterministic",true},
+           {"kv_dtype","bf16"},{"state_dtype","f32"},{"embedding","vram"},{"tp_wire","exact"},{"p2p","off"},{"vision",false},
+@@ -196,6 +198,28 @@
+                 PlannerInput input{&q.builder->program(),&c,r,world,nullptr,0,false,false};Plan plan;
+                 const int status=weight_mib>0?Planner(input).plan(&plan):RAD_E_NOMEM;fits=fits&&status==RAD_OK&&plan.fits();
+                 auto entry=plan_summary(plan,status);entry["rank"]=r;entry["nonweight_device_budget_bytes"]=nonweight;
++                if(!q.main_metadata_done){
++                    namespace mm=glm53::main_metadata;mm::Quote metadata;std::string diagnostic;
++                    const int metadata_status=mm::quote(checkpoint,sources,q.builder->program(),plan,{},mm::Limits{},&metadata,&diagnostic);
++                    Json m{{"status",metadata_status},{"diagnostic",diagnostic},{"geometry_only",true},{"payload_checksums_or_generation_authority",false},
++                        {"payload_read_copied_converted_or_packed",false},{"native_inventory_or_ready_source",false},{"input_plan_fits",status==RAD_OK&&plan.fits()},
++                        {"main_units",metadata.main_units},{"owned_layouts",metadata.owned.size()},{"resident_layouts",metadata.resident_main_units.size()},
++                        {"stored_bytes",metadata.stored_bytes},{"source_selected_bytes",metadata.source_selected_bytes},{"physical_rectangles",metadata.physical_rectangles},
++                        {"immutable_requested",metadata.immutable_requested},{"scratch_requested",metadata.scratch_requested},{"construction_requested",metadata.construction_requested},
++                        {"sizeof_record",metadata.sizeof_record},{"sizeof_member",metadata.sizeof_member},{"sizeof_slice",metadata.sizeof_slice},{"sizeof_owned",metadata.sizeof_owned}};
++                    main_metadata_complete=main_metadata_complete&&metadata_status==RAD_OK;
++                    if(metadata_status==RAD_OK){
++                        const auto& first=metadata.records.front();const auto& last=metadata.records.back();
++                        m["first_record"]={{"unit",first.unit},{"layer",first.layer},{"expert",first.expert},{"stride",first.stride},{"offsets",first.offsets},{"bytes",first.bytes},{"shape",first.shape}};
++                        m["last_record"]={{"unit",last.unit},{"layer",last.layer},{"expert",last.expert},{"stride",last.stride}};
++                        if(r==0){mm::ContractReceipt checks;std::string contract_why;
++                            const int tested=mm::contract_checks(checkpoint,sources,q.builder->program(),plan,&checks,&contract_why);
++                            m["actual_input_contract_cases"]={{"status",tested},{"diagnostic",contract_why},{"checks",checks.checks},{"refusals",checks.refusals}};
++                            main_metadata_complete=main_metadata_complete&&tested==RAD_OK;
++                        }
++                    }
++                    report["ranks"][size_t(r)]["main_expert_metadata"]=std::move(m);q.main_metadata_done=true;
++                }
+                 entry["weight_budget_mib_derived"]=weight_mib;entry["dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum"]=expert_vram_floor(q.weights,host_mib*MiB);
+                 entry["deterministic_expert_payload_lower_bound_NOT_first_fit_cost"]=std::max<int64_t>(0,q.weights.experts-host_mib*MiB);
+                 scenario["ranks"].push_back(std::move(entry));}
+@@ -206,6 +230,8 @@
+         const auto after=tracked_allocations();report["core_tracked_allocated_bytes_before_queries"]=allocations(before);
+         report["core_tracked_allocated_bytes_after_planning"]=allocations(after);report["core_tracked_allocation_bytes_unchanged"]=before==after;
+         report["actual_device_selection_complete"]=selection;
++        report["main_expert_geometry_metadata_complete"]=main_metadata_complete;
++        report["main_metadata_scope"]="separate geometry-only adapter on actual same Checkpoint/cache/Program/Plan; no native descriptor/source/Ready capability; canonical identity layouts only";
+         report["hidden_runtime_effects"]={"AQL discovery calls hsa_init/agent/pool discovery and code-object ISA validation; host metadata and driver-internal state canallocate.",
+           "Plugin dlopen/static registration, source metadata/cache and kernel layout/scratch callbacks execute; opaque plugin/HSA allocations are not a process-wide allocation proof.",
+           "No Pool.configure/carve, Engine.start, kernel init_instance, Ctx, rad_stream_create, copy or kernel launch is called by this tool.",
+@@ -214,7 +240,7 @@
+           "deterministic=true disables dynamic heat/shadow slots, XP prefetch and dynamic expert-layer lending/staging baseline; actual Planner still reports any required ordinary staged ring/slab costs. Kernel collective/driver/queues remain explicit assumed margins."};
+         report["not_proved"]={"actual startup/Pools allocations","whole-model inference correctness","TP communicator initialization","Loader/pin/startup peak","current hardware fit while production serves","throughput"};
+         report["completed"]=true;publish(output,report);std::cout<<"WROTE full stockGLM TP4 planning report "<<output<<" selection="<<selection<<" trackedAllocUnchanged="<<(before==after)<<"\n";
+-        return selection&&before==after?0:1;
++        return selection&&before==after&&main_metadata_complete?0:1;
+     }catch(const std::exception& e){std::cerr<<"FAIL stockGLM planning: "<<e.what()<<"\n";
+         if(!output.empty()&&!fs::exists(output)){try{report["completed"]=false;report["error"]=e.what();publish(output,report);}catch(...){}}
+         return 1;}

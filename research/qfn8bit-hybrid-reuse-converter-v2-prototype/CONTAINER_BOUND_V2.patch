@@ -1,0 +1,37 @@
+--- hybrid-v1/checker.cpp
++++ hybrid-v2/checker.cpp
+@@ -17,6 +17,7 @@
+ using namespace rad;
+ namespace {
+ size_t checks=0,groups=0,converter_calls=0,preflight_refusals=0,hybrid_refusals=0,reuse_predicate_refusals=0;
++uint64_t bounded_container_count=0,bounded_container_bytes=0,bounded_plane_bytes=0,bounded_header_reserved=0;
+ void need(bool ok,const std::string& why){++checks;if(!ok)throw std::runtime_error(why);}
+ void good(int rc,const std::string& why){need(rc==RAD_OK,why+" status="+std::to_string(rc));}
+ const std::string prefix="model.language_model.layers.1.ple.ple_embedding.ngram_embedding.";
+@@ -190,7 +191,18 @@
+     }return names;
+ }
+ const RadFileEntry& required(const RadFile& file,const std::string& name){const auto* entry=file.find(name);need(entry,"required complete logical output name: "+name);return *entry;}
+-void bounded_open(RadFile& file,const fs::path& path){need(fs::is_regular_file(path)&&fs::file_size(path)<1u<<20,"actual output file<1MiB before mapping");good(file.open(path.c_str()),"bounded output open");}
++void bounded_open(RadFile& file,const fs::path& path){
++    constexpr uint64_t blob_cap=256u<<10,plane_cap=200u<<10,container_cap=uint64_t(RAD_ALIGN_POOL)+blob_cap;
++    need(fs::is_regular_file(path),"actual output regular file");const auto extent=fs::file_size(path);
++    need(extent<=container_cap,"actual bounded output before mapping bytes="+std::to_string(extent)+" cap="+std::to_string(container_cap));
++    good(file.open(path.c_str()),"bounded output open");const auto& h=file.header();
++    need(h.data_off==RAD_ALIGN_POOL&&h.data_bytes<=blob_cap&&h.file_bytes==h.data_off+h.data_bytes&&h.file_bytes==extent,
++         "actual2MiB container metadata/alignment reserve + bounded native blob");
++    uint64_t payload=0;for(int64_t i=0;i<file.entry_count();++i){const auto& e=file.entry(i);
++        for(int k=0;k<e.n_planes;++k){const auto bytes=file.plane(e,k).bytes;need(bytes<=plane_cap-payload,"closed tiny plane-payload bound");payload+=bytes;}}
++    ++bounded_container_count;bounded_container_bytes+=extent;bounded_plane_bytes+=payload;bounded_header_reserved+=h.data_off;
++    std::cout<<"CONTAINER bytes="<<extent<<" headerReserved="<<h.data_off<<" blob="<<h.data_bytes<<" planes="<<payload<<"\n";
++}
+ void old_planes(const Fixture& source,const RadFile& old){need(old.entry_count()==6,"old actual six-entry catalog");
+     plane(old,required(old,ng),0,source.ngram);plane(old,required(old,ng),1,{0x51,0x39});
+     plane(old,required(old,"fixture.retained.weight"),0,source.retained);
+@@ -270,5 +282,5 @@
+     need(logged_names(hybrid_log," as is",complete)==normal_names,"EXACT new expert raw-copy evidence");
+     need(fingerprint(old_source.path)==old_hash&&fingerprint(new_source.path)==new_hash,"both distinct source checkpoint generations immutable");
+     need(fingerprint(f.path)==input_hash,"all converter input artifacts unchanged");
+-    need(groups==8&&preflight_refusals==7&&hybrid_refusals==3&&reuse_predicate_refusals==9&&converter_calls==10,"honest exact matrix counts");std::cout<<"PASS synthetic CPU converter groups="<<groups<<" checks="<<checks<<" calls="<<converter_calls<<" overlayRefusals="<<preflight_refusals<<" hybridRefusals="<<hybrid_refusals<<" predicateRefusals="<<reuse_predicate_refusals<<" retainedEntries=4 nativeExpertEntries=2 retainedPlanes=5 newPlanes=4 finiteFP8Codes=254 payload=2400B no inference\n";return 0;
++    need(groups==8&&preflight_refusals==7&&hybrid_refusals==3&&reuse_predicate_refusals==9&&converter_calls==10&&bounded_container_count==4,"honest exact matrix counts");std::cout<<"PASS synthetic CPU converter groups="<<groups<<" checks="<<checks<<" calls="<<converter_calls<<" overlayRefusals="<<preflight_refusals<<" hybridRefusals="<<hybrid_refusals<<" predicateRefusals="<<reuse_predicate_refusals<<" retainedEntries=4 nativeExpertEntries=2 retainedPlanes=5 newPlanes=4 finiteFP8Codes=254 payload=2400B boundedContainerBytes="<<bounded_container_bytes<<" boundedPlaneBytes="<<bounded_plane_bytes<<" boundedHeaderReserved="<<bounded_header_reserved<<" no inference\n";return 0;
+ }catch(const std::exception& e){std::cerr<<"FAIL "<<e.what()<<" checks="<<checks<<" converterCalls="<<converter_calls<<"\n";return 1;}}

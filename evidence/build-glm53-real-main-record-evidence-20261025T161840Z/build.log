@@ -1,0 +1,36 @@
+[ 25%] Building CXX object CMakeFiles/glm53_real_main_record_check.dir/sample_packer.cpp.o
+[ 50%] Building CXX object CMakeFiles/glm53_real_main_record_check.dir/main_records.cpp.o
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-real-main-record-packer-prototype/main_records.cpp: In function ‘uint64_t glm53::main_records::{anonymous}::stream_hash(int, uint64_t, uint64_t, std::vector<std::byte>&, bool)’:
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-real-main-record-packer-prototype/main_records.cpp:46:5: warning: this ‘if’ clause does not guard... [-Wmisleading-indentation]
+   46 |     if(zero)need(std::all_of(buffer.begin(),buffer.begin()+n,[](auto b){return b==std::byte{0};}),Status::checksum,"nonzero canonical record padding");result=hash(result,buffer.data(),n);done+=n;}return result;}
+      |     ^~
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-real-main-record-packer-prototype/main_records.cpp:46:152: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘if’
+   46 |     if(zero)need(std::all_of(buffer.begin(),buffer.begin()+n,[](auto b){return b==std::byte{0};}),Status::checksum,"nonzero canonical record padding");result=hash(result,buffer.data(),n);done+=n;}return result;}
+      |                                                                                                                                                        ^~~~~~
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-real-main-record-packer-prototype/main_records.cpp: In function ‘void glm53::main_records::{anonymous}::padding(int, const glm53::main_records::RecordInfo&, std::vector<std::byte>&)’:
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-real-main-record-packer-prototype/main_records.cpp:76:5: warning: this ‘if’ clause does not guard... [-Wmisleading-indentation]
+   76 |     if(at>previous)(void)stream_hash(fd,info.offset+previous,at-previous,buffer,true);previous=at+bytes;}
+      |     ^~
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-real-main-record-packer-prototype/main_records.cpp:76:87: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘if’
+   76 |     if(at>previous)(void)stream_hash(fd,info.offset+previous,at-previous,buffer,true);previous=at+bytes;}
+      |                                                                                       ^~~~~~~~
+In file included from /home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-real-main-record-packer-prototype/sample_packer.cpp:6:
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-real-main-record-packer-prototype/stock/stock_plan.cpp: In function ‘{anonymous}::RankQuote {anonymous}::declare_rank(rad::Registry&, const rad::Plugin&, rad::Checkpoint&, rad::CheckpointSources&, const RadModelMeta&, const RadDeviceProps&, int, const Options&)’:
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-real-main-record-packer-prototype/stock/stock_plan.cpp:78:82: warning: unused parameter ‘checkpoint’ [-Wunused-parameter]
+   78 | RankQuote declare_rank(Registry& registry,const Plugin& architecture,Checkpoint& checkpoint,CheckpointSources& sources,
+      |                                                                      ~~~~~~~~~~~~^~~~~~~~~~
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-real-main-record-packer-prototype/sample_packer.cpp: In function ‘int __wrap_renameat2(int, const char*, int, const char*, unsigned int)’:
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-real-main-record-packer-prototype/sample_packer.cpp:82:54: error: ‘::mkdir’ has not been declared
+   82 |     if(fault==3&&wrote){fault=0;++failures_seen;if(::mkdir(newpath,0700))return -1;const std::string marker=std::string(newpath)+"/marker";const int fd=::open(marker.c_str(),O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC,0600);if(fd<0)return -1;(void)::write(fd,"original",8);::close(fd);}
+      |                                                      ^~~~~
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-real-main-record-packer-prototype/sample_packer.cpp:82:246: warning: ignoring return value of ‘ssize_t write(int, const void*, size_t)’ declared with attribute ‘warn_unused_result’ [-Wunused-result]
+   82 |     if(fault==3&&wrote){fault=0;++failures_seen;if(::mkdir(newpath,0700))return -1;const std::string marker=std::string(newpath)+"/marker";const int fd=::open(marker.c_str(),O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC,0600);if(fd<0)return -1;(void)::write(fd,"original",8);::close(fd);}
+      |                                                                                                                                                                                                                                               ~~~~~~~^~~~~~~~~~~~~~~~~
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-real-main-record-packer-prototype/sample_packer.cpp: In function ‘int main(int, char**)’:
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-real-main-record-packer-prototype/sample_packer.cpp:124:18: warning: ignoring return value of ‘ssize_t write(int, const void*, size_t)’ declared with attribute ‘warn_unused_result’ [-Wunused-result]
+  124 |     (void)::write(STDOUT_FILENO,completion,size_t(n));return 0;
+      |           ~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+gmake[2]: *** [CMakeFiles/glm53_real_main_record_check.dir/build.make:79: CMakeFiles/glm53_real_main_record_check.dir/sample_packer.cpp.o] Error 1
+gmake[2]: *** Waiting for unfinished jobs....
+gmake[1]: *** [CMakeFiles/Makefile2:87: CMakeFiles/glm53_real_main_record_check.dir/all] Error 2
+gmake: *** [Makefile:91: all] Error 2

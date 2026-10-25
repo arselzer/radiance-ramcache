@@ -1,0 +1,86 @@
+GLM-5.3-Flash actual checkpoint preparation, 2026-10-25
+
+The AMD checkpoint is complete locally: all72files,185107699217bytes, verified
+against their pinned LFS SHA256 or Git-blob SHA1 identities. Source:
+https://huggingface.co/amd/GLM-5.3-Flash-Quark-MXFP4
+Revision b5688f25491202978c19c4d036eef579f61bbe07.
+No model startup, GPU kernel execution, production configuration or restart
+was performed by these checks.
+
+Actual stock GLM and shipped gfx1201 kernels resolve all required DEVICE bands
+for four logical ranks. No missing DEVICE selection or reference-only operation
+was admitted. One visible RX9070XT supplied ISA/capacity metadata; logical ranks
+assume the separately identified identical four-card hardware. No other card
+binding, queue, collective or kernel instance was initialized by these tools.
+
+The main expert geometry is now verified against the complete real checkpoint:
+42routed layers x288experts =12096units per rank. Each actual canonical rank-local
+record is3342336B, with four code/scale members drawn from six physical gate/up/
+down tensors. Each rank holds37.65234375GiB of main expert payload. Metadata
+construction requests11462905B/rank including its scratch; this is not process
+RSS or the upstream graph/import-cache footprint. Rank0 actual-input contract
+checks passed62checks/27refusals. The original frozen source README's intended
+26-refusal count is a prose error; observed implementation count is27.
+
+The complete no-MTP, text-only native weight selection totals166.368791GiB
+across four ranks. This differs from raw checkpoint byte sums because native
+selection includes widening/replication and excludes unused components.
+The geometry adapter alone does not make records acquirable or establish a
+NativeInventory/Ready capability.
+
+Stock placement,512context/128batch/one sequence/noMTP, exact wire, deterministic,
+BF16 KV, GPU embeddings, no vision/prefix/checkpoint slots:
+Assumed runtime per GPU     Smallest checked fitting host pool/rank   Host quote
+512MiB                     26.5GiB                                  114.0625GiB
+1024MiB                    27.0GiB                                  116.0625GiB
+1536MiB                    27.5GiB                                  118.0625GiB
+2048MiB                    28.0GiB                                  120.0625GiB
+The host quote includes an illustrative8GiB margin and64MiB total sampler
+allowance. The estimated post-stop available RAM is113.6GiB; no service was
+stopped to measure it. The8GiB margin may partly overlap OS/nonmodel memory
+already excluded from that estimate. These results do not prove tiny stock
+startup impossible, and do not prove loader/pin/collective/runtime peaks fit.
+
+At262144context with the same one-sequence/noMTP/batch128 profile, real KV costs
+2.8759765625GiB per GPU and arena+scratch81.859375MiB/card. All required kernels
+and expert layouts still resolve, but NONE of the checked26..28GiB/rank host
+pools fit all weights. Even28GiB/rank leaves1.210876..2.782837GiB unplaced PER
+RANK as the runtime allowance rises512..2048MiB. A failed plan's SSD accounting
+is unplaced data, not a working disk tier. Stock GLM requires BF16 KV; substituting
+QFN's FP8 KV setting is unsupported by this plugin. This is a concrete reason
+to finish the bounded expert cache for useful long-context operation.
+
+The next actual-byte milestone passed on one complete expert (layer3,expert0)
+for all four logical ranks. The packer reads the real six-tensor bundle, writes
+one canonical record/rank, verifies it through its Reader and independently
+compares physical source coordinates. It passed82119checks and26738688native
+byte comparisons, including repeated reads after creator destruction and four
+late I/O/publication error cases. Copy/hash uses64KiB windows and at most two
+payload FDs; selected source bytes are12.75MiB per pack and each output record
+3.1875MiB. Private sample weights are excluded from the public repository.
+
+The fourth error case returns EIO from an actual successful index fstat after
+the actual manifest write. It tests the late source-audit path without changing
+the downloaded checkpoint. It is not a real source-mutation experiment. The
+source ID currently identifies this one selected raw expert bundle across four
+rank cuts; it is not the complete model/catalog generation. Full-store assembly
+must establish a separate common verified bundle and complete four-rank domain.
+
+Earlier failures are preserved: v1 lacked a test-header include; v2's1MiB config
+cap refused the actual1716060B config. V3 adds an explicit2MiB maximum while
+retaining the128MiB total metadata cap and twice-the-actual-config-byte charge.
+The record/layout/copy arithmetic is unchanged, and a config-size-minus-one
+refusal is now exercised. This is not an arbitrary unbounded cap increase.
+
+Evidence:
+  glm53-real-main-metadata-20261025T162250Z/receipt.json
+  glm53-real-main-metadata-262k-20261025T163229Z/receipt.json
+  validation-glm53-real-main-record-20261025T163117Z/receipt.json
+  GLM53_CHECKPOINT_DOWNLOAD_STATUS.json
+
+The actual Engine transport fixture separately passes Release, ASan/UBSan and
+TSan on a tiny HOST model. Its portable repository entrypoint passes all eight
+Release checkers. It does not establish full GLM inference. The next isolated
+code slice wires the real GLM route hooks and four-rank preparation/fail-stop
+protocol; its full-source startup gate stays closed until complete store/source
+binding is available. Production continues serving the original container.

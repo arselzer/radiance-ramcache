@@ -1,0 +1,16 @@
+{
+  "repo": "amd/GLM-5.3-Flash-Quark-MXFP4",
+  "revision": "b5688f25491202978c19c4d036eef579f61bbe07",
+  "destination": "/home/as/models/hf/amd/GLM-5.3-Flash-Quark-MXFP4",
+  "expected_bytes": 185107699217,
+  "file_count": 72,
+  "pid": 3459748,
+  "status": "complete",
+  "started_utc": "2026-10-25T15:06:13.335995+00:00",
+  "verified_files": 72,
+  "verified_bytes": 185107699217,
+  "production_changes": false,
+  "updated_utc": "2026-10-25T16:21:12.441431+00:00",
+  "attempt": 1,
+  "finished_utc": "2026-10-25T16:21:12.441427+00:00"
+}

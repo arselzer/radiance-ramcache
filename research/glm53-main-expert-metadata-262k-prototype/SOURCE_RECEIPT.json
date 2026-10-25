@@ -1,0 +1,52 @@
+{
+  "actual_sizes_or_success_not_claimed": "parent matching compilation/runtime pending; returned receipts use actual sizeof/counts/selected source spans",
+  "api": "quote(Checkpoint&,const CheckpointSources&,const Program&,const Plan&,span<const int32_t> residents,const Limits&,Quote*,string*why) noexcept",
+  "authored_contract_cases": "22 direct metadata/layout/source/budget mutations plus empty cache/current GU map swap/stale code swap/stale scale swap/duplicate resident =26 intended refusals; full positives/resident partition/restoration require actual parent run",
+  "compiler_or_runtime_by_author": false,
+  "core_changed": false,
+  "created_utc": "2026-10-25T16:30:49.297326+00:00",
+  "expected_pod_64bit_static_asserts": {
+    "MemberLayout": 176,
+    "OwnedLayout": 8,
+    "PhysicalSlice": 80,
+    "RecordLayout": 880
+  },
+  "files": {
+    "CMakeLists.txt": "d603978e164049b4dc706782898f96a0e929b0733a32a0b7e6f486fc866ccefd",
+    "CORE_SOURCE_PINS.json": "ca0e322696dd07c0791abb6504d36d7b9cff20820765b228e417c67e9f3d79a0",
+    "README.txt": "951966480260af6f50f111e35d5cdc04c69460b9f1b124caa66bbc7fadc5ed53",
+    "STOCK_DRIVER_DIFF.diff": "c8152e8258bd9065cb1169ad369c5b097716991fadb933c1e805222702f697ef",
+    "main_metadata.cpp": "a5571c7406012a9d8daa9e23f916c184a1dd847762637eeb4130ccfd2de85de4",
+    "main_metadata.h": "36db9a0a0176fcc6dc2ff364852e5b1c2c93deaad88d3f3298a1a269de4c9698",
+    "metadata_contract.cpp": "1ee1e160df8928ba3817fc65520a459f0a2be144f7239c297e6289b9f995ae8e",
+    "metadata_contract.h": "edb46ee8b8898817001bd17154be7100f14d592509516522caaba3f593e34576",
+    "stock_plan.cpp": "7d53cce9b88323b5bef98f2bd086299f0eb3f2511e91c96f902bf5a8655dec35",
+    "verify_source_pins.py": "0a3c3df1a6e5dfff51aae17f2325f383fee7a217472314f919881c742cd56d92"
+  },
+  "known_limits": [
+    "selected noncanonical/tagged/widened/rank!=2/initialized DEVICE layout refuses, no relayout implementation",
+    "requires complete actual main graph; no sparse fake record readiness",
+    "upstream Checkpoint/Program/cache/model mapping and plugin/driver/runtime/global memory are excluded from requested adapter metadata quote",
+    "actual allocator OOM injection not implemented or claimed; exact metadata budget-minus-one and output preservation covered",
+    "same opened mapped names/objects/spans are metadata binding, not payload checksum/file generation or hostile writer exclusion",
+    "stock planning fit/margins remain separate; geometry cannot turn failed placement into fit/Ready"
+  ],
+  "payload_reads_hashes_packing_conversion_or_gpu_execution": "none by adapter; inherited parent-gated stock driver does actual AQL discovery/code eligibility and metadata layouts only",
+  "private_abi": "exact original stock headers+whole matching archive, no research Native private headers",
+  "publication": "caller preserved on any refusal; no generation/checksum/lease/catalog/source/NativeInventory/Ready capability",
+  "reviewed_inputs": {
+    "GLM53_FULL_SHAPE_NATIVE_SCALING_REVIEW.txt": "d3f52d5b21a015d58275d49d80fee90058058c5a17435be4fbc09be861d5462e",
+    "GLM53_NATIVE_TP4_CONVERSION_NOTES_V1.txt": "c39a2b030885adfdf525e5779f02a9f395a5c0bb54b994489d9bb7f0d4a80123",
+    "GLM53_STOCK_BASELINE_HEADER_PAYLOAD_BREAKDOWN.json": "0c4059044d6d47eac752f62e11c9d272c98390f1e0838a6d087d33d30a28e96d",
+    "glm53-stock-full-graph-plan-v4-prototype/CMakeLists.txt": "48c1c03be18d4c7be1a7120aa4f40cbb22f2c8e4f698c741e4830dc9a36c49e8",
+    "glm53-stock-full-graph-plan-v4-prototype/CORE_SOURCE_PINS.json": "ca0e322696dd07c0791abb6504d36d7b9cff20820765b228e417c67e9f3d79a0",
+    "glm53-stock-full-graph-plan-v4-prototype/SOURCE_RECEIPT.json": "f9dd5797dcd0989dc97375401289ded547ffdc39b28235b0559ac03df1162007",
+    "glm53-stock-full-graph-plan-v4-prototype/stock_plan.cpp": "94a7919f95c1ad23976da40fde221157d8d03a66d4fdffb232a64ed152e433ec"
+  },
+  "schema": "glm53-main-expert-tp4-geometry-metadata-262k-source-v2",
+  "scope": "main MXFP4/E8M0 actual TP4 rank0..3/layers3..44/E288/top8/max_spec0; geometry only; canonical identity DEVICE layouts independently checked",
+  "source_only": true,
+  "stock_core": "radiance-src",
+  "parent_receipt_sha256": "b1483bc4452b2beaf26f03bd5cedb0bc1566d810b5716e26aaa1f646522830f7",
+  "parent_derivative": "Only CLI context whitelist additionally admits262144 and report schema labels it; all quoted allocation/layout/source/graph validation bodies unchanged. Not an inference-capability extension."
+}

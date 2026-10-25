@@ -1,5 +1,5 @@
 {
-  "updated_utc": "2026-10-25T16:18:13.893867+00:00",
+  "updated_utc": "2026-10-25T16:35:22.360192+00:00",
   "hypothesis": "Replace production W4NL experts with native E4M3/BF16block128, retain all nonexperts and ten protected BF16 experts. Not wholesale officialFP8 import.",
   "profiles": [
     {
@@ -411,5 +411,8 @@
     "KV figures reserve all declared sequences at fullcontext; shown profiles use1sequence."
   ],
   "finite_converter_v2_receipt": "validation-qfn8bit-scale-alias-v2-20261025T161708Z/receipt.json",
-  "hybrid_reuse_review": "QFN_EXPLICIT_FP8_HYBRID_REUSE_REVIEW.txt"
+  "hybrid_reuse_review": "QFN_EXPLICIT_FP8_HYBRID_REUSE_REVIEW.txt",
+  "hybrid_converter_receipt": "validation-qfn8bit-hybrid-reuse-20261025T163118Z/receipt.json",
+  "recorded_production_recipe_receipt": "qfn8bit-production-recipe-20261025T163326Z/receipt.json",
+  "hybrid_recipe_proposal": "qfn8bit-conversion-plan/hybrid-recipe-proposal.json"
 }

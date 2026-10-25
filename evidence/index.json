@@ -178,5 +178,45 @@
     "directory": "validation-portable-engine-v4-release-20261025T162856Z",
     "passed": true,
     "scope": "Portable eight HOST checker programs with verified source-identical transport-v4 Core; no fresh Core build, model step, GPU, production or full-model proof"
+  },
+  {
+    "directory": "glm53-real-main-metadata-262k-20261025T163017Z",
+    "passed": false,
+    "scope": "Actual checkpoint main-expert geometry and conditional stock TP4 placement; device metadata discovery only"
+  },
+  {
+    "directory": "glm53-real-main-metadata-262k-20261025T163229Z",
+    "passed": true,
+    "scope": "Actual checkpoint main-expert geometry and conditional stock TP4 placement; device metadata discovery only"
+  },
+  {
+    "directory": "build-glm53-real-main-record-evidence-20261025T161840Z",
+    "passed": false,
+    "scope": "Build only, no model/GPU execution"
+  },
+  {
+    "directory": "validation-glm53-real-main-record-20261025T162644Z",
+    "passed": false,
+    "scope": "One complete actual GLM expert across four logical TP4 ranks, source/record equality and failure cleanup; no NativeSourceReady or inference"
+  },
+  {
+    "directory": "validation-glm53-real-main-record-20261025T163117Z",
+    "passed": true,
+    "scope": "One complete actual GLM expert across four logical TP4 ranks, source/record equality and failure cleanup; no NativeSourceReady or inference"
+  },
+  {
+    "directory": "validation-qfn8bit-hybrid-reuse-20261025T162644Z",
+    "passed": false,
+    "scope": "Synthetic complete hybrid reuse predicates and exact plane equality plus inherited FP8 selector/scale checks; no full model"
+  },
+  {
+    "directory": "validation-qfn8bit-hybrid-reuse-20261025T163118Z",
+    "passed": true,
+    "scope": "Synthetic complete hybrid reuse predicates and exact plane equality plus inherited FP8 selector/scale checks; no full model"
+  },
+  {
+    "directory": "qfn8bit-production-recipe-20261025T163326Z",
+    "passed": true,
+    "scope": "Actual production .rad recorded recipe metadata only; no payload hashing or device discovery"
   }
 ]

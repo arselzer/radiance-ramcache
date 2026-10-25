@@ -32,8 +32,11 @@ Three different conversion choices must stay distinct:
    finds a possible --reuse route, but every retained entry must pass the
    converter's exact reuse predicate and final byte equality. Stock reuse
    silently falls back to recalculating mismatches. This intentionally mixes
-   provenance; it is not a claim that both releases are identical. A bounded
-   hybrid fixture is in progress. See QFN_EXPLICIT_FP8_HYBRID_REUSE_REVIEW.txt.
+   provenance; it is not a claim that both releases are identical. The bounded
+   hybrid fixture passed8groups/651checks/10actualconvertercalls: exact4retained
+   entries(5planes) and2native expert entries(4planes), with3guarded hybrid
+   refusals and9reuse-predicate mutation refusals. Full-model coverage remains
+   untested. See QFN_EXPLICIT_FP8_HYBRID_REUSE_REVIEW.txt for the source contract.
 
 Validated native placement hypothesis
 The actual stock QFN graph/layout/Planner was queried with only expert encodings
@@ -94,6 +97,23 @@ Prepared official-source workflow; full commands have NOT been run:
 Use the exact recipe path emitted by the overlay. Conversion would follow only
 after the full real-source plan and retained/native plane verification gates.
 This command is option2, not the BF16-source recipe or the hybrid option3.
+
+The hybrid candidate is now derived from the ACTUAL production container's
+recorded recipe, not merely the current checkout. All25 retained rule lines stay
+byte-identical; only the generic expert GPTQ rule is removed. Normalized retained
+rules also match the checkout. The removed rule has its recorded calibration
+path expanded; it is no longer needed for native FP8 experts. The candidate is:
+  research/qfn-fp8-conversion/qwen4exp-official-fp8-experts-retained-trunk-hybrid.recipe
+After authenticating both complete inputs and validating every retained planned
+entry against the old container, the unexecuted hybrid plan command would be:
+  rad-convert ABS_VERIFIED_FP8_OVERLAY -o ABS_NEW_HYBRID_RAD \
+    --recipe ABS_HYBRID_RECIPE --reuse ABS_CURRENT_RAD \
+    --set quantization_config.quant_method= --home ABS_MATCHING_RADIANCE_HOME \
+    --plan-only -v
+The full-size strict metadata guard is not implemented by the tiny test: that
+fixture uses an actual small candidate conversion to inspect metadata and does
+not present that as a scalable preflight for the172GiB source. Tokenizer/config
+compatibility and full retained/new plane equality remain publication gates.
 
 Receipts and exact report hashes are indexed by
 QFN8BIT_VALIDATED_PREFLIGHT_INDEX_20261025.json. The frozen source READMEs retain

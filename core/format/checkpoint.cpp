@@ -1,5 +1,7 @@
 /* checkpoint.cpp -- see checkpoint.h. */
 #include "checkpoint.h"
+#include "encoding.h"
+#include "lq_ggml_planes.h"
 #include "rad_plugin.h"
 
 #include <nlohmann/json.hpp>
@@ -422,22 +424,79 @@ int meta_from_gguf(GgufFile& g, MetaOwn* out) {
 int Checkpoint::open_gguf(const std::string& path) {
     RAD_TRY(gguf_.open(path.c_str()));
     kind_ = Gguf;
-    for (const GgufTensor& t : gguf_.tensors()) {
-        SrcTensor s;
-        s.name  = t.name;
-        s.ggml  = t.ggml_type;
-        s.rad_dtype = gguf_to_rad_dtype(t.ggml_type);
-        /* GGUF is fastest-first; everything from here on is row-major. */
-        for (int d = (int)t.n_dims - 1; d >= 0; --d) s.shape.push_back(t.ne[d]);
-        s.data  = gguf_.tensor_data(t);
-        s.bytes = (int64_t)t.bytes;
-        if (!s.data) {
-            RAD_ERR("%s: '%s' has no readable extent", path.c_str(), t.name.c_str());
+    auto add = [&](const GgufFile& g) -> int {
+        for (const GgufTensor& t : g.tensors()) {
+            SrcTensor s;
+            s.name  = t.name;
+            s.ggml  = t.ggml_type;
+            s.rad_dtype = gguf_to_rad_dtype(t.ggml_type);
+            /* GGUF is fastest-first; everything from here on is row-major. */
+            for (int d = (int)t.n_dims - 1; d >= 0; --d) s.shape.push_back(t.ne[d]);
+            s.data  = g.tensor_data(t);
+            s.bytes = (int64_t)t.bytes;
+            if (!s.data) {
+                RAD_ERR("%s: '%s' has no readable extent", g.path().c_str(), t.name.c_str());
+                return (int)RAD_E_FORMAT;
+            }
+            if (!index_.emplace(s.name, tensors_.size()).second) {
+                RAD_ERR("%s: '%s' is in more than one shard", g.path().c_str(), t.name.c_str());
+                return RAD_E_FORMAT;
+            }
+            tensors_.push_back(std::move(s));
+        }
+        return (int)RAD_OK;
+    };
+    RAD_TRY(add(gguf_));
+    /* llama.cpp's split files (gguf-split): the first shard carries the metadata and every shard a
+     * part of the tensors, named <prefix>-NNNNN-of-MMMMM.gguf (1-based) with `split.no` 0-based. */
+    int64_t n_split = 1, no = 0;
+    if (gguf_.get_i64("split.count", &n_split) && n_split > 1) {
+        gguf_.get_i64("split.no", &no);
+        const std::string tail = fmt("-%05d-of-%05d.gguf", 1, (int)n_split);
+        if (no != 0 || path.size() <= tail.size() ||
+            path.compare(path.size() - tail.size(), tail.size(), tail) != 0) {
+            RAD_ERR("%s is shard %lld of a %lld-way split GGUF; give the first, named *%s",
+                    path.c_str(), (long long)no + 1, (long long)n_split, tail.c_str());
             return RAD_E_FORMAT;
         }
-        index_.emplace(s.name, tensors_.size());
-        tensors_.push_back(std::move(s));
+        const std::string prefix = path.substr(0, path.size() - tail.size());
+        for (int64_t i = 1; i < n_split; ++i) {
+            const std::string sp = prefix + fmt("-%05d-of-%05d.gguf", (int)i + 1, (int)n_split);
+            auto g = std::make_unique<GgufFile>();
+            if (g->open(sp.c_str()) != RAD_OK) {
+                RAD_ERR("%s: shard %lld of %lld will not open", sp.c_str(), (long long)i + 1,
+                        (long long)n_split);
+                return RAD_E_IO;
+            }
+            int64_t gi = -1;
+            if (!g->get_i64("split.no", &gi) || gi != i) {
+                RAD_ERR("%s says it is split.no %lld, expected %lld", sp.c_str(), (long long)gi,
+                        (long long)i);
+                return RAD_E_FORMAT;
+            }
+            RAD_TRY(add(*g));
+            gguf_more_.push_back(std::move(g));
+        }
+        int64_t want = -1;
+        if (gguf_.get_i64("split.tensors.count", &want) && want != (int64_t)tensors_.size()) {
+            RAD_ERR("%s: the split holds %zu tensors, its first shard says %lld", path.c_str(),
+                    tensors_.size(), (long long)want);
+            return RAD_E_FORMAT;
+        }
     }
+    /* Block types import as planes; one rad-convert cannot read is named now, not at its weight. */
+    for (const SrcTensor& t : tensors_) {
+        if (t.rad_dtype != RAD_DT_INVALID) continue;
+        if (lq::ggml::plane_kind(t.ggml)) {
+            if (import_ == Import::None) import_ = Import::Gguf;
+        } else if (import_why_.empty()) {
+            const GgufDtype* gd = gguf_dtype(t.ggml);
+            import_why_ = "'" + t.name + "' is GGUF type " +
+                          (gd ? std::string(gd->name) : std::to_string(t.ggml)) +
+                          ", which rad-convert does not import";
+        }
+    }
+    if (!import_why_.empty()) import_ = Import::None;
     return meta_from_gguf(gguf_, &meta_);
 }
 
@@ -1249,7 +1308,8 @@ int Checkpoint::import_piece(const std::string& name, const SrcTensor** codes,
         return rc;
     };
     /* CtFp8 has no imported form: its FP8 weights read stock (ckpt_resolve). */
-    if (import_ == Import::None || import_ == Import::CtFp8) return RAD_E_NOTFOUND;
+    if (import_ == Import::None || import_ == Import::CtFp8 || import_ == Import::Gguf)
+        return RAD_E_NOTFOUND;
     if (auto hit = imported_.find(name); hit != imported_.end()) {
         *codes = hit->second.first;
         *scale = hit->second.second;
@@ -2183,8 +2243,29 @@ int ckpt_resolve(Checkpoint& ck, const Program& prog, const std::string& name, b
         if (out->scales[k]) unscaled = false; else scaled = false;
     }
     if (dt == RAD_DT_INVALID) {
-        out->why = std::string("'") + p0.name + "' is a GGUF " +
-                   (gguf_dtype(p0.ggml) ? gguf_dtype(p0.ggml)->name : "block") + " tensor";
+        /* A GGUF block type, imported block for block as the planes libquant's `ggml` quantiser
+         * writes for the same blocks (lq_ggml_planes.h). One type throughout, joined only along
+         * rows: a block never spans rows, so a row join keeps every block whole. */
+        const lq::ggml::PlaneKind* kind = lq::ggml::plane_kind(p0.ggml);
+        const std::string tn = gguf_dtype(p0.ggml) ? gguf_dtype(p0.ggml)->name : "block";
+        bool one = true;
+        for (const SrcTensor* pk : out->pieces) one = one && pk->ggml == p0.ggml;
+        if (!kind) {
+            out->why = "'" + p0.name + "' is a GGUF " + tn +
+                       " tensor, a type rad-convert does not import";
+        } else if (!one) {
+            out->why = "its GGUF pieces are stored in different block types";
+        } else if (d != 0 && out->pieces.size() > 1) {
+            out->why = "its GGUF " + tn + " pieces are joined along a column, across their blocks";
+        } else if (out->cols % kind->block) {
+            out->why = "its rows (" + std::to_string(out->cols) + " values) are not whole " + tn +
+                       " blocks of " + std::to_string(kind->block);
+        } else {
+            out->imported = true;
+            out->enc = lq::ggml::encoding_of(kind->type);
+            out->why = "it is GGUF " + tn + ", which rad-convert imports block for block -- "
+                       "serve the container it writes";
+        }
     } else if (!same) {
         out->why = "its pieces are stored in different dtypes";
     } else if (p0.pbits) {
@@ -2651,6 +2732,28 @@ int ckpt_rows_f32(const CkptWeight& w, int64_t r0, int64_t nr, float* out, std::
         }
         return RAD_OK;
     }
+    if (w.imported && w.pieces[0]->rad_dtype == RAD_DT_INVALID) {
+        /* A GGUF block type: the rows' planes through the core's decoder, which gives llama.cpp's
+         * dequantize_row_<type> value for value (tests/quant_ggml_test.cpp holds the two equal).
+         * Every row plane has blocks one row tall, so the planes of these rows are a weight of
+         * `nr` rows on their own; the shared planes are whole. */
+        std::vector<std::vector<uint8_t>> pl((size_t)w.enc.n_planes);
+        const void* data[RAD_ENC_MAX_PLANES] = {};
+        for (int i = 0; i < w.enc.n_planes; ++i) {
+            const RadEncPlane& p = w.enc.plane[i];
+            int64_t pr = 0, pc = 0;
+            rad_enc_plane_dims(&p, w.rows, w.cols, &pr, &pc);
+            const bool row = p.kind == RAD_PLANE_TILED && p.block[0] == 1;
+            const int64_t a = row ? r0 : 0, n = row ? nr : pr;
+            pl[(size_t)i].resize((size_t)std::max<int64_t>(1, n * rad_enc_row_bytes(p.dtype, pc)));
+            const int rc = ckpt_plane_rows(w, i, a, n, pl[(size_t)i].data(), why);
+            if (rc != RAD_OK) return rc;
+            data[i] = pl[(size_t)i].data();
+        }
+        EncodedView v;
+        enc_view(w.enc, nr, w.cols, data, &v);
+        return enc_decode_rows(v, 0, nr, out, why);
+    }
     Joined j;
     j.init(w.pieces, w.concat_dim);
     /* Runs arrive in order, so the cursor is the count already written. */
@@ -3078,6 +3181,50 @@ int ckpt_plane_rows(const CkptWeight& w, int k, int64_t r0, int64_t nr, void* ds
                 }
             }
             base += N;
+        }
+        return RAD_OK;
+    }
+    if (w.imported && w.pieces[0]->rad_dtype == RAD_DT_INVALID) {
+        /* A GGUF block type, unpacked as libquant's `ggml` quantiser unpacks the blocks its own
+         * search writes (lq_ggml_planes.h): a shared plane (codebook, IQ4's levels, IQ2/IQ3's 1/8)
+         * as it writes it, a row plane from that row's blocks. Pieces join along rows, so a row is
+         * one piece's row. */
+        const lq::ggml::PlaneKind* kind = lq::ggml::plane_kind(w.pieces[0]->ggml);
+        if (!kind) return refuse(RAD_E_STATE, "'" + w.name + "' is not a GGUF type with planes");
+        const RadEncPlane& pl = w.enc.plane[k];
+        const int64_t prb = rad_enc_row_bytes(dt, pc);
+        if (pl.kind != RAD_PLANE_TILED || pl.block[0] != 1) {
+            std::vector<uint8_t> all((size_t)std::max<int64_t>(1, pr * prb));
+            void* planes[RAD_ENC_MAX_PLANES] = {};
+            planes[k] = all.data();
+            lq::ggml::write_shared(kind->type, w.enc, planes);
+            std::memcpy(o, all.data() + r0 * prb, (size_t)(nr * prb));
+            return RAD_OK;
+        }
+        const int64_t nb = w.cols / kind->block, rb = nb * (int64_t)kind->block_bytes;
+        std::vector<std::vector<uint8_t>> scratch((size_t)w.enc.n_planes);
+        uint8_t* row[RAD_ENC_MAX_PLANES] = {};
+        for (int i = 0; i < w.enc.n_planes; ++i) {
+            const RadEncPlane& p = w.enc.plane[i];
+            if (i == k || p.kind != RAD_PLANE_TILED || p.block[0] != 1) continue;
+            int64_t r_ = 0, c_ = 0;
+            rad_enc_plane_dims(&p, w.rows, w.cols, &r_, &c_);
+            scratch[(size_t)i].resize((size_t)rad_enc_row_bytes(p.dtype, c_));
+            row[i] = scratch[(size_t)i].data();
+        }
+        int64_t base = 0;
+        for (const SrcTensor* sp : w.pieces) {
+            int64_t n_rows = 0, n_cols = 0;
+            rad_enc_view((uint32_t)sp->shape.size(), sp->shape.data(), &n_rows, &n_cols);
+            if (n_cols != w.cols || sp->bytes < n_rows * rb)
+                return refuse(RAD_E_SHAPE, "'" + sp->name + "' is not whole rows of " + kind->name +
+                                           " blocks");
+            for (int64_t r = std::max(r0, base); r < std::min(r0 + nr, base + n_rows); ++r) {
+                row[k] = o;
+                kind->unpack((const uint8_t*)sp->data + (r - base) * rb, nb, row);
+                o += prb;
+            }
+            base += n_rows;
         }
         return RAD_OK;
     }

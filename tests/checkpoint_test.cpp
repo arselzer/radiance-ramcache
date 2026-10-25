@@ -2113,7 +2113,8 @@ TEST(a_gguf_tensor_is_row_major_and_its_legacy_blocks_decode_by_definition) {
     const std::string dir = fresh_dir();
     const std::string path = dir + "/m.gguf";
     std::vector<float> w8, w40, w41, w50, w51;
-    std::vector<uint8_t> q4k(144, 0);
+    /* Row 1 of the q4_K tensor is all zero (a row read at an offset of an imported weight). */
+    std::vector<uint8_t> q4k(2 * 144, 0);
     const uint16_t q4d = h16(0.5f), q4min = h16(0.25f);
     std::memcpy(q4k.data(), &q4d, 2);
     std::memcpy(q4k.data() + 2, &q4min, 2);
@@ -2122,7 +2123,7 @@ TEST(a_gguf_tensor_is_row_major_and_its_legacy_blocks_decode_by_definition) {
     std::memcpy(q4k.data() + 4, q4scales, sizeof q4scales);
     q4k[16] = 0x21;       /* low/high nibbles of values 0 and 32 */
     q4k[16 + 64] = 0x32;  /* values 128 and 160, including packed high scale bits */
-    GTensor k4{ "t.q4_k", 12, { 256, 1 }, q4k };
+    GTensor k4{ "t.q4_k", 12, { 256, 2 }, q4k };
     std::vector<uint8_t> q6k(210, 0);
     const uint16_t q6d = h16(0.5f);
     std::memcpy(q6k.data() + 208, &q6d, 2);
@@ -2172,9 +2173,14 @@ TEST(a_gguf_tensor_is_row_major_and_its_legacy_blocks_decode_by_definition) {
         CHECK_EQ(row[63], (*l.want)[3 * 64 + 63]);
     }
     {
+        /* A K-quant imports block for block, as the planes libquant's `ggml` quantiser writes, and
+         * decodes as dequantize_row_q4_K does: d * sc * q - dmin * m. */
         CkptWeight w;
         REQUIRE_EQ(ckpt_resolve(ck, prog, "t.q4_k", false, &w, &why), RAD_OK);
-        CHECK_EQ(w.shape[0], (int64_t)1);
+        CHECK(w.imported);
+        CHECK(!w.trivial);
+        CHECK(has(w.why, "q4_K"));
+        CHECK_EQ(w.shape[0], (int64_t)2);
         CHECK_EQ(w.shape[1], (int64_t)256);
         std::vector<float> f(256);
         REQUIRE_EQ(ckpt_rows_f32(w, 0, 1, f.data(), &why), RAD_OK);
@@ -2182,10 +2188,16 @@ TEST(a_gguf_tensor_is_row_major_and_its_legacy_blocks_decode_by_definition) {
         CHECK_EQ(f[32], 0.5f);
         CHECK_EQ(f[128], 12.5f);
         CHECK_EQ(f[160], 22.25f);
+        std::vector<float> one(256);                        /* row 1 alone */
+        REQUIRE_EQ(ckpt_rows_f32(w, 1, 1, one.data(), &why), RAD_OK);
+        int bad = 0;
+        for (float v : one) bad += v != 0.0f;
+        CHECK_EQ(bad, 0);
     }
     {
         CkptWeight w;
         REQUIRE_EQ(ckpt_resolve(ck, prog, "t.q6_k", false, &w, &why), RAD_OK);
+        CHECK(w.imported);
         std::vector<float> f(256);
         REQUIRE_EQ(ckpt_rows_f32(w, 0, 1, f.data(), &why), RAD_OK);
         CHECK_EQ(f[0], 17.0f);

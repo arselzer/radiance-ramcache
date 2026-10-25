@@ -164,11 +164,14 @@ public:
      * (detect_import). ModelOpt: NVIDIA ModelOpt's NVFP4, FP8, or both per layer
      * (MIXED_PRECISION). In an Nvfp4, CtFp8 or ModelOpt release every weight without the NVFP4
      * tensors reads stock, so FP8 and bf16 linears beside the NVFP4 ones read by their own form.
+     * Gguf: a GGUF holding llama.cpp block types (K-, I- and legacy quants): every such tensor is
+     * imported block for block as the affine planes libquant's `ggml` quantiser writes for the
+     * same blocks (libquant/lq_ggml_planes.h); its float tensors read as they are.
      * An unreadable form of these stays None, with the reason in import_refusal(). The
      * quantization_config keys are then renamed `imported_quantization_config.*`, since they
      * describe the tool, not a served format. */
     enum class Import { None, Gptq, QuarkMx, CtInt4, ParoMx, ParoM2, ParoI5, ParoI4, Nvfp4, CtFp8,
-                        ModelOpt };
+                        ModelOpt, Gguf };
     Import imports() const { return import_; }
     const std::string& import_refusal() const { return import_why_; }
 
@@ -200,6 +203,8 @@ private:
     enum Kind { None, Gguf, SafeT } kind_ = None;
     std::string path_, dir_, tok_dir_, meta_dir_;
     GgufFile    gguf_;
+    /* A split GGUF's shards after the first (llama.cpp's gguf-split): tensors only. */
+    std::vector<std::unique_ptr<GgufFile>> gguf_more_;
     MetaOwn     meta_;
     std::vector<std::unique_ptr<SafeTensorsFile>> shards_;
     std::vector<std::unique_ptr<TorchZipFile>>    torch_;

@@ -1174,6 +1174,16 @@ std::vector<Case> build_cases() {
                                    HS("dtype", dt) });
         add("rope_rows", { HI("M", 4), HI("n_head", 2), HI("head_dim", 64), HI("rot", 64),
                            HI("off", 0), HS("mode", "gptj"), HI("inverse", 0), HS("dtype", dt) });
+        add("quant_roundtrip", { HI("M", 5), HI("n", 448), HI("block", 64), HS("format", "fp8_e4m3"),
+                                 HS("scale", "ue8m0"), HS("dtype", dt) });
+        add("quant_roundtrip", { HI("M", 5), HI("n", 192), HI("block", 64), HS("format", "fp8_e4m3"),
+                                 HS("scale", "f32"), HS("dtype", dt) });
+        add("quant_roundtrip", { HI("M", 5), HI("n", 160), HI("block", 32), HS("format", "fp4_e2m1"),
+                                 HS("scale", "ue8m0"), HS("dtype", dt) });
+        add("quant_roundtrip", { HI("M", 5), HI("n", 144), HI("block", 16), HS("format", "fp4_e2m1"),
+                                 HS("scale", "e4m3"), HS("dtype", dt) });
+        for (int ratio : { 4, 64 })
+            add("softmax_pool", { HI("M", 5), HI("n", 131), HI("ratio", ratio), HS("dtype", dt) });
     }
 
     /* ================================================================== speed-only, at model size

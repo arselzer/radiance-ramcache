@@ -373,6 +373,11 @@ static const RadOperandSpec oRopeTable[] = { OPD("positions"), OUT("cos_sin") };
 static const RadParamSpec pRopeRows[] = { P_INT("M"), P_INT("n_head"), P_INT("head_dim"),
     P_INT("rot"), P_INT("off"), P_STR("mode"), P_INT("inverse"), P_STR("dtype") };
 static const RadOperandSpec oRopeRows[] = { INOUT("x"), OPD("cos_sin"), OPD("positions") };
+static const RadParamSpec pQuantRoundtrip[] = { P_INT("M"), P_INT("n"), P_INT("block"),
+    P_STR("format"), P_STR("scale"), P_STR("dtype") };
+static const RadOperandSpec oQuantRoundtrip[] = { INOUT("x") };
+static const RadParamSpec pSoftmaxPool[] = { P_INT("M"), P_INT("n"), P_INT("ratio"), P_STR("dtype") };
+static const RadOperandSpec oSoftmaxPool[] = { OPD("stage"), OUT("out"), OPD_O("page") };
 
 /* QSA's compressed key, libr4d's schema (libr4d/r4d_rows.cpp): `block_size` is `ratio` under the
  * name the block-key store's KV group uses; `page` and `pos` are optional. */
@@ -1080,6 +1085,10 @@ static const RadOpSchema kSchemas[] = {
 { "rope_table", ARR(pRopeTable), ARR(oRopeTable), "cos/sin at each position's own row." },
 { "rope_rows", ARR(pRopeRows), ARR(oRopeRows),
   "rope from a rope_table plane over columns [off, off+rot) of each head, in place." },
+{ "quant_roundtrip", ARR(pQuantRoundtrip), ARR(oQuantRoundtrip),
+  "block-scaled fp8 / fp4 quantise then dequantise in place, libref's scales and codes." },
+{ "softmax_pool", ARR(pSoftmaxPool), ARR(oSoftmaxPool),
+  "channel-wise softmax pooling of `ratio` rows into one entry; a negative page skips it." },
 { "qsa_block_key", ARR(pQsaBlockKey), ARR(oQsaBlockKey),
   "QSA's compressed key: the mean of a block's `ratio` rows rounded to k's dtype, RMS-normed with "
   "gain (wadd + w), rotated at the block's position with `rope`'s ladder and YaRN; libref's "
@@ -1671,6 +1680,10 @@ SIMPLE("avx_rope_table", "rope_table", "attn", "cos/sin at each position's own r
        L(rope_table)),
 SIMPLE("avx_rope_rows", "rope_rows", "attn", "rope from a cos/sin plane over a window of each head",
        DT_FLOAT, L(rope_rows)),
+SIMPLE("avx_quant_roundtrip", "quant_roundtrip", "quant",
+       "block-scaled fp8 / fp4 quantise-dequantise in place", DT_FLOAT, L(quant_roundtrip)),
+SIMPLE("avx_softmax_pool", "softmax_pool", "attn", "channel-wise softmax pooling of ratio rows",
+       DT_FLOAT, L(softmax_pool)),
 SIMPLE("avx_qsa_block_key", "qsa_block_key", "attn",
        "QSA compressed key: pooled, normed and rotated at the block's position", DT_FLOAT,
        L(qsa_block_key)),

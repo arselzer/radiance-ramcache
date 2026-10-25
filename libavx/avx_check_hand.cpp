@@ -4795,6 +4795,22 @@ void audio_cases(std::vector<Hand>& hs) {
     }
 }
 
+/* ================================================================== DeepSeek-V4.1
+ *
+ * The ops' descriptions draw what the model hands them, but not the optional operands and the
+ * negative ids that skip a row. */
+void ds41_cases(std::vector<Hand>& hs) {
+    /* ---- the selections' optional operands and skipped rows ------------------------------ */
+    {
+        Hand h("a negative page skips its entry", "softmax_pool", 1e-6);
+        h.dense(RAD_F32, { 3 * 4, 2 * 40 }, hfill(62, 2.0f))
+         .dense(RAD_BF16, { 3, 40 }, hfill(63), true)
+         .idx({ 2, -1, 0 })
+         .pi("M", 3).pi("n", 40).pi("ratio", 4).ps("dtype", "bf16");
+        hs.push_back(std::move(h));
+    }
+}
+
 }  // namespace
 
 bool hand_cases(const Check& ck) {
@@ -4812,6 +4828,7 @@ bool hand_cases(const Check& ck) {
     kvstream_cases(hs);
     encoder_cases(hs);
     audio_cases(hs);
+    ds41_cases(hs);
     Broken broken;
     planes_cases(ck, hs, broken);
 

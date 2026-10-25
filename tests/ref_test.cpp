@@ -450,6 +450,77 @@ TEST(rope_rows_rotates_a_window_of_each_head_and_inverts) {
     CHECK_EQ(run("rope_rows", u), RAD_E_UNSUPPORTED);
 }
 
+/* quant_roundtrip against hand-worked blocks: fp8 with a power-of-two scale, fp4 with an e4m3
+ * scale (and an all-zero block floored, not divided by zero), fp4 with a power-of-two scale and
+ * ties to the even code; a second pass changes nothing. */
+TEST(quant_roundtrip_rounds_blocks_as_the_reference_kernels_do) {
+    T x(RAD_F32, {1, 8}); x.f({0.1f, -0.2f, 0.3f, 0.4f, 0, 0, 0, 0});
+    A a; a.t(x).i("M", 1).i("n", 8).i("block", 4).s("format", "fp8_e4m3").s("scale", "ue8m0")
+        .s("dtype", "f32");
+    REQUIRE_EQ(run("quant_roundtrip", a), RAD_OK);
+    /* amax .4: scale 2^-10; 102.4 -> 104, 204.8 -> 208, 307.2 -> 320, 409.6 -> 416. */
+    const float e8[8] = {104 / 1024.0f, -208 / 1024.0f, 320 / 1024.0f, 416 / 1024.0f, 0, 0, 0, 0};
+    for (int i = 0; i < 8; ++i) CHECK_EQ(x.at(i), e8[i]);
+    REQUIRE_EQ(run("quant_roundtrip", a), RAD_OK);
+    for (int i = 0; i < 8; ++i) CHECK_EQ(x.at(i), e8[i]);
+
+    T y(RAD_BF16, {1, 32});
+    std::vector<float> yv(32, 0.0f);
+    yv[0] = 0.6f; yv[1] = 1.2f; yv[2] = -3.0f;
+    y.f(yv);
+    A b; b.t(y).i("M", 1).i("n", 32).i("block", 16).s("format", "fp4_e2m1").s("scale", "e4m3")
+        .s("dtype", "bf16");
+    REQUIRE_EQ(run("quant_roundtrip", b), RAD_OK);
+    /* amax 3: scale fp8(.5) = .5; 1.19.. -> 1, 2.39.. -> 2, -6 -> -6. The zero block stays zero. */
+    CHECK_EQ(y.at(0), 0.5f);
+    CHECK_EQ(y.at(1), 1.0f);
+    CHECK_EQ(y.at(2), -3.0f);
+    for (int i = 3; i < 32; ++i) CHECK_EQ(y.at(i), 0.0f);
+
+    T z(RAD_F32, {1, 32});
+    std::vector<float> zv(32, 0.0f);
+    zv[0] = 5.0f; zv[1] = 0.75f; zv[2] = 2.5f; zv[3] = -0.25f; zv[4] = 0.7f;
+    z.f(zv);
+    A c; c.t(z).i("M", 1).i("n", 32).i("block", 32).s("format", "fp4_e2m1").s("scale", "ue8m0")
+        .s("dtype", "f32");
+    REQUIRE_EQ(run("quant_roundtrip", c), RAD_OK);
+    /* amax 5: scale 1; the ties 5, .75, 2.5 and .25 go to the even code: 4, 1, 2, 0. */
+    CHECK_EQ(z.at(0), 4.0f);
+    CHECK_EQ(z.at(1), 1.0f);
+    CHECK_EQ(z.at(2), 2.0f);
+    CHECK_EQ(z.at(3), 0.0f);
+    CHECK_EQ(z.at(4), 0.5f);
+    /* fp4 has no f32 scale and fp8 no e4m3 one; a block that does not divide the row is refused. */
+    A d; d.t(z).i("M", 1).i("n", 32).i("block", 32).s("format", "fp4_e2m1").s("scale", "f32")
+        .s("dtype", "f32");
+    CHECK_EQ(run("quant_roundtrip", d), RAD_E_UNSUPPORTED);
+    A e; e.t(z).i("M", 1).i("n", 32).i("block", 12).s("format", "fp4_e2m1").s("scale", "ue8m0")
+        .s("dtype", "f32");
+    CHECK_EQ(run("quant_roundtrip", e), RAD_E_SHAPE);
+}
+
+/* softmax_pool: per channel, the softmax of the scores weights the values; a negative page skips
+ * the entry. */
+TEST(softmax_pool_weights_each_channel_by_its_own_softmax) {
+    T st(RAD_F32, {4, 4});
+    st.f({1, 2, 0, 0,                       /* entry 0, row 0: values 1 2, scores 0 0 */
+          3, 4, 0, std::log(3.0f),          /* entry 0, row 1: values 3 4, scores 0 ln3 */
+          5, 6, 1, 1,
+          7, 8, 1, 1});
+    T out(RAD_F32, {2, 2}); out.f({99, 99, 99, 99});
+    T page(RAD_I32, {2}); page.n({0, -1});
+    A a; a.t(st).t(out).t(page).i("M", 2).i("n", 2).i("ratio", 2).s("dtype", "f32");
+    REQUIRE_EQ(run("softmax_pool", a), RAD_OK);
+    CHECK_EQ(out.at(0), 2.0f);
+    CHECK(std::fabs(out.at(1) - 3.5f) < 1e-6f);
+    CHECK_EQ(out.at(2), 99.0f);
+    CHECK_EQ(out.at(3), 99.0f);
+    A b; b.t(st).t(out).i("M", 2).i("n", 2).i("ratio", 2).s("dtype", "f32");
+    REQUIRE_EQ(run("softmax_pool", b), RAD_OK);
+    CHECK_EQ(out.at(2), 6.0f);
+    CHECK_EQ(out.at(3), 7.0f);
+}
+
 TEST(manifold_sinkhorn_first_pass_and_epsilon_are_distinct) {
     T h(RAD_F32, {1, 2}); h.f({1, 3});
     T fn(RAD_F32, {8, 2}), scale(RAD_F32, {3}); scale.f({1, 1, 1});
@@ -1098,7 +1169,7 @@ TEST(op_vocabulary) {
         "rmsnorm", "rmsnorm_p", "rmsnorm_add", "hc_enter", "hc_read", "hc_write", "hc_project",
         "mtp_enter",
         "mhc_pre", "mhc_pre_partial", "mhc_pre_finish", "mhc_post", "mhc_contract",
-        "mhc_mix", "mhc_collapse", "swiglu_clamped", "router_sigmoid_topk", "router_scored_topk", "rope_rows", "dsa_pool", "dsa_query", "dsa_score", "mla_attn", "mla_project", "gemm_nt_f32",
+        "mhc_mix", "mhc_collapse", "swiglu_clamped", "router_sigmoid_topk", "router_scored_topk", "rope_rows", "quant_roundtrip", "softmax_pool", "dsa_pool", "dsa_query", "dsa_score", "mla_attn", "mla_project", "gemm_nt_f32",
         "kda_update",
         "layernorm", "add", "mul", "mul_weight", "silu_mul", "gelu_mul", "act_mul", "seg_mean",
         "pool_rows", "relu", "clamp", "conv2d", "conv2d_unfold", "conv1d_dw", "rel_sinusoid",
@@ -8669,6 +8740,9 @@ std::vector<Geo> geometries() {
                                   .d("theta", 1e4).d("eps", 1e-6)),
         G("rope_table", "M", 3, a.i("M", R).i("rot", 8).d("theta", 1e4).d("scale", 1.0)
                                 .s("dtype", "f32")),
+        G("quant_roundtrip", "M", 3, a.i("M", R).i("n", 64).i("block", 32).s("format", "fp4_e2m1")
+                                     .s("scale", "ue8m0").s("dtype", "bf16")),
+        G("softmax_pool", "M", 3, a.i("M", R).i("n", 8).i("ratio", 2).s("dtype", "bf16")),
         G("rope_rows", "M", 3, a.i("M", R).i("n_head", 2).i("head_dim", 12).i("rot", 8).i("off", 4)
                                .s("mode", "gptj").i("inverse", 0).s("dtype", "f32")),
         G("qsa_block_key", "M", 2, a.i("M", R).i("n", 32).i("ratio", 4).i("rotary_dim", 8)

@@ -84,6 +84,7 @@ int         avx_par_force(int threads);
     X(mhc_mix)              X(mhc_collapse)                                                       \
     X(router_scored_topk)                                                                         \
     X(rope_rows)                                                                                  \
+    X(quant_roundtrip)      X(softmax_pool)                                                       \
     X(add)                  X(grid_embed)           X(grid_embed_aa)        X(causal_conv1d)      \
     X(mul)                  X(silu_mul)             X(gelu_mul)             X(gelu)               \
     X(silu)                 X(sigmoid)              X(logit_softcap)        X(gather_rows)        \

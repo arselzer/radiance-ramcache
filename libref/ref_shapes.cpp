@@ -1626,6 +1626,24 @@ int ref_rope_rows_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out
     return o.finish("rope_rows", operand, out);
 }
 
+int ref_quant_roundtrip_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0), block = gi(p, n_p, "block", 0);
+    if (M <= 0 || n < 1 || block < 1 || n % block) return RAD_E_UNSUPPORTED;
+    Opd o;
+    o.t(act_dt(p, n_p), { M, n });
+    return o.finish("quant_roundtrip", operand, out);
+}
+
+int ref_softmax_pool_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0), ratio = gi(p, n_p, "ratio", 0);
+    if (M <= 0 || n < 1 || ratio < 1 || ratio > 64) return RAD_E_UNSUPPORTED;
+    Opd o;
+    o.t((uint32_t)RAD_F32, { M * ratio, 2 * n });   /* stage: values then scores */
+    o.t(act_dt(p, n_p), { M, n });
+    o.t_idx({ M }, M, -1, 0);                       /* page, optional: negative skips the entry */
+    return o.finish("softmax_pool", operand, out);
+}
+
 int ref_qsa_block_key_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = gi(p, n_p, "M", 0);
     const int64_t n = gi(p, n_p, "n", 0);

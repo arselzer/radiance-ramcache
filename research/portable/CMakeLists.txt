@@ -3,7 +3,7 @@ project(radiance_ramcache_portable_host LANGUAGES CXX)
 find_package(Threads REQUIRED)
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 get_filename_component(PORTABLE_REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
-set(RADIANCE_SOURCE "${PORTABLE_REPO_ROOT}/radiance" CACHE PATH "Exported selected Foundation v2 source")
+set(RADIANCE_SOURCE "${PORTABLE_REPO_ROOT}/radiance" CACHE PATH "Exported selected Engine transport v4 source")
 set(RADIANCE_HOST_BUILD "" CACHE PATH "Explicit separately built matching HOST Core")
 set(PORTABLE_MODE "release" CACHE STRING "release | asan | tsan")
 if(NOT PORTABLE_MODE MATCHES "^(release|asan|tsan)$")
@@ -33,6 +33,7 @@ elseif(PORTABLE_MODE STREQUAL "tsan")
   add_link_options(-fsanitize=thread)
 endif()
 set(FOUNDATION "${PORTABLE_REPO_ROOT}/research/glm53-engine-native-foundation-v3-prototype")
+set(TRANSPORT "${PORTABLE_REPO_ROOT}/research/glm53-tiny-engine-native-transport-v4-prototype")
 set(COMPACT "${FOUNDATION}/regressions/compact")
 set(P3 "${COMPACT}/strict_p3")
 set(PROVIDER "${PORTABLE_REPO_ROOT}/research/glm53-sharded-native-provider-prototype")
@@ -109,5 +110,21 @@ target_compile_definitions(ds41_unified_native_policy_host_test PRIVATE UNIFIED_
 target_link_libraries(ds41_unified_native_policy_host_test PRIVATE portable_legacy_native_source)
 target_link_options(ds41_unified_native_policy_host_test PRIVATE "LINKER:--wrap=rad_memcpy_async" "LINKER:--wrap=rad_event_record")
 add_dependencies(ds41_unified_native_policy_host_test unified_policy_collector)
+# Eighth checker: unchanged v4 body and original caller-owned fixture writer.
+# Engine's fixed source-factory helpers already live in isolated namespaces in
+# the matching Core; do not link a second source-factory/provider archive here.
+add_executable(tiny_engine_native_transport_check "${TRANSPORT}/checker.cpp"
+  "${TRANSPORT}/contract/fixture_writer.cpp" "${TRANSPORT}/contract/profile.cpp"
+  "${TRANSPORT}/contract/shape_profile.cpp")
+portable_core_exe(tiny_engine_native_transport_check)
+target_include_directories(tiny_engine_native_transport_check PRIVATE
+  "${TRANSPORT}" "${TRANSPORT}/contract" "${RADIANCE_SOURCE}")
+target_link_options(tiny_engine_native_transport_check PRIVATE
+  "LINKER:--wrap=rad_dev_alloc" "LINKER:--wrap=rad_dev_free"
+  "LINKER:--wrap=rad_memcpy_async" "LINKER:--wrap=open" "LINKER:--wrap=pread")
+# The shared architecture module's tiny_arch/shape_profile bodies are byte-exact
+# to v4's contract copies (recorded in staging provenance), so reuse that module.
+add_dependencies(tiny_engine_native_transport_check glm53_tiny_startup_arch)
 # No archival add_subdirectory/pin rewrite, CTest/automatic execution, GPU/HIP,
-# optional physical exporter target, install, Engine/CLI activation or serving.
+# optional physical exporter target, install, production CLI activation or serving.
+# The eighth explicit manual checker calls actual tiny HOST Engine.start only.

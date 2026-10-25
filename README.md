@@ -20,7 +20,7 @@ python3 tools/verify_snapshot.py
 python3 tools/build_host.py --mode release --run-host-checks
 ```
 
-The HOST checks build CPU fixtures. They do not start an API server or use a GPU. Sanitizer modes and further details are described by `python3 tools/build_host.py --help`.
+The eight HOST checks build CPU fixtures. One calls actual Engine startup and teardown for the closed tiny synthetic transport profile; none starts an API server, runs a model step or uses a GPU. Sanitizer modes and further details are described by `python3 tools/build_host.py --help`.
 
 The original package READMEs and receipts retain their historical paths and source pins. Their legacy verification scripts require the original workspace. Use the portable entrypoint above for this repository. Optional physical-source and composite-exporter packages are included as research source; their original CMake files target older pinned Core revisions.
 

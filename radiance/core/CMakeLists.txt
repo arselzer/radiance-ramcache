@@ -25,6 +25,7 @@ target_link_libraries(rad_core PUBLIC rad_abi ${CMAKE_DL_LIBS} Threads::Threads)
 target_compile_definitions(rad_core PUBLIC RAD_VERSION="${PROJECT_VERSION}")
 target_include_directories(rad_core PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}
+  ${CMAKE_SOURCE_DIR} # private bounded tiny-source helper includes tests/tiny_model.h
   ${CMAKE_SOURCE_DIR}/abi
   ${CMAKE_SOURCE_DIR}/vendor)
 

@@ -1,0 +1,345 @@
+{
+  "passed": true,
+  "mode": "tsan",
+  "commands": [
+    {
+      "command": [
+        "python3",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-tiny-engine-native-transport-v4-prototype/verify_source_pins.py"
+      ],
+      "log": "pins-before.log",
+      "returncode": 0
+    },
+    {
+      "command": [
+        "flock",
+        "--no-fork",
+        "--exclusive",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/research-heavy-runtime.lock",
+        "nice",
+        "-n19",
+        "/usr/bin/python3",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/run_guarded_heavy_research.py",
+        "--",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/build-glm53-engine-native-transport-v4-host-tsan/tiny_engine_native_transport_check",
+        "--run-host",
+        "--radiance-home",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/build-glm-engine-native-transport-v4-host-tsan/radiance_home",
+        "--architecture",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/build-glm53-engine-native-transport-v4-host-tsan/research-architectures/libglm53_tiny_startup_arch.so"
+      ],
+      "log": "engine-transport.log",
+      "returncode": 0
+    },
+    {
+      "command": [
+        "flock",
+        "--no-fork",
+        "--exclusive",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/research-heavy-runtime.lock",
+        "nice",
+        "-n19",
+        "/usr/bin/python3",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/run_guarded_heavy_research.py",
+        "--",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/build-glm53-engine-native-transport-v4-host-tsan/tiny_native_foundation_check"
+      ],
+      "log": "foundation.log",
+      "returncode": 0
+    },
+    {
+      "command": [
+        "flock",
+        "--no-fork",
+        "--exclusive",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/research-heavy-runtime.lock",
+        "nice",
+        "-n19",
+        "/usr/bin/python3",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/run_guarded_heavy_research.py",
+        "--",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/build-glm53-engine-native-transport-v4-host-tsan/contract/tiny_startup_metadata_check",
+        "--run-host",
+        "--radiance-home",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/build-glm-engine-native-transport-v4-host-tsan/radiance_home",
+        "--architecture",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/build-glm53-engine-native-transport-v4-host-tsan/research-architectures/libglm53_tiny_startup_arch.so"
+      ],
+      "log": "contract.log",
+      "returncode": 0
+    },
+    {
+      "command": [
+        "flock",
+        "--no-fork",
+        "--exclusive",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/research-heavy-runtime.lock",
+        "nice",
+        "-n19",
+        "/usr/bin/python3",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/run_guarded_heavy_research.py",
+        "--",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/build-glm53-engine-native-transport-v4-host-tsan/regressions/compact/compact_authority_test"
+      ],
+      "log": "compact_authority_test.log",
+      "returncode": 0
+    },
+    {
+      "command": [
+        "flock",
+        "--no-fork",
+        "--exclusive",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/research-heavy-runtime.lock",
+        "nice",
+        "-n19",
+        "/usr/bin/python3",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/run_guarded_heavy_research.py",
+        "--",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/build-glm53-engine-native-transport-v4-host-tsan/regressions/compact/compact_authority_collision_test"
+      ],
+      "log": "compact_authority_collision_test.log",
+      "returncode": 0
+    },
+    {
+      "command": [
+        "flock",
+        "--no-fork",
+        "--exclusive",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/research-heavy-runtime.lock",
+        "nice",
+        "-n19",
+        "/usr/bin/python3",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/run_guarded_heavy_research.py",
+        "--",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/build-glm53-engine-native-transport-v4-host-tsan/regressions/compact/compact_native_inventory_test",
+        "--radiance-home",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/build-glm-engine-native-transport-v4-host-tsan/radiance_home"
+      ],
+      "log": "inventory.log",
+      "returncode": 0
+    },
+    {
+      "command": [
+        "flock",
+        "--no-fork",
+        "--exclusive",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/research-heavy-runtime.lock",
+        "nice",
+        "-n19",
+        "/usr/bin/python3",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/run_guarded_heavy_research.py",
+        "--",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/build-glm53-engine-native-transport-v4-host-tsan/regressions/compact/strict_p3/glm53_native_source_strict_policy_test",
+        "--radiance-home",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/build-glm-engine-native-transport-v4-host-tsan/radiance_home"
+      ],
+      "log": "strict-p3.log",
+      "returncode": 0
+    },
+    {
+      "command": [
+        "flock",
+        "--no-fork",
+        "--exclusive",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/research-heavy-runtime.lock",
+        "nice",
+        "-n19",
+        "/usr/bin/python3",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/run_guarded_heavy_research.py",
+        "--",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/build-glm53-engine-native-transport-v4-host-tsan/regressions/compact/frozen-unified-regressions/ds41_unified_native_policy_host_test",
+        "--radiance-home",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/build-glm-engine-native-transport-v4-host-tsan/radiance_home"
+      ],
+      "log": "unified-policy.log",
+      "returncode": 0
+    },
+    {
+      "command": [
+        "flock",
+        "--no-fork",
+        "--exclusive",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/research-heavy-runtime.lock",
+        "nice",
+        "-n19",
+        "/usr/bin/python3",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/run_guarded_heavy_research.py",
+        "--",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/build-glm-engine-native-transport-v4-host-tsan/tests/model_failure_policy_test",
+        "-perf_"
+      ],
+      "log": "model_failure_policy_test.log",
+      "returncode": 0
+    },
+    {
+      "command": [
+        "flock",
+        "--no-fork",
+        "--exclusive",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/research-heavy-runtime.lock",
+        "nice",
+        "-n19",
+        "/usr/bin/python3",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/run_guarded_heavy_research.py",
+        "--",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/build-glm-engine-native-transport-v4-host-tsan/tests/deferred_status_test",
+        "-perf_"
+      ],
+      "log": "deferred_status_test.log",
+      "returncode": 0
+    },
+    {
+      "command": [
+        "flock",
+        "--no-fork",
+        "--exclusive",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/research-heavy-runtime.lock",
+        "nice",
+        "-n19",
+        "/usr/bin/python3",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/run_guarded_heavy_research.py",
+        "--",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/build-glm-engine-native-transport-v4-host-tsan/tests/deferred_status_checkpoint_test",
+        "-perf_"
+      ],
+      "log": "deferred_status_checkpoint_test.log",
+      "returncode": 0
+    },
+    {
+      "command": [
+        "flock",
+        "--no-fork",
+        "--exclusive",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/research-heavy-runtime.lock",
+        "nice",
+        "-n19",
+        "/usr/bin/python3",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/run_guarded_heavy_research.py",
+        "--",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/build-glm-engine-native-transport-v4-host-tsan/tests/abi_layout_test",
+        "-perf_"
+      ],
+      "log": "abi_layout_test.log",
+      "returncode": 0
+    },
+    {
+      "command": [
+        "flock",
+        "--no-fork",
+        "--exclusive",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/research-heavy-runtime.lock",
+        "nice",
+        "-n19",
+        "/usr/bin/python3",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/run_guarded_heavy_research.py",
+        "--",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/build-glm-engine-native-transport-v4-host-tsan/tests/runtime_test",
+        "-perf_"
+      ],
+      "log": "runtime_test.log",
+      "returncode": 0
+    },
+    {
+      "command": [
+        "flock",
+        "--no-fork",
+        "--exclusive",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/research-heavy-runtime.lock",
+        "nice",
+        "-n19",
+        "/usr/bin/python3",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/run_guarded_heavy_research.py",
+        "--",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/build-glm-engine-native-transport-v4-host-tsan/tests/mem_test",
+        "-perf_"
+      ],
+      "log": "mem_test.log",
+      "returncode": 0
+    },
+    {
+      "command": [
+        "flock",
+        "--no-fork",
+        "--exclusive",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/research-heavy-runtime.lock",
+        "nice",
+        "-n19",
+        "/usr/bin/python3",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/run_guarded_heavy_research.py",
+        "--",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/build-glm-engine-native-transport-v4-host-tsan/tests/plugin_test",
+        "-perf_"
+      ],
+      "log": "plugin_test.log",
+      "returncode": 0
+    },
+    {
+      "command": [
+        "flock",
+        "--no-fork",
+        "--exclusive",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/research-heavy-runtime.lock",
+        "nice",
+        "-n19",
+        "/usr/bin/python3",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/run_guarded_heavy_research.py",
+        "--",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/build-glm-engine-native-transport-v4-host-tsan/tests/place_test",
+        "-perf_"
+      ],
+      "log": "place_test.log",
+      "returncode": 0
+    },
+    {
+      "command": [
+        "flock",
+        "--no-fork",
+        "--exclusive",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/research-heavy-runtime.lock",
+        "nice",
+        "-n19",
+        "/usr/bin/python3",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/run_guarded_heavy_research.py",
+        "--",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/build-glm-engine-native-transport-v4-host-tsan/tests/build_test",
+        "-perf_"
+      ],
+      "log": "build_test.log",
+      "returncode": 0
+    },
+    {
+      "command": [
+        "python3",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-tiny-engine-native-transport-v4-prototype/verify_source_pins.py"
+      ],
+      "log": "pins-after.log",
+      "returncode": 0
+    }
+  ],
+  "GPU_execution": false,
+  "production_changes": false,
+  "scope": "Actual tiny Engine startup/transport and preserved regressions; no model step/GPU/full GLM",
+  "build_receipt_sha256": "3ef2f3433ba6153069f29395aa42b177dcca6a0f68bd9c75f6fc13f0a10cc0c6",
+  "source_receipt_sha256": "86dba9a7a3a522b137f6d5faeb0d7836dd071a4a21d9f2fbbbc7baa3e8cb1de8",
+  "evidence_sha256": {
+    "mem_test.log": "e10d16074563e44cfadc0b3d56d9d8bfb2e08acd997a06fc3b0e754470d24bf2",
+    "plugin_test.log": "1384eb88a9eb375094bcfaaf979112174dcd9aabe9d0db1681631dd4da79c4ea",
+    "engine-transport.log": "771da062dc4097ace4020923a93cb57e9e102f9da4c7db495ce1be8192868c2f",
+    "runtime_test.log": "18a868f442788889281d313200625735b1ca532f964b48c37c36f6a23c8eb3d1",
+    "unified-policy.log": "5d4cc0e17fe7a747414871993701bb538f5eb95dc0b2518c30ef2aa6dd18c01b",
+    "inventory.log": "88b7401f01c2fef512803e288ad6d3474d522b13641f22a2a750fda54e900f48",
+    "compact_authority_collision_test.log": "fb7e1e447e3676dccd47f90bd7206badb35c0b6b262553e20fec780e0183e30b",
+    "abi_layout_test.log": "13710a8c3a8ca2b56252c3948bbb4d192e40fe6bcd0c0f7ac0f11c2afed3bab1",
+    "pins-after.log": "9931b5f0bc49eb9d41a04a7b601ad6487775454bc15e32dcf12978bfb5de72b1",
+    "build_test.log": "4862b275eaac55cefc2a933f35e30262f9188afc87d068409368d63c9482a2c0",
+    "model_failure_policy_test.log": "136d754de4d41f4a6fea7c76aa74de9f13970d84d7f3c272680a16cf2067881c",
+    "foundation.log": "952b0b73f930acd5276eedce55e58e4618de27496817aebdd2835db7824c7cef",
+    "deferred_status_test.log": "dd1f74d0e8f05267536dd0d0ff2272d280ec8fad2fa399bbd5d866295d283283",
+    "compact_authority_test.log": "33244761f7b90d71fc715492b29d1857d271991f5c373581c9a1e1f58a3db20e",
+    "strict-p3.log": "34571b1abc2778314dd0184b2c8e09d29bfab479dd470d3d4e88bcfaf854b40c",
+    "place_test.log": "c5018284c90e3f6e3f0c6d2e1166748506716460cf3216055f1538d235e39afc",
+    "deferred_status_checkpoint_test.log": "22ac2e19d9ba16a2f796c2241eedd54fbc0808bf20fe4b45f9276abeca5bbffb",
+    "contract.log": "c088e2a8167756dfb6f838f53b8ed79f2652893b0dadb9118214c7959818a834",
+    "pins-before.log": "9931b5f0bc49eb9d41a04a7b601ad6487775454bc15e32dcf12978bfb5de72b1"
+  }
+}

@@ -143,5 +143,40 @@
     "directory": "validation-glm53-tp4-prepare-lookahead-tsan-20261025T160106Z",
     "passed": true,
     "scope": "Standalone HOST coordinator; no Core integration"
+  },
+  {
+    "directory": "validation-glm53-engine-native-transport-v2-release-20261025T154557Z",
+    "passed": false,
+    "scope": "Actual tiny Engine startup/transport and preserved regressions; no model step/GPU/full GLM"
+  },
+  {
+    "directory": "validation-glm53-engine-native-transport-v4-release-20261025T160051Z",
+    "passed": true,
+    "scope": "Actual tiny Engine startup/transport and preserved regressions; no model step/GPU/full GLM"
+  },
+  {
+    "directory": "validation-glm53-engine-native-transport-v4-asan-20261025T161107Z",
+    "passed": true,
+    "scope": "Actual tiny Engine startup/transport and preserved regressions; no model step/GPU/full GLM"
+  },
+  {
+    "directory": "validation-glm53-engine-native-transport-v4-tsan-20261025T162255Z",
+    "passed": true,
+    "scope": "Actual tiny Engine startup/transport and preserved regressions; no model step/GPU/full GLM"
+  },
+  {
+    "directory": "glm53-real-main-metadata-20261025T162250Z",
+    "passed": true,
+    "scope": "Actual checkpoint main-expert geometry and conditional stock TP4 placement; device metadata discovery only"
+  },
+  {
+    "directory": "validation-portable-engine-v4-release-20261025T162839Z",
+    "passed": false,
+    "scope": "Portable eight HOST checker programs with verified source-identical transport-v4 Core; no fresh Core build, model step, GPU, production or full-model proof"
+  },
+  {
+    "directory": "validation-portable-engine-v4-release-20261025T162856Z",
+    "passed": true,
+    "scope": "Portable eight HOST checker programs with verified source-identical transport-v4 Core; no fresh Core build, model step, GPU, production or full-model proof"
   }
 ]

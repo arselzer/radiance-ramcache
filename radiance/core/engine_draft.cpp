@@ -26,7 +26,10 @@ namespace rad {
 /* Every rank's zeroed StepSlots and sorted end-of-generation ids, and the pinned host copy of rank
  * 0's slots the step reads back. Allocated once at start, so the step path never allocates. */
 int Engine::step_state_init() {
-    std::vector<int32_t> eog;
+    std::vector<int32_t> local_eog;
+    // Tiny source must outlive an async copy even when that call enqueues and
+    // reports failure. State retirement drains before clearing this vector.
+    auto& eog=tiny_?tiny_->eog_stage:local_eog;
     if (vocab_) eog = vocab_->eog();
     std::sort(eog.begin(), eog.end());
     eog.erase(std::unique(eog.begin(), eog.end()), eog.end());

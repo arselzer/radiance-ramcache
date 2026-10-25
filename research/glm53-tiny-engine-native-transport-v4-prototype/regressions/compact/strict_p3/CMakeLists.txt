@@ -1,0 +1,46 @@
+cmake_minimum_required(VERSION 3.24)
+project(glm53_sharded_native_strict_policy_host LANGUAGES CXX)
+find_package(Threads REQUIRED)
+set(RESEARCH_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../..")
+set(RADIANCE_SOURCE "${RESEARCH_ROOT}/radiance-glm-engine-native-transport-v4-src" CACHE PATH "Matching unified Native-ready plus PermanentV1 Core")
+set(RADIANCE_HOST_BUILD "${RESEARCH_ROOT}/build-glm-engine-native-transport-v4-host-release" CACHE PATH "Matching unified HOST Core")
+set(PROVIDER_SOURCE "${RESEARCH_ROOT}/glm53-sharded-native-provider-prototype")
+if(NOT EXISTS "${RADIANCE_SOURCE}/abi/rad_model_failure_policy.h" OR NOT EXISTS "${RADIANCE_SOURCE}/core/runtime/expert_prepare.cpp" OR NOT EXISTS "${RADIANCE_HOST_BUILD}/core/librad_core.a")
+  message(FATAL_ERROR "Parent must compose/build matching unified Core; no implicit rebuild")
+endif()
+file(STRINGS "${RADIANCE_HOST_BUILD}/CMakeCache.txt" CORE_HOME REGEX "^CMAKE_HOME_DIRECTORY:INTERNAL=")
+string(REPLACE "CMAKE_HOME_DIRECTORY:INTERNAL=" "" CORE_HOME "${CORE_HOME}")
+file(REAL_PATH "${CORE_HOME}" CORE_HOME_REAL)
+file(REAL_PATH "${RADIANCE_SOURCE}" EXPECTED_CORE_REAL)
+if(NOT CORE_HOME_REAL STREQUAL EXPECTED_CORE_REAL)
+  message(FATAL_ERROR "Private Core/Program/Plan/Ctx header/archive mismatch")
+endif()
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/UNIFIED_CORE_PINS.json" READY_PINS)
+string(JSON PIN_COUNT LENGTH "${READY_PINS}")
+math(EXPR PIN_LAST "${PIN_COUNT}-1")
+foreach(I RANGE 0 ${PIN_LAST})
+  string(JSON REL MEMBER "${READY_PINS}" ${I})
+  string(JSON EXPECTED GET "${READY_PINS}" "${REL}")
+  file(SHA256 "${RADIANCE_SOURCE}/${REL}" ACTUAL)
+  if(NOT ACTUAL STREQUAL EXPECTED)
+    message(FATAL_ERROR "Unified Core source mismatch: ${REL}")
+  endif()
+endforeach()
+# Every private C++ source is recompiled against these matching headers. No old prototype lib.
+add_library(p3_native_source STATIC native_source.cpp rank_native_store.cpp
+  "${PROVIDER_SOURCE}/candidate_native_record_store.cpp")
+target_compile_features(p3_native_source PUBLIC cxx_std_20)
+target_include_directories(p3_native_source PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}" "${PROVIDER_SOURCE}"
+  "${RADIANCE_SOURCE}/core" "${RADIANCE_SOURCE}/abi" "${RADIANCE_SOURCE}/vendor" "${RADIANCE_HOST_BUILD}/rad_include")
+target_compile_options(p3_native_source PRIVATE -Wall -Wextra -Wpedantic -fno-fast-math -ffp-contract=off)
+add_executable(glm53_native_source_strict_policy_test native_source_test.cpp)
+target_compile_features(glm53_native_source_strict_policy_test PRIVATE cxx_std_20)
+target_compile_options(glm53_native_source_strict_policy_test PRIVATE -Wall -Wextra -Wpedantic -fno-fast-math -ffp-contract=off)
+target_include_directories(glm53_native_source_strict_policy_test PRIVATE "${RADIANCE_SOURCE}/arch/common" "${RADIANCE_SOURCE}/tools")
+target_link_libraries(glm53_native_source_strict_policy_test PRIVATE p3_native_source
+  "-Wl,--whole-archive" "${RADIANCE_HOST_BUILD}/core/librad_core.a" "-Wl,--no-whole-archive"
+  "${RADIANCE_HOST_BUILD}/vendor/librad_vendor_llama.a" "${RADIANCE_HOST_BUILD}/vendor/librad_vendor_httplib.a" Threads::Threads ${CMAKE_DL_LIBS})
+target_link_options(glm53_native_source_strict_policy_test PRIVATE "LINKER:--export-dynamic"
+  "LINKER:--wrap=rad_memcpy_async" "LINKER:--wrap=rad_event_record"
+  "LINKER:--wrap=rad_event_wait" "LINKER:--wrap=pread")
+# Parent invokes manually with --radiance-home MATCHING_READY_HOST_HOME. No Core/serving/GPU target.

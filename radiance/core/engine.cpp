@@ -59,6 +59,7 @@ Engine::Readback::~Readback() {
 }
 
 Engine::~Engine() {
+    if(tiny_) {tiny_shutdown();rad_tools_registry().close();return;}
     /* The control vector's per-rank direction copies. Uploaded at declare, outside any arena, so
      * nothing else frees them; each rank's copy is freed with that rank's device bound, since the
      * allocator is per device. */
@@ -1449,6 +1450,7 @@ void Engine::clear_fresh_states() {
 }
 
 int Engine::serve(std::unique_ptr<StallWatch> watch) {
+    if(tiny_)return RAD_E_UNSUPPORTED; // transport-only: never serve/step
     // Before scheduler creation, request admission, state resets or stream work.
     // In particular serve() must not clear a failed Ctx by resetting loop atomics.
     if (const int s = model_policy_admission(); s < 0) return s;

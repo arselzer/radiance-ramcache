@@ -10,6 +10,8 @@
  */
 #pragma once
 #include "engine.h"
+#include "engine_tiny_native.h"
+#include "place/native_backing_owner.h"
 
 #include "mem/pools.h"
 #include "mem/kv.h"
@@ -40,7 +42,9 @@ struct Engine::Rank {
     std::vector<lora::Site> lora_sites;
     Plan      plan;
     Pools     pools;
+    TinyStream tiny_compute; // default inert; survives Ctx/owner/Mover destruction
     Mover     mover;
+    std::unique_ptr<NativeBackingOwner> native_owner;
     std::unique_ptr<ExpertRecordOwner> record_owner; // default null; no Engine activation/loader yet
     /* The policy half of tiered placement, bound to the plan at bring-up and off unless the plan
      * is dynamic. `heat_seen[l]` is the last step whose layer-l histogram was credited: a

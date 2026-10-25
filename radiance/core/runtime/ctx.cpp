@@ -5,6 +5,7 @@
 #include "ctx.h"
 #include "xp_state.h"
 #include "../build/tiny_component_quotes.h"
+#include "../build/tiny_startup.h"
 #include "../device/device.h"
 
 #include <algorithm>
@@ -20,8 +21,22 @@ namespace rad {
 int Ctx::tiny_startup_quote(const CtxDesc& d,bool handoff,TinyCtxQuote* out) noexcept {
     if(!out||!d.program)return RAD_E_INVAL;
     const Program& p=*d.program;
+    if(d.tiny_retirement&&(!d.stream||d.device))return RAD_E_UNSUPPORTED;
     if(tiny_quote::program_profile(p)<0||d.rank||d.world_size!=1||d.profile_ops||d.record_passes||d.kv.size()>1||(!handoff&&d.expert_prepare_owner))return RAD_E_UNSUPPORTED;
-    for(const auto& k:d.kv){if(k.base||k.layer_stride||k.bytes||k.rank||!k.layer_slot.empty())return RAD_E_UNSUPPORTED;}
+    // Builder reserves handle0 even when the graph has no cache. KVManager's
+    // real carve may give that inert zero-byte plan a pool base; bind_kv_pools
+    // faithfully carries it. Admit only that exact sentinel, never a real KV
+    // group or an opaque nonzero-size binding. No pointer is dereferenced here.
+    if(p.kv_groups.size()!=1)return RAD_E_UNSUPPORTED;
+    const auto& sentinel=p.kv_groups[0];const auto& kd=sentinel.decl;
+    if(!sentinel.name.empty()||kd.kind||kd.dtype||kd.window||kd.n_head_kv||kd.head_dim||
+       kd.state_dim[0]||kd.state_dim[1]||kd.conv_width||sentinel.block_size||
+       sentinel.bytes_per_block||sentinel.bytes_per_state||!sentinel.layers.empty()||
+       sentinel.zero||sentinel.replicated||sentinel.drafter)return RAD_E_UNSUPPORTED;
+    for(const auto& k:d.kv){
+        if(k.layer_stride||k.bytes||k.rank||k.dtype!=RAD_DT_INVALID||!k.layer_slot.empty())return RAD_E_UNSUPPORTED;
+        for(const auto extent:k.shape)if(extent)return RAD_E_UNSUPPORTED;
+    }
     for(const char* key:{"RADIANCE_OP_ORACLE","RADIANCE_OP_REPEAT"}){const auto* value=std::getenv(key);if(value&&*value)return RAD_E_UNSUPPORTED;}
     TinyCtxQuote q;auto& s=q.storage;
     q.sizeof_ctx=sizeof(Ctx);q.sizeof_tensor=sizeof(RadTensor);q.sizeof_op_plan=sizeof(OpPlan);q.sizeof_issue_plan=sizeof(IssuePlan);
@@ -130,6 +145,14 @@ Ctx::~Ctx() { shutdown(); }
 int Ctx::init(const CtxDesc& d) {
     if (const int failed = terminal_status(); failed < 0) return failed;
     if (!d.program) return RAD_E_INVAL;
+    if(d.tiny_retirement&&(!d.stream||d.device||d.rank||d.world_size!=1))return RAD_E_UNSUPPORTED;
+    if(tiny_retirement_&&(program_||stream_))return RAD_E_STATE;
+    if(tiny_retirement_&&!d.tiny_retirement)return RAD_E_UNSUPPORTED;
+    // Snapshot the policy and borrowed stream before any fallible vector copies
+    // or prepare()/owner-open call can lead to this object's internal shutdown.
+    if(d.tiny_retirement){
+        tiny_retirement_=true;device_=d.device;stream_=d.stream;own_stream_=false;
+    }
     if (d.program->requires_permanent_model_failure() && d.world_size != 1)
         return RAD_E_UNSUPPORTED;
     permanent_model_failure_ = d.program->requires_permanent_model_failure();
@@ -168,12 +191,18 @@ int Ctx::init(const CtxDesc& d) {
 }
 
 void Ctx::shutdown() {
+    if(tiny_retirement_){
+        if(stream_)tiny_drain_or_fail(stream_,device_);
+        if(lane1_)tiny_drain_or_fail(lane1_,device_);
+    }
     oracle_close();
     xp_close();
     /* Teardown sync, before freeing memory the streams may still use: the routing staging is the
      * destination of unwaited copies (spec §5.5) and the arena holds every kernel's operands. */
-    const int stream_drained = stream_ ? rad_stream_sync(stream_) : RAD_OK;
-    const int lane1_drained = lane1_ ? rad_stream_sync(lane1_) : RAD_OK;
+    const int stream_drained = stream_ ?
+        (tiny_retirement_?(tiny_drain_or_fail(stream_,device_),RAD_OK):rad_stream_sync(stream_)):RAD_OK;
+    const int lane1_drained = lane1_ ?
+        (tiny_retirement_?(tiny_drain_or_fail(lane1_,device_),RAD_OK):rad_stream_sync(lane1_)):RAD_OK;
     if (stream_drained < 0 || lane1_drained < 0)
         remember_model_failure(stream_drained < 0 ? stream_drained : lane1_drained,
                                "model retirement could not drain its streams");

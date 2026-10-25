@@ -112,13 +112,13 @@ def verify_snapshot(root):
             raise Refusal("source SHA256 mismatch: " + name)
     core_files = {name.removeprefix("radiance/"): h
                   for name, h in files.items() if name.startswith("radiance/")}
-    archived_pins = root / "research/glm53-engine-native-foundation-v3-prototype/CORE_SOURCE_PINS.json"
+    archived_pins = root / "research/glm53-tiny-engine-native-transport-v4-prototype/CORE_SOURCE_PINS.json"
     original = json.loads(archived_pins.read_text(encoding="utf-8"))
-    if not isinstance(original, dict) or len(original) != 1492 or not CORE_CACHE_EXCLUSIONS <= set(original):
-        raise Refusal("unexpected frozen Foundation v2 Core pin inventory")
+    if not isinstance(original, dict) or len(original) != 1512 or not CORE_CACHE_EXCLUSIONS <= set(original):
+        raise Refusal("unexpected frozen Engine transport v4 Core pin inventory")
     filtered = {name: h for name, h in original.items() if name not in CORE_CACHE_EXCLUSIONS}
     if core_files != filtered:
-        raise Refusal("exported Core differs from the frozen 1492-file inventory minus the two recorded caches")
+        raise Refusal("exported Core differs from the frozen 1512-file inventory minus the two recorded caches")
     if any(name in core_files for name in CORE_CACHE_EXCLUSIONS):
         raise Refusal("portable source snapshot must exclude the two recorded Python caches")
     return files
@@ -139,7 +139,7 @@ def cache_values(path):
     return values
 
 
-def verify_compiler_profile(cache, languages=("CXX", "C")):
+def verify_compiler_profile(cache, languages=("CXX", "C"), allow_exact_ccache=False):
     # Closed research profile: source identity alone cannot establish matching
     # private STL/ABI layouts when e.g. -D_GLIBCXX_DEBUG or -fpack-struct differs.
     # Sanitizer flags are supplied only by the reviewed RAD_ASAN/RAD_TSAN CMake
@@ -163,8 +163,20 @@ def verify_compiler_profile(cache, languages=("CXX", "C")):
             raise Refusal("unsupported linker flags: " + key)
         if key.startswith("CMAKE_INTERPROCEDURAL_OPTIMIZATION") and value not in ("", "OFF", "FALSE", "0"):
             raise Refusal("unsupported interprocedural optimization profile")
+    for key in ("CMAKE_CXX_COMPILER_LAUNCHER", "CMAKE_C_COMPILER_LAUNCHER"):
+        value = cache.get(key, "")
+        if not value:
+            continue
+        # Existing reviewed v4 HOST archives used this ONE system compiler-cache
+        # front end. Admit no argument/list/alternate launcher, and do not pass
+        # it on to the fixture build. Compiler/flags/private source checks still
+        # apply. System tool trust is not prebuilt-binary authentication.
+        launcher = Path("/usr/bin/ccache")
+        if (not allow_exact_ccache or value != "/usr/bin/ccache"
+                or launcher.is_symlink() or not launcher.is_file()
+                or not os.access(launcher, os.X_OK)):
+            raise Refusal("unsupported compiler/toolchain injection: " + key)
     for key in ("CMAKE_CXX_COMPILER_ARG1", "CMAKE_C_COMPILER_ARG1",
-                "CMAKE_CXX_COMPILER_LAUNCHER", "CMAKE_C_COMPILER_LAUNCHER",
                 "CMAKE_TOOLCHAIN_FILE", "CMAKE_SYSROOT", "CMAKE_CXX_COMPILER_TARGET",
                 "CMAKE_CXX_COMPILER_EXTERNAL_TOOLCHAIN", "CMAKE_PROJECT_TOP_LEVEL_INCLUDES"):
         if cache.get(key, "").strip():
@@ -185,7 +197,7 @@ def verify_core_build(root, build, mode, files=None, require_archives=True):
         if cache.get(key) != value:
             raise Refusal("Core build profile mismatch: " + key + " expected " + value
                           + " observed " + repr(cache.get(key)))
-    verify_compiler_profile(cache)
+    verify_compiler_profile(cache, allow_exact_ccache=True)
     if cache.get("RAD_BUILD_DS41_EXPERIMENTAL") not in ("ON", "OFF"):
         raise Refusal("Core must explicitly record its experimental-DS41 build option")
     home_value = cache.get("CMAKE_HOME_DIRECTORY", "")

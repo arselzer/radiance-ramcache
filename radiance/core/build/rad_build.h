@@ -99,6 +99,10 @@ using WeightSourceFn = std::function<int(const std::string& name, const Program&
                                          WeightSource* out)>;
 
 /* ------------------------------------------------------------------ the builder */
+// Shared actual instance pass, also used after closed metadata-only Engine admission.
+int initialize_program_instances(Registry&,Program&,
+    const std::function<void(int,const std::string&)>& report = {});
+
 class Builder : public RadBuilder {
 public:
     /* The Registry must outlive the Builder and its Program (see the file header). */

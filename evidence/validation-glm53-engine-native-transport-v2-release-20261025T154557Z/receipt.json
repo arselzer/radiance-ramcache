@@ -1,0 +1,45 @@
+{
+  "passed": false,
+  "mode": "release",
+  "commands": [
+    {
+      "command": [
+        "python3",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-tiny-engine-native-transport-v2-prototype/verify_source_pins.py"
+      ],
+      "log": "pins-before.log",
+      "returncode": 0
+    },
+    {
+      "command": [
+        "flock",
+        "--no-fork",
+        "--exclusive",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/research-heavy-runtime.lock",
+        "nice",
+        "-n19",
+        "/usr/bin/python3",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/run_guarded_heavy_research.py",
+        "--",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/build-glm53-engine-native-transport-v2-host-release/tiny_engine_native_transport_check",
+        "--run-host",
+        "--radiance-home",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/build-glm-engine-native-transport-v2-host-release/radiance_home",
+        "--architecture",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/build-glm53-engine-native-transport-v2-host-release/research-architectures/libglm53_tiny_startup_arch.so"
+      ],
+      "log": "engine-transport.log",
+      "returncode": 1
+    }
+  ],
+  "GPU_execution": false,
+  "production_changes": false,
+  "scope": "Actual tiny Engine startup/transport and preserved regressions; no model step/GPU/full GLM",
+  "build_receipt_sha256": "68c14c22d14cb29a71d7c438cc766a7d74db62883b90e25d14878353d8140594",
+  "source_receipt_sha256": "f9025763fcae7a5dedd06c4f99c935f46cd6ae5d994c5d7263f30c379876a581",
+  "error": "RuntimeError('engine-transport.log')",
+  "evidence_sha256": {
+    "engine-transport.log": "58519663a4d830f0c1f82cdfb1783deb625d040b0a479a261ec68670516fc219",
+    "pins-before.log": "9931b5f0bc49eb9d41a04a7b601ad6487775454bc15e32dcf12978bfb5de72b1"
+  }
+}

@@ -577,27 +577,37 @@ void Builder::resolve_bands(OpInfo& oi) {
 /* init() once per resolved instance (op, band, domain), after the whole graph has resolved
  * (spec §2.1; see rad_build.h). A negative init means the kernel refused an instance it matched:
  * the band becomes a miss reported here rather than at the first launch. */
-void Builder::finish_instances() {
-    for (size_t i = 1; i < prog_.ops.size(); ++i) {
-        OpInfo& oi = prog_.ops[i];
+int initialize_program_instances(Registry& registry,Program& program,
+    const std::function<void(int,const std::string&)>& report) {
+    int first=RAD_OK;
+    for (size_t i = 1; i < program.ops.size(); ++i) {
+        OpInfo& oi = program.ops[i];
         for (Band& b : oi.bands) {
             for (int d = 0; d < RAD_N_DOMAINS; ++d) {
                 Resolved& r = b.dom[d];
                 if (!r) continue;
-                const int s = reg_.init_instance(r, prog_.ctx.rank, prog_.ctx.world_size);
+                const int s = registry.init_instance(r, program.ctx.rank, program.ctx.world_size);
                 if (s >= 0) continue;
 
-                err(s, "%s: kernel %s matched %s and then its init() refused the instance: %s",
-                    oi.op.c_str(), r.row->info ? r.row->info->name : "?",
-                    r.geom.str().c_str(), rad_strerror(s));
+                if(first>=0)first=s;
+                const auto message=fmt("%s: kernel %s matched %s and then its init() refused the instance: %s",
+                    oi.op.c_str(),r.row->info?r.row->info->name:"?",r.geom.str().c_str(),rad_strerror(s));
+                if(report)report(s,message);
                 b.miss[d] = fmt("init() refused the instance: %s", rad_strerror(s));
-                prog_.misses.push_back({ oi.op, display_geometry(oi, b).str(), b.span,
+                program.misses.push_back({ oi.op, display_geometry(oi, b).str(), b.span,
                                          b.miss[d], d, oi.index });
                 r = Resolved{};
             }
         }
     }
+    return first;
 }
+void Builder::finish_instances() {
+    (void)initialize_program_instances(reg_,prog_,[this](int status,const std::string& message){
+        err(status,"%s",message.c_str());
+    });
+}
+
 rad_op Builder::decl_op(const char* opname, const RadParam* p, int n_p,
                         const rad_weight* w, int n_w) {
     if (finished_) return err(RAD_E_STATE, "decl_op('%s') after declare finished", opname ? opname : "");

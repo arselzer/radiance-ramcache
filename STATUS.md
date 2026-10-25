@@ -9,21 +9,24 @@ This is a research checkpoint from 25 October 2026. It has not been deployed.
 | Bounded physical source/export/read bridge | Passed all three CPU modes against synthetic complete expert records. |
 | Current Foundation v2 Core, real HOST loader and failure cleanup | Corrected fixture v3 passed Release, Address/UndefinedBehaviorSanitizer and ThreadSanitizer checks, including preserved Core regressions. |
 | Foundation v2 independent source review | Both identified findings were repaired and reviewed. |
-| Actual Engine startup through the native cache path | Implementation in progress; validation pending. |
+| Actual Engine startup through the native cache path | Transport v4 passed Release, Address/UndefinedBehaviorSanitizer and ThreadSanitizer, including retained regressions. Closed tiny HOST fixture; no model step or serving. |
 | Standalone four-rank cache preparation coordinator | Base and bounded prefill-lookahead variants passed Release, Address/UndefinedBehaviorSanitizer and ThreadSanitizer. The latter has 11 cases and 27 refusal groups. Not yet wired into Engine. |
-| Full GLM checkpoint, four-GPU inference, quality and performance | Not validated. |
+| Actual GLM checkpoint and TP4 expert layouts | All 72 source files verified; metadata resolved supported GPU kernels and canonical layouts for all 12,096 main experts per rank. No GPU execution. |
+| Full GLM four-GPU inference, quality and performance | Not validated. |
 
 Foundation v2 fixes a routing-profile admission error, reserves backend-global control credit before generic use, and corrects a checker compilation error. The earlier failed build is retained in `evidence/`; later results do not turn that failed revision into a pass.
 
 Fixture v3 completes the test harness's `nothrow` allocation/deallocation hooks. It uses the same Core v2, keeps the same budget assertions and leaves sanitizer diagnostics enabled. The failed fixture-v2 ASan result is included in the evidence.
 
-The next Engine work must keep one checkpoint/source cache, omit native-owned expert payloads from ordinary loading, prove resident uploads complete, and preserve owner/stream lifetimes through failures. The source audit also identifies EOG upload lifetime, Ctx cleanup and HOST virtual-memory accounting requirements.
+Transport v4 uses one checkpoint/source cache, omits native-owned expert payloads from ordinary loading, checks resident data and preserves owner/stream lifetimes through failure and retirement. Its six Engine groups include a narrow fix for an empty KV sentinel that legitimately has a non-null reserved base. The earlier failed v2 run remains in the evidence. Actual GLM source binding and four-rank execution are the next integration steps.
 
-The four-rank coordinator compares exact routed expert IDs and waits for each rank's local preparation before allowing expert computation. The first proposed experimental profile terminates the process on a cache error; the HOST subprocess test verifies that termination policy, not GPU recovery. Real GLM geometry, source ownership and Engine/Ctx integration remain required before enabling TP4 caching.
+The four-rank coordinator compares exact routed expert IDs and waits for each rank's local preparation before allowing expert computation. The first proposed experimental profile terminates the process on a cache error; the HOST subprocess test verifies that termination policy, not GPU recovery. Real GLM geometry is now checked; complete source ownership and Engine/Ctx integration remain required before enabling TP4 caching.
 
 The current fixtures use a small synthetic model. Passing them does not establish real-model memory use, token throughput, prefill speed, TP4 behavior or MTP support. The requested-allocation budget is not a process RSS limit.
 
-The portable repository entrypoint compiled and passed all seven Release checkers using an existing Core whose source bytes and build profile were verified against the export. A fresh Core build from this repository was not repeated. Original receipts keep their source identities and individual proof scopes.
+The updated portable entrypoint compiled and passed all eight Release checkers using a verified source-identical transport-v4 Core. A fresh Core build from this exported repository was not repeated. The earlier seven-check Foundation run and the initial guard-only invocation failure remain recorded with their original scopes.
+
+The real GLM stock placement query is tight even at 512 tokens, one sequence and MTP disabled. The smallest checked fitting pool is 26.5 GiB per rank with an assumed 512 MiB runtime allowance per GPU. Including an illustrative 8 GiB host margin gives 114.0625 GiB, slightly above the estimated 113.6 GiB available after stopping production; that margin can partly overlap memory already excluded by the estimate. This neither proves startup failure nor establishes a comfortable fit. The bounded cache remains useful for longer contexts and host headroom.
 
 Qwen3.8-Flash-Next with FP8 experts is also under investigation. The official Qwen FP8 checkpoint exists, and three representative source headers confirm E4M3 expert codes with BF16 scales in 128×128 blocks, a format Radiance already supports. The ordinary four-bit `.rad` linked upstream is not an eight-bit expert model despite its filename.
 

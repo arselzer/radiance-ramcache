@@ -1,0 +1,134 @@
+{
+  "added": {
+    "core/build/tiny_native_source/contract/bound_sources.h": "276feba99dfd7c96fb0f98b0ba35ec61fa94adf787c70ffba73e454a56aa6bae",
+    "core/build/tiny_native_source/contract/fixture_writer.cpp": "bc7e92d4cd93e7d97b49e81badbf331f41c22968b2ab88cc5a4f61f833d5b1e9",
+    "core/build/tiny_native_source/contract/fixture_writer.h": "4a871c251e17a042ff31e085505ecaa7e1a88e4fd2f0623c8192ba7a2af82650",
+    "core/build/tiny_native_source/contract/graph_quote.cpp": "a8c5c69c7766c1b07752b102ba87dd883d5e8854e5a933afb09ea5d1dd8257fb",
+    "core/build/tiny_native_source/contract/graph_quote.h": "4d6951d65f6266788cdb57914cd68084636d596379569812a5ba1c4d4599a1b6",
+    "core/build/tiny_native_source/contract/profile.cpp": "99327834f2e1d1f39d894d2b8bb23ae7daa8f5c3647d078169bf75cb69b87d9b",
+    "core/build/tiny_native_source/contract/profile.h": "ce80b228960077ae365f23ef2848fc2bddebad955b853d04289898ec30520103",
+    "core/build/tiny_native_source/contract/shape_profile.cpp": "d8e4202b1e998613ade78b2ec8531672e93c3fe8430173b5cd21bcfd63e66f9d",
+    "core/build/tiny_native_source/source_factory.cpp": "ad77e7780d041dd197b165df075bd8783da85f6bf076847904c4b546ee93b997",
+    "core/build/tiny_native_source/source_factory.h": "93891b54e549c46b9ce5f35ab0c0841f82f24ed0e4884b0cecf6fada7a5b26a1",
+    "core/build/tiny_native_source/storage/candidate_native_record_store.cpp": "dedb5b10a4016ab3a7b31c1841756c5203ad546c31fabdb0caa4b2a5d0280ae7",
+    "core/build/tiny_native_source/storage/candidate_native_record_store.h": "6507d9f0e40100b56f2bade02ca9eecd4825c70fcdfb0e89fe72bec8d53f3d0f",
+    "core/build/tiny_native_source/storage/native_source.cpp": "02ac7a5bbff696db87afb2c9611cbc5f1f5b0276056576f39cf52c765921b807",
+    "core/build/tiny_native_source/storage/native_source.h": "0542e65e58e24b88eab6322e3e10710f05a1fc96eb2752d936cc04a411d91152",
+    "core/build/tiny_native_source/storage/physical_source_bridge.cpp": "ce3bc7724eb280ed405fdaa4761b9aa0fb6b110f6bf1e84ec7a762f8783e2e33",
+    "core/build/tiny_native_source/storage/physical_source_bridge.h": "2d167121371d871fd20f45b1c233253f9543b60b020d5715be73d5bcf978d737",
+    "core/build/tiny_native_source/storage/rank_native_store.cpp": "cfa8fa544e7798bcd9c703bf214225a97757f2f5afc14503f9059ba6afa4fd19",
+    "core/build/tiny_native_source/storage/rank_native_store.h": "133a6211fe5cb18b5b1853ffc3cf46fd8a3cb3d9966da78d07c437faaf6b670b",
+    "core/engine_tiny_native.cpp": "7360d306ac0a766626b68b62a67dd91ec81315c09e8ffdb48f2d2a5d4e7d69e0",
+    "core/engine_tiny_native.h": "88edbab5b69d295db962c5c839f957ceb217686912cc3f58dd7650380835f3d4"
+  },
+  "base_core_count": 1492,
+  "changed": {
+    "core/CMakeLists.txt": {
+      "base": "3c7b76f0875be0d0628d1f24ac5598ea2f8082c5ee66e89f49abadb4cf29e0fe",
+      "transport": "5b7bf62eef9e8f1998050bb94640e27d8f5f9adbdd35d19f0f0c4963b815cf82"
+    },
+    "core/build/rad_build.h": {
+      "base": "fed560acb41a716433ed866b900a12e9a00ee71e311baa977ef99be1495c5e4a",
+      "transport": "3c93ba8b1945c4a752eaa238a235911cd1f42c2d35245dd4f0b07b34b7201f1e"
+    },
+    "core/build/rad_builder.cpp": {
+      "base": "a3611460a75c90af77643fccb525dd088f4f92983f568b30541541a334261499",
+      "transport": "5345769408ef1c1b14d9978dad4e025a8d87d1adb4a52592adae1410cd3d2ac8"
+    },
+    "core/engine.cpp": {
+      "base": "79991170bf2af120d1eecea853d8af5f428a8e6d43e7834ddec6458db43f50b2",
+      "transport": "129a1c49fcb064ddd1ec7da6754c3709dc1178e25d3cd6e4cee06bfdc96b15b2"
+    },
+    "core/engine.h": {
+      "base": "b5f672d0ac114fcd7ac109f70256fc1e7174fa10744e48da963b666460136785",
+      "transport": "0769319112c636b0bfa38bd116c232d8c40462b5d2dedf976ae7cf37fb060c0a"
+    },
+    "core/engine_bringup.cpp": {
+      "base": "561fe92ba07a60f1daee88cf35bab0f889bc9ed23c79117e4c253bdbe9f0999c",
+      "transport": "cfefc0731d73c0d80d829d8b414802330b65719ee1a361795f6837304f9f3d2d"
+    },
+    "core/engine_draft.cpp": {
+      "base": "e7cd41b906b73d064c4f66acf15c71a2670add76ee1c709073237d42ed830590",
+      "transport": "de239b1513fb9cc6472933582d4af2915b4dc6d9ff31905cbb61cb2e1b66590a"
+    },
+    "core/engine_priv.h": {
+      "base": "f053ef48e32ceadf5724e2eb410e6e8462f0f04d26655c5ba2febf63c20f4f9f",
+      "transport": "b78dd71f2fb48b98921d5769fc15c6ae243374f6667498de37b4803d520fb592"
+    },
+    "core/place/mover.cpp": {
+      "base": "408650785ebd251df0d07ba53a95464d5f9227ea8662ef2f69906f3ae02ad5db",
+      "transport": "b55170de635a67945abdef6e94b14b4b493ca3f24905f0a56b26988588fd0fdf"
+    },
+    "core/place/mover.h": {
+      "base": "3ac54ac80e55d0504939bfc0ce04b1de4d2c0d259f9c978f3c6356695f19e52a",
+      "transport": "a6dd9d8a853db96bd76f73d06b9b3f70b6edefcc6a56fb1734d47de6c64cb075"
+    },
+    "core/place/native_mover.cpp": {
+      "base": "78b8195e5b5386cffaf97d433632dbd00d6abfdf46da62a01fff6101cd0c2846",
+      "transport": "af029dd3292758abb1f120f988783195570ecb0d7ce553d5b2a695fddd55c7ce"
+    },
+    "core/runtime/ctx.cpp": {
+      "base": "fc6f0999b224d4dd7e6837930010d39d83f796d3f1cb2902dd6955a11adfb471",
+      "transport": "b59837787150b94933f460dd2a425ade3a43b000fb92e1d8db06eba343b67f64"
+    },
+    "core/runtime/ctx.h": {
+      "base": "df61d1a8ae70b0aed9fc8abba4578381db75feacaae2527b13315b4f92cbe914",
+      "transport": "daf3afa0dc95be641e990674ebd7787c9fac335282fab1346560f71fa72df33f"
+    }
+  },
+  "core_count": 1512,
+  "factory_namespace_map": "FACTORY_COPY_NAMESPACE_MAP.json",
+  "fixed_profile": "synthetic HOST TP1 only; no model/sampler step/serve/GPU/full-GLM/TP4 activation",
+  "preserved_source_bodies": {
+    "contract/bound_sources.h": "glm53-engine-native-foundation-v3-prototype/contract/bound_sources.h",
+    "contract/checker.cpp": "glm53-engine-native-foundation-v3-prototype/contract/checker.cpp",
+    "contract/fixture_writer.cpp": "glm53-engine-native-foundation-v3-prototype/contract/fixture_writer.cpp",
+    "contract/fixture_writer.h": "glm53-engine-native-foundation-v3-prototype/contract/fixture_writer.h",
+    "contract/graph_quote.cpp": "glm53-engine-native-foundation-v3-prototype/contract/graph_quote.cpp",
+    "contract/graph_quote.h": "glm53-engine-native-foundation-v3-prototype/contract/graph_quote.h",
+    "contract/profile.cpp": "glm53-engine-native-foundation-v3-prototype/contract/profile.cpp",
+    "contract/profile.h": "glm53-engine-native-foundation-v3-prototype/contract/profile.h",
+    "contract/shape_profile.cpp": "glm53-engine-native-foundation-v3-prototype/contract/shape_profile.cpp",
+    "contract/tiny_arch.cpp": "glm53-engine-native-foundation-v3-prototype/contract/tiny_arch.cpp",
+    "contract/tiny_arch.h": "glm53-engine-native-foundation-v3-prototype/contract/tiny_arch.h",
+    "foundation_checker.cpp": "glm53-engine-native-foundation-v3-prototype/checker.cpp",
+    "regressions/compact/allocation_hooks.h": "glm53-engine-native-foundation-v3-prototype/regressions/compact/allocation_hooks.h",
+    "regressions/compact/authority_test.cpp": "glm53-engine-native-foundation-v3-prototype/regressions/compact/authority_test.cpp",
+    "regressions/compact/baseline_metadata.h": "glm53-engine-native-foundation-v3-prototype/regressions/compact/baseline_metadata.h",
+    "regressions/compact/inventory_test.cpp": "glm53-engine-native-foundation-v3-prototype/regressions/compact/inventory_test.cpp",
+    "regressions/compact/mutations.h": "glm53-engine-native-foundation-v3-prototype/regressions/compact/mutations.h",
+    "regressions/compact/strict_p3/adapter_fixture.h": "glm53-engine-native-foundation-v3-prototype/regressions/compact/strict_p3/adapter_fixture.h",
+    "regressions/compact/strict_p3/foreign_fixture.h": "glm53-engine-native-foundation-v3-prototype/regressions/compact/strict_p3/foreign_fixture.h",
+    "regressions/compact/strict_p3/native_source.cpp": "glm53-engine-native-foundation-v3-prototype/regressions/compact/strict_p3/native_source.cpp",
+    "regressions/compact/strict_p3/native_source.h": "glm53-engine-native-foundation-v3-prototype/regressions/compact/strict_p3/native_source.h",
+    "regressions/compact/strict_p3/native_source_test.cpp": "glm53-engine-native-foundation-v3-prototype/regressions/compact/strict_p3/native_source_test.cpp",
+    "regressions/compact/strict_p3/rank_native_store.cpp": "glm53-engine-native-foundation-v3-prototype/regressions/compact/strict_p3/rank_native_store.cpp",
+    "regressions/compact/strict_p3/rank_native_store.h": "glm53-engine-native-foundation-v3-prototype/regressions/compact/strict_p3/rank_native_store.h",
+    "regressions/device/adapter_fixture.h": "glm53-engine-native-foundation-v3-prototype/regressions/device/adapter_fixture.h",
+    "regressions/device/ffn_oracle.h": "glm53-engine-native-foundation-v3-prototype/regressions/device/ffn_oracle.h",
+    "regressions/device/gemm_cfg.cpp": "glm53-engine-native-foundation-v3-prototype/regressions/device/gemm_cfg.cpp",
+    "regressions/device/native_device_owner_test.cpp": "glm53-engine-native-foundation-v3-prototype/regressions/device/native_device_owner_test.cpp",
+    "regressions/device/native_source.cpp": "glm53-engine-native-foundation-v3-prototype/regressions/device/native_source.cpp",
+    "regressions/device/native_source.h": "glm53-engine-native-foundation-v3-prototype/regressions/device/native_source.h",
+    "regressions/device/rank_native_store.cpp": "glm53-engine-native-foundation-v3-prototype/regressions/device/rank_native_store.cpp",
+    "regressions/device/rank_native_store.h": "glm53-engine-native-foundation-v3-prototype/regressions/device/rank_native_store.h",
+    "regressions/device/reader_rows.cpp": "glm53-engine-native-foundation-v3-prototype/regressions/device/reader_rows.cpp"
+  },
+  "preserved_v1_source_receipt": "glm53-tiny-engine-native-transport-prototype/SOURCE_RECEIPT.json",
+  "schema": "glm53.actual-engine-native-transport.composition.v4-sentinel-fix",
+  "source_author_runtime": "none; parent matching builds/checks pending",
+  "v3_core_delta": {
+    "core/engine_tiny_native.cpp": {
+      "v3": "fbc2a4b9ab4097543fa38fd79d50932d057dde14c44fa60682d77fec58b6fab6",
+      "v4": "7360d306ac0a766626b68b62a67dd91ec81315c09e8ffdb48f2d2a5d4e7d69e0"
+    },
+    "core/engine_tiny_native.h": {
+      "v3": "5dadf94d34cbf24864ab5937a9df204b6ba44dba0fb3011cc2169942f65bd608",
+      "v4": "88edbab5b69d295db962c5c839f957ceb217686912cc3f58dd7650380835f3d4"
+    },
+    "core/runtime/ctx.cpp": {
+      "v3": "25d5c61d743e249594a02ec18faeaab77a3897f7e9e30853e9af933e27ef84a3",
+      "v4": "b59837787150b94933f460dd2a425ade3a43b000fb92e1d8db06eba343b67f64"
+    }
+  }
+}

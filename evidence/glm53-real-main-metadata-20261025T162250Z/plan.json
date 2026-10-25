@@ -1,0 +1,4781 @@
+{
+  "schema": "glm53-stock-fullgraph-tp4-planning-v1",
+  "checkpoint": "/home/as/models/hf/amd/GLM-5.3-Flash-Quark-MXFP4",
+  "home": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/shipped-radiance-1.12.0-home",
+  "mode": "actual DEVICE metadata selection; no kernel instances or inference",
+  "ctx": 512,
+  "max_tok": 128,
+  "max_seqs": 1,
+  "mtp_depth": 0,
+  "deterministic": true,
+  "kv_dtype": "bf16",
+  "state_dtype": "f32",
+  "embedding": "vram",
+  "tp_wire": "exact",
+  "p2p": "off",
+  "vision": false,
+  "prefix_cache": false,
+  "checkpoint_slots": 0,
+  "raw_physical_tensors": 76108,
+  "visible_devices_reported": 1,
+  "eligibility_device_queried": 0,
+  "four_card_geometry_assumption": "logical ranks0..3 use identical gfx1201/capacity to visible card0; parent separately verified4physical identical boards; no other card/device binding/peer query",
+  "recipe_scope": "hypothetical preconversion of exactly *attn_kv_b.weight toBF16 per stock glm53-mxfp4.recipe; no payload conversion",
+  "planner_container": false,
+  "weights_disk_tier": false,
+  "raw_checkpoint_direct_serve_claim": false,
+  "model_allocations_requested_by_tool": false,
+  "queues_created_by_tool": false,
+  "kernel_launches": false,
+  "sampler_instances": false,
+  "sampler_omission_reserve_is_assumed": true,
+  "ranks": [
+    {
+      "rank": 0,
+      "device": "AMD Radeon RX 9070 XT",
+      "capacity_bytes": 17095983104,
+      "eligibility_card0_free_snapshot_NOT_rank_free": 154812416,
+      "weights_with_sentinel": 49657,
+      "used_weights": 49656,
+      "logical_sources": 25246,
+      "widened_weights": 323,
+      "selected_stored_weight_bytes_sum": 44659282296,
+      "ordinary_loader_metadata": {
+        "direct_identity_count": 49081,
+        "direct_identity_stored_bytes": 44171551096,
+        "nonidentity_OR_widen_count": 575,
+        "nonidentity_OR_widen_stored_bytes": 487731200,
+        "nonidentity_OR_widen_max_stored_bytes": 4718592,
+        "widen_count": 323,
+        "widen_stored_bytes": 347138048,
+        "widen_max_stored_bytes": 4718592,
+        "top10_nonidentity_OR_widen": [
+          {
+            "name": "blk.10.glm_router.weight",
+            "source": "blk.10.glm_router.weight",
+            "stored_bytes": 4718592,
+            "logical_bytes": 4718592,
+            "layout": "",
+            "identity_flag": true,
+            "widen": true,
+            "dtype": 1,
+            "first_use": 416,
+            "last_use": 417
+          },
+          {
+            "name": "blk.11.glm_router.weight",
+            "source": "blk.11.glm_router.weight",
+            "stored_bytes": 4718592,
+            "logical_bytes": 4718592,
+            "layout": "",
+            "identity_flag": true,
+            "widen": true,
+            "dtype": 1,
+            "first_use": 471,
+            "last_use": 472
+          },
+          {
+            "name": "blk.12.glm_router.weight",
+            "source": "blk.12.glm_router.weight",
+            "stored_bytes": 4718592,
+            "logical_bytes": 4718592,
+            "layout": "",
+            "identity_flag": true,
+            "widen": true,
+            "dtype": 1,
+            "first_use": 510,
+            "last_use": 511
+          },
+          {
+            "name": "blk.13.glm_router.weight",
+            "source": "blk.13.glm_router.weight",
+            "stored_bytes": 4718592,
+            "logical_bytes": 4718592,
+            "layout": "",
+            "identity_flag": true,
+            "widen": true,
+            "dtype": 1,
+            "first_use": 549,
+            "last_use": 550
+          },
+          {
+            "name": "blk.14.glm_router.weight",
+            "source": "blk.14.glm_router.weight",
+            "stored_bytes": 4718592,
+            "logical_bytes": 4718592,
+            "layout": "",
+            "identity_flag": true,
+            "widen": true,
+            "dtype": 1,
+            "first_use": 588,
+            "last_use": 589
+          },
+          {
+            "name": "blk.15.glm_router.weight",
+            "source": "blk.15.glm_router.weight",
+            "stored_bytes": 4718592,
+            "logical_bytes": 4718592,
+            "layout": "",
+            "identity_flag": true,
+            "widen": true,
+            "dtype": 1,
+            "first_use": 643,
+            "last_use": 644
+          },
+          {
+            "name": "blk.16.glm_router.weight",
+            "source": "blk.16.glm_router.weight",
+            "stored_bytes": 4718592,
+            "logical_bytes": 4718592,
+            "layout": "",
+            "identity_flag": true,
+            "widen": true,
+            "dtype": 1,
+            "first_use": 682,
+            "last_use": 683
+          },
+          {
+            "name": "blk.17.glm_router.weight",
+            "source": "blk.17.glm_router.weight",
+            "stored_bytes": 4718592,
+            "logical_bytes": 4718592,
+            "layout": "",
+            "identity_flag": true,
+            "widen": true,
+            "dtype": 1,
+            "first_use": 721,
+            "last_use": 722
+          },
+          {
+            "name": "blk.18.glm_router.weight",
+            "source": "blk.18.glm_router.weight",
+            "stored_bytes": 4718592,
+            "logical_bytes": 4718592,
+            "layout": "",
+            "identity_flag": true,
+            "widen": true,
+            "dtype": 1,
+            "first_use": 760,
+            "last_use": 761
+          },
+          {
+            "name": "blk.19.glm_router.weight",
+            "source": "blk.19.glm_router.weight",
+            "stored_bytes": 4718592,
+            "logical_bytes": 4718592,
+            "layout": "",
+            "identity_flag": true,
+            "widen": true,
+            "dtype": 1,
+            "first_use": 815,
+            "last_use": 816
+          }
+        ],
+        "scope": "stored output/layout metadata only; not measured worker/input/bounce/retained-output residency or recipe conversion peak"
+      },
+      "ops_with_sentinel": 1906,
+      "buffers_with_sentinel": 297,
+      "device_selection_complete": true,
+      "device_holes": [],
+      "device_hole_free": true,
+      "stock_reference_gate_passed": true,
+      "stock_reference_only_op_instances": 0,
+      "stock_reference_only_op_names": [],
+      "reference_device_bands": 0,
+      "device_bands_by_kernel": {
+        "libr4d/embed_lookup_bf16": 1,
+        "libr4d/ar_oneshot_4rank_exact_host": 182,
+        "libr4d/cast_bf16_bf16": 23,
+        "libr4d/mhc_pre_bf16": 90,
+        "libr4d/mhc_pre_partial_bf16": 90,
+        "libr4d/ar_gather_4rank_host": 154,
+        "libr4d/mhc_pre_finish_bf16": 90,
+        "libr4d/rmsnorm_quant_fp8": 101,
+        "libr4d/gemm_bf16_nt_m16": 192,
+        "libr4d/gemm_bf16_nt_m64": 362,
+        "libr4d/gemm_bf16_nt_tiled": 226,
+        "libr4d/ple_conv_bf16": 34,
+        "libr4d/kda_update_k128_v128_bf16": 68,
+        "libr4d/gdn_gated_rmsnorm_h128_bf16": 34,
+        "libr4d/mhc_post_bf16": 90,
+        "libr4d/gemm_fp8a8_f32scale": 200,
+        "libr4d/swiglu_clamped_quant_fp8": 87,
+        "libr4d/rmsnorm_bf16": 12,
+        "libr4d/kv_store_bf16": 11,
+        "libr4d/layernorm_bf16": 11,
+        "libr4d/gemm_nt_f32_bf16": 95,
+        "libr4d/dsa_query_fp8": 11,
+        "libr4d/qsa_work_bf16": 11,
+        "libr4d/dsa_pool_fp8": 11,
+        "libr4d/qsa_tail_store_bf16": 11,
+        "libr4d/dsa_score_fp8": 22,
+        "libr4d/qsa_select_i32": 22,
+        "libr4d/mla_project_bf16": 22,
+        "libr4d/mla_attn_matrix_bf16": 11,
+        "libr4d/quant_act_fp8": 11,
+        "libr4d/router_sigmoid_topk_f32": 42,
+        "libr4d/moe_scatter_inv_i32": 42,
+        "libr4d/moe_gemm_mxfp4a8": 84,
+        "libr4d/moe_gather_inv_bf16": 42,
+        "libr4d/gemm_mxfp4a8_gemv": 84,
+        "libr4d/gemm_mxfp4a8_gemv_wide": 168,
+        "libr4d/gemm_mxfp4a8_decode": 84,
+        "libr4d/fill_bf16": 42,
+        "libr4d/router_sigmoid_topk_scatter_f32": 42,
+        "libr4d/mhc_contract_bf16": 1,
+        "libr4d/gather_rows_bf16": 1,
+        "libr4d/logits_gemm_bf16_cols": 1
+      },
+      "weight_footprint": {
+        "statics": 4231704576,
+        "experts": 40428896256,
+        "expert_spare_dynamic_upper_bound": 113643520,
+        "expert_unit_max": 3342336,
+        "expert_layer_max": 962592768,
+        "layer_unit_max": 111407104,
+        "embedding": 317194240,
+        "tower": 0,
+        "hosted": 0,
+        "mapped": 0,
+        "routed": true,
+        "units": 12144
+      },
+      "arena_plus_scratch_bytes": 52346880,
+      "host_arena_bytes": 0,
+      "kv_fixed_bytes": 36937728,
+      "kv_ceiling_bytes": 42896384,
+      "kv_pool_mib_rounded_bytes": 42991616,
+      "checkpoint_one_slot_bytes_NOT_ALLOCATED": 36927488,
+      "batch_staging_device_bytes": 17152,
+      "state_groups": [
+        {
+          "name": "kv_latent",
+          "kind": 0,
+          "layers": 11,
+          "block_size": 4,
+          "bytes_per_block": 45056,
+          "bytes_per_sequence_state": 0,
+          "states": 0,
+          "zero": false,
+          "replicated": true
+        },
+        {
+          "name": "kv_index_tail",
+          "kind": 2,
+          "layers": 11,
+          "block_size": 0,
+          "bytes_per_block": 0,
+          "bytes_per_sequence_state": 22528,
+          "states": 1,
+          "zero": false,
+          "replicated": false
+        },
+        {
+          "name": "kv_kda",
+          "kind": 2,
+          "layers": 34,
+          "block_size": 0,
+          "bytes_per_block": 0,
+          "bytes_per_sequence_state": 35651584,
+          "states": 1,
+          "zero": false,
+          "replicated": false
+        },
+        {
+          "name": "kv_kda_conv",
+          "kind": 3,
+          "layers": 34,
+          "block_size": 0,
+          "bytes_per_block": 0,
+          "bytes_per_sequence_state": 1253376,
+          "states": 1,
+          "zero": false,
+          "replicated": false
+        },
+        {
+          "name": "kv_dsa_index",
+          "kind": 0,
+          "layers": 11,
+          "block_size": 4,
+          "bytes_per_block": 1496,
+          "bytes_per_sequence_state": 0,
+          "states": 0,
+          "zero": false,
+          "replicated": true
+        }
+      ],
+      "planned_recipe_casts": [
+        {
+          "logical_source": "blk.11.attn_kv_b.weight",
+          "raw_encoding": "bf16",
+          "planned_encoding": "bf16",
+          "shape": [
+            32768,
+            512
+          ],
+          "payload_converted": false
+        },
+        {
+          "logical_source": "blk.15.attn_kv_b.weight",
+          "raw_encoding": "bf16",
+          "planned_encoding": "bf16",
+          "shape": [
+            32768,
+            512
+          ],
+          "payload_converted": false
+        },
+        {
+          "logical_source": "blk.19.attn_kv_b.weight",
+          "raw_encoding": "bf16",
+          "planned_encoding": "bf16",
+          "shape": [
+            32768,
+            512
+          ],
+          "payload_converted": false
+        },
+        {
+          "logical_source": "blk.23.attn_kv_b.weight",
+          "raw_encoding": "bf16",
+          "planned_encoding": "bf16",
+          "shape": [
+            32768,
+            512
+          ],
+          "payload_converted": false
+        },
+        {
+          "logical_source": "blk.27.attn_kv_b.weight",
+          "raw_encoding": "bf16",
+          "planned_encoding": "bf16",
+          "shape": [
+            32768,
+            512
+          ],
+          "payload_converted": false
+        },
+        {
+          "logical_source": "blk.3.attn_kv_b.weight",
+          "raw_encoding": "bf16",
+          "planned_encoding": "bf16",
+          "shape": [
+            32768,
+            512
+          ],
+          "payload_converted": false
+        },
+        {
+          "logical_source": "blk.31.attn_kv_b.weight",
+          "raw_encoding": "bf16",
+          "planned_encoding": "bf16",
+          "shape": [
+            32768,
+            512
+          ],
+          "payload_converted": false
+        },
+        {
+          "logical_source": "blk.35.attn_kv_b.weight",
+          "raw_encoding": "bf16",
+          "planned_encoding": "bf16",
+          "shape": [
+            32768,
+            512
+          ],
+          "payload_converted": false
+        },
+        {
+          "logical_source": "blk.39.attn_kv_b.weight",
+          "raw_encoding": "bf16",
+          "planned_encoding": "bf16",
+          "shape": [
+            32768,
+            512
+          ],
+          "payload_converted": false
+        },
+        {
+          "logical_source": "blk.43.attn_kv_b.weight",
+          "raw_encoding": "bf16",
+          "planned_encoding": "bf16",
+          "shape": [
+            32768,
+            512
+          ],
+          "payload_converted": false
+        },
+        {
+          "logical_source": "blk.7.attn_kv_b.weight",
+          "raw_encoding": "bf16",
+          "planned_encoding": "bf16",
+          "shape": [
+            32768,
+            512
+          ],
+          "payload_converted": false
+        }
+      ],
+      "sampler_declared": false,
+      "sampler_margin_device_bytes_assumed": 16777216,
+      "sampler_margin_host_bytes_assumed": 16777216,
+      "kernel_instances_initialized": 0,
+      "main_expert_metadata": {
+        "status": 0,
+        "diagnostic": "",
+        "geometry_only": true,
+        "payload_checksums_or_generation_authority": false,
+        "payload_read_copied_converted_or_packed": false,
+        "native_inventory_or_ready_source": false,
+        "input_plan_fits": false,
+        "main_units": 12096,
+        "owned_layouts": 12096,
+        "resident_layouts": 0,
+        "stored_bytes": 40428896256,
+        "source_selected_bytes": 40428896256,
+        "physical_rectangles": 72576,
+        "immutable_requested": 10741440,
+        "scratch_requested": 721465,
+        "construction_requested": 11462905,
+        "sizeof_record": 880,
+        "sizeof_member": 176,
+        "sizeof_slice": 80,
+        "sizeof_owned": 8,
+        "first_record": {
+          "unit": 7,
+          "layer": 3,
+          "expert": 0,
+          "stride": 3342336,
+          "offsets": [
+            0,
+            2097152,
+            2228224,
+            3276800
+          ],
+          "bytes": [
+            2097152,
+            131072,
+            1048576,
+            65536
+          ],
+          "shape": [
+            [
+              1024,
+              4096
+            ],
+            [
+              1024,
+              128
+            ],
+            [
+              4096,
+              512
+            ],
+            [
+              4096,
+              16
+            ]
+          ]
+        },
+        "last_record": {
+          "unit": 12143,
+          "layer": 44,
+          "expert": 287,
+          "stride": 3342336
+        },
+        "actual_input_contract_cases": {
+          "status": 0,
+          "diagnostic": "",
+          "checks": 62,
+          "refusals": 27
+        }
+      }
+    },
+    {
+      "rank": 1,
+      "device": "AMD Radeon RX 9070 XT",
+      "capacity_bytes": 17095983104,
+      "eligibility_card0_free_snapshot_NOT_rank_free": 154812416,
+      "weights_with_sentinel": 49657,
+      "used_weights": 49656,
+      "logical_sources": 25246,
+      "widened_weights": 323,
+      "selected_stored_weight_bytes_sum": 44659282296,
+      "ordinary_loader_metadata": {
+        "direct_identity_count": 49081,
+        "direct_identity_stored_bytes": 44171551096,
+        "nonidentity_OR_widen_count": 575,
+        "nonidentity_OR_widen_stored_bytes": 487731200,
+        "nonidentity_OR_widen_max_stored_bytes": 4718592,
+        "widen_count": 323,
+        "widen_stored_bytes": 347138048,
+        "widen_max_stored_bytes": 4718592,
+        "top10_nonidentity_OR_widen": [
+          {
+            "name": "blk.10.glm_router.weight",
+            "source": "blk.10.glm_router.weight",
+            "stored_bytes": 4718592,
+            "logical_bytes": 4718592,
+            "layout": "",
+            "identity_flag": true,
+            "widen": true,
+            "dtype": 1,
+            "first_use": 416,
+            "last_use": 417
+          },
+          {
+            "name": "blk.11.glm_router.weight",
+            "source": "blk.11.glm_router.weight",
+            "stored_bytes": 4718592,
+            "logical_bytes": 4718592,
+            "layout": "",
+            "identity_flag": true,
+            "widen": true,
+            "dtype": 1,
+            "first_use": 471,
+            "last_use": 472
+          },
+          {
+            "name": "blk.12.glm_router.weight",
+            "source": "blk.12.glm_router.weight",
+            "stored_bytes": 4718592,
+            "logical_bytes": 4718592,
+            "layout": "",
+            "identity_flag": true,
+            "widen": true,
+            "dtype": 1,
+            "first_use": 510,
+            "last_use": 511
+          },
+          {
+            "name": "blk.13.glm_router.weight",
+            "source": "blk.13.glm_router.weight",
+            "stored_bytes": 4718592,
+            "logical_bytes": 4718592,
+            "layout": "",
+            "identity_flag": true,
+            "widen": true,
+            "dtype": 1,
+            "first_use": 549,
+            "last_use": 550
+          },
+          {
+            "name": "blk.14.glm_router.weight",
+            "source": "blk.14.glm_router.weight",
+            "stored_bytes": 4718592,
+            "logical_bytes": 4718592,
+            "layout": "",
+            "identity_flag": true,
+            "widen": true,
+            "dtype": 1,
+            "first_use": 588,
+            "last_use": 589
+          },
+          {
+            "name": "blk.15.glm_router.weight",
+            "source": "blk.15.glm_router.weight",
+            "stored_bytes": 4718592,
+            "logical_bytes": 4718592,
+            "layout": "",
+            "identity_flag": true,
+            "widen": true,
+            "dtype": 1,
+            "first_use": 643,
+            "last_use": 644
+          },
+          {
+            "name": "blk.16.glm_router.weight",
+            "source": "blk.16.glm_router.weight",
+            "stored_bytes": 4718592,
+            "logical_bytes": 4718592,
+            "layout": "",
+            "identity_flag": true,
+            "widen": true,
+            "dtype": 1,
+            "first_use": 682,
+            "last_use": 683
+          },
+          {
+            "name": "blk.17.glm_router.weight",
+            "source": "blk.17.glm_router.weight",
+            "stored_bytes": 4718592,
+            "logical_bytes": 4718592,
+            "layout": "",
+            "identity_flag": true,
+            "widen": true,
+            "dtype": 1,
+            "first_use": 721,
+            "last_use": 722
+          },
+          {
+            "name": "blk.18.glm_router.weight",
+            "source": "blk.18.glm_router.weight",
+            "stored_bytes": 4718592,
+            "logical_bytes": 4718592,
+            "layout": "",
+            "identity_flag": true,
+            "widen": true,
+            "dtype": 1,
+            "first_use": 760,
+            "last_use": 761
+          },
+          {
+            "name": "blk.19.glm_router.weight",
+            "source": "blk.19.glm_router.weight",
+            "stored_bytes": 4718592,
+            "logical_bytes": 4718592,
+            "layout": "",
+            "identity_flag": true,
+            "widen": true,
+            "dtype": 1,
+            "first_use": 815,
+            "last_use": 816
+          }
+        ],
+        "scope": "stored output/layout metadata only; not measured worker/input/bounce/retained-output residency or recipe conversion peak"
+      },
+      "ops_with_sentinel": 1906,
+      "buffers_with_sentinel": 297,
+      "device_selection_complete": true,
+      "device_holes": [],
+      "device_hole_free": true,
+      "stock_reference_gate_passed": true,
+      "stock_reference_only_op_instances": 0,
+      "stock_reference_only_op_names": [],
+      "reference_device_bands": 0,
+      "device_bands_by_kernel": {
+        "libr4d/embed_lookup_bf16": 1,
+        "libr4d/ar_oneshot_4rank_exact_host": 182,
+        "libr4d/cast_bf16_bf16": 23,
+        "libr4d/mhc_pre_bf16": 90,
+        "libr4d/mhc_pre_partial_bf16": 90,
+        "libr4d/ar_gather_4rank_host": 154,
+        "libr4d/mhc_pre_finish_bf16": 90,
+        "libr4d/rmsnorm_quant_fp8": 101,
+        "libr4d/gemm_bf16_nt_m16": 192,
+        "libr4d/gemm_bf16_nt_m64": 362,
+        "libr4d/gemm_bf16_nt_tiled": 226,
+        "libr4d/ple_conv_bf16": 34,
+        "libr4d/kda_update_k128_v128_bf16": 68,
+        "libr4d/gdn_gated_rmsnorm_h128_bf16": 34,
+        "libr4d/mhc_post_bf16": 90,
+        "libr4d/gemm_fp8a8_f32scale": 200,
+        "libr4d/swiglu_clamped_quant_fp8": 87,
+        "libr4d/rmsnorm_bf16": 12,
+        "libr4d/kv_store_bf16": 11,
+        "libr4d/layernorm_bf16": 11,
+        "libr4d/gemm_nt_f32_bf16": 95,
+        "libr4d/dsa_query_fp8": 11,
+        "libr4d/qsa_work_bf16": 11,
+        "libr4d/dsa_pool_fp8": 11,
+        "libr4d/qsa_tail_store_bf16": 11,
+        "libr4d/dsa_score_fp8": 22,
+        "libr4d/qsa_select_i32": 22,
+        "libr4d/mla_project_bf16": 22,
+        "libr4d/mla_attn_matrix_bf16": 11,
+        "libr4d/quant_act_fp8": 11,
+        "libr4d/router_sigmoid_topk_f32": 42,
+        "libr4d/moe_scatter_inv_i32": 42,
+        "libr4d/moe_gemm_mxfp4a8": 84,
+        "libr4d/moe_gather_inv_bf16": 42,
+        "libr4d/gemm_mxfp4a8_gemv": 84,
+        "libr4d/gemm_mxfp4a8_gemv_wide": 168,
+        "libr4d/gemm_mxfp4a8_decode": 84,
+        "libr4d/fill_bf16": 42,
+        "libr4d/router_sigmoid_topk_scatter_f32": 42,
+        "libr4d/mhc_contract_bf16": 1,
+        "libr4d/gather_rows_bf16": 1,
+        "libr4d/logits_gemm_bf16_cols": 1
+      },
+      "weight_footprint": {
+        "statics": 4231704576,
+        "experts": 40428896256,
+        "expert_spare_dynamic_upper_bound": 113643520,
+        "expert_unit_max": 3342336,
+        "expert_layer_max": 962592768,
+        "layer_unit_max": 111407104,
+        "embedding": 317194240,
+        "tower": 0,
+        "hosted": 0,
+        "mapped": 0,
+        "routed": true,
+        "units": 12144
+      },
+      "arena_plus_scratch_bytes": 52346880,
+      "host_arena_bytes": 0,
+      "kv_fixed_bytes": 36937728,
+      "kv_ceiling_bytes": 42896384,
+      "kv_pool_mib_rounded_bytes": 42991616,
+      "checkpoint_one_slot_bytes_NOT_ALLOCATED": 36927488,
+      "batch_staging_device_bytes": 17152,
+      "state_groups": [
+        {
+          "name": "kv_latent",
+          "kind": 0,
+          "layers": 11,
+          "block_size": 4,
+          "bytes_per_block": 45056,
+          "bytes_per_sequence_state": 0,
+          "states": 0,
+          "zero": false,
+          "replicated": true
+        },
+        {
+          "name": "kv_index_tail",
+          "kind": 2,
+          "layers": 11,
+          "block_size": 0,
+          "bytes_per_block": 0,
+          "bytes_per_sequence_state": 22528,
+          "states": 1,
+          "zero": false,
+          "replicated": false
+        },
+        {
+          "name": "kv_kda",
+          "kind": 2,
+          "layers": 34,
+          "block_size": 0,
+          "bytes_per_block": 0,
+          "bytes_per_sequence_state": 35651584,
+          "states": 1,
+          "zero": false,
+          "replicated": false
+        },
+        {
+          "name": "kv_kda_conv",
+          "kind": 3,
+          "layers": 34,
+          "block_size": 0,
+          "bytes_per_block": 0,
+          "bytes_per_sequence_state": 1253376,
+          "states": 1,
+          "zero": false,
+          "replicated": false
+        },
+        {
+          "name": "kv_dsa_index",
+          "kind": 0,
+          "layers": 11,
+          "block_size": 4,
+          "bytes_per_block": 1496,
+          "bytes_per_sequence_state": 0,
+          "states": 0,
+          "zero": false,
+          "replicated": true
+        }
+      ],
+      "planned_recipe_casts": [
+        {
+          "logical_source": "blk.11.attn_kv_b.weight",
+          "raw_encoding": "bf16",
+          "planned_encoding": "bf16",
+          "shape": [
+            32768,
+            512
+          ],
+          "payload_converted": false
+        },
+        {
+          "logical_source": "blk.15.attn_kv_b.weight",
+          "raw_encoding": "bf16",
+          "planned_encoding": "bf16",
+          "shape": [
+            32768,
+            512
+          ],
+          "payload_converted": false
+        },
+        {
+          "logical_source": "blk.19.attn_kv_b.weight",
+          "raw_encoding": "bf16",
+          "planned_encoding": "bf16",
+          "shape": [
+            32768,
+            512
+          ],
+          "payload_converted": false
+        },
+        {
+          "logical_source": "blk.23.attn_kv_b.weight",
+          "raw_encoding": "bf16",
+          "planned_encoding": "bf16",
+          "shape": [
+            32768,
+            512
+          ],
+          "payload_converted": false
+        },
+        {
+          "logical_source": "blk.27.attn_kv_b.weight",
+          "raw_encoding": "bf16",
+          "planned_encoding": "bf16",
+          "shape": [
+            32768,
+            512
+          ],
+          "payload_converted": false
+        },
+        {
+          "logical_source": "blk.3.attn_kv_b.weight",
+          "raw_encoding": "bf16",
+          "planned_encoding": "bf16",
+          "shape": [
+            32768,
+            512
+          ],
+          "payload_converted": false
+        },
+        {
+          "logical_source": "blk.31.attn_kv_b.weight",
+          "raw_encoding": "bf16",
+          "planned_encoding": "bf16",
+          "shape": [
+            32768,
+            512
+          ],
+          "payload_converted": false
+        },
+        {
+          "logical_source": "blk.35.attn_kv_b.weight",
+          "raw_encoding": "bf16",
+          "planned_encoding": "bf16",
+          "shape": [
+            32768,
+            512
+          ],
+          "payload_converted": false
+        },
+        {
+          "logical_source": "blk.39.attn_kv_b.weight",
+          "raw_encoding": "bf16",
+          "planned_encoding": "bf16",
+          "shape": [
+            32768,
+            512
+          ],
+          "payload_converted": false
+        },
+        {
+          "logical_source": "blk.43.attn_kv_b.weight",
+          "raw_encoding": "bf16",
+          "planned_encoding": "bf16",
+          "shape": [
+            32768,
+            512
+          ],
+          "payload_converted": false
+        },
+        {
+          "logical_source": "blk.7.attn_kv_b.weight",
+          "raw_encoding": "bf16",
+          "planned_encoding": "bf16",
+          "shape": [
+            32768,
+            512
+          ],
+          "payload_converted": false
+        }
+      ],
+      "sampler_declared": false,
+      "sampler_margin_device_bytes_assumed": 16777216,
+      "sampler_margin_host_bytes_assumed": 16777216,
+      "kernel_instances_initialized": 0,
+      "main_expert_metadata": {
+        "status": 0,
+        "diagnostic": "",
+        "geometry_only": true,
+        "payload_checksums_or_generation_authority": false,
+        "payload_read_copied_converted_or_packed": false,
+        "native_inventory_or_ready_source": false,
+        "input_plan_fits": false,
+        "main_units": 12096,
+        "owned_layouts": 12096,
+        "resident_layouts": 0,
+        "stored_bytes": 40428896256,
+        "source_selected_bytes": 40428896256,
+        "physical_rectangles": 72576,
+        "immutable_requested": 10741440,
+        "scratch_requested": 721465,
+        "construction_requested": 11462905,
+        "sizeof_record": 880,
+        "sizeof_member": 176,
+        "sizeof_slice": 80,
+        "sizeof_owned": 8,
+        "first_record": {
+          "unit": 7,
+          "layer": 3,
+          "expert": 0,
+          "stride": 3342336,
+          "offsets": [
+            0,
+            2097152,
+            2228224,
+            3276800
+          ],
+          "bytes": [
+            2097152,
+            131072,
+            1048576,
+            65536
+          ],
+          "shape": [
+            [
+              1024,
+              4096
+            ],
+            [
+              1024,
+              128
+            ],
+            [
+              4096,
+              512
+            ],
+            [
+              4096,
+              16
+            ]
+          ]
+        },
+        "last_record": {
+          "unit": 12143,
+          "layer": 44,
+          "expert": 287,
+          "stride": 3342336
+        }
+      }
+    },
+    {
+      "rank": 2,
+      "device": "AMD Radeon RX 9070 XT",
+      "capacity_bytes": 17095983104,
+      "eligibility_card0_free_snapshot_NOT_rank_free": 154812416,
+      "weights_with_sentinel": 49657,
+      "used_weights": 49656,
+      "logical_sources": 25246,
+      "widened_weights": 323,
+      "selected_stored_weight_bytes_sum": 44659282296,
+      "ordinary_loader_metadata": {
+        "direct_identity_count": 49081,
+        "direct_identity_stored_bytes": 44171551096,
+        "nonidentity_OR_widen_count": 575,
+        "nonidentity_OR_widen_stored_bytes": 487731200,
+        "nonidentity_OR_widen_max_stored_bytes": 4718592,
+        "widen_count": 323,
+        "widen_stored_bytes": 347138048,
+        "widen_max_stored_bytes": 4718592,
+        "top10_nonidentity_OR_widen": [
+          {
+            "name": "blk.10.glm_router.weight",
+            "source": "blk.10.glm_router.weight",
+            "stored_bytes": 4718592,
+            "logical_bytes": 4718592,
+            "layout": "",
+            "identity_flag": true,
+            "widen": true,
+            "dtype": 1,
+            "first_use": 416,
+            "last_use": 417
+          },
+          {
+            "name": "blk.11.glm_router.weight",
+            "source": "blk.11.glm_router.weight",
+            "stored_bytes": 4718592,
+            "logical_bytes": 4718592,
+            "layout": "",
+            "identity_flag": true,
+            "widen": true,
+            "dtype": 1,
+            "first_use": 471,
+            "last_use": 472
+          },
+          {
+            "name": "blk.12.glm_router.weight",
+            "source": "blk.12.glm_router.weight",
+            "stored_bytes": 4718592,
+            "logical_bytes": 4718592,
+            "layout": "",
+            "identity_flag": true,
+            "widen": true,
+            "dtype": 1,
+            "first_use": 510,
+            "last_use": 511
+          },
+          {
+            "name": "blk.13.glm_router.weight",
+            "source": "blk.13.glm_router.weight",
+            "stored_bytes": 4718592,
+            "logical_bytes": 4718592,
+            "layout": "",
+            "identity_flag": true,
+            "widen": true,
+            "dtype": 1,
+            "first_use": 549,
+            "last_use": 550
+          },
+          {
+            "name": "blk.14.glm_router.weight",
+            "source": "blk.14.glm_router.weight",
+            "stored_bytes": 4718592,
+            "logical_bytes": 4718592,
+            "layout": "",
+            "identity_flag": true,
+            "widen": true,
+            "dtype": 1,
+            "first_use": 588,
+            "last_use": 589
+          },
+          {
+            "name": "blk.15.glm_router.weight",
+            "source": "blk.15.glm_router.weight",
+            "stored_bytes": 4718592,
+            "logical_bytes": 4718592,
+            "layout": "",
+            "identity_flag": true,
+            "widen": true,
+            "dtype": 1,
+            "first_use": 643,
+            "last_use": 644
+          },
+          {
+            "name": "blk.16.glm_router.weight",
+            "source": "blk.16.glm_router.weight",
+            "stored_bytes": 4718592,
+            "logical_bytes": 4718592,
+            "layout": "",
+            "identity_flag": true,
+            "widen": true,
+            "dtype": 1,
+            "first_use": 682,
+            "last_use": 683
+          },
+          {
+            "name": "blk.17.glm_router.weight",
+            "source": "blk.17.glm_router.weight",
+            "stored_bytes": 4718592,
+            "logical_bytes": 4718592,
+            "layout": "",
+            "identity_flag": true,
+            "widen": true,
+            "dtype": 1,
+            "first_use": 721,
+            "last_use": 722
+          },
+          {
+            "name": "blk.18.glm_router.weight",
+            "source": "blk.18.glm_router.weight",
+            "stored_bytes": 4718592,
+            "logical_bytes": 4718592,
+            "layout": "",
+            "identity_flag": true,
+            "widen": true,
+            "dtype": 1,
+            "first_use": 760,
+            "last_use": 761
+          },
+          {
+            "name": "blk.19.glm_router.weight",
+            "source": "blk.19.glm_router.weight",
+            "stored_bytes": 4718592,
+            "logical_bytes": 4718592,
+            "layout": "",
+            "identity_flag": true,
+            "widen": true,
+            "dtype": 1,
+            "first_use": 815,
+            "last_use": 816
+          }
+        ],
+        "scope": "stored output/layout metadata only; not measured worker/input/bounce/retained-output residency or recipe conversion peak"
+      },
+      "ops_with_sentinel": 1906,
+      "buffers_with_sentinel": 297,
+      "device_selection_complete": true,
+      "device_holes": [],
+      "device_hole_free": true,
+      "stock_reference_gate_passed": true,
+      "stock_reference_only_op_instances": 0,
+      "stock_reference_only_op_names": [],
+      "reference_device_bands": 0,
+      "device_bands_by_kernel": {
+        "libr4d/embed_lookup_bf16": 1,
+        "libr4d/ar_oneshot_4rank_exact_host": 182,
+        "libr4d/cast_bf16_bf16": 23,
+        "libr4d/mhc_pre_bf16": 90,
+        "libr4d/mhc_pre_partial_bf16": 90,
+        "libr4d/ar_gather_4rank_host": 154,
+        "libr4d/mhc_pre_finish_bf16": 90,
+        "libr4d/rmsnorm_quant_fp8": 101,
+        "libr4d/gemm_bf16_nt_m16": 192,
+        "libr4d/gemm_bf16_nt_m64": 362,
+        "libr4d/gemm_bf16_nt_tiled": 226,
+        "libr4d/ple_conv_bf16": 34,
+        "libr4d/kda_update_k128_v128_bf16": 68,
+        "libr4d/gdn_gated_rmsnorm_h128_bf16": 34,
+        "libr4d/mhc_post_bf16": 90,
+        "libr4d/gemm_fp8a8_f32scale": 200,
+        "libr4d/swiglu_clamped_quant_fp8": 87,
+        "libr4d/rmsnorm_bf16": 12,
+        "libr4d/kv_store_bf16": 11,
+        "libr4d/layernorm_bf16": 11,
+        "libr4d/gemm_nt_f32_bf16": 95,
+        "libr4d/dsa_query_fp8": 11,
+        "libr4d/qsa_work_bf16": 11,
+        "libr4d/dsa_pool_fp8": 11,
+        "libr4d/qsa_tail_store_bf16": 11,
+        "libr4d/dsa_score_fp8": 22,
+        "libr4d/qsa_select_i32": 22,
+        "libr4d/mla_project_bf16": 22,
+        "libr4d/mla_attn_matrix_bf16": 11,
+        "libr4d/quant_act_fp8": 11,
+        "libr4d/router_sigmoid_topk_f32": 42,
+        "libr4d/moe_scatter_inv_i32": 42,
+        "libr4d/moe_gemm_mxfp4a8": 84,
+        "libr4d/moe_gather_inv_bf16": 42,
+        "libr4d/gemm_mxfp4a8_gemv": 84,
+        "libr4d/gemm_mxfp4a8_gemv_wide": 168,
+        "libr4d/gemm_mxfp4a8_decode": 84,
+        "libr4d/fill_bf16": 42,
+        "libr4d/router_sigmoid_topk_scatter_f32": 42,
+        "libr4d/mhc_contract_bf16": 1,
+        "libr4d/gather_rows_bf16": 1,
+        "libr4d/logits_gemm_bf16_cols": 1
+      },
+      "weight_footprint": {
+        "statics": 4231704576,
+        "experts": 40428896256,
+        "expert_spare_dynamic_upper_bound": 113643520,
+        "expert_unit_max": 3342336,
+        "expert_layer_max": 962592768,
+        "layer_unit_max": 111407104,
+        "embedding": 317194240,
+        "tower": 0,
+        "hosted": 0,
+        "mapped": 0,
+        "routed": true,
+        "units": 12144
+      },
+      "arena_plus_scratch_bytes": 52346880,
+      "host_arena_bytes": 0,
+      "kv_fixed_bytes": 36937728,
+      "kv_ceiling_bytes": 42896384,
+      "kv_pool_mib_rounded_bytes": 42991616,
+      "checkpoint_one_slot_bytes_NOT_ALLOCATED": 36927488,
+      "batch_staging_device_bytes": 17152,
+      "state_groups": [
+        {
+          "name": "kv_latent",
+          "kind": 0,
+          "layers": 11,
+          "block_size": 4,
+          "bytes_per_block": 45056,
+          "bytes_per_sequence_state": 0,
+          "states": 0,
+          "zero": false,
+          "replicated": true
+        },
+        {
+          "name": "kv_index_tail",
+          "kind": 2,
+          "layers": 11,
+          "block_size": 0,
+          "bytes_per_block": 0,
+          "bytes_per_sequence_state": 22528,
+          "states": 1,
+          "zero": false,
+          "replicated": false
+        },
+        {
+          "name": "kv_kda",
+          "kind": 2,
+          "layers": 34,
+          "block_size": 0,
+          "bytes_per_block": 0,
+          "bytes_per_sequence_state": 35651584,
+          "states": 1,
+          "zero": false,
+          "replicated": false
+        },
+        {
+          "name": "kv_kda_conv",
+          "kind": 3,
+          "layers": 34,
+          "block_size": 0,
+          "bytes_per_block": 0,
+          "bytes_per_sequence_state": 1253376,
+          "states": 1,
+          "zero": false,
+          "replicated": false
+        },
+        {
+          "name": "kv_dsa_index",
+          "kind": 0,
+          "layers": 11,
+          "block_size": 4,
+          "bytes_per_block": 1496,
+          "bytes_per_sequence_state": 0,
+          "states": 0,
+          "zero": false,
+          "replicated": true
+        }
+      ],
+      "planned_recipe_casts": [
+        {
+          "logical_source": "blk.11.attn_kv_b.weight",
+          "raw_encoding": "bf16",
+          "planned_encoding": "bf16",
+          "shape": [
+            32768,
+            512
+          ],
+          "payload_converted": false
+        },
+        {
+          "logical_source": "blk.15.attn_kv_b.weight",
+          "raw_encoding": "bf16",
+          "planned_encoding": "bf16",
+          "shape": [
+            32768,
+            512
+          ],
+          "payload_converted": false
+        },
+        {
+          "logical_source": "blk.19.attn_kv_b.weight",
+          "raw_encoding": "bf16",
+          "planned_encoding": "bf16",
+          "shape": [
+            32768,
+            512
+          ],
+          "payload_converted": false
+        },
+        {
+          "logical_source": "blk.23.attn_kv_b.weight",
+          "raw_encoding": "bf16",
+          "planned_encoding": "bf16",
+          "shape": [
+            32768,
+            512
+          ],
+          "payload_converted": false
+        },
+        {
+          "logical_source": "blk.27.attn_kv_b.weight",
+          "raw_encoding": "bf16",
+          "planned_encoding": "bf16",
+          "shape": [
+            32768,
+            512
+          ],
+          "payload_converted": false
+        },
+        {
+          "logical_source": "blk.3.attn_kv_b.weight",
+          "raw_encoding": "bf16",
+          "planned_encoding": "bf16",
+          "shape": [
+            32768,
+            512
+          ],
+          "payload_converted": false
+        },
+        {
+          "logical_source": "blk.31.attn_kv_b.weight",
+          "raw_encoding": "bf16",
+          "planned_encoding": "bf16",
+          "shape": [
+            32768,
+            512
+          ],
+          "payload_converted": false
+        },
+        {
+          "logical_source": "blk.35.attn_kv_b.weight",
+          "raw_encoding": "bf16",
+          "planned_encoding": "bf16",
+          "shape": [
+            32768,
+            512
+          ],
+          "payload_converted": false
+        },
+        {
+          "logical_source": "blk.39.attn_kv_b.weight",
+          "raw_encoding": "bf16",
+          "planned_encoding": "bf16",
+          "shape": [
+            32768,
+            512
+          ],
+          "payload_converted": false
+        },
+        {
+          "logical_source": "blk.43.attn_kv_b.weight",
+          "raw_encoding": "bf16",
+          "planned_encoding": "bf16",
+          "shape": [
+            32768,
+            512
+          ],
+          "payload_converted": false
+        },
+        {
+          "logical_source": "blk.7.attn_kv_b.weight",
+          "raw_encoding": "bf16",
+          "planned_encoding": "bf16",
+          "shape": [
+            32768,
+            512
+          ],
+          "payload_converted": false
+        }
+      ],
+      "sampler_declared": false,
+      "sampler_margin_device_bytes_assumed": 16777216,
+      "sampler_margin_host_bytes_assumed": 16777216,
+      "kernel_instances_initialized": 0,
+      "main_expert_metadata": {
+        "status": 0,
+        "diagnostic": "",
+        "geometry_only": true,
+        "payload_checksums_or_generation_authority": false,
+        "payload_read_copied_converted_or_packed": false,
+        "native_inventory_or_ready_source": false,
+        "input_plan_fits": false,
+        "main_units": 12096,
+        "owned_layouts": 12096,
+        "resident_layouts": 0,
+        "stored_bytes": 40428896256,
+        "source_selected_bytes": 40428896256,
+        "physical_rectangles": 72576,
+        "immutable_requested": 10741440,
+        "scratch_requested": 721465,
+        "construction_requested": 11462905,
+        "sizeof_record": 880,
+        "sizeof_member": 176,
+        "sizeof_slice": 80,
+        "sizeof_owned": 8,
+        "first_record": {
+          "unit": 7,
+          "layer": 3,
+          "expert": 0,
+          "stride": 3342336,
+          "offsets": [
+            0,
+            2097152,
+            2228224,
+            3276800
+          ],
+          "bytes": [
+            2097152,
+            131072,
+            1048576,
+            65536
+          ],
+          "shape": [
+            [
+              1024,
+              4096
+            ],
+            [
+              1024,
+              128
+            ],
+            [
+              4096,
+              512
+            ],
+            [
+              4096,
+              16
+            ]
+          ]
+        },
+        "last_record": {
+          "unit": 12143,
+          "layer": 44,
+          "expert": 287,
+          "stride": 3342336
+        }
+      }
+    },
+    {
+      "rank": 3,
+      "device": "AMD Radeon RX 9070 XT",
+      "capacity_bytes": 17095983104,
+      "eligibility_card0_free_snapshot_NOT_rank_free": 154812416,
+      "weights_with_sentinel": 49657,
+      "used_weights": 49656,
+      "logical_sources": 25246,
+      "widened_weights": 323,
+      "selected_stored_weight_bytes_sum": 44659282296,
+      "ordinary_loader_metadata": {
+        "direct_identity_count": 49081,
+        "direct_identity_stored_bytes": 44171551096,
+        "nonidentity_OR_widen_count": 575,
+        "nonidentity_OR_widen_stored_bytes": 487731200,
+        "nonidentity_OR_widen_max_stored_bytes": 4718592,
+        "widen_count": 323,
+        "widen_stored_bytes": 347138048,
+        "widen_max_stored_bytes": 4718592,
+        "top10_nonidentity_OR_widen": [
+          {
+            "name": "blk.10.glm_router.weight",
+            "source": "blk.10.glm_router.weight",
+            "stored_bytes": 4718592,
+            "logical_bytes": 4718592,
+            "layout": "",
+            "identity_flag": true,
+            "widen": true,
+            "dtype": 1,
+            "first_use": 416,
+            "last_use": 417
+          },
+          {
+            "name": "blk.11.glm_router.weight",
+            "source": "blk.11.glm_router.weight",
+            "stored_bytes": 4718592,
+            "logical_bytes": 4718592,
+            "layout": "",
+            "identity_flag": true,
+            "widen": true,
+            "dtype": 1,
+            "first_use": 471,
+            "last_use": 472
+          },
+          {
+            "name": "blk.12.glm_router.weight",
+            "source": "blk.12.glm_router.weight",
+            "stored_bytes": 4718592,
+            "logical_bytes": 4718592,
+            "layout": "",
+            "identity_flag": true,
+            "widen": true,
+            "dtype": 1,
+            "first_use": 510,
+            "last_use": 511
+          },
+          {
+            "name": "blk.13.glm_router.weight",
+            "source": "blk.13.glm_router.weight",
+            "stored_bytes": 4718592,
+            "logical_bytes": 4718592,
+            "layout": "",
+            "identity_flag": true,
+            "widen": true,
+            "dtype": 1,
+            "first_use": 549,
+            "last_use": 550
+          },
+          {
+            "name": "blk.14.glm_router.weight",
+            "source": "blk.14.glm_router.weight",
+            "stored_bytes": 4718592,
+            "logical_bytes": 4718592,
+            "layout": "",
+            "identity_flag": true,
+            "widen": true,
+            "dtype": 1,
+            "first_use": 588,
+            "last_use": 589
+          },
+          {
+            "name": "blk.15.glm_router.weight",
+            "source": "blk.15.glm_router.weight",
+            "stored_bytes": 4718592,
+            "logical_bytes": 4718592,
+            "layout": "",
+            "identity_flag": true,
+            "widen": true,
+            "dtype": 1,
+            "first_use": 643,
+            "last_use": 644
+          },
+          {
+            "name": "blk.16.glm_router.weight",
+            "source": "blk.16.glm_router.weight",
+            "stored_bytes": 4718592,
+            "logical_bytes": 4718592,
+            "layout": "",
+            "identity_flag": true,
+            "widen": true,
+            "dtype": 1,
+            "first_use": 682,
+            "last_use": 683
+          },
+          {
+            "name": "blk.17.glm_router.weight",
+            "source": "blk.17.glm_router.weight",
+            "stored_bytes": 4718592,
+            "logical_bytes": 4718592,
+            "layout": "",
+            "identity_flag": true,
+            "widen": true,
+            "dtype": 1,
+            "first_use": 721,
+            "last_use": 722
+          },
+          {
+            "name": "blk.18.glm_router.weight",
+            "source": "blk.18.glm_router.weight",
+            "stored_bytes": 4718592,
+            "logical_bytes": 4718592,
+            "layout": "",
+            "identity_flag": true,
+            "widen": true,
+            "dtype": 1,
+            "first_use": 760,
+            "last_use": 761
+          },
+          {
+            "name": "blk.19.glm_router.weight",
+            "source": "blk.19.glm_router.weight",
+            "stored_bytes": 4718592,
+            "logical_bytes": 4718592,
+            "layout": "",
+            "identity_flag": true,
+            "widen": true,
+            "dtype": 1,
+            "first_use": 815,
+            "last_use": 816
+          }
+        ],
+        "scope": "stored output/layout metadata only; not measured worker/input/bounce/retained-output residency or recipe conversion peak"
+      },
+      "ops_with_sentinel": 1906,
+      "buffers_with_sentinel": 297,
+      "device_selection_complete": true,
+      "device_holes": [],
+      "device_hole_free": true,
+      "stock_reference_gate_passed": true,
+      "stock_reference_only_op_instances": 0,
+      "stock_reference_only_op_names": [],
+      "reference_device_bands": 0,
+      "device_bands_by_kernel": {
+        "libr4d/embed_lookup_bf16": 1,
+        "libr4d/ar_oneshot_4rank_exact_host": 182,
+        "libr4d/cast_bf16_bf16": 23,
+        "libr4d/mhc_pre_bf16": 90,
+        "libr4d/mhc_pre_partial_bf16": 90,
+        "libr4d/ar_gather_4rank_host": 154,
+        "libr4d/mhc_pre_finish_bf16": 90,
+        "libr4d/rmsnorm_quant_fp8": 101,
+        "libr4d/gemm_bf16_nt_m16": 192,
+        "libr4d/gemm_bf16_nt_m64": 362,
+        "libr4d/gemm_bf16_nt_tiled": 226,
+        "libr4d/ple_conv_bf16": 34,
+        "libr4d/kda_update_k128_v128_bf16": 68,
+        "libr4d/gdn_gated_rmsnorm_h128_bf16": 34,
+        "libr4d/mhc_post_bf16": 90,
+        "libr4d/gemm_fp8a8_f32scale": 200,
+        "libr4d/swiglu_clamped_quant_fp8": 87,
+        "libr4d/rmsnorm_bf16": 12,
+        "libr4d/kv_store_bf16": 11,
+        "libr4d/layernorm_bf16": 11,
+        "libr4d/gemm_nt_f32_bf16": 95,
+        "libr4d/dsa_query_fp8": 11,
+        "libr4d/qsa_work_bf16": 11,
+        "libr4d/dsa_pool_fp8": 11,
+        "libr4d/qsa_tail_store_bf16": 11,
+        "libr4d/dsa_score_fp8": 22,
+        "libr4d/qsa_select_i32": 22,
+        "libr4d/mla_project_bf16": 22,
+        "libr4d/mla_attn_matrix_bf16": 11,
+        "libr4d/quant_act_fp8": 11,
+        "libr4d/router_sigmoid_topk_f32": 42,
+        "libr4d/moe_scatter_inv_i32": 42,
+        "libr4d/moe_gemm_mxfp4a8": 84,
+        "libr4d/moe_gather_inv_bf16": 42,
+        "libr4d/gemm_mxfp4a8_gemv": 84,
+        "libr4d/gemm_mxfp4a8_gemv_wide": 168,
+        "libr4d/gemm_mxfp4a8_decode": 84,
+        "libr4d/fill_bf16": 42,
+        "libr4d/router_sigmoid_topk_scatter_f32": 42,
+        "libr4d/mhc_contract_bf16": 1,
+        "libr4d/gather_rows_bf16": 1,
+        "libr4d/logits_gemm_bf16_cols": 1
+      },
+      "weight_footprint": {
+        "statics": 4231704576,
+        "experts": 40428896256,
+        "expert_spare_dynamic_upper_bound": 113643520,
+        "expert_unit_max": 3342336,
+        "expert_layer_max": 962592768,
+        "layer_unit_max": 111407104,
+        "embedding": 317194240,
+        "tower": 0,
+        "hosted": 0,
+        "mapped": 0,
+        "routed": true,
+        "units": 12144
+      },
+      "arena_plus_scratch_bytes": 52346880,
+      "host_arena_bytes": 0,
+      "kv_fixed_bytes": 36937728,
+      "kv_ceiling_bytes": 42896384,
+      "kv_pool_mib_rounded_bytes": 42991616,
+      "checkpoint_one_slot_bytes_NOT_ALLOCATED": 36927488,
+      "batch_staging_device_bytes": 17152,
+      "state_groups": [
+        {
+          "name": "kv_latent",
+          "kind": 0,
+          "layers": 11,
+          "block_size": 4,
+          "bytes_per_block": 45056,
+          "bytes_per_sequence_state": 0,
+          "states": 0,
+          "zero": false,
+          "replicated": true
+        },
+        {
+          "name": "kv_index_tail",
+          "kind": 2,
+          "layers": 11,
+          "block_size": 0,
+          "bytes_per_block": 0,
+          "bytes_per_sequence_state": 22528,
+          "states": 1,
+          "zero": false,
+          "replicated": false
+        },
+        {
+          "name": "kv_kda",
+          "kind": 2,
+          "layers": 34,
+          "block_size": 0,
+          "bytes_per_block": 0,
+          "bytes_per_sequence_state": 35651584,
+          "states": 1,
+          "zero": false,
+          "replicated": false
+        },
+        {
+          "name": "kv_kda_conv",
+          "kind": 3,
+          "layers": 34,
+          "block_size": 0,
+          "bytes_per_block": 0,
+          "bytes_per_sequence_state": 1253376,
+          "states": 1,
+          "zero": false,
+          "replicated": false
+        },
+        {
+          "name": "kv_dsa_index",
+          "kind": 0,
+          "layers": 11,
+          "block_size": 4,
+          "bytes_per_block": 1496,
+          "bytes_per_sequence_state": 0,
+          "states": 0,
+          "zero": false,
+          "replicated": true
+        }
+      ],
+      "planned_recipe_casts": [
+        {
+          "logical_source": "blk.11.attn_kv_b.weight",
+          "raw_encoding": "bf16",
+          "planned_encoding": "bf16",
+          "shape": [
+            32768,
+            512
+          ],
+          "payload_converted": false
+        },
+        {
+          "logical_source": "blk.15.attn_kv_b.weight",
+          "raw_encoding": "bf16",
+          "planned_encoding": "bf16",
+          "shape": [
+            32768,
+            512
+          ],
+          "payload_converted": false
+        },
+        {
+          "logical_source": "blk.19.attn_kv_b.weight",
+          "raw_encoding": "bf16",
+          "planned_encoding": "bf16",
+          "shape": [
+            32768,
+            512
+          ],
+          "payload_converted": false
+        },
+        {
+          "logical_source": "blk.23.attn_kv_b.weight",
+          "raw_encoding": "bf16",
+          "planned_encoding": "bf16",
+          "shape": [
+            32768,
+            512
+          ],
+          "payload_converted": false
+        },
+        {
+          "logical_source": "blk.27.attn_kv_b.weight",
+          "raw_encoding": "bf16",
+          "planned_encoding": "bf16",
+          "shape": [
+            32768,
+            512
+          ],
+          "payload_converted": false
+        },
+        {
+          "logical_source": "blk.3.attn_kv_b.weight",
+          "raw_encoding": "bf16",
+          "planned_encoding": "bf16",
+          "shape": [
+            32768,
+            512
+          ],
+          "payload_converted": false
+        },
+        {
+          "logical_source": "blk.31.attn_kv_b.weight",
+          "raw_encoding": "bf16",
+          "planned_encoding": "bf16",
+          "shape": [
+            32768,
+            512
+          ],
+          "payload_converted": false
+        },
+        {
+          "logical_source": "blk.35.attn_kv_b.weight",
+          "raw_encoding": "bf16",
+          "planned_encoding": "bf16",
+          "shape": [
+            32768,
+            512
+          ],
+          "payload_converted": false
+        },
+        {
+          "logical_source": "blk.39.attn_kv_b.weight",
+          "raw_encoding": "bf16",
+          "planned_encoding": "bf16",
+          "shape": [
+            32768,
+            512
+          ],
+          "payload_converted": false
+        },
+        {
+          "logical_source": "blk.43.attn_kv_b.weight",
+          "raw_encoding": "bf16",
+          "planned_encoding": "bf16",
+          "shape": [
+            32768,
+            512
+          ],
+          "payload_converted": false
+        },
+        {
+          "logical_source": "blk.7.attn_kv_b.weight",
+          "raw_encoding": "bf16",
+          "planned_encoding": "bf16",
+          "shape": [
+            32768,
+            512
+          ],
+          "payload_converted": false
+        }
+      ],
+      "sampler_declared": false,
+      "sampler_margin_device_bytes_assumed": 16777216,
+      "sampler_margin_host_bytes_assumed": 16777216,
+      "kernel_instances_initialized": 0,
+      "main_expert_metadata": {
+        "status": 0,
+        "diagnostic": "",
+        "geometry_only": true,
+        "payload_checksums_or_generation_authority": false,
+        "payload_read_copied_converted_or_packed": false,
+        "native_inventory_or_ready_source": false,
+        "input_plan_fits": false,
+        "main_units": 12096,
+        "owned_layouts": 12096,
+        "resident_layouts": 0,
+        "stored_bytes": 40428896256,
+        "source_selected_bytes": 40428896256,
+        "physical_rectangles": 72576,
+        "immutable_requested": 10741440,
+        "scratch_requested": 721465,
+        "construction_requested": 11462905,
+        "sizeof_record": 880,
+        "sizeof_member": 176,
+        "sizeof_slice": 80,
+        "sizeof_owned": 8,
+        "first_record": {
+          "unit": 7,
+          "layer": 3,
+          "expert": 0,
+          "stride": 3342336,
+          "offsets": [
+            0,
+            2097152,
+            2228224,
+            3276800
+          ],
+          "bytes": [
+            2097152,
+            131072,
+            1048576,
+            65536
+          ],
+          "shape": [
+            [
+              1024,
+              4096
+            ],
+            [
+              1024,
+              128
+            ],
+            [
+              4096,
+              512
+            ],
+            [
+              4096,
+              16
+            ]
+          ]
+        },
+        "last_record": {
+          "unit": 12143,
+          "layer": 44,
+          "expert": 287,
+          "stride": 3342336
+        }
+      }
+    }
+  ],
+  "scenarios": [
+    {
+      "runtime_driver_collective_headroom_mib_ASSUMED": 512,
+      "host_pool_mib_per_rank": 26624,
+      "ranks": [
+        {
+          "status": -6,
+          "fits": false,
+          "notes": [],
+          "unfit": [
+            {
+              "class": "blk.*.ffn_gate_up_exps.*.weight",
+              "why": "the host pool is full and no --weights-disk-tier was given",
+              "count": 96,
+              "bytes": 320864256
+            }
+          ],
+          "unfit_bytes": 320864256,
+          "tier_bytes": {
+            "vram": 16423227768,
+            "pinned": 27915190272,
+            "pageable": 0,
+            "ssd": 320864256,
+            "mapped": 0
+          },
+          "weight_budget": 16446914560,
+          "host_budget_after_staging": 27917287424,
+          "slab_overhead": 0,
+          "file_stage_vram": 20058112,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": true,
+          "rank": 0,
+          "nonweight_device_budget_bytes": 649003776,
+          "weight_budget_mib_derived": 15685,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 12631937024,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 12511608832
+        },
+        {
+          "status": -6,
+          "fits": false,
+          "notes": [],
+          "unfit": [
+            {
+              "class": "blk.*.ffn_gate_up_exps.*.weight",
+              "why": "the host pool is full and no --weights-disk-tier was given",
+              "count": 96,
+              "bytes": 320864256
+            }
+          ],
+          "unfit_bytes": 320864256,
+          "tier_bytes": {
+            "vram": 16423227768,
+            "pinned": 27915190272,
+            "pageable": 0,
+            "ssd": 320864256,
+            "mapped": 0
+          },
+          "weight_budget": 16446914560,
+          "host_budget_after_staging": 27917287424,
+          "slab_overhead": 0,
+          "file_stage_vram": 20058112,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": true,
+          "rank": 1,
+          "nonweight_device_budget_bytes": 649003776,
+          "weight_budget_mib_derived": 15685,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 12631937024,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 12511608832
+        },
+        {
+          "status": -6,
+          "fits": false,
+          "notes": [],
+          "unfit": [
+            {
+              "class": "blk.*.ffn_gate_up_exps.*.weight",
+              "why": "the host pool is full and no --weights-disk-tier was given",
+              "count": 96,
+              "bytes": 320864256
+            }
+          ],
+          "unfit_bytes": 320864256,
+          "tier_bytes": {
+            "vram": 16423227768,
+            "pinned": 27915190272,
+            "pageable": 0,
+            "ssd": 320864256,
+            "mapped": 0
+          },
+          "weight_budget": 16446914560,
+          "host_budget_after_staging": 27917287424,
+          "slab_overhead": 0,
+          "file_stage_vram": 20058112,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": true,
+          "rank": 2,
+          "nonweight_device_budget_bytes": 649003776,
+          "weight_budget_mib_derived": 15685,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 12631937024,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 12511608832
+        },
+        {
+          "status": -6,
+          "fits": false,
+          "notes": [],
+          "unfit": [
+            {
+              "class": "blk.*.ffn_gate_up_exps.*.weight",
+              "why": "the host pool is full and no --weights-disk-tier was given",
+              "count": 96,
+              "bytes": 320864256
+            }
+          ],
+          "unfit_bytes": 320864256,
+          "tier_bytes": {
+            "vram": 16423227768,
+            "pinned": 27915190272,
+            "pageable": 0,
+            "ssd": 320864256,
+            "mapped": 0
+          },
+          "weight_budget": 16446914560,
+          "host_budget_after_staging": 27917287424,
+          "slab_overhead": 0,
+          "file_stage_vram": 20058112,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": true,
+          "rank": 3,
+          "nonweight_device_budget_bytes": 649003776,
+          "weight_budget_mib_derived": 15685,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 12631937024,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 12511608832
+        }
+      ],
+      "all_rank_weight_plans_fit": false,
+      "host_pools_plus_hostarena_sampler_and_ASSUMED8GiB_bytes": 120326193152,
+      "within_physical_memtotal_under_ASSUMED_margin": true,
+      "within_current_memavailable_without_stopping_anything": false,
+      "planning_candidate_only": false
+    },
+    {
+      "runtime_driver_collective_headroom_mib_ASSUMED": 512,
+      "host_pool_mib_per_rank": 27136,
+      "ranks": [
+        {
+          "status": 0,
+          "fits": true,
+          "notes": [],
+          "unfit": [],
+          "unfit_bytes": 0,
+          "tier_bytes": {
+            "vram": 16443281784,
+            "pinned": 28216000512,
+            "pageable": 0,
+            "ssd": 0,
+            "mapped": 0
+          },
+          "weight_budget": 16446914560,
+          "host_budget_after_staging": 28454158336,
+          "slab_overhead": 0,
+          "file_stage_vram": 0,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": false,
+          "rank": 0,
+          "nonweight_device_budget_bytes": 649003776,
+          "weight_budget_mib_derived": 15685,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 12095066112,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 11974737920
+        },
+        {
+          "status": 0,
+          "fits": true,
+          "notes": [],
+          "unfit": [],
+          "unfit_bytes": 0,
+          "tier_bytes": {
+            "vram": 16443281784,
+            "pinned": 28216000512,
+            "pageable": 0,
+            "ssd": 0,
+            "mapped": 0
+          },
+          "weight_budget": 16446914560,
+          "host_budget_after_staging": 28454158336,
+          "slab_overhead": 0,
+          "file_stage_vram": 0,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": false,
+          "rank": 1,
+          "nonweight_device_budget_bytes": 649003776,
+          "weight_budget_mib_derived": 15685,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 12095066112,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 11974737920
+        },
+        {
+          "status": 0,
+          "fits": true,
+          "notes": [],
+          "unfit": [],
+          "unfit_bytes": 0,
+          "tier_bytes": {
+            "vram": 16443281784,
+            "pinned": 28216000512,
+            "pageable": 0,
+            "ssd": 0,
+            "mapped": 0
+          },
+          "weight_budget": 16446914560,
+          "host_budget_after_staging": 28454158336,
+          "slab_overhead": 0,
+          "file_stage_vram": 0,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": false,
+          "rank": 2,
+          "nonweight_device_budget_bytes": 649003776,
+          "weight_budget_mib_derived": 15685,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 12095066112,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 11974737920
+        },
+        {
+          "status": 0,
+          "fits": true,
+          "notes": [],
+          "unfit": [],
+          "unfit_bytes": 0,
+          "tier_bytes": {
+            "vram": 16443281784,
+            "pinned": 28216000512,
+            "pageable": 0,
+            "ssd": 0,
+            "mapped": 0
+          },
+          "weight_budget": 16446914560,
+          "host_budget_after_staging": 28454158336,
+          "slab_overhead": 0,
+          "file_stage_vram": 0,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": false,
+          "rank": 3,
+          "nonweight_device_budget_bytes": 649003776,
+          "weight_budget_mib_derived": 15685,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 12095066112,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 11974737920
+        }
+      ],
+      "all_rank_weight_plans_fit": true,
+      "host_pools_plus_hostarena_sampler_and_ASSUMED8GiB_bytes": 122473676800,
+      "within_physical_memtotal_under_ASSUMED_margin": true,
+      "within_current_memavailable_without_stopping_anything": false,
+      "planning_candidate_only": true
+    },
+    {
+      "runtime_driver_collective_headroom_mib_ASSUMED": 512,
+      "host_pool_mib_per_rank": 27648,
+      "ranks": [
+        {
+          "status": 0,
+          "fits": true,
+          "notes": [],
+          "unfit": [],
+          "unfit_bytes": 0,
+          "tier_bytes": {
+            "vram": 16443281784,
+            "pinned": 28216000512,
+            "pageable": 0,
+            "ssd": 0,
+            "mapped": 0
+          },
+          "weight_budget": 16446914560,
+          "host_budget_after_staging": 28991029248,
+          "slab_overhead": 0,
+          "file_stage_vram": 0,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": false,
+          "rank": 0,
+          "nonweight_device_budget_bytes": 649003776,
+          "weight_budget_mib_derived": 15685,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 11558195200,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 11437867008
+        },
+        {
+          "status": 0,
+          "fits": true,
+          "notes": [],
+          "unfit": [],
+          "unfit_bytes": 0,
+          "tier_bytes": {
+            "vram": 16443281784,
+            "pinned": 28216000512,
+            "pageable": 0,
+            "ssd": 0,
+            "mapped": 0
+          },
+          "weight_budget": 16446914560,
+          "host_budget_after_staging": 28991029248,
+          "slab_overhead": 0,
+          "file_stage_vram": 0,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": false,
+          "rank": 1,
+          "nonweight_device_budget_bytes": 649003776,
+          "weight_budget_mib_derived": 15685,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 11558195200,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 11437867008
+        },
+        {
+          "status": 0,
+          "fits": true,
+          "notes": [],
+          "unfit": [],
+          "unfit_bytes": 0,
+          "tier_bytes": {
+            "vram": 16443281784,
+            "pinned": 28216000512,
+            "pageable": 0,
+            "ssd": 0,
+            "mapped": 0
+          },
+          "weight_budget": 16446914560,
+          "host_budget_after_staging": 28991029248,
+          "slab_overhead": 0,
+          "file_stage_vram": 0,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": false,
+          "rank": 2,
+          "nonweight_device_budget_bytes": 649003776,
+          "weight_budget_mib_derived": 15685,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 11558195200,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 11437867008
+        },
+        {
+          "status": 0,
+          "fits": true,
+          "notes": [],
+          "unfit": [],
+          "unfit_bytes": 0,
+          "tier_bytes": {
+            "vram": 16443281784,
+            "pinned": 28216000512,
+            "pageable": 0,
+            "ssd": 0,
+            "mapped": 0
+          },
+          "weight_budget": 16446914560,
+          "host_budget_after_staging": 28991029248,
+          "slab_overhead": 0,
+          "file_stage_vram": 0,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": false,
+          "rank": 3,
+          "nonweight_device_budget_bytes": 649003776,
+          "weight_budget_mib_derived": 15685,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 11558195200,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 11437867008
+        }
+      ],
+      "all_rank_weight_plans_fit": true,
+      "host_pools_plus_hostarena_sampler_and_ASSUMED8GiB_bytes": 124621160448,
+      "within_physical_memtotal_under_ASSUMED_margin": true,
+      "within_current_memavailable_without_stopping_anything": false,
+      "planning_candidate_only": true
+    },
+    {
+      "runtime_driver_collective_headroom_mib_ASSUMED": 512,
+      "host_pool_mib_per_rank": 28160,
+      "ranks": [
+        {
+          "status": 0,
+          "fits": true,
+          "notes": [],
+          "unfit": [],
+          "unfit_bytes": 0,
+          "tier_bytes": {
+            "vram": 16443281784,
+            "pinned": 28216000512,
+            "pageable": 0,
+            "ssd": 0,
+            "mapped": 0
+          },
+          "weight_budget": 16446914560,
+          "host_budget_after_staging": 29527900160,
+          "slab_overhead": 0,
+          "file_stage_vram": 0,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": false,
+          "rank": 0,
+          "nonweight_device_budget_bytes": 649003776,
+          "weight_budget_mib_derived": 15685,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 11021324288,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 10900996096
+        },
+        {
+          "status": 0,
+          "fits": true,
+          "notes": [],
+          "unfit": [],
+          "unfit_bytes": 0,
+          "tier_bytes": {
+            "vram": 16443281784,
+            "pinned": 28216000512,
+            "pageable": 0,
+            "ssd": 0,
+            "mapped": 0
+          },
+          "weight_budget": 16446914560,
+          "host_budget_after_staging": 29527900160,
+          "slab_overhead": 0,
+          "file_stage_vram": 0,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": false,
+          "rank": 1,
+          "nonweight_device_budget_bytes": 649003776,
+          "weight_budget_mib_derived": 15685,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 11021324288,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 10900996096
+        },
+        {
+          "status": 0,
+          "fits": true,
+          "notes": [],
+          "unfit": [],
+          "unfit_bytes": 0,
+          "tier_bytes": {
+            "vram": 16443281784,
+            "pinned": 28216000512,
+            "pageable": 0,
+            "ssd": 0,
+            "mapped": 0
+          },
+          "weight_budget": 16446914560,
+          "host_budget_after_staging": 29527900160,
+          "slab_overhead": 0,
+          "file_stage_vram": 0,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": false,
+          "rank": 2,
+          "nonweight_device_budget_bytes": 649003776,
+          "weight_budget_mib_derived": 15685,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 11021324288,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 10900996096
+        },
+        {
+          "status": 0,
+          "fits": true,
+          "notes": [],
+          "unfit": [],
+          "unfit_bytes": 0,
+          "tier_bytes": {
+            "vram": 16443281784,
+            "pinned": 28216000512,
+            "pageable": 0,
+            "ssd": 0,
+            "mapped": 0
+          },
+          "weight_budget": 16446914560,
+          "host_budget_after_staging": 29527900160,
+          "slab_overhead": 0,
+          "file_stage_vram": 0,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": false,
+          "rank": 3,
+          "nonweight_device_budget_bytes": 649003776,
+          "weight_budget_mib_derived": 15685,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 11021324288,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 10900996096
+        }
+      ],
+      "all_rank_weight_plans_fit": true,
+      "host_pools_plus_hostarena_sampler_and_ASSUMED8GiB_bytes": 126768644096,
+      "within_physical_memtotal_under_ASSUMED_margin": true,
+      "within_current_memavailable_without_stopping_anything": false,
+      "planning_candidate_only": true
+    },
+    {
+      "runtime_driver_collective_headroom_mib_ASSUMED": 512,
+      "host_pool_mib_per_rank": 28672,
+      "ranks": [
+        {
+          "status": 0,
+          "fits": true,
+          "notes": [],
+          "unfit": [],
+          "unfit_bytes": 0,
+          "tier_bytes": {
+            "vram": 16443281784,
+            "pinned": 28216000512,
+            "pageable": 0,
+            "ssd": 0,
+            "mapped": 0
+          },
+          "weight_budget": 16446914560,
+          "host_budget_after_staging": 30064771072,
+          "slab_overhead": 0,
+          "file_stage_vram": 0,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": false,
+          "rank": 0,
+          "nonweight_device_budget_bytes": 649003776,
+          "weight_budget_mib_derived": 15685,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 10484453376,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 10364125184
+        },
+        {
+          "status": 0,
+          "fits": true,
+          "notes": [],
+          "unfit": [],
+          "unfit_bytes": 0,
+          "tier_bytes": {
+            "vram": 16443281784,
+            "pinned": 28216000512,
+            "pageable": 0,
+            "ssd": 0,
+            "mapped": 0
+          },
+          "weight_budget": 16446914560,
+          "host_budget_after_staging": 30064771072,
+          "slab_overhead": 0,
+          "file_stage_vram": 0,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": false,
+          "rank": 1,
+          "nonweight_device_budget_bytes": 649003776,
+          "weight_budget_mib_derived": 15685,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 10484453376,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 10364125184
+        },
+        {
+          "status": 0,
+          "fits": true,
+          "notes": [],
+          "unfit": [],
+          "unfit_bytes": 0,
+          "tier_bytes": {
+            "vram": 16443281784,
+            "pinned": 28216000512,
+            "pageable": 0,
+            "ssd": 0,
+            "mapped": 0
+          },
+          "weight_budget": 16446914560,
+          "host_budget_after_staging": 30064771072,
+          "slab_overhead": 0,
+          "file_stage_vram": 0,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": false,
+          "rank": 2,
+          "nonweight_device_budget_bytes": 649003776,
+          "weight_budget_mib_derived": 15685,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 10484453376,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 10364125184
+        },
+        {
+          "status": 0,
+          "fits": true,
+          "notes": [],
+          "unfit": [],
+          "unfit_bytes": 0,
+          "tier_bytes": {
+            "vram": 16443281784,
+            "pinned": 28216000512,
+            "pageable": 0,
+            "ssd": 0,
+            "mapped": 0
+          },
+          "weight_budget": 16446914560,
+          "host_budget_after_staging": 30064771072,
+          "slab_overhead": 0,
+          "file_stage_vram": 0,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": false,
+          "rank": 3,
+          "nonweight_device_budget_bytes": 649003776,
+          "weight_budget_mib_derived": 15685,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 10484453376,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 10364125184
+        }
+      ],
+      "all_rank_weight_plans_fit": true,
+      "host_pools_plus_hostarena_sampler_and_ASSUMED8GiB_bytes": 128916127744,
+      "within_physical_memtotal_under_ASSUMED_margin": true,
+      "within_current_memavailable_without_stopping_anything": false,
+      "planning_candidate_only": true
+    },
+    {
+      "runtime_driver_collective_headroom_mib_ASSUMED": 1024,
+      "host_pool_mib_per_rank": 26624,
+      "ranks": [
+        {
+          "status": -6,
+          "fits": false,
+          "notes": [],
+          "unfit": [
+            {
+              "class": "blk.*.ffn_gate_up_exps.*.weight",
+              "why": "the host pool is full and no --weights-disk-tier was given",
+              "count": 264,
+              "bytes": 882376704
+            }
+          ],
+          "unfit_bytes": 882376704,
+          "tier_bytes": {
+            "vram": 15861715320,
+            "pinned": 27915190272,
+            "pageable": 0,
+            "ssd": 882376704,
+            "mapped": 0
+          },
+          "weight_budget": 15910043648,
+          "host_budget_after_staging": 27917287424,
+          "slab_overhead": 0,
+          "file_stage_vram": 46796800,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": true,
+          "rank": 0,
+          "nonweight_device_budget_bytes": 1185874688,
+          "weight_budget_mib_derived": 15173,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 12631937024,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 12511608832
+        },
+        {
+          "status": -6,
+          "fits": false,
+          "notes": [],
+          "unfit": [
+            {
+              "class": "blk.*.ffn_gate_up_exps.*.weight",
+              "why": "the host pool is full and no --weights-disk-tier was given",
+              "count": 264,
+              "bytes": 882376704
+            }
+          ],
+          "unfit_bytes": 882376704,
+          "tier_bytes": {
+            "vram": 15861715320,
+            "pinned": 27915190272,
+            "pageable": 0,
+            "ssd": 882376704,
+            "mapped": 0
+          },
+          "weight_budget": 15910043648,
+          "host_budget_after_staging": 27917287424,
+          "slab_overhead": 0,
+          "file_stage_vram": 46796800,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": true,
+          "rank": 1,
+          "nonweight_device_budget_bytes": 1185874688,
+          "weight_budget_mib_derived": 15173,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 12631937024,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 12511608832
+        },
+        {
+          "status": -6,
+          "fits": false,
+          "notes": [],
+          "unfit": [
+            {
+              "class": "blk.*.ffn_gate_up_exps.*.weight",
+              "why": "the host pool is full and no --weights-disk-tier was given",
+              "count": 264,
+              "bytes": 882376704
+            }
+          ],
+          "unfit_bytes": 882376704,
+          "tier_bytes": {
+            "vram": 15861715320,
+            "pinned": 27915190272,
+            "pageable": 0,
+            "ssd": 882376704,
+            "mapped": 0
+          },
+          "weight_budget": 15910043648,
+          "host_budget_after_staging": 27917287424,
+          "slab_overhead": 0,
+          "file_stage_vram": 46796800,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": true,
+          "rank": 2,
+          "nonweight_device_budget_bytes": 1185874688,
+          "weight_budget_mib_derived": 15173,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 12631937024,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 12511608832
+        },
+        {
+          "status": -6,
+          "fits": false,
+          "notes": [],
+          "unfit": [
+            {
+              "class": "blk.*.ffn_gate_up_exps.*.weight",
+              "why": "the host pool is full and no --weights-disk-tier was given",
+              "count": 264,
+              "bytes": 882376704
+            }
+          ],
+          "unfit_bytes": 882376704,
+          "tier_bytes": {
+            "vram": 15861715320,
+            "pinned": 27915190272,
+            "pageable": 0,
+            "ssd": 882376704,
+            "mapped": 0
+          },
+          "weight_budget": 15910043648,
+          "host_budget_after_staging": 27917287424,
+          "slab_overhead": 0,
+          "file_stage_vram": 46796800,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": true,
+          "rank": 3,
+          "nonweight_device_budget_bytes": 1185874688,
+          "weight_budget_mib_derived": 15173,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 12631937024,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 12511608832
+        }
+      ],
+      "all_rank_weight_plans_fit": false,
+      "host_pools_plus_hostarena_sampler_and_ASSUMED8GiB_bytes": 120326193152,
+      "within_physical_memtotal_under_ASSUMED_margin": true,
+      "within_current_memavailable_without_stopping_anything": false,
+      "planning_candidate_only": false
+    },
+    {
+      "runtime_driver_collective_headroom_mib_ASSUMED": 1024,
+      "host_pool_mib_per_rank": 27136,
+      "ranks": [
+        {
+          "status": -6,
+          "fits": false,
+          "notes": [],
+          "unfit": [
+            {
+              "class": "blk.*.ffn_gate_up_exps.*.weight",
+              "why": "the host pool is full and no --weights-disk-tier was given",
+              "count": 95,
+              "bytes": 317521920
+            }
+          ],
+          "unfit_bytes": 317521920,
+          "tier_bytes": {
+            "vram": 15888454008,
+            "pinned": 28453306368,
+            "pageable": 0,
+            "ssd": 317521920,
+            "mapped": 0
+          },
+          "weight_budget": 15910043648,
+          "host_budget_after_staging": 28454158336,
+          "slab_overhead": 0,
+          "file_stage_vram": 20058112,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": true,
+          "rank": 0,
+          "nonweight_device_budget_bytes": 1185874688,
+          "weight_budget_mib_derived": 15173,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 12095066112,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 11974737920
+        },
+        {
+          "status": -6,
+          "fits": false,
+          "notes": [],
+          "unfit": [
+            {
+              "class": "blk.*.ffn_gate_up_exps.*.weight",
+              "why": "the host pool is full and no --weights-disk-tier was given",
+              "count": 95,
+              "bytes": 317521920
+            }
+          ],
+          "unfit_bytes": 317521920,
+          "tier_bytes": {
+            "vram": 15888454008,
+            "pinned": 28453306368,
+            "pageable": 0,
+            "ssd": 317521920,
+            "mapped": 0
+          },
+          "weight_budget": 15910043648,
+          "host_budget_after_staging": 28454158336,
+          "slab_overhead": 0,
+          "file_stage_vram": 20058112,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": true,
+          "rank": 1,
+          "nonweight_device_budget_bytes": 1185874688,
+          "weight_budget_mib_derived": 15173,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 12095066112,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 11974737920
+        },
+        {
+          "status": -6,
+          "fits": false,
+          "notes": [],
+          "unfit": [
+            {
+              "class": "blk.*.ffn_gate_up_exps.*.weight",
+              "why": "the host pool is full and no --weights-disk-tier was given",
+              "count": 95,
+              "bytes": 317521920
+            }
+          ],
+          "unfit_bytes": 317521920,
+          "tier_bytes": {
+            "vram": 15888454008,
+            "pinned": 28453306368,
+            "pageable": 0,
+            "ssd": 317521920,
+            "mapped": 0
+          },
+          "weight_budget": 15910043648,
+          "host_budget_after_staging": 28454158336,
+          "slab_overhead": 0,
+          "file_stage_vram": 20058112,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": true,
+          "rank": 2,
+          "nonweight_device_budget_bytes": 1185874688,
+          "weight_budget_mib_derived": 15173,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 12095066112,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 11974737920
+        },
+        {
+          "status": -6,
+          "fits": false,
+          "notes": [],
+          "unfit": [
+            {
+              "class": "blk.*.ffn_gate_up_exps.*.weight",
+              "why": "the host pool is full and no --weights-disk-tier was given",
+              "count": 95,
+              "bytes": 317521920
+            }
+          ],
+          "unfit_bytes": 317521920,
+          "tier_bytes": {
+            "vram": 15888454008,
+            "pinned": 28453306368,
+            "pageable": 0,
+            "ssd": 317521920,
+            "mapped": 0
+          },
+          "weight_budget": 15910043648,
+          "host_budget_after_staging": 28454158336,
+          "slab_overhead": 0,
+          "file_stage_vram": 20058112,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": true,
+          "rank": 3,
+          "nonweight_device_budget_bytes": 1185874688,
+          "weight_budget_mib_derived": 15173,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 12095066112,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 11974737920
+        }
+      ],
+      "all_rank_weight_plans_fit": false,
+      "host_pools_plus_hostarena_sampler_and_ASSUMED8GiB_bytes": 122473676800,
+      "within_physical_memtotal_under_ASSUMED_margin": true,
+      "within_current_memavailable_without_stopping_anything": false,
+      "planning_candidate_only": false
+    },
+    {
+      "runtime_driver_collective_headroom_mib_ASSUMED": 1024,
+      "host_pool_mib_per_rank": 27648,
+      "ranks": [
+        {
+          "status": 0,
+          "fits": true,
+          "notes": [],
+          "unfit": [],
+          "unfit_bytes": 0,
+          "tier_bytes": {
+            "vram": 15908508024,
+            "pinned": 28750774272,
+            "pageable": 0,
+            "ssd": 0,
+            "mapped": 0
+          },
+          "weight_budget": 15910043648,
+          "host_budget_after_staging": 28991029248,
+          "slab_overhead": 0,
+          "file_stage_vram": 0,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": false,
+          "rank": 0,
+          "nonweight_device_budget_bytes": 1185874688,
+          "weight_budget_mib_derived": 15173,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 11558195200,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 11437867008
+        },
+        {
+          "status": 0,
+          "fits": true,
+          "notes": [],
+          "unfit": [],
+          "unfit_bytes": 0,
+          "tier_bytes": {
+            "vram": 15908508024,
+            "pinned": 28750774272,
+            "pageable": 0,
+            "ssd": 0,
+            "mapped": 0
+          },
+          "weight_budget": 15910043648,
+          "host_budget_after_staging": 28991029248,
+          "slab_overhead": 0,
+          "file_stage_vram": 0,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": false,
+          "rank": 1,
+          "nonweight_device_budget_bytes": 1185874688,
+          "weight_budget_mib_derived": 15173,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 11558195200,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 11437867008
+        },
+        {
+          "status": 0,
+          "fits": true,
+          "notes": [],
+          "unfit": [],
+          "unfit_bytes": 0,
+          "tier_bytes": {
+            "vram": 15908508024,
+            "pinned": 28750774272,
+            "pageable": 0,
+            "ssd": 0,
+            "mapped": 0
+          },
+          "weight_budget": 15910043648,
+          "host_budget_after_staging": 28991029248,
+          "slab_overhead": 0,
+          "file_stage_vram": 0,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": false,
+          "rank": 2,
+          "nonweight_device_budget_bytes": 1185874688,
+          "weight_budget_mib_derived": 15173,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 11558195200,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 11437867008
+        },
+        {
+          "status": 0,
+          "fits": true,
+          "notes": [],
+          "unfit": [],
+          "unfit_bytes": 0,
+          "tier_bytes": {
+            "vram": 15908508024,
+            "pinned": 28750774272,
+            "pageable": 0,
+            "ssd": 0,
+            "mapped": 0
+          },
+          "weight_budget": 15910043648,
+          "host_budget_after_staging": 28991029248,
+          "slab_overhead": 0,
+          "file_stage_vram": 0,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": false,
+          "rank": 3,
+          "nonweight_device_budget_bytes": 1185874688,
+          "weight_budget_mib_derived": 15173,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 11558195200,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 11437867008
+        }
+      ],
+      "all_rank_weight_plans_fit": true,
+      "host_pools_plus_hostarena_sampler_and_ASSUMED8GiB_bytes": 124621160448,
+      "within_physical_memtotal_under_ASSUMED_margin": true,
+      "within_current_memavailable_without_stopping_anything": false,
+      "planning_candidate_only": true
+    },
+    {
+      "runtime_driver_collective_headroom_mib_ASSUMED": 1024,
+      "host_pool_mib_per_rank": 28160,
+      "ranks": [
+        {
+          "status": 0,
+          "fits": true,
+          "notes": [],
+          "unfit": [],
+          "unfit_bytes": 0,
+          "tier_bytes": {
+            "vram": 15908508024,
+            "pinned": 28750774272,
+            "pageable": 0,
+            "ssd": 0,
+            "mapped": 0
+          },
+          "weight_budget": 15910043648,
+          "host_budget_after_staging": 29527900160,
+          "slab_overhead": 0,
+          "file_stage_vram": 0,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": false,
+          "rank": 0,
+          "nonweight_device_budget_bytes": 1185874688,
+          "weight_budget_mib_derived": 15173,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 11021324288,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 10900996096
+        },
+        {
+          "status": 0,
+          "fits": true,
+          "notes": [],
+          "unfit": [],
+          "unfit_bytes": 0,
+          "tier_bytes": {
+            "vram": 15908508024,
+            "pinned": 28750774272,
+            "pageable": 0,
+            "ssd": 0,
+            "mapped": 0
+          },
+          "weight_budget": 15910043648,
+          "host_budget_after_staging": 29527900160,
+          "slab_overhead": 0,
+          "file_stage_vram": 0,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": false,
+          "rank": 1,
+          "nonweight_device_budget_bytes": 1185874688,
+          "weight_budget_mib_derived": 15173,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 11021324288,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 10900996096
+        },
+        {
+          "status": 0,
+          "fits": true,
+          "notes": [],
+          "unfit": [],
+          "unfit_bytes": 0,
+          "tier_bytes": {
+            "vram": 15908508024,
+            "pinned": 28750774272,
+            "pageable": 0,
+            "ssd": 0,
+            "mapped": 0
+          },
+          "weight_budget": 15910043648,
+          "host_budget_after_staging": 29527900160,
+          "slab_overhead": 0,
+          "file_stage_vram": 0,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": false,
+          "rank": 2,
+          "nonweight_device_budget_bytes": 1185874688,
+          "weight_budget_mib_derived": 15173,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 11021324288,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 10900996096
+        },
+        {
+          "status": 0,
+          "fits": true,
+          "notes": [],
+          "unfit": [],
+          "unfit_bytes": 0,
+          "tier_bytes": {
+            "vram": 15908508024,
+            "pinned": 28750774272,
+            "pageable": 0,
+            "ssd": 0,
+            "mapped": 0
+          },
+          "weight_budget": 15910043648,
+          "host_budget_after_staging": 29527900160,
+          "slab_overhead": 0,
+          "file_stage_vram": 0,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": false,
+          "rank": 3,
+          "nonweight_device_budget_bytes": 1185874688,
+          "weight_budget_mib_derived": 15173,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 11021324288,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 10900996096
+        }
+      ],
+      "all_rank_weight_plans_fit": true,
+      "host_pools_plus_hostarena_sampler_and_ASSUMED8GiB_bytes": 126768644096,
+      "within_physical_memtotal_under_ASSUMED_margin": true,
+      "within_current_memavailable_without_stopping_anything": false,
+      "planning_candidate_only": true
+    },
+    {
+      "runtime_driver_collective_headroom_mib_ASSUMED": 1024,
+      "host_pool_mib_per_rank": 28672,
+      "ranks": [
+        {
+          "status": 0,
+          "fits": true,
+          "notes": [],
+          "unfit": [],
+          "unfit_bytes": 0,
+          "tier_bytes": {
+            "vram": 15908508024,
+            "pinned": 28750774272,
+            "pageable": 0,
+            "ssd": 0,
+            "mapped": 0
+          },
+          "weight_budget": 15910043648,
+          "host_budget_after_staging": 30064771072,
+          "slab_overhead": 0,
+          "file_stage_vram": 0,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": false,
+          "rank": 0,
+          "nonweight_device_budget_bytes": 1185874688,
+          "weight_budget_mib_derived": 15173,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 10484453376,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 10364125184
+        },
+        {
+          "status": 0,
+          "fits": true,
+          "notes": [],
+          "unfit": [],
+          "unfit_bytes": 0,
+          "tier_bytes": {
+            "vram": 15908508024,
+            "pinned": 28750774272,
+            "pageable": 0,
+            "ssd": 0,
+            "mapped": 0
+          },
+          "weight_budget": 15910043648,
+          "host_budget_after_staging": 30064771072,
+          "slab_overhead": 0,
+          "file_stage_vram": 0,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": false,
+          "rank": 1,
+          "nonweight_device_budget_bytes": 1185874688,
+          "weight_budget_mib_derived": 15173,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 10484453376,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 10364125184
+        },
+        {
+          "status": 0,
+          "fits": true,
+          "notes": [],
+          "unfit": [],
+          "unfit_bytes": 0,
+          "tier_bytes": {
+            "vram": 15908508024,
+            "pinned": 28750774272,
+            "pageable": 0,
+            "ssd": 0,
+            "mapped": 0
+          },
+          "weight_budget": 15910043648,
+          "host_budget_after_staging": 30064771072,
+          "slab_overhead": 0,
+          "file_stage_vram": 0,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": false,
+          "rank": 2,
+          "nonweight_device_budget_bytes": 1185874688,
+          "weight_budget_mib_derived": 15173,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 10484453376,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 10364125184
+        },
+        {
+          "status": 0,
+          "fits": true,
+          "notes": [],
+          "unfit": [],
+          "unfit_bytes": 0,
+          "tier_bytes": {
+            "vram": 15908508024,
+            "pinned": 28750774272,
+            "pageable": 0,
+            "ssd": 0,
+            "mapped": 0
+          },
+          "weight_budget": 15910043648,
+          "host_budget_after_staging": 30064771072,
+          "slab_overhead": 0,
+          "file_stage_vram": 0,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": false,
+          "rank": 3,
+          "nonweight_device_budget_bytes": 1185874688,
+          "weight_budget_mib_derived": 15173,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 10484453376,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 10364125184
+        }
+      ],
+      "all_rank_weight_plans_fit": true,
+      "host_pools_plus_hostarena_sampler_and_ASSUMED8GiB_bytes": 128916127744,
+      "within_physical_memtotal_under_ASSUMED_margin": true,
+      "within_current_memavailable_without_stopping_anything": false,
+      "planning_candidate_only": true
+    },
+    {
+      "runtime_driver_collective_headroom_mib_ASSUMED": 1536,
+      "host_pool_mib_per_rank": 26624,
+      "ranks": [
+        {
+          "status": -6,
+          "fits": false,
+          "notes": [],
+          "unfit": [
+            {
+              "class": "blk.*.ffn_gate_up_exps.*.weight",
+              "why": "the host pool is full and no --weights-disk-tier was given",
+              "count": 433,
+              "bytes": 1447231488
+            }
+          ],
+          "unfit_bytes": 1447231488,
+          "tier_bytes": {
+            "vram": 15296860536,
+            "pinned": 27915190272,
+            "pageable": 0,
+            "ssd": 1447231488,
+            "mapped": 0
+          },
+          "weight_budget": 15373172736,
+          "host_budget_after_staging": 27917287424,
+          "slab_overhead": 0,
+          "file_stage_vram": 73535488,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": true,
+          "rank": 0,
+          "nonweight_device_budget_bytes": 1722745600,
+          "weight_budget_mib_derived": 14661,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 12631937024,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 12511608832
+        },
+        {
+          "status": -6,
+          "fits": false,
+          "notes": [],
+          "unfit": [
+            {
+              "class": "blk.*.ffn_gate_up_exps.*.weight",
+              "why": "the host pool is full and no --weights-disk-tier was given",
+              "count": 433,
+              "bytes": 1447231488
+            }
+          ],
+          "unfit_bytes": 1447231488,
+          "tier_bytes": {
+            "vram": 15296860536,
+            "pinned": 27915190272,
+            "pageable": 0,
+            "ssd": 1447231488,
+            "mapped": 0
+          },
+          "weight_budget": 15373172736,
+          "host_budget_after_staging": 27917287424,
+          "slab_overhead": 0,
+          "file_stage_vram": 73535488,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": true,
+          "rank": 1,
+          "nonweight_device_budget_bytes": 1722745600,
+          "weight_budget_mib_derived": 14661,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 12631937024,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 12511608832
+        },
+        {
+          "status": -6,
+          "fits": false,
+          "notes": [],
+          "unfit": [
+            {
+              "class": "blk.*.ffn_gate_up_exps.*.weight",
+              "why": "the host pool is full and no --weights-disk-tier was given",
+              "count": 433,
+              "bytes": 1447231488
+            }
+          ],
+          "unfit_bytes": 1447231488,
+          "tier_bytes": {
+            "vram": 15296860536,
+            "pinned": 27915190272,
+            "pageable": 0,
+            "ssd": 1447231488,
+            "mapped": 0
+          },
+          "weight_budget": 15373172736,
+          "host_budget_after_staging": 27917287424,
+          "slab_overhead": 0,
+          "file_stage_vram": 73535488,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": true,
+          "rank": 2,
+          "nonweight_device_budget_bytes": 1722745600,
+          "weight_budget_mib_derived": 14661,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 12631937024,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 12511608832
+        },
+        {
+          "status": -6,
+          "fits": false,
+          "notes": [],
+          "unfit": [
+            {
+              "class": "blk.*.ffn_gate_up_exps.*.weight",
+              "why": "the host pool is full and no --weights-disk-tier was given",
+              "count": 433,
+              "bytes": 1447231488
+            }
+          ],
+          "unfit_bytes": 1447231488,
+          "tier_bytes": {
+            "vram": 15296860536,
+            "pinned": 27915190272,
+            "pageable": 0,
+            "ssd": 1447231488,
+            "mapped": 0
+          },
+          "weight_budget": 15373172736,
+          "host_budget_after_staging": 27917287424,
+          "slab_overhead": 0,
+          "file_stage_vram": 73535488,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": true,
+          "rank": 3,
+          "nonweight_device_budget_bytes": 1722745600,
+          "weight_budget_mib_derived": 14661,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 12631937024,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 12511608832
+        }
+      ],
+      "all_rank_weight_plans_fit": false,
+      "host_pools_plus_hostarena_sampler_and_ASSUMED8GiB_bytes": 120326193152,
+      "within_physical_memtotal_under_ASSUMED_margin": true,
+      "within_current_memavailable_without_stopping_anything": false,
+      "planning_candidate_only": false
+    },
+    {
+      "runtime_driver_collective_headroom_mib_ASSUMED": 1536,
+      "host_pool_mib_per_rank": 27136,
+      "ranks": [
+        {
+          "status": -6,
+          "fits": false,
+          "notes": [],
+          "unfit": [
+            {
+              "class": "blk.*.ffn_gate_up_exps.*.weight",
+              "why": "the host pool is full and no --weights-disk-tier was given",
+              "count": 264,
+              "bytes": 882376704
+            }
+          ],
+          "unfit_bytes": 882376704,
+          "tier_bytes": {
+            "vram": 15323599224,
+            "pinned": 28453306368,
+            "pageable": 0,
+            "ssd": 882376704,
+            "mapped": 0
+          },
+          "weight_budget": 15373172736,
+          "host_budget_after_staging": 28454158336,
+          "slab_overhead": 0,
+          "file_stage_vram": 46796800,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": true,
+          "rank": 0,
+          "nonweight_device_budget_bytes": 1722745600,
+          "weight_budget_mib_derived": 14661,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 12095066112,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 11974737920
+        },
+        {
+          "status": -6,
+          "fits": false,
+          "notes": [],
+          "unfit": [
+            {
+              "class": "blk.*.ffn_gate_up_exps.*.weight",
+              "why": "the host pool is full and no --weights-disk-tier was given",
+              "count": 264,
+              "bytes": 882376704
+            }
+          ],
+          "unfit_bytes": 882376704,
+          "tier_bytes": {
+            "vram": 15323599224,
+            "pinned": 28453306368,
+            "pageable": 0,
+            "ssd": 882376704,
+            "mapped": 0
+          },
+          "weight_budget": 15373172736,
+          "host_budget_after_staging": 28454158336,
+          "slab_overhead": 0,
+          "file_stage_vram": 46796800,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": true,
+          "rank": 1,
+          "nonweight_device_budget_bytes": 1722745600,
+          "weight_budget_mib_derived": 14661,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 12095066112,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 11974737920
+        },
+        {
+          "status": -6,
+          "fits": false,
+          "notes": [],
+          "unfit": [
+            {
+              "class": "blk.*.ffn_gate_up_exps.*.weight",
+              "why": "the host pool is full and no --weights-disk-tier was given",
+              "count": 264,
+              "bytes": 882376704
+            }
+          ],
+          "unfit_bytes": 882376704,
+          "tier_bytes": {
+            "vram": 15323599224,
+            "pinned": 28453306368,
+            "pageable": 0,
+            "ssd": 882376704,
+            "mapped": 0
+          },
+          "weight_budget": 15373172736,
+          "host_budget_after_staging": 28454158336,
+          "slab_overhead": 0,
+          "file_stage_vram": 46796800,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": true,
+          "rank": 2,
+          "nonweight_device_budget_bytes": 1722745600,
+          "weight_budget_mib_derived": 14661,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 12095066112,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 11974737920
+        },
+        {
+          "status": -6,
+          "fits": false,
+          "notes": [],
+          "unfit": [
+            {
+              "class": "blk.*.ffn_gate_up_exps.*.weight",
+              "why": "the host pool is full and no --weights-disk-tier was given",
+              "count": 264,
+              "bytes": 882376704
+            }
+          ],
+          "unfit_bytes": 882376704,
+          "tier_bytes": {
+            "vram": 15323599224,
+            "pinned": 28453306368,
+            "pageable": 0,
+            "ssd": 882376704,
+            "mapped": 0
+          },
+          "weight_budget": 15373172736,
+          "host_budget_after_staging": 28454158336,
+          "slab_overhead": 0,
+          "file_stage_vram": 46796800,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": true,
+          "rank": 3,
+          "nonweight_device_budget_bytes": 1722745600,
+          "weight_budget_mib_derived": 14661,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 12095066112,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 11974737920
+        }
+      ],
+      "all_rank_weight_plans_fit": false,
+      "host_pools_plus_hostarena_sampler_and_ASSUMED8GiB_bytes": 122473676800,
+      "within_physical_memtotal_under_ASSUMED_margin": true,
+      "within_current_memavailable_without_stopping_anything": false,
+      "planning_candidate_only": false
+    },
+    {
+      "runtime_driver_collective_headroom_mib_ASSUMED": 1536,
+      "host_pool_mib_per_rank": 27648,
+      "ranks": [
+        {
+          "status": -6,
+          "fits": false,
+          "notes": [],
+          "unfit": [
+            {
+              "class": "blk.*.ffn_gate_up_exps.*.weight",
+              "why": "the host pool is full and no --weights-disk-tier was given",
+              "count": 96,
+              "bytes": 320864256
+            }
+          ],
+          "unfit_bytes": 320864256,
+          "tier_bytes": {
+            "vram": 15350337912,
+            "pinned": 28988080128,
+            "pageable": 0,
+            "ssd": 320864256,
+            "mapped": 0
+          },
+          "weight_budget": 15373172736,
+          "host_budget_after_staging": 28991029248,
+          "slab_overhead": 0,
+          "file_stage_vram": 20058112,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": true,
+          "rank": 0,
+          "nonweight_device_budget_bytes": 1722745600,
+          "weight_budget_mib_derived": 14661,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 11558195200,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 11437867008
+        },
+        {
+          "status": -6,
+          "fits": false,
+          "notes": [],
+          "unfit": [
+            {
+              "class": "blk.*.ffn_gate_up_exps.*.weight",
+              "why": "the host pool is full and no --weights-disk-tier was given",
+              "count": 96,
+              "bytes": 320864256
+            }
+          ],
+          "unfit_bytes": 320864256,
+          "tier_bytes": {
+            "vram": 15350337912,
+            "pinned": 28988080128,
+            "pageable": 0,
+            "ssd": 320864256,
+            "mapped": 0
+          },
+          "weight_budget": 15373172736,
+          "host_budget_after_staging": 28991029248,
+          "slab_overhead": 0,
+          "file_stage_vram": 20058112,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": true,
+          "rank": 1,
+          "nonweight_device_budget_bytes": 1722745600,
+          "weight_budget_mib_derived": 14661,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 11558195200,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 11437867008
+        },
+        {
+          "status": -6,
+          "fits": false,
+          "notes": [],
+          "unfit": [
+            {
+              "class": "blk.*.ffn_gate_up_exps.*.weight",
+              "why": "the host pool is full and no --weights-disk-tier was given",
+              "count": 96,
+              "bytes": 320864256
+            }
+          ],
+          "unfit_bytes": 320864256,
+          "tier_bytes": {
+            "vram": 15350337912,
+            "pinned": 28988080128,
+            "pageable": 0,
+            "ssd": 320864256,
+            "mapped": 0
+          },
+          "weight_budget": 15373172736,
+          "host_budget_after_staging": 28991029248,
+          "slab_overhead": 0,
+          "file_stage_vram": 20058112,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": true,
+          "rank": 2,
+          "nonweight_device_budget_bytes": 1722745600,
+          "weight_budget_mib_derived": 14661,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 11558195200,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 11437867008
+        },
+        {
+          "status": -6,
+          "fits": false,
+          "notes": [],
+          "unfit": [
+            {
+              "class": "blk.*.ffn_gate_up_exps.*.weight",
+              "why": "the host pool is full and no --weights-disk-tier was given",
+              "count": 96,
+              "bytes": 320864256
+            }
+          ],
+          "unfit_bytes": 320864256,
+          "tier_bytes": {
+            "vram": 15350337912,
+            "pinned": 28988080128,
+            "pageable": 0,
+            "ssd": 320864256,
+            "mapped": 0
+          },
+          "weight_budget": 15373172736,
+          "host_budget_after_staging": 28991029248,
+          "slab_overhead": 0,
+          "file_stage_vram": 20058112,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": true,
+          "rank": 3,
+          "nonweight_device_budget_bytes": 1722745600,
+          "weight_budget_mib_derived": 14661,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 11558195200,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 11437867008
+        }
+      ],
+      "all_rank_weight_plans_fit": false,
+      "host_pools_plus_hostarena_sampler_and_ASSUMED8GiB_bytes": 124621160448,
+      "within_physical_memtotal_under_ASSUMED_margin": true,
+      "within_current_memavailable_without_stopping_anything": false,
+      "planning_candidate_only": false
+    },
+    {
+      "runtime_driver_collective_headroom_mib_ASSUMED": 1536,
+      "host_pool_mib_per_rank": 28160,
+      "ranks": [
+        {
+          "status": 0,
+          "fits": true,
+          "notes": [],
+          "unfit": [],
+          "unfit_bytes": 0,
+          "tier_bytes": {
+            "vram": 15370391928,
+            "pinned": 29288890368,
+            "pageable": 0,
+            "ssd": 0,
+            "mapped": 0
+          },
+          "weight_budget": 15373172736,
+          "host_budget_after_staging": 29527900160,
+          "slab_overhead": 0,
+          "file_stage_vram": 0,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": false,
+          "rank": 0,
+          "nonweight_device_budget_bytes": 1722745600,
+          "weight_budget_mib_derived": 14661,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 11021324288,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 10900996096
+        },
+        {
+          "status": 0,
+          "fits": true,
+          "notes": [],
+          "unfit": [],
+          "unfit_bytes": 0,
+          "tier_bytes": {
+            "vram": 15370391928,
+            "pinned": 29288890368,
+            "pageable": 0,
+            "ssd": 0,
+            "mapped": 0
+          },
+          "weight_budget": 15373172736,
+          "host_budget_after_staging": 29527900160,
+          "slab_overhead": 0,
+          "file_stage_vram": 0,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": false,
+          "rank": 1,
+          "nonweight_device_budget_bytes": 1722745600,
+          "weight_budget_mib_derived": 14661,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 11021324288,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 10900996096
+        },
+        {
+          "status": 0,
+          "fits": true,
+          "notes": [],
+          "unfit": [],
+          "unfit_bytes": 0,
+          "tier_bytes": {
+            "vram": 15370391928,
+            "pinned": 29288890368,
+            "pageable": 0,
+            "ssd": 0,
+            "mapped": 0
+          },
+          "weight_budget": 15373172736,
+          "host_budget_after_staging": 29527900160,
+          "slab_overhead": 0,
+          "file_stage_vram": 0,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": false,
+          "rank": 2,
+          "nonweight_device_budget_bytes": 1722745600,
+          "weight_budget_mib_derived": 14661,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 11021324288,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 10900996096
+        },
+        {
+          "status": 0,
+          "fits": true,
+          "notes": [],
+          "unfit": [],
+          "unfit_bytes": 0,
+          "tier_bytes": {
+            "vram": 15370391928,
+            "pinned": 29288890368,
+            "pageable": 0,
+            "ssd": 0,
+            "mapped": 0
+          },
+          "weight_budget": 15373172736,
+          "host_budget_after_staging": 29527900160,
+          "slab_overhead": 0,
+          "file_stage_vram": 0,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": false,
+          "rank": 3,
+          "nonweight_device_budget_bytes": 1722745600,
+          "weight_budget_mib_derived": 14661,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 11021324288,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 10900996096
+        }
+      ],
+      "all_rank_weight_plans_fit": true,
+      "host_pools_plus_hostarena_sampler_and_ASSUMED8GiB_bytes": 126768644096,
+      "within_physical_memtotal_under_ASSUMED_margin": true,
+      "within_current_memavailable_without_stopping_anything": false,
+      "planning_candidate_only": true
+    },
+    {
+      "runtime_driver_collective_headroom_mib_ASSUMED": 1536,
+      "host_pool_mib_per_rank": 28672,
+      "ranks": [
+        {
+          "status": 0,
+          "fits": true,
+          "notes": [],
+          "unfit": [],
+          "unfit_bytes": 0,
+          "tier_bytes": {
+            "vram": 15370391928,
+            "pinned": 29288890368,
+            "pageable": 0,
+            "ssd": 0,
+            "mapped": 0
+          },
+          "weight_budget": 15373172736,
+          "host_budget_after_staging": 30064771072,
+          "slab_overhead": 0,
+          "file_stage_vram": 0,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": false,
+          "rank": 0,
+          "nonweight_device_budget_bytes": 1722745600,
+          "weight_budget_mib_derived": 14661,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 10484453376,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 10364125184
+        },
+        {
+          "status": 0,
+          "fits": true,
+          "notes": [],
+          "unfit": [],
+          "unfit_bytes": 0,
+          "tier_bytes": {
+            "vram": 15370391928,
+            "pinned": 29288890368,
+            "pageable": 0,
+            "ssd": 0,
+            "mapped": 0
+          },
+          "weight_budget": 15373172736,
+          "host_budget_after_staging": 30064771072,
+          "slab_overhead": 0,
+          "file_stage_vram": 0,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": false,
+          "rank": 1,
+          "nonweight_device_budget_bytes": 1722745600,
+          "weight_budget_mib_derived": 14661,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 10484453376,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 10364125184
+        },
+        {
+          "status": 0,
+          "fits": true,
+          "notes": [],
+          "unfit": [],
+          "unfit_bytes": 0,
+          "tier_bytes": {
+            "vram": 15370391928,
+            "pinned": 29288890368,
+            "pageable": 0,
+            "ssd": 0,
+            "mapped": 0
+          },
+          "weight_budget": 15373172736,
+          "host_budget_after_staging": 30064771072,
+          "slab_overhead": 0,
+          "file_stage_vram": 0,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": false,
+          "rank": 2,
+          "nonweight_device_budget_bytes": 1722745600,
+          "weight_budget_mib_derived": 14661,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 10484453376,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 10364125184
+        },
+        {
+          "status": 0,
+          "fits": true,
+          "notes": [],
+          "unfit": [],
+          "unfit_bytes": 0,
+          "tier_bytes": {
+            "vram": 15370391928,
+            "pinned": 29288890368,
+            "pageable": 0,
+            "ssd": 0,
+            "mapped": 0
+          },
+          "weight_budget": 15373172736,
+          "host_budget_after_staging": 30064771072,
+          "slab_overhead": 0,
+          "file_stage_vram": 0,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": false,
+          "rank": 3,
+          "nonweight_device_budget_bytes": 1722745600,
+          "weight_budget_mib_derived": 14661,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 10484453376,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 10364125184
+        }
+      ],
+      "all_rank_weight_plans_fit": true,
+      "host_pools_plus_hostarena_sampler_and_ASSUMED8GiB_bytes": 128916127744,
+      "within_physical_memtotal_under_ASSUMED_margin": true,
+      "within_current_memavailable_without_stopping_anything": false,
+      "planning_candidate_only": true
+    },
+    {
+      "runtime_driver_collective_headroom_mib_ASSUMED": 2048,
+      "host_pool_mib_per_rank": 26624,
+      "ranks": [
+        {
+          "status": -6,
+          "fits": false,
+          "notes": [],
+          "unfit": [
+            {
+              "class": "blk.*.ffn_gate_up_exps.*.weight",
+              "why": "the host pool is full and no --weights-disk-tier was given",
+              "count": 602,
+              "bytes": 2012086272
+            }
+          ],
+          "unfit_bytes": 2012086272,
+          "tier_bytes": {
+            "vram": 14732005752,
+            "pinned": 27915190272,
+            "pageable": 0,
+            "ssd": 2012086272,
+            "mapped": 0
+          },
+          "weight_budget": 14836301824,
+          "host_budget_after_staging": 27917287424,
+          "slab_overhead": 0,
+          "file_stage_vram": 100274176,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": true,
+          "rank": 0,
+          "nonweight_device_budget_bytes": 2259616512,
+          "weight_budget_mib_derived": 14149,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 12631937024,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 12511608832
+        },
+        {
+          "status": -6,
+          "fits": false,
+          "notes": [],
+          "unfit": [
+            {
+              "class": "blk.*.ffn_gate_up_exps.*.weight",
+              "why": "the host pool is full and no --weights-disk-tier was given",
+              "count": 602,
+              "bytes": 2012086272
+            }
+          ],
+          "unfit_bytes": 2012086272,
+          "tier_bytes": {
+            "vram": 14732005752,
+            "pinned": 27915190272,
+            "pageable": 0,
+            "ssd": 2012086272,
+            "mapped": 0
+          },
+          "weight_budget": 14836301824,
+          "host_budget_after_staging": 27917287424,
+          "slab_overhead": 0,
+          "file_stage_vram": 100274176,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": true,
+          "rank": 1,
+          "nonweight_device_budget_bytes": 2259616512,
+          "weight_budget_mib_derived": 14149,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 12631937024,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 12511608832
+        },
+        {
+          "status": -6,
+          "fits": false,
+          "notes": [],
+          "unfit": [
+            {
+              "class": "blk.*.ffn_gate_up_exps.*.weight",
+              "why": "the host pool is full and no --weights-disk-tier was given",
+              "count": 602,
+              "bytes": 2012086272
+            }
+          ],
+          "unfit_bytes": 2012086272,
+          "tier_bytes": {
+            "vram": 14732005752,
+            "pinned": 27915190272,
+            "pageable": 0,
+            "ssd": 2012086272,
+            "mapped": 0
+          },
+          "weight_budget": 14836301824,
+          "host_budget_after_staging": 27917287424,
+          "slab_overhead": 0,
+          "file_stage_vram": 100274176,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": true,
+          "rank": 2,
+          "nonweight_device_budget_bytes": 2259616512,
+          "weight_budget_mib_derived": 14149,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 12631937024,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 12511608832
+        },
+        {
+          "status": -6,
+          "fits": false,
+          "notes": [],
+          "unfit": [
+            {
+              "class": "blk.*.ffn_gate_up_exps.*.weight",
+              "why": "the host pool is full and no --weights-disk-tier was given",
+              "count": 602,
+              "bytes": 2012086272
+            }
+          ],
+          "unfit_bytes": 2012086272,
+          "tier_bytes": {
+            "vram": 14732005752,
+            "pinned": 27915190272,
+            "pageable": 0,
+            "ssd": 2012086272,
+            "mapped": 0
+          },
+          "weight_budget": 14836301824,
+          "host_budget_after_staging": 27917287424,
+          "slab_overhead": 0,
+          "file_stage_vram": 100274176,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": true,
+          "rank": 3,
+          "nonweight_device_budget_bytes": 2259616512,
+          "weight_budget_mib_derived": 14149,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 12631937024,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 12511608832
+        }
+      ],
+      "all_rank_weight_plans_fit": false,
+      "host_pools_plus_hostarena_sampler_and_ASSUMED8GiB_bytes": 120326193152,
+      "within_physical_memtotal_under_ASSUMED_margin": true,
+      "within_current_memavailable_without_stopping_anything": false,
+      "planning_candidate_only": false
+    },
+    {
+      "runtime_driver_collective_headroom_mib_ASSUMED": 2048,
+      "host_pool_mib_per_rank": 27136,
+      "ranks": [
+        {
+          "status": -6,
+          "fits": false,
+          "notes": [],
+          "unfit": [
+            {
+              "class": "blk.*.ffn_gate_up_exps.*.weight",
+              "why": "the host pool is full and no --weights-disk-tier was given",
+              "count": 433,
+              "bytes": 1447231488
+            }
+          ],
+          "unfit_bytes": 1447231488,
+          "tier_bytes": {
+            "vram": 14758744440,
+            "pinned": 28453306368,
+            "pageable": 0,
+            "ssd": 1447231488,
+            "mapped": 0
+          },
+          "weight_budget": 14836301824,
+          "host_budget_after_staging": 28454158336,
+          "slab_overhead": 0,
+          "file_stage_vram": 73535488,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": true,
+          "rank": 0,
+          "nonweight_device_budget_bytes": 2259616512,
+          "weight_budget_mib_derived": 14149,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 12095066112,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 11974737920
+        },
+        {
+          "status": -6,
+          "fits": false,
+          "notes": [],
+          "unfit": [
+            {
+              "class": "blk.*.ffn_gate_up_exps.*.weight",
+              "why": "the host pool is full and no --weights-disk-tier was given",
+              "count": 433,
+              "bytes": 1447231488
+            }
+          ],
+          "unfit_bytes": 1447231488,
+          "tier_bytes": {
+            "vram": 14758744440,
+            "pinned": 28453306368,
+            "pageable": 0,
+            "ssd": 1447231488,
+            "mapped": 0
+          },
+          "weight_budget": 14836301824,
+          "host_budget_after_staging": 28454158336,
+          "slab_overhead": 0,
+          "file_stage_vram": 73535488,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": true,
+          "rank": 1,
+          "nonweight_device_budget_bytes": 2259616512,
+          "weight_budget_mib_derived": 14149,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 12095066112,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 11974737920
+        },
+        {
+          "status": -6,
+          "fits": false,
+          "notes": [],
+          "unfit": [
+            {
+              "class": "blk.*.ffn_gate_up_exps.*.weight",
+              "why": "the host pool is full and no --weights-disk-tier was given",
+              "count": 433,
+              "bytes": 1447231488
+            }
+          ],
+          "unfit_bytes": 1447231488,
+          "tier_bytes": {
+            "vram": 14758744440,
+            "pinned": 28453306368,
+            "pageable": 0,
+            "ssd": 1447231488,
+            "mapped": 0
+          },
+          "weight_budget": 14836301824,
+          "host_budget_after_staging": 28454158336,
+          "slab_overhead": 0,
+          "file_stage_vram": 73535488,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": true,
+          "rank": 2,
+          "nonweight_device_budget_bytes": 2259616512,
+          "weight_budget_mib_derived": 14149,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 12095066112,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 11974737920
+        },
+        {
+          "status": -6,
+          "fits": false,
+          "notes": [],
+          "unfit": [
+            {
+              "class": "blk.*.ffn_gate_up_exps.*.weight",
+              "why": "the host pool is full and no --weights-disk-tier was given",
+              "count": 433,
+              "bytes": 1447231488
+            }
+          ],
+          "unfit_bytes": 1447231488,
+          "tier_bytes": {
+            "vram": 14758744440,
+            "pinned": 28453306368,
+            "pageable": 0,
+            "ssd": 1447231488,
+            "mapped": 0
+          },
+          "weight_budget": 14836301824,
+          "host_budget_after_staging": 28454158336,
+          "slab_overhead": 0,
+          "file_stage_vram": 73535488,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": true,
+          "rank": 3,
+          "nonweight_device_budget_bytes": 2259616512,
+          "weight_budget_mib_derived": 14149,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 12095066112,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 11974737920
+        }
+      ],
+      "all_rank_weight_plans_fit": false,
+      "host_pools_plus_hostarena_sampler_and_ASSUMED8GiB_bytes": 122473676800,
+      "within_physical_memtotal_under_ASSUMED_margin": true,
+      "within_current_memavailable_without_stopping_anything": false,
+      "planning_candidate_only": false
+    },
+    {
+      "runtime_driver_collective_headroom_mib_ASSUMED": 2048,
+      "host_pool_mib_per_rank": 27648,
+      "ranks": [
+        {
+          "status": -6,
+          "fits": false,
+          "notes": [],
+          "unfit": [
+            {
+              "class": "blk.*.ffn_gate_up_exps.*.weight",
+              "why": "the host pool is full and no --weights-disk-tier was given",
+              "count": 265,
+              "bytes": 885719040
+            }
+          ],
+          "unfit_bytes": 885719040,
+          "tier_bytes": {
+            "vram": 14785483128,
+            "pinned": 28988080128,
+            "pageable": 0,
+            "ssd": 885719040,
+            "mapped": 0
+          },
+          "weight_budget": 14836301824,
+          "host_budget_after_staging": 28991029248,
+          "slab_overhead": 0,
+          "file_stage_vram": 46796800,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": true,
+          "rank": 0,
+          "nonweight_device_budget_bytes": 2259616512,
+          "weight_budget_mib_derived": 14149,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 11558195200,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 11437867008
+        },
+        {
+          "status": -6,
+          "fits": false,
+          "notes": [],
+          "unfit": [
+            {
+              "class": "blk.*.ffn_gate_up_exps.*.weight",
+              "why": "the host pool is full and no --weights-disk-tier was given",
+              "count": 265,
+              "bytes": 885719040
+            }
+          ],
+          "unfit_bytes": 885719040,
+          "tier_bytes": {
+            "vram": 14785483128,
+            "pinned": 28988080128,
+            "pageable": 0,
+            "ssd": 885719040,
+            "mapped": 0
+          },
+          "weight_budget": 14836301824,
+          "host_budget_after_staging": 28991029248,
+          "slab_overhead": 0,
+          "file_stage_vram": 46796800,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": true,
+          "rank": 1,
+          "nonweight_device_budget_bytes": 2259616512,
+          "weight_budget_mib_derived": 14149,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 11558195200,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 11437867008
+        },
+        {
+          "status": -6,
+          "fits": false,
+          "notes": [],
+          "unfit": [
+            {
+              "class": "blk.*.ffn_gate_up_exps.*.weight",
+              "why": "the host pool is full and no --weights-disk-tier was given",
+              "count": 265,
+              "bytes": 885719040
+            }
+          ],
+          "unfit_bytes": 885719040,
+          "tier_bytes": {
+            "vram": 14785483128,
+            "pinned": 28988080128,
+            "pageable": 0,
+            "ssd": 885719040,
+            "mapped": 0
+          },
+          "weight_budget": 14836301824,
+          "host_budget_after_staging": 28991029248,
+          "slab_overhead": 0,
+          "file_stage_vram": 46796800,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": true,
+          "rank": 2,
+          "nonweight_device_budget_bytes": 2259616512,
+          "weight_budget_mib_derived": 14149,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 11558195200,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 11437867008
+        },
+        {
+          "status": -6,
+          "fits": false,
+          "notes": [],
+          "unfit": [
+            {
+              "class": "blk.*.ffn_gate_up_exps.*.weight",
+              "why": "the host pool is full and no --weights-disk-tier was given",
+              "count": 265,
+              "bytes": 885719040
+            }
+          ],
+          "unfit_bytes": 885719040,
+          "tier_bytes": {
+            "vram": 14785483128,
+            "pinned": 28988080128,
+            "pageable": 0,
+            "ssd": 885719040,
+            "mapped": 0
+          },
+          "weight_budget": 14836301824,
+          "host_budget_after_staging": 28991029248,
+          "slab_overhead": 0,
+          "file_stage_vram": 46796800,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": true,
+          "rank": 3,
+          "nonweight_device_budget_bytes": 2259616512,
+          "weight_budget_mib_derived": 14149,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 11558195200,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 11437867008
+        }
+      ],
+      "all_rank_weight_plans_fit": false,
+      "host_pools_plus_hostarena_sampler_and_ASSUMED8GiB_bytes": 124621160448,
+      "within_physical_memtotal_under_ASSUMED_margin": true,
+      "within_current_memavailable_without_stopping_anything": false,
+      "planning_candidate_only": false
+    },
+    {
+      "runtime_driver_collective_headroom_mib_ASSUMED": 2048,
+      "host_pool_mib_per_rank": 28160,
+      "ranks": [
+        {
+          "status": -6,
+          "fits": false,
+          "notes": [],
+          "unfit": [
+            {
+              "class": "blk.*.ffn_gate_up_exps.*.weight",
+              "why": "the host pool is full and no --weights-disk-tier was given",
+              "count": 96,
+              "bytes": 320864256
+            }
+          ],
+          "unfit_bytes": 320864256,
+          "tier_bytes": {
+            "vram": 14812221816,
+            "pinned": 29526196224,
+            "pageable": 0,
+            "ssd": 320864256,
+            "mapped": 0
+          },
+          "weight_budget": 14836301824,
+          "host_budget_after_staging": 29527900160,
+          "slab_overhead": 0,
+          "file_stage_vram": 20058112,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": true,
+          "rank": 0,
+          "nonweight_device_budget_bytes": 2259616512,
+          "weight_budget_mib_derived": 14149,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 11021324288,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 10900996096
+        },
+        {
+          "status": -6,
+          "fits": false,
+          "notes": [],
+          "unfit": [
+            {
+              "class": "blk.*.ffn_gate_up_exps.*.weight",
+              "why": "the host pool is full and no --weights-disk-tier was given",
+              "count": 96,
+              "bytes": 320864256
+            }
+          ],
+          "unfit_bytes": 320864256,
+          "tier_bytes": {
+            "vram": 14812221816,
+            "pinned": 29526196224,
+            "pageable": 0,
+            "ssd": 320864256,
+            "mapped": 0
+          },
+          "weight_budget": 14836301824,
+          "host_budget_after_staging": 29527900160,
+          "slab_overhead": 0,
+          "file_stage_vram": 20058112,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": true,
+          "rank": 1,
+          "nonweight_device_budget_bytes": 2259616512,
+          "weight_budget_mib_derived": 14149,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 11021324288,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 10900996096
+        },
+        {
+          "status": -6,
+          "fits": false,
+          "notes": [],
+          "unfit": [
+            {
+              "class": "blk.*.ffn_gate_up_exps.*.weight",
+              "why": "the host pool is full and no --weights-disk-tier was given",
+              "count": 96,
+              "bytes": 320864256
+            }
+          ],
+          "unfit_bytes": 320864256,
+          "tier_bytes": {
+            "vram": 14812221816,
+            "pinned": 29526196224,
+            "pageable": 0,
+            "ssd": 320864256,
+            "mapped": 0
+          },
+          "weight_budget": 14836301824,
+          "host_budget_after_staging": 29527900160,
+          "slab_overhead": 0,
+          "file_stage_vram": 20058112,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": true,
+          "rank": 2,
+          "nonweight_device_budget_bytes": 2259616512,
+          "weight_budget_mib_derived": 14149,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 11021324288,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 10900996096
+        },
+        {
+          "status": -6,
+          "fits": false,
+          "notes": [],
+          "unfit": [
+            {
+              "class": "blk.*.ffn_gate_up_exps.*.weight",
+              "why": "the host pool is full and no --weights-disk-tier was given",
+              "count": 96,
+              "bytes": 320864256
+            }
+          ],
+          "unfit_bytes": 320864256,
+          "tier_bytes": {
+            "vram": 14812221816,
+            "pinned": 29526196224,
+            "pageable": 0,
+            "ssd": 320864256,
+            "mapped": 0
+          },
+          "weight_budget": 14836301824,
+          "host_budget_after_staging": 29527900160,
+          "slab_overhead": 0,
+          "file_stage_vram": 20058112,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": true,
+          "rank": 3,
+          "nonweight_device_budget_bytes": 2259616512,
+          "weight_budget_mib_derived": 14149,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 11021324288,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 10900996096
+        }
+      ],
+      "all_rank_weight_plans_fit": false,
+      "host_pools_plus_hostarena_sampler_and_ASSUMED8GiB_bytes": 126768644096,
+      "within_physical_memtotal_under_ASSUMED_margin": true,
+      "within_current_memavailable_without_stopping_anything": false,
+      "planning_candidate_only": false
+    },
+    {
+      "runtime_driver_collective_headroom_mib_ASSUMED": 2048,
+      "host_pool_mib_per_rank": 28672,
+      "ranks": [
+        {
+          "status": 0,
+          "fits": true,
+          "notes": [],
+          "unfit": [],
+          "unfit_bytes": 0,
+          "tier_bytes": {
+            "vram": 14832275832,
+            "pinned": 29827006464,
+            "pageable": 0,
+            "ssd": 0,
+            "mapped": 0
+          },
+          "weight_budget": 14836301824,
+          "host_budget_after_staging": 30064771072,
+          "slab_overhead": 0,
+          "file_stage_vram": 0,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": false,
+          "rank": 0,
+          "nonweight_device_budget_bytes": 2259616512,
+          "weight_budget_mib_derived": 14149,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 10484453376,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 10364125184
+        },
+        {
+          "status": 0,
+          "fits": true,
+          "notes": [],
+          "unfit": [],
+          "unfit_bytes": 0,
+          "tier_bytes": {
+            "vram": 14832275832,
+            "pinned": 29827006464,
+            "pageable": 0,
+            "ssd": 0,
+            "mapped": 0
+          },
+          "weight_budget": 14836301824,
+          "host_budget_after_staging": 30064771072,
+          "slab_overhead": 0,
+          "file_stage_vram": 0,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": false,
+          "rank": 1,
+          "nonweight_device_budget_bytes": 2259616512,
+          "weight_budget_mib_derived": 14149,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 10484453376,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 10364125184
+        },
+        {
+          "status": 0,
+          "fits": true,
+          "notes": [],
+          "unfit": [],
+          "unfit_bytes": 0,
+          "tier_bytes": {
+            "vram": 14832275832,
+            "pinned": 29827006464,
+            "pageable": 0,
+            "ssd": 0,
+            "mapped": 0
+          },
+          "weight_budget": 14836301824,
+          "host_budget_after_staging": 30064771072,
+          "slab_overhead": 0,
+          "file_stage_vram": 0,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": false,
+          "rank": 2,
+          "nonweight_device_budget_bytes": 2259616512,
+          "weight_budget_mib_derived": 14149,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 10484453376,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 10364125184
+        },
+        {
+          "status": 0,
+          "fits": true,
+          "notes": [],
+          "unfit": [],
+          "unfit_bytes": 0,
+          "tier_bytes": {
+            "vram": 14832275832,
+            "pinned": 29827006464,
+            "pageable": 0,
+            "ssd": 0,
+            "mapped": 0
+          },
+          "weight_budget": 14836301824,
+          "host_budget_after_staging": 30064771072,
+          "slab_overhead": 0,
+          "file_stage_vram": 0,
+          "file_stage_host": 0,
+          "units": 12144,
+          "classes": 6,
+          "failed_plan_ssd_tier_is_not_successful_ssd_support": false,
+          "rank": 3,
+          "nonweight_device_budget_bytes": 2259616512,
+          "weight_budget_mib_derived": 14149,
+          "dynamic_spare_conservative_floor_helper_NOT_deterministic_minimum": 10484453376,
+          "deterministic_expert_payload_lower_bound_NOT_first_fit_cost": 10364125184
+        }
+      ],
+      "all_rank_weight_plans_fit": true,
+      "host_pools_plus_hostarena_sampler_and_ASSUMED8GiB_bytes": 128916127744,
+      "within_physical_memtotal_under_ASSUMED_margin": true,
+      "within_current_memavailable_without_stopping_anything": false,
+      "planning_candidate_only": true
+    }
+  ],
+  "plugins": [
+    {
+      "name": "libavx",
+      "version": "0.1.0",
+      "path": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/shipped-radiance-1.12.0-home/kernels/libavx.so",
+      "kind": 1,
+      "device_code_absent": false
+    },
+    {
+      "name": "libr4d",
+      "version": "0.5.0",
+      "path": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/shipped-radiance-1.12.0-home/kernels/libr4d.so",
+      "kind": 1,
+      "device_code_absent": false
+    },
+    {
+      "name": "spechub",
+      "version": "0.1.0",
+      "path": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/shipped-radiance-1.12.0-home/kernels/spechub.so",
+      "kind": 1,
+      "device_code_absent": false
+    },
+    {
+      "name": "libref",
+      "version": "0.1.0",
+      "path": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/shipped-radiance-1.12.0-home/kernels/libref.so",
+      "kind": 1,
+      "device_code_absent": false
+    },
+    {
+      "name": "anima",
+      "version": "0.1.0",
+      "path": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/shipped-radiance-1.12.0-home/architectures/anima.so",
+      "kind": 2,
+      "device_code_absent": false
+    },
+    {
+      "name": "breeze",
+      "version": "0.1.0",
+      "path": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/shipped-radiance-1.12.0-home/architectures/breeze.so",
+      "kind": 2,
+      "device_code_absent": false
+    },
+    {
+      "name": "embgemma2",
+      "version": "0.1.0",
+      "path": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/shipped-radiance-1.12.0-home/architectures/embgemma2.so",
+      "kind": 2,
+      "device_code_absent": false
+    },
+    {
+      "name": "fishomni",
+      "version": "0.1.0",
+      "path": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/shipped-radiance-1.12.0-home/architectures/fishomni.so",
+      "kind": 2,
+      "device_code_absent": false
+    },
+    {
+      "name": "flux3",
+      "version": "0.1.0",
+      "path": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/shipped-radiance-1.12.0-home/architectures/flux3.so",
+      "kind": 2,
+      "device_code_absent": false
+    },
+    {
+      "name": "flux3distilled",
+      "version": "0.1.0",
+      "path": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/shipped-radiance-1.12.0-home/architectures/flux3distilled.so",
+      "kind": 2,
+      "device_code_absent": false
+    },
+    {
+      "name": "gemma3",
+      "version": "0.1.0",
+      "path": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/shipped-radiance-1.12.0-home/architectures/gemma3.so",
+      "kind": 2,
+      "device_code_absent": false
+    },
+    {
+      "name": "gemma4",
+      "version": "0.1.0",
+      "path": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/shipped-radiance-1.12.0-home/architectures/gemma4.so",
+      "kind": 2,
+      "device_code_absent": false
+    },
+    {
+      "name": "gemma4_bf16",
+      "version": "0.1.0",
+      "path": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/shipped-radiance-1.12.0-home/architectures/gemma4_bf16.so",
+      "kind": 2,
+      "device_code_absent": false
+    },
+    {
+      "name": "glm5next",
+      "version": "0.1.0",
+      "path": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/shipped-radiance-1.12.0-home/architectures/glm5next.so",
+      "kind": 2,
+      "device_code_absent": false
+    },
+    {
+      "name": "krea2",
+      "version": "0.1.0",
+      "path": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/shipped-radiance-1.12.0-home/architectures/krea2.so",
+      "kind": 2,
+      "device_code_absent": false
+    },
+    {
+      "name": "lfm2_bf16",
+      "version": "0.1.0",
+      "path": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/shipped-radiance-1.12.0-home/architectures/lfm2_bf16.so",
+      "kind": 2,
+      "device_code_absent": false
+    },
+    {
+      "name": "llama_dense_fp8",
+      "version": "0.1.0",
+      "path": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/shipped-radiance-1.12.0-home/architectures/llama_dense_fp8.so",
+      "kind": 2,
+      "device_code_absent": false
+    },
+    {
+      "name": "llama_fp8",
+      "version": "0.1.0",
+      "path": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/shipped-radiance-1.12.0-home/architectures/llama_fp8.so",
+      "kind": 2,
+      "device_code_absent": false
+    },
+    {
+      "name": "ltx2",
+      "version": "0.1.0",
+      "path": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/shipped-radiance-1.12.0-home/architectures/ltx2.so",
+      "kind": 2,
+      "device_code_absent": false
+    },
+    {
+      "name": "minimaxh3",
+      "version": "0.1.0",
+      "path": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/shipped-radiance-1.12.0-home/architectures/minimaxh3.so",
+      "kind": 2,
+      "device_code_absent": false
+    },
+    {
+      "name": "minimaxmusic3",
+      "version": "0.1.0",
+      "path": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/shipped-radiance-1.12.0-home/architectures/minimaxmusic3.so",
+      "kind": 2,
+      "device_code_absent": false
+    },
+    {
+      "name": "qwen35_bf16",
+      "version": "0.1.0",
+      "path": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/shipped-radiance-1.12.0-home/architectures/qwen35_bf16.so",
+      "kind": 2,
+      "device_code_absent": false
+    },
+    {
+      "name": "qwen35_fp8",
+      "version": "0.1.0",
+      "path": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/shipped-radiance-1.12.0-home/architectures/qwen35_fp8.so",
+      "kind": 2,
+      "device_code_absent": false
+    },
+    {
+      "name": "qwen35_w8a8",
+      "version": "0.1.0",
+      "path": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/shipped-radiance-1.12.0-home/architectures/qwen35_w8a8.so",
+      "kind": 2,
+      "device_code_absent": false
+    },
+    {
+      "name": "qwen35moe_fp8",
+      "version": "0.1.0",
+      "path": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/shipped-radiance-1.12.0-home/architectures/qwen35moe_fp8.so",
+      "kind": 2,
+      "device_code_absent": false
+    },
+    {
+      "name": "qwen3asr_bf16",
+      "version": "0.1.0",
+      "path": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/shipped-radiance-1.12.0-home/architectures/qwen3asr_bf16.so",
+      "kind": 2,
+      "device_code_absent": false
+    },
+    {
+      "name": "qwen4exp_fp8",
+      "version": "0.1.0",
+      "path": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/shipped-radiance-1.12.0-home/architectures/qwen4exp_fp8.so",
+      "kind": 2,
+      "device_code_absent": false
+    },
+    {
+      "name": "qwenimage21",
+      "version": "0.1.0",
+      "path": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/shipped-radiance-1.12.0-home/architectures/qwenimage21.so",
+      "kind": 2,
+      "device_code_absent": false
+    },
+    {
+      "name": "sdxl",
+      "version": "0.1.0",
+      "path": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/shipped-radiance-1.12.0-home/architectures/sdxl.so",
+      "kind": 2,
+      "device_code_absent": false
+    },
+    {
+      "name": "unlimitedocr_bf16",
+      "version": "0.1.0",
+      "path": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/shipped-radiance-1.12.0-home/architectures/unlimitedocr_bf16.so",
+      "kind": 2,
+      "device_code_absent": false
+    },
+    {
+      "name": "libquant",
+      "version": "0.2.0",
+      "path": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/shipped-radiance-1.12.0-home/quantizers/libquant.so",
+      "kind": 3,
+      "device_code_absent": false
+    }
+  ],
+  "source_refusals": [],
+  "host_memtotal_bytes": 132489420800,
+  "host_memavailable_snapshot_bytes": 9458823168,
+  "four_card_physical_bytes": 68383932416,
+  "four_rank_selected_weight_bytes_sum": 178637129184,
+  "host_nonpool_margin_bytes_ASSUMED": 8589934592,
+  "host_margin_scope": "OS/current nonmodel consumers/loader temporaries:8GiB illustrative allowance, NOT a proved startup peak; current production muststop separately",
+  "core_tracked_allocated_bytes_before_queries": {
+    "device": 0,
+    "pinned": 0,
+    "host": 0,
+    "mapped": 0
+  },
+  "core_tracked_allocated_bytes_after_planning": {
+    "device": 0,
+    "pinned": 0,
+    "host": 0,
+    "mapped": 0
+  },
+  "core_tracked_allocation_bytes_unchanged": true,
+  "actual_device_selection_complete": true,
+  "main_expert_geometry_metadata_complete": true,
+  "main_metadata_scope": "separate geometry-only adapter on actual same Checkpoint/cache/Program/Plan; no native descriptor/source/Ready capability; canonical identity layouts only",
+  "hidden_runtime_effects": [
+    "AQL discovery calls hsa_init/agent/pool discovery and code-object ISA validation; host metadata and driver-internal state canallocate.",
+    "Plugin dlopen/static registration, source metadata/cache and kernel layout/scratch callbacks execute; opaque plugin/HSA allocations are not a process-wide allocation proof.",
+    "No Pool.configure/carve, Engine.start, kernel init_instance, Ctx, rad_stream_create, copy or kernel launch is called by this tool.",
+    "Checkpoint::open maps real payload files in virtual address space and reads headers/config; source resolver metadata is real; tensor data are not converted/copied by this tool.",
+    "Sampler graph omitted and covered with separate16MiB/rank device +16MiB/rank host assumptions; driver/queue/collective/module/loader peaks remain declared margins, not measurements.",
+    "deterministic=true disables dynamic heat/shadow slots, XP prefetch and dynamic expert-layer lending/staging baseline; actual Planner still reports any required ordinary staged ring/slab costs. Kernel collective/driver/queues remain explicit assumed margins."
+  ],
+  "not_proved": [
+    "actual startup/Pools allocations",
+    "whole-model inference correctness",
+    "TP communicator initialization",
+    "Loader/pin/startup peak",
+    "current hardware fit while production serves",
+    "throughput"
+  ],
+  "completed": true
+}

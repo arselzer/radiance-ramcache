@@ -37,6 +37,8 @@
 #include "planner.h"
 #include "residency_iface.h"
 #include "record_session.h"
+#include "../build/tiny_component_quotes.h"
+#include "../build/tiny_startup.h"
 
 #include <algorithm>
 #include <atomic>
@@ -65,6 +67,8 @@ namespace rad {
  */
 class SlotPool {
 public:
+    // Actual private bookkeeping size for the pure sealed-startup quote.
+    static constexpr size_t tiny_segment_bytes() noexcept { return sizeof(Seg); }
     /* Segment 0 starts with `n_live` slots, all held (the plan's resident set) until add_free()
      * releases them. `n_cap` is how far segment 0 may grow into address space the caller has
      * reserved and backs on demand; the default is no growth. */
@@ -316,6 +320,9 @@ struct MoverConfig {
     /* Pinned staging buffers for file-tier reads, one class stride each; the count the planner
      * charged to --host-pool-mib. */
     int stage_slots = RAD_PLACE_FILE_STAGE_SLOTS;
+    // Internal sealed transport only. The admission and its tickets outlive this
+    // Mover. Null preserves ordinary stream creation/retirement behavior.
+    TinyBudget* tiny_budget = nullptr;
 };
 
 /* ------------------------------------------------------------------ the loan */
@@ -358,6 +365,10 @@ struct MoverStats {
 /* ------------------------------------------------------------------ the mover */
 class Mover {
 public:
+    // Actual bounded private bookkeeping/event quote; pool backings and the
+    // backend TinyStream reservation are charged separately. No allocation/I/O.
+    static int tiny_startup_quote(const Program&,const Plan&,const MoverConfig&,
+                                  TinyStorageQuote*) noexcept;
     ~Mover();
     Mover() = default;
     Mover(const Mover&) = delete;
@@ -374,6 +385,10 @@ public:
     /* The compute stream this rank issues on. Transfers are ordered against it and the
      * quarantine barrier is recorded on it; without one the mover refuses to move. */
     int bind_compute_stream(RadStream s);
+    // Internal tiny teardown barrier, before owner/Ctx/storage retirement. This
+    // proves real stream retirement, not success of a prior operation. Ordinary
+    // Mover users retain their existing behavior when tiny_budget is null.
+    void tiny_retire_or_fail() noexcept;
 
     /* The mover's stream, to be shared by any subsystem moving bytes off the critical path. Each
      * HIP stream costs a hardware queue, and on RDNA4 a fourth one is expensive: on two R9700s
@@ -664,7 +679,8 @@ private:
      * reservation belongs to the Pool; freeing it here would be a double free. */
     bool           owns_memory_ = false;
 
-    RadStream mover_ = nullptr;
+    TinyStream tiny_stream_; // owns ONLY the sealed tiny transfer stream
+    RadStream mover_ = nullptr; // borrowed from tiny_stream_ in that profile
     RadStream compute_ = nullptr;
     RadEvent  gate_ = nullptr;          /* recorded on compute, waited on by the mover stream */
     std::vector<RadCopySeg> stage_segs_;   /* stage_units' list, kept so a layer allocates nothing */

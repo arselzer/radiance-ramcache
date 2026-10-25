@@ -13,6 +13,7 @@
 
 #include "build/startup.h"
 #include "build/tiny_loader.h"
+#include "build/tiny_native_source/source_factory.h"
 #include "build/rad_build.h"
 #include "device/device.h"
 #include "device/directio.h"
@@ -715,7 +716,20 @@ bool is_container(const std::string& path) {
 
 }  /* namespace */
 
+Checkpoint* Engine::checkpoint_view() const {
+    return tiny_&&tiny_->binding?&tiny_->binding->checkpoint():ckpt_.get();
+}
+const CkptWeight* Engine::checkpoint_find(const std::string& name) const {
+    return tiny_&&tiny_->binding?tiny_->binding->find(name):(ckpt_src_?ckpt_src_->find(name):nullptr);
+}
+std::string Engine::checkpoint_missing(const std::string& name) const {
+    return tiny_&&tiny_->binding?tiny_->binding->missing(name):(ckpt_src_?ckpt_src_->missing(name):std::string());
+}
+std::vector<std::string> Engine::checkpoint_refused() const {
+    return tiny_&&tiny_->binding?tiny_->binding->refused():(ckpt_src_?ckpt_src_->refused():std::vector<std::string>());
+}
 WeightSourceFn Engine::sources() const {
+    if(tiny_&&tiny_->binding)return tiny_->binding->source_fn();
     if (file_) return rad_container_sources(*file_);
     return ckpt_src_ ? ckpt_src_->fn() : WeightSourceFn{};
 }
@@ -795,13 +809,17 @@ int Engine::read_metadata() {
  * as rad-convert reads it, and its tensors are the weights. Only encodings served as stored are
  * answered (CheckpointSources); weights needing quantisation are refused after declare. */
 int Engine::read_checkpoint_metadata() {
-    ckpt_ = std::make_unique<Checkpoint>();
-    RAD_TRY(ckpt_->open(cfg_.model));
-    ckpt_src_ = std::make_unique<CheckpointSources>(*ckpt_);
-    const MetaOwn& mo = ckpt_->meta();
+    if(!tiny_) {
+        ckpt_ = std::make_unique<Checkpoint>();
+        RAD_TRY(ckpt_->open(cfg_.model));
+        ckpt_src_ = std::make_unique<CheckpointSources>(*ckpt_);
+    }
+    Checkpoint* active=checkpoint_view();if(!active)return RAD_E_STATE;
+    const MetaOwn& mo = active->meta();
     meta_ = mo.m;
     if (!meta_.name || !*meta_.name) meta_.name = meta_.arch_id;
-    if (meta_.n_layers <= 0 || meta_.n_embd <= 0 || meta_.n_head <= 0 || meta_.n_vocab <= 0) {
+    const bool tiny_zero=tiny_&&tiny_->binding&&tiny_->binding->permits_zero_head(meta_,build_ctx(0,cfg_.max_tok));
+    if (meta_.n_layers <= 0 || meta_.n_embd <= 0 || (!tiny_zero&&meta_.n_head <= 0) || meta_.n_vocab <= 0) {
         RAD_ERR("%s: the checkpoint's configuration states no model dimensions (n_layers=%lld "
                 "n_embd=%lld n_head=%lld n_vocab=%lld)", cfg_.model.c_str(),
                 (long long)meta_.n_layers, (long long)meta_.n_embd, (long long)meta_.n_head,
@@ -820,7 +838,7 @@ int Engine::read_checkpoint_metadata() {
     RAD_INFO("model: %s  arch=%s  quant=%s  %lld layers  %lld ctx  (checkpoint, %zu tensors, "
              "served as it stands)", meta_.name, meta_.arch_id,
              meta_.quant && *meta_.quant ? meta_.quant : "bf16", (long long)meta_.n_layers,
-             (long long)meta_.n_ctx_train, ckpt_->tensors().size());
+             (long long)meta_.n_ctx_train, active->tensors().size());
     return RAD_OK;
 }
 
@@ -877,13 +895,13 @@ int Engine::apply_rope_scaling() {
 int Engine::load_plugins() {
     int s = rad_tools_load_plugins(cfg_.radiance_home, cfg_.kernel_hierarchy,
                                    meta_.arch_id, meta_.quant ? meta_.quant : "", &plugins_,
-                                   ckpt_ && ckpt_->imports() != Checkpoint::Import::None);
+                                   checkpoint_view() && checkpoint_view()->imports() != Checkpoint::Import::None);
     if (s < 0) {
         /* rad_tools_load_plugins already logged why. A checkpoint whose quantisation the import
          * refused keeps the tool's descriptor, which no plugin claims; the refusal is the reason. */
-        if (ckpt_ && !ckpt_->import_refusal().empty() && plugins_.arch_plugin.empty())
+        if (checkpoint_view() && !checkpoint_view()->import_refusal().empty() && plugins_.arch_plugin.empty())
             RAD_ERR("quantisation '%s' cannot be imported: %s", meta_.quant ? meta_.quant : "",
-                    ckpt_->import_refusal().c_str());
+                    checkpoint_view()->import_refusal().c_str());
         RAD_ERR("the plugins under %s did not load (above)", cfg_.radiance_home.c_str());
         return s;
     }
@@ -927,10 +945,29 @@ RadBuildCtx Engine::build_ctx(int rank, int64_t max_tok) const {
     if (cvec_.loaded() && rank >= 0 && rank < (int) cvec_views_.size() &&
         cvec_views_[(size_t) rank].dir)
         bc.cvec = &cvec_views_[(size_t) rank];
+    if(tiny_) {bc.kv_dtype=0;bc.kv_quant=0;bc.tp_wire_min_bytes=0;}
     return bc;
 }
 
 int Engine::declare() {
+    if(tiny_) {
+        if(ranks_.size()!=1||ranks_[0]->index||ranks_[0]->device)return RAD_E_UNSUPPORTED;
+        TinyTicket auxiliary;RAD_TRY(tiny_->budget.take_aux_thread(&auxiliary));
+        int status=RAD_E_STATE;
+        std::thread worker;
+        struct Join {std::thread& worker;~Join(){if(worker.joinable())try{worker.join();}catch(...){tiny_unretired_fail_stop();}}} join{worker};
+        worker=std::thread([&]{try{
+            const int bound=rad_dev_set(0);if(bound<0){status=bound;return;}
+            auto& r=*ranks_[0];const auto context=build_ctx(0,cfg_.max_tok);
+            status=rad_tools_declare(plugins_,meta_,context,&r.program,
+                [this](RadBuilder* b,int64_t width){return declare_sampler(0,b,width);},
+                nullptr,sources(),false,nullptr);
+        }catch(const std::bad_alloc&){status=RAD_E_NOMEM;}catch(...){status=RAD_E_STATE;}});
+        worker.join();
+        if(status<0)return status;
+        if(!checkpoint_refused().empty())return RAD_E_UNSUPPORTED;
+        return RAD_OK;
+    }
     RAD_TRY(lora_targets());
     /* KL mode measures the trunk (core/kld.h): a drafter writes no scored rows and a prefix hit
      * would skip positions the reference holds, so both are off, and an explicit depth is refused
@@ -1319,8 +1356,8 @@ int Engine::declare() {
     }
     /* Checkpoint weights that cannot be served as stored cannot be loaded; name them all with the
      * remedy. */
-    if (ckpt_src_) {
-        const std::vector<std::string> no = ckpt_src_->refused();
+    if (checkpoint_view()) {
+        const std::vector<std::string> no = checkpoint_refused();
         if (!no.empty()) {
             RAD_ERR("%zu weight(s) of %s are not in a form the engine serves as it stands -- "
                     "nothing is quantised at load. Convert the checkpoint to a container with a "
@@ -2848,7 +2885,26 @@ static int fill_from_checkpoint(const CkptWeight& cw, const std::vector<PlaneSha
     return RAD_OK;
 }
 
+struct TinyCheckpointContext {
+    const CkptWeight* source=nullptr;
+    const std::string* name=nullptr;
+    std::vector<PlaneShare> shares;
+    std::vector<int> selected;
+    std::vector<int64_t> offsets;
+};
+static int tiny_checkpoint_fill(void* context,uint8_t* input,int64_t) {
+    const auto& c=*static_cast<TinyCheckpointContext*>(context);
+    return fill_from_checkpoint(*c.source,c.shares,c.selected,c.offsets,*c.name,input);
+}
+
 int Engine::load_weights() {
+    TinyTicket tiny_loader_credit;
+    if(tiny_) {
+        RAD_TRY(tiny_->budget.take(TinyCategory::Loader,2u<<20,&tiny_loader_credit));
+        if(file_||!tiny_->records||tiny_->records->audit()<0||!tiny_->binding||tiny_->binding->audit()<0)return RAD_E_STATE;
+    }
+    std::vector<TinyCheckpointContext> tiny_contexts;
+    if(tiny_)tiny_contexts.reserve(59);
     int64_t total = 0, n_loaded = 0, n_missing = 0;
     /* Counted apart from `n_loaded`: mapped weights are published in place, not loaded. */
     int64_t n_mapped = 0, mapped_bytes = 0;
@@ -2859,6 +2915,7 @@ int Engine::load_weights() {
      * read replicated weights once per rank). */
     std::vector<LoadRun> runs;
     std::vector<StagedWeight> staged;
+    if(tiny_)staged.reserve(59);
     int64_t n_out = 0;      /* destination overruns reported, capped */
 
     /* ============================================================== the walk */
@@ -2872,7 +2929,12 @@ int Engine::load_weights() {
          * aligned (rad_format.h), DirectFile's alignment, so stages take the no-bounce path. */
         MoverConfig mc{};
         mc.container_path = file_ ? cfg_.model : std::string();
+        if(tiny_)mc.tiny_budget=&tiny_->budget;
         RAD_TRY(r->mover.init(r->program, r->plan, mc, &r->pools));
+        if(tiny_) {
+            RAD_TRY(r->mover.bind_compute_stream(r->tiny_compute.get()));
+            RAD_TRY(tiny_phase(uint32_t(TinyEnginePhase::MoverReady)));
+        }
         /* What the mover took, before the first copy. Its slabs are allocated in init, so the pool
          * is as full as it will get; a load stopping with zero free is a placement failure, not
          * a loader one. */
@@ -2913,10 +2975,10 @@ int Engine::load_weights() {
             /* The planes' source: a container entry or the checkpoint tensors declare resolved,
              * giving the encoding and logical shape the share is cut in. */
             const RadFileEntry* e = file_ ? file_->find(w.source) : nullptr;
-            const CkptWeight* cw = ckpt_src_ ? ckpt_src_->find(w.source) : nullptr;
+            const CkptWeight* cw = checkpoint_find(w.source);
             if (!e && !cw) {
                 if (w.decl.optional) continue;
-                const std::string why = ckpt_src_ ? ckpt_src_->missing(w.source) : std::string();
+                const std::string why = checkpoint_missing(w.source);
                 if (!why.empty())
                     RAD_ERR("rank %d: '%s' was declared over '%s', and %s", r->index,
                             w.name.c_str(), w.source.c_str(), why.c_str());
@@ -2942,6 +3004,21 @@ int Engine::load_weights() {
                 return RAD_E_FORMAT;
             }
 
+            PlaneShare tiny_share[RAD_ENC_MAX_PLANES];
+            if(tiny_) {
+                // Real source and weight_share precede typed omission and EVERY
+                // destination lookup/publication/staging reservation for owned views.
+                std::string why;
+                if(!cw||e||weight_share(w,src_enc,src_rank,src_shape,cfg_.tp,r->index,tiny_share,&why)<0)return RAD_E_SHAPE;
+                const auto unit=tiny_->inventory->unit_for_weight(rad_weight(i));
+                if(tiny_->inventory->find(unit)) {
+                    RAD_TRY(tiny_->inventory->validate_unit(r->program,r->plan,unit));
+                    w.tier=r->plan.weight[i].tier;w.site=r->plan.weight[i].site;w.slab_slot=r->plan.weight[i].slab_slot;
+                    ++tiny_->result.omitted_views;
+                    for(int k=0;k<w.n_sel;++k)tiny_->result.omitted_source_bytes+=tiny_share[k].dense_bytes();
+                    continue;
+                }
+            }
             /* Copy the planner's decision (Plan::weight[], a parallel array) onto WeightInfo.
              * Ctx::bind_weights picks RAD_DOMAIN_HOST only when every weight operand has
              * Site::Host, so without this host-site execution is unreachable. file_offset (the
@@ -3051,7 +3128,8 @@ int Engine::load_weights() {
             /* This rank's share of the selected planes (format/share.h). */
             PlaneShare sh[RAD_ENC_MAX_PLANES];
             std::string why;
-            if (weight_share(w, src_enc, src_rank, src_shape, cfg_.tp, r->index, sh, &why) !=
+            if(tiny_)for(int k=0;k<w.n_sel;++k)sh[k]=std::move(tiny_share[k]);
+            if (!tiny_ && weight_share(w, src_enc, src_rank, src_shape, cfg_.tp, r->index, sh, &why) !=
                 RAD_OK) {
                 RAD_ERR("rank %d: '%s' at --tp %d: %s", r->index, w.name.c_str(), cfg_.tp,
                         why.c_str());
@@ -3080,6 +3158,18 @@ int Engine::load_weights() {
                             r->index, w.name.c_str(), (long long)sh[0].dense_bytes(),
                             (long long)w.stored_bytes);
                     return RAD_E_FORMAT;
+                }
+                if(tiny_) {
+                    if(staged.size()>=59||tiny_contexts.size()>=59)return RAD_E_SHAPE;
+                    TinyCheckpointContext context;context.source=cw;context.name=&w.name;
+                    for(int k=0;k<w.n_sel;++k) {
+                        // Closed TP1 complete planes only: the generic partial-
+                        // column path's64MiB temporary is outside this tiny profile.
+                        for(const auto& rect:sh[k].rects)if(rect.byte0||rect.bytes!=sh[k].row_bytes)return RAD_E_UNSUPPORTED;
+                        context.shares.push_back(std::move(sh[k]));context.selected.push_back(w.sel[k]);context.offsets.push_back(sw.plane_off[k]);
+                    }
+                    tiny_contexts.push_back(std::move(context));sw.tiny_context=&tiny_contexts.back();sw.tiny_fill=tiny_checkpoint_fill;
+                    staged.push_back(std::move(sw));++n_loaded;continue;
                 }
                 std::vector<PlaneShare> shares(sh, sh + w.n_sel);
                 std::vector<int> sel(w.sel, w.sel + w.n_sel);
@@ -3158,6 +3248,62 @@ int Engine::load_weights() {
         return RAD_E_NOTFOUND;
     }
 
+    if(tiny_) {
+        auto& state=*tiny_;
+        if(staged.size()!=59||state.result.omitted_views!=96||state.result.omitted_source_bytes!=626688||total!=393856)return RAD_E_SHAPE;
+        std::array<TinyLoadJob,59> jobs{};
+        uint64_t context_bytes=tiny_contexts.capacity()*sizeof(TinyCheckpointContext)+131072; // independent verification scratch peak
+        for(size_t k=0;k<staged.size();++k) {
+            const auto& item=staged[k];auto& job=jobs[k];
+            job.program=item.prog;job.weight=item.wi;job.destination=item.dst;job.device=item.device;job.device_destination=item.dev;
+            job.input_bytes=item.in_bytes;std::copy(std::begin(item.plane_off),std::end(item.plane_off),std::begin(job.plane_offset));
+            job.fill=item.tiny_fill;job.fill_context=item.tiny_context;
+            const auto& c=tiny_contexts[k];context_bytes+=c.shares.capacity()*sizeof(PlaneShare)+c.selected.capacity()*sizeof(int)+c.offsets.capacity()*sizeof(int64_t);
+            for(const auto& share:c.shares)context_bytes+=share.rects.capacity()*sizeof(PlaneShare::Rect);
+        }
+        TinyLoaderQuote quote{};RAD_TRY(tiny_loader_quote(jobs.data(),jobs.size(),&quote));
+        if(context_bytes>2097152-quote.requested_bytes)return RAD_E_NOMEM;
+        quote.requested_bytes+=context_bytes;quote.page_upper=(quote.requested_bytes+4095)&~uint64_t(4095);
+        if(quote.page_upper>2097152)return RAD_E_NOMEM;
+        state.result.loader_context_bytes=context_bytes;
+        {
+            // Existing actual Pool/run/relayout; no second loader or payload cache.
+            RelayoutPool pool(staged,true);
+            const int start=pool.start_tiny(state.budget,quote,TinyLoaderFault::None,&state.result.loader);
+            if(start>=0)pool.queue_tiny();const int finished=pool.finish();
+            if(start<0)return start;if(finished<0)return finished;
+        }
+        state.result.ordinary_views=n_loaded;state.result.ordinary_source_bytes=total;
+        auto& r=*ranks_[0];std::vector<std::byte> scratch(131072);
+        // Independent full-plane read comparison; never call the loader fill function.
+        for(size_t i=1;i<r.program.weights.size();++i) {
+            const auto& w=r.program.weights[i];const auto unit=state.inventory->unit_for_weight(rad_weight(i));
+            if(state.inventory->find(unit))continue;
+            const auto* cw=checkpoint_find(w.source);const auto* slot=r.mover.residency()->lookup(rad_weight(i));
+            if(!cw||!slot||!slot->ptr||slot->ready||w.ptr!=slot->ptr||!w.identity||w.widen||w.n_sel!=1)return RAD_E_STATE;
+            int64_t rows=0,cols=0;const auto& plane=cw->enc.plane[w.sel[0]];rad_enc_plane_dims(&plane,cw->rows,cw->cols,&rows,&cols);
+            const int64_t bytes=rows*rad_enc_row_bytes(plane.dtype,cols);
+            if(bytes!=w.stored_bytes||bytes<=0||size_t(bytes)>scratch.size())return RAD_E_SHAPE;
+            RAD_TRY(ckpt_plane_rows(*cw,w.sel[0],0,rows,scratch.data(),nullptr));
+            if(std::memcmp(slot->ptr,scratch.data(),size_t(bytes)))return RAD_E_STATE;
+            ++state.result.ordinary_checked;
+        }
+        for(const auto unit_id:state.records->resident_units()) {
+            if(unit_id<0||size_t(unit_id)>=state.metadata_plan.units.size())return RAD_E_STATE;
+            const auto& unit=state.metadata_plan.units[size_t(unit_id)];
+            if(unit.weights.size()!=4||unit.offset.size()!=4||unit.bytes<=0||size_t(unit.bytes)>scratch.size())return RAD_E_SHAPE;
+            std::fill(scratch.begin(),scratch.end(),std::byte{0xcd});
+            RAD_TRY(state.records->bootstrap(unit_id,std::span<std::byte>(scratch.data(),size_t(unit.bytes))));
+            for(size_t m=0;m<4;++m) {
+                const auto h=unit.weights[m];const auto& w=r.program.weights[h];const auto* slot=r.mover.residency()->lookup(h);
+                if(!slot||!slot->ptr||slot->ready||w.ptr!=slot->ptr||unit.offset[m]<0||w.stored_bytes<=0||unit.offset[m]+w.stored_bytes>unit.bytes||
+                    std::memcmp(slot->ptr,scratch.data()+unit.offset[m],size_t(w.stored_bytes)))return RAD_E_STATE;
+                ++state.result.resident_members_checked;
+            }
+        }
+        if(state.result.ordinary_checked!=59||state.result.resident_members_checked!=32)return RAD_E_STATE;
+        RAD_TRY(state.records->audit());RAD_TRY(state.binding->audit());return RAD_OK;
+    }
     /* ============================================================== the sweep */
     std::vector<int> devices;
     devices.reserve(ranks_.size());
@@ -3594,6 +3740,7 @@ int Engine::configure_kv() {
 
 /* ================================================================== start */
 int Engine::start() {
+    if(tiny_)return start_tiny_transport();
     startup_begin_ns_ = rad_mono_ns();
     std::vector<int> devs;
     std::string inventory;
@@ -4081,17 +4228,17 @@ int Engine::load_vocab() {
             return RAD_E_FORMAT;
         }
         RAD_TRY(vocab_deserialize(file_->base(), (uint64_t)file_->size(), vs.h, vb));
-    } else if (ckpt_->is_gguf()) {
+    } else if (checkpoint_view()->is_gguf()) {
         /* GGUF names its pre-tokeniser; the chain is reconstructed from the name or refused (a
          * container converted with --tokenizer bakes in the declared one). */
-        RAD_TRY(vocab_from_gguf(ckpt_->gguf(), vb));
+        RAD_TRY(vocab_from_gguf(checkpoint_view()->gguf(), vb));
     } else {
         /* With tokenizer_config.json and chat_template.jinja: beside config.json in a model
          * repository, in a diffusers pipeline's processor/ or tokenizer/ folder. */
-        const std::string tj = ckpt_->tok_dir() + "/tokenizer.json";
+        const std::string tj = checkpoint_view()->tok_dir() + "/tokenizer.json";
         if (parse_tokenizer_json(tj.c_str(), vb) < 0) {
             RAD_ERR("%s: no readable tokenizer.json in %s", cfg_.model.c_str(),
-                    ckpt_->tok_dir().c_str());
+                    checkpoint_view()->tok_dir().c_str());
             return RAD_E_FORMAT;
         }
     }
@@ -4162,6 +4309,10 @@ int Engine::load_vocab() {
     if (gs < 0) {
         RAD_ERR("gbnf: the vocabulary index could not be built: %s", rad_strerror(gs));
         return gs;
+    }
+    if(tiny_) {
+        tiny_->result.vocab_index_bytes=gi.bytes;
+        if(gi.bytes>(1u<<20))return RAD_E_UNSUPPORTED;
     }
     RAD_INFO("gbnf: vocabulary index built in %.0f ms, %s", gi.build_ms,
              humanb((int64_t)gi.bytes).c_str());

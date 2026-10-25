@@ -69,6 +69,13 @@ int Mover::native_record_init(){
                 native_device_allocation_.push_back(device);native_host_allocation_.push_back(host_view);
                 rad_dev_host_wrote();
                 const int copied=rad_memcpy_async(device,on_card,cls.allocation_bytes,mover_);
+                if(cfg_.tiny_budget){
+                    // Installed before this first asynchronous bootstrap copy.
+                    // A failed REAL drain cannot unwind landing/pool storage.
+                    tiny_drain_or_fail(mover_,0);
+                    if(copied<0)return copied;
+                    continue;
+                }
                 const int drained=rad_stream_sync(mover_);
                 if(drained<0)return drained; // HOST-only profile; no GPU fault-recovery claim.
                 if(copied<0)return copied;

@@ -1,18 +1,21 @@
-Portable Foundation Core v2 / checker v3 HOST source checks
+Portable Engine transport Core v4 / eight HOST source checks
 ========================================
 
 This NEW entrypoint compiles manual Foundation checker v3, genuine startup
 contract, compact authority normal/collision, compact inventory, strict P3 and
-23-case unified-policy checker bodies with ONE matching private Core layout.
-It is a tiny synthetic research fixture, not a serving cache, real checkpoint
-conversion, Engine activation, full-model/TP/GPU proof or deployment procedure.
-The v3 manual checker repairs allocation-hook completeness; its numerical case
-bodies and frozen Foundation v2 Core remain unchanged. Historical v2 failure
-evidence and archival sources/receipts are not rewritten.
+23-case unified-policy checker bodies plus the actual Engine transport v4
+checker, with ONE matching private Core layout. Original checker bodies remain
+byte-exact. The eighth checker calls actual Engine.start for closed synthetic
+HOST transport, exercises startup/refusal/retirement, and explicitly refuses
+serve/model/sampler steps. It is not real-checkpoint conversion, full-model/TP/
+GPU serving or a deployment procedure. The older Foundation and earlier Engine
+source/failed-run receipts remain unchanged; v4 is a distinct validated source
+revision, not a relabeling of the older inventory.
 
 Expected layout:
-  radiance/                 selected frozen Foundation v2 source minus TWO pyc
+  radiance/                 selected frozen Engine transport v4 source minus TWO pyc
   research/glm53-engine-native-foundation-v3-prototype/
+  research/glm53-tiny-engine-native-transport-v4-prototype/
   research/ds41-unified-native-policy-host-prototype/
   research/glm53-sharded-native-provider-prototype/
   research/glm53-expert-record-store-prototype/
@@ -31,10 +34,14 @@ From the repository root:
   python3 tools/build_host.py --jobs 1
 
 The default builds fresh out-of-tree HOST Core/reference/quantizer targets and
-the seven portable checker programs; it does NOT execute them. The experimental
+the eight portable checker programs; it does NOT execute them. The experimental
 DS41 source vocabulary is built explicitly to match the original fixture build
-profile, not installed/activated as a service. No Core executable is launched.
+profile, not installed/activated as a service. The default build launches no
+checker or Core executable; only --run-host-checks executes the tiny fixtures.
 All generated files and the compiler serialization lock stay under repo/build/.
+V4 uses core-engine-v4-host-MODE and portable-engine-v4-host-MODE subdirectories;
+older Foundation builds/evidence are left in place and are never silently reused
+with the new Core headers. An explicit source mismatch still refuses.
 Repeated invocations may reuse that snapshot's own verified build directory.
 
 Explicit manual HOST checks (including intended fault/refusal subprocesses):
@@ -57,15 +64,25 @@ No claim is made that source hashes authenticate arbitrary prebuilt binaries.
 The accepted compiler cache profile is deliberately closed: empty global C/C++
 flags; default Release -O3 -DNDEBUG, Debug -g, MinSizeRel -Os -DNDEBUG and
 RelWithDebInfo -O2 -g -DNDEBUG; empty linker overrides. Extra ABI defines such as
-_GLIBCXX_DEBUG, custom toolchain/compiler arguments, launchers or LTO are refused
-rather than silently compiling helpers with different private layouts. Nonempty
-flag/include/library-path build environment overrides are likewise refused.
+_GLIBCXX_DEBUG, custom toolchain/compiler arguments, alternate launchers or LTO
+are refused rather than silently compiling helpers with different layouts.
+A reused matching Core may record ONLY the single /usr/bin/ccache system launcher
+without arguments or a CMake list; it must be a regular executable, not a symlink.
+This is the reviewed v4 compiler-cache front end, not permission for wrappers or
+injected flags. Helpers never inherit it. All other launcher/toolchain/ABI checks
+remain unchanged. Nonempty CCACHE_* or compiler-launcher environment overrides,
+and flag/include/library-path overrides, are refused. System compiler/cache tool
+trust is still required; cache/source inspection does not authenticate arbitrary
+prebuilt archives. A machine without that exact launcher can use a fresh default
+no-launcher Core build instead.
 The same closed compiler-profile check applies to a reused portable fixture
 cache, immediately after configure and again before any checker execution;
 compiler, mode, source-home and Core-build paths must still match.
 
 All subprocesses receive OMP_NUM_THREADS=1 and OMP_THREAD_LIMIT=1 with GPU
-visibility variables empty. ASan defaults (unless the caller already set the
+visibility variables empty. Only the actual Engine checker additionally removes
+ALL RADIANCE_* variables, matching its fixed clean-environment admission; seven
+legacy checker environments and build environments remain unchanged. ASan defaults (unless the caller already set the
 variable) are ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 and
 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1. TSan similarly defaults to
 TSAN_OPTIONS=halt_on_error=1:second_deadlock_stack=1. These match the original
@@ -75,7 +92,7 @@ detection follows the original detect_leaks=0 process setting.
 Manifest verification checks all exported files, refuses missing/extra files,
 symlinks and hash drift, and excludes only top-level .git/, build/ and the
 manifest itself. It also checks the exported Core against the unchanged frozen
-1492-file Core pin inventory with exactly the two recorded pyc files removed.
+1512-file Engine transport v4 Core pin inventory with exactly the two recorded pyc files removed.
 Source generation and verification assume an ordinarily immutable checkout;
 these checks are not a hostile concurrent-writer or cryptographic-signature
 security boundary. Builds may execute trusted CMake/compiler code as usual.

@@ -66,10 +66,75 @@ void Residency::begin_transfer(rad_weight w, void* ptr, RadEvent ready) {
 }
 
 /* ------------------------------------------------------------------ the mover */
+int Mover::tiny_startup_quote(const Program& p,const Plan& plan,const MoverConfig& cfg,
+                              TinyStorageQuote* out) noexcept {
+    if(!out)return RAD_E_INVAL;
+    if(tiny_quote::program_profile(p)<0||!cfg.tiny_budget||!plan.native_inventory||
+       plan.strategy!=Strategy::NativeBacked||plan.dynamic||!cfg.container_path.empty()||
+       cfg.max_lead_dispatches!=2||plan.units.empty()||plan.units.size()>512||
+       plan.classes.size()>512||plan.file_stage_vram||plan.file_windows||
+       plan.native_inventory->validate(p,plan)<0)return RAD_E_UNSUPPORTED;
+    const auto& inventory=*plan.native_inventory;
+    const auto& f=inventory.footprint();
+    if(!f.regions||f.regions>512||f.consumer_slots>512||inventory.owned().size()>128)
+        return RAD_E_UNSUPPORTED;
+    TinyStorageQuote s;s.embedded_object_bytes=sizeof(Mover);s.stream_count=1;
+    const uint64_t units=plan.units.size(),classes=plan.classes.size(),weights=p.weights.size();
+    uint64_t slab_slots=0;
+    for(size_t c=0;c<plan.classes.size();++c){
+        const auto& sc=plan.classes[c];
+        if(sc.n_shadow||sc.n_stage)return RAD_E_UNSUPPORTED;
+        uint64_t live=0;
+        for(const auto& u:plan.units){
+            if(u.slab_class < -1||u.slab_class>=int32_t(classes)||u.layer < -1||u.layer>=p.meta.n_layers||
+               (u.tier!=Tier::VRAM&&u.tier!=Tier::NativeStore))return RAD_E_UNSUPPORTED;
+            if(u.tier==Tier::VRAM&&u.slab_class==int32_t(c)&&u.slab_slot>=0){
+                if(uint64_t(u.slab_slot)>=units)return RAD_E_SHAPE;
+                live=std::max(live,uint64_t(u.slab_slot)+1);
+            }
+        }
+        if(!tiny_quote::add(slab_slots,live))return RAD_E_SHAPE;
+    }
+    // Init vectors, including its simultaneous temporary n_slab/n_pool arrays.
+    // There are no native-profile pageable/pinned/static expert duplicates,
+    // loans, stage picks, file windows or dynamic swap workspaces here.
+    if(!tiny_quote::heap(s,units,sizeof(UnitState)+sizeof(uint16_t))||
+       !tiny_quote::heap(s,classes,sizeof(ClassPools)+sizeof(DonorRank)+sizeof(std::vector<int32_t>)+2*sizeof(int64_t))||
+       !tiny_quote::heap(s,classes,2*SlotPool::tiny_segment_bytes())||
+       !tiny_quote::heap(s,slab_slots,sizeof(uint8_t))||
+       !tiny_quote::heap(s,4,sizeof(Move))||!tiny_quote::heap(s,3,sizeof(RadEvent))||
+       !tiny_quote::heap(s,weights,sizeof(WeightSlot)+sizeof(uint8_t)+sizeof(rad_weight)))return RAD_E_SHAPE;
+    // Native bootstrap's actual bounded arrays and the first session's staging
+    // copy. Reserve-before-publication belongs to Mover, not NativeOwner's quote.
+    if(!tiny_quote::heap(s,f.regions,2*sizeof(RecordRegion)+4*sizeof(char*)+sizeof(int32_t)+sizeof(uint8_t))||
+       !tiny_quote::heap(s,inventory.owned().size(),4*sizeof(rad_weight)+sizeof(RecordClaim))||
+       !tiny_quote::heap(s,f.consumer_slots,sizeof(RecordPublication)))return RAD_E_SHAPE;
+    s.event_count=1+3+4+f.consumer_slots; // gate, lead, four Move events, non-sentinel ready events
+    s.heap_growth_allowance=s.heap_payload_bytes;
+    s.control_allowance=4096+s.event_count*128;
+    if(!tiny_quote::finish(s))return RAD_E_SCRATCH;
+    *out=s;return RAD_OK;
+}
+
+void Mover::tiny_retire_or_fail() noexcept {
+    if(!cfg_.tiny_budget)return;
+    try {
+        // A copy API can enqueue and then return a negative status. Always retire
+        // both actual streams before any retained landing/event/storage release.
+        if(mover_)(void)flush_moves();
+        if(compute_)tiny_drain_or_fail(compute_,0);
+        if(mover_)tiny_drain_or_fail(mover_,0);
+    } catch(...) { tiny_unretired_fail_stop(); }
+}
+
 Mover::~Mover() {
     /* Drain the stream first: its queued gate waits, event records and copies refer to the
      * events and memory freed below. */
-    if (mover_) {
+    if(cfg_.tiny_budget){
+        tiny_retire_or_fail();
+        tiny_stream_.close(); // sole owner; never raw-destroy this borrowed handle
+        mover_=nullptr;
+    } else if (mover_) {
         (void)flush_moves();
         rad_stream_sync(mover_);
         rad_stream_destroy(mover_);
@@ -109,6 +174,13 @@ void* Mover::reserve(const char* what, int64_t bytes, int kind) {
 }
 
 int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, Pools* budget) {
+    if(tiny_stream_.get()||cfg_.tiny_budget)return RAD_E_STATE;
+    if(cfg.tiny_budget){
+        TinyStorageQuote checked;
+        const int status=tiny_startup_quote(prog,plan,cfg,&checked);
+        if(status<0)return status;
+        if(!cfg.tiny_budget->admitted()||!budget)return RAD_E_UNSUPPORTED;
+    }
     if (!plan.native_inventory &&
         std::any_of(plan.units.begin(),plan.units.end(),[](const auto& u){return u.tier==Tier::NativeStore;}))
         return RAD_E_INVAL;
@@ -327,7 +399,12 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
     }
 
     /* ---- streams, events, move records ------------------------------------------------------ */
-    RAD_TRY(rad_stream_create(&mover_, /*high_priority=*/0));
+    if(cfg_.tiny_budget){
+        RAD_TRY(tiny_stream_.open(*cfg_.tiny_budget,0));
+        mover_=tiny_stream_.get();
+    } else {
+        RAD_TRY(rad_stream_create(&mover_, /*high_priority=*/0));
+    }
     /* Every event here is local: they order the mover's queue against this card's compute queue
      * and tell the host when a slot is free, and the host never reads the ordered bytes through
      * them. A copy out to host memory carries system scope on its own packets. */

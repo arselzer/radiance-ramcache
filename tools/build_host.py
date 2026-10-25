@@ -19,7 +19,7 @@ def main():
     parser.add_argument("--existing-core-build", type=Path,
                         help="absolute existing HOST build; reuses it only after exact source/profile verification")
     parser.add_argument("--run-host-checks", action="store_true",
-                        help="after building, explicitly execute the seven manual HOST checker programs")
+                        help="after building, explicitly execute the eight manual HOST checker programs, including tiny Engine transport")
     args = parser.parse_args()
     if not 1 <= args.jobs <= 8:
         parser.error("--jobs must be in 1..8")
@@ -41,9 +41,16 @@ def main():
         env = dict(os.environ)
         for key in ("CFLAGS", "CXXFLAGS", "CPPFLAGS", "LDFLAGS", "CMAKE_TOOLCHAIN_FILE",
                     "CPATH", "CPLUS_INCLUDE_PATH", "C_INCLUDE_PATH", "LIBRARY_PATH",
-                    "GCC_EXEC_PREFIX", "COMPILER_PATH"):
+                    "GCC_EXEC_PREFIX", "COMPILER_PATH",
+                    "CMAKE_CXX_COMPILER_LAUNCHER", "CMAKE_C_COMPILER_LAUNCHER"):
             if env.get(key, "").strip():
                 raise refuse("unsupported build environment override for closed HOST profile: " + key)
+        # A reused Core may record the exact reviewed /usr/bin/ccache front
+        # end, but caller-provided ccache/prefix/compiler overrides are outside
+        # this closed build profile. Fresh Core/fixtures use no launcher.
+        for key, value in env.items():
+            if key.startswith("CCACHE_") and value.strip():
+                raise refuse("unsupported compiler-cache environment override: " + key)
         env["OMP_NUM_THREADS"] = "1"
         env["OMP_THREAD_LIMIT"] = "1"
         for key in ("HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES", "GPU_DEVICE_ORDINAL"):
@@ -54,9 +61,14 @@ def main():
         elif args.mode == "tsan":
             env.setdefault("TSAN_OPTIONS", "halt_on_error=1:second_deadlock_stack=1")
 
-        def command(argv):
+        def command(argv, clean_radiance=False):
             print("RUN", json.dumps([str(x) for x in argv]), flush=True)
-            subprocess.run([str(x) for x in argv], cwd=build_root, env=env, check=True)
+            # The exact v4 Engine checker requires a clean RADIANCE_* namespace;
+            # retain the original environment for all seven legacy checkers and
+            # builds. Its home/profile are supplied by explicit checked paths.
+            run_env = ({k: v for k, v in env.items() if not k.startswith("RADIANCE_")}
+                       if clean_radiance else env)
+            subprocess.run([str(x) for x in argv], cwd=build_root, env=run_env, check=True)
 
         build_type = "Release" if args.mode == "release" else "Debug"
         if args.existing_core_build is not None:
@@ -66,7 +78,7 @@ def main():
             cache = verify["verify_core_build"](root, core_build, args.mode, files)
             print("REUSE verified source-identical HOST Core:", core_build, flush=True)
         else:
-            core_build = build_root / ("core-host-" + args.mode)
+            core_build = build_root / ("core-engine-v4-host-" + args.mode)
             if core_build.is_symlink():
                 raise refuse("fresh Core build directory must not be a symlink")
             # Source and build directories are distinct. The default reuses only
@@ -82,7 +94,7 @@ def main():
                      "rad_core", "libref", "libquant"])
             cache = verify["verify_core_build"](root, core_build, args.mode, files)
 
-        fixture_build = build_root / ("portable-host-" + args.mode)
+        fixture_build = build_root / ("portable-engine-v4-host-" + args.mode)
         if fixture_build.is_symlink():
             raise refuse("fixture build directory must not be a symlink")
         if (fixture_build / "CMakeCache.txt").exists():
@@ -99,7 +111,7 @@ def main():
         verify["verify_core_build"](root, core_build, args.mode, files)
         verify["verify_fixture_build"](root, fixture_build, args.mode, core_build, cache)
         if not args.run_host_checks:
-            print("BUILT seven HOST checker programs; none executed. Add --run-host-checks for explicit manual execution.")
+            print("BUILT eight HOST checker programs; none executed. Add --run-host-checks for explicit manual execution.")
             return
 
         home = core_build / "radiance_home"
@@ -118,10 +130,13 @@ def main():
             [fixture_build / "compact_native_inventory_test", "--radiance-home", home],
             [fixture_build / "glm53_native_source_strict_policy_test", "--radiance-home", home],
             [fixture_build / "ds41_unified_native_policy_host_test", "--radiance-home", home],
+            [fixture_build / "tiny_engine_native_transport_check", "--run-host", "--radiance-home", home,
+             "--architecture", architecture],
         ]
+        engine_checker = fixture_build / "tiny_engine_native_transport_check"
         for argv in executions:
-            command(argv)
-        print("PASS seven explicitly invoked HOST research checker programs. No GPU/Engine/serving/TP/full-model claim.")
+            command(argv, clean_radiance=argv[0] == engine_checker)
+        print("PASS eight explicitly invoked HOST research checker programs, including tiny Engine startup/transport. No GPU/model step/serving/TP/full-model claim.")
 
 
 if __name__ == "__main__":

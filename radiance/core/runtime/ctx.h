@@ -181,6 +181,9 @@ struct CtxDesc {
     Registry*       registry    = nullptr;
     ExpertPrepareOwner* expert_prepare_owner = nullptr; // lifetime through Ctx shutdown
     ExpertPrepareLimits expert_prepare_limits{};
+    // Internal sealed transport only: borrow a precharged compute stream and
+    // fail stop on unproven retirement BEFORE any internal shutdown releases.
+    bool tiny_retirement = false;
 };
 
 /* ------------------------------------------------------------------ Ctx */
@@ -650,6 +653,7 @@ private:
     int       device_     = 0;
     RadStream stream_     = nullptr;
     bool      own_stream_ = false;
+    bool      tiny_retirement_ = false;
 
     /* ---- The second lane: overlaps the tensor-parallel all-reduce with compute at prefill
      * (order of 15% prefill throughput). Any use must respect these constraints:

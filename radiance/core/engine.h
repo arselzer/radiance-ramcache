@@ -46,6 +46,8 @@
 namespace rad {
 
 class Kld;
+struct EngineTinyState;
+class TinyNativeHarness;
 class StallWatch;
 namespace gen { class Driver; class AudioDriver; class VideoDriver; struct IPassDriver; }
 struct TierPump;
@@ -109,6 +111,16 @@ public:
     uint64_t cvec_salt_for(bool on) const { return on ? cvec_salt_ : 0; }
 
 private:
+    friend class TinyNativeHarness;
+    std::unique_ptr<EngineTinyState> tiny_; // declared before ranks: last owner to retire
+    int start_tiny_transport();
+    int tiny_transport_body();
+    int tiny_phase(uint32_t);
+    void tiny_shutdown() noexcept;
+    Checkpoint* checkpoint_view() const;
+    const CkptWeight* checkpoint_find(const std::string&) const;
+    std::string checkpoint_missing(const std::string&) const;
+    std::vector<std::string> checkpoint_refused() const;
     friend struct ModelFailurePolicyTestAccess; // actual HOST Engine admission fixture
     /* One thread per tensor-parallel rank, each owning one device. Ranks share the address
      * space, so there is no IPC or serialisation and the step batch is shared by pointer rather

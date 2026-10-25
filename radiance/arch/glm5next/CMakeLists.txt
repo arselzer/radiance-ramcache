@@ -5,3 +5,11 @@ if(NOT COMMAND rad_add_plugin)
   rad_plugin_defaults()
 endif()
 rad_add_plugin(glm5next architectures SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/glm5next.cpp)
+
+# Never a default/shipped architecture: explicit research build and separate home.
+option(RAD_BUILD_GLM_TP4_CACHE_EXPERIMENTAL "Build sealed-source-gated GLM TP4 cache research module" OFF)
+if(RAD_BUILD_GLM_TP4_CACHE_EXPERIMENTAL)
+  set(RAD_PLUGIN_OUT "${CMAKE_BINARY_DIR}/research-glm-tp4-home")
+  set(RAD_PLUGIN_INSTALL OFF)
+  rad_add_plugin(glm5next_cache architectures SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/glm5next_cache.cpp)
+endif()

@@ -1,0 +1,104 @@
+{
+  "passed": true,
+  "GPU_execution": false,
+  "production_changes": false,
+  "source": {
+    "CMAKE_ADDITION.patch": "7922329f2a419dc61c0e45170e932123564399256d62063b480e4ecaa31608e7",
+    "CMakeLists.txt": "1380b9d3863cb21a0a08bc351f1e6d2d0af8a53d6c58ed101d5bff54b2122e21",
+    "CORE_SOURCE_PINS.json": "ca0e322696dd07c0791abb6504d36d7b9cff20820765b228e417c67e9f3d79a0",
+    "PARENT_V3_README.txt": "a48bc8d9e6ae7994f6479b5cc772390c245660cd3910cb2cb7f73a411b261e08",
+    "PINNED_UPSTREAM_MODEL_INFO.json": "efbd6ca6794f23f16113afb8e77f6dd68f8053f2b0c8f0fde4db5cb3be947596",
+    "README.txt": "4d7f26aac9fe8ab5370fc32bb021be8312513c244cdb6259c0e90b5497514410",
+    "SOURCE_CONFIG_REPAIR_QUOTE.json": "95bf61831eadec07a6003b067b10f3b35d8c1623e37d73294a03134a53d53024",
+    "SOURCE_RECEIPT.json": "cc6f93b45120e48159844453a61fff086f5f66ddbb10d722895ce8838a800594",
+    "allocation_hooks.h": "b25b37c2d7cc66eda3e231e79b477ecf594a7118654f05aef5a7b6d24b3aef91",
+    "assemble_store.cpp": "e77edb07c93969dc48142b7113bf8fe23606d3c6c01f1866e3d56ea6395b7667",
+    "bundle_records.cpp": "b9bd432c38c397d9c628a25226e3bca5a18596267d1e5732277343ed8c50e70b",
+    "bundle_records.h": "6befd0a8f6697745cf39b5880be9600d769b093c078323c01292af721158e729",
+    "geometry/main_metadata.cpp": "a5571c7406012a9d8daa9e23f916c184a1dd847762637eeb4130ccfd2de85de4",
+    "geometry/main_metadata.h": "36db9a0a0176fcc6dc2ff364852e5b1c2c93deaad88d3f3298a1a269de4c9698",
+    "main_records.cpp": "7ec80633f8192f996a5463556c99ab4cb84ade2eb625bae60baf63c99f567b7a",
+    "main_records.h": "4731d4ecc5e90d0eb717cd91ade053742ba3cc7c99c85a493ad2a81d6d7cb1b6",
+    "pinned_files.h": "1c3cfe8d84600a2600b5db0cbe05d9cd1e774a1da9524e75de24a36415cb6204",
+    "sample_packer.cpp": "91a199854c60a17f19fc33ee6f4df5fb0c2b71c0c74c939b41e913e5ea3d6d47",
+    "source_proof.py": "b11b93a532dbd756d8605fdbf61044e1806d96c189968c078cfb2d39a3c5957f",
+    "stock/stock_plan.cpp": "94a7919f95c1ad23976da40fde221157d8d03a66d4fdffb232a64ed152e433ec",
+    "test_source_proof.py": "947ed916442f532a46795f9bf7015783a6ff75a7c01513adf4e8ad749d5af884",
+    "verify_source_pins.py": "3235f138e46c45de07991a8e5b3b7ab8092e8d1ae527208e00442fd07ad43c90"
+  },
+  "commands": [
+    {
+      "command": [
+        "/usr/bin/python3",
+        "-B",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-complete-main-store-assembler-prototype/verify_source_pins.py"
+      ],
+      "log": "pins-before.log",
+      "returncode": 0
+    },
+    {
+      "command": [
+        "flock",
+        "--no-fork",
+        "--exclusive",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/research-compiler.lock",
+        "nice",
+        "-n19",
+        "cmake",
+        "-S",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-complete-main-store-assembler-prototype",
+        "-B",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/build-glm53-complete-main-store-assembler",
+        "-DCMAKE_BUILD_TYPE=Release",
+        "-DCMAKE_CXX_COMPILER=/usr/bin/c++",
+        "-DCMAKE_CXX_COMPILER_LAUNCHER=/usr/bin/ccache",
+        "-DRADIANCE_SOURCE=/home/as/radiance-setup/research/deepseek-v41-1017-20261024/radiance-src",
+        "-DRADIANCE_BUILD=/home/as/radiance-setup/research/deepseek-v41-1017-20261024/build-ds41-aql"
+      ],
+      "log": "configure.log",
+      "returncode": 0
+    },
+    {
+      "command": [
+        "flock",
+        "--no-fork",
+        "--exclusive",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/research-compiler.lock",
+        "nice",
+        "-n19",
+        "cmake",
+        "--build",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/build-glm53-complete-main-store-assembler",
+        "-j2",
+        "--target",
+        "glm53_main_store_assembler"
+      ],
+      "log": "build.log",
+      "returncode": 0
+    },
+    {
+      "command": [
+        "/usr/bin/python3",
+        "-B",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-complete-main-store-assembler-prototype/verify_source_pins.py"
+      ],
+      "log": "pins-after.log",
+      "returncode": 0
+    }
+  ],
+  "scope": "Build only; no packing, device discovery or inference",
+  "source_receipt_sha256": "cc6f93b45120e48159844453a61fff086f5f66ddbb10d722895ce8838a800594",
+  "matching_core_artifacts": {
+    "build-ds41-aql/CMakeCache.txt": "d89cd220025f6aa5ef21a8fd67373fca6e3b15e9efaf267f9642b8902a7bb080",
+    "build-ds41-aql/core/librad_core.a": "b18bb2d3279674869832204673c62b2b0a369645c5ea28a801b68581f0d0bc65",
+    "build-ds41-aql/vendor/librad_vendor_llama.a": "9040bc7463eade4b955cb220d356243c6cfebac65c82581f1de286065a575231",
+    "build-ds41-aql/vendor/librad_vendor_httplib.a": "026daef0192dd0792944e9fec5906471f11032612b2df547f5283506c2784087"
+  },
+  "binary_sha256": "277f6c593f26c4369ad6eda9c87e48bde1536f8651961fcc601aafc1aee7b8bd",
+  "evidence_sha256": {
+    "build.log": "5cb367d0ba2911077f08567f41c97839efe3f8835022005c06fb78298771d0b9",
+    "configure.log": "0c1d0bace9e69511ebc8209f99c9d6c23cd62ba0845fffdc455be73670ccb452",
+    "pins-after.log": "f726574cda9b528f7a7e285c455af699fed81ffea8e6ddb336d82267fd49436d",
+    "pins-before.log": "f726574cda9b528f7a7e285c455af699fed81ffea8e6ddb336d82267fd49436d"
+  }
+}

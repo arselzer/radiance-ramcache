@@ -4,6 +4,7 @@
 #include <vector>
 #include "ctx.h"
 #include "xp_state.h"
+#include "cache_prepare4_session.h"
 #include "../build/tiny_component_quotes.h"
 #include "../build/tiny_startup.h"
 #include "../device/device.h"
@@ -20,6 +21,7 @@ namespace rad {
 // WTAB mirrors. Container/allocator overhead is a separate conservative allowance.
 int Ctx::tiny_startup_quote(const CtxDesc& d,bool handoff,TinyCtxQuote* out) noexcept {
     if(!out||!d.program)return RAD_E_INVAL;
+    if(d.cache_prepare4)return RAD_E_UNSUPPORTED;
     const Program& p=*d.program;
     if(d.tiny_retirement&&(!d.stream||d.device))return RAD_E_UNSUPPORTED;
     if(tiny_quote::program_profile(p)<0||d.rank||d.world_size!=1||d.profile_ops||d.record_passes||d.kv.size()>1||(!handoff&&d.expert_prepare_owner))return RAD_E_UNSUPPORTED;
@@ -145,6 +147,13 @@ Ctx::~Ctx() { shutdown(); }
 int Ctx::init(const CtxDesc& d) {
     if (const int failed = terminal_status(); failed < 0) return failed;
     if (!d.program) return RAD_E_INVAL;
+    if(cache_prepare4_)return RAD_E_STATE; // one-shot binding; no legacy downgrade/reinit after shutdown
+    if(d.program->requires_glm_main_tp4_cache_fail_stop()) {
+        if(!d.cache_prepare4||!d.cache_prepare4->runtime_admitted()||d.cache_prepare4->rank()!=d.rank||
+           d.world_size!=4||d.program->ctx.rank!=d.rank||d.record_passes||d.profile_ops||d.tiny_retirement||
+           glm_main_tp4_cache_program_profile(*d.program)<0||device_is_host()||std::strcmp(device_backend_name(),"aql"))return RAD_E_UNSUPPORTED;
+        cache_prepare4_=d.cache_prepare4;
+    }else if(d.cache_prepare4)return RAD_E_UNSUPPORTED;
     if(d.tiny_retirement&&(!d.stream||d.device||d.rank||d.world_size!=1))return RAD_E_UNSUPPORTED;
     if(tiny_retirement_&&(program_||stream_))return RAD_E_STATE;
     if(tiny_retirement_&&!d.tiny_retirement)return RAD_E_UNSUPPORTED;
@@ -184,13 +193,19 @@ int Ctx::init(const CtxDesc& d) {
     /* The second lane is created lazily; see lane_init(). */
 
     int s = prepare();
-    if (s < 0) { shutdown(); return s; }
+    if (s < 0) { cache_prepare4_fail_if_bound(s);shutdown(); return s; }
     s = expert_prepare_open(d.expert_prepare_owner,d.expert_prepare_limits);
-    if (s < 0) { shutdown(); return s; }
+    if (s < 0) { cache_prepare4_fail_if_bound(s);shutdown(); return s; }
     return RAD_OK;
 }
 
 void Ctx::shutdown() {
+    if(cache_prepare4_&&cache_prepare4_->runtime_admitted()){
+        if(cache_prepare4_->active())cache_prepare4_->fail_stop(RAD_E_STATE);
+        const int bound=rad_dev_set(device_);if(bound<0)cache_prepare4_->fail_stop(bound);
+        if(stream_){const int drained=rad_stream_sync(stream_);if(drained<0)cache_prepare4_->fail_stop(drained);}
+        if(lane1_){const int drained=rad_stream_sync(lane1_);if(drained<0)cache_prepare4_->fail_stop(drained);}
+    } // BEFORE oracle/xp/end-owner/free on the experimental profile
     if(tiny_retirement_){
         if(stream_)tiny_drain_or_fail(stream_,device_);
         if(lane1_)tiny_drain_or_fail(lane1_,device_);
@@ -288,7 +303,11 @@ int Ctx::bind_deferred_status() {
     return RAD_OK;
 }
 
+void Ctx::cache_prepare4_fail_if_bound(int status)const noexcept {
+    if(status<0&&cache_prepare4_&&cache_prepare4_->runtime_admitted())cache_prepare4_->fail_stop(status);
+}
 int Ctx::remember_model_failure(int status, const char* fallback) {
+    cache_prepare4_fail_if_bound(status);
     if (!permanent_model_failure_) return status;
     if (const int first = terminal_status(); first < 0) return first;
     if (status >= 0) return status;
@@ -1560,9 +1579,15 @@ int Ctx::run_pass(const RadBatch* b) {
 }
 
 int Ctx::run_step(const RadBatch* b) {
-    if (const int first = terminal_status(); first < 0) return first;
+    if(cache_prepare4_){
+        const int admitted=b?cache_prepare4_->check_batch(*b):RAD_E_INVAL;
+        if(admitted<0)cache_prepare4_fail_if_bound(admitted);
+        if(admitted<0)return admitted;
+    }
+    if (const int first = terminal_status(); first < 0) {cache_prepare4_fail_if_bound(first);return first;}
     if (!b) return RAD_E_INVAL;
     if (!arch_step_) {
+        cache_prepare4_fail_if_bound(RAD_E_STATE);
         RAD_WARN("Ctx::run_step: no architecture step function was installed");
         return RAD_E_STATE;
     }
@@ -1608,7 +1633,10 @@ int Ctx::run_step(const RadBatch* b) {
     step_fail_.clear();
     prof_n_      = 0;
     {
-        const int rc = run_pass(b);
+        int rc=RAD_E_STATE;
+        if(cache_prepare4_){try{rc=run_pass(b);}catch(...){cache_prepare4_fail_if_bound(RAD_E_STATE);throw;}}
+        else rc=run_pass(b);
+        cache_prepare4_fail_if_bound(rc);cache_prepare4_fail_if_bound(step_status_);
         if (rc < 0 && step_status_ >= 0) step_status_ = rc;
     }
 
@@ -1618,9 +1646,12 @@ int Ctx::run_step(const RadBatch* b) {
     lane_ = 0;
     {
         const int lj = lane_join(1, 0);   /* no-op when lane 1 is unbuilt */
+        cache_prepare4_fail_if_bound(lj);
         if (lj < 0 && step_status_ >= 0) step_status_ = lj;
     }
+    cache_prepare4_fail_if_bound(step_status_); // BEFORE owner/end drains on any known failure
     const int prepared_end = expert_prepare_end();
+    cache_prepare4_fail_if_bound(prepared_end);
     if (prepared_end < 0 && step_status_ >= 0) step_status_ = prepared_end;
     /* After the join, so the compute stream is behind every reader of staged weights; regardless
      * of status, because a staged weight must never outlive its pass. */

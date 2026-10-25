@@ -37,6 +37,7 @@
 struct RadCtx { };
 
 namespace rad {
+class CachePrepare4RankBinding;
 
 class Registry;
 struct TinyCtxQuote;
@@ -184,6 +185,7 @@ struct CtxDesc {
     // Internal sealed transport only: borrow a precharged compute stream and
     // fail stop on unproven retirement BEFORE any internal shutdown releases.
     bool tiny_retirement = false;
+    CachePrepare4RankBinding* cache_prepare4 = nullptr; // experimental sealed-source TP4 binding, borrowed through shutdown
 };
 
 /* ------------------------------------------------------------------ Ctx */
@@ -217,6 +219,7 @@ public:
     /* Call once on the rank thread before its first run_step: the backend's current device is
      * thread-local, and init may have run on another thread. */
     int bind_thread();
+    CachePrepare4RankBinding* cache_prepare4_binding()const noexcept{return cache_prepare4_;}
     /* The runtime LoRA slot every row of the generator passes that follow runs with, -1 for none
      * (Ctx::issue_lora). Set by the pass loop before it releases the rank for a pass. */
     void set_gen_lora_slot(int32_t s) { gen_lora_slot_ = s; }
@@ -793,6 +796,8 @@ private:
     std::vector<double>   prof_wait_ms_;
 
     bool        permanent_model_failure_ = false;
+    CachePrepare4RankBinding* cache_prepare4_ = nullptr;
+    void cache_prepare4_fail_if_bound(int status)const noexcept;
     // Deliberately not reset by shutdown/init; a failed object cannot be reused.
     std::atomic<int> terminal_status_{RAD_OK};
     char terminal_error_[2048] = {}; // owned bounded fallback, no failure-path allocation

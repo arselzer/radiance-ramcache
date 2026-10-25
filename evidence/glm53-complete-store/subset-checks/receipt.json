@@ -1,0 +1,262 @@
+{
+  "passed": true,
+  "production_changes": false,
+  "kernel_execution": false,
+  "model_execution": false,
+  "full_model_packed": false,
+  "commands": [
+    {
+      "command": [
+        "nice",
+        "-n19",
+        "/usr/bin/python3",
+        "-B",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-complete-main-store-assembler-prototype/verify_source_pins.py"
+      ],
+      "log": "pins-before.log",
+      "device_metadata": false,
+      "returncode": 0
+    },
+    {
+      "command": [
+        "nice",
+        "-n19",
+        "/usr/bin/python3",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-complete-main-store-assembler-prototype",
+        "-p",
+        "test_source_proof.py"
+      ],
+      "log": "source-proof-unit.log",
+      "device_metadata": false,
+      "returncode": 0
+    },
+    {
+      "command": [
+        "nice",
+        "-n19",
+        "/usr/bin/python3",
+        "-B",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-complete-main-store-assembler-prototype/source_proof.py",
+        "--source",
+        "/home/as/models/hf/amd/GLM-5.3-Flash-Quark-MXFP4",
+        "--mode",
+        "subset",
+        "--output",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/validation-glm53-main-store-subset-20261025T172650Z/subset-source-proof.json"
+      ],
+      "log": "source-proof.log",
+      "device_metadata": false,
+      "returncode": 0
+    },
+    {
+      "command": [
+        "nice",
+        "-n19",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/build-glm53-complete-main-store-assembler/glm53_main_store_assembler",
+        "--run-subset-validation",
+        "--checkpoint",
+        "/home/as/models/hf/amd/GLM-5.3-Flash-Quark-MXFP4",
+        "--home",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/shipped-radiance-1.12.0-home",
+        "--source-proof",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/validation-glm53-main-store-subset-20261025T172650Z/subset-source-proof.json",
+        "--output",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/validation-glm53-main-store-subset-20261025T172650Z/private-record-subset"
+      ],
+      "log": "check.log",
+      "device_metadata": true,
+      "returncode": 0
+    },
+    {
+      "command": [
+        "nice",
+        "-n19",
+        "/usr/bin/python3",
+        "-B",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-complete-main-store-assembler-prototype/verify_source_pins.py"
+      ],
+      "log": "pins-after.log",
+      "device_metadata": false,
+      "returncode": 0
+    }
+  ],
+  "model_payloads_private": true,
+  "scope": "Eight actual native records: two complete experts across four logical ranks; no runtime source admission or inference",
+  "build_receipt_sha256": "475844e45a2dfe186f068f89338ad4c7f47b034b300df5cc942b6461bfa2391e",
+  "checkpoint_download_status_sha256": "391d72138be12300ab5f646aaed9bd2b2a871b2697f7a705d8d667c73f0b0b6a",
+  "MemAvailable_before": 9486245888,
+  "health_before_device_metadata": {
+    "status": "ok",
+    "model": "qwen-vllm",
+    "in_flight": 0,
+    "queue_cap": 64
+  },
+  "subset_result": {
+    "schema": "glm53-main-store-assembler-subset-check-v1",
+    "passed": true,
+    "runtime_ready": false,
+    "mode": "subset_component_NONREADY",
+    "records": 8,
+    "shards": 8,
+    "native_bytes": 26738688,
+    "bundle_id": 7324736234177547666,
+    "graph_quotes": 4,
+    "total_graph_declarations": 9,
+    "total_geometry_quotes_including_faults": 11,
+    "checks": 82173,
+    "fault_triggers": 4,
+    "compared_records": 8,
+    "compared_native_bytes": 26738688,
+    "metadata_requested_peak": 245014216,
+    "metadata_on_disk_actual": 58949,
+    "metadata_on_disk_upper": 37879808,
+    "own_complete_tensor_read_bytes": 26738688,
+    "own_source_band_read_bytes": 53477376,
+    "native_copy_bytes": 26738688,
+    "actual_total_checker_pread_calls_before_receipt": 5322,
+    "actual_total_checker_pwrite_calls_before_receipt": 1869,
+    "positive_assembly_and_verify_pread_calls": 2056,
+    "positive_assembly_and_verify_pwrite_calls": 826,
+    "producer_source_proof_hashed_bytes": 30516817,
+    "trusted_source_proof_complete": false,
+    "full_checkpoint_payload_hashes_independently_computed_by_Cpp": false,
+    "input_payload_fd_peak": 2,
+    "assembler_owned_fd_upper": 8,
+    "verifier_owned_fds": 6,
+    "assembler_destroyed_before_verifier": true,
+    "window_bytes": 65536,
+    "upstream_Checkpoint_Program_metadata_and_mapping_owners_separate": true,
+    "fixture_independent_oracle_buffers_upper": 8388608,
+    "nonexpert_kv_b_metadata_scope": "inherited declaration hook only; actual raw/planned encodings recorded, no payload conversion/load",
+    "nonexpert_kv_b_metadata_evidence": [
+      {
+        "logical_source": "blk.11.attn_kv_b.weight",
+        "raw_encoding": "bf16",
+        "planned_encoding": "bf16",
+        "shape": [
+          32768,
+          512
+        ],
+        "payload_converted": false
+      },
+      {
+        "logical_source": "blk.15.attn_kv_b.weight",
+        "raw_encoding": "bf16",
+        "planned_encoding": "bf16",
+        "shape": [
+          32768,
+          512
+        ],
+        "payload_converted": false
+      },
+      {
+        "logical_source": "blk.19.attn_kv_b.weight",
+        "raw_encoding": "bf16",
+        "planned_encoding": "bf16",
+        "shape": [
+          32768,
+          512
+        ],
+        "payload_converted": false
+      },
+      {
+        "logical_source": "blk.23.attn_kv_b.weight",
+        "raw_encoding": "bf16",
+        "planned_encoding": "bf16",
+        "shape": [
+          32768,
+          512
+        ],
+        "payload_converted": false
+      },
+      {
+        "logical_source": "blk.27.attn_kv_b.weight",
+        "raw_encoding": "bf16",
+        "planned_encoding": "bf16",
+        "shape": [
+          32768,
+          512
+        ],
+        "payload_converted": false
+      },
+      {
+        "logical_source": "blk.3.attn_kv_b.weight",
+        "raw_encoding": "bf16",
+        "planned_encoding": "bf16",
+        "shape": [
+          32768,
+          512
+        ],
+        "payload_converted": false
+      },
+      {
+        "logical_source": "blk.31.attn_kv_b.weight",
+        "raw_encoding": "bf16",
+        "planned_encoding": "bf16",
+        "shape": [
+          32768,
+          512
+        ],
+        "payload_converted": false
+      },
+      {
+        "logical_source": "blk.35.attn_kv_b.weight",
+        "raw_encoding": "bf16",
+        "planned_encoding": "bf16",
+        "shape": [
+          32768,
+          512
+        ],
+        "payload_converted": false
+      },
+      {
+        "logical_source": "blk.39.attn_kv_b.weight",
+        "raw_encoding": "bf16",
+        "planned_encoding": "bf16",
+        "shape": [
+          32768,
+          512
+        ],
+        "payload_converted": false
+      },
+      {
+        "logical_source": "blk.43.attn_kv_b.weight",
+        "raw_encoding": "bf16",
+        "planned_encoding": "bf16",
+        "shape": [
+          32768,
+          512
+        ],
+        "payload_converted": false
+      },
+      {
+        "logical_source": "blk.7.attn_kv_b.weight",
+        "raw_encoding": "bf16",
+        "planned_encoding": "bf16",
+        "shape": [
+          32768,
+          512
+        ],
+        "payload_converted": false
+      }
+    ],
+    "nonexpert_kv_b_all_raw_already_planned_BF16": true,
+    "model_kernel_or_Engine_execution": false,
+    "content_ID_excludes_runtime_ctx_batch_residency_path_inode_stat": true,
+    "future_SourceFactory_still_absent": true
+  },
+  "subset_result_sha256": "e14f25837cf35b9b42bf997d5c3fe1043eae54a45197c842965df5d211c36dbc",
+  "evidence_sha256": {
+    "subset-source-proof.json": "a5bf0fe574806b23f9ab376880a3ad7e335a35c3d781e15468c44c23e52dd512",
+    "source-proof-unit.log": "133449d6f429f0588126e0403937f271f33f90517460d5c4b39d69c2eeda0f25",
+    "pins-after.log": "f726574cda9b528f7a7e285c455af699fed81ffea8e6ddb336d82267fd49436d",
+    "check.log": "bb88d8c28d10bf246e3bb745752ef96e53432103f88a260c7e13245765caed93",
+    "pins-before.log": "f726574cda9b528f7a7e285c455af699fed81ffea8e6ddb336d82267fd49436d",
+    "source-proof.log": "a582fea59ac3704ef4cb515d19dceb7ceec45f7b364977b4a233b0c8feefed86"
+  }
+}

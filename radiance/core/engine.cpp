@@ -59,6 +59,7 @@ Engine::Readback::~Readback() {
 }
 
 Engine::~Engine() {
+    if(cache_prepare4_)cache_prepare4_->stop_admission(); // before any diagnostic/resource teardown
     if(tiny_) {tiny_shutdown();rad_tools_registry().close();return;}
     /* The control vector's per-rank direction copies. Uploaded at declare, outside any arena, so
      * nothing else frees them; each rank's copy is freed with that rank's device bound, since the
@@ -281,27 +282,38 @@ void Engine::tiering_dispatch(Rank& r, int step) {
 /* ------------------------------------------------------------------ the rank thread */
 void Engine::rank_loop(int index) {
     Rank& r = *ranks_[(size_t)index];
+    auto* cache_binding=cache_prepare4_?cache_prepare4_->binding(index):nullptr;
     if (r.ctx.bind_thread() < 0) {
+        if(cache_binding)cache_binding->fail_stop(RAD_E_DEVICE);
         RAD_ERR("rank %d: could not bind its device", index);
         step_status_.store(RAD_E_DEVICE, std::memory_order_release);
     }
 
     for (;;) {
         barrier_->arrive_and_wait();                    /* released against this step's batch */
-        if (stopping_.load(std::memory_order_acquire)) break;
+        if (stopping_.load(std::memory_order_acquire)) {if(cache_prepare4_)cache_prepare4_->stop_if_active();break;}
 
+        try {
         const RadBatch* b = step_batch_.load(std::memory_order_acquire);
         if (b) {
+            const int cache_what=issue_what_.load(std::memory_order_acquire);
+            struct CacheRankGuard {
+                CachePrepare4RankBinding* binding;bool model,finished=false;
+                ~CacheRankGuard(){if(binding&&model&&!finished)binding->fail_stop(RAD_E_STATE);}
+            } cache_guard{cache_binding,cache_what==kIssueModel};
+            if(cache_binding&&(cache_what!=kIssueModel&&cache_what!=kIssueSampler))cache_binding->fail_stop(RAD_E_UNSUPPORTED);
             /* This rank's view of the step, pointing at this card's staging. Its upload was issued
              * on this rank's stream, so no cross-rank fence is needed. */
             const RadBatch* mine = gen_ ? gen_->batch_for(index) : sched_.batch_for(index);
             if (!mine) {
+                if(cache_binding)cache_binding->fail_stop(RAD_E_STATE);
                 RAD_ERR("rank %d: the builder has no batch for this rank", index);
                 step_status_.store(RAD_E_STATE, std::memory_order_release);
                 barrier_->arrive_and_wait();
                 continue;
             }
             b = mine;
+            if(cache_binding){const int same=cache_binding->check_batch(*b);if(same<0)cache_binding->fail_stop(same);}
             const int what = issue_what_.load(std::memory_order_acquire);
             const bool sampler_phase = what == kIssueAll || what == kIssueSampler;
             int s = what == kIssueStatus
@@ -309,7 +321,9 @@ void Engine::rank_loop(int index) {
                         : what == kIssueSampler ? RAD_OK : r.ctx.run_step(b);
             if (s >= 0 && what == kIssueAll && r.ctx.checks_device_status())
                 s = r.ctx.await_device_status();
+            if(cache_binding&&cache_guard.model){const int ended=cache_binding->finish(*b,s);if(ended<0)cache_binding->fail_stop(ended);cache_guard.finished=true;}
             if (s < 0) {
+                if(cache_binding)cache_binding->fail_stop(s);
                 RAD_ERR("rank %d step %d: %s", index, b->step, r.ctx.step_error());
                 step_status_.store(s, std::memory_order_release);
             } else if (b->n_out > 0 && sampler_phase) {
@@ -321,6 +335,7 @@ void Engine::rank_loop(int index) {
                     build_cv_.wait(lk, [this] { return build_ready_; });
                     bst = build_status_;
                 }
+                if(bst<0&&cache_binding)cache_binding->fail_stop(bst);
                 /* The sampler chain goes on the same stream behind the model with no host sync
                  * (spec §13). */
                 if (bst >= 0) {
@@ -328,6 +343,7 @@ void Engine::rank_loop(int index) {
                     if (b->draft_pass == 0 && !score_rows_.empty()) s = issue_scored_rows(r);
                     if (s >= 0) s = r.sampler.run(&r.ctx, r.program.logits_buf, r.tok_buf);
                     if (s < 0) {
+                        if(cache_binding)cache_binding->fail_stop(s);
                         RAD_ERR("rank %d step %d: sampler: %s", index, b->step, rad_strerror(s));
                         step_status_.store(s, std::memory_order_release);
                     }
@@ -336,7 +352,8 @@ void Engine::rank_loop(int index) {
             /* Behind the pass, once a step: see tiering_dispatch. */
             if (s >= 0 && b->draft_pass == 0 && sampler_phase) tiering_dispatch(r, b->step);
 
-        }
+        }else if(cache_binding&&cache_binding->active())cache_binding->fail_stop(RAD_E_STATE);
+        }catch(...){if(cache_binding)cache_binding->fail_stop(RAD_E_STATE);throw;}
         barrier_->arrive_and_wait();                    /* joined; the scheduler may read */
     }
 }
@@ -362,6 +379,7 @@ int Engine::prepare_release(const RadBatch* b) {
 
 int Engine::issue_ahead(const RadBatch** out) {
     *out = nullptr;
+    if(cache_prepare4_)return RAD_OK; // preserve truthful Batch.n_ahead; disable ONLY actual issue-ahead
     if (!pipelining_) return RAD_OK;
     for (int i = 0; i < serial_rows_ && serial_done_ > 0; ++i)
         sched_.expect_draft(serial_row_[(size_t)i].seq, serial_done_);
@@ -406,12 +424,34 @@ bool Engine::requires_checked_model_profile() const {
     });
 }
 
+int Engine::glm_main_tp4_cold_source_gate()const {
+    if(plugins_.arch_plugin!="glm5next_cache")return RAD_OK;
+    // The real packed-one-expert proof is NOT complete source coverage. No
+    // factory is installed in this slice; do not create a Session or allocate
+    // model payload/opaque instances from an asserted boolean or scalar hash.
+    RAD_ERR("experimental GLM TP4 cache is closed: complete verified four-rank source/placement factory is not implemented");
+    return RAD_E_UNSUPPORTED;
+}
 int Engine::model_policy_admission() const {
     if (ranks_.empty()) return RAD_E_STATE;
     const bool required = ranks_[0]->program.requires_permanent_model_failure();
+    const bool cache_required=ranks_[0]->program.requires_glm_main_tp4_cache_fail_stop();
+    if(cache_required){
+        if(!cache_prepare4_||!cache_prepare4_->runtime_admitted()||ranks_.size()!=4||cfg_.tp!=4||cfg_.n_spec||cfg_.max_seqs!=1||cfg_.max_tok<1||cfg_.max_tok>128||
+           cfg_.kld()||cfg_.profile_ops||cfg_.mm_max_patches||cfg_.prefix_cache||cfg_.checkpoint_slots||cfg_.checkpoint_interval)return RAD_E_UNSUPPORTED;
+        for(size_t index=0;index<ranks_.size();++index){const auto& r=*ranks_[index];
+            if(glm_main_tp4_cache_program_profile(r.program)<0||r.ctx.checks_device_status()||!r.native_owner||!r.plan.native_inventory||
+               r.plan.native_inventory->limits().backend_profile!=NativeBackendProfile::GlmMainTp4AqlFailStopV1||
+               r.plan.native_inventory->source_generation()!=cache_prepare4_->source_generation()||
+               r.ctx.cache_prepare4_binding()!=cache_prepare4_->binding(int(index)))return RAD_E_UNSUPPORTED;
+        }
+        return RAD_OK;
+    }
+    if(cache_prepare4_)return RAD_E_UNSUPPORTED;
     for (const auto& r : ranks_) {
         if (const int first = r->ctx.terminal_status(); first < 0) return first;
         if (r->program.requires_permanent_model_failure() != required) return RAD_E_STATE;
+        if(r->program.requires_glm_main_tp4_cache_fail_stop())return RAD_E_STATE;
         const int s = model_profile_admission(r->program, r->ctx.checks_device_status(),
                                               (int)ranks_.size(), cfg_.n_spec);
         if (s < 0) return s;
@@ -420,6 +460,7 @@ int Engine::model_policy_admission() const {
 }
 
 int Engine::fail_loop(int st) {
+    if(cache_prepare4_&&cache_prepare4_->runtime_admitted()&&!cache_prepare4_->admission_closed())cache_prepare4_->fail_stop(-1,st);
     stopping_.store(true, std::memory_order_release);
     if (barrier_) barrier_->abort();
     sched_.shutdown("the engine stopped on an error and is not serving", st < 0 ? st : RAD_E_STATE);
@@ -452,7 +493,7 @@ int Engine::step_loop() {
     }
     /* Not in KL mode: its scored rows are copied out of the logits buffer after collection, and a
      * pass issued ahead would overwrite them. */
-    pipelining_ = !deferred_status_profile_ && !cfg_.kld() && !embedding_ &&
+    pipelining_ = !cache_prepare4_ && !deferred_status_profile_ && !cfg_.kld() && !embedding_ &&
                   (serial_drafting() || block_drafting() || cfg_.n_spec <= 0);
     const bool t_on = (int)log_level() >= (int)Log::Debug;
     /* The next step's forward pass when already issued behind the previous step, before its
@@ -640,14 +681,17 @@ int Engine::step_loop() {
                     build_status_ = RAD_OK;
                 }
                 if (const int ps = prepare_release(b); ps < 0) return ps;
+                if(cache_prepare4_){const int begun=cache_prepare4_->begin(*b);
+                    if(begun<0){if(cache_prepare4_->admission_closed())return RAD_OK;cache_prepare4_->fail_stop(-1,begun);}}
                 /* An embedding program has no sampler to issue behind its pass. */
-                issue_what_.store(embedding_ || deferred_status_profile_ ? kIssueModel : kIssueAll,
+                issue_what_.store(embedding_ || deferred_status_profile_ || cache_prepare4_ ? kIssueModel : kIssueAll,
                                   std::memory_order_release);
                 step_batch_.store(b, std::memory_order_release);
                 barrier_->arrive_and_wait();      /* release the ranks */
                 {
                     /* Stage the sampler while the ranks enqueue and the device runs the pass. */
                     bst = stage_sampler();
+                    if(bst<0&&cache_prepare4_)cache_prepare4_->fail_stop(-1,bst);
                     {
                         std::lock_guard<std::mutex> lk(build_mu_);
                         build_ready_  = true;
@@ -656,7 +700,7 @@ int Engine::step_loop() {
                     build_cv_.notify_all();
                 }
                 barrier_->arrive_and_wait();      /* wait for them */
-                return deferred_status_profile_
+                return (deferred_status_profile_||cache_prepare4_)
                     ? (bst < 0 ? bst : step_status_.load(std::memory_order_acquire)) : RAD_OK;
             };
             int phase_status = RAD_OK;
@@ -678,6 +722,15 @@ int Engine::step_loop() {
                     barrier_->arrive_and_wait();
                     return step_status_.load(std::memory_order_acquire);
                 });
+            } else if(cache_prepare4_){
+                phase_status=model_phase();
+                if(cache_prepare4_->admission_closed())return RAD_OK; // idle stop won begin admission; release NO workers
+                if(phase_status<0)cache_prepare4_->fail_stop(-1,phase_status);
+                // Every rank completed all42 MODEL gates before sampler release.
+                issue_what_.store(kIssueSampler,std::memory_order_release);step_batch_.store(b,std::memory_order_release);
+                barrier_->arrive_and_wait();barrier_->arrive_and_wait();
+                phase_status=step_status_.load(std::memory_order_acquire);
+                if(phase_status<0)cache_prepare4_->fail_stop(-1,phase_status);
             } else {
                 phase_status = model_phase();
             }
@@ -775,6 +828,7 @@ int Engine::step_loop() {
         st = embedding_ ? collect_pooled(b, so) : collect_step(b, so);
         if (t_on) phase_mark(PH_COLLECT);
         if (st < 0) return fail_loop(st);
+        if(cache_prepare4_){const int completed=cache_prepare4_->complete_frame(*b);if(completed<0)cache_prepare4_->fail_stop(-1,completed);}
         /* The step's sampler chain, verify op included, has returned: one line at the first
          * coupled verify that actually completed. */
         couple_verify_evidence(b->step);
@@ -1707,6 +1761,7 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
 
     /* Stop the step loop before the server's storage is destroyed: Request::sink points into it,
      * and an unfinished request still writes there (server.h). */
+    if(cache_prepare4_)cache_prepare4_->stop_admission(); // serialize against begin BEFORE Engine barrier/worker joins
     stopping_.store(true, std::memory_order_release);
     barrier_->abort();
     if (stepper.joinable()) stepper.join();

@@ -1,5 +1,6 @@
 #include "native_backing_owner.h"
 #include "runtime/ctx.h"
+#include "runtime/cache_prepare4_session.h"
 #include "../build/tiny_component_quotes.h"
 #include <algorithm>
 namespace rad {
@@ -112,6 +113,17 @@ int NativeBackingOwner::close_after_context_shutdown(){
     RAD_TRY(p_->mover->record_session_close(p_->token));
     p_->token=0;
     return RAD_OK;
+}
+int NativeBackingOwner::complete_prepared(const ExpertPrepareView& view){
+    auto& p=*p_;const auto* binding=view.context?view.context->cache_prepare4_binding():nullptr;
+    if(p.fatal<0)return p.fatal;
+    if(!binding||!binding->runtime_admitted()||!p.token||view.context!=p.context||view.program!=p.program||
+       view.producer_stream!=p.mover->native_record_compute_stream()||
+       p.inventory->limits().backend_profile!=NativeBackendProfile::GlmMainTp4AqlFailStopV1||
+       p.inventory->source_generation()!=binding->source_generation())return RAD_E_UNSUPPORTED;
+    const int completed=p.mover->native_record_wait_prepared(p.token,p.publication);
+    if(completed<0&&p.fatal>=0)p.fatal=completed;
+    return completed; // leases/publications stay held through GU/activation/DN/gather
 }
 int NativeBackingOwner::end_pass(RadStream,int status){
     if(status<0&&p_->fatal>=0)p_->fatal=status;

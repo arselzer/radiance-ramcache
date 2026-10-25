@@ -3771,6 +3771,7 @@ int Engine::start() {
     rad_tools_registry().set_code_device(devs[0]);
     rad_tools_registry().set_no_device_code(device_is_host());
     RAD_TRY(load_plugins());
+    RAD_TRY(glm_main_tp4_cold_source_gate()); // absent complete-store factory: BEFORE declare/init/Plan/Pools
     {
         /* The loaded libraries in selection order: as --kernels named them, or every library in
          * the home. */

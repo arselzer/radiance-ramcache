@@ -1,0 +1,33 @@
+{
+  "Core_pins_checked": 309,
+  "byte_exact_parent_bodies": 10,
+  "files": {
+    "GLM53_COMPLETE_MAIN_STORE_ASSEMBLER_INDEPENDENT_REVIEW.txt": "600275db58616740874bc9602239ec46d4e7252de18b14911008699a040584f3",
+    "glm53-complete-main-store-assembler-prototype/CMAKE_ADDITION.patch": "7922329f2a419dc61c0e45170e932123564399256d62063b480e4ecaa31608e7",
+    "glm53-complete-main-store-assembler-prototype/CMakeLists.txt": "1380b9d3863cb21a0a08bc351f1e6d2d0af8a53d6c58ed101d5bff54b2122e21",
+    "glm53-complete-main-store-assembler-prototype/CORE_SOURCE_PINS.json": "ca0e322696dd07c0791abb6504d36d7b9cff20820765b228e417c67e9f3d79a0",
+    "glm53-complete-main-store-assembler-prototype/PARENT_V3_README.txt": "a48bc8d9e6ae7994f6479b5cc772390c245660cd3910cb2cb7f73a411b261e08",
+    "glm53-complete-main-store-assembler-prototype/PINNED_UPSTREAM_MODEL_INFO.json": "efbd6ca6794f23f16113afb8e77f6dd68f8053f2b0c8f0fde4db5cb3be947596",
+    "glm53-complete-main-store-assembler-prototype/README.txt": "4d7f26aac9fe8ab5370fc32bb021be8312513c244cdb6259c0e90b5497514410",
+    "glm53-complete-main-store-assembler-prototype/SOURCE_CONFIG_REPAIR_QUOTE.json": "95bf61831eadec07a6003b067b10f3b35d8c1623e37d73294a03134a53d53024",
+    "glm53-complete-main-store-assembler-prototype/SOURCE_RECEIPT.json": "cc6f93b45120e48159844453a61fff086f5f66ddbb10d722895ce8838a800594",
+    "glm53-complete-main-store-assembler-prototype/allocation_hooks.h": "b25b37c2d7cc66eda3e231e79b477ecf594a7118654f05aef5a7b6d24b3aef91",
+    "glm53-complete-main-store-assembler-prototype/assemble_store.cpp": "e77edb07c93969dc48142b7113bf8fe23606d3c6c01f1866e3d56ea6395b7667",
+    "glm53-complete-main-store-assembler-prototype/bundle_records.cpp": "b9bd432c38c397d9c628a25226e3bca5a18596267d1e5732277343ed8c50e70b",
+    "glm53-complete-main-store-assembler-prototype/bundle_records.h": "6befd0a8f6697745cf39b5880be9600d769b093c078323c01292af721158e729",
+    "glm53-complete-main-store-assembler-prototype/geometry/main_metadata.cpp": "a5571c7406012a9d8daa9e23f916c184a1dd847762637eeb4130ccfd2de85de4",
+    "glm53-complete-main-store-assembler-prototype/geometry/main_metadata.h": "36db9a0a0176fcc6dc2ff364852e5b1c2c93deaad88d3f3298a1a269de4c9698",
+    "glm53-complete-main-store-assembler-prototype/main_records.cpp": "7ec80633f8192f996a5463556c99ab4cb84ade2eb625bae60baf63c99f567b7a",
+    "glm53-complete-main-store-assembler-prototype/main_records.h": "4731d4ecc5e90d0eb717cd91ade053742ba3cc7c99c85a493ad2a81d6d7cb1b6",
+    "glm53-complete-main-store-assembler-prototype/pinned_files.h": "1c3cfe8d84600a2600b5db0cbe05d9cd1e774a1da9524e75de24a36415cb6204",
+    "glm53-complete-main-store-assembler-prototype/sample_packer.cpp": "91a199854c60a17f19fc33ee6f4df5fb0c2b71c0c74c939b41e913e5ea3d6d47",
+    "glm53-complete-main-store-assembler-prototype/source_proof.py": "b11b93a532dbd756d8605fdbf61044e1806d96c189968c078cfb2d39a3c5957f",
+    "glm53-complete-main-store-assembler-prototype/stock/stock_plan.cpp": "94a7919f95c1ad23976da40fde221157d8d03a66d4fdffb232a64ed152e433ec",
+    "glm53-complete-main-store-assembler-prototype/test_source_proof.py": "947ed916442f532a46795f9bf7015783a6ff75a7c01513adf4e8ad749d5af884",
+    "glm53-complete-main-store-assembler-prototype/verify_source_pins.py": "3235f138e46c45de07991a8e5b3b7ab8092e8d1ae527208e00442fd07ad43c90"
+  },
+  "package_pins_checked": 21,
+  "parent_execution_pending": true,
+  "schema": "glm53-complete-main-assembler-independent-source-review-v1",
+  "target_execution_by_reviewer": false
+}

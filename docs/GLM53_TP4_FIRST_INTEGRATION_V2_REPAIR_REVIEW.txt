@@ -1,0 +1,19 @@
+TP4 integration fixture-v2 compile repair: independent source closure
+
+Candidate glm53-main-tp4-cache-integration-v2-prototype
+SOURCE_RECEIPT SHA256
+1de8d56f99b32f2a8ae88e8351b6c121b201a2a73623016878bbc547ef15bbdf
+Unchanged CORE_SOURCE_PINS SHA256
+776827647d9a26c0d3fb0d7f09edd31b6fd2e86d82eff92c2bdf707e47748e26
+
+The only C++ change from reviewed frozen v1 is two explicit rad:: namespace
+qualifications of rad_dev_vmem_committed in session_checker.cpp. Direct diff
+matches NAMESPACE_COMPILE_REPAIR.diff. All 54 prototype source hashes match.
+Other changes are the disclosed README/receipt and new parent-receipt/diff files.
+Core, Mover fixture, inherited bodies, policy, arithmetic and source-activation
+behavior are unchanged. No new scoped source blocker found.
+
+Parent reported the whole Core and experimental architecture module compiled;
+the actual earlier fixture failure is retained separately. This reviewer did
+not compile, execute, import target modules, query devices, or edit candidates.
+The original independent review and its source-only limits continue to apply.

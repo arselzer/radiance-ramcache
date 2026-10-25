@@ -1209,6 +1209,7 @@ int Ctx::host_join_wait(bool drain) {
 /* ================================================================== the cold paths */
 
 int Ctx::abort_step(rad_op h, int band, int dom, const IssuePlan& ip, int64_t n, int status) {
+    cache_prepare4_fail_if_bound(status);
     if (const int first = terminal_status(); first < 0) return first;
     const OpInfo&   o     = *plans_[h].info;
     const char*     kname = ip.row && ip.row->info ? ip.row->info->name : "<unnamed>";
@@ -1235,6 +1236,7 @@ int Ctx::abort_step(rad_op h, int band, int dom, const IssuePlan& ip, int64_t n,
 }
 
 int Ctx::step_fail(const char* what) {
+    cache_prepare4_fail_if_bound(RAD_E_SHAPE);
     if (const int first = terminal_status(); first < 0) return first;
     step_fail_ = what ? what : "the architecture block refused this batch";
     RAD_ERR("%s", step_fail_.c_str());
@@ -1243,6 +1245,7 @@ int Ctx::step_fail(const char* what) {
 }
 
 int Ctx::abort_step_msg(rad_op h, int status, std::string what) {
+    cache_prepare4_fail_if_bound(status);
     if (const int first = terminal_status(); first < 0) return first;
     const OpInfo* o = (h != RAD_NULL_HANDLE && (size_t)h < plans_.size()) ? plans_[h].info : nullptr;
     step_fail_ = o ? fmt("op '%s' {%s}: %s", o->op.c_str(), o->base.str().c_str(), what.c_str())
@@ -1253,6 +1256,7 @@ int Ctx::abort_step_msg(rad_op h, int status, std::string what) {
 }
 
 void Ctx::fatal_issue(rad_op h, int64_t n, const char* why) const {
+    cache_prepare4_fail_if_bound(RAD_E_STATE);
     if (h == RAD_NULL_HANDLE || (size_t)h >= plans_.size() || !plans_[h].info)
         fatal("rad_issue: op handle %u at n=%lld %s", (unsigned)h, (long long)n, why);
     const OpInfo& o = *plans_[h].info;

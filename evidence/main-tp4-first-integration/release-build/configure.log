@@ -1,0 +1,6 @@
+-- radiance: HIP backend OFF by request -- host backend only
+-- arch: 'deepseek41' has no CMakeLists.txt -- not an architecture plugin, skipped
+-- spechub: this radiance has no device build -- only the host reference is built
+-- Configuring done (0.1s)
+-- Generating done (0.5s)
+-- Build files have been written to: /home/as/radiance-setup/research/deepseek-v41-1017-20261024/build-glm-main-tp4-cache-host-release

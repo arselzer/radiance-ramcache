@@ -112,13 +112,13 @@ def verify_snapshot(root):
             raise Refusal("source SHA256 mismatch: " + name)
     core_files = {name.removeprefix("radiance/"): h
                   for name, h in files.items() if name.startswith("radiance/")}
-    archived_pins = root / "research/glm53-tiny-engine-native-transport-v4-prototype/CORE_SOURCE_PINS.json"
+    archived_pins = root / "research/glm53-main-tp4-cache-integration-v4-prototype/CORE_SOURCE_PINS.json"
     original = json.loads(archived_pins.read_text(encoding="utf-8"))
-    if not isinstance(original, dict) or len(original) != 1512 or not CORE_CACHE_EXCLUSIONS <= set(original):
-        raise Refusal("unexpected frozen Engine transport v4 Core pin inventory")
+    if not isinstance(original, dict) or len(original) != 1517 or not CORE_CACHE_EXCLUSIONS <= set(original):
+        raise Refusal("unexpected frozen GLM main TP4 Core pin inventory")
     filtered = {name: h for name, h in original.items() if name not in CORE_CACHE_EXCLUSIONS}
     if core_files != filtered:
-        raise Refusal("exported Core differs from the frozen 1512-file inventory minus the two recorded caches")
+        raise Refusal("exported Core differs from the frozen 1517-file inventory minus the two recorded caches")
     if any(name in core_files for name in CORE_CACHE_EXCLUSIONS):
         raise Refusal("portable source snapshot must exclude the two recorded Python caches")
     return files
@@ -200,6 +200,8 @@ def verify_core_build(root, build, mode, files=None, require_archives=True):
     verify_compiler_profile(cache, allow_exact_ccache=True)
     if cache.get("RAD_BUILD_DS41_EXPERIMENTAL") not in ("ON", "OFF"):
         raise Refusal("Core must explicitly record its experimental-DS41 build option")
+    if cache.get("RAD_BUILD_GLM_TP4_CACHE_EXPERIMENTAL") not in ("ON", "OFF"):
+        raise Refusal("Core must explicitly record its experimental GLM TP4 module build option")
     home_value = cache.get("CMAKE_HOME_DIRECTORY", "")
     if not home_value or not Path(home_value).is_absolute():
         raise Refusal("Core build has no absolute CMAKE_HOME_DIRECTORY")

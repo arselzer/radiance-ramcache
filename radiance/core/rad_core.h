@@ -356,8 +356,10 @@ class Program {
     friend class Builder;
     // Fixed by declaration, with no public downgrade setter.
     bool permanent_model_failure_ = false;
+    bool glm_main_tp4_cache_fail_stop_ = false; // separate additive profile; never clears PermanentV1
 public:
     bool requires_permanent_model_failure() const { return permanent_model_failure_; }
+    bool requires_glm_main_tp4_cache_fail_stop() const { return glm_main_tp4_cache_fail_stop_; }
     std::vector<WeightInfo>  weights;    /* index 0 is a sentinel: handles are 1-based */
     std::vector<BufferInfo>  buffers;
     std::vector<OpInfo>      ops;

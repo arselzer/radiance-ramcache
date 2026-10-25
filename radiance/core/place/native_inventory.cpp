@@ -1,5 +1,7 @@
 #include "native_inventory.h"
 #include "device/device.h"
+#include "format/share.h"
+#include "runtime/cache_prepare4_session.h"
 #include <algorithm>
 #include <array>
 #include <cstring>
@@ -34,9 +36,104 @@ bool geometry(const Program& p,const MoveUnit& a,const MoveUnit& b){
     return true;
 }
 void explain(std::string* why,const char* s)noexcept{if(why)try{*why=s;}catch(...){}}
+void glm_main_geometry(const Program& p,const Plan& plan,const NativeInventoryLimits& limits){
+    require(glm_main_tp4_cache_program_profile(p)==RAD_OK&&
+            !device_is_host()&&!std::strcmp(device_backend_name(),"aql")&&
+            p.ctx.world_size==4&&p.ctx.rank>=0&&p.ctx.rank<4&&
+            plan.world_size==4&&plan.rank==p.ctx.rank&&
+            limits.max_rows==uint32_t(p.ctx.max_tok)&&limits.max_rows>=1&&limits.max_rows<=128&&limits.top_k==8,
+            RAD_E_UNSUPPORTED,"closed actual GLM main TP4 AQL cache profile");
+    require(p.expert_route_maps.size()==42,RAD_E_SHAPE,"GLM exact42 current-route maps");
+    std::array<const ExpertRouteMap*,42> routes{};
+    for(const auto& map:p.expert_route_maps){const auto& d=map.decl;
+        require(d.layer>=3&&d.layer<=44&&!routes[size_t(d.layer-3)]&&
+                d.canonical_experts==288&&d.local_experts==288&&d.regular_experts==288&&
+                d.expert_base==0&&d.classes==2&&d.top_k==8&&d.max_rows==p.ctx.max_tok&&
+                d.n_entries==288&&map.entries.size()==288,
+                RAD_E_SHAPE,"GLM full-domain unsliced per-layer route map");
+        routes[size_t(d.layer-3)]=&map;
+    }
+    bool seen[42][288]{};size_t experts=0;
+    constexpr int64_t offsets[]{0,2097152,2228224,3276800};
+    constexpr int64_t bytes[]{2097152,131072,1048576,65536};
+    constexpr int64_t shape[4][2]{{1024,4096},{1024,128},{4096,512},{4096,16}};
+    const auto mx=rad_enc_affine(RAD_FP4E2M1,RAD_E8M0,1,32);
+    for(size_t ui=0;ui<plan.units.size();++ui){const auto& u=plan.units[ui];if(u.expert<0)continue;
+        require(u.layer>=3&&u.layer<=44&&u.expert<288&&!seen[u.layer-3][u.expert]&&
+                u.slot_bytes==3342336&&u.bytes==3342336&&u.weights.size()==4&&u.offset.size()==4&&
+                std::equal(u.offset.begin(),u.offset.end(),offsets)&&u.access==RAD_ACCESS_CONDITIONAL,
+                RAD_E_SHAPE,"GLM exact main four-member record including fixed residents");
+        seen[u.layer-3][u.expert]=true;++experts;
+        const auto& route=routes[size_t(u.layer-3)]->entries[size_t(u.expert)];
+        require(route.canonical==u.expert&&route.slot==u.expert&&route.class_index==u.expert%2&&!route.protected_expert&&
+                std::equal(u.weights.begin(),u.weights.end(),route.members),
+                RAD_E_INVAL,"GLM canonical/runtime/member identity including fixed residents");
+        for(size_t m=0;m<4;++m){const auto h=u.weights[m];
+            require(h&&h<p.weights.size()&&h<plan.unit_of_weight.size()&&plan.unit_of_weight[h]==int32_t(ui),RAD_E_INVAL,"GLM exact member/unit map");
+            const auto& w=p.weights[h];const auto dtype=m%2?RAD_E8M0:RAD_FP4E2M1;
+            require(w.enc_known&&rad_enc_equal(&w.enc,&mx)&&w.identity&&!w.widen&&w.layout_tag.empty()&&
+                    w.n_sel==1&&w.sel[0]==int(m%2)&&w.stored_dtype==dtype&&w.decl.dtype==dtype&&
+                    w.decl.rank==2&&w.stored_rank==2&&w.decl.shape[0]==shape[m][0]&&w.decl.shape[1]==shape[m][1]&&
+                    w.stored_shape[0]==shape[m][0]&&w.stored_shape[1]==shape[m][1]&&
+                    w.sel_rows[0]==shape[m][0]&&w.sel_cols[0]==shape[m][1]&&w.stored_bytes==bytes[m]&&
+                    w.align>0&&w.align<=4096&&4096%w.align==0&&w.decl.access==RAD_ACCESS_CONDITIONAL&&!w.decl.optional&&
+                    w.decl.group.layer==u.layer&&w.decl.group.expert==u.expert&&w.decl.group.slot==int(m/2)&&
+                    w.decl.shard==(m<2?RAD_SHARD_ROW:RAD_SHARD_COL),RAD_E_SHAPE,"GLM selected canonical member geometry");
+            for(size_t d=2;d<RAD_MAX_RANK;++d)require(!w.decl.shape[d]&&!w.stored_shape[d],RAD_E_SHAPE,"GLM rank2 shape tail");
+            require(w.n_part_spans==0&&w.shard_lo==(int64_t(p.ctx.rank)*512)/(m==3?32:1)&&
+                    w.shard_hi==(int64_t(p.ctx.rank+1)*512)/(m==3?32:1)&&
+                    w.decl.n_row_parts==(m<2?2:0),RAD_E_SHAPE,"GLM actual TP4 rank cuts");
+            if(m<2)require(w.decl.row_parts[0]==512&&w.decl.row_parts[1]==512,RAD_E_SHAPE,"GLM two separate local GU halves");
+            for(size_t n=m<2?2:0;n<RAD_MAX_ROW_PARTS;++n)require(!w.decl.row_parts[n],RAD_E_SHAPE,"GLM row-part tail");
+            const int64_t source_shape[]{4096,m<2?4096:2048};
+            PlaneShare shares[RAD_ENC_MAX_PLANES];
+            require(weight_share(w,mx,2,source_shape,4,p.ctx.rank,shares,nullptr)==RAD_OK,RAD_E_SHAPE,"GLM actual source PlaneShare");
+            const auto& share=shares[0];
+            require(share.dtype==dtype&&share.rows==shape[m][0]&&share.cols==shape[m][1]&&
+                    share.dense_bytes()==bytes[m]&&share.rects.size()==(m<2?2u:1u),RAD_E_SHAPE,"GLM canonical source coverage");
+            for(size_t part=0;part<share.rects.size();++part){const auto& q=share.rects[part];const bool gu=m<2;
+                const int64_t row_bytes=gu?(m%2?128:2048):(m%2?64:1024);
+                require(q.row0==(gu?int64_t(part)*2048+int64_t(p.ctx.rank)*512:0)&&
+                        q.rows==(gu?512:4096)&&q.byte0==(gu?0:int64_t(p.ctx.rank)*(m%2?16:256))&&
+                        q.bytes==(gu?row_bytes:(m%2?16:256))&&share.row_bytes==row_bytes,
+                        RAD_E_SHAPE,"GLM ROW half/COL K512 source rectangles");
+            }
+        }
+    }
+    require(experts==12096,RAD_E_SHAPE,"GLM complete42x288 main unit coverage, no MTP");
+    // Canonical bytes must also be accepted by the ACTUAL selected DEVICE
+    // consumers. A permissive metadata row (LAYOUT_ANY) is not an affirmative
+    // native-reader claim. Scratch is covered by the precharged per-weight
+    // construction reservation and released before compact-authority capture.
+    uint64_t references=0,bands=0;
+    for(const auto& op:p.ops){references=add(references,op.weights.size());bands=add(bands,op.bands.size());}
+    require(references<=1000000&&bands<=100000,RAD_E_SHAPE,"GLM selected consumer metadata work cap");
+    std::vector<uint8_t> claimed(p.weights.size(),0);
+    for(const auto& op:p.ops)for(size_t wi=0;wi<op.weights.size();++wi){const auto h=op.weights[wi];
+        if(!h)continue;
+        require(h<p.weights.size(),RAD_E_INVAL,"GLM selected consumer weight handle");
+        const auto& w=p.weights[h];if(w.decl.group.expert<0)continue;
+        require(!op.bands.empty(),RAD_E_SHAPE,"GLM expert has no selected consumer band");
+        const int operand=wi<op.weight_opd.size()&&op.weight_opd[wi]>=0?op.weight_opd[wi]:int(wi);
+        for(const auto& band:op.bands){const auto& resolved=band.dom[RAD_DOMAIN_DEVICE];
+            require(resolved.row&&resolved.row->info,RAD_E_UNSUPPORTED,"GLM missing actual DEVICE expert reader");
+            const auto* info=resolved.row->info;
+            RadTensor planes[RAD_ENC_MAX_PLANES]{};weight_planes(w,planes);RadLayout layout{};
+            const int status=info->layout?info->layout(resolved.geom.params(),resolved.geom.n_params(),operand,
+                &w.enc,w.sel,planes,w.n_sel,&layout):RAD_E_UNSUPPORTED;
+            if(status==RAD_LAYOUT_ANY)continue;
+            require(status==RAD_E_UNSUPPORTED,RAD_E_UNSUPPORTED,"GLM DEVICE reader requires noncanonical native layout");
+            claimed[h]=1;
+        }
+    }
+    for(size_t h=1;h<p.weights.size();++h)if(p.weights[h].decl.group.expert>=0)
+        require(claimed[h],RAD_E_UNSUPPORTED,"GLM expert lacks affirmative canonical DEVICE reader");
+}
 }
 struct NativeInventory::Impl {
     const Program* program=nullptr;
+    int32_t world=1,rank=0;
+    int64_t max_ctx=0;
     NativeInventoryLimits limits;
     NativeBackingFootprint footprint;
     std::unique_ptr<NativeWeightAuthority> authority;
@@ -47,6 +144,14 @@ struct NativeInventory::Impl {
     std::vector<NativeOwnedUnit> owned;
     std::vector<NativeClassReservation> classes;
     std::vector<ExpertRouteMap> routes;
+    bool rank_profile_matches(const Program& p,const Plan& plan)const noexcept{
+        if(p.ctx.world_size!=world||p.ctx.rank!=rank||plan.world_size!=world||plan.rank!=rank)return false;
+        if(limits.backend_profile!=NativeBackendProfile::GlmMainTp4AqlFailStopV1)
+            return world==1&&rank==0; // Preserve the closed HOST/Tiny TP1 contract.
+        return world==4&&rank>=0&&rank<4&&p.requires_glm_main_tp4_cache_fail_stop()&&
+            !p.requires_permanent_model_failure()&&p.ctx.max_tok==limits.max_rows&&p.ctx.max_seqs==1&&
+            p.ctx.max_spec==0&&!p.ctx.is_draft&&!p.ctx.shape_probe&&p.ctx.max_ctx==max_ctx;
+    }
 };
 NativeInventory::NativeInventory(std::unique_ptr<Impl> p):p_(std::move(p)){}
 NativeInventory::~NativeInventory()=default;
@@ -56,6 +161,7 @@ std::span<const NativeClassReservation> NativeInventory::classes()const noexcept
 const NativeBackingFootprint& NativeInventory::footprint()const noexcept{return p_->footprint;}
 const NativeAuthorityStats& NativeInventory::authority_stats()const noexcept{return p_->authority->stats();}
 const NativeInventoryLimits& NativeInventory::limits()const noexcept{return p_->limits;}
+uint64_t NativeInventory::source_generation()const noexcept{return p_->owned.empty()?0:p_->owned.front().descriptor.source_generation;}
 const NativeOwnedUnit* NativeInventory::find(int32_t unit)const noexcept{
     if(unit<0||size_t(unit)>=p_->owned_index.size())return nullptr;
     const auto i=p_->owned_index[size_t(unit)];
@@ -68,11 +174,13 @@ int NativeInventory::bind(const Program& program,const Plan& layout,
                          std::shared_ptr<const NativeInventory>* out,std::string* why){
     try{
         require(out&&!*out,RAD_E_INVAL,"native inventory output must be empty");
-        require(program.ctx.world_size==1&&program.ctx.rank==0&&layout.world_size==1&&
-                layout.rank==0&&!layout.dynamic&&layout.strategy==Strategy::AllVram,
-                RAD_E_UNSUPPORTED,"initial native inventory requires truthful static TP1 layout");
+        const bool glm_tp4=limits.backend_profile==NativeBackendProfile::GlmMainTp4AqlFailStopV1;
+        require(!layout.dynamic&&layout.strategy==Strategy::AllVram,
+                RAD_E_UNSUPPORTED,"native inventory requires truthful static all_vram layout");
+        if(!glm_tp4)require(program.ctx.world_size==1&&program.ctx.rank==0&&layout.world_size==1&&layout.rank==0,
+                RAD_E_UNSUPPORTED,"initial HOST/Tiny native inventory remains TP1");
         require(limits.backend_profile==NativeBackendProfile::HostOnly||
-                limits.backend_profile==NativeBackendProfile::TinyAqlV1,
+                limits.backend_profile==NativeBackendProfile::TinyAqlV1||glm_tp4,
                 RAD_E_UNSUPPORTED,"unknown native backend profile");
         if(limits.backend_profile==NativeBackendProfile::TinyAqlV1){
             require(!device_is_host()&&!std::strcmp(device_backend_name(),"aql")&&
@@ -168,6 +276,10 @@ int NativeInventory::bind(const Program& program,const Plan& layout,
         }
         reservation=add(reservation,catalog.size());
         require(reservation<=limits.max_metadata_bytes,RAD_E_SCRATCH,"native metadata reservation cap");
+        // Includes the existing64KiB fixed scratch and128B per weight; the
+        // temporary byte-per-weight layout claims and <=2 PlaneShare rectangles
+        // do not coexist with later compact-authority construction scratch.
+        if(glm_tp4)glm_main_geometry(program,layout,limits);
         // Recheck the pure Planner's grouping/offset result rather than accepting a forged
         // same-sized Plan. Each actual Program weight occurs exactly once in its declared group.
         std::vector<size_t> class_unit_counts(layout.classes.size(),0);
@@ -212,6 +324,7 @@ int NativeInventory::bind(const Program& program,const Plan& layout,
         reservation=add(reservation,authority->stats().construction_peak_bytes);
         require(reservation<=limits.max_metadata_bytes,RAD_E_SCRATCH,"native compact metadata reservation cap");
         auto p=std::make_unique<Impl>();p->program=&program;p->limits=limits;
+        p->world=program.ctx.world_size;p->rank=program.ctx.rank;p->max_ctx=program.ctx.max_ctx;
         p->authority=std::move(authority);
         p->footprint.metadata_reservation=reservation;
         p->owned_index.assign(layout.units.size(),-1);
@@ -233,7 +346,7 @@ int NativeInventory::bind(const Program& program,const Plan& layout,
                     u.tier==Tier::VRAM&&!u.movable&&u.weights.size()==4&&u.offset.size()==4&&
                     u.slot_bytes>0&&u.slot_bytes%4096==0&&u.bytes>0,
                     RAD_E_SHAPE,"native ownership requires four-member actual native expert");
-            require(d.world==1&&d.rank==0&&d.layer==u.layer&&d.expert==u.expert&&
+            require(d.world==uint32_t(p->world)&&d.rank==uint32_t(p->rank)&&d.layer==u.layer&&d.expert==u.expert&&
                     d.source_generation&&d.stride==u.slot_bytes,RAD_E_INVAL,"native source/rank/stride identity");
             require(p->owned.empty()||d.source_generation==p->owned.front().descriptor.source_generation,
                     RAD_E_INVAL,"mixed native source generations");
@@ -335,6 +448,10 @@ int NativeInventory::bind(const Program& program,const Plan& layout,
             for(const auto& owned:p->owned)for(const auto h:layout.units[size_t(owned.unit)].weights)
                 require(rad_enc_equal(&program.weights[h].enc,&mx),RAD_E_DTYPE,"tiny AQL main MXFP4 only");
         }
+        if(glm_tp4)require(p->classes.size()==1&&p->classes[0].stride==3342336&&
+                p->footprint.consumer_slots>=1&&p->footprint.consumer_slots<=288&&
+                p->footprint.regions==p->footprint.consumer_slots+1,
+                RAD_E_SHAPE,"GLM one native geometry class, separate from two route parity classes");
         p->footprint.hot_bytes=limits.hot_bytes;p->footprint.cold_bytes=limits.cold_bytes;
         p->footprint.owned_units=p->owned.size();
         p->units=layout.units;
@@ -352,8 +469,7 @@ int NativeInventory::bind(const Program& program,const Plan& layout,
     catch(...){explain(why,"native snapshot exception");return RAD_E_STATE;}
 }
 int NativeInventory::validate(const Program& program,const Plan& layout,std::string* why)const{
-    if(&program!=p_->program||program.ctx.world_size!=1||program.ctx.rank!=0||
-       layout.rank!=0||layout.world_size!=1||layout.units.size()!=p_->units.size()||
+    if(&program!=p_->program||!p_->rank_profile_matches(program,layout)||layout.units.size()!=p_->units.size()||
        program.weights.size()!=p_->authority->size()||
        layout.classes.size()!=p_->plan_classes.size()||
        layout.unit_of_weight.size()!=p_->unit_of_weight.size()||
@@ -425,8 +541,7 @@ int NativeInventory::validate(const Program& program,const Plan& layout,std::str
     return RAD_OK;
 }
 int NativeInventory::validate_runtime_header(const Program& program,const Plan& plan)const{
-    if(&program!=p_->program||program.ctx.world_size!=1||program.ctx.rank!=0||
-       program.weights.size()!=p_->authority->size()||plan.rank!=0||plan.world_size!=1||
+    if(&program!=p_->program||!p_->rank_profile_matches(program,plan)||program.weights.size()!=p_->authority->size()||
        plan.units.size()!=p_->units.size()||plan.unit_of_weight.size()!=p_->unit_of_weight.size()||
        plan.classes.size()!=p_->plan_classes.size()||plan.native_inventory.get()!=this||
        plan.strategy!=Strategy::NativeBacked||plan.dynamic||

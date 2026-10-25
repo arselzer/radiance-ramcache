@@ -10,6 +10,7 @@
  */
 #include "rad_build.h"
 #include "rad_model_failure_policy.h"
+#include "rad_glm_main_tp4_cache.h"
 #include "lora/lora.h"
 #include "../device/device.h"
 
@@ -2370,8 +2371,19 @@ int Builder::require_permanent_model_failure() {
         err(RAD_E_STATE, "permanent model failure policy after declare finished");
         return RAD_E_STATE;
     }
+    if(prog_.requires_glm_main_tp4_cache_fail_stop()) {
+        err(RAD_E_UNSUPPORTED,"PermanentV1 and GLM TP4 cache fail-stop are separate profiles");return RAD_E_UNSUPPORTED;
+    }
     prog_.permanent_model_failure_ = true;
     return RAD_OK;
+}
+int Builder::require_glm_main_tp4_cache_fail_stop(){
+    // The experimental Engine must first metadata-declare and verify its full
+    // source capability. An opaque init cannot precede that cold admission.
+    if(finished_){err(RAD_E_STATE,"GLM TP4 cache profile after declare finished");return RAD_E_STATE;}
+    if(instances_){err(RAD_E_UNSUPPORTED,"GLM TP4 cache requires metadata-first verified source admission");return RAD_E_UNSUPPORTED;}
+    if(prog_.requires_permanent_model_failure()){err(RAD_E_UNSUPPORTED,"GLM TP4 cache profile cannot replace PermanentV1");return RAD_E_UNSUPPORTED;}
+    prog_.glm_main_tp4_cache_fail_stop_=true;return RAD_OK;
 }
 
 int Builder::finish() {
@@ -2383,6 +2395,8 @@ int Builder::finish() {
     if (ref_) {
         if (ref_->requires_permanent_model_failure() != prog_.requires_permanent_model_failure())
             err(RAD_E_STATE, "sizing declaration changes permanent model failure policy");
+        if(ref_->requires_glm_main_tp4_cache_fail_stop()!=prog_.requires_glm_main_tp4_cache_fail_stop())
+            err(RAD_E_STATE,"sizing declaration changes GLM TP4 cache profile");
         finish_buffer_liveness();
         return status_;
     }
@@ -2447,6 +2461,8 @@ static rad::Builder* B(RadBuilder* b) { return static_cast<rad::Builder*>(b); }
 int rad_require_permanent_model_failure(RadBuilder* b) {
     return b ? B(b)->require_permanent_model_failure() : RAD_E_INVAL;
 }
+uint32_t rad_core_glm_main_tp4_cache_profile_version(void){return RAD_GLM_MAIN_TP4_CACHE_PROFILE_VERSION;}
+int rad_require_glm_main_tp4_cache_fail_stop(RadBuilder* b){return b?B(b)->require_glm_main_tp4_cache_fail_stop():RAD_E_INVAL;}
 
 rad_weight rad_decl_weight(RadBuilder* b, const char* name, const RadWeightDecl* d) {
     if (!b) return RAD_NULL_HANDLE;

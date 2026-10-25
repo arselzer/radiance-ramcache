@@ -3,7 +3,7 @@ project(radiance_ramcache_portable_host LANGUAGES CXX)
 find_package(Threads REQUIRED)
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 get_filename_component(PORTABLE_REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
-set(RADIANCE_SOURCE "${PORTABLE_REPO_ROOT}/radiance" CACHE PATH "Exported selected Engine transport v4 source")
+set(RADIANCE_SOURCE "${PORTABLE_REPO_ROOT}/radiance" CACHE PATH "Exported selected GLM main TP4 integration source")
 set(RADIANCE_HOST_BUILD "" CACHE PATH "Explicit separately built matching HOST Core")
 set(PORTABLE_MODE "release" CACHE STRING "release | asan | tsan")
 if(NOT PORTABLE_MODE MATCHES "^(release|asan|tsan)$")
@@ -34,6 +34,7 @@ elseif(PORTABLE_MODE STREQUAL "tsan")
 endif()
 set(FOUNDATION "${PORTABLE_REPO_ROOT}/research/glm53-engine-native-foundation-v3-prototype")
 set(TRANSPORT "${PORTABLE_REPO_ROOT}/research/glm53-tiny-engine-native-transport-v4-prototype")
+set(TP4 "${PORTABLE_REPO_ROOT}/research/glm53-main-tp4-cache-integration-v4-prototype")
 set(COMPACT "${FOUNDATION}/regressions/compact")
 set(P3 "${COMPACT}/strict_p3")
 set(PROVIDER "${PORTABLE_REPO_ROOT}/research/glm53-sharded-native-provider-prototype")
@@ -128,3 +129,16 @@ add_dependencies(tiny_engine_native_transport_check glm53_tiny_startup_arch)
 # No archival add_subdirectory/pin rewrite, CTest/automatic execution, GPU/HIP,
 # optional physical exporter target, install, production CLI activation or serving.
 # The eighth explicit manual checker calls actual tiny HOST Engine.start only.
+
+# Ninth and tenth manual checks use the source-identical reviewed TP4 fixture V4.
+# They do not activate a real TP4 source or execute a model/GPU step.
+add_executable(glm53_tp4_cache_session_check "${TP4}/session_checker.cpp")
+portable_core_exe(glm53_tp4_cache_session_check)
+target_include_directories(glm53_tp4_cache_session_check PRIVATE "${TP4}")
+add_executable(glm53_tp4_mover_fence_check "${TP4}/mover_wait_checker.cpp")
+portable_core_exe(glm53_tp4_mover_fence_check)
+target_include_directories(glm53_tp4_mover_fence_check PRIVATE
+  "${TP4}" "${RADIANCE_SOURCE}/arch/common" "${RADIANCE_SOURCE}/tools")
+target_link_libraries(glm53_tp4_mover_fence_check PRIVATE portable_p3_native_source)
+target_link_options(glm53_tp4_mover_fence_check PRIVATE
+  "LINKER:--wrap=rad_memcpy_async" "LINKER:--wrap=rad_event_record" "LINKER:--wrap=rad_stream_sync")

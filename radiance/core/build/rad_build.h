@@ -158,6 +158,7 @@ public:
      * becomes an error only if the run phase issues it. */
     int finish();
     int require_permanent_model_failure();
+    int require_glm_main_tp4_cache_fail_stop();
 
     /* A sizing declare (RadBuildCtx::shape_probe): each op takes the bands `ref` resolved at the
      * same position, and finish() initialises nothing. The plugin sees the real declare's answers

@@ -1,0 +1,21 @@
+-- The C compiler identification is GNU 15.2.0
+-- The CXX compiler identification is GNU 15.2.0
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- radiance: HIP backend OFF by request -- host backend only
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD - Success
+-- Found Threads: TRUE
+-- arch: 'deepseek41' has no CMakeLists.txt -- not an architecture plugin, skipped
+-- spechub: this radiance has no device build -- only the host reference is built
+-- Configuring done (1.1s)
+-- Generating done (0.4s)
+-- Build files have been written to: /home/as/radiance-setup/research/deepseek-v41-1017-20261024/build-glm-main-tp4-cache-host-asan

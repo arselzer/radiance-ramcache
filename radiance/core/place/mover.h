@@ -575,6 +575,10 @@ public:
     // Native-only B2 capability: regions are carved/charged by Mover from typed Pools.
     int native_record_session_open(uint64_t* token);
     int native_record_upload(uint64_t,int32_t unit,int32_t region,std::span<const std::byte>);
+    // Explicit READY fence for a sealed native session: validate the exact current
+    // publication/generations, finish the REAL transfer stream, then revalidate.
+    // No compute drain, unpublish, lease release, or region reuse is authorized.
+    int native_record_wait_prepared(uint64_t,std::span<const RecordPublication>);
     int native_record_guards_host() const;
     // Test-only TinyAqlV1: bounded caller-owned mapped readback, both streams drained.
     int native_record_guards_aql(void* host,void* device,int64_t bytes,RadStream) const;

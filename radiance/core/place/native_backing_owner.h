@@ -16,6 +16,7 @@ public:
     bool accepts_native_inventory(const NativeInventory*)const override;
     int bind_native_context(const NativeInventory*,const Ctx*,RadStream)override;
     int prepare(const ExpertPrepareView&,bool*)override;
+    int complete_prepared(const ExpertPrepareView&)override;
     int end_pass(RadStream,int)override;
     int quiesce();
     // Required after Ctx::shutdown and successful quiesce. Native pointers are withdrawn,

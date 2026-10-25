@@ -1,0 +1,84 @@
+GLM main TP4 first integration: independent source review
+
+Reviewed candidate
+  glm53-main-tp4-cache-integration-prototype/SOURCE_RECEIPT.json
+  SHA256 33a1e5e44b9cec31ab89c3533e9279be7d830622fb70b581b4f2118388be6b6d
+  radiance-glm-main-tp4-cache-src, CORE_SOURCE_PINS.json
+  SHA256 776827647d9a26c0d3fb0d7f09edd31b6fd2e86d82eff92c2bdf707e47748e26
+
+Result: no remaining scoped source blocker found in this frozen first slice.
+This is independent read-only review, not compilation, execution, device testing,
+or a proof of complete Engine/TP4 model inference. Parent validation is pending.
+No candidate, baseline, public export, service, or configuration was edited.
+
+Identity checks performed using stdlib file hashes and direct byte comparison:
+  1,517 Core files and 52 prototype source pins match their receipt.
+  All 34 inherited fixture bodies match their stated frozen originals.
+  All six peer-owned Inventory/Mover paths match final pins 08269165... .
+  The pre-existing ABI directory files match frozen transport-v4 byte-for-byte.
+  The coordinator matches the passed lookahead prototype byte-for-byte.
+  The raw-session fixture differs from its inherited body only by the disclosed
+  extra parameter and return after actual source/Pools/Mover bootstrap.
+These hash checks do not imply line-by-line review of every unchanged Core file.
+
+Reviewed lifetime and failure flow
+  core/runtime/expert_prepare.cpp:142-152 first obtains actual producer-event
+  completion and validates the current route payload, then agrees exact IDs
+  across ranks, prepares the owner, completes actual uploads, invalidates WTAB
+  bookkeeping, and finally votes READY. Invalid IDs/slices and owner failures
+  enter the process-fatal path before owner end/drain or diagnostic formatting.
+  core/place/native_backing_owner.cpp:117 delegates completion to the real Mover
+  fence while retaining publications and cache leases through the GU/activation/
+  DN/gather readers. Existing explicit retirement remains responsible for reuse.
+  core/place/native_mover.cpp:165 validates exact live token/publication/busy
+  regions, pointers, events and nonzero generations; it synchronizes the actual
+  transfer stream and revalidates the same generation. It neither treats WTAB
+  invalidation as DMA completion nor settles events/releases leases on READY.
+
+  core/engine.cpp:684 begins a shared frame before worker release. Model ranks
+  complete all 42 gates before sampler release, and sampler ranks check the same
+  pass metadata. Session activity spans sampler and successful final collection
+  (engine.cpp:831); model coordinator completion alone does not authorize stop.
+  issue_ahead is disabled for this Session while actual Batch.n_ahead is retained.
+  Ctx/Engine known negative/exception paths notify process-fatal handling before
+  diagnostic, owner teardown, or worker/barrier retirement. Exit88 is fail-stop,
+  not recovery from a hardware/driver hang and not a rollback guarantee.
+
+Review findings repaired before this freeze
+  - Session enter rejects layers outside3..44 before signed layer-3 arithmetic,
+    including INT_MIN; the new authored checker covers that boundary.
+  - Routing parity remains two WTAB classes with expert%2, distinct from one
+    Native record geometry class. No actual router geometry was changed.
+  - An idle stop could previously observe no frame, then allow begin after
+    workers exited. stop_admission now shares pass_mutex with begin, permanently
+    closes idle admission, and exits88 for an active frame. Engine calls it before
+    worker abort. If idle close wins, model_phase returns before worker release
+    and the caller exits before sampler/publication. There is no new begin after
+    a closed Session. This fixes the identified ordering race by source evidence.
+
+Closed activation and unchanged profiles
+  Engine::glm_main_tp4_cold_source_gate (engine.cpp:427), called in bringup before
+  declare/opaque initialization/Plan/Pools, refuses the experimental plugin while
+  no complete verified source factory exists. Earlier metadata/Vocab/plugin/HSA
+  startup is outside that no-model-payload boundary. Builder independently refuses
+  instances=true for this profile; sizing and real profile bits must agree.
+  ProtocolHarness cannot set source_admitted. Native generation uniformity alone
+  is not full-catalog provenance or Ready. A selected_raw_bundle sample identity
+  cannot replace the complete common four-rank bundle authority.
+  PermanentV1, HostOnly and TinyAqlV1 retain their separate TP1 constraints.
+  The experimental module is opt-in OFF, separate-home, install-disabled; ordinary
+  glm5next is unchanged outside the explicit experimental compile macro.
+
+Authored checks are honestly scoped
+  Session checker invokes actual new Core Session/Builder/closed Ctx admission and
+  the actual private Engine gate through an existing HOST-only test friend.
+  It cannot establish a positive TP4 Ctx/source capability or execute a model.
+  Its death children have a monotonic deadline, kill/reap containment and
+  nonblocking pipe reads; the no-unwind witness checks process exit88.
+  Mover checker invokes actual HostOnly source/Pools/Mover/upload/publication and
+  transfer completion. Its injected negative occurs AFTER successful real sync;
+  later ordinary retirement is explicitly controlled. This does not prove safe
+  recovery from a real failed GPU sync, and no TP4 HOST runtime is fabricated.
+  All matching whole-Core builds, regression executions, true four-rank DEVICE
+  payload/collective tests, full source admission/placement, and performance remain
+  separate parent-owned gates. Ctx's borrowed Session must outlive all Ctx teardown.

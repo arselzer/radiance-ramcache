@@ -1067,9 +1067,13 @@ int Planner::plan(Plan* out) {
         // NativeInventory::bind sealed the actual AQL/backend/topology checks.
         // Planner remains pure: it consumes that capability and never queries a device.
         const bool tiny_aql_profile=profile==NativeBackendProfile::TinyAqlV1&&!in_.host_backend;
+        const bool glm_aql_profile=profile==NativeBackendProfile::GlmMainTp4AqlFailStopV1&&
+            !in_.host_backend&&in_.world_size==4&&in_.rank>=0&&in_.rank<4&&
+            prog.requires_glm_main_tp4_cache_fail_stop()&&!prog.requires_permanent_model_failure()&&
+            cfg.tp==4&&cfg.n_spec==0&&cfg.max_seqs==1&&cfg.max_tok==prog.ctx.max_tok;
+        const bool rank_profile=((host_profile||tiny_aql_profile)&&in_.rank==0&&in_.world_size==1)||glm_aql_profile;
         if (!cfg.deterministic || cfg.placement != "all_vram" || cfg.host_pool_mib ||
-            cfg.weights_disk_tier || in_.container || (!host_profile&&!tiny_aql_profile) ||
-            in_.rank != 0 || in_.world_size != 1 || in_.resident_eligibility)
+            cfg.weights_disk_tier || in_.container || !rank_profile || in_.resident_eligibility)
             return RAD_E_UNSUPPORTED;
         // Explicit profile capability: exact native classes precede legacy pin_mapped.
         build_classes(out);

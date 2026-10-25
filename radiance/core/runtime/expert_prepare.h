@@ -32,6 +32,8 @@ public:
     virtual ~ExpertPrepareOwner()=default;
     virtual int prepare(const ExpertPrepareView&,bool* residency_changed)=0;
     virtual int check_program(const Program&) const { return RAD_OK; }
+    // Experimental TP4 only: actual checked upload completion, not enqueue or WTAB invalidation.
+    virtual int complete_prepared(const ExpertPrepareView&) { return RAD_E_UNSUPPORTED; }
     virtual bool accepts_native_inventory(const NativeInventory*) const { return false; }
     virtual int bind_native_context(const NativeInventory*,const Ctx*,RadStream) { return RAD_E_UNSUPPORTED; }
     // Called after all compute lanes join, including preparation/issue failure. Future owners

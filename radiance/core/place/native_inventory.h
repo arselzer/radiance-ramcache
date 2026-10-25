@@ -59,6 +59,10 @@ public:
     const NativeBackingFootprint& footprint()const noexcept;
     const NativeAuthorityStats& authority_stats()const noexcept;
     const NativeInventoryLimits& limits()const noexcept;
+    // Uniform descriptor generation sealed by bind. Active TP4 additionally
+    // requires the separately verified complete four-rank bundle ID; this
+    // accessor alone proves neither payload integrity nor runtime readiness.
+    uint64_t source_generation()const noexcept;
 private:
     struct Impl;
     explicit NativeInventory(std::unique_ptr<Impl>);

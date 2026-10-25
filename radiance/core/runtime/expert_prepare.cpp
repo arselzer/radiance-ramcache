@@ -1,4 +1,6 @@
 #include "ctx.h"
+#include "cache_prepare4_session.h"
+#include "place/native_inventory.h"
 #include <algorithm>
 #include <cstring>
 #include <limits>
@@ -11,8 +13,14 @@ ExpertPrepareState::~ExpertPrepareState(){if(ready)rad_event_destroy(ready);if(a
 int Ctx::expert_prepare_open(ExpertPrepareOwner* owner,const ExpertPrepareLimits& l){
     const auto* native=residency_?residency_->native_inventory():nullptr;
     if(native && (!owner || !owner->accepts_native_inventory(native)))return RAD_E_UNSUPPORTED;
+    if(cache_prepare4_&&(!cache_prepare4_->runtime_admitted()||!owner||!native||
+       native->limits().backend_profile!=NativeBackendProfile::GlmMainTp4AqlFailStopV1||
+       native->source_generation()!=cache_prepare4_->source_generation()))return RAD_E_UNSUPPORTED;
     if(!owner)return RAD_OK;
-    if(world_size_!=1||rank_!=0||record_passes_||checks_device_status()||!limits_ok(l)||program_->lane1_w0>=0||program_->expert_route_maps.empty()||program_->expert_route_maps.size()>l.max_maps)return RAD_E_UNSUPPORTED;
+    if(cache_prepare4_){
+        if(world_size_!=4||rank_<0||rank_>=4||cache_prepare4_->rank()!=rank_||glm_main_tp4_cache_program_profile(*program_)<0)return RAD_E_UNSUPPORTED;
+    }else if(world_size_!=1||rank_!=0)return RAD_E_UNSUPPORTED; // original TP1 path remains separate
+    if(record_passes_||checks_device_status()||!limits_ok(l)||program_->lane1_w0>=0||program_->expert_route_maps.empty()||program_->expert_route_maps.size()>l.max_maps)return RAD_E_UNSUPPORTED;
     try{
         const int accepted=owner->check_program(*program_);
         if (accepted < 0) return accepted;
@@ -49,6 +57,7 @@ void Ctx::expert_prepare_close(bool drained){
     expert_prepare_.reset();
 }
 int Ctx::expert_prepare_fail(int status,const char* why){
+    cache_prepare4_fail_if_bound(status); // before formatting, ownership-end or any drain
     if(const int first=terminal_status();first<0)return first;
     // A later Native refusal must not replace an earlier synchronous pass
     // failure in the owner's sticky state, including default Legacy programs.
@@ -62,7 +71,11 @@ int Ctx::expert_prepare_admit(const RadBatch* batch){
     if(const int first=terminal_status();first<0)return first;
     if(!expert_prepare_)return RAD_OK;
     if(expert_prepare_->fatal<0)return remember_model_failure(expert_prepare_->fatal,"current expert prepare is already fatal");
-    if(!batch||world_size_!=1||lane_!=0||batch->n_spec!=0||batch->draft_pass!=0||batch->n_ahead!=0||stager_||xp_||tape_on_||rec_)return expert_prepare_fail(RAD_E_UNSUPPORTED,"current expert prepare requires TP1,lane0,eager,no speculation/ahead/stager/XP");
+    if(cache_prepare4_){
+        if(!batch||!cache_prepare4_->runtime_admitted()||world_size_!=4||rank_<0||rank_>=4||lane_!=0||batch->n_spec||batch->draft_pass||batch->n_ahead<0||batch->n_ahead>128||
+           stager_||xp_||tape_on_||rec_||cache_prepare4_->check_batch(*batch)<0)
+            return expert_prepare_fail(RAD_E_UNSUPPORTED,"GLM TP4 cache requires truthful bounded batch metadata and eager single-lane model pass");
+    }else if(!batch||world_size_!=1||lane_!=0||batch->n_spec!=0||batch->draft_pass!=0||batch->n_ahead!=0||stager_||xp_||tape_on_||rec_)return expert_prepare_fail(RAD_E_UNSUPPORTED,"current expert prepare requires TP1,lane0,eager,no speculation/ahead/stager/XP");
     return RAD_OK;
 }
 void Ctx::expert_prepare_begin(){
@@ -126,10 +139,17 @@ int Ctx::expert_prepare(const RadExpertPrepare* request){
         if(sum!=live||offsets[d.local_experts]!=live)return fail(RAD_E_INVAL,"current route live count mismatch");
         for(int64_t i=live;i<routes;++i)if(sorted[i]!=-1)return fail(RAD_E_INVAL,"current dropped-padding sorted tail is not -1");
         for(int64_t i=0;i<routes;++i)if(bool(state.seen[size_t(i)])!=(ids[i]>=0))return fail(RAD_E_INVAL,"current live slot omitted/negative padding included");
+        if(cache_prepare4_){
+            if(r.first_row!=0||r.rows!=r.total_rows||r.total_rows!=batch_->n_tok)return fail(RAD_E_UNSUPPORTED,"GLM TP4 cache requires exactly one truthful route slice per layer");
+            const int entered=cache_prepare4_->enter(d.layer,r.first_row,r.rows,{ids,size_t(routes)});
+            if(entered<0)return fail(entered,"GLM TP4 exact canonical route agreement failed");
+        }
         ++state.generation;bool changed=false;
         ExpertPrepareView view{program_,this,d,map.entries,batch_->step,r.total_rows,r.first_row,r.rows,state.generation,cur_stream(),tensors[0],tensors[1],tensors[2],tensors[3],{counts,size_t(d.local_experts)},{offsets,size_t(d.local_experts+1)},{sorted,size_t(routes)},{ids,size_t(routes)}};
         ++state.callbacks;rc=state.owner->prepare(view,&changed);if(rc<0)return fail(rc,"current expert prepare owner refused before GU");
-        if(changed){sync_residency();}
+        if(cache_prepare4_){rc=state.owner->complete_prepared(view);if(rc<0)return fail(rc,"GLM TP4 actual upload completion failed before READY");}
+        if(changed){sync_residency();} // table invalidation, NOT the DMA fence
+        if(cache_prepare4_){rc=cache_prepare4_->ready(RAD_OK);if(rc<0)return fail(rc,"GLM TP4 READY agreement failed before GU");}
         return RAD_OK;
     }catch(const std::bad_alloc&){return fail(RAD_E_NOMEM,"current expert prepare allocation failure");}catch(...){return fail(RAD_E_STATE,"current expert prepare owner exception");}
 }

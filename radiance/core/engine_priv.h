@@ -11,6 +11,7 @@
 #pragma once
 #include "engine.h"
 #include "engine_tiny_native.h"
+#include "runtime/cache_prepare4_session.h"
 #include "place/native_backing_owner.h"
 
 #include "mem/pools.h"

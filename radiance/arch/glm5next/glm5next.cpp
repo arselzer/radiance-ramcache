@@ -357,6 +357,10 @@ static int layer(RadBuilder* b, Model& m, Layer& lay, Names& nm, int l, bool dra
         s.shared = nm.ckpt("%s.mlp.shared_experts", pre);
         s.cfg.n_expert = s.cfg.n_expert_all = 288;
         s.cfg.top_k = 8;
+#if defined(RAD_GLM_MAIN_TP4_CACHE_EXPERIMENTAL)
+        // Explicit separate module only. No dense/MTP/vision route hook.
+        if(!draft&&l>=3&&l<=44)s.cfg.route_prepare=1;
+#endif
         s.cfg.n_ff_exp = s.cfg.n_ff_shared = GlmTp::expert_width(g.world);
         s.cfg.rows = g.max_tok;
         s.cfg.sigmoid_router = 1;
@@ -407,6 +411,13 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     if (!b || !meta || !ctx || ctx->is_draft || ctx->rank < 0 || ctx->rank >= MAX_RANKS)
         return RAD_E_INVAL;
     const int world = ctx->world_size ? ctx->world_size : 1;
+#if defined(RAD_GLM_MAIN_TP4_CACHE_EXPERIMENTAL)
+    if(world!=4||ctx->max_tok<1||ctx->max_tok>128||ctx->max_seqs!=1||ctx->max_spec||ctx->max_enc_patches||ctx->is_draft)
+        return RAD_E_UNSUPPORTED;
+    if(!rad_core_glm_main_tp4_cache_profile_version||!rad_require_glm_main_tp4_cache_fail_stop||
+       rad_core_glm_main_tp4_cache_profile_version()<RAD_GLM_MAIN_TP4_CACHE_PROFILE_VERSION)return RAD_E_ABI;
+    RAD_ARCH_TRY(rad_require_glm_main_tp4_cache_fail_stop(b));
+#endif
     if (!GlmTp::world_ok(world)) {
         fprintf(stderr, "radiance: glm5next: --tp %d; the head, KDA channel and expert splits of "
                         "this plugin are built for 1, 2, 4 or 8 ranks\n", world);

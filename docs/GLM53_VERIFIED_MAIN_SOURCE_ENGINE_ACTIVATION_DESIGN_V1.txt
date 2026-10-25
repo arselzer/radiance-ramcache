@@ -1,0 +1,307 @@
+Actual GLM main TP4 verified-source / Engine activation: narrow next slice
+SOURCE DESIGN ONLY, 2026-10-25. No frozen Core/prototype edits, build, payload
+packing/read, device query, model execution, service change or activation here.
+
+1. Shortest first run
+
+Use existing glm5next math and the separate experimental glm5next_cache module,
+GlmMainTp4AqlFailStopV1, TP4/seq1/max_tok1/spec0, exact wire, no XP/stager/tape,
+no vision/LoRA/prefix/checkpoints/profile ops. max_ctx remains an explicitly
+quoted request; a small first context reduces first-start scope. A later262K
+context uses the SAME content bundle, but must pass its own actual KV/arena/fit.
+max_tok1 is already within the first slice's1..128 profile. It makes prefill
+very slow and is deliberately a first correctness setting.
+
+Use an EMPTY fixed-expert resident list initially. NativeInventory bind accepts
+all12096 routed units/rank as owned with no resident requirement. NativeOwner
+skips owned experts while snapshotting fixed original weights. Thus ordinary
+weights stay resident, every routed expert comes from the real cache, and
+bootstrap is vacuous plus explicit trim/audit. Do not impose expert0/layer.
+The adapter may later accept a checked explicit nonempty resident mask: ordinary
+Loader loads those exact members, independent native-record member comparisons
+after successful completion verify them, then bootstrap cache leases are trimmed.
+Do not compare uninitialized canonical record padding. This actual GLM layout
+has contiguous four-member payload; guarded consumer tails are a separate owner.
+
+No conversion is currently justified for attn_kv_b. Parent's actual pinned-header
+inventory proves ALL11 main projections (layers3,7,...43) are BF16[32768,512],
+33554432B each, no scales; physical layer45 is MTP and excluded. Earlier stock
+metadata's BF16 cast is not evidence of an actual encoding mismatch. Require
+actual CheckpointSources outputs to equal declared encodings for EVERY ordinary
+source. Keep the existing loader guard. Only an observed importer contradiction
+would justify another patch; do not add decode/materialization preemptively.
+
+2. Exact assembler boundary and generation
+
+Current evolving external source: glm53-complete-main-store-assembler-prototype,
+bundle_records.{h,cpp}. It is DATA assembly only, not a runtime factory.
+Complete mode:48384 records (4*42*288),168 rank/layer shards,3342336B/record,
+161715585024B total =150.609375GiB. Subset mode is exactly8 records/8 shards
+(layer3/e0 and44/e1 on each rank), always NONREADY. The current strict verify()
+requires independently retained PublishedBundle Capture; it cannot reopen an
+arbitrary persisted bundle for a later Engine process. That missing reopen is
+an explicit required patch, not a positive existing capability.
+
+The common complete bundle ID hashes pinned72-file content identities, format/
+layout, ordered key/spec/payload-checksum catalog and finalized shard-manifest
+set. It excludes runtime ctx/batch, local resident masks, paths/inodes/stamps.
+Per-component six-raw-tensor IDs and per-rank record checksums remain separate.
+Session model_generation is a separately owned nonzero Engine-instance generation,
+created once centrally after all rank admissions; it is not a per-rank CRC or a
+caller-chosen scalar. Session source_generation is the verified complete bundle ID.
+Do not use the one-expert selected_raw_bundle ID as NativeInventory generation.
+Do not insert the final ID into already-hashed manifests (no hash circularity).
+FNV checksums are integrity/identity witnesses, not authentication. The producer
+source proof is trusted parent SHA/hash evidence; C++ does not claim to have
+computed those full cryptographic source hashes.
+
+3. A strict actual-profile Reader, not synthetic-parser relaxation
+
+Add a small actual-profile BundleReader/VerifiedMainBundle in a NEW isolated
+package after assembler freeze. Recompile its actual-geometry helper against
+ONE matching research Core when used with Program/Plan. Stock writer/archive
+private Program/Plan ABI must never be linked into a different research Core;
+the existing versioned files/PODs are the boundary.
+
+Proposed narrow internal API (names provisional, no arbitrary resolver callback):
+  GlmMainBundleRequest{root, expected_complete_bundle_id, source_proof_path}
+  VerifiedMainBundle::open(request, actualCheckpoint, caps, shared_ptr<const>*)
+  VerifiedMainBundle::bind_rank(actualCheckpoint,actualCheckpointSources,
+      const Program&,const stableMetadataPlan&, rankCaps, VerifiedRankMain*)
+Outputs are private immutable owned authorities, assigned only on success.
+No public mutable JSON/boolean/caller-built descriptor grants verified status.
+The expected complete ID is retained from the independently verified producer
+receipt/request. Initial implementation may require the same source root/current
+proof stamps as the producer; portable source-proof rebinding is not required.
+No Program/Checkpoint borrow may escape without explicit Engine owner lifetime.
+
+open must cap and verify the root bundle/proof first; require COMPLETE mode,
+expected nonzero common ID, exact world4/domain/168 leaves, pinned source content,
+closed format profile, source-proof complete transcript/current immutable source
+witnesses, all manifest hashes and ordered catalog checksum. Open the FIXED root
+source-proof.json; never follow arbitrary manifest proof paths. Parse one bounded
+layer manifest at a time; verify all288 records and their payload checksum/extent/
+member boundaries using one bounded window. Capture named directory/manifest/
+segment stamps and re-audit before publication. No publication from incomplete
+source, mixed roots, foreign ranks, duplicates, missing layers or subsets.
+The initial actual Reader may stream the complete150.6GiB once at startup.
+That scan is startup validation, not HOT cache population or a speed claim.
+
+bind_rank runs actual full source/layout geometry ONCE/rank, using the same
+Engine-opened Checkpoint and same CheckpointSources resolved objects. Match exact
+record key, actual unit/member/name/source/encoding/dtype/layout/shard/rowparts/
+physical cuts/spec checksum, and native payload checksum. Four compact immutable
+rank-layout templates can share numeric geometry; exact per-record name/source
+binding is still checked from the actual graph. Retain normalized POD record rows,
+small shared layout templates and strings actually required, not W WeightInfo
+clones or full parsed JSON trees. Discard geometry-construction scratch after bind.
+Ordinary Loader may publish ptr/tier fields legitimately; audits compare source/
+layout authority, while NativeInventory keeps its existing exact mutation guards.
+
+4. Reuse cache mechanics through one explicit actual-profile admission path
+
+Reuse RankNativeStore's real ProcessBudget/Token/FD ledger, immutable generation,
+weak/HOT cells, whole-missing-union COLD reservation, leases, serialized acquire,
+selected stamp checks, payload checksum checks, bounded FD LRU, trim/close and
+failure sealing. Generic limits already support world4,12096 records/rank,
+42 shards/rank and3342336B records when explicitly capped.
+
+DO NOT feed these manifests into native::Reader or widen its synthetic schema.
+Existing RankNativeStore::open unconditionally calls that closed Reader.
+New narrow open_glm_main_verified accepts ONLY the opaque VerifiedRankMain
+constructed above. It fills the same internal normalized Generation using
+precharged actual metadata, verified stamps and a checked canonical mapping.
+Keep old generic/synthetic open and its existing regressions unchanged.
+No caller-made spans/boolean/normalized-POD constructor is a verification bypass.
+
+Avoid two existing O(N^2) setup paths: generic open linearly searches Plan.units
+per record, and generic bind(key) is linear, which P3 calls once per catalog row.
+For the closed actual profile, use the once/rank quote's ordinal->actual unit
+mapping and canonical ordinal=(layer-3)*288+expert. Produce opaque provider
+handles in one checked linear pass, still checking each exact key/rank. Do not
+call whole-graph quote, capture_unit or linear key search12096 times.
+
+The current P3 ShardedNativeSource is closed to TP1/E4/8layers/32records/3shards,
+small HOT/COLD and request<=3. Preserve it. New GlmMainNativeSource implements
+actual NativeRecordSource and reuses its PREALLOCATION/lifetime pattern, not its
+hard constants. Owned-only descriptor IDs map to immutable provider handles.
+Descriptors use COMMON complete bundle ID, actual per-rank key/member geometry,
+and rank-local payload checksum. NativeInventory copies compact authority as it
+already does. acquire preallocates holder/output before provider commit, returns
+exact immutable first-occurrence leases, and keeps provider/budget/root authority
+alive through final leases after close. No live source/checkpoint/raw map is
+substituted by a shape-only descriptor.
+
+5. Minimal Engine patch and ownership order
+
+New internal GlmMainTp4VerifiedSourceFactory (the existing Session friend name)
+owns this capability path. New private research request/create API names the
+complete bundle/expected ID/cache caps. It does not add a serving CLI option or
+change existing Engine defaults. A missing request/factory remains the current
+cold refusal before declaration/opaque init/Plan/Pools/model payload.
+
+Keep existing Engine ckpt_ and ckpt_src_ as the ONE source owner/cache. Do not
+open another Checkpoint or resolve against a second cache. Factory borrows these
+objects only while Engine owns them; source/lease normalized authorities own
+their own immutable bundle data. Engine explicitly closes adapters before graph/
+source destruction, so no provider operation can dereference a dead Program.
+Each private cache state owns four STABLE metadata Plans separately from final
+Rank::plan; NativeInventory/Reader borrows must not refer to temporaries or to a
+Plan overwritten by Native planning. Source cache objects remain the same after
+ordinary ptr publication. Source lease bytes/key/accounting remain valid after
+source close; no post-close API may use borrowed Program pointers.
+
+Concrete startup sequence:
+ a. Latch attempted/terminal on the actual private Engine state before source
+    work; same-Engine retry after failed/retired start refuses without new work.
+    Preflight request/source/metadata/cache caps; existing metadata/vocab/plugins.
+ b. Actual declare on all4 ranks with instances=false, including REAL Sampler
+    declaration and PERSIST sampler.tokens. Keep original GLM math. Refuse any
+    nontrivial/unsupported direct checkpoint source or device-resolution hole.
+    No opaque collective instance initialization before source/fit admission.
+ c. Pure all_vram metadata layouts (uncapped placement budget is layout-only,
+    no physical fit assertion/no Pools); strict bundle bind once/rank; all12096
+    expert descriptors/rank; empty initial resident list; owned coverage exact.
+ d. Bind all4 actual AQL NativeInventories and derive final Native plans against
+    actual rank VRAM budgets, ordinary static weight cost, guarded consumer/
+    landing footprints, actual arena/runtime/Sampler/KV/state and headroom.
+    Session source admission is allowed ONLY after all4 complete sources,
+    graph/layout identity, Native capabilities and budgets are verified. It is
+    not EngineReady or loaded-weight proof. No rank is externally published.
+ e. Create engine-owned per-rank compute streams BEFORE Mover/native Owner/Ctx;
+    each is created under actual rad_dev_set(device), checked and precharged.
+    TinyStream/TinyBudget are device0/192MiB closed helpers and are NOT widened
+    or reused as world4 capabilities. Mover owns its transfer stream separately.
+ f. Initialize actual kernel instances on all4 rank threads, then configure
+    typed Native Pools/Mover and load ordinary weights. Source-admitted startup
+    GPU/collective failures fail-stop immediately before peer joins/drains or
+    formatting. initialize_program_instances currently formats before reporting
+    a failed init; add a narrow early-negative hook for this profile BEFORE that
+    formatting, preserve default helper behavior. Catch worker exceptions with
+    the same fixed process-stop policy; do not wait on peers after first failure.
+ g. Actual Engine::load_weights validates source encoding and real weight_share
+    BEFORE typed owned omission and before destination publication. All ordinary
+    weights still use actual fill/relayout and actual loaded destinations. Real
+    successful upload completion precedes Owner fixed-baseline capture.
+ h. Empty resident bootstrap: audit and trim, no synthetic copy/padding claims.
+    Optional later residents: load exact ordinary resident member spans, compare
+    checked native-record members after successful real drain, then trim/audit.
+ i. Persistent NativeBackingOwner per rank before Ctx; supply borrowed compute
+    stream + its exact Session rank binding + actual bounded prepare limits.
+    Initialize real KV groups/state and bind actual pools (no tiny sentinel trick
+    for GLM attention); actual Ctx/Sampler/StepSlot/EOG staging lives through use.
+ j. Final source/Native authority/budget audit, exact4rank completion and explicit
+    transportReady publication. Model/sampler step is a SEPARATE later gate;
+    neither a complete DATA bundle nor source-admitted Session implies that pass.
+
+Sequential ordinary Loader (parent approved): extract/reuse the existing narrow
+fill/share/weight-plane/widen/selected relayout helper, not an entire copied loader.
+After typed omissions, prewalk ALL actual ordinary jobs across4 ranks. Derive
+max input, max nonidentity output, column scratch<=64MiB, counts and destinations;
+reserve reusable owned buffers BEFORE allocation. No unbounded input fallback.
+Run one job at a time, on each rank's OWNED compute stream, with checked device
+binding. Call real rad_memcpy_async then successful rad_stream_sync BEFORE any
+source/output buffer reuse/free. On an ambiguous returned-negative copy or sync,
+fail-stop before release; do not use a negative sync as retirement evidence.
+This reuses mathematical materialization behavior and avoids expanding the tiny
+2worker/device0 Bounce pipeline to TP4. No new loader workers/queues/uplinks are
+needed. Startup speed is secondary and does not affect steady inference speed.
+
+6. Teardown / live-runtime audit closure
+
+Current normal destructor drains mover then quiesces record_owner only, and
+clears ranks without explicit NativeBackingOwner close_after_context_shutdown.
+That is insufficient once this profile can activate. New private shutdown must:
+stop_admission BEFORE stopping/barrier abort; join parked rank/scheduler workers;
+for every actual device prove successful compute+transfer retirement; quiesce
+NativeOwner (retain leases on failure); shut down Ctx/WTAB; close NativeOwner
+session after Ctx; step_state_fini while its backing survives; close sources;
+release Owners/ranks/metadata Plans; close owned streams/Pools; release source
+Checkpoint/cache last. Existing accounting/leases may retain shared budget/root
+metadata after close without borrowed Program use. Negative drain/device bind
+is process-stop, not a fall-through destructor. Default/Tiny paths unchanged.
+Install a narrowly scoped admitted-profile Mover retirement guard BEFORE its
+first async operation/partial initialization (borrowed Session binding outlives
+Mover). Its destructor/explicit close must check real device binding and mover/
+compute retirement before event/backing release; the current generic Mover
+destructor is not a checked TP4 guard. Do not widen TinyStream device0 policy.
+
+Before actual model execution, fix inherited step_loop initial rad_dev_set
+failure to fail-stop for this admitted profile BEFORE log/continued batch work.
+Audit all new profile GPU-start/rank/sampler/collect/stop paths similarly. Preserve
+frame-active-through-final-collect, truthful n_ahead with NO real issue-ahead,
+all42 prepare/READY votes, immediate first-error exit88 before Owner drains,
+and exactly-once current-frame completion already in the frozen slice.
+
+7. Ownership/budget contract and useful exact arithmetic
+
+Do not reuse tiny192MiB or call old HOST max_units/records constants full-GLM caps.
+One parent-compiled quote uses ACTUAL POD/private sizeof and actual graph counts;
+no mirrored private structs or whole-W snapshot. Named owners/reservations:
+ - Existing source Checkpoint/maps/cache/vocab and four actual Programs/Samplers:
+   report actual metadata counts/retained storage and known platform exclusions.
+ - Added full-bundle catalog/templates/stamps and one-layer parser scratch;
+   no retained full parsed JSON/one-spec-per-record strings unless charged.
+ - Per-rank provider Generation/cells/opaque handles/FD metadata, descriptor array,
+   NativeInventory compact authority and final/stable metadata Plans.
+ - Independent per-rank HOT cap plus COLD whole-missing-union cap; ProcessBudget
+   owns aggregate rank/cache/FD reservations, leases retain the same token.
+ - Native guarded DEVICE + pinned landing backings via NativeInventory/Pools,
+   ordinary resident weights, actual arenas/scratch/WTAB, Sampler/StepSlot/EOG,
+   actual KV/state committed/VA budgets and selected backend stream/event owners.
+ - One sequential-loader input/output/column scratch plus its source-fill internal
+   scratch; release before steady runtime, and never double bill its shared alias.
+ - Kernel-instance/vendor/driver/stdlib/OS page-cache/RSS costs are explicit
+   measured/excluded margins, not silently called controlled requested bytes.
+   Existing backend process-global credits stay separately owned/no double use.
+Capacity reservations can be cross-checked by Provider/Pools and Engine but are
+charged ONCE in the whole requested-owner ledger. host_pool_mib remains0 for
+Native planning; HOT/COLD RAM cache is a separately named bounded owner.
+Before a positive payload allocation/Ready, refuse if any named added owner or
+actual whole fit fails. Parent compiles/measures real sizeof/counts/allocator
+witnesses, not just this design arithmetic; no positive full-fit claim here.
+
+Actual parent reference graph (stock metadata, BEFORE real Sampler/experimental
+hook declaration):49657 weights incl sentinel,49656 used,12144 units/rank;
+12096 main units/48384 main weight views,1272 ordinary views/48 ordinary units.
+Total stored44659282296B minus main40428896256B =4230386040B ordinary stored output
+(~3.94GiB)/rank, BEFORE alignment/Sampler/KV/arena/backend. Source actual main
+metadata quote is~11.46MB temporary/rank and can be discarded after bind. Fresh
+experimental graph must rederive counts; do not hardcode stock sampler omissions.
+
+With no residents, ONE actual Native class and top8:
+  S=min(288,max_tok*8)
+  stride3342336; region bytes=stride+4096; allocation bytes=stride+16384
+  COLD floor=S*stride
+  DEVICE native=(S+1)*(stride+16384)
+  pinned landing=the same independently owned amount
+max_tok1 =>S8,COLD26738688B=25.5MiB, each guarded backing30228480B(~28.83MiB)/rank.
+max_tok128 =>S288,COLD962592768B=918MiB, each guarded backing970670080B/rank.
+HOT is additional and must not consume COLD/landing/ordinary-weights credits.
+Do not sum aliased source/device pointer views as separate payload allocations.
+
+8. Patch order / review boundaries
+
+A. Freeze/validate assembler DATA contract first. New strict reopen/normalized
+   actual catalog + rank geometry binding, including subset refusal and linear
+   setup. Positive complete-source gate remains pending until REAL full output
+   exists and parent verifies it. No invented complete metadata/payload fixture.
+B. New actual-profile provider admission + GlmMainNativeSource, reusing cache/
+   leases/FD mechanics. Bounded subset/component cache tests can remain NONREADY;
+   only actual complete bundle can make factory source capability positive.
+C. NEW Core fork for private Engine request/state/factory + metadata-first
+   declaration, actual Native plans/Pools, sequential ordinary loader, owning
+   streams/Owner/Ctx and strict cleanup. Keep current frozen Core untouched.
+   Root reviews/compiles matching whole Core, unchanged regressions/all3 modes.
+D. Later parent-owned approved idle window: actual complete-source verification,
+   actual per-rank fit/startup transport; then separately tiny actual text pass,
+   byte/source/route/consumer correctness and failure containment. No service,
+   production switch or restart is implicit in these source steps.
+
+After correctness, measure real cache hits/misses/evictions/bypasses/bytes/read
+syscalls and phase times. Existing admission is plain LRU; layer-wide sweeps can
+thrash when the nonresident domain exceeds HOT RAM. Never subtract HOT capacity
+once and call that repeated-prefill disk traffic. Subsequent work may preserve
+hot decode working sets via prefill-aware bypass/admission, larger actual batch
+sizes and coalesced reads, each backed by counters; none is needed to open the
+first correctness gate, and no throughput promise follows from capacity alone.

@@ -1,0 +1,21 @@
+--- packer-v3/CMakeLists.txt
++++ assembler/CMakeLists.txt
+@@ -41,3 +41,18 @@
+ # No CTest, Core rebuild, model allocation, queue/launch target, install or serving change.
+ 
+ target_link_options(glm53_real_main_record_check PRIVATE "LINKER:--wrap=pread" "LINKER:--wrap=pwrite" "LINKER:--wrap=renameat2" "LINKER:--wrap=fstat")
++
++# bundle_records.cpp includes the byte-identical v3 main_records.cpp primitives;
++# never list main_records.cpp a second time in this target.
++add_executable(glm53_main_store_assembler assemble_store.cpp bundle_records.cpp geometry/main_metadata.cpp)
++target_compile_features(glm53_main_store_assembler PRIVATE cxx_std_20)
++target_compile_definitions(glm53_main_store_assembler PRIVATE RAD_HAVE_HIP=1)
++target_compile_options(glm53_main_store_assembler PRIVATE -Wall -Wextra -Wpedantic -fno-fast-math -ffp-contract=off)
++target_include_directories(glm53_main_store_assembler PRIVATE "${RADIANCE_SOURCE}" "${RADIANCE_SOURCE}/core"
++  "${RADIANCE_SOURCE}/abi" "${RADIANCE_SOURCE}/vendor" "${RADIANCE_BUILD}/rad_include")
++target_link_libraries(glm53_main_store_assembler PRIVATE
++  "-Wl,--whole-archive" "${RADIANCE_BUILD}/core/librad_core.a" "-Wl,--no-whole-archive"
++  "${RADIANCE_BUILD}/vendor/librad_vendor_llama.a" "${RADIANCE_BUILD}/vendor/librad_vendor_httplib.a"
++  ${PLAN_HIP_LIBRARY} ${PLAN_HSA_LIBRARY} Threads::Threads ${CMAKE_DL_LIBS})
++target_link_options(glm53_main_store_assembler PRIVATE "LINKER:--wrap=pread" "LINKER:--wrap=pwrite" "LINKER:--wrap=renameat2" "LINKER:--wrap=fstat")
++set_target_properties(glm53_main_store_assembler PROPERTIES ENABLE_EXPORTS ON)

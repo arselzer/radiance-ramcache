@@ -1,0 +1,66 @@
+[ 25%] Building CXX object CMakeFiles/glm53_main_store_assembler.dir/bundle_records.cpp.o
+[ 50%] Building CXX object CMakeFiles/glm53_main_store_assembler.dir/assemble_store.cpp.o
+In file included from /home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-complete-main-store-assembler-prototype/assemble_store.cpp:6:
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-complete-main-store-assembler-prototype/stock/stock_plan.cpp: In function ‘{anonymous}::RankQuote {anonymous}::declare_rank(rad::Registry&, const rad::Plugin&, rad::Checkpoint&, rad::CheckpointSources&, const RadModelMeta&, const RadDeviceProps&, int, const Options&)’:
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-complete-main-store-assembler-prototype/stock/stock_plan.cpp:78:82: warning: unused parameter ‘checkpoint’ [-Wunused-parameter]
+   78 | RankQuote declare_rank(Registry& registry,const Plugin& architecture,Checkpoint& checkpoint,CheckpointSources& sources,
+      |                                                                      ~~~~~~~~~~~~^~~~~~~~~~
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-complete-main-store-assembler-prototype/assemble_store.cpp: In function ‘int __wrap_renameat2(int, const char*, int, const char*, unsigned int)’:
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-complete-main-store-assembler-prototype/assemble_store.cpp:104:322: warning: ignoring return value of ‘ssize_t write(int, const void*, size_t)’ declared with attribute ‘warn_unused_result’ [-Wunused-result]
+  104 | extern "C" int __wrap_renameat2(int a,const char* from,int b,const char* to,unsigned flags){if(fault==4&&segment_written){fault=0;++triggers;if(::mkdir(to,0700))return -1;const auto marker=std::string(to)+"/marker";const int fd=::open(marker.c_str(),O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC,0600);if(fd<0)return -1;(void)::write(fd,"original",8);::close(fd);}return __real_renameat2(a,from,b,to,flags);}
+      |                                                                                                                                                                                                                                                                                                                           ~~~~~~~^~~~~~~~~~~~~~~~~
+[ 75%] Building CXX object CMakeFiles/glm53_main_store_assembler.dir/geometry/main_metadata.cpp.o
+In file included from /home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-complete-main-store-assembler-prototype/bundle_records.cpp:3:
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-complete-main-store-assembler-prototype/main_records.cpp: In function ‘uint64_t glm53::main_records::{anonymous}::stream_hash(int, uint64_t, uint64_t, std::vector<std::byte>&, bool)’:
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-complete-main-store-assembler-prototype/main_records.cpp:46:5: warning: this ‘if’ clause does not guard... [-Wmisleading-indentation]
+   46 |     if(zero)need(std::all_of(buffer.begin(),buffer.begin()+n,[](auto b){return b==std::byte{0};}),Status::checksum,"nonzero canonical record padding");result=hash(result,buffer.data(),n);done+=n;}return result;}
+      |     ^~
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-complete-main-store-assembler-prototype/main_records.cpp:46:152: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘if’
+   46 |     if(zero)need(std::all_of(buffer.begin(),buffer.begin()+n,[](auto b){return b==std::byte{0};}),Status::checksum,"nonzero canonical record padding");result=hash(result,buffer.data(),n);done+=n;}return result;}
+      |                                                                                                                                                        ^~~~~~
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-complete-main-store-assembler-prototype/main_records.cpp: In function ‘void glm53::main_records::{anonymous}::padding(int, const glm53::main_records::RecordInfo&, std::vector<std::byte>&)’:
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-complete-main-store-assembler-prototype/main_records.cpp:76:5: warning: this ‘if’ clause does not guard... [-Wmisleading-indentation]
+   76 |     if(at>previous)(void)stream_hash(fd,info.offset+previous,at-previous,buffer,true);previous=at+bytes;}
+      |     ^~
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-complete-main-store-assembler-prototype/main_records.cpp:76:87: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘if’
+   76 |     if(at>previous)(void)stream_hash(fd,info.offset+previous,at-previous,buffer,true);previous=at+bytes;}
+      |                                                                                       ^~~~~~~~
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-complete-main-store-assembler-prototype/main_records.cpp: At global scope:
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-complete-main-store-assembler-prototype/main_records.cpp:81:8: warning: ‘glm53::main_records::Capture’ has a field ‘std::vector<glm53::main_records::{anonymous}::FileProof> glm53::main_records::Capture::files’ whose type has internal linkage [-Wsubobject-linkage]
+   81 | struct Capture {
+      |        ^~~~~~~
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-complete-main-store-assembler-prototype/main_records.cpp:81:8: warning: ‘glm53::main_records::Capture’ has a field ‘std::array<glm53::main_records::{anonymous}::Member, 4> glm53::main_records::Capture::members’ whose type has internal linkage [-Wsubobject-linkage]
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-complete-main-store-assembler-prototype/main_records.cpp:203:20: warning: ‘glm53::main_records::MainReader::Impl’ has a field ‘glm53::main_records::{anonymous}::Fd glm53::main_records::MainReader::Impl::directory’ whose type uses the anonymous namespace [-Wsubobject-linkage]
+  203 | struct MainReader::Impl {Fd directory,manifest,segment;FileStamp directory_stamp,manifest_stamp,segment_stamp;std::shared_ptr<const Capture> capture;Limits limits;};
+      |                    ^~~~
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-complete-main-store-assembler-prototype/main_records.cpp:203:20: warning: ‘glm53::main_records::MainReader::Impl’ has a field ‘glm53::main_records::{anonymous}::Fd glm53::main_records::MainReader::Impl::manifest’ whose type uses the anonymous namespace [-Wsubobject-linkage]
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-complete-main-store-assembler-prototype/main_records.cpp:203:20: warning: ‘glm53::main_records::MainReader::Impl’ has a field ‘glm53::main_records::{anonymous}::Fd glm53::main_records::MainReader::Impl::segment’ whose type uses the anonymous namespace [-Wsubobject-linkage]
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-complete-main-store-assembler-prototype/bundle_records.cpp: In member function ‘glm53::main_bundle::Status glm53::main_bundle::Assembler::append_rank(rad::Checkpoint&, const rad::CheckpointSources&, const rad::Program&, const rad::Plan&, std::string*)’:
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-complete-main-store-assembler-prototype/bundle_records.cpp:253:5: warning: this ‘if’ clause does not guard... [-Wmisleading-indentation]
+  253 |     if(status!=Status::ok)p.fatal=true;return status;
+      |     ^~
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-complete-main-store-assembler-prototype/bundle_records.cpp:253:40: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘if’
+  253 |     if(status!=Status::ok)p.fatal=true;return status;
+      |                                        ^~~~~~
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-complete-main-store-assembler-prototype/bundle_records.cpp: In member function ‘glm53::main_bundle::Status glm53::main_bundle::Assembler::finish(glm53::main_bundle::PublishedBundle*, std::string*)’:
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-complete-main-store-assembler-prototype/bundle_records.cpp:256:5: warning: this ‘if’ clause does not guard... [-Wmisleading-indentation]
+  256 |     if(!p_||p_->finished||p_->fatal)return Status::invalid;auto& p=*p_;
+      |     ^~
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-complete-main-store-assembler-prototype/bundle_records.cpp:256:60: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘if’
+  256 |     if(!p_||p_->finished||p_->fatal)return Status::invalid;auto& p=*p_;
+      |                                                            ^~~~
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-complete-main-store-assembler-prototype/bundle_records.cpp:285:5: warning: this ‘if’ clause does not guard... [-Wmisleading-indentation]
+  285 |     if(status!=Status::ok)p.fatal=true;return status;
+      |     ^~
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-complete-main-store-assembler-prototype/bundle_records.cpp:285:40: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘if’
+  285 |     if(status!=Status::ok)p.fatal=true;return status;
+      |                                        ^~~~~~
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-complete-main-store-assembler-prototype/geometry/main_metadata.cpp: In function ‘void glm53::main_metadata::{anonymous}::selected_device_layouts(const rad::Program&, const rad::Plan&, std::vector<unsigned char>&)’:
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-complete-main-store-assembler-prototype/geometry/main_metadata.cpp:145:9: warning: this ‘if’ clause does not guard... [-Wmisleading-indentation]
+  145 |         if(!h)continue;need(h<p.weights.size(),RAD_E_INVAL,"actual op references outside Program weights");const auto& w=p.weights[h];
+      |         ^~
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-complete-main-store-assembler-prototype/geometry/main_metadata.cpp:145:24: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘if’
+  145 |         if(!h)continue;need(h<p.weights.size(),RAD_E_INVAL,"actual op references outside Program weights");const auto& w=p.weights[h];
+      |                        ^~~~
+[100%] Linking CXX executable glm53_main_store_assembler
+[100%] Built target glm53_main_store_assembler

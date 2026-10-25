@@ -1,0 +1,645 @@
+[  0%] Building CXX object vendor/CMakeFiles/rad_vendor_httplib.dir/cpp-httplib/httplib.cpp.o
+[  0%] Building CXX object vendor/CMakeFiles/rad_vendor_llama.dir/llama/src/unicode.cpp.o
+[  0%] Building CXX object vendor/CMakeFiles/rad_vendor_llama.dir/llama/src/unicode-data.cpp.o
+[  0%] Building CXX object vendor/CMakeFiles/rad_vendor_llama.dir/llama/common/unicode.cpp.o
+[  0%] Building CXX object vendor/CMakeFiles/rad_vendor_llama.dir/llama/common/jinja/lexer.cpp.o
+[  0%] Building CXX object vendor/CMakeFiles/rad_vendor_llama.dir/llama/common/jinja/parser.cpp.o
+[  0%] Linking CXX static library librad_vendor_httplib.a
+[  5%] Building CXX object vendor/CMakeFiles/rad_vendor_llama.dir/llama/common/jinja/runtime.cpp.o
+[  5%] Built target rad_vendor_httplib
+[  5%] Building CXX object vendor/CMakeFiles/rad_vendor_llama.dir/llama/common/jinja/string.cpp.o
+[  5%] Building CXX object vendor/CMakeFiles/rad_vendor_llama.dir/llama/common/jinja/value.cpp.o
+[  5%] Building CXX object vendor/CMakeFiles/rad_vendor_llama.dir/llama/common/jinja/caps.cpp.o
+[  5%] Building CXX object vendor/CMakeFiles/rad_vendor_llama.dir/llama/common/chat.cpp.o
+[  5%] Building CXX object vendor/CMakeFiles/rad_vendor_llama.dir/llama/common/chat-peg-parser.cpp.o
+[  5%] Building CXX object vendor/CMakeFiles/rad_vendor_llama.dir/llama/common/chat-auto-parser-generator.cpp.o
+[  5%] Building CXX object vendor/CMakeFiles/rad_vendor_llama.dir/llama/common/chat-auto-parser-helpers.cpp.o
+[  5%] Building CXX object vendor/CMakeFiles/rad_vendor_llama.dir/llama/common/chat-diff-analyzer.cpp.o
+[ 10%] Building CXX object vendor/CMakeFiles/rad_vendor_llama.dir/llama/common/peg-parser.cpp.o
+[ 10%] Building CXX object vendor/CMakeFiles/rad_vendor_llama.dir/llama/common/json-schema-to-grammar.cpp.o
+[ 10%] Building CXX object vendor/CMakeFiles/rad_vendor_llama.dir/llama/common/json-partial.cpp.o
+[ 10%] Building CXX object vendor/CMakeFiles/rad_vendor_llama.dir/llama/common/regex-partial.cpp.o
+[ 10%] Building CXX object vendor/CMakeFiles/rad_vendor_llama.dir/shim/llama_shim.cpp.o
+[ 10%] Linking CXX static library librad_vendor_llama.a
+[ 10%] Built target rad_vendor_llama
+[ 10%] Building CXX object core/CMakeFiles/rad_core.dir/util/rad_util.cpp.o
+[ 10%] Building CXX object core/CMakeFiles/rad_core.dir/util/stallwatch.cpp.o
+[ 15%] Building CXX object core/CMakeFiles/rad_core.dir/device/aql.cpp.o
+[ 15%] Building CXX object core/CMakeFiles/rad_core.dir/device/aql_code.cpp.o
+[ 15%] Building CXX object core/CMakeFiles/rad_core.dir/device/directio.cpp.o
+[ 15%] Building CXX object core/CMakeFiles/rad_core.dir/device/dispatch.cpp.o
+[ 15%] Building CXX object core/CMakeFiles/rad_core.dir/device/hip.cpp.o
+[ 15%] Building CXX object core/CMakeFiles/rad_core.dir/device/host.cpp.o
+[ 15%] Building CXX object core/CMakeFiles/rad_core.dir/plugin/bands.cpp.o
+[ 15%] Building CXX object core/CMakeFiles/rad_core.dir/plugin/loader.cpp.o
+[ 21%] Building CXX object core/CMakeFiles/rad_core.dir/plugin/schema.cpp.o
+[ 21%] Building CXX object core/CMakeFiles/rad_core.dir/plugin/select.cpp.o
+[ 21%] Building CXX object core/CMakeFiles/rad_core.dir/build/expert_prepare.cpp.o
+[ 21%] Building CXX object core/CMakeFiles/rad_core.dir/build/rad_bufplan.cpp.o
+[ 21%] Building CXX object core/CMakeFiles/rad_core.dir/build/rad_builder.cpp.o
+[ 21%] Building CXX object core/CMakeFiles/rad_core.dir/build/rad_graph.cpp.o
+[ 21%] Building CXX object core/CMakeFiles/rad_core.dir/build/startup.cpp.o
+[ 21%] Building CXX object core/CMakeFiles/rad_core.dir/build/tiny_component_quotes.cpp.o
+[ 21%] Building CXX object core/CMakeFiles/rad_core.dir/build/tiny_native_source/contract/fixture_writer.cpp.o
+[ 26%] Building CXX object core/CMakeFiles/rad_core.dir/build/tiny_native_source/contract/graph_quote.cpp.o
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/radiance-glm-main-tp4-cache-src/core/build/tiny_native_source/contract/graph_quote.cpp: In function ‘void glm53::engine_core_contract::{anonymous}::exact_maps(const rad::Program&, const std::vector<View>&)’:
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/radiance-glm-main-tp4-cache-src/core/build/tiny_native_source/contract/graph_quote.cpp:61:9: warning: this ‘for’ clause does not guard... [-Wmisleading-indentation]
+   61 |         for(int s=0;s<8;++s)need(m.src_index[s]==-1&&m.src_rows[s]==0&&(s<m.n_src||m.src[s]==nullptr),"exact full physical map slice extent");++n;
+      |         ^~~
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/radiance-glm-main-tp4-cache-src/core/build/tiny_native_source/contract/graph_quote.cpp:61:143: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘for’
+   61 |         for(int s=0;s<8;++s)need(m.src_index[s]==-1&&m.src_rows[s]==0&&(s<m.n_src||m.src[s]==nullptr),"exact full physical map slice extent");++n;
+      |                                                                                                                                               ^~
+[ 26%] Building CXX object core/CMakeFiles/rad_core.dir/build/tiny_native_source/contract/profile.cpp.o
+[ 26%] Building CXX object core/CMakeFiles/rad_core.dir/build/tiny_native_source/contract/shape_profile.cpp.o
+[ 26%] Building CXX object core/CMakeFiles/rad_core.dir/build/tiny_native_source/source_factory.cpp.o
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/radiance-glm-main-tp4-cache-src/core/build/tiny_native_source/contract/fixture_writer.cpp: In function ‘void glm53::engine_core_contract::{anonymous}::audit_file_payload(const std::filesystem::__cxx11::path&, uint64_t, const std::vector<glm53::engine_core_contract::TensorSpec>&)’:
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/radiance-glm-main-tp4-cache-src/core/build/tiny_native_source/contract/fixture_writer.cpp:40:9: warning: this ‘for’ clause does not guard... [-Wmisleading-indentation]
+   40 |         for(size_t i=0;i<n;++i)need(bytes[i]==expected_byte(s,at+i),RAD_E_FORMAT,"current physical file payload differs from inspected mapping contract");at+=n;}offset+=s.bytes;}
+      |         ^~~
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/radiance-glm-main-tp4-cache-src/core/build/tiny_native_source/contract/fixture_writer.cpp:40:155: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘for’
+   40 |         for(size_t i=0;i<n;++i)need(bytes[i]==expected_byte(s,at+i),RAD_E_FORMAT,"current physical file payload differs from inspected mapping contract");at+=n;}offset+=s.bytes;}
+      |                                                                                                                                                           ^~
+[ 26%] Building CXX object core/CMakeFiles/rad_core.dir/build/tiny_native_source/storage/candidate_native_record_store.cpp.o
+[ 26%] Building CXX object core/CMakeFiles/rad_core.dir/build/tiny_native_source/storage/native_source.cpp.o
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/radiance-glm-main-tp4-cache-src/core/build/tiny_native_source/storage/native_source.cpp: In member function ‘int glm53::engine_core_p3::ShardedNativeSource::bootstrap(int32_t, std::span<std::byte>)’:
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/radiance-glm-main-tp4-cache-src/core/build/tiny_native_source/storage/native_source.cpp:70:5: warning: this ‘if’ clause does not guard... [-Wmisleading-indentation]
+   70 |     if(in_facade)return RAD_E_STATE;Active active;std::lock_guard lock(operation_);if(bootstrap_done_||closed_||!target.data())return RAD_E_STATE;
+      |     ^~
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/radiance-glm-main-tp4-cache-src/core/build/tiny_native_source/storage/native_source.cpp:70:37: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘if’
+   70 |     if(in_facade)return RAD_E_STATE;Active active;std::lock_guard lock(operation_);if(bootstrap_done_||closed_||!target.data())return RAD_E_STATE;
+      |                                     ^~~~~~
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/radiance-glm-main-tp4-cache-src/core/build/tiny_native_source/storage/native_source.cpp: In member function ‘virtual int glm53::engine_core_p3::ShardedNativeSource::acquire(std::span<const unsigned int>, rad::NativeRecordBatch*)’:
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/radiance-glm-main-tp4-cache-src/core/build/tiny_native_source/storage/native_source.cpp:86:5: warning: this ‘if’ clause does not guard... [-Wmisleading-indentation]
+   86 |     if(in_facade)return RAD_E_STATE;Active active;std::lock_guard lock(operation_);if(!out||!bootstrap_done_||closed_||request.empty()||request.size()>3)return RAD_E_INVAL;
+      |     ^~
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/radiance-glm-main-tp4-cache-src/core/build/tiny_native_source/storage/native_source.cpp:86:37: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘if’
+   86 |     if(in_facade)return RAD_E_STATE;Active active;std::lock_guard lock(operation_);if(!out||!bootstrap_done_||closed_||request.empty()||request.size()>3)return RAD_E_INVAL;
+      |                                     ^~~~~~
+[ 26%] Building CXX object core/CMakeFiles/rad_core.dir/build/tiny_native_source/storage/physical_source_bridge.cpp.o
+[ 26%] Building CXX object core/CMakeFiles/rad_core.dir/build/tiny_native_source/storage/rank_native_store.cpp.o
+[ 26%] Building CXX object core/CMakeFiles/rad_core.dir/build/tiny_startup.cpp.o
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/radiance-glm-main-tp4-cache-src/core/build/tiny_startup.cpp: In member function ‘int rad::TinyBudget::take_aux_thread(rad::TinyTicket*)’:
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/radiance-glm-main-tp4-cache-src/core/build/tiny_startup.cpp:88:5: warning: this ‘if’ clause does not guard... [-Wmisleading-indentation]
+   88 |     if(st>=0)++state_.aux_threads;return st;
+      |     ^~
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/radiance-glm-main-tp4-cache-src/core/build/tiny_startup.cpp:88:35: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘if’
+   88 |     if(st>=0)++state_.aux_threads;return st;
+      |                                   ^~~~~~
+[ 31%] Building CXX object core/CMakeFiles/rad_core.dir/runtime/arena.cpp.o
+[ 31%] Building CXX object core/CMakeFiles/rad_core.dir/runtime/cache_prepare4_session.cpp.o
+[ 31%] Building CXX object core/CMakeFiles/rad_core.dir/runtime/ctx.cpp.o
+[ 31%] Building CXX object core/CMakeFiles/rad_core.dir/runtime/expert_prepare.cpp.o
+[ 31%] Building CXX object core/CMakeFiles/rad_core.dir/runtime/issue.cpp.o
+[ 31%] Building CXX object core/CMakeFiles/rad_core.dir/runtime/kvbind.cpp.o
+[ 31%] Building CXX object core/CMakeFiles/rad_core.dir/runtime/oracle.cpp.o
+[ 31%] Building CXX object core/CMakeFiles/rad_core.dir/runtime/rank_barrier.cpp.o
+[ 36%] Building CXX object core/CMakeFiles/rad_core.dir/runtime/tierexec.cpp.o
+[ 36%] Building CXX object core/CMakeFiles/rad_core.dir/runtime/wtab.cpp.o
+[ 36%] Building CXX object core/CMakeFiles/rad_core.dir/runtime/xprefetch.cpp.o
+[ 36%] Building CXX object core/CMakeFiles/rad_core.dir/mem/hostarena.cpp.o
+[ 36%] Building CXX object core/CMakeFiles/rad_core.dir/mem/kv.cpp.o
+In file included from /usr/include/c++/15/bits/shared_ptr_atomic.h:33,
+                 from /usr/include/c++/15/memory:83,
+                 from /home/as/radiance-setup/research/deepseek-v41-1017-20261024/radiance-glm-main-tp4-cache-src/core/runtime/../rad_core.h:14,
+                 from /home/as/radiance-setup/research/deepseek-v41-1017-20261024/radiance-glm-main-tp4-cache-src/core/runtime/ctx.h:19,
+                 from /home/as/radiance-setup/research/deepseek-v41-1017-20261024/radiance-glm-main-tp4-cache-src/core/runtime/xprefetch.cpp:2:
+In function ‘void std::atomic_thread_fence(memory_order)’,
+    inlined from ‘void rad::Ctx::xp_serve(rad::XpState&)’ at /home/as/radiance-setup/research/deepseek-v41-1017-20261024/radiance-glm-main-tp4-cache-src/core/runtime/xprefetch.cpp:182:33:
+/usr/include/c++/15/bits/atomic_base.h:147:26: warning: ‘atomic_thread_fence’ is not supported with ‘-fsanitize=thread’ [-Wtsan]
+  147 |   { __atomic_thread_fence(int(__m)); }
+      |     ~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~
+In function ‘void std::atomic_thread_fence(memory_order)’,
+    inlined from ‘void rad::Ctx::xp_serve(rad::XpState&)’ at /home/as/radiance-setup/research/deepseek-v41-1017-20261024/radiance-glm-main-tp4-cache-src/core/runtime/xprefetch.cpp:194:41:
+/usr/include/c++/15/bits/atomic_base.h:147:26: warning: ‘atomic_thread_fence’ is not supported with ‘-fsanitize=thread’ [-Wtsan]
+  147 |   { __atomic_thread_fence(int(__m)); }
+      |     ~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~
+[ 36%] Building CXX object core/CMakeFiles/rad_core.dir/mem/kvtier.cpp.o
+[ 36%] Building CXX object core/CMakeFiles/rad_core.dir/mem/pools.cpp.o
+[ 36%] Building CXX object core/CMakeFiles/rad_core.dir/mem/prefix.cpp.o
+[ 36%] Building CXX object core/CMakeFiles/rad_core.dir/mem/vram_budget.cpp.o
+[ 42%] Building CXX object core/CMakeFiles/rad_core.dir/sched/advance.cpp.o
+[ 42%] Building CXX object core/CMakeFiles/rad_core.dir/sched/batch.cpp.o
+[ 42%] Building CXX object core/CMakeFiles/rad_core.dir/sched/derive.cpp.o
+[ 42%] Building CXX object core/CMakeFiles/rad_core.dir/sched/draft.cpp.o
+[ 42%] Building CXX object core/CMakeFiles/rad_core.dir/sched/geometry.cpp.o
+[ 42%] Building CXX object core/CMakeFiles/rad_core.dir/sched/scheduler.cpp.o
+[ 42%] Building CXX object core/CMakeFiles/rad_core.dir/place/heat.cpp.o
+[ 42%] Building CXX object core/CMakeFiles/rad_core.dir/place/mover.cpp.o
+[ 42%] Building CXX object core/CMakeFiles/rad_core.dir/place/native_backing_owner.cpp.o
+[ 47%] Building CXX object core/CMakeFiles/rad_core.dir/place/native_inventory.cpp.o
+[ 47%] Building CXX object core/CMakeFiles/rad_core.dir/place/native_mover.cpp.o
+[ 47%] Building CXX object core/CMakeFiles/rad_core.dir/place/native_weight_authority.cpp.o
+[ 47%] Building CXX object core/CMakeFiles/rad_core.dir/place/planner.cpp.o
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/radiance-glm-main-tp4-cache-src/core/place/native_weight_authority.cpp: In function ‘uint64_t rad::{anonymous}::geometry_hash(const rad::WeightInfo&)’:
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/radiance-glm-main-tp4-cache-src/core/place/native_weight_authority.cpp:87:5: warning: this ‘for’ clause does not guard... [-Wmisleading-indentation]
+   87 |     for(const auto v:w.decl.shape)scalar(v);for(const auto v:w.decl.row_parts)scalar(v);
+      |     ^~~
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/radiance-glm-main-tp4-cache-src/core/place/native_weight_authority.cpp:87:45: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘for’
+   87 |     for(const auto v:w.decl.shape)scalar(v);for(const auto v:w.decl.row_parts)scalar(v);
+      |                                             ^~~
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/radiance-glm-main-tp4-cache-src/core/place/native_weight_authority.cpp:89:5: warning: this ‘for’ clause does not guard... [-Wmisleading-indentation]
+   89 |     for(const auto v:w.part_lo)scalar(v);for(const auto v:w.part_hi)scalar(v);for(const auto v:w.part_total)scalar(v);
+      |     ^~~
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/radiance-glm-main-tp4-cache-src/core/place/native_weight_authority.cpp:89:42: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘for’
+   89 |     for(const auto v:w.part_lo)scalar(v);for(const auto v:w.part_hi)scalar(v);for(const auto v:w.part_total)scalar(v);
+      |                                          ^~~
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/radiance-glm-main-tp4-cache-src/core/place/native_weight_authority.cpp:91:5: warning: this ‘for’ clause does not guard... [-Wmisleading-indentation]
+   91 |     for(const auto v:w.sel)scalar(v);for(const auto v:w.sel_rows)scalar(v);for(const auto v:w.sel_cols)scalar(v);
+      |     ^~~
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/radiance-glm-main-tp4-cache-src/core/place/native_weight_authority.cpp:91:38: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘for’
+   91 |     for(const auto v:w.sel)scalar(v);for(const auto v:w.sel_rows)scalar(v);for(const auto v:w.sel_cols)scalar(v);
+      |                                      ^~~
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/radiance-glm-main-tp4-cache-src/core/place/native_weight_authority.cpp:94:5: warning: this ‘for’ clause does not guard... [-Wmisleading-indentation]
+   94 |     for(const auto v:w.stored_shape)scalar(v);scalar(w.stored_bytes);scalar(w.align);return h;
+      |     ^~~
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/radiance-glm-main-tp4-cache-src/core/place/native_weight_authority.cpp:94:47: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘for’
+   94 |     for(const auto v:w.stored_shape)scalar(v);scalar(w.stored_bytes);scalar(w.align);return h;
+      |                                               ^~~~~~
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/radiance-glm-main-tp4-cache-src/core/place/native_weight_authority.cpp: In member function ‘bool rad::NativeWeightAuthority::Impl::matches(size_t, const rad::WeightInfo&) const’:
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/radiance-glm-main-tp4-cache-src/core/place/native_weight_authority.cpp:186:9: warning: this ‘if’ clause does not guard... [-Wmisleading-indentation]
+  186 |         if(index>=stats.weights)return false;const auto& r=refs[index];
+      |         ^~
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/radiance-glm-main-tp4-cache-src/core/place/native_weight_authority.cpp:186:46: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘if’
+  186 |         if(index>=stats.weights)return false;const auto& r=refs[index];
+      |                                              ^~~~~
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/radiance-glm-main-tp4-cache-src/core/place/native_weight_authority.cpp: In lambda function:
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/radiance-glm-main-tp4-cache-src/core/place/native_weight_authority.cpp:219:13: warning: this ‘if’ clause does not guard... [-Wmisleading-indentation]
+  219 |             if(!text.empty())std::memcpy(p->arena.get()+cursor,text.data(),text.size());cursor+=text.size();return slice;
+      |             ^~
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/radiance-glm-main-tp4-cache-src/core/place/native_weight_authority.cpp:219:89: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘if’
+  219 |             if(!text.empty())std::memcpy(p->arena.get()+cursor,text.data(),text.size());cursor+=text.size();return slice;
+      |                                                                                         ^~~~~~
+[ 47%] Building CXX object core/CMakeFiles/rad_core.dir/place/record_owner.cpp.o
+[ 47%] Building CXX object core/CMakeFiles/rad_core.dir/place/record_residency.cpp.o
+[ 47%] Building CXX object core/CMakeFiles/rad_core.dir/place/stager.cpp.o
+[ 47%] Building CXX object core/CMakeFiles/rad_core.dir/sample/accept.cpp.o
+[ 52%] Building CXX object core/CMakeFiles/rad_core.dir/sample/gbnf.cpp.o
+[ 52%] Building CXX object core/CMakeFiles/rad_core.dir/sample/gbnf_mask.cpp.o
+[ 52%] Building CXX object core/CMakeFiles/rad_core.dir/sample/grammar.cpp.o
+[ 52%] Building CXX object core/CMakeFiles/rad_core.dir/sample/host_ref.cpp.o
+[ 52%] Building CXX object core/CMakeFiles/rad_core.dir/sample/sampler.cpp.o
+[ 52%] Building CXX object core/CMakeFiles/rad_core.dir/sample/word_scan.cpp.o
+[ 52%] Building CXX object core/CMakeFiles/rad_core.dir/text/chat.cpp.o
+[ 52%] Building CXX object core/CMakeFiles/rad_core.dir/text/chatfmt.cpp.o
+[ 52%] Building CXX object core/CMakeFiles/rad_core.dir/text/chatparse.cpp.o
+[ 57%] Building CXX object core/CMakeFiles/rad_core.dir/text/gguf.cpp.o
+[ 57%] Building CXX object core/CMakeFiles/rad_core.dir/text/tokenizer.cpp.o
+[ 57%] Building CXX object core/CMakeFiles/rad_core.dir/text/tokenizer_bpe.cpp.o
+[ 57%] Building CXX object core/CMakeFiles/rad_core.dir/text/tokenizer_grapheme.cpp.o
+[ 57%] Building CXX object core/CMakeFiles/rad_core.dir/text/tokenizer_grapheme_ucd.cpp.o
+[ 57%] Building CXX object core/CMakeFiles/rad_core.dir/text/tokenizer_json.cpp.o
+[ 57%] Building CXX object core/CMakeFiles/rad_core.dir/text/tokenizer_nfc.cpp.o
+[ 57%] Building CXX object core/CMakeFiles/rad_core.dir/text/tokenizer_regex.cpp.o
+[ 57%] Building CXX object core/CMakeFiles/rad_core.dir/text/tokenizer_ucd.cpp.o
+[ 63%] Building CXX object core/CMakeFiles/rad_core.dir/text/unicode_norm.cpp.o
+[ 63%] Building CXX object core/CMakeFiles/rad_core.dir/text/unicode_norm_data.cpp.o
+[ 63%] Building CXX object core/CMakeFiles/rad_core.dir/server/admin.cpp.o
+[ 63%] Building CXX object core/CMakeFiles/rad_core.dir/server/audio_gen.cpp.o
+[ 63%] Building CXX object core/CMakeFiles/rad_core.dir/server/dashboard.cpp.o
+[ 63%] Building CXX object core/CMakeFiles/rad_core.dir/server/http.cpp.o
+[ 63%] Building CXX object core/CMakeFiles/rad_core.dir/server/images.cpp.o
+[ 63%] Building CXX object core/CMakeFiles/rad_core.dir/server/json_partial.cpp.o
+[ 63%] Building CXX object core/CMakeFiles/rad_core.dir/server/liveview.cpp.o
+[ 68%] Building CXX object core/CMakeFiles/rad_core.dir/server/loras.cpp.o
+[ 68%] Building CXX object core/CMakeFiles/rad_core.dir/server/metrics.cpp.o
+[ 68%] Building CXX object core/CMakeFiles/rad_core.dir/server/oai.cpp.o
+[ 68%] Building CXX object core/CMakeFiles/rad_core.dir/server/realtime.cpp.o
+[ 68%] Building CXX object core/CMakeFiles/rad_core.dir/server/server.cpp.o
+[ 68%] Building CXX object core/CMakeFiles/rad_core.dir/server/sink.cpp.o
+[ 68%] Building CXX object core/CMakeFiles/rad_core.dir/server/speech.cpp.o
+[ 68%] Building CXX object core/CMakeFiles/rad_core.dir/server/speech_stream.cpp.o
+[ 73%] Building CXX object core/CMakeFiles/rad_core.dir/server/systemone.cpp.o
+[ 73%] Building CXX object core/CMakeFiles/rad_core.dir/server/text_split.cpp.o
+[ 73%] Building CXX object core/CMakeFiles/rad_core.dir/server/videos.cpp.o
+[ 73%] Building CXX object core/CMakeFiles/rad_core.dir/format/checkpoint.cpp.o
+[ 73%] Building CXX object core/CMakeFiles/rad_core.dir/format/encoding.cpp.o
+[ 73%] Building CXX object core/CMakeFiles/rad_core.dir/format/imatrix.cpp.o
+[ 73%] Building CXX object core/CMakeFiles/rad_core.dir/format/machine_key.cpp.o
+[ 73%] Building CXX object core/CMakeFiles/rad_core.dir/format/quantise.cpp.o
+[ 73%] Building CXX object core/CMakeFiles/rad_core.dir/format/radfile.cpp.o
+[ 78%] Building CXX object core/CMakeFiles/rad_core.dir/format/recipe.cpp.o
+[ 78%] Building CXX object core/CMakeFiles/rad_core.dir/format/safetensors.cpp.o
+[ 78%] Building CXX object core/CMakeFiles/rad_core.dir/format/share.cpp.o
+[ 78%] Building CXX object core/CMakeFiles/rad_core.dir/format/table_copy.cpp.o
+[ 78%] Building CXX object core/CMakeFiles/rad_core.dir/format/torch_zip.cpp.o
+[ 78%] Building CXX object core/CMakeFiles/rad_core.dir/format/tunecache.cpp.o
+[ 78%] Building CXX object core/CMakeFiles/rad_core.dir/mm/imaging.cpp.o
+[ 78%] Building CXX object core/CMakeFiles/rad_core.dir/mm/item.cpp.o
+[ 78%] Building CXX object core/CMakeFiles/rad_core.dir/mm/media.cpp.o
+[ 84%] Building CXX object core/CMakeFiles/rad_core.dir/mm/mp4.cpp.o
+[ 84%] Building CXX object core/CMakeFiles/rad_core.dir/mm/processor.cpp.o
+[ 84%] Building CXX object core/CMakeFiles/rad_core.dir/mm/resample.cpp.o
+[ 84%] Building CXX object core/CMakeFiles/rad_core.dir/diag/checks.cpp.o
+[ 84%] Building CXX object core/CMakeFiles/rad_core.dir/diag/report.cpp.o
+[ 84%] Building CXX object core/CMakeFiles/rad_core.dir/diag/sysinfo.cpp.o
+[ 84%] Building CXX object core/CMakeFiles/rad_core.dir/gen/audio_driver.cpp.o
+[ 84%] Building CXX object core/CMakeFiles/rad_core.dir/gen/driver.cpp.o
+[ 89%] Building CXX object core/CMakeFiles/rad_core.dir/gen/gen.cpp.o
+[ 89%] Building CXX object core/CMakeFiles/rad_core.dir/gen/video_driver.cpp.o
+[ 89%] Building CXX object core/CMakeFiles/rad_core.dir/lora/adapter.cpp.o
+[ 89%] Building CXX object core/CMakeFiles/rad_core.dir/lora/declare.cpp.o
+[ 89%] Building CXX object core/CMakeFiles/rad_core.dir/lora/lora.cpp.o
+[ 89%] Building CXX object core/CMakeFiles/rad_core.dir/lora/slots.cpp.o
+[ 89%] Building CXX object core/CMakeFiles/rad_core.dir/config.cpp.o
+[ 89%] Building CXX object core/CMakeFiles/rad_core.dir/cvec.cpp.o
+[ 89%] Building CXX object core/CMakeFiles/rad_core.dir/engine.cpp.o
+[ 94%] Building CXX object core/CMakeFiles/rad_core.dir/engine_bringup.cpp.o
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/radiance-glm-main-tp4-cache-src/core/engine_bringup.cpp: In constructor ‘rad::RelayoutPool::Bounce::Bounce(rad::RelayoutPool::Uplink*, rad::RelayoutPool*)’:
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/radiance-glm-main-tp4-cache-src/core/engine_bringup.cpp:2181:17: warning: ‘rad::RelayoutPool::Bounce::up_’ will be initialized after [-Wreorder]
+ 2181 |         Uplink* up_;
+      |                 ^~~
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/radiance-glm-main-tp4-cache-src/core/engine_bringup.cpp:2167:23: warning:   ‘rad::RelayoutPool* rad::RelayoutPool::Bounce::tiny_’ [-Wreorder]
+ 2167 |         RelayoutPool* tiny_=nullptr;
+      |                       ^~~~~
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/radiance-glm-main-tp4-cache-src/core/engine_bringup.cpp:2166:18: warning:   when initialized here [-Wreorder]
+ 2166 |         explicit Bounce(Uplink* up,RelayoutPool* tiny=nullptr) : up_(up),tiny_(tiny) {}
+      |                  ^~~~~~
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/radiance-glm-main-tp4-cache-src/core/engine_bringup.cpp: In member function ‘int rad::Engine::load_weights()’:
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/radiance-glm-main-tp4-cache-src/core/engine_bringup.cpp:3273:13: warning: this ‘if’ clause does not guard... [-Wmisleading-indentation]
+ 3273 |             if(start>=0)pool.queue_tiny();const int finished=pool.finish();
+      |             ^~
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/radiance-glm-main-tp4-cache-src/core/engine_bringup.cpp:3273:43: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘if’
+ 3273 |             if(start>=0)pool.queue_tiny();const int finished=pool.finish();
+      |                                           ^~~~~
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/radiance-glm-main-tp4-cache-src/core/engine_bringup.cpp:3274:13: warning: this ‘if’ clause does not guard... [-Wmisleading-indentation]
+ 3274 |             if(start<0)return start;if(finished<0)return finished;
+      |             ^~
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/radiance-glm-main-tp4-cache-src/core/engine_bringup.cpp:3274:37: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘if’
+ 3274 |             if(start<0)return start;if(finished<0)return finished;
+      |                                     ^~
+[ 94%] Building CXX object core/CMakeFiles/rad_core.dir/engine_diag.cpp.o
+[ 94%] Building CXX object core/CMakeFiles/rad_core.dir/engine_draft.cpp.o
+[ 94%] Building CXX object core/CMakeFiles/rad_core.dir/engine_gen.cpp.o
+[ 94%] Building CXX object core/CMakeFiles/rad_core.dir/engine_hostmem.cpp.o
+[ 94%] Building CXX object core/CMakeFiles/rad_core.dir/engine_kld.cpp.o
+[ 94%] Building CXX object core/CMakeFiles/rad_core.dir/engine_lora.cpp.o
+[ 94%] Building CXX object core/CMakeFiles/rad_core.dir/engine_mm.cpp.o
+[ 94%] Building CXX object core/CMakeFiles/rad_core.dir/engine_probe.cpp.o
+[100%] Building CXX object core/CMakeFiles/rad_core.dir/engine_tiny_native.cpp.o
+[100%] Building CXX object core/CMakeFiles/rad_core.dir/gen_config.cpp.o
+[100%] Building CXX object core/CMakeFiles/rad_core.dir/hf_model.cpp.o
+[100%] Building CXX object core/CMakeFiles/rad_core.dir/kld.cpp.o
+[100%] Linking CXX static library librad_core.a
+[100%] Built target rad_core
+[100%] Built target rad_vendor_llama
+Built target rad_vendor_httplib
+[  0%] Building CXX object libref/CMakeFiles/libref.dir/ref_attn.cpp.o
+[  0%] Building CXX object libref/CMakeFiles/libref.dir/ref_audio.cpp.o
+[  0%] Building CXX object libref/CMakeFiles/libref.dir/ref_collective.cpp.o
+[  0%] Building CXX object libref/CMakeFiles/libref.dir/ref_ds41.cpp.o
+[  0%] Building CXX object libref/CMakeFiles/libref.dir/ref_dsa.cpp.o
+[  0%] Building CXX object libref/CMakeFiles/libref.dir/ref_elementwise.cpp.o
+[  0%] Building CXX object libref/CMakeFiles/libref.dir/ref_gdn.cpp.o
+[ 33%] Building CXX object libref/CMakeFiles/libref.dir/ref_gemm.cpp.o
+[ 33%] Building CXX object libref/CMakeFiles/libref.dir/ref_gen.cpp.o
+[ 33%] Building CXX object libref/CMakeFiles/libref.dir/ref_glm.cpp.o
+[ 33%] Building CXX object libref/CMakeFiles/libref.dir/ref_hc.cpp.o
+[ 33%] Building CXX object libref/CMakeFiles/libref.dir/ref_kda.cpp.o
+[ 33%] Building CXX object libref/CMakeFiles/libref.dir/ref_lora.cpp.o
+[ 33%] Building CXX object libref/CMakeFiles/libref.dir/ref_ltx.cpp.o
+[ 33%] Building CXX object libref/CMakeFiles/libref.dir/ref_mhc.cpp.o
+[ 33%] Building CXX object libref/CMakeFiles/libref.dir/ref_mla.cpp.o
+[ 66%] Building CXX object libref/CMakeFiles/libref.dir/ref_moe.cpp.o
+[ 66%] Building CXX object libref/CMakeFiles/libref.dir/ref_ngram.cpp.o
+[ 66%] Building CXX object libref/CMakeFiles/libref.dir/ref_ple.cpp.o
+[ 66%] Building CXX object libref/CMakeFiles/libref.dir/ref_qsa.cpp.o
+[ 66%] Building CXX object libref/CMakeFiles/libref.dir/ref_quant.cpp.o
+[ 66%] Building CXX object libref/CMakeFiles/libref.dir/ref_registry.cpp.o
+[ 66%] Building CXX object libref/CMakeFiles/libref.dir/ref_sam_attn.cpp.o
+[ 66%] Building CXX object libref/CMakeFiles/libref.dir/ref_sample.cpp.o
+[100%] Building CXX object libref/CMakeFiles/libref.dir/ref_shapes.cpp.o
+[100%] Building CXX object libref/CMakeFiles/libref.dir/ref_video.cpp.o
+[100%] Building CXX object libref/CMakeFiles/libref.dir/ref_vsa.cpp.o
+[100%] Linking CXX shared module ../radiance_home/kernels/libref.so
+[100%] Built target libref
+[  0%] Building CXX object libquant/CMakeFiles/libquant.dir/lq_autoround.cpp.o
+[ 50%] Building CXX object libquant/CMakeFiles/libquant.dir/lq_awq.cpp.o
+[ 50%] Building CXX object libquant/CMakeFiles/libquant.dir/lq_ggml.cpp.o
+[ 50%] Building CXX object libquant/CMakeFiles/libquant.dir/lq_ggml_port.cpp.o
+[ 50%] Building CXX object libquant/CMakeFiles/libquant.dir/lq_ggml_tables.cpp.o
+[ 50%] Building CXX object libquant/CMakeFiles/libquant.dir/lq_gptq.cpp.o
+[ 50%] Building CXX object libquant/CMakeFiles/libquant.dir/lq_grid.cpp.o
+[ 50%] Building CXX object libquant/CMakeFiles/libquant.dir/lq_hess.cpp.o
+[ 50%] Building CXX object libquant/CMakeFiles/libquant.dir/lq_paro.cpp.o
+[100%] Building CXX object libquant/CMakeFiles/libquant.dir/lq_registry.cpp.o
+[100%] Linking CXX shared module ../radiance_home/quantizers/libquant.so
+[100%] Built target libquant
+[  0%] Building CXX object libds41/CMakeFiles/libds41_ref.dir/ds41_packed_host.cpp.o
+[  0%] Building CXX object libds41/CMakeFiles/libds41_ref.dir/ds41_packed_rows.cpp.o
+[  0%] Building CXX object libds41/CMakeFiles/libds41_ref.dir/ds41_latent_host.cpp.o
+[100%] Building CXX object libds41/CMakeFiles/libds41_ref.dir/ds41_host_ops.cpp.o
+[100%] Building CXX object libds41/CMakeFiles/libds41_ref.dir/ds41_embedding_host.cpp.o
+[100%] Building CXX object libds41/CMakeFiles/libds41_ref.dir/ds41_reorder_heads_host.cpp.o
+[100%] Building CXX object libds41/CMakeFiles/libds41_ref.dir/ds41_compress_finish_host.cpp.o
+[100%] Building CXX object libds41/CMakeFiles/libds41_ref.dir/ds41_latent_emit_host.cpp.o
+[100%] Building CXX object libds41/CMakeFiles/libds41_ref.dir/ds41_engram_gate_host.cpp.o
+[100%] Building CXX object libds41/CMakeFiles/libds41_ref.dir/ds41_qdq_host.cpp.o
+[100%] Linking CXX shared module ../radiance_home/experimental/kernels/libds41_ref.so
+[100%] Built target libds41_ref
+[  0%] Building CXX object tests/CMakeFiles/model_policy_stale_probe.dir/model_policy_legacy_probe.cpp.o
+[ 10%] Built target rad_vendor_llama
+[ 10%] Built target rad_vendor_httplib
+[ 10%] Building CXX object core/plugin/testplugin/CMakeFiles/radtest_model_policy.dir/__/__/__/tests/model_failure_policy_plugin.cpp.o
+[ 10%] Linking CXX executable model_policy_stale_probe
+[ 10%] Linking CXX shared module ../../../radiance_home/testpolicy/policy.so
+[ 10%] Built target model_policy_stale_probe
+[ 10%] Building CXX object tests/CMakeFiles/model_policy_missing_probe.dir/model_policy_legacy_probe.cpp.o
+[ 10%] Built target radtest_model_policy
+[ 15%] Linking CXX executable model_policy_missing_probe
+[ 15%] Built target model_policy_missing_probe
+[100%] Built target rad_core
+[100%] Building CXX object tests/CMakeFiles/model_failure_policy_test.dir/model_failure_policy_test.cpp.o
+[100%] Linking CXX executable model_failure_policy_test
+[100%] Built target model_failure_policy_test
+[  0%] Building CXX object core/plugin/testplugin/CMakeFiles/radtest_status_6.dir/__/__/__/tests/deferred_status_plugin.cpp.o
+[  9%] Built target rad_vendor_llama
+[  9%] Built target rad_vendor_httplib
+[  9%] Building CXX object core/plugin/testplugin/CMakeFiles/radtest_status_0.dir/__/__/__/tests/deferred_status_plugin.cpp.o
+[  9%] Linking CXX shared module ../../../radiance_home/teststatus/status6.so
+[  9%] Linking CXX shared module ../../../radiance_home/teststatus/status0.so
+[  9%] Built target radtest_status_6
+[ 14%] Building CXX object core/plugin/testplugin/CMakeFiles/radtest_status_1.dir/__/__/__/tests/deferred_status_plugin.cpp.o
+[ 14%] Built target radtest_status_0
+[ 14%] Building CXX object core/plugin/testplugin/CMakeFiles/radtest_status_2.dir/__/__/__/tests/deferred_status_plugin.cpp.o
+[ 14%] Linking CXX shared module ../../../radiance_home/teststatus/status1.so
+[ 14%] Linking CXX shared module ../../../radiance_home/teststatus/status2.so
+[ 14%] Built target radtest_status_1
+[ 14%] Building CXX object core/plugin/testplugin/CMakeFiles/radtest_status_3.dir/__/__/__/tests/deferred_status_plugin.cpp.o
+[ 14%] Built target radtest_status_2
+[ 14%] Building CXX object core/plugin/testplugin/CMakeFiles/radtest_status_4.dir/__/__/__/tests/deferred_status_plugin.cpp.o
+[ 14%] Linking CXX shared module ../../../radiance_home/teststatus/status3.so
+[ 14%] Linking CXX shared module ../../../radiance_home/teststatus/status4.so
+[ 14%] Built target radtest_status_3
+[ 14%] Building CXX object core/plugin/testplugin/CMakeFiles/radtest_status_5.dir/__/__/__/tests/deferred_status_plugin.cpp.o
+[ 14%] Built target radtest_status_4
+[ 19%] Linking CXX shared module ../../../radiance_home/teststatus/status5.so
+[100%] Built target rad_core
+[100%] Built target radtest_status_5
+[100%] Building CXX object tests/CMakeFiles/deferred_status_test.dir/deferred_status_test.cpp.o
+[100%] Linking CXX executable deferred_status_test
+[100%] Built target deferred_status_test
+[  0%] Built target rad_vendor_httplib
+[ 10%] Built target rad_vendor_llama
+[100%] Built target rad_core
+[100%] Building CXX object tests/CMakeFiles/deferred_status_checkpoint_test.dir/deferred_status_checkpoint_test.cpp.o
+[100%] Linking CXX executable deferred_status_checkpoint_test
+[100%] Built target deferred_status_checkpoint_test
+[  0%] Built target rad_vendor_httplib
+[ 10%] Built target rad_vendor_llama
+[100%] Built target rad_core
+[100%] Building CXX object tests/CMakeFiles/abi_layout_test.dir/abi_layout_test.cpp.o
+[100%] Building C object tests/CMakeFiles/abi_layout_test.dir/abi_c_test.c.o
+[100%] Linking CXX executable abi_layout_test
+[100%] Built target abi_layout_test
+[  5%] Built target rad_vendor_llama
+[ 14%] Built target libref
+[ 14%] Building CXX object core/plugin/testplugin/CMakeFiles/radtest_kbarch.dir/kbarch.cc.o
+[ 14%] Built target rad_vendor_httplib
+[ 17%] Building CXX object core/plugin/testplugin/CMakeFiles/radtest_base.dir/testplugin.cc.o
+[ 20%] Linking CXX shared module ../../../radiance_home/testarch/kbench/radtest_kbarch.so
+[ 20%] Linking CXX shared module ../../../radiance_home/testkernels/radtest_base.so
+[ 20%] Built target radtest_kbarch
+[ 20%] Built target radtest_base
+[ 20%] Building CXX object core/plugin/testplugin/CMakeFiles/radtest_over.dir/testplugin.cc.o
+[ 20%] Building CXX object core/plugin/testplugin/CMakeFiles/radtest_conflict.dir/testplugin.cc.o
+[ 20%] Linking CXX shared module ../../../radiance_home/testkernels/radtest_over.so
+[ 20%] Linking CXX shared module ../../../radiance_home/testkernels/bad/radtest_conflict.so
+[ 20%] Built target radtest_over
+[ 20%] Built target radtest_conflict
+[ 20%] Building CXX object core/plugin/testplugin/CMakeFiles/radtest_badabi.dir/testplugin.cc.o
+[ 20%] Building CXX object core/plugin/testplugin/CMakeFiles/radtest_arch.dir/testplugin.cc.o
+[ 20%] Linking CXX shared module ../../../radiance_home/testkernels/bad/radtest_badabi.so
+[ 23%] Linking CXX shared module ../../../radiance_home/testarch/radtest_arch.so
+[ 23%] Built target radtest_badabi
+[ 23%] Built target radtest_arch
+[ 23%] Building CXX object core/plugin/testplugin/CMakeFiles/radtest_arch2.dir/testplugin.cc.o
+[ 23%] Building CXX object core/plugin/testplugin/CMakeFiles/radtest_ord_a.dir/testplugin.cc.o
+[ 23%] Linking CXX shared module ../../../radiance_home/testarch/radtest_arch2.so
+[ 23%] Linking CXX shared module ../../../radiance_home/testkernels/order/radtest_ord_a.so
+[ 23%] Built target radtest_arch2
+[ 23%] Built target radtest_ord_a
+[ 23%] Building CXX object core/plugin/testplugin/CMakeFiles/radtest_ord_b.dir/testplugin.cc.o
+[ 26%] Building CXX object core/plugin/testplugin/CMakeFiles/radtest_extra.dir/testplugin.cc.o
+[ 26%] Linking CXX shared module ../../../radiance_home/testkernels/order/radtest_ord_b.so
+[ 26%] Built target radtest_ord_b
+[ 26%] Building CXX object core/plugin/testplugin/CMakeFiles/radtest_badtune_default.dir/testplugin.cc.o
+[ 26%] Linking CXX shared module ../../../radiance_home/testkernels/extra/radtest_extra.so
+[ 26%] Linking CXX shared module ../../../radiance_home/testkernels/bad/radtest_badtune_default.so
+[ 26%] Built target radtest_extra
+[ 26%] Building CXX object core/plugin/testplugin/CMakeFiles/radtest_badtune_twice.dir/testplugin.cc.o
+[ 26%] Built target radtest_badtune_default
+[ 26%] Building CXX object core/plugin/testplugin/CMakeFiles/radtest_decline.dir/testplugin.cc.o
+[ 26%] Linking CXX shared module ../../../radiance_home/testkernels/bad/radtest_badtune_twice.so
+[ 26%] Linking CXX shared module ../../../radiance_home/testkernels/decline/radtest_decline.so
+[ 26%] Built target radtest_badtune_twice
+[ 26%] Built target radtest_decline
+[ 26%] Building CXX object core/plugin/testplugin/CMakeFiles/radtest_archq_plain.dir/testplugin.cc.o
+[ 26%] Building CXX object core/plugin/testplugin/CMakeFiles/radtest_archq_fp8.dir/testplugin.cc.o
+[ 26%] Linking CXX shared module ../../../radiance_home/testarchq/radtest_archq_fp8.so
+[ 26%] Linking CXX shared module ../../../radiance_home/testarchq/radtest_archq_plain.so
+[ 26%] Built target radtest_archq_plain
+[ 26%] Built target radtest_archq_fp8
+[ 26%] Building CXX object core/plugin/testplugin/CMakeFiles/radtest_archq_w4.dir/testplugin.cc.o
+[ 26%] Building CXX object core/plugin/testplugin/CMakeFiles/radtest_archq_w8.dir/testplugin.cc.o
+[ 29%] Linking CXX shared module ../../../radiance_home/testarchq/radtest_archq_w4.so
+[ 29%] Linking CXX shared module ../../../radiance_home/testarchq/radtest_archq_w8.so
+[ 29%] Built target radtest_archq_w8
+[ 29%] Built target radtest_archq_w4
+[ 32%] Building CXX object core/plugin/testplugin/CMakeFiles/radtest_quant.dir/testquant.cc.o
+[ 32%] Building CXX object core/plugin/testplugin/CMakeFiles/radtest_rows.dir/tierrows.cc.o
+[ 32%] Linking CXX shared module ../../../radiance_home/testrows/radtest_rows.so
+[ 32%] Built target radtest_rows
+[ 32%] Building CXX object core/plugin/testplugin/CMakeFiles/radtest_importarch.dir/importarch.cc.o
+[ 32%] Linking CXX shared module ../../../radiance_home/testarch/import/radtest_importarch.so
+[ 32%] Linking CXX shared module ../../../radiance_home/testquant/radtest_quant.so
+[ 32%] Built target radtest_importarch
+[ 32%] Built target radtest_quant
+[ 32%] Building CXX object core/plugin/testplugin/CMakeFiles/radtest_importkernel.dir/importkernel.cc.o
+[ 32%] Building CXX object core/plugin/testplugin/CMakeFiles/radtest_repackkernel.dir/repackkernel.cc.o
+[ 32%] Linking CXX shared module ../../../radiance_home/testkernels/import/radtest_importkernel.so
+[ 32%] Built target radtest_importkernel
+[ 32%] Building CXX object core/plugin/testplugin/CMakeFiles/radtest_ds41meta.dir/__/__/__/libds41/ds41_packed_rows.cpp.o
+[ 32%] Linking CXX shared module ../../../radiance_home/testkernels/repack/radtest_repackkernel.so
+[ 32%] Built target radtest_repackkernel
+[ 32%] Built target radtest_status_0
+[ 35%] Built target radtest_status_1
+[ 35%] Built target radtest_status_2
+[ 35%] Built target radtest_status_3
+[ 35%] Built target radtest_status_4
+[ 38%] Built target radtest_status_5
+[ 38%] Built target radtest_status_6
+[ 38%] Building CXX object core/plugin/testplugin/CMakeFiles/radtest_importbad_1.dir/importplugin.cc.o
+[ 38%] Linking CXX shared module ../../../radiance_home/testquant/import/radtest_importbad_1.so
+[ 38%] Built target radtest_importbad_1
+[ 38%] Building CXX object core/plugin/testplugin/CMakeFiles/radtest_importbad_2.dir/importplugin.cc.o
+/home/as/radiance-setup/research/deepseek-v41-1017-20261024/radiance-glm-main-tp4-cache-src/core/plugin/testplugin/importplugin.cc:8:5: warning: ‘int {anonymous}::encoding(const RadCheckpointImportWeight*, RadEncoding*)’ defined but not used [-Wunused-function]
+    8 | int encoding(const RadCheckpointImportWeight*, RadEncoding*) { return RAD_E_UNSUPPORTED; }
+      |     ^~~~~~~~
+[ 38%] Linking CXX shared module ../../../radiance_home/testquant/import/radtest_importbad_2.so
+[ 38%] Building CXX object core/plugin/testplugin/CMakeFiles/radtest_ds41meta.dir/ds41meta.cc.o
+[ 38%] Built target radtest_importbad_2
+[ 41%] Building CXX object core/plugin/testplugin/CMakeFiles/radtest_importbad_3.dir/importplugin.cc.o
+[ 41%] Linking CXX shared module ../../../radiance_home/testkernels/ds41meta/radtest_ds41meta.so
+[ 41%] Linking CXX shared module ../../../radiance_home/testquant/import/radtest_importbad_3.so
+[ 41%] Built target radtest_ds41meta
+[ 41%] Building CXX object core/plugin/testplugin/CMakeFiles/radtest_importbad_4.dir/importplugin.cc.o
+[ 41%] Built target radtest_importbad_3
+[ 41%] Building CXX object core/plugin/testplugin/CMakeFiles/radtest_importbad_5.dir/importplugin.cc.o
+[ 41%] Linking CXX shared module ../../../radiance_home/testquant/import/radtest_importbad_4.so
+[ 41%] Linking CXX shared module ../../../radiance_home/testquant/import/radtest_importbad_5.so
+[ 41%] Built target radtest_importbad_4
+[ 41%] Building CXX object core/plugin/testplugin/CMakeFiles/kbm_ok.dir/kbmutant.cc.o
+[ 41%] Built target radtest_importbad_5
+[ 41%] Building CXX object core/plugin/testplugin/CMakeFiles/kbm_scale.dir/kbmutant.cc.o
+[ 41%] Linking CXX shared module ../../../radiance_home/testkernels/kbmut/kbm_ok.so
+[ 41%] Linking CXX shared module ../../../radiance_home/testkernels/kbmut/kbm_scale.so
+[ 41%] Built target kbm_ok
+[ 41%] Building CXX object core/plugin/testplugin/CMakeFiles/kbm_nan.dir/kbmutant.cc.o
+[ 41%] Built target kbm_scale
+[ 41%] Building CXX object core/plugin/testplugin/CMakeFiles/kbm_half.dir/kbmutant.cc.o
+[ 44%] Linking CXX shared module ../../../radiance_home/testkernels/kbmut/kbm_nan.so
+[ 44%] Linking CXX shared module ../../../radiance_home/testkernels/kbmut/kbm_half.so
+[ 44%] Built target kbm_nan
+[ 44%] Building CXX object core/plugin/testplugin/CMakeFiles/kbm_overrun.dir/kbmutant.cc.o
+[ 44%] Built target kbm_half
+[ 44%] Building CXX object core/plugin/testplugin/CMakeFiles/kbm_refuse.dir/kbmutant.cc.o
+[ 44%] Linking CXX shared module ../../../radiance_home/testkernels/kbmut/kbm_overrun.so
+[ 44%] Linking CXX shared module ../../../radiance_home/testkernels/kbmut/kbm_refuse.so
+[ 44%] Built target kbm_overrun
+[ 47%] Building CXX object core/plugin/testplugin/CMakeFiles/kbm_shape.dir/kbmutant.cc.o
+[ 47%] Built target kbm_refuse
+[ 50%] Building CXX object core/plugin/testplugin/CMakeFiles/kbm_argmax.dir/kbmutant.cc.o
+[ 50%] Linking CXX shared module ../../../radiance_home/testkernels/kbmut/kbm_shape.so
+[ 50%] Built target kbm_shape
+[ 50%] Linking CXX shared module ../../../radiance_home/testkernels/kbmut/kbm_argmax.so
+[ 50%] Building CXX object core/plugin/testplugin/CMakeFiles/kbm_inwrite.dir/kbmutant.cc.o
+[ 50%] Built target kbm_argmax
+[ 50%] Building CXX object core/plugin/testplugin/CMakeFiles/kbm_enc.dir/kbmutant.cc.o
+[ 50%] Linking CXX shared module ../../../radiance_home/testkernels/kbmut/kbm_inwrite.so
+[ 50%] Built target kbm_inwrite
+[ 50%] Linking CXX shared module ../../../radiance_home/testkernels/kbmut/kbm_enc.so
+[100%] Built target rad_core
+[100%] Built target kbm_enc
+[100%] Built target radtest_plugin_fixtures
+[100%] Building CXX object tests/CMakeFiles/runtime_test.dir/runtime_test.cpp.o
+[100%] Linking CXX executable runtime_test
+[100%] Built target runtime_test
+[  3%] Built target radtest_kbarch
+[  6%] Built target radtest_base
+[  6%] Built target radtest_conflict
+[  6%] Built target radtest_over
+[  6%] Built target radtest_badabi
+[  9%] Built target radtest_arch
+[  9%] Built target radtest_arch2
+[  9%] Built target radtest_ord_a
+[  9%] Built target radtest_ord_b
+[ 12%] Built target radtest_extra
+[ 12%] Built target radtest_badtune_twice
+[ 12%] Built target radtest_badtune_default
+[ 12%] Built target radtest_decline
+[ 12%] Built target radtest_archq_plain
+[ 12%] Built target radtest_archq_fp8
+[ 12%] Built target radtest_archq_w8
+[ 16%] Built target radtest_archq_w4
+[ 16%] Built target radtest_rows
+[ 19%] Built target radtest_quant
+[ 19%] Built target radtest_importarch
+[ 19%] Built target radtest_importkernel
+[ 19%] Built target radtest_repackkernel
+[ 19%] Built target radtest_ds41meta
+[ 22%] Built target radtest_status_1
+[ 22%] Built target radtest_status_0
+[ 22%] Built target radtest_status_2
+[ 22%] Built target radtest_status_3
+[ 22%] Built target radtest_status_4
+[ 25%] Built target radtest_status_5
+[ 25%] Built target radtest_status_6
+[ 25%] Built target radtest_importbad_1
+[ 29%] Built target radtest_importbad_3
+[ 29%] Built target radtest_importbad_2
+[ 29%] Built target radtest_importbad_4
+[ 29%] Built target radtest_importbad_5
+[ 29%] Built target kbm_ok
+[ 32%] Built target kbm_nan
+[ 32%] Built target kbm_scale
+[ 32%] Built target kbm_overrun
+[ 32%] Built target kbm_half
+[ 35%] Built target kbm_shape
+[ 35%] Built target kbm_refuse
+[ 38%] Built target kbm_argmax
+[ 38%] Built target kbm_inwrite
+[ 38%] Built target kbm_enc
+[ 38%] Built target rad_vendor_httplib
+[ 45%] Built target rad_vendor_llama
+[ 45%] Built target radtest_plugin_fixtures
+[100%] Built target rad_core
+[100%] Building CXX object tests/CMakeFiles/mem_test.dir/mem_test.cpp.o
+[100%] Linking CXX executable mem_test
+[100%] Built target mem_test
+[  3%] Built target radtest_base
+[  6%] Built target radtest_kbarch
+[  6%] Built target radtest_over
+[  6%] Built target radtest_conflict
+[  6%] Built target radtest_badabi
+[  9%] Built target radtest_arch
+[  9%] Built target radtest_arch2
+[  9%] Built target radtest_ord_a
+[  9%] Built target radtest_ord_b
+[ 12%] Built target radtest_extra
+[ 12%] Built target radtest_badtune_default
+[ 12%] Built target radtest_badtune_twice
+[ 12%] Built target radtest_decline
+[ 12%] Built target radtest_archq_plain
+[ 12%] Built target radtest_archq_fp8
+[ 16%] Built target radtest_archq_w4
+[ 16%] Built target radtest_archq_w8
+[ 16%] Built target radtest_rows
+[ 19%] Built target radtest_quant
+[ 19%] Built target radtest_importarch
+[ 19%] Built target radtest_importkernel
+[ 19%] Built target radtest_repackkernel
+[ 19%] Built target radtest_ds41meta
+[ 19%] Built target radtest_status_0
+[ 22%] Built target radtest_status_1
+[ 22%] Built target radtest_status_2
+[ 22%] Built target radtest_status_3
+[ 22%] Built target radtest_status_4
+[ 25%] Built target radtest_status_5
+[ 25%] Built target radtest_status_6
+[ 25%] Built target radtest_importbad_1
+[ 25%] Built target radtest_importbad_2
+[ 29%] Built target radtest_importbad_3
+[ 29%] Built target radtest_importbad_4
+[ 29%] Built target radtest_importbad_5
+[ 29%] Built target kbm_ok
+[ 32%] Built target kbm_scale
+[ 32%] Built target kbm_nan
+[ 32%] Built target kbm_half
+[ 32%] Built target kbm_overrun
+[ 32%] Built target kbm_refuse
+[ 35%] Built target kbm_shape
+[ 38%] Built target kbm_argmax
+[ 38%] Built target kbm_inwrite
+[ 38%] Built target kbm_enc
+[ 45%] Built target rad_vendor_llama
+[ 45%] Built target rad_vendor_httplib
+[ 45%] Built target radtest_plugin_fixtures
+[100%] Built target rad_core
+[100%] Building CXX object tests/CMakeFiles/plugin_test.dir/plugin_test.cpp.o
+[100%] Linking CXX executable plugin_test
+[100%] Built target plugin_test
+[  0%] Built target rad_vendor_httplib
+[ 10%] Built target rad_vendor_llama
+[ 95%] Built target rad_core
+[ 95%] Building CXX object tests/CMakeFiles/place_test.dir/place_test.cpp.o
+[100%] Linking CXX executable place_test
+[100%] Built target place_test
+[  0%] Built target rad_vendor_httplib
+[ 10%] Built target rad_vendor_llama
+[ 95%] Built target rad_core
+[ 95%] Building CXX object tests/CMakeFiles/build_test.dir/build_test.cpp.o
+[100%] Linking CXX executable build_test
+[100%] Built target build_test
+Building CXX object arch/glm5next/CMakeFiles/glm5next_cache.dir/glm5next_cache.cpp.o
+Linking CXX shared module ../../research-glm-tp4-home/architectures/glm5next_cache.so
+Built target glm5next_cache

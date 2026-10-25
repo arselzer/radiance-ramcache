@@ -1,6 +1,7 @@
 #include "mover.h"
 #include "native_inventory.h"
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <limits>
 namespace rad {
@@ -8,7 +9,8 @@ uint32_t native_device_owner_profile_version()noexcept{return kNativeDeviceOwner
 namespace {
 bool native_backend_allowed(const NativeInventory& inventory){
     if(inventory.limits().backend_profile==NativeBackendProfile::HostOnly)return device_is_host();
-    return inventory.limits().backend_profile==NativeBackendProfile::TinyAqlV1&&
+    return (inventory.limits().backend_profile==NativeBackendProfile::TinyAqlV1||
+            inventory.limits().backend_profile==NativeBackendProfile::GlmMainTp4AqlFailStopV1)&&
         !device_is_host()&&!std::strcmp(device_backend_name(),"aql");
 }
 }
@@ -159,6 +161,59 @@ int Mover::native_record_upload(uint64_t token,int32_t unit,int32_t region,std::
     if(recorded>=0)native_uploaded_unit_[size_t(region)]=unit;
     else record_session_.upload_failed=true;
     return recorded;
+}
+int Mover::native_record_wait_prepared(uint64_t token,std::span<const RecordPublication> expected){
+    if(!token||token!=record_session_.token||!record_session_.native_only||native_closed_||
+       !prog_||!plan_||!budget_||!mover_||!compute_||!plan_->native_inventory||
+       plan_->native_inventory.get()!=budget_->native_inventory()||
+       res_.native_inventory()!=budget_->native_inventory()||
+       !native_backend_allowed(*plan_->native_inventory)||record_session_.upload_failed)
+        return RAD_E_STATE;
+    const auto& inventory=*plan_->native_inventory;
+    if(inventory.validate_runtime_header(*prog_,*plan_)<0||native_regions_.size()>512||
+       native_uploaded_unit_.size()!=native_regions_.size()||native_region_busy_.size()!=native_regions_.size()||
+       expected.size()>512||expected.size()!=record_session_.published.size()||
+       (expected.empty()!=record_session_.quiesced))return RAD_E_STATE;
+    // Single rank-thread contract. Preserve exact generations across the blocking
+    // transfer fence; no pointer/event generation is settled or republished here.
+    std::array<uint8_t,512> selected{};
+    std::array<rad_weight,2048> weights{};
+    std::array<uint64_t,2048> generations{};
+    size_t count=0;
+    auto validate=[&](bool capture)->int{
+        if(inventory.validate_runtime_header(*prog_,*plan_)<0||record_session_.upload_failed)return RAD_E_STATE;
+        size_t at=0;
+        for(size_t i=0;i<expected.size();++i){const auto& wanted=expected[i];const auto& published=record_session_.published[i];
+            if(wanted.unit!=published.unit||wanted.region!=published.region||wanted.region<0||
+               size_t(wanted.region)>=native_regions_.size())return RAD_E_STATE;
+            const auto region_index=size_t(wanted.region);const auto& region=native_regions_[region_index];
+            if(region.sentinel||!region.base||!region.ready||!native_region_busy_[region_index]||
+               native_uploaded_unit_[region_index]!=wanted.unit||
+               inventory.validate_unit(*prog_,*plan_,wanted.unit)<0||
+               inventory.validate_unit(*prog_,*plan_,region.exemplar)<0)return RAD_E_STATE;
+            if(capture){if(selected[region_index])return RAD_E_STATE;selected[region_index]=1;}
+            const auto& unit=plan_->units[size_t(wanted.unit)];
+            if(unit.weights.size()!=4||at>weights.size()-4)return RAD_E_STATE;
+            for(size_t m=0;m<4;++m){const auto w=unit.weights[m];const auto* slot=res_.lookup(w);
+                if(!slot||slot->ptr!=static_cast<char*>(region.base)+unit.offset[m]||
+                   slot->ready!=region.ready||!slot->generation)return RAD_E_STATE;
+                if(capture){weights[at]=w;generations[at]=slot->generation;}
+                else if(weights[at]!=w||generations[at]!=slot->generation)return RAD_E_STATE;
+                ++at;
+            }
+        }
+        if(!capture&&at!=count)return RAD_E_STATE;
+        for(size_t r=0;r<native_regions_.size();++r)
+            if(bool(native_region_busy_[r])!=bool(selected[r])||(!selected[r]&&native_uploaded_unit_[r]!=-1))return RAD_E_STATE;
+        if(capture)count=at;
+        return RAD_OK;
+    };
+    RAD_TRY(validate(true));
+    const int completed=rad_stream_sync(mover_);
+    if(completed<0){record_session_.upload_failed=true;return completed;}
+    const int unchanged=validate(false);
+    if(unchanged<0)record_session_.upload_failed=true;
+    return unchanged;
 }
 int Mover::native_record_guards_host()const{
     const auto* inventory=budget_?budget_->native_inventory():nullptr;

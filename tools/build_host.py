@@ -19,7 +19,7 @@ def main():
     parser.add_argument("--existing-core-build", type=Path,
                         help="absolute existing HOST build; reuses it only after exact source/profile verification")
     parser.add_argument("--run-host-checks", action="store_true",
-                        help="after building, explicitly execute the eight manual HOST checker programs, including tiny Engine transport")
+                        help="after building, explicitly execute the ten manual HOST checker programs, including tiny Engine transport")
     args = parser.parse_args()
     if not 1 <= args.jobs <= 8:
         parser.error("--jobs must be in 1..8")
@@ -63,9 +63,8 @@ def main():
 
         def command(argv, clean_radiance=False):
             print("RUN", json.dumps([str(x) for x in argv]), flush=True)
-            # The exact v4 Engine checker requires a clean RADIANCE_* namespace;
-            # retain the original environment for all seven legacy checkers and
-            # builds. Its home/profile are supplied by explicit checked paths.
+            # Engine and the actual TP4 Session checker require a clean
+            # RADIANCE_* namespace. Keep other checker/build environments unchanged.
             run_env = ({k: v for k, v in env.items() if not k.startswith("RADIANCE_")}
                        if clean_radiance else env)
             subprocess.run([str(x) for x in argv], cwd=build_root, env=run_env, check=True)
@@ -78,7 +77,7 @@ def main():
             cache = verify["verify_core_build"](root, core_build, args.mode, files)
             print("REUSE verified source-identical HOST Core:", core_build, flush=True)
         else:
-            core_build = build_root / ("core-engine-v4-host-" + args.mode)
+            core_build = build_root / ("core-main-tp4-v4-host-" + args.mode)
             if core_build.is_symlink():
                 raise refuse("fresh Core build directory must not be a symlink")
             # Source and build directories are distinct. The default reuses only
@@ -88,13 +87,14 @@ def main():
             command(["cmake", "-S", root / "radiance", "-B", core_build,
                      "-DCMAKE_BUILD_TYPE=" + build_type, "-DRAD_WITH_HIP=OFF", "-DRAD_WITH_FFMPEG=OFF",
                      "-DRAD_BUILD_TESTS=ON", "-DRAD_BUILD_DS41_EXPERIMENTAL=ON",
+                     "-DRAD_BUILD_GLM_TP4_CACHE_EXPERIMENTAL=OFF",
                      "-DRAD_ASAN=" + ("ON" if args.mode == "asan" else "OFF"),
                      "-DRAD_TSAN=" + ("ON" if args.mode == "tsan" else "OFF")])
             command(["cmake", "--build", core_build, "--parallel", args.jobs, "--target",
                      "rad_core", "libref", "libquant"])
             cache = verify["verify_core_build"](root, core_build, args.mode, files)
 
-        fixture_build = build_root / ("portable-engine-v4-host-" + args.mode)
+        fixture_build = build_root / ("portable-main-tp4-v4-host-" + args.mode)
         if fixture_build.is_symlink():
             raise refuse("fixture build directory must not be a symlink")
         if (fixture_build / "CMakeCache.txt").exists():
@@ -111,7 +111,7 @@ def main():
         verify["verify_core_build"](root, core_build, args.mode, files)
         verify["verify_fixture_build"](root, fixture_build, args.mode, core_build, cache)
         if not args.run_host_checks:
-            print("BUILT eight HOST checker programs; none executed. Add --run-host-checks for explicit manual execution.")
+            print("BUILT ten HOST checker programs; none executed. Add --run-host-checks for explicit manual execution.")
             return
 
         home = core_build / "radiance_home"
@@ -122,6 +122,8 @@ def main():
         if not architecture.is_file() or architecture.is_symlink():
             raise refuse("missing freshly built research architecture module")
         executions = [
+            [fixture_build / "glm53_tp4_cache_session_check", "--run-host-protocol"],
+            [fixture_build / "glm53_tp4_mover_fence_check", "--radiance-home", home],
             [fixture_build / "tiny_native_foundation_check"],
             [fixture_build / "tiny_startup_metadata_check", "--run-host", "--radiance-home", home,
              "--architecture", architecture],
@@ -133,10 +135,11 @@ def main():
             [fixture_build / "tiny_engine_native_transport_check", "--run-host", "--radiance-home", home,
              "--architecture", architecture],
         ]
-        engine_checker = fixture_build / "tiny_engine_native_transport_check"
+        clean_checkers = {fixture_build / "tiny_engine_native_transport_check",
+                          fixture_build / "glm53_tp4_cache_session_check"}
         for argv in executions:
-            command(argv, clean_radiance=argv[0] == engine_checker)
-        print("PASS eight explicitly invoked HOST research checker programs, including tiny Engine startup/transport. No GPU/model step/serving/TP/full-model claim.")
+            command(argv, clean_radiance=argv[0] in clean_checkers)
+        print("PASS ten explicitly invoked HOST research checker programs, including tiny Engine transport and actual TP4 protocol/HostOnly upload fence. Full-source activation remains CLOSED; no GPU/model step/serving/full-model claim.")
 
 
 if __name__ == "__main__":

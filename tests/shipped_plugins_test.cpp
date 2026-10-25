@@ -92,7 +92,7 @@ TEST(the_shipped_architectures_load_with_distinct_selection_keys) {
     const std::set<std::pair<std::string, std::string>> want = {
         { "anima", "" }, { "breeze", "" }, { "embeddinggemma2", "" },
         { "fishomni", "bsgemm-moe" }, { "flux3", "" }, { "flux3distilled", "" },
-        { "gemma3", "" }, { "gemma4", "" },
+        { "deepseek41", "" }, { "gemma3", "" }, { "gemma4", "" },
         { "gemma4", "compressed-tensors" }, { "glm5next", "" },
         { "hyv3", "" }, { "hyv3", "fp8" }, { "hyv3", "gguf_ftype_15" },
         { "lfm2", "" }, { "llama", "" },

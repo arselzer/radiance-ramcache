@@ -1,0 +1,129 @@
+Independent Patch A review: backend/loader/HOST RAII and manual failure matrix
+
+Result within this subscope: no additional concrete lifecycle or publication
+blocker found in the frozen backend/loader patch. This is source review only;
+no compilation, checker/model/Torch/Core/backend/GPU execution or network action
+was performed. No reviewed code was edited. Parent owns all actual results.
+
+Reviewed freeze
+  Prototype SOURCE_RECEIPT5569e0a5f1719e250c1b1a4f4bed5c046a2233ff7f5b7d458eb47b30d0cf84bd
+  Whole Core pins21cb2ce622b27183de641340e218db8e65ebf78099cecdf02c564594440a6a1e
+  All1492 Core files,45 prototype source pins and31 preserved regression bodies
+  matched by source hashing. The base StepA source remains separately frozen.
+  This pass covers device.{h,dispatch,host,aql}, tiny_startup, tiny_loader,
+  RelayoutPool changes in engine_bringup and the new manual checker. It excludes
+  independent approval of the reviewer's eight authored private quote paths.
+
+Separate known findings, not hidden by this result
+  Complementary DS41 review identified the reviewer's Ctx quote classes==1 guard
+  as too strict for the unchanged real contract classes==2; the repair is queued
+  with the parent in a compiler-safe window. It also raised explicit ownership
+  of global_control_allowance before Patch B: admit checks it but does not debit
+  Controls.live. No current manual overrun is demonstrated, but the whole-ledger
+  integration must reserve/subtract that slice rather than spend it twice.
+  This report does not mark whole Patch A or its quotes numerically validated.
+
+Backend construction and feature-off behavior
+  HOST stream creation is publish-last. The local unique owner handles failed
+  HostStream allocation, ring resize and std::thread construction. After a
+  successful std::thread construction, move assignment into the previously
+  unstarted member and pointer release are nonfallible, so caller output is not
+  exposed before ownership is complete. New failure returns replace leaks or
+  escaping construction exceptions; successful normal startup is unchanged.
+
+  AQL Partial owns every returned queue/karg/bounce pointer before subsequent
+  access calls, diagnostic registration or streams-vector growth. Its destructor
+  runs before the local Stream owner and frees all partial resources. The live
+  allocation map's insertion is strong on allocation failure; note_free erases
+  live registration before fallible history growth, which is contained during
+  cleanup. No packets have been submitted during this constructor, so these
+  partial resources do not require a reader drain. The streams vector publishes
+  before the atomic queue table only after its last fallible growth; there is
+  no remaining fallible work after final publication.
+
+  The tiny-only TLS guard restores its flag on constructor return/exception and
+  checks actual queue depth before argument/bounce allocation. Normal creation
+  retains its old actual queue sizing/priority/argument placement. Tiny hooks
+  are appended private Backend entries; absent hooks explicitly refuse, rather
+  than selecting an invented quote for an unknown backend. Whole private Core
+  recompilation is required and the checker CMake checks actual build HOME and
+  complete source pins. No public plugin ABI/schema is changed.
+
+Ticket and scope ownership
+  Tickets are move-only, acquired before the manual loader's vector/Pool work,
+  and retained outside the whole cleanup scope. Auxiliary-thread and stream
+  tickets remain Pool members until actual owners retire. TinyStream drains the
+  actual selected stream before destruction and ticket release. Budget must
+  outlive tickets; its destructor fail-stops if live tickets remain rather than
+  permitting a dangling budget ledger. Maximum three stream/two auxiliary roles
+  are explicit. Queried pthread defaults are compared between admission and
+  use; the documented stable-default/no external mutation contract remains.
+
+  Category reservations, backend global allowances and local tickets are not a
+  process-wide allocator interposer, vendor/driver allocation bound or RSS proof.
+  Event/global/TLS size facts and opaque control allowances are distinguished.
+  Actual backend discovery and ordinary legacy allocations remain outside a
+  claim that every process allocation is captured. The global-control ownership
+  question above must be closed before Engine-wide activation/admission claims.
+
+Tiny loader allocation and last-reader proof
+  The manual seam preflights bounded job count, input pages, selected-plane
+  rectangles/row products, source indices, actual relayout row metadata,
+  destination pointer arithmetic, duplicate weight jobs and overlapping output
+  spans. Borrowed Program/job/fill/destination object capacity and immutability
+  remain caller contracts; this is not an untrusted memory safety sandbox or a
+  GLM source seal. The tiny path has a fixed admitted input region and job ring;
+  generic input fallback and captured std::function payloads are not used there.
+
+  Both complete Bounce owners are Pool-owned and prepared before workers start.
+  Each slot is marked busy and unverified BEFORE copy. Failed copy/event-record
+  returns preserve that state; successful return does not release the source.
+  Copy/event emission shares an uplink admission lock and stop state. Other
+  workers observe sticky failure before subsequent admission. All workers join
+  before final drain and all Bounce/pinned/input owners remain alive throughout.
+  A real successful shared-uplink stream drain is the proof allowing event,
+  stream, pinned slots and tickets to release. Event success alone is not treated
+  as sufficient after a possibly enqueued failure. Worker exceptions are caught
+  on the tiny path; partial worker construction unwinds through the same Pool.
+
+  Failure before a complete Pool has no queued work and leaves all_retired=false;
+  constructed-Pool retirement is recorded separately. Both Bounce owners survive
+  copy-before-record failures, and unrecorded slots are not reacquired. A negative
+  or throwing REAL final drain fail-stops86 before cleanup. No failed-GPU/Rank
+  quarantine, retry, rollback or recovery is claimed. Destination bytes may have
+  changed on terminal load failure; no Ready/model publication follows.
+
+  With tiny=false, original8x4MiB bounce geometry, existing input hole/fallback
+  behavior and normal Engine load callers are retained. The tiny option is not
+  routed through Engine::start, CLI or serving. This proof does not fix or claim
+  legacy arbitrary failed-drain behavior outside its explicit research policy.
+
+Manual failure matrix and limits of its evidence
+  HOST constructor tests target three actual new-failure ordinals, assert output
+  sentinel preservation, and recover with a real stream/drain. Loader controls
+  assert named storage categories, actual destination bytes and no ticket leak.
+  Five semantic phase faults each assert exactly one intended trigger. Actual
+  pinned allocation failures target both prepared owners. Two early C++ staging/
+  control failures assert no workers started and complete quota release.
+
+  Copy/record/event-wait wrappers FIRST perform the real operation, require its
+  success, increment dedicated observed counters once, then return the semantic
+  failure. Tests require the intended trigger and real-success counts plus final
+  real shared drain with both Bounces alive. This distinguishes an actual queued
+  copy from a pre-operation mock failure; receipt enqueue counts are successful
+  return observations, not omniscient proof about ambiguous backend failures.
+  Final rad_stream_sync itself is not mocked by these wrappers.
+
+  The genuine negative-drain subprocess is separate: after earlier stream owners
+  retire, it creates a real HOST closed gate, observes real stream_sync STATE,
+  arms release traps, and expects exit86 before cleanup. This is test-process
+  containment, not GPU fault injection/recovery. Fork assumes no external active
+  worker threads, consistent with this standalone sequence; it is not an Engine
+  fork facility. No actual test/sanitizer result follows from source assertions.
+
+  Matching Release/ASanUBSan/TSan, all preserved Core/contract/compact/P3 cases,
+  and later separately idle-gated AQL construction are still required. Unknown
+  vendor allocation/access/destruction behavior, source-authorized Engine loads,
+  checkpoint/cache singleton activation, actual model/sampler execution and
+  production lifecycle remain later gates. There is no new Engine/CLI/serving,
+  model quality, TP/MTP or deployment result in Patch A or this review.

@@ -1,0 +1,99 @@
+Explicit checker-only Engram row source -> actual Rad/AQL lifetime gate
+=======================================================================
+
+Build this manual target with HIP-enabled rad_core and its normal exported AQL
+interposition/link options (WHOLE_ARCHIVE + ENABLE_EXPORTS), HIP runtime headers/
+library for checked pinned allocation only, and -ffp-contract=off. It is not a
+*_test.cpp or automatic CTest. No experimental kernel plugin/home is needed: the
+GPU consumer is an actual core D2D blit on the actual Rad stream. It does not
+claim Ctx/rad_issue, architecture/OpStager, serving or inference integration.
+
+Only in an approved tiny idle-card window:
+  env -u HIP_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES=0 \
+    <build>/tests/ds41-aql-engram-check --run-gpu \
+      --fixtures <source>/tests/data/golden/deepseek41-engram-store.json
+Repeat in a fresh process with --host-kargs for alternate core argument placement.
+Missing flags, host fallback, a backend other than AQL, multiple visible cards or
+non-gfx1201 are refused. The flag gate precedes all explicit device queries,
+streams, allocations, file writes and operations; linked HIP registration
+constructors may have initialized their runtime before main.
+
+Only two 217-byte synthetic assets
+-----------------------------------
+Each file consists of the known 73-byte prefix plus the first 144-byte IQ4_NL
+row (width256) from the independent checked-in synthetic store fixture. Literal
+bytes in this source must equal the supplied fixture bytes exactly before they
+are admitted with their separately pinned SHA256 identities and layers1/14.
+Their SHA256 pins were computed over these exact217B byte strings with Python
+hashlib.sha256, not guessed GGML IDs or full-model weights:
+  layer1  fa2911bd11ade3bf67dec0fa029c6cd040b6f88040b4d92c9ca571cea7d5c5aa
+  layer14 1525c78cc395df31e91e29596fb50a47bd7f297d959ae85a0921dd33c868bd4d
+The primary row decode must equal the independent F32 golden bytes. The secondary
+row is deliberately different and is checked through the existing CPU row decoder.
+No large download, model file scan/mapping, network, service or restart.
+
+Five transfers, four actual GPU D2D consumers
+--------------------------------------------
+The actual Iq4NlLayerStores/POSIX pread/cache, EngramStagingPool and unmodified
+RadEngramBackend are used. No fake Rad handles, mocked events, launch replacement,
+HIP stream/event construction, HIP copies, or HIP/Rad casts are involved.
+
+1. Hold actual AQL upload behind rad_stream_gate. Ticket stays nonquiescent and
+   another one-slot request returns FULL. Finish upload alone: ticket must still
+   remain nonquiescent before a final-reader seal.
+2. Hold its real core D2D reader behind another gate, cancel after reader enqueue,
+   prove staging cannot be reused, then open/drain and verify exact result bytes.
+   Cancellation does not revoke an already queued reader or its source lifetime.
+3. Submit the other asset and throw from the callback after its D2D copy queues.
+   The adapter must still record a final-reader fence, preserve error status and
+   keep the slot alive until actual stream completion. The copied row must land.
+4. Cancel a queued upload before consume: no new reader callback may run, its
+   output must remain unchanged, the ticket stays pending until fenced/drained,
+   and the shared row cache plus a fresh subsequent request must remain usable.
+5. Exercise the manual order_upload -> actual core D2D -> finish_readers path;
+   finish_no_readers must refuse after consumer ownership was acquired.
+
+Exactly two Rad events are reused for five operations. Old completion generations
+remain latched while new gated work is pending. Wrong SHA and out-of-table row IDs
+are refused. Every source/destination has 256-byte device guards, and readback
+uses actual core mapped-host memory/copies with system-scope stream completion.
+
+Checked physical pinned lifetime, with a strict process-final boundary
+-----------------------------------------------------------------------
+The checker-owned fixed registry precreates allocation ownership, uses checked
+hipHostMalloc/attributes/device-alias calls, and adopts the staging allocation's
+StagingCharge immediately. The ring uses one physical4096B pinned slot; it is
+reused logically only after upload plus final-reader completion. Physical free
+never occurs during the Rad run. Pool close leaves the pin AND adopted quota
+retained. Errors/partial allocation also return an owning wrapper for retention.
+
+After all tickets, pool, backend, device owners and actual Rad stream have drained
+and been destroyed, the checker calls checked hipHostFree. Only successful physical
+free refunds its adopted staging quota. A failed physical free retains both memory
+and charge until process exit. No Rad/AQL call occurs after this boundary.
+
+This restriction is necessary because direct external hipHostFree bypasses the
+current AQL locate-cache invalidation generation. The gate is NOT proof of a
+reusable external allocator that supports mid-run physical release/hot pool close.
+It uses no dummy/null core free to disturb that cache and makes no claim that the
+existing void rad_dev_free proves physical release. Ordinary core device/readback
+buffers use the existing trusted core teardown policy; their counters count owned
+requested extents, not checked driver RSS or physical-free acknowledgments.
+Unproven stream/owner teardown prevents pinned finalization and retains resources.
+
+Bounds and limitations
+------------------------
+Two stores share one16KiB packed-cache cap. A separate256KiB staging quota includes
+pool/source/slot controls, rounded pinned payload, explicit64KiB driver allowance,
+and metadata allowance. Fixed registry controls have a separate8KiB allowance.
+Core requested device/readback buffers are tiny and share an aggregate1MiB bound
+with those caps. The one core AQL queue's argument/bounce rings (~4+8MiB), driver
+metadata, allocator rounding and small CPU fixture copies are separately outside
+that fixture cap. The per-allocation driver allowance is conservative accounting,
+not a proven bound on HIP driver resident memory.
+
+This gate proves one bounded asynchronous row-upload/reader lifetime path on one
+stream, using actual Rad events and core blits. It does not prove row-ID discovery,
+automatic graph scheduling, lane1, prefix/rollback, graph replay, model quality,
+full-model context fit, TP, latency or throughput. The child has not compiled/run
+it; parent coordinates all builds and explicit GPU validation.

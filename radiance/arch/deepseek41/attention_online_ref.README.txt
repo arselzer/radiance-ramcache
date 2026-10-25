@@ -1,0 +1,111 @@
+Bounded scalar online64 BF16-numerator attention candidate
+
+Pinned source: deepseek-ai/DeepSeek-V4.1-Flash-1017 revision
+1bae0e1088993b9b82de08f59de5be5a34e42170, inference/kernel.py:311-389.
+Local inspected source: ROOT/reference/inference/kernel.py
+SHA2561236c3507019ed176f5dba5e04bcea58867cf654818c6cf138ed4845398c2455.
+See ROOT/DS41_OFFICIAL_CACHE_PRECISION_GAP.txt for the larger numerical gap.
+This code does NOT execute or establish bit parity with TileLang, native GEMM,
+GPU exponent lowering, trained logits or the official model. It is a named scalar
+mathematical candidate with the source's explicit storage/online boundaries.
+The existing F32 attention baseline and all runtime/architecture defaults stay
+untouched. No graph registration, GPU kernel, model load or serving change.
+
+API (namespace rad::deepseek41::attention_online)
+  View{heads,dimension,kv_rows,query,kv,sinks,selected,scale}
+  int evaluate(const View&,span<uint16_t> out,Workspace* scratch)
+query and KV are raw BF16 uint16 spans with exact shapes[heads,D]/[N,D]. KV is shared
+K=V. Sinks are exact F32[heads]; selected is I32[K]. Output is exact BF16[heads,D].
+There are no strides or implicit dtype casts, dimensions inferred from spans,
+owned result allocations, global state or dynamic diagnostic strings. Return codes
+are standard RAD_E_*; the API itself performs no heap allocation. Workspace is
+caller-owned, exclusive to the call, with fixed arrays totaling about69KiB. It
+holds only a1024-column numerator,64 scores/IDs/BF16 weights and32*1024 transaction
+output words, never a dense[queries,KV] score or probability matrix.
+
+Explicit caps: heads1..32,D1..1024,selected slots0..640,KV rows0..INT32_MAX.
+All span sizes are exact and products/byte ranges/alignment/pointer ends are
+checked before reads or scratch writes. Output must be byte-disjoint from all
+input spans. The WHOLE Workspace must be byte-disjoint from all live input spans
+AND output; aliasing its transactional result as output is refused. Readonly
+input spans may overlap. Missing Workspace or null required positive-size spans
+refuse. Source span allocations remain caller-owned/trusted; a span is the capacity
+contract. Empty KV is valid only when no selected ID requires a row.
+
+Every selected ID is checked BEFORE any selected KV payload read. Only-1 is
+padding, anywhere in the sequence. Other negative/out-of-range IDs refuse; IDs
+are not clamped. Query, sink and selected KV payloads are validated before math;
+unselected KV rows may be nonfinite or inaccessible and are not touched. Duplicate
+IDs retain multiplicity, input order is preserved, and padding occupies its literal
+candidate slot. No sorting, deduplication or compaction. The final tile is padded
+to64 with ID-1, score-Inf and KV+0, as in the source. A padded zero PV addition is
+retained rather than silently omitted, including its signed-zero consequences.
+
+Arithmetic boundaries
+  1. Decode supplied BF16 q/KV to exact F32. A scalar QK dot visits dimension in
+     increasing order with separate F32 product and addition, then multiplies
+     supplied positive finite F32 scale. Native GEMM reduction order is NOT modeled.
+  2. Start each head's online maximum at the source's finite F32-1e30, denominator
+     at+0 and numerator vector at+0. Visit selected slots in consecutive64 blocks.
+  3. New maximum includes previous maximum and this block's scores. alpha is
+     F32 std::exp(previous-new). Compute original unnormalized exp(score-new) in
+     F32 and sum those ORIGINAL F32 values into the block denominator.
+  4. Round EACH UNNORMALIZED exponential to BF16 BEFORE PV. Rescale old numerator
+     by alpha, then scalar PV accumulates these BF16 weights times BF16 KV, in
+     candidate order. Denominator uses old_den*alpha +F32 block_sum. No normalized
+     probability is rounded to BF16 as a substitute.
+  5. AFTER ALL KV blocks, add exp(sink-current_max) to the denominator. Sink does
+     not update the running maximum and contributes no value. Divide the F32
+     numerator by this denominator, then round the final result to BF16.
+Separate volatile F32 destinations define product/add/subtract/divide boundaries
+and prevent contraction into a different FMA. std::exp, scalar reductions and
+host RNE are still not the native TileLang exponential/GEMM/reduction tree. Only
+IEEE F32 round-nearest with gradual underflow is accepted; controls are checked,
+never changed by the candidate. Normal math/libm may set exception flags/errno.
+Compile this profile with -fno-fast-math -fno-finite-math-only -ffp-contract=off.
+If __FAST_MATH__ is defined or __FINITE_MATH_ONLY__ is positive, the environment
+check is compiled to false and numerical execution refuses RAD_E_UNSUPPORTED.
+An -Ofast/finite-only build must not be treated as the specified IEEE candidate.
+
+Nonfinite/undefined cases (explicit candidate policy)
+All query/selected-KV inputs must be finite. Sink may be finite or-Inf only.
+Reject nonfinite scalar QK products/sums/scores, numerator products/accumulations,
+pre-sink denominator, and nonfinite/unrepresentable final BF16 output. These are
+stronger explicit refusals where the literal source might propagate NaN/Inf.
+Positive infinity is permitted ONLY in the FINAL sink exponential/denominator;
+finite numerator divided by+Inf yields the literal signed zero. In particular,
+all-padding with ordinary finite sink0 leaves max=-1e30 and exp(1e30)=+Inf, giving
+zero. All-padding with sink=-Inf instead has0/0 and is REFUSED, preserving caller
+output. An extremely negative finite sink can underflow to the same zero-denominator
+refusal. This does not relabel the source comment as an oracle for its undefined
+corner. Finite scores below-1e30 can also underflow all exponentials because the
+initial maximum is finite; that literal boundary is retained, not stabilized away.
+
+All input/metadata failures leave output unchanged. Derived arithmetic failures
+may modify Workspace but still leave the ENTIRE caller output unchanged, including
+when an earlier head already produced a temporary result. Output is copied only
+after all heads succeed. Workspace contents are unspecified on refusal. Concurrent
+reuse of one Workspace or mutation of input spans is outside this call contract.
+
+New CPU tests: tests/deepseek41_attention_online_test.cpp, header-only math, normal
+ABI/test include paths. Parent owns CMake/compilation/execution. Eight TEST bodies:
+  * counts0/1/63/64/65/127/128/640 versus exact rational/long-double BF16 oracle,
+    and supported heads32/D1024 geometry;
+  * explicit numerator witness: q[1,0],KV[[0,0],[-2,1]] gives value0x3DF5,
+    while rounding normalized probabilities gives0x3DF4;
+  * duplicate multiplicity, literal padding/block order witness0x4037 vs0x4038;
+  * sink+Inf-denominator, sink=-Inf, all-padding and finite-initial-max policies;
+  * late ID/nonfinite failures, finite-payload QK/PV overflow and later-head atomicity;
+  * unselected nonfinite/protected KV rows and bad-late-ID-before-KV-read proof;
+  * exact sizes/caps/null/range/alignment plus output/workspace/input byte aliases,
+    checked before scratch mutation;
+  * non-RNE and x86 FTZ/DAZ refusals preserve scratch/output/input bytes, with RAII
+    restoration of the complete floating environment and MXCSR controls.
+The independent BF16 test oracle uses long-double nearest-neighbor search over
+representable values, not the implementation's bit-add converter. Hand witnesses
+are away from final BF16 midpoints; they prove the selected arithmetic distinction,
+not a general high-precision substitute for native online/GEMM execution. These
+tests run only the new scalar header. They do NOT execute the unchanged pinned
+TileLang function or establish its execution/bit parity; the source hash records
+provenance only.
+No compiler, GPU, shared-source/default or service operations were run by the child.

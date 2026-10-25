@@ -1,0 +1,335 @@
+Actual tiny Engine startup transport patch design V1
+2026-10-25. Source inspection/design only; no Core edits, compilation, Engine,
+model/sampler step, GPU, serving or deployment performed by this author.
+
+Entry conditions and scope
+The ee131f1c corrected source/declaration contract now passes the parent's actual
+Release/ASanUBSan/TSan runs:7groups263checks,24shape/7graph/11SamplerOOM/
+7source-binding/10tokenizer refusals,2stale-cache and5actual-tokenizer witnesses.
+It proves the complete219-tensor synthetic source,4artifacts,320/BOS257/EOS256/
+EOT256,43actual units and exact compact quote. The individual compact, native
+DEVICE owner/persistent-input, combined Core and bounded physical S1 gates are
+also prerequisite evidence; no claim that these already compose Engine follows.
+This document supplies the next implementation contract for a NEW Core copy,
+not authority to edit the frozen parents or deploy/restart. Parent design review
+precedes Core authoring. Current packages remain EngineEligible=false.
+
+Target behavior: actual Engine::start through real metadata/plugins/declaration,
+source export/P3/native plan/Pools/ordinary load/persistent native owner/actual
+Rank::ctx initialization/step-state construction, then final TransportReady.
+No Engine::serve, rank_loop, scheduler publication, model step, sampler run or
+HTTP starts. The tiny request explicitly refuses serve even after TransportReady.
+Initial HOST transport is validated first; actual AQL startup requires matching
+build and a separately approved idle GPU window. Actual AQL graph rows/layouts
+must resolve honestly; no host-backed allocator or forced HOST kernel substitution.
+
+Actual source anchors and decisions
+1. engine.h owns unique_ptr<Checkpoint> ckpt_ and unique_ptr<CheckpointSources>
+   ckpt_src_; read_checkpoint_metadata constructs/opens them directly. There is
+   NO shared Checkpoint field to adopt. engine_bringup.cpp is the only direct
+   consumer: sources,metadata,plugin import choice,refusal report,load walk,vocab.
+2. Engine::Rank in engine_priv.h embeds Program,Plan,Pools,Mover,Ctx,Sampler.
+   Its existing record_owner is unique_ptr<ExpertRecordOwner>, NOT the distinct
+   NativeBackingOwner required here. It is currently inactive in Engine startup.
+3. Engine::plan currently configures Pools BEFORE pure Planner; this is wrong for
+   native admission. Its generic VRAM resolution also creates2probe queues.
+4. load_weights initializes Mover, then resolves source/encoding, publishes the
+   residency destination, performs weight_share and stages every checkpoint
+   weight. NativeStore is not an ordinary memcpy destination. Omission must move
+   before destination lookup/publication and AFTER real source/share validation.
+5. start creates Ctx's stream implicitly then binds Mover to it. Native owner
+   opening requires a real compute stream BEFORE Ctx admission instead.
+6. Engine::declare_sampler adds PERSIST sampler.tokens[I32,1], beyond the tested
+   standalone Sampler graph. Engine arena/buffer counts must be measured again;
+   the prior26880B arena is evidence, not an Engine arena assertion.
+7. build_ctx always sets BF16 KV dtype and128KiB wire threshold. The sealed SDK
+   no-KV/no-collective profile admits0defaults. Tiny build_ctx must explicitly
+   normalize ONLY these unused ABI-default fields to0 and preserve every other
+   exact field, then prove zero KV/attention/collectives post-declare. Default
+   build_ctx remains byte-behavior equivalent. No dummy heads are permitted.
+8. generic Ctx::shutdown frees arenas/tables even after a failed drain, and
+   Engine/Mover destructors ignore some drain/quiesce statuses. The new tiny
+   profile needs a real fail-stop retirement policy BEFORE any async submission;
+   an earlier successful drain does not excuse a later genuine negative drain.
+
+Proposed private API and storage (new names, not existing APIs)
+Add engine_native_startup.h/.cpp plus the fixed tiny factory implementation.
+  TinyNativeStartupRequest: noncopyable private-constructor request created by
+    make_glm53_tiny_transport_request; exact profile/version/backend, bounded
+    checkpoint path, separate private work-root parent, fixed caps/module pins.
+    It accepts no arbitrary SourceCatalog,NativeRecordSource,Ready bool or
+    independently produced checksum/manifest as a shortcut.
+  TinyNativeStartupState: Engine-owned unique pimpl, fixed source factory,
+    retained checkpoint binding, source setup/provider, pure metadata Plan,
+    compact NativeInventory, budget/creation/retirement ledgers and sticky phase.
+  Engine::set_tiny_native_startup(unique_ptr<Request>): internal/friend-only,
+    empty state and before the FIRST start only; no production CLI/config flag.
+  Engine::checkpoint_view(): returns tiny state's exact Checkpoint when opted,
+    otherwise ckpt_.get(). checkpoint_sources_view()/sources() similarly select
+    the ACTUAL cache inside BoundSources or default ckpt_src_. These are the
+    centralized replacements for ALL direct consumers listed above.
+  Engine::tiny_transport_snapshot(out): bounded read-only receipt for the manual
+    fixture; no mutable Program/Pools/Ctx/source escape or alternate Ctx proof.
+
+Keep default ckpt_/ckpt_src_ as their existing unique owners. In the tiny branch
+the fixed source factory constructs the ONE private SourceCheckpoint owner and
+its unique actual Checkpoint, and stores it in Engine::TinyNativeStartupState;
+ckpt_/ckpt_src_ stay empty. BoundSources retains that SAME owner and owns the
+unchanged actual Core CheckpointSources. Do not open a second Checkpoint/cache,
+change all default owners to shared_ptr, or borrow an external Checkpoint whose
+lifetime is merely promised. The Engine owns this source transitively through
+its private state; every metadata/load/export consumer uses checkpoint_view.
+Expose only bounded const find/refused/missing delegates from BoundSources for
+the stock loader; no second resolver map. Destructor order is explicit below.
+
+Rank adds unique_ptr<NativeBackingOwner> native_owner beside, not in place of,
+the existing legacy record_owner. Add a checked Rank-owned compute handle BEFORE
+Mover in member declaration order: Program,Plan,Pools,NativeCompute,Mover,
+native_owner,...Ctx,Sampler. Reverse destruction then keeps compute/Pools alive
+through Ctx/owner/Mover teardown. The NativeCompute handle does not release an
+unretired stream; its policy is installed at creation. Source state outlives all
+ranks and all callbacks; Registry closes after ranks as in the current destructor.
+
+Cold admission and actual quote providers
+Before source mapping, parse, new worker, sampler pinning, stream or bulk payload
+allocation, consume the unchanged conditional192MiB requested-owner ledger:
+201326592B cap,135244800B category reservations,12MiB checkpoint/source,
+8MiB source factory,24MiB provider metadata,4MiB compact metadata,6MiB pools,
+4MiB arena/scratch,4MiB Ctx/owner/sampler/step control,2MiB loader,
+16785408B auxiliary stacks/guards,38538240B backend stream reservation and the
+other previously reviewed categories. No category grows because a quote fails.
+Keep aliases/mapped bytes, logical sizes, actual requests and VMem reserves
+distinct. This is neither RSS nor driver physical-page accounting.
+
+Quote fields must come from the actual implementing translation unit:
+- Sampler::startup_quote(SamplerConfig): sizeof(DeviceSampleParams),rows,history,
+  mask,candidates,logprob planes/request counts/rounding. Expected current actual
+  values11requests/18984B/49152B page upper are checked, not reimplemented wire
+  struct guesses. Give Sampler's actual stage allocation a consumed budget ticket.
+- device_startup_quote: backend/version,actual stream/event/control sizeof,
+  Task/kQueueDepth ring,thread requirement and implementation-control allowance;
+  AQL actual kQueuePackets4096,kKargSlot1024,4097karg slots,8MiB bounce,packet
+  sizeof/count,host-kargs placement and all queue/signal/control owners. Add an
+  optional trailing private DeviceBackend quote hook; absent/unknown refuses.
+  The known AQL request term12846080B/stream,38538240B/3streams is checked against
+  the same private constants, not copied into an unrelated mirror struct.
+  HOST actual sizeof(HostStream)+actual1024Task capacity/control request quote
+  must fit128KiB PER stream; actual default stack<=8MiB/guard<=4KiB. Explicit
+  bounded thread-start/control allowance is identified separately from sizeof;
+  actual creation/allocation traces must fit it under the pinned implementation.
+- RelayoutPool::tiny_startup_quote: actual StagedWeight/Copy/Uplink/once_flag/
+  vector/deque/control capacities and the sealed tiny loader parameters below.
+- Ctx::startup_quote: arena_plan_bytes/Arena alignment,buffer templates/ops,
+  actual WTAB representations,route banks,events,deferred state and exact
+  ExpertPrepareState readback/maps; no mirrored private structs. Expected route
+ 4096pinned+128device and68current-route readback are checked from actual types.
+- NativeBackingOwner::startup_quote: actual Impl,WeightSlot fixed array W,
+  request/publication/held lease/class vectors and metadata. A W WeightSlot table
+  is legal/charged; a W WeightInfo snapshot is forbidden. NativeInventory returns
+  its actual compact construction peak/immutable plus complete footprint.
+- Engine step_state_quote beside engine_draft.cpp uses actual StepSlot,n_slot1,
+  actual loaded EOG{256,258},device/host arrays and ctor uploads. Unknown owners,
+  nonzero draft/media/profile/oracle/XP/workspace requirements refuse this profile.
+
+Private stream/thread tickets are reserved BEFORE creation, shared by all tiny
+startup callers and explicitly inherited by loader/declaration threads. Backend
+stream_create checks its matching quote and at most3owned live streams; actual
+HOST workers plus2loader workers peak at5. The1declaration thread joins before
+loader/compute creation and reuses the reserved auxiliary-stack envelope. Check
+actual pthread defaults before each creation; changed attrs refuse. No HTTP,
+rank-loop/scheduler/StallWatch/probe/OpenMP kernel team starts in this transport.
+Calls outside the tiny profile retain normal behavior; there is no processwide
+fake backend or allocator substitution.
+
+Stage sequence on the actual Engine
+A. Requested->ColdAdmitted: validate bounded Config/module/source/work paths and
+   exact profile. n_spec0,TP1,rank0,T5/ctx5/seq1,deterministic,all unsupported
+   features off. Cold budget/actual sampler/thread/stream quotes precede source
+   open and all charged allocations. Any earlier Engine constructor metadata is
+   either constructed by the bounded request factory under its CPU reservation
+   or explicitly accounted as preexisting baseline; no silent unbounded env copy.
+B. SourceOwned: fixed factory performs the reviewed FOUR-file preflight, opens
+   the unique Engine-owned SourceCheckpoint once, verifies both file/mapped bytes
+   and actual tokenizer contract, and retains its seal/BoundSources. Work files
+   are separate from the closed four-file checkpoint root. read_metadata uses
+   this object; the generic n_head>0 guard is bypassed ONLY by this exact sealed
+   request/id/metadata/source. All feature-off metadata guards stay unchanged.
+   Engine::load_vocab reads this same checkpoint and reasserts actual IDs/flags.
+C. Declared: actual Engine::declare invokes rad_tools_declare into the final
+   Rank::program with real Engine::declare_sampler callback, instances=false for
+   this branch only. No second declare or second W snapshot. Requote the actual
+   added sampler.tokens buffer/arena. Assert real no-attention/KV/media/draft/
+   collectives,43unit topology,all source/plane/name/order bindings and caps.
+   Before kernel init, admit selected instances. Initial closed mode accepts only
+   rows whose init callback is null (or an explicitly reviewed bounded private
+   quote later); opaque init/hipMalloc is unsupported, not an uncharged bypass.
+   Extract/reuse Builder::finish_instances' exact loop as one shared helper over
+   actual Program/Registry::init_instance; default Builder uses the same helper.
+   Initialize actual selected instances in place after admission; no reselection,
+   fake instances or duplicated graph. Init refusal poisons this Engine.
+D. MetadataPlanned: make the truthful actual checkpoint-style AllVram Plan with
+   host_backend reflecting the real backend,43units and no allocations. Use the
+   existing pure Planner and exact source/share checks. No generic free-VRAM
+   resolver/probe queues in this sealed fixed tiny branch.
+E. SourceReady: fixed factory derives exact physical ranges from THIS retained
+   Checkpoint plus its bounded actual safetensors header and source cache. A new
+   small SourceRange table holds219named raw references/offsets/shape/type/bytes,
+   not WeightInfo copies. Bind every range to same raw tensor object/data, actual
+   Quark import_piece views, header offsets and four artifact stamps. Verify map
+   order/source/group/selected shares against Rank::program and metadata Plan.
+   Derive the192gate/up/down code/scale spans from this same file (paths may
+   repeat); they are complete synthetic checkpoint ranges, not partial rows.
+   The existing physical bridge's tensor strings are canonical ROLE keys, not
+   actual checkpoint tensor names: retain explicit named raw-range binding before
+   translating to that format. Keep synthetic provenance; do not assert real GLM
+   checkpoint provenance or relabel partial excerpts as complete records.
+   Run actual bounded physical materialize -> S1capture_unit for all32actual
+   expert units -> actual pack into3layer-mod3 shards -> actual Reader padding/
+   checksum/catalog validation -> ShardedNativeSource::open with typed expected
+   specs/catalog from the same binding. Its real Store.open repeats S1 validation.
+   Keep all publications in private owned NOREPLACE work directories and preserve
+   previous caller output on failure. No unrelated/prebuilt catalog is accepted.
+   The result owns the exact source identity/Program identity/provider; temporary
+   specs/catalog/export metadata can retire after the real source captures them.
+F. NativePlanned: derive24owned units from actual source catalog and8expert0
+   residents from actual metadata Plan, not assumed unit indices. Bind actual
+   compact NativeInventory on Rank::program, preserving all caps/backend checks.
+   inventory.configure_pools produces exact Config; pure Planner with this typed
+   inventory produces NativeBacked final Plan BEFORE any Pools allocation.
+   Validate original static/member bytes,196608native device+landing and current
+   <=1MiB logical weights/1MiB logical KV solution. Actual AQL edge layouts may
+   differ: quote/refuse honestly; HOST393856B is not a universal AQL constant.
+   Configure real Pools::configure_native with counted allocators delegating
+   rad_device_allocator. Count actual rounded requests and VMem separately:
+   KV::init_elastic can bypass MemAllocator for a VMem reserve on AQL. Its unused
+   1MiB logical range must be quoted/capped (rounded<=2MiB),with0commit for no KV;
+   do not falsely report3backing allocations. The unchanged6MiB category covers
+   either HOST3rounded backing requests or AQL backings+bounded VMem reservation.
+G. ResidentLoaded: create Rank-owned compute stream, initialize actual Mover on
+   native Plan/Pools and bind compute ONCE before owner opening. The stock loader
+   must resolve/validate each actual source encoding and call real weight_share
+   BEFORE consulting typed omission. For every owned member, validate inventory
+   unit/name/source/shape/span plus exact CkptWeight binding, then count/skip it
+   BEFORE residency destination,WeightInfo.ptr assignment,dst_fits,StagedWeight,
+   lambda or memcpy. Never stage the Native sentinel. Check96omitted views/
+   24units/626688member payloadB and exactly59ordinary views/393856HOST identity
+   storedB; preserve actual AQL quotes where required.
+   Finish the real bounded ordinary loader and actual shared uplink retirement;
+   verify every ordinary member against same checkpoint independently of the
+   loader fill routine. Compare8expert0 members against S1 bootstrap one bounded
+   unit at a time if used as a second oracle. Compare the FOUR actual member
+   spans,encoding,source identity and final null-readiness/completed state. Do
+   NOT compare uninitialized inter-member/end padding in the ordinary resident
+   pool against S1 canonical zero padding; initialize/charge it explicitly first
+   if a later test needs that stronger condition. Then finish_bootstrap/trim and prove
+   HOT/COLD live payload0 and no bootstrap leases before owner opening. Ordinary
+   nonexpert weights still load from the Engine checkpoint, not forged S1 data.
+H. OwnerBound->ContextBound: store NativeBackingOwner::open in Rank::native_owner
+   (not a temporary or the legacy owner). CtxDesc.stream is the Rank compute;
+   residency is actual mover.residency; record_passes=false;expert_prepare_owner
+   is that persistent owner; limits R2/E4/K2/maps8/entries32/readback68 with actual
+   metadata quote. Call actual Rank::ctx.init. Skip the old second compute bind.
+   Assert actual PermanentV1/TP1/eager/no collector/no second lane. Owner/typed
+   inventory/stream identity admission is the real final Ctx commit. No other Ctx
+   or standalone fixture substitutes for this Engine-owned object.
+I. TransportReady: actual configure_kv with only the null sentinel must carve no
+   real group; actual step_state_init may run with quoted one slot/EOG2 and its
+   real compute uploads/drain. No step/model/sampler invocation occurs. Audit
+   sources/provider/inventory/guard bytes/resident completion and all requested
+   peaks. Final Ready publication is nonfallible and last. Engine::serve refuses
+   this transport-only request. Ready does not mean24native experts were uploaded:
+   consumers are sentinel-bound until a later separately tested routed prepare.
+
+Tiny ordinary loader and retirement changes (default profile stays ordinary)
+RelayoutPool gains an optional sealed TinyLoadProfile consumed by start; start
+returns status and is exception-safe even after one worker was created. Quote
+exact2workers,1MiB input arena,2*128KiB pinned slots/worker (512KiB combined),
+output<=128KiB/worker,actual bounded items/queues/copy/once/event/control storage
+under2MiB. Disable unbounded input new[] fallback,256MiB retained output and the
+generic4GiB region only for this profile. No silent fallback on fragmentation;
+bounded reservation rejects instead of holding an incomplete weight indefinitely.
+All59staged descriptors/closures are bounded and source owner remains retained
+until every worker,fill callback and possible DMA retires.
+
+Crucial ownership change: the tiny profile's TWO WorkerState/Bounce objects are
+POOL-OWNED, allocated/charged before starting either worker. Worker stacks borrow
+their state's Bounce and NEVER destroy/free it on exit. Keep both states/buffers/
+events alive across ALL worker joins and the final shared-uplink real drain.
+RelayoutPool::finish is idempotent and explicitly releases these states only
+after that drain; the destructor calls that checked finish. A partial-start error
+sets stop/done,joins every successfully created thread,drains,then releases. The
+existing worker-local Bounce automatic destructor is NOT used in the tiny path.
+Its event flush alone cannot retire a copy enqueued before a failed record.
+
+Uplink owns sticky failure/stopping/possibly-queued state under its existing
+shared mutex. A Bounce slot becomes busy/possibly enqueued BEFORE memcpy_async,
+not after event_record. Record/copy semantic failure stops ALL workers' future
+submissions under that lock and retains every ambiguous slot/event/source. A
+successfully recorded event can retire its own copy; any unrecorded/ambiguous
+copy requires REAL rad_stream_sync of the shared uplink. One worker's local
+destructor cannot free a possibly queued slot while another still submits.
+Join/stop protocol: stop submissions -> every worker drains/retains its own busy
+slots through shared state -> join all workers -> final real uplink drain ->
+destroy stream -> release slots/input/closures. On unproven real drain, invoke
+the explicit tiny fail-stop policy before ANY backing release. A wrapper that
+returns a semantic error AFTER a real successful drain is distinguished from a
+genuine negative drain; tests must witness both. This is not production recovery.
+
+HOST h_stream_create needs real RAII: use a local unique HostStream owner, resize
+the actual Task ring, construct its worker, then publish *out last. Catch bad_alloc
+and system_error; no exception crosses the C ABI and caller output is preserved.
+If a worker can exist at a failing later site, queue/join it before releasing
+its ring/control. The current raw new/resize/std::thread sequence leaks on throw.
+Actual request/thread/stream tickets are released only after destruction/join.
+
+Terminal/shutdown discipline
+Phase is sticky Requested,ColdAdmitted,SourceOwned,Declared,MetadataPlanned,
+SourceReady,NativePlanned,PoolsLive,ResidentLoaded,OwnerBound,ContextBound,Ready;
+any failure latches FIRST status and moves to Terminal. A same-Engine start or
+request replacement refuses before work. Recovery is a fresh Engine and fresh
+owned generation, never mutating/retrying the old failed Ctx/source in place.
+Install a tiny-only retirement policy on CtxDesc/Mover/loader/compute ownership
+before their first async work. It calls real sync and is explicitly noreturn on
+a genuine failed drain in this isolated manual profile. Ctx::shutdown's existing
+void/negative-drain free path and Mover destructor's ignored sync are not proof;
+the tiny policy must intercept those negative returns BEFORE the free branches.
+Default Ctx/Mover paths keep their existing behavior until a separate general fix.
+
+Normal teardown/failure after queued work: stop/join loader -> real uplink drain;
+quiesce NativeBackingOwner while compute/Ctx live -> actual Ctx.shutdown under
+the checked retirement policy -> owner.close_after_context_shutdown -> drop owner
+-> Mover retire/destroy -> Rank compute destroy -> Pools destroy. Clear ranks
+before closing P3 provider/cache/BoundSources/checkpoint/work files; close Registry
+last. Ctx partial-init shutdown uses the same policy. Semantic failures with proven
+drains return their error after cleanup; unproven drains fail-stop instead of
+unwinding into freed arenas/Pools. No bare leaked Owner Impl is treated as enough
+while Mover/Pools still destruct. No production quarantine/recovery claim.
+
+Reviewable patch/validation split
+Patch A: private actual quote/creation hooks,HOST partial-construction RAII,
+sealed tiny Loader parameters/busy/shared-drain cleanup and real failure tests.
+No Engine activation in A. Patch B: centralized source ownership/request/state,
+shared actual instance init helper,typed source factory from Engine checkpoint,
+native-before-Pools plan/load omission,persistent owner/Ctx/Ready/shutdown.
+Author both only in NEW matching Core/prototype after parent review. Preserve
+frozen StepA/source/physical/device parents and all their receipts.
+
+Required observations/refusals: actual singleton Engine checkpoint/cache identity;
+S1all32fresh records/3shards/24owned8bootstrap; foreign/stale source or range
+rejected before export/Ready; default no-request zero native callbacks; bad native
+source/share cannot bypass validation merely because it is omitted;96omitted
+views never write/stage sentinel;59real loads match independent bytes;0retained
+bootstrap payload; persistent owner and actual Ctx admission; extra stream/thread
+or changed defaults refused before creation; one-below each resource cap; every
+partial-thread/OOM/copy/record/wait failure witnesses its actual trigger, preserves
+caller output/Ready and balances credits after real retirement; subprocess
+fail-stop on genuine unretired drain; same-Engine retries refuse. Ready receipt
+contains actual per-category current/peak/request/VA/commit counters,source/graph/
+native compact counts and0model/sampler/scheduler calls,not fabricated fit labels.
+
+Run matching whole-Core HOST Release/ASanUBSan/TSan plus all unchanged compact
+normal/collision/inventory,unified23/Permanent17,strict P3/physical and existing
+Core/weighted/readiness regressions. Then matching AQL build and separately
+approved real GPU startup transport with actual default/host-kargs as supported.
+Do not infer numerical Engine/logits/quality/TP/MTP/full-model support or speed
+from startup. A later actual Engine-owned numerical/scheduler oracle is separate.

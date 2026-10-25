@@ -1,0 +1,28 @@
+QDQ candidate fixtures: provenance is deliberately mixed and explicit
+
+deepseek41-qdq-generate.py reads pinned official kernel source and records primary
+AMD header hashes, then uses existing CPU-only Torch2.14.1+cpu. GPU masks are
+hidden before imports; no GPU enumeration/model weights/TileLang execution.
+
+Actual CPU Torch execution: E4M3 all codes/cast boundaries; E8M0 decode bytes;
+BF16 cast boundaries; FP8 quantization and E4M3 scale casts within the newly
+interpreted pipeline. The pipeline itself is NOT an unchanged official function.
+FP4 CPU casting is unsupported. Its quantization uses an independent exact
+Fraction-distance nearest-codebook oracle, grounded in the vendor's documented
+E2M1 format and round-bit/sticky/odd ties-to-even implementation.
+
+The local CPU Torch E4M3 cast saturates overflow, including Inf, to448. The C++
+candidate deliberately refuses >464 and nonfinite inputs. candidate_accepts and
+candidate_status distinguish that stronger refusal from the observed cast bytes.
+Exact official TileLang overflow lowering remains unverified.
+
+The dedicated index half_min_normal row preserves ±2^-127 after code0.5 times
+scale2^-126. A GPU port that flushes it to zero has failed the portability gate.
+Diagnostic codes are logical one-byte-per-code, not an invented packed cache ABI.
+
+See arch/deepseek41/qdq_ref.README.txt for API/source anchors and limitations.
+Reproduce with /home/as/venvs/embed/bin/python deepseek41-qdq-generate.py on the
+recorded environment; the script itself sets ROCR_VISIBLE_DEVICES=99,
+HIP_VISIBLE_DEVICES=-1 and CUDA_VISIBLE_DEVICES=-1 before importing Torch.
+ROOT/ds41_amd_host_fp4_oracle.cpp is an additional optional actual-vendor CPU
+conversion checker. It is not a dependency of portable project tests.

@@ -1,0 +1,99 @@
+Bounded original-IQ4_NL Engram row source
+
+This provides a CPU POSIX row backend and cache, not a registered Radiance serving
+architecture or a measured SSD/GPU integration. It reads tiny synthetic files in
+tests. No model payloads or real device workloads have been used to validate it.
+
+Source admission
+
+Iq4NlAsset supplies an installer-verified SHA256 pin, path, full expected file
+size, exact data byte offset, layer ID, row count, width and named format
+"gguf-iq4_nl-block-v1". The store does not guess a dtype from an external GGML type
+number, parse an unbounded GGUF header, map the full table or scan it to recompute
+the content hash. Full SHA verification and immutable model asset installation
+are the installer's responsibility before source admission.
+
+The fd is opened O_RDONLY|O_CLOEXEC and must refer to a regular file of exactly the
+pinned length. Checked arithmetic bounds the complete table extent against the
+file and off_t. The fd's device/inode/size/mtime/ctime epoch is retained. Visible
+changes cause reads, including new cached hits, to fail. A live lease remains an
+immutable copy of its original row. Rename/unlink does not redirect an open fd.
+Epoch checks are best-effort mutation detection, not a cryptographic proof or an
+OS lock against an external writer; installed assets must remain immutable.
+
+Layout and decoding
+
+The original IQ4_NL layout is 18 bytes for each 32 values: one little-endian F16
+scale followed by 16 nibble pairs. Low nibbles are values 0..15, high nibbles 16..31,
+using the fixed GGML IQ4_NL level table. The half decoder handles signed zero,
+subnormals, infinities and NaNs. Cache payload stays in original packed bytes;
+leases decode only a requested row into a caller-owned float span. The synthetic
+oracle is derived from the independently decoded gguf-import.json fixture.
+
+Budget and ownership
+
+Use Iq4NlLayerStores::open with ONE total budget across both sidecar extents.
+For this target, layer 1 has 384006168 rows and layer 14 has 384016682 rows, both
+width 256. A total 2 GiB cap is divided between them after group controls are
+reserved; it does not allocate 2 GiB per layer. Each store's actual allocation is
+reported and the aggregate cannot exceed the total cap. The common per-store
+budget field is overridden by this global division; other common tuning options
+are retained. Independent store owners isolate layer/asset namespaces even when
+both extents share a file SHA.
+
+Every store uses a single preallocated slab containing packed cached rows,
+clock-eviction metadata, open-addressed row lookup, bounded request workspace
+and coalesced-read scratch. Loading and leased rows occupy those same bounded
+slots. Fixed object/string/control-block/allocator allowance is reported too.
+There is no per-read heap payload allocation. A fast hot-batch operation uses at
+most 64 slot indices on the caller stack. Caller lease containers, decoded output
+spans, thread stacks, kernel page cache and an optional external I/O backend's
+own resources require separate budgets; the production RAM receipt must count
+them. The default backend is plain pread and owns no extra I/O payload buffers.
+
+Iq4NlRowLease is move-only, pins its row and retains its store owner. Eviction
+cannot reuse a pinned/loading slot. Decoding an existing lease still works after
+cancel or after the original shared store handle is dropped. Last-lease release
+permits eviction/destruction; RAII closes the fd and frees the slab after active
+operations/leases no longer hold the owner. Excess pinned capacity returns
+RAD_E_FULL rather than waiting indefinitely or expanding the budget.
+
+Batching and concurrency
+
+lease_many sorts a bounded request workspace, deduplicates IDs and combines only
+adjacent requested cold misses into one pread range, capped by max_io_rows. It
+never fills gaps or speculatively reads the entire table. Partial pread results
+and EINTR are retried with exact offsets; EOF/EIO cancels publication of the whole
+batch and releases all reservations. Row pin outputs remain unchanged on failure.
+copy_rows streams requests across a smaller cache and decodes into caller memory;
+on error its output may have a written prefix, which callers must discard.
+
+Cold batches serialize on one bounded workspace per store. Ready single leases
+and hot copy_rows batches of up to 64 rows at a time bypass unrelated cold I/O.
+No pread holds the cache mutex. Concurrent same-row waiters reuse the committed
+row. Global cancel() is model-shutdown only. Individual requests supply a std::stop_token
+as the final copy_rows/lease argument or bind it through row_lookup(stop_token).
+It propagates through hot copies, workspace/loading waits and exact-read polling;
+a per-request stop callback wakes waits without cancelling the shared cache.
+Other requests and later hot/cold accesses stay usable. Caller-owned stop state
+and callback stack/control allocations are outside the row-cache allocation cap.
+
+Both forms of cancellation wake their affected waiters. A POSIX pread already in
+progress cannot be forcibly interrupted, but its owner discards reservations on
+return. There are no background reader threads to outlive the store.
+
+Integration
+
+Iq4NlLayerStores::row_lookup returns the existing Engram RowLookup callback,
+selects the exact layer asset, checks width/count/output extents and serves only
+requested rows. Hash-column/bucket validation remains in gather_rows using the
+model's pinned controls. The forthcoming graph must hold leases or copy into
+owned pinned staging until transfers/compute finish; this CPU backend makes no
+GPU lifetime guarantee and does not register itself as a production kernel.
+
+Counters cover requests, hits, unique misses, duplicates, waits, committed loads,
+evictions, failures, actual pread calls/bytes, slab/fixed/payload/metadata/scratch
+allocation, loading/pinned/reference counts and peak in-flight I/O. They are
+readable without waiting for a cold read. Aggregate allocation receipts are
+available from the layer-store group; tune throughput only after numerical and
+real-device gates pass.

@@ -1,0 +1,72 @@
+Explicit tiny AQL math / persistent compressor / FFN integration gate
+====================================================================
+
+This manual checker is deliberately not *_test.cpp and must not be registered
+as an automatic CTest. It uses the same normal HIP-enabled rad_core link/export
+options as ds41-aql-runtime-check / ds41-aql-ops-check (WHOLE_ARCHIVE and
+ENABLE_EXPORTS), with -ffp-contract=off and isolated libquant/libds41 dependencies.
+
+Only during an approved tiny idle-card window:
+  env -u HIP_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES=0 \
+    <build>/tests/ds41-aql-math-state-check --run-gpu \
+      --home <build>/radiance_home
+Run again in a fresh process with --host-kargs to cover the alternate AQL argument
+placement. Missing explicit flags, host fallback, non-AQL backend, multiple visible
+devices or non-gfx1201 are refused. The flag gate precedes explicit device queries,
+Registry, streams, allocation and launch; linked HIP registration constructors may
+have initialized native runtime before main. No model, server, Pools or restart.
+
+The checker resolves unmodified registered libds41 device rows using the actual
+Builder, binds real declared PERSIST DEVICE buffers and real weights, calls actual
+rad_issue in Ctx's architecture callback, then awaits its versioned deferred status
+before incrementing a publication counter or examining outputs. No launch pointer
+is replaced and no HIP stream/event is cast to a core AQL object. The module's
+normal core interposition/launch path emits the actual kernel packets, including
+the new bounded staged-Plan transport below the 768-byte AQL argument limit.
+
+Twenty-one tiny programs perform 69 passes: 48 valid and 21 rejected payloads:
+* All four DS41 math rows: shifted-mHC prepare, carried-pre collapse, biased-ID
+  sqrt-softplus router and selected shared-latent attention, with NaN preflight.
+* Compressor C1 in F32/BF16 and C2 in F32: cold state, malformed warm request,
+  two genuine warm chunks with slot reorder and pending groups, then cold reset.
+* FFN expert activation, deterministic complete-expert combine and mHC residual
+  post in F32/BF16, each with valid -> invalid NaN -> valid reset.
+* Actual latent store/gather rows with rank4 physical cache, I64 positions/slots,
+  F32/BF16 opaque payload bits and ratios1/2. Invalid physical slots must leave
+  cache/output unchanged while every explicit status element receives the error.
+
+Compressor state is genuinely retained on the GPU between its chunks. The checker
+reads it before each continuation and requires equality with the previous CPU
+state, but does not re-upload or reset that state operand. A malformed warm request
+must leave it intact, after which a valid continuation must succeed. Two odd-start
+C2 chunks exercise pending projected KV/gate bits and exact U32 cursor continuity.
+This is not a fixture that seeds a fresh GPU state before every warm request.
+
+Every invalid case has valid metadata and must enqueue successfully, then fail
+await_device_status with the component CPU preflight's exact code. Guard rows,
+read-only inputs, state and failed outputs are checked after that gate. Latent
+status arrays intentionally change to error codes and are checked separately;
+all corresponding cache/activation bytes stay unchanged. The
+subsequent valid pass must reset validation and compute correctly. Tapes are
+requested but must stay disabled, with zero played passes. This caller's publication
+counter demonstrates required ordering, not full Engine all-rank/sampler/commit
+or recovery coverage; device-fault recovery is not promised.
+
+Each operand uses owned mapped-host staging with checked host/device aliases and
+rad_dev_host_wrote after CPU initialization. Staging remains alive through copies,
+Ctx drain/teardown precedes its owners, and failed-drain explicit allocations are
+retained/charged until process exit. Typed rank3/4 views come from the actual Ctx
+arena templates, surrounded by guard rows and narrowed with RAD_B_N. Active arena
+and scratch are charged using arena_plan_bytes (<=128 KiB); mapped staging and
+guarded weight requests share the <=1 MiB explicit-request cap. Individual explicit
+requests are <=64 KiB. Allocator/page rounding, driver metadata, fixed Ctx status
+resources and the one reused AQL stream's argument/bounce rings are additional.
+
+CPU expectations reuse existing independently checked component emulators; this
+is an integration gate, not a second mathematical oracle. F32 tolerance is
+4e-6 + 4e-5*abs(reference), F16/BF16 at most one representable step with signed
+zeros retained; I32/U32 outputs/state, latent opaque-copy outputs, source bytes and
+guards are exact. Latent expectations independently implement the bounded physical
+copy and atomic whole-batch validation rather than interpreting IEEE payloads. No
+production architecture, serving/full graph, TP, context-fit or throughput claim.
+The child has not compiled or run this source; parent owns all build/GPU work.

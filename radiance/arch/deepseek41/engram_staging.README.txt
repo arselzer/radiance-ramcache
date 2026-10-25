@@ -1,0 +1,119 @@
+Engram asynchronous staging contract (source adapter; not serving registration)
+=============================================================================
+
+engram_staging.h bridges the existing Iq4NlLayerStores RowLookup to a caller's
+asynchronous device backend. It has no HIP dependency, does not pin memory by
+itself, and does not implement or register a production device backend. The CPU
+tests use actual tiny IQ4_NL source files/cache/decode with simulated uploads and
+independently delayed final device readers. No real model payload is needed.
+
+Data and ownership path
+-----------------------
+1. EngramStagingPool::create validates its immutable model identity against the
+   actual Iq4NlLayerStores, snapshots each asset's SHA256/layer/geometry, reserves
+   bounded controls, and asks the backend for a fixed number (1..64) of stable,
+   float-aligned host allocations. A real backend must supply host memory safe
+   for its DMA mechanism, normally pinned memory. CPU tests use ordinary memory.
+2. submit(layer, rows, destination, &ticket, request_stop, why) validates the
+   layer, row count/range, model ID, asset SHA, device owner, float alignment and
+   overflow-safe destination extent before any native upload is attempted.
+   It obtains a free slot or returns RAD_E_FULL; there is no unbounded queue.
+3. Actual cache RowLookup decodes requested IQ4_NL rows into that owned host
+   slot. Cache leases may then release because the slot contains a complete
+   copy. No raw pointer into an evictable packed cache row reaches the backend.
+4. The tracker installs an owning record BEFORE calling enqueue_native. That
+   record holds source identity, host memory, destination owner, stop tokens and
+   backend. The destination owner must keep its identity/address/extent stable;
+   neither the owner nor the caller may recycle that allocation while the record
+   is active. Overlapping device ranges on the same device are rejected across
+   pools sharing one backend until the earlier record is quiescent. All writes
+   to a destination must participate in this backend's lifetime protocol.
+5. The completion's quiescent=true certifies BOTH host upload completion AND
+   completion of the final device consumer. It is a monotonic, irreversible
+   promise: no later DMA or device read may use that submission's resources.
+   DMA-complete by itself does not free a slot. This first interface deliberately
+   retains host staging longer than necessary when a device reader is delayed.
+   A later optimized interface could split host-DMA and device-reader fences.
+6. reap()/backend.progress() may reuse a slot only after quiescence. A ticket is
+   an observation/cancellation handle, not the sole lifetime owner. Dropping a
+   ticket or pool never proves an operation safe. Holding a completed ticket may
+   keep the allocation and its budget charge alive after pool destruction.
+
+Budgets
+-------
+Use one shared StagingBudget for ALL Engram staging pools that should obey a
+single pinned-host cap, including layers 1 and 14 and concurrent sequences.
+Creation reserves all slots before they can be used, plus explicit conservative
+pool/source/control allowances. Backend allocation_charge reports an upper bound
+including its host allocation and allocator controls; allocate_host must return
+an exclusive allocation within that bound. The charge outlives physical host
+allocation destruction. The same allocation must not be returned to multiple
+slots or retained by the backend outside the charged ownership record.
+
+A slot holds max_rows * width * sizeof(float) usable bytes. For width=256 and
+max_rows=32 that is 32 KiB per slot, before the backend/control allowance. The
+budget exposes used/peak/limit and rejects new pools when retained operations
+still consume it. It is distinct from the packed-row cache's shared 2 GiB cap
+and from device allocations. It is not a process-RSS cap: caller stop states,
+request/completion/event objects, tracker vector/control blocks and native
+backend bookkeeping need a separate bounded engine/request budget. Caller-owned
+device destinations need their own allocator and budget. Pools reserve all host
+slots up front; the adapter never allocates a full table or maps model payloads.
+
+Native HostRowAllocation implementations may adopt_budget_charge into their own
+preallocated registry. The pool offers the reserved charge immediately whenever
+allocate_host returns an owner, including an error return, before validation or
+another potentially allocating operation. Such a backend must retain the owner
+and charge on failed physical free, and refund only after actual free succeeds.
+The default hook leaves the charge with StagingBuffer for ordinary CPU allocators.
+Native allocation wrapper/control creation must precede physical allocation so
+an error with a nonnull pointer can always return its owner for charge adoption.
+
+Cancellation, errors and teardown
+---------------------------------
+Per-request stop_token is passed through cache reads/workspace waits and carried
+to the backend. Ticket cancel() requests advisory cancellation of the completion.
+It must not invalidate in-flight DMA or device readers. Cancellation while filling
+returns the slot without enqueue; cancellation racing with enqueue can leave an
+ordinary pending submission. Pool shutdown stops this pool's filling requests
+and asks the backend to cancel/drain its active records. It NEVER cancels the
+shared Iq4NlLayerStores, so unrelated sequences/cache users remain usable.
+
+Native enqueue and drain are serialized per record. Shutdown cannot treat an
+unpublished native enqueue result as no work, or drain it concurrently with
+submission. Completion polling/cancellation may occur concurrently and must be
+thread-safe, nonthrowing and nonblocking. Poll/cancel/destruction must not reenter
+the tracker's methods while its registry is locked.
+
+An error code is not proof of quiescence. enqueue_native must return an owned
+completion even after partial native submission, or explicitly certify that NO
+native work was queued. An absent completion defaults to unsafe retention;
+success without a completion is RAD_E_ABI and is also retained. reserve native
+fences/control resources before queuing hardware work whenever possible. Native
+methods are noexcept: an exception or cleanup path must never drop submitted
+resources. drain_native(error,false) keeps the record quarantined; a failed HIP
+event query/synchronize alone is not proof that the device stopped reading.
+
+The backend registry retains itself via pending records, along with host and
+device owners and budget charges. The engine MUST keep a backend handle and call
+progress/drain until records become quiescent. If pool destruction cannot prove
+safety, registry ownership intentionally survives it. drain_all(model_identity)
+is an explicit model/backend teardown recovery path for orphaned records; it must
+not be used as a per-request cancellation shortcut. Persistent device failure
+can intentionally retain memory and quota indefinitely rather than cause UAF.
+The backend's own teardown policy must eventually prove safety or quarantine it.
+
+submit resets its output ticket on entry. An enqueue error can still return a
+nonempty pending ticket: inspect its quiescent flag, not just the return code.
+Pre-enqueue validation/decode errors return an empty ticket. No code should assume
+error or cancellation authorizes immediate device destination reuse.
+
+Integration work still required
+--------------------------------
+A real HIP backend must provide bounded hipHostMalloc/registration ownership,
+stable device owners, a correctly ordered upload plus final-consumer event chain,
+nonblocking query, safe cancellation/drain, and bounded native event bookkeeping.
+The engine must select the right per-layer asset and bind this adapter to Engram
+execution, maintain model identity and separate device/request budgets, and poll
+at request boundaries. None of that is registered by this header. There are no
+throughput, hardware-pinning, GPU-lifetime or full-model quality claims here.

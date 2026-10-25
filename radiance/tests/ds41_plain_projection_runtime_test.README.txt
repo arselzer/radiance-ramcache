@@ -1,0 +1,42 @@
+Existing plain projection HOST runtime proof
+===========================================
+
+ds41_plain_projection_runtime_test.cpp uses the real libref.so Registry rows,
+Builder, Ctx arenas, public rad_issue and a real ResidencyTable. It creates no
+GEMM implementation, wraps/substitutes no launcher, and needs no libds41 kernel,
+model payload, GPU, Pools, network or quantizer. Parent owns CMake integration.
+The two cases refuse non-HOST execution by skipping; missing libref fails.
+
+1. BF16 source metadata with an explicit F32 weight declaration:
+   - asserts Builder marks widen, preserves original BF16 encoding and bills
+     four stored bytes/value (rather than two);
+   - manually constructs the exact F32 payload by BF16 bit widening;
+   - binds that F32 payload and issues existing gemm_nt_f32, with BF16 input,
+     F32 weights and F32 output, at tiny N4/K17 and actual M1/M3;
+   - moves the weight pointer to a different, separately owned F32 payload
+     through the ResidencyTable and checks the changed numerical result.
+2. The BF16 index boundary uses existing gemm_nt, BF16 source/weight/output,
+   N4/K256 and actual M1/M3, with the same explicit relocation checks. Builder
+   must leave widen=false and charge two bytes/value.
+
+Both use pitched full allocations and public operand row/column views with
+nonzero offsets. All output padding and unused rows retain sentinels. Inputs
+and both generations of source/widened weights must remain bitwise unchanged.
+The expected result is an independent integer dot product divided by128,
+followed by an explicit BF16 RNE cast only in the BF16-output case. Tiny dyadic
+inputs keep all F32 sums exact, so this checks binding/shape/rounding rather
+than asserting a universal GEMM reduction-order equivalence. Saved registered
+launch pointers must remain unchanged. Tapes are disabled for this fixture.
+
+Important limit: the F32 payload conversion is TEST SCAFFOLDING. This verifies
+Builder's widening decision/accounting and actual Ctx consumption of the correct
+payload; it does NOT execute Engine's private StagedWeight::run loader branch.
+That branch was reviewed separately in core/engine_bringup.cpp:2245-2251. A real
+checkpoint/.rad -> Engine initialization test would be a further loader proof.
+The test also does not execute real DS41 dimensions, GPU/AQL, TP collectives,
+whole-model precision, official Torch arithmetic, inference speed or capacity.
+
+Expected integration: ordinary HOST CPU test linked against rad_core, depending
+on libref; RADIANCE_HOME points at the built home (same convention as the other
+runtime tests). No GPU-specific CMake flags are required. Source was handed off
+without a child compilation or run; parent serializes validation.

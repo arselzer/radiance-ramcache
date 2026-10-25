@@ -1,0 +1,162 @@
+Engram runtime handoff audit / proposed safe baseline (2026-10-24)
+================================================================
+
+Status: source/design note only. The SSD store, generic staging pool and standalone
+HIP backend do NOT wire Engram into rad_issue or a serving architecture. No ABI,
+core, graph, scheduler or live service changes are made by this note.
+
+Observed interfaces and constraints (paths relative to Radiance source)
+------------------------------------------------------------------------
+* core/device/aql.cpp:584 defines the engine's own Stream/HSA queue. A RadStream
+  is not an ordinary HIP stream. aql.cpp:3774-3785 explicitly rejects HIP event
+  recording/waiting on engine streams. A cast of rad_stream(ctx) into the native
+  HIP backend would not fix this. Native HIP events cannot bridge those queues.
+* abi/rad_runtime.h:698-711 defines lanes/joins; core/runtime/ctx.h:217-222
+  distinguishes lane0 stream() from cur_stream(). Public rad_stream(ctx) returns
+  stream(), not the active lane (core/runtime/issue.cpp:1256). Kernel launch and
+  OpStager hooks receive the actual active stream (issue.cpp:978 and:407/:413).
+* core/runtime/ctx.cpp:1255 and:1270 replay a recorded pass without calling the
+  architecture step. pass_key hashes token/sequence POINTERS, not their contents
+  (ctx.cpp:943-947). Arbitrary CPU hashing/row lookup in step would be skipped on
+  replay and silently reuse stale rows. A host op is specially re-executed between
+  recorded stretches (issue.cpp:932-951; ctx.cpp:1192-1206), but this does not make
+  undeclared callbacks replay-safe.
+* OpStager's existing contract forces armed passes to issue live and supplies
+  actual-stream before/after/end hooks (core/runtime/stager.h:9-37). Ctx invokes
+  end_pass AFTER joining lane1 to lane0, even when step status failed
+  (core/runtime/ctx.cpp:1345-1357). This is the useful first integration seam.
+  after_op is skipped when issue_body fails (issue.cpp:411-413), so error cleanup
+  must also be handled by end_pass, not solely by the successful after_op path.
+* Ordinary RadBatch token_ids/positions/cu_seqlens/seq_ids are DEVICE pointers
+  (abi/rad_runtime.h:21 and:48-51), not CPU arrays. The scheduler has private host
+  pairs (core/sched/batch.cpp:102-109), fills exact shifted IDs/positions
+  (batch.cpp:939-946), and reuses host staging spans after upload completes
+  (core/sched/batch.h:222-225). A CPU worker must not retain those spans without a
+  new bounded owner/copy. The public generator's tokens_h is not an ordinary
+  causal-batch token mirror.
+* core/runtime/issue.cpp:862-879 joins before host ops, tracks host-arena hazards,
+  and publishes host writes for later device reads. Existing PLE uses persistent
+  host row IDs, a host gather and a declared device copy
+  (arch/common/rad_block_ple.h:278-317/:331-336). This is a useful ordering example,
+  NOT compatible hashing: DS41's token_map/controls/DEAD semantics differ and
+  DS41 Engram has no PLE convolution.
+* abi/rad_abi.h:87-97 provides per-resolved-instance init/fini and prohibits
+  allocation/synchronization in launch. init precedes weight load and receives
+  geometry, not a loaded table owner. Registry fini runs in reverse instance order
+  (core/plugin/select.cpp:487-495). Architecture export macros expose declare/step
+  (arch/common/rad_arch.h:1390-1397), not a model-specific unload callback. Thus
+  use explicit engine-owned Engram model/rank state rather than unrelated global
+  statics or one full cache per resolved band.
+* Engine already drains transfer streams before Ctx shutdown frees its arena
+  (core/engine.cpp:92-100); Ctx shutdown syncs lanes before freeing buffers
+  (core/runtime/ctx.cpp:58-60/:81-96). Engram copy streams and callbacks must be
+  integrated into that ordering, not outlive the context behind a noop owner.
+* rad_dev_free/stream_destroy/event_destroy return void (abi/rad_device.h:46-60).
+  AQL pinned free warnings do NOT set a checked status, and its registry entry is
+  removed before unlock/free (core/device/aql.cpp:3420-3445). HIP free uses a
+  logging-only HIP_NOTE (core/device/hip.cpp:55-61/:311-324). Therefore an empty
+  rad_dev_last_error is NOT proof that physical free succeeded. It is only a
+  cleared-on-read diagnostic string (core/device/dispatch.cpp:664-669).
+
+First graph handoff, intentionally conservative
+-----------------------------------------------
+1. Create one model owner with verified controls and two explicit asset specs,
+   one TOTAL bounded packed cache cap shared across all ranks/layers, and separate
+   fixed staging/device/metadata budgets. Per-rank state is owned and retired by
+   the engine; request/sequence ownership includes a generation, not recycled
+   batch row or state-slot index. Never create a 2 GiB cache per kernel band.
+2. Use a bounded engine-side host input handoff before architecture issuance.
+   Copy exact batch IDs, sequence boundaries/identity, positions and token-mask
+   information into owned storage while the scheduler bank is still valid. CPU
+   workers perform file work only; every rad_* device call remains on the rank
+   thread after Ctx::bind_thread. No public rad_dev_get exists to restore an
+   arbitrary worker's previous device. A synchronous first CPU fill is acceptable;
+   new device launch functions must not hide host pread/allocations/sync inside a
+   supposedly ordinary asynchronous kernel launch.
+3. Hash each sequence ONCE per token span, producing IDs for both Engram layers
+   with supplied controls and exact layer/head order. Preserve max_ngram-1 history
+   and DEAD barriers. For an initial n_spec=0 path, reconstructing the bounded
+   raw-token/mask tail from the request's committed prefix is simpler and safer
+   than adding an untracked CPU state beside the core's checkpoint state. The
+   prefix-hit position must be the real absolute position. Never treat a full
+   cached attention prefix as permission to reset Engram history.
+4. Decode only requested rows into fixed owned pinned slots using existing
+   Iq4NlLayerStores. Dedup/coalesce at the packed cache boundary as already tested.
+   Chunk token/heads so rows <= the slot's explicit max_rows. The output's order
+   remains [token, layer, head, head_dim]; cache-sorted I/O must not reorder it.
+5. Use a new Rad-device backend, not the standalone HIP backend. Initially run
+   Engram consumers on lane0 only. Own one rad_stream_create transfer stream and
+   fixed RadEvent pairs; queue rad_memcpy_async on transfer, record upload-ready,
+   rad_event_wait on the ACTUAL consumer stream, then issue declared Engram
+   projection/gate ops via rad_issue. Buffers participate in the declared arena
+   plan and remain valid until final reader; a shared_ptr with noop deleter to
+   rad_buf_ptr is not an arena lease and cannot prevent lending/reallocation.
+6. Arm an OpStager-compatible pass owner so the entire affected pass issues live.
+   Before the first Engram projection, wait on upload-ready; after the LAST
+   projection that reads the row buffer, record final-reader on that stream.
+   After both events complete, slots/targets can be reused. Keep host staging
+   through the last reader initially, as the generic contract requires. A pass
+   failure's end_pass still records/seals behind all already submitted work after
+   lane joins. There must be an explicit no-future-reader decision on every exit.
+7. Cancellation stops further CPU work and seals already submitted work; it does
+   not cancel the shared cache or free device targets. Discard tentative hash
+   state or reconstruct it again from committed tokens. Do not commit a CPU hash
+   update merely because H2D was enqueued. Enqueue/query/sync errors retain owners
+   until an actual successful quiescence proof; per-device fatal errors already
+   lead the engine to stop rather than serve from a wedged queue.
+8. Initially refuse speculative/tree passes until accepted-length rollback,
+   per-branch histories and checkpoint restore are connected. Validate prefix
+   reuse/fork/slot recycling against full recomputation and joint attention+hash
+   restoration. Cache contents are model/asset-scoped and reusable, but per-request
+   hash histories are not. n_ahead prefetch can be added later using a COPIED tail;
+   it must not advance committed history (abi/rad_runtime.h:158-166).
+
+Small Rad-device adapter (now implemented; graph handoff remains proposed)
+------------------------------------------------------------------------
+See engram_rad_staging.h and its README. The small standalone adapter implements
+the baseline below using a BORROWED actual consumer stream for both upload and
+readers. A separate owned Rad transfer stream was the initial proposal; it needs
+additional engine ownership/wait integration and is not implemented here.
+
+RadEngramBackend::create_on_rank(model_identity, binding, checked_allocator,
+                                options, &backend)
+  - Called and all future methods executed on the same bound rank thread; record
+    creator thread ID and reject cross-thread operations. No hidden rad_dev_set
+    or HIP cast. Device ordinal is explicit caller/engine knowledge.
+  - Hold a strong borrowed-stream owner and bounded upload/reader event pool. Use public
+    system-scope rad_event_create events when the host queries them; do not use
+    card-local events as proof for reading device-written host memory.
+  - Accept a checked, caller-owned arena target (model/device/range/arena epoch/
+    lifetime or strict pass owner). The public ABI cannot introspect/own arbitrary
+    arena suballocations; caller proof is required, not a string/pointer claim.
+  - bind_consumer(ticket, actual_stream, pass_epoch) waits upload-ready on that
+    stream. seal(ticket, same_stream) records last-reader after final rad_issue;
+    seal_no_readers is an explicit advanced no-future-reader promise. A guarded
+    consume callback can always seal on normal/error/exception return. Cross-lane
+    consumers require explicit joins before the final seal.
+  - Native poll latches upload+reader completion before event generation reuse.
+    drain requires a sealed scope and successful rad_stream_sync on the relevant
+    stream(s). Pending/error operations preserve generic record ownership.
+
+Allocator limitation must be explicit: current public rad_dev_free cannot support
+our checked physical-free/refund guarantee. Do NOT implement 'clear last_error,
+free, empty last_error => refund'. A safe no-ABI-change baseline can borrow fixed
+engine-owned pinned/device slots for the model's whole lifetime, retaining their
+budget reservation until process teardown and prohibiting fresh allocations from
+that reservation after logical close. A better reusable backend needs a supplied
+checked-free callback whose allocator actually returns proof, or a separately
+reviewed checked core allocation API. No allocation/free ABI change is made here.
+
+Verification gates before serving registration
+-----------------------------------------------
+Existing CPU network fixture already checks real attention callback ordering,
+prefix rollback/replay and interleaved sequence isolation. Generic fake staging
+checks failed/partial enqueue, cancellation, last-reader ownership and final-owner
+teardown. The Rad adapter test source now covers actual HOST event/stream handoff,
+delayed copy/readers and a real Ctx/rad_issue arena consumer. Further integration
+tests still need context/pass failure end cleanup, static-pointer/new-content
+replay rejection, two interleaved sequence histories, prefix hit/fork/recycled slot,
+and transfer drain before arena shutdown. Only then run a tiny AQL-specific checker
+on an approved idle card. Compare n_spec=0 logits with full CPU reference before
+adding speculation, replay or async prefetch. This note makes no serving or
+performance claim.

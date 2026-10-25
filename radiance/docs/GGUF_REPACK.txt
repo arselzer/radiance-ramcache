@@ -1,0 +1,115 @@
+Lossless packed GGUF host layouts (experimental source branch)
+
+Purpose and scope
+
+The CPU importer stores canonical affine planes, while relevant HIP reference
+kernels read original GGUF blocks. arch/common/rad_gguf_repack*.h provides a
+strict, lossless bridge for IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, Q5_K and Q8_0.
+rad_gguf_unrepack.h recovers the canonical planes so a future device kernel can
+be checked against the dense oracle. These headers register no serving kernels
+or architecture. They are not a full-model conversion, GPU port or fit proof.
+
+The native layouts use these versioned tags, values/block and bytes/block:
+  gguf.iq2_xxs.v1   256 / 66
+  gguf.iq2_xs.v1    256 / 74
+  gguf.iq2_s.v1     256 / 82
+  gguf.iq3_xxs.v1   256 / 98
+  gguf.q5_K.v1     256 / 176
+  gguf.q8_0.v1      32 / 34
+
+These are standard named source formats. No external numeric GGML type ID is
+accepted as a private alias. Code width is insufficient to identify a format:
+Q5_K differs from ParoQuant w5, Q8_0 group32 differs from group128, and IQ vector
+grids differ from scalar nonlinear tables. No requantization or FP16 expansion
+occurs. F16 scale bits are copied exactly, including NaN payloads and signed zero.
+
+Bounded host API
+
+Namespace rad::gguf:
+  canonical_encoding(format) gives the exact expected encoding.
+  plan(format, encoding, source_rows, source_cols, region, out, why)
+    validates metadata/geometry without reading payloads.
+  repack(format, View, Region, output_span, why)
+    reads bounded const planes, writes contiguous raw row-major blocks.
+  unrepack(format, input_span, MutableView, why)
+    reads contiguous raw blocks and writes all canonical planes for that matrix.
+
+View/MutableView contain logical rows/cols and per-plane byte spans with optional
+byte row pitches. Zero pitch means tightly packed. Table/constant planes keep
+their full source extents. A Region selects source rows and block-aligned
+columns. Start and width must be multiples of 256 for the four IQs/Q5_K, or 32
+for Q8_0. The inverse processes the full destination matrix; callers may pass
+an already sliced native matrix to recover rank-local planes.
+
+All metadata, overflow, pitches and capacities are validated before writes.
+Copying refuses source/destination aliases; inverse copying also refuses aliases
+between output planes. Checks conservatively cover whole supplied spans. Output
+row padding and trailing capacity are untouched. Mutable source bytes during a
+call are a caller error; the APIs do not provide synchronization.
+
+Repack validates every IQ codebook byte and exact fixed 1/8 or 1/4 factor, odd
+local scale codes 1..31, and parity-table signs where required. IQ2_S accepts
+all sign bytes. Validation of the complete selected region precedes copying,
+so even a malformed final block leaves output unchanged. No approximate inverse
+search or silent fallback is used. Every native block bit pattern can be
+unpacked into canonical planes; the inverse initializes those planes and writes
+the fixed codebook/constants without a numerical conversion.
+
+Host ABI integration
+
+rad_gguf_relayout.h defines abi_layout<Format>, abi_relayout<Format> and
+abi_unrelayout<Format>, matching RadLayoutFn, RadRelayoutFn and RadUnrelayoutFn.
+Every canonical plane is selected in encoding order, with dense rank-two
+element-contiguous geometry. The layout hook accepts null tensor data; the
+copy hooks require allocated payloads. Layout storage is U8 rank2
+[logical_rows, native_row_bytes], base alignment 256, exact unpadded payload
+bytes. Consumers must not overread that extent, including the final host slot.
+
+RadTensor has no allocation capacity. The loader/tool must guarantee plane
+buffers are large enough for the advertised geometry. Use the bounded APIs when
+separate allocation sizes or byte pitches are available. A consuming kernel
+must still validate its own operand role, GEMM geometry and numerical contract.
+The hooks do not infer an operation from its parameters.
+
+The metadata-only fixture in core/plugin/testplugin/repackkernel.cc lives under
+testkernels/repack, outside the serving scan, and its launch always refuses.
+gguf_relayout_builder_test drives Registry + Builder with real importer encoding
+descriptors and existing rad_weight_shard_span. It verifies stored bytes/tag,
+all-plane selection and group/geometry for 768/512/512/512 TP4 rotation, including
+5120-wide gate/up row cuts and down column cuts. It allocates no model pools.
+
+Storage and memory implications
+
+The planner uses the selected layout's stored bytes, then aligns member weights
+and rounds movement-unit class strides to 4096. Host and GPU slots use the same
+compact representation. Configured host pools are fully backed; smaller occupied
+slots do not reduce RSS unless the pool configuration is subsequently resized.
+No production pool configuration is changed by these headers or tests.
+
+Canonical loader inputs coexist temporarily with final packed slots. The current
+loader requests a 4 GiB input staging region, permits overshoot, and has separate
+sweep windows/upload/output temporaries. A 1 GiB generic buffer allowance cannot
+certify startup peak. Actual graph classes, pool receipts, scratch and startup
+measurements remain necessary before claiming 262K model capacity.
+
+These private layouts cannot use the existing mapped/SSD expert path:
+weight_file_direct requires identity container storage and compatible sharding.
+Supporting disk overflow needs a packed backing store or a separately budgeted
+on-demand conversion path. The separate bounded IQ4_NL Engram service is still
+pending. The runtime does not keep a second full canonical expert cache.
+
+Validation
+
+Host-only targets: gguf_repack_test, gguf_repack_dense_test, gguf_relayout_test,
+gguf_unrepack_test, gguf_relayout_builder_test. Tests use the actual libquant
+importer plus independent GGML packed/numeric goldens. They cover arbitrary
+blocks at model width, aligned TP cuts, byte pitches/canaries, all 65536 F16
+payloads, malformed tables/scales/signs, late capacity errors, aliases and the
+actual ABI function pointer types. No GPU execution or model payload is needed.
+
+Remaining work
+
+Actual gfx1201 dense/routed kernels, arithmetic/quality validation, bounded
+Engram storage, production graph/state integration and measured model capacity
+remain open. Lossless stored weights alone do not prove activation/cache
+arithmetic equivalence, numerical quality, GPU correctness or performance.

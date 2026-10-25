@@ -1,0 +1,142 @@
+Experimental compact/streaming DS41 index selection
+=================================================
+
+ds41_index_stream produces logical compressed-key selections without allocating
+a full F32[R,K] score plane or U8[R,K] candidate mask. Only the independent CPU
+test oracle materializes those dense arrays. Source, consumer and plain modes
+are isolated floating semantic baselines, not performance or full-model claims.
+No architecture, cache allocation, distributed collective or serving lifecycle
+is registered by these source files.
+
+Contract
+--------
+Parameters: M (row capacity), key_rows (logical compressed key capacity), heads,
+global_heads, head_dim, sequences (capacity), dtype, ratio, block_size,
+candidate_block_size, topk, top_blocks, mode (source/consumer/plain).
+
+Operands:
+ 0 query           [R,H,D]                 dtype F32/F16/BF16
+ 1 cache           [P,1,B,D/ratio]          same dtype, FULL opaque shared keys
+ 2 head_weights    [R,H]                   F32, unscaled
+ 3 sequence_ids    [R]                     I32
+ 4 visible         [R]                     I32, logical completed-entry count
+ 5 block_table     [S,L]                   I32, original-token coordinates
+ 6 origins         [S]                     I32 optional, selected sequences zero
+ 7 candidates_in   [R,C]                   I32, consumer only
+ 8 selected_out    [R,T]                   I32
+ 9 candidates_out  [R,C]                   I32, source only
+
+R and S are actual descriptor extents bounded by capacities M/sequences.
+T=topk<=1024 and T<=key_rows. C=top_blocks<=2048. Source/consumer require C>0;
+plain requires C=0. candidate_block_size is1..256, normally8 for the pinned model.
+ratio is1/2, B%ratio==0 and D%(2*ratio)==0. Other geometry bounds match the paged
+floating index reader. Positive ordered row/inner pitches are supported. The
+caller still guarantees actual allocation capacities behind every descriptor.
+
+All heads must be available: heads MUST equal global_heads. A partial-head
+query is refused with RAD_E_UNSUPPORTED. Head axis order must be the canonical
+global head order, since the F32 head sum is ordered. This avoids selecting from locally
+reduced scores; local top-k/block maxima cannot be combined into global winners.
+The keys must also be the complete replicated FULL cache for those global heads.
+A future graph could gather every query/head-weight shard before this operator,
+or provide explicit tile-score reductions; no such collective is hidden here.
+
+Compact block IDs represent groups of candidate_block_size COMPRESSED ENTRIES.
+They are neither physical page IDs nor original-token positions. Core's literal
+block_size is the cache's ORIGINAL-token page width, independently normally4.
+Logical entry j maps to original j*ratio via the FULL block table, using existing
+paged-index addressing. Nonzero origins/runtime window mappings are unsupported.
+visible must be the per-query floor((original_position+1)/ratio), bounded by that
+sequence's complete cache. Correct causal visibility and producer identity remain
+the caller's responsibility, not a chunk-end broadcast inferred by this API.
+
+Modes and deterministic selection
+---------------------------------
+Each key's score uses ascending F32 head and dimension order:
+sum_h relu(dot(q[row,h],key[seq,j])) *
+      (head_weights[row,h]/sqrt(D)/sqrt(global_heads)).
+The floating path consumes unscaled F32 weights. It does not reproduce official
+BF16 weights_proj/scaling or FP4 query/key quantization.
+
+source scans ALL visible keys. It maintains TWO independent bounded selections:
+the layer's own T-key top-k over all keys, and C candidate blocks ranked by their
+maximum visible score, with the newest reachable block forced to +Inf. Its own
+top-k is NOT restricted to the blocks it publishes. This follows the pinned
+model.py if-source/elif-consumer distinction. Source candidate IDs and selected
+key IDs are each sorted by logical ID, followed by -1 padding.
+
+consumer requires sorted UNIQUE nonnegative candidate block IDs followed by an
+unbroken -1 suffix. Every live ID must start below visible. It evaluates only
+visible keys in those blocks, using THIS consumer's own queries/head weights.
+The whole last block is represented by its ID, but invisible tail keys do not
+map a page or read a value. Duplicate, descending, other-negative, hole or future
+block IDs fail the whole batch. Output IDs refer to original logical compressed
+positions, not positions within a compact list. No attention concat offset is
+applied. Candidate list order is not score order.
+
+plain scans all visible keys and emits only selected_out, without either compact
+operand. Source/plain refuse candidates_in; consumer/plain refuse candidates_out.
+Highest scores win; equal scores favor lower logical IDs. Selections are then
+position sorted and padded -1. Consumer undersupply keeps the existing explicit
+hard-filter/pad rule, rather than Torch's arbitrary masked -Inf fill behavior.
+
+Algorithm and storage
+---------------------
+One GPU block owns a query. Its128 threads score up to128 keys per tile, each
+thread following canonical head/dimension accumulation. Thread0 merges scores
+into the heaps in ascending logical-key order. Source carries a partial block
+maximum across score tiles. Consumers visit their sorted compact blocks, so
+logical key order is preserved despite gaps. IDs are sorted before publication.
+
+Selected and candidate heaps share at most (1024+2048)*8=24576 bytes; the score
+tile adds512 bytes and small shared counters fit below32KiB total. There is no
+hidden dense score/mask allocation or device-side heap allocation. This serial
+heap merge is a correctness baseline; removal of dense matrices does not prove
+better latency or throughput. Source still scans all keys, and payload preflight
+recomputes scores once to reject nonfinite computed values before publication.
+
+Validation/status and lifetime
+------------------------------
+Host metadata validation checks exact mode operands, shapes/dtypes, ordered
+pitches, addressing overflow, output-versus-all-input/output overlap and status
+scratch. Device phases are whole-batch metadata, selected physical pages, then
+consumed finite payloads AND finite computed scores, before any output write.
+Thus a late bad row or score overflow cannot leave another row published.
+Only consumed pages/values need to be valid/finite: unused cache sequences,
+unselected consumer blocks and invisible whole-block tails are not accessed.
+Queries/head weights are finite even for zero visible keys; those rows emit -1.
+
+Four semantic status bytes at offset0 are retained. GPU launches use bounded
+caller-owned Plan staging at scratch+16 through common ds41_device_plan.h. The
+helper validates the full reserved scratch extent, alignment and aliases before
+any chunk enqueue; kernels receive one device Plan pointer. CPU validators and
+emulators keep four-byte status semantics. This staging avoids passing a large
+Plan through the core AQL kernel argument slot without enlarging the core ring.
+The GPU scratch callback returns16+roundup(sizeof(Plan),device_plan_chunk_bytes); its actual bytes
+must be accounted for. Only sizeof(Plan) bytes are written behind the16-byte
+status/guard prefix; rounded padding and additional capacity remain untouched.
+
+Inputs, compact lists and caches must remain immutable across preflight and
+compute. Producer writes must precede this call on the same stream or be joined
+explicitly. The source candidate buffer remains live through its last later
+consumer. Enqueue success is not validation success: the scalar status must be
+collected before scratch reuse and checked at the joined all-rank gate before
+any successful step publication. Native HIP checker calls do not turn an opaque
+core RadStream into a hipStream_t or establish the runtime backend adapter.
+
+Checks supplied in source
+-------------------------
+tests/ds41_index_stream_test.cpp has eight independent CPU cases. It compares
+all modes against both existing dense score/candidate/top-k operators and the
+canonical reference; it covers typed pitches/ratio/page mappings, score-tile
+crossing, per-query C2 visibility, source-own-selection outside its candidates,
+consumer-specific scores, ties/empty lists, maximum1024+2048 heaps, ignored
+pages/tails, malformed lists, derived overflow and global failure atomicity.
+Inaccessible page/cache memory proves the staged metadata/page checks prevent
+unsafe later reads. Metadata tests reject partial heads, aliases and bad spans.
+
+The separately CLI-gated native checker has334 payload cases plus15 descriptor
+failures, with every allocation guarded, every readonly byte/padding preserved,
+both output arrays compared exactly and status checked independently of launch.
+It is never a build/CTest action. Parent owns all compilation and approved GPU
+execution; no passing execution is inferred from these source inventories.

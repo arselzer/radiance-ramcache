@@ -1,0 +1,100 @@
+Explicit tiny registered DS41 operations / Ctx / AQL checker
+===========================================================
+
+ds41_aql_ops_check.cpp is a manual target, deliberately not *_test.cpp and not a
+CTest. Link HIP-enabled rad_core with its normal AQL interposition/export options
+(WHOLE_ARCHIVE + ENABLE_EXPORTS as used by ds41-aql-runtime-check), and build the
+isolated libquant + experimental libds41 as dependencies. Use -ffp-contract=off
+for the scalar component CPU expectations. The child has not compiled or run it;
+the parent coordinates all compilation and explicit GPU execution.
+
+After an isolated build and permission for the tiny idle-GPU window:
+  env -u HIP_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES=0 \
+    <build>/tests/ds41-aql-ops-check --run-gpu --home <build>/radiance_home
+Run a separate process with --host-kargs for the core's small-BAR argument-ring
+placement. Missing --run-gpu/--home refuses before any explicit device query,
+Registry, Ctx, stream, allocation or launch. Linked HIP registration constructors
+may have initialized their runtime before main. Host fallback, anything other
+than the actual AQL backend, multiple visible devices, or non-gfx1201 is refused.
+No production model, architecture plugin, Pools, KV carve, service or restart.
+
+What this checks
+----------------
+Actual Builder schemas resolve the unmodified experimental libds41 device rows
+and their separately versioned deferred-status collectors. The architecture
+callback calls actual rad_issue. No launch pointer is replaced, delegated, or
+wrapped by the checker, and no fake HIP stream is handed to core AQL. The core's
+existing normal module launcher/interposition owns kernel enqueue.
+
+There are 65 tiny passes: 43 valid and 22 invalid-payload passes, over 21 small
+program instances. Every program runs good -> bad -> good using the same Ctx, so
+the last pass proves its fixed status latch/readback resets after a failed device
+validation. Route jobs additionally rejects an out-of-range ID and resets again.
+
+Covered registered operations:
+* ds41_route_jobs: literal expert IDs, gate/up token rows, down identity rows,
+  integer counts, and exact negative-zero/subnormal/large finite weight bits;
+  duplicate and out-of-range expert IDs are asynchronous failures.
+* ds41_rmsnorm: F32->F32, BF16->F32, F32->BF16, including a mapped-host gain;
+  a final NaN input refuses the whole batch.
+* ds41_rope_tail: F32 forward and BF16 inverse with position-pair table;
+  a position equal to the table bound is refused.
+* ds41_index_scores: F32/BF16 query/keys, invisible score tails and bad sequence.
+* ds41_index_scores_paged: ratio1/2, F32/BF16, permuted visible pages, checked
+  against the same canonical dense-key CPU scores; an invalid visible page fails.
+* ds41_candidate_blocks and ds41_index_topk: visible selection, optional candidate
+  mask present/absent, and invalid visible length. Selection IDs/masks are exact.
+* ds41_sparse_attn_paged: ordinary fixed WINDOW plus ratio0/1/2 compressed FULL
+  cases in F32/BF16, unused sequence and supplied sinks; invalid visible window
+  page. BF16 variants bind the sink weight from owned mapped-host memory.
+
+Metadata is valid in each failure case: run_step must enqueue successfully, then
+await_device_status must return the CPU preflight's negative status before the
+checker increments its publication counter. Diagnostics read outputs only after
+that await. Failed batch output bytes, every read-only input and every guard must
+be unchanged. Fresh valid output is checked numerically/exactly after reset.
+Recorded passes are requested but must be disabled, and played must stay zero.
+
+This is a single-Ctx integration gate. The publication counter demonstrates the
+required call order in this caller; it is not a substitute for Engine sampler,
+all-rank, commit, cancellation or prefix-state tests. The separate actual Engine
+phase helper test covers cross-rank sampler suppression.
+
+Storage, ownership and bounds
+-----------------------------
+Raw public operands carry at most rank2, so rank3 query/rotary tables and rank4
+caches use actual Builder-declared PERSIST DEVICE buffers. Guard rows surround
+every such tensor; RAD_B_N binds the original logical shape at its interior.
+Each buffer is owned by the Ctx arena and uses its real packed-stride template.
+Gain/sink operands use real declared weights and owned guarded rad_dev_alloc
+storage; activations are not mislabeled as weights. Optional operands are NONE.
+
+Each tensor has an owned RAD_MEM_HOST_MAPPED staging allocation. Checked host and
+device aliases are used for CPU initialization versus ordered core copies, and
+rad_dev_host_wrote marks CPU writes. Staging is not modified or released while a
+copy can read it. The actual Ctx is destroyed/drained before its staging, weight
+owners, Builder or Registry. Explicit allocation destructors require a successful
+stream drain before release; failed-drain storage stays allocated/charged until
+process exit. rad_dev_free remains the existing void/trusted core teardown API,
+not new checked-free accounting.
+
+Every active fixture requests <=1 MiB total: core arena+scratch are charged using
+the actual arena_plan_bytes calculation, bounded to 128 KiB; all mapped staging
+and guarded weight allocations are also charged. Individual explicit allocation
+requests are <=64 KiB. Receipt counts requested extents, excluding allocator/page
+rounding, driver metadata, fixed Ctx validation allocations/events, and the one
+reused AQL stream's argument/bounce rings (~4+8 MiB in the present runtime).
+CPU fixture storage, small scalar-emulator workspaces and Registry metadata are
+separate host allocations; there are no model weights or configured cache pools.
+
+Numerical provenance and limits
+--------------------------------
+Route IDs/counts have an independent literal oracle. Paged index expectations
+must equal the canonical dense-key fixture, independently of physical page order.
+Other numeric expectations use the existing component CPU emulators; their
+equations are independently covered by their focused component CPU/golden tests.
+This checker tests real binding/launch/status/ownership integration, not a new
+independent mathematical oracle. F32 tolerance is 4e-6 + 4e-5*abs(reference);
+F16/BF16 allows at most one representable step, preserving zero signs. All exact
+integer/route-weight outputs, inputs and guard bytes require byte equality.
+No full serving graph, quality, TP, context-fit, performance or throughput claim.

@@ -1,0 +1,81 @@
+Experimental original-row-indexed completed-latent publication
+
+Suggested op ds41_latent_store_emitted; fixed6 operands in order:
+  x[T,D] f32/f16/bf16 (IN), original_positions[T] I32 orI64 (IN),
+  final_slot_mapping[T] independently I32 orI64 (IN), emit[T] I32 (IN),
+  opaque_cache[physical_blocks,1,4,D/ratio] activation dtype (INOUT),
+  status[T] I32 (OUT).
+Required params M(capacity<=4096),dimension(D<=1024),ratio1/2,dtype; block_size is
+DERIVED and must be4 in this profile. Optional n_blocks is0/absent or a positive
+upper bound on actual physical blocks. D must divide2*ratio as the existing opaque
+KV mapping requires. No WEIGHT or layout/relayout hooks are involved. Parent owns
+schema/row registration and actual source/cache binding. The semantic tensor ABI
+supplies geometry/pitches; the caller still guarantees the corresponding byte
+allocations, since RadTensor carries no independent capacity field.
+
+Positions and final slots accept current core batch I32 fields DIRECTLY; no I64
+conversion buffer. I64 remains useful for independent coordinates. x, positions,
+slots, mask and status support nonoverlapping positive inner/outer pitches; the
+cache requires exact packed contiguous strides including singleton axes. Cache
+and status must overlap no other operand; scratch must overlap no operand. Read-only
+inputs may share bytes. All products/pointer ends/alignment and the full reserved
+GPU scratch span are validated before enqueue. Source payloads remain immutable
+and cache/status ownership remains ordered until completion.
+
+Mask values must be0 or1. On success emit0 does NOT read that row's x, positions
+or slots and does not write cache; status0 is still produced. Emit1 applies the
+exact existing latent::store_row final-phase rule: position>=0, position%ratio==
+ratio-1, valid final physical slot with matching original-token within-page phase,
+and a full entry contained in one physical page. The cache offset is the first
+original slot timesD/ratio, preserving contiguous opaque K=V rows over ratio1/2
+virtual slots. Duplicate active final slots are refused; valid phase alignment
+makes this equivalent to duplicate/overlapping completed cache entries.
+
+Execution is explicitly phased on one stream: staged Plan -> scalar flag reset ->
+ALL masks -> ALL active coordinates -> ALL active destination duplicates -> seal
+ALL vector status rows -> copy only completed rows if flag==RAD_OK. A payload
+failure writes the same negative code to EVERY status row (including masked rows)
+and writes NO cache bytes. Metadata refusal writes no status/cache/scratch bytes.
+Independent error kinds in one device batch may race to the scalar first-error
+flag; the contract is a negative all-row seal, not a deterministic priority across
+different simultaneous errors. Every phase boundary is kernel completion ordering,
+not a host wait. No allocation or synchronization inside the launch.
+
+GPU scratch callback ds41_latent_emit_scratch returns common gpu_scratch_bytes<Plan>:
+semantic flag at0..3, untouched reserved bytes4..15, then validated Plan transport
+in256B common chunks. CPU emulator accepts4 semantic bytes. HOST reference uses
+private CPU flag and returns payload errors directly, never caller/device scratch.
+GPU launch success alone is not payload success. The existing pitched-vector
+collector ds41_collect_routed_status already scans operand5 and can be reused by
+parent for this schema; collection/step gating must finish before publication or
+status reuse. Runtime status propagation is parent-owned integration.
+
+Copies use raw constant-sized byte memcpy, preserving signaling/quiet NaNs,
+signedzero, subnormal and all arbitrary16/32-bit patterns. This is floating opaque
+latent storage only; no FP8/FP4 QDQ, pooling, norm, RoPE, pending state, IO, gather,
+commit/speculation acceptance, ring cache or full model graph is implemented.
+The graph must prepare correctly cast/normed/rotated rows and an accepted completion
+mask first. KV original-token slot mapping remains core-owned; no private entry
+positions replace it. Same-stream/lifetime rules must prevent other writers from
+racing these cache entries or later readers from observing unvalidated writes.
+
+Files/dependencies:
+  HOST libds41/ds41_latent_emit_host.cpp defines prepare + reference wrapper.
+  HIP  libds41/ds41_latent_emit.hip contains baseline kernels.
+  CPU tests/ds41_latent_emit_test.cpp +host.cpp, normal ABI includes; no model data.
+  native checker libds41/ds41_latent_emit_selftest.cpp +.hip +host.cpp,
+    hipcc --offload-arch=gfx1201 -Iabi -Ivendor -ffp-contract=off.
+  Explicit checker flag --run-gpu [device], never an automatic invocation.
+The old latent::store_row helper is used directly by CPU preflight. Its same small
+phase equation is mirrored in the new device-only compilation path to avoid editing
+the existing host metadata/table header. Native comparisons exercise that bridge.
+
+Eight CPU cases include144 basic dtype/coordinate-width/ratio/D/pitch fixtures,
+independent state::physical_byte oracle, real compressor cold7 vs U32-persisted3+4
+pool composition, allzero PROT_NONE coordinates/x/cache, mixed active/inactive
+PROT_NONE row pages, complete-mask-before-coordinate access, atomic later failure
+and duplicate destination seal, metadata alias/geometry and private HOST flag.
+Native checker has432 payload scenarios +16 metadata refusals with common staged
+Plan/status/tail guards, raw special bits, I32/I64 boundary coordinates, masked
+invalid rows, all-row failures and all read-only input/cache padding checks.
+No compiler, GPU, model/service operation or deployment was run by the child.

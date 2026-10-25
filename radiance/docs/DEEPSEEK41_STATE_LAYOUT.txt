@@ -1,0 +1,85 @@
+DS41 compressed state using the current KV ABI (proposal, CPU metadata tested)
+
+state_layout.h supplies checked scalar addressing, byte budgets and pure metadata constructors.
+It does not register an architecture, allocate KV, implement stores/attention, or integrate
+prefix reuse, speculation or ownership. No core change is needed to represent the byte layout.
+
+Physical layout and contiguous entries
+
+core/runtime/kvbind.cpp exposes one bound layer as
+  cache[physical_block, n_head_kv, original_token_slot, 2*head_dim].
+libref/ref_attn.cpp::ref_kv_store writes K then V within each token slot. There are no whole-page
+K/V planes. core/mem/kv.h::KVGroupPlan lays layers out separately, with a whole layer's pages
+before the next layer. core/build/rad_builder.cpp::finish_kv_groups charges
+  2 * block_size * n_head_kv * head_dim * element_bytes * bound_layers.
+
+Use n_head_kv=1, ratio=1 or 2, head_dim=D/(2*ratio), with D divisible by 2*ratio and block_size
+divisible by ratio. For compressed entry j and element e:
+  original_token = j*ratio + e/(D/ratio)
+  within_token = e%(D/ratio)
+  plane = within_token/head_dim; column = within_token%head_dim
+  page = original_token/block_size; slot = original_token%block_size
+  page_element = slot*(2*head_dim) + plane*head_dim + column
+               = (j%(block_size/ratio))*D + e.
+Each completed row is contiguous and never crosses a page. This is an opaque shared latent,
+not ordinary distinct K/V: both MLA roles use the same logical vector. No ordinary attention
+kernel may interpret this storage as independent K/V. Ratio 1 matches the existing GLM MLA
+512D flat-row arrangement in arch/common/rad_block_glm_mla.h.
+
+At BF16, 512D ratio-2 rows use head_dim=128: 1024 bytes per completed entry, 512 bytes per
+original token. A 128D ratio-2 index uses head_dim=32: 256 bytes per entry, 128 bytes per token.
+The per-layer 512D window uses ratio 1 and head_dim=256: 1024 bytes per original token.
+These are byte-addressable reference storage budgets; they do not implement the official FP8
+window or FP4 compressed/index quantizers and scale metadata, or claim their quality/budgets.
+
+Ownership and metadata
+
+paged_decl describes FULL compressed latent/index caches or a fixed WINDOW cache. Bind window
+state for every real layer that owns it. Bind compressed and index-key caches only at their
+actual producers; consumers must address that producer's group/layer. Separate ratios and
+geometries require separate groups. A top-k index producer is not automatically an index-key
+cache producer. Do not allocate a duplicate cache for every cross-layer consumer.
+
+Block size is not declared in RadKVGroupDecl. Declare a compatible consuming op, then obtain
+rad_kv_block_size and verify it matches the packing geometry and is divisible by ratio. Group
+declaration/consumer order matters: Builder pairs each group with the next unclaimed op carrying
+block_size. Helpers deliberately do not perform these declarations or invent consumer ops.
+
+pending_c2_decl describes two pending vectors (projected KV and gate scores), with phase derived
+from committed_tokens%2. This is a storage proposal; F32 is the existing serial reference's
+precision. engram_history_decl describes one shared I32 history of max_ngram_size-1 entries;
+bind it once to one real owning layer, preserve DEAD=-1, and update it once per original token.
+The group must be explicitly initialized: core zeroing does not create DEAD/pad history values.
+These helpers use existing opaque LINEAR storage. They do not implement state updates or rollback.
+
+Commit, prefixes, windows and speculation
+
+Only floor(committed_original_tokens/ratio) compressed rows are readable. A ratio-2 prefix ending
+after an odd number of original tokens retains one pending projected KV/gate pair; an incomplete
+compressed row must never be exposed. Prefix keys, block allocation, lengths, checkpoints and
+position/RoPE inputs must continue to use original-token coordinates. Kernels convert visible
+entry counts explicitly; changing the scheduler's sequence length to a compressed length is wrong.
+Checkpoint quantum includes every paged block size; an even block size aligns normal C2 prefix
+checkpoints, but odd intermediate decode/chunk boundaries still require correct pending state.
+
+FULL groups can reuse existing page ownership and prefix references. For fixed WINDOW groups,
+the block table starts at KVManager::first_block_pos, an original-token position. Subtract this
+floor before indexing the table; do not use the absolute page index as its table index. Runtime
+reference/ring windows have a different mapping and are deliberately excluded from the helper.
+
+There is an existing core limitation for the combined proposal: core/mem/kv.cpp::plan_groups
+sets window win_snap only when NO LINEAR/CONV group exists. Adding C2 pending or Engram LINEAR
+state therefore disables window snapshots. core/sched/scheduler.cpp clamps prefix reuse to zero
+for a windowed trunk without a window snapshot, even if a linear checkpoint and FULL pages
+exist. Current behavior safely re-prefills. This proposal cannot promise fast prefix resume on
+that mixed topology without a separate core change and correctness tests. Do not bypass the clamp.
+
+LINEAR allocation provides two physical copies under speculation, but the existing protocol is
+GDN-specific committed-state plus replay factors, not an automatic arbitrary-state undo log.
+DS41 needs explicit acceptance-safe updates/replay for pending vectors and history, and must not
+overwrite the uncommitted half of a shared page. Copy 0 alone is checkpointed. Until such kernels
+and lifecycle tests exist, these metadata helpers do not establish speculative correctness.
+
+Validation remains synthetic and CPU-only: exhaustive address bijections/page boundaries, partial
+C2 visibility and overflow checks, real core KV binding geometry and real plan_groups snapshot
+policy. Production DS41 state remains unintegrated.

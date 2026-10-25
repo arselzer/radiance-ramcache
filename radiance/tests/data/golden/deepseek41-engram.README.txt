@@ -1,0 +1,35 @@
+DeepSeek V4.1-Flash-1017 Engram CPU fixtures
+
+Reference: deepseek-ai/DeepSeek-V4.1-Flash-1017
+commit 1bae0e1088993b9b82de08f59de5be5a34e42170 (MIT)
+inference/engram.py:NgramHashState.forward
+inference/model.py:Engram.forward
+Exact source SHA256s and NumPy version are recorded in the fixture. The generator
+refuses a different source body; it does not install/import PyTorch or touch a GPU.
+
+Reproduce from the Radiance repository root:
+  OPENBLAS_NUM_THREADS=1 python3 tests/data/golden/deepseek41-engram-generate.py \
+    /path/to/pinned/official/reference tests/data/golden/deepseek41-engram.json
+
+The reference path has inference/engram.py and inference/model.py below it.
+Ordinary tests read only this checked-in JSON and need no external checkout.
+
+The generator extracts each original forward function with the Python AST and
+executes its unchanged body with a minimal NumPy CPU tensor facade. Only function
+decorators and annotations are removed. No hash RNG, tokenizer normalization or
+checkpoint weights are generated: compressed mapping, hash controls, masks and
+projected KV values are tiny synthetic inputs. Hashes compare exactly; gate
+float32 values use absolute tolerance 3e-6 and gate coefficients 2e-6. Final BF16
+residuals compare exactly on these cases. This does not promise bit equality for
+arbitrary floating-point reduction orders on a real GPU.
+
+Covered semantics: newest-to-oldest products, order-major/head-minor bucket
+layout, compressed pad IDs, cumulative DEAD/image barriers, chunk/decode parity,
+per-copy RMS, fused q*k weighting after RMS, signed-sqrt clamp and sigmoid, one
+value shared across copies, text masks and final BF16 output rounding.
+Zero-query and zero-key cases execute the actual source: copysign retains a
+positive signed square-root clamp at dot=+0 (gate about 0.50025), rather than
+replacing it with sign(0)*sqrt(...) and changing the gate to 0.5.
+
+This proves small operator/history behavior, not a complete architecture, real
+model quality, 262K context capacity, SSD cache behavior or GPU performance.

@@ -1,0 +1,42 @@
+--- frozen-P1P2/rank_native_store.h
++++ P3/rank_native_store.h
+@@ -81,6 +81,13 @@
+     // empty Batch to release retained vector storage and its credits, or destroy it.
+     std::shared_ptr<detail::BatchCredit> storage_;
+ };
++struct BoundInfo {
++    const rad::Program* program=nullptr;
++    uint64_t epoch=0,length=0,checksum=0;
++    int32_t unit=-1;native::Key key;
++    std::array<uint64_t,4> offsets{},bytes{};
++    bool operator==(const BoundInfo&)const=default;
++};
+ struct Usage {
+     uint64_t hot_bytes=0,cold_bytes=0,peak_hot_bytes=0,peak_cold_bytes=0,metadata_reserved=0;
+     size_t live_records=0,live_leases=0,peak_live_leases=0,lease_vector_slots=0;
+@@ -113,6 +120,7 @@
+     RankNativeStore(const RankNativeStore&)=delete;
+     // Key lookup is a setup API. Requests use opaque immutable handles, never mutable keys.
+     Error bind(const native::Key&,BoundRecord* out)const noexcept;
++    Error describe(const BoundRecord&,BoundInfo* out)const noexcept;
+     Error acquire(std::span<const BoundRecord>,Batch* out,std::stop_token={})noexcept;
+     Error audit_all()noexcept; // Global ordinary file-stamp audit; no full payload scrub.
+     Error trim()noexcept;
+--- frozen-P1P2/rank_native_store.cpp
++++ P3/rank_native_store.cpp
+@@ -378,6 +378,15 @@
+     check(found!=p.generation->records.end(),Error::identity,"unknown record identity");
+     BoundRecord result;result.generation_=p.generation;result.ordinal_=uint32_t(found-p.generation->records.begin());*out=std::move(result);return Error::ok;
+ }catch(const Failure& e){return e.error;}catch(...){return Error::invalid;}}
++Error RankNativeStore::describe(const BoundRecord& handle,BoundInfo* out)const noexcept{try{
++    Active active;auto& p=*impl_;std::lock_guard lock(p.transaction);
++    check(out&&!p.closed&&!p.closing.load()&&!p.generation->sealed.load(),Error::closed,"describe output/closed generation");
++    check(handle.generation_.get()==p.generation.get()&&handle.ordinal_<p.generation->records.size(),Error::identity,"describe foreign handle");
++    const auto& record=p.generation->records[handle.ordinal_];
++    const BoundInfo result{p.generation->program,p.generation->epoch,record.native.length,record.native.checksum,
++                           record.unit,record.native.key,record.native.member_offsets,record.native.member_bytes};
++    *out=result;return Error::ok;
++}catch(const Failure& e){return e.error;}catch(...){return Error::invalid;}}
+ Error RankNativeStore::acquire(std::span<const BoundRecord> request,Batch* out,std::stop_token stop)noexcept{
+     if(active)return Error::reentrant;
+     try{Active guard;auto& p=*impl_;std::lock_guard lock(p.transaction);

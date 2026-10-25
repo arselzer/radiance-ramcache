@@ -1,0 +1,91 @@
+{
+  "scope": "Frozen bounded complete synthetic composite physical-plane exporter; source-only, no child compiler/Core/device/network; no S1/provider/Engine compatibility",
+  "created_utc": "2026-10-25T08:59:24.193068+00:00",
+  "schema": "radiance-synthetic-composite-native-v1",
+  "planned_cases": 8,
+  "records": 16,
+  "rank_metadata": 4,
+  "native_bytes": 720896,
+  "padding_bytes": 118688,
+  "io_window": 4096,
+  "input_fd_cap": 2,
+  "metadata_logical_reservation": 16777216,
+  "files": {
+    "glm53-composite-source-exporter-prototype/BASE_SOURCE_PINS.json": {
+      "bytes": 680,
+      "sha256": "62003f1aea4f8c58369a9cba2cf59367c7591ca428ae8a791d14dc35956001ba"
+    },
+    "glm53-composite-source-exporter-prototype/CMakeLists.txt": {
+      "bytes": 2915,
+      "sha256": "66b0f77aa5f55f2ee326845594471bd2a5dbd360ed3215ba95ea16f876e06645"
+    },
+    "glm53-composite-source-exporter-prototype/CORE_SOURCE_PINS.json": {
+      "bytes": 657,
+      "sha256": "38540288dd070bedbb54503e825fb365f31fb0fdbdb12690fe31e25c029949b2"
+    },
+    "glm53-composite-source-exporter-prototype/README.txt": {
+      "bytes": 8762,
+      "sha256": "20e8c7209ec7397709f06914305ba693c81bf89ab954b0d92914b27a824a5ab6"
+    },
+    "glm53-composite-source-exporter-prototype/composite_exporter_test.cpp": {
+      "bytes": 20863,
+      "sha256": "c3a74968650412058fb9b680ef3ef31ba54ffe86d21bd80e8fb4d7ef922895ad"
+    },
+    "glm53-composite-source-exporter-prototype/native_record_store.cpp": {
+      "bytes": 35836,
+      "sha256": "c10c8c576cc41d2e8daaf86a62b42e3b3725d6ff3adc3195eb0922c8e91b0611"
+    },
+    "glm53-composite-source-exporter-prototype/native_record_store.h": {
+      "bytes": 4358,
+      "sha256": "8d206957028fa0ac402a05b7370ffdfe7be9fe9a1c163bf835ff72e7466ea5d5"
+    },
+    "glm53-composite-source-exporter-prototype/verify_source_pins.py": {
+      "bytes": 544,
+      "sha256": "fa963105e540a252e816082a89cfe51bb90e3f2bcec2723241ffbbe8f4a767af"
+    },
+    "glm53-expert-record-store-prototype/CMakeLists.txt": {
+      "bytes": 1911,
+      "sha256": "507a8ebcb7cbb76d1bdb90339b3519a9cc9b81f1d5de26a1f03ece3d7811e5fd"
+    },
+    "glm53-expert-record-store-prototype/native_record_store.cpp": {
+      "bytes": 30746,
+      "sha256": "432c7961d40796559f68e25c3b2acf82b5e844af75f0ea43787bff20ec4f5083"
+    },
+    "glm53-expert-record-store-prototype/native_record_store.h": {
+      "bytes": 3742,
+      "sha256": "b398bce05f8ba6d30572370fa0ebfd1d47ba49e003957f8e244d33da1c284faa"
+    },
+    "glm53-expert-record-store-prototype/record_store_test.cpp": {
+      "bytes": 17654,
+      "sha256": "51526a9dbbfa672c636f85c53b00ca0ee6efa933c9b9fc8ab4d790bba5724202"
+    },
+    "radiance-src/abi/rad_builder.h": {
+      "bytes": 101884,
+      "sha256": "3483154789ad7b906fc9c82df22c259c35f55d60a750a4357a264f15febf7a71"
+    },
+    "radiance-src/abi/rad_encoding.h": {
+      "bytes": 22639,
+      "sha256": "0c3b9c774b29f1285c7a7dcd30327471a28e419943749b3d1cc5e4b169c0e703"
+    },
+    "radiance-src/abi/rad_types.h": {
+      "bytes": 15430,
+      "sha256": "cb52bb662978b8641fc6dff42a5860cc2651729d7cf258cc0ba9e6d6a24ef863"
+    },
+    "radiance-src/core/format/share.cpp": {
+      "bytes": 11837,
+      "sha256": "ba002de773aaccc759b699348273d4f7612aa599e6e69f3801f1f5eec0bb7168"
+    },
+    "radiance-src/core/format/share.h": {
+      "bytes": 2078,
+      "sha256": "d63f2b2fa1d08d30025e15687b457945f4011f4ae1aea8cf8a6e8e124623b08b"
+    },
+    "radiance-src/core/rad_core.h": {
+      "bytes": 62145,
+      "sha256": "2c57e84cf951a95ed3010c81b94268b0f079085d7e7038f6e8979a59f5fdf24c"
+    },
+    "radiance-src/tools/glm53_weight_allocation.h": {
+      "bytes": 9681,
+      "sha256": "f039f42ae74e2ec3a840af79855b1d5e043364f9370377dd629abaf155b62c06"
+    }
+  }
+}

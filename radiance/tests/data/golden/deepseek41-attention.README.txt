@@ -1,0 +1,35 @@
+DeepSeek V4.1-Flash-1017 serial attention FP32 reference fixture
+
+Source math: official DeepSeek-AI inference/model.py at
+1bae0e1088993b9b82de08f59de5be5a34e42170 (MIT), Attention/Compressor/Indexer,
+precompute_freqs_cis/apply_rotary_emb/select_candidate_blocks. Shared ownership
+also follows official DeepInfer cross_layer.py (9bd9cf243fc5).
+
+Generator: tests/gen_deepseek41_attention.py. It uses independent NumPy full-prefix
+projections/pooled groups and causal history slicing, whereas the C++ reference
+uses serial ring/cache/partial-compressor updates. It imports only the sibling
+NumPy reference functions, not C++ implementation, Torch or GPU libraries.
+No original model weights or tokenizer contents are included.
+
+Reproduce from repository root:
+  OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 python3 tests/gen_deepseek41_attention.py \
+    tests/data/golden/deepseek41-attention.json
+
+Synthetic seed 411017. Six layers: two sliding-window-only, ratio-2 KV producer /
+consumer, ratio-1 KV+candidate producer and a new top-k producer sharing its KV.
+18 tokens wrap the three-row windows, cross pending compressor groups and exceed
+the candidate budget. Two heads/output groups and nontrivial low-rank projections
+exercise grouped output and inverse RoPE. Index keys derive from unrotated pooled
+latents. Candidates keep two blocks of two positions; newest partial block pinned.
+
+Every projected intermediate, selected index, candidate mask and final output is
+checked. Float tolerance was chosen before running: abs 2e-5 + rel 2e-5 for tiny
+FP32 NumPy matmul/reduction versus explicitly ordered C++ accumulation. Selection
+indices/masks match exactly under a deterministic ascending-position tie rule.
+The official framework does not specify equal-score top-k ordering; this fixture
+does not promise identical tied choices to Torch. Prefix replay
+compares the C++ reference bit for bit across a pending group and ring wrap.
+
+This oracle omits the official FP8/FP4 activation, KV and index quantizers and
+output-projection quantization. It cannot establish packed-kernel parity, actual
+model quality, TP4 numerics, large-context memory or production throughput.

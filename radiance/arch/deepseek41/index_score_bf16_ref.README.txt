@@ -1,0 +1,60 @@
+Bounded BF16 index-score mathematical reference (source-only precision evidence)
+
+Pin: deepseek-ai/DeepSeek-V4.1-Flash-1017 revision
+1bae0e1088993b9b82de08f59de5be5a34e42170, inference/model.py SHA256
+ e5decd76fe70fd56ef2f10124d245c6f64fb6a0003cc9068a1d3182a168b8d2d.
+Indexer.forward lines556-558 are the boundary being studied:
+ weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads**-0.5)
+ index_score = torch.einsum("bshd,btd->bsht", q, index_k)
+ index_score = (index_score.relu_() * weights.unsqueeze(-1)).sum(dim=2)
+
+The supplied query/key/projected_weights are BF16 bit patterns at that boundary.
+The positive finite F32 factor is explicit; this helper does not construct model
+weights or choose a trained model's scale. CPU Torch's wrapped scalar conversion
+for the pinned dyadic fixtures gives the supplied F32 factor. The actual CPU
+Torch expression receipts record BF16 scaled weights, einsum result, ReLU result,
+product and final head sum. The associated Python executes those unchanged AST
+assignments; only weights_proj is a stub returning supplied projected weights.
+This is not an execution of the whole unchanged Indexer.forward or its kernels.
+
+API: index_score_bf16::evaluate(View, exact span<uint16_t> output, Workspace*).
+One query: query[heads,D], key[keys,D], projected_weights[heads]; output[keys].
+Caps heads1..32, D1..1024, keys0..640. All spans must have EXACT sizes. The caller
+owns Workspace (124224 bytes, below128KiB), disjoint from all live inputs/output.
+It contains a bounded one-query stage receipt, not a multi-query dense score
+matrix. There is no allocation. Byte products, pointer ranges, alignment and all
+aliases of writable storage are checked before scratch mutation. Read-only inputs
+may overlap each other. Workspace cannot overlap any input or output.
+
+Arithmetic candidate: decode BF16, multiply projected weight by factor in F32,
+RNE BF16; scalar F32 QK sum in increasing dimension order, RNE BF16; ReLU preserving
+negative zero; F32 product of decoded BF16 score/weight, RNE BF16; scalar F32 sum
+of decoded BF16 products in increasing head order, RNE final BF16. Separate
+volatile F32 operations prevent fused multiply-add. Source signed-zero effects
+are retained in receipt stages; adding a lone negative-zero product to initial
+positive-zero head sum produces positive zero in RNE.
+
+All input BF16 values and factor must be finite; factor must be positive.
+All intermediate products/sums and BF16 conversions must remain finite. Refuse
+rather than propagate a NaN/infinity or silently saturate. Validate all payloads
+before scratch mutation. Derived arithmetic refusal may change Workspace, but
+output is copied only after every head/key has succeeded. Metadata, environment
+and input-payload refusal leave Workspace unchanged. Output and all input bytes
+remain unchanged on every failure. Workspace stage contents are only meaningful
+on success; reserved inactive receipt slots are unspecified.
+
+Compile with IEEE assumptions, no fast-math/finite-math-only, -ffp-contract=off;
+use RNE with gradual F32 underflow, no FTZ/DAZ. The shared checked arithmetic helper
+refuses unsupported runtime environments and compile-time fast-math profiles.
+
+Evidence and limits: actual Torch2.14.1+cpu one-thread AST execution is recorded
+in tests/data/golden/ds41-index-score-cpu.json. Tests compare every supplied stage
+word exactly on small dyadics, plus independent exact-arithmetic cases/refusals.
+A strict ordering reversal against unrounded F32 score equations demonstrates
+that omitting these BF16 boundaries can change candidate ordering, even without
+a top-k tie. This does not establish which candidates a real model would choose.
+CPU einsum/reduction trees are implementation-specific: this scalar accumulation
+order is a mathematical candidate, NOT a general Torch GEMM, TileLang or GPU bit
+parity claim. No projection/norm/RoPE/FP4 QDQ, mask/candidate policy, top-k, tensor
+parallel collective, architecture registration, serving defaults or full model
+execution is supplied or changed. The existing F32 index operator is unchanged.

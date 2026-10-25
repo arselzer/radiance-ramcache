@@ -1,0 +1,1028 @@
+  ok   planner_fits_an_all_vram_model
+  ok   planner_reports_what_did_not_fit
+  ok   planner_host_runs_are_contiguous
+  ok   planner_stages_when_no_host_kernel_resolved
+  ok   planner_shards_under_world_size_2
+  ok   planner_spills_experts_before_dense_weights
+I device: host backend, 1 device(s) [0:host]
+E placement: rank 0 planned against a 5.00 MiB weights budget (5242880 bytes) and its weights pool holds 11.00 MiB (11534336 bytes): the planner and the pool were given different splits
+  ok   a_resplit_ranks_config_reaches_the_pools_and_the_planner
+  ok   the_expert_floor_places_every_expert
+  ok   planner_warm_starts_from_the_container_profile
+E placement: layer_offload needs a weights budget and none was resolved; there is nothing to spill against
+  ok   planner_refuses_an_offload_strategy_with_no_budget
+I placement is static (--deterministic): residency and summation order are fixed for the run
+  ok   deterministic_mode_pins_placement_to_static
+  ok   planner_reads_routed_experts_it_cannot_hold_from_the_container
+  ok   weight_class_key_collapses_indices
+I heat engine: 8 movable units, 64 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.50 credit cap 512
+  ok   heat_promotes_a_hot_pooled_expert
+I heat engine: 8 movable units, 64 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.50 credit cap 512
+I heat engine: 8 movable units, 64 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+  ok   heat_does_not_thrash_on_an_alternating_pattern
+I heat engine: 8 movable units, 64 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.50 credit cap 512
+  ok   heat_caps_what_one_histogram_credits
+I heat engine: 8 movable units, 3 moves a step, decay 0.950 hysteresis 1.25 min-gain 0.50 credit cap 512
+  ok   heat_respects_the_move_budget
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.25 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.25 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.25 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.25 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.25 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.25 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.25 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.25 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.25 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.25 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.25 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.25 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.25 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.25 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.25 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.25 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.25 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.25 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.25 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.25 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.25 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.25 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.25 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.25 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.25 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.25 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.25 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.25 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.25 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.25 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.25 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.25 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.25 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.25 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.25 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.25 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.25 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.25 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+  ok   heat_step_proposes_exactly_what_repeated_picks_would
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.25 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.25 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.25 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.25 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.25 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.25 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.25 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.25 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.25 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.25 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.25 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.25 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.25 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.25 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.25 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.25 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.25 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.25 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.25 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.25 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.25 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.25 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.25 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.25 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.25 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.25 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.25 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 8 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.50 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.25 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 7 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.00 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.50 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.25 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 4 moves a step, decay 0.950 hysteresis 1.25 min-gain 0.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.00 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 5 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 6 moves a step, decay 0.950 hysteresis 1.00 min-gain 1.00 credit cap 512
+  ok   heat_swaps_stay_inside_a_slab_class
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.00 min-gain 4.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.75 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.75 min-gain 3.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.50 min-gain 3.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.50 min-gain 4.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.75 min-gain 3.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.75 min-gain 4.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.50 min-gain 3.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.75 min-gain 3.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.25 min-gain 4.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.75 min-gain 1.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.75 min-gain 3.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.50 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.50 min-gain 3.00 credit cap 512
+I heat engine: 64 movable units, 2 moves a step, decay 0.950 hysteresis 1.25 min-gain 2.00 credit cap 512
+I heat engine: 64 movable units, 1 move a step, decay 0.950 hysteresis 1.50 min-gain 3.00 credit cap 512
+I heat engine: 64 movable units, 3 moves a step, decay 0.950 hysteresis 1.00 min-gain 4.00 credit cap 512
+  ok   heat_step_agrees_with_picks_over_a_run_of_dispatches
+I heat engine: 68 movable units, 3 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.50 credit cap 512
+  ok   heat_credits_and_prices_every_layout_the_plan_can_have
+  ok   heat_is_off_when_nothing_is_movable
+  ok   slot_pool_hands_out_and_takes_back
+  ok   a_slot_pool_takes_the_lowest_slot_a_predicate_wants
+  ok   a_slot_pool_grows_only_into_the_capacity_it_was_given
+  ok   a_slot_pool_shrinks_past_what_nothing_holds
+  ok   a_slot_a_shrink_stranded_is_never_handed_out_twice
+  ok   a_slot_pool_regrows_every_slot_a_shrink_dropped
+  ok   file_tier_alignment_is_the_container_alignment
+W mover: no Pools given; allocating the slab and host pool directly (test only)
+I mover: 5 slab slots (1 shadow, 5 more kept free out of a loan), 4 pinned pool slots, 1.00 MiB static vram
+  ok   mover_publishes_addresses_for_every_tier
+W mover: no Pools given; allocating the slab and host pool directly (test only)
+I mover: 0 slab slots (0 shadow, 0 more kept free out of a loan), 0 pinned pool slots, 121.04 MiB static vram, file tier open
+  ok   the_file_stager_reads_each_routed_layer_from_the_container (0.78 s)
+I heat engine: 8 movable units, 64 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.50 credit cap 512
+W mover: no Pools given; allocating the slab and host pool directly (test only)
+I mover: 5 slab slots (1 shadow, 5 more kept free out of a loan), 4 pinned pool slots, 1.00 MiB static vram
+  ok   mover_promotes_and_demotes_through_the_shadow_slots
+I heat engine: 8 movable units, 64 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.50 credit cap 512
+W mover: no Pools given; allocating the slab and host pool directly (test only)
+I mover: 5 slab slots (1 shadow, 0 more kept free out of a loan), 4 pinned pool slots, 1.00 MiB static vram
+I mover: 4 slots can be lent out of the KV cache (4.00 MiB), filled as it lends them
+E mover: lend_from called twice for one lender; its slots are carved once
+W mover: no Pools given; allocating the slab and host pool directly (test only)
+I mover: 5 slab slots (1 shadow, 5 more kept free out of a loan), 4 pinned pool slots, 1.00 MiB static vram
+  ok   the_lent_slots_hold_nothing_until_a_loan_covers_them
+I heat engine: 8 movable units, 64 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.50 credit cap 512
+W mover: no Pools given; allocating the slab and host pool directly (test only)
+I mover: 5 slab slots (1 shadow, 0 more kept free out of a loan), 4 pinned pool slots, 1.00 MiB static vram
+I mover: 4 slots can be lent out of the KV cache (4.00 MiB), filled as it lends them
+  ok   every_lent_slot_is_filled_in_one_dispatch
+I heat engine: 24 movable units, 64 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.50 credit cap 512
+W mover: no Pools given; allocating the slab and host pool directly (test only)
+I mover: 5 slab slots (1 shadow, 2 more kept free out of a loan), 20 pinned pool slots, 1.00 MiB static vram
+I mover: 6 slots can be lent out of the KV cache (6.00 MiB), filled as it lends them
+  ok   the_turnover_slots_stay_free_and_are_rebuilt_by_drops
+I heat engine: 24 movable units, 64 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.50 credit cap 512
+W mover: no Pools given; allocating the slab and host pool directly (test only)
+I mover: 5 slab slots (1 shadow, 2 more kept free out of a loan), 20 pinned pool slots, 1.00 MiB static vram
+I mover: 6 slots can be lent out of the KV cache (6.00 MiB), filled as it lends them
+  ok   a_budgeted_victim_takes_a_lent_units_host_copy_and_a_recall_moves_the_donor (0.12 s)
+I heat engine: 24 movable units, 64 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.50 credit cap 512
+W mover: no Pools given; allocating the slab and host pool directly (test only)
+I mover: 5 slab slots (1 shadow, 2 more kept free out of a loan), 20 pinned pool slots, 1.00 MiB static vram
+I mover: 6 slots can be lent out of the KV cache (6.00 MiB), filled as it lends them
+  ok   a_recall_moves_a_donor_whose_slots_are_still_in_quarantine (0.26 s)
+I heat engine: 24 movable units, 64 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.50 credit cap 512
+W mover: no Pools given; allocating the slab and host pool directly (test only)
+I mover: 5 slab slots (1 shadow, 2 more kept free out of a loan), 20 pinned pool slots, 1.00 MiB static vram
+I mover: 6 slots can be lent out of the KV cache (6.00 MiB), filled as it lends them
+  ok   a_held_turnover_takes_no_host_copy
+I heat engine: 24 movable units, 64 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.50 credit cap 512
+W mover: no Pools given; allocating the slab and host pool directly (test only)
+I mover: 5 slab slots (1 shadow, 2 more kept free out of a loan), 20 pinned pool slots, 1.00 MiB static vram
+I mover: 6 slots can be lent out of the KV cache (6.00 MiB), filled as it lends them
+  ok   a_demotion_with_no_slab_slot_takes_no_host_copy
+I heat engine: 24 movable units, 64 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.50 credit cap 512
+W mover: no Pools given; allocating the slab and host pool directly (test only)
+I mover: 5 slab slots (1 shadow, 2 more kept free out of a loan), 20 pinned pool slots, 1.00 MiB static vram
+I mover: 6 slots can be lent out of the KV cache (6.00 MiB), filled as it lends them
+  ok   a_shrinking_loan_moves_a_donor_out_before_its_slot_is_given_back
+I heat engine: 8 movable units, 64 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.50 credit cap 512
+W mover: no Pools given; allocating the slab and host pool directly (test only)
+I mover: 5 slab slots (1 shadow, 0 more kept free out of a loan), 4 pinned pool slots, 1.00 MiB static vram
+I mover: 4 slots can be lent out of the KV cache (4.00 MiB), filled as it lends them
+  ok   a_shrinking_loan_drops_units_without_copying_them
+I heat engine: 8 movable units, 64 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.50 credit cap 512
+W mover: no Pools given; allocating the slab and host pool directly (test only)
+I mover: 5 slab slots (1 shadow, 0 more kept free out of a loan), 4 pinned pool slots, 1.00 MiB static vram
+I mover: 4 slots can be lent out of the KV cache (4.00 MiB), filled as it lends them
+  ok   a_recall_takes_the_slots_back_before_it_returns
+I heat engine: 8 movable units, 64 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.50 credit cap 512
+W mover: no Pools given; allocating the slab and host pool directly (test only)
+I mover: 5 slab slots (1 shadow, 0 more kept free out of a loan), 4 pinned pool slots, 1.00 MiB static vram
+I mover: 4 slots can be lent out of the KV cache (4.00 MiB), filled as it lends them
+  ok   an_idle_mover_fills_what_it_is_lent
+I heat engine: 8 movable units, 64 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.50 credit cap 512
+W mover: no Pools given; allocating the slab and host pool directly (test only)
+I mover: 5 slab slots (1 shadow, 0 more kept free out of a loan), 4 pinned pool slots, 1.00 MiB static vram
+I mover: 4 slots can be lent out of the KV cache (4.00 MiB), filled as it lends them
+I mover: 4 slots can be lent out of the activation arena (4.00 MiB), filled as it lends them
+E mover: lend_from called twice for one lender; its slots are carved once
+  ok   a_second_lender_is_recalled_without_touching_the_first
+  ok   slot_pool_segments_have_their_own_targets
+W mover: no Pools given; allocating the slab and host pool directly (test only)
+I mover: 2 slab slots (2 shadow, 0 more kept free out of a loan), 7 pinned pool slots, 2.00 MiB static vram
+  ok   mover_prefetches_staged_units_against_the_declared_order
+W mover: no Pools given; allocating the slab and host pool directly (test only)
+I mover: 5 slab slots (1 shadow, 5 more kept free out of a loan), 4 pinned pool slots, 1.00 MiB static vram
+  ok   a_staged_layer_is_published_at_its_copies_and_unstaged_at_its_pool_slots
+W mover: no Pools given; allocating the slab and host pool directly (test only)
+I mover: 10 slab slots (2 shadow, 10 more kept free out of a loan), 8 pinned pool slots, 1.00 MiB static vram
+  ok   the_stager_stages_ahead_and_releases_each_layer_when_the_next_starts
+W mover: no Pools given; allocating the slab and host pool directly (test only)
+I mover: 13 slab slots (2 shadow, 10 more kept free out of a loan), 37 pinned pool slots, 1.00 MiB static vram
+  ok   the_stager_ring_laps_without_overwriting_a_published_layer
+W mover: no Pools given; allocating the slab and host pool directly (test only)
+I mover: 13 slab slots (2 shadow, 10 more kept free out of a loan), 45 pinned pool slots, 1.00 MiB static vram
+  ok   the_stager_stages_the_next_steps_first_layers_and_never_the_draft_head
+W mover: the 'expert/1.00 MiB' host pool has no device address; a kernel reading it zero-copy would fault
+I mover: 5 slab slots (1 shadow, 5 more kept free out of a loan), 4 pinned pool slots, 1.00 MiB static vram
+  ok   mover_reserves_from_the_weight_pool_rather_than_beside_it
+W mover: no Pools given; allocating the slab and host pool directly (test only)
+I mover: 0 slab slots (0 shadow, 0 more kept free out of a loan), 4 pinned pool slots, 5.00 MiB static vram
+  ok   mover_declines_to_move_under_a_static_plan
+  ok   the_plan_report_names_every_class_once
+  ok   the_strategy_names_round_trip_and_an_unknown_one_is_refused
+  ok   access_strength_orders_the_classes_and_is_pessimistic_about_an_unknown_one
+  ok   weight_bytes_prefers_the_stored_layout_then_the_logical_then_the_shape
+  ok   the_weight_footprint_splits_statics_from_the_elastic_expert_plane
+  ok   weights_in_one_layer_are_one_unit_and_are_aligned_once_each
+  ok   a_weight_with_no_device_band_takes_its_whole_unit_to_the_mapped_tier
+  ok   on_the_host_backend_a_converted_host_only_weight_takes_a_pool_copy
+  ok   on_the_host_backend_an_op_reads_a_mapped_and_a_pooled_weight_together
+  ok   a_mapped_unit_that_cannot_be_read_in_place_is_counted_once
+  ok   the_placement_flags_find_their_tables_by_what_reads_them
+I placement: 'token_embd.weight' (1.00 MiB) in the pinned host pool, read in place (--embedding-placement ram, the default)
+  ok   embedding_ram_goes_to_the_pinned_pool_read_in_place_and_costs_no_vram
+I placement: 'token_embd.weight' (1.00 MiB) in the pinned host pool, read in place (--embedding-placement ram, the default)
+I placement: 'token_embd.weight' (1.00 MiB) in the pinned host pool, read in place (--embedding-placement ram, the default)
+  ok   embedding_ram_brings_its_own_room_beside_the_host_pool
+  ok   the_footprint_counts_an_encoder_tower_at_every_level
+I placement: 'token_embd.weight' (1.00 MiB) in the pinned host pool, read in place (--embedding-placement ram, the default)
+I placement: 'v.pos_x.weight' (1.00 MiB) in the pinned host pool, read in place (--embedding-placement ram, the default)
+I placement: the encoder towers, 5 units (8.00 MiB), in the pinned host pool, read in place (--vision-tower-placement ram)
+I placement: 'token_embd.weight' (1.00 MiB) in the pinned host pool, read in place (--embedding-placement ram, the default)
+I placement: 'v.pos_x.weight' (1.00 MiB) in the pinned host pool, read in place (--embedding-placement ram, the default)
+I placement: the encoder towers, 5 units (8.00 MiB), in the pinned host pool, read in place (--vision-tower-placement ram)
+I placement: the encoder towers, 6 units (9.00 MiB), in the pinned host pool, read in place (--vision-tower-placement ram)
+  ok   a_tower_lookup_table_the_embedding_pins_leaves_the_card_once
+I placement: the encoder towers, 5 units (8.00 MiB), in the pinned host pool, read in place (--vision-tower-placement ram)
+  ok   tower_ram_pins_every_tower_unit_in_the_pool_and_costs_no_vram
+E placement: --vision-tower-placement ram: the encoder towers need 8.00 MiB of the pinned host pool and 7.00 MiB of it is left
+E placement: --vision-tower-placement ram found no weight read once per request
+  ok   tower_ram_refuses_a_pool_too_small_and_a_program_with_no_tower
+I placement: 'token_embd.weight' (3.00 MiB) in the pinned host pool, read in place (--embedding-placement ram, the default)
+  ok   the_report_counts_a_hosted_embedding_once_in_one_unit
+E placement: --embedding-placement ram found no model-level weight that only embed_lookup reads
+  ok   embedding_ram_with_no_table_to_place_is_refused
+E placement: --embedding-placement ram: 'token_embd.weight' needs 1.00 MiB of the pinned host pool and 0 B of --host-pool-mib is left
+  ok   embedding_ram_that_does_not_fit_the_host_pool_is_refused_with_the_plan_filled_in
+  ok   ngram_ram_stays_mapped_and_reports_the_copy
+  ok   an_ngram_table_a_device_kernel_reads_goes_where_the_placement_says
+  ok   an_ngram_table_with_no_host_kernel_cannot_stay_on_disk
+  ok   an_empty_program_has_an_empty_footprint
+  ok   planner_spreads_residents_over_the_layers_and_follows_a_profile
+  ok   auto_placement_picks_the_strategy_the_model_and_budget_call_for
+  ok   layer_offload_spills_the_layers_that_run_last_not_the_highest_numbered
+  ok   an_expert_fill_after_a_layer_spill_spends_the_host_pool_once
+  ok   an_op_reading_host_and_device_weights_demotes_the_host_one_to_staged
+I heat engine: 16 movable units, 64 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.50 credit cap 512
+  ok   on_equal_heat_the_thinner_layer_is_promoted_into_and_the_fuller_one_gives_up
+I heat engine: 16 movable units, 64 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.50 credit cap 512
+  ok   on_equal_heat_and_residents_the_lower_unit_wins
+I heat engine: 16 movable units, 64 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.50 credit cap 512
+I heat engine: 16 movable units, 64 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.50 credit cap 512
+  ok   the_promotion_guard_is_inclusive_at_its_boundary
+I heat engine: 64 movable units, 64 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.50 credit cap 512
+W mover: no Pools given; allocating the slab and host pool directly (test only)
+I mover: 6 slab slots (1 shadow, 0 more kept free out of a loan), 59 pinned pool slots, 1.00 MiB static vram
+I mover: 30 slots can be lent out of the KV cache (7.50 MiB), filled as it lends them
+  ok   a_cold_fill_spreads_the_loan_over_the_layers
+W mover: no Pools given; allocating the slab and host pool directly (test only)
+I mover: 2 slab slots (2 shadow, 0 more kept free out of a loan), 7 pinned pool slots, 2.00 MiB static vram
+I heat engine: 8 movable units, 64 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.50 credit cap 512
+W mover: no Pools given; allocating the slab and host pool directly (test only)
+I mover: 5 slab slots (1 shadow, 0 more kept free out of a loan), 4 pinned pool slots, 1.00 MiB static vram
+I mover: 4 slots can be lent out of the KV cache (4.00 MiB), filled as it lends them
+W mover: no Pools given; allocating the slab and host pool directly (test only)
+I mover: 2 slab slots (2 shadow, 0 more kept free out of a loan), 7 pinned pool slots, 2.00 MiB static vram
+I heat engine: 8 movable units, 64 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.50 credit cap 512
+W mover: no Pools given; allocating the slab and host pool directly (test only)
+I mover: 5 slab slots (1 shadow, 0 more kept free out of a loan), 4 pinned pool slots, 1.00 MiB static vram
+I mover: 4 slots can be lent out of the KV cache (4.00 MiB), filled as it lends them
+  ok   a_mover_gives_back_every_event_and_device_byte (0.21 s)
+55005 check(s) over 86 case(s) in 1.75 s, 1.57 s of CPU
+slowest: the_file_stager_reads_each_routed_layer_from_the_container 0.78 s, a_recall_moves_a_donor_whose_slots_are_still_in_quarantine 0.26 s, a_mover_gives_back_every_event_and_device_byte 0.21 s

@@ -1,0 +1,80 @@
+Experimental DS41 scalar host-reference operation adapters
+=========================================================
+
+ds41_host_ops.h/.cpp expose 16 additional C launch symbols matching RadLaunchFn:
+ds41_ref_hc_prepare, hc_collapse, router_topk, sparse_attn, compress_pool,
+expert_act, moe_combine, mhc_post, index_scores, candidate_blocks, index_topk,
+index_scores_paged, rmsnorm, rope_tail, sparse_attn_paged, route_jobs. Each name
+after the first has the same ds41_ref_ prefix. Existing packed GEMM/routed and
+latent store/gather source/functions remain unchanged, yielding 20 reference rows
+once the parent registers these symbols in the explicitly opt-in libds41_ref.
+
+No device call, stream enqueue/synchronization, kernel initialization, service,
+model load, production architecture, ABI layout change or serving registration
+is hidden in these wrappers. They ignore their stream and synchronously execute
+the existing validated scalar CPU emulators. The caller must supply host-visible
+operands and order them behind any asynchronous producer. Actual Ctx host launch
+already performs its ordinary host_join ordering before it invokes the row.
+
+Metadata and payload errors return directly from the launch. The host Ctx catches
+that return synchronously, so these rows must NOT opt in to deferred GPU status
+collection. Each wrapper copies RadArgs and supplies a private four-byte CPU flag
+to the emulator. Caller scratch is ignored and never read/written; register these
+host rows with no scratch hook. Core generic host IssuePlans may retain DEVICE-
+arena scratch on a real GPU backend, which must never be CPU-dereferenced. The
+direct return is authoritative, including allocation failures before/during
+workspace setup. Exceptions do not cross the C launch boundary: std::bad_alloc
+becomes RAD_E_NOMEM, other unexpected exceptions become RAD_E_STATE. Existing
+component validators retain their alias/extent/pitch and full-preflight rules.
+
+The explicitly marked reference plugin remains subject to the Engine's reference
+kernel serving gate. Parent owns row tables/CMake and keeps GPU-only capability
+gates/collectors out of the host-reference module. These are scalar oracles and a
+future CPU graph integration foundation, not a production/performance claim.
+
+CPU workspaces
+---------------
+Current emulator caps bound local workspace independently of total model size:
+math uses <=8192 F32 router values or bounded selected-attention workspace, MoE
+combine <=4096 I32 expert-order entries, index selection <=4096 Entry objects,
+and paged attention a fixed 8192-F32 stack array. The other adapters allocate no
+local model/table state. All cache/tensor extents remain caller owned. Scalar
+runtime can be large for a large valid problem; this is a correctness baseline.
+
+Actual host integration tests
+------------------------------
+tests/ds41_host_ops_test.cpp dynamically loads the actual libds41_ref (plus
+libquant), verifies all 20 host rows are present, explicitly reference-marked and
+collector-free, and verifies malformed null arguments are refused. Its main
+proof uses actual Builder -> declared buffer/weight templates -> Ctx -> rad_issue
+through unmodified host launches. It never swaps a launch pointer or fabricates
+a GPU stream. It runs only on the real host backend.
+
+Eleven CPU cases cover 32 small programs and 98 passes: 65 good, 33 invalid. A
+focused extra direct-call case supplies an intentionally inaccessible caller
+scratch pointer, proving host adapters use only their private CPU flag. Every
+new host operation is exercised via actual Ctx, including math/mHC/routing,
+compressor U32 state, FFN, transforms, dense/paged index, optional selection masks,
+paged attention ratio0/1/2, and route token/identity/count outputs. Every program
+runs good -> bad -> good; route jobs also tests a second bad ID and reset.
+This reset is a test probe of reference components, not an Engine retry promise.
+
+Rank3/4 activations and state use real Builder-declared PERSIST HOST buffers;
+guard rows surround their narrowed RAD_B_N views. Gains, sinks and mHC weights
+use actual declared weight handles with owned guarded CPU storage. Fixtures
+drain the host stream before CPU writes, keep ownership through Ctx teardown,
+and compare read-only inputs, failed outputs/state and all guards exactly.
+Successful output is byte-identical to the component emulator expectation.
+CPU fixture expectations reuse existing independently checked component math;
+this test proves ABI/schema/runtime integration, not another math oracle.
+
+Host payload errors must be returned by run_step before the caller's publication
+counter advances. checks_device_status must remain false and await_device_status
+is the ordinary absent-hook no-op. Successful follow-up passes recompute cleanly.
+Core host/device arena plus explicit weight extents are capped at 1 MiB per
+fixture, excluding allocator/runtime metadata and the small CPU fixture copies.
+
+Build the host plugin and this test with -ffp-contract=off; test dependencies need
+libds41_ref and libquant. The test loads the real module and does not need to link
+another copy of ds41_host_ops.cpp. The child has not compiled/run these files;
+parent coordinates all builds and validation. No production restart/deploy.

@@ -1,0 +1,61 @@
+Actual HOST grouped projection handoff execution
+==============================================
+
+ds41_grouped_projection_runtime_test.cpp has two test cases. They run actual
+Builder/Ctx/rad_issue with registered libds41_ref packed dense rows, without
+replacing a launch. No new GEMM/kernel, architecture or CMake change is included.
+The test requires existing libquant and libds41_ref module build dependencies;
+parent owns builds and execution. No GPU work is performed by this test.
+
+Weight path is deliberately concrete:
+  existing independent GGML golden original blocks + decoded values ->
+  tiny stacked GGUF [G,N=3,K=256] file -> actual Checkpoint ->
+  RAD_MAP_COPY with src_index=g -> ckpt_resolve/Checkpoint::slice ->
+  actual ckpt_import_band/libquant canonical planes -> Core weight_share ->
+  registered DS41 private relayout -> distinct per-group native weight ->
+  actual registered HOST dense projection via nativeLinear helper/rad_issue.
+
+The new handoff plan chooses each complete group, its logical source region and
+original-block byte extent. The test verifies that the actual checkpoint slice
+has that original pointer/byte extent and that the actual native relayout equals
+the independent original blocks. It NEVER slices a private opaque weight tensor
+descriptor at issue time or treats a canonical scale/grid plane offset as an
+original GGUF block offset. The declared source for each operation is already
+one checked group, so its nativeLinear ownership is replicated/NONE; the grouped
+plan chooses which complete groups a logical rank declares.
+
+This is an explicit conversion/import test seam, like rad-convert's lossless
+import. The custom Builder source callback invokes the real ckpt_resolve and
+reports imported canonical metadata. Normal CheckpointSources intentionally
+refuses nontrivial raw imported GGUF serving; this test does NOT change/bypass
+that production gate or establish direct raw-GGUF model serving. A real model
+would serve appropriately converted per-group records or add reviewed loader
+integration. Native descriptors remain distinct per group in this baseline.
+
+Activations use actual HOST persistent arena buffers and RAD_B_COL slices, with
+different group inputs, different row contents and extra physical row padding.
+Per-group offsets come from the handoff plan; RAD_B_COL preserves the arena's
+larger declared row stride. Thus the physical pitches are explicitly larger than
+the helper's dense global metadata profile; physical arena allocation is counted
+separately and capped at1MiB. Output columns concatenate groups in global group
+order, leaving unowned groups/padding and inactive live-capacity rows unchanged.
+These extra pitches are test bindings, not an implicit local-storage extension
+of projection_handoffs.h's full-global dense metadata plan.
+
+Case1: G2, all six formats IQ2_XXS/IQ2_XS/IQ2_S/IQ3_XXS/Q5_K/Q8_0;
+three actual passes at the same pointers with live M1,3,2 and changed contents.
+The last pass intentionally gives each group the WRONG common group0 input,
+verifies that actual kernel result against its independent wrong-input oracle,
+and requires it to differ from the correct independent-group contraction.
+Case2: Q5_K G8, sequential logical TP4 rank metadata with two complete groups per
+rank, global activation/output offsets, good M2 and negative M1 bindings.
+There is no collective, actual TP device execution, partial sum or model result.
+
+Independent expected values come from tests/data/golden/gguf-import.json, whose
+provenance records the GGML decoder. Whole golden rows are repeated to populate
+the tiny group matrices; the operator under test does not generate the oracle.
+Results require exact F32 scalar-dot agreement on the HOST reference row; source
+blocks/weights, guard bytes, readonly input, inter-group/padding/inactive output
+bytes and unchanged registered launch pointers are checked. Tapes are disabled
+and played count remains zero. Full grouped model precision, quantized activation
+boundaries, BF16 grouped output, GPU parity, performance and serving remain open.

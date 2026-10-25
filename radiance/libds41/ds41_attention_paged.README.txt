@@ -1,0 +1,146 @@
+Experimental direct DS41 shared-latent paged attention
+=====================================================
+
+ds41_sparse_attn_paged reads ordinary fixed WINDOW KV plus FULL compressed KV directly.
+It never concatenates caches, copies/gathers the selected payload, or materializes window IDs.
+This is an isolated F32 semantic baseline with F32/F16/BF16 storage. The opt-in libds41 module
+registers its device row and scalar deferred-status collector. No architecture, cache
+allocation/lifecycle or full-model serving path is registered. Actual AQL execution needs its
+separate manual runtime checker; native HIP results alone do not prove core integration.
+
+Exact initial ABI
+-----------------
+Parameters: M (row capacity), sequences (capacity), heads, head_dim, window, topk, ratio,
+block_size, dtype, scale, n_spec. n_spec must explicitly equal 0. ratio is 0,1,2. ratio=0
+has topk=0 and absent compressed operands; ratio>0 has topk>0. One common block_size is
+used by both caches and must be a multiple of ratio when compression is enabled. head_dim is divisible by 2 for
+window storage and by 2*ratio for compressed storage. scale is a positive finite F32 value.
+
+Operands, in order (all may have positive ordered row/inner gaps):
+  0 query             [R,H,D]                         dtype
+  1 window_cache      [Pw,1,B,D]                      dtype
+  2 window_table      [S,Lw]                          I32
+  3 window_used       [S]                             I32
+  4 compressed_cache  [Pc,1,B,D/ratio]                 dtype, absent at ratio=0
+  5 compressed_table  [S,Lc]                          I32, absent at ratio=0
+  6 compressed_used   [S]                             I32, absent at ratio=0
+  7 selected          [R,T]                           I32, absent at ratio=0
+  8 positions         [R]                             I32
+  9 cu                [S+1]                           I32
+ 10 ctx_lens          [S]                             I32
+ 11 sinks             [H]                             F32
+ 12 output            [R,H,D]                         dtype
+
+M and sequences are capacities; R/S are actual descriptor extents. Cu begins at 0, ends at R
+and is nondecreasing. A nonempty sequence s owns rows [cu[s],cu[s+1]), with position
+ctx_lens[s] + row-cu[s]. Empty segments do not consume their context/used/table data. Output
+and four-byte status scratch must alias no input. Readonly inputs may share storage provided
+the caller supplies the promised values. ABI geometry must describe actual allocated spans;
+RadTensor carries no independent allocation capacity.
+
+Current profile bounds: R,S<=65536, H,D<=1024, W,T<=4096, context<=1048576, B<=65536.
+The probability workspace is at most (W+T)*4 bytes plus one F32 denominator in shared memory.
+Launches allocate and synchronize nothing. Core currently discovers a paged group's page size
+from a consumer's literal block_size constraint/param (rad_builder.cpp:404-449); a common B
+works for both groups without core edits. Different B values are outside this first profile.
+
+Original coordinates and safe chunk visibility
+----------------------------------------------
+For a row at ORIGINAL position p, window keys are exactly max(0,p-W+1)..p, oldest first.
+The standard window_cache declaration uses n_head_kv=1 and head_dim=D/2: its K/V-named
+planes are one opaque D-dimensional latent, not distinct keys and values. Its table row starts
+at original first position F. A key k maps to table[(k-F)/B], slot k%B and all D scalars.
+
+The public RadKVGroupBatch has no table_first_pos field (abi/rad_runtime.h:25-39). For an
+ordinary fixed WINDOW, the existing scheduler stages window_used = chunk_end-F, with
+chunk_end=ctx_lens[s]+cu[s+1]-cu[s] (core/sched/batch.cpp:763-791). Thus this operator
+derives F=chunk_end-window_used entirely on device, without a core edit or host readback.
+It checks F>=0, B alignment, all table bounds, and F<=max(0,ctx_lens[s]-W+1). The last
+condition rejects a cache trimmed to the chunk's end that already lost early-query keys.
+
+Existing fixed-WINDOW allocation preserves a chunk: recycle_window trims from the FIRST query
+keep_from (core/mem/kv.cpp:1239-1262), ensure grows through the whole chunk end (1280-1336),
+and window_seq_cap includes the step's blocks (1227-1237). It retains extra whole blocks, but
+this operator still enforces the exact per-row W-token causal mask. Future tokens stored later
+in the same chunk occupy distinct slots and are never selected. tests/mem_test.cpp:1130-1191
+already pins the 80->400 example and a prompt longer than W; the new core proof uses real
+staged metadata for a 12->29 chunk with W=5, including an extra retained older page.
+
+Compressed selection IDs are logical completed-entry indices j, without a window offset.
+-1 is padding; values below -1, or j>=floor((p+1)/ratio), fail the entire batch. The FULL
+compressed_used must equal chunk_end, in ORIGINAL-token coordinates, and its table begins
+at 0. Entry j begins at original j*ratio. The cache's n_head_kv=1 and
+head_dim=D/(2*ratio), so one contiguous D-scalar row occupies ratio original-token slots.
+The existing state_layout.h mapper and latent::store_row pin this exact representation.
+B%ratio==0 ensures an entry never crosses a physical page. A partial C2 entry is absent:
+it must not be read as a QSA-style partial page. Already-produced future complete entries
+at the chunk end remain hidden from each earlier query. Repeated selected IDs retain their
+multiplicity, and a compressed entry is not deduplicated against a window token.
+
+Why runtime/R-SWA is excluded
+----------------------------
+Core RAD_KV_RING/runtime windows retain a reference prefix and append a cyclic block ring;
+they are not fixed sliding windows (core/mem/kv.h:58-92). Their first_block_pos stays 0,
+seqused saturates at the reference+ring table span, and a later original token maps modulo
+ring_blocks (mem_iface.h:274-289; batch.cpp:783-788). Some frozen reference-tail tokens can
+also remain beyond the exact W. Reading that layout with the ordinary F rule is wrong.
+A multiquery chunk written into a ring can overwrite an earlier query's required keys with
+its own future: the new negative control uses the real ring mapper to show position 8 replacing
+position 0. Existing R-SWA scheduling avoids post-prompt multiquery steps (scheduler.cpp:785-790)
+but does not turn the retained-reference attention into DS41's sliding-window semantics.
+
+The architecture must bind ordinary RAD_KV_WINDOW and RAD_KV_FULL, never runtime/RING.
+Descriptor shape alone cannot prove kind: an unwrapped initial ring can look identical.
+No runtime-ring, speculative rollback, prefix-cache or production acceptance claim is made.
+
+Joint normalization and precision
+--------------------------------
+For each local head, visit window keys in chronological order, then compressed IDs in supplied
+order, ignoring -1. Compute each ascending-column F32 dot times scale. Let m be the maximum
+of those scores AND the sink logit. Denominator is exp(sink-m) plus all key exp(score-m),
+accumulated in that same order. The numerator is the corresponding F32 weighted sum of each
+shared K=V latent. The sink contributes zero value. Sinks may be finite or -Inf. A disabled
+sink and no finite score follows the existing reference's positive-zero convention.
+There is ONE denominator across both sources: separately normalized results cannot be added.
+The local head's final result is stored once in dtype; inverse tail RoPE remains a separate op.
+
+These equations match arch/common/rad_ds41_ref.h::sparse_attention and the existing floating
+ds41_sparse_attn baseline. They are deliberately not a claim of official TileLang arithmetic:
+reference/inference/kernel.py:375-380 rounds each exponent tile to BF16 before P*V while the
+denominator stays F32. Its cache pipeline also uses FP8 window KV and FP4 compressed KV with
+different scale group formats. This floating reader does neither quantizer nor BF16 probability
+tiles. Faithful quantized integration must explicitly implement those boundaries and their
+separate readers. Normal generic attn_paged treats K/V halves separately; it cannot consume
+these opaque latents. r4d_mla.hip:154-194 is the closer existing shared-K=V reader precedent,
+but it has one source, no DS41 sink and a different selection/packing contract.
+QSA's per-query visibility tests (r4d_selftest.cpp:21015 onward; r4d_emu/test_qsa.cpp:326)
+provide the causal precedent, including the warning against chunk-end bounds for early rows.
+
+This op partitions only independent query heads; each rank needs the complete shared cache
+state for those heads and its matching sinks. Global index-score TP reduction and all required
+projection reductions/casts are upstream/downstream responsibilities, not attention work.
+
+Validation, lifetime and checks
+------------------------------
+Four aligned scratch bytes at offset 0 hold I32 status. Host descriptor validation precedes
+enqueue. The same stream then runs initialization, a whole-batch Cu/context/position/selected-ID
+preflight, a whole-batch selected-page preflight, a whole-batch consumed-payload preflight, then
+compute. No table reads occur before structural validity, no cache reads before every selected
+page is safe, and no output writes before all payloads pass. Unselected pages/cache rows and
+unfinished C2 slots may contain arbitrary nonfinite bytes. Invalid selected pages are errors,
+not silently dropped keys. All output/padding stays unchanged on any validation failure.
+
+Caches/tables/query metadata remain immutable through preflight AND compute. Producer cache
+stores must finish first on the same stream, or be joined by explicit synchronization before
+issue. Another sequence/layer/pass must not recycle, overwrite, trim or repurpose these input
+pages during the call. Shared compressor sources must already have emitted the complete rows
+promised by compressed_used; their pending LINEAR state has its own acceptance contract.
+
+A launch return RAD_OK means enqueue success; the device flag still needs explicit propagation
+before treating output as valid. The opt-in row has a deferred-status collector; its actual AQL validation is separate.
+CPU emulator tests and a CLI-gated GPU checker are provided separately. CPU tests compare an
+independent canonical dense oracle, a C2 pool/cast/norm/RoPE/paged-index/topk composition, true
+staged core tables/slots, and PROT_NONE page/cache guards that prove preflight ordering.
+The GPU checker is never run by builds/CTest: --run-gpu is required before any HIP call. It has
+352 tiny payload cases and 8 descriptor failures, with every allocation red-zoned, readonly
+bytes and output padding checked, and scratch status read independently of launch status.

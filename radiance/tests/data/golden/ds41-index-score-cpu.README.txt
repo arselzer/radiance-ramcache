@@ -1,0 +1,42 @@
+Actual CPU Torch BF16 index-score expression receipt
+
+Generated 2026-10-24 with the already-installed /home/as/venvs/embed/bin/python
+(Torch2.14.1+cpu). The generator sets CUDA_VISIBLE_DEVICES=-1,
+HIP_VISIBLE_DEVICES=-1 and ROCR_VISIBLE_DEVICES=99 before importing Torch, requires a CPU-only Torch
+build, and sets one CPU thread. No GPU, installation, model weights or inference.
+
+Generator (outside this source checkout):
+ ../ds41_index_score_torch_cpu_oracle.py
+Command, from research/deepseek-v41-1017-20261024:
+ /home/as/venvs/embed/bin/python ds41_index_score_torch_cpu_oracle.py
+Golden SHA256:
+ dc643ff99ff15c6ca2089250656fe6cde248c7863e1bce471ff0e8fb8dfaad23
+Generator and extracted AST hashes, CPU environment and explicit device masks
+are embedded. This supersedes the earlier fixture's provenance-only fields;
+all numerical case/stage values are unchanged.
+
+Pinned inference/model.py SHA256:
+ e5decd76fe70fd56ef2f10124d245c6f64fb6a0003cc9068a1d3182a168b8d2d
+HF revision: 1bae0e1088993b9b82de08f59de5be5a34e42170.
+The generator extracts unchanged AST nodes for Indexer.forward's three score
+assignments at lines556-558. It executes these assignments on supplied BF16 q,
+key and projected-weight tensors. self.weights_proj(x) is explicitly replaced by
+a stub returning supplied projected weights. Separate unchanged ReLU/product
+expression subtrees run on clones to capture intermediate stages; the original
+combined assignment is executed unchanged to record final scores too.
+
+This is an independently EXECUTED source-expression oracle, not a hand-rewritten
+Torch implementation or an execution of the whole Indexer. No q/KV/weight
+projection, norm, RoPE, FP4 QDQ, candidate/visibility mask, top-k, TP or TileLang
+kernel is executed. Raw BF16 words are recorded for input/scaled weights, QK dot,
+ReLU, product and head-sum output; all actual tensor stages are BF16. F32 baseline
+bits are separately recorded from equivalent equations omitting BF16 boundaries.
+
+Six tiny cases: four structured dyadic profiles H2/D8, H4/D16, H8/D32, H32/D128;
+one signed-zero weight boundary; one bounded deterministic search witness. The
+search uses seed411017 and succeeds at attempt40. For candidates1 and3, BF16
+scores are -0.87890625 and -0.875, while F32 scores are -0.8750228881835938 and
+-0.8753204345703125: strict opposite ordering, not a tie. This is evidence that
+rounding boundaries can affect ordering, not an accuracy or real-model claim.
+CPU Torch internal GEMM/reduction order is CPU-specific; scalar C++ fixture
+agreement does not establish general Torch/TileLang/device parity.

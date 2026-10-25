@@ -1,0 +1,312 @@
+--- frozen-P3/CMakeLists.txt
++++ strict-P3/CMakeLists.txt
+@@ -1,12 +1,12 @@
+ cmake_minimum_required(VERSION 3.24)
+-project(glm53_sharded_native_source_host LANGUAGES CXX)
++project(glm53_sharded_native_strict_policy_host LANGUAGES CXX)
+ find_package(Threads REQUIRED)
+ set(RESEARCH_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/..")
+-set(RADIANCE_SOURCE "${RESEARCH_ROOT}/radiance-native-backed-ready-src" CACHE PATH "Matching repaired B2a plus checked-wait Core")
+-set(RADIANCE_HOST_BUILD "${RESEARCH_ROOT}/build-glm53-native-backed-ready-release" CACHE PATH "Matching ready HOST Core")
++set(RADIANCE_SOURCE "${RESEARCH_ROOT}/radiance-unified-native-policy-src" CACHE PATH "Matching unified Native-ready plus PermanentV1 Core")
++set(RADIANCE_HOST_BUILD "${RESEARCH_ROOT}/build-unified-native-policy-release" CACHE PATH "Matching unified HOST Core")
+ set(PROVIDER_SOURCE "${RESEARCH_ROOT}/glm53-sharded-native-provider-prototype")
+-if(NOT EXISTS "${RADIANCE_SOURCE}/.native-backed-overlay-applied.json" OR NOT EXISTS "${RADIANCE_HOST_BUILD}/core/librad_core.a")
+-  message(FATAL_ERROR "Parent must apply/build matching ready Core; no implicit rebuild")
++if(NOT EXISTS "${RADIANCE_SOURCE}/abi/rad_model_failure_policy.h" OR NOT EXISTS "${RADIANCE_SOURCE}/core/runtime/expert_prepare.cpp" OR NOT EXISTS "${RADIANCE_HOST_BUILD}/core/librad_core.a")
++  message(FATAL_ERROR "Parent must compose/build matching unified Core; no implicit rebuild")
+ endif()
+ file(STRINGS "${RADIANCE_HOST_BUILD}/CMakeCache.txt" CORE_HOME REGEX "^CMAKE_HOME_DIRECTORY:INTERNAL=")
+ string(REPLACE "CMAKE_HOME_DIRECTORY:INTERNAL=" "" CORE_HOME "${CORE_HOME}")
+@@ -15,7 +15,7 @@
+ if(NOT CORE_HOME_REAL STREQUAL EXPECTED_CORE_REAL)
+   message(FATAL_ERROR "Private Core/Program/Plan/Ctx header/archive mismatch")
+ endif()
+-file(READ "${CMAKE_CURRENT_SOURCE_DIR}/READY_CORE_PINS.json" READY_PINS)
++file(READ "${CMAKE_CURRENT_SOURCE_DIR}/UNIFIED_CORE_PINS.json" READY_PINS)
+ string(JSON PIN_COUNT LENGTH "${READY_PINS}")
+ math(EXPR PIN_LAST "${PIN_COUNT}-1")
+ foreach(I RANGE 0 ${PIN_LAST})
+@@ -23,7 +23,7 @@
+   string(JSON EXPECTED GET "${READY_PINS}" "${REL}")
+   file(SHA256 "${RADIANCE_SOURCE}/${REL}" ACTUAL)
+   if(NOT ACTUAL STREQUAL EXPECTED)
+-    message(FATAL_ERROR "Ready Core source mismatch: ${REL}")
++    message(FATAL_ERROR "Unified Core source mismatch: ${REL}")
+   endif()
+ endforeach()
+ # Every private C++ source is recompiled against these matching headers. No old prototype lib.
+@@ -33,14 +33,14 @@
+ target_include_directories(p3_native_source PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}" "${PROVIDER_SOURCE}"
+   "${RADIANCE_SOURCE}/core" "${RADIANCE_SOURCE}/abi" "${RADIANCE_SOURCE}/vendor" "${RADIANCE_HOST_BUILD}/rad_include")
+ target_compile_options(p3_native_source PRIVATE -Wall -Wextra -Wpedantic -fno-fast-math -ffp-contract=off)
+-add_executable(glm53_native_source_adapter_test native_source_test.cpp)
+-target_compile_features(glm53_native_source_adapter_test PRIVATE cxx_std_20)
+-target_compile_options(glm53_native_source_adapter_test PRIVATE -Wall -Wextra -Wpedantic -fno-fast-math -ffp-contract=off)
+-target_include_directories(glm53_native_source_adapter_test PRIVATE "${RADIANCE_SOURCE}/arch/common" "${RADIANCE_SOURCE}/tools")
+-target_link_libraries(glm53_native_source_adapter_test PRIVATE p3_native_source
++add_executable(glm53_native_source_strict_policy_test native_source_test.cpp)
++target_compile_features(glm53_native_source_strict_policy_test PRIVATE cxx_std_20)
++target_compile_options(glm53_native_source_strict_policy_test PRIVATE -Wall -Wextra -Wpedantic -fno-fast-math -ffp-contract=off)
++target_include_directories(glm53_native_source_strict_policy_test PRIVATE "${RADIANCE_SOURCE}/arch/common" "${RADIANCE_SOURCE}/tools")
++target_link_libraries(glm53_native_source_strict_policy_test PRIVATE p3_native_source
+   "-Wl,--whole-archive" "${RADIANCE_HOST_BUILD}/core/librad_core.a" "-Wl,--no-whole-archive"
+   "${RADIANCE_HOST_BUILD}/vendor/librad_vendor_llama.a" "${RADIANCE_HOST_BUILD}/vendor/librad_vendor_httplib.a" Threads::Threads ${CMAKE_DL_LIBS})
+-target_link_options(glm53_native_source_adapter_test PRIVATE "LINKER:--export-dynamic"
++target_link_options(glm53_native_source_strict_policy_test PRIVATE "LINKER:--export-dynamic"
+   "LINKER:--wrap=rad_memcpy_async" "LINKER:--wrap=rad_event_record"
+   "LINKER:--wrap=rad_event_wait" "LINKER:--wrap=pread")
+ # Parent invokes manually with --radiance-home MATCHING_READY_HOST_HOME. No Core/serving/GPU target.
+--- frozen-P3/adapter_fixture.h
++++ strict-P3/adapter_fixture.h
+@@ -11,6 +11,7 @@
+ #include <fcntl.h>
+ #include <sys/stat.h>
+ #include "rad_plugin.h"
++#include "rad_model_failure_policy.h"
+ #include <nlohmann/json.hpp>
+ #include <algorithm>
+ #include <array>
+@@ -44,6 +45,7 @@
+     return __real_rad_memcpy_async(dst,src,bytes,stream);
+ }
+ 
++namespace allocation_fault {extern thread_local int64_t remaining;}
+ namespace es=rad::expert_store_candidate;
+ namespace sc=glm53::sharded;
+ namespace fs=std::filesystem;
+@@ -86,6 +88,19 @@
+         ~Gate(){if(value&&rad_gate_open(value)<0)std::abort();}
+     };
+     using Source=glm53::p3::ShardedNativeSource;
++    // Only the two model-pass allocation fixtures use this boundary decorator.
++    // Normal eight cases still bind the actual facade directly to the Owner.
++    struct ModelAllocationSource final:NativeRecordSource {
++        std::shared_ptr<Source> real;int64_t armed=-1;uint64_t callbacks=0;
++        explicit ModelAllocationSource(std::shared_ptr<Source> source):real(std::move(source)){}
++        std::span<const NativeRecordDescriptor> catalog()const noexcept override{return real->catalog();}
++        int acquire(std::span<const uint32_t> ids,NativeRecordBatch* out)override{
++            ++callbacks;if(armed<0)return real->acquire(ids,out);
++            const auto position=armed;armed=-1;
++            struct Disarm {~Disarm(){allocation_fault::remaining=-1;}} disarm;
++            allocation_fault::remaining=position;return real->acquire(ids,out);
++        }
++    };
+     struct CountingAllocator final:MemAllocator {
+         struct Request{void* ptr;int64_t bytes,physical;int kind;};
+         std::vector<Request> live;uint64_t requested=0,physical=0,calls=0;
+@@ -141,17 +156,19 @@
+         size_t producer_retained=0,producer_peak=0;
+         PayloadTotals before_ctx{},after_ctx{};
+         static constexpr uint64_t admitted=64u<<20;
+-        static constexpr uint64_t declared_upper=(4u+4u+4u+24u+4u+2u)*(1u<<20)+2*65536+163840;
++        static constexpr uint64_t strict_extra=32768; // decorator/counters/tiny terminal snapshots
++        static constexpr uint64_t declared_upper=strict_extra+(4u+4u+4u+24u+4u+2u)*(1u<<20)+2*65536+163840;
+         static_assert(declared_upper<=admitted);
+         std::shared_ptr<Source> source;
++        std::shared_ptr<ModelAllocationSource> model_allocation_source;
+         std::unique_ptr<NativeBackingOwner> owner;
+         uint64_t original_expert_reads=0;
+         std::array<uint16_t,T*H> caller{};
+         rad_buf bad_dn=0;
+         bool fail_dn=false;
+-        int mode=0;
++        int mode=0;uint64_t caller_version=0,step_entries=0;
+         Ctx ctx;
+-        Fixture(const std::string& home,bool owned,uint64_t cold=3*32768,int layers=8,uint64_t hot=65536):names(""){
++        Fixture(const std::string& home,bool owned,uint64_t cold=3*32768,int layers=8,uint64_t hot=65536,bool model_allocation=false):names(""){
+             need(device_is_host(),"HOST-only, no device execution permitted");
+             good(registry.load_plugin(home+"/kernels/libref.so",0),"actual matching HOST libref");
+             RadModelMeta meta{};
+@@ -169,6 +186,7 @@
+             bc.max_ctx=T;
+             bc.scope="";
+             builder=std::make_unique<Builder>(registry,meta,bc);
++            good(builder->require_permanent_model_failure(),"immutable PermanentV1 before runtime declarations");
+             builder->set_instances(false);
+             builder->set_sources([](const std::string& name,const Program&,WeightSource* out){const bool gu=name.find("ffn_gate_up_exps.")!=std::string::npos,dn=name.find("ffn_down_exps.")!=std::string::npos;if(!gu&&!dn)return RAD_E_NOTFOUND;*out={};out->enc=rad_enc_affine(RAD_FP4E2M1,RAD_E8M0,1,32);out->rank=2;out->shape[0]=gu?2*H:H;out->shape[1]=H;return RAD_OK;});
+             moes.resize(size_t(layers));
+@@ -325,8 +343,13 @@
+             for(auto& input:shard_inputs){input.specs={};input.sources=nullptr;}
+             for(auto& group:shard_specs)std::vector<es::RecordSpec>().swap(group);
+             std::vector<es::RecordSpec>().swap(specs);source_catalog={};
+-            if(owned)good(NativeBackingOwner::open(program,plan,mover,source,&owner),
+-                           "typed native rank owner");
++            if(owned){
++                if(model_allocation)model_allocation_source=std::make_shared<ModelAllocationSource>(source);
++                const std::shared_ptr<NativeRecordSource> owner_source=model_allocation_source?
++                    std::static_pointer_cast<NativeRecordSource>(model_allocation_source):
++                    std::static_pointer_cast<NativeRecordSource>(source);
++                good(NativeBackingOwner::open(program,plan,mover,owner_source,&owner),"typed native rank owner");
++            }
+             CtxDesc d{};
+             d.program=&program;
+             d.stream=compute.value;
+@@ -340,6 +363,8 @@
+             d.expert_prepare_limits.max_readback_bytes=68;
+             before_ctx=payload_totals();
+             good(ctx.init(d),"actual checked-wait native Ctx");
++            need(program.requires_permanent_model_failure()&&ctx.requires_permanent_model_failure()&&
++                 !ctx.checks_device_status()&&!ctx.records_passes(),"actual strict TP1 eager zero-collector profile");
+             after_ctx=payload_totals();
+             for(size_t n=0;n<before_ctx.size();++n)need(after_ctx[n].second-before_ctx[n].second>=0&&
+                 after_ctx[n].second-before_ctx[n].second<4*(1<<20),"actual Ctx side backing exceeds admitted arena/work bound");
+@@ -397,7 +422,9 @@
+                 }static_cast<float*>(ctx.buf_ptr(selected().w.h.s))[row]=1.f;
+             }std::memset(ctx.buf_ptr(selected().w.egu),0x5a,size_t(R*K*2*H*2));
+         }
+-        int run(){reset();
++        int run(){
++            if(const int first=ctx.terminal_status();first<0)return first; // caller preparation guard; direct Core guards tested separately
++            reset();
+             RadBatch b{};
+             b.n_tok=T;
+             b.n_seq=1;
+@@ -406,13 +433,14 @@
+             active=this;
+             const int status=ctx.run_step(&b);
+             active=nullptr;
++            const int complete=ctx.await_device_status();
+             good(rad_stream_sync(compute.value),"final actual HOST completion");
+-            if(status==RAD_OK){auto* output=static_cast<uint16_t*>(ctx.buf_ptr(selected().w.h.x));
+-                std::copy(output,output+caller.size(),caller.begin());
+-            }return status;
++            if(status==RAD_OK&&complete==RAD_OK){auto* output=static_cast<uint16_t*>(ctx.buf_ptr(selected().w.h.x));
++                std::copy(output,output+caller.size(),caller.begin());++caller_version;
++            }return status<0?status:complete;
+         }
+     };
+-    void step(RadCtx* c,const RadBatch* b){auto& f=*active;
++    void step(RadCtx* c,const RadBatch* b){auto& f=*active;++f.step_entries;
+         const auto down=f.selected().w.edn;
+         if(f.fail_dn)f.selected().w.edn=f.bad_dn;
+         for(int64_t r0=0;r0<b->n_tok;r0+=R)f.selected().pass(c,b->n_tok,r0,std::min<int64_t>(R,b->n_tok-r0));
+--- frozen-P3/native_source_test.cpp
++++ strict-P3/native_source_test.cpp
+@@ -51,6 +51,35 @@
+     return __real_rad_event_wait(stream,event);
+ }
+ namespace {
++std::array<uint64_t,26> source_counts(const sc::Stats& x){return {x.acquires,x.refused,x.hot_hits,x.cold_hits,x.misses,x.duplicates,x.payload_opens,x.payload_reads,x.payload_read_bytes,x.fd_evictions,x.cell_lookups,x.dedup_touches,x.metadata_opens,x.stat_probes,x.global_audits,x.evictions,x.admission_bypasses,x.usage.hot_bytes,x.usage.cold_bytes,x.usage.live_records,x.usage.live_leases,x.usage.lease_vector_slots,x.cached_payload_fds,x.setup_verified_bytes,x.setup_manifest_bytes,x.setup_payload_io_bytes};}
++std::array<uint64_t,8> owner_counts(const NativeBackingStats& x){return {x.prepares,x.source_batches,x.source_bytes,x.copy_bytes,x.published_units,x.retirements,x.held_leases,x.peak_held_leases};}
++void terminal_barriers(Fixture& f,int first){
++    need(first<0&&f.ctx.terminal_status()==first,"actual Core did not latch permanent model failure");
++    const std::string diagnostic=f.ctx.step_error();need(!diagnostic.empty()&&diagnostic.size()<2048,"first bounded diagnostic missing");
++    const auto caller=f.caller;const auto version=f.caller_version;const auto source=source_counts(f.source->stats());
++    const auto owner=owner_counts(f.owner->stats());const auto epoch=f.mover.residency()->epoch();
++    const auto alloc=payload_totals();const auto copies=f.ctx.expert_prepare_copies();const auto waits=f.ctx.stream_waits();
++    const auto entries=f.step_entries;const auto callbacks=f.model_allocation_source?f.model_allocation_source->callbacks:0;
++    std::array<uint16_t,T*H> input{};std::copy_n(static_cast<const uint16_t*>(f.ctx.buf_ptr(f.selected().w.h.x)),input.size(),input.begin());
++    const auto weight=f.plan.units[size_t(residents(f).front())].weights.front();
++    RadBatch b{};b.n_tok=T;b.n_seq=1;b.phase=RAD_PHASE_PREFILL;b.step=100;
++    active=&f;const int direct=f.ctx.run_step(&b);active=nullptr;
++    need(direct==first&&f.run()==first&&f.ctx.expert_prepare(nullptr)==first&&
++         f.ctx.set_lane(1)==first&&f.ctx.weight_ptr(weight)==nullptr,"terminal direct Core/helper guard did not preserve first refusal");
++    need(f.caller==caller&&f.caller_version==version&&f.step_entries==entries&&
++         f.ctx.expert_prepare_copies()==copies&&f.ctx.stream_waits()==waits&&payload_totals()==alloc&&
++         source_counts(f.source->stats())==source&&owner_counts(f.owner->stats())==owner&&
++         f.mover.residency()->epoch()==epoch&&std::string(f.ctx.step_error())==diagnostic&&
++         (!f.model_allocation_source||f.model_allocation_source->callbacks==callbacks)&&
++         std::equal(input.begin(),input.end(),static_cast<const uint16_t*>(f.ctx.buf_ptr(f.selected().w.h.x))),
++         "terminal retry changed input/caller/version/source/I/O/owner/wait/allocation/publication");
++    auto* program=&f.builder->program();f.ctx.shutdown();const auto retired=payload_totals();
++    CtxDesc desc{};desc.program=program;desc.stream=f.compute.value;desc.residency=f.mover.residency();
++    desc.arch_step=step;desc.record_passes=false;desc.expert_prepare_owner=f.owner.get();
++    need(f.ctx.init(desc)==first&&payload_totals()==retired&&source_counts(f.source->stats())==source&&
++         std::string(f.ctx.step_error())==diagnostic&&f.caller==caller&&f.caller_version==version,
++         "terminal same-Ctx reinit allocated/rebound/read source or lost diagnostic/caller");
++}
+ uint32_t record(const Source& source,int layer,int expert){const auto catalog=source.catalog();const auto found=std::find_if(catalog.begin(),catalog.end(),[&](const auto& d){return d.layer==layer&&d.expert==expert;});need(found!=catalog.end(),"owned record lookup");return uint32_t(found-catalog.begin());}
+ bool untouched_gu(Fixture& f){const auto* p=static_cast<const uint8_t*>(f.ctx.buf_ptr(f.selected().w.egu));return std::all_of(p,p+size_t(R*K*2*H*2),[](uint8_t x){return x==0x5a;});}
+ void connected(const std::string& home){++cases;Fixture reference(home,false),f(home,true);
+@@ -82,7 +111,7 @@
+     need(f.source->bootstrap(fixed.front(),{})<0,"static bootstrap reopened after binding");
+     const auto process=f.source->process_usage();const auto stats=f.source->stats();
+     uint64_t ctx_bytes=0;for(size_t n=0;n<f.before_ctx.size();++n)ctx_bytes+=uint64_t(f.after_ctx[n].second-f.before_ctx[n].second);
+-    const auto component=f.device_allocator.physical+f.host_allocator.physical+process.metadata_reserved+process.cache_reserved+bytes.metadata_reservation+65536+ctx_bytes+uint64_t(f.pools.kv().committed());
++    const auto component=Fixture::strict_extra+f.device_allocator.physical+f.host_allocator.physical+process.metadata_reserved+process.cache_reserved+bytes.metadata_reservation+65536+ctx_bytes+uint64_t(f.pools.kv().committed());
+     need(component<Fixture::admitted&&ctx_bytes<4u<<20&&process.metadata_reserved<=24u<<20&&bytes.metadata_reservation<=4u<<20,"composite admission exceeded");
+     good(f.run(),"budgeted actual HOST forward");for(const auto& [w,old]:slots){const auto* current=f.mover.residency()->lookup(w);need(current->ptr==old.ptr&&current->ready==old.ready&&current->generation==old.generation,"static resident generation changed");}
+     for(const auto& [u,hash]:resident_hashes)need(es::checksum({static_cast<const std::byte*>(f.mover.unit_base(u)),size_t(f.plan.units[size_t(u)].bytes)})==hash,"static resident bytes changed");
+@@ -91,7 +120,7 @@
+              <<" pool-requested="<<f.device_allocator.requested+f.host_allocator.requested<<" pool-rounded="<<f.device_allocator.physical+f.host_allocator.physical
+              <<" native="<<bytes.native_device_bytes<<" landing="<<bytes.landing_bytes<<" native-meta="<<bytes.metadata_reservation
+              <<" provider-steady-meta="<<process.metadata_reserved<<" provider-setup-peak="<<process.peak_metadata_reserved<<" HOT+COLD="<<process.cache_reserved
+-             <<" adapter-reserved=65536 ctx-raddev-delta="<<ctx_bytes<<" setup-native-verified="<<stats.setup_verified_bytes<<" setup-payload-IO="<<stats.setup_payload_io_bytes
++             <<" adapter-reserved=65536 strict-helper-reserved="<<Fixture::strict_extra<<" ctx-raddev-delta="<<ctx_bytes<<" setup-native-verified="<<stats.setup_verified_bytes<<" setup-payload-IO="<<stats.setup_payload_io_bytes
+              <<" bootstrap-reads="<<stats.payload_reads<<" bootstrap-bytes="<<stats.payload_read_bytes<<" KV-logical="<<f.pools.kv().bytes()<<" KV-committed="<<f.pools.kv().committed()<<" buffered-OS-cache-excluded\n";
+ }
+ void pressure(const std::string& home){++cases;Fixture f(home,true,98304,8,0);const std::array held_id{record(*f.source,7,1)};NativeRecordBatch held;good(f.source->acquire(held_id,&held),"retain external unselected COLD lease");
+@@ -99,6 +128,7 @@
+     need(f.run()<0&&f.caller==caller&&untouched_gu(f)&&f.mover.residency()->epoch()==epoch,"whole-union pressure published partial expert/launch/output");
+     need(f.source->stats().payload_reads==before.payload_reads&&f.owner->stats().published_units==0&&f.owner->stats().held_leases==0,"pressure performed partial I/O/publication");
+     need(f.run()<0,"failed pressure pass reused");held.leases.clear();need(f.source->adapter_usage().live_holders==0&&f.source->accounting().usage().cold_bytes==0,"retained lease pressure leaked");
++    terminal_barriers(f,f.ctx.terminal_status());
+ }
+ fs::path touched_file;
+ void touch_file(){struct stat s{};need(!::stat(touched_file.c_str(),&s),"late stat witness");timespec times[2]{s.st_atim,s.st_mtim};++times[1].tv_sec;need(!::utimensat(AT_FDCWD,touched_file.c_str(),times,0),"late selected stamp change");}
+@@ -110,6 +140,7 @@
+         need(e<0&&f.caller==caller&&untouched_gu(f)&&f.mover.residency()->epoch()==epoch,"late source failure reached native readers/publication");
+         const auto after=f.source->stats();need(after.payload_reads>=before.payload_reads+2&&after.usage.hot_bytes==0&&after.usage.cold_bytes==0&&f.owner->stats().held_leases==0&&f.source->adapter_usage().live_holders==0,"failed source transaction retained private/ready payload");
+         need(f.run()<0,"late source failed pass reused");
++        terminal_barriers(f,e);
+     }
+ }
+ void describe_authority(const std::string& home){++cases;Fixture f(home,true);auto& store=f.source->store_for_test();const auto local=f.source->handle_for_test(0);sc::BoundInfo exact;
+@@ -140,6 +171,7 @@
+         need(e<0&&f.caller==caller&&owner.published_units>0&&owner.held_leases==0&&adapter.live_holders==0,context.c_str());
+         if(kind)need(wait_fault::failures==failures+1,"actual checked event wait not injected");
+         need(f.run()<0,"late issue/checked-wait fatal pass reused");good(f.mover.native_record_guards_host(),"late issue/wait pool guards");
++        terminal_barriers(f,e);
+     }
+ }
+ void allocation_family_smoke(){
+@@ -182,7 +214,34 @@
+     const auto old_caller=f.caller;const auto io=f.source->stats().payload_reads;const int refused=f.run();
+     weight.stored_shape[0]=rows;weight.stored_shape[1]=cols;
+     need(refused<0&&f.caller==old_caller&&f.source->stats().payload_reads==io,"same-size live Program mutation refreshed source authority");
++    terminal_barriers(f,refused);
+ 
++}
++void model_allocation_failures(const std::string& home){++cases;
++    for(int64_t site=0;site<2;++site){Fixture f(home,true,98304,8,65536,true);
++        good(f.run(),"actual successful publication before model allocation failure");
++        need(f.caller_version==1&&f.model_allocation_source,"positive model/decorator setup");
++        const auto caller=f.caller;const auto before=source_counts(f.source->stats());
++        const auto published=f.owner->stats().published_units;const auto callbacks=f.model_allocation_source->callbacks;
++        f.model_allocation_source->armed=site;f.active_layer=7;f.mode=2;
++        const int failure=f.run();
++        need(failure==RAD_E_NOMEM&&f.ctx.terminal_status()==failure&&f.caller==caller&&f.caller_version==1&&
++             source_counts(f.source->stats())==before&&f.owner->stats().published_units==published&&
++             f.owner->stats().held_leases==0&&f.source->adapter_usage().live_holders==0&&
++             f.model_allocation_source->callbacks==callbacks+1&&allocation_fault::remaining==-1,
++             "model facade allocation failure committed source/Native/caller or failed to latch");
++        terminal_barriers(f,failure);
++    }
++}
++void model_io_after_publication(const std::string& home){++cases;Fixture f(home,true);
++    good(f.run(),"actual successful publication before late source I/O failure");
++    need(f.caller_version==1,"prior caller version absent");const auto caller=f.caller;
++    f.active_layer=7;f.mode=3;io_fault::remaining=1;
++    const int failure=f.run();io_fault::remaining=-1;
++    need(failure==RAD_E_IO&&f.ctx.terminal_status()==failure&&f.caller==caller&&f.caller_version==1&&
++         f.owner->stats().held_leases==0&&f.source->adapter_usage().live_holders==0,
++         "source I/O after success replaced caller publication or escaped actual permanent policy");
++    terminal_barriers(f,failure);
+ }
+ void close_leases(const std::string& home){++cases;Fixture f(home,true);good(f.run(),"positive forward before final retirement");
+     const std::array id{record(*f.source,7,1)};NativeRecordBatch held;good(f.source->acquire(id,&held),"retain source lease beyond facade");const auto bytes=std::vector<std::byte>(held.leases[0].bytes.begin(),held.leases[0].bytes.end());
+@@ -197,8 +256,10 @@
+ }
+ }
+ int main(int argc,char** argv){const char* current="arguments";try{
+-    need(argc==3&&!std::strcmp(argv[1],"--radiance-home"),"usage: glm53_native_source_adapter_test --radiance-home MATCHING_READY_HOST_HOME");need(device_is_host(),"HOST only");
+-    using Test=void(*)(const std::string&);const std::array<std::pair<const char*,Test>,8> tests{{{"connected",connected},{"backing_and_budget",backing_and_budget},{"pressure",pressure},{"source_errors",source_errors},{"describe_authority",describe_authority},{"late_issue_and_wait",late_issue_and_wait},{"facade_contract",facade_contract},{"close_leases",close_leases}}};
++    need(argc==3&&!std::strcmp(argv[1],"--radiance-home"),"usage: glm53_native_source_strict_policy_test --radiance-home MATCHING_UNIFIED_HOST_HOME");need(device_is_host(),"HOST only");
++    need(rad_core_model_failure_policy_version()==RAD_MODEL_FAILURE_POLICY_VERSION,"matching unified Core+Engine PermanentV1 capability required");
++    using Test=void(*)(const std::string&);const std::array<std::pair<const char*,Test>,10> tests{{{"connected",connected},{"backing_and_budget",backing_and_budget},{"pressure",pressure},{"source_errors",source_errors},{"describe_authority",describe_authority},{"late_issue_and_wait",late_issue_and_wait},{"facade_contract",facade_contract},{"close_leases",close_leases},{"model_allocation_failures",model_allocation_failures},{"model_io_after_publication",model_io_after_publication}}};
+     for(const auto& [name,test]:tests){current=name;test(argv[2]);}
+-    std::cout<<"PASS "<<cases<<" actual HOST sharded source/native-owner/connected-FFN cases, "<<checks<<" checks; synthetic main TP1, no Engine/GPU/checkpoint/TP serving claim\n";return 0;
++    need(cases==10,"eight original direct-source groups plus two strict model-failure groups");
++    std::cout<<"PASS "<<cases<<" actual HOST strict-policy sharded source/native-owner/connected-FFN cases, "<<checks<<" checks; synthetic main TP1, no Engine/GPU/checkpoint/TP serving claim\n";return 0;
+ }catch(const std::exception& e){allocation_fault::remaining=-1;io_fault::remaining=-1;io_fault::after=nullptr;wait_fault::stream=nullptr;std::cerr<<"FAIL case="<<current<<" "<<e.what()<<'\n';return 1;}}

@@ -1,0 +1,15 @@
+/build/
+__pycache__/
+*.py[cod]
+*.o
+*.a
+*.so
+*.hsaco
+*.safetensors
+*.gguf
+!radiance/data/vectors/*.gguf
+.env
+.env.*
+!radiance/deploy/compose/.env.example
+*.key
+*.pem

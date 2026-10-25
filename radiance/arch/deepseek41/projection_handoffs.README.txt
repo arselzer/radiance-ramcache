@@ -1,0 +1,85 @@
+Checked projection handoff metadata (HOST only)
+==============================================
+
+projection_handoffs.h closes a specification gap, NOT an execution gap. It
+declares/registers/issues no operator, mutates no Builder, loads no weight bytes,
+executes no projection or collective, and establishes no whole-model precision,
+quality, speed or fit. Namespace: rad::deepseek41::handoff.
+
+Source is a caller-declared immutable snapshot of bounded asset_identity and
+tensor_name, exact RadEncoding, normalized [N,K] or [G,N,K] shape, explicit storage
+layout and exact original payload extent. GGUF inventory dimensions are reversed
+to normalized order by the caller. The identity may contain a pinned revision or
+hash, but these strings/keys do NOT authenticate payload bytes. Preserve/verify
+the actual source asset separately and do not change it after binding the plan.
+No source-file offset is inferred from the tensor name.
+
+plan_plain(Source,PlainSpec,PlainPlan*) accepts only exact plain BF16/F32 encoding
+and contiguous row-major source storage. It checks expected input/output extents,
+tokens1..65536 and dimensions1..65536 before publishing a replacement plan. Input,
+weight and output MatrixSlices identify stored dtype, element offset, rows/cols,
+row stride and checked byte span. Parameters record M/N/K, activation input,
+compute and output dtype; weight storage dtype is a separate field. Compute is
+explicitly F32, with required BF16-input/weight promotion recorded as flags. These
+are obligations for a future operator, not a claim any selected GEMM performs them.
+
+PlainRole defaults to generic; generic is a caller-named numerical policy and
+does not infer training semantics from a tensor name. Explicit roles add rules:
+  c2_projection: F32 compute AND output; BF16 source storage does not permit a
+    premature BF16 projection output. Pinned model.py:444-465 promotes C2 weights
+    and x to F32 before wkv/wgate and pooling. Pool output casts later at485.
+  router_logits: F32 compute/output, matching x.float()/weight.float() at813.
+  index_bf16: explicitly BF16 output for the requested index projection boundary;
+    model.py:544,551,556 then introduces its own norm/rotation/QDQ/scaling stages.
+The default output type is F32, so choosing C2/router role is safe by default.
+F16, quantized plain storage, transposed/padded source layouts and other compute
+types are intentionally unsupported. Norm gains/rank1 tensors are not projections.
+
+plan_grouped(Source,GroupedSpec,GroupedPlan*) accepts normalized [G,N,K], G<=64,
+plain BF16/F32 or EXACT existing six GGUF block formats. K must obey the original
+format's block geometry. It supports TP1 or TP4 METADATA ownership only, with an
+equal whole number of groups per rank; incomplete/cut groups are refused. No TP
+runtime enablement, gather, reconstruction, reduction, error recovery or memory
+admission is implied. Actual deferred-status Engine serving still requires TP1.
+
+Activation arrays are explicitly FULL GLOBAL token-major [M,G*K] and [M,G*N].
+For global group g, input offset=g*K with row_stride=G*K; output offset=g*N with
+row_stride=G*N. This prevents feeding one common group0 input to every group's
+weight rows. A rank owns [rank*(G/world), (rank+1)*(G/world)), and each live fixed
+array slice records its own Parameters and complete logical weight row Region.
+Local compact activations are NOT assumed; a future graph may introduce a distinct
+reviewed local-storage plan. Dead slice entries beyond group_count have no meaning.
+
+Weight locations are deliberately different concepts:
+  logical_weight: [row=g*N,rows=N,col=0,cols=K] in normalized flattened [G*N,K].
+    Use this logical region with the source encoding/Builder relayout machinery.
+  original_block_byte_offset/bytes: the contiguous region in ORIGINAL GGUF blocks
+    (or original plain storage). These are NOT offsets into Radiance's canonical
+    multigrid code/scale/min/grid planes, an arena, a source file or a WTAB.
+Canonical all-plane selection and runtime-private relayout remain separate work.
+
+Checked arithmetic covers source payload equality and all activation offsets,
+row gaps and spans within signed ABI/SIZE_MAX bounds. Identity limits are256/512
+bytes, disallow empty or embedded-NUL names, and bounded arrays avoid unbounded
+slice allocation. Plans retain their own identity strings; allocation failure is
+RAD_E_NOMEM. All failures leave the caller's existing output plan unchanged.
+There is no tensor payload allocation or pointer validation: these are metadata
+plans, and a future binding must validate actual memory/strides/owners/lifetimes.
+
+Provenance and tests
+--------------------
+Official model.py pin: 1bae0e1088993b9b82de08f59de5be5a34e42170,
+SHA256 e5decd76fe70fd56ef2f10124d245c6f64fb6a0003cc9068a1d3182a168b8d2d.
+Grouped wo_a contracts each group's own head slice at model.py:784-789. Inventory
+tests use the existing metadata-only gguf-weight-inventory.json from ISTA revision
+cb02422c900df489cea5833e8a92171224059b3c, whose flags explicitly say payload bytes
+were not downloaded or hash verified. Real Q5_K wo_a is [4096,1024,8] GGUF order;
+eight groups each consume4096 scalars and produce1024, with TP4 planning2groups/rank.
+
+Six tiny CPU tests cover actual BF16 compressor/router/index + F32 mHC metadata,
+C2/router output dtype refusal, TP1/4 real grouped slices, invalid metadata and
+transactional replacement, and an independent tiny two-group arithmetic witness.
+Its inputs/matrices are asymmetric: correct group1 gives68 where the incorrect
+flattened/common group0 input gives14. The witness is NOT a kernel or graph test.
+Actual Builder/Ctx projection execution, numerical boundary fixtures, all-plane
+weight relayout, grouped output concatenation and native AQL gates remain next.

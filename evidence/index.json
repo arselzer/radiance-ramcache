@@ -1,0 +1,87 @@
+[
+  {
+    "directory": "build-glm53-foundation-host-release-evidence-20261025T141027Z",
+    "passed": false,
+    "scope": "Matching isolated research Core build only, no GPU or target execution"
+  },
+  {
+    "directory": "portable-host-release-20261025",
+    "passed": true,
+    "scope": "Portable Release checker build and seven explicit HOST runs, reusing an existing source-identical validated Core; no fresh portable Core build, GPU, Engine, full-model or serving proof"
+  },
+  {
+    "directory": "portable-release-initial-configure-failure",
+    "passed": false,
+    "scope": "Initial portable-wrapper configure only; reserved CACHE variable fixed in successor"
+  },
+  {
+    "directory": "validation-glm53-combined-frontier-asan-20261025T121924Z",
+    "passed": true,
+    "scope": "Matching private HOST Core and exact bounded synthetic fixtures; no fullmodel/Engine/GPU/serving activation"
+  },
+  {
+    "directory": "validation-glm53-combined-frontier-release-20261025T120740Z",
+    "passed": true,
+    "scope": "Matching private HOST Core and exact bounded synthetic fixtures; no fullmodel/Engine/GPU/serving activation"
+  },
+  {
+    "directory": "validation-glm53-combined-frontier-tsan-20261025T123036Z",
+    "passed": true,
+    "scope": "Matching private HOST Core and exact bounded synthetic fixtures; no fullmodel/Engine/GPU/serving activation"
+  },
+  {
+    "directory": "validation-glm53-combined-persistent-input-default-20261025T123035Z",
+    "passed": true,
+    "scope": "Actual one-card Native-owner TP1 synthetic GLM FFN and learned-router-form with permanent semantic faults; no Engine/fullmodel/TP/MTP/performance/failed-drain recovery"
+  },
+  {
+    "directory": "validation-glm53-combined-persistent-input-host-kargs-20261025T123257Z",
+    "passed": true,
+    "scope": "Actual one-card Native-owner TP1 synthetic GLM FFN and learned-router-form with permanent semantic faults; no Engine/fullmodel/TP/MTP/performance/failed-drain recovery"
+  },
+  {
+    "directory": "validation-glm53-foundation-v2-asan-20261025T143707Z",
+    "passed": false,
+    "scope": "Tiny real HOST loader and quotes, preserved regressions; no Engine/model"
+  },
+  {
+    "directory": "validation-glm53-foundation-v2-release-20261025T142822Z",
+    "passed": true,
+    "scope": "Tiny real HOST loader and quotes, preserved regressions; no Engine/model"
+  },
+  {
+    "directory": "validation-glm53-foundation-v3-asan-20261025T144240Z",
+    "passed": true,
+    "scope": "Tiny real HOST loader and quotes, preserved regressions; no Engine/model"
+  },
+  {
+    "directory": "validation-glm53-physical-bound-v3-frontier-asan-20261025T121402Z",
+    "passed": true,
+    "scope": "Matching private HOST Core and exact bounded synthetic fixtures; no fullmodel/Engine/GPU/serving activation"
+  },
+  {
+    "directory": "validation-glm53-physical-bound-v3-frontier-release-20261025T120741Z",
+    "passed": true,
+    "scope": "Matching private HOST Core and exact bounded synthetic fixtures; no fullmodel/Engine/GPU/serving activation"
+  },
+  {
+    "directory": "validation-glm53-physical-bound-v3-frontier-tsan-20261025T121941Z",
+    "passed": true,
+    "scope": "Matching private HOST Core and exact bounded synthetic fixtures; no fullmodel/Engine/GPU/serving activation"
+  },
+  {
+    "directory": "validation-glm53-tiny-engine-startup-contract-asan-20261025T131956Z",
+    "passed": true,
+    "scope": "Actual synthetic checkpoint/importer320tokenizer/source authority/sharedFFN+Sampler declaration/purePlanner/compactquote only; noPools/NativeSource/Owner/Ctx/streams/Engine/model orsamplerexecution"
+  },
+  {
+    "directory": "validation-glm53-tiny-engine-startup-contract-release-20261025T131940Z",
+    "passed": true,
+    "scope": "Actual synthetic checkpoint/importer320tokenizer/source authority/sharedFFN+Sampler declaration/purePlanner/compactquote only; noPools/NativeSource/Owner/Ctx/streams/Engine/model orsamplerexecution"
+  },
+  {
+    "directory": "validation-glm53-tiny-engine-startup-contract-tsan-20261025T132036Z",
+    "passed": true,
+    "scope": "Actual synthetic checkpoint/importer320tokenizer/source authority/sharedFFN+Sampler declaration/purePlanner/compactquote only; noPools/NativeSource/Owner/Ctx/streams/Engine/model orsamplerexecution"
+  }
+]

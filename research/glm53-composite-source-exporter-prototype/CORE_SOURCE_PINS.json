@@ -1,0 +1,9 @@
+{
+  "core/rad_core.h": "2c57e84cf951a95ed3010c81b94268b0f079085d7e7038f6e8979a59f5fdf24c",
+  "core/format/share.h": "d63f2b2fa1d08d30025e15687b457945f4011f4ae1aea8cf8a6e8e124623b08b",
+  "core/format/share.cpp": "ba002de773aaccc759b699348273d4f7612aa599e6e69f3801f1f5eec0bb7168",
+  "abi/rad_types.h": "cb52bb662978b8641fc6dff42a5860cc2651729d7cf258cc0ba9e6d6a24ef863",
+  "abi/rad_builder.h": "3483154789ad7b906fc9c82df22c259c35f55d60a750a4357a264f15febf7a71",
+  "abi/rad_encoding.h": "0c3b9c774b29f1285c7a7dcd30327471a28e419943749b3d1cc5e4b169c0e703",
+  "tools/glm53_weight_allocation.h": "f039f42ae74e2ec3a840af79855b1d5e043364f9370377dd629abaf155b62c06"
+}

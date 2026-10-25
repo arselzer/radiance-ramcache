@@ -1,0 +1,69 @@
+I device: host backend, 1 device(s) [0:host]
+I arena: 256 B device + 256 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+I deferred device validation: enabled; recorded passes, speculation and issue-ahead are unsupported
+E kernel policy_refuse (policy-fixture, no tunables, host domain) refused op 'policy_refuse' at M=1 [band M<=1] geometry {M=1}: invalid argument; the step is aborted (a kernel that refuses at issue was selected wrongly)
+  ok   policy_default_legacy_final_and_sync_failures_can_still_reset
+I arena: 256 B device + 256 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+I arena: 256 B device + 256 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+I deferred device validation: enabled; recorded passes, speculation and issue-ahead are unsupported
+  ok   policy_good_status_passes_and_host_only_passes_remain_reusable
+I arena: 256 B device + 256 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+I deferred device validation: enabled; recorded passes, speculation and issue-ahead are unsupported
+  ok   policy_final_flag_survives_scratch_overwrite_and_denies_reset_before_any_preparation
+I arena: 256 B device + 256 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+E kernel policy_refuse (policy-fixture, no tunables, host domain) refused op 'policy_refuse' at M=1 [band M<=1] geometry {M=1}: invalid argument; the step is aborted (a kernel that refuses at issue was selected wrongly)
+  ok   policy_synchronous_late_failure_is_terminal_without_rolling_back_prior_host_state
+I arena: 256 B device + 256 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+I deferred device validation: enabled; recorded passes, speculation and issue-ahead are unsupported
+I arena: 256 B device + 256 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+I deferred device validation: enabled; recorded passes, speculation and issue-ahead are unsupported
+  ok   policy_checkpoint_failure_and_later_final_failure_both_become_permanent
+I arena: 256 B device + 256 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+I deferred device validation: enabled; recorded passes, speculation and issue-ahead are unsupported
+I arena: 256 B device + 256 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+I deferred device validation: enabled; recorded passes, speculation and issue-ahead are unsupported
+I arena: 256 B device + 256 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+I deferred device validation: enabled; recorded passes, speculation and issue-ahead are unsupported
+  ok   policy_malformed_readback_refuses_without_invented_attribution
+I arena: 256 B device + 256 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+E first owned failure
+I arena: 0 B device + 0 B scratch = 4.00 KiB, charged to the VRAM budget before it was split
+  ok   policy_failed_ctx_shutdown_does_not_allow_reinit_or_lose_owned_diagnostic
+I arena: 256 B device + 256 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+I deferred device validation: enabled; recorded passes, speculation and issue-ahead are unsupported
+  ok   policy_trivial_null_admission_does_not_claim_a_model_pass_was_mutated
+I arena: 256 B device + 256 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+I deferred device validation: enabled; recorded passes, speculation and issue-ahead are unsupported
+I arena: 256 B device + 256 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+I deferred device validation: enabled; recorded passes, speculation and issue-ahead are unsupported
+I arena: 256 B device + 256 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+I deferred device validation: enabled; recorded passes, speculation and issue-ahead are unsupported
+  ok   policy_checkpoint_transport_return_refusal_allows_retirement_but_never_reuse
+I arena: 256 B device + 256 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+I deferred device validation: enabled; recorded passes, speculation and issue-ahead are unsupported
+  ok   policy_final_await_return_refusal_remains_first_error_after_later_successful_retirement
+I arena: 256 B device + 256 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+I deferred device validation: enabled; recorded passes, speculation and issue-ahead are unsupported
+I arena: 256 B device + 256 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+I deferred device validation: enabled; recorded passes, speculation and issue-ahead are unsupported
+  ok   policy_final_seal_copy_or_record_refusal_does_not_authorize_a_new_pass
+E declare: permanent model failure policy after declare finished
+E declare: sizing declaration changes permanent model failure policy
+  ok   policy_builder_requirement_and_sizing_cannot_be_downgraded
+I arena: 0 B device + 0 B scratch = 4.00 KiB, charged to the VRAM budget before it was split
+E Engine owned HOST failure
+  ok   policy_actual_engine_zero_collector_host_profile_and_failure_admission
+I arena: 0 B device + 0 B scratch = 4.00 KiB, charged to the VRAM budget before it was split
+I arena: 0 B device + 0 B scratch = 4.00 KiB, charged to the VRAM budget before it was split
+I arena: 0 B device + 0 B scratch = 4.00 KiB, charged to the VRAM budget before it was split
+I arena: 0 B device + 0 B scratch = 4.00 KiB, charged to the VRAM budget before it was split
+  ok   policy_actual_engine_rejects_unintegrated_profiles_before_serving
+I arena: 256 B device + 256 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+E HOST synchronous refusal
+I arena: 256 B device + 256 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+I deferred device validation: enabled; recorded passes, speculation and issue-ahead are unsupported
+  ok   policy_engine_protocol_no_sampler_or_publication_after_host_or_async_failure
+I arena: 256 B device + 256 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+  ok   policy_profile_tp1_and_spec_guard_is_not_a_collective_cancellation_claim
+  ok   policy_loader_new_core_and_real_decl_requirement_old_cores_fail_closed
+205 check(s) over 17 case(s) in 0.01 s, 0.01 s of CPU

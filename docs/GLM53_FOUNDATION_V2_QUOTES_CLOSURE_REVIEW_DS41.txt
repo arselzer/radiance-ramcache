@@ -1,0 +1,76 @@
+Independent source review: Foundation v2 F1/F2 closure
+/root/ds41_engram_ref; 2026-10-25; source only
+
+Disposition
+No remaining scoped F1/F2 blocker found at
+glm53-engine-native-foundation-v2-prototype SOURCE_RECEIPT SHA256
+92c47fd9b272fdfa0d03058f65fbac5fce46909e5d92d74fa8f753fff23b2254,
+Core1492-file pins75e34cfccbc635cc2b99c052dd7916dd07755bc7321bb6095a9fca981e3cfc53.
+This review closes the two findings in the unchanged pre-repair review
+68b6ab2cdb08d67e72419aadf0f77f514c9789b1f6416a5bb2e8e8dfc1c1a323 for this
+NEW revision; it does not retroactively pass the original failed revision.
+No source edits/compiler/target import/runtime/numerical/device calls by reviewer.
+Stdlib source/hash verifier passed1492Core/47prototype/31preserved source bodies,
+including exact original contract-case recovery and unchanged original Core.
+
+F1 closure: truthful class profiles
+core/runtime/ctx.cpp has exactly two predicate changes versus frozen v1:
+classes1 OR2 are accepted; nonnegative class_index must equal slot index modulo
+classes. The class-count test precedes the modulo, so zero/negative unsupported
+counts cannot reach division. All original bounds/member/source/shape guards and
+quote allocation formulas remain unchanged. This matches actual supported route
+parity without conflating NativeInventory cache classes with MoeFP8 route classes.
+
+The actual contract declaration/graph quote STILL requires classes2 and its actual
+entries alternate0/1. contract/checker.cpp first successfully quotes that truthful
+same Program, then explicitly labels a classes1 metadata-only API mutation. It
+does not claim a second genuine declaration, numerical execution or Native class
+layout proof. The bounded restore guard saves only8 class integers and32 indices,
+not a WeightInfo vector; every iteration resets them and its destructor restores
+them on failure. Seven explicit negative cases cover unsupported0/3/4 counts,
+two in-range wrong-modulo entries, negative-2 and out-of-range2, with caller
+sentinel unchanged. Final restored two-class quote is required. Neither immutable
+source generators nor original class2 declaration/consumer code is changed.
+
+F2 closure: admission-owned global credit
+tiny_startup.h adds an explicit admission_controls field, not an external ticket.
+tiny_startup.cpp:63-71 sets it and debits Controls.live/peak/requests UNDER the
+same mutex and BEFORE admitted_ becomes true. No generic ticket can observe an
+admitted ledger without this baseline. Existing take/take_stream cap checks now
+see the baseline in live credit; AQL stream controls therefore consume only the
+remaining slice, and the old admission three-stream fit test still subtracts it.
+No category/whole cap is increased.
+
+release refuses lowering Controls below baseline. Generic/stream ticket resets
+cannot accidentally release admission-owned credit. Destructor requires every
+category equal its owned baseline(Controls only), plus zero streams/workers;
+unadmitted or failed admission has zero baseline and safely retains old behavior.
+Second admission failure does not rewrite the existing credit. The destructor
+ends logical admission only; it neither frees nor claims retirement of backend
+global caches that may remain beyond this manually scoped Budget.
+
+New tests require full4MiB generic Controls refusal, exact usable-remainder
+admission, one additional byte refusal, and preserved baseline after generic AND
+all stream-control ticket resets. no_live now correctly means no ticket/role
+credit beyond the admission-owned baseline. Reported request counters are
+explicitly admission/ticket counters, not malloc/backend allocation traces.
+Ticket-owner lifetime and nonconcurrent Budget-destruction preconditions remain
+as documented; baseline accounting does not assert a process-wide RSS quota.
+
+Change containment and limits
+Direct full-tree comparison independently found ONLY three Core paths changed
+from the frozen v1: core/build/tiny_startup.h/.cpp and core/runtime/ctx.cpp.
+All actual-private Sampler/Owner/StepSlot providers, backend/loader retirement
+bodies and default Engine/serving paths remain byte-identical to the reviewed
+v1 composition. The new manual checker fixes RAD_DT_BF16 to actual RAD_BF16,
+and documentation preserves the original failed fixture compile instead of
+claiming a runtime pass. Existing source/contract case bodies and all parents
+remain unchanged. No caller-visible Engine activation or readiness authority
+is introduced; EngineEligible remains false.
+
+Parent matching Release/ASanUBSan/TSan compilation/execution remains separate.
+This review establishes source closure of F1/F2 and truthful source-covered
+tests, not their runtime outcome. The previous positive NativeOwner-quote versus
+real NativePlan integration gate is still not exercised by the metadata-only
+contract refusal case; do not infer it or full Engine startup from these repairs.
+Companion pins bind this exact revision, old review and three-file deltas.

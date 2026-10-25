@@ -1,0 +1,28 @@
+DeepSeek1017 FP32 mathematical oracle fixtures
+
+Source: deepseek-ai/DeepSeek-V4.1-Flash-1017
+revision 1bae0e1088993b9b82de08f59de5be5a34e42170 (MIT),
+inference/model.py and kernel.py. The independent NumPy implementation in
+../../gen_deepseek41_reference.py uses tiny synthetic weights, seed1017.
+It never imports C++ helpers, model weights, Torch, TileLang or GPU libraries.
+
+From the Radiance source root:
+  OPENBLAS_NUM_THREADS=1 python3 tests/gen_deepseek41_reference.py \
+    tests/data/golden/deepseek41-reference.json
+
+Cases include two shifted mHC sublayers and final carried-pre collapse,
+normalized sqrt-softplus top6 and unnormalized top1 routing, asymmetric clamps,
+RoPE with and without YaRN through position262143, sparse attention/sinks,
+global-head-scaled index scores, latest partial candidate blocks, ratio1/2
+compressor groups and grouped low-rank output projection.
+
+The C++ tests generally compare FP32 values with 3e-6 absolute +2e-5 relative.
+RoPE allows8e-4 absolute +4e-5 relative for long-position frequency/libm rounding;
+inverse roundtrip and the untouched nonrotary prefix have tighter checks.
+Masks/indices and causal visibility compare exactly. Tied top-k chooses the
+smallest ID/position; this is an explicit oracle policy, not Torch tie parity.
+
+These are pre-quantization semantic fixtures. They do not reproduce FP8/FP4
+activation/cache quantizers, optimized probability rounding, real-model quality,
+262K memory use or GPU performance. The separate Engram/block generators execute
+actual SHA-pinned official forward bodies rather than this adapted math oracle.

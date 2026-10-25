@@ -1,0 +1,18 @@
+{
+  "glm53-expert-record-store-prototype/native_record_store.h": {
+    "bytes": 3742,
+    "sha256": "b398bce05f8ba6d30572370fa0ebfd1d47ba49e003957f8e244d33da1c284faa"
+  },
+  "glm53-expert-record-store-prototype/native_record_store.cpp": {
+    "bytes": 30746,
+    "sha256": "432c7961d40796559f68e25c3b2acf82b5e844af75f0ea43787bff20ec4f5083"
+  },
+  "glm53-expert-record-store-prototype/record_store_test.cpp": {
+    "bytes": 17654,
+    "sha256": "51526a9dbbfa672c636f85c53b00ca0ee6efa933c9b9fc8ab4d790bba5724202"
+  },
+  "glm53-expert-record-store-prototype/CMakeLists.txt": {
+    "bytes": 1911,
+    "sha256": "507a8ebcb7cbb76d1bdb90339b3519a9cc9b81f1d5de26a1f03ece3d7811e5fd"
+  }
+}

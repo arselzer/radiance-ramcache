@@ -1,0 +1,32 @@
+/* Never-launch host-only stubs for checking the real experimental device schemas.
+ * Output is outside the serving scan and this module links no GPU runtime. */
+#include "rad_abi.h"
+#define STUB(name) extern "C" int name(const RadArgs*,RadStream) {return RAD_E_STATE;}
+STUB(ds41_packed_gemm)
+STUB(ds41_packed_routed)
+STUB(ds41_latent_store)
+STUB(ds41_latent_gather)
+STUB(ds41_hc_prepare)
+STUB(ds41_hc_collapse)
+STUB(ds41_router_topk)
+STUB(ds41_sparse_attn)
+STUB(ds41_compress_pool)
+STUB(ds41_expert_act)
+STUB(ds41_moe_combine)
+STUB(ds41_mhc_post)
+STUB(ds41_index_scores)
+STUB(ds41_candidate_blocks)
+STUB(ds41_index_topk)
+STUB(ds41_index_scores_paged)
+STUB(ds41_rmsnorm)
+STUB(ds41_rope_tail)
+STUB(ds41_sparse_attn_paged)
+STUB(ds41_route_jobs)
+STUB(ds41_index_stream)
+STUB(ds41_embedding)
+STUB(ds41_reorder_heads)
+STUB(ds41_compress_finish)
+STUB(ds41_latent_store_emitted)
+STUB(ds41_engram_gate)
+STUB(ds41_qdq_candidate)
+#undef STUB

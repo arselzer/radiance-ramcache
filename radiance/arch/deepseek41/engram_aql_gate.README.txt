@@ -1,0 +1,77 @@
+Source audit: a safe actual Rad/AQL Engram staging gate
+=======================================================
+
+Status: design/source audit only. Existing CPU Rad staging tests and standalone
+native HIP staging checks do not establish an actual Engram -> Rad/AQL pass.
+No GPU run, core change or serving registration was performed for this note.
+
+Practical allocator limitation
+------------------------------
+CheckedRadHostAllocator must return DMA-safe memory and prove physical release,
+retaining both allocation and adopted StagingCharge if free fails. The public
+rad_dev_free is void, so it cannot supply that proof. The existing native HIP
+allocator demonstrates checked hipHostMalloc/hipHostFree with bounded allocation
+slots and charge retention (libds41/ds41_engram_hip.cpp:63,113,187), but creating
+that full backend also creates a native HIP stream/events. Those objects must
+not be substituted for the Rad backend's core AQL stream/events.
+
+A small checked HIP-pinned allocator alone is possible, with another constraint:
+core/device/aql.cpp:1405 locate() caches live foreign HSA/locked-host ranges and
+their address translation (1426-1450). The cache's validity rule assumes frees or
+unmaps pass through this backend (1353-1371). Core a_free invalidates it before
+free (3475-3478), but a direct external hipHostFree does not. Reusing that address
+for another allocation could leave a stale pinned/device classification. There
+is no public external-allocation invalidation callback in the current device ABI.
+rad_dev_host_wrote changes host visibility ordering, not allocation-cache epochs.
+
+Therefore a tiny manual checker can conservatively keep all its HIP-pinned slots
+and their charges until every Rad stream/Ctx is destroyed, then perform checked
+hipHostFree with NO subsequent AQL work in that process. It must retain failed
+frees/charges until exit. This is an explicit process-finalization restriction,
+not a reusable production allocator. The more general implementation needs a
+deliberate core invalidation/checked-allocation contract. Calling a dummy/null
+core free merely to disturb its cache would be a brittle implementation shortcut
+and would not provide checked free accounting for the actual staging allocation.
+
+Concrete manual-gate shape
+--------------------------
+Use a separate explicit --run-gpu / --home / --fixtures checker, exactly one
+visible gfx1201 and actual AQL, optionally --host-kargs in a fresh process. Keep
+all fixture/cache/staging/device requests bounded below 1 MiB, excluding printed
+core stream/driver overhead. No model, Pools, production service or network.
+
+1. Open the existing tiny independent IQ4_NL golden file as two distinct layers
+   with pinned SHA/geometry and a shared bounded Iq4NlLayerStores cache budget.
+   Use the actual packed row source, not a predecoded stand-in.
+2. Build a tiny real libds41 RMSNorm operation over one F32 width256 Engram row,
+   a real all-ones gain weight and an independent output. Use actual Builder/Ctx
+   declarations and core-owned stream/arena lifetime owner. Disable tapes.
+3. Bind the declared input span with RadEngramBackend::bind_arena, exact model,
+   device and arena epoch. Destination ownership must keep the real Ctx/arena
+   alive; a no-op shared_ptr to an otherwise stack-owned Ctx is insufficient.
+4. Use a checked pinned allocator restricted as described above. Direct HIP
+   allocation/attributes/free calls are allowed; all transfers, upload/final-reader
+   events and consumers must use actual Rad APIs. Do not create native HIP events
+   or streams, and do not cast them to Rad handles.
+5. Close an actual rad_stream_gate before submit to hold the upload. This also
+   detects a source that AQL mistakes for pageable memory: pageable_copy drains,
+   which is refused behind a closed gate, rather than silently proving async DMA.
+   Observe a pending ticket and a FULL one-slot pool before completion.
+6. In Ctx's architecture callback, order_upload -> actual rad_issue(RMSNorm) ->
+   finish_readers on EVERY exit. Keep the gate closed while checking that the
+   ticket remains nonquiescent and a second submit cannot reuse staging/target.
+   Do not await a gated event. Parent device.h:127-146 documents bounded gate-room
+   rules; open the gate before any blocking wait or stream teardown.
+7. Open the gate, await Ctx device status before output publication, drain/reap
+   the transfer and compare the actual normalized row against CPU golden math.
+   Verify the last-reader fence retires before slot/target reuse. Repeat for the
+   second asset/layer and a cancelled request without cancelling shared stores.
+8. Drain/seal all operations, close the Rad backend, destroy Ctx/stream owners,
+   then checked-free the pinned registry and assert its adopted quota refunds
+   only after physical free. Failed frees stay physically retained AND charged.
+
+This gate would prove one real bounded read/decode/upload/consumer lifetime path.
+It would not establish automatic row-ID discovery, OpStager integration, lane1,
+graph replay, prefix restore, full-model memory fit, latency or throughput. The
+manual single-stream reader seal must remain conservative until those lifecycle
+contracts are explicitly integrated and tested.

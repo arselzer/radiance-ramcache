@@ -1,0 +1,109 @@
+RAM_ADMISSION MemAvailable=10109288448
+I device: host backend, 1 device(s) [0:host]
+I mover: 0 slab slots (0 shadow, 0 more kept free out of a loan), 0 pinned pool slots, 1.06 MiB static vram
+I arena: 57.00 KiB device + 0 B scratch = 60.00 KiB, charged to the VRAM budget before it was split
+I mover: 0 slab slots (0 shadow, 0 more kept free out of a loan), 0 pinned pool slots, 316.50 KiB static vram
+I arena: 57.00 KiB device + 0 B scratch = 60.00 KiB, charged to the VRAM budget before it was split
+I mover: 0 slab slots (0 shadow, 0 more kept free out of a loan), 0 pinned pool slots, 36.50 KiB static vram
+I arena: 8.00 KiB device + 0 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+I mover: 0 slab slots (0 shadow, 0 more kept free out of a loan), 0 pinned pool slots, 316.50 KiB static vram
+I arena: 57.00 KiB device + 0 B scratch = 60.00 KiB, charged to the VRAM budget before it was split
+I mover: 0 slab slots (0 shadow, 0 more kept free out of a loan), 0 pinned pool slots, 36.50 KiB static vram
+I arena: 8.00 KiB device + 0 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+I mover: 0 slab slots (0 shadow, 0 more kept free out of a loan), 0 pinned pool slots, 36.50 KiB static vram
+I arena: 8.00 KiB device + 0 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+E pool allocation refused:
+vram_weights     1.00 MiB budget,        0 B used,   1.00 MiB free
+vram_kv          1.00 MiB budget,        0 B used,   1.00 MiB free
+host_pool             0 B budget,        0 B used,        0 B free
+    host_pool: backing allocation of 192.00 KiB refused: the allocator returned nothing
+
+I mover: 0 slab slots (0 shadow, 0 more kept free out of a loan), 0 pinned pool slots, 36.50 KiB static vram
+I arena: 8.00 KiB device + 0 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+I mover: 0 slab slots (0 shadow, 0 more kept free out of a loan), 0 pinned pool slots, 36.50 KiB static vram
+I arena: 8.00 KiB device + 0 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+I arena: 8.00 KiB device + 0 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+I arena: 8.00 KiB device + 0 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+I arena: 8.00 KiB device + 0 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+I arena: 8.00 KiB device + 0 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+I arena: 8.00 KiB device + 0 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+I mover: 0 slab slots (0 shadow, 0 more kept free out of a loan), 0 pinned pool slots, 36.50 KiB static vram
+I arena: 8.00 KiB device + 0 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+E op handle 0: current expert prepare owner refused before GU
+I mover: 0 slab slots (0 shadow, 0 more kept free out of a loan), 0 pinned pool slots, 36.50 KiB static vram
+I arena: 8.00 KiB device + 0 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+E op handle 0: current expert prepare owner refused before GU
+I mover: 0 slab slots (0 shadow, 0 more kept free out of a loan), 0 pinned pool slots, 36.50 KiB static vram
+I mover: 0 slab slots (0 shadow, 0 more kept free out of a loan), 0 pinned pool slots, 36.50 KiB static vram
+I arena: 8.00 KiB device + 0 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+E op 'moe_gemm_q' {N=128 K=128 n_expert=4 top_k=2 group=128 a_order=sorted dtype=mxfp4a8 N_odd=128 K_odd=128 parts=1}: operand 8 reaches past buffer 'layer.0.invalid.late.DN': [4,128]/[128,1] at offset 0, declared [1,128]/[128,1]
+I mover: 0 slab slots (0 shadow, 0 more kept free out of a loan), 0 pinned pool slots, 36.50 KiB static vram
+I arena: 8.00 KiB device + 0 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+I mover: 0 slab slots (0 shadow, 0 more kept free out of a loan), 0 pinned pool slots, 36.50 KiB static vram
+I arena: 8.00 KiB device + 0 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+I mover: 0 slab slots (0 shadow, 0 more kept free out of a loan), 0 pinned pool slots, 36.50 KiB static vram
+I mover: 0 slab slots (0 shadow, 0 more kept free out of a loan), 0 pinned pool slots, 36.50 KiB static vram
+I arena: 8.00 KiB device + 0 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+E op handle 0: current expert prepare owner refused before GU
+I mover: 0 slab slots (0 shadow, 0 more kept free out of a loan), 0 pinned pool slots, 36.50 KiB static vram
+I arena: 8.00 KiB device + 0 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+E op handle 0: current expert prepare owner refused before GU
+I mover: 0 slab slots (0 shadow, 0 more kept free out of a loan), 0 pinned pool slots, 36.50 KiB static vram
+I arena: 8.00 KiB device + 0 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+E op handle 0: current expert prepare owner refused before GU
+I mover: 0 slab slots (0 shadow, 0 more kept free out of a loan), 0 pinned pool slots, 36.50 KiB static vram
+I arena: 8.00 KiB device + 0 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+E op handle 0: current expert prepare owner refused before GU
+I mover: 0 slab slots (0 shadow, 0 more kept free out of a loan), 0 pinned pool slots, 36.50 KiB static vram
+I arena: 8.00 KiB device + 0 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+E op handle 0: current expert prepare owner refused before GU
+I mover: 0 slab slots (0 shadow, 0 more kept free out of a loan), 0 pinned pool slots, 36.50 KiB static vram
+I arena: 8.00 KiB device + 0 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+E op handle 0: current expert prepare owner refused before GU
+I mover: 0 slab slots (0 shadow, 0 more kept free out of a loan), 0 pinned pool slots, 36.50 KiB static vram
+I arena: 8.00 KiB device + 0 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+E op handle 0: current expert prepare owner refused before GU
+I mover: 0 slab slots (0 shadow, 0 more kept free out of a loan), 0 pinned pool slots, 36.50 KiB static vram
+I arena: 8.00 KiB device + 0 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+E op handle 0: current expert prepare owner refused before GU
+I mover: 0 slab slots (0 shadow, 0 more kept free out of a loan), 0 pinned pool slots, 36.50 KiB static vram
+I arena: 8.00 KiB device + 0 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+E op handle 0: current expert prepare owner refused before GU
+I mover: 0 slab slots (0 shadow, 0 more kept free out of a loan), 0 pinned pool slots, 36.50 KiB static vram
+I arena: 8.00 KiB device + 0 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+E op handle 0: current expert prepare owner refused before GU
+I mover: 0 slab slots (0 shadow, 0 more kept free out of a loan), 0 pinned pool slots, 36.50 KiB static vram
+I arena: 8.00 KiB device + 0 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+E op handle 0: current expert prepare owner refused before GU
+I mover: 0 slab slots (0 shadow, 0 more kept free out of a loan), 0 pinned pool slots, 36.50 KiB static vram
+I arena: 8.00 KiB device + 0 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+E op handle 0: current expert prepare owner refused before GU
+I mover: 0 slab slots (0 shadow, 0 more kept free out of a loan), 0 pinned pool slots, 36.50 KiB static vram
+I mover: 0 slab slots (0 shadow, 0 more kept free out of a loan), 0 pinned pool slots, 36.50 KiB static vram
+I arena: 8.00 KiB device + 0 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+E op handle 0: current expert prepare requires TP1,lane0,eager,no speculation/ahead/stager/XP
+I mover: 0 slab slots (0 shadow, 0 more kept free out of a loan), 0 pinned pool slots, 36.50 KiB static vram
+I arena: 8.00 KiB device + 0 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+E op handle 0: current expert prepare outside active pass
+I mover: 0 slab slots (0 shadow, 0 more kept free out of a loan), 0 pinned pool slots, 36.50 KiB static vram
+I arena: 8.00 KiB device + 0 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+I mover: 0 slab slots (0 shadow, 0 more kept free out of a loan), 0 pinned pool slots, 36.50 KiB static vram
+I arena: 8.00 KiB device + 0 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+E first error before Native prepare
+I mover: 0 slab slots (0 shadow, 0 more kept free out of a loan), 0 pinned pool slots, 132.50 KiB static vram
+I arena: 8.00 KiB device + 0 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+E first error before Native prepare
+I mover: 0 slab slots (0 shadow, 0 more kept free out of a loan), 0 pinned pool slots, 36.50 KiB static vram
+I arena: 8.00 KiB device + 0 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+E op handle 0: current expert prepare requires TP1,lane0,eager,no speculation/ahead/stager/XP
+I mover: 0 slab slots (0 shadow, 0 more kept free out of a loan), 0 pinned pool slots, 36.50 KiB static vram
+I arena: 8.00 KiB device + 0 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+I deferred device validation: enabled; recorded passes, speculation and issue-ahead are unsupported
+I mover: 0 slab slots (0 shadow, 0 more kept free out of a loan), 0 pinned pool slots, 36.50 KiB static vram
+I arena: 8.00 KiB device + 0 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+I deferred device validation: enabled; recorded passes, speculation and issue-ahead are unsupported
+I mover: 0 slab slots (0 shadow, 0 more kept free out of a loan), 0 pinned pool slots, 36.50 KiB static vram
+I arena: 8.00 KiB device + 0 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+E Legacy first A before lane B
+RECEIPT owned=24 regions=4 native=196608 landing=196608 static=324096 metadata-reservation=697288 HOT=65536 COLD=98304 source-metadata-reservation=7799296 source-staging-peak=32768 pool-requested=1245184 HOST-allocator-rounded=4194304 KV-elastic=1 KV-logical=1048576 KV-VA-rounded-from-granularity=2097152 KV-committed=0 (2MiB allocation alignment is actual backing, not reclaimed bytes)
+PASS 23 actual HOST unified strict-policy Native plan/allocation/owner cases, 3786 checks; no Engine Loader/production/full-model/TP/GPU claim

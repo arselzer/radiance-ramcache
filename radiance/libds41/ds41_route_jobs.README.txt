@@ -1,0 +1,89 @@
+DS41 router -> packed expert jobs (isolated source adapter)
+==========================================================
+
+This adapter materializes a token-major routed job list; it neither sorts experts
+nor performs FFN arithmetic, normalization, sampling or full-model serving.
+The opt-in libds41 module registers its row and scalar deferred-status collector.
+The existing packed GEMM ABI is unchanged.
+
+Parameters: M is token capacity; topk=K and n_expert=E are fixed. Require
+0<M<=INT_MAX, 0<K<=E<=4096 and M*K<=INT_MAX. Actual input rows m satisfy 0<m<=M;
+R=m*K. Hist counts cannot overflow I32: duplicate expert IDs within a token are
+refused, so each expert count<=m, and the total count=R<=INT_MAX.
+
+Seven operands, in order:
+0 ids[m,K] I32              router's selected IDs
+1 weights[m,K] F32          router's selected, already scaled weights
+2 expert_ids[R] I32         exact ids[row,choice], token-major
+3 token_ids[R] I32          job/K: input row for gate/up GEMMs
+4 job_weights[R] F32        exact F32 input bits; no normalization/filtering
+5 expert_counts[E] I32      number of selected jobs per expert, including weight 0
+6 identity_rows[R] I32      job: expanded input row for the DOWN GEMM
+
+Gate/up read the original m activation rows using token_ids. Down reads R already
+expanded/weighted activation rows using identity_rows. Reusing token_ids for down
+silently reuses another job's activation. Both packed GEMMs use expert_ids. Weight
+application remains BEFORE the down-input cast/projection, in ds41_expert_act;
+this adapter must not multiply or reapply weights to completed expert outputs.
+
+All logical operands accept positive, non-overlapping pitches; vectors may also
+be strided in standalone tests. Metadata checks dtype, rank, shape, arithmetic,
+alignment, pointer spans, every output-vs-input/output alias and scratch alias
+before any memory write. The caller guarantees actual allocation capacity. A
+scalar 4-byte scratch status is cleared, then WHOLE-BATCH preflight checks every
+ID, finite nonnegative weight and per-token duplicate. No histogram clear or job
+output write occurs until that full preflight finished successfully. Negative
+zero/subnormal/large finite weights are valid and copied exactly; zero-weight
+routes still exist and contribute a count. Payload failures alter only the flag,
+not any output or histogram. Metadata refusal leaves the flag unchanged too.
+
+GPU phases are ordered on the supplied stream: flag init, preflight, conditional
+histogram clear, then job writes+atomic integer counts. There is no allocation,
+host sync, sorting, new stream, full model data or performance claim. GPU enqueue
+success is not payload success; the opt-in row uses the scalar
+scratch deferred-status collector before scratch reuse and the Engine's all-rank
+validation gate before sampling/publishing a failed step. Input and output buffers
+must remain owned and immutable to unrelated writers until these phases finish;
+payload preflight does not protect against a concurrent caller mutation.
+
+The .hip entry is an isolated native-HIP launch/checker implementation. It does
+not make an arbitrary core RadStream a hipStream_t: the actual AQL runtime needs
+its ordinary kernel-module launcher/row integration. The counts view and CPU
+handoff test do not imply that native launch is already wired into that runtime.
+
+Actual RadRouting handoff
+-------------------------
+libds41/ds41_route_jobs_report.h builds a METADATA-only ContiguousJobs view. It
+requires unit-stride output vectors because RadRouting carries no strides and
+existing packed_routed's IDs/row IDs require stride 1. It provides expert_ids,
+weights, expert_counts, top_k/n_expert, token_ids and identity_rows. It deliberately
+leaves sorted_tok/expert_offset null: token-major jobs are not expert-sorted.
+This helper does not prove GPU completion or payload validity.
+
+Evidence in current core: abi/rad_runtime.h:731-754 describes RadRouting/counts;
+core/runtime/ctx.cpp route_report_impl copies only expert_count, bounded by
+n_expert, and records other pointers without dereferencing them. last_routing has
+no internal consumer other than test diagnostics. Thus counts-only heat reporting
+currently needs expert_count+n_expert; sorting is not needed by this path. The
+HOST test passes a minimal counts-only report through actual Ctx and checks the
+landed histogram. This is evidence about the current implementation, not a claim
+that arbitrary future consumers accept missing fields.
+
+rad_route_counts(ctx,layer,E) can supply the output histogram directly when it
+returns a large enough row; otherwise use an owned contiguous histogram and
+rad_route_report performs a copy. Core report/flush uses lane0, so generate/report
+on lane0 or explicitly join the producer lane before report. Keep all buffers
+owned through their final reader/copy. A report is not a validation or ownership
+transfer; failed asynchronous routes need the new deferred status gate.
+
+Verification source
+--------------------
+CPU emulator shares the staged GPU primitives. Tests independently pin literal
+flattening/token/identity/count results, exact F32 bits, padding guards, whole-batch
+transactionality, full topk 4096, metadata/alias/span refusals, actual Ctx histogram
+handoff, and actual packed-reference gate/up versus down gathers with different
+row mappings. The separate GPU checker compares all bytes and guarded allocations
+against those CPU fixtures, including invalid payloads and metadata refusals.
+It requires --run-gpu [device], gfx1201 and an approved idle window; it is not a
+CTest target. Parent owns compilation, row/CMake integration and GPU execution; registered rows
+are isolated from the serving kernel scan.

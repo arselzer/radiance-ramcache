@@ -1,0 +1,69 @@
+Experimental local DS41 all-gather head reorder
+
+This is ONLY a local, bit-preserving reorder of already all-gathered activations.
+Input query[tp,actualM,Hlocal,D] dtype f32/f16/bf16 and weights[tp,actualM,Hlocal]
+F32 become query_out[actualM,tp*Hlocal,D] and weights_out[actualM,tp*Hlocal]F32.
+Global head rank*Hlocal+h retains the all-gather's rank order. No all-gather,
+normalization, weight scaling, arithmetic, source-key replication, TP synchronization,
+architecture registration or inference lifecycle is implemented here. A compatible
+actual all-gather MUST produce the specified rank-major packed layout; padded
+maxM rows are not silently interpreted as packed actualM rows. Slice/copy them
+explicitly before this op if the gather has a different stride/layout.
+
+Current-core binding: RAD_B_N narrows only dim0. Therefore a compatible second
+input profile uses query[tp*actualM,Hlocal,D] and weights[tp*actualM,Hlocal]. Physical
+bytes are identical to rank-major4D/3D inputs; actualM is derived from dim0/tp with
+an exact divisibility guard. Both input profiles are strictly packed, cannot mix
+ranks and use the same88B launch mapper. Declare flat gather destination buffers
+[tp*maxM,H,D]/[tp*maxM,H] and issue RAD_B_N(...,tp*actualM); output buffers issue
+ordinary RAD_B_N(...,actualM). Buffer identities/liveness then remain public.
+The shape hook defaults to the original rank4/rank3 input profile; callers building
+ordinary variable-M graph buffers should explicitly declare the equivalent flat
+input shapes. No core view, raw-pointer hazard workaround or padded-rank stride
+is invented. The all-gather itself must compact each rank's actualM rows.
+
+Suggested schema name ds41_reorder_heads; required params M(capacity),tp,heads(local),
+head_dim,dtype. Operands in order query(IN),weights(IN),query_out(OUT),weights_out(OUT).
+No WEIGHT/WTAB operands or storage layout hooks are needed: these are ordinary
+contiguous activation buffers. opd_shape is reorder_heads::shape; launches
+are ds41_reorder_heads (GPU) / ds41_ref_reorder_heads (host). No scratch callback
+or device-status collector: every payload bit pattern is valid. Do not mark this
+op as a communication/collective release. All four operands should be declared in
+the graph's ordinary buffer reads/writes with correct liveness/order.
+
+Runtime actualM is the input query's token axis, >0 and <=M. All shapes/dtypes and
+EXACT packed positive strides are checked, including singleton axes. Every pair
+of operand spans must be disjoint (including both inputs), all counts/byte products
+and pointer ends are checked before enqueue; query width is2/4 bytes, weights4.
+Accepted metadata profile tp1..65536, M/H/D <=INT_MAX subject to capacity byte-size
+overflow checks. Tests concentrate on tp1/2/4/8. No payload is read at validation.
+
+Each GPU work item copies one query element and d0 additionally copies its head
+weight. The copy uses constant-sized byte memcpy, no floating conversion/load/store
+expression. Thus NaN payloads (including signaling), signedzero, subnormal and
+arbitrary16/32-bit patterns are preserved. CPU independent oracle scatters complete
+head byte rows in nested rank/token/head order, not using the launch mapper.
+The launch descriptor has only4 pointers,6 int64 values and2 four-byte fields
+(88B on the current64-bit ABI), compile-time bounded<=128B. It is passed directly;
+no staged RadTensor Plan, hidden allocation, scratch/status or host wait is needed.
+A single128-thread grid-stride kernel uses at most4096 blocks.
+
+This ordinary kernel has no hidden mutable state: potential tape/replay eligibility
+uses the public operand hazards/pointer-lifetime rules. This source does not prove
+actual AQL/replay integration; parent owns that validation. Core still must order
+all-gather completion before this copy and keep inputs/outputs alive through users.
+The full-head streaming index requires ALL canonical global query heads and full
+replicated key cache. This reorder only supplies the right local head layout; it
+is not evidence of source-cache replication or a complete distributed graph.
+
+Compile/link: CPU test tests/ds41_reorder_heads_test.cpp +
+libds41/ds41_reorder_heads_host.cpp; standalone native checker
+libds41/ds41_reorder_heads_selftest.cpp +libds41/ds41_reorder_heads.hip (host.cpp is
+optional for checker), hipcc --offload-arch=gfx1201 -Iabi. No models/vendor headers
+are needed. Explicit invocation --run-gpu [device], never automatic.
+Six CPU test bodies cover648 exhaustive geometry/dtype/profile fixtures,100 seeded random
+fixtures, raw special-bit patterns, pairwise aliases,18 malformed descriptors,
+shape-hook maxM, overflow/wrap and PROT_NONE caller scratch on host execution.
+Native checker has502 payload cases (including6 capped-grid-stride cases) and26
+metadata refusals, guards every input/output allocation and caller scratch.
+No compiler, GPU or serving/service operations were run by the implementing child.

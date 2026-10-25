@@ -1,0 +1,26 @@
+I device: card 0 (0000:c3:00.0) keeps kernel arguments in pinned host memory, as a test asked
+I device: AQL backend, 1 device(s) [0:gfx1201]
+I mover: 0 slab slots (0 shadow, 0 more kept free out of a loan), 0 pinned pool slots, 316.50 KiB static vram
+I arena: 64.75 KiB device + 16 B scratch = 72.00 KiB, charged to the VRAM budget before it was split
+I mover: 0 slab slots (0 shadow, 0 more kept free out of a loan), 0 pinned pool slots, 316.50 KiB static vram
+I arena: 64.75 KiB device + 16 B scratch = 72.00 KiB, charged to the VRAM budget before it was split
+I mover: 0 slab slots (0 shadow, 0 more kept free out of a loan), 0 pinned pool slots, 316.50 KiB static vram
+I arena: 64.75 KiB device + 16 B scratch = 72.00 KiB, charged to the VRAM budget before it was split
+E op handle 0: current expert prepare owner refused before GU
+I mover: 0 slab slots (0 shadow, 0 more kept free out of a loan), 0 pinned pool slots, 316.50 KiB static vram
+I arena: 64.75 KiB device + 16 B scratch = 72.00 KiB, charged to the VRAM budget before it was split
+E op handle 0: current expert prepare owner refused before GU
+I mover: 0 slab slots (0 shadow, 0 more kept free out of a loan), 0 pinned pool slots, 316.50 KiB static vram
+I arena: 64.75 KiB device + 16 B scratch = 72.00 KiB, charged to the VRAM budget before it was split
+E op handle 0: readiness wait for weight 'blk.7.ffn_gate_up_exps.2.weight' failed: io error
+I mover: 0 slab slots (0 shadow, 0 more kept free out of a loan), 0 pinned pool slots, 316.50 KiB static vram
+I arena: 64.75 KiB device + 16 B scratch = 72.00 KiB, charged to the VRAM budget before it was split
+E op 'moe_gemm_q' {N=128 K=128 n_expert=4 top_k=2 group=128 a_order=sorted dtype=mxfp4a8 N_odd=128 K_odd=128 parts=1}: operand 8 reaches past buffer 'layer.7.invalid.late.DN': [4,128]/[128,1] at offset 0, declared [1,128]/[128,1]
+I mover: 0 slab slots (0 shadow, 0 more kept free out of a loan), 0 pinned pool slots, 316.50 KiB static vram
+I arena: 64.75 KiB device + 16 B scratch = 72.00 KiB, charged to the VRAM budget before it was split
+E op handle 0: current expert prepare owner refused before GU
+I mover: 0 slab slots (0 shadow, 0 more kept free out of a loan), 0 pinned pool slots, 316.50 KiB static vram
+I arena: 64.75 KiB device + 16 B scratch = 72.00 KiB, charged to the VRAM budget before it was split
+COMPONENT bytes=7288388 admitted=67108864 declared=46432256 native=196608 landing=196608 metadata=697280 pool-physical=4194304 mapped-helper-reservation=2097152 snapshot-bank-mapped=73728 snapshot-payload-peak=12340 actual-arena=66304 router=supplied legal F32 routes
+COMPONENT bytes=7288388 admitted=67108864 declared=46432256 native=196608 landing=196608 metadata=697280 pool-physical=4194304 mapped-helper-reservation=2097152 snapshot-bank-mapped=73728 snapshot-payload-peak=12340 actual-arena=66304 router=actual DEVICE learned-form synthetic weights
+PASS 4 actual Native DEVICE-owner cases, 158625 checks; forwards=15 refused=5 exact_BF16=21120 exact_FP8=3840 exact_scale=30 resident_metadata_refusals=32 semantic_fault_triggers=1,1,1,1 router_max_ULP=0 snapshot_slices=45 snapshot_BF16=67200 snapshot_FP8=19200 snapshot_scales=150 input_words=38700 kernargs=host; P3-sized TP1 AQL synthetic, no Engine/checkpoint/TP/speculation/failed-drain recovery claim

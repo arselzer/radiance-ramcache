@@ -1,0 +1,55 @@
+Real local-head reorder binding/replay gate (experimental, never automatic)
+
+New source files:
+  ds41_reorder_heads_core_fixture.h: shared real-Builder/Ctx/public-buffer harness
+  ds41_reorder_heads_core_test.cpp: two ordinary HOST regression tests
+  ds41_aql_reorder_check.cpp: explicitly gated real AQL/replay checker
+
+Parent owns registration/build/CMake and all execution. The two tests depend on
+actual isolated libds41_ref and ordinary rad_core HOST backend, not fake row launches.
+The manual target needs HIP-enabled rad_core (WHOLE_ARCHIVE + ENABLE_EXPORTS as
+with existing AQL checks) and actual libds41 as a build dependency, not libquant or
+model fixtures. Include tests/core/abi paths as the existing targets do.
+
+No compilation, execution, deployment, serving API or service changes were done
+by the implementing child. After a separately approved idle window, parent can use:
+  env -u HIP_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES=0 \
+    <build>/tests/ds41-aql-reorder-check --run-gpu \
+      --home <build>/radiance_home
+Repeat in a NEW PROCESS with --host-kargs to test the alternate argument ring.
+The program refuses absent --run-gpu/--home before any explicit registry/device
+query/allocation/stream. Linked HIP module registration may precede main, as with
+other native manual checks. Requires actual AQL, one visible gfx1201, no HOST fallback.
+
+Core binding proof:
+  real registered op -> Builder -> normal buffers and reads/writes -> finish ->
+  Ctx -> rad_issue with ordinary RAD_B_N row slices -> unmodified launch.
+For compact inputs, buffers are [tp*maxM,H,D]/[tp*maxM,H] and issue slices have
+first dimension tp*actualM; output [maxM,tp*H,D]/[maxM,tp*H] uses actualM slices.
+maxM5 > actualM1 and3, with an additional actualM5 boundary. No rank4 dynamic
+secondary-axis workaround, forged RadTensor or raw-pointer operand bypass is used.
+The original rank4/rank3 packed input profile is independently tested at actualM3
+with capacity5, all four operand buffer identities/lifetimes remaining ordinary.
+
+Every declared buffer includes >=256 bytes of prefix/suffix guard ROWS, retained
+in its own actual arena allocation. Entire buffers are poisoned/uploaded/read and
+compared exactly, including input immutability, internal payloads, unused capacity
+rows and both guard regions. One graph's actual arena receipt (DEVICE floor plus
+HOST arena if any) must be <=64KiB. No Pools, KV, model weights or separate large
+device allocations. Stream runtime/argument/bounce rings, module/driver metadata
+and general allocator/page overhead are additional and not included in that receipt.
+
+The HOST binary has two TEST cases and60 total passes over TP1/2/4/8 x3dtypes,
+including varying actualM and the original metadata profile. It never initializes
+GPU work and explicitly requires device_is_host before fixtures.
+The AQL checker runs24 separate graphs and432 guarded passes, changing raw input
+bits before EVERY pass, including NaN/signedzero/subnormal patterns. The oracle
+is independent complete-head byte scatter from rank-major source. It asserts
+records_passes true, checks_device_status false, no row scratch/status/collective
+hooks, and ACTUAL pass_counts().played>0 for every graph. It never substitutes the
+launch or merely assumes replay from a recording count. Default/host-kargs runs
+are separate processes, each with their own receipt and pass assertions.
+
+This tests ONE local copy in each graph. It is not actual all-gather, multiple
+concurrent ranks, head normalization or replicated cache/source equivalence.
+It establishes ordinary public operand binding and bit copy/replay behavior only.

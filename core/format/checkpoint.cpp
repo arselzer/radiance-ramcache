@@ -11,6 +11,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <climits>
 #include <cstring>
 #include <fstream>
 #include <map>
@@ -279,6 +280,11 @@ std::string quant_descriptor(const MetaOwn& m) {
     return q;
 }
 
+/* A GGUF integer array of at most this many values is spelled out in the metadata, so a plugin
+ * reads it at declare (deepseek41's 43 compress ratios, 48 n-gram bucket sizes); a longer one is
+ * summarised there and readable as a tensor named by its key instead (open_gguf). */
+constexpr size_t kGgufSpellMax = 1024;
+
 int meta_from_gguf(GgufFile& g, MetaOwn* out) {
     if (!g.get_str("general.architecture", &out->arch)) {
         RAD_ERR("the GGUF has no general.architecture, so no architecture plugin can be chosen");
@@ -387,18 +393,21 @@ int meta_from_gguf(GgufFile& g, MetaOwn* out) {
         out->kv("mlp_bias", "0");
     }
 
-    /* Everything else, stringified, for the plugin. Arrays are summarised (small integer arrays
-     * spelled out); tokenizer keys are skipped, since the vocab has its own section. */
+    /* Everything else, stringified, for the plugin. Arrays are summarised, integer arrays of up to
+     * kGgufSpellMax values spelled out in full (comma-separated, never truncated); tokenizer keys
+     * are skipped, since the vocab has its own section. */
     for (const GgufKV& kv : g.kv()) {
         if (kv.key.rfind("tokenizer.", 0) == 0) continue;
         std::string v;
         if (kv.is_array) {
             v = fmt("[%zu values]", kv.type == GGUF_STR ? kv.s.size()
                                   : !kv.i.empty()       ? kv.i.size() : kv.f.size());
-            if (kv.type != GGUF_STR && kv.i.size() <= 8 && !kv.i.empty()) {
+            if (kv.type != GGUF_STR && kv.i.size() <= kGgufSpellMax && !kv.i.empty()) {
                 v.clear();
                 for (size_t j = 0; j < kv.i.size(); ++j)
                     v += fmt("%s%lld", j ? "," : "", (long long)kv.i[j]);
+                out->kv(kv.key, v);
+                continue;
             }
         } else if (!kv.s.empty()) v = kv.s.front();
         else if (!kv.f.empty() && kv.type == GGUF_F32) v = fmt("%g", kv.f.front());
@@ -483,6 +492,36 @@ int Checkpoint::open_gguf(const std::string& path) {
                     tensors_.size(), (long long)want);
             return RAD_E_FORMAT;
         }
+    }
+    /* Some GGUFs carry a table as an integer metadata array (deepseek41's engram.token_map, 129,280
+     * compressed token ids) that a graph reads as a device table. Each integer array longer than
+     * kGgufSpellMax is also a tensor named by its key, [n], I32 when every value fits, else I64. */
+    for (const GgufKV& kv : gguf_.kv()) {
+        if (!kv.is_array || kv.type == GGUF_STR || kv.i.size() <= kGgufSpellMax ||
+            kv.key.rfind("tokenizer.", 0) == 0)
+            continue;
+        bool fits = true;
+        for (int64_t v : kv.i) fits = fits && v >= INT32_MIN && v <= INT32_MAX;
+        std::vector<uint8_t>& buf = gguf_arrays_.emplace_back(kv.i.size() * (fits ? 4 : 8));
+        for (size_t j = 0; j < kv.i.size(); ++j) {
+            if (fits) {
+                const int32_t v = (int32_t)kv.i[j];
+                std::memcpy(buf.data() + 4 * j, &v, 4);
+            } else
+                std::memcpy(buf.data() + 8 * j, &kv.i[j], 8);
+        }
+        SrcTensor s;
+        s.name = kv.key;
+        s.ggml = fits ? 26u : 27u;                         /* GGML_TYPE_I32, GGML_TYPE_I64 */
+        s.rad_dtype = fits ? RAD_I32 : RAD_I64;
+        s.shape = { (int64_t)kv.i.size() };
+        s.data = buf.data();
+        s.bytes = (int64_t)buf.size();
+        if (!index_.emplace(s.name, tensors_.size()).second) {
+            RAD_ERR("%s: metadata array '%s' has the name of a tensor", path.c_str(), s.name.c_str());
+            return RAD_E_FORMAT;
+        }
+        tensors_.push_back(std::move(s));
     }
     /* Block types import as planes; one rad-convert cannot read is named now, not at its weight. */
     for (const SrcTensor& t : tensors_) {

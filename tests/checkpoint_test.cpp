@@ -1983,9 +1983,11 @@ namespace {
 
 struct GKv {
     std::string key;
-    uint32_t type;                     /* 4 u32, 6 f32, 8 string, 9 array of strings */
+    uint32_t type;                     /* 4 u32, 6 f32, 8 string, 9 array (of strings, or `ints`) */
     double num = 0;
     std::vector<std::string> strs;
+    std::vector<int64_t> ints = {};    /* with type 9: an array of i32, or u64 when `wide` */
+    bool wide = false;
 };
 struct GTensor { std::string name; uint32_t type; std::vector<uint64_t> ne; std::vector<uint8_t> bytes; };
 
@@ -2010,7 +2012,16 @@ void write_gguf(const std::string& path, const std::vector<GKv>& kvs, const std:
         if (kv.type == 4) { const uint32_t v = (uint32_t)kv.num; put_bytes(&b, &v, 4); }
         else if (kv.type == 6) { const float v = (float)kv.num; put_bytes(&b, &v, 4); }
         else if (kv.type == 8) put_str(&b, kv.strs.at(0));
-        else {
+        else if (!kv.ints.empty()) {
+            const uint32_t et = kv.wide ? 10 : 5;          /* GGUF u64 or i32 */
+            const uint64_t n = kv.ints.size();
+            put_bytes(&b, &et, 4);
+            put_bytes(&b, &n, 8);
+            for (int64_t v : kv.ints) {
+                if (kv.wide) put_bytes(&b, &v, 8);
+                else { const int32_t w = (int32_t)v; put_bytes(&b, &w, 4); }
+            }
+        } else {
             const uint32_t et = 8;
             const uint64_t n = kv.strs.size();
             put_bytes(&b, &et, 4);
@@ -2108,6 +2119,54 @@ std::vector<GKv> llama_kvs(int64_t file_type) {
 }
 
 }  /* namespace */
+
+/* Integer metadata arrays: up to 1024 values spelled out in full in the metadata (a plugin reads
+ * them at declare), longer ones readable as a tensor under their key, I32 when every value fits
+ * and I64 otherwise. */
+TEST(gguf_integer_arrays_are_spelled_out_or_read_as_tensors) {
+    const std::string dir = fresh_dir();
+    const std::string path = dir + "/m.gguf";
+    std::vector<GKv> kvs = llama_kvs(1);
+    std::vector<int64_t> ratios(43), map(2000), big(1100);
+    for (size_t i = 0; i < ratios.size(); ++i) ratios[i] = i < 2 ? 0 : (i < 20 ? 2 : 1);
+    for (size_t i = 0; i < map.size(); ++i) map[i] = (int64_t)(i * 7 % 1999);
+    for (size_t i = 0; i < big.size(); ++i) big[i] = (int64_t)i * 4000000000LL;
+    kvs.push_back({ "llama.compress_ratios", 9, 0, {}, ratios });
+    kvs.push_back({ "llama.token_map", 9, 0, {}, map });
+    kvs.push_back({ "llama.wide_table", 9, 0, {}, big, true });
+    std::vector<float> w8;
+    write_gguf(path, kvs, { legacy_blocks("t.q8_0", 8, &w8) });
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(path), RAD_OK);
+    const char* r = ck.meta().get("llama.compress_ratios");
+    REQUIRE(r != nullptr);
+    std::string want;
+    for (size_t i = 0; i < ratios.size(); ++i) want += (i ? "," : "") + std::to_string(ratios[i]);
+    CHECK_EQ(std::string(r), want);
+    const SrcTensor* tm = nullptr;
+    const SrcTensor* wt = nullptr;
+    for (const SrcTensor& s : ck.tensors()) {
+        if (s.name == "llama.token_map") tm = &s;
+        if (s.name == "llama.wide_table") wt = &s;
+        CHECK(s.name != "llama.compress_ratios");
+    }
+    REQUIRE(tm != nullptr);
+    CHECK_EQ(tm->rad_dtype, (uint32_t)RAD_I32);
+    REQUIRE_EQ(tm->shape.size(), (size_t)1);
+    CHECK_EQ(tm->shape[0], (int64_t)2000);
+    int bad = 0;
+    for (size_t i = 0; i < map.size(); ++i) {
+        int32_t v;
+        std::memcpy(&v, (const uint8_t*)tm->data + 4 * i, 4);
+        bad += v != (int32_t)map[i];
+    }
+    CHECK_EQ(bad, 0);
+    REQUIRE(wt != nullptr);
+    CHECK_EQ(wt->rad_dtype, (uint32_t)RAD_I64);
+    int64_t last;
+    std::memcpy(&last, (const uint8_t*)wt->data + 8 * 1099, 8);
+    CHECK_EQ(last, big[1099]);
+}
 
 TEST(a_gguf_tensor_is_row_major_and_its_legacy_blocks_decode_by_definition) {
     const std::string dir = fresh_dir();

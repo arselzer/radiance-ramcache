@@ -205,6 +205,8 @@ private:
     GgufFile    gguf_;
     /* A split GGUF's shards after the first (llama.cpp's gguf-split): tensors only. */
     std::vector<std::unique_ptr<GgufFile>> gguf_more_;
+    /* Long integer metadata arrays as tensor bytes (open_gguf); a deque, so data never moves. */
+    std::deque<std::vector<uint8_t>> gguf_arrays_;
     MetaOwn     meta_;
     std::vector<std::unique_ptr<SafeTensorsFile>> shards_;
     std::vector<std::unique_ptr<TorchZipFile>>    torch_;

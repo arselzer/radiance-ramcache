@@ -2623,6 +2623,22 @@ int ref_embed_lookup_q_shape(const RadParam* p, int n_p, int operand, RadOpdDesc
     return o.finish("embed_lookup_q", operand, out);
 }
 
+/* The planes as a host tool draws them: i8 codes (no table), a scale per `group` of a row. */
+int ref_embed_lookup_planes_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M  = gi(p, n_p, "M", 0);
+    const int64_t ne = gi(p, n_p, "n_embd", 0), nv = gi(p, n_p, "n_vocab", 0);
+    const int64_t G  = gi(p, n_p, "group", 0), vo = gi(p, n_p, "vocab_offset", 0);
+    if (M <= 0 || ne <= 0 || nv <= 0 || G <= 0 || ne % G || vo < 0) return RAD_E_UNSUPPORTED;
+    const uint32_t D = act_dt(p, n_p);
+    Opd o;
+    o.t_idx({ M }, vo + nv, -1, 0);                  /* tokens */
+    o.t((uint32_t)RAD_I8, { nv, ne });               /* codes */
+    o.t(D, { nv, ne / G });                          /* scale */
+    o.skip();                                        /* table: optional */
+    o.t(D, { M, ne });                               /* x */
+    return o.finish("embed_lookup_planes", operand, out);
+}
+
 int ref_logits_gemm_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M  = gi(p, n_p, "M", 0);
     const int64_t nv = gi(p, n_p, "n_vocab", 0);

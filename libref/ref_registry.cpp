@@ -753,6 +753,12 @@ static const RadParamSpec pEmbedM[] = { P_INT("M"), P_INT("n_embd"), P_INT("n_vo
                                         P_STR("dtype"), P_INTO("vocab_offset"),
                                         P_F64O("wscale"), P_F64O("mult") };
 static const RadOperandSpec oEmbed[] = { OPD("tokens"), WGT("wte"), OUT("x") };
+/* A table's affine planes, read in place (ref_gemm.cpp): codes, a scale per group, a codebook. */
+static const RadParamSpec pEmbedPlanes[] = { P_INT("M"), P_INT("n_embd"), P_INT("n_vocab"),
+                                             P_INT("group"), P_STR("dtype"), P_INTO("vocab_offset"),
+                                             P_F64O("mult") };
+static const RadOperandSpec oEmbedPlanes[] = { OPD("tokens"), WGT("codes"), WGT("scale"),
+                                               WGT_O("table"), OUT("x") };
 /* The quantised table, one scale for all of it; a separate op since it adds an operand. */
 static const RadOperandSpec oEmbedQ[] = { OPD("tokens"), WGT("wte"), WGT_O("scale"), OUT("x"),
                                           OPD_O("ahead") };
@@ -1726,6 +1732,11 @@ static const RadOpSchema kSchemas[] = {
   "Qwen3.8-Flash-Next-FP8's 320-million-row n-gram embedding is stored that way -- E4M3 codes and a "
   "single bf16 `weight_scale` -- and it can be, because E4M3 carries its own exponent and a row's "
   "dynamic range is 2.3x. Padding and bounds behave exactly as embed_lookup's." },
+{ "embed_lookup_planes", ARR(pEmbedPlanes), ARR(oEmbedPlanes),
+  "A gather from a table stored as single-level affine planes, read in place: x[m, i] = v * "
+  "scale[id, i / group] * mult, v = table[code] when a table is given, else the code. Codes are i8, "
+  "u8, or 4-bit elements of a bit stream along the row, lowest bits first; a table is indexed by an "
+  "unsigned code and holds every value. Padding, bounds and vocab_offset as embed_lookup." },
 { "logits_gemm", ARR(pLogits), ARR(oLogits),
   "logits[M, n_vocab] = x[M, n_embd] @ lm_head[n_vocab, n_embd]^T. Separate from gemm_nt because "
   "lm_head is its own access class and the sampler wants to fuse against it." },
@@ -2212,6 +2223,13 @@ int ref_unrelayout_gemm_q_m2(const RadParam*, int, int, const RadEncoding*, cons
           return rc < 0 ? rc : fn(a, s);                                                         \
       },                                                                                         \
       nullptr, lay, rel, fn##_shape, unrel }
+/* A row whose kernel checks its own operands' dtypes (codes the generic reader does not read, such
+ * as u4) and reads its weights as stored: no layout hooks, so a table on the file tier is read in
+ * place. */
+#define ROW_OWN(nm, opname, fam, what, dts, fn)                                                  \
+    { nm, opname, fam, what, SHAPE_ANY, dts, RAD_DOMAIN_HOST, 0,                                 \
+      nullptr, 0, nullptr, 0, nullptr, nullptr, nullptr, fn,                                     \
+      nullptr, nullptr, nullptr, fn##_shape, nullptr }
 
 #define DT_FLOAT "bf16 f16 f32 fp8_e4m3 fp8_e5m2 i8 i32, chosen per operand from its own dtype"
 #define DT_ANY   "any dtype rad_types.h names, per operand"
@@ -2530,6 +2548,8 @@ SIMPLE("ref_embed_lookup", "embed_lookup", "vocab", "embedding gather", DT_FLOAT
        ref_embed_lookup),
 SIMPLE("ref_embed_lookup_q", "embed_lookup_q", "vocab", "embedding gather, one scale for the table",
        DT_ANY, ref_embed_lookup_q),
+ROW_OWN("ref_embed_lookup_planes", "embed_lookup_planes", "vocab", "embedding gather from a table's affine planes in place",
+        "i8 u8 i4 u4 codes, any float scale and table, per operand", ref_embed_lookup_planes),
 ROWL("ref_logits_gemm", "logits_gemm", "vocab", "the lm_head projection",
      DT_FLOAT ", or a head of E4M3 / int8 codes with a scale plane, joined",
      ref_check_dtypes, ref_logits_gemm, ref::ref_layout_head),

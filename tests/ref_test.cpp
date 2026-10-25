@@ -909,6 +909,74 @@ TEST(vocab_ggml_ops_read_native_blocks) {
     CHECK(run("embed_lookup_ggml", d) < 0);
 }
 
+/* embed_lookup_planes over the planes libquant imports a GGUF table as (llama.cpp's blocks
+ * unpacked: IQ4_NL's u4 codes into a 16-entry table with an f16 scale per 32, Q8_0's i8 codes and
+ * Q4_0's i4 codes with no table) gathers each id's row equal to llama.cpp's dequantize_row_<type>
+ * of the same blocks, bit for bit; padding and an id past the vocabulary as embed_lookup. */
+TEST(embed_lookup_planes_gathers_imported_ggml_tables_in_place) {
+    uint64_t seed = 0xE16A11u;
+    auto rnd = [&]() { seed = seed * 6364136223846793005ull + 1442695040888963407ull; return seed >> 33; };
+    int ran = 0;
+    for (uint32_t type : { 20u /* iq4_nl */, 8u /* q8_0 */, 2u /* q4_0, when its dequant is ported */ }) {
+        const lq::ggml::PlaneKind* k = lq::ggml::plane_kind(type);
+        if (!k || !lq::ggml::dequant_of(type)) continue;
+        ++ran;
+        const RadEncoding e = lq::ggml::encoding_of(k->type);
+        const int64_t V = 5, E = 2 * k->block, nb = E / k->block, rb = nb * (int64_t)k->block_bytes;
+        std::vector<uint8_t> blocks((size_t)(V * rb));
+        for (uint8_t& b : blocks) b = (uint8_t)rnd();
+        for (int64_t i = 0; i < V * nb; ++i) {      /* every type here has its f16 d first */
+            const uint16_t h = (uint16_t)((rnd() & 0x8000u) | ((8u + rnd() % 8u) << 10) | (rnd() & 0x3FFu));
+            std::memcpy(blocks.data() + i * (int64_t)k->block_bytes, &h, 2);
+        }
+        /* the planes, as the import writes them */
+        std::vector<std::vector<uint8_t>> planes((size_t)e.n_planes);
+        std::vector<int64_t> prb((size_t)e.n_planes, 0);
+        for (int i = 0; i < e.n_planes; ++i) {
+            const RadEncPlane& pl = e.plane[i];
+            int64_t pr = 0, pc = 0;
+            if (pl.kind == RAD_PLANE_TABLE) { pr = pl.extent[0]; pc = pl.extent[1]; }
+            else rad_enc_plane_dims(&pl, V, E, &pr, &pc);
+            prb[(size_t)i] = rad_enc_row_bytes(pl.dtype, pc);
+            planes[(size_t)i].assign((size_t)(pr * prb[(size_t)i] + 8), 0);
+        }
+        std::vector<uint8_t*> row((size_t)e.n_planes);
+        for (int64_t r = 0; r < V; ++r) {
+            for (int i = 0; i < e.n_planes; ++i)
+                row[(size_t)i] = e.plane[i].kind == RAD_PLANE_TABLE ? nullptr
+                                                                    : planes[(size_t)i].data() + r * prb[(size_t)i];
+            k->unpack(blocks.data() + r * rb, nb, row.data());
+        }
+        std::vector<void*> all((size_t)e.n_planes);
+        for (int i = 0; i < e.n_planes; ++i) all[(size_t)i] = planes[(size_t)i].data();
+        lq::ggml::write_shared(k->type, e, all.data());
+        const int ic = rad_enc_find(&e, "codes"), is = rad_enc_find(&e, "scale"), it = rad_enc_find(&e, "table");
+        REQUIRE(ic >= 0 && is >= 0);
+        const int64_t G = e.plane[is].block[1];
+        T codes(e.plane[ic].dtype, {V, E}); codes.raw(planes[(size_t)ic]);
+        T scale(e.plane[is].dtype, {V, E / G}); scale.raw(planes[(size_t)is]);
+        std::vector<float> deq((size_t)(V * E));
+        for (int64_t r = 0; r < V; ++r) lq::ggml::dequant_of(type)(blocks.data() + r * rb, deq.data() + r * E, E);
+        T tok(RAD_I32, {4}); tok.n({3, -1, 0, 4});
+        T x(RAD_F32, {4, E});
+        A a; a.t(tok).t(codes).t(scale);
+        T table(it >= 0 ? e.plane[it].dtype : RAD_I8, {1, it >= 0 ? e.plane[it].extent[1] : 1});
+        if (it >= 0) { table.raw(planes[(size_t)it]); a.t(table); } else a.tnull();
+        a.t(x).i("M", 4).i("n_embd", E).i("n_vocab", V).i("group", G).s("dtype", "f32");
+        REQUIRE_EQ(run("embed_lookup_planes", a), RAD_OK);
+        const int64_t ids[] = {3, -1, 0, 4};
+        for (int64_t m = 0; m < 4; ++m)
+            for (int64_t i = 0; i < E; ++i)
+                CHECK_EQ(x.at(m * E + i), ids[m] < 0 ? 0.0f : deq[(size_t)(ids[m] * E + i)]);
+        T bad(RAD_I32, {4}); bad.n({0, 5, 1, 2});
+        A b; b.t(bad).t(codes).t(scale);
+        if (it >= 0) b.t(table); else b.tnull();
+        b.t(x).i("M", 4).i("n_embd", E).i("n_vocab", V).i("group", G).s("dtype", "f32");
+        CHECK(run("embed_lookup_planes", b) < 0);
+    }
+    CHECK(ran >= 2);
+}
+
 TEST(manifold_sinkhorn_first_pass_and_epsilon_are_distinct) {
     T h(RAD_F32, {1, 2}); h.f({1, 3});
     T fn(RAD_F32, {8, 2}), scale(RAD_F32, {3}); scale.f({1, 1, 1});
@@ -1557,7 +1625,7 @@ TEST(op_vocabulary) {
         "rmsnorm", "rmsnorm_p", "rmsnorm_add", "hc_enter", "hc_read", "hc_write", "hc_project",
         "mtp_enter",
         "mhc_pre", "mhc_pre_partial", "mhc_pre_finish", "mhc_post", "mhc_contract",
-        "mhc_mix", "mhc_collapse", "swiglu_clamped", "router_sigmoid_topk", "router_scored_topk", "rope_rows", "quant_roundtrip", "softmax_pool", "attn_sparse_sink", "index_score", "index_candidates", "index_topk", "entry_store", "token_map", "stream_gate_add", "gemm_nt_ggml", "moe_gemm_ggml", "logits_gemm_ggml", "embed_lookup_ggml", "dsa_pool", "dsa_query", "dsa_score", "mla_attn", "mla_project", "gemm_nt_f32",
+        "mhc_mix", "mhc_collapse", "swiglu_clamped", "router_sigmoid_topk", "router_scored_topk", "rope_rows", "quant_roundtrip", "softmax_pool", "attn_sparse_sink", "index_score", "index_candidates", "index_topk", "entry_store", "token_map", "stream_gate_add", "gemm_nt_ggml", "moe_gemm_ggml", "logits_gemm_ggml", "embed_lookup_ggml", "embed_lookup_planes", "dsa_pool", "dsa_query", "dsa_score", "mla_attn", "mla_project", "gemm_nt_f32",
         "kda_update",
         "layernorm", "add", "mul", "mul_weight", "silu_mul", "gelu_mul", "act_mul", "seg_mean",
         "pool_rows", "relu", "clamp", "conv2d", "conv2d_unfold", "conv1d_dw", "rel_sinusoid",
@@ -9205,6 +9273,7 @@ std::vector<Geo> geometries() {
                                     .s("dtype", "fp8_e4m3")),
         G("logits_gemm", "M", 3, a.i("M", R).i("n_vocab", 20).i("n_embd", 8).s("dtype", "f32")),
         G("logits_gemm_ggml", "M", 3, a.i("M", R).i("n_vocab", 20).i("n_embd", 64).s("type", "q8_0").s("dtype", "f32")),
+        G("embed_lookup_planes", "M", 3, a.i("M", R).i("n_embd", 64).i("n_vocab", 20).i("group", 32).s("dtype", "f32")),
         G("embed_lookup_ggml", "M", 3, a.i("M", R).i("n_embd", 64).i("n_vocab", 20).s("type", "q8_0").s("dtype", "f32")),
         G("sample_penalties", "M", 2, a.i("M", R).i("n_vocab", 64)),
         G("sample_dry", "M", 2, a.i("M", R).i("n_vocab", 64)),

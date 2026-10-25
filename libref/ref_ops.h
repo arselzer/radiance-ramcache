@@ -175,6 +175,7 @@ int ref_logits_gemm_ggml   (const RadArgs*, RadStream);
 int ref_embed_lookup_ggml  (const RadArgs*, RadStream);
 #endif
 int ref_token_map          (const RadArgs*, RadStream);
+int ref_embed_lookup_planes(const RadArgs*, RadStream);
 int ref_stream_gate_add    (const RadArgs*, RadStream);
 int ref_qk_norm_rope       (const RadArgs*, RadStream);
 /* image generation (ref_gen.cpp) */
@@ -450,6 +451,7 @@ REF_SHAPE_FN(ref_logits_gemm_ggml);
 REF_SHAPE_FN(ref_embed_lookup_ggml);
 #endif
 REF_SHAPE_FN(ref_token_map);
+REF_SHAPE_FN(ref_embed_lookup_planes);
 REF_SHAPE_FN(ref_stream_gate_add);
 REF_SHAPE_FN(ref_qk_norm_rope);
 REF_SHAPE_FN(ref_ln_mod);

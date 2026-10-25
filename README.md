@@ -2,7 +2,7 @@
 
 Work in progress on an expert RAM-cache tier for Radiance, focused on GLM 5.3 Flash and models whose experts exceed system RAM.
 
-The small synthetic cache pipeline works, including a correctness check on one RX 9070 XT. Full-model Engine integration is still unfinished. This checkpoint does not enable cached GLM serving.
+The cache passes checks against the complete GLM expert store and small synthetic GPU fixtures, including a correctness check on one RX 9070 XT. Full-model Engine integration is still being validated. This checkpoint does not enable cached GLM serving.
 
 The cache keeps a bounded set of expert records in RAM and reads cold records from disk. A RAM hit avoids the disk read, but still uploads the expert to its GPU consumer. Persistent GPU expert caching, prefill overlap and admission policies remain future work.
 

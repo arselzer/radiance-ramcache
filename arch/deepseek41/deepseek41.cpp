@@ -305,7 +305,7 @@ static rad_weight wts(RadBuilder* b, const Geom& g, const char* name, uint32_t d
  * dimension. */
 static rad_weight lw(RadBuilder* b, Model& m, const char* name, int64_t n, int64_t k,
                      RadWeightGroup grp, int shard = RAD_SHARD_NONE, int64_t lo = 0, int64_t hi = 0,
-                     bool mapped = false) {
+                     bool mapped = false, int access = RAD_ACCESS_PER_TOKEN) {
     if (!mapped && map_copy(b, name, name) != RAD_OK) return 0;
     RadEncoding e{};
     int64_t blk = 0;
@@ -318,7 +318,7 @@ static rad_weight lw(RadBuilder* b, Model& m, const char* name, int64_t n, int64
         return 0;
     }
     const rad_weight w = decl_w(b, name, ty ? ggml_codes_dtype(e) : (uint32_t)RAD_BF16, { n, k },
-                                RAD_ACCESS_PER_TOKEN, split ? shard : RAD_SHARD_NONE, grp);
+                                access, split ? shard : RAD_SHARD_NONE, grp);
     if (!w) {
         fprintf(stderr, "radiance: deepseek41: weight %s refused\n", name);
         return 0;
@@ -895,16 +895,25 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     /* The vocabulary is split over the ranks (shard_extent): the lookup gives zeros outside this
      * rank's rows and an all-reduce completes it; the head's logits stay sharded for the sampler. */
     const int64_t v0 = g.vocab_off, v1 = g.vocab_off + g.n_vocab;
-    m.token = wts(b, g, nm.f("token_embd.weight"), RAD_BF16, { g.n_vocab, D }, grp_model(), RAD_SHARD_ROW,
-                  v0, v1, RAD_ACCESS_VOCAB);
-    m.head = wts(b, g, nm.f("output.weight"), RAD_BF16, { g.n_vocab, D }, grp_model(), RAD_SHARD_ROW, v0,
-                 v1, RAD_ACCESS_VOCAB);
+    m.token = lw(b, m, nm.f("token_embd.weight"), g.n_vocab, D, grp_model(), RAD_SHARD_ROW, v0, v1,
+                 false, RAD_ACCESS_VOCAB);
+    m.head = lw(b, m, nm.f("output.weight"), g.n_vocab, D, grp_model(), RAD_SHARD_ROW, v0, v1, false,
+                RAD_ACCESS_VOCAB);
     if (!m.token || !m.head) return RAD_E_INVAL;
     m.final_gain = wt(b, nm.f("output_norm.weight"), RAD_F32, { D }, grp_model());
-    m.embed = op(b, "embed_lookup",
-                 { RAD_RANGE("M", 1, T), RAD_INT("n_embd", D), RAD_INT("n_vocab", g.n_vocab),
-                   RAD_STR("dtype", "bf16"), RAD_INT("vocab_offset", g.vocab_off) },
-                 { m.token }, {}, { m.xcol });
+    /* A GGUF's table in llama.cpp's blocks is gathered from them (embed_lookup_ggml). */
+    const auto tt = m.wty.find(m.token);
+    if (tt != m.wty.end())
+        m.embed = op(b, "embed_lookup_ggml",
+                     { RAD_RANGE("M", 1, T), RAD_INT("n_embd", D), RAD_INT("n_vocab", g.n_vocab),
+                       RAD_STR("type", tt->second), RAD_STR("dtype", "bf16"),
+                       RAD_INT("vocab_offset", g.vocab_off) },
+                     { m.token }, {}, { m.xcol });
+    else
+        m.embed = op(b, "embed_lookup",
+                     { RAD_RANGE("M", 1, T), RAD_INT("n_embd", D), RAD_INT("n_vocab", g.n_vocab),
+                       RAD_STR("dtype", "bf16"), RAD_INT("vocab_offset", g.vocab_off) },
+                     { m.token }, {}, { m.xcol });
     if (g.world > 1)
         m.embed_ar = op(b, "all_reduce",
                         { RAD_INT("world_size", g.world), RAD_RANGE("numel", D, T * D),
@@ -948,10 +957,17 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.gather = op(b, "gather_rows",
                   { RAD_RANGE("M", 1, g.max_logit_rows), RAD_INT("n", D), RAD_STR("dtype", "bf16") },
                   {}, { m.final_hidden }, { m.logit_input });
-    m.head_op = op(b, "logits_gemm",
-                   { RAD_RANGE("M", 1, g.max_logit_rows), RAD_INT("n_vocab", g.n_vocab),
-                     RAD_INT("n_embd", D), RAD_STR("dtype", "bf16") },
-                   { m.head }, { m.logit_input }, { m.logits });
+    const auto ht = m.wty.find(m.head);
+    if (ht != m.wty.end())
+        m.head_op = op(b, "logits_gemm_ggml",
+                       { RAD_RANGE("M", 1, g.max_logit_rows), RAD_INT("n_vocab", g.n_vocab),
+                         RAD_INT("n_embd", D), RAD_STR("type", ht->second), RAD_STR("dtype", "bf16") },
+                       { m.head }, { m.logit_input }, { m.logits });
+    else
+        m.head_op = op(b, "logits_gemm",
+                       { RAD_RANGE("M", 1, g.max_logit_rows), RAD_INT("n_vocab", g.n_vocab),
+                         RAD_INT("n_embd", D), RAD_STR("dtype", "bf16") },
+                       { m.head }, { m.logit_input }, { m.logits });
     if (debug_noq())
         fprintf(stderr, "radiance: deepseek41: RADIANCE_DEBUG_NOQ: the model's quantise-dequantise "
                         "points are off -- a diagnosis form, not the model\n");

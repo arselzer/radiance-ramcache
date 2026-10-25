@@ -33,6 +33,17 @@
 namespace deepseek41 {
 using namespace rad::arch;
 
+/* RAD_ARCH_TRY that names the call that failed: a refused declaration otherwise surfaces only as
+ * the plugin's return code. */
+#define DS_TRY(e)                                                                                \
+    do {                                                                                         \
+        const int rc_ = (e);                                                                     \
+        if (rc_ < 0) {                                                                           \
+            fprintf(stderr, "radiance: deepseek41: %s refused (%d)\n", #e, rc_);                  \
+            return rc_;                                                                          \
+        }                                                                                        \
+    } while (0)
+
 /* ------------------------------------------------------------------ the configuration */
 struct Cfg {
     int64_t n_layer = 0, n_embd = 0, n_head = 0, head_dim = 0, rope = 0, q_lora = 0;
@@ -214,7 +225,7 @@ struct Layer {
     rad_op k_gemm = 0, k_norm = 0, k_rope = 0, k_q = 0, k_st = 0;
     rad_op l_rope = 0, l_q = 0, l_st = 0, c_tail = 0;
     rad_op i_q = 0, i_rope = 0, i_qq = 0, i_w = 0, i_score = 0, i_cand = 0, i_topk = 0;
-    rad_op attn = 0, o_rope = 0, o_q = 0, o_b = 0, post_a = 0;
+    rad_op attn = 0, o_rope = 0, o_q = 0, o_b = 0, post_a = 0, attn_fill = 0, ar_attn = 0;
     std::vector<rad_op> o_a;
     rad_weight ffn_norm = 0;
     rad_op mix_f = 0, col_f = 0, norm_f = 0, post_f = 0;
@@ -227,6 +238,11 @@ struct Model {
     Cfg c{};
     std::vector<Layer> layers;
     int64_t work = 0, cmax = 0;
+    /* The attention world (geometry()): attention ranks [0, aw), this rank's index `ar` in it and
+     * its `gr` output groups; `zero` for an attention-zero rank. */
+    int aw = 1, ar = 0;
+    int64_t gr = 0;
+    bool zero = false;
     /* buffers */
     rad_buf h0 = 0, h1 = 0, xcol = 0, xn = 0, pre_a = 0, pre_f = 0, post = 0, comb = 0;
     rad_buf qr = 0, qrn = 0, q = 0, kv = 0, kvn = 0, o = 0, oa = 0, attn_out = 0;
@@ -244,7 +260,7 @@ struct Model {
     /* model-wide weights and ops */
     rad_weight token = 0, head = 0, final_gain = 0, tmap = 0, ple_table = 0;
     rad_op embed = 0, expand = 0, pre0 = 0, pre1 = 0, rope_a = 0, rope_b_step = 0, tok_map = 0;
-    rad_op contract = 0, fnorm = 0, gather = 0, head_op = 0;
+    rad_op contract = 0, fnorm = 0, gather = 0, head_op = 0, embed_ar = 0;
 };
 static std::unique_ptr<Model> models[MAX_RANKS];
 
@@ -260,6 +276,25 @@ static rad_weight wt(RadBuilder* b, const char* name, uint32_t dt,
                      int access = RAD_ACCESS_PER_TOKEN) {
     if (map_copy(b, name, name) != RAD_OK) return 0;
     return decl_w(b, name, dt, shape, access, RAD_SHARD_NONE, grp);
+}
+/* A weight split over the ranks: this rank's [lo, hi) of its split dimension (rows for
+ * RAD_SHARD_ROW, columns for RAD_SHARD_COL), declared at `shape`, which must already be that
+ * extent. An explicit span because the attention world can be smaller than the world. */
+static rad_weight wts(RadBuilder* b, const Geom& g, const char* name, uint32_t dt,
+                      std::initializer_list<int64_t> shape, RadWeightGroup grp, int shard, int64_t lo,
+                      int64_t hi, int access = RAD_ACCESS_PER_TOKEN) {
+    if (map_copy(b, name, name) != RAD_OK) return 0;
+    const rad_weight w = decl_w(b, name, dt, shape, access, g.world > 1 ? shard : RAD_SHARD_NONE, grp);
+    if (!w) {
+        fprintf(stderr, "radiance: deepseek41: weight %s refused\n", name);
+        return 0;
+    }
+    if (g.world > 1 && rad_weight_shard_span(b, w, lo, hi) != RAD_OK) {
+        fprintf(stderr, "radiance: deepseek41: %s's span [%lld, %lld) refused\n", name, (long long)lo,
+                (long long)hi);
+        return 0;
+    }
+    return w;
 }
 static rad_op linear(RadBuilder* b, const Geom& g, int64_t rows, rad_weight w, int64_t n,
                      int64_t k, rad_buf x, rad_buf y) {
@@ -312,15 +347,44 @@ static int geometry(Model& m, const RadBuildCtx* ctx) {
     g.n_layer = c.n_layer;
     g.n_embd = c.n_embd;
     g.head_dim = c.head_dim;
-    g.n_head = g.n_head_all = c.n_head;
+    const int world = ctx->world_size ? ctx->world_size : 1;
+    g.world = world;
+    g.rank = ctx->rank;
+    /* The attention world: the largest d <= world that divides both the output groups and the
+     * heads; the ranks past it are attention-zero (Geom::attn_world). There is one latent KV head,
+     * so geom_from's KV-head rule does not apply: three ranks attend on two, four on four. */
+    int aw = 1;
+    for (int d = world; d >= 1; --d)
+        if (c.o_groups % d == 0 && c.n_head % d == 0) {
+            aw = d;
+            break;
+        }
+    g.attn_world = aw;
+    g.attn_zero = ctx->rank >= aw;
+    g.attn_rank = g.attn_zero ? aw - 1 : ctx->rank;
+    m.aw = aw;
+    m.ar = g.attn_rank;
+    m.zero = g.attn_zero;
+    m.gr = c.o_groups / aw;
+    g.n_head_all = c.n_head;
+    g.n_head = c.n_head / aw;
     g.n_head_kv = g.n_head_kv_all = 1;
-    g.n_ff = g.n_ff_all = c.n_ff;
-    g.n_vocab = g.n_vocab_all = c.n_vocab;
-    g.vocab_off = 0;
-    g.rank = 0;
-    g.world = 1;
-    g.attn_world = 1;
-    g.attn_rank = 0;
+    /* Routed experts are expert-parallel: each rank holds n_expert / world whole experts, an even
+     * count (the grouped GEMM takes two parity tables), and the router stays replicated. Whole
+     * experts are what the bf16 and quantised expert paths both serve, at any world (an expert's
+     * width split into whole quant blocks holds at three ranks but not at four). The shared expert
+     * is split by width. */
+    if (c.n_expert % world || (c.n_expert / world) % 2 || c.n_ff % world) {
+        fprintf(stderr, "radiance: deepseek41: %lld experts of width %lld do not split over %d ranks "
+                        "(an even count of whole experts each, and the shared expert's width)\n",
+                (long long)c.n_expert, (long long)c.n_ff, world);
+        return RAD_E_UNSUPPORTED;
+    }
+    g.n_ff_all = c.n_ff;
+    g.n_ff = c.n_ff / world;
+    g.n_vocab_all = c.n_vocab;
+    g.n_vocab = shard_extent(c.n_vocab, world, ctx->rank);
+    g.vocab_off = shard_begin(c.n_vocab, world, ctx->rank);
     g.max_tok = ctx->max_tok;
     g.max_ctx = ctx->max_ctx;
     g.max_seqs = ctx->max_seqs;
@@ -341,7 +405,7 @@ static int buffers(RadBuilder* b, Model& m) {
     auto& nm = m.nm;
     const auto& c = m.c;
     const int64_t T = g.max_tok, D = c.n_embd, W = m.work;
-    const int64_t HN = c.hc * D, HD = c.n_head * c.head_dim;
+    const int64_t HN = c.hc * D, HD = g.n_head * c.head_dim;
     auto bf = [&](const char* n, std::initializer_list<int64_t> s) {
         return decl_b(b, nm.f("%s", n), RAD_BF16, s);
     };
@@ -359,7 +423,7 @@ static int buffers(RadBuilder* b, Model& m) {
     m.kv = bf("window_kv", { T, c.head_dim });
     m.kvn = bf("window_kv_normed", { T, c.head_dim });
     m.o = bf("attn_o", { T, HD });
-    m.oa = bf("attn_o_lora", { T, c.o_groups * c.o_rank });
+    m.oa = bf("attn_o_lora", { T, m.gr * c.o_rank });
     m.attn_out = bf("attn_out", { T, D });
     m.kvs = decl_b(b, nm.f("comp_kv_score"), RAD_F32, { T, 2 * c.head_dim });
     m.stage = decl_b(b, nm.f("comp_stage"), RAD_F32, { 2 * W, 2 * c.head_dim });
@@ -401,14 +465,45 @@ static int buffers(RadBuilder* b, Model& m) {
     mw.egu = bf("expert_gate_up", { T * c.top_k, 2 * c.n_ff });
     mw.eff.x = bf("expert_ff", { T * c.top_k, c.n_ff });
     mw.edn = bf("expert_down", { T * c.top_k, D });
-    mw.sgu = bf("shared_gate_up", { T, 2 * c.n_ff });
-    mw.sff.x = bf("shared_ff", { T, c.n_ff });
+    mw.sgu = bf("shared_gate_up", { T, 2 * g.n_ff });   /* the shared expert: this rank's width */
+    mw.sff.x = bf("shared_ff", { T, g.n_ff });
     mw.sout = bf("shared_out", { T, D });
     mw.sgate = bf("shared_one", { T, 1 });
     m.final_hidden = decl_b(b, nm.f("final_hidden"), RAD_BF16, { T, D }, RAD_BUF_PERSIST);
     m.logit_input = bf("logit_input", { g.max_logit_rows, D });
-    m.logits = decl_b(b, nm.f("logits"), RAD_F32, { g.max_logit_rows, c.n_vocab });
+    m.logits = decl_b(b, nm.f("logits"), RAD_F32, { g.max_logit_rows, g.n_vocab });
     return rad_declare_logits(b, m.logits);
+}
+
+/* The caches. The window holds the whole rotated latent per slot (K then V halves); a compressed or
+ * index group holds one entry a block of `ratio` slots (entry_store fixes the block size); the
+ * compressor's tail is a per-sequence ring of r + max_spec f32 rows. Declared identically on every
+ * rank (an attention-zero rank zeroes them). */
+static rad_kvgroup win_group(RadBuilder* b, Model& m) {
+    RadKVGroupDecl d{};
+    d.kind = RAD_KV_WINDOW;
+    d.dtype = RAD_BF16;
+    d.window = m.c.window + m.g.max_spec;
+    d.n_head_kv = 1;
+    d.head_dim = m.c.head_dim / 2;
+    return rad_decl_kv_group(b, m.nm.f("kv_window"), &d);
+}
+static rad_kvgroup tail_group(RadBuilder* b, Model& m, int64_t r) {
+    RadKVGroupDecl d{};
+    d.kind = RAD_KV_LINEAR;
+    d.dtype = RAD_F32;
+    d.n_head_kv = 1;
+    d.state_dim[0] = r + m.g.max_spec;
+    d.state_dim[1] = 2 * m.c.head_dim;
+    return rad_decl_kv_group(b, m.nm.f("kv_comp_tail_r%lld", (long long)r), &d);
+}
+static rad_kvgroup full_group(RadBuilder* b, Model& m, const char* fmt, int64_t n, int64_t r) {
+    RadKVGroupDecl d{};
+    d.kind = RAD_KV_FULL;
+    d.dtype = RAD_BF16;
+    d.n_head_kv = 1;
+    d.head_dim = n / r / 2;
+    return rad_decl_kv_group(b, m.nm.f(fmt, (long long)r), &d);
 }
 
 /* ------------------------------------------------------------------ one layer */
@@ -416,7 +511,7 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
     auto& g = m.g;
     auto& nm = m.nm;
     const auto& c = m.c;
-    const int64_t T = g.max_tok, D = c.n_embd, HD = c.n_head * c.head_dim, W = m.work;
+    const int64_t T = g.max_tok, D = c.n_embd, HD = g.n_head * c.head_dim, W = m.work;
     const int64_t hd = c.head_dim, mix = c.hc * (c.hc + 2);
     const auto grp = grp_layer(l);
     L.l = l;
@@ -431,11 +526,11 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
     const int pi = c.ple_index(l);
     if (pi >= 0) {
         const int64_t H = c.ple_heads;
-        RAD_ARCH_TRY(map_rows(b, nm.f("blk.%d.engram_mult", l),
+        DS_TRY(map_rows(b, nm.f("blk.%d.engram_mult", l),
                               { { "deepseek41.ple.layer_multipliers", (int)(pi * c.ngram), c.ngram } }));
-        RAD_ARCH_TRY(map_rows(b, nm.f("blk.%d.engram_vsz", l),
+        DS_TRY(map_rows(b, nm.f("blk.%d.engram_vsz", l),
                               { { "deepseek41.ple.head_vocab_sizes", (int)(pi * H), H } }));
-        RAD_ARCH_TRY(map_rows(b, nm.f("blk.%d.engram_off", l),
+        DS_TRY(map_rows(b, nm.f("blk.%d.engram_off", l),
                               { { "deepseek41.ple.head_offsets", (int)(pi * H), H } }));
         L.e_mult = decl_w(b, nm.f("blk.%d.engram_mult", l), RAD_I64, { c.ngram },
                           RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp);
@@ -455,7 +550,7 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
             m.tok = rad_decl_kv_group(b, nm.f("kv_engram_tokens"), &d);
             if (!m.tok) return RAD_E_INVAL;
         }
-        RAD_ARCH_TRY(rad_bind_layer_kv(b, l, m.tok));
+        DS_TRY(rad_bind_layer_kv(b, l, m.tok));
         L.e_ids = op(b, "ngram_ids",
                      { RAD_RANGE("M", 1, T), RAD_INT("heads", H), RAD_INT("ngram", c.ngram),
                        RAD_INT("eos", c.pad) },
@@ -489,188 +584,205 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
     L.mix_a = op(b, "mhc_mix", mixp, { L.hc_a_fn, L.hc_a_scale, L.hc_a_base }, { m.h0 },
                  { m.pre_a, m.post, m.comb });
     L.col_a = op(b, "mhc_collapse", hcp, {}, { m.h0, m.pre_f }, { m.xcol });
-    L.attn_norm = w("blk.%d.attn_norm.weight", RAD_F32, { D });
-    L.norm_a = rmsnorm(b, m, T, L.attn_norm, D, m.xcol, m.xn);
-
-    /* ---- attention: the query, the window key */
-    L.wq_a = w("blk.%d.attn_q_a.weight", RAD_BF16, { c.q_lora, D });
-    L.q_norm = w("blk.%d.attn_q_a_norm.weight", RAD_F32, { c.q_lora });
-    L.wq_b = w("blk.%d.attn_q_b.weight", RAD_BF16, { HD, c.q_lora });
-    L.q_a = linear(b, g, T, L.wq_a, c.q_lora, D, m.xn, m.qr);
-    L.q_an = rmsnorm(b, m, T, L.q_norm, c.q_lora, m.qr, m.qrn);
-    L.q_b = linear(b, g, T, L.wq_b, HD, c.q_lora, m.qrn, m.q);
-    const rad_buf cs = L.r > 0 ? m.cs_b : m.cs_a;
-    L.q_rope = rope_rows(b, m, T, c.n_head, hd, 0, m.q, cs);
-    L.wkv = w("blk.%d.attn_kv.weight", RAD_BF16, { hd, D });
-    L.kv_norm = w("blk.%d.attn_kv_a_norm.weight", RAD_F32, { hd });
-    L.kv_g = linear(b, g, T, L.wkv, hd, D, m.xn, m.kv);
-    L.kv_n = rmsnorm(b, m, T, L.kv_norm, hd, m.kv, m.kvn);
-    L.kv_rope = rope_rows(b, m, T, 1, hd, 0, m.kvn, cs);
-    L.kv_q = roundtrip(b, T, hd, 32, "fp8_e4m3", "ue8m0", m.kvn);
-    if (!m.win) {
-        RadKVGroupDecl d{};
-        d.kind = RAD_KV_WINDOW;
-        d.dtype = RAD_BF16;
-        d.window = c.window + g.max_spec;
-        d.n_head_kv = 1;
-        d.head_dim = hd / 2;            /* a slot is K then V: the whole latent */
-        m.win = rad_decl_kv_group(b, nm.f("kv_window"), &d);
-        if (!m.win) return RAD_E_INVAL;
-    }
-    L.kv_st = op(b, "kv_store",
-                 { RAD_RANGE("M", 1, T), RAD_INT("head_dim", hd / 2), RAD_INT("n_head_kv", 1),
-                   RAD_INT("block_size", 16), RAD_STR("kv_dtype", "bf16") },
-                 {}, { m.kvn }, {});
-    if (!m.win_bs) {
-        m.win_bs = rad_kv_block_size(b, m.win);
-        if (m.win_bs < 1) return RAD_E_INVAL;
-    }
-    RAD_ARCH_TRY(rad_bind_layer_kv(b, l, m.win));
-
-    /* ---- the compressor and the index keys, at a kv source */
-    const int64_t r = L.r;
-    if (L.src) {
-        const int64_t rows = r > 1 ? W : T;
-        L.comp_norm = w("blk.%d.attn_compressor_norm.weight", RAD_F32, { hd });
-        if (r > 1) {
-            const char* cn = nm.f("blk.%d.attn_compressor_kvg.weight", l);
-            RAD_ARCH_TRY(map_concat(b, cn, { nm.f("blk.%d.attn_compressor_kv.weight", l),
-                                             nm.f("blk.%d.attn_compressor_gate.weight", l) }));
-            L.comp_w = decl_w(b, cn, RAD_F32, { 2 * hd, D }, RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE,
-                              grp);
-            L.c_gemm = op(b, "gemm_nt_f32",
-                          { RAD_RANGE("M", 1, T), RAD_INT("N", 2 * hd), RAD_INT("K", D),
-                            RAD_STR("dtype", "bf16") },
-                          { L.comp_w }, { m.xn }, { m.kvs });
-            if (!m.tail.count(r)) {
-                RadKVGroupDecl d{};
-                d.kind = RAD_KV_LINEAR;
-                d.dtype = RAD_F32;
-                d.n_head_kv = 1;
-                d.state_dim[0] = r + g.max_spec;
-                d.state_dim[1] = 2 * hd;
-                m.tail[r] = rad_decl_kv_group(b, nm.f("kv_comp_tail_r%lld", (long long)r), &d);
-                if (!m.tail[r]) return RAD_E_INVAL;
+    if (m.zero) {
+        /* Attention-zero (Geom::attn_world): no heads on this rank. Its caches are declared and
+         * bound as on an attention rank, the weightless stores that fix their block sizes declared
+         * but never issued, then zeroed (rad_kv_group_zero); the block's output is a fill of zeros
+         * the all-reduce adds. */
+        if (!m.win && !(m.win = win_group(b, m))) return RAD_E_INVAL;
+        L.kv_st = op(b, "kv_store",
+                     { RAD_RANGE("M", 1, T), RAD_INT("head_dim", hd / 2), RAD_INT("n_head_kv", 1),
+                       RAD_INT("block_size", 16), RAD_STR("kv_dtype", "bf16") },
+                     {}, { m.kvn }, {});
+        if (!m.win_bs && (m.win_bs = rad_kv_block_size(b, m.win)) < 1) return RAD_E_INVAL;
+        DS_TRY(rad_bind_layer_kv(b, l, m.win));
+        DS_TRY(rad_kv_group_zero(b, m.win));
+        const int64_t r = L.r;
+        if (L.src) {
+            const int64_t rows = r > 1 ? W : T;
+            if (r > 1) {
+                if (!m.tail.count(r) && !(m.tail[r] = tail_group(b, m, r))) return RAD_E_INVAL;
+                /* Per-sequence state is kept on every rank (only paged groups zero): this rank's
+                 * copy of the ring is small and never written. */
+                DS_TRY(rad_bind_layer_kv(b, l, m.tail[r]));
             }
-            RAD_ARCH_TRY(rad_bind_layer_kv(b, l, m.tail[r]));
-            L.c_work = op(b, "qsa_work",
-                          { RAD_RANGE("M", 1, T), RAD_INT("n", 2 * hd), RAD_INT("ratio", r),
-                            RAD_INT("ring", r + g.max_spec), RAD_INT("seqs", g.max_seqs),
-                            RAD_INT("work", W), RAD_STR("dtype", "f32") },
-                          {}, { m.kvs }, { m.stage, m.page, m.bpos, m.nc });
-            L.c_pool = op(b, "softmax_pool",
-                          { RAD_RANGE("M", 1, W), RAD_INT("n", hd), RAD_INT("ratio", r),
-                            RAD_STR("dtype", "bf16") },
-                          {}, { m.stage, m.page }, { m.pooled });
-            L.c_norm = rmsnorm(b, m, W, L.comp_norm, hd, m.pooled, m.lat);
-        } else {
-            L.comp_w = w("blk.%d.attn_compressor_kv.weight", RAD_BF16, { hd, D });
-            L.c_gemm = linear(b, g, T, L.comp_w, hd, D, m.xn, m.pooled);
-            L.c_norm = rmsnorm(b, m, T, L.comp_norm, hd, m.pooled, m.lat);
+            if (!m.index.count(r) && !(m.index[r] = full_group(b, m, "kv_index_r%lld", c.idim, r))) return RAD_E_INVAL;
+            L.k_st = entry_store(b, rows, c.idim, r, m.ikn, m.page);
+            if (rad_kv_block_size(b, m.index[r]) != r) return RAD_E_INVAL;
+            DS_TRY(rad_bind_layer_kv(b, l, m.index[r]));
+            DS_TRY(rad_kv_group_zero(b, m.index[r]));
+            if (!m.comp.count(r) && !(m.comp[r] = full_group(b, m, "kv_compressed_r%lld", hd, r))) return RAD_E_INVAL;
+            L.l_st = entry_store(b, rows, hd, r, m.lat, m.page);
+            if (rad_kv_block_size(b, m.comp[r]) != r) return RAD_E_INVAL;
+            DS_TRY(rad_bind_layer_kv(b, l, m.comp[r]));
+            DS_TRY(rad_kv_group_zero(b, m.comp[r]));
         }
-        /* The compressed rows' angles, at each entry's first-token position. */
-        L.c_tab = op(b, "rope_table",
-                     { RAD_RANGE("M", 1, rows), RAD_INT("rot", c.rope), RAD_F64("theta", c.comp_theta),
-                       RAD_F64("scale", 1.0), RAD_STR("dtype", "f32"),
-                       RAD_F64("yarn_factor", c.yarn_factor > 1.0 ? c.yarn_factor : 0.0),
-                       RAD_F64("yarn_low", c.yarn_low), RAD_F64("yarn_high", c.yarn_high),
-                       RAD_F64("yarn_magnitude", 1.0) },
-                     {}, { m.bpos }, { m.cs_b });
-        /* Index keys from the unrotated latent, then the latent itself rotated and quantised. */
-        L.ik_w = w("blk.%d.indexer.attn_k.weight", RAD_BF16, { c.idim, hd });
-        L.ik_norm = w("blk.%d.indexer.k_norm.weight", RAD_F32, { c.idim });
-        L.k_gemm = linear(b, g, rows, L.ik_w, c.idim, hd, m.lat, m.ik);
-        L.k_norm = rmsnorm(b, m, rows, L.ik_norm, c.idim, m.ik, m.ikn);
-        L.k_rope = rope_rows(b, m, rows, 1, c.idim, 0, m.ikn, m.cs_b);
-        L.k_q = roundtrip(b, rows, c.idim, 32, "fp4_e2m1", "ue8m0", m.ikn);
-        if (!m.index.count(r)) {
-            RadKVGroupDecl d{};
-            d.kind = RAD_KV_FULL;
-            d.dtype = RAD_BF16;
-            d.n_head_kv = 1;
-            d.head_dim = c.idim / r / 2;
-            m.index[r] = rad_decl_kv_group(b, nm.f("kv_index_r%lld", (long long)r), &d);
-            if (!m.index[r]) return RAD_E_INVAL;
-        }
-        L.k_st = entry_store(b, rows, c.idim, r, m.ikn, m.page);
-        if (rad_kv_block_size(b, m.index[r]) != r) return RAD_E_INVAL;
-        RAD_ARCH_TRY(rad_bind_layer_kv(b, l, m.index[r]));
-        L.l_rope = rope_rows(b, m, rows, 1, hd, 0, m.lat, m.cs_b);
-        L.l_q = roundtrip(b, rows, hd, 16, "fp4_e2m1", "e4m3", m.lat);
-        if (!m.comp.count(r)) {
-            RadKVGroupDecl d{};
-            d.kind = RAD_KV_FULL;
-            d.dtype = RAD_BF16;
-            d.n_head_kv = 1;
-            d.head_dim = hd / r / 2;
-            m.comp[r] = rad_decl_kv_group(b, nm.f("kv_compressed_r%lld", (long long)r), &d);
-            if (!m.comp[r]) return RAD_E_INVAL;
-        }
-        L.l_st = entry_store(b, rows, hd, r, m.lat, m.page);
-        if (rad_kv_block_size(b, m.comp[r]) != r) return RAD_E_INVAL;
-        RAD_ARCH_TRY(rad_bind_layer_kv(b, l, m.comp[r]));
-        if (r > 1)
-            L.c_tail = op(b, "qsa_tail_store",
-                          { RAD_RANGE("M", 1, T), RAD_INT("n", 2 * hd), RAD_INT("ratio", r),
-                            RAD_INT("ring", r + g.max_spec), RAD_INT("seqs", g.max_seqs),
-                            RAD_STR("dtype", "f32") },
-                          {}, { m.kvs }, {});
-    }
+        L.attn_fill = op(b, "fill", { RAD_RANGE("M", 1, T), RAD_INT("n", D), RAD_STR("dtype", "bf16"),
+                                      RAD_F64("value", 0.0) },
+                         {}, {}, { m.attn_out });
+    } else {
+        L.attn_norm = w("blk.%d.attn_norm.weight", RAD_F32, { D });
+        L.norm_a = rmsnorm(b, m, T, L.attn_norm, D, m.xcol, m.xn);
 
-    /* ---- the indexer, at an index source */
-    if (L.idx && r > 0) {
-        L.iq_w = w("blk.%d.indexer.attn_q_b.weight", RAD_BF16, { c.ih * c.idim, c.q_lora });
-        L.iproj = w("blk.%d.indexer.proj.weight", RAD_BF16, { c.ih, D });
-        L.i_q = linear(b, g, T, L.iq_w, c.ih * c.idim, c.q_lora, m.qrn, m.iq);
-        L.i_rope = rope_rows(b, m, T, c.ih, c.idim, 0, m.iq, m.cs_b);
-        L.i_qq = roundtrip(b, T, c.ih * c.idim, 32, "fp4_e2m1", "ue8m0", m.iq);
-        L.i_w = linear(b, g, T, L.iproj, c.ih, D, m.xn, m.iw);
-        const int64_t width = g.max_ctx / r + 1;
-        L.i_score = op(b, "index_score",
-                       { RAD_RANGE("M", 1, T), RAD_INT("heads", c.ih), RAD_INT("dim", c.idim),
-                         RAD_INT("ratio", r), RAD_INT("width", width),
-                         RAD_F64("wscale", 1.0 / std::sqrt((double)c.idim * (double)c.ih)),
-                         RAD_STR("dtype", "bf16") },
-                       {}, { m.iq, m.iw }, { m.score });
-        if (l == c.cand)
-            L.i_cand = op(b, "index_candidates",
-                          { RAD_RANGE("M", 1, T), RAD_INT("width", width),
-                            RAD_INT("block", c.cand_block), RAD_INT("topk_blocks", c.cand_blocks),
+        /* ---- attention: the query, the window key */
+        L.wq_a = w("blk.%d.attn_q_a.weight", RAD_BF16, { c.q_lora, D });
+        L.q_norm = w("blk.%d.attn_q_a_norm.weight", RAD_F32, { c.q_lora });
+        L.wq_b = wts(b, g, nm.f("blk.%d.attn_q_b.weight", l), RAD_BF16, { HD, c.q_lora }, grp, RAD_SHARD_ROW,
+                     m.ar * HD, (m.ar + 1) * HD);
+        L.q_a = linear(b, g, T, L.wq_a, c.q_lora, D, m.xn, m.qr);
+        L.q_an = rmsnorm(b, m, T, L.q_norm, c.q_lora, m.qr, m.qrn);
+        L.q_b = linear(b, g, T, L.wq_b, HD, c.q_lora, m.qrn, m.q);
+        const rad_buf cs = L.r > 0 ? m.cs_b : m.cs_a;
+        L.q_rope = rope_rows(b, m, T, g.n_head, hd, 0, m.q, cs);
+        L.wkv = w("blk.%d.attn_kv.weight", RAD_BF16, { hd, D });
+        L.kv_norm = w("blk.%d.attn_kv_a_norm.weight", RAD_F32, { hd });
+        L.kv_g = linear(b, g, T, L.wkv, hd, D, m.xn, m.kv);
+        L.kv_n = rmsnorm(b, m, T, L.kv_norm, hd, m.kv, m.kvn);
+        L.kv_rope = rope_rows(b, m, T, 1, hd, 0, m.kvn, cs);
+        L.kv_q = roundtrip(b, T, hd, 32, "fp8_e4m3", "ue8m0", m.kvn);
+        if (!m.win && !(m.win = win_group(b, m))) return RAD_E_INVAL;
+        L.kv_st = op(b, "kv_store",
+                     { RAD_RANGE("M", 1, T), RAD_INT("head_dim", hd / 2), RAD_INT("n_head_kv", 1),
+                       RAD_INT("block_size", 16), RAD_STR("kv_dtype", "bf16") },
+                     {}, { m.kvn }, {});
+        if (!m.win_bs) {
+            m.win_bs = rad_kv_block_size(b, m.win);
+            if (m.win_bs < 1) return RAD_E_INVAL;
+        }
+        DS_TRY(rad_bind_layer_kv(b, l, m.win));
+
+        /* ---- the compressor and the index keys, at a kv source */
+        const int64_t r = L.r;
+        if (L.src) {
+            const int64_t rows = r > 1 ? W : T;
+            L.comp_norm = w("blk.%d.attn_compressor_norm.weight", RAD_F32, { hd });
+            if (r > 1) {
+                const char* cn = nm.f("blk.%d.attn_compressor_kvg.weight", l);
+                DS_TRY(map_concat(b, cn, { nm.f("blk.%d.attn_compressor_kv.weight", l),
+                                                 nm.f("blk.%d.attn_compressor_gate.weight", l) }));
+                L.comp_w = decl_w(b, cn, RAD_F32, { 2 * hd, D }, RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE,
+                                  grp);
+                L.c_gemm = op(b, "gemm_nt_f32",
+                              { RAD_RANGE("M", 1, T), RAD_INT("N", 2 * hd), RAD_INT("K", D),
+                                RAD_STR("dtype", "bf16") },
+                              { L.comp_w }, { m.xn }, { m.kvs });
+                if (!m.tail.count(r) && !(m.tail[r] = tail_group(b, m, r))) return RAD_E_INVAL;
+                DS_TRY(rad_bind_layer_kv(b, l, m.tail[r]));
+                L.c_work = op(b, "qsa_work",
+                              { RAD_RANGE("M", 1, T), RAD_INT("n", 2 * hd), RAD_INT("ratio", r),
+                                RAD_INT("ring", r + g.max_spec), RAD_INT("seqs", g.max_seqs),
+                                RAD_INT("work", W), RAD_STR("dtype", "f32") },
+                              {}, { m.kvs }, { m.stage, m.page, m.bpos, m.nc });
+                L.c_pool = op(b, "softmax_pool",
+                              { RAD_RANGE("M", 1, W), RAD_INT("n", hd), RAD_INT("ratio", r),
+                                RAD_STR("dtype", "bf16") },
+                              {}, { m.stage, m.page }, { m.pooled });
+                L.c_norm = rmsnorm(b, m, W, L.comp_norm, hd, m.pooled, m.lat);
+            } else {
+                L.comp_w = w("blk.%d.attn_compressor_kv.weight", RAD_BF16, { hd, D });
+                L.c_gemm = linear(b, g, T, L.comp_w, hd, D, m.xn, m.pooled);
+                L.c_norm = rmsnorm(b, m, T, L.comp_norm, hd, m.pooled, m.lat);
+            }
+            /* The compressed rows' angles, at each entry's first-token position. */
+            L.c_tab = op(b, "rope_table",
+                         { RAD_RANGE("M", 1, rows), RAD_INT("rot", c.rope), RAD_F64("theta", c.comp_theta),
+                           RAD_F64("scale", 1.0), RAD_STR("dtype", "f32"),
+                           RAD_F64("yarn_factor", c.yarn_factor > 1.0 ? c.yarn_factor : 0.0),
+                           RAD_F64("yarn_low", c.yarn_low), RAD_F64("yarn_high", c.yarn_high),
+                           RAD_F64("yarn_magnitude", 1.0) },
+                         {}, { m.bpos }, { m.cs_b });
+            /* Index keys from the unrotated latent, then the latent itself rotated and quantised. */
+            L.ik_w = w("blk.%d.indexer.attn_k.weight", RAD_BF16, { c.idim, hd });
+            L.ik_norm = w("blk.%d.indexer.k_norm.weight", RAD_F32, { c.idim });
+            L.k_gemm = linear(b, g, rows, L.ik_w, c.idim, hd, m.lat, m.ik);
+            L.k_norm = rmsnorm(b, m, rows, L.ik_norm, c.idim, m.ik, m.ikn);
+            L.k_rope = rope_rows(b, m, rows, 1, c.idim, 0, m.ikn, m.cs_b);
+            L.k_q = roundtrip(b, rows, c.idim, 32, "fp4_e2m1", "ue8m0", m.ikn);
+            if (!m.index.count(r) && !(m.index[r] = full_group(b, m, "kv_index_r%lld", c.idim, r))) return RAD_E_INVAL;
+            L.k_st = entry_store(b, rows, c.idim, r, m.ikn, m.page);
+            if (rad_kv_block_size(b, m.index[r]) != r) return RAD_E_INVAL;
+            DS_TRY(rad_bind_layer_kv(b, l, m.index[r]));
+            L.l_rope = rope_rows(b, m, rows, 1, hd, 0, m.lat, m.cs_b);
+            L.l_q = roundtrip(b, rows, hd, 16, "fp4_e2m1", "e4m3", m.lat);
+            if (!m.comp.count(r) && !(m.comp[r] = full_group(b, m, "kv_compressed_r%lld", hd, r))) return RAD_E_INVAL;
+            L.l_st = entry_store(b, rows, hd, r, m.lat, m.page);
+            if (rad_kv_block_size(b, m.comp[r]) != r) return RAD_E_INVAL;
+            DS_TRY(rad_bind_layer_kv(b, l, m.comp[r]));
+            if (r > 1)
+                L.c_tail = op(b, "qsa_tail_store",
+                              { RAD_RANGE("M", 1, T), RAD_INT("n", 2 * hd), RAD_INT("ratio", r),
+                                RAD_INT("ring", r + g.max_spec), RAD_INT("seqs", g.max_seqs),
+                                RAD_STR("dtype", "f32") },
+                              {}, { m.kvs }, {});
+        }
+
+        /* ---- the indexer, at an index source */
+        if (L.idx && r > 0) {
+            L.iq_w = w("blk.%d.indexer.attn_q_b.weight", RAD_BF16, { c.ih * c.idim, c.q_lora });
+            L.iproj = w("blk.%d.indexer.proj.weight", RAD_BF16, { c.ih, D });
+            L.i_q = linear(b, g, T, L.iq_w, c.ih * c.idim, c.q_lora, m.qrn, m.iq);
+            L.i_rope = rope_rows(b, m, T, c.ih, c.idim, 0, m.iq, m.cs_b);
+            L.i_qq = roundtrip(b, T, c.ih * c.idim, 32, "fp4_e2m1", "ue8m0", m.iq);
+            L.i_w = linear(b, g, T, L.iproj, c.ih, D, m.xn, m.iw);
+            const int64_t width = g.max_ctx / r + 1;
+            L.i_score = op(b, "index_score",
+                           { RAD_RANGE("M", 1, T), RAD_INT("heads", c.ih), RAD_INT("dim", c.idim),
+                             RAD_INT("ratio", r), RAD_INT("width", width),
+                             RAD_F64("wscale", 1.0 / std::sqrt((double)c.idim * (double)c.ih)),
+                             RAD_STR("dtype", "bf16") },
+                           {}, { m.iq, m.iw }, { m.score });
+            if (l == c.cand)
+                L.i_cand = op(b, "index_candidates",
+                              { RAD_RANGE("M", 1, T), RAD_INT("width", width),
+                                RAD_INT("block", c.cand_block), RAD_INT("topk_blocks", c.cand_blocks),
+                                RAD_INT("ratio", r) },
+                              {}, { m.score }, { m.keep });
+            const bool uses = c.cand >= 0 && c.cand < l;
+            L.i_topk = op(b, "index_topk",
+                          { RAD_RANGE("M", 1, T), RAD_INT("width", width), RAD_INT("topk", c.itopk),
                             RAD_INT("ratio", r) },
-                          {}, { m.score }, { m.keep });
-        const bool uses = c.cand >= 0 && c.cand < l;
-        L.i_topk = op(b, "index_topk",
-                      { RAD_RANGE("M", 1, T), RAD_INT("width", width), RAD_INT("topk", c.itopk),
-                        RAD_INT("ratio", r) },
-                      {}, uses ? std::initializer_list<rad_buf>{ m.score, m.keep }
-                               : std::initializer_list<rad_buf>{ m.score },
-                      { m.sel });
-    }
+                          {}, uses ? std::initializer_list<rad_buf>{ m.score, m.keep }
+                                   : std::initializer_list<rad_buf>{ m.score },
+                          { m.sel });
+        }
 
-    /* ---- the sparse attention and the output projection */
-    L.sinks = w("blk.%d.attn_sinks.weight", RAD_F32, { c.n_head });
-    L.attn = op(b, "attn_sparse_sink",
-                { RAD_RANGE("M", 1, T), RAD_INT("heads", c.n_head), RAD_INT("dim", hd),
-                  RAD_INT("window", c.window), RAD_INT("ratio", r),
-                  RAD_INT("topk", r > 0 ? c.itopk : 0),
-                  RAD_F64("scale", 1.0 / std::sqrt((double)hd)), RAD_STR("dtype", "bf16") },
-                { L.sinks },
-                r > 0 ? std::initializer_list<rad_buf>{ m.q, m.sel }
-                      : std::initializer_list<rad_buf>{ m.q },
-                { m.o });
-    L.o_rope = rope_rows(b, m, T, c.n_head, hd, 1, m.o, cs);
-    L.o_q = roundtrip(b, T, HD, 32, "fp8_e4m3", "ue8m0", m.o);
-    const int64_t gd = HD / c.o_groups;
-    for (int gi_ = 0; gi_ < c.o_groups; ++gi_) {
-        const char* n = nm.f("blk.%d.attn_output_a.g%d.weight", l, gi_);
-        RAD_ARCH_TRY(map_rows(b, n, { { nm.f("blk.%d.attn_output_a.weight", l), (int)(gi_ * c.o_rank),
-                                        c.o_rank } }));
-        L.wo_a.push_back(decl_w(b, n, RAD_BF16, { c.o_rank, gd }, RAD_ACCESS_PER_TOKEN,
-                                RAD_SHARD_NONE, grp));
-        L.o_a.push_back(linear(b, g, T, L.wo_a.back(), c.o_rank, gd, m.o, m.oa));
+        /* ---- the sparse attention and the output projection */
+        L.sinks = wts(b, g, nm.f("blk.%d.attn_sinks.weight", l), RAD_F32, { g.n_head }, grp, RAD_SHARD_ROW,
+                      m.ar * g.n_head, (m.ar + 1) * g.n_head);
+        L.attn = op(b, "attn_sparse_sink",
+                    { RAD_RANGE("M", 1, T), RAD_INT("heads", g.n_head), RAD_INT("dim", hd),
+                      RAD_INT("window", c.window), RAD_INT("ratio", r),
+                      RAD_INT("topk", r > 0 ? c.itopk : 0),
+                      RAD_F64("scale", 1.0 / std::sqrt((double)hd)), RAD_STR("dtype", "bf16") },
+                    { L.sinks },
+                    r > 0 ? std::initializer_list<rad_buf>{ m.q, m.sel }
+                          : std::initializer_list<rad_buf>{ m.q },
+                    { m.o });
+        L.o_rope = rope_rows(b, m, T, g.n_head, hd, 1, m.o, cs);
+        L.o_q = roundtrip(b, T, HD, 32, "fp8_e4m3", "ue8m0", m.o);
+        /* This rank's output groups, each a block of the block-diagonal wo_a. */
+        const int64_t gd = HD / m.gr;
+        for (int j = 0; j < m.gr; ++j) {
+            const int gi_ = (int)(m.ar * m.gr + j);
+            const char* n = nm.f("blk.%d.attn_output_a.g%d.weight", l, gi_);
+            DS_TRY(map_rows(b, n, { { nm.f("blk.%d.attn_output_a.weight", l), (int)(gi_ * c.o_rank),
+                                            c.o_rank } }));
+            L.wo_a.push_back(decl_w(b, n, RAD_BF16, { c.o_rank, gd }, RAD_ACCESS_PER_TOKEN,
+                                    RAD_SHARD_NONE, grp));
+            L.o_a.push_back(linear(b, g, T, L.wo_a.back(), c.o_rank, gd, m.o, m.oa));
+        }
+        const int64_t ok = m.gr * c.o_rank;
+        L.wo_b = wts(b, g, nm.f("blk.%d.attn_output_b.weight", l), RAD_BF16, { D, ok }, grp, RAD_SHARD_COL,
+                     m.ar * ok, (m.ar + 1) * ok);
+        L.o_b = linear(b, g, T, L.wo_b, D, ok, m.oa, m.attn_out);
     }
-    L.wo_b = w("blk.%d.attn_output_b.weight", RAD_BF16, { D, c.o_groups * c.o_rank });
-    L.o_b = linear(b, g, T, L.wo_b, D, c.o_groups * c.o_rank, m.oa, m.attn_out);
+    /* The heads' partial outputs (zeros on an attention-zero rank) summed over every rank. */
+    if (g.world > 1)
+        L.ar_attn = op(b, "all_reduce",
+                       { RAD_INT("world_size", g.world), RAD_RANGE("numel", D, T * D),
+                         RAD_STR("dtype", "bf16"), RAD_INT("exact", g.wire_exact),
+                         RAD_INT("min_bytes", g.wire_min_bytes) },
+                       {}, { m.attn_out }, { m.attn_out });
     L.post_a = op(b, "mhc_post", hcp, {}, { m.attn_out, m.h0, m.post, m.comb }, { m.h1 });
 
     /* ---- the ffn connection and the MoE */
@@ -692,9 +804,12 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
     s.shared_mlp_gate = nm.f("blk.%d.ffn_gate_shexp.weight", l);
     s.shared_mlp_up = nm.f("blk.%d.ffn_up_shexp.weight", l);
     s.shared_mlp_down = nm.f("blk.%d.ffn_down_shexp.weight", l);
-    s.cfg.n_expert = s.cfg.n_expert_all = c.n_expert;
+    s.cfg.n_expert_all = c.n_expert;
+    s.cfg.n_expert = c.n_expert / g.world;
+    s.cfg.expert_base = g.rank * s.cfg.n_expert;
     s.cfg.top_k = c.top_k;
-    s.cfg.n_ff_exp = s.cfg.n_ff_shared = c.n_ff;
+    s.cfg.n_ff_exp = c.n_ff;
+    s.cfg.n_ff_shared = g.n_ff;
     s.cfg.rows = T;
     s.cfg.norm_topk = c.norm_topk;
     s.cfg.sigmoid_router = 1;
@@ -702,8 +817,8 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
     s.cfg.route_scale = c.route_scale;
     s.cfg.swiglu_limit = c.swiglu_limit;
     s.cfg.shared_ungated = 1;
-    RAD_ARCH_TRY(MoeFP8::probe(b, nm, l, s, &s.cfg));
-    RAD_ARCH_TRY(L.moe.declare(b, nm, g, l, m.mw, s, false, false));
+    DS_TRY(MoeFP8::probe(b, nm, l, s, &s.cfg));
+    DS_TRY(L.moe.declare(b, nm, g, l, m.mw, s, false, false));
     L.post_f = op(b, "mhc_post", hcp, {}, { m.act.x, m.h1, m.post, m.comb }, { m.h0 });
     return RAD_OK;
 }
@@ -712,11 +827,6 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
     if (!b || !meta || !ctx || ctx->is_draft || ctx->rank < 0 || ctx->rank >= MAX_RANKS)
         return RAD_E_INVAL;
-    const int world = ctx->world_size ? ctx->world_size : 1;
-    if (world != 1) {
-        fprintf(stderr, "radiance: deepseek41: --tp %d; this plugin runs on one rank so far\n", world);
-        return RAD_E_UNSUPPORTED;
-    }
     if (ctx->kv_dtype && ctx->kv_dtype != RAD_BF16) {
         fprintf(stderr, "radiance: deepseek41: its caches hold bf16 (lossless for the fp8 and fp4 "
                         "values the model writes); run with --kv-cache-dtype bf16\n");
@@ -727,8 +837,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     auto& m = *slot;
     m.nm = Names(ctx->scope);
     auto& nm = m.nm;
-    RAD_ARCH_TRY(read_cfg(m.c, meta));
-    RAD_ARCH_TRY(geometry(m, ctx));
+    DS_TRY(read_cfg(m.c, meta));
+    DS_TRY(geometry(m, ctx));
     const auto& c = m.c;
     auto& g = m.g;
     int64_t rmin = 0;
@@ -736,17 +846,27 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         if (c.ratio[(size_t)l] > 0 && (rmin == 0 || c.ratio[(size_t)l] < rmin)) rmin = c.ratio[(size_t)l];
     m.work = g.max_tok + g.max_seqs;
     m.cmax = g.max_ctx / std::max<int64_t>(rmin, 1) + 1;
-    RAD_ARCH_TRY(buffers(b, m));
+    DS_TRY(buffers(b, m));
 
     const int64_t T = g.max_tok, D = c.n_embd;
-    m.token = wt(b, nm.f("token_embd.weight"), RAD_BF16, { c.n_vocab, D }, grp_model(),
-                 RAD_ACCESS_VOCAB);
-    m.head = wt(b, nm.f("output.weight"), RAD_BF16, { c.n_vocab, D }, grp_model(), RAD_ACCESS_VOCAB);
+    /* The vocabulary is split over the ranks (shard_extent): the lookup gives zeros outside this
+     * rank's rows and an all-reduce completes it; the head's logits stay sharded for the sampler. */
+    const int64_t v0 = g.vocab_off, v1 = g.vocab_off + g.n_vocab;
+    m.token = wts(b, g, nm.f("token_embd.weight"), RAD_BF16, { g.n_vocab, D }, grp_model(), RAD_SHARD_ROW,
+                  v0, v1, RAD_ACCESS_VOCAB);
+    m.head = wts(b, g, nm.f("output.weight"), RAD_BF16, { g.n_vocab, D }, grp_model(), RAD_SHARD_ROW, v0,
+                 v1, RAD_ACCESS_VOCAB);
+    if (!m.token || !m.head) return RAD_E_INVAL;
     m.final_gain = wt(b, nm.f("output_norm.weight"), RAD_F32, { D }, grp_model());
     m.embed = op(b, "embed_lookup",
-                 { RAD_RANGE("M", 1, T), RAD_INT("n_embd", D), RAD_INT("n_vocab", c.n_vocab),
-                   RAD_STR("dtype", "bf16") },
+                 { RAD_RANGE("M", 1, T), RAD_INT("n_embd", D), RAD_INT("n_vocab", g.n_vocab),
+                   RAD_STR("dtype", "bf16"), RAD_INT("vocab_offset", g.vocab_off) },
                  { m.token }, {}, { m.xcol });
+    if (g.world > 1)
+        m.embed_ar = op(b, "all_reduce",
+                        { RAD_INT("world_size", g.world), RAD_RANGE("numel", D, T * D),
+                          RAD_STR("dtype", "bf16"), RAD_INT("exact", 1) },
+                        {}, { m.xcol }, { m.xcol });
     m.expand = op(b, "cast",
                   { RAD_RANGE("M", 1, T), RAD_INT("n", D), RAD_STR("from", "bf16"),
                     RAD_STR("to", "bf16") },
@@ -777,7 +897,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                        { m.tmap }, {}, { m.ctok });
     }
     m.layers.resize((size_t)c.n_layer);
-    for (int l = 0; l < c.n_layer; ++l) RAD_ARCH_TRY(layer(b, m, m.layers[(size_t)l], l));
+    for (int l = 0; l < c.n_layer; ++l) DS_TRY(layer(b, m, m.layers[(size_t)l], l));
     m.contract = op(b, "mhc_collapse",
                     { RAD_RANGE("M", 1, T), RAD_INT("n", D), RAD_INT("hc", c.hc), RAD_STR("dtype", "bf16") },
                     {}, { m.h0, m.pre_f }, { m.xcol });
@@ -786,7 +906,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                   { RAD_RANGE("M", 1, g.max_logit_rows), RAD_INT("n", D), RAD_STR("dtype", "bf16") },
                   {}, { m.final_hidden }, { m.logit_input });
     m.head_op = op(b, "logits_gemm",
-                   { RAD_RANGE("M", 1, g.max_logit_rows), RAD_INT("n_vocab", c.n_vocab),
+                   { RAD_RANGE("M", 1, g.max_logit_rows), RAD_INT("n_vocab", g.n_vocab),
                      RAD_INT("n_embd", D), RAD_STR("dtype", "bf16") },
                    { m.head }, { m.logit_input }, { m.logits });
     if (debug_noq())
@@ -805,7 +925,7 @@ static void step(RadCtx* x, const RadBatch* batch) {
     const auto& c = m.c;
     const auto& g = m.g;
     const int64_t T = batch->n_tok, S = batch->n_seq, D = c.n_embd;
-    const int64_t HD = c.n_head * c.head_dim, hd = c.head_dim;
+    const int64_t HD = g.n_head * c.head_dim, hd = c.head_dim;
     const RadOperand pos = praw(batch->positions, RAD_I32, T);
     const RadOperand cu = praw(batch->cu_seqlens, RAD_I32, S + 1);
     const auto* wb = kv_batch(batch, m.win);
@@ -819,6 +939,7 @@ static void step(RadCtx* x, const RadBatch* batch) {
     const RadOperand wused = praw(wb->seqused, RAD_I32, S);
 
     RAD_ISSUE_N(x, m.embed, T, praw(batch->token_ids, RAD_I32, T), RAD_W(m.token), brows(m.xcol, T));
+    if (m.embed_ar) RAD_ISSUE_N(x, m.embed_ar, T * D, brows(m.xcol, T), RAD_NONE);
     for (int64_t i = 0; i < c.hc; ++i)
         RAD_ISSUE_N(x, m.expand, T, brows(m.xcol, T), bcol(m.h0, i * D, D, T));
     RAD_ISSUE_N(x, m.pre0, T, brows(m.pre_f, T));
@@ -863,106 +984,111 @@ static void step(RadCtx* x, const RadBatch* batch) {
         RAD_ISSUE_N(x, L.mix_a, T, brows(m.h0, T), RAD_W(L.hc_a_fn), RAD_W(L.hc_a_scale),
                     RAD_W(L.hc_a_base), brows(m.pre_a, T), brows(m.post, T), brows(m.comb, T));
         RAD_ISSUE_N(x, L.col_a, T, brows(m.h0, T), brows(m.pre_f, T), brows(m.xcol, T));
-        RAD_ISSUE_N(x, L.norm_a, T, brows(m.xcol, T), RAD_W(L.attn_norm), brows(m.xn, T));
-        RAD_ISSUE_N(x, L.q_a, T, brows(m.xn, T), RAD_W(L.wq_a), brows(m.qr, T));
-        RAD_ISSUE_N(x, L.q_an, T, brows(m.qr, T), RAD_W(L.q_norm), brows(m.qrn, T));
-        RAD_ISSUE_N(x, L.q_b, T, brows(m.qrn, T), RAD_W(L.wq_b), brows(m.q, T));
-        const rad_buf cs = r > 0 ? m.cs_b : m.cs_a;
-        RAD_ISSUE_N(x, L.q_rope, T, brows(m.q, T), brows(cs, g.max_ctx), pos);
-        RAD_ISSUE_N(x, L.kv_g, T, brows(m.xn, T), RAD_W(L.wkv), brows(m.kv, T));
-        RAD_ISSUE_N(x, L.kv_n, T, brows(m.kv, T), RAD_W(L.kv_norm), brows(m.kvn, T));
-        RAD_ISSUE_N(x, L.kv_rope, T, brows(m.kvn, T), brows(cs, g.max_ctx), pos);
-        if (L.kv_q) RAD_ISSUE_N(x, L.kv_q, T, brows(m.kvn, T));
-        RAD_ISSUE_N(x, L.kv_st, T, bcol(m.kvn, 0, hd / 2, T), bcol(m.kvn, hd / 2, hd / 2, T),
-                    praw(wb->slot_mapping, RAD_I32, T), kv_cache(m.win, l));
+        if (m.zero) {
+            RAD_ISSUE_N(x, L.attn_fill, T, brows(m.attn_out, T));
+        } else {
+            RAD_ISSUE_N(x, L.norm_a, T, brows(m.xcol, T), RAD_W(L.attn_norm), brows(m.xn, T));
+            RAD_ISSUE_N(x, L.q_a, T, brows(m.xn, T), RAD_W(L.wq_a), brows(m.qr, T));
+            RAD_ISSUE_N(x, L.q_an, T, brows(m.qr, T), RAD_W(L.q_norm), brows(m.qrn, T));
+            RAD_ISSUE_N(x, L.q_b, T, brows(m.qrn, T), RAD_W(L.wq_b), brows(m.q, T));
+            const rad_buf cs = r > 0 ? m.cs_b : m.cs_a;
+            RAD_ISSUE_N(x, L.q_rope, T, brows(m.q, T), brows(cs, g.max_ctx), pos);
+            RAD_ISSUE_N(x, L.kv_g, T, brows(m.xn, T), RAD_W(L.wkv), brows(m.kv, T));
+            RAD_ISSUE_N(x, L.kv_n, T, brows(m.kv, T), RAD_W(L.kv_norm), brows(m.kvn, T));
+            RAD_ISSUE_N(x, L.kv_rope, T, brows(m.kvn, T), brows(cs, g.max_ctx), pos);
+            if (L.kv_q) RAD_ISSUE_N(x, L.kv_q, T, brows(m.kvn, T));
+            RAD_ISSUE_N(x, L.kv_st, T, bcol(m.kvn, 0, hd / 2, T), bcol(m.kvn, hd / 2, hd / 2, T),
+                        praw(wb->slot_mapping, RAD_I32, T), kv_cache(m.win, l));
 
-        if (L.src) {
-            const auto* cb = kv_batch(batch, m.comp[r]);
-            const auto* ib = kv_batch(batch, m.index[r]);
-            if (!cb || !ib || !cb->block_table || !ib->block_table) {
-                rad_step_fail(x, "deepseek41: a compressed group has no block table");
-                return;
-            }
-            int64_t rows = T;
-            RadOperand page = praw(cb->slot_mapping, RAD_I32, T), bpos = pos;
-            if (r > 1) {
-                const auto* tb = kv_batch(batch, m.tail[r]);
-                if (!tb || !tb->state_index) {
-                    rad_step_fail(x, "deepseek41: the compressor tail has no state slots");
+            if (L.src) {
+                const auto* cb = kv_batch(batch, m.comp[r]);
+                const auto* ib = kv_batch(batch, m.index[r]);
+                if (!cb || !ib || !cb->block_table || !ib->block_table) {
+                    rad_step_fail(x, "deepseek41: a compressed group has no block table");
                     return;
                 }
-                const int64_t pitch = tb->state_index_pitch > 0 ? tb->state_index_pitch : 1;
-                rows = m.work;
-                RAD_ISSUE_N(x, L.c_gemm, T, brows(m.xn, T), RAD_W(L.comp_w), brows(m.kvs, T));
-                RAD_ISSUE_N(x, L.c_work, T, brows(m.kvs, T), pos, cu, kv_cache(m.tail[r], l),
-                            praw2(tb->state_index, RAD_I32, S, pitch),
-                            praw2(cb->block_table, RAD_I32, S, cb->block_table_pitch), RAD_NONE,
-                            brows(m.stage, rows * r), brows(m.page, rows), brows(m.bpos, rows),
-                            brows(m.nc, S));
-                RAD_ISSUE_N(x, L.c_pool, rows, brows(m.stage, rows * r), brows(m.pooled, rows),
-                            brows(m.page, rows));
-                RAD_ISSUE_N(x, L.c_norm, rows, brows(m.pooled, rows), RAD_W(L.comp_norm),
-                            brows(m.lat, rows));
-                page = brows(m.page, rows);
-                bpos = brows(m.bpos, rows);
+                int64_t rows = T;
+                RadOperand page = praw(cb->slot_mapping, RAD_I32, T), bpos = pos;
+                if (r > 1) {
+                    const auto* tb = kv_batch(batch, m.tail[r]);
+                    if (!tb || !tb->state_index) {
+                        rad_step_fail(x, "deepseek41: the compressor tail has no state slots");
+                        return;
+                    }
+                    const int64_t pitch = tb->state_index_pitch > 0 ? tb->state_index_pitch : 1;
+                    rows = m.work;
+                    RAD_ISSUE_N(x, L.c_gemm, T, brows(m.xn, T), RAD_W(L.comp_w), brows(m.kvs, T));
+                    RAD_ISSUE_N(x, L.c_work, T, brows(m.kvs, T), pos, cu, kv_cache(m.tail[r], l),
+                                praw2(tb->state_index, RAD_I32, S, pitch),
+                                praw2(cb->block_table, RAD_I32, S, cb->block_table_pitch), RAD_NONE,
+                                brows(m.stage, rows * r), brows(m.page, rows), brows(m.bpos, rows),
+                                brows(m.nc, S));
+                    RAD_ISSUE_N(x, L.c_pool, rows, brows(m.stage, rows * r), brows(m.pooled, rows),
+                                brows(m.page, rows));
+                    RAD_ISSUE_N(x, L.c_norm, rows, brows(m.pooled, rows), RAD_W(L.comp_norm),
+                                brows(m.lat, rows));
+                    page = brows(m.page, rows);
+                    bpos = brows(m.bpos, rows);
+                } else {
+                    RAD_ISSUE_N(x, L.c_gemm, T, brows(m.xn, T), RAD_W(L.comp_w), brows(m.pooled, T));
+                    RAD_ISSUE_N(x, L.c_norm, T, brows(m.pooled, T), RAD_W(L.comp_norm), brows(m.lat, T));
+                }
+                RAD_ISSUE_N(x, L.c_tab, rows, bpos, brows(m.cs_b, g.max_ctx));
+                RAD_ISSUE_N(x, L.k_gemm, rows, brows(m.lat, rows), RAD_W(L.ik_w), brows(m.ik, rows));
+                RAD_ISSUE_N(x, L.k_norm, rows, brows(m.ik, rows), RAD_W(L.ik_norm), brows(m.ikn, rows));
+                RAD_ISSUE_N(x, L.k_rope, rows, brows(m.ikn, rows), brows(m.cs_b, g.max_ctx), bpos);
+                if (L.k_q) RAD_ISSUE_N(x, L.k_q, rows, brows(m.ikn, rows));
+                RAD_ISSUE_N(x, L.k_st, rows, brows(m.ikn, rows), page, kv_cache(m.index[r], l));
+                RAD_ISSUE_N(x, L.l_rope, rows, brows(m.lat, rows), brows(m.cs_b, g.max_ctx), bpos);
+                if (L.l_q) RAD_ISSUE_N(x, L.l_q, rows, brows(m.lat, rows));
+                RAD_ISSUE_N(x, L.l_st, rows, brows(m.lat, rows), page, kv_cache(m.comp[r], l));
+                if (L.c_tail) {
+                    const auto* tb = kv_batch(batch, m.tail[r]);
+                    const int64_t pitch = tb->state_index_pitch > 0 ? tb->state_index_pitch : 1;
+                    RAD_ISSUE_N(x, L.c_tail, T, brows(m.kvs, T), pos, cu, kv_cache(m.tail[r], l),
+                                praw2(tb->state_index, RAD_I32, S, pitch));
+                }
+            }
+
+            if (L.i_score) {
+                const int src = c.src_of[(size_t)l];
+                const auto* ib = kv_batch(batch, m.index[r]);
+                const int64_t live = std::min<int64_t>(
+                    g.max_ctx / r + 1, ((int64_t)batch->max_ctx_len + batch->max_q_len) / r + 1);
+                RAD_ISSUE_N(x, L.i_q, T, brows(m.qrn, T), RAD_W(L.iq_w), brows(m.iq, T));
+                RAD_ISSUE_N(x, L.i_rope, T, brows(m.iq, T), brows(m.cs_b, g.max_ctx), pos);
+                if (L.i_qq) RAD_ISSUE_N(x, L.i_qq, T, brows(m.iq, T));
+                RAD_ISSUE_N(x, L.i_w, T, brows(m.xn, T), RAD_W(L.iproj), brows(m.iw, T));
+                RAD_ISSUE_N(x, L.i_score, T, brows(m.iq, T), brows(m.iw, T), kv_cache(m.index[r], src),
+                            praw2(ib->block_table, RAD_I32, S, ib->block_table_pitch), pos, cu,
+                            bcol(m.score, 0, live, T));
+                if (L.i_cand)
+                    RAD_ISSUE_N(x, L.i_cand, T, bcol(m.score, 0, live, T), pos, bcol(m.keep, 0, live, T));
+                const bool uses = c.cand >= 0 && c.cand < l;
+                RAD_ISSUE_N(x, L.i_topk, T, bcol(m.score, 0, live, T),
+                            uses ? bcol(m.keep, 0, live, T) : RAD_NONE, pos, brows(m.sel, T));
+            }
+
+            if (r > 0) {
+                const int src = c.src_of[(size_t)l];
+                const auto* cb = kv_batch(batch, m.comp[r]);
+                RAD_ISSUE_N(x, L.attn, T, brows(m.q, T), kv_cache(m.win, l), wbt, wused,
+                            kv_cache(m.comp[r], src),
+                            praw2(cb->block_table, RAD_I32, S, cb->block_table_pitch), brows(m.sel, T),
+                            pos, cu, RAD_W(L.sinks), brows(m.o, T));
             } else {
-                RAD_ISSUE_N(x, L.c_gemm, T, brows(m.xn, T), RAD_W(L.comp_w), brows(m.pooled, T));
-                RAD_ISSUE_N(x, L.c_norm, T, brows(m.pooled, T), RAD_W(L.comp_norm), brows(m.lat, T));
+                RAD_ISSUE_N(x, L.attn, T, brows(m.q, T), kv_cache(m.win, l), wbt, wused, RAD_NONE,
+                            RAD_NONE, RAD_NONE, pos, cu, RAD_W(L.sinks), brows(m.o, T));
             }
-            RAD_ISSUE_N(x, L.c_tab, rows, bpos, brows(m.cs_b, g.max_ctx));
-            RAD_ISSUE_N(x, L.k_gemm, rows, brows(m.lat, rows), RAD_W(L.ik_w), brows(m.ik, rows));
-            RAD_ISSUE_N(x, L.k_norm, rows, brows(m.ik, rows), RAD_W(L.ik_norm), brows(m.ikn, rows));
-            RAD_ISSUE_N(x, L.k_rope, rows, brows(m.ikn, rows), brows(m.cs_b, g.max_ctx), bpos);
-            if (L.k_q) RAD_ISSUE_N(x, L.k_q, rows, brows(m.ikn, rows));
-            RAD_ISSUE_N(x, L.k_st, rows, brows(m.ikn, rows), page, kv_cache(m.index[r], l));
-            RAD_ISSUE_N(x, L.l_rope, rows, brows(m.lat, rows), brows(m.cs_b, g.max_ctx), bpos);
-            if (L.l_q) RAD_ISSUE_N(x, L.l_q, rows, brows(m.lat, rows));
-            RAD_ISSUE_N(x, L.l_st, rows, brows(m.lat, rows), page, kv_cache(m.comp[r], l));
-            if (L.c_tail) {
-                const auto* tb = kv_batch(batch, m.tail[r]);
-                const int64_t pitch = tb->state_index_pitch > 0 ? tb->state_index_pitch : 1;
-                RAD_ISSUE_N(x, L.c_tail, T, brows(m.kvs, T), pos, cu, kv_cache(m.tail[r], l),
-                            praw2(tb->state_index, RAD_I32, S, pitch));
-            }
+            RAD_ISSUE_N(x, L.o_rope, T, brows(m.o, T), brows(cs, g.max_ctx), pos);
+            if (L.o_q) RAD_ISSUE_N(x, L.o_q, T, brows(m.o, T));
+            const int64_t gd = HD / m.gr;
+            for (int j = 0; j < m.gr; ++j)
+                RAD_ISSUE_N(x, L.o_a[(size_t)j], T, bcol(m.o, j * gd, gd, T), RAD_W(L.wo_a[(size_t)j]),
+                            bcol(m.oa, j * c.o_rank, c.o_rank, T));
+            RAD_ISSUE_N(x, L.o_b, T, brows(m.oa, T), RAD_W(L.wo_b), brows(m.attn_out, T));
         }
-
-        if (L.i_score) {
-            const int src = c.src_of[(size_t)l];
-            const auto* ib = kv_batch(batch, m.index[r]);
-            const int64_t live = std::min<int64_t>(
-                g.max_ctx / r + 1, ((int64_t)batch->max_ctx_len + batch->max_q_len) / r + 1);
-            RAD_ISSUE_N(x, L.i_q, T, brows(m.qrn, T), RAD_W(L.iq_w), brows(m.iq, T));
-            RAD_ISSUE_N(x, L.i_rope, T, brows(m.iq, T), brows(m.cs_b, g.max_ctx), pos);
-            if (L.i_qq) RAD_ISSUE_N(x, L.i_qq, T, brows(m.iq, T));
-            RAD_ISSUE_N(x, L.i_w, T, brows(m.xn, T), RAD_W(L.iproj), brows(m.iw, T));
-            RAD_ISSUE_N(x, L.i_score, T, brows(m.iq, T), brows(m.iw, T), kv_cache(m.index[r], src),
-                        praw2(ib->block_table, RAD_I32, S, ib->block_table_pitch), pos, cu,
-                        bcol(m.score, 0, live, T));
-            if (L.i_cand)
-                RAD_ISSUE_N(x, L.i_cand, T, bcol(m.score, 0, live, T), pos, bcol(m.keep, 0, live, T));
-            const bool uses = c.cand >= 0 && c.cand < l;
-            RAD_ISSUE_N(x, L.i_topk, T, bcol(m.score, 0, live, T),
-                        uses ? bcol(m.keep, 0, live, T) : RAD_NONE, pos, brows(m.sel, T));
-        }
-
-        if (r > 0) {
-            const int src = c.src_of[(size_t)l];
-            const auto* cb = kv_batch(batch, m.comp[r]);
-            RAD_ISSUE_N(x, L.attn, T, brows(m.q, T), kv_cache(m.win, l), wbt, wused,
-                        kv_cache(m.comp[r], src),
-                        praw2(cb->block_table, RAD_I32, S, cb->block_table_pitch), brows(m.sel, T),
-                        pos, cu, RAD_W(L.sinks), brows(m.o, T));
-        } else {
-            RAD_ISSUE_N(x, L.attn, T, brows(m.q, T), kv_cache(m.win, l), wbt, wused, RAD_NONE,
-                        RAD_NONE, RAD_NONE, pos, cu, RAD_W(L.sinks), brows(m.o, T));
-        }
-        RAD_ISSUE_N(x, L.o_rope, T, brows(m.o, T), brows(cs, g.max_ctx), pos);
-        if (L.o_q) RAD_ISSUE_N(x, L.o_q, T, brows(m.o, T));
-        const int64_t gd = HD / c.o_groups;
-        for (int gi_ = 0; gi_ < c.o_groups; ++gi_)
-            RAD_ISSUE_N(x, L.o_a[(size_t)gi_], T, bcol(m.o, gi_ * gd, gd, T),
-                        RAD_W(L.wo_a[(size_t)gi_]), bcol(m.oa, gi_ * c.o_rank, c.o_rank, T));
-        RAD_ISSUE_N(x, L.o_b, T, brows(m.oa, T), RAD_W(L.wo_b), brows(m.attn_out, T));
+        if (L.ar_attn) RAD_ISSUE_N(x, L.ar_attn, T * D, brows(m.attn_out, T), RAD_NONE);
         RAD_ISSUE_N(x, L.post_a, T, brows(m.attn_out, T), brows(m.h0, T), brows(m.post, T),
                     brows(m.comb, T), brows(m.h1, T));
 

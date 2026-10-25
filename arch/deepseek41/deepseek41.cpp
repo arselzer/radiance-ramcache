@@ -261,6 +261,10 @@ struct Model {
     int64_t win_bs = 0;
     /* model-wide weights and ops */
     rad_weight token = 0, head = 0, final_gain = 0, tmap = 0, ple_table = 0;
+    /* The Engram table stored as affine planes (a GGUF's IQ4_NL): views gathered in place by
+     * embed_lookup_planes, `ple_group` values a scale; 0 for a plain bf16 table. */
+    rad_weight ple_codes = 0, ple_scale = 0, ple_tab = 0;
+    int64_t ple_group = 0;
     rad_op embed = 0, expand = 0, pre0 = 0, pre1 = 0, rope_a = 0, rope_b_step = 0, tok_map = 0;
     rad_op contract = 0, fnorm = 0, gather = 0, head_op = 0, embed_ar = 0;
 };
@@ -597,10 +601,23 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
                      { RAD_RANGE("M", 1, T), RAD_INT("heads", H), RAD_INT("ngram", c.ngram),
                        RAD_INT("eos", c.pad) },
                      { L.e_mult, L.e_vsz, L.e_off }, { m.ctok }, { m.ids });
-        L.e_emb = op(b, "embed_lookup",
-                     { RAD_RANGE("M", 1, T * H), RAD_INT("n_embd", c.ple_dim),
-                       RAD_INT("n_vocab", c.ple_rows), RAD_STR("dtype", "bf16") },
-                     { m.ple_table }, { m.ids }, { m.emb });
+        if (m.ple_group > 0 && m.ple_tab)
+            L.e_emb = op(b, "embed_lookup_planes",
+                         { RAD_RANGE("M", 1, T * H), RAD_INT("n_embd", c.ple_dim),
+                           RAD_INT("n_vocab", c.ple_rows), RAD_INT("group", m.ple_group),
+                           RAD_STR("dtype", "bf16") },
+                         { m.ple_codes, m.ple_scale, m.ple_tab }, { m.ids }, { m.emb });
+        else if (m.ple_group > 0)
+            L.e_emb = op(b, "embed_lookup_planes",
+                         { RAD_RANGE("M", 1, T * H), RAD_INT("n_embd", c.ple_dim),
+                           RAD_INT("n_vocab", c.ple_rows), RAD_INT("group", m.ple_group),
+                           RAD_STR("dtype", "bf16") },
+                         { m.ple_codes, m.ple_scale }, { m.ids }, { m.emb });
+        else
+            L.e_emb = op(b, "embed_lookup",
+                         { RAD_RANGE("M", 1, T * H), RAD_INT("n_embd", c.ple_dim),
+                           RAD_INT("n_vocab", c.ple_rows), RAD_STR("dtype", "bf16") },
+                         { m.ple_table }, { m.ids }, { m.emb });
         L.e_gemm = linear(b, m, T, L.e_kv, (c.hc + 1) * D, H * c.ple_dim, m.emb, m.ekv);
         L.e_gate_op = op(b, "stream_gate_add",
                          { RAD_RANGE("M", 1, T), RAD_INT("n", D), RAD_INT("hc", c.hc),
@@ -943,8 +960,45 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                        {}, {}, { m.cs_b });
     if (!c.ple.empty()) {
         m.tmap = wt(b, "deepseek41.engram.token_map", RAD_I32, { c.n_vocab }, grp_model());
-        m.ple_table = wt(b, nm.f("per_layer_token_embd.weight"), RAD_BF16, { c.ple_rows, c.ple_dim },
-                         grp_model(), RAD_ACCESS_VOCAB);
+        /* Bf16, or a single-level affine encoding (codes, a scale per group, an optional
+         * codebook: a GGUF's IQ4_NL, Q8_0, Q4_0) read in place from its stored planes, since the
+         * table (103 GiB in the 1017) is too large to relayout or copy; it stays on whatever tier
+         * holds the container's bytes. */
+        const char* tn = nm.f("per_layer_token_embd.weight");
+        DS_TRY(map_copy(b, tn, tn));
+        RadEncoding te{};
+        const bool known = weight_enc(b, tn, &te);
+        if (!known || (rad_enc_is(&te, "plain") && te.n_planes == 1)) {
+            m.ple_table = decl_w(b, tn, RAD_BF16, { c.ple_rows, c.ple_dim }, RAD_ACCESS_VOCAB,
+                                 RAD_SHARD_NONE, grp_model());
+            if (!m.ple_table) return RAD_E_INVAL;
+        } else {
+            const RadEncPlane* cp = rad_enc_plane(&te, "codes");
+            const RadEncPlane* sp = rad_enc_plane(&te, "scale");
+            const RadEncPlane* tp = rad_enc_plane(&te, "table");
+            const int64_t G = sp ? sp->block[1] : 0;
+            if (!rad_enc_is(&te, "affine") || te.transform[0] || !cp || !sp || cp->block[0] != 1 ||
+                cp->block[1] != 1 || sp->block[0] != 1 || G <= 0 || c.ple_dim % G ||
+                te.n_planes != 2 + (tp ? 1 : 0)) {
+                char en[256];
+                rad_enc_format(&te, en, sizeof en);
+                fprintf(stderr, "radiance: deepseek41: the Engram table is %s; it is read as bf16 or "
+                                "as codes with one scale per group of a row and an optional "
+                                "codebook\n", en);
+                return RAD_E_DTYPE;
+            }
+            m.ple_group = G;
+            m.ple_codes = decl_view(b, tn, nullptr, "codes", cp->dtype, { c.ple_rows, c.ple_dim },
+                                    RAD_ACCESS_VOCAB, RAD_SHARD_NONE, grp_model());
+            m.ple_scale = decl_view(b, nm.f("per_layer_token_embd.scale"), tn, "scale", sp->dtype,
+                                    { c.ple_rows, c.ple_dim / G }, RAD_ACCESS_VOCAB, RAD_SHARD_NONE,
+                                    grp_model());
+            if (tp)
+                m.ple_tab = decl_view(b, nm.f("per_layer_token_embd.table"), tn, "table", tp->dtype,
+                                      { tp->extent[0], tp->extent[1] }, RAD_ACCESS_PER_TOKEN,
+                                      RAD_SHARD_NONE, grp_model());
+            if (!m.ple_codes || !m.ple_scale || (tp && !m.ple_tab)) return RAD_E_INVAL;
+        }
         m.tok_map = op(b, "token_map", { RAD_RANGE("M", 1, T), RAD_INT("n_vocab", c.n_vocab) },
                        { m.tmap }, {}, { m.ctok });
     }
@@ -1034,7 +1088,11 @@ static void step(RadCtx* x, const RadBatch* batch) {
                             RAD_NONE);
             /* T rows of operands; the gather's band is T * H, one table row per head per token,
              * read through the ids and rows as flat (rad_block_ple.h does the same). */
-            RAD_ISSUE_N(x, L.e_emb, T * H, brows(m.ids, T), RAD_W(m.ple_table), brows(m.emb, T));
+            if (m.ple_group > 0)
+                RAD_ISSUE_N(x, L.e_emb, T * H, brows(m.ids, T), RAD_W(m.ple_codes), RAD_W(m.ple_scale),
+                            m.ple_tab ? RAD_W(m.ple_tab) : RAD_NONE, brows(m.emb, T));
+            else
+                RAD_ISSUE_N(x, L.e_emb, T * H, brows(m.ids, T), RAD_W(m.ple_table), brows(m.emb, T));
             RAD_ISSUE_N(x, L.e_gemm, T, brows(m.emb, T), RAD_W(L.e_kv), brows(m.ekv, T));
             RAD_ISSUE_N(x, L.e_gate_op, T, brows(m.h0, T), bcol(m.ekv, 0, c.hc * D, T),
                         bcol(m.ekv, c.hc * D, D, T), RAD_W(L.e_gate), brows(m.h1, T));

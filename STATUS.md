@@ -7,9 +7,9 @@ This is a research checkpoint from 25 October 2026. It has not been deployed.
 | Synthetic RAM cache → native owner → GPU expert FFN | Passed on one RX 9070 XT, including default and host-kernel-argument modes, on the preceding combined Core revision. |
 | Compact native metadata and source/declaration contract | Passed Release, Address/UndefinedBehaviorSanitizer and ThreadSanitizer CPU checks. |
 | Bounded physical source/export/read bridge | Passed all three CPU modes against synthetic complete expert records. |
-| Current Foundation v2 Core, real HOST loader and failure cleanup | Corrected fixture v3 passed Release and Address/UndefinedBehaviorSanitizer checks. ThreadSanitizer validation remains pending. |
+| Current Foundation v2 Core, real HOST loader and failure cleanup | Corrected fixture v3 passed Release, Address/UndefinedBehaviorSanitizer and ThreadSanitizer checks, including preserved Core regressions. |
 | Foundation v2 independent source review | Both identified findings were repaired and reviewed. |
-| Actual Engine startup through the native cache path | Pending implementation and validation. |
+| Actual Engine startup through the native cache path | Implementation in progress; validation pending. |
 | Full GLM checkpoint, four-GPU inference, quality and performance | Not validated. |
 
 Foundation v2 fixes a routing-profile admission error, reserves backend-global control credit before generic use, and corrects a checker compilation error. The earlier failed build is retained in `evidence/`; later results do not turn that failed revision into a pass.

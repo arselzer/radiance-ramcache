@@ -1,0 +1,36 @@
+RAM_ADMISSION MemAvailable=9679921152
+I device: host backend, 1 device(s) [0:host]
+I arena: 256 B device + 256 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+I deferred device validation: enabled; recorded passes, speculation and issue-ahead are unsupported
+  ok   checkpoint_good_repeated_readbacks_preserve_active_pass_and_allow_later_issues
+I arena: 256 B device + 256 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+I deferred device validation: enabled; recorded passes, speculation and issue-ahead are unsupported
+  ok   checkpoint_bad_after_good_preserves_first_attribution_and_never_publishes_or_reuses_ctx
+I arena: 256 B device + 256 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+I deferred device validation: enabled; recorded passes, speculation and issue-ahead are unsupported
+  ok   checkpoint_misuse_outside_unsealed_pass_refuses_without_poisoning_next_pass
+I arena: 256 B device + 256 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+I deferred device validation: enabled; recorded passes, speculation and issue-ahead are unsupported
+I arena: 256 B device + 256 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+I deferred device validation: enabled; recorded passes, speculation and issue-ahead are unsupported
+  ok   checkpoint_refuses_active_or_created_lane1_instead_of_ignoring_its_collectors
+I arena: 256 B device + 256 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+I deferred device validation: enabled; recorded passes, speculation and issue-ahead are unsupported
+  ok   checkpoint_logical_tp2_is_explicitly_unsupported_without_any_collective
+I arena: 256 B device + 256 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+I deferred device validation: enabled; recorded passes, speculation and issue-ahead are unsupported
+E earlier synchronous fixture error
+  ok   checkpoint_preserves_an_earlier_synchronous_failure_including_its_diagnostic
+I arena: 256 B device + 256 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+  ok   checkpoint_absent_metadata_refuses_without_adding_a_validation_claim_or_default_behavior
+I arena: 256 B device + 256 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+I deferred device validation: enabled; recorded passes, speculation and issue-ahead are unsupported
+I arena: 256 B device + 256 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+I deferred device validation: enabled; recorded passes, speculation and issue-ahead are unsupported
+I arena: 256 B device + 256 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+I deferred device validation: enabled; recorded passes, speculation and issue-ahead are unsupported
+I arena: 256 B device + 256 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+I deferred device validation: enabled; recorded passes, speculation and issue-ahead are unsupported
+  ok   checkpoint_malformed_payload_is_fatal_without_fabricating_an_op_attribution
+  ok   checkpoint_primitive_physically_preserves_sticky_latch_after_negative_readback
+164 check(s) over 9 case(s) in 0.00 s, 0.03 s of CPU

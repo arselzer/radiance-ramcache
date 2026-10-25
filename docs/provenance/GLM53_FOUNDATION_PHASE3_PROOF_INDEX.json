@@ -1,0 +1,26 @@
+{
+  "utc": "2026-10-25T14:55:34.220794+00:00",
+  "scope": "Foundation lifecycle/quotes/source contract and preserved HOST regressions only; no Engine startup/full-model/GPU claim",
+  "Core": "radiance-glm-engine-native-foundation-v2-src",
+  "Core_pin_manifest_sha256": "75e34cfccbc635cc2b99c052dd7916dd07755bc7321bb6095a9fca981e3cfc53",
+  "fixture": "glm53-engine-native-foundation-v3-prototype",
+  "fixture_receipt_sha256": "264514096e1389f54661747dbea99c8f2c13dee0537b83e0e58b8aa9e840c7a0",
+  "modes": {
+    "release": {
+      "receipt": "validation-glm53-foundation-v3-release-20261025T144634Z/receipt.json",
+      "receipt_sha256": "6a0ecc29da8cc5b1672c081599f93779299496fb3c2c0644aa4bc07453be89f7",
+      "passed": true
+    },
+    "asan": {
+      "receipt": "validation-glm53-foundation-v3-asan-20261025T144240Z/receipt.json",
+      "receipt_sha256": "9cbd5ce410e38bf688137e94a17af5bc96a3ba872ead420918f273347af988f0",
+      "passed": true
+    },
+    "tsan": {
+      "receipt": "validation-glm53-foundation-v3-tsan-20261025T145159Z/receipt.json",
+      "receipt_sha256": "86fe87b8a04ad734bec809c1bf988a9864cf04816672026e9ba373e56859f1d3",
+      "passed": true
+    }
+  },
+  "production_changes": false
+}

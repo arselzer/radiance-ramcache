@@ -55,6 +55,16 @@
     "scope": "Tiny real HOST loader and quotes, preserved regressions; no Engine/model"
   },
   {
+    "directory": "validation-glm53-foundation-v3-release-20261025T144634Z",
+    "passed": true,
+    "scope": "Tiny real HOST loader and quotes, preserved regressions; no Engine/model"
+  },
+  {
+    "directory": "validation-glm53-foundation-v3-tsan-20261025T145159Z",
+    "passed": true,
+    "scope": "Tiny real HOST loader and quotes, preserved regressions; no Engine/model"
+  },
+  {
     "directory": "validation-glm53-physical-bound-v3-frontier-asan-20261025T121402Z",
     "passed": true,
     "scope": "Matching private HOST Core and exact bounded synthetic fixtures; no fullmodel/Engine/GPU/serving activation"

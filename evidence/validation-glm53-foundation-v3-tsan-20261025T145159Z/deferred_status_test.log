@@ -1,0 +1,52 @@
+RAM_ADMISSION MemAvailable=10081579008
+I device: host backend, 1 device(s) [0:host]
+I arena: 256 B device + 256 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+I deferred device validation: enabled; recorded passes, speculation and issue-ahead are unsupported
+  ok   deferred_status_captures_actual_flag_before_same_scratch_is_overwritten
+I arena: 256 B device + 256 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+I deferred device validation: enabled; recorded passes, speculation and issue-ahead are unsupported
+  ok   deferred_status_lane1_join_and_existing_lane_reset_preserve_actual_failure
+I arena: 256 B device + 256 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+I deferred device validation: enabled; recorded passes, speculation and issue-ahead are unsupported
+  ok   deferred_status_requires_completed_readback_before_next_pass_and_refuses_speculation
+I arena: 256 B device + 256 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+I deferred device validation: enabled; recorded passes, speculation and issue-ahead are unsupported
+E kernel produce (status_capture_test, no tunables, device domain) refused op 'produce' at M=1 [band M<=1] geometry {M=1}: called in the wrong phase; the step is aborted (a kernel that refuses at issue was selected wrongly)
+I arena: 256 B device + 256 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+I deferred device validation: enabled; recorded passes, speculation and issue-ahead are unsupported
+E kernel produce (status_capture_test, no tunables, device domain) refused op 'produce' at M=1 [band M<=1] geometry {M=1}: called in the wrong phase; the step is aborted (a kernel that refuses at issue was selected wrongly)
+I arena: 256 B device + 256 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+I deferred device validation: enabled; recorded passes, speculation and issue-ahead are unsupported
+E kernel produce (status_capture_test, no tunables, device domain) refused op 'produce' at M=1 [band M<=1] geometry {M=1}: called in the wrong phase; the step is aborted (a kernel that refuses at issue was selected wrongly)
+  ok   deferred_status_lifecycle_rejects_opted_issues_before_body_or_collector_can_write
+I arena: 256 B device + 256 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+I deferred device validation: enabled; recorded passes, speculation and issue-ahead are unsupported
+I arena: 256 B device + 256 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+I deferred device validation: enabled; recorded passes, speculation and issue-ahead are unsupported
+I arena: 256 B device + 256 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+I deferred device validation: enabled; recorded passes, speculation and issue-ahead are unsupported
+I arena: 256 B device + 256 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+I deferred device validation: enabled; recorded passes, speculation and issue-ahead are unsupported
+  ok   deferred_status_rejects_malformed_positive_or_unattributed_payload
+I arena: 256 B device + 256 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+  ok   deferred_status_absent_metadata_keeps_original_dispatch_and_needs_no_readback
+I arena: 256 B device + 256 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+I arena: 256 B device + 256 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+I deferred device validation: enabled; recorded passes, speculation and issue-ahead are unsupported
+  ok   deferred_status_all_rank_model_phase_blocks_every_sampler_when_one_rank_fails
+I arena: 256 B device + 256 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+I deferred device validation: enabled; recorded passes, speculation and issue-ahead are unsupported
+I arena: 256 B device + 256 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+  ok   deferred_status_all_rank_model_phase_releases_samplers_only_after_success
+I arena: 256 B device + 256 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+I deferred device validation: enabled; recorded passes, speculation and issue-ahead are unsupported
+I arena: 256 B device + 256 B scratch = 8.00 KiB, charged to the VRAM budget before it was split
+E synthetic synchronous rank refusal
+  ok   deferred_status_joins_host_refusal_before_any_peer_waits_on_held_device_work
+E plugin 'status_fixture' has an incomplete or unsupported deferred-status interface
+E plugin 'status_fixture' has an incomplete or unsupported deferred-status interface
+E plugin 'status_fixture' has an incomplete or unsupported deferred-status interface
+E kernel 'status_fixture' in plugin 'status_fixture' requests device-status collection from a host row
+E kernel 'status_fixture' in plugin 'status_fixture' combines deferred status with a self-releasing link hold; contract v1 refuses it
+  ok   deferred_status_loader_requires_complete_supported_pair_and_device_rows
+115 check(s) over 10 case(s) in 0.02 s, 0.07 s of CPU

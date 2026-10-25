@@ -439,6 +439,9 @@ static const RadParamSpec pRopeTable[] = { P_INT("M"), P_INT("rot"), P_F64("thet
                                            P_F64O("yarn_high"), P_F64O("yarn_magnitude"),
                                            P_INTO("head_dim"), P_STRO("ladder") };
 static const RadOperandSpec oRopeTable[] = { OPD("positions"), OUT("cos_sin") };
+static const RadParamSpec pRopeRows[] = { P_INT("M"), P_INT("n_head"), P_INT("head_dim"),
+    P_INT("rot"), P_INT("off"), P_STR("mode"), P_INT("inverse"), P_STR("dtype") };
+static const RadOperandSpec oRopeRows[] = { INOUT("x"), OPD("cos_sin"), OPD("positions") };
 
 /* QSA's compressed key, libr4d's schema exactly (libr4d/r4d_rows.cpp): `block_size` is `ratio`
  * spelled for the block-key store's KV group; `page` and `pos` are optional. */
@@ -1423,6 +1426,10 @@ static const RadOpSchema kSchemas[] = {
   "at the block's identity row, and into the ring slot only when the residency map says the block "
   "is resident. A negative slot is skipped. The mirror is the truth; a block absent from the ring "
   "is copied in whole by kv_resolve." },
+{ "rope_rows", ARR(pRopeRows), ARR(oRopeRows),
+  "rope from a rope_table plane over columns [off, off+rot) of each head_dim-wide head of x, in "
+  "place: gptj pairs adjacent columns, neox i with i+rot/2; (a,b)(c+is) in f32, rounded once; "
+  "inverse 1 conjugates the rotation. A negative or out-of-table position leaves its row." },
 { "rope_table", ARR(pRopeTable), ARR(oRopeTable),
   "cos/sin for the positions a step names, at each position's own row of a [max_ctx, rot] plane: "
   "rot values a row, cos for the first half and sin for the second. The angles are `rope`'s "
@@ -2343,6 +2350,7 @@ ROW_CB("ref_moe_gemm_q_mod4", "moe_gemm_q_mod4", "moe",
 SIMPLE("ref_moe_gather", "moe_gather", "moe", "weighted scatter back to token order", DT_FLOAT,
        ref_moe_gather),
 SIMPLE("ref_rope_table", "rope_table", "attn", "cos/sin at each position's own row", DT_FLOAT, ref_rope_table),
+SIMPLE("ref_rope_rows", "rope_rows", "attn", "rope from a cos/sin plane over a window of each head", DT_FLOAT, ref_rope_rows),
 SIMPLE("ref_qsa_block_key", "qsa_block_key", "attn",
        "QSA compressed key: pooled, normed and rotated at the block's position", DT_FLOAT,
        ref_qsa_block_key),

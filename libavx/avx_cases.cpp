@@ -1167,6 +1167,13 @@ std::vector<Case> build_cases() {
             add("router_scored_topk",
                 { HI("M", 5), HI("n_expert", 256), HI("top_k", 6), HI("norm", 1),
                   HF("route_scale", 1.5), HS("score", score), HS("dtype", dt) });
+        for (const char* mode : { "gptj", "neox" })
+            for (int inv : { 0, 1 })
+                add("rope_rows", { HI("M", 5), HI("n_head", 3), HI("head_dim", 96), HI("rot", 32),
+                                   HI("off", 64), HS("mode", mode), HI("inverse", inv),
+                                   HS("dtype", dt) });
+        add("rope_rows", { HI("M", 4), HI("n_head", 2), HI("head_dim", 64), HI("rot", 64),
+                           HI("off", 0), HS("mode", "gptj"), HI("inverse", 0), HS("dtype", dt) });
     }
 
     /* ================================================================== speed-only, at model size

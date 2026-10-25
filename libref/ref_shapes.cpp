@@ -1614,6 +1614,18 @@ int ref_rope_table_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* ou
     return o.finish("rope_table", operand, out);
 }
 
+int ref_rope_rows_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), nh = gi(p, n_p, "n_head", 0), hd = gi(p, n_p, "head_dim", 0);
+    const int64_t rot = gi(p, n_p, "rot", 0), off = gi(p, n_p, "off", -1);
+    if (M <= 0 || nh < 1 || rot < 2 || (rot & 1) || off < 0 || off + rot > hd) return RAD_E_UNSUPPORTED;
+    const uint32_t D = act_dt(p, n_p);
+    Opd o;
+    o.t(D, { M, nh * hd });                         /* x, rotated in place */
+    o.t((uint32_t)RAD_F32, { M, rot });             /* cos_sin: a rope_table plane of M rows */
+    o.t_idx({ M }, M, -1, 0);                       /* positions */
+    return o.finish("rope_rows", operand, out);
+}
+
 int ref_qsa_block_key_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = gi(p, n_p, "M", 0);
     const int64_t n = gi(p, n_p, "n", 0);

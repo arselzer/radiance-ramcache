@@ -369,6 +369,11 @@ static const RadParamSpec pRopeTable[]   = { P_INT("M"), P_INT("rot"), P_F64("th
                                              P_INTO("head_dim"), P_STRO("ladder") };
 static const RadOperandSpec oRopeTable[] = { OPD("positions"), OUT("cos_sin") };
 
+/* DeepSeek-V4.1's ops, libref's schemas. */
+static const RadParamSpec pRopeRows[] = { P_INT("M"), P_INT("n_head"), P_INT("head_dim"),
+    P_INT("rot"), P_INT("off"), P_STR("mode"), P_INT("inverse"), P_STR("dtype") };
+static const RadOperandSpec oRopeRows[] = { INOUT("x"), OPD("cos_sin"), OPD("positions") };
+
 /* QSA's compressed key, libr4d's schema (libr4d/r4d_rows.cpp): `block_size` is `ratio` under the
  * name the block-key store's KV group uses; `page` and `pos` are optional. */
 static const RadParamSpec pQsaBlockKey[] = { P_INT("M"), P_INT("n"), P_INT("ratio"),
@@ -1073,6 +1078,8 @@ static const RadOpSchema kSchemas[] = {
   "that cannot place every miss latches ctl[3] and leaves those entries naming blocks, never a "
   "fabricated slot." },
 { "rope_table", ARR(pRopeTable), ARR(oRopeTable), "cos/sin at each position's own row." },
+{ "rope_rows", ARR(pRopeRows), ARR(oRopeRows),
+  "rope from a rope_table plane over columns [off, off+rot) of each head, in place." },
 { "qsa_block_key", ARR(pQsaBlockKey), ARR(oQsaBlockKey),
   "QSA's compressed key: the mean of a block's `ratio` rows rounded to k's dtype, RMS-normed with "
   "gain (wadd + w), rotated at the block's position with `rope`'s ladder and YaRN; libref's "
@@ -1662,6 +1669,8 @@ SIMPLE("avx_kv_resolve", "kv_resolve", "attn",
 SIMPLE("avx_rope", "rope", "attn", "rotary embedding in place", DT_FLOAT, L(rope)),
 SIMPLE("avx_rope_table", "rope_table", "attn", "cos/sin at each position's own row", DT_FLOAT,
        L(rope_table)),
+SIMPLE("avx_rope_rows", "rope_rows", "attn", "rope from a cos/sin plane over a window of each head",
+       DT_FLOAT, L(rope_rows)),
 SIMPLE("avx_qsa_block_key", "qsa_block_key", "attn",
        "QSA compressed key: pooled, normed and rotated at the block's position", DT_FLOAT,
        L(qsa_block_key)),

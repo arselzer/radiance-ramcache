@@ -396,6 +396,60 @@ TEST(router_scored_topk_names_its_score_function) {
     CHECK_EQ(run("router_scored_topk", d), RAD_E_UNSUPPORTED);
 }
 
+/* rope_rows over DeepSeek-V4's layout: the last rot columns of each head, adjacent pairs, angles
+ * from rope_table with YaRN. The rotation is the complex product, the inverse undoes it, the head's
+ * other columns and a row with a negative position are untouched, and neox pairs i with i+rot/2. */
+TEST(rope_rows_rotates_a_window_of_each_head_and_inverts) {
+    const int64_t M = 4, nh = 3, hd = 16, rot = 8, off = hd - rot;
+    T pos(RAD_I32, {M}); pos.n({0, 5, 1000, -1});
+    T cs(RAD_F32, {1024, rot});
+    T tp(RAD_I32, {M}); tp.n({0, 5, 1000, 3});
+    A ta; ta.t(tp).t(cs).i("M", M).i("rot", rot).d("theta", 160000.0).d("scale", 1.0)
+        .s("dtype", "f32").d("yarn_factor", 16.0).d("yarn_low", 0.0).d("yarn_high", 3.0);
+    REQUIRE_EQ(run("rope_table", ta), RAD_OK);
+    T x(RAD_F32, {M, nh * hd}), x0(RAD_F32, {M, nh * hd});
+    for (int64_t i = 0; i < M * nh * hd; ++i) { x.set(i, std::sin(0.7f * (float)i + 0.1f)); x0.set(i, x.at(i)); }
+    A a; a.t(x).t(cs).t(pos).i("M", M).i("n_head", nh).i("head_dim", hd).i("rot", rot).i("off", off)
+        .s("mode", "gptj").i("inverse", 0).s("dtype", "f32");
+    REQUIRE_EQ(run("rope_rows", a), RAD_OK);
+    for (int64_t m = 0; m < M; ++m)
+        for (int64_t h = 0; h < nh; ++h) {
+            const int64_t b = m * nh * hd + h * hd;
+            for (int64_t c = 0; c < off; ++c) CHECK_EQ(x.at(b + c), x0.at(b + c));
+            const int64_t p = pos.iat(m);
+            for (int64_t i = 0; i < rot / 2; ++i) {
+                const float va = x0.at(b + off + 2 * i), vb = x0.at(b + off + 2 * i + 1);
+                if (p < 0) { CHECK_EQ(x.at(b + off + 2 * i), va); continue; }
+                const float c = cs.at(p * rot + i), s = cs.at(p * rot + rot / 2 + i);
+                CHECK_EQ(x.at(b + off + 2 * i), va * c - vb * s);
+                CHECK_EQ(x.at(b + off + 2 * i + 1), va * s + vb * c);
+            }
+        }
+    a.ps[6].ival = 1;   /* inverse */
+    REQUIRE_EQ(run("rope_rows", a), RAD_OK);
+    for (int64_t i = 0; i < M * nh * hd; ++i) CHECK(std::fabs(x.at(i) - x0.at(i)) < 1e-5f);
+    /* neox pairs i with i + rot/2. */
+    T y(RAD_F32, {M, nh * hd});
+    for (int64_t i = 0; i < M * nh * hd; ++i) y.set(i, x0.at(i));
+    A n; n.t(y).t(cs).t(pos).i("M", M).i("n_head", nh).i("head_dim", hd).i("rot", rot).i("off", off)
+        .s("mode", "neox").i("inverse", 0).s("dtype", "f32");
+    REQUIRE_EQ(run("rope_rows", n), RAD_OK);
+    {
+        const int64_t b = 1 * nh * hd + 2 * hd;   /* row 1 (position 5), head 2 */
+        const float va = x0.at(b + off + 1), vb = x0.at(b + off + 1 + rot / 2);
+        const float c = cs.at(5 * rot + 1), s = cs.at(5 * rot + rot / 2 + 1);
+        CHECK_EQ(y.at(b + off + 1), va * c - vb * s);
+        CHECK_EQ(y.at(b + off + 1 + rot / 2), va * s + vb * c);
+    }
+    /* A window past the head is refused, as is an unknown mode. */
+    A w; w.t(x).t(cs).t(pos).i("M", M).i("n_head", nh).i("head_dim", hd).i("rot", rot).i("off", off + 2)
+        .s("mode", "gptj").i("inverse", 0).s("dtype", "f32");
+    CHECK_EQ(run("rope_rows", w), RAD_E_SHAPE);
+    A u; u.t(x).t(cs).t(pos).i("M", M).i("n_head", nh).i("head_dim", hd).i("rot", rot).i("off", off)
+        .s("mode", "spiral").i("inverse", 0).s("dtype", "f32");
+    CHECK_EQ(run("rope_rows", u), RAD_E_UNSUPPORTED);
+}
+
 TEST(manifold_sinkhorn_first_pass_and_epsilon_are_distinct) {
     T h(RAD_F32, {1, 2}); h.f({1, 3});
     T fn(RAD_F32, {8, 2}), scale(RAD_F32, {3}); scale.f({1, 1, 1});
@@ -1044,7 +1098,7 @@ TEST(op_vocabulary) {
         "rmsnorm", "rmsnorm_p", "rmsnorm_add", "hc_enter", "hc_read", "hc_write", "hc_project",
         "mtp_enter",
         "mhc_pre", "mhc_pre_partial", "mhc_pre_finish", "mhc_post", "mhc_contract",
-        "mhc_mix", "mhc_collapse", "swiglu_clamped", "router_sigmoid_topk", "router_scored_topk", "dsa_pool", "dsa_query", "dsa_score", "mla_attn", "mla_project", "gemm_nt_f32",
+        "mhc_mix", "mhc_collapse", "swiglu_clamped", "router_sigmoid_topk", "router_scored_topk", "rope_rows", "dsa_pool", "dsa_query", "dsa_score", "mla_attn", "mla_project", "gemm_nt_f32",
         "kda_update",
         "layernorm", "add", "mul", "mul_weight", "silu_mul", "gelu_mul", "act_mul", "seg_mean",
         "pool_rows", "relu", "clamp", "conv2d", "conv2d_unfold", "conv1d_dw", "rel_sinusoid",
@@ -8615,6 +8669,8 @@ std::vector<Geo> geometries() {
                                   .d("theta", 1e4).d("eps", 1e-6)),
         G("rope_table", "M", 3, a.i("M", R).i("rot", 8).d("theta", 1e4).d("scale", 1.0)
                                 .s("dtype", "f32")),
+        G("rope_rows", "M", 3, a.i("M", R).i("n_head", 2).i("head_dim", 12).i("rot", 8).i("off", 4)
+                               .s("mode", "gptj").i("inverse", 0).s("dtype", "f32")),
         G("qsa_block_key", "M", 2, a.i("M", R).i("n", 32).i("ratio", 4).i("rotary_dim", 8)
                                    .d("eps", 1e-6).d("theta", 1e4).s("dtype", "bf16")),
         G("qsa_score", "M", 4, a.i("M", R).i("n", 32).i("heads", 2).i("blocks", 6).i("seqs", 2)

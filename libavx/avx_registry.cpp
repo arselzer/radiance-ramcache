@@ -80,6 +80,9 @@ static const RadOperandSpec oMhcPreFinish[] = { OPD("part"), OPD("h"), WGT("scal
     OUT("x"), OUT("post"), OUT("comb") };
 static const RadOperandSpec oMhcPost[] = { OPD("x"), OPD("h"), OPD("post"), OPD("comb"), OUT("out") };
 static const RadOperandSpec oMhcContract[] = { OPD("h"), OUT("x") };
+static const RadOperandSpec oMhcMix[] = { OPD("h"), WGT("fn"), WGT("scale"), WGT("base"),
+    OUT("pre"), OUT("post"), OUT("comb") };
+static const RadOperandSpec oMhcCollapse[] = { OPD("h"), OPD("pre"), OUT("x") };
 static const RadParamSpec pKdaUpdate[] = { P_INT("M"), P_INT("heads"), P_INT("head_k"),
     P_INT("head_v"), P_F64("lower_bound"), P_F64("scale"), P_F64("l2_eps"),
     P_STR("mode"), P_STR("dtype"), P_STRO("state_form") };
@@ -890,6 +893,11 @@ static const RadOpSchema kSchemas[] = {
   "mhc_pre from every chunk's partials: chunk sums, gates, Sinkhorn mixing, collapse." },
 { "mhc_post", ARR(pHcWrite), ARR(oMhcPost), "Source-to-destination manifold residual update." },
 { "mhc_contract", ARR(pHcWrite), ARR(oMhcContract), "Mean over manifold residual streams." },
+{ "mhc_mix", ARR(pMhcPre), ARR(oMhcMix),
+  "mhc_pre without the collapse: the gates and Sinkhorn mixing, the pre gates written to `pre` "
+  "(f32 [M, hc]) for a later mhc_collapse." },
+{ "mhc_collapse", ARR(pHcWrite), ARR(oMhcCollapse),
+  "x[i] = sum over hc streams of pre[stream] * h[stream, i], accumulated in f32 and rounded once." },
 { "kda_update", ARR(pKdaUpdate), ARR(oKdaUpdate), "Bounded per-channel KDA with candidate-state rollback." },
 { "hc_read", ARR(pHcRead), ARR(oHcRead),
   "The read half of a gated residual: grouped norm, low-rank gate, stream mix, and optionally the "
@@ -1464,6 +1472,10 @@ SIMPLE("avx_mhc_pre_partial", "mhc_pre_partial", "norm", "manifold projection pa
 SIMPLE("avx_mhc_pre_finish", "mhc_pre_finish", "norm", "manifold gates from projection partials", DT_FLOAT, L(mhc_pre_finish)),
 SIMPLE("avx_mhc_post", "mhc_post", "norm", "manifold residual update", DT_FLOAT, L(mhc_post)),
 SIMPLE("avx_mhc_contract", "mhc_contract", "norm", "mean of residual streams", DT_FLOAT, L(mhc_contract)),
+SIMPLE("avx_mhc_mix", "mhc_mix", "norm", "manifold gates and Sinkhorn mixing, pre gates out",
+       DT_FLOAT, L(mhc_mix)),
+SIMPLE("avx_mhc_collapse", "mhc_collapse", "norm", "residual streams collapsed by given gates",
+       DT_FLOAT, L(mhc_collapse)),
 SIMPLE("avx_kda_update", "kda_update", "gdn", "bounded KDA and candidate-state rollback", DT_FLOAT, L(kda_update)),
 ROWL("avx_hc_read", "hc_read", "norm",
      "gated residual read: grouped norm, low-rank gate, stream mix",

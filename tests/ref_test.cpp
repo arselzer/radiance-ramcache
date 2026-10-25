@@ -151,6 +151,7 @@ struct T {
         for (size_t i = 0; i < v.size(); ++i) st_int(t.dtype, t.data, (int64_t)i, v[i]);
         return *this;
     }
+    void     set(int64_t i, float v) { st_dt(t.dtype, t.data, i, v); }
     float    at(int64_t i) const  { return ld_dt(t.dtype, t.data, i); }
     int64_t  iat(int64_t i) const { return ld_int(t.dtype, t.data, i); }
 };
@@ -315,6 +316,45 @@ TEST(manifold_post_mixes_sources_into_destinations_and_contracts_by_mean) {
     REQUIRE_EQ(run("mhc_contract", c), RAD_OK);
     CHECK_EQ(contracted.at(0), 30.0f);
     CHECK_EQ(contracted.at(1), 40.0f);
+}
+
+/* mhc_mix is mhc_pre with the collapse moved out: its post and comb are mhc_pre's, its pre gates
+ * collapse h through mhc_collapse into mhc_pre's x, and with every gate 1/hc the collapse is
+ * mhc_contract. */
+TEST(manifold_mix_and_collapse_are_mhc_pre_split_in_two) {
+    const int64_t M = 3, n = 5, hc = 4, W = hc * n, mix = hc * (hc + 2);
+    T h(RAD_F32, {M, W}), fn(RAD_F32, {mix, W}), scale(RAD_F32, {3}), base(RAD_F32, {mix});
+    for (int64_t i = 0; i < M * W; ++i) h.set(i, std::sin(0.37f * (float)i) * 2.0f);
+    for (int64_t i = 0; i < mix * W; ++i) fn.set(i, std::cos(0.11f * (float)i) * 0.3f);
+    scale.f({0.7f, 1.3f, 0.9f});
+    for (int64_t i = 0; i < mix; ++i) base.set(i, 0.05f * (float)(i % 7) - 0.1f);
+    T x(RAD_F32, {M, n}), post(RAD_F32, {M, hc}), comb(RAD_F32, {M, hc * hc});
+    A a; a.t(h).t(fn).t(scale).t(base).t(x).t(post).t(comb).i("M", M).i("n", n).i("hc", hc)
+        .i("iterations", 20).d("eps", 1e-6).d("hc_eps", 1e-6).s("dtype", "f32");
+    REQUIRE_EQ(run("mhc_pre", a), RAD_OK);
+    T pre(RAD_F32, {M, hc}), post2(RAD_F32, {M, hc}), comb2(RAD_F32, {M, hc * hc});
+    A b; b.t(h).t(fn).t(scale).t(base).t(pre).t(post2).t(comb2).i("M", M).i("n", n).i("hc", hc)
+        .i("iterations", 20).d("eps", 1e-6).d("hc_eps", 1e-6).s("dtype", "f32");
+    REQUIRE_EQ(run("mhc_mix", b), RAD_OK);
+    for (int64_t i = 0; i < M * hc; ++i) CHECK_EQ(post2.at(i), post.at(i));
+    for (int64_t i = 0; i < M * hc * hc; ++i) CHECK_EQ(comb2.at(i), comb.at(i));
+    for (int64_t i = 0; i < M * hc; ++i) CHECK(pre.at(i) > 0.0f && pre.at(i) < 1.01f);
+    T x2(RAD_F32, {M, n});
+    A c; c.t(h).t(pre).t(x2).i("M", M).i("n", n).i("hc", hc).s("dtype", "f32");
+    REQUIRE_EQ(run("mhc_collapse", c), RAD_OK);
+    for (int64_t i = 0; i < M * n; ++i) CHECK_EQ(x2.at(i), x.at(i));
+    /* Uniform gates are the mean. */
+    for (int64_t i = 0; i < M * hc; ++i) pre.set(i, 1.0f / (float)hc);
+    T x3(RAD_F32, {M, n}), xm(RAD_F32, {M, n});
+    A d; d.t(h).t(pre).t(x3).i("M", M).i("n", n).i("hc", hc).s("dtype", "f32");
+    REQUIRE_EQ(run("mhc_collapse", d), RAD_OK);
+    A e; e.t(h).t(xm).i("M", M).i("n", n).i("hc", hc).s("dtype", "f32");
+    REQUIRE_EQ(run("mhc_contract", e), RAD_OK);
+    for (int64_t i = 0; i < M * n; ++i) CHECK(std::fabs(x3.at(i) - xm.at(i)) <= 1e-6f * (1 + std::fabs(xm.at(i))));
+    /* A gate matrix of the wrong width is refused. */
+    T badpre(RAD_F32, {M, hc + 1});
+    A f; f.t(h).t(badpre).t(x3).i("M", M).i("n", n).i("hc", hc).s("dtype", "f32");
+    CHECK_EQ(run("mhc_collapse", f), RAD_E_SHAPE);
 }
 
 TEST(manifold_sinkhorn_first_pass_and_epsilon_are_distinct) {
@@ -964,7 +1004,8 @@ TEST(op_vocabulary) {
     static const char* kOps[] = {
         "rmsnorm", "rmsnorm_p", "rmsnorm_add", "hc_enter", "hc_read", "hc_write", "hc_project",
         "mtp_enter",
-        "mhc_pre", "mhc_pre_partial", "mhc_pre_finish", "mhc_post", "mhc_contract", "swiglu_clamped", "router_sigmoid_topk", "dsa_pool", "dsa_query", "dsa_score", "mla_attn", "mla_project", "gemm_nt_f32",
+        "mhc_pre", "mhc_pre_partial", "mhc_pre_finish", "mhc_post", "mhc_contract",
+        "mhc_mix", "mhc_collapse", "swiglu_clamped", "router_sigmoid_topk", "dsa_pool", "dsa_query", "dsa_score", "mla_attn", "mla_project", "gemm_nt_f32",
         "kda_update",
         "layernorm", "add", "mul", "mul_weight", "silu_mul", "gelu_mul", "act_mul", "seg_mean",
         "pool_rows", "relu", "clamp", "conv2d", "conv2d_unfold", "conv1d_dw", "rel_sinusoid",
@@ -8645,6 +8686,9 @@ std::vector<Geo> geometries() {
                                     .s("dtype", "f32")),
         G("mhc_post", "M", 3, a.i("M", R).i("n", 8).i("hc", 4).s("dtype", "f32")),
         G("mhc_contract", "M", 3, a.i("M", R).i("n", 8).i("hc", 4).s("dtype", "f32")),
+        G("mhc_mix", "M", 3, a.i("M", R).i("n", 8).i("hc", 4).i("iterations", 20).d("eps", 1e-5)
+                             .d("hc_eps", 1e-6).s("dtype", "f32")),
+        G("mhc_collapse", "M", 3, a.i("M", R).i("n", 8).i("hc", 4).s("dtype", "f32")),
         G("kda_update", "M", 3, a.i("M", R).i("heads", 2).i("head_k", 8).i("head_v", 8)
                                 .d("lower_bound", -5.0).d("scale", 0.35).d("l2_eps", 1e-6)
                                 .s("mode", "prefill").s("dtype", "f32")),

@@ -1157,6 +1157,14 @@ std::vector<Case> build_cases() {
     add("sub_i32", { HI("M", 1) });
     add("sub_i32", { HI("M", 37) });
 
+    /* DeepSeek-V4.1's ops, scaled down from the model (hc 4, 512-wide latent heads of 64-dim rope,
+     * a 4:1 and a 128:1 compressor, top-k over the compressed positions). */
+    for (const char* dt : { "f32", "bf16" }) {
+        add("mhc_mix", { HI("M", 3), HI("n", 129), HI("hc", 4), HI("iterations", 20),
+                         HF("eps", 1e-5), HF("hc_eps", 1e-6), HS("dtype", dt) });
+        add("mhc_collapse", { HI("M", 3), HI("n", 129), HI("hc", 4), HS("dtype", dt) });
+    }
+
     /* ================================================================== speed-only, at model size
      *
      * Timed by rad-avx-bench, skipped by rad-avx-check. The cases above are sized to break kernels;

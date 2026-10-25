@@ -139,6 +139,9 @@ static const RadOperandSpec oMhcPreFinish[] = { OPD("part"), OPD("h"), WGT("scal
     OUT("x"), OUT("post"), OUT("comb") };
 static const RadOperandSpec oMhcPost[] = { OPD("x"), OPD("h"), OPD("post"), OPD("comb"), OUT("out") };
 static const RadOperandSpec oMhcContract[] = { OPD("h"), OUT("x") };
+static const RadOperandSpec oMhcMix[] = { OPD("h"), WGT("fn"), WGT("scale"), WGT("base"),
+    OUT("pre"), OUT("post"), OUT("comb") };
+static const RadOperandSpec oMhcCollapse[] = { OPD("h"), OPD("pre"), OUT("x") };
 static const RadParamSpec pKdaUpdate[] = { P_INT("M"), P_INT("heads"), P_INT("head_k"),
     P_INT("head_v"), P_F64("lower_bound"), P_F64("scale"), P_F64("l2_eps"),
     P_STR("mode"), P_STR("dtype"), P_STRO("state_form") };
@@ -1069,6 +1072,14 @@ static const RadOpSchema kSchemas[] = {
   "out must not alias h. No normalization of the residual stream." },
 { "mhc_contract", ARR(pHcWrite), ARR(oMhcContract),
   "x[i] = mean over hc streams h[stream,i], rounded once to dtype." },
+{ "mhc_mix", ARR(pMhcPre), ARR(oMhcMix),
+  "mhc_pre without the collapse: the same RMS-scaled projection, gates and Sinkhorn mixing, with "
+  "the pre gates written to `pre` (f32 [M, hc]) instead of collapsing h. For models that collapse "
+  "a sublayer's input with gates an earlier sublayer computed (DeepSeek-V4.1); mhc_collapse "
+  "applies them." },
+{ "mhc_collapse", ARR(pHcWrite), ARR(oMhcCollapse),
+  "x[i] = sum over hc streams of pre[stream] * h[stream, i], accumulated in f32 and rounded once "
+  "to dtype. pre is f32 [M, hc]; with every pre 1/hc it is mhc_contract." },
 { "kda_update", ARR(pKdaUpdate), ARR(oKdaUpdate),
   "L2-normalized KDA: per-channel decay exp(lower_bound*sigmoid(exp(A_log)*(a+dt_bias))), "
   "beta=sigmoid(b), S*=decay; S+=beta*(v-S*k)*k; o=scale*S*q. State is f32 [slot,heads,V,K]. "
@@ -2102,6 +2113,10 @@ SIMPLE("ref_mhc_post", "mhc_post", "norm", "manifold residual source-to-destinat
        ref_mhc_post),
 SIMPLE("ref_mhc_contract", "mhc_contract", "norm", "mean of manifold residual streams", DT_FLOAT,
        ref_mhc_contract),
+SIMPLE("ref_mhc_mix", "mhc_mix", "norm", "manifold residual gates and Sinkhorn mixing, pre gates out", DT_FLOAT,
+       ref_mhc_mix),
+SIMPLE("ref_mhc_collapse", "mhc_collapse", "norm", "manifold residual streams collapsed by given gates", DT_FLOAT,
+       ref_mhc_collapse),
 SIMPLE("ref_kda_update", "kda_update", "gdn", "bounded per-channel delta recurrence and candidate rollback", DT_FLOAT,
        ref_kda_update),
 ROWL("ref_hc_read", "hc_read", "norm",

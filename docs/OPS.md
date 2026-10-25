@@ -198,6 +198,8 @@ at once. Run it before adding a kernel plugin; the loader names only the first c
 | `mhc_pre_finish` | `M`(range) `n` `hc` `iterations` `eps`:f64 `hc_eps`:f64 `chunk` `dtype` | `part`, `h`, `scale`w, `base`w → `x`, `post`, `comb` |
 | `mhc_post` | `M`(range) `n` `hc` `dtype` | `x`, `h`, `post`, `comb` → `out` |
 | `mhc_contract` | `M`(range) `n` `hc` `dtype` | `h` → `x` |
+| `mhc_mix` | `M`(range) `n` `hc` `iterations` `eps`:f64 `hc_eps`:f64 `dtype` | `h`, `fn`w, `scale`w, `base`w → `pre`, `post`, `comb` |
+| `mhc_collapse` | `M`(range) `n` `hc` `dtype` | `h`, `pre` → `x` |
 | `hc_read` | `M`(range) `n` `hc` `lowrank` `eps`:f64 `dtype` `wadd`:f64/opt `inject`/opt `group`/opt `rotate`/opt `mix`/opt | `h`, `w`w, `mix_down`w, `mix_up`w, `inject_w`w? → `x`, `inj`?, `q`?, `scale`?, `rq`?, `rscale`? |
 | `hc_write` | `M`(range) `n` `hc` `dtype` | `y`, `inj`, `h`:inout |
 | `hc_project` | `M`(range) `n` `hc` `scale`:f64 `dtype` | `h`:inout, `v`, `on` |

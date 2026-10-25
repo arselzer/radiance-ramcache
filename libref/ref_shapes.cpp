@@ -425,6 +425,30 @@ int ref_mhc_contract_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* 
     return o.finish("mhc_contract", operand, out);
 }
 
+int ref_mhc_mix_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0), hc = gi(p, n_p, "hc", 0);
+    if (M <= 0 || n <= 0 || hc < 2 || hc > 8) return RAD_E_UNSUPPORTED;
+    Opd o;
+    o.t(D, {M, hc * n});
+    o.t((uint32_t)RAD_F32, {hc * (hc + 2), hc * n});
+    o.t((uint32_t)RAD_F32, {3});
+    o.t((uint32_t)RAD_F32, {hc * (hc + 2)});
+    o.t((uint32_t)RAD_F32, {M, hc});
+    o.t((uint32_t)RAD_F32, {M, hc});
+    o.t((uint32_t)RAD_F32, {M, hc * hc});
+    return o.finish("mhc_mix", operand, out);
+}
+
+int ref_mhc_collapse_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0), hc = gi(p, n_p, "hc", 0);
+    if (M <= 0 || n <= 0 || hc < 2 || hc > 8) return RAD_E_UNSUPPORTED;
+    Opd o;
+    o.t(D, {M, hc * n}); o.t((uint32_t)RAD_F32, {M, hc}); o.t(D, {M, n});
+    return o.finish("mhc_collapse", operand, out);
+}
+
 int ref_hc_write_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const uint32_t D = act_dt(p, n_p);
     const int64_t M  = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);

@@ -229,3 +229,129 @@ int ref_attn_sparse_sink(const RadArgs* a, RadStream) {
     }
     return RAD_OK;
 }
+
+/* The indexer's score of each compressed position for each row: sum over heads h of
+ * relu(q_h . k_j) w_h, where k_j is entry j of the paged index cache (addressed as
+ * attn_sparse_sink's compressed entries). Rounded as the reference computes it in q's dtype: the
+ * dot, then relu(dot) w_h, then the head sum accumulated in f32, each rounded once to the dtype
+ * (no rounding for f32). A position the row has not passed, j >= (pos + 1) / ratio, or whose
+ * block is unmapped, scores -inf. score is f32 [M, width]. */
+int ref_index_score(const RadArgs* a, RadStream) {
+    if (!have(a, 7)) return RAD_E_INVAL;
+    const RadTensor &q = a->t[0], &w = a->t[1], &kc = a->t[2], &bt = a->t[3];
+    const RadTensor &pos = a->t[4], &cu = a->t[5], &sc = a->t[6];
+    const int64_t H = p_int(a, "heads", 0), Dm = p_int(a, "dim", 0), ratio = p_int(a, "ratio", 0);
+    if (H < 1 || Dm < 1 || ratio < 1 || Dm % ratio || q.rank != 2 || q.shape[0] < 1 ||
+        q.shape[1] != H * Dm || w.rank != 2 || w.shape[0] != q.shape[0] || w.shape[1] != H ||
+        w.dtype != RAD_F32 || kc.rank != 4 || kc.shape[1] != 1 || kc.shape[3] * ratio != Dm ||
+        kc.shape[2] % ratio || bt.rank != 2 || numel(&pos) != q.shape[0] || numel(&cu) < 2 ||
+        sc.rank != 2 || sc.shape[0] != q.shape[0] || sc.shape[1] < 1 || sc.dtype != RAD_F32)
+        return RAD_E_SHAPE;
+    const int64_t M = q.shape[0], C = sc.shape[1], S = numel(&cu) - 1, cbs = kc.shape[2];
+    const uint32_t dt = q.dtype;
+#pragma omp parallel for schedule(dynamic)
+    for (int64_t m = 0; m < M; ++m) {
+        const int64_t s = seq_of_row(cu, S, m);
+        const int64_t reach = (ld_int(pos.dtype, pos.data, offlin(&pos, m)) + 1) / ratio;
+        const int64_t qb = rowoff(&q, m, H * Dm), qs = laststride(&q);
+        for (int64_t j = 0; j < C; ++j) {
+            float v = -INFINITY;
+            const int64_t col = (j * ratio) / cbs;
+            if (j < reach && col < bt.shape[1]) {
+                const int64_t blk = ld_int(bt.dtype, bt.data, rowoff(&bt, s, bt.shape[1]) + col * laststride(&bt));
+                if (blk >= 0 && blk < kc.shape[0]) {
+                    const int64_t ko = (blk * cbs + (j * ratio) % cbs) * (Dm / ratio);
+                    float acc = 0;
+                    for (int64_t h = 0; h < H; ++h) {
+                        float dot = 0;
+                        for (int64_t d = 0; d < Dm; ++d)
+                            dot += ldt(&q, qb + (h * Dm + d) * qs) * ldt(&kc, ko + d);
+                        dot = round_dt(dt, dot);
+                        acc += round_dt(dt, std::max(dot, 0.0f) *
+                                                ldt(&w, rowoff(&w, m, H) + h * laststride(&w)));
+                    }
+                    v = round_dt(dt, acc);
+                }
+            }
+            stt(&sc, rowoff(&sc, m, C) + j * laststride(&sc), v);
+        }
+    }
+    return RAD_OK;
+}
+
+namespace {
+/* The k largest of v[0..n) by value, ties to the lower index, as indices (fewer when n < k). */
+std::vector<int64_t> top_indices(const std::vector<float>& v, int64_t k) {
+    std::vector<int64_t> idx(v.size());
+    for (size_t i = 0; i < idx.size(); ++i) idx[i] = (int64_t)i;
+    k = std::min<int64_t>(k, (int64_t)idx.size());
+    std::partial_sort(idx.begin(), idx.begin() + k, idx.end(), [&](int64_t x, int64_t y) {
+        return v[(size_t)x] > v[(size_t)y] || (v[(size_t)x] == v[(size_t)y] && x < y);
+    });
+    idx.resize((size_t)k);
+    return idx;
+}
+}  // namespace
+
+/* Level one of a two-level top-k: each `block` positions of a score row scores as its maximum
+ * (a short last block padded with -inf), the block holding the row's newest reachable position
+ * ((pos + 1) / ratio - 1) is pinned to +inf, and the topk_blocks highest blocks (ties to the lower
+ * block) are kept unless they score -inf. keep[m, j] is 1 inside a kept block, else 0. */
+int ref_index_candidates(const RadArgs* a, RadStream) {
+    if (!have(a, 3)) return RAD_E_INVAL;
+    const RadTensor &sc = a->t[0], &pos = a->t[1], &keep = a->t[2];
+    const int64_t block = p_int(a, "block", 0), kb = p_int(a, "topk_blocks", 0);
+    const int64_t ratio = p_int(a, "ratio", 0);
+    if (block < 1 || kb < 1 || ratio < 1 || sc.rank != 2 || sc.shape[0] < 1 || sc.shape[1] < 1 ||
+        sc.dtype != RAD_F32 || numel(&pos) != sc.shape[0] || keep.rank != 2 ||
+        keep.shape[0] != sc.shape[0] || keep.shape[1] != sc.shape[1])
+        return RAD_E_SHAPE;
+    const int64_t M = sc.shape[0], C = sc.shape[1], nb = (C + block - 1) / block;
+#pragma omp parallel for schedule(dynamic)
+    for (int64_t m = 0; m < M; ++m) {
+        std::vector<float> bs((size_t)nb, -INFINITY);
+        for (int64_t j = 0; j < C; ++j)
+            bs[(size_t)(j / block)] = std::max(bs[(size_t)(j / block)],
+                                               ldt(&sc, rowoff(&sc, m, C) + j * laststride(&sc)));
+        const int64_t reach = (ld_int(pos.dtype, pos.data, offlin(&pos, m)) + 1) / ratio;
+        if (reach >= 1 && (reach - 1) / block < nb) bs[(size_t)((reach - 1) / block)] = INFINITY;
+        std::vector<char> kept((size_t)nb, 0);
+        for (int64_t b : top_indices(bs, kb)) kept[(size_t)b] = bs[(size_t)b] > -INFINITY;
+        for (int64_t j = 0; j < C; ++j)
+            st_int(keep.dtype, keep.data, rowoff(&keep, m, C) + j * laststride(&keep),
+                   kept[(size_t)(j / block)] ? 1 : 0);
+    }
+    return RAD_OK;
+}
+
+/* The topk highest-scoring positions a row has passed (j < (pos + 1) / ratio), inside the kept
+ * positions when `keep` is given, never a -inf score; ties to the lower position; written in
+ * ascending position order, then -1 to topk. */
+int ref_index_topk(const RadArgs* a, RadStream) {
+    if (!a || a->n_t < 4 || !a->t) return RAD_E_INVAL;
+    const RadTensor &sc = a->t[0], &pos = a->t[2], &sel = a->t[3];
+    const RadTensor* keep = a->t[1].data ? &a->t[1] : nullptr;
+    const int64_t topk = p_int(a, "topk", 0), ratio = p_int(a, "ratio", 0);
+    if (topk < 1 || ratio < 1 || !sc.data || !pos.data || !sel.data || sc.rank != 2 ||
+        sc.shape[0] < 1 || sc.dtype != RAD_F32 || numel(&pos) != sc.shape[0] || sel.rank != 2 ||
+        sel.shape[0] != sc.shape[0] || sel.shape[1] != topk ||
+        (keep && (keep->rank != 2 || keep->shape[0] != sc.shape[0] || keep->shape[1] != sc.shape[1])))
+        return RAD_E_SHAPE;
+    const int64_t M = sc.shape[0], C = sc.shape[1];
+#pragma omp parallel for schedule(dynamic)
+    for (int64_t m = 0; m < M; ++m) {
+        const int64_t reach = std::min<int64_t>(C, (ld_int(pos.dtype, pos.data, offlin(&pos, m)) + 1) / ratio);
+        std::vector<float> v((size_t)std::max<int64_t>(reach, 0), -INFINITY);
+        for (int64_t j = 0; j < reach; ++j)
+            if (!keep || ld_int(keep->dtype, keep->data, rowoff(keep, m, C) + j * laststride(keep)))
+                v[(size_t)j] = ldt(&sc, rowoff(&sc, m, C) + j * laststride(&sc));
+        std::vector<int64_t> pick;
+        for (int64_t j : top_indices(v, topk))
+            if (v[(size_t)j] > -INFINITY) pick.push_back(j);
+        std::sort(pick.begin(), pick.end());
+        for (int64_t t = 0; t < topk; ++t)
+            st_int(sel.dtype, sel.data, rowoff(&sel, m, topk) + t * laststride(&sel),
+                   t < (int64_t)pick.size() ? pick[(size_t)t] : -1);
+    }
+    return RAD_OK;
+}

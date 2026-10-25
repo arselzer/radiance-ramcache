@@ -452,6 +452,15 @@ static const RadParamSpec pAttnSparseSink[] = { P_INT("M"), P_INT("heads"), P_IN
 static const RadOperandSpec oAttnSparseSink[] = { OPD("q"), OPD("window_cache"), OPD("window_bt"),
     OPD_O("comp_cache"), OPD_O("comp_bt"), OPD_O("sel"), OPD("positions"), OPD("cu_seqlens"),
     WGT("sinks"), OUT("out") };
+static const RadParamSpec pIndexScore[] = { P_INT("M"), P_INT("heads"), P_INT("dim"),
+    P_INT("ratio"), P_INT("width"), P_STR("dtype") };
+static const RadOperandSpec oIndexScore[] = { OPD("q"), OPD("w"), OPD("index_cache"), OPD("bt"),
+    OPD("positions"), OPD("cu_seqlens"), OUT("score") };
+static const RadParamSpec pIndexCand[] = { P_INT("M"), P_INT("width"), P_INT("block"),
+    P_INT("topk_blocks"), P_INT("ratio") };
+static const RadOperandSpec oIndexCand[] = { OPD("score"), OPD("positions"), OUT("keep") };
+static const RadParamSpec pIndexTopk[] = { P_INT("M"), P_INT("width"), P_INT("topk"), P_INT("ratio") };
+static const RadOperandSpec oIndexTopk[] = { OPD("score"), OPD_O("keep"), OPD("positions"), OUT("sel") };
 
 /* QSA's compressed key, libr4d's schema exactly (libr4d/r4d_rows.cpp): `block_size` is `ratio`
  * spelled for the block-key store's KV group; `page` and `pos` are optional. */
@@ -1452,6 +1461,17 @@ static const RadOpSchema kSchemas[] = {
   "the selected compressed entries c (tokens [c ratio, (c+1) ratio), block cbt[s][c ratio/cbs], "
   "cache [blocks,1,cbs,dim/ratio]). f32 scores q.k*scale, max floored at -1e30, "
   "out = sum p k / (sum p + exp(sink - max)), rounded once; a row with no key is zero." },
+{ "index_score", ARR(pIndexScore), ARR(oIndexScore),
+  "Per row and compressed position j: sum_h relu(q_h . k_j) w_h with k_j entry j of the paged "
+  "index cache; the dot, relu(dot) w_h and the f32 head sum each rounded once to dtype. "
+  "j >= (pos+1)/ratio or an unmapped block scores -inf. score is f32 [M, width]." },
+{ "index_candidates", ARR(pIndexCand), ARR(oIndexCand),
+  "Blocks of `block` positions scored by their maximum, the newest reachable block pinned to "
+  "+inf, the topk_blocks highest (ties to the lower block) kept unless -inf; keep is 1 inside "
+  "a kept block." },
+{ "index_topk", ARR(pIndexTopk), ARR(oIndexTopk),
+  "The topk highest-scoring passed positions (j < (pos+1)/ratio), inside keep when given, "
+  "never -inf, ties to the lower position, in ascending order, then -1." },
 { "rope_rows", ARR(pRopeRows), ARR(oRopeRows),
   "rope from a rope_table plane over columns [off, off+rot) of each head_dim-wide head of x, in "
   "place: gptj pairs adjacent columns, neox i with i+rot/2; (a,b)(c+is) in f32, rounded once; "
@@ -2379,6 +2399,9 @@ SIMPLE("ref_rope_table", "rope_table", "attn", "cos/sin at each position's own r
 SIMPLE("ref_rope_rows", "rope_rows", "attn", "rope from a cos/sin plane over a window of each head", DT_FLOAT, ref_rope_rows),
 SIMPLE("ref_quant_roundtrip", "quant_roundtrip", "quant", "block-scaled fp8/fp4 quantise-dequantise in place", DT_FLOAT, ref_quant_roundtrip),
 SIMPLE("ref_softmax_pool", "softmax_pool", "attn", "channel-wise softmax pooling of ratio rows", DT_FLOAT, ref_softmax_pool),
+SIMPLE("ref_index_score", "index_score", "attn", "indexer relu-gated head scores over a paged index cache", DT_FLOAT, ref_index_score),
+SIMPLE("ref_index_candidates", "index_candidates", "attn", "two-level top-k: kept candidate blocks", DT_ANY, ref_index_candidates),
+SIMPLE("ref_index_topk", "index_topk", "attn", "top-k passed positions in position order", DT_ANY, ref_index_topk),
 SIMPLE("ref_attn_sparse_sink", "attn_sparse_sink", "attn", "window plus selected compressed latent attention with sinks", DT_FLOAT, ref_attn_sparse_sink),
 SIMPLE("ref_qsa_block_key", "qsa_block_key", "attn",
        "QSA compressed key: pooled, normed and rotated at the block's position", DT_FLOAT,

@@ -3,10 +3,13 @@
  *   quant_roundtrip    the block-scaled quantise-dequantise round trip of a cached key
  *   softmax_pool       `ratio` rows folded into one compressed entry by a channel-wise softmax
  *   attn_sparse_sink   latent attention over a window and the selected compressed entries
+ *   index_score        the indexer's relu-gated head sum over a paged index cache
+ *   index_candidates   level one of the two-level top-k: the kept blocks
+ *   index_topk         level two: the selected positions, in position order
  *
- * Each kernel computes libref's expression. Where libref's result is exact (the round trip's codes
- * and scales) this one is the same bits; elsewhere it differs from libref only in summation
- * order: rows are widened to f32 once and reduced with this level's vector dot.
+ * Each kernel computes libref's expression. Where libref's result is exact (a selection's ids, the
+ * round trip's codes and scales) this one is the same bits; elsewhere it differs from libref only
+ * in summation order: rows are widened to f32 once and reduced with this level's vector dot.
  * Parallel regions are over rows and every output has one owner, so the bytes do not depend on the
  * team size. */
 #include "avx_vec.h"
@@ -291,6 +294,155 @@ AVX_KERNEL(attn_sparse_sink) {
             for (; d < D; ++d) acc[d] = acc[d] / den;
             out_row(&out, rowoff(&out, m, H * D) + h * D * os, D, acc);
         }
+    }
+    return RAD_OK;
+}
+
+/* The indexer's score of each compressed position for each row (libref's index_score): per head
+ * the dot q_h . k_j rounded to q's dtype, relu(dot) times the f32 head weight w_h rounded, the
+ * head sum in f32 rounded. The row's queries and head weights are read once; each live position's
+ * key is widened once and dotted with every head. */
+AVX_KERNEL(index_score) {
+    if (!rad_args_have(a, 7)) return RAD_E_INVAL;
+    const RadTensor &q = a->t[0], &w = a->t[1], &kc = a->t[2], &bt = a->t[3];
+    const RadTensor &pos = a->t[4], &cu = a->t[5], &sc = a->t[6];
+    const int64_t H = p_int(a, "heads", 0), Dm = p_int(a, "dim", 0), ratio = p_int(a, "ratio", 0);
+    if (H < 1 || Dm < 1 || ratio < 1 || Dm % ratio || q.rank != 2 || q.shape[0] < 1 ||
+        q.shape[1] != H * Dm || w.rank != 2 || w.shape[0] != q.shape[0] || w.shape[1] != H ||
+        w.dtype != RAD_F32 || kc.rank != 4 || kc.shape[1] != 1 || kc.shape[3] * ratio != Dm ||
+        kc.shape[2] % ratio || bt.rank != 2 || numel(&pos) != q.shape[0] || numel(&cu) < 2 ||
+        sc.rank != 2 || sc.shape[0] != q.shape[0] || sc.shape[1] < 1 || sc.dtype != RAD_F32)
+        return RAD_E_SHAPE;
+    const int64_t M = q.shape[0], C = sc.shape[1], S = numel(&cu) - 1, cbs = kc.shape[2];
+    const uint32_t dt = q.dtype;
+    const bool exact = dt == RAD_F32;
+    AVX_PARALLEL_FOR_IF(M * C * H * Dm >= AVX_PAR_MIN)
+    for (int64_t m = 0; m < M; ++m) {
+        float* buf = scratch_f32((size_t)(H * Dm + Dm + H + C + 16));
+        float* qv = buf;
+        float* kv = qv + H * Dm;
+        float* wh = kv + Dm;
+        float* row = wh + H;
+        const float* qr = in_row(&q, rowoff(&q, m, H * Dm), H * Dm, qv);
+        for (int64_t h = 0; h < H; ++h) wh[h] = ldt(&w, rowoff(&w, m, H) + h * laststride(&w));
+        const int64_t s = seq_of_row(cu, S, m);
+        const int64_t reach = (ldi(&pos, offlin(&pos, m)) + 1) / ratio;
+        for (int64_t j = 0; j < C; ++j) {
+            float v = -INFINITY;
+            const int64_t col = (j * ratio) / cbs;
+            if (j < reach && col < bt.shape[1]) {
+                const int64_t blk = ldi(&bt, rowoff(&bt, s, bt.shape[1]) + col * laststride(&bt));
+                if (blk >= 0 && blk < kc.shape[0]) {
+                    widen_flat(kc, (blk * cbs + (j * ratio) % cbs) * (Dm / ratio), Dm, kv);
+                    float acc = 0;
+                    for (int64_t h = 0; h < H; ++h) {
+                        float dot = dotf(qr + h * Dm, kv, Dm);
+                        if (!exact) dot = narrow1(dt, dot);
+                        const float t = std::max(dot, 0.0f) * wh[h];
+                        acc += exact ? t : narrow1(dt, t);
+                    }
+                    v = exact ? acc : narrow1(dt, acc);
+                }
+            }
+            row[j] = v;
+        }
+        out_row(&sc, rowoff(&sc, m, C), C, row);
+    }
+    return RAD_OK;
+}
+
+namespace {
+/* libref's order: higher value first, ties to the lower index; a strict total order, so any
+ * selection under it picks libref's set. */
+struct ByScore {
+    const float* v;
+    bool operator()(int64_t x, int64_t y) const {
+        return v[x] > v[y] || (v[x] == v[y] && x < y);
+    }
+};
+/* The k first indices of [0, n) under ByScore, in that order (fewer when n < k). */
+void top_indices(const float* v, int64_t n, int64_t k, std::vector<int64_t>* idx) {
+    idx->resize((size_t)n);
+    for (int64_t i = 0; i < n; ++i) (*idx)[(size_t)i] = i;
+    k = std::min(k, n);
+    if (k < n) std::nth_element(idx->begin(), idx->begin() + k, idx->end(), ByScore{ v });
+    idx->resize((size_t)k);
+    std::sort(idx->begin(), idx->end(), ByScore{ v });
+}
+}  // namespace
+
+/* Level one of the two-level top-k (libref's index_candidates): blocks of `block` positions
+ * scored by their maximum, the newest reachable block pinned to +inf, the topk_blocks best kept
+ * unless -inf. */
+AVX_KERNEL(index_candidates) {
+    if (!rad_args_have(a, 3)) return RAD_E_INVAL;
+    const RadTensor &sc = a->t[0], &pos = a->t[1], &keep = a->t[2];
+    const int64_t block = p_int(a, "block", 0), kb = p_int(a, "topk_blocks", 0);
+    const int64_t ratio = p_int(a, "ratio", 0);
+    if (block < 1 || kb < 1 || ratio < 1 || sc.rank != 2 || sc.shape[0] < 1 || sc.shape[1] < 1 ||
+        sc.dtype != RAD_F32 || numel(&pos) != sc.shape[0] || keep.rank != 2 ||
+        keep.shape[0] != sc.shape[0] || keep.shape[1] != sc.shape[1])
+        return RAD_E_SHAPE;
+    const int64_t M = sc.shape[0], C = sc.shape[1], nb = (C + block - 1) / block;
+    AVX_PARALLEL_FOR_IF(M * C >= AVX_PAR_MIN)
+    for (int64_t m = 0; m < M; ++m) {
+        float* buf = scratch_f32((size_t)(C + nb + 16));
+        float* row = buf;
+        float* bsc = row + C;
+        const float* r = in_row(&sc, rowoff(&sc, m, C), C, row);
+        /* std::max(running, v): a NaN score never wins a block, as in libref. */
+        for (int64_t b = 0; b < nb; ++b) {
+            float mx = -INFINITY;
+            for (int64_t j = b * block, e = std::min(C, j + block); j < e; ++j) mx = std::max(mx, r[j]);
+            bsc[b] = mx;
+        }
+        const int64_t reach = (ldi(&pos, offlin(&pos, m)) + 1) / ratio;
+        if (reach >= 1 && (reach - 1) / block < nb) bsc[(reach - 1) / block] = INFINITY;
+        static thread_local std::vector<int64_t> idx;
+        static thread_local std::vector<char> kept;
+        top_indices(bsc, nb, kb, &idx);
+        kept.assign((size_t)nb, 0);
+        for (int64_t b : idx) kept[(size_t)b] = bsc[b] > -INFINITY;
+        const int64_t kbase = rowoff(&keep, m, C), ks = laststride(&keep);
+        for (int64_t j = 0; j < C; ++j) st_int_dt(keep.dtype, keep.data, kbase + j * ks, kept[(size_t)(j / block)] ? 1 : 0);
+    }
+    return RAD_OK;
+}
+
+/* Level two (libref's index_topk): the topk best positions the row has passed, inside `keep` when
+ * given, never -inf, ties to the lower position, written in position order then -1. */
+AVX_KERNEL(index_topk) {
+    if (!a || a->n_t < 4 || !a->t) return RAD_E_INVAL;
+    const RadTensor &sc = a->t[0], &pos = a->t[2], &sel = a->t[3];
+    const RadTensor* keep = a->t[1].data ? &a->t[1] : nullptr;
+    const int64_t topk = p_int(a, "topk", 0), ratio = p_int(a, "ratio", 0);
+    if (topk < 1 || ratio < 1 || !sc.data || !pos.data || !sel.data || sc.rank != 2 ||
+        sc.shape[0] < 1 || sc.dtype != RAD_F32 || numel(&pos) != sc.shape[0] || sel.rank != 2 ||
+        sel.shape[0] != sc.shape[0] || sel.shape[1] != topk ||
+        (keep && (keep->rank != 2 || keep->shape[0] != sc.shape[0] || keep->shape[1] != sc.shape[1])))
+        return RAD_E_SHAPE;
+    const int64_t M = sc.shape[0], C = sc.shape[1];
+    AVX_PARALLEL_FOR_IF(M * C >= AVX_PAR_MIN)
+    for (int64_t m = 0; m < M; ++m) {
+        const int64_t reach = std::min<int64_t>(C, (ldi(&pos, offlin(&pos, m)) + 1) / ratio);
+        const int64_t n = std::max<int64_t>(reach, 0);
+        float* v = scratch_f32((size_t)(C + 16));
+        const float* r = in_row(&sc, rowoff(&sc, m, C), C, v);
+        if (r != v) std::memcpy(v, r, (size_t)n * sizeof(float));
+        if (keep) {
+            const int64_t kbase = rowoff(keep, m, C), ks = laststride(keep);
+            for (int64_t j = 0; j < n; ++j)
+                if (!ld_int_dt(keep->dtype, keep->data, kbase + j * ks)) v[j] = -INFINITY;
+        }
+        static thread_local std::vector<int64_t> idx;
+        top_indices(v, n, topk, &idx);
+        int64_t np = 0;
+        for (int64_t j : idx)
+            if (v[j] > -INFINITY) idx[(size_t)np++] = j;
+        std::sort(idx.begin(), idx.begin() + np);
+        const int64_t sb = rowoff(&sel, m, topk), ss = laststride(&sel);
+        for (int64_t t = 0; t < topk; ++t)
+            st_int_dt(sel.dtype, sel.data, sb + t * ss, t < np ? idx[(size_t)t] : -1);
     }
     return RAD_OK;
 }

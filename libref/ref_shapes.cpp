@@ -1671,6 +1671,46 @@ int ref_attn_sparse_sink_shape(const RadParam* p, int n_p, int operand, RadOpdDe
     return o.finish("attn_sparse_sink", operand, out);
 }
 
+int ref_index_score_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), H = gi(p, n_p, "heads", 0), Dm = gi(p, n_p, "dim", 0);
+    const int64_t ratio = gi(p, n_p, "ratio", 0), C = gi(p, n_p, "width", 0);
+    if (M <= 0 || H < 1 || Dm < 1 || ratio < 1 || Dm % ratio || C < 1) return RAD_E_UNSUPPORTED;
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t ncb = C + 1;
+    Opd o;
+    o.t(D, { M, H * Dm });                              /* q */
+    o.t((uint32_t)RAD_F32, { M, H });                   /* head weights */
+    o.t(D, { ncb, 1, ratio, Dm / ratio });              /* index cache: an entry a block */
+    o.t_idx({ 1, ncb }, ncb, -1, 0);                    /* block table */
+    o.t_idx({ M }, M, -1, 0);                           /* positions */
+    o.t_idx({ 2 }, M, -1, (uint32_t)RAD_OPD_F_IDX_CU);  /* cu_seqlens */
+    o.t((uint32_t)RAD_F32, { M, C });                   /* score */
+    return o.finish("index_score", operand, out);
+}
+
+int ref_index_candidates_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), C = gi(p, n_p, "width", 0);
+    if (M <= 0 || C < 1 || gi(p, n_p, "block", 0) < 1 || gi(p, n_p, "topk_blocks", 0) < 1 ||
+        gi(p, n_p, "ratio", 0) < 1)
+        return RAD_E_UNSUPPORTED;
+    Opd o;
+    o.t((uint32_t)RAD_F32, { M, C });                   /* score */
+    o.t_idx({ M }, M, -1, 0);                           /* positions */
+    o.t((uint32_t)RAD_I32, { M, C });                   /* keep */
+    return o.finish("index_candidates", operand, out);
+}
+
+int ref_index_topk_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), C = gi(p, n_p, "width", 0), k = gi(p, n_p, "topk", 0);
+    if (M <= 0 || C < 1 || k < 1 || gi(p, n_p, "ratio", 0) < 1) return RAD_E_UNSUPPORTED;
+    Opd o;
+    o.t((uint32_t)RAD_F32, { M, C });                   /* score */
+    o.skip();                                           /* keep, optional */
+    o.t_idx({ M }, M, -1, 0);                           /* positions */
+    o.t((uint32_t)RAD_I32, { M, k });                   /* sel */
+    return o.finish("index_topk", operand, out);
+}
+
 int ref_qsa_block_key_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = gi(p, n_p, "M", 0);
     const int64_t n = gi(p, n_p, "n", 0);

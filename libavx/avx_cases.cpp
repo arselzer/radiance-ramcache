@@ -1189,7 +1189,15 @@ std::vector<Case> build_cases() {
                                   HI("ratio", 0), HI("topk", 0), HF("scale", 0.125), HS("dtype", dt) });
         add("attn_sparse_sink", { HI("M", 9), HI("heads", 3), HI("dim", 64), HI("window", 8),
                                   HI("ratio", 4), HI("topk", 5), HF("scale", 0.125), HS("dtype", dt) });
+        add("index_score", { HI("M", 9), HI("heads", 4), HI("dim", 64), HI("ratio", 4),
+                             HI("width", 13), HS("dtype", dt) });
     }
+    add("index_candidates", { HI("M", 9), HI("width", 40), HI("block", 8), HI("topk_blocks", 2),
+                              HI("ratio", 1) });
+    add("index_candidates", { HI("M", 6), HI("width", 21), HI("block", 4), HI("topk_blocks", 3),
+                              HI("ratio", 1) });
+    add("index_topk", { HI("M", 9), HI("width", 17), HI("topk", 4), HI("ratio", 1) });
+    add("index_topk", { HI("M", 9), HI("width", 9), HI("topk", 4), HI("ratio", 2) });
 
     /* ================================================================== speed-only, at model size
      *

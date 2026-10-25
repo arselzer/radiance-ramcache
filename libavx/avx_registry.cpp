@@ -383,6 +383,15 @@ static const RadParamSpec pAttnSparseSink[] = { P_INT("M"), P_INT("heads"), P_IN
 static const RadOperandSpec oAttnSparseSink[] = { OPD("q"), OPD("window_cache"), OPD("window_bt"),
     OPD_O("comp_cache"), OPD_O("comp_bt"), OPD_O("sel"), OPD("positions"), OPD("cu_seqlens"),
     WGT("sinks"), OUT("out") };
+static const RadParamSpec pIndexScore[] = { P_INT("M"), P_INT("heads"), P_INT("dim"),
+    P_INT("ratio"), P_INT("width"), P_STR("dtype") };
+static const RadOperandSpec oIndexScore[] = { OPD("q"), OPD("w"), OPD("index_cache"), OPD("bt"),
+    OPD("positions"), OPD("cu_seqlens"), OUT("score") };
+static const RadParamSpec pIndexCand[] = { P_INT("M"), P_INT("width"), P_INT("block"),
+    P_INT("topk_blocks"), P_INT("ratio") };
+static const RadOperandSpec oIndexCand[] = { OPD("score"), OPD("positions"), OUT("keep") };
+static const RadParamSpec pIndexTopk[] = { P_INT("M"), P_INT("width"), P_INT("topk"), P_INT("ratio") };
+static const RadOperandSpec oIndexTopk[] = { OPD("score"), OPD_O("keep"), OPD("positions"), OUT("sel") };
 
 /* QSA's compressed key, libr4d's schema (libr4d/r4d_rows.cpp): `block_size` is `ratio` under the
  * name the block-key store's KV group uses; `page` and `pos` are optional. */
@@ -1096,6 +1105,12 @@ static const RadOpSchema kSchemas[] = {
   "channel-wise softmax pooling of `ratio` rows into one entry; a negative page skips it." },
 { "attn_sparse_sink", ARR(pAttnSparseSink), ARR(oAttnSparseSink),
   "latent attention with a per-head sink over the window and the selected compressed entries." },
+{ "index_score", ARR(pIndexScore), ARR(oIndexScore),
+  "the indexer's relu-gated head sum per row and compressed position, -inf where not passed." },
+{ "index_candidates", ARR(pIndexCand), ARR(oIndexCand),
+  "level one of the two-level top-k: the kept blocks, the newest reachable pinned." },
+{ "index_topk", ARR(pIndexTopk), ARR(oIndexTopk),
+  "the topk best passed positions inside keep, in position order, then -1." },
 { "qsa_block_key", ARR(pQsaBlockKey), ARR(oQsaBlockKey),
   "QSA's compressed key: the mean of a block's `ratio` rows rounded to k's dtype, RMS-normed with "
   "gain (wadd + w), rotated at the block's position with `rope`'s ladder and YaRN; libref's "
@@ -1693,6 +1708,12 @@ SIMPLE("avx_softmax_pool", "softmax_pool", "attn", "channel-wise softmax pooling
        DT_FLOAT, L(softmax_pool)),
 SIMPLE("avx_attn_sparse_sink", "attn_sparse_sink", "attn",
        "window plus selected compressed latent attention with sinks", DT_FLOAT, L(attn_sparse_sink)),
+SIMPLE("avx_index_score", "index_score", "attn",
+       "indexer relu-gated head scores over a paged index cache", DT_FLOAT, L(index_score)),
+SIMPLE("avx_index_candidates", "index_candidates", "attn", "two-level top-k: kept candidate blocks",
+       DT_ANY, L(index_candidates)),
+SIMPLE("avx_index_topk", "index_topk", "attn", "top-k passed positions in position order", DT_ANY,
+       L(index_topk)),
 SIMPLE("avx_qsa_block_key", "qsa_block_key", "attn",
        "QSA compressed key: pooled, normed and rotated at the block's position", DT_FLOAT,
        L(qsa_block_key)),

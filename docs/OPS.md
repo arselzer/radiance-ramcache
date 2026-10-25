@@ -875,6 +875,9 @@ as the weight's GEMM stored them and claims no form. It changes no value.
 | `quant_roundtrip` | `M`(range) `n` `block` `format`:str `scale`:str `dtype` | `x`:inout |
 | `softmax_pool` | `M`(range) `n` `ratio` `dtype` | `stage` → `out`; `page`? |
 | `attn_sparse_sink` | `M`(range) `heads` `dim` `window` `ratio` `topk` `scale`:f64 `dtype` | `q`, `window_cache`, `window_bt`, `comp_cache`?, `comp_bt`?, `sel`?, `positions`, `cu_seqlens`, `sinks`w → `out` |
+| `index_score` | `M`(range) `heads` `dim` `ratio` `width` `dtype` | `q`, `w`, `index_cache`, `bt`, `positions`, `cu_seqlens` → `score` |
+| `index_candidates` | `M`(range) `width` `block` `topk_blocks` `ratio` | `score`, `positions` → `keep` |
+| `index_topk` | `M`(range) `width` `topk` `ratio` | `score`, `keep`?, `positions` → `sel` |
 | `qk_norm_rope` | `M`(range) `head_dim` `n_head` `n_head_kv` `theta`:f64 `eps`:f64 `scale`:f64/opt `mode`/opt `rotary_dim`/opt `wadd`:f64/opt `v_norm`/opt `sections`/opt `comps`/opt | `qkv`:inout, `positions`?, `q_w`w?, `k_w`w? |
 | `qkv_norm_rope` | `M`(range) `head_dim` `n_head` `n_head_kv` `theta`:f64 `eps`:f64 `scale`:f64/opt `mode`/opt `rotary_dim`/opt `ladder`/opt `wadd`:f64/opt `v_from_k`/opt `v_norm`/opt `dtype` | `q`:inout, `k`:inout, `v`:inout, `positions`, `q_w`w, `k_w`w |
 | `qkv_norm_rope_kv_store` | `M`(range) `head_dim` `n_head` `n_head_kv` `theta`:f64 `eps`:f64 `scale`:f64/opt `mode`/opt `rotary_dim`/opt `ladder`/opt `wadd`:f64/opt `v_from_k`/opt `dtype` `v_norm`/opt `block_size` `kv_dtype` `k_scale`:f64/opt `v_scale`:f64/opt | `q`:inout, `k`:inout, `v`:inout, `positions`, `q_w`w, `k_w`w, `slot_mapping`, `kv_cache`:inout |

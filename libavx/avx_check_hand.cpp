@@ -4802,6 +4802,33 @@ void audio_cases(std::vector<Hand>& hs) {
 void ds41_cases(std::vector<Hand>& hs) {
     /* ---- the selections' optional operands and skipped rows ------------------------------ */
     {
+        /* keep from index_candidates' shape: two blocks of four kept a row, one row keeping none
+         * it can reach. Positions past the width, before it and at its edge. */
+        const int64_t M = 4, C = 16, K = 5;
+        std::vector<float> keep((size_t)(M * C));
+        for (int64_t m = 0; m < M; ++m)
+            for (int64_t j = 0; j < C; ++j)
+                keep[(size_t)(m * C + j)] = m == 3 ? (j >= 12 ? 1.0f : 0.0f)
+                                                   : (((j / 4) + m) % 2 == 0 ? 1.0f : 0.0f);
+        Hand h("keep given; reach 0, 8, 5 and past the width", "index_topk", 0.0);
+        h.dense(RAD_F32, { M, C }, hfill(61))
+         .dense(RAD_I32, { M, C }, [keep](int64_t i) { return keep[(size_t)i]; })
+         .idx({ 0, 15, 40, 9 })
+         .dense(RAD_I32, { M, K }, [](int64_t) { return 7.0f; }, true)
+         .pi("M", M).pi("width", C).pi("topk", K).pi("ratio", 2);
+        hs.push_back(std::move(h));
+    }
+    {
+        /* Ties: equal scores in a block and across blocks pick the lower index. */
+        const int64_t M = 2, C = 12;
+        Hand h("tied block maxima, the newest reachable block pinned", "index_candidates", 0.0);
+        h.dense(RAD_F32, { M, C }, [](int64_t i) { return (float)((i % 5) == 0 ? 2 : (i % 3)); })
+         .idx({ 11, 2 })
+         .dense(RAD_I32, { M, C }, [](int64_t) { return 9.0f; }, true)
+         .pi("M", M).pi("width", C).pi("block", 3).pi("topk_blocks", 2).pi("ratio", 1);
+        hs.push_back(std::move(h));
+    }
+    {
         Hand h("a negative page skips its entry", "softmax_pool", 1e-6);
         h.dense(RAD_F32, { 3 * 4, 2 * 40 }, hfill(62, 2.0f))
          .dense(RAD_BF16, { 3, 40 }, hfill(63), true)

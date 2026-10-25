@@ -576,6 +576,70 @@ TEST(attn_sparse_sink_reads_the_window_and_the_selected_entries) {
     CHECK_EQ(run("attn_sparse_sink", b), RAD_E_SHAPE);
 }
 
+/* index_score: row 0 (position 3, ratio 2) has passed entries 0 (block 1) and 1 (block 0) and
+ * scores entry 2 -inf; row 1 (position 0) has passed none. */
+TEST(index_score_gates_relu_dots_per_head_and_masks_the_future) {
+    const int64_t H = 2, D = 4;
+    T q(RAD_F32, {2, H * D}), w(RAD_F32, {2, H}), kc(RAD_F32, {3, 1, 2, D / 2});
+    for (int64_t i = 0; i < 2 * H * D; ++i) q.set(i, std::sin(1.3f * (float)i));
+    w.f({0.7f, -0.4f, 1.0f, 1.0f});
+    for (int64_t i = 0; i < 3 * D; ++i) kc.set(i, std::cos(0.8f * (float)i + 0.2f));
+    T bt(RAD_I32, {1, 3}); bt.n({1, 0, 2});
+    T pos(RAD_I32, {2}); pos.n({3, 0});
+    T cu(RAD_I32, {2}); cu.n({0, 2});
+    T sc(RAD_F32, {2, 3});
+    A a; a.t(q).t(w).t(kc).t(bt).t(pos).t(cu).t(sc).i("M", 2).i("heads", H).i("dim", D).i("ratio", 2)
+        .i("width", 3).s("dtype", "f32");
+    REQUIRE_EQ(run("index_score", a), RAD_OK);
+    const int64_t koff[2] = {4, 0};   /* entry 0 -> block 1, entry 1 -> block 0 */
+    for (int j = 0; j < 2; ++j) {
+        double e = 0;
+        for (int64_t h = 0; h < H; ++h) {
+            double dot = 0;
+            for (int64_t d = 0; d < D; ++d) dot += (double)q.at(h * D + d) * kc.at(koff[j] + d);
+            e += std::max(dot, 0.0) * w.at(h);
+        }
+        CHECK(std::fabs(sc.at(j) - e) < 1e-5);
+    }
+    CHECK(std::isinf(sc.at(2)) && sc.at(2) < 0);
+    for (int j = 0; j < 3; ++j) CHECK(std::isinf(sc.at(3 + j)) && sc.at(3 + j) < 0);
+}
+
+/* index_candidates: blocks of 8 over 20 positions. Row 0 (position 17, ratio 1) pins block 2 and
+ * keeps the better of blocks 0 and 1; row 1 (position 3) pins block 0, and the -inf blocks it
+ * could also pick stay out. */
+TEST(index_candidates_keeps_the_best_blocks_and_pins_the_newest) {
+    const int64_t C = 20;
+    T sc(RAD_F32, {2, C});
+    for (int64_t j = 0; j < C; ++j) sc.set(j, j < 18 ? (j == 5 ? 5.0f : (j == 12 ? 7.0f : 0.0f)) : -INFINITY);
+    for (int64_t j = 0; j < C; ++j) sc.set(C + j, j < 4 ? 1.0f : -INFINITY);
+    T pos(RAD_I32, {2}); pos.n({17, 3});
+    T keep(RAD_I32, {2, C});
+    A a; a.t(sc).t(pos).t(keep).i("M", 2).i("width", C).i("block", 8).i("topk_blocks", 2).i("ratio", 1);
+    REQUIRE_EQ(run("index_candidates", a), RAD_OK);
+    for (int64_t j = 0; j < C; ++j) CHECK_EQ(keep.iat(j), j >= 8 ? 1 : 0);
+    for (int64_t j = 0; j < C; ++j) CHECK_EQ(keep.iat(C + j), j < 8 ? 1 : 0);
+}
+
+/* index_topk: the passed positions only, inside keep, ties to the lower position, ascending, -1
+ * padded. */
+TEST(index_topk_selects_passed_positions_in_order) {
+    T sc(RAD_F32, {3, 6});
+    sc.f({1, 5, 3, 5, 2, 9,   1, 5, 3, 5, 2, 9,   4, 4, 4, 4, 4, 4});
+    T pos(RAD_I32, {3}); pos.n({9, 9, 7});
+    T sel(RAD_I32, {3, 3});
+    A a; a.t(sc).tnull().t(pos).t(sel).i("M", 3).i("width", 6).i("topk", 3).i("ratio", 2);
+    REQUIRE_EQ(run("index_topk", a), RAD_OK);
+    const int64_t e0[9] = {1, 2, 3,  1, 2, 3,  0, 1, 2};
+    for (int i = 0; i < 9; ++i) CHECK_EQ(sel.iat(i), e0[i]);
+    T keep(RAD_I32, {3, 6}); keep.n({1, 1, 0, 1, 1, 1,  1, 1, 1, 1, 1, 1,  0, 0, 0, 1, 0, 0});
+    T pos2(RAD_I32, {3}); pos2.n({9, 2, 7});
+    A b; b.t(sc).t(keep).t(pos2).t(sel).i("M", 3).i("width", 6).i("topk", 3).i("ratio", 2);
+    REQUIRE_EQ(run("index_topk", b), RAD_OK);
+    const int64_t e1[9] = {1, 3, 4,  0, -1, -1,  3, -1, -1};
+    for (int i = 0; i < 9; ++i) CHECK_EQ(sel.iat(i), e1[i]);
+}
+
 TEST(manifold_sinkhorn_first_pass_and_epsilon_are_distinct) {
     T h(RAD_F32, {1, 2}); h.f({1, 3});
     T fn(RAD_F32, {8, 2}), scale(RAD_F32, {3}); scale.f({1, 1, 1});
@@ -1224,7 +1288,7 @@ TEST(op_vocabulary) {
         "rmsnorm", "rmsnorm_p", "rmsnorm_add", "hc_enter", "hc_read", "hc_write", "hc_project",
         "mtp_enter",
         "mhc_pre", "mhc_pre_partial", "mhc_pre_finish", "mhc_post", "mhc_contract",
-        "mhc_mix", "mhc_collapse", "swiglu_clamped", "router_sigmoid_topk", "router_scored_topk", "rope_rows", "quant_roundtrip", "softmax_pool", "attn_sparse_sink", "dsa_pool", "dsa_query", "dsa_score", "mla_attn", "mla_project", "gemm_nt_f32",
+        "mhc_mix", "mhc_collapse", "swiglu_clamped", "router_sigmoid_topk", "router_scored_topk", "rope_rows", "quant_roundtrip", "softmax_pool", "attn_sparse_sink", "index_score", "index_candidates", "index_topk", "dsa_pool", "dsa_query", "dsa_score", "mla_attn", "mla_project", "gemm_nt_f32",
         "kda_update",
         "layernorm", "add", "mul", "mul_weight", "silu_mul", "gelu_mul", "act_mul", "seg_mean",
         "pool_rows", "relu", "clamp", "conv2d", "conv2d_unfold", "conv1d_dw", "rel_sinusoid",
@@ -8800,6 +8864,11 @@ std::vector<Geo> geometries() {
         G("softmax_pool", "M", 3, a.i("M", R).i("n", 8).i("ratio", 2).s("dtype", "bf16")),
         G("attn_sparse_sink", "M", 3, a.i("M", R).i("heads", 2).i("dim", 8).i("window", 4).i("ratio", 2)
                                       .i("topk", 3).d("scale", 0.35).s("dtype", "f32")),
+        G("index_score", "M", 3, a.i("M", R).i("heads", 2).i("dim", 8).i("ratio", 2).i("width", 5)
+                                 .s("dtype", "bf16")),
+        G("index_candidates", "M", 3, a.i("M", R).i("width", 20).i("block", 8).i("topk_blocks", 2)
+                                      .i("ratio", 1)),
+        G("index_topk", "M", 3, a.i("M", R).i("width", 9).i("topk", 4).i("ratio", 2)),
         G("rope_rows", "M", 3, a.i("M", R).i("n_head", 2).i("head_dim", 12).i("rot", 8).i("off", 4)
                                .s("mode", "gptj").i("inverse", 0).s("dtype", "f32")),
         G("qsa_block_key", "M", 2, a.i("M", R).i("n", 32).i("ratio", 4).i("rotary_dim", 8)

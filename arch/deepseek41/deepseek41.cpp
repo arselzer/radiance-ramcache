@@ -19,9 +19,11 @@
  *   ffn connection           mhc_mix ; mhc_collapse ; MoeFP8 (norm, router, experts) ; mhc_post
  * then mhc_collapse with the last gates, the final norm and the head.
  *
- * This first form is one rank and bf16 linears, without the MTP head; the rest is refused by name. */
+ * The checkpoint's DSpark drafter (mtp.0 .. mtp.{n-1}, when the container carries its stages as
+ * blk.{n_layer}.. with `nextn_predict_layers`) runs on the block-drafter protocol: see struct Dsp. */
 #include <arch/rad_block_moe_fp8.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -230,6 +232,58 @@ struct Layer {
     rad_weight ffn_norm = 0;
     rad_op mix_f = 0, col_f = 0, norm_f = 0, post_f = 0;
     MoeFP8 moe{};
+    /* A DSpark target layer: the hc mean of its input streams (after its Engram) into column slice
+     * `tap_col` of the drafter's source rows. */
+    rad_op tap = 0;
+    int tap_col = -1;
+    /* A DSpark stage's context pass: its window key from the projected trunk rows. */
+    rad_op d_kv = 0, d_kvn = 0, d_kvrope = 0, d_kvq = 0, d_kvst = 0;
+};
+
+/* The DSpark block drafter (the checkpoint's mtp.0 .. mtp.{n-1}; official inference/model.py DSparkBlock,
+ * forward_spec), on the engine's block-drafter protocol (docs/PLUGIN.md, RAD_DRAFT_BLOCK):
+ *
+ *   trunk step    each target layer's input streams (after its Engram) collapse to their hc mean
+ *                 (mhc_contract) into one column slice of `src` [T, n_taps * D]: model.py's main_hiddens.
+ *   context pass  one row per trunk row: main_x = main_norm(main_proj(src)); per stage the window key
+ *                 kv_norm(wkv(main_x)), rotated at the row's position, fp8 round trip, into the stage's
+ *                 layer of the drafter's window cache. The stages' blocks never run over the context
+ *                 (DSparkBlock.forward at start_pos 0 only seeds the cache, and each decode step writes the
+ *                 committed token's key from its main_x).
+ *   query pass    `block` rows a sequence, [anchor, noise x (block - 1)] at the anchor's position on: the
+ *                 trunk's embedding into hc copies, identity pre gates, then each stage a full V4 block
+ *                 (hc mix, window-only latent attention, MoE) whose attention reads the last `window`
+ *                 context keys before the anchor plus all `block` keys of its own rows, non-causal
+ *                 (get_dspark_topk_idxs): attn_sparse_sink over the drafter's cache with window
+ *                 `window + block` and every row placed at its block's last position (iota + add over
+ *                 the positions), while rope uses each row's own. The head: hc collapse with the last
+ *                 stage's ffn gates, the stage's norm, the trunk's lm_head; the Markov bias
+ *                 W2 . W1[prev] walked greedily over the head's top `cand` (dflash_select, as
+ *                 arch/common/rad_block_dspark.h) into the proposal buffer. Every row predicts the token
+ *                 after it (forward_head: logits[i] + bias(output_ids[i]) -> output_ids[i + 1]), so the
+ *                 block is the depth.
+ *   not applied   the confidence head (adaptive block length; it changes no proposal), and the bias
+ *                 from outside the head's top `cand` (the walk's only approximation, acceptance only). */
+struct Dsp {
+    bool on = false;
+    int base = 0, n_stage = 0;            /* stages at absolute layers base .. base + n_stage - 1 */
+    int64_t block = 0, noise = -1, rank = 0, n_expert = 0, top_k = 0, cand = 0, Q = 0;
+    std::vector<int64_t> taps;            /* target layers, ascending (main_hiddens' order) */
+    rad_kvgroup kv = 0;
+    int64_t kv_bs = 0;
+    /* the trunk's taps and the context pass, max_tok rows */
+    rad_buf src = 0, c = 0, cn = 0, ckv = 0, ckvn = 0;
+    /* the query pass, Q rows */
+    rad_buf x = 0, xn = 0, h0 = 0, h1 = 0, pre_a = 0, pre_f = 0, post = 0, comb = 0;
+    rad_buf qr = 0, qrn = 0, q = 0, kv_ = 0, kvn = 0, o = 0, oa = 0, attn_out = 0, poff = 0, apos = 0;
+    rad_buf fin = 0, rows = 0, logits = 0, cand_ = 0, unary = 0, pairs = 0, gath = 0, tokens = 0;
+    ActFP8 act{};
+    MoeFP8::Wire mw{};
+    rad_weight fc = 0, main_norm = 0, norm = 0, mk1 = 0, mk2 = 0;
+    rad_op c_tab = 0, c_fc = 0, c_norm = 0, sizing = 0;
+    rad_op embed = 0, embed_ar = 0, expand = 0, pre0 = 0, pre1 = 0, q_tab = 0, poff_op = 0, apos_op = 0;
+    rad_op contract = 0, fnorm = 0, gather = 0, head = 0, topk = 0, pgather = 0, merge = 0, select = 0;
+    std::vector<Layer> st;
 };
 
 struct Model {
@@ -267,6 +321,7 @@ struct Model {
     int64_t ple_group = 0;
     rad_op embed = 0, expand = 0, pre0 = 0, pre1 = 0, rope_a = 0, rope_b_step = 0, tok_map = 0;
     rad_op contract = 0, fnorm = 0, gather = 0, head_op = 0, embed_ar = 0;
+    Dsp dsp{};
 };
 static std::unique_ptr<Model> models[MAX_RANKS];
 
@@ -631,6 +686,17 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
                       {}, { m.h1 }, { m.h0 });
     }
 
+    /* ---- a DSpark target: the attention input's hc mean (model.py main_hiddens), after the Engram */
+    if (m.dsp.on && !m.zero)   /* the context pass is an attention rank's */
+        for (size_t j = 0; j < m.dsp.taps.size(); ++j)
+            if (m.dsp.taps[j] == l) {
+                L.tap_col = (int)j;
+                L.tap = op(b, "mhc_contract",
+                           { RAD_RANGE("M", 1, T), RAD_INT("n", D), RAD_INT("hc", c.hc), RAD_STR("dtype", "bf16") },
+                           {}, { m.h0 }, { m.dsp.src });
+                if (!L.tap) return RAD_E_INVAL;
+            }
+
     /* ---- the attention connection */
     L.hc_a_fn = w("blk.%d.hc_attn_fn.weight", RAD_F32, { mix, c.hc * D });
     L.hc_a_scale = w("blk.%d.hc_attn_scale.weight", RAD_F32, { 3 });
@@ -883,6 +949,423 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------------ the DSpark drafter (Dsp) */
+/* Whether this checkpoint and deployment get the drafter (m.dsp.on); an error only for a serve the
+ * drafter cannot run as asked. The checkpoint states it by `nextn_predict_layers` (the stages ship as
+ * blk.{n_layer}.. ) beside the 1017's `dspark.*` keys; the published UD GGUFs carry the keys but no
+ * stages, and get no drafter. */
+static int dsp_config(RadBuilder* b, Model& m, const RadModelMeta* meta, const RadBuildCtx* ctx) {
+    auto& d = m.dsp;
+    const auto& c = m.c;
+    const auto& g = m.g;
+    const int64_t ns = gi(meta, "nextn_predict_layers", 0), blk = gi(meta, "dspark.block_size", 0);
+    if (blk <= 0) return RAD_OK;
+    if (ns <= 0) {
+        rad_note(b, "the checkpoint names a DSpark drafter (dspark.block_size %lld) but carries none of its "
+                    "stages (no nextn_predict_layers): no drafter", (long long)blk);
+        return RAD_OK;
+    }
+    if (ctx->max_spec <= 0) return RAD_OK;
+    if (ctx->max_spec != blk) {
+        fprintf(stderr, "radiance: deepseek41: the DSpark drafter proposes a whole block of %lld tokens "
+                        "(dspark.block_size, the length it was trained at) and this serve asks for %d; run "
+                        "--num-speculative-tokens %lld (or auto)\n", (long long)blk, ctx->max_spec, (long long)blk);
+        return RAD_E_UNSUPPORTED;
+    }
+    d.n_expert = gi(meta, "dspark.expert_count", c.n_expert);
+    d.top_k = gi(meta, "dspark.expert_used_count", c.top_k);
+    d.rank = gi(meta, "dspark.markov_rank", 0);
+    d.noise = gi(meta, "dspark.noise_token_id", -1);
+    d.cand = gi(meta, "dspark.markov_top_k", 16);
+    d.taps = gl(meta, "dspark.target_layers");
+    std::sort(d.taps.begin(), d.taps.end());
+    bool ok = !d.taps.empty() && d.noise >= 0 && d.noise < c.n_vocab && d.rank > 0 && d.rank % 32 == 0 &&
+              d.rank <= 512 && d.cand >= 1 && d.cand <= 32 && d.n_expert > 0 && d.top_k > 0 &&
+              d.top_k <= d.n_expert;
+    for (int64_t t : d.taps) ok = ok && t >= 0 && t < c.n_layer;
+    if (!ok) {
+        fprintf(stderr, "radiance: deepseek41: the dspark.* configuration does not describe a drafter this "
+                        "plugin runs (target layers %zu, noise id %lld, markov rank %lld (a multiple of 32 up "
+                        "to 512), candidates %lld (1..32), experts %lld top-%lld)\n",
+                d.taps.size(), (long long)d.noise, (long long)d.rank, (long long)d.cand,
+                (long long)d.n_expert, (long long)d.top_k);
+        return RAD_E_UNSUPPORTED;
+    }
+    /* Experts are expert-parallel as in the trunk (an even count of whole experts a rank). */
+    if (d.n_expert % g.world || (d.n_expert / g.world) % 2) {
+        fprintf(stderr, "radiance: deepseek41: the DSpark drafter's %lld experts do not split over %d ranks "
+                        "(an even count of whole experts each); serving without it\n",
+                (long long)d.n_expert, g.world);
+        rad_note(b, "DSpark drafter NOT declared: %lld experts over %d ranks", (long long)d.n_expert, g.world);
+        d.taps.clear();
+        return RAD_OK;
+    }
+    d.block = blk;
+    d.base = (int)c.n_layer;
+    d.n_stage = (int)ns;
+    d.Q = std::min<int64_t>(g.max_seqs * blk, g.max_tok);
+    d.on = d.Q >= blk;
+    return RAD_OK;
+}
+
+/* One stage's weights (blk.{base + s}.*, the trunk's suffixes) and its context-pass key ops. */
+static int dsp_stage_weights(RadBuilder* b, Model& m, Layer& L, int s) {
+    auto& g = m.g;
+    auto& nm = m.nm;
+    const auto& c = m.c;
+    const int l = m.dsp.base + s;
+    const int64_t D = c.n_embd, HD = g.n_head * c.head_dim, hd = c.head_dim, mix = c.hc * (c.hc + 2);
+    const auto grp = grp_layer(l);
+    L.l = l;
+    L.r = 0;
+    auto w = [&](const char* fmt, uint32_t dt, std::initializer_list<int64_t> shape) {
+        return wt(b, nm.f(fmt, l), dt, shape, grp);
+    };
+    L.hc_a_fn = w("blk.%d.hc_attn_fn.weight", RAD_F32, { mix, c.hc * D });
+    L.hc_a_scale = w("blk.%d.hc_attn_scale.weight", RAD_F32, { 3 });
+    L.hc_a_base = w("blk.%d.hc_attn_base.weight", RAD_F32, { mix });
+    L.hc_f_fn = w("blk.%d.hc_ffn_fn.weight", RAD_F32, { mix, c.hc * D });
+    L.hc_f_scale = w("blk.%d.hc_ffn_scale.weight", RAD_F32, { 3 });
+    L.hc_f_base = w("blk.%d.hc_ffn_base.weight", RAD_F32, { mix });
+    L.ffn_norm = w("blk.%d.ffn_norm.weight", RAD_F32, { D });
+    if (!L.hc_a_fn || !L.hc_a_scale || !L.hc_a_base || !L.hc_f_fn || !L.hc_f_scale || !L.hc_f_base || !L.ffn_norm)
+        return RAD_E_INVAL;
+    if (m.zero) return RAD_OK;
+    L.attn_norm = w("blk.%d.attn_norm.weight", RAD_F32, { D });
+    L.wq_a = lw(b, m, nm.f("blk.%d.attn_q_a.weight", l), c.q_lora, D, grp);
+    L.q_norm = w("blk.%d.attn_q_a_norm.weight", RAD_F32, { c.q_lora });
+    L.wq_b = lw(b, m, nm.f("blk.%d.attn_q_b.weight", l), HD, c.q_lora, grp, RAD_SHARD_ROW, m.ar * HD,
+                (m.ar + 1) * HD);
+    L.wkv = lw(b, m, nm.f("blk.%d.attn_kv.weight", l), hd, D, grp);
+    L.kv_norm = w("blk.%d.attn_kv_a_norm.weight", RAD_F32, { hd });
+    L.sinks = wts(b, g, nm.f("blk.%d.attn_sinks.weight", l), RAD_F32, { g.n_head }, grp, RAD_SHARD_ROW,
+                  m.ar * g.n_head, (m.ar + 1) * g.n_head);
+    const int64_t gd = HD / m.gr;
+    for (int j = 0; j < m.gr; ++j) {
+        const int gi_ = (int)(m.ar * m.gr + j);
+        const char* n = nm.f("blk.%d.attn_output_a.g%d.weight", l, gi_);
+        DS_TRY(map_rows(b, n, { { nm.f("blk.%d.attn_output_a.weight", l), (int)(gi_ * c.o_rank), c.o_rank } }));
+        L.wo_a.push_back(lw(b, m, n, c.o_rank, gd, grp, RAD_SHARD_NONE, 0, 0, true));
+        if (!L.wo_a.back()) return RAD_E_INVAL;
+    }
+    const int64_t ok = m.gr * c.o_rank;
+    L.wo_b = lw(b, m, nm.f("blk.%d.attn_output_b.weight", l), D, ok, grp, RAD_SHARD_COL, m.ar * ok,
+                (m.ar + 1) * ok);
+    return L.attn_norm && L.wq_a && L.q_norm && L.wq_b && L.wkv && L.kv_norm && L.sinks && L.wo_b ? RAD_OK
+                                                                                                  : RAD_E_INVAL;
+}
+
+/* One stage's query-pass block: Layer::layer()'s window-only path over the drafter's rows, its
+ * attention over the drafter's cache. */
+static int dsp_stage_ops(RadBuilder* b, Model& m, Layer& L) {
+    auto& g = m.g;
+    auto& nm = m.nm;
+    const auto& c = m.c;
+    auto& d = m.dsp;
+    const int l = L.l;
+    const int64_t Q = d.Q, D = c.n_embd, HD = g.n_head * c.head_dim, hd = c.head_dim;
+    const std::vector<RadParam> mixp = { RAD_RANGE("M", 1, Q), RAD_INT("n", D), RAD_INT("hc", c.hc),
+                                         RAD_INT("iterations", c.hc_iters), RAD_F64("eps", c.eps),
+                                         RAD_F64("hc_eps", c.hc_eps), RAD_STR("dtype", "bf16") };
+    const std::vector<RadParam> hcp = { RAD_RANGE("M", 1, Q), RAD_INT("n", D), RAD_INT("hc", c.hc),
+                                        RAD_STR("dtype", "bf16") };
+    L.mix_a = op(b, "mhc_mix", mixp, { L.hc_a_fn, L.hc_a_scale, L.hc_a_base }, { d.h0 }, { d.pre_a, d.post, d.comb });
+    L.col_a = op(b, "mhc_collapse", hcp, {}, { d.h0, d.pre_f }, { d.x });
+    if (m.zero) {
+        L.attn_fill = op(b, "fill", { RAD_RANGE("M", 1, Q), RAD_INT("n", D), RAD_STR("dtype", "bf16"),
+                                      RAD_F64("value", 0.0) },
+                         {}, {}, { d.attn_out });
+    } else {
+        L.norm_a = rmsnorm(b, m, Q, L.attn_norm, D, d.x, d.xn);
+        L.q_a = linear(b, m, Q, L.wq_a, c.q_lora, D, d.xn, d.qr);
+        L.q_an = rmsnorm(b, m, Q, L.q_norm, c.q_lora, d.qr, d.qrn);
+        L.q_b = linear(b, m, Q, L.wq_b, HD, c.q_lora, d.qrn, d.q);
+        L.q_rope = rope_rows(b, m, Q, g.n_head, hd, 0, d.q, m.cs_a);
+        L.kv_g = linear(b, m, Q, L.wkv, hd, D, d.xn, d.kv_);
+        L.kv_n = rmsnorm(b, m, Q, L.kv_norm, hd, d.kv_, d.kvn);
+        L.kv_rope = rope_rows(b, m, Q, 1, hd, 0, d.kvn, m.cs_a);
+        L.kv_q = roundtrip(b, Q, hd, 32, "fp8_e4m3", "ue8m0", d.kvn);
+        L.kv_st = op(b, "kv_store",
+                     { RAD_RANGE("M", 1, Q), RAD_INT("head_dim", hd / 2), RAD_INT("n_head_kv", 1),
+                       RAD_INT("block_size", d.kv_bs), RAD_STR("kv_dtype", "bf16") },
+                     {}, { d.kvn }, {});
+        /* The window of `c.window` context keys before the anchor plus the block's own `block` keys,
+         * for every row: each row is placed at its block's last position (apos). */
+        L.attn = op(b, "attn_sparse_sink",
+                    { RAD_RANGE("M", 1, Q), RAD_INT("heads", g.n_head), RAD_INT("dim", hd),
+                      RAD_INT("window", c.window + d.block), RAD_INT("ratio", 0), RAD_INT("topk", 0),
+                      RAD_F64("scale", 1.0 / std::sqrt((double)hd)), RAD_STR("dtype", "bf16") },
+                    { L.sinks }, { d.q, d.apos }, { d.o });
+        L.o_rope = rope_rows(b, m, Q, g.n_head, hd, 1, d.o, m.cs_a);
+        L.o_q = roundtrip(b, Q, HD, 32, "fp8_e4m3", "ue8m0", d.o);
+        const int64_t gd = HD / m.gr;
+        for (int j = 0; j < m.gr; ++j) L.o_a.push_back(linear(b, m, Q, L.wo_a[(size_t)j], c.o_rank, gd, d.o, d.oa));
+        L.o_b = linear(b, m, Q, L.wo_b, D, m.gr * c.o_rank, d.oa, d.attn_out);
+        if (!L.norm_a || !L.q_a || !L.q_an || !L.q_b || !L.q_rope || !L.kv_g || !L.kv_n || !L.kv_rope ||
+            !L.kv_st || !L.attn || !L.o_rope || !L.o_b)
+            return RAD_E_INVAL;
+    }
+    if (g.world > 1)
+        L.ar_attn = op(b, "all_reduce",
+                       { RAD_INT("world_size", g.world), RAD_RANGE("numel", D, Q * D), RAD_STR("dtype", "bf16"),
+                         RAD_INT("exact", g.wire_exact), RAD_INT("min_bytes", g.wire_min_bytes) },
+                       {}, { d.attn_out }, { d.attn_out });
+    L.post_a = op(b, "mhc_post", hcp, {}, { d.attn_out, d.h0, d.post, d.comb }, { d.h1 });
+    L.mix_f = op(b, "mhc_mix", mixp, { L.hc_f_fn, L.hc_f_scale, L.hc_f_base }, { d.h1 }, { d.pre_f, d.post, d.comb });
+    L.col_f = op(b, "mhc_collapse", hcp, {}, { d.h1, d.pre_a }, { d.x });
+    L.norm_f = rmsnorm(b, m, Q, L.ffn_norm, D, d.x, d.act.x);
+    MoeFP8::Src s;
+    s.norm = nullptr;
+    s.router = nm.f("blk.%d.ffn_gate_inp.weight", l);
+    s.router_bias = nm.f("blk.%d.exp_probs_b.bias", l);
+    s.experts_gate = nm.f("blk.%d.ffn_gate_exps.weight", l);
+    s.experts_up = nm.f("blk.%d.ffn_up_exps.weight", l);
+    s.experts_down = nm.f("blk.%d.ffn_down_exps.weight", l);
+    s.shared_mlp_gate = nm.f("blk.%d.ffn_gate_shexp.weight", l);
+    s.shared_mlp_up = nm.f("blk.%d.ffn_up_shexp.weight", l);
+    s.shared_mlp_down = nm.f("blk.%d.ffn_down_shexp.weight", l);
+    s.cfg.n_expert_all = d.n_expert;
+    s.cfg.n_expert = d.n_expert / g.world;
+    s.cfg.expert_base = g.rank * s.cfg.n_expert;
+    s.cfg.probed_expert = s.cfg.expert_base;
+    s.cfg.top_k = d.top_k;
+    s.cfg.n_ff_exp = c.n_ff;
+    s.cfg.n_ff_shared = g.n_ff;
+    s.cfg.rows = Q;
+    s.cfg.norm_topk = c.norm_topk;
+    s.cfg.sigmoid_router = 1;
+    s.cfg.router_score = "sqrtsoftplus";
+    s.cfg.route_scale = c.route_scale;
+    s.cfg.swiglu_limit = c.swiglu_limit;
+    s.cfg.shared_ungated = 1;
+    DS_TRY(MoeFP8::probe(b, nm, l, s, &s.cfg));
+    DS_TRY(L.moe.declare(b, nm, g, l, d.mw, s, false, false));
+    L.post_f = op(b, "mhc_post", hcp, {}, { d.act.x, d.h1, d.post, d.comb }, { d.h0 });
+    return L.mix_a && L.col_a && L.post_a && L.mix_f && L.col_f && L.norm_f && L.post_f ? RAD_OK : RAD_E_INVAL;
+}
+
+/* Everything of the drafter past the trunk's head (declaration order is the buffer planner's
+ * liveness: the drafter's passes run after the whole trunk step, as arch/llama_fp8 declares its own). */
+static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
+    auto& g = m.g;
+    auto& nm = m.nm;
+    const auto& c = m.c;
+    auto& d = m.dsp;
+    const int64_t T = g.max_tok, Q = d.Q, D = c.n_embd, HD = g.n_head * c.head_dim, hd = c.head_dim;
+    const int64_t R = d.cand;
+    auto bf = [&](const char* n, std::initializer_list<int64_t> s) { return decl_b(b, nm.f("%s", n), RAD_BF16, s); };
+    static const bool keep = std::getenv("RADIANCE_DEBUG_DSPARK_KEEP") != nullptr;
+
+    /* ---- buffers: the context pass (a trunk step's rows), the query pass (Q rows), the head */
+    d.c = bf("dspark_main", { T, D });
+    d.cn = bf("dspark_main_normed", { T, D });
+    d.ckv = bf("dspark_ctx_kv", { T, hd });
+    d.ckvn = bf("dspark_ctx_kv_normed", { T, hd });
+    d.x = bf("dspark_collapsed", { Q, D });
+    d.xn = bf("dspark_normed", { Q, D });
+    d.h0 = bf("dspark_streams", { Q, c.hc * D });
+    d.h1 = bf("dspark_streams_next", { Q, c.hc * D });
+    d.pre_a = decl_b(b, nm.f("dspark_pre_attn"), RAD_F32, { Q, c.hc });
+    d.pre_f = decl_b(b, nm.f("dspark_pre_ffn"), RAD_F32, { Q, c.hc });
+    d.post = decl_b(b, nm.f("dspark_post"), RAD_F32, { Q, c.hc });
+    d.comb = decl_b(b, nm.f("dspark_comb"), RAD_F32, { Q, c.hc * c.hc });
+    d.qr = bf("dspark_q_lora", { Q, c.q_lora });
+    d.qrn = bf("dspark_q_lora_normed", { Q, c.q_lora });
+    d.q = bf("dspark_q", { Q, HD });
+    d.kv_ = bf("dspark_kv", { Q, hd });
+    d.kvn = bf("dspark_kv_normed", { Q, hd });
+    d.o = bf("dspark_attn_o", { Q, HD });
+    d.oa = bf("dspark_attn_o_lora", { Q, m.gr * c.o_rank });
+    d.attn_out = bf("dspark_attn_out", { Q, D });
+    d.poff = decl_b(b, nm.f("dspark_pos_offset"), RAD_I32, { Q, 1 });
+    d.apos = decl_b(b, nm.f("dspark_attn_pos"), RAD_I32, { Q, 1 });
+    d.act.x = bf("dspark_ffn_normed", { Q, D });
+    auto& mw = d.mw;
+    mw.x = d.x;
+    mw.h = d.act;
+    mw.logits = decl_b(b, nm.f("dspark_router_logits"), RAD_F32, { Q, d.n_expert });
+    mw.ids = decl_b(b, nm.f("dspark_expert_ids"), RAD_I32, { Q, d.top_k });
+    mw.ew = decl_b(b, nm.f("dspark_expert_weights"), RAD_F32, { Q, d.top_k });
+    mw.eoff = decl_b(b, nm.f("dspark_expert_offsets"), RAD_I32, { d.n_expert + 1 });
+    mw.ecnt = decl_b(b, nm.f("dspark_expert_counts"), RAD_I32, { d.n_expert });
+    mw.sorted = decl_b(b, nm.f("dspark_expert_sorted"), RAD_I32, { Q * d.top_k });
+    mw.egu = bf("dspark_expert_gate_up", { Q * d.top_k, 2 * c.n_ff });
+    mw.eff.x = bf("dspark_expert_ff", { Q * d.top_k, c.n_ff });
+    mw.edn = bf("dspark_expert_down", { Q * d.top_k, D });
+    mw.sgu = bf("dspark_shared_gate_up", { Q, 2 * g.n_ff });
+    mw.sff.x = bf("dspark_shared_ff", { Q, g.n_ff });
+    mw.sout = bf("dspark_shared_out", { Q, D });
+    mw.sgate = bf("dspark_shared_one", { Q, 1 });
+    d.fin = bf("dspark_final", { Q, D });
+    d.rows = bf("dspark_head_in", { Q, D });
+    /* RADIANCE_DEBUG_DSPARK_KEEP: the head's logits kept whole after the pass (a persistent buffer) so a
+     * RADIANCE_DUMP_BUF probe reads them; diagnosis only. */
+    d.logits = decl_b(b, nm.f("dspark_logits"), RAD_F32, { Q, g.n_vocab }, keep ? RAD_BUF_PERSIST : RAD_BUF_TRANSIENT);
+    d.cand_ = decl_b(b, nm.f("dspark_cand"), RAD_I32, { Q, R });
+    d.unary = decl_b(b, nm.f("dspark_unary"), RAD_F32, { Q, R });
+    if (g.world > 1) {
+        d.pairs = decl_b(b, nm.f("dspark_pairs"), RAD_F32, { Q, R, 2 });
+        d.gath = decl_b(b, nm.f("dspark_pairs_all"), RAD_F32, { Q, (int64_t)g.world * R, 2 });
+    }
+    /* The proposal buffer (RadDrafterDecl::proposal), `block` tokens a sequence. */
+    d.tokens = decl_b(b, nm.f("dspark_tokens"), RAD_I32, { g.max_seqs, d.block });
+    if (!d.c || !d.cn || !d.ckv || !d.ckvn || !d.x || !d.h0 || !d.logits || !d.tokens) return RAD_E_INVAL;
+
+    /* ---- weights */
+    d.st.resize((size_t)d.n_stage);
+    for (int s = 0; s < d.n_stage; ++s) DS_TRY(dsp_stage_weights(b, m, d.st[(size_t)s], s));
+    const int64_t nt = (int64_t)d.taps.size();
+    /* The context pass runs on the attention ranks only (an attention-zero rank keeps no keys). */
+    if (!m.zero) {
+        d.fc = lw(b, m, nm.f("dspark.fc.weight"), D, nt * D, grp_model());
+        d.main_norm = wt(b, nm.f("dspark.enc.output_norm.weight"), RAD_F32, { D }, grp_model());
+        if (!d.fc || !d.main_norm) return RAD_E_INVAL;
+    }
+    d.norm = wt(b, nm.f("dspark.output_norm.weight"), RAD_F32, { D }, grp_model());
+    /* The Markov head's tables, [vocab, rank] each and replicated: the walk gathers rows by global id. */
+    d.mk1 = wt(b, nm.f("dspark.markov_w1.weight"), RAD_BF16, { c.n_vocab, d.rank }, grp_model(), RAD_ACCESS_VOCAB);
+    d.mk2 = wt(b, nm.f("dspark.markov_w2.weight"), RAD_BF16, { c.n_vocab, d.rank }, grp_model(), RAD_ACCESS_VOCAB);
+    if (!d.norm || !d.mk1 || !d.mk2) return RAD_E_INVAL;
+
+    /* ---- the context pass, and the drafter's window cache: the context keys of every committed
+     * position plus, past them, the block keys a query pass writes (the next context pass overwrites
+     * them). Declared right before the first store, whose block_size fixes the group's. */
+    RadKVGroupDecl kd{};
+    kd.kind = RAD_KV_WINDOW;
+    kd.dtype = RAD_BF16;
+    kd.window = c.window + d.block + g.max_spec;
+    kd.n_head_kv = 1;
+    kd.head_dim = hd / 2;
+    const std::vector<RadParam> stp = { RAD_RANGE("M", 1, T), RAD_INT("head_dim", hd / 2), RAD_INT("n_head_kv", 1),
+                                        RAD_INT("block_size", 16), RAD_STR("kv_dtype", "bf16") };
+    if (m.zero) {
+        if (!(d.kv = rad_decl_kv_group(b, nm.f("kv_dspark"), &kd))) return RAD_E_INVAL;
+        d.sizing = op(b, "kv_store", stp, {}, { d.ckvn }, {});   /* fixes the block size; never issued */
+    } else {
+        d.c_tab = op(b, "rope_table",
+                     { RAD_RANGE("M", 1, T), RAD_INT("rot", c.rope), RAD_F64("theta", c.theta),
+                       RAD_F64("scale", 1.0), RAD_STR("dtype", "f32") },
+                     {}, {}, { m.cs_a });
+        d.c_fc = linear(b, m, T, d.fc, D, nt * D, d.src, d.c);
+        d.c_norm = rmsnorm(b, m, T, d.main_norm, D, d.c, d.cn);
+        for (auto& L : d.st) {
+            L.d_kv = linear(b, m, T, L.wkv, hd, D, d.cn, d.ckv);
+            L.d_kvn = rmsnorm(b, m, T, L.kv_norm, hd, d.ckv, d.ckvn);
+            L.d_kvrope = rope_rows(b, m, T, 1, hd, 0, d.ckvn, m.cs_a);
+            L.d_kvq = roundtrip(b, T, hd, 32, "fp8_e4m3", "ue8m0", d.ckvn);
+            if (!d.kv && !(d.kv = rad_decl_kv_group(b, nm.f("kv_dspark"), &kd))) return RAD_E_INVAL;
+            L.d_kvst = op(b, "kv_store", stp, {}, { d.ckvn }, {});
+            if (!L.d_kv || !L.d_kvn || !L.d_kvrope || !L.d_kvst) return RAD_E_INVAL;
+        }
+        if (!d.c_tab || !d.c_fc || !d.c_norm) return RAD_E_INVAL;
+    }
+    d.kv_bs = rad_kv_block_size(b, d.kv);
+    if (d.kv_bs < 1) return RAD_E_INVAL;
+    for (const auto& L : d.st) DS_TRY(rad_bind_layer_kv(b, L.l, d.kv));
+    if (m.zero) DS_TRY(rad_kv_group_zero(b, d.kv));
+
+    /* ---- the query pass: [anchor, noise ...] embedded by the trunk's table into hc copies */
+    const auto tt = m.wty.find(m.token);
+    if (tt != m.wty.end())
+        d.embed = op(b, "embed_lookup_ggml",
+                     { RAD_RANGE("M", 1, Q), RAD_INT("n_embd", D), RAD_INT("n_vocab", g.n_vocab),
+                       RAD_STR("type", tt->second), RAD_STR("dtype", "bf16"), RAD_INT("vocab_offset", g.vocab_off) },
+                     { m.token }, {}, { d.x });
+    else
+        d.embed = op(b, "embed_lookup",
+                     { RAD_RANGE("M", 1, Q), RAD_INT("n_embd", D), RAD_INT("n_vocab", g.n_vocab),
+                       RAD_STR("dtype", "bf16"), RAD_INT("vocab_offset", g.vocab_off) },
+                     { m.token }, {}, { d.x });
+    if (g.world > 1)
+        d.embed_ar = op(b, "all_reduce",
+                        { RAD_INT("world_size", g.world), RAD_RANGE("numel", D, Q * D), RAD_STR("dtype", "bf16"),
+                          RAD_INT("exact", 1) },
+                        {}, { d.x }, { d.x });
+    d.expand = op(b, "cast", { RAD_RANGE("M", 1, Q), RAD_INT("n", D), RAD_STR("from", "bf16"), RAD_STR("to", "bf16") },
+                  {}, { d.x }, { d.h0 });
+    d.pre0 = op(b, "fill", { RAD_RANGE("M", 1, Q), RAD_INT("n", c.hc), RAD_STR("dtype", "f32"), RAD_F64("value", 0.0) },
+                {}, {}, { d.pre_f });
+    d.pre1 = op(b, "fill", { RAD_RANGE("M", 1, Q), RAD_INT("n", 1), RAD_STR("dtype", "f32"), RAD_F64("value", 1.0) },
+                {}, {}, { d.pre_f });
+    d.q_tab = op(b, "rope_table",
+                 { RAD_RANGE("M", 1, Q), RAD_INT("rot", c.rope), RAD_F64("theta", c.theta), RAD_F64("scale", 1.0),
+                   RAD_STR("dtype", "f32") },
+                 {}, {}, { m.cs_a });
+    /* apos = position + (block - 1 - row % block): each row at its block's last position. */
+    d.poff_op = op(b, "iota", { RAD_RANGE("M", 1, Q), RAD_INT("start", d.block - 1), RAD_INT("step", -1),
+                                RAD_INT("period", d.block) },
+                   {}, {}, { d.poff });
+    d.apos_op = op(b, "add", { RAD_RANGE("M", 1, Q), RAD_INT("n", 1), RAD_STR("dtype", "i32") }, {}, { d.poff },
+                   { d.apos });
+    if (!d.embed || !d.expand || !d.pre0 || !d.pre1 || !d.q_tab || !d.poff_op || !d.apos_op) return RAD_E_INVAL;
+    for (auto& L : d.st) DS_TRY(dsp_stage_ops(b, m, L));
+
+    /* ---- the head: the last stage's ffn gates collapse the streams, its norm, the trunk's lm_head */
+    d.contract = op(b, "mhc_collapse", { RAD_RANGE("M", 1, Q), RAD_INT("n", D), RAD_INT("hc", c.hc), RAD_STR("dtype", "bf16") },
+                    {}, { d.h0, d.pre_f }, { d.x });
+    d.fnorm = rmsnorm(b, m, Q, d.norm, D, d.x, d.fin);
+    d.gather = op(b, "gather_rows", { RAD_RANGE("M", 1, Q), RAD_INT("n", D), RAD_STR("dtype", "bf16") }, {},
+                  { d.fin }, { d.rows });
+    const auto ht = m.wty.find(m.head);
+    if (ht != m.wty.end())
+        d.head = op(b, "logits_gemm_ggml",
+                    { RAD_RANGE("M", 1, Q), RAD_INT("n_vocab", g.n_vocab), RAD_INT("n_embd", D),
+                      RAD_STR("type", ht->second), RAD_STR("dtype", "bf16") },
+                    { m.head }, { d.rows }, { d.logits });
+    else
+        d.head = op(b, "logits_gemm",
+                    { RAD_RANGE("M", 1, Q), RAD_INT("n_vocab", g.n_vocab), RAD_INT("n_embd", D), RAD_STR("dtype", "bf16") },
+                    { m.head }, { d.rows }, { d.logits });
+    /* The candidates: this rank's top-R of its vocabulary shard, merged to the global top-R across
+     * ranks (ties to the lower id, as an unsharded top-R). */
+    if (g.world > 1) {
+        d.topk = op(b, "row_topk", { RAD_RANGE("M", 1, Q), RAD_INT("N", g.n_vocab), RAD_INT("R", R),
+                                     RAD_INT("vocab_off", g.vocab_off), RAD_STR("dtype", "f32") },
+                    {}, { d.logits }, { d.cand_, d.unary, d.pairs });
+        d.pgather = op(b, "all_gather", { RAD_INT("world_size", g.world), RAD_INT("numel", Q * R * 2),
+                                          RAD_STR("dtype", "f32"), RAD_INT("row", R * 2) },
+                       {}, { d.pairs }, { d.gath });
+        d.merge = op(b, "row_topk_merge", { RAD_RANGE("M", 1, Q), RAD_INT("R", R), RAD_INT("world_size", g.world),
+                                            RAD_STR("dtype", "f32") },
+                     {}, { d.gath }, { d.cand_, d.unary });
+        if (!d.pgather || !d.merge) return RAD_E_INVAL;
+    } else {
+        d.topk = op(b, "row_topk", { RAD_RANGE("M", 1, Q), RAD_INT("N", g.n_vocab), RAD_INT("R", R), RAD_STR("dtype", "f32") },
+                    {}, { d.logits }, { d.cand_, d.unary });
+    }
+    /* The Markov walk: logits[i] + W2 . W1[prev(i)], prev(0) the anchor, greedily (dflash_select with no
+     * hidden projection is exactly that bigram over the candidates). */
+    d.select = op(b, "dflash_select",
+                  { RAD_RANGE("M", 1, g.max_seqs), RAD_INT("steps", d.block), RAD_INT("top_k", R),
+                    RAD_INT("rank", d.rank), RAD_INT("n_vocab", c.n_vocab), RAD_INT("anchor_stride", d.block),
+                    RAD_STR("dtype", "bf16") },
+                  { d.mk1, d.mk2 }, { d.cand_, d.unary }, { d.tokens });
+    if (!d.contract || !d.fnorm || !d.gather || !d.head || !d.topk || !d.select) return RAD_E_INVAL;
+
+    RadDrafterDecl drf{};
+    drf.name = "dspark";
+    drf.kind = RAD_DRAFT_BLOCK;
+    drf.depth = ctx->max_spec;
+    drf.block = d.block;
+    drf.proposal = d.tokens;
+    drf.proposal_pitch = d.block;
+    /* The query block's first row reads back `window` keys before itself. */
+    drf.window = c.window + 1;
+    drf.mask_token = (int32_t)d.noise;
+    DS_TRY(rad_declare_drafter(b, &drf));
+    if (keep)
+        fprintf(stderr, "radiance: deepseek41: RADIANCE_DEBUG_DSPARK_KEEP: the drafter's logits buffer is "
+                        "persistent -- a diagnosis form\n");
+    rad_note(b, "DSpark drafter: %d stages at absolute layers %d..%d (window-only V4 blocks, %lld experts top-%lld), "
+                "taps before %zu trunk layer(s), one pass over [anchor, noise %lld x %lld] proposes %lld tokens; "
+                "attention over %lld context keys + the block's own; Markov rank %lld walked over the head's top %lld; "
+                "the confidence head is not applied",
+             d.n_stage, d.base, d.base + d.n_stage - 1, (long long)d.n_expert, (long long)d.top_k, d.taps.size(),
+             (long long)d.noise, (long long)(d.block - 1), (long long)d.block, (long long)c.window,
+             (long long)d.rank, (long long)R);
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------------ declare */
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
     if (!b || !meta || !ctx || ctx->is_draft || ctx->rank < 0 || ctx->rank >= MAX_RANKS)
@@ -899,6 +1382,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     auto& nm = m.nm;
     DS_TRY(read_cfg(m.c, meta));
     DS_TRY(geometry(m, ctx));
+    DS_TRY(dsp_config(b, m, meta, ctx));
     const auto& c = m.c;
     auto& g = m.g;
     int64_t rmin = 0;
@@ -907,6 +1391,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.work = g.max_tok + g.max_seqs;
     m.cmax = g.max_ctx / std::max<int64_t>(rmin, 1) + 1;
     DS_TRY(buffers(b, m));
+    /* The drafter's source rows, one hc-mean row a target layer, written by the trunk step. */
+    if (m.dsp.on && !m.zero &&
+        !(m.dsp.src = decl_b(b, nm.f("dspark_src"), RAD_BF16, { g.max_tok, (int64_t)m.dsp.taps.size() * c.n_embd })))
+        return RAD_E_INVAL;
 
     const int64_t T = g.max_tok, D = c.n_embd;
     /* The vocabulary is split over the ranks (shard_extent): the lookup gives zeros outside this
@@ -1022,6 +1510,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                        { RAD_RANGE("M", 1, g.max_logit_rows), RAD_INT("n_vocab", g.n_vocab),
                          RAD_INT("n_embd", D), RAD_STR("dtype", "bf16") },
                        { m.head }, { m.logit_input }, { m.logits });
+    /* The drafter after everything the trunk step issues (llama_fp8's rule: declaration order is
+     * liveness, and its passes run behind the step). */
+    if (m.dsp.on) DS_TRY(dsp_declare(b, m, ctx));
     if (debug_noq())
         fprintf(stderr, "radiance: deepseek41: RADIANCE_DEBUG_NOQ: the model's quantise-dequantise "
                         "points are off -- a diagnosis form, not the model\n");
@@ -1033,8 +1524,132 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 }
 
 /* ------------------------------------------------------------------ step */
+/* The drafter's context pass (draft_pass < 0): the trunk step's rows, in order. */
+static void dsp_context(RadCtx* x, Model& m, const RadBatch* batch) {
+    const auto& d = m.dsp;
+    const auto& g = m.g;
+    const int64_t T = batch->n_tok, hd = m.c.head_dim;
+    if (T <= 0 || m.zero) return;   /* an attention-zero rank keeps no keys (its cache is zeroed) */
+    const auto* kb = kv_batch(batch, d.kv);
+    if (!kb || !kb->slot_mapping) {
+        rad_step_fail(x, "deepseek41: the DSpark cache has no slots on a context pass");
+        return;
+    }
+    const RadOperand pos = praw(batch->positions, RAD_I32, T);
+    RAD_ISSUE_N(x, d.c_tab, T, pos, brows(m.cs_a, g.max_ctx));
+    RAD_ISSUE_N(x, d.c_fc, T, brows(d.src, T), RAD_W(d.fc), brows(d.c, T));
+    RAD_ISSUE_N(x, d.c_norm, T, brows(d.c, T), RAD_W(d.main_norm), brows(d.cn, T));
+    for (const auto& L : d.st) {
+        RAD_ISSUE_N(x, L.d_kv, T, brows(d.cn, T), RAD_W(L.wkv), brows(d.ckv, T));
+        RAD_ISSUE_N(x, L.d_kvn, T, brows(d.ckv, T), RAD_W(L.kv_norm), brows(d.ckvn, T));
+        RAD_ISSUE_N(x, L.d_kvrope, T, brows(d.ckvn, T), brows(m.cs_a, g.max_ctx), pos);
+        if (L.d_kvq) RAD_ISSUE_N(x, L.d_kvq, T, brows(d.ckvn, T));
+        RAD_ISSUE_N(x, L.d_kvst, T, bcol(d.ckvn, 0, hd / 2, T), bcol(d.ckvn, hd / 2, hd / 2, T),
+                    praw(kb->slot_mapping, RAD_I32, T), kv_cache(d.kv, L.l));
+    }
+}
+
+/* The drafter's query pass (draft_pass > 0): `block` rows a drafting sequence, the anchor first. */
+static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
+    const auto& d = m.dsp;
+    const auto& c = m.c;
+    const auto& g = m.g;
+    const int64_t T = batch->n_tok, S = batch->n_seq, D = c.n_embd;
+    const int64_t HD = g.n_head * c.head_dim, hd = c.head_dim;
+    if (T <= 0 || S <= 0) return;
+    if (T != S * d.block || T > d.Q) {
+        rad_step_fail(x, "deepseek41: a DSpark query pass staged at a block this drafter has no ops for");
+        return;
+    }
+    const RadOperand pos = praw(batch->positions, RAD_I32, T);
+    const RadOperand cu = praw(batch->cu_seqlens, RAD_I32, S + 1);
+    const auto* kb = kv_batch(batch, d.kv);
+    if (!m.zero && (!kb || !kb->slot_mapping || !kb->block_table || !kb->seqused)) {
+        rad_step_fail(x, "deepseek41: the DSpark cache has no block table on a query pass");
+        return;
+    }
+
+    RAD_ISSUE_N(x, d.embed, T, praw(batch->token_ids, RAD_I32, T), RAD_W(m.token), brows(d.x, T));
+    if (d.embed_ar) RAD_ISSUE_N(x, d.embed_ar, T * D, brows(d.x, T), RAD_NONE);
+    for (int64_t i = 0; i < c.hc; ++i) RAD_ISSUE_N(x, d.expand, T, brows(d.x, T), bcol(d.h0, i * D, D, T));
+    RAD_ISSUE_N(x, d.pre0, T, brows(d.pre_f, T));
+    RAD_ISSUE_N(x, d.pre1, T, bcol(d.pre_f, 0, 1, T));
+    RAD_ISSUE_N(x, d.q_tab, T, pos, brows(m.cs_a, g.max_ctx));
+    RAD_ISSUE_N(x, d.poff_op, T, brows(d.poff, T));
+    RAD_ISSUE_N(x, d.apos_op, T, pos, brows(d.poff, T), brows(d.apos, T));
+
+    for (const auto& L : d.st) {
+        RAD_ISSUE_N(x, L.mix_a, T, brows(d.h0, T), RAD_W(L.hc_a_fn), RAD_W(L.hc_a_scale), RAD_W(L.hc_a_base),
+                    brows(d.pre_a, T), brows(d.post, T), brows(d.comb, T));
+        RAD_ISSUE_N(x, L.col_a, T, brows(d.h0, T), brows(d.pre_f, T), brows(d.x, T));
+        if (m.zero) {
+            RAD_ISSUE_N(x, L.attn_fill, T, brows(d.attn_out, T));
+        } else {
+            RAD_ISSUE_N(x, L.norm_a, T, brows(d.x, T), RAD_W(L.attn_norm), brows(d.xn, T));
+            RAD_ISSUE_N(x, L.q_a, T, brows(d.xn, T), RAD_W(L.wq_a), brows(d.qr, T));
+            RAD_ISSUE_N(x, L.q_an, T, brows(d.qr, T), RAD_W(L.q_norm), brows(d.qrn, T));
+            RAD_ISSUE_N(x, L.q_b, T, brows(d.qrn, T), RAD_W(L.wq_b), brows(d.q, T));
+            RAD_ISSUE_N(x, L.q_rope, T, brows(d.q, T), brows(m.cs_a, g.max_ctx), pos);
+            RAD_ISSUE_N(x, L.kv_g, T, brows(d.xn, T), RAD_W(L.wkv), brows(d.kv_, T));
+            RAD_ISSUE_N(x, L.kv_n, T, brows(d.kv_, T), RAD_W(L.kv_norm), brows(d.kvn, T));
+            RAD_ISSUE_N(x, L.kv_rope, T, brows(d.kvn, T), brows(m.cs_a, g.max_ctx), pos);
+            if (L.kv_q) RAD_ISSUE_N(x, L.kv_q, T, brows(d.kvn, T));
+            /* The block's keys past the committed end; the next context pass overwrites them. */
+            RAD_ISSUE_N(x, L.kv_st, T, bcol(d.kvn, 0, hd / 2, T), bcol(d.kvn, hd / 2, hd / 2, T),
+                        praw(kb->slot_mapping, RAD_I32, T), kv_cache(d.kv, L.l));
+            RAD_ISSUE_N(x, L.attn, T, brows(d.q, T), kv_cache(d.kv, L.l),
+                        praw2(kb->block_table, RAD_I32, S, kb->block_table_pitch), praw(kb->seqused, RAD_I32, S),
+                        RAD_NONE, RAD_NONE, RAD_NONE, brows(d.apos, T), cu, RAD_W(L.sinks), brows(d.o, T));
+            RAD_ISSUE_N(x, L.o_rope, T, brows(d.o, T), brows(m.cs_a, g.max_ctx), pos);
+            if (L.o_q) RAD_ISSUE_N(x, L.o_q, T, brows(d.o, T));
+            const int64_t gd = HD / m.gr;
+            for (int j = 0; j < m.gr; ++j)
+                RAD_ISSUE_N(x, L.o_a[(size_t)j], T, bcol(d.o, j * gd, gd, T), RAD_W(L.wo_a[(size_t)j]),
+                            bcol(d.oa, j * c.o_rank, c.o_rank, T));
+            RAD_ISSUE_N(x, L.o_b, T, brows(d.oa, T), RAD_W(L.wo_b), brows(d.attn_out, T));
+        }
+        if (L.ar_attn) RAD_ISSUE_N(x, L.ar_attn, T * D, brows(d.attn_out, T), RAD_NONE);
+        RAD_ISSUE_N(x, L.post_a, T, brows(d.attn_out, T), brows(d.h0, T), brows(d.post, T), brows(d.comb, T),
+                    brows(d.h1, T));
+        RAD_ISSUE_N(x, L.mix_f, T, brows(d.h1, T), RAD_W(L.hc_f_fn), RAD_W(L.hc_f_scale), RAD_W(L.hc_f_base),
+                    brows(d.pre_f, T), brows(d.post, T), brows(d.comb, T));
+        RAD_ISSUE_N(x, L.col_f, T, brows(d.h1, T), brows(d.pre_a, T), brows(d.x, T));
+        RAD_ISSUE_N(x, L.norm_f, T, brows(d.x, T), RAD_W(L.ffn_norm), brows(d.act.x, T));
+        L.moe.step(x, batch);
+        RAD_ISSUE_N(x, L.post_f, T, brows(d.act.x, T), brows(d.h1, T), brows(d.post, T), brows(d.comb, T),
+                    brows(d.h0, T));
+    }
+
+    RAD_ISSUE_N(x, d.contract, T, brows(d.h0, T), brows(d.pre_f, T), brows(d.x, T));
+    RAD_ISSUE_N(x, d.fnorm, T, brows(d.x, T), RAD_W(d.norm), brows(d.fin, T));
+    const int64_t N = batch->n_out;
+    if (N <= 0) return;
+    RAD_ISSUE_N(x, d.gather, N, brows(d.fin, T), praw(batch->out_ids, RAD_I32, N), brows(d.rows, N));
+    RAD_ISSUE_N(x, d.head, N, brows(d.rows, N), RAD_W(m.head), brows(d.logits, N));
+    if (d.merge) {
+        RAD_ISSUE_N(x, d.topk, N, brows(d.logits, N), brows(d.cand_, N), brows(d.unary, N), brows(d.pairs, N));
+        RAD_ISSUE(x, d.pgather, brows(d.pairs, N), brows(d.gath, N));
+        RAD_ISSUE_N(x, d.merge, N, brows(d.gath, N), brows(d.cand_, N), brows(d.unary, N));
+    } else {
+        RAD_ISSUE_N(x, d.topk, N, brows(d.logits, N), brows(d.cand_, N), brows(d.unary, N), RAD_NONE);
+    }
+    RAD_ISSUE_N(x, d.select, S, brows(d.cand_, N), brows(d.unary, N), RAD_NONE, praw(batch->token_ids, RAD_I32, T),
+                RAD_W(d.mk1), RAD_W(d.mk2), brows(d.tokens, S));
+}
+
 static void step(RadCtx* x, const RadBatch* batch) {
     auto& m = *models[rad_rank(x)];
+    /* A drafter pass: the sign gives the kind (rad_runtime.h); zero is a trunk step. */
+    if (batch->draft_pass != 0) {
+        if (!m.dsp.on) {
+            rad_step_fail(x, "deepseek41: a drafter pass and no DSpark drafter is declared (the checkpoint "
+                             "carries none, or declare ran at max_spec 0)");
+            return;
+        }
+        if (batch->draft_pass > 0) dsp_query(x, m, batch);
+        else dsp_context(x, m, batch);
+        return;
+    }
     const auto& c = m.c;
     const auto& g = m.g;
     const int64_t T = batch->n_tok, S = batch->n_seq, D = c.n_embd;
@@ -1098,6 +1713,7 @@ static void step(RadCtx* x, const RadBatch* batch) {
                         bcol(m.ekv, c.hc * D, D, T), RAD_W(L.e_gate), brows(m.h1, T));
             RAD_ISSUE_N(x, L.e_back, T, brows(m.h1, T), brows(m.h0, T));
         }
+        if (L.tap) RAD_ISSUE_N(x, L.tap, T, brows(m.h0, T), bcol(m.dsp.src, L.tap_col * D, D, T));
         RAD_ISSUE_N(x, L.mix_a, T, brows(m.h0, T), RAD_W(L.hc_a_fn), RAD_W(L.hc_a_scale),
                     RAD_W(L.hc_a_base), brows(m.pre_a, T), brows(m.post, T), brows(m.comb, T));
         RAD_ISSUE_N(x, L.col_a, T, brows(m.h0, T), brows(m.pre_f, T), brows(m.xcol, T));
@@ -1229,6 +1845,12 @@ static void step(RadCtx* x, const RadBatch* batch) {
 
 static int probe(const RadModelMeta* meta, RadArchProbe* out) {
     if (!meta || !out) return RAD_E_INVAL;
+    /* A DSpark drafter proposes the block it was trained at, every row predicting (block = depth). */
+    const int64_t ns = gi(meta, "nextn_predict_layers", 0), blk = gi(meta, "dspark.block_size", 0);
+    if (ns > 0 && blk > 0) {
+        out->draft_depth = (int)blk;
+        out->draft_depth_fixed = 1;
+    }
     return RAD_OK;
 }
 }  // namespace deepseek41

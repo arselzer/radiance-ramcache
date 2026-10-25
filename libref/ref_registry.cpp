@@ -453,7 +453,7 @@ static const RadOperandSpec oAttnSparseSink[] = { OPD("q"), OPD("window_cache"),
     OPD_O("comp_cache"), OPD_O("comp_bt"), OPD_O("sel"), OPD("positions"), OPD("cu_seqlens"),
     WGT("sinks"), OUT("out") };
 static const RadParamSpec pIndexScore[] = { P_INT("M"), P_INT("heads"), P_INT("dim"),
-    P_INT("ratio"), P_INT("width"), P_STR("dtype") };
+    P_INT("ratio"), P_INT("width"), P_F64("wscale"), P_STR("dtype") };
 static const RadOperandSpec oIndexScore[] = { OPD("q"), OPD("w"), OPD("index_cache"), OPD("bt"),
     OPD("positions"), OPD("cu_seqlens"), OUT("score") };
 static const RadParamSpec pIndexCand[] = { P_INT("M"), P_INT("width"), P_INT("block"),
@@ -1470,7 +1470,8 @@ static const RadOpSchema kSchemas[] = {
   "out = sum p k / (sum p + exp(sink - max)), rounded once; a row with no key is zero." },
 { "index_score", ARR(pIndexScore), ARR(oIndexScore),
   "Per row and compressed position j: sum_h relu(q_h . k_j) w_h with k_j entry j of the paged "
-  "index cache; the dot, relu(dot) w_h and the f32 head sum each rounded once to dtype. "
+  "index cache and w_h = round(w * wscale); the dot, relu(dot) w_h and the f32 head sum each "
+  "rounded once to dtype. "
   "j >= (pos+1)/ratio or an unmapped block scores -inf. score is f32 [M, width]." },
 { "index_candidates", ARR(pIndexCand), ARR(oIndexCand),
   "Blocks of `block` positions scored by their maximum, the newest reachable block pinned to "

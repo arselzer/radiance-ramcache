@@ -302,17 +302,18 @@ AVX_KERNEL(attn_sparse_sink) {
 }
 
 /* The indexer's score of each compressed position for each row (libref's index_score): per head
- * the dot q_h . k_j rounded to q's dtype, relu(dot) times the f32 head weight w_h rounded, the
- * head sum in f32 rounded. The row's queries and head weights are read once; each live position's
- * key is widened once and dotted with every head. */
+ * the dot q_h . k_j rounded to q's dtype, relu(dot) times w_h = round(w * wscale) rounded, the head
+ * sum in f32 rounded. The row's queries and head weights are read once; each live position's key
+ * is widened once and dotted with every head. */
 AVX_KERNEL(index_score) {
     if (!rad_args_have(a, 7)) return RAD_E_INVAL;
     const RadTensor &q = a->t[0], &w = a->t[1], &kc = a->t[2], &bt = a->t[3];
     const RadTensor &pos = a->t[4], &cu = a->t[5], &sc = a->t[6];
     const int64_t H = p_int(a, "heads", 0), Dm = p_int(a, "dim", 0), ratio = p_int(a, "ratio", 0);
-    if (H < 1 || Dm < 1 || ratio < 1 || Dm % ratio || q.rank != 2 || q.shape[0] < 1 ||
-        q.shape[1] != H * Dm || w.rank != 2 || w.shape[0] != q.shape[0] || w.shape[1] != H ||
-        w.dtype != RAD_F32 || kc.rank != 4 || kc.shape[1] != 1 || kc.shape[3] * ratio != Dm ||
+    const float wscale = p_f32(a, "wscale", 0.0f);
+    if (H < 1 || Dm < 1 || ratio < 1 || Dm % ratio || !std::isfinite(wscale) || q.rank != 2 ||
+        q.shape[0] < 1 || q.shape[1] != H * Dm || w.rank != 2 || w.shape[0] != q.shape[0] ||
+        w.shape[1] != H || kc.rank != 4 || kc.shape[1] != 1 || kc.shape[3] * ratio != Dm ||
         kc.shape[2] % ratio || bt.rank != 2 || numel(&pos) != q.shape[0] || numel(&cu) < 2 ||
         sc.rank != 2 || sc.shape[0] != q.shape[0] || sc.shape[1] < 1 || sc.dtype != RAD_F32)
         return RAD_E_SHAPE;
@@ -327,7 +328,10 @@ AVX_KERNEL(index_score) {
         float* wh = kv + Dm;
         float* row = wh + H;
         const float* qr = in_row(&q, rowoff(&q, m, H * Dm), H * Dm, qv);
-        for (int64_t h = 0; h < H; ++h) wh[h] = ldt(&w, rowoff(&w, m, H) + h * laststride(&w));
+        for (int64_t h = 0; h < H; ++h) {
+            const float v = ldt(&w, rowoff(&w, m, H) + h * laststride(&w)) * wscale;
+            wh[h] = exact ? v : narrow1(dt, v);
+        }
         const int64_t s = seq_of_row(cu, S, m);
         const int64_t reach = (ldi(&pos, offlin(&pos, m)) + 1) / ratio;
         for (int64_t j = 0; j < C; ++j) {

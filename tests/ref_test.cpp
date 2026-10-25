@@ -589,7 +589,7 @@ TEST(index_score_gates_relu_dots_per_head_and_masks_the_future) {
     T cu(RAD_I32, {2}); cu.n({0, 2});
     T sc(RAD_F32, {2, 3});
     A a; a.t(q).t(w).t(kc).t(bt).t(pos).t(cu).t(sc).i("M", 2).i("heads", H).i("dim", D).i("ratio", 2)
-        .i("width", 3).s("dtype", "f32");
+        .i("width", 3).d("wscale", 0.5).s("dtype", "f32");
     REQUIRE_EQ(run("index_score", a), RAD_OK);
     const int64_t koff[2] = {4, 0};   /* entry 0 -> block 1, entry 1 -> block 0 */
     for (int j = 0; j < 2; ++j) {
@@ -597,7 +597,7 @@ TEST(index_score_gates_relu_dots_per_head_and_masks_the_future) {
         for (int64_t h = 0; h < H; ++h) {
             double dot = 0;
             for (int64_t d = 0; d < D; ++d) dot += (double)q.at(h * D + d) * kc.at(koff[j] + d);
-            e += std::max(dot, 0.0) * w.at(h);
+            e += std::max(dot, 0.0) * (w.at(h) * 0.5);
         }
         CHECK(std::fabs(sc.at(j) - e) < 1e-5);
     }
@@ -8911,7 +8911,7 @@ std::vector<Geo> geometries() {
         G("attn_sparse_sink", "M", 3, a.i("M", R).i("heads", 2).i("dim", 8).i("window", 4).i("ratio", 2)
                                       .i("topk", 3).d("scale", 0.35).s("dtype", "f32")),
         G("index_score", "M", 3, a.i("M", R).i("heads", 2).i("dim", 8).i("ratio", 2).i("width", 5)
-                                 .s("dtype", "bf16")),
+                                 .d("wscale", 0.25).s("dtype", "bf16")),
         G("index_candidates", "M", 3, a.i("M", R).i("width", 20).i("block", 8).i("topk_blocks", 2)
                                       .i("ratio", 1)),
         G("index_topk", "M", 3, a.i("M", R).i("width", 9).i("topk", 4).i("ratio", 2)),

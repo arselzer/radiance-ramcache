@@ -232,7 +232,8 @@ int ref_attn_sparse_sink(const RadArgs* a, RadStream) {
 
 /* The indexer's score of each compressed position for each row: sum over heads h of
  * relu(q_h . k_j) w_h, where k_j is entry j of the paged index cache (addressed as
- * attn_sparse_sink's compressed entries). Rounded as the reference computes it in q's dtype: the
+ * attn_sparse_sink's compressed entries) and w_h = round(w[m, h] * wscale) (the reference scales
+ * its bf16 head weights by a constant). Rounded as the reference computes it in q's dtype: the
  * dot, then relu(dot) w_h, then the head sum accumulated in f32, each rounded once to the dtype
  * (no rounding for f32). A position the row has not passed, j >= (pos + 1) / ratio, or whose
  * block is unmapped, scores -inf. score is f32 [M, width]. */
@@ -241,9 +242,10 @@ int ref_index_score(const RadArgs* a, RadStream) {
     const RadTensor &q = a->t[0], &w = a->t[1], &kc = a->t[2], &bt = a->t[3];
     const RadTensor &pos = a->t[4], &cu = a->t[5], &sc = a->t[6];
     const int64_t H = p_int(a, "heads", 0), Dm = p_int(a, "dim", 0), ratio = p_int(a, "ratio", 0);
-    if (H < 1 || Dm < 1 || ratio < 1 || Dm % ratio || q.rank != 2 || q.shape[0] < 1 ||
-        q.shape[1] != H * Dm || w.rank != 2 || w.shape[0] != q.shape[0] || w.shape[1] != H ||
-        w.dtype != RAD_F32 || kc.rank != 4 || kc.shape[1] != 1 || kc.shape[3] * ratio != Dm ||
+    const float wscale = p_f32(a, "wscale", 0.0f);
+    if (H < 1 || Dm < 1 || ratio < 1 || Dm % ratio || !std::isfinite(wscale) || q.rank != 2 ||
+        q.shape[0] < 1 || q.shape[1] != H * Dm || w.rank != 2 || w.shape[0] != q.shape[0] ||
+        w.shape[1] != H || kc.rank != 4 || kc.shape[1] != 1 || kc.shape[3] * ratio != Dm ||
         kc.shape[2] % ratio || bt.rank != 2 || numel(&pos) != q.shape[0] || numel(&cu) < 2 ||
         sc.rank != 2 || sc.shape[0] != q.shape[0] || sc.shape[1] < 1 || sc.dtype != RAD_F32)
         return RAD_E_SHAPE;
@@ -267,8 +269,9 @@ int ref_index_score(const RadArgs* a, RadStream) {
                         for (int64_t d = 0; d < Dm; ++d)
                             dot += ldt(&q, qb + (h * Dm + d) * qs) * ldt(&kc, ko + d);
                         dot = round_dt(dt, dot);
-                        acc += round_dt(dt, std::max(dot, 0.0f) *
-                                                ldt(&w, rowoff(&w, m, H) + h * laststride(&w)));
+                        const float wh =
+                            round_dt(dt, ldt(&w, rowoff(&w, m, H) + h * laststride(&w)) * wscale);
+                        acc += round_dt(dt, std::max(dot, 0.0f) * wh);
                     }
                     v = round_dt(dt, acc);
                 }

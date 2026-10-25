@@ -1679,7 +1679,7 @@ int ref_index_score_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* o
     const int64_t ncb = C + 1;
     Opd o;
     o.t(D, { M, H * Dm });                              /* q */
-    o.t((uint32_t)RAD_F32, { M, H });                   /* head weights */
+    o.t(D, { M, H });                                   /* head weights */
     o.t(D, { ncb, 1, ratio, Dm / ratio });              /* index cache: an entry a block */
     o.t_idx({ 1, ncb }, ncb, -1, 0);                    /* block table */
     o.t_idx({ M }, M, -1, 0);                           /* positions */

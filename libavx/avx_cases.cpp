@@ -1190,7 +1190,7 @@ std::vector<Case> build_cases() {
         add("attn_sparse_sink", { HI("M", 9), HI("heads", 3), HI("dim", 64), HI("window", 8),
                                   HI("ratio", 4), HI("topk", 5), HF("scale", 0.125), HS("dtype", dt) });
         add("index_score", { HI("M", 9), HI("heads", 4), HI("dim", 64), HI("ratio", 4),
-                             HI("width", 13), HS("dtype", dt) });
+                             HI("width", 13), HF("wscale", 0.25), HS("dtype", dt) });
         add("entry_store", { HI("M", 5), HI("n", 128), HI("block_size", 4), HS("dtype", dt) });
         add("stream_gate_add", { HI("M", 5), HI("n", 129), HI("hc", 4), HF("eps", 1e-6),
                                  HF("gate_eps", 1e-6), HS("dtype", dt) });

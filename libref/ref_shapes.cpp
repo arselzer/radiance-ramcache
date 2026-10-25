@@ -1644,6 +1644,33 @@ int ref_softmax_pool_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* 
     return o.finish("softmax_pool", operand, out);
 }
 
+int ref_attn_sparse_sink_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), H = gi(p, n_p, "heads", 0), Dm = gi(p, n_p, "dim", 0);
+    const int64_t win = gi(p, n_p, "window", 0), ratio = gi(p, n_p, "ratio", 0);
+    const int64_t topk = gi(p, n_p, "topk", 0);
+    if (M <= 0 || H < 1 || Dm < 2 || win < 1 || ratio < 0 || (ratio > 0 && (topk < 1 || Dm % ratio)))
+        return RAD_E_UNSUPPORTED;
+    const uint32_t D = act_dt(p, n_p);
+    /* One sequence; window blocks of 4 slots covering every position a row may hold. */
+    const int64_t bs = 4, nb = (M + bs - 1) / bs + 1, ncb = M + 1;
+    Opd o;
+    o.t(D, { M, H * Dm });                              /* q */
+    o.t(D, { nb, 1, bs, Dm });                          /* window cache */
+    o.t_idx({ 1, nb }, nb, -1, 0);                      /* window block table */
+    if (ratio > 0) {
+        o.t(D, { ncb, 1, ratio, Dm / ratio });          /* compressed cache: an entry a block */
+        o.t_idx({ 1, ncb }, ncb, -1, 0);                /* compressed block table */
+        o.t_idx({ M, topk }, ncb, -1, 0);               /* selected compressed positions */
+    } else {
+        o.skip(); o.skip(); o.skip();
+    }
+    o.t_idx({ M }, M, -1, 0);                           /* positions */
+    o.t_idx({ 2 }, M, -1, (uint32_t)RAD_OPD_F_IDX_CU);  /* cu_seqlens */
+    o.t((uint32_t)RAD_F32, { H });                      /* sinks */
+    o.t(D, { M, H * Dm });                              /* out */
+    return o.finish("attn_sparse_sink", operand, out);
+}
+
 int ref_qsa_block_key_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = gi(p, n_p, "M", 0);
     const int64_t n = gi(p, n_p, "n", 0);

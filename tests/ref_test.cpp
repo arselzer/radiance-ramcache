@@ -521,6 +521,61 @@ TEST(softmax_pool_weights_each_channel_by_its_own_softmax) {
     CHECK_EQ(out.at(3), 7.0f);
 }
 
+/* attn_sparse_sink against keys listed by hand: row 0 (position 4, window 3) reads window slots
+ * 4, 5 (block 1 -> 2) and 2 (block 2 -> 1) plus compressed entries 0 (block 2) and 2 (block 0);
+ * row 1 (position 1) reads window slots 6, 7 (block 0 -> 3), skips position -1, skips the -1
+ * selection and entry 1, whose block is unmapped. The sink joins only the denominator. */
+TEST(attn_sparse_sink_reads_the_window_and_the_selected_entries) {
+    const int64_t D = 4, H = 2;
+    T q(RAD_F32, {2, H * D}), wc(RAD_F32, {4, 1, 2, D}), cc(RAD_F32, {3, 1, 2, D / 2});
+    for (int64_t i = 0; i < 2 * H * D; ++i) q.set(i, std::sin(0.9f * (float)i + 0.3f));
+    for (int64_t i = 0; i < 4 * 2 * D; ++i) wc.set(i, std::cos(0.37f * (float)i));
+    for (int64_t i = 0; i < 3 * 2 * (D / 2); ++i) cc.set(i, std::sin(0.53f * (float)i - 1.0f));
+    T wbt(RAD_I32, {1, 4}); wbt.n({3, 2, 1, 0});
+    T cbt(RAD_I32, {1, 3}); cbt.n({2, -1, 0});
+    T sel(RAD_I32, {2, 2}); sel.n({0, 2, -1, 1});
+    T pos(RAD_I32, {2}); pos.n({4, 1});
+    T cu(RAD_I32, {2}); cu.n({0, 2});
+    T sink(RAD_F32, {H}); sink.f({0.3f, -0.5f});
+    T out(RAD_F32, {2, H * D});
+    A a; a.t(q).t(wc).t(wbt).t(cc).t(cbt).t(sel).t(pos).t(cu).t(sink).t(out).i("M", 2).i("heads", H)
+        .i("dim", D).i("window", 3).i("ratio", 2).i("topk", 2).d("scale", 0.5).s("dtype", "f32");
+    REQUIRE_EQ(run("attn_sparse_sink", a), RAD_OK);
+    struct Key { const T* t; int64_t off; };
+    const std::vector<std::vector<Key>> keys = {
+        {{&wc, 16}, {&wc, 20}, {&wc, 8}, {&cc, 8}, {&cc, 0}},
+        {{&wc, 24}, {&wc, 28}},
+    };
+    for (int64_t m = 0; m < 2; ++m)
+        for (int64_t h = 0; h < H; ++h) {
+            std::vector<double> sc;
+            double mx = -1e30;
+            for (const Key& k : keys[(size_t)m]) {
+                double dot = 0;
+                for (int64_t d = 0; d < D; ++d) dot += (double)q.at(m * H * D + h * D + d) * k.t->at(k.off + d);
+                sc.push_back(dot * 0.5);
+                mx = std::max(mx, sc.back());
+            }
+            double den = std::exp((double)sink.at(h) - mx);
+            std::vector<double> acc((size_t)D, 0.0);
+            for (size_t i = 0; i < sc.size(); ++i) {
+                const double pk = std::exp(sc[i] - mx);
+                den += pk;
+                for (int64_t d = 0; d < D; ++d) acc[(size_t)d] += pk * keys[(size_t)m][i].t->at(keys[(size_t)m][i].off + d);
+            }
+            for (int64_t d = 0; d < D; ++d)
+                CHECK(std::fabs(out.at(m * H * D + h * D + d) - acc[(size_t)d] / den) < 1e-5);
+        }
+    /* Window only (ratio 0): the compressed operands may be absent. */
+    A w; w.t(q).t(wc).t(wbt).tnull().tnull().tnull().t(pos).t(cu).t(sink).t(out).i("M", 2).i("heads", H)
+        .i("dim", D).i("window", 3).i("ratio", 0).i("topk", 0).d("scale", 0.5).s("dtype", "f32");
+    REQUIRE_EQ(run("attn_sparse_sink", w), RAD_OK);
+    /* A compressed entry wider than the cache's block is refused. */
+    A b; b.t(q).t(wc).t(wbt).t(cc).t(cbt).t(sel).t(pos).t(cu).t(sink).t(out).i("M", 2).i("heads", H)
+        .i("dim", D).i("window", 3).i("ratio", 4).i("topk", 2).d("scale", 0.5).s("dtype", "f32");
+    CHECK_EQ(run("attn_sparse_sink", b), RAD_E_SHAPE);
+}
+
 TEST(manifold_sinkhorn_first_pass_and_epsilon_are_distinct) {
     T h(RAD_F32, {1, 2}); h.f({1, 3});
     T fn(RAD_F32, {8, 2}), scale(RAD_F32, {3}); scale.f({1, 1, 1});
@@ -1169,7 +1224,7 @@ TEST(op_vocabulary) {
         "rmsnorm", "rmsnorm_p", "rmsnorm_add", "hc_enter", "hc_read", "hc_write", "hc_project",
         "mtp_enter",
         "mhc_pre", "mhc_pre_partial", "mhc_pre_finish", "mhc_post", "mhc_contract",
-        "mhc_mix", "mhc_collapse", "swiglu_clamped", "router_sigmoid_topk", "router_scored_topk", "rope_rows", "quant_roundtrip", "softmax_pool", "dsa_pool", "dsa_query", "dsa_score", "mla_attn", "mla_project", "gemm_nt_f32",
+        "mhc_mix", "mhc_collapse", "swiglu_clamped", "router_sigmoid_topk", "router_scored_topk", "rope_rows", "quant_roundtrip", "softmax_pool", "attn_sparse_sink", "dsa_pool", "dsa_query", "dsa_score", "mla_attn", "mla_project", "gemm_nt_f32",
         "kda_update",
         "layernorm", "add", "mul", "mul_weight", "silu_mul", "gelu_mul", "act_mul", "seg_mean",
         "pool_rows", "relu", "clamp", "conv2d", "conv2d_unfold", "conv1d_dw", "rel_sinusoid",
@@ -8743,6 +8798,8 @@ std::vector<Geo> geometries() {
         G("quant_roundtrip", "M", 3, a.i("M", R).i("n", 64).i("block", 32).s("format", "fp4_e2m1")
                                      .s("scale", "ue8m0").s("dtype", "bf16")),
         G("softmax_pool", "M", 3, a.i("M", R).i("n", 8).i("ratio", 2).s("dtype", "bf16")),
+        G("attn_sparse_sink", "M", 3, a.i("M", R).i("heads", 2).i("dim", 8).i("window", 4).i("ratio", 2)
+                                      .i("topk", 3).d("scale", 0.35).s("dtype", "f32")),
         G("rope_rows", "M", 3, a.i("M", R).i("n_head", 2).i("head_dim", 12).i("rot", 8).i("off", 4)
                                .s("mode", "gptj").i("inverse", 0).s("dtype", "f32")),
         G("qsa_block_key", "M", 2, a.i("M", R).i("n", 32).i("ratio", 4).i("rotary_dim", 8)

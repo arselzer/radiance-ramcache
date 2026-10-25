@@ -2,6 +2,7 @@
  *
  *   quant_roundtrip    the block-scaled quantise-dequantise round trip of a cached key
  *   softmax_pool       `ratio` rows folded into one compressed entry by a channel-wise softmax
+ *   attn_sparse_sink   latent attention over a window and the selected compressed entries
  *
  * Each kernel computes libref's expression. Where libref's result is exact (the round trip's codes
  * and scales) this one is the same bits; elsewhere it differs from libref only in summation
@@ -182,6 +183,114 @@ AVX_KERNEL(softmax_pool) {
             acc[c] = s;
         }
         out_row(&out, rowoff(&out, w, n), n, acc);
+    }
+    return RAD_OK;
+}
+
+namespace {
+/* The s with cu[s] <= row < cu[s+1] (libref's seq_of_row). */
+int64_t seq_of_row(const RadTensor& cu, int64_t n_seq, int64_t row) {
+    int64_t lo = 0, hi = n_seq;
+    while (hi - lo > 1) {
+        const int64_t mid = (lo + hi) / 2;
+        if (ldi(&cu, offlin(&cu, mid)) <= row) lo = mid;
+        else hi = mid;
+    }
+    return lo;
+}
+
+/* `n` elements of t from flat offset `off`, as f32 (a cache entry: dense, libref's flat read). */
+void widen_flat(const RadTensor& t, int64_t off, int64_t n, float* dst) {
+    row_to_f32(t.dtype, byte_at(t.data, t.dtype, off), dst, n);
+}
+}  // namespace
+
+/* Latent attention with a sink over a window and the selected compressed entries (libref's
+ * attn_sparse_sink, the same keys): each row's keys are found and widened once, then per head the
+ * scores are vector dots, p = exp(s - max) as libref (expf), and the output a vector sum of p k. */
+AVX_KERNEL(attn_sparse_sink) {
+    if (!a || a->n_t < 10 || !a->t) return RAD_E_INVAL;
+    const RadTensor &q = a->t[0], &wc = a->t[1], &wbt = a->t[2];
+    const RadTensor *cc = a->t[3].data ? &a->t[3] : nullptr, *cbt = a->t[4].data ? &a->t[4] : nullptr;
+    const RadTensor* sel = a->t[5].data ? &a->t[5] : nullptr;
+    const RadTensor &pos = a->t[6], &cu = a->t[7], &sink = a->t[8], &out = a->t[9];
+    const int64_t H = p_int(a, "heads", 0), D = p_int(a, "dim", 0), win = p_int(a, "window", 0);
+    const int64_t ratio = p_int(a, "ratio", 0), topk = p_int(a, "topk", 0);
+    const float scale = p_f32(a, "scale", 0.0f);
+    const bool comp = ratio > 0;
+    if (H < 1 || D < 2 || D > 4096 || win < 1 || ratio < 0 || topk < 0 || !std::isfinite(scale) ||
+        scale <= 0 || (comp && (!cc || !cbt || !sel || topk < 1 || D % ratio)))
+        return RAD_E_SHAPE;
+    if (!q.data || !wc.data || !wbt.data || !pos.data || !cu.data || !sink.data || !out.data ||
+        q.rank != 2 || q.shape[0] < 1 || q.shape[1] != H * D || out.rank != 2 ||
+        out.shape[0] != q.shape[0] || out.shape[1] != H * D || wc.rank != 4 || wc.shape[1] != 1 ||
+        wc.shape[3] != D || wbt.rank != 2 || numel(&pos) != q.shape[0] || numel(&sink) != H ||
+        sink.dtype != RAD_F32 || numel(&cu) < 2)
+        return RAD_E_SHAPE;
+    const int64_t cbs = comp ? cc->shape[2] : 0;
+    if (comp && (cc->rank != 4 || cc->shape[1] != 1 || cc->shape[3] * ratio != D || cbs % ratio ||
+                 cbt->rank != 2 || sel->rank != 2 || sel->shape[0] != q.shape[0] ||
+                 sel->shape[1] != topk || cbt->shape[0] != wbt.shape[0]))
+        return RAD_E_SHAPE;
+    const int64_t M = q.shape[0], S = numel(&cu) - 1, bs = wc.shape[2];
+    const int64_t nkeys = win + (comp ? topk : 0);
+    const int64_t qs = laststride(&q), os = laststride(&out);
+    AVX_PARALLEL_FOR_IF(M * H * nkeys * D >= AVX_PAR_MIN)
+    for (int64_t m = 0; m < M; ++m) {
+        const int64_t s = seq_of_row(cu, S, m);
+        const int64_t p = ldi(&pos, offlin(&pos, m));
+        /* The row's keys widened, in libref's key order (the window, then the selection); a slot
+         * with no key is left out, as every one of libref's sums skips it. */
+        float* buf = scratch_f32((size_t)(nkeys * D + 2 * D + nkeys + 16));
+        float* keys = buf;
+        float* qh = keys + nkeys * D;
+        float* acc = qh + D;
+        float* sc = acc + D;
+        int64_t nk = 0;
+        for (int64_t i = 0; i < win; ++i) {
+            const int64_t j = p - win + 1 + i;
+            if (j < 0 || j / bs >= wbt.shape[1]) continue;
+            const int64_t blk = ldi(&wbt, rowoff(&wbt, s, wbt.shape[1]) + (j / bs) * laststride(&wbt));
+            if (blk < 0 || blk >= wc.shape[0]) continue;
+            widen_flat(wc, ((blk * bs) + j % bs) * D, D, keys + nk * D);
+            ++nk;
+        }
+        for (int64_t t = 0; comp && t < topk; ++t) {
+            const int64_t c = ldi(sel, rowoff(sel, m, topk) + t * laststride(sel));
+            if (c < 0 || (c * ratio) / cbs >= cbt->shape[1]) continue;
+            const int64_t blk =
+                ldi(cbt, rowoff(cbt, s, cbt->shape[1]) + ((c * ratio) / cbs) * laststride(cbt));
+            if (blk < 0 || blk >= cc->shape[0]) continue;
+            widen_flat(*cc, (blk * cbs + (c * ratio) % cbs) * (D / ratio), D, keys + nk * D);
+            ++nk;
+        }
+        for (int64_t h = 0; h < H; ++h) {
+            const int64_t qb = rowoff(&q, m, H * D) + h * D * qs;
+            const float* qv = in_row(&q, qb, D, qh);
+            float mx = -1e30f;
+            for (int64_t k = 0; k < nk; ++k) {
+                sc[k] = dotf(qv, keys + k * D, D) * scale;
+                mx = std::max(mx, sc[k]);
+            }
+            float den = 0;
+            for (int64_t d = 0; d < D; ++d) acc[d] = 0.0f;
+            for (int64_t k = 0; k < nk; ++k) {
+                const float pk = std::exp(sc[k] - mx);
+                den += pk;
+                const float* kv = keys + k * D;
+                const vf vp = vf_set1(pk);
+                int64_t d = 0;
+                for (; d + VF_N <= D; d += VF_N)
+                    vf_storeu(acc + d, vf_fma(vp, vf_loadu(kv + d), vf_loadu(acc + d)));
+                for (; d < D; ++d) acc[d] += pk * kv[d];
+            }
+            den += std::exp(ldt(&sink, h * laststride(&sink)) - mx);
+            const vf vd = vf_set1(den);
+            int64_t d = 0;
+            for (; d + VF_N <= D; d += VF_N) vf_storeu(acc + d, vf_div(vf_loadu(acc + d), vd));
+            for (; d < D; ++d) acc[d] = acc[d] / den;
+            out_row(&out, rowoff(&out, m, H * D) + h * D * os, D, acc);
+        }
     }
     return RAD_OK;
 }

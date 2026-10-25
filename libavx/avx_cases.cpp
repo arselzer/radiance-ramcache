@@ -1184,6 +1184,11 @@ std::vector<Case> build_cases() {
                                  HS("scale", "e4m3"), HS("dtype", dt) });
         for (int ratio : { 4, 64 })
             add("softmax_pool", { HI("M", 5), HI("n", 131), HI("ratio", ratio), HS("dtype", dt) });
+        /* The window alone, then with the compressed entries. */
+        add("attn_sparse_sink", { HI("M", 12), HI("heads", 3), HI("dim", 64), HI("window", 6),
+                                  HI("ratio", 0), HI("topk", 0), HF("scale", 0.125), HS("dtype", dt) });
+        add("attn_sparse_sink", { HI("M", 9), HI("heads", 3), HI("dim", 64), HI("window", 8),
+                                  HI("ratio", 4), HI("topk", 5), HF("scale", 0.125), HS("dtype", dt) });
     }
 
     /* ================================================================== speed-only, at model size

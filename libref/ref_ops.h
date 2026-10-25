@@ -163,6 +163,7 @@ int ref_rope_table         (const RadArgs*, RadStream);
 int ref_rope_rows          (const RadArgs*, RadStream);
 int ref_quant_roundtrip    (const RadArgs*, RadStream);
 int ref_softmax_pool       (const RadArgs*, RadStream);
+int ref_attn_sparse_sink   (const RadArgs*, RadStream);
 int ref_qk_norm_rope       (const RadArgs*, RadStream);
 /* image generation (ref_gen.cpp) */
 int ref_ln_mod(const RadArgs*, RadStream);
@@ -425,6 +426,7 @@ REF_SHAPE_FN(ref_rope_table);
 REF_SHAPE_FN(ref_rope_rows);
 REF_SHAPE_FN(ref_quant_roundtrip);
 REF_SHAPE_FN(ref_softmax_pool);
+REF_SHAPE_FN(ref_attn_sparse_sink);
 REF_SHAPE_FN(ref_qk_norm_rope);
 REF_SHAPE_FN(ref_ln_mod);
 REF_SHAPE_FN(ref_ln_mod_quant_fp8);

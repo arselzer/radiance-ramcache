@@ -447,6 +447,11 @@ static const RadParamSpec pQuantRoundtrip[] = { P_INT("M"), P_INT("n"), P_INT("b
 static const RadOperandSpec oQuantRoundtrip[] = { INOUT("x") };
 static const RadParamSpec pSoftmaxPool[] = { P_INT("M"), P_INT("n"), P_INT("ratio"), P_STR("dtype") };
 static const RadOperandSpec oSoftmaxPool[] = { OPD("stage"), OUT("out"), OPD_O("page") };
+static const RadParamSpec pAttnSparseSink[] = { P_INT("M"), P_INT("heads"), P_INT("dim"),
+    P_INT("window"), P_INT("ratio"), P_INT("topk"), P_F64("scale"), P_STR("dtype") };
+static const RadOperandSpec oAttnSparseSink[] = { OPD("q"), OPD("window_cache"), OPD("window_bt"),
+    OPD_O("comp_cache"), OPD_O("comp_bt"), OPD_O("sel"), OPD("positions"), OPD("cu_seqlens"),
+    WGT("sinks"), OUT("out") };
 
 /* QSA's compressed key, libr4d's schema exactly (libr4d/r4d_rows.cpp): `block_size` is `ratio`
  * spelled for the block-key store's KV group; `page` and `pos` are optional. */
@@ -1441,6 +1446,12 @@ static const RadOpSchema kSchemas[] = {
   "Channel-wise softmax pooling of `ratio` rows: stage [M*ratio, 2n] f32 holds each entry's "
   "values then scores; out[w,c] = sum_i softmax_i(score[i,c]) value[i,c] in f32, rounded once. "
   "An entry whose optional page is negative is not written." },
+{ "attn_sparse_sink", ARR(pAttnSparseSink), ARR(oAttnSparseSink),
+  "Latent attention (key = value, dim wide) with a per-head sink over the window cache's keys "
+  "at [pos-window+1, pos] (block wbt[s][j/bs], cache [blocks,1,bs,dim]) and, with ratio > 0, "
+  "the selected compressed entries c (tokens [c ratio, (c+1) ratio), block cbt[s][c ratio/cbs], "
+  "cache [blocks,1,cbs,dim/ratio]). f32 scores q.k*scale, max floored at -1e30, "
+  "out = sum p k / (sum p + exp(sink - max)), rounded once; a row with no key is zero." },
 { "rope_rows", ARR(pRopeRows), ARR(oRopeRows),
   "rope from a rope_table plane over columns [off, off+rot) of each head_dim-wide head of x, in "
   "place: gptj pairs adjacent columns, neox i with i+rot/2; (a,b)(c+is) in f32, rounded once; "
@@ -2368,6 +2379,7 @@ SIMPLE("ref_rope_table", "rope_table", "attn", "cos/sin at each position's own r
 SIMPLE("ref_rope_rows", "rope_rows", "attn", "rope from a cos/sin plane over a window of each head", DT_FLOAT, ref_rope_rows),
 SIMPLE("ref_quant_roundtrip", "quant_roundtrip", "quant", "block-scaled fp8/fp4 quantise-dequantise in place", DT_FLOAT, ref_quant_roundtrip),
 SIMPLE("ref_softmax_pool", "softmax_pool", "attn", "channel-wise softmax pooling of ratio rows", DT_FLOAT, ref_softmax_pool),
+SIMPLE("ref_attn_sparse_sink", "attn_sparse_sink", "attn", "window plus selected compressed latent attention with sinks", DT_FLOAT, ref_attn_sparse_sink),
 SIMPLE("ref_qsa_block_key", "qsa_block_key", "attn",
        "QSA compressed key: pooled, normed and rotated at the block's position", DT_FLOAT,
        ref_qsa_block_key),

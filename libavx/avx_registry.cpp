@@ -378,6 +378,11 @@ static const RadParamSpec pQuantRoundtrip[] = { P_INT("M"), P_INT("n"), P_INT("b
 static const RadOperandSpec oQuantRoundtrip[] = { INOUT("x") };
 static const RadParamSpec pSoftmaxPool[] = { P_INT("M"), P_INT("n"), P_INT("ratio"), P_STR("dtype") };
 static const RadOperandSpec oSoftmaxPool[] = { OPD("stage"), OUT("out"), OPD_O("page") };
+static const RadParamSpec pAttnSparseSink[] = { P_INT("M"), P_INT("heads"), P_INT("dim"),
+    P_INT("window"), P_INT("ratio"), P_INT("topk"), P_F64("scale"), P_STR("dtype") };
+static const RadOperandSpec oAttnSparseSink[] = { OPD("q"), OPD("window_cache"), OPD("window_bt"),
+    OPD_O("comp_cache"), OPD_O("comp_bt"), OPD_O("sel"), OPD("positions"), OPD("cu_seqlens"),
+    WGT("sinks"), OUT("out") };
 
 /* QSA's compressed key, libr4d's schema (libr4d/r4d_rows.cpp): `block_size` is `ratio` under the
  * name the block-key store's KV group uses; `page` and `pos` are optional. */
@@ -1089,6 +1094,8 @@ static const RadOpSchema kSchemas[] = {
   "block-scaled fp8 / fp4 quantise then dequantise in place, libref's scales and codes." },
 { "softmax_pool", ARR(pSoftmaxPool), ARR(oSoftmaxPool),
   "channel-wise softmax pooling of `ratio` rows into one entry; a negative page skips it." },
+{ "attn_sparse_sink", ARR(pAttnSparseSink), ARR(oAttnSparseSink),
+  "latent attention with a per-head sink over the window and the selected compressed entries." },
 { "qsa_block_key", ARR(pQsaBlockKey), ARR(oQsaBlockKey),
   "QSA's compressed key: the mean of a block's `ratio` rows rounded to k's dtype, RMS-normed with "
   "gain (wadd + w), rotated at the block's position with `rope`'s ladder and YaRN; libref's "
@@ -1684,6 +1691,8 @@ SIMPLE("avx_quant_roundtrip", "quant_roundtrip", "quant",
        "block-scaled fp8 / fp4 quantise-dequantise in place", DT_FLOAT, L(quant_roundtrip)),
 SIMPLE("avx_softmax_pool", "softmax_pool", "attn", "channel-wise softmax pooling of ratio rows",
        DT_FLOAT, L(softmax_pool)),
+SIMPLE("avx_attn_sparse_sink", "attn_sparse_sink", "attn",
+       "window plus selected compressed latent attention with sinks", DT_FLOAT, L(attn_sparse_sink)),
 SIMPLE("avx_qsa_block_key", "qsa_block_key", "attn",
        "QSA compressed key: pooled, normed and rotated at the block's position", DT_FLOAT,
        L(qsa_block_key)),

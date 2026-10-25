@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <vector>
 
 using namespace ref;
 
@@ -124,6 +125,106 @@ int ref_softmax_pool(const RadArgs* a, RadStream) {
             for (int64_t i = 0; i < ratio; ++i)
                 acc += sc[i] / den * ldt(&st, rowoff(&st, w * ratio + i, 2 * n) + c * ss);
             stt(&out, ob + c * os, acc);
+        }
+    }
+    return RAD_OK;
+}
+
+namespace {
+int64_t seq_of_row(const RadTensor& cu, int64_t n_seq, int64_t row) {
+    int64_t lo = 0, hi = n_seq;   /* the s with cu[s] <= row < cu[s+1] */
+    while (hi - lo > 1) {
+        const int64_t mid = (lo + hi) / 2;
+        if (ld_int(cu.dtype, cu.data, offlin(&cu, mid)) <= row) lo = mid;
+        else hi = mid;
+    }
+    return lo;
+}
+}  // namespace
+
+/* Latent attention with a sink over two paged sources: the window cache's keys at positions
+ * [pos - window + 1, pos], and the compressed cache's entries the row selected. A key is its own
+ * value (`dim` wide). Window slot of position j: block wbt[s][j / bs] (its cache is
+ * [blocks, 1, bs, dim]); compressed entry c: tokens [c ratio, (c+1) ratio), slots of block
+ * cbt[s][c ratio / cbs] (cache [blocks, 1, cbs, dim / ratio], cbs a multiple of ratio). A negative
+ * block or selection is no key. Per head: f32 scores q.k * scale, max floored at -1e30,
+ * p = exp(s - max), out = sum p k / (sum p + exp(sink - max)), rounded once to out's dtype. A row
+ * with no key gives zeros. */
+int ref_attn_sparse_sink(const RadArgs* a, RadStream) {
+    /* Operands 3-5 are optional (null without a compressed source), so count rather than have(). */
+    if (!a || a->n_t < 10 || !a->t) return RAD_E_INVAL;
+    const RadTensor &q = a->t[0], &wc = a->t[1], &wbt = a->t[2];
+    const RadTensor *cc = a->t[3].data ? &a->t[3] : nullptr, *cbt = a->t[4].data ? &a->t[4] : nullptr;
+    const RadTensor *sel = a->t[5].data ? &a->t[5] : nullptr;
+    const RadTensor &pos = a->t[6], &cu = a->t[7], &sink = a->t[8], &out = a->t[9];
+    const int64_t H = p_int(a, "heads", 0), D = p_int(a, "dim", 0), win = p_int(a, "window", 0);
+    const int64_t ratio = p_int(a, "ratio", 0), topk = p_int(a, "topk", 0);
+    const float scale = p_f32(a, "scale", 0.0f);
+    const bool comp = ratio > 0;
+    if (H < 1 || D < 2 || D > 4096 || win < 1 || ratio < 0 || topk < 0 || !std::isfinite(scale) ||
+        scale <= 0 || (comp && (!cc || !cbt || !sel || topk < 1 || D % ratio)))
+        return RAD_E_SHAPE;
+    if (!q.data || !wc.data || !wbt.data || !pos.data || !cu.data || !sink.data || !out.data ||
+        q.rank != 2 || q.shape[0] < 1 || q.shape[1] != H * D || out.rank != 2 ||
+        out.shape[0] != q.shape[0] || out.shape[1] != H * D || wc.rank != 4 || wc.shape[1] != 1 ||
+        wc.shape[3] != D || wbt.rank != 2 || numel(&pos) != q.shape[0] || numel(&sink) != H ||
+        sink.dtype != RAD_F32 || numel(&cu) < 2)
+        return RAD_E_SHAPE;
+    const int64_t cbs = comp ? cc->shape[2] : 0;
+    if (comp && (cc->rank != 4 || cc->shape[1] != 1 || cc->shape[3] * ratio != D || cbs % ratio ||
+                 cbt->rank != 2 || sel->rank != 2 || sel->shape[0] != q.shape[0] ||
+                 sel->shape[1] != topk || cbt->shape[0] != wbt.shape[0]))
+        return RAD_E_SHAPE;
+    const int64_t M = q.shape[0], S = numel(&cu) - 1, bs = wc.shape[2];
+    const int64_t nkeys = win + (comp ? topk : 0);
+#pragma omp parallel for schedule(dynamic)
+    for (int64_t m = 0; m < M; ++m) {
+        const int64_t s = seq_of_row(cu, S, m);
+        const int64_t p = ld_int(pos.dtype, pos.data, offlin(&pos, m));
+        /* Each key's first element as a (tensor, flat offset) pair; -1 when there is no key. */
+        std::vector<const RadTensor*> kt((size_t)nkeys, nullptr);
+        std::vector<int64_t> ko((size_t)nkeys, -1);
+        for (int64_t i = 0; i < win; ++i) {
+            const int64_t j = p - win + 1 + i;
+            if (j < 0 || j / bs >= wbt.shape[1]) continue;
+            const int64_t blk = ld_int(wbt.dtype, wbt.data, rowoff(&wbt, s, wbt.shape[1]) +
+                                                               (j / bs) * laststride(&wbt));
+            if (blk < 0 || blk >= wc.shape[0]) continue;
+            kt[(size_t)i] = &wc;
+            ko[(size_t)i] = ((blk * bs) + j % bs) * D;
+        }
+        for (int64_t t = 0; comp && t < topk; ++t) {
+            const int64_t c = ld_int(sel->dtype, sel->data, rowoff(sel, m, topk) + t * laststride(sel));
+            if (c < 0 || (c * ratio) / cbs >= cbt->shape[1]) continue;
+            const int64_t blk = ld_int(cbt->dtype, cbt->data, rowoff(cbt, s, cbt->shape[1]) +
+                                                                  ((c * ratio) / cbs) * laststride(cbt));
+            if (blk < 0 || blk >= cc->shape[0]) continue;
+            kt[(size_t)(win + t)] = cc;
+            ko[(size_t)(win + t)] = (blk * cbs + (c * ratio) % cbs) * (D / ratio);
+        }
+        std::vector<float> sc((size_t)nkeys), acc((size_t)D);
+        for (int64_t h = 0; h < H; ++h) {
+            const int64_t qb = rowoff(&q, m, H * D) + h * D * laststride(&q);
+            float mx = -1e30f;
+            for (int64_t k = 0; k < nkeys; ++k) {
+                if (!kt[(size_t)k]) continue;
+                float dot = 0;
+                for (int64_t d = 0; d < D; ++d)
+                    dot += ldt(&q, qb + d * laststride(&q)) * ldt(kt[(size_t)k], ko[(size_t)k] + d);
+                sc[(size_t)k] = dot * scale;
+                mx = std::max(mx, sc[(size_t)k]);
+            }
+            float den = 0;
+            std::fill(acc.begin(), acc.end(), 0.0f);
+            for (int64_t k = 0; k < nkeys; ++k) {
+                if (!kt[(size_t)k]) continue;
+                const float pk = std::exp(sc[(size_t)k] - mx);
+                den += pk;
+                for (int64_t d = 0; d < D; ++d) acc[(size_t)d] += pk * ldt(kt[(size_t)k], ko[(size_t)k] + d);
+            }
+            den += std::exp(ldt(&sink, h * laststride(&sink)) - mx);
+            const int64_t ob = rowoff(&out, m, H * D) + h * D * laststride(&out);
+            for (int64_t d = 0; d < D; ++d) stt(&out, ob + d * laststride(&out), acc[(size_t)d] / den);
         }
     }
     return RAD_OK;

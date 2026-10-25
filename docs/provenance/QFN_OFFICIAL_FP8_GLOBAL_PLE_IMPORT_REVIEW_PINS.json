@@ -1,0 +1,26 @@
+{
+  "scope": "source/metadata only; no implementation/conversion/test execution or new payload acquisition",
+  "report_sha256": "73c94550a6d5255c88cbafed7c6f4a85a688d063e5b68169ceaefebde167e6b2",
+  "source_root": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/radiance-glm-engine-native-foundation-v2-src",
+  "Core_paths": {
+    "core/format/checkpoint.cpp": "a9f1ff3e938e0ff9ef1d80d8dac9dc159f7e541ca59b39e4ba1e39d7a78450aa",
+    "core/format/quantise.cpp": "359e7afd63a3d17ae733e14f8ec4bc7116f405f3af2f67ea5a8df07b6aaea59c",
+    "core/format/quantise.h": "4ae9cb8773344ca2342946b93f23efbcb47a2a2dd1a969c546cca682abe9c211",
+    "core/format/safetensors.cpp": "f41598ccbb11bb0e6f444b117b6df84525b1fc15e11fa6569ca11a66283ac75b",
+    "core/build/startup.cpp": "9ee1a78a2defd38375c5d67b8653ba54447f3c2b1020bed15d53bde75f9fcfbd",
+    "core/place/planner.cpp": "0280592118dc33747ef6c9e519076c7394ea21e51d54b4d9cc123f4f7b1646fc",
+    "tools/rad_convert.cpp": "9eaa52f8ad2c840baf20b96792fb7e97d1ecabe3e172cde0858618186c85db8c",
+    "libquant/lq_grid.cpp": "c2eac8d74afa046ec0485bd871ec7ff3f9773114b04918b622fe5cd92b66e3a0",
+    "libquant/CMakeLists.txt": "28677471f1ffc13bc5ed341fe05848ca1463aaccded2e225661ab4c5f85802c3",
+    "abi/rad_plugin.h": "ae440e30e36da68e7b64023ef3382fbd4db8f55b15fc405cf9ccc7b1a4a7e26e",
+    "arch/common/rad_block_ple.h": "25483c3ace5a61bfe7332e9dae4909167981aedab5a04f30c27207ebeb257f18",
+    "arch/qwen4exp_fp8/qwen4exp_fp8.cpp": "0e63d8f02ac85dde132ca753117d47389dcac423977e864287ac712517ca2908"
+  },
+  "metadata_paths": {
+    "qfn8bit-model-header-review/representative-headers-receipt.json": "77cd02b2bfaef5cad50ed447b11c36f6be72b7a6d3f41cb51479dba5f668622b",
+    "qfn8bit-model-header-review/metadata-receipt.json": "ab27ee0d45e56bf70fdb47b78bebad2064b67cfa9b9e002f7455af285e198f47",
+    "qfn8bit-model-header-review/model.safetensors.index.json": "0419e2c2dfbb925257d7409405433a793cf7ff7d96f3eba882a815ec6d9fe7a6",
+    "qfn8bit-model-header-review/config.json": "c22eb0a053eed62e18f0184d3ca62d3798f208c3e00b9feee939fc3dbacdc8ca",
+    "glm53-stock-full-graph-plan-v4-prototype/stock_plan.cpp": "94a7919f95c1ad23976da40fde221157d8d03a66d4fdffb232a64ed152e433ec"
+  }
+}

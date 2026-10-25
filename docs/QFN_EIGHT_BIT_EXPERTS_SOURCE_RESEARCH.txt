@@ -1,0 +1,120 @@
+Qwen3.8-Flash-Next: 8-bit expert feasibility, source review 2026-10-25
+
+Scope: source/metadata and primary model-card research only. No model download, conversion,
+benchmark, GPU access, deployment, or inference. Sources inspected are the frozen
+radiance-glm-engine-native-foundation-v2-src tree and the primary pages below. This is a
+conversion proposal, not a claim that an untested checkpoint has completed Radiance import.
+
+The useful existing model is Qwen/Qwen3.8-Flash-Next-FP8:
+https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8
+https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8/blob/main/config.json
+The publisher describes block-128 fine-grained FP8; its config declares fp8, dynamic
+activations, and 128x128 weight blocks. The visible config revision is 236dfdf. The repository
+tree is about 186 GB decimal, including non-expert weights, PLE and MTP. Its release is a real
+8-bit source, unlike expanding a four-bit container. Exact tensor headers, all mappings,
+scales, and payload identities remain a separate preflight gate.
+
+The ready Radiance file linked by the README is instead four-bit:
+https://huggingface.co/StillDeadcode/qwen3.8-next-flash-fp8-iq4r-moe
+Its card labels the experts four-bit codebook weights, ten experts BF16, and the trunk INT8;
+the approximately 113.6-GiB filename's fp8 component does not mean eight-bit experts. No
+all-eight-bit-expert .rad was found among the inspected README links, author listing and
+targeted searches. This is a search result, not a universal absence claim. EXL3 and W5
+community .rad releases found during the search remain lower-bit variants.
+
+Radiance already serves the required expert arithmetic. In
+arch/common/rad_block_moe_fp8.h, MoeFP8::format_of accepts E4M3 codes with two-plane affine
+BF16 scales at [128,128] (fp8a8), and the F32-scale spelling (fp8a8f32). It also serves BF16
+and multiple four-/five-bit forms. Its exhaustive served-format list contains no INT8 expert
+variant. The INT8 trunk and lm_head support is a different kernel path. Therefore use
+"FP8 experts" in an implementation proposal, rather than treating FP8 and INT8 as equivalent.
+No new expert GEMM is needed for the ordinary E4M3 form on gfx1201.
+
+TP4 is supported without slicing an FP8 block into four 160-column fragments. The actual
+QFN plugin splits its five 128-column expert blocks into 256/128/128/128 widths, rotating the
+extra block by expert ID modulo four. Every rank averages five blocks per four experts.
+See arch/qwen4exp_fp8/qwen4exp_fp8.cpp, block_slice and the four-class branch. Reuse this
+architecture; do not introduce a uniform 160-column cut or expert-parallel ownership.
+
+Two sensible conversion paths, with different precision statements:
+
+1. Controlled change from today's file. Start with the actual BF16 Qwen checkpoint and copy
+   data/recipes/qwen4exp-w4nl64-i8-hc8m.recipe to a new recipe. Keep all ten explicit protected
+   BF16 rules and every non-expert rule. Replace only the expert GPTQ/FWHT/codebook rule by:
+
+   blk.*.ffn_*_exps.*.weight  rtn codes=fp8_e4m3 block=128x128 scale=bf16
+
+   Proposed command, not run:
+
+   rad-convert /path/to/Qwen3.8-Flash-Next -o flashnext-fp8-experts-i8-trunk.rad \
+     --recipe /path/to/new-fp8-experts.recipe --reuse /path/to/current.rad --home HOME
+
+   First run the same command with --plan-only -v. The converter's documented --reuse
+   contract copies unchanged-rule weights from the previous container; changed experts come
+   from the real source. Assert that every non-expert's encoding and bytes stayed unchanged,
+   expert transforms are empty, and every rank resolves fp8a8. The newly rounded experts need
+   no GPTQ calibration. This produces FP8 plus ten BF16 exceptions, not literally all experts
+   at eight bits. Removing those exceptions is a separate comparison.
+
+2. Repack the official FP8 release. This avoids recreating its expert quantization and needs
+   the smaller FP8 source rather than BF16. The generic importer supports code/scale row
+   concatenation and 128x128 BF16/F32 scales, but no-recipe success is NOT established here.
+   PLE is the important mapping check: the architecture's ngram table requires one global
+   BF16 scale, whereas generic checkpoint source resolution searches each shard tensor's
+   adjacent _scale_inv or _scale. The recipe explicitly uses the official global scale
+   1.99317932128906e-4 (BF16 0x3951). Verify the actual parent-scale/shard spelling before
+   promising an untouched official-FP8 import; a narrowly checked global-scale mapping may
+   be needed. Do not fabricate or silently omit that scale. Trunk/HC/LM-head precision also
+   differs from today's recipe unless deliberately converted/reused, so this is not an
+   expert-only quality comparison. Direct checkpoint serving must pass the same checks.
+
+BF16->FP8 is a new lossy quantization. Native-FP8 code/scale repacking can preserve the source
+numbers if no scales are narrowed/recomputed. Four-bit->FP8 only stores the already-rounded
+values in more bytes and cannot recover the lost BF16 precision. Likewise, casting an
+official FP8 expert to BF16 does not recreate the original BF16 expert. Do not use --reuse to
+substitute four-bit expert payloads for source experts whose recipe changed.
+
+Conditional memory arithmetic (not measured native placement):
+- Main expert codes: 48*512*3*2560*640 = 120,795,955,200 B = 112.5 GiB.
+- BF16 block scales add 600 B per whole expert, 0.013733 GiB across the main graph.
+- One MTP layer's 512 FP8 experts adds 2.344036 GiB codes+scales if enabled.
+- FP8 PLE: 320,001,536*160 = 51,200,245,760 B = 47.683945 GiB, shared in host RAM rather
+  than multiplied by four. The original BF16 table would instead require 95.367889 GiB.
+- Main expert+PLE sum is already 160.197678 GiB before trunk, MTP, native padding and KV.
+- Keeping today's other weights and ten BF16 exceptions, replacing all main+MTP W4NL64
+  experts adds approximately 55.62 GiB of logical payload. Applied to the rounded 113.6-GiB
+  card size this predicts about 169.2 GiB, not an exact finished container size. Alignment,
+  scale/table layout and native record padding require the actual conversion/planner receipt.
+- TP4 average main FP8 logical expert payload is about 28.13 GiB/rank. Individual rank-local
+  records are about 0.938 or 1.875 MiB before member alignment. Never budget each expert as
+  one equal 160-column shard. For 4096-aligned members, record padding is material.
+
+On this host the parent's actual cards total 63.6875 GiB. The hypothetical available host
+memory after stopping the existing 104-GiB service is about 113.6 GiB, not the entire
+123.39-GiB MemTotal. Thus 177.29 GiB combined less the approximately 169.2-GiB candidate
+leaves only about 8.1 GiB for additional physical overhead, KV, loading peaks and padding.
+This does not prove startup failure, nor prove a full 262K multi-session profile fits.
+The current 12-GiB-per-rank expert host pools cannot simply remain unchanged: subtracting
+PLE from the candidate leaves roughly 121.5 GiB of other weights; with 48 GiB host pools,
+more than 73 GiB would still need card placement before runtime overhead, exceeding 63.7.
+
+The existing --ngram-placement disk path is an immediately relevant alternative: it reads
+the table through a shared host row cache and avoids the mandatory 47.7-GiB pinned copy.
+It trades I/O and gather latency for capacity, and needs real-prompt measurements. Keeping
+ngram RAM instead makes expert-cache capacity, KV allocation and loader peaks compete for
+the last few GiB. A bounded expert RAM cache could help, but is not a prerequisite proven
+by this arithmetic; stock expert_tiered plus disk-backed PLE may already fit a tiny context.
+Eight-bit expert misses carry roughly twice the weight bytes of W4NL; no speed or quality
+improvement is guaranteed without routing locality, cold-I/O, generation and matched-KL tests.
+
+First practical next step is metadata/header preflight and a converter plan for the two
+source options, then choose one controlled recipe. Any actual conversion/startup requires
+an authorized idle window and full native per-rank receipts. Keep tp-wire exact, KV dtype,
+prompt corpus, MTP and cache-hit state identical in the eventual precision comparison.
+
+Local source anchors: README.md models/conversion examples; docs/GUIDE.md sections3.2,
+--reuse and ngram placement; docs/MOE-W4.md memory/served-format discussion;
+data/recipes/qwen4exp-w4.recipe (FP8 blocks and official PLE scalar);
+data/recipes/qwen4exp-w4nl64-i8-hc8m.recipe; arch/common/rad_block_moe_fp8.h;
+arch/common/rad_block_ple.h; arch/qwen4exp_fp8/qwen4exp_fp8.cpp;
+core/format/checkpoint.cpp FP8 resolve branch. Source hashes accompany this report.

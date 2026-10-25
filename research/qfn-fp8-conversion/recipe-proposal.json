@@ -1,0 +1,30 @@
+{
+  "status": "recipe prepared; parser/converter/model execution pending",
+  "source_recipe": "radiance-src/data/recipes/qwen4exp-w4nl64-i8-hc8m.recipe",
+  "source_sha256": "65712a6fefa12c11bcbcaf47baf20030ca056465e9111b7e7b8f0eea62b270bc",
+  "output_recipe": "qfn8bit-conversion-plan/qwen4exp-fp8-experts-i8-hc8m.recipe",
+  "output_sha256": "9183b5e9c2b3a1d92de0933ce393ba9318522abf9b56f82e92f4c86704697d76",
+  "active_rules": 26,
+  "changed_rules": 1,
+  "protected_BF16_experts": 10,
+  "all_other_active_rules_byte_identical": true,
+  "BF16_source_required": true,
+  "existing_4bit_experts_not_reused": true,
+  "source_model_downloaded": false,
+  "production_changes": false,
+  "plan_command_template": [
+    "rad-convert",
+    "ABS_MATCHING_BF16_CHECKPOINT",
+    "-o",
+    "ABS_NEW_FP8_EXPERT_RAD",
+    "--recipe",
+    "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/qfn8bit-conversion-plan/qwen4exp-fp8-experts-i8-hc8m.recipe",
+    "--reuse",
+    "ABS_VERIFIED_SAME_SOURCE_PRODUCTION_RAD",
+    "--home",
+    "ABS_MATCHING_RADIANCE_HOME",
+    "--plan-only",
+    "-v"
+  ],
+  "native_FP8_source_alternative": "Official Qwen FP8 checkpoint is a smaller source; generic PLE global-scale mapping remains unverified and nonexpert precision differs unless explicitly controlled."
+}

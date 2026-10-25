@@ -1,0 +1,198 @@
+{
+  "repo": "Qwen/Qwen3.8-Flash-Next-FP8",
+  "revision": "236dfdf285828023ca3bcd3f37366c58a3469b13",
+  "headers": [
+    {
+      "shard": "model-00002-of-00131.safetensors",
+      "file_size": 1678209208,
+      "header_length": 282800,
+      "ranges": [
+        {
+          "url": "https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8/resolve/236dfdf285828023ca3bcd3f37366c58a3469b13/model-00002-of-00131.safetensors?header_begin=0&header_end=7",
+          "range": "bytes=0-7",
+          "bytes": 8,
+          "content_range": "bytes 0-7/1678209208",
+          "sha256": "7f1a9c10bff4d038a0889f7bc3e425ea5751e40a5e3b9be6d704a130d9644398"
+        },
+        {
+          "url": "https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8/resolve/236dfdf285828023ca3bcd3f37366c58a3469b13/model-00002-of-00131.safetensors?header_begin=8&header_end=282807",
+          "range": "bytes=8-282807",
+          "bytes": 282800,
+          "content_range": "bytes 8-282807/1678209208",
+          "sha256": "46fce270ed46b03c3219e6f11109aceff0440fa14beba4b09349de5a9e99eb01"
+        }
+      ],
+      "tensor_count": 2048,
+      "payload_read": false,
+      "all_header_spans_checked": true
+    },
+    {
+      "shard": "model-00003-of-00131.safetensors",
+      "file_size": 993901136,
+      "header_length": 144520,
+      "ranges": [
+        {
+          "url": "https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8/resolve/236dfdf285828023ca3bcd3f37366c58a3469b13/model-00003-of-00131.safetensors?header_begin=0&header_end=7",
+          "range": "bytes=0-7",
+          "bytes": 8,
+          "content_range": "bytes 0-7/993901136",
+          "sha256": "0928e150124d9273fc932a140579ab21015b1264e0201bb2e789681791c9e93e"
+        },
+        {
+          "url": "https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8/resolve/236dfdf285828023ca3bcd3f37366c58a3469b13/model-00003-of-00131.safetensors?header_begin=8&header_end=144527",
+          "range": "bytes=8-144527",
+          "bytes": 144520,
+          "content_range": "bytes 8-144527/993901136",
+          "sha256": "b114b2ea646bcade5694638cd36f3f678b6cd8fc432d2ee39ed07b2272196967"
+        }
+      ],
+      "tensor_count": 1046,
+      "payload_read": false,
+      "all_header_spans_checked": true
+    },
+    {
+      "shard": "model-00005-of-00131.safetensors",
+      "file_size": 1717267690,
+      "header_length": 143816,
+      "ranges": [
+        {
+          "url": "https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8/resolve/236dfdf285828023ca3bcd3f37366c58a3469b13/model-00005-of-00131.safetensors?header_begin=0&header_end=7",
+          "range": "bytes=0-7",
+          "bytes": 8,
+          "content_range": "bytes 0-7/1717267690",
+          "sha256": "1b583d8355b64e2dfcd676df8f3b1c3506c38bffbc4d424e83a0a32e9588a3a4"
+        },
+        {
+          "url": "https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8/resolve/236dfdf285828023ca3bcd3f37366c58a3469b13/model-00005-of-00131.safetensors?header_begin=8&header_end=143823",
+          "range": "bytes=8-143823",
+          "bytes": 143816,
+          "content_range": "bytes 8-143823/1717267690",
+          "sha256": "bfacd68a8e8620880b1cc05e0a9ab8139edaf0eb044443b23a3344873da5457d"
+        }
+      ],
+      "tensor_count": 1041,
+      "payload_read": false,
+      "all_header_spans_checked": true
+    }
+  ],
+  "targets": [
+    {
+      "name": "model.language_model.layers.0.mlp.experts.0.gate_proj.weight",
+      "shard": "model-00002-of-00131.safetensors",
+      "dtype": "F8_E4M3",
+      "shape": [
+        640,
+        2560
+      ],
+      "data_offsets": [
+        204800,
+        1843200
+      ]
+    },
+    {
+      "name": "model.language_model.layers.0.mlp.experts.0.gate_proj.weight_scale_inv",
+      "shard": "model-00002-of-00131.safetensors",
+      "dtype": "BF16",
+      "shape": [
+        5,
+        20
+      ],
+      "data_offsets": [
+        0,
+        200
+      ]
+    },
+    {
+      "name": "model.language_model.layers.0.mlp.experts.0.up_proj.weight",
+      "shard": "model-00002-of-00131.safetensors",
+      "dtype": "F8_E4M3",
+      "shape": [
+        640,
+        2560
+      ],
+      "data_offsets": [
+        1843200,
+        3481600
+      ]
+    },
+    {
+      "name": "model.language_model.layers.0.mlp.experts.0.up_proj.weight_scale_inv",
+      "shard": "model-00002-of-00131.safetensors",
+      "dtype": "BF16",
+      "shape": [
+        5,
+        20
+      ],
+      "data_offsets": [
+        200,
+        400
+      ]
+    },
+    {
+      "name": "model.language_model.layers.0.mlp.experts.0.down_proj.weight",
+      "shard": "model-00003-of-00131.safetensors",
+      "dtype": "F8_E4M3",
+      "shape": [
+        2560,
+        640
+      ],
+      "data_offsets": [
+        154895808,
+        156534208
+      ]
+    },
+    {
+      "name": "model.language_model.layers.0.mlp.experts.0.down_proj.weight_scale_inv",
+      "shard": "model-00003-of-00131.safetensors",
+      "dtype": "BF16",
+      "shape": [
+        20,
+        5
+      ],
+      "data_offsets": [
+        0,
+        200
+      ]
+    },
+    {
+      "name": "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight",
+      "shard": "model-00005-of-00131.safetensors",
+      "dtype": "F8_E4M3",
+      "shape": [
+        2500012,
+        160
+      ],
+      "data_offsets": [
+        917120026,
+        1317121946
+      ]
+    },
+    {
+      "name": "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.weight_scale",
+      "shard": "model-00005-of-00131.safetensors",
+      "dtype": "BF16",
+      "shape": [
+        1
+      ],
+      "data_offsets": [
+        78259224,
+        78259226
+      ]
+    }
+  ],
+  "expert_payload_read": false,
+  "scalar_payload_bytes_read": 2,
+  "passed": true,
+  "global_ngram_scale": {
+    "dtype": "BF16",
+    "bytes_hex": "5139",
+    "retrieval": {
+      "url": "https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8/resolve/236dfdf285828023ca3bcd3f37366c58a3469b13/model-00005-of-00131.safetensors?header_begin=78403048&header_end=78403049",
+      "range": "bytes=78403048-78403049",
+      "bytes": 2,
+      "content_range": "bytes 78403048-78403049/1717267690",
+      "sha256": "c7c58bd6007672362da2106fdbfaf9f50629e4bdf8598169c598027394ef9791"
+    },
+    "value": 0.00019931793212890625
+  }
+}

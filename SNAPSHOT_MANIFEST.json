@@ -5,7 +5,7 @@
     ".gitignore": "5b6b7c23165a945f1c3ffe5c4855c472a807e34a750a14dc3a4655c68a7dbca4",
     "LICENSE": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
     "README.md": "365fe3963f65493f19f3a4a9f9bb1288dafc651144c95ff7149be532c0fca286",
-    "STATUS.md": "48bee0c8d2a132a5318a6d13354bbb9ef370b7e345d0ca41cc877aa71d211581",
+    "STATUS.md": "8c0aff8828c07eccff356fab376f88416c3b20f53c5815dec713f2cb801ea53d",
     "docs/GLM53_ENGINE_NATIVE_PATCH_B_SOURCE_AUDIT_V1.txt": "cfb8e770e8cc9771aeb03a89dec06a206c5744d318ff16de10d4f0a55daac219",
     "docs/GLM53_FOUNDATION_BACKEND_LOADER_INDEPENDENT_REVIEW.txt": "df383853dfe69b2eb48220226f83bae3eadc698adfe43b1d726db69259d46e6e",
     "docs/GLM53_FOUNDATION_QUOTES_INDEPENDENT_REVIEW_DS41.txt": "68b6ab2cdb08d67e72419aadf0f77f514c9789b1f6416a5bb2e8e8dfc1c1a323",
@@ -13,7 +13,11 @@
     "docs/GLM53_FOUNDATION_V2_QUOTES_CLOSURE_REVIEW_DS41.txt": "26ad335c4e9baf153c25dbf9a18fb562b4dfc0218ac400f5536ae9607ef0a4f8",
     "docs/GLM53_RAM_CACHE_PREFILL_STRATEGY.txt": "63513f5842e3c610b44f5a61430b302ff2323aba51df0cdaeba9a7e59ffb10c9",
     "docs/GLM53_TINY_ENGINE_NATIVE_TRANSPORT_PATCH_DESIGN_V1.txt": "f048d517f27976bbd177906c0f520b20418f998ba15c54ad28223421d08a4b83",
+    "docs/QFN_EIGHT_BIT_EXPERTS_SOURCE_RESEARCH.txt": "7f54474b47e15625813336c03b4f1b96e44ff377f8bd6d9380a92dfe10151bd9",
+    "docs/QFN_OFFICIAL_FP8_GLOBAL_PLE_IMPORT_REVIEW.txt": "73c94550a6d5255c88cbafed7c6f4a85a688d063e5b68169ceaefebde167e6b2",
     "docs/provenance/GLM53_FOUNDATION_PHASE3_PROOF_INDEX.json": "9993e6cbf2361a8d29e40d9d581598a92cbd22a6494cceaa6643c5eb5e16f57e",
+    "docs/provenance/QFN_EIGHT_BIT_EXPERTS_SOURCE_RESEARCH_PINS.json": "b612620e3bd8a7d8a300761c3f7c07efaab1993dc06125f9ddcf57fcf454fe9e",
+    "docs/provenance/QFN_OFFICIAL_FP8_GLOBAL_PLE_IMPORT_REVIEW_PINS.json": "f3b0e7898d5f28ab0dbf6cc0304bb6137c357f1ea41774f483acadb57993fd6b",
     "docs/provenance/export.json": "da2a1f59be6b2ef50d6042f67ec086615fa2e9f7aef876b6a9a6ec8dbae6ad4d",
     "docs/provenance/foundation-v2-COMPOSITION_MANIFEST.json": "d7fc42ffae670c9e3965b56ca92f6b72263fdd832733e4507e5ae03ea2d0583e",
     "docs/provenance/foundation-v2-CORE_SOURCE_PINS.json": "75e34cfccbc635cc2b99c052dd7916dd07755bc7321bb6095a9fca981e3cfc53",
@@ -33,6 +37,8 @@
     "evidence/portable-host-release-20261025/receipt.json": "27f4ca297c48a02220f70fe773ee86a862919ee761ffefec4a879f427bcf815a",
     "evidence/portable-release-initial-configure-failure/configure.log": "ebdf23e49ab79dc0c541e9c8ad321cb3dcdbc8815be9db53b6bf106ba0149847",
     "evidence/portable-release-initial-configure-failure/receipt.json": "ae55f1ebdd19fe9e70957357cefddf5da9a4379eb0a84af1001964d2caeccf98",
+    "evidence/qfn-fp8-source-preflight/metadata-receipt.json": "ab27ee0d45e56bf70fdb47b78bebad2064b67cfa9b9e002f7455af285e198f47",
+    "evidence/qfn-fp8-source-preflight/representative-headers-receipt.json": "77cd02b2bfaef5cad50ed447b11c36f6be72b7a6d3f41cb51479dba5f668622b",
     "evidence/validation-glm53-combined-frontier-asan-20261025T121924Z/abi_layout_test.log": "0c2315c3407729226701983dd382c9c01ce60982ea7f0611840c1c183d9bc29a",
     "evidence/validation-glm53-combined-frontier-asan-20261025T121924Z/build_test.log": "15ed4547fb583cada467c33838e044104b45a212f1691e1a40e1760dc430bf47",
     "evidence/validation-glm53-combined-frontier-asan-20261025T121924Z/compact_authority_collision_test.log": "8e7dc946e578eea1441f4beef680cc443fbbc18d5b949b088023f55bea813d26",
@@ -1856,7 +1862,10 @@
     "research/glm53-sharded-native-provider-prototype/sharded_native_store_test.cpp": "ea8c8fe23111c0727ef192914f7c6022823fca3a1548733e57b2134446a40f92",
     "research/portable/CMakeLists.txt": "bfa06748e3e90ebd308958b9667364aad8fec2c113724f59cd357ffa5c600bfd",
     "research/portable/README.txt": "ab4c964b113ee35eb6b15ad6cf69d155be169d2023cf2cdec9e665bcb79f46e5",
+    "research/qfn-fp8-conversion/qwen4exp-fp8-experts-i8-hc8m.recipe": "9183b5e9c2b3a1d92de0933ce393ba9318522abf9b56f82e92f4c86704697d76",
+    "research/qfn-fp8-conversion/recipe-proposal.json": "457cd02e791a11c1714caee10949835e38639b899a65d509253630b1d47b6a86",
     "tools/build_host.py": "f10e80b713dd6874a1d288ea9dfdd91304459b8ccd7fe9e76569372d2bf7d7cd",
     "tools/verify_snapshot.py": "07df550e7f499d47f74ee172d4f1f7f169f494ee6f4c57d74f3e831d6454249c"
-  }
+  },
+  "updated_utc": "2026-10-25T15:42:52.110866+00:00"
 }

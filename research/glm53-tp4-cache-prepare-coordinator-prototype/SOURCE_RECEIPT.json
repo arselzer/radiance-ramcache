@@ -1,0 +1,30 @@
+{
+  "schema": "glm53-tp4-cache-prepare-process-failstop-host-spec-source-only-v1",
+  "scope": "standalone4threadHOSTcachegates/process-fatalproof; no Core, GPU, model or collective recovery",
+  "author_execution": "stdlib source/hash only; no compiler, target runtime or device",
+  "planned_cases": 9,
+  "planned_refusal_groups": 24,
+  "planned_two_success_pass_gu_counters": 336,
+  "files": {
+    "CMakeLists.txt": "8e2f317a41ff3710a3bd7be2c2956af01937cbd2526c025a7a3240dea5472618",
+    "README.txt": "ad95399cc37a67f9dfc1ee55993f774a01c6b4e1d64df96ed0d1e318d6c30e97",
+    "cache_prepare4.h": "74db4c329437534927817326e3b1ca16c8087711c7c6ce20f1a3c1e7286d7afe",
+    "checker.cpp": "70aded4a7ebf8a2286fa4b23d46d78cc7b6e40b281739a5d32bda79d335d8d23",
+    "verify_source_pins.py": "10c78aa94a37d30d0e43f5bf2eb744324bc55b91a49d6f33976a14b6a7066b26"
+  },
+  "input_pins": {
+    "GLM53_TP4_CACHE_FAILSTOP_REASSESSMENT.txt": "f31dbe0626c44bd6a6b03abf4f9770d30f4412b55d7e214ffad1a4c7d0b638ac",
+    "GLM53_TP4_CACHE_PREPARE_COORDINATION_DESIGN.txt": "2bd063e60647b5d715bd879dfc3319442d2cf24a56b3f71847dc45df5f4d3d2d",
+    "ds41-tp-coordinator-prototype/coordinator.h": "86c478179d33b4abf762ee5be3990b9a54d4382ba5d64742bf03eb443ac35558",
+    "radiance-glm-engine-native-transport-src/core/engine.cpp": "129a1c49fcb064ddd1ec7da6754c3709dc1178e25d3cd6e4cee06bfdc96b15b2",
+    "radiance-glm-engine-native-transport-src/core/runtime/ctx.cpp": "25d5c61d743e249594a02ec18faeaab77a3897f7e9e30853e9af933e27ef84a3",
+    "radiance-glm-engine-native-transport-src/core/runtime/expert_prepare.cpp": "7af0bf6596e36ee105751fc80d94bc742b57ba1f04c13fb5cb004488a12ae0aa",
+    "radiance-glm-engine-native-transport-src/core/runtime/issue.cpp": "462f8ee7b1407b31f8ceea8ab87ba332f2b5ff9a6e405c94d93d3ea02d402ecc",
+    "radiance-glm-engine-native-transport-src/core/runtime/model_failure_policy.h": "a95374bcf34a38e2d7af67714dabf6d18ac442e221ba74377e397546695bbce2",
+    "radiance-glm-engine-native-transport-src/core/place/native_backing_owner.cpp": "9b2db04f11fef69f16e8069472a2ace38f4fb15c3343ddeeb1e18df880828684",
+    "radiance-glm-engine-native-transport-src/core/place/native_mover.cpp": "af029dd3292758abb1f120f988783195570ecb0d7ce553d5b2a695fddd55c7ce",
+    "radiance-glm-engine-native-transport-src/core/place/record_residency.cpp": "bab4166702417d2540e1c2e68850e7d9fc0dc995ffc005826c349d4f86254535",
+    "radiance-glm-engine-native-transport-src/arch/common/rad_block_moe_fp8.h": "f37eeb579fe1efb96b9d95354e1d368a45d4941bb89314dd2acef63e4fc3dc43",
+    "radiance-glm-engine-native-transport-src/arch/glm5next/glm5next.cpp": "5e868e40c454d799eb70dfabeb227507cf3959ea047e09d5b528189e7f84ee3d"
+  }
+}

@@ -1,0 +1,2 @@
+RAM_ADMISSION MemAvailable=9781342208
+PASS TP4 cache HOST coordinator cases=9 checks=90 refusalGroups=24 twoSuccessPassGUCount=336 sizeofCoordinator=16632; no Core, GPU, model, collectives or recovery proof

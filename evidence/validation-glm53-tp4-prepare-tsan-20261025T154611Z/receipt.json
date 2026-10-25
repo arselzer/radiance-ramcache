@@ -1,0 +1,94 @@
+{
+  "passed": true,
+  "mode": "tsan",
+  "commands": [
+    {
+      "command": [
+        "python3",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-tp4-cache-prepare-coordinator-prototype/verify_source_pins.py"
+      ],
+      "log": "pins-before.log",
+      "returncode": 0
+    },
+    {
+      "command": [
+        "flock",
+        "--no-fork",
+        "--exclusive",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/research-compiler.lock",
+        "nice",
+        "-n19",
+        "cmake",
+        "-S",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-tp4-cache-prepare-coordinator-prototype",
+        "-B",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/build-glm53-tp4-prepare-tsan",
+        "-DCMAKE_CXX_COMPILER=/usr/bin/c++",
+        "-DCMAKE_BUILD_TYPE=Debug",
+        "-DCMAKE_CXX_FLAGS=-fsanitize=thread -fno-omit-frame-pointer",
+        "-DCMAKE_EXE_LINKER_FLAGS=-fsanitize=thread"
+      ],
+      "log": "configure.log",
+      "returncode": 0
+    },
+    {
+      "command": [
+        "flock",
+        "--no-fork",
+        "--exclusive",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/research-compiler.lock",
+        "nice",
+        "-n19",
+        "cmake",
+        "--build",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/build-glm53-tp4-prepare-tsan",
+        "-j2"
+      ],
+      "log": "build.log",
+      "returncode": 0
+    },
+    {
+      "command": [
+        "flock",
+        "--no-fork",
+        "--exclusive",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/research-heavy-runtime.lock",
+        "nice",
+        "-n19",
+        "/usr/bin/python3",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/run_guarded_heavy_research.py",
+        "--",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/build-glm53-tp4-prepare-tsan/tp4_cache_prepare_check"
+      ],
+      "log": "check.log",
+      "returncode": 0
+    },
+    {
+      "command": [
+        "python3",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-tp4-cache-prepare-coordinator-prototype/verify_source_pins.py"
+      ],
+      "log": "pins-after.log",
+      "returncode": 0
+    }
+  ],
+  "GPU_execution": false,
+  "production_changes": false,
+  "scope": "Standalone HOST coordinator; no Core integration",
+  "source_hashes": {
+    "README.txt": "ad95399cc37a67f9dfc1ee55993f774a01c6b4e1d64df96ed0d1e318d6c30e97",
+    "CMakeLists.txt": "8e2f317a41ff3710a3bd7be2c2956af01937cbd2526c025a7a3240dea5472618",
+    "cache_prepare4.h": "74db4c329437534927817326e3b1ca16c8087711c7c6ce20f1a3c1e7286d7afe",
+    "SOURCE_RECEIPT.json": "4fc4b2284508d13dedf2f49619cb859daa4a178a1528d421f58a0bd6d2e54685",
+    "checker.cpp": "70aded4a7ebf8a2286fa4b23d46d78cc7b6e40b281739a5d32bda79d335d8d23",
+    "verify_source_pins.py": "10c78aa94a37d30d0e43f5bf2eb744324bc55b91a49d6f33976a14b6a7066b26"
+  },
+  "binary_sha256": "e7799dcc3ebcb6be41b505a50139a3b0d3f59413359ad906a3334f0e082323a3",
+  "logs_sha256": {
+    "build.log": "b0e65ac50073c0b3fe9b6c111107d584f856a5d8910f481e74309a0d6d2f76a4",
+    "configure.log": "2458111b4c82223aeaa55de65a2560897dfd09b79d358c4bb441b2d7b9091cf9",
+    "pins-after.log": "ad1048e6a2ac3358e939990ab0c45fdd2b988e3d0384b5d8916b2697951d5242",
+    "check.log": "a376a67652e35d192c44710b353a5a118ea9957a5c4731fc73e72c2effda57e7",
+    "pins-before.log": "ad1048e6a2ac3358e939990ab0c45fdd2b988e3d0384b5d8916b2697951d5242"
+  }
+}

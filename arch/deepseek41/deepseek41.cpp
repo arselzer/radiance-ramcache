@@ -256,6 +256,8 @@ struct Model {
     /* KV groups */
     rad_kvgroup win = 0, tok = 0;
     std::map<int64_t, rad_kvgroup> comp, index, tail;
+    /* The GGUF type of each linear weight the model ships in llama.cpp's blocks (lw()). */
+    std::map<rad_weight, const char*> wty;
     int64_t win_bs = 0;
     /* model-wide weights and ops */
     rad_weight token = 0, head = 0, final_gain = 0, tmap = 0, ple_table = 0;
@@ -296,10 +298,50 @@ static rad_weight wts(RadBuilder* b, const Geom& g, const char* name, uint32_t d
     }
     return w;
 }
-static rad_op linear(RadBuilder* b, const Geom& g, int64_t rows, rad_weight w, int64_t n,
+/* A linear's weight, [n, k] at this rank's extents: llama.cpp's blocks when the model ships it
+ * so (a GGUF weight, imported as its type's planes; rad_ggml.h), declared at the codes' dtype and
+ * read by gemm_nt_ggml, else bf16. A block's values run along k, so k and a column span must cut
+ * whole blocks. With `shard` and a world above one, this rank holds [lo, hi) of the split
+ * dimension. */
+static rad_weight lw(RadBuilder* b, Model& m, const char* name, int64_t n, int64_t k,
+                     RadWeightGroup grp, int shard = RAD_SHARD_NONE, int64_t lo = 0, int64_t hi = 0,
+                     bool mapped = false) {
+    if (!mapped && map_copy(b, name, name) != RAD_OK) return 0;
+    RadEncoding e{};
+    int64_t blk = 0;
+    const char* ty = weight_enc(b, name, &e) ? ggml_type_of(e, &blk) : nullptr;
+    const bool split = m.g.world > 1 && shard != RAD_SHARD_NONE;
+    if (ty && (k % blk || (split && shard == RAD_SHARD_COL && (lo % blk || hi % blk)))) {
+        fprintf(stderr, "radiance: deepseek41: %s is GGUF %s, whose blocks cover %lld of K; this rank "
+                        "reads %lld columns%s\n", name, ty, (long long)blk, (long long)k,
+                split && shard == RAD_SHARD_COL ? " of a slice" : "");
+        return 0;
+    }
+    const rad_weight w = decl_w(b, name, ty ? ggml_codes_dtype(e) : (uint32_t)RAD_BF16, { n, k },
+                                RAD_ACCESS_PER_TOKEN, split ? shard : RAD_SHARD_NONE, grp);
+    if (!w) {
+        fprintf(stderr, "radiance: deepseek41: weight %s refused\n", name);
+        return 0;
+    }
+    if (split && rad_weight_shard_span(b, w, lo, hi) != RAD_OK) {
+        fprintf(stderr, "radiance: deepseek41: %s's span [%lld, %lld) refused\n", name, (long long)lo,
+                (long long)hi);
+        return 0;
+    }
+    if (ty) m.wty[w] = ty;
+    return w;
+}
+/* y = x . w^T over lw()'s weight: gemm_nt_ggml for a GGUF block weight, gemm_nt for bf16. */
+static rad_op linear(RadBuilder* b, const Model& m, int64_t rows, rad_weight w, int64_t n,
                      int64_t k, rad_buf x, rad_buf y) {
+    const auto t = m.wty.find(w);
+    if (t != m.wty.end())
+        return op(b, "gemm_nt_ggml",
+                  { RAD_RANGE("M", 1, rows), RAD_INT("N", n), RAD_INT("K", k), RAD_STR("type", t->second),
+                    RAD_STR("dtype", m.g.dtype) },
+                  { w }, { x }, { y });
     return op(b, "gemm_nt",
-              { RAD_RANGE("M", 1, rows), RAD_INT("N", n), RAD_INT("K", k), RAD_STR("dtype", g.dtype) },
+              { RAD_RANGE("M", 1, rows), RAD_INT("N", n), RAD_INT("K", k), RAD_STR("dtype", m.g.dtype) },
               { w }, { x }, { y });
 }
 static rad_op rmsnorm(RadBuilder* b, const Model& m, int64_t rows, rad_weight w, int64_t n,
@@ -538,7 +580,7 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
                          RAD_SHARD_NONE, grp);
         L.e_off = decl_w(b, nm.f("blk.%d.engram_off", l), RAD_I64, { H }, RAD_ACCESS_PER_TOKEN,
                          RAD_SHARD_NONE, grp);
-        L.e_kv = w("blk.%d.engram_kv.weight", RAD_BF16, { (c.hc + 1) * D, H * c.ple_dim });
+        L.e_kv = lw(b, m, nm.f("blk.%d.engram_kv.weight", l), (c.hc + 1) * D, H * c.ple_dim, grp);
         L.e_gate = w("blk.%d.engram_gate.weight", RAD_F32, { c.hc * D });
         if (!m.tok) {
             RadKVGroupDecl d{};
@@ -559,7 +601,7 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
                      { RAD_RANGE("M", 1, T * H), RAD_INT("n_embd", c.ple_dim),
                        RAD_INT("n_vocab", c.ple_rows), RAD_STR("dtype", "bf16") },
                      { m.ple_table }, { m.ids }, { m.emb });
-        L.e_gemm = linear(b, g, T, L.e_kv, (c.hc + 1) * D, H * c.ple_dim, m.emb, m.ekv);
+        L.e_gemm = linear(b, m, T, L.e_kv, (c.hc + 1) * D, H * c.ple_dim, m.emb, m.ekv);
         L.e_gate_op = op(b, "stream_gate_add",
                          { RAD_RANGE("M", 1, T), RAD_INT("n", D), RAD_INT("hc", c.hc),
                            RAD_F64("eps", c.eps), RAD_F64("gate_eps", 1e-6),
@@ -625,18 +667,18 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
         L.norm_a = rmsnorm(b, m, T, L.attn_norm, D, m.xcol, m.xn);
 
         /* ---- attention: the query, the window key */
-        L.wq_a = w("blk.%d.attn_q_a.weight", RAD_BF16, { c.q_lora, D });
+        L.wq_a = lw(b, m, nm.f("blk.%d.attn_q_a.weight", l), c.q_lora, D, grp);
         L.q_norm = w("blk.%d.attn_q_a_norm.weight", RAD_F32, { c.q_lora });
-        L.wq_b = wts(b, g, nm.f("blk.%d.attn_q_b.weight", l), RAD_BF16, { HD, c.q_lora }, grp, RAD_SHARD_ROW,
-                     m.ar * HD, (m.ar + 1) * HD);
-        L.q_a = linear(b, g, T, L.wq_a, c.q_lora, D, m.xn, m.qr);
+        L.wq_b = lw(b, m, nm.f("blk.%d.attn_q_b.weight", l), HD, c.q_lora, grp, RAD_SHARD_ROW,
+                    m.ar * HD, (m.ar + 1) * HD);
+        L.q_a = linear(b, m, T, L.wq_a, c.q_lora, D, m.xn, m.qr);
         L.q_an = rmsnorm(b, m, T, L.q_norm, c.q_lora, m.qr, m.qrn);
-        L.q_b = linear(b, g, T, L.wq_b, HD, c.q_lora, m.qrn, m.q);
+        L.q_b = linear(b, m, T, L.wq_b, HD, c.q_lora, m.qrn, m.q);
         const rad_buf cs = L.r > 0 ? m.cs_b : m.cs_a;
         L.q_rope = rope_rows(b, m, T, g.n_head, hd, 0, m.q, cs);
-        L.wkv = w("blk.%d.attn_kv.weight", RAD_BF16, { hd, D });
+        L.wkv = lw(b, m, nm.f("blk.%d.attn_kv.weight", l), hd, D, grp);
         L.kv_norm = w("blk.%d.attn_kv_a_norm.weight", RAD_F32, { hd });
-        L.kv_g = linear(b, g, T, L.wkv, hd, D, m.xn, m.kv);
+        L.kv_g = linear(b, m, T, L.wkv, hd, D, m.xn, m.kv);
         L.kv_n = rmsnorm(b, m, T, L.kv_norm, hd, m.kv, m.kvn);
         L.kv_rope = rope_rows(b, m, T, 1, hd, 0, m.kvn, cs);
         L.kv_q = roundtrip(b, T, hd, 32, "fp8_e4m3", "ue8m0", m.kvn);
@@ -679,8 +721,8 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
                               {}, { m.stage, m.page }, { m.pooled });
                 L.c_norm = rmsnorm(b, m, W, L.comp_norm, hd, m.pooled, m.lat);
             } else {
-                L.comp_w = w("blk.%d.attn_compressor_kv.weight", RAD_BF16, { hd, D });
-                L.c_gemm = linear(b, g, T, L.comp_w, hd, D, m.xn, m.pooled);
+                L.comp_w = lw(b, m, nm.f("blk.%d.attn_compressor_kv.weight", l), hd, D, grp);
+                L.c_gemm = linear(b, m, T, L.comp_w, hd, D, m.xn, m.pooled);
                 L.c_norm = rmsnorm(b, m, T, L.comp_norm, hd, m.pooled, m.lat);
             }
             /* The compressed rows' angles, at each entry's first-token position. */
@@ -692,9 +734,9 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
                            RAD_F64("yarn_magnitude", 1.0) },
                          {}, { m.bpos }, { m.cs_b });
             /* Index keys from the unrotated latent, then the latent itself rotated and quantised. */
-            L.ik_w = w("blk.%d.indexer.attn_k.weight", RAD_BF16, { c.idim, hd });
+            L.ik_w = lw(b, m, nm.f("blk.%d.indexer.attn_k.weight", l), c.idim, hd, grp);
             L.ik_norm = w("blk.%d.indexer.k_norm.weight", RAD_F32, { c.idim });
-            L.k_gemm = linear(b, g, rows, L.ik_w, c.idim, hd, m.lat, m.ik);
+            L.k_gemm = linear(b, m, rows, L.ik_w, c.idim, hd, m.lat, m.ik);
             L.k_norm = rmsnorm(b, m, rows, L.ik_norm, c.idim, m.ik, m.ikn);
             L.k_rope = rope_rows(b, m, rows, 1, c.idim, 0, m.ikn, m.cs_b);
             L.k_q = roundtrip(b, rows, c.idim, 32, "fp4_e2m1", "ue8m0", m.ikn);
@@ -718,12 +760,12 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
 
         /* ---- the indexer, at an index source */
         if (L.idx && r > 0) {
-            L.iq_w = w("blk.%d.indexer.attn_q_b.weight", RAD_BF16, { c.ih * c.idim, c.q_lora });
-            L.iproj = w("blk.%d.indexer.proj.weight", RAD_BF16, { c.ih, D });
-            L.i_q = linear(b, g, T, L.iq_w, c.ih * c.idim, c.q_lora, m.qrn, m.iq);
+            L.iq_w = lw(b, m, nm.f("blk.%d.indexer.attn_q_b.weight", l), c.ih * c.idim, c.q_lora, grp);
+            L.iproj = lw(b, m, nm.f("blk.%d.indexer.proj.weight", l), c.ih, D, grp);
+            L.i_q = linear(b, m, T, L.iq_w, c.ih * c.idim, c.q_lora, m.qrn, m.iq);
             L.i_rope = rope_rows(b, m, T, c.ih, c.idim, 0, m.iq, m.cs_b);
             L.i_qq = roundtrip(b, T, c.ih * c.idim, 32, "fp4_e2m1", "ue8m0", m.iq);
-            L.i_w = linear(b, g, T, L.iproj, c.ih, D, m.xn, m.iw);
+            L.i_w = linear(b, m, T, L.iproj, c.ih, D, m.xn, m.iw);
             const int64_t width = g.max_ctx / r + 1;
             L.i_score = op(b, "index_score",
                            { RAD_RANGE("M", 1, T), RAD_INT("heads", c.ih), RAD_INT("dim", c.idim),
@@ -767,14 +809,14 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
             const char* n = nm.f("blk.%d.attn_output_a.g%d.weight", l, gi_);
             DS_TRY(map_rows(b, n, { { nm.f("blk.%d.attn_output_a.weight", l), (int)(gi_ * c.o_rank),
                                             c.o_rank } }));
-            L.wo_a.push_back(decl_w(b, n, RAD_BF16, { c.o_rank, gd }, RAD_ACCESS_PER_TOKEN,
-                                    RAD_SHARD_NONE, grp));
-            L.o_a.push_back(linear(b, g, T, L.wo_a.back(), c.o_rank, gd, m.o, m.oa));
+            L.wo_a.push_back(lw(b, m, n, c.o_rank, gd, grp, RAD_SHARD_NONE, 0, 0, true));
+            if (!L.wo_a.back()) return RAD_E_INVAL;
+            L.o_a.push_back(linear(b, m, T, L.wo_a.back(), c.o_rank, gd, m.o, m.oa));
         }
         const int64_t ok = m.gr * c.o_rank;
-        L.wo_b = wts(b, g, nm.f("blk.%d.attn_output_b.weight", l), RAD_BF16, { D, ok }, grp, RAD_SHARD_COL,
-                     m.ar * ok, (m.ar + 1) * ok);
-        L.o_b = linear(b, g, T, L.wo_b, D, ok, m.oa, m.attn_out);
+        L.wo_b = lw(b, m, nm.f("blk.%d.attn_output_b.weight", l), D, ok, grp, RAD_SHARD_COL,
+                    m.ar * ok, (m.ar + 1) * ok);
+        L.o_b = linear(b, m, T, L.wo_b, D, ok, m.oa, m.attn_out);
     }
     /* The heads' partial outputs (zeros on an attention-zero rank) summed over every rank. */
     if (g.world > 1)
@@ -807,6 +849,7 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
     s.cfg.n_expert_all = c.n_expert;
     s.cfg.n_expert = c.n_expert / g.world;
     s.cfg.expert_base = g.rank * s.cfg.n_expert;
+    s.cfg.probed_expert = s.cfg.expert_base;
     s.cfg.top_k = c.top_k;
     s.cfg.n_ff_exp = c.n_ff;
     s.cfg.n_ff_shared = g.n_ff;

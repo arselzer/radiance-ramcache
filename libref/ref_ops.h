@@ -167,6 +167,7 @@ int ref_attn_sparse_sink   (const RadArgs*, RadStream);
 int ref_index_score        (const RadArgs*, RadStream);
 int ref_index_candidates   (const RadArgs*, RadStream);
 int ref_index_topk         (const RadArgs*, RadStream);
+int ref_entry_store        (const RadArgs*, RadStream);
 int ref_qk_norm_rope       (const RadArgs*, RadStream);
 /* image generation (ref_gen.cpp) */
 int ref_ln_mod(const RadArgs*, RadStream);
@@ -433,6 +434,7 @@ REF_SHAPE_FN(ref_attn_sparse_sink);
 REF_SHAPE_FN(ref_index_score);
 REF_SHAPE_FN(ref_index_candidates);
 REF_SHAPE_FN(ref_index_topk);
+REF_SHAPE_FN(ref_entry_store);
 REF_SHAPE_FN(ref_qk_norm_rope);
 REF_SHAPE_FN(ref_ln_mod);
 REF_SHAPE_FN(ref_ln_mod_quant_fp8);

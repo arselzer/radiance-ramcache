@@ -640,6 +640,17 @@ TEST(index_topk_selects_passed_positions_in_order) {
     for (int i = 0; i < 9; ++i) CHECK_EQ(sel.iat(i), e1[i]);
 }
 
+/* entry_store writes whole blocks at their pages and skips a negative page. */
+TEST(entry_store_writes_one_entry_a_block) {
+    T x(RAD_F32, {3, 4}); x.f({1, 2, 3, 4,  5, 6, 7, 8,  9, 10, 11, 12});
+    T page(RAD_I32, {3}); page.n({2, -1, 0});
+    T cache(RAD_F32, {3, 1, 2, 2}); cache.f({0, 0, 0, 0,  -1, -1, -1, -1,  0, 0, 0, 0});
+    A a; a.t(x).t(page).t(cache).i("M", 3).i("n", 4).i("block_size", 2).s("dtype", "f32");
+    REQUIRE_EQ(run("entry_store", a), RAD_OK);
+    const float e[12] = {9, 10, 11, 12,  -1, -1, -1, -1,  1, 2, 3, 4};
+    for (int i = 0; i < 12; ++i) CHECK_EQ(cache.at(i), e[i]);
+}
+
 TEST(manifold_sinkhorn_first_pass_and_epsilon_are_distinct) {
     T h(RAD_F32, {1, 2}); h.f({1, 3});
     T fn(RAD_F32, {8, 2}), scale(RAD_F32, {3}); scale.f({1, 1, 1});
@@ -1288,7 +1299,7 @@ TEST(op_vocabulary) {
         "rmsnorm", "rmsnorm_p", "rmsnorm_add", "hc_enter", "hc_read", "hc_write", "hc_project",
         "mtp_enter",
         "mhc_pre", "mhc_pre_partial", "mhc_pre_finish", "mhc_post", "mhc_contract",
-        "mhc_mix", "mhc_collapse", "swiglu_clamped", "router_sigmoid_topk", "router_scored_topk", "rope_rows", "quant_roundtrip", "softmax_pool", "attn_sparse_sink", "index_score", "index_candidates", "index_topk", "dsa_pool", "dsa_query", "dsa_score", "mla_attn", "mla_project", "gemm_nt_f32",
+        "mhc_mix", "mhc_collapse", "swiglu_clamped", "router_sigmoid_topk", "router_scored_topk", "rope_rows", "quant_roundtrip", "softmax_pool", "attn_sparse_sink", "index_score", "index_candidates", "index_topk", "entry_store", "dsa_pool", "dsa_query", "dsa_score", "mla_attn", "mla_project", "gemm_nt_f32",
         "kda_update",
         "layernorm", "add", "mul", "mul_weight", "silu_mul", "gelu_mul", "act_mul", "seg_mean",
         "pool_rows", "relu", "clamp", "conv2d", "conv2d_unfold", "conv1d_dw", "rel_sinusoid",
@@ -8869,6 +8880,7 @@ std::vector<Geo> geometries() {
         G("index_candidates", "M", 3, a.i("M", R).i("width", 20).i("block", 8).i("topk_blocks", 2)
                                       .i("ratio", 1)),
         G("index_topk", "M", 3, a.i("M", R).i("width", 9).i("topk", 4).i("ratio", 2)),
+        G("entry_store", "M", 3, a.i("M", R).i("n", 8).i("block_size", 2).s("dtype", "bf16")),
         G("rope_rows", "M", 3, a.i("M", R).i("n_head", 2).i("head_dim", 12).i("rot", 8).i("off", 4)
                                .s("mode", "gptj").i("inverse", 0).s("dtype", "f32")),
         G("qsa_block_key", "M", 2, a.i("M", R).i("n", 32).i("ratio", 4).i("rotary_dim", 8)

@@ -6,6 +6,7 @@
  *   index_score        the indexer's relu-gated head sum over a paged index cache
  *   index_candidates   level one of the two-level top-k: the kept blocks
  *   index_topk         level two: the selected positions, in position order
+ *   entry_store        one compressed entry a paged block
  *
  * Each kernel computes libref's expression. Where libref's result is exact (a selection's ids, the
  * round trip's codes and scales) this one is the same bits; elsewhere it differs from libref only
@@ -443,6 +444,31 @@ AVX_KERNEL(index_topk) {
         const int64_t sb = rowoff(&sel, m, topk), ss = laststride(&sel);
         for (int64_t t = 0; t < topk; ++t)
             st_int_dt(sel.dtype, sel.data, sb + t * ss, t < np ? idx[(size_t)t] : -1);
+    }
+    return RAD_OK;
+}
+
+/* One entry a block (libref's entry_store): x[w] into the whole of block page[w] of the cache,
+ * rounded once to its dtype; a negative page writes nothing. Every page is checked before any
+ * entry is written, where libref writes the entries before a bad one; the code is libref's. */
+AVX_KERNEL(entry_store) {
+    if (!rad_args_have(a, 3)) return RAD_E_INVAL;
+    const RadTensor &x = a->t[0], &page = a->t[1], &cache = a->t[2];
+    const int64_t n = p_int(a, "n", 0), bs = p_int(a, "block_size", 0);
+    if (n < 1 || bs < 1 || x.rank != 2 || x.shape[0] < 1 || x.shape[1] != n ||
+        numel(&page) < x.shape[0] || cache.rank != 4 || cache.shape[2] != bs ||
+        cache.shape[1] * cache.shape[2] * cache.shape[3] != n)
+        return RAD_E_SHAPE;
+    const int64_t W = x.shape[0];
+    for (int64_t w = 0; w < W; ++w)
+        if (ldi(&page, offlin(&page, w)) >= cache.shape[0]) return RAD_E_INVAL;
+    /* Serial, as libref: two entries naming one page leave the later one. */
+    for (int64_t w = 0; w < W; ++w) {
+        const int64_t pg = ldi(&page, offlin(&page, w));
+        if (pg < 0) continue;
+        float* row = scratch_f32((size_t)n);
+        const float* in = in_row(&x, rowoff(&x, w, n), n, row);
+        row_from_f32(cache.dtype, in, (void*)byte_at(cache.data, cache.dtype, pg * n), n);
     }
     return RAD_OK;
 }

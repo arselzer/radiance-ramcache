@@ -4836,6 +4836,23 @@ void ds41_cases(std::vector<Hand>& hs) {
          .pi("M", 3).pi("n", 40).pi("ratio", 4).ps("dtype", "bf16");
         hs.push_back(std::move(h));
     }
+    {
+        Hand h("a negative page writes nothing", "entry_store", 0.0);
+        h.dense(RAD_BF16, { 3, 32 }, hfill(64))
+         .idx({ 4, -1, 1 })
+         .dense(RAD_BF16, { 6, 1, 4, 8 }, hfill(65), true)
+         .pi("M", 3).pi("n", 32).pi("block_size", 4).ps("dtype", "bf16");
+        hs.push_back(std::move(h));
+    }
+    {
+        Hand h("a page past the cache is refused before any write", "entry_store", 0.0);
+        h.dense(RAD_BF16, { 2, 32 }, hfill(66))
+         .idx({ 6, 1 })
+         .dense(RAD_BF16, { 6, 1, 4, 8 }, hfill(67), true)
+         .pi("M", 2).pi("n", 32).pi("block_size", 4).ps("dtype", "bf16")
+         .refuses(RAD_E_INVAL);
+        hs.push_back(std::move(h));
+    }
 }
 
 }  // namespace

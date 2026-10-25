@@ -1191,6 +1191,7 @@ std::vector<Case> build_cases() {
                                   HI("ratio", 4), HI("topk", 5), HF("scale", 0.125), HS("dtype", dt) });
         add("index_score", { HI("M", 9), HI("heads", 4), HI("dim", 64), HI("ratio", 4),
                              HI("width", 13), HS("dtype", dt) });
+        add("entry_store", { HI("M", 5), HI("n", 128), HI("block_size", 4), HS("dtype", dt) });
     }
     add("index_candidates", { HI("M", 9), HI("width", 40), HI("block", 8), HI("topk_blocks", 2),
                               HI("ratio", 1) });

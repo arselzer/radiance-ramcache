@@ -355,3 +355,26 @@ int ref_index_topk(const RadArgs* a, RadStream) {
     }
     return RAD_OK;
 }
+
+/* One entry a block: x[w] (n values) into the whole of block page[w] of a paged cache
+ * [blocks, kv_heads, block_size, slot] with kv_heads * block_size * slot == n, rounded once to the
+ * cache's dtype. A negative page writes nothing. The pooled compressed entries qsa_work pages
+ * (one block of `ratio` slots each) are stored this way; `block_size` is a parameter so that the
+ * op, declared right after its group, sets the group's block size (spec section 7.2). */
+int ref_entry_store(const RadArgs* a, RadStream) {
+    if (!have(a, 3)) return RAD_E_INVAL;
+    const RadTensor &x = a->t[0], &page = a->t[1], &cache = a->t[2];
+    const int64_t n = p_int(a, "n", 0), bs = p_int(a, "block_size", 0);
+    if (n < 1 || bs < 1 || x.rank != 2 || x.shape[0] < 1 || x.shape[1] != n ||
+        numel(&page) < x.shape[0] || cache.rank != 4 || cache.shape[2] != bs ||
+        cache.shape[1] * cache.shape[2] * cache.shape[3] != n)
+        return RAD_E_SHAPE;
+    for (int64_t w = 0; w < x.shape[0]; ++w) {
+        const int64_t pg = ld_int(page.dtype, page.data, offlin(&page, w));
+        if (pg < 0) continue;
+        if (pg >= cache.shape[0]) return RAD_E_INVAL;
+        const int64_t xb = rowoff(&x, w, n), xs = laststride(&x);
+        for (int64_t i = 0; i < n; ++i) stt(&cache, pg * n + i, ldt(&x, xb + i * xs));
+    }
+    return RAD_OK;
+}

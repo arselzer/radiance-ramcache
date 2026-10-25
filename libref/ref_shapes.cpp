@@ -1711,6 +1711,17 @@ int ref_index_topk_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* ou
     return o.finish("index_topk", operand, out);
 }
 
+int ref_entry_store_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0), bs = gi(p, n_p, "block_size", 0);
+    if (M <= 0 || n < 1 || bs < 1 || n % bs) return RAD_E_UNSUPPORTED;
+    const uint32_t D = act_dt(p, n_p);
+    Opd o;
+    o.t(D, { M, n });                                   /* x */
+    o.t_idx({ M }, M, -1, (uint32_t)RAD_OPD_F_IDX_UNIQUE); /* page: distinct blocks */
+    o.t(D, { M, 1, bs, n / bs });                       /* cache */
+    return o.finish("entry_store", operand, out);
+}
+
 int ref_qsa_block_key_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = gi(p, n_p, "M", 0);
     const int64_t n = gi(p, n_p, "n", 0);

@@ -192,6 +192,9 @@ struct CtxDesc {
 class Ctx : public RadCtx {
 public:
     static int tiny_startup_quote(const CtxDesc&,bool current_route_handoff,TinyCtxQuote*) noexcept;
+    // Metadata-only actual GLM TP4/seq1/maxTok1/no-spec quote. Real KV pool
+    // payload is charged by Pools/KV; this quotes the Context's binding copies.
+    static int glm_main_startup_quote(const CtxDesc&,TinyCtxQuote*) noexcept;
     Ctx();   /* out of line, beside ~Ctx: xp_ points to a type this header only names */
     ~Ctx();
     Ctx(const Ctx&) = delete;

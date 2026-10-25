@@ -1,0 +1,33 @@
+{
+  "created_utc": "2026-10-25T21:47:20.198098+00:00",
+  "decision": "no scoped source blocker",
+  "execution_by_reviewer": false,
+  "files": {
+    "GLM53_CORE_V6_FIXTURE_V7_RUNNER_V3_LINKAGE_REVIEW.txt": "051f27764e0900c552865b040ff0c02d25d1352b8b0fedf2918b6c246d78ff02",
+    "build_glm53_main_verified_engine.py": "6203ac27a93b6a8df32d93b242207a5ee20084aa9d2662c50de71972d5d44784",
+    "glm53-main-verified-source-engine-v7-prototype/SOURCE_RECEIPT.json": "5639daa71b01eafca37a5958bc484aff413a097330ccc2acc0d673697d329b9f",
+    "glm53-main-verified-source-engine-v8-prototype/CORE_SOURCE_PINS.json": "83d57401b288dc78ddad965498d47c2066e99050291411bc3545985d2a874159",
+    "glm53-main-verified-source-engine-v8-prototype/SOURCE_RECEIPT.json": "61b84df3fb482992331ad66fe37e0175d877bcf4687030882fdcf98224479f6a",
+    "glm53-main-verified-source-engine-v8-prototype/V8_ACTIVE_PRIVATE_CORE_PIN_MAPS.json": "2e29c10149566c0f7fc5a77ab6cedf6af05a121eb01bf54b455ad0c4619980b6",
+    "glm53-main-verified-source-engine-v8-prototype/V8_NESTED_PRIVATE_CORE_PIN_DELTA.diff": "e69870cd6e08359f0ae48ded5bf667c55bf23d9343451e25283651d70c438c33",
+    "glm53-main-verified-source-engine-v8-prototype/regressions/compact/strict_p3/CMakeLists.txt": "56c476a523374b1814b8512ace8146cc33fbd9609aa1e9da9e18764fd595484d",
+    "glm53-main-verified-source-engine-v8-prototype/regressions/compact/strict_p3/UNIFIED_CORE_PINS.json": "83d57401b288dc78ddad965498d47c2066e99050291411bc3545985d2a874159",
+    "glm53-main-verified-source-engine-v8-prototype/regressions/device/CORE_SOURCE_PINS.json": "83d57401b288dc78ddad965498d47c2066e99050291411bc3545985d2a874159",
+    "glm53-manual-maintenance-runner-v3-20261025/SOURCE_RECEIPT.json": "82856508493704d6b551276b3e20f5c29dca5f40e1c4e58f8ec2689e80903672",
+    "glm53-manual-maintenance-runner-v3-20261025/runner.py": "3f09e3511b601275665076ebe17c6bc458360f1f440882517bb03d4d62186db9",
+    "glm53-manual-maintenance-runner-v4-20261025/README.txt": "496a455d0ebe65f74c31ab440516646ad5ac968d39728fc4d55f14983f1b655b",
+    "glm53-manual-maintenance-runner-v4-20261025/SOURCE_RECEIPT.json": "90cce1e88d0056dc93e0af55218b28907993ecd7dce1f683a929a275286094ed",
+    "glm53-manual-maintenance-runner-v4-20261025/runner.py": "1f50141f4a1b059dca4be0d0ef1ec1c69c0ebdca92063fade188726805f68e43",
+    "validate_glm53_main_verified_engine.py": "b4e1ece3e8b61bc51a1c894c0ea541f8503286042944b9cb0b19686e7685797f"
+  },
+  "report_sha256": "781cb9ac2e5000282b9ce7cc0fd5ba84f56d7570c5875e42635e04927b4638e8",
+  "schema": "glm53-core6-fixture8-runner4-source-review-v1",
+  "verified_counts": {
+    "Core": 1535,
+    "active_maps_equal_Core": 3,
+    "fixture_inputs": 30,
+    "fixture_source": 86,
+    "total_runner_functions": 32,
+    "unchanged_runner_functions": 31
+  }
+}

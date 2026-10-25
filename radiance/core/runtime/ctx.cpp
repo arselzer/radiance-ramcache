@@ -6,6 +6,7 @@
 #include "xp_state.h"
 #include "cache_prepare4_session.h"
 #include "../build/tiny_component_quotes.h"
+#include "../build/glm_main_quote.h"
 #include "../build/tiny_startup.h"
 #include "../device/device.h"
 
@@ -136,6 +137,173 @@ int Ctx::tiny_startup_quote(const CtxDesc& d,bool handoff,TinyCtxQuote* out) noe
     // explicit planning allowance, never reported as an actual measured sizeof.
     s.control_allowance=4096+q.tables*(sizeof(decltype(wtab_of_)::value_type)+128)+gate_vectors*128;
     if(!tiny_quote::finish(s))return RAD_E_SCRATCH;
+    *out=q;return RAD_OK;
+}
+
+int Ctx::glm_main_startup_quote(const CtxDesc& d,TinyCtxQuote* out) noexcept {
+    if(!out||!d.program)return RAD_E_INVAL;
+    const auto& p=*d.program;
+    constexpr uint64_t arena_cap=uint64_t(2)<<30;
+    constexpr uint64_t max_weights=100000,max_buffers=100000,max_ops=50000,max_bands=100000,max_entries=1000000;
+    if(glm_main_tp4_cache_program_profile(p)<0||p.ctx.max_tok!=1||p.ctx.max_ctx<=0||p.ctx.max_ctx>2048||
+       d.rank!=p.ctx.rank||d.world_size!=4||d.device<0||d.profile_ops||d.record_passes||d.tiny_retirement||
+       p.weights.empty()||p.weights.size()>max_weights||p.buffers.empty()||p.buffers.size()>max_buffers||
+       p.ops.empty()||p.ops.size()>max_ops||p.kv_groups.empty()||p.kv_groups.size()>128||
+       (p.scratch_regions!=1&&p.scratch_regions!=2)||p.arena_stage_bytes||p.arena_bytes<0||uint64_t(p.arena_bytes)>arena_cap||
+       p.scratch_bytes<0||uint64_t(p.scratch_bytes)>arena_cap||
+       (!d.kv.empty()&&d.kv.size()!=p.kv_groups.size()))return RAD_E_UNSUPPORTED;
+    for(const char* key:{"RADIANCE_OP_ORACLE","RADIANCE_OP_REPEAT","RADIANCE_DEBUG_ROUTING"}){
+        const auto* value=std::getenv(key);if(value&&*value)return RAD_E_UNSUPPORTED;
+    }
+    TinyCtxQuote q;auto& s=q.storage;
+    q.sizeof_ctx=sizeof(Ctx);q.sizeof_tensor=sizeof(RadTensor);q.sizeof_op_plan=sizeof(OpPlan);q.sizeof_issue_plan=sizeof(IssuePlan);
+    q.sizeof_weight_table=sizeof(WeightTable);q.sizeof_weight_member=sizeof(WMemb);q.sizeof_route_slot=sizeof(RouteSlot);
+    q.sizeof_expert_state=sizeof(ExpertPrepareState);q.sizeof_expert_map=sizeof(ExpertRouteMap);q.sizeof_expert_entry=sizeof(RadExpertRouteEntry);
+    q.buffers=p.buffers.size();q.weights=p.weights.size();q.ops=p.ops.size();
+    for(size_t i=1;i<p.buffers.size();++i){const auto& b=p.buffers[i];
+        if(b.arena_offset<0||b.bytes<=0||uint64_t(b.arena_offset)>arena_cap||uint64_t(b.bytes)>arena_cap-uint64_t(b.arena_offset)||
+           !b.decl.rank||b.decl.rank>RAD_MAX_RANK||(b.decl.domain!=RAD_DOMAIN_DEVICE&&b.decl.domain!=RAD_DOMAIN_HOST))return RAD_E_SHAPE;
+        uint64_t count=1;
+        for(uint32_t axis=0;axis<b.decl.rank;++axis)
+            if(b.decl.shape[axis]<=0||!tiny_quote::mul(count,uint64_t(b.decl.shape[axis]),&count)||count>arena_cap*8)return RAD_E_SHAPE;
+        const int bits=rad_dtype_bits(b.decl.dtype);uint64_t bit_count=0;
+        if(bits<=0||bits>64||!tiny_quote::mul(count,uint64_t(bits),&bit_count)||(bit_count+7)/8>uint64_t(b.bytes))return RAD_E_DTYPE;
+    }
+    for(size_t i=1;i<p.weights.size();++i){const auto& w=p.weights[i];
+        if(w.decl.rank>RAD_MAX_RANK||w.stored_bytes<=0||uint64_t(w.stored_bytes)>arena_cap)return RAD_E_SHAPE;
+        uint64_t count=1;
+        for(uint32_t axis=0;axis<w.decl.rank;++axis)
+            if(w.decl.shape[axis]<=0||!tiny_quote::mul(count,uint64_t(w.decl.shape[axis]),&count)||count>arena_cap*8)return RAD_E_SHAPE;
+    }
+    // Shared MoeFP8 buffers are marked concurrent even though its shared arm
+    // interleaves on the same queue. Builder therefore declares two scratch
+    // regions without a lane1 window. The profile above still forbids an active
+    // lane1, and the existing arena planner charges the actual second region.
+    int64_t dev=0,total=0;arena_plan_bytes(p,&dev,&total);const auto host=arena_host_bytes(p);
+    if(dev<0||total<=0||host<0||uint64_t(total)>arena_cap||uint64_t(host)>arena_cap-uint64_t(total))return RAD_E_SCRATCH;
+    q.arena_device=uint64_t(total);q.arena_host=host?((uint64_t(host)+4095)/4096*4096):0;
+    if(q.arena_host>arena_cap-q.arena_device||!tiny_quote::device(s,q.arena_device)||
+       (q.arena_host&&!tiny_quote::mapped(s,q.arena_host)))return RAD_E_SCRATCH;
+    s.embedded_object_bytes=sizeof(Ctx);s.stream_count=d.stream?0:1;
+    if(!tiny_quote::heap(s,q.buffers,2*sizeof(RadTensor)+sizeof(int32_t)+sizeof(uint8_t))||
+       !tiny_quote::heap(s,1,sizeof(std::vector<RadTensor>))||
+       !tiny_quote::heap(s,q.weights,sizeof(RadTensor)+sizeof(int32_t)+2*sizeof(uint32_t)+sizeof(uint8_t))||
+       !tiny_quote::heap(s,q.ops,sizeof(OpPlan)+sizeof(uint32_t)+sizeof(std::atomic<uint8_t>))||
+       !tiny_quote::heap(s,q.ops,3*sizeof(double)+sizeof(int64_t)+sizeof(uint8_t))||
+       !tiny_quote::heap(s,p.kv_groups.size(),sizeof(KVPoolBinding)))return RAD_E_SHAPE;
+    // Exact bind_kv_pools layer-slot lengths, independent of not-yet-carved base
+    // addresses. No KV tensor payload is allocated/charged by Ctx itself.
+    for(size_t g=0;g<p.kv_groups.size();++g){const auto& group=p.kv_groups[g];
+        if(group.layers.size()>45||group.drafter)return RAD_E_UNSUPPORTED;
+        const auto& decl=group.decl;
+        if(!g){
+            if(!group.name.empty()||decl.kind||decl.dtype||decl.window||decl.n_head_kv||decl.head_dim||
+               decl.state_dim[0]||decl.state_dim[1]||decl.conv_width||group.block_size||group.bytes_per_block||
+               group.bytes_per_state||!group.layers.empty()||group.zero||group.replicated)return RAD_E_UNSUPPORTED;
+        }else{
+            if(decl.kind!=RAD_KV_FULL&&decl.kind!=RAD_KV_WINDOW&&decl.kind!=RAD_KV_LINEAR&&decl.kind!=RAD_KV_CONV)
+                return RAD_E_UNSUPPORTED;
+            // The actual TP4 GLM KDA convolution has 3*(64/4)*128=6144
+            // channels. Preserve its declared geometry; all other kinds keep
+            // the original 4096 head bound and only this exact tuple extends it.
+            const bool glm_conv6144=decl.kind==RAD_KV_CONV&&decl.head_dim==6144&&
+                decl.dtype==RAD_BF16&&decl.n_head_kv==1&&decl.conv_width==4&&
+                decl.window==0&&decl.state_dim[0]==0&&decl.state_dim[1]==0;
+            if(decl.window<0||decl.n_head_kv<0||decl.n_head_kv>4096||decl.head_dim<0||
+               (decl.head_dim>4096&&!glm_conv6144)||
+               decl.state_dim[0]<0||decl.state_dim[0]>4096||decl.state_dim[1]<0||decl.state_dim[1]>4096||
+               decl.conv_width<0||decl.conv_width>4096||group.block_size<0||group.bytes_per_block<0||group.bytes_per_state<0)
+                return RAD_E_SHAPE;
+            if(!group.zero){
+                if(group.layers.empty()||decl.n_head_kv<=0||rad_dtype_bits(decl.dtype)<=0)return RAD_E_SHAPE;
+                if((decl.kind==RAD_KV_FULL||decl.kind==RAD_KV_WINDOW)&&
+                   (decl.head_dim<=0||group.block_size<=0||group.bytes_per_block<=0))return RAD_E_SHAPE;
+                if(decl.kind==RAD_KV_LINEAR&&(decl.state_dim[0]<=0||decl.state_dim[1]<=0||group.bytes_per_state<=0))return RAD_E_SHAPE;
+                if(decl.kind==RAD_KV_CONV&&(decl.head_dim<=0||decl.conv_width<=0||group.bytes_per_state<=0))return RAD_E_SHAPE;
+            }
+        }
+        int high=-1;
+        for(size_t i=0;i<group.layers.size();++i){const int layer=group.layers[i];
+            if(layer<0||layer>=45)return RAD_E_SHAPE;
+            for(size_t j=0;j<i;++j)if(group.layers[j]==layer)return RAD_E_SHAPE;
+            high=std::max(high,layer);
+        }
+        if(!tiny_quote::heap(s,uint64_t(high+1),sizeof(int32_t)))return RAD_E_SHAPE;
+        if(!d.kv.empty()){const auto& binding=d.kv[g];
+            if(binding.rank>RAD_MAX_RANK||binding.bytes<0||binding.layer_stride<0||binding.layer_slot.size()!=size_t(high+1)||
+               binding.dtype!=group.decl.dtype)return RAD_E_SHAPE;
+            for(const auto dim:binding.shape)if(dim<0)return RAD_E_SHAPE;
+            for(size_t layer=0;layer<binding.layer_slot.size();++layer){int expected=-1;
+                for(size_t slot=0;slot<group.layers.size();++slot)if(group.layers[slot]==int(layer))expected=int(slot);
+                if(binding.layer_slot[layer]!=expected)return RAD_E_SHAPE;
+            }
+        }
+    }
+    uint64_t gate_params=0,gate_vectors=0;
+    for(size_t oi=0;oi<p.ops.size();++oi){const auto& op=p.ops[oi];
+        if(op.bands.size()>max_bands-q.bands)return RAD_E_SHAPE;
+        q.bands+=op.bands.size();
+        if(oi&&(!op.schema||op.schema->n_operands<0||op.schema->n_operands>MAX_OPERANDS||
+           (op.schema->n_operands&&!op.schema->operands)||op.weights.size()!=op.weight_opd.size()||op.weights.size()>max_weights))return RAD_E_UNSUPPORTED;
+        for(const auto& band:op.bands)for(const auto& r:band.dom){
+            if(r.scratch_bytes<0||r.scratch_bytes>p.scratch_bytes)return RAD_E_SCRATCH;
+            // Actual collective/init rows are metadata here, not initialized by
+            // this quote; unlike the tiny profile they are deliberately allowed.
+            if(r.row&&(!r.row->info||r.row->deferred_status))return RAD_E_UNSUPPORTED;
+            if(r.row&&r.row->releases_link){const auto count=r.geom.n_params();
+                if(count<0||count>256||!tiny_quote::add(gate_params,uint64_t(count)+1))return RAD_E_SHAPE;
+                ++gate_vectors;
+            }
+        }
+        if(!oi)continue;
+        for(int operand=0;operand<op.schema->n_operands;++operand){
+            if(op.schema->operands[operand].role!=RAD_OPD_WTAB)continue;
+            rad_weight low=0,high=0;uint64_t count=0;
+            for(size_t k=0;k<op.weights.size();++k){if(op.weight_opd[k]!=operand)continue;const auto w=op.weights[k];
+                if(!w||w>=p.weights.size())return RAD_E_INVAL;
+                if(!count)low=high=w;else{low=std::min(low,w);high=std::max(high,w);}++count;
+            }
+            if(!count)continue;
+            if(uint64_t(high-low)+1!=count||q.tables>=max_ops||count>max_entries-q.table_entries)return RAD_E_INVAL;
+            ++q.tables;q.table_entries+=count;
+            if(!tiny_quote::pinned(s,count*sizeof(void*))||!tiny_quote::device(s,count*sizeof(void*)))return RAD_E_SHAPE;
+        }
+    }
+    if(!tiny_quote::heap(s,q.bands,sizeof(int64_t)+RAD_N_DOMAINS*sizeof(IssuePlan))||
+       !tiny_quote::heap(s,gate_params,sizeof(RadParam)))return RAD_E_SHAPE;
+    if(q.tables){
+        if(!tiny_quote::heap(s,q.weights,sizeof(int32_t))||!tiny_quote::heap(s,q.tables,sizeof(WeightTable))||
+           !tiny_quote::heap(s,q.table_entries,sizeof(WMemb)+sizeof(int32_t)+sizeof(void*)))return RAD_E_SHAPE;
+        q.first_use_heap_reservation=q.table_entries*sizeof(void*);
+        uint64_t growing=q.tables*sizeof(WeightTable)+q.table_entries*(sizeof(WMemb)+sizeof(int32_t)+sizeof(void*));
+        if(!tiny_quote::mul(growing,2,&s.heap_growth_allowance))return RAD_E_SHAPE;
+    }
+    uint64_t growth=0;if(!tiny_quote::mul(gate_params,2*sizeof(RadParam),&growth)||!tiny_quote::add(s.heap_growth_allowance,growth))return RAD_E_SHAPE;
+    q.route_bank=uint64_t(45)*kRouteBanks*288*sizeof(int32_t);q.route_device=uint64_t(45)*288*sizeof(int32_t);
+    if(!tiny_quote::heap(s,45,sizeof(RouteSlot))||!tiny_quote::pinned(s,q.route_bank)||!tiny_quote::device(s,q.route_device))return RAD_E_SHAPE;
+    s.event_count=kRouteBanks;
+    const auto& limits=d.expert_prepare_limits;
+    if(limits.max_rows!=1||limits.max_experts!=288||limits.max_top_k!=8||limits.max_maps<42||limits.max_maps>256||
+       limits.max_entries<12096||limits.max_entries>65536||!limits.max_readback_bytes||limits.max_readback_bytes>(16u<<20)||
+       !limits.max_metadata_bytes||limits.max_metadata_bytes>(32u<<20))return RAD_E_UNSUPPORTED;
+    q.prepare_maps=p.expert_route_maps.size();
+    for(const auto& map:p.expert_route_maps){
+        if(!tiny_quote::add(q.prepare_entries,map.entries.size())||q.prepare_entries>limits.max_entries)return RAD_E_SHAPE;
+        const auto& decl=map.decl;
+        q.prepare_bank=std::max(q.prepare_bank,uint64_t(2*decl.local_experts+1+2*decl.max_rows*decl.top_k)*sizeof(int32_t));
+    }
+    q.prepare_seen=8;
+    const uint64_t prepare_metadata=q.prepare_entries*sizeof(RadExpertRouteEntry)+q.prepare_seen+q.prepare_maps*sizeof(ExpertRouteMap);
+    if(q.prepare_bank>limits.max_readback_bytes||prepare_metadata>limits.max_metadata_bytes)return RAD_E_SCRATCH;
+    if(!tiny_quote::heap(s,1,sizeof(ExpertPrepareState))||!tiny_quote::heap(s,q.prepare_maps,sizeof(ExpertRouteMap))||
+       !tiny_quote::heap(s,q.prepare_entries,sizeof(RadExpertRouteEntry))||!tiny_quote::heap(s,q.prepare_seen,sizeof(uint8_t))||
+       !tiny_quote::add(s.heap_growth_allowance,288)||!tiny_quote::mapped(s,q.prepare_bank))return RAD_E_SHAPE;
+    ++s.event_count;
+    // Two possible lazy HOST-scope touch events are a separately stated upper;
+    // lane1/recorded passes/XP remain excluded by the actual profile.
+    s.event_count+=2;
+    s.control_allowance=65536+q.tables*(sizeof(decltype(wtab_of_)::value_type)+128)+gate_vectors*128;
+    if(!glm_main_quote_finish(s))return RAD_E_SCRATCH;
     *out=q;return RAD_OK;
 }
 

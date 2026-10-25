@@ -1,0 +1,102 @@
+{
+  "files": {
+    "contract/bound_sources.h": {
+      "core_copy": "276feba99dfd7c96fb0f98b0ba35ec61fa94adf787c70ffba73e454a56aa6bae",
+      "original": "a450fbfc241855a9b149e57b866bac97ee29728e6cc58998c2291ef771386a1d",
+      "original_source": "glm53-tiny-engine-source-factory-v2-prototype/contract/bound_sources.h"
+    },
+    "contract/fixture_writer.cpp": {
+      "core_copy": "bc7e92d4cd93e7d97b49e81badbf331f41c22968b2ab88cc5a4f61f833d5b1e9",
+      "original": "4790f974c96efd29f755c0b515a1d6ee5b63f3c2846154038bf2134d71cf6840",
+      "original_source": "glm53-tiny-engine-source-factory-v2-prototype/contract/fixture_writer.cpp"
+    },
+    "contract/fixture_writer.h": {
+      "core_copy": "4a871c251e17a042ff31e085505ecaa7e1a88e4fd2f0623c8192ba7a2af82650",
+      "original": "4c2d3a9eb87ea69cd79b0adfff3b34b39772a053b044381ef63fcfe3d0162c7a",
+      "original_source": "glm53-tiny-engine-source-factory-v2-prototype/contract/fixture_writer.h"
+    },
+    "contract/graph_quote.cpp": {
+      "core_copy": "a8c5c69c7766c1b07752b102ba87dd883d5e8854e5a933afb09ea5d1dd8257fb",
+      "original": "65b9e7ce9532795a781c2e5c869a5b5ff094cac0dcb0bf6d6c6e835bd9f268ed",
+      "original_source": "glm53-tiny-engine-source-factory-v2-prototype/contract/graph_quote.cpp"
+    },
+    "contract/graph_quote.h": {
+      "core_copy": "4d6951d65f6266788cdb57914cd68084636d596379569812a5ba1c4d4599a1b6",
+      "original": "623afe632946d3f71acb5da4cdea398bb274847320ccae8b08301cf2644b651e",
+      "original_source": "glm53-tiny-engine-source-factory-v2-prototype/contract/graph_quote.h"
+    },
+    "contract/profile.cpp": {
+      "core_copy": "99327834f2e1d1f39d894d2b8bb23ae7daa8f5c3647d078169bf75cb69b87d9b",
+      "original": "ddc5d067812b2d3bd167db0210fb61e0c1e8c418cf7c38d7b27e1e34b73c4e50",
+      "original_source": "glm53-tiny-engine-source-factory-v2-prototype/contract/profile.cpp"
+    },
+    "contract/profile.h": {
+      "core_copy": "ce80b228960077ae365f23ef2848fc2bddebad955b853d04289898ec30520103",
+      "original": "28f9cedbed3e6efd9405634a50332a2aac2a3cf7b82ddb307c034fcf1468bda7",
+      "original_source": "glm53-tiny-engine-source-factory-v2-prototype/contract/profile.h"
+    },
+    "contract/shape_profile.cpp": {
+      "core_copy": "d8e4202b1e998613ade78b2ec8531672e93c3fe8430173b5cd21bcfd63e66f9d",
+      "original": "47acb350d13a6f46a0644fe5c2e5d057a49adc6a49839b31aea2e9092c9fdc0f",
+      "original_source": "glm53-tiny-engine-source-factory-v2-prototype/contract/shape_profile.cpp"
+    },
+    "source_factory.cpp": {
+      "core_copy": "ad77e7780d041dd197b165df075bd8783da85f6bf076847904c4b546ee93b997",
+      "original": "670e1d9cebc41805750f05ce68e1cae0115a7d89181dac8344fd3725155e3da4",
+      "original_source": "glm53-tiny-engine-source-factory-v2-prototype/source_factory.cpp"
+    },
+    "source_factory.h": {
+      "core_copy": "93891b54e549c46b9ce5f35ab0c0841f82f24ed0e4884b0cecf6fada7a5b26a1",
+      "original": "93891b54e549c46b9ce5f35ab0c0841f82f24ed0e4884b0cecf6fada7a5b26a1",
+      "original_source": "glm53-tiny-engine-source-factory-v2-prototype/source_factory.h"
+    },
+    "storage/candidate_native_record_store.cpp": {
+      "core_copy": "dedb5b10a4016ab3a7b31c1841756c5203ad546c31fabdb0caa4b2a5d0280ae7",
+      "original": "9e3f8ba58030c2ddc099499c47da72b005766323e33119f34107bbd22f556b7f",
+      "original_source": "glm53-tiny-engine-source-factory-v2-prototype/storage/candidate_native_record_store.cpp"
+    },
+    "storage/candidate_native_record_store.h": {
+      "core_copy": "6507d9f0e40100b56f2bade02ca9eecd4825c70fcdfb0e89fe72bec8d53f3d0f",
+      "original": "1d3b21ae6a3e80b524ef62378af79f2d9c7177d6f4a9502c8c4da0df743e794a",
+      "original_source": "glm53-tiny-engine-source-factory-v2-prototype/storage/candidate_native_record_store.h"
+    },
+    "storage/native_source.cpp": {
+      "core_copy": "02ac7a5bbff696db87afb2c9611cbc5f1f5b0276056576f39cf52c765921b807",
+      "original": "f4d02c7e0b3b5ff7f1add54a002db1e2360cc9db5e805704d0c2a973d591729f",
+      "original_source": "glm53-tiny-engine-source-factory-v2-prototype/storage/native_source.cpp"
+    },
+    "storage/native_source.h": {
+      "core_copy": "0542e65e58e24b88eab6322e3e10710f05a1fc96eb2752d936cc04a411d91152",
+      "original": "42e39f672e223f6c7a964decf652ac3211eb84b121ab5ef78cb89a1bae72be07",
+      "original_source": "glm53-tiny-engine-source-factory-v2-prototype/storage/native_source.h"
+    },
+    "storage/physical_source_bridge.cpp": {
+      "core_copy": "ce3bc7724eb280ed405fdaa4761b9aa0fb6b110f6bf1e84ec7a762f8783e2e33",
+      "original": "41e7fabd82376ad14603e5a2e815b7e50755e988ca573e670d614aee33c9faf2",
+      "original_source": "glm53-tiny-engine-source-factory-v2-prototype/storage/physical_source_bridge.cpp"
+    },
+    "storage/physical_source_bridge.h": {
+      "core_copy": "2d167121371d871fd20f45b1c233253f9543b60b020d5715be73d5bcf978d737",
+      "original": "0d5bce208a8e0cefcbb296352575b102f64c06be0125e66fea26edea4bd51367",
+      "original_source": "glm53-tiny-engine-source-factory-v2-prototype/storage/physical_source_bridge.h"
+    },
+    "storage/rank_native_store.cpp": {
+      "core_copy": "cfa8fa544e7798bcd9c703bf214225a97757f2f5afc14503f9059ba6afa4fd19",
+      "original": "327887f40ed9356ffe95b6d6941641d26e69dbeb0d1585a1c25a76543e6eb848",
+      "original_source": "glm53-tiny-engine-source-factory-v2-prototype/storage/rank_native_store.cpp"
+    },
+    "storage/rank_native_store.h": {
+      "core_copy": "133a6211fe5cb18b5b1853ffc3cf46fd8a3cb3d9966da78d07c437faaf6b670b",
+      "original": "68fc535ebf99042498d317407df873e89ea5622fc9533ab7495b3934949f3f2f",
+      "original_source": "glm53-tiny-engine-source-factory-v2-prototype/storage/rank_native_store.h"
+    }
+  },
+  "namespace_only_mapping": {
+    "glm53::p3": "glm53::engine_core_p3",
+    "glm53::physical_bridge": "glm53::engine_core_physical",
+    "glm53::sharded": "glm53::engine_core_sharded",
+    "glm53::tiny_startup": "glm53::engine_core_contract",
+    "rad::expert_store_candidate": "rad::engine_core_expert_store"
+  },
+  "original_factory_receipt": "1ca4d749fe54211f61fa7b26065d681ca871341c0f6251e2fa7aa2c29c67f7b4"
+}

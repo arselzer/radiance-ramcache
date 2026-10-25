@@ -1,0 +1,55 @@
+Current publication: Core V6, Engine fixture V8, Components V12, archived Runner V4
+
+radiance/ exactly matches the 1,535 Core V6 files pinned by 83d57401. All three
+active fixture V8 maps (top/device/strictP3) equal that inventory. V8 C++/CMake
+cases are byte-identical to V7; its map synchronizes two loader hashes. V7 fixed
+only a boolean test sentinel. The production Core V6 delta is loader.h/.cpp:
+exact parallel scales, null placeholders required for canonical plain one-plane
+encoding, and physical scales required for affine two-plane encoding. Source
+bounds and transform exclusions remain; missing affine data is not inferred.
+
+Passed stages, with original receipts exported:
+- Matching HOST/AQL Release builds and matching HOST sanitizer builds.
+- Release, ASan/UBSan and TSan HOST suites: 20 commands each, no GPU/model/serving.
+- Actual complete-data prewalk: all four source/native/final plans, 5,088 ordinary
+  jobs and 193,536 native-view omissions covering 161,715,585,024 expert bytes;
+  1,046.67 seconds. No loader execution, Pools/Ctx/Engine startup or model kernel.
+  Source/reservation evidence is not runtime-fit, inference or throughput proof.
+- Twelve portable Release programs compiled at the original d2915f6e snapshot.
+  That build-only receipt did NOT execute them. The later portable runtime passed
+  all twelve HOST programs at preserved snapshot f0eaee18 (3,021 files). Final
+  export adds evidence/docs only; all raw source/tools/CMake bytes are unchanged.
+  The separate GPU attempt failed as recorded below.
+
+The first private manual profile remains one prompt token and one output token,
+maxTok1/seq1/spec0, exact wire, context512 and no fixed resident experts. Ordinary
+CLI/HTTP cannot manufacture the private verified-source request. Arbitrary
+prompts, 262K, MTP, quality, speed and deployment are not validated. The inherited
+synchronous-clear refusal limitation and lack of GPU/driver recovery remain.
+
+Runner V4 admits Core V6/fixture V8 or matching legacy revisions through V5, with
+complete source-pin/inventory/binary binding. Its operational bodies are unchanged
+from V3/V2. Fresh V4 preparation and original private gates/environment are
+required. Public default builds/checkers neither import nor call it. Portable
+checks stay explicitly HOST-only; compiler/ABI/environment/ccache/private-header/
+archive/mode guards remain closed.
+
+Raw packages, author-time receipts and historical evidence remain byte-identical.
+Old Core V5 reconstruction uses two archived loader files plus 1,533 identical
+current files. Previous 914c/f95/f696/d291 source maps and wrapper scopes are
+retained; their histories do not establish current readiness. Normalized docs
+and new evidence now include the final failed GPU outcome and restoration; the
+portable runtime passed at the preserved coherent f0ea snapshot. Final manifest
+regeneration adds its evidence/docs without changing tested code.
+No weights, native store, tokenizer payloads, compiled research libraries, private
+serving configuration, Docker Config/Env, API keys or prepared HOME are included.
+No production deployment is included.
+
+Actual Core V6 GPU outcome: failed -14/RAD_E_FORMAT in ColdAdmitted after four
+gfx1201 devices and tokenizer loading. Tokenizer154856/model154880 padded rows
+violated the strict equality guard, before source admission/native verification,
+weight pools/uploads or model computation. No inference/ready/fit claim. Same
+original QFN container restored with 40+ seconds stable health and an independent
+four-token QFN completion. Earlier health-timeout attempt stopped nothing and
+launched no child. Window closed; no further GPU window queued. A safe padded
+vocab/mask change is separate future source work, absent from frozen Core V6.

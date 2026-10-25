@@ -294,7 +294,12 @@ public:
     /* Calls init() once per resolved instance (one op, band and domain) with the frozen geometry,
      * rank and world size, off the hot path: e.g. libr4d's all-reduce sets up peer signal buffers
      * and IPC handles here. A negative return aborts startup; the caller names the kernel. */
-    int  init_instance(Resolved& r, int rank, int world_size);
+    using InitFailureHook=void(*)(void*,int) noexcept;
+    // Internal opt-in startup: reserve actual tracking slots BEFORE any peer
+    // init may rendezvous. Null hook retains the original default path.
+    int reserve_instance_tracking(size_t additional) noexcept;
+    int init_instance(Resolved& r,int rank,int world_size,
+                      InitFailureHook early_failure=nullptr,void* failure_context=nullptr);
     void fini_instances();
     size_t n_instances() const;
 
@@ -355,6 +360,7 @@ private:
     std::vector<SelectionRecord> log_;
     std::unordered_map<std::string, size_t> log_at_;   /* SelectionRecord::key -> index in log_ */
     std::vector<std::pair<const RadKernelInfo*, void*>> instances_;
+    size_t instance_tracking_credits_=0; // only the explicit opt-in path
 };
 
 /* The value a kernel's own constraints place on one key, e.g. the paged block size the resolved

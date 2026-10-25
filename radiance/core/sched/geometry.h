@@ -75,5 +75,9 @@ int64_t prefill_shared_tok(const Config& cfg);
  * out->min_max_tok, the reason in out->why; the caller stops), and RAD_E_SHAPE when two kernels'
  * constraints contradict each other, which is a kernel-set bug. */
 int chunk_geometry_resolve(const Program& prog, const Config& cfg, ChunkGeometry* out);
+// Internal metadata-only admission for the closed actual first GLM profile.
+// Keeps actual quantum/minimum; permits ONLY Engine's final one-token prompt.
+// Ordinary resolver and Scheduler nonfinal clamps are unchanged.
+int glm_main_final_token_geometry_resolve(const Program&,const Config&,ChunkGeometry*);
 
 }  /* namespace rad */

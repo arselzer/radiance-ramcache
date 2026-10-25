@@ -1,0 +1,59 @@
+{
+  "Core6_checkpoint_ready_for_inference": false,
+  "Core_revision": "v6",
+  "GLM_serving_enabled": false,
+  "GPU_window_closed": true,
+  "actual_GPU_window_attempts": 1,
+  "additional_GPU_window_queued": false,
+  "combined_startup_and_one_token": {
+    "cause": "Core6 strict vocabulary-size guard: actual tokenizer154856 vs model padded vocabulary154880",
+    "child_returncode": 1,
+    "combined_log_sha256": "bc944b69c808f93eacf202b4456e018e89076076c6f478672ca2d9a3083147e6",
+    "device_requested": [
+      0,
+      0,
+      0,
+      0
+    ],
+    "failed_phase": 1,
+    "failed_phase_name": "ColdAdmitted",
+    "model_kernels_reached": false,
+    "native_bytes_verified": 0,
+    "ordinary_jobs": 0,
+    "ordinary_upload_bytes": 0,
+    "original_directory": "glm53-manual-window-core-v6-fixture-v8-20261025T222006Z",
+    "passed": false,
+    "receipt_sha256": "8a6d91f6d0edad8ca3b315261b9273691dc05402518c82e257cafd586c212cc0",
+    "reported_status": -14,
+    "scope": "Four gfx1201 devices enumerated; checkpoint/tokenizer loaded, then admission failed before source verification, weight pools/uploads or model computation",
+    "source_admitted": false,
+    "text_complete": false,
+    "transport_ready": false
+  },
+  "fixture_revision": "v8",
+  "future_Core7_fix": "Separate source design only; not part of this Core6 export",
+  "performance_or_quality_claim": false,
+  "portable_runtime": "PENDING parent wrapper invocation after coherent manifest",
+  "prior_pre_stop_abort": {
+    "child_attempted": false,
+    "original_directory": "glm53-manual-window-core-v6-fixture-v8-20261025T221755Z",
+    "reason": "health timeout before stop was armed/issued; no child",
+    "receipt_sha256": "bfb7204353ae868f49dcefbaf181835daf241c62e98fd53e85fe7244c4366a76",
+    "stop_issued": false
+  },
+  "production_configuration_or_deployment_changes": false,
+  "restoration": {
+    "RestartCount": 0,
+    "completion_scope": "original restored QFN server; NOT GLM",
+    "in_flight_after": 0,
+    "independent_check": "evidence/glm53-main-verified-v6/restoration-independent/server-check-after-glm-window-20261025T222331Z.json",
+    "independent_check_sha256": "ab47cdc1726fb9d1723193fceceb7ac9b818e440b00be7f8e00cf81d05871fce",
+    "independent_completion_model": "qwen-vllm",
+    "independent_completion_tokens": 4,
+    "same_Id_Image_Name_independently_verified": true,
+    "same_original_container_restored": true,
+    "stable_health_seconds": 40.65445147594437
+  },
+  "runner_revision": "v4",
+  "schema": "glm53-core6-fixture8-manual-window-result-v1"
+}

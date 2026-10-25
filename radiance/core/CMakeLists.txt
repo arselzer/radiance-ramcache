@@ -13,6 +13,10 @@ foreach(d ${RAD_CORE_DIRS})
        ${CMAKE_CURRENT_SOURCE_DIR}/${d}/*.c)
   list(APPEND RAD_CORE_SRC ${_s})
 endforeach()
+# Private complete-main Reader textually includes this producer implementation.
+# It is not a second translation unit (the same rule as its frozen A/B parent).
+list(REMOVE_ITEM RAD_CORE_SRC ${CMAKE_CURRENT_SOURCE_DIR}/build/glm_main_source_data/producer/main_records.cpp)
+
 # The top level minus main.cpp, which belongs to the `radiance` executable. Every architecture plugin
 # host links the archive whole (tools/CMakeLists.txt), so a main() inside it would collide with each
 # tool's own.
@@ -28,6 +32,12 @@ target_include_directories(rad_core PUBLIC
   ${CMAKE_SOURCE_DIR} # private bounded tiny-source helper includes tests/tiny_model.h
   ${CMAKE_SOURCE_DIR}/abi
   ${CMAKE_SOURCE_DIR}/vendor)
+
+# Match the frozen A/B textual producer include contract. Only Core translation
+# units include producer/main_records.h; public Engine headers resolve their
+# own relative includes and do not require this private search root.
+target_include_directories(rad_core PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/build/glm_main_source_data)
 
 if(TARGET rad_vendor)
   target_link_libraries(rad_core PUBLIC rad_vendor)

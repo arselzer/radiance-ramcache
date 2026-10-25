@@ -1,6 +1,7 @@
 /* batch.cpp -- builds the step batch once per step. See batch.h.
  */
 #include "batch.h"
+#include "runtime/cache_prepare4_session.h"
 #include "mm/processor.h"
 #include "derive.h"
 #include "device/device.h"
@@ -253,18 +254,21 @@ void BatchBuilder::forget_tables() {
 }
 
 void BatchBuilder::free_set(Set& s) {
+    const auto bind=[this](int device){const int status=rad_dev_set(device);
+        if(status<0&&prog_&&prog_->requires_glm_main_tp4_cache_fail_stop())glm53::cache_prepare4::process_fail_stop();
+    };
     for (size_t f = 0; f < ev_.size(); ++f)
         for (size_t r = 0; r < ev_[f].size(); ++r) {
-            if (r < ranks_.size()) rad_dev_set(ranks_[r].device);
+            if (r < ranks_.size()) bind(ranks_[r].device);
             if (ev_[f][r]) rad_event_destroy(ev_[f][r]);
         }
     ev_.clear();
     ev_free_.clear();
     for (size_t r = 0; r < s.dev.size(); ++r) {
-        if (r < ranks_.size()) rad_dev_set(ranks_[r].device);
+        if (r < ranks_.size()) bind(ranks_[r].device);
         if (s.dev[r]) rad_dev_free(s.dev[r], RAD_MEM_DEVICE);
     }
-    if (!ranks_.empty()) rad_dev_set(ranks_[0].device);
+    if (!ranks_.empty()) bind(ranks_[0].device);
     s.dev.clear();
     if (ring_.host) { rad_dev_free(ring_.host, RAD_MEM_HOST_PINNED); ring_.host = nullptr; }
     ring_.first = 0;
@@ -356,6 +360,23 @@ int64_t BatchBuilder::device_bytes(Program& prog, const Config& cfg, const KVGeo
     b.size_set(b.set_, prog.kv_groups);
     const MediaBytes m = b.mm_on_ ? b.media_bytes() : MediaBytes{};
     return b.set_.dev_bytes + m.mm + m.pix + m.crd + m.cu;
+}
+
+int BatchBuilder::glm_main_staging_quote(Program& p,const Config& c,const KVGeom& kg,
+                                         uint64_t* device,uint64_t* pinned,uint64_t* events){
+    if(!device||!pinned||!events)return RAD_E_INVAL;
+    if(glm_main_tp4_cache_program_profile(p)<0||c.tp!=4||c.max_tok!=1||c.max_seqs!=1||c.n_spec||
+       c.max_ctx<1||c.max_ctx>512||p.encoder.modalities||p.audio_encoder.modalities)return RAD_E_UNSUPPORTED;
+    BatchBuilder b;b.prog_=&p;b.cfg_=c;b.kvgeom_=kg;
+    RAD_TRY(b.layout(p,c));b.size_set(b.set_,p.kv_groups);
+    if(b.mm_on_||b.set_.dev_bytes<=0||b.set_.host_bytes<=0)return RAD_E_UNSUPPORTED;
+    uint64_t pay=0;
+    for(const auto& g:b.set_.groups){if(g.max_blocks<0||uint64_t(g.max_blocks)>(UINT64_MAX-pay)/4)return RAD_E_SHAPE;pay+=uint64_t(g.max_blocks)*4;}
+    const uint64_t ranges=pay/uint64_t(k_range_max)+b.set_.groups.size()+1;
+    if(ranges>(UINT64_MAX-uint64_t(b.set_.host_bytes)-uint64_t(k_carve_align))/sizeof(RadCopyRange))return RAD_E_SHAPE;
+    const uint64_t one=uint64_t(b.set_.host_bytes)+ranges*sizeof(RadCopyRange)+uint64_t(k_carve_align);
+    if(one>UINT64_MAX/3)return RAD_E_SHAPE;
+    *device=uint64_t(b.set_.dev_bytes);*pinned=3*one;*events=uint64_t(kFlights)*4;return RAD_OK;
 }
 
 int BatchBuilder::layout(Program& prog, const Config& cfg) {

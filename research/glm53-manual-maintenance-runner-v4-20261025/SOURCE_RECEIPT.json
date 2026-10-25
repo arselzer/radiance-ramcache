@@ -1,0 +1,57 @@
+{
+  "AST_added_functions": [],
+  "AST_old_functions_unchanged_except": [
+    "verify_build"
+  ],
+  "AST_parse_only": true,
+  "compiler_or_tokenizer_or_model_or_Docker_executed_by_author": false,
+  "core_revision": "v6",
+  "core_source_pins_sha256": "83d57401b288dc78ddad965498d47c2066e99050291411bc3545985d2a874159",
+  "delta": "Only verify_build current admitted pair v6/v7->v6/v8/errorlabel; fullguards and alloperational bodies exactV3/V2.",
+  "fixture_revision": "v8",
+  "inputs": {
+    "GLM53_SHIPPED_PLUGIN_HASHES.json": "f6ce7f3167aff1df128545197c00ed405c2b52a5f12f6011b86e9fe5c8894a7d",
+    "glm53-main-verified-source-engine-v8-prototype/SOURCE_RECEIPT.json": "61b84df3fb482992331ad66fe37e0175d877bcf4687030882fdcf98224479f6a",
+    "glm53-manual-tokenizer-home-preflight-20261025/METADATA_REVIEW.json": "af19b78c7f07db8c51c50c4d500d7f1ee6c75cfc962b9dc904d70e28578a158c",
+    "run_guarded_heavy_research.py": "7488c4fc4f32e207e4e88cb3dcedbacb6830d85f0fc539bd2be76381bcb11fc2"
+  },
+  "legacy_fixture_fallback": "Core<=v5 only; explicit legacy fields must match same revision",
+  "parent_source_receipt": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-manual-maintenance-runner-v3-20261025/SOURCE_RECEIPT.json",
+  "parent_source_receipt_sha256": "82856508493704d6b551276b3e20f5c29dca5f40e1c4e58f8ec2689e80903672",
+  "physical_resource_gate": {
+    "AMD_BDFs": [
+      "0000:c3:00.0",
+      "0000:83:00.0",
+      "0000:03:00.0",
+      "0000:06:00.0"
+    ],
+    "GPU_query_subprocess": false,
+    "exact_total_bytes_each": 17095983104,
+    "max_samples": 31,
+    "max_used_bytes_each": 67108864,
+    "min_MemAvailable_bytes": 34359738368,
+    "wait_seconds": 60
+  },
+  "production_changed_by_author": false,
+  "readiness": "Source-only; parent matchingCore6/fixture8 build/runtime/prewalk and independentV4 review required; freshV4prepare required.",
+  "reviewed_Core_fixture_pairs": [
+    [
+      "v6",
+      "v8"
+    ]
+  ],
+  "revision": "v4",
+  "rollback_limits": [
+    "No external SIGKILL/power-loss guardian",
+    "Same container identity only; parent serving baseline supplies model identity",
+    "Ambiguous original stop acknowledgement remains overall unproven even after best-effort health",
+    "No GPU/driver fault recovery or configuration substitution"
+  ],
+  "runtime_executed_by_author": false,
+  "schema": "glm53-manual-maintenance-source-v1",
+  "scope": "Parent-owned prepare plus one authorized same-container stop/combined GLM startup+one-token/restore window; source only",
+  "source_files": {
+    "README.txt": "496a455d0ebe65f74c31ab440516646ad5ac968d39728fc4d55f14983f1b655b",
+    "runner.py": "1f50141f4a1b059dca4be0d0ef1ec1c69c0ebdca92063fade188726805f68e43"
+  }
+}

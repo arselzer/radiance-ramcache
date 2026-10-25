@@ -1,0 +1,61 @@
+{
+  "Core_already_omits_two_historical_pyc": true,
+  "additional_Core_cache_exclusions": [],
+  "archived_review_files": {
+    "GLM53_ACTUAL_CONTEXT_QUOTE_PREFLIGHT_SOURCE_DIAGNOSIS_20261025.txt": "b11209a124ab1950f2839ef558a79e7979b532269b23e38d4576185e4fed9bec",
+    "GLM53_MANUAL_MAINTENANCE_RUNNER_INDEPENDENT_REVIEW.txt": "65b9ca6239cc6852de78f6f582f936eb515348ec96f78d201953f18c0ce5226f",
+    "GLM53_MANUAL_MAINTENANCE_RUNNER_INDEPENDENT_REVIEW_PINS.json": "3dffc4ceea92b91f8fc38add367cdeb159a870884ce2cc611b9b4d5ef68af1ba",
+    "GLM53_MANUAL_MAINTENANCE_RUNNER_V2_RESOURCE_GATE_REVIEW.txt": "1807a9fa54699cb73ce88a64ee5e50bf8d10d39fffc1b3b73d61db4acae4c7f4",
+    "GLM53_MANUAL_MAINTENANCE_RUNNER_V2_RESOURCE_GATE_REVIEW_PINS.json": "9d5877f057e3d0a42074c4937c56e00398a43109f9ab64e879fe263f153be139",
+    "GLM53_VERIFIED_MAIN_COMPONENTS_V3_INDEPENDENT_REVIEW.txt": "2086c1d00f262974f846118042d5dbb083b4d32c130110a347f1be93d31f6332",
+    "GLM53_VERIFIED_MAIN_COMPONENTS_V3_INDEPENDENT_REVIEW_PINS.json": "cdbd6420a3155dc7658f269676b17e481777eb3478123746ccfe77a1ba23f282",
+    "GLM53_VERIFIED_MAIN_COMPONENTS_V7_QUOTE_GUARDS_REVIEW.txt": "6b0b92ae3c99bdc7c1452e467ce9f898f9d08edb47d4ed1778c21e2f45417ca0",
+    "GLM53_VERIFIED_MAIN_COMPONENTS_V7_QUOTE_GUARDS_REVIEW_PINS.json": "f29fbdc3bc1eeb27e78c070450a612773c5973e71fad0433c1629a6dabd8b897",
+    "GLM53_VERIFIED_MAIN_ENGINE_C_F_INDEPENDENT_REVIEW_PINS_V2.json": "ed838c6bdd39580c175061f7b960c5e21ccadc1f86a6a841a789ae62df7476ab",
+    "GLM53_VERIFIED_MAIN_ENGINE_C_F_INDEPENDENT_REVIEW_V2.txt": "df67e7d1337b779976dcdd08987865f54af58021baf18def3c9be5772aea71f3",
+    "GLM53_VERIFIED_MAIN_ENGINE_V3_INCLUDE_REPAIR_REVIEW.txt": "e21456c3b32d828c30f124cb42e02bd37287ca90ce3f260c7fde8cbe120679a3",
+    "GLM53_VERIFIED_MAIN_ENGINE_V3_INCLUDE_REPAIR_REVIEW_PINS.json": "9a1c2e919d1844ca9849edd4f185817137c495ad47296f8976d1bf9faeb5a6a0",
+    "GLM53_VERIFIED_MAIN_ENGINE_V4_VISIBILITY_REPAIR_REVIEW.txt": "64e2982c22caa84c16b57c2b672f8cf63f118aac7133a97c4472fcea770a3859",
+    "GLM53_VERIFIED_MAIN_ENGINE_V4_VISIBILITY_REPAIR_REVIEW_PINS.json": "36c4c84840695dc2db421ba8abf6491c6e8995ab3295e0fc9386868645c9cd7a",
+    "GLM53_VERIFIED_MAIN_ENGINE_V5_CTX_QUOTE_REPAIR_REVIEW.txt": "36e7449e4a21a5509861e7e9d3bdebcb0344d9d8ee56175bad778f7a86894889",
+    "GLM53_VERIFIED_MAIN_ENGINE_V5_CTX_QUOTE_REPAIR_REVIEW_PINS.json": "20c9ebaf4bf37bd147b154276773bc5d9a2c25bc33608615ea9c8649b9bed949"
+  },
+  "base_public_commit": "e3d00a8c25bb08dc3fccc7201a935b1877595bee",
+  "compiled_outputs_or_actual_model_payloads_exported": false,
+  "exact_research_packages": {
+    "glm53-main-verified-components-v7-prototype": {
+      "files": 9,
+      "original_receipt": "SOURCE_RECEIPT.json",
+      "original_receipt_sha256": "e5f382300425e88b4fd2f4d167d7b7dcc735305a845fdc57c3de3df9ff973e99",
+      "source_bodies_changed": false
+    },
+    "glm53-main-verified-source-engine-v5-prototype": {
+      "files": 79,
+      "original_receipt": "SOURCE_RECEIPT.json",
+      "original_receipt_sha256": "5fb644e7648616b890a0a31d9cd9ff49675a559b0d464764e96c98c4f0133729",
+      "source_bodies_changed": false
+    },
+    "glm53-manual-maintenance-runner-v2-20261025": {
+      "files": 3,
+      "original_receipt": "SOURCE_RECEIPT.json",
+      "original_receipt_sha256": "f3ac69d09fa669f181e87847797a098bdcff875bce44815c31fcbca7005b34d3",
+      "source_bodies_changed": false
+    },
+    "glm53-manual-tokenizer-home-preflight-20261025": {
+      "files": 4,
+      "original_receipt": "RECEIPT.json",
+      "original_receipt_sha256": "41878a1e67aab23c4c12de74178259fcea2e8d5d35f5d9e7e78c63a85434445c",
+      "source_bodies_changed": false
+    }
+  },
+  "exported_Core_files": 1535,
+  "legacy_manifests": "Retained unchanged; they describe their original complete source folders, not current radiance/",
+  "new_source_bodies_changed": false,
+  "original_Core_pin_manifest_sha256": "0001f0a163dbc87198b899f9f9c782e6a9a0071c7a6a964fb2d2e10a68b8f19e",
+  "private_serving_configuration_exported": false,
+  "runner": "Archived exact server-specific research source only; absent private runtime dependencies, no default/import/CMake/test action",
+  "schema": "glm53-main-verified-v5-portable-export-v1",
+  "source_Core": "radiance-glm-main-verified-source-v5-src",
+  "upstream_base_commit": "5a9ce4912bb4ae5315e4a177f9e7d5b10d035766",
+  "validation": "SOURCE STAGING ONLY; public-snapshot verification, compiler/portable HOST execution and parent real-data/manual results remain pending"
+}

@@ -1,0 +1,46 @@
+{
+  "passed": true,
+  "GPU_execution": false,
+  "production_changes": false,
+  "stage": "checks",
+  "checks_executed": true,
+  "scope": "Twelve portable V5 HOST programs against source-identical existing Core; build-only when selected, no GPU/model/serving admission",
+  "snapshot_manifest_sha256": "914c311b327e7d877367b1cf2447b2dc3f97568114d486dcbb7630bbe79a60fd",
+  "wrapper_files_sha256": {
+    "tools/build_host.py": "fbc6a9d4fddad924723b621d2cca27e44d1d60b7ee14ea26b324333dde561e8a",
+    "tools/verify_snapshot.py": "a7ca3558822d74d513b31a3c2d58b1a684d985dc39984a1b9fcd489c5fae0c58",
+    "research/portable/CMakeLists.txt": "87d2a51a16f9a53234b74b67b9b8848b57b9ca7b0dae5be68e40d81be2fd930e"
+  },
+  "command": [
+    "flock",
+    "--no-fork",
+    "--exclusive",
+    "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/research-compiler.lock",
+    "flock",
+    "--no-fork",
+    "--exclusive",
+    "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/research-heavy-runtime.lock",
+    "nice",
+    "-n19",
+    "/usr/bin/python3",
+    "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/run_guarded_heavy_research.py",
+    "--",
+    "/usr/bin/python3",
+    "-B",
+    "/home/as/radiance-ramcache-glm-engine-v5-publish/tools/build_host.py",
+    "--repo-root",
+    "/home/as/radiance-ramcache-glm-engine-v5-publish",
+    "--mode",
+    "release",
+    "--jobs",
+    "1",
+    "--existing-core-build",
+    "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/build-glm53-main-verified-engine-core-v5-host-release",
+    "--run-host-checks"
+  ],
+  "owned_child_pid": 12,
+  "returncode": 0,
+  "evidence_sha256": {
+    "portable.log": "dd47dbc6171a79174272bdbad645dacff5419da89d4ef0e5fc3cd43bf3802ba9"
+  }
+}

@@ -1,0 +1,75 @@
+{
+  "scope": "Independent same-container safe identity, health and tiny inference after controlled GLM window",
+  "passed": true,
+  "utc": "2026-10-25T22:23:31.815270+00:00",
+  "identity": {
+    "Id": "608764c1d1989c714d8aad7b8a79f8057c3e73473b9f9d55b49d02e82defd2b8",
+    "Image": "sha256:e82764045e46ebae07e33961f17dedba981c0d07336dfcddd67e4b3b042b8600",
+    "Name": "/radiance-flashnext",
+    "Status": "running",
+    "Running": true,
+    "Paused": false,
+    "Restarting": false,
+    "Dead": false,
+    "StartedAt": "2026-10-25T22:21:21.12254649Z",
+    "RestartCount": 0
+  },
+  "health_before": {
+    "status": "ok",
+    "model": "qwen-vllm",
+    "in_flight": 0,
+    "queue_cap": 64
+  },
+  "request": {
+    "model": "qwen-vllm",
+    "prompt": "1 + 1 =",
+    "max_tokens": 4,
+    "temperature": 0,
+    "stream": false
+  },
+  "elapsed_seconds": 0.48133842600509524,
+  "response": {
+    "id": "cmpl-d8ace939f916640cab27add3",
+    "object": "text_completion",
+    "created": 1792967011,
+    "model": "qwen-vllm",
+    "system_fingerprint": "radiance-1.12.0",
+    "choices": [
+      {
+        "text": " 2. ",
+        "index": 0,
+        "logprobs": null,
+        "finish_reason": "length"
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 5,
+      "completion_tokens": 4,
+      "total_tokens": 9,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "timings": {
+      "cache_n": 0,
+      "prompt_n": 5,
+      "prompt_ms": 236.358659,
+      "prompt_per_token_ms": 47.2717318,
+      "prompt_per_second": 21.154291622546396,
+      "predicted_n": 4,
+      "predicted_ms": 238.636527,
+      "predicted_per_token_ms": 79.545509,
+      "predicted_per_second": 12.571419965393646,
+      "ttft_ms": 237.167985,
+      "total_ms": 475.804512,
+      "draft_n": 6,
+      "draft_n_accepted": 2
+    }
+  },
+  "health_after": {
+    "status": "ok",
+    "model": "qwen-vllm",
+    "in_flight": 0,
+    "queue_cap": 64
+  }
+}

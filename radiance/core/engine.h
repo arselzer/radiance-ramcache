@@ -48,6 +48,9 @@ namespace rad {
 class Kld;
 struct EngineTinyState;
 class TinyNativeHarness;
+struct EngineGlmMainState;
+class GlmMainEngineHarness;
+class GlmMainTp4VerifiedSourceFactory;
 class CachePrepare4Session;
 class StallWatch;
 namespace gen { class Driver; class AudioDriver; class VideoDriver; struct IPassDriver; }
@@ -113,6 +116,14 @@ public:
 
 private:
     friend class TinyNativeHarness;
+    friend class GlmMainEngineHarness;
+    friend class GlmMainTp4VerifiedSourceFactory;
+    std::unique_ptr<EngineGlmMainState> glm_main_; // outlives Session/ranks/source leases
+    int start_glm_main();
+    int glm_main_body();
+    int glm_main_declare();
+    int glm_main_run_request();
+    void glm_main_shutdown() noexcept;
     std::unique_ptr<EngineTinyState> tiny_; // declared before ranks: last owner to retire
     std::unique_ptr<CachePrepare4Session> cache_prepare4_; // full-source owner, outlives all rank joins/resources
     int glm_main_tp4_cold_source_gate()const;

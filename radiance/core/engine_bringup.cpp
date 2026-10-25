@@ -950,6 +950,7 @@ RadBuildCtx Engine::build_ctx(int rank, int64_t max_tok) const {
 }
 
 int Engine::declare() {
+    if(glm_main_)return glm_main_declare();
     if(tiny_) {
         if(ranks_.size()!=1||ranks_[0]->index||ranks_[0]->device)return RAD_E_UNSUPPORTED;
         TinyTicket auxiliary;RAD_TRY(tiny_->budget.take_aux_thread(&auxiliary));
@@ -3439,7 +3440,10 @@ int Engine::size_checkpoint_store(int64_t slot, const char* what) {
 
 int Engine::configure_kv() {
     /* Resolved once, for the cache below and Scheduler::init later (see Engine::geo_). */
-    RAD_TRY(chunk_geometry_resolve(ranks_[0]->program, cfg_, &geo_));
+    if(glm_main_){
+        if(!cache_prepare4_||!cache_prepare4_->runtime_admitted()||glm_main_->geometry[0].shared_tok!=1)return RAD_E_STATE;
+        geo_=glm_main_->geometry[0]; // actual checked pre-Pools geometry, including true Q
+    }else RAD_TRY(chunk_geometry_resolve(ranks_[0]->program, cfg_, &geo_));
     if (geo_.checkpoint_interval != cfg_.checkpoint_interval)
         decide("--checkpoint-interval",
                geo_.checkpoint_interval ? std::to_string(geo_.checkpoint_interval) : "0 (none)",
@@ -3741,6 +3745,7 @@ int Engine::configure_kv() {
 /* ================================================================== start */
 int Engine::start() {
     if(tiny_)return start_tiny_transport();
+    if(glm_main_)return start_glm_main();
     startup_begin_ns_ = rad_mono_ns();
     std::vector<int> devs;
     std::string inventory;

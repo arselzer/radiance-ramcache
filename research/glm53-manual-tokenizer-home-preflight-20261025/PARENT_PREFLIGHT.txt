@@ -1,0 +1,90 @@
+Parent-only tokenizer + exclusive HOME preparation (no author execution)
+
+The current manual --one-token path sends raw user text to TokenView::tokenize.
+TokenView calls Tokenizer::encode(add_special=false,parse_special=false). It does
+not render the model's chat_template.jinja and does not prepend BOS/append EOS.
+Engine.load_vocab reads/stores the template and EOG metadata, but this manual
+request never calls a chat-template renderer. Therefore this is a raw one-token
+continuation smoke test, not an instruction-following/chat quality evaluation.
+
+Primary candidate: literal ASCII a, expected input ID64.
+  tokenizer.json has no normalizer. The first Split's letter alternative keeps a
+  as one pre-token. ByteLevel has add_prefix_space=false/use_regex=false, and its
+  ASCII byte alphabet preserves a. BPE ignore_merges=true takes an existing whole
+  ordinary token directly. Vocab a=64; it is not an added/control token. Even the
+  one-byte BPE fallback has only that single symbol. Input must contain NO newline,
+  space, shell quote byte or chat marker. Optional alternative Hello has ID9703.
+  These are static metadata deductions; the author has not run the tokenizer.
+
+Cheap exact Core tokenizer preflight BEFORE complete Reader/Engine startup
+  Use the matching new HOST Core's existing rad-tokcheck tool. Its source needs
+  neither plugin loading nor declare/device setup. The tool's --user flag gives
+  the SAME add_special=false/parse_special=false encode mode as the manual Engine.
+  --turns0 disables synthetic conversation/template timings. The default reference
+  comparison can remain enabled; --repeat1 suffices. Parent owns compilation/run.
+
+  R=/home/as/radiance-setup/research/deepseek-v41-1017-20261024
+  MODEL=/home/as/models/hf/amd/GLM-5.3-Flash-Quark-MXFP4
+  BUILD=$R/build-glm53-main-verified-engine-core-v4-host-release
+
+  Parent builds rad-tokcheck under its normal compiler/resource lock against that
+  exact already-configured HOST Core (no installation or serving process change):
+    cmake --build "$BUILD" --target rad-tokcheck --parallel 1
+
+  Under a NEW parent-owned evidence directory, create a file whose bytes are
+  exactly hex61 (one byte a), not the line produced by echo. Example Python:
+    Path(NEW_DIR/'prompt-a.txt').write_bytes(b'a')
+  Then invoke only:
+    "$BUILD/bin/rad-tokcheck" --user --turns 0 --repeat 1 \
+      "$MODEL/tokenizer.json" NEW_DIR/prompt-a.txt
+  Require exit0, corpus1byte, tokenizer1id and reference identical. Capture the
+  command/output plus exact Core/tokenizer/tool hashes. This existing tool prints
+  token COUNT on success, not individual IDs; do not describe64 as runtime-printed
+  evidence. Do not use --hf-dir with a fabricated expected-ID file: its label would
+  imply an HF run that did not occur. The static metadata pins separately bind64.
+
+  A second small file b'Hello' can confirm the optional5byte/1id alternative.
+  No model safetensors or complete store is needed by this tokenizer preflight.
+  Neither the author nor the preparation commands above have executed it yet.
+
+Exact exclusive research HOME for later parent AQL metadata/startup gates
+  Create a NEW directory under the parent validation evidence, not a serving home.
+  Layout contains exactly six shared libraries:
+    architectures/glm5next_cache.so
+    kernels/libavx.so
+    kernels/libr4d.so
+    kernels/libref.so
+    kernels/spechub.so
+    quantizers/libquant.so
+
+  Architecture source MUST be the matching successfully built AQL artifact:
+    $R/build-glm53-main-verified-engine-core-v4-aql-release/
+      research-glm-tp4-home/architectures/glm5next_cache.so
+  Parent must record its actual build receipt/hash after that build succeeds.
+  Do not substitute a HOST build or previous Core revision merely because the
+  architecture host code looks similar.
+
+  All five kernel/quantizer sources are the already pinned baseline:
+    $R/shipped-radiance-1.12.0-home/<same relative name>
+  Expected hashes are in METADATA_REVIEW.json and the existing authoritative
+  $R/GLM53_SHIPPED_PLUGIN_HASHES.json. Parent checks hashes before and after copies.
+  Prefer private copies over links to mutable serving paths; mark copied files
+  read-only if desired. Only the NEW destination is written.
+
+  Use that one exclusive HOME string, not EXCLUSIVE_HOME:SHIPPED_HOME. The shipped
+  architectures/glm5next.so claims the same architecture/quantization pair and
+  would either conflict or defeat the intended experimental selection. Preserve
+  all four pinned kernel libraries to retain the baseline schema/selection order;
+  the Engine's existing reference-device gate still refuses an actual reference
+  DEVICE fallback. Kernel hierarchy stays the Engine's existing empty/default list.
+
+  Do not copy shipped architectures, recipes, vectors, .host-tests-passed, serving
+  credentials, or service settings. kernels.rkb/kernels_moe.rkb are bench inputs,
+  not startup requirements. The inspected baseline has no tune/<machine>.tune;
+  omitting tune data retains its untuned selection defaults. Import plugins are
+  preserved by the pinned quantizers/libquant.so.
+
+  Parent can prepare this HOME reversibly without starting any model. The later
+  actual metadata/startup process still needs its independent complete DATA,
+  runtime, resource/idle/VRAM and model-execution authorization gates. No deployment
+  or production restart is implied by making a research directory.

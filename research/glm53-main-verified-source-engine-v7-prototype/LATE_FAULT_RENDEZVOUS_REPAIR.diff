@@ -1,0 +1,34 @@
+--- v2/session_checker.cpp
++++ v3/session_checker.cpp
+@@ -93,16 +93,29 @@
+     {auto test=session();auto b=batch();good(test->begin(b),"second begin pass");need(test->begin(b)<0,"cannot replace in-flight frame");++refusals;}
+ }
+ void coordinated_failures(){++groups;
+-    for(int mutation=0;mutation<4;++mutation){auto s=session();auto b=batch();b.n_ahead=7;good(s->begin(b),"failure pass begin");std::atomic<unsigned> owners{0},gu{0};
++    for(int mutation=0;mutation<4;++mutation){auto s=session();auto b=batch();b.n_ahead=7;good(s->begin(b),"failure pass begin");std::atomic<unsigned> owners{0},gu{0},late_source_witness{0};
+         const auto result=four(*s,b,[&](int rank){auto* binding=s->binding(rank);auto ids=routes(b,3);
+             if(mutation==0&&rank==3)ids[0]=(ids[0]+1)%288;
+             if(mutation==1&&rank==3)return binding->finish(b,RAD_OK); // omitted first prepare boundary
+             if(mutation==2&&rank==3)return binding->enter(INT_MIN,0,b.n_tok,{ids.data(),size_t(b.n_tok*8)});
+             int rc=binding->enter(3,0,b.n_tok,{ids.data(),size_t(b.n_tok*8)});if(rc<0)return rc;++owners;
++            if(mutation==3){
++                // Test-only late-fault gate: all four workers must have actually
++                // returned from enter and reached owner work before the injected
++                // READY error. A faster peer may otherwise fail enter waiters
++                // correctly, before they can increment owners.
++                const auto limit=std::chrono::steady_clock::now()+std::chrono::seconds(10);
++                while(owners.load(std::memory_order_acquire)!=4){
++                    const int failed=s->observe().first.status;if(failed<0)return failed;
++                    if(std::chrono::steady_clock::now()>=limit)return binding->finish(b,RAD_E_STATE);
++                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
++                }
++                if(rank==3)++late_source_witness;
++            }
+             rc=binding->ready(mutation==3&&rank==3?RAD_E_IO:RAD_OK);if(rc==RAD_OK)++gu;return rc;});
+         for(int rc:result)need(rc<0,"all rank waiters wake on first refusal");
+         const auto first=s->observe().first;need(first.status<0&&gu==0,"no GU after boundary refusal");
+-        if(mutation<3)need(owners==0,"route/early-exit refusal before owner work");else need(owners==4&&first.status==RAD_E_IO,"late source error after exact all-rank enter");
++        if(mutation<3)need(owners==0,"route/early-exit refusal before owner work");else need(owners==4&&late_source_witness==1&&first.status==RAD_E_IO,"late source error after all four actual owner-work arrivals");
+         need(s->begin(b)<0&&s->observe().first==first,"first failure sticky/no pass retry");++refusals;}
+ }
+ void builder_and_closed_runtime(){++groups;rad::Registry registry;RadModelMeta meta{};RadBuildCtx bc{};bc.world_size=4;bc.max_tok=3;bc.max_seqs=1;

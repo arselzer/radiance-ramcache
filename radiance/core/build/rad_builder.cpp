@@ -579,7 +579,8 @@ void Builder::resolve_bands(OpInfo& oi) {
  * (spec §2.1; see rad_build.h). A negative init means the kernel refused an instance it matched:
  * the band becomes a miss reported here rather than at the first launch. */
 int initialize_program_instances(Registry& registry,Program& program,
-    const std::function<void(int,const std::string&)>& report) {
+    const std::function<void(int,const std::string&)>& report,
+    Registry::InitFailureHook early_failure,void* failure_context) {
     int first=RAD_OK;
     for (size_t i = 1; i < program.ops.size(); ++i) {
         OpInfo& oi = program.ops[i];
@@ -587,7 +588,7 @@ int initialize_program_instances(Registry& registry,Program& program,
             for (int d = 0; d < RAD_N_DOMAINS; ++d) {
                 Resolved& r = b.dom[d];
                 if (!r) continue;
-                const int s = registry.init_instance(r, program.ctx.rank, program.ctx.world_size);
+                const int s = registry.init_instance(r,program.ctx.rank,program.ctx.world_size,early_failure,failure_context);
                 if (s >= 0) continue;
 
                 if(first>=0)first=s;

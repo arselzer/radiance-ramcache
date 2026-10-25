@@ -1,0 +1,7 @@
+RAM_ADMISSION MemAvailable=18199822336
+I device: host backend, 1 device(s) [0:host]
+E --max-num-batched-tokens is 1 but this model's chunk geometry needs at least 128, so a chunk can end on a linear-state boundary: attn_block=128 from metadata-only paged quantum
+I chunk geometry: quantum 128 (attn block 128, state chunk 1), checkpoint interval 0, max_tok 1 -> prefill chunks of at most 1
+I draft floor: 1 paged group(s), 0 prefix-cached -> a hit leaves a hole in a drafter's own KV
+I step batch: 26.46 KiB pinned staging ring + 8.50 KiB device slab a rank (2.50 KiB of it block tables), 2 KV group(s), 0 derived buffer(s)
+PASS actual Engine cold/lifecycle/Registry/geometry/source HOST gates: 4 groups 112 checks 52 refusals; no complete source or inference claim

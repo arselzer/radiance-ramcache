@@ -1,0 +1,38 @@
+--- radiance-glm-main-verified-source-v4-src/core/runtime/ctx.cpp
++++ radiance-glm-main-verified-source-v5-src/core/runtime/ctx.cpp
+@@ -149,7 +149,7 @@
+        d.rank!=p.ctx.rank||d.world_size!=4||d.device<0||d.profile_ops||d.record_passes||d.tiny_retirement||
+        p.weights.empty()||p.weights.size()>max_weights||p.buffers.empty()||p.buffers.size()>max_buffers||
+        p.ops.empty()||p.ops.size()>max_ops||p.kv_groups.empty()||p.kv_groups.size()>128||
+-       p.scratch_regions!=1||p.arena_stage_bytes||p.arena_bytes<0||uint64_t(p.arena_bytes)>arena_cap||
++       (p.scratch_regions!=1&&p.scratch_regions!=2)||p.arena_stage_bytes||p.arena_bytes<0||uint64_t(p.arena_bytes)>arena_cap||
+        p.scratch_bytes<0||uint64_t(p.scratch_bytes)>arena_cap||
+        (!d.kv.empty()&&d.kv.size()!=p.kv_groups.size()))return RAD_E_UNSUPPORTED;
+     for(const char* key:{"RADIANCE_OP_ORACLE","RADIANCE_OP_REPEAT","RADIANCE_DEBUG_ROUTING"}){
+@@ -175,6 +175,10 @@
+         for(uint32_t axis=0;axis<w.decl.rank;++axis)
+             if(w.decl.shape[axis]<=0||!tiny_quote::mul(count,uint64_t(w.decl.shape[axis]),&count)||count>arena_cap*8)return RAD_E_SHAPE;
+     }
++    // Shared MoeFP8 buffers are marked concurrent even though its shared arm
++    // interleaves on the same queue. Builder therefore declares two scratch
++    // regions without a lane1 window. The profile above still forbids an active
++    // lane1, and the existing arena planner charges the actual second region.
+     int64_t dev=0,total=0;arena_plan_bytes(p,&dev,&total);const auto host=arena_host_bytes(p);
+     if(dev<0||total<=0||host<0||uint64_t(total)>arena_cap||uint64_t(host)>arena_cap-uint64_t(total))return RAD_E_SCRATCH;
+     q.arena_device=uint64_t(total);q.arena_host=host?((uint64_t(host)+4095)/4096*4096):0;
+@@ -199,7 +203,14 @@
+         }else{
+             if(decl.kind!=RAD_KV_FULL&&decl.kind!=RAD_KV_WINDOW&&decl.kind!=RAD_KV_LINEAR&&decl.kind!=RAD_KV_CONV)
+                 return RAD_E_UNSUPPORTED;
+-            if(decl.window<0||decl.n_head_kv<0||decl.n_head_kv>4096||decl.head_dim<0||decl.head_dim>4096||
++            // The actual TP4 GLM KDA convolution has 3*(64/4)*128=6144
++            // channels. Preserve its declared geometry; all other kinds keep
++            // the original 4096 head bound and only this exact tuple extends it.
++            const bool glm_conv6144=decl.kind==RAD_KV_CONV&&decl.head_dim==6144&&
++                decl.dtype==RAD_BF16&&decl.n_head_kv==1&&decl.conv_width==4&&
++                decl.window==0&&decl.state_dim[0]==0&&decl.state_dim[1]==0;
++            if(decl.window<0||decl.n_head_kv<0||decl.n_head_kv>4096||decl.head_dim<0||
++               (decl.head_dim>4096&&!glm_conv6144)||
+                decl.state_dim[0]<0||decl.state_dim[0]>4096||decl.state_dim[1]<0||decl.state_dim[1]>4096||
+                decl.conv_width<0||decl.conv_width>4096||group.block_size<0||group.bytes_per_block<0||group.bytes_per_state<0)
+                 return RAD_E_SHAPE;

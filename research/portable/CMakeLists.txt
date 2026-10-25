@@ -3,7 +3,7 @@ project(radiance_ramcache_portable_host LANGUAGES CXX)
 find_package(Threads REQUIRED)
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 get_filename_component(PORTABLE_REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
-set(RADIANCE_SOURCE "${PORTABLE_REPO_ROOT}/radiance" CACHE PATH "Exported selected GLM main TP4 integration source")
+set(RADIANCE_SOURCE "${PORTABLE_REPO_ROOT}/radiance" CACHE PATH "Exported frozen verified-main V6 source")
 set(RADIANCE_HOST_BUILD "" CACHE PATH "Explicit separately built matching HOST Core")
 set(PORTABLE_MODE "release" CACHE STRING "release | asan | tsan")
 if(NOT PORTABLE_MODE MATCHES "^(release|asan|tsan)$")
@@ -142,3 +142,17 @@ target_include_directories(glm53_tp4_mover_fence_check PRIVATE
 target_link_libraries(glm53_tp4_mover_fence_check PRIVATE portable_p3_native_source)
 target_link_options(glm53_tp4_mover_fence_check PRIVATE
   "LINKER:--wrap=rad_memcpy_async" "LINKER:--wrap=rad_event_record" "LINKER:--wrap=rad_stream_sync")
+
+# Eleventh/twelfth explicit HOST checks, byte-exact archived sources. The real
+# checkpoint/manual/AQL executables and maintenance runner are NOT default targets.
+set(VERIFIED_ENGINE "${PORTABLE_REPO_ROOT}/research/glm53-main-verified-source-engine-v8-prototype")
+set(VERIFIED_COMPONENTS "${PORTABLE_REPO_ROOT}/research/glm53-main-verified-components-v12-prototype")
+add_executable(glm53_main_verified_engine_gate "${VERIFIED_ENGINE}/gate_checker.cpp")
+portable_core_exe(glm53_main_verified_engine_gate)
+target_include_directories(glm53_main_verified_engine_gate PRIVATE "${VERIFIED_ENGINE}")
+target_link_options(glm53_main_verified_engine_gate PRIVATE
+  "LINKER:--wrap=open" "LINKER:--wrap=pread" "LINKER:--wrap=rad_dev_alloc")
+add_executable(glm53_main_verified_component_quotes "${VERIFIED_COMPONENTS}/host_quotes.cpp")
+portable_core_exe(glm53_main_verified_component_quotes)
+target_link_options(glm53_main_verified_component_quotes PRIVATE
+  "LINKER:--wrap=rad_dev_alloc" "LINKER:--wrap=pread")

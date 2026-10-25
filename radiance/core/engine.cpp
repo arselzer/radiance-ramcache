@@ -61,6 +61,7 @@ Engine::Readback::~Readback() {
 Engine::~Engine() {
     if(cache_prepare4_)cache_prepare4_->stop_admission(); // before any diagnostic/resource teardown
     if(tiny_) {tiny_shutdown();rad_tools_registry().close();return;}
+    if(glm_main_) {glm_main_shutdown();return;}
     /* The control vector's per-rank direction copies. Uploaded at declare, outside any arena, so
      * nothing else frees them; each rank's copy is freed with that rank's device bound, since the
      * allocator is per device. */
@@ -163,6 +164,13 @@ int Engine::declare_sampler(int rank, RadBuilder* b, int64_t logits_width, bool 
     sc.rank          = rank;
     sc.world_size    = cfg_.tp;
     sc.draft_coupling = cfg_.draft_coupling;
+    if(glm_main_&&!sizing){
+        TinySamplerQuote quote;RAD_TRY(Sampler::glm_main_startup_quote(sc,&quote));
+        const auto total=glm_main_->result.sampler_requested+quote.storage.page_and_heap_total;
+        if(total<glm_main_->result.sampler_requested||total>(8u<<20))return RAD_E_NOMEM;
+        glm_main_->sampler_quotes[size_t(rank)]=quote;
+        glm_main_->result.sampler_requested=total;
+    }
     RAD_TRY(smp.declare(b, sc));
 
     /* Where the chain writes the sampled ids. The engine declares it because rad-kbench drives the
@@ -425,7 +433,8 @@ bool Engine::requires_checked_model_profile() const {
 }
 
 int Engine::glm_main_tp4_cold_source_gate()const {
-    if(plugins_.arch_plugin!="glm5next_cache")return RAD_OK;
+    if(plugins_.arch_plugin!="glm5next_cache")return glm_main_?RAD_E_UNSUPPORTED:RAD_OK;
+    if(glm_main_&&glm_main_->attempted&&!glm_main_->result.retired)return RAD_OK;
     // The real packed-one-expert proof is NOT complete source coverage. No
     // factory is installed in this slice; do not create a Session or allocate
     // model payload/opaque instances from an asserted boolean or scalar hash.
@@ -472,8 +481,10 @@ int Engine::step_loop() {
     if (const int s = model_policy_admission(); s < 0) return fail_loop(s);
     /* The batch is built on rank 0's stream into rank 0's memory, so this thread binds rank 0's
      * device; the backend's current device is thread-local and starts at device 0. */
-    if (rad_dev_set(ranks_[0]->device) < 0)
+    if (const int bound=rad_dev_set(ranks_[0]->device);bound<0){
+        if(cache_prepare4_&&cache_prepare4_->runtime_admitted())cache_prepare4_->fail_stop(0,bound);
         RAD_ERR("step loop: could not bind rank 0's device");
+    }
     StepOut so;
     int idle = 0;
     std::vector<uint64_t> cancel;
@@ -1504,6 +1515,7 @@ void Engine::clear_fresh_states() {
 }
 
 int Engine::serve(std::unique_ptr<StallWatch> watch) {
+    if(glm_main_&&!glm_main_->manual_requested)return RAD_E_UNSUPPORTED; // no research HTTP serving
     if(tiny_)return RAD_E_UNSUPPORTED; // transport-only: never serve/step
     // Before scheduler creation, request admission, state resets or stream work.
     // In particular serve() must not clear a failed Ctx by resetting loop atomics.
@@ -1756,7 +1768,7 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
         print_startup_report(RAD_OK);
         startup_watch_.reset();
     }
-    int s = cfg_.kld() ? run_kld() : run_server();
+    int s = glm_main_ ? glm_main_run_request() : cfg_.kld() ? run_kld() : run_server();
     startup_watch_.reset();
 
     /* Stop the step loop before the server's storage is destroyed: Request::sink points into it,

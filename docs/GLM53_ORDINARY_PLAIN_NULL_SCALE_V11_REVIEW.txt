@@ -1,0 +1,61 @@
+Independent source-only diagnosis/review: ordinary plain-source null scales
+Reviewer: /root/ds41_engram_ref
+
+Confirmed concrete CoreV5 defect; narrow V11 diagnostic has no scoped blocker.
+No Core/source edit or runtime action was performed by this reviewer. Parent
+owns the actual retained witness, future narrow Core correction and its tests.
+
+Source contract:
+checkpoint.cpp2155-2156 appends a codes pointer and parallel scale pointer for
+EVERY source piece. Plain BF16/F32 sources legitimately appendnullptr. At2217,
+resolver distinguishes all-null unscaled pieces; at2446+ it creates a valid
+plain single-plane encoding. CkptWeight.scales is therefore not a list of only
+physical tensors. ckpt_plane_rows3026 selects pieces for plane0; a valid plain
+encoding has no plane1 and never dereferences its null scale placeholders.
+CoreV5 glm_main_ordinary_loader.cpp75 nevertheless calls physical(t) on every
+scale pointer, and physical requires nonnull. Valid plain sources always fail
+that ordinary_source check with RAD_E_UNSUPPORTED.
+
+Actual parent witness:
+validation-glm53-components-v11-ordinary-metadata-diagnostic-20261025T211654Z
+has passed=true as a DIAGNOSTIC execution, not loader/model execution. Its result
+shows all4 ranks have1272 ordinary views,1067 physical-storage refusals, and zero
+reported materializer,selected-relayout,destination or plane-share refusals.
+First is token_embd.weight: trivial=true,imported=false,exact plain1/BF16,
+one piece/one scale/one null placeholder,logical154880x4096,localstored317194240B.
+Its recorded failing family is scales,index0,present=false. This agrees with the
+source contract and isolates the targeted null-placeholder defect.
+
+Minimal safe correction/test obligation:
+Use one production pure eligibility helper shared with direct HOST tests and
+next actual metadata diagnostic. Require exact pieces/scales parallel cardinality;
+validate every codes tensor. Permit (prefer require) null scales only for exact
+canonical plain1 encoding; require physical nonnull scales for scaled encodings.
+Do not broadly skip null scales, which could admit a missing affine plane.
+Existing materializer exclusions, pointer/span/rank/shape/product checks remain.
+Positive coverage should include real plain BF16/F32/small concatenations and
+native scaled FP8. Negatives should include missing/mixed affine scales, vector
+cardinality changes,bad nonnull tensor metadata and forbidden import flags,
+with unchanged outputs and no payload/backend work. Actual full prepare remains
+the integration proof; a copied diagnostic alone is not production validation.
+
+V11 frozen receipt84a216ed0ed5f13eb9deef2c0d26e95dc5c284be945e45af0f7b2e3e15672932;
+checker0c4916d51b4564656cfdbdcd772b8880f1c4e687ed9f5177d5dee303279b4054.
+All16 nonreceipt package pins,1535 CoreV5 pins and reused helper match. HOST
+checker/CMake are byte-identical to V10. Diagnostic reads actual retained source
+metadata and reports null/plain/materializer/layout/share/destination categories;
+complete mode refuses observed failures BEFORE expensive complete Reader work.
+No forged catalog,NativeInventory,Session or Engine capability is constructed,
+and no Program/Plan normalization occurs. Remaining bind_rank/loader statuses
+are now sequenced before why string formatting.
+
+Qualification: this diagnostic mirrors targeted UNSUPPORTED predicates, not
+every production SHAPE/product/selected-layout bound or final Native-plan
+identity. current_guard_predicates_satisfied describes that mirrored subset and
+cannot replace successful real GlmMainOrdinaryLoader::prepare. Its result keeps
+runtime_ready=false and cannot satisfy the maintenance complete-prewalk gate.
+
+Only source/stat/hash/recorded JSON metadata was read. No target import,compiler,
+Torch/numerical/model execution,GPU query/launch,service stop,production mutation,
+network or push occurred. No first model token,loader execution or readiness is
+claimed by this diagnosis; QFN is unchanged at this gate.

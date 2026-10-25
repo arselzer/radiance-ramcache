@@ -1,0 +1,38 @@
+{
+  "schema": "glm53-verified-component-run-v1",
+  "passed": false,
+  "mode": "native-metadata-diagnostic",
+  "component_build_receipt": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/build-glm53-main-verified-components-v9-aql-release-evidence-20261025T204226Z/receipt.json",
+  "component_build_receipt_sha256": "c408548d2c1ac520e24d26a7a89d444f6ed87e62e46e988ca41785370286691b",
+  "core_build_receipt": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/build-glm53-main-verified-engine-v5-aql-release-evidence-20261025T193824Z/receipt.json",
+  "core_build_receipt_sha256": "8475dc5e51deae642732dd2d37bf0b2931def55a56d9aeb560f63db3739a68f9",
+  "GPU_kernel_execution": false,
+  "production_changes": false,
+  "scope": "Pure HOST or actual AQL metadata/complete source prewalk only; no model, loader execution or Engine admission",
+  "home_receipt_sha256": "cde95a5c9ba8f07b8793fa508c85eb797d24b8977f5e7bfe1b6aec62ae7faea3",
+  "command": [
+    "nice",
+    "-n19",
+    "/usr/bin/ionice",
+    "-c",
+    "3",
+    "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/build-glm53-main-verified-components-v9-aql-release/glm53_main_verified_graph_quotes",
+    "--run-native-metadata-diagnostic",
+    "/home/as/models/hf/amd/GLM-5.3-Flash-Quark-MXFP4",
+    "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-manual-preparation-v2-core-v5-20261025T200738Z/exclusive-home",
+    "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/validation-glm53-components-v9-native-metadata-diagnostic-20261025T204320Z/result.json"
+  ],
+  "MemAvailable_before": 11079278592,
+  "health_before_device_metadata": {
+    "status": "ok",
+    "model": "qwen-vllm",
+    "in_flight": 0,
+    "queue_cap": 64
+  },
+  "returncode": 1,
+  "elapsed_seconds": 3.523057683953084,
+  "error": "AssertionError()",
+  "evidence_sha256": {
+    "check.log": "e300e130e5c93166e18d69ea7e9e306b18c4a79ef39662ccd16133999de2ba0c"
+  }
+}

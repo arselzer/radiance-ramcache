@@ -8,6 +8,7 @@ struct NativeBackingStats {
 struct TinyOwnerQuote;
 class NativeBackingOwner final:public ExpertPrepareOwner {
 public:
+    static int glm_main_startup_quote(const Program&,const Plan&,TinyOwnerQuote*) noexcept;
     static int tiny_startup_quote(const Program&,const Plan&,TinyOwnerQuote*) noexcept;
     static int open(Program&,const Plan&,Mover&,std::shared_ptr<NativeRecordSource>,
                     std::unique_ptr<NativeBackingOwner>* out);

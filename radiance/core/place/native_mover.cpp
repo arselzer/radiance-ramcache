@@ -1,5 +1,6 @@
 #include "mover.h"
 #include "native_inventory.h"
+#include "runtime/cache_prepare4_session.h"
 #include <algorithm>
 #include <array>
 #include <cstring>
@@ -71,6 +72,13 @@ int Mover::native_record_init(){
                 native_device_allocation_.push_back(device);native_host_allocation_.push_back(host_view);
                 rad_dev_host_wrote();
                 const int copied=rad_memcpy_async(device,on_card,cls.allocation_bytes,mover_);
+                if(cfg_.glm_main_binding){
+                    // Policy installed before the first possibly enqueued bootstrap copy.
+                    if(copied<0)cfg_.glm_main_binding->fail_stop(copied);
+                    const int drained=rad_stream_sync(mover_);
+                    if(drained<0)cfg_.glm_main_binding->fail_stop(drained);
+                    continue;
+                }
                 if(cfg_.tiny_budget){
                     // Installed before this first asynchronous bootstrap copy.
                     // A failed REAL drain cannot unwind landing/pool storage.

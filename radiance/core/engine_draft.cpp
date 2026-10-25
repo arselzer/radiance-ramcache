@@ -29,7 +29,7 @@ int Engine::step_state_init() {
     std::vector<int32_t> local_eog;
     // Tiny source must outlive an async copy even when that call enqueues and
     // reports failure. State retirement drains before clearing this vector.
-    auto& eog=tiny_?tiny_->eog_stage:local_eog;
+    auto& eog=tiny_?tiny_->eog_stage:glm_main_?glm_main_->eog_stage:local_eog;
     if (vocab_) eog = vocab_->eog();
     std::sort(eog.begin(), eog.end());
     eog.erase(std::unique(eog.begin(), eog.end()), eog.end());
@@ -110,7 +110,8 @@ int Engine::step_state_init() {
 
 void Engine::step_state_fini() {
     for (auto& rk : ranks_) {
-        (void)rad_dev_set(rk->device);
+        const int bound=rad_dev_set(rk->device);
+        if(glm_main_&&bound<0&&cache_prepare4_)cache_prepare4_->fail_stop(rk->index,bound);
         if (rk->step_slots) rad_dev_free(rk->step_slots, RAD_MEM_DEVICE);
         if (rk->eog) rad_dev_free(rk->eog, RAD_MEM_DEVICE);
         rk->step_slots = nullptr;

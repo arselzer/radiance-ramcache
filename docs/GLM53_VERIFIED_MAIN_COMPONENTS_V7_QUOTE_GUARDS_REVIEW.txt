@@ -1,0 +1,47 @@
+Independent source-only review: component V7 actual GLM quote regression
+Reviewer: /root/ds41_engram_ref
+
+Verdict: no remaining scoped source blocker in the V6-to-V7 test delta.
+Receipt e5f382300425e88b4fd2f4d167d7b7dcc735305a845fdc57c3de3df9ff973e99;
+actual checker691711f9510b1c6290b13405fc7de3ec4b55c2d952c5a0f58abed9494b188fcd.
+All8 package source hashes,1535 matching CoreV5 hashes,1 reused stock helper
+and2 original Tiny quote-body hashes agree. Core manifest is0001f0a163dbc87198b899f9f9c782e6a9a0071c7a6a964fb2d2e10a68b8f19e.
+HOST quote checker and bounded V6 diagnostic helper are byte-identical.
+
+actual_graph_quotes.cpp:127 checks all four declared real Programs have two
+scratch regions, zero second scratch extent and no lane1 window BEFORE the
+positive quote. It does not write/normalize Program metadata. This catches
+accidental workaround of the real Builder declaration. The old scratch refusal
+at:156 now mutates to3, which lies outside the corrected Core's1|2 admission.
+The original value is restored on the normal test path; assertion failure
+terminates the harness rather than allowing a corrupted Program to execute.
+
+At:162-168 the harness locates exactly one genuine CONV6144 group and checks
+its BF16/nhead1/width4/window0/state0,0 tuple before any new mutations. Ten
+independent mutations change kind,dtype,nhead,head_dim6143/6145,width3/5,
+window,state0,state1. Each starts from the actual tuple and changes exactly one
+field. With head_dim6144 (or6143/6145), the value remains above4096, so losing
+the exact exception must refuse; these are meaningful guard witnesses rather
+than changes already allowed by a broader normal range. The actual exact tuple
+was already positively quoted before any negatives.
+
+At:175-177 each new mutation is protected by a local POD Restore object holding
+the entire original RadKVGroupDecl. Its destructor runs on both success and
+thrown assertion, so no mutated tuple survives a test. This introduces no
+borrowed descriptor lifetime beyond the synchronous mutation call. The small
+std::function array is constructed outside the quote/purity measurement.
+
+The existing bad_context helper at:142 seeds the entire TinyCtxQuote with0x6b,
+requires a negative quote result, then compares the complete output bytes and
+backend-allocation/pread counters. It therefore checks failure before caller
+output publication and backend/payload work. It does not purport to intercept
+all C++ allocations or device-driver activity. Ten previous metadata refusals
+plus these10 authored cases give20; they are source-authored counts until parent
+execution confirms them. No expanded runtime/model/Engine/Session or loader
+execution claim is introduced. Optional complete prewalk remains separate and
+expensive, with the previously reviewed loader arithmetic unchanged.
+
+No target import, compiler/runtime test, model/Torch arithmetic, device query,
+kernel launch, Docker/service operation, production stop or network action was
+performed by this reviewer. Actual successful matching preflight and parent
+controlled-window gates remain necessary; this review is not a runtime PASS.

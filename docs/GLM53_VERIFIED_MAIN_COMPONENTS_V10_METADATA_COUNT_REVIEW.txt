@@ -1,0 +1,57 @@
+Independent source-only review: component V10 exact metadata-count correction
+Reviewer: /root/ds41_engram_ref
+
+Verdict: no remaining scoped source blocker in the V9-to-V10 change. This is
+not actual metadata/prewalk success. V9's real refusal remains a failed result;
+the previous narrow source review missed its incompatible4096 ceiling.
+
+Frozen V10 receipt dadfd2b840b598c924efff9c5ccf1a1f17155f3651e3eb7e3827351c041c02f9;
+actual checker244139a91a8ca5fdc469bbf5601c160f83ad2f7166bfce9167ca8354a9ef7c3a.
+All14 nonreceipt package pins,1535 exact CoreV5 pins,one reused helper and2
+original Tiny quote bodies match. CMake and HOST checker are byte-identical to
+V9. Core, source authority, loader, scheduler, model/quantized math and refusal
+contracts are unchanged.
+
+Count evidence:
+A separate source-derived stdlib metadata count follows checkpoint.cpp's
+flatten_json/join_scalars and text_config alias rules. It reads only bounded
+public metadata JSON, not tensor payloads or Core/model execution:
+  config.json1716060B SHA3a2c766e6a5256241b0b6ad82bc07e65bf4881b7211a0484cf18ce7020bfbd8f
+  ->20454 flattened entries;
+  63 text_config candidates,61 bare aliases actually added (2 bare collisions)
+  ->20515 after config aliasing;
+  generation_config194B SHA230c30609ecbbb9e6583bedde8e7bdda0c6eb8fe5fad0eaeb3d1b293d751cb4f ->6;
+  processor_config909B SHAaae38374c94b08cc9b0547c6e64f05b951bd9735cea571c6988f5ed552bed3ed ->22.
+This predicts20543 MetaOwn entries before optional companion configs. Import
+detection renames quantization keys without changing this count. It is a
+source-derived prediction, not claimed unchanged-Core runtime observation.
+The invented4096 ceiling therefore conflicts with known pinned input metadata.
+
+Narrow correction:
+The helper now separately requires exact key/value/pointer-vector lengths,
+then m.n_kv>=0 followed by size_t(m.n_kv)==own.keys.size(), then exact pointer
+array identities. The short-circuit nonnegative test precedes unsigned
+conversion, with no narrowing cast of the vector length to int. Every pointer
+entry still must equal the c_str of its actual retained string. Each Program
+still must borrow those exact pointers/count before strcmp/profile dereference.
+No guessed replacement ceiling, metadata truncation, ignored mismatch or pointer
+repair is introduced. Existing pinned input/owner/source budgets remain distinct
+from this consistency check on already owned vectors.
+
+Failure text contains only five numeric counts with fixed labels, not metadata
+contents or borrowed strings. The output adds retained_declaration_metadata
+with those actual counts and a true check-completed marker only after all owner
+checks. It grants no NativeInventory/Session/Engine capability and cannot satisfy
+the complete-prewalk runner gate without its separate real result. The stable
+Actual-owned MetaOwn lifetime and V9 bounded reason conversion remain intact.
+No existing scratch/CONV/refusal test is removed or weakened.
+
+Parent must first run fast metadata/diagnostic checks, then the actual full-data
+prewalk. Any further NativeInventory/loader admission refusal remains a refusal;
+this source repair does not presume the previous dangling pointer/count ceiling
+were the only remaining integration issues. Old source/evidence is preserved.
+
+No target import, compiler, numerical/Torch/model/Core execution, GPU/device
+query or launch, service/production action, network, source edit or push was
+performed by this reviewer. Only source, hashes, AST/diffs and the stated bounded
+metadata JSON count were inspected.

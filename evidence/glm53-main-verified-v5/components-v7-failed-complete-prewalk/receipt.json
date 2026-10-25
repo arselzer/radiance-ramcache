@@ -1,0 +1,54 @@
+{
+  "schema": "glm53-verified-component-run-v1",
+  "passed": false,
+  "mode": "complete-prewalk",
+  "component_build_receipt": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/build-glm53-main-verified-components-v7-aql-release-evidence-20261025T200636Z/receipt.json",
+  "component_build_receipt_sha256": "ae246d00e957e3c86d79acb443ef9c495ebd9ae83d39a34a9980c7a1b6fb6163",
+  "core_build_receipt": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/build-glm53-main-verified-engine-v5-aql-release-evidence-20261025T193824Z/receipt.json",
+  "core_build_receipt_sha256": "8475dc5e51deae642732dd2d37bf0b2931def55a56d9aeb560f63db3739a68f9",
+  "GPU_kernel_execution": false,
+  "production_changes": false,
+  "scope": "Pure HOST or actual AQL metadata/complete source prewalk only; no model, loader execution or Engine admission",
+  "home_receipt_sha256": "cde95a5c9ba8f07b8793fa508c85eb797d24b8977f5e7bfe1b6aec62ae7faea3",
+  "assembly_receipt_sha256": "7efe866461dfe9921ce12cfa7b676297f1581e3b9ec15b74cff64878e7ab12a4",
+  "source_pass_receipt_sha256": "0952e9b61aba9369dbae9087ed217d72f8eb2a9b4167d9d26c2e0907a5b06ec7",
+  "command": [
+    "nice",
+    "-n19",
+    "/usr/bin/ionice",
+    "-c",
+    "3",
+    "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/build-glm53-main-verified-components-v7-aql-release/glm53_main_verified_graph_quotes",
+    "--run-complete-prewalk",
+    "/home/as/models/hf/amd/GLM-5.3-Flash-Quark-MXFP4",
+    "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-manual-preparation-v2-core-v5-20261025T200738Z/exclusive-home",
+    "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-full-main-store-20261025T175438Z/private-complete-store/data",
+    "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-complete-source-proof-20261025T172943Z/complete-source-proof.json",
+    "7279810219167007678",
+    "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/validation-glm53-components-v7-complete-prewalk-20261025T201618Z/result.json"
+  ],
+  "MemAvailable_before": 10056024064,
+  "health_before_device_metadata": {
+    "status": "ok",
+    "model": "qwen-vllm",
+    "in_flight": 0,
+    "queue_cap": 64
+  },
+  "heartbeat_utc": "2026-10-25T20:27:19.461709+00:00",
+  "elapsed_seconds_live": 660.0366253600223,
+  "os_io_counters_live": {
+    "rchar": 346980922846,
+    "wchar": 4327,
+    "syscr": 5298019,
+    "syscw": 15,
+    "read_bytes": 416578953216,
+    "write_bytes": 8192,
+    "cancelled_write_bytes": 0
+  },
+  "returncode": 1,
+  "elapsed_seconds": 684.854630974005,
+  "error": "AssertionError()",
+  "evidence_sha256": {
+    "check.log": "43b49c21e3affcb85aef606823f79a7b5c4021ac37b7bd51e206ac413941e494"
+  }
+}

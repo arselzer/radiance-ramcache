@@ -1,0 +1,124 @@
+GLM53 single maintenance-test runner — independent source review
+2026-10-25 UTC
+
+Verdict: no remaining scoped source blocker after the rollback repairs.
+Execution remains conditional on the parent's completed preflight receipts,
+trusted serving baseline and fresh physical CPU/GPU resource/idle checks.
+The user already authorized this temporary stop/test/restore sequence; this
+review introduces no additional permission request.
+
+Frozen package: glm53-manual-maintenance-runner-20261025
+SOURCE_RECEIPT.json SHA256:
+aadf48a1233dc7f109a7801c276257c089e462caad390f02c3e9f1487bd4e5a0
+runner.py SHA256:
+e18c0cea9e27b5ed009245291e81842cbd2212e8b58760ff617942f2c55b39ae
+Both source files and all three reviewed input hashes match. Python AST parses
+with 29 distinct top-level functions and no duplicate definitions. This reviewer
+did not import/run the runner or perform compiler, tokenizer, Docker, GPU,
+service, model, network or numerical execution. Control-flow/failure handling
+was reviewed from source, not verified through injected runtime failures.
+
+Preparation and artifact closure
+---------------------------------
+prepare() performs no Docker operation. It requires matching successful HOST/AQL
+Release build receipts, source/header home and current artifact hashes. It uses
+the owned compiler lock and pinned guarded launcher to build only the matching
+HOST tokenizer tool before any outage, then rechecks the pinned Core archive.
+Literal input is b'a', no newline. rad-tokcheck --user uses add_special=false and
+parse_special=false, matching actual TokenVocab::tokenize in the Engine. Runtime
+count1 and reference-identical tokenization are required; ID64 is not falsely
+advertised as observed.
+
+The new exclusive HOME contains exactly five pinned shipped kernel/quantizer
+libraries plus the matching AQL glm5next_cache architecture. They are real copied
+files, checked by hash and made read-only, with no symlink/extra-directory or
+colon-merged serving HOME. No serving path, image, configuration or deployment
+is modified by preparation. Failed preparation leaves no passed window gate.
+
+run-window revalidates its own frozen source/input closure, prepared binary,
+tokenizer artifacts, exact HOME and both builds. It requires three distinct
+successful HOST modes with nonempty actual command/artifact evidence and resolves
+the digest-bound exact build for each. The complete assembly/native DATA reader
+and actual graph/Sampler/loader-prewalk results must agree on the exact bundle,
+48384 records/168 shards, all four source-cut authorities, 193536 expert views,
+actual upload/maxima arithmetic and no prior model execution. Slow verification
+is performed while QFN remains up and repeated under the heavy-runtime lock
+before stop and immediately before the sole child. These JSON receipts are
+trusted parent-produced evidence, not cryptographic authentication of an
+arbitrary untrusted caller.
+
+Stop and owned child boundaries
+--------------------------------
+The runner captures the full existing radiance-flashnext container ID, image ID,
+name and filtered State fields. It requires a running/unpaused/non-restarting
+container and two fresh status-ok/in_flight0 replies. Stop and restart target
+that immutable captured ID, never a name lookup replacement/new container.
+The heavy-runtime lock spans stop, test, restoration and stable health.
+
+Restoration is armed BEFORE issuing stop. An acknowledged fully exited state
+with matching identity is required before launch. Stop state is checked again
+immediately before and periodically during the child. Child command/arguments
+are fixed, GPU visibility is explicitly all four cards, and RADIANCE overrides
+are removed. There are no compose/recreate/pull/configuration/reset commands.
+
+The logged child owns a fresh session/process group. WNOWAIT observes exit
+without releasing the direct PID reservation before group TERM/KILL cleanup,
+avoiding a reaped leader's numeric group-ID reuse. The leader is subsequently
+reaped. SIGCHLD disposition is explicitly waitable. First handled interruption
+sets cancellation and raises; later signals cannot interrupt cleanup/unwind.
+No new model/compiler work is admitted after cancellation. Child deadlines,
+log caps, heartbeats and Docker-call deadlines are explicit. Nominal deadlines
+also have bounded current-command/TERM/KILL cleanup grace; they are not an exact
+wall-clock outage SLA.
+
+Test success requires child exit0 plus the exact Engine JSON domain, bundle,
+source byte totals, closed profile, valid sampled token and ordinary job/upload/
+successful-drain counts equal to the prewalk. Zero exit follows the tested source's
+explicit teardown; known negative retirement paths exit88. This is one combined
+startup plus final-partial-prefill/sampling experiment, not two independent runs,
+a subsequent decode proof, throughput benchmark or model-quality result.
+
+Rollback findings and repaired behavior
+----------------------------------------
+Two concrete active-source issues were identified during this review and are
+repaired in the frozen source:
+
+1. restore() originally saved evidence before entering its protected recovery
+   path. A receipt/disk failure after stop could therefore prevent any restart.
+   Restoration evidence writes are now best-effort/non-throwing and cannot gate
+   the physical inspect/stop-boundary/start/health loop.
+2. A failed ambiguous recovery-stop originally returned immediately. The loop
+   now re-inspects/retries, so a negative client acknowledgement cannot cause it
+   to abandon an original container that actually reached exited state.
+
+For ambiguous original stop acknowledgement, the runner cannot accept an early
+Running/healthy sample: daemon stop work may still finish later. It first obtains
+an exited boundary, then starts the original ID. Restoration requires a new
+StartedAt, running/unpaused/non-restarting/non-dead state and 40 seconds of
+consecutive public health samples. Ambiguous acknowledgement remains explicitly
+overall unproven even after best-effort healthy recovery. Child success and
+restoration success are independent; overall PASS requires both and no signal.
+
+Scope and operational limits
+-----------------------------
+At the parent's explicit privacy boundary the runner NEVER requests raw Docker
+Config/Env/Cmd/HostConfig, labels, mounts or health-log contents. Its identity
+proof is captured ID/image/name plus public health, not independent QFN model/
+configuration attestation or protection against concurrent HostConfig edits.
+The parent supplies the trusted baseline. The runner does not independently
+measure every physical CPU/GPU resource or exclude noncooperating outside work;
+the parent's fresh operational resource gate remains necessary. Core placement
+checks are separate from those operational checks.
+
+There is no external SIGKILL/power-loss guardian. Docker daemon loss, unkillable
+kernel/device work, driver faults, physical-free failures and outside concurrent
+administrative mutation can defeat recovery. The runner neither resets hardware
+nor substitutes a different configuration/container. Those cases must not be
+called proven restoration; the parent must continue operational recovery and
+report any remaining outage. Ordinary caught failures have bounded owned-child
+cleanup and finally-based same-container restoration, with evidence failure
+prevented from blocking that recovery.
+
+This source closure permits the parent to proceed through preparation and the
+already authorized maintenance window only after all gates are actually met.
+It is not a claim that preparation, GPU test or QFN restoration has run or passed.

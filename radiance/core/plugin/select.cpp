@@ -464,14 +464,33 @@ std::string Registry::selection_table() const {
 
 /* ------------------------------------------------------------------ instances */
 /* See registry.h: init_instance. */
-int Registry::init_instance(Resolved& r, int rank, int world_size) {
+int Registry::reserve_instance_tracking(size_t additional) noexcept {
+    try {std::lock_guard<std::mutex> lock(mu_);
+        if(additional>instances_.max_size()-instances_.size()||
+           instance_tracking_credits_>instances_.max_size()-instances_.size()-additional)return RAD_E_NOMEM;
+        instances_.reserve(instances_.size()+instance_tracking_credits_+additional);
+        instance_tracking_credits_+=additional;return RAD_OK;
+    }catch(const std::bad_alloc&){return RAD_E_NOMEM;}catch(...){return RAD_E_STATE;}
+}
+int Registry::init_instance(Resolved& r,int rank,int world_size,
+                            InitFailureHook early_failure,void* failure_context) {
     if (!r.row || !r.row->info) return RAD_E_INVAL;
     const RadKernelInfo* k = r.row->info;
     if (!k->init) { r.instance = nullptr; return RAD_OK; }
 
+    if(early_failure){
+        // Claim before entering a collective; after success emplace cannot grow.
+        std::lock_guard<std::mutex> lock(mu_);
+        if(!instance_tracking_credits_){early_failure(failure_context,RAD_E_STATE);return RAD_E_STATE;}
+        --instance_tracking_credits_;
+    }
     void* inst = nullptr;
-    const int st = k->init(r.geom.params(), r.geom.n_params(), rank, world_size, &inst);
+    int st=RAD_E_STATE;
+    if(early_failure){try{st=k->init(r.geom.params(),r.geom.n_params(),rank,world_size,&inst);}
+        catch(...){early_failure(failure_context,RAD_E_STATE);return RAD_E_STATE;}}
+    else st=k->init(r.geom.params(),r.geom.n_params(),rank,world_size,&inst);
     if (st < 0) {
+        if(early_failure)early_failure(failure_context,st); // BEFORE the first Core formatting/log
         /* A negative init aborts startup rather than launching a kernel whose setup failed. */
         RAD_ERR("kernel '%s' (%s) failed to initialise for %s: %s", k->name, r.row->plugin.c_str(),
                 r.geom.str().c_str(), rad_strerror(st));
@@ -480,6 +499,7 @@ int Registry::init_instance(Resolved& r, int rank, int world_size) {
     r.instance = inst;
     /* Registered even when the instance is null: fini pairs 1:1 with every successful init. */
     std::lock_guard<std::mutex> lk(mu_);
+    if(early_failure&&instances_.size()==instances_.capacity()){early_failure(failure_context,RAD_E_STATE);return RAD_E_STATE;}
     instances_.emplace_back(k, inst);
     return RAD_OK;
 }
@@ -489,6 +509,7 @@ void Registry::fini_instances() {
     {
         std::lock_guard<std::mutex> lk(mu_);
         take.swap(instances_);
+        instance_tracking_credits_=0;
     }
     for (auto it = take.rbegin(); it != take.rend(); ++it)
         if (it->first->fini) it->first->fini(it->second);

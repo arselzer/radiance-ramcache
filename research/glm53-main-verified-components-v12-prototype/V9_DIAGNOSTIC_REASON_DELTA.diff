@@ -1,0 +1,11 @@
+--- componentV8/actual_graph_quotes.cpp
++++ componentV9/actual_graph_quotes.cpp
+@@ -227,7 +227,7 @@
+             row["first_static_refusal"]={{"unit",ui},{"layer",u.layer},{"expert",u.expert},{"tier",tier},
+                 {"site",int(u.site)},{"bytes",u.bytes},{"slot_bytes",u.slot_bytes},{"movable",u.movable},
+                 {"slab_slot",u.slab_slot},{"slab_class",u.slab_class},{"host_forced",u.host_forced},
+-                {"reason",u.reason.substr(0,160)},{"member_count",u.weights.size()},{"members",std::move(members)}};
++                {"reason",std::string(u.reason?u.reason:"",u.reason?strnlen(u.reason,160):0)},{"member_count",u.weights.size()},{"members",std::move(members)}};
+         }
+         for(size_t oi=0;oi<p.ops.size();++oi){const auto& op=p.ops[oi];
+             for(size_t wi=0;wi<op.weights.size();++wi){const auto h=op.weights[wi];

@@ -1,0 +1,11 @@
+{
+  "compiler_or_tokenizer_or_GPU_execution_by_author": false,
+  "files": {
+    "METADATA_REVIEW.json": "af19b78c7f07db8c51c50c4d500d7f1ee6c75cfc962b9dc904d70e28578a158c",
+    "PARENT_PREFLIGHT.txt": "d64191ab4c9dab367ea3a517647b1e39d78266de956e3cde834ce30941d89d80",
+    "SOURCE_PINS.json": "d25de43cee02bfc3f4d736490b21df2cbc38a6f539f8e0953fe8423031037d34"
+  },
+  "model_payload_read_by_author": false,
+  "scope": "source-only metadata inspection and parent-owned command draft",
+  "serving_or_frozen_source_changes": false
+}

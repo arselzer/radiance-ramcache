@@ -4,6 +4,7 @@
 #include "sampler.h"
 #include "gbnf.h"
 #include "../build/tiny_component_quotes.h"
+#include "../build/glm_main_quote.h"
 
 #include <algorithm>
 #include <chrono>
@@ -24,6 +25,43 @@ int Sampler::tiny_startup_quote(const SamplerConfig& c,TinySamplerQuote* out) no
     q.storage.embedded_object_bytes=sizeof(Sampler);q.storage.control_allowance=512;
     if(!tiny_quote::finish(q.storage))return RAD_E_SCRATCH;
     *out=q;return RAD_OK;
+}
+
+int Sampler::glm_main_startup_quote(const SamplerConfig& c,TinySamplerQuote* out) noexcept {
+    if(!out)return RAD_E_INVAL;
+    if(c.n_vocab!=154880||c.world_size!=4||c.rank<0||c.rank>=4||c.max_seqs!=1||c.max_spec||
+       c.max_hist!=2048||c.draft_coupling||c.max_candidates<=0||c.max_candidates>kSampleMergeCandidates)
+        return RAD_E_UNSUPPORTED;
+    const int64_t local=c.n_vocab_local>0?c.n_vocab_local:c.n_vocab/c.world_size;
+    if(local!=c.n_vocab/4||c.vocab_off!=int64_t(c.rank)*local)return RAD_E_UNSUPPORTED;
+    TinySamplerQuote q;
+    q.sizeof_sampler=sizeof(Sampler);q.sizeof_sample_params=sizeof(DeviceSampleParams);
+    q.sizeof_couple_entry=sizeof(decltype(CoupleBuild::seqs)::value_type);
+    q.rows=1;q.history=c.max_hist;
+    // EXACT Sampler::declare clamp, including a caller's larger requested width.
+    q.candidates=uint64_t(std::min<int64_t>(c.max_candidates,kSampleMergeCandidates/c.world_size));
+    q.mask_words=grammar_mask_words(local);q.logprob_width=uint64_t(lp_width())*4;
+    const uint64_t bytes[]{sizeof(DeviceSampleParams),sizeof(DeviceSampleParams),sizeof(DeviceSampleParams),
+        uint64_t(c.max_hist)*sizeof(int32_t),uint64_t(c.max_hist),2*sizeof(int32_t),
+        q.mask_words*sizeof(uint32_t),q.mask_words*sizeof(uint32_t),
+        c.rank==0?q.logprob_width*sizeof(float):0,
+        c.rank==0?q.candidates*sizeof(int32_t):0,c.rank==0?q.candidates*sizeof(float):0};
+    for(size_t i=0;i<11;++i){q.pinned_request_bytes[i]=bytes[i];if(bytes[i]&&!tiny_quote::pinned(q.storage,bytes[i]))return RAD_E_SHAPE;}
+    // Actual whole-vocab mask + stage_alloc's unconditional CoupleBuild reserve.
+    if(!tiny_quote::heap(q.storage,grammar_mask_words(c.n_vocab),sizeof(uint32_t))||
+       !tiny_quote::heap(q.storage,1,q.sizeof_couple_entry))return RAD_E_SHAPE;
+    // Conservative one-request baseline uses ACTUAL private node/row sizes. It
+    // does not price arbitrary grammar/DRY programs or unbounded request queues.
+    if(!tiny_quote::heap(q.storage,1,sizeof(decltype(seqs_)::value_type)+128)||
+       !tiny_quote::heap(q.storage,1,sizeof(LpRow)+sizeof(uint64_t))||
+       !tiny_quote::heap(q.storage,uint64_t(c.max_hist),sizeof(int32_t)))return RAD_E_SHAPE;
+    q.storage.embedded_object_bytes=sizeof(Sampler);q.storage.control_allowance=1024;
+    if(!glm_main_quote_finish(q.storage))return RAD_E_SCRATCH;
+    *out=q;return RAD_OK;
+}
+int Sampler::glm_main_startup_quote(TinySamplerQuote* out)const noexcept {
+    if(!declared_)return RAD_E_STATE;
+    return glm_main_startup_quote(cfg_,out);
 }
 
 /* ================================================================== grammar triggers

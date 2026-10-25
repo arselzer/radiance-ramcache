@@ -1,0 +1,38 @@
+{
+  "Core_count": 1535,
+  "Engine_nonreceipt_files": 81,
+  "Engine_reviewed_inputs": 26,
+  "authored_helper_negatives": 18,
+  "authored_helper_positives": 4,
+  "authored_null_output_refusal": 1,
+  "changed_Core_paths": [
+    "core/build/glm_main_ordinary_loader.h",
+    "core/build/glm_main_ordinary_loader.cpp"
+  ],
+  "component_HOST_exactV11": true,
+  "component_nonreceipt_files": 18,
+  "created_utc": "2026-10-25T21:26:15.803356+00:00",
+  "helper_shared_by_prepare_and_diagnostic": true,
+  "inherited_bodies": 37,
+  "mismatches": [],
+  "pins": {
+    "GLM53_ORDINARY_PLAIN_NULL_SCALE_V11_REVIEW.txt": "c839321fbe0bbfd78a4436cdc7f81375f9ee83854f041cd749615875d36bb566",
+    "GLM53_ORDINARY_PLAIN_NULL_SCALE_V11_REVIEW_PINS.json": "7667f9d72448cc3df49e7cf636ce288df4c39b72f5f868d23a14f63ed350fc07",
+    "GLM53_VERIFIED_MAIN_V6_PLAIN_SOURCE_HELPER_REVIEW.txt": "06b4fcfd34cfb35e4e0f6cfbe58c65acb80940ad6bb92d5bb40ed7148d509fa8",
+    "glm53-main-verified-components-v12-prototype/SOURCE_RECEIPT.json": "79f74ad437af4126eced1de270b35cd78ddc2e687ac4cc81ebe123c2c06bc820",
+    "glm53-main-verified-components-v12-prototype/actual_graph_quotes.cpp": "930a6f46404294ce7178b7cc659568aa94318d9531ead00443d12159d578d454",
+    "glm53-main-verified-components-v12-prototype/host_quotes.cpp": "f977134fdc3d84dd355f48fb05b01760b01341f936a6d28b1e0fd6472ff48c59",
+    "glm53-main-verified-source-engine-v6-prototype/CORE_SOURCE_PINS.json": "83d57401b288dc78ddad965498d47c2066e99050291411bc3545985d2a874159",
+    "glm53-main-verified-source-engine-v6-prototype/SOURCE_RECEIPT.json": "9345219898c353afa14f14f9f24ac43c1505d5ef9099cd44af2261d2a69dd299",
+    "glm53-main-verified-source-engine-v6-prototype/gate_checker.cpp": "42f9f0bc915d663b52b6aa6fd821f4d9f6fc6998941409a114cd2b5f5a2caa3e",
+    "radiance-glm-main-verified-source-v6-src/abi/rad_encoding.h": "0c3b9c774b29f1285c7a7dcd30327471a28e419943749b3d1cc5e4b169c0e703",
+    "radiance-glm-main-verified-source-v6-src/core/build/glm_main_ordinary_loader.cpp": "0d6eb405e187b38f09c4afc98301ecc2092739ccdb7f7b1f6332f2b2c9d83f4b",
+    "radiance-glm-main-verified-source-v6-src/core/build/glm_main_ordinary_loader.h": "ebfe0cc2a793c14bfafc6867a30f8d9d00c64dc354a2c1a47ef5bd3de3b97313",
+    "radiance-glm-main-verified-source-v6-src/core/format/checkpoint.cpp": "a9f1ff3e938e0ff9ef1d80d8dac9dc159f7e541ca59b39e4ba1e39d7a78450aa"
+  },
+  "reviewer": "/root/ds41_engram_ref",
+  "runtime_PASS_claimed": false,
+  "schema": "glm53-v6-plain-source-helper-independent-review-v1",
+  "source_only": true,
+  "verdict": "no scoped Core/helper semantic blocker; external driver wording update required"
+}

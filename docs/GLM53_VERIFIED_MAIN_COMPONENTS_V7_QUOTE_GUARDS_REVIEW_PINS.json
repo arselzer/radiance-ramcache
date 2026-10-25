@@ -1,0 +1,32 @@
+{
+  "Core_count": 1535,
+  "HOST_checker_exact": true,
+  "authored_Context_refusals": 20,
+  "authored_new_CONV_refusals": 10,
+  "created_utc": "2026-10-25T19:46:00.202574+00:00",
+  "diagnostic_body_exact": true,
+  "helper_count": 1,
+  "mismatches": [],
+  "package_count": 8,
+  "pins": {
+    "GLM53_VERIFIED_MAIN_COMPONENTS_V7_QUOTE_GUARDS_REVIEW.txt": "6b0b92ae3c99bdc7c1452e467ce9f898f9d08edb47d4ed1778c21e2f45417ca0",
+    "GLM53_VERIFIED_MAIN_ENGINE_V5_CTX_QUOTE_REPAIR_REVIEW.txt": "36e7449e4a21a5509861e7e9d3bdebcb0344d9d8ee56175bad778f7a86894889",
+    "glm53-main-verified-components-v6-prototype/SOURCE_RECEIPT.json": "9ec3bcfeba04d2ebd16d857d6857123c8de634f6d0a23efa6a6a6010ddacba1f",
+    "glm53-main-verified-components-v6-prototype/actual_graph_quotes.cpp": "fcd11703a55db117324134a70f753f609c9b647ac488a203774163cda38c6083",
+    "glm53-main-verified-components-v6-prototype/host_quotes.cpp": "f977134fdc3d84dd355f48fb05b01760b01341f936a6d28b1e0fd6472ff48c59",
+    "glm53-main-verified-components-v7-prototype/CMakeLists.txt": "bb1784c20770bef7fe8da03f745e2c4abec2385eb7831a11186c2bf777d92b86",
+    "glm53-main-verified-components-v7-prototype/CORE_SOURCE_PINS.json": "0001f0a163dbc87198b899f9f9c782e6a9a0071c7a6a964fb2d2e10a68b8f19e",
+    "glm53-main-verified-components-v7-prototype/HELPER_SOURCE_PINS.json": "36b94cd4ecf41db4919966bb4f9ff873491bf81bf2c87c015bf19c12e4c3c85a",
+    "glm53-main-verified-components-v7-prototype/PRESERVED_QUOTE_BODIES.json": "9c1ae8ac6d3947fe6c1c98fab1c314e1d3bb7142bcf86df9844e6c549bdbc056",
+    "glm53-main-verified-components-v7-prototype/SOURCE_RECEIPT.json": "e5f382300425e88b4fd2f4d167d7b7dcc735305a845fdc57c3de3df9ff973e99",
+    "glm53-main-verified-components-v7-prototype/actual_graph_quotes.cpp": "691711f9510b1c6290b13405fc7de3ec4b55c2d952c5a0f58abed9494b188fcd",
+    "glm53-main-verified-components-v7-prototype/host_quotes.cpp": "f977134fdc3d84dd355f48fb05b01760b01341f936a6d28b1e0fd6472ff48c59",
+    "radiance-glm-main-verified-source-v5-src/core/runtime/ctx.cpp": "c9b3a2a9308e226841e6dc4a553c2634f93a886c4b0a4ea55f95dff0cc578749"
+  },
+  "preserved_Tiny_bodies": 2,
+  "reviewer": "/root/ds41_engram_ref",
+  "runtime_PASS_claimed": false,
+  "schema": "glm53-component-v7-quote-guard-independent-review-v1",
+  "source_only": true,
+  "verdict": "no remaining scoped source blocker"
+}

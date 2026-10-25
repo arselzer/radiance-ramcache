@@ -1,0 +1,35 @@
+{
+  "created_utc": "2026-10-25T21:39:49.149323+00:00",
+  "decision": "no scoped source blocker",
+  "execution_by_reviewer": false,
+  "files": {
+    "GLM53_MANUAL_MAINTENANCE_RUNNER_V2_RESOURCE_GATE_REVIEW.txt": "1807a9fa54699cb73ce88a64ee5e50bf8d10d39fffc1b3b73d61db4acae4c7f4",
+    "GLM53_VERIFIED_MAIN_V6_PLAIN_SOURCE_HELPER_REVIEW.txt": "06b4fcfd34cfb35e4e0f6cfbe58c65acb80940ad6bb92d5bb40ed7148d509fa8",
+    "build_glm53_main_verified_engine.py": "c31e6b5e28fd5357094f8fa151d8db48e4795f43cc666b8ab19fb447dd29c50e",
+    "glm53-main-verified-source-engine-v6-prototype/SOURCE_RECEIPT.json": "9345219898c353afa14f14f9f24ac43c1505d5ef9099cd44af2261d2a69dd299",
+    "glm53-main-verified-source-engine-v6-prototype/gate_checker.cpp": "42f9f0bc915d663b52b6aa6fd821f4d9f6fc6998941409a114cd2b5f5a2caa3e",
+    "glm53-main-verified-source-engine-v7-prototype/CMakeLists.txt": "dd9467aa003e10266e69536deabab82e603f652b40d8eca001146b7c1d817969",
+    "glm53-main-verified-source-engine-v7-prototype/CORE_SOURCE_PINS.json": "83d57401b288dc78ddad965498d47c2066e99050291411bc3545985d2a874159",
+    "glm53-main-verified-source-engine-v7-prototype/SOURCE_RECEIPT.json": "5639daa71b01eafca37a5958bc484aff413a097330ccc2acc0d673697d329b9f",
+    "glm53-main-verified-source-engine-v7-prototype/gate_checker.cpp": "9d2eb536afeff1400020e863091ea3207c8b0ceca97cd4a8442a20873ec3e426",
+    "glm53-manual-maintenance-runner-v2-20261025/SOURCE_RECEIPT.json": "f3ac69d09fa669f181e87847797a098bdcff875bce44815c31fcbca7005b34d3",
+    "glm53-manual-maintenance-runner-v2-20261025/runner.py": "1d69d68c74fdba7e55d58f56b340da953909776eb1525d7f6346bc9a51b7fc12",
+    "glm53-manual-maintenance-runner-v3-20261025/README.txt": "fbd5b02c0abeae01e89722c1fd733cb98fa483df8bfaa6f8fbfb66c48150b4a9",
+    "glm53-manual-maintenance-runner-v3-20261025/SOURCE_RECEIPT.json": "82856508493704d6b551276b3e20f5c29dca5f40e1c4e58f8ec2689e80903672",
+    "glm53-manual-maintenance-runner-v3-20261025/runner.py": "3f09e3511b601275665076ebe17c6bc458360f1f440882517bb03d4d62186db9",
+    "validate_glm53_main_verified_engine.py": "056f2c758ab93794249102d9192357bf3e3ab2f8271eb9e7ed680d3dcd83bfbc"
+  },
+  "review_sha256": "051f27764e0900c552865b040ff0c02d25d1352b8b0fedf2918b6c246d78ff02",
+  "schema": "glm53-core6-fixture7-runner3-source-review-v1",
+  "verified_counts": {
+    "Core_files": 1535,
+    "fixture_nonreceipt": 83,
+    "fixture_reviewed_inputs": 27,
+    "runner_changed_functions": [
+      "verify_build"
+    ],
+    "runner_functions": 32,
+    "runner_reviewed_inputs": 4,
+    "runner_source_files": 2
+  }
+}

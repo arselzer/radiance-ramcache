@@ -1,0 +1,71 @@
+Independent source-only review: CoreV6 plain-source helper and shared tests
+Reviewer: /root/ds41_engram_ref
+
+Verdict: no scoped Core/helper/test semantic blocker. Parent-runner classifier
+must recognize the new Engine gate success wording before interpreting runtime;
+matching builds and actual metadata/full prewalk/model evidence remain required.
+No compiler/runtime/device/service or frozen-source edit was performed here.
+
+Frozen Core pins83d57401b288dc78ddad965498d47c2066e99050291411bc3545985d2a874159;
+1535 files,identical domain to V5,only glm_main_ordinary_loader.h/.cpp differ.
+EngineV6 receipt9345219898c353afa14f14f9f24ac43c1505d5ef9099cd44af2261d2a69dd299:
+81 nonreceipt files,26 reviewed inputs,37 inherited C++ bodies all match.
+ComponentsV12 receipt79f74ad437af4126eced1de270b35cd78ddc2e687ac4cc81ebe123c2c06bc820:
+18 nonreceipt files and reused helper match; HOST checker remains exactV11.
+Old Tiny methods/default Core paths and all ABI27 C headers remain unchanged.
+
+Production semantics:
+ordinary_source first invokes the existing source_bounds (positive logical
+rows/cols,rank/extents/product,encoding validity,piece/scale count caps). Existing
+trivial/imported requirement and block-importer/Paro/wnorm/derived exclusions are
+unchanged. Every codes piece still passes the original physical tensor pointer,
+byte-span,rank,shape/product and packed-import-flag checks.
+
+Scales must have exactly the same count as pieces. Canonical plain is determined
+by equality against rad_enc_plain(plane0dtype),not just a string or a guessed
+dtype. This exact one-plane form requires every parallel scale slot to beNULL.
+Other supported sources must be valid two-plane affine encoding and every scale
+slot must be nonnull physical storage. Missing/mixed affine scales do not become
+accepted via generic null skipping. Unexpected physical scales on plain sources
+also refuse. This matches actual CheckpointSources representation while retaining
+stronger malformed-source refusal. It introduces no conversion or saturation.
+
+The added internal C++ validate_source method returns only small metadata POD,
+not source provenance or any Native/Engine capability. It assigns caller output
+only after all checks; every error leaves that output untouched. It performs no
+payload reads,backend calls,plane allocation or source mutation. Failure text
+is best-effort protected. Production prepare calls this same helper after actual
+source/share validation and typed native-owned omission. On failure it returns
+before loader publication,with the real diagnostic copied after the call. All
+previous destination/share/cap/final-authority checks remain unchanged.
+
+Tests/diagnostic:
+The new HOST group directly calls the production helper with manually owned
+small tensor-metadata fixtures. Four meaningful positives cover plainBF16,
+plainF32,two-piece plain concatenation and scaledFP8 affine. Eighteen negatives
+cover mixed/unexpected/missing scale slots,cardinality changes,null codes,
+invalid source materialization flags,missing physical pointers,packed-import
+flags,zero bytes and logical-view mismatch. A nineteenth null-output refusal
+checks early argument handling. Output sentinels and actual open/pread/backend
+counters remain unchanged on refusal. These are metadata-helper tests,not a
+claim that a fake Checkpoint/provider/source was admitted.
+
+ComponentsV12 removes its private physical/materializer mirror and calls exactly
+this production validator for actual ordinary sources. It reports canonical
+plain/affine counts and actual helper status/why. Actual source shares,selected
+relayout and metadata destinations are still separately inspected; final Native
+plan identity and real prepare remain separate gates. Diagnostic output grants
+no authority and cannot substitute for successful complete-prewalk data. The
+actual V11 witness and failed V10 prepare are preserved as original evidence.
+
+Driver compatibility:
+The new gate prints PASS actual Engine cold/lifecycle/Registry/geometry/source
+HOST gates:. The separate parent validate_glm53_main_verified_engine.py was
+observed still expecting the old geometry-only wording. Root was notified to
+make that classifier revision-aware before runtime. This is an external evidence
+classification fix,not permission to change tests or turn a failing body intoPASS.
+
+No target import,compiler,model/Torch/numerical execution,GPU query/launch,
+network,service stop/restore,production mutation,source edit or push occurred.
+The source fix does not itself establish successful ordinary loading,first-token
+quality,normal prompts,long context,performance or deployment readiness.

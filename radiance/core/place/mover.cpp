@@ -6,6 +6,8 @@
  */
 #include "mover.h"
 #include "native_inventory.h"
+#include "runtime/cache_prepare4_session.h"
+#include "build/glm_main_quote.h"
 #include "../device/device.h"
 
 #include <algorithm>
@@ -116,6 +118,55 @@ int Mover::tiny_startup_quote(const Program& p,const Plan& plan,const MoverConfi
     *out=s;return RAD_OK;
 }
 
+int Mover::glm_main_startup_quote(const Program& p,const Plan& plan,
+                              TinyStorageQuote* out) noexcept {
+    if(!out)return RAD_E_INVAL;
+    if(glm_main_tp4_cache_program_profile(p)<0||p.ctx.max_tok!=1||!plan.native_inventory||
+       plan.strategy!=Strategy::NativeBacked||plan.dynamic||plan.units.empty()||plan.units.size()>65536||
+       plan.classes.size()>65536||plan.file_stage_vram||plan.file_windows||
+       plan.native_inventory->validate(p,plan)<0)return RAD_E_UNSUPPORTED;
+    const auto& inventory=*plan.native_inventory;
+    const auto& f=inventory.footprint();
+    if(!f.regions||f.regions>512||f.consumer_slots>512||inventory.owned().size()!=12096)
+        return RAD_E_UNSUPPORTED;
+    TinyStorageQuote s;s.embedded_object_bytes=sizeof(Mover);s.stream_count=1;
+    const uint64_t units=plan.units.size(),classes=plan.classes.size(),weights=p.weights.size();
+    uint64_t slab_slots=0;
+    for(size_t c=0;c<plan.classes.size();++c){
+        const auto& sc=plan.classes[c];
+        if(sc.n_shadow||sc.n_stage)return RAD_E_UNSUPPORTED;
+        uint64_t live=0;
+        for(const auto& u:plan.units){
+            if(u.slab_class < -1||u.slab_class>=int32_t(classes)||u.layer < -1||u.layer>=p.meta.n_layers||
+               (u.tier!=Tier::VRAM&&u.tier!=Tier::NativeStore))return RAD_E_UNSUPPORTED;
+            if(u.tier==Tier::VRAM&&u.slab_class==int32_t(c)&&u.slab_slot>=0){
+                if(uint64_t(u.slab_slot)>=units)return RAD_E_SHAPE;
+                live=std::max(live,uint64_t(u.slab_slot)+1);
+            }
+        }
+        if(!tiny_quote::add(slab_slots,live))return RAD_E_SHAPE;
+    }
+    // Init vectors, including its simultaneous temporary n_slab/n_pool arrays.
+    // There are no native-profile pageable/pinned/static expert duplicates,
+    // loans, stage picks, file windows or dynamic swap workspaces here.
+    if(!tiny_quote::heap(s,units,sizeof(UnitState)+sizeof(uint16_t))||
+       !tiny_quote::heap(s,classes,sizeof(ClassPools)+sizeof(DonorRank)+sizeof(std::vector<int32_t>)+2*sizeof(int64_t))||
+       !tiny_quote::heap(s,classes,2*SlotPool::tiny_segment_bytes())||
+       !tiny_quote::heap(s,slab_slots,sizeof(uint8_t))||
+       !tiny_quote::heap(s,4,sizeof(Move))||!tiny_quote::heap(s,3,sizeof(RadEvent))||
+       !tiny_quote::heap(s,weights,sizeof(WeightSlot)+sizeof(uint8_t)+sizeof(rad_weight)))return RAD_E_SHAPE;
+    // Native bootstrap's actual bounded arrays and the first session's staging
+    // copy. Reserve-before-publication belongs to Mover, not NativeOwner's quote.
+    if(!tiny_quote::heap(s,f.regions,2*sizeof(RecordRegion)+4*sizeof(char*)+sizeof(int32_t)+sizeof(uint8_t))||
+       !tiny_quote::heap(s,inventory.owned().size(),4*sizeof(rad_weight)+sizeof(RecordClaim))||
+       !tiny_quote::heap(s,f.consumer_slots,sizeof(RecordPublication)))return RAD_E_SHAPE;
+    s.event_count=1+3+4+f.consumer_slots; // gate, lead, four Move events, non-sentinel ready events
+    s.heap_growth_allowance=s.heap_payload_bytes;
+    s.control_allowance=4096+s.event_count*128;
+    if(!glm_main_quote_finish(s))return RAD_E_SCRATCH;
+    *out=s;return RAD_OK;
+}
+
 void Mover::tiny_retire_or_fail() noexcept {
     if(!cfg_.tiny_budget)return;
     try {
@@ -127,10 +178,23 @@ void Mover::tiny_retire_or_fail() noexcept {
     } catch(...) { tiny_unretired_fail_stop(); }
 }
 
+void Mover::glm_main_retire_or_fail() noexcept {
+    auto* binding=cfg_.glm_main_binding;if(!binding)return;
+    try{
+        if(rad_dev_set(cfg_.glm_main_device)<0)binding->fail_stop(RAD_E_DEVICE);
+        // No diagnostics/unwind before either actual stream has retired.
+        if(compute_){const int st=rad_stream_sync(compute_);if(st<0)binding->fail_stop(st);}
+        if(mover_){const int st=rad_stream_sync(mover_);if(st<0)binding->fail_stop(st);}
+    }catch(...){binding->fail_stop(RAD_E_STATE);}
+}
 Mover::~Mover() {
     /* Drain the stream first: its queued gate waits, event records and copies refer to the
      * events and memory freed below. */
-    if(cfg_.tiny_budget){
+    if(cfg_.glm_main_binding){
+        glm_main_retire_or_fail();
+        if(mover_)rad_stream_destroy(mover_);
+        mover_=nullptr;
+    } else if(cfg_.tiny_budget){
         tiny_retire_or_fail();
         tiny_stream_.close(); // sole owner; never raw-destroy this borrowed handle
         mover_=nullptr;
@@ -174,7 +238,13 @@ void* Mover::reserve(const char* what, int64_t bytes, int kind) {
 }
 
 int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, Pools* budget) {
-    if(tiny_stream_.get()||cfg_.tiny_budget)return RAD_E_STATE;
+    if(tiny_stream_.get()||cfg_.tiny_budget||cfg_.glm_main_binding)return RAD_E_STATE;
+    if(cfg.glm_main_binding){
+        if(cfg.tiny_budget||!cfg.glm_main_binding->runtime_admitted()||cfg.glm_main_device<0||
+           cfg.glm_main_binding->rank()!=prog.ctx.rank||!plan.native_inventory||
+           plan.native_inventory->limits().backend_profile!=NativeBackendProfile::GlmMainTp4AqlFailStopV1||
+           plan.native_inventory->source_generation()!=cfg.glm_main_binding->source_generation())return RAD_E_UNSUPPORTED;
+    }else if(plan.native_inventory&&plan.native_inventory->limits().backend_profile==NativeBackendProfile::GlmMainTp4AqlFailStopV1)return RAD_E_UNSUPPORTED;
     if(cfg.tiny_budget){
         TinyStorageQuote checked;
         const int status=tiny_startup_quote(prog,plan,cfg,&checked);

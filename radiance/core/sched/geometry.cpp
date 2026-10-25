@@ -2,6 +2,7 @@
  * See geometry.h.
  */
 #include "geometry.h"
+#include "runtime/cache_prepare4_session.h"
 
 #include <algorithm>
 #include <cstring>
@@ -38,7 +39,7 @@ int64_t prefill_shared_tok(const Config& cfg) {
     return std::max(std::min(cfg.max_tok, I), cfg.max_tok - (cfg.prefill_span - 1) * I);
 }
 
-int chunk_geometry_resolve(const Program& prog, const Config& cfg, ChunkGeometry* out) {
+static int resolve_geometry(const Program& prog,const Config& cfg,ChunkGeometry* out,bool final_single_token) {
     if (!out) return RAD_E_INVAL;
     ChunkGeometry g;
 
@@ -145,7 +146,7 @@ int chunk_geometry_resolve(const Program& prog, const Config& cfg, ChunkGeometry
 
     *out = g;
 
-    if (cfg.max_tok < g.min_max_tok) {
+    if (cfg.max_tok < g.min_max_tok && !final_single_token) {
         RAD_ERR("--max-num-batched-tokens is %lld but this model's chunk geometry needs at least "
                 "%lld, so a chunk can end on a linear-state boundary: %s",
                 (long long)cfg.max_tok, (long long)g.min_max_tok, g.why.c_str());
@@ -193,6 +194,25 @@ int chunk_geometry_resolve(const Program& prog, const Config& cfg, ChunkGeometry
                      (long long)g.shared_tok);
     }
     return RAD_OK;
+}
+
+int chunk_geometry_resolve(const Program& p,const Config& c,ChunkGeometry* out) {
+    return resolve_geometry(p,c,out,false); // original minimum and all old behavior
+}
+int glm_main_final_token_geometry_resolve(const Program& p,const Config& c,ChunkGeometry* out) {
+    if(!out)return RAD_E_INVAL;
+    if(glm_main_tp4_cache_program_profile(p)<0||p.ctx.max_tok!=1||c.tp!=4||c.max_tok!=1||
+       c.max_seqs!=1||c.n_spec||c.prefix_cache||c.prefix_cache_mib||c.checkpoint_slots||
+       c.checkpoint_interval||c.prefill_span!=1||!c.deterministic||!c.tp_wire_exact||
+       c.max_ctx!=p.ctx.max_ctx)return RAD_E_UNSUPPORTED;
+    ChunkGeometry actual;
+    const int status=resolve_geometry(p,c,&actual,true);
+    if(status<0)return status;
+    // Every actual block/state/kernel contradiction is retained. Only the
+    // scheduler's final-partial-one-row admission is enabled, never a nonfinal
+    // sub-quantum chunk. Engine enforces exactly one token before add().
+    if(actual.checkpoint_interval||actual.span!=1||actual.shared_tok!=1)return RAD_E_UNSUPPORTED;
+    *out=std::move(actual);return RAD_OK;
 }
 
 }  /* namespace rad */

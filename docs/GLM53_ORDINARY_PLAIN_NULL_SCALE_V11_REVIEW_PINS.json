@@ -1,0 +1,30 @@
+{
+  "Core_count": 1535,
+  "child_runtime": false,
+  "created_utc": "2026-10-25T21:17:59.886084+00:00",
+  "diagnostic_is_full_production_validator": false,
+  "mismatches": [],
+  "package_nonreceipt_files": 16,
+  "pins": {
+    "GLM53_ORDINARY_PLAIN_NULL_SCALE_V11_REVIEW.txt": "c839321fbe0bbfd78a4436cdc7f81375f9ee83854f041cd749615875d36bb566",
+    "glm53-main-verified-components-v11-prototype/CORE_SOURCE_PINS.json": "0001f0a163dbc87198b899f9f9c782e6a9a0071c7a6a964fb2d2e10a68b8f19e",
+    "glm53-main-verified-components-v11-prototype/SOURCE_RECEIPT.json": "84a216ed0ed5f13eb9deef2c0d26e95dc5c284be945e45af0f7b2e3e15672932",
+    "glm53-main-verified-components-v11-prototype/actual_graph_quotes.cpp": "0c4916d51b4564656cfdbdcd772b8880f1c4e687ed9f5177d5dee303279b4054",
+    "radiance-glm-main-verified-source-v5-src/abi/rad_encoding.h": "0c3b9c774b29f1285c7a7dcd30327471a28e419943749b3d1cc5e4b169c0e703",
+    "radiance-glm-main-verified-source-v5-src/core/build/glm_main_ordinary_loader.cpp": "44107ae825400dc56aee4421a9a4d03056d5c42a1c3f072843d9977d3435bde6",
+    "radiance-glm-main-verified-source-v5-src/core/format/checkpoint.cpp": "a9f1ff3e938e0ff9ef1d80d8dac9dc159f7e541ca59b39e4ba1e39d7a78450aa",
+    "radiance-glm-main-verified-source-v5-src/core/format/checkpoint.h": "708ca4a2ed27c218452fe67f1f6a45e010eccab16a70d9a19fa3094392d4410a",
+    "validation-glm53-components-v10-complete-prewalk-20261025T205250Z/check.log": "4593b1d113b782fed05aca88f466b0ff978da1f44afabf15fa10e164ebdec389",
+    "validation-glm53-components-v11-ordinary-metadata-diagnostic-20261025T211654Z/receipt.json": "49cad6e729fe48f1b9efc3245591411bc4f8ba65ecdd6ba11de1d4fa30429577",
+    "validation-glm53-components-v11-ordinary-metadata-diagnostic-20261025T211654Z/result.json": "0834ca2dafe4bd748bb390ba335f029d1ac0a01f599a21fdf7841ab94d11049d"
+  },
+  "reported_per_rank": {
+    "ordinary_views": 1272,
+    "other_reported_refusals": 0,
+    "physical_refusals": 1067
+  },
+  "reviewer": "/root/ds41_engram_ref",
+  "schema": "glm53-ordinary-plain-null-scale-v11-review-v1",
+  "source_only": true,
+  "verdict": "CoreV5 null-scale bug confirmed; V11 diagnostic no scoped blocker"
+}

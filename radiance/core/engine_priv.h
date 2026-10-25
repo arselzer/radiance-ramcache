@@ -11,6 +11,7 @@
 #pragma once
 #include "engine.h"
 #include "engine_tiny_native.h"
+#include "engine_glm_main.h"
 #include "runtime/cache_prepare4_session.h"
 #include "place/native_backing_owner.h"
 
@@ -43,6 +44,7 @@ struct Engine::Rank {
     std::vector<lora::Site> lora_sites;
     Plan      plan;
     Pools     pools;
+    GlmMainComputeStream glm_compute; // actual TP4 compute owner; Ctx borrows
     TinyStream tiny_compute; // default inert; survives Ctx/owner/Mover destruction
     Mover     mover;
     std::unique_ptr<NativeBackingOwner> native_owner;

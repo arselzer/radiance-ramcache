@@ -1,0 +1,33 @@
+{
+  "child_compiler_import_numerical_payload_device_network_runtime": false,
+  "counts": {
+    "Core": 1535,
+    "helper": 1,
+    "package": 8,
+    "preserved_Tiny_quote_bodies": 2
+  },
+  "created_utc": "2026-10-25T18:34:47.497844+00:00",
+  "mismatches": [],
+  "pins": {
+    "GLM53_VERIFIED_MAIN_COMPONENTS_V3_INDEPENDENT_REVIEW.txt": "2086c1d00f262974f846118042d5dbb083b4d32c130110a347f1be93d31f6332",
+    "glm53-main-verified-components-v3-prototype/CMakeLists.txt": "17464c0634e96a7f1b1c5ab227ac5f9737828fdeaf89ae560c8351af4f764091",
+    "glm53-main-verified-components-v3-prototype/CORE_SOURCE_PINS.json": "9986ab23db17a5148caea5e6577620ab68f76bf580aebe7350a4f969baff3ef9",
+    "glm53-main-verified-components-v3-prototype/HELPER_SOURCE_PINS.json": "36b94cd4ecf41db4919966bb4f9ff873491bf81bf2c87c015bf19c12e4c3c85a",
+    "glm53-main-verified-components-v3-prototype/PRESERVED_QUOTE_BODIES.json": "9c1ae8ac6d3947fe6c1c98fab1c314e1d3bb7142bcf86df9844e6c549bdbc056",
+    "glm53-main-verified-components-v3-prototype/README.txt": "eb30672e4fa2b007e7a6ae29a590c8c55c9fca9e1b234028933dc59291f5e0ea",
+    "glm53-main-verified-components-v3-prototype/SOURCE_RECEIPT.json": "07527968cbf0fd45bc9dbfc3506b503d95acfa8d94efb8b34b68a705bb1c510b",
+    "glm53-main-verified-components-v3-prototype/actual_graph_quotes.cpp": "6386c849ca6268b3607918224c58b815c9787a4a77f839412903325bd4ae4e84",
+    "glm53-main-verified-components-v3-prototype/host_quotes.cpp": "edfe697d1b226e58812f7f3a76cea5b8b8fb24f8ef0f5f981de2fcb159c946e1",
+    "glm53-main-verified-components-v3-prototype/verify_sources.py": "6aa1037f5beb638bfed555c05e7a9ef890bb6aaca24775228dcb7b3838cfe5c2",
+    "radiance-glm-main-verified-source-v3-src/core/build/glm_main_ordinary_loader.cpp": "44107ae825400dc56aee4421a9a4d03056d5c42a1c3f072843d9977d3435bde6",
+    "radiance-glm-main-verified-source-v3-src/core/build/glm_main_ordinary_loader.h": "dfd0b68354a3fb8a2e7e37e9d537173c8924640219741d94bd5b86b3f48b60e9",
+    "radiance-glm-main-verified-source-v3-src/core/device/aql.cpp": "9f3782d8f0a2efd8186d08639063e3c29e9cf8d7338db3c69b1be78e284a70ea",
+    "radiance-glm-main-verified-source-v3-src/core/runtime/ctx.cpp": "15b836046115449f48aefb010b043781a1d828164e4856d08f6729fc1b57f275",
+    "radiance-glm-main-verified-source-v3-src/core/sample/sampler.cpp": "aa8ab5f5b0139fdc324bc74992572acd767f48640965e9ee0a69a125832a9cc0"
+  },
+  "qualification": "Sampler under1MiB is requested/page-rounded staging, not physical driver backing/RSS.",
+  "runtime_PASS_claimed": false,
+  "schema": "glm53-verified-main-components-v3-independent-review-pins-v1",
+  "source_only": true,
+  "verdict": "no scoped implementation blocker"
+}

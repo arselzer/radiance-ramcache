@@ -47,6 +47,7 @@
 #include <vector>
 
 namespace rad {
+class CachePrepare4RankBinding;
 
 /* ------------------------------------------------------------------ slot bookkeeping */
 /* Free-list bookkeeping for the VRAM slab and the pinned host pool. Pure host state, testable
@@ -323,6 +324,8 @@ struct MoverConfig {
     // Internal sealed transport only. The admission and its tickets outlive this
     // Mover. Null preserves ordinary stream creation/retirement behavior.
     TinyBudget* tiny_budget = nullptr;
+    CachePrepare4RankBinding* glm_main_binding=nullptr;
+    int glm_main_device=-1; // actual device, never inferred from logical rank
 };
 
 /* ------------------------------------------------------------------ the loan */
@@ -369,6 +372,8 @@ public:
     // backend TinyStream reservation are charged separately. No allocation/I/O.
     static int tiny_startup_quote(const Program&,const Plan&,const MoverConfig&,
                                   TinyStorageQuote*) noexcept;
+    static int glm_main_startup_quote(const Program&,const Plan&,TinyStorageQuote*) noexcept;
+    void glm_main_retire_or_fail() noexcept;
     ~Mover();
     Mover() = default;
     Mover(const Mover&) = delete;

@@ -129,6 +129,10 @@ struct TinySamplerQuote;
 class Sampler {
 public:
     static int tiny_startup_quote(const SamplerConfig&,TinySamplerQuote*) noexcept;
+    // Actual pinned GLM TP4/seq1/spec0 staging quote, BEFORE declare's stage_alloc.
+    // Pure metadata; existing Tiny/default admission is unchanged.
+    static int glm_main_startup_quote(const SamplerConfig&,TinySamplerQuote*) noexcept;
+    int glm_main_startup_quote(TinySamplerQuote*)const noexcept;
     Sampler() = default;
     ~Sampler();
 

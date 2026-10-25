@@ -1,0 +1,193 @@
+{
+  "GPU_visibility": {
+    "HIP_VISIBLE_DEVICES": "0,1,2,3",
+    "ROCR_VISIBLE_DEVICES": "0,1,2,3"
+  },
+  "assembly_receipt_sha256": "7efe866461dfe9921ce12cfa7b676297f1581e3b9ec15b74cff64878e7ab12a4",
+  "combined_child_attempted": true,
+  "combined_startup_plus_text_passed": false,
+  "commands": [
+    {
+      "command": [
+        "nice",
+        "-n19",
+        "/usr/bin/ionice",
+        "-c",
+        "3",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/build-glm53-main-verified-engine-checks-v6-aql-release-fixture-v8/glm53_main_verified_engine_manual",
+        "--one-token",
+        "/home/as/models/hf/amd/GLM-5.3-Flash-Quark-MXFP4",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-manual-preparation-v4-core-v6-fixture-v8-20261025T214833Z/exclusive-home",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-full-main-store-20261025T175438Z/private-complete-store/data",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-complete-source-proof-20261025T172943Z/complete-source-proof.json",
+        "7279810219167007678",
+        "a"
+      ],
+      "elapsed_live": 2.0870007574558258e-05,
+      "elapsed_seconds": 1.6075660439673811,
+      "finished": "2026-10-25T22:21:21.032112+00:00",
+      "heartbeat_utc": "2026-10-25T22:21:19.424579+00:00",
+      "log": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-manual-window-core-v6-fixture-v8-20261025T222006Z/combined-engine.log",
+      "os_counters": {
+        "VmPeak_kB": 43032,
+        "VmRSS_kB": 504,
+        "rchar": 23768,
+        "read_bytes": 507904,
+        "wchar": 0,
+        "write_bytes": 0
+      },
+      "owned_pid": 3675653,
+      "returncode": 1,
+      "started": "2026-10-25T22:21:19.412617+00:00"
+    }
+  ],
+  "configuration_or_deployment_changes": false,
+  "error": "RuntimeError: combined actual GLM child failed with exit 1",
+  "external_SIGKILL_or_power_loss_recovery_guaranteed": false,
+  "finished": "2026-10-25T22:23:02.855526+00:00",
+  "health_before": [
+    {
+      "in_flight": 0,
+      "status": "ok"
+    },
+    {
+      "in_flight": 0,
+      "status": "ok"
+    }
+  ],
+  "host_validation_receipts": {
+    "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/validation-glm53-main-verified-engine-v6-host-asan-20261025T220810Z/receipt.json": "4cf486ca646aa51d96c013e7f27bd968f721b3ba601a5be24cdf29691bc50a26",
+    "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/validation-glm53-main-verified-engine-v6-host-release-20261025T214806Z/receipt.json": "10cffcea6b8bf1332a46acf2971e287fee88537993a75038316ed6a4cfcf5bd3",
+    "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/validation-glm53-main-verified-engine-v6-host-tsan-20261025T220921Z/receipt.json": "4362e89368f1733e60f793f7f4a7c269970f8993374676acfcfe60e5e61ef60e"
+  },
+  "logs_sha256": {
+    "combined-engine.log": "bc944b69c808f93eacf202b4456e018e89076076c6f478672ca2d9a3083147e6"
+  },
+  "original_container": {
+    "Dead": false,
+    "ExitCode": 0,
+    "FinishedAt": "0001-01-01T00:00:00Z",
+    "Id": "608764c1d1989c714d8aad7b8a79f8057c3e73473b9f9d55b49d02e82defd2b8",
+    "Image": "sha256:e82764045e46ebae07e33961f17dedba981c0d07336dfcddd67e4b3b042b8600",
+    "Name": "/radiance-flashnext",
+    "Paused": false,
+    "Restarting": false,
+    "Running": true,
+    "StartedAt": "2026-10-24T13:01:04.473569004Z",
+    "Status": "running"
+  },
+  "passed": false,
+  "physical_resource_gate": {
+    "GPU_query_subprocess": false,
+    "expected_AMD_BDFs": [
+      "0000:03:00.0",
+      "0000:06:00.0",
+      "0000:83:00.0",
+      "0000:c3:00.0"
+    ],
+    "expected_vram_total_bytes_per_device": 17095983104,
+    "finished": "2026-10-25T22:21:19.401563+00:00",
+    "max_vram_used_bytes_per_device": 67108864,
+    "min_MemAvailable_bytes": 34359738368,
+    "passed": true,
+    "samples": [
+      {
+        "MemAvailable_bytes": 123969839104,
+        "all_vram_idle": true,
+        "devices": [
+          {
+            "bdf": "0000:c3:00.0",
+            "card": "card0",
+            "device_directory": "/sys/devices/pci0000:c0/0000:c0:03.1/0000:c1:00.0/0000:c2:00.0/0000:c3:00.0",
+            "total_bytes": 17095983104,
+            "used_bytes": 59912192,
+            "vendor": "0x1002"
+          },
+          {
+            "bdf": "0000:83:00.0",
+            "card": "card2",
+            "device_directory": "/sys/devices/pci0000:80/0000:80:03.1/0000:81:00.0/0000:82:00.0/0000:83:00.0",
+            "total_bytes": 17095983104,
+            "used_bytes": 59912192,
+            "vendor": "0x1002"
+          },
+          {
+            "bdf": "0000:03:00.0",
+            "card": "card3",
+            "device_directory": "/sys/devices/pci0000:00/0000:00:01.1/0000:01:00.0/0000:02:00.0/0000:03:00.0",
+            "total_bytes": 17095983104,
+            "used_bytes": 59912192,
+            "vendor": "0x1002"
+          },
+          {
+            "bdf": "0000:06:00.0",
+            "card": "card4",
+            "device_directory": "/sys/devices/pci0000:00/0000:00:03.1/0000:04:00.0/0000:05:00.0/0000:06:00.0",
+            "total_bytes": 17095983104,
+            "used_bytes": 59912192,
+            "vendor": "0x1002"
+          }
+        ],
+        "exact_devices": true,
+        "passed": true,
+        "utc": "2026-10-25T22:21:19.396400+00:00"
+      }
+    ],
+    "started": "2026-10-25T22:21:19.370250+00:00",
+    "wait_seconds": 60
+  },
+  "preparation_receipt_sha256": "a5d88ee22bbf2ea111f79df5d984ff63d41ba649c451df5a653e2eb9943292e0",
+  "prewalk_receipt_sha256": "fc0731b9c4d16124fb0cd78b8c167d371caad1b82c1a914e18b687bcf7f6aa7f",
+  "restoration": {
+    "attempted": true,
+    "finished": "2026-10-25T22:23:02.844452+00:00",
+    "health": {
+      "in_flight": 0,
+      "status": "ok"
+    },
+    "healthy_after_best_effort": true,
+    "last_error": "URLError: <urlopen error [Errno 111] Connection refused>",
+    "last_state": {
+      "Dead": false,
+      "ExitCode": 0,
+      "FinishedAt": "2026-10-25T22:21:06.35863784Z",
+      "Id": "608764c1d1989c714d8aad7b8a79f8057c3e73473b9f9d55b49d02e82defd2b8",
+      "Image": "sha256:e82764045e46ebae07e33961f17dedba981c0d07336dfcddd67e4b3b042b8600",
+      "Name": "/radiance-flashnext",
+      "Paused": false,
+      "Restarting": false,
+      "Running": true,
+      "StartedAt": "2026-10-25T22:21:21.12254649Z",
+      "Status": "running"
+    },
+    "original_stop_ambiguous": false,
+    "passed": true,
+    "same_container_id": "608764c1d1989c714d8aad7b8a79f8057c3e73473b9f9d55b49d02e82defd2b8",
+    "stable_seconds": 40.65445147594437,
+    "start_requested": true,
+    "started": "2026-10-25T22:21:21.037841+00:00"
+  },
+  "restoration_armed_before_stop": true,
+  "same_original_container_restored": true,
+  "schema": "glm53-controlled-manual-maintenance-v1",
+  "scope": "one controlled stop/start of the SAME existing QFN container plus one combined isolated GLM startup+one-token child",
+  "separate_independent_transport_run": false,
+  "source_pass_receipt_sha256": "0952e9b61aba9369dbae9087ed217d72f8eb2a9b4167d9d26c2e0907a5b06ec7",
+  "source_receipt": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-manual-maintenance-runner-v4-20261025/SOURCE_RECEIPT.json",
+  "source_receipt_sha256": "90cce1e88d0056dc93e0af55218b28907993ecd7dce1f683a929a275286094ed",
+  "started": "2026-10-25T22:20:20.813346+00:00",
+  "stop_boundary_confirmed": true,
+  "stopped_state": {
+    "Dead": false,
+    "ExitCode": 137,
+    "FinishedAt": "2026-10-25T22:21:06.35863784Z",
+    "Id": "608764c1d1989c714d8aad7b8a79f8057c3e73473b9f9d55b49d02e82defd2b8",
+    "Image": "sha256:e82764045e46ebae07e33961f17dedba981c0d07336dfcddd67e4b3b042b8600",
+    "Name": "/radiance-flashnext",
+    "Paused": false,
+    "Restarting": false,
+    "Running": false,
+    "StartedAt": "2026-10-24T13:01:04.473569004Z",
+    "Status": "exited"
+  }
+}

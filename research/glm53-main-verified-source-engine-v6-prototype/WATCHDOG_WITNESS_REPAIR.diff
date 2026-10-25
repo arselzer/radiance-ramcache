@@ -1,0 +1,28 @@
+--- v3/session_checker.cpp
++++ v4/session_checker.cpp
+@@ -41,12 +41,14 @@
+     for(int i=0;i<b.n_tok*8;++i)a[size_t(i)]=(i*13+layer*7)%288;return a;}
+ template<class Fn>std::array<int,4> four(rad::CachePrepare4Session& s,const RadBatch& b,Fn fn){
+     // A failed authored gate must fail the checker, not strand its test process.
++    std::atomic<bool> timeout_fired{false};
+     std::jthread timeout([&](std::stop_token stop){const auto limit=std::chrono::steady_clock::now()+std::chrono::seconds(10);
+         while(!stop.stop_requested()&&std::chrono::steady_clock::now()<limit)std::this_thread::sleep_for(std::chrono::milliseconds(1));
+-        if(!stop.stop_requested())(void)s.binding(0)->finish(b,RAD_E_IO);});
++        if(!stop.stop_requested()){timeout_fired.store(true,std::memory_order_release);(void)s.binding(0)->finish(b,RAD_E_IO);}});
+     std::array<int,4> result{};std::array<std::jthread,4> workers;
+     for(int rank=0;rank<4;++rank)workers[size_t(rank)]=std::jthread([&,rank]{try{result[size_t(rank)]=fn(rank);}catch(...){result[size_t(rank)]=s.binding(rank)->finish(b,RAD_E_STATE);}});
+-    for(auto& worker:workers)worker.join();timeout.request_stop();timeout.join();return result;
++    for(auto& worker:workers)worker.join();timeout.request_stop();timeout.join();
++    need(!timeout_fired.load(std::memory_order_acquire),"protocol required watchdog rescue; intended gate notification did not complete");return result;
+ }
+ void generations_and_sampler_frame(){++groups;auto s=session();
+     need(!s->runtime_admitted()&&s->model_generation()==11&&s->source_generation()==29,"CPU protocol cannot grant source admission");
+@@ -115,7 +117,7 @@
+             rc=binding->ready(mutation==3&&rank==3?RAD_E_IO:RAD_OK);if(rc==RAD_OK)++gu;return rc;});
+         for(int rc:result)need(rc<0,"all rank waiters wake on first refusal");
+         const auto first=s->observe().first;need(first.status<0&&gu==0,"no GU after boundary refusal");
+-        if(mutation<3)need(owners==0,"route/early-exit refusal before owner work");else need(owners==4&&late_source_witness==1&&first.status==RAD_E_IO,"late source error after all four actual owner-work arrivals");
++        if(mutation<3)need(owners==0,"route/early-exit refusal before owner work");else need(owners==4&&late_source_witness==1&&first.status==RAD_E_IO&&first.reason==cp::Reason::source_failure&&first.rank==3,"late source error after all four actual owner-work arrivals");
+         need(s->begin(b)<0&&s->observe().first==first,"first failure sticky/no pass retry");++refusals;}
+ }
+ void builder_and_closed_runtime(){++groups;rad::Registry registry;RadModelMeta meta{};RadBuildCtx bc{};bc.world_size=4;bc.max_tok=3;bc.max_seqs=1;

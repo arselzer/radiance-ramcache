@@ -116,6 +116,10 @@ public:
     /* Bytes init() allocates on each rank's card (the step slab and, with an encoder, the media
      * regions), computed without allocating, for the VRAM budget. -1 if init() would refuse. */
     static int64_t device_bytes(Program& prog, const Config& cfg, const KVGeom& kvg);
+    // Closed manual GLM profile: actual shared pinned-ring and event requests.
+    // Metadata sizing only; outputs commit together, no backend/payload work.
+    static int glm_main_staging_quote(Program&,const Config&,const KVGeom&,
+        uint64_t* device,uint64_t* pinned,uint64_t* events);
 
     /* Build the batch for this step. The returned pointer stays valid for the next kOut - 1
      * calls and is shared by pointer across rank threads (spec §1). Null on a device failure,

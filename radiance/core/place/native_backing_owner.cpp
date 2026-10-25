@@ -2,6 +2,7 @@
 #include "runtime/ctx.h"
 #include "runtime/cache_prepare4_session.h"
 #include "../build/tiny_component_quotes.h"
+#include "../build/glm_main_quote.h"
 #include <algorithm>
 namespace rad {
 namespace {
@@ -40,6 +41,21 @@ int NativeBackingOwner::tiny_startup_quote(const Program& program,const Plan& pl
         if(!tiny_quote::heap(s,1,sizeof(Impl))||!tiny_quote::heap(s,q.weights,sizeof(WeightSlot))||!tiny_quote::heap(s,q.slots,sizeof(uint32_t))||!tiny_quote::heap(s,q.slots,sizeof(RecordPublication))||!tiny_quote::heap(s,q.slots,sizeof(NativeRecordLease))||!tiny_quote::heap(s,q.classes,sizeof(int32_t)))return RAD_E_SHAPE;
         s.control_allowance=512;
         if(!tiny_quote::finish(s))return RAD_E_SCRATCH;
+        *out=q;return RAD_OK;
+    }catch(...){return RAD_E_STATE;}
+}
+int NativeBackingOwner::glm_main_startup_quote(const Program& program,const Plan& plan,TinyOwnerQuote* out) noexcept {
+    if(!out)return RAD_E_INVAL;
+    if(glm_main_tp4_cache_program_profile(program)<0||program.ctx.max_tok!=1||!plan.native_inventory||plan.native_inventory->program()!=&program)return RAD_E_UNSUPPORTED;
+    try {
+        const auto& inv=*plan.native_inventory;const int valid=inv.validate(program,plan);if(valid<0)return valid;
+        TinyOwnerQuote q;q.sizeof_owner=sizeof(NativeBackingOwner);q.sizeof_impl=sizeof(Impl);q.sizeof_weight_slot=sizeof(WeightSlot);q.sizeof_publication=sizeof(RecordPublication);q.sizeof_lease=sizeof(NativeRecordLease);
+        q.weights=program.weights.size();q.slots=inv.footprint().consumer_slots;q.classes=inv.classes().size();
+        if(!q.slots||q.slots>512||!q.classes||q.classes>64)return RAD_E_UNSUPPORTED;
+        auto& s=q.storage;s.embedded_object_bytes=sizeof(NativeBackingOwner);
+        if(!tiny_quote::heap(s,1,sizeof(Impl))||!tiny_quote::heap(s,q.weights,sizeof(WeightSlot))||!tiny_quote::heap(s,q.slots,sizeof(uint32_t))||!tiny_quote::heap(s,q.slots,sizeof(RecordPublication))||!tiny_quote::heap(s,q.slots,sizeof(NativeRecordLease))||!tiny_quote::heap(s,q.classes,sizeof(int32_t)))return RAD_E_SHAPE;
+        s.control_allowance=512;
+        if(!glm_main_quote_finish(s))return RAD_E_SCRATCH;
         *out=q;return RAD_OK;
     }catch(...){return RAD_E_STATE;}
 }

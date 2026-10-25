@@ -1,0 +1,72 @@
+Independent source-only review: components V8 lifetime fix and V9 compile repair
+Reviewer: /root/ds41_engram_ref
+
+Verdict: no remaining scoped source blocker in V9. CoreV5 is unchanged; this
+repairs a definite fixture metadata-owner lifetime defect. Actual metadata and
+full prewalk still require parent execution before any authorized model window.
+V7's failed prewalk and V8's failed compiler result remain historical failures.
+
+Frozen V9 receipt0f2e9a9cd670156f64556194a6d18dca17a262423ad1720394f44c17e70d08ce;
+checker9033db50cafdefc32de06cf29b11344a8dd10905810a87b96876f6ce8b2aa674.
+Frozen V8 receiptfad070576a2369862f7cc49fa98d3c98a303b660df41930329d34d770dcf00ad;
+checker2c503a96136f50aef72f0313b39fa8d713d0ae3a2869ca5c45c2ca3f28442185.
+All10 V8 and12 V9 nonreceipt source pins,1535 identical CoreV5 pins,one helper
+and2 Tiny quote bodies match. HOST checker remains byte-identical to V7.
+
+Defect and concrete ownership closure:
+MetaOwn::finish(checkpoint.cpp39-49) publishes raw pointers into its own strings,
+string vectors and pointer vectors. Builder::Builder(rad_builder.cpp110) copies
+RadModelMeta shallowly into Program. V7 declare_actual copied/finished MetaOwn
+in a local variable, then returned Programs after that owner died. The later
+NativeInventory profile strcmp could therefore read dangling architecture data;
+all initial in-helper checks occurred while the owner was alive. This source
+bug invalidates V7's lifetime guarantee independently of whether that exact
+runtime -18 branch was captured. No specific failed predicate is now presumed
+without the new parent result.
+
+V8/V9 Actual declares MetaOwn declaration_meta BEFORE the four Programs. Reverse
+member destruction therefore destroys Programs first. Actual is allocated once
+behind unique_ptr; returning that pointer does not move the MetaOwn object.
+Checkpoint metadata is copied into this retained member; optional imported
+quant override happens before unconditional finish(), which rebinds ALL raw
+string and KV pointers even for non-imported input. No later mutation/move of
+this owner is introduced.
+
+Immediately after declare_actual returns, metadata_owner_lifetime validates
+arch/name/quant pointers against the live member strings, bounded KV vector
+counts and pointer arrays against the live member vectors, and every pointer
+entry against its owning string. For each Program it checks exact pointer/count
+identity BEFORE strcmp or profile dereference. The guard runs before context
+negative cases/expensive Reader work and repeats after source verification.
+It does not repair/rewrite Program metadata after declaration or substitute a
+literal architecture string. The ordinary actual Engine uses its retained
+Checkpoint/Engine-owned metadata and does not share this helper-local defect.
+
+Diagnostic/error behavior:
+NativeInventory bind status is now assigned before error text concatenates why,
+so its actual error description is observed after the call. The new explicit
+native metadata diagnostic uses actual Planner metadata and selected layout
+callbacks, reports static-resident and reader predicates, and checks unchanged
+backend-allocation/pread counters. It constructs no catalog or NativeInventory,
+never opens complete Reader data, grants no Source/Session/Engine capability,
+and does not normalize Program/Plan inputs. Diagnostic success means the report
+was generated, not that every reported predicate passed. Existing output fields
+keep runtime_ready=false and zero kernel initialization/launches; the diagnostic
+has no actual_complete_data_prewalk field and cannot satisfy the runner gate.
+
+V9's sole C++ difference from V8 replaces invalid const-char* .substr with
+std::string(u.reason?u.reason:"",u.reason?strnlen(u.reason,160):0).
+This is null-safe, bounds the source read to160 bytes, and preserves diagnostic
+text intent. Existing cstring/POSIX Linux profile supplies strnlen. It changes
+no ownership, guard, layout callback, source/data, loader, scheduler or math.
+V8 remains a preserved compiler failure, not an executed repaired revision.
+
+All corrected scratch/CONV guards and20 authored context refusals remain intact.
+The retained metadata owner adds lifetime, not payload or authority. Metadata
+mode can now catch post-return ownership/profile failure before expensive scans.
+Successful actual source/loader prewalk is still necessary; a static review
+cannot assume that the previous -18 was the only remaining admission issue.
+
+No target import/compiler/runtime/model/Torch/numerical/device operation,
+service stop, production action, network, source edit or push was performed by
+this reviewer. Source/metadata/hash comparisons only were used.

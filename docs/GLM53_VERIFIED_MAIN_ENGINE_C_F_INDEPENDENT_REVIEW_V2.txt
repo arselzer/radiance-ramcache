@@ -1,0 +1,149 @@
+Actual GLM verified-source Engine C-F — independent source review, V2
+2026-10-25 UTC
+
+Verdict and immutable scope
+---------------------------
+No remaining scoped source blocker was identified in:
+  glm53-main-verified-source-engine-v2-prototype
+  receipt 2062af696b87638f5fbe0b3033db9f6c22720227d5509a9bf345994e1ae46b87
+  radiance-glm-main-verified-source-v2-src
+  Core pins dcec5262e3d088016554885bef1aed296762f109b59c11f08691868087168df1
+
+Independently checked all 1535 Core hashes, 71 fixture hashes, 37 inherited file
+bodies and eight reviewed input hashes: no mismatches. All 20 original ABI files
+remain unchanged. This review performed no compiler, target import, numerical
+execution, model-payload scan, GPU query/launch, network or serving action.
+Matching whole-Core builds and actual execution remain parent-owned gates.
+
+V1 is preserved and uncompiled. Its namespace-only composition had unresolved
+short sibling references. V2 changes exactly three private copied files plus
+their COMPOSITION.json. Independently regenerated all 14 copied bodies from the
+frozen A/B package with the six full namespace substitutions and two identifier-
+scope substitutions. The result is byte-exact; include paths, arithmetic, source
+data and acceptance predicates are unchanged. This is a source correction, not
+a claim that V1 built successfully.
+
+Admission, state and identity
+------------------------------
+core/engine_glm_main.cpp:23,67,88 preflight the closed request and latch the actual
+Engine attempt before startup. A failed or retired Engine cannot restart. A
+process-local manual lease prevents concurrent manual owners. The profile must
+find the process-global Registry empty and only closes a Registry it owns; a
+refused shell cannot close another Engine's instances. The new HOST fixture
+retains an actual global test instance across refusal/destruction and then
+retires it explicitly (gate_checker.cpp:66-75).
+
+The factory at core/engine_glm_main.cpp:132 uses the ONE Engine-owned Checkpoint
+and CheckpointSources. Four stable metadata Plans outlive the separate final
+Native plans. The strict complete A/B reader is reused without synthetic parser
+relaxation. Every rank binds the same complete bundle ID, all 12096 owned records
+and an empty resident set through actual Program/source/layout geometry. The
+central Engine-instance generation uses a saturating CAS; it is not a local
+record checksum or caller-selected generation. Only after all four sources,
+inventories, final placement/owner quotes and final source audits does the private
+factory publish Session source admission (line234). This is explicitly distinct
+from loaded weights, TransportReady or a successful model step.
+
+The ordinary Engine/CLI path still refuses the experimental module without the
+private manual state. Default Legacy, PermanentV1, HostOnly and Tiny profiles are
+not widened. No production CLI/HTTP activation, installation or source factory
+callback is introduced.
+
+Opaque init and failure boundary
+--------------------------------
+Registry::reserve_instance_tracking admits the actual tracking vector before
+any peer init can rendezvous (core/plugin/select.cpp:467). Credits are claimed
+under the mutex; a returning zero-credit callback now returns STATE instead of
+underflowing. The new opt-in failure callback is invoked at the lowest Registry
+negative/exception seam BEFORE Core diagnostic formatting. Null-hook behavior
+retains the original path. The actual Engine callback is non-returning.
+
+All four metadata-only declarations and actual final-token geometry checks
+precede opaque init, Pools or ordinary payload allocation. Engine marks the
+async/fatal boundary before launching the four actual init threads
+(core/engine_glm_main.cpp:262-264). Later known backend/source failures stop the
+experimental process rather than joining peers or unwinding submitted resources.
+The HOST tests exercise real Registry init/fini tracking, allocation refusal and
+bounded negative/exception subprocesses; they do not emulate GPU quiescence.
+
+Ordinary loader and resource accounting
+---------------------------------------
+core/build/glm_main_ordinary_loader.cpp:157 validates actual source encoding,
+weight_share rectangles and typed owned omission before preparing destinations.
+It does not reinterpret raw FP8 as BF16 or fabricate kv_b conversion. Actual
+pinned main kv_b sources remain BF16. The actual embedding source exceeds 1GiB;
+this profile supplies explicit 2GiB input/output limits, and the actual per-job
+quote still enforces them. No assumption that a 1GiB default suffices remains.
+
+The fill loop preserves stock whole-row reshape and column-band equations.
+It excludes block-importer/Paro/wnorm/derived source families that would hide
+large materialization, and pre-admits one bounded reusable column buffer.
+All runtime destinations are validated before payload work (line247 onward).
+Actual AQL pinned storage has a host-address mapping accessible to every card,
+so sequential device binding does not invalidate the staging alias. Every copy
+refusal or failed REAL drain invokes the admitted fail-stop before pinned RAII
+cleanup (lines302,305). Successful drain precedes source/output reuse and pointer
+publication. Earlier loaded private weights may remain after failure; no rollback
+or same-Engine retry is claimed.
+
+Sampler/Ctx/Owner/Mover quotes use actual private structures and allocation loops,
+not mirrored layouts or a whole WeightInfo clone. The four old tiny quote method
+bodies remain byte-identical. The new BatchBuilder quote reuses actual layout and
+carve sizing, inserts real state-index widths, checks identical rank geometry,
+and charges its single shared pinned ring, per-rank device slab and events. The
+named metadata/host envelopes are requested planning bounds, not allocator/RSS
+quotas; checkpoint mapped RSS, page cache and vendor/driver/stdlib allocator RSS
+are excluded as disclosed. Driver/opaque-init headroom is an assumption and is
+not a hardware-fit proof. Parent execution must check actual availability.
+
+Final-token geometry is deliberately narrow
+-------------------------------------------
+core/sched/geometry.cpp:202 adds a separate closed-profile resolver. It requires
+the real GLM profile, TP4/M1/seq1/spec0/exact wire/deterministic/no prefix/no
+checkpoint interval or slots. It performs the same full block/state/kernel
+reconciliation and preserves the ACTUAL attention block, state chunk, quantum,
+max-chunk and generic minimum. It bypasses only the minimum-budget refusal.
+The ordinary resolver and Scheduler::plan_chunk algorithms remain unchanged.
+
+Actual tokenized prompt length must be exactly one before scheduler.add
+(core/engine_glm_main.cpp:49,350). A one-token generation limit alone would not
+provide that guarantee. The fixture uses the real Scheduler to require final
+plan_chunk(0,1,1)==1 and non-final plan_chunk(0,2,1)==0, alongside old-resolver
+refusal and new negative geometry cases. Its large Program is explicitly
+synthetic METADATA, not a complete-source or DEVICE/Ready proof.
+The first successful manual text test would establish final partial PREFILL
+plus sampling. It would not establish a later decode model pass or long prompts.
+
+Retirement and lifetime
+------------------------
+core/engine_glm_main.cpp:307 closes Session admission before worker abort/join.
+Actual rank device binding and compute/transfer retirement precede Owner lease
+release. Ctx/WTAB shuts down while Native backing and borrowed streams live;
+Owner close follows Ctx. StepSlot/EOG and Scheduler staging are freed before
+rank Programs/Pools, while source adapters close before their borrowed metadata
+owners disappear. Source data/authorities and Checkpoint/cache retire last.
+
+The review identified two inherited late device-bind holes in the new path.
+Both are now guarded only for this explicit profile: step_state_fini before
+StepSlot/EOG device frees, and BatchBuilder::free_set before staging-event/device
+release. Prior healthy drains do not turn a later failed bind into success.
+Mapped EOG staging remains owned until all potentially reading copies retire.
+Mover/compute ownership checks stop before releasing resources on failed drain.
+Void-free APIs and arbitrary hardware/queue hangs do not become checked physical
+free or graceful cancellation proofs. The explicit process-fatal policy and
+external process deadline remain necessary limits.
+
+Evidence separation and next validation
+---------------------------------------
+The parent separately reported complete offline-store verification of all
+161715585024 native bytes, 48384 records and 168 shards, and Release/ASan/TSan
+success for the basic A/B HOST refusal and generic-provider tests. At this review
+closure the fresh complete persisted DATA reader/provider run was still separate
+from C-F. None of those results proves this new Engine transport or text path.
+
+The V2 HOST fixture is suitable for matching-Core compile and negative/lifecycle
+validation. The manual AQL transport target remains explicit, requires an
+exclusive matching experimental architecture home and complete-source admission,
+and needs the parent's idle/resource gate. Actual four-GPU startup, loaded-weight
+checks, model arithmetic, sampling output, throughput and quality remain execution
+gates. Production remains unchanged.

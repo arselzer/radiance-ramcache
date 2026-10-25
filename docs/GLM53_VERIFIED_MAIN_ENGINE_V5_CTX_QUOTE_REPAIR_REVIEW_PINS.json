@@ -1,0 +1,38 @@
+{
+  "Core_bytes_outside_GLM_quote_unchanged": true,
+  "Core_count": 1535,
+  "changed_Core_paths": [
+    "core/runtime/ctx.cpp"
+  ],
+  "created_utc": "2026-10-25T19:43:29.185914+00:00",
+  "fixture_source_count": 78,
+  "inherited_body_count": 37,
+  "metadata_witness_arena_total_derived": 4743168,
+  "mismatches": [],
+  "old_Tiny_quote_bodies_unchanged": 4,
+  "pins": {
+    "GLM53_VERIFIED_MAIN_ENGINE_V5_CTX_QUOTE_REPAIR_REVIEW.txt": "36e7449e4a21a5509861e7e9d3bdebcb0344d9d8ee56175bad778f7a86894889",
+    "glm53-main-verified-source-engine-v5-prototype/CORE_SOURCE_PINS.json": "0001f0a163dbc87198b899f9f9c782e6a9a0071c7a6a964fb2d2e10a68b8f19e",
+    "glm53-main-verified-source-engine-v5-prototype/SOURCE_RECEIPT.json": "5fb644e7648616b890a0a31d9cd9ff49675a559b0d464764e96c98c4f0133729",
+    "glm53-main-verified-source-engine-v5-prototype/V5_ACTUAL_GLM_CTX_QUOTE_DELTA.diff": "8ccb939107391b5fdcd85549930b7bc456a5c27b49a384f85f11ca36001e0c89",
+    "glm53-main-verified-source-engine-v5-prototype/V5_DIRECT_PARENT_CORE_SOURCE_PINS.json": "4891881bf80e2990d8c3cd74e56c8d4e9f775c7b17b80ac02c83e7e9a3dffe13",
+    "radiance-glm-main-verified-source-v4-src/core/runtime/ctx.cpp": "15b836046115449f48aefb010b043781a1d828164e4856d08f6729fc1b57f275",
+    "radiance-glm-main-verified-source-v5-src/abi/rad_format.h": "f11a4280d0b5829d9166866d5caf54cfe222dc795b4fbeb93af6383ee1dd779a",
+    "radiance-glm-main-verified-source-v5-src/arch/common/rad_block_moe_fp8.h": "f37eeb579fe1efb96b9d95354e1d368a45d4941bb89314dd2acef63e4fc3dc43",
+    "radiance-glm-main-verified-source-v5-src/arch/common/rad_glm_tp.h": "25dbff19bb67bdb4d063ebb8f15218ef6220581f7e43d084836e0fed3df1a61c",
+    "radiance-glm-main-verified-source-v5-src/arch/glm5next/glm5next.cpp": "88b6e91251ec89c519a00a076eda6dae65944432514a4b73dc6218b2f03af180",
+    "radiance-glm-main-verified-source-v5-src/core/build/rad_builder.cpp": "7d6bcd6d25fe964e623873ea9de81f67853e833ce66acfd8b7108f336e6503c6",
+    "radiance-glm-main-verified-source-v5-src/core/runtime/arena.cpp": "62c4e1dd6e554f664f6d315f2cd3e1808c231e3b23868d74c432806754f6efbd",
+    "radiance-glm-main-verified-source-v5-src/core/runtime/cache_prepare4_session.cpp": "3102472c64b3be28088a052fb01ac9a41a591d6b2d7bea7bd7296ac31a022539",
+    "radiance-glm-main-verified-source-v5-src/core/runtime/ctx.cpp": "c9b3a2a9308e226841e6dc4a553c2634f93a886c4b0a4ea55f95dff0cc578749",
+    "validation-glm53-components-v6-metadata-20261025T193336Z/check.log": "cb760baa8d02a5fe94d7e41a2c303c5e0b208621c5d36d0a009b7b1fff02143a",
+    "validation-glm53-components-v6-metadata-20261025T193336Z/receipt.json": "9cbf3b2c236f988dc6dfeb6dedc89be906d5224334c068c40a19ad1dd54ec032"
+  },
+  "reviewed_input_count": 20,
+  "reviewer": "/root/ds41_engram_ref",
+  "runtime_or_preflight_PASS_claimed": false,
+  "schema": "glm53-verified-main-engine-v5-quote-repair-review-v1",
+  "source_only": true,
+  "verdict": "no remaining scoped source blocker",
+  "window_started": false
+}

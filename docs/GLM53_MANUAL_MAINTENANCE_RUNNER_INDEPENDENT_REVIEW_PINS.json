@@ -1,0 +1,35 @@
+{
+  "AST_top_level_functions": 29,
+  "checked_frozen_inputs": 3,
+  "checked_source_files": 2,
+  "child_import_execution_compiler_tokenizer_Docker_GPU_service_network_numeric": false,
+  "created_utc": "2026-10-25T19:17:03.680983+00:00",
+  "duplicate_top_level_functions": [],
+  "execution_conditions": [
+    "parent matching HOST Release/ASan/TSan validations",
+    "actual complete assembly/reader/provider/prewalk PASS",
+    "trusted current serving baseline",
+    "fresh operational physical CPU/GPU resource and idle gates"
+  ],
+  "failure_scope": "ordinary caught errors only; external SIGKILL/power loss and unkillable hardware/daemon faults are not guaranteed recoverable",
+  "identity_scope": "same captured original container ID/image/name and public health; raw Config/Env inspection is forbidden; model/config baseline remains parent-supplied",
+  "mismatches": [],
+  "pins": {
+    "GLM53_MANUAL_MAINTENANCE_RUNNER_INDEPENDENT_REVIEW.txt": "65b9ca6239cc6852de78f6f582f936eb515348ec96f78d201953f18c0ce5226f",
+    "GLM53_SHIPPED_PLUGIN_HASHES.json": "f6ce7f3167aff1df128545197c00ed405c2b52a5f12f6011b86e9fe5c8894a7d",
+    "GLM53_VERIFIED_MAIN_ENGINE_V4_VISIBILITY_REPAIR_REVIEW.txt": "64e2982c22caa84c16b57c2b672f8cf63f118aac7133a97c4472fcea770a3859",
+    "glm53-manual-maintenance-runner-20261025/README.txt": "e823268af6aea22610cb188f9a86ca205e8776a0fa8206a8989e78e4d7eb7665",
+    "glm53-manual-maintenance-runner-20261025/SOURCE_RECEIPT.json": "aadf48a1233dc7f109a7801c276257c089e462caad390f02c3e9f1487bd4e5a0",
+    "glm53-manual-maintenance-runner-20261025/runner.py": "e18c0cea9e27b5ed009245291e81842cbd2212e8b58760ff617942f2c55b39ae",
+    "glm53-manual-tokenizer-home-preflight-20261025/METADATA_REVIEW.json": "af19b78c7f07db8c51c50c4d500d7f1ee6c75cfc962b9dc904d70e28578a158c",
+    "radiance-glm-main-verified-source-v4-src/core/engine_glm_main.cpp": "cc4545b458b1b67a040584f69b13ba2718422e96fe1894fd1830dfd7eda5625a",
+    "radiance-glm-main-verified-source-v4-src/core/text/token_view.h": "8f3993c5ba571d46ddb4e929b0cfb1235dfb9a7dca09d3392d52a7a43d452f88",
+    "radiance-glm-main-verified-source-v4-src/tools/rad_tokcheck.cpp": "2c81a5eb7e004147effafe899c4bd8cc203147f37bbdbe2d1840daa9a5991ce5",
+    "run_guarded_heavy_research.py": "7488c4fc4f32e207e4e88cb3dcedbacb6830d85f0fc539bd2be76381bcb11fc2"
+  },
+  "reviewer": "/root/ds41_engram_ref",
+  "runtime_or_restoration_PASS_claimed": false,
+  "schema": "glm53-manual-maintenance-runner-independent-review-pins-v1",
+  "source_only": true,
+  "verdict": "no remaining scoped source blocker after rollback repairs"
+}

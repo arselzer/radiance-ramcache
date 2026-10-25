@@ -1,105 +1,91 @@
-Portable Engine transport Core v4 / eight HOST source checks
-========================================
+Portable Core V6, fixture V8, Components V12
 
-This NEW entrypoint compiles manual Foundation checker v3, genuine startup
-contract, compact authority normal/collision, compact inventory, strict P3 and
-23-case unified-policy checker bodies plus the actual Engine transport v4
-checker, with ONE matching private Core layout. Original checker bodies remain
-byte-exact. The eighth checker calls actual Engine.start for closed synthetic
-HOST transport, exercises startup/refusal/retirement, and explicitly refuses
-serve/model/sampler steps. It is not real-checkpoint conversion, full-model/TP/
-GPU serving or a deployment procedure. The older Foundation and earlier Engine
-source/failed-run receipts remain unchanged; v4 is a distinct validated source
-revision, not a relabeling of the older inventory.
+This entrypoint builds twelve explicitly requested HOST checkers against one
+matching private Core layout. The retained tiny Engine, compact metadata,
+source/provider, TP4 protocol and transfer checks keep their original bodies.
+The actual Engine gate also tests cold admission, Registry/geometry and the same
+production plain/affine source validator. The component HOST quote body is
+unchanged. No model download, GPU, server or real-data path is invoked.
 
-Expected layout:
-  radiance/                 selected frozen Engine transport v4 source minus TWO pyc
-  research/glm53-engine-native-foundation-v3-prototype/
-  research/glm53-tiny-engine-native-transport-v4-prototype/
-  research/ds41-unified-native-policy-host-prototype/
-  research/glm53-sharded-native-provider-prototype/
-  research/glm53-expert-record-store-prototype/
-  research/glm53-record-cache-bridge-prototype/
-  research/glm53-cache-prototype/
-  research/portable/        this NEW CMake entrypoint
-  tools/{verify_snapshot.py,build_host.py}
-  SNAPSHOT_MANIFEST.json    NEW complete exported file SHA256 map
+Current evidence: matching Core V6/fixture V8 Release, ASan/UBSan and TSan HOST
+suites passed 20 commands each. The portable twelve-program Release build passed
+against a verified source-identical existing Core at snapshot d2915f6e. All
+twelve portable HOST runtime checks then passed at the preserved 3,021-file
+f0eaee18 snapshot. Final additions are evidence/docs; source, tools and CMake
+remain unchanged. A separate actual-data prewalk passed
+5,088 ordinary jobs and 193,536 omissions, without executing the loader, Engine
+or model kernels. These are distinct scopes.
 
-Requirements: Linux/POSIX, Python 3.9+, CMake 3.24+, a C++20 compiler, pthreads
-and ordinary build tools. Vendored JSON/llama/httplib source stays in radiance/.
-No Torch, ROCm, downloaded tensor/tokenizer/model or network is needed for HOST.
+Requirements: Linux/POSIX, Python 3.10+, CMake 3.24+, a C++20 compiler, pthreads
+and ordinary build tools. Vendored JSON/llama/httplib source remains in radiance/.
+No Torch, ROCm, network, tokenizer or model is required for these HOST programs.
 
 From the repository root:
   python3 tools/verify_snapshot.py
-  python3 tools/build_host.py --jobs 1
+  python3 tools/build_host.py --mode release --jobs 1
 
 The default builds fresh out-of-tree HOST Core/reference/quantizer targets and
-the eight portable checker programs; it does NOT execute them. The experimental
-DS41 source vocabulary is built explicitly to match the original fixture build
-profile, not installed/activated as a service. The default build launches no
-checker or Core executable; only --run-host-checks executes the tiny fixtures.
-All generated files and the compiler serialization lock stay under repo/build/.
-V4 uses core-engine-v4-host-MODE and portable-engine-v4-host-MODE subdirectories;
-older Foundation builds/evidence are left in place and are never silently reused
-with the new Core headers. An explicit source mismatch still refuses.
-Repeated invocations may reuse that snapshot's own verified build directory.
-
-Explicit manual HOST checks (including intended fault/refusal subprocesses):
-  python3 tools/build_host.py --jobs 1 --run-host-checks
-
-Sanitizers use distinct matching Core+helper builds; checks remain enabled:
+twelve checker programs; it does NOT execute them. Generated files and locks stay
+under repo/build/. Current directories are core-main-verified-v6-host-MODE and
+portable-main-verified-v6-fixture-v8-host-MODE, preserving older caches/evidence.
+Explicit execution:
+  python3 tools/build_host.py --mode release --jobs 1 --run-host-checks
   python3 tools/build_host.py --mode asan --jobs 1 --run-host-checks
   python3 tools/build_host.py --mode tsan --jobs 1 --run-host-checks
 
-Optional parent-owned already-built Core reuse:
+Optional existing Core reuse:
   python3 tools/build_host.py --existing-core-build /ABS/MATCHING/HOST/BUILD --run-host-checks
 
-Reuse is allowed only after the actual CMAKE_HOME_DIRECTORY source tree matches
-EVERY exported radiance/ file SHA256, with no extra source files except the two
-explicit original pyc files. The source-home path may differ; private source
-bytes may not. Archives, HOST/no-FFmpeg profile, build type, sanitizer mode and
-absolute compiler are checked. It does not silently rebuild an external Core.
-An existing matching build must contain libref and libquant to run the checks.
-No claim is made that source hashes authenticate arbitrary prebuilt binaries.
-The accepted compiler cache profile is deliberately closed: empty global C/C++
-flags; default Release -O3 -DNDEBUG, Debug -g, MinSizeRel -Os -DNDEBUG and
-RelWithDebInfo -O2 -g -DNDEBUG; empty linker overrides. Extra ABI defines such as
-_GLIBCXX_DEBUG, custom toolchain/compiler arguments, alternate launchers or LTO
-are refused rather than silently compiling helpers with different layouts.
-A reused matching Core may record ONLY the single /usr/bin/ccache system launcher
-without arguments or a CMake list; it must be a regular executable, not a symlink.
-This is the reviewed v4 compiler-cache front end, not permission for wrappers or
-injected flags. Helpers never inherit it. All other launcher/toolchain/ABI checks
-remain unchanged. Nonempty CCACHE_* or compiler-launcher environment overrides,
-and flag/include/library-path overrides, are refused. System compiler/cache tool
-trust is still required; cache/source inspection does not authenticate arbitrary
-prebuilt archives. A machine without that exact launcher can use a fresh default
-no-launcher Core build instead.
-The same closed compiler-profile check applies to a reused portable fixture
-cache, immediately after configure and again before any checker execution;
-compiler, mode, source-home and Core-build paths must still match.
+Reuse requires every exported Core source SHA to match the actual source tree;
+no extra files except the two recorded historical pyc files are allowed. The
+current frozen 1,535-file inventory itself already omits both pyc files. Core,
+headers, archives, compiler, HOST/no-FFmpeg profile, mode, sanitizer and source
+home are checked. A reused build needs libref/libquant. External Core is not
+silently rebuilt. Source hashes do not authenticate arbitrary prebuilt binaries.
 
-All subprocesses receive OMP_NUM_THREADS=1 and OMP_THREAD_LIMIT=1 with GPU
-visibility variables empty. Only the actual Engine checker additionally removes
-ALL RADIANCE_* variables, matching its fixed clean-environment admission; seven
-legacy checker environments and build environments remain unchanged. ASan defaults (unless the caller already set the
-variable) are ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 and
-UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1. TSan similarly defaults to
-TSAN_OPTIONS=halt_on_error=1:second_deadlock_stack=1. These match the original
-research process controls. Address/undefined-behavior/thread errors halt; leak
-detection follows the original detect_leaks=0 process setting.
+The compiler profile is closed: empty global C/C++ flags and linker overrides;
+standard Release -O3 -DNDEBUG, Debug -g, MinSizeRel -Os -DNDEBUG and
+RelWithDebInfo -O2 -g -DNDEBUG. Extra ABI defines such as _GLIBCXX_DEBUG, custom
+toolchains/compiler arguments, LTO and launchers refuse. The sole existing-Core
+launcher exception is regular executable /usr/bin/ccache with no arguments,
+CMake list or symlink; helper builds never inherit it. Nonempty CCACHE_*, compiler
+launcher, flag, include and library-path environment overrides refuse. System
+compiler/cache trust remains required. The same checks run on a reused fixture
+cache, after configuration and before execution; no guard was relaxed.
 
-Manifest verification checks all exported files, refuses missing/extra files,
-symlinks and hash drift, and excludes only top-level .git/, build/ and the
-manifest itself. It also checks the exported Core against the unchanged frozen
-1512-file Engine transport v4 Core pin inventory with exactly the two recorded pyc files removed.
-Source generation and verification assume an ordinarily immutable checkout;
-these checks are not a hostile concurrent-writer or cryptographic-signature
-security boundary. Builds may execute trusted CMake/compiler code as usual.
+All subprocesses receive OMP_NUM_THREADS=1 and OMP_THREAD_LIMIT=1, with GPU
+visibility variables empty. The tiny Engine, TP4 Session, actual Engine gate and
+component checker remove all RADIANCE_* variables. Defaults preserve a caller's
+existing sanitizer settings; otherwise they use:
+  ASAN_OPTIONS=detect_leaks=0:halt_on_error=1
+  UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1
+  TSAN_OPTIONS=halt_on_error=1:second_deadlock_stack=1
+Address, UB and thread errors halt. Leak detection follows the original research
+setting; these runs do not establish a separate leak-proof claim.
 
-Archival verify_source_pins.py scripts still intentionally refer to historical
-research parents and whole old Core trees. They are provenance artifacts, not
-this portable entrypoint. Optional physical V3/composite exporter source is
-archived separately; its older private-Core pin loops are not bypassed here and
-it is NOT built by the initial portable target. DEVICE sources remain source
-artifacts only; this entrypoint never configures HIP or executes a GPU checker.
+Snapshot verification covers the exact exported file set, refusing symlinks and
+hash drift, and excludes only top-level .git/, build/ and the manifest itself.
+Current radiance/ must equal fixture V8's CORE_SOURCE_PINS.json: exactly 1,535
+Core V6 files. Private ABI, compiler, cache and environment checks are unchanged.
+These source/inventory guards are not a hostile concurrent-writer or signature
+boundary. Builds execute trusted CMake/compiler code as usual.
+
+Archived packages retain original paths, maps and author-time READMEs; use this
+guide for current public commands. Historical Core V5 is reconstructible using
+its two-file overlay. Earlier manifests and failed/pass receipts retain their
+individual scopes.
+
+Runner V4 is archived server-specific source with no default, import, build or
+checker action. It admits the reviewed Core V6/fixture V8 pair or matching legacy
+revisions through V5. It requires fresh V4 preparation and original private
+model, store, HOME, runtime, container and hardware gates. Its operational stop,
+restore, resource, signal and window bodies are unchanged from V3/V2. No shipped
+library, model, native store, tokenizer, serving configuration or API credential
+is exported. Actual AQL declaration, Engine model execution, maintenance and
+serving are never automatic actions of this portable entrypoint.
+
+The later actual four-GPU Engine attempt failed at Core V6’s strict padded-vocab
+guard before source admission (tokenizer154856/model154880); no model computation
+or GLM token occurred. Same-container QFN restoration and an independent QFN
+completion passed. This is separate from the passed CPU/prewalk evidence and
+the separately passed portable HOST runtime. No further GPU window is queued.

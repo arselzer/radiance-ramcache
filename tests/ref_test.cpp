@@ -743,6 +743,14 @@ TEST(gemm_nt_ggml_reads_native_blocks_as_llama_cpp_dequantises) {
         REQUIRE_EQ(run("gemm_nt_ggml", a), RAD_OK);
         A b; b.t(x).t(wl).t(yl).i("M", M).i("N", N).i("K", K).s("type", ty.name).s("dtype", "f32");
         REQUIRE_EQ(run("gemm_nt_ggml", b), RAD_OK);
+        /* the engine's form: the relayouted bytes at the declared shape [N, K] (core/runtime/ctx.cpp) */
+        T we(RAD_U8, {N, rb}); we.raw(blocks);              /* the stored bytes ... */
+        we.t.shape[1] = K;                                   /* ... at the declared shape */
+        we.t.stride[0] = K;
+        T ye(RAD_F32, {M, N});
+        A e; e.t(x).t(we).t(ye).i("M", M).i("N", N).i("K", K).s("type", ty.name).s("dtype", "f32");
+        REQUIRE_EQ(run("gemm_nt_ggml", e), RAD_OK);
+        for (int64_t i = 0; i < M * N; ++i) CHECK_EQ(ye.at(i), y.at(i));
         for (int64_t m = 0; m < M; ++m)
             for (int64_t n = 0; n < N; ++n) {
                 float acc = 0.0f;
@@ -809,6 +817,18 @@ TEST(moe_gemm_ggml_routes_rows_to_native_block_experts) {
             A b; b.t(x).t(wl).t(sorted).t(off).t(yl).i("M", M).i("N", N).i("K", K).i("n_expert", NE)
                  .i("top_k", TK).s("a_order", order).s("type", ty.name).s("dtype", "f32");
             REQUIRE_EQ(run("moe_gemm_ggml", b), RAD_OK);
+            /* the engine's form: a WEIGHT TABLE (leading stride 0, one pointer an expert) whose
+             * entries are relayouted bytes at the declared shape [N, K] */
+            std::vector<void*> ptrs((size_t)NE);
+            for (int64_t e = 0; e < NE; ++e) ptrs[(size_t)e] = blocks.data() + e * N * rb;
+            T tab(RAD_U8, {NE, N, K});
+            tab.t.data = ptrs.data();
+            tab.t.stride[0] = 0;
+            T yt(RAD_F32, {NR, N});
+            A tb; tb.t(x).t(tab).t(sorted).t(off).t(yt).i("M", M).i("N", N).i("K", K).i("n_expert", NE)
+                  .i("top_k", TK).s("a_order", order).s("type", ty.name).s("dtype", "f32");
+            REQUIRE_EQ(run("moe_gemm_ggml", tb), RAD_OK);
+            for (int64_t i = 0; i < NR * N; ++i) CHECK_EQ(yt.at(i), y.at(i));
             for (int64_t i = 0; i < NR; ++i) {
                 const int64_t flat = sorted.iat(i);
                 int64_t e = 0;

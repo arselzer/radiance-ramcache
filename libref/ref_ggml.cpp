@@ -139,8 +139,14 @@ extern "C" int ref_ggml_unrelayout(const RadParam* p, int n_p, int operand, cons
     return RAD_OK;
 }
 
-/* y[m, n] = sum_k a[m, k] w[n, k]: w native blocks [N, K/block*block_bytes] u8 dequantised a row at
- * a time, or a plain float [N, K]; f32 accumulation in index order, rounded once. */
+/* y[m, n] = sum_k a[m, k] w[n, k]: w native blocks dequantised a row at a time, or a plain float
+ * [N, K]; f32 accumulation in index order, rounded once.
+ *
+ * Native blocks are u8, each row K / block * block_bytes bytes, rows back to back as the relayout
+ * wrote them. The engine hands a relayouted weight at its stored dtype and its DECLARED shape,
+ * [N, K] (core/runtime/ctx.cpp: a re-laying kernel derives its own stride), so the row stride is
+ * computed here, never read from the operand; [N, row bytes] (a tool holding the stored bytes) is
+ * read the same way. */
 int ref_gemm_nt_ggml(const RadArgs* a, RadStream) {
     if (!have(a, 3)) return RAD_E_INVAL;
     const RadTensor &x = a->t[0], &w = a->t[1], &y = a->t[2];
@@ -152,7 +158,7 @@ int ref_gemm_nt_ggml(const RadArgs* a, RadStream) {
         return RAD_E_SHAPE;
     const int64_t rb = K / k->block * (int64_t)k->block_bytes;
     const bool native = w.dtype == RAD_U8;
-    if (native ? w.shape[1] != rb : w.shape[1] != K) return RAD_E_SHAPE;
+    if (native ? (w.shape[1] != rb && w.shape[1] != K) : w.shape[1] != K) return RAD_E_SHAPE;
     const lq::ggml::DequantFn dq = lq::ggml::dequant_of(k->type);
 #pragma omp parallel
     {
@@ -160,7 +166,7 @@ int ref_gemm_nt_ggml(const RadArgs* a, RadStream) {
 #pragma omp for schedule(static)
         for (int64_t n = 0; n < N; ++n) {
             if (native)
-                dq((const uint8_t*)w.data + n * w.stride[0], wr.data(), K);
+                dq((const uint8_t*)w.data + n * rb, wr.data(), K);
             else
                 for (int64_t i = 0; i < K; ++i) wr[(size_t)i] = ldt(&w, rowoff(&w, n, K) + i * laststride(&w));
             for (int64_t m = 0; m < M; ++m) {
@@ -198,10 +204,14 @@ int ref_moe_gemm_ggml(const RadArgs* a, RadStream) {
     if (T <= 0 || numel(&sorted) < T || numel(&off) < ne + 1) return RAD_E_SHAPE;
     const int64_t rb = K / k->block * (int64_t)k->block_bytes;
     const bool native = W.dtype == RAD_U8;
-    if (native ? W.shape[2] != rb : W.shape[2] != K) return RAD_E_SHAPE;
+    if (native ? (W.shape[2] != rb && W.shape[2] != K) : W.shape[2] != K) return RAD_E_SHAPE;
+    /* Each expert's weight: a table entry (the engine's form, one pointer per expert), or a slab of
+     * a stacked tensor. Native rows are rb bytes apart (gemm_nt_ggml), so a stacked native
+     * expert is N * rb bytes on from the last. */
     std::vector<RadTensor> we((size_t)ne);
     for (int64_t e = 0; e < ne; ++e) {
         we[(size_t)e] = expert_entry(&W, e);
+        if (native && W.stride[0] != 0) we[(size_t)e].data = (uint8_t*)W.data + e * N * rb;
         if (!we[(size_t)e].data) return RAD_E_STRIDE;
     }
     /* Each row's expert and activation row, or -1 for a row of zeros; then the live rows grouped
@@ -237,7 +247,7 @@ int ref_moe_gemm_ggml(const RadArgs* a, RadStream) {
             const int64_t e = items[(size_t)it].first, n = items[(size_t)it].second;
             const RadTensor& w = we[(size_t)e];
             if (native)
-                dq((const uint8_t*)w.data + n * w.stride[0], wr.data(), K);
+                dq((const uint8_t*)w.data + n * rb, wr.data(), K);
             else
                 for (int64_t c = 0; c < K; ++c) wr[(size_t)c] = ldt(&w, rowoff(&w, n, K) + c * laststride(&w));
             for (int64_t i : rows[(size_t)e]) {

@@ -96,7 +96,9 @@ int gemm_ggml_impl(const RadArgs* a, const char* nN, const char* nK) {
         return RAD_E_SHAPE;
     const int64_t rb = K / k->block * (int64_t)k->block_bytes;
     const bool native = w.dtype == RAD_U8;
-    if (native ? w.shape[1] != rb : w.shape[1] != K) return RAD_E_SHAPE;
+    if (native ? (w.shape[1] != rb && w.shape[1] != K) : w.shape[1] != K) return RAD_E_SHAPE;
+    /* The row stride of native blocks is computed, never read: the engine hands a relayouted
+     * weight at its declared shape [N, K] (libref's reading). */
     const GgmlDec dec = make_dec(k, w.data, K);
     const Mat ma = as_mat(&x, K);
     const Mat mb = native ? Mat{ &w, K, 1, &dec } : as_mat(&w, K);
@@ -165,13 +167,15 @@ AVX_KERNEL(moe_gemm_ggml) {
     if (T <= 0 || numel(&sorted) < T || numel(&off) < ne + 1) return RAD_E_SHAPE;
     const int64_t rb = K / k->block * (int64_t)k->block_bytes;
     const bool native = W.dtype == RAD_U8;
-    if (native ? W.shape[2] != rb : W.shape[2] != K) return RAD_E_SHAPE;
-    /* Each expert's weight: a table entry, or a slab of a stacked tensor. */
+    if (native ? (W.shape[2] != rb && W.shape[2] != K) : W.shape[2] != K) return RAD_E_SHAPE;
+    /* Each expert's weight: a table entry, or a slab of a stacked tensor (native rows rb bytes
+     * apart, so a stacked native expert is N * rb bytes on from the last). */
     std::vector<RadTensor> we((size_t)ne);
     std::vector<GgmlDec> dec((size_t)ne);
     std::vector<Mat> mw((size_t)ne);
     for (int64_t e = 0; e < ne; ++e) {
         we[(size_t)e] = expert_entry(&W, e);
+        if (native && W.stride[0] != 0) we[(size_t)e].data = (uint8_t*)W.data + e * N * rb;
         if (!we[(size_t)e].data) return RAD_E_STRIDE;
     }
     for (int64_t e = 0; e < ne; ++e) {

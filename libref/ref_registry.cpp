@@ -450,7 +450,7 @@ static const RadOperandSpec oSoftmaxPool[] = { OPD("stage"), OUT("out"), OPD_O("
 static const RadParamSpec pAttnSparseSink[] = { P_INT("M"), P_INT("heads"), P_INT("dim"),
     P_INT("window"), P_INT("ratio"), P_INT("topk"), P_F64("scale"), P_STR("dtype") };
 static const RadOperandSpec oAttnSparseSink[] = { OPD("q"), OPD("window_cache"), OPD("window_bt"),
-    OPD_O("comp_cache"), OPD_O("comp_bt"), OPD_O("sel"), OPD("positions"), OPD("cu_seqlens"),
+    OPD("window_used"), OPD_O("comp_cache"), OPD_O("comp_bt"), OPD_O("sel"), OPD("positions"), OPD("cu_seqlens"),
     WGT("sinks"), OUT("out") };
 static const RadParamSpec pIndexScore[] = { P_INT("M"), P_INT("heads"), P_INT("dim"),
     P_INT("ratio"), P_INT("width"), P_F64("wscale"), P_STR("dtype") };
@@ -1464,7 +1464,8 @@ static const RadOpSchema kSchemas[] = {
   "An entry whose optional page is negative is not written." },
 { "attn_sparse_sink", ARR(pAttnSparseSink), ARR(oAttnSparseSink),
   "Latent attention (key = value, dim wide) with a per-head sink over the window cache's keys "
-  "at [pos-window+1, pos] (block wbt[s][j/bs], cache [blocks,1,bs,dim]) and, with ratio > 0, "
+  "at [pos-window+1, pos] (the window table rebased at first = pos(last row of s) + 1 - "
+  "window_used[s]: block wbt[s][(j-first)/bs], cache [blocks,1,bs,dim]) and, with ratio > 0, "
   "the selected compressed entries c (tokens [c ratio, (c+1) ratio), block cbt[s][c ratio/cbs], "
   "cache [blocks,1,cbs,dim/ratio]). f32 scores q.k*scale, max floored at -1e30, "
   "out = sum p k / (sum p + exp(sink - max)), rounded once; a row with no key is zero." },

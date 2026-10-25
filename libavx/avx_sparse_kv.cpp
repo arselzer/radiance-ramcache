@@ -215,11 +215,11 @@ void widen_flat(const RadTensor& t, int64_t off, int64_t n, float* dst) {
  * attn_sparse_sink, the same keys): each row's keys are found and widened once, then per head the
  * scores are vector dots, p = exp(s - max) as libref (expf), and the output a vector sum of p k. */
 AVX_KERNEL(attn_sparse_sink) {
-    if (!a || a->n_t < 10 || !a->t) return RAD_E_INVAL;
-    const RadTensor &q = a->t[0], &wc = a->t[1], &wbt = a->t[2];
-    const RadTensor *cc = a->t[3].data ? &a->t[3] : nullptr, *cbt = a->t[4].data ? &a->t[4] : nullptr;
-    const RadTensor* sel = a->t[5].data ? &a->t[5] : nullptr;
-    const RadTensor &pos = a->t[6], &cu = a->t[7], &sink = a->t[8], &out = a->t[9];
+    if (!a || a->n_t < 11 || !a->t) return RAD_E_INVAL;
+    const RadTensor &q = a->t[0], &wc = a->t[1], &wbt = a->t[2], &wused = a->t[3];
+    const RadTensor *cc = a->t[4].data ? &a->t[4] : nullptr, *cbt = a->t[5].data ? &a->t[5] : nullptr;
+    const RadTensor* sel = a->t[6].data ? &a->t[6] : nullptr;
+    const RadTensor &pos = a->t[7], &cu = a->t[8], &sink = a->t[9], &out = a->t[10];
     const int64_t H = p_int(a, "heads", 0), D = p_int(a, "dim", 0), win = p_int(a, "window", 0);
     const int64_t ratio = p_int(a, "ratio", 0), topk = p_int(a, "topk", 0);
     const float scale = p_f32(a, "scale", 0.0f);
@@ -227,11 +227,11 @@ AVX_KERNEL(attn_sparse_sink) {
     if (H < 1 || D < 2 || D > 4096 || win < 1 || ratio < 0 || topk < 0 || !std::isfinite(scale) ||
         scale <= 0 || (comp && (!cc || !cbt || !sel || topk < 1 || D % ratio)))
         return RAD_E_SHAPE;
-    if (!q.data || !wc.data || !wbt.data || !pos.data || !cu.data || !sink.data || !out.data ||
-        q.rank != 2 || q.shape[0] < 1 || q.shape[1] != H * D || out.rank != 2 ||
+    if (!q.data || !wc.data || !wbt.data || !wused.data || !pos.data || !cu.data || !sink.data ||
+        !out.data || q.rank != 2 || q.shape[0] < 1 || q.shape[1] != H * D || out.rank != 2 ||
         out.shape[0] != q.shape[0] || out.shape[1] != H * D || wc.rank != 4 || wc.shape[1] != 1 ||
         wc.shape[3] != D || wbt.rank != 2 || numel(&pos) != q.shape[0] || numel(&sink) != H ||
-        sink.dtype != RAD_F32 || numel(&cu) < 2)
+        sink.dtype != RAD_F32 || numel(&cu) < 2 || numel(&wused) < numel(&cu) - 1)
         return RAD_E_SHAPE;
     const int64_t cbs = comp ? cc->shape[2] : 0;
     if (comp && (cc->rank != 4 || cc->shape[1] != 1 || cc->shape[3] * ratio != D || cbs % ratio ||
@@ -245,6 +245,8 @@ AVX_KERNEL(attn_sparse_sink) {
     for (int64_t m = 0; m < M; ++m) {
         const int64_t s = seq_of_row(cu, S, m);
         const int64_t p = ldi(&pos, offlin(&pos, m));
+        const int64_t last = ldi(&pos, offlin(&pos, ldi(&cu, offlin(&cu, s + 1)) - 1));
+        const int64_t first = last + 1 - ldi(&wused, offlin(&wused, s));
         /* The row's keys widened, in libref's key order (the window, then the selection); a slot
          * with no key is left out, as every one of libref's sums skips it. */
         float* buf = scratch_f32((size_t)(nkeys * D + 2 * D + nkeys + 16));
@@ -254,11 +256,11 @@ AVX_KERNEL(attn_sparse_sink) {
         float* sc = acc + D;
         int64_t nk = 0;
         for (int64_t i = 0; i < win; ++i) {
-            const int64_t j = p - win + 1 + i;
-            if (j < 0 || j / bs >= wbt.shape[1]) continue;
-            const int64_t blk = ldi(&wbt, rowoff(&wbt, s, wbt.shape[1]) + (j / bs) * laststride(&wbt));
+            const int64_t j = p - win + 1 + i, r = j - first;
+            if (j < 0 || r < 0 || r / bs >= wbt.shape[1]) continue;
+            const int64_t blk = ldi(&wbt, rowoff(&wbt, s, wbt.shape[1]) + (r / bs) * laststride(&wbt));
             if (blk < 0 || blk >= wc.shape[0]) continue;
-            widen_flat(wc, ((blk * bs) + j % bs) * D, D, keys + nk * D);
+            widen_flat(wc, ((blk * bs) + r % bs) * D, D, keys + nk * D);
             ++nk;
         }
         for (int64_t t = 0; comp && t < topk; ++t) {

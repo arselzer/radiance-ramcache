@@ -524,7 +524,10 @@ TEST(softmax_pool_weights_each_channel_by_its_own_softmax) {
 /* attn_sparse_sink against keys listed by hand: row 0 (position 4, window 3) reads window slots
  * 4, 5 (block 1 -> 2) and 2 (block 2 -> 1) plus compressed entries 0 (block 2) and 2 (block 0);
  * row 1 (position 1) reads window slots 6, 7 (block 0 -> 3), skips position -1, skips the -1
- * selection and entry 1, whose block is unmapped. The sink joins only the denominator. */
+ * selection and entry 1, whose block is unmapped. The sink joins only the denominator. Then the
+ * window table rebased at position 2 (a window group that dropped its first block): row 0 reads
+ * positions 2, 3 in table block 0 (-> 3) and 4 in table block 1 (-> 2); row 1's positions all lie
+ * before the table, so with no compressed key either its row is zero. */
 TEST(attn_sparse_sink_reads_the_window_and_the_selected_entries) {
     const int64_t D = 4, H = 2;
     T q(RAD_F32, {2, H * D}), wc(RAD_F32, {4, 1, 2, D}), cc(RAD_F32, {3, 1, 2, D / 2});
@@ -536,42 +539,52 @@ TEST(attn_sparse_sink_reads_the_window_and_the_selected_entries) {
     T sel(RAD_I32, {2, 2}); sel.n({0, 2, -1, 1});
     T pos(RAD_I32, {2}); pos.n({4, 1});
     T cu(RAD_I32, {2}); cu.n({0, 2});
+    T used(RAD_I32, {1}); used.n({2});          /* last row at position 1 holds 2: first = 0 */
     T sink(RAD_F32, {H}); sink.f({0.3f, -0.5f});
     T out(RAD_F32, {2, H * D});
-    A a; a.t(q).t(wc).t(wbt).t(cc).t(cbt).t(sel).t(pos).t(cu).t(sink).t(out).i("M", 2).i("heads", H)
+    A a; a.t(q).t(wc).t(wbt).t(used).t(cc).t(cbt).t(sel).t(pos).t(cu).t(sink).t(out).i("M", 2).i("heads", H)
         .i("dim", D).i("window", 3).i("ratio", 2).i("topk", 2).d("scale", 0.5).s("dtype", "f32");
     REQUIRE_EQ(run("attn_sparse_sink", a), RAD_OK);
     struct Key { const T* t; int64_t off; };
-    const std::vector<std::vector<Key>> keys = {
-        {{&wc, 16}, {&wc, 20}, {&wc, 8}, {&cc, 8}, {&cc, 0}},
-        {{&wc, 24}, {&wc, 28}},
+    auto expect = [&](const std::vector<std::vector<Key>>& keys) {
+        for (int64_t m = 0; m < 2; ++m)
+            for (int64_t h = 0; h < H; ++h) {
+                if (keys[(size_t)m].empty()) {
+                    for (int64_t d = 0; d < D; ++d) CHECK_EQ(out.at(m * H * D + h * D + d), 0.0f);
+                    continue;
+                }
+                std::vector<double> sc;
+                double mx = -1e30;
+                for (const Key& k : keys[(size_t)m]) {
+                    double dot = 0;
+                    for (int64_t d = 0; d < D; ++d) dot += (double)q.at(m * H * D + h * D + d) * k.t->at(k.off + d);
+                    sc.push_back(dot * 0.5);
+                    mx = std::max(mx, sc.back());
+                }
+                double den = std::exp((double)sink.at(h) - mx);
+                std::vector<double> acc((size_t)D, 0.0);
+                for (size_t i = 0; i < sc.size(); ++i) {
+                    const double pk = std::exp(sc[i] - mx);
+                    den += pk;
+                    for (int64_t d = 0; d < D; ++d) acc[(size_t)d] += pk * keys[(size_t)m][i].t->at(keys[(size_t)m][i].off + d);
+                }
+                for (int64_t d = 0; d < D; ++d)
+                    CHECK(std::fabs(out.at(m * H * D + h * D + d) - acc[(size_t)d] / den) < 1e-5);
+            }
     };
-    for (int64_t m = 0; m < 2; ++m)
-        for (int64_t h = 0; h < H; ++h) {
-            std::vector<double> sc;
-            double mx = -1e30;
-            for (const Key& k : keys[(size_t)m]) {
-                double dot = 0;
-                for (int64_t d = 0; d < D; ++d) dot += (double)q.at(m * H * D + h * D + d) * k.t->at(k.off + d);
-                sc.push_back(dot * 0.5);
-                mx = std::max(mx, sc.back());
-            }
-            double den = std::exp((double)sink.at(h) - mx);
-            std::vector<double> acc((size_t)D, 0.0);
-            for (size_t i = 0; i < sc.size(); ++i) {
-                const double pk = std::exp(sc[i] - mx);
-                den += pk;
-                for (int64_t d = 0; d < D; ++d) acc[(size_t)d] += pk * keys[(size_t)m][i].t->at(keys[(size_t)m][i].off + d);
-            }
-            for (int64_t d = 0; d < D; ++d)
-                CHECK(std::fabs(out.at(m * H * D + h * D + d) - acc[(size_t)d] / den) < 1e-5);
-        }
+    expect({ {{&wc, 16}, {&wc, 20}, {&wc, 8}, {&cc, 8}, {&cc, 0}}, {{&wc, 24}, {&wc, 28}} });
+    /* Rebased at 2: the last row (position 1) holds nothing of the table, used = 0. */
+    T used2(RAD_I32, {1}); used2.n({0});
+    A r; r.t(q).t(wc).t(wbt).t(used2).t(cc).t(cbt).t(sel).t(pos).t(cu).t(sink).t(out).i("M", 2).i("heads", H)
+        .i("dim", D).i("window", 3).i("ratio", 2).i("topk", 2).d("scale", 0.5).s("dtype", "f32");
+    REQUIRE_EQ(run("attn_sparse_sink", r), RAD_OK);
+    expect({ {{&wc, 24}, {&wc, 28}, {&wc, 16}, {&cc, 8}, {&cc, 0}}, {} });
     /* Window only (ratio 0): the compressed operands may be absent. */
-    A w; w.t(q).t(wc).t(wbt).tnull().tnull().tnull().t(pos).t(cu).t(sink).t(out).i("M", 2).i("heads", H)
+    A w; w.t(q).t(wc).t(wbt).t(used).tnull().tnull().tnull().t(pos).t(cu).t(sink).t(out).i("M", 2).i("heads", H)
         .i("dim", D).i("window", 3).i("ratio", 0).i("topk", 0).d("scale", 0.5).s("dtype", "f32");
     REQUIRE_EQ(run("attn_sparse_sink", w), RAD_OK);
     /* A compressed entry wider than the cache's block is refused. */
-    A b; b.t(q).t(wc).t(wbt).t(cc).t(cbt).t(sel).t(pos).t(cu).t(sink).t(out).i("M", 2).i("heads", H)
+    A b; b.t(q).t(wc).t(wbt).t(used).t(cc).t(cbt).t(sel).t(pos).t(cu).t(sink).t(out).i("M", 2).i("heads", H)
         .i("dim", D).i("window", 3).i("ratio", 4).i("topk", 2).d("scale", 0.5).s("dtype", "f32");
     CHECK_EQ(run("attn_sparse_sink", b), RAD_E_SHAPE);
 }

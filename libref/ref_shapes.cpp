@@ -1657,6 +1657,7 @@ int ref_attn_sparse_sink_shape(const RadParam* p, int n_p, int operand, RadOpdDe
     o.t(D, { M, H * Dm });                              /* q */
     o.t(D, { nb, 1, bs, Dm });                          /* window cache */
     o.t_idx({ 1, nb }, nb, -1, 0);                      /* window block table */
+    o.t_idx({ 1 }, M + 1, -1, 0);                       /* window tokens held from the table's start */
     if (ratio > 0) {
         o.t(D, { ncb, 1, ratio, Dm / ratio });          /* compressed cache: an entry a block */
         o.t_idx({ 1, ncb }, ncb, -1, 0);                /* compressed block table */

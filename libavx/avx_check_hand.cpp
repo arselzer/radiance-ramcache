@@ -4853,6 +4853,30 @@ void ds41_cases(std::vector<Hand>& hs) {
          .refuses(RAD_E_INVAL);
         hs.push_back(std::move(h));
     }
+    {
+        /* Two sequences, the second's window partly evicted (window_used short of its length),
+         * absent selections (-1) and a selection past the compressed table. */
+        const int64_t M = 6, H = 2, Dm = 16, win = 4, ratio = 4, topk = 3, bs = 2, nb = 6, ncb = 4;
+        Hand h("two sequences, a short window, absent and out-of-table selections",
+               "attn_sparse_sink", 1e-4);
+        h.dense(RAD_F32, { M, H * Dm }, hfill(71))
+         .dense(RAD_F32, { nb, 1, bs, Dm }, hfill(72))
+         .dense(RAD_I32, { 2, 3 }, [](int64_t i) { const float t[6] = { 0, 1, 2, 3, 5, -1 }; return t[i]; })
+         .idx({ 3, 2 })
+         .dense(RAD_F32, { ncb, 1, ratio, Dm / ratio }, hfill(73))
+         .dense(RAD_I32, { 2, 2 }, [](int64_t i) { const float t[4] = { 1, 0, 3, 2 }; return t[i]; })
+         .dense(RAD_I32, { M, topk }, [](int64_t i) { const float t[18] = { 0, 1, -1, 1, 0, 7,
+                                                                         -1, -1, -1, 0, 1, 2,
+                                                                         1, -1, 0, 3, 2, 1 };
+                                                     return t[i]; })
+         .idx({ 0, 1, 2, 0, 1, 2 })
+         .idx({ 0, 3, 6 })
+         .dense(RAD_F32, { H }, hfill(74))
+         .dense(RAD_F32, { M, H * Dm }, hfill(75), true)
+         .pi("M", M).pi("heads", H).pi("dim", Dm).pi("window", win).pi("ratio", ratio)
+         .pi("topk", topk).pf("scale", 0.25).ps("dtype", "f32");
+        hs.push_back(std::move(h));
+    }
 }
 
 }  // namespace

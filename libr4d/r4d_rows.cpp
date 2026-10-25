@@ -2857,7 +2857,19 @@ static const RadOperandSpec oQuantCols[] = {
     { "x", RAD_OPD_IN, 0 }, { "y", RAD_OPD_OUT, 0 }, { "scale", RAD_OPD_OUT, 0 },
 };
 
+/* DeepSeek-V4.1's ops (r4d_ds41_*.inc): parameter and operand specs, constraints. */
+#define R4D_DS41_SPECS
+#include "r4d_ds41_elem.inc"
+#include "r4d_ds41_sparse.inc"
+#include "r4d_ds41_ggml.inc"
+#undef R4D_DS41_SPECS
+
 static const RadOpSchema kSchemas[] = {
+#define R4D_DS41_SCHEMAS
+#include "r4d_ds41_elem.inc"
+#include "r4d_ds41_sparse.inc"
+#include "r4d_ds41_ggml.inc"
+#undef R4D_DS41_SCHEMAS
     SCHEMA("rmsnorm", pRmsNorm, oRmsNorm,
            "y = x * rsqrt(mean(x^2) + eps) * (w + wadd). `wadd` is GemmaRMSNorm's `1 +`, added in "
            "f32 after the load because forming it in bf16 first costs 0.3% per channel."),
@@ -5417,6 +5429,11 @@ static const RadConstraint cVsa[] = {
 static const RadConstraint cQuantCols[] = { C_DIV("n", 8), C_IN("dtype", "bf16") };
 
 static const RadKernelInfo kKernels[] = {
+#define R4D_DS41_ROWS
+#include "r4d_ds41_elem.inc"
+#include "r4d_ds41_sparse.inc"
+#include "r4d_ds41_ggml.inc"
+#undef R4D_DS41_ROWS
 /* ---------------------------------- the small model ops (r4d_model_bf16.hip) ----------------
  *
  * The ops between the larger kernels. They need device rows because the engine's buffers live in

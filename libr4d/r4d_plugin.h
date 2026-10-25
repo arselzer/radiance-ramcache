@@ -960,6 +960,11 @@ int r4d_fuse_ar_rmsnorm_quant_fp8(const RadParam*, int, uint64_t, int, RadFuseSt
 int r4d_fuse_ar_gather_hc_write  (const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_attn_paged_gate_quant(const RadParam*, int, uint64_t, int, RadFuseStep*);
 
+/* DeepSeek-V4.1's ops: launches (r4d_ds41_<group>.hip) and shapes (r4d_ds41_<group>_shapes.inc). */
+#include "r4d_ds41_elem.h"
+#include "r4d_ds41_sparse.h"
+#include "r4d_ds41_ggml.h"
+
 }  /* extern "C" */
 
 #endif /* RAD_R4D_PLUGIN_H */

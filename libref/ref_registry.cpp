@@ -464,6 +464,9 @@ static const RadOperandSpec oTokenMap[] = { OPD("ids"), WGT("table"), OUT("mappe
 static const RadParamSpec pStreamGate[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_F64("eps"),
     P_F64("gate_eps"), P_STR("dtype") };
 static const RadOperandSpec oStreamGate[] = { OPD("h"), OPD("k"), OPD("v"), WGT("w"), OUT("out") };
+static const RadParamSpec pGemmGgml[] = { P_INT("M"), P_INT("N"), P_INT("K"), P_STR("type"),
+    P_STR("dtype") };
+static const RadOperandSpec oGemmGgml[] = { OPD("a"), WGT("w"), OUT("y") };
 static const RadParamSpec pEntryStore[] = { P_INT("M"), P_INT("n"), P_INT("block_size"), P_STR("dtype") };
 static const RadOperandSpec oEntryStore[] = { OPD("x"), OPD("page"), INOUT("cache") };
 static const RadParamSpec pIndexTopk[] = { P_INT("M"), P_INT("width"), P_INT("topk"), P_INT("ratio") };
@@ -1481,6 +1484,10 @@ static const RadOpSchema kSchemas[] = {
 { "index_topk", ARR(pIndexTopk), ARR(oIndexTopk),
   "The topk highest-scoring passed positions (j < (pos+1)/ratio), inside keep when given, "
   "never -inf, ties to the lower position, in ascending order, then -1." },
+{ "gemm_nt_ggml", ARR(pGemmGgml), ARR(oGemmGgml),
+  "y = a . w^T with w llama.cpp's own blocks of GGUF type `type` (\"iq1_s\", \"q6_K\", ...), "
+  "relayouted from the type's planes at load: each row dequantised as llama.cpp does, f32 dot in "
+  "index order, rounded once to dtype. A float [N, K] w is the logical form." },
 { "entry_store", ARR(pEntryStore), ARR(oEntryStore),
   "x[w] (n values) into the whole of block page[w] of a paged cache [blocks, heads, block_size, "
   "slot], heads*block_size*slot == n, rounded once to the cache dtype; a negative page writes "
@@ -2121,6 +2128,22 @@ static int ref_check_dtypes(const char* op, const RadArgs* a) {
       },                                                                                         \
       nullptr, ref_moe_cb_layout, ref_moe_cb_relayout, fn##_shape, ref_moe_cb_unrelayout }
 
+#ifdef REF_HAVE_GGML
+extern "C" int ref_ggml_layout(const RadParam*, int, int, const RadEncoding*, const int*,
+                               const RadTensor*, int, RadLayout*);
+extern "C" int ref_ggml_relayout(const RadParam*, int, int, const RadEncoding*, const int*,
+                                 const RadTensor*, int, void*, int64_t);
+extern "C" int ref_ggml_unrelayout(const RadParam*, int, int, const RadEncoding*, const int*,
+                                   const void*, int64_t, const RadTensor*, int);
+/* A GEMM over llama.cpp's native blocks (ref_ggml.cpp): the hooks relayout the type's planes into
+ * its blocks, and the kernel checks its own operands (the weight is u8 blocks or a float logical
+ * form, which the generic dtype check does not describe). */
+#define ROW_GGML(nm, opname, fam, what, dts, fn)                                                 \
+    { nm, opname, fam, what, SHAPE_ANY, dts, RAD_DOMAIN_HOST, 0,                                 \
+      nullptr, 0, nullptr, 0, nullptr, nullptr, nullptr, fn,                                     \
+      nullptr, ref_ggml_layout, ref_ggml_relayout, fn##_shape, ref_ggml_unrelayout }
+#endif
+
 /* gemm_nt_q's zero-point grids read their codes as `b`: u2, u4 or u5, which ld_dt does not read
  * and every other op refuses. The grid's own path reads them (ref_gemm.cpp: gemm_zp), so they pass
  * the check there and only there. */
@@ -2420,6 +2443,9 @@ SIMPLE("ref_quant_roundtrip", "quant_roundtrip", "quant", "block-scaled fp8/fp4 
 SIMPLE("ref_softmax_pool", "softmax_pool", "attn", "channel-wise softmax pooling of ratio rows", DT_FLOAT, ref_softmax_pool),
 SIMPLE("ref_token_map", "token_map", "embed", "ids through an id table", DT_ANY, ref_token_map),
 SIMPLE("ref_stream_gate_add", "stream_gate_add", "norm", "normalized-dot gated write into hc streams", DT_FLOAT, ref_stream_gate_add),
+#ifdef REF_HAVE_GGML
+ROW_GGML("ref_gemm_nt_ggml", "gemm_nt_ggml", "gemm", "llama.cpp native-block linear", DT_FLOAT, ref_gemm_nt_ggml),
+#endif
 SIMPLE("ref_entry_store", "entry_store", "attn", "one entry a block into a paged cache", DT_FLOAT, ref_entry_store),
 SIMPLE("ref_index_score", "index_score", "attn", "indexer relu-gated head scores over a paged index cache", DT_FLOAT, ref_index_score),
 SIMPLE("ref_index_candidates", "index_candidates", "attn", "two-level top-k: kept candidate blocks", DT_ANY, ref_index_candidates),

@@ -89,6 +89,7 @@ int         avx_par_force(int threads);
     X(index_score)          X(index_candidates)     X(index_topk)                                 \
     X(entry_store)                                                                                \
     X(token_map)            X(stream_gate_add)                                                    \
+    X(gemm_nt_ggml)                                                                               \
     X(add)                  X(grid_embed)           X(grid_embed_aa)        X(causal_conv1d)      \
     X(mul)                  X(silu_mul)             X(gelu_mul)             X(gelu)               \
     X(silu)                 X(sigmoid)              X(logit_softcap)        X(gather_rows)        \

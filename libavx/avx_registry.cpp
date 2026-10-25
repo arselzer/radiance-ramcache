@@ -399,6 +399,9 @@ static const RadOperandSpec oTokenMap[] = { OPD("ids"), WGT("table"), OUT("mappe
 static const RadParamSpec pStreamGate[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_F64("eps"),
     P_F64("gate_eps"), P_STR("dtype") };
 static const RadOperandSpec oStreamGate[] = { OPD("h"), OPD("k"), OPD("v"), WGT("w"), OUT("out") };
+static const RadParamSpec pGemmGgml[] = { P_INT("M"), P_INT("N"), P_INT("K"), P_STR("type"),
+    P_STR("dtype") };
+static const RadOperandSpec oGemmGgml[] = { OPD("a"), WGT("w"), OUT("y") };
 
 /* QSA's compressed key, libr4d's schema (libr4d/r4d_rows.cpp): `block_size` is `ratio` under the
  * name the block-key store's KV group uses; `page` and `pos` are optional. */
@@ -1124,6 +1127,8 @@ static const RadOpSchema kSchemas[] = {
   "mapped[m] = table[ids[m]], -1 for an id outside [0, n_vocab)." },
 { "stream_gate_add", ARR(pStreamGate), ARR(oStreamGate),
   "a normalised-dot sigmoid gate per row and stream, out = h + gate v." },
+{ "gemm_nt_ggml", ARR(pGemmGgml), ARR(oGemmGgml),
+  "y = a . w^T with w llama.cpp's own blocks of GGUF type `type`, or the float [N, K] form." },
 { "qsa_block_key", ARR(pQsaBlockKey), ARR(oQsaBlockKey),
   "QSA's compressed key: the mean of a block's `ratio` rows rounded to k's dtype, RMS-normed with "
   "gain (wadd + w), rotated at the block's position with `rope`'s ladder and YaRN; libref's "
@@ -1503,6 +1508,116 @@ static int avx_moe_cb_unrelayout(const RadParam* p, int n_p, int operand, const 
       avxp::avx_relayout_planes<avxp::lay>, nullptr, avxp::avx_unrelayout_planes<avxp::lay>,     \
       nullptr }
 
+/* ---- the GEMMs over llama.cpp's native blocks (avx_ggml.cpp): libref's hooks, restated
+ *
+ * The layout hook asks for all of a GGUF type's planes and relayouts them into the type's native
+ * blocks with libquant's pack_of, [N, K / block * block_bytes] bytes; the unrelayout unpacks them.
+ * The selection accepted, the tag and the bytes are libref's (libref/ref_ggml.cpp), so both
+ * libraries store one form under one tag. */
+#ifdef AVX_HAVE_GGML
+#include "lq_ggml_dequant.h"
+#include "lq_ggml_planes.h"
+
+static const lq::ggml::PlaneKind* ggml_kind_named(const char* s) {
+    if (!s) return nullptr;
+    for (uint32_t t = 0; t < 64; ++t) {
+        const lq::ggml::PlaneKind* k = lq::ggml::plane_kind(t);
+        if (k && !std::strcmp(k->name, s) && lq::ggml::pack_of(t) && lq::ggml::dequant_of(t)) return k;
+    }
+    return nullptr;
+}
+static int64_t ggml_pint(const RadParam* p, int n_p, const char* key) {
+    const RadParam* q = rad_param_find(p, n_p, key);
+    if (!q) return 0;
+    if (q->kind == RAD_P_RANGE) return (int64_t)q->ihi;
+    return q->kind == RAD_P_INT ? (int64_t)q->ival : 0;
+}
+/* The values a weight row holds: `K`. */
+static int64_t ggml_row_len(const RadParam* p, int n_p) { return ggml_pint(p, n_p, "K"); }
+static int ggml_check(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
+                      const int* sel, int n_planes, const lq::ggml::PlaneKind** out) {
+    const RadParam* t = rad_param_find(p, n_p, "type");
+    const lq::ggml::PlaneKind* k = ggml_kind_named(t && t->kind == RAD_P_STR ? t->sval : nullptr);
+    if (operand != 1 || !k || !enc || !sel) return RAD_E_DTYPE;
+    const RadEncoding want = lq::ggml::encoding_of(k->type);
+    if (!rad_enc_equal(enc, &want) || n_planes != want.n_planes) return RAD_E_DTYPE;
+    for (int i = 0; i < n_planes; ++i)
+        if (sel[i] != i) return RAD_E_SHAPE;
+    *out = k;
+    return RAD_OK;
+}
+/* Plane i's row r, or null for a TABLE or per-tensor plane (pack and unpack do not touch those). */
+static uint8_t* ggml_plane_row(const RadEncoding* enc, const RadTensor* planes, int i, int64_t r) {
+    const RadEncPlane& pl = enc->plane[i];
+    if (pl.kind == RAD_PLANE_TABLE || (pl.block[0] == 0 && pl.block[1] == 0)) return nullptr;
+    const int64_t cols = planes[i].rank >= 2 ? planes[i].shape[1] : 0;
+    return (uint8_t*)planes[i].data + r * rad_enc_row_bytes(pl.dtype, cols);
+}
+static int avx_ggml_layout(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
+                           const int* sel, const RadTensor* planes, int n_planes, RadLayout* out) {
+    if (n_planes <= 1) return RAD_E_UNSUPPORTED;
+    const lq::ggml::PlaneKind* k = nullptr;
+    const int rc = ggml_check(p, n_p, operand, enc, sel, n_planes, &k);
+    if (rc < 0) return rc;
+    const int64_t K = ggml_row_len(p, n_p), rows = planes[0].rank >= 1 ? planes[0].shape[0] : 0;
+    if (K <= 0 || K % k->block || rows <= 0) return RAD_E_SHAPE;
+    static thread_local char tag[32];
+    snprintf(tag, sizeof tag, "ggml_%s", k->name);
+    std::memset(out, 0, sizeof *out);
+    out->tag = tag;
+    out->dtype = RAD_U8;
+    out->rank = 2;
+    out->shape[0] = rows;
+    out->shape[1] = K / k->block * (int64_t)k->block_bytes;
+    out->align = 64;
+    out->bytes = out->shape[0] * out->shape[1];
+    return RAD_OK;
+}
+static int avx_ggml_relayout(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
+                             const int* sel, const RadTensor* planes, int n_planes, void* dst,
+                             int64_t dst_bytes) {
+    if (n_planes <= 1) return RAD_E_UNSUPPORTED;
+    const lq::ggml::PlaneKind* k = nullptr;
+    const int rc = ggml_check(p, n_p, operand, enc, sel, n_planes, &k);
+    if (rc < 0) return rc;
+    const int64_t K = ggml_row_len(p, n_p), rows = planes[0].rank >= 1 ? planes[0].shape[0] : 0;
+    const int64_t nb = K / k->block, rb = nb * (int64_t)k->block_bytes;
+    if (K <= 0 || K % k->block || rows <= 0 || dst_bytes < rows * rb) return RAD_E_SHAPE;
+    const lq::ggml::PackFn pack = lq::ggml::pack_of(k->type);
+    const uint8_t* row[RAD_ENC_MAX_PLANES];
+    for (int64_t r = 0; r < rows; ++r) {
+        for (int i = 0; i < n_planes; ++i) row[i] = ggml_plane_row(enc, planes, i, r);
+        pack(row, nb, (uint8_t*)dst + r * rb);
+    }
+    return RAD_OK;
+}
+static int avx_ggml_unrelayout(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
+                               const int* sel, const void* src, int64_t src_bytes,
+                               const RadTensor* planes, int n_planes) {
+    if (n_planes <= 1) return RAD_E_UNSUPPORTED;
+    const lq::ggml::PlaneKind* k = nullptr;
+    const int rc = ggml_check(p, n_p, operand, enc, sel, n_planes, &k);
+    if (rc < 0) return rc;
+    const int64_t K = ggml_row_len(p, n_p), rows = planes[0].rank >= 1 ? planes[0].shape[0] : 0;
+    const int64_t nb = K / k->block, rb = nb * (int64_t)k->block_bytes;
+    if (K <= 0 || K % k->block || rows <= 0 || src_bytes < rows * rb) return RAD_E_SHAPE;
+    uint8_t* row[RAD_ENC_MAX_PLANES];
+    void* all[RAD_ENC_MAX_PLANES];
+    for (int i = 0; i < n_planes; ++i) all[i] = planes[i].data;
+    for (int64_t r = 0; r < rows; ++r) {
+        for (int i = 0; i < n_planes; ++i) row[i] = ggml_plane_row(enc, planes, i, r);
+        k->unpack((const uint8_t*)src + r * rb, nb, row);
+    }
+    lq::ggml::write_shared(k->type, *enc, all);
+    return RAD_OK;
+}
+/* The kernel checks its own operands: the weight is u8 blocks or a float logical form. */
+#define ROW_GGML(nm, opname, fam, what, dts, fn)                                                  \
+    { nm, opname, fam, what, SHAPE_ANY, dts, RAD_DOMAIN_HOST, 0,                                  \
+      nullptr, 0, nullptr, 0, nullptr, nullptr, nullptr, fn, nullptr, avx_ggml_layout,            \
+      avx_ggml_relayout, nullptr, avx_ggml_unrelayout, nullptr }
+#endif
+
 #define DT_FLOAT "bf16 f16 f32 fp8_e4m3 fp8_e5m2 i8 i32, chosen per operand from its own dtype"
 #define DT_ANY   "any dtype rad_types.h names, per operand"
 #define DT_FLOAT_CB DT_FLOAT "; or u4 / u5 codes into an f32 table, joined (w4nl* / w5nl*)"
@@ -1732,6 +1847,10 @@ SIMPLE("avx_entry_store", "entry_store", "attn", "one entry a block into a paged
 SIMPLE("avx_token_map", "token_map", "embed", "ids through an id table", DT_ANY, L(token_map)),
 SIMPLE("avx_stream_gate_add", "stream_gate_add", "norm", "normalized-dot gated write into hc streams",
        DT_FLOAT, L(stream_gate_add)),
+#ifdef AVX_HAVE_GGML
+ROW_GGML("avx_gemm_nt_ggml", "gemm_nt_ggml", "gemm", "llama.cpp native-block linear", DT_FLOAT,
+         L(gemm_nt_ggml)),
+#endif  /* AVX_HAVE_GGML: the native-block rows */
 SIMPLE("avx_qsa_block_key", "qsa_block_key", "attn",
        "QSA compressed key: pooled, normed and rotated at the block's position", DT_FLOAT,
        L(qsa_block_key)),

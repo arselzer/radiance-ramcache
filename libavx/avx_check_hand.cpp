@@ -4797,9 +4797,55 @@ void audio_cases(std::vector<Hand>& hs) {
 
 /* ================================================================== DeepSeek-V4.1
  *
- * The ops' descriptions draw what the model hands them, but not the optional operands and the
- * negative ids that skip a row. */
+ * The ops' descriptions draw what the model hands them, but not llama.cpp's native blocks (the
+ * weight is described in its float logical form), nor the optional operands and the negative ids
+ * that skip a row. */
 void ds41_cases(std::vector<Hand>& hs) {
+    /* ---- the GEMMs and the lookup over native blocks ------------------------------------ */
+    /* Random blocks, each f16 scale set to a finite value near 1, so every dequantised value is a
+     * number of the size the type stores. The offsets are the types' llama.cpp block layouts
+     * (libquant/lq_ggml_port.h). */
+    struct Ty { const char* name; int64_t block, bytes; std::vector<int64_t> f16_at; };
+    const Ty types[] = {
+        { "q8_0",    32,  34,  { 0 } },
+        { "q5_K",    256, 176, { 0, 2 } },
+        { "q6_K",    256, 210, { 208 } },
+        { "iq4_nl",  32,  18,  { 0 } },
+        { "iq2_xxs", 256, 66,  { 0 } },
+        { "iq1_s",   256, 50,  { 0 } },
+    };
+    uint64_t seed = 0x2545F4914F6CDD1Dull;
+    auto rnd = [&]() { seed = seed * 6364136223846793005ull + 1442695040888963407ull; return seed >> 33; };
+    auto blocks = [&](const Ty& ty, int64_t rows, int64_t K) {
+        const int64_t nb = K / ty.block;
+        std::vector<uint8_t> b((size_t)(rows * nb * ty.bytes));
+        for (uint8_t& v : b) v = (uint8_t)rnd();
+        for (int64_t i = 0; i < rows * nb; ++i) {
+            for (int64_t off : ty.f16_at) {
+                const uint16_t h = (uint16_t)((rnd() & 0x8000u) | ((8u + rnd() % 8u) << 10) | (rnd() & 0x3FFu));
+                std::memcpy(b.data() + i * ty.bytes + off, &h, 2);
+            }
+        }
+        return b;
+    };
+    for (const Ty& ty : types) {
+        for (const char* dt : { "f32", "bf16" }) {
+            const uint32_t D = std::strcmp(dt, "f32") ? RAD_BF16 : RAD_F32;
+            const double tol = D == RAD_F32 ? 2e-5 : 8e-3;
+            const int64_t K = 2 * ty.block, N = 37, M = 5, rb = K / ty.block * ty.bytes;
+            {
+                const std::vector<uint8_t> w = blocks(ty, N, K);
+                std::string nm = std::string("native ") + ty.name + " blocks, " + dt;
+                Hand h(nm.c_str(), "gemm_nt_ggml", tol);
+                h.dense(D, { M, K }, hfill(51))
+                 .raw(RAD_U8, { N, rb }, w.data())
+                 .dense(D, { M, N }, hfill(52), true)
+                 .pi("M", M).pi("N", N).pi("K", K).ps("type", ty.name).ps("dtype", dt);
+                hs.push_back(std::move(h));
+            }
+        }
+    }
+
     /* ---- the selections' optional operands and skipped rows ------------------------------ */
     {
         /* keep from index_candidates' shape: two blocks of four kept a row, one row keeping none

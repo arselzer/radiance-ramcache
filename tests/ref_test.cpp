@@ -11,6 +11,10 @@
  * The plugin is reached through RadKernelInfo::launch with a hand-built RadArgs, as the engine
  * reaches it, so the operand order and parameter names in libref/ref_registry.cpp are tested too.
  */
+#include "../libquant/lq_ggml_dequant.h"
+#include "../libquant/lq_ggml_planes.h"
+#include "../libquant/lq_ggml_port.h"
+#include <cstddef>
 #include "rad_test.h"
 #include "rad_abi.h"
 #include "../libref/ref_common.h"
@@ -699,6 +703,59 @@ TEST(token_map_and_stream_gate_add) {
         }
 }
 
+/* gemm_nt_ggml over native blocks of every type it reads: each weight row dequantised as
+ * llama.cpp's dequantize_row_<type> does, dotted in f32 in index order, so the product equals a
+ * dot over those dequantised values bit for bit -- and the logical f32 form of the same weight
+ * gives the same bits. Random blocks, each f16 super-scale set finite. */
+TEST(gemm_nt_ggml_reads_native_blocks_as_llama_cpp_dequantises) {
+    struct Ty { const char* name; uint32_t type; std::vector<size_t> f16_at; };
+    const Ty types[] = {
+        { "q8_0",    8,  { offsetof(lq::ggml::block_q8_0, d) } },
+        { "q5_K",    13, { offsetof(lq::ggml::block_q5_K, d), offsetof(lq::ggml::block_q5_K, dmin) } },
+        { "q6_K",    14, { offsetof(lq::ggml::block_q6_K, d) } },
+        { "iq4_nl",  20, { offsetof(lq::ggml::block_iq4_nl, d) } },
+        { "iq2_xxs", 16, { offsetof(lq::ggml::block_iq2_xxs, d) } },
+        { "iq1_s",   19, { offsetof(lq::ggml::block_iq1_s, d) } },
+    };
+    uint64_t seed = 0x2545F4914F6CDD1Dull;
+    auto rnd = [&]() { seed = seed * 6364136223846793005ull + 1442695040888963407ull; return seed >> 33; };
+    for (const Ty& ty : types) {
+        const lq::ggml::PlaneKind* k = lq::ggml::plane_kind(ty.type);
+        REQUIRE(k != nullptr);
+        const int64_t M = 3, N = 4, K = 2 * k->block, nb = K / k->block;
+        const int64_t rb = nb * (int64_t)k->block_bytes;
+        std::vector<uint8_t> blocks((size_t)(N * rb));
+        for (uint8_t& b : blocks) b = (uint8_t)rnd();
+        for (int64_t i = 0; i < N * nb; ++i)
+            for (size_t off : ty.f16_at) {
+                const uint16_t h = (uint16_t)((rnd() & 0x8000u) | ((8u + rnd() % 8u) << 10) | (rnd() & 0x3FFu));
+                std::memcpy(blocks.data() + i * (int64_t)k->block_bytes + off, &h, 2);
+            }
+        T w(RAD_U8, {N, rb}); w.raw(blocks);
+        T wl(RAD_F32, {N, K});
+        std::vector<float> deq((size_t)(N * K));
+        for (int64_t n = 0; n < N; ++n) lq::ggml::dequant_of(ty.type)(blocks.data() + n * rb, deq.data() + n * K, K);
+        for (int64_t i = 0; i < N * K; ++i) wl.set(i, deq[(size_t)i]);
+        T x(RAD_F32, {M, K});
+        for (int64_t i = 0; i < M * K; ++i) x.set(i, std::sin(0.37f * (float)i + 0.1f));
+        T y(RAD_F32, {M, N}), yl(RAD_F32, {M, N});
+        A a; a.t(x).t(w).t(y).i("M", M).i("N", N).i("K", K).s("type", ty.name).s("dtype", "f32");
+        REQUIRE_EQ(run("gemm_nt_ggml", a), RAD_OK);
+        A b; b.t(x).t(wl).t(yl).i("M", M).i("N", N).i("K", K).s("type", ty.name).s("dtype", "f32");
+        REQUIRE_EQ(run("gemm_nt_ggml", b), RAD_OK);
+        for (int64_t m = 0; m < M; ++m)
+            for (int64_t n = 0; n < N; ++n) {
+                float acc = 0.0f;
+                for (int64_t i = 0; i < K; ++i) acc += x.at(m * K + i) * deq[(size_t)(n * K + i)];
+                CHECK_EQ(y.at(m * N + n), acc);
+                CHECK_EQ(yl.at(m * N + n), acc);
+            }
+        /* a K that is not whole blocks is refused */
+        A c; c.t(x).t(w).t(y).i("M", M).i("N", N).i("K", K - 1).s("type", ty.name).s("dtype", "f32");
+        CHECK(run("gemm_nt_ggml", c) < 0);
+    }
+}
+
 TEST(manifold_sinkhorn_first_pass_and_epsilon_are_distinct) {
     T h(RAD_F32, {1, 2}); h.f({1, 3});
     T fn(RAD_F32, {8, 2}), scale(RAD_F32, {3}); scale.f({1, 1, 1});
@@ -1347,7 +1404,7 @@ TEST(op_vocabulary) {
         "rmsnorm", "rmsnorm_p", "rmsnorm_add", "hc_enter", "hc_read", "hc_write", "hc_project",
         "mtp_enter",
         "mhc_pre", "mhc_pre_partial", "mhc_pre_finish", "mhc_post", "mhc_contract",
-        "mhc_mix", "mhc_collapse", "swiglu_clamped", "router_sigmoid_topk", "router_scored_topk", "rope_rows", "quant_roundtrip", "softmax_pool", "attn_sparse_sink", "index_score", "index_candidates", "index_topk", "entry_store", "token_map", "stream_gate_add", "dsa_pool", "dsa_query", "dsa_score", "mla_attn", "mla_project", "gemm_nt_f32",
+        "mhc_mix", "mhc_collapse", "swiglu_clamped", "router_sigmoid_topk", "router_scored_topk", "rope_rows", "quant_roundtrip", "softmax_pool", "attn_sparse_sink", "index_score", "index_candidates", "index_topk", "entry_store", "token_map", "stream_gate_add", "gemm_nt_ggml", "dsa_pool", "dsa_query", "dsa_score", "mla_attn", "mla_project", "gemm_nt_f32",
         "kda_update",
         "layernorm", "add", "mul", "mul_weight", "silu_mul", "gelu_mul", "act_mul", "seg_mean",
         "pool_rows", "relu", "clamp", "conv2d", "conv2d_unfold", "conv1d_dw", "rel_sinusoid",
@@ -8930,6 +8987,7 @@ std::vector<Geo> geometries() {
         G("index_topk", "M", 3, a.i("M", R).i("width", 9).i("topk", 4).i("ratio", 2)),
         G("entry_store", "M", 3, a.i("M", R).i("n", 8).i("block_size", 2).s("dtype", "bf16")),
         G("token_map", "M", 3, a.i("M", R).i("n_vocab", 11)),
+        G("gemm_nt_ggml", "M", 3, a.i("M", R).i("N", 5).i("K", 64).s("type", "q8_0").s("dtype", "bf16")),
         G("stream_gate_add", "M", 3, a.i("M", R).i("n", 8).i("hc", 4).d("eps", 1e-6).d("gate_eps", 1e-6)
                                      .s("dtype", "bf16")),
         G("rope_rows", "M", 3, a.i("M", R).i("n_head", 2).i("head_dim", 12).i("rot", 8).i("off", 4)

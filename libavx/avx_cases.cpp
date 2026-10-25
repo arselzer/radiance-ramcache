@@ -1195,6 +1195,10 @@ std::vector<Case> build_cases() {
         add("entry_store", { HI("M", 5), HI("n", 128), HI("block_size", 4), HS("dtype", dt) });
         add("stream_gate_add", { HI("M", 5), HI("n", 129), HI("hc", 4), HF("eps", 1e-6),
                                  HF("gate_eps", 1e-6), HS("dtype", dt) });
+        for (const char* ty : { "q8_0", "q6_K", "iq4_nl" }) {
+            const int K = std::strcmp(ty, "q6_K") ? 96 : 256;
+            add("gemm_nt_ggml", { HI("M", 4), HI("N", 33), HI("K", K), HS("type", ty), HS("dtype", dt) });
+        }
     }
     add("index_candidates", { HI("M", 9), HI("width", 40), HI("block", 8), HI("topk_blocks", 2),
                               HI("ratio", 1) });

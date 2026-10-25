@@ -1723,6 +1723,22 @@ int ref_entry_store_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* o
     return o.finish("entry_store", operand, out);
 }
 
+#ifdef REF_HAVE_GGML
+extern "C" int64_t ref_ggml_block(const char* type);
+int ref_gemm_nt_ggml_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const RadParam* t = rad_param_find(p, n_p, "type");
+    const int64_t blk = ref_ggml_block(t && t->kind == RAD_P_STR ? t->sval : nullptr);
+    const int64_t M = gi(p, n_p, "M", 0), N = gi(p, n_p, "N", 0), K = gi(p, n_p, "K", 0);
+    if (blk <= 0 || M <= 0 || N <= 0 || K <= 0 || K % blk) return RAD_E_UNSUPPORTED;
+    const uint32_t D = act_dt(p, n_p);
+    Opd o;
+    o.t(D, { M, K });                                   /* a */
+    o.t((uint32_t)RAD_F32, { N, K });                   /* w, the logical form */
+    o.t(D, { M, N });                                   /* y */
+    return o.finish("gemm_nt_ggml", operand, out);
+}
+#endif
+
 int ref_token_map_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = gi(p, n_p, "M", 0), nv = gi(p, n_p, "n_vocab", 0);
     if (M <= 0 || nv < 1) return RAD_E_UNSUPPORTED;

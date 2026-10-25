@@ -2121,8 +2121,8 @@ std::vector<GKv> llama_kvs(int64_t file_type) {
 }  /* namespace */
 
 /* Integer metadata arrays: up to 1024 values spelled out in full in the metadata (a plugin reads
- * them at declare), longer ones readable as a tensor under their key, I32 when every value fits
- * and I64 otherwise. */
+ * them at declare), and every one readable as a tensor under its key, I64 for 64-bit elements,
+ * I32 otherwise. */
 TEST(gguf_integer_arrays_are_spelled_out_or_read_as_tensors) {
     const std::string dir = fresh_dir();
     const std::string path = dir + "/m.gguf";
@@ -2148,7 +2148,10 @@ TEST(gguf_integer_arrays_are_spelled_out_or_read_as_tensors) {
     for (const SrcTensor& s : ck.tensors()) {
         if (s.name == "llama.token_map") tm = &s;
         if (s.name == "llama.wide_table") wt = &s;
-        CHECK(s.name != "llama.compress_ratios");
+        if (s.name == "llama.compress_ratios") {
+            CHECK_EQ(s.rad_dtype, (uint32_t)RAD_I32);
+            CHECK_EQ(s.shape.at(0), (int64_t)43);
+        }
     }
     REQUIRE(tm != nullptr);
     CHECK_EQ(tm->rad_dtype, (uint32_t)RAD_I32);

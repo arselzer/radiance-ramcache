@@ -282,7 +282,7 @@ std::string quant_descriptor(const MetaOwn& m) {
 
 /* A GGUF integer array of at most this many values is spelled out in the metadata, so a plugin
  * reads it at declare (deepseek41's 43 compress ratios, 48 n-gram bucket sizes); a longer one is
- * summarised there and readable as a tensor named by its key instead (open_gguf). */
+ * summarised there. Every integer array is also a tensor named by its key (open_gguf). */
 constexpr size_t kGgufSpellMax = 1024;
 
 int meta_from_gguf(GgufFile& g, MetaOwn* out) {
@@ -493,14 +493,14 @@ int Checkpoint::open_gguf(const std::string& path) {
             return RAD_E_FORMAT;
         }
     }
-    /* Some GGUFs carry a table as an integer metadata array (deepseek41's engram.token_map, 129,280
-     * compressed token ids) that a graph reads as a device table. Each integer array longer than
-     * kGgufSpellMax is also a tensor named by its key, [n], I32 when every value fits, else I64. */
+    /* Some GGUFs carry tables as integer metadata arrays that a graph reads as device tables
+     * (deepseek41's engram.token_map, its n-gram multipliers, bucket sizes and offsets). Every
+     * integer array but the tokenizer's is also a tensor named by its key, [n]: I64 when its
+     * elements are 64-bit or a value does not fit 32 bits, I32 otherwise. */
     for (const GgufKV& kv : gguf_.kv()) {
-        if (!kv.is_array || kv.type == GGUF_STR || kv.i.size() <= kGgufSpellMax ||
-            kv.key.rfind("tokenizer.", 0) == 0)
+        if (!kv.is_array || kv.type == GGUF_STR || kv.i.empty() || kv.key.rfind("tokenizer.", 0) == 0)
             continue;
-        bool fits = true;
+        bool fits = kv.type != GGUF_U64 && kv.type != GGUF_I64;
         for (int64_t v : kv.i) fits = fits && v >= INT32_MIN && v <= INT32_MAX;
         std::vector<uint8_t>& buf = gguf_arrays_.emplace_back(kv.i.size() * (fits ? 4 : 8));
         for (size_t j = 0; j < kv.i.size(); ++j) {

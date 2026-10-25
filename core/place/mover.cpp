@@ -34,14 +34,15 @@ int FileTier::read(uint64_t offset, int64_t bytes, void* dst, int64_t dst_cap) {
     if (!f_.is_open()) return RAD_E_STATE;
     if (!dst || bytes <= 0) return RAD_E_INVAL;
     /* The extent rounded up to the alignment: the unit stride already covers it, and reading
-     * one extra block is cheaper than a branch on the step path. */
+     * one extra block is cheaper than a branch on the step path. The rounding may pass end of
+     * file when the extent is the container's last; only `bytes` must arrive. */
     const int64_t want = direct_align(bytes);
     if (want > dst_cap) {
         RAD_ERR("file tier: a %s read needs a %s aligned buffer, the staging slot is %s",
                 humanb(bytes).c_str(), humanb(want).c_str(), humanb(dst_cap).c_str());
         return RAD_E_SCRATCH;
     }
-    RAD_TRY(f_.read_at(dst, (int64_t)offset, want));
+    RAD_TRY(f_.read_covering(dst, (int64_t)offset, want, bytes));
     return RAD_OK;
 }
 
@@ -736,7 +737,7 @@ int Mover::read_relaid(const WeightInfo& w, void* dst, int64_t dst_cap, RelayIn*
         in->cap = in->p ? n : 0;
         if (!in->p) return RAD_E_NOMEM;
     }
-    RAD_TRY(file_.read((uint64_t)a0, n, in->p, in->cap));
+    RAD_TRY(file_.read((uint64_t)a0, hi - a0, in->p, in->cap));   /* reads n, needs hi - a0 */
     for (int k = 0; k < w.n_sel; ++k) pt[k].data = in->p + ((int64_t)w.file_plane_offset[k] - a0);
     const int st = relayout_(w, pt, dst, w.stored_bytes);
     if (st < 0)

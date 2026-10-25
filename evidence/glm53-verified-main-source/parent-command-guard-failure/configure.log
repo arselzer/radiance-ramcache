@@ -1,0 +1,5 @@
+Traceback (most recent call last):
+  File "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/run_guarded_heavy_research.py", line 8, in <module>
+    assert args and Path(args[0]).is_absolute()
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError

@@ -1,0 +1,24 @@
+This package does not activate Engine or set Session admission.
+
+After real complete-data validation, a NEW matching Core revision still needs:
+1. Actual private Engine source request/factory with same owned Checkpoint/cache,
+   metadata-first declaration, stable metadata Plans, NativeInventory and real fit.
+2. Actual ordinary loader using existing source/share/relayout behavior, bounded
+   sequential buffers/owned compute streams, successful retirement before reuse.
+   The11 main kv_b tensors are already BF16; no speculative conversion work.
+3. Typed Pools/Mover +persistent NativeOwner before Ctx; real KV/Sampler/StepSlot
+   state; all4 final source/placement/load checks before transportReady.
+4. Checked admitted-profile Mover/Owner/Ctx/source shutdown and same-Engine sticky
+   retry/retire protection; existing default/Tiny profiles must remain unchanged.
+5. Place early-negative kernel-init fail-stop at or BEFORE Registry::init_instance's
+   first negative k->init log in core/plugin/select.cpp (474+ in frozen Core).
+   initialize_program_instances callback alone is too high: Registry already logs
+   before returning. Cover that ACTUAL Registry refusal, not a post-log surrogate.
+6. Admitted profile's initial Engine::step_loop rad_dev_set failure must fail-stop
+   before inherited log-and-continue behavior. Preserve all42 gates, no issue-ahead,
+   truthful Batch.n_ahead, active-through-collect and first-error exit88 behavior.
+7. Parent-owned separate actual GPU/startup/text-pass checks in an approved idle
+   window. No service/port/deployment/restart/switch follows from A/B data success.
+
+Plain LRU may thrash on all-layer prefill. Performance admission/bypass/larger
+batches/coalescing are later measured changes, not part of this correctness source.

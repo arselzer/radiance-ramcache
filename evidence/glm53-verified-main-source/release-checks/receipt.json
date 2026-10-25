@@ -1,0 +1,50 @@
+{
+  "passed": true,
+  "mode": "release",
+  "revision": "v1",
+  "commands": [
+    {
+      "command": [
+        "flock",
+        "--no-fork",
+        "--exclusive",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/research-heavy-runtime.lock",
+        "nice",
+        "-n19",
+        "/usr/bin/python3",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/run_guarded_heavy_research.py",
+        "--",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/build-glm53-verified-main-source-v1-host-release/glm53_verified_main_reader_refusals",
+        "--run-host-refusals"
+      ],
+      "log": "reader-refusals.log",
+      "returncode": 0
+    },
+    {
+      "command": [
+        "flock",
+        "--no-fork",
+        "--exclusive",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/research-heavy-runtime.lock",
+        "nice",
+        "-n19",
+        "/usr/bin/python3",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/run_guarded_heavy_research.py",
+        "--",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/build-glm53-verified-main-source-v1-host-release/glm53_verified_main_generic_regression"
+      ],
+      "log": "generic-provider.log",
+      "returncode": 0
+    }
+  ],
+  "GPU_execution": false,
+  "model_execution": false,
+  "production_changes": false,
+  "scope": "HOST negative actual-reader metadata and preserved generic/synthetic provider cases; no positive complete-source admission",
+  "build_receipt_sha256": "549996c0204ce48d0769e4e4dd3a47b2b69fa4e78a9746440478c3e881680d62",
+  "source_receipt_sha256": "ab7e527685b4ab49c7db9f63d55c913af889e7ec863fdcff04f7c87a754bd70c",
+  "evidence_sha256": {
+    "reader-refusals.log": "a27d3c908eb2879c8ed9f1396bd6265b4d53652bff9c3539226402ec82e697ea",
+    "generic-provider.log": "cb18461e7bc6f33a0f5f2b2523476aeca29c5a1e311d2730c37776c8251a09f4"
+  }
+}

@@ -1,0 +1,37 @@
+{
+  "created_utc": "2026-10-25T18:00:36.274478+00:00",
+  "evidence_scope": "HOST negative/generic tests are not complete-positive admission; complete-data driver remains separate, and no Engine/Session/GPU model activation is established. Parent reports Release compile only at review closure.",
+  "matching_core_pins_sha256": "776827647d9a26c0d3fb0d7f09edd31b6fd2e86d82eff92c2bdf707e47748e26",
+  "package_receipt_sha256": "ab7e527685b4ab49c7db9f63d55c913af889e7ec863fdcff04f7c87a754bd70c",
+  "pins": {
+    "GLM53_VERIFIED_MAIN_SOURCE_INDEPENDENT_REVIEW.txt": "0f9a2cd77a1c2f2d72f2d234fb1a86d33b88e08b21093a063957fe1c0723eefe",
+    "assemble_glm53_complete_store.py": "80f0464205a6741c1fc99707ece56a2b6df4c69d87b910543134733bda65eed5",
+    "glm53-verified-main-source-prototype/BUILD_AND_RUN.txt": "9895fefbc9407df13d96e13276a4d464ee4aaa4d63099cc32472f5548fff5143",
+    "glm53-verified-main-source-prototype/CMakeLists.txt": "88f91a37aef561ad0ac81107ad470b96ed3cd07881847d93888c5a11446bf324",
+    "glm53-verified-main-source-prototype/CORE_SOURCE_PINS.json": "776827647d9a26c0d3fb0d7f09edd31b6fd2e86d82eff92c2bdf707e47748e26",
+    "glm53-verified-main-source-prototype/SOURCE_RECEIPT.json": "ab7e527685b4ab49c7db9f63d55c913af889e7ec863fdcff04f7c87a754bd70c",
+    "glm53-verified-main-source-prototype/complete_reader_check.cpp": "2c738fc0e73f9e5aae295cd5c0eac6a436a2ee9359fb2e812262b21f3c11d19e",
+    "glm53-verified-main-source-prototype/main_bundle_reader.cpp": "2bfe8f9b1801db434bba891dc2384ac4be3905e53c735660e6eba0d107bd7afe",
+    "glm53-verified-main-source-prototype/main_bundle_reader.h": "b2c89c899ecb8927a1c022c61b2d6e3e1790e5be9dfc0d38837b30fd66b9cd00",
+    "glm53-verified-main-source-prototype/native_source.cpp": "4efce206e6a0d98673d940a4fa22006f4a834d80c5ea7bb8e18a4e64c6c8cdf2",
+    "glm53-verified-main-source-prototype/native_source.h": "9442061203eb80bd11fb60771d98f2ed7405faba7f7374026044a1807853671f",
+    "glm53-verified-main-source-prototype/reader_refusal_check.cpp": "9bef6cfabbcfd0f7de959b5d2b86677c54b5fc2b735245c371e71a40678ba0f1",
+    "glm53-verified-main-source-prototype/storage/candidate_native_record_store.cpp": "9e3f8ba58030c2ddc099499c47da72b005766323e33119f34107bbd22f556b7f",
+    "glm53-verified-main-source-prototype/storage/candidate_native_record_store.h": "583d99d3ae4b8d3c21939d2968935f44ebd860a2cc80ed8f6dfe3c295ac3e4d1",
+    "glm53-verified-main-source-prototype/storage/rank_native_store.cpp": "b9148148495d0b811701c1f8e464d7173ca018750949b203a0452a4b4f530e1e",
+    "glm53-verified-main-source-prototype/storage/rank_native_store.h": "a29ad5f7c3e4886a65f6852d4eabf233bc79cd0c17d32bb6d3f1940e827469a9",
+    "validate_glm53_main_store_assembler.py": "04ad056567a7a7676c1b94db19cc9acb07571410c0da6793be12392fc5bc3fd9"
+  },
+  "reviewer": "/root/ds41_engram_ref",
+  "schema": "glm53-verified-main-source-independent-review-pins-v1",
+  "source_only": true,
+  "source_pin_mismatches": [],
+  "target_code_import_compile_runtime_device_or_network": false,
+  "verdict": "no remaining scoped source blocker",
+  "verified_counts": {
+    "byte_exact_copied_bodies": 12,
+    "frozen_inputs": 20,
+    "matching_core_files": 1517,
+    "source_hashes": 27
+  }
+}

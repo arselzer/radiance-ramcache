@@ -1,0 +1,56 @@
+All commands below are for the PARENT. Authors have not compiled/run this source.
+No command changes serving, downloads, packs, admits Engine/Session or launches
+model/GPU kernels. Complete mode performs expensive I/O and device METADATA.
+
+Let R=/home/as/radiance-setup/research/deepseek-v41-1017-20261024.
+
+HASH ONLY (safe, no target import):
+ python3 "$R/glm53-verified-main-source-prototype/verify_source_pins.py"
+
+HOST RELEASE with the existing matching frozen1517-file Core:
+ cmake -S "$R/glm53-verified-main-source-prototype" \
+   -B "$R/build-glm53-verified-main-source-host-release" \
+   -DRADIANCE_SOURCE="$R/radiance-glm-main-tp4-cache-src" \
+   -DRADIANCE_BUILD="$R/build-glm-main-tp4-cache-host-release" \
+   -DRADIANCE_AQL_CORE=OFF -DCMAKE_BUILD_TYPE=Release
+ cmake --build "$R/build-glm53-verified-main-source-host-release" --target \
+   glm53_verified_main_reader_refusals glm53_verified_main_generic_regression \
+   glm53_complete_main_source_check -j2
+ "$R/build-glm53-verified-main-source-host-release/glm53_verified_main_reader_refusals" --run-host-refusals
+ "$R/build-glm53-verified-main-source-host-release/glm53_verified_main_generic_regression"
+The complete driver may compile in HOST mode, but intentionally refuses execution
+there. HOST refusals are2 authored groups/19 refusal cases (14scalar/caps +null
+output +subset +firstOOM +globalmetadata cap +foreign ID); no positive complete
+source claim. Existing generic regression contains14 unchanged synthetic cases.
+Actual counts/PASS are only reported after parent execution.
+
+ASan/UBSan and TSan: use NEW separate fixture build directories and matching
+parent whole-Core MODE directories, the SAME compiler, ABI/stdlib flags and
+sanitizer compile/link profile as that Core. Reuse neither a different archive
+nor old private headers. No sanitizer suppression or implicit Core rebuild here.
+Parent applies its established owned process-group timeouts/retry policy.
+
+ACTUAL COMPLETE DATA (after full physical bundle publication+parent verification):
+First parent-build the SAME frozen Core/private headers for AQL; do not link the
+stock writer's different private ABI. Configure a NEW fixture directory with:
+ -DRADIANCE_SOURCE="$R/radiance-glm-main-tp4-cache-src"
+ -DRADIANCE_BUILD=ABS_MATCHING_AQL_WHOLE_CORE
+ -DRADIANCE_AQL_CORE=ON [same compiler/ABI/build-mode flags]
+Build glm53_complete_main_source_check, then under explicit complete-input/idle
+I/O/device-metadata gate and an adequate outer process-group deadline:
+ ABS_FIXTURE/glm53_complete_main_source_check --run-complete-reader \
+   /home/as/models/hf/amd/GLM-5.3-Flash-Quark-MXFP4 \
+   ABS_MATCHING_AQL_HOME REAL_COMPLETE_BUNDLE PRODUCER_PROOF \
+   TRUSTED_DECIMAL_COMPLETE_BUNDLE_ID ABS_NEW_REPORT_JSON
+The root must be actual CompleteMainData:48384 records/168 shards/161715585024B;
+subset8 records can only produce a refusal. Proof must be the exact trusted
+producer transcript copied into that bundle. Output is a NEW path outside both
+immutable roots. No full pack/source-proof generation is included in this tool.
+
+Complete mode semantics: ordinary metadata declarations4logical ranks/max_tok1
+without kernel instances, layout-only pure Plans; full persisted/native/raw source
+verification; once/rank actual source-cut CRC+compact authority; shared bounded
+provider budgets; first8 records/rank across shards, repeat dedup/no payload reads;
+close/destroy actual Source+Program+Checkpoint owners, then retained native byte
+leases and full token retirement. All reports explicitly runtime_ready=false and
+Engine_or_Session_admitted=false. No actual model step/inference/production fit.

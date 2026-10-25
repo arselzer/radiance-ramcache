@@ -1,0 +1,202 @@
+{
+  "passed": true,
+  "production_changes": false,
+  "kernel_execution": false,
+  "model_execution": false,
+  "full_model_packed": false,
+  "complete_main_expert_store_packed": true,
+  "model_payloads_private": true,
+  "scope": "Offline complete 48384-record main expert DATA store across four logical ranks; one-card metadata selection only, no runtime source activation or inference",
+  "proof_receipt": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-complete-source-proof-20261025T172943Z/receipt.json",
+  "proof_receipt_sha256": "5b9830ff7182daa10d63fb52bd31b4a2e97dba000835bc28173273708e58fd2d",
+  "proof_sha256": "d8685504c30be3c25b0a8b6aab4913df0128fd46a162a8c409ae367d7bf58137",
+  "build_receipt_sha256": "475844e45a2dfe186f068f89338ad4c7f47b034b300df5cc942b6461bfa2391e",
+  "passed_subset_receipt_sha256": "95a7bd9053084bda731ecb7a3660d77788a3833e3b08bcba62388e681f0818f2",
+  "command": [
+    "nice",
+    "-n19",
+    "/usr/bin/ionice",
+    "-c",
+    "3",
+    "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/build-glm53-complete-main-store-assembler/glm53_main_store_assembler",
+    "--assemble-complete-main-bundle",
+    "--checkpoint",
+    "/home/as/models/hf/amd/GLM-5.3-Flash-Quark-MXFP4",
+    "--home",
+    "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/shipped-radiance-1.12.0-home",
+    "--source-proof",
+    "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-complete-source-proof-20261025T172943Z/complete-source-proof.json",
+    "--output",
+    "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-full-main-store-20261025T175438Z/private-complete-store",
+    "--max-native-bytes",
+    "161715585024"
+  ],
+  "MemAvailable_before": 10654547968,
+  "health_before": {
+    "status": "ok",
+    "model": "qwen-vllm",
+    "in_flight": 0,
+    "queue_cap": 64
+  },
+  "owned_child_pid_namespace_local": 3549494,
+  "returncode": 0,
+  "elapsed_seconds": 1466.8520529270172,
+  "complete_result": {
+    "schema": "glm53-main-store-assembler-complete-check-v1",
+    "passed": true,
+    "runtime_ready": false,
+    "mode": "complete_main_data",
+    "records": 48384,
+    "shards": 168,
+    "native_bytes": 161715585024,
+    "bundle_id": 7279810219167007678,
+    "graph_quotes": 4,
+    "total_graph_declarations": 4,
+    "total_geometry_quotes_including_faults": 4,
+    "checks": 496419886,
+    "fault_triggers": 0,
+    "compared_records": 48384,
+    "compared_native_bytes": 161715585024,
+    "metadata_requested_peak": 261083256,
+    "metadata_on_disk_actual": 168298055,
+    "metadata_on_disk_upper": 708968448,
+    "own_complete_tensor_read_bytes": 161715585024,
+    "own_source_band_read_bytes": 323431170048,
+    "native_copy_bytes": 161715585024,
+    "actual_total_checker_pread_calls_before_receipt": 12386764,
+    "actual_total_checker_pwrite_calls_before_receipt": 4935338,
+    "positive_assembly_and_verify_pread_calls": 12338380,
+    "positive_assembly_and_verify_pwrite_calls": 4935338,
+    "producer_source_proof_hashed_bytes": 185107699217,
+    "trusted_source_proof_complete": true,
+    "full_checkpoint_payload_hashes_independently_computed_by_Cpp": false,
+    "input_payload_fd_peak": 2,
+    "assembler_owned_fd_upper": 8,
+    "verifier_owned_fds": 6,
+    "assembler_destroyed_before_verifier": true,
+    "window_bytes": 65536,
+    "upstream_Checkpoint_Program_metadata_and_mapping_owners_separate": true,
+    "fixture_independent_oracle_buffers_upper": 8388608,
+    "nonexpert_kv_b_metadata_scope": "inherited declaration hook only; actual raw/planned encodings recorded, no payload conversion/load",
+    "nonexpert_kv_b_metadata_evidence": [
+      {
+        "logical_source": "blk.11.attn_kv_b.weight",
+        "raw_encoding": "bf16",
+        "planned_encoding": "bf16",
+        "shape": [
+          32768,
+          512
+        ],
+        "payload_converted": false
+      },
+      {
+        "logical_source": "blk.15.attn_kv_b.weight",
+        "raw_encoding": "bf16",
+        "planned_encoding": "bf16",
+        "shape": [
+          32768,
+          512
+        ],
+        "payload_converted": false
+      },
+      {
+        "logical_source": "blk.19.attn_kv_b.weight",
+        "raw_encoding": "bf16",
+        "planned_encoding": "bf16",
+        "shape": [
+          32768,
+          512
+        ],
+        "payload_converted": false
+      },
+      {
+        "logical_source": "blk.23.attn_kv_b.weight",
+        "raw_encoding": "bf16",
+        "planned_encoding": "bf16",
+        "shape": [
+          32768,
+          512
+        ],
+        "payload_converted": false
+      },
+      {
+        "logical_source": "blk.27.attn_kv_b.weight",
+        "raw_encoding": "bf16",
+        "planned_encoding": "bf16",
+        "shape": [
+          32768,
+          512
+        ],
+        "payload_converted": false
+      },
+      {
+        "logical_source": "blk.3.attn_kv_b.weight",
+        "raw_encoding": "bf16",
+        "planned_encoding": "bf16",
+        "shape": [
+          32768,
+          512
+        ],
+        "payload_converted": false
+      },
+      {
+        "logical_source": "blk.31.attn_kv_b.weight",
+        "raw_encoding": "bf16",
+        "planned_encoding": "bf16",
+        "shape": [
+          32768,
+          512
+        ],
+        "payload_converted": false
+      },
+      {
+        "logical_source": "blk.35.attn_kv_b.weight",
+        "raw_encoding": "bf16",
+        "planned_encoding": "bf16",
+        "shape": [
+          32768,
+          512
+        ],
+        "payload_converted": false
+      },
+      {
+        "logical_source": "blk.39.attn_kv_b.weight",
+        "raw_encoding": "bf16",
+        "planned_encoding": "bf16",
+        "shape": [
+          32768,
+          512
+        ],
+        "payload_converted": false
+      },
+      {
+        "logical_source": "blk.43.attn_kv_b.weight",
+        "raw_encoding": "bf16",
+        "planned_encoding": "bf16",
+        "shape": [
+          32768,
+          512
+        ],
+        "payload_converted": false
+      },
+      {
+        "logical_source": "blk.7.attn_kv_b.weight",
+        "raw_encoding": "bf16",
+        "planned_encoding": "bf16",
+        "shape": [
+          32768,
+          512
+        ],
+        "payload_converted": false
+      }
+    ],
+    "nonexpert_kv_b_all_raw_already_planned_BF16": true,
+    "model_kernel_or_Engine_execution": false,
+    "content_ID_excludes_runtime_ctx_batch_residency_path_inode_stat": true,
+    "future_SourceFactory_still_absent": true
+  },
+  "complete_result_sha256": "798175989971c636e6a3d9794c51d539e2e8b953e033acc6b5caca22b34a71b6",
+  "evidence_sha256": {
+    "assembly.log": "ecc33da8e65cd4624e898d137aded88dc47ac5d5dadd8f8493ba2e28a979da6d"
+  }
+}

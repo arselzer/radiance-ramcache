@@ -1,0 +1,133 @@
+GLM53 verified complete-main reader/provider — independent source review
+2026-10-25 UTC
+
+Scope and verdict
+-----------------
+Reviewed the frozen A/B package glm53-verified-main-source-prototype at
+SOURCE_RECEIPT.json SHA256
+ab7e527685b4ab49c7db9f63d55c913af889e7ec863fdcff04f7c87a754bd70c.
+No remaining scoped source blocker was identified. This is a read-only source,
+ownership, accounting and test-design review. I did not compile, run tests,
+import target code, scan model payloads, query devices or execute kernels.
+
+All 27 source hashes, 12 byte-exact copied bodies, 20 frozen input hashes and
+1517 matching Core hashes were independently checked and matched. The Core is
+radiance-glm-main-tp4-cache-src, pinned by CORE_SOURCE_PINS.json SHA256
+776827647d9a26c0d3fb0d7f09edd31b6fd2e86d82eff92c2bdf707e47748e26.
+This review does not apply to subsequent mutable C-F integration forks.
+
+Admission and source authority
+------------------------------
+main_bundle_reader.cpp:75-99 admits only the complete persisted four-rank
+main-expert DATA format: 48384 records, 168 shards and the expected complete
+bundle ID. Subset/component identities cannot become complete authority. The
+complete common generation is separate from rank-local cuts and six-raw-tensor
+component IDs. Runtime readiness remains false.
+
+The source-proof transcript is a trusted parent-produced SHA/Git-blob evidence
+input. C++ checks the pinned expected 72-file identity list and current stamps;
+it does not independently implement cryptographic verification of that JSON.
+The reader additionally compares all 76108 actual raw tensor mappings against
+the current physical files from the SAME opened Checkpoint
+(main_bundle_reader.cpp:51-63). It checks native record checksums and complete
+component identities before creating opaque normalized catalogs. FNV/checksum
+comparisons establish integrity within this stated trust boundary, not hostile
+writer authentication. Ordinary descriptor/path stamps remain race-detection
+checks, not a claim of filesystem immutability against adversarial writers.
+
+bind_rank (main_bundle_reader.cpp:108-123) permits one successful binding per
+rank, serializes the bind transaction, requires the same source-cache identity,
+and derives all 12096 rank-local descriptors from actual Program/Plan geometry.
+The selected DEVICE layout callback, ROW/COL cuts and source-cut checksums are
+checked independently against persisted records. There are no resident records
+in this first profile. Borrowed Checkpoint/cache/Program/Plan owners must remain
+alive and immutable while sources are open; this is an explicit API contract.
+Returned native leases retain owned metadata/payload and need not dereference
+those borrowed owners after source close.
+
+Budget and publication review
+-----------------------------
+Reader limits enforce the closed scalar/cap domain and a real sizeof-based
+minimum rank descriptor/geometry envelope before path/file I/O
+(main_bundle_reader.cpp:28-29). Rank binding pre-admits base storage, passes the
+remaining cap to geometry construction, subtracts the actual construction
+reservation, and only then admits compact NativeWeightAuthority storage. This
+avoids allocating a geometry/authority independently against the full cap.
+There is no full WeightInfo snapshot. Actual requested accounting excludes
+general allocator/RSS, page cache and caller-owned model metadata as disclosed.
+
+The final wrapper/control allocations precede final audits in both open and
+bind. Broker capacity is prepared before audit; fixed leaf names use a const
+char path to avoid a late implicit string allocation. Source/root stamps are
+checked again after the file audits. The final success path is an out move
+after those audits, with no fallible positive-path C++ allocation added between
+audit and publication (main_bundle_reader.cpp:46-49,99,107,123).
+
+Provider and lease lifecycle
+----------------------------
+The new actual-specific provider consumes private VerifiedRankMain authority;
+the copied old synthetic reader/open path is not relaxed. The one local friend
+addition permits catalog creation only inside the reviewed complete reader.
+RankNativeStore::open_verified_main (storage/rank_native_store.cpp:386-510)
+precharges one process/rank token, metadata, cache and FD credits. The shared
+bundle allowance is conservatively charged per rank token, not asserted to be
+four physical metadata copies. Source acquire work is selected-only; full
+Program/source/bundle scans occur at setup or explicit lifecycle audits.
+
+The provider wrapper is allocated before the final Program/root/all-shard
+audit. The facade allocates Quota/handles before its final validation and source
+publication (native_source.cpp:79-91). Each acquire reserves Holder/result
+capacity before the underlying cache can publish ready records
+(native_source.cpp:112-152). Bounded first-occurrence dedup, whole-union cache
+reservations, failed-read cleanup and exact selected audits reuse the existing
+storage implementation. There is no fallible facade allocation after successful
+underlying acquire and before the caller swap.
+
+Holder destruction releases its Batch before quota credit. Quota retains the
+SAME Accounting token through that interval (native_source.cpp:24-45). Source
+close prevents new acquisition; returned leases retain payload/token ownership
+through the last reader, including after source and original metadata owners
+are destroyed. Caller-retained NativeRecordBatch vector capacity is explicitly
+excluded because the ABI cannot track it after leases are cleared; provider
+retained-vector/holder slots remain charged. Public stats are external-context
+operations, not reentrant test-pread callbacks.
+
+Test evidence boundaries
+-------------------------
+The HOST refusal checker uses the actual reader API and actual Core ABI. Its
+cap/subset/OOM cases do not fabricate a complete universe or establish positive
+complete-source admission. The inherited generic-provider tests retain their
+original bodies; they prove the generic storage component, not the actual full
+source domain.
+
+complete_reader_check.cpp is the separate explicit positive DATA gate. It
+predeclares four actual metadata graphs, opens the persisted complete store,
+binds all ranks, exercises selected cold/hot/deduplicated reads, closes sources,
+destroys actual Checkpoint/cache/Program/Plan owners and then compares retained
+lease bytes again. It finally requires all rank/cache/FD credits to retire
+(complete_reader_check.cpp:30-53). The driver truthfully reports no Engine or
+Session admission, no kernel instances/launches and unchanged tracked model
+device bytes. AQL row-eligibility metadata is distinct from GPU inference.
+
+Parent execution note: at review closure the parent reported a successful
+Release compile of all three targets; HOST runtime tests were queued behind
+the full-store assembly lock and ASan compilation was underway. This report
+does not turn that compile result into a runtime or complete-positive PASS.
+
+Assembly-runner scope cross-check
+---------------------------------
+Read-only review also covered assemble_glm53_complete_store.py and
+validate_glm53_main_store_assembler.py. No additional scoped blocker was found.
+The runner pins source/binary/proof/archive inputs, gates MemAvailable and
+production idle health, serializes heavy work, uses an explicitly bounded
+process deadline, and requires complete record/shard counts and private output
+verification before publication. The complete assembly establishes main-expert
+DATA only: it is not a full-model conversion, ready SourceFactory, Engine
+activation, hardware fit, throughput or four-GPU execution proof.
+
+Review outcome
+---------------
+The reviewed A/B source is suitable for the parent's matching-Core build and
+staged HOST/complete-DATA validation. Full Engine activation, checked hardware
+quiescence, source-session admission and actual TP4 model execution belong to
+separately reviewed later stages; none is advertised by this package.

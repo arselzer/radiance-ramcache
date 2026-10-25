@@ -1,0 +1,2 @@
+RAM_ADMISSION MemAvailable=19546185728
+PASS actual-main Reader refusals groups=2 checks=25 refusals=19; no complete/source/RuntimeReady authority or model/GPU execution

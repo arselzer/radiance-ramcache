@@ -1,0 +1,2 @@
+RAM_ADMISSION MemAvailable=17130233856
+PASS 14 synthetic once-bound sharded-provider cases, 1116 checks, independent_native_bytes=1892352; selected-audit/buffered CPU profile, no Core adapter/GPU/checkpoint claim

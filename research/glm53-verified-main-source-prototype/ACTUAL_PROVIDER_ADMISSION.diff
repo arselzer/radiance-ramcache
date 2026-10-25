@@ -1,0 +1,258 @@
+--- frozen-generic/candidate_native_record_store.h
++++ verified-main/storage/candidate_native_record_store.h
+@@ -9,6 +9,7 @@
+ #include <span>
+ #include <string>
+ #include <vector>
++namespace glm53::verified_main { class VerifiedBundle; }
+ namespace rad::expert_store_candidate {
+ enum class Status {ok,invalid,budget,io,checksum,identity,exists,no_memory,unsupported};
+ const char* name(Status) noexcept;
+@@ -74,6 +75,7 @@
+     const Receipt& receipt()const noexcept{return receipt_;}
+ private:
+     friend class Reader;
++    friend class ::glm53::verified_main::VerifiedBundle; // local actual-reader-only admission; no public POD constructor
+     VerifiedCatalog()=default;
+     FileStamp directory_,manifest_;Receipt receipt_;
+     std::vector<VerifiedSegment> segments_;std::vector<VerifiedRecord> records_;
+--- frozen-generic/rank_native_store.h
++++ verified-main/storage/rank_native_store.h
+@@ -1,11 +1,13 @@
+ #pragma once
+-// CPU-only synthetic storage/cache mechanics. No Engine/CLI/GPU/TP execution integration.
++// CPU-only storage/cache mechanics with separate synthetic and opaque verified
++// actual-main admission. No Engine/CLI/GPU/TP execution integration.
+ #include "candidate_native_record_store.h"
+ #include <memory>
+ #include <span>
+ #include <stop_token>
+ #include <string>
+ #include <vector>
++namespace glm53::verified_main {class VerifiedRankMain;}
+ namespace glm53::sharded {
+ namespace native=rad::expert_store_candidate;
+ enum class Error {ok,invalid,budget,identity,io,checksum,cancelled,closed,reentrant,no_memory,unsupported,exhausted};
+@@ -99,6 +101,10 @@
+     uint64_t cell_lookups=0,dedup_touches=0,metadata_opens=0,stat_probes=0,global_audits=0;
+     uint64_t evictions=0,admission_bypasses=0,setup_verified_bytes=0,setup_manifest_bytes=0,
+              setup_payload_io_bytes=0;
++    // Actual-profile authority was verified BEFORE provider open. These are
++    // retained planning reservations/verification facts, not provider I/O.
++    uint64_t authority_verified_bytes=0,authority_metadata_reservation=0,
++             facade_metadata_reservation=0;
+     size_t catalog_records=0,segments=0,shards=0,cached_payload_fds=0;
+     size_t startup_reserved_fd_peak=0,startup_actual_fd_peak=0;
+     Usage usage;
+@@ -109,10 +115,21 @@
+                       const std::string& generation_root,uint64_t epoch,
+                       std::span<const ShardInput>,const Limits&,
+                       std::unique_ptr<RankNativeStore>* out,std::string* why=nullptr)noexcept;
++    // Separate complete-real-main admission; never routes actual manifests into
++    // the closed synthetic Reader. Retains immutable authority and its credits
++    // through every handle/lease, including after close. Full audits are setup
++    // only; acquire audits the generation header and selected files.
++    static Error open_verified_main(std::shared_ptr<ProcessBudget>,
++                      std::shared_ptr<const glm53::verified_main::VerifiedRankMain>,
++                      const Limits&,uint64_t facade_metadata_bytes,
++                      std::unique_ptr<RankNativeStore>* out,std::string* why=nullptr)noexcept;
+     ~RankNativeStore();
+     RankNativeStore(const RankNativeStore&)=delete;
+     // Key lookup is a setup API. Requests use opaque immutable handles, never mutable keys.
+     Error bind(const native::Key&,BoundRecord* out)const noexcept;
++    // Actual profile only. Exact canonical ordinal order, O(records), no key
++    // searches. Entire span is preserved if validation fails.
++    Error bind_main_handles(std::span<BoundRecord> out)const noexcept;
+     Error acquire(std::span<const BoundRecord>,Batch* out,std::stop_token={})noexcept;
+     Error audit_all()noexcept; // Global ordinary file-stamp audit; no full payload scrub.
+     Error trim()noexcept;
+--- frozen-generic/rank_native_store.cpp
++++ verified-main/storage/rank_native_store.cpp
+@@ -1,4 +1,5 @@
+ #include "rank_native_store.h"
++#include "../main_bundle_reader.h"
+ #include <algorithm>
+ #include <atomic>
+ #include <cerrno>
+@@ -71,8 +72,11 @@
+ native::FileStamp fd_stamp(int fd,bool directory=false){struct stat s{};
+     verify(!::fstat(fd,&s)&&s.st_size>=0&&(directory?S_ISDIR(s.st_mode):S_ISREG(s.st_mode)),"fstat type/extent");return stamp(s);
+ }
+-native::FileStamp at_stamp(int fd,const std::string& name,bool directory=false){struct stat s{};
+-    verify(!::fstatat(fd,name.c_str(),&s,AT_SYMLINK_NOFOLLOW)&&s.st_size>=0&&(directory?S_ISDIR(s.st_mode):S_ISREG(s.st_mode)),"named identity/type");return stamp(s);
++native::FileStamp at_stamp(int fd,const char* name,bool directory=false){struct stat s{};
++    verify(!::fstatat(fd,name,&s,AT_SYMLINK_NOFOLLOW)&&s.st_size>=0&&(directory?S_ISDIR(s.st_mode):S_ISREG(s.st_mode)),"named identity/type");return stamp(s);
++}
++native::FileStamp at_stamp(int fd,const std::string& name,bool directory=false){
++    return at_stamp(fd,name.c_str(),directory);
+ }
+ bool leaf(const std::string& s){if(s.empty()||s.size()>64||s=="."||s=="..")return false;
+     for(const unsigned char c:s)if(!((c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||c=='_'||c=='-'))return false;
+@@ -85,6 +89,9 @@
+     uint32_t world=0,rank=0;uint64_t epoch=0;std::atomic<bool> sealed{false};
+     std::string root_path;native::FileStamp root_stamp;
+     std::vector<Shard> shards;std::vector<GenRecord> records;size_t file_count=0;
++    // No Program/Plan reads after close. Strong leases retain this authority
++    // and the SAME process/rank token, not an uncharged detached catalog.
++    std::shared_ptr<const glm53::verified_main::VerifiedRankMain> main_authority;
+ };
+ struct Ledger {
+     std::shared_ptr<Token> token;Limits limits;mutable std::mutex mutex;Usage usage;
+@@ -137,6 +144,11 @@
+     void cancelled(std::stop_token stop){check(!stop.stop_requested()&&!closing.load(),Error::cancelled,"request cancelled/closing");}
+     void root_audit(){inc(counters.stat_probes,2);
+         verify(fd_stamp(root.fd,true)==generation->root_stamp&&at_stamp(AT_FDCWD,generation->root_path,true)==generation->root_stamp,"generation root changed");
++        if(generation->main_authority){inc(counters.stat_probes,2);
++            verify(at_stamp(root.fd,"bundle.json")==generation->main_authority->bundle_stamp()&&
++                   at_stamp(root.fd,"source-proof.json")==generation->main_authority->proof_stamp(),
++                   "actual complete generation header changed");
++        }
+     }
+     void audit_shard(uint32_t s,bool all){const auto& shard=generation->shards[s];
+         auto dir=Fd::open(generation->token,root.fd,shard.name,O_RDONLY|O_DIRECTORY);inc(counters.metadata_opens);
+@@ -371,6 +383,145 @@
+         auto result=std::unique_ptr<RankNativeStore>(new RankNativeStore(std::move(p)));*out=std::move(result);return Error::ok;
+     }catch(const Failure& e){explain(why,e.why);return e.error;}catch(const std::bad_alloc&){explain(why,"allocation refused");return Error::no_memory;}catch(...){explain(why,"unexpected setup failure");return Error::invalid;}
+ }
++Error RankNativeStore::open_verified_main(std::shared_ptr<ProcessBudget> process,
++    std::shared_ptr<const glm53::verified_main::VerifiedRankMain> authority,
++    const Limits& l,uint64_t facade_metadata,std::unique_ptr<RankNativeStore>* out,std::string* why)noexcept{
++    try{
++        Active active;
++        constexpr size_t count=42*288,shard_count=42;
++        constexpr uint64_t record_bytes=3342336;
++        check(process&&authority&&out&&!*out&&l.buffered_io&&
++              l.integrity==IntegrityPolicy::ImmutableGenerationSelectedAudit,
++              Error::unsupported,"actual complete-main profile/output");
++        check(l.max_records>=count&&l.max_records<=65536&&l.max_batch&&l.max_batch<=8&&
++              l.max_shards>=shard_count&&l.max_shards<=256&&l.max_segments>=shard_count&&l.max_segments<=65536&&
++              l.max_payload_fds&&l.max_payload_fds<=64&&l.max_rank_fd_credits>=l.max_payload_fds+2&&
++              l.max_rank_fd_credits<=4096&&l.max_live_records&&l.max_live_records<=count&&
++              l.max_live_leases&&l.max_live_leases<=65536&&l.max_transactions&&
++              l.max_record_bytes>=record_bytes&&l.max_record_bytes<=SIZE_MAX&&
++              l.max_metadata_bytes&&l.max_metadata_bytes<=(512u<<20)&&
++              l.hot_bytes<=UINT64_MAX-l.cold_bytes&&l.cold_bytes>=record_bytes&&
++              l.io_chunk_bytes>=4096&&l.io_chunk_bytes<=1u<<20,
++              Error::invalid,"bounded actual-main rank limits");
++        const auto* program=authority->program();const auto* plan=authority->metadata_plan();
++        const auto& path=authority->root();const auto& receipt=authority->receipt();
++        check(program&&plan&&authority->generation()&&authority->rank()<4&&
++              program->ctx.world_size==4&&program->ctx.rank==int32_t(authority->rank())&&
++              program->ctx.max_tok==1&&program->ctx.max_seqs==1&&!program->ctx.max_spec&&
++              plan->world_size==4&&plan->rank==program->ctx.rank&&
++              !plan->units.empty()&&plan->units.size()<=l.max_records+8192&&
++              program->weights.size()<=4*l.max_records+8192&&
++              !path.empty()&&path[0]=='/'&&path.size()<=4096&&path.find('\0')==std::string::npos&&
++              authority->shards().size()==shard_count&&authority->descriptors().size()==count&&
++              authority->owned().size()==count&&authority->units().size()==count&&
++              receipt.records==count&&receipt.rank==authority->rank()&&receipt.bundle_id==authority->generation(),
++              Error::identity,"opaque complete-main rank/domain/profile");
++        // The shared complete bundle allowance is intentionally charged once per
++        // rank token (conservative duplication, NOT four physical copies). Parser
++        // and geometry construction peaks remain separate startup owner quotes.
++        const uint64_t retained_authority=add(receipt.immutable_metadata_reservation,
++                                              receipt.retained_bundle_reservation);
++        check(receipt.immutable_metadata_reservation&&receipt.retained_bundle_reservation,
++              Error::identity,"missing persistent authority reservations");
++        const uint64_t provider_metadata=add(4096,add(add(mul(count,1024),mul(shard_count,3072)),
++            add(mul(l.max_batch,256),add(mul(l.max_live_leases,256),mul(plan->units.size(),128)))));
++        const uint64_t persistent=add(provider_metadata,add(retained_authority,facade_metadata));
++        check(persistent<=l.max_metadata_bytes,Error::budget,"actual rank authority/cache/facade metadata cap");
++        // No catalog vectors, cache payloads or FDs precede this process admission.
++        auto token=std::make_shared<Token>();token->process=process->state_;token->world=4;
++        token->rank=authority->rank();token->fd_cap=l.max_rank_fd_credits;
++        {
++            std::lock_guard lock(token->process->mutex);size_t slot=token->process->slots.size();
++            for(size_t i=0;i<token->process->slots.size();++i){const auto& s=token->process->slots[i];
++                if(!s.owner.expired())check(s.world!=token->world||s.rank!=token->rank,Error::budget,"rank already owns budget token");
++                else if(slot==token->process->slots.size())slot=i;
++            }
++            check(slot<token->process->slots.size()&&
++                  persistent<=token->process->limits.max_metadata_bytes-token->process->usage.metadata_reserved&&
++                  l.hot_bytes+l.cold_bytes<=token->process->limits.max_cache_reservations-token->process->usage.cache_reserved,
++                  Error::budget,"process actual rank/cache/authority admission");
++            token->slot=slot;token->metadata=persistent;token->cache=l.hot_bytes+l.cold_bytes;
++            auto& usage=token->process->usage;usage.metadata_reserved+=persistent;usage.cache_reserved+=token->cache;
++            ++usage.rank_owners;token->committed=true;
++            usage.peak_metadata_reserved=std::max(usage.peak_metadata_reserved,usage.metadata_reserved);
++            token->process->slots[slot]={token,token->world,token->rank};
++        }
++        // The reader/binder already performed their own globally bounded source
++        // audit. Do not reopen their uncredited temporary source FDs here. This
++        // provider validates Program metadata plus its OWN credited root/shards.
++        check(authority->validate_program()==glm53::verified_main::Error::ok,
++              Error::identity,"verified rank changed before provider open");
++        auto generation=std::make_shared<Generation>();generation->token=token;generation->program=program;
++        generation->world=4;generation->rank=token->rank;generation->epoch=authority->generation();
++        generation->root_path=path;generation->root_stamp=authority->root_stamp();generation->main_authority=std::move(authority);
++        auto p=std::make_unique<StoreImpl>(l,generation);p->root=Fd::open(token,AT_FDCWD,path,O_RDONLY|O_DIRECTORY);
++        p->root_audit();generation->shards.reserve(shard_count);generation->records.resize(count);
++        const auto descriptors=generation->main_authority->descriptors();
++        const auto owned=generation->main_authority->owned();const auto units=generation->main_authority->units();
++        std::vector<uint8_t> claimed_units(plan->units.size(),0),claimed_records(count,0);
++        for(size_t s=0;s<shard_count;++s){const auto& input=generation->main_authority->shards()[s];
++            check(leaf(input.name)&&input.catalog&&input.catalog->records().size()==288&&
++                  input.catalog->segments().size()==1,Error::identity,"actual canonical layer catalog");
++            const auto first_file=uint32_t(generation->file_count);
++            check(input.catalog->segments().size()<=l.max_segments-generation->file_count,Error::budget,"actual segment cap");
++            generation->file_count+=input.catalog->segments().size();
++            for(const auto& record:input.catalog->records()){
++                check(record.key.world==4&&record.key.rank==generation->rank&&record.key.layer==int32_t(s)+3&&
++                      record.key.expert>=0&&record.key.expert<288&&
++                      record.key.record_class==native::RecordClass::main_mxfp4_e8m0&&record.segment==0&&
++                      record.length==record_bytes&&record.offset==uint64_t(record.key.expert)*record_bytes,
++                      Error::identity,"actual record key/segment/extent");
++                const size_t ordinal=s*288+size_t(record.key.expert);const auto& d=descriptors[ordinal];
++                const auto unit=units[ordinal];
++                check(!claimed_records[ordinal]&&unit>=0&&size_t(unit)<plan->units.size()&&!claimed_units[size_t(unit)]&&
++                      owned[ordinal].record==ordinal&&owned[ordinal].unit==unit&&
++                      d.world==4&&d.rank==generation->rank&&d.layer==record.key.layer&&d.expert==record.key.expert&&
++                      d.source_generation==generation->epoch&&d.checksum==record.checksum&&d.stride==int64_t(record_bytes),
++                      Error::identity,"actual ordinal/owned/typed descriptor binding");
++                uint64_t previous=0;
++                for(size_t m=0;m<4;++m){
++                    check(d.offsets[m]>=0&&d.bytes[m]>0&&uint64_t(d.offsets[m])==record.member_offsets[m]&&
++                          uint64_t(d.bytes[m])==record.member_bytes[m]&&record.member_offsets[m]>=previous&&
++                          record.member_offsets[m]<=record.length&&record.member_bytes[m]<=record.length-record.member_offsets[m],
++                          Error::identity,"actual typed member extent");
++                    previous=record.member_offsets[m]+record.member_bytes[m];
++                }
++                claimed_records[ordinal]=1;claimed_units[size_t(unit)]=1;
++                generation->records[ordinal]={record,uint32_t(s),first_file,unit};
++            }
++            generation->shards.push_back({input.name,input.catalog,first_file});
++        }
++        check(std::all_of(claimed_records.begin(),claimed_records.end(),[](auto x){return x==1;}),
++              Error::identity,"actual complete canonical record coverage");
++        p->cells.resize(count);p->fds.resize(l.max_payload_fds);p->unique.reserve(l.max_batch);p->work.reserve(l.max_batch);
++        p->selected_shards.reserve(std::min(shard_count,l.max_batch));p->file_heads.resize(shard_count,-1);
++        p->file_next.resize(generation->file_count,-1);p->file_marks.resize(generation->file_count,0);p->shard_marks.resize(shard_count,0);
++        p->counters.catalog_records=count;p->counters.segments=generation->file_count;p->counters.shards=shard_count;
++        p->counters.authority_verified_bytes=mul(count,record_bytes);
++        p->counters.authority_metadata_reservation=retained_authority;p->counters.facade_metadata_reservation=facade_metadata;
++        p->counters.startup_reserved_fd_peak=2;p->counters.startup_actual_fd_peak=2;
++        // Allocate the final owner BEFORE the last audits. No allocation hook
++        // can mutate the validated generation between those audits and publish.
++        auto result=std::unique_ptr<RankNativeStore>(new RankNativeStore(std::move(p)));
++        auto& ready=*result->impl_;
++        check(generation->main_authority->validate_program()==glm53::verified_main::Error::ok,
++              Error::identity,"actual rank changed during provider setup");
++        ready.root_audit();for(uint32_t s=0;s<shard_count;++s)ready.audit_shard(s,true);
++        *out=std::move(result);return Error::ok;
++    }catch(const Failure& e){explain(why,e.why);return e.error;}
++    catch(const std::bad_alloc&){explain(why,"actual provider allocation refused");return Error::no_memory;}
++    catch(...){explain(why,"unexpected actual provider setup failure");return Error::invalid;}
++}
++Error RankNativeStore::bind_main_handles(std::span<BoundRecord> out)const noexcept{try{
++    Active active;auto& p=*impl_;std::lock_guard lock(p.transaction);
++    check(!p.closed&&!p.closing.load()&&!p.generation->sealed.load(),Error::closed,"bind actual closed generation");
++    check(p.generation->main_authority&&out.data()&&out.size()==p.generation->records.size()&&out.size()==42*288,
++          Error::identity,"actual canonical handle output extent/profile");
++    // All failure checks precede assignments. Shared pointer copies and scalar
++    // assignment below cannot allocate, and no borrowed Program is inspected.
++    for(size_t n=0;n<out.size();++n){out[n].generation_=p.generation;out[n].ordinal_=uint32_t(n);}
++    return Error::ok;
++}catch(const Failure& e){return e.error;}catch(...){return Error::invalid;}}
+ Error RankNativeStore::bind(const native::Key& key,BoundRecord* out)const noexcept{try{
+     Active active;auto& p=*impl_;std::lock_guard lock(p.transaction);
+     check(out&&!p.closed&&!p.closing.load()&&!p.generation->sealed.load(),Error::closed,"bind output/closed generation");

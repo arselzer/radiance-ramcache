@@ -483,6 +483,166 @@ void fill_grid(uint8_t* out, const W* grid, int n) {
             out[k * (int)sizeof(W) + j] = (uint8_t)(grid[k] >> (8 * j));
 }
 
+/* ================================================================== packing a row's blocks
+ *
+ * Each pack_<type> is its unpack_<type> run backwards: plane i's row at row[i] -> the `nb` blocks
+ * of one row, every byte of each block written. Since the unpack copies every block field into a
+ * plane exactly (no value is rounded or dropped), unpack then pack returns the same bytes for any
+ * block, which is what lets a kernel read llama.cpp's own native-density blocks from a container
+ * that stores planes. Written for the types a kernel reads natively so far. */
+
+/* Reads a plane row front to back, `bits` per element, lowest bits first: Bits run backwards. */
+class BitsIn {
+  public:
+    explicit BitsIn(const uint8_t* row) : p_(row) {}
+    uint32_t get(int bits) {
+        while (n_ < bits) {
+            acc_ |= (uint64_t)*p_++ << n_;
+            n_ += 8;
+        }
+        const uint32_t v = (uint32_t)(acc_ & ((1ull << bits) - 1ull));
+        acc_ >>= bits;
+        n_ -= bits;
+        return v;
+    }
+
+  private:
+    const uint8_t* p_;
+    uint64_t acc_ = 0;
+    int      n_ = 0;
+};
+
+inline uint16_t get16(const uint8_t* row, int64_t i) {
+    return (uint16_t)(row[2 * i] | (uint16_t)row[2 * i + 1] << 8);
+}
+
+/* Element k of a nibble row (two codes a byte, element 2k low). */
+inline uint8_t nib(const uint8_t* row, int64_t k) {
+    return (uint8_t)((row[k / 2] >> (4 * (k % 2))) & 15);
+}
+
+void pack_q8_0(const uint8_t* const* row, int64_t nb, void* v) {
+    block_q8_0* b = (block_q8_0*)v;
+    for (int64_t i = 0; i < nb; ++i) {
+        std::memcpy(b[i].qs, row[0] + QK8_0 * i, QK8_0);
+        b[i].d = get16(row[1], i);
+    }
+}
+
+void pack_iq4_nl(const uint8_t* const* row, int64_t nb, void* v) {
+    block_iq4_nl* b = (block_iq4_nl*)v;
+    for (int64_t i = 0; i < nb; ++i) {
+        for (int j = 0; j < 16; ++j)
+            b[i].qs[j] = (uint8_t)(nib(row[0], 32 * i + j) | nib(row[0], 32 * i + j + 16) << 4);
+        b[i].d = get16(row[2], i);
+    }
+}
+
+/* get_scale_min_k4 run backwards: sub-block j's 6-bit scale and min into the 12 scale bytes. */
+inline void k4_put_scale_min(int j, uint32_t d, uint32_t m, uint8_t* q) {
+    if (j < 4) {
+        q[j] = (uint8_t)((q[j] & 0xC0) | (d & 63));
+        q[j + 4] = (uint8_t)((q[j + 4] & 0xC0) | (m & 63));
+    } else {
+        q[j + 4] = (uint8_t)((d & 0xF) | (m & 0xF) << 4);
+        q[j - 4] = (uint8_t)((q[j - 4] & 63) | (d >> 4) << 6);
+        q[j] = (uint8_t)((q[j] & 63) | (m >> 4) << 6);
+    }
+}
+
+void pack_q5_K(const uint8_t* const* row, int64_t nb, void* v) {
+    block_q5_K* b = (block_q5_K*)v;
+    BitsIn c(row[0]), s(row[1]), m(row[3]);
+    for (int64_t i = 0; i < nb; ++i) {
+        block_q5_K& x = b[i];
+        std::memset(x.qs, 0, sizeof x.qs);
+        std::memset(x.qh, 0, sizeof x.qh);
+        std::memset(x.scales, 0, sizeof x.scales);
+        for (int k = 0; k < QK_K; ++k) {
+            const uint32_t q = c.get(5);
+            uint8_t& lo = x.qs[32 * (k / 64) + k % 32];
+            lo |= (uint8_t)((k % 64) < 32 ? (q & 15) : (q & 15) << 4);
+            x.qh[k % 32] |= (uint8_t)(((q >> 4) & 1u) << (k / 32));
+        }
+        for (int j = 0; j < QK_K / 32; ++j) {
+            const uint32_t sc = s.get(6), mn = m.get(6);
+            k4_put_scale_min(j, sc, mn, x.scales);
+        }
+        x.d = get16(row[2], i);
+        x.dmin = get16(row[4], i);
+    }
+}
+
+void pack_q6_K(const uint8_t* const* row, int64_t nb, void* v) {
+    block_q6_K* b = (block_q6_K*)v;
+    BitsIn c(row[0]);
+    for (int64_t i = 0; i < nb; ++i) {
+        block_q6_K& x = b[i];
+        std::memset(x.ql, 0, sizeof x.ql);
+        std::memset(x.qh, 0, sizeof x.qh);
+        for (int k = 0; k < QK_K; ++k) {
+            const uint32_t q = (c.get(6) + 32u) & 63u;
+            const int n = k / 128, t = (k % 128) / 32, l = k % 32;
+            uint8_t& lo = x.ql[64 * n + l + 32 * (t & 1)];
+            lo |= (uint8_t)(t < 2 ? (q & 15) : (q & 15) << 4);
+            x.qh[32 * n + l] |= (uint8_t)((q >> 4) << (2 * t));
+        }
+        std::memcpy(x.scales, row[1] + (QK_K / 16) * i, QK_K / 16);
+        x.d = get16(row[2], i);
+    }
+}
+
+/* ksigns_iq2xs[i] is i with its parity in bit 7, so a sign byte's low seven bits are its index. */
+void pack_iq2_xxs(const uint8_t* const* row, int64_t nb, void* v) {
+    block_iq2_xxs* b = (block_iq2_xxs*)v;
+    BitsIn s(row[3]);
+    for (int64_t i = 0; i < nb; ++i) {
+        for (int ib32 = 0; ib32 < QK_K / 32; ++ib32) {
+            uint32_t a0 = 0, a1 = 0;
+            for (int l = 0; l < 4; ++l) {
+                a0 |= (uint32_t)row[0][32 * i + 4 * ib32 + l] << 8 * l;
+                a1 |= (uint32_t)(row[2][32 * i + 4 * ib32 + l] & 127u) << 7 * l;
+            }
+            a1 |= ((s.get(5) - 1u) / 2u) << 28;
+            uint16_t* q = b[i].qs + 4 * ib32;
+            q[0] = (uint16_t)a0;
+            q[1] = (uint16_t)(a0 >> 16);
+            q[2] = (uint16_t)a1;
+            q[3] = (uint16_t)(a1 >> 16);
+        }
+        b[i].d = get16(row[4], i);
+    }
+}
+
+void pack_iq1_s(const uint8_t* const* row, int64_t nb, void* v) {
+    block_iq1_s* b = (block_iq1_s*)v;
+    BitsIn c(row[0]), s(row[2]);
+    for (int64_t i = 0; i < nb; ++i) {
+        for (int ib = 0; ib < QK_K / 32; ++ib) {
+            uint32_t h = 0;
+            for (int l = 0; l < 4; ++l) {
+                const uint32_t code = c.get(11);
+                b[i].qs[4 * ib + l] = (uint8_t)code;
+                h |= ((code >> 8) & 7u) << 3 * l;
+            }
+            h |= ((s.get(4) - 1u) / 2u & 7u) << 12;
+            if (get16(row[4], (QK_K / 32) * i + ib) == iq1_zero(true)) h |= 0x8000u;
+            b[i].qh[ib] = (uint16_t)h;
+        }
+        b[i].d = get16(row[3], i);
+    }
+}
+
+struct PackEntry { ggml_type type; PackFn fn; };
+const PackEntry kPacks[] = {
+    { GGML_TYPE_Q8_0,    pack_q8_0 },
+    { GGML_TYPE_Q5_K,    pack_q5_K },
+    { GGML_TYPE_Q6_K,    pack_q6_K },
+    { GGML_TYPE_IQ4_NL,  pack_iq4_nl },
+    { GGML_TYPE_IQ2_XXS, pack_iq2_xxs },
+    { GGML_TYPE_IQ1_S,   pack_iq1_s },
+};
+
 }  /* namespace */
 
 /* ================================================================== the types */
@@ -508,6 +668,12 @@ const PlaneKind kPlaneKinds[] = {
     { "iq1_s",   GGML_TYPE_IQ1_S,   QK_K,   sizeof(block_iq1_s),   unpack_iq1_s },
     { "iq1_m",   GGML_TYPE_IQ1_M,   QK_K,   sizeof(block_iq1_m),   unpack_iq1_m },
 };
+
+PackFn pack_of(uint32_t type) {
+    for (const PackEntry& e : kPacks)
+        if ((uint32_t)e.type == type) return e.fn;
+    return nullptr;
+}
 
 const PlaneKind* plane_kind(uint32_t type) {
     for (const PlaneKind& k : kPlaneKinds)

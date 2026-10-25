@@ -9,6 +9,7 @@
 #include "rad_test.h"
 #include "format/checkpoint.h"
 #include "format/encoding.h"
+#include "../libquant/lq_ggml_planes.h"
 #include "rad_plugin.h"
 
 #include <cmath>
@@ -3204,3 +3205,46 @@ TEST(single_files_merge_by_name_and_read_their_metadata_elsewhere) {
 }
 
 RAD_TEST_MAIN()
+
+/* pack_of inverts unpack for the native-layout types: any bytes as blocks, unpacked into their
+ * planes and packed again, come back unchanged (every bit pattern is a valid block of these
+ * types: codes, scales and signs are copied, never interpreted). */
+TEST(ggml_pack_inverts_unpack_for_every_block) {
+    const uint32_t types[] = { 8 /* q8_0 */, 13 /* q5_K */, 14 /* q6_K */, 20 /* iq4_nl */,
+                               16 /* iq2_xxs */, 19 /* iq1_s */ };
+    uint64_t seed = 0x9E3779B97F4A7C15ull;
+    for (uint32_t ty : types) {
+        const lq::ggml::PlaneKind* k = lq::ggml::plane_kind(ty);
+        REQUIRE(k != nullptr);
+        const lq::ggml::PackFn pack = lq::ggml::pack_of(ty);
+        REQUIRE(pack != nullptr);
+        const RadEncoding e = lq::ggml::encoding_of(k->type);
+        for (int64_t nb : { (int64_t)1, (int64_t)3, (int64_t)7 }) {
+            std::vector<uint8_t> blocks((size_t)(nb * (int64_t)k->block_bytes)), back(blocks.size(), 0xA5);
+            for (uint8_t& b : blocks) {
+                seed = seed * 6364136223846793005ull + 1442695040888963407ull;
+                b = (uint8_t)(seed >> 56);
+            }
+            const int64_t cols = nb * k->block;
+            std::vector<std::vector<uint8_t>> planes((size_t)e.n_planes);
+            std::vector<uint8_t*> row((size_t)e.n_planes, nullptr);
+            for (int i = 0; i < e.n_planes; ++i) {
+                const RadEncPlane& pl = e.plane[i];
+                if (pl.kind == RAD_PLANE_TABLE || (pl.block[0] == 0 && pl.block[1] == 0)) continue;
+                int64_t pr = 0, pc = 0;
+                rad_enc_plane_dims(&pl, 1, cols, &pr, &pc);
+                planes[(size_t)i].assign((size_t)(rad_enc_row_bytes(pl.dtype, pc) + 8), 0);
+                row[(size_t)i] = planes[(size_t)i].data();
+            }
+            k->unpack(blocks.data(), nb, row.data());
+            pack((const uint8_t* const*)row.data(), nb, back.data());
+            CHECK(blocks == back);
+            if (blocks != back) {
+                size_t at = 0;
+                while (at < blocks.size() && blocks[at] == back[at]) ++at;
+                fprintf(stderr, "  %s nb=%lld: first byte differing at %zu of %zu (%02x vs %02x)\n",
+                        k->name, (long long)nb, at, blocks.size(), blocks[at], back[at]);
+            }
+        }
+    }
+}

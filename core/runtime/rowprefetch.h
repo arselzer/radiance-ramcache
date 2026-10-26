@@ -24,12 +24,34 @@
  * so with rad_kernel_fetches_rows (rad_abi.h) and is left alone: the page cache would read each of
  * its rows a second time.
  *
+ * A hint costs a syscall a page whether or not the page is resident (~0.5 us alone, ~0.8 us with
+ * every rank asking at once: the ranks share one mapping, and the asking does not scale across
+ * threads). That is nothing beside a decode step's ~50 pages, but a prefill chunk's gather names
+ * hundreds of thousands (8192 tokens x 24 rows x 2 planes = 393k pages, ~240 ms of hints a rank),
+ * and asked in front of the kernel it held up the card at the first Engram layer for all of it,
+ * though a repeated prompt's pages were all resident and the kernel itself took ~60 ms. A
+ * read-ahead longer than kRowAheadInline pages therefore first samples whether its rows are
+ * resident (mincore on kRowAheadSample rows spread over the ids, ~0.1 ms):
+ * - any sampled page out: in front of the kernel, as before. Run beside a kernel whose threads
+ *   fault on the pages the hints have not reached yet, the same cold gather took 830 ms a call
+ *   instead of 370 (TP4 DeepSeek-V4.1, 16k prompt, caches dropped): the faults queue behind the
+ *   hints instead of waiting on reads already in flight.
+ * - every sampled page in: BESIDE the kernel (RowPrefetchWorker, one helper thread a rank), which
+ *   walks the ids from the first while the kernel gathers and stops when it returns, so the few
+ *   pages the sample missed are still asked for without the kernel waiting on the asking.
+ * The hints are the same pages either way, so the output cannot change.
+ *
  * RADIANCE_ROW_PREFETCH=0 turns it off, for an A/B of the gather's cost.
  */
 #pragma once
+#include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
 #include <string>
+#include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -67,7 +89,9 @@ struct RowPrefetchScratch {
 /* Rows [0, m) of `ids` (I32, U32, I64 or I16; any strides), read through `rp` against the bound
  * tensors `t` (the table operands' data). Calls `emit` with every merged run, sorted, when the
  * scratch fills or the ids end; returns the pages covered, or -1 for an id dtype it cannot read
- * (nothing is emitted then). Without syscalls, so the page arithmetic is testable on its own. */
+ * (nothing is emitted then). Without syscalls, so the page arithmetic is testable on its own.
+ * An `emit` that returns bool stops the walk by returning false (the pages emitted so far are
+ * returned); one that returns void sees every run. */
 template <class Emit>
 int64_t row_page_runs(const RowPrefetch& rp, const RadTensor& ids, int64_t m, const RadTensor* t,
                       int64_t page, RowPrefetchScratch* s, Emit&& emit);
@@ -78,6 +102,47 @@ int64_t row_prefetch(const RowPrefetch& rp, const RadTensor& ids, int64_t m, con
 
 /* The system's page size, read once. */
 int64_t row_prefetch_page();
+
+/* A read-ahead whose upper bound (ids x tables) is above this samples residency first and runs
+ * beside its kernel when the sample is all in (RowPrefetchWorker); at or below it, always in front
+ * of the kernel as before. 1024 hints are ~0.5 ms: every decode and verify gather stays in front
+ * (DeepSeek-V4.1: 24 rows x 2 planes a token). */
+static const int64_t kRowAheadInline = 1024;
+static const int     kRowAheadSample = 64;
+
+/* Whether every table page of kRowAheadSample rows spread evenly over ids [0, m) is resident
+ * (mincore). False on the first page out, an id dtype it cannot read, or a failed mincore. */
+bool row_pages_resident(const RowPrefetch& rp, const RadTensor& ids, int64_t m, const RadTensor* t);
+
+/* One helper thread that runs a read-ahead beside its kernel: start() hands it the ids and tables
+ * and returns at once; finish(), called when the kernel has returned, stops the walk at the next
+ * run, waits until the helper no longer reads the ids, and returns the pages it asked for. The
+ * ids and table operands must stay valid and unwritten between the two (the gather only reads
+ * them). The thread starts at the first start() and ends with the object. */
+class RowPrefetchWorker {
+public:
+    RowPrefetchWorker() = default;
+    RowPrefetchWorker(const RowPrefetchWorker&) = delete;
+    RowPrefetchWorker& operator=(const RowPrefetchWorker&) = delete;
+    ~RowPrefetchWorker();
+    void    start(const RowPrefetch& rp, const RadTensor& ids, int64_t m, const RadTensor* t);
+    int64_t finish();
+    bool    busy() const { return busy_.load(std::memory_order_acquire); }
+
+private:
+    void loop();
+    std::thread             th_;
+    std::mutex              mu_;
+    std::condition_variable cv_;
+    bool                    have_ = false, quit_ = false;   /* under mu_ */
+    std::atomic<bool>       busy_{false}, stop_{false};
+    /* The job: tables compacted to positions 0..n-1. */
+    RowPrefetch             rp_{};
+    RadTensor               ids_{};
+    RadTensor               t_[kRowTablesMax]{};
+    int64_t                 m_ = 0, pages_ = 0;
+    RowPrefetchScratch      s_;
+};
 
 /* ------------------------------------------------------------------ implementation */
 
@@ -95,17 +160,22 @@ int64_t row_page_runs(const RowPrefetch& rp, const RadTensor& ids, int64_t m, co
     if (!row_id_at(ids, 0, &probe)) return -1;
     const uintptr_t mask = ~(uintptr_t)(page - 1);
     int64_t pages = 0;
+    bool go = true;
     auto flush = [&] {
         if (s->runs.empty()) return;
         row_runs_merge(&s->runs);
         for (const PageRun& r : s->runs) {
+            if constexpr (std::is_same_v<decltype(emit(r)), bool>) {
+                if (!emit(r)) { go = false; break; }
+            } else {
+                emit(r);
+            }
             pages += (int64_t)((r.second - r.first) / (uintptr_t)page);
-            emit(r);
         }
         s->runs.clear();
     };
     const size_t cap = s->cap ? s->cap : 1024;
-    for (int64_t i = 0; i < m; ++i) {
+    for (int64_t i = 0; i < m && go; ++i) {
         int64_t id;
         row_id_at(ids, i, &id);
         id -= rp.voff;
@@ -120,7 +190,8 @@ int64_t row_page_runs(const RowPrefetch& rp, const RadTensor& ids, int64_t m, co
             s->runs.emplace_back(first, last);
         }
     }
-    flush();
+    if (go) flush();
+    s->runs.clear();
     return pages;
 }
 

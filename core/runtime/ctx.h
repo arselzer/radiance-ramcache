@@ -377,6 +377,9 @@ public:
      * (runtime/rowprefetch.h); tests read them. */
     int64_t     row_prefetch_calls() const { return rowpf_calls_; }
     int64_t     row_prefetch_pages() const { return rowpf_pages_; }
+    /* Of the calls, those whose read-ahead ran beside the kernel (runtime/rowprefetch.h). */
+    int64_t     row_prefetch_beside_calls() const { return rowpf_beside_calls_; }
+    bool        row_prefetch_busy() const { return rowpf_worker_ && rowpf_worker_->busy(); }
     /* This rank's all-reduce traffic. The inter-card link carries both the tensor-parallel
      * all-reduce and the expert mover's transfers; the mover counts its own (MoverStats), so the
      * two can be told apart.
@@ -752,14 +755,19 @@ private:
     bool      host_join_drains(const RadOperand* opd, int n_opd) const;
     int       host_join_wait(bool drain);
     /* Read ahead a host gather's rows on the mapped tier (runtime/rowprefetch.h): which tables
-     * this issue reads there, then the madvise over the rows `t[0]` names. Off with
+     * this issue reads there, then the madvise over the rows `t[0]` names -- in front of the
+     * kernel, or beside it on rowpf_worker_ when longer than kRowAheadInline and its sampled rows
+     * are resident; row_prefetch_done() after the kernel returns stops and joins that. Off with
      * RADIANCE_ROW_PREFETCH=0. */
     bool      row_prefetch_on_ = true;
     RowPrefetchScratch rowpf_;
-    int64_t   rowpf_calls_ = 0, rowpf_pages_ = 0;
+    int64_t   rowpf_calls_ = 0, rowpf_pages_ = 0, rowpf_beside_calls_ = 0;
+    std::unique_ptr<RowPrefetchWorker> rowpf_worker_;
+    bool      rowpf_beside_ = false;   /* a read-ahead runs beside the kernel being launched */
     void      row_prefetch_plan(const RadArgs& a, const RadOperand* opd, int n_opd,
                                 const RadTensor* t, RowPrefetch* out) const;
     void      row_prefetch_run(const RowPrefetch& rp, const RadTensor* t, int64_t n);
+    void      row_prefetch_done();
     /* A lane issued a scratch user and the other lane has not been joined behind it since. Keeps
      * two lanes off the shared region at once; lane_join clears its `from` side. See the scratch
      * block in Ctx::issue. */

@@ -2580,23 +2580,29 @@ struct ColdTable {
 
 const ColdTable* g_cold = nullptr;
 int64_t g_cold_rb = 0, g_cold_rows = 0;
+int64_t g_cold_n = 4;            /* ids the probe kernel reads */
 double  g_cold_wait_ms = 0;      /* how long the probe kernel waits for its rows */
 bool    g_cold_rows_in = false;  /* every row it was asked for came in */
 int64_t g_cold_other = -1;       /* resident pages of a row nobody asked for */
+int64_t g_cold_other_row = 900;
 
 /* A gather that reads nothing itself: it waits, up to g_cold_wait_ms, for the pages of the rows
  * its ids name to arrive in the page cache. Only a read ahead can bring them. */
 int k_cold_gather(const RadArgs* a, RadStream) {
     const int32_t* ids = (const int32_t*)a->t[0].data;
     const auto t0 = std::chrono::steady_clock::now();
+    const int64_t pg = rad::row_prefetch_page();
+    const int64_t np = (g_cold_rows * g_cold_rb + pg - 1) / pg;
+    std::vector<unsigned char> v((size_t)np);
     g_cold_rows_in = false;
     for (;;) {
-        bool all = true;
-        for (int i = 0; i < 4; ++i) {
+        /* One mincore over the table, then the named rows' pages from it. */
+        bool all = ::mincore(g_cold->base, (size_t)(np * pg), v.data()) == 0;
+        for (int64_t i = 0; all && i < g_cold_n; ++i) {
             if (ids[i] < 0 || ids[i] >= g_cold_rows) continue;
-            if (g_cold->resident_pages(ids[i] * g_cold_rb, g_cold_rb) !=
-                (ids[i] * g_cold_rb + g_cold_rb + 4095) / 4096 - ids[i] * g_cold_rb / 4096)
-                all = false;
+            const int64_t a0 = ids[i] * g_cold_rb / pg, a1 = (ids[i] * g_cold_rb + g_cold_rb - 1) / pg;
+            for (int64_t p = a0; p <= a1; ++p)
+                if (!(v[(size_t)p] & 1)) all = false;
         }
         if (all) { g_cold_rows_in = true; break; }
         if (std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() >
@@ -2604,24 +2610,25 @@ int k_cold_gather(const RadArgs* a, RadStream) {
             break;
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
-    g_cold_other = g_cold->resident_pages(900 * g_cold_rb, g_cold_rb);
+    g_cold_other = g_cold->resident_pages(g_cold_other_row * g_cold_rb, g_cold_rb);
     return RAD_OK;
 }
 
 /* One step issuing an embed_lookup_q over a mapped table of `rows` x `rb` from `ct`, with the
- * ids `ids`. Returns the Ctx's read-ahead counters. */
-struct ColdRun { int status = RAD_OK; int64_t calls = 0, pages = 0; };
-ColdRun cold_run(const ColdTable& ct, int64_t rows, int64_t rb, const int32_t ids[4], double wait_ms,
-                 bool fetches_rows = false) {
+ * ids `ids` (n of them). Returns the Ctx's read-ahead counters. */
+struct ColdRun { int status = RAD_OK; int64_t calls = 0, pages = 0, beside = 0; bool busy_after = false; };
+ColdRun cold_run(const ColdTable& ct, int64_t rows, int64_t rb, const int32_t* ids, int64_t n,
+                 double wait_ms, bool fetches_rows = false) {
     ColdRun out;
     g_cold = &ct;
     g_cold_rb = rb;
     g_cold_rows = rows;
+    g_cold_n = n;
     g_cold_wait_ms = wait_ms;
     Fixture f;
-    rad_buf ib = f.add_buffer("ids", RAD_I32, 4, 1, 0);
+    rad_buf ib = f.add_buffer("ids", RAD_I32, n, 1, 0);
     f.P.buffers[ib].decl.domain = RAD_DOMAIN_HOST;
-    rad_buf xb = f.add_buffer("x", RAD_BF16, 4, 8, 256);
+    rad_buf xb = f.add_buffer("x", RAD_BF16, n, 8, 256);
     rad_weight w = f.add_weight("ngram.weight", RAD_U8, rows, rb, ct.base);
     rad::WeightInfo& wi = f.P.weights[w];
     wi.tier = rad::Tier::Mapped;
@@ -2639,13 +2646,15 @@ ColdRun cold_run(const ColdTable& ct, int64_t rows, int64_t rb, const int32_t id
     out.status = f.start();
     if (out.status < 0) return out;
     if (f.ctx.set_op_domain(op, RAD_DOMAIN_HOST) != RAD_OK) { out.status = RAD_E_STATE; return out; }
-    std::memcpy(f.ctx.buf_ptr(ib), ids, 4 * sizeof(int32_t));
-    out.status = f.step(4, 0, [&](Ctx& c) {
+    std::memcpy(f.ctx.buf_ptr(ib), ids, (size_t)n * sizeof(int32_t));
+    out.status = f.step(n, 0, [&](Ctx& c) {
         const RadOperand o[3] = { RAD_B(ib), RAD_W(w), RAD_B(xb) };
         CHECK_OK(c.issue(op, o, 3, RAD_N_BATCH));
     });
+    out.busy_after = f.ctx.row_prefetch_busy();
     out.calls = f.ctx.row_prefetch_calls();
     out.pages = f.ctx.row_prefetch_pages();
+    out.beside = f.ctx.row_prefetch_beside_calls();
     rad_stream_sync(f.ctx.stream());
     f.ctx.shutdown();
     return out;
@@ -2661,14 +2670,16 @@ TEST(a_host_gather_from_the_mapped_tier_reads_its_rows_ahead_of_its_kernel) {
     if (!rad::device_is_host()) SKIP("the probe kernel runs on the host backend's host domain");
     const int64_t rows = 1024, rb = 1000;   /* 250 pages; rows straddle pages */
     const int32_t ids[4] = { 3, 200, 201, 4000 };   /* 4000: past the table, skipped */
+    g_cold_other_row = 900;
     {
         ColdTable ct(radtest::tmp_path("rowpf-a.bin"), rows * rb);
         if (!ct.base) SKIP("could not write and map a table under %s", radtest::tmpdir().c_str());
         if (!ct.cold) SKIP("this filesystem keeps a file's pages cached after POSIX_FADV_DONTNEED "
                            "(tmpfs?), so a read ahead cannot be told from none");
-        const ColdRun r = cold_run(ct, rows, rb, ids, 3000.0);
+        const ColdRun r = cold_run(ct, rows, rb, ids, 4, 3000.0);
         CHECK_OK(r.status);
         CHECK_EQ(r.calls, (int64_t)1);
+        CHECK_EQ(r.beside, (int64_t)0);   /* 4 ids: in front of the kernel */
         /* row 3: [3000, 4000) page 0; rows 200-201: [200000, 202000) pages 48-49 */
         CHECK_EQ(r.pages, (int64_t)3);
         CHECK(g_cold_rows_in);
@@ -2678,7 +2689,7 @@ TEST(a_host_gather_from_the_mapped_tier_reads_its_rows_ahead_of_its_kernel) {
         ColdTable ct(radtest::tmp_path("rowpf-b.bin"), rows * rb);
         REQUIRE(ct.base && ct.cold);
         setenv("RADIANCE_ROW_PREFETCH", "0", 1);
-        const ColdRun r = cold_run(ct, rows, rb, ids, 50.0);
+        const ColdRun r = cold_run(ct, rows, rb, ids, 4, 50.0);
         unsetenv("RADIANCE_ROW_PREFETCH");
         CHECK_OK(r.status);
         CHECK_EQ(r.calls, (int64_t)0);
@@ -2688,10 +2699,76 @@ TEST(a_host_gather_from_the_mapped_tier_reads_its_rows_ahead_of_its_kernel) {
         /* A kernel that fetches its rows itself (rad_kernel_fetches_rows) is left alone. */
         ColdTable ct(radtest::tmp_path("rowpf-c.bin"), rows * rb);
         REQUIRE(ct.base && ct.cold);
-        const ColdRun r = cold_run(ct, rows, rb, ids, 50.0, true);
+        const ColdRun r = cold_run(ct, rows, rb, ids, 4, 50.0, true);
         CHECK_OK(r.status);
         CHECK_EQ(r.calls, (int64_t)0);
         CHECK(!g_cold_rows_in);
+    }
+}
+
+/* A read-ahead longer than kRowAheadInline (a prefill chunk's gather) samples its rows' residency:
+ * cold, it runs in front of the kernel as before (the rows arrive without the kernel touching
+ * them, a row nobody named stays out); warm, it runs beside the kernel, and when the kernel
+ * returns before the helper is through, the helper has stopped by the time the issue returns (it
+ * reads the ids, which the next step rewrites). One sampled page out sends it in front again. */
+TEST(a_long_host_gather_reads_its_rows_ahead_beside_its_kernel_when_they_are_resident) {
+    if (!rad::device_is_host()) SKIP("the probe kernel runs on the host backend's host domain");
+    const int64_t rows = 8192, rb = 4096;   /* a page a row, 32 MiB */
+    std::vector<int32_t> ids(6000);         /* the op's band ends at 8192 rows */
+    for (size_t i = 0; i < ids.size(); ++i) ids[i] = (int32_t)(i * 4 % 8000 + i * 4 / 8000);
+    std::sort(ids.begin(), ids.end());
+    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+    const int64_t n = (int64_t)ids.size();
+    REQUIRE(n > rad::kRowAheadInline);
+    g_cold_other_row = 8100;   /* past every named row (ids < 8000 + 3) */
+    auto warm = [&](const ColdTable& ct) {
+        volatile uint8_t s = 0;
+        for (int64_t p = 0; p < rows * rb; p += 4096) s = s + ct.base[p];
+        (void)s;
+    };
+    {
+        ColdTable ct(radtest::tmp_path("rowpf-d.bin"), rows * rb);
+        if (!ct.base) SKIP("could not write and map a table under %s", radtest::tmpdir().c_str());
+        if (!ct.cold) SKIP("this filesystem keeps a file's pages cached after POSIX_FADV_DONTNEED "
+                           "(tmpfs?), so a read ahead cannot be told from none");
+        const ColdRun r = cold_run(ct, rows, rb, ids.data(), n, 20000.0);
+        CHECK_OK(r.status);
+        CHECK_EQ(r.calls, (int64_t)1);
+        CHECK_EQ(r.beside, (int64_t)0);   /* cold: in front */
+        CHECK(g_cold_rows_in);
+        CHECK_EQ(r.pages, n);
+        CHECK_EQ(g_cold_other, (int64_t)0);
+    }
+    {
+        /* Warm, and the kernel returns at once: beside, and stopped and idle at the return. */
+        ColdTable ct(radtest::tmp_path("rowpf-e.bin"), rows * rb);
+        REQUIRE(ct.base && ct.cold);
+        warm(ct);
+        const ColdRun r = cold_run(ct, rows, rb, ids.data(), n, 0.0);
+        CHECK_OK(r.status);
+        CHECK_EQ(r.calls, (int64_t)1);
+        CHECK_EQ(r.beside, (int64_t)1);
+        CHECK(g_cold_rows_in);
+        CHECK(!r.busy_after);
+        CHECK(r.pages <= n);
+    }
+    {
+        /* The sample itself: every sampled row in -> true; the first sampled row's page out
+         * -> false; a cold table -> false. */
+        ColdTable ct(radtest::tmp_path("rowpf-f.bin"), rows * rb);
+        REQUIRE(ct.base && ct.cold);
+        RadTensor t[2]{};
+        t[0].data = ids.data(); t[0].dtype = RAD_I32; t[0].rank = 1; t[0].shape[0] = n; t[0].stride[0] = 1;
+        t[1].data = ct.base;
+        rad::RowPrefetch rp;
+        rp.n = 1; rp.opd[0] = 1; rp.row_bytes[0] = rb; rp.rows = rows;
+        CHECK(!rad::row_pages_resident(rp, t[0], n, t));
+        warm(ct);
+        CHECK(rad::row_pages_resident(rp, t[0], n, t));
+        const int64_t first = ids[(size_t)(n / (2 * rad::kRowAheadSample))];
+        ::madvise(ct.base + first * rb, 4096, MADV_DONTNEED);
+        ::posix_fadvise(ct.fd, first * rb, 4096, POSIX_FADV_DONTNEED);
+        CHECK(!rad::row_pages_resident(rp, t[0], n, t));
     }
 }
 

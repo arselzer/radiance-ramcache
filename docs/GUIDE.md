@@ -804,7 +804,10 @@ from the container through a row cache with direct reads on the host; about half
 are first-seen, so steps wait on the drive. (That is libavx's `embed_lookup_q`. A host gather
 without a row source of its own, such as libref's `embed_lookup_planes` over a GGUF table's planes,
 reads through the mapping; the engine then asks for every page a step's rows cover before the
-gather runs, so the drive answers them together rather than one fault at a time.
+gather runs, so the drive answers them together rather than one fault at a time. A long gather
+(a prefill chunk's) whose sampled rows are already resident is asked for beside the gather
+instead, so a warm chunk does not wait for the asking: ~0.5 us a page, ~240 ms a rank for an
+8192-token Engram chunk.
 `RADIANCE_ROW_PREFETCH=0` turns that off.) `ram` copies the table into host memory at load (12 to
 40 s more startup, depending on the page cache) and the card's gather kernel reads the pinned copy,
 so a step has no host work. `vram` puts all of it on every card. `ram` needs the table's size free

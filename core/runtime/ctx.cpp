@@ -64,6 +64,8 @@ int Ctx::init(const CtxDesc& d) {
 void Ctx::shutdown() {
     oracle_close();
     xp_close();
+    row_prefetch_done();
+    rowpf_worker_.reset();   /* joins the read-ahead helper, if one started */
     /* Teardown sync, before freeing memory the streams may still use: the routing staging is the
      * destination of unwaited copies (spec §5.5) and the arena holds every kernel's operands. */
     if (stream_) rad_stream_sync(stream_);
@@ -880,9 +882,9 @@ void Ctx::dump_profile() const {
     fprintf(stderr, "  %10s %12.3f   (waited %.3f ms besides)\n\n", "total", total, waited);
     if (rowpf_calls_)
         fprintf(stderr, "  row read-ahead: %lld host gather(s) from the mapped tier asked for %lld "
-                        "page(s) ahead of their kernel (runtime/rowprefetch.h; "
-                        "RADIANCE_ROW_PREFETCH=0 turns it off)\n\n",
-                (long long)rowpf_calls_, (long long)rowpf_pages_);
+                        "page(s) ahead of their kernel, %lld of them beside it "
+                        "(runtime/rowprefetch.h; RADIANCE_ROW_PREFETCH=0 turns it off)\n\n",
+                (long long)rowpf_calls_, (long long)rowpf_pages_, (long long)rowpf_beside_calls_);
 }
 
 /* ================================================================== the step driver */
@@ -1272,6 +1274,7 @@ int Ctx::play_pass(PassTape& t) {
                 th.args.t = th.t;
                 if (th.rp.n) row_prefetch_run(th.rp, th.t, th.n);
                 rc = th.launch(&th.args, cur_stream());
+                row_prefetch_done();
                 rad_dev_host_wrote();
             }
             lane_ = l0;

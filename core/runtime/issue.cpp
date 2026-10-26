@@ -1076,6 +1076,8 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
         /* The launch alone, split from the band scan and operand resolution `own` covers above. */
         s = ip.launch(la, cur_stream());
     }
+    /* A read-ahead beside a host gather stops with its kernel (runtime/rowprefetch.h). */
+    if (rowpf_beside_) row_prefetch_done();
     if (hold) {
         /* Always released, by a barrier unless the launch ended the hold itself
          * (RAD_LINK_ENDED); otherwise a list waiting on the hold never ends. */
@@ -1203,10 +1205,29 @@ void Ctx::row_prefetch_plan(const RadArgs& a, const RadOperand* opd, int n_opd, 
 void Ctx::row_prefetch_run(const RowPrefetch& rp, const RadTensor* t, int64_t n) {
     const int64_t have = rad_tensor_numel(&t[0]);
     const int64_t m = have > 0 && have < n ? have : n;
+    if (m > 0 && rp.n > 0 && m * rp.n > kRowAheadInline && t[0].data &&
+        row_pages_resident(rp, t[0], m, t)) {
+        /* Long and its sampled rows resident: beside the kernel (rowprefetch.h);
+         * row_prefetch_done() after its launch. */
+        if (!rowpf_worker_) rowpf_worker_ = std::make_unique<RowPrefetchWorker>();
+        rowpf_worker_->start(rp, t[0], m, t);
+        rowpf_beside_ = true;
+        ++rowpf_calls_;
+        ++rowpf_beside_calls_;
+        return;
+    }
     const int64_t pages = row_prefetch(rp, t[0], m, t, &rowpf_);
     if (pages < 0) return;
     ++rowpf_calls_;
     rowpf_pages_ += pages;
+}
+
+/* The kernel a read-ahead ran beside has returned (or never launched): stop the helper and wait
+ * until it no longer reads the ids, before anything may write them. */
+void Ctx::row_prefetch_done() {
+    if (!rowpf_beside_) return;
+    rowpf_beside_ = false;
+    rowpf_pages_ += rowpf_worker_->finish();
 }
 
 /* Whether any operand is untracked by the host arena, so the join must drain the stream. */
@@ -1237,6 +1258,7 @@ int Ctx::host_join_wait(bool drain) {
 /* ================================================================== the cold paths */
 
 int Ctx::abort_step(rad_op h, int band, int dom, const IssuePlan& ip, int64_t n, int status) {
+    row_prefetch_done();   /* no helper outlives the op that started it */
     const OpInfo&   o     = *plans_[h].info;
     const char*     kname = ip.row && ip.row->info ? ip.row->info->name : "<unnamed>";
     const char*     pname = ip.row ? ip.row->plugin.c_str() : "<unknown plugin>";

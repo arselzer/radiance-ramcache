@@ -594,16 +594,7 @@ static rad_op entry_store(RadBuilder* b, int64_t rows, int64_t n, int64_t bs, ra
  * the same bytes as the chain (a kernel library's `replaces`). A decode step pays a fixed cost per
  * dependent launch, so this is most of what the small ops cost there. They are device-only (libr4d
  * declares them; libref has no row): each declares the fused op only where a loaded library
- * declares and serves it, and returns 0 otherwise, and the caller then declares the chain.
- * Switches for A/B, default on:
- * RADIANCE_DS41_FUSE=0 all, RADIANCE_DS41_FUSE_KEY=0 the window and index keys' norm + rope + round
- * trip, RADIANCE_DS41_FUSE_ROPE=0 rope + round trip (attention output, compressed latent, index
- * query), RADIANCE_DS41_FUSE_COLLAPSE=0 the sublayer inputs' collapse + norm. */
-static bool fuse_on(const char* env) {
-    const char* a = std::getenv("RADIANCE_DS41_FUSE");
-    const char* e = std::getenv(env);
-    return !(a && a[0] == '0') && !(e && e[0] == '0');
-}
+ * declares and serves it, and returns 0 otherwise, and the caller then declares the chain. */
 static rad_op fused(RadBuilder* b, const char* name, std::vector<RadParam> ps,
                     std::vector<rad_weight> ws, std::initializer_list<rad_buf> rd,
                     std::initializer_list<rad_buf> wr) {
@@ -617,7 +608,7 @@ static rad_op fused(RadBuilder* b, const char* name, std::vector<RadParam> ps,
 static rad_op norm_rope_rt(RadBuilder* b, const Model& m, int64_t rows, rad_weight w, int64_t n,
                            int64_t block, const char* fmt, const char* scale, rad_buf x, rad_buf y,
                            rad_buf cs) {
-    if (debug_noq() || !fuse_on("RADIANCE_DS41_FUSE_KEY")) return 0;
+    if (debug_noq()) return 0;
     return fused(b, "rmsnorm_rope_roundtrip",
                  { RAD_RANGE("M", 1, rows), RAD_INT("n", n), RAD_F64("eps", m.c.eps),
                    RAD_INT("n_head", 1), RAD_INT("head_dim", n), RAD_INT("rot", m.c.rope),
@@ -630,7 +621,7 @@ static rad_op norm_rope_rt(RadBuilder* b, const Model& m, int64_t rows, rad_weig
 static rad_op rope_rt(RadBuilder* b, const Model& m, int64_t rows, int64_t heads, int64_t hd,
                       int inverse, int64_t block, const char* fmt, const char* scale, rad_buf x,
                       rad_buf cs) {
-    if (debug_noq() || !fuse_on("RADIANCE_DS41_FUSE_ROPE")) return 0;
+    if (debug_noq()) return 0;
     return fused(b, "rope_rows_roundtrip",
                  { RAD_RANGE("M", 1, rows), RAD_INT("n_head", heads), RAD_INT("head_dim", hd),
                    RAD_INT("rot", m.c.rope), RAD_INT("off", hd - m.c.rope), RAD_STR("mode", "gptj"),
@@ -641,18 +632,16 @@ static rad_op rope_rt(RadBuilder* b, const Model& m, int64_t rows, int64_t heads
 /* mhc_collapse (h, pre -> x) then rmsnorm (x, w -> y), as one op. */
 static rad_op collapse_norm(RadBuilder* b, const Model& m, int64_t rows, rad_weight w, rad_buf h,
                             rad_buf pre, rad_buf x, rad_buf y) {
-    if (!fuse_on("RADIANCE_DS41_FUSE_COLLAPSE")) return 0;
     return fused(b, "mhc_collapse_rmsnorm",
                  { RAD_RANGE("M", 1, rows), RAD_INT("n", m.c.n_embd), RAD_INT("hc", m.c.hc),
                    RAD_F64("eps", m.c.eps), RAD_STR("dtype", "bf16") },
                  { w }, { h, pre }, { x, y });
 }
 /* mhc_post (in, h, post, comb -> out), mhc_collapse (out, pre -> x), rmsnorm (x, w -> y), as one
- * op. RADIANCE_DS41_FUSE_POST=0 keeps mhc_post apart (then collapse_norm() as before). */
+ * op. */
 static rad_op post_collapse_norm(RadBuilder* b, const Model& m, int64_t rows, rad_weight w,
                                  rad_buf in, rad_buf h, rad_buf out, rad_buf pre, rad_buf x,
                                  rad_buf y) {
-    if (!fuse_on("RADIANCE_DS41_FUSE_COLLAPSE") || !fuse_on("RADIANCE_DS41_FUSE_POST")) return 0;
     return fused(b, "mhc_post_collapse_rmsnorm",
                  { RAD_RANGE("M", 1, rows), RAD_INT("n", m.c.n_embd), RAD_INT("hc", m.c.hc),
                    RAD_F64("eps", m.c.eps), RAD_STR("dtype", "bf16") },
@@ -2107,24 +2096,13 @@ static void step(RadCtx* x, const RadBatch* batch) {
          * unordered when it touches nothing in flight). Each connection's collapse reads the gates
          * the previous connection's mix wrote, never what its own mix writes, and nothing reads a
          * mix's output before the next mhc_post. So, same kernels on the same operands:
-         * - RADIANCE_DS41_MIX_LATE (default on): on an attention rank the attention mix goes
-         *   between the output projection's groups and attn_output_b, where its launches overlap
-         *   those GEMVs instead of running nearly alone at the layer's start.
-         * - RADIANCE_DS41_COLLAPSE_FIRST (default on): where the collapse is its own op (no fused
-         *   mhc_post before it: the first layer, after an Engram block, the attention-zero rank,
-         *   RADIANCE_DS41_FUSE_POST=0) and the mix is not moved, the collapse goes first; the mix's
-         *   second launch, ordered anyway, is then the barrier the norm needs.
-         * =0 on both (with RADIANCE_DS41_MIX_F_BESIDE=0 and RADIANCE_DS41_SIDE_INTERLEAVE=0 below)
-         * restores the order before them. */
-        static const bool col_first = [] {
-            const char* e = std::getenv("RADIANCE_DS41_COLLAPSE_FIRST");
-            return !(e && e[0] == '0');
-        }();
-        static const bool mix_late = [] {
-            const char* e = std::getenv("RADIANCE_DS41_MIX_LATE");
-            return !(e && e[0] == '0');
-        }();
-        const bool late = mix_late && !m.zero;
+         * - the collapse goes first. Where it is its own op (no fused mhc_post before it: the
+         *   first layer, after an Engram block, the attention-zero rank) the mix's second launch,
+         *   ordered anyway, is then the barrier the norm needs;
+         * - on an attention rank the attention mix goes between the output projection's groups
+         *   and attn_output_b, where its launches overlap those GEMVs instead of running nearly
+         *   alone at the layer's start; on the attention-zero rank it follows the collapse. */
+        const bool late = !m.zero;
         const auto mix_a = [&] {
             RAD_ISSUE_N(x, L.mix_a, T, brows(m.h0, T), RAD_W(L.hc_a_fn), RAD_W(L.hc_a_scale),
                         RAD_W(L.hc_a_base), brows(m.pre_a, T), brows(m.post, T), brows(m.comb, T));
@@ -2136,36 +2114,21 @@ static void step(RadCtx* x, const RadBatch* batch) {
             else if (L.col_a)   /* 0 under pcn_a: issued for the previous post_f */
                 RAD_ISSUE_N(x, L.col_a, T, brows(m.h0, T), brows(m.pre_f, T), brows(m.xcol, T));
         };
-        if (late || col_first) {
-            col_a();
-            if (!late) mix_a();
-        } else {
-            mix_a();
-            col_a();
-        }
+        col_a();
+        if (!late) mix_a();
         if (m.zero) {
             RAD_ISSUE_N(x, L.attn_fill, T, brows(m.attn_out, T));
         } else {
             if (L.norm_a)
                 RAD_ISSUE_N(x, L.norm_a, T, brows(m.xcol, T), RAD_W(L.attn_norm), brows(m.xn, T));
             const rad_buf cs = r > 0 ? m.cs_b : m.cs_a;
-            static const bool ilv = [] {
-                const char* e = std::getenv("RADIANCE_DS41_QKV_INTERLEAVE");
-                return !(e && e[0] == '0');
-            }();
             /* The compressor (at a kv source) and the indexer (at an index source) read xn and qrn
              * as the query and key chains do, and their only order with them is the compressed
              * angles: c_tab rewrites cs_b after the query and the window key read it, and at a
-             * source the index query's rope reads it after. With the interleave, each of their ops
-             * goes between the query/key pairs at the first point its inputs are issued, so a
-             * recorded pass overlaps three or four chains instead of running the compressor and the
-             * indexer alone after the window key. Same kernels on the same operands;
-             * RADIANCE_DS41_SIDE_INTERLEAVE=0 issues them after kv_store. */
-            static const bool side_ilv = [] {
-                const char* e = std::getenv("RADIANCE_DS41_SIDE_INTERLEAVE");
-                return !(e && e[0] == '0');
-            }();
-            const bool sx = ilv && side_ilv;
+             * source the index query's rope reads it after. Each of their ops goes between the
+             * query/key pairs at the first point its inputs are issued, so a recorded pass overlaps
+             * three or four chains instead of running the compressor and the indexer alone after
+             * the window key. Same kernels on the same operands. */
             const bool ctail = L.src && r > 1;
             int64_t rows = T, tpitch = 1;
             RadOperand page = RAD_NONE, bpos = pos;
@@ -2316,35 +2279,24 @@ static void step(RadCtx* x, const RadBatch* batch) {
                             uses ? bcol(m.keep, 0, live, T) : RAD_NONE, pos, brows(m.sel, T));
             };
 
-            if (sx) {
-                c_gemm();
-                q_a(); kv_g();
-                i_w(); c_work();
-                q_an(); kv_n();
-                i_q(); c_pool();
-                q_b(); kv_rope();
-                if (!L.src) i_rope();   /* at a source it reads the angles c_tab rewrites */
-                c_tail(); c_norm();
-                q_rope(); kv_q();
-                if (!L.src) i_qq();
-                k_gemm(); c_tab();
-                kv_st();
-                k_norm();
-                if (L.src) i_rope();
-                l_rope(); k_rope();
-                if (L.src) i_qq();
-                l_q(); k_q(); l_st(); k_st(); i_score();
-            } else {
-                if (ilv) {
-                    q_a(); kv_g(); q_an(); kv_n(); q_b(); kv_rope(); q_rope(); kv_q();
-                } else {
-                    q_a(); q_an(); q_b(); q_rope(); kv_g(); kv_n(); kv_rope(); kv_q();
-                }
-                kv_st();
-                c_gemm(); c_work(); c_pool(); c_norm(); c_tab(); k_gemm(); k_norm(); k_rope(); k_q(); k_st();
-                l_rope(); l_q(); l_st(); c_tail();
-                i_q(); i_rope(); i_qq(); i_w(); i_score();
-            }
+            c_gemm();
+            q_a(); kv_g();
+            i_w(); c_work();
+            q_an(); kv_n();
+            i_q(); c_pool();
+            q_b(); kv_rope();
+            if (!L.src) i_rope();   /* at a source it reads the angles c_tab rewrites */
+            c_tail(); c_norm();
+            q_rope(); kv_q();
+            if (!L.src) i_qq();
+            k_gemm(); c_tab();
+            kv_st();
+            k_norm();
+            if (L.src) i_rope();
+            l_rope(); k_rope();
+            if (L.src) i_qq();
+            l_q(); k_q(); l_st(); k_st(); i_score();
+
             if (r > 0) {
                 const int src = c.src_of[(size_t)l];
                 const auto* cb = kv_batch(batch, m.comp[r]);
@@ -2381,16 +2333,7 @@ static void step(RadCtx* x, const RadBatch* batch) {
         /* The ffn connection's mix is likewise needed first by the next mhc_post, so the MoE block
          * issues it (MoeFP8::Beside) behind its routed and shared gate_up, where a recorded pass
          * overlaps it with those GEMMs instead of with the collapse and the norm (or, under the
-         * fused post, with nothing). It reads h1 and writes what post_a (fused or not) has read.
-         * RADIANCE_DS41_MIX_F_BESIDE=0 issues it after post_a. */
-        static const bool mixf_in = [] {
-            const char* e = std::getenv("RADIANCE_DS41_MIX_F_BESIDE");
-            return !(e && e[0] == '0');
-        }();
-        const auto mix_f = [&] {
-            RAD_ISSUE_N(x, L.mix_f, T, brows(m.h1, T), RAD_W(L.hc_f_fn), RAD_W(L.hc_f_scale),
-                        RAD_W(L.hc_f_base), brows(m.pre_f, T), brows(m.post, T), brows(m.comb, T));
-        };
+         * fused post, with nothing). It reads h1 and writes what post_a (fused or not) has read. */
         const auto col_f = [&] {
             if (L.pcn_f) {
             } else if (L.cn_f) {
@@ -2401,29 +2344,12 @@ static void step(RadCtx* x, const RadBatch* batch) {
                 RAD_ISSUE_N(x, L.norm_f, T, brows(m.xcol, T), RAD_W(L.ffn_norm), brows(m.act.x, T));
             }
         };
-        if (mixf_in) {
-            col_f();
-            MixBeside mb{ &L, &m, T };
-            MoeFP8::Beside bs;
-            bs.fn = mix_f_beside;
-            bs.arg = &mb;
-            L.moe.step(x, batch, bs);
-        } else {
-            /* Collapse first (RADIANCE_DS41_COLLAPSE_FIRST, above) where it is its own op: the
-             * norm's op then follows the mix's second launch. */
-            if (col_first && !L.pcn_f && !L.cn_f) {
-                RAD_ISSUE_N(x, L.col_f, T, brows(m.h1, T), brows(m.pre_a, T), brows(m.xcol, T));
-                mix_f();
-                RAD_ISSUE_N(x, L.norm_f, T, brows(m.xcol, T), RAD_W(L.ffn_norm), brows(m.act.x, T));
-            } else if (col_first) {
-                col_f();
-                mix_f();
-            } else {
-                mix_f();
-                col_f();
-            }
-            L.moe.step(x, batch);
-        }
+        col_f();
+        MixBeside mb{ &L, &m, T };
+        MoeFP8::Beside bs;
+        bs.fn = mix_f_beside;
+        bs.arg = &mb;
+        L.moe.step(x, batch, bs);
         /* post_f, or post_f with the next collapse + norm (the next layer's pcn_a, or pcn_fin). */
         const Layer* nx = L.l + 1 < c.n_layer ? &m.layers[(size_t)L.l + 1] : nullptr;
         if (nx && nx->pcn_a)

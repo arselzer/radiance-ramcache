@@ -25,7 +25,8 @@ bool path_text(const std::string& s)noexcept{return !s.empty()&&s.size()<=4096&&
 int request_valid(const GlmMainEngineOptions& o)noexcept {
     if(!path_text(o.checkpoint)||!path_text(o.home)||!path_text(o.bundle_root)||!path_text(o.source_proof)||
        !o.expected_bundle_id||o.context<128||o.context>512||o.context%128||
-       o.hot_bytes_per_rank>GiB||o.metadata_limit<metadata_envelope||o.metadata_limit>8*GiB||
+       o.hot_bytes_per_rank>2*GiB||(o.hot_bytes_per_rank>GiB&&o.host_payload_limit!=16*GiB)||
+       (o.read_chunk_bytes!=65536&&o.read_chunk_bytes!=(1u<<20))||o.metadata_limit<metadata_envelope||o.metadata_limit>8*GiB||
        o.host_payload_limit<GiB||o.host_payload_limit>16*GiB||
        o.loader_input_limit<stride||o.loader_input_limit>2*GiB||o.loader_output_limit<stride||o.loader_output_limit>2*GiB||
        !o.loader_column_limit||o.loader_column_limit>64*MiB||o.gpu_headroom<96*MiB||o.gpu_headroom>GiB||
@@ -92,6 +93,9 @@ int GlmMainEngineHarness::vocabulary_preflight(const std::string& checkpoint,Glm
         *out=e->glm_main_->result.vocabulary;return RAD_OK;
     }catch(const std::bad_alloc&){return RAD_E_NOMEM;}catch(...){return RAD_E_STATE;}
 }
+int glm_main_output_admission(int32_t outputs,int64_t context)noexcept {
+    return outputs>=1&&outputs<=int32_t(glm_main_max_outputs)&&context>=int64_t(outputs)+1?RAD_OK:RAD_E_SHAPE;
+}
 int glm_main_one_prompt_admission(std::span<const int32_t> tokens,int64_t vocabulary,int64_t context)noexcept {
     return tokens.size()==1&&vocabulary>0&&context>=2&&tokens[0]>=0&&tokens[0]<vocabulary?RAD_OK:RAD_E_SHAPE;
 }
@@ -134,8 +138,9 @@ int GlmMainEngineHarness::retire(Engine& e)noexcept {if(!e.glm_main_)return RAD_
 int Engine::start_glm_main(){auto& s=*glm_main_;
     if(s.attempted||s.retiring||s.result.retired||s.result.phase==GlmMainEnginePhase::Terminal)
         return s.result.first_status<0?s.result.first_status:RAD_E_STATE;
-    s.attempted=true;s.result.attempts=1;int status=RAD_E_STATE;
+    s.attempted=true;s.result.attempts=1;int status=RAD_E_STATE;const uint64_t started=rad_mono_ns();
     try{status=glm_main_body();}catch(const std::bad_alloc&){status=RAD_E_NOMEM;}catch(...){status=RAD_E_STATE;}
+    s.result.startup_elapsed_ns=rad_mono_ns()-started;
     if(status<0){
         // A known error after peer init/async work must never join or unwind live
         // peer collectives. Before that boundary metadata failures are returnable.
@@ -198,7 +203,7 @@ public:
             if(s.authorities[rank]->generation()!=receipt.bundle_id||s.authorities[rank]->owned().size()!=12096)return RAD_E_INVAL;
             glm_main_provider::Limits limits;limits.hot_bytes=s.options.hot_bytes_per_rank;limits.cold_bytes=cold;limits.max_record_bytes=stride;
             limits.max_metadata_bytes=256*MiB;limits.max_records=12096;limits.max_batch=8;limits.max_shards=42;limits.max_segments=42;
-            limits.max_payload_fds=2;limits.max_rank_fd_credits=12;limits.max_live_records=12096;limits.max_live_leases=64;limits.io_chunk_bytes=65536;
+            limits.max_payload_fds=2;limits.max_rank_fd_credits=12;limits.max_live_records=12096;limits.max_live_leases=64;limits.io_chunk_bytes=s.options.read_chunk_bytes;
             RAD_TRY(glm_main_data::GlmMainNativeSource::open(s.process,s.authorities[rank],limits,&s.sources[rank],&why));
             NativeInventoryLimits caps;caps.backend_profile=NativeBackendProfile::GlmMainTp4AqlFailStopV1;
             caps.max_rows=1;caps.top_k=8;caps.max_owned_units=12096;caps.max_classes=1;caps.max_regions=9;
@@ -380,36 +385,95 @@ void Engine::glm_main_shutdown()noexcept {
         if(s.result.first_status>=0)s.result.phase=GlmMainEnginePhase::Retired;s.retiring=false;
     }catch(...){if(cache_prepare4_)cache_prepare4_->fail_stop(-1,RAD_E_STATE);glm53::cache_prepare4::process_fail_stop();}
 }
+// Metadata is captured before worker release and validated before its publication.
+// No device token/position pointer is read on the CPU.
+int Engine::glm_main_step_begin(const StepPlan& plan,const RadBatch& batch){
+    auto& s=*glm_main_;const size_t i=s.step_witness_count;
+    if(i>=s.manual_outputs||i>=glm_main_max_outputs||plan.e.size()!=1||plan.n_tok!=1||plan.n_spec||plan.draft_pass||
+       batch.n_tok!=1||batch.n_seq!=1||batch.n_out!=1||batch.n_spec||batch.draft_pass||
+       batch.phase!=(i?RAD_PHASE_DECODE:RAD_PHASE_PREFILL)||plan.phase!=batch.phase)return RAD_E_STATE;
+    const auto& e=plan.e[0];
+    if(!e.req||e.req->id!=1||e.seq!=1||e.dev||e.n_tokens!=1||e.ctx_len!=int32_t(i)||e.n_spec||e.n_draft||
+       !e.produces_token||e.is_prefill!=(i==0)||e.req->prompt.size()!=1||e.req->output.size()!=i||
+       e.req->n_computed!=int32_t(i))return RAD_E_STATE;
+    const int32_t input=i?e.req->output.back():e.req->prompt[0];
+    if(input<0||input>=s.result.vocabulary.valid_tokens)return RAD_E_STATE;
+    const auto gate=cache_prepare4_->observe();
+    if(gate.first.status<0||gate.epoch!=i+1||gate.ordinal||gate.finished||!gate.active)return RAD_E_STATE;
+    GlmMainStepWitness w;w.epoch=gate.epoch;w.request=e.seq;w.step=batch.step;w.rows=batch.n_tok;
+    w.n_ahead=batch.n_ahead;w.phase=batch.phase;w.context_position=e.ctx_len;w.input_token=input;w.begin_ns=rad_mono_ns();
+    s.step_witness[i]=w;return RAD_OK;
+}
+int Engine::glm_main_step_complete(const RadBatch& batch,int32_t sampled){
+    auto& s=*glm_main_;const size_t i=s.step_witness_count;
+    if(i>=s.manual_outputs||i>=glm_main_max_outputs||sampled<0||sampled>=s.result.vocabulary.valid_tokens)return RAD_E_STATE;
+    auto& w=s.step_witness[i];const auto gate=cache_prepare4_->observe();
+    // complete_frame checked all four finish calls, each after exactly42 gates,
+    // and returned only after actual sampler + final collect completed.
+    if(w.step!=batch.step||w.phase!=batch.phase||w.epoch!=gate.epoch||gate.epoch!=i+1||
+       gate.first.status<0||gate.active||gate.ordinal!=42||gate.finished!=15||cache_prepare4_->active())return RAD_E_STATE;
+    w.sampled_token=sampled;w.completed_prepare_gates.fill(42);w.model_sampler_collect_complete=true;w.end_ns=rad_mono_ns();
+    ++s.step_witness_count;return RAD_OK;
+}
 int GlmMainEngineHarness::one_token(Engine& e,const std::string& prompt,int32_t* token)noexcept {
-    if(!token||!e.glm_main_||!e.glm_main_->result.transport_ready||e.glm_main_->manual_requested||prompt.empty()||prompt.size()>4096)return RAD_E_INVAL;
+    if(!token)return RAD_E_INVAL;
+    return generate(e,prompt,std::span<int32_t>(token,1));
+}
+int GlmMainEngineHarness::generate(Engine& e,const std::string& prompt,std::span<int32_t> tokens)noexcept {
+    if(!e.glm_main_||!e.glm_main_->result.transport_ready||e.glm_main_->manual_requested||prompt.empty()||prompt.size()>4096||
+       !tokens.data()||tokens.size()>glm_main_max_outputs||glm_main_output_admission(int32_t(tokens.size()),e.cfg_.max_ctx)<0)return RAD_E_INVAL;
     auto& s=*e.glm_main_;
-    try{s.manual_prompt=prompt;s.manual_requested=true;const int status=e.serve(nullptr);
+    try{s.manual_prompt=prompt;s.manual_outputs=uint32_t(tokens.size());s.result.requested_outputs=s.manual_outputs;s.manual_requested=true;
+        const uint64_t started=rad_mono_ns();const int status=e.serve(nullptr);s.result.request_elapsed_ns=rad_mono_ns()-started;
         if(status<0){if(e.cache_prepare4_)e.cache_prepare4_->fail_stop(-1,status);return status;}
-        if(!s.result.text_complete||s.result.sampled_token<0)return RAD_E_STATE;*token=s.result.sampled_token;return RAD_OK;
+        // serve has joined every step/rank writer. This also proves actual decode
+        // inputs equal the preceding committed output, without CPU device reads.
+        if(!s.result.text_complete||s.result.generated_outputs!=tokens.size()||s.step_witness_count!=tokens.size())return RAD_E_STATE;
+        for(size_t i=0;i<tokens.size();++i){const auto& w=s.step_witness[i];
+            if(!w.model_sampler_collect_complete||w.epoch!=i+1||w.context_position!=int32_t(i)||w.rows!=1||
+               w.phase!=(i?RAD_PHASE_DECODE:RAD_PHASE_PREFILL)||w.sampled_token!=s.result.generated_tokens[i]||
+               (i&&w.input_token!=s.result.generated_tokens[i-1]))return RAD_E_STATE;
+        }
+        s.result.steps=s.step_witness;s.result.completed_steps=s.step_witness_count;
+        for(size_t rank=0;rank<4;++rank)s.result.provider_stats[rank]=s.sources[rank]->stats();
+        std::copy_n(s.result.generated_tokens.begin(),tokens.size(),tokens.begin());return RAD_OK;
     }catch(...){if(e.cache_prepare4_)e.cache_prepare4_->fail_stop(-1,RAD_E_STATE);return RAD_E_STATE;}
 }
 int Engine::glm_main_run_request(){auto& s=*glm_main_;
     try{
-        auto request=std::make_unique<Request>();request->id=1;request->max_tokens=1;request->ignore_eos=true;
+        RAD_TRY(glm_main_output_admission(int32_t(s.manual_outputs),cfg_.max_ctx));
+        auto request=std::make_unique<Request>();request->id=1;request->max_tokens=int32_t(s.manual_outputs);request->ignore_eos=true;
         request->sp.temp=0;request->sp.top_k=1;request->sp.seed=1;request->may_speculate=false;
         RAD_TRY(vocab_view_->tokenize(s.manual_prompt,&request->prompt));
         RAD_TRY(glm_main_one_prompt_admission(request->prompt,s.result.vocabulary.valid_tokens,cfg_.max_ctx));
-        server::Sink sink(8);request->sink=&sink;sink.id=request->id;
+        //32 slots exceed the entire16-token bound even if the consumer sleeps.
+        // Drain while waiting too: the final output never relies on ring overflow.
+        server::Sink sink(32);request->sink=&sink;sink.id=request->id;
+        s.result.manual_fixed_host_bytes=sizeof(EngineGlmMainState)+sizeof(server::Sink)+
+            32*sizeof(server::SinkToken)+glm_main_max_outputs*sizeof(server::SinkToken);
+        static_assert(sizeof(EngineGlmMainState)+sizeof(server::Sink)+48*sizeof(server::SinkToken)<(8u<<20));
+        std::array<server::SinkToken,glm_main_max_outputs> collected{};size_t count=0;
         const int added=sched_.add(std::move(request));if(added<0){sink.fail(added);return added;}
         const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(s.options.manual_timeout_seconds);
         while(!sink.done()){
+            count+=sink.read(collected.data()+count,collected.size()-count);
             if(std::chrono::steady_clock::now()>=deadline||loop_status_.load(std::memory_order_acquire)<0)cache_prepare4_->fail_stop(-1,RAD_E_STATE);
             (void)sink.wait(25);
         }
+        count+=sink.read(collected.data()+count,collected.size()-count);
         while(cache_prepare4_->active()){
             if(std::chrono::steady_clock::now()>=deadline)cache_prepare4_->fail_stop(-1,RAD_E_STATE);
             std::this_thread::yield();
         }
         if(sink.status()<0)cache_prepare4_->fail_stop(-1,sink.status());
-        server::SinkToken token;const auto n=sink.read(&token,1);
-        if(n!=1||sink.n_produced()!=1||token.token<0||token.token>=s.result.vocabulary.valid_tokens)cache_prepare4_->fail_stop(-1,RAD_E_STATE);
+        if(sink.overflowed()||count!=s.manual_outputs||sink.n_produced()!=int64_t(s.manual_outputs))cache_prepare4_->fail_stop(-1,RAD_E_STATE);
+        for(size_t i=0;i<count;++i)if(collected[i].token<0||collected[i].token>=s.result.vocabulary.valid_tokens)cache_prepare4_->fail_stop(-1,RAD_E_STATE);
         const int reaped=sched_.reap(1);if(reaped<0)cache_prepare4_->fail_stop(-1,reaped);
-        s.result.sampled_token=token.token;s.result.text_complete=true;phase(s,GlmMainEnginePhase::TextComplete);return RAD_OK;
+        for(size_t i=0;i<count;++i)s.result.generated_tokens[i]=collected[i].token;
+        s.result.generated_outputs=uint32_t(count);s.result.sampled_token=collected[0].token;
+        s.result.first_token_ns=uint64_t(std::max<int64_t>(sink.t_first_token_ns(),0));
+        s.result.last_token_ns=uint64_t(std::max<int64_t>(sink.t_last_token_ns(),0));
+        s.result.text_complete=true;phase(s,GlmMainEnginePhase::TextComplete);return RAD_OK;
     }catch(...){cache_prepare4_->fail_stop(-1,RAD_E_STATE);}
 }
 } // namespace rad

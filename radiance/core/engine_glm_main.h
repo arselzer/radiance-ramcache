@@ -9,6 +9,16 @@
 #include <array>
 namespace rad {
 int glm_main_one_prompt_admission(std::span<const int32_t>,int64_t vocabulary,int64_t context)noexcept;
+int glm_main_output_admission(int32_t outputs,int64_t context)noexcept;
+inline constexpr size_t glm_main_max_outputs=16;
+// Host StepPlan + actual RadBatch metadata only; never dereference device rows.
+struct GlmMainStepWitness {
+    uint64_t epoch=0,request=0,begin_ns=0,end_ns=0;
+    int64_t step=-1,rows=0,n_ahead=0;
+    int32_t phase=-1,context_position=-1,input_token=-1,sampled_token=-1;
+    std::array<uint32_t,4> completed_prepare_gates{};
+    bool model_sampler_collect_complete=false;
+};
 // Pure metadata facts. No payload pointer, source capability or Ready state.
 struct GlmMainVocabularyFacts {
     int64_t model_rows=0,model_width=0,tokenizer_tokens=0,view_tokens=0;
@@ -30,6 +40,8 @@ struct GlmMainEngineOptions {
     uint64_t expected_bundle_id=0;int64_t context=512;
     // Exact first functional profile: batch1/seq1/spec0/exact wire/no residents.
     uint64_t hot_bytes_per_rank=64u<<20;
+    // Exact experiment choices; reads still use the same full-record integrity.
+    uint32_t read_chunk_bytes=64u<<10;
     uint64_t metadata_limit=4ull<<30,host_payload_limit=8ull<<30;
     uint64_t gpu_headroom=256u<<20;
     uint64_t loader_input_limit=2ull<<30,loader_output_limit=2ull<<30,loader_column_limit=64u<<20;
@@ -51,6 +63,12 @@ struct GlmMainEngineSnapshot {
     GlmMainVocabularyAdmission vocabulary;
     bool source_admitted=false,transport_ready=false,text_complete=false,retired=false;
     int32_t sampled_token=-1;
+    uint32_t requested_outputs=1,generated_outputs=0,completed_steps=0;
+    std::array<int32_t,glm_main_max_outputs> generated_tokens{};
+    std::array<GlmMainStepWitness,glm_main_max_outputs> steps{};
+    std::array<glm_main_provider::Stats,4> provider_stats{};
+    uint64_t startup_elapsed_ns=0,request_elapsed_ns=0,first_token_ns=0,last_token_ns=0;
+    uint64_t manual_fixed_host_bytes=0;
 };
 // Pool/stream owners are real; Ctx only borrows this stream. Binding survives it.
 class GlmMainComputeStream final {
@@ -76,6 +94,10 @@ struct EngineGlmMainState {
     TinyBackendQuote backend;
     std::vector<int32_t> eog_stage; // survives every possibly queued copy
     std::string manual_prompt;
+    uint32_t manual_outputs=1;
+    // Sole writer is the stepper. Harness consumes only AFTER serve joins it.
+    std::array<GlmMainStepWitness,glm_main_max_outputs> step_witness{};
+    uint32_t step_witness_count=0;
     bool attempted=false,retiring=false,async_started=false,manual_requested=false;
     bool registry_owned=false,process_lease=false;
 };
@@ -91,5 +113,8 @@ public:
     // One bounded request through existing scheduler/model/sampler/collect.
     // Never opens an HTTP server. Requires successful start.
     static int one_token(Engine&,const std::string& prompt,int32_t* token)noexcept;
+    // One request, exactly one input token and 1..16 greedy output tokens.
+    // Output span is committed only after joined step witnesses fully validate.
+    static int generate(Engine&,const std::string& prompt,std::span<int32_t> tokens)noexcept;
 };
 }

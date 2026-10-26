@@ -145,8 +145,8 @@ target_link_options(glm53_tp4_mover_fence_check PRIVATE
 
 # Eleventh/twelfth explicit HOST checks, byte-exact archived sources. The real
 # checkpoint/manual/AQL executables and maintenance runner are NOT default targets.
-set(VERIFIED_ENGINE "${PORTABLE_REPO_ROOT}/research/glm53-main-verified-source-engine-v9-prototype")
-set(VERIFIED_COMPONENTS "${PORTABLE_REPO_ROOT}/research/glm53-main-verified-components-v13-prototype")
+set(VERIFIED_ENGINE "${PORTABLE_REPO_ROOT}/research/glm53-main-verified-source-engine-v10-prototype")
+set(VERIFIED_COMPONENTS "${PORTABLE_REPO_ROOT}/research/glm53-main-verified-components-v14-prototype")
 add_executable(glm53_main_verified_engine_gate "${VERIFIED_ENGINE}/gate_checker.cpp")
 portable_core_exe(glm53_main_verified_engine_gate)
 target_include_directories(glm53_main_verified_engine_gate PRIVATE "${VERIFIED_ENGINE}")
@@ -164,3 +164,11 @@ portable_core_exe(glm53_main_vocabulary_check)
 target_link_options(glm53_main_vocabulary_check PRIVATE
   "LINKER:--wrap=rad_dev_count" "LINKER:--wrap=rad_dev_set" "LINKER:--wrap=rad_dev_props"
   "LINKER:--wrap=rad_dev_alloc" "LINKER:--wrap=rad_stream_create")
+
+# Fourteenth explicit HOST check: exact frozen Fixture10 bounded-decode body.
+# It tests HOST Scheduler/KV/protocol metadata, never actual model/GPU admission.
+add_executable(glm53_main_bounded_decode_check "${VERIFIED_ENGINE}/decode_checker.cpp")
+portable_core_exe(glm53_main_bounded_decode_check)
+target_include_directories(glm53_main_bounded_decode_check PRIVATE "${VERIFIED_ENGINE}")
+target_link_options(glm53_main_bounded_decode_check PRIVATE
+  "LINKER:--wrap=open" "LINKER:--wrap=pread" "LINKER:--wrap=rad_dev_alloc")

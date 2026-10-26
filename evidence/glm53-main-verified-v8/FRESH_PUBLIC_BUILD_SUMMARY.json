@@ -1,0 +1,57 @@
+{
+  "Core": "v8",
+  "GPU_execution": false,
+  "build_artifacts_sha256": {
+    "build/core-main-verified-v8-host-release/core/librad_core.a": "8c67cebcd6deaf5a677af1b8695800626ed52e6df250090cf3efbfb7b02ee6ff",
+    "build/core-main-verified-v8-host-release/radiance_home/kernels/libref.so": "b86e8afa2d4a2b4d6f8bc4042bc0044194fb7d178742acdbeffaa1e1d5ec23ec",
+    "build/core-main-verified-v8-host-release/radiance_home/quantizers/libquant.so": "5f1036781dccc2539e9a9504d38833da95f09510ab397642b81fd7dc85b91f02",
+    "build/core-main-verified-v8-host-release/vendor/librad_vendor_httplib.a": "026daef0192dd0792944e9fec5906471f11032612b2df547f5283506c2784087",
+    "build/core-main-verified-v8-host-release/vendor/librad_vendor_llama.a": "f15f31020ea09f9b87f04ac0b59f1339eab6f65de09814058fb943fb45af96a4"
+  },
+  "checks_executed": 14,
+  "evidence": {
+    "portable14-fresh-build": {
+      "files_sha256": {
+        "portable.log": "d7068466cf1317416798a8ac50a608976f631828db97157d7e996c51518ed8bc",
+        "receipt.json": "23b57f095ed8f7a162fc9cbc2b57b0f942a7fffe31d64d67eb1ff560e82c283f"
+      },
+      "original_directory": "validation-public-core8-fresh-release-build-20261026T031040Z",
+      "passed": true
+    },
+    "portable14-fresh-runtime": {
+      "files_sha256": {
+        "portable.log": "9b24ab98227abf76a0b979248a9452f8bb4155c113627331651fe0021d351c68",
+        "receipt.json": "2aa2a09414882752f04b6dc9c301ba368883cbe9a167d0fd404804fa90f96e0c"
+      },
+      "original_directory": "validation-public-core8-fresh-release-checks-20261026T032403Z",
+      "passed": true
+    }
+  },
+  "fixture": "v10",
+  "fresh_build_then_existing_fresh_archive_for_checks": true,
+  "fresh_whole_Core_from_published_primary": true,
+  "model_execution": false,
+  "parent_wrapper_source": {
+    "exported": false,
+    "original_name": "validate_public_core8_fresh_build.py",
+    "sha256": "83facff86b3d633232cf74b712987fdf3d6b36c8d8f8000beca57301e931924d"
+  },
+  "passed": true,
+  "private_research_Core_archive_used": false,
+  "production_changes": false,
+  "schema": "glm53-core8-fresh-public-build-and-host-checks-v1",
+  "scope": "Fresh published-source Release build plus all14 portable HOST checks; actual model scope remains raw1-input/two-output. Final delta adds evidence and documentation only.",
+  "source_export_author_runtime": false,
+  "tested_files": 3550,
+  "tested_manifest_archive": "docs/provenance/portable-tested-b0fef123-checkpoint/SNAPSHOT_MANIFEST.json",
+  "tested_manifest_sha256": "b0fef12369115ce00f89f50f55938749d86a531dac5f835ba4d909dd653bde55",
+  "tested_metadata_archived": [
+    "README.md",
+    "STATUS.md",
+    "docs/GLM53_VERIFIED_MAIN_V8_PUBLICATION_SCOPE.txt",
+    "evidence/glm53-main-verified-v8/VALIDATION_SUMMARY.json",
+    "docs/provenance/glm-core-v8-flight-export.json",
+    "docs/provenance/glm-core-v8-flight-wrapper.json",
+    "docs/provenance/glm-core-v8-flight-change-index.json"
+  ]
+}

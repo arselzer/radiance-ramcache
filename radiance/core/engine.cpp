@@ -698,7 +698,8 @@ int Engine::step_loop() {
                 }
                 if (const int ps = prepare_release(b); ps < 0) return ps;
                 if(cache_prepare4_){const int begun=cache_prepare4_->begin(*b);
-                    if(begun<0){if(cache_prepare4_->admission_closed())return RAD_OK;cache_prepare4_->fail_stop(-1,begun);}}
+                    if(begun<0){if(cache_prepare4_->admission_closed())return RAD_OK;cache_prepare4_->fail_stop(-1,begun);}
+                    if(glm_main_){const int witnessed=glm_main_step_begin(plan,*b);if(witnessed<0)cache_prepare4_->fail_stop(-1,witnessed);}}
                 /* An embedding program has no sampler to issue behind its pass. */
                 issue_what_.store(embedding_ || deferred_status_profile_ || cache_prepare4_ ? kIssueModel : kIssueAll,
                                   std::memory_order_release);
@@ -844,7 +845,9 @@ int Engine::step_loop() {
         st = embedding_ ? collect_pooled(b, so) : collect_step(b, so);
         if (t_on) phase_mark(PH_COLLECT);
         if (st < 0) return fail_loop(st);
-        if(cache_prepare4_){const int completed=cache_prepare4_->complete_frame(*b);if(completed<0)cache_prepare4_->fail_stop(-1,completed);}
+        if(cache_prepare4_){const int completed=cache_prepare4_->complete_frame(*b);if(completed<0)cache_prepare4_->fail_stop(-1,completed);
+            if(glm_main_){if(so.token.size()!=1)cache_prepare4_->fail_stop(-1,RAD_E_STATE);
+                const int witnessed=glm_main_step_complete(*b,so.token[0]);if(witnessed<0)cache_prepare4_->fail_stop(-1,witnessed);}}
         /* The step's sampler chain, verify op included, has returned: one line at the first
          * coupled verify that actually completed. */
         couple_verify_evidence(b->step);

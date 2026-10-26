@@ -1,0 +1,11 @@
+RAM_ADMISSION MemAvailable=11190284288
+[  0%] Built target rad_vendor_httplib
+[ 10%] Built target rad_vendor_llama
+[100%] Built target rad_core
+[100%] Building CXX object tools/CMakeFiles/rad_tokref.dir/tokref.cpp.o
+[100%] Linking CXX static library librad_tokref.a
+[100%] Built target rad_tokref
+[100%] Building CXX object tools/CMakeFiles/rad-tokcheck.dir/rad_tokcheck.cpp.o
+[100%] Building CXX object tools/CMakeFiles/rad-tokcheck.dir/iface.cpp.o
+[100%] Linking CXX executable ../bin/rad-tokcheck
+[100%] Built target rad-tokcheck

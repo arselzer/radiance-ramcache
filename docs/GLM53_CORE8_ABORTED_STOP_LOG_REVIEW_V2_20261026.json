@@ -1,0 +1,72 @@
+{
+  "utc": "2026-10-26T01:05:18.764005+00:00",
+  "scope": "Selectedkernel/appshutdownmessages andonlyDockerkill/die/stop/starteventscalars; excludesexec/healthcheckeventcommands,Config/Env/healthlogcontents andrequestbodies",
+  "since": "2026-10-26T01:00:40Z",
+  "until": "2026-10-26T01:04:00Z",
+  "events_returncode": 0,
+  "events": [
+    {
+      "action": "kill",
+      "timeNano": 1792976465271040172,
+      "id": "608764c1d1989c714d8aad7b8a79f8057c3e73473b9f9d55b49d02e82defd2b8",
+      "signal": "15",
+      "exitCode": "",
+      "utc": "2026-10-26T01:01:05.271040+00:00"
+    },
+    {
+      "action": "kill",
+      "timeNano": 1792976495300799503,
+      "id": "608764c1d1989c714d8aad7b8a79f8057c3e73473b9f9d55b49d02e82defd2b8",
+      "signal": "9",
+      "exitCode": "",
+      "utc": "2026-10-26T01:01:35.300799+00:00"
+    },
+    {
+      "action": "kill",
+      "timeNano": 1792976509374942050,
+      "id": "608764c1d1989c714d8aad7b8a79f8057c3e73473b9f9d55b49d02e82defd2b8",
+      "signal": "15",
+      "exitCode": "",
+      "utc": "2026-10-26T01:01:49.374942+00:00"
+    },
+    {
+      "action": "stop",
+      "timeNano": 1792976520618672866,
+      "id": "608764c1d1989c714d8aad7b8a79f8057c3e73473b9f9d55b49d02e82defd2b8",
+      "signal": "",
+      "exitCode": "",
+      "utc": "2026-10-26T01:02:00.618673+00:00"
+    },
+    {
+      "action": "die",
+      "timeNano": 1792976520629338627,
+      "id": "608764c1d1989c714d8aad7b8a79f8057c3e73473b9f9d55b49d02e82defd2b8",
+      "signal": "",
+      "exitCode": "137",
+      "utc": "2026-10-26T01:02:00.629339+00:00"
+    },
+    {
+      "action": "start",
+      "timeNano": 1792976522839460496,
+      "id": "608764c1d1989c714d8aad7b8a79f8057c3e73473b9f9d55b49d02e82defd2b8",
+      "signal": "",
+      "exitCode": "",
+      "utc": "2026-10-26T01:02:02.839461+00:00"
+    }
+  ],
+  "kernel_returncode": 0,
+  "selected_kernel_messages": [],
+  "app_returncode": 0,
+  "selected_app_shutdown_messages": [],
+  "interpretation": {
+    "first_SIGTERM_utc": "2026-10-26T01:01:05.271040+00:00",
+    "SIGKILL_utc": "2026-10-26T01:01:35.300799+00:00",
+    "terminal_exit_utc": "2026-10-26T01:02:00.629339+00:00",
+    "exit_after_SIGKILL_seconds": 25.328539,
+    "exit_code": 137,
+    "driver_or_OOM_messages_in_selected_kernel_window": 0,
+    "cause_of_slow_process_exit_proved": false,
+    "GLM_child_launched": false,
+    "QFN_independent_recovery_check": "server-check-after-window-v2-20261026T010503Z.json"
+  }
+}

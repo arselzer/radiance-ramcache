@@ -1,0 +1,26 @@
+{
+  "execution_by_reviewer": false,
+  "files": {
+    "glm53-main-verified-source-engine-v10-prototype/CMakeLists.txt": "9b5351cf14b0a8fd153acce6d3d79a8e126182da4c57d04342e3dc154bf27d61",
+    "glm53-main-verified-source-engine-v10-prototype/CORE_SOURCE_PINS.json": "df4051bb85328badd3a130953721d31efff36b94133560bca29fcbb758a1ee0e",
+    "glm53-main-verified-source-engine-v10-prototype/README_V10.txt": "a3a9911372ae840d3028f5721fad83d464eba03b75760d696c41118aabfdb23d",
+    "glm53-main-verified-source-engine-v10-prototype/SOURCE_RECEIPT.json": "2a39c520eae1af6daa9f81caafb76bc95ea3d90a83bbbeec331d0c4bafe41f76",
+    "glm53-main-verified-source-engine-v10-prototype/V10_BOUNDED_DECODE_AND_CACHE_OPTIONS.diff": "067163118b975301e23be9960b8a79c30b7c08dc64acaceaef7595fa6dd62fca",
+    "glm53-main-verified-source-engine-v10-prototype/decode_checker.cpp": "f333711fba72eba8342aecfdc6fd6ca7b7beff291b58bf94bafc4a8bd56a9ddc",
+    "glm53-main-verified-source-engine-v10-prototype/gate_checker.cpp": "9d2eb536afeff1400020e863091ea3207c8b0ceca97cd4a8442a20873ec3e426",
+    "glm53-main-verified-source-engine-v10-prototype/manual_engine.cpp": "bced8f7bdbc8adb269d2e94a111c3eb8a41df30505cb595f03be6b820a0642bc",
+    "glm53-main-verified-source-engine-v10-prototype/vocabulary_checker.cpp": "5c1788197876111c45bea1a2a3cf5d452f7d140330a625634f4c836189a4ab50",
+    "radiance-glm-main-verified-source-v8-src/core/build/glm_main_source_data/storage/rank_native_store.cpp": "2687ffd4a98e98a9b3c3e21b01da957115285196bb51d9a23048e4b2d9efdac4",
+    "radiance-glm-main-verified-source-v8-src/core/engine.cpp": "233c4f7dc6deca1e283fb0cf6e93e860c453b116196e3734899637b4f2292fa3",
+    "radiance-glm-main-verified-source-v8-src/core/engine.h": "91c28d71ffca3f387df0ec6a53a59f7bc425505e35f615e1edf32f194774282e",
+    "radiance-glm-main-verified-source-v8-src/core/engine_glm_main.cpp": "be2997bcdb9d02ce70e98740fd51079e6c0007612c6025bb2d73db1d06d44181",
+    "radiance-glm-main-verified-source-v8-src/core/engine_glm_main.h": "00f06bb4542af370fcef7106498246c513cc9d5113d80de4d85db6281c28a78b",
+    "radiance-glm-main-verified-source-v8-src/core/runtime/cache_prepare4_session.cpp": "3102472c64b3be28088a052fb01ac9a41a591d6b2d7bea7bd7296ac31a022539",
+    "radiance-glm-main-verified-source-v8-src/core/sched/batch.h": "8963d455bc7bddbbeb2c95811fba6f71833be3287108f631923154d19e60a8a5",
+    "radiance-glm-main-verified-source-v8-src/core/sched/scheduler.cpp": "5624e7433cfef2a0488914f42aaa506be2428521bf1aa53d49edd3d8cf95c43d",
+    "radiance-glm-main-verified-source-v8-src/core/server/sink.cpp": "3895b7e061b8d32e4efd118a92d4b35f446db9751b3db61f54cd721b499c3dec"
+  },
+  "review_sha256": "1402f228e23021825fb059bac5ddceee530b83cb9a4ba12272e38c4c6bd98705",
+  "schema": "source-only-independent-review-v1",
+  "scoped_blocker": false
+}

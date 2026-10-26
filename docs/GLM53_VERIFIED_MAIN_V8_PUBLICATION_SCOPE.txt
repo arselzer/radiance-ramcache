@@ -1,0 +1,36 @@
+Core8 publication scope — source export with parent runtime evidence
+
+Exact Core8 df4051bb /1535 source files, Fixture10 (99 files), Components14
+(23 files), Runner9 (4 files) and selected original evidence are exported.
+Only four Engine paths differ from Core7. ABI27, architecture/kernels, original
+source Reader/provider/cache algorithms, sampler mask, inventory/Owner/Mover
+and default one-token profile remain unchanged. No Core9 normal prefill,
+Core10 staged startup or Core11 GPU retention is exported or implied.
+
+Actual parent evidence: full20 HOST commands and focused3 perRelease/ASan/TSan,
+matching AQL build, actual metadata/full source prewalk, and one combined four-
+GPU trial with raw'a' ID64 and outputs154822,154822. One actual decode is proved
+by the second frame's input matching the first committed output and all4x42
+prepare-gate completions. QFN was restored to the same container and independently
+completed4tokens. Prior failed stop/noGLM attempt is separately preserved.
+
+This private actual-data result is distinct from the now-passed PUBLIC14 build/runtime.
+Public tools retain13 checker bodies and add only exact bounded-decode HOST
+source; neither actual-model CPU mode nor manual Engine/Runner action is default.
+Parent built the whole Core from public manifestb0fef123 and ran all14 HOST programs successfully. The tested manifest and seven overwritten metadata files are archived; the final delta adds only evidence/documentation. No private Core archive was reused.
+
+Startup832.387s includes eager full-data verification/loading. Frame5.102/4.596s
+are whole model/sampler/collect durations, not isolated kernels or token-speed
+benchmarks. Actual64MiB HOT/rank had no HOT hits in these two frames. No cache
+speedup, altered checksum policy, persistent GPU cache, quality/useful text,
+normal chat/prefill,16-output GPU,262K,MTP or production adoption is claimed.
+
+Source export contains no model/native/tokenizer payloads, binaries, credentials,
+private serving configs or parent deployment scripts. Runner9 is an immutable
+archival manual source artifact, never imported/executed by public entrypoints.
+All historical raw archives/evidence are retained. Four originalCore7 Engine
+files plus the archived d04b562/ea0b checkpoint reconstruct exact previous source;
+V6/V5 historical overlays remain valid in sequence.
+
+Export author only copies source/evidence and checks hashes/AST/maps/privacy.
+No compiler/test/target/library/model/GPU/service/Git write is performed.

@@ -124,6 +124,8 @@ private:
     int glm_main_declare();
     int glm_main_vocabulary_admit();
     int glm_main_run_request();
+    int glm_main_step_begin(const StepPlan&,const RadBatch&);
+    int glm_main_step_complete(const RadBatch&,int32_t sampled);
     void glm_main_shutdown() noexcept;
     std::unique_ptr<EngineTinyState> tiny_; // declared before ranks: last owner to retire
     std::unique_ptr<CachePrepare4Session> cache_prepare4_; // full-source owner, outlives all rank joins/resources

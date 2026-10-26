@@ -1,0 +1,116 @@
+{
+  "Core_count": 1535,
+  "Core_pins_sha256": "df4051bb85328badd3a130953721d31efff36b94133560bca29fcbb758a1ee0e",
+  "actual_context_metadata_refusals_authored": 20,
+  "actual_failed_complete_prewalk": {
+    "validation-glm53-components-v7-complete-prewalk-20261025T201618Z/check.log": "43b49c21e3affcb85aef606823f79a7b5c4021ac37b7bd51e206ac413941e494",
+    "validation-glm53-components-v7-complete-prewalk-20261025T201618Z/receipt.json": "34e831a28b57badb9388c1d4576ac1b5d9dd54cfdca38541ea06f2a01ce00707"
+  },
+  "actual_failed_v10_complete_prewalk": {
+    "validation-glm53-components-v10-complete-prewalk-20261025T205250Z/check.log": "4593b1d113b782fed05aca88f466b0ff978da1f44afabf15fa10e164ebdec389",
+    "validation-glm53-components-v10-complete-prewalk-20261025T205250Z/receipt.json": "2a24265f3b5998653a2ee50815315545ca68d506d648f8fcea4322996b0c3b09"
+  },
+  "actual_failed_v8_compile": {
+    "build-glm53-main-verified-components-v8-aql-release-evidence-20261025T204107Z/build.log": "8a8ffd5108be573e3b8784301c71d28add60be496b5839fb15a15414070d89a2",
+    "build-glm53-main-verified-components-v8-aql-release-evidence-20261025T204107Z/receipt.json": "2a3699ff102f4c133edde50bf47fd183441794ab5d1bdbf077d4f85990c87612"
+  },
+  "actual_failed_v9_metadata": {
+    "validation-glm53-components-v9-native-metadata-diagnostic-20261025T204320Z/check.log": "e300e130e5c93166e18d69ea7e9e306b18c4a79ef39662ccd16133999de2ba0c",
+    "validation-glm53-components-v9-native-metadata-diagnostic-20261025T204320Z/receipt.json": "da424bde3d616fc2ea1d2572972e755e76766344648cb2fa7679bf9b5b7de991"
+  },
+  "actual_v11_plain_null_scale_witness": {
+    "validation-glm53-components-v10-complete-prewalk-20261025T205250Z/check.log": "4593b1d113b782fed05aca88f466b0ff978da1f44afabf15fa10e164ebdec389",
+    "validation-glm53-components-v10-complete-prewalk-20261025T205250Z/receipt.json": "2a24265f3b5998653a2ee50815315545ca68d506d648f8fcea4322996b0c3b09",
+    "validation-glm53-components-v11-ordinary-metadata-diagnostic-20261025T211654Z/check.log": "4b94593180d53ddf5526e3e23ca243eff1666cf08598031186df0d15111401aa",
+    "validation-glm53-components-v11-ordinary-metadata-diagnostic-20261025T211654Z/receipt.json": "49cad6e729fe48f1b9efc3245591411bc4f8ba65ecdd6ba11de1d4fa30429577",
+    "validation-glm53-components-v11-ordinary-metadata-diagnostic-20261025T211654Z/result.json": "0834ca2dafe4bd748bb390ba335f029d1ac0a01f599a21fdf7841ab94d11049d"
+  },
+  "author_compilation_execution_or_payload_read": false,
+  "core_directory": "radiance-glm-main-verified-source-v8-src",
+  "diagnostic_JSON_cap": 65536,
+  "diagnostic_only": false,
+  "files_sha256": {
+    "CMakeLists.txt": "982c17de1c6882c00636134f2e1a0f1a439edcdc80b943fd4a5d9a4e792b4155",
+    "CORE_SOURCE_PINS.json": "df4051bb85328badd3a130953721d31efff36b94133560bca29fcbb758a1ee0e",
+    "HELPER_SOURCE_PINS.json": "36b94cd4ecf41db4919966bb4f9ff873491bf81bf2c87c015bf19c12e4c3c85a",
+    "PRESERVED_COMPONENT_V10_SOURCE_RECEIPT.json": "dadfd2b840b598c924efff9c5ccf1a1f17155f3651e3eb7e3827351c041c02f9",
+    "PRESERVED_COMPONENT_V11_SOURCE_RECEIPT.json": "84a216ed0ed5f13eb9deef2c0d26e95dc5c284be945e45af0f7b2e3e15672932",
+    "PRESERVED_COMPONENT_V12_SOURCE_RECEIPT.json": "79f74ad437af4126eced1de270b35cd78ddc2e687ac4cc81ebe123c2c06bc820",
+    "PRESERVED_COMPONENT_V13_SOURCE_RECEIPT.json": "2e364dd804fce51dc3749bab9ae398073b148cb22bd4edca44dbd8974a0fe051",
+    "PRESERVED_COMPONENT_V7_SOURCE_RECEIPT.json": "e5f382300425e88b4fd2f4d167d7b7dcc735305a845fdc57c3de3df9ff973e99",
+    "PRESERVED_COMPONENT_V8_SOURCE_RECEIPT.json": "fad070576a2369862f7cc49fa98d3c98a303b660df41930329d34d770dcf00ad",
+    "PRESERVED_COMPONENT_V9_SOURCE_RECEIPT.json": "0f2e9a9cd670156f64556194a6d18dca17a262423ad1720394f44c17e70d08ce",
+    "PRESERVED_QUOTE_BODIES.json": "9c1ae8ac6d3947fe6c1c98fab1c314e1d3bb7142bcf86df9844e6c549bdbc056",
+    "README.txt": "f3571e7b286b12a2d02d8566d3da55dbf363ace057b9f77c379510f0af457911",
+    "V10_ACTUAL_METADATA_COUNT_DELTA.diff": "44a833a0a24938140a19f370a89c641bea19f1cad507e2edfb93862df51f160c",
+    "V11_ORDINARY_METADATA_DIAGNOSTIC_DELTA.diff": "b2a050cbe1b832d208e5be8b7e6bad0de4ea50b651afbe615e417de2cf97db37",
+    "V12_PRODUCTION_SOURCE_HELPER_DELTA.diff": "01da613d6d070fcf4274450f90b19fe762ece6e5be8124888aa21c01968f20ea",
+    "V13_CORE7_VALID_TOKEN_PROFILE_DELTA.diff": "011f63ba139bb607a92c45da16fd3b62af4ec47b8f474ce0025db5600fdbf35f",
+    "V14_CORE8_PRIVATE_PINS_ONLY.diff": "711195b4159ea1c42438cc036594d246fb384d3bf21312b6d872aebef4c63f35",
+    "V8_METADATA_LIFETIME_DELTA.diff": "149bac5e4451ee33a28ced3a3bbe904aa0eb56c388eb4674ee94bcff78c826d8",
+    "V9_DIAGNOSTIC_REASON_DELTA.diff": "d825b6795706e5feaf1dc35e606e77ae6c72c88c7de85328a12124aa204a7f86",
+    "actual_graph_quotes.cpp": "00ecfab60744c2f295451c70a872f034b82ff24b939e7ca8522b212f6dd66457",
+    "host_quotes.cpp": "f977134fdc3d84dd355f48fb05b01760b01341f936a6d28b1e0fd6472ff48c59",
+    "verify_sources.py": "6aa1037f5beb638bfed555c05e7a9ef890bb6aaca24775228dcb7b3838cfe5c2"
+  },
+  "helper_body_scope": "Existing stock metadata helper source included unchanged; its old main and cast-hypothesis graph are never invoked.",
+  "lifetime_evidence": {
+    "core/build/rad_builder.cpp": "7d6bcd6d25fe964e623873ea9de81f67853e833ce66acfd8b7108f336e6503c6",
+    "core/format/checkpoint.cpp": "a9f1ff3e938e0ff9ef1d80d8dac9dc159f7e541ca59b39e4ba1e39d7a78450aa",
+    "core/format/checkpoint.h": "708ca4a2ed27c218452fe67f1f6a45e010eccab16a70d9a19fa3094392d4410a"
+  },
+  "new_exact_CONV_tuple_refusals": 10,
+  "parent_Engine_v2_receipt": "2062af696b87638f5fbe0b3033db9f6c22720227d5509a9bf345994e1ae46b87",
+  "parent_Engine_v3_receipt": "6db8cb12e149e00ca1844baf38332d15b6d4c5944f44dec1455f34a5731b4d4f",
+  "parent_Engine_v4_receipt": "7651dc68bffc7f31d484a213fe37f58fc582916b1c13e330d815672c99386ad1",
+  "parent_Engine_v5_receipt": "5fb644e7648616b890a0a31d9cd9ff49675a559b0d464764e96c98c4f0133729",
+  "parent_Engine_v6_receipt": "9345219898c353afa14f14f9f24ac43c1505d5ef9099cd44af2261d2a69dd299",
+  "parent_Engine_v7_fixture_v9_receipt": "31e65caf5d0caba7c716dddbf35f27c58d4bce5ebe818056f7b66c7491a43fc2",
+  "parent_Engine_v8_fixture_v10_receipt": "2a39c520eae1af6daa9f81caafb76bc95ea3d90a83bbbeec331d0c4bafe41f76",
+  "parent_owned_validation": true,
+  "preserved_Tiny_Ctx_positive_runtime_tests": "Unchanged matching new-Core Foundation contract/tiny Engine regression package owned by compact_native_impl; not duplicated here.",
+  "preserved_component_v10_receipt": "dadfd2b840b598c924efff9c5ccf1a1f17155f3651e3eb7e3827351c041c02f9",
+  "preserved_component_v11_receipt": "84a216ed0ed5f13eb9deef2c0d26e95dc5c284be945e45af0f7b2e3e15672932",
+  "preserved_component_v12_receipt": "79f74ad437af4126eced1de270b35cd78ddc2e687ac4cc81ebe123c2c06bc820",
+  "preserved_component_v13_receipt": "2e364dd804fce51dc3749bab9ae398073b148cb22bd4edca44dbd8974a0fe051",
+  "preserved_component_v1_receipt": "454231d969b863dd53a99c7e3e0c8e22f445ffc95d82520cc4ed195ca1bb5782",
+  "preserved_component_v2_receipt": "1d24f5b60c9b66d00be15d728b18c7352486173f7ab8e8f3b129ef69ded6539f",
+  "preserved_component_v3_receipt": "07527968cbf0fd45bc9dbfc3506b503d95acfa8d94efb8b34b68a705bb1c510b",
+  "preserved_component_v4_receipt": "78207e9d9ab083e091875250ab4ccff2a476c9cc4650e66ff44682335bff41a7",
+  "preserved_component_v5_receipt": "2943be8f75c076a839b3b0f8d755ded3fc7e1f1b9b0907cab7aa1b441b872960",
+  "preserved_component_v6_receipt": "9ec3bcfeba04d2ebd16d857d6857123c8de634f6d0a23efa6a6a6010ddacba1f",
+  "preserved_component_v7_receipt": "e5f382300425e88b4fd2f4d167d7b7dcc735305a845fdc57c3de3df9ff973e99",
+  "preserved_component_v8_receipt": "fad070576a2369862f7cc49fa98d3c98a303b660df41930329d34d770dcf00ad",
+  "preserved_component_v9_receipt": "0f2e9a9cd670156f64556194a6d18dca17a262423ad1720394f44c17e70d08ce",
+  "preserved_tiny_quote_bodies": [
+    {
+      "begin": "int Ctx::tiny_startup_quote",
+      "end": "int Ctx::glm_main_startup_quote",
+      "file": "core/runtime/ctx.cpp",
+      "sha256": "b42ea02a295e0eda9ab7577e4ca8966150c74fc138687a4f6eebe8085e76bf2e"
+    },
+    {
+      "begin": "int Sampler::tiny_startup_quote",
+      "end": "int Sampler::glm_main_startup_quote",
+      "file": "core/sample/sampler.cpp",
+      "sha256": "39941cce4d2b190688c15160ace20a8654119bbeff2ba4401babf9a38479ec8e"
+    }
+  ],
+  "retained_diagnostic": true,
+  "schema": "glm53-main-verified-components-source-v14",
+  "scope": "SOURCE ONLY; HOST5quote groups, explicit actual AQL metadata graphs and optional REAL complete-data loader prewalk. No SourceFactory/Session/Engine admission, loader execute, kernel init/launch or model pass.",
+  "source_only_created_utc": "2026-10-26T00:12:36.739198+00:00",
+  "v10_delta": "Remove invented4096KV ceiling; nonnegative count+safe size_t equality, decomposed measured vector/count/pointer diagnostics and JSON actualcounts only; all owners/source/Core/guards retained.",
+  "v11_delta": "Diagnostic only: exact source/physical/null-scale/layout/share/static metadata witness before Reader; all rc/why calls sequenced. No Core/Program/admission/math normalization.",
+  "v12_delta": "Matching CoreV6; ordinary diagnostic uses same production validate_source instead of private physical/materializer mirror, reports canonicalplain/affine counts. Existing owner/count/status/refusal/HOST bodies unchanged.",
+  "v13_delta": "MatchingCore7; Samplerconfigvalid_token_count154856 in sharedpredeclare/callback, reportactualmodel/valid/paddedranks. Allother source/quote/refusal/owner/helper semantics unchanged.",
+  "v14_delta": "Only exact Core8 private pin directory/map, receipt and provenance/docs; all C++ checker/helper/quote/refusal/source/owner math bodies BYTE-EXACT Components13; no execution by author.",
+  "v2_delta": "New Core path/pins + complete-mode bounded path/ID validation before metadata/device setup; no quote/test-math changes.",
+  "v3_delta": "Core path/pins/provenance only; private Core include-root repair; all checkers byte-identical to componentV2.",
+  "v4_delta": "Matching Core path/pins plus actual metadata checker uses the public Program.device_holes(false).empty() predicate instead of TU-local miss_report; no loader or quote arithmetic changed.",
+  "v5_delta": "Only host_quotes.cpp qualifies two RAD_MAX_LOGPROBS references with rad::; no arithmetic, guard, actual checker or Core change.",
+  "v6_delta": "One read-only bounded rank0 diagnostic helper/call/include before first original Ctx quote. No Program, Core, guard, math, quote retry or acceptance changes.",
+  "v7_delta": "Matching CoreV5; preserve genuine two scratch regions, mutate3 for refusal, add10 exact actualCONV6144 tuple mutations with output/purity preservation and RAII restoration. BoundedV6 diagnostic retained; no Program baseline normalization.",
+  "v8_delta": "Fixture owns MetaOwn through all Program lifetimes, post-return pointer/KV/profile guards before Reader, bind rc-before-why, explicit pure native metadata diagnostic; CoreV5 and HOST checker unchanged",
+  "v9_delta": "Only diagnostic reason const-char* -> null-safe std::string with strnlen160; same bounded diagnostic output, all V8 metadata ownership/guards and Core unchanged."
+}

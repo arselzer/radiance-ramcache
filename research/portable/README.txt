@@ -1,81 +1,59 @@
-Portable Core V7, fixture V9, Components V13: thirteen HOST programs
+Portable Core V8 / fixture V10 / Components V14: fourteen HOST programs
 
-Current public defaults build CPU-only Core/reference/quantizer targets and
-thirteen HOST research checkers. The new thirteenth target is the exact fixture V9
-vocabulary_checker.cpp with the same export-dynamic and GNU wrap flags. Its
---run-host-vocab HOME mode uses synthetic metadata and actual matching HOST
-sampler/mask/top-k rows. It downloads no model and launches no GPU or API server.
-The same binary's --model-vocab-check MODEL mode is explicit/manual only; the
-portable driver NEVER invokes it. Archived Runner V5 is never imported or run.
+Current defaults build CPU-only Core/reference/quantizer targets and14 manual
+HOST checkers. The new target glm53_main_bounded_decode_check uses exact frozen
+Fixture10 decode_checker.cpp, including the unchanged gate source for its test
+hooks. Its --run-host-decode mode tests HOST Scheduler/KV/BatchBuilder commits,
+protocol-only PREFILL/DECODE frames and bounded admission/output preservation.
+It grants no actual TP4 source authority and launches no GPU/model kernels.
+The retained13 checker bodies are byte-identical to the preceding publication.
 
-Current fresh-build result: all13 Release HOST programs PASSED after a whole
-Core build from the published source at manifest
-4d9c9e4a8d662f90441c00c40519f35709ea4875347db7a42b0ae24edc9b6db1
-(3287files). Checks used only that freshly built public archive; no private
-research Core archive was used. The tested manifest and overwritten metadata
-are preserved. Fresh-build/13check logs and receipts are under
-evidence/glm53-main-verified-v7/portable13-fresh-{build,runtime}.
+Fresh PUBLIC Core8 build/runtime is PENDING. Private matchingCore8 all20 HOST
+commands and focused3 suites passed Release/ASan/TSan; a separate controlled
+one-input/two-output GPU trial passed. Those do not replace a fresh public14
+build/check. Core7's prior fresh-public13 PASS at manifest4d9c9e4a and its exact
+source/docs checkpoint are preserved with their original scope.
 
-Earlier, all thirteen Release HOST programs passed at exact tested source manifest
-8b966d37d75f96af9f1ad5f81d5f252f25072cc30726f68ba6a89601d4ec0d14
-(3212files), using verified source-identical existing Core7 archives and newly
-built portable fixtures. The final export adds evidence/normalized docs only;
-no tested source, tool or CMake byte changed. Original Core7 full20 HOST commands
-also passed Release/ASan/TSan. Focused mask+actualCPU vocabulary passed all modes;
-the initial focused ASan ptrace/LSan executor failure remains separately failed,
-with its unchanged host rerun passed. Full-data prewalk and a separate controlled
-one-input/one-output GPU trial passed; none are automatic portable actions.
-
-Requirements: Linux/POSIX, Python 3.10+, CMake 3.24+, C++20, pthreads and standard
-build tools. All JSON/llama/httplib source is vendored. No Torch/ROCm/model/network
-is required for the automatic HOST path.
-
-Commands from the repository root:
+Linux/POSIX, Python3.10+, CMake3.24+, C++20 and standard build tools are required.
+All JSON/llama/httplib sources are vendored. No Torch/ROCm/model/network is
+required for these automatic HOST targets. No CTest/auto-run/install/model/HTTP
+or maintenance target is added. Default builds only:
   python3 tools/verify_snapshot.py
   python3 tools/build_host.py --mode release --jobs 1
   python3 tools/build_host.py --mode release --jobs 1 --run-host-checks
   python3 tools/build_host.py --mode asan --jobs 1 --run-host-checks
   python3 tools/build_host.py --mode tsan --jobs 1 --run-host-checks
-The default builds only. The explicit flag runs all 13, including intended
-refusal/fail-stop subprocesses. build/ contains generated files and locks.
-Current directories core-main-verified-v7-host-MODE and
-portable-main-verified-v7-fixture-v9-host-MODE never silently reuse old headers.
+Generated directories are core-main-verified-v8-host-MODE and
+portable-main-verified-v8-fixture-v10-host-MODE. Old builds are preserved.
 
-Optional existing matching HOST Core:
+Optional exact existing HOST Core:
   python3 tools/build_host.py --existing-core-build /ABS/MATCHING/HOST/BUILD --run-host-checks
-Every exported source SHA must match the actual CMake source tree. Whole-Core
-archives, standard compiler, HOST/noFFmpeg/backend/mode/sanitizer/source-home and
-fixture-cache identities are checked. The only recorded extra original source
-files allowed for external reuse are two historicalpyc; frozenCore V7 already
-omits both. Existing builds need matching libref/libquant. No arbitrary prebuilt
-binary authenticity or hostile concurrent-writer protection is claimed.
+The actual source HOME must match every exported1535-file Core8 hash and closed
+inventory. Whole archive/header/compiler/STL/backend/mode/sanitizer/cache source
+identity is checked before and after configure. Only the two recorded historical
+pyc paths may be additional external-source files; neither is exported. Cache
+checks never admit a Core7 archive against Core8 private headers.
 
-Private ABI/compiler/environment/ccache/cache checks are unchanged from aacccd8:
-empty globalC/C++/linker overrides; standardRelease -O3 -DNDEBUG/Debug -g/
-MinSizeRel -Os -DNDEBUG/RelWithDebInfo -O2 -g -DNDEBUG. ExtraABIdefines/toolchains/
-compilerargs/LTO/launchers refuse. Existing Core alone may name regular
-/usr/bin/ccache with noargs/list/symlink; helpers never inherit it. Nonempty
-CCACHE_*/launcher/flag/include/library-path environment overrides refuse.
-Checks repeat afterconfigure and beforeexecution. Trusted compilers/CMake/source
-are still required. Sanitizer errors halt; no diagnostic is disabled.
+All prior compiler/ABI/environment safeguards remain: empty global C/C++/linker
+injection; standard Release/Debug/MinSizeRel/RelWithDebInfo flags; no arbitrary
+ABI defines/toolchain/compiler arguments/LTO. Existing Core alone may use exact
+regular /usr/bin/ccache with no arguments/list; fresh builds and portable fixtures
+use no launcher. Nonempty CCACHE_*, compiler/include/library/flag environment
+overrides refuse. Source identity does not authenticate an arbitrary compiler or
+prebuilt binary, and no hostile-writer or RSS-quota claim is made.
 
-OMP_NUM_THREADS=1/OMP_THREAD_LIMIT=1 and emptyGPUvisibility are set. The tinyEngine,
-TP4Session, actualEnginegate, component and newvocabulary checker remove ALL
-RADIANCE_*variables. Existing ASan/UBSan/TSan default options and caller overrides
-are unchanged (ASan detect_leaks=0:halt_on_error=1; UBSan halt_on_error=1:
-print_stacktrace=1; TSan halt_on_error=1:second_deadlock_stack=1).
+OMP_NUM_THREADS=1/OMP_THREAD_LIMIT=1 and empty GPU visibility are set. TinyEngine,
+TP4Session, actual cold gates, component quotes, vocabulary and bounded-decode
+checker commands remove ALL RADIANCE_* variables. ASan/UBSan/TSan defaults and
+caller overrides remain unchanged; no sanitizer diagnostic is disabled here.
+The vocabulary binary is invoked only with --run-host-vocab HOME. Its separate
+actual-model CPU mode and archived manual Engine/Runner sources are NEVER
+invoked by portable tools. No HOME binaries, checkpoint/native records, tokenizer
+payload, serving configuration, API keys or parent deployment wrappers export.
 
-Exact snapshot file-set/hash/symlink verification excludes only top-level.git/,
-build/and the manifest. CurrentCore pins are fixture V9/CORE_SOURCE_PINS.json,
-exactly1535Core V7files; no second subtraction of oldpyc. All raw archives retain
-original paths/READMEs/maps; use this guide for current normalized commands.
-OldCore V6 is reconstructible via its six-file overlay; V5 then uses two more.
-No raw package or old evidence/testedmanifest was modified to manufacture a pass.
-
-Manual candidate profile is one prompt/output token, maxTok1/seq1/spec0/exactwire/
-context512, nofixedresidents. Runner V5 requires originalprivate model/store/HOME/
-focus+three HOST modes/prewalk/container/hardware gates and fresh V5preparation.
-Its source is archived only; no maintenance action/default model/source admission,
-weights/tokenizer/native-store payload/compiled library/APIkey/serving config is
-included or invoked. Only the separate one-input/one-output GPU trial is validated. Subsequent decode,
-quality/performance/normal chat readiness remain unvalidated.
+The exact preceding guide/tools/CMake/manifest are retained in
+ docs/provenance/base-d04b562-checkpoint/
+Use docs/provenance/glm-core-v8-flight-wrapper.json for current source/target
+mapping, guards and pending parent validation. Actual raw receipts stay under
+ evidence/glm53-main-verified-v8/
+No quality,16-output GPU, normal chat,262K,MTP,speed or production claim follows.

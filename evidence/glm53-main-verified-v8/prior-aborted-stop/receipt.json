@@ -1,0 +1,105 @@
+{
+  "assembly_receipt_sha256": "7efe866461dfe9921ce12cfa7b676297f1581e3b9ec15b74cff64878e7ab12a4",
+  "combined_startup_plus_text_passed": false,
+  "commands": [],
+  "configuration_or_deployment_changes": false,
+  "error": "RuntimeError: Docker stop failed: Error response from daemon: cannot stop container: 608764c1d1989c714d8aad7b8a79f8057c3e73473b9f9d55b49d02e82defd2b8: tried to kill container, but did not receive an exit event\n",
+  "experimental_generation": {
+    "budget_scope": "host-payload only; metadata/stacks/device and RSS excluded",
+    "experiment_scope": "bounded decode; changing HOT and read chunk together is a combined experiment, not isolated attribution",
+    "host_payload_gib": 8,
+    "hot_mib_per_rank": 64,
+    "input_tokens": 1,
+    "minimum_requested_host_payload_bytes": 4866768896,
+    "outputs": 2,
+    "read_chunk_kib": 64
+  },
+  "external_SIGKILL_or_power_loss_recovery_guaranteed": false,
+  "finished": "2026-10-26T01:03:50.647387+00:00",
+  "health_before": [
+    {
+      "in_flight": 0,
+      "status": "ok"
+    },
+    {
+      "in_flight": 0,
+      "status": "ok"
+    }
+  ],
+  "host_validation_receipts": {
+    "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/validation-glm53-main-verified-engine-v8-host-asan-20261026T002403Z/receipt.json": "a0f380673d477aa9be03cc7b3154f764fe5189c7c8ac0f0737eaa053d0a8a111",
+    "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/validation-glm53-main-verified-engine-v8-host-release-20261026T000614Z/receipt.json": "e7795ae80b2d8231e5c6d8a133f7ab15c30ec4a030977474b3afdd419fe42b32",
+    "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/validation-glm53-main-verified-engine-v8-host-tsan-20261026T002513Z/receipt.json": "7b17b2a90e34b9334ec565bf21d7eb85e51b242a1ff471f2f9320291042ce6bf"
+  },
+  "logs_sha256": {},
+  "original_container": {
+    "Dead": false,
+    "ExitCode": 0,
+    "FinishedAt": "2026-10-25T23:40:01.728231501Z",
+    "Id": "608764c1d1989c714d8aad7b8a79f8057c3e73473b9f9d55b49d02e82defd2b8",
+    "Image": "sha256:e82764045e46ebae07e33961f17dedba981c0d07336dfcddd67e4b3b042b8600",
+    "Name": "/radiance-flashnext",
+    "Paused": false,
+    "Restarting": false,
+    "Running": true,
+    "StartedAt": "2026-10-25T23:54:16.478277866Z",
+    "Status": "running"
+  },
+  "passed": false,
+  "preparation_receipt_sha256": "347d70ecdef46241e0281e52454774dabff4cd12ff25165cd36165544d72969e",
+  "prewalk_receipt_sha256": "e6c85be36b8a7413f5e4b537f553e6ce737ad8df26ff15c27cbaa777fde7604d",
+  "restoration": {
+    "attempted": true,
+    "error": "original stop acknowledgement ambiguous; recovery is best effort",
+    "finished": "2026-10-26T01:03:50.636681+00:00",
+    "health": {
+      "in_flight": 0,
+      "status": "ok"
+    },
+    "healthy_after_best_effort": true,
+    "last_error": "URLError: <urlopen error [Errno 111] Connection refused>",
+    "last_state": {
+      "Dead": false,
+      "ExitCode": 0,
+      "FinishedAt": "2026-10-26T01:02:00.573042354Z",
+      "Id": "608764c1d1989c714d8aad7b8a79f8057c3e73473b9f9d55b49d02e82defd2b8",
+      "Image": "sha256:e82764045e46ebae07e33961f17dedba981c0d07336dfcddd67e4b3b042b8600",
+      "Name": "/radiance-flashnext",
+      "Paused": false,
+      "Restarting": false,
+      "Running": true,
+      "StartedAt": "2026-10-26T01:02:02.719584163Z",
+      "Status": "running"
+    },
+    "original_stop_ambiguous": true,
+    "passed": false,
+    "recovery_stop_boundary": true,
+    "recovery_stopped_state": {
+      "Dead": false,
+      "ExitCode": 137,
+      "FinishedAt": "2026-10-26T01:02:00.573042354Z",
+      "Id": "608764c1d1989c714d8aad7b8a79f8057c3e73473b9f9d55b49d02e82defd2b8",
+      "Image": "sha256:e82764045e46ebae07e33961f17dedba981c0d07336dfcddd67e4b3b042b8600",
+      "Name": "/radiance-flashnext",
+      "Paused": false,
+      "Restarting": false,
+      "Running": false,
+      "StartedAt": "2026-10-25T23:54:16.478277866Z",
+      "Status": "exited"
+    },
+    "same_container_id": "608764c1d1989c714d8aad7b8a79f8057c3e73473b9f9d55b49d02e82defd2b8",
+    "stable_seconds": 40.66525896603707,
+    "start_requested": true,
+    "started": "2026-10-26T01:01:49.311194+00:00"
+  },
+  "restoration_armed_before_stop": true,
+  "same_original_container_restored": false,
+  "schema": "glm53-controlled-manual-maintenance-v1",
+  "scope": "one controlled stop/start of the SAME existing QFN container plus one combined isolated GLM startup+bounded-decode child",
+  "separate_independent_transport_run": false,
+  "source_pass_receipt_sha256": "0952e9b61aba9369dbae9087ed217d72f8eb2a9b4167d9d26c2e0907a5b06ec7",
+  "source_receipt": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-manual-maintenance-runner-v6-20261026/SOURCE_RECEIPT.json",
+  "source_receipt_sha256": "de397a3497b2ba3e381e1c3d71275da186992bb8e978a61394b57cc7c979b1b0",
+  "started": "2026-10-26T01:00:48.384111+00:00",
+  "stop_boundary_confirmed": false
+}

@@ -1,0 +1,5 @@
+Components14/Core8 pin-only independent source closure
+
+No scoped blocker. Receipt36f23505b556a9cf6228c68dae6df37ad2cc59111ee8fbb04ee1ac13c8b09f32/all22filepins/closed23fileinventory and1535Core8pinsdf4051bb match. Both actual_graph_quotes.cpp and host_quotes.cpp plus verify_sources.py and all preserved helper/body files remain exactComponents13. CMake changes only default sourceCore7->Core8; exact archive/private-header/map admission remains. Added prior13receipt preserves history. README top explicitly supersedes historical revisions, retains capacityONE/no model/sourceReady result, and claims no execution.
+
+Components14 still checks metadata/complete-prewalk/sampler opt-in for actual one-row capacity. It is not a positive test of Core8bounded output/witness/model decode, and oldCore7 private archives cannot substitute. No source/shape/math/authority/loader/negative predicate changed. Matching parent build/runtime required; no reviewer import/compiler/runtime/GPU/service/source edit.

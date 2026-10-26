@@ -4617,8 +4617,15 @@ static const RadConstraint cMoeGather[] = {
 static const RadConstraint cRowTopK[] = {
     C_DIV("N", 8), C_GE("M", 1), C_GE("R", 1), C_LE("R", 32), C_IN("dtype", "bf16"),
 };
+/* rowtopk_f32 is exact for any N (no vector-width rule) and needs no tunable: RC = R, PT >= R. */
+static const RadConstraint cRowTopKF32[] = {
+    C_GE("N", 1), C_GE("M", 1), C_LE("M", 65535), C_GE("R", 1), C_LE("R", 32),
+    C_IN("dtype", "f32"),
+};
+/* `dtype` names the source logits' type; the gathered plane is f32 pairs either way and neither
+ * implementation rounds to it, so a bf16 and an f32 head merge alike. */
 static const RadConstraint cRowTopKMerge[] = {
-    C_GE("M", 1), C_GE("R", 1), C_LE("R", 32), C_GE("world_size", 1), C_IN("dtype", "bf16"),
+    C_GE("M", 1), C_GE("R", 1), C_LE("R", 32), C_GE("world_size", 1), C_IN("dtype", "bf16 f32"),
 };
 static const RadConstraint cLogitRerank[] = {
     C_GE("M", 1), C_GE("R", 1), C_LE("R", 32), C_GE("n_vocab", 1), C_GE("n_embd", 1),
@@ -5285,6 +5292,7 @@ static const RadTunable tRmsQ8[] = {
  * power-of-two padding. */
 static const RadConstraint cBf16Row[]   = { C_IN("dtype", "bf16") };
 static const RadConstraint cF32Row[]    = { C_IN("dtype", "f32") };
+static const RadConstraint cI32Row[]    = { C_IN("dtype", "i32") };
 /* bf16 rows over the byte copy, which moves four bytes a thread: an even width. */
 static const RadConstraint cBf16Row2[]  = { C_IN("dtype", "bf16"), C_DIV("n", 2) };
 /* Opaque byte rows, four at a time: the vectorised copy's alignment, stated so the selector
@@ -5803,6 +5811,17 @@ static const RadKernelInfo kKernels[] = {
   "f32 in and out",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cF32Row), NOTUNE,
+  nullptr, nullptr, r4d_rad_add, nullptr, nullptr, nullptr,
+  r4d_shape_binary },
+
+{ "add_i32", "add", "elem",
+  "elementwise int32 sum (a drafter's ids and positions) as libref computes it: operands read as "
+  "f32, the f32 sum rounded to nearest and saturated into int32; `div` divides the rounded sum",
+  "any M and n, the same one row-broadcast form, flat over the extent; equal to a wrapping int32 "
+  "add while |a|, |b|, |a + b| < 2^24",
+  "i32 in and out",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cI32Row), NOTUNE,
   nullptr, nullptr, r4d_rad_add, nullptr, nullptr, nullptr,
   r4d_shape_binary },
 
@@ -8179,6 +8198,17 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   nullptr, nullptr, r4d_rad_rowtopk, r4d_rad_rowtopk_scratch, nullptr, nullptr,
   r4d_shape_row_topk },
 
+{ "rowtopk_f32", "row_topk", "select",
+  "exact per-row top-R of an f32 matrix (a GGUF head's logits), descending, ties to the lower "
+  "column; -0 ties +0 as libref's float compare does",
+  "any M <= 65535, any N (uneven vocab shards), R <= 32; two launches (1024-column chunks keeping "
+  "their top-R, then one wave a row), caller-sized partial buffer, exact for any non-NaN data",
+  "f32 in, f32 values + i32 columns out (-1 / -inf for a slot past N)",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cRowTopKF32), NOTUNE,
+  nullptr, nullptr, r4d_rad_rowtopk_f32, r4d_rad_rowtopk_f32_scratch, nullptr, nullptr,
+  r4d_shape_row_topk },
+
 { "logit_rerank", "logit_rerank", "select",
   "R candidates a row rescored exactly against the full-precision head",
   "any M, R <= 32, bf16 x and the E4M3 lm_head plane logits_gemm_fp8 stores; one block a row with "
@@ -8207,7 +8237,7 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   "the global top-R of world_size all-gathered per-rank candidate sets",
   "any M, R <= 32; `gathered` is [M, world_size * R, 2] f32 pairs, an int32 id in the first slot; "
   "one wave a row, one launch, no scratch",
-  "f32 pairs in, f32 values + i32 ids out, ties to the lower id",
+  "f32 pairs in (from a bf16 or an f32 head), f32 values + i32 ids out, ties to the lower id",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cRowTopKMerge), NOTUNE,
   nullptr, nullptr, r4d_rad_rowtopk_merge, nullptr, nullptr, nullptr,

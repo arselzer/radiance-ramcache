@@ -487,6 +487,8 @@ int r4d_rad_dequant_w4      (const RadArgs*, RadStream);
 int r4d_rad_rowtopk         (const RadArgs*, RadStream);
 int64_t r4d_rad_rowtopk_scratch(const RadArgs*);
 int r4d_rad_rowtopk_merge   (const RadArgs*, RadStream);
+int r4d_rad_rowtopk_f32     (const RadArgs*, RadStream);
+int64_t r4d_rad_rowtopk_f32_scratch(const RadArgs*);
 int r4d_rad_logit_rerank    (const RadArgs*, RadStream);
 int r4d_rad_logit_rerank_i8 (const RadArgs*, RadStream);
 

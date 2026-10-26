@@ -1518,6 +1518,8 @@ int embed_planes_body(const RadArgs* a, RadStream stream) {
  * rmsnorm_rope_roundtrip  rmsnorm -> rope_rows -> quant_roundtrip   (a window or index key)
  * rope_rows_roundtrip     rope_rows -> quant_roundtrip              (attention output, keys)
  * mhc_collapse_rmsnorm    mhc_collapse -> rmsnorm                   (a sublayer's input)
+ * mhc_post_collapse_rmsnorm  mhc_post -> mhc_collapse -> rmsnorm    (a sublayer's output into the
+ *                         next sublayer's input)
  * One launch each where a decode step issued two or three dependent ones. Byte-identical to the
  * chain of rows (r4d_fuse.cpp declares it, rad-kbench's fusion oracle runs it): every step forms
  * its values as its own row does and rounds where that row stores. The norm is rmsnorm_bf16's
@@ -1762,6 +1764,100 @@ __global__ __launch_bounds__(THR) void collapse_norm_kernel(
     }
 }
 
+/* mhc_post_collapse_rmsnorm: collapse_norm_kernel with mhc_post in front, column-local. For each of
+ * its columns a thread forms every output stream k as mhc_post_kernel does (from zero, comb[j][k] *
+ * h[j] over the source streams in order, then + post[k] * x, f32_to_bf16), stores it, and collapses
+ * the stored values (collapse_kernel's sum over k, ds_bf16); the norm is collapse_norm_kernel's. */
+template <bool WF32, uint32_t THR, int HCM>
+__global__ __launch_bounds__(THR) void post_collapse_norm_kernel(
+    const uint16_t* __restrict__ xin, long xp, const uint16_t* __restrict__ h, long hp,
+    const float* __restrict__ post, long ptp, const float* __restrict__ comb, long cbp,
+    uint16_t* __restrict__ out, long op, const float* __restrict__ pre, long pp, long pst,
+    uint16_t* __restrict__ x, uint32_t x_ld, const void* __restrict__ w, uint16_t* __restrict__ y,
+    uint32_t y_ld, uint32_t n, int hc, float eps, float wadd, float mult, uint32_t M) {
+    __shared__ float lds[THR / kFzWave];
+    const uint32_t m = blockIdx.x;
+    if (m >= M) return;
+    const uint16_t* __restrict__ xir = xin + (long)m * xp;
+    const uint16_t* __restrict__ hr = h + (long)m * hp;
+    uint16_t* __restrict__ orow = out + (long)m * op;
+    const float* __restrict__ pr = pre + (long)m * pp;
+    uint16_t* __restrict__ xr = x + (size_t)m * x_ld;
+    float pj[HCM], pk[HCM], cb[HCM][HCM];
+#pragma unroll
+    for (int k = 0; k < HCM; ++k) {
+        const int kk = k < hc ? k : hc - 1;
+        pj[k] = pr[(long)kk * pst];
+        pk[k] = post[(long)m * ptp + kk];
+#pragma unroll
+        for (int j = 0; j < HCM; ++j) cb[j][k] = comb[(long)m * cbp + (j < hc ? j : hc - 1) * hc + kk];
+    }
+    const bool one = n <= (uint32_t)kFzCols * THR;
+    float xv[kFzCols], gv[kFzCols];
+    float ss = 0.0f;
+#pragma unroll 1
+    for (uint32_t i0 = threadIdx.x; i0 < n; i0 += (uint32_t)kFzCols * THR) {
+        uint32_t hv[kFzCols][HCM], xi[kFzCols];
+#pragma unroll
+        for (int c = 0; c < kFzCols; ++c) {
+            const uint32_t i = min(i0 + (uint32_t)c * THR, n - 1);
+#pragma unroll
+            for (int j = 0; j < HCM; ++j) hv[c][j] = hr[(long)(j < hc ? j : hc - 1) * n + i];
+            xi[c] = xir[i];
+            gv[c] = WF32 ? ((const float*)w)[i] : bf16_to_f32(((const uint16_t*)w)[i]);
+        }
+#pragma unroll
+        for (int c = 0; c < kFzCols; ++c) {
+            const uint32_t i = i0 + (uint32_t)c * THR;
+            float v = 0;
+#pragma unroll
+            for (int k = 0; k < HCM; ++k) {
+                if (k >= hc) continue;
+                float u = 0;
+#pragma unroll
+                for (int j = 0; j < HCM; ++j)
+                    if (j < hc) u += cb[j][k] * bf16_to_f32((uint16_t)hv[c][j]);
+                u += pk[k] * bf16_to_f32((uint16_t)xi[c]);
+                const uint16_t o = f32_to_bf16(u);
+                if (i < n) orow[(long)k * n + i] = o;
+                v += pj[k] * ds_bf(o);
+            }
+            const uint16_t b = ds_bf16(v);
+            xv[c] = bf16_to_f32(b);
+            if (i < n) {
+                xr[i] = b;
+                ss += xv[c] * xv[c];
+            }
+        }
+    }
+    ss = fz_block_sum<THR / kFzWave>(ss, lds);
+    const float s = rsqrtf(ss / (float)n + eps);
+    uint16_t* __restrict__ yr = y + (size_t)m * y_ld;
+    if (one) {
+#pragma unroll
+        for (int c = 0; c < kFzCols; ++c) {
+            const uint32_t i = threadIdx.x + (uint32_t)c * THR;
+            if (i < n) yr[i] = f32_to_bf16(xv[c] * s * (gv[c] + wadd) * mult);
+        }
+        return;
+    }
+#pragma unroll 1
+    for (uint32_t i0 = threadIdx.x; i0 < n; i0 += (uint32_t)kFzCols * THR) {
+        uint16_t xb[kFzCols];
+#pragma unroll
+        for (int c = 0; c < kFzCols; ++c) {
+            const uint32_t i = min(i0 + (uint32_t)c * THR, n - 1);
+            xb[c] = xr[i];
+            gv[c] = WF32 ? ((const float*)w)[i] : bf16_to_f32(((const uint16_t*)w)[i]);
+        }
+#pragma unroll
+        for (int c = 0; c < kFzCols; ++c) {
+            const uint32_t i = i0 + (uint32_t)c * THR;
+            if (i < n) yr[i] = f32_to_bf16(bf16_to_f32(xb[c]) * s * (gv[c] + wadd) * mult);
+        }
+    }
+}
+
 // quant_rt_body's format and scale names.
 bool fz_quant_fmt(const RadArgs* a, int* fmt, int* sc) {
     const char* fs = r4d_gets(a, "format");
@@ -1948,6 +2044,55 @@ int collapse_norm_body(const RadArgs* a, RadStream stream) {
 #undef FZ_CN
 }
 
+/* x [M, n], h [M, hc*n], post [M, hc], comb [M, hc*hc] f32 -> out [M, hc*n] (mhc_post_bf16's
+ * checks: n <= 16384, out not h); pre, xc, w, y as mhc_collapse_rmsnorm. */
+int post_collapse_norm_body(const RadArgs* a, RadStream stream) {
+    if (!a || a->n_t < 9) return RAD_E_INVAL;
+    const long n = (long)r4d_geti_or(a, "n", 0), hc = (long)r4d_geti_or(a, "hc", 0);
+    if (n <= 0 || n > 16384 || hc < 2 || hc > 8) return R4D_NO(RAD_E_SHAPE);
+    const RadTensor &xi = a->t[0], &h = a->t[1], &po = a->t[2], &cb = a->t[3], &o = a->t[4];
+    const RadTensor &pre = a->t[5], &x = a->t[6], &w = a->t[7], &y = a->t[8];
+    if (!w.data || !y.data) return R4D_NO(RAD_E_INVAL);
+    if (xi.rank != 2 || xi.shape[0] < 1 || xi.shape[0] > 65535) return R4D_NO(RAD_E_SHAPE);
+    const long rows = xi.shape[0];
+    if (xi.dtype != RAD_BF16 || h.dtype != RAD_BF16 || po.dtype != RAD_F32 || cb.dtype != RAD_F32 ||
+        o.dtype != RAD_BF16 || pre.dtype != RAD_F32 || x.dtype != RAD_BF16 || y.dtype != RAD_BF16)
+        return R4D_NO(RAD_E_DTYPE);
+    if (!mat(xi, RAD_BF16, rows, n) || !mat(h, RAD_BF16, rows, hc * n) ||
+        !mat(po, RAD_F32, rows, hc) || !mat(cb, RAD_F32, rows, hc * hc) ||
+        !mat(o, RAD_BF16, rows, hc * n) || o.data == h.data || !mat_s(pre, RAD_F32, rows, hc) ||
+        !mat(x, RAD_BF16, rows, n))
+        return R4D_NO(RAD_E_SHAPE);
+    if (!r4d_contig(&w)) return R4D_NO(RAD_E_STRIDE);
+    if (w.dtype != RAD_F32 && w.dtype != RAD_BF16) return R4D_NO(RAD_E_DTYPE);
+    if (r4d_numel(&w) < n) return R4D_NO(RAD_E_SHAPE);
+    long long My = 0;
+    const long long y_ld = r4d_rows_pitch(&y, n, &My);
+    if (y_ld < 0) return R4D_NO(RAD_E_STRIDE);
+    if (My < rows) return R4D_NO(RAD_E_SHAPE);
+    const float eps = (float)r4d_getf(a, "eps", 1e-6), wadd = (float)r4d_getf(a, "wadd", 0.0);
+    const float mult = (float)r4d_getf(a, "mult", 1.0);
+    const int thr = r4d_act_threads((int)rows, (int)n);
+#define FZ_PCN(WF, T, HM)                                                                          \
+    R4D_EMIT(stream, (post_collapse_norm_kernel<WF, T, HM>),                                       \
+             dim3(r4d_cliff_rows((uint32_t)rows, 1, T / kFzWave)), dim3(T), 0,                     \
+             (const uint16_t*)xi.data, (long)xi.stride[0], (const uint16_t*)h.data,                \
+             (long)h.stride[0], (const float*)po.data, (long)po.stride[0],                         \
+             (const float*)cb.data, (long)cb.stride[0], (uint16_t*)o.data, (long)o.stride[0],      \
+             (const float*)pre.data, (long)pre.stride[0], (long)pre.stride[1], (uint16_t*)x.data,  \
+             (uint32_t)x.stride[0], (const void*)w.data, (uint16_t*)y.data, (uint32_t)y_ld,        \
+             (uint32_t)n, (int)hc, eps, wadd, mult, (uint32_t)rows)
+#define FZ_PCN_T(WF, HM)                                                                           \
+    return thr == 1024 ? FZ_PCN(WF, 1024, HM) : thr == 512 ? FZ_PCN(WF, 512, HM) : FZ_PCN(WF, 256, HM)
+#define FZ_PCN_W(WF)                                                                               \
+    do { if (hc <= 4) FZ_PCN_T(WF, 4); FZ_PCN_T(WF, 8); } while (0)
+    if (w.dtype == RAD_F32) FZ_PCN_W(true);
+    FZ_PCN_W(false);
+#undef FZ_PCN_W
+#undef FZ_PCN_T
+#undef FZ_PCN
+}
+
 }  // namespace
 
 extern "C" int r4d_rad_token_map(const RadArgs* a, RadStream s) { return token_map_body(a, s); }
@@ -1985,4 +2130,7 @@ extern "C" int r4d_rad_rope_rows_roundtrip(const RadArgs* a, RadStream s) {
 }
 extern "C" int r4d_rad_mhc_collapse_rmsnorm(const RadArgs* a, RadStream s) {
     return collapse_norm_body(a, s);
+}
+extern "C" int r4d_rad_mhc_post_collapse_rmsnorm(const RadArgs* a, RadStream s) {
+    return post_collapse_norm_body(a, s);
 }

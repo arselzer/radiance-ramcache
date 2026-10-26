@@ -19,6 +19,7 @@ int r4d_rad_embed_lookup_planes(const RadArgs* a, RadStream stream);
 int r4d_rad_rmsnorm_rope_roundtrip(const RadArgs* a, RadStream stream);
 int r4d_rad_rope_rows_roundtrip(const RadArgs* a, RadStream stream);
 int r4d_rad_mhc_collapse_rmsnorm(const RadArgs* a, RadStream stream);
+int r4d_rad_mhc_post_collapse_rmsnorm(const RadArgs* a, RadStream stream);
 
 /* Shapes (r4d_ds41_elem_shapes.inc), libref's ref_<op>_shape operand for operand. */
 int r4d_shape_token_map(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
@@ -34,10 +35,12 @@ int r4d_shape_embed_lookup_planes(const RadParam* p, int n_p, int operand, RadOp
 int r4d_shape_rmsnorm_rope_roundtrip(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 int r4d_shape_rope_rows_roundtrip(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 int r4d_shape_mhc_collapse_rmsnorm(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
+int r4d_shape_mhc_post_collapse_rmsnorm(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 
 /* The chains the fused rows replace (r4d_fuse.cpp). */
 int r4d_fuse_rmsnorm_rope_roundtrip(const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_rope_rows_roundtrip(const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_mhc_collapse_rmsnorm(const RadParam*, int, uint64_t, int, RadFuseStep*);
+int r4d_fuse_mhc_post_collapse_rmsnorm(const RadParam*, int, uint64_t, int, RadFuseStep*);
 
 #endif

@@ -201,6 +201,7 @@ at once. Run it before adding a kernel plugin; the loader names only the first c
 | `mhc_mix` | `M`(range) `n` `hc` `iterations` `eps`:f64 `hc_eps`:f64 `dtype` | `h`, `fn`w, `scale`w, `base`w → `pre`, `post`, `comb` |
 | `mhc_collapse` | `M`(range) `n` `hc` `dtype` | `h`, `pre` → `x` |
 | `mhc_collapse_rmsnorm` | `M`(range) `n` `hc` `eps`:f64 `dtype` `wadd`:f64/opt `mult`:f64/opt | `h`, `pre` → `x`; `w`w → `y` (device-only: mhc_collapse then rmsnorm, x rounded before the norm reads it) |
+| `mhc_post_collapse_rmsnorm` | `M`(range) `n` `hc` `eps`:f64 `dtype` `wadd`:f64/opt `mult`:f64/opt | `x`, `h`, `post`, `comb` → `out`; `pre` → `xc`; `w`w → `y` (device-only: mhc_post, mhc_collapse over out, rmsnorm over xc; each rounded before the next reads it; out must not alias h) |
 | `hc_read` | `M`(range) `n` `hc` `lowrank` `eps`:f64 `dtype` `wadd`:f64/opt `inject`/opt `group`/opt `rotate`/opt `mix`/opt | `h`, `w`w, `mix_down`w, `mix_up`w, `inject_w`w? → `x`, `inj`?, `q`?, `scale`?, `rq`?, `rscale`? |
 | `hc_write` | `M`(range) `n` `hc` `dtype` | `y`, `inj`, `h`:inout |
 | `hc_project` | `M`(range) `n` `hc` `scale`:f64 `dtype` | `h`:inout, `v`, `on` |
@@ -252,12 +253,13 @@ no plane to feed `rmsnorm` as a gain.
 **`rmsnorm_add`** is the residual add and the next norm in one pass, as every real implementation
 does it. A plugin asks for it first and falls back to `add` + `rmsnorm` (`spec.md` §2.3).
 
-**`mhc_collapse_rmsnorm`** (device-only) is DeepSeek-V4.1's sublayer entry in one launch:
-`mhc_collapse` then `rmsnorm`. Each step stores its output in the activation dtype before the next
-reads it, so it is bit-identical to the chain. libr4d declares it with `replaces`, and
-`rad-kbench`'s fusion oracle holds it to libr4d's own chain byte for byte. libref has no row: an
-architecture asks `rad_op_declared` and `rad_op_resolved` and declares the chain where they do not
-resolve, so a host deployment runs the chain.
+**`mhc_collapse_rmsnorm`** and **`mhc_post_collapse_rmsnorm`** (device-only) are DeepSeek-V4.1's
+sublayer entry in one launch: `mhc_collapse` then `rmsnorm`, and `mhc_post`, `mhc_collapse` over its
+`out` and `rmsnorm`. Each step stores its output in the activation dtype before the next reads it,
+so they are bit-identical to the chain. libr4d declares them with `replaces`, and `rad-kbench`'s
+fusion oracle holds each to libr4d's own chain byte for byte. libref has no row: an architecture
+asks `rad_op_declared` and `rad_op_resolved` and declares the chain where they do not resolve, so a
+host deployment runs the chain.
 
 **`gelu_mul`** is `silu_mul` with the tanh GELU: Gemma's gated FFN is trained with
 `gelu_pytorch_tanh`, while the unary `gelu` is the exact erf form. Both split the fused `gate_up`

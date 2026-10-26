@@ -167,6 +167,16 @@ static const RadOperandSpec oDs41CollapseNorm[] = {
 static const RadConstraint cDs41CollapseNorm[] = {
     C_GE("M", 1), C_GE("n", 1), C_GE("hc", 2), C_LE("hc", 8), C_IN("dtype", "bf16"),
 };
+static const RadOperandSpec oDs41PostCollapseNorm[] = {
+    { "x", RAD_OPD_IN, 0 },   { "h", RAD_OPD_IN, 0 },  { "post", RAD_OPD_IN, 0 },
+    { "comb", RAD_OPD_IN, 0 }, { "out", RAD_OPD_OUT, 0 }, { "pre", RAD_OPD_IN, 0 },
+    { "xc", RAD_OPD_OUT, 0 }, { "w", RAD_OPD_WEIGHT, 0 }, { "y", RAD_OPD_OUT, 0 },
+};
+/* mhc_post_bf16's range (cMhcPlain). */
+static const RadConstraint cDs41PostCollapseNorm[] = {
+    C_GE("M", 1),  C_LE("M", 65535), C_GE("n", 1),          C_LE("n", 16384),
+    C_GE("hc", 2), C_LE("hc", 8),    C_IN("dtype", "bf16"),
+};
 
 #elif defined(R4D_DS41_SCHEMAS)
 
@@ -220,6 +230,10 @@ static const RadConstraint cDs41CollapseNorm[] = {
     SCHEMA("mhc_collapse_rmsnorm", pDs41CollapseNorm, oDs41CollapseNorm,
            "mhc_collapse (h, pre -> x), then rmsnorm (x, w -> y): x and y as the two ops leave them, x "
            "rounded to dtype before the norm reads it."),
+    SCHEMA("mhc_post_collapse_rmsnorm", pDs41CollapseNorm, oDs41PostCollapseNorm,
+           "mhc_post (x, h, post, comb -> out), then mhc_collapse (out, pre -> xc), then rmsnorm (xc, "
+           "w -> y): out, xc and y as the three ops leave them, each rounded to dtype before the next "
+           "step reads it. out must not alias h."),
 
 #elif defined(R4D_DS41_ROWS)
 
@@ -321,5 +335,12 @@ static const RadConstraint cDs41CollapseNorm[] = {
   "bf16 h, x and y, f32 pre, f32 or bf16 w", RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cDs41CollapseNorm), NOTUNE, nullptr, nullptr, r4d_rad_mhc_collapse_rmsnorm, nullptr,
   nullptr, nullptr, r4d_shape_mhc_collapse_rmsnorm, nullptr, r4d_fuse_mhc_collapse_rmsnorm },
+{ "mhc_post_collapse_rmsnorm_bf16", "mhc_post_collapse_rmsnorm", "norm",
+  "out = post[k] x + sum_j comb[j,k] h[j], xc = sum_k pre[k] out[k], y = rmsnorm(xc), in one pass",
+  "M 1..65535, n 1..16384, hc 2..8; rmsnorm_bf16's workgroup a row (r4d_act_threads)",
+  "bf16 x, h, out, xc and y, f32 post, comb and pre, f32 or bf16 w", RAD_DOMAIN_DEVICE,
+  R4D_PRIO_ONLY, ROW(cDs41PostCollapseNorm), NOTUNE, nullptr, nullptr,
+  r4d_rad_mhc_post_collapse_rmsnorm, nullptr, nullptr, nullptr,
+  r4d_shape_mhc_post_collapse_rmsnorm, nullptr, r4d_fuse_mhc_post_collapse_rmsnorm },
 
 #endif

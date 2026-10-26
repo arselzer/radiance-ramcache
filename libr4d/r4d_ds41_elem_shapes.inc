@@ -177,3 +177,22 @@ extern "C" int r4d_shape_mhc_collapse_rmsnorm(const RadParam* p, int n_p, int op
     };
     R4D_PICK(l);
 }
+
+extern "C" int r4d_shape_mhc_post_collapse_rmsnorm(const RadParam* p, int n_p, int operand,
+                                                   RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n"), hc = pi(p, n_p, "hc");
+    if (M <= 0 || n <= 0 || hc < 2 || hc > 8) return RAD_E_UNSUPPORTED;
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = {
+        opd(D, M, n),                      /* x */
+        opd(D, M, hc * n),                 /* h */
+        opd((uint32_t)RAD_F32, M, hc),     /* post */
+        opd((uint32_t)RAD_F32, M, hc * hc), /* comb */
+        opd(D, M, hc * n),                 /* out */
+        opd((uint32_t)RAD_F32, M, hc),     /* pre */
+        opd(D, M, n),                      /* xc */
+        opd((uint32_t)RAD_F32, n),         /* w */
+        opd(D, M, n),                      /* y */
+    };
+    R4D_PICK(l);
+}

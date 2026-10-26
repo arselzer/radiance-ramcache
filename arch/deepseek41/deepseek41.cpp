@@ -238,6 +238,10 @@ struct Layer {
      * + kv_q, k_norm + k_rope + k_q, o_rope + o_q, l_rope + l_q, i_rope + i_qq, col_a + norm_a,
      * col_f + norm_f. */
     rad_op kv_f = 0, k_f = 0, o_f = 0, l_f = 0, i_f = 0, cn_a = 0, cn_f = 0;
+    /* mhc_post into the next sublayer's collapse + norm (post_collapse_norm()): pcn_f = post_a +
+     * col_f + norm_f, issued for post_a; pcn_a = the previous layer's post_f + this layer's col_a +
+     * norm_a, issued for that post_f (so before this layer's Engram-free tap and mix_a). */
+    rad_op pcn_f = 0, pcn_a = 0;
     rad_weight ffn_norm = 0;
     rad_op mix_f = 0, col_f = 0, norm_f = 0, post_f = 0;
     MoeFP8 moe{};
@@ -332,6 +336,7 @@ struct Model {
     rad_op embed = 0, expand = 0, pre0 = 0, pre1 = 0, rope_a = 0, rope_b_step = 0, tok_map = 0;
     rad_op contract = 0, fnorm = 0, gather = 0, head_op = 0, embed_ar = 0;
     rad_op cn_fin = 0;   /* contract + fnorm fused (fused()), or 0 */
+    rad_op pcn_fin = 0;  /* the last post_f + contract + fnorm fused, or 0 */
     Dsp dsp{};
 };
 static std::unique_ptr<Model> models[MAX_RANKS];
@@ -510,6 +515,17 @@ static rad_op collapse_norm(RadBuilder* b, const Model& m, int64_t rows, rad_wei
                  { RAD_RANGE("M", 1, rows), RAD_INT("n", m.c.n_embd), RAD_INT("hc", m.c.hc),
                    RAD_F64("eps", m.c.eps), RAD_STR("dtype", "bf16") },
                  { w }, { h, pre }, { x, y });
+}
+/* mhc_post (in, h, post, comb -> out), mhc_collapse (out, pre -> x), rmsnorm (x, w -> y), as one
+ * op. RADIANCE_DS41_FUSE_POST=0 keeps mhc_post apart (then collapse_norm() as before). */
+static rad_op post_collapse_norm(RadBuilder* b, const Model& m, int64_t rows, rad_weight w,
+                                 rad_buf in, rad_buf h, rad_buf out, rad_buf pre, rad_buf x,
+                                 rad_buf y) {
+    if (!fuse_on("RADIANCE_DS41_FUSE_COLLAPSE") || !fuse_on("RADIANCE_DS41_FUSE_POST")) return 0;
+    return fused(b, "mhc_post_collapse_rmsnorm",
+                 { RAD_RANGE("M", 1, rows), RAD_INT("n", m.c.n_embd), RAD_INT("hc", m.c.hc),
+                   RAD_F64("eps", m.c.eps), RAD_STR("dtype", "bf16") },
+                 { w }, { in, h, m.post, m.comb, pre }, { out, x, y });
 }
 
 static int geometry(Model& m, const RadBuildCtx* ctx) {
@@ -795,9 +811,14 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
                  { m.pre_a, m.post, m.comb });
     if (!m.zero) {
         L.attn_norm = w("blk.%d.attn_norm.weight", RAD_F32, { D });
-        L.cn_a = collapse_norm(b, m, T, L.attn_norm, m.h0, m.pre_f, m.xcol, m.xn);
+        /* The previous layer's post_f writes h0 straight into this collapse unless an Engram
+         * block (above) rewrites h0 between them. */
+        if (l > 0 && !L.e_ids)
+            L.pcn_a = post_collapse_norm(b, m, T, L.attn_norm, m.act.x, m.h1, m.h0, m.pre_f,
+                                         m.xcol, m.xn);
+        if (!L.pcn_a) L.cn_a = collapse_norm(b, m, T, L.attn_norm, m.h0, m.pre_f, m.xcol, m.xn);
     }
-    if (!L.cn_a) L.col_a = op(b, "mhc_collapse", hcp, {}, { m.h0, m.pre_f }, { m.xcol });
+    if (!L.cn_a && !L.pcn_a) L.col_a = op(b, "mhc_collapse", hcp, {}, { m.h0, m.pre_f }, { m.xcol });
     if (m.zero) {
         /* Attention-zero (Geom::attn_world): no heads on this rank. Its caches are declared and
          * bound as on an attention rank, the weightless stores that fix their block sizes declared
@@ -835,7 +856,7 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
                                       RAD_F64("value", 0.0) },
                          {}, {}, { m.attn_out });
     } else {
-        if (!L.cn_a) L.norm_a = rmsnorm(b, m, T, L.attn_norm, D, m.xcol, m.xn);
+        if (!L.cn_a && !L.pcn_a) L.norm_a = rmsnorm(b, m, T, L.attn_norm, D, m.xcol, m.xn);
 
         /* ---- attention: the query, the window key */
         L.wq_a = lw(b, m, nm.f("blk.%d.attn_q_a.weight", l), c.q_lora, D, grp);
@@ -1021,8 +1042,10 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
     L.mix_f = op(b, "mhc_mix", mixp, { L.hc_f_fn, L.hc_f_scale, L.hc_f_base }, { m.h1 },
                  { m.pre_f, m.post, m.comb });
     L.ffn_norm = w("blk.%d.ffn_norm.weight", RAD_F32, { D });
-    L.cn_f = collapse_norm(b, m, T, L.ffn_norm, m.h1, m.pre_a, m.xcol, m.act.x);
-    if (!L.cn_f) {
+    L.pcn_f = post_collapse_norm(b, m, T, L.ffn_norm, m.attn_out, m.h0, m.h1, m.pre_a, m.xcol,
+                                 m.act.x);
+    if (!L.pcn_f) L.cn_f = collapse_norm(b, m, T, L.ffn_norm, m.h1, m.pre_a, m.xcol, m.act.x);
+    if (!L.pcn_f && !L.cn_f) {
         L.col_f = op(b, "mhc_collapse", hcp, {}, { m.h1, m.pre_a }, { m.xcol });
         L.norm_f = rmsnorm(b, m, T, L.ffn_norm, D, m.xcol, m.act.x);
     }
@@ -1620,8 +1643,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     }
     m.layers.resize((size_t)c.n_layer);
     for (int l = 0; l < c.n_layer; ++l) DS_TRY(layer(b, m, m.layers[(size_t)l], l));
-    m.cn_fin = collapse_norm(b, m, T, m.final_gain, m.h0, m.pre_f, m.xcol, m.final_hidden);
-    if (!m.cn_fin) {
+    m.pcn_fin = post_collapse_norm(b, m, T, m.final_gain, m.act.x, m.h1, m.h0, m.pre_f, m.xcol,
+                                   m.final_hidden);
+    if (!m.pcn_fin)
+        m.cn_fin = collapse_norm(b, m, T, m.final_gain, m.h0, m.pre_f, m.xcol, m.final_hidden);
+    if (!m.pcn_fin && !m.cn_fin) {
         m.contract = op(b, "mhc_collapse",
                         { RAD_RANGE("M", 1, T), RAD_INT("n", D), RAD_INT("hc", c.hc), RAD_STR("dtype", "bf16") },
                         {}, { m.h0, m.pre_f }, { m.xcol });
@@ -1864,12 +1890,12 @@ static void step(RadCtx* x, const RadBatch* batch) {
         if (L.cn_a)
             RAD_ISSUE_N(x, L.cn_a, T, brows(m.h0, T), brows(m.pre_f, T), brows(m.xcol, T),
                         RAD_W(L.attn_norm), brows(m.xn, T));
-        else
+        else if (L.col_a)   /* 0 under pcn_a: issued for the previous post_f */
             RAD_ISSUE_N(x, L.col_a, T, brows(m.h0, T), brows(m.pre_f, T), brows(m.xcol, T));
         if (m.zero) {
             RAD_ISSUE_N(x, L.attn_fill, T, brows(m.attn_out, T));
         } else {
-            if (!L.cn_a)
+            if (L.norm_a)
                 RAD_ISSUE_N(x, L.norm_a, T, brows(m.xcol, T), RAD_W(L.attn_norm), brows(m.xn, T));
             const rad_buf cs = r > 0 ? m.cs_b : m.cs_a;
             /* The query and key chains share only xn. Issued alternately, each op's predecessor
@@ -2018,12 +2044,18 @@ static void step(RadCtx* x, const RadBatch* batch) {
             RAD_ISSUE_N(x, L.o_b, T, brows(m.oa, T), RAD_W(L.wo_b), brows(m.attn_out, T));
         }
         if (L.ar_attn) RAD_ISSUE_N(x, L.ar_attn, T * D, brows(m.attn_out, T), RAD_NONE);
-        RAD_ISSUE_N(x, L.post_a, T, brows(m.attn_out, T), brows(m.h0, T), brows(m.post, T),
-                    brows(m.comb, T), brows(m.h1, T));
+        if (L.pcn_f)   /* post_a, col_f and norm_f in one */
+            RAD_ISSUE_N(x, L.pcn_f, T, brows(m.attn_out, T), brows(m.h0, T), brows(m.post, T),
+                        brows(m.comb, T), brows(m.h1, T), brows(m.pre_a, T), brows(m.xcol, T),
+                        RAD_W(L.ffn_norm), brows(m.act.x, T));
+        else
+            RAD_ISSUE_N(x, L.post_a, T, brows(m.attn_out, T), brows(m.h0, T), brows(m.post, T),
+                        brows(m.comb, T), brows(m.h1, T));
 
         RAD_ISSUE_N(x, L.mix_f, T, brows(m.h1, T), RAD_W(L.hc_f_fn), RAD_W(L.hc_f_scale),
                     RAD_W(L.hc_f_base), brows(m.pre_f, T), brows(m.post, T), brows(m.comb, T));
-        if (L.cn_f) {
+        if (L.pcn_f) {
+        } else if (L.cn_f) {
             RAD_ISSUE_N(x, L.cn_f, T, brows(m.h1, T), brows(m.pre_a, T), brows(m.xcol, T),
                         RAD_W(L.ffn_norm), brows(m.act.x, T));
         } else {
@@ -2031,10 +2063,22 @@ static void step(RadCtx* x, const RadBatch* batch) {
             RAD_ISSUE_N(x, L.norm_f, T, brows(m.xcol, T), RAD_W(L.ffn_norm), brows(m.act.x, T));
         }
         L.moe.step(x, batch);
-        RAD_ISSUE_N(x, L.post_f, T, brows(m.act.x, T), brows(m.h1, T), brows(m.post, T),
-                    brows(m.comb, T), brows(m.h0, T));
+        /* post_f, or post_f with the next collapse + norm (the next layer's pcn_a, or pcn_fin). */
+        const Layer* nx = L.l + 1 < c.n_layer ? &m.layers[(size_t)L.l + 1] : nullptr;
+        if (nx && nx->pcn_a)
+            RAD_ISSUE_N(x, nx->pcn_a, T, brows(m.act.x, T), brows(m.h1, T), brows(m.post, T),
+                        brows(m.comb, T), brows(m.h0, T), brows(m.pre_f, T), brows(m.xcol, T),
+                        RAD_W(nx->attn_norm), brows(m.xn, T));
+        else if (!nx && m.pcn_fin)
+            RAD_ISSUE_N(x, m.pcn_fin, T, brows(m.act.x, T), brows(m.h1, T), brows(m.post, T),
+                        brows(m.comb, T), brows(m.h0, T), brows(m.pre_f, T), brows(m.xcol, T),
+                        RAD_W(m.final_gain), brows(m.final_hidden, T));
+        else
+            RAD_ISSUE_N(x, L.post_f, T, brows(m.act.x, T), brows(m.h1, T), brows(m.post, T),
+                        brows(m.comb, T), brows(m.h0, T));
     }
-    if (m.cn_fin) {
+    if (m.pcn_fin) {
+    } else if (m.cn_fin) {
         RAD_ISSUE_N(x, m.cn_fin, T, brows(m.h0, T), brows(m.pre_f, T), brows(m.xcol, T),
                     RAD_W(m.final_gain), brows(m.final_hidden, T));
     } else {

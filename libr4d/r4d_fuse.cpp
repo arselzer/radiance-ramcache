@@ -897,6 +897,9 @@ extern "C" int r4d_fuse_ar_rmsnorm_quant_fp8(const RadParam* p, int n_p, uint64_
  *     rope_rows_bf16 then quant_roundtrip over x's n_head * head_dim columns, in place.
  * mhc_collapse_rmsnorm    [0] h  [1] pre  [2] x  [3] w  [4] y
  *     mhc_collapse_bf16 (h, pre -> x), then rmsnorm_bf16 (x, w -> y).
+ * mhc_post_collapse_rmsnorm  [0] x  [1] h  [2] post  [3] comb  [4] out  [5] pre  [6] xc  [7] w  [8] y
+ *     mhc_post_bf16 (x, h, post, comb -> out), mhc_collapse_bf16 (out, pre -> xc), rmsnorm_bf16
+ *     (xc, w -> y).
  * Each step's output is the bf16 its own row stores; the fused kernels keep exactly those values
  * between steps (in LDS, a register, or the stored x).
  */
@@ -953,6 +956,26 @@ extern "C" int r4d_fuse_mhc_collapse_rmsnorm(const RadParam* p, int n_p, uint64_
         return s.wire({ 0, 1, 2 });                 /* h, pre, x */
     }
     case 1: { Step s(out, "rmsnorm"); mirror_norm(s, p, n_p); return s.wire({ 2, 3, 4 }); }
+    default: return RAD_E_NOTFOUND;
+    }
+}
+
+extern "C" int r4d_fuse_mhc_post_collapse_rmsnorm(const RadParam* p, int n_p, uint64_t present,
+                                                  int step, RadFuseStep* out) {
+    if (!out) return RAD_E_INVAL;
+    if (pi(p, n_p, "M") <= 0 || pi(p, n_p, "n") <= 0) return RAD_E_UNSUPPORTED;
+    switch (step) {
+    case 0: {
+        Step s(out, "mhc_post");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "n").mirror(p, n_p, "hc").mirror(p, n_p, "dtype");
+        return s.wire({ 0, 1, 2, 3, 4 });           /* x, h, post, comb, out */
+    }
+    case 1: {
+        Step s(out, "mhc_collapse");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "n").mirror(p, n_p, "hc").mirror(p, n_p, "dtype");
+        return s.wire({ 4, 5, 6 });                 /* out, pre, xc */
+    }
+    case 2: { Step s(out, "rmsnorm"); mirror_norm(s, p, n_p); return s.wire({ 6, 7, 8 }); }
     default: return RAD_E_NOTFOUND;
     }
 }

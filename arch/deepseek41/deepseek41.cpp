@@ -311,6 +311,9 @@ struct Model {
     int aw = 1, ar = 0;
     int64_t gr = 0;
     bool zero = false;
+    /* This rank's columns [sh_lo, sh_hi) of the shared expert when its width does not split
+     * evenly into whole blocks (shared_slice); 0, 0 is the even split. */
+    int64_t sh_lo = 0, sh_hi = 0;
     /* buffers */
     rad_buf h0 = 0, h1 = 0, xcol = 0, xn = 0, pre_a = 0, pre_f = 0, post = 0, comb = 0;
     rad_buf qr = 0, qrn = 0, q = 0, kv = 0, kvn = 0, o = 0, oa = 0, attn_out = 0;
@@ -528,6 +531,27 @@ static rad_op post_collapse_norm(RadBuilder* b, const Model& m, int64_t rows, ra
                  { w }, { in, h, m.post, m.comb, pre }, { out, x, y });
 }
 
+/* The shared expert is split by width, and a rank's K slice of its down projection must fall on
+ * the encoding's block boundary along K: 256 columns for the GGUF k- and i-quant superblocks, 128 for
+ * block fp8, 32 for legacy GGUF and MXFP4, 1 for bf16. A slice on a 256-column boundary is on every
+ * one's. The even split is kept wherever each rank's share is whole 256-column blocks (and wherever
+ * the width is no whole number of them, where the encoding decides at declare, as before); otherwise
+ * the width splits by whole blocks, the first nb % world ranks one block more. DeepSeek-V4.1-Flash's
+ * 2304 columns are nine blocks: three ranks take three each, and four ranks 768/512/512/512 where
+ * the even 576 would cut a superblock. Each rank computes its gate/up columns and K slice of down,
+ * and the all-reduce sums the partials (MoeFP8::Config::shared_lo). */
+static constexpr int64_t kSharedBlock = 256;
+
+static void shared_slice(int64_t n_ff, int world, int rank, int64_t* lo, int64_t* hi) {
+    *lo = *hi = 0;
+    if (world <= 1 || n_ff % kSharedBlock) return;
+    if (n_ff % world == 0 && (n_ff / world) % kSharedBlock == 0) return;
+    const int64_t nb = n_ff / kSharedBlock, base = nb / world, extra = nb % world;
+    const int64_t b0 = rank * base + std::min<int64_t>(rank, extra);
+    *lo = b0 * kSharedBlock;
+    *hi = (b0 + base + (rank < extra ? 1 : 0)) * kSharedBlock;
+}
+
 static int geometry(Model& m, const RadBuildCtx* ctx) {
     auto& g = m.g;
     const auto& c = m.c;
@@ -561,14 +585,19 @@ static int geometry(Model& m, const RadBuildCtx* ctx) {
      * experts are what the bf16 and quantised expert paths both serve, at any world (an expert's
      * width split into whole quant blocks holds at three ranks but not at four). The shared expert
      * is split by width. */
-    if (c.n_expert % world || (c.n_expert / world) % 2 || c.n_ff % world) {
+    int64_t sh_lo = 0, sh_hi = 0;
+    shared_slice(c.n_ff, world, ctx->rank, &sh_lo, &sh_hi);
+    if (c.n_expert % world || (c.n_expert / world) % 2 || (sh_hi == 0 && c.n_ff % world)) {
         fprintf(stderr, "radiance: deepseek41: %lld experts of width %lld do not split over %d ranks "
                         "(an even count of whole experts each, and the shared expert's width)\n",
                 (long long)c.n_expert, (long long)c.n_ff, world);
         return RAD_E_UNSUPPORTED;
     }
     g.n_ff_all = c.n_ff;
-    g.n_ff = c.n_ff / world;
+    /* This rank's width of the shared expert (its buffers and the MoE block's n_ff_shared). */
+    g.n_ff = sh_hi ? sh_hi - sh_lo : c.n_ff / world;
+    m.sh_lo = sh_lo;
+    m.sh_hi = sh_hi;
     g.n_vocab_all = c.n_vocab;
     g.n_vocab = shard_extent(c.n_vocab, world, ctx->rank);
     g.vocab_off = shard_begin(c.n_vocab, world, ctx->rank);
@@ -658,8 +687,11 @@ static int buffers(RadBuilder* b, Model& m) {
     mw.egu = bf("expert_gate_up", { T * c.top_k, 2 * c.n_ff });
     mw.eff.x = bf("expert_ff", { T * c.top_k, c.n_ff });
     mw.edn = bf("expert_down", { T * c.top_k, D });
-    mw.sgu = bf("shared_gate_up", { T, 2 * g.n_ff });   /* the shared expert: this rank's width */
-    mw.sff.x = bf("shared_ff", { T, g.n_ff });
+    /* the shared expert: this rank's width; none where its slice is empty (shared_slice) */
+    if (g.n_ff > 0) {
+        mw.sgu = bf("shared_gate_up", { T, 2 * g.n_ff });
+        mw.sff.x = bf("shared_ff", { T, g.n_ff });
+    }
     mw.sout = bf("shared_out", { T, D });
     mw.sgate = bf("shared_one", { T, 1 });
     m.final_hidden = decl_b(b, nm.f("final_hidden"), RAD_BF16, { T, D }, RAD_BUF_PERSIST);
@@ -1066,6 +1098,8 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
     s.cfg.top_k = c.top_k;
     s.cfg.n_ff_exp = c.n_ff;
     s.cfg.n_ff_shared = g.n_ff;
+    s.cfg.shared_lo = m.sh_lo;
+    s.cfg.shared_hi = m.sh_hi;
     s.cfg.rows = T;
     s.cfg.norm_topk = c.norm_topk;
     s.cfg.sigmoid_router = 1;
@@ -1282,6 +1316,8 @@ static int dsp_stage_ops(RadBuilder* b, Model& m, Layer& L) {
     s.cfg.top_k = d.top_k;
     s.cfg.n_ff_exp = c.n_ff;
     s.cfg.n_ff_shared = g.n_ff;
+    s.cfg.shared_lo = m.sh_lo;
+    s.cfg.shared_hi = m.sh_hi;
     s.cfg.rows = Q;
     s.cfg.norm_topk = c.norm_topk;
     s.cfg.sigmoid_router = 1;
@@ -1343,8 +1379,10 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
     mw.egu = bf("dspark_expert_gate_up", { Q * d.top_k, 2 * c.n_ff });
     mw.eff.x = bf("dspark_expert_ff", { Q * d.top_k, c.n_ff });
     mw.edn = bf("dspark_expert_down", { Q * d.top_k, D });
-    mw.sgu = bf("dspark_shared_gate_up", { Q, 2 * g.n_ff });
-    mw.sff.x = bf("dspark_shared_ff", { Q, g.n_ff });
+    if (g.n_ff > 0) {
+        mw.sgu = bf("dspark_shared_gate_up", { Q, 2 * g.n_ff });
+        mw.sff.x = bf("dspark_shared_ff", { Q, g.n_ff });
+    }
     mw.sout = bf("dspark_shared_out", { Q, D });
     mw.sgate = bf("dspark_shared_one", { Q, 1 });
     d.fin = bf("dspark_final", { Q, D });

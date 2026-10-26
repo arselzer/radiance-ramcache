@@ -1041,7 +1041,22 @@ int Ctx::record_pass(const RadBatch* b, uint64_t key, PassTape* out) {
     out->touch_pending[1] = host_touch_pending_[1];
     out->scratch_open[0] = scratch_open_[0];
     out->scratch_open[1] = scratch_open_[1];
-    if (haz_mark(*out) < 0) {
+    {
+        /* RAD_TAPE_DUMP=1: the first recording of each draft pass kind lists its dispatches
+         * (TAPEDUMP lines on stderr, every rank): a diagnostic for issue-order work. */
+        static const bool dump = [] {
+            const char* e = std::getenv("RAD_TAPE_DUMP");
+            return e && e[0] == '1';
+        }();
+        const int db = b->draft_pass + 8;
+        haz_dump_ = dump && db >= 0 && db < 64 && !(tape_told_ & (1ull << db));
+        if (haz_dump_)
+            fprintf(stderr, "TAPEDUMP r%d begin draft %d tok %lld\n", rank_, b->draft_pass,
+                    (long long)b->n_tok);
+    }
+    const int hm = haz_mark(*out);
+    haz_dump_ = false;
+    if (hm < 0) {
         tape_destroy(t);
         out->dev = nullptr;
         return 0;
@@ -1108,18 +1123,50 @@ int Ctx::haz_mark(PassTape& t) {
         if (!q) { qs.push_back(Q{}); q = &qs.back(); q->id = qid; }
         /* An event packet: the next dispatch is ordered, since nothing after a wait may start
          * before its event completes. */
-        if (kind != 0) { q->infl.clear(); q->opaque = true; q->run = 0; continue; }
+        if (kind != 0) {
+            if (haz_dump_) fprintf(stderr, "TAPEDUMP r%d %d q%u event\n", rank_, i, qid);
+            q->infl.clear(); q->opaque = true; q->run = 0; continue;
+        }
         ++t.dispatches;
 
         const int32_t op = first_of[(size_t)i];
         bool ok = op >= 0 && !q->opaque && !haz_ops_[(size_t)op].opaque && q->run < kTapeOverlapRun;
+        int32_t clash = -1;
         if (ok) {
             const HazOp& h = haz_ops_[(size_t)op];
             for (int32_t x : q->infl) {
                 const HazOp& f = haz_ops_[(size_t)x];
                 if (overlaps(h.rd, h.n_rd, f.wr, f.n_wr) || overlaps(h.wr, h.n_wr, f.rd, f.n_rd) ||
-                    overlaps(h.wr, h.n_wr, f.wr, f.n_wr)) { ok = false; break; }
+                    overlaps(h.wr, h.n_wr, f.wr, f.n_wr)) { ok = false; clash = x; break; }
             }
+        }
+        if (haz_dump_) {
+            const int32_t own = part_of[(size_t)i];
+            const HazOp* h = own >= 0 ? &haz_ops_[(size_t)own] : nullptr;
+            const OpPlan* pl = h ? &plans_[h->op] : nullptr;
+            const char* why = ok                                 ? "U"
+                              : own < 0                          ? "O noop"
+                              : op < 0                           ? "O cont"
+                              : h->opaque                        ? "O opaque"
+                              : q->opaque                        ? "O after-opaque"
+                              : q->run >= kTapeOverlapRun        ? "O run-cap"
+                                                                 : "O clash";
+            std::string rr;
+            if (h && op >= 0 && !h->opaque) {
+                rr = " rd";
+                for (uint32_t k = 0; k < h->n_rd; ++k)
+                    rr += fmt(" %llx+%llx", (unsigned long long)haz_rng_[h->rd + k].first,
+                              (unsigned long long)(haz_rng_[h->rd + k].second - haz_rng_[h->rd + k].first));
+                rr += " wr";
+                for (uint32_t k = 0; k < h->n_wr; ++k)
+                    rr += fmt(" %llx+%llx", (unsigned long long)haz_rng_[h->wr + k].first,
+                              (unsigned long long)(haz_rng_[h->wr + k].second - haz_rng_[h->wr + k].first));
+            }
+            fprintf(stderr, "TAPEDUMP r%d %d q%u hop%d op%d decl%d %s %s %s%s%s\n", rank_, i, qid, own,
+                    h ? (int)h->op : -1, pl && pl->info ? pl->info->index : -1,
+                    pl && pl->info ? pl->info->op.c_str() : "-",
+                    h && h->row && h->row->info && h->row->info->name ? h->row->info->name : "-", why,
+                    clash >= 0 ? fmt(" with hop%d", clash).c_str() : "", rr.c_str());
         }
         if (ok) {
             const int sc = tape_set_overlap(t.dev, i, true);

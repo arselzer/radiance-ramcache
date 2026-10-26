@@ -1121,6 +1121,7 @@ void Ctx::haz_note(const OpPlan& p, const IssuePlan& ip, const RadTensor* t, int
     o.rec0 = rec0;
     o.rec1 = rec1;
     o.op = (uint32_t)(&p - plans_.data());
+    o.row = ip.row;
     const RadOpSchema* sc = p.info ? p.info->schema : nullptr;
     o.opaque = p.collective || !sc || sc->n_operands != n_opd || !ip.row || !ip.row->concurrent;
     std::pair<uintptr_t, uintptr_t> rd[MAX_OPERANDS + 1], wr[MAX_OPERANDS + 1];

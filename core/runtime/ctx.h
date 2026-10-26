@@ -571,6 +571,7 @@ private:
         int32_t  rec0 = 0, rec1 = 0;      /* its dispatches in the tape */
         uint32_t op = 0;
         bool     opaque = false;
+        const KernelRow* row = nullptr;   /* for RAD_TAPE_DUMP only */
         uint32_t rd = 0, n_rd = 0, wr = 0, n_wr = 0;   /* into haz_rng_ */
     };
     std::vector<HazOp> haz_ops_;
@@ -578,6 +579,7 @@ private:
     void haz_note(const OpPlan& p, const IssuePlan& ip, const RadTensor* t, int n_opd, int rec0,
                   int rec1);
     int  haz_mark(PassTape& t);
+    bool haz_dump_ = false;   /* RAD_TAPE_DUMP=1: haz_mark lists this recording's dispatches */
 
     static constexpr size_t  kTapes      = 24;     /* recorded passes kept, least recently used out */
     static constexpr int64_t kAuditPlays = 1024;

@@ -565,17 +565,8 @@ static rad_op rope_rows(RadBuilder* b, const Model& m, int64_t rows, int64_t hea
                 RAD_INT("inverse", inverse), RAD_STR("dtype", "bf16") },
               {}, { x, cs }, { x });
 }
-/* RADIANCE_DEBUG_NOQ: the model's own quantise-dequantise points (window, compressed and index
- * keys, the indexer query, the attention output) become identity. Diagnosis only: it changes what
- * the model computes, and exists so a parity run against the reference's REF_NOQ=1 form is exact
- * rather than chaotic on random weights (the port's NOTES, GATE0). */
-static bool debug_noq() {
-    static const bool on = std::getenv("RADIANCE_DEBUG_NOQ") != nullptr;
-    return on;
-}
 static rad_op roundtrip(RadBuilder* b, int64_t rows, int64_t n, int64_t block, const char* fmt,
                         const char* scale, rad_buf x) {
-    if (debug_noq()) return 0;
     return op(b, "quant_roundtrip",
               { RAD_RANGE("M", 1, rows), RAD_INT("n", n), RAD_INT("block", block),
                 RAD_STR("format", fmt), RAD_STR("scale", scale), RAD_STR("dtype", "bf16") },
@@ -608,7 +599,6 @@ static rad_op fused(RadBuilder* b, const char* name, std::vector<RadParam> ps,
 static rad_op norm_rope_rt(RadBuilder* b, const Model& m, int64_t rows, rad_weight w, int64_t n,
                            int64_t block, const char* fmt, const char* scale, rad_buf x, rad_buf y,
                            rad_buf cs) {
-    if (debug_noq()) return 0;
     return fused(b, "rmsnorm_rope_roundtrip",
                  { RAD_RANGE("M", 1, rows), RAD_INT("n", n), RAD_F64("eps", m.c.eps),
                    RAD_INT("n_head", 1), RAD_INT("head_dim", n), RAD_INT("rot", m.c.rope),
@@ -621,7 +611,6 @@ static rad_op norm_rope_rt(RadBuilder* b, const Model& m, int64_t rows, rad_weig
 static rad_op rope_rt(RadBuilder* b, const Model& m, int64_t rows, int64_t heads, int64_t hd,
                       int inverse, int64_t block, const char* fmt, const char* scale, rad_buf x,
                       rad_buf cs) {
-    if (debug_noq()) return 0;
     return fused(b, "rope_rows_roundtrip",
                  { RAD_RANGE("M", 1, rows), RAD_INT("n_head", heads), RAD_INT("head_dim", hd),
                    RAD_INT("rot", m.c.rope), RAD_INT("off", hd - m.c.rope), RAD_STR("mode", "gptj"),
@@ -1480,7 +1469,6 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
     const int64_t T = g.max_tok, Q = d.Q, D = c.n_embd, HD = g.n_head * c.head_dim, hd = c.head_dim;
     const int64_t R = d.cand;
     auto bf = [&](const char* n, std::initializer_list<int64_t> s) { return decl_b(b, nm.f("%s", n), RAD_BF16, s); };
-    static const bool keep = std::getenv("RADIANCE_DEBUG_DSPARK_KEEP") != nullptr;
 
     /* ---- buffers: the context pass (a trunk step's rows), the query pass (Q rows), the head */
     d.c = bf("dspark_main", { T, D });
@@ -1526,9 +1514,7 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
     mw.sgate = bf("dspark_shared_one", { Q, 1 });
     d.fin = bf("dspark_final", { Q, D });
     d.rows = bf("dspark_head_in", { Q, D });
-    /* RADIANCE_DEBUG_DSPARK_KEEP: the head's logits kept whole after the pass (a persistent buffer) so a
-     * RADIANCE_DUMP_BUF probe reads them; diagnosis only. */
-    d.logits = decl_b(b, nm.f("dspark_logits"), RAD_F32, { Q, g.n_vocab }, keep ? RAD_BUF_PERSIST : RAD_BUF_TRANSIENT);
+    d.logits = decl_b(b, nm.f("dspark_logits"), RAD_F32, { Q, g.n_vocab });
     d.cand_ = decl_b(b, nm.f("dspark_cand"), RAD_I32, { Q, R });
     d.unary = decl_b(b, nm.f("dspark_unary"), RAD_F32, { Q, R });
     if (g.world > 1) {
@@ -1681,9 +1667,6 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
     drf.window = c.window + 1;
     drf.mask_token = (int32_t)d.noise;
     DS_TRY(rad_declare_drafter(b, &drf));
-    if (keep)
-        fprintf(stderr, "radiance: deepseek41: RADIANCE_DEBUG_DSPARK_KEEP: the drafter's logits buffer is "
-                        "persistent -- a diagnosis form\n");
     rad_note(b, "DSpark drafter: %d stages at absolute layers %d..%d (window-only V4 blocks, %lld experts top-%lld), "
                 "taps before %zu trunk layer(s), one pass over [anchor, noise %lld x %lld] proposes %lld tokens; "
                 "attention over %lld context keys + the block's own; Markov rank %lld walked over the head's top %lld; "
@@ -1862,9 +1845,6 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     /* The drafter after everything the trunk step issues (llama_fp8's rule: declaration order is
      * liveness, and its passes run behind the step). */
     if (m.dsp.on) DS_TRY(dsp_declare(b, m, ctx));
-    if (debug_noq())
-        fprintf(stderr, "radiance: deepseek41: RADIANCE_DEBUG_NOQ: the model's quantise-dequantise "
-                        "points are off -- a diagnosis form, not the model\n");
     rad_note(b, "DeepSeek-V4.1: %lld layers, hc %lld, window %lld, %zu kv sources, %zu index "
                 "sources, %lld experts top-%lld, Engram at %zu layers",
              (long long)c.n_layer, (long long)c.hc, (long long)c.window, c.kv_src.size(),

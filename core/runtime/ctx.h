@@ -20,6 +20,7 @@
 #include "arena.h"
 #include "rank_barrier.h"
 #include "residency.h"
+#include "rowprefetch.h"
 #include "stager.h"
 #include "device/device.h"
 
@@ -91,6 +92,9 @@ struct OpPlan {
     /* Its position in the declared order, or its anchor's for a core-appended op: what the second
      * lane's window (Program::lane1_w0..lane1_w1) is checked against. */
     int32_t       order = 0;
+    /* A row gather (runtime/rowprefetch.h): on the host, its rows on the mapped tier are read
+     * ahead before the kernel runs. Matched by name once here, like `billed`. */
+    bool          row_gather = false;
 };
 
 /* ------------------------------------------------------------------ routing handoff */
@@ -366,6 +370,13 @@ public:
     /* Host synchronisations on the step path. Always zero unless per-op timing is on (spec §16);
      * tests read it. Teardown's drain is not counted. */
     int64_t     host_syncs()   const { return n_host_syncs_; }
+    /* Of those, the host-op joins that drained the stream because an operand is untracked by the
+     * host arena (host_join_drains); tests read it. */
+    int64_t     host_drains()  const { return n_host_drains_; }
+    /* Host gathers whose rows were read ahead from the mapped tier, and the pages they advised
+     * (runtime/rowprefetch.h); tests read them. */
+    int64_t     row_prefetch_calls() const { return rowpf_calls_; }
+    int64_t     row_prefetch_pages() const { return rowpf_pages_; }
     /* This rank's all-reduce traffic. The inter-card link carries both the tensor-parallel
      * all-reduce and the expert mover's transfers; the mover counts its own (MoverStats), so the
      * two can be told apart.
@@ -526,6 +537,11 @@ private:
         RadTensor        t[MAX_OPERANDS] = {};
         int64_t          n = 0;
         bool             drain = false;    /* an operand the arena does not track: drain instead */
+        /* The lanes whose last host-arena toucher its join waited on when recorded. A play
+         * re-records those events in the played stretches, but only the issue path raises
+         * host_touch_pending_, so a pass with two host ops would run the second unjoined. */
+        bool             touch[2] = { false, false };
+        RowPrefetch      rp{};             /* its rows read ahead at every play (rowprefetch.h) */
     };
     struct PassTape {
         uint64_t key = 0;
@@ -733,6 +749,15 @@ private:
     int       host_join(const RadOperand* opd, int n_opd);
     bool      host_join_drains(const RadOperand* opd, int n_opd) const;
     int       host_join_wait(bool drain);
+    /* Read ahead a host gather's rows on the mapped tier (runtime/rowprefetch.h): which tables
+     * this issue reads there, then the madvise over the rows `t[0]` names. Off with
+     * RADIANCE_ROW_PREFETCH=0. */
+    bool      row_prefetch_on_ = true;
+    RowPrefetchScratch rowpf_;
+    int64_t   rowpf_calls_ = 0, rowpf_pages_ = 0;
+    void      row_prefetch_plan(const RadArgs& a, const RadOperand* opd, int n_opd,
+                                const RadTensor* t, RowPrefetch* out) const;
+    void      row_prefetch_run(const RowPrefetch& rp, const RadTensor* t, int64_t n);
     /* A lane issued a scratch user and the other lane has not been joined behind it since. Keeps
      * two lanes off the shared region at once; lane_join clears its `from` side. See the scratch
      * block in Ctx::issue. */
@@ -824,6 +849,7 @@ private:
     int64_t n_issues_ = 0;
     int64_t n_stream_waits_ = 0;
     int64_t n_host_syncs_ = 0;
+    int64_t n_host_drains_ = 0;
     std::atomic<int64_t> ar_calls_{0}, ar_bytes_{0};
     std::atomic<int64_t> pc_played_{0}, pc_recorded_{0}, pc_audited_{0};
     std::atomic<int64_t> pc_unkeyed_{0}, pc_refused_{0}, pc_first_{0};

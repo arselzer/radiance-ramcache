@@ -32,6 +32,13 @@ int Ctx::init(const CtxDesc& d) {
     kv_        = d.kv;
     arch_step_ = d.arch_step;
     profiling_ = d.profile_ops;
+    /* A host gather's rows on the mapped tier are read ahead unless this says 0
+     * (runtime/rowprefetch.h). The scratch is sized once, off the step path. */
+    {
+        const char* rp = std::getenv("RADIANCE_ROW_PREFETCH");
+        row_prefetch_on_ = !(rp && rp[0] == '0' && rp[1] == 0);
+        rowpf_.reserve(4096);
+    }
 
     /* The rank owns one device. Set it here so allocation lands on the right card, and again from
      * the rank thread in bind_thread() because the backend's current device is thread-local. */
@@ -331,6 +338,7 @@ int Ctx::bind_ops() {
         p.n_opd_schema = oi.schema ? (int32_t)oi.schema->n_operands : -1;
         /* Matched by name once here, not on the issue path; see OpPlan::billed. */
         p.billed     = (oi.op == "all_reduce");
+        p.row_gather = row_gather_op(oi.op);
         p.collective = p.billed;
         p.lora_site  = oi.lora_site;
         p.order      = oi.anchor > 0 && (size_t)oi.anchor < P.ops.size() ? P.ops[(size_t)oi.anchor].index
@@ -870,6 +878,11 @@ void Ctx::dump_profile() const {
         waited += wait;
     }
     fprintf(stderr, "  %10s %12.3f   (waited %.3f ms besides)\n\n", "total", total, waited);
+    if (rowpf_calls_)
+        fprintf(stderr, "  row read-ahead: %lld host gather(s) from the mapped tier asked for %lld "
+                        "page(s) ahead of their kernel (runtime/rowprefetch.h; "
+                        "RADIANCE_ROW_PREFETCH=0 turns it off)\n\n",
+                (long long)rowpf_calls_, (long long)rowpf_pages_);
 }
 
 /* ================================================================== the step driver */
@@ -1204,9 +1217,13 @@ int Ctx::play_pass(PassTape& t) {
         case kTapeHost: {
             TapeHost& th = t.host[(size_t)st.a];
             lane_ = st.lane;
+            /* What the recorded join waited on (TapeHost::touch): the stretches played before this
+             * step re-recorded those events. */
+            for (int l = 0; l < 2; ++l) host_touch_pending_[l] = host_touch_pending_[l] || th.touch[l];
             rc = host_join_wait(th.drain);
             if (rc >= 0) {
                 th.args.t = th.t;
+                if (th.rp.n) row_prefetch_run(th.rp, th.t, th.n);
                 rc = th.launch(&th.args, cur_stream());
                 rad_dev_host_wrote();
             }

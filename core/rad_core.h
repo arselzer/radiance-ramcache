@@ -59,6 +59,9 @@ struct KernelRow {
     bool                 reference = false;
     /* rad_kernel_chain: its launches can wait in the kernel instead of behind the barrier bit. */
     bool                 chain = false;
+    /* rad_kernel_fetches_rows: it reads a mapped table's rows itself, so the engine does not read
+     * them ahead through the page cache (runtime/rowprefetch.h). */
+    bool                 fetches_rows = false;
 };
 
 /* A kernel bound to one geometry, one domain and one variant, with init() already run. */

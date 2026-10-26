@@ -2179,3 +2179,10 @@ extern "C" const RadKernelInfo* rad_kernel_at(int i) {
     if (i < 0 || i >= rad_kernel_count()) return nullptr;
     return &kKernels[i];
 }
+/* embed_lookup_q reads a file-backed table's rows itself (avx_ngram.cpp: direct reads into its row
+ * cache), so the engine must not read them ahead through the page cache as well. */
+extern "C" int rad_kernel_fetches_rows(int i) {
+    const RadKernelInfo* k = rad_kernel_at(i);
+    return k && k->init == avx_init_ngram;
+}
+[[maybe_unused]] static const RadKernelFetchesRowsFn kFetchesRowsCheck = rad_kernel_fetches_rows;

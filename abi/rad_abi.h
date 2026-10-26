@@ -578,6 +578,16 @@ typedef int  (*RadKernelChainFn)(int i);
 typedef int  (*RadKernelCollectiveFn)(int i);
 #define RAD_LINK_ENDED 1
 
+/* Optional promise about kernel `i` of rad_kernel_at: nonzero means that, gathering rows of a table
+ * the engine reads in place from the container (the mapped tier, e.g. --ngram-placement disk), it
+ * fetches them itself -- direct reads into a row cache of its own -- rather than by touching the
+ * mapping. The engine then leaves those rows alone. Without the symbol, or with 0, the engine asks
+ * the page cache for every page a host gather's rows cover before the launch, so the kernel's page
+ * faults wait on reads issued together rather than one at a time (core/runtime/rowprefetch.h); for
+ * a kernel that reads the file itself that would read each row twice. Symbol name:
+ * `rad_kernel_fetches_rows`. */
+typedef int  (*RadKernelFetchesRowsFn)(int i);
+
 /* Optional: nonzero declares this kernel library a reference implementation, written to be
  * plainly correct rather than fast. For any library that says so, whatever its name:
  *   - the loader ranks it below every unnamed kernel library, because a reference matches every

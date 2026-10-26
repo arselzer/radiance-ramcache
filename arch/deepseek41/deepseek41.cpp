@@ -10,7 +10,9 @@
  * does it (quant_roundtrip), so the bf16 caches hold the reference's values.
  *
  * Per layer, in issue order (docs: the port's PLAN.md, "Phase 2 plumbing design"):
- *   engram (at ple layers)   token_map -> ngram_ids -> embed_lookup -> gemm -> stream_gate_add
+ *   engram (at ple layers)   token_map -> ngram_ids -> embed_lookup -> cast to the card -> gemm ->
+ *                            stream_gate_add (every layer's ngram_ids issued before the first
+ *                            block, see step())
  *   attention connection     mhc_mix (this layer's gates) ; mhc_collapse (the previous gates)
  *   attention                q path, window key into the window cache, the compressor at a
  *                            kv-source layer (qsa_work / softmax_pool, or one entry a token at
@@ -219,7 +221,10 @@ struct Layer {
     rad_weight comp_w = 0, comp_norm = 0, ik_w = 0, ik_norm = 0, iq_w = 0, iproj = 0;
     rad_weight e_mult = 0, e_vsz = 0, e_off = 0, e_kv = 0, e_gate = 0;
     /* ops, in issue order */
-    rad_op e_ids = 0, e_emb = 0, e_gemm = 0, e_gate_op = 0, e_back = 0;
+    rad_op e_ids = 0, e_emb = 0, e_copy = 0, e_gemm = 0, e_gate_op = 0, e_back = 0;
+    /* This Engram layer's row ids [T, heads]: one buffer a layer, since step() writes every
+     * layer's ids before the first block runs (see there). */
+    rad_buf ids = 0;
     rad_op mix_a = 0, col_a = 0, norm_a = 0;
     rad_op q_a = 0, q_an = 0, q_b = 0, q_rope = 0;
     rad_op kv_g = 0, kv_n = 0, kv_rope = 0, kv_q = 0, kv_st = 0;
@@ -304,7 +309,7 @@ struct Model {
     rad_buf kvs = 0, stage = 0, page = 0, bpos = 0, nc = 0, pooled = 0, lat = 0, latn = 0,
             ik = 0, ikn = 0;
     rad_buf iq = 0, iw = 0, score = 0, keep = 0, sel = 0, cs_a = 0, cs_b = 0;
-    rad_buf ctok = 0, ids = 0, emb = 0, ekv = 0;
+    rad_buf ctok = 0, emb = 0, embd = 0, ekv = 0;
     rad_buf final_hidden = 0, logit_input = 0, logits = 0;
     ActFP8 act{};
     MoeFP8::Wire mw{};
@@ -547,8 +552,14 @@ static int buffers(RadBuilder* b, Model& m) {
     m.cs_b = decl_b(b, nm.f("rope_compressed"), RAD_F32, { g.max_ctx, c.rope }, RAD_BUF_PERSIST);
     if (!c.ple.empty()) {
         m.ctok = decl_b(b, nm.f("engram_tokens"), RAD_I32, { T });
-        m.ids = decl_b(b, nm.f("engram_ids"), RAD_I32, { T, c.ple_heads });
-        m.emb = bf("engram_rows", { T, c.ple_heads * c.ple_dim });
+        /* The gathered rows are host domain, as rad_block_ple.h's: a host gather (the table on the
+         * disk or RAM tier) whose operands are all host-arena buffers joins on the last device op
+         * that touched the host arena, where a device-domain operand drains the stream
+         * (core/runtime/issue.cpp). A cast copies them onto the card for the GEMM, which reads
+         * each row band once per column block. */
+        m.emb = decl_b(b, nm.f("engram_rows"), RAD_BF16, { T, c.ple_heads * c.ple_dim },
+                       RAD_BUF_TRANSIENT, RAD_DOMAIN_HOST);
+        m.embd = bf("engram_rows_dev", { T, c.ple_heads * c.ple_dim });
         m.ekv = bf("engram_kv", { T, (c.hc + 1) * D });
     }
     /* The routed FFN's wires (rad_block_moe_fp8.h), bf16 throughout. */
@@ -653,28 +664,37 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
             if (!m.tok) return RAD_E_INVAL;
         }
         DS_TRY(rad_bind_layer_kv(b, l, m.tok));
+        /* Host domain, like the rows (see m.emb), and persistent rather than liveness-shared:
+         * liveness runs over the declared op order, and step() writes these ids before the first
+         * block, far ahead of this layer's gather. */
+        L.ids = decl_b(b, nm.f("blk.%d.engram_ids", l), RAD_I32, { T, H }, RAD_BUF_PERSIST,
+                       RAD_DOMAIN_HOST);
         L.e_ids = op(b, "ngram_ids",
                      { RAD_RANGE("M", 1, T), RAD_INT("heads", H), RAD_INT("ngram", c.ngram),
                        RAD_INT("eos", c.pad) },
-                     { L.e_mult, L.e_vsz, L.e_off }, { m.ctok }, { m.ids });
+                     { L.e_mult, L.e_vsz, L.e_off }, { m.ctok }, { L.ids });
         if (m.ple_group > 0 && m.ple_tab)
             L.e_emb = op(b, "embed_lookup_planes",
                          { RAD_RANGE("M", 1, T * H), RAD_INT("n_embd", c.ple_dim),
                            RAD_INT("n_vocab", c.ple_rows), RAD_INT("group", m.ple_group),
                            RAD_STR("dtype", "bf16") },
-                         { m.ple_codes, m.ple_scale, m.ple_tab }, { m.ids }, { m.emb });
+                         { m.ple_codes, m.ple_scale, m.ple_tab }, { L.ids }, { m.emb });
         else if (m.ple_group > 0)
             L.e_emb = op(b, "embed_lookup_planes",
                          { RAD_RANGE("M", 1, T * H), RAD_INT("n_embd", c.ple_dim),
                            RAD_INT("n_vocab", c.ple_rows), RAD_INT("group", m.ple_group),
                            RAD_STR("dtype", "bf16") },
-                         { m.ple_codes, m.ple_scale }, { m.ids }, { m.emb });
+                         { m.ple_codes, m.ple_scale }, { L.ids }, { m.emb });
         else
             L.e_emb = op(b, "embed_lookup",
                          { RAD_RANGE("M", 1, T * H), RAD_INT("n_embd", c.ple_dim),
                            RAD_INT("n_vocab", c.ple_rows), RAD_STR("dtype", "bf16") },
-                         { m.ple_table }, { m.ids }, { m.emb });
-        L.e_gemm = linear(b, m, T, L.e_kv, (c.hc + 1) * D, H * c.ple_dim, m.emb, m.ekv);
+                         { m.ple_table }, { L.ids }, { m.emb });
+        L.e_copy = op(b, "cast",
+                      { RAD_RANGE("M", 1, T), RAD_INT("n", H * c.ple_dim), RAD_STR("from", "bf16"),
+                        RAD_STR("to", "bf16") },
+                      {}, { m.emb }, { m.embd });
+        L.e_gemm = linear(b, m, T, L.e_kv, (c.hc + 1) * D, H * c.ple_dim, m.embd, m.ekv);
         L.e_gate_op = op(b, "stream_gate_add",
                          { RAD_RANGE("M", 1, T), RAD_INT("n", D), RAD_INT("hc", c.hc),
                            RAD_F64("eps", c.eps), RAD_F64("gate_eps", 1e-6),
@@ -1700,37 +1720,51 @@ static void step(RadCtx* x, const RadBatch* batch) {
         RAD_ISSUE_N(x, m.tok_map, T, praw(batch->token_ids, RAD_I32, T), RAD_W(m.tmap),
                     brows(m.ctok, T));
 
+    /* The Engram's row ids are a function of the batch's tokens alone (token_map, each Engram
+     * layer's token history), never of an activation, so every Engram layer's ngram_ids is issued
+     * here, before the first block, each into its own host buffer (rad_block_ple.h's ids() does
+     * the same). A host-site gather (the table on the disk or RAM tier) joins on the last device
+     * op that touched the host arena: these few ops, or the previous Engram layer's copy of its
+     * rows. It then reads its rows while the device runs the blocks the host has already issued,
+     * where ngram_ids at its layer (and device-domain rows) made the device drain before every
+     * gather and idle through it. */
+    for (auto& L : m.layers) {
+        if (!L.e_ids) continue;
+        const int l = L.l;
+        const auto* tk = kv_batch(batch, m.tok);
+        const int32_t* tk_idx = tk ? tk->state_index : nullptr;
+        int64_t Dn = 0, DT = 0;
+        batch_split(batch, &Dn, &DT);
+        const int64_t P = S - Dn;
+        if (Dn > 0)
+            RAD_ISSUE_N(x, L.e_ids, DT, brows(m.ctok, DT), kv_cache(m.tok, l),
+                        praw(batch->cu_seqlens, RAD_I32, Dn + 1), RAD_W(L.e_mult),
+                        RAD_W(L.e_vsz), RAD_W(L.e_off), praw(tk_idx, RAD_I32, Dn),
+                        praw(batch->ctx_lens, RAD_I32, Dn),
+                        praw(batch->num_accepted, RAD_I32, Dn), brows(L.ids, DT), RAD_NONE);
+        if (P > 0)
+            RAD_ISSUE_N(x, L.e_ids, T, brows(m.ctok, T), kv_cache(m.tok, l),
+                        praw(batch->cu_seqlens + Dn, RAD_I32, P + 1), RAD_W(L.e_mult),
+                        RAD_W(L.e_vsz), RAD_W(L.e_off),
+                        praw(tk_idx ? tk_idx + Dn : nullptr, RAD_I32, P),
+                        praw(batch->ctx_lens + Dn, RAD_I32, P), RAD_NONE, brows(L.ids, T),
+                        RAD_NONE);
+    }
+
     for (auto& L : m.layers) {
         const int l = L.l;
         const int64_t r = L.r;
         if (L.e_ids) {
-            const auto* tk = kv_batch(batch, m.tok);
-            const int32_t* tk_idx = tk ? tk->state_index : nullptr;
-            int64_t Dn = 0, DT = 0;
-            batch_split(batch, &Dn, &DT);
-            const int64_t P = S - Dn;
             const int64_t H = c.ple_heads;
-            if (Dn > 0)
-                RAD_ISSUE_N(x, L.e_ids, DT, brows(m.ctok, DT), kv_cache(m.tok, l),
-                            praw(batch->cu_seqlens, RAD_I32, Dn + 1), RAD_W(L.e_mult),
-                            RAD_W(L.e_vsz), RAD_W(L.e_off), praw(tk_idx, RAD_I32, Dn),
-                            praw(batch->ctx_lens, RAD_I32, Dn),
-                            praw(batch->num_accepted, RAD_I32, Dn), brows(m.ids, DT), RAD_NONE);
-            if (P > 0)
-                RAD_ISSUE_N(x, L.e_ids, T, brows(m.ctok, T), kv_cache(m.tok, l),
-                            praw(batch->cu_seqlens + Dn, RAD_I32, P + 1), RAD_W(L.e_mult),
-                            RAD_W(L.e_vsz), RAD_W(L.e_off),
-                            praw(tk_idx ? tk_idx + Dn : nullptr, RAD_I32, P),
-                            praw(batch->ctx_lens + Dn, RAD_I32, P), RAD_NONE, brows(m.ids, T),
-                            RAD_NONE);
             /* T rows of operands; the gather's band is T * H, one table row per head per token,
              * read through the ids and rows as flat (rad_block_ple.h does the same). */
             if (m.ple_group > 0)
-                RAD_ISSUE_N(x, L.e_emb, T * H, brows(m.ids, T), RAD_W(m.ple_codes), RAD_W(m.ple_scale),
+                RAD_ISSUE_N(x, L.e_emb, T * H, brows(L.ids, T), RAD_W(m.ple_codes), RAD_W(m.ple_scale),
                             m.ple_tab ? RAD_W(m.ple_tab) : RAD_NONE, brows(m.emb, T));
             else
-                RAD_ISSUE_N(x, L.e_emb, T * H, brows(m.ids, T), RAD_W(m.ple_table), brows(m.emb, T));
-            RAD_ISSUE_N(x, L.e_gemm, T, brows(m.emb, T), RAD_W(L.e_kv), brows(m.ekv, T));
+                RAD_ISSUE_N(x, L.e_emb, T * H, brows(L.ids, T), RAD_W(m.ple_table), brows(m.emb, T));
+            RAD_ISSUE_N(x, L.e_copy, T, brows(m.emb, T), brows(m.embd, T));
+            RAD_ISSUE_N(x, L.e_gemm, T, brows(m.embd, T), RAD_W(L.e_kv), brows(m.ekv, T));
             RAD_ISSUE_N(x, L.e_gate_op, T, brows(m.h0, T), bcol(m.ekv, 0, c.hc * D, T),
                         bcol(m.ekv, c.hc * D, D, T), RAD_W(L.e_gate), brows(m.h1, T));
             RAD_ISSUE_N(x, L.e_back, T, brows(m.h1, T), brows(m.h0, T));

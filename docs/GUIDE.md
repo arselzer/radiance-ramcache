@@ -801,7 +801,11 @@ radiance --model qwen3.8-27b-fp8.rad --tp 1 --vision-tower-placement ram
 
 *An n-gram table* (Qwen3.8-Flash-Next's is 47.7 GiB) is read a few rows a token. `disk` reads rows
 from the container through a row cache with direct reads on the host; about half of a step's rows
-are first-seen, so steps wait on the drive. `ram` copies the table into host memory at load (12 to
+are first-seen, so steps wait on the drive. (That is libavx's `embed_lookup_q`. A host gather
+without a row source of its own, such as libref's `embed_lookup_planes` over a GGUF table's planes,
+reads through the mapping; the engine then asks for every page a step's rows cover before the
+gather runs, so the drive answers them together rather than one fault at a time.
+`RADIANCE_ROW_PREFETCH=0` turns that off.) `ram` copies the table into host memory at load (12 to
 40 s more startup, depending on the page cache) and the card's gather kernel reads the pinned copy,
 so a step has no host work. `vram` puts all of it on every card. `ram` needs the table's size free
 after the pinned host pools and the prefix cache's host tier, with `--host-headroom-mib` to spare

@@ -468,12 +468,22 @@ struct MoeFP8 {
                  const Wire& wire, const Src& src, bool fold = false, bool add_out = true,
                  int ar_in = kArNone, bool ar_out_ = false);
     void step(RadCtx* c, const RadBatch* batch) const;
+    /* Opt-in: work the caller issues inside the block, behind the first pass's routed gate_up and
+     * the shared arm's gate_up, so a recorded pass can overlap it with those GEMMs
+     * (Ctx::haz_mark). It must touch nothing the block reads or writes. Without it (every other
+     * caller) the block issues exactly as before. */
+    struct Beside {
+        void (*fn)(RadCtx*, void*) = nullptr;
+        void* arg = nullptr;
+    };
+    void step(RadCtx* c, const RadBatch* batch, const Beside& beside) const;
     /* The block over the first `T` rows of its buffers, for passes that need fewer rows than the
      * batch (the MTP head's history pass reads its output only at drafting rows). */
-    void step_rows(RadCtx* c, int64_t T) const;
+    void step_rows(RadCtx* c, int64_t T, const Beside* beside = nullptr) const;
     /* One pass of at most `c.rows` tokens. `own_ar` false: the caller issues the pass's
      * all-reduce itself (issue_ar), as GdnFP8::step describes. */
-    void pass(RadCtx* c, int64_t T, int64_t r0, int64_t rows, bool own_ar = true) const;
+    void pass(RadCtx* c, int64_t T, int64_t r0, int64_t rows, bool own_ar = true,
+              const Beside* beside = nullptr) const;
     /* The heat engine's handoff, after a step's last pass (step() says what it reports). */
     void route_report(RadCtx* c) const;
     bool issues_ar(int64_t T, int64_t rows) const {
@@ -1671,7 +1681,8 @@ inline void MoeFP8::shared_up(RadCtx* c_, int64_t T, int64_t r0, int64_t rows,
  *
  * The expert buffers are addressed from zero, not `r0`: they are a pass tall and `sorted_tok` is
  * pass-relative. Only step-tall operands (residual stream, normed input) carry the offset. */
-inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool own_ar) const {
+inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool own_ar,
+                          const Beside* beside) const {
     /* `ne` is this rank's expert count, `ne_all` the model's: logits and top-k are model-wide,
      * everything after the scatter is this rank's slice. */
     const int64_t ne = c.n_expert, ne_all = c.n_expert_all, k = c.top_k;
@@ -1778,6 +1789,7 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
                     brows(w.egu, rows * k));
     if (shared) shared_up(c_, T, r0, rows,
                           (rfused && router_fused_gate) || (sfused && sigmoid_scatter_gate));
+    if (beside && beside->fn && r0 == 0) beside->fn(c_, beside->arg);
     gq_exp.step(c_, w.egu, rows * k, 0, rows * k);
     if (shared) gq_sh.step(c_, w.sgu, T, r0, rows);
     if (act_bf16())
@@ -1946,10 +1958,14 @@ inline void MoeFP8::step(RadCtx* c_, const RadBatch* batch) const {
     step_rows(c_, batch->n_tok);
 }
 
-inline void MoeFP8::step_rows(RadCtx* c_, int64_t T) const {
+inline void MoeFP8::step(RadCtx* c_, const RadBatch* batch, const Beside& beside) const {
+    step_rows(c_, batch->n_tok, &beside);
+}
+
+inline void MoeFP8::step_rows(RadCtx* c_, int64_t T, const Beside* beside) const {
     for (int64_t r0 = 0; r0 < T; r0 += c.rows) {
         const int64_t n = (T - r0 < c.rows) ? (T - r0) : c.rows;
-        pass(c_, T, r0, n);
+        pass(c_, T, r0, n, true, beside);
     }
     route_report(c_);
 }

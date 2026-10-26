@@ -1794,6 +1794,21 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
                 RAD_W(d.mk1), RAD_W(d.mk2), brows(d.tokens, S));
 }
 
+/* The ffn connection's mix, issued by the MoE block behind its routed gate_up (MoeFP8::Beside). */
+struct MixBeside {
+    const Layer* L;
+    const Model* m;
+    int64_t T;
+};
+static void mix_f_beside(RadCtx* x, void* a) {
+    const MixBeside& p = *(const MixBeside*)a;
+    const Layer& L = *p.L;
+    const Model& m = *p.m;
+    const int64_t T = p.T;
+    RAD_ISSUE_N(x, L.mix_f, T, brows(m.h1, T), RAD_W(L.hc_f_fn), RAD_W(L.hc_f_scale),
+                RAD_W(L.hc_f_base), brows(m.pre_f, T), brows(m.post, T), brows(m.comb, T));
+}
+
 static void step(RadCtx* x, const RadBatch* batch) {
     auto& m = *models[rad_rank(x)];
     /* A drafter pass: the sign gives the kind (rad_runtime.h); zero is a trunk step. */
@@ -1885,131 +1900,209 @@ static void step(RadCtx* x, const RadBatch* batch) {
             RAD_ISSUE_N(x, L.e_back, T, brows(m.h1, T), brows(m.h0, T));
         }
         if (L.tap) RAD_ISSUE_N(x, L.tap, T, brows(m.h0, T), bcol(m.dsp.src, L.tap_col * D, D, T));
-        RAD_ISSUE_N(x, L.mix_a, T, brows(m.h0, T), RAD_W(L.hc_a_fn), RAD_W(L.hc_a_scale),
-                    RAD_W(L.hc_a_base), brows(m.pre_a, T), brows(m.post, T), brows(m.comb, T));
-        if (L.cn_a)
-            RAD_ISSUE_N(x, L.cn_a, T, brows(m.h0, T), brows(m.pre_f, T), brows(m.xcol, T),
-                        RAD_W(L.attn_norm), brows(m.xn, T));
-        else if (L.col_a)   /* 0 under pcn_a: issued for the previous post_f */
-            RAD_ISSUE_N(x, L.col_a, T, brows(m.h0, T), brows(m.pre_f, T), brows(m.xcol, T));
+        /* Issue order of the connections' mixes (Ctx::haz_mark: a recorded pass leaves a dispatch
+         * unordered when it touches nothing in flight). Each connection's collapse reads the gates
+         * the previous connection's mix wrote, never what its own mix writes, and nothing reads a
+         * mix's output before the next mhc_post. So, same kernels on the same operands:
+         * - RADIANCE_DS41_MIX_LATE (default on): on an attention rank the attention mix goes
+         *   between the output projection's groups and attn_output_b, where its launches overlap
+         *   those GEMVs instead of running nearly alone at the layer's start.
+         * - RADIANCE_DS41_COLLAPSE_FIRST (default on): where the collapse is its own op (no fused
+         *   mhc_post before it: the first layer, after an Engram block, the attention-zero rank,
+         *   RADIANCE_DS41_FUSE_POST=0) and the mix is not moved, the collapse goes first; the mix's
+         *   second launch, ordered anyway, is then the barrier the norm needs.
+         * =0 on both (with RADIANCE_DS41_MIX_F_BESIDE=0 and RADIANCE_DS41_SIDE_INTERLEAVE=0 below)
+         * restores the order before them. */
+        static const bool col_first = [] {
+            const char* e = std::getenv("RADIANCE_DS41_COLLAPSE_FIRST");
+            return !(e && e[0] == '0');
+        }();
+        static const bool mix_late = [] {
+            const char* e = std::getenv("RADIANCE_DS41_MIX_LATE");
+            return !(e && e[0] == '0');
+        }();
+        const bool late = mix_late && !m.zero;
+        const auto mix_a = [&] {
+            RAD_ISSUE_N(x, L.mix_a, T, brows(m.h0, T), RAD_W(L.hc_a_fn), RAD_W(L.hc_a_scale),
+                        RAD_W(L.hc_a_base), brows(m.pre_a, T), brows(m.post, T), brows(m.comb, T));
+        };
+        const auto col_a = [&] {
+            if (L.cn_a)
+                RAD_ISSUE_N(x, L.cn_a, T, brows(m.h0, T), brows(m.pre_f, T), brows(m.xcol, T),
+                            RAD_W(L.attn_norm), brows(m.xn, T));
+            else if (L.col_a)   /* 0 under pcn_a: issued for the previous post_f */
+                RAD_ISSUE_N(x, L.col_a, T, brows(m.h0, T), brows(m.pre_f, T), brows(m.xcol, T));
+        };
+        if (late || col_first) {
+            col_a();
+            if (!late) mix_a();
+        } else {
+            mix_a();
+            col_a();
+        }
         if (m.zero) {
             RAD_ISSUE_N(x, L.attn_fill, T, brows(m.attn_out, T));
         } else {
             if (L.norm_a)
                 RAD_ISSUE_N(x, L.norm_a, T, brows(m.xcol, T), RAD_W(L.attn_norm), brows(m.xn, T));
             const rad_buf cs = r > 0 ? m.cs_b : m.cs_a;
-            /* The query and key chains share only xn. Issued alternately, each op's predecessor
-             * is in the other chain, so a recorded pass can leave it unordered behind it (the
-             * tape's hazard check) and the two chains' dispatches overlap; one after the other,
-             * every op but kv_g waits for the one before. Same kernels on the same operands. */
-            /* The window key's norm, rope and round trip as one op (kv_f), where declared. */
-            const auto issue_kv_f = [&] {
-                RAD_ISSUE_N(x, L.kv_f, T, brows(m.kv, T), RAD_W(L.kv_norm), brows(m.kvn, T),
-                            brows(cs, g.max_ctx), pos);
-            };
             static const bool ilv = [] {
                 const char* e = std::getenv("RADIANCE_DS41_QKV_INTERLEAVE");
                 return !(e && e[0] == '0');
             }();
-            if (ilv) {
-                RAD_ISSUE_N(x, L.q_a, T, brows(m.xn, T), RAD_W(L.wq_a), brows(m.qr, T));
-                RAD_ISSUE_N(x, L.kv_g, T, brows(m.xn, T), RAD_W(L.wkv), brows(m.kv, T));
-                RAD_ISSUE_N(x, L.q_an, T, brows(m.qr, T), RAD_W(L.q_norm), brows(m.qrn, T));
-                if (L.kv_f) issue_kv_f();
-                else RAD_ISSUE_N(x, L.kv_n, T, brows(m.kv, T), RAD_W(L.kv_norm), brows(m.kvn, T));
-                RAD_ISSUE_N(x, L.q_b, T, brows(m.qrn, T), RAD_W(L.wq_b), brows(m.q, T));
-                if (!L.kv_f) RAD_ISSUE_N(x, L.kv_rope, T, brows(m.kvn, T), brows(cs, g.max_ctx), pos);
-                RAD_ISSUE_N(x, L.q_rope, T, brows(m.q, T), brows(cs, g.max_ctx), pos);
-                if (L.kv_q) RAD_ISSUE_N(x, L.kv_q, T, brows(m.kvn, T));
-            } else {
-                RAD_ISSUE_N(x, L.q_a, T, brows(m.xn, T), RAD_W(L.wq_a), brows(m.qr, T));
-                RAD_ISSUE_N(x, L.q_an, T, brows(m.qr, T), RAD_W(L.q_norm), brows(m.qrn, T));
-                RAD_ISSUE_N(x, L.q_b, T, brows(m.qrn, T), RAD_W(L.wq_b), brows(m.q, T));
-                RAD_ISSUE_N(x, L.q_rope, T, brows(m.q, T), brows(cs, g.max_ctx), pos);
-                RAD_ISSUE_N(x, L.kv_g, T, brows(m.xn, T), RAD_W(L.wkv), brows(m.kv, T));
-                if (L.kv_f) {
-                    issue_kv_f();
-                } else {
-                    RAD_ISSUE_N(x, L.kv_n, T, brows(m.kv, T), RAD_W(L.kv_norm), brows(m.kvn, T));
-                    RAD_ISSUE_N(x, L.kv_rope, T, brows(m.kvn, T), brows(cs, g.max_ctx), pos);
-                    if (L.kv_q) RAD_ISSUE_N(x, L.kv_q, T, brows(m.kvn, T));
-                }
-            }
-            RAD_ISSUE_N(x, L.kv_st, T, bcol(m.kvn, 0, hd / 2, T), bcol(m.kvn, hd / 2, hd / 2, T),
-                        praw(wb->slot_mapping, RAD_I32, T), kv_cache(m.win, l));
-
+            /* The compressor (at a kv source) and the indexer (at an index source) read xn and qrn
+             * as the query and key chains do, and their only order with them is the compressed
+             * angles: c_tab rewrites cs_b after the query and the window key read it, and at a
+             * source the index query's rope reads it after. With the interleave, each of their ops
+             * goes between the query/key pairs at the first point its inputs are issued, so a
+             * recorded pass overlaps three or four chains instead of running the compressor and the
+             * indexer alone after the window key. Same kernels on the same operands;
+             * RADIANCE_DS41_SIDE_INTERLEAVE=0 issues them after kv_store. */
+            static const bool side_ilv = [] {
+                const char* e = std::getenv("RADIANCE_DS41_SIDE_INTERLEAVE");
+                return !(e && e[0] == '0');
+            }();
+            const bool sx = ilv && side_ilv;
+            const bool ctail = L.src && r > 1;
+            int64_t rows = T, tpitch = 1;
+            RadOperand page = RAD_NONE, bpos = pos;
+            const auto* cb = L.src ? kv_batch(batch, m.comp[r]) : nullptr;
+            const auto* tb = ctail ? kv_batch(batch, m.tail[r]) : nullptr;
             if (L.src) {
-                const auto* cb = kv_batch(batch, m.comp[r]);
                 const auto* ib = kv_batch(batch, m.index[r]);
                 if (!cb || !ib || !cb->block_table || !ib->block_table) {
                     rad_step_fail(x, "deepseek41: a compressed group has no block table");
                     return;
                 }
-                int64_t rows = T;
-                RadOperand page = praw(cb->slot_mapping, RAD_I32, T), bpos = pos;
-                if (r > 1) {
-                    const auto* tb = kv_batch(batch, m.tail[r]);
+                page = praw(cb->slot_mapping, RAD_I32, T);
+                if (ctail) {
                     if (!tb || !tb->state_index) {
                         rad_step_fail(x, "deepseek41: the compressor tail has no state slots");
                         return;
                     }
-                    const int64_t pitch = tb->state_index_pitch > 0 ? tb->state_index_pitch : 1;
+                    tpitch = tb->state_index_pitch > 0 ? tb->state_index_pitch : 1;
                     rows = m.work;
-                    RAD_ISSUE_N(x, L.c_gemm, T, brows(m.xn, T), RAD_W(L.comp_w), brows(m.kvs, T));
+                    page = brows(m.page, rows);
+                    bpos = brows(m.bpos, rows);
+                }
+            }
+            /* The query and key chains share only xn. Issued alternately, each op's predecessor
+             * is in the other chain, so a recorded pass can leave it unordered behind it (the
+             * tape's hazard check) and the two chains' dispatches overlap; one after the other,
+             * every op but kv_g waits for the one before. Same kernels on the same operands. */
+            const auto q_a = [&] { RAD_ISSUE_N(x, L.q_a, T, brows(m.xn, T), RAD_W(L.wq_a), brows(m.qr, T)); };
+            const auto q_an = [&] { RAD_ISSUE_N(x, L.q_an, T, brows(m.qr, T), RAD_W(L.q_norm), brows(m.qrn, T)); };
+            const auto q_b = [&] { RAD_ISSUE_N(x, L.q_b, T, brows(m.qrn, T), RAD_W(L.wq_b), brows(m.q, T)); };
+            const auto q_rope = [&] { RAD_ISSUE_N(x, L.q_rope, T, brows(m.q, T), brows(cs, g.max_ctx), pos); };
+            const auto kv_g = [&] { RAD_ISSUE_N(x, L.kv_g, T, brows(m.xn, T), RAD_W(L.wkv), brows(m.kv, T)); };
+            /* The window key's norm, rope and round trip: one op (kv_f) where declared, else
+             * kv_n here and kv_rope / kv_q at the next two points. */
+            const auto kv_n = [&] {
+                if (L.kv_f)
+                    RAD_ISSUE_N(x, L.kv_f, T, brows(m.kv, T), RAD_W(L.kv_norm), brows(m.kvn, T),
+                                brows(cs, g.max_ctx), pos);
+                else
+                    RAD_ISSUE_N(x, L.kv_n, T, brows(m.kv, T), RAD_W(L.kv_norm), brows(m.kvn, T));
+            };
+            const auto kv_rope = [&] {
+                if (!L.kv_f) RAD_ISSUE_N(x, L.kv_rope, T, brows(m.kvn, T), brows(cs, g.max_ctx), pos);
+            };
+            const auto kv_q = [&] {
+                if (L.kv_q) RAD_ISSUE_N(x, L.kv_q, T, brows(m.kvn, T));
+            };
+            const auto kv_st = [&] {
+                RAD_ISSUE_N(x, L.kv_st, T, bcol(m.kvn, 0, hd / 2, T), bcol(m.kvn, hd / 2, hd / 2, T),
+                            praw(wb->slot_mapping, RAD_I32, T), kv_cache(m.win, l));
+            };
+            const auto c_gemm = [&] {
+                if (L.src)
+                    RAD_ISSUE_N(x, L.c_gemm, T, brows(m.xn, T), RAD_W(L.comp_w),
+                                brows(ctail ? m.kvs : m.pooled, T));
+            };
+            const auto c_work = [&] {
+                if (ctail)
                     RAD_ISSUE_N(x, L.c_work, T, brows(m.kvs, T), pos, cu, kv_cache(m.tail[r], l),
-                                praw2(tb->state_index, RAD_I32, S, pitch),
+                                praw2(tb->state_index, RAD_I32, S, tpitch),
                                 praw2(cb->block_table, RAD_I32, S, cb->block_table_pitch), RAD_NONE,
                                 brows(m.stage, rows * r), brows(m.page, rows), brows(m.bpos, rows),
                                 brows(m.nc, S));
+            };
+            const auto c_pool = [&] {
+                if (ctail)
                     RAD_ISSUE_N(x, L.c_pool, rows, brows(m.stage, rows * r), brows(m.pooled, rows),
                                 brows(m.page, rows));
+            };
+            const auto c_norm = [&] {
+                if (L.src)
                     RAD_ISSUE_N(x, L.c_norm, rows, brows(m.pooled, rows), RAD_W(L.comp_norm),
                                 brows(m.lat, rows));
-                    page = brows(m.page, rows);
-                    bpos = brows(m.bpos, rows);
-                } else {
-                    RAD_ISSUE_N(x, L.c_gemm, T, brows(m.xn, T), RAD_W(L.comp_w), brows(m.pooled, T));
-                    RAD_ISSUE_N(x, L.c_norm, T, brows(m.pooled, T), RAD_W(L.comp_norm), brows(m.lat, T));
-                }
-                RAD_ISSUE_N(x, L.c_tab, rows, bpos, brows(m.cs_b, g.max_ctx));
-                RAD_ISSUE_N(x, L.k_gemm, rows, brows(m.lat, rows), RAD_W(L.ik_w), brows(m.ik, rows));
-                if (L.k_f) {
+            };
+            const auto c_tab = [&] {
+                if (L.src) RAD_ISSUE_N(x, L.c_tab, rows, bpos, brows(m.cs_b, g.max_ctx));
+            };
+            const auto k_gemm = [&] {
+                if (L.src) RAD_ISSUE_N(x, L.k_gemm, rows, brows(m.lat, rows), RAD_W(L.ik_w), brows(m.ik, rows));
+            };
+            /* The index key's norm, rope and round trip (k_f where declared); the latent's rope and
+             * round trip (l_f where declared); the index query's (i_f where declared). Each part
+             * function issues the fused op at the chain's first point and nothing at the others. */
+            const auto k_norm = [&] {
+                if (!L.src) return;
+                if (L.k_f)
                     RAD_ISSUE_N(x, L.k_f, rows, brows(m.ik, rows), RAD_W(L.ik_norm), brows(m.ikn, rows),
                                 brows(m.cs_b, g.max_ctx), bpos);
-                } else {
+                else
                     RAD_ISSUE_N(x, L.k_norm, rows, brows(m.ik, rows), RAD_W(L.ik_norm), brows(m.ikn, rows));
-                    RAD_ISSUE_N(x, L.k_rope, rows, brows(m.ikn, rows), brows(m.cs_b, g.max_ctx), bpos);
-                    if (L.k_q) RAD_ISSUE_N(x, L.k_q, rows, brows(m.ikn, rows));
-                }
-                RAD_ISSUE_N(x, L.k_st, rows, brows(m.ikn, rows), page, kv_cache(m.index[r], l));
-                if (L.l_f) {
+            };
+            const auto k_rope = [&] {
+                if (L.src && !L.k_f) RAD_ISSUE_N(x, L.k_rope, rows, brows(m.ikn, rows), brows(m.cs_b, g.max_ctx), bpos);
+            };
+            const auto k_q = [&] {
+                if (L.src && L.k_q) RAD_ISSUE_N(x, L.k_q, rows, brows(m.ikn, rows));
+            };
+            const auto k_st = [&] {
+                if (L.src) RAD_ISSUE_N(x, L.k_st, rows, brows(m.ikn, rows), page, kv_cache(m.index[r], l));
+            };
+            const auto l_rope = [&] {
+                if (!L.src) return;
+                if (L.l_f)
                     RAD_ISSUE_N(x, L.l_f, rows, brows(m.lat, rows), brows(m.cs_b, g.max_ctx), bpos);
-                } else {
+                else
                     RAD_ISSUE_N(x, L.l_rope, rows, brows(m.lat, rows), brows(m.cs_b, g.max_ctx), bpos);
-                    if (L.l_q) RAD_ISSUE_N(x, L.l_q, rows, brows(m.lat, rows));
-                }
-                RAD_ISSUE_N(x, L.l_st, rows, brows(m.lat, rows), page, kv_cache(m.comp[r], l));
-                if (L.c_tail) {
-                    const auto* tb = kv_batch(batch, m.tail[r]);
-                    const int64_t pitch = tb->state_index_pitch > 0 ? tb->state_index_pitch : 1;
+            };
+            const auto l_q = [&] {
+                if (L.src && L.l_q) RAD_ISSUE_N(x, L.l_q, rows, brows(m.lat, rows));
+            };
+            const auto l_st = [&] {
+                if (L.src) RAD_ISSUE_N(x, L.l_st, rows, brows(m.lat, rows), page, kv_cache(m.comp[r], l));
+            };
+            const auto c_tail = [&] {
+                if (ctail && L.c_tail)
                     RAD_ISSUE_N(x, L.c_tail, T, brows(m.kvs, T), pos, cu, kv_cache(m.tail[r], l),
-                                praw2(tb->state_index, RAD_I32, S, pitch));
-                }
-            }
-
-            if (L.i_score) {
+                                praw2(tb->state_index, RAD_I32, S, tpitch));
+            };
+            const auto i_q = [&] {
+                if (L.i_score) RAD_ISSUE_N(x, L.i_q, T, brows(m.qrn, T), RAD_W(L.iq_w), brows(m.iq, T));
+            };
+            const auto i_rope = [&] {
+                if (!L.i_score) return;
+                if (L.i_f)
+                    RAD_ISSUE_N(x, L.i_f, T, brows(m.iq, T), brows(m.cs_b, g.max_ctx), pos);
+                else
+                    RAD_ISSUE_N(x, L.i_rope, T, brows(m.iq, T), brows(m.cs_b, g.max_ctx), pos);
+            };
+            const auto i_qq = [&] {
+                if (L.i_score && L.i_qq) RAD_ISSUE_N(x, L.i_qq, T, brows(m.iq, T));
+            };
+            const auto i_w = [&] {
+                if (L.i_score) RAD_ISSUE_N(x, L.i_w, T, brows(m.xn, T), RAD_W(L.iproj), brows(m.iw, T));
+            };
+            const auto i_score = [&] {   /* the scores, the candidates and the selection */
+                if (!L.i_score) return;
                 const int src = c.src_of[(size_t)l];
                 const auto* ib = kv_batch(batch, m.index[r]);
                 const int64_t live = std::min<int64_t>(
                     g.max_ctx / r + 1, ((int64_t)batch->max_ctx_len + batch->max_q_len) / r + 1);
-                RAD_ISSUE_N(x, L.i_q, T, brows(m.qrn, T), RAD_W(L.iq_w), brows(m.iq, T));
-                if (L.i_f) {
-                    RAD_ISSUE_N(x, L.i_f, T, brows(m.iq, T), brows(m.cs_b, g.max_ctx), pos);
-                } else {
-                    RAD_ISSUE_N(x, L.i_rope, T, brows(m.iq, T), brows(m.cs_b, g.max_ctx), pos);
-                    if (L.i_qq) RAD_ISSUE_N(x, L.i_qq, T, brows(m.iq, T));
-                }
-                RAD_ISSUE_N(x, L.i_w, T, brows(m.xn, T), RAD_W(L.iproj), brows(m.iw, T));
                 RAD_ISSUE_N(x, L.i_score, T, brows(m.iq, T), brows(m.iw, T), kv_cache(m.index[r], src),
                             praw2(ib->block_table, RAD_I32, S, ib->block_table_pitch), pos, cu,
                             bcol(m.score, 0, live, T));
@@ -2018,8 +2111,37 @@ static void step(RadCtx* x, const RadBatch* batch) {
                 const bool uses = c.cand >= 0 && c.cand < l;
                 RAD_ISSUE_N(x, L.i_topk, T, bcol(m.score, 0, live, T),
                             uses ? bcol(m.keep, 0, live, T) : RAD_NONE, pos, brows(m.sel, T));
-            }
+            };
 
+            if (sx) {
+                c_gemm();
+                q_a(); kv_g();
+                i_w(); c_work();
+                q_an(); kv_n();
+                i_q(); c_pool();
+                q_b(); kv_rope();
+                if (!L.src) i_rope();   /* at a source it reads the angles c_tab rewrites */
+                c_tail(); c_norm();
+                q_rope(); kv_q();
+                if (!L.src) i_qq();
+                k_gemm(); c_tab();
+                kv_st();
+                k_norm();
+                if (L.src) i_rope();
+                l_rope(); k_rope();
+                if (L.src) i_qq();
+                l_q(); k_q(); l_st(); k_st(); i_score();
+            } else {
+                if (ilv) {
+                    q_a(); kv_g(); q_an(); kv_n(); q_b(); kv_rope(); q_rope(); kv_q();
+                } else {
+                    q_a(); q_an(); q_b(); q_rope(); kv_g(); kv_n(); kv_rope(); kv_q();
+                }
+                kv_st();
+                c_gemm(); c_work(); c_pool(); c_norm(); c_tab(); k_gemm(); k_norm(); k_rope(); k_q(); k_st();
+                l_rope(); l_q(); l_st(); c_tail();
+                i_q(); i_rope(); i_qq(); i_w(); i_score();
+            }
             if (r > 0) {
                 const int src = c.src_of[(size_t)l];
                 const auto* cb = kv_batch(batch, m.comp[r]);
@@ -2041,6 +2163,7 @@ static void step(RadCtx* x, const RadBatch* batch) {
             for (int j = 0; j < m.gr; ++j)
                 RAD_ISSUE_N(x, L.o_a[(size_t)j], T, bcol(m.o, j * gd, gd, T), RAD_W(L.wo_a[(size_t)j]),
                             bcol(m.oa, j * c.o_rank, c.o_rank, T));
+            if (late) mix_a();
             RAD_ISSUE_N(x, L.o_b, T, brows(m.oa, T), RAD_W(L.wo_b), brows(m.attn_out, T));
         }
         if (L.ar_attn) RAD_ISSUE_N(x, L.ar_attn, T * D, brows(m.attn_out, T), RAD_NONE);
@@ -2052,17 +2175,52 @@ static void step(RadCtx* x, const RadBatch* batch) {
             RAD_ISSUE_N(x, L.post_a, T, brows(m.attn_out, T), brows(m.h0, T), brows(m.post, T),
                         brows(m.comb, T), brows(m.h1, T));
 
-        RAD_ISSUE_N(x, L.mix_f, T, brows(m.h1, T), RAD_W(L.hc_f_fn), RAD_W(L.hc_f_scale),
-                    RAD_W(L.hc_f_base), brows(m.pre_f, T), brows(m.post, T), brows(m.comb, T));
-        if (L.pcn_f) {
-        } else if (L.cn_f) {
-            RAD_ISSUE_N(x, L.cn_f, T, brows(m.h1, T), brows(m.pre_a, T), brows(m.xcol, T),
-                        RAD_W(L.ffn_norm), brows(m.act.x, T));
+        /* The ffn connection's mix is likewise needed first by the next mhc_post, so the MoE block
+         * issues it (MoeFP8::Beside) behind its routed and shared gate_up, where a recorded pass
+         * overlaps it with those GEMMs instead of with the collapse and the norm (or, under the
+         * fused post, with nothing). It reads h1 and writes what post_a (fused or not) has read.
+         * RADIANCE_DS41_MIX_F_BESIDE=0 issues it after post_a. */
+        static const bool mixf_in = [] {
+            const char* e = std::getenv("RADIANCE_DS41_MIX_F_BESIDE");
+            return !(e && e[0] == '0');
+        }();
+        const auto mix_f = [&] {
+            RAD_ISSUE_N(x, L.mix_f, T, brows(m.h1, T), RAD_W(L.hc_f_fn), RAD_W(L.hc_f_scale),
+                        RAD_W(L.hc_f_base), brows(m.pre_f, T), brows(m.post, T), brows(m.comb, T));
+        };
+        const auto col_f = [&] {
+            if (L.pcn_f) {
+            } else if (L.cn_f) {
+                RAD_ISSUE_N(x, L.cn_f, T, brows(m.h1, T), brows(m.pre_a, T), brows(m.xcol, T),
+                            RAD_W(L.ffn_norm), brows(m.act.x, T));
+            } else {
+                RAD_ISSUE_N(x, L.col_f, T, brows(m.h1, T), brows(m.pre_a, T), brows(m.xcol, T));
+                RAD_ISSUE_N(x, L.norm_f, T, brows(m.xcol, T), RAD_W(L.ffn_norm), brows(m.act.x, T));
+            }
+        };
+        if (mixf_in) {
+            col_f();
+            MixBeside mb{ &L, &m, T };
+            MoeFP8::Beside bs;
+            bs.fn = mix_f_beside;
+            bs.arg = &mb;
+            L.moe.step(x, batch, bs);
         } else {
-            RAD_ISSUE_N(x, L.col_f, T, brows(m.h1, T), brows(m.pre_a, T), brows(m.xcol, T));
-            RAD_ISSUE_N(x, L.norm_f, T, brows(m.xcol, T), RAD_W(L.ffn_norm), brows(m.act.x, T));
+            /* Collapse first (RADIANCE_DS41_COLLAPSE_FIRST, above) where it is its own op: the
+             * norm's op then follows the mix's second launch. */
+            if (col_first && !L.pcn_f && !L.cn_f) {
+                RAD_ISSUE_N(x, L.col_f, T, brows(m.h1, T), brows(m.pre_a, T), brows(m.xcol, T));
+                mix_f();
+                RAD_ISSUE_N(x, L.norm_f, T, brows(m.xcol, T), RAD_W(L.ffn_norm), brows(m.act.x, T));
+            } else if (col_first) {
+                col_f();
+                mix_f();
+            } else {
+                mix_f();
+                col_f();
+            }
+            L.moe.step(x, batch);
         }
-        L.moe.step(x, batch);
         /* post_f, or post_f with the next collapse + norm (the next layer's pcn_a, or pcn_fin). */
         const Layer* nx = L.l + 1 < c.n_layer ? &m.layers[(size_t)L.l + 1] : nullptr;
         if (nx && nx->pcn_a)

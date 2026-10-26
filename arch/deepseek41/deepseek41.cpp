@@ -229,9 +229,10 @@ static int read_cfg(Cfg& c, const RadModelMeta* m) {
             fprintf(stderr, "radiance: deepseek41: the checkpoint has no deepseek41.%s\n", n.what);
             return RAD_E_UNSUPPORTED;
         }
-    if ((int64_t)c.ratio.size() < c.n_layer || c.kv_src.empty() || c.idx_src.empty()) {
-        fprintf(stderr, "radiance: deepseek41: compress_ratios (%zu values for %lld layers), "
-                        "kv_source_layers or indexer.source_layers is missing\n",
+    /* The kv and index sources may be absent where no layer compresses (a model cut to its first
+     * layers); a compressing layer without one is refused below. */
+    if ((int64_t)c.ratio.size() < c.n_layer) {
+        fprintf(stderr, "radiance: deepseek41: compress_ratios has %zu values for %lld layers\n",
                 c.ratio.size(), (long long)c.n_layer);
         return RAD_E_UNSUPPORTED;
     }

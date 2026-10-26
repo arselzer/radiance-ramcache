@@ -29,8 +29,10 @@ Portable13 Release HOST programs passed using source-identical existing Core7,
 exact3212filemanifest8b966d37. Full tested manifest and overwritten normalized
 metadata are archived under portable-tested-8b966d37-checkpoint. Final source,
 wrapper, CMake, oldrawarchives remain byte-identical; finalmanifest adds only new
-evidence/docs and records this tested association. A fresh Core rebuild from the
-public export was not repeated. Portable defaults remain CPU-only/no download/
+evidence/docs and records this tested association. A later fresh whole Core build from the published source and all13 Release
+HOST checks PASSED at exact3287filemanifest4d9c9e4a. That manifest and overwritten
+metadata are archived under portable-tested-4d9c9e4a-checkpoint. The checks reused
+only the archive produced by this fresh public build, not a private Core build. Portable defaults remain CPU-only/no download/
 model/maintenance/API action; actual-model CPU mode stays manual. Runner5 source
 is archived only, never imported or invoked by public tools.
 

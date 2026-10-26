@@ -354,6 +354,41 @@
     ],
     "removed_paths": []
   },
+  "fresh_public_build_delta": {
+    "Core_fixture_tools_CMake_unchanged": true,
+    "added_paths": [
+      "docs/provenance/portable-tested-4d9c9e4a-checkpoint/README.md",
+      "docs/provenance/portable-tested-4d9c9e4a-checkpoint/SNAPSHOT_MANIFEST.json",
+      "docs/provenance/portable-tested-4d9c9e4a-checkpoint/STATUS.md",
+      "docs/provenance/portable-tested-4d9c9e4a-checkpoint/docs/GLM53_VERIFIED_MAIN_V7_PUBLICATION_SCOPE.txt",
+      "docs/provenance/portable-tested-4d9c9e4a-checkpoint/docs/provenance/glm-core-v7-flight-change-index.json",
+      "docs/provenance/portable-tested-4d9c9e4a-checkpoint/docs/provenance/glm-core-v7-flight-export.json",
+      "docs/provenance/portable-tested-4d9c9e4a-checkpoint/docs/provenance/glm-core-v7-flight-wrapper.json",
+      "docs/provenance/portable-tested-4d9c9e4a-checkpoint/evidence/glm53-main-verified-v7/CPU_STAGING_SUMMARY.json",
+      "docs/provenance/portable-tested-4d9c9e4a-checkpoint/evidence/glm53-main-verified-v7/VALIDATION_SUMMARY.json",
+      "docs/provenance/portable-tested-4d9c9e4a-checkpoint/research/portable/README.txt",
+      "evidence/glm53-main-verified-v7/FRESH_PUBLIC_BUILD_SUMMARY.json",
+      "evidence/glm53-main-verified-v7/portable13-fresh-build/portable.log",
+      "evidence/glm53-main-verified-v7/portable13-fresh-build/receipt.json",
+      "evidence/glm53-main-verified-v7/portable13-fresh-runtime/portable.log",
+      "evidence/glm53-main-verified-v7/portable13-fresh-runtime/receipt.json"
+    ],
+    "evidence_scope": "fresh whole public Core Release build +13 HOST runs PASS; no additional model trial",
+    "modified_paths": [
+      "README.md",
+      "STATUS.md",
+      "docs/GLM53_VERIFIED_MAIN_V7_PUBLICATION_SCOPE.txt",
+      "research/portable/README.txt",
+      "docs/provenance/glm-core-v7-flight-wrapper.json",
+      "docs/provenance/glm-core-v7-flight-export.json",
+      "docs/provenance/glm-core-v7-flight-change-index.json",
+      "evidence/glm53-main-verified-v7/CPU_STAGING_SUMMARY.json",
+      "evidence/glm53-main-verified-v7/VALIDATION_SUMMARY.json"
+    ],
+    "removed_paths": [],
+    "tested_snapshot_files": 3287,
+    "tested_snapshot_sha256": "4d9c9e4a8d662f90441c00c40519f35709ea4875347db7a42b0ae24edc9b6db1"
+  },
   "modified_paths": [
     "README.md",
     "STATUS.md",
@@ -369,7 +404,7 @@
     "tools/verify_snapshot.py"
   ],
   "old_archive_evidence_rewritten": false,
-  "parent_validation": "PASSRelease/ASan/TSanfullHOST20, focusedallmodes+preservedfailedLSanexecutor, completeprewalk, actualone-input/one-output4GPU+QFNrestore, portable13Releaseat8b966d37",
+  "parent_validation": "PASSRelease/ASan/TSanfullHOST20, focusedallmodes+preservedfailedLSanexecutor, completeprewalk, actualone-input/one-output4GPU+QFNrestore, portable13Releaseat8b966d37; fresh public whole-Core Release+13HOST at4d9c9e4a PASS",
   "removed_paths": [],
   "schema": "glm53-core7-flight-change-index-v1",
   "self_hash_scope": "CurrentSNAPSHOT_MANIFEST covers this index; ownhash omitted",

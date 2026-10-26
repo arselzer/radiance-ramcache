@@ -1,7 +1,7 @@
 {
   "CPU_staging_summary": {
     "path": "evidence/glm53-main-verified-v7/CPU_STAGING_SUMMARY.json",
-    "sha256": "9709c13f12bcb2fad168cc9ef27fd8a464bb0b608c36cb48b93d545645c30960"
+    "sha256": "e88c100582ab26fe6f53db05a4e61b83cf40888f929ae3b23b05b4ef370c1c07"
   },
   "Core_files": 1535,
   "Core_pins_sha256": "753436bac31f041b8e051fb4e4797319d4eefa12df6d2bde0f8e28eee407b366",
@@ -15,7 +15,7 @@
   "current_manual_runner": "glm53-manual-maintenance-runner-v5-20261025",
   "current_validation_summary": {
     "path": "evidence/glm53-main-verified-v7/VALIDATION_SUMMARY.json",
-    "sha256": "e9212d2501cf74f12868cd54e09842f10c92fc7937950e30dbb525cfac89d543"
+    "sha256": "6428dd857b5bff6026187bd414142dd2398771c5fc44c0a084bb497e639dbdc1"
   },
   "exact_new_packages": {
     "glm53-main-verified-components-v13-prototype": {
@@ -33,6 +33,16 @@
       "original_receipt_sha256": "ef5d7f382102fdd08b8f50077e5165585fe82e3cf804a60b1da40c44452941eb",
       "source_bodies_changed": false
     }
+  },
+  "fresh_public_build_summary": {
+    "path": "evidence/glm53-main-verified-v7/FRESH_PUBLIC_BUILD_SUMMARY.json",
+    "sha256": "7b3bf92f39017d3ca82c2b19dc224eedd203b0fd606ea8c379719b973de15ef7"
+  },
+  "historical_archive_reuse_tested_snapshot": {
+    "files": 3212,
+    "final_changes": "normalizeddocs/evidence/provenance only; no runtime source/tool/CMake changes",
+    "manifest": "docs/provenance/portable-tested-8b966d37-checkpoint/SNAPSHOT_MANIFEST.json",
+    "sha256": "8b966d37d75f96af9f1ad5f81d5f252f25072cc30726f68ba6a89601d4ec0d14"
   },
   "model_weights_native_store_tokenizer_binaries_private_config_or_credentials_exported": false,
   "old_Core5_reconstruction": "ApplyCore6sixfileoverlay, then existingV5twofileloaderoverlay; exact1535oldpins verified",
@@ -262,6 +272,22 @@
       "original_directory": "validation-portable-main-engine-v7-release-build-20261025T232743Z",
       "passed": true
     },
+    "portable13-fresh-build": {
+      "files_sha256": {
+        "portable.log": "f5804752140362ebbff6334f44880606678309c22475a24213d3ca773bb06ea1",
+        "receipt.json": "de2b70c4732d60d504411ce074cc92e299c36adfe330c022b961e00beb61972e"
+      },
+      "original_directory": "validation-public-core7-fresh-release-build-20261026T003005Z",
+      "passed": true
+    },
+    "portable13-fresh-runtime": {
+      "files_sha256": {
+        "portable.log": "fd58c3b6ae991c32f3f7d037322e761802444a5563c5ea8bf46541bb22a3149e",
+        "receipt.json": "5def886b5b56826c2c5a7c4e28f880eec261ee366c0ce7c2f1276ce0faffe716"
+      },
+      "original_directory": "validation-public-core7-fresh-release-checks-20261026T010712Z",
+      "passed": true
+    },
     "portable13-runtime": {
       "files_sha256": {
         "portable.log": "af515429c3edf29447eb2412b2c51ddf09b274dc536aa629c04ab33a06eac656",
@@ -281,9 +307,10 @@
     }
   },
   "tested_portable_snapshot": {
-    "files": 3212,
-    "final_changes": "normalizeddocs/evidence/provenance only; no runtime source/tool/CMake changes",
-    "manifest": "docs/provenance/portable-tested-8b966d37-checkpoint/SNAPSHOT_MANIFEST.json",
-    "sha256": "8b966d37d75f96af9f1ad5f81d5f252f25072cc30726f68ba6a89601d4ec0d14"
+    "files": 3287,
+    "final_changes": "normalized docs/evidence/provenance only; no runtime source/tool/CMake changes",
+    "fresh_whole_Core_built_from_published_source": true,
+    "manifest": "docs/provenance/portable-tested-4d9c9e4a-checkpoint/SNAPSHOT_MANIFEST.json",
+    "sha256": "4d9c9e4a8d662f90441c00c40519f35709ea4875347db7a42b0ae24edc9b6db1"
   }
 }

@@ -8,7 +8,15 @@ sampler/mask/top-k rows. It downloads no model and launches no GPU or API server
 The same binary's --model-vocab-check MODEL mode is explicit/manual only; the
 portable driver NEVER invokes it. Archived Runner V5 is never imported or run.
 
-All thirteen Release HOST programs passed at exact tested source manifest
+Current fresh-build result: all13 Release HOST programs PASSED after a whole
+Core build from the published source at manifest
+4d9c9e4a8d662f90441c00c40519f35709ea4875347db7a42b0ae24edc9b6db1
+(3287files). Checks used only that freshly built public archive; no private
+research Core archive was used. The tested manifest and overwritten metadata
+are preserved. Fresh-build/13check logs and receipts are under
+evidence/glm53-main-verified-v7/portable13-fresh-{build,runtime}.
+
+Earlier, all thirteen Release HOST programs passed at exact tested source manifest
 8b966d37d75f96af9f1ad5f81d5f252f25072cc30726f68ba6a89601d4ec0d14
 (3212files), using verified source-identical existing Core7 archives and newly
 built portable fixtures. The final export adds evidence/normalized docs only;

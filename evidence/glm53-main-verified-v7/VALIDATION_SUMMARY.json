@@ -172,6 +172,22 @@
       "original_directory": "validation-portable-main-engine-v7-release-build-20261025T232743Z",
       "passed": true
     },
+    "portable13-fresh-build": {
+      "files_sha256": {
+        "portable.log": "f5804752140362ebbff6334f44880606678309c22475a24213d3ca773bb06ea1",
+        "receipt.json": "de2b70c4732d60d504411ce074cc92e299c36adfe330c022b961e00beb61972e"
+      },
+      "original_directory": "validation-public-core7-fresh-release-build-20261026T003005Z",
+      "passed": true
+    },
+    "portable13-fresh-runtime": {
+      "files_sha256": {
+        "portable.log": "fd58c3b6ae991c32f3f7d037322e761802444a5563c5ea8bf46541bb22a3149e",
+        "receipt.json": "5def886b5b56826c2c5a7c4e28f880eec261ee366c0ce7c2f1276ce0faffe716"
+      },
+      "original_directory": "validation-public-core7-fresh-release-checks-20261026T010712Z",
+      "passed": true
+    },
     "portable13-runtime": {
       "files_sha256": {
         "portable.log": "af515429c3edf29447eb2412b2c51ddf09b274dc536aa629c04ab33a06eac656",
@@ -195,6 +211,15 @@
     "GPU/driver failure recovery"
   ],
   "portable13": {
+    "checks": 13,
+    "fresh_whole_Core_from_published_source": true,
+    "passed": true,
+    "private_research_Core_archive_used": false,
+    "summary": "evidence/glm53-main-verified-v7/FRESH_PUBLIC_BUILD_SUMMARY.json",
+    "tested_files": 3287,
+    "tested_manifest_sha256": "4d9c9e4a8d662f90441c00c40519f35709ea4875347db7a42b0ae24edc9b6db1"
+  },
+  "portable13_historical_archive_reuse": {
     "passed": true,
     "source_and_build_glue_unchanged_in_final_metadata_export": true,
     "tested_files": 3212,

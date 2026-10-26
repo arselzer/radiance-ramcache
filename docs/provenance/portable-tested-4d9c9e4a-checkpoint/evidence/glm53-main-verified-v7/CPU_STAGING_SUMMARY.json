@@ -1,0 +1,281 @@
+{
+  "CPU_evidence_does_not_establish_GPU_ready": true,
+  "Core_revision": "v7",
+  "actual_metadata": {
+    "kernel_instances_or_launches": 0,
+    "model_vocab_rows": 154880,
+    "passed": true,
+    "ranks": 4,
+    "runtime_ready": false,
+    "valid_token_count": 154856
+  },
+  "actual_vocabulary": {
+    "GPU_execution": false,
+    "backend_calls": 0,
+    "eog_ids": 3,
+    "local_rows": 38720,
+    "model_rows": 154880,
+    "padded_rows": 24,
+    "passed": true,
+    "schema": "glm53-real-vocabulary-cpu-preflight-v1",
+    "scope": "actual Engine metadata/tokenizer and real raw embedding/head headers; no payload scan/model start",
+    "source_admitted": false,
+    "status": 0,
+    "tokenizer_tokens": 154856
+  },
+  "complete_prewalk": {
+    "Engine_or_Session_admitted": false,
+    "active_valid_token_count": 154856,
+    "jobs": 5088,
+    "kernel_instances_or_launches": 0,
+    "native_bytes": 161715585024,
+    "omitted_expert_views": 193536,
+    "passed": true
+  },
+  "components_revision": "v13",
+  "first_focused_ASan_attempt": {
+    "classification": "LSan executor/ptrace fatal after test assertions printed PASS; failed receipt remains failed",
+    "original_directory": "validation-glm53-v7-vocabulary-asan-20261025T233425Z",
+    "passed": false,
+    "rerun_directory": "validation-glm53-v7-vocabulary-asan-20261025T233641Z",
+    "same_build_unchanged_host_rerun_passed": true,
+    "suppressed_or_source_changed": false
+  },
+  "fixture_revision": "v9",
+  "focused_modes": {
+    "asan": {
+      "actual_CPU_vocabulary": true,
+      "mask_checks": 387323,
+      "mask_groups": 3,
+      "mask_refusals": 31,
+      "passed": true
+    },
+    "release": {
+      "actual_CPU_vocabulary": true,
+      "mask_checks": 387323,
+      "mask_groups": 3,
+      "mask_refusals": 31,
+      "passed": true
+    },
+    "tsan": {
+      "actual_CPU_vocabulary": true,
+      "mask_checks": 387323,
+      "mask_groups": 3,
+      "mask_refusals": 31,
+      "passed": true
+    }
+  },
+  "full_HOST_modes": {
+    "asan": {
+      "commands": 20,
+      "passed": true
+    },
+    "release": {
+      "commands": 20,
+      "passed": true
+    },
+    "tsan": {
+      "commands": 20,
+      "passed": true
+    }
+  },
+  "passed_stable_receipts": {
+    "actual-metadata": {
+      "files_sha256": {
+        "check.log": "c392bd77083758360e831228020d48dcb084e94815e72f1268d8482202dcc9ca",
+        "receipt.json": "219ba270b25a42e82720cb1306886d3e356f62e5e880fd3f0f190ade1ba69d84",
+        "result.json": "930085df2c27fdd559a747765186845dbba56dcbc69dc942d1b26e059298a26d"
+      },
+      "original_directory": "validation-glm53-components-v13-metadata-20261025T230757Z",
+      "passed": true
+    },
+    "build-aql-release": {
+      "files_sha256": {
+        "receipt.json": "4b1dd4aeeafbb8caf0233c64c2346fb3e470e4304d57a0f19b7fdb816daf75bc"
+      },
+      "original_directory": "build-glm53-main-verified-engine-v7-aql-release-evidence-20261025T224946Z",
+      "passed": true
+    },
+    "build-components13-aql-release": {
+      "files_sha256": {
+        "receipt.json": "b6083cf9468958d54f95e02bd16920f270ad09a3857cebd5edba1fef0c387767"
+      },
+      "original_directory": "build-glm53-main-verified-components-v13-aql-release-evidence-20261025T225926Z",
+      "passed": true
+    },
+    "build-host-asan": {
+      "files_sha256": {
+        "receipt.json": "a11d0689791c90a7ae3fb0a4ea00157e88afbf9a74247c8550f9e55f5b253319"
+      },
+      "original_directory": "build-glm53-main-verified-engine-v7-host-asan-evidence-20261025T230643Z",
+      "passed": true
+    },
+    "build-host-release": {
+      "files_sha256": {
+        "receipt.json": "018227b44f67bcd7ab64c35dc15710e994b6e669d3ce2eb0ac8baeca42200155"
+      },
+      "original_directory": "build-glm53-main-verified-engine-v7-host-release-evidence-20261025T223733Z",
+      "passed": true
+    },
+    "build-host-tsan": {
+      "files_sha256": {
+        "receipt.json": "c4598fe1d9fafaa402922f989a18c969f57a313daa40443af52f884a96de9095"
+      },
+      "original_directory": "build-glm53-main-verified-engine-v7-host-tsan-evidence-20261025T230643Z",
+      "passed": true
+    },
+    "complete-prewalk": {
+      "files_sha256": {
+        "check.log": "90b320925823d0f92ae86fb54cc9550f3a7968e5d24d807d30f7c03aead2dd26",
+        "receipt.json": "26d77be782b87b0f19658eafaaf3ebd854caf583c1b4931b0a1cdd87b9c61c2f",
+        "result.json": "4c831b003a8cef8fc4fdde7e6eedcf06a0fec904c0873d6a98e901cae2e2aa35"
+      },
+      "original_directory": "validation-glm53-components-v13-complete-prewalk-20261025T230831Z",
+      "passed": true
+    },
+    "focused-vocabulary-asan-host-rerun": {
+      "files_sha256": {
+        "host-mask.log": "c928e8bfd8dfc713aa467fda068aba1f989cc82f1c78ac1b4013e18503b9392f",
+        "real-vocabulary.log": "aca5db1ec0599a4a0d6dca0d7b8cfd42584e13d2a0e18764280089911ebe1149",
+        "receipt.json": "3487be0a94a0895e193b159abc5e73126623dd5696a187fdceb71ab73a881f9b"
+      },
+      "original_directory": "validation-glm53-v7-vocabulary-asan-20261025T233641Z",
+      "passed": true
+    },
+    "focused-vocabulary-release": {
+      "files_sha256": {
+        "host-mask.log": "fa939a1f5a5322f7db6c056c9b1b0cb3b7d4f56a06958741aff8de7f9e28ca12",
+        "real-vocabulary.log": "7d2c43679d41f5b8860a5679f79b5cfc5e1154876d037d0b83255351418af4ba",
+        "receipt.json": "c594da4686aa0ed39b3d9b1d6c61b67239f0f8bd22f72c7fcd569fd619a8444a"
+      },
+      "original_directory": "validation-glm53-v7-vocabulary-release-20261025T224721Z",
+      "passed": true
+    },
+    "focused-vocabulary-tsan": {
+      "files_sha256": {
+        "host-mask.log": "9520ca2eacc719454ead41c30079b2c44f801d19cb46cc2299c3249493b2b33a",
+        "real-vocabulary.log": "9def4e57c808cab82a1654391c0322af424cdda2fbf4810e7079b6750531ae15",
+        "receipt.json": "985286dfadeea468564fd0e2cd23cf73f41b7ebd2a115730c39282de686732e3"
+      },
+      "original_directory": "validation-glm53-v7-vocabulary-tsan-20261025T233415Z",
+      "passed": true
+    },
+    "host-asan": {
+      "files_sha256": {
+        "abi_layout_test.log": "c8ed50418cf958fbd33df6bd17196c8d0e512265919a0b8cbe4b5ba62602256d",
+        "build_test.log": "dbad4d79e3fb24f0446eb397da698d4c382820a956ad4dbd07d21421641b0cf5",
+        "compact_authority_collision_test.log": "25cb4f0ba8ba768cee702480edc955aa68035fad531e0b31c71f175e3d72e6c6",
+        "compact_authority_test.log": "f3975ebfa1af568d8086f13de90a8448ce88314d338cf412db5c67873aacbeb3",
+        "contract.log": "4ccccbdb002c244a8925422359724590edd4f25f1ab50466f91fcc4ab7ff2c1e",
+        "deferred_status_checkpoint_test.log": "4c91b4eb2e50f5f0afb0074f1b9c724c450314fd746d410936f4e6a7c75708fd",
+        "deferred_status_test.log": "5b06e7a1982a3fe4c03179e7e5d410a4f0540f20b71bf7bbd3fdffeaa471a38c",
+        "engine-transport.log": "0847d377ad938dd12e70ce71298b5c1b1cabb45a7bda973ed8d42f1e2304dcdd",
+        "foundation.log": "12c3b78024286f77e9b84b86510f30a6789d48551a71085392060900541413b7",
+        "inventory.log": "c2a71f1a95550bb676bcc36f43f9dd7c4a1ba0ef70f9a8038d0574296e2b8637",
+        "mem_test.log": "12ff3b47f52e5fb34be301a7d46c164dda4c5367455619b250f12cdd7d3a7da6",
+        "model_failure_policy_test.log": "4e347798c758be71da3534669d298aad784435a576f0ccc136e58c7f43c10574",
+        "mover-fence.log": "ee551a7b96db017d5b4af885e7136d769413907ca5158ba30c11ad05902171d5",
+        "place_test.log": "7871f55ead3d931f826e0ff209f0f4f200696427816f197022495661927137bc",
+        "plugin_test.log": "8db88993a74da7b8774c4f7b4dbc822e03bf23a391c55bd73bf723a9385bc846",
+        "receipt.json": "faa1ac8e3434dde8bd5cad0d822b88e1f8eeed199606fdda23dbd2da64cb7338",
+        "runtime_test.log": "fc29d6f1502626ec102f3173519dec4c351ea20ef446f577195981cc35399d17",
+        "strict-p3.log": "2fbd340d65a78a4a271b7ddd0bf6012946c1ad433b5abdb3dedff3ad56dfcee6",
+        "tp4-session.log": "24c0b1109b1c562516e7ea35e171ab651d74c8d81743e2a33d9d1b023b1f3435",
+        "unified-policy.log": "8d00415e3fb71e98339f580feebdd63eaddc44d316716ac3da26912268137d66",
+        "verified-engine-gates.log": "641e661f81d76fba7b057e3880c0b821da461d3c774c11c396e5bb150374ca4e"
+      },
+      "original_directory": "validation-glm53-main-verified-engine-v7-host-asan-20261025T232445Z",
+      "passed": true
+    },
+    "host-release": {
+      "files_sha256": {
+        "abi_layout_test.log": "d20fc1217850d8e89e62e23e3df15f8e87308fc605c717c496e77a099607c765",
+        "build_test.log": "50e8e29ec6f65422bd4f5197c0da4bbb359cc892d5e8b1a650eb43cc1468ec28",
+        "compact_authority_collision_test.log": "31f895f97a7ea0576b6b183d6607da9c246ed0a49c7d4e7cab5a2a10f47f1fcd",
+        "compact_authority_test.log": "a10c20f83c099cf4fbe288a8b524f17dbfa41af7ae692431688c8241d921a1a4",
+        "contract.log": "3a88c0a879ea8d821e918e7ac379e05578c5c57005e40a6bbb18c95c730cc7ac",
+        "deferred_status_checkpoint_test.log": "1bc86fadefdc7ee07036b29877a6ffd812cc73f0c42b17cae5775ee73b18f970",
+        "deferred_status_test.log": "07e8e298f6cf0b9b734c90e9ef672cab9f08e1789e929e2101abff6295543028",
+        "engine-transport.log": "9b4c57d284b25ba2016ca9c465f1171f4bb702f2957ad17e951c833030101319",
+        "foundation.log": "a8af63e22457a3d4af10dfe07f685afd9bcd639967d411ae0bdd784cfa156c94",
+        "inventory.log": "67d509cb56815d459f1bd1a45b31346cf7d88645b388fa93dfdf64cd9512a586",
+        "mem_test.log": "bcd054a12850c141b655b24fda101acdd513e9c2af43bdc6d4b8e0422c103605",
+        "model_failure_policy_test.log": "16bfde389aee77341eff753e87808019cf799963d9bebdcf2c4489e1e15bdefa",
+        "mover-fence.log": "f5e4f10f2fe742f71c0204bfcf6bab49f1f37241701174108802702b107184aa",
+        "place_test.log": "c4f7cc401d5cddd1c0eed1425cfa751e8be55cbf3a73bffab127566554acee86",
+        "plugin_test.log": "cce4585d93030e65a54606e730309dc8b77be3786fe99255facc3122fa843abe",
+        "receipt.json": "42dd5527e31a967ee062ee2cdcea7bc669c0ed09ae2fd830824cc7797c645470",
+        "runtime_test.log": "e817db67d82613e5eecafb9ba6e77fded893bed9cacf10ab96ee2146300b5b3d",
+        "strict-p3.log": "b3c2b112f42bdb359de44e05f723d148a4e45df3a029dfa99be91217052c76b8",
+        "tp4-session.log": "25a6b878dcb3ab126edb20017972be26088393b84695e234fdd121881e2010c6",
+        "unified-policy.log": "eaaacc59cac11c2f06ecc66df892a8bbb71f8ed1a50de8de69c78edaaf0275cc",
+        "verified-engine-gates.log": "fb6b4d13c5d83672eeacfc5d89da32300daebff9c65ee73b1300039c80f29f7f"
+      },
+      "original_directory": "validation-glm53-main-verified-engine-v7-host-release-20261025T224749Z",
+      "passed": true
+    },
+    "host-tsan": {
+      "files_sha256": {
+        "abi_layout_test.log": "9d8877896ee05aa8c576a3c494bd966c4eceafefd27ed7e63aefdb929a92a8ec",
+        "build_test.log": "62a67f918bcc25b4181b74f5054923d91762c5907eb6bfb4b4c85a7ec4c33c54",
+        "compact_authority_collision_test.log": "2e52c76732c9f679eeea66ce135227d8ce355f9a66bb6a9a0df3fa989763e441",
+        "compact_authority_test.log": "e15dba37234da2528073a30040b92f8494bf6c37ca9fc192eb50526e84373b70",
+        "contract.log": "84bd05a7391c951ddc4105af056d52ca85d26396352486d8cf7453c1fda3bc3f",
+        "deferred_status_checkpoint_test.log": "9f386f34bcb9984b0232e06d9c7edb0349f3026827873d490a4249881e8dfd5f",
+        "deferred_status_test.log": "c3b58267e4880bcf202d97cf5b706f82964d45c685467e5e067fdd7d9aca7b1b",
+        "engine-transport.log": "6bca8f94fd9fa6571b6df1a4c1e3cc9ce001c40e2b57951d4286e8ddf7ed7042",
+        "foundation.log": "02dc4ca94d7463f9611d82b465bb603d4eeb096a0210731bd0f8a5db62a51d81",
+        "inventory.log": "9d819f88fc2153f879be3d7f2d6e3beda01cc60a2afd2f135193b31874409174",
+        "mem_test.log": "9ba971b584d5369d954d00770bce8640b8df5cabc3106cbad2a68e9ed37ced81",
+        "model_failure_policy_test.log": "decbe0ee2b2f613c04d65cd70df66c95a5b7b458208c20677e5d66336720883b",
+        "mover-fence.log": "6961f80d9cd434246969a6d3dcacff8feee30edc14a9a182a69085f31c28319d",
+        "place_test.log": "cdd37ecf02ce679d6df93ef8b2a494c57895b2fc27755685cd1d7ac9e9b099d0",
+        "plugin_test.log": "5b87a5455613d150c26c583bca7daa741368242d4e0c0e5ef516d58704b58181",
+        "receipt.json": "8a954dbf8f4c48aa57236ef572ed6bf03b9774ff2e301de6cb1f394dd67ebc7d",
+        "runtime_test.log": "82c6c4c2621ff95c0154da2cb24e79a7c0fcedef4044a4b550328c97a542570e",
+        "strict-p3.log": "1b693774e12fc623b28be5b43b92e5fbc6229bc65a7ddc9c5d523a1574eb1aeb",
+        "tp4-session.log": "25313a019969811a3e053a0f26f0b6d27e950ed736378d2815733e7187dd6240",
+        "unified-policy.log": "2c1b9f66a93759b2fcab6f5b3983ebc12288d7250a6e9e68942a12f1cf3e9d12",
+        "verified-engine-gates.log": "38b8e4b4c46f864148cbed353387bebad90498c6c71920255b16a4d7bcc77afb"
+      },
+      "original_directory": "validation-glm53-main-verified-engine-v7-host-tsan-20261025T232605Z",
+      "passed": true
+    },
+    "portable13-build": {
+      "files_sha256": {
+        "portable.log": "1efb5588fdaf7cf45539da198e85b33912a876b671da6cf6536fe1df9743c379",
+        "receipt.json": "ae5ad6da3944af4b00f795290b8f92bd4e01a80e92f2c8386e676309d8ac86a7"
+      },
+      "original_directory": "validation-portable-main-engine-v7-release-build-20261025T232743Z",
+      "passed": true
+    },
+    "portable13-runtime": {
+      "files_sha256": {
+        "portable.log": "af515429c3edf29447eb2412b2c51ddf09b274dc536aa629c04ab33a06eac656",
+        "receipt.json": "54bfe41be72bc01d112dabd66d78c0ce101eb4bde5ecd2fa9f96f0c41a40b7b6"
+      },
+      "original_directory": "validation-portable-main-engine-v7-release-checks-20261026T000216Z",
+      "passed": true
+    },
+    "preparation-v5": {
+      "files_sha256": {
+        "home-receipt.json": "270fa0ae9e5573e488f791313740b1ae5b1423432f778a83dfe8110c9f31b765",
+        "receipt.json": "45846dff23582fa94df4f9589af1a44bc01d13e5ce3285ef64d0fe91deae89e8",
+        "tokenizer.log": "8877d83d740e8ecd8ba8a23b18c1f752a429ef944b04f9218f047927816fb01c"
+      },
+      "original_directory": "glm53-manual-preparation-v5-core-v7-fixture-v9-20261025T230200Z",
+      "passed": true
+    }
+  },
+  "pending": [],
+  "portable_release": {
+    "passed": true,
+    "programs": 13,
+    "scope": "source-identical existing Core7 archives; portable fixtures rebuilt and executed; no GPU/model action",
+    "tested_file_count": 3212,
+    "tested_manifest_sha256": "8b966d37d75f96af9f1ad5f81d5f252f25072cc30726f68ba6a89601d4ec0d14"
+  },
+  "runner_revision": "v5",
+  "schema": "glm53-core7-cpu-validation-v2",
+  "source_author_compilation_or_runtime_execution": false
+}

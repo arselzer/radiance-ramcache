@@ -12,7 +12,7 @@ Candidate source: Core V7 (1,535 files), Engine fixture V9, Components V13 and a
 | Core V7 fast actual metadata | Passed all four logical rank graphs with active valid-token profile. No kernel initialization/launch or source readiness. |
 | Matching ASan/TSan builds and runtime | Passed all 20 HOST commands per mode. |
 | Current complete-data prewalk | Passed all four rank bindings/native plans and 5,088 ordinary jobs; 161,715,585,024 expert bytes. No kernels or Engine admission in this prewalk. |
-| Portable thirteen-program build/runtime | Passed Release at exact tested manifest `8b966d37`, 3,212 files, reusing source-identical Core archives. |
+| Portable thirteen-program build/runtime | Passed Release from a fresh whole Core built from published source at exact manifest `4d9c9e4a`, 3,287 files; all 13 programs ran against that fresh archive. Earlier `8b966d37` reuse evidence is preserved. |
 | Core V7 four-GPU startup/one-token trial | Passed combined startup/transport/one model step: one input token, one output ID154822 `[gMASK]`; healthy teardown and same-QFN restoration independently checked. |
 
 Exact original receipts/logs and the preserved focused-ASan executor failure are under [the current validation evidence](evidence/glm53-main-verified-v7/VALIDATION_SUMMARY.json). The first focused ASan attempt printed all test assertions passed but then failed LeakSanitizer under ptrace; it remains failed. The same source/build passed both focused modes on the host rerun, without changing sanitizer diagnostics or source. The parent owns all compiler/runtime/service/GPU actions; this export author performed source/hash/AST checks only.

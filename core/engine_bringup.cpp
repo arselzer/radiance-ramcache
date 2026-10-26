@@ -51,6 +51,7 @@
 #include <memory>
 #include <mutex>
 #include <chrono>
+#include <cstdio>
 
 namespace rad {
 
@@ -2591,6 +2592,23 @@ static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
      * (e.g. a mapped n-gram table, read from its mapping for the process lifetime): what an earlier
      * run brought in stays, so its gathers do not start cold after a restart. */
     file->drop_blob_cache(keep_cached);
+    /* ... and what the load's allocations reclaimed of it comes back (RadFile::rewarm), at most half
+     * of what the kernel calls available, so the re-read cannot itself push the host into reclaim. */
+    if (!keep_cached.empty()) {
+        int64_t avail = 0;
+        if (FILE* mi = std::fopen("/proc/meminfo", "r")) {
+            char line[256];
+            while (std::fgets(line, sizeof line, mi))
+                if (std::sscanf(line, "MemAvailable: %lld kB", (long long*)&avail) == 1) { avail *= 1024; break; }
+            std::fclose(mi);
+        }
+        const auto w0 = std::chrono::steady_clock::now();
+        const int64_t asked = file->rewarm(keep_cached, avail / 2);
+        if (asked > 0)
+            RAD_INFO("mapped tier: asked the page cache again for %s an earlier run had cached (%.0f ms; "
+                     "RADIANCE_MAPPED_REWARM=0 turns it off)", humanb(asked).c_str(),
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count());
+    }
     /* Drain before freeing: a sweep that failed part-way may have copies outstanding. */
     for (int b = 0; b < kWin; ++b) pool->drain(b);
     for (int b = 0; b < kWin; ++b) if (buf[b]) rad_dev_free(buf[b], RAD_MEM_HOST_PINNED);

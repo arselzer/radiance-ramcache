@@ -106,6 +106,11 @@ static const Flag g_flags[] = {
     { "--weights-disk-tier",  nullptr,  "read weights that fit neither VRAM nor the host pool from the\n"
     "                                    container on disk (O_DIRECT); a routed expert is read a layer\n"
     "                                    at a time, so a step is paced by the drive" },
+    { "--row-prefetch",       "MODE",   "on (default) | off -- a host gather from a table read through\n"
+    "                                    the container's mapping (--ngram-placement disk) asks for the\n"
+    "                                    pages its rows cover before its kernel runs, or beside it when\n"
+    "                                    they are already resident; off leaves every row to the\n"
+    "                                    kernel's own page faults. The output is the same either way" },
     { "--prefix-cache-mib",   "N",      "copy finished conversations' KV to host memory, up to N MiB,\n"
     "                                    so their VRAM can go to experts and a return restores\n"
     "                                    instead of re-prefilling. A full tier drops its least\n"
@@ -573,6 +578,15 @@ int config_parse(int argc, char** argv, Config* c) {
             c->tower_placement = p;
         }
         else if (S("--weights-disk-tier"))     { c->weights_disk_tier = true; }
+        else if (S("--row-prefetch")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if      (!std::strcmp(v, "on"))  c->row_prefetch = true;
+            else if (!std::strcmp(v, "off")) c->row_prefetch = false;
+            else {
+                RAD_ERR("--row-prefetch takes on or off, not '%s'", v);
+                return RAD_E_INVAL;
+            }
+        }
         else if (S("--prefix-cache-mib"))      { if (!num(0, INT32_MAX, &c->prefix_cache_mib)) return RAD_E_INVAL; }
         else if (S("--prefix-cache-ttl"))      { if (!num(0, INT32_MAX, &c->prefix_cache_ttl)) return RAD_E_INVAL; }
         else if (S("--lora")) {
@@ -1124,6 +1138,7 @@ const ShowRow kShow[] = {
     { "--ngram-placement",    [](const Config& c) { return std::string(table_placement_name(c.ngram_placement)); } },
     { "--vision-tower-placement", [](const Config& c) { return std::string(table_placement_name(c.tower_placement)); } },
     { "--weights-disk-tier",  [](const Config& c) { return onoff(c.weights_disk_tier); } },
+    { "--row-prefetch",       [](const Config& c) { return onoff(c.row_prefetch); } },
     { "--prefix-cache-mib",   [](const Config& c) {
           return c.prefix_cache_mib ? num(c.prefix_cache_mib) : std::string("0 (off)"); } },
     { "--prefix-cache-ttl",   [](const Config& c) {

@@ -863,6 +863,10 @@ struct Config {
      * exact prefetch, a routed expert a routed layer at a time). Off by default because disk
      * paces the step, so an accidental spill makes the server orders of magnitude slower. */
     bool    weights_disk_tier = false;
+    /* --row-prefetch on|off: a host gather's rows on the mapped tier (a table on disk, read
+     * through the container's mapping) are asked for ahead of its kernel (runtime/rowprefetch.h,
+     * CtxDesc::row_prefetch). Output-neutral; on is the default. */
+    bool    row_prefetch = true;
 
     std::string placement = "auto";    /* all_vram | layer_offload | expert_tiered | auto */
     /* --embedding-placement and --ngram-placement as given (see TablePlacement), and their

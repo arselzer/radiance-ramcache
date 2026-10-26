@@ -235,6 +235,8 @@ struct Fixture {
         return (rad_op)(P.ops.size() - 1);
     }
 
+    bool row_prefetch = true;   /* CtxDesc::row_prefetch */
+
     int start(rad::ResidencyTable* res = nullptr, bool profile = false, bool record = false) {
         CtxDesc d;
         d.program     = &P;
@@ -243,6 +245,7 @@ struct Fixture {
         d.arch_step   = arch_step_trampoline;
         d.residency   = res;
         d.profile_ops = profile;
+        d.row_prefetch = row_prefetch;
         d.kv          = kv;
         d.registry    = registry;
         /* The arch bodies here issue whatever a case asks, which the batch does not describe, so
@@ -2618,7 +2621,7 @@ int k_cold_gather(const RadArgs* a, RadStream) {
  * ids `ids` (n of them). Returns the Ctx's read-ahead counters. */
 struct ColdRun { int status = RAD_OK; int64_t calls = 0, pages = 0, beside = 0; bool busy_after = false; };
 ColdRun cold_run(const ColdTable& ct, int64_t rows, int64_t rb, const int32_t* ids, int64_t n,
-                 double wait_ms, bool fetches_rows = false) {
+                 double wait_ms, bool fetches_rows = false, bool row_prefetch = true) {
     ColdRun out;
     g_cold = &ct;
     g_cold_rb = rb;
@@ -2643,6 +2646,7 @@ ColdRun cold_run(const ColdTable& ct, int64_t rows, int64_t rb, const int32_t* i
     attach_host_row(f, op, k_cold_gather, "cold_gather");
     f.rows.back().fetches_rows = fetches_rows;   /* rad_kernel_fetches_rows */
     for (rad::Band& band : f.P.ops[op].bands) band.dom[RAD_DOMAIN_HOST].geom.set_i("n_vocab", rows);
+    f.row_prefetch = row_prefetch;
     out.status = f.start();
     if (out.status < 0) return out;
     if (f.ctx.set_op_domain(op, RAD_DOMAIN_HOST) != RAD_OK) { out.status = RAD_E_STATE; return out; }
@@ -2664,8 +2668,8 @@ ColdRun cold_run(const ColdTable& ct, int64_t rows, int64_t rb, const int32_t* i
 
 /* Through the issue path: a host gather (embed_lookup_q) over a weight on the mapped tier has its
  * rows' pages asked for before its kernel, so they arrive without the kernel touching them; a row
- * it does not name stays out, and an id past the table is skipped. RADIANCE_ROW_PREFETCH=0 turns
- * it off. */
+ * it does not name stays out, and an id past the table is skipped. --row-prefetch off
+ * (CtxDesc::row_prefetch) turns it off. */
 TEST(a_host_gather_from_the_mapped_tier_reads_its_rows_ahead_of_its_kernel) {
     if (!rad::device_is_host()) SKIP("the probe kernel runs on the host backend's host domain");
     const int64_t rows = 1024, rb = 1000;   /* 250 pages; rows straddle pages */
@@ -2688,9 +2692,7 @@ TEST(a_host_gather_from_the_mapped_tier_reads_its_rows_ahead_of_its_kernel) {
     {
         ColdTable ct(radtest::tmp_path("rowpf-b.bin"), rows * rb);
         REQUIRE(ct.base && ct.cold);
-        setenv("RADIANCE_ROW_PREFETCH", "0", 1);
-        const ColdRun r = cold_run(ct, rows, rb, ids, 4, 50.0);
-        unsetenv("RADIANCE_ROW_PREFETCH");
+        const ColdRun r = cold_run(ct, rows, rb, ids, 4, 50.0, false, false);
         CHECK_OK(r.status);
         CHECK_EQ(r.calls, (int64_t)0);
         CHECK(!g_cold_rows_in);

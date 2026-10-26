@@ -3600,6 +3600,7 @@ int Engine::start() {
         d.residency   = r->plan.strategy == Strategy::AllVram ? nullptr : r->mover.residency();
         d.arch_step   = arch_step_;
         d.profile_ops = cfg_.profile_ops;
+        d.row_prefetch = cfg_.row_prefetch;
         bind_kv_pools(r->program, [&](int32_t g) { return r->kv.plan(g); }, &d.kv);
         d.registry    = &rad_tools_registry();
         RAD_TRY(r->ctx.init(d));

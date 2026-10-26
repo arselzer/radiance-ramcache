@@ -808,7 +808,7 @@ gather runs, so the drive answers them together rather than one fault at a time.
 (a prefill chunk's) whose sampled rows are already resident is asked for beside the gather
 instead, so a warm chunk does not wait for the asking: ~0.5 us a page, ~240 ms a rank for an
 8192-token Engram chunk.
-`RADIANCE_ROW_PREFETCH=0` turns that off.) `ram` copies the table into host memory at load (12 to
+`--row-prefetch off` turns that off.) `ram` copies the table into host memory at load (12 to
 40 s more startup, depending on the page cache) and the card's gather kernel reads the pinned copy,
 so a step has no host work. `vram` puts all of it on every card. `ram` needs the table's size free
 after the pinned host pools and the prefix cache's host tier, with `--host-headroom-mib` to spare
@@ -1847,6 +1847,7 @@ by 0.002-0.003 nats.
 | `--ngram-placement WHERE` | auto | `auto`, `vram`, `ram` or `disk`: an n-gram table on the card, as a copy in RAM made at load and read by the card, or read from the container (§4.3) |
 | `--vision-tower-placement WHERE` | vram | `vram` or `ram`: the encoder towers (vision, and audio where a model has one) on the card, or pinned in host memory beside `--host-pool-mib` and read in place once an image (§4.3) |
 | `--weights-disk-tier` | off | read weights that fit neither VRAM nor the host pool from the container (O_DIRECT); routed experts a layer at a time |
+| `--row-prefetch MODE` | on | `on` or `off`: a host gather from a table read through the container's mapping (`--ngram-placement disk`) asks for its rows' pages before its kernel, or beside it when they are resident (§4.3); the output is the same either way |
 
 **LoRA adapters** (§4.9.1)
 

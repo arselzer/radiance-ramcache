@@ -197,6 +197,9 @@ struct CtxDesc {
     ResidencyTable* residency   = nullptr;  /* null in the all-in-VRAM case */
     ArchStepFn      arch_step   = nullptr;  /* the architecture plugin's rad_arch_step */
     bool            profile_ops = false;    /* spec §16, and it changes what you measure */
+    /* --row-prefetch: a host gather's rows on the mapped tier are read ahead of (or beside) its
+     * kernel (runtime/rowprefetch.h). */
+    bool            row_prefetch = true;
     /* Whether a repeated pass may be recorded and played back. False for a caller whose pass
      * issues work the batch does not describe (e.g. a test driving another component through
      * run_step), since a recording keyed on the batch would replay the wrong pass. */
@@ -758,7 +761,7 @@ private:
      * this issue reads there, then the madvise over the rows `t[0]` names -- in front of the
      * kernel, or beside it on rowpf_worker_ when longer than kRowAheadInline and its sampled rows
      * are resident; row_prefetch_done() after the kernel returns stops and joins that. Off with
-     * RADIANCE_ROW_PREFETCH=0. */
+     * --row-prefetch off (CtxDesc::row_prefetch). */
     bool      row_prefetch_on_ = true;
     RowPrefetchScratch rowpf_;
     int64_t   rowpf_calls_ = 0, rowpf_pages_ = 0, rowpf_beside_calls_ = 0;

@@ -432,6 +432,7 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--host-pool-mib", { "1024" } }, { "--host-headroom-mib", { "2048" } },
         { "--embedding-placement", { "vram" } },
         { "--vision-tower-placement", { "ram" } }, { "--ngram-placement", { "disk" } },
+        { "--row-prefetch", { "off" } },
         { "--prefix-cache-mib", { "256" } }, { "--prefix-cache-ttl", { "60" } },
         { "--placement", { "all_vram" } }, { "--checkpoint-interval", { "256" } },
         { "--prefill-span", { "2" } },

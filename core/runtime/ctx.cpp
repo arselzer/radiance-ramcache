@@ -32,13 +32,10 @@ int Ctx::init(const CtxDesc& d) {
     kv_        = d.kv;
     arch_step_ = d.arch_step;
     profiling_ = d.profile_ops;
-    /* A host gather's rows on the mapped tier are read ahead unless this says 0
+    /* A host gather's rows on the mapped tier are read ahead unless --row-prefetch off
      * (runtime/rowprefetch.h). The scratch is sized once, off the step path. */
-    {
-        const char* rp = std::getenv("RADIANCE_ROW_PREFETCH");
-        row_prefetch_on_ = !(rp && rp[0] == '0' && rp[1] == 0);
-        rowpf_.reserve(4096);
-    }
+    row_prefetch_on_ = d.row_prefetch;
+    rowpf_.reserve(4096);
 
     /* The rank owns one device. Set it here so allocation lands on the right card, and again from
      * the rank thread in bind_thread() because the backend's current device is thread-local. */
@@ -883,7 +880,7 @@ void Ctx::dump_profile() const {
     if (rowpf_calls_)
         fprintf(stderr, "  row read-ahead: %lld host gather(s) from the mapped tier asked for %lld "
                         "page(s) ahead of their kernel, %lld of them beside it "
-                        "(runtime/rowprefetch.h; RADIANCE_ROW_PREFETCH=0 turns it off)\n\n",
+                        "(runtime/rowprefetch.h; --row-prefetch off turns it off)\n\n",
                 (long long)rowpf_calls_, (long long)rowpf_pages_, (long long)rowpf_beside_calls_);
 }
 

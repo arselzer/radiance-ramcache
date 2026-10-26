@@ -41,7 +41,7 @@
  *   pages the sample missed are still asked for without the kernel waiting on the asking.
  * The hints are the same pages either way, so the output cannot change.
  *
- * RADIANCE_ROW_PREFETCH=0 turns it off, for an A/B of the gather's cost.
+ * --row-prefetch off (CtxDesc::row_prefetch) turns it off, for an A/B of the gather's cost.
  */
 #pragma once
 #include <atomic>

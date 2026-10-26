@@ -310,6 +310,11 @@ struct MoeFP8 {
         const char* router      = nullptr;   /* mlp.gate.weight, [n_expert, n_embd] bf16 */
         const char* router_bias = nullptr;   /* GLM noaux_tc correction bias */
         const char* experts     = nullptr;   /* prefix; ".<e>.{gate,up,down}_proj.weight" */
+        /* The per-expert tensors' names under `experts` (".<e>.<name>.weight"): Hugging Face's
+         * spelling unless a family ships its own (DeepSeek's release: w1, w3, w2). */
+        const char* expert_gate = "gate_proj";
+        const char* expert_up   = "up_proj";
+        const char* expert_down = "down_proj";
         const char* shared      = nullptr;   /* prefix; ".{gate,up,down}_proj.weight" */
         /* Stacked checkpoints (recent releases) store all experts in two tensors:
          * `mlp.experts.gate_up_proj` [n_expert, 2*n_ff, n_embd] and `mlp.experts.down_proj`
@@ -577,8 +582,8 @@ inline int moe_map_gate_up(RadBuilder* b, Names& nm, const MoeFP8::Src& src, con
     if (src.experts_gate_up) return map_slice(b, guw, src.experts_gate_up, (int)ge);
     if (src.experts_gate && src.experts_up)
         return map_slice_concat(b, guw, {src.experts_gate, src.experts_up}, (int)ge);
-    return map_concat(b, guw, {nm.ckpt("%s.%lld.gate_proj.weight", src.experts, ge),
-                                nm.ckpt("%s.%lld.up_proj.weight", src.experts, ge)});
+    return map_concat(b, guw, {nm.ckpt("%s.%lld.%s.weight", src.experts, ge, src.expert_gate),
+                                nm.ckpt("%s.%lld.%s.weight", src.experts, ge, src.expert_up)});
 }
 
 inline int moe_map_expert(RadBuilder* b, Names& nm, const MoeFP8::Src& src, const char* guw,
@@ -586,7 +591,7 @@ inline int moe_map_expert(RadBuilder* b, Names& nm, const MoeFP8::Src& src, cons
     if (gate_up) RAD_ARCH_TRY(moe_map_gate_up(b, nm, src, guw, ge));
     if (src.experts_gate_up || src.experts_gate)
         return map_slice(b, dnw, src.experts_down, (int)ge);
-    return map_copy(b, dnw, nm.ckpt("%s.%lld.down_proj.weight", src.experts, ge));
+    return map_copy(b, dnw, nm.ckpt("%s.%lld.%s.weight", src.experts, ge, src.expert_down));
 }
 
 inline int MoeFP8::probe(RadBuilder* b, Names& nm, int l, const Src& src, Config* cfg) {

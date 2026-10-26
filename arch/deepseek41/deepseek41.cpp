@@ -29,6 +29,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <map>
 #include <memory>
 #include <string>
@@ -73,16 +74,74 @@ struct Cfg {
 };
 
 static std::string key(const char* k) { return std::string("deepseek41.") + k; }
+/* DeepSeek's release states the same values in its config.json (text_config's keys, which the
+ * core also reads bare). Each deepseek41.* key read here and the release's name for it; a key the
+ * release does not state (the Engram's bucket sizes, derived from its primes) has none. */
+static const char* release_key(const char* k) {
+    static const struct { const char* gguf; const char* hf; } t[] = {
+        { "rope.dimension_count", "qk_rope_head_dim" },
+        { "attention.q_lora_rank", "q_lora_rank" },
+        { "attention.output_group_count", "o_groups" },
+        { "attention.output_lora_rank", "o_lora_rank" },
+        { "attention.sliding_window", "sliding_window" },
+        { "expert_feed_forward_length", "moe_intermediate_size" },
+        { "expert_weights_scale", "routed_scaling_factor" },
+        { "expert_weights_norm", "norm_topk_prob" },
+        { "swiglu_clamp_exp", "swiglu_limit" },
+        { "attention.indexer.head_count", "index_n_heads" },
+        { "attention.indexer.key_length", "index_head_dim" },
+        { "attention.indexer.top_k", "index_topk" },
+        { "attention.indexer.candidate_source_layer", "candidate_source_layer_id" },
+        { "attention.indexer.candidate_top_k_blocks", "candidate_topk_blocks" },
+        { "attention.indexer.candidate_block_size", "candidate_block_size" },
+        { "hyper_connection.count", "hc_mult" },
+        { "hyper_connection.sinkhorn_iterations", "hc_sinkhorn_iters" },
+        { "hyper_connection.epsilon", "hc_eps" },
+        { "attention.compress_rope_freq_base", "compress_rope_theta" },
+        { "attention.compress_ratios", "compress_ratios" },
+        { "attention.kv_source_layers", "kv_source_layer_ids" },
+        { "attention.indexer.source_layers", "index_source_layer_ids" },
+        { "ple.layers", "engram_layer_ids" },
+        { "ple.ngram_size", "engram_max_ngram_size" },
+        { "ple.heads_per_ngram", "engram_n_heads" },
+        { "embedding_length_per_layer_input", "engram_head_dim" },
+        { "engram.pad_token_id", "engram_pad_token_id" },
+        { "nextn_predict_layers", "num_nextn_predict_layers" },
+        { "dspark.block_size", "dspark_block_size" },
+        { "dspark.noise_token_id", "dspark_noise_token_id" },
+        { "dspark.target_layers", "dspark_target_layer_ids" },
+        { "dspark.markov_rank", "dspark_markov_rank" },
+        { "dspark.expert_count", "dspark_n_routed_experts" },
+        { "dspark.expert_used_count", "dspark_num_experts_per_tok" } };
+    for (const auto& e : t)
+        if (std::strcmp(e.gguf, k) == 0) return e.hf;
+    return nullptr;
+}
+/* deepseek41.<k>, else the release's spelling of it; null when neither is there. */
+static const char* gs(const RadModelMeta* m, const char* k) {
+    const char* s = rad_meta_gets(m, key(k).c_str(), nullptr);
+    if (!s)
+        if (const char* r = release_key(k)) s = rad_meta_gets(m, r, nullptr);
+    return s;
+}
 static int64_t gi(const RadModelMeta* m, const char* k, int64_t d) {
-    return rad_meta_geti(m, key(k).c_str(), d);
+    const char* s = gs(m, k);
+    return s && *s ? std::strtoll(s, nullptr, 10) : d;
 }
 static double gf(const RadModelMeta* m, const char* k, double d) {
-    return rad_meta_getf(m, key(k).c_str(), d);
+    const char* s = gs(m, k);
+    return s && *s ? std::strtod(s, nullptr) : d;
 }
-/* A spelled-out integer array (core/format/checkpoint.cpp, meta_from_gguf). */
-static std::vector<int64_t> gl(const RadModelMeta* m, const char* k) {
+/* Whether the checkpoint is DeepSeek's release (config.json, inference/model.py's tensor names)
+ * rather than a GGUF in llama.cpp's names: it states no deepseek41.block_count. */
+static bool is_release(const RadModelMeta* m) {
+    return rad_meta_gets(m, key("block_count").c_str(), nullptr) == nullptr &&
+           rad_meta_gets(m, "num_hidden_layers", nullptr) != nullptr;
+}
+/* An integer array spelled out, comma-separated (core/format/checkpoint.cpp, meta_from_gguf) or
+ * space-separated (a config.json array). */
+static std::vector<int64_t> int_list(const char* s) {
     std::vector<int64_t> v;
-    const char* s = rad_meta_gets(m, key(k).c_str(), "");
     if (!s || !*s || *s == '[') return v;
     while (*s) {
         char* e = nullptr;
@@ -92,6 +151,7 @@ static std::vector<int64_t> gl(const RadModelMeta* m, const char* k) {
     }
     return v;
 }
+static std::vector<int64_t> gl(const RadModelMeta* m, const char* k) { return int_list(gs(m, k)); }
 
 static int read_cfg(Cfg& c, const RadModelMeta* m) {
     c.n_layer = m->n_layers;
@@ -113,7 +173,7 @@ static int read_cfg(Cfg& c, const RadModelMeta* m) {
     {
         /* One clamp for every layer and arm; a per-layer schedule is refused. */
         const std::vector<int64_t> dummy;
-        const char* s = rad_meta_gets(m, key("swiglu_clamp_exp").c_str(), "");
+        const char* s = gs(m, "swiglu_clamp_exp");
         c.swiglu_limit = s && *s && *s != '[' ? std::atof(s) : 10.0;
     }
     c.ih = gi(m, "attention.indexer.head_count", 0);
@@ -137,6 +197,9 @@ static int read_cfg(Cfg& c, const RadModelMeta* m) {
     c.ple_dim = gi(m, "embedding_length_per_layer_input", 0);
     c.pad = gi(m, "engram.pad_token_id", -1);
     for (int64_t v : gl(m, "ple.head_vocab_sizes")) c.ple_rows += v;
+    /* The release states each Engram table's rows; their sum is the joined table's. */
+    if (!c.ple_rows)
+        for (int64_t v : int_list(rad_meta_gets(m, "engram_num_embeddings", nullptr))) c.ple_rows += v;
     /* The compressed layers' rotary: YaRN with the bounds the reference derives from the
      * training length (model.py, precompute_freqs_cis). */
     c.yarn_factor = rad_meta_getf(m, "rope_scaling.factor", 0.0);
@@ -341,8 +404,72 @@ struct Model {
     rad_op cn_fin = 0;   /* contract + fnorm fused (fused()), or 0 */
     rad_op pcn_fin = 0;  /* the last post_f + contract + fnorm fused, or 0 */
     Dsp dsp{};
+    /* The checkpoint is DeepSeek's release (is_release): the name map reads its tensors by
+     * inference/model.py's names (ckpt_name), `n_stage` DSpark stages (mtp.*) after the trunk. */
+    bool release = false;
+    int n_stage = 0;
 };
 static std::unique_ptr<Model> models[MAX_RANKS];
+/* The model whose name map is being declared (declare() on this thread). */
+static thread_local Model* naming = nullptr;
+
+/* The checkpoint tensor a declared weight is read from. The declared names are llama.cpp's GGUF
+ * names (`blk.N.attn_q_a.weight`, the drafter's stages as blk.{n_layer + s}), which a GGUF ships as
+ * they are. DeepSeek's release ships the same tensors under inference/model.py's names, and
+ * llama.cpp's converter (conversion/deepseek41.py, DeepseekV4Model._map_dsv4_tensor_name) only
+ * renames them: no permutation, split or transpose. So this is a table of renames; the joins and
+ * products the converter makes (the experts' stacks, the Engram tables, the Engram gate) are maps
+ * of their own at their call sites. A name the table does not know is returned unchanged. */
+static const char* ckpt_name(const char* declared) {
+    Model* m = naming;
+    if (!m || !m->release) return declared;
+    static const struct { const char* gguf; const char* rel; } layer_t[] = {
+        { "attn_norm.weight", "attn_norm.weight" },
+        { "ffn_norm.weight", "ffn_norm.weight" },
+        { "hc_attn_fn.weight", "hc_attn_fn" }, { "hc_attn_base.weight", "hc_attn_base" },
+        { "hc_attn_scale.weight", "hc_attn_scale" }, { "hc_ffn_fn.weight", "hc_ffn_fn" },
+        { "hc_ffn_base.weight", "hc_ffn_base" }, { "hc_ffn_scale.weight", "hc_ffn_scale" },
+        { "attn_sinks.weight", "attn.attn_sink" },
+        { "attn_q_a.weight", "attn.wq_a.weight" },
+        { "attn_q_a_norm.weight", "attn.q_norm.weight" },
+        { "attn_q_b.weight", "attn.wq_b.weight" },
+        { "attn_kv.weight", "attn.wkv.weight" },
+        { "attn_kv_a_norm.weight", "attn.kv_norm.weight" },
+        { "attn_output_a.weight", "attn.wo_a.weight" },
+        { "attn_output_b.weight", "attn.wo_b.weight" },
+        { "attn_compressor_kv.weight", "attn.compressor.wkv.weight" },
+        { "attn_compressor_gate.weight", "attn.compressor.wgate.weight" },
+        { "attn_compressor_norm.weight", "attn.compressor.norm.weight" },
+        { "indexer.attn_k.weight", "attn.indexer.wk.weight" },
+        { "indexer.k_norm.weight", "attn.indexer.k_norm.weight" },
+        { "indexer.attn_q_b.weight", "attn.indexer.wq_b.weight" },
+        { "indexer.proj.weight", "attn.indexer.weights_proj.weight" },
+        { "ffn_gate_inp.weight", "ffn.gate.weight" },
+        { "exp_probs_b.bias", "ffn.gate.bias" },
+        { "ffn_gate_shexp.weight", "ffn.shared_experts.w1.weight" },
+        { "ffn_up_shexp.weight", "ffn.shared_experts.w3.weight" },
+        { "ffn_down_shexp.weight", "ffn.shared_experts.w2.weight" },
+        { "engram_kv.weight", "engram.wkv.weight" } };
+    const int last = m->n_stage - 1;
+    const std::string d = declared;
+    if (d == "token_embd.weight") return "embed.weight";
+    if (d == "output.weight") return "head.weight";
+    if (d == "output_norm.weight") return "norm.weight";
+    if (d == "deepseek41.engram.token_map") return "engram.token_map";
+    if (d == "dspark.fc.weight") return "mtp.0.main_proj.weight";
+    if (d == "dspark.enc.output_norm.weight") return "mtp.0.main_norm.weight";
+    if (d == "dspark.output_norm.weight") return m->nm.ckpt("mtp.%d.norm.weight", last);
+    if (d == "dspark.markov_w1.weight") return m->nm.ckpt("mtp.%d.markov_head.embed.weight", last);
+    if (d == "dspark.markov_w2.weight") return m->nm.ckpt("mtp.%d.markov_head.head.weight", last);
+    int l = -1, at = 0;
+    if (std::sscanf(declared, "blk.%d.%n", &l, &at) != 1 || at <= 0) return declared;
+    const char* suffix = declared + at;
+    for (const auto& e : layer_t)
+        if (std::strcmp(e.gguf, suffix) == 0)
+            return l < m->c.n_layer ? m->nm.ckpt("layers.%d.%s", l, e.rel)
+                                    : m->nm.ckpt("mtp.%d.%s", l - (int)m->c.n_layer, e.rel);
+    return declared;
+}
 
 static rad_op op(RadBuilder* b, const char* name, std::vector<RadParam> ps,
                  std::vector<rad_weight> ws, std::initializer_list<rad_buf> rd,
@@ -354,7 +481,7 @@ static rad_op op(RadBuilder* b, const char* name, std::vector<RadParam> ps,
 static rad_weight wt(RadBuilder* b, const char* name, uint32_t dt,
                      std::initializer_list<int64_t> shape, RadWeightGroup grp,
                      int access = RAD_ACCESS_PER_TOKEN) {
-    if (map_copy(b, name, name) != RAD_OK) return 0;
+    if (map_copy(b, name, ckpt_name(name)) != RAD_OK) return 0;
     return decl_w(b, name, dt, shape, access, RAD_SHARD_NONE, grp);
 }
 /* A weight split over the ranks: this rank's [lo, hi) of its split dimension (rows for
@@ -363,7 +490,7 @@ static rad_weight wt(RadBuilder* b, const char* name, uint32_t dt,
 static rad_weight wts(RadBuilder* b, const Geom& g, const char* name, uint32_t dt,
                       std::initializer_list<int64_t> shape, RadWeightGroup grp, int shard, int64_t lo,
                       int64_t hi, int access = RAD_ACCESS_PER_TOKEN) {
-    if (map_copy(b, name, name) != RAD_OK) return 0;
+    if (map_copy(b, name, ckpt_name(name)) != RAD_OK) return 0;
     const rad_weight w = decl_w(b, name, dt, shape, access, g.world > 1 ? shard : RAD_SHARD_NONE, grp);
     if (!w) {
         fprintf(stderr, "radiance: deepseek41: weight %s refused\n", name);
@@ -384,7 +511,7 @@ static rad_weight wts(RadBuilder* b, const Geom& g, const char* name, uint32_t d
 static rad_weight lw(RadBuilder* b, Model& m, const char* name, int64_t n, int64_t k,
                      RadWeightGroup grp, int shard = RAD_SHARD_NONE, int64_t lo = 0, int64_t hi = 0,
                      bool mapped = false, int access = RAD_ACCESS_PER_TOKEN) {
-    if (!mapped && map_copy(b, name, name) != RAD_OK) return 0;
+    if (!mapped && map_copy(b, name, ckpt_name(name)) != RAD_OK) return 0;
     RadEncoding e{};
     int64_t blk = 0;
     const char* ty = weight_enc(b, name, &e) ? ggml_type_of(e, &blk) : nullptr;
@@ -731,6 +858,29 @@ static rad_kvgroup full_group(RadBuilder* b, Model& m, const char* fmt, int64_t 
     return rad_decl_kv_group(b, m.nm.f(fmt, (long long)r), &d);
 }
 
+/* The routed FFN's checkpoint tensors at (absolute) layer `l`: a GGUF's stacks (ffn_gate_exps,
+ * ffn_up_exps, ffn_down_exps, each [n_expert, ...]), or the release's experts one by one
+ * (`<layer>.ffn.experts.<e>.w1/w3/w2`, gate/up/down as model.py's Expert names them). */
+static void moe_names(Model& m, int l, MoeFP8::Src* s) {
+    auto& nm = m.nm;
+    s->router = ckpt_name(nm.f("blk.%d.ffn_gate_inp.weight", l));
+    s->router_bias = ckpt_name(nm.f("blk.%d.exp_probs_b.bias", l));
+    s->shared_mlp_gate = ckpt_name(nm.f("blk.%d.ffn_gate_shexp.weight", l));
+    s->shared_mlp_up = ckpt_name(nm.f("blk.%d.ffn_up_shexp.weight", l));
+    s->shared_mlp_down = ckpt_name(nm.f("blk.%d.ffn_down_shexp.weight", l));
+    if (m.release) {
+        s->experts = l < m.c.n_layer ? nm.ckpt("layers.%d.ffn.experts", l)
+                                     : nm.ckpt("mtp.%d.ffn.experts", l - (int)m.c.n_layer);
+        s->expert_gate = "w1";
+        s->expert_up = "w3";
+        s->expert_down = "w2";
+        return;
+    }
+    s->experts_gate = nm.f("blk.%d.ffn_gate_exps.weight", l);
+    s->experts_up = nm.f("blk.%d.ffn_up_exps.weight", l);
+    s->experts_down = nm.f("blk.%d.ffn_down_exps.weight", l);
+}
+
 /* ------------------------------------------------------------------ one layer */
 static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
     auto& g = m.g;
@@ -751,12 +901,16 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
     const int pi = c.ple_index(l);
     if (pi >= 0) {
         const int64_t H = c.ple_heads;
+        /* The hash constants: GGUF metadata arrays (llama.cpp's converter computes them), or the
+         * release's, which the core derives from its config.json and tokenizer as
+         * inference/engram.py does at load (core/format/engram.h). One layout either way. */
+        const char* tab = m.release ? "engram." : "deepseek41.ple.";
         DS_TRY(map_rows(b, nm.f("blk.%d.engram_mult", l),
-                              { { "deepseek41.ple.layer_multipliers", (int)(pi * c.ngram), c.ngram } }));
+                        { { nm.ckpt("%slayer_multipliers", tab), (int)(pi * c.ngram), c.ngram } }));
         DS_TRY(map_rows(b, nm.f("blk.%d.engram_vsz", l),
-                              { { "deepseek41.ple.head_vocab_sizes", (int)(pi * H), H } }));
+                        { { nm.ckpt("%shead_vocab_sizes", tab), (int)(pi * H), H } }));
         DS_TRY(map_rows(b, nm.f("blk.%d.engram_off", l),
-                              { { "deepseek41.ple.head_offsets", (int)(pi * H), H } }));
+                        { { nm.ckpt("%shead_offsets", tab), (int)(pi * H), H } }));
         L.e_mult = decl_w(b, nm.f("blk.%d.engram_mult", l), RAD_I64, { c.ngram },
                           RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp);
         L.e_vsz = decl_w(b, nm.f("blk.%d.engram_vsz", l), RAD_I64, { H }, RAD_ACCESS_PER_TOKEN,
@@ -764,7 +918,16 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
         L.e_off = decl_w(b, nm.f("blk.%d.engram_off", l), RAD_I64, { H }, RAD_ACCESS_PER_TOKEN,
                          RAD_SHARD_NONE, grp);
         L.e_kv = lw(b, m, nm.f("blk.%d.engram_kv.weight", l), (c.hc + 1) * D, H * c.ple_dim, grp);
-        L.e_gate = w("blk.%d.engram_gate.weight", RAD_F32, { c.hc * D });
+        if (m.release) {
+            /* The release ships the gate as two factors, k_weight and q_weight, that the model only
+             * multiplies (model.py Engram): one gain, as llama.cpp's converter folds it. */
+            const char* gn = nm.f("blk.%d.engram_gate.weight", l);
+            DS_TRY(map_mul(b, gn, nm.ckpt("layers.%d.engram.q_weight", l),
+                           nm.ckpt("layers.%d.engram.k_weight", l)));
+            L.e_gate = decl_w(b, gn, RAD_F32, { c.hc * D }, RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp);
+        } else {
+            L.e_gate = w("blk.%d.engram_gate.weight", RAD_F32, { c.hc * D });
+        }
         if (!m.tok) {
             RadKVGroupDecl d{};
             d.kind = RAD_KV_CONV;
@@ -927,8 +1090,8 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
             L.comp_norm = w("blk.%d.attn_compressor_norm.weight", RAD_F32, { hd });
             if (r > 1) {
                 const char* cn = nm.f("blk.%d.attn_compressor_kvg.weight", l);
-                DS_TRY(map_concat(b, cn, { nm.f("blk.%d.attn_compressor_kv.weight", l),
-                                                 nm.f("blk.%d.attn_compressor_gate.weight", l) }));
+                DS_TRY(map_concat(b, cn, { ckpt_name(nm.f("blk.%d.attn_compressor_kv.weight", l)),
+                                           ckpt_name(nm.f("blk.%d.attn_compressor_gate.weight", l)) }));
                 L.comp_w = decl_w(b, cn, RAD_F32, { 2 * hd, D }, RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE,
                                   grp);
                 L.c_gemm = op(b, "gemm_nt_f32",
@@ -1047,7 +1210,7 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
         for (int j = 0; j < m.gr; ++j) {
             const int gi_ = (int)(m.ar * m.gr + j);
             const char* n = nm.f("blk.%d.attn_output_a.g%d.weight", l, gi_);
-            DS_TRY(map_rows(b, n, { { nm.f("blk.%d.attn_output_a.weight", l), (int)(gi_ * c.o_rank),
+            DS_TRY(map_rows(b, n, { { ckpt_name(nm.f("blk.%d.attn_output_a.weight", l)), (int)(gi_ * c.o_rank),
                                             c.o_rank } }));
             L.wo_a.push_back(lw(b, m, n, c.o_rank, gd, grp, RAD_SHARD_NONE, 0, 0, true));
             if (!L.wo_a.back()) return RAD_E_INVAL;
@@ -1083,14 +1246,7 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
     }
     MoeFP8::Src s;
     s.norm = nullptr;
-    s.router = nm.f("blk.%d.ffn_gate_inp.weight", l);
-    s.router_bias = nm.f("blk.%d.exp_probs_b.bias", l);
-    s.experts_gate = nm.f("blk.%d.ffn_gate_exps.weight", l);
-    s.experts_up = nm.f("blk.%d.ffn_up_exps.weight", l);
-    s.experts_down = nm.f("blk.%d.ffn_down_exps.weight", l);
-    s.shared_mlp_gate = nm.f("blk.%d.ffn_gate_shexp.weight", l);
-    s.shared_mlp_up = nm.f("blk.%d.ffn_up_shexp.weight", l);
-    s.shared_mlp_down = nm.f("blk.%d.ffn_down_shexp.weight", l);
+    moe_names(m, l, &s);
     s.cfg.n_expert_all = c.n_expert;
     s.cfg.n_expert = c.n_expert / g.world;
     s.cfg.expert_base = g.rank * s.cfg.n_expert;
@@ -1229,7 +1385,7 @@ static int dsp_stage_weights(RadBuilder* b, Model& m, Layer& L, int s) {
     for (int j = 0; j < m.gr; ++j) {
         const int gi_ = (int)(m.ar * m.gr + j);
         const char* n = nm.f("blk.%d.attn_output_a.g%d.weight", l, gi_);
-        DS_TRY(map_rows(b, n, { { nm.f("blk.%d.attn_output_a.weight", l), (int)(gi_ * c.o_rank), c.o_rank } }));
+        DS_TRY(map_rows(b, n, { { ckpt_name(nm.f("blk.%d.attn_output_a.weight", l)), (int)(gi_ * c.o_rank), c.o_rank } }));
         L.wo_a.push_back(lw(b, m, n, c.o_rank, gd, grp, RAD_SHARD_NONE, 0, 0, true));
         if (!L.wo_a.back()) return RAD_E_INVAL;
     }
@@ -1301,14 +1457,7 @@ static int dsp_stage_ops(RadBuilder* b, Model& m, Layer& L) {
     L.norm_f = rmsnorm(b, m, Q, L.ffn_norm, D, d.x, d.act.x);
     MoeFP8::Src s;
     s.norm = nullptr;
-    s.router = nm.f("blk.%d.ffn_gate_inp.weight", l);
-    s.router_bias = nm.f("blk.%d.exp_probs_b.bias", l);
-    s.experts_gate = nm.f("blk.%d.ffn_gate_exps.weight", l);
-    s.experts_up = nm.f("blk.%d.ffn_up_exps.weight", l);
-    s.experts_down = nm.f("blk.%d.ffn_down_exps.weight", l);
-    s.shared_mlp_gate = nm.f("blk.%d.ffn_gate_shexp.weight", l);
-    s.shared_mlp_up = nm.f("blk.%d.ffn_up_shexp.weight", l);
-    s.shared_mlp_down = nm.f("blk.%d.ffn_down_shexp.weight", l);
+    moe_names(m, l, &s);
     s.cfg.n_expert_all = d.n_expert;
     s.cfg.n_expert = d.ne_rank;
     s.cfg.expert_base = d.ne_base;
@@ -1570,6 +1719,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.nm = Names(ctx->scope);
     auto& nm = m.nm;
     DS_TRY(read_cfg(m.c, meta));
+    m.release = is_release(meta);
+    m.n_stage = (int)gi(meta, "nextn_predict_layers", 0);
+    naming = &m;
     DS_TRY(geometry(m, ctx));
     DS_TRY(dsp_config(b, m, meta, ctx));
     const auto& c = m.c;
@@ -1642,7 +1794,19 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
          * table (103 GiB in the 1017) is too large to relayout or copy; it stays on whatever tier
          * holds the container's bytes. */
         const char* tn = nm.f("per_layer_token_embd.weight");
-        DS_TRY(map_copy(b, tn, tn));
+        if (m.release) {
+            /* Every Engram layer's table, joined in layer order (the GGUF's one table). */
+            for (size_t i = 0; i < c.ple.size(); i += 8) {
+                std::vector<const char*> parts;
+                for (size_t k = i; k < c.ple.size() && k < i + 8; ++k)
+                    parts.push_back(nm.ckpt("layers.%lld.engram.embed.weight", (long long)c.ple[k]));
+                RadNameMap mp = map_base(tn, RAD_MAP_CONCAT);
+                for (const char* p : parts) mp.src[mp.n_src++] = p;
+                DS_TRY(rad_decl_name_map(b, &mp));
+            }
+        } else {
+            DS_TRY(map_copy(b, tn, tn));
+        }
         RadEncoding te{};
         const bool known = weight_enc(b, tn, &te);
         if (!known || (rad_enc_is(&te, "plain") && te.n_planes == 1)) {

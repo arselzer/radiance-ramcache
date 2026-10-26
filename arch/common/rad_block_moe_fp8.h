@@ -175,6 +175,9 @@ struct MoeFP8 {
         /* GLM routing (GlmRouter): sigmoid scores with a correction bias, top-k, `route_scale` on
          * the kept weights, which are then f32 in `ew`. */
         int     sigmoid_router = 0;
+        /* With `sigmoid_router`: the score function by name instead of the sigmoid
+         * (GlmRouter::Config::score, router_scored_topk); null keeps the sigmoid. */
+        const char* router_score = nullptr;
         /* With `sigmoid_router`: the selection, the scatter and an ungated shared arm's gate fill in
          * one launch (`router_sigmoid_topk_scatter`) wherever the pass fits the sort's one
          * workgroup; the separate ops otherwise. Byte-identical either way. */
@@ -762,6 +765,7 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         rc.rows = c.rows;
         rc.norm = c.norm_topk;
         rc.route_scale = c.route_scale;
+        rc.score = c.router_score;
         const GlmRouter::Wire wire{ w.h.x, w.logits, w.ids, w.ew };
         const GlmRouter::Src rs{ src.router, src.router_bias };
         RAD_ARCH_TRY(glm_router.declare(b, nm, g, l, nm.f("blk.%d.glm_router", l), rc, wire, rs));

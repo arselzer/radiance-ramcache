@@ -1514,6 +1514,440 @@ int embed_planes_body(const RadArgs* a, RadStream stream) {
                     xp, (int)E, (int)G, V, voff, mult, M);
 }
 
+/* ==================================================================== fused chains
+ * rmsnorm_rope_roundtrip  rmsnorm -> rope_rows -> quant_roundtrip   (a window or index key)
+ * rope_rows_roundtrip     rope_rows -> quant_roundtrip              (attention output, keys)
+ * mhc_collapse_rmsnorm    mhc_collapse -> rmsnorm                   (a sublayer's input)
+ * One launch each where a decode step issued two or three dependent ones. Byte-identical to the
+ * chain of rows (r4d_fuse.cpp declares it, rad-kbench's fusion oracle runs it): every step forms
+ * its values as its own row does and rounds where that row stores. The norm is rmsnorm_bf16's
+ * (r4d_model_bf16.hip rmsnorm_body): r4d_act_threads(M, n) threads a row, column i on thread
+ * i % width, the same block_sum, rsqrtf, product order and f32_to_bf16 (no NaN quieting there);
+ * rope_rows' pair expressions and quant_roundtrip's lane-group amax are the rows above. */
+
+constexpr uint32_t kFzWave = 32;
+// Columns a thread loads ahead per batch in the fused norms (rows of up to kFzCols * width stay in registers).
+constexpr int kFzCols = 4;
+
+// r4d_model_bf16.hip's block_sum: the wave butterfly, then the waves' sums in order from zero.
+template <uint32_t NW>
+__device__ __forceinline__ float fz_block_sum(float v, float* lds) {
+    v = r4d_wave_sum(v);
+    const uint32_t lane = threadIdx.x & (kFzWave - 1), wave = threadIdx.x / kFzWave;
+    if (lane == 0) lds[wave] = v;
+    __syncthreads();
+    float s = 0.0f;
+#pragma unroll
+    for (uint32_t w = 0; w < NW; ++w) s += lds[w];
+    return s;
+}
+
+// rope_rows' operands and geometry, as rope_rows_body passes them to rope_rows_kernel.
+struct FzRope {
+    const float* cs;
+    long cp, cst;
+    const int32_t* pos;
+    long ps, tab_rows;
+    int hd, half, off, pairs, gptj;
+    float sign;
+};
+
+// quant_group_kernel's step over a row held in `buf`: lane groups of B columns, `width` threads.
+template <int B>
+__device__ __forceinline__ void fz_quant_group(const uint16_t* buf, uint16_t* yr, int n,
+                                               uint32_t width, int fmt, int sc) {
+    for (int base = 0; base < n; base += (int)width) {
+        const int col = base + (int)threadIdx.x;
+        const bool in = col < n;
+        const float v = in ? ds_bf(buf[col]) : 0.0f;
+        float a = fabsf(v);
+        a = a == a ? a : 0.0f;
+        const float amax = r4d_xor_max<B>(a);
+        if (in) yr[col] = ds_bf16(roundtrip(v, block_scale(amax, fmt, sc), fmt));
+    }
+}
+
+// quant_serial_kernel's step: one thread a block.
+__device__ __forceinline__ void fz_quant_serial(const uint16_t* buf, uint16_t* yr, int n, int block,
+                                                uint32_t width, int fmt, int sc) {
+    for (int b = (int)threadIdx.x; b < n / block; b += (int)width) {
+        const uint16_t* p = buf + (long)b * block;
+        float amax = 0;
+        for (int i = 0; i < block; ++i) amax = ds_max(amax, fabsf(ds_bf(p[i])));
+        const float s = block_scale(amax, fmt, sc);
+        for (int i = 0; i < block; ++i) yr[(long)b * block + i] = ds_bf16(roundtrip(ds_bf(p[i]), s, fmt));
+    }
+}
+
+/* rmsnorm_rope_roundtrip: one workgroup a row (rmsnorm's grid and width); the row passes between
+ * the steps through LDS as the bf16 each step stores. */
+template <bool WF32, uint32_t THR>
+__global__ __launch_bounds__(THR) void norm_rope_rt_kernel(
+    const uint16_t* __restrict__ x, uint32_t x_ld, const void* __restrict__ w,
+    uint16_t* __restrict__ y, uint32_t y_ld, uint32_t n, float eps, float wadd, float mult,
+    uint32_t M, FzRope r, int block, int fmt, int sc) {
+    extern __shared__ uint16_t fz_row[];
+    __shared__ float lds[THR / kFzWave];
+    const uint32_t m = blockIdx.x;
+    if (m >= M) return;   // a row the launch added past the full-card cliff (r4d_cliff_rows)
+    const uint16_t* __restrict__ xr = x + (size_t)m * x_ld;
+
+    // rmsnorm_body's sums; the row and its gains are loaded a batch of kFzCols columns ahead, and
+    // stay in registers across the barrier when the row is one batch (n <= kFzCols * THR).
+    const bool one = n <= (uint32_t)kFzCols * THR;
+    float xv[kFzCols], gv[kFzCols];
+    float ss = 0.0f;
+#pragma unroll 1
+    for (uint32_t i0 = threadIdx.x; i0 < n; i0 += (uint32_t)kFzCols * THR) {
+        uint16_t xb[kFzCols];
+#pragma unroll
+        for (int c = 0; c < kFzCols; ++c) {
+            const uint32_t i = min(i0 + (uint32_t)c * THR, n - 1);
+            xb[c] = xr[i];
+            gv[c] = WF32 ? ((const float*)w)[i] : bf16_to_f32(((const uint16_t*)w)[i]);
+        }
+#pragma unroll
+        for (int c = 0; c < kFzCols; ++c) {
+            xv[c] = bf16_to_f32(xb[c]);
+            if (i0 + (uint32_t)c * THR < n) ss += xv[c] * xv[c];
+        }
+    }
+    ss = fz_block_sum<THR / kFzWave>(ss, lds);
+    const float s = rsqrtf(ss / (float)n + eps);
+    if (one) {
+#pragma unroll
+        for (int c = 0; c < kFzCols; ++c) {
+            const uint32_t i = threadIdx.x + (uint32_t)c * THR;
+            if (i < n) fz_row[i] = f32_to_bf16(xv[c] * s * (gv[c] + wadd) * mult);
+        }
+    } else {
+        for (uint32_t i = threadIdx.x; i < n; i += THR) {
+            const float g = WF32 ? ((const float*)w)[i] : bf16_to_f32(((const uint16_t*)w)[i]);
+            fz_row[i] = f32_to_bf16(bf16_to_f32(xr[i]) * s * (g + wadd) * mult);
+        }
+    }
+    __syncthreads();
+
+    const long p = r.pos[(long)m * r.ps];
+    if (p >= 0 && p < r.tab_rows)
+        for (int q = (int)threadIdx.x; q < r.pairs; q += (int)THR) {
+            const int hh = q / r.half, i = q - hh * r.half;
+            const long ia = (long)hh * r.hd + r.off + (r.gptj ? 2 * i : i);
+            const long ib = r.gptj ? ia + 1 : ia + r.half;
+            const float c = r.cs[p * r.cp + (long)i * r.cst];
+            const float sn = r.sign * r.cs[p * r.cp + (long)(r.half + i) * r.cst];
+            const float va = ds_bf(fz_row[ia]), vb = ds_bf(fz_row[ib]);
+            fz_row[ia] = ds_bf16(va * c - vb * sn);
+            fz_row[ib] = ds_bf16(va * sn + vb * c);
+        }
+    __syncthreads();
+
+    uint16_t* __restrict__ yr = y + (size_t)m * y_ld;
+    switch (block) {
+        case 1: fz_quant_group<1>(fz_row, yr, (int)n, THR, fmt, sc); break;
+        case 2: fz_quant_group<2>(fz_row, yr, (int)n, THR, fmt, sc); break;
+        case 4: fz_quant_group<4>(fz_row, yr, (int)n, THR, fmt, sc); break;
+        case 8: fz_quant_group<8>(fz_row, yr, (int)n, THR, fmt, sc); break;
+        case 16: fz_quant_group<16>(fz_row, yr, (int)n, THR, fmt, sc); break;
+        case 32: fz_quant_group<32>(fz_row, yr, (int)n, THR, fmt, sc); break;
+        default: fz_quant_serial(fz_row, yr, (int)n, block, THR, fmt, sc); break;
+    }
+}
+
+/* rope_rows_roundtrip, in place: quant_group_kernel's grid (a thread a column, rows over grid.y);
+ * a rotated column takes its gptj partner (the other lane of its even/odd pair, the same wave)
+ * by a shuffle, forms its half of rope_rows' pair and rounds it as rope_rows stores it. */
+template <int B>
+__global__ __launch_bounds__(256) void rope_rt_kernel(uint16_t* x, long xp, int n, long rows,
+                                                      FzRope r, int fmt, int sc) {
+    const int col = blockIdx.x * 256 + threadIdx.x;
+    const bool in = col < n;
+    const int hh = col / r.hd, d = col - hh * r.hd - r.off;
+    const bool rot = in && d >= 0 && d < 2 * r.half;
+    const int i = d >> 1;
+    const bool is_a = (d & 1) == 0;
+    for (long m = blockIdx.y; m < rows; m += gridDim.y) {
+        uint16_t* row = x + m * xp;
+        const uint32_t h = in ? (uint32_t)row[col] : 0u;
+        const uint32_t hp = (uint32_t)__shfl_xor((int)h, 1);
+        float v = ds_bf((uint16_t)h);
+        const long p = r.pos[m * r.ps];
+        if (rot && p >= 0 && p < r.tab_rows) {
+            const float c = r.cs[p * r.cp + (long)i * r.cst];
+            const float sn = r.sign * r.cs[p * r.cp + (long)(r.half + i) * r.cst];
+            const float va = is_a ? v : ds_bf((uint16_t)hp), vb = is_a ? ds_bf((uint16_t)hp) : v;
+            v = ds_bf(is_a ? ds_bf16(va * c - vb * sn) : ds_bf16(va * sn + vb * c));
+        }
+        float a = fabsf(v);
+        a = a == a ? a : 0.0f;
+        const float amax = r4d_xor_max<B>(a);
+        if (in) row[col] = ds_bf16(roundtrip(v, block_scale(amax, fmt, sc), fmt));
+    }
+}
+
+/* mhc_collapse_rmsnorm: rmsnorm's grid and width. A thread owns columns i = tid + k*THR (the norm's
+ * own split), collapses each (the streams from zero in order, collapse_kernel's sum), stores it and
+ * folds the stored bf16 into the sum of squares in that order. Loads go out a batch of kFzCols
+ * columns at a time (every stream and the gains, at clamped addresses) ahead of the arithmetic; when
+ * the row is one batch (n <= kFzCols * THR: DeepSeek-V4.1's decode rows) the collapsed values and
+ * gains stay in registers across the barrier, else the second pass re-reads what this thread stored
+ * (as add_rmsnorm_body), so no barrier between. HCM: streams loaded a column (4 or 8, hc <= HCM). */
+template <bool WF32, uint32_t THR, int HCM>
+__global__ __launch_bounds__(THR) void collapse_norm_kernel(
+    const uint16_t* __restrict__ h, long hp, const float* __restrict__ pre, long pp, long pst,
+    uint16_t* __restrict__ x, uint32_t x_ld, const void* __restrict__ w, uint16_t* __restrict__ y,
+    uint32_t y_ld, uint32_t n, int hc, float eps, float wadd, float mult, uint32_t M) {
+    __shared__ float lds[THR / kFzWave];
+    const uint32_t m = blockIdx.x;
+    if (m >= M) return;
+    const uint16_t* __restrict__ hr = h + (long)m * hp;
+    const float* __restrict__ pr = pre + (long)m * pp;
+    uint16_t* __restrict__ xr = x + (size_t)m * x_ld;
+    float pj[HCM];
+#pragma unroll
+    for (int j = 0; j < HCM; ++j) pj[j] = pr[(long)(j < hc ? j : hc - 1) * pst];
+    const bool one = n <= (uint32_t)kFzCols * THR;
+    float xv[kFzCols], gv[kFzCols];
+    float ss = 0.0f;
+#pragma unroll 1
+    for (uint32_t i0 = threadIdx.x; i0 < n; i0 += (uint32_t)kFzCols * THR) {
+        uint32_t hv[kFzCols][HCM];
+#pragma unroll
+        for (int c = 0; c < kFzCols; ++c) {
+            const uint32_t i = min(i0 + (uint32_t)c * THR, n - 1);
+#pragma unroll
+            for (int j = 0; j < HCM; ++j) hv[c][j] = hr[(long)(j < hc ? j : hc - 1) * n + i];
+            gv[c] = WF32 ? ((const float*)w)[i] : bf16_to_f32(((const uint16_t*)w)[i]);
+        }
+#pragma unroll
+        for (int c = 0; c < kFzCols; ++c) {
+            const uint32_t i = i0 + (uint32_t)c * THR;
+            float v = 0;
+#pragma unroll
+            for (int j = 0; j < HCM; ++j)
+                if (j < hc) v += pj[j] * ds_bf((uint16_t)hv[c][j]);
+            const uint16_t b = ds_bf16(v);
+            xv[c] = bf16_to_f32(b);
+            if (i < n) {
+                xr[i] = b;
+                ss += xv[c] * xv[c];
+            }
+        }
+    }
+    ss = fz_block_sum<THR / kFzWave>(ss, lds);
+    const float s = rsqrtf(ss / (float)n + eps);
+    uint16_t* __restrict__ yr = y + (size_t)m * y_ld;
+    if (one) {
+#pragma unroll
+        for (int c = 0; c < kFzCols; ++c) {
+            const uint32_t i = threadIdx.x + (uint32_t)c * THR;
+            if (i < n) yr[i] = f32_to_bf16(xv[c] * s * (gv[c] + wadd) * mult);
+        }
+        return;
+    }
+#pragma unroll 1
+    for (uint32_t i0 = threadIdx.x; i0 < n; i0 += (uint32_t)kFzCols * THR) {
+        uint16_t xb[kFzCols];
+#pragma unroll
+        for (int c = 0; c < kFzCols; ++c) {
+            const uint32_t i = min(i0 + (uint32_t)c * THR, n - 1);
+            xb[c] = xr[i];
+            gv[c] = WF32 ? ((const float*)w)[i] : bf16_to_f32(((const uint16_t*)w)[i]);
+        }
+#pragma unroll
+        for (int c = 0; c < kFzCols; ++c) {
+            const uint32_t i = i0 + (uint32_t)c * THR;
+            if (i < n) yr[i] = f32_to_bf16(bf16_to_f32(xb[c]) * s * (gv[c] + wadd) * mult);
+        }
+    }
+}
+
+// quant_rt_body's format and scale names.
+bool fz_quant_fmt(const RadArgs* a, int* fmt, int* sc) {
+    const char* fs = r4d_gets(a, "format");
+    const char* ss = r4d_gets(a, "scale");
+    if (!fs || !ss) return false;
+    if (!std::strcmp(fs, "fp8_e4m3")) *fmt = kFp8;
+    else if (!std::strcmp(fs, "fp4_e2m1")) *fmt = kFp4;
+    else return false;
+    if (!std::strcmp(ss, "ue8m0")) *sc = kUe8m0;
+    else if (!std::strcmp(ss, "e4m3") && *fmt == kFp4) *sc = kE4m3;
+    else if (!std::strcmp(ss, "f32") && *fmt == kFp8) *sc = kScaleF32;
+    else return false;
+    return true;
+}
+
+// rope_rows_body's checks over `x` [M, nh*hd] and its cos_sin / positions, into an FzRope.
+int fz_rope_args(const RadArgs* a, const RadTensor& x, const RadTensor& cs, const RadTensor& pos,
+                 long M, FzRope* r) {
+    const long nh = (long)r4d_geti_or(a, "n_head", 0), hd = (long)r4d_geti_or(a, "head_dim", 0);
+    const long rot = (long)r4d_geti_or(a, "rot", 0), off = (long)r4d_geti_or(a, "off", -1);
+    const long inv = (long)r4d_geti_or(a, "inverse", -1);
+    const char* mode = r4d_gets(a, "mode");
+    if (!mode) return RAD_E_UNSUPPORTED;
+    const bool gptj = !std::strcmp(mode, "gptj");
+    if (!gptj && std::strcmp(mode, "neox")) return RAD_E_UNSUPPORTED;
+    if (nh < 1 || hd < 2 || rot < 2 || (rot & 1) || off < 0 || off + rot > hd ||
+        (inv != 0 && inv != 1) || nh * hd > INT_MAX)
+        return RAD_E_SHAPE;
+    if (x.dtype != RAD_BF16 || cs.dtype != RAD_F32 || pos.dtype != RAD_I32) return RAD_E_DTYPE;
+    long ps;
+    if (!mat(x, RAD_BF16, M, nh * hd) || !cs.data || cs.rank != 2 || cs.shape[1] != rot ||
+        rad_tensor_numel(&pos) != M || !lin_step(pos, &ps))
+        return RAD_E_SHAPE;
+    r->cs = (const float*)cs.data;
+    r->cp = (long)cs.stride[0];
+    r->cst = (long)cs.stride[1];
+    r->pos = (const int32_t*)pos.data;
+    r->ps = ps;
+    r->tab_rows = (long)cs.shape[0];
+    r->hd = (int)hd;
+    r->half = (int)(rot / 2);
+    r->off = (int)off;
+    r->pairs = (int)(nh * (rot / 2));
+    r->gptj = gptj ? 1 : 0;
+    r->sign = inv ? -1.0f : 1.0f;
+    return RAD_OK;
+}
+
+// Most columns the fused norm holds in LDS (the row as bf16); the row's constraint says the same.
+constexpr long kFzMaxN = 16384;
+
+/* x [M, n] (rows as rmsnorm reads them), w, y [M, n], cos_sin, positions. */
+int norm_rope_rt_body(const RadArgs* a, RadStream stream) {
+    if (!a || a->n_t < 5) return RAD_E_INVAL;
+    const RadTensor &x = a->t[0], &w = a->t[1], &y = a->t[2], &cs = a->t[3], &pos = a->t[4];
+    if (!x.data || !w.data || !y.data || !cs.data || !pos.data) return R4D_NO(RAD_E_INVAL);
+    if (x.dtype != RAD_BF16 || y.dtype != RAD_BF16) return R4D_NO(RAD_E_DTYPE);
+    if (!r4d_contig(&w)) return R4D_NO(RAD_E_STRIDE);
+    if (w.dtype != RAD_F32 && w.dtype != RAD_BF16) return R4D_NO(RAD_E_DTYPE);
+    const long long n = r4d_geti_or(a, "n", 0);
+    if (n <= 0 || n > kFzMaxN || r4d_numel(&w) < n) return R4D_NO(RAD_E_SHAPE);
+    long long M = 0;
+    const long long x_ld = r4d_rows_pitch(&x, n, &M);
+    if (x_ld < 0) return R4D_NO(RAD_E_STRIDE);
+    if (M <= 0 || M > INT_MAX) return R4D_NO(RAD_E_SHAPE);
+    FzRope r;
+    const int rc = fz_rope_args(a, y, cs, pos, (long)M, &r);
+    if (rc != RAD_OK) return R4D_NO(rc);
+    if ((long long)r.hd * (r.pairs / r.half) != n) return R4D_NO(RAD_E_SHAPE);
+    const long long block = r4d_geti_or(a, "block", 0);
+    int fmt, sc;
+    if (!fz_quant_fmt(a, &fmt, &sc)) return R4D_NO(RAD_E_UNSUPPORTED);
+    if (block < 1 || n % block) return R4D_NO(RAD_E_SHAPE);
+    const float eps = (float)r4d_getf(a, "eps", 1e-6), wadd = (float)r4d_getf(a, "wadd", 0.0);
+    const float mult = (float)r4d_getf(a, "mult", 1.0);
+    const int thr = r4d_act_threads((int)M, (int)n);
+    const uint32_t lds = (uint32_t)(n * sizeof(uint16_t));
+#define FZ_NRQ(WF, T)                                                                             \
+    R4D_EMIT(stream, (norm_rope_rt_kernel<WF, T>), dim3(r4d_cliff_rows((uint32_t)M, 1, T / kFzWave)), \
+             dim3(T), lds, (const uint16_t*)x.data, (uint32_t)x_ld, (const void*)w.data,          \
+             (uint16_t*)y.data, (uint32_t)y.stride[0], (uint32_t)n, eps, wadd, mult, (uint32_t)M, \
+             r, (int)block, fmt, sc)
+#define FZ_NRQ_W(WF)                                                                              \
+    return thr == 1024 ? FZ_NRQ(WF, 1024) : thr == 512 ? FZ_NRQ(WF, 512) : FZ_NRQ(WF, 256)
+    if (w.dtype == RAD_F32) FZ_NRQ_W(true);
+    FZ_NRQ_W(false);
+#undef FZ_NRQ_W
+#undef FZ_NRQ
+}
+
+/* x [M, n_head*head_dim] in place, cos_sin, positions. The lane-group form needs a gptj pair on
+ * one wave's even/odd lanes (head_dim and off even, the row's constraints) and a power-of-two block
+ * up to 32; any other geometry runs rope_rows then quant_roundtrip as two launches, the same bits. */
+int rope_rt_body(const RadArgs* a, RadStream stream) {
+    if (!a || a->n_t < 3 || !a->t[0].data || !a->t[1].data || !a->t[2].data) return RAD_E_INVAL;
+    const RadTensor &x = a->t[0], &cs = a->t[1], &pos = a->t[2];
+    if (x.rank != 2 || x.shape[0] < 1) return R4D_NO(RAD_E_SHAPE);
+    const long M = (long)x.shape[0];
+    FzRope r;
+    const int rc = fz_rope_args(a, x, cs, pos, M, &r);
+    if (rc != RAD_OK) return R4D_NO(rc);
+    const long n = (long)r.hd * (r.pairs / r.half);
+    const long block = (long)r4d_geti_or(a, "block", 0);
+    int fmt, sc;
+    if (!fz_quant_fmt(a, &fmt, &sc)) return R4D_NO(RAD_E_UNSUPPORTED);
+    if (block < 1 || n % block) return R4D_NO(RAD_E_SHAPE);
+    const bool lanes = r.gptj && !(r.hd & 1) && !(r.off & 1) &&
+                       (block == 1 || block == 2 || block == 4 || block == 8 || block == 16 ||
+                        block == 32);
+    if (!lanes) {
+        const int rr = rope_rows_body(a, stream);
+        if (rr != RAD_OK) return rr;
+        RadParam pp[24];
+        if (a->n_p > 23) return R4D_NO(RAD_E_INVAL);
+        std::memcpy(pp, a->p, sizeof(RadParam) * (size_t)a->n_p);
+        RadParam& pn = pp[a->n_p];
+        std::memset(&pn, 0, sizeof pn);
+        pn.key = "n";
+        pn.kind = RAD_P_INT;
+        pn.ival = n;
+        RadArgs q = *a;
+        q.p = pp;
+        q.n_p = a->n_p + 1;
+        return quant_rt_body(&q, stream);
+    }
+    const dim3 grid((unsigned)((n + 255) / 256), grid_rows(M));
+    uint16_t* xd = (uint16_t*)x.data;
+    const long xp = (long)x.stride[0];
+#define FZ_RRT(B)                                                                                  \
+    case B:                                                                                        \
+        return R4D_EMIT(stream, rope_rt_kernel<B>, grid, dim3(256), 0, xd, xp, (int)n, M, r, fmt, sc)
+    switch (block) {
+        FZ_RRT(1);
+        FZ_RRT(2);
+        FZ_RRT(4);
+        FZ_RRT(8);
+        FZ_RRT(16);
+        FZ_RRT(32);
+        default: break;
+    }
+#undef FZ_RRT
+    return R4D_NO(RAD_E_SHAPE);
+}
+
+/* h [M, hc*n], pre [M, hc] f32, x [M, n] (the collapsed row, stored), w, y (rows as rmsnorm). */
+int collapse_norm_body(const RadArgs* a, RadStream stream) {
+    if (!a || a->n_t < 5) return RAD_E_INVAL;
+    const long n = (long)r4d_geti_or(a, "n", 0), hc = (long)r4d_geti_or(a, "hc", 0);
+    if (n <= 0 || hc < 2 || hc > 8 || hc * n > INT_MAX) return R4D_NO(RAD_E_SHAPE);
+    const RadTensor &h = a->t[0], &pre = a->t[1], &x = a->t[2], &w = a->t[3], &y = a->t[4];
+    if (!w.data || !y.data) return R4D_NO(RAD_E_INVAL);
+    if (h.rank != 2 || h.shape[0] < 1) return R4D_NO(RAD_E_SHAPE);
+    const long rows = h.shape[0];
+    if (h.dtype != RAD_BF16 || pre.dtype != RAD_F32 || x.dtype != RAD_BF16 || y.dtype != RAD_BF16)
+        return R4D_NO(RAD_E_DTYPE);
+    if (!mat(h, RAD_BF16, rows, hc * n) || !mat_s(pre, RAD_F32, rows, hc) ||
+        !mat(x, RAD_BF16, rows, n))
+        return R4D_NO(RAD_E_SHAPE);
+    if (!r4d_contig(&w)) return R4D_NO(RAD_E_STRIDE);
+    if (w.dtype != RAD_F32 && w.dtype != RAD_BF16) return R4D_NO(RAD_E_DTYPE);
+    if (r4d_numel(&w) < n) return R4D_NO(RAD_E_SHAPE);
+    long long My = 0;
+    const long long y_ld = r4d_rows_pitch(&y, n, &My);
+    if (y_ld < 0) return R4D_NO(RAD_E_STRIDE);
+    if (My < rows || rows > INT_MAX) return R4D_NO(RAD_E_SHAPE);
+    const float eps = (float)r4d_getf(a, "eps", 1e-6), wadd = (float)r4d_getf(a, "wadd", 0.0);
+    const float mult = (float)r4d_getf(a, "mult", 1.0);
+    const int thr = r4d_act_threads((int)rows, (int)n);
+#define FZ_CN(WF, T, HM)                                                                           \
+    R4D_EMIT(stream, (collapse_norm_kernel<WF, T, HM>),                                            \
+             dim3(r4d_cliff_rows((uint32_t)rows, 1, T / kFzWave)), dim3(T), 0,                     \
+             (const uint16_t*)h.data, (long)h.stride[0], (const float*)pre.data,                   \
+             (long)pre.stride[0], (long)pre.stride[1], (uint16_t*)x.data, (uint32_t)x.stride[0],   \
+             (const void*)w.data, (uint16_t*)y.data, (uint32_t)y_ld, (uint32_t)n, (int)hc, eps,    \
+             wadd, mult, (uint32_t)rows)
+#define FZ_CN_T(WF, HM)                                                                            \
+    return thr == 1024 ? FZ_CN(WF, 1024, HM) : thr == 512 ? FZ_CN(WF, 512, HM) : FZ_CN(WF, 256, HM)
+#define FZ_CN_W(WF)                                                                                \
+    do { if (hc <= 4) FZ_CN_T(WF, 4); FZ_CN_T(WF, 8); } while (0)
+    if (w.dtype == RAD_F32) FZ_CN_W(true);
+    FZ_CN_W(false);
+#undef FZ_CN_W
+#undef FZ_CN_T
+#undef FZ_CN
+}
+
 }  // namespace
 
 extern "C" int r4d_rad_token_map(const RadArgs* a, RadStream s) { return token_map_body(a, s); }
@@ -1542,4 +1976,13 @@ extern "C" int r4d_rad_router_scored_topk(const RadArgs* a, RadStream s) {
 }
 extern "C" int r4d_rad_embed_lookup_planes(const RadArgs* a, RadStream s) {
     return embed_planes_body(a, s);
+}
+extern "C" int r4d_rad_rmsnorm_rope_roundtrip(const RadArgs* a, RadStream s) {
+    return norm_rope_rt_body(a, s);
+}
+extern "C" int r4d_rad_rope_rows_roundtrip(const RadArgs* a, RadStream s) {
+    return rope_rt_body(a, s);
+}
+extern "C" int r4d_rad_mhc_collapse_rmsnorm(const RadArgs* a, RadStream s) {
+    return collapse_norm_body(a, s);
 }

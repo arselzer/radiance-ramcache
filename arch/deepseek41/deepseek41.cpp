@@ -234,6 +234,10 @@ struct Layer {
     rad_op i_q = 0, i_rope = 0, i_qq = 0, i_w = 0, i_score = 0, i_cand = 0, i_topk = 0;
     rad_op attn = 0, o_rope = 0, o_q = 0, o_b = 0, post_a = 0, attn_fill = 0, ar_attn = 0;
     std::vector<rad_op> o_a;
+    /* The fused chains (fused()), each 0 where its chain above is declared instead: kv_n + kv_rope
+     * + kv_q, k_norm + k_rope + k_q, o_rope + o_q, l_rope + l_q, i_rope + i_qq, col_a + norm_a,
+     * col_f + norm_f. */
+    rad_op kv_f = 0, k_f = 0, o_f = 0, l_f = 0, i_f = 0, cn_a = 0, cn_f = 0;
     rad_weight ffn_norm = 0;
     rad_op mix_f = 0, col_f = 0, norm_f = 0, post_f = 0;
     MoeFP8 moe{};
@@ -327,6 +331,7 @@ struct Model {
     int64_t ple_group = 0;
     rad_op embed = 0, expand = 0, pre0 = 0, pre1 = 0, rope_a = 0, rope_b_step = 0, tok_map = 0;
     rad_op contract = 0, fnorm = 0, gather = 0, head_op = 0, embed_ar = 0;
+    rad_op cn_fin = 0;   /* contract + fnorm fused (fused()), or 0 */
     Dsp dsp{};
 };
 static std::unique_ptr<Model> models[MAX_RANKS];
@@ -446,6 +451,65 @@ static rad_op entry_store(RadBuilder* b, int64_t rows, int64_t n, int64_t bs, ra
               { RAD_RANGE("M", 1, rows), RAD_INT("n", n), RAD_INT("block_size", bs),
                 RAD_STR("dtype", "bf16") },
               {}, { x, page }, {});
+}
+
+/* ---- fused chains (docs/OPS.md rmsnorm_rope_roundtrip, rope_rows_roundtrip,
+ * mhc_collapse_rmsnorm): one launch for a chain of two or three dependent ops on the same rows,
+ * the same bytes as the chain (a kernel library's `replaces`). A decode step pays a fixed cost per
+ * dependent launch, so this is most of what the small ops cost there. They are device-only (libr4d
+ * declares them; libref has no row): each declares the fused op only where a loaded library
+ * declares and serves it, and returns 0 otherwise, and the caller then declares the chain.
+ * Switches for A/B, default on:
+ * RADIANCE_DS41_FUSE=0 all, RADIANCE_DS41_FUSE_KEY=0 the window and index keys' norm + rope + round
+ * trip, RADIANCE_DS41_FUSE_ROPE=0 rope + round trip (attention output, compressed latent, index
+ * query), RADIANCE_DS41_FUSE_COLLAPSE=0 the sublayer inputs' collapse + norm. */
+static bool fuse_on(const char* env) {
+    const char* a = std::getenv("RADIANCE_DS41_FUSE");
+    const char* e = std::getenv(env);
+    return !(a && a[0] == '0') && !(e && e[0] == '0');
+}
+static rad_op fused(RadBuilder* b, const char* name, std::vector<RadParam> ps,
+                    std::vector<rad_weight> ws, std::initializer_list<rad_buf> rd,
+                    std::initializer_list<rad_buf> wr) {
+    if (!rad_op_declared(b, name)) return 0;
+    const rad_op h = rad_decl_op(b, name, ps.data(), (int)ps.size(),
+                                 ws.empty() ? nullptr : ws.data(), (int)ws.size());
+    if (!h || !rad_op_resolved(b, h)) return 0;
+    return rw(b, h, rd, wr);
+}
+/* rmsnorm (x, w -> y) then rope_rows and roundtrip over y, as one op: one head of n columns. */
+static rad_op norm_rope_rt(RadBuilder* b, const Model& m, int64_t rows, rad_weight w, int64_t n,
+                           int64_t block, const char* fmt, const char* scale, rad_buf x, rad_buf y,
+                           rad_buf cs) {
+    if (debug_noq() || !fuse_on("RADIANCE_DS41_FUSE_KEY")) return 0;
+    return fused(b, "rmsnorm_rope_roundtrip",
+                 { RAD_RANGE("M", 1, rows), RAD_INT("n", n), RAD_F64("eps", m.c.eps),
+                   RAD_INT("n_head", 1), RAD_INT("head_dim", n), RAD_INT("rot", m.c.rope),
+                   RAD_INT("off", n - m.c.rope), RAD_STR("mode", "gptj"), RAD_INT("inverse", 0),
+                   RAD_INT("block", block), RAD_STR("format", fmt), RAD_STR("scale", scale),
+                   RAD_STR("dtype", "bf16") },
+                 { w }, { x, cs }, { y });
+}
+/* rope_rows then roundtrip over all heads * hd columns of x, in place, as one op. */
+static rad_op rope_rt(RadBuilder* b, const Model& m, int64_t rows, int64_t heads, int64_t hd,
+                      int inverse, int64_t block, const char* fmt, const char* scale, rad_buf x,
+                      rad_buf cs) {
+    if (debug_noq() || !fuse_on("RADIANCE_DS41_FUSE_ROPE")) return 0;
+    return fused(b, "rope_rows_roundtrip",
+                 { RAD_RANGE("M", 1, rows), RAD_INT("n_head", heads), RAD_INT("head_dim", hd),
+                   RAD_INT("rot", m.c.rope), RAD_INT("off", hd - m.c.rope), RAD_STR("mode", "gptj"),
+                   RAD_INT("inverse", inverse), RAD_INT("block", block), RAD_STR("format", fmt),
+                   RAD_STR("scale", scale), RAD_STR("dtype", "bf16") },
+                 {}, { x, cs }, { x });
+}
+/* mhc_collapse (h, pre -> x) then rmsnorm (x, w -> y), as one op. */
+static rad_op collapse_norm(RadBuilder* b, const Model& m, int64_t rows, rad_weight w, rad_buf h,
+                            rad_buf pre, rad_buf x, rad_buf y) {
+    if (!fuse_on("RADIANCE_DS41_FUSE_COLLAPSE")) return 0;
+    return fused(b, "mhc_collapse_rmsnorm",
+                 { RAD_RANGE("M", 1, rows), RAD_INT("n", m.c.n_embd), RAD_INT("hc", m.c.hc),
+                   RAD_F64("eps", m.c.eps), RAD_STR("dtype", "bf16") },
+                 { w }, { h, pre }, { x, y });
 }
 
 static int geometry(Model& m, const RadBuildCtx* ctx) {
@@ -729,7 +793,11 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
                                         RAD_STR("dtype", "bf16") };
     L.mix_a = op(b, "mhc_mix", mixp, { L.hc_a_fn, L.hc_a_scale, L.hc_a_base }, { m.h0 },
                  { m.pre_a, m.post, m.comb });
-    L.col_a = op(b, "mhc_collapse", hcp, {}, { m.h0, m.pre_f }, { m.xcol });
+    if (!m.zero) {
+        L.attn_norm = w("blk.%d.attn_norm.weight", RAD_F32, { D });
+        L.cn_a = collapse_norm(b, m, T, L.attn_norm, m.h0, m.pre_f, m.xcol, m.xn);
+    }
+    if (!L.cn_a) L.col_a = op(b, "mhc_collapse", hcp, {}, { m.h0, m.pre_f }, { m.xcol });
     if (m.zero) {
         /* Attention-zero (Geom::attn_world): no heads on this rank. Its caches are declared and
          * bound as on an attention rank, the weightless stores that fix their block sizes declared
@@ -767,8 +835,7 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
                                       RAD_F64("value", 0.0) },
                          {}, {}, { m.attn_out });
     } else {
-        L.attn_norm = w("blk.%d.attn_norm.weight", RAD_F32, { D });
-        L.norm_a = rmsnorm(b, m, T, L.attn_norm, D, m.xcol, m.xn);
+        if (!L.cn_a) L.norm_a = rmsnorm(b, m, T, L.attn_norm, D, m.xcol, m.xn);
 
         /* ---- attention: the query, the window key */
         L.wq_a = lw(b, m, nm.f("blk.%d.attn_q_a.weight", l), c.q_lora, D, grp);
@@ -783,9 +850,12 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
         L.wkv = lw(b, m, nm.f("blk.%d.attn_kv.weight", l), hd, D, grp);
         L.kv_norm = w("blk.%d.attn_kv_a_norm.weight", RAD_F32, { hd });
         L.kv_g = linear(b, m, T, L.wkv, hd, D, m.xn, m.kv);
-        L.kv_n = rmsnorm(b, m, T, L.kv_norm, hd, m.kv, m.kvn);
-        L.kv_rope = rope_rows(b, m, T, 1, hd, 0, m.kvn, cs);
-        L.kv_q = roundtrip(b, T, hd, 32, "fp8_e4m3", "ue8m0", m.kvn);
+        L.kv_f = norm_rope_rt(b, m, T, L.kv_norm, hd, 32, "fp8_e4m3", "ue8m0", m.kv, m.kvn, cs);
+        if (!L.kv_f) {
+            L.kv_n = rmsnorm(b, m, T, L.kv_norm, hd, m.kv, m.kvn);
+            L.kv_rope = rope_rows(b, m, T, 1, hd, 0, m.kvn, cs);
+            L.kv_q = roundtrip(b, T, hd, 32, "fp8_e4m3", "ue8m0", m.kvn);
+        }
         if (!m.win && !(m.win = win_group(b, m))) return RAD_E_INVAL;
         L.kv_st = op(b, "kv_store",
                      { RAD_RANGE("M", 1, T), RAD_INT("head_dim", hd / 2), RAD_INT("n_head_kv", 1),
@@ -841,15 +911,22 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
             L.ik_w = lw(b, m, nm.f("blk.%d.indexer.attn_k.weight", l), c.idim, hd, grp);
             L.ik_norm = w("blk.%d.indexer.k_norm.weight", RAD_F32, { c.idim });
             L.k_gemm = linear(b, m, rows, L.ik_w, c.idim, hd, m.lat, m.ik);
-            L.k_norm = rmsnorm(b, m, rows, L.ik_norm, c.idim, m.ik, m.ikn);
-            L.k_rope = rope_rows(b, m, rows, 1, c.idim, 0, m.ikn, m.cs_b);
-            L.k_q = roundtrip(b, rows, c.idim, 32, "fp4_e2m1", "ue8m0", m.ikn);
+            L.k_f = norm_rope_rt(b, m, rows, L.ik_norm, c.idim, 32, "fp4_e2m1", "ue8m0", m.ik, m.ikn,
+                                 m.cs_b);
+            if (!L.k_f) {
+                L.k_norm = rmsnorm(b, m, rows, L.ik_norm, c.idim, m.ik, m.ikn);
+                L.k_rope = rope_rows(b, m, rows, 1, c.idim, 0, m.ikn, m.cs_b);
+                L.k_q = roundtrip(b, rows, c.idim, 32, "fp4_e2m1", "ue8m0", m.ikn);
+            }
             if (!m.index.count(r) && !(m.index[r] = full_group(b, m, "kv_index_r%lld", c.idim, r))) return RAD_E_INVAL;
             L.k_st = entry_store(b, rows, c.idim, r, m.ikn, m.page);
             if (rad_kv_block_size(b, m.index[r]) != r) return RAD_E_INVAL;
             DS_TRY(rad_bind_layer_kv(b, l, m.index[r]));
-            L.l_rope = rope_rows(b, m, rows, 1, hd, 0, m.lat, m.cs_b);
-            L.l_q = roundtrip(b, rows, hd, 16, "fp4_e2m1", "e4m3", m.lat);
+            L.l_f = rope_rt(b, m, rows, 1, hd, 0, 16, "fp4_e2m1", "e4m3", m.lat, m.cs_b);
+            if (!L.l_f) {
+                L.l_rope = rope_rows(b, m, rows, 1, hd, 0, m.lat, m.cs_b);
+                L.l_q = roundtrip(b, rows, hd, 16, "fp4_e2m1", "e4m3", m.lat);
+            }
             if (!m.comp.count(r) && !(m.comp[r] = full_group(b, m, "kv_compressed_r%lld", hd, r))) return RAD_E_INVAL;
             L.l_st = entry_store(b, rows, hd, r, m.lat, m.page);
             if (rad_kv_block_size(b, m.comp[r]) != r) return RAD_E_INVAL;
@@ -867,8 +944,11 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
             L.iq_w = lw(b, m, nm.f("blk.%d.indexer.attn_q_b.weight", l), c.ih * c.idim, c.q_lora, grp);
             L.iproj = lw(b, m, nm.f("blk.%d.indexer.proj.weight", l), c.ih, D, grp);
             L.i_q = linear(b, m, T, L.iq_w, c.ih * c.idim, c.q_lora, m.qrn, m.iq);
-            L.i_rope = rope_rows(b, m, T, c.ih, c.idim, 0, m.iq, m.cs_b);
-            L.i_qq = roundtrip(b, T, c.ih * c.idim, 32, "fp4_e2m1", "ue8m0", m.iq);
+            L.i_f = rope_rt(b, m, T, c.ih, c.idim, 0, 32, "fp4_e2m1", "ue8m0", m.iq, m.cs_b);
+            if (!L.i_f) {
+                L.i_rope = rope_rows(b, m, T, c.ih, c.idim, 0, m.iq, m.cs_b);
+                L.i_qq = roundtrip(b, T, c.ih * c.idim, 32, "fp4_e2m1", "ue8m0", m.iq);
+            }
             L.i_w = linear(b, m, T, L.iproj, c.ih, D, m.xn, m.iw);
             const int64_t width = g.max_ctx / r + 1;
             L.i_score = op(b, "index_score",
@@ -904,8 +984,11 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
                     r > 0 ? std::initializer_list<rad_buf>{ m.q, m.sel }
                           : std::initializer_list<rad_buf>{ m.q },
                     { m.o });
-        L.o_rope = rope_rows(b, m, T, g.n_head, hd, 1, m.o, cs);
-        L.o_q = roundtrip(b, T, HD, 32, "fp8_e4m3", "ue8m0", m.o);
+        L.o_f = rope_rt(b, m, T, g.n_head, hd, 1, 32, "fp8_e4m3", "ue8m0", m.o, cs);
+        if (!L.o_f) {
+            L.o_rope = rope_rows(b, m, T, g.n_head, hd, 1, m.o, cs);
+            L.o_q = roundtrip(b, T, HD, 32, "fp8_e4m3", "ue8m0", m.o);
+        }
         /* This rank's output groups, each a block of the block-diagonal wo_a. */
         const int64_t gd = HD / m.gr;
         for (int j = 0; j < m.gr; ++j) {
@@ -937,9 +1020,12 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
     L.hc_f_base = w("blk.%d.hc_ffn_base.weight", RAD_F32, { mix });
     L.mix_f = op(b, "mhc_mix", mixp, { L.hc_f_fn, L.hc_f_scale, L.hc_f_base }, { m.h1 },
                  { m.pre_f, m.post, m.comb });
-    L.col_f = op(b, "mhc_collapse", hcp, {}, { m.h1, m.pre_a }, { m.xcol });
     L.ffn_norm = w("blk.%d.ffn_norm.weight", RAD_F32, { D });
-    L.norm_f = rmsnorm(b, m, T, L.ffn_norm, D, m.xcol, m.act.x);
+    L.cn_f = collapse_norm(b, m, T, L.ffn_norm, m.h1, m.pre_a, m.xcol, m.act.x);
+    if (!L.cn_f) {
+        L.col_f = op(b, "mhc_collapse", hcp, {}, { m.h1, m.pre_a }, { m.xcol });
+        L.norm_f = rmsnorm(b, m, T, L.ffn_norm, D, m.xcol, m.act.x);
+    }
     MoeFP8::Src s;
     s.norm = nullptr;
     s.router = nm.f("blk.%d.ffn_gate_inp.weight", l);
@@ -1534,10 +1620,13 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     }
     m.layers.resize((size_t)c.n_layer);
     for (int l = 0; l < c.n_layer; ++l) DS_TRY(layer(b, m, m.layers[(size_t)l], l));
-    m.contract = op(b, "mhc_collapse",
-                    { RAD_RANGE("M", 1, T), RAD_INT("n", D), RAD_INT("hc", c.hc), RAD_STR("dtype", "bf16") },
-                    {}, { m.h0, m.pre_f }, { m.xcol });
-    m.fnorm = rmsnorm(b, m, T, m.final_gain, D, m.xcol, m.final_hidden);
+    m.cn_fin = collapse_norm(b, m, T, m.final_gain, m.h0, m.pre_f, m.xcol, m.final_hidden);
+    if (!m.cn_fin) {
+        m.contract = op(b, "mhc_collapse",
+                        { RAD_RANGE("M", 1, T), RAD_INT("n", D), RAD_INT("hc", c.hc), RAD_STR("dtype", "bf16") },
+                        {}, { m.h0, m.pre_f }, { m.xcol });
+        m.fnorm = rmsnorm(b, m, T, m.final_gain, D, m.xcol, m.final_hidden);
+    }
     m.gather = op(b, "gather_rows",
                   { RAD_RANGE("M", 1, g.max_logit_rows), RAD_INT("n", D), RAD_STR("dtype", "bf16") },
                   {}, { m.final_hidden }, { m.logit_input });
@@ -1772,16 +1861,26 @@ static void step(RadCtx* x, const RadBatch* batch) {
         if (L.tap) RAD_ISSUE_N(x, L.tap, T, brows(m.h0, T), bcol(m.dsp.src, L.tap_col * D, D, T));
         RAD_ISSUE_N(x, L.mix_a, T, brows(m.h0, T), RAD_W(L.hc_a_fn), RAD_W(L.hc_a_scale),
                     RAD_W(L.hc_a_base), brows(m.pre_a, T), brows(m.post, T), brows(m.comb, T));
-        RAD_ISSUE_N(x, L.col_a, T, brows(m.h0, T), brows(m.pre_f, T), brows(m.xcol, T));
+        if (L.cn_a)
+            RAD_ISSUE_N(x, L.cn_a, T, brows(m.h0, T), brows(m.pre_f, T), brows(m.xcol, T),
+                        RAD_W(L.attn_norm), brows(m.xn, T));
+        else
+            RAD_ISSUE_N(x, L.col_a, T, brows(m.h0, T), brows(m.pre_f, T), brows(m.xcol, T));
         if (m.zero) {
             RAD_ISSUE_N(x, L.attn_fill, T, brows(m.attn_out, T));
         } else {
-            RAD_ISSUE_N(x, L.norm_a, T, brows(m.xcol, T), RAD_W(L.attn_norm), brows(m.xn, T));
+            if (!L.cn_a)
+                RAD_ISSUE_N(x, L.norm_a, T, brows(m.xcol, T), RAD_W(L.attn_norm), brows(m.xn, T));
             const rad_buf cs = r > 0 ? m.cs_b : m.cs_a;
             /* The query and key chains share only xn. Issued alternately, each op's predecessor
              * is in the other chain, so a recorded pass can leave it unordered behind it (the
              * tape's hazard check) and the two chains' dispatches overlap; one after the other,
              * every op but kv_g waits for the one before. Same kernels on the same operands. */
+            /* The window key's norm, rope and round trip as one op (kv_f), where declared. */
+            const auto issue_kv_f = [&] {
+                RAD_ISSUE_N(x, L.kv_f, T, brows(m.kv, T), RAD_W(L.kv_norm), brows(m.kvn, T),
+                            brows(cs, g.max_ctx), pos);
+            };
             static const bool ilv = [] {
                 const char* e = std::getenv("RADIANCE_DS41_QKV_INTERLEAVE");
                 return !(e && e[0] == '0');
@@ -1790,9 +1889,10 @@ static void step(RadCtx* x, const RadBatch* batch) {
                 RAD_ISSUE_N(x, L.q_a, T, brows(m.xn, T), RAD_W(L.wq_a), brows(m.qr, T));
                 RAD_ISSUE_N(x, L.kv_g, T, brows(m.xn, T), RAD_W(L.wkv), brows(m.kv, T));
                 RAD_ISSUE_N(x, L.q_an, T, brows(m.qr, T), RAD_W(L.q_norm), brows(m.qrn, T));
-                RAD_ISSUE_N(x, L.kv_n, T, brows(m.kv, T), RAD_W(L.kv_norm), brows(m.kvn, T));
+                if (L.kv_f) issue_kv_f();
+                else RAD_ISSUE_N(x, L.kv_n, T, brows(m.kv, T), RAD_W(L.kv_norm), brows(m.kvn, T));
                 RAD_ISSUE_N(x, L.q_b, T, brows(m.qrn, T), RAD_W(L.wq_b), brows(m.q, T));
-                RAD_ISSUE_N(x, L.kv_rope, T, brows(m.kvn, T), brows(cs, g.max_ctx), pos);
+                if (!L.kv_f) RAD_ISSUE_N(x, L.kv_rope, T, brows(m.kvn, T), brows(cs, g.max_ctx), pos);
                 RAD_ISSUE_N(x, L.q_rope, T, brows(m.q, T), brows(cs, g.max_ctx), pos);
                 if (L.kv_q) RAD_ISSUE_N(x, L.kv_q, T, brows(m.kvn, T));
             } else {
@@ -1801,9 +1901,13 @@ static void step(RadCtx* x, const RadBatch* batch) {
                 RAD_ISSUE_N(x, L.q_b, T, brows(m.qrn, T), RAD_W(L.wq_b), brows(m.q, T));
                 RAD_ISSUE_N(x, L.q_rope, T, brows(m.q, T), brows(cs, g.max_ctx), pos);
                 RAD_ISSUE_N(x, L.kv_g, T, brows(m.xn, T), RAD_W(L.wkv), brows(m.kv, T));
-                RAD_ISSUE_N(x, L.kv_n, T, brows(m.kv, T), RAD_W(L.kv_norm), brows(m.kvn, T));
-                RAD_ISSUE_N(x, L.kv_rope, T, brows(m.kvn, T), brows(cs, g.max_ctx), pos);
-                if (L.kv_q) RAD_ISSUE_N(x, L.kv_q, T, brows(m.kvn, T));
+                if (L.kv_f) {
+                    issue_kv_f();
+                } else {
+                    RAD_ISSUE_N(x, L.kv_n, T, brows(m.kv, T), RAD_W(L.kv_norm), brows(m.kvn, T));
+                    RAD_ISSUE_N(x, L.kv_rope, T, brows(m.kvn, T), brows(cs, g.max_ctx), pos);
+                    if (L.kv_q) RAD_ISSUE_N(x, L.kv_q, T, brows(m.kvn, T));
+                }
             }
             RAD_ISSUE_N(x, L.kv_st, T, bcol(m.kvn, 0, hd / 2, T), bcol(m.kvn, hd / 2, hd / 2, T),
                         praw(wb->slot_mapping, RAD_I32, T), kv_cache(m.win, l));
@@ -1843,12 +1947,21 @@ static void step(RadCtx* x, const RadBatch* batch) {
                 }
                 RAD_ISSUE_N(x, L.c_tab, rows, bpos, brows(m.cs_b, g.max_ctx));
                 RAD_ISSUE_N(x, L.k_gemm, rows, brows(m.lat, rows), RAD_W(L.ik_w), brows(m.ik, rows));
-                RAD_ISSUE_N(x, L.k_norm, rows, brows(m.ik, rows), RAD_W(L.ik_norm), brows(m.ikn, rows));
-                RAD_ISSUE_N(x, L.k_rope, rows, brows(m.ikn, rows), brows(m.cs_b, g.max_ctx), bpos);
-                if (L.k_q) RAD_ISSUE_N(x, L.k_q, rows, brows(m.ikn, rows));
+                if (L.k_f) {
+                    RAD_ISSUE_N(x, L.k_f, rows, brows(m.ik, rows), RAD_W(L.ik_norm), brows(m.ikn, rows),
+                                brows(m.cs_b, g.max_ctx), bpos);
+                } else {
+                    RAD_ISSUE_N(x, L.k_norm, rows, brows(m.ik, rows), RAD_W(L.ik_norm), brows(m.ikn, rows));
+                    RAD_ISSUE_N(x, L.k_rope, rows, brows(m.ikn, rows), brows(m.cs_b, g.max_ctx), bpos);
+                    if (L.k_q) RAD_ISSUE_N(x, L.k_q, rows, brows(m.ikn, rows));
+                }
                 RAD_ISSUE_N(x, L.k_st, rows, brows(m.ikn, rows), page, kv_cache(m.index[r], l));
-                RAD_ISSUE_N(x, L.l_rope, rows, brows(m.lat, rows), brows(m.cs_b, g.max_ctx), bpos);
-                if (L.l_q) RAD_ISSUE_N(x, L.l_q, rows, brows(m.lat, rows));
+                if (L.l_f) {
+                    RAD_ISSUE_N(x, L.l_f, rows, brows(m.lat, rows), brows(m.cs_b, g.max_ctx), bpos);
+                } else {
+                    RAD_ISSUE_N(x, L.l_rope, rows, brows(m.lat, rows), brows(m.cs_b, g.max_ctx), bpos);
+                    if (L.l_q) RAD_ISSUE_N(x, L.l_q, rows, brows(m.lat, rows));
+                }
                 RAD_ISSUE_N(x, L.l_st, rows, brows(m.lat, rows), page, kv_cache(m.comp[r], l));
                 if (L.c_tail) {
                     const auto* tb = kv_batch(batch, m.tail[r]);
@@ -1864,8 +1977,12 @@ static void step(RadCtx* x, const RadBatch* batch) {
                 const int64_t live = std::min<int64_t>(
                     g.max_ctx / r + 1, ((int64_t)batch->max_ctx_len + batch->max_q_len) / r + 1);
                 RAD_ISSUE_N(x, L.i_q, T, brows(m.qrn, T), RAD_W(L.iq_w), brows(m.iq, T));
-                RAD_ISSUE_N(x, L.i_rope, T, brows(m.iq, T), brows(m.cs_b, g.max_ctx), pos);
-                if (L.i_qq) RAD_ISSUE_N(x, L.i_qq, T, brows(m.iq, T));
+                if (L.i_f) {
+                    RAD_ISSUE_N(x, L.i_f, T, brows(m.iq, T), brows(m.cs_b, g.max_ctx), pos);
+                } else {
+                    RAD_ISSUE_N(x, L.i_rope, T, brows(m.iq, T), brows(m.cs_b, g.max_ctx), pos);
+                    if (L.i_qq) RAD_ISSUE_N(x, L.i_qq, T, brows(m.iq, T));
+                }
                 RAD_ISSUE_N(x, L.i_w, T, brows(m.xn, T), RAD_W(L.iproj), brows(m.iw, T));
                 RAD_ISSUE_N(x, L.i_score, T, brows(m.iq, T), brows(m.iw, T), kv_cache(m.index[r], src),
                             praw2(ib->block_table, RAD_I32, S, ib->block_table_pitch), pos, cu,
@@ -1888,8 +2005,12 @@ static void step(RadCtx* x, const RadBatch* batch) {
                 RAD_ISSUE_N(x, L.attn, T, brows(m.q, T), kv_cache(m.win, l), wbt, wused, RAD_NONE,
                             RAD_NONE, RAD_NONE, pos, cu, RAD_W(L.sinks), brows(m.o, T));
             }
-            RAD_ISSUE_N(x, L.o_rope, T, brows(m.o, T), brows(cs, g.max_ctx), pos);
-            if (L.o_q) RAD_ISSUE_N(x, L.o_q, T, brows(m.o, T));
+            if (L.o_f) {
+                RAD_ISSUE_N(x, L.o_f, T, brows(m.o, T), brows(cs, g.max_ctx), pos);
+            } else {
+                RAD_ISSUE_N(x, L.o_rope, T, brows(m.o, T), brows(cs, g.max_ctx), pos);
+                if (L.o_q) RAD_ISSUE_N(x, L.o_q, T, brows(m.o, T));
+            }
             const int64_t gd = HD / m.gr;
             for (int j = 0; j < m.gr; ++j)
                 RAD_ISSUE_N(x, L.o_a[(size_t)j], T, bcol(m.o, j * gd, gd, T), RAD_W(L.wo_a[(size_t)j]),
@@ -1902,14 +2023,24 @@ static void step(RadCtx* x, const RadBatch* batch) {
 
         RAD_ISSUE_N(x, L.mix_f, T, brows(m.h1, T), RAD_W(L.hc_f_fn), RAD_W(L.hc_f_scale),
                     RAD_W(L.hc_f_base), brows(m.pre_f, T), brows(m.post, T), brows(m.comb, T));
-        RAD_ISSUE_N(x, L.col_f, T, brows(m.h1, T), brows(m.pre_a, T), brows(m.xcol, T));
-        RAD_ISSUE_N(x, L.norm_f, T, brows(m.xcol, T), RAD_W(L.ffn_norm), brows(m.act.x, T));
+        if (L.cn_f) {
+            RAD_ISSUE_N(x, L.cn_f, T, brows(m.h1, T), brows(m.pre_a, T), brows(m.xcol, T),
+                        RAD_W(L.ffn_norm), brows(m.act.x, T));
+        } else {
+            RAD_ISSUE_N(x, L.col_f, T, brows(m.h1, T), brows(m.pre_a, T), brows(m.xcol, T));
+            RAD_ISSUE_N(x, L.norm_f, T, brows(m.xcol, T), RAD_W(L.ffn_norm), brows(m.act.x, T));
+        }
         L.moe.step(x, batch);
         RAD_ISSUE_N(x, L.post_f, T, brows(m.act.x, T), brows(m.h1, T), brows(m.post, T),
                     brows(m.comb, T), brows(m.h0, T));
     }
-    RAD_ISSUE_N(x, m.contract, T, brows(m.h0, T), brows(m.pre_f, T), brows(m.xcol, T));
-    RAD_ISSUE_N(x, m.fnorm, T, brows(m.xcol, T), RAD_W(m.final_gain), brows(m.final_hidden, T));
+    if (m.cn_fin) {
+        RAD_ISSUE_N(x, m.cn_fin, T, brows(m.h0, T), brows(m.pre_f, T), brows(m.xcol, T),
+                    RAD_W(m.final_gain), brows(m.final_hidden, T));
+    } else {
+        RAD_ISSUE_N(x, m.contract, T, brows(m.h0, T), brows(m.pre_f, T), brows(m.xcol, T));
+        RAD_ISSUE_N(x, m.fnorm, T, brows(m.xcol, T), RAD_W(m.final_gain), brows(m.final_hidden, T));
+    }
     if (batch->n_out > 0) {
         RAD_ISSUE_N(x, m.gather, batch->n_out, brows(m.final_hidden, T),
                     praw(batch->out_ids, RAD_I32, batch->n_out), brows(m.logit_input, batch->n_out));

@@ -200,6 +200,7 @@ at once. Run it before adding a kernel plugin; the loader names only the first c
 | `mhc_contract` | `M`(range) `n` `hc` `dtype` | `h` → `x` |
 | `mhc_mix` | `M`(range) `n` `hc` `iterations` `eps`:f64 `hc_eps`:f64 `dtype` | `h`, `fn`w, `scale`w, `base`w → `pre`, `post`, `comb` |
 | `mhc_collapse` | `M`(range) `n` `hc` `dtype` | `h`, `pre` → `x` |
+| `mhc_collapse_rmsnorm` | `M`(range) `n` `hc` `eps`:f64 `dtype` `wadd`:f64/opt `mult`:f64/opt | `h`, `pre` → `x`; `w`w → `y` (device-only: mhc_collapse then rmsnorm, x rounded before the norm reads it) |
 | `hc_read` | `M`(range) `n` `hc` `lowrank` `eps`:f64 `dtype` `wadd`:f64/opt `inject`/opt `group`/opt `rotate`/opt `mix`/opt | `h`, `w`w, `mix_down`w, `mix_up`w, `inject_w`w? → `x`, `inj`?, `q`?, `scale`?, `rq`?, `rscale`? |
 | `hc_write` | `M`(range) `n` `hc` `dtype` | `y`, `inj`, `h`:inout |
 | `hc_project` | `M`(range) `n` `hc` `scale`:f64 `dtype` | `h`:inout, `v`, `on` |
@@ -250,6 +251,13 @@ no plane to feed `rmsnorm` as a gain.
 
 **`rmsnorm_add`** is the residual add and the next norm in one pass, as every real implementation
 does it. A plugin asks for it first and falls back to `add` + `rmsnorm` (`spec.md` §2.3).
+
+**`mhc_collapse_rmsnorm`** (device-only) is DeepSeek-V4.1's sublayer entry in one launch:
+`mhc_collapse` then `rmsnorm`. Each step stores its output in the activation dtype before the next
+reads it, so it is bit-identical to the chain. libr4d declares it with `replaces`, and
+`rad-kbench`'s fusion oracle holds it to libr4d's own chain byte for byte. libref has no row: an
+architecture asks `rad_op_declared` and `rad_op_resolved` and declares the chain where they do not
+resolve, so a host deployment runs the chain.
 
 **`gelu_mul`** is `silu_mul` with the tanh GELU: Gemma's gated FFN is trained with
 `gelu_pytorch_tanh`, while the unary `gelu` is the exact erf form. Both split the fused `gate_up`
@@ -874,6 +882,8 @@ as the weight's GEMM stored them and claims no form. It changes no value.
 | `rope_table` | `M`(range) `rot` `theta`:f64 `scale`:f64 `dtype` `yarn_factor`:f64/opt `yarn_low`:f64/opt `yarn_high`:f64/opt `yarn_magnitude`:f64/opt `head_dim`/opt `ladder`/opt | `positions` → `cos_sin` |
 | `rope_rows` | `M`(range) `n_head` `head_dim` `rot` `off` `mode` `inverse` `dtype` | `x`:inout, `cos_sin`, `positions` |
 | `quant_roundtrip` | `M`(range) `n` `block` `format`:str `scale`:str `dtype` | `x`:inout |
+| `rope_rows_roundtrip` | `M`(range) `n_head` `head_dim` `rot` `off` `mode` `inverse` `block` `format`:str `scale`:str `dtype` | `x`:inout, `cos_sin`, `positions` (device-only: rope_rows then quant_roundtrip over n_head * head_dim columns) |
+| `rmsnorm_rope_roundtrip` | `M`(range) `n` `eps`:f64 `n_head` `head_dim` `rot` `off` `mode` `inverse` `block` `format`:str `scale`:str `dtype` `wadd`:f64/opt `mult`:f64/opt | `x`, `w`w → `y`; `cos_sin`, `positions` (device-only: rmsnorm, then rope_rows and quant_roundtrip over y; n = n_head * head_dim) |
 | `softmax_pool` | `M`(range) `n` `ratio` `dtype` | `stage` → `out`; `page`? |
 | `attn_sparse_sink` | `M`(range) `heads` `dim` `window` `ratio` `topk` `scale`:f64 `dtype` | `q`, `window_cache`, `window_bt`, `window_used`, `comp_cache`?, `comp_bt`?, `sel`?, `positions`, `cu_seqlens`, `sinks`w → `out` |
 | `index_score` | `M`(range) `heads` `dim` `ratio` `width` `wscale`:f64 `dtype` | `q`, `w`, `index_cache`, `bt`, `positions`, `cu_seqlens` → `score` |
@@ -1039,6 +1049,13 @@ holding its token's finished head, so it also writes it into the paged cache at 
 Its parameters are the two ops' own, its operands the prologue's followed by `slot_mapping` and
 `kv_cache`. Byte-identical to the pair at either cache width: the store converts each element as
 `kv_store` does, and q, k and v are still written in place as the prologue leaves them.
+
+**`rope_rows_roundtrip`** (device-only) is `rope_rows` then `quant_roundtrip` over all `n_head *
+head_dim` columns of `x`, in place; **`rmsnorm_rope_roundtrip`** (device-only) is `rmsnorm` (`x`,
+`w` → `y`) followed by the same two over `y`. They are DeepSeek-V4.1's attention output, compressed
+latent and index query, and its window and index keys. Each step rounds where its own op stores, so
+both are bit-identical to the chain; as with `mhc_collapse_rmsnorm`, libr4d declares them with
+`replaces`, libref has no row, and an architecture declares the chain where they do not resolve.
 
 | op | params | operands |
 |---|---|---|

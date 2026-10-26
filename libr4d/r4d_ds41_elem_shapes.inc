@@ -126,3 +126,54 @@ extern "C" int r4d_shape_embed_lookup_planes(const RadParam* p, int n_p, int ope
     };
     R4D_PICK(l);
 }
+
+/* The fused chains: the operands of their steps' rows, as those rows describe them. */
+extern "C" int r4d_shape_rmsnorm_rope_roundtrip(const RadParam* p, int n_p, int operand,
+                                                RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n"), nh = pi(p, n_p, "n_head");
+    const int64_t hd = pi(p, n_p, "head_dim"), rot = pi(p, n_p, "rot"), off = pi(p, n_p, "off", -1);
+    const int64_t block = pi(p, n_p, "block");
+    if (M <= 0 || nh < 1 || rot < 2 || (rot & 1) || off < 0 || off + rot > hd || n != nh * hd ||
+        block < 1 || n % block)
+        return RAD_E_UNSUPPORTED;
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = {
+        opd(D, M, n),                      /* x */
+        opd((uint32_t)RAD_F32, n),         /* w, the gain */
+        opd(D, M, n),                      /* y */
+        opd((uint32_t)RAD_F32, M, rot),    /* cos_sin: a rope_table plane of M rows */
+        opd_idx(M, 0, M),                  /* positions */
+    };
+    R4D_PICK(l);
+}
+
+extern "C" int r4d_shape_rope_rows_roundtrip(const RadParam* p, int n_p, int operand,
+                                             RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), nh = pi(p, n_p, "n_head"), hd = pi(p, n_p, "head_dim");
+    const int64_t rot = pi(p, n_p, "rot"), off = pi(p, n_p, "off", -1), block = pi(p, n_p, "block");
+    if (M <= 0 || nh < 1 || rot < 2 || (rot & 1) || off < 0 || off + rot > hd || block < 1 ||
+        (nh * hd) % block)
+        return RAD_E_UNSUPPORTED;
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = {
+        opd(D, M, nh * hd),                /* x, in place */
+        opd((uint32_t)RAD_F32, M, rot),    /* cos_sin */
+        opd_idx(M, 0, M),                  /* positions */
+    };
+    R4D_PICK(l);
+}
+
+extern "C" int r4d_shape_mhc_collapse_rmsnorm(const RadParam* p, int n_p, int operand,
+                                              RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n"), hc = pi(p, n_p, "hc");
+    if (M <= 0 || n <= 0 || hc < 2 || hc > 8) return RAD_E_UNSUPPORTED;
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = {
+        opd(D, M, hc * n),                 /* h */
+        opd((uint32_t)RAD_F32, M, hc),     /* pre */
+        opd(D, M, n),                      /* x */
+        opd((uint32_t)RAD_F32, n),         /* w */
+        opd(D, M, n),                      /* y */
+    };
+    R4D_PICK(l);
+}

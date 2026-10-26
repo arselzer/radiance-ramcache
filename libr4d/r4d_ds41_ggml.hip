@@ -41,7 +41,6 @@
 #include "r4d_plugin.h"
 
 #include <cstdint>
-#include <cstdlib>
 #include <cstring>
 #include <type_traits>
 
@@ -1193,6 +1192,7 @@ __global__ __launch_bounds__(kGgThreads) void gg_gemv_kernel(GgGemvArgs A) {
  * the old one and gemm_nt_ggml's gemv agree on every bit. */
 constexpr int kMdMaxT = 288;             /* sorted rows a launch: 48 tokens at top-6 */
 constexpr int kMdXM = 4;                 /* rows a segment at most (the sums a lane keeps a row) */
+constexpr long long kMdLds = 65536;      /* LDS a block at most */
 
 struct GgMdArgs {
     const uint16_t* x;
@@ -1211,7 +1211,6 @@ struct GgMdArgs {
     int meta_off, x_off;                 /* LDS byte offsets */
     int raw_off, raw_wave;               /* the waves' chunk buffers (md_step_stg), or -1 */
     int xs_off;                          /* the dot path's unit sums of the staged rows (IQ1_S) */
-    int dbg;                             /* R4D_MD_DBG (measurement only): 2 the loads without the math */
 };
 
 /* Where a staged row keeps value k in LDS, so that the lanes of a wave (lane = unit mod 32, all
@@ -1896,22 +1895,13 @@ __device__ __forceinline__ void mdd_xload(const uint16_t* xb, const float* xsm, 
 template <int T, int RPW, int UF, int NF, bool TL, bool XR>
 __device__ __forceinline__ void mdd_crunch(const uint32_t (&raw)[UF][RPW][3], const uint32_t (&xr)[UF][16],
                                            const float (&xsr)[UF], int lane, int UK, const uint16_t* xb,
-                                           const float* xsm, int K, const uint8_t* tab, bool xbad, int dbg,
+                                           const float* xsm, int K, const uint8_t* tab, bool xbad,
                                            float (&acc)[RPW][1]) {
     constexpr int TW = 32 / RPW;
     bool ok[RPW];
 #pragma unroll
     for (int r = 0; r < RPW; ++r) ok[r] = true;
     const bool ok1[1] = { true };
-    if (dbg & 2) {                       /* measurement: the loads only */
-        gg_for<UF>([&](auto fi) {
-            constexpr int F = decltype(fi)::value;
-#pragma unroll
-            for (int r = 0; r < RPW; ++r)
-                if (F < NF || r == 0) acc[r][0] += __uint_as_float((raw[F][r][1] ^ raw[F][r][2] ^ raw[F][r][0]) & 0x0fffffffu);
-        });
-        return;
-    }
     bool bad = xbad;
     gg_for<UF>([&](auto fi) {
         constexpr int F = decltype(fi)::value;
@@ -2001,7 +1991,7 @@ __device__ __forceinline__ void mdd_pipe(const GgMdArgs& A, const uint8_t* wb, i
         float acc[RPW][1];
 #pragma unroll
         for (int r = 0; r < RPW; ++r) acc[r][0] = 0.0f;
-        mdd_crunch<T, RPW, UF, NF, TL, XR>(raw, xr, xsr, lane, UK, xb, xsm, A.K, tab, xbad, A.dbg, acc);
+        mdd_crunch<T, RPW, UF, NF, TL, XR>(raw, xr, xsr, lane, UK, xb, xsm, A.K, tab, xbad, acc);
         const int n0 = ti * RPW;
 #pragma unroll
         for (int r = 0; r < RPW; ++r) {
@@ -3389,10 +3379,9 @@ int gg_launch_md_t(RadStream s, int UK, int xmx, const GgMdArgs& A, unsigned gri
 /* The dot path (16 waves a block, a row a segment): RPW 4 x UF 3 up to 96 units (down), 2 x 5 up to
  * 160 (gate_up). */
 template <int T>
-int gg_launch_mdd_t(RadStream s, int UK, int xmx, int rpw, const GgMdArgs& A, unsigned grid, unsigned lds) {
+int gg_launch_mdd_t(RadStream s, int UK, int xmx, const GgMdArgs& A, unsigned grid, unsigned lds) {
     const dim3 g(grid), b(16 * 32);
 #define GG_MDD_X(R, F) R4D_EMIT(s, (gg_md_kernel<T, R, F, 16, 1, true>), g, b, lds, A)
-    (void)rpw;
     (void)xmx;
     if (UK <= 96) return GG_MDD_X(4, 3);
     if (UK <= 160) return GG_MDD_X(2, 5);
@@ -3400,15 +3389,15 @@ int gg_launch_mdd_t(RadStream s, int UK, int xmx, int rpw, const GgMdArgs& A, un
 #undef GG_MDD_X
 }
 
-int gg_launch_mdd(RadStream s, int ty, int UK, int xmx, int rpw, const GgMdArgs& A, unsigned grid, unsigned lds) {
-    if (ty == GG_IQ1_S) return gg_launch_mdd_t<GG_IQ1_S>(s, UK, xmx, rpw, A, grid, lds);
-    if (ty == GG_IQ2_XXS) return gg_launch_mdd_t<GG_IQ2_XXS>(s, UK, xmx, rpw, A, grid, lds);
+int gg_launch_mdd(RadStream s, int ty, int UK, int xmx, const GgMdArgs& A, unsigned grid, unsigned lds) {
+    if (ty == GG_IQ1_S) return gg_launch_mdd_t<GG_IQ1_S>(s, UK, xmx, A, grid, lds);
+    if (ty == GG_IQ2_XXS) return gg_launch_mdd_t<GG_IQ2_XXS>(s, UK, xmx, A, grid, lds);
     return R4D_NO(RAD_E_DTYPE);
 }
 
-template <int NW>
+/* 16 waves a block. */
 int gg_launch_md(RadStream s, int ty, int UK, int xmx, const GgMdArgs& A, unsigned grid, unsigned lds) {
-#define GG_CALL_MD(T) gg_launch_md_t<T, NW>(s, UK, xmx, A, grid, lds)
+#define GG_CALL_MD(T) gg_launch_md_t<T, 16>(s, UK, xmx, A, grid, lds)
     switch (ty) {
     case GG_Q8_0: return GG_CALL_MD(GG_Q8_0);
     case GG_Q5_K: return GG_CALL_MD(GG_Q5_K);
@@ -3435,11 +3424,6 @@ int gg_cu_count() {
     return cache[dev];
 }
 
-int gg_env_int(const char* k, int dflt) {
-    const char* v = std::getenv(k);
-    return v && *v ? std::atoi(v) : dflt;
-}
-
 int gg_launch_tiled(RadStream s, int ty, int bm, bool moe, bool f32out, const GgTiledArgs& A,
                     dim3 grid, unsigned lds) {
 #define GG_CALL_TILED(T) gg_launch_tiled_t<T>(s, bm, moe, f32out, A, grid, lds)
@@ -3461,23 +3445,12 @@ template <int T>
 constexpr unsigned gg_wm_lds(int bm) {
     return (unsigned)(Wq<T>::TB + 2 * bm * kWmXP * 2 + (Wq<T>::XG > 0 ? 2 * (kWmS / Wq<T>::XG) * bm * 4 : 0));
 }
-/* 16-row tiles a block: three; IQ1_S four (R4D_WM_MT1=3: three). IQ1_S at 4 is held to 2 blocks a WGP
- * (LDS 50 KiB, 241+ VGPRs) and at 3 runs 3 (1.15x in the uniform-routing bench), but the real serve's
- * skewed routing splits more heavy experts into extra tiles, each re-reading the expert's weights. */
-int gg_wm_mt(int ty) {
-    static const int mt1 = gg_env_int("R4D_WM_MT1", 4) == 3 ? 3 : 4;
-    return ty == GG_IQ1_S ? mt1 : 3;
-}
+/* 16-row tiles a block: three; IQ1_S four. IQ1_S at 4 is held to 2 blocks a WGP (LDS 50 KiB, 241+
+ * VGPRs) and at 3 runs 3 (1.15x in the uniform-routing bench), but the real serve's skewed routing
+ * splits more heavy experts into extra tiles, each re-reading the expert's weights. */
+int gg_wm_mt(int ty) { return ty == GG_IQ1_S ? 4 : 3; }
 template <int T>
 int gg_launch_wm_t(bool moe, bool f32out, RadStream s, const GgTiledArgs& A, dim3 grid) {
-    if constexpr (T == GG_IQ1_S) {
-        if (gg_wm_mt(T) == 3) {
-            const unsigned lds = gg_wm_lds<T>(48);
-            if (moe) return R4D_EMIT(s, (gg_wm_kernel<T, 3, true, uint16_t>), grid, dim3(256), lds, A);
-            if (f32out) return R4D_EMIT(s, (gg_wm_kernel<T, 3, false, float>), grid, dim3(256), lds, A);
-            return R4D_EMIT(s, (gg_wm_kernel<T, 3, false, uint16_t>), grid, dim3(256), lds, A);
-        }
-    }
     constexpr int MT = T == GG_IQ1_S ? 4 : 3;
     const unsigned lds = gg_wm_lds<T>(16 * MT);
     if (moe) return R4D_EMIT(s, (gg_wm_kernel<T, MT, true, uint16_t>), grid, dim3(256), lds, A);
@@ -3588,8 +3561,7 @@ int gg_gemm(const RadArgs* a, RadStream s, const char* nN, const char* nK, bool 
     A.M = (int)M; A.N = (int)N; A.K = (int)K;
     A.x_al = x_al; A.tab_bytes = (int)tb;
     /* The WMMA kernel (factored scales) for every block type DeepSeek-V4.1 uses. */
-    static const int wm_off = gg_env_int("R4D_WM_OFF", 0);
-    if (!wm_off && x_al && ty != GG_F32 && ty != GG_IQ4_NL && K % (2 * kWmS) == 0 && (N + kWmBN - 1) / kWmBN <= 65535) {
+    if (x_al && ty != GG_F32 && ty != GG_IQ4_NL && K % (2 * kWmS) == 0 && (N + kWmBN - 1) / kWmBN <= 65535) {
         const int bmw = 16 * gg_wm_mt(ty);
         const long long gx = (M + bmw - 1) / bmw, gyw = (N + kWmBN - 1) / kWmBN;
         return gg_launch_wm(s, ty, false, logits, A, dim3((unsigned)gx, (unsigned)gyw));
@@ -3649,27 +3621,20 @@ int gg_moe(const RadArgs* a, RadStream s, bool gemv) {
     const long long tb = gg_r16(gg_tab_bytes(ty));
     const long long tokens = a_sorted ? (T + top_k - 1) / top_k : AR;
     const long long L = ne < T ? ne : T;       /* experts that can have rows */
-    /* The decode kernel (gg_md_kernel) when the routing fits its lists and a row fits LDS. */
-    static const int md_off = gg_env_int("R4D_MD_OFF", 0);
-    static const int md_dot = gg_env_int("R4D_MD_DOT", 1);
+    /* The decode kernel (gg_md_kernel) when the routing fits its lists and a row fits LDS (64 KiB). */
     /* The I-quants' dot path: bf16 rows, each with its unit sums for IQ1_S. */
     /* Every pass whose sorted rows fit the decode kernels' lists takes them, whichever row (gemv or
      * tiled) the engine picked: a token's outputs are then the same bits whatever else is in the
      * pass (decode, a speculative verify pass and a short prefill agree). */
-    if (T <= kMdMaxT && !md_off && md_dot && (ty == GG_IQ1_S || ty == GG_IQ2_XXS)) {
-        static const int md_cap = gg_env_int("R4D_MD_LDS", 65536);
-        static const int md_g = gg_env_int("R4D_MD_G", 0);
-        static const int md_bpc = gg_env_int("R4D_MD_BPC", 2);
-        static const int md_rpw = gg_env_int("R4D_MD_RPW", 0);
-        static const int md_dbg = gg_env_int("R4D_MD_DBG", 0);
+    if (T <= kMdMaxT && (ty == GG_IQ1_S || ty == GG_IQ2_XXS)) {
         const long long tbd = gg_r16(ty == GG_IQ1_S ? kMddTab1 : kMddTab2);
         const long long meta = gg_r16(8LL * kMdMaxT + 4LL * (3 * kMdMaxT + 1 + 3));
         const long long temp = gg_r16(8 * ne + 4 * (ne + 1) + 12 * T);
         const long long rowb = 2 * K + 4 * (K / 32) + 4;    /* bf16 row, unit sums, flag */
-        long long xb = md_cap > tbd + meta + 16 ? (md_cap - tbd - meta - 16) / rowb : 0;
+        long long xb = kMdLds > tbd + meta + 16 ? (kMdLds - tbd - meta - 16) / rowb : 0;
         if (xb > T) xb = T;
         const long long xbytes = gg_r16(xb * rowb) > temp ? gg_r16(xb * rowb) : temp;
-        if (xb >= 1 && tbd + meta + xbytes <= 65536) {
+        if (xb >= 1 && tbd + meta + xbytes <= kMdLds) {
             GgMdArgs A{};
             A.x = (const uint16_t*)A_->data; A.x_ld = x_ld;
             A.w = table ? nullptr : (const uint8_t*)W->data;
@@ -3691,42 +3656,37 @@ int gg_moe(const RadArgs* a, RadStream s, bool gemv) {
             A.xs_off = (int)(tbd + meta + xb * 2 * K);
             A.raw_off = -1;
             A.raw_wave = 0;
-            A.dbg = md_dbg;
             const unsigned lds = (unsigned)(tbd + meta + xbytes);
-            /* Blocks a CU: as many as its LDS holds (a WGP's 128 KiB), at most md_bpc. */
+            /* Blocks a CU: as many as its LDS holds (a WGP's 128 KiB), at most two. */
             long long bpc = 131072 / lds;
-            if (bpc > md_bpc) bpc = md_bpc;
+            if (bpc > 2) bpc = 2;
             if (bpc < 1) bpc = 1;
-            const long long gq = md_g > 0 ? md_g : (long long)gg_cu_count() * bpc;
-            return gg_launch_mdd(s, ty, (int)(K / 32), xmx, md_rpw, A, (unsigned)gq, lds);
+            const long long gq = (long long)gg_cu_count() * bpc;
+            return gg_launch_mdd(s, ty, (int)(K / 32), xmx, A, (unsigned)gq, lds);
         }
     }
-    if (T <= kMdMaxT && !md_off) {
-        static const int md_cap = gg_env_int("R4D_MD_LDS", 65536);
-        static const int md_nw = gg_env_int("R4D_MD_NW", 16);
-        static const int md_g = gg_env_int("R4D_MD_G", 0);
+    if (T <= kMdMaxT) {
         const long long meta = gg_r16(8LL * kMdMaxT + 4LL * (3 * kMdMaxT + 1 + 3));
         const long long temp = gg_r16(8 * ne + 4 * (ne + 1) + 12 * T);
-        const long long room = md_cap - tb - meta;
+        const long long room = kMdLds - tb - meta;
         /* One token: f32 rows (no widening in the loop), a segment a row. More: bf16 rows, up to
          * kMdXM a segment, as many staged together as fit. */
         const long long xbf = room > 0 ? room / (2 * K) : 0;
         const bool bf = tokens >= 2 && xbf >= 2;
         long long xb = room > 0 ? room / ((bf ? 2 : 4) * K) : 0;
         if (xb > T) xb = T;
-        /* The I-quants' chunk buffers (md_step_stg): RPW rows of 4 blocks a wave. */
-        static const int md_stg = gg_env_int("R4D_MD_STG", 1);
+        /* The I-quants' chunk buffers (md_step_stg): RPW rows of 4 blocks a wave, 16 waves. */
         const long long uk_ = K / gt->qk * (gt->qk == 256 ? 8 : 1);
         const bool iq = ty == GG_IQ1_S || ty == GG_IQ2_XXS;
-        const long long rwave = iq && md_stg ? (uk_ <= 160 ? 4 : 2) * ((4 * gt->bb + 15) / 16 * 16) : 0;
-        const long long rbytes = rwave * md_nw;
-        if (rbytes && xb > 1 && tb + meta + xb * (bf ? 2 : 4) * K + rbytes > md_cap) {
-            const long long r2 = (md_cap - tb - meta - rbytes) / ((bf ? 2 : 4) * K);
+        const long long rwave = iq ? (uk_ <= 160 ? 4 : 2) * ((4 * gt->bb + 15) / 16 * 16) : 0;
+        const long long rbytes = rwave * 16;
+        if (rbytes && xb > 1 && tb + meta + xb * (bf ? 2 : 4) * K + rbytes > kMdLds) {
+            const long long r2 = (kMdLds - tb - meta - rbytes) / ((bf ? 2 : 4) * K);
             if (r2 >= (bf ? 2 : 1)) xb = r2;
         }
         const long long xbytes = xb * (bf ? 2 : 4) * K > temp ? xb * (bf ? 2 : 4) * K : temp;
-        const bool stg = rbytes && tb + meta + xbytes + rbytes <= 65536;
-        if (xb >= 1 && tb + meta + xbytes <= 65536) {
+        const bool stg = rbytes && tb + meta + xbytes + rbytes <= kMdLds;
+        if (xb >= 1 && tb + meta + xbytes <= kMdLds) {
             GgMdArgs A{};
             A.x = (const uint16_t*)A_->data; A.x_ld = x_ld;
             A.w = table ? nullptr : (const uint8_t*)W->data;
@@ -3747,13 +3707,12 @@ int gg_moe(const RadArgs* a, RadStream s, bool gemv) {
             A.raw_wave = (int)rwave;
             const unsigned lds = (unsigned)(tb + meta + xbytes + (stg ? rbytes : 0));
             const int per_cu = (int)(65536 / lds);
-            const long long gq = md_g > 0 ? md_g : (long long)gg_cu_count() * (per_cu < 1 ? 1 : per_cu);
+            const long long gq = (long long)gg_cu_count() * (per_cu < 1 ? 1 : per_cu);
             const unsigned grid = (unsigned)(gq < 1 ? 1 : gq);
             const int UK = (int)(K / gt->qk * (gt->qk == 256 ? 8 : 1));
             const int ukf = ty == GG_F32 ? (int)(K / 32) : UK;
             const int xmx = bf ? kMdXM : 1;
-            return md_nw == 8 ? gg_launch_md<8>(s, ty, ukf, xmx, A, grid, lds)
-                              : gg_launch_md<16>(s, ty, ukf, xmx, A, grid, lds);
+            return gg_launch_md(s, ty, ukf, xmx, A, grid, lds);
         }
     }
     if (gemv && tokens <= 16) {
@@ -3798,8 +3757,7 @@ int gg_moe(const RadArgs* a, RadStream s, bool gemv) {
     A.x_al = gg_al16(A_->data, x_ld) ? 1 : 0;
     A.tab_bytes = (int)tb;
     /* The WMMA kernel for the I-quants (every DeepSeek-V4.1 expert): 16 MT-row tiles. */
-    static const int wm_off = gg_env_int("R4D_WM_OFF", 0);
-    if (!wm_off && A.x_al && (ty == GG_IQ1_S || ty == GG_IQ2_XXS) && K % (2 * kWmS) == 0) {
+    if (A.x_al && (ty == GG_IQ1_S || ty == GG_IQ2_XXS) && K % (2 * kWmS) == 0) {
         const int bmw = 16 * gg_wm_mt(ty);
         const long long gx = (T + bmw - 1) / bmw + L, gy = (N + kWmBN - 1) / kWmBN;
         if (gy > 65535 || gx > 0x7fffffffLL) return R4D_NO(RAD_E_SHAPE);

@@ -82,7 +82,7 @@ SCHEMA("index_topk", pDs41IndexTopk, oDs41IndexTopk,
   "up to 48 rows; taller passes on WMMA (online softmax, P as bf16 hi + lo), not bit-exact",
   "dim 512, any heads, window <= 1024, topk <= 2048, ratio 0..64; one workgroup a (d half, head "
   "group of 2/4/8, row), the group picked by row count; > 48 rows a (16-head tile, row), four "
-  "waves of 128 latent columns, 16 keys a step (R4D_ATTN_WM_OFF=1: the exact kernel)",
+  "waves of 128 latent columns, 16 keys a step",
   "bf16 q, caches and out; f32 sinks; i32 tables, positions, selections",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cDs41AttnSparseSink), NOTUNE,
   nullptr, nullptr, r4d_rad_ds41_attn_sparse_sink, nullptr, nullptr, nullptr,
@@ -92,7 +92,7 @@ SCHEMA("index_topk", pDs41IndexTopk, oDs41IndexTopk,
   "(> 48 rows: the dot on WMMA, its summation order the only change)",
   "dim 128, any heads, ratio 1..16; a thread an entry (1, 2, 4 or 8 waves an entry group by "
   "grid size), -inf past (pos+1)/ratio without reading keys; > 48 rows and <= 32 heads a wave a "
-  "row over 128 entries (R4D_IDX_WM_OFF=1: the exact kernel)",
+  "row over 128 entries",
   "bf16 q, w and cache; i32 tables and positions; f32 score",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cDs41IndexScore), NOTUNE,
   nullptr, nullptr, r4d_rad_ds41_index_score, nullptr, nullptr, nullptr,

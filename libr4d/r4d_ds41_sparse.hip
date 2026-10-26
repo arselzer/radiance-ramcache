@@ -22,8 +22,7 @@
 // Prefill heights (more than kWmRows = 48 rows a pass) take WMMA forms instead, which are NOT
 // libref's bits (kbench tolerance): attn_sparse_sink with an online softmax, v_exp_f32 and P as
 // bf16 hi + lo; index_score with only the dot's summation order changed (every rounding after it
-// is libref's). The decode band keeps the exact kernels, so speculative verify reproduces decode;
-// R4D_ATTN_WM_OFF=1 / R4D_IDX_WM_OFF=1 restore the exact kernels at every height.
+// is libref's). The decode band keeps the exact kernels, so speculative verify reproduces decode.
 #include "r4d.h"
 #include "r4d_args.h"
 #include "r4d_common.h"
@@ -31,7 +30,6 @@
 #include "r4d_plugin.h"
 
 #include <climits>
-#include <cstdlib>
 #include <cmath>
 #include <cstdint>
 
@@ -1202,7 +1200,7 @@ __global__ __launch_bounds__(NT) void ds41_attn_dec_kernel(DsAttnArgs a) {
  *                   straight from the score layout, P = hi + lo in bf16 (two WMMAs; hi truncated,
  *                   lo = p - hi rounded, so |p - hi - lo| <= 2^-17 p).
  * Not libref's bits: q.k products are exact but sum in WMMA order, the exponential is v_exp_f32
- * and the softmax online; the old kernel stays for the decode band (and R4D_ATTN_WM_OFF=1). A key
+ * and the softmax online; the old kernel stays for the decode band. A key
  * with no entry reads a zero row and scores -inf (0 * NaN from a recycled slot would be NaN). */
 typedef __bf16 ds_v8bf __attribute__((ext_vector_type(8)));
 typedef float ds_v8f __attribute__((ext_vector_type(8)));
@@ -1500,11 +1498,6 @@ long lin_stride(const RadTensor& t) {
 
 bool aligned(const void* p, unsigned bytes) { return ((uintptr_t)p & (uintptr_t)(bytes - 1)) == 0; }
 
-int ds_env_int(const char* k, int dflt) {
-    const char* v = std::getenv(k);
-    return v && *v ? std::atoi(v) : dflt;
-}
-
 constexpr int kDsChunk = 8192;                       /* index_topk's split: positions a chunk */
 constexpr int kDsSplitRows = 16;                     /* ... at up to this many rows */
 constexpr int kDsSplitMinChunks = 4;                 /* ... over at least this many chunks */
@@ -1568,10 +1561,9 @@ int index_score_body(const RadArgs* a, RadStream stream) {
     s.cbs = (int)kc.shape[2];
     s.slot = (int)(Dm / ratio);
     s.wscale = wscale;
-    /* Prefill heights on WMMA (up to 32 heads, 16-byte q rows); the decode band, and every height
-     * with R4D_IDX_WM_OFF=1, on the scalar kernel below (libref's bits). */
-    static const int iw_off = ds_env_int("R4D_IDX_WM_OFF", 0);
-    if (!iw_off && s.M > kWmRows && H <= 32 && s.qr % 8 == 0 && aligned(q.data, 16) &&
+    /* Prefill heights on WMMA (up to 32 heads, 16-byte q rows); the decode band on the scalar
+     * kernel below (libref's bits). */
+    if (s.M > kWmRows && H <= 32 && s.qr % 8 == 0 && aligned(q.data, 16) &&
         (s.M + 7) / 8 <= 65535) {
         const dim3 grid((unsigned)((s.C + kIwEB - 1) / kIwEB), (unsigned)((s.M + 7) / 8));
         if (H > 16) return R4D_EMIT(stream, ds41_index_score_wm_kernel<2>, grid, dim3(256), 0u, s);
@@ -1810,13 +1802,12 @@ int attn_body(const RadArgs* a, RadStream stream) {
     s.nk = (int)(win + (comp ? topk : 0));
     s.nkp = (s.nk + 3) / 4 * 4;
     s.scale = scale;
-    /* Prefill heights on WMMA (16-byte q and out rows); the decode band, and every height with
-     * R4D_ATTN_WM_OFF=1, on the scalar kernel below (libref's bits). */
-    static const int wm_off = ds_env_int("R4D_ATTN_WM_OFF", 0);
+    /* Prefill heights on WMMA (16-byte q and out rows); the decode band on the scalar kernels
+     * below (libref's bits). */
     {
         const int nkt = (s.nk + 15) / 16;
         const long lds = ds_wm_sbuf_off(nkt) + kWmSbufBytes;
-        if (!wm_off && s.M > kWmRows && s.qr % 8 == 0 && s.outr % 8 == 0 && aligned(q.data, 16) &&
+        if (s.M > kWmRows && s.qr % 8 == 0 && s.outr % 8 == 0 && aligned(q.data, 16) &&
             aligned(out.data, 16) && lds <= 65536 && (H + 15) / 16 <= 65535) {
             const unsigned gy = (unsigned)(s.M < 65535 ? s.M : 65535);
             const dim3 grid((unsigned)((H + 15) / 16), gy);
@@ -1828,11 +1819,8 @@ int attn_body(const RadArgs* a, RadStream stream) {
      * in the same order, so the bits do not depend on it. */
     const long rows = s.M;
     if (rows <= kWmRows) {
-        static const int dec_off = ds_env_int("R4D_ATTN_DEC_OFF", 0);
-        if (!dec_off) {
-            const int rc = attn_dec_emit(stream, s);
-            if (rc != RAD_E_UNSUPPORTED) return rc;
-        }
+        const int rc = attn_dec_emit(stream, s);
+        if (rc != RAD_E_UNSUPPORTED) return rc;
     }
     int HG = 8, DS = 1;
     if (rows * H < 2048) HG = rows * H >= 512 ? 4 : 2;

@@ -106,6 +106,10 @@ Tools and images are not covered.
   `core/kvstream/` headers, never committed (#242; the directory is part of #240): neither builds without them.
 - **Family gating:** the kernels use RDNA4 WMMA and FP8; each has to be selected on gfx12 only, with the existing op as
   the fallback, and rebased after the RDNA3.5 `libr4d` port lands.
+- **This head on cards:** the numbers above are from the commit before the environment switches went. Since then
+  `rad-kbench` on one card reads 604 of 604 checked with every per-geometry error unchanged, and 103 of `libr4d`'s 104
+  code objects are unchanged; the four IQ1_S / IQ2_XXS decode MoE kernels were recompiled when their debug branch was
+  removed. The TP4 output identity and decode speed of this head are not re-run yet.
 - **Not gated:** TP2 and TP1 on cards (they boot on the host backend only), thinking mode, contexts past 20k, more than
   4 concurrent sequences, tools, images.
 

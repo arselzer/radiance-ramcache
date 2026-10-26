@@ -3604,6 +3604,7 @@ int Engine::start() {
         d.arch_step   = arch_step_;
         d.profile_ops = cfg_.profile_ops;
         d.row_prefetch = cfg_.row_prefetch;
+        d.tape_dump   = cfg_.debug_tape_dump;
         bind_kv_pools(r->program, [&](int32_t g) { return r->kv.plan(g); }, &d.kv);
         d.registry    = &rad_tools_registry();
         RAD_TRY(r->ctx.init(d));

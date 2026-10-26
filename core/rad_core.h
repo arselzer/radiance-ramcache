@@ -1099,6 +1099,9 @@ struct Config {
     bool    debug_graph = false;
     bool    debug_selection = false;
     bool    debug_placement = false;
+    /* --debug-tape-dump: each rank lists the dispatches of the first recorded pass of each kind
+     * (CtxDesc::tape_dump). */
+    bool    debug_tape_dump = false;
     bool    profile_ops = false;
     /* --live: the live view (spec §16). Off by default like everything else in that section. */
     bool    live_view = false;

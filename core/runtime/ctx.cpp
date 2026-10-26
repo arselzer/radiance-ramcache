@@ -32,6 +32,7 @@ int Ctx::init(const CtxDesc& d) {
     kv_        = d.kv;
     arch_step_ = d.arch_step;
     profiling_ = d.profile_ops;
+    tape_dump_ = d.tape_dump;
     /* A host gather's rows on the mapped tier are read ahead unless --row-prefetch off
      * (runtime/rowprefetch.h). The scratch is sized once, off the step path. */
     row_prefetch_on_ = d.row_prefetch;
@@ -1041,14 +1042,10 @@ int Ctx::record_pass(const RadBatch* b, uint64_t key, PassTape* out) {
     out->scratch_open[0] = scratch_open_[0];
     out->scratch_open[1] = scratch_open_[1];
     {
-        /* RAD_TAPE_DUMP=1: the first recording of each draft pass kind lists its dispatches
+        /* --debug-tape-dump: the first recording of each draft pass kind lists its dispatches
          * (TAPEDUMP lines on stderr, every rank): a diagnostic for issue-order work. */
-        static const bool dump = [] {
-            const char* e = std::getenv("RAD_TAPE_DUMP");
-            return e && e[0] == '1';
-        }();
         const int db = b->draft_pass + 8;
-        haz_dump_ = dump && db >= 0 && db < 64 && !(tape_told_ & (1ull << db));
+        haz_dump_ = tape_dump_ && db >= 0 && db < 64 && !(tape_told_ & (1ull << db));
         if (haz_dump_)
             fprintf(stderr, "TAPEDUMP r%d begin draft %d tok %lld\n", rank_, b->draft_pass,
                     (long long)b->n_tok);

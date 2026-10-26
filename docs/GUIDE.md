@@ -1975,6 +1975,7 @@ flags are refused on it, and so are the pixel bands.
 | `--debug-graph` | print the declared graph and the selection table, and exit |
 | `--debug-selection` | print the selection table |
 | `--debug-placement` | print the placement plan |
+| `--debug-tape-dump` | list the dispatches of the first recorded pass of each kind (`TAPEDUMP` lines on stderr, every rank) and which of them start unordered behind the one before |
 | `--debug-accept-reference-kernels` | serve even when ops resolve to `libref`. Not a production configuration |
 | `--profile-ops` | per-op device timing |
 | `--live` | the live terminal view (§6.4) |

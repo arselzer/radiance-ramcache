@@ -297,6 +297,9 @@ static const Flag g_flags[] = {
     { "--debug-graph",        nullptr,  "print the entire declared graph and exit-quality detail" },
     { "--debug-selection",    nullptr,  "print the selection table" },
     { "--debug-placement",    nullptr,  "print the placement plan" },
+    { "--debug-tape-dump",    nullptr,  "list the dispatches of the first recorded pass of each kind\n"
+    "                                    on stderr (TAPEDUMP lines, every rank) and which of them\n"
+    "                                    start unordered behind the one before" },
     { "--debug-accept-reference-kernels", nullptr,
       "serve even when ops resolve only to a reference library. NOT a production configuration: the reference\n"
       "                              implementation is an oracle and a last resort, and falling back\n"
@@ -929,6 +932,7 @@ int config_parse(int argc, char** argv, Config* c) {
         else if (S("--debug-graph"))           { c->debug_graph = true; c->debug_selection = true; }
         else if (S("--debug-selection"))       c->debug_selection = true;
         else if (S("--debug-placement"))       c->debug_placement = true;
+        else if (S("--debug-tape-dump"))       c->debug_tape_dump = true;
         else if (S("--debug-accept-reference-kernels")) c->accept_reference_kernels = true;
         else if (S("--profile-ops"))           c->profile_ops = true;
         else if (S("--live"))                  c->live_view = true;
@@ -1268,6 +1272,7 @@ const ShowRow kShow[] = {
     { "--debug-graph",        [](const Config& c) { return onoff(c.debug_graph); } },
     { "--debug-selection",    [](const Config& c) { return onoff(c.debug_selection); } },
     { "--debug-placement",    [](const Config& c) { return onoff(c.debug_placement); } },
+    { "--debug-tape-dump",    [](const Config& c) { return onoff(c.debug_tape_dump); } },
     { "--debug-accept-reference-kernels", [](const Config& c) { return onoff(c.accept_reference_kernels); } },
     { "--profile-ops",        [](const Config& c) { return onoff(c.profile_ops); } },
     { "--live",               [](const Config& c) { return onoff(c.live_view); } },

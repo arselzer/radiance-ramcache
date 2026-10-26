@@ -200,6 +200,9 @@ struct CtxDesc {
     /* --row-prefetch: a host gather's rows on the mapped tier are read ahead of (or beside) its
      * kernel (runtime/rowprefetch.h). */
     bool            row_prefetch = true;
+    /* --debug-tape-dump: the first recording of each draft pass kind lists its dispatches on
+     * stderr (TAPEDUMP lines) and which of them start unordered behind the one before. */
+    bool            tape_dump = false;
     /* Whether a repeated pass may be recorded and played back. False for a caller whose pass
      * issues work the batch does not describe (e.g. a test driving another component through
      * run_step), since a recording keyed on the batch would replay the wrong pass. */
@@ -577,7 +580,7 @@ private:
         int32_t  rec0 = 0, rec1 = 0;      /* its dispatches in the tape */
         uint32_t op = 0;
         bool     opaque = false;
-        const KernelRow* row = nullptr;   /* for RAD_TAPE_DUMP only */
+        const KernelRow* row = nullptr;   /* for --debug-tape-dump only */
         uint32_t rd = 0, n_rd = 0, wr = 0, n_wr = 0;   /* into haz_rng_ */
     };
     std::vector<HazOp> haz_ops_;
@@ -585,7 +588,8 @@ private:
     void haz_note(const OpPlan& p, const IssuePlan& ip, const RadTensor* t, int n_opd, int rec0,
                   int rec1);
     int  haz_mark(PassTape& t);
-    bool haz_dump_ = false;   /* RAD_TAPE_DUMP=1: haz_mark lists this recording's dispatches */
+    bool tape_dump_ = false;  /* --debug-tape-dump (CtxDesc::tape_dump) */
+    bool haz_dump_ = false;   /* haz_mark lists this recording's dispatches (tape_dump_) */
 
     static constexpr size_t  kTapes      = 24;     /* recorded passes kept, least recently used out */
     static constexpr int64_t kAuditPlays = 1024;

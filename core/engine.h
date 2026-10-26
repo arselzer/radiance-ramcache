@@ -418,7 +418,8 @@ private:
      * `mtp_couple_state`; the engine stages one draw per drafting row before the serial passes and
      * reads the states back once, then binds each to the verify row it will be coupled at. */
     bool     mtp_couple_ = false;
-    rad_buf  couple_draws_buf_ = 0, couple_state_buf_ = 0;
+    rad_buf  couple_draws_buf_ = 0, couple_state_buf_ = 0;   /* rank 0's handles */
+    std::vector<rad_buf> couple_draws_rank_;           /* the draws plane, by rank */
     int64_t  couple_rows_ = 0;                       /* the state plane's rows per round */
     RadMtpCoupleDraw*  couple_draw_stage_ = nullptr;   /* pinned [max_seqs] */
     RadMtpCoupleState* couple_readback_  = nullptr;    /* pinned [rounds, couple_rows_] */

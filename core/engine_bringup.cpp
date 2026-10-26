@@ -1340,6 +1340,31 @@ int Engine::declare() {
     drafter_       = p0.drafter;
     drafter_name_  = p0.drafter_name;
     drafter_.name  = drafter_name_.c_str();
+    /* Every rank declared its own drafter, and the engine drives one from rank 0's: they must
+     * agree in everything but the proposal's handle, which indexes each rank's own program (a
+     * plugin may declare different buffers per rank) and is resolved per rank (advance_all). */
+    for (size_t i = 1; i < ranks_.size(); ++i) {
+        const Program& pr = ranks_[i]->program;
+        const RadDrafterDecl& d = pr.drafter;
+        bool same = d.kind == drafter_.kind && d.depth == drafter_.depth && d.block == drafter_.block &&
+                    d.proposal_pitch == drafter_.proposal_pitch && d.mask_token == drafter_.mask_token &&
+                    d.window == drafter_.window && !d.proposal == !drafter_.proposal;
+        if (same && d.proposal) {
+            const RadBufDecl& a = p0.buffers[(size_t)drafter_.proposal].decl;
+            const RadBufDecl& b = pr.buffers[(size_t)d.proposal].decl;
+            same = a.dtype == b.dtype && a.rank == b.rank &&
+                   std::equal(a.shape, a.shape + a.rank, b.shape);
+        }
+        if (!same) {
+            RAD_ERR("rank %zu declared drafter '%s' (kind %d, depth %d, block %lld, proposal %s) unlike "
+                    "rank 0's '%s' (kind %d, depth %d, block %lld, proposal %s); every rank runs the "
+                    "same passes", i, pr.drafter_name.c_str(), d.kind, d.depth, (long long)d.block,
+                    d.proposal ? pr.buffers[(size_t)d.proposal].name.c_str() : "none",
+                    drafter_name_.c_str(), drafter_.kind, drafter_.depth, (long long)drafter_.block,
+                    drafter_.proposal ? p0.buffers[(size_t)drafter_.proposal].name.c_str() : "none");
+            return RAD_E_STATE;
+        }
+    }
     /* --spec-ngram asked the plugin to leave its head out (RadBuildCtx::draft_head_off). One that
      * declared it anyway would hold its weights and passes for nothing, so startup stops. */
     if (cfg_.spec_ngram > 0 && drafter_.kind != RAD_DRAFT_NONE) {

@@ -2862,6 +2862,7 @@ static const RadOperandSpec oQuantCols[] = {
 #include "r4d_ds41_elem.inc"
 #include "r4d_ds41_sparse.inc"
 #include "r4d_ds41_ggml.inc"
+#include "r4d_ds41_mxfp4.inc"
 #undef R4D_DS41_SPECS
 
 static const RadOpSchema kSchemas[] = {
@@ -2869,6 +2870,7 @@ static const RadOpSchema kSchemas[] = {
 #include "r4d_ds41_elem.inc"
 #include "r4d_ds41_sparse.inc"
 #include "r4d_ds41_ggml.inc"
+#include "r4d_ds41_mxfp4.inc"
 #undef R4D_DS41_SCHEMAS
     SCHEMA("rmsnorm", pRmsNorm, oRmsNorm,
            "y = x * rsqrt(mean(x^2) + eps) * (w + wadd). `wadd` is GemmaRMSNorm's `1 +`, added in "
@@ -5449,6 +5451,7 @@ static const RadKernelInfo kKernels[] = {
 #include "r4d_ds41_elem.inc"
 #include "r4d_ds41_sparse.inc"
 #include "r4d_ds41_ggml.inc"
+#include "r4d_ds41_mxfp4.inc"
 #undef R4D_DS41_ROWS
 /* ---------------------------------- the small model ops (r4d_model_bf16.hip) ----------------
  *

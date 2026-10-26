@@ -30,6 +30,8 @@
  *            zero bf16 [1x32] = -delta
  *   iq1_m    codes u11 [1x8]; grid i8 {2048x8}; scale u4 [1x16] = 2ls+1; scale.1 f16 [1x256] = d
  *            (assembled from the scale words' top nibbles); zero bf16 [1x8] = -delta
+ *   mxfp4    codes fp4_e2m1; scale e8m0 [1x32] = e -- OCP MXFP4, the very spelling a Quark or
+ *            gpt-oss safetensors MXFP4 imports as (core/format/checkpoint.cpp)
  *
  * Each line is llama.cpp's dequantize_row_<type> rewritten in the affine order (q = code | grid |
  * table, negated by its sign, less its zero, times every scale level, less every min level):
@@ -42,6 +44,12 @@
  * Gaussian weights with std 0.02, typical for transformer linears, 98-100% of IQ2 and IQ3_XXS
  * super-blocks have d/8 or d/4 below f16's normal range and would lose up to three bits of scale.
  * As an f32 [*x*] constant the factor costs four bytes per tensor and multiplies exactly.
+ *
+ * MXFP4 needs no table and no per-tensor half: ggml's nibble is the OCP e2m1 bit pattern (sign in
+ * bit 3) and kvalues_mxfp4 = 2 * e2m1, so kvalues_mxfp4[q] * 2^(e - 128) = e2m1(q) * 2^(e - 127), the
+ * e8m0 plane's value. The two decodes agree on every e but 255, which ggml reads as 2^127 and OCP
+ * as NaN (ggml's quantiser writes it for no finite weight), and nibble 8 is OCP's -0 and ggml's
+ * +0: the same number, apart in the sign of a zero.
  *
  * Every product in the decode is exact in f32, so the affine order (code * sub-scale * d, where
  * llama.cpp forms d * sub-scale first) reproduces llama.cpp's dequantised values bit for bit. d is
@@ -316,6 +324,18 @@ void unpack_iq4_nl(const void* v, int64_t nb, uint8_t* const* row) {
     }
 }
 
+/* MXFP4: the nibbles in value order (ggml's are iq4_nl's: value j low in qs[j], j + 16 high), the
+ * exponent byte as it is. */
+void unpack_mxfp4(const void* v, int64_t nb, uint8_t* const* row) {
+    const block_mxfp4* b = (const block_mxfp4*)v;
+    uint8_t q[QK_MXFP4];
+    for (int64_t i = 0; i < nb; ++i) {
+        nibbles32(b[i].qs, q);
+        put_nibbles(row[0] + 16 * i, q, QK_MXFP4);
+        row[1][i] = b[i].e;
+    }
+}
+
 void unpack_iq4_xs(const void* v, int64_t nb, uint8_t* const* row) {
     const block_iq4_xs* b = (const block_iq4_xs*)v;
     Bits s(row[2]);
@@ -538,6 +558,15 @@ void pack_iq4_nl(const uint8_t* const* row, int64_t nb, void* v) {
     }
 }
 
+void pack_mxfp4(const uint8_t* const* row, int64_t nb, void* v) {
+    block_mxfp4* b = (block_mxfp4*)v;
+    for (int64_t i = 0; i < nb; ++i) {
+        b[i].e = row[1][i];
+        for (int j = 0; j < 16; ++j)
+            b[i].qs[j] = (uint8_t)(nib(row[0], 32 * i + j) | nib(row[0], 32 * i + j + 16) << 4);
+    }
+}
+
 /* get_scale_min_k4 run backwards: sub-block j's 6-bit scale and min into the 12 scale bytes. */
 inline void k4_put_scale_min(int j, uint32_t d, uint32_t m, uint8_t* q) {
     if (j < 4) {
@@ -641,6 +670,7 @@ const PackEntry kPacks[] = {
     { GGML_TYPE_IQ4_NL,  pack_iq4_nl },
     { GGML_TYPE_IQ2_XXS, pack_iq2_xxs },
     { GGML_TYPE_IQ1_S,   pack_iq1_s },
+    { GGML_TYPE_MXFP4,   pack_mxfp4 },
 };
 
 }  /* namespace */
@@ -667,6 +697,7 @@ const PlaneKind kPlaneKinds[] = {
     { "iq3_s",   GGML_TYPE_IQ3_S,   QK_K,   sizeof(block_iq3_s),   unpack_iq3_s },
     { "iq1_s",   GGML_TYPE_IQ1_S,   QK_K,   sizeof(block_iq1_s),   unpack_iq1_s },
     { "iq1_m",   GGML_TYPE_IQ1_M,   QK_K,   sizeof(block_iq1_m),   unpack_iq1_m },
+    { "mxfp4",   GGML_TYPE_MXFP4,   QK_MXFP4, sizeof(block_mxfp4), unpack_mxfp4 },
 };
 
 PackFn pack_of(uint32_t type) {
@@ -771,6 +802,10 @@ RadEncoding encoding_of(ggml_type t) {
             plane("scale", RAD_U4, t == GGML_TYPE_IQ1_S ? 32 : 16);
             plane("scale.1", RAD_F16, 256);
             plane("zero", RAD_BF16, t == GGML_TYPE_IQ1_S ? 32 : 8);
+            break;
+        case GGML_TYPE_MXFP4:
+            plane("codes", RAD_FP4E2M1, 1);
+            plane("scale", RAD_E8M0, 32);
             break;
     }
     return e;

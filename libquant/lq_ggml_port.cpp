@@ -146,6 +146,7 @@ static size_t ggml_type_size(enum ggml_type type) {
         case GGML_TYPE_IQ2_S:   return sizeof(block_iq2_s);
         case GGML_TYPE_IQ4_XS:  return sizeof(block_iq4_xs);
         case GGML_TYPE_IQ1_M:   return sizeof(block_iq1_m);
+        case GGML_TYPE_MXFP4:   return sizeof(block_mxfp4);
     }
     GGML_ABORT("not a type this port quantises");
 }
@@ -158,6 +159,7 @@ static int64_t ggml_blck_size(enum ggml_type type) {
         case GGML_TYPE_Q5_1:   return QK5_1;
         case GGML_TYPE_Q8_0:   return QK8_0;
         case GGML_TYPE_IQ4_NL: return QK4_NL;
+        case GGML_TYPE_MXFP4:  return QK_MXFP4;
         default:               return QK_K;
     }
 }
@@ -4240,6 +4242,86 @@ size_t quantize_iq2_s(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
         qrow += nblock*sizeof(block_iq2_s);
     }
     return nrow * nblock * sizeof(block_iq2_s);
+}
+
+// ---- ggml-impl.h:477-496 (ggml_e8m0_to_fp32_half)
+static inline float ggml_e8m0_to_fp32_half(uint8_t x) {
+    uint32_t bits;
+
+    // For x < 2: use precomputed denormal patterns
+    if (x < 2) {
+        // 0x00200000 = 2^(-128), 0x00400000 = 2^(-127)
+        bits = 0x00200000 << x;
+    }
+    // For x >= 2: normalized exponent adjustment
+    else {
+        // 0.5 * 2^(x-127) = 2^(x-128) = normalized with exponent (x-1)
+        bits = (uint32_t)(x - 1) << 23;
+    }
+    // Note: NaNs are not handled here
+
+    float result;
+    memcpy(&result, &bits, sizeof(float));
+    return result;
+}
+#define GGML_E8M0_TO_FP32_HALF(x) ggml_e8m0_to_fp32_half(x)
+
+// ---- ggml-quants.c:299-345
+static inline int best_index_mxfp4(float x, float e) {
+    int best_index = 0;
+    float best_err = fabsf(kvalues_mxfp4[0]*e - x);
+    for (int i = 1; i < 16; i++) {
+        float err = fabsf(kvalues_mxfp4[i]*e - x);
+        if (err < best_err) {
+            best_index = i;
+            best_err = err;
+        }
+    }
+    return best_index;
+}
+
+void quantize_row_mxfp4_ref(const float * GGML_RESTRICT x, block_mxfp4 * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_MXFP4;
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        float amax = 0.0f; // absolute max
+
+        for (int j = 0; j < qk; j++) {
+            const float v = x[i*qk + j];
+
+            if (amax < fabsf(v)) {
+                amax = fabsf(v);
+            }
+        }
+
+        // Upstream converts the float to uint8_t directly, undefined below 0 (amax under 2^-125);
+        // through int32 it is the low byte x86-64's cvttss2si leaves there, the same for every
+        // amax a weight has.
+        const uint8_t e = amax > 0.0f ? (uint8_t) (int32_t) (floorf(log2f(amax)) - 2 + 127) : 0;
+
+        const float d = GGML_E8M0_TO_FP32_HALF(e);
+
+        y[i].e = e;
+
+        for (int j = 0; j < qk/2; ++j) {
+            const uint8_t x0 = best_index_mxfp4(x[i*qk + 0    + j], d);
+            const uint8_t x1 = best_index_mxfp4(x[i*qk + qk/2 + j], d);
+
+            y[i].qs[j]  = x0;
+            y[i].qs[j] |= x1 << 4;
+        }
+    }
+}
+
+// ---- ggml-quants.c:2230-2234
+size_t quantize_mxfp4(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    (void)quant_weights;
+    quantize_row_mxfp4_ref(src, (block_mxfp4 *)dst, (int64_t)nrow*n_per_row);
+    return nrow * ggml_row_size(GGML_TYPE_MXFP4, n_per_row);
 }
 
 /* ================================================================== ggml.c: ggml_quantize_init

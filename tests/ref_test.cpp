@@ -708,7 +708,7 @@ TEST(token_map_and_stream_gate_add) {
  * dot over those dequantised values bit for bit -- and the logical f32 form of the same weight
  * gives the same bits. Random blocks, each f16 super-scale set finite. */
 TEST(gemm_nt_ggml_reads_native_blocks_as_llama_cpp_dequantises) {
-    struct Ty { const char* name; uint32_t type; std::vector<size_t> f16_at; };
+    struct Ty { const char* name; uint32_t type; std::vector<size_t> f16_at; std::vector<size_t> e8_at = {}; };
     const Ty types[] = {
         { "q8_0",    8,  { offsetof(lq::ggml::block_q8_0, d) } },
         { "q5_K",    13, { offsetof(lq::ggml::block_q5_K, d), offsetof(lq::ggml::block_q5_K, dmin) } },
@@ -716,6 +716,7 @@ TEST(gemm_nt_ggml_reads_native_blocks_as_llama_cpp_dequantises) {
         { "iq4_nl",  20, { offsetof(lq::ggml::block_iq4_nl, d) } },
         { "iq2_xxs", 16, { offsetof(lq::ggml::block_iq2_xxs, d) } },
         { "iq1_s",   19, { offsetof(lq::ggml::block_iq1_s, d) } },
+        { "mxfp4",   39, {}, { offsetof(lq::ggml::block_mxfp4, e) } },
     };
     uint64_t seed = 0x2545F4914F6CDD1Dull;
     auto rnd = [&]() { seed = seed * 6364136223846793005ull + 1442695040888963407ull; return seed >> 33; };
@@ -731,6 +732,9 @@ TEST(gemm_nt_ggml_reads_native_blocks_as_llama_cpp_dequantises) {
                 const uint16_t h = (uint16_t)((rnd() & 0x8000u) | ((8u + rnd() % 8u) << 10) | (rnd() & 0x3FFu));
                 std::memcpy(blocks.data() + i * (int64_t)k->block_bytes + off, &h, 2);
             }
+        /* an e8m0 exponent near 2^0 (MXFP4: 2^(e - 128) times codes up to 12) */
+        for (int64_t i = 0; i < N * nb; ++i)
+            for (size_t off : ty.e8_at) blocks[(size_t)(i * (int64_t)k->block_bytes + off)] = (uint8_t)(122u + rnd() % 8u);
         T w(RAD_U8, {N, rb}); w.raw(blocks);
         T wl(RAD_F32, {N, K});
         std::vector<float> deq((size_t)(N * K));
@@ -769,12 +773,13 @@ TEST(gemm_nt_ggml_reads_native_blocks_as_llama_cpp_dequantises) {
  * f32 index-order dot of its activation row with its expert's dequantised weight row, bit for bit;
  * a dropped row is zeros. */
 TEST(moe_gemm_ggml_routes_rows_to_native_block_experts) {
-    struct Ty { const char* name; uint32_t type; std::vector<size_t> f16_at; };
+    struct Ty { const char* name; uint32_t type; std::vector<size_t> f16_at; std::vector<size_t> e8_at = {}; };
     const Ty types[] = {
         { "q8_0",    8,  { offsetof(lq::ggml::block_q8_0, d) } },
         { "q6_K",    14, { offsetof(lq::ggml::block_q6_K, d) } },
         { "iq2_xxs", 16, { offsetof(lq::ggml::block_iq2_xxs, d) } },
         { "iq1_s",   19, { offsetof(lq::ggml::block_iq1_s, d) } },
+        { "mxfp4",   39, {}, { offsetof(lq::ggml::block_mxfp4, e) } },
     };
     uint64_t seed = 0x9E3779B97F4A7C15ull;
     auto rnd = [&]() { seed = seed * 6364136223846793005ull + 1442695040888963407ull; return seed >> 33; };
@@ -798,6 +803,8 @@ TEST(moe_gemm_ggml_routes_rows_to_native_block_experts) {
                 const uint16_t h = (uint16_t)((rnd() & 0x8000u) | ((8u + rnd() % 8u) << 10) | (rnd() & 0x3FFu));
                 std::memcpy(blocks.data() + i * (int64_t)k->block_bytes + o, &h, 2);
             }
+        for (int64_t i = 0; i < NE * N * nb; ++i)
+            for (size_t o : ty.e8_at) blocks[(size_t)(i * (int64_t)k->block_bytes + o)] = (uint8_t)(122u + rnd() % 8u);
         T w(RAD_U8, {NE, N, rb}); w.raw(blocks);
         std::vector<float> deq((size_t)(NE * N * K));
         for (int64_t r = 0; r < NE * N; ++r)

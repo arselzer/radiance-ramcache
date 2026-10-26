@@ -966,6 +966,7 @@ int r4d_fuse_attn_paged_gate_quant(const RadParam*, int, uint64_t, int, RadFuseS
 #include "r4d_ds41_elem.h"
 #include "r4d_ds41_sparse.h"
 #include "r4d_ds41_ggml.h"
+#include "r4d_ds41_mxfp4.h"
 
 }  /* extern "C" */
 

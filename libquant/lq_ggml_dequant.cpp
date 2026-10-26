@@ -33,6 +33,13 @@ float f16_to_f32(uint16_t h) {
     return f;
 }
 
+float e8m0_to_fp32_half(uint8_t e) {
+    const uint32_t bits = e < 2 ? 0x00200000u << e : (uint32_t)(e - 1) << 23;
+    float f;
+    std::memcpy(&f, &bits, 4);
+    return f;
+}
+
 namespace {
 
 inline void scale_min_k4(int j, const uint8_t* q, uint8_t* d, uint8_t* m) {
@@ -164,6 +171,22 @@ void dq_iq1_s(const void* v, float* y, int64_t k) {
     }
 }
 
+/* MXFP4: e, qs[16]. y[j] = kvalues_mxfp4[qs[j] & 15] * d, y[j + 16] = kvalues_mxfp4[qs[j] >> 4] * d,
+ * d = 2^(e - 128); an int8 times a power of two, exact in f32 short of overflow. */
+void dq_mxfp4(const void* v, float* y, int64_t k) {
+    const block_mxfp4* x = (const block_mxfp4*)v;
+    const int64_t nb = k / QK_MXFP4;
+    for (int64_t i = 0; i < nb; i++) {
+        const float d = e8m0_to_fp32_half(x[i].e);
+        for (int j = 0; j < QK_MXFP4 / 2; ++j) {
+            const int8_t x0 = kvalues_mxfp4[x[i].qs[j] & 0x0F];
+            const int8_t x1 = kvalues_mxfp4[x[i].qs[j] >> 4];
+            y[i * QK_MXFP4 + j + 0] = x0 * d;
+            y[i * QK_MXFP4 + j + QK_MXFP4 / 2] = x1 * d;
+        }
+    }
+}
+
 struct Entry { ggml_type type; DequantFn fn; };
 const Entry kDequant[] = {
     { GGML_TYPE_Q8_0,    dq_q8_0 },
@@ -172,6 +195,7 @@ const Entry kDequant[] = {
     { GGML_TYPE_IQ4_NL,  dq_iq4_nl },
     { GGML_TYPE_IQ2_XXS, dq_iq2_xxs },
     { GGML_TYPE_IQ1_S,   dq_iq1_s },
+    { GGML_TYPE_MXFP4,   dq_mxfp4 },
 };
 
 }  /* namespace */

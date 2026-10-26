@@ -35,7 +35,7 @@ const PlaneKind* plane_kind(uint32_t type);
 /* The inverse of a type's UnpackFn: plane i's row at row[i] -> the `nb` native blocks of one row,
  * every byte written, so unpack then pack returns any block's bytes unchanged. A kernel that reads
  * llama.cpp's block layout relayouts a container's planes with it at load. Null for a type with no
- * pack yet (written so far: q8_0, q5_K, q6_K, iq4_nl, iq2_xxs, iq1_s). */
+ * pack yet (written so far: q8_0, q5_K, q6_K, iq4_nl, iq2_xxs, iq1_s, mxfp4). */
 typedef void (*PackFn)(const uint8_t* const* row, int64_t nb, void* blocks);
 PackFn pack_of(uint32_t type);
 

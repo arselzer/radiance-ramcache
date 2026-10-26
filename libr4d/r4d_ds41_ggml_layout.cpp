@@ -8,7 +8,9 @@
  * libref's so a weight both libraries read is stored once. The unrelayout unpacks the blocks
  * back into the planes and writes the shared tables (an IQ grid). The row length is `K` for the
  * GEMMs and `n_embd` for the vocabulary ops. Only the types the kernels decode are served (pack
- * and dequant both written in libquant): q8_0, q5_K, q6_K, iq4_nl, iq2_xxs, iq1_s. */
+ * and dequant both written in libquant): q8_0, q5_K, q6_K, iq4_nl, iq2_xxs, iq1_s (r4d_ds41_ggml),
+ * and mxfp4 (r4d_ds41_mxfp4: OCP MXFP4's planes, fp4_e2m1 codes and an e8m0 per 32, packed into
+ * block_mxfp4 {e, qs[16]}, 17 bytes a block of 32). */
 #include "r4d_plugin.h"
 
 #include "lq_ggml_dequant.h"
@@ -74,6 +76,7 @@ const char* gg_tag(const lq::ggml::PlaneKind* k) {
     static const char* const kTags[][2] = {
         { "q8_0", "ggml_q8_0" },     { "q5_K", "ggml_q5_K" },       { "q6_K", "ggml_q6_K" },
         { "iq4_nl", "ggml_iq4_nl" }, { "iq2_xxs", "ggml_iq2_xxs" }, { "iq1_s", "ggml_iq1_s" },
+        { "mxfp4", "ggml_mxfp4" },
     };
     for (const auto& t : kTags)
         if (!std::strcmp(t[0], k->name)) return t[1];

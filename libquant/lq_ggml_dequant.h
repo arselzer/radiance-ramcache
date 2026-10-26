@@ -14,10 +14,17 @@ namespace lq::ggml {
 /* `k` values (a whole number of blocks) of one row's native blocks -> f32 at y. */
 typedef void (*DequantFn)(const void* blocks, float* y, int64_t k);
 
-/* Null for a type with no native reader yet (so far: q8_0, q5_K, q6_K, iq4_nl, iq2_xxs, iq1_s). */
+/* Null for a type with no native reader yet (so far: q8_0, q5_K, q6_K, iq4_nl, iq2_xxs, iq1_s,
+ * mxfp4). */
 DequantFn dequant_of(uint32_t type);
 
 /* IEEE half -> float, exactly (subnormals, infinities and NaN included). */
 float f16_to_f32(uint16_t h);
+
+/* ggml-impl.h's ggml_e8m0_to_fp32_half: MXFP4's block scale 2^(e - 128), exactly (the two
+ * subnormals, e = 0 and 1, included). e = 255 is 2^127: ggml reads no NaN there, where OCP E8M0
+ * (and the core's decode of the e8m0 plane) reads 0xFF as NaN. ggml's quantiser never writes 255
+ * for a finite weight. */
+float e8m0_to_fp32_half(uint8_t e);
 
 }  /* namespace lq::ggml */

@@ -4,12 +4,14 @@
  * The quantiser claims its codes and scales are llama.cpp's own, at the commit vendor/UPSTREAM
  * names (06938ac12, ggml-quants.c built as ggml-base builds it): the same weights and imatrix
  * through llama.cpp's quantize_<type> and through this port give identical GGUF blocks for all
- * nineteen types, and llama.cpp's dequantize_row_<type> equals enc_decode_rows of these planes
+ * twenty types, and llama.cpp's dequantize_row_<type> equals enc_decode_rows of these planes
  * value for value. llama.cpp's quantisers are not in this build, so bit_exact_against_llama_cpp
  * pins hashes of those planes for this file's inputs; any code or scale that moves fails there.
  * The error bounds carry margin and catch a wrong plane layout, which decodes to noise.
  */
 #include "quant_fixture.h"
+#include "../libquant/lq_ggml_dequant.h"
+#include "../libquant/lq_ggml_planes.h"
 
 #include <cstdint>
 
@@ -61,6 +63,7 @@ const Type kTypes[] = {
                "zero=bf16[1x32]", true, 256, 0.751 },
     { "iq1_m", "affine:codes=u11[1x8],grid=i8{2048x8},scale=u4[1x16],scale.1=f16[1x256],"
                "zero=bf16[1x8]", false, 256, 0.770 },
+    { "mxfp4", "fp4_e2m1*e8m0[1x32]", false, 32, 0.169 },
 };
 
 /* llama.cpp's iq1_* and iq2_* types, whose searches are exhaustive over a neighbour grid. */
@@ -161,8 +164,8 @@ TEST(every_type_decodes_within_its_bound) {
 TEST(the_imatrix_reaches_the_search) {
     NEED_LIBQUANT();
     /* With importances the search minimises the importance-weighted error, so every type that
-     * has a search must lower it measurably (2.5-25% on this weight). q8_0 has no search
-     * (llama.cpp rounds to nearest either way) and must not change at all. */
+     * has a search must lower it measurably (2.5-25% on this weight). q8_0 and mxfp4 have no
+     * search (llama.cpp rounds to nearest either way) and must not change at all. */
     const int64_t R = 32, C = 1024;
     const std::vector<float> w = draw(R * C, 11, 10.0f);
     const std::vector<float> imp = importance(C, 12);
@@ -172,7 +175,7 @@ TEST(the_imatrix_reaches_the_search) {
         Quantised b = quantise_ggml(t.name, R, C, w, imp.data(), 8);
         REQUIRE_EQ(a.status, RAD_OK);
         REQUIRE_EQ(b.status, RAD_OK);
-        if (!std::strcmp(t.name, "q8_0")) {
+        if (!std::strcmp(t.name, "q8_0") || !std::strcmp(t.name, "mxfp4")) {
             CHECK(a.planes == b.planes);
             continue;
         }
@@ -230,7 +233,8 @@ TEST(bit_exact_against_llama_cpp) {
     NEED_LIBQUANT();
     /* FNV-1a of every plane's bytes, in plane order, for the [8 x 512] weight below without (0)
      * and with (1) the importances below; each confirmed equal to llama.cpp's own blocks and
-     * dequantisation (see the file header). */
+     * dequantisation (see the file header); mxfp4's by llama.cpp's own ggml_quantize_chunk through
+     * libggml-base on the same draw. */
     struct Pin { const char* type; int imatrix; uint64_t fnv; };
     const Pin kPins[] = {
         { "q4_0", 0, 0xafebf0225eb23c08ull },    { "q4_0", 1, 0x249e07415953dc83ull },
@@ -251,6 +255,7 @@ TEST(bit_exact_against_llama_cpp) {
         { "iq3_s", 0, 0x7feeb3c566708bebull },   { "iq3_s", 1, 0xae2be8d72969b54aull },
         { "iq1_s", 1, 0xd527fc0b9d1bbb0aull },
         { "iq1_m", 0, 0xba4b5b012fb32412ull },   { "iq1_m", 1, 0x691e880c1d50e84dull },
+        { "mxfp4", 0, 0xafc06a47ffba4991ull },   { "mxfp4", 1, 0xafc06a47ffba4991ull },
     };
     const int64_t R = 8, C = 512;
     const std::vector<float> w = draw(R * C, 0x6a6, 8.0f);
@@ -310,6 +315,8 @@ TEST(a_weight_the_type_cannot_tile_is_declined) {
     CHECK_EQ(encoding_status("q4_K", 4, 512), RAD_OK);
     CHECK_EQ(encoding_status("q4_K", 4, 512 + 32), RAD_E_UNSUPPORTED);
     CHECK_EQ(encoding_status("iq4_nl", 4, 2880), RAD_OK);
+    CHECK_EQ(encoding_status("mxfp4", 4, 2880), RAD_OK);
+    CHECK_EQ(encoding_status("mxfp4", 4, 2880 + 16), RAD_E_UNSUPPORTED);
     CHECK_EQ(encoding_status("iq4_xs", 4, 2880), RAD_E_UNSUPPORTED);
     /* a vector is declined, not an error */
     CHECK_EQ(encoding_status("q8_0", 1, 256, 1), RAD_E_UNSUPPORTED);
@@ -342,6 +349,92 @@ TEST(the_imatrix_types_refuse_to_run_without_one) {
         Quantised q = quantise_ggml(t.name, R, C, w, nullptr);
         CHECK_EQ(q.status, t.needs_im ? RAD_E_INVAL : RAD_OK);
     }
+}
+
+/* MXFP4 restated from its definitions rather than from the port. (1) A GGUF block (e, qs[16]) and
+ * its planes are one another: random blocks unpack and pack back to the same bytes. (2) Its values
+ * are OCP MXFP4's: llama.cpp's dequantize_row_mxfp4 (dequant_of: kvalues_mxfp4[q] * 2^(e - 128),
+ * the doubled table at half the scale), the core's decode of the planes (fp4_e2m1 codes times the
+ * e8m0 plane) and e2m1 * 2^(e - 127) worked here in double all agree bit for bit, with value j
+ * of a block the low nibble of qs[j] and value j + 16 the high one; and the dequantised bytes hash
+ * to what gguf-py's MXFP4.dequantize_blocks gives for the same blocks. The
+ * exponents cover the two subnormal scales (e = 0, 1) and 100..154; 255 is the one exponent where
+ * ggml (2^127) and OCP (NaN) part, and no quantiser writes it. (3) Without an imatrix the codes
+ * are llama.cpp's round to nearest at e = floor(log2 amax) - 2 + 127. */
+TEST(mxfp4_blocks_are_ocp_mxfp4_and_round_trip) {
+    NEED_LIBQUANT();
+    const uint32_t type = 39;
+    const lq::ggml::PlaneKind* k = lq::ggml::plane_kind(type);
+    REQUIRE(k != nullptr);
+    REQUIRE(lq::ggml::pack_of(type) != nullptr);
+    REQUIRE(lq::ggml::dequant_of(type) != nullptr);
+    CHECK_EQ(k->block, (int64_t)32);
+    CHECK_EQ(k->block_bytes, (size_t)17);
+    CHECK_EQ(std::string(k->name), std::string("mxfp4"));
+    uint64_t seed = 0x4D584650345F5445ull;   /* "MXFP4_TE" */
+    auto rnd = [&]() { seed = seed * 6364136223846793005ull + 1442695040888963407ull; return seed >> 33; };
+    const int64_t nb = 48, cols = nb * 32;
+    std::vector<uint8_t> blocks((size_t)(nb * 17));
+    for (uint8_t& b : blocks) b = (uint8_t)rnd();
+    for (int64_t i = 0; i < nb; ++i) blocks[(size_t)(17 * i)] = (uint8_t)(100 + rnd() % 55);
+    blocks[0] = 0; blocks[17] = 1; blocks[34] = 2;
+    /* (1) the planes, as the import writes them, and back */
+    const RadEncoding e = lq::ggml::encoding_of(k->type);
+    REQUIRE_EQ(e.n_planes, 2);
+    Quantised q;
+    q.enc = e;
+    q.planes.emplace_back((size_t)rad_enc_plane_bytes(&e.plane[0], 1, cols), 0);
+    q.planes.emplace_back((size_t)rad_enc_plane_bytes(&e.plane[1], 1, cols), 0);
+    CHECK_EQ(q.planes[0].size(), (size_t)(cols / 2));
+    CHECK_EQ(q.planes[1].size(), (size_t)nb);
+    uint8_t* row[2] = { q.planes[0].data(), q.planes[1].data() };
+    k->unpack(blocks.data(), nb, row);
+    std::vector<uint8_t> back(blocks.size(), 0xA5);
+    lq::ggml::pack_of(type)((const uint8_t* const*)row, nb, back.data());
+    CHECK(back == blocks);
+    for (int64_t i = 0; i < nb; ++i) CHECK_EQ(q.planes[1][(size_t)i], blocks[(size_t)(17 * i)]);
+    /* (2) three decodes */
+    std::vector<float> dq((size_t)cols);
+    lq::ggml::dequant_of(type)(blocks.data(), dq.data(), cols);
+    const std::vector<float> core = decode(q, 1, cols);
+    REQUIRE_EQ(core.size(), (size_t)cols);
+    static const double kE2m1[16] = { 0, .5, 1, 1.5, 2, 3, 4, 6, 0, -.5, -1, -1.5, -2, -3, -4, -6 };
+    int bad = 0;
+    for (int64_t v = 0; v < cols; ++v) {
+        const uint8_t* b = blocks.data() + 17 * (v / 32);
+        const int j = (int)(v % 32);
+        const int nibble = j < 16 ? (b[1 + j] & 15) : (b[1 + j - 16] >> 4);
+        const float ocp = (float)std::ldexp(kE2m1[nibble], (int)b[0] - 127);
+        bad += dq[(size_t)v] != ocp || core[(size_t)v] != ocp;
+    }
+    CHECK_EQ(bad, 0);
+    std::vector<uint8_t> bytes((size_t)cols * 4);
+    std::memcpy(bytes.data(), dq.data(), bytes.size());
+    CHECK(fnv(bytes) == 0x560d6ed748103508ull);
+    /* (3) round to nearest against the half scale */
+    const int64_t RR = 4, CC = 256;
+    const std::vector<float> w = draw(RR * CC, 23, 6.0f);
+    Quantised z = quantise_ggml("mxfp4", RR, CC, w, nullptr);
+    REQUIRE_EQ(z.status, RAD_OK);
+    static const int8_t kv[16] = { 0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12 };
+    int off = 0;
+    for (int64_t r = 0; r < RR; ++r)
+        for (int64_t blk = 0; blk < CC / 32; ++blk) {
+            const float* x = w.data() + r * CC + 32 * blk;
+            float amax = 0;
+            for (int j = 0; j < 32; ++j) amax = std::fmax(amax, std::fabs(x[j]));
+            const int ee = amax > 0 ? (int)std::floor(std::log2(amax)) - 2 + 127 : 0;
+            off += z.planes[1][(size_t)(r * (CC / 32) + blk)] != (uint8_t)ee;
+            const float d = std::ldexp(1.0f, ee - 128);
+            for (int j = 0; j < 32; ++j) {
+                int best = 0;
+                for (int c = 1; c < 16; ++c)
+                    if (std::fabs(kv[c] * d - x[j]) < std::fabs(kv[best] * d - x[j])) best = c;
+                const int64_t at = r * CC + 32 * blk + j;
+                off += ((z.planes[0][(size_t)(at / 2)] >> (4 * (at % 2))) & 15) != best;
+            }
+        }
+    CHECK_EQ(off, 0);
 }
 
 TEST(quantize_refuses_rows_outside_the_weight) {

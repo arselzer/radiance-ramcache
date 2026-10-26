@@ -202,10 +202,12 @@ set(R4D_UNITS
   # the other three only feed the GEMM.
   "r4d_moe|"
   # DeepSeek-V4.1-Flash: the elementwise and small ops, the sparse attention and its indexer, and
-  # the GEMMs over llama.cpp's native blocks (GGUF imports).
+  # the GEMMs over llama.cpp's native blocks (GGUF imports), MXFP4's in a unit of their own.
   "r4d_ds41_elem|"
   "r4d_ds41_sparse|"
   "r4d_ds41_ggml|"
+  # GGUF MXFP4 blocks (type=mxfp4) for gemm_nt_ggml and moe_gemm_ggml: the DSpark drafter's experts.
+  "r4d_ds41_mxfp4|"
 )
 
 set(R4D_SRC "")

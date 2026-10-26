@@ -2200,10 +2200,20 @@ TEST(a_gguf_tensor_is_row_major_and_its_legacy_blocks_decode_by_definition) {
         f16.bytes.push_back((uint8_t)v);
         f16.bytes.push_back((uint8_t)(v >> 8));
     }
+    /* An MXFP4 tensor [2, 64] (GGUF type 39: e, qs[16] a block of 32). Row 0, block 0: e = 127,
+     * qs[j] = j | (15 - j) << 4, so value j is e2m1(j) and value 16 + j e2m1(15 - j) at scale 1;
+     * block 1: e = 130 (x 8), every nibble 8 (OCP's -0) but qs[0] = 0x71 (values 0.5 x 8 and 6 x 8
+     * at 0 and 16). Row 1 all zero bytes: e = 0, every value 0. */
+    GTensor mx{ "t.mxfp4", 39, { 64, 2 }, std::vector<uint8_t>(2 * 2 * 17, 0) };
+    mx.bytes[0] = 127;
+    for (int j = 0; j < 16; ++j) mx.bytes[1 + j] = (uint8_t)(j | (15 - j) << 4);
+    mx.bytes[17] = 130;
+    for (int j = 0; j < 16; ++j) mx.bytes[18 + j] = 0x88;
+    mx.bytes[18] = 0x71;
     write_gguf(path, llama_kvs(7),
                { legacy_blocks("t.q8_0", 8, &w8), legacy_blocks("t.q4_0", 2, &w40),
                  legacy_blocks("t.q4_1", 3, &w41), legacy_blocks("t.q5_0", 6, &w50),
-                 legacy_blocks("t.q5_1", 7, &w51), k4, k6, f16 });
+                 legacy_blocks("t.q5_1", 7, &w51), k4, k6, f16, mx });
     Checkpoint ck;
     REQUIRE_EQ(ck.open(path), RAD_OK);
     CHECK(ck.is_gguf());
@@ -2217,6 +2227,7 @@ TEST(a_gguf_tensor_is_row_major_and_its_legacy_blocks_decode_by_definition) {
     prog.name_map.push_back(map("t.q4_k", RAD_MAP_COPY, { "t.q4_k" }));
     prog.name_map.push_back(map("t.q6_k", RAD_MAP_COPY, { "t.q6_k" }));
     prog.name_map.push_back(map("t.f16", RAD_MAP_COPY, { "t.f16" }));
+    prog.name_map.push_back(map("t.mxfp4", RAD_MAP_COPY, { "t.mxfp4" }));
     std::string why;
     for (const auto& l : legacy) {
         CkptWeight w;
@@ -2268,6 +2279,41 @@ TEST(a_gguf_tensor_is_row_major_and_its_legacy_blocks_decode_by_definition) {
         CHECK_EQ(f[32], -43.5f);
         CHECK_EQ(f[64], -28.0f);
         CHECK_EQ(f[96], 50.0f);
+    }
+    {
+        /* MXFP4 imports block for block as OCP MXFP4's own planes (ggml's nibble is the e2m1 bit
+         * pattern, kvalues_mxfp4 [q] * 2^(e - 128) = e2m1(q) * 2^(e - 127)): `fp4_e2m1*e8m0[1x32]`,
+         * the encoding a safetensors MXFP4 imports as, and it decodes as dequantize_row_mxfp4. */
+        CkptWeight w;
+        REQUIRE_EQ(ckpt_resolve(ck, prog, "t.mxfp4", false, &w, &why), RAD_OK);
+        CHECK(w.imported);
+        CHECK(!w.trivial);
+        CHECK(has(w.why, "mxfp4"));
+        char en[128];
+        rad_enc_format(&w.enc, en, sizeof en);
+        CHECK_EQ(std::string(en), std::string("fp4_e2m1*e8m0[1x32]"));
+        CHECK_EQ(w.shape[0], (int64_t)2);
+        CHECK_EQ(w.shape[1], (int64_t)64);
+        static const float kE2m1[16] = { 0, .5f, 1, 1.5f, 2, 3, 4, 6, 0, -.5f, -1, -1.5f, -2, -3, -4, -6 };
+        std::vector<float> f(2 * 64);
+        REQUIRE_EQ(ckpt_rows_f32(w, 0, 2, f.data(), &why), RAD_OK);
+        int bad = 0;
+        for (int v = 0; v < 128; ++v) {
+            float want = 0.0f;
+            if (v < 16) want = kE2m1[v];
+            else if (v < 32) want = kE2m1[15 - (v - 16)];
+            else if (v == 32) want = 4.0f;
+            else if (v == 48) want = 48.0f;
+            bad += f[(size_t)v] != want;
+        }
+        CHECK_EQ(bad, 0);
+        std::vector<float> dq(128);
+        const lq::ggml::DequantFn dqf = lq::ggml::dequant_of(39);
+        REQUIRE(dqf != nullptr);
+        dqf(mx.bytes.data(), dq.data(), 64);
+        dqf(mx.bytes.data() + 34, dq.data() + 64, 64);
+        for (int v = 0; v < 128; ++v) bad += dq[(size_t)v] != f[(size_t)v];
+        CHECK_EQ(bad, 0);
     }
     {
         /* A plain f16 tensor of rank 3 is trivial and reversed in every dimension. */
@@ -3212,7 +3258,7 @@ RAD_TEST_MAIN()
  * types: codes, scales and signs are copied, never interpreted). */
 TEST(ggml_pack_inverts_unpack_for_every_block) {
     const uint32_t types[] = { 8 /* q8_0 */, 13 /* q5_K */, 14 /* q6_K */, 20 /* iq4_nl */,
-                               16 /* iq2_xxs */, 19 /* iq1_s */ };
+                               16 /* iq2_xxs */, 19 /* iq1_s */, 39 /* mxfp4 */ };
     uint64_t seed = 0x9E3779B97F4A7C15ull;
     for (uint32_t ty : types) {
         const lq::ggml::PlaneKind* k = lq::ggml::plane_kind(ty);
@@ -3270,9 +3316,10 @@ TEST(ggml_encodings_are_distinct) {
 
 /* dequant_of (llama.cpp's dequantize_row_<type>) over native blocks equals the core's decode of the
  * same blocks' planes, bit for bit: the native reader's values are the container's. Random blocks
- * with each f16 super-scale set to a finite value (a NaN scale compares unequal to itself). */
+ * with each f16 super-scale set to a finite value (a NaN scale compares unequal to itself), and
+ * MXFP4's e8m0 exponent kept off 255 (ggml's 2^127, OCP's NaN: the one value the two read apart). */
 TEST(ggml_native_dequant_equals_the_plane_decode) {
-    struct T { uint32_t type; std::vector<size_t> f16_at; };
+    struct T { uint32_t type; std::vector<size_t> f16_at; std::vector<size_t> e8_at = {}; };
     const T types[] = {
         { 8,  { offsetof(lq::ggml::block_q8_0, d) } },
         { 13, { offsetof(lq::ggml::block_q5_K, d), offsetof(lq::ggml::block_q5_K, dmin) } },
@@ -3280,6 +3327,7 @@ TEST(ggml_native_dequant_equals_the_plane_decode) {
         { 20, { offsetof(lq::ggml::block_iq4_nl, d) } },
         { 16, { offsetof(lq::ggml::block_iq2_xxs, d) } },
         { 19, { offsetof(lq::ggml::block_iq1_s, d) } },
+        { 39, {}, { offsetof(lq::ggml::block_mxfp4, e) } },
     };
     uint64_t seed = 0xD1B54A32D192ED03ull;
     auto rnd = [&]() { seed = seed * 6364136223846793005ull + 1442695040888963407ull; return seed >> 33; };
@@ -3299,6 +3347,9 @@ TEST(ggml_native_dequant_equals_the_plane_decode) {
                 const uint16_t h = (uint16_t)((rnd() & 0x8000u) | ((5u + rnd() % 14u) << 10) | (rnd() & 0x3FFu));
                 std::memcpy(blocks.data() + i * (int64_t)k->block_bytes + off, &h, 2);
             }
+        /* e8m0 exponents over the subnormal two and the whole normal range short of 255 */
+        for (int64_t i = 0; i < nb; ++i)
+            for (size_t off : ty.e8_at) blocks[(size_t)(i * (int64_t)k->block_bytes + off)] = (uint8_t)(i < 2 ? i : rnd() % 255u);
         std::vector<std::vector<uint8_t>> planes((size_t)e.n_planes);
         std::vector<uint8_t*> row((size_t)e.n_planes, nullptr);
         std::vector<void*> all((size_t)e.n_planes, nullptr);
@@ -3324,6 +3375,9 @@ TEST(ggml_native_dequant_equals_the_plane_decode) {
             uint32_t x, y;
             std::memcpy(&x, &a[(size_t)j], 4);
             std::memcpy(&y, &b[(size_t)j], 4);
+            /* MXFP4's nibble 8 is OCP's -0 (the core decodes -0.0) and ggml's kvalues 0 (+0.0):
+             * the same number, apart only in the sign of a zero */
+            if (ty.type == 39 && a[(size_t)j] == 0.0f && b[(size_t)j] == 0.0f) continue;
             if (x != y) { ++bad; if (first < 0) first = j; }
         }
         CHECK_EQ(bad, (int64_t)0);

@@ -2185,3 +2185,4 @@ extern "C" int r4d_shape_dflash_select(const RadParam* p, int n_p, int operand,
 #include "r4d_ds41_elem_shapes.inc"
 #include "r4d_ds41_sparse_shapes.inc"
 #include "r4d_ds41_ggml_shapes.inc"
+#include "r4d_ds41_mxfp4_shapes.inc"

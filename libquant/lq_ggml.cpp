@@ -58,6 +58,7 @@ const Kind kKinds[] = {
     { "iq3_s",   GGML_TYPE_IQ3_S,   QK_K,   quantize_iq3_s },
     { "iq1_s",   GGML_TYPE_IQ1_S,   QK_K,   quantize_iq1_s },
     { "iq1_m",   GGML_TYPE_IQ1_M,   QK_K,   quantize_iq1_m },
+    { "mxfp4",   GGML_TYPE_MXFP4,   QK_MXFP4, quantize_mxfp4 },
 };
 
 /* ================================================================== the quantiser */
@@ -153,15 +154,15 @@ int ggml_quantize(const RadParam* o, int n_o, const RadQuantWeight* w, float* sr
 const RadQuantOption kOptions[] = {
     { "type", RAD_P_STR, nullptr,
       "the llama.cpp type, any case: q4_0 q4_1 q5_0 q5_1 q8_0 q2_K q3_K q4_K q5_K q6_K iq4_nl "
-      "iq4_xs iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq1_s iq1_m. iq2_xxs, iq2_xs and iq1_s need an "
-      "imatrix" },
+      "iq4_xs iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq1_s iq1_m mxfp4. iq2_xxs, iq2_xs and iq1_s need an "
+      "imatrix; mxfp4 (one round-to-nearest path, as upstream) ignores one" },
 };
 
 }  /* namespace */
 
 const RadQuantizerInfo ggml_quantizer = {
     "ggml",
-    "llama.cpp's legacy, K- and I-quants, the codes and scales chosen by llama.cpp's own search "
+    "llama.cpp's legacy, K- and I-quants and MXFP4, the codes and scales chosen by llama.cpp's own search "
     "(with the imatrix when the converter has one) and stored as affine planes",
     kOptions, (int)(sizeof kOptions / sizeof kOptions[0]),
     ggml_encoding, ggml_row_block, ggml_quantize, nullptr,

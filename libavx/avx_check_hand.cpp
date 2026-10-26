@@ -4802,17 +4802,18 @@ void audio_cases(std::vector<Hand>& hs) {
  * that skip a row. */
 void ds41_cases(std::vector<Hand>& hs) {
     /* ---- the GEMMs and the lookup over native blocks ------------------------------------ */
-    /* Random blocks, each f16 scale set to a finite value near 1, so every dequantised value is a
-     * number of the size the type stores. The offsets are the types' llama.cpp block layouts
-     * (libquant/lq_ggml_port.h). */
-    struct Ty { const char* name; int64_t block, bytes; std::vector<int64_t> f16_at; };
+    /* Random blocks, each f16 scale set to a finite value near 1 and each E8M0 exponent near 2^0,
+     * so every dequantised value is a number of the size the type stores. The offsets are the
+     * types' llama.cpp block layouts (libquant/lq_ggml_port.h). */
+    struct Ty { const char* name; int64_t block, bytes; std::vector<int64_t> f16_at, e8_at; };
     const Ty types[] = {
-        { "q8_0",    32,  34,  { 0 } },
-        { "q5_K",    256, 176, { 0, 2 } },
-        { "q6_K",    256, 210, { 208 } },
-        { "iq4_nl",  32,  18,  { 0 } },
-        { "iq2_xxs", 256, 66,  { 0 } },
-        { "iq1_s",   256, 50,  { 0 } },
+        { "q8_0",    32,  34,  { 0 },    {} },
+        { "q5_K",    256, 176, { 0, 2 }, {} },
+        { "q6_K",    256, 210, { 208 },  {} },
+        { "iq4_nl",  32,  18,  { 0 },    {} },
+        { "iq2_xxs", 256, 66,  { 0 },    {} },
+        { "iq1_s",   256, 50,  { 0 },    {} },
+        { "mxfp4",   32,  17,  {},       { 0 } },
     };
     uint64_t seed = 0x2545F4914F6CDD1Dull;
     auto rnd = [&]() { seed = seed * 6364136223846793005ull + 1442695040888963407ull; return seed >> 33; };
@@ -4825,6 +4826,7 @@ void ds41_cases(std::vector<Hand>& hs) {
                 const uint16_t h = (uint16_t)((rnd() & 0x8000u) | ((8u + rnd() % 8u) << 10) | (rnd() & 0x3FFu));
                 std::memcpy(b.data() + i * ty.bytes + off, &h, 2);
             }
+            for (int64_t off : ty.e8_at) b[(size_t)(i * ty.bytes + off)] = (uint8_t)(122u + rnd() % 8u);
         }
         return b;
     };

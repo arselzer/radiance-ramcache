@@ -159,6 +159,13 @@ void usage() {
         "                       old header and length\n"
         "      --plan-only      declare, plan every weight's encoding, print the plan, and stop\n"
         "                       before writing anything\n"
+        "      --sources FILE   one JSON line a planned weight: its logical shape, the encoding\n"
+        "                       planned, how it is stored, and the checkpoint tensors (and rows\n"
+        "                       of them) its pieces and scales read -- the name map as resolved\n"
+        "      --dump-f32 SPEC:OUT  SPEC lists 'NAME ROW0 NROWS' a line; the f32 rows a quantiser\n"
+        "                       is handed for each are appended to OUT in that order (raw\n"
+        "                       little-endian), to check a checkpoint's decoding against another\n"
+        "                       converter's\n"
         "      --report N       the worst N quantisation errors to print (default 20)\n"
         "  -v, --verbose\n"
         "  -h, --help\n");
@@ -199,7 +206,7 @@ int main(int argc, char** argv) {
     bool     max_spec_given = false;
     int      report_n = 20;
     bool     verbose = false, plan_only = false, list_quant = false;
-    std::string reuse_path, changed_path;
+    std::string reuse_path, changed_path, sources_path, dump_spec, dump_out;
     bool        in_place = false;
     int         kv_dtype = RAD_DT_INVALID;
     std::vector<std::pair<std::string, std::string>> set_kv;
@@ -242,6 +249,17 @@ int main(int argc, char** argv) {
                                        max_spec_given = true; }
         else if (a == "--draft-model") draft_dir = next("--draft-model");
         else if (a == "--plan-only") plan_only = true;
+        else if (a == "--sources")   sources_path = next("--sources");
+        else if (a == "--dump-f32") {
+            const std::string v = next("--dump-f32");
+            const size_t c = v.find(':');
+            if (c == std::string::npos || c == 0 || c + 1 == v.size()) {
+                std::fprintf(stderr, "rad-convert: --dump-f32 wants SPEC:OUT, got '%s'\n", v.c_str());
+                return 2;
+            }
+            dump_spec = v.substr(0, c);
+            dump_out = v.substr(c + 1);
+        }
         else if (a == "--report")    report_n = (int)num("--report", 0, INT32_MAX);
         else if (a == "--reuse")     reuse_path = next("--reuse");
         else if (a == "--changed")   changed_path = next("--changed");
@@ -710,6 +728,92 @@ int main(int argc, char** argv) {
                          (long long)n, (long long)rounded, (long long)n_round,
                          rad_dtype_name(f.scale), max_rel);
         }
+    }
+
+    /* ---------------------------------------------------------------- --sources, --dump-f32 */
+    if (!sources_path.empty()) {
+        std::ofstream so(sources_path);
+        if (!so) { RAD_ERR("--sources %s: cannot write it", sources_path.c_str()); return 1; }
+        auto jstr = [](const std::string& x) {
+            std::string o = "\"";
+            for (char ch : x) {
+                if (ch == '"' || ch == '\\') o += '\\';
+                o += ch;
+            }
+            return o + "\"";
+        };
+        auto jshape = [](const std::vector<int64_t>& sh) {
+            std::string o = "[";
+            for (size_t i = 0; i < sh.size(); ++i) o += (i ? "," : "") + std::to_string(sh[i]);
+            return o + "]";
+        };
+        auto jtensors = [&](const std::vector<const SrcTensor*>& v) {
+            std::string o = "[";
+            for (size_t i = 0; i < v.size(); ++i) {
+                o += i ? "," : "";
+                o += v[i] ? "{\"name\":" + jstr(v[i]->name) + ",\"tensor\":" +
+                                jstr(ckpt_tensor_of(*v[i])) + ",\"dtype\":" +
+                                jstr(v[i]->rad_dtype == RAD_DT_INVALID
+                                         ? std::string("ggml") + std::to_string(v[i]->ggml)
+                                         : std::string(rad_dtype_name(v[i]->rad_dtype))) +
+                                ",\"shape\":" + jshape(v[i]->shape) + "}"
+                          : "null";
+            }
+            return o + "]";
+        };
+        for (const Logical* L : plan) {
+            const CkptWeight& c = L->src;
+            std::vector<int64_t> sh(c.shape, c.shape + c.rank);
+            const std::string how = L->rule ? L->rule->rule->quantizer + " " + L->rule->rule->options_text()
+                                  : L->import_rule ? std::string(kImportRule) + " " +
+                                                         L->import_rule->options_text()
+                                  : c.imported ? "imported" : "as is";
+            so << "{\"name\":" << jstr(c.name) << ",\"shape\":" << jshape(sh)
+               << ",\"rows\":" << c.rows << ",\"cols\":" << c.cols << ",\"encoding\":"
+               << jstr(enc_name(L->enc)) << ",\"stored\":" << jstr(how)
+               << ",\"form\":" << jstr(!c.derived.empty() ? "derived" : c.trivial ? "trivial"
+                                        : c.imported ? "imported" : "other")
+               << ",\"concat_dim\":" << c.concat_dim << ",\"pieces\":" << jtensors(c.pieces)
+               << ",\"scales\":" << jtensors(c.scales) << ",\"layer\":" << L->layer
+               << ",\"expert\":" << L->expert << "}\n";
+        }
+        RAD_INFO("--sources: %zu weight(s) written to %s", plan.size(), sources_path.c_str());
+    }
+    if (!dump_spec.empty()) {
+        std::ifstream sf(dump_spec);
+        FILE* of = std::fopen(dump_out.c_str(), "wb");
+        if (!sf || !of) {
+            RAD_ERR("--dump-f32 %s:%s: cannot read the one or write the other", dump_spec.c_str(),
+                    dump_out.c_str());
+            if (of) std::fclose(of);
+            return 1;
+        }
+        std::string nm;
+        int64_t r0 = 0, nr = 0, n_req = 0, n_val = 0;
+        std::vector<float> buf;
+        while (sf >> nm >> r0 >> nr) {
+            auto it = logical.find(nm);
+            if (it == logical.end() || it->second.status != RAD_OK) {
+                RAD_ERR("--dump-f32: '%s' is not a planned weight", nm.c_str());
+                std::fclose(of);
+                return 1;
+            }
+            const CkptWeight& c = it->second.src;
+            buf.resize((size_t)(nr * c.cols));
+            std::string why;
+            if (ckpt_rows_f32(c, r0, nr, buf.data(), &why) != RAD_OK) {
+                RAD_ERR("--dump-f32: '%s' rows [%lld, %lld): %s", nm.c_str(), (long long)r0,
+                        (long long)(r0 + nr), why.c_str());
+                std::fclose(of);
+                return 1;
+            }
+            std::fwrite(buf.data(), sizeof(float), buf.size(), of);
+            ++n_req;
+            n_val += (int64_t)buf.size();
+        }
+        std::fclose(of);
+        RAD_INFO("--dump-f32: %lld request(s), %lld value(s) to %s", (long long)n_req,
+                 (long long)n_val, dump_out.c_str());
     }
 
     if (plan_only) {

@@ -30,6 +30,12 @@ below was measured on 4× (and earlier 3×) Radeon AI PRO R9700 (gfx1201, 32 GiB
   to their unfused / reference forms on the gates below.
 - **Engine core:** `rad-convert --imatrix` finds llama.cpp's entry names (`.weight` kept; before this no weight matched
   and iq1_s/iq2_xxs were refused); a long host gather's read-ahead runs beside its kernel when its rows are resident.
+- **No environment switches.** What the branch adds that a user may set is a flag: `--row-prefetch on|off` (the
+  mapped tier's row read-ahead, on), `--mapped-rewarm on|off` (the page-cache rewarm of the mapped tier at startup,
+  on), `--debug-tape-dump` (a recorded pass's dispatch list) and `--debug-draft-oracle FILE` (the verify-path
+  harness the e2e test drives). The lab's A/B and tuning switches are deleted, each with the value every measured
+  run used fixed in code: `deepseek41`'s fused chains and issue order, the `libr4d` kernels' variant and tuning knobs,
+  the port's no-quantise and kept-logits diagnostics.
 
 ## Numbers (UD-IQ1_S mix, 251 GiB container, greedy, thinking off)
 
@@ -96,8 +102,6 @@ Tools and images are not covered.
 
 ## Not done
 
-- **Environment switches still in the branch** (31 names, `R4D_*`, `RADIANCE_*`, `RAD_TAPE_DUMP`): every one becomes a
-  CLI flag, a `--debug-*` flag, or is deleted with its chosen value fixed in code, before any of this is proposed.
 - **`main` does not compile here:** the branch is rebased on `main` at 341cedf, and `main` there includes the
   `core/kvstream/` headers, never committed (#242; the directory is part of #240): neither builds without them.
 - **Family gating:** the kernels use RDNA4 WMMA and FP8; each has to be selected on gfx12 only, with the existing op as

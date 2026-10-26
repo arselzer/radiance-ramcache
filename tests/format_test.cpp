@@ -1620,6 +1620,8 @@ TEST(safetensors_refuses_a_shape_that_is_not_its_span) {
         "{\"t\":{\"dtype\":\"F32\",\"shape\":[-1,-1],\"data_offsets\":[0,4]}}",
         /* fewer elements than the span */
         "{\"t\":{\"dtype\":\"BF16\",\"shape\":[1],\"data_offsets\":[0,4]}}",
+        /* an E8M0 scale is one byte: nine of them are not four bytes */
+        "{\"t\":{\"dtype\":\"F8_E8M0\",\"shape\":[9],\"data_offsets\":[0,4]}}",
     };
     for (const char* h : bad) {
         const std::string path = st_write(h);
@@ -1633,8 +1635,9 @@ TEST(safetensors_refuses_a_shape_that_is_not_its_span) {
         "{\"t\":{\"dtype\":\"F32\",\"shape\":[],\"data_offsets\":[0,4]}}",        /* a scalar */
         "{\"t\":{\"dtype\":\"BF16\",\"shape\":[2,1],\"data_offsets\":[0,4]}}",
         "{\"t\":{\"dtype\":\"F32\",\"shape\":[0,7],\"data_offsets\":[4,4]}}",     /* empty */
+        "{\"t\":{\"dtype\":\"F8_E8M0\",\"shape\":[4],\"data_offsets\":[0,4]}}",   /* four 1-byte scales */
         /* an unsized dtype is left to consumers, which refuse it by name */
-        "{\"t\":{\"dtype\":\"F8_E8M0\",\"shape\":[9],\"data_offsets\":[0,4]}}",
+        "{\"t\":{\"dtype\":\"F64\",\"shape\":[9],\"data_offsets\":[0,4]}}",
     };
     for (const char* h : good) {
         const std::string path = st_write(h);

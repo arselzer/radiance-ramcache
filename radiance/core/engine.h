@@ -122,6 +122,7 @@ private:
     int start_glm_main();
     int glm_main_body();
     int glm_main_declare();
+    int glm_main_vocabulary_admit();
     int glm_main_run_request();
     void glm_main_shutdown() noexcept;
     std::unique_ptr<EngineTinyState> tiny_; // declared before ranks: last owner to retire

@@ -1,0 +1,69 @@
+{
+  "AST_added_functions": [
+    "verify_focused_vocabulary"
+  ],
+  "AST_old_functions_unchanged_except": [
+    "verify_build",
+    "verify_window_inputs",
+    "final_json",
+    "main"
+  ],
+  "AST_parse_only": true,
+  "compiler_or_tokenizer_or_model_or_Docker_executed_by_author": false,
+  "core_revision": "v7",
+  "core_source_pins_sha256": "753436bac31f041b8e051fb4e4797319d4eefa12df6d2bde0f8e28eee407b366",
+  "delta": "Verification-only Core7/fixture9, exact focusedRelease vocabulary proof and Components13 active-mask prewalk bindings/result-token range; all operational bodies exactV4.",
+  "fixture_revision": "v9",
+  "focused_proof_scope": "Exact passedRelease realCPUguard+HOSTmask; full three-mode HOST regressions mandatory. Window source-receipt hash binds focused receipt/logs.",
+  "inputs": {
+    "GLM53_SHIPPED_PLUGIN_HASHES.json": "f6ce7f3167aff1df128545197c00ed405c2b52a5f12f6011b86e9fe5c8894a7d",
+    "build_glm53_main_verified_engine_v7.py": "20fcd63d76dfbd647c641b4e14da4155567a6bcc83fa9af06549786aa0a840be",
+    "glm53-main-verified-components-v13-prototype/SOURCE_RECEIPT.json": "2e364dd804fce51dc3749bab9ae398073b148cb22bd4edca44dbd8974a0fe051",
+    "glm53-main-verified-source-engine-v9-prototype/SOURCE_RECEIPT.json": "31e65caf5d0caba7c716dddbf35f27c58d4bce5ebe818056f7b66c7491a43fc2",
+    "glm53-manual-tokenizer-home-preflight-20261025/METADATA_REVIEW.json": "af19b78c7f07db8c51c50c4d500d7f1ee6c75cfc962b9dc904d70e28578a158c",
+    "run_guarded_heavy_research.py": "7488c4fc4f32e207e4e88cb3dcedbacb6830d85f0fc539bd2be76381bcb11fc2",
+    "validate_glm53_v7_vocabulary.py": "14ae48279cad16efff189b6893761607ab2dc4b771f4bdb8c9295f9793c19f82",
+    "validation-glm53-v7-vocabulary-release-20261025T224721Z/host-mask.log": "fa939a1f5a5322f7db6c056c9b1b0cb3b7d4f56a06958741aff8de7f9e28ca12",
+    "validation-glm53-v7-vocabulary-release-20261025T224721Z/real-vocabulary.log": "7d2c43679d41f5b8860a5679f79b5cfc5e1154876d037d0b83255351418af4ba",
+    "validation-glm53-v7-vocabulary-release-20261025T224721Z/receipt.json": "c594da4686aa0ed39b3d9b1d6c61b67239f0f8bd22f72c7fcd569fd619a8444a"
+  },
+  "legacy_fixture_fallback": "Core<=v5 only; explicit legacy fields must match same revision",
+  "parent_source_receipt": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-manual-maintenance-runner-v4-20261025/SOURCE_RECEIPT.json",
+  "parent_source_receipt_sha256": "90cce1e88d0056dc93e0af55218b28907993ecd7dce1f683a929a275286094ed",
+  "physical_resource_gate": {
+    "AMD_BDFs": [
+      "0000:c3:00.0",
+      "0000:83:00.0",
+      "0000:03:00.0",
+      "0000:06:00.0"
+    ],
+    "GPU_query_subprocess": false,
+    "exact_total_bytes_each": 17095983104,
+    "max_samples": 31,
+    "max_used_bytes_each": 67108864,
+    "min_MemAvailable_bytes": 34359738368,
+    "wait_seconds": 60
+  },
+  "production_changed_by_author": false,
+  "readiness": "Source-onlyRunner5; parent Core7/fixture9 Release/ASan/TSanHOST+focusedRelease+currentComponents13realprewalk+freshV5prepare/idle/resource gates and independent review before actual attempt.",
+  "reviewed_Core_fixture_pairs": [
+    [
+      "v7",
+      "v9"
+    ]
+  ],
+  "revision": "v5",
+  "rollback_limits": [
+    "No external SIGKILL/power-loss guardian",
+    "Same container identity only; parent serving baseline supplies model identity",
+    "Ambiguous original stop acknowledgement remains overall unproven even after best-effort health",
+    "No GPU/driver fault recovery or configuration substitution"
+  ],
+  "runtime_executed_by_author": false,
+  "schema": "glm53-manual-maintenance-source-v1",
+  "scope": "Parent-owned prepare plus one authorized same-container stop/combined GLM startup+one-token/restore window; source only",
+  "source_files": {
+    "README.txt": "cd00441f892ed66bd3ac04c69758968505188a74ff2bfc2d348c30534f930d99",
+    "runner.py": "92bc2bc1b5ec63d36daaaeba1287f8c7e654f37e469230531d1de1cbcbe381c5"
+  }
+}

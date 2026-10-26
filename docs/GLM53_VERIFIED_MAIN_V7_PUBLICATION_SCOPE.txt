@@ -1,0 +1,41 @@
+Core V7 / fixture V9 / Components V13 / archived Runner V5 validation checkpoint
+
+Selected Core remains exactly1535files/pins753436ba. Only six Engine/Sampler
+files differ from publicCore V6/aacccd8. All original raw packages/source maps,
+old Core6 failure and restoration evidence remain unchanged. Exact overlays
+reconstruct all1535 Core6pins, then all1535 Core5pins. ABI27 and kernel bodies
+remain unchanged. This final evidence/docs update changes no source/tool/CMake.
+
+Actual Core7 matches full20 HOST commands in Release/ASan/TSan; focused vocabulary
+mask+actual CPU check passes all3modes. Initial focused ASan attempt233425Z remains
+FAILED: assertions printed PASS, then LeakSanitizer fatal-under-ptrace prevented
+successful executor completion. Same source/build host rerun233641Z passed; no
+source or sanitizer diagnostic suppression manufactures a pass. Full actual
+Components13 prewalk passed four logical rank/native bindings,5088 ordinary jobs,
+193536 expert view omissions/161715585024B expert data; no model execution there.
+
+The controlled four-RX9070XT trial233912Z PASSED one combined startup/transport/
+model-step run: exactly ONE raw input token and ONE output154822 [gMASK]. Actual
+quantum4/attention4/state1, maxTok1/seq1/spec0/exactwire/context512/emptyresidents.
+All5088ordinaryuploads/drains=16921544160B. Verified native161715585024B and raw
+mapped185066521464B. Whole840.326schild includes complete verification/load/start/
+one step/healthy retirement; cannot derive tok/s. The same original QFN container
+was restored,40.631sstablehealthpassed, independent small QFN inference passed.
+No config/deployment change. This is NOT a subsequent decode/chat/quality/prefill/
+262K/MTP/performance or GPU/driver recovery proof. Special output [gMASK] is a
+valid ID, not a useful-text-quality claim. Core8boundeddecode is NOT exported.
+
+Portable13 Release HOST programs passed using source-identical existing Core7,
+exact3212filemanifest8b966d37. Full tested manifest and overwritten normalized
+metadata are archived under portable-tested-8b966d37-checkpoint. Final source,
+wrapper, CMake, oldrawarchives remain byte-identical; finalmanifest adds only new
+evidence/docs and records this tested association. A fresh Core rebuild from the
+public export was not repeated. Portable defaults remain CPU-only/no download/
+model/maintenance/API action; actual-model CPU mode stays manual. Runner5 source
+is archived only, never imported or invoked by public tools.
+
+Evidence preserves both failures and passes with exact source scopes. No weights,
+native-store/tokenizer payloads, compiled libraries, APIkeys, private serving
+config, DockerConfig/Env or newCore8 candidate is exported. Parent owns actual
+runtime/service/GPU operations and any eventual Git commit/push. Export author
+performs file/hash/source work only.

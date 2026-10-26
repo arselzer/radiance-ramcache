@@ -1,0 +1,143 @@
+{
+  "CPU_staging_summary": {
+    "path": "evidence/glm53-main-verified-v7/CPU_STAGING_SUMMARY.json",
+    "sha256": "32c0847190ea518373af2121b601d56a6b60ef7682890fa49320bfa3c90e213f"
+  },
+  "Core_files": 1535,
+  "Core_pins_sha256": "753436bac31f041b8e051fb4e4797319d4eefa12df6d2bde0f8e28eee407b366",
+  "all_old_raw_packages_and_evidence_unchanged": true,
+  "base_public_commit": "aacccd89ea0e829637380b0d1cc1d066da00cc18",
+  "base_public_manifest_sha256": "013d77df52d34b7113d4838946a31a44eece7ae8eb1decf38534af1eddb190e2",
+  "compiler_runtime_service_Gitcommit_or_push_by_source_author": false,
+  "current_Core": "radiance-glm-main-verified-source-v7-src",
+  "current_components": "glm53-main-verified-components-v13-prototype",
+  "current_fixture": "glm53-main-verified-source-engine-v9-prototype",
+  "current_manual_runner": "glm53-manual-maintenance-runner-v5-20261025",
+  "exact_new_packages": {
+    "glm53-main-verified-components-v13-prototype": {
+      "files": 21,
+      "original_receipt_sha256": "2e364dd804fce51dc3749bab9ae398073b148cb22bd4edca44dbd8974a0fe051",
+      "source_bodies_changed": false
+    },
+    "glm53-main-verified-source-engine-v9-prototype": {
+      "files": 94,
+      "original_receipt_sha256": "31e65caf5d0caba7c716dddbf35f27c58d4bce5ebe818056f7b66c7491a43fc2",
+      "source_bodies_changed": false
+    },
+    "glm53-manual-maintenance-runner-v5-20261025": {
+      "files": 3,
+      "original_receipt_sha256": "ef5d7f382102fdd08b8f50077e5165585fe82e3cf804a60b1da40c44452941eb",
+      "source_bodies_changed": false
+    }
+  },
+  "model_weights_native_store_tokenizer_binaries_private_config_or_credentials_exported": false,
+  "old_Core5_reconstruction": "ApplyCore6sixfileoverlay, then existingV5twofileloaderoverlay; exact1535oldpins verified",
+  "old_Core6_reconstruction": {
+    "exact_all1535_verified": true,
+    "original_pins_sha256": "83d57401b288dc78ddad965498d47c2066e99050291411bc3545985d2a874159",
+    "overlay": "research/historical-core-v6-overlay",
+    "same_current_files": 1529
+  },
+  "only_Core_delta_vs_public6": [
+    "core/engine.cpp",
+    "core/engine.h",
+    "core/engine_glm_main.cpp",
+    "core/engine_glm_main.h",
+    "core/sample/sampler.cpp",
+    "core/sample/sampler.h"
+  ],
+  "pending": [
+    "currentASan/TSanbuildandruntime",
+    "currentcompleteprewalk",
+    "portable13buildandruntime",
+    "Core7actualGPUstartup+one-token"
+  ],
+  "public_ABI27_unchanged": true,
+  "readiness": "SOURCE checkpoint only; no currentGPU/chatReady/performance claim; parent owns build/runtime/test-window evidence",
+  "reviews": {
+    "GLM53_COMPONENTS_V13_VALID_TOKEN_OPTIN_INDEPENDENT_REVIEW.txt": "00c4bf3a63ca6245638f6d7f28adc68928093ceaf05b3102c77dae382d2bc19c",
+    "GLM53_COMPONENTS_V13_VALID_TOKEN_OPTIN_INDEPENDENT_REVIEW_PINS.json": "385b682e2bc2d2916617d8b4310bd702e2e5f05673322dd81ec30293e0752a90",
+    "GLM53_CORE7_FIXTURE9_PADDED_VOCAB_INDEPENDENT_REVIEW.txt": "ea23ff1ae5581f0373562460ecef53ec51e635f8eed32533f129eed9561198cb",
+    "GLM53_CORE7_FIXTURE9_PADDED_VOCAB_INDEPENDENT_REVIEW_PINS.json": "17e74c9d0991b9edf8605a44fa54f28125799a895c597605d2592a9a83f68865",
+    "GLM53_RUNNER_V5_CORE7_VOCABULARY_GATE_INDEPENDENT_REVIEW.txt": "266343e65f6a3a95ceb6a20dc50af2d637466ea25861c107512e3a922feca1bc",
+    "GLM53_RUNNER_V5_CORE7_VOCABULARY_GATE_INDEPENDENT_REVIEW_PINS.json": "92d7fec88f0ea97ce506c4e22e46ac3555ba8c891f6979521a3932b92a9c8239"
+  },
+  "schema": "glm53-core7-flight-source-export-v1",
+  "stable_passing_evidence": {
+    "actual-metadata": {
+      "files_sha256": {
+        "check.log": "c392bd77083758360e831228020d48dcb084e94815e72f1268d8482202dcc9ca",
+        "receipt.json": "219ba270b25a42e82720cb1306886d3e356f62e5e880fd3f0f190ade1ba69d84",
+        "result.json": "930085df2c27fdd559a747765186845dbba56dcbc69dc942d1b26e059298a26d"
+      },
+      "original_directory": "validation-glm53-components-v13-metadata-20261025T230757Z",
+      "passed": true
+    },
+    "build-aql-release": {
+      "files_sha256": {
+        "receipt.json": "4b1dd4aeeafbb8caf0233c64c2346fb3e470e4304d57a0f19b7fdb816daf75bc"
+      },
+      "original_directory": "build-glm53-main-verified-engine-v7-aql-release-evidence-20261025T224946Z",
+      "passed": true
+    },
+    "build-components13-aql-release": {
+      "files_sha256": {
+        "receipt.json": "b6083cf9468958d54f95e02bd16920f270ad09a3857cebd5edba1fef0c387767"
+      },
+      "original_directory": "build-glm53-main-verified-components-v13-aql-release-evidence-20261025T225926Z",
+      "passed": true
+    },
+    "build-host-release": {
+      "files_sha256": {
+        "receipt.json": "018227b44f67bcd7ab64c35dc15710e994b6e669d3ce2eb0ac8baeca42200155"
+      },
+      "original_directory": "build-glm53-main-verified-engine-v7-host-release-evidence-20261025T223733Z",
+      "passed": true
+    },
+    "focused-vocabulary-release": {
+      "files_sha256": {
+        "host-mask.log": "fa939a1f5a5322f7db6c056c9b1b0cb3b7d4f56a06958741aff8de7f9e28ca12",
+        "real-vocabulary.log": "7d2c43679d41f5b8860a5679f79b5cfc5e1154876d037d0b83255351418af4ba",
+        "receipt.json": "c594da4686aa0ed39b3d9b1d6c61b67239f0f8bd22f72c7fcd569fd619a8444a"
+      },
+      "original_directory": "validation-glm53-v7-vocabulary-release-20261025T224721Z",
+      "passed": true
+    },
+    "host-release": {
+      "files_sha256": {
+        "abi_layout_test.log": "d20fc1217850d8e89e62e23e3df15f8e87308fc605c717c496e77a099607c765",
+        "build_test.log": "50e8e29ec6f65422bd4f5197c0da4bbb359cc892d5e8b1a650eb43cc1468ec28",
+        "compact_authority_collision_test.log": "31f895f97a7ea0576b6b183d6607da9c246ed0a49c7d4e7cab5a2a10f47f1fcd",
+        "compact_authority_test.log": "a10c20f83c099cf4fbe288a8b524f17dbfa41af7ae692431688c8241d921a1a4",
+        "contract.log": "3a88c0a879ea8d821e918e7ac379e05578c5c57005e40a6bbb18c95c730cc7ac",
+        "deferred_status_checkpoint_test.log": "1bc86fadefdc7ee07036b29877a6ffd812cc73f0c42b17cae5775ee73b18f970",
+        "deferred_status_test.log": "07e8e298f6cf0b9b734c90e9ef672cab9f08e1789e929e2101abff6295543028",
+        "engine-transport.log": "9b4c57d284b25ba2016ca9c465f1171f4bb702f2957ad17e951c833030101319",
+        "foundation.log": "a8af63e22457a3d4af10dfe07f685afd9bcd639967d411ae0bdd784cfa156c94",
+        "inventory.log": "67d509cb56815d459f1bd1a45b31346cf7d88645b388fa93dfdf64cd9512a586",
+        "mem_test.log": "bcd054a12850c141b655b24fda101acdd513e9c2af43bdc6d4b8e0422c103605",
+        "model_failure_policy_test.log": "16bfde389aee77341eff753e87808019cf799963d9bebdcf2c4489e1e15bdefa",
+        "mover-fence.log": "f5e4f10f2fe742f71c0204bfcf6bab49f1f37241701174108802702b107184aa",
+        "place_test.log": "c4f7cc401d5cddd1c0eed1425cfa751e8be55cbf3a73bffab127566554acee86",
+        "plugin_test.log": "cce4585d93030e65a54606e730309dc8b77be3786fe99255facc3122fa843abe",
+        "receipt.json": "42dd5527e31a967ee062ee2cdcea7bc669c0ed09ae2fd830824cc7797c645470",
+        "runtime_test.log": "e817db67d82613e5eecafb9ba6e77fded893bed9cacf10ab96ee2146300b5b3d",
+        "strict-p3.log": "b3c2b112f42bdb359de44e05f723d148a4e45df3a029dfa99be91217052c76b8",
+        "tp4-session.log": "25a6b878dcb3ab126edb20017972be26088393b84695e234fdd121881e2010c6",
+        "unified-policy.log": "eaaacc59cac11c2f06ecc66df892a8bbb71f8ed1a50de8de69c78edaaf0275cc",
+        "verified-engine-gates.log": "fb6b4d13c5d83672eeacfc5d89da32300daebff9c65ee73b1300039c80f29f7f"
+      },
+      "original_directory": "validation-glm53-main-verified-engine-v7-host-release-20261025T224749Z",
+      "passed": true
+    },
+    "preparation-v5": {
+      "files_sha256": {
+        "home-receipt.json": "270fa0ae9e5573e488f791313740b1ae5b1423432f778a83dfe8110c9f31b765",
+        "receipt.json": "45846dff23582fa94df4f9589af1a44bc01d13e5ce3285ef64d0fe91deae89e8",
+        "tokenizer.log": "8877d83d740e8ecd8ba8a23b18c1f752a429ef944b04f9218f047927816fb01c"
+      },
+      "original_directory": "glm53-manual-preparation-v5-core-v7-fixture-v9-20261025T230200Z",
+      "passed": true
+    }
+  }
+}

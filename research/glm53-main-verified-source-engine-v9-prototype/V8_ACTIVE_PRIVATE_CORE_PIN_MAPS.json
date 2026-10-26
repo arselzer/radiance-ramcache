@@ -1,0 +1,21 @@
+{
+  "Core_pins_sha256": "83d57401b288dc78ddad965498d47c2066e99050291411bc3545985d2a874159",
+  "active_maps": {
+    "CORE_SOURCE_PINS.json": {
+      "entries": 1535,
+      "exact_CoreV6": true,
+      "sha256": "83d57401b288dc78ddad965498d47c2066e99050291411bc3545985d2a874159"
+    },
+    "regressions/compact/strict_p3/UNIFIED_CORE_PINS.json": {
+      "entries": 1535,
+      "exact_CoreV6": true,
+      "sha256": "83d57401b288dc78ddad965498d47c2066e99050291411bc3545985d2a874159"
+    },
+    "regressions/device/CORE_SOURCE_PINS.json": {
+      "entries": 1535,
+      "exact_CoreV6": true,
+      "sha256": "83d57401b288dc78ddad965498d47c2066e99050291411bc3545985d2a874159"
+    }
+  },
+  "historical_V5_maps_unchanged": true
+}

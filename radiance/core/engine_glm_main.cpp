@@ -48,6 +48,50 @@ void phase(EngineGlmMainState& s,GlmMainEnginePhase p)noexcept{s.result.phase=p;
 uint64_t sum(uint64_t a,uint64_t b){if(b>UINT64_MAX-a)throw std::bad_alloc();return a+b;}
 uint64_t round_page(uint64_t n){return sum(n,4095)/4096*4096;}
 }
+int glm_main_vocabulary_guard(const GlmMainVocabularyFacts& f,std::span<const int32_t> specials,
+    std::span<const int32_t> eog,GlmMainVocabularyAdmission* out)noexcept {
+    if(!out)return RAD_E_INVAL;
+    constexpr int64_t rows=154880,width=4096,tokens=154856,bytes=rows*width*2;
+    if(f.model_rows!=rows||f.model_width!=width||f.tokenizer_tokens!=tokens||f.view_tokens!=tokens||
+       f.embedding_rows!=rows||f.embedding_cols!=width||f.embedding_bytes!=bytes||f.embedding_dtype!=RAD_BF16||!f.embedding_physical_plain||
+       f.head_rows!=rows||f.head_cols!=width||f.head_bytes!=bytes||f.head_dtype!=RAD_BF16||!f.head_physical_plain||
+       specials.size()!=5||eog.empty()||eog.size()>64)return RAD_E_FORMAT;
+    for(const int32_t id:specials)if(id < -1||id>=tokens)return RAD_E_FORMAT;
+    for(size_t i=0;i<eog.size();++i){if(eog[i]<0||eog[i]>=tokens)return RAD_E_FORMAT;
+        for(size_t j=0;j<i;++j)if(eog[j]==eog[i])return RAD_E_FORMAT;}
+    GlmMainVocabularyAdmission admitted;admitted.model_rows=rows;admitted.valid_tokens=tokens;
+    admitted.padded_rows=rows-tokens;admitted.local_rows=rows/4;
+    admitted.special_ids=int32_t(specials.size());admitted.eog_ids=int32_t(eog.size());
+    *out=admitted;return RAD_OK;
+}
+int Engine::glm_main_vocabulary_admit(){
+    if(!glm_main_||!ckpt_||!vocab_||!vocab_view_)return RAD_E_STATE;
+    if(!meta_.arch_id||std::strcmp(meta_.arch_id,"glm5next")||meta_.n_layers!=45||
+       meta_.n_embd!=4096||meta_.n_expert!=288||meta_.n_expert_used!=8)return RAD_E_SHAPE;
+    GlmMainVocabularyFacts f;f.model_rows=meta_.n_vocab;f.model_width=meta_.n_embd;
+    f.tokenizer_tokens=vocab_->n_tokens();f.view_tokens=vocab_view_->n_tokens();
+    auto tensor=[&](const SrcTensor* t,int64_t& rows,int64_t& cols,int64_t& bytes,uint32_t& dtype,bool& plain){
+        if(!t)return;bytes=t->bytes;dtype=t->rad_dtype;
+        if(t->shape.size()==2){rows=t->shape[0];cols=t->shape[1];}
+        plain=t->data&&!t->ggml&&!t->gptq_bits&&!t->gptq_group&&!t->ct_group&&!t->ct_zero&&!t->pbits&&
+            !t->aux[0]&&!t->aux[1]&&!t->aux[2]&&t->shape.size()==2;
+    };
+    tensor(ckpt_->find("model.language_model.embed_tokens.weight"),f.embedding_rows,f.embedding_cols,f.embedding_bytes,f.embedding_dtype,f.embedding_physical_plain);
+    tensor(ckpt_->find("lm_head.weight"),f.head_rows,f.head_cols,f.head_bytes,f.head_dtype,f.head_physical_plain);
+    const std::array<int32_t,5> specials{vocab_->bos(),vocab_->eos(),vocab_->eot(),vocab_->unk(),vocab_->pad()};
+    return glm_main_vocabulary_guard(f,specials,vocab_->eog(),&glm_main_->result.vocabulary);
+}
+int GlmMainEngineHarness::vocabulary_preflight(const std::string& checkpoint,GlmMainVocabularyAdmission* out)noexcept {
+    if(!out||!path_text(checkpoint))return RAD_E_INVAL;
+    try{
+        Config c;c.model=checkpoint;auto e=std::make_unique<Engine>(std::move(c));
+        e->glm_main_=std::make_unique<EngineGlmMainState>();
+        int st=e->read_metadata();if(st<0)return st;
+        st=e->load_vocab();if(st<0)return st;
+        st=e->glm_main_vocabulary_admit();if(st<0)return st;
+        *out=e->glm_main_->result.vocabulary;return RAD_OK;
+    }catch(const std::bad_alloc&){return RAD_E_NOMEM;}catch(...){return RAD_E_STATE;}
+}
 int glm_main_one_prompt_admission(std::span<const int32_t> tokens,int64_t vocabulary,int64_t context)noexcept {
     return tokens.size()==1&&vocabulary>0&&context>=2&&tokens[0]>=0&&tokens[0]<vocabulary?RAD_OK:RAD_E_SHAPE;
 }
@@ -249,7 +293,7 @@ int Engine::glm_main_body(){auto& s=*glm_main_;
     if(!rad_tools_registry().plugins().empty()||rad_tools_registry().n_instances())return RAD_E_STATE;
     s.registry_owned=true;
     RAD_TRY(read_metadata());RAD_TRY(load_vocab());if(!vocab_||!vocab_view_||meta_.n_layers!=45||meta_.n_embd!=4096||meta_.n_expert!=288||meta_.n_expert_used!=8)return RAD_E_SHAPE;
-    if(vocab_->eog().size()>64||vocab_->n_tokens()!=meta_.n_vocab)return RAD_E_FORMAT;
+    RAD_TRY(glm_main_vocabulary_admit());
     phase(s,GlmMainEnginePhase::MetadataOwned);
     rad_tools_registry().set_code_device(0);rad_tools_registry().set_no_device_code(false);
     // Deliberately conservative host-mailbox collectives for first functionality.
@@ -349,7 +393,7 @@ int Engine::glm_main_run_request(){auto& s=*glm_main_;
         auto request=std::make_unique<Request>();request->id=1;request->max_tokens=1;request->ignore_eos=true;
         request->sp.temp=0;request->sp.top_k=1;request->sp.seed=1;request->may_speculate=false;
         RAD_TRY(vocab_view_->tokenize(s.manual_prompt,&request->prompt));
-        RAD_TRY(glm_main_one_prompt_admission(request->prompt,meta_.n_vocab,cfg_.max_ctx));
+        RAD_TRY(glm_main_one_prompt_admission(request->prompt,s.result.vocabulary.valid_tokens,cfg_.max_ctx));
         server::Sink sink(8);request->sink=&sink;sink.id=request->id;
         const int added=sched_.add(std::move(request));if(added<0){sink.fail(added);return added;}
         const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(s.options.manual_timeout_seconds);
@@ -363,7 +407,7 @@ int Engine::glm_main_run_request(){auto& s=*glm_main_;
         }
         if(sink.status()<0)cache_prepare4_->fail_stop(-1,sink.status());
         server::SinkToken token;const auto n=sink.read(&token,1);
-        if(n!=1||sink.n_produced()!=1||token.token<0||token.token>=meta_.n_vocab)cache_prepare4_->fail_stop(-1,RAD_E_STATE);
+        if(n!=1||sink.n_produced()!=1||token.token<0||token.token>=s.result.vocabulary.valid_tokens)cache_prepare4_->fail_stop(-1,RAD_E_STATE);
         const int reaped=sched_.reap(1);if(reaped<0)cache_prepare4_->fail_stop(-1,reaped);
         s.result.sampled_token=token.token;s.result.text_complete=true;phase(s,GlmMainEnginePhase::TextComplete);return RAD_OK;
     }catch(...){cache_prepare4_->fail_stop(-1,RAD_E_STATE);}

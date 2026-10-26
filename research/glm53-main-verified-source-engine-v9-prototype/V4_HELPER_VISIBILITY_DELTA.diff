@@ -1,0 +1,20 @@
+--- failed-v3/core/engine_glm_main.cpp
++++ v4/core/engine_glm_main.cpp
+@@ -1,6 +1,8 @@
+ #include "engine_priv.h"
+ #include "build/glm_main_quote.h"
+ #include "mem/vram_budget.h"
++#include "runtime/kvbind.h"
++#include "util/stallwatch.h"
+ #include "server/sink.h"
+ #include <algorithm>
+ #include <array>
+@@ -112,7 +114,7 @@
+         if(sampler_actual.storage.page_and_heap_total!=s.sampler_quotes[size_t(r->index)].storage.page_and_heap_total||
+            sampler_actual.candidates!=s.sampler_quotes[size_t(r->index)].candidates)return RAD_E_STATE;
+         if(r->program.ctx.max_tok!=1||r->program.buffers.size()>20000||r->program.ops.size()>10000||r->program.weights.size()>60000)return RAD_E_SHAPE;
+-        const auto misses=miss_report(r->program,false);if(!misses.device.empty())return RAD_E_NOTFOUND;
++        if(!r->program.device_holes(false).empty())return RAD_E_NOTFOUND; // exact predicate underlying miss_report
+         RAD_TRY(rad_gate_reference_kernels(r->program,false,"actual GLM main cache"));
+         if(!r->tok_buf||r->tok_buf>=r->program.buffers.size())return RAD_E_SHAPE;
+         const auto& token=r->program.buffers[r->tok_buf];

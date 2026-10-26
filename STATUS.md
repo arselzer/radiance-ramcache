@@ -1,31 +1,31 @@
 # Status
 
-Current selection: Core V6 (1,535 files), Engine fixture V8, Components V12 and the archived Runner V4. Production deployment is not included.
+Candidate source: Core V7 (1,535 files), Engine fixture V9, Components V13 and archived Runner V5. The prior public checkpoint is commit `aacccd8`, Core V6. This is a validated one-input/one-output research checkpoint, with no production deployment.
 
-| Current stage | Result |
+| Current Core V7 stage | Result |
 |---|---|
-| Matching Core and experimental module builds | HOST and AQL Release builds passed; matching sanitizer builds supplied the HOST suites below. |
-| HOST regression suites | Release, Address/UndefinedBehaviorSanitizer and ThreadSanitizer passed 20 commands each, including the same production source validator and retained regressions. |
-| Actual complete-data prewalk | Passed all four source-rank bindings, NativeInventory bindings and final Native plans; prepared 5,088 ordinary jobs after 193,536 native-owned views were omitted. No loader execution, Engine or model kernels. |
-| Portable twelve-program Release build | Passed against a source-identical existing Core at the original `d2915f6e` source checkpoint. Programs compiled; the separate runtime result below also passed. |
-| Current portable twelve-program execution | Passed all twelve HOST programs against the 3,021-file `f0eaee18` snapshot. Its exact manifest is preserved; final changes add evidence/docs with identical source/tools/CMake. |
-| Four-GPU Engine startup and one-token output | Failed before source admission: `RAD_E_FORMAT`, `ColdAdmitted`, tokenizer154856 versus padded model154880. No GLM token or model computation. |
-| Original QFN restoration | Passed same-container restoration, 40+ seconds of stable health and an independent four-token completion. |
-| Normal prompts, 262K, MTP, quality and throughput | Not validated. |
+| HOST Release build and full regressions | Passed; 20 commands with matching Core V7/fixture V9. |
+| Focused vocabulary/mask suite | Passed actual HOST mask/top-k rows, grammar intersection, cached greedy refresh, default control and refusals. |
+| Actual CPU vocabulary preflight | Passed the same Engine metadata/tokenizer/header guard: model154880, tokenizer154856, padded24, local38720, backend calls0. No Engine start/source admission. |
+| AQL Core/module and Components V13 builds | Passed matching compilation; the separate controlled trial below exercised one model step. |
+| Fresh V5 tokenizer/HOME preparation | Passed; one raw input token and matching private six-library HOME, no model/GPU execution. No HOME binaries are exported. |
+| Core V7 fast actual metadata | Passed all four logical rank graphs with active valid-token profile. No kernel initialization/launch or source readiness. |
+| Matching ASan/TSan builds and runtime | Passed all 20 HOST commands per mode. |
+| Current complete-data prewalk | Passed all four rank bindings/native plans and 5,088 ordinary jobs; 161,715,585,024 expert bytes. No kernels or Engine admission in this prewalk. |
+| Portable thirteen-program build/runtime | Passed Release at exact tested manifest `8b966d37`, 3,212 files, reusing source-identical Core archives. |
+| Core V7 four-GPU startup/one-token trial | Passed combined startup/transport/one model step: one input token, one output ID154822 `[gMASK]`; healthy teardown and same-QFN restoration independently checked. |
 
-Original receipts and all 20 logs per HOST mode are under [the current evidence](evidence/glm53-main-verified-v6/CPU_PREWALK_SUMMARY.json). Earlier Core V5 results retain their original manifests and scope.
+Exact original receipts/logs and the preserved focused-ASan executor failure are under [the current validation evidence](evidence/glm53-main-verified-v7/VALIDATION_SUMMARY.json). The first focused ASan attempt printed all test assertions passed but then failed LeakSanitizer under ptrace; it remains failed. The same source/build passed both focused modes on the host rerun, without changing sanitizer diagnostics or source. The parent owns all compiler/runtime/service/GPU actions; this export author performed source/hash/AST checks only.
 
-The actual prewalk took 1,046.67 seconds and passed 82,370 checks with 27 intended refusals. It verified 161,715,585,024 native bytes/source-rank cuts and omitted the same expert payload from ordinary loading. Its 5,088 remaining jobs comprise 2,788 identity, 1,292 widening and 1,008 relayout jobs. The reusable input/output/column reservation is 389,021,696 bytes and job metadata is 13,326,920 bytes. These requested reservations are not process RSS or a full Engine memory-fit result. [The exact prewalk output](evidence/glm53-main-verified-v6/complete-prewalk/result.json) explicitly records `loader_execute_called:false` and `runtime_ready:false`.
+Core V7 preserves physical model/logit geometry (154,880 rows, 38,720 per TP4 rank) and admits exactly the real 154,856-token prefix after the actual Engine-owned Checkpoint, tokenizer/view and BF16 embedding/head header checks. The existing mask stage excludes 24 tail IDs; it intersects grammar masks and refreshes greedy staging. A zero opt-in preserves stock/default/tiny behavior. Model arithmetic, public ABI27, kernel schema, expert records and cache policy are unchanged.
 
-Core V6 fixes an actual plain-source scale handling error: CheckpointSources keeps a null scale placeholder beside every unscaled piece. The production validator now requires those nulls for exact canonical plain encoding, and requires physical nonnull scales for affine encoding. It preserves source bounds and transform exclusions. Fixture V7 corrected only a boolean test sentinel; fixture V8 synchronized the stale nested strictP3 Core pins. All three current active pin maps equal Core V6. Earlier failed source/build/prewalk receipts remain unchanged.
+The focused tests prove CPU staging and existing HOST mask/top-k behavior; they do not simulate a successful TP collective or model forward. The real CPU mode loads headers/tokenizer metadata through the same Engine guard, not start(). The current fast metadata/prewalk and actual trial use active Sampler valid_token_count154856; no old unmasked Core V6 result is substituted. The controlled trial loaded and drained all 5,088 ordinary jobs (16,921,544,160 uploaded bytes), verified 161,715,585,024 native expert bytes and compared 185,066,521,464 mapped source bytes. Actual quantum/attention block/state chunk were4/4/1. The combined child took840.326seconds including full verification/loading/startup/one step/healthy retirement; this establishes no tok/s measurement. QFN restoration passed a40.631-second stable health interval and an independent four-token QFN completion.
 
-The first manual profile remains one raw prompt token and one sampled output, maxTok1/seq1/spec0/exact wire, context512 and no fixed resident experts. The private request cannot be enabled through ordinary CLI/HTTP serving. Core V6 currently fails its strict vocabulary-size guard before source admission; the passing prewalk does not repair that Engine constraint. Even a later one-token success would not establish arbitrary prompts, 262K, quality, speed or deployment. Runner V4 is manual server-specific source; fresh V4 preparation and original private gates are required, and it is never invoked by portable tools.
+The first manual profile remains one prompt/output token, maxTok1/seq1/spec0/exact wire/context512 and no fixed resident experts. Ordinary CLI/HTTP cannot manufacture its private source request. Subsequent recurrent decode, arbitrary prompts, 262K, MTP, full-model numerical quality, speed and production serving remain unvalidated. `[gMASK]` is a valid sampled ID, not evidence of useful text quality. Runner V5 is archived manual source only, with fresh preparation, current focused/prewalk/three-mode gates and the unchanged stop/restore/resource/signal machinery.
 
-The actual window enumerated four gfx1201 devices and loaded the checkpoint/tokenizer. It then returned -14 (`RAD_E_FORMAT`) in phase `ColdAdmitted`: 154,856 tokenizer entries do not equal the model's 154,880 padded rows. The snapshot reports source_admitted=false, native_bytes_verified=0, ordinary_jobs=0, ordinary_upload_bytes=0 and transport_ready=false. No GLM inference or memory-fit result is established. [The exact failed child and restoration evidence](evidence/glm53-main-verified-v6/GPU_WINDOW_SUMMARY.json) are retained.
+The prior public Core V6 checkpoint is retained unchanged: all three HOST modes, full prewalk and twelve portable HOST programs passed, but its GPU startup failed at the exact-equality vocabulary guard in ColdAdmitted. No GLM token or model computation occurred; the same QFN container was restored and independently generated four tokens. Those passes/failure retain their tested manifests and do not establish a Core V7 result.
 
-The same original QFN container was restored; health stayed stable for over 40 seconds. An independent check verified the same full ID/image/name and generated four tokens on QFN, not GLM. The earlier pre-stop health timeout had issued no stop and launched no child. This window is closed, with no further GPU run queued. A separate padded-vocabulary/mask design is future work; frozen Core V6 still contains the failing guard.
-
-The inherited synchronous fresh-state-clear refusal limitation remains documented. GPU/driver recovery is not claimed.
+Core V6 reconstruction overlays the six original files onto a copy of current radiance/ and checks the original1,535pins. V5 reconstruction then applies its two original loader files. All raw archived packages, historical evidence and tested manifests remain byte-identical. The inherited synchronous fresh-state-clear refusal limitation and absence of GPU/driver recovery remain explicit.
 
 The following notes describe earlier individually pinned research stages; they retain their historical scope.
 
@@ -45,7 +45,7 @@ This is a research checkpoint from 25 October 2026. It has not been deployed.
 | Complete actual GLM main-expert store | All 48,384 rank records in 168 shards passed independent comparisons covering every one of the 161,715,585,024 native bytes. Model payloads remain private. |
 | Persisted complete-store reader and RAM-cache provider | Actual complete-data check passed across four logical ranks, including all native checksums/source cuts, cache hits without payload rereads, and leases after source/graph destruction. HOST refusals/provider cases also passed all three modes. No Engine admission or GPU model execution. |
 | Earlier TP4 Core, preparation protocol and upload completion | Fixture v4 passed Release, Address/UndefinedBehaviorSanitizer and ThreadSanitizer, including retained regressions. Ten portable Release checkers also passed against the matching existing Core. |
-| Full GLM four-GPU inference, quality and performance | Not validated. |
+| At the earlier stages: full GLM four-GPU inference, quality and performance | Not validated then. Current Core V7 adds only the single-input/single-output trial above; quality and performance remain unvalidated. |
 
 Foundation v2 fixes a routing-profile admission error, reserves backend-global control credit before generic use, and corrects a checker compilation error. The earlier failed build is retained in `evidence/`; later results do not turn that failed revision into a pass.
 

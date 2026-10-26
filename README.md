@@ -2,16 +2,18 @@
 
 Work in progress on an expert RAM-cache tier for Radiance, focused on GLM 5.3 Flash and models whose experts exceed system RAM.
 
-The current source is Core V6, Engine fixture V8 and Components V12. Matching HOST regression suites passed Release, Address/UndefinedBehaviorSanitizer and ThreadSanitizer. The complete actual-model prewalk also passed. The four-GPU startup attempt failed before source admission at a vocabulary-size guard; no GLM token was generated. The same original QFN container was restored and independently checked. Cached GLM serving is not enabled.
+This checkpoint selects Core V7, Engine fixture V9 and Components V13. Actual startup and one model step passed on four RX 9070 XT GPUs through the complete-store RAM-cache path: one raw input token produced one sampled token, `154822` (`[gMASK]`). The same QFN container was restored and passed an independent tiny inference check. Matching HOST Release/ASan/TSan, full-data prewalk and thirteen portable HOST programs also passed. This does not establish chat readiness, subsequent decode, quality or performance.
 
-The cache keeps a bounded set of expert records in RAM and reads cold records from disk. A RAM hit avoids the disk read and still uploads the expert to its GPU consumer. Persistent GPU expert caching, prefill overlap and admission policies remain future work.
+Model and logit dimensions stay at 154,880 rows. The private GLM profile admits the actual 154,856 tokenizer IDs and masks the 24 undefined tail rows through the existing sampler mask operation. Stock/default paths retain a zero opt-in value. The repair changes no model arithmetic, kernel schema or public ABI.
 
-- `radiance/`: exactly 1,535 pinned Core source files.
-- `research/`: immutable source fixtures, cache/provider implementations and portable HOST checks.
-- `evidence/`: selected original receipts, logs and results with their run scopes preserved.
-- `docs/`: designs, independent reviews, historical source maps and export provenance.
+The cache keeps a bounded set of expert records in RAM and reads cold records from disk. A RAM hit avoids disk I/O and still uploads the expert to its GPU consumer. Persistent GPU expert caching, prefill overlap and cache-admission policies are being investigated; no performance change is claimed here.
 
-The source is based on Radiance commit `5a9ce4912bb4ae5315e4a177f9e7d5b10d035766`. Upstream licensing and notices are retained. Model weights, the complete native expert store, tokenizer payloads, serving configuration, API keys and compiled research libraries are excluded.
+- `radiance/`: exactly 1,535 pinned Core V7 source files.
+- `research/`: immutable fixtures, source/cache implementations and portable HOST checks.
+- `evidence/`: selected original receipts/logs with each run's scope retained.
+- `docs/`: designs, independent reviews, source overlays and tested manifests.
+
+The source is based on Radiance commit `5a9ce4912bb4ae5315e4a177f9e7d5b10d035766`. Upstream licensing and notices remain. Model weights, native-store payloads, tokenizer payloads, serving configuration, API keys and compiled research libraries are excluded.
 
 On Linux, use Python 3.10+, CMake 3.24+ and a C++20 compiler:
 
@@ -20,14 +22,8 @@ python3 tools/verify_snapshot.py
 python3 tools/build_host.py --mode release --run-host-checks
 ```
 
-The portable entrypoint builds twelve HOST checkers. Their current build and all twelve runtime checks passed using a source-identical existing Core. The runtime receipt binds the preserved 3,021-file `f0eaee18` snapshot; this final export adds evidence and normalized documentation without changing source, tools or CMake. These checks use no downloaded model or GPU and start no API server. `--run-host-checks` explicitly requests execution; without it the tools only build. See [the portable guide](research/portable/README.txt) for sanitizer modes, archive reuse and compiler guards.
+The portable entrypoint now builds thirteen HOST checkers, adding the actual sampler staging/mask tests to the retained twelve. All thirteen passed Release execution against the exact source-identical existing Core V7 at tested manifest `8b966d37` (3,212 files); this final export adds documentation/evidence only. The default builds without executing; `--run-host-checks` requests CPU execution. It requires no model download, GPU or API server. The vocabulary binary's separate actual-model CPU mode remains manual. See [the portable guide](research/portable/README.txt).
 
-The separate real-data prewalk verified all four rank authorities, omitted 193,536 native-owned expert views covering 161,715,585,024 bytes, and prepared 5,088 ordinary load jobs. It took 1,046.67 seconds and executed no loader, Engine or model kernel. [The exact result](evidence/glm53-main-verified-v6/complete-prewalk/result.json) is a source, layout and budget check rather than an inference result.
+The validated private manual profile uses one prompt token and one output token, maxTok1/seq1/spec0, exact wire, context512 and no fixed resident experts. Normal prompts, 262K, MTP, quality, throughput and deployment are not validated. The archived Runner V5 requires the reviewed Core V7/fixture V9 pair, focused vocabulary evidence, three HOST modes and a fresh Core V7 prewalk/HOME. No maintenance or GPU action is invoked by public tools.
 
-The private manual Engine path targets one prompt token and one output token, maxTok1/seq1/spec0, exact wire, context512 and no fixed resident experts. The current Core V6 cannot complete startup: its exact-equality guard rejects the tokenizer’s 154,856 entries against the model’s 154,880 padded rows. Normal prompts, 262K context, quality, throughput and deployment are not validated. [STATUS.md](STATUS.md) separates each passed stage from the failed startup and restoration result.
-
-The current archived maintenance source is Runner V4 for the reviewed Core V6/fixture V8 pair. It has no default build, import or execution action and requires its original private gates and reviewed environment. No maintenance, download or GPU action is invoked by the portable tools.
-
-Historical Core V5, component and runner revisions retain their exact sources and failed/pass receipts. Two archived V5 loader files reconstruct the earlier Core inventory over the unchanged 1,533 files. The plain-source scale fix in V6 and the V7/V8 fixture repairs are described in [the current publication scope](docs/GLM53_VERIFIED_MAIN_V6_PUBLICATION_SCOPE.txt); archived package READMEs retain their original paths and historical statements.
-
-[The completed maintenance window](evidence/glm53-main-verified-v6/GPU_WINDOW_SUMMARY.json) reached four gfx1201 devices and tokenizer loading, then returned `RAD_E_FORMAT` in `ColdAdmitted`, with no source admission, expert reads/uploads or model computation. Restoration passed more than 40 seconds of stable health; an independent four-token completion checked the original QFN server. An earlier attempt aborted on a health timeout before stopping anything. No additional GPU window is queued. A possible padded-vocabulary fix is separate future work, not included in this Core V6 snapshot.
+The published Core V6 checkpoint remains preserved: its CPU/prewalk/portable passes stand, its GPU attempt failed before source admission, and the original QFN container was restored. Six archived V6 files reconstruct that exact Core over V7; applying the earlier two-file overlay then reconstructs V5. See [STATUS.md](STATUS.md) and [the candidate scope](docs/GLM53_VERIFIED_MAIN_V7_PUBLICATION_SCOPE.txt). The 840.326-second child duration includes full data verification, loading, startup, one model step and healthy teardown; it is not a token-rate benchmark. The first focused ASan executor attempt failed because LeakSanitizer cannot run under ptrace; its failed receipt is preserved alongside the passing unchanged host rerun.

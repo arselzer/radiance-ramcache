@@ -19,7 +19,7 @@ def main():
     parser.add_argument("--existing-core-build", type=Path,
                         help="absolute existing HOST build; reuses it only after exact source/profile verification")
     parser.add_argument("--run-host-checks", action="store_true",
-                        help="after building, explicitly execute the twelve manual HOST checker programs, including tiny Engine and real-source cold gates")
+                        help="after building, explicitly execute the thirteen manual HOST checker programs, including tiny Engine and real-source cold gates")
     args = parser.parse_args()
     if not 1 <= args.jobs <= 8:
         parser.error("--jobs must be in 1..8")
@@ -77,7 +77,7 @@ def main():
             cache = verify["verify_core_build"](root, core_build, args.mode, files)
             print("REUSE verified source-identical HOST Core:", core_build, flush=True)
         else:
-            core_build = build_root / ("core-main-verified-v6-host-" + args.mode)
+            core_build = build_root / ("core-main-verified-v7-host-" + args.mode)
             if core_build.is_symlink():
                 raise refuse("fresh Core build directory must not be a symlink")
             # Source and build directories are distinct. The default reuses only
@@ -94,7 +94,7 @@ def main():
                      "rad_core", "libref", "libquant"])
             cache = verify["verify_core_build"](root, core_build, args.mode, files)
 
-        fixture_build = build_root / ("portable-main-verified-v6-fixture-v8-host-" + args.mode)
+        fixture_build = build_root / ("portable-main-verified-v7-fixture-v9-host-" + args.mode)
         if fixture_build.is_symlink():
             raise refuse("fixture build directory must not be a symlink")
         if (fixture_build / "CMakeCache.txt").exists():
@@ -111,7 +111,7 @@ def main():
         verify["verify_core_build"](root, core_build, args.mode, files)
         verify["verify_fixture_build"](root, fixture_build, args.mode, core_build, cache)
         if not args.run_host_checks:
-            print("BUILT twelve HOST checker programs; none executed. Add --run-host-checks for explicit manual execution.")
+            print("BUILT thirteen HOST checker programs; none executed. Add --run-host-checks for explicit manual execution.")
             return
 
         home = core_build / "radiance_home"
@@ -136,14 +136,16 @@ def main():
              "--architecture", architecture],
             [fixture_build / "glm53_main_verified_engine_gate", "--run-source-gates"],
             [fixture_build / "glm53_main_verified_component_quotes", "--run-host-quotes"],
+            [fixture_build / "glm53_main_vocabulary_check", "--run-host-vocab", home],
         ]
         clean_checkers = {fixture_build / "tiny_engine_native_transport_check",
                           fixture_build / "glm53_tp4_cache_session_check",
                           fixture_build / "glm53_main_verified_engine_gate",
-                          fixture_build / "glm53_main_verified_component_quotes"}
+                          fixture_build / "glm53_main_verified_component_quotes",
+                          fixture_build / "glm53_main_vocabulary_check"}
         for argv in executions:
             command(argv, clean_radiance=argv[0] in clean_checkers)
-        print("PASS twelve explicitly invoked HOST research checker programs, including tiny Engine, actual TP4 protocol/HostOnly upload fence and verified-main cold/component gates. These HOST checks grant no real-source capability and execute no GPU/model/serving path.")
+        print("PASS thirteen explicitly invoked HOST research checker programs, including tiny Engine, actual TP4 protocol/HostOnly upload fence and verified-main cold/component gates. These HOST checks grant no real-source capability and execute no GPU/model/serving path.")
 
 
 if __name__ == "__main__":

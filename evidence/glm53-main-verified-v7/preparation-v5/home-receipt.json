@@ -1,0 +1,20 @@
+{
+  "GPU_kernel_execution": false,
+  "aql_build_receipt": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/build-glm53-main-verified-engine-v7-aql-release-evidence-20261025T224946Z/receipt.json",
+  "aql_build_receipt_sha256": "4b1dd4aeeafbb8caf0233c64c2346fb3e470e4304d57a0f19b7fdb816daf75bc",
+  "files": {
+    "architectures/glm5next_cache.so": "06d7eb2a47e43e8534073525a5b56ac81e0696e5156ce357660435ed798ceff7",
+    "kernels/libavx.so": "4bd77799e7ea5c3212fe95fc0902fb8269db416914484609eb936c5d290c4b20",
+    "kernels/libr4d.so": "e99d9816fe60bf36646c7fb6cbede558ee9da7ba6dc6df2d45c8c5b55168f3fd",
+    "kernels/libref.so": "e8c1f368b64ba29120391aa0576de3be6179f7ac988b0834f725c49752c3b8fe",
+    "kernels/spechub.so": "780f113d81c8b763d95db487d431a4ce8c1f1300dee6e129aad48cbe5b9bdb5e",
+    "quantizers/libquant.so": "fbd756597cb519df7341c17c89b559f1bca2bb886652f2b2e5022e07acf90287"
+  },
+  "home": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-manual-preparation-v5-core-v7-fixture-v9-20261025T230200Z/exclusive-home",
+  "passed": true,
+  "production_changes": false,
+  "revision": "v7",
+  "schema": "glm53-manual-research-home-v1",
+  "shipped_pin_manifest_sha256": "f6ce7f3167aff1df128545197c00ed405c2b52a5f12f6011b86e9fe5c8894a7d",
+  "source_architecture": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/build-glm53-main-verified-engine-core-v7-aql-release/research-glm-tp4-home/architectures/glm5next_cache.so"
+}

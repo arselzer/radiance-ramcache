@@ -121,6 +121,11 @@ struct SamplerConfig {
     /* --draft-coupling: declare the coupled verify (`mtp_couple_verify`) behind the pick and the
      * per-row state plane it reads. */
     bool    draft_coupling = false;
+    /* Internal opt-in for the closed GLM manual profile only. Zero preserves
+     * every legacy sampler path. Append to retain old aggregate member order.
+     * Model/logit widths stay padded; the existing sample_mask row admits only
+     * real tokenizer IDs. No public ABI struct or kernel schema changes. */
+    int64_t valid_token_count = 0;
 };
 
 /* ================================================================== the driver */

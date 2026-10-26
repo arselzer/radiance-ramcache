@@ -133,6 +133,11 @@ int Engine::declare_sampler(int rank, RadBuilder* b, int64_t logits_width, bool 
 
     SamplerConfig sc{};
     sc.n_vocab       = meta_.n_vocab;
+    if(glm_main_){
+        if(glm_main_->result.vocabulary.model_rows!=meta_.n_vocab||
+           glm_main_->result.vocabulary.valid_tokens!=154856)return RAD_E_STATE;
+        sc.valid_token_count=glm_main_->result.vocabulary.valid_tokens;
+    }
     /* This rank's vocabulary width, from the declared logits buffer (see rad_tools_declare).
      * meta_.n_vocab is the whole model's on every rank. */
     sc.n_vocab_local = logits_width > 0 ? logits_width : meta_.n_vocab;

@@ -1,0 +1,110 @@
+{
+  "passed": true,
+  "mode": "release",
+  "backend": "aql",
+  "revision": "v13",
+  "source": {
+    "CMakeLists.txt": "599bd80c28e1d506e717039656812971392f840c635c6d11ead040ed90f5ff33",
+    "CORE_SOURCE_PINS.json": "753436bac31f041b8e051fb4e4797319d4eefa12df6d2bde0f8e28eee407b366",
+    "HELPER_SOURCE_PINS.json": "36b94cd4ecf41db4919966bb4f9ff873491bf81bf2c87c015bf19c12e4c3c85a",
+    "PRESERVED_COMPONENT_V10_SOURCE_RECEIPT.json": "dadfd2b840b598c924efff9c5ccf1a1f17155f3651e3eb7e3827351c041c02f9",
+    "PRESERVED_COMPONENT_V11_SOURCE_RECEIPT.json": "84a216ed0ed5f13eb9deef2c0d26e95dc5c284be945e45af0f7b2e3e15672932",
+    "PRESERVED_COMPONENT_V12_SOURCE_RECEIPT.json": "79f74ad437af4126eced1de270b35cd78ddc2e687ac4cc81ebe123c2c06bc820",
+    "PRESERVED_COMPONENT_V7_SOURCE_RECEIPT.json": "e5f382300425e88b4fd2f4d167d7b7dcc735305a845fdc57c3de3df9ff973e99",
+    "PRESERVED_COMPONENT_V8_SOURCE_RECEIPT.json": "fad070576a2369862f7cc49fa98d3c98a303b660df41930329d34d770dcf00ad",
+    "PRESERVED_COMPONENT_V9_SOURCE_RECEIPT.json": "0f2e9a9cd670156f64556194a6d18dca17a262423ad1720394f44c17e70d08ce",
+    "PRESERVED_QUOTE_BODIES.json": "9c1ae8ac6d3947fe6c1c98fab1c314e1d3bb7142bcf86df9844e6c549bdbc056",
+    "README.txt": "669dcea5cf00e7a863b2e5b8f15377946edbd2f82bfa106c934860da6b6ced3c",
+    "SOURCE_RECEIPT.json": "2e364dd804fce51dc3749bab9ae398073b148cb22bd4edca44dbd8974a0fe051",
+    "V10_ACTUAL_METADATA_COUNT_DELTA.diff": "44a833a0a24938140a19f370a89c641bea19f1cad507e2edfb93862df51f160c",
+    "V11_ORDINARY_METADATA_DIAGNOSTIC_DELTA.diff": "b2a050cbe1b832d208e5be8b7e6bad0de4ea50b651afbe615e417de2cf97db37",
+    "V12_PRODUCTION_SOURCE_HELPER_DELTA.diff": "01da613d6d070fcf4274450f90b19fe762ece6e5be8124888aa21c01968f20ea",
+    "V13_CORE7_VALID_TOKEN_PROFILE_DELTA.diff": "011f63ba139bb607a92c45da16fd3b62af4ec47b8f474ce0025db5600fdbf35f",
+    "V8_METADATA_LIFETIME_DELTA.diff": "149bac5e4451ee33a28ced3a3bbe904aa0eb56c388eb4674ee94bcff78c826d8",
+    "V9_DIAGNOSTIC_REASON_DELTA.diff": "d825b6795706e5feaf1dc35e606e77ae6c72c88c7de85328a12124aa204a7f86",
+    "actual_graph_quotes.cpp": "00ecfab60744c2f295451c70a872f034b82ff24b939e7ca8522b212f6dd66457",
+    "host_quotes.cpp": "f977134fdc3d84dd355f48fb05b01760b01341f936a6d28b1e0fd6472ff48c59",
+    "verify_sources.py": "6aa1037f5beb638bfed555c05e7a9ef890bb6aaca24775228dcb7b3838cfe5c2"
+  },
+  "commands": [
+    {
+      "command": [
+        "/usr/bin/python3",
+        "-B",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-main-verified-components-v13-prototype/verify_sources.py"
+      ],
+      "log": "pins-before.log",
+      "returncode": 0
+    },
+    {
+      "command": [
+        "flock",
+        "--no-fork",
+        "--exclusive",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/research-compiler.lock",
+        "nice",
+        "-n19",
+        "/usr/bin/python3",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/run_guarded_heavy_research.py",
+        "--",
+        "/usr/bin/cmake",
+        "-S",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-main-verified-components-v13-prototype",
+        "-B",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/build-glm53-main-verified-components-v13-aql-release",
+        "-DCMAKE_CXX_COMPILER=/usr/bin/c++",
+        "-DCMAKE_BUILD_TYPE=Release",
+        "-DCMAKE_CXX_FLAGS=",
+        "-DRADIANCE_SOURCE=/home/as/radiance-setup/research/deepseek-v41-1017-20261024/radiance-glm-main-verified-source-v7-src",
+        "-DRADIANCE_BUILD=/home/as/radiance-setup/research/deepseek-v41-1017-20261024/build-glm53-main-verified-engine-core-v7-aql-release",
+        "-DRADIANCE_AQL_CORE=ON"
+      ],
+      "log": "configure.log",
+      "returncode": 0
+    },
+    {
+      "command": [
+        "flock",
+        "--no-fork",
+        "--exclusive",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/research-compiler.lock",
+        "nice",
+        "-n19",
+        "/usr/bin/python3",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/run_guarded_heavy_research.py",
+        "--",
+        "/usr/bin/cmake",
+        "--build",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/build-glm53-main-verified-components-v13-aql-release",
+        "-j2"
+      ],
+      "log": "build.log",
+      "returncode": 0
+    },
+    {
+      "command": [
+        "/usr/bin/python3",
+        "-B",
+        "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-main-verified-components-v13-prototype/verify_sources.py"
+      ],
+      "log": "pins-after.log",
+      "returncode": 0
+    }
+  ],
+  "core_build_receipt": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/build-glm53-main-verified-engine-v7-aql-release-evidence-20261025T224946Z/receipt.json",
+  "core_build_receipt_sha256": "4b1dd4aeeafbb8caf0233c64c2346fb3e470e4304d57a0f19b7fdb816daf75bc",
+  "GPU_execution": false,
+  "production_changes": false,
+  "scope": "Component checker compilation only",
+  "binary_sha256": {
+    "glm53_main_verified_component_quotes": "40fe004043a0ec50dd20031d5aac6b6f4c118b51fb0f9179f6e91ed03910301f",
+    "glm53_main_verified_graph_quotes": "73f2069cc6bfd9642b6b311f73ffbfd5b24147aee693eb6066b5c4fab20b7624"
+  },
+  "build": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/build-glm53-main-verified-components-v13-aql-release",
+  "evidence_sha256": {
+    "build.log": "825bcc3c569f911c6014054bf8b77181a1857515394a5e1b8fae723e190ee6e5",
+    "configure.log": "c153898d634ccf0afc85b485ad696126a5fedc1aa799e9b569871d98b73dbd86",
+    "pins-after.log": "b367dc22221b4d24069337a351f214ad5798b305bc00a81ff0d3d9f18631f9f6",
+    "pins-before.log": "b367dc22221b4d24069337a351f214ad5798b305bc00a81ff0d3d9f18631f9f6"
+  }
+}

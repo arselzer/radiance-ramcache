@@ -1,0 +1,6 @@
+/home/as/models/hf/amd/GLM-5.3-Flash-Quark-MXFP4/tokenizer.json: 154856 tokens, vocab load 69.4 ms
+  /home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-manual-preparation-v5-core-v7-fixture-v9-20261025T230200Z/prompt-a.txt: 1 bytes
+    tokenizer         1 ids      0.00 ms      0.2 MB/s  (first encode 0.00 ms, 0.2 MB/s)
+    reference         1 ids      0.24 ms      0.0 MB/s
+    reference  identical
+total: 0.0 MB, 1 ids; tokenizer 0.2 MB/s, reference 0.0 MB/s; 0 difference(s)

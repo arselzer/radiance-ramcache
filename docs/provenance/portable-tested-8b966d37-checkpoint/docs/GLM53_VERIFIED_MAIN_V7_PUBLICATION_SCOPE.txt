@@ -1,0 +1,36 @@
+Core V7 / fixture V9 / Components V13 / archived Runner V5 source checkpoint
+
+Selected Core has exactly1535files, pins753436ba. Only six Engine/Sampler files
+differ from publicCore V6/aacccd8. Exact oldsix-file overlay reconstructs Core V6;
+then existingtwo-file overlay reconstructs V5. All old raw archives/evidence/maps
+remain unchanged. Current legacyABI27 headers/schema and kernel bodies are
+unchanged; fullmatchingCore/private headers are still required.
+
+The paddedvocab repair keeps model/embedding/head154880 andlocal38720, verifies
+actualTokenizer/View154856 and exact BF16 physical headers/special/EOG ranges,
+and stages the existing mask to exclude24undefined IDs. Defaults0 stayneutral.
+No arbitrary vocab shrinking, kernel/geometry/model arithmetic or source capability
+is substituted. Core V7 runtime validation remains separate from CPU proof.
+
+Passed stable receipts included: matchingHOSTRelease/full20; focusedHOSTmask+
+actualCPUvocab/backend0; AQLCore+module/Components V13 compilation; fresh V5tokenizer/
+privateHOME preparation; fastactualmetadata with activevalid154856. Preparation
+receipt/hashes only, no HOME binaries/tokenizer/modeldata exported. All active
+ASan/TSan/prewalk receipts were omitted until completed. CurrentGPU/portable13/
+san/fullprewalk outcomes remain PENDING at source staging; no chatReady/fit/
+quality/throughput claim. PriorCore V6CPU/prewalk/portablepasses+GPUfailure/restore
+keep their original source scope, not a Core V7pass.
+
+Portable driver adds only13thHOST --run-host-vocab HOME; --model-vocab-check is
+manual only. Default build/run never downloads a model, configures AQL, executes
+maintenance or starts an APIserver. All compiler/ABI/env/ccache/cache guards
+remain unchanged. New GNUwrap flags match fixture V9 exactly. Runner V5 source
+requires private proofs/newsource digest/three HOST modes/focused Release/current
+AQLprewalk/HOME/resource+idle gates; all stop/restore/signal/ownership bodies
+remain exactRunner V4. No public default/import/install action invokes it.
+
+First authorized functional profile is one prompt/output token, maxTok1/seq1/spec0,
+exactwire/context512, emptyfixedresidents. Normalprompt/262K/MTP/modelquality/
+performance/productionserving remain unvalidated. No weights/native-store/
+tokenizer payload/compiled research library/API credential/private servingconfig or
+DockerConfig/Env is exported. Only the original parent owns actual test windows.

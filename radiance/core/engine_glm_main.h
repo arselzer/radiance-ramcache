@@ -9,6 +9,20 @@
 #include <array>
 namespace rad {
 int glm_main_one_prompt_admission(std::span<const int32_t>,int64_t vocabulary,int64_t context)noexcept;
+// Pure metadata facts. No payload pointer, source capability or Ready state.
+struct GlmMainVocabularyFacts {
+    int64_t model_rows=0,model_width=0,tokenizer_tokens=0,view_tokens=0;
+    int64_t embedding_rows=0,embedding_cols=0,embedding_bytes=0;
+    int64_t head_rows=0,head_cols=0,head_bytes=0;
+    uint32_t embedding_dtype=0,head_dtype=0;
+    bool embedding_physical_plain=false,head_physical_plain=false;
+};
+struct GlmMainVocabularyAdmission {
+    int64_t model_rows=0,valid_tokens=0,padded_rows=0,local_rows=0;
+    int32_t special_ids=0,eog_ids=0;
+};
+int glm_main_vocabulary_guard(const GlmMainVocabularyFacts&,std::span<const int32_t> specials,
+    std::span<const int32_t> eog,GlmMainVocabularyAdmission*)noexcept;
 class Engine;class CachePrepare4RankBinding;class GlmMainTp4VerifiedSourceFactory;
 enum class GlmMainEnginePhase:uint32_t {Requested,ColdAdmitted,MetadataOwned,Plugins,Declared,SourceVerified,NativePlanned,SourceAdmitted,Instances,Pools,Mover,OrdinaryLoaded,Contexts,TransportReady,TextComplete,Terminal,Retired};
 struct GlmMainEngineOptions {
@@ -34,6 +48,7 @@ struct GlmMainEngineSnapshot {
     std::array<uint64_t,4> inventory_metadata{},context_requested{},owner_requested{},mover_requested{};
     std::array<uint64_t,4> ordinary_jobs{},omitted_views{};
     GlmMainOrdinaryLoaderReceipt loader;
+    GlmMainVocabularyAdmission vocabulary;
     bool source_admitted=false,transport_ready=false,text_complete=false,retired=false;
     int32_t sampled_token=-1;
 };
@@ -68,6 +83,10 @@ class GlmMainEngineHarness {
 public:
     static int create(const GlmMainEngineOptions&,std::unique_ptr<Engine>* out)noexcept;
     static int snapshot(const Engine&,GlmMainEngineSnapshot*)noexcept;
+    // CPU-only actual Checkpoint+Tokenizer parse and SAME production guard.
+    // Never calls start(), loads plugins, selects a device, creates a stream,
+    // admits a source or allocates a model. Output has no borrowed lifetime.
+    static int vocabulary_preflight(const std::string& checkpoint,GlmMainVocabularyAdmission* out)noexcept;
     static int retire(Engine&)noexcept;
     // One bounded request through existing scheduler/model/sampler/collect.
     // Never opens an HTTP server. Requires successful start.

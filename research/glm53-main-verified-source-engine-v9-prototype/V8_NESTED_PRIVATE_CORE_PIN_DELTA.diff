@@ -1,0 +1,13 @@
+--- FixtureV7/strict_p3/UNIFIED_CORE_PINS.json
++++ FixtureV8/strict_p3/UNIFIED_CORE_PINS.json
+@@ -153,8 +153,8 @@
+   "cmake/radiance-config.cmake.in": "780e6fc04b8684f77d26a308d94b829a8c2c72199d6a391038ed0b9bb5d16961",
+   "core/CMakeLists.txt": "00dde87d8595354e25a7d77b404c0e86528d2fbdb7a7ea4199c5ad976d425f44",
+   "core/build/expert_prepare.cpp": "5ecd81d657a220f96563b7fef8d083ec2b75e5c66701bff38f4808612d8da9d1",
+-  "core/build/glm_main_ordinary_loader.cpp": "44107ae825400dc56aee4421a9a4d03056d5c42a1c3f072843d9977d3435bde6",
+-  "core/build/glm_main_ordinary_loader.h": "dfd0b68354a3fb8a2e7e37e9d537173c8924640219741d94bd5b86b3f48b60e9",
++  "core/build/glm_main_ordinary_loader.cpp": "0d6eb405e187b38f09c4afc98301ecc2092739ccdb7f7b1f6332f2b2c9d83f4b",
++  "core/build/glm_main_ordinary_loader.h": "ebfe0cc2a793c14bfafc6867a30f8d9d00c64dc354a2c1a47ef5bd3de3b97313",
+   "core/build/glm_main_quote.h": "33bf39468df9e50744e2b24c6791d243b100c4816ae7cc41ba72a09097572f67",
+   "core/build/glm_main_source_data/COMPOSITION.json": "061012b879fa5f2a7ec404f929e76605a2be7f7c50bb26e2e938d5e4a3d10e0f",
+   "core/build/glm_main_source_data/geometry/main_metadata.cpp": "44fd15cd0a37f04a3ab3e815bdd32ea903fa92b0df56669e33ccf8f469dbc1bd",

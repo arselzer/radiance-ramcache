@@ -112,14 +112,14 @@ def verify_snapshot(root):
             raise Refusal("source SHA256 mismatch: " + name)
     core_files = {name.removeprefix("radiance/"): h
                   for name, h in files.items() if name.startswith("radiance/")}
-    archived_pins = root / "research/glm53-main-verified-source-engine-v8-prototype/CORE_SOURCE_PINS.json"
+    archived_pins = root / "research/glm53-main-verified-source-engine-v9-prototype/CORE_SOURCE_PINS.json"
     original = json.loads(archived_pins.read_text(encoding="utf-8"))
-    # V6 retains the V5 inventory (which omitted both generated caches before adding20 source
+    # V7 retains the V6/V5 inventory (which omitted both generated caches before adding20 source
     # files:1517-2+20=1535). Do not subtract them a second time or rewrite history.
     if not isinstance(original, dict) or len(original) != 1535 or CORE_CACHE_EXCLUSIONS & set(original):
-        raise Refusal("unexpected frozen1535-file verified-main V6 Core pin inventory")
+        raise Refusal("unexpected frozen1535-file verified-main V7 Core pin inventory")
     if core_files != original:
-        raise Refusal("exported Core differs from the exact frozen1535-file V6 inventory")
+        raise Refusal("exported Core differs from the exact frozen1535-file V7 inventory")
     if any(name in core_files for name in CORE_CACHE_EXCLUSIONS):
         raise Refusal("portable source snapshot must exclude the two recorded Python caches")
     return files

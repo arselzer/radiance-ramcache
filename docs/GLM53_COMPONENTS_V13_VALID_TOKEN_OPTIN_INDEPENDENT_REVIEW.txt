@@ -1,0 +1,49 @@
+SOURCE-ONLY INDEPENDENT REVIEW: COMPONENTS V13 VALID-TOKEN OPT-IN
+
+Decision: no scoped source blocker. Frozen SOURCE_RECEIPT SHA256
+2e364dd804fce51dc3749bab9ae398073b148cb22bd4edca44dbd8974a0fe051;
+actual_graph_quotes.cpp00ecfab60744c2f295451c70a872f034b82ff24b939e7ca8522b212f6dd66457.
+No compiler, target import, numerical/model/GPU/service action or source edit
+was performed by this reviewer. Parent runtime/build/prewalk results are separate.
+
+Identity checks
+All20 receipt file hashes match the closed21-file package. All1535 Core7 hashes
+match753436bac31f041b8e051fb4e4797319d4eefa12df6d2bde0f8e28eee407b366.
+The HOST quote source, helper source map and preserved quote-body map are exactly
+V12. The diff against V12 consists of documentation/receipt/current Core pins,
+CMake Core6->Core7 source selection, and the narrow actual-checker delta below.
+The raw parent V12 receipt is retained. No archived parent was edited.
+
+Actual callback and quote coherence
+The single sampler_config(rank) helper keeps model154880/local38720, actual rank,
+world4 and vocab_offset=rank*38720. It now opts into valid_token_count154856.
+Both the predeclare static Sampler quote AND the actual per-rank Sampler.declare
+callback call this same helper; there is no zero-bound shadow prequote and no
+second fake configuration. The existing member postdeclare quote still checks
+staging/candidate closure. The actual callback's contiguous local-width check,
+real bounded pinned staging tracker and no-opaque-instance check remain.
+Core7's opt-in declaration itself requires the existing sample_mask op, without
+changing model/head widths or inventing a kernel. This review is not DEVICE
+sampling execution proof; metadata/complete prewalk deliberately launch no rows.
+
+Result and source/lifetime scope
+Each rank's new three result fields read the retained real Program.meta.n_vocab
+and real Sampler.config.valid_token_count; padded rows are their difference.
+The established geometry/profile checks make these154880/154856/24. This records
+an actual declaration setting, not successful runtime sampling or tokenizer
+identity. The separate focused HOST/real CPU vocabulary receipt remains required.
+The actual MetaOwn lifetime, exact arrays/count/pointer checks, current source
+cache binding, NativeInventory/full-domain checks, final plans, omission count,
+ordinary eligibility helper, loader refusal/cap checks and final output publication
+are unchanged V12. No graph normalization, source capability, SourceFactory,
+Session/Engine admission or loader execution is introduced.
+
+Private ABI and validation gates
+The exact current Core map and CMake archive/source-home checks remain; an old
+Core6 archive with new SamplerConfig/header layout is not admitted. HOST quote
+mode intentionally remains the byte-identical neutral/default body. Actual
+metadata/prewalk mode now declares the opt-in using matching Core7. The old
+Core6 complete-prewalk pass cannot establish the new current-source gate.
+Parent must compile matching Core7, run current actual metadata/full prewalk,
+and bind those receipts to the fresh HOME/build/tokenizer proof before any
+separately authorized maintenance action. No prior failure or scope is promoted.

@@ -116,8 +116,7 @@ void RadFile::drop_range(int64_t off, int64_t bytes) const {
 
 void RadFile::snapshot_resident() {
     resident_.clear();
-    const char* e = std::getenv("RADIANCE_MAPPED_REWARM");
-    if (e && e[0] == '0' && e[1] == 0) return;
+    if (!base_ || !hdr_) return;
     const int64_t pg = 4096;
     const int64_t tables = (int64_t)hdr_->data_off < size_ ? (int64_t)hdr_->data_off : size_;
     const int64_t chunk = 1ll << 30;
@@ -198,7 +197,6 @@ int RadFile::open(const char* path) {
     if ((int64_t)hdr_->str_off >= blob_end && blob_end < size_)
         ::madvise(base_ + (blob_end & ~(int64_t)(RAD_ALIGN_UNIT - 1)),
                   (size_t)(size_ - (blob_end & ~(int64_t)(RAD_ALIGN_UNIT - 1))), MADV_WILLNEED);
-    snapshot_resident();
     s = index_experts();
     if (s < 0) { close(); return s; }
 

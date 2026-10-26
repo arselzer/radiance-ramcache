@@ -867,6 +867,10 @@ struct Config {
      * through the container's mapping) are asked for ahead of its kernel (runtime/rowprefetch.h,
      * CtxDesc::row_prefetch). Output-neutral; on is the default. */
     bool    row_prefetch = true;
+    /* --mapped-rewarm on|off: at startup, the mapped tier's pages an earlier run left in the page
+     * cache and the load's allocations reclaimed are asked for again, at most half of
+     * MemAvailable (RadFile::rewarm). Output-neutral; on is the default. */
+    bool    mapped_rewarm = true;
 
     std::string placement = "auto";    /* all_vram | layer_offload | expert_tiered | auto */
     /* --embedding-placement and --ngram-placement as given (see TablePlacement), and their

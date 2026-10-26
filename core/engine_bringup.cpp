@@ -722,6 +722,9 @@ int Engine::read_metadata() {
     if (!is_container(cfg_.model)) return read_checkpoint_metadata();
     file_ = std::make_unique<RadFile>();
     RAD_TRY(file_->open(cfg_.model.c_str()));
+    /* What an earlier run left cached of the container, recorded before anything here allocates,
+     * for the mapped tier's rewarm after the load (RadFile::rewarm). */
+    if (cfg_.mapped_rewarm) file_->snapshot_resident();
 
     const RadFileHeader& h = file_->header();
     meta_ = RadModelMeta{};
@@ -2606,7 +2609,7 @@ static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
         const int64_t asked = file->rewarm(keep_cached, avail / 2);
         if (asked > 0)
             RAD_INFO("mapped tier: asked the page cache again for %s an earlier run had cached (%.0f ms; "
-                     "RADIANCE_MAPPED_REWARM=0 turns it off)", humanb(asked).c_str(),
+                     "--mapped-rewarm off turns it off)", humanb(asked).c_str(),
                      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count());
     }
     /* Drain before freeing: a sweep that failed part-way may have copies outstanding. */

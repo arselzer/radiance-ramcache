@@ -1848,6 +1848,7 @@ by 0.002-0.003 nats.
 | `--vision-tower-placement WHERE` | vram | `vram` or `ram`: the encoder towers (vision, and audio where a model has one) on the card, or pinned in host memory beside `--host-pool-mib` and read in place once an image (§4.3) |
 | `--weights-disk-tier` | off | read weights that fit neither VRAM nor the host pool from the container (O_DIRECT); routed experts a layer at a time |
 | `--row-prefetch MODE` | on | `on` or `off`: a host gather from a table read through the container's mapping (`--ngram-placement disk`) asks for its rows' pages before its kernel, or beside it when they are resident (§4.3); the output is the same either way |
+| `--mapped-rewarm MODE` | on | `on` or `off`: at startup, the pages of such a table an earlier run left in the page cache, and the load's own allocations pushed out, are asked for again (at most half of the available memory), so the first requests after a restart do not read them from the drive |
 
 **LoRA adapters** (§4.9.1)
 

@@ -111,6 +111,11 @@ static const Flag g_flags[] = {
     "                                    pages its rows cover before its kernel runs, or beside it when\n"
     "                                    they are already resident; off leaves every row to the\n"
     "                                    kernel's own page faults. The output is the same either way" },
+    { "--mapped-rewarm",      "MODE",   "on (default) | off -- at startup, ask the page cache again for\n"
+    "                                    the pages of a table read through the container's mapping\n"
+    "                                    that an earlier run left cached and the load's own\n"
+    "                                    allocations pushed out, at most half of the available memory,\n"
+    "                                    so the first requests do not read them from the drive" },
     { "--prefix-cache-mib",   "N",      "copy finished conversations' KV to host memory, up to N MiB,\n"
     "                                    so their VRAM can go to experts and a return restores\n"
     "                                    instead of re-prefilling. A full tier drops its least\n"
@@ -584,6 +589,15 @@ int config_parse(int argc, char** argv, Config* c) {
             else if (!std::strcmp(v, "off")) c->row_prefetch = false;
             else {
                 RAD_ERR("--row-prefetch takes on or off, not '%s'", v);
+                return RAD_E_INVAL;
+            }
+        }
+        else if (S("--mapped-rewarm")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if      (!std::strcmp(v, "on"))  c->mapped_rewarm = true;
+            else if (!std::strcmp(v, "off")) c->mapped_rewarm = false;
+            else {
+                RAD_ERR("--mapped-rewarm takes on or off, not '%s'", v);
                 return RAD_E_INVAL;
             }
         }
@@ -1139,6 +1153,7 @@ const ShowRow kShow[] = {
     { "--vision-tower-placement", [](const Config& c) { return std::string(table_placement_name(c.tower_placement)); } },
     { "--weights-disk-tier",  [](const Config& c) { return onoff(c.weights_disk_tier); } },
     { "--row-prefetch",       [](const Config& c) { return onoff(c.row_prefetch); } },
+    { "--mapped-rewarm",      [](const Config& c) { return onoff(c.mapped_rewarm); } },
     { "--prefix-cache-mib",   [](const Config& c) {
           return c.prefix_cache_mib ? num(c.prefix_cache_mib) : std::string("0 (off)"); } },
     { "--prefix-cache-ttl",   [](const Config& c) {

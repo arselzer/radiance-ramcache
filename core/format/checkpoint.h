@@ -167,11 +167,16 @@ public:
      * Gguf: a GGUF holding llama.cpp block types (K-, I- and legacy quants): every such tensor is
      * imported block for block as the affine planes libquant's `ggml` quantiser writes for the
      * same blocks (libquant/lq_ggml_planes.h); its float tensors read as they are.
+     * Fp8Mx: DeepSeek-V4's release form (quant_method fp8, scale_fmt ue8m0, expert_dtype fp4):
+     * block-FP8 linears with an e8m0 scale per weight_block_size block, read stock beside their
+     * `X.scale` (DeepSeek's spelling of the scale plane), and routed experts as `X.weight` I8
+     * [N, K/2] (two e2m1 codes a byte, element 2j in the low nibble) with `X.scale` e8m0
+     * [N, K/32]: `fp4_e2m1*e8m0[1x32]` byte for byte, as Quark's MXFP4.
      * An unreadable form of these stays None, with the reason in import_refusal(). The
      * quantization_config keys are then renamed `imported_quantization_config.*`, since they
      * describe the tool, not a served format. */
     enum class Import { None, Gptq, QuarkMx, CtInt4, ParoMx, ParoM2, ParoI5, ParoI4, Nvfp4, CtFp8,
-                        ModelOpt, Gguf };
+                        ModelOpt, Gguf, Fp8Mx };
     Import imports() const { return import_; }
     const std::string& import_refusal() const { return import_why_; }
 

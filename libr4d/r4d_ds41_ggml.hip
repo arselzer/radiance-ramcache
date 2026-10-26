@@ -37,6 +37,7 @@
 #include "r4d_plugin.h"
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <type_traits>
 
@@ -635,6 +636,13 @@ enum : int { GG_Q8_0 = 0, GG_Q5_K, GG_Q6_K, GG_IQ4_NL, GG_IQ2_XXS, GG_IQ1_S, GG_
 
 typedef __attribute__((address_space(1))) const uint32_t* gg_gu32;
 typedef __attribute__((address_space(1))) const r4d_u32x4* gg_gu128;
+/* Wider words at a 2-byte-aligned address, one load each: the device runs with unaligned access
+ * enabled (the compiler emits global_load_b32/b64 for these). Only the decode kernel uses them. */
+typedef uint32_t __attribute__((aligned(2))) gg_u32a2_t;
+typedef unsigned int gg_u32x2 __attribute__((ext_vector_type(2)));
+typedef gg_u32x2 __attribute__((aligned(2))) gg_u64a2_t;
+typedef __attribute__((address_space(1))) const gg_u32a2_t* gg_gu32a2;
+typedef __attribute__((address_space(1))) const gg_u64a2_t* gg_gu64a2;
 
 __device__ __forceinline__ uint32_t gg_u16(const uint8_t* p) { return ldg_u16((const uint16_t*)p); }
 __device__ __forceinline__ uint32_t gg_d32a2(const uint8_t* p) {
@@ -796,6 +804,12 @@ template <> struct Gg<GG_IQ2_XXS> {
         r[1] = gg_d32a2(b + 2 + 8 * u);
         r[2] = gg_d32a2(b + 6 + 8 * u);
     }
+    __device__ static __forceinline__ void load_w(const uint8_t* b, int u, uint32_t* r) {
+        r[0] = gg_u16(b);
+        const gg_u32x2 v = *(gg_gu64a2)(const void*)(b + 2 + 8 * u);
+        r[1] = v.x;
+        r[2] = v.y;
+    }
     __device__ static __forceinline__ int goff(int u, int g) { return 32 * u + 8 * g; }
     template <int G>
     __device__ static __forceinline__ void dec(const uint32_t* r, int, const void* tab, float* w) {
@@ -822,6 +836,11 @@ template <> struct Gg<GG_IQ1_S> {
     __device__ static __forceinline__ void load(const uint8_t* b, int u, uint32_t* r) {
         r[0] = gg_u16(b);
         r[1] = gg_d32a2(b + 2 + 4 * u);
+        r[2] = gg_u16(b + 34 + 2 * u);
+    }
+    __device__ static __forceinline__ void load_w(const uint8_t* b, int u, uint32_t* r) {
+        r[0] = gg_u16(b);
+        r[1] = *(gg_gu32a2)(const void*)(b + 2 + 4 * u);
         r[2] = gg_u16(b + 34 + 2 * u);
     }
     __device__ static __forceinline__ int goff(int u, int g) { return 32 * u + 8 * g; }
@@ -916,6 +935,7 @@ __device__ __forceinline__ int gg_moe_tok(const int32_t* sorted, int i, int top_
 constexpr int kGgWaves = 8;
 constexpr int kGgThreads = 256;
 constexpr int kGgXM = 8;                 /* activation rows a pass */
+constexpr int kGgDecodeRows = 48;        /* gemm_nt_ggml / logits_gemm_ggml: rows the decode kernel takes */
 constexpr int kGgMaxExpert = 1024;
 
 struct GgGemvArgs {
@@ -1146,6 +1166,1117 @@ __global__ __launch_bounds__(kGgThreads) void gg_gemv_kernel(GgGemvArgs A) {
                 }
             }
         }
+    }
+}
+
+/* ================================================================== moe decode
+ *
+ * gg_md_kernel, moe_gemm_ggml's decode band (up to kMdMaxT sorted rows). Each block reads the
+ * routing itself: a row's expert by libref's binary search over the offsets, the row dead when its
+ * slot is dropped or its token lies past `a`. The live rows (in sorted order, so grouped by
+ * expert) are cut into segments of at most XM consecutive rows of one expert, and a segment's
+ * work is its expert's N weight rows in tasks of RPW rows. The grid's waves split all the tasks
+ * evenly, each a contiguous run, so an expert without live rows costs nothing, a live one is
+ * streamed once a segment, and the experts of a step stream side by side. The dead rows are
+ * zeroed by all the blocks together.
+ *
+ * A block's tasks sit in one or a few consecutive segments; it stages their activation rows (all
+ * that fit XB rows of LDS) once, widened to f32, then its waves stream their tasks: every lane
+ * loads its units of all RPW rows at once (one round trip a task), and decodes them against the
+ * staged rows, the grid table in LDS. Per output the arithmetic is gg_gemv_kernel's to the bit:
+ * lane = unit mod 32, the lane's units in order, the same butterfly, and the same dequantised
+ * values (the I-quants by an exact rearrangement, md_unit_iq1s / md_unit_iq2xxs), so this path,
+ * the old one and gemm_nt_ggml's gemv agree on every bit. */
+constexpr int kMdMaxT = 288;             /* sorted rows a launch: 48 tokens at top-6 */
+constexpr int kMdXM = 4;                 /* rows a segment at most (the sums a lane keeps a row) */
+
+struct GgMdArgs {
+    const uint16_t* x;
+    long long x_ld;
+    const uint8_t* w;                    /* stacked experts, or null */
+    const uint8_t* const* wtab;          /* the expert table, or null */
+    long long w_ld, w_es;                /* bytes a weight row, an expert */
+    uint16_t* y;
+    long long y_ld;
+    const int32_t* sorted;
+    const int32_t* off;
+    int T, N, K;                         /* T: sorted (output) rows */
+    int n_expert, top_k, a_sorted, AR, x_al;
+    int XB;                              /* activation rows the LDS buffer holds */
+    int XM;                              /* rows a segment, <= min(XB, kMdXM) */
+    int meta_off, x_off;                 /* LDS byte offsets */
+    int raw_off, raw_wave;               /* the waves' chunk buffers (md_step_stg), or -1 */
+    int xs_off;                          /* the dot path's unit sums of the staged rows (IQ1_S) */
+    int dbg;                             /* R4D_MD_DBG (measurement only): 2 the loads without the math */
+};
+
+/* Where a staged row keeps value k in LDS, so that the lanes of a wave (lane = unit mod 32, all
+ * reading group G of their units) hit distinct banks. f32 rows: k a multiple of 4, the 16-byte
+ * chunks of each 32-float line permuted by line / 2; eight values from a multiple of 8 are two
+ * chunks. bf16 rows: eight values from a multiple of 8 are one chunk, permuted by line / 4. */
+__device__ __forceinline__ int gg_xswz(int k) {
+    return (k & ~31) | ((((k >> 2) ^ (k >> 6)) & 7) << 2);
+}
+__device__ __forceinline__ int gg_xswz16(int k) {
+    const int q = k >> 3;
+    return (q ^ ((q >> 4) & 3)) << 3;
+}
+
+/* IEEE half -> float by the hardware conversion: exact for zeros, subnormals, normals and
+ * infinities (f16 denormals are kept); a NaN comes out quiet. */
+__device__ __forceinline__ float gg_h2f_hw(uint32_t h) {
+    return (float)__builtin_bit_cast(_Float16, (uint16_t)h);
+}
+
+/* The mc (<= XMX) staged rows' eight values at k .. k + 7: f32 rows when XMX is 1, bf16 rows
+ * (widened here, exactly) above. */
+template <int XMX>
+__device__ __forceinline__ void md_x8(const float* xs, int K, int k, int mc, float (&xv)[XMX][8]) {
+    if constexpr (XMX == 1) {
+        const float4 a = *(const float4*)(xs + gg_xswz(k));
+        const float4 c = *(const float4*)(xs + gg_xswz(k + 4));
+        xv[0][0] = a.x; xv[0][1] = a.y; xv[0][2] = a.z; xv[0][3] = a.w;
+        xv[0][4] = c.x; xv[0][5] = c.y; xv[0][6] = c.z; xv[0][7] = c.w;
+    } else {
+        const uint16_t* xb = (const uint16_t*)(const void*)xs;
+        const int p = gg_xswz16(k);
+#pragma unroll
+        for (int m = 0; m < XMX; ++m) {
+            if (m < mc) {
+                const r4d_u32x4 v = *(const r4d_u32x4*)(const void*)(xb + m * K + p);
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    xv[m][2 * i] = bf16w_lo(v[i]);
+                    xv[m][2 * i + 1] = bf16w_hi(v[i]);
+                }
+            }
+        }
+    }
+}
+
+/* One weight row's eight values into its sums, value by value (gg_unit's order). */
+template <int XMX>
+__device__ __forceinline__ void md_acc(const float (&w)[8], const float (&xv)[XMX][8], int mc,
+                                       float (&acc)[XMX]) {
+#pragma unroll
+    for (int m = 0; m < XMX; ++m) {
+        if (XMX == 1 || m < mc) {
+#pragma unroll
+            for (int t = 0; t < 8; ++t) acc[m] += xv[m][t] * w[t];
+        }
+    }
+}
+
+/* One unit of RPW rows by the type's own dec (any type; the I-quants' path for a block whose d is
+ * an infinity or a NaN). */
+template <int T, int RPW, int XMX, bool SER = false>
+__device__ __forceinline__ void md_unit(const uint32_t (&raw)[RPW][Gg<T>::NR], int U, const float* xs,
+                                        int K, int mc, const void* tab, const bool (&ok)[RPW],
+                                        float (&acc)[RPW][XMX]) {
+    using Q = Gg<T>;
+    const int b = U / Q::UPB, u = U - b * Q::UPB;
+    gg_for<4>([&](auto gi) {
+        constexpr int G = decltype(gi)::value;
+        float xv[XMX][8];
+        md_x8<XMX>(xs, K, b * Q::QK + Q::goff(u, G), mc, xv);
+#pragma unroll
+        for (int r = 0; r < RPW; ++r)
+            if (ok[r]) {
+                if constexpr (SER) sched_barrier();   /* a rare path: keep it narrow */
+                float w[8];
+                Q::template dec<G>(raw[r], u, tab, w);
+                md_acc<XMX>(w, xv, mc, acc[r]);
+            }
+    });
+}
+
+/* IQ1_S, a finite d: Gg<IQ1_S>::dec's dl * (byte + c) is exact (dl = d (2s + 1) has at most 15
+ * significant bits, byte + c is one of +-1/8, +-7/8, +-9/8), so fma(byte, dl, dl * c) -- an exact
+ * product plus an exact dl * c, whose sum is representable -- is the same float, in two
+ * operations instead of three. (Not for an infinite dl: 0 * inf; md_task routes those blocks to
+ * md_unit.) */
+template <int RPW, int XMX>
+__device__ __forceinline__ void md_unit_iq1s(const uint32_t (&raw)[RPW][3], int U, const float* xs,
+                                             int K, int mc, const uint32_t* grid,
+                                             const bool (&ok)[RPW], float (&acc)[RPW][XMX]) {
+    gg_for<4>([&](auto gi) {
+        constexpr int G = decltype(gi)::value;
+        float xv[XMX][8];
+        md_x8<XMX>(xs, K, 32 * U + 8 * G, mc, xv);
+#pragma unroll
+        for (int r = 0; r < RPW; ++r)
+            if (ok[r]) {
+                const uint32_t qh = raw[r][2];
+                const float dl = gg_h2f_hw(raw[r][0]) * (float)(int)(2 * ((qh >> 12) & 7u) + 1);
+                const float dlc = dl * ((qh & 0x8000u) ? -1.125f : -0.875f);
+                const uint32_t ix = gg_byte(raw[r][1], G) | (((qh >> (3 * G)) & 7u) << 8);
+                const uint2 g = *(const uint2*)(grid + 2 * ix);
+                float w[8];
+#pragma unroll
+                for (int t = 0; t < 8; ++t) w[t] = fmaf((float)gg_byte(t < 4 ? g.x : g.y, t % 4), dl, dlc);
+                md_acc<XMX>(w, xv, mc, acc[r]);
+            }
+    });
+}
+
+/* IQ2_XXS: Gg<IQ2_XXS>::dec's m = db * grid, negated by the sign bit, is |db| * grid with the sign
+ * (sign bit) xor (db's sign) inserted -- the same bits, NaN and zeros included -- so the sign costs
+ * a shift and a bit insert. */
+template <int RPW, int XMX>
+__device__ __forceinline__ void md_unit_iq2xxs(const uint32_t (&raw)[RPW][3], int U, const float* xs,
+                                               int K, int mc, const uint32_t* grid,
+                                               const bool (&ok)[RPW], float (&acc)[RPW][XMX]) {
+    gg_for<4>([&](auto gi) {
+        constexpr int G = decltype(gi)::value;
+        float xv[XMX][8];
+        md_x8<XMX>(xs, K, 32 * U + 8 * G, mc, xv);
+#pragma unroll
+        for (int r = 0; r < RPW; ++r)
+            if (ok[r]) {
+                const float db = gg_h2f_hw(raw[r][0]) * (0.5f + (float)(raw[r][2] >> 28)) * 0.25f;
+                const float adb = fabsf(db);
+                const uint32_t dsg = (__float_as_uint(db) >> 31) ? 0xffu : 0u;
+                const uint2 g = *(const uint2*)(grid + 2 * gg_byte(raw[r][1], G));
+                const uint32_t sx = (raw[r][2] >> (7 * G)) & 127u;
+                const uint32_t sg = (sx | ((__builtin_popcount(sx) & 1u) << 7)) ^ dsg;
+                float w[8];
+#pragma unroll
+                for (int t = 0; t < 8; ++t) {
+                    const float m = adb * (float)gg_byte(t < 4 ? g.x : g.y, t % 4);
+                    w[t] = __uint_as_float((__float_as_uint(m) & 0x7fffffffu) | ((sg << (31 - t)) & 0x80000000u));
+                }
+                md_acc<XMX>(w, xv, mc, acc[r]);
+            }
+    });
+}
+
+/* One step of md_task: the lane's units U, U + 32, ... (UF of them) of its RPW rows. NF > 0: every
+ * row exists, and so do the first NF units of every lane (no guards there: straight code the
+ * scheduler can interleave); NF = 0: all guarded. */
+template <int T, int RPW, int UF, int XMX, int NF>
+__device__ __forceinline__ void md_step(const uint8_t* const (&wr)[RPW], const bool (&okr)[RPW], int U,
+                                        int UK, const float* xs, int K, int mc, const void* tab,
+                                        float (&acc)[RPW][XMX]) {
+    using Q = Gg<T>;
+    bool ok[RPW];
+#pragma unroll
+    for (int r = 0; r < RPW; ++r) ok[r] = NF > 0 || okr[r];
+    uint32_t raw[UF][RPW][Q::NR];
+    gg_for<UF>([&](auto fi) {
+        constexpr int F = decltype(fi)::value;
+        const int V = U + 32 * F;
+        if (F < NF || V < UK) {
+            const int b = V / Q::UPB;
+#pragma unroll
+            for (int r = 0; r < RPW; ++r)
+                if (ok[r]) {
+                    if constexpr (T == GG_IQ1_S || T == GG_IQ2_XXS)
+                        Q::load_w(wr[r] + (long long)b * Q::BB, V - b * Q::UPB, raw[F][r]);
+                    else
+                        Q::load(wr[r] + (long long)b * Q::BB, V - b * Q::UPB, raw[F][r]);
+                }
+        }
+    });
+    bool fast = T == GG_IQ2_XXS;
+    if constexpr (T == GG_IQ1_S) {
+        bool bad = false;
+        gg_for<UF>([&](auto fi) {
+            constexpr int F = decltype(fi)::value;
+            if (F < NF || U + 32 * F < UK) {
+#pragma unroll
+                for (int r = 0; r < RPW; ++r)
+                    if (ok[r]) bad |= (raw[F][r][0] & 0x7c00u) == 0x7c00u;
+            }
+        });
+        fast = __builtin_amdgcn_ballot_w32(bad) == 0u;
+    }
+    if (fast) {
+        if constexpr (T == GG_IQ1_S || T == GG_IQ2_XXS) {
+            gg_for<UF>([&](auto fi) {
+                constexpr int F = decltype(fi)::value;
+                const int V = U + 32 * F;
+                /* Unit by unit: the loads above stay in flight together, but one unit's LDS reads
+                 * are not hoisted over another's (that would hold every unit's activations). */
+                if constexpr (F < NF) sched_barrier();
+                if (F < NF || V < UK) {
+                    if constexpr (T == GG_IQ1_S)
+                        md_unit_iq1s<RPW, XMX>(raw[F], V, xs, K, mc, (const uint32_t*)tab, ok, acc);
+                    else
+                        md_unit_iq2xxs<RPW, XMX>(raw[F], V, xs, K, mc, (const uint32_t*)tab, ok, acc);
+                }
+            });
+        }
+    } else {
+        gg_for<UF>([&](auto fi) {
+            constexpr int F = decltype(fi)::value;
+            const int V = U + 32 * F;
+            if constexpr (F < NF) sched_barrier();
+            if (F < NF || V < UK)
+                md_unit<T, RPW, XMX, (T == GG_IQ1_S)>(raw[F], V, xs, K, mc, tab, ok, acc);
+        });
+    }
+}
+
+/* md_step for the I-quants through a wave-private LDS chunk: the first NFS of the lane's units are
+ * whole 4-block chunks of each of the RPW rows (32 units, 4 * BB contiguous bytes a row), which
+ * the wave reads with 8-byte loads at consecutive addresses -- every byte once, the fewest load
+ * instructions, and each line of a host-pool expert crosses the link once -- then hands out
+ * through LDS, unit by unit, as md_step's raw words. Units past NFS load directly (guarded). The
+ * values and their order are md_step's. */
+__device__ __forceinline__ uint32_t md_l16(const uint8_t* p) { return *(const uint16_t*)(const void*)p; }
+
+/* A wave-uniform pointer kept in scalar registers (loads then take it as their base). */
+__device__ __forceinline__ const uint8_t* md_uniform(const uint8_t* p) {
+    const unsigned long long v = (unsigned long long)p;
+    const unsigned lo = (unsigned)__builtin_amdgcn_readfirstlane((int)(unsigned)v);
+    const unsigned hi = (unsigned)__builtin_amdgcn_readfirstlane((int)(unsigned)(v >> 32));
+    return (const uint8_t*)(((unsigned long long)hi << 32) | lo);
+}
+
+template <int T, int RPW, int UF, int XMX, int NFS>
+__device__ __forceinline__ void md_step_stg(const uint8_t* w0, long long w_ld, int U0, int lane, int UK,
+                                            const float* xs, int K, int mc, const void* tab, uint8_t* buf,
+                                            float (&acc)[RPW][XMX]) {
+    using Q = Gg<T>;
+    static_assert(T == GG_IQ1_S || T == GG_IQ2_XXS, "the three-word I-quants");
+    constexpr int CB = 4 * Q::BB, CBP = (CB + 15) / 16 * 16, LPR = CB / 8, NS = RPW * LPR;
+    constexpr int NJ = (NS + 31) / 32, NT_ = UF - NFS > 0 ? UF - NFS : 1;
+    static_assert(CB % 8 == 0, "a chunk is whole 8-byte pieces");
+    const int b0 = U0 >> 3;
+    const uint8_t* cb = w0 + (long long)b0 * Q::BB;       /* uniform: a scalar base */
+    bool sv[NJ];
+    int go[NJ], ro[NJ];
+#pragma unroll
+    for (int j = 0; j < NJ; ++j) {
+        const int idx = lane + 32 * j;
+        sv[j] = idx < NS;
+        const int r = sv[j] ? idx / LPR : 0, l = idx - r * LPR;
+        go[j] = r * (int)w_ld + 8 * l;
+        ro[j] = r * CBP + 8 * l;
+    }
+    gg_u32x2 g[NFS > 0 ? NFS : 1][NJ];
+    gg_for<NFS>([&](auto fi) {
+        constexpr int F = decltype(fi)::value;
+#pragma unroll
+        for (int j = 0; j < NJ; ++j)
+            if (sv[j]) g[F][j] = *(gg_gu64a2)(const void*)(cb + (go[j] + 4 * F * Q::BB));
+    });
+    uint32_t rawt[NT_][RPW][Q::NR];
+    gg_for<UF - NFS>([&](auto fi) {
+        constexpr int F = decltype(fi)::value + NFS;
+        const int V = U0 + lane + 32 * F;
+        if (V < UK) {
+            const int b = V / Q::UPB;
+#pragma unroll
+            for (int r = 0; r < RPW; ++r)
+                Q::load_w(w0 + (long long)r * w_ld + (long long)b * Q::BB, V - b * Q::UPB, rawt[F - NFS][r]);
+        }
+    });
+    bool ok[RPW];
+#pragma unroll
+    for (int r = 0; r < RPW; ++r) ok[r] = true;
+    const int beta = lane >> 3, sub = lane & 7;
+    auto run = [&](const uint32_t (&raw)[RPW][3], int V) {
+        bool fast = T == GG_IQ2_XXS;
+        if constexpr (T == GG_IQ1_S) {
+            bool bad = false;
+#pragma unroll
+            for (int r = 0; r < RPW; ++r) bad |= (raw[r][0] & 0x7c00u) == 0x7c00u;
+            fast = __builtin_amdgcn_ballot_w32(bad) == 0u;
+        }
+        if (fast) {
+            if constexpr (T == GG_IQ1_S)
+                md_unit_iq1s<RPW, XMX>(raw, V, xs, K, mc, (const uint32_t*)tab, ok, acc);
+            else
+                md_unit_iq2xxs<RPW, XMX>(raw, V, xs, K, mc, (const uint32_t*)tab, ok, acc);
+        } else {
+            md_unit<T, RPW, XMX, true>(raw, V, xs, K, mc, tab, ok, acc);
+        }
+    };
+    gg_for<NFS>([&](auto fi) {
+        constexpr int F = decltype(fi)::value;
+        sched_barrier();
+#pragma unroll
+        for (int j = 0; j < NJ; ++j)
+            if (sv[j]) *(gg_u32x2*)(void*)(buf + ro[j]) = g[F][j];
+        uint32_t raw[RPW][3];
+#pragma unroll
+        for (int r = 0; r < RPW; ++r) {
+            const uint8_t* bp = buf + r * CBP + beta * Q::BB;
+            raw[r][0] = md_l16(bp);
+            if constexpr (T == GG_IQ1_S) {
+                raw[r][1] = md_l16(bp + 2 + 4 * sub) | (md_l16(bp + 4 + 4 * sub) << 16);
+                raw[r][2] = md_l16(bp + 34 + 2 * sub);
+            } else {
+                raw[r][1] = md_l16(bp + 2 + 8 * sub) | (md_l16(bp + 4 + 8 * sub) << 16);
+                raw[r][2] = md_l16(bp + 6 + 8 * sub) | (md_l16(bp + 8 + 8 * sub) << 16);
+            }
+        }
+        run(raw, U0 + lane + 32 * F);
+    });
+    gg_for<UF - NFS>([&](auto fi) {
+        constexpr int F = decltype(fi)::value + NFS;
+        const int V = U0 + lane + 32 * F;
+        sched_barrier();
+        if (V < UK) run(rawt[F - NFS], V);
+    });
+}
+
+/* RPW weight rows from n0 of the expert at wb against the mc staged rows at xs: lane = unit mod
+ * 32 as gg_row, every unit of the lane's rows loaded before the first is decoded (UF of them a
+ * lane a row, UF * 32 >= the row's units for the real shapes). */
+template <int T, int RPW, int UF, int XMX>
+__device__ __forceinline__ void md_task(const uint8_t* wb, long long w_ld, int n0, int N, int UK,
+                                        const float* xs, int K, int mc, int lane, const void* tab,
+                                        uint8_t* buf, float (&acc)[RPW][XMX]) {
+    bool ok[RPW];
+    const uint8_t* wr[RPW];
+#pragma unroll
+    for (int r = 0; r < RPW; ++r) {
+        ok[r] = n0 + r < N;
+        wr[r] = wb + (long long)(ok[r] ? n0 + r : 0) * w_ld;
+    }
+    const bool fullr = n0 + RPW <= N;
+    for (int U0 = 0; U0 < UK; U0 += 32 * UF) {
+        const int nf = fullr ? (UK - U0) >> 5 : 0;      /* units every lane has, this step */
+        if constexpr (T == GG_IQ1_S || T == GG_IQ2_XXS) {
+            if (buf && nf >= UF) {
+                md_step_stg<T, RPW, UF, XMX, UF>(wr[0], w_ld, U0, lane, UK, xs, K, mc, tab, buf, acc);
+                continue;
+            }
+            if (buf && UF > 1 && nf == UF - 1) {
+                md_step_stg<T, RPW, UF, XMX, (UF > 1 ? UF - 1 : 0)>(wr[0], w_ld, U0, lane, UK, xs, K, mc, tab, buf, acc);
+                continue;
+            }
+        }
+        if (nf >= UF)
+            md_step<T, RPW, UF, XMX, UF>(wr, ok, U0 + lane, UK, xs, K, mc, tab, acc);
+        else if (UF > 1 && nf == UF - 1)
+            md_step<T, RPW, UF, XMX, (UF > 1 ? UF - 1 : 0)>(wr, ok, U0 + lane, UK, xs, K, mc, tab, acc);
+        else
+            md_step<T, RPW, UF, XMX, 0>(wr, ok, U0 + lane, UK, xs, K, mc, tab, acc);
+    }
+}
+
+/* ------------------------------------------------------------------ the I-quants' dot path
+ * IQ1_S and IQ2_XXS against the staged bf16 rows by v_dot2_f32_bf16. The grid values (IQ1_S's
+ * -1, 0, 1; IQ2_XXS's 8, 25, 43 with the signs xor-ed in) are exact in bf16 and so is every
+ * product; a unit's 32 values sum pairwise into one f32 and the unit's scale applies once:
+ * IQ1_S dl (sum x g + delta sum x) (sum x: the staged row's unit sums, kept beside it), IQ2_XXS
+ * db sum x g. The weights are libref's floats (dl (g + delta), db g); only the rounding order
+ * differs, so this path is within reduction-order tolerance of libref (not bit-equal to the
+ * gemv). A step whose units hold a non-finite d, or a phase whose staged rows hold a non-finite
+ * value (or IQ1_S unit sum), runs mdd_unit_exact: gg_gemv_kernel's per-value arithmetic.
+ * Tables in LDS: IQ1_S 2048 x 8 bf16 (32 KiB); IQ2_XXS 256 x 8 bf16, then 128 sign masks (by the
+ * seven stored sign bits, the eighth their parity: the xor of the eight signs as four bf16 pairs). */
+constexpr int kMddTab1 = 2048 * 16, kMddTab2 = 256 * 16 + 128 * 16;
+typedef __bf16 gg_bf16x2 __attribute__((ext_vector_type(2)));
+
+__device__ __forceinline__ float mdd_dot2(uint32_t a, uint32_t b, float c) {
+    return __builtin_amdgcn_fdot2_f32_bf16(__builtin_bit_cast(gg_bf16x2, a), __builtin_bit_cast(gg_bf16x2, b), c,
+                                           false);
+}
+/* bf16 bits of a small integer (exact). */
+__device__ __forceinline__ uint32_t mdd_bfi(int v) { return __float_as_uint((float)v) >> 16; }
+
+template <int T>
+__device__ __forceinline__ void mdd_load_table(uint8_t* lds) {
+    const int tid = (int)threadIdx.x, nt = (int)blockDim.x;
+    r4d_u32x4* dst = (r4d_u32x4*)(void*)lds;
+    constexpr int NE = T == GG_IQ1_S ? 2048 : 256;
+    for (int i = tid; i < NE; i += nt) {
+        uint64_t e;
+        if constexpr (T == GG_IQ1_S) e = kGgIq1sGridP1[i];
+        else e = kGgIq2xxsGrid[i];
+        r4d_u32x4 v;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            int b0 = (int)((e >> (16 * j)) & 0xffu), b1 = (int)((e >> (16 * j + 8)) & 0xffu);
+            if constexpr (T == GG_IQ1_S) { b0 -= 1; b1 -= 1; }      /* the table holds grid + 1 */
+            v[j] = mdd_bfi(b0) | (mdd_bfi(b1) << 16);
+        }
+        dst[i] = v;
+    }
+    if constexpr (T == GG_IQ2_XXS) {
+        for (int i = tid; i < 128; i += nt) {
+            const uint32_t sg = (uint32_t)i | ((__builtin_popcount((uint32_t)i) & 1u) << 7);
+            r4d_u32x4 v;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) v[j] = (((sg >> (2 * j)) & 1u) << 15) | (((sg >> (2 * j + 1)) & 1u) << 31);
+            ((r4d_u32x4*)(void*)(lds + 256 * 16))[i] = v;
+        }
+    }
+}
+
+/* A unit's 32 staged values of the mc rows as bf16 pairs (16 dwords a row). */
+template <int XMX>
+__device__ __forceinline__ void mdd_x32(const uint16_t* xb, int K, int V, int mc, uint32_t (&xv)[XMX][16]) {
+#pragma unroll
+    for (int m = 0; m < XMX; ++m)
+        if (XMX == 1 || m < mc) {
+#pragma unroll
+            for (int G = 0; G < 4; ++G) {
+                const r4d_u32x4 v = *(const r4d_u32x4*)(const void*)(xb + m * K + gg_xswz16(32 * V + 8 * G));
+#pragma unroll
+                for (int i = 0; i < 4; ++i) xv[m][4 * G + i] = v[i];
+            }
+        }
+}
+
+template <int T, int RPW, int XMX>
+__device__ __forceinline__ void mdd_unit(const uint32_t (&raw)[RPW][3], int V, const uint16_t* xb, const float* xsm,
+                                         int K, int UK, int mc, const uint8_t* tab, const bool (&ok)[RPW],
+                                         float (&acc)[RPW][XMX]) {
+    uint32_t xv[XMX][16];
+    mdd_x32<XMX>(xb, K, V, mc, xv);
+    float xs[XMX];
+#pragma unroll
+    for (int m = 0; m < XMX; ++m) xs[m] = 0.0f;
+    if constexpr (T == GG_IQ1_S) {
+#pragma unroll
+        for (int m = 0; m < XMX; ++m)
+            if (XMX == 1 || m < mc) xs[m] = xsm[m * UK + V];
+    }
+    const r4d_u32x4* t4 = (const r4d_u32x4*)(const void*)tab;
+#pragma unroll
+    for (int r = 0; r < RPW; ++r) {
+        if (!ok[r]) continue;
+        float s[XMX];
+#pragma unroll
+        for (int m = 0; m < XMX; ++m) s[m] = 0.0f;
+        float sc, dc = 0.0f;
+        if constexpr (T == GG_IQ1_S) {
+            const uint32_t qh = raw[r][2];
+            sc = gg_h2f_hw(raw[r][0]) * (float)(int)(2 * ((qh >> 12) & 7u) + 1);
+            dc = (qh & 0x8000u) ? -0.125f : 0.125f;
+            gg_for<4>([&](auto gi) {
+                constexpr int G = decltype(gi)::value;
+                const r4d_u32x4 g = t4[gg_byte(raw[r][1], G) | (((qh >> (3 * G)) & 7u) << 8)];
+#pragma unroll
+                for (int m = 0; m < XMX; ++m)
+                    if (XMX == 1 || m < mc) {
+#pragma unroll
+                        for (int i = 0; i < 4; ++i) s[m] = mdd_dot2(xv[m][4 * G + i], g[i], s[m]);
+                    }
+            });
+        } else {
+            const uint32_t a1 = raw[r][2];
+            sc = gg_h2f_hw(raw[r][0]) * (0.5f + (float)(a1 >> 28)) * 0.25f;
+            gg_for<4>([&](auto gi) {
+                constexpr int G = decltype(gi)::value;
+                r4d_u32x4 g = t4[gg_byte(raw[r][1], G)];
+                g ^= t4[256 + ((a1 >> (7 * G)) & 127u)];
+#pragma unroll
+                for (int m = 0; m < XMX; ++m)
+                    if (XMX == 1 || m < mc) {
+#pragma unroll
+                        for (int i = 0; i < 4; ++i) s[m] = mdd_dot2(xv[m][4 * G + i], g[i], s[m]);
+                    }
+            });
+        }
+#pragma unroll
+        for (int m = 0; m < XMX; ++m)
+            if (XMX == 1 || m < mc) {
+                const float u = T == GG_IQ1_S ? fmaf(dc, xs[m], s[m]) : s[m];
+                acc[r][m] = fmaf(sc, u, acc[r][m]);
+            }
+    }
+}
+
+/* mdd_unit for one row whose 32 values (xv, bf16 pairs) and sum (xs) the lane keeps in registers
+ * across the tasks of a run; two partial sums a row (groups 0, 2 and 1, 3). */
+template <int T, int RPW>
+__device__ __forceinline__ void mdd_unit_r(const uint32_t (&raw)[RPW][3], const uint32_t (&xv)[16], float xs,
+                                           const uint8_t* tab, float (&acc)[RPW][1]) {
+    const r4d_u32x4* t4 = (const r4d_u32x4*)(const void*)tab;
+#pragma unroll
+    for (int r = 0; r < RPW; ++r) {
+        if (r > 0) sched_barrier();      /* a row's table reads at a time (registers) */
+        float s2[2] = { 0.0f, 0.0f };
+        if constexpr (T == GG_IQ1_S) {
+            const uint32_t qh = raw[r][2];
+            gg_for<4>([&](auto gi) {
+                constexpr int G = decltype(gi)::value;
+                const r4d_u32x4 g = t4[gg_byte(raw[r][1], G) | (((qh >> (3 * G)) & 7u) << 8)];
+#pragma unroll
+                for (int i = 0; i < 4; ++i) s2[G & 1] = mdd_dot2(xv[4 * G + i], g[i], s2[G & 1]);
+            });
+            const float sc = gg_h2f_hw(raw[r][0]) * (float)(int)(2 * ((qh >> 12) & 7u) + 1);
+            const float dc = (qh & 0x8000u) ? -0.125f : 0.125f;
+            acc[r][0] = fmaf(sc, fmaf(dc, xs, s2[0] + s2[1]), acc[r][0]);
+        } else {
+            const uint32_t a1 = raw[r][2];
+            gg_for<4>([&](auto gi) {
+                constexpr int G = decltype(gi)::value;
+                r4d_u32x4 g = t4[gg_byte(raw[r][1], G)];
+                g ^= t4[256 + ((a1 >> (7 * G)) & 127u)];
+#pragma unroll
+                for (int i = 0; i < 4; ++i) s2[G & 1] = mdd_dot2(xv[4 * G + i], g[i], s2[G & 1]);
+            });
+            const float sc = gg_h2f_hw(raw[r][0]) * (0.5f + (float)(a1 >> 28)) * 0.25f;
+            acc[r][0] = fmaf(sc, s2[0] + s2[1], acc[r][0]);
+        }
+    }
+}
+
+/* The exact unit: each value dequantised as Gg<T>::dec does (the same float) and multiplied and
+ * added in order, as gg_unit. */
+template <int T, int RPW, int XMX>
+__device__ __forceinline__ void mdd_unit_exact(const uint32_t (&raw)[RPW][3], int V, const uint16_t* xb, int K,
+                                               int mc, const uint8_t* tab, const bool (&ok)[RPW],
+                                               float (&acc)[RPW][XMX]) {
+    const r4d_u32x4* t4 = (const r4d_u32x4*)(const void*)tab;
+    gg_for<4>([&](auto gi) {
+        constexpr int G = decltype(gi)::value;
+        float xv[XMX][8];
+#pragma unroll
+        for (int m = 0; m < XMX; ++m)
+            if (XMX == 1 || m < mc) {
+                const r4d_u32x4 v = *(const r4d_u32x4*)(const void*)(xb + m * K + gg_xswz16(32 * V + 8 * G));
+#pragma unroll
+                for (int i = 0; i < 4; ++i) { xv[m][2 * i] = bf16w_lo(v[i]); xv[m][2 * i + 1] = bf16w_hi(v[i]); }
+            }
+#pragma unroll
+        for (int r = 0; r < RPW; ++r)
+            if (ok[r]) {
+                sched_barrier();
+                float w[8];
+                if constexpr (T == GG_IQ1_S) {
+                    const uint32_t qh = raw[r][2];
+                    const float dl = gg_h2f(raw[r][0]) * (float)(int)(2 * ((qh >> 12) & 7u) + 1);
+                    const float dt = (qh & 0x8000u) ? -0.125f : 0.125f;
+                    const r4d_u32x4 g = t4[gg_byte(raw[r][1], G) | (((qh >> (3 * G)) & 7u) << 8)];
+#pragma unroll
+                    for (int t = 0; t < 8; ++t)
+                        w[t] = dl * (((t & 1) ? bf16w_hi(g[t >> 1]) : bf16w_lo(g[t >> 1])) + dt);
+                } else {
+                    const float db = gg_h2f(raw[r][0]) * (0.5f + (float)(raw[r][2] >> 28)) * 0.25f;
+                    const r4d_u32x4 g = t4[gg_byte(raw[r][1], G)];
+                    const uint32_t sx = (raw[r][2] >> (7 * G)) & 127u;
+                    const uint32_t sg = sx | ((__builtin_popcount(sx) & 1u) << 7);
+#pragma unroll
+                    for (int t = 0; t < 8; ++t) {
+                        const float m = db * ((t & 1) ? bf16w_hi(g[t >> 1]) : bf16w_lo(g[t >> 1]));
+                        w[t] = ((sg >> t) & 1u) ? -m : m;
+                    }
+                }
+                md_acc<XMX>(w, xv, mc, acc[r]);
+            }
+    });
+}
+
+/* One step: the lane's units U, U + 32, ... (UF of them) of its RPW rows, all loaded before the
+ * first is used (one round trip). NF as md_step. */
+template <int T, int RPW, int UF, int XMX, int NF>
+__device__ __forceinline__ void mdd_step(const uint8_t* const (&wr)[RPW], const bool (&okr)[RPW], int U, int UK,
+                                         const uint16_t* xb, const float* xsm, int K, int mc, const uint8_t* tab,
+                                         bool xbad, float (&acc)[RPW][XMX]) {
+    using Q = Gg<T>;
+    bool ok[RPW];
+#pragma unroll
+    for (int r = 0; r < RPW; ++r) ok[r] = NF > 0 || okr[r];
+    uint32_t raw[UF][RPW][3];
+    gg_for<UF>([&](auto fi) {
+        constexpr int F = decltype(fi)::value;
+        const int V = U + 32 * F;
+#pragma unroll
+        for (int r = 0; r < RPW; ++r) raw[F][r][0] = raw[F][r][1] = raw[F][r][2] = 0u;
+        if (F < NF || V < UK) {
+            const int b = V >> 3;
+#pragma unroll
+            for (int r = 0; r < RPW; ++r)
+                if (ok[r]) Q::load_w(wr[r] + (long long)b * Q::BB, V - 8 * b, raw[F][r]);
+        }
+    });
+    bool bad = xbad;
+    gg_for<UF>([&](auto fi) {
+        constexpr int F = decltype(fi)::value;
+        if (F < NF || U + 32 * F < UK) {
+#pragma unroll
+            for (int r = 0; r < RPW; ++r)
+                if (ok[r]) bad |= (raw[F][r][0] & 0x7c00u) == 0x7c00u;
+        }
+    });
+    const bool fast = __builtin_amdgcn_ballot_w32(bad) == 0u;
+    gg_for<UF>([&](auto fi) {
+        constexpr int F = decltype(fi)::value;
+        const int V = U + 32 * F;
+        if constexpr (F < NF) sched_barrier();
+        if (F < NF || V < UK) {
+            if (fast) {
+                if constexpr (XMX == 1) {
+                    uint32_t xv[16];
+#pragma unroll
+                    for (int G = 0; G < 4; ++G) {
+                        const r4d_u32x4 v = *(const r4d_u32x4*)(const void*)(xb + gg_xswz16(32 * V + 8 * G));
+#pragma unroll
+                        for (int i = 0; i < 4; ++i) xv[4 * G + i] = v[i];
+                    }
+                    mdd_unit_r<T, RPW>(raw[F], xv, T == GG_IQ1_S ? xsm[V] : 0.0f, tab, acc);
+                } else {
+                    mdd_unit<T, RPW, XMX>(raw[F], V, xb, xsm, K, UK, mc, tab, ok, acc);
+                }
+            } else {
+                mdd_unit_exact<T, RPW, XMX>(raw[F], V, xb, K, mc, tab, ok, acc);
+            }
+        }
+    });
+}
+
+template <int T, int RPW, int UF, int XMX>
+__device__ __forceinline__ void mdd_task(const uint8_t* wb, long long w_ld, int n0, int N, int UK, const uint16_t* xb,
+                                         const float* xsm, int K, int mc, int lane, const uint8_t* tab, bool xbad,
+                                         float (&acc)[RPW][XMX]) {
+    bool ok[RPW];
+    const uint8_t* wr[RPW];
+#pragma unroll
+    for (int r = 0; r < RPW; ++r) {
+        ok[r] = n0 + r < N;
+        wr[r] = wb + (long long)(ok[r] ? n0 + r : 0) * w_ld;
+    }
+    const bool fullr = n0 + RPW <= N;
+    for (int U0 = 0; U0 < UK; U0 += 32 * UF) {
+        const int nf = fullr ? (UK - U0) >> 5 : 0;
+        if (nf >= UF)
+            mdd_step<T, RPW, UF, XMX, UF>(wr, ok, U0 + lane, UK, xb, xsm, K, mc, tab, xbad, acc);
+        else if (UF > 1 && nf == UF - 1)
+            mdd_step<T, RPW, UF, XMX, (UF > 1 ? UF - 1 : 0)>(wr, ok, U0 + lane, UK, xb, xsm, K, mc, tab, xbad, acc);
+        else
+            mdd_step<T, RPW, UF, XMX, 0>(wr, ok, U0 + lane, UK, xb, xsm, K, mc, tab, xbad, acc);
+    }
+}
+
+/* The pipelined form of a wave's run of full tasks in one segment when a task is one step (32 UF
+ * >= UK): the next task's units are loaded before this one is decoded, so every wave keeps a
+ * task's bytes in flight while it works. NF units every lane has; TL: the last UK - 32 NF units
+ * (32 / RPW of them) of the RPW rows spread over the lanes, a (row, unit) a lane, instead of the
+ * first lanes only. */
+template <int T, int RPW, int UF, int NF, bool TL>
+__device__ __forceinline__ void mdd_fetch(const uint8_t* w0, long long w_ld, int lane, int UK,
+                                          uint32_t (&raw)[UF][RPW][3]) {
+    using Q = Gg<T>;
+    constexpr int TW = 32 / RPW;
+    gg_for<UF>([&](auto fi) {
+        constexpr int F = decltype(fi)::value;
+        if constexpr (F < NF) {
+            const int V = lane + 32 * F, b = V >> 3;
+#pragma unroll
+            for (int r = 0; r < RPW; ++r) Q::load_w(w0 + r * w_ld + (long long)b * Q::BB, V - 8 * b, raw[F][r]);
+        } else if constexpr (TL && F == NF) {
+            const int r = lane / TW, V = 32 * NF + lane % TW, b = V >> 3;
+            Q::load_w(w0 + r * w_ld + (long long)b * Q::BB, V - 8 * b, raw[F][0]);
+        } else {
+            const int V = lane + 32 * F, b = V >> 3;
+            if (V < UK) {
+#pragma unroll
+                for (int r = 0; r < RPW; ++r) Q::load_w(w0 + r * w_ld + (long long)b * Q::BB, V - 8 * b, raw[F][r]);
+            }
+        }
+    });
+}
+
+/* A unit's 32 staged values (bf16 pairs) and, for IQ1_S, its sum. */
+template <int T>
+__device__ __forceinline__ void mdd_xload(const uint16_t* xb, const float* xsm, int V, uint32_t (&xv)[16], float& xs) {
+#pragma unroll
+    for (int G = 0; G < 4; ++G) {
+        const r4d_u32x4 v = *(const r4d_u32x4*)(const void*)(xb + gg_xswz16(32 * V + 8 * G));
+#pragma unroll
+        for (int i = 0; i < 4; ++i) xv[4 * G + i] = v[i];
+    }
+    xs = T == GG_IQ1_S ? xsm[V] : 0.0f;
+}
+
+/* XR: the lane's activation units sit in registers (xr, xsr) for the run; otherwise each step reads
+ * them from LDS (fewer registers; the same values, so the same bits). */
+template <int T, int RPW, int UF, int NF, bool TL, bool XR>
+__device__ __forceinline__ void mdd_crunch(const uint32_t (&raw)[UF][RPW][3], const uint32_t (&xr)[UF][16],
+                                           const float (&xsr)[UF], int lane, int UK, const uint16_t* xb,
+                                           const float* xsm, int K, const uint8_t* tab, bool xbad, int dbg,
+                                           float (&acc)[RPW][1]) {
+    constexpr int TW = 32 / RPW;
+    bool ok[RPW];
+#pragma unroll
+    for (int r = 0; r < RPW; ++r) ok[r] = true;
+    const bool ok1[1] = { true };
+    if (dbg & 2) {                       /* measurement: the loads only */
+        gg_for<UF>([&](auto fi) {
+            constexpr int F = decltype(fi)::value;
+#pragma unroll
+            for (int r = 0; r < RPW; ++r)
+                if (F < NF || r == 0) acc[r][0] += __uint_as_float((raw[F][r][1] ^ raw[F][r][2] ^ raw[F][r][0]) & 0x0fffffffu);
+        });
+        return;
+    }
+    bool bad = xbad;
+    gg_for<UF>([&](auto fi) {
+        constexpr int F = decltype(fi)::value;
+        if constexpr (F < NF) {
+#pragma unroll
+            for (int r = 0; r < RPW; ++r) bad |= (raw[F][r][0] & 0x7c00u) == 0x7c00u;
+        } else if constexpr (TL && F == NF) {
+            bad |= (raw[F][0][0] & 0x7c00u) == 0x7c00u;
+        } else {
+            if (lane + 32 * F < UK) {
+#pragma unroll
+                for (int r = 0; r < RPW; ++r) bad |= (raw[F][r][0] & 0x7c00u) == 0x7c00u;
+            }
+        }
+    });
+    const bool fast = __builtin_amdgcn_ballot_w32(bad) == 0u;
+    gg_for<UF>([&](auto fi) {
+        constexpr int F = decltype(fi)::value;
+        sched_barrier();
+        if constexpr (F < NF) {
+            const int V = lane + 32 * F;
+            if (fast) {
+                if constexpr (XR) mdd_unit_r<T, RPW>(raw[F], xr[F], xsr[F], tab, acc);
+                else { uint32_t xl[16]; float xs; mdd_xload<T>(xb, xsm, V, xl, xs); mdd_unit_r<T, RPW>(raw[F], xl, xs, tab, acc); }
+            } else {
+                mdd_unit_exact<T, RPW, 1>(raw[F], V, xb, K, 1, tab, ok, acc);
+            }
+        } else if constexpr (TL && F == NF) {
+            const int tr = lane / TW, V = 32 * NF + lane % TW;
+            const uint32_t r1[1][3] = { { raw[F][0][0], raw[F][0][1], raw[F][0][2] } };
+            float at[1][1] = { { 0.0f } };
+            if (fast) {
+                if constexpr (XR) mdd_unit_r<T, 1>(r1, xr[F], xsr[F], tab, at);
+                else { uint32_t xl[16]; float xs; mdd_xload<T>(xb, xsm, V, xl, xs); mdd_unit_r<T, 1>(r1, xl, xs, tab, at); }
+            } else {
+                mdd_unit_exact<T, 1, 1>(r1, V, xb, K, 1, tab, ok1, at);
+            }
+#pragma unroll
+            for (int r = 0; r < RPW; ++r) acc[r][0] = r == tr ? acc[r][0] + at[0][0] : acc[r][0];
+        } else {
+            const int V = lane + 32 * F;
+            if (V < UK) {
+                if (fast) {
+                    if constexpr (XR) mdd_unit_r<T, RPW>(raw[F], xr[F], xsr[F], tab, acc);
+                    else { uint32_t xl[16]; float xs; mdd_xload<T>(xb, xsm, V, xl, xs); mdd_unit_r<T, RPW>(raw[F], xl, xs, tab, acc); }
+                } else {
+                    mdd_unit_exact<T, RPW, 1>(raw[F], V, xb, K, 1, tab, ok, acc);
+                }
+            }
+        }
+    });
+}
+
+template <int T, int RPW, int UF, int NF, bool TL, int D, bool XR>
+__device__ __forceinline__ void mdd_pipe(const GgMdArgs& A, const uint8_t* wb, int ta, int tc, int UK, const uint16_t* xb,
+                                         const float* xsm, int lane, const uint8_t* tab, bool xbad, const int* lr,
+                                         uint32_t (&rr)[D][UF][RPW][3], bool primed) {
+    constexpr int TW = 32 / RPW;
+    const long long ts = (long long)RPW * A.w_ld;
+    /* D - 1 tasks ahead in flight: a ring of D task buffers (rr[0] already holds task ta when
+     * primed: the kernel loaded it before staging the activations). */
+    gg_for<D - 1>([&](auto ji) {
+        constexpr int J = decltype(ji)::value;
+        if (ta + J < tc && (J > 0 || !primed)) mdd_fetch<T, RPW, UF, NF, TL>(wb + (ta + J) * ts, A.w_ld, lane, UK, rr[J]);
+    });
+    /* The lane's units of the activation row (the same in every task of the run), in registers. */
+    uint32_t xr[UF][16];
+    float xsr[UF];
+    if constexpr (XR) gg_for<UF>([&](auto fi) {
+        constexpr int F = decltype(fi)::value;
+        const int V = (TL && F == NF) ? 32 * NF + lane % TW : lane + 32 * F;
+        if (F < NF || (TL && F == NF) || V < UK) {
+#pragma unroll
+            for (int G = 0; G < 4; ++G) {
+                const r4d_u32x4 v = *(const r4d_u32x4*)(const void*)(xb + gg_xswz16(32 * V + 8 * G));
+#pragma unroll
+                for (int i = 0; i < 4; ++i) xr[F][4 * G + i] = v[i];
+            }
+            xsr[F] = T == GG_IQ1_S ? xsm[V] : 0.0f;
+        } else {
+#pragma unroll
+            for (int i = 0; i < 16; ++i) xr[F][i] = 0u;
+            xsr[F] = 0.0f;
+        }
+    });
+    auto fin = [&](const uint32_t (&raw)[UF][RPW][3], int ti) {
+        float acc[RPW][1];
+#pragma unroll
+        for (int r = 0; r < RPW; ++r) acc[r][0] = 0.0f;
+        mdd_crunch<T, RPW, UF, NF, TL, XR>(raw, xr, xsr, lane, UK, xb, xsm, A.K, tab, xbad, A.dbg, acc);
+        const int n0 = ti * RPW;
+#pragma unroll
+        for (int r = 0; r < RPW; ++r) {
+            const float v = r4d_wave_sum(acc[r][0]);
+            if (lane == 0) gg_put(A.y + (long long)lr[0] * A.y_ld + n0 + r, v);
+        }
+    };
+    for (int ti = ta; ti < tc; ti += D) {
+        gg_for<D>([&](auto ji) {
+            constexpr int J = decltype(ji)::value;
+            const int t = ti + J;
+            if (t < tc) {
+                if (t + D - 1 < tc) mdd_fetch<T, RPW, UF, NF, TL>(wb + (t + D - 1) * ts, A.w_ld, lane, UK, rr[(J + D - 1) % D]);
+                sched_barrier();
+                fin(rr[J], t);
+            }
+        });
+    }
+}
+
+/* The pipelined run (one activation row, the decode case) when the shape allows it (gate_up: 2 rows
+ * x 5 full steps; down: 4 rows x 2 full steps and the spread tail), a task ahead; false: the
+ * caller runs the tasks one by one. */
+template <int T, int RPW, int UF, int XMX>
+__device__ __forceinline__ bool mdd_try_pipe(const GgMdArgs& A, const uint8_t* wb, int ta, int tc, int UK,
+                                             const uint16_t* xb, const float* xsm, int mc, int lane,
+                                             const uint8_t* tab, bool xbad, const int* lr,
+                                             uint32_t (&rr)[2][UF][RPW][3], bool primed) {
+    (void)tc;
+    if (A.N % RPW) return false;          /* by the shape only: every pass of it takes one path */
+    if constexpr (UF == 5 && RPW == 2) {
+        if (UK == 160) { mdd_pipe<T, RPW, UF, 5, false, 2, true>(A, wb, ta, tc, UK, xb, xsm, lane, tab, xbad, lr, rr, primed); return true; }
+    } else if constexpr (UF == 3 && RPW == 4) {
+        if (UK == 64 + 8) { mdd_pipe<T, RPW, UF, 2, true, 2, true>(A, wb, ta, tc, UK, xb, xsm, lane, tab, xbad, lr, rr, primed); return true; }
+    }
+    return false;
+}
+
+/* The wave's first task into rr[0] before the activations are staged (its load latency under
+ * the staging), when mdd_try_pipe will take it. */
+template <int T, int RPW, int UF>
+__device__ __forceinline__ bool mdd_prime(const GgMdArgs& A, const uint8_t* wb, int t, int UK, int lane,
+                                          uint32_t (&rr)[2][UF][RPW][3]) {
+    if (A.N % RPW) return false;
+    if constexpr (UF == 5 && RPW == 2) {
+        if (UK == 160) { mdd_fetch<T, RPW, UF, 5, false>(wb + (long long)t * RPW * A.w_ld, A.w_ld, lane, UK, rr[0]); return true; }
+    } else if constexpr (UF == 3 && RPW == 4) {
+        if (UK == 64 + 8) { mdd_fetch<T, RPW, UF, 2, true>(wb + (long long)t * RPW * A.w_ld, A.w_ld, lane, UK, rr[0]); return true; }
+    }
+    return false;
+}
+
+/* Rows [j0, j0 + rows) of the live list into LDS, a row of K values in md_x8's form: widened to
+ * f32 (BF false) or the bf16 as they are. */
+template <int NT, bool BF>
+__device__ __forceinline__ void md_stage(const GgMdArgs& A, float* xs, const int* s_lt, int j0, int rows) {
+    const int c8n = A.K >> 3;
+    for (int idx = (int)threadIdx.x; idx < rows * c8n; idx += NT) {
+        const int m = idx / c8n, kk = (idx - m * c8n) << 3;
+        const uint16_t* src = A.x + (long long)s_lt[j0 + m] * A.x_ld + kk;
+        if constexpr (BF) {
+            uint32_t q[4];
+            gg_x8raw(src, A.x_al != 0, q);
+            uint16_t* d = (uint16_t*)(void*)xs + m * A.K + gg_xswz16(kk);
+            r4d_u32x4 v;
+            v[0] = q[0]; v[1] = q[1]; v[2] = q[2]; v[3] = q[3];
+            *(r4d_u32x4*)(void*)d = v;
+        } else {
+            float v[8];
+            gg_x8(src, A.x_al != 0, v);
+            float* d = xs + m * A.K;
+            *(float4*)(d + gg_xswz(kk)) = make_float4(v[0], v[1], v[2], v[3]);
+            *(float4*)(d + gg_xswz(kk + 4)) = make_float4(v[4], v[5], v[6], v[7]);
+        }
+    }
+}
+
+template <int T, int RPW, int UF, int NW, int XMX, bool DOT = false>
+__global__ __launch_bounds__(NW * 32) void gg_md_kernel(GgMdArgs A) {
+    using Q = Gg<T>;
+    constexpr int NT = NW * 32;
+    extern __shared__ __attribute__((aligned(16))) uint8_t gg_smem[];
+    const int tid = (int)threadIdx.x, lane = tid & 31, wave = tid >> 5;
+    const int ne = A.n_expert, TT = A.T;
+    /* Kept: each segment's expert weight and first live row (s_seg[ns] = the live count), each
+     * live row's output row and activation row. */
+    const uint8_t** s_segw = (const uint8_t**)(gg_smem + A.meta_off);
+    int* s_lr = (int*)(s_segw + kMdMaxT);
+    int* s_lt = s_lr + kMdMaxT;
+    int* s_seg = s_lt + kMdMaxT;
+    int* s_cnt = s_seg + kMdMaxT + 1;
+    /* Scratch of the routing pass, under the activation rows. */
+    float* xs = (float*)(gg_smem + A.x_off);
+    const uint8_t** s_wt = (const uint8_t**)(gg_smem + A.x_off);
+    int* s_off = (int*)(s_wt + ne);
+    int* s_srt = s_off + ne + 1;
+    int* s_le = s_srt + TT;
+    int* s_dr = s_le + TT;
+
+    if constexpr (DOT) mdd_load_table<T>(gg_smem);
+    else gg_load_table<T>(gg_smem);
+    for (int i = tid; i <= ne; i += NT) s_off[i] = A.off[i];
+    for (int i = tid; i < TT; i += NT) s_srt[i] = A.sorted[i];
+    if (A.wtab)
+        for (int i = tid; i < ne; i += NT) s_wt[i] = A.wtab[i];
+    lds_barrier();
+    if (wave == 0) {
+        const uint32_t lt = (1u << lane) - 1u;
+        int nl = 0, nd = 0;
+        for (int c0 = 0; c0 < TT; c0 += 32) {
+            const int i = c0 + lane;
+            int e = 0, tok = -1;
+            if (i < TT) {
+                const int flat = s_srt[i];
+                if (flat >= 0) {
+                    tok = A.a_sorted ? i : flat / A.top_k;
+                    if (tok >= A.AR) tok = -1;
+                }
+                int lo = 0, hi = ne;          /* libref's search: the last offset <= i */
+                while (lo + 1 < hi) {
+                    const int mid = (lo + hi) >> 1;
+                    if (s_off[mid] <= i) lo = mid; else hi = mid;
+                }
+                e = lo;
+            }
+            const bool live = i < TT && tok >= 0, dead = i < TT && tok < 0;
+            const uint32_t bl = __builtin_amdgcn_ballot_w32(live), bd = __builtin_amdgcn_ballot_w32(dead);
+            if (live) {
+                const int p = nl + __builtin_popcount(bl & lt);
+                s_lr[p] = i;
+                s_lt[p] = tok;
+                s_le[p] = e;
+            }
+            if (dead) s_dr[nd + __builtin_popcount(bd & lt)] = i;
+            nl += __builtin_popcount(bl);
+            nd += __builtin_popcount(bd);
+        }
+        /* Segments: a run of one expert's rows, cut every XM rows. */
+        int ns = 0, run = 0;
+        for (int c0 = 0; c0 < nl; c0 += 32) {
+            const int j = c0 + lane;
+            const bool in = j < nl;
+            const bool head = in && (j == 0 || s_le[j] != s_le[j - 1]);
+            const uint32_t hb = __builtin_amdgcn_ballot_w32(head);
+            const uint32_t upto = hb & (lt | (1u << lane));
+            const int rs = upto ? c0 + 31 - __builtin_clz(upto) : run;
+            const bool start = in && (j - rs) % A.XM == 0;
+            const uint32_t sb = __builtin_amdgcn_ballot_w32(start);
+            if (start) {
+                const int p = ns + __builtin_popcount(sb & lt);
+                const int e = s_le[j];
+                s_seg[p] = j;
+                s_segw[p] = A.wtab ? s_wt[e] : A.w + (long long)e * A.w_es;
+            }
+            ns += __builtin_popcount(sb);
+            if (hb) run = c0 + 31 - __builtin_clz(hb);
+        }
+        if (lane == 0) {
+            s_seg[ns] = nl;
+            s_cnt[0] = nl;
+            s_cnt[1] = ns;
+            s_cnt[2] = nd;
+        }
+    }
+    lds_barrier();
+    const int ns = s_cnt[1], nd = s_cnt[2];
+    /* The dead rows: zeros, this block's share. */
+    {
+        const long long tot = (long long)nd * A.N;
+        const long long z0 = tot * blockIdx.x / gridDim.x, z1 = tot * (blockIdx.x + 1) / gridDim.x;
+        for (long long q = z0 + tid; q < z1; q += NT) {
+            const int r = (int)(q / A.N);
+            A.y[(long long)s_dr[r] * A.y_ld + (q - (long long)r * A.N)] = 0;
+        }
+    }
+    if (ns == 0) return;
+    const int TPS = (A.N + RPW - 1) / RPW;               /* tasks a segment */
+    const long long W = (long long)ns * TPS, GW = (long long)gridDim.x * NW;
+    const long long gb = (long long)blockIdx.x * NW;
+    const long long bt0 = W * gb / GW, bt1 = W * (gb + NW) / GW;
+    const long long wt0 = W * (gb + wave) / GW, wt1 = W * (gb + wave + 1) / GW;
+    const int UK = A.K / Q::QK * Q::UPB;
+    uint8_t* wbuf = A.raw_off >= 0 ? gg_smem + A.raw_off + wave * A.raw_wave : nullptr;
+    uint32_t rr[2][UF][RPW][3];          /* the dot path's task ring (mdd_pipe) */
+    int pr_sg = -1, pr_t = -1;
+    if constexpr (DOT) {
+        if (wt0 < wt1) {
+            const int sg0 = (int)(wt0 / TPS), t0 = (int)(wt0 - (long long)sg0 * TPS);
+            if (mdd_prime<T, RPW, UF>(A, md_uniform(s_segw[sg0]), t0, UK, lane, rr)) { pr_sg = sg0; pr_t = t0; }
+        }
+    }
+    int s = (int)(bt0 / TPS);
+    while (bt0 < bt1 && (long long)s * TPS < bt1) {
+        /* A phase: the block's next segments whose rows fit the buffer together. */
+        int s2 = s + 1;
+        while (s2 < ns && (long long)s2 * TPS < bt1 && s_seg[s2 + 1] - s_seg[s] <= A.XB) ++s2;
+        const int j0 = s_seg[s];
+        lds_barrier();
+        md_stage<NT, (XMX > 1 || DOT)>(A, xs, s_lt, j0, s_seg[s2] - j0);
+        int* s_rb = (int*)(void*)(gg_smem + A.xs_off) + A.XB * (A.K >> 5);  /* the dot path's row flags */
+        if constexpr (DOT)
+            for (int i = tid; i < s_seg[s2] - j0; i += NT) s_rb[i] = 0;
+        lds_barrier();
+        if constexpr (DOT) {
+            /* The unit sums (IQ1_S) and whether any staged value or sum is not finite. */
+            const int rows = s_seg[s2] - j0, ukr = A.K >> 5;
+            const uint16_t* x16 = (const uint16_t*)(const void*)xs;
+            float* xsm = (float*)(void*)(gg_smem + A.xs_off);
+            for (int idx = tid; idx < rows * ukr; idx += NT) {
+                int bad = 0;
+                const int m = idx / ukr, u = idx - m * ukr;
+                float sum = 0.0f;
+#pragma unroll
+                for (int G = 0; G < 4; ++G) {
+                    const r4d_u32x4 v = *(const r4d_u32x4*)(const void*)(x16 + m * A.K + gg_xswz16(32 * u + 8 * G));
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        bad |= ((v[i] & 0x7f80u) == 0x7f80u) | ((v[i] & 0x7f800000u) == 0x7f800000u);
+                        if constexpr (T == GG_IQ1_S) {
+                            sum += bf16w_lo(v[i]);
+                            sum += bf16w_hi(v[i]);
+                        }
+                    }
+                }
+                if constexpr (T == GG_IQ1_S) {
+                    xsm[idx] = sum;
+                    bad |= (__float_as_uint(sum) & 0x7f800000u) == 0x7f800000u;
+                }
+                if (bad) atomicOr(&s_rb[m], 1);
+            }
+            lds_barrier();
+        }
+        for (int sg = s; sg < s2; ++sg) {
+            const long long base = (long long)sg * TPS;
+            const int ta = (int)((wt0 > base ? wt0 : base) - base);
+            const int tc = (int)((wt1 < base + TPS ? wt1 : base + TPS) - base);
+            if (ta >= tc) continue;
+            const int sj = s_seg[sg], mc = s_seg[sg + 1] - sj;
+            const uint8_t* wb = md_uniform(s_segw[sg]);
+            const float* xr = XMX > 1 ? (const float*)(const void*)((const uint16_t*)(const void*)xs + (long long)(sj - j0) * A.K)
+                                      : xs + (long long)(sj - j0) * A.K;
+            if constexpr (DOT) {
+                const bool pr = sg == pr_sg && ta == pr_t;
+                if (pr) pr_sg = -1;
+                /* A row's own flag: its arithmetic never depends on the other rows of the pass. */
+                const bool xbad = s_rb[sj - j0] != 0;
+                if (mc == 1 && mdd_try_pipe<T, RPW, UF, 1>(A, wb, ta, tc, UK,
+                                                  (const uint16_t*)(const void*)xs + (long long)(sj - j0) * A.K,
+                                                  (const float*)(const void*)(gg_smem + A.xs_off) + (long long)(sj - j0) * (A.K >> 5),
+                                                  mc, lane, gg_smem, xbad, s_lr + sj, rr, pr))
+                    continue;
+            }
+            for (int ti = ta; ti < tc; ++ti) {
+                const int n0 = ti * RPW;
+                float acc[RPW][XMX];
+#pragma unroll
+                for (int r = 0; r < RPW; ++r)
+#pragma unroll
+                    for (int m = 0; m < XMX; ++m) acc[r][m] = 0.0f;
+                if constexpr (DOT)
+                    mdd_task<T, RPW, UF, XMX>(wb, A.w_ld, n0, A.N, UK,
+                                              (const uint16_t*)(const void*)xs + (long long)(sj - j0) * A.K,
+                                              (const float*)(const void*)(gg_smem + A.xs_off) + (long long)(sj - j0) * (A.K >> 5),
+                                              A.K, mc, lane, gg_smem, s_rb[sj - j0] != 0, acc);
+                else
+                    md_task<T, RPW, UF, XMX>(wb, A.w_ld, n0, A.N, UK, xr, A.K, mc, lane, gg_smem, wbuf, acc);
+#pragma unroll
+                for (int r = 0; r < RPW; ++r) {
+                    if (n0 + r >= A.N) continue;
+#pragma unroll
+                    for (int m = 0; m < XMX; ++m) {
+                        if (m >= mc) continue;
+                        const float v = r4d_wave_sum(acc[r][m]);
+                        if (lane == 0) gg_put(A.y + (long long)s_lr[sj + m] * A.y_ld + n0 + r, v);
+                    }
+                }
+            }
+        }
+        s = s2;
     }
 }
 
@@ -1453,6 +2584,81 @@ int gg_launch_gemv(RadStream s, int ty, int rpw, bool moe, bool f32out, const Gg
 #undef GG_CALL_GEMV
 }
 
+/* The decode kernel's shape a type: the I-quants' three-word units keep every unit of a lane's
+ * rows in flight (RPW x UF units: 8 x 3 for a row of up to 96 units, the down projection's 72;
+ * 4 x 5 up to 160, gate_up's), the multi-word types two rows of two, the float form one. */
+template <int T, int NW>
+int gg_launch_md_t(RadStream s, int UK, int xmx, const GgMdArgs& A, unsigned grid, unsigned lds) {
+    const dim3 g(grid), b(NW * 32);
+#define GG_MD_X(R, F)                                                                              \
+    (xmx == 1 ? R4D_EMIT(s, (gg_md_kernel<T, R, F, NW, 1>), g, b, lds, A)                           \
+              : R4D_EMIT(s, (gg_md_kernel<T, R, F, NW, kMdXM>), g, b, lds, A))
+    if constexpr (T == GG_IQ1_S || T == GG_IQ2_XXS) {
+        if (UK <= 96) return GG_MD_X(4, 3);
+        if (UK <= 160) return GG_MD_X(4, 5);
+        return GG_MD_X(2, 8);
+    } else if constexpr (T == GG_F32) {
+        return GG_MD_X(1, 2);
+    } else {
+        return GG_MD_X(2, 2);
+    }
+#undef GG_MD_X
+}
+
+/* The dot path (16 waves a block, a row a segment): RPW 4 x UF 3 up to 96 units (down), 2 x 5 up to
+ * 160 (gate_up). */
+template <int T>
+int gg_launch_mdd_t(RadStream s, int UK, int xmx, int rpw, const GgMdArgs& A, unsigned grid, unsigned lds) {
+    const dim3 g(grid), b(16 * 32);
+#define GG_MDD_X(R, F) R4D_EMIT(s, (gg_md_kernel<T, R, F, 16, 1, true>), g, b, lds, A)
+    (void)rpw;
+    (void)xmx;
+    if (UK <= 96) return GG_MDD_X(4, 3);
+    if (UK <= 160) return GG_MDD_X(2, 5);
+    return GG_MDD_X(2, 8);
+#undef GG_MDD_X
+}
+
+int gg_launch_mdd(RadStream s, int ty, int UK, int xmx, int rpw, const GgMdArgs& A, unsigned grid, unsigned lds) {
+    if (ty == GG_IQ1_S) return gg_launch_mdd_t<GG_IQ1_S>(s, UK, xmx, rpw, A, grid, lds);
+    if (ty == GG_IQ2_XXS) return gg_launch_mdd_t<GG_IQ2_XXS>(s, UK, xmx, rpw, A, grid, lds);
+    return R4D_NO(RAD_E_DTYPE);
+}
+
+template <int NW>
+int gg_launch_md(RadStream s, int ty, int UK, int xmx, const GgMdArgs& A, unsigned grid, unsigned lds) {
+#define GG_CALL_MD(T) gg_launch_md_t<T, NW>(s, UK, xmx, A, grid, lds)
+    switch (ty) {
+    case GG_Q8_0: return GG_CALL_MD(GG_Q8_0);
+    case GG_Q5_K: return GG_CALL_MD(GG_Q5_K);
+    case GG_Q6_K: return GG_CALL_MD(GG_Q6_K);
+    case GG_IQ4_NL: return GG_CALL_MD(GG_IQ4_NL);
+    case GG_IQ2_XXS: return GG_CALL_MD(GG_IQ2_XXS);
+    case GG_IQ1_S: return GG_CALL_MD(GG_IQ1_S);
+    case GG_F32: return GG_CALL_MD(GG_F32);
+    default: return R4D_NO(RAD_E_DTYPE);
+    }
+#undef GG_CALL_MD
+}
+
+/* The device's compute units, once a device. */
+int gg_cu_count() {
+    static int cache[64];
+    int dev = 0;
+    if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= 64) return 64;
+    if (cache[dev] <= 0) {
+        int v = 0;
+        if (hipDeviceGetAttribute(&v, hipDeviceAttributeMultiprocessorCount, dev) != hipSuccess || v <= 0) v = 64;
+        cache[dev] = v;
+    }
+    return cache[dev];
+}
+
+int gg_env_int(const char* k, int dflt) {
+    const char* v = std::getenv(k);
+    return v && *v ? std::atoi(v) : dflt;
+}
+
 int gg_launch_tiled(RadStream s, int ty, int bm, bool moe, bool f32out, const GgTiledArgs& A,
                     dim3 grid, unsigned lds) {
 #define GG_CALL_TILED(T) gg_launch_tiled_t<T>(s, bm, moe, f32out, A, grid, lds)
@@ -1532,7 +2738,12 @@ int gg_gemm(const RadArgs* a, RadStream s, const char* nN, const char* nK, bool 
     const long long x_ld = M > 1 ? x->stride[0] : K, y_ld = M > 1 ? y->stride[0] : N;
     const int x_al = gg_al16(x->data, x_ld) ? 1 : 0;
     const long long tb = gg_r16(gg_tab_bytes(ty));
-    if (gemv && M <= 16) {
+    /* Every pass of up to kGgDecodeRows rows runs the decode kernel, whichever row (gemv or tiled)
+     * the engine picked: a row's outputs are then the same bits whatever else is in the pass
+     * (decode, a speculative verify pass and a short prefill agree); the tiled kernel sums in
+     * another order. */
+    (void)gemv;
+    if (M <= kGgDecodeRows) {
         GgGemvArgs A{};
         A.x = (const uint16_t*)x->data; A.x_ld = x_ld;
         A.w = (const uint8_t*)w->data; A.wtab = nullptr; A.w_ld = w_ld; A.w_es = 0;
@@ -1610,6 +2821,113 @@ int gg_moe(const RadArgs* a, RadStream s, bool gemv) {
     const long long tb = gg_r16(gg_tab_bytes(ty));
     const long long tokens = a_sorted ? (T + top_k - 1) / top_k : AR;
     const long long L = ne < T ? ne : T;       /* experts that can have rows */
+    /* The decode kernel (gg_md_kernel) when the routing fits its lists and a row fits LDS. */
+    static const int md_off = gg_env_int("R4D_MD_OFF", 0);
+    static const int md_dot = gg_env_int("R4D_MD_DOT", 1);
+    /* The I-quants' dot path: bf16 rows, each with its unit sums for IQ1_S. */
+    /* Every pass whose sorted rows fit the decode kernels' lists takes them, whichever row (gemv or
+     * tiled) the engine picked: a token's outputs are then the same bits whatever else is in the
+     * pass (decode, a speculative verify pass and a short prefill agree). */
+    if (T <= kMdMaxT && !md_off && md_dot && (ty == GG_IQ1_S || ty == GG_IQ2_XXS)) {
+        static const int md_cap = gg_env_int("R4D_MD_LDS", 65536);
+        static const int md_g = gg_env_int("R4D_MD_G", 0);
+        static const int md_bpc = gg_env_int("R4D_MD_BPC", 2);
+        static const int md_rpw = gg_env_int("R4D_MD_RPW", 0);
+        static const int md_dbg = gg_env_int("R4D_MD_DBG", 0);
+        const long long tbd = gg_r16(ty == GG_IQ1_S ? kMddTab1 : kMddTab2);
+        const long long meta = gg_r16(8LL * kMdMaxT + 4LL * (3 * kMdMaxT + 1 + 3));
+        const long long temp = gg_r16(8 * ne + 4 * (ne + 1) + 12 * T);
+        const long long rowb = 2 * K + 4 * (K / 32) + 4;    /* bf16 row, unit sums, flag */
+        long long xb = md_cap > tbd + meta + 16 ? (md_cap - tbd - meta - 16) / rowb : 0;
+        if (xb > T) xb = T;
+        const long long xbytes = gg_r16(xb * rowb) > temp ? gg_r16(xb * rowb) : temp;
+        if (xb >= 1 && tbd + meta + xbytes <= 65536) {
+            GgMdArgs A{};
+            A.x = (const uint16_t*)A_->data; A.x_ld = x_ld;
+            A.w = table ? nullptr : (const uint8_t*)W->data;
+            A.wtab = table ? (const uint8_t* const*)W->data : nullptr;
+            A.w_ld = w_ld; A.w_es = w_es;
+            A.y = (uint16_t*)Y->data; A.y_ld = y_ld;
+            A.sorted = (const int32_t*)so->data; A.off = (const int32_t*)of->data;
+            A.T = (int)T; A.N = (int)N; A.K = (int)K;
+            A.n_expert = (int)ne; A.top_k = (int)top_k; A.a_sorted = a_sorted ? 1 : 0; A.AR = (int)AR;
+            A.x_al = gg_al16(A_->data, x_ld) ? 1 : 0;
+            A.XB = (int)xb;
+            /* A row a segment: an expert with r live rows streams r times (the decode routing gives
+             * most live experts one row; the repeats mostly hit L2), every task on the one-row
+             * pipelined form, no straggling multi-row tasks. */
+            const int xmx = 1;
+            A.XM = 1;
+            A.meta_off = (int)tbd;
+            A.x_off = (int)(tbd + meta);
+            A.xs_off = (int)(tbd + meta + xb * 2 * K);
+            A.raw_off = -1;
+            A.raw_wave = 0;
+            A.dbg = md_dbg;
+            const unsigned lds = (unsigned)(tbd + meta + xbytes);
+            /* Blocks a CU: as many as its LDS holds (a WGP's 128 KiB), at most md_bpc. */
+            long long bpc = 131072 / lds;
+            if (bpc > md_bpc) bpc = md_bpc;
+            if (bpc < 1) bpc = 1;
+            const long long gq = md_g > 0 ? md_g : (long long)gg_cu_count() * bpc;
+            return gg_launch_mdd(s, ty, (int)(K / 32), xmx, md_rpw, A, (unsigned)gq, lds);
+        }
+    }
+    if (T <= kMdMaxT && !md_off) {
+        static const int md_cap = gg_env_int("R4D_MD_LDS", 65536);
+        static const int md_nw = gg_env_int("R4D_MD_NW", 16);
+        static const int md_g = gg_env_int("R4D_MD_G", 0);
+        const long long meta = gg_r16(8LL * kMdMaxT + 4LL * (3 * kMdMaxT + 1 + 3));
+        const long long temp = gg_r16(8 * ne + 4 * (ne + 1) + 12 * T);
+        const long long room = md_cap - tb - meta;
+        /* One token: f32 rows (no widening in the loop), a segment a row. More: bf16 rows, up to
+         * kMdXM a segment, as many staged together as fit. */
+        const long long xbf = room > 0 ? room / (2 * K) : 0;
+        const bool bf = tokens >= 2 && xbf >= 2;
+        long long xb = room > 0 ? room / ((bf ? 2 : 4) * K) : 0;
+        if (xb > T) xb = T;
+        /* The I-quants' chunk buffers (md_step_stg): RPW rows of 4 blocks a wave. */
+        static const int md_stg = gg_env_int("R4D_MD_STG", 1);
+        const long long uk_ = K / gt->qk * (gt->qk == 256 ? 8 : 1);
+        const bool iq = ty == GG_IQ1_S || ty == GG_IQ2_XXS;
+        const long long rwave = iq && md_stg ? (uk_ <= 160 ? 4 : 2) * ((4 * gt->bb + 15) / 16 * 16) : 0;
+        const long long rbytes = rwave * md_nw;
+        if (rbytes && xb > 1 && tb + meta + xb * (bf ? 2 : 4) * K + rbytes > md_cap) {
+            const long long r2 = (md_cap - tb - meta - rbytes) / ((bf ? 2 : 4) * K);
+            if (r2 >= (bf ? 2 : 1)) xb = r2;
+        }
+        const long long xbytes = xb * (bf ? 2 : 4) * K > temp ? xb * (bf ? 2 : 4) * K : temp;
+        const bool stg = rbytes && tb + meta + xbytes + rbytes <= 65536;
+        if (xb >= 1 && tb + meta + xbytes <= 65536) {
+            GgMdArgs A{};
+            A.x = (const uint16_t*)A_->data; A.x_ld = x_ld;
+            A.w = table ? nullptr : (const uint8_t*)W->data;
+            A.wtab = table ? (const uint8_t* const*)W->data : nullptr;
+            A.w_ld = w_ld; A.w_es = w_es;
+            A.y = (uint16_t*)Y->data; A.y_ld = y_ld;
+            A.sorted = (const int32_t*)so->data; A.off = (const int32_t*)of->data;
+            A.T = (int)T; A.N = (int)N; A.K = (int)K;
+            A.n_expert = (int)ne; A.top_k = (int)top_k; A.a_sorted = a_sorted ? 1 : 0; A.AR = (int)AR;
+            A.x_al = gg_al16(A_->data, x_ld) ? 1 : 0;
+            A.XB = (int)xb;
+            long long xm = bf ? (xb < kMdXM ? xb : kMdXM) : 1;
+            if (xm > tokens) xm = tokens < 1 ? 1 : tokens;
+            A.XM = (int)xm;
+            A.meta_off = (int)tb;
+            A.x_off = (int)(tb + meta);
+            A.raw_off = stg ? (int)(tb + meta + xbytes) : -1;
+            A.raw_wave = (int)rwave;
+            const unsigned lds = (unsigned)(tb + meta + xbytes + (stg ? rbytes : 0));
+            const int per_cu = (int)(65536 / lds);
+            const long long gq = md_g > 0 ? md_g : (long long)gg_cu_count() * (per_cu < 1 ? 1 : per_cu);
+            const unsigned grid = (unsigned)(gq < 1 ? 1 : gq);
+            const int UK = (int)(K / gt->qk * (gt->qk == 256 ? 8 : 1));
+            const int ukf = ty == GG_F32 ? (int)(K / 32) : UK;
+            const int xmx = bf ? kMdXM : 1;
+            return md_nw == 8 ? gg_launch_md<8>(s, ty, ukf, xmx, A, grid, lds)
+                              : gg_launch_md<16>(s, ty, ukf, xmx, A, grid, lds);
+        }
+    }
     if (gemv && tokens <= 16) {
         GgGemvArgs A{};
         A.x = (const uint16_t*)A_->data; A.x_ld = x_ld;

@@ -1,0 +1,24 @@
+RAM_ADMISSION MemAvailable=19204628480
+I model: glm5next  arch=glm5next  quant=quark  45 layers  1048576 ctx  (checkpoint, 76108 tensors, served as it stands)
+I tokenizer: chat template from /home/as/models/hf/amd/GLM-5.3-Flash-Quark-MXFP4/chat_template.jinja (10643 bytes)
+I tokenizer: /home/as/models/hf/amd/GLM-5.3-Flash-Quark-MXFP4/tokenizer.json -> 154856 tokens, 321649 merges, 3 chain steps
+I tokenizer:   Split((?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+ behavior=1 invert=0) [dfa: 21 states, 15 classes]
+I tokenizer:   ByteLevel(add_prefix_space=0 use_regex=0)
+I tokenizer:   decode ByteLevel
+I vocab: end-of-generation also on <|user|>=154827 <|observation|>=154829 (named by the checkpoint's generation_config.json)
+I vocab: 154856 tokens, bos=-1 eos=154820
+I gbnf: vocabulary index built in 1284 ms, 16.78 MiB
+{
+  "GPU_execution": false,
+  "backend_calls": 0,
+  "eog_ids": 3,
+  "local_rows": 38720,
+  "model_rows": 154880,
+  "padded_rows": 24,
+  "passed": true,
+  "schema": "glm53-real-vocabulary-cpu-preflight-v1",
+  "scope": "actual Engine metadata/tokenizer and real raw embedding/head headers; no payload scan/model start",
+  "source_admitted": false,
+  "status": 0,
+  "tokenizer_tokens": 154856
+}

@@ -846,8 +846,8 @@ int Engine::step_loop() {
         if (t_on) phase_mark(PH_COLLECT);
         if (st < 0) return fail_loop(st);
         if(cache_prepare4_){const int completed=cache_prepare4_->complete_frame(*b);if(completed<0)cache_prepare4_->fail_stop(-1,completed);
-            if(glm_main_){if(so.token.size()!=1)cache_prepare4_->fail_stop(-1,RAD_E_STATE);
-                const int witnessed=glm_main_step_complete(*b,so.token[0]);if(witnessed<0)cache_prepare4_->fail_stop(-1,witnessed);}}
+            if(glm_main_){if((b->n_out!=0&&b->n_out!=1)||(b->n_out&&so.token.size()!=1)||(!b->n_out&&so.n_rows))cache_prepare4_->fail_stop(-1,RAD_E_STATE);
+                const int witnessed=glm_main_step_complete(*b,b->n_out?so.token[0]:-1);if(witnessed<0)cache_prepare4_->fail_stop(-1,witnessed);}}
         /* The step's sampler chain, verify op included, has returned: one line at the first
          * coupled verify that actually completed. */
         couple_verify_evidence(b->step);

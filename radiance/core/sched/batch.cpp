@@ -1,3 +1,4 @@
+#include "../build/glm_main_profile_limits.h"
 /* batch.cpp -- builds the step batch once per step. See batch.h.
  */
 #include "batch.h"
@@ -365,7 +366,7 @@ int64_t BatchBuilder::device_bytes(Program& prog, const Config& cfg, const KVGeo
 int BatchBuilder::glm_main_staging_quote(Program& p,const Config& c,const KVGeom& kg,
                                          uint64_t* device,uint64_t* pinned,uint64_t* events){
     if(!device||!pinned||!events)return RAD_E_INVAL;
-    if(glm_main_tp4_cache_program_profile(p)<0||c.tp!=4||c.max_tok!=1||c.max_seqs!=1||c.n_spec||
+    if(glm_main_tp4_cache_program_profile(p)<0||c.tp!=4||!glm_main_rows_supported(c.max_tok)||c.max_tok!=p.ctx.max_tok||c.max_seqs!=1||c.n_spec||
        c.max_ctx<1||c.max_ctx>512||p.encoder.modalities||p.audio_encoder.modalities)return RAD_E_UNSUPPORTED;
     BatchBuilder b;b.prog_=&p;b.cfg_=c;b.kvgeom_=kg;
     RAD_TRY(b.layout(p,c));b.size_set(b.set_,p.kv_groups);

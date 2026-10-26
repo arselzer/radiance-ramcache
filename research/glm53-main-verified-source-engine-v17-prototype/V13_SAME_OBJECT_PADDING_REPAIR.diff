@@ -1,0 +1,12 @@
+--- Fixture11/prefill_checker.cpp
++++ Fixture13/prefill_checker.cpp
+@@ -11,7 +11,8 @@
+         cap.consumer_bytes==110837760&&cap.route_bank_bytes==2564,"independent exact R4 budgets");
+     GlmMainProfileCapacity legacy;good(glm_main_profile_capacity(1,&legacy),"old R1 capacity");
+     need(legacy.selected_union==8&&legacy.cold_bytes==26738688&&legacy.consumer_bytes==30228480,"old exact budgets preserved");
+-    for(int rows:{-1,0,2,3,5,8,128}){auto out=cap;need(glm_main_profile_capacity(rows,&out)<0&&!std::memcmp(&out,&cap,sizeof cap),"unsupported capacity output atomic");++refusals;}
++    for(int rows:{-1,0,2,3,5,8,128}){auto out=cap;std::array<unsigned char,sizeof out> before{};std::memcpy(before.data(),&out,sizeof out);
++        need(glm_main_profile_capacity(rows,&out)<0&&!std::memcmp(before.data(),&out,sizeof out),"unsupported capacity output atomic");++refusals;}
+     std::array<int32_t,65> tokens{};for(size_t i=0;i<tokens.size();++i)tokens[i]=int32_t(4+i);
+     for(size_t n:{size_t(1),size_t(8),size_t(9),size_t(64)})for(int outputs:{1,16})good(glm_main_prefill_prompt_admission({tokens.data(),n},154856,512,outputs),"bounded real-ID metadata admission");
+     for(int which=0;which<7;++which){auto t=tokens;size_t n=9;int64_t ctx=512;int outputs=2;

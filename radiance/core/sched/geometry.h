@@ -79,5 +79,7 @@ int chunk_geometry_resolve(const Program& prog, const Config& cfg, ChunkGeometry
 // Keeps actual quantum/minimum; permits ONLY Engine's final one-token prompt.
 // Ordinary resolver and Scheduler nonfinal clamps are unchanged.
 int glm_main_final_token_geometry_resolve(const Program&,const Config&,ChunkGeometry*);
+// Explicit four-row profile uses the ORIGINAL ordinary minimum and chunk law.
+int glm_main_prefill4_geometry_resolve(const Program&,const Config&,ChunkGeometry*);
 
 }  /* namespace rad */

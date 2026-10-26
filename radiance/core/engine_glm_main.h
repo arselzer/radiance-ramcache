@@ -10,7 +10,12 @@
 namespace rad {
 int glm_main_one_prompt_admission(std::span<const int32_t>,int64_t vocabulary,int64_t context)noexcept;
 int glm_main_output_admission(int32_t outputs,int64_t context)noexcept;
+int glm_main_prefill_prompt_admission(std::span<const int32_t>,int64_t vocabulary,int64_t context,int32_t outputs)noexcept;
 inline constexpr size_t glm_main_max_outputs=16;
+inline constexpr size_t glm_main_max_prompt_tokens=64;
+// R4: at most16 prefill passes+15 decode passes. 80 is a conservative fixed
+// request-local cap, independent of the unchanged16 produced-output bound.
+inline constexpr size_t glm_main_max_steps=80;
 // Host StepPlan + actual RadBatch metadata only; never dereference device rows.
 struct GlmMainStepWitness {
     uint64_t epoch=0,request=0,begin_ns=0,end_ns=0;
@@ -18,6 +23,8 @@ struct GlmMainStepWitness {
     int32_t phase=-1,context_position=-1,input_token=-1,sampled_token=-1;
     std::array<uint32_t,4> completed_prepare_gates{};
     bool model_sampler_collect_complete=false;
+    bool model_complete=false,sample_expected=false,sampler_collect_performed=false;
+    std::array<int32_t,4> input_tokens{};
 };
 // Pure metadata facts. No payload pointer, source capability or Ready state.
 struct GlmMainVocabularyFacts {
@@ -31,6 +38,18 @@ struct GlmMainVocabularyAdmission {
     int64_t model_rows=0,valid_tokens=0,padded_rows=0,local_rows=0;
     int32_t special_ids=0,eog_ids=0;
 };
+// Actual same-Engine declaration-only witness. Owned scalar metadata; no source,
+// runtime, DEVICE-layout or model-execution authority is returned.
+struct GlmMainDeclarationContext {
+    int64_t requested_max_tok=0;
+    std::array<int64_t,4> program_max_tok{},route_max_rows{},quantum{},attn_block{},state_chunk{};
+    std::array<uint32_t,4> route_maps{};
+    std::array<uint64_t,4> model_pool_bytes{};
+    uint64_t registry_instances=0,vmem_committed_before=0,vmem_committed_after=0;
+    uint32_t declared_ranks=0;
+    bool engine_retired=false,source_admitted=false,session_present=false,native_owner_present=false;
+    bool provider_present=false,application_stream_present=false,context_initialized=false;
+};
 int glm_main_vocabulary_guard(const GlmMainVocabularyFacts&,std::span<const int32_t> specials,
     std::span<const int32_t> eog,GlmMainVocabularyAdmission*)noexcept;
 class Engine;class CachePrepare4RankBinding;class GlmMainTp4VerifiedSourceFactory;
@@ -38,7 +57,12 @@ enum class GlmMainEnginePhase:uint32_t {Requested,ColdAdmitted,MetadataOwned,Plu
 struct GlmMainEngineOptions {
     std::string checkpoint,home,bundle_root,source_proof;
     uint64_t expected_bundle_id=0;int64_t context=512;
-    // Exact first functional profile: batch1/seq1/spec0/exact wire/no residents.
+    // Default preserves first one-prompt-token profile. Explicit4 enables normal
+    // bounded prefill; no other capacity is supported by this candidate.
+    uint32_t prefill_max_tok=1;
+    // Explicit caller-rendered prompt only; legacy/raw never parse special text.
+    bool formatted_prompt=false;
+    // Exact seq1/spec0/exact wire/no residents.
     uint64_t hot_bytes_per_rank=64u<<20;
     // Exact experiment choices; reads still use the same full-record integrity.
     uint32_t read_chunk_bytes=64u<<10;
@@ -63,9 +87,10 @@ struct GlmMainEngineSnapshot {
     GlmMainVocabularyAdmission vocabulary;
     bool source_admitted=false,transport_ready=false,text_complete=false,retired=false;
     int32_t sampled_token=-1;
-    uint32_t requested_outputs=1,generated_outputs=0,completed_steps=0;
+    uint32_t requested_outputs=1,generated_outputs=0,completed_steps=0,input_tokens=0,max_tok=1;
     std::array<int32_t,glm_main_max_outputs> generated_tokens{};
-    std::array<GlmMainStepWitness,glm_main_max_outputs> steps{};
+    std::array<int32_t,glm_main_max_prompt_tokens> prompt_token_ids{};
+    std::array<GlmMainStepWitness,glm_main_max_steps> steps{};
     std::array<glm_main_provider::Stats,4> provider_stats{};
     uint64_t startup_elapsed_ns=0,request_elapsed_ns=0,first_token_ns=0,last_token_ns=0;
     uint64_t manual_fixed_host_bytes=0;
@@ -96,7 +121,9 @@ struct EngineGlmMainState {
     std::string manual_prompt;
     uint32_t manual_outputs=1;
     // Sole writer is the stepper. Harness consumes only AFTER serve joins it.
-    std::array<GlmMainStepWitness,glm_main_max_outputs> step_witness{};
+    std::array<GlmMainStepWitness,glm_main_max_steps> step_witness{};
+    std::array<int32_t,glm_main_max_prompt_tokens> prompt_tokens{};
+    uint32_t prompt_token_count=0,witness_outputs=0,model_tokens_computed=0;
     uint32_t step_witness_count=0;
     bool attempted=false,retiring=false,async_started=false,manual_requested=false;
     bool registry_owned=false,process_lease=false;
@@ -109,6 +136,12 @@ public:
     // Never calls start(), loads plugins, selects a device, creates a stream,
     // admits a source or allocates a model. Output has no borrowed lifetime.
     static int vocabulary_preflight(const std::string& checkpoint,GlmMainVocabularyAdmission* out)noexcept;
+    // Consumes this Engine's sole start attempt and always retires it. Reuses
+    // the production metadata/plugin/actual declaration/geometry prefix, then
+    // stops BEFORE the full source factory, Session, Pools, instances or work.
+    // Actual AQL initialization/plugins and Sampler pinned allocations occur.
+    // Output is unchanged on refusal; HOST refuses before source/backend work.
+    static int declaration_preflight(Engine&,GlmMainDeclarationContext* out)noexcept;
     static int retire(Engine&)noexcept;
     // One bounded request through existing scheduler/model/sampler/collect.
     // Never opens an HTTP server. Requires successful start.

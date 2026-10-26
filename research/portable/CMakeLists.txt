@@ -3,7 +3,7 @@ project(radiance_ramcache_portable_host LANGUAGES CXX)
 find_package(Threads REQUIRED)
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 get_filename_component(PORTABLE_REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
-set(RADIANCE_SOURCE "${PORTABLE_REPO_ROOT}/radiance" CACHE PATH "Exported frozen verified-main V7 source")
+set(RADIANCE_SOURCE "${PORTABLE_REPO_ROOT}/radiance" CACHE PATH "Exported frozen verified-main Core12 source")
 set(RADIANCE_HOST_BUILD "" CACHE PATH "Explicit separately built matching HOST Core")
 set(PORTABLE_MODE "release" CACHE STRING "release | asan | tsan")
 if(NOT PORTABLE_MODE MATCHES "^(release|asan|tsan)$")
@@ -145,7 +145,7 @@ target_link_options(glm53_tp4_mover_fence_check PRIVATE
 
 # Eleventh/twelfth explicit HOST checks, byte-exact archived sources. The real
 # checkpoint/manual/AQL executables and maintenance runner are NOT default targets.
-set(VERIFIED_ENGINE "${PORTABLE_REPO_ROOT}/research/glm53-main-verified-source-engine-v10-prototype")
+set(VERIFIED_ENGINE "${PORTABLE_REPO_ROOT}/research/glm53-main-verified-source-engine-v17-prototype")
 set(VERIFIED_COMPONENTS "${PORTABLE_REPO_ROOT}/research/glm53-main-verified-components-v14-prototype")
 add_executable(glm53_main_verified_engine_gate "${VERIFIED_ENGINE}/gate_checker.cpp")
 portable_core_exe(glm53_main_verified_engine_gate)
@@ -172,3 +172,19 @@ portable_core_exe(glm53_main_bounded_decode_check)
 target_include_directories(glm53_main_bounded_decode_check PRIVATE "${VERIFIED_ENGINE}")
 target_link_options(glm53_main_bounded_decode_check PRIVATE
   "LINKER:--wrap=open" "LINKER:--wrap=pread" "LINKER:--wrap=rad_dev_alloc")
+
+# Fifteenth: unchanged Fixture17 normal4 capacity/Scheduler/protocol HOST body.
+# Its synthetic metadata and real HOST scheduling grant no actual source/DEVICE
+# admission and consume no checkpoint/native payload.
+add_executable(glm53_main_normal_prefill_check "${VERIFIED_ENGINE}/prefill_checker.cpp")
+portable_core_exe(glm53_main_normal_prefill_check)
+target_include_directories(glm53_main_normal_prefill_check PRIVATE "${VERIFIED_ENGINE}")
+target_link_options(glm53_main_normal_prefill_check PRIVATE
+  "LINKER:--wrap=open" "LINKER:--wrap=pread" "LINKER:--wrap=rad_dev_alloc")
+
+# Sixteenth: corrected Fixture17 HOST-only same-Engine declaration REFUSAL and
+# terminal-lifecycle checker. Positive all4-device declaration remains separate.
+add_executable(glm53_main_declaration_context_check "${VERIFIED_ENGINE}/declaration_checker.cpp")
+portable_core_exe(glm53_main_declaration_context_check)
+target_link_options(glm53_main_declaration_context_check PRIVATE
+  "LINKER:--wrap=open" "LINKER:--wrap=pread" "LINKER:--wrap=rad_dev_alloc" "LINKER:--wrap=rad_stream_create")

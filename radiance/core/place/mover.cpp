@@ -1,3 +1,4 @@
+#include "../build/glm_main_profile_limits.h"
 /* mover.cpp -- the mover's mechanics; mover.h has the design.
  *
  * Everything here runs on the dispatch thread. Transfers run asynchronously on the mover's
@@ -121,7 +122,7 @@ int Mover::tiny_startup_quote(const Program& p,const Plan& plan,const MoverConfi
 int Mover::glm_main_startup_quote(const Program& p,const Plan& plan,
                               TinyStorageQuote* out) noexcept {
     if(!out)return RAD_E_INVAL;
-    if(glm_main_tp4_cache_program_profile(p)<0||p.ctx.max_tok!=1||!plan.native_inventory||
+    if(glm_main_tp4_cache_program_profile(p)<0||!glm_main_rows_supported(p.ctx.max_tok)||!plan.native_inventory||
        plan.strategy!=Strategy::NativeBacked||plan.dynamic||plan.units.empty()||plan.units.size()>65536||
        plan.classes.size()>65536||plan.file_stage_vram||plan.file_windows||
        plan.native_inventory->validate(p,plan)<0)return RAD_E_UNSUPPORTED;

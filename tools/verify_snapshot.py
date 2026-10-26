@@ -11,6 +11,8 @@ import sys
 
 
 MANIFEST = "SNAPSHOT_MANIFEST.json"
+CORE_ARCHIVE_PINS_SHA256 = "c5c474c9ab5e8e96bd939069ee646937f99b9237d6cc1933bd5b8b69316eaf2a"
+FIXTURE_ARCHIVE_RECEIPT_SHA256 = "82665d51cccdb3bd55e16b4fa62282414737a2ae11dcd7db0f2024592f6c48b2"
 CORE_CACHE_EXCLUSIONS = frozenset({
     "tests/__pycache__/gen_deepseek41_reference.cpython-314.pyc",
     "tests/data/golden/__pycache__/deepseek41-engram-generate.cpython-314.pyc",
@@ -112,14 +114,17 @@ def verify_snapshot(root):
             raise Refusal("source SHA256 mismatch: " + name)
     core_files = {name.removeprefix("radiance/"): h
                   for name, h in files.items() if name.startswith("radiance/")}
-    archived_pins = root / "research/glm53-main-verified-source-engine-v10-prototype/CORE_SOURCE_PINS.json"
+    archived_pins = regular_path(root, "research/glm53-main-verified-source-engine-v17-prototype/CORE_SOURCE_PINS.json")
+    archived_receipt = regular_path(root, "research/glm53-main-verified-source-engine-v17-prototype/SOURCE_RECEIPT.json")
+    if digest(archived_pins) != CORE_ARCHIVE_PINS_SHA256 or digest(archived_receipt) != FIXTURE_ARCHIVE_RECEIPT_SHA256:
+        raise Refusal("expected exact frozen Core12 / Fixture17 archived source identity")
     original = json.loads(archived_pins.read_text(encoding="utf-8"))
-    # V8 retains the V6/V5 inventory (which omitted both generated caches before adding20 source
-    # files:1517-2+20=1535). Do not subtract them a second time or rewrite history.
-    if not isinstance(original, dict) or len(original) != 1535 or CORE_CACHE_EXCLUSIONS & set(original):
-        raise Refusal("unexpected frozen1535-file verified-main V8 Core pin inventory")
+    # Core12's original1536-file map already excludes both historical generated
+    # caches. Compare it directly; preserve all older archived maps unchanged.
+    if not isinstance(original, dict) or len(original) != 1536 or CORE_CACHE_EXCLUSIONS & set(original):
+        raise Refusal("unexpected frozen1536-file Core12 pin inventory")
     if core_files != original:
-        raise Refusal("exported Core differs from the exact frozen1535-file V8 inventory")
+        raise Refusal("exported Core differs from the exact frozen1536-file Core12 inventory")
     if any(name in core_files for name in CORE_CACHE_EXCLUSIONS):
         raise Refusal("portable source snapshot must exclude the two recorded Python caches")
     return files

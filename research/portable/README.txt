@@ -1,59 +1,42 @@
-Portable Core V8 / fixture V10 / Components V14: fourteen HOST programs
+Core12 / Fixture17: sixteen explicit portable HOST checks
 
-Current defaults build CPU-only Core/reference/quantizer targets and14 manual
-HOST checkers. The new target glm53_main_bounded_decode_check uses exact frozen
-Fixture10 decode_checker.cpp, including the unchanged gate source for its test
-hooks. Its --run-host-decode mode tests HOST Scheduler/KV/BatchBuilder commits,
-protocol-only PREFILL/DECODE frames and bounded admission/output preservation.
-It grants no actual TP4 source authority and launches no GPU/model kernels.
-The retained13 checker bodies are byte-identical to the preceding publication.
+Fresh public Release build and all sixteen HOST programs PASSED at the exact
+3715-file tested manifest b9bb3cbeb4db7296da690f6fb670ed7ea4e65648f3204e4014d02bca8ca2aef2.
+Matching private Release, ASan/UBSan and TSan full20 plus focused5 suites also
+passed. These CPU checks establish no GPU/model result. The separate formatted
+model trial exited88 without final JSON; see current root STATUS.md.
 
-Fresh PUBLIC Core8 build/runtime is PENDING. Private matchingCore8 all20 HOST
-commands and focused3 suites passed Release/ASan/TSan; a separate controlled
-one-input/two-output GPU trial passed. Those do not replace a fresh public14
-build/check. Core7's prior fresh-public13 PASS at manifest4d9c9e4a and its exact
-source/docs checkpoint are preserved with their original scope.
+Linux/POSIX, Python3.10+, CMake3.24+ and C++20 build tools are required. The
+HOST targets need no Torch, ROCm, model download or API server.
 
-Linux/POSIX, Python3.10+, CMake3.24+, C++20 and standard build tools are required.
-All JSON/llama/httplib sources are vendored. No Torch/ROCm/model/network is
-required for these automatic HOST targets. No CTest/auto-run/install/model/HTTP
-or maintenance target is added. Default builds only:
-  python3 tools/verify_snapshot.py
-  python3 tools/build_host.py --mode release --jobs 1
-  python3 tools/build_host.py --mode release --jobs 1 --run-host-checks
-  python3 tools/build_host.py --mode asan --jobs 1 --run-host-checks
-  python3 tools/build_host.py --mode tsan --jobs 1 --run-host-checks
-Generated directories are core-main-verified-v8-host-MODE and
-portable-main-verified-v8-fixture-v10-host-MODE. Old builds are preserved.
+ python3 tools/verify_snapshot.py
+ python3 tools/build_host.py --mode release --jobs 1
+ python3 tools/build_host.py --mode release --jobs 1 --run-host-checks
 
-Optional exact existing HOST Core:
-  python3 tools/build_host.py --existing-core-build /ABS/MATCHING/HOST/BUILD --run-host-checks
-The actual source HOME must match every exported1535-file Core8 hash and closed
-inventory. Whole archive/header/compiler/STL/backend/mode/sanitizer/cache source
-identity is checked before and after configure. Only the two recorded historical
-pyc paths may be additional external-source files; neither is exported. Cache
-checks never admit a Core7 archive against Core8 private headers.
+The default builds without executing. --run-host-checks explicitly invokes the
+sixteen programs. The first fourteen retain their prior bodies and arguments;
+the two additions exercise normal-prefill HOST scheduling/protocol and the
+HOST-only declaration refusal/terminal lifecycle. They grant no actual model
+Source/Session/AQL admission or GPU readiness. No manual Engine, real-checkpoint
+mode, maintenance runner, HTTP, Docker, CTest or install step is dispatched.
 
-All prior compiler/ABI/environment safeguards remain: empty global C/C++/linker
-injection; standard Release/Debug/MinSizeRel/RelWithDebInfo flags; no arbitrary
-ABI defines/toolchain/compiler arguments/LTO. Existing Core alone may use exact
-regular /usr/bin/ccache with no arguments/list; fresh builds and portable fixtures
-use no launcher. Nonempty CCACHE_*, compiler/include/library/flag environment
-overrides refuse. Source identity does not authenticate an arbitrary compiler or
-prebuilt binary, and no hostile-writer or RSS-quota claim is made.
+Fresh builds use build/core-main-verified-v12-host-MODE and
+build/portable-main-verified-v12-fixture-v17-host-MODE. Modes release, asan and
+tsan retain their existing flags and diagnostics. Optional --existing-core-build
+ABS requires exact1536-file Core12 source identity and the closed matching
+compiler/backend/ABI/mode/cache checks; a Core8 archive is refused. Fresh fixtures
+use no compiler launcher. Existing safeguards against toolchain/environment/
+packing/linker/LTO overrides remain. GPU visibility is disabled, OMP thread
+limits remain set, and the relevant checks clear RADIANCE_* variables.
 
-OMP_NUM_THREADS=1/OMP_THREAD_LIMIT=1 and empty GPU visibility are set. TinyEngine,
-TP4Session, actual cold gates, component quotes, vocabulary and bounded-decode
-checker commands remove ALL RADIANCE_* variables. ASan/UBSan/TSan defaults and
-caller overrides remain unchanged; no sanitizer diagnostic is disabled here.
-The vocabulary binary is invoked only with --run-host-vocab HOME. Its separate
-actual-model CPU mode and archived manual Engine/Runner sources are NEVER
-invoked by portable tools. No HOME binaries, checkpoint/native records, tokenizer
-payload, serving configuration, API keys or parent deployment wrappers export.
+Core source must exactly match frozen map
+c5c474c9ab5e8e96bd939069ee646937f99b9237d6cc1933bd5b8b69316eaf2a;
+Fixture17 receipt is82665d51cccdb3bd55e16b4fa62282414737a2ae11dcd7db0f2024592f6c48b2.
+Archived source-era CMake/pins/absolute paths remain historical; these portable
+tools are the supported HOST entrypoint. Source identity alone does not establish
+arbitrary binary/compiler provenance or an allocator/RSS quota.
 
-The exact preceding guide/tools/CMake/manifest are retained in
- docs/provenance/base-d04b562-checkpoint/
-Use docs/provenance/glm-core-v8-flight-wrapper.json for current source/target
-mapping, guards and pending parent validation. Actual raw receipts stay under
- evidence/glm53-main-verified-v8/
-No quality,16-output GPU, normal chat,262K,MTP,speed or production claim follows.
+The prior Core8 public14 and earlier checkpoints remain in evidence/provenance
+with their original scopes. Exact overwritten Core8 files and manifest are
+archived at docs/provenance/core8-before-core12/. No serving deployment or
+configuration change is part of this source export.

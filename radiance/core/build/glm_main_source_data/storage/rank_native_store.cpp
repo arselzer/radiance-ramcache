@@ -1,3 +1,4 @@
+#include "../../glm_main_profile_limits.h"
 #include "rank_native_store.h"
 #include "../main_bundle_reader.h"
 #include <algorithm>
@@ -393,7 +394,7 @@ Error RankNativeStore::open_verified_main(std::shared_ptr<ProcessBudget> process
         check(process&&authority&&out&&!*out&&l.buffered_io&&
               l.integrity==IntegrityPolicy::ImmutableGenerationSelectedAudit,
               Error::unsupported,"actual complete-main profile/output");
-        check(l.max_records>=count&&l.max_records<=65536&&l.max_batch&&l.max_batch<=8&&
+        check(l.max_records>=count&&l.max_records<=65536&&l.max_batch&&l.max_batch<=glm_main_max_union&&
               l.max_shards>=shard_count&&l.max_shards<=256&&l.max_segments>=shard_count&&l.max_segments<=65536&&
               l.max_payload_fds&&l.max_payload_fds<=64&&l.max_rank_fd_credits>=l.max_payload_fds+2&&
               l.max_rank_fd_credits<=4096&&l.max_live_records&&l.max_live_records<=count&&
@@ -407,7 +408,7 @@ Error RankNativeStore::open_verified_main(std::shared_ptr<ProcessBudget> process
         const auto& path=authority->root();const auto& receipt=authority->receipt();
         check(program&&plan&&authority->generation()&&authority->rank()<4&&
               program->ctx.world_size==4&&program->ctx.rank==int32_t(authority->rank())&&
-              program->ctx.max_tok==1&&program->ctx.max_seqs==1&&!program->ctx.max_spec&&
+              glm_main_rows_supported(program->ctx.max_tok)&&l.max_batch<=size_t(program->ctx.max_tok)*8&&program->ctx.max_seqs==1&&!program->ctx.max_spec&&
               plan->world_size==4&&plan->rank==program->ctx.rank&&
               !plan->units.empty()&&plan->units.size()<=l.max_records+8192&&
               program->weights.size()<=4*l.max_records+8192&&

@@ -1,3 +1,4 @@
+#include "../build/glm_main_profile_limits.h"
 /* ctx.cpp -- the run phase outside the hot path: arena and plan bring-up, the step driver, the
  * routing handoff and opt-in per-op timing. The hot path is issue.cpp.
  */
@@ -145,7 +146,7 @@ int Ctx::glm_main_startup_quote(const CtxDesc& d,TinyCtxQuote* out) noexcept {
     const auto& p=*d.program;
     constexpr uint64_t arena_cap=uint64_t(2)<<30;
     constexpr uint64_t max_weights=100000,max_buffers=100000,max_ops=50000,max_bands=100000,max_entries=1000000;
-    if(glm_main_tp4_cache_program_profile(p)<0||p.ctx.max_tok!=1||p.ctx.max_ctx<=0||p.ctx.max_ctx>2048||
+    if(glm_main_tp4_cache_program_profile(p)<0||!glm_main_rows_supported(p.ctx.max_tok)||p.ctx.max_ctx<=0||p.ctx.max_ctx>2048||
        d.rank!=p.ctx.rank||d.world_size!=4||d.device<0||d.profile_ops||d.record_passes||d.tiny_retirement||
        p.weights.empty()||p.weights.size()>max_weights||p.buffers.empty()||p.buffers.size()>max_buffers||
        p.ops.empty()||p.ops.size()>max_ops||p.kv_groups.empty()||p.kv_groups.size()>128||
@@ -283,7 +284,7 @@ int Ctx::glm_main_startup_quote(const CtxDesc& d,TinyCtxQuote* out) noexcept {
     if(!tiny_quote::heap(s,45,sizeof(RouteSlot))||!tiny_quote::pinned(s,q.route_bank)||!tiny_quote::device(s,q.route_device))return RAD_E_SHAPE;
     s.event_count=kRouteBanks;
     const auto& limits=d.expert_prepare_limits;
-    if(limits.max_rows!=1||limits.max_experts!=288||limits.max_top_k!=8||limits.max_maps<42||limits.max_maps>256||
+    if(limits.max_rows!=p.ctx.max_tok||limits.max_experts!=288||limits.max_top_k!=8||limits.max_maps<42||limits.max_maps>256||
        limits.max_entries<12096||limits.max_entries>65536||!limits.max_readback_bytes||limits.max_readback_bytes>(16u<<20)||
        !limits.max_metadata_bytes||limits.max_metadata_bytes>(32u<<20))return RAD_E_UNSUPPORTED;
     q.prepare_maps=p.expert_route_maps.size();
@@ -292,7 +293,7 @@ int Ctx::glm_main_startup_quote(const CtxDesc& d,TinyCtxQuote* out) noexcept {
         const auto& decl=map.decl;
         q.prepare_bank=std::max(q.prepare_bank,uint64_t(2*decl.local_experts+1+2*decl.max_rows*decl.top_k)*sizeof(int32_t));
     }
-    q.prepare_seen=8;
+    q.prepare_seen=uint64_t(p.ctx.max_tok)*8;
     const uint64_t prepare_metadata=q.prepare_entries*sizeof(RadExpertRouteEntry)+q.prepare_seen+q.prepare_maps*sizeof(ExpertRouteMap);
     if(q.prepare_bank>limits.max_readback_bytes||prepare_metadata>limits.max_metadata_bytes)return RAD_E_SCRATCH;
     if(!tiny_quote::heap(s,1,sizeof(ExpertPrepareState))||!tiny_quote::heap(s,q.prepare_maps,sizeof(ExpertRouteMap))||

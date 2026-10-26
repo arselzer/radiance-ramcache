@@ -10,7 +10,8 @@
     },
     "main_bundle_reader.cpp": {
       "parent_sha256": "2bfe8f9b1801db434bba891dc2384ac4be3905e53c735660e6eba0d107bd7afe",
-      "private_sha256": "9bacf71f01551024cda0bb3366977312ad4426e74139d71cc60ffb36f50138f1"
+      "private_sha256": "71c8cd2da7d335d0dd1350c6702a37464c1838f9ec75c5514362652e3fc9d488",
+      "prefill_profile_base_private_sha256": "9bacf71f01551024cda0bb3366977312ad4426e74139d71cc60ffb36f50138f1"
     },
     "main_bundle_reader.h": {
       "parent_sha256": "b2c89c899ecb8927a1c022c61b2d6e3e1790e5be9dfc0d38837b30fd66b9cd00",
@@ -18,11 +19,13 @@
     },
     "native_source.cpp": {
       "parent_sha256": "4efce206e6a0d98673d940a4fa22006f4a834d80c5ea7bb8e18a4e64c6c8cdf2",
-      "private_sha256": "3704d9c877302388211ac467a4cc033f3aff630cce8fcce25ec1fbc1b7fd67c4"
+      "private_sha256": "7fbeabac750fe265d8a1f9c6163c8ebbfb6ec1a6572e43f63ab11f1738f3d9b7",
+      "prefill_profile_base_private_sha256": "3704d9c877302388211ac467a4cc033f3aff630cce8fcce25ec1fbc1b7fd67c4"
     },
     "native_source.h": {
       "parent_sha256": "9442061203eb80bd11fb60771d98f2ed7405faba7f7374026044a1807853671f",
-      "private_sha256": "90d6d783c547384401240883e4a8f05d8e6d62252b89f6c6845cf8c9e2a35263"
+      "private_sha256": "1d5f0075ef2f1f453b351cae1b0bca4378e680810617f4711d30252787c68ede",
+      "prefill_profile_base_private_sha256": "90d6d783c547384401240883e4a8f05d8e6d62252b89f6c6845cf8c9e2a35263"
     },
     "producer/bundle_records.h": {
       "parent_sha256": "6befd0a8f6697745cf39b5880be9600d769b093c078323c01292af721158e729",
@@ -50,7 +53,8 @@
     },
     "storage/rank_native_store.cpp": {
       "parent_sha256": "b9148148495d0b811701c1f8e464d7173ca018750949b203a0452a4b4f530e1e",
-      "private_sha256": "2687ffd4a98e98a9b3c3e21b01da957115285196bb51d9a23048e4b2d9efdac4"
+      "private_sha256": "ae7e2de71d2b66747d7b92bfeea21f1a80d74ade4338d06f1396f20a88af52e0",
+      "prefill_profile_base_private_sha256": "2687ffd4a98e98a9b3c3e21b01da957115285196bb51d9a23048e4b2d9efdac4"
     },
     "storage/rank_native_store.h": {
       "parent_sha256": "a29ad5f7c3e4886a65f6852d4eabf233bc79cd0c17d32bb6d3f1940e827469a9",
@@ -93,5 +97,27 @@
       "glm_main_records::"
     ]
   ],
-  "parent_receipt": "ab7e527685b4ab49c7db9f63d55c913af889e7ec863fdcff04f7c87a754bd70c"
+  "parent_receipt": "ab7e527685b4ab49c7db9f63d55c913af889e7ec863fdcff04f7c87a754bd70c",
+  "normal_prefill_profile_overlay": {
+    "scope": "functional internal R1/R4 admission and immutable captured row capacity; NOT namespace-only for these paths",
+    "changed_private_files": {
+      "main_bundle_reader.cpp": {
+        "base": "9bacf71f01551024cda0bb3366977312ad4426e74139d71cc60ffb36f50138f1",
+        "new": "71c8cd2da7d335d0dd1350c6702a37464c1838f9ec75c5514362652e3fc9d488"
+      },
+      "native_source.cpp": {
+        "base": "3704d9c877302388211ac467a4cc033f3aff630cce8fcce25ec1fbc1b7fd67c4",
+        "new": "7fbeabac750fe265d8a1f9c6163c8ebbfb6ec1a6572e43f63ab11f1738f3d9b7"
+      },
+      "native_source.h": {
+        "base": "90d6d783c547384401240883e4a8f05d8e6d62252b89f6c6845cf8c9e2a35263",
+        "new": "1d5f0075ef2f1f453b351cae1b0bca4378e680810617f4711d30252787c68ede"
+      },
+      "storage/rank_native_store.cpp": {
+        "base": "2687ffd4a98e98a9b3c3e21b01da957115285196bb51d9a23048e4b2d9efdac4",
+        "new": "ae7e2de71d2b66747d7b92bfeea21f1a80d74ade4338d06f1396f20a88af52e0"
+      }
+    },
+    "default_R1_preserved": true
+  }
 }

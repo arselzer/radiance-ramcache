@@ -1,0 +1,93 @@
+RAM_ADMISSION MemAvailable=19187929088
+I device: host backend, 1 device(s) [0:host]
+  ok   bucket_table_resolves_per_band
+  ok   an_op_with_no_ranged_parameter_is_one_band
+  ok   graph_dump_matches_the_spec
+  ok   liveness_packing
+  ok   a_smaller_step_packs_its_transients_lower_and_keeps_the_fixed_region
+  ok   unknown_liveness_is_conservative
+  ok   host_and_device_buffers_get_separate_offset_spaces
+  ok   buffer_uses_drive_liveness
+E declare: t_gemm: 'M' and 'K' are both ranges; an op may have at most one ranged parameter
+  ok   two_ranged_parameters_is_an_error
+E declare: t_gemm: required parameter 'K' was not given (declared by plugin 'radtest_over')
+E declare: t_gemm: no parameter 'tile' in this op's schema
+E declare: t_gemm: parameter 'dtype' is an integer, but the schema says it is a string
+E declare: op 't_gemm': 2 weight operands declared, but the schema has 1 (1 required) among its 3 operands
+  ok   schema_mismatches_are_named
+E declare: no loaded kernel plugin declares op 't_tei'; did you mean 't_eq'?
+  ok   no_schema_names_the_near_miss
+  ok   a_weight_list_divides_over_its_tables_the_first_taking_the_remainder
+E declare: op 't_moe': 8 weight operands declared; the schema has 1 fixed weight operands and 8 weight TABLE operands, so 7 leaves a table empty. A table takes one weight per expert
+  ok   a_weight_list_shorter_than_its_tables_is_refused_by_name
+  ok   a_hole_in_the_range_is_reported_as_that_band
+  ok   an_op_with_no_host_kernel_is_a_miss_per_band_not_a_failure
+  ok   a_device_hole_is_decided_per_instance
+E kernel 't_eq_m32' (radtest_base) failed to initialise for M=32 n=4096: out of memory
+E declare: t_eq: kernel t_eq_m32 matched M=32 n=4096 and then its init() refused the instance: out of memory
+W declare: 1 device band(s) and 1 host band(s) resolved to nothing; run with --debug-graph for the full list
+  ok   a_refusing_init_becomes_a_miss_and_not_an_abort
+  ok   tune_requests_are_one_per_kernel_and_shape
+E declare: drafter 'mtp' keeps no cache of its own (rad_drafter_shared_kv) and its layer 2 is bound to KV group 'kv_full', which no pass would ever write
+  ok   a_head_with_no_cache_of_its_own_binds_no_group_of_its_own
+E declare: rad_kv_block_size('kv_full'): no op that reads this group has been declared yet. The block size comes off the RESOLVED attention kernel's block_size constraint, so the attention op has to exist before there is an answer (spec §7.2)
+  ok   kv_block_size_comes_off_the_kernel
+  ok   glm_index_cache_pages_are_sized_by_the_real_pool_consumer
+E declare: kv group 'kv_full' has no layers bound: call rad_bind_layer_kv(b, layer, g) for every layer that owns state in this group, or the block manager cannot tell how many state instances a sequence holds
+  ok   a_kv_group_with_no_layers_is_an_error
+  ok   linear_state_is_sized_per_sequence
+E declare: kv group 'kv_full': kv_group_zero on a group declared replicated; a replicated group is held whole on every rank
+E declare: kv group 'kv_full': kv_group_replicated on a group declared zero; a zero rank holds none of it
+E declare: kv group 'gdn_state': kv_group_replicated on a group that is not paged
+E declare: kv_group_replicated: 7 is not a declared KV group
+E declare: kv_group_replicated after declare finished
+  ok   a_replicated_kv_group_is_paged_and_never_zero
+  ok   a_name_map_carries_its_sub_tensor_index
+E declare: name map for 'w': declared twice, and only a CONCAT, ROWS or EMA map may be extended -- a repeated COPY map means two sources for one weight, and which one wins is not something a declaration can express
+E declare: name map for 'w': extended at concat_dim 1 having been declared at 0; the pieces of one concatenation join along one axis
+  ok   a_concat_name_map_may_be_declared_in_pieces
+  ok   name_map_and_notes_survive_the_plugin
+E declare: weight 'blk.0.ffn_gate.weight' declared twice; the container has one entry for that name and two declarations cannot both own it
+  ok   the_c_surface_drives_the_builder
+  ok   the_drafter_name_survives_the_program_leaving_the_builder
+E declare: drafter_short_block: no drafter is declared. Only a BLOCK drafter proposes a block; declare it with rad_declare_drafter first.
+E declare: drafter_short_block: the declared drafter is a SERIAL head. Only a BLOCK drafter proposes a block; declare it with rad_declare_drafter first.
+E declare: drafter_short_block 'df': 5 rows. The short block must be shorter than the drafter's own (5) and still propose a token (more than 1 rows).
+E declare: drafter_short_block 'df': 1 rows. The short block must be shorter than the drafter's own (5) and still propose a token (more than 1 rows).
+  ok   a_block_drafters_short_block_is_shorter_and_still_proposes
+E declare: declare_drafter 'df': proposal_pitch 3 under depth 4. A block pass writes each sequence's 4 proposals into one row of the proposal buffer, so a row must hold them.
+  ok   a_block_drafters_proposal_pitch_holds_its_proposals
+E declare: drafter_shared_kv: no drafter is declared. Only a SERIAL head runs round after round at one position; declare it with rad_declare_drafter first.
+E declare: drafter_shared_kv: the declared drafter is a BLOCK drafter. Only a SERIAL head runs round after round at one position; declare it with rad_declare_drafter first.
+E declare: drafter_shared_kv 'mtp': pos_offset 2. The rows sit at the committed position (0) or one past it (1); nothing else names a position the head was trained at.
+  ok   a_head_that_keeps_no_cache_of_its_own_is_a_serial_one
+  ok   the_declared_enums_all_have_names_and_an_unknown_value_says_so
+  ok   buffer_bytes_sizes_a_declaration_or_says_it_cannot
+  ok   the_graph_json_groups_identical_declarations_and_keeps_the_order
+  ok   the_graph_json_splits_a_group_whose_band_table_differs
+  ok   the_graph_json_of_an_empty_program_is_still_valid_json
+  ok   an_op_a_real_library_serves_is_not_a_reference_fallback
+  ok   the_op_sentinel_is_not_counted_as_a_reference_fallback
+  ok   an_op_only_the_reference_serves_refuses_the_serve
+  ok   the_reference_count_is_per_declaration_and_the_names_are_not
+  ok   a_real_kernel_in_any_band_or_domain_clears_the_op
+  ok   an_op_nothing_resolved_is_counted_rather_than_waved_through
+  ok   the_gate_names_its_caller
+  ok   shard_spans_survive_the_weight_list_reallocating
+  ok   a_weight_wanted_in_two_stored_forms_is_refused_naming_both_kernels
+  ok   a_kernel_that_does_not_read_the_encoding_gives_its_band_to_the_next
+  ok   a_two_plane_weight_needs_a_kernel_that_joins_its_planes
+  ok   a_kernel_that_reads_any_stored_form_claims_none
+  ok   a_host_kernel_joins_the_planes_no_device_kernel_reads
+  ok   a_device_kernels_stored_form_stands_beside_a_joining_host_kernel
+  ok   a_two_plane_weight_read_only_by_a_hookless_host_kernel_is_refused_by_name
+  ok   a_widened_weight_cannot_also_be_relayouted
+  ok   a_sizing_declare_must_declare_the_real_graph_with_its_fixed_parameters
+  ok   the_logits_pooled_and_concurrent_buffers_live_past_their_declared_uses
+  ok   a_concurrent_buffer_under_a_window_lives_across_the_window_only
+E declare: rad_lane1_window_begin without rad_lane1_window_end
+  ok   a_second_lane_window_must_be_closed
+  ok   the_buffer_plan_never_aliases_two_live_buffers
+  ok   the_home_search_path_splits_on_colons_and_the_first_home_with_a_file_wins
+  ok   the_architecture_plugin_is_picked_by_id_and_quantisation
+917 check(s) over 60 case(s) in 0.10 s, 0.12 s of CPU

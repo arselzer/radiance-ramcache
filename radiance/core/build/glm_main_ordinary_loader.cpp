@@ -1,3 +1,4 @@
+#include "glm_main_profile_limits.h"
 #include "glm_main_ordinary_loader.h"
 #include "format/checkpoint.h"
 #include "format/share.h"
@@ -194,7 +195,7 @@ int GlmMainOrdinaryLoader::prepare(std::span<const GlmMainOrdinaryRankSpec> rank
             need(r.program&&r.plan&&r.sources&&r.plan->native_inventory&&
                  r.plan->strategy==Strategy::NativeBacked&&!r.plan->dynamic&&
                  r.plan->rank==int(rank)&&r.plan->world_size==4&&r.plan->weight.size()==r.program->weights.size()&&
-                 r.program->ctx.rank==int(rank)&&r.program->ctx.world_size==4&&r.program->ctx.max_tok==1&&
+                 r.program->ctx.rank==int(rank)&&r.program->ctx.world_size==4&&glm_main_rows_supported(r.program->ctx.max_tok)&&
                  r.program->ctx.max_seqs==1&&!r.program->ctx.max_spec&&r.program->weights.size()<=limits.max_weights_per_rank&&
                  r.plan->native_inventory->program()==r.program&&
                  r.plan->native_inventory->limits().backend_profile==NativeBackendProfile::GlmMainTp4AqlFailStopV1,

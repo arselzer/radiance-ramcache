@@ -1,0 +1,665 @@
+--- Core8/core/build/glm_main_ordinary_loader.cpp
++++ Core9/core/build/glm_main_ordinary_loader.cpp
+@@ -1,3 +1,4 @@
++#include "glm_main_profile_limits.h"
+ #include "glm_main_ordinary_loader.h"
+ #include "format/checkpoint.h"
+ #include "format/share.h"
+@@ -194,7 +195,7 @@
+             need(r.program&&r.plan&&r.sources&&r.plan->native_inventory&&
+                  r.plan->strategy==Strategy::NativeBacked&&!r.plan->dynamic&&
+                  r.plan->rank==int(rank)&&r.plan->world_size==4&&r.plan->weight.size()==r.program->weights.size()&&
+-                 r.program->ctx.rank==int(rank)&&r.program->ctx.world_size==4&&r.program->ctx.max_tok==1&&
++                 r.program->ctx.rank==int(rank)&&r.program->ctx.world_size==4&&glm_main_rows_supported(r.program->ctx.max_tok)&&
+                  r.program->ctx.max_seqs==1&&!r.program->ctx.max_spec&&r.program->weights.size()<=limits.max_weights_per_rank&&
+                  r.plan->native_inventory->program()==r.program&&
+                  r.plan->native_inventory->limits().backend_profile==NativeBackendProfile::GlmMainTp4AqlFailStopV1,
+--- Core8/core/build/glm_main_profile_limits.h
++++ Core9/core/build/glm_main_profile_limits.h
+@@ -0,0 +1,21 @@
++#pragma once
++// Internal closed research profiles. No public ABI/default serving change.
++#include <cstdint>
++#include "rad_plugin.h"
++namespace rad {
++inline constexpr bool glm_main_rows_supported(int64_t rows) noexcept {return rows==1||rows==4;}
++inline constexpr uint64_t glm_main_record_bytes=3342336;
++inline constexpr uint32_t glm_main_max_union=32;
++struct GlmMainProfileCapacity {
++    uint32_t rows=0,selected_union=0,regions=0;
++    uint64_t cold_bytes=0,consumer_bytes=0,route_bank_bytes=0;
++};
++inline int glm_main_profile_capacity(int64_t rows,GlmMainProfileCapacity* out) noexcept {
++    if(!out||!glm_main_rows_supported(rows))return RAD_E_UNSUPPORTED;
++    GlmMainProfileCapacity q;q.rows=uint32_t(rows);q.selected_union=uint32_t(rows)*8;q.regions=q.selected_union+1;
++    q.cold_bytes=uint64_t(q.selected_union)*glm_main_record_bytes;
++    q.consumer_bytes=uint64_t(q.regions)*(glm_main_record_bytes+16384);
++    q.route_bank_bytes=uint64_t(577+16*rows)*sizeof(int32_t);
++    *out=q;return RAD_OK;
++}
++} // namespace rad
+--- Core8/core/build/glm_main_source_data/COMPOSITION.json
++++ Core9/core/build/glm_main_source_data/COMPOSITION.json
+@@ -10,7 +10,8 @@
+     },
+     "main_bundle_reader.cpp": {
+       "parent_sha256": "2bfe8f9b1801db434bba891dc2384ac4be3905e53c735660e6eba0d107bd7afe",
+-      "private_sha256": "9bacf71f01551024cda0bb3366977312ad4426e74139d71cc60ffb36f50138f1"
++      "private_sha256": "71c8cd2da7d335d0dd1350c6702a37464c1838f9ec75c5514362652e3fc9d488",
++      "prefill_profile_base_private_sha256": "9bacf71f01551024cda0bb3366977312ad4426e74139d71cc60ffb36f50138f1"
+     },
+     "main_bundle_reader.h": {
+       "parent_sha256": "b2c89c899ecb8927a1c022c61b2d6e3e1790e5be9dfc0d38837b30fd66b9cd00",
+@@ -18,11 +19,13 @@
+     },
+     "native_source.cpp": {
+       "parent_sha256": "4efce206e6a0d98673d940a4fa22006f4a834d80c5ea7bb8e18a4e64c6c8cdf2",
+-      "private_sha256": "3704d9c877302388211ac467a4cc033f3aff630cce8fcce25ec1fbc1b7fd67c4"
++      "private_sha256": "7fbeabac750fe265d8a1f9c6163c8ebbfb6ec1a6572e43f63ab11f1738f3d9b7",
++      "prefill_profile_base_private_sha256": "3704d9c877302388211ac467a4cc033f3aff630cce8fcce25ec1fbc1b7fd67c4"
+     },
+     "native_source.h": {
+       "parent_sha256": "9442061203eb80bd11fb60771d98f2ed7405faba7f7374026044a1807853671f",
+-      "private_sha256": "90d6d783c547384401240883e4a8f05d8e6d62252b89f6c6845cf8c9e2a35263"
++      "private_sha256": "1d5f0075ef2f1f453b351cae1b0bca4378e680810617f4711d30252787c68ede",
++      "prefill_profile_base_private_sha256": "90d6d783c547384401240883e4a8f05d8e6d62252b89f6c6845cf8c9e2a35263"
+     },
+     "producer/bundle_records.h": {
+       "parent_sha256": "6befd0a8f6697745cf39b5880be9600d769b093c078323c01292af721158e729",
+@@ -50,7 +53,8 @@
+     },
+     "storage/rank_native_store.cpp": {
+       "parent_sha256": "b9148148495d0b811701c1f8e464d7173ca018750949b203a0452a4b4f530e1e",
+-      "private_sha256": "2687ffd4a98e98a9b3c3e21b01da957115285196bb51d9a23048e4b2d9efdac4"
++      "private_sha256": "ae7e2de71d2b66747d7b92bfeea21f1a80d74ade4338d06f1396f20a88af52e0",
++      "prefill_profile_base_private_sha256": "2687ffd4a98e98a9b3c3e21b01da957115285196bb51d9a23048e4b2d9efdac4"
+     },
+     "storage/rank_native_store.h": {
+       "parent_sha256": "a29ad5f7c3e4886a65f6852d4eabf233bc79cd0c17d32bb6d3f1940e827469a9",
+@@ -93,5 +97,27 @@
+       "glm_main_records::"
+     ]
+   ],
+-  "parent_receipt": "ab7e527685b4ab49c7db9f63d55c913af889e7ec863fdcff04f7c87a754bd70c"
++  "parent_receipt": "ab7e527685b4ab49c7db9f63d55c913af889e7ec863fdcff04f7c87a754bd70c",
++  "normal_prefill_profile_overlay": {
++    "scope": "functional internal R1/R4 admission and immutable captured row capacity; NOT namespace-only for these paths",
++    "changed_private_files": {
++      "main_bundle_reader.cpp": {
++        "base": "9bacf71f01551024cda0bb3366977312ad4426e74139d71cc60ffb36f50138f1",
++        "new": "71c8cd2da7d335d0dd1350c6702a37464c1838f9ec75c5514362652e3fc9d488"
++      },
++      "native_source.cpp": {
++        "base": "3704d9c877302388211ac467a4cc033f3aff630cce8fcce25ec1fbc1b7fd67c4",
++        "new": "7fbeabac750fe265d8a1f9c6163c8ebbfb6ec1a6572e43f63ab11f1738f3d9b7"
++      },
++      "native_source.h": {
++        "base": "90d6d783c547384401240883e4a8f05d8e6d62252b89f6c6845cf8c9e2a35263",
++        "new": "1d5f0075ef2f1f453b351cae1b0bca4378e680810617f4711d30252787c68ede"
++      },
++      "storage/rank_native_store.cpp": {
++        "base": "2687ffd4a98e98a9b3c3e21b01da957115285196bb51d9a23048e4b2d9efdac4",
++        "new": "ae7e2de71d2b66747d7b92bfeea21f1a80d74ade4338d06f1396f20a88af52e0"
++      }
++    },
++    "default_R1_preserved": true
++  }
+ }
+--- Core8/core/build/glm_main_source_data/main_bundle_reader.cpp
++++ Core9/core/build/glm_main_source_data/main_bundle_reader.cpp
+@@ -1,3 +1,4 @@
++#include "../glm_main_profile_limits.h"
+ // Frozen passed v3 low-level POSIX/JSON/FNV primitives; no assembler entrypoint
+ // is invoked and this target must not also compile producer/main_records.cpp.
+ #include "producer/main_records.cpp"
+@@ -99,18 +100,18 @@
+   need(ordered==number(identity.at("ordered_catalog_checksum"))&&p->components.size()==all_records&&p->receipt.native_bytes_verified==all_records*stride,mr::Status::checksum,"complete ordered catalog identity");p->receipt.immutable_metadata_reservation=p->persistent();p->receipt.bundle_id=request.expected_bundle_id;p->receipt.records=all_records;p->receipt.shards=168;p->receipt.complete_main_domain=true;auto result=std::shared_ptr<const VerifiedBundle>(new VerifiedBundle(std::move(p)));Broker final_broker(result->p_->files,2);result->p_->audit_with(final_broker);*out=std::move(result);
+  });
+ }
+-struct VerifiedRankMain::Impl {std::shared_ptr<const VerifiedBundle> bundle;const rad::Program* program=nullptr;const rad::Plan* plan=nullptr;size_t weight_count=0,unit_count=0;uint32_t rank=0;RankReceipt receipt;std::vector<VerifiedShard> shards;std::vector<rad::NativeRecordDescriptor> descriptors;std::vector<rad::RecordOwnerBinding> owned;std::vector<int32_t> units;std::unique_ptr<rad::NativeWeightAuthority> authority;};
++struct VerifiedRankMain::Impl {std::shared_ptr<const VerifiedBundle> bundle;const rad::Program* program=nullptr;const rad::Plan* plan=nullptr;size_t weight_count=0,unit_count=0;int64_t max_tok=0;uint32_t rank=0;RankReceipt receipt;std::vector<VerifiedShard> shards;std::vector<rad::NativeRecordDescriptor> descriptors;std::vector<rad::RecordOwnerBinding> owned;std::vector<int32_t> units;std::unique_ptr<rad::NativeWeightAuthority> authority;};
+ VerifiedRankMain::VerifiedRankMain(std::unique_ptr<Impl> p):p_(std::move(p)){}VerifiedRankMain::~VerifiedRankMain()=default;
+ const rad::Program* VerifiedRankMain::program()const noexcept{return p_->program;}const rad::Plan* VerifiedRankMain::metadata_plan()const noexcept{return p_->plan;}const std::string& VerifiedRankMain::root()const noexcept{return p_->bundle->p_->root;}native::FileStamp VerifiedRankMain::root_stamp()const noexcept{return p_->bundle->p_->root_stamp;}native::FileStamp VerifiedRankMain::bundle_stamp()const noexcept{return p_->bundle->p_->bundle_stamp;}native::FileStamp VerifiedRankMain::proof_stamp()const noexcept{return p_->bundle->p_->proof_stamp;}uint64_t VerifiedRankMain::generation()const noexcept{return p_->receipt.bundle_id;}uint32_t VerifiedRankMain::rank()const noexcept{return p_->rank;}
+ std::span<const VerifiedShard> VerifiedRankMain::shards()const noexcept{return p_->shards;}std::span<const rad::NativeRecordDescriptor> VerifiedRankMain::descriptors()const noexcept{return p_->descriptors;}std::span<const rad::RecordOwnerBinding> VerifiedRankMain::owned()const noexcept{return p_->owned;}std::span<const int32_t> VerifiedRankMain::units()const noexcept{return p_->units;}const RankReceipt& VerifiedRankMain::receipt()const noexcept{return p_->receipt;}
+-Error VerifiedRankMain::validate_program()const noexcept{return operation(nullptr,[&]{need(p_->program&&p_->plan&&p_->program->weights.size()==p_->weight_count&&p_->plan->units.size()==p_->unit_count&&p_->plan->unit_of_weight.size()==p_->weight_count&&p_->program->ctx.world_size==4&&p_->program->ctx.rank==int32_t(p_->rank)&&p_->program->ctx.max_tok==1&&!p_->program->ctx.max_spec&&p_->program->ctx.max_seqs==1,mr::Status::identity,"bound rank/program geometry changed");for(size_t w=0;w<p_->weight_count;++w)need(p_->authority->matches(rad_weight(w),p_->program->weights[w])&&p_->plan->unit_of_weight[w]==p_->authority->unit_for_weight(rad_weight(w)),mr::Status::identity,"compact bound rank authority changed");for(size_t i=0;i<per_rank;++i){const auto u=p_->units[i];need(u>=0&&size_t(u)<p_->plan->units.size(),mr::Status::identity,"bound unit outside plan");const auto& actual=p_->plan->units[size_t(u)];const auto& d=p_->descriptors[i];need(actual.layer==d.layer&&actual.expert==d.expert&&actual.bytes==d.stride&&actual.slot_bytes==d.stride&&actual.weights.size()==4&&actual.offset.size()==4,mr::Status::identity,"bound exact unit changed");for(size_t m=0;m<4;++m)need(actual.offset[m]==d.offsets[m]&&p_->authority->member_index(actual.weights[m])==int32_t(m)&&p_->authority->unit_for_weight(actual.weights[m])==u,mr::Status::identity,"bound unit member order/offset changed");}});}
++Error VerifiedRankMain::validate_program()const noexcept{return operation(nullptr,[&]{need(p_->program&&p_->plan&&p_->program->weights.size()==p_->weight_count&&p_->plan->units.size()==p_->unit_count&&p_->plan->unit_of_weight.size()==p_->weight_count&&p_->program->ctx.world_size==4&&p_->program->ctx.rank==int32_t(p_->rank)&&glm_main_rows_supported(p_->program->ctx.max_tok)&&p_->program->ctx.max_tok==p_->max_tok&&!p_->program->ctx.max_spec&&p_->program->ctx.max_seqs==1,mr::Status::identity,"bound rank/program geometry changed");for(size_t w=0;w<p_->weight_count;++w)need(p_->authority->matches(rad_weight(w),p_->program->weights[w])&&p_->plan->unit_of_weight[w]==p_->authority->unit_for_weight(rad_weight(w)),mr::Status::identity,"compact bound rank authority changed");for(size_t i=0;i<per_rank;++i){const auto u=p_->units[i];need(u>=0&&size_t(u)<p_->plan->units.size(),mr::Status::identity,"bound unit outside plan");const auto& actual=p_->plan->units[size_t(u)];const auto& d=p_->descriptors[i];need(actual.layer==d.layer&&actual.expert==d.expert&&actual.bytes==d.stride&&actual.slot_bytes==d.stride&&actual.weights.size()==4&&actual.offset.size()==4,mr::Status::identity,"bound exact unit changed");for(size_t m=0;m<4;++m)need(actual.offset[m]==d.offsets[m]&&p_->authority->member_index(actual.weights[m])==int32_t(m)&&p_->authority->unit_for_weight(actual.weights[m])==u,mr::Status::identity,"bound unit member order/offset changed");}});}
+ Error VerifiedRankMain::audit()const noexcept{return operation(nullptr,[&]{Broker prepared(p_->bundle->p_->files,2);need(validate_program()==Error::ok,mr::Status::identity,"bound rank metadata changed before final audit");p_->bundle->p_->audit_with(prepared);});}
+ Error VerifiedBundle::bind_rank(rad::Checkpoint& ck,const rad::CheckpointSources& sources,const rad::Program& program,const rad::Plan& plan,std::shared_ptr<const VerifiedRankMain>* out,std::string* why)const noexcept {
+- return operation(why,[&]{std::lock_guard lock(p_->bind_mutex);need(out&&!*out&& &ck==p_->checkpoint&&program.ctx.world_size==4&&program.ctx.rank>=0&&program.ctx.rank<4&&program.ctx.max_tok==1&&program.ctx.max_seqs==1&&!program.ctx.max_spec,mr::Status::identity,"same checkpoint and closed first rank profile");need(!(p_->bound_mask&(1u<<program.ctx.rank))&&(!p_->bound_cache||p_->bound_cache==&sources),mr::Status::identity,"rank already bound or foreign source cache");
++ return operation(why,[&]{std::lock_guard lock(p_->bind_mutex);need(out&&!*out&& &ck==p_->checkpoint&&program.ctx.world_size==4&&program.ctx.rank>=0&&program.ctx.rank<4&&glm_main_rows_supported(program.ctx.max_tok)&&program.ctx.max_seqs==1&&!program.ctx.max_spec,mr::Status::identity,"same checkpoint and closed first rank profile");need(!(p_->bound_mask&(1u<<program.ctx.rank))&&(!p_->bound_cache||p_->bound_cache==&sources),mr::Status::identity,"rank already bound or foreign source cache");
+   const uint64_t base=rank_base();
+   need(base<p_->limits.rank_metadata_bytes,mr::Status::budget,"rank base reservation before quote/audit");
+   glm_main_metadata::Quote geometry;glm_main_metadata::Limits gl;gl.max_metadata_bytes=std::min<uint64_t>(64u<<20,p_->limits.rank_metadata_bytes-base);std::string error;const int quoted=glm_main_metadata::quote(ck,sources,program,plan,{},gl,&geometry,&error);need(quoted==RAD_OK,quoted==RAD_E_NOMEM?mr::Status::no_memory:quoted==RAD_E_SCRATCH?mr::Status::budget:mr::Status::identity,"once/rank actual source/layout quote refused");need(geometry.records.size()==per_rank&&geometry.owned.size()==per_rank&&geometry.resident_main_units.empty(),mr::Status::identity,"complete empty-resident rank geometry");
+-  auto result=std::make_unique<VerifiedRankMain::Impl>();result->rank=uint32_t(program.ctx.rank);result->program=&program;result->plan=&plan;result->weight_count=program.weights.size();result->unit_count=plan.units.size();result->bundle=shared_from_this();result->receipt.bundle_id=p_->receipt.bundle_id;result->receipt.rank=result->rank;result->receipt.records=per_rank;result->receipt.geometry_peak=geometry.construction_requested;
++  auto result=std::make_unique<VerifiedRankMain::Impl>();result->rank=uint32_t(program.ctx.rank);result->program=&program;result->plan=&plan;result->max_tok=program.ctx.max_tok;result->weight_count=program.weights.size();result->unit_count=plan.units.size();result->bundle=shared_from_this();result->receipt.bundle_id=p_->receipt.bundle_id;result->receipt.rank=result->rank;result->receipt.records=per_rank;result->receipt.geometry_peak=geometry.construction_requested;
+   need(geometry.construction_requested<=p_->limits.rank_metadata_bytes-base,mr::Status::budget,"geometry stayed inside remaining reservation");
+   const uint64_t remaining=p_->limits.rank_metadata_bytes-base-geometry.construction_requested;
+   const uint64_t authority_budget=std::min(p_->limits.authority_bytes,remaining);need(authority_budget,mr::Status::budget,"authority remaining budget before scratch allocation");
+--- Core8/core/build/glm_main_source_data/native_source.cpp
++++ Core9/core/build/glm_main_source_data/native_source.cpp
+@@ -1,3 +1,4 @@
++#include "../glm_main_profile_limits.h"
+ #include "native_source.h"
+ #include <algorithm>
+ #include <array>
+@@ -11,7 +12,7 @@
+     Active(){in_main_facade=true;}
+     ~Active(){in_main_facade=false;}
+ };
+-constexpr size_t records=42*288,max_request=8,max_holders=64;
++constexpr size_t records=42*288,max_request=glm_main_max_union,max_holders=64;
+ constexpr uint64_t record_bytes=3342336;
+ uint64_t sum(uint64_t a,uint64_t b){if(b>UINT64_MAX-a)throw std::bad_alloc();return a+b;}
+ uint64_t product(uint64_t a,uint64_t b){if(a&&b>UINT64_MAX/a)throw std::bad_alloc();return a*b;}
+@@ -56,10 +57,10 @@
+         explanation(why,"complete-main facade authority/output");return RAD_E_INVAL;
+     }
+     const auto& p=*authority->program();
+-    if(p.ctx.world_size!=4||p.ctx.rank<0||p.ctx.rank>=4||p.ctx.max_tok!=1||p.ctx.max_seqs!=1||p.ctx.max_spec||
++    if(p.ctx.world_size!=4||p.ctx.rank<0||p.ctx.rank>=4||!glm_main_rows_supported(p.ctx.max_tok)||p.ctx.max_seqs!=1||p.ctx.max_spec||
+        authority->rank()!=uint32_t(p.ctx.rank)||authority->descriptors().size()!=records||
+        authority->owned().size()!=records||authority->units().size()!=records||
+-       !limits.max_batch||limits.max_batch>max_request||limits.max_record_bytes<record_bytes){
++       !limits.max_batch||limits.max_batch>size_t(p.ctx.max_tok)*8||limits.max_record_bytes<record_bytes){
+         explanation(why,"closed TP4 main/max-token1/max-sequence1/no-spec profile");return RAD_E_INVAL;
+     }
+     try{
+@@ -81,7 +82,7 @@
+         if(opened!=sc::Error::ok)return native_status(opened);
+         result->quota_=std::make_shared<Quota>();result->quota_->usage.metadata_reservation=metadata;
+         result->quota_->reservation=result->store_->accounting();
+-        result->handles_.resize(records);
++        result->request_limit_=limits.max_batch;result->handles_.resize(records);
+         const auto bound=result->store_->bind_main_handles(result->handles_);
+         if(bound!=sc::Error::ok)return native_status(bound);
+         // Quota/control blocks/handle storage all exist before the final
+@@ -113,7 +114,7 @@
+     if(in_main_facade)return RAD_E_STATE;
+     Active active;std::lock_guard lock(operation_);
+     if(closed_||!bootstrap_done_||!store_)return RAD_E_STATE;
+-    if(!out||!request.data()||request.empty()||request.size()>max_request)return RAD_E_INVAL;
++    if(!out||!request.data()||request.empty()||request.size()>request_limit_)return RAD_E_INVAL;
+     std::array<uint32_t,max_request> ids{};
+     std::array<sc::BoundRecord,max_request> selected{};
+     size_t count=0;
+--- Core8/core/build/glm_main_source_data/native_source.h
++++ Core9/core/build/glm_main_source_data/native_source.h
+@@ -41,6 +41,7 @@
+     std::vector<sc::BoundRecord> handles_;
+     std::shared_ptr<Quota> quota_;
+     mutable std::mutex operation_;
++    size_t request_limit_=0;
+     bool bootstrap_done_=false,closed_=false;
+ };
+ int native_status(sc::Error)noexcept;
+--- Core8/core/build/glm_main_source_data/storage/rank_native_store.cpp
++++ Core9/core/build/glm_main_source_data/storage/rank_native_store.cpp
+@@ -1,3 +1,4 @@
++#include "../../glm_main_profile_limits.h"
+ #include "rank_native_store.h"
+ #include "../main_bundle_reader.h"
+ #include <algorithm>
+@@ -393,7 +394,7 @@
+         check(process&&authority&&out&&!*out&&l.buffered_io&&
+               l.integrity==IntegrityPolicy::ImmutableGenerationSelectedAudit,
+               Error::unsupported,"actual complete-main profile/output");
+-        check(l.max_records>=count&&l.max_records<=65536&&l.max_batch&&l.max_batch<=8&&
++        check(l.max_records>=count&&l.max_records<=65536&&l.max_batch&&l.max_batch<=glm_main_max_union&&
+               l.max_shards>=shard_count&&l.max_shards<=256&&l.max_segments>=shard_count&&l.max_segments<=65536&&
+               l.max_payload_fds&&l.max_payload_fds<=64&&l.max_rank_fd_credits>=l.max_payload_fds+2&&
+               l.max_rank_fd_credits<=4096&&l.max_live_records&&l.max_live_records<=count&&
+@@ -407,7 +408,7 @@
+         const auto& path=authority->root();const auto& receipt=authority->receipt();
+         check(program&&plan&&authority->generation()&&authority->rank()<4&&
+               program->ctx.world_size==4&&program->ctx.rank==int32_t(authority->rank())&&
+-              program->ctx.max_tok==1&&program->ctx.max_seqs==1&&!program->ctx.max_spec&&
++              glm_main_rows_supported(program->ctx.max_tok)&&l.max_batch<=size_t(program->ctx.max_tok)*8&&program->ctx.max_seqs==1&&!program->ctx.max_spec&&
+               plan->world_size==4&&plan->rank==program->ctx.rank&&
+               !plan->units.empty()&&plan->units.size()<=l.max_records+8192&&
+               program->weights.size()<=4*l.max_records+8192&&
+--- Core8/core/engine.cpp
++++ Core9/core/engine.cpp
+@@ -846,8 +846,8 @@
+         if (t_on) phase_mark(PH_COLLECT);
+         if (st < 0) return fail_loop(st);
+         if(cache_prepare4_){const int completed=cache_prepare4_->complete_frame(*b);if(completed<0)cache_prepare4_->fail_stop(-1,completed);
+-            if(glm_main_){if(so.token.size()!=1)cache_prepare4_->fail_stop(-1,RAD_E_STATE);
+-                const int witnessed=glm_main_step_complete(*b,so.token[0]);if(witnessed<0)cache_prepare4_->fail_stop(-1,witnessed);}}
++            if(glm_main_){if((b->n_out!=0&&b->n_out!=1)||(b->n_out&&so.token.size()!=1)||(!b->n_out&&so.n_rows))cache_prepare4_->fail_stop(-1,RAD_E_STATE);
++                const int witnessed=glm_main_step_complete(*b,b->n_out?so.token[0]:-1);if(witnessed<0)cache_prepare4_->fail_stop(-1,witnessed);}}
+         /* The step's sampler chain, verify op included, has returned: one line at the first
+          * coupled verify that actually completed. */
+         couple_verify_evidence(b->step);
+--- Core8/core/engine_glm_main.cpp
++++ Core9/core/engine_glm_main.cpp
+@@ -1,3 +1,4 @@
++#include "build/glm_main_profile_limits.h"
+ #include "engine_priv.h"
+ #include "build/glm_main_quote.h"
+ #include "mem/vram_budget.h"
+@@ -16,13 +17,16 @@
+ #include <unistd.h>
+ namespace rad {
+ namespace {
+-constexpr uint64_t MiB=1ull<<20,GiB=1ull<<30,stride=3342336,cold=8*stride;
++constexpr uint64_t MiB=1ull<<20,GiB=1ull<<30,stride=3342336;
+ std::atomic<bool> manual_process_owner{false};
+ // Requested planning envelopes, admitted BEFORE Checkpoint/Tokenizer/Sampler.
+ // Includes shared bundle allowance PER rank token, not physical duplicate bytes.
+ constexpr uint64_t metadata_envelope=(256+4*192+256+4*128+4*128+1024+4*128+64)*MiB;
+ bool path_text(const std::string& s)noexcept{return !s.empty()&&s.size()<=4096&&s.find('\0')==std::string::npos;}
+ int request_valid(const GlmMainEngineOptions& o)noexcept {
++    GlmMainProfileCapacity capacity;
++    if(glm_main_profile_capacity(o.prefill_max_tok,&capacity)<0||
++       (o.prefill_max_tok==4&&o.context!=512)||(o.formatted_prompt&&o.prefill_max_tok!=4))return RAD_E_INVAL;
+     if(!path_text(o.checkpoint)||!path_text(o.home)||!path_text(o.bundle_root)||!path_text(o.source_proof)||
+        !o.expected_bundle_id||o.context<128||o.context>512||o.context%128||
+        o.hot_bytes_per_rank>2*GiB||(o.hot_bytes_per_rank>GiB&&o.host_payload_limit!=16*GiB)||
+@@ -32,7 +36,7 @@
+        !o.loader_column_limit||o.loader_column_limit>64*MiB||o.gpu_headroom<96*MiB||o.gpu_headroom>GiB||
+        !o.thread_stack_limit||o.thread_stack_limit>64*MiB||!o.manual_timeout_seconds||o.manual_timeout_seconds>7200)return RAD_E_INVAL;
+     uint64_t host=o.loader_input_limit+o.loader_output_limit+o.loader_column_limit+8*MiB;
+-    if(!tiny_quote::add(host,4*(o.hot_bytes_per_rank+cold+30228480))||host>o.host_payload_limit)return RAD_E_NOMEM;
++    if(!tiny_quote::add(host,4*(o.hot_bytes_per_rank+capacity.cold_bytes+capacity.consumer_bytes))||host>o.host_payload_limit)return RAD_E_NOMEM;
+     return RAD_OK;
+ }
+ int data_status(glm_main_data::Error e)noexcept {
+@@ -99,6 +103,13 @@
+ int glm_main_one_prompt_admission(std::span<const int32_t> tokens,int64_t vocabulary,int64_t context)noexcept {
+     return tokens.size()==1&&vocabulary>0&&context>=2&&tokens[0]>=0&&tokens[0]<vocabulary?RAD_OK:RAD_E_SHAPE;
+ }
++int glm_main_prefill_prompt_admission(std::span<const int32_t> tokens,int64_t vocabulary,int64_t context,int32_t outputs)noexcept {
++    if(tokens.empty()||tokens.size()>glm_main_max_prompt_tokens||!tokens.data()||vocabulary<=0||
++       context!=512||outputs<1||outputs>int32_t(glm_main_max_outputs)||
++       tokens.size()+size_t(outputs)>size_t(context))return RAD_E_SHAPE;
++    for(const auto token:tokens)if(token<0||token>=vocabulary)return RAD_E_SHAPE;
++    return RAD_OK;
++}
+ GlmMainComputeStream::~GlmMainComputeStream(){retire();}
+ int GlmMainComputeStream::open(int device,CachePrepare4RankBinding* binding){
+     if(stream_||binding_||device<0||!binding||!binding->runtime_admitted())return RAD_E_STATE;
+@@ -119,10 +130,12 @@
+     const int valid=request_valid(o);if(valid<0)return valid;
+     try {
+         auto state=std::make_unique<EngineGlmMainState>();state->options=o;
++        GlmMainProfileCapacity capacity;const int cap=glm_main_profile_capacity(o.prefill_max_tok,&capacity);if(cap<0)return cap;
++        state->result.max_tok=o.prefill_max_tok;
+         state->result.metadata_reserved=metadata_envelope;
+-        state->result.host_payload_reserved=o.loader_input_limit+o.loader_output_limit+o.loader_column_limit+8*MiB+4*(o.hot_bytes_per_rank+cold+30228480);
++        state->result.host_payload_reserved=o.loader_input_limit+o.loader_output_limit+o.loader_column_limit+8*MiB+4*(o.hot_bytes_per_rank+capacity.cold_bytes+capacity.consumer_bytes);
+         Config c;c.model=o.checkpoint;c.radiance_home=o.home;c.tp=4;c.tp_wire_exact=1;c.tp_wire_min_kb=0;
+-        c.max_tok=1;c.max_seqs=1;c.max_ctx=o.context;c.n_spec=0;c.deterministic=true;
++        c.max_tok=o.prefill_max_tok;c.max_seqs=1;c.max_ctx=o.context;c.n_spec=0;c.deterministic=true;
+         c.placement="all_vram";c.host_pool_mib=0;c.weights_disk_tier=false;
+         c.embedding_placement=c.embedding_resolved=TablePlacement::Vram;c.embedding_host_mib=c.tower_host_mib=0;
+         c.tower_placement=TablePlacement::Vram;c.prefix_cache=false;c.prefix_cache_mib=0;
+@@ -162,7 +175,7 @@
+         TinySamplerQuote sampler_actual;RAD_TRY(r->sampler.glm_main_startup_quote(&sampler_actual));
+         if(sampler_actual.storage.page_and_heap_total!=s.sampler_quotes[size_t(r->index)].storage.page_and_heap_total||
+            sampler_actual.candidates!=s.sampler_quotes[size_t(r->index)].candidates)return RAD_E_STATE;
+-        if(r->program.ctx.max_tok!=1||r->program.buffers.size()>20000||r->program.ops.size()>10000||r->program.weights.size()>60000)return RAD_E_SHAPE;
++        if(r->program.ctx.max_tok!=cfg_.max_tok||!glm_main_rows_supported(r->program.ctx.max_tok)||r->program.buffers.size()>20000||r->program.ops.size()>10000||r->program.weights.size()>60000)return RAD_E_SHAPE;
+         if(!r->program.device_holes(false).empty())return RAD_E_NOTFOUND; // exact predicate underlying miss_report
+         RAD_TRY(rad_gate_reference_kernels(r->program,false,"actual GLM main cache"));
+         if(!r->tok_buf||r->tok_buf>=r->program.buffers.size())return RAD_E_SHAPE;
+@@ -172,7 +185,9 @@
+     if(!ckpt_src_->refused().empty())return RAD_E_UNSUPPORTED;
+     // Validate all actual row paths/constraints BEFORE source scan, Native fit,
+     // opaque collective init, Pools or ordinary payload allocations.
+-    for(size_t i=0;i<4;++i){RAD_TRY(glm_main_final_token_geometry_resolve(ranks_[i]->program,cfg_,&s.geometry[i]));
++    for(size_t i=0;i<4;++i){RAD_TRY(s.options.prefill_max_tok==4?
++            glm_main_prefill4_geometry_resolve(ranks_[i]->program,cfg_,&s.geometry[i]):
++            glm_main_final_token_geometry_resolve(ranks_[i]->program,cfg_,&s.geometry[i]));
+         if(i&&(s.geometry[i].quantum!=s.geometry[0].quantum||s.geometry[i].state_chunk!=s.geometry[0].state_chunk||
+                s.geometry[i].attn_block!=s.geometry[0].attn_block||s.geometry[i].max_chunk!=s.geometry[0].max_chunk))return RAD_E_SHAPE;}
+     s.result.actual_quantum=s.geometry[0].quantum;s.result.actual_state_chunk=s.geometry[0].state_chunk;
+@@ -183,6 +198,7 @@
+ class GlmMainTp4VerifiedSourceFactory final {
+ public:
+     static int prepare(Engine& e){auto& s=*e.glm_main_;std::string why;
++        GlmMainProfileCapacity capacity;RAD_TRY(glm_main_profile_capacity(e.cfg_.max_tok,&capacity));
+         if(!e.ckpt_||!e.ckpt_src_||e.ranks_.size()!=4||e.cache_prepare4_)return RAD_E_STATE;
+         for(size_t rank=0;rank<4;++rank){auto& r=*e.ranks_[rank];
+             Config c=e.cfg_;c.vram_weights_mib=0;c.vram_kv_mib=0;
+@@ -195,21 +211,21 @@
+         if(!receipt.complete_main_domain||receipt.records!=48384||receipt.shards!=168||receipt.native_bytes_verified!=161715585024ull||receipt.bundle_id!=s.options.expected_bundle_id)return RAD_E_INVAL;
+         s.result.bundle_id=receipt.bundle_id;s.result.source_bytes_verified=receipt.native_bytes_verified;s.result.mapped_bytes_compared=receipt.mapped_source_bytes_compared;
+         glm_main_provider::ProcessLimits process_limits;process_limits.max_rank_owners=4;process_limits.max_open_fds=48;
+-        process_limits.max_metadata_bytes=GiB;process_limits.max_cache_reservations=4*(s.options.hot_bytes_per_rank+cold);
++        process_limits.max_metadata_bytes=GiB;process_limits.max_cache_reservations=4*(s.options.hot_bytes_per_rank+capacity.cold_bytes);
+         if(glm_main_provider::ProcessBudget::create(process_limits,&s.process)!=glm_main_provider::Error::ok)return RAD_E_NOMEM;
+         e.rank_cfg_.resize(4);
+         for(size_t rank=0;rank<4;++rank){auto& r=*e.ranks_[rank];
+             RAD_TRY(data_status(s.bundle->bind_rank(*e.ckpt_,*e.ckpt_src_,r.program,s.metadata_plans[rank],&s.authorities[rank],&why)));
+             if(s.authorities[rank]->generation()!=receipt.bundle_id||s.authorities[rank]->owned().size()!=12096)return RAD_E_INVAL;
+-            glm_main_provider::Limits limits;limits.hot_bytes=s.options.hot_bytes_per_rank;limits.cold_bytes=cold;limits.max_record_bytes=stride;
+-            limits.max_metadata_bytes=256*MiB;limits.max_records=12096;limits.max_batch=8;limits.max_shards=42;limits.max_segments=42;
++            glm_main_provider::Limits limits;limits.hot_bytes=s.options.hot_bytes_per_rank;limits.cold_bytes=capacity.cold_bytes;limits.max_record_bytes=stride;
++            limits.max_metadata_bytes=256*MiB;limits.max_records=12096;limits.max_batch=capacity.selected_union;limits.max_shards=42;limits.max_segments=42;
+             limits.max_payload_fds=2;limits.max_rank_fd_credits=12;limits.max_live_records=12096;limits.max_live_leases=64;limits.io_chunk_bytes=s.options.read_chunk_bytes;
+             RAD_TRY(glm_main_data::GlmMainNativeSource::open(s.process,s.authorities[rank],limits,&s.sources[rank],&why));
+             NativeInventoryLimits caps;caps.backend_profile=NativeBackendProfile::GlmMainTp4AqlFailStopV1;
+-            caps.max_rows=1;caps.top_k=8;caps.max_owned_units=12096;caps.max_classes=1;caps.max_regions=9;
+-            caps.max_device_bytes=caps.max_landing_bytes=32*MiB;caps.max_weights_bytes=8*GiB;
+-            caps.max_metadata_bytes=128*MiB;caps.hot_bytes=s.options.hot_bytes_per_rank;caps.cold_bytes=cold;
+-            caps.max_host_bytes=s.options.hot_bytes_per_rank+cold+32*MiB+128*MiB;
++            caps.max_rows=capacity.rows;caps.top_k=8;caps.max_owned_units=12096;caps.max_classes=1;caps.max_regions=capacity.regions;
++            caps.max_device_bytes=caps.max_landing_bytes=capacity.consumer_bytes;caps.max_weights_bytes=8*GiB;
++            caps.max_metadata_bytes=128*MiB;caps.hot_bytes=s.options.hot_bytes_per_rank;caps.cold_bytes=capacity.cold_bytes;
++            caps.max_host_bytes=s.options.hot_bytes_per_rank+capacity.cold_bytes+capacity.consumer_bytes+128*MiB;
+             RAD_TRY(NativeInventory::bind(r.program,s.metadata_plans[rank],s.sources[rank]->catalog(),s.authorities[rank]->owned(),{},caps,&s.inventories[rank],&why));
+             RAD_TRY(rad_dev_set(r.device));
+             RAD_TRY(r.kv.plan_groups(r.program.kv_groups,e.cfg_));const int64_t kv=r.kv.ceiling(e.cfg_.max_ctx);
+@@ -241,7 +257,7 @@
+             s.result.backend_stream_requested=sum(s.result.backend_stream_requested,3*stream); //compute+mover+per-card backend spare/shared lane allowance
+             extra_host=sum(extra_host,3*stream);
+             CtxDesc desc;desc.program=&r.program;desc.rank=int(i);desc.world_size=4;desc.device=r.device;desc.record_passes=false;desc.profile_ops=false;
+-            desc.expert_prepare_limits.max_rows=1;desc.expert_prepare_limits.max_top_k=8;desc.expert_prepare_limits.max_experts=288;
++            desc.expert_prepare_limits.max_rows=e.cfg_.max_tok;desc.expert_prepare_limits.max_top_k=8;desc.expert_prepare_limits.max_experts=288;
+             desc.expert_prepare_limits.max_maps=42;desc.expert_prepare_limits.max_entries=12096;
+             RAD_TRY(Ctx::glm_main_startup_quote(desc,&s.context_quotes[i]));
+             RAD_TRY(NativeBackingOwner::glm_main_startup_quote(r.program,r.plan,&s.owner_quotes[i]));
+@@ -343,7 +359,7 @@
+     for(size_t rank=0;rank<4;++rank){auto& r=*ranks_[rank];RAD_TRY(rad_dev_set(r.device));CtxDesc d;
+         d.program=&r.program;d.rank=int(rank);d.world_size=4;d.device=r.device;d.stream=r.glm_compute.get();d.residency=r.mover.residency();
+         d.arch_step=arch_step_;d.record_passes=false;d.profile_ops=false;d.registry=&rad_tools_registry();d.expert_prepare_owner=r.native_owner.get();d.cache_prepare4=cache_prepare4_->binding(int(rank));
+-        d.expert_prepare_limits.max_rows=1;d.expert_prepare_limits.max_top_k=8;d.expert_prepare_limits.max_experts=288;d.expert_prepare_limits.max_maps=42;d.expert_prepare_limits.max_entries=12096;
++        d.expert_prepare_limits.max_rows=cfg_.max_tok;d.expert_prepare_limits.max_top_k=8;d.expert_prepare_limits.max_experts=288;d.expert_prepare_limits.max_maps=42;d.expert_prepare_limits.max_entries=12096;
+         bind_kv_pools(r.program,[&](int32_t g){return r.kv.plan(g);},&d.kv);
+         TinyCtxQuote actual;RAD_TRY(Ctx::glm_main_startup_quote(d,&actual));const auto& admitted=s.context_quotes[rank];
+         if(actual.storage.device_page_bytes!=admitted.storage.device_page_bytes||actual.storage.pinned_page_bytes!=admitted.storage.pinned_page_bytes||
+@@ -389,6 +405,33 @@
+ // No device token/position pointer is read on the CPU.
+ int Engine::glm_main_step_begin(const StepPlan& plan,const RadBatch& batch){
+     auto& s=*glm_main_;const size_t i=s.step_witness_count;
++    if(s.options.prefill_max_tok==4){
++        if(i>=glm_main_max_steps||s.geometry[0].quantum!=4||s.prompt_token_count<1||s.prompt_token_count>glm_main_max_prompt_tokens||
++           plan.e.size()!=1||plan.n_spec||plan.draft_pass||batch.n_seq!=1||batch.n_spec||batch.draft_pass||
++           plan.n_tok!=batch.n_tok||batch.n_tok<1||batch.n_tok>4||batch.n_out<0||batch.n_out>1||plan.phase!=batch.phase)
++            return RAD_E_STATE;
++        const auto& e=plan.e[0];const bool prefill=s.model_tokens_computed<s.prompt_token_count;
++        const uint32_t remaining=prefill?s.prompt_token_count-s.model_tokens_computed:0;
++        const uint32_t rows=prefill?std::min<uint32_t>(4,remaining):1;
++        const bool sample=!prefill||remaining<=4;
++        if(!e.req||e.req->id!=1||e.seq!=1||e.dev||e.n_tokens!=int32_t(rows)||batch.n_tok!=int64_t(rows)||
++           e.ctx_len!=int32_t(s.model_tokens_computed)||e.n_spec||e.n_draft||
++           e.produces_token!=sample||e.is_prefill!=prefill||batch.n_out!=int64_t(sample)||
++           batch.phase!=(prefill?RAD_PHASE_PREFILL:RAD_PHASE_DECODE)||
++           e.req->prompt.size()!=s.prompt_token_count||e.req->output.size()!=s.witness_outputs||
++           e.req->n_computed!=int32_t(s.model_tokens_computed)||
++           !std::equal(e.req->prompt.begin(),e.req->prompt.end(),s.prompt_tokens.begin())||
++           (!prefill&&(s.witness_outputs<1||s.witness_outputs>=s.manual_outputs))||
++           (prefill&&!sample&&(s.model_tokens_computed+rows)%s.geometry[0].quantum))return RAD_E_STATE;
++        const auto gate=cache_prepare4_->observe();
++        if(gate.first.status<0||gate.epoch!=i+1||gate.ordinal||gate.finished||!gate.active)return RAD_E_STATE;
++        GlmMainStepWitness w;w.epoch=gate.epoch;w.request=e.seq;w.step=batch.step;w.rows=batch.n_tok;
++        w.n_ahead=batch.n_ahead;w.phase=batch.phase;w.context_position=e.ctx_len;w.sample_expected=sample;
++        for(uint32_t row=0;row<rows;++row){const int32_t input=prefill?s.prompt_tokens[s.model_tokens_computed+row]:e.req->output.back();
++            if(input<0||input>=s.result.vocabulary.valid_tokens)return RAD_E_STATE;
++            w.input_tokens[row]=input;}
++        w.input_token=w.input_tokens[0];w.begin_ns=rad_mono_ns();s.step_witness[i]=w;return RAD_OK;
++    }
+     if(i>=s.manual_outputs||i>=glm_main_max_outputs||plan.e.size()!=1||plan.n_tok!=1||plan.n_spec||plan.draft_pass||
+        batch.n_tok!=1||batch.n_seq!=1||batch.n_out!=1||batch.n_spec||batch.draft_pass||
+        batch.phase!=(i?RAD_PHASE_DECODE:RAD_PHASE_PREFILL)||plan.phase!=batch.phase)return RAD_E_STATE;
+@@ -401,18 +444,30 @@
+     const auto gate=cache_prepare4_->observe();
+     if(gate.first.status<0||gate.epoch!=i+1||gate.ordinal||gate.finished||!gate.active)return RAD_E_STATE;
+     GlmMainStepWitness w;w.epoch=gate.epoch;w.request=e.seq;w.step=batch.step;w.rows=batch.n_tok;
+-    w.n_ahead=batch.n_ahead;w.phase=batch.phase;w.context_position=e.ctx_len;w.input_token=input;w.begin_ns=rad_mono_ns();
++    w.n_ahead=batch.n_ahead;w.phase=batch.phase;w.context_position=e.ctx_len;w.input_token=input;w.input_tokens[0]=input;w.sample_expected=true;w.begin_ns=rad_mono_ns();
+     s.step_witness[i]=w;return RAD_OK;
+ }
+ int Engine::glm_main_step_complete(const RadBatch& batch,int32_t sampled){
+     auto& s=*glm_main_;const size_t i=s.step_witness_count;
++    if(s.options.prefill_max_tok==4){
++        if(i>=glm_main_max_steps)return RAD_E_STATE;
++        auto& w=s.step_witness[i];const auto gate=cache_prepare4_->observe();
++        if(w.step!=batch.step||w.phase!=batch.phase||w.epoch!=gate.epoch||gate.epoch!=i+1||w.rows!=batch.n_tok||
++           gate.first.status<0||gate.active||gate.ordinal!=42||gate.finished!=15||cache_prepare4_->active()||
++           batch.n_out!=int64_t(w.sample_expected)||s.model_tokens_computed!=uint32_t(w.context_position))return RAD_E_STATE;
++        if(w.sample_expected){if(sampled<0||sampled>=s.result.vocabulary.valid_tokens||s.witness_outputs>=s.manual_outputs)return RAD_E_STATE;
++            w.sampled_token=sampled;++s.witness_outputs;w.sampler_collect_performed=true;w.model_sampler_collect_complete=true;
++        }else if(sampled!=-1)return RAD_E_STATE;
++        s.model_tokens_computed+=uint32_t(w.rows);w.completed_prepare_gates.fill(42);w.model_complete=true;w.end_ns=rad_mono_ns();
++        ++s.step_witness_count;return RAD_OK;
++    }
+     if(i>=s.manual_outputs||i>=glm_main_max_outputs||sampled<0||sampled>=s.result.vocabulary.valid_tokens)return RAD_E_STATE;
+     auto& w=s.step_witness[i];const auto gate=cache_prepare4_->observe();
+     // complete_frame checked all four finish calls, each after exactly42 gates,
+     // and returned only after actual sampler + final collect completed.
+     if(w.step!=batch.step||w.phase!=batch.phase||w.epoch!=gate.epoch||gate.epoch!=i+1||
+        gate.first.status<0||gate.active||gate.ordinal!=42||gate.finished!=15||cache_prepare4_->active())return RAD_E_STATE;
+-    w.sampled_token=sampled;w.completed_prepare_gates.fill(42);w.model_sampler_collect_complete=true;w.end_ns=rad_mono_ns();
++    w.sampled_token=sampled;w.completed_prepare_gates.fill(42);w.model_sampler_collect_complete=true;w.model_complete=true;w.sampler_collect_performed=true;w.end_ns=rad_mono_ns();
+     ++s.step_witness_count;return RAD_OK;
+ }
+ int GlmMainEngineHarness::one_token(Engine& e,const std::string& prompt,int32_t* token)noexcept {
+@@ -428,12 +483,32 @@
+         if(status<0){if(e.cache_prepare4_)e.cache_prepare4_->fail_stop(-1,status);return status;}
+         // serve has joined every step/rank writer. This also proves actual decode
+         // inputs equal the preceding committed output, without CPU device reads.
+-        if(!s.result.text_complete||s.result.generated_outputs!=tokens.size()||s.step_witness_count!=tokens.size())return RAD_E_STATE;
++        if(!s.result.text_complete||s.result.generated_outputs!=tokens.size())return RAD_E_STATE;
++        if(s.options.prefill_max_tok==4){
++            const size_t prefill=(s.prompt_token_count+3)/4,passes=prefill+tokens.size()-1;
++            if(s.prompt_token_count<1||s.prompt_token_count>glm_main_max_prompt_tokens||s.step_witness_count!=passes||
++               passes>glm_main_max_steps||s.witness_outputs!=tokens.size()||
++               s.model_tokens_computed!=s.prompt_token_count+tokens.size()-1)return RAD_E_STATE;
++            size_t output=0,position=0;
++            for(size_t i=0;i<passes;++i){const auto& w=s.step_witness[i];const bool pf=i<prefill;
++                const auto rows=pf?std::min<size_t>(4,s.prompt_token_count-position):size_t(1);
++                const bool sample=!pf||i+1==prefill;
++                if(!w.model_complete||w.epoch!=i+1||w.context_position!=int32_t(position)||w.rows!=int64_t(rows)||
++                   w.phase!=(pf?RAD_PHASE_PREFILL:RAD_PHASE_DECODE)||w.sample_expected!=sample||
++                   w.sampler_collect_performed!=sample||w.model_sampler_collect_complete!=sample)return RAD_E_STATE;
++                for(size_t row=0;row<rows;++row){const auto input=pf?s.prompt_tokens[position+row]:s.result.generated_tokens[output-1];
++                    if(w.input_tokens[row]!=input)return RAD_E_STATE;}
++                if(sample){if(output>=tokens.size()||w.sampled_token!=s.result.generated_tokens[output])return RAD_E_STATE;++output;}
++                else if(w.sampled_token!=-1)return RAD_E_STATE;
++                position+=rows;
++            }
++            if(output!=tokens.size())return RAD_E_STATE;
++        }else {if(s.step_witness_count!=tokens.size())return RAD_E_STATE;
+         for(size_t i=0;i<tokens.size();++i){const auto& w=s.step_witness[i];
+             if(!w.model_sampler_collect_complete||w.epoch!=i+1||w.context_position!=int32_t(i)||w.rows!=1||
+                w.phase!=(i?RAD_PHASE_DECODE:RAD_PHASE_PREFILL)||w.sampled_token!=s.result.generated_tokens[i]||
+                (i&&w.input_token!=s.result.generated_tokens[i-1]))return RAD_E_STATE;
+-        }
++        }}
+         s.result.steps=s.step_witness;s.result.completed_steps=s.step_witness_count;
+         for(size_t rank=0;rank<4;++rank)s.result.provider_stats[rank]=s.sources[rank]->stats();
+         std::copy_n(s.result.generated_tokens.begin(),tokens.size(),tokens.begin());return RAD_OK;
+@@ -444,8 +519,13 @@
+         RAD_TRY(glm_main_output_admission(int32_t(s.manual_outputs),cfg_.max_ctx));
+         auto request=std::make_unique<Request>();request->id=1;request->max_tokens=int32_t(s.manual_outputs);request->ignore_eos=true;
+         request->sp.temp=0;request->sp.top_k=1;request->sp.seed=1;request->may_speculate=false;
+-        RAD_TRY(vocab_view_->tokenize(s.manual_prompt,&request->prompt));
+-        RAD_TRY(glm_main_one_prompt_admission(request->prompt,s.result.vocabulary.valid_tokens,cfg_.max_ctx));
++        if(s.options.formatted_prompt)RAD_TRY(vocab_view_->tokenize_special(s.manual_prompt,&request->prompt));
++        else RAD_TRY(vocab_view_->tokenize(s.manual_prompt,&request->prompt));
++        if(s.options.prefill_max_tok==4)RAD_TRY(glm_main_prefill_prompt_admission(request->prompt,s.result.vocabulary.valid_tokens,cfg_.max_ctx,int32_t(s.manual_outputs)));
++        else RAD_TRY(glm_main_one_prompt_admission(request->prompt,s.result.vocabulary.valid_tokens,cfg_.max_ctx));
++        s.prompt_token_count=uint32_t(request->prompt.size());s.result.input_tokens=s.prompt_token_count;
++        std::copy(request->prompt.begin(),request->prompt.end(),s.prompt_tokens.begin());
++        s.result.prompt_token_ids=s.prompt_tokens;
+         //32 slots exceed the entire16-token bound even if the consumer sleeps.
+         // Drain while waiting too: the final output never relies on ring overflow.
+         server::Sink sink(32);request->sink=&sink;sink.id=request->id;
+--- Core8/core/engine_glm_main.h
++++ Core9/core/engine_glm_main.h
+@@ -10,7 +10,12 @@
+ namespace rad {
+ int glm_main_one_prompt_admission(std::span<const int32_t>,int64_t vocabulary,int64_t context)noexcept;
+ int glm_main_output_admission(int32_t outputs,int64_t context)noexcept;
++int glm_main_prefill_prompt_admission(std::span<const int32_t>,int64_t vocabulary,int64_t context,int32_t outputs)noexcept;
+ inline constexpr size_t glm_main_max_outputs=16;
++inline constexpr size_t glm_main_max_prompt_tokens=64;
++// R4: at most16 prefill passes+15 decode passes. 80 is a conservative fixed
++// request-local cap, independent of the unchanged16 produced-output bound.
++inline constexpr size_t glm_main_max_steps=80;
+ // Host StepPlan + actual RadBatch metadata only; never dereference device rows.
+ struct GlmMainStepWitness {
+     uint64_t epoch=0,request=0,begin_ns=0,end_ns=0;
+@@ -18,6 +23,8 @@
+     int32_t phase=-1,context_position=-1,input_token=-1,sampled_token=-1;
+     std::array<uint32_t,4> completed_prepare_gates{};
+     bool model_sampler_collect_complete=false;
++    bool model_complete=false,sample_expected=false,sampler_collect_performed=false;
++    std::array<int32_t,4> input_tokens{};
+ };
+ // Pure metadata facts. No payload pointer, source capability or Ready state.
+ struct GlmMainVocabularyFacts {
+@@ -38,7 +45,12 @@
+ struct GlmMainEngineOptions {
+     std::string checkpoint,home,bundle_root,source_proof;
+     uint64_t expected_bundle_id=0;int64_t context=512;
+-    // Exact first functional profile: batch1/seq1/spec0/exact wire/no residents.
++    // Default preserves first one-prompt-token profile. Explicit4 enables normal
++    // bounded prefill; no other capacity is supported by this candidate.
++    uint32_t prefill_max_tok=1;
++    // Explicit caller-rendered prompt only; legacy/raw never parse special text.
++    bool formatted_prompt=false;
++    // Exact seq1/spec0/exact wire/no residents.
+     uint64_t hot_bytes_per_rank=64u<<20;
+     // Exact experiment choices; reads still use the same full-record integrity.
+     uint32_t read_chunk_bytes=64u<<10;
+@@ -63,9 +75,10 @@
+     GlmMainVocabularyAdmission vocabulary;
+     bool source_admitted=false,transport_ready=false,text_complete=false,retired=false;
+     int32_t sampled_token=-1;
+-    uint32_t requested_outputs=1,generated_outputs=0,completed_steps=0;
++    uint32_t requested_outputs=1,generated_outputs=0,completed_steps=0,input_tokens=0,max_tok=1;
+     std::array<int32_t,glm_main_max_outputs> generated_tokens{};
+-    std::array<GlmMainStepWitness,glm_main_max_outputs> steps{};
++    std::array<int32_t,glm_main_max_prompt_tokens> prompt_token_ids{};
++    std::array<GlmMainStepWitness,glm_main_max_steps> steps{};
+     std::array<glm_main_provider::Stats,4> provider_stats{};
+     uint64_t startup_elapsed_ns=0,request_elapsed_ns=0,first_token_ns=0,last_token_ns=0;
+     uint64_t manual_fixed_host_bytes=0;
+@@ -96,7 +109,9 @@
+     std::string manual_prompt;
+     uint32_t manual_outputs=1;
+     // Sole writer is the stepper. Harness consumes only AFTER serve joins it.
+-    std::array<GlmMainStepWitness,glm_main_max_outputs> step_witness{};
++    std::array<GlmMainStepWitness,glm_main_max_steps> step_witness{};
++    std::array<int32_t,glm_main_max_prompt_tokens> prompt_tokens{};
++    uint32_t prompt_token_count=0,witness_outputs=0,model_tokens_computed=0;
+     uint32_t step_witness_count=0;
+     bool attempted=false,retiring=false,async_started=false,manual_requested=false;
+     bool registry_owned=false,process_lease=false;
+--- Core8/core/place/mover.cpp
++++ Core9/core/place/mover.cpp
+@@ -1,3 +1,4 @@
++#include "../build/glm_main_profile_limits.h"
+ /* mover.cpp -- the mover's mechanics; mover.h has the design.
+  *
+  * Everything here runs on the dispatch thread. Transfers run asynchronously on the mover's
+@@ -121,7 +122,7 @@
+ int Mover::glm_main_startup_quote(const Program& p,const Plan& plan,
+                               TinyStorageQuote* out) noexcept {
+     if(!out)return RAD_E_INVAL;
+-    if(glm_main_tp4_cache_program_profile(p)<0||p.ctx.max_tok!=1||!plan.native_inventory||
++    if(glm_main_tp4_cache_program_profile(p)<0||!glm_main_rows_supported(p.ctx.max_tok)||!plan.native_inventory||
+        plan.strategy!=Strategy::NativeBacked||plan.dynamic||plan.units.empty()||plan.units.size()>65536||
+        plan.classes.size()>65536||plan.file_stage_vram||plan.file_windows||
+        plan.native_inventory->validate(p,plan)<0)return RAD_E_UNSUPPORTED;
+--- Core8/core/place/native_backing_owner.cpp
++++ Core9/core/place/native_backing_owner.cpp
+@@ -1,3 +1,4 @@
++#include "../build/glm_main_profile_limits.h"
+ #include "native_backing_owner.h"
+ #include "runtime/ctx.h"
+ #include "runtime/cache_prepare4_session.h"
+@@ -46,7 +47,7 @@
+ }
+ int NativeBackingOwner::glm_main_startup_quote(const Program& program,const Plan& plan,TinyOwnerQuote* out) noexcept {
+     if(!out)return RAD_E_INVAL;
+-    if(glm_main_tp4_cache_program_profile(program)<0||program.ctx.max_tok!=1||!plan.native_inventory||plan.native_inventory->program()!=&program)return RAD_E_UNSUPPORTED;
++    if(glm_main_tp4_cache_program_profile(program)<0||!glm_main_rows_supported(program.ctx.max_tok)||!plan.native_inventory||plan.native_inventory->program()!=&program)return RAD_E_UNSUPPORTED;
+     try {
+         const auto& inv=*plan.native_inventory;const int valid=inv.validate(program,plan);if(valid<0)return valid;
+         TinyOwnerQuote q;q.sizeof_owner=sizeof(NativeBackingOwner);q.sizeof_impl=sizeof(Impl);q.sizeof_weight_slot=sizeof(WeightSlot);q.sizeof_publication=sizeof(RecordPublication);q.sizeof_lease=sizeof(NativeRecordLease);
+--- Core8/core/runtime/ctx.cpp
++++ Core9/core/runtime/ctx.cpp
+@@ -1,3 +1,4 @@
++#include "../build/glm_main_profile_limits.h"
+ /* ctx.cpp -- the run phase outside the hot path: arena and plan bring-up, the step driver, the
+  * routing handoff and opt-in per-op timing. The hot path is issue.cpp.
+  */
+@@ -145,7 +146,7 @@
+     const auto& p=*d.program;
+     constexpr uint64_t arena_cap=uint64_t(2)<<30;
+     constexpr uint64_t max_weights=100000,max_buffers=100000,max_ops=50000,max_bands=100000,max_entries=1000000;
+-    if(glm_main_tp4_cache_program_profile(p)<0||p.ctx.max_tok!=1||p.ctx.max_ctx<=0||p.ctx.max_ctx>2048||
++    if(glm_main_tp4_cache_program_profile(p)<0||!glm_main_rows_supported(p.ctx.max_tok)||p.ctx.max_ctx<=0||p.ctx.max_ctx>2048||
+        d.rank!=p.ctx.rank||d.world_size!=4||d.device<0||d.profile_ops||d.record_passes||d.tiny_retirement||
+        p.weights.empty()||p.weights.size()>max_weights||p.buffers.empty()||p.buffers.size()>max_buffers||
+        p.ops.empty()||p.ops.size()>max_ops||p.kv_groups.empty()||p.kv_groups.size()>128||
+@@ -283,7 +284,7 @@
+     if(!tiny_quote::heap(s,45,sizeof(RouteSlot))||!tiny_quote::pinned(s,q.route_bank)||!tiny_quote::device(s,q.route_device))return RAD_E_SHAPE;
+     s.event_count=kRouteBanks;
+     const auto& limits=d.expert_prepare_limits;
+-    if(limits.max_rows!=1||limits.max_experts!=288||limits.max_top_k!=8||limits.max_maps<42||limits.max_maps>256||
++    if(limits.max_rows!=p.ctx.max_tok||limits.max_experts!=288||limits.max_top_k!=8||limits.max_maps<42||limits.max_maps>256||
+        limits.max_entries<12096||limits.max_entries>65536||!limits.max_readback_bytes||limits.max_readback_bytes>(16u<<20)||
+        !limits.max_metadata_bytes||limits.max_metadata_bytes>(32u<<20))return RAD_E_UNSUPPORTED;
+     q.prepare_maps=p.expert_route_maps.size();
+@@ -292,7 +293,7 @@
+         const auto& decl=map.decl;
+         q.prepare_bank=std::max(q.prepare_bank,uint64_t(2*decl.local_experts+1+2*decl.max_rows*decl.top_k)*sizeof(int32_t));
+     }
+-    q.prepare_seen=8;
++    q.prepare_seen=uint64_t(p.ctx.max_tok)*8;
+     const uint64_t prepare_metadata=q.prepare_entries*sizeof(RadExpertRouteEntry)+q.prepare_seen+q.prepare_maps*sizeof(ExpertRouteMap);
+     if(q.prepare_bank>limits.max_readback_bytes||prepare_metadata>limits.max_metadata_bytes)return RAD_E_SCRATCH;
+     if(!tiny_quote::heap(s,1,sizeof(ExpertPrepareState))||!tiny_quote::heap(s,q.prepare_maps,sizeof(ExpertRouteMap))||
+--- Core8/core/sched/batch.cpp
++++ Core9/core/sched/batch.cpp
+@@ -1,3 +1,4 @@
++#include "../build/glm_main_profile_limits.h"
+ /* batch.cpp -- builds the step batch once per step. See batch.h.
+  */
+ #include "batch.h"
+@@ -365,7 +366,7 @@
+ int BatchBuilder::glm_main_staging_quote(Program& p,const Config& c,const KVGeom& kg,
+                                          uint64_t* device,uint64_t* pinned,uint64_t* events){
+     if(!device||!pinned||!events)return RAD_E_INVAL;
+-    if(glm_main_tp4_cache_program_profile(p)<0||c.tp!=4||c.max_tok!=1||c.max_seqs!=1||c.n_spec||
++    if(glm_main_tp4_cache_program_profile(p)<0||c.tp!=4||!glm_main_rows_supported(c.max_tok)||c.max_tok!=p.ctx.max_tok||c.max_seqs!=1||c.n_spec||
+        c.max_ctx<1||c.max_ctx>512||p.encoder.modalities||p.audio_encoder.modalities)return RAD_E_UNSUPPORTED;
+     BatchBuilder b;b.prog_=&p;b.cfg_=c;b.kvgeom_=kg;
+     RAD_TRY(b.layout(p,c));b.size_set(b.set_,p.kv_groups);
+--- Core8/core/sched/geometry.cpp
++++ Core9/core/sched/geometry.cpp
+@@ -215,4 +215,20 @@
+     *out=std::move(actual);return RAD_OK;
+ }
+ 
++int glm_main_prefill4_geometry_resolve(const Program& p,const Config& c,ChunkGeometry* out) {
++    if(!out)return RAD_E_INVAL;
++    if(glm_main_tp4_cache_program_profile(p)<0||p.ctx.max_tok!=4||c.tp!=4||c.max_tok!=4||
++       c.max_seqs!=1||c.n_spec||c.max_ctx!=512||p.ctx.max_ctx!=512||c.prefix_cache||
++       c.prefix_cache_mib||c.checkpoint_slots||c.checkpoint_interval||c.prefill_span!=1||
++       !c.deterministic||!c.tp_wire_exact)return RAD_E_UNSUPPORTED;
++    ChunkGeometry actual;
++    const int status=resolve_geometry(p,c,&actual,false);
++    if(status<0)return status;
++    // Closed to the actual parent-observed grid; a newly selected kernel with a
++    // different legal geometry is a new profile review, never guessed padding.
++    if(actual.quantum!=4||actual.attn_block!=4||actual.state_chunk!=1||
++       actual.checkpoint_interval||actual.span!=1||actual.shared_tok!=4)return RAD_E_UNSUPPORTED;
++    *out=std::move(actual);return RAD_OK;
++}
++
+ }  /* namespace rad */
+--- Core8/core/sched/geometry.h
++++ Core9/core/sched/geometry.h
+@@ -79,5 +79,7 @@
+ // Keeps actual quantum/minimum; permits ONLY Engine's final one-token prompt.
+ // Ordinary resolver and Scheduler nonfinal clamps are unchanged.
+ int glm_main_final_token_geometry_resolve(const Program&,const Config&,ChunkGeometry*);
++// Explicit four-row profile uses the ORIGINAL ordinary minimum and chunk law.
++int glm_main_prefill4_geometry_resolve(const Program&,const Config&,ChunkGeometry*);
+ 
+ }  /* namespace rad */

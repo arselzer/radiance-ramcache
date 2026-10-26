@@ -1,0 +1,32 @@
+--- Fixture13/prefill_metadata.cpp
++++ Fixture14/prefill_metadata.cpp
+@@ -393,7 +393,8 @@
+         l.max_metadata_bytes=256u<<20;l.max_records=12096;l.max_batch=32;l.max_shards=42;l.max_segments=42;
+         l.max_payload_fds=2;l.max_rank_fd_credits=12;l.max_live_records=12096;l.max_live_leases=64;l.io_chunk_bytes=65536;
+         std::shared_ptr<data::GlmMainNativeSource> source;std::string error;
+-        good(data::GlmMainNativeSource::open(budget,ranks[rank],l,&source,&error),"actual source open union32: "+error);good(source->finish_bootstrap(),"actual setup-only source audit");
++        const int source_opened=data::GlmMainNativeSource::open(budget,ranks[rank],l,&source,&error);
++        good(source_opened,"actual source open union32: "+error);good(source->finish_bootstrap(),"actual setup-only source audit");
+         std::array<uint32_t,33> ids{};for(size_t i=0;i<ids.size();++i)ids[i]=uint32_t(i);
+         NativeRecordBatch batch;good(source->acquire({ids.data(),32},&batch),"entire actual32-record union acquired");
+         checked(batch.leases.size()==32,"all32 leases delivered");
+@@ -406,7 +407,8 @@
+         checked(batch.leases[31].bytes.size()==3342336&&rad::glm_main_native_store::checksum(batch.leases[31].bytes)==ranks[rank]->descriptors()[31].checksum,"held bytes survive source close");
+         batch.leases.clear();checked(budget->usage().rank_owners==0,"all real lease/token ownership released");
+         l.cold_bytes=106954751;
+-        good(data::GlmMainNativeSource::open(budget,ranks[rank],l,&source,&error),"cold-minus-one setup, not a native runtime admission");good(source->finish_bootstrap(),"cold-minus-one setup audit");
++        error.clear();const int budget_source_opened=data::GlmMainNativeSource::open(budget,ranks[rank],l,&source,&error);
++        good(budget_source_opened,"cold-minus-one setup, not a native runtime admission: "+error);good(source->finish_bootstrap(),"cold-minus-one setup audit");
+         const auto no_reads=payload_reads.load();NativeRecordBatch unchanged;
+         checked(source->acquire({ids.data(),32},&unchanged)==RAD_E_SCRATCH&&unchanged.leases.empty()&&payload_reads.load()==no_reads,"whole cold32-minus-one refusal BEFORE any record I/O/publication");++component_refusals;
+         good(source->close(),"budget-refused source close");source.reset();
+@@ -442,7 +444,8 @@
+     for(int rank=0;rank<4;++rank){auto& p=graphs->programs[size_t(rank)];auto plan=metadata_plan(p,rank);
+         rad::glm_main_metadata::Quote q;rad::glm_main_metadata::Limits l;std::string why;
+         const auto allocations=backend_allocations.load(),reads=payload_reads.load();
+-        good(rad::glm_main_metadata::quote(*graphs->checkpoint,*graphs->sources,p,plan,{},l,&q,&why),"ALL actual normal4 native member layouts: "+why);
++        const int quoted=rad::glm_main_metadata::quote(*graphs->checkpoint,*graphs->sources,p,plan,{},l,&q,&why);
++        good(quoted,"ALL actual normal4 native member layouts: "+why);
+         checked(q.records.size()==12096&&q.stored_bytes==40428896256ull,"complete normal4 canonical rank layout");
+         checked(backend_allocations.load()==allocations&&payload_reads.load()==reads,"layout quote no backend/payload side effect");
+         Config gc=config(512,4);gc.checkpoint_interval=0;gc.prefill_span=1;ChunkGeometry g;good(glm_main_prefill4_geometry_resolve(p,gc,&g),"normal4 actual graph geometry");

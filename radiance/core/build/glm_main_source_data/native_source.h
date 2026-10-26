@@ -41,6 +41,7 @@ private:
     std::vector<sc::BoundRecord> handles_;
     std::shared_ptr<Quota> quota_;
     mutable std::mutex operation_;
+    size_t request_limit_=0;
     bool bootstrap_done_=false,closed_=false;
 };
 int native_status(sc::Error)noexcept;

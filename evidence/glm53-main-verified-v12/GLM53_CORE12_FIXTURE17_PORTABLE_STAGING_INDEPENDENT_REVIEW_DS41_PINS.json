@@ -1,0 +1,36 @@
+{
+  "Core12_files_exact": 1536,
+  "Fixture17_files_exact": 126,
+  "final_publication_metadata_closure": "pending scope correction and actual outcome evidence",
+  "first14_command_ASTs_exact": true,
+  "manifest_files_checked": 3715,
+  "new_files_no_binary_or_payload_extensions": 152,
+  "no_target_imports_or_execution": true,
+  "old_files_reconstructible": 22,
+  "previous_evidence_provenance_exact": 893,
+  "public_or_frozen_source_writes": false,
+  "public_worktree": "/home/as/radiance-ramcache-glm-v12-flight",
+  "reviewed_ROOT_files_sha256": {
+    "GLM53_CORE12_FIXTURE17_PORTABLE_STAGING_INDEPENDENT_REVIEW_DS41.txt": "719c9bfbd849c5ab909bc68d98b1cce18b063de1f7e9d38855e248f8e5c611d2",
+    "glm53-core12-fixture17-publication-candidate-20261026/COPY_MAP.json": "e794b733584de1431c9af5306a080134518be04927e8a42180053dd26a56ca55",
+    "glm53-core12-fixture17-publication-candidate-20261026/PRESERVE_BASE_EVIDENCE_AND_PROVENANCE.json": "0a3714d0936c8b2d06e64befd9ec3f80a1f0e59b8868e840b528a81e4dfacc38",
+    "glm53-core12-fixture17-publication-candidate-20261026/PUBLIC8_TO_CORE12_CANDIDATE.diff": "c36c8faa81c5a59516fbcfc75d3a7387c218083451ce5b396b057ff0d8743c38",
+    "glm53-core12-fixture17-publication-candidate-20261026/SOURCE_RECEIPT.json": "f899eb2fc7bf417c35975479e06a58b6ec35533e8d4e784696d3294b3841dcdb",
+    "glm53-main-verified-source-engine-v17-prototype/CORE_SOURCE_PINS.json": "c5c474c9ab5e8e96bd939069ee646937f99b9237d6cc1933bd5b8b69316eaf2a",
+    "glm53-main-verified-source-engine-v17-prototype/SOURCE_RECEIPT.json": "82665d51cccdb3bd55e16b4fa62282414737a2ae11dcd7db0f2024592f6c48b2"
+  },
+  "reviewed_public_files_sha256": {
+    "README.md": "1235a523ada2df9232848706961d0d6a4aad340192cdcbe5acfc13c400314216",
+    "SNAPSHOT_MANIFEST.json": "b9bb3cbeb4db7296da690f6fb670ed7ea4e65648f3204e4014d02bca8ca2aef2",
+    "STATUS.md": "4f4416539019661604ca856968bfd57b4058a9a83468b4ba683eb3f42476aa0e",
+    "docs/provenance/core8-before-core12/SNAPSHOT_MANIFEST.json": "90e172eaa500e14b5193d6188507e6c906d8d5c9efa64e3c1f976b6eb091185f",
+    "research/portable/CMakeLists.txt": "715ef4ffc0c09a697f5d2ffb2133ce10af308fd6eae9bd14d38d271106b4d28f",
+    "research/portable/README.txt": "bd916b3140758e789a2a0aef2d9ef53f174247d5d10eb2be664fa02b6fe62f9c",
+    "tools/build_host.py": "3342b0dbdff34d59ceef3b8c89081cbf2b0e86ee748c9cd951eb8788a7e407ed",
+    "tools/verify_snapshot.py": "015c5b9e1d2e549ccd2f561619ff576fe101ad1821f9e8606c73ede5da8315f7"
+  },
+  "schema": "glm53-core12-fixture17-portable-staging-source-review-v1",
+  "source_disposition": "no scoped source-copy/ABI/privacy blocker",
+  "source_only": true,
+  "unchanged_verifier_guard_functions_byte_exact": 10
+}

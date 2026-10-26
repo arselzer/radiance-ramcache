@@ -1,0 +1,23 @@
+Parent-only, not run by author:
+
+Use build_glm53_main_verified_engine_v12.py strict Core12/Fixture16; rebuild WHOLE
+HOST/AQL Core and plugins, then existing20 and focused old4+newHOST lifecycle.
+Exact target: glm53_main_declaration_context_check --run-host-declaration-context
+Actual target: glm53_main_declaration_metadata --run-actual-declaration \
+  ABS_MODEL ABS_EXCLUSIVE_CORE12_HOME ABS_COMPLETE_BUNDLE ABS_PROOF TRUSTED_ID
+
+Actual JSON schema glm53-actual-same-engine-declaration-context-v1. Require
+passedtrue/status0/requested_max_tok4/declared_ranks4; program_max_tok and
+route_max_rows all4; route_maps all42; actual_quantum/attention_block all4,
+state_chunk all1; model_pool_bytes all0; Registryinstances/VMem beforeafter0;
+source/Session/provider/Owner/streams/context absent; rad DEVICEalloc/stream/event/
+copy/clear call counts0; engine_retiredtrue and repeat_start_status<0.
+Report Sampler pinned call/request bytes honestly, excluding opaque driver costs.
+Run with parent locks/idle/resource/process/deadline ownership; no automatic stop.
+This declaration result grants no full-source/Ready/model capability and cannot
+substitute full verification, quotes, normal source binding, fit or model checks.
+
+The exact old manual command --prefill4-formatted ... remains unchanged but must
+link this new whole Core12 and use strict new receipts. Parent authors Runner12
+proof mapping and owns all maintenance/restore actions. No model child is executed
+or authorized by this source file. Preserve failed9 evidence and all source pins.

@@ -1,0 +1,88 @@
+Core12 / Fixture17 FINAL publication delta: independent source-only review
+
+Disposition: no scoped final-delta blocker found at manifest
+19e37df4cc98f8f05f839c08870f2a7907b19f00456305534a6100624479a85f.
+
+Scope: final metadata/evidence delta in /home/as/radiance-ramcache-glm-v12-flight,
+compared with the exact archived tested b9bb3cbeb4db7296da690f6fb670ed7ea4e65648f3204e4014d02bca8ca2aef2.
+I inspected/hash-checked source and recorded evidence only. No imports, exported
+verifier/checker execution, tests, compilation, numerical/model/GPU/Docker/service
+operations, Git commands or public/frozen writes occurred. Only this new review
+and its pins were written in ROOT. Parent owns any publication action.
+
+Exact tested-code preservation and history
+
+All3823 final manifest files match the closed regular/nonsymlink inventory,
+excluding root .git/build and the manifest itself. There are108 additions,
+no removals, and EXACTLY THREE changed tested files: root README.md, STATUS.md
+and research/portable/README.txt. The other3712 tested files, including ALL
+Core/checker/wrapper code, retain their tested hashes. Full1536-file Core12
+matches map c5c474c9; all126 Fixture17 files match receipt82665d51. Both also
+match tested b9bb. No Core13, Fixture19 implementation or actual-expert numerical
+candidate is introduced by this delta.
+
+All101 evidence-copy-map entries match their ROOT original receipts/logs/reviews
+byte-for-byte. The other7 additions are the generated validation summary, two
+final provenance records and four files preserving the tested manifest plus its
+three overwritten docs. Archived docs reproduce their exact b9bb hashes. All893
+prior evidence/provenance checklist files are unchanged. The old Core8 manifest
+and22 overwritten files reconstruct all3563 preceding mapped files together
+with unchanged current files. Earlier successes/failures remain historical.
+
+Authorship exclusion
+
+I authored tools/build_host.py, tools/verify_snapshot.py and portable CMake.
+I DO NOT independently approve their semantics here. I verified ONLY unchanged
+hash linkage through b9bb, final19e37, actual public receipt wrapper hashes and
+DS's separate staging review719c9bfbd849c5ab909bc68d98b1cce18b063de1f7e9d38855e248f8e5c611d2
+with pins59ec63bb3ea820c286f5cf4c597fc8534253e5ca078f0041329752766cf5f6c2.
+This review likewise does not reapprove existing Core or checker math.
+
+Recorded results and honest limits
+
+Public build055441/checks061330 record passed=true/returncode0 against exact
+b9bb source and identical portable-code hashes. Build requests a fresh Core;
+checks reuse THAT fresh public Core with identical recorded artifacts. Its
+log contains2 CMake RUNs plus16 checker RUNs and the final16-HOST-program PASS.
+This is recorded parent runtime evidence, not execution by this reviewer.
+Private Release/ASan-UBSan/TSan each retain20 successful commands plus5 focused
+commands; all copied log hashes match. Actual declaration, metadata and complete
+prewalk result/log hashes match their successful separately scoped receipts.
+
+The actual formatted23/o16 window STILL FAILED: exit88, four Mover setup lines,
+no final result JSON. Original ROOT window contains only its receipt and2339B
+combined log. That log cannot distinguish late startup from the first model
+step. Current docs/summary make no normal-output, quality, throughput,262K or
+GPU-model-PASS claim from HOST/declaration/prewalk or earlier Core8 raw outputs.
+
+The original strict restoration receipt remains failed, preserving
+23.585317816003226/40 stable seconds within the900-second deadline. Separately,
+v3 at055319 records the SAME full Id/Image/Name, SAME restored StartedAt,
+RestartCount0, health before/after, and a four-token tiny completion taking
+0.06316812301520258s. Independent recovery does not rewrite the failed strict
+restoration or imply an extra restart. I made no new live-service health probe.
+
+STATUS explicitly discloses the stale Core8 scope text in tested b9bb as
+historical metadata; its actual mapped source is independently exact Core12.
+Current manifest.scope/source_checkpoint correctly select Core12/Fixture17.
+The evidence/docs-only final delta does not pretend public16 was rerun after
+those metadata additions. Original failed outcomes remain visibly false.
+
+Privacy qualification
+
+The108 additions contain evidence/docs/provenance, no new model/native-store/
+tokenizer payload or compiled artifact, and no identified private serving
+configuration or Docker Env/HostConfig/Mounts dump. No compiled ELF/ar/Mach-O
+signature occurred among mapped files. Narrow private-key/AWS/GitHub/Bearer
+patterns on every addition had no findings. This is a scoped inspection, not
+a universal secret-detection guarantee. Local paths/hashes are provenance.
+
+The manifest's short no-payload/binaries phrase must not be read as claiming
+stock source contains no binary fixtures: qwen4exp-control-vector.gguf483520B
+and uocr_resample_golden.bin9573220B are upstream assets already present in
+Core8, byte-exact through tested12/final12. Neither is new in this delta. No
+research binary, downloaded checkpoint, native-store payload or private serving
+configuration was added.
+
+No remaining scoped blocker. This covers frozen final source and recorded
+outcomes, not deployment/readiness, future changes or Git/push mechanics.

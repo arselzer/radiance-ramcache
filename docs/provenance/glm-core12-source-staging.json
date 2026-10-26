@@ -1,0 +1,39 @@
+{
+  "schema": "glm53-core12-source-export-staging-v1",
+  "utc": "2026-10-26T05:27:28.327992+00:00",
+  "passed": true,
+  "base_commit": "8d5c16b72cbf6488a583ec8e666e0e39b5b20ba0",
+  "base_manifest_sha256": "90e172eaa500e14b5193d6188507e6c906d8d5c9efa64e3c1f976b6eb091185f",
+  "Core_files": 1536,
+  "fixture17_files": 126,
+  "exactCore_map_sha256": "c5c474c9ab5e8e96bd939069ee646937f99b9237d6cc1933bd5b8b69316eaf2a",
+  "candidate_source_receipt_sha256": "f899eb2fc7bf417c35975479e06a58b6ec35533e8d4e784696d3294b3841dcdb",
+  "overwritten_archived": [
+    "radiance/core/build/glm_main_ordinary_loader.cpp",
+    "radiance/core/build/glm_main_source_data/COMPOSITION.json",
+    "radiance/core/build/glm_main_source_data/main_bundle_reader.cpp",
+    "radiance/core/build/glm_main_source_data/native_source.cpp",
+    "radiance/core/build/glm_main_source_data/native_source.h",
+    "radiance/core/build/glm_main_source_data/storage/rank_native_store.cpp",
+    "radiance/core/engine.cpp",
+    "radiance/core/engine.h",
+    "radiance/core/engine_glm_main.cpp",
+    "radiance/core/engine_glm_main.h",
+    "radiance/core/place/mover.cpp",
+    "radiance/core/place/native_backing_owner.cpp",
+    "radiance/core/runtime/ctx.cpp",
+    "radiance/core/sched/batch.cpp",
+    "radiance/core/sched/geometry.cpp",
+    "radiance/core/sched/geometry.h",
+    "research/portable/CMakeLists.txt",
+    "research/portable/README.txt",
+    "tools/build_host.py",
+    "tools/verify_snapshot.py"
+  ],
+  "added_Core_paths": [
+    "radiance/core/build/glm_main_profile_limits.h"
+  ],
+  "public_build_or_runtime_performed": false,
+  "model_result_pending": true,
+  "Core8_evidence_and_provenance_preserved": true
+}

@@ -1,0 +1,32 @@
+{
+  "schema": "glm53-core12-public16-and-failed-r4-model-evidence-v1",
+  "utc": "2026-10-26T06:29:04.529949+00:00",
+  "source_Core": "v12",
+  "source_fixture": "v17",
+  "Core_files": 1536,
+  "Core_map_sha256": "c5c474c9ab5e8e96bd939069ee646937f99b9237d6cc1933bd5b8b69316eaf2a",
+  "tested_public_manifest_sha256": "b9bb3cbeb4db7296da690f6fb670ed7ea4e65648f3204e4014d02bca8ca2aef2",
+  "tested_public_files": 3715,
+  "fresh_public_Release_Core_and_all16_checks_passed": true,
+  "private_all3_full20_and_focused5_passed": true,
+  "all4_actual_declaration_metadata_complete_prewalk_passed": true,
+  "actual_R4_model_passed": false,
+  "actual_model_window": "glm53-manual-window-core-v12-runner-v12-fixture-v17-formatted23-o16-20261026T051813Z",
+  "actual_model_exit_code": 88,
+  "actual_model_final_JSON_present": false,
+  "generated_tokens_or_normal_chat_quality_verified": false,
+  "strict_window_restoration_deadline_passed": false,
+  "strict_restore_stable_seconds_observed": 23.585317816003226,
+  "strict_restore_stable_seconds_required": 40,
+  "original_same_container_independent_recovery_passed": true,
+  "independent_recovery_file": "server-check-after-window-v3-20261026T055319Z.json",
+  "independent_recovery_completion_seconds": 0.06316812301520258,
+  "persistent_GLM_deployment": false,
+  "driver_reset_or_hardware_changes": false,
+  "limits": [
+    "FourMover setup lines do not distinguish late startup from first model step",
+    "No normal chat/quality/performance/262K-runtime claim",
+    "Source19 diagnostics and cacheCore13 are separate unpublished work",
+    "Final publication delta must contain only evidence/docs/manifest metadata relative to exact tested3715-file source checkpoint"
+  ]
+}

@@ -1,0 +1,120 @@
+{
+  "schema": "glm53-actual-declaration-component-run-v1",
+  "passed": true,
+  "build_receipt": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/build-glm53-main-verified-engine-v12-aql-release-evidence-20261026T041547Z/receipt.json",
+  "build_receipt_sha256": "99e39b3d907ec01419d515b5804aac2647ce7b4ffb7b4daf1d26b233cba11c1e",
+  "core_build_receipt": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/build-glm53-main-verified-engine-v12-aql-release-evidence-20261026T041547Z/receipt.json",
+  "core_build_receipt_sha256": "99e39b3d907ec01419d515b5804aac2647ce7b4ffb7b4daf1d26b233cba11c1e",
+  "home_receipt": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-manual-preparation-v12-core-v12-fixture-v17-20261026T044600Z/home-receipt.json",
+  "home_receipt_sha256": "c17d61c6ca7ce02c9db7bb542e2753e049007031f636d4263c779b10c8ed8d36",
+  "assembly_receipt_sha256": "7efe866461dfe9921ce12cfa7b676297f1581e3b9ec15b74cff64878e7ab12a4",
+  "binary": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/build-glm53-main-verified-engine-checks-v12-aql-release-fixture-v17-20261026T041547Z/glm53_main_declaration_metadata",
+  "binary_sha256": "96f903c6171dd05b5f50ff2ea0a4698333dc7e13f6195259935c7d9b60463c99",
+  "parent_wrapper_sha256": "4614cba31d3c0cf03b80958168d7e106440b68e35e5a923e1867f6c61bc25c72",
+  "ownership_wrapper_sha256": "3f4781852a0a5cbe70e2ef6664d3ac715eb4f1066a6c3c632a657c6b54396979",
+  "GPU_model_execution": false,
+  "source_factory_or_model_execution": false,
+  "production_changes": false,
+  "scope": "Actual same-Engine all4-rank declaration only; all4 AQL/HIP devices/plugins and bounded Sampler pinned resources may initialize; not zero opaque GPU activity/RSS, SourceReady, Reader/full prewalk or model inference.",
+  "command": [
+    "nice",
+    "-n19",
+    "/usr/bin/ionice",
+    "-c",
+    "3",
+    "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/build-glm53-main-verified-engine-checks-v12-aql-release-fixture-v17-20261026T041547Z/glm53_main_declaration_metadata",
+    "--run-actual-declaration",
+    "/home/as/models/hf/amd/GLM-5.3-Flash-Quark-MXFP4",
+    "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-manual-preparation-v12-core-v12-fixture-v17-20261026T044600Z/exclusive-home",
+    "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-full-main-store-20261025T175438Z/private-complete-store/data",
+    "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-complete-source-proof-20261025T172943Z/complete-source-proof.json",
+    "7279810219167007678"
+  ],
+  "MemAvailable_before": 12518514688,
+  "health_before_metadata": {
+    "status": "ok",
+    "model": "qwen-vllm",
+    "in_flight": 0,
+    "queue_cap": 64
+  },
+  "returncode": 0,
+  "result_file": "/home/as/radiance-setup/research/deepseek-v41-1017-20261024/validation-glm53-actual-declaration-v12-f17-20261026T045724Z/result.json",
+  "result_sha256": "b44b6f1d47f9bbcceb512656de2ddf2f188c0c69f0e0c118b37c4f142a912f87",
+  "result": {
+    "schema": "glm53-actual-same-engine-declaration-context-v1",
+    "passed": true,
+    "status": 0,
+    "requested_max_tok": 4,
+    "declared_ranks": 4,
+    "program_max_tok": [
+      4,
+      4,
+      4,
+      4
+    ],
+    "route_max_rows": [
+      4,
+      4,
+      4,
+      4
+    ],
+    "route_maps": [
+      42,
+      42,
+      42,
+      42
+    ],
+    "actual_quantum": [
+      4,
+      4,
+      4,
+      4
+    ],
+    "actual_attention_block": [
+      4,
+      4,
+      4,
+      4
+    ],
+    "actual_state_chunk": [
+      1,
+      1,
+      1,
+      1
+    ],
+    "model_pool_bytes": [
+      0,
+      0,
+      0,
+      0
+    ],
+    "registry_instances": 0,
+    "vmem_committed_before": 0,
+    "vmem_committed_after": 0,
+    "source_admitted": false,
+    "native_bytes_verified": 0,
+    "raw_mapped_bytes_compared": 0,
+    "session_present": false,
+    "provider_present": false,
+    "native_owner_present": false,
+    "application_stream_present": false,
+    "context_initialized": false,
+    "rad_DEVICE_allocation_calls": 0,
+    "rad_stream_create_calls": 0,
+    "rad_event_create_calls": 0,
+    "rad_async_copy_calls": 0,
+    "rad_async_clear_calls": 0,
+    "sampler_pinned_allocation_calls": 35,
+    "sampler_pinned_requested_bytes": 89760,
+    "engine_retired": true,
+    "repeat_start_status": -16,
+    "failed_phase": 0,
+    "GPU_model_execution": false,
+    "full_source_factory_called": false,
+    "scope": "same production Engine declaration prefix/actual all4 Program and geometry witnesses, closed before publication; AQL/HIP/driver/plugins and Sampler pinned resources may exist; rad API wrappers exclude opaque driver/vendor activity, not a zero-GPU-activity or RSS claim"
+  },
+  "evidence_sha256": {
+    "result.json": "b44b6f1d47f9bbcceb512656de2ddf2f188c0c69f0e0c118b37c4f142a912f87",
+    "check.log": "b00c9ba7b9c1542f287e245c34385dc308aa4a3b605183b446d20b0fee16a38e"
+  }
+}

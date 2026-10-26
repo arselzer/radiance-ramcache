@@ -1,3 +1,4 @@
+#include "../build/glm_main_profile_limits.h"
 #include "native_backing_owner.h"
 #include "runtime/ctx.h"
 #include "runtime/cache_prepare4_session.h"
@@ -46,7 +47,7 @@ int NativeBackingOwner::tiny_startup_quote(const Program& program,const Plan& pl
 }
 int NativeBackingOwner::glm_main_startup_quote(const Program& program,const Plan& plan,TinyOwnerQuote* out) noexcept {
     if(!out)return RAD_E_INVAL;
-    if(glm_main_tp4_cache_program_profile(program)<0||program.ctx.max_tok!=1||!plan.native_inventory||plan.native_inventory->program()!=&program)return RAD_E_UNSUPPORTED;
+    if(glm_main_tp4_cache_program_profile(program)<0||!glm_main_rows_supported(program.ctx.max_tok)||!plan.native_inventory||plan.native_inventory->program()!=&program)return RAD_E_UNSUPPORTED;
     try {
         const auto& inv=*plan.native_inventory;const int valid=inv.validate(program,plan);if(valid<0)return valid;
         TinyOwnerQuote q;q.sizeof_owner=sizeof(NativeBackingOwner);q.sizeof_impl=sizeof(Impl);q.sizeof_weight_slot=sizeof(WeightSlot);q.sizeof_publication=sizeof(RecordPublication);q.sizeof_lease=sizeof(NativeRecordLease);

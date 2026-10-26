@@ -1,0 +1,92 @@
+I device: AQL backend, 4 device(s) [0:gfx1201 1:gfx1201 2:gfx1201 3:gfx1201]
+I model: glm5next  arch=glm5next  quant=quark  45 layers  1048576 ctx  (checkpoint, 76108 tensors, served as it stands)
+I tokenizer: chat template from /home/as/models/hf/amd/GLM-5.3-Flash-Quark-MXFP4/chat_template.jinja (10643 bytes)
+I tokenizer: /home/as/models/hf/amd/GLM-5.3-Flash-Quark-MXFP4/tokenizer.json -> 154856 tokens, 321649 merges, 3 chain steps
+I tokenizer:   Split((?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+ behavior=1 invert=0) [dfa: 21 states, 15 classes]
+I tokenizer:   ByteLevel(add_prefix_space=0 use_regex=0)
+I tokenizer:   decode ByteLevel
+I vocab: end-of-generation also on <|user|>=154827 <|observation|>=154829 (named by the checkpoint's generation_config.json)
+I vocab: 154856 tokens, bos=-1 eos=154820
+I gbnf: vocabulary index built in 32 ms, 16.78 MiB
+I quantisation 'quark' is imported weight by weight; 'glm5next_cache' serves it as (unquantised)
+I sampler: 154880-token vocabulary (38720 this rank), 1 rows, 1210 mask words (4.73 KiB per row)
+I sampler: 154880-token vocabulary (38720 this rank), 1 rows, 1210 mask words (4.73 KiB per row)
+I sampler: 154880-token vocabulary (38720 this rank), 1 rows, 1210 mask words (4.73 KiB per row)
+I sampler: 154880-token vocabulary (38720 this rank), 1 rows, 1210 mask words (4.73 KiB per row)
+I chunk geometry: quantum 4 (attn block 4, state chunk 1), checkpoint interval 0, max_tok 4 -> prefill chunks of at most 4
+I chunk geometry: quantum 4 (attn block 4, state chunk 1), checkpoint interval 0, max_tok 4 -> prefill chunks of at most 4
+I chunk geometry: quantum 4 (attn block 4, state chunk 1), checkpoint interval 0, max_tok 4 -> prefill chunks of at most 4
+I chunk geometry: quantum 4 (attn block 4, state chunk 1), checkpoint interval 0, max_tok 4 -> prefill chunks of at most 4
+{
+  "schema": "glm53-actual-same-engine-declaration-context-v1",
+  "passed": true,
+  "status": 0,
+  "requested_max_tok": 4,
+  "declared_ranks": 4,
+  "program_max_tok": [
+    4,
+    4,
+    4,
+    4
+  ],
+  "route_max_rows": [
+    4,
+    4,
+    4,
+    4
+  ],
+  "route_maps": [
+    42,
+    42,
+    42,
+    42
+  ],
+  "actual_quantum": [
+    4,
+    4,
+    4,
+    4
+  ],
+  "actual_attention_block": [
+    4,
+    4,
+    4,
+    4
+  ],
+  "actual_state_chunk": [
+    1,
+    1,
+    1,
+    1
+  ],
+  "model_pool_bytes": [
+    0,
+    0,
+    0,
+    0
+  ],
+  "registry_instances": 0,
+  "vmem_committed_before": 0,
+  "vmem_committed_after": 0,
+  "source_admitted": false,
+  "native_bytes_verified": 0,
+  "raw_mapped_bytes_compared": 0,
+  "session_present": false,
+  "provider_present": false,
+  "native_owner_present": false,
+  "application_stream_present": false,
+  "context_initialized": false,
+  "rad_DEVICE_allocation_calls": 0,
+  "rad_stream_create_calls": 0,
+  "rad_event_create_calls": 0,
+  "rad_async_copy_calls": 0,
+  "rad_async_clear_calls": 0,
+  "sampler_pinned_allocation_calls": 35,
+  "sampler_pinned_requested_bytes": 89760,
+  "engine_retired": true,
+  "repeat_start_status": -16,
+  "failed_phase": 0,
+  "GPU_model_execution": false,
+  "full_source_factory_called": false,
+  "scope": "same production Engine declaration prefix/actual all4 Program and geometry witnesses, closed before publication; AQL/HIP/driver/plugins and Sampler pinned resources may exist; rad API wrappers exclude opaque driver/vendor activity, not a zero-GPU-activity or RSS claim"
+}

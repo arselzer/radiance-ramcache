@@ -121,6 +121,7 @@ private:
     std::unique_ptr<EngineGlmMainState> glm_main_; // outlives Session/ranks/source leases
     int start_glm_main();
     int glm_main_body();
+    int glm_main_metadata_prepare();
     int glm_main_declare();
     int glm_main_vocabulary_admit();
     int glm_main_run_request();

@@ -1,3 +1,4 @@
+#include "../glm_main_profile_limits.h"
 #include "native_source.h"
 #include <algorithm>
 #include <array>
@@ -11,7 +12,7 @@ struct Active {
     Active(){in_main_facade=true;}
     ~Active(){in_main_facade=false;}
 };
-constexpr size_t records=42*288,max_request=8,max_holders=64;
+constexpr size_t records=42*288,max_request=glm_main_max_union,max_holders=64;
 constexpr uint64_t record_bytes=3342336;
 uint64_t sum(uint64_t a,uint64_t b){if(b>UINT64_MAX-a)throw std::bad_alloc();return a+b;}
 uint64_t product(uint64_t a,uint64_t b){if(a&&b>UINT64_MAX/a)throw std::bad_alloc();return a*b;}
@@ -56,10 +57,10 @@ int GlmMainNativeSource::open(std::shared_ptr<sc::ProcessBudget> process,
         explanation(why,"complete-main facade authority/output");return RAD_E_INVAL;
     }
     const auto& p=*authority->program();
-    if(p.ctx.world_size!=4||p.ctx.rank<0||p.ctx.rank>=4||p.ctx.max_tok!=1||p.ctx.max_seqs!=1||p.ctx.max_spec||
+    if(p.ctx.world_size!=4||p.ctx.rank<0||p.ctx.rank>=4||!glm_main_rows_supported(p.ctx.max_tok)||p.ctx.max_seqs!=1||p.ctx.max_spec||
        authority->rank()!=uint32_t(p.ctx.rank)||authority->descriptors().size()!=records||
        authority->owned().size()!=records||authority->units().size()!=records||
-       !limits.max_batch||limits.max_batch>max_request||limits.max_record_bytes<record_bytes){
+       !limits.max_batch||limits.max_batch>size_t(p.ctx.max_tok)*8||limits.max_record_bytes<record_bytes){
         explanation(why,"closed TP4 main/max-token1/max-sequence1/no-spec profile");return RAD_E_INVAL;
     }
     try{
@@ -81,7 +82,7 @@ int GlmMainNativeSource::open(std::shared_ptr<sc::ProcessBudget> process,
         if(opened!=sc::Error::ok)return native_status(opened);
         result->quota_=std::make_shared<Quota>();result->quota_->usage.metadata_reservation=metadata;
         result->quota_->reservation=result->store_->accounting();
-        result->handles_.resize(records);
+        result->request_limit_=limits.max_batch;result->handles_.resize(records);
         const auto bound=result->store_->bind_main_handles(result->handles_);
         if(bound!=sc::Error::ok)return native_status(bound);
         // Quota/control blocks/handle storage all exist before the final
@@ -113,7 +114,7 @@ int GlmMainNativeSource::acquire(std::span<const uint32_t> request,rad::NativeRe
     if(in_main_facade)return RAD_E_STATE;
     Active active;std::lock_guard lock(operation_);
     if(closed_||!bootstrap_done_||!store_)return RAD_E_STATE;
-    if(!out||!request.data()||request.empty()||request.size()>max_request)return RAD_E_INVAL;
+    if(!out||!request.data()||request.empty()||request.size()>request_limit_)return RAD_E_INVAL;
     std::array<uint32_t,max_request> ids{};
     std::array<sc::BoundRecord,max_request> selected{};
     size_t count=0;

@@ -215,4 +215,20 @@ int glm_main_final_token_geometry_resolve(const Program& p,const Config& c,Chunk
     *out=std::move(actual);return RAD_OK;
 }
 
+int glm_main_prefill4_geometry_resolve(const Program& p,const Config& c,ChunkGeometry* out) {
+    if(!out)return RAD_E_INVAL;
+    if(glm_main_tp4_cache_program_profile(p)<0||p.ctx.max_tok!=4||c.tp!=4||c.max_tok!=4||
+       c.max_seqs!=1||c.n_spec||c.max_ctx!=512||p.ctx.max_ctx!=512||c.prefix_cache||
+       c.prefix_cache_mib||c.checkpoint_slots||c.checkpoint_interval||c.prefill_span!=1||
+       !c.deterministic||!c.tp_wire_exact)return RAD_E_UNSUPPORTED;
+    ChunkGeometry actual;
+    const int status=resolve_geometry(p,c,&actual,false);
+    if(status<0)return status;
+    // Closed to the actual parent-observed grid; a newly selected kernel with a
+    // different legal geometry is a new profile review, never guessed padding.
+    if(actual.quantum!=4||actual.attn_block!=4||actual.state_chunk!=1||
+       actual.checkpoint_interval||actual.span!=1||actual.shared_tok!=4)return RAD_E_UNSUPPORTED;
+    *out=std::move(actual);return RAD_OK;
+}
+
 }  /* namespace rad */

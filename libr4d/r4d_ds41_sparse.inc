@@ -78,17 +78,21 @@ SCHEMA("index_topk", pDs41IndexTopk, oDs41IndexTopk,
 
 { "ds41_attn_sparse_sink_d512_bf16", "attn_sparse_sink", "attn",
   "latent attention (key = value) over the window keys and the selected compressed entries, "
-  "per-head sinks; libref's key order and roundings (glibc expf algorithm), so libref's bits",
+  "per-head sinks; libref's key order and roundings (glibc expf algorithm), so libref's bits, "
+  "up to 48 rows; taller passes on WMMA (online softmax, P as bf16 hi + lo), not bit-exact",
   "dim 512, any heads, window <= 1024, topk <= 2048, ratio 0..64; one workgroup a (d half, head "
-  "group of 2/4/8, row), the group picked by row count",
+  "group of 2/4/8, row), the group picked by row count; > 48 rows a (16-head tile, row), four "
+  "waves of 128 latent columns, 16 keys a step (R4D_ATTN_WM_OFF=1: the exact kernel)",
   "bf16 q, caches and out; f32 sinks; i32 tables, positions, selections",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cDs41AttnSparseSink), NOTUNE,
   nullptr, nullptr, r4d_rad_ds41_attn_sparse_sink, nullptr, nullptr, nullptr,
   r4d_shape_attn_sparse_sink },
 { "ds41_index_score_d128_bf16", "index_score", "attn",
-  "indexer score sum_h relu(q_h.k_j) w_h over a paged index cache, libref's roundings and order",
+  "indexer score sum_h relu(q_h.k_j) w_h over a paged index cache, libref's roundings and order "
+  "(> 48 rows: the dot on WMMA, its summation order the only change)",
   "dim 128, any heads, ratio 1..16; a thread an entry (1, 2, 4 or 8 waves an entry group by "
-  "grid size), -inf past (pos+1)/ratio without reading keys",
+  "grid size), -inf past (pos+1)/ratio without reading keys; > 48 rows and <= 32 heads a wave a "
+  "row over 128 entries (R4D_IDX_WM_OFF=1: the exact kernel)",
   "bf16 q, w and cache; i32 tables and positions; f32 score",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cDs41IndexScore), NOTUNE,
   nullptr, nullptr, r4d_rad_ds41_index_score, nullptr, nullptr, nullptr,

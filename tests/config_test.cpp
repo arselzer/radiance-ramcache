@@ -433,6 +433,7 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--embedding-placement", { "vram" } },
         { "--vision-tower-placement", { "ram" } }, { "--ngram-placement", { "disk" } },
         { "--row-prefetch", { "off" } }, { "--mapped-rewarm", { "off" } },
+        { "--debug-draft-oracle", { "/o.txt", "--spec-ngram", "4" } },
         { "--prefix-cache-mib", { "256" } }, { "--prefix-cache-ttl", { "60" } },
         { "--placement", { "all_vram" } }, { "--checkpoint-interval", { "256" } },
         { "--prefill-span", { "2" } },

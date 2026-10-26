@@ -158,12 +158,12 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
      * As a fallback beside a head it keeps the step's window and stays out of the head's
      * estimate. The outcome is logged either way. */
     lookup_adapt_ = false;
-    /* The verify-path harness (scheduler.h): RADIANCE_DEBUG_DRAFT_ORACLE names a file of token ids,
+    /* The verify-path harness (scheduler.h): --debug-draft-oracle names a file of token ids,
      * whitespace or comma separated, a plain greedy run's continuation of the one prompt the test
-     * sends; RADIANCE_DEBUG_DRAFT_MISS the share of drafts corrupted (default 0.3). The text must
-     * stay the plain run's whatever is accepted. */
+     * sends; kDebugMiss of the drafts are corrupted. The text must stay the plain run's whatever is
+     * accepted. */
     debug_oracle_.clear();
-    if (const char* f = std::getenv("RADIANCE_DEBUG_DRAFT_ORACLE"); f && *f && cfg.n_spec > 0) {
+    if (const char* f = cfg.debug_draft_oracle.c_str(); *f && cfg.n_spec > 0) {
         if (FILE* fp = std::fopen(f, "r")) {
             std::string text;
             char buf[4096];
@@ -178,11 +178,9 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
                 if (v >= 0 && v < prog.meta.n_vocab) debug_oracle_.push_back((int32_t)v);
             }
         }
-        if (const char* m = std::getenv("RADIANCE_DEBUG_DRAFT_MISS"); m && *m)
-            debug_miss_ = std::atof(m);
-        RAD_WARN("RADIANCE_DEBUG_DRAFT_ORACLE: prompt lookup proposes from %zu fixed ids in %s, "
+        RAD_WARN("--debug-draft-oracle: prompt lookup proposes from %zu fixed ids in %s, "
                  "%.0f%% of drafts corrupted -- a verify-path test, not a drafter",
-                 debug_oracle_.size(), f, 100.0 * debug_miss_);
+                 debug_oracle_.size(), f, 100.0 * kDebugMiss);
     }
     if (cfg.draft_window == DraftWindow::Adaptive) {
         const RadDrafterDecl& dd = prog.drafter;
@@ -825,7 +823,7 @@ int Scheduler::draft_ngram(SchedReq& s, int depth) const {
             h ^= h >> 31;
             h *= 0xbf58476d1ce4e5b9ull;
             h ^= h >> 29;
-            const bool miss = (double)(h >> 11) * 0x1.0p-53 < debug_miss_;
+            const bool miss = (double)(h >> 11) * 0x1.0p-53 < kDebugMiss;
             const int32_t t = debug_oracle_[(size_t)(n + d)];
             s.draft[d] = miss ? (int32_t)((t + 1) % (int32_t)prog_->meta.n_vocab) : t;
         }

@@ -546,11 +546,11 @@ private:
     /* Prompt lookup is the deployment's only drafter and --draft-window adaptive is on: its
      * proposals feed each sequence's estimate and are capped by its window, as a head's are. */
     bool lookup_adapt_ = false;
-    /* RADIANCE_DEBUG_DRAFT_ORACLE / RADIANCE_DEBUG_DRAFT_MISS (draft_ngram): a fixed continuation
-     * the lookup proposes from instead, with drafts corrupted at a fixed rate, so a verify accepts
-     * and rejects at every depth on any model. A test harness; empty when unset. */
-    std::vector<int32_t> debug_oracle_;
-    double               debug_miss_ = 0.3;
+    /* --debug-draft-oracle (draft_ngram): a fixed continuation the lookup proposes from instead,
+     * with kDebugMiss of the drafts corrupted, so a verify accepts and rejects at every depth on
+     * any model. A test harness; empty when not given. */
+    std::vector<int32_t>    debug_oracle_;
+    static constexpr double kDebugMiss = 0.3;
 
     mutable std::mutex mu_;
 

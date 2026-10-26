@@ -1975,6 +1975,7 @@ flags are refused on it, and so are the pixel bands.
 | `--debug-graph` | print the declared graph and the selection table, and exit |
 | `--debug-selection` | print the selection table |
 | `--debug-placement` | print the placement plan |
+| `--debug-draft-oracle FILE` | a verify-path test, not a drafter: with `--spec-ngram`, prompt lookup proposes from the token ids in `FILE` (a plain greedy run's continuation of the one prompt the test sends) with 30% of the drafts corrupted, so verifies accept and reject at every depth; the text must stay the plain run's |
 | `--debug-tape-dump` | list the dispatches of the first recorded pass of each kind (`TAPEDUMP` lines on stderr, every rank) and which of them start unordered behind the one before |
 | `--debug-accept-reference-kernels` | serve even when ops resolve to `libref`. Not a production configuration |
 | `--profile-ops` | per-op device timing |

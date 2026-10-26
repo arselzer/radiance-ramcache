@@ -1102,6 +1102,9 @@ struct Config {
     /* --debug-tape-dump: each rank lists the dispatches of the first recorded pass of each kind
      * (CtxDesc::tape_dump). */
     bool    debug_tape_dump = false;
+    /* --debug-draft-oracle FILE: prompt lookup proposes from these token ids, 30% of its drafts
+     * corrupted -- the verify path's test harness (Scheduler::draft_ngram). Empty is off. */
+    std::string debug_draft_oracle;
     bool    profile_ops = false;
     /* --live: the live view (spec §16). Off by default like everything else in that section. */
     bool    live_view = false;

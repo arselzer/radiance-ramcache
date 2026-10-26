@@ -1768,7 +1768,7 @@ TEST(spec_ngram_alone_returns_the_tokens_plain_decoding_returns) {
 }
 
 /* The verify path with rejections at every depth, on text that never repeats: the harness
- * (RADIANCE_DEBUG_DRAFT_ORACLE) proposes from the plain run's own continuation with 30% of the
+ * (--debug-draft-oracle) proposes from the plain run's own continuation with 30% of the
  * drafts corrupted, so a verify accepts 0..4 drafts and rolls back the rest, on each family's
  * recurrent state, conv window and sliding window. Text and logprobs must be the plain run's. */
 TEST(verifies_that_reject_at_every_depth_return_the_plain_tokens) {
@@ -1791,8 +1791,8 @@ TEST(verifies_that_reject_at_every_depth_return_the_plain_tokens) {
             std::fclose(fp);
         }
         Server ng;
-        REQUIRE(ng.start(world().*f.model, { "--spec-ngram", "4", "--no-prefix-cache" },
-                         { "RADIANCE_DEBUG_DRAFT_ORACLE=" + oracle }));
+        REQUIRE(ng.start(world().*f.model, { "--spec-ngram", "4", "--no-prefix-cache",
+                                             "--debug-draft-oracle", oracle }));
         const json b = post(ng.port, "/completion", completion(p, 40, 0.0, 0, 2));
         CHECK_EQ(ng.stop(), 0);
         const std::vector<int32_t> tb = tokens_of(b);

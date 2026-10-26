@@ -300,6 +300,10 @@ static const Flag g_flags[] = {
     { "--debug-tape-dump",    nullptr,  "list the dispatches of the first recorded pass of each kind\n"
     "                                    on stderr (TAPEDUMP lines, every rank) and which of them\n"
     "                                    start unordered behind the one before" },
+    { "--debug-draft-oracle", "FILE",   "a verify-path test, not a drafter: with --spec-ngram, prompt\n"
+    "                                    lookup proposes from the token ids in FILE (a plain greedy\n"
+    "                                    run's continuation of the one prompt the test sends), 30% of\n"
+    "                                    the drafts corrupted; the text must stay the plain run's" },
     { "--debug-accept-reference-kernels", nullptr,
       "serve even when ops resolve only to a reference library. NOT a production configuration: the reference\n"
       "                              implementation is an oracle and a last resort, and falling back\n"
@@ -933,6 +937,7 @@ int config_parse(int argc, char** argv, Config* c) {
         else if (S("--debug-selection"))       c->debug_selection = true;
         else if (S("--debug-placement"))       c->debug_placement = true;
         else if (S("--debug-tape-dump"))       c->debug_tape_dump = true;
+        else if (S("--debug-draft-oracle"))    { if (!(v = need(i))) return RAD_E_INVAL; c->debug_draft_oracle = v; }
         else if (S("--debug-accept-reference-kernels")) c->accept_reference_kernels = true;
         else if (S("--profile-ops"))           c->profile_ops = true;
         else if (S("--live"))                  c->live_view = true;
@@ -1273,6 +1278,7 @@ const ShowRow kShow[] = {
     { "--debug-selection",    [](const Config& c) { return onoff(c.debug_selection); } },
     { "--debug-placement",    [](const Config& c) { return onoff(c.debug_placement); } },
     { "--debug-tape-dump",    [](const Config& c) { return onoff(c.debug_tape_dump); } },
+    { "--debug-draft-oracle", [](const Config& c) { return or_none(c.debug_draft_oracle, "none"); } },
     { "--debug-accept-reference-kernels", [](const Config& c) { return onoff(c.accept_reference_kernels); } },
     { "--profile-ops",        [](const Config& c) { return onoff(c.profile_ops); } },
     { "--live",               [](const Config& c) { return onoff(c.live_view); } },

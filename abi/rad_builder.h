@@ -566,7 +566,8 @@ int rad_op_declared(RadBuilder* b, const char* op);
  * convert-time fusions (q/k/v into one qkv, gate and up into gate_up). It is the only component
  * that knows both sides, and rad-convert reads the map from it (spec §2.4). */
 enum { RAD_MAP_COPY = 0, RAD_MAP_CONCAT = 1, RAD_MAP_WNORM = 2, RAD_MAP_ROWS = 3,
-       RAD_MAP_TRANSPOSE = 4, RAD_MAP_EMA = 5, RAD_MAP_TAP = 6, RAD_MAP_COLS = 7 };
+       RAD_MAP_TRANSPOSE = 4, RAD_MAP_EMA = 5, RAD_MAP_TAP = 6, RAD_MAP_COLS = 7,
+       RAD_MAP_MUL = 8 };
 
 typedef struct RadNameMap {
     const char* declared;        /* the name given to rad_decl_weight */
@@ -622,8 +623,13 @@ typedef struct RadNameMap {
  * run on a single frame reads only its last temporal tap, so [cout, cin, kt, kh, kw] read at tap -1
  * of dimension 2 is the 2-D convolution it then is.
  *
- * TRANSPOSE, EMA, TAP and COLS are computed at convert in f32, like WNORM, and stored as the recipe
- * says. */
+ * RAD_MAP_MUL is the elementwise product of src[0] and src[1], two tensors of one shape: a gain a
+ * checkpoint ships as two factors that the model only ever multiplies (DeepSeek-V4.1's Engram gate,
+ * q_weight * k_weight, which llama.cpp's converter folds into one engram_gate the same way). Two
+ * bf16 factors multiply exactly in f32.
+ *
+ * TRANSPOSE, EMA, TAP, COLS and MUL are computed at convert in f32, like WNORM, and stored as the
+ * recipe says. */
 
 int rad_decl_name_map(RadBuilder* b, const RadNameMap* m);
 

@@ -2058,8 +2058,8 @@ static int resolve_wnorm(Checkpoint& ck, const RadNameMap& m, bool optional, Ckp
 
 /* RAD_MAP_TRANSPOSE (src[0] [.., a, b] read as [.., b, a]), RAD_MAP_EMA (src[0] the embedding
  * sums [bins, ...], src[1] the cluster usage [bins]; each row over max(usage, 1e-5)), RAD_MAP_TAP
- * (one index of one dimension of src[0]) and RAD_MAP_COLS (one column range of src[0]), computed in
- * f32 into `derived`. */
+ * (one index of one dimension of src[0]), RAD_MAP_COLS (one column range of src[0]) and RAD_MAP_MUL
+ * (src[0] times src[1], element by element), computed in f32 into `derived`. */
 static int resolve_derived(Checkpoint& ck, const std::vector<const RadNameMap*>& maps,
                            bool optional, CkptWeight* out, std::string* why) {
     auto refuse = [&](int rc, std::string msg) {
@@ -2101,16 +2101,40 @@ static int resolve_derived(Checkpoint& ck, const std::vector<const RadNameMap*>&
         return RAD_OK;
     }
     const RadNameMap& m = *maps.front();
-    const bool ema = m.mode == RAD_MAP_EMA;
+    const bool ema = m.mode == RAD_MAP_EMA, mul = m.mode == RAD_MAP_MUL;
     const SrcTensor* a = ck.find(m.src[0]);
-    const SrcTensor* u = ema ? ck.find(m.src[1]) : nullptr;
-    if (!a || (ema && !u)) {
+    const SrcTensor* u = ema || mul ? ck.find(m.src[1]) : nullptr;
+    if (!a || ((ema || mul) && !u)) {
         if (optional && !a && !u) return refuse(RAD_E_NOTFOUND, "none of its tensors is there");
         return refuse(RAD_E_NOTFOUND, std::string("it needs checkpoint tensor") +
-                                      (ema ? "s '" + std::string(m.src[0]) + "' and '" +
-                                                 m.src[1] + "'" : " '" + std::string(m.src[0]) +
-                                                                  "'") +
+                                      (ema || mul ? "s '" + std::string(m.src[0]) + "' and '" +
+                                                        m.src[1] + "'"
+                                                  : " '" + std::string(m.src[0]) + "'") +
                                       ", not all in " + ck.path());
+    }
+    if (mul) {
+        /* Any rank: the factors' shape is the weight's. */
+        if (a->shape != u->shape || a->shape.empty() || a->shape.size() > RAD_MAX_RANK)
+            return refuse(RAD_E_SHAPE, "'" + a->name + "' and '" + u->name + "' are not one shape, "
+                                       "so they have no elementwise product");
+        const int64_t n = a->numel();
+        out->derived.resize((size_t)n);
+        std::vector<float> f((size_t)n);
+        if (piece_f32(*a, 0, n, out->derived.data()) < 0 || piece_f32(*u, 0, n, f.data()) < 0)
+            return refuse(RAD_E_FORMAT, "'" + a->name + "' or '" + u->name + "' cannot be read as "
+                                        "f32");
+        for (int64_t i = 0; i < n; ++i) out->derived[(size_t)i] *= f[(size_t)i];
+        out->rank = (uint32_t)a->shape.size();
+        for (size_t i = 0; i < a->shape.size(); ++i) out->shape[i] = a->shape[i];
+        out->pieces.assign(1, a);
+        out->pieces.push_back(u);
+        out->scales.assign(2, nullptr);
+        out->concat_dim = 0;
+        rad_enc_view(out->rank, out->shape, &out->rows, &out->cols);
+        out->trivial = false;
+        out->why = "it is '" + a->name + "' times '" + u->name + "', at convert -- a recipe rule "
+                   "stores it";
+        return RAD_OK;
     }
     const size_t rank = a->shape.size();
     if (rank < 2 || rank > RAD_MAX_RANK)
@@ -2216,7 +2240,8 @@ int ckpt_resolve(Checkpoint& ck, const Program& prog, const std::string& name, b
     if (maps.front()->mode == RAD_MAP_WNORM)
         return resolve_wnorm(ck, *maps.front(), optional, out, why);
     if (maps.front()->mode == RAD_MAP_TRANSPOSE || maps.front()->mode == RAD_MAP_EMA ||
-        maps.front()->mode == RAD_MAP_TAP || maps.front()->mode == RAD_MAP_COLS)
+        maps.front()->mode == RAD_MAP_TAP || maps.front()->mode == RAD_MAP_COLS ||
+        maps.front()->mode == RAD_MAP_MUL)
         return resolve_derived(ck, maps, optional, out, why);
     struct Src1 { const char* name; int index; int64_t rows; };
     std::vector<Src1> srcs;

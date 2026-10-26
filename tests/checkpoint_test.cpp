@@ -3600,3 +3600,34 @@ TEST(a_deepseek_release_in_another_form_is_refused) {
     CHECK(ckpt_resolve(ck, prog, "e", false, &w, &why) < 0);
     CHECK(why.find("exponent plane") != std::string::npos);
 }
+
+/* A gain shipped as two factors (DeepSeek-V4.1's Engram q_weight and k_weight) is their product,
+ * element by element, in f32: exact for two bf16s. Factors of two shapes are refused. */
+TEST(a_product_map_multiplies_its_two_factors) {
+    T q = bf16("e.q_weight", { 2, 6 }, 0.0f), k = bf16("e.k_weight", { 2, 6 }, 0.0f);
+    for (int i = 0; i < 12; ++i) {
+        rad_store_f32(q.bytes.data(), RAD_BF16, i, 0.75f + 0.125f * (float)i);
+        rad_store_f32(k.bytes.data(), RAD_BF16, i, -1.5f + 0.0625f * (float)(i * i));
+    }
+    const std::string dir = write_checkpoint({ q, k, bf16("odd", { 3, 4 }, 1.0f) }, kConfig);
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(dir), RAD_OK);
+    Program prog;
+    prog.name_map.push_back(map("g", RAD_MAP_MUL, { "e.q_weight", "e.k_weight" }));
+    prog.name_map.push_back(map("bad", RAD_MAP_MUL, { "e.q_weight", "odd" }));
+    CkptWeight w;
+    std::string why;
+    REQUIRE_EQ(ckpt_resolve(ck, prog, "g", false, &w, &why), RAD_OK);
+    CHECK(!w.trivial);
+    CHECK_EQ(w.rows, (int64_t)2);
+    CHECK_EQ(w.cols, (int64_t)6);
+    std::unordered_set<std::string> hit;
+    CHECK(ckpt_reads_any(w, { "e.k_weight" }, &hit));
+    std::vector<float> f(12);
+    REQUIRE_EQ(ckpt_rows_f32(w, 0, 2, f.data(), &why), RAD_OK);
+    for (int i = 0; i < 12; ++i)
+        CHECK_EQ(f[(size_t)i], rad_load_f32(q.bytes.data(), RAD_BF16, i) *
+                               rad_load_f32(k.bytes.data(), RAD_BF16, i));
+    CHECK(ckpt_resolve(ck, prog, "bad", false, &w, &why) < 0);
+    CHECK(why.find("not one shape") != std::string::npos);
+}

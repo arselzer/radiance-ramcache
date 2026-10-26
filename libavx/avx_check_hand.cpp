@@ -1316,6 +1316,43 @@ bool anchor_replays_per_candidate(const Check& ck, int64_t K, int64_t V, int64_t
 }
 
 /* ================================================================== packed stores */
+/* embed_lookup_planes over the forms libref's description does not draw (it draws i8 codes and no
+ * table): u4 codes through a 16-entry table, the served form libavx decodes sixteen at a time,
+ * with group 32 and 16, a multiplier, a padded and out-of-slice id; u4 without a table and i4
+ * (signed, element loop); a group of 8 (element loop). Bit for bit: both sides multiply the same
+ * f32 operands in the same order. */
+void planes_gather_cases(std::vector<Hand>& hs) {
+    static const float kNl[16] = { -127, -104, -83, -65, -49, -35, -22, -10,
+                                   1, 13, 25, 38, 53, 69, 89, 113 };
+    struct F { const char* name; uint32_t cdt; bool tab; int64_t E, G, voff; float mult; };
+    const F fs[] = {
+        { "u4 + table, group 32 (sixteen at a time)", RAD_U4, true, 256, 32, 0, 1.0f },
+        { "u4 + table, group 16, mult, vocab slice", RAD_U4, true, 64, 16, 5, 0.375f },
+        { "u4, no table", RAD_U4, false, 64, 32, 0, 1.0f },
+        { "i4, no table", RAD_I4, false, 64, 32, 0, 2.0f },
+        { "u4 + table, group 8 (element loop)", RAD_U4, true, 64, 8, 0, 1.0f },
+    };
+    for (const F& f : fs) {
+        const int64_t V = 61, M = 37;
+        std::vector<uint8_t> codes((size_t)(V * f.E / 2));
+        uint32_t st = 0x9e3779b9u ^ (uint32_t)f.E;
+        for (auto& c : codes) { st = st * 1664525u + 1013904223u; c = (uint8_t)(st >> 24); }
+        std::vector<int64_t> ids((size_t)M);
+        for (int64_t m = 0; m < M; ++m) ids[(size_t)m] = (m * 17 + 3) % (V + f.voff) ;
+        ids[3] = -1;
+        Hand hd((std::string("embed_lookup_planes: ") + f.name).c_str(), "embed_lookup_planes", 0.0);
+        hd.idx(ids)
+          .raw(f.cdt, { V, f.E }, codes.data())
+          .dense(RAD_F16, { V, f.E / f.G }, [](int64_t i) { return 0.00048828125f * (float)((i * 7) % 23 + 1) * ((i & 1) ? -1.0f : 1.0f); });
+        if (f.tab) hd.dense(RAD_F32, { 16 }, [](int64_t i) { return kNl[i]; });
+        else       hd.none();
+        hd.dense(RAD_BF16, { M, f.E }, [](int64_t) { return 0.0f; }, true)
+          .pi("M", M).pi("n_embd", f.E).pi("n_vocab", V).pi("group", f.G).ps("dtype", "bf16")
+          .pi("vocab_offset", f.voff).pf("mult", f.mult);
+        hs.push_back(std::move(hd));
+    }
+}
+
 void packed_cases(std::vector<Hand>& hs) {
     /* Nearest code, ties to the even code, saturation and NaN, into e2m1, int4 and int2: the
      * stores a gather or a cast of packed rows rests on. 27 values, so the last byte is half
@@ -4973,6 +5010,7 @@ bool hand_cases(const Check& ck) {
     format_cases(hs);
     anchor_cases(hs);
     packed_cases(hs);
+    planes_gather_cases(hs);
     gen_cases(hs);
     video_cases(hs);
     upscaler_cases(hs);

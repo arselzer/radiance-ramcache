@@ -868,6 +868,11 @@ static const RadParamSpec pEmbedM[]   = { P_INT("M"), P_INT("n_embd"), P_INT("n_
                                           P_STR("dtype"), P_INTO("vocab_offset"),
                                           P_F64O("wscale"), P_F64O("mult") };
 static const RadOperandSpec oEmbed[]  = { OPD("tokens"), WGT("wte"), OUT("x") };
+static const RadParamSpec pEmbedPlanes[] = { P_INT("M"), P_INT("n_embd"), P_INT("n_vocab"),
+                                             P_INT("group"), P_STR("dtype"), P_INTO("vocab_offset"),
+                                             P_F64O("mult") };
+static const RadOperandSpec oEmbedPlanes[] = { OPD("tokens"), WGT("codes"), WGT("scale"),
+                                               WGT_O("table"), OUT("x") };
 static const RadOperandSpec oEmbedQ[] = { OPD("tokens"), WGT("wte"), WGT_O("scale"), OUT("x"),
                                           OPD_O("ahead") };
 
@@ -1395,6 +1400,11 @@ static const RadOpSchema kSchemas[] = {
   "embedding gather, vocab-parallel with an offset; `mult` multiplies every row (rounded once)." },
 { "embed_lookup_q", ARR(pEmbed), ARR(oEmbedQ),
   "embedding gather, one scale for the table; without a scale the table is read as it is." },
+{ "embed_lookup_planes", ARR(pEmbedPlanes), ARR(oEmbedPlanes),
+  "A gather from a table stored as single-level affine planes, read in place: x[m, i] = v * "
+  "scale[id, i / group] * mult, v = table[code] when a table is given, else the code. Codes are i8, "
+  "u8, or 4-bit elements of a bit stream along the row, lowest bits first; a table is indexed by an "
+  "unsigned code and holds every value. Padding, bounds and vocab_offset as embed_lookup." },
 { "logits_gemm", ARR(pLogits), ARR(oLogits), "the lm_head projection." },
 { "sample_penalties", ARR(pPenal), ARR(oPenalties),
   "repetition, frequency and presence penalties." },
@@ -2100,6 +2110,10 @@ SIMPLE("avx_sub_i32", "sub_i32", "elem", "a device int32 vector less a device sc
        L(sub_i32)),
 
 SIMPLE("avx_embed_lookup", "embed_lookup", "vocab", "embedding gather", DT_FLOAT, L(embed_lookup)),
+SIMPLE("avx_embed_lookup_planes", "embed_lookup_planes", "vocab",
+       "embedding gather from a table's affine planes in place: u4 codes through a 16-entry table "
+       "sixteen at a time at AVX-512, every other form element by element",
+       "i8 u8 i4 u4 codes, any float scale and table, per operand", L(embed_lookup_planes)),
 /* Its layout hook only validates: the table is read as stored and other encodings are refused
  * (avx_ngram.cpp). An E4M3 table into bf16 goes through the row cache; other dtype pairs take
  * the general gather. The init hook refuses, at declare, a process that cannot create the

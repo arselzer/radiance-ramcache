@@ -332,6 +332,10 @@ std::vector<Case> build_cases() {
                                 HI("vocab_offset", 0), HF("mult", 22.625) });
         add("embed_lookup_q", { HI("M", 9), HI("n_embd", 128), HI("n_vocab", 64), HS("dtype", dt),
                                 HI("vocab_offset", 0), HF("wscale", 0.01) });
+        add("embed_lookup_planes", { HI("M", 9), HI("n_embd", 128), HI("n_vocab", 64), HI("group", 32),
+                                     HS("dtype", dt), HI("vocab_offset", 0), HF("mult", 1) });
+        add("embed_lookup_planes", { HI("M", 9), HI("n_embd", 96), HI("n_vocab", 64), HI("group", 8),
+                                     HS("dtype", dt), HI("vocab_offset", 0), HF("mult", 22.625) });
     }
 
     /* Attention. q_len 1 is decode, 17 a ragged verify window, 64 the prefill panel form

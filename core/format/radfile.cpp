@@ -71,13 +71,40 @@ int RadFile::read_at(void* dst, int64_t bytes, int64_t off) const {
     return RAD_OK;
 }
 
-void RadFile::drop_blob_cache() const {
+void RadFile::drop_blob_cache(const std::vector<std::pair<int64_t, int64_t>>& keep) const {
     if (!base_ || !hdr_ || fd_ < 0) return;
     const int64_t tables = (int64_t)hdr_->data_off < size_ ? (int64_t)hdr_->data_off : size_;
     if (tables >= size_) return;
-    /* Unmap first, then drop the cache: the kernel cannot drop a page still mapped here. */
-    ::madvise(base_ + tables, (size_t)(size_ - tables), MADV_DONTNEED);
-    ::posix_fadvise(fd_, (off_t)tables, (off_t)(size_ - tables), POSIX_FADV_DONTNEED);
+    /* The kept ranges, clipped to the blob, sorted and merged. */
+    std::vector<std::pair<int64_t, int64_t>> k;
+    for (const auto& r : keep) {
+        const int64_t a = std::max(r.first, tables), b = std::min(r.first + r.second, size_);
+        if (b > a) k.emplace_back(a, b);
+    }
+    std::sort(k.begin(), k.end());
+    size_t m = 0;
+    for (size_t i = 0; i < k.size(); ++i) {
+        if (m && k[i].first <= k[m - 1].second) k[m - 1].second = std::max(k[m - 1].second, k[i].second);
+        else k[m++] = k[i];
+    }
+    k.resize(m);
+    /* Whole pages only, so a page that holds kept bytes stays: a gap's start rounds up and its
+     * end rounds down (the blob's own end is the mapping's). Unmap first, then drop the cache:
+     * the kernel cannot drop a page still mapped here. */
+    const int64_t pg = 4096;
+    auto drop = [&](int64_t a, int64_t b) {
+        a = (a + pg - 1) / pg * pg;
+        if (b < size_) b = b / pg * pg;
+        if (b <= a) return;
+        ::madvise(base_ + a, (size_t)(b - a), MADV_DONTNEED);
+        ::posix_fadvise(fd_, (off_t)a, (off_t)(b - a), POSIX_FADV_DONTNEED);
+    };
+    int64_t cur = tables;
+    for (const auto& r : k) {
+        if (r.first > cur) drop(cur, r.first);
+        cur = std::max(cur, r.second);
+    }
+    if (cur < size_) drop(cur, size_);
 }
 
 /* Advisory, with no madvise: the load reads with pread and never maps these pages. The one region

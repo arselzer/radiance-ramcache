@@ -2354,7 +2354,8 @@ private:
  * card. */
 static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
                            const std::vector<int>& devices, RelayoutPool* pool,
-                           int64_t* read_out) {
+                           int64_t* read_out,
+                           const std::vector<std::pair<int64_t, int64_t>>& keep_cached) {
     *read_out = 0;
     if (runs.empty()) return RAD_OK;
 
@@ -2586,9 +2587,10 @@ static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
         return RAD_OK;
     }();
 
-    /* Release the page cache of weights never read from the file again, leaving it to the mapped
-     * tier (e.g. a mapped n-gram table, read from its mapping for the process lifetime). */
-    file->drop_blob_cache();
+    /* Release the page cache of weights never read from the file again, leaving the mapped tier's
+     * (e.g. a mapped n-gram table, read from its mapping for the process lifetime): what an earlier
+     * run brought in stays, so its gathers do not start cold after a restart. */
+    file->drop_blob_cache(keep_cached);
     /* Drain before freeing: a sweep that failed part-way may have copies outstanding. */
     for (int b = 0; b < kWin; ++b) pool->drain(b);
     for (int b = 0; b < kWin; ++b) if (buf[b]) rad_dev_free(buf[b], RAD_MEM_HOST_PINNED);
@@ -2651,6 +2653,7 @@ int Engine::load_weights() {
     int64_t total = 0, n_loaded = 0, n_missing = 0;
     /* Counted apart from `n_loaded`: mapped weights are published in place, not loaded. */
     int64_t n_mapped = 0, mapped_bytes = 0;
+    std::vector<std::pair<int64_t, int64_t>> mapped_ranges;   /* kept cached by the sweep's drop */
 
     /* Two phases. The walk decides which rank wants which bytes, where they land, and what is
      * refused, without touching the disk; sweep_container then reads the container once in file
@@ -2854,6 +2857,7 @@ int Engine::load_weights() {
                  * container keeps sequential readahead. The effect shows only with a cold cache. */
                 posix_madvise(w.ptr, (size_t)n, POSIX_MADV_RANDOM);
                 r->mover.publish_mapped((rad_weight)i, w.ptr);
+                mapped_ranges.emplace_back((int64_t)((const uint8_t*)w.ptr - file_->base()), n);
                 ++n_mapped;
                 mapped_bytes += n;
                 continue;
@@ -3004,7 +3008,7 @@ int Engine::load_weights() {
     const auto rt0 = std::chrono::steady_clock::now();
     int sw_st = RAD_OK;
     if (file_) {
-        sw_st = sweep_container(file_.get(), runs, devices, &pool, &read_bytes);
+        sw_st = sweep_container(file_.get(), runs, devices, &pool, &read_bytes, mapped_ranges);
     } else {
         /* Every weight to the workers in declaration order, as the budget allows. */
         for (size_t k = 0; k < staged.size() && !pool.failed(); ++k) {

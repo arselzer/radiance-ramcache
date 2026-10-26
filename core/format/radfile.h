@@ -21,6 +21,7 @@
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace rad {
@@ -68,8 +69,10 @@ public:
 
     /* Drop the blob from the page cache and this process's page tables, so a container larger
      * than RAM does not leave the cache full of pages nothing will read. Only the blob: the tables
-     * are small and read constantly. Advisory; the kernel may decline. */
-    void drop_blob_cache() const;
+     * are small and read constantly. `keep` (file offset, bytes) is left alone: the mapped tier,
+     * read through the mapping for the engine's life, whose cached pages a restart would otherwise
+     * throw away (every gather from it then starts cold). Advisory; the kernel may decline. */
+    void drop_blob_cache(const std::vector<std::pair<int64_t, int64_t>>& keep = {}) const;
 
     /* Drop one range of the blob behind a single forward cursor. A buffered front-to-back read of
      * a container larger than RAM otherwise builds reclaim pressure that slows the read itself.

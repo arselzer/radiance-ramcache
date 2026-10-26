@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 
 namespace rad {
 
@@ -152,17 +153,49 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
      * A block drafter proposes its block in one pass, but each verified draft is still a verify
      * row, which is not free on a MoE that reads each row's routed experts. So it takes the same
      * policy with fixed rounds: each sequence verifies the first min(D, its stop) of the block.
-     * Prompt lookup runs no pass and keeps the fixed window; the outcome is logged either way. */
+     * Prompt lookup as the only drafter runs no pass either, and takes the policy the same way:
+     * its drafts feed each sequence's estimate and its proposal is cut to the sequence's window.
+     * As a fallback beside a head it keeps the step's window and stays out of the head's
+     * estimate. The outcome is logged either way. */
+    lookup_adapt_ = false;
+    /* The verify-path harness (scheduler.h): RADIANCE_DEBUG_DRAFT_ORACLE names a file of token ids,
+     * whitespace or comma separated, a plain greedy run's continuation of the one prompt the test
+     * sends; RADIANCE_DEBUG_DRAFT_MISS the share of drafts corrupted (default 0.3). The text must
+     * stay the plain run's whatever is accepted. */
+    debug_oracle_.clear();
+    if (const char* f = std::getenv("RADIANCE_DEBUG_DRAFT_ORACLE"); f && *f && cfg.n_spec > 0) {
+        if (FILE* fp = std::fopen(f, "r")) {
+            std::string text;
+            char buf[4096];
+            for (size_t k; (k = std::fread(buf, 1, sizeof buf, fp)) > 0;) text.append(buf, k);
+            std::fclose(fp);
+            for (char& ch : text)
+                if ((ch < '0' || ch > '9') && ch != '-') ch = ' ';
+            const char* q = text.c_str();
+            for (char* e = nullptr;; q = e) {
+                const long long v = std::strtoll(q, &e, 10);
+                if (e == q) break;
+                if (v >= 0 && v < prog.meta.n_vocab) debug_oracle_.push_back((int32_t)v);
+            }
+        }
+        if (const char* m = std::getenv("RADIANCE_DEBUG_DRAFT_MISS"); m && *m)
+            debug_miss_ = std::atof(m);
+        RAD_WARN("RADIANCE_DEBUG_DRAFT_ORACLE: prompt lookup proposes from %zu fixed ids in %s, "
+                 "%.0f%% of drafts corrupted -- a verify-path test, not a drafter",
+                 debug_oracle_.size(), f, 100.0 * debug_miss_);
+    }
     if (cfg.draft_window == DraftWindow::Adaptive) {
         const RadDrafterDecl& dd = prog.drafter;
         if (cfg.n_spec <= 0)
             RAD_WARN("--draft-window adaptive: this deployment does not speculate "
                      "(--num-speculative-tokens %d), so there is no window to adapt", cfg.n_spec);
-        else if ((dd.kind != RAD_DRAFT_SERIAL && dd.kind != RAD_DRAFT_BLOCK) || dd.depth <= 0)
-            RAD_WARN("--draft-window adaptive: the window is fixed at %d with prompt lookup only "
-                     "-- the adaptive window prices draft passes and verify rows, and prompt "
-                     "lookup runs no pass", cfg.n_spec);
-        else {
+        else if ((dd.kind != RAD_DRAFT_SERIAL && dd.kind != RAD_DRAFT_BLOCK) || dd.depth <= 0) {
+            dp.adapt = true;
+            lookup_adapt_ = true;
+            RAD_INFO("--draft-window adaptive with prompt lookup only: each sequence verifies its "
+                     "lookup's first min(D, its stop) drafts, %d at most, priced like a head's",
+                     cfg.n_spec);
+        } else {
             dp.adapt = true;
             if (dd.kind == RAD_DRAFT_BLOCK)
                 RAD_INFO("--draft-window adaptive with a block drafter: the block of %d is "
@@ -513,6 +546,8 @@ void Scheduler::close_request(SchedReq& s, ReqState st, const char* reason, bool
     }
 
     if (cfg_.prefix_cache && pc_) pc_->release(*s.req);
+    /* Prompt lookup's index is this text's alone. */
+    s.ngram_ix.reset();
     /* Fold what the draft head did on this text into the next text's starting estimate, once:
      * marking it unstarted makes a second close add nothing. */
     if (draft_.adaptive()) {
@@ -766,28 +801,38 @@ int Scheduler::requests_locked(ReqStat* out, int max) const {
  *
  * Longest pattern and most recent occurrence first: a longer match predicts better, and falling
  * back to shorter ones only on a miss keeps common bigrams from dragging acceptance down. A
- * declared draft head calls set_draft() before step(), so this only fills an empty proposal. */
+ * declared draft head calls set_draft() before step(), so this only fills an empty proposal.
+ *
+ * The occurrence comes from the sequence's own index (ngram.h): O(pattern) a lookup, plus the
+ * n-grams the last commit added, rather than a scan of the context. */
 int Scheduler::draft_ngram(SchedReq& s, int depth) const {
     if (depth <= 0 || !s.req) return 0;
     const Request& r = *s.req;
-    const int64_t np = (int64_t)r.prompt.size(), no = (int64_t)r.output.size();
-    const int64_t n  = np + no;
-    if (n < 2) return 0;
-    auto at = [&](int64_t i) -> int32_t {
-        return i < np ? r.prompt[(size_t)i] : r.output[(size_t)(i - np)];
-    };
-    for (int k = kNgramMax; k >= kNgramMin; --k) {
-        if (n < (int64_t)k + 1) continue;
-        for (int64_t j = n - k - 1; j >= 0; --j) {
-            bool hit = true;
-            for (int t = 0; t < k && hit; ++t) hit = (at(j + t) == at(n - k + t));
-            if (!hit) continue;
-            int d = 0;
-            while (d < depth && j + k + d < n) { s.draft[d] = at(j + k + d); ++d; }
-            return d;
+    TokenSeq seq;
+    seq.a = r.prompt.data();
+    seq.na = (int64_t)r.prompt.size();
+    seq.b = r.output.data();
+    seq.nb = (int64_t)r.output.size();
+    if (seq.size() < 2) return 0;
+    if (depth > RAD_SCHED_MAX_SPEC) depth = RAD_SCHED_MAX_SPEC;
+    if (!debug_oracle_.empty()) {
+        /* The harness: ids n.. of the plain run's continuation, each replaced by its neighbour id
+         * where a hash of (n, position) falls under the miss rate. */
+        const int64_t n = seq.nb;
+        int d = 0;
+        for (; d < depth && n + d < (int64_t)debug_oracle_.size(); ++d) {
+            uint64_t h = (uint64_t)(n * RAD_SCHED_MAX_SPEC + d + 1) * 0x9E3779B97F4A7C15ull;
+            h ^= h >> 31;
+            h *= 0xbf58476d1ce4e5b9ull;
+            h ^= h >> 29;
+            const bool miss = (double)(h >> 11) * 0x1.0p-53 < debug_miss_;
+            const int32_t t = debug_oracle_[(size_t)(n + d)];
+            s.draft[d] = miss ? (int32_t)((t + 1) % (int32_t)prog_->meta.n_vocab) : t;
         }
+        return d;
     }
-    return 0;
+    if (s.ngram_ix.owner() != r.id) s.ngram_ix.reset(r.id);
+    return s.ngram_ix.propose(seq, cfg_.spec_ngram_min, cfg_.spec_ngram_max, depth, s.draft);
 }
 
 /* ------------------------------------------------------------------ chunking */
@@ -1419,7 +1464,9 @@ const RadBatch* Scheduler::step() {
             bool ngram = false;
             if (!r.may_speculate) s.n_draft = 0;
             else if (s.n_draft == 0) {
-                s.n_draft = (int32_t)draft_ngram(s, draft_.step_window());
+                /* As the only drafter under the adaptive window, the lookup is the head: its
+                 * proposal is cut to the sequence's own window. */
+                s.n_draft = (int32_t)draft_ngram(s, lookup_adapt_ ? cap : draft_.step_window());
                 ngram = s.n_draft > 0;
             }
             if (!ngram && s.n_draft > cap) s.n_draft = cap;
@@ -2122,7 +2169,7 @@ int Scheduler::commit(const StepResult& res) {
                 /* And this sequence's own estimate under the adaptive window, only when the head
                  * drafted: a prompt-lookup proposal is accepted on different text by a different
                  * rule. A move takes effect at the next draft; this step's drafter already ran. */
-                if (draft_.adaptive() && !e.ngram) {
+                if (draft_.adaptive() && (!e.ngram || lookup_adapt_)) {
                     const int was = s.adapt.depth;
                     const int now = draft_.adapt_observe(s.adapt, e.n_spec, a);
                     if (now != was && was > 0 && (int)log_level() >= (int)Log::Debug) {

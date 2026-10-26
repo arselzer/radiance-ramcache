@@ -908,6 +908,7 @@ RadBuildCtx Engine::build_ctx(int rank, int64_t max_tok) const {
     bc.tp_attn_rows = cfg_.tp_attn_rows;
     bc.state_dtype = cfg_.state_cache_dtype == "f16" ? RAD_F16 : 0;
     bc.draft_coupling = cfg_.draft_coupling ? 1 : 0;
+    bc.draft_head_off = cfg_.spec_ngram > 0 ? 1 : 0;
     bc.tp_wire_min_bytes = cfg_.tp_wire_min_kb * 1024;
     bc.scope      = "";
     bc.max_enc_patches = cfg_.mm_max_patches > 0 ? cfg_.mm_max_patches : 0;
@@ -1339,6 +1340,16 @@ int Engine::declare() {
     drafter_       = p0.drafter;
     drafter_name_  = p0.drafter_name;
     drafter_.name  = drafter_name_.c_str();
+    /* --spec-ngram asked the plugin to leave its head out (RadBuildCtx::draft_head_off). One that
+     * declared it anyway would hold its weights and passes for nothing, so startup stops. */
+    if (cfg_.spec_ngram > 0 && drafter_.kind != RAD_DRAFT_NONE) {
+        RAD_ERR("--spec-ngram %d: the '%s' plugin declared its draft head '%s' although the "
+                "deployment drafts by prompt lookup alone (it does not read "
+                "RadBuildCtx::draft_head_off). Use --num-speculative-tokens N instead: the head "
+                "drafts and prompt lookup fills in for any sequence it declines",
+                cfg_.spec_ngram, plugins_.arch_plugin.c_str(), drafter_name_.c_str());
+        return RAD_E_UNSUPPORTED;
+    }
     if (cfg_.n_spec <= 0) drafter_ = RadDrafterDecl{};
     drafter_short_ = drafter_.kind == RAD_DRAFT_BLOCK && cfg_.draft_short_from > 0
                    ? p0.drafter_short_block : 0;
@@ -1370,8 +1381,18 @@ int Engine::declare() {
                  : fmt("'%s' drafts %d token(s) a step in %d serial pass(es); prompt lookup fills "
                        "in for any sequence it declines",
                        drafter_.name, drafter_.depth, drafter_.depth).c_str());
+    } else if (cfg_.spec_ngram > 0) {
+        RAD_INFO("speculation: prompt lookup only (--spec-ngram %d) -- up to %d draft(s) a step "
+                 "from the latest earlier occurrence of the sequence's last %d..%d tokens; no "
+                 "draft head is declared", cfg_.spec_ngram, cfg_.n_spec, cfg_.spec_ngram_max,
+                 cfg_.spec_ngram_min);
+        decide("--spec-ngram", std::to_string(cfg_.spec_ngram),
+               fmt("prompt lookup alone, patterns of %d..%d tokens, longest first; the "
+                   "container's draft head (if any) is not declared",
+                   cfg_.spec_ngram_max, cfg_.spec_ngram_min));
     } else if (cfg_.n_spec > 0) {
-        RAD_INFO("speculation: prompt lookup only -- this container declares no draft head");
+        RAD_INFO("speculation: prompt lookup only -- this container declares no draft head "
+                 "(patterns of %d..%d tokens)", cfg_.spec_ngram_max, cfg_.spec_ngram_min);
     }
     probe_arena_levels();
     return RAD_OK;

@@ -240,7 +240,25 @@ typedef struct RadBuildCtx {
      *
      * Trailing and zero-defaulted, so a plugin built against the older struct is unchanged. */
     int      draft_coupling;
+
+    /* ---- appended in ABI 27 (prompt lookup alone) */
+    /* Nonzero from --spec-ngram: the deployment drafts by prompt lookup only, in the core, and
+     * verifies up to `max_spec` drafts a step. The plugin declares no draft head, so a head the
+     * container carries stays off the card, but sizes every verify buffer, state ring and kernel
+     * band for `max_spec` as at any speculative serve. rad_ctx_draft_head() below is the test.
+     * The engine refuses to start when a head is declared anyway, rather than load one it was
+     * told to leave out.
+     *
+     * Zero-defaulted and in the padding after draft_coupling, so no other field moves and a
+     * plugin built against the older struct is unchanged. */
+    int      draft_head_off;
 } RadBuildCtx;
+
+/* Whether a declare should include the container's draft head: the deployment speculates and
+ * does not draft by prompt lookup alone. */
+static inline int rad_ctx_draft_head(const RadBuildCtx* ctx) {
+    return ctx && ctx->max_spec > 0 && !ctx->draft_head_off;
+}
 
 /* ================================================================== control vectors */
 /* A direction per layer, in the shape llama.cpp's `--cvec-mode project` applies it:

@@ -1178,6 +1178,37 @@ whose nearest checkpoint below that point would give back more than two windows 
 `radiance:draft_refills_total` counts the hits ended early and `radiance:draft_refill_tokens_total`
 the tokens recomputed.
 
+**Prompt lookup.** The engine also drafts with no model at all: for each sequence it finds the
+latest earlier occurrence of the sequence's last n tokens (prompt and output alike, n from
+`--spec-ngram-max` down to `--spec-ngram-min`, 4 and 2 by default, the longest first) and proposes
+the tokens that followed it, continuing past the end with its own proposal when the pattern repeats
+within the window. There is no draft pass, and no proposal when nothing recurs, so such a step is an
+ordinary decode. It pays where the reply copies its context -- code edits, rewrites, diffs, JSON,
+quoting -- and costs a verify row per wrong draft elsewhere. Each sequence keeps an index of where
+its n-grams last occurred (about 8 bytes a token per pattern length, 16 MiB at 400k tokens and the
+default range), extended by each commit, so a lookup does not scan the context.
+
+```sh
+radiance --model m.rad --spec-ngram 5                         # prompt lookup alone, up to 5 drafts
+radiance --model m.rad --spec-ngram 5 --draft-window adaptive # each sequence's window follows its acceptance
+radiance --model m.rad --num-speculative-tokens 4             # a head drafts; lookup fills in where it declines
+```
+
+`--spec-ngram K` sets the window to K (a different `--num-speculative-tokens` is refused) and asks
+the plugin to leave out any draft head the container carries (`RadBuildCtx::draft_head_off`), so
+the head's weights take no memory: the choice for a model whose head does not fit, or does not pay.
+A plugin that declares its head regardless is refused at startup. Without the flag, prompt lookup
+still drafts for every sequence a declared head declines, and is the only drafter when speculation
+is on (`--num-speculative-tokens N`) and the container has no head. Startup says which
+(`speculation: prompt lookup only (--spec-ngram K)`), and the drafts count in `draft_n` /
+`draft_n_accepted` and the `radiance:draft_*` metrics like a head's. Prompt lookup reads the
+committed sequence, so a step is not issued ahead of the previous one's readback.
+
+A lookup draft is a single token, a point mass, and the verify accepts it when the target's own draw
+at that position equals it: with probability p(x), and otherwise the emitted token is the target's
+draw conditioned on not being x. That is the speculative-sampling rule for a deterministic proposal,
+so output is distribution-exact at any temperature and greedy text matches decoding without it.
+
 **Adaptive window.** Code and JSON keep accepting deep into the window; prose falls off after a
 position or two. With `--draft-window adaptive`, `--num-speculative-tokens` is the ceiling and the
 engine keeps a smoothed acceptance per draft position for every sequence:
@@ -1194,9 +1225,11 @@ being emitted is under one in ten. The depth moves only after eight steps and fo
 each new window is a new pass shape and a new recording. A new sequence starts from what earlier
 sequences finished on.
 
-The adaptive window needs a serial draft head; with a block drafter, prompt lookup alone, or
-speculation off, the window stays fixed and startup says so. Prompt-lookup proposals made when the
-head declines count in the acceptance metrics but do not move the window. At temperature 0 the text
+A block drafter proposes its whole block in one pass and each sequence verifies the first min(D,
+its stop) of it; prompt lookup as the only drafter is measured the same way, its drafts feeding each
+sequence's estimate. With speculation off the window has nothing to adapt and startup says so.
+Prompt-lookup proposals made when a head declines count in the acceptance metrics but do not move
+the head's window. At temperature 0 the text
 is that of a fixed depth wherever fixed depths agree; above 0 it is distribution-exact.
 `radiance:draft_depth_adaptive` and `radiance:draft_verify_depth_total` (§6.3) show the windows.
 
@@ -1856,7 +1889,9 @@ by 0.002-0.003 nats.
 | flag | default | |
 |---|---|---|
 | `--num-speculative-tokens N` | auto | speculative window; 0 disables. The ceiling under `--draft-window adaptive` |
-| `--draft-window MODE` | fixed | `fixed` drafts N every step; `adaptive` follows each sequence's acceptance and the measured step cost, serial draft heads only (§4.6) |
+| `--spec-ngram K` | 0 | prompt lookup alone: up to K drafts a step from the sequence's own n-grams, no draft head declared; sets the window to K (§4.6) |
+| `--spec-ngram-min N`, `--spec-ngram-max N` | 2, 4 | the pattern lengths prompt lookup tries, longest first (at most 15), wherever it drafts |
+| `--draft-window MODE` | fixed | `fixed` drafts N every step; `adaptive` follows each sequence's acceptance and the measured step cost, for a draft head or prompt lookup alone (§4.6) |
 | `--draft-short-from N` | 0 | a block drafter that declares a shorter block runs it from N decoding sequences on, its own block again two below; 0 never (§4.6) |
 | `--draft-coupling MODE` | off | `on`: a linear MTP drafter with a 2-bit candidate head (Qwen3.8-Flash-Next) samples each proposal from its reranked top-8 and the sampler maximally couples the target's draw to it. The output distribution is unchanged and a fixed seed yields other tokens than `off`. The head's law is taken at temperature 1, so it pays at high request temperatures and costs at low ones: on Flash-Next TP2 at 2x R9700, tokens per decode step +18% at temperature 1.0 and c1, +11% at 0.7 and c4, -4% at 0.3. Greedy rows are unchanged; any other drafter is refused at startup |
 | `--draft-model PATH` | | not implemented: merge the drafter at convert time |

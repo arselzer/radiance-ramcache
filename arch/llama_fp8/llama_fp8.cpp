@@ -367,7 +367,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * Two key spellings: a SpecForge DFlash config nests the wiring under `dflash_config`, while
      * the published DSpark configs (openbmb/MiniCPM5-2B-DSpark and siblings) put it at the top
      * level. The flat key is read first. */
-    if (ctx->max_spec > 0) {
+    if (rad_ctx_draft_head(ctx)) {
         const char* da = rad_meta_gets(meta, "draft.architectures", "");
         if (da && (std::strstr(da, "DSpark") || std::strstr(da, "DFlash"))) {
             const char* ids = rad_meta_gets(meta, "draft.target_layer_ids", nullptr);

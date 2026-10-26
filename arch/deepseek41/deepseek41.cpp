@@ -988,7 +988,7 @@ static int dsp_config(RadBuilder* b, Model& m, const RadModelMeta* meta, const R
                     "stages (no nextn_predict_layers): no drafter", (long long)blk);
         return RAD_OK;
     }
-    if (ctx->max_spec <= 0) return RAD_OK;
+    if (!rad_ctx_draft_head(ctx)) return RAD_OK;   /* no speculation, or prompt lookup alone */
     if (ctx->max_spec != blk) {
         fprintf(stderr, "radiance: deepseek41: the DSpark drafter proposes a whole block of %lld tokens "
                         "(dspark.block_size, the length it was trained at) and this serve asks for %d; run "

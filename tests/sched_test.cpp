@@ -11,6 +11,7 @@
 #include "server/sink.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <new>
@@ -2667,9 +2668,9 @@ TEST(the_adaptive_window_chooses_the_head_depth_over_the_whole_batch) {
     CHECK_EQ(h.plan_step(hone, 0, 3), 2);
 }
 
-/* The flag, for a drafting head (serial or block). --draft-window adaptive with prompt lookup
- * alone, or with no speculation, keeps the configured depth and says so at startup; the proposal
- * then reaches the step uncut. The default is the fixed window. */
+/* The flag, for a drafting head (serial or block) or prompt lookup alone. --draft-window adaptive
+ * with no speculation keeps the configured depth and says so at startup. The default is the fixed
+ * window. */
 TEST(the_adaptive_window_is_a_flag_for_a_drafting_head_and_said_when_there_is_none) {
     {
         Fixture f;
@@ -2722,6 +2723,8 @@ TEST(the_adaptive_window_is_a_flag_for_a_drafting_head_and_said_when_there_is_no
         CHECK(f.sch.metrics().draft_verify_depth[4] > 0);
         CHECK(f.sch.metrics().draft_verify_depth[1] > 0);
     }
+    /* Prompt lookup as the only drafter takes the policy as a block drafter does: each of its
+     * drafts is a verify row (prompt_lookup_alone_follows_its_own_acceptance). */
     {
         Fixture f;
         adaptive_fixture(f, 4);
@@ -2730,9 +2733,9 @@ TEST(the_adaptive_window_is_a_flag_for_a_drafting_head_and_said_when_there_is_no
         int st = RAD_E_STATE;
         const std::string log = info_of([&] { st = f.start(); });
         CHECK_OK(st);
-        CHECK(!f.sch.draft().adaptive());
-        CHECK(log.find("--draft-window adaptive: the window is fixed at 4") != std::string::npos);
-        CHECK(log.find("prompt lookup only") != std::string::npos);
+        CHECK(f.sch.draft().adaptive());
+        CHECK(log.find("--draft-window adaptive with prompt lookup only") != std::string::npos);
+        CHECK(log.find("the window is fixed") == std::string::npos);
 
         const uint64_t a = f.submit(160, 64);
         CHECK(f.sch.step() != nullptr);
@@ -2740,7 +2743,7 @@ TEST(the_adaptive_window_is_a_flag_for_a_drafting_head_and_said_when_there_is_no
         int32_t draft[4] = { 21, 22, 23, 24 };
         CHECK_OK(f.sch.set_draft(a, draft, 4));
         CHECK_EQ(f.sch.find(a)->n_draft, 4);
-        CHECK(!f.sch.metrics().draft_adaptive);
+        CHECK(f.sch.metrics().draft_adaptive);
     }
     {
         Fixture f;
@@ -2938,6 +2941,155 @@ TEST(the_adaptive_window_is_not_fed_by_prompt_lookup) {
         f.commit_plain(100 + (t + 1) % 8);
     }
     CHECK_NEAR(f.sch.metrics().draft_depth_adaptive, 1.0, 1e-6);
+}
+
+/* With prompt lookup the only drafter, its drafts are what the adaptive window measures: refused
+ * lookups bring each sequence's window, and the lookup's proposals, down to one draft. */
+TEST(prompt_lookup_alone_follows_its_own_acceptance) {
+    Fixture f;
+    adaptive_fixture(f, 4);
+    f.prog.drafter.kind = RAD_DRAFT_NONE;
+    f.prog.drafter.depth = 0;
+    CHECK_OK(f.start());
+    REQUIRE(f.sch.draft().adaptive());
+
+    auto r = std::make_unique<Request>();
+    r->id = f.next_id++;
+    r->max_tokens = 2000;
+    r->prompt.resize(160);
+    for (int i = 0; i < 160; ++i) r->prompt[(size_t)i] = 100 + i % 8;
+    CHECK_OK(f.sch.add(std::move(r)));
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(100);
+
+    int first = 0, last = 0, lookups = 0;
+    for (int t = 0; t < 6 * DraftController::kHold; ++t) {
+        REQUIRE(f.sch.step() != nullptr);
+        const StepEntry& e = f.sch.plan().e[0];
+        if (e.n_spec > 0) {
+            CHECK(e.ngram);
+            /* What the pattern says comes next, the period continued. */
+            CHECK_EQ(e.draft[0], 100 + (t + 1) % 8);
+            if (!first) first = e.n_spec;
+            last = e.n_spec;
+            ++lookups;
+        }
+        f.commit_plain(100 + (t + 1) % 8);             /* every lookup refused */
+    }
+    CHECK_EQ(lookups, 6 * DraftController::kHold);
+    CHECK_EQ(first, 4);
+    CHECK_EQ(last, 1);
+    CHECK_NEAR(f.sch.metrics().draft_depth_adaptive, 1.0, 1e-6);
+}
+
+namespace {
+/* Prompt lookup by scanning: the longest pattern first, its latest earlier occurrence, the
+ * proposal continued past the end with its own tokens. The index must answer exactly this. */
+int scan_propose(const std::vector<int32_t>& s, int nmin, int nmax, int depth, int32_t* out) {
+    const int64_t L = (int64_t)s.size();
+    if (L < 2) return 0;
+    for (int n = (int)std::min<int64_t>(nmax, L - 1); n >= nmin; --n)
+        for (int64_t e = L - 2; e >= n - 1; --e) {
+            bool ok = true;
+            for (int k = 0; k < n && ok; ++k) ok = s[(size_t)(e - k)] == s[(size_t)(L - 1 - k)];
+            if (!ok) continue;
+            for (int d = 0; d < depth; ++d) {
+                const int64_t i = e + 1 + d;
+                out[d] = i < L ? s[(size_t)i] : out[i - L];
+            }
+            return depth;
+        }
+    return 0;
+}
+}  /* namespace */
+
+/* The index against the scan, over sequences grown a few tokens at a time across the prompt /
+ * output seam, on alphabets small enough to repeat often and large enough to miss, at several
+ * pattern ranges; then a change of range and a shorter sequence, which rebuild it. */
+TEST(prompt_lookup_index_answers_what_a_scan_answers) {
+    uint32_t rng = 12345;
+    auto next = [&](uint32_t mod) { rng = rng * 1664525u + 1013904223u; return (rng >> 8) % mod; };
+    const int kRanges[][2] = { { 1, 1 }, { 1, 4 }, { 2, 4 }, { 3, 7 }, { 15, 15 } };
+    int64_t hits = 0, misses = 0;
+    for (const uint32_t alphabet : { 2u, 5u, 40u, 3000u }) {
+        for (const auto& rg : kRanges) {
+            std::vector<int32_t> seq;
+            const int64_t np = 50 + next(200);
+            NgramIndex ix;
+            ix.reset(7);
+            while (seq.size() < 1500) {
+                const int add = 1 + (int)next(6);
+                for (int k = 0; k < add; ++k) {
+                    /* Runs and copies as well as noise, so long patterns recur. */
+                    if (seq.size() > 20 && next(4) == 0) {
+                        const size_t from = next((uint32_t)seq.size() - 10);
+                        for (int c = 0; c < 6; ++c) seq.push_back(seq[from + (size_t)c]);
+                    } else {
+                        seq.push_back((int32_t)next(alphabet));
+                    }
+                }
+                TokenSeq ts;
+                ts.a = seq.data();
+                ts.na = std::min<int64_t>(np, (int64_t)seq.size());
+                ts.b = seq.data() + ts.na;
+                ts.nb = (int64_t)seq.size() - ts.na;
+                int32_t want[8] = {}, got[8] = {};
+                const int depth = 1 + (int)next(8);
+                const int w = scan_propose(seq, rg[0], rg[1], depth, want);
+                const int g = ix.propose(ts, rg[0], rg[1], depth, got);
+                CHECK_EQ(g, w);
+                if (g == w) CHECK(std::memcmp(got, want, sizeof(int32_t) * (size_t)w) == 0);
+                (w ? hits : misses) += 1;
+            }
+            CHECK_EQ(ix.indexed(), (int64_t)seq.size() - 1);
+            CHECK(ix.bytes() <= (size_t)(16 * (rg[1] - rg[0] + 1)) * seq.size() + 8192);
+        }
+    }
+    CHECK(hits > 100);
+    CHECK(misses > 100);
+
+    /* Another range, then a shorter sequence (another request in the slot): both rebuild. */
+    std::vector<int32_t> a = { 1, 2, 3, 9, 1, 2, 3 };
+    TokenSeq ta{ a.data(), (int64_t)a.size(), nullptr, 0 };
+    NgramIndex ix;
+    int32_t out[4] = {};
+    CHECK_EQ(ix.propose(ta, 2, 4, 2, out), 2);
+    CHECK_EQ(out[0], 9);
+    CHECK_EQ(out[1], 1);
+    CHECK_EQ(ix.propose(ta, 4, 4, 2, out), 0);         /* no 4-gram recurs */
+    std::vector<int32_t> b = { 5, 6, 5 };
+    TokenSeq tb{ b.data(), (int64_t)b.size(), nullptr, 0 };
+    CHECK_EQ(ix.propose(tb, 1, 4, 3, out), 3);         /* period 2, continued: 6 5 6 */
+    CHECK_EQ(out[0], 6);
+    CHECK_EQ(out[1], 5);
+    CHECK_EQ(out[2], 6);
+}
+
+/* A lookup costs the n-grams the last commit added, not a pass over the context: over a 400k-token
+ * prompt that never repeats a 2-gram, the first lookup indexes it once and the next thousand
+ * lookups, a token apart, together take a small fraction of that. */
+TEST(prompt_lookup_does_not_scan_the_context) {
+    std::vector<int32_t> seq;
+    seq.reserve(401000);
+    for (int i = 0; i < 400000; ++i) seq.push_back(i);   /* every token distinct: always a miss */
+    NgramIndex ix;
+    int32_t out[8];
+    TokenSeq ts{ seq.data(), (int64_t)seq.size(), nullptr, 0 };
+    const auto t0 = std::chrono::steady_clock::now();
+    CHECK_EQ(ix.propose(ts, 2, 4, 8, out), 0);
+    const auto t1 = std::chrono::steady_clock::now();
+    for (int i = 0; i < 1000; ++i) {
+        seq.push_back(1000000 + i);
+        TokenSeq t2{ seq.data(), (int64_t)seq.size(), nullptr, 0 };
+        CHECK_EQ(ix.propose(t2, 2, 4, 8, out), 0);
+    }
+    const auto t2 = std::chrono::steady_clock::now();
+    const double build = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    const double steps = std::chrono::duration<double, std::milli>(t2 - t1).count();
+    fprintf(stderr, "    index 400k tokens: %.1f ms; 1000 lookups after: %.3f ms (%.1f MiB)\n", build,
+            steps, (double)ix.bytes() / 1048576.0);
+    CHECK(steps < build);
+    CHECK_EQ(ix.indexed(), (int64_t)seq.size() - 1);
 }
 
 /* The scheduler's half of the cost: a decode step that verified drafts is timed at its deepest

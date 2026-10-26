@@ -1711,6 +1711,114 @@ TEST(seeded_sampling_repeats_and_is_unchanged_by_speculation) {
     }
 }
 
+/* --spec-ngram K: prompt lookup alone at window K, here with single-token patterns allowed and,
+ * in the second arm, the adaptive window cutting each sequence's lookups to its own acceptance.
+ * Greedy text must equal one-token-a-step decoding token for token, a seeded draw must repeat
+ * its plain run's draw (a lookup draft is a point mass, for which accepting on agreement with the
+ * target's draw is the speculative-sampling rule: accept with probability p(x), else a draw from
+ * p without x), and the timings must show lookups made, some taken and some not. The code-edit
+ * prompt asks for a copy with a rename, the case prompt lookup is for. */
+TEST(spec_ngram_alone_returns_the_tokens_plain_decoding_returns) {
+    REQUIRE(world().ok);
+    const std::vector<int32_t> edit = tiny::byte_ids(
+        "Rename total to acc in this function and keep the rest as it is.\n"
+        "def add_all(xs):\n    total = 0\n    for x in xs:\n        total = total + x\n"
+        "    return total\n\ndef add_all(xs):\n    acc = 0\n    for x in xs:\n");
+    const std::vector<std::string> kArms[] = {
+        { "--spec-ngram", "4", "--spec-ngram-min", "1", "--no-prefix-cache" },
+        { "--spec-ngram", "4", "--draft-window", "adaptive", "--no-prefix-cache" } };
+    for (const Family& f : kSpecFamilies) {
+        Server plain;
+        REQUIRE(plain.start(world().*f.model, kPlain));
+        for (const std::vector<std::string>& arm : kArms) {
+            Server ng;
+            REQUIRE(ng.start(world().*f.model, arm));
+            CHECK(has(ng.output(), "speculation: prompt lookup only (--spec-ngram 4)"));
+            int64_t drafted = 0, accepted = 0;
+            for (const std::vector<int32_t>* p : { &repetitive_prompt(), &edit }) {
+                const json a = post(plain.port, "/completion", completion(*p, 48));
+                int status = 0;
+                const json b = post(ng.port, "/completion", completion(*p, 48), &status);
+                CHECK_EQ(status, 200);
+                const std::vector<int32_t> ta = tokens_of(a), tb = tokens_of(b);
+                CHECK_EQ(ta.size(), (size_t)48);
+                if (ta != tb)
+                    fprintf(stderr, "    %s %s plain %s\n    ngram %s\n", f.name, arm[3].c_str(),
+                            show(ta).c_str(), show(tb).c_str());
+                CHECK(ta == tb);
+                drafted += std::max<int64_t>(timing(b, "draft_n"), 0);
+                accepted += std::max<int64_t>(timing(b, "draft_n_accepted"), 0);
+            }
+            fprintf(stderr, "    %s %s %s: drafted %lld, accepted %lld\n", f.name, arm[2].c_str(),
+                    arm[3].c_str(), (long long)drafted, (long long)accepted);
+            CHECK(drafted > accepted);
+            CHECK(accepted > 0);
+
+            const json req = completion(repetitive_prompt(), 64, 0.7, 4321);
+            const std::vector<int32_t> sa = tokens_of(post(plain.port, "/completion", req));
+            const json sb = post(ng.port, "/completion", req);
+            if (sa != tokens_of(sb))
+                fprintf(stderr, "    %s seeded plain %s\n    ngram %s\n", f.name, show(sa).c_str(),
+                        show(tokens_of(sb)).c_str());
+            CHECK(sa == tokens_of(sb));
+            CHECK_EQ(ng.stop(), 0);
+        }
+        CHECK_EQ(plain.stop(), 0);
+    }
+}
+
+/* The verify path with rejections at every depth, on text that never repeats: the harness
+ * (RADIANCE_DEBUG_DRAFT_ORACLE) proposes from the plain run's own continuation with 30% of the
+ * drafts corrupted, so a verify accepts 0..4 drafts and rolls back the rest, on each family's
+ * recurrent state, conv window and sliding window. Text and logprobs must be the plain run's. */
+TEST(verifies_that_reject_at_every_depth_return_the_plain_tokens) {
+    REQUIRE(world().ok);
+    for (const Family& f : kSpecFamilies) {
+        Server plain;
+        REQUIRE(plain.start(world().*f.model, kPlain));
+        const std::vector<int32_t> p = prompt_ids(77, 50);
+        const json a = post(plain.port, "/completion", completion(p, 40, 0.0, 0, 2));
+        CHECK_EQ(plain.stop(), 0);
+        const std::vector<int32_t> ta = tokens_of(a);
+        REQUIRE(ta.size() == 40);
+        const std::string oracle = radtest::tmp_path(std::string("oracle-") + f.name + ".txt");
+        {
+            std::string ids;
+            for (int32_t t : ta) ids += std::to_string(t) + " ";
+            FILE* fp = std::fopen(oracle.c_str(), "w");
+            REQUIRE(fp != nullptr);
+            std::fputs(ids.c_str(), fp);
+            std::fclose(fp);
+        }
+        Server ng;
+        REQUIRE(ng.start(world().*f.model, { "--spec-ngram", "4", "--no-prefix-cache" },
+                         { "RADIANCE_DEBUG_DRAFT_ORACLE=" + oracle }));
+        const json b = post(ng.port, "/completion", completion(p, 40, 0.0, 0, 2));
+        CHECK_EQ(ng.stop(), 0);
+        const std::vector<int32_t> tb = tokens_of(b);
+        if (ta != tb)
+            fprintf(stderr, "    %s plain %s\n    oracle %s\n", f.name, show(ta).c_str(),
+                    show(tb).c_str());
+        CHECK(ta == tb);
+        const int64_t drafted = timing(b, "draft_n"), accepted = timing(b, "draft_n_accepted");
+        fprintf(stderr, "    %s: drafted %lld, accepted %lld\n", f.name, (long long)drafted,
+                (long long)accepted);
+        CHECK(drafted > 2 * accepted);
+        CHECK(accepted > 4);
+        /* Every emitted token's logprobs are its own row's, verify row or decode row alike. */
+        double worst = 0;
+        const json& pa = a["completion_probabilities"];
+        const json& pb = b["completion_probabilities"];
+        REQUIRE(pa.size() == pb.size());
+        for (size_t i = 0; i < pa.size(); ++i)
+            worst = std::max(worst,
+                             std::fabs(pa[i]["top_logprobs"][0]["logprob"].get<double>() -
+                                       pb[i]["top_logprobs"][0]["logprob"].get<double>()));
+        fprintf(stderr, "    %s: worst |dlogprob| %.3g\n", f.name, worst);
+        CHECK(worst < 0.1);
+    }
+}
+
 /* Four distinct prompts in flight at once, each against its reply alone on a fresh server: every
  * step batches them in other slots and other rows, and with speculation each row's window differs
  * as well. */

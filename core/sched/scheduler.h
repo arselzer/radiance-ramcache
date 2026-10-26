@@ -15,6 +15,7 @@
 #include "batch.h"
 #include "draft.h"
 #include "metrics.h"
+#include "ngram.h"
 
 #include <chrono>
 #include <memory>
@@ -77,6 +78,10 @@ struct SchedReq {
     DraftAdapt adapt;
     /* The proposal the step being planned carries came from prompt lookup (StepEntry::ngram). */
     bool       draft_ngram = false;
+    /* Prompt lookup's index over prompt ++ output (ngram.h), built at the sequence's first lookup
+     * and extended by each later one. It depends on the tokens alone, so preemption keeps it; it
+     * is keyed by request id, so a recycled slot starts over, and a closed request frees it. */
+    NgramIndex ngram_ix;
 
     int32_t  sched_tokens = 0;   /* tokens given to this request in the current step */
     int32_t  entry = -1;         /* its index in the current StepPlan, or -1 */
@@ -534,11 +539,18 @@ private:
     std::vector<DraftAdapt*> draft_est_;
     void    draft_cycle();
 
-    /* The built-in prompt-lookup drafter (scheduler.cpp). Fills s.draft and returns how many
-     * tokens it proposed; 0 when the sequence has no repeated pattern to extend. The pattern
-     * lengths it tries, longest first. */
+    /* The built-in prompt-lookup drafter (scheduler.cpp, ngram.h). Fills s.draft and returns how
+     * many tokens it proposed; 0 when the sequence has no repeated pattern to extend. It tries
+     * --spec-ngram-max down to --spec-ngram-min tokens, longest first. */
     int draft_ngram(SchedReq& s, int depth) const;
-    enum { kNgramMin = 2, kNgramMax = 4 };
+    /* Prompt lookup is the deployment's only drafter and --draft-window adaptive is on: its
+     * proposals feed each sequence's estimate and are capped by its window, as a head's are. */
+    bool lookup_adapt_ = false;
+    /* RADIANCE_DEBUG_DRAFT_ORACLE / RADIANCE_DEBUG_DRAFT_MISS (draft_ngram): a fixed continuation
+     * the lookup proposes from instead, with drafts corrupted at a fixed rate, so a verify accepts
+     * and rejects at every depth on any model. A test harness; empty when unset. */
+    std::vector<int32_t> debug_oracle_;
+    double               debug_miss_ = 0.3;
 
     mutable std::mutex mu_;
 

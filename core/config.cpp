@@ -39,7 +39,7 @@ static const std::string g_draft_window_help =
     std::string("fixed | adaptive: how many drafts each sequence carries. fixed drafts\n"
                 "                                    --num-speculative-tokens every step; adaptive makes that\n"
                 "                                    the ceiling and follows each sequence's acceptance and the\n"
-                "                                    measured step cost (a serial draft head only). Default ") +
+                "                                    measured step cost (a draft head, or prompt lookup alone). Default ") +
     draft_window_name(kDraftWindowDefault);
 
 static const Flag g_flags[] = {
@@ -164,6 +164,14 @@ static const Flag g_flags[] = {
     { "--num-speculative-tokens", "N",  "speculative window; 0 disables. Default `auto`: the drafter's\n"
     "                                    own operating point, which the plugin states. A container\n"
     "                                    with no draft head is unaffected -- auto resolves to 0." },
+    { "--spec-ngram",         "K",      "speculate by prompt lookup alone: up to K drafts a step\n"
+    "                                    copied from what followed the latest earlier occurrence of\n"
+    "                                    the sequence's last n tokens (no weights, no draft pass).\n"
+    "                                    Sets the window to K; a draft head the container carries is\n"
+    "                                    not loaded. 0 (default) off" },
+    { "--spec-ngram-min",     "N",      "shortest pattern prompt lookup matches (default 2)" },
+    { "--spec-ngram-max",     "N",      "longest pattern prompt lookup matches, tried first\n"
+                                        "(default 4, at most 15)" },
     { "--draft-window",       "MODE",   g_draft_window_help.c_str() },
     { "--draft-short-from",   "N",      "a block drafter that also serves a shorter block runs it\n"
                                         "from N decoding sequences on (0 never, the default): the\n"
@@ -671,6 +679,9 @@ int config_parse(int argc, char** argv, Config* c) {
                 return RAD_E_INVAL;
             c->n_spec = (int)n;
         }
+        else if (S("--spec-ngram"))            { if (!num(0, 64, &c->spec_ngram)) return RAD_E_INVAL; }
+        else if (S("--spec-ngram-min"))        { if (!num(1, 15, &c->spec_ngram_min)) return RAD_E_INVAL; }
+        else if (S("--spec-ngram-max"))        { if (!num(1, 15, &c->spec_ngram_max)) return RAD_E_INVAL; }
         else if (S("--draft-window")) {
             if (!(v = need(i))) return RAD_E_INVAL;
             if      (!std::strcmp(v, "fixed"))    c->draft_window = DraftWindow::Fixed;
@@ -927,6 +938,22 @@ int config_parse(int argc, char** argv, Config* c) {
         return RAD_E_INVAL;
     }
 
+    /* Prompt lookup alone: the window is its K, stated once. */
+    if (c->spec_ngram_min > c->spec_ngram_max) {
+        RAD_ERR("--spec-ngram-min %d is longer than --spec-ngram-max %d", c->spec_ngram_min,
+                c->spec_ngram_max);
+        return RAD_E_INVAL;
+    }
+    if (c->spec_ngram > 0) {
+        if (c->given.count("--num-speculative-tokens") && c->n_spec != c->spec_ngram) {
+            RAD_ERR("--spec-ngram %d sets the speculative window to %d, and "
+                    "--num-speculative-tokens asks for %s; give one", c->spec_ngram,
+                    c->spec_ngram, c->n_spec < 0 ? "auto" : std::to_string(c->n_spec).c_str());
+            return RAD_E_INVAL;
+        }
+        c->n_spec = c->spec_ngram;
+    }
+
     /* KL mode: exactly one direction, each with the inputs it reads. */
     if (!c->kld_record.empty() && !c->kld_ref.empty()) {
         RAD_ERR("--kld-record writes a reference and --kld-ref scores against one; give one");
@@ -1126,6 +1153,10 @@ const ShowRow kShow[] = {
           return std::string(c.prefix_cache ? "not given: prefix caching on" : "prefix caching off"); } },
     { "--checkpoint-policy",  [](const Config& c) { return c.checkpoint_policy; } },
     { "--num-speculative-tokens", [](const Config& c) { return c.n_spec < 0 ? std::string("auto") : num(c.n_spec); } },
+    { "--spec-ngram",         [](const Config& c) {
+          return c.spec_ngram > 0 ? num(c.spec_ngram) : std::string("0 (off)"); } },
+    { "--spec-ngram-min",     [](const Config& c) { return num(c.spec_ngram_min); } },
+    { "--spec-ngram-max",     [](const Config& c) { return num(c.spec_ngram_max); } },
     { "--draft-window",       [](const Config& c) { return std::string(draft_window_name(c.draft_window)); } },
     { "--draft-short-from",   [](const Config& c) {
           return c.draft_short_from > 0 ? num(c.draft_short_from) : std::string("0 (never)"); } },

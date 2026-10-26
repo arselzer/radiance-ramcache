@@ -949,6 +949,17 @@ struct Config {
      * and rad-tune read the same operating point; defaulting to off would pay for the head in
      * VRAM and still decode one token a step. */
     int     n_spec = -1;                /* --num-speculative-tokens; -1 = auto, 0 = off */
+    /* --spec-ngram K: speculate by prompt lookup alone, K drafts a step (core/sched/ngram.h).
+     * Sets the window to K and tells the plugin to declare no draft head
+     * (RadBuildCtx::draft_head_off), so a head the container carries costs no memory. 0 (the
+     * default) is off: a deployment that speculates still uses prompt lookup for any sequence its
+     * head declines, and a container without a head speculates by prompt lookup at
+     * --num-speculative-tokens N. */
+    int     spec_ngram = 0;
+    /* The pattern lengths prompt lookup tries, longest first (--spec-ngram-min/--spec-ngram-max),
+     * wherever it runs. */
+    int     spec_ngram_min = 2;
+    int     spec_ngram_max = 4;
     DraftWindow draft_window = kDraftWindowDefault;   /* --draft-window */
     /* A block drafter's short block (rad_drafter_short_block) from this many decoding sequences in
      * the step just run; 0 never. Ignored without a drafter that declares one. */

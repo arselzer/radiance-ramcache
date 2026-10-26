@@ -723,6 +723,471 @@ __global__ __launch_bounds__(256) void ds41_attn_sparse_sink_kernel(DsAttnArgs a
     }
 }
 
+/* ================================================================== attn_sparse_sink, decode band
+ *
+ * Passes of at most kWmRows rows (decode, speculative verify) run the chains of the kernel above,
+ * each in its order and with its roundings, so its bits; only which thread runs a chain changes.
+ * (Where two NaNs of different sign meet in one add, which one propagates follows the operand order
+ * the compiler picked, in the kernel above as here: such outputs are NaN in both, their sign bit
+ * may differ.) A workgroup is a (head group of HG, row) of NT threads:
+ *   keys     the row's key pointers in LDS (a zero row for no key), q as f32 in LDS, the expf
+ *            table, the sinks.
+ *   scores   a lane a key, HS heads at a time: each dot in d order, the key read straight from
+ *            global 16 bytes at a time, two 128-byte lines in flight, q broadcast from LDS (four
+ *            heads: from its bf16 row by scalar loads). Each
+ *            wave keeps its 32 keys' maximum per head (floored at -1e30; a NaN score never wins,
+ *            as in `mx < v ? v : mx`); the max is order-free, a -0/+0 choice included (s - max
+ *            and sink - max give the same exp either way).
+ *   softmax  p = glibc expf(s - max), a thread a key.
+ *   PV       a thread owns DPT latent columns x HPT heads and sums p k over the keys in key order;
+ *            sum p, key by key, in the first wave of each head part. The keys come either straight
+ *            from global (PVD: a wave walks 32-key blocks, one block's loads in flight, no barrier)
+ *            or through LDS tiles of NT/64 keys (a thread one 16-byte piece, P tiles in flight in
+ *            registers, a barrier a tile). A no-key slot adds p = 0 times a zero row: +0, which
+ *            leaves a sum that starts at +0 unchanged.
+ * No global load may sit under a branch: the wait-count pass then waits for every load in flight
+ * (s_wait_loadcnt 0) and the pipelining is gone; loads past the end read the zero row instead. */
+__device__ __align__(16) uint16_t kDsZeroKey[kDsAttnD];
+
+/* 16 bytes at p[i] by a global (not flat) load. */
+typedef unsigned int ds_v4u __attribute__((ext_vector_type(4)));
+__device__ __forceinline__ uint4 ds_ldg16(const uint16_t* p, int i) {
+    const ds_v4u v = ((__attribute__((address_space(1))) const ds_v4u*)p)[i];
+    return make_uint4(v.x, v.y, v.z, v.w);
+}
+
+struct DsDecLds {
+    long kp, sp, smx, sden, tab, u, sq, bmax, total;
+};
+/* nkq: keys rounded up to 32. kp [nkq] pointers, sp [HG][nkq] scores then p, smx / sden [HG] (sden
+ * holds the sinks until the den), tab the 32 doubles of the expf table; then, in one region,
+ * sq [HG][512] q and bmax [HG][nkq/32] block maxima (scores) or the two key tiles of a tiled PV
+ * (2 x nt x 16 bytes; nt = 0 for the direct PV). */
+__host__ __device__ constexpr DsDecLds ds_dec_lds(int nkq, int hg, int nt) {
+    DsDecLds l{};
+    l.kp = 0;
+    l.sp = (long)nkq * 8;
+    l.smx = l.sp + (long)hg * nkq * 4;
+    l.sden = l.smx + (long)hg * 4;
+    l.tab = (l.sden + (long)hg * 4 + 15) / 16 * 16;
+    l.u = l.tab + 32 * 8;
+    l.sq = l.u;
+    l.bmax = l.sq + (long)hg * kDsAttnD * 4;
+    const long sc = l.bmax + (long)hg * (nkq / 32) * 4, pv = l.u + 2L * nt * 16;
+    l.total = sc > pv ? sc : pv;
+    return l;
+}
+
+/* ds_expf with the table read from `tab` (an LDS copy of kDsExp2fTab): the same operations. */
+__device__ __forceinline__ float ds_expf_tab(float x, const unsigned long long* tab) {
+    const uint32_t ux = __float_as_uint(x);
+    const uint32_t abstop = (ux >> 20) & 0x7ffu;
+    if (abstop >= 0x42bu) {
+        if (ux == 0xff800000u) return 0.0f;
+        if (abstop >= 0x7f8u) return x + x;
+        if (x > 0x1.62e42ep6f) return kDsInf;
+        if (x < -0x1.9fe368p6f) return 0.0f;
+    }
+    const double xd = (double)x;
+    double z = 0x1.71547652b82fep+5 * xd;
+    double kd = z + 0x1.8p+52;
+    const unsigned long long ki = (unsigned long long)__double_as_longlong(kd);
+    kd -= 0x1.8p+52;
+    const double r = z - kd;
+    unsigned long long t = tab[ki % 32];
+    t += ki << 47;
+    const double s = __longlong_as_double((long long)t);
+    z = 0x1.c6af84b912394p-20 * r + 0x1.ebfce50fac4f3p-13;
+    const double r2 = r * r;
+    double y = 0x1.62e42ff0c52d6p-6 * r + 1.0;
+    y = z * r2 + y;
+    y = y * s;
+    return (float)y;
+}
+
+/* An offset of 0 the compiler cannot see through, made after the running sums and before the
+ * next 16 key bytes are unpacked: the q reads and key conversions of 8 columns cannot be hoisted
+ * above the previous columns' fmas (HS x 64 live floats spilled otherwise). */
+template <int HS>
+__device__ __forceinline__ int ds_dec_step(const float (&acc)[HS], uint32_t (&w)[4]) {
+    int z;
+    if constexpr (HS == 1)
+        asm volatile("v_mov_b32 %0, 0" : "=v"(z), "+v"(w[0]), "+v"(w[1]), "+v"(w[2]), "+v"(w[3]) : "v"(acc[0]));
+    else if constexpr (HS == 2)
+        asm volatile("v_mov_b32 %0, 0" : "=v"(z), "+v"(w[0]), "+v"(w[1]), "+v"(w[2]), "+v"(w[3])
+                     : "v"(acc[0]), "v"(acc[1]));
+    else
+        asm volatile("v_mov_b32 %0, 0" : "=v"(z), "+v"(w[0]), "+v"(w[1]), "+v"(w[2]), "+v"(w[3])
+                     : "v"(acc[0]), "v"(acc[1]), "v"(acc[2]), "v"(acc[3]));
+    return z;
+}
+
+/* 64 latent columns of one key (8 x 16 bytes) into the HS dots, in d order. With more than one
+ * head, step i+1's q reads go out (behind the fence of step i-1's sums) before step i's fmas. */
+template <int HS>
+__device__ __forceinline__ void ds_dec_dot(float (&acc)[HS], const uint4 (&r)[8], const float* qp) {
+    static_assert(HS == 1 || HS == 2 || HS == 4, "head subgroup");
+    if constexpr (HS == 1) {
+        /* one head: 64 hoisted q floats fit (no spill), and the hoist hides the LDS latency */
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const uint32_t wk[4] = { r[i].x, r[i].y, r[i].z, r[i].w };
+            const float4 qa = *(const float4*)(qp + i * 8);
+            const float4 qb = *(const float4*)(qp + i * 8 + 4);
+            const float qv[8] = { qa.x, qa.y, qa.z, qa.w, qb.x, qb.y, qb.z, qb.w };
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                acc[0] = __builtin_fmaf(qv[2 * e], bf16w_lo(wk[e]), acc[0]);
+                acc[0] = __builtin_fmaf(qv[2 * e + 1], bf16w_hi(wk[e]), acc[0]);
+            }
+        }
+    } else {
+        float4 qc[HS][2], qn[HS][2];
+        uint32_t wc[4] = { r[0].x, r[0].y, r[0].z, r[0].w }, wn[4];
+        {
+            const float* qi = qp + ds_dec_step<HS>(acc, wc);
+#pragma unroll
+            for (int h = 0; h < HS; ++h) {
+                qc[h][0] = *(const float4*)(qi + h * kDsAttnD);
+                qc[h][1] = *(const float4*)(qi + h * kDsAttnD + 4);
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            if (i + 1 < 8) {
+                wn[0] = r[i + 1].x; wn[1] = r[i + 1].y; wn[2] = r[i + 1].z; wn[3] = r[i + 1].w;
+                const float* qi = qp + ds_dec_step<HS>(acc, wn) + (i + 1) * 8;
+#pragma unroll
+                for (int h = 0; h < HS; ++h) {
+                    qn[h][0] = *(const float4*)(qi + h * kDsAttnD);
+                    qn[h][1] = *(const float4*)(qi + h * kDsAttnD + 4);
+                }
+            }
+#pragma unroll
+            for (int h = 0; h < HS; ++h) {
+                const float qv[8] = { qc[h][0].x, qc[h][0].y, qc[h][0].z, qc[h][0].w,
+                                      qc[h][1].x, qc[h][1].y, qc[h][1].z, qc[h][1].w };
+#pragma unroll
+                for (int e = 0; e < 4; ++e) {
+                    acc[h] = __builtin_fmaf(qv[2 * e], bf16w_lo(wc[e]), acc[h]);
+                    acc[h] = __builtin_fmaf(qv[2 * e + 1], bf16w_hi(wc[e]), acc[h]);
+                }
+            }
+            if (i + 1 < 8) {
+#pragma unroll
+                for (int h = 0; h < HS; ++h) { qc[h][0] = qn[h][0]; qc[h][1] = qn[h][1]; }
+#pragma unroll
+                for (int e = 0; e < 4; ++e) wc[e] = wn[e];
+            }
+        }
+    }
+}
+
+/* The HS-head dot of ds_dec_dot with q read straight from its bf16 row by scalar loads (wave-uniform
+ * addresses: qw the row's words at this chunk, ho[h] head h's word offset), so the q values take
+ * neither LDS bandwidth nor VGPRs. The same fmas in the same order. */
+template <int HS>
+__device__ __forceinline__ void ds_dec_dot_s(float (&acc)[HS], const uint4 (&r)[8], const uint32_t* qw,
+                                             const int (&ho)[HS]) {
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        uint32_t wk[4] = { r[i].x, r[i].y, r[i].z, r[i].w };
+        const int z = __builtin_amdgcn_readfirstlane(ds_dec_step<HS>(acc, wk));
+        const uint32_t* qi = qw + z + i * 4;
+#pragma unroll
+        for (int h = 0; h < HS; ++h) {
+            const uint32_t* qh = qi + ho[h];
+            const uint32_t qq[4] = { qh[0], qh[1], qh[2], qh[3] };
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                acc[h] = __builtin_fmaf(bf16w_lo(qq[e]), bf16w_lo(wk[e]), acc[h]);
+                acc[h] = __builtin_fmaf(bf16w_hi(qq[e]), bf16w_hi(wk[e]), acc[h]);
+            }
+        }
+    }
+}
+
+/* Four keys (their DPT columns in kw) into the HPT heads' sums p k, and sum p in the den wave,
+ * each chain in key order (libref's mul, then add). */
+template <int HPT, int DPT>
+__device__ __forceinline__ void ds_dec_pv4(float (&acc)[HPT][DPT], float (&den)[HPT], const uint32_t (&kw)[4],
+                                           const float* ph, int nkq, int k0, bool dw) {
+    float kf[4][DPT];
+#pragma unroll
+    for (int u = 0; u < 4; ++u) {
+        kf[u][0] = bf16w_lo(kw[u]);
+        if constexpr (DPT == 2) kf[u][DPT - 1] = bf16w_hi(kw[u]);
+    }
+#pragma unroll
+    for (int j = 0; j < HPT; ++j) {
+        const float4 pv = *(const float4*)(ph + (long)j * nkq + k0);
+        const float pk[4] = { pv.x, pv.y, pv.z, pv.w };
+#pragma unroll
+        for (int u = 0; u < 4; ++u) {
+#pragma unroll
+            for (int d = 0; d < DPT; ++d) {
+                const float prod = pk[u] * kf[u][d];
+                acc[j][d] = acc[j][d] + prod;
+            }
+        }
+        if (dw) {
+#pragma unroll
+            for (int u = 0; u < 4; ++u) den[j] = den[j] + pk[u];
+        }
+    }
+}
+
+/* The DPT columns at dcol of the 32 keys whose pointers lanes 0..31 hold (a wave-uniform pointer a
+ * key, through readlane), straight from global. */
+template <int DPT>
+__device__ __forceinline__ void ds_dec_pvld(uint32_t (&kv)[32], const uint16_t* lp, int dcol) {
+    const unsigned long long v = (unsigned long long)lp;
+    const int lo = (int)(uint32_t)v, hi = (int)(uint32_t)(v >> 32);
+#pragma unroll
+    for (int u = 0; u < 32; ++u) {
+        const unsigned long long pu = ((unsigned long long)(uint32_t)__builtin_amdgcn_readlane(hi, u) << 32) |
+                                      (uint32_t)__builtin_amdgcn_readlane(lo, u);
+        const uint16_t* p = (const uint16_t*)pu + dcol;
+        if constexpr (DPT == 2) kv[u] = *(__attribute__((address_space(1))) const uint32_t*)p;
+        else kv[u] = ldg_u16(p);
+    }
+}
+
+template <int HPT, int DPT>
+__device__ __forceinline__ void ds_dec_pvsum(float (&acc)[HPT][DPT], float (&den)[HPT], const uint32_t (&kv)[32],
+                                             const float* ph, int nkq, int k0, bool dw) {
+#pragma unroll
+    for (int u0 = 0; u0 < 32; u0 += 4) {
+        const uint32_t kw[4] = { kv[u0], kv[u0 + 1], kv[u0 + 2], kv[u0 + 3] };
+        ds_dec_pv4<HPT, DPT>(acc, den, kw, ph, nkq, k0 + u0, dw);
+    }
+}
+
+
+template <int HG, int NT, int DPT, int P, bool PVD>
+__global__ __launch_bounds__(NT) void ds41_attn_dec_kernel(DsAttnArgs a) {
+    constexpr int D = kDsAttnD, NW = NT / 32, NCG = D / DPT, TK = NT / 64;
+    constexpr int NHP = (NT / NCG) < HG ? (NT / NCG) : HG;   /* head parts in PV */
+    constexpr int HPT = HG / NHP;                           /* heads a PV thread */
+    constexpr int HS = HG < 4 ? HG : 4, NSG = HG / HS;      /* heads a score task, tasks a key block */
+    constexpr bool QS = HS == 4;                            /* q by scalar loads in the scores */
+    static_assert(HG % HS == 0, "head subgroups");
+    static_assert(NT % 64 == 0 && 32 % TK == 0 && TK % 4 == 0 && NT >= NCG && HG % NHP == 0 &&
+                  (DPT == 1 || DPT == 2) && P >= 1, "layout");
+    const int nkq = (a.nk + 31) / 32 * 32, nkb = nkq / 32, ntl = nkq / TK;
+    const DsDecLds L = ds_dec_lds(nkq, HG, PVD ? 0 : NT);
+    const uint16_t** kp = (const uint16_t**)(r4d_ds41_sparse_dyn + L.kp);
+    float* sp = (float*)(r4d_ds41_sparse_dyn + L.sp);
+    float* sq = (float*)(r4d_ds41_sparse_dyn + L.sq);
+    float* bmax = (float*)(r4d_ds41_sparse_dyn + L.bmax);
+    float* smx = (float*)(r4d_ds41_sparse_dyn + L.smx);
+    float* sden = (float*)(r4d_ds41_sparse_dyn + L.sden);
+    unsigned long long* tab = (unsigned long long*)(r4d_ds41_sparse_dyn + L.tab);
+    unsigned char* tiles = r4d_ds41_sparse_dyn + L.u;
+    const int tid = threadIdx.x, lane = tid & 31;
+    const int wave = __builtin_amdgcn_readfirstlane((int)(tid >> 5));
+    const int hg0 = blockIdx.x * HG;
+    const int hmax = min(HG, a.H - hg0);
+    const long m = blockIdx.y;
+    const uint16_t* zero = kDsZeroKey;
+
+    /* ---- the row's keys, in libref's order: the window, then the selections */
+    {
+        const int s = ds_seq_of_row(a.cu, a.cs, a.S, m);
+        const long p = a.pos[m * a.ps];
+        long lr = (long)a.cu[(long)(s + 1) * a.cs] - 1;
+        lr = lr < 0 ? 0 : (lr >= a.M ? a.M - 1 : lr);
+        const long last = a.pos[lr * a.ps];
+        const long first = last + 1 - (long)a.wused[(long)s * a.wus];
+        for (int k = tid; k < nkq; k += NT) {
+            const uint16_t* ptr = zero;
+            if (k < a.win) {
+                const long j = p - a.win + 1 + k, r = j - first;
+                if (j >= 0 && r >= 0 && r / a.bs < a.nwbt) {
+                    const long blk = a.wbt[(long)s * a.wbtr + (r / a.bs) * a.wbtc];
+                    if (blk >= 0 && blk < a.nwblk) ptr = a.wc + (blk * a.bs + r % a.bs) * (long)D;
+                }
+            } else if (k < a.nk) {
+                const long c = a.sel[m * a.selr + (long)(k - a.win) * a.selc];
+                if (c >= 0 && (c * a.ratio) / a.cbs < a.ncbt) {
+                    const long blk = a.cbt[(long)s * a.cbtr + ((c * a.ratio) / a.cbs) * a.cbtc];
+                    if (blk >= 0 && blk < a.ncblk)
+                        ptr = a.cc + (blk * a.cbs + (c * a.ratio) % a.cbs) * (long)(D / a.ratio);
+                }
+            }
+            kp[k] = ptr;
+        }
+        const uint32_t* qrow = (const uint32_t*)(a.q + m * a.qr) + (long)hg0 * (D / 2);
+        for (int i = tid; i < (QS ? 0 : HG * (D / 2)); i += NT) {
+            const int h = i / (D / 2), c = i % (D / 2);
+            const uint32_t w = qrow[(long)(h < hmax ? h : 0) * (D / 2) + c];
+            *(float2*)(sq + h * D + 2 * c) = make_float2(bf16w_lo(w), bf16w_hi(w));
+        }
+        if (tid < 32) tab[tid] = kDsExp2fTab[tid];
+        if (tid < hmax) sden[tid] = a.sink[(long)(hg0 + tid) * a.sks];   /* the sinks, until the den */
+    }
+    lds_barrier();
+
+    /* ---- scores: a lane a key, every dot in d order. A wave task is (32 keys, HS heads); the
+     * NSG tasks of a key block go to neighbouring waves, so the block's second read hits L0.
+     * Four heads read q by scalar loads (QS; LDS-bound otherwise), fewer from LDS. */
+    for (int t = wave; t < nkb * NSG; t += NW) {
+        const int kb = t / NSG, g = t % NSG;
+        const int k = kb * 32 + lane;
+        const uint16_t* kk = kp[k];
+        const bool have = kk != zero;
+        const float* qg = sq + g * HS * D;
+        float acc[HS];
+#pragma unroll
+        for (int h = 0; h < HS; ++h) acc[h] = 0.0f;
+        const uint32_t* qw = (const uint32_t*)(a.q + m * a.qr) + (long)hg0 * (D / 2);
+        int ho[HS];
+#pragma unroll
+        for (int h = 0; h < HS; ++h) ho[h] = (g * HS + h < hmax ? g * HS + h : 0) * (D / 2);
+        uint4 ra[8], rb[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) ra[i] = ds_ldg16(kk, i);
+        /* No branch around a load (the wait counts would fall back to 0): the last pass reloads
+         * its own first half, unused. */
+#pragma unroll 1
+        for (int c = 0; c < D / 8; c += 16) {
+#pragma unroll
+            for (int i = 0; i < 8; ++i) rb[i] = ds_ldg16(kk, c + 8 + i);
+            if constexpr (QS) ds_dec_dot_s<HS>(acc, ra, qw + c * 4, ho);
+            else ds_dec_dot<HS>(acc, ra, qg + c * 8);
+            const int cn = c + 16 < D / 8 ? c + 16 : c;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) ra[i] = ds_ldg16(kk, cn + i);
+            if constexpr (QS) ds_dec_dot_s<HS>(acc, rb, qw + (c + 8) * 4, ho);
+            else ds_dec_dot<HS>(acc, rb, qg + (c + 8) * 8);
+        }
+#pragma unroll
+        for (int h = 0; h < HS; ++h) {
+            const int hh = g * HS + h;
+            const float v = have ? acc[h] * a.scale : -kDsInf;
+            sp[(long)hh * nkq + k] = v;
+            const float t2 = r4d_wave_max(-1e30f < v ? v : -1e30f);
+            if (lane == 0) bmax[hh * nkb + kb] = t2;
+        }
+    }
+
+    /* PV through LDS tiles: the first tiles' loads go out now, under the softmax. A thread carries
+     * one 16-byte piece (key lk of the tile, piece lc) of each of P tiles. No load sits under a
+     * branch (the wait counts would fall back to 0): past the last tile they read the zero row. */
+    const int lk = tid >> 6, lc = tid & 63;
+    uint4 rg[PVD ? 1 : P];
+    if constexpr (!PVD) {
+#pragma unroll
+        for (int s = 0; s < P; ++s) {
+            const uint16_t* pp = kp[min(s, ntl - 1) * TK + lk];
+            rg[s] = ds_ldg16(s < ntl ? pp : zero, lc);
+        }
+    }
+    lds_barrier();
+
+    /* ---- per head: the max, then p in place (0 for no key) */
+#pragma unroll 1
+    for (int h = 0; h < HG; ++h) {
+        float t = -1e30f;
+        for (int j = lane; j < nkb; j += 32) t = fmaxf(t, bmax[h * nkb + j]);
+        const float mx = r4d_wave_max(t);
+        if (tid == 0) smx[h] = mx;
+        float* sh = sp + (long)h * nkq;
+        for (int k = tid; k < nkq; k += NT) sh[k] = kp[k] != zero ? ds_expf_tab(sh[k] - mx, tab) : 0.0f;
+    }
+    lds_barrier();                                       /* sq and bmax are dead: tiles may land */
+
+    /* ---- sum p k and sum p, key by key in libref's order */
+    const int cg = tid % NCG, hp = tid / NCG;
+    const int dcol = cg * DPT;
+    float acc[HPT][DPT], den[HPT];
+#pragma unroll
+    for (int j = 0; j < HPT; ++j) {
+        den[j] = 0.0f;
+#pragma unroll
+        for (int d = 0; d < DPT; ++d) acc[j][d] = 0.0f;
+    }
+    const bool pvt = hp < NHP;                           /* wave-uniform: NCG is a multiple of 32 */
+    const bool dw = cg < 32;
+    const float* ph = sp + (long)(pvt ? hp * HPT : 0) * nkq;
+    if constexpr (PVD) {
+        /* Straight from global: a wave walks 32-key blocks, lane L holding block key L's pointer
+         * (handed to the whole wave by readlane), one block's loads in flight while the previous
+         * block is summed. Past the last block the loads read the zero row. */
+        if (pvt) {
+            uint32_t kv[2][32];
+            const uint16_t* lp = kp[lane];
+            ds_dec_pvld<DPT>(kv[0], lp, dcol);
+#pragma unroll 1
+            for (int kb = 0; kb < nkb; kb += 2) {
+                lp = kb + 1 < nkb ? kp[(kb + 1) * 32 + lane] : zero;
+                ds_dec_pvld<DPT>(kv[1], lp, dcol);
+                ds_dec_pvsum<HPT, DPT>(acc, den, kv[0], ph, nkq, kb * 32, dw);
+                lp = kb + 2 < nkb ? kp[(kb + 2) * 32 + lane] : zero;
+                ds_dec_pvld<DPT>(kv[0], lp, dcol);
+                if (kb + 1 < nkb) ds_dec_pvsum<HPT, DPT>(acc, den, kv[1], ph, nkq, (kb + 1) * 32, dw);
+            }
+        }
+    } else {
+        *(uint4*)(tiles + lk * (D * 2) + lc * 16) = rg[0];
+        {
+            const uint16_t* pp = kp[min(P, ntl - 1) * TK + lk];
+            rg[0] = ds_ldg16(P < ntl ? pp : zero, lc);
+        }
+        lds_barrier();
+#pragma unroll 1
+        for (int t0 = 0; t0 < ntl; t0 += P) {
+#pragma unroll
+            for (int s = 0; s < P; ++s) {
+                const int t = t0 + s;
+                /* the pointer of the ring's next load first, off the tail of the step */
+                const uint16_t* pp = kp[min(t + 1 + P, ntl - 1) * TK + lk];
+                if (pvt && t < ntl) {
+                    const unsigned char* tb = tiles + (t & 1) * (TK * D * 2) + dcol * 2;
+#pragma unroll
+                    for (int u0 = 0; u0 < TK; u0 += 4) {
+                        uint32_t kw[4];
+#pragma unroll
+                        for (int u = 0; u < 4; ++u) {
+                            if constexpr (DPT == 2) kw[u] = *(const uint32_t*)(tb + (u0 + u) * (D * 2));
+                            else kw[u] = *(const uint16_t*)(tb + (u0 + u) * (D * 2));
+                        }
+                        ds_dec_pv4<HPT, DPT>(acc, den, kw, ph, nkq, t * TK + u0, dw);
+                    }
+                }
+                /* tile t+1 into the other buffer (read last before the previous barrier) */
+                const int sn = (s + 1) % P;
+                *(uint4*)(tiles + ((t + 1) & 1) * (TK * D * 2) + lk * (D * 2) + lc * 16) = rg[sn];
+                rg[sn] = ds_ldg16(t + 1 + P < ntl ? pp : zero, lc);
+                lds_barrier();
+            }
+        }
+    }
+    if (pvt && cg == 0) {
+#pragma unroll
+        for (int j = 0; j < HPT; ++j) {
+            const int h = hp * HPT + j;
+            if (h < hmax) sden[h] = den[j] + ds_expf_tab(sden[h] - smx[h], tab);
+        }
+    }
+    lds_barrier();
+    if (pvt) {
+        uint16_t* orow = a.out + m * a.outr + (long)hg0 * D + dcol;
+#pragma unroll
+        for (int j = 0; j < HPT; ++j) {
+            const int h = hp * HPT + j;
+            if (h >= hmax) break;
+            const float dn = sden[h];
+            if constexpr (DPT == 2) {
+                const uint32_t lo = ds_bf16_bits(acc[j][0] / dn), hi = ds_bf16_bits(acc[j][DPT - 1] / dn);
+                *(uint32_t*)(orow + (long)h * D) = lo | (hi << 16);
+            } else {
+                orow[(long)h * D] = (uint16_t)ds_bf16_bits(acc[j][0] / dn);
+            }
+        }
+    }
+}
+
 /* ================================================================== attn_sparse_sink on WMMA
  *
  * Passes of more than kWmRows rows (prefill) on v_wmma_f32_16x16x16_bf16. A workgroup is a
@@ -748,8 +1213,6 @@ constexpr int kWmRows = 48;                          /* passes up to this many r
 constexpr int kWmWaves = 4;
 constexpr int kWmCols = kDsAttnD / kWmWaves;         /* latent columns a wave */
 constexpr int kWmSbufBytes = 2 * kWmWaves * 32 * 8 * 4;
-
-__device__ __align__(16) uint16_t kDsZeroKey[kDsAttnD];
 
 __host__ __device__ constexpr long ds_wm_mask_off(int nkt) { return (long)nkt * 16 * 8; }
 __host__ __device__ constexpr long ds_wm_sbuf_off(int nkt) {
@@ -1231,6 +1694,43 @@ int attn_emit(RadStream stream, const DsAttnArgs& s, unsigned gz) {
     return R4D_EMIT(stream, (ds41_attn_sparse_sink_kernel<HG, DS>), grid, dim3(256), lds, s);
 }
 
+template <int HG, int NT, int DPT, bool PVD>
+int attn_dec_go(RadStream stream, const DsAttnArgs& s) {
+    constexpr int P = 4;                                /* key tiles in flight in PV */
+    const int nkq = (s.nk + 31) / 32 * 32;
+    const long lds = ds_dec_lds(nkq, HG, PVD ? 0 : NT).total;
+    if (lds > 65536) return RAD_E_UNSUPPORTED;
+    const dim3 grid((unsigned)((s.H + HG - 1) / HG), (unsigned)s.M);
+    return R4D_EMIT(stream, (ds41_attn_dec_kernel<HG, NT, DPT, P, PVD>), grid, dim3(NT), (uint32_t)lds, s);
+}
+
+/* The decode band's kernel. The form by how many (row, head) pairs the pass has, any choice giving
+ * the same bits (measured on R9700, 32 heads x 640 keys: one row 17 us, 2 rows 27, 3-4 rows 44,
+ * 5-8 rows 73, 48 rows 367; the scalar kernel 129-582). On an LDS refusal (long rows), the next
+ * smaller form; the one-head form takes every row this op accepts. */
+int attn_dec_emit(RadStream stream, const DsAttnArgs& s) {
+    if (s.M > 65535 || (s.H + 0L) > 65535L * 8) return RAD_E_UNSUPPORTED;
+    const long hr = (long)s.M * s.H;
+    int c = hr <= 32 ? 0 : (hr <= 64 ? 1 : (hr <= 128 ? 2 : (hr <= 256 ? 3 : 4)));
+    static const int next[7] = { -1, 0, 1, 2, 5, 6, 1 };
+    while (c >= 0) {
+        int rc = RAD_E_UNSUPPORTED;
+        switch (c) {
+            case 0: rc = attn_dec_go<1, 1024, 2, true>(stream, s); break;
+            case 1: rc = attn_dec_go<2, 1024, 2, true>(stream, s); break;
+            case 2: rc = attn_dec_go<4, 1024, 2, true>(stream, s); break;
+            case 3: rc = attn_dec_go<8, 1024, 2, true>(stream, s); break;
+            case 4: rc = attn_dec_go<8, 512, 2, false>(stream, s); break;
+            case 5: rc = attn_dec_go<4, 512, 2, false>(stream, s); break;
+            case 6: rc = attn_dec_go<2, 512, 2, false>(stream, s); break;
+            default: break;
+        }
+        if (rc != RAD_E_UNSUPPORTED) return rc;
+        c = next[c];
+    }
+    return RAD_E_UNSUPPORTED;
+}
+
 int attn_body(const RadArgs* a, RadStream stream) {
     /* Operands 4-6 are optional (null without a compressed source), as in libref. */
     if (!a || a->n_t < 11 || !a->t) return RAD_E_INVAL;
@@ -1327,6 +1827,13 @@ int attn_body(const RadArgs* a, RadStream stream) {
     /* Head group and d split by how many workgroups the rows give. Every choice sums each output
      * in the same order, so the bits do not depend on it. */
     const long rows = s.M;
+    if (rows <= kWmRows) {
+        static const int dec_off = ds_env_int("R4D_ATTN_DEC_OFF", 0);
+        if (!dec_off) {
+            const int rc = attn_dec_emit(stream, s);
+            if (rc != RAD_E_UNSUPPORTED) return rc;
+        }
+    }
     int HG = 8, DS = 1;
     if (rows * H < 2048) HG = rows * H >= 512 ? 4 : 2;
     if (HG == 2) DS = 2;

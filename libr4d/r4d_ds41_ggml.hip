@@ -2496,6 +2496,19 @@ __device__ __forceinline__ gg_v8f gg_wmma(r4d_u32x4 a, r4d_u32x4 b, gg_v8f c) {
     return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(__builtin_bit_cast(gg_v8bf, a),
                                                              __builtin_bit_cast(gg_v8bf, b), c);
 }
+/* Keep eight values computed here (an empty asm reading and writing each, one VGPR apiece). */
+__device__ __forceinline__ void gg_pin8(gg_v8f& v) {
+    float a0 = v[0], a1 = v[1], a2 = v[2], a3 = v[3], a4 = v[4], a5 = v[5], a6 = v[6], a7 = v[7];
+    asm volatile("" : "+v"(a0), "+v"(a1), "+v"(a2), "+v"(a3), "+v"(a4), "+v"(a5), "+v"(a6), "+v"(a7));
+    v[0] = a0; v[1] = a1; v[2] = a2; v[3] = a3; v[4] = a4; v[5] = a5; v[6] = a6; v[7] = a7;
+}
+/* A wave-uniform pointer in SGPRs (for the scalar prefetch). */
+__device__ __forceinline__ const uint8_t* gg_sptr(const uint8_t* p) {
+    const uint64_t u = (uint64_t)p;
+    const uint32_t lo = (uint32_t)__builtin_amdgcn_readfirstlane((int)(uint32_t)u);
+    const uint32_t hi = (uint32_t)__builtin_amdgcn_readfirstlane((int)(uint32_t)(u >> 32));
+    return (const uint8_t*)(((uint64_t)hi << 32) | lo);
+}
 /* libref's products with an infinite d mix signs (and zeros): NaN. */
 __device__ __forceinline__ float gg_wm_fin(float s) { return __builtin_isinf(s) ? __builtin_nanf("") : s; }
 /* Four selector dwords against a pool (lo: low bytes, hi: high bytes of the values). */
@@ -2513,6 +2526,18 @@ template <int T> struct Wq;
  * reads them again. */
 struct WqBase {
     static constexpr int XG = 0, MINS = 0, CINIT = 0, ROLL = 0, GUARD = 0;
+    /* Raw words loaded a slab ahead into a second set (bit k: word k); ROLL types reload the
+     * others in place after their last use (reload<J>), which leaves a word whose next-slab first
+     * use comes soon after its last use too little time to arrive -- those go early. */
+    static constexpr uint32_t EARLY = 0xffffffffu;
+    /* B fragments a K step ahead (decoded behind the previous step's WMMAs); the wide K-quant
+     * blocks (Q6_K, Q5_K) decode in their own step: the second fragment set and the inits it
+     * keeps live cost them a block a WGP (> 240 VGPRs). */
+    static constexpr int PIPE = 1;
+    /* A K step's LDS table reads, issued a step ahead of its decode (none for the K-quants). */
+    struct Pf {};
+    template <int J>
+    __device__ static __forceinline__ void pre(const uint32_t*, int, const uint8_t*, Pf&) {}
     template <int J>
     __device__ static __forceinline__ void reload(const uint8_t*, int, int, uint32_t*) {}
     static constexpr float XGK = 0.0f;
@@ -2520,10 +2545,13 @@ struct WqBase {
 };
 
 /* IQ1_S. Lane half h of slab c takes sub-blocks 4c + 2h and 4c + 2h + 1; K step J is group J & 3
- * of the lane's sub-block J >> 2. Table: 2048 selector entries (value b = grid + 1 at byte b, its
- * high byte at b + 4), then 16 pools by qh >> 12 (s, the delta's sign): (2 s + 1)(b - 1 + delta). */
+ * of the lane's sub-block J >> 2. Table: the 2048 grid entries as bytes b = grid + 1 (two dwords),
+ * then 16 pools by qh >> 12 (s, the delta's sign): the low and the high bytes of the bf16 values
+ * (2 s + 1)(b - 1 + delta), b = 0, 1, 2. Decode: v_perm with the grid dword as the selector looks
+ * four values' low (high) bytes up in the pool; two more v_perm interleave them into bf16 pairs. */
 template <> struct Wq<GG_IQ1_S> : WqBase {
-    static constexpr int RAW = 4, SPG = 8, TB = 2048 * 16 + 16 * 8;
+    static constexpr int RAW = 4, SPG = 8, TB = 2048 * 8 + 16 * 8;
+    struct Pf { gg_u32x2 g, p; };
     __device__ static __forceinline__ int xoff(int J, int h) { return 64 * h + 8 * J; }
     __device__ static __forceinline__ void load(const uint8_t* row, int s, int h, uint32_t* r) {
         const uint8_t* b = row + (long long)(s >> 1) * 50;
@@ -2536,26 +2564,28 @@ template <> struct Wq<GG_IQ1_S> : WqBase {
     }
     __device__ static __forceinline__ float scale(const uint32_t* r, int, int) { return gg_wm_fin(gg_h2f(r[0])); }
     template <int J>
-    __device__ static __forceinline__ r4d_u32x4 bfrag(const uint32_t* r, int, const uint8_t* tab, int) {
+    __device__ static __forceinline__ void pre(const uint32_t* r, int, const uint8_t* tab, Pf& f) {
         constexpr int SB = J >> 2, G = J & 3;
         const uint32_t qh = SB ? (r[3] >> 16) : (r[3] & 0xffffu);
         const uint32_t gi = gg_byte(r[1 + SB], G) | (((qh >> (3 * G)) & 7u) << 8);
-        const r4d_u32x4 sel = *(const r4d_u32x4*)(const void*)(tab + 16 * gi);
-        const gg_u32x2 pool = *(const gg_u32x2*)(const void*)(tab + 2048 * 16 + 8 * (qh >> 12));
-        return gg_wm_perm4(pool.y, pool.x, sel);
+        f.g = *(const gg_u32x2*)(const void*)(tab + 8 * gi);
+        f.p = *(const gg_u32x2*)(const void*)(tab + 2048 * 8 + 8 * (qh >> 12));
+    }
+    template <int J>
+    __device__ static __forceinline__ r4d_u32x4 bfrag(const uint32_t*, int, const Pf& f, int) {
+        r4d_u32x4 b;
+#pragma unroll
+        for (int w = 0; w < 2; ++w) {
+            const uint32_t gw = w ? f.g.y : f.g.x;
+            const uint32_t lo = __builtin_amdgcn_perm(f.p.x, f.p.x, gw), hi = __builtin_amdgcn_perm(f.p.y, f.p.y, gw);
+            b[2 * w] = __builtin_amdgcn_perm(hi, lo, 0x05010400u);
+            b[2 * w + 1] = __builtin_amdgcn_perm(hi, lo, 0x07030602u);
+        }
+        return b;
     }
     __device__ static __forceinline__ void table(uint8_t* lds) {
         const int tid = (int)threadIdx.x;
-        for (int i = tid; i < 2048; i += (int)blockDim.x) {
-            const uint64_t g = kGgIq1sGridP1[i];
-            r4d_u32x4 v;
-#pragma unroll
-            for (int p = 0; p < 4; ++p) {
-                const uint32_t b0 = (uint32_t)(g >> (16 * p)) & 0xffu, b1 = (uint32_t)(g >> (16 * p + 8)) & 0xffu;
-                v[p] = b0 | ((b0 + 4u) << 8) | (b1 << 16) | ((b1 + 4u) << 24);
-            }
-            ((r4d_u32x4*)(void*)lds)[i] = v;
-        }
+        for (int i = tid; i < 2048; i += (int)blockDim.x) ((uint64_t*)(void*)lds)[i] = kGgIq1sGridP1[i];
         if (tid < 16) {
             const float m = (float)(2 * (tid & 7) + 1), dl = (tid & 8) ? -0.125f : 0.125f;
             uint32_t lo = 0, hi = 0;
@@ -2568,14 +2598,14 @@ template <> struct Wq<GG_IQ1_S> : WqBase {
             gg_u32x2 pv;
             pv.x = lo;
             pv.y = hi;
-            ((gg_u32x2*)(void*)(lds + 2048 * 16))[tid] = pv;
+            ((gg_u32x2*)(void*)(lds + 2048 * 8))[tid] = pv;
         }
     }
 };
 
-/* IQ2_XXS. K step J is sub-block J >> 1 of the slab, group 2 (J & 1) + h. Table: 256 selector
- * entries (8 / 25 / 43 at bytes 0 / 1 / 2, high bytes 0x41 / 0x42 at 4 / 5, negated at 6 / 7),
- * then 128 sign masks (bit 1 of a high byte's selector, by the seven stored sign bits). */
+/* IQ2_XXS. K step J is sub-block J >> 1 of the slab, group 2 (J & 1) + h. Table: the 256 grid
+ * entries as bf16 (8 / 25 / 43, exact), then 128 sign masks (0x8000 a negated value, by the seven
+ * stored sign bits): a B fragment is one xor. */
 template <> struct Wq<GG_IQ2_XXS> : WqBase {
     static constexpr int RAW = 9, SPG = 2, TB = 256 * 16 + 128 * 16;
     __device__ static __forceinline__ int xoff(int J, int h) { return 16 * J + 8 * h; }
@@ -2590,17 +2620,21 @@ template <> struct Wq<GG_IQ2_XXS> : WqBase {
         }
     }
     __device__ static __forceinline__ float scale(const uint32_t* r, int q, int) {
-        return gg_wm_fin(gg_h2f(r[0]) * (0.5f + (float)(r[2 + 2 * q] >> 28)) * 0.25f);
+        return gg_wm_fin(gg_h2f(r[0])) * (0.5f + (float)(r[2 + 2 * q] >> 28)) * 0.25f;   /* exact; inf d -> NaN either way */
     }
+    struct Pf { r4d_u32x4 sel, sm; };
     template <int J>
-    __device__ static __forceinline__ r4d_u32x4 bfrag(const uint32_t* r, int h, const uint8_t* tab, int) {
+    __device__ static __forceinline__ void pre(const uint32_t* r, int h, const uint8_t* tab, Pf& f) {
         constexpr int SB = J >> 1;
         const int G = 2 * (J & 1) + h;
         const uint32_t gi = (r[1 + 2 * SB] >> (8 * G)) & 0xffu;
         const uint32_t sx = (r[2 + 2 * SB] >> (7 * G)) & 127u;
-        const r4d_u32x4 sel = *(const r4d_u32x4*)(const void*)(tab + 16 * gi);
-        const r4d_u32x4 sm = *(const r4d_u32x4*)(const void*)(tab + 4096 + 16 * sx);
-        return gg_wm_perm4(0xC2C14241u, 0x002CC800u, sel ^ sm);
+        f.sel = *(const r4d_u32x4*)(const void*)(tab + 16 * gi);
+        f.sm = *(const r4d_u32x4*)(const void*)(tab + 4096 + 16 * sx);
+    }
+    template <int J>
+    __device__ static __forceinline__ r4d_u32x4 bfrag(const uint32_t*, int, const Pf& f, int) {
+        return f.sel ^ f.sm;
     }
     __device__ static __forceinline__ void table(uint8_t* lds) {
         const int tid = (int)threadIdx.x;
@@ -2612,9 +2646,8 @@ template <> struct Wq<GG_IQ2_XXS> : WqBase {
                 uint32_t w = 0;
 #pragma unroll
                 for (int t = 0; t < 2; ++t) {
-                    const uint32_t by = (uint32_t)(g >> (16 * p + 8 * t)) & 0xffu;
-                    const uint32_t ix = by == 0x08u ? 0u : (by == 0x19u ? 1u : 2u);
-                    w |= (ix | ((4u + (ix == 2u ? 1u : 0u)) << 8)) << (16 * t);
+                    const uint32_t by = (uint32_t)(g >> (16 * p + 8 * t)) & 0xffu;   /* 8, 25 or 43 */
+                    w |= (__float_as_uint((float)by) >> 16) << (16 * t);              /* exact bf16 */
                 }
                 v[p] = w;
             }
@@ -2624,7 +2657,7 @@ template <> struct Wq<GG_IQ2_XXS> : WqBase {
             const uint32_t sg = (uint32_t)i | ((__builtin_popcount((uint32_t)i) & 1u) << 7);
             r4d_u32x4 v;
 #pragma unroll
-            for (int p = 0; p < 4; ++p) v[p] = (((sg >> (2 * p)) & 1u) << 9) | (((sg >> (2 * p + 1)) & 1u) << 25);
+            for (int p = 0; p < 4; ++p) v[p] = (((sg >> (2 * p)) & 1u) << 15) | (((sg >> (2 * p + 1)) & 1u) << 31);
             ((r4d_u32x4*)(void*)(lds + 4096))[i] = v;
         }
     }
@@ -2644,6 +2677,7 @@ __device__ __forceinline__ void gg_wm_u128(uint32_t u, uint32_t* b) {
  * values exact through f32 (v_cvt_f32_i32 of the sign-extended byte). */
 template <> struct Wq<GG_Q8_0> : WqBase {
     static constexpr int RAW = 20, SPG = 2, TB = 0, ROLL = 1;
+    static constexpr uint32_t EARLY = 0;
     __device__ static __forceinline__ int xoff(int J, int h) { return 16 * J + 8 * h; }
     __device__ static __forceinline__ void load1(const uint8_t* row, int s, int h, int i, uint32_t* r) {
         const uint8_t* b = row + (long long)(4 * s + i) * 34;
@@ -2666,7 +2700,7 @@ template <> struct Wq<GG_Q8_0> : WqBase {
     }
     __device__ static __forceinline__ float scale(const uint32_t* r, int q, int) { return gg_wm_fin(gg_h2f(r[5 * q])); }
     template <int J>
-    __device__ static __forceinline__ r4d_u32x4 bfrag(const uint32_t* r, int, const uint8_t*, int) {
+    __device__ static __forceinline__ r4d_u32x4 bfrag(const uint32_t* r, int, const Pf&, int) {
         constexpr int B0 = 5 * (J >> 1) + 1 + 2 * (J & 1);
         r4d_u32x4 b;
 #pragma unroll
@@ -2685,7 +2719,8 @@ template <> struct Wq<GG_Q8_0> : WqBase {
  * one v_perm_b32 a pair) and each chain starts at -160 (sum x) over the group: the sum is
  * sum x (q6 - 32), every operand exact. */
 template <> struct Wq<GG_Q6_K> : WqBase {
-    static constexpr int RAW = 15, SPG = 1, TB = 0, XG = 16, CINIT = 1, ROLL = 1;
+    static constexpr int RAW = 15, SPG = 1, TB = 0, XG = 16, CINIT = 1, ROLL = 1, PIPE = 0;
+    static constexpr uint32_t EARLY = 0x4f00u;   /* qh pairs (8..11) and d (14) */
     static constexpr float XGK = -160.0f;
     __device__ static __forceinline__ int xoff(int J, int h) { return 16 * J + 8 * h; }
     /* ql pair i ((q & 1) = i >> 1, l-half i & 1), qh pair i (l-half), scales and d. */
@@ -2714,26 +2749,33 @@ template <> struct Wq<GG_Q6_K> : WqBase {
         lqh(b, c, h, 1, r);
         lsc(b, c, r);
     }
-    /* Last uses: ql pair i at step 4 + i, qh pair i at 6 + i, scales and d at 7. */
+    /* Last uses: ql pair i at step 4 + i (next used at i), the scale words at 3 and 7 (next
+     * used at 0 and 4); qh and d (used every step) go early. */
     template <int J>
     __device__ static __forceinline__ void reload(const uint8_t* row, int s, int h, uint32_t* r) {
         const uint8_t* b = row + (long long)(s >> 1) * 210;
         const int c = s & 1;
         if constexpr (J >= 4) lql(b, c, h, J - 4, r);
-        if constexpr (J >= 6) lqh(b, c, h, J - 6, r);
-        if constexpr (J == 7) lsc(b, c, r);
+        if constexpr (J == 3) r[12] = *(gg_gu32a2)(const void*)(b + 192 + 8 * c);
+        if constexpr (J == 7) r[13] = *(gg_gu32a2)(const void*)(b + 196 + 8 * c);
     }
+    /* d sc: fma(d, sc + 128, -128 d), sc + 128 the byte of sc ^ 0x80 (v_cvt_f32_ubyte); d sc is exact
+     * (11 x 8 bits), so the fma returns it. An infinite d -> NaN, as gg_wm_fin(d sc). */
     __device__ static __forceinline__ float scale(const uint32_t* r, int J, int) {
-        return gg_wm_fin(gg_h2f(r[14]) * (float)gg_sbyte(J < 4 ? r[12] : r[13], J & 3));
+        const float d = gg_wm_fin(gg_h2f(r[14]));
+        const uint32_t u = gg_byte((J < 4 ? r[12] : r[13]) ^ 0x80808080u, J & 3);
+        return __builtin_fmaf(d, (float)u, -128.0f * d);
     }
     template <int J>
-    __device__ static __forceinline__ r4d_u32x4 bfrag(const uint32_t* r, int, const uint8_t*, int) {
+    __device__ static __forceinline__ r4d_u32x4 bfrag(const uint32_t* r, int, const Pf&, int) {
         constexpr int Q = J >> 1, LH = J & 1;
         constexpr int QL = 2 * (2 * (Q & 1) + LH), QH = 8 + 2 * LH;
         r4d_u32x4 b;
 #pragma unroll
         for (int w = 0; w < 2; ++w) {
-            const uint32_t u = ((r[QL + w] >> (4 * (Q >> 1))) & 0x0F0F0F0Fu) | (((r[QH + w] >> (2 * Q)) & 0x03030303u) << 4);
+            const uint32_t qh = r[QH + w];
+            const uint32_t hs = Q < 2 ? qh << (4 - 2 * Q) : qh >> (2 * Q - 4);   /* qh bits 2Q, 2Q + 1 -> 4, 5 */
+            const uint32_t u = ((r[QL + w] >> (4 * (Q >> 1))) & 0x0F0F0F0Fu) | (hs & 0x30303030u);   /* v_bfi */
             uint32_t p[2];
             gg_wm_u128(u, p);
             b[2 * w] = p[0];
@@ -2749,7 +2791,8 @@ template <> struct Wq<GG_Q6_K> : WqBase {
  * The WMMA sees 128 + q5, so P = sum x (128 + q5) and y = d1 P - (128 d1 + m1) sum x: one fma on
  * the staged group sum (the min term and the offset together). */
 template <> struct Wq<GG_Q5_K> : WqBase {
-    static constexpr int RAW = 16, SPG = 2, TB = 0, XG = 32, MINS = 1, ROLL = 1, GUARD = 1;
+    static constexpr int RAW = 16, SPG = 2, TB = 0, XG = 32, MINS = 1, ROLL = 1, GUARD = 1, PIPE = 0;
+    static constexpr uint32_t EARLY = 0xf00fu;   /* d / dmin, scales (0..3) and qh pairs (12..15) */
     static constexpr float XGK = 1.0f;
     __device__ static __forceinline__ int xoff(int J, int h) { return 16 * J + 8 * h; }
     /* ql pair i (chunk 2c + (i >> 1), l-half i & 1), qh pair i (l-half), d / dmin and scales. */
@@ -2778,31 +2821,28 @@ template <> struct Wq<GG_Q5_K> : WqBase {
         lqh(b, h, 0, r);
         lqh(b, h, 1, r);
     }
-    /* Last uses: ql pairs 0 / 1 at steps 2 / 3, 2 / 3 at 6 / 7, qh pairs at 6 / 7, d and scales at 7. */
+    /* Last uses: ql pairs 0 / 1 at steps 2 / 3, 2 / 3 at 6 / 7 (next used two steps after
+     * that, a slab on); d, scales and qh (used throughout) go early. */
     template <int J>
     __device__ static __forceinline__ void reload(const uint8_t* row, int s, int h, uint32_t* r) {
         const uint8_t* b = row + (long long)(s >> 1) * 176;
         const int c = s & 1;
         if constexpr (J == 2 || J == 3) lql(b, c, h, J - 2, r);
-        if constexpr (J >= 6) {
-            lql(b, c, h, J - 4, r);
-            lqh(b, h, J - 6, r);
-        }
-        if constexpr (J == 7) lsc(b, r);
+        if constexpr (J >= 6) lql(b, c, h, J - 4, r);
     }
     /* scale_min_k4(4c + g): q[g], q[g + 4], q[g + 8] are byte g of r[1], r[2], r[3]. */
     __device__ static __forceinline__ float scale(const uint32_t* r, int g, int s) {
         const uint32_t qa = gg_byte(r[1], g), qc = gg_byte(r[3], g);
         const uint32_t sc = (s & 1) ? ((qc & 0xFu) | ((qa >> 6) << 4)) : (qa & 63u);
-        return gg_wm_fin(gg_h2f(r[0] & 0xffffu) * (float)sc);
+        return gg_wm_fin(gg_h2f(r[0] & 0xffffu)) * (float)sc;   /* d sc exact; inf d -> NaN either way */
     }
     __device__ static __forceinline__ float mins(const uint32_t* r, int g, int s) {
         const uint32_t qb = gg_byte(r[2], g), qc = gg_byte(r[3], g);
         const uint32_t mn = (s & 1) ? ((qc >> 4) | ((qb >> 6) << 4)) : (qb & 63u);
-        return -(128.0f * scale(r, g, s) + gg_wm_fin(gg_h2f(r[0] >> 16) * (float)mn));
+        return -(128.0f * scale(r, g, s) + gg_wm_fin(gg_h2f(r[0] >> 16)) * (float)mn);
     }
     template <int J>
-    __device__ static __forceinline__ r4d_u32x4 bfrag(const uint32_t* r, int, const uint8_t*, int s) {
+    __device__ static __forceinline__ r4d_u32x4 bfrag(const uint32_t* r, int, const Pf&, int s) {
         constexpr int G = J >> 1, JL = G >> 1, HI = G & 1, LH = J & 1;
         constexpr int QL = 4 + 2 * (2 * JL + LH), QH = 12 + 2 * LH;
         const int hb = 4 * (s & 1) + G;
@@ -2823,14 +2863,19 @@ template <> struct Wq<GG_Q5_K> : WqBase {
 template <int T, int MT, bool MOE, typename OT>
 __global__ __launch_bounds__(256) void gg_wm_kernel(GgTiledArgs A) {
     using W = Wq<T>;
+    using Pf = typename W::Pf;
     constexpr int BM = 16 * MT;
+    constexpr int XE = BM * kWmXP;                                  /* bf16 a staged slab */
+    constexpr int XGE = W::XG > 0 ? kWmS / W::XG * BM : 0;          /* floats a slab's group sums */
     extern __shared__ __attribute__((aligned(16))) uint8_t gg_smem[];
-    __shared__ int s_e, s_r0, s_r1, s_nmt;
+    __shared__ int s_e, s_r0, s_r1, s_nmt, s_any;
     __shared__ int s_tok[BM];
     const int tid = (int)threadIdx.x, lane = tid & 31, wave = tid >> 5;
     int e = 0, r0, r1;
     if constexpr (MOE) {
-        /* Slot blockIdx.x -> (expert, its tile), as gg_tiled_kernel. */
+        /* Slot blockIdx.x -> (expert, its tile), as gg_tiled_kernel. (Chunk-major -- a tile's 256-row
+         * chunks together -- wins the all-VRAM bench but costs the real serve ~1.5x: the tiered
+         * experts' weights stream better spread across the dispatch.) */
         if (wave == 0) {
             if (lane == 0) s_e = -1;
             const uint32_t slot = blockIdx.x;
@@ -2862,7 +2907,10 @@ __global__ __launch_bounds__(256) void gg_wm_kernel(GgTiledArgs A) {
         r0 = (int)blockIdx.x * BM;
         r1 = min(r0 + BM, A.M);
     }
-    if (tid == 0) s_nmt = 0;
+    if (tid == 0) {
+        s_nmt = 0;
+        s_any = 0;
+    }
     if (tid < BM) {
         const int i = r0 + tid;
         int tk = -1;
@@ -2873,7 +2921,10 @@ __global__ __launch_bounds__(256) void gg_wm_kernel(GgTiledArgs A) {
         s_tok[tid] = tk;
     }
     __syncthreads();
-    if (tid < BM && s_tok[tid] >= 0) atomicMax(&s_nmt, tid / 16 + 1);
+    if (tid < BM && s_tok[tid] >= 0) {
+        atomicMax(&s_nmt, tid / 16 + 1);
+        atomicMax(&s_any, s_tok[tid]);
+    }
     __syncthreads();
     const int nmt = __builtin_amdgcn_readfirstlane(s_nmt);   /* 16-row tiles up to the last live row */
     const int n0 = (int)blockIdx.y * kWmBN;
@@ -2885,9 +2936,11 @@ __global__ __launch_bounds__(256) void gg_wm_kernel(GgTiledArgs A) {
         return;
     }
     W::table(gg_smem);
+    /* Two staged slabs (slab s in buffer s & 1) and, XG > 0, their rows' group sums times XGK,
+     * [group][row]. One barrier a slab: slab s + 1 is stored into the other buffer once slab s is
+     * computed, and the barrier after it both publishes it and frees buffer s & 1. */
     uint16_t* Xs = (uint16_t*)(void*)(gg_smem + W::TB);
-    /* XG > 0: the staged rows' group sums times XGK, [group][row]. */
-    float* Xg = (float*)(void*)(gg_smem + W::TB + BM * kWmXP * 2);
+    float* Xg = (float*)(void*)(gg_smem + W::TB + 2 * XE * 2);
     const uint8_t* wb = A.w;
     if constexpr (MOE) wb = A.wtab ? A.wtab[e] : A.w + (long long)e * A.w_es;
     const int h = lane >> 4, c16 = lane & 15;
@@ -2897,156 +2950,290 @@ __global__ __launch_bounds__(256) void gg_wm_kernel(GgTiledArgs A) {
         const int n = n0 + wave * 32 + nt * 16 + c16;
         wr[nt] = wb + (long long)(n < A.N ? n : A.N - 1) * A.w_ld;
     }
-    /* Activation staging: MT 16-byte chunks a thread a slab (row q >> 4, values 8 (q & 15)). The
-     * sixteen chunks of a row are sixteen consecutive lanes, so a group's sum is a shuffle away. */
+    /* Activation staging: MT 16-byte chunks a thread a slab (row q >> 4, values 8 (q & 15)); the
+     * sixteen chunks of a row are sixteen consecutive lanes, so a group's sum is a shuffle away.
+     * A dead row stages a live row (rows are independent; its outputs are written as zeros), so
+     * every load is unconditional. */
+    const int tany = s_any;
     const uint16_t* xsrc[MT];
-    uint16_t* xdst[MT];
+    int xdo[MT];
 #pragma unroll
     for (int i = 0; i < MT; ++i) {
         const int q = tid + 256 * i, row = q >> 4, kc = (q & 15) * 8;
         const int tk = s_tok[row];
-        xsrc[i] = tk >= 0 ? A.x + (long long)tk * A.x_ld + kc : nullptr;
-        xdst[i] = Xs + row * kWmXP + kc;
+        xsrc[i] = A.x + (long long)(tk >= 0 ? tk : tany) * A.x_ld + kc;
+        xdo[i] = row * kWmXP + kc;
     }
     r4d_u32x4 xr[MT];
     auto xload = [&](int s) {
 #pragma unroll
-        for (int i = 0; i < MT; ++i) {
-            uint32_t v[4] = { 0u, 0u, 0u, 0u };
-            if (xsrc[i]) gg_x8raw(xsrc[i] + s * kWmS, A.x_al != 0, v);
-            xr[i] = r4d_u32x4{ v[0], v[1], v[2], v[3] };
-        }
+        for (int i = 0; i < MT; ++i) xr[i] = *(gg_gu128)(const void*)(xsrc[i] + s * kWmS);
     };
-    auto xstore = [&]() {
+    auto xstore = [&](int b) {
+        uint16_t* xs = Xs + b * XE;
 #pragma unroll
         for (int i = 0; i < MT; ++i) {
-            *(r4d_u32x4*)(void*)xdst[i] = xr[i];
+            *(r4d_u32x4*)(void*)(xs + xdo[i]) = xr[i];
             if constexpr (W::XG > 0) {
                 const int q = tid + 256 * i;
                 float sm = 0.0f;
 #pragma unroll
                 for (int k = 0; k < 4; ++k) sm += bf16w_lo(xr[i][k]) + bf16w_hi(xr[i][k]);
-                sm += __shfl_xor(sm, 1);
-                if constexpr (W::XG == 32) sm += __shfl_xor(sm, 2);
-                if ((q & (W::XG / 8 - 1)) == 0) Xg[((q & 15) * 8 / W::XG) * BM + (q >> 4)] = W::XGK * sm;
+                /* Lane-pair (quad) sums by DPP, not an LDS bpermute queued behind the slab's LDS
+                 * traffic; every lane of the group then holds the same sum (a + b == b + a) and
+                 * stores it. */
+                sm += __int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(sm), 0xB1, 0xF, 0xF, false));
+                if constexpr (W::XG == 32)
+                    sm += __int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(sm), 0x4E, 0xF, 0xF, false));
+                Xg[b * XGE + ((q & 15) * 8 / W::XG) * BM + (q >> 4)] = W::XGK * sm;
             }
         }
     };
-    /* The raw words: the next slab's prefetched into rn, or (ROLL) each reloaded in place for the
-     * next slab right after its last use in this one. */
-    uint32_t rc[2][W::RAW], rn[2][W::ROLL ? 1 : W::RAW];
-    gg_v8f acc[MT][2];
-#pragma unroll
-    for (int i = 0; i < MT; ++i)
-#pragma unroll
-        for (int j = 0; j < 2; ++j) acc[i][j] = (gg_v8f)(0.0f);
     const int S = A.K / kWmS;
-    xload(0);
-#pragma unroll
-    for (int nt = 0; nt < 2; ++nt) W::load(wr[nt], 0, h, rc[nt]);
+    /* Weight rows prefetched into L2 three slabs ahead (s_prefetch_data, no VGPRs): every second
+     * slab each wave touches its 32 rows' bytes of slabs s + 3, s + 4 (PFL + 1 lines of 128 B), so
+     * the register loads a slab ahead hit L2 instead of waiting out DRAM. */
+    const uint8_t* prow = gg_sptr(wb + (long long)(n0 + __builtin_amdgcn_readfirstlane(wave) * 32) * A.w_ld);
+    const int prmax = __builtin_amdgcn_readfirstlane(A.N - 1 - (n0 + wave * 32));   /* rows past N: the last */
+    const long long psb = A.w_ld / S;                                             /* bytes a slab a row */
+    const int pfl = (int)min(31LL, (2 * psb + 127) / 128);
+    auto prefetch = [&](int s) {
+        const uint8_t* p = prow + (long long)min(s + 3, S - 1) * psb;
+#pragma unroll 1
+        for (int i = 0; i < 32; ++i) {
+            __builtin_amdgcn_s_prefetch_data(p, pfl);
+            if (i < prmax) p += A.w_ld;
+        }
+    };
     const uint16_t* xa = Xs + c16 * kWmXP;
-    const float* xg = Xg + 8 * h;
-    for (int s = 0; s < S; ++s) {
-        if (s) lds_barrier();
-        xstore();
-        lds_barrier();
-        if (s + 1 < S) {
-            xload(s + 1);
-            if constexpr (!W::ROLL) {
+    const float* xgl = Xg + 8 * h;
+    /* The whole K loop for NM live 16-row tiles (NM a constant: no branch splits a step, and its
+     * LDS reads issue ahead of the WMMAs). GUARD (Q5_K): one loop for every live count, a tile at
+     * a time behind a guard (its branch-free bodies spill). */
+    auto run = [&](auto nmc) {
+        constexpr int NM = decltype(nmc)::value;
+        auto live = [&](int mt) { return !W::GUARD || mt < nmt; };
+        gg_v8f acc[NM][2];
 #pragma unroll
-                for (int nt = 0; nt < 2; ++nt) W::load(wr[nt], s + 1, h, rn[nt]);
+        for (int i = 0; i < NM; ++i)
+#pragma unroll
+            for (int j = 0; j < 2; ++j) acc[i][j] = (gg_v8f)(0.0f);
+        /* Raw weight words: the EARLY ones in two sets (slab s computes from set s & 1 while set
+         * (s + 1) & 1 loads), the ROLL types' others in one set reloaded in place. */
+        uint32_t rE[2][2][W::RAW], rR[2][W::RAW];
+        xload(0);
+#pragma unroll
+        for (int nt = 0; nt < 2; ++nt) {
+            uint32_t t[W::RAW];
+            W::load(wr[nt], 0, h, t);
+#pragma unroll
+            for (int k = 0; k < W::RAW; ++k) {
+                if ((W::EARLY >> k) & 1u) rE[0][nt][k] = t[k];
+                else rR[nt][k] = t[k];
             }
         }
-        const int sn = s + 1 < S ? s + 1 : s;
-        /* The slab's 8 K steps over the NM live 16-row tiles, NM a constant so no branch splits the
-         * step and its LDS reads issue ahead of the WMMAs. */
-        auto slab = [&](auto nmc) {
-        constexpr int NM = decltype(nmc)::value;
-        gg_v8f P[NM][2];
-        /* GUARD (Q5_K): one body for every live count, a tile at a time (its branch-free bodies
-         * spill). */
-        auto live = [&](int mt) { return !W::GUARD || mt < nmt; };
-        gg_for<8>([&](auto jc) {
-            constexpr int J = decltype(jc)::value;
-            r4d_u32x4 bf[2];
+        xstore(0);
+        xload(1);
+        /* B fragments run a K step ahead: step J computes step J + 1's (step 7 the next slab's step
+         * 0) after issuing its own WMMAs, which hide the table reads (issued at the step's start)
+         * and give the WMMAs' results time before the scale fmas. */
+        r4d_u32x4 bf[2][2];
+        Pf pf[2];
+        lds_barrier();   /* the table (and slab 0) complete before step 0's table reads */
+        {
+            uint32_t rc[2][W::RAW];
 #pragma unroll
-            for (int nt = 0; nt < 2; ++nt) bf[nt] = W::template bfrag<J>(rc[nt], h, gg_smem, s);
+            for (int nt = 0; nt < 2; ++nt)
+#pragma unroll
+                for (int k = 0; k < W::RAW; ++k) rc[nt][k] = ((W::EARLY >> k) & 1u) ? rE[0][nt][k] : rR[nt][k];
+            if constexpr (W::PIPE) {
+#pragma unroll
+                for (int nt = 0; nt < 2; ++nt) W::template pre<0>(rc[nt], h, gg_smem, pf[nt]);
+#pragma unroll
+                for (int nt = 0; nt < 2; ++nt) bf[0][nt] = W::template bfrag<0>(rc[nt], h, pf[nt], 0);
+            }
+        }
+        /* Slab s from buffer / raw set PB = s & 1. Step J: (a) step J + 1's A fragments and table
+         * reads, (b) its WMMAs, (c) step J + 1's chain inits (CINIT), (d) step J + 1's B fragments,
+         * (e) its scale fmas, then the ROLL reloads. */
+        auto slab = [&](auto pc, int s) {
+            constexpr int PB = decltype(pc)::value;
+            uint32_t rc[2][W::RAW];
+#pragma unroll
+            for (int nt = 0; nt < 2; ++nt)
+#pragma unroll
+                for (int k = 0; k < W::RAW; ++k) rc[nt][k] = ((W::EARLY >> k) & 1u) ? rE[PB][nt][k] : rR[nt][k];
+            /* Every load is unconditional (past the end they reread the last slab): a load skipped
+             * on some path leaves the wait-count pass assuming the worst, a wait for the loads just
+             * issued. */
+            const int sn = s + 1 < S ? s + 1 : s;
+            if constexpr (PB == 0) prefetch(s);
+#pragma unroll
+            for (int nt = 0; nt < 2; ++nt) {
+                uint32_t t[W::RAW];
+                W::load(wr[nt], sn, h, t);   /* the non-early words' loads are dead */
+#pragma unroll
+                for (int k = 0; k < W::RAW; ++k)
+                    if ((W::EARLY >> k) & 1u) rE[PB ^ 1][nt][k] = t[k];
+            }
+            const uint16_t* xb = xa + PB * XE;
+            const float* xg = xgl + PB * XGE;
+            gg_v8f P[NM][2];
+            r4d_u32x4 af[2][NM];
+            gg_v8f ci[NM];
 #pragma unroll
             for (int mt = 0; mt < NM; ++mt) {
                 if (live(mt)) {
-                    const r4d_u32x4 af = *(const r4d_u32x4*)(const void*)(xa + mt * 16 * kWmXP + W::xoff(J, h));
-                    if constexpr (J % W::SPG == 0) {
-                        gg_v8f c0 = (gg_v8f)(0.0f);
-                        if constexpr (W::CINIT) c0 = *(const gg_v8f*)(const void*)(xg + (J * 16 / W::XG) * BM + mt * 16);
-#pragma unroll
-                        for (int nt = 0; nt < 2; ++nt) P[mt][nt] = gg_wmma(af, bf[nt], c0);
-                    } else {
-#pragma unroll
-                        for (int nt = 0; nt < 2; ++nt) P[mt][nt] = gg_wmma(af, bf[nt], P[mt][nt]);
-                    }
+                    af[0][mt] = *(const r4d_u32x4*)(const void*)(xb + mt * 16 * kWmXP + W::xoff(0, h));
+                    if constexpr (W::CINIT && W::PIPE) ci[mt] = *(const gg_v8f*)(const void*)(xg + mt * 16);
                 }
             }
-            if constexpr (J % W::SPG == W::SPG - 1) {
-                float sc[2], mn[2];
+            gg_for<8>([&](auto jc) {
+                constexpr int J = decltype(jc)::value, C = J & 1;
+                /* (a) */
+                if constexpr (!W::PIPE) {   /* (Pf is empty) */
+                    if constexpr (J < 7) {
 #pragma unroll
-                for (int nt = 0; nt < 2; ++nt) {
-                    sc[nt] = W::scale(rc[nt], J / W::SPG, s);
-                    if constexpr (W::MINS) mn[nt] = W::mins(rc[nt], J / W::SPG, s);
+                        for (int mt = 0; mt < NM; ++mt)
+                            if (live(mt))
+                                af[C ^ 1][mt] = *(const r4d_u32x4*)(const void*)(xb + mt * 16 * kWmXP + W::xoff(J + 1, h));
+                    }
+#pragma unroll
+                    for (int nt = 0; nt < 2; ++nt) bf[C][nt] = W::template bfrag<J>(rc[nt], h, pf[nt], s);
+                } else if constexpr (J < 7) {
+#pragma unroll
+                    for (int mt = 0; mt < NM; ++mt)
+                        if (live(mt))
+                            af[C ^ 1][mt] = *(const r4d_u32x4*)(const void*)(xb + mt * 16 * kWmXP + W::xoff(J + 1, h));
+#pragma unroll
+                    for (int nt = 0; nt < 2; ++nt) W::template pre<J + 1>(rc[nt], h, gg_smem, pf[nt]);
+                } else {
+#pragma unroll
+                    for (int nt = 0; nt < 2; ++nt) {
+#pragma unroll
+                        for (int k = 0; k < W::RAW; ++k) rc[nt][k] = ((W::EARLY >> k) & 1u) ? rE[PB ^ 1][nt][k] : rR[nt][k];
+                        W::template pre<0>(rc[nt], h, gg_smem, pf[nt]);
+                    }
                 }
+                gg_v8f g8[NM];
+                if constexpr (W::MINS && W::PIPE && J % W::SPG == W::SPG - 1) {
+#pragma unroll
+                    for (int mt = 0; mt < NM; ++mt)
+                        if (live(mt)) g8[mt] = *(const gg_v8f*)(const void*)(xg + (J * 16 / W::XG) * BM + mt * 16);
+                }
+                /* (b) */
 #pragma unroll
                 for (int mt = 0; mt < NM; ++mt) {
                     if (live(mt)) {
-                        gg_v8f g8 = (gg_v8f)(0.0f);
-                        if constexpr (W::MINS) g8 = *(const gg_v8f*)(const void*)(xg + (J * 16 / W::XG) * BM + mt * 16);
+                        if constexpr (J % W::SPG == 0) {
+                            gg_v8f c0 = (gg_v8f)(0.0f);
+                            if constexpr (W::CINIT && W::PIPE) c0 = ci[mt];
+                            else if constexpr (W::CINIT) c0 = *(const gg_v8f*)(const void*)(xg + (J * 16 / W::XG) * BM + mt * 16);
 #pragma unroll
-                        for (int nt = 0; nt < 2; ++nt)
+                            for (int nt = 0; nt < 2; ++nt) P[mt][nt] = gg_wmma(af[C][mt], bf[C][nt], c0);
+                        } else {
 #pragma unroll
-                            for (int q = 0; q < 8; ++q) {
-                                acc[mt][nt][q] = __builtin_fmaf(P[mt][nt][q], sc[nt], acc[mt][nt][q]);
-                                if constexpr (W::MINS) acc[mt][nt][q] = __builtin_fmaf(g8[q], mn[nt], acc[mt][nt][q]);
-                            }
+                            for (int nt = 0; nt < 2; ++nt) P[mt][nt] = gg_wmma(af[C][mt], bf[C][nt], P[mt][nt]);
+                        }
                     }
                 }
-            }
-            if constexpr (W::ROLL) {
+                /* (c) */
+                if constexpr (W::CINIT && W::PIPE && J < 7 && (J + 1) % W::SPG == 0) {
 #pragma unroll
-                for (int nt = 0; nt < 2; ++nt) W::template reload<J>(wr[nt], sn, h, rc[nt]);
-            }
-            /* A step's reads issue together, but no further ahead: hoisting the next steps' fragments
-             * spills the wide-block types. */
-            __builtin_amdgcn_sched_barrier(0);
-        });
-        };
-        if constexpr (W::GUARD) {
-            slab(std::integral_constant<int, MT>{});
-        } else {
-            gg_for<MT>([&](auto ic) {
-                constexpr int NM = decltype(ic)::value + 1;
-                if (nmt == NM) slab(std::integral_constant<int, NM>{});
+                    for (int mt = 0; mt < NM; ++mt)
+                        if (live(mt)) ci[mt] = *(const gg_v8f*)(const void*)(xg + ((J + 1) * 16 / W::XG) * BM + mt * 16);
+                }
+                /* (d) */
+                if constexpr (W::PIPE) {
+#pragma unroll
+                    for (int nt = 0; nt < 2; ++nt)
+                        bf[C ^ 1][nt] = W::template bfrag<(J + 1) & 7>(rc[nt], h, pf[nt], J < 7 ? s : sn);
+                }
+                /* (e) */
+                if constexpr (J % W::SPG == W::SPG - 1) {
+                    float sc[2], mn[2];
+                    if constexpr (J < 7 || !W::PIPE) {
+#pragma unroll
+                        for (int nt = 0; nt < 2; ++nt) {
+                            sc[nt] = W::scale(rc[nt], J / W::SPG, s);
+                            if constexpr (W::MINS) mn[nt] = W::mins(rc[nt], J / W::SPG, s);
+                        }
+                    } else {   /* rc is the next slab's now: this slab's words */
+#pragma unroll
+                        for (int nt = 0; nt < 2; ++nt) {
+                            uint32_t ro[W::RAW];
+#pragma unroll
+                            for (int k = 0; k < W::RAW; ++k) ro[k] = ((W::EARLY >> k) & 1u) ? rE[PB][nt][k] : rR[nt][k];
+                            sc[nt] = W::scale(ro, J / W::SPG, s);
+                            if constexpr (W::MINS) mn[nt] = W::mins(ro, J / W::SPG, s);
+                        }
+                    }
+#pragma unroll
+                    for (int mt = 0; mt < NM; ++mt) {
+                        if (live(mt)) {
+                            if constexpr (W::MINS && !W::PIPE) g8[mt] = *(const gg_v8f*)(const void*)(xg + (J * 16 / W::XG) * BM + mt * 16);
+#pragma unroll
+                            for (int nt = 0; nt < 2; ++nt)
+#pragma unroll
+                                for (int q = 0; q < 8; ++q) {
+                                    acc[mt][nt][q] = __builtin_fmaf(P[mt][nt][q], sc[nt], acc[mt][nt][q]);
+                                    if constexpr (W::MINS) acc[mt][nt][q] = __builtin_fmaf(g8[mt][q], mn[nt], acc[mt][nt][q]);
+                                }
+                        }
+                    }
+                    /* The step's sums here (each value its own VGPR, so they stay in-place v_fmac /
+                     * dual-issue), not sunk past the slab with every P kept live. */
+#pragma unroll
+                    for (int mt = 0; mt < NM; ++mt)
+#pragma unroll
+                        for (int nt = 0; nt < 2; ++nt) gg_pin8(acc[mt][nt]);
+                }
+                if constexpr (W::ROLL) {
+#pragma unroll
+                    for (int nt = 0; nt < 2; ++nt) W::template reload<J>(wr[nt], sn, h, rR[nt]);
+                }
+                /* Mid-slab: stage slab s + 1 into the other buffer (its loads, issued mid-slab s - 1,
+                 * had a slab to land) and start slab s + 2's; the slab's remaining steps hide it. The
+                 * barrier after the slab both publishes s + 1 and frees this buffer (the last slab
+                 * stages a buffer nobody reads). */
+                if constexpr (J == 3) {
+                    xstore(PB ^ 1);
+                    xload(s + 2 < S ? s + 2 : S - 1);
+                }
+                /* A step's reads issue together, but no further ahead: hoisting the next steps'
+                 * fragments spills the wide-block types. */
+                __builtin_amdgcn_sched_barrier(0);
             });
+            lds_barrier();
+        };
+        for (int s = 0; s < S; s += 2) {   /* S is even (K % 256 == 0) */
+            slab(std::integral_constant<int, 0>{}, s);
+            slab(std::integral_constant<int, 1>{}, s + 1);
         }
-        if constexpr (!W::ROLL) {
-            if (s + 1 < S) {
+        gg_for<MT>([&](auto mc) {
+            constexpr int mt = decltype(mc)::value;
 #pragma unroll
-                for (int nt = 0; nt < 2; ++nt)
+            for (int nt = 0; nt < 2; ++nt) {
+                const int n = n0 + wave * 32 + nt * 16 + c16;
+                if (n >= A.N) continue;
 #pragma unroll
-                    for (int i = 0; i < W::RAW; ++i) rc[nt][i] = rn[nt][i];
+                for (int q = 0; q < 8; ++q) {
+                    const int lr = mt * 16 + 8 * h + q, row = r0 + lr;
+                    if (row >= r1) continue;
+                    float v = 0.0f;
+                    if constexpr (mt < NM) v = s_tok[lr] >= 0 ? acc[mt][nt][q] : 0.0f;
+                    gg_put((OT*)A.y + (long long)row * A.y_ld + n, v);
+                }
             }
-        }
-    }
-#pragma unroll
-    for (int mt = 0; mt < MT; ++mt) {
-#pragma unroll
-        for (int nt = 0; nt < 2; ++nt) {
-            const int n = n0 + wave * 32 + nt * 16 + c16;
-            if (n >= A.N) continue;
-#pragma unroll
-            for (int q = 0; q < 8; ++q) {
-                const int lr = mt * 16 + 8 * h + q, row = r0 + lr;
-                if (row >= r1) continue;
-                gg_put((OT*)A.y + (long long)row * A.y_ld + n, s_tok[lr] >= 0 ? acc[mt][nt][q] : 0.0f);
-            }
-        }
+        });
+    };
+    if constexpr (W::GUARD) {
+        run(std::integral_constant<int, MT>{});
+    } else {
+        gg_for<MT>([&](auto ic) {
+            constexpr int NM = decltype(ic)::value + 1;
+            if (nmt == NM) run(std::integral_constant<int, NM>{});
+        });
     }
 }
 
@@ -3269,15 +3456,28 @@ int gg_launch_tiled(RadStream s, int ty, int bm, bool moe, bool f32out, const Gg
 #undef GG_CALL_TILED
 }
 
-/* LDS of the WMMA kernel: the table, the staged slab, its group sums. */
+/* LDS of the WMMA kernel: the table, the two staged slabs, their group sums. */
 template <int T>
 constexpr unsigned gg_wm_lds(int bm) {
-    return (unsigned)(Wq<T>::TB + bm * kWmXP * 2 + (Wq<T>::XG > 0 ? kWmS / Wq<T>::XG * bm * 4 : 0));
+    return (unsigned)(Wq<T>::TB + 2 * bm * kWmXP * 2 + (Wq<T>::XG > 0 ? 2 * (kWmS / Wq<T>::XG) * bm * 4 : 0));
 }
-/* 16-row tiles a block: IQ1_S's four fit 256 VGPRs, the wider raw blocks three. */
-int gg_wm_mt(int ty) { return ty == GG_IQ1_S ? 4 : 3; }
+/* 16-row tiles a block: three; IQ1_S four (R4D_WM_MT1=3: three). IQ1_S at 4 is held to 2 blocks a WGP
+ * (LDS 50 KiB, 241+ VGPRs) and at 3 runs 3 (1.15x in the uniform-routing bench), but the real serve's
+ * skewed routing splits more heavy experts into extra tiles, each re-reading the expert's weights. */
+int gg_wm_mt(int ty) {
+    static const int mt1 = gg_env_int("R4D_WM_MT1", 4) == 3 ? 3 : 4;
+    return ty == GG_IQ1_S ? mt1 : 3;
+}
 template <int T>
 int gg_launch_wm_t(bool moe, bool f32out, RadStream s, const GgTiledArgs& A, dim3 grid) {
+    if constexpr (T == GG_IQ1_S) {
+        if (gg_wm_mt(T) == 3) {
+            const unsigned lds = gg_wm_lds<T>(48);
+            if (moe) return R4D_EMIT(s, (gg_wm_kernel<T, 3, true, uint16_t>), grid, dim3(256), lds, A);
+            if (f32out) return R4D_EMIT(s, (gg_wm_kernel<T, 3, false, float>), grid, dim3(256), lds, A);
+            return R4D_EMIT(s, (gg_wm_kernel<T, 3, false, uint16_t>), grid, dim3(256), lds, A);
+        }
+    }
     constexpr int MT = T == GG_IQ1_S ? 4 : 3;
     const unsigned lds = gg_wm_lds<T>(16 * MT);
     if (moe) return R4D_EMIT(s, (gg_wm_kernel<T, MT, true, uint16_t>), grid, dim3(256), lds, A);
@@ -3389,7 +3589,7 @@ int gg_gemm(const RadArgs* a, RadStream s, const char* nN, const char* nK, bool 
     A.x_al = x_al; A.tab_bytes = (int)tb;
     /* The WMMA kernel (factored scales) for every block type DeepSeek-V4.1 uses. */
     static const int wm_off = gg_env_int("R4D_WM_OFF", 0);
-    if (!wm_off && ty != GG_F32 && ty != GG_IQ4_NL && K % kWmS == 0 && (N + kWmBN - 1) / kWmBN <= 65535) {
+    if (!wm_off && x_al && ty != GG_F32 && ty != GG_IQ4_NL && K % (2 * kWmS) == 0 && (N + kWmBN - 1) / kWmBN <= 65535) {
         const int bmw = 16 * gg_wm_mt(ty);
         const long long gx = (M + bmw - 1) / bmw, gyw = (N + kWmBN - 1) / kWmBN;
         return gg_launch_wm(s, ty, false, logits, A, dim3((unsigned)gx, (unsigned)gyw));
@@ -3599,7 +3799,7 @@ int gg_moe(const RadArgs* a, RadStream s, bool gemv) {
     A.tab_bytes = (int)tb;
     /* The WMMA kernel for the I-quants (every DeepSeek-V4.1 expert): 16 MT-row tiles. */
     static const int wm_off = gg_env_int("R4D_WM_OFF", 0);
-    if (!wm_off && (ty == GG_IQ1_S || ty == GG_IQ2_XXS) && K % kWmS == 0) {
+    if (!wm_off && A.x_al && (ty == GG_IQ1_S || ty == GG_IQ2_XXS) && K % (2 * kWmS) == 0) {
         const int bmw = 16 * gg_wm_mt(ty);
         const long long gx = (T + bmw - 1) / bmw + L, gy = (N + kWmBN - 1) / kWmBN;
         if (gy > 65535 || gx > 0x7fffffffLL) return R4D_NO(RAD_E_SHAPE);

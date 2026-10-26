@@ -26,6 +26,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <type_traits>
 
 namespace {
 
@@ -123,8 +124,258 @@ __device__ __forceinline__ float ds_clamp(float v, float lo, float hi) {
     return v < lo ? lo : (hi < v ? hi : v);
 }
 
-__device__ __forceinline__ float ds_exp(float x) { return (float)exp((double)x); }
-__device__ __forceinline__ float ds_log1p(float x) { return (float)log1p((double)x); }
+// The double routines rounded once, as libref's contract states them.
+__device__ __forceinline__ float ds_exp_ref(float x) { return (float)exp((double)x); }
+__device__ __forceinline__ float ds_log1p_ref(float x) { return (float)log1p((double)x); }
+
+/* The same two values without FP64 on the common path (gfx1201 runs a wave's double exp + log1p
+ * in ~4 us: the router's sqrt(softplus) over 12 experts a lane was 48 us of FP64). Each is formed
+ * in float-float (|error| ~2^-46 for exp, ~2^-40 for log1p, relative), and kept only when every
+ * real within a bound of that (2^-43, 2^-38: the double routine's own error is far below) rounds
+ * to the same float; otherwise (about one input in 2^17 / 2^13, and outside the reduced ranges)
+ * the lane runs the double routine itself. So the float returned is the double routine's, bit for
+ * bit, for every input: checked exhaustively on gfx1201 over all 2^32 floats against
+ * ds_exp_ref / ds_log1p_ref (r4d-port/bench/decsmall). Tables: 2^(j/64) as hi + lo;
+ * R_j = RN(1/(1 + j/256)) and -log(R_j) as hi + lo. */
+__device__ __constant__ uint32_t kDsExpHi[64] = {
+    0x3f800000u, 0x3f8164d2u, 0x3f82cd87u, 0x3f843a29u, 0x3f85aac3u, 0x3f871f62u, 0x3f88980fu, 0x3f8a14d5u,
+    0x3f8b95c2u, 0x3f8d1adfu, 0x3f8ea43au, 0x3f9031dcu, 0x3f91c3d3u, 0x3f935a2bu, 0x3f94f4f0u, 0x3f96942du,
+    0x3f9837f0u, 0x3f99e046u, 0x3f9b8d3au, 0x3f9d3edau, 0x3f9ef532u, 0x3fa0b051u, 0x3fa27043u, 0x3fa43516u,
+    0x3fa5fed7u, 0x3fa7cd94u, 0x3fa9a15bu, 0x3fab7a3au, 0x3fad583fu, 0x3faf3b79u, 0x3fb123f6u, 0x3fb311c4u,
+    0x3fb504f3u, 0x3fb6fd92u, 0x3fb8fbafu, 0x3fbaff5bu, 0x3fbd08a4u, 0x3fbf179au, 0x3fc12c4du, 0x3fc346cdu,
+    0x3fc5672au, 0x3fc78d75u, 0x3fc9b9beu, 0x3fcbec15u, 0x3fce248cu, 0x3fd06334u, 0x3fd2a81eu, 0x3fd4f35bu,
+    0x3fd744fdu, 0x3fd99d16u, 0x3fdbfbb8u, 0x3fde60f5u, 0x3fe0ccdfu, 0x3fe33f89u, 0x3fe5b907u, 0x3fe8396au,
+    0x3feac0c7u, 0x3fed4f30u, 0x3fefe4bau, 0x3ff28177u, 0x3ff5257du, 0x3ff7d0dfu, 0x3ffa83b3u, 0x3ffd3e0cu,
+};
+__device__ __constant__ uint32_t kDsExpLo[64] = {
+    0x00000000u, 0xb1c43fd0u, 0xb34ea7a9u, 0xb2f14c87u, 0x334f9891u, 0xb352c2e6u, 0xb37eda4bu, 0x336a92deu,
+    0xb260aba1u, 0x3336fcb7u, 0xb3697465u, 0x330628cdu, 0x33675624u, 0x32bc4f9cu, 0xb32e0212u, 0x32dc8061u,
+    0x33231b71u, 0xb359be90u, 0xb30c5563u, 0xb331a601u, 0x33412342u, 0x31fb9715u, 0x30c3125au, 0xb323ec33u,
+    0xb32c9d5eu, 0xb3162d36u, 0xb3162b08u, 0xb314ad82u, 0xb22deaf6u, 0xb3252debu, 0xb37c5aa8u, 0x32154889u,
+    0x32cfe77au, 0xb266b974u, 0x330ec5f7u, 0xb31bd983u, 0xb3414fe8u, 0xb3130b1au, 0xb2d6663eu, 0xb2976da2u,
+    0x320aa837u, 0xb2dd5119u, 0xb37323a2u, 0xb006c6c2u, 0x3228fc24u, 0xb2944353u, 0xb35c1daau, 0xb3286024u,
+    0xb2d4a58au, 0xb2f61d41u, 0xb3504a1cu, 0xb37b43e3u, 0xb21eab59u, 0x33657d15u, 0xb2441be6u, 0x33207898u,
+    0xb24116deu, 0x3276cca1u, 0xb348464au, 0x32f167ffu, 0x32292436u, 0x336615a2u, 0xb2923758u, 0x31cf486cu,
+};
+__device__ __constant__ uint32_t kDsLogR[256] = {
+    0x3f800000u, 0x3f7f00ffu, 0x3f7e03f8u, 0x3f7d08e5u, 0x3f7c0fc1u, 0x3f7b1885u, 0x3f7a232du, 0x3f792fb2u,
+    0x3f783e10u, 0x3f774e40u, 0x3f76603eu, 0x3f757404u, 0x3f74898du, 0x3f73a0d5u, 0x3f72b9d6u, 0x3f71d48cu,
+    0x3f70f0f1u, 0x3f700f01u, 0x3f6f2eb7u, 0x3f6e500fu, 0x3f6d7304u, 0x3f6c9791u, 0x3f6bbdb3u, 0x3f6ae564u,
+    0x3f6a0ea1u, 0x3f693965u, 0x3f6865acu, 0x3f679373u, 0x3f66c2b4u, 0x3f65f36du, 0x3f652598u, 0x3f645933u,
+    0x3f638e39u, 0x3f62c4a7u, 0x3f61fc78u, 0x3f6135aau, 0x3f607038u, 0x3f5fac1fu, 0x3f5ee95cu, 0x3f5e27ebu,
+    0x3f5d67c9u, 0x3f5ca8f1u, 0x3f5beb62u, 0x3f5b2f17u, 0x3f5a740eu, 0x3f59ba42u, 0x3f5901b2u, 0x3f584a5au,
+    0x3f579436u, 0x3f56df44u, 0x3f562b81u, 0x3f5578e9u, 0x3f54c77bu, 0x3f541733u, 0x3f53680du, 0x3f52ba08u,
+    0x3f520d21u, 0x3f516154u, 0x3f50b6a0u, 0x3f500d01u, 0x3f4f6475u, 0x3f4ebcf9u, 0x3f4e168au, 0x3f4d7127u,
+    0x3f4ccccdu, 0x3f4c2978u, 0x3f4b8728u, 0x3f4ae5d8u, 0x3f4a4588u, 0x3f49a634u, 0x3f4907dau, 0x3f486a79u,
+    0x3f47ce0cu, 0x3f473294u, 0x3f46980cu, 0x3f45fe74u, 0x3f4565c8u, 0x3f44ce08u, 0x3f443730u, 0x3f43a13eu,
+    0x3f430c31u, 0x3f427806u, 0x3f41e4bcu, 0x3f415250u, 0x3f40c0c1u, 0x3f40300cu, 0x3f3fa030u, 0x3f3f112bu,
+    0x3f3e82fau, 0x3f3df59du, 0x3f3d6910u, 0x3f3cdd53u, 0x3f3c5264u, 0x3f3bc841u, 0x3f3b3ee7u, 0x3f3ab656u,
+    0x3f3a2e8cu, 0x3f39a786u, 0x3f392144u, 0x3f389bc3u, 0x3f381703u, 0x3f379301u, 0x3f370fbbu, 0x3f368d31u,
+    0x3f360b61u, 0x3f358a48u, 0x3f3509e7u, 0x3f348a3au, 0x3f340b41u, 0x3f338cfau, 0x3f330f63u, 0x3f32927cu,
+    0x3f321643u, 0x3f319ab6u, 0x3f311fd4u, 0x3f30a59bu, 0x3f302c0bu, 0x3f2fb322u, 0x3f2f3adeu, 0x3f2ec33eu,
+    0x3f2e4c41u, 0x3f2dd5e6u, 0x3f2d602bu, 0x3f2ceb10u, 0x3f2c7692u, 0x3f2c02b0u, 0x3f2b8f6au, 0x3f2b1cbeu,
+    0x3f2aaaabu, 0x3f2a392fu, 0x3f29c84au, 0x3f2957fbu, 0x3f28e83fu, 0x3f287917u, 0x3f280a81u, 0x3f279c7bu,
+    0x3f272f05u, 0x3f26c21eu, 0x3f2655c4u, 0x3f25e9f7u, 0x3f257eb5u, 0x3f2513fdu, 0x3f24a9cfu, 0x3f244029u,
+    0x3f23d70au, 0x3f236e72u, 0x3f23065eu, 0x3f229ecfu, 0x3f2237c3u, 0x3f21d13au, 0x3f216b31u, 0x3f2105a9u,
+    0x3f20a0a1u, 0x3f203c17u, 0x3f1fd80au, 0x3f1f747au, 0x3f1f1166u, 0x3f1eaecdu, 0x3f1e4cadu, 0x3f1deb07u,
+    0x3f1d89d9u, 0x3f1d2922u, 0x3f1cc8e1u, 0x3f1c6917u, 0x3f1c09c1u, 0x3f1baadfu, 0x3f1b4c70u, 0x3f1aee73u,
+    0x3f1a90e8u, 0x3f1a33cdu, 0x3f19d723u, 0x3f197ae7u, 0x3f191f1au, 0x3f18c3bbu, 0x3f1868c8u, 0x3f180e41u,
+    0x3f17b426u, 0x3f175a75u, 0x3f17012eu, 0x3f16a850u, 0x3f164fdau, 0x3f15f7ccu, 0x3f15a025u, 0x3f1548e5u,
+    0x3f14f209u, 0x3f149b93u, 0x3f144581u, 0x3f13efd2u, 0x3f139a86u, 0x3f13459cu, 0x3f12f114u, 0x3f129cecu,
+    0x3f124925u, 0x3f11f5bdu, 0x3f11a2b4u, 0x3f115009u, 0x3f10fdbcu, 0x3f10abccu, 0x3f105a38u, 0x3f100901u,
+    0x3f0fb824u, 0x3f0f67a2u, 0x3f0f177au, 0x3f0ec7abu, 0x3f0e7835u, 0x3f0e2918u, 0x3f0dda52u, 0x3f0d8be3u,
+    0x3f0d3dcbu, 0x3f0cf009u, 0x3f0ca29cu, 0x3f0c5584u, 0x3f0c08c1u, 0x3f0bbc51u, 0x3f0b7034u, 0x3f0b246bu,
+    0x3f0ad8f3u, 0x3f0a8dcdu, 0x3f0a42f8u, 0x3f09f874u, 0x3f09ae41u, 0x3f09645cu, 0x3f091ac7u, 0x3f08d181u,
+    0x3f088889u, 0x3f083fdeu, 0x3f07f781u, 0x3f07af70u, 0x3f0767abu, 0x3f072033u, 0x3f06d905u, 0x3f069223u,
+    0x3f064b8au, 0x3f06053cu, 0x3f05bf37u, 0x3f05797cu, 0x3f053408u, 0x3f04eeddu, 0x3f04a9fau, 0x3f04655eu,
+    0x3f042108u, 0x3f03dcf9u, 0x3f039930u, 0x3f0355adu, 0x3f03126fu, 0x3f02cf75u, 0x3f028cc0u, 0x3f024a4eu,
+    0x3f020821u, 0x3f01c636u, 0x3f01848eu, 0x3f014328u, 0x3f010204u, 0x3f00c122u, 0x3f008081u, 0x3f004020u,
+};
+__device__ __constant__ uint32_t kDsLogHi[256] = {
+    0x00000000u, 0x3b7f8056u, 0x3bff015bu, 0x3c3ee24fu, 0x3c7e0545u, 0x3c9e752fu, 0x3cbdc8d6u, 0x3cdcfe05u,
+    0x3cfc14c8u, 0x3d0d86c8u, 0x3d1cf437u, 0x3d2c52dbu, 0x3d3ba2ceu, 0x3d4ae41bu, 0x3d5a16f0u, 0x3d693b59u,
+    0x3d785185u, 0x3d83acc1u, 0x3d8b29b9u, 0x3d929fb1u, 0x3d9a0ebau, 0x3da176e7u, 0x3da8d837u, 0x3db032c5u,
+    0x3db78694u, 0x3dbed3b5u, 0x3dc61a33u, 0x3dcd5a11u, 0x3dd4936cu, 0x3ddbc63fu, 0x3de2f2a6u, 0x3dea189du,
+    0x3df1383au, 0x3df85182u, 0x3dff648au, 0x3e0338a8u, 0x3e06bbf4u, 0x3e0a3c2eu, 0x3e0db958u, 0x3e11337au,
+    0x3e14aa96u, 0x3e181ebau, 0x3e1b8fe1u, 0x3e1efe16u, 0x3e22695au, 0x3e25d1b9u, 0x3e29372fu, 0x3e2c99c5u,
+    0x3e2ff983u, 0x3e33566au, 0x3e36b07eu, 0x3e3a07cau, 0x3e3d5c48u, 0x3e40ae03u, 0x3e43fd04u, 0x3e474948u,
+    0x3e4a92d4u, 0x3e4dd9b3u, 0x3e511de0u, 0x3e545f67u, 0x3e579e49u, 0x3e5ada8cu, 0x3e5e1436u, 0x3e614b44u,
+    0x3e647fbdu, 0x3e67b1adu, 0x3e6ae10au, 0x3e6e0de7u, 0x3e71383bu, 0x3e746013u, 0x3e778570u, 0x3e7aa850u,
+    0x3e7dc8c6u, 0x3e807362u, 0x3e82012eu, 0x3e838dc3u, 0x3e851928u, 0x3e86a35au, 0x3e882c5fu, 0x3e89b438u,
+    0x3e8b3ae5u, 0x3e8cc06au, 0x3e8e44c6u, 0x3e8fc7fdu, 0x3e914a0fu, 0x3e92cb01u, 0x3e944ad0u, 0x3e95c981u,
+    0x3e974716u, 0x3e98c38du, 0x3e9a3eeeu, 0x3e9bb934u, 0x3e9d3263u, 0x3e9eaa7cu, 0x3ea02185u, 0x3ea19779u,
+    0x3ea30c5du, 0x3ea48034u, 0x3ea5f2fdu, 0x3ea764bbu, 0x3ea8d56cu, 0x3eaa4515u, 0x3eabb3bau, 0x3ead2156u,
+    0x3eae8dedu, 0x3eaff984u, 0x3eb16416u, 0x3eb2cdabu, 0x3eb43640u, 0x3eb59dd8u, 0x3eb70476u, 0x3eb86a18u,
+    0x3eb9cebfu, 0x3ebb3270u, 0x3ebc952au, 0x3ebdf6f1u, 0x3ebf57c2u, 0x3ec0b7a0u, 0x3ec2168eu, 0x3ec3748du,
+    0x3ec4d19du, 0x3ec62dbfu, 0x3ec788f5u, 0x3ec8e33eu, 0x3eca3c9fu, 0x3ecb951au, 0x3eccecacu, 0x3ece4358u,
+    0x3ecf991eu, 0x3ed0ee04u, 0x3ed24205u, 0x3ed39524u, 0x3ed4e766u, 0x3ed638c6u, 0x3ed78949u, 0x3ed8d8f1u,
+    0x3eda27bdu, 0x3edb75adu, 0x3edcc2c5u, 0x3ede0f04u, 0x3edf5a6du, 0x3ee0a501u, 0x3ee1eebeu, 0x3ee337a7u,
+    0x3ee47fbfu, 0x3ee5c702u, 0x3ee70d79u, 0x3ee8531eu, 0x3ee997f4u, 0x3eeadbfbu, 0x3eec1f3au, 0x3eed61abu,
+    0x3eeea34fu, 0x3eefe42bu, 0x3ef12441u, 0x3ef2638eu, 0x3ef3a213u, 0x3ef4dfd2u, 0x3ef61ccfu, 0x3ef75906u,
+    0x3ef8947au, 0x3ef9cf2du, 0x3efb0921u, 0x3efc4250u, 0x3efd7ac3u, 0x3efeb278u, 0x3effe96fu, 0x3f008fd6u,
+    0x3f012a95u, 0x3f01c4f8u, 0x3f025efdu, 0x3f02f8a7u, 0x3f0391f3u, 0x3f042ae4u, 0x3f04c37bu, 0x3f055bb7u,
+    0x3f05f397u, 0x3f068b1fu, 0x3f07224cu, 0x3f07b921u, 0x3f084f9eu, 0x3f08e5c2u, 0x3f097b8du, 0x3f0a1100u,
+    0x3f0aa61fu, 0x3f0b3ae5u, 0x3f0bcf55u, 0x3f0c6370u, 0x3f0cf735u, 0x3f0d8aa5u, 0x3f0e1dc0u, 0x3f0eb088u,
+    0x3f0f42fau, 0x3f0fd51au, 0x3f1066e6u, 0x3f10f860u, 0x3f118987u, 0x3f121a5bu, 0x3f12aadfu, 0x3f133b0fu,
+    0x3f13caf0u, 0x3f145a80u, 0x3f14e9c0u, 0x3f1578b0u, 0x3f160750u, 0x3f1695a0u, 0x3f1723a2u, 0x3f17b155u,
+    0x3f183ebau, 0x3f18cbd0u, 0x3f19589au, 0x3f19e516u, 0x3f1a7144u, 0x3f1afd27u, 0x3f1b88beu, 0x3f1c1407u,
+    0x3f1c9f07u, 0x3f1d29bau, 0x3f1db423u, 0x3f1e3e41u, 0x3f1ec812u, 0x3f1f519du, 0x3f1fdaddu, 0x3f2063d2u,
+    0x3f20ec7eu, 0x3f2174e3u, 0x3f21fcfeu, 0x3f2284d2u, 0x3f230c5fu, 0x3f2393a1u, 0x3f241a9fu, 0x3f24a154u,
+    0x3f2527c4u, 0x3f25adecu, 0x3f2633ceu, 0x3f26b969u, 0x3f273ec1u, 0x3f27c3d2u, 0x3f28489eu, 0x3f28cd25u,
+    0x3f29516au, 0x3f29d569u, 0x3f2a5924u, 0x3f2adc9au, 0x3f2b5fceu, 0x3f2be2c0u, 0x3f2c656du, 0x3f2ce7dau,
+    0x3f2d6a01u, 0x3f2debe9u, 0x3f2e6d8eu, 0x3f2eeef3u, 0x3f2f7015u, 0x3f2ff0f6u, 0x3f307197u, 0x3f30f1f8u,
+};
+__device__ __constant__ uint32_t kDsLogLo[256] = {
+    0x00000000u, 0x2dac42f0u, 0x2f310679u, 0x2f70215cu, 0xaff03fc2u, 0xae395a38u, 0x307d5b12u, 0x307af91au,
+    0x30678338u, 0x30923d99u, 0x2f7f5ec7u, 0xb08371b2u, 0xaf66916eu, 0x30cc8e3fu, 0x3091971du, 0x2fb6c2d7u,
+    0x2d0b153bu, 0x30931c8eu, 0xb175c852u, 0xb15f5ebeu, 0x30c37a3cu, 0xb0cb3722u, 0xb03e79ebu, 0x3153750cu,
+    0xb151a94bu, 0xb1784ed3u, 0xafe7325du, 0x30a40676u, 0x3124ad57u, 0xb154f125u, 0xaf2438b8u, 0x3116cb36u,
+    0x3162af2eu, 0xb0ddd3a7u, 0x2fedf55eu, 0xb1c35a69u, 0x31cd08e6u, 0x315ce858u, 0x3017b3d4u, 0xb1d75a53u,
+    0x3103fea6u, 0x31c647feu, 0xb19e1709u, 0x309b318bu, 0xb166905bu, 0x31534abeu, 0x31343687u, 0xb1967df7u,
+    0x2fa793d5u, 0x2f655aa2u, 0x31e19d22u, 0xaeff2116u, 0x31021b21u, 0xb1479500u, 0x31441923u, 0x30a21b51u,
+    0x2ff456b8u, 0xb1b82047u, 0xae6a54c7u, 0xaff7d0e4u, 0xb16fe800u, 0xb1bf04a5u, 0xb069398au, 0x3190c18du,
+    0x31735345u, 0xb1df63a1u, 0x30d3eee6u, 0xb0d504ddu, 0xb06a868du, 0xb1f55a5au, 0xb088e9b0u, 0x31ecb7b5u,
+    0xb0a8706fu, 0xb1ea55fcu, 0xb214b2fbu, 0x304d590du, 0x3227390fu, 0xb119522cu, 0xb2651b52u, 0xb1bd8aeau,
+    0xb205459fu, 0xb23abdc9u, 0xb2496660u, 0x311228bdu, 0x31d9ef2du, 0xb262089cu, 0x323de86au, 0xb248762du,
+    0xb08f7168u, 0x31828832u, 0xb256782au, 0x311ff619u, 0xb1d2d743u, 0xb0bf0472u, 0xb25f9582u, 0x32784e81u,
+    0x310717b3u, 0x326c009du, 0xb2488876u, 0xb1fbffb1u, 0xb17481f5u, 0x3226dd26u, 0xb213aa59u, 0x314d33f9u,
+    0x31ab013au, 0x326a793eu, 0x32139c7au, 0x3160f87du, 0x3166c52du, 0x31b6b288u, 0x31f5743du, 0xb26876ddu,
+    0x312ef402u, 0xb151890bu, 0x31bba8f5u, 0x30fbd7e2u, 0xb15f540fu, 0xb19be56cu, 0x31a3d163u, 0x31b66174u,
+    0x320c1426u, 0xb1a4e96eu, 0x31f6cc5au, 0xb03a57b3u, 0x32621171u, 0x31a26a2bu, 0xb21e81f7u, 0xb25a3f7au,
+    0x324bf985u, 0xb1dd48cdu, 0x323e5bb1u, 0xb1ba84c2u, 0xb18cbef6u, 0x31b3161du, 0xb2738879u, 0xb208203au,
+    0xb263370au, 0xb1c86194u, 0x32493110u, 0x31736b43u, 0xb0ac7242u, 0xb1a541f9u, 0xb24b252bu, 0x3223f700u,
+    0xafcacbb4u, 0x327cd7adu, 0x3190be7eu, 0xb20cde1au, 0x32700ebdu, 0x32262c69u, 0xb1feba18u, 0xb2593a6bu,
+    0xb09f1daau, 0x32146d5cu, 0xb1d0727bu, 0xb2717890u, 0xb2029787u, 0xb20a79e0u, 0x30468cc2u, 0xb27ff220u,
+    0xb2050f90u, 0x318023ccu, 0x30f8145cu, 0x325be9edu, 0x31cf1e65u, 0xb25c9ea8u, 0x2fafe94au, 0xb2f7a007u,
+    0xb1968bc0u, 0x3225cc68u, 0xb2a16d93u, 0xb2c79ba6u, 0x32d1cdf4u, 0xb1e52ebcu, 0xb2ea8caeu, 0xb2f11eb3u,
+    0x2f94aa0cu, 0xb2fe6294u, 0x324a3991u, 0xb1325b41u, 0xb2ad2b36u, 0xb2ff8330u, 0x32bd3efcu, 0x32ec43d5u,
+    0x31fd357cu, 0x320974c2u, 0x32131335u, 0x31cd73c2u, 0x326cf92eu, 0x32ffda2au, 0x320e2786u, 0xb2031200u,
+    0x324e081bu, 0xb2031ed6u, 0x3212556eu, 0x3102df76u, 0xb2482818u, 0x32fc8393u, 0x32131efau, 0x3285430fu,
+    0x32e89b12u, 0x3276c0f0u, 0xb29bd4f7u, 0xb1be6fd4u, 0x323891d3u, 0xb23a246cu, 0xb289bfd9u, 0x327612a9u,
+    0xb2ab0ef4u, 0x3210ffceu, 0xb23dbc52u, 0x30b28995u, 0x31c73878u, 0x3119b751u, 0x3248e8f7u, 0x31ae1e63u,
+    0xb2da9d5eu, 0x323bd7bfu, 0x31ffff0bu, 0xb27119beu, 0x32ef1570u, 0x323d65ecu, 0xb2d6e90cu, 0xb1d7c8c5u,
+    0x32c4672cu, 0x32a1f80cu, 0x325739ceu, 0x32667761u, 0xb26c7427u, 0x32b53aabu, 0x318aa239u, 0xb2efd03fu,
+    0xb209f827u, 0xb2a291d9u, 0x32619dc8u, 0xb00c05e9u, 0x3236eb77u, 0x32c3026fu, 0xb13f4bc9u, 0x3287a345u,
+    0xb29a43a5u, 0xb26ccc90u, 0xb20ccd6cu, 0x32dd40bdu, 0xb1f30317u, 0xb2be90e7u, 0x3239af32u, 0xb19145deu,
+    0x32d359f4u, 0x2f9c71deu, 0x325d82edu, 0xb2feb66eu, 0x32b24167u, 0x32723124u, 0xb2b78771u, 0x31523233u,
+};
+
+__device__ __forceinline__ void ds_two_sum(float a, float b, float& s, float& e) {
+    s = a + b;
+    const float bb = s - a;
+    e = (a - (s - bb)) + (b - bb);
+}
+__device__ __forceinline__ void ds_two_prod(float a, float b, float& p, float& e) {
+    p = a * b;
+    e = fmaf(a, b, -p);
+}
+// Every real within rel*zh of zh + zl (zh > 0, normal) rounds to zh.
+__device__ __forceinline__ bool ds_settled(float zh, float zl, float rel) {
+    const uint32_t u = __float_as_uint(zh);
+    const float nb = __uint_as_float(zl < 0.0f ? u - 1u : u + 1u);
+    return fabsf(zl) + rel * zh < fabsf(nb - zh) * 0.5f;
+}
+__device__ __forceinline__ float ds_tab(const uint32_t* t, int i) { return __uint_as_float(t[i]); }
+
+// Branch-free, so a caller's independent evaluations interleave; false = take the double routine.
+__device__ __forceinline__ bool ds_exp_fast(float xi, float& y) {
+    const bool dom = fabsf(xi) <= 87.0f;
+    const float x = dom ? xi : 0.0f;
+    const float kf = rintf(x * __uint_as_float(0x42b8aa3bu));     // x * 64 / ln2
+    const int k = (int)kf;
+    const float c1 = __uint_as_float(0x3c316000u), c2 = __uint_as_float(0x3690bfbfu),
+                c3 = __uint_as_float(0xaa630865u);                 // ln2/64 = c1 + c2 + c3
+    const float rh0 = x - kf * c1;                                 // both steps exact
+    float ph, pl, rh, rl;
+    ds_two_prod(kf, c2, ph, pl);
+    ds_two_sum(rh0, -ph, rh, rl);
+    rl = rl - (pl + kf * c3);
+    ds_two_sum(rh, rl, rh, rl);                                    // r = rh + rl, |r| <= ln2/128
+    float qh, ql, eh, el;
+    ds_two_prod(rh, rh, qh, ql);
+    const float t = rh * qh * (0.16666667f + rh * (0.041666668f + rh * 0.008333334f));
+    ds_two_sum(rh, 0.5f * qh, eh, el);                             // e^r - 1 = eh + el
+    el = el + (t + (0.5f * ql + (rh * rl + rl)));
+    const float th = ds_tab(kDsExpHi, k & 63), tl = ds_tab(kDsExpLo, k & 63);
+    float p2h, p2l, yh, yl, zh, zl;
+    ds_two_prod(th, eh, p2h, p2l);
+    ds_two_sum(th, p2h, yh, yl);
+    yl = yl + (tl + (p2l + (th * el + tl * eh)));
+    ds_two_sum(yh, yl, zh, zl);
+    y = ldexpf(zh, k >> 6);
+    return dom & ds_settled(zh, zl, 0x1p-43f);  // `&`: no branch
+}
+
+__device__ __forceinline__ bool ds_log1p_fast(float xi, float& y) {
+    const bool dom = xi >= 0x1p-60f && xi <= 0x1p100f;
+    const float x = dom ? xi : 1.0f;
+    float uh, ul;
+    ds_two_sum(1.0f, x, uh, ul);                                   // 1 + x = uh + ul exactly
+    const uint32_t bu = __float_as_uint(uh);
+    const int m = (int)(bu >> 23) - 127, j = (int)((bu >> 15) & 255u);
+    const float f = __uint_as_float((bu & 0x007fffffu) | 0x3f800000u), r = ds_tab(kDsLogR, j);
+    float ph, pl, sh, sl;
+    ds_two_prod(f, r, ph, pl);
+    ds_two_sum(ph - 1.0f, pl, sh, sl);                             // f r - 1, ph - 1 exact
+    sl = sl + ldexpf(ul, -m) * r;                                  // s = (1 + x) 2^-m r - 1
+    ds_two_sum(sh, sl, sh, sl);
+    float qh, ql, lh, ll;
+    ds_two_prod(sh, sh, qh, ql);
+    ql = ql + 2.0f * sh * sl;
+    const float p3 = sh * qh *
+        (0.33333334f + sh * (-0.25f + sh * (0.2f + sh * (-0.16666667f + sh * 0.14285715f))));
+    ds_two_sum(sh, -0.5f * qh, lh, ll);                            // log1p(s) = lh + ll
+    ll = ll + (p3 + (sl - 0.5f * ql));
+    const float mf = (float)m, l2h = __uint_as_float(0x3f317200u),
+                l2l = __uint_as_float(0x35bfbe8eu), l2l2 = __uint_as_float(0x29779abdu);
+    float bh, bl, a0, e0, a1, e1, zh, zl;
+    ds_two_prod(mf, l2l, bh, bl);
+    ds_two_sum(mf * l2h, ds_tab(kDsLogHi, j), a0, e0);             // m ln2 + -log(R_j) + log1p(s)
+    ds_two_sum(a0, lh, a1, e1);
+    const float lo = e1 + (e0 + (ll + (bh + (ds_tab(kDsLogLo, j) + (bl + mf * l2l2)))));
+    ds_two_sum(a1, lo, zh, zl);
+    y = zh;
+    return dom & ds_settled(zh, zl, 0x1p-38f);
+}
+
+__device__ __forceinline__ float ds_exp(float x) {
+    float y;
+    return ds_exp_fast(x, y) ? y : ds_exp_ref(x);
+}
+// N independent values in place: every fast path first, then the rare double routines.
+// (One branch for all N, so the N fast paths interleave ahead of it.)
+template <int N>
+__device__ __forceinline__ void ds_exp_n(float (&v)[N]) {
+    float y[N];
+    bool ok[N], all = true;
+#pragma unroll
+    for (int i = 0; i < N; ++i) {
+        ok[i] = ds_exp_fast(v[i], y[i]);
+        all &= ok[i];
+    }
+    if (!all)
+#pragma unroll
+        for (int i = 0; i < N; ++i)
+            if (!ok[i]) y[i] = ds_exp_ref(v[i]);
+#pragma unroll
+    for (int i = 0; i < N; ++i) v[i] = y[i];
+}
+template <int N>
+__device__ __forceinline__ void ds_log1p_n(float (&v)[N]) {
+    float y[N];
+    bool ok[N], all = true;
+#pragma unroll
+    for (int i = 0; i < N; ++i) {
+        ok[i] = ds_log1p_fast(v[i], y[i]);
+        all &= ok[i];
+    }
+    if (!all)
+#pragma unroll
+        for (int i = 0; i < N; ++i)
+            if (!ok[i]) y[i] = ds_log1p_ref(v[i]);
+#pragma unroll
+    for (int i = 0; i < N; ++i) v[i] = y[i];
+}
 
 // An element of a float plane of any of the dtypes ld_dt reads that these ops accept.
 __device__ __forceinline__ float ds_ld(uint32_t dt, const void* p, long i) {
@@ -446,10 +697,10 @@ int quant_rt_body(const RadArgs* a, RadStream stream) {
 
 /* ==================================================================== mhc_mix
  * The projection is mhc_pre's: hc*(hc+2) dots of the row with fn and its sum of squares. The row
- * splits into 1024-column chunks; a wave takes a chunk of R rows (lane L the columns L, L+32, ..
- * in order), closes each sum with the wave butterfly, and the chunk partials are added in chunk
- * order. With scratch the chunks are separate workgroups (partials, then a finishing wave a row);
- * without, one wave a row walks the chunks itself, in the same order, for the same bits. The
+ * splits into 1024-column chunks; in a chunk each sum is lane L's columns L, L+32, .. in order,
+ * closed with the wave butterfly, and the chunk partials are added in chunk order. With scratch
+ * the chunks are separate workgroups whose waves split the sums (mix_split_kernel), then a
+ * finishing wave a row; without, one wave a row walks the chunks itself, for the same bits. The
  * finish is ref finish_row lane-parallel: element (j,k) of the Sinkhorn matrix on lane j*hc+k (and
  * +32 from hc 6), every row and column sum gathered by shuffles in the scalar loop's order. */
 
@@ -497,11 +748,35 @@ __device__ __forceinline__ void mix_chunk(const uint16_t* h, long hp, const floa
     }
 }
 
+// The scales and biases a lane of mix_finish reads, loaded before the partials so their latencies
+// overlap.
+template <int HC>
+struct MixPre {
+    float s0, s1, s2, bpre, bpost, bc[(HC * HC + 31) / 32];
+};
+template <int HC>
+__device__ __forceinline__ MixPre<HC> mix_pre(int lane, const MixOut& o) {
+    constexpr int NN = HC * HC, NE = (NN + 31) / 32;
+    MixPre<HC> p;
+    p.s0 = o.scale[0];
+    p.s1 = o.scale[o.sst];
+    p.s2 = o.scale[2 * o.sst];
+    const int jl = lane < HC ? lane : 0;
+    p.bpre = o.base[(long)jl * o.bst];
+    p.bpost = o.base[(long)(HC + jl) * o.bst];
+#pragma unroll
+    for (int u = 0; u < NE; ++u) {
+        const int e = lane + 32 * u;
+        p.bc[u] = o.base[(long)(2 * HC + (e < NN ? e : 0)) * o.bst];
+    }
+    return p;
+}
+
 // d[q] holds sum j = lane + 32q (the hc*(hc+2) dots, then the sum of squares) in every lane that
 // owns one. Every lane must enter: the gathers are shuffles.
 template <int HC>
 __device__ __forceinline__ void mix_finish(const float (&d)[(HC * (HC + 2) + 32) / 32], int lane,
-                                           long row, const MixOut& o) {
+                                           long row, const MixOut& o, const MixPre<HC>& pr) {
     constexpr int MIX = HC * (HC + 2), Q = (MIX + 32) / 32, NN = HC * HC, NE = (NN + 31) / 32;
     const float sq = __shfl(d[MIX / 32], MIX % 32, 32);
     const float inv = 1.0f / sqrtf(sq / (float)o.width + o.eps);
@@ -517,15 +792,10 @@ __device__ __forceinline__ void mix_finish(const float (&d)[(HC * (HC + 2) + 32)
         }
         return r;
     };
-    const float s0 = o.scale[0], s1 = o.scale[o.sst], s2 = o.scale[2 * o.sst];
+    const float s0 = pr.s0, s1 = pr.s1, s2 = pr.s2;
     const int jl = lane < HC ? lane : 0;
     const float cpre = coeff(jl), cpost = coeff(HC + jl);
-    if (lane < HC) {
-        const float pj = 1.0f / (1.0f + ds_exp(-(cpre * s0 + o.base[(long)lane * o.bst]))) + o.heps;
-        const float z = cpost * s1 + o.base[(long)(HC + lane) * o.bst];
-        o.post[row * o.pop + lane * o.pos] = 2.0f / (1.0f + ds_exp(-z));
-        o.pre[row * o.prp + lane * o.prs] = pj;
-    }
+    const float zpre = -(cpre * s0 + pr.bpre), z = cpost * s1 + pr.bpost;
     float c[NE];
     int rb[NE], ck[NE];
 #pragma unroll
@@ -534,7 +804,7 @@ __device__ __forceinline__ void mix_finish(const float (&d)[(HC * (HC + 2) + 32)
         rb[u] = ee / HC * HC;
         ck[u] = ee % HC;
         const float cq = coeff(2 * HC + ee);
-        c[u] = e < NN ? cq * s2 + o.base[(long)(2 * HC + ee) * o.bst] : 0.0f;
+        c[u] = e < NN ? cq * s2 + pr.bc[u] : 0.0f;
     }
     auto get = [&](int idx) {
         float r = 0.0f;
@@ -553,8 +823,19 @@ __device__ __forceinline__ void mix_finish(const float (&d)[(HC * (HC + 2) + 32)
 #pragma unroll
             for (int k = 0; k < HC; ++k) mx[u] = ds_max(mx[u], get(rb[u] + k));
         }
+        float ex[2 + NE];  // every lane's three exps in one batch (pre and post kept on hc lanes)
+        ex[0] = zpre;
+        ex[1] = -z;
 #pragma unroll
-        for (int u = 0; u < NE; ++u) c[u] = ds_exp(c[u] - mx[u]);
+        for (int u = 0; u < NE; ++u) ex[2 + u] = c[u] - mx[u];
+        ds_exp_n(ex);
+        if (lane < HC) {
+            const float pj = 1.0f / (1.0f + ex[0]) + o.heps;
+            o.post[row * o.pop + lane * o.pos] = 2.0f / (1.0f + ex[1]);
+            o.pre[row * o.prp + lane * o.prs] = pj;
+        }
+#pragma unroll
+        for (int u = 0; u < NE; ++u) c[u] = ex[2 + u];
 #pragma unroll
         for (int u = 0; u < NE; ++u) {
             sum[u] = 0.0f;
@@ -592,46 +873,135 @@ __device__ __forceinline__ void mix_finish(const float (&d)[(HC * (HC + 2) + 32)
     }
 }
 
-// Partials of chunk blockIdx.x for 8*R rows a workgroup: part[row][chunk][j], j <= mix.
-template <int HC, int R>
-__global__ __launch_bounds__(256) void mix_partial_kernel(const uint16_t* h, long hp,
-                                                          const float* fn, long fp, float* part,
-                                                          int width, int chunks, long rows) {
-    constexpr int MIX = HC * (HC + 2);
+// The same partials at decode heights: the WV waves of a workgroup take the same R rows of one
+// chunk and split its hc*(hc+2) dots between them (wave w forms dots w, w+WV, ..; wave
+// hc*(hc+2) % WV also the sum of squares), each walked as mix_chunk walks it (lane L the columns
+// L, L+32, .. in order, each product added unfused), so a partial is the same sum in the same
+// order whichever wave forms it, for any R, WV and row count. A wave's loads for TS column steps
+// go out before their adds (one wave of a row's 24 loads a step, as a chunk a workgroup with the
+// rows over its waves had it at decode heights, was ~1 us a step: 34 us of a 36 us call).
+constexpr int kMixSteps = 8;
+
+template <int HC, int R, int WV, int TS>
+__global__ __launch_bounds__(32 * WV) void mix_split_kernel(const uint16_t* h, long hp,
+                                                            const float* fn, long fp, float* part,
+                                                            int width, int chunks, long rows) {
+    constexpr int MIX = HC * (HC + 2), S = MIX + 1, JW = (MIX + WV - 1) / WV;
     const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5, chunk = blockIdx.x;
-    for (long g = blockIdx.y; g * 8 * R < rows; g += gridDim.y) {
-        const long r0 = (g * 8 + wave) * R;
-        if (r0 >= rows) continue;
-        const int nr = (int)(rows - r0 < R ? rows - r0 : R);
-        float acc[MIX + 1][R];
-        mix_chunk<HC, R>(h, hp, fn, fp, width, r0, nr, chunk, lane, acc);
+    const int c0 = chunk * kMixCols;
+    const float* wr[JW];  // a slot past the last dot walks row 0 and is dropped
 #pragma unroll
-        for (int j = 0; j <= MIX; ++j)
+    for (int q = 0; q < JW; ++q) {
+        const int j = wave + WV * q;
+        wr[q] = fn + (long)(j < MIX ? j : 0) * fp;
+    }
+    for (long g = blockIdx.y; g * R < rows; g += gridDim.y) {
+        const long r0 = g * R;
+        const int nr = (int)(rows - r0 < R ? rows - r0 : R);
+        const uint16_t* hr[R];
+#pragma unroll
+        for (int r = 0; r < R; ++r) hr[r] = h + (r0 + (r < nr ? r : 0)) * hp;
+        float acc[JW + 1][R];  // [JW]: the sum of squares
+#pragma unroll
+        for (int q = 0; q <= JW; ++q)
+#pragma unroll
+            for (int r = 0; r < R; ++r) acc[q][r] = 0.0f;
+        auto walk = [&](auto full, auto sq) {
+            constexpr bool FULL = decltype(full)::value, SQ = decltype(sq)::value;
+#pragma unroll 1  // unrolled, the loads of every step went up front and spilled
+            for (int t0 = 0; t0 < kMixCols / 32; t0 += TS) {
+                float v[TS][R], w[TS][JW];
+#pragma unroll
+                for (int u = 0; u < TS; ++u) {
+                    const int col = c0 + (t0 + u) * 32 + lane;
+                    const bool in = FULL || col < width;
+                    const int cc = in ? col : 0;  // a valid address; the value is replaced by 0
+#pragma unroll
+                    for (int r = 0; r < R; ++r) {
+                        const float x = ds_bf(hr[r][cc]);
+                        v[u][r] = in && r < nr ? x : 0.0f;
+                    }
+#pragma unroll
+                    for (int q = 0; q < JW; ++q) {
+                        const float x = wr[q][cc];
+                        w[u][q] = in ? x : 0.0f;
+                    }
+                }
+#pragma unroll
+                for (int u = 0; u < TS; ++u) {
+#pragma unroll
+                    for (int q = 0; q < JW; ++q)
+#pragma unroll
+                        for (int r = 0; r < R; ++r) acc[q][r] += v[u][r] * w[u][q];
+                    if (SQ)
+#pragma unroll
+                        for (int r = 0; r < R; ++r) acc[JW][r] += v[u][r] * v[u][r];
+                }
+            }
+        };
+        const bool full = c0 + kMixCols <= width, sq = wave == MIX % WV;
+        if (full) {
+            if (sq) walk(std::true_type{}, std::true_type{});
+            else walk(std::true_type{}, std::false_type{});
+        } else {
+            if (sq) walk(std::false_type{}, std::true_type{});
+            else walk(std::false_type{}, std::false_type{});
+        }
+#pragma unroll
+        for (int q = 0; q <= JW; ++q) {
+            const int j = q < JW ? wave + WV * q : MIX;
+            if (q < JW ? j >= MIX : !sq) continue;
 #pragma unroll
             for (int r = 0; r < R; ++r) {
-                const float s = r4d_wave_sum(acc[j][r]);
-                if (!lane && r < nr) part[((r0 + r) * chunks + chunk) * (MIX + 1) + j] = s;
+                const float s = r4d_wave_sum(acc[q][r]);
+                if (!lane && r < nr) part[((r0 + r) * S + j) * chunks + chunk] = s;
             }
+        }
     }
 }
 
 template <int HC>
 __global__ __launch_bounds__(128) void mix_finish_kernel(const float* part, int chunks, MixOut o,
                                                          long rows) {
-    constexpr int MIX = HC * (HC + 2), Q = (MIX + 32) / 32;
+    constexpr int MIX = HC * (HC + 2), Q = (MIX + 32) / 32, CU = 32;
     const int lane = threadIdx.x & 31;
     const long row = (long)blockIdx.x * 4 + (threadIdx.x >> 5);
     if (row >= rows) return;
+    const MixPre<HC> pr = mix_pre<HC>(lane, o);
+    const bool vec = (chunks & 3) == 0 && ((uintptr_t)part & 15) == 0;
     float d[Q];
 #pragma unroll
     for (int q = 0; q < Q; ++q) {
         const int j = lane + 32 * q;
+        const float* p = part + (row * (MIX + 1) + (j <= MIX ? j : 0)) * chunks;
         float s = 0.0f;
-        if (j <= MIX)
-            for (int c = 0; c < chunks; ++c) s += part[(row * chunks + c) * (MIX + 1) + j];
-        d[q] = s;
+        if (vec) {  // CU chunks a batch as CU/4 16-byte loads, then their adds in chunk order
+            for (int c = 0; c < chunks; c += CU) {
+                float4 t[CU / 4];
+#pragma unroll
+                for (int u = 0; u < CU / 4; ++u)
+                    t[u] = reinterpret_cast<const float4*>(p + c)[c + 4 * u < chunks ? u : 0];
+#pragma unroll
+                for (int u = 0; u < CU / 4; ++u) {
+                    const float e[4] = { t[u].x, t[u].y, t[u].z, t[u].w };
+#pragma unroll
+                    for (int k = 0; k < 4; ++k)
+                        if (c + 4 * u + k < chunks) s += e[k];
+                }
+            }
+        } else {
+            for (int c = 0; c < chunks; c += CU) {
+                float t[CU];
+#pragma unroll
+                for (int u = 0; u < CU; ++u) t[u] = p[c + u < chunks ? c + u : c];
+#pragma unroll
+                for (int u = 0; u < CU; ++u)
+                    if (c + u < chunks) s += t[u];
+            }
+        }
+        d[q] = j <= MIX ? s : 0.0f;
     }
-    mix_finish<HC>(d, lane, row, o);
+    mix_finish<HC>(d, lane, row, o, pr);
 }
 
 // Without scratch: one wave a row, the chunks in order, the same partials and the same sums.
@@ -642,6 +1012,7 @@ __global__ __launch_bounds__(128) void mix_fused_kernel(const uint16_t* h, long 
     const int lane = threadIdx.x & 31;
     const long row = (long)blockIdx.x * 4 + (threadIdx.x >> 5);
     if (row >= rows) return;
+    const MixPre<HC> pr = mix_pre<HC>(lane, o);
     float tot[MIX + 1];
 #pragma unroll
     for (int j = 0; j <= MIX; ++j) tot[j] = 0.0f;
@@ -659,25 +1030,33 @@ __global__ __launch_bounds__(128) void mix_fused_kernel(const uint16_t* h, long 
         for (int j = 0; j <= MIX; ++j)
             if (j == lane + 32 * q) d[q] = tot[j];
     }
-    mix_finish<HC>(d, lane, row, o);
+    mix_finish<HC>(d, lane, row, o, pr);
 }
 
 long mix_chunks(long width) { return (width + kMixCols - 1) / kMixCols; }
 
+
 template <int HC>
 int mix_emit(RadStream stream, const RadTensor& h, const RadTensor& fn, const MixOut& o, long rows,
              void* scratch, int64_t scratch_bytes) {
-    constexpr int MIX = HC * (HC + 2), R = HC <= 4 ? 2 : 1;
+    constexpr int MIX = HC * (HC + 2);
     const long chunks = mix_chunks(o.width);
     const int64_t need = (int64_t)rows * chunks * (MIX + 1) * (int64_t)sizeof(float);
     const unsigned fin = (unsigned)((rows + 3) / 4);
     if (scratch && scratch_bytes >= need) {
         float* part = (float*)scratch;
-        const long groups = (rows + 8 * R - 1) / (8 * R);
-        const int rc = R4D_EMIT(stream, (mix_partial_kernel<HC, R>),
-                                dim3((unsigned)chunks, grid_rows(groups)), dim3(256), 0,
-                                (const uint16_t*)h.data, (long)h.stride[0], (const float*)fn.data,
-                                (long)fn.stride[0], part, o.width, (int)chunks, rows);
+        // Rows a wave keeps (its sums' registers), and the fastest split measured per height on
+        // gfx1201 (n 5120, hc 4): one row up to 8, four rows 4 steps up to 24, then eight.
+        constexpr int RB = HC <= 4 ? 8 : HC <= 6 ? 4 : 2, RM = RB < 4 ? RB : 4;
+#define MIX_SPLIT(RS, TS)                                                                          \
+    R4D_EMIT(stream, (mix_split_kernel<HC, RS, 8, TS>),                                            \
+             dim3((unsigned)chunks, grid_rows((rows + (RS) - 1) / (RS))), dim3(256), 0,            \
+             (const uint16_t*)h.data, (long)h.stride[0], (const float*)fn.data,                    \
+             (long)fn.stride[0], part, o.width, (int)chunks, rows)
+        const int rc = rows <= 8 ? MIX_SPLIT(1, kMixSteps)
+                       : rows <= 24 ? MIX_SPLIT(RM, 4)
+                                    : MIX_SPLIT(RB, 4);
+#undef MIX_SPLIT
         if (rc < 0) return rc;
         return R4D_EMIT(stream, mix_finish_kernel<HC>, dim3(fin), dim3(128), 0, (const float*)part,
                         (int)chunks, o, rows);
@@ -929,11 +1308,13 @@ __global__ __launch_bounds__(128) void router_scored_kernel(const float* logits,
     const int lane = threadIdx.x & 31;
     const long r = (long)blockIdx.x * 4 + (threadIdx.x >> 5);
     if (r >= m) return;
-    float p[OWN];
+    float p[OWN], bv[OWN];  // every load first (a clamped index past ne, its value dropped)
 #pragma unroll
     for (int i = 0; i < OWN; ++i) {
-        const int e = lane + 32 * i;
-        p[i] = e < ne ? logits[r * lp + e] : 0.0f;
+        const int e = lane + 32 * i, ec = e < ne ? e : 0;
+        const float x = logits[r * lp + ec];
+        bv[i] = bias[(long)ec * bp];
+        p[i] = e < ne ? x : 0.0f;
     }
     if (SCORE == kSoftmax) {
         float mx = -INFINITY;
@@ -952,18 +1333,26 @@ __global__ __launch_bounds__(128) void router_scored_kernel(const float* logits,
 #pragma unroll
         for (int i = 0; i < OWN; ++i) p[i] = p[i] / den;
     } else if (SCORE == kSigmoid) {
+        float t[OWN];
 #pragma unroll
-        for (int i = 0; i < OWN; ++i) p[i] = 1.0f / (1.0f + ds_exp(-p[i]));
+        for (int i = 0; i < OWN; ++i) t[i] = -p[i];
+        ds_exp_n(t);
+#pragma unroll
+        for (int i = 0; i < OWN; ++i) p[i] = 1.0f / (1.0f + t[i]);
     } else {
+        float t[OWN];
 #pragma unroll
-        for (int i = 0; i < OWN; ++i)
-            p[i] = sqrtf(p[i] > 20.0f ? p[i] : ds_log1p(ds_exp(p[i])));
+        for (int i = 0; i < OWN; ++i) t[i] = p[i];
+        ds_exp_n(t);
+        ds_log1p_n(t);
+#pragma unroll
+        for (int i = 0; i < OWN; ++i) p[i] = sqrtf(p[i] > 20.0f ? p[i] : t[i]);
     }
     unsigned long long key[OWN];
 #pragma unroll
     for (int i = 0; i < OWN; ++i) {
         const int e = lane + 32 * i;
-        key[i] = e < ne ? ds_rank_key(p[i] + bias[(long)e * bp], e) : 0ull;
+        key[i] = e < ne ? ds_rank_key(p[i] + bv[i], e) : 0ull;
     }
     unsigned long long below = ~0ull, mine = 0;
     for (int j = 0; j < k; ++j) {

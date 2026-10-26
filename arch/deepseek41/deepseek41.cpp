@@ -1777,15 +1777,34 @@ static void step(RadCtx* x, const RadBatch* batch) {
             RAD_ISSUE_N(x, L.attn_fill, T, brows(m.attn_out, T));
         } else {
             RAD_ISSUE_N(x, L.norm_a, T, brows(m.xcol, T), RAD_W(L.attn_norm), brows(m.xn, T));
-            RAD_ISSUE_N(x, L.q_a, T, brows(m.xn, T), RAD_W(L.wq_a), brows(m.qr, T));
-            RAD_ISSUE_N(x, L.q_an, T, brows(m.qr, T), RAD_W(L.q_norm), brows(m.qrn, T));
-            RAD_ISSUE_N(x, L.q_b, T, brows(m.qrn, T), RAD_W(L.wq_b), brows(m.q, T));
             const rad_buf cs = r > 0 ? m.cs_b : m.cs_a;
-            RAD_ISSUE_N(x, L.q_rope, T, brows(m.q, T), brows(cs, g.max_ctx), pos);
-            RAD_ISSUE_N(x, L.kv_g, T, brows(m.xn, T), RAD_W(L.wkv), brows(m.kv, T));
-            RAD_ISSUE_N(x, L.kv_n, T, brows(m.kv, T), RAD_W(L.kv_norm), brows(m.kvn, T));
-            RAD_ISSUE_N(x, L.kv_rope, T, brows(m.kvn, T), brows(cs, g.max_ctx), pos);
-            if (L.kv_q) RAD_ISSUE_N(x, L.kv_q, T, brows(m.kvn, T));
+            /* The query and key chains share only xn. Issued alternately, each op's predecessor
+             * is in the other chain, so a recorded pass can leave it unordered behind it (the
+             * tape's hazard check) and the two chains' dispatches overlap; one after the other,
+             * every op but kv_g waits for the one before. Same kernels on the same operands. */
+            static const bool ilv = [] {
+                const char* e = std::getenv("RADIANCE_DS41_QKV_INTERLEAVE");
+                return !(e && e[0] == '0');
+            }();
+            if (ilv) {
+                RAD_ISSUE_N(x, L.q_a, T, brows(m.xn, T), RAD_W(L.wq_a), brows(m.qr, T));
+                RAD_ISSUE_N(x, L.kv_g, T, brows(m.xn, T), RAD_W(L.wkv), brows(m.kv, T));
+                RAD_ISSUE_N(x, L.q_an, T, brows(m.qr, T), RAD_W(L.q_norm), brows(m.qrn, T));
+                RAD_ISSUE_N(x, L.kv_n, T, brows(m.kv, T), RAD_W(L.kv_norm), brows(m.kvn, T));
+                RAD_ISSUE_N(x, L.q_b, T, brows(m.qrn, T), RAD_W(L.wq_b), brows(m.q, T));
+                RAD_ISSUE_N(x, L.kv_rope, T, brows(m.kvn, T), brows(cs, g.max_ctx), pos);
+                RAD_ISSUE_N(x, L.q_rope, T, brows(m.q, T), brows(cs, g.max_ctx), pos);
+                if (L.kv_q) RAD_ISSUE_N(x, L.kv_q, T, brows(m.kvn, T));
+            } else {
+                RAD_ISSUE_N(x, L.q_a, T, brows(m.xn, T), RAD_W(L.wq_a), brows(m.qr, T));
+                RAD_ISSUE_N(x, L.q_an, T, brows(m.qr, T), RAD_W(L.q_norm), brows(m.qrn, T));
+                RAD_ISSUE_N(x, L.q_b, T, brows(m.qrn, T), RAD_W(L.wq_b), brows(m.q, T));
+                RAD_ISSUE_N(x, L.q_rope, T, brows(m.q, T), brows(cs, g.max_ctx), pos);
+                RAD_ISSUE_N(x, L.kv_g, T, brows(m.xn, T), RAD_W(L.wkv), brows(m.kv, T));
+                RAD_ISSUE_N(x, L.kv_n, T, brows(m.kv, T), RAD_W(L.kv_norm), brows(m.kvn, T));
+                RAD_ISSUE_N(x, L.kv_rope, T, brows(m.kvn, T), brows(cs, g.max_ctx), pos);
+                if (L.kv_q) RAD_ISSUE_N(x, L.kv_q, T, brows(m.kvn, T));
+            }
             RAD_ISSUE_N(x, L.kv_st, T, bcol(m.kvn, 0, hd / 2, T), bcol(m.kvn, hd / 2, hd / 2, T),
                         praw(wb->slot_mapping, RAD_I32, T), kv_cache(m.win, l));
 

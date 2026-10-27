@@ -1196,6 +1196,10 @@ std::vector<Case> build_cases() {
                                   HI("ratio", 4), HI("topk", 5), HF("scale", 0.125), HS("dtype", dt) });
         add("index_score", { HI("M", 9), HI("heads", 4), HI("dim", 64), HI("ratio", 4),
                              HI("width", 13), HF("wscale", 0.25), HS("dtype", dt) });
+        /* A run of a step scored in runs (row_part): rows 2 M .. 3 M - 1 of a 3 M-row step. */
+        add("index_score", { HI("M", 4), HI("heads", 4), HI("dim", 64), HI("ratio", 4),
+                             HI("width", 13), HF("wscale", 0.25), HS("dtype", dt),
+                             HI("row_part", 2) });
         add("entry_store", { HI("M", 5), HI("n", 128), HI("block_size", 4), HS("dtype", dt) });
         add("stream_gate_add", { HI("M", 5), HI("n", 129), HI("hc", 4), HF("eps", 1e-6),
                                  HF("gate_eps", 1e-6), HS("dtype", dt) });
@@ -1216,8 +1220,16 @@ std::vector<Case> build_cases() {
                               HI("ratio", 1) });
     add("index_candidates", { HI("M", 6), HI("width", 21), HI("block", 4), HI("topk_blocks", 3),
                               HI("ratio", 1) });
+    /* 35 blocks: keep is two words a row. */
+    add("index_candidates", { HI("M", 5), HI("width", 140), HI("block", 4), HI("topk_blocks", 20),
+                              HI("ratio", 1) });
     add("index_topk", { HI("M", 9), HI("width", 17), HI("topk", 4), HI("ratio", 1) });
     add("index_topk", { HI("M", 9), HI("width", 9), HI("topk", 4), HI("ratio", 2) });
+    /* keep's bits over blocks of 3 (a short last block) and of 2 across two words. */
+    add("index_topk", { HI("M", 9), HI("width", 17), HI("topk", 4), HI("ratio", 1),
+                        HI("block", 3) });
+    add("index_topk", { HI("M", 6), HI("width", 90), HI("topk", 6), HI("ratio", 1),
+                        HI("block", 2) });
     add("token_map", { HI("M", 9), HI("n_vocab", 50) });
 
     /* ================================================================== speed-only, at model size

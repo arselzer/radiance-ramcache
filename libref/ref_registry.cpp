@@ -453,7 +453,7 @@ static const RadOperandSpec oAttnSparseSink[] = { OPD("q"), OPD("window_cache"),
     OPD("window_used"), OPD_O("comp_cache"), OPD_O("comp_bt"), OPD_O("sel"), OPD("positions"), OPD("cu_seqlens"),
     WGT("sinks"), OUT("out") };
 static const RadParamSpec pIndexScore[] = { P_INT("M"), P_INT("heads"), P_INT("dim"),
-    P_INT("ratio"), P_INT("width"), P_F64("wscale"), P_STR("dtype") };
+    P_INT("ratio"), P_INT("width"), P_F64("wscale"), P_STR("dtype"), P_INTO("row_part") };
 static const RadOperandSpec oIndexScore[] = { OPD("q"), OPD("w"), OPD("index_cache"), OPD("bt"),
     OPD("positions"), OPD("cu_seqlens"), OUT("score") };
 static const RadParamSpec pIndexCand[] = { P_INT("M"), P_INT("width"), P_INT("block"),
@@ -479,7 +479,8 @@ static const RadParamSpec pEmbedGgml[] = { P_INT("M"), P_INT("n_embd"), P_INT("n
 static const RadOperandSpec oEmbedGgml[] = { OPD("tokens"), WGT("wte"), OUT("x") };
 static const RadParamSpec pEntryStore[] = { P_INT("M"), P_INT("n"), P_INT("block_size"), P_STR("dtype") };
 static const RadOperandSpec oEntryStore[] = { OPD("x"), OPD("page"), INOUT("cache") };
-static const RadParamSpec pIndexTopk[] = { P_INT("M"), P_INT("width"), P_INT("topk"), P_INT("ratio") };
+static const RadParamSpec pIndexTopk[] = { P_INT("M"), P_INT("width"), P_INT("topk"), P_INT("ratio"),
+    P_INTO("block") };
 static const RadOperandSpec oIndexTopk[] = { OPD("score"), OPD_O("keep"), OPD("positions"), OUT("sel") };
 
 /* QSA's compressed key, libr4d's schema exactly (libr4d/r4d_rows.cpp): `block_size` is `ratio`
@@ -1492,14 +1493,16 @@ static const RadOpSchema kSchemas[] = {
   "Per row and compressed position j: sum_h relu(q_h . k_j) w_h with k_j entry j of the paged "
   "index cache and w_h = round(w * wscale); the dot, relu(dot) w_h and the f32 head sum each "
   "rounded once to dtype. "
-  "j >= (pos+1)/ratio or an unmapped block scores -inf. score is f32 [M, width]." },
+  "j >= (pos+1)/ratio or an unmapped block scores -inf. score is f32 [M, width]. With row_part "
+  "p, score row i is step row p M + i (q, w, positions the step's; past the step -inf)." },
 { "index_candidates", ARR(pIndexCand), ARR(oIndexCand),
   "Blocks of `block` positions scored by their maximum, the newest reachable block pinned to "
-  "+inf, the topk_blocks highest (ties to the lower block) kept unless -inf; keep is 1 inside "
-  "a kept block." },
+  "+inf, the topk_blocks highest (ties to the lower block) kept unless -inf; keep is a bit a "
+  "block, i32 [M, ceil(ceil(width/block)/32)], bit b%32 of word b/32 set when block b is kept." },
 { "index_topk", ARR(pIndexTopk), ARR(oIndexTopk),
-  "The topk highest-scoring passed positions (j < (pos+1)/ratio), inside keep when given, "
-  "never -inf, ties to the lower position, in ascending order, then -1." },
+  "The topk highest-scoring passed positions (j < (pos+1)/ratio), inside keep when given "
+  "(index_candidates' bits over blocks of `block`), never -inf, ties to the lower position, in "
+  "ascending order, then -1." },
 { "gemm_nt_ggml", ARR(pGemmGgml), ARR(oGemmGgml),
   "y = a . w^T with w llama.cpp's own blocks of GGUF type `type` (\"iq1_s\", \"q6_K\", ...), "
   "relayouted from the type's planes at load: each row dequantised as llama.cpp does, f32 dot in "

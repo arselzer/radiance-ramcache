@@ -384,13 +384,14 @@ static const RadOperandSpec oAttnSparseSink[] = { OPD("q"), OPD("window_cache"),
     OPD("window_used"), OPD_O("comp_cache"), OPD_O("comp_bt"), OPD_O("sel"), OPD("positions"),
     OPD("cu_seqlens"), WGT("sinks"), OUT("out") };
 static const RadParamSpec pIndexScore[] = { P_INT("M"), P_INT("heads"), P_INT("dim"),
-    P_INT("ratio"), P_INT("width"), P_F64("wscale"), P_STR("dtype") };
+    P_INT("ratio"), P_INT("width"), P_F64("wscale"), P_STR("dtype"), P_INTO("row_part") };
 static const RadOperandSpec oIndexScore[] = { OPD("q"), OPD("w"), OPD("index_cache"), OPD("bt"),
     OPD("positions"), OPD("cu_seqlens"), OUT("score") };
 static const RadParamSpec pIndexCand[] = { P_INT("M"), P_INT("width"), P_INT("block"),
     P_INT("topk_blocks"), P_INT("ratio") };
 static const RadOperandSpec oIndexCand[] = { OPD("score"), OPD("positions"), OUT("keep") };
-static const RadParamSpec pIndexTopk[] = { P_INT("M"), P_INT("width"), P_INT("topk"), P_INT("ratio") };
+static const RadParamSpec pIndexTopk[] = { P_INT("M"), P_INT("width"), P_INT("topk"), P_INT("ratio"),
+    P_INTO("block") };
 static const RadOperandSpec oIndexTopk[] = { OPD("score"), OPD_O("keep"), OPD("positions"), OUT("sel") };
 static const RadParamSpec pEntryStore[] = { P_INT("M"), P_INT("n"), P_INT("block_size"), P_STR("dtype") };
 static const RadOperandSpec oEntryStore[] = { OPD("x"), OPD("page"), INOUT("cache") };
@@ -1131,11 +1132,13 @@ static const RadOpSchema kSchemas[] = {
 { "attn_sparse_sink", ARR(pAttnSparseSink), ARR(oAttnSparseSink),
   "latent attention with a per-head sink over the window and the selected compressed entries." },
 { "index_score", ARR(pIndexScore), ARR(oIndexScore),
-  "the indexer's relu-gated head sum per row and compressed position, -inf where not passed." },
+  "the indexer's relu-gated head sum per row and compressed position, -inf where not passed; "
+  "with row_part p, score row i is step row p M + i." },
 { "index_candidates", ARR(pIndexCand), ARR(oIndexCand),
-  "level one of the two-level top-k: the kept blocks, the newest reachable pinned." },
+  "level one of the two-level top-k: the kept blocks, the newest reachable pinned; keep a bit a "
+  "block." },
 { "index_topk", ARR(pIndexTopk), ARR(oIndexTopk),
-  "the topk best passed positions inside keep, in position order, then -1." },
+  "the topk best passed positions inside keep's blocks of `block`, in position order, then -1." },
 { "entry_store", ARR(pEntryStore), ARR(oEntryStore),
   "x[w] into the whole of block page[w] of a paged cache; a negative page writes nothing." },
 { "token_map", ARR(pTokenMap), ARR(oTokenMap),

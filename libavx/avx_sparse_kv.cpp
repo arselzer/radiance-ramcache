@@ -306,24 +306,35 @@ AVX_KERNEL(attn_sparse_sink) {
 /* The indexer's score of each compressed position for each row (libref's index_score): per head
  * the dot q_h . k_j rounded to q's dtype, relu(dot) times w_h = round(w * wscale) rounded, the head
  * sum in f32 rounded. The row's queries and head weights are read once; each live position's key
- * is widened once and dotted with every head. */
+ * is widened once and dotted with every head. With `row_part` p, score holds one run of R rows:
+ * score row i is step row p R + i of q, w, positions and cu_seqlens, and a row past the step
+ * scores -inf, as in libref. */
 AVX_KERNEL(index_score) {
     if (!rad_args_have(a, 7)) return RAD_E_INVAL;
     const RadTensor &q = a->t[0], &w = a->t[1], &kc = a->t[2], &bt = a->t[3];
     const RadTensor &pos = a->t[4], &cu = a->t[5], &sc = a->t[6];
     const int64_t H = p_int(a, "heads", 0), Dm = p_int(a, "dim", 0), ratio = p_int(a, "ratio", 0);
+    const int64_t part = p_int(a, "row_part", -1);
     const float wscale = p_f32(a, "wscale", 0.0f);
     if (H < 1 || Dm < 1 || ratio < 1 || Dm % ratio || !std::isfinite(wscale) || q.rank != 2 ||
         q.shape[0] < 1 || q.shape[1] != H * Dm || w.rank != 2 || w.shape[0] != q.shape[0] ||
         w.shape[1] != H || kc.rank != 4 || kc.shape[1] != 1 || kc.shape[3] * ratio != Dm ||
         kc.shape[2] % ratio || bt.rank != 2 || numel(&pos) != q.shape[0] || numel(&cu) < 2 ||
-        sc.rank != 2 || sc.shape[0] != q.shape[0] || sc.shape[1] < 1 || sc.dtype != RAD_F32)
+        sc.rank != 2 || sc.shape[0] < 1 || (part < 0 && sc.shape[0] != q.shape[0]) ||
+        sc.shape[1] < 1 || sc.dtype != RAD_F32)
         return RAD_E_SHAPE;
-    const int64_t M = q.shape[0], C = sc.shape[1], S = numel(&cu) - 1, cbs = kc.shape[2];
+    const int64_t Mq = q.shape[0], M = sc.shape[0], C = sc.shape[1], S = numel(&cu) - 1;
+    const int64_t cbs = kc.shape[2], row0 = part > 0 ? part * M : 0;
     const uint32_t dt = q.dtype;
     const bool exact = dt == RAD_F32;
     AVX_PARALLEL_FOR_IF(M * C * H * Dm >= AVX_PAR_MIN)
-    for (int64_t m = 0; m < M; ++m) {
+    for (int64_t i = 0; i < M; ++i) {
+        const int64_t m = row0 + i;
+        if (m >= Mq) {
+            const int64_t sb = rowoff(&sc, i, C), ss = laststride(&sc);
+            for (int64_t j = 0; j < C; ++j) stt(&sc, sb + j * ss, -INFINITY);
+            continue;
+        }
         float* buf = scratch_f32((size_t)(H * Dm + Dm + H + C + 16));
         float* qv = buf;
         float* kv = qv + H * Dm;
@@ -355,7 +366,7 @@ AVX_KERNEL(index_score) {
             }
             row[j] = v;
         }
-        out_row(&sc, rowoff(&sc, m, C), C, row);
+        out_row(&sc, rowoff(&sc, i, C), C, row);
     }
     return RAD_OK;
 }
@@ -378,11 +389,17 @@ void top_indices(const float* v, int64_t n, int64_t k, std::vector<int64_t>* idx
     idx->resize((size_t)k);
     std::sort(idx->begin(), idx->end(), ByScore{ v });
 }
+/* index_candidates' keep words a row: a bit a block of `block` positions over `width`, 32 to an
+ * i32 word (libref's ref_keep_words). */
+int64_t keep_words(int64_t width, int64_t block) {
+    return block < 1 || width < 1 ? 0 : ((width + block - 1) / block + 31) / 32;
+}
 }  // namespace
 
 /* Level one of the two-level top-k (libref's index_candidates): blocks of `block` positions
  * scored by their maximum, the newest reachable block pinned to +inf, the topk_blocks best kept
- * unless -inf. */
+ * unless -inf. keep is a bit a block, i32 [M, ceil(ceil(width / block) / 32)]: bit b % 32 of word
+ * b / 32 set when block b is kept, the bits past the last block 0. */
 AVX_KERNEL(index_candidates) {
     if (!rad_args_have(a, 3)) return RAD_E_INVAL;
     const RadTensor &sc = a->t[0], &pos = a->t[1], &keep = a->t[2];
@@ -390,9 +407,11 @@ AVX_KERNEL(index_candidates) {
     const int64_t ratio = p_int(a, "ratio", 0);
     if (block < 1 || kb < 1 || ratio < 1 || sc.rank != 2 || sc.shape[0] < 1 || sc.shape[1] < 1 ||
         sc.dtype != RAD_F32 || numel(&pos) != sc.shape[0] || keep.rank != 2 ||
-        keep.shape[0] != sc.shape[0] || keep.shape[1] != sc.shape[1])
+        keep.shape[0] != sc.shape[0] || keep.shape[1] != keep_words(sc.shape[1], block))
         return RAD_E_SHAPE;
+    if (keep.dtype != RAD_I32) return RAD_E_DTYPE;
     const int64_t M = sc.shape[0], C = sc.shape[1], nb = (C + block - 1) / block;
+    const int64_t KW = keep.shape[1];
     AVX_PARALLEL_FOR_IF(M * C >= AVX_PAR_MIN)
     for (int64_t m = 0; m < M; ++m) {
         float* buf = scratch_f32((size_t)(C + nb + 16));
@@ -408,29 +427,35 @@ AVX_KERNEL(index_candidates) {
         const int64_t reach = (ldi(&pos, offlin(&pos, m)) + 1) / ratio;
         if (reach >= 1 && (reach - 1) / block < nb) bsc[(reach - 1) / block] = INFINITY;
         static thread_local std::vector<int64_t> idx;
-        static thread_local std::vector<char> kept;
+        static thread_local std::vector<uint32_t> bits;
         top_indices(bsc, nb, kb, &idx);
-        kept.assign((size_t)nb, 0);
-        for (int64_t b : idx) kept[(size_t)b] = bsc[b] > -INFINITY;
-        const int64_t kbase = rowoff(&keep, m, C), ks = laststride(&keep);
-        for (int64_t j = 0; j < C; ++j) st_int_dt(keep.dtype, keep.data, kbase + j * ks, kept[(size_t)(j / block)] ? 1 : 0);
+        bits.assign((size_t)KW, 0u);
+        for (int64_t b : idx)
+            if (bsc[b] > -INFINITY) bits[(size_t)(b / 32)] |= 1u << (b % 32);
+        const int64_t kbase = rowoff(&keep, m, KW), ks = laststride(&keep);
+        for (int64_t wd = 0; wd < KW; ++wd)
+            st_int_dt(keep.dtype, keep.data, kbase + wd * ks, (int32_t)bits[(size_t)wd]);
     }
     return RAD_OK;
 }
 
-/* Level two (libref's index_topk): the topk best positions the row has passed, inside `keep` when
- * given, never -inf, ties to the lower position, written in position order then -1. */
+/* Level two (libref's index_topk): the topk best positions the row has passed, inside the kept
+ * blocks when `keep` is given (index_candidates' bits over blocks of `block`), never -inf, ties to
+ * the lower position, written in position order then -1. */
 AVX_KERNEL(index_topk) {
     if (!a || a->n_t < 4 || !a->t) return RAD_E_INVAL;
     const RadTensor &sc = a->t[0], &pos = a->t[2], &sel = a->t[3];
     const RadTensor* keep = a->t[1].data ? &a->t[1] : nullptr;
     const int64_t topk = p_int(a, "topk", 0), ratio = p_int(a, "ratio", 0);
+    const int64_t block = p_int(a, "block", 0);
     if (topk < 1 || ratio < 1 || !sc.data || !pos.data || !sel.data || sc.rank != 2 ||
         sc.shape[0] < 1 || sc.dtype != RAD_F32 || numel(&pos) != sc.shape[0] || sel.rank != 2 ||
         sel.shape[0] != sc.shape[0] || sel.shape[1] != topk ||
-        (keep && (keep->rank != 2 || keep->shape[0] != sc.shape[0] || keep->shape[1] != sc.shape[1])))
+        (keep && (block < 1 || keep->rank != 2 || keep->shape[0] != sc.shape[0] ||
+                  keep->shape[1] != keep_words(sc.shape[1], block))))
         return RAD_E_SHAPE;
-    const int64_t M = sc.shape[0], C = sc.shape[1];
+    if (keep && keep->dtype != RAD_I32) return RAD_E_DTYPE;
+    const int64_t M = sc.shape[0], C = sc.shape[1], KW = keep ? keep->shape[1] : 0;
     AVX_PARALLEL_FOR_IF(M * C >= AVX_PAR_MIN)
     for (int64_t m = 0; m < M; ++m) {
         const int64_t reach = std::min<int64_t>(C, (ldi(&pos, offlin(&pos, m)) + 1) / ratio);
@@ -439,9 +464,14 @@ AVX_KERNEL(index_topk) {
         const float* r = in_row(&sc, rowoff(&sc, m, C), C, v);
         if (r != v) std::memcpy(v, r, (size_t)n * sizeof(float));
         if (keep) {
-            const int64_t kbase = rowoff(keep, m, C), ks = laststride(keep);
-            for (int64_t j = 0; j < n; ++j)
-                if (!ld_int_dt(keep->dtype, keep->data, kbase + j * ks)) v[j] = -INFINITY;
+            /* A block at a time: its word's bit clears the whole block. */
+            const int64_t kbase = rowoff(keep, m, KW), ks = laststride(keep);
+            for (int64_t b = 0, j0 = 0; j0 < n; ++b, j0 += block) {
+                const uint32_t wd =
+                    (uint32_t)ld_int_dt(keep->dtype, keep->data, kbase + (b / 32) * ks);
+                if ((wd >> (b % 32)) & 1u) continue;
+                for (int64_t j = j0, e = std::min(n, j0 + block); j < e; ++j) v[j] = -INFINITY;
+            }
         }
         static thread_local std::vector<int64_t> idx;
         top_indices(v, n, topk, &idx);

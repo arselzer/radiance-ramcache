@@ -13,7 +13,7 @@ static const RadOperandSpec oDs41AttnSparseSink[] = {
     { "sinks", RAD_OPD_WEIGHT, 0 }, { "out", RAD_OPD_OUT, 0 },
 };
 static const RadParamSpec pDs41IndexScore[] = { P_INT("M"), P_INT("heads"), P_INT("dim"),
-    P_INT("ratio"), P_INT("width"), P_F64("wscale"), P_STR("dtype") };
+    P_INT("ratio"), P_INT("width"), P_F64("wscale"), P_STR("dtype"), P_INTO("row_part") };
 static const RadOperandSpec oDs41IndexScore[] = {
     { "q", RAD_OPD_IN, 0 },  { "w", RAD_OPD_IN, 0 },         { "index_cache", RAD_OPD_IN, 0 },
     { "bt", RAD_OPD_IN, 0 }, { "positions", RAD_OPD_IN, 0 }, { "cu_seqlens", RAD_OPD_IN, 0 },
@@ -24,7 +24,8 @@ static const RadParamSpec pDs41IndexCand[] = { P_INT("M"), P_INT("width"), P_INT
 static const RadOperandSpec oDs41IndexCand[] = {
     { "score", RAD_OPD_IN, 0 }, { "positions", RAD_OPD_IN, 0 }, { "keep", RAD_OPD_OUT, 0 },
 };
-static const RadParamSpec pDs41IndexTopk[] = { P_INT("M"), P_INT("width"), P_INT("topk"), P_INT("ratio") };
+static const RadParamSpec pDs41IndexTopk[] = { P_INT("M"), P_INT("width"), P_INT("topk"), P_INT("ratio"),
+    P_INTO("block") };
 static const RadOperandSpec oDs41IndexTopk[] = {
     { "score", RAD_OPD_IN, 0 }, { "keep", RAD_OPD_IN, 1 }, { "positions", RAD_OPD_IN, 0 },
     { "sel", RAD_OPD_OUT, 0 },
@@ -65,14 +66,16 @@ SCHEMA("index_score", pDs41IndexScore, oDs41IndexScore,
        "Per row and compressed position j: sum_h relu(q_h . k_j) w_h with k_j entry j of the paged "
        "index cache and w_h = round(w * wscale); the dot, relu(dot) w_h and the f32 head sum each "
        "rounded once to dtype. "
-       "j >= (pos+1)/ratio or an unmapped block scores -inf. score is f32 [M, width]."),
+       "j >= (pos+1)/ratio or an unmapped block scores -inf. score is f32 [M, width]. With row_part "
+       "p, score row i is step row p M + i (q, w, positions the step's; past the step -inf)."),
 SCHEMA("index_candidates", pDs41IndexCand, oDs41IndexCand,
        "Blocks of `block` positions scored by their maximum, the newest reachable block pinned to "
-       "+inf, the topk_blocks highest (ties to the lower block) kept unless -inf; keep is 1 inside "
-       "a kept block."),
+       "+inf, the topk_blocks highest (ties to the lower block) kept unless -inf; keep is a bit a "
+       "block, i32 [M, ceil(ceil(width/block)/32)], bit b%32 of word b/32 set when block b is kept."),
 SCHEMA("index_topk", pDs41IndexTopk, oDs41IndexTopk,
-       "The topk highest-scoring passed positions (j < (pos+1)/ratio), inside keep when given, "
-       "never -inf, ties to the lower position, in ascending order, then -1."),
+       "The topk highest-scoring passed positions (j < (pos+1)/ratio), inside keep when given "
+       "(index_candidates' bits over blocks of `block`), never -inf, ties to the lower position, in "
+       "ascending order, then -1."),
 
 #elif defined(R4D_DS41_ROWS)
 
@@ -90,9 +93,9 @@ SCHEMA("index_topk", pDs41IndexTopk, oDs41IndexTopk,
 { "ds41_index_score_d128_bf16", "index_score", "attn",
   "indexer score sum_h relu(q_h.k_j) w_h over a paged index cache, libref's roundings and order "
   "(> 48 rows: the dot on WMMA, its summation order the only change)",
-  "dim 128, any heads, ratio 1..16; a thread an entry (1, 2, 4 or 8 waves an entry group by "
-  "grid size), -inf past (pos+1)/ratio without reading keys; > 48 rows and <= 32 heads a wave a "
-  "row over 128 entries",
+  "dim 128, any heads, ratio 1..16, row_part; a thread an entry (1, 2, 4 or 8 waves an entry "
+  "group by grid size), -inf past (pos+1)/ratio without reading keys; > 48 rows and <= 32 heads a "
+  "wave a row over 128 entries",
   "bf16 q, w and cache; i32 tables and positions; f32 score",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cDs41IndexScore), NOTUNE,
   nullptr, nullptr, r4d_rad_ds41_index_score, nullptr, nullptr, nullptr,
@@ -101,7 +104,7 @@ SCHEMA("index_topk", pDs41IndexTopk, oDs41IndexTopk,
   "two-level top-k level one: block maxima, newest block pinned, exact top topk_blocks by radix "
   "select, ties to the lower block",
   "any width and block; one 1024-thread block a row",
-  "f32 score, i32 positions and keep",
+  "f32 score, i32 positions and keep (a bit a block, a wave's ballot a word)",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cDs41IndexCand), NOTUNE,
   nullptr, nullptr, r4d_rad_ds41_index_candidates, nullptr, nullptr, nullptr,
   r4d_shape_index_candidates },
@@ -109,7 +112,7 @@ SCHEMA("index_topk", pDs41IndexTopk, oDs41IndexTopk,
   "exact top-k passed positions by radix select, ties to the lower position, ascending, -1 fill",
   "any width and topk; one 1024-thread block a row, or at <= 16 rows over >= 4 chunks of 8192 "
   "positions (topk <= 2048) a chunk-parallel pass and a merge (scratch)",
-  "f32 score, i32 keep, positions and sel",
+  "f32 score, i32 keep (a bit a block), positions and sel",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cDs41IndexTopk), NOTUNE,
   nullptr, nullptr, r4d_rad_ds41_index_topk, r4d_rad_ds41_index_topk_scratch, nullptr, nullptr,
   r4d_shape_index_topk },

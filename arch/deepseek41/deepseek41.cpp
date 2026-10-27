@@ -296,6 +296,8 @@ struct Layer {
     rad_op k_gemm = 0, k_norm = 0, k_rope = 0, k_q = 0, k_st = 0;
     rad_op l_rope = 0, l_q = 0, l_st = 0, c_tail = 0;
     rad_op i_q = 0, i_rope = 0, i_qq = 0, i_w = 0, i_score = 0, i_cand = 0, i_topk = 0;
+    /* index_score over run p of a step's rows (row_part p); i_runs[0] is i_score. */
+    std::vector<rad_op> i_runs;
     rad_op attn = 0, o_rope = 0, o_q = 0, o_b = 0, post_a = 0, attn_fill = 0, ar_attn = 0;
     std::vector<rad_op> o_a;
     /* The fused chains (fused()), each 0 where its chain above is declared instead: kv_n + kv_rope
@@ -370,6 +372,10 @@ struct Model {
     Cfg c{};
     std::vector<Layer> layers;
     int64_t work = 0, cmax = 0;
+    /* The indexer scores a step's rows in runs of at most `irows` rows into one [irows, cmax] score
+     * plane (index_runs()), at most `iparts` runs a step; `kwords` is index_candidates' keep, a bit
+     * a block of the candidate layer's width, i32 words a row (0: the model has no candidates). */
+    int64_t irows = 0, iparts = 0, kwords = 0;
     /* The attention world (geometry()): attention ranks [0, aw), this rank's index `ar` in it and
      * its `gr` output groups; `zero` for an attention-zero rank. */
     int aw = 1, ar = 0;
@@ -722,6 +728,36 @@ static int geometry(Model& m, const RadBuildCtx* ctx) {
     return g.max_tok < 1 || g.max_ctx < 1 || g.max_seqs < 1 ? RAD_E_INVAL : RAD_OK;
 }
 
+/* index_candidates' keep words a row (docs/OPS.md): a bit a block of `block` positions. */
+static int64_t keep_words(int64_t width, int64_t block) {
+    return block < 1 || width < 1 ? 0 : ((width + block - 1) / block + 31) / 32;
+}
+
+/* The indexer's score plane is a row's score of every compressed position, [rows, cmax] f32 with
+ * cmax = max_ctx / (the smallest ratio) + 1: at ratio 1, 8192-row chunks and 256k of context a
+ * whole step's plane would be 8 GiB, and the candidates' mask (live from the candidate layer to the
+ * last that reads it) as much again. So a step is scored in runs of rows into one plane of at most
+ * kScorePlane bytes (but never fewer than kScoreRunMin rows), each run selected from before the next
+ * overwrites it, and the mask is a bit a block (index_candidates).
+ *
+ * A step of T rows takes n = ceil(T / irows) runs of R = ceil(T / n) rows. Rows are independent,
+ * so every run is the unsplit op's rows bit for bit, provided each run is scored by the kernel the
+ * whole step would have taken: kernels pick their form by the pass height (libr4d's index_score
+ * runs WMMA above 48 rows, a different dot order from the decode form's), and a run of a split
+ * step is over irows / 2 >= 128 rows, as tall as any form's threshold. A step of at most irows
+ * rows is one run, the op as before. */
+static constexpr int64_t kScorePlane = 256ll << 20;
+static constexpr int64_t kScoreRunMin = 256;
+static void index_runs(Model& m) {
+    const auto& g = m.g;
+    const auto& c = m.c;
+    m.irows = std::min(g.max_tok, std::max(kScoreRunMin, kScorePlane / (4 * m.cmax)));
+    m.iparts = (g.max_tok + m.irows - 1) / m.irows;
+    m.kwords = 0;
+    if (c.cand >= 0 && c.cand < c.n_layer && c.cand_block > 0 && c.ratio[(size_t)c.cand] > 0)
+        m.kwords = keep_words(g.max_ctx / c.ratio[(size_t)c.cand] + 1, c.cand_block);
+}
+
 static int buffers(RadBuilder* b, Model& m) {
     auto& g = m.g;
     auto& nm = m.nm;
@@ -760,8 +796,8 @@ static int buffers(RadBuilder* b, Model& m) {
     m.ikn = bf("index_k_normed", { LR, c.idim });
     m.iq = bf("index_q", { T, c.ih * c.idim });
     m.iw = bf("index_w", { T, c.ih });
-    m.score = decl_b(b, nm.f("index_score"), RAD_F32, { T, m.cmax });
-    m.keep = decl_b(b, nm.f("index_keep"), RAD_I32, { T, m.cmax });
+    m.score = decl_b(b, nm.f("index_score"), RAD_F32, { m.irows, m.cmax });
+    if (m.kwords > 0) m.keep = decl_b(b, nm.f("index_keep"), RAD_I32, { T, m.kwords });
     m.sel = decl_b(b, nm.f("index_sel"), RAD_I32, { T, c.itopk });
     m.cs_a = decl_b(b, nm.f("rope_window"), RAD_F32, { g.max_ctx, c.rope }, RAD_BUF_PERSIST);
     m.cs_b = decl_b(b, nm.f("rope_compressed"), RAD_F32, { g.max_ctx, c.rope }, RAD_BUF_PERSIST);
@@ -1145,26 +1181,43 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
                 L.i_qq = roundtrip(b, T, c.ih * c.idim, 32, "fp4_e2m1", "ue8m0", m.iq);
             }
             L.i_w = linear(b, m, T, L.iproj, c.ih, D, m.xn, m.iw);
-            const int64_t width = g.max_ctx / r + 1;
-            L.i_score = op(b, "index_score",
-                           { RAD_RANGE("M", 1, T), RAD_INT("heads", c.ih), RAD_INT("dim", c.idim),
-                             RAD_INT("ratio", r), RAD_INT("width", width),
-                             RAD_F64("wscale", 1.0 / std::sqrt((double)c.idim * (double)c.ih)),
-                             RAD_STR("dtype", "bf16") },
-                           {}, { m.iq, m.iw }, { m.score });
-            if (l == c.cand)
+            const int64_t width = g.max_ctx / r + 1, IR = m.irows;
+            /* One index_score a run of rows (index_runs()): run p scores step rows [p R, p R + R)
+             * into the score plane's first R rows. */
+            for (int64_t p = 0; p < m.iparts; ++p) {
+                const rad_op h = op(b, "index_score",
+                                    { RAD_RANGE("M", 1, IR), RAD_INT("heads", c.ih), RAD_INT("dim", c.idim),
+                                      RAD_INT("ratio", r), RAD_INT("width", width),
+                                      RAD_F64("wscale", 1.0 / std::sqrt((double)c.idim * (double)c.ih)),
+                                      RAD_STR("dtype", "bf16"), RAD_INT("row_part", p) },
+                                    {}, { m.iq, m.iw }, { m.score });
+                if (!h) return RAD_E_INVAL;
+                L.i_runs.push_back(h);
+            }
+            L.i_score = L.i_runs[0];
+            if (l == c.cand) {
+                if (!m.keep) return RAD_E_INVAL;
                 L.i_cand = op(b, "index_candidates",
-                              { RAD_RANGE("M", 1, T), RAD_INT("width", width),
+                              { RAD_RANGE("M", 1, IR), RAD_INT("width", width),
                                 RAD_INT("block", c.cand_block), RAD_INT("topk_blocks", c.cand_blocks),
                                 RAD_INT("ratio", r) },
                               {}, { m.score }, { m.keep });
+                if (!L.i_cand) return RAD_E_INVAL;
+            }
             const bool uses = c.cand >= 0 && c.cand < l;
-            L.i_topk = op(b, "index_topk",
-                          { RAD_RANGE("M", 1, T), RAD_INT("width", width), RAD_INT("topk", c.itopk),
-                            RAD_INT("ratio", r) },
-                          {}, uses ? std::initializer_list<rad_buf>{ m.score, m.keep }
-                                   : std::initializer_list<rad_buf>{ m.score },
+            if (uses && (!m.keep || c.ratio[(size_t)c.cand] != r)) {
+                fprintf(stderr, "radiance: deepseek41: layer %d reads the candidate layer's blocks at "
+                                "another ratio (%lld) or there are none\n", l, (long long)r);
+                return RAD_E_UNSUPPORTED;
+            }
+            std::vector<RadParam> tp = { RAD_RANGE("M", 1, IR), RAD_INT("width", width),
+                                         RAD_INT("topk", c.itopk), RAD_INT("ratio", r) };
+            if (uses) tp.push_back(RAD_INT("block", c.cand_block));
+            L.i_topk = op(b, "index_topk", tp, {},
+                          uses ? std::initializer_list<rad_buf>{ m.score, m.keep }
+                               : std::initializer_list<rad_buf>{ m.score },
                           { m.sel });
+            if (!L.i_topk) return RAD_E_INVAL;
         }
 
         /* ---- the sparse attention and the output projection */
@@ -1704,6 +1757,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         if (c.ratio[(size_t)l] > 0 && (rmin == 0 || c.ratio[(size_t)l] < rmin)) rmin = c.ratio[(size_t)l];
     m.work = g.max_tok + g.max_seqs;
     m.cmax = g.max_ctx / std::max<int64_t>(rmin, 1) + 1;
+    index_runs(m);
     DS_TRY(buffers(b, m));
     /* The drafter's source rows, one hc-mean row a target layer, written by the trunk step. */
     if (m.dsp.on && !m.zero &&
@@ -2249,14 +2303,26 @@ static void step(RadCtx* x, const RadBatch* batch) {
                 const auto* ib = kv_batch(batch, m.index[r]);
                 const int64_t live = std::min<int64_t>(
                     g.max_ctx / r + 1, ((int64_t)batch->max_ctx_len + batch->max_q_len) / r + 1);
-                RAD_ISSUE_N(x, L.i_score, T, brows(m.iq, T), brows(m.iw, T), kv_cache(m.index[r], src),
-                            praw2(ib->block_table, RAD_I32, S, ib->block_table_pitch), pos, cu,
-                            bcol(m.score, 0, live, T));
-                if (L.i_cand)
-                    RAD_ISSUE_N(x, L.i_cand, T, bcol(m.score, 0, live, T), pos, bcol(m.keep, 0, live, T));
+                const int64_t kw = keep_words(live, c.cand_block);
                 const bool uses = c.cand >= 0 && c.cand < l;
-                RAD_ISSUE_N(x, L.i_topk, T, bcol(m.score, 0, live, T),
-                            uses ? bcol(m.keep, 0, live, T) : RAD_NONE, pos, brows(m.sel, T));
+                /* Run by run (index_runs()): score R rows into the plane, then select from them
+                 * before the next run overwrites it. Rows are independent, so each row's score,
+                 * candidates and selection are the whole step's. */
+                const int64_t n = (T + m.irows - 1) / m.irows, R = (T + n - 1) / n;
+                for (int64_t p = 0; p * R < T; ++p) {
+                    const int64_t r0 = p * R, rows = std::min(R, T - r0);
+                    const RadOperand prow = praw(batch->positions + r0, RAD_I32, rows);
+                    RAD_ISSUE_N(x, L.i_runs[(size_t)p], R, brows(m.iq, T), brows(m.iw, T),
+                                kv_cache(m.index[r], src),
+                                praw2(ib->block_table, RAD_I32, S, ib->block_table_pitch), pos, cu,
+                                bcol(m.score, 0, live, R));
+                    if (L.i_cand)
+                        RAD_ISSUE_N(x, L.i_cand, rows, bcol(m.score, 0, live, rows), prow,
+                                    bcol_at(m.keep, r0, m.kwords, 0, kw, rows));
+                    RAD_ISSUE_N(x, L.i_topk, rows, bcol(m.score, 0, live, rows),
+                                uses ? bcol_at(m.keep, r0, m.kwords, 0, kw, rows) : RAD_NONE, prow,
+                                brow_slice(m.sel, r0, rows, c.itopk));
+                }
             };
 
             c_gemm();

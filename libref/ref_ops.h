@@ -167,6 +167,10 @@ int ref_attn_sparse_sink   (const RadArgs*, RadStream);
 int ref_index_score        (const RadArgs*, RadStream);
 int ref_index_candidates   (const RadArgs*, RadStream);
 int ref_index_topk         (const RadArgs*, RadStream);
+/* index_candidates' keep: one bit a block of `block` positions over `width`, 32 to an i32 word. */
+static inline int64_t ref_keep_words(int64_t width, int64_t block) {
+    return block < 1 || width < 1 ? 0 : ((width + block - 1) / block + 31) / 32;
+}
 int ref_entry_store        (const RadArgs*, RadStream);
 #ifdef REF_HAVE_GGML
 int ref_gemm_nt_ggml       (const RadArgs*, RadStream);

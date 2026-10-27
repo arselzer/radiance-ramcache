@@ -624,18 +624,41 @@ TEST(index_score_gates_relu_dots_per_head_and_masks_the_future) {
 
 /* index_candidates: blocks of 8 over 20 positions. Row 0 (position 17, ratio 1) pins block 2 and
  * keeps the better of blocks 0 and 1; row 1 (position 3) pins block 0, and the -inf blocks it
- * could also pick stay out. */
+ * could also pick stay out. keep is a bit a block: one word for 3 blocks. */
 TEST(index_candidates_keeps_the_best_blocks_and_pins_the_newest) {
     const int64_t C = 20;
     T sc(RAD_F32, {2, C});
     for (int64_t j = 0; j < C; ++j) sc.set(j, j < 18 ? (j == 5 ? 5.0f : (j == 12 ? 7.0f : 0.0f)) : -INFINITY);
     for (int64_t j = 0; j < C; ++j) sc.set(C + j, j < 4 ? 1.0f : -INFINITY);
     T pos(RAD_I32, {2}); pos.n({17, 3});
-    T keep(RAD_I32, {2, C});
+    T keep(RAD_I32, {2, 1}); keep.n({-1, -1});
     A a; a.t(sc).t(pos).t(keep).i("M", 2).i("width", C).i("block", 8).i("topk_blocks", 2).i("ratio", 1);
     REQUIRE_EQ(run("index_candidates", a), RAD_OK);
-    for (int64_t j = 0; j < C; ++j) CHECK_EQ(keep.iat(j), j >= 8 ? 1 : 0);
-    for (int64_t j = 0; j < C; ++j) CHECK_EQ(keep.iat(C + j), j < 8 ? 1 : 0);
+    CHECK_EQ(keep.iat(0), 6);   /* blocks 1 and 2 */
+    CHECK_EQ(keep.iat(1), 1);   /* block 0 */
+    /* A mask as wide as the positions (the old form) is refused. */
+    T wide(RAD_I32, {2, C});
+    A b; b.t(sc).t(pos).t(wide).i("M", 2).i("width", C).i("block", 8).i("topk_blocks", 2).i("ratio", 1);
+    CHECK_EQ(run("index_candidates", b), RAD_E_SHAPE);
+}
+
+/* index_candidates over 70 blocks (three words): the kept blocks' bits, block 69's word padded
+ * with zeros past it. Scores rise with the block, so the top 33 are blocks 37..69. */
+TEST(index_candidates_packs_a_bit_a_block_across_words) {
+    const int64_t block = 2, nb = 70, C = nb * block - 1;   /* a short last block */
+    T sc(RAD_F32, {1, C});
+    for (int64_t j = 0; j < C; ++j) sc.set(j, (float)(j / block));
+    T pos(RAD_I32, {1}); pos.n({C - 1});
+    T keep(RAD_I32, {1, 3}); keep.n({-1, -1, -1});
+    A a; a.t(sc).t(pos).t(keep).i("M", 1).i("width", C).i("block", block).i("topk_blocks", 33)
+        .i("ratio", 1);
+    REQUIRE_EQ(run("index_candidates", a), RAD_OK);
+    for (int64_t wd = 0; wd < 3; ++wd) {
+        uint32_t e = 0;
+        for (int64_t b = wd * 32; b < std::min<int64_t>(nb, wd * 32 + 32); ++b)
+            if (b >= nb - 33) e |= 1u << (b % 32);
+        CHECK_EQ((uint32_t)keep.iat(wd), e);
+    }
 }
 
 /* index_topk: the passed positions only, inside keep, ties to the lower position, ascending, -1
@@ -649,12 +672,62 @@ TEST(index_topk_selects_passed_positions_in_order) {
     REQUIRE_EQ(run("index_topk", a), RAD_OK);
     const int64_t e0[9] = {1, 2, 3,  1, 2, 3,  0, 1, 2};
     for (int i = 0; i < 9; ++i) CHECK_EQ(sel.iat(i), e0[i]);
-    T keep(RAD_I32, {3, 6}); keep.n({1, 1, 0, 1, 1, 1,  1, 1, 1, 1, 1, 1,  0, 0, 0, 1, 0, 0});
+    /* keep as index_candidates writes it, blocks of 1: positions {0,1,3,4,5}, all, {3}. */
+    T keep(RAD_I32, {3, 1}); keep.n({0x3b, 0x3f, 0x08});
     T pos2(RAD_I32, {3}); pos2.n({9, 2, 7});
-    A b; b.t(sc).t(keep).t(pos2).t(sel).i("M", 3).i("width", 6).i("topk", 3).i("ratio", 2);
+    A b; b.t(sc).t(keep).t(pos2).t(sel).i("M", 3).i("width", 6).i("topk", 3).i("ratio", 2).i("block", 1);
     REQUIRE_EQ(run("index_topk", b), RAD_OK);
     const int64_t e1[9] = {1, 3, 4,  0, -1, -1,  3, -1, -1};
     for (int i = 0; i < 9; ++i) CHECK_EQ(sel.iat(i), e1[i]);
+    /* Blocks of 2 at the first positions: row 0 keeps blocks 0 and 2 (positions 0, 1, 4; 5 is not
+     * passed), row 1 block 1, row 2 none. */
+    T keep2(RAD_I32, {3, 1}); keep2.n({0x5, 0x2, 0x0});
+    A c; c.t(sc).t(keep2).t(pos).t(sel).i("M", 3).i("width", 6).i("topk", 3).i("ratio", 2).i("block", 2);
+    REQUIRE_EQ(run("index_topk", c), RAD_OK);
+    const int64_t e2[9] = {0, 1, 4,  2, 3, -1,  -1, -1, -1};
+    for (int i = 0; i < 9; ++i) CHECK_EQ(sel.iat(i), e2[i]);
+    /* keep without block is refused. */
+    A d; d.t(sc).t(keep2).t(pos).t(sel).i("M", 3).i("width", 6).i("topk", 3).i("ratio", 2);
+    CHECK_EQ(run("index_topk", d), RAD_E_SHAPE);
+}
+
+/* index_score's runs (row_part): five rows of two sequences scored in runs of two rows into one
+ * two-row plane are the unsplit op's rows bit for bit; the run past the step's fifth row scores
+ * -inf there. */
+TEST(index_score_runs_are_the_unsplit_rows) {
+    const int64_t H = 2, D = 4, M = 5, C = 4, R = 2;
+    T q(RAD_BF16, {M, H * D}), w(RAD_BF16, {M, H}), kc(RAD_BF16, {4, 1, 2, D / 2});
+    for (int64_t i = 0; i < M * H * D; ++i) q.set(i, std::sin(1.3f * (float)i));
+    for (int64_t i = 0; i < M * H; ++i) w.set(i, std::cos(0.9f * (float)i));
+    for (int64_t i = 0; i < 4 * D; ++i) kc.set(i, std::cos(0.8f * (float)i + 0.2f));
+    T bt(RAD_I32, {2, 2}); bt.n({1, 0,  3, 2});
+    T pos(RAD_I32, {M}); pos.n({5, 6, 7, 1, 2});   /* sequence 0 rows 0-2, sequence 1 rows 3-4 */
+    T cu(RAD_I32, {3}); cu.n({0, 3, 5});
+    T whole(RAD_F32, {M, C});
+    A a; a.t(q).t(w).t(kc).t(bt).t(pos).t(cu).t(whole).i("M", M).i("heads", H).i("dim", D)
+        .i("ratio", 2).i("width", C).d("wscale", 0.5).s("dtype", "bf16");
+    REQUIRE_EQ(run("index_score", a), RAD_OK);
+    for (int64_t p = 0; p < 3; ++p) {
+        T part(RAD_F32, {R, C});
+        A b; b.t(q).t(w).t(kc).t(bt).t(pos).t(cu).t(part).i("M", R).i("heads", H).i("dim", D)
+            .i("ratio", 2).i("width", C).d("wscale", 0.5).s("dtype", "bf16").i("row_part", p);
+        REQUIRE_EQ(run("index_score", b), RAD_OK);
+        for (int64_t i = 0; i < R; ++i)
+            for (int64_t j = 0; j < C; ++j) {
+                const float got = part.at(i * C + j);
+                if (p * R + i < M) {
+                    const float want = whole.at((p * R + i) * C + j);
+                    CHECK(std::memcmp(&got, &want, 4) == 0);
+                } else {
+                    CHECK(std::isinf(got) && got < 0);
+                }
+            }
+    }
+    /* Without row_part the plane must hold the step's rows. */
+    T short_(RAD_F32, {R, C});
+    A c; c.t(q).t(w).t(kc).t(bt).t(pos).t(cu).t(short_).i("M", R).i("heads", H).i("dim", D)
+        .i("ratio", 2).i("width", C).d("wscale", 0.5).s("dtype", "bf16");
+    CHECK_EQ(run("index_score", c), RAD_E_SHAPE);
 }
 
 /* entry_store writes whole blocks at their pages and skips a negative page. */
@@ -9213,6 +9286,9 @@ std::vector<Geo> geometries() {
         G("index_candidates", "M", 3, a.i("M", R).i("width", 20).i("block", 8).i("topk_blocks", 2)
                                       .i("ratio", 1)),
         G("index_topk", "M", 3, a.i("M", R).i("width", 9).i("topk", 4).i("ratio", 2)),
+        G("index_topk", "M", 3, a.i("M", R).i("width", 9).i("topk", 4).i("ratio", 2).i("block", 2)),
+        G("index_score", "M", 3, a.i("M", R).i("heads", 2).i("dim", 8).i("ratio", 2).i("width", 5)
+                                 .d("wscale", 0.25).s("dtype", "bf16").i("row_part", 2)),
         G("entry_store", "M", 3, a.i("M", R).i("n", 8).i("block_size", 2).s("dtype", "bf16")),
         G("token_map", "M", 3, a.i("M", R).i("n_vocab", 11)),
         G("gemm_nt_ggml", "M", 3, a.i("M", R).i("N", 5).i("K", 64).s("type", "q8_0").s("dtype", "bf16")),

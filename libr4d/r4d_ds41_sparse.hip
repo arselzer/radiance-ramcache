@@ -114,6 +114,9 @@ __device__ __forceinline__ void ds_wave_sync() {
 }
 
 /* ================================================================== index_score */
+/* q, w and pos start at the run's first row (row_part); row0 is that row's index in cu_seqlens.
+ * M is the score's rows (the pass height, which picks the form), Mv how many of them the step
+ * holds: a row from Mv on is past the step and scores -inf without a read. */
 struct DsScoreArgs {
     const uint16_t* q;
     const uint16_t* w;
@@ -122,8 +125,8 @@ struct DsScoreArgs {
     const int* pos;
     const int* cu;
     float* sc;
-    long qr, wr, wc, btr, btc, nblk, ps, cs, sr, scs;
-    int nbt, S, M, C, H, ratio, cbs, slot;
+    long qr, wr, wc, btr, btc, nblk, ps, cs, sr, scs, row0;
+    int nbt, S, M, Mv, C, H, ratio, cbs, slot;
     float wscale;
 };
 
@@ -142,12 +145,12 @@ __global__ __launch_bounds__(256) void ds41_index_score_kernel(DsScoreArgs a) {
     const int hp = (a.H + HS - 1) / HS, h0 = sub * hp, h1 = min(a.H, h0 + hp);
     for (long m = blockIdx.y; m < a.M; m += gridDim.y) {
         float* srow = a.sc + m * a.sr;
-        const long reach = ((long)a.pos[m * a.ps] + 1) / a.ratio;
+        const long reach = m < a.Mv ? ((long)a.pos[m * a.ps] + 1) / a.ratio : 0;
         if (jb >= reach) {                           /* block-uniform: no key in this block */
             if (sub == 0 && j < a.C) srow[j * a.scs] = -kDsInf;
             continue;
         }
-        const int s = ds_seq_of_row(a.cu, a.cs, a.S, m);
+        const int s = ds_seq_of_row(a.cu, a.cs, a.S, a.row0 + m);
         const uint16_t* kp = nullptr;
         if (j < a.C && j < reach) {
             const long col = (j * a.ratio) / a.cbs;
@@ -357,13 +360,15 @@ __device__ void ds_emit(const Get& get, uint32_t n, const uint32_t* cache, DsSel
 }
 
 /* ------------------------------------------------------------------ index_topk */
+/* keep: index_candidates' bits, a bit a block of `block` positions (bshift = log2(block) when
+ * block is a power of two, else -1). */
 struct DsTopkArgs {
     const float* sc;
     const int* keep;
     const int* pos;
     int* sel;
     long sr, scs, kr, kcs, ps, selr, selc;
-    int M, C, K, ratio;
+    int M, C, K, ratio, block, bshift;
 };
 
 __device__ __forceinline__ long ds_topk_reach(const DsTopkArgs& a, long m) {
@@ -372,14 +377,18 @@ __device__ __forceinline__ long ds_topk_reach(const DsTopkArgs& a, long m) {
     return reach < 0 ? 0 : reach;
 }
 
-/* The key of position j0 + i of a row: not a candidate outside keep or at -inf (or NaN). */
+/* The key of position j0 + i of a row: not a candidate outside keep's blocks or at -inf (or NaN). */
 struct DsTopkKey {
     const float* row;
     const int* krow;
     long scs, kcs, j0;
+    int block, bshift;
     __device__ __forceinline__ uint32_t operator()(uint32_t i) const {
         const long j = j0 + (long)i;
-        if (krow && !krow[j * kcs]) return 0u;
+        if (krow) {
+            const uint32_t b = bshift >= 0 ? (uint32_t)j >> bshift : (uint32_t)j / (uint32_t)block;
+            if (!(((uint32_t)krow[(long)(b >> 5) * kcs] >> (b & 31u)) & 1u)) return 0u;
+        }
         const float v = row[j * scs];
         return v > -kDsInf ? ds_key(v) : 0u;
     }
@@ -390,7 +399,8 @@ __global__ __launch_bounds__(kDsSelThreads) void ds41_index_topk_kernel(DsTopkAr
     __shared__ uint32_t cache[kDsCache];
     for (long m = blockIdx.x; m < a.M; m += gridDim.x) {
         const uint32_t n = (uint32_t)ds_topk_reach(a, m);
-        const DsTopkKey get{ a.sc + m * a.sr, a.keep ? a.keep + m * a.kr : nullptr, a.scs, a.kcs, 0 };
+        const DsTopkKey get{ a.sc + m * a.sr, a.keep ? a.keep + m * a.kr : nullptr, a.scs, a.kcs, 0,
+                             a.block, a.bshift };
         uint32_t* c = n <= (uint32_t)kDsCacheUse ? cache : nullptr;
         ds_select(get, n, (uint32_t)a.K, c, &s);
         int* srow = a.sel + m * a.selr;
@@ -424,7 +434,7 @@ __global__ __launch_bounds__(kDsSelThreads) void ds41_index_topk_split1_kernel(D
     long n = ds_topk_reach(a.t, m) - j0;
     n = n < 0 ? 0 : (n > a.chunk ? a.chunk : n);
     const DsTopkKey get{ a.t.sc + m * a.t.sr, a.t.keep ? a.t.keep + m * a.t.kr : nullptr, a.t.scs,
-                         a.t.kcs, j0 };
+                         a.t.kcs, j0, a.t.block, a.t.bshift };
     ds_select(get, (uint32_t)n, (uint32_t)a.t.K, cache, &s);
     unsigned long long* out = a.cand + (m * a.nch + c) * (long)a.t.K;
     int* cnt = a.cnt + m * a.nch + c;
@@ -470,6 +480,7 @@ __global__ __launch_bounds__(kDsSelThreads) void ds41_index_topk_split2_kernel(D
 }
 
 /* ------------------------------------------------------------------ index_candidates */
+/* keep: a bit a block, word b / 32 of a row holding blocks [32 (b / 32), 32 (b / 32) + 32). */
 struct DsCandArgs {
     const float* sc;
     const int* pos;
@@ -496,6 +507,8 @@ struct DsBlockKey {
     }
 };
 
+static_assert(kDsSelThreads % 32 == 0, "index_candidates writes a wave's ballot as a keep word");
+
 __global__ __launch_bounds__(kDsSelThreads) void ds41_index_candidates_kernel(DsCandArgs a) {
     __shared__ DsSelShared s;
     __shared__ uint32_t cache[kDsCache];
@@ -507,11 +520,15 @@ __global__ __launch_bounds__(kDsSelThreads) void ds41_index_candidates_kernel(Ds
         uint32_t* c = nb <= kDsCacheUse ? cache : nullptr;
         ds_select(get, (uint32_t)nb, (uint32_t)a.KB, c, &s);
         int* krow = a.keep + m * a.kr;
-        const long kcs = a.kcs, C = a.C, block = a.block;
+        const long kcs = a.kcs;
+        /* ds_emit walks the blocks kDsSelThreads at a time, thread t on block i0 + t, so a wave's
+         * 32 lanes hold one word's blocks and its lane 0 the word's first: the wave's ballot of
+         * `take` is the word. Past the last block the lanes do not run and their bits are 0; a
+         * wave whose lane 0 does not run holds no block. */
         ds_emit(get, (uint32_t)nb, c, &s,
                 [&](uint32_t b, bool take, uint32_t) {
-                    const long j0 = (long)b * block, j1 = j0 + block < C ? j0 + block : C;
-                    for (long j = j0; j < j1; ++j) krow[j * kcs] = take ? 1 : 0;
+                    const uint32_t word = __builtin_amdgcn_ballot_w32(take);
+                    if ((threadIdx.x & 31u) == 0u) krow[(long)(b >> 5) * kcs] = (int)word;
                 },
                 [&](uint32_t) {});
         __syncthreads();
@@ -1423,12 +1440,12 @@ __global__ __launch_bounds__(256) void ds41_index_score_wm_kernel(DsScoreArgs a)
     const long jb = (long)blockIdx.x * kIwEB;
     const long jend = jb + kIwEB < (long)a.C ? jb + kIwEB : (long)a.C;
     float* srow = a.sc + m * a.sr;
-    const long reach = ((long)a.pos[m * a.ps] + 1) / a.ratio;
+    const long reach = m < a.Mv ? ((long)a.pos[m * a.ps] + 1) / a.ratio : 0;
     if (jb >= reach) {
         for (long j = jb + lane; j < jend; j += 32) srow[j * a.scs] = -kDsInf;
         return;
     }
-    const int s = ds_seq_of_row(a.cu, a.cs, a.S, m);
+    const int s = ds_seq_of_row(a.cu, a.cs, a.S, a.row0 + m);
     uint4 qf[HT][8];
     float wh[HT][8];
 #pragma unroll
@@ -1503,6 +1520,11 @@ constexpr int kDsSplitRows = 16;                     /* ... at up to this many r
 constexpr int kDsSplitMinChunks = 4;                 /* ... over at least this many chunks */
 constexpr int kDsSplitMaxK = 2048;
 
+/* index_candidates' keep words a row: a bit a block of `block` positions over `width`. */
+long long keep_words(long long width, long long block) {
+    return block < 1 || width < 1 ? 0 : ((width + block - 1) / block + 31) / 32;
+}
+
 int64_t topk_split_bytes(long rows, long C, long K) {
     const long nch = (C + kDsChunk - 1) / kDsChunk;
     if (rows < 1 || nch < kDsSplitMinChunks || K < 1 || K > kDsSplitMaxK) return 0;
@@ -1515,6 +1537,7 @@ int index_score_body(const RadArgs* a, RadStream stream) {
     const RadTensor &pos = a->t[4], &cu = a->t[5], &sc = a->t[6];
     const long long H = r4d_geti_or(a, "heads", 0), Dm = r4d_geti_or(a, "dim", 0);
     const long long ratio = r4d_geti_or(a, "ratio", 0);
+    const long long part = r4d_geti_or(a, "row_part", -1);
     const float wscale = (float)r4d_getf(a, "wscale", 0.0);
     for (int i = 0; i < 7; ++i)
         if (!a->t[i].data) return R4D_NO(RAD_E_INVAL);
@@ -1522,7 +1545,7 @@ int index_score_body(const RadArgs* a, RadStream stream) {
         q.shape[0] < 1 || q.shape[1] != H * Dm || w.rank != 2 || w.shape[0] != q.shape[0] ||
         w.shape[1] != H || kc.rank != 4 || kc.shape[1] != 1 || kc.shape[3] * ratio != Dm ||
         kc.shape[2] % ratio || bt.rank != 2 || r4d_numel(&pos) != q.shape[0] || r4d_numel(&cu) < 2 ||
-        sc.rank != 2 || sc.shape[0] != q.shape[0] || sc.shape[1] < 1)
+        sc.rank != 2 || sc.shape[0] < 1 || (part < 0 && sc.shape[0] != q.shape[0]) || sc.shape[1] < 1)
         return R4D_NO(RAD_E_SHAPE);
     if (q.dtype != RAD_BF16 || w.dtype != RAD_BF16 || kc.dtype != RAD_BF16 || bt.dtype != RAD_I32 ||
         pos.dtype != RAD_I32 || cu.dtype != RAD_I32 || sc.dtype != RAD_F32)
@@ -1534,14 +1557,24 @@ int index_score_body(const RadArgs* a, RadStream stream) {
         !aligned(kc.data, 16) || q.shape[0] > INT_MAX || sc.shape[1] > INT_MAX / 2 ||
         r4d_numel(&cu) - 1 > INT_MAX || bt.shape[1] > INT_MAX || H > INT_MAX / 128)
         return R4D_NO(RAD_E_SHAPE);
+    if (sc.shape[0] > INT_MAX || (part > 0 && part > (long long)INT_MAX)) return R4D_NO(RAD_E_SHAPE);
+    /* A run (row_part p) scores step rows [p R, p R + R), R the score's rows: q, w and pos are read
+     * from row p R on; the rows the step does not hold score -inf. */
+    const long row0 = part > 0 ? (long)part * (long)sc.shape[0] : 0;
+    const long Mv = row0 < (long)q.shape[0]
+                        ? ((long)q.shape[0] - row0 < (long)sc.shape[0] ? (long)q.shape[0] - row0
+                                                                       : (long)sc.shape[0])
+                        : 0;
+    const long r0 = Mv > 0 ? row0 : 0;               /* no pointer past the operands */
     DsScoreArgs s{};
-    s.q = (const uint16_t*)q.data;
-    s.w = (const uint16_t*)w.data;
+    s.q = (const uint16_t*)q.data + r0 * (long)q.stride[0];
+    s.w = (const uint16_t*)w.data + r0 * (long)w.stride[0];
     s.kc = (const uint16_t*)kc.data;
     s.bt = (const int*)bt.data;
-    s.pos = (const int*)pos.data;
+    s.pos = (const int*)pos.data + r0 * ps;
     s.cu = (const int*)cu.data;
     s.sc = (float*)sc.data;
+    s.row0 = row0;
     s.qr = (long)q.stride[0];
     s.wr = (long)w.stride[0];
     s.wc = (long)w.stride[1];
@@ -1554,7 +1587,8 @@ int index_score_body(const RadArgs* a, RadStream stream) {
     s.scs = (long)sc.stride[1];
     s.nbt = (int)bt.shape[1];
     s.S = (int)(r4d_numel(&cu) - 1);
-    s.M = (int)q.shape[0];
+    s.M = (int)sc.shape[0];
+    s.Mv = (int)Mv;
     s.C = (int)sc.shape[1];
     s.H = (int)H;
     s.ratio = (int)ratio;
@@ -1563,7 +1597,7 @@ int index_score_body(const RadArgs* a, RadStream stream) {
     s.wscale = wscale;
     /* Prefill heights on WMMA (up to 32 heads, 16-byte q rows); the decode band on the scalar
      * kernel below (libref's bits). */
-    if (s.M > kWmRows && H <= 32 && s.qr % 8 == 0 && aligned(q.data, 16) &&
+    if (s.M > kWmRows && H <= 32 && s.qr % 8 == 0 && aligned(s.q, 16) &&
         (s.M + 7) / 8 <= 65535) {
         const dim3 grid((unsigned)((s.C + kIwEB - 1) / kIwEB), (unsigned)((s.M + 7) / 8));
         if (H > 16) return R4D_EMIT(stream, ds41_index_score_wm_kernel<2>, grid, dim3(256), 0u, s);
@@ -1595,7 +1629,7 @@ int index_candidates_body(const RadArgs* a, RadStream stream) {
     if (!sc.data || !pos.data || !keep.data) return R4D_NO(RAD_E_INVAL);
     if (block < 1 || kb < 1 || ratio < 1 || sc.rank != 2 || sc.shape[0] < 1 || sc.shape[1] < 1 ||
         r4d_numel(&pos) != sc.shape[0] || keep.rank != 2 || keep.shape[0] != sc.shape[0] ||
-        keep.shape[1] != sc.shape[1])
+        keep.shape[1] != keep_words(sc.shape[1], block))
         return R4D_NO(RAD_E_SHAPE);
     if (sc.dtype != RAD_F32 || pos.dtype != RAD_I32 || keep.dtype != RAD_I32) return R4D_NO(RAD_E_DTYPE);
     const long ps = lin_stride(pos);
@@ -1631,10 +1665,12 @@ int index_topk_body(const RadArgs* a, RadStream stream) {
     const RadTensor* keep = a->t[1].data ? &a->t[1] : nullptr;
     long long topk, ratio;
     if (index_topk_params(a, &topk, &ratio) != RAD_OK) return R4D_NO(RAD_E_SHAPE);
+    const long long block = r4d_geti_or(a, "block", 0);
     if (!sc.data || !pos.data || !sel.data || sc.rank != 2 || sc.shape[0] < 1 ||
         r4d_numel(&pos) != sc.shape[0] || sel.rank != 2 || sel.shape[0] != sc.shape[0] ||
         sel.shape[1] != topk ||
-        (keep && (keep->rank != 2 || keep->shape[0] != sc.shape[0] || keep->shape[1] != sc.shape[1])))
+        (keep && (block < 1 || block > INT_MAX || keep->rank != 2 || keep->shape[0] != sc.shape[0] ||
+                  keep->shape[1] != keep_words(sc.shape[1], block))))
         return R4D_NO(RAD_E_SHAPE);
     if (sc.dtype != RAD_F32 || pos.dtype != RAD_I32 || sel.dtype != RAD_I32 ||
         (keep && keep->dtype != RAD_I32))
@@ -1659,6 +1695,10 @@ int index_topk_body(const RadArgs* a, RadStream stream) {
     t.C = (int)sc.shape[1];
     t.K = (int)topk;
     t.ratio = (int)(ratio < INT_MAX ? ratio : INT_MAX);
+    t.block = keep ? (int)block : 1;
+    t.bshift = -1;
+    for (int sh = 0; sh < 31; ++sh)
+        if ((1LL << sh) == (long long)t.block) t.bshift = sh;
     /* Few rows over a long row: chunks in parallel, then one merge a row. The same selection, so
      * the same bits, as the one-block-a-row kernel. */
     const int64_t need = t.M <= kDsSplitRows ? topk_split_bytes(t.M, t.C, t.K) : 0;

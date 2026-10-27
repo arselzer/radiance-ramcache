@@ -1678,35 +1678,39 @@ int ref_index_score_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* o
     if (M <= 0 || H < 1 || Dm < 1 || ratio < 1 || Dm % ratio || C < 1) return RAD_E_UNSUPPORTED;
     const uint32_t D = act_dt(p, n_p);
     const int64_t ncb = C + 1;
+    /* A run (row_part p) scores rows [p M, p M + M) of a step that holds them. */
+    const int64_t part = gi(p, n_p, "row_part", 0), Mq = part > 0 ? (part + 1) * M : M;
     Opd o;
-    o.t(D, { M, H * Dm });                              /* q */
-    o.t(D, { M, H });                                   /* head weights */
+    o.t(D, { Mq, H * Dm });                             /* q */
+    o.t(D, { Mq, H });                                  /* head weights */
     o.t(D, { ncb, 1, ratio, Dm / ratio });              /* index cache: an entry a block */
     o.t_idx({ 1, ncb }, ncb, -1, 0);                    /* block table */
-    o.t_idx({ M }, M, -1, 0);                           /* positions */
-    o.t_idx({ 2 }, M, -1, (uint32_t)RAD_OPD_F_IDX_CU);  /* cu_seqlens */
+    o.t_idx({ Mq }, Mq, -1, 0);                         /* positions */
+    o.t_idx({ 2 }, Mq, -1, (uint32_t)RAD_OPD_F_IDX_CU); /* cu_seqlens */
     o.t((uint32_t)RAD_F32, { M, C });                   /* score */
     return o.finish("index_score", operand, out);
 }
 
 int ref_index_candidates_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
-    const int64_t M = gi(p, n_p, "M", 0), C = gi(p, n_p, "width", 0);
-    if (M <= 0 || C < 1 || gi(p, n_p, "block", 0) < 1 || gi(p, n_p, "topk_blocks", 0) < 1 ||
-        gi(p, n_p, "ratio", 0) < 1)
+    const int64_t M = gi(p, n_p, "M", 0), C = gi(p, n_p, "width", 0), block = gi(p, n_p, "block", 0);
+    if (M <= 0 || C < 1 || block < 1 || gi(p, n_p, "topk_blocks", 0) < 1 || gi(p, n_p, "ratio", 0) < 1)
         return RAD_E_UNSUPPORTED;
     Opd o;
     o.t((uint32_t)RAD_F32, { M, C });                   /* score */
     o.t_idx({ M }, M, -1, 0);                           /* positions */
-    o.t((uint32_t)RAD_I32, { M, C });                   /* keep */
+    o.t((uint32_t)RAD_I32, { M, ref_keep_words(C, block) });  /* keep: a bit a block */
     return o.finish("index_candidates", operand, out);
 }
 
 int ref_index_topk_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = gi(p, n_p, "M", 0), C = gi(p, n_p, "width", 0), k = gi(p, n_p, "topk", 0);
+    const int64_t block = gi(p, n_p, "block", 0);
     if (M <= 0 || C < 1 || k < 1 || gi(p, n_p, "ratio", 0) < 1) return RAD_E_UNSUPPORTED;
     Opd o;
     o.t((uint32_t)RAD_F32, { M, C });                   /* score */
-    o.skip();                                           /* keep, optional */
+    /* keep, optional: with `block`, index_candidates' bits (any word is a valid mask) */
+    if (block > 0) o.t_idx({ M, ref_keep_words(C, block) }, 0x7fffffff, -1, 0);
+    else o.skip();
     o.t_idx({ M }, M, -1, 0);                           /* positions */
     o.t((uint32_t)RAD_I32, { M, k });                   /* sel */
     return o.finish("index_topk", operand, out);

@@ -4925,20 +4925,41 @@ void ds41_cases(std::vector<Hand>& hs) {
 
     /* ---- the selections' optional operands and skipped rows ------------------------------ */
     {
-        /* keep from index_candidates' shape: two blocks of four kept a row, one row keeping none
-         * it can reach. Positions past the width, before it and at its edge. */
+        /* keep as index_candidates writes it, a bit a block of four: two blocks kept a row, one
+         * row keeping none it can reach. Positions past the width, before it and at its edge. */
         const int64_t M = 4, C = 16, K = 5;
-        std::vector<float> keep((size_t)(M * C));
-        for (int64_t m = 0; m < M; ++m)
-            for (int64_t j = 0; j < C; ++j)
-                keep[(size_t)(m * C + j)] = m == 3 ? (j >= 12 ? 1.0f : 0.0f)
-                                                   : (((j / 4) + m) % 2 == 0 ? 1.0f : 0.0f);
         Hand h("keep given; reach 0, 8, 5 and past the width", "index_topk", 0.0);
         h.dense(RAD_F32, { M, C }, hfill(61))
-         .dense(RAD_I32, { M, C }, [keep](int64_t i) { return keep[(size_t)i]; })
+         .dense(RAD_I32, { M, 1 },
+                [](int64_t m) { return (float)(m == 3 ? 0b1000 : 0b0101 << (m % 2)); })
          .idx({ 0, 15, 40, 9 })
          .dense(RAD_I32, { M, K }, [](int64_t) { return 7.0f; }, true)
-         .pi("M", M).pi("width", C).pi("topk", K).pi("ratio", 2);
+         .pi("M", M).pi("width", C).pi("topk", K).pi("ratio", 2).pi("block", 4);
+        hs.push_back(std::move(h));
+    }
+    {
+        /* Blocks of one over 40 positions, two words a row: bit 31 (the word's sign) beside bits
+         * of the second word; every bit, the row reaching two; the second word alone. */
+        const int64_t M = 3, C = 40, K = 4;
+        const int32_t keep[] = { (int32_t)0x80000080u, 0x5, -1, -1, 0, 0x90 };
+        Hand h("keep a bit a position across two words", "index_topk", 0.0);
+        h.dense(RAD_F32, { M, C }, hfill(520))
+         .raw(RAD_I32, { M, 2 }, keep)
+         .idx({ 39, 1, 60 })
+         .dense(RAD_I32, { M, K }, [](int64_t) { return 7.0f; }, true)
+         .expect(3, { 7, 31, 32, 34, 0, 1, -1, -1, 36, 39, -1, -1 })
+         .pi("M", M).pi("width", C).pi("topk", K).pi("ratio", 1).pi("block", 1);
+        hs.push_back(std::move(h));
+    }
+    {
+        /* keep's words are read only with `block`: without it they are refused, nothing written. */
+        Hand h("keep without block is refused", "index_topk", 0.0);
+        h.dense(RAD_F32, { 2, 8 }, hfill(521))
+         .dense(RAD_I32, { 2, 1 }, [](int64_t) { return 3.0f; })
+         .idx({ 7, 7 })
+         .dense(RAD_I32, { 2, 2 }, [](int64_t) { return 7.0f; }, true)
+         .refuses(RAD_E_SHAPE)
+         .pi("M", 2).pi("width", 8).pi("topk", 2).pi("ratio", 1);
         hs.push_back(std::move(h));
     }
     {
@@ -4947,8 +4968,60 @@ void ds41_cases(std::vector<Hand>& hs) {
         Hand h("tied block maxima, the newest reachable block pinned", "index_candidates", 0.0);
         h.dense(RAD_F32, { M, C }, [](int64_t i) { return (float)((i % 5) == 0 ? 2 : (i % 3)); })
          .idx({ 11, 2 })
-         .dense(RAD_I32, { M, C }, [](int64_t) { return 9.0f; }, true)
+         .dense(RAD_I32, { M, 1 }, [](int64_t) { return 9.0f; }, true)
          .pi("M", M).pi("width", C).pi("block", 3).pi("topk_blocks", 2).pi("ratio", 1);
+        hs.push_back(std::move(h));
+    }
+    {
+        /* keep's bit layout by hand: 35 blocks of two, block 33 the best and block 34 (the newest
+         * reachable) pinned, so word 0 is clear and word 1 holds bits 1 and 2; the bits past the
+         * last block, preset, are cleared. */
+        const int64_t C = 70;
+        Hand h("keep's bits: blocks 33 and 34 in the second word", "index_candidates", 0.0);
+        h.dense(RAD_F32, { 1, C },
+                [](int64_t j) { return j == 66 ? 5.0f : 0.01f * (float)(j % 7); })
+         .idx({ 69 })
+         .dense(RAD_I32, { 1, 2 }, [](int64_t) { return -1.0f; }, true)
+         .expect_bytes(2, { 0, 0, 0, 0, 6, 0, 0, 0 })
+         .pi("M", 1).pi("width", C).pi("block", 2).pi("topk_blocks", 2).pi("ratio", 1);
+        hs.push_back(std::move(h));
+    }
+    for (int part : { 0, 1, 2 }) {
+        /* index_score's runs (row_part): five rows of two sequences (rows 0-2 and 3-4) in runs of
+         * two. Run 0 is a split step's first, run 1 straddles the sequences, run 2's second row
+         * is past the step and scores -inf. Blocks unmapped (-1) and past the cache (9). */
+        const char* nm[] = { "index scorer row_part: a split step's first run",
+                             "index scorer row_part: a run across two sequences",
+                             "index scorer row_part: a run past the step's last row" };
+        const int64_t Mq = 5, H = 2, Dm = 64, R = 4, C = 6;
+        Hand h(nm[part], "index_score", 1e-5);
+        h.dense(RAD_F32, { Mq, H * Dm }, hfill(522 + part))
+         .dense(RAD_F32, { Mq, H }, hfill(525 + part))
+         .dense(RAD_F32, { 4, 1, R, Dm / R }, hfill(528 + part))
+         .dense(RAD_I32, { 2, C }, [](int64_t i) {
+             const int64_t t[] = { 0, 2, 1, -1, 3, 0, 3, 1, 9, 2, -1, 1 };
+             return (float)t[i];
+         })
+         .idx({ 13, 14, 15, 20, 22 })
+         .idx({ 0, 3, 5 })
+         .dense(RAD_F32, { 2, C }, [](int64_t) { return 0.0f; }, true)
+         .pi("M", 2).pi("heads", H).pi("dim", Dm).pi("ratio", R).pi("width", C)
+         .pf("wscale", 0.5).ps("dtype", "f32").pi("row_part", part);
+        hs.push_back(std::move(h));
+    }
+    {
+        /* Without row_part score holds every row of q: fewer rows are refused, nothing written. */
+        Hand h("index scorer refuses a short score without row_part", "index_score", 1e-5);
+        h.dense(RAD_F32, { 3, 2 * 64 }, hfill(531))
+         .dense(RAD_F32, { 3, 2 }, hfill(532))
+         .dense(RAD_F32, { 2, 1, 4, 16 }, hfill(533))
+         .dense(RAD_I32, { 1, 2 }, [](int64_t i) { return (float)i; })
+         .idx({ 9, 10, 11 })
+         .idx({ 0, 3 })
+         .dense(RAD_F32, { 2, 3 }, [](int64_t) { return 0.0f; }, true)
+         .refuses(RAD_E_SHAPE)
+         .pi("M", 2).pi("heads", 2).pi("dim", 64).pi("ratio", 4).pi("width", 3)
+         .pf("wscale", 0.5).ps("dtype", "f32");
         hs.push_back(std::move(h));
     }
     {

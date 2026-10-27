@@ -178,7 +178,8 @@ static const Flag g_flags[] = {
     "                                    copied from what followed the latest earlier occurrence of\n"
     "                                    the sequence's last n tokens (no weights, no draft pass).\n"
     "                                    Sets the window to K; a draft head the container carries is\n"
-    "                                    not loaded. 0 (default) off" },
+    "                                    not loaded. A proposal is verified only when its record\n"
+    "                                    says it pays at the measured step cost. 0 (default) off" },
     { "--spec-ngram-min",     "N",      "shortest pattern prompt lookup matches (default 2)" },
     { "--spec-ngram-max",     "N",      "longest pattern prompt lookup matches, tried first\n"
                                         "(default 4, at most 15)" },

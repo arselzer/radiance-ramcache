@@ -2982,6 +2982,274 @@ TEST(prompt_lookup_alone_follows_its_own_acceptance) {
     CHECK_NEAR(f.sch.metrics().draft_depth_adaptive, 1.0, 1e-6);
 }
 
+/* ------------------------------------------------------------------ prompt lookup's verify gate */
+/* A held proposal is scored against the text that follows, as a verify would have scored it: its
+ * accepted count is the common prefix. One proposal at a time; the next is taken once it ends. */
+TEST(the_lookup_gate_scores_a_held_proposal_against_the_text_that_follows) {
+    LookupGate g;
+    g.configure(4);
+    LookupSeq q;
+    /* The priors: a short match waits, a long one drafts. */
+    CHECK_NEAR(g.expect(q, 0, 4), 4 * LookupGate::kPriorShort, 1e-6);
+    CHECK_NEAR(g.expect(q, 1, 4), 4 * LookupGate::kPriorLong, 1e-6);
+    CHECK_EQ(LookupGate::class_of(LookupGate::kLongMatch - 1), 0);
+    CHECK_EQ(LookupGate::class_of(LookupGate::kLongMatch), 1);
+
+    std::vector<int32_t> text(10, 1);                  /* the sequence so far: 10 tokens */
+    TokenSeq ts;
+    auto view = [&]() {
+        ts.a = text.data();
+        ts.na = (int64_t)text.size();
+    };
+    const int32_t prop[4] = { 5, 6, 7, 8 };
+    g.offer(q, 10, prop, 4, 2);
+    g.held(q, 4);
+    const int32_t other[4] = { 40, 41, 42, 43 };
+    g.offer(q, 10, other, 4, 9);                       /* pending already: counted, not taken */
+    CHECK_EQ(q.proposed, (int64_t)2);
+    CHECK_EQ(q.pend_cls, 0);
+
+    text.push_back(5);                                 /* the first came true; no verdict yet */
+    view();
+    g.advance(q, ts);
+    CHECK(q.pend_pos >= 0);
+    CHECK_NEAR(q.s[0][0], 0.0, 1e-6);
+    text.push_back(6);
+    text.push_back(9);                                 /* two came true, the third did not */
+    view();
+    g.advance(q, ts);
+    CHECK(q.pend_pos < 0);
+    /* The prior weighs two proposals: the first evaluated moves each position a third. */
+    const double w = 1.0 / (LookupGate::kPriorWeight + 1.0);
+    CHECK_NEAR(q.s[0][0], w, 1e-6);
+    CHECK_NEAR(q.s[0][1], w, 1e-6);
+    CHECK_NEAR(q.s[0][2], 0.0, 1e-6);
+    CHECK_NEAR(q.s[0][3], 0.0, 1e-6);
+    CHECK_NEAR(q.s[1][0], LookupGate::kPriorLong, 1e-6);   /* the other class untouched */
+    CHECK_EQ(q.held_hits, (int64_t)2);
+    CHECK_EQ(g.held_hits(), (int64_t)2);
+    CHECK_EQ(g.held_count(), (int64_t)1);
+    CHECK_EQ(g.held_drafts(), (int64_t)4);
+
+    /* A proposal that comes true whole ends at its last token; a verified one counts no held
+     * hits but feeds the estimate the same way. */
+    const int64_t at = (int64_t)text.size();
+    const int32_t whole[4] = { 11, 12, 13, 14 };
+    g.offer(q, at, whole, 4, 3);
+    for (int32_t t : whole) text.push_back(t);
+    view();
+    g.advance(q, ts);
+    CHECK(q.pend_pos < 0);
+    CHECK(q.s[0][3] > 0.0f);
+    CHECK_EQ(q.held_hits, (int64_t)2);
+
+    /* Evidence is what moves a short match into drafting: a run of proposals that come true. */
+    LookupGate g2;
+    g2.configure(4);
+    LookupSeq r;
+    CHECK(!g2.pays(g2.expect(r, 0, 4), 4, 1, 1.0));
+    std::vector<int32_t> s2(4, 1);
+    for (int i = 0; i < 6; ++i) {
+        const int32_t p2[4] = { 2, 3, 4, 5 };
+        g2.offer(r, (int64_t)s2.size(), p2, 4, 2);
+        for (int32_t t : p2) s2.push_back(t);
+        TokenSeq t2;
+        t2.a = s2.data();
+        t2.na = (int64_t)s2.size();
+        g2.advance(r, t2);
+    }
+    CHECK(g2.expect(r, 0, 4) > 2.9);   /* 6 / (6 + 2) a position */
+    CHECK(g2.pays(g2.expect(r, 0, 4), 4, 1, 1.0));
+}
+
+/* What a verify costs: the measured step time at the step's rows with the drafts against without
+ * them; between timed row counts a line, outside them the nearest scaled by the prior's shape. */
+TEST(the_lookup_gate_prices_a_verify_by_measured_step_times) {
+    LookupGate g;
+    g.configure(4);
+    /* Untimed: the prior shape, 6% a row, so a whole window pays at a quarter of a token. */
+    CHECK_NEAR(g.step_cost(5) / g.step_cost(1), 1.0 + 4 * LookupGate::kRowCost, 1e-9);
+    CHECK(g.pays(0.3, 4, 1, 1.0));
+    CHECK(!g.pays(0.2, 4, 1, 1.0));
+    CHECK(!g.pays(0.0, 4, 1, 1.0));
+
+    /* One row timed: a verify is priced off it on the prior's shape. */
+    for (int i = 0; i < 8; ++i) g.step_time(1, 10.0);
+    CHECK_EQ(g.cost_samples(1), (int64_t)8);
+    CHECK_NEAR(g.step_cost(5), 10.0 * (1.0 + 4 * LookupGate::kRowCost), 1e-9);
+
+    /* Both timed: 2.5x for four drafts (a MoE reading each row's experts). 1 + E must beat it. */
+    for (int i = 0; i < 8; ++i) g.step_time(5, 25.0);
+    CHECK_NEAR(g.step_cost(5), 25.0, 1e-9);
+    CHECK_NEAR(g.step_cost(3), 17.5, 1e-9);            /* between: the line */
+    CHECK(!g.pays(1.4, 4, 1, 1.0));
+    CHECK(g.pays(1.6, 4, 1, 1.0));
+    /* Past the last timed count: the prior's shape from there. */
+    CHECK_NEAR(g.step_cost(9), 25.0 * (1.0 + 8 * LookupGate::kRowCost) /
+                                   (1.0 + 4 * LookupGate::kRowCost), 1e-9);
+    /* In a step of eight rows already expecting eight tokens, the same drafts weigh against the
+     * whole step: marginal cost over the step's rate. */
+    for (int i = 0; i < 8; ++i) g.step_time(8, 30.0);
+    for (int i = 0; i < 8; ++i) g.step_time(12, 36.0);
+    CHECK(!g.pays(1.5, 4, 8, 8.0));                    /* 1.5 / 8 < 36 / 30 - 1 */
+    CHECK(g.pays(1.7, 4, 8, 8.0));
+
+    /* A step that waited on something else counts as at most four times the mean. */
+    g.step_time(1, 1000.0);
+    CHECK(g.step_cost(1) < 10.0 + 40.0 / 8.0);
+    /* Junk is ignored. */
+    g.step_time(0, 5.0);
+    g.step_time(2, -1.0);
+    CHECK_EQ(g.cost_samples(2), (int64_t)0);
+    /* Wide steps share keys in bands of 32 rows past 128. */
+    g.step_time(200, 80.0);
+    g.step_time(210, 90.0);
+    CHECK_EQ(g.cost_samples(205), (int64_t)2);
+}
+
+/* The index says how far the match behind a proposal runs back, up to the cap. */
+TEST(prompt_lookup_reports_how_far_its_match_runs_back) {
+    NgramIndex ix;
+    /* 1 2 3 4 5 6 7 8 9 | 30 31 | 5 6 7 8 9: the last four match 5 6 7 8 9 at its first place,
+     * which runs five back; 30 31 then follows. */
+    std::vector<int32_t> s = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 30, 31, 5, 6, 7, 8, 9 };
+    TokenSeq ts;
+    ts.a = s.data();
+    ts.na = (int64_t)s.size();
+    int32_t out[4];
+    int m = -1;
+    CHECK_EQ(ix.propose(ts, 2, 4, 4, out, &m, 8), 4);
+    CHECK_EQ(out[0], 30);
+    CHECK_EQ(m, 5);
+    /* A copy that runs back further is cut at the cap. */
+    std::vector<int32_t> c;
+    for (int i = 0; i < 20; ++i) c.push_back(100 + i);
+    for (int i = 0; i < 12; ++i) c.push_back(100 + i);
+    TokenSeq tc;
+    tc.a = c.data();
+    tc.na = (int64_t)c.size();
+    NgramIndex ic;
+    CHECK_EQ(ic.propose(tc, 2, 4, 4, out, &m, 8), 4);
+    CHECK_EQ(out[0], 112);
+    CHECK_EQ(m, 8);
+    /* Without the out-parameter nothing changes. */
+    NgramIndex id;
+    CHECK_EQ(id.propose(tc, 2, 4, 4, out), 4);
+}
+
+namespace {
+/* A lookup-only deployment (no draft head) at window `depth`, the fixed window (the default). */
+void lookup_fixture(Fixture& f, int depth) {
+    f.build(/*blocks=*/4096, /*states=*/64);
+    f.cfg.n_spec = depth;
+    f.prog.drafter.kind = RAD_DRAFT_NONE;
+    f.prog.drafter.depth = 0;
+}
+}  /* namespace */
+
+/* Prompt lookup alone, the gate on by default. Text that copies a stretch it has seen drafts at
+ * once and keeps drafting while its drafts come true; text that only repeats bigrams it has seen,
+ * whose proposals do not come true, is never verified, yet every proposal is still scored; and a
+ * reply that turns from the second kind into the first drafts as soon as it does. The text is
+ * the same either way: the emitted token is the fixture's, whatever was verified. */
+TEST(prompt_lookup_alone_holds_back_proposals_that_do_not_pay) {
+    Fixture f;
+    lookup_fixture(f, 4);
+    std::string log = info_of([&]() { CHECK_OK(f.start()); });
+    CHECK(log.find("prompt lookup: a proposal is verified when") != std::string::npos);
+    CHECK(!f.sch.draft().adaptive());
+
+    /* A copy: an 8-token period, 160 tokens of it; the reply goes on with it. */
+    auto r = std::make_unique<Request>();
+    r->id = f.next_id++;
+    r->max_tokens = 2000;
+    r->prompt.resize(160);
+    for (int i = 0; i < 160; ++i) r->prompt[(size_t)i] = 100 + i % 8;
+    CHECK_OK(f.sch.add(std::move(r)));
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(100);
+    f.sch.step_finished();                               /* a prefill step: not a sample */
+    for (int64_t rows = 1; rows <= 5; ++rows)
+        CHECK_EQ(f.sch.lookup_gate().cost_samples(rows), (int64_t)0);
+    int64_t pos = 161;                                   /* the next token's place in the period */
+    auto truth = [&](int64_t p) { return (int32_t)(100 + p % 8); };
+    int verified = 0;
+    for (int t = 0; t < 24; ++t) {
+        REQUIRE(f.sch.step() != nullptr);
+        const StepEntry& e = f.sch.plan().e[0];
+        int32_t a = 0;
+        if (e.n_spec > 0) {
+            CHECK(e.ngram);
+            ++verified;
+            while (a < e.n_spec && e.draft[a] == truth(pos + a)) ++a;
+        }
+        CHECK_OK(f.commit(truth(pos + a), 0, [a](const StepEntry&) { return a; }));
+        f.sch.step_finished();                           /* a decode step of 1 + 4 rows, timed */
+        pos += a + 1;
+    }
+    CHECK_EQ(verified, 24);
+    CHECK_EQ(f.sch.lookup_gate().cost_samples(5), (int64_t)24);
+    SchedMetrics m = f.sch.metrics();
+    CHECK_EQ(m.lookup_held, (int64_t)0);
+    CHECK_EQ(m.lookup_proposals, (int64_t)24);
+    CHECK_EQ(m.draft_accepted, m.draft_tokens);
+
+    /* Recurring bigrams: the prompt holds every pair of the reply 200, 201, 202, ... followed by
+     * a 50, so after each token the lookup proposes 50 on a two-token match, and it never comes
+     * true. */
+    Fixture g;
+    lookup_fixture(g, 4);
+    CHECK_OK(g.start());
+    auto q = std::make_unique<Request>();
+    q->id = g.next_id++;
+    q->max_tokens = 2000;
+    for (int i = 0; i < 60; ++i) {
+        q->prompt.push_back(200 + i);
+        q->prompt.push_back(201 + i);
+        q->prompt.push_back(50);
+    }
+    q->prompt.push_back(199);
+    CHECK_OK(g.sch.add(std::move(q)));
+    REQUIRE(g.sch.step() != nullptr);
+    g.commit_plain(200);
+    int proposals = 0;
+    for (int t = 0; t < 40; ++t) {
+        REQUIRE(g.sch.step() != nullptr);
+        CHECK_EQ(g.sch.plan().e[0].n_spec, 0);           /* held, every one */
+        g.commit_plain(201 + t);
+        ++proposals;
+    }
+    m = g.sch.metrics();
+    CHECK_EQ(m.draft_tokens, (int64_t)0);
+    CHECK(m.lookup_proposals >= proposals - 1);
+    CHECK_EQ(m.lookup_held, m.lookup_proposals);
+    CHECK_EQ(m.lookup_held_drafts, 4 * m.lookup_held);
+    CHECK_EQ(m.lookup_held_hits, (int64_t)0);
+
+    /* The reply now copies its own stretch 201.. from the start: a long match, drafted at once. */
+    std::vector<int32_t> copy;
+    for (int i = 0; i < 40; ++i) copy.push_back(200 + i);
+    size_t k = 0;
+    int drafted_steps = 0, steps = 0;
+    while (k < copy.size() && steps < 40) {
+        REQUIRE(g.sch.step() != nullptr);
+        const StepEntry& e = g.sch.plan().e[0];
+        int32_t a = 0;
+        if (e.n_spec > 0) {
+            ++drafted_steps;
+            while (a < e.n_spec && k + (size_t)a < copy.size() &&
+                   e.draft[a] == copy[k + (size_t)a])
+                ++a;
+        }
+        CHECK_OK(g.commit(copy[std::min(k + (size_t)a, copy.size() - 1)], 0,
+                          [a](const StepEntry&) { return a; }));
+        k += (size_t)a + 1;
+        ++steps;
+    }
+    CHECK(drafted_steps > 0);
+    CHECK(g.sch.metrics().draft_accepted > 0);
+}
+
 namespace {
 /* Prompt lookup by scanning: the longest pattern first, its latest earlier occurrence, the
  * proposal continued past the end with its own tokens. The index must answer exactly this. */

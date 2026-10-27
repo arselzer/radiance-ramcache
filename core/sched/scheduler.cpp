@@ -202,6 +202,20 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
         }
     }
     RAD_TRY(draft_.configure(dp));
+    /* Prompt lookup as the deployment's only drafter verifies a proposal only when it pays
+     * (lookup.h). Not configurable: the one deployment property it needs, the cost of a verify
+     * row, is measured. */
+    {
+        const RadDrafterDecl& dd = prog.drafter;
+        const bool head =
+            (dd.kind == RAD_DRAFT_SERIAL || dd.kind == RAD_DRAFT_BLOCK) && dd.depth > 0;
+        lookup_gate_on_ = cfg.n_spec > 0 && !head;
+        lookup_.configure(lookup_gate_on_ ? cfg.n_spec : 0);
+        if (lookup_gate_on_)
+            RAD_INFO("prompt lookup: a proposal is verified when its sequence's record says it "
+                     "pays for its verify rows at the measured step cost; one held back is still "
+                     "scored against the text that follows");
+    }
     draft_est_.clear();
     draft_est_.reserve((size_t)cfg.max_seqs);
 
@@ -329,6 +343,7 @@ int Scheduler::add_locked(std::unique_ptr<Request> r) {
     /* A new request's text, so a new estimate. */
     s.adapt.depth = 0;
     s.adapt.held  = 0;
+    s.look.started = false;
     s.sched_tokens = 0;
     s.entry = -1;
     s.entry_next = -1;
@@ -546,6 +561,14 @@ void Scheduler::close_request(SchedReq& s, ReqState st, const char* reason, bool
     if (cfg_.prefix_cache && pc_) pc_->release(*s.req);
     /* Prompt lookup's index is this text's alone. */
     s.ngram_ix.reset();
+    if (lookup_gate_on_ && s.look.started && s.look.proposed > 0)
+        RAD_DEBUG("prompt lookup: request %llu made %lld proposals, held back %lld (%lld drafts, "
+                  "%lld of those scored came true); a %d-draft verify costs %.2f plain steps",
+                  (unsigned long long)s.req->id, (long long)s.look.proposed,
+                  (long long)s.look.held, (long long)s.look.held_drafts,
+                  (long long)s.look.held_hits, lookup_.max_depth(),
+                  lookup_.step_cost(1 + lookup_.max_depth()) / lookup_.step_cost(1));
+    s.look.started = false;
     /* Fold what the draft head did on this text into the next text's starting estimate, once:
      * marking it unstarted makes a second close add nothing. */
     if (draft_.adaptive()) {
@@ -803,7 +826,8 @@ int Scheduler::requests_locked(ReqStat* out, int max) const {
  *
  * The occurrence comes from the sequence's own index (ngram.h): O(pattern) a lookup, plus the
  * n-grams the last commit added, rather than a scan of the context. */
-int Scheduler::draft_ngram(SchedReq& s, int depth) const {
+int Scheduler::draft_ngram(SchedReq& s, int depth, int* match) const {
+    if (match) *match = -1;
     if (depth <= 0 || !s.req) return 0;
     const Request& r = *s.req;
     TokenSeq seq;
@@ -830,7 +854,8 @@ int Scheduler::draft_ngram(SchedReq& s, int depth) const {
         return d;
     }
     if (s.ngram_ix.owner() != r.id) s.ngram_ix.reset(r.id);
-    return s.ngram_ix.propose(seq, cfg_.spec_ngram_min, cfg_.spec_ngram_max, depth, s.draft);
+    return s.ngram_ix.propose(seq, cfg_.spec_ngram_min, cfg_.spec_ngram_max, depth, s.draft, match,
+                              LookupGate::kLongMatch);
 }
 
 /* ------------------------------------------------------------------ chunking */
@@ -1410,6 +1435,19 @@ const RadBatch* Scheduler::step() {
     int32_t capped_at = -1;
     int64_t capped_full = 0;
 
+    /* The verify gate's view of the step: every decoding sequence's own row, before any drafts. */
+    if (lookup_gate_on_) {
+        gate_rows_ = 0;
+        for (int32_t slot : running_) {
+            const SchedReq& g = *reqs_[(size_t)slot];
+            if (!g.req) continue;
+            const Request& gr = *g.req;
+            if (gr.n_computed >= (int64_t)gr.prompt.size() && gr.n_computed + 1 >= g.seq_len())
+                ++gate_rows_;
+        }
+        gate_tokens_ = (double)gate_rows_;
+    }
+
     /* ---------------------------------------------------------- running requests first */
     /* Continuous batching: requests already holding blocks are served before new ones are
      * admitted, so new work never preempts work half done. */
@@ -1464,8 +1502,27 @@ const RadBatch* Scheduler::step() {
             else if (s.n_draft == 0) {
                 /* As the only drafter under the adaptive window, the lookup is the head: its
                  * proposal is cut to the sequence's own window. */
-                s.n_draft = (int32_t)draft_ngram(s, lookup_adapt_ ? cap : draft_.step_window());
+                int match = -1;
+                s.n_draft = (int32_t)draft_ngram(s, lookup_adapt_ ? cap : draft_.step_window(),
+                                                 &match);
                 ngram = s.n_draft > 0;
+                /* The verify gate (lookup.h). Every proposal is offered, so a held one is still
+                 * scored against the text; the --debug-draft-oracle harness (match < 0) is a
+                 * verify-path test and always verified. */
+                if (ngram && lookup_gate_on_ && match >= 0) {
+                    const int64_t pos = (int64_t)r.prompt.size() + (int64_t)r.output.size();
+                    lookup_.offer(s.look, pos, s.draft, s.n_draft, match);
+                    const double gain =
+                        lookup_.expect(s.look, LookupGate::class_of(match), s.n_draft);
+                    if (lookup_.pays(gain, s.n_draft, gate_rows_, gate_tokens_)) {
+                        gate_rows_ += s.n_draft;
+                        gate_tokens_ += gain;
+                    } else {
+                        lookup_.held(s.look, s.n_draft);
+                        s.n_draft = 0;
+                        ngram = false;
+                    }
+                }
             }
             if (!ngram && s.n_draft > cap) s.n_draft = cap;
             s.draft_ngram = ngram;
@@ -2160,6 +2217,15 @@ int Scheduler::commit(const StepResult& res) {
             for (int32_t j = 0; j < a; ++j) emit(s.draft[j], j);
             if (res.token) emit(res.token[i], a);
             r.n_computed = valid;
+            /* The gate's pending proposal against what this step emitted (lookup.h). */
+            if (lookup_gate_on_ && s.look.started) {
+                TokenSeq ts;
+                ts.a = r.prompt.data();
+                ts.na = (int64_t)r.prompt.size();
+                ts.b = r.output.data();
+                ts.nb = (int64_t)r.output.size();
+                lookup_.advance(s.look, ts);
+            }
             step_decode_tok_ += 1 + a;
 
             if (e.n_spec > 0) {
@@ -2302,6 +2368,13 @@ void Scheduler::step_finished() {
         /* The decay never reaches zero; below 0.05 tok/s it reads as zero. */
         if (m_.prefill_tps < 0.05f) m_.prefill_tps = 0.0f;
         if (m_.decode_tps  < 0.05f) m_.decode_tps  = 0.0f;
+    }
+    /* The step's cost by query rows, for the prompt-lookup gate (lookup.h): every pure decode
+     * step, drafting or not, since the plain step is what a verify is weighed against. */
+    if (lookup_gate_on_ && plan_.phase == RAD_PHASE_DECODE && wall > 0) {
+        int64_t rows = 0;
+        for (const StepEntry& e : plan_.e) rows += e.is_prefill ? 0 : e.n_tokens;
+        if (rows > 0) lookup_.step_time(rows, wall * 1e3);
     }
     /* The step's cost at its depth, for the adaptive window (draft.h): the same wall time,
      * including the draft rounds after it, with a step issued ahead counted once. Decode steps
@@ -2920,6 +2993,10 @@ SchedMetrics Scheduler::metrics_locked() const {
         m.draft_pos_reached [j] = draft_.reached(j);
         m.draft_pos_accepted[j] = draft_.hits(j);
     }
+    m.lookup_proposals   = lookup_.proposed();
+    m.lookup_held        = lookup_.held_count();
+    m.lookup_held_drafts = lookup_.held_drafts();
+    m.lookup_held_hits   = lookup_.held_hits();
     if (draft_.adaptive()) {
         m.draft_adaptive = true;
         /* Over the running sequences whose estimate has started; one that has not drafted yet

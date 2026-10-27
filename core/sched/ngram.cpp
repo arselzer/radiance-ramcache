@@ -84,7 +84,8 @@ int64_t NgramIndex::find_suffix(const TokenSeq& s, int n) const {
     }
 }
 
-int NgramIndex::propose(const TokenSeq& seq, int nmin, int nmax, int depth, int32_t* out) {
+int NgramIndex::propose(const TokenSeq& seq, int nmin, int nmax, int depth, int32_t* out,
+                        int* match, int match_cap) {
     const int64_t len = seq.size();
     if (depth <= 0 || len < 2) return 0;
     nmin = std::max(1, std::min(nmin, (int)kMaxN));
@@ -104,6 +105,11 @@ int NgramIndex::propose(const TokenSeq& seq, int nmin, int nmax, int depth, int3
         for (int d = 0; d < depth; ++d) {
             const int64_t i = e + 1 + d;
             out[d] = i < len ? seq[i] : out[i - len];
+        }
+        if (match) {
+            int m = n;
+            while (m < match_cap && e - m >= 0 && seq[e - m] == seq[len - 1 - m]) ++m;
+            *match = m;
         }
         return depth;
     }

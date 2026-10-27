@@ -51,8 +51,14 @@ public:
      * proposed whole. Returns how many were proposed, 0 when no pattern of those lengths recurs.
      *
      * The sequence must only grow between calls under one owner; a shorter one (or other pattern
-     * lengths) rebuilds the index. 1 <= nmin <= nmax <= kMaxN. */
-    int propose(const TokenSeq& seq, int nmin, int nmax, int depth, int32_t* out);
+     * lengths) rebuilds the index. 1 <= nmin <= nmax <= kMaxN.
+     *
+     * `match`, if given, receives how far the match behind the proposal runs back: the number of
+     * tokens before the end that equal those before the occurrence, at least the pattern's n and
+     * at most `match_cap` (counted only that far). The verify gate (lookup.h) prices a long match
+     * apart from a recurring bigram. */
+    int propose(const TokenSeq& seq, int nmin, int nmax, int depth, int32_t* out,
+                int* match = nullptr, int match_cap = 0);
 
     /* The latest end position e < seq.size() - 1 of an earlier occurrence of the sequence's last
      * `n` tokens, or -1. Visible for tests; propose() calls it after indexing. */

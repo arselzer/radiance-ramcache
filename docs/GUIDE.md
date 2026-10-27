@@ -1191,6 +1191,19 @@ quoting -- and costs a verify row per wrong draft elsewhere. Each sequence keeps
 its n-grams last occurred (about 8 bytes a token per pattern length, 16 MiB at 400k tokens and the
 default range), extended by each commit, so a lookup does not scan the context.
 
+A verify row is not free: on a MoE each row reads its own routed experts, and five drafts can cost
+a couple of plain steps. So when prompt lookup is the only drafter, a proposal is verified only when
+it is expected to pay: K drafts are verified when E[accepted] * T(R) > tokens * (T(R + K) - T(R)),
+with T(R) the measured time of a decode step of R query rows (timed online over every pure decode
+step) and `tokens` what the step already expects to emit -- for one sequence, 1 + E[accepted] >
+T(1 + K) / T(1). E[accepted] is the sequence's own record, kept apart for a match that runs at least
+8 tokens back (the reply is copying a stretch; drafted at once) and a shorter one (a recurring
+bigram; drafted once its record says so). A proposal held back is still scored against the tokens
+the sequence goes on to emit, which is exactly what a verify would have accepted, so a sequence that
+stops drafting on prose keeps learning and drafts again as soon as it starts copying. There is
+nothing to configure; the constants are in `core/sched/lookup.h`. Only which proposals are verified
+changes, never the text. `radiance:lookup_held_total` counts the held proposals.
+
 ```sh
 radiance --model m.rad --spec-ngram 5                         # prompt lookup alone, up to 5 drafts
 radiance --model m.rad --spec-ngram 5 --draft-window adaptive # each sequence's window follows its acceptance
@@ -1894,7 +1907,7 @@ by 0.002-0.003 nats.
 | flag | default | |
 |---|---|---|
 | `--num-speculative-tokens N` | auto | speculative window; 0 disables. The ceiling under `--draft-window adaptive` |
-| `--spec-ngram K` | 0 | prompt lookup alone: up to K drafts a step from the sequence's own n-grams, no draft head declared; sets the window to K (§4.6) |
+| `--spec-ngram K` | 0 | prompt lookup alone: up to K drafts a step from the sequence's own n-grams, each proposal verified when it pays at the measured step cost; no draft head declared; sets the window to K (§4.6) |
 | `--spec-ngram-min N`, `--spec-ngram-max N` | 2, 4 | the pattern lengths prompt lookup tries, longest first (at most 15), wherever it drafts |
 | `--draft-window MODE` | fixed | `fixed` drafts N every step; `adaptive` follows each sequence's acceptance and the measured step cost, for a draft head or prompt lookup alone (§4.6) |
 | `--draft-short-from N` | 0 | a block drafter that declares a shorter block runs it from N decoding sequences on, its own block again two below; 0 never (§4.6) |
@@ -3322,6 +3335,7 @@ there is none.
 | `draft_tokens_total`, `draft_accepted_total`, `draft_acceptance_ratio` | |
 | `draft_position_reached_total`, `draft_position_accepted_total`, `draft_position_acceptance_ratio` | acceptance by position: the two counters over any window, the ratio since start |
 | `draft_refills_total`, `draft_refill_tokens_total` | prefix hits ended a drafter window early, and the tokens recomputed (§4.6) |
+| `lookup_proposals_total`, `lookup_held_total`, `lookup_held_drafts_total`, `lookup_held_hits_total` | prompt lookup as the only drafter: proposals made, proposals held back as not paying for their verify rows and their drafts, and of the held ones scored against the text that followed, the drafts that came true (§4.6) |
 | `decode_rows_unspeculated_total` | rows that never drafted |
 | `draft_depth_adaptive`, `draft_verify_depth_total{depth}` | the adaptive window's mean over the running sequences, and verifies by the drafts they carried; only with `--draft-window adaptive` (§4.6) |
 | `engine_prefill_chunks_capped_total` | prefill chunks held back to share a step (§4.5) |

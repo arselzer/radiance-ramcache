@@ -128,6 +128,7 @@ set(RAD_TEST_CPU_BUDGET_quant_ggml_test 25)  # llama.cpp's iq1_s and iq2_* grid 
 set(RAD_TEST_CPU_BUDGET_tokenizer_test 20)  # the reference encoder over every corpus: ~3 s built by GCC 16, ~10.5 s by GCC 14 (the image's Ubuntu)
 set(RAD_TEST_CPU_BUDGET_arch_test 15)  # every plugin's graph declared; ~10.8 s with the batched-tower case
 set(RAD_TEST_CPU_BUDGET_glm5next_test 20)  # GLM-5.3-Flash's graphs and op schemas: ~4.8 s built by GCC 16, ~10.1 s by GCC 14 (the image's Ubuntu)
+set(RAD_TEST_CPU_BUDGET_native_mapped_copy_mover_test 20)  # 29 full-payload cache/transport and fault cases: ~11.8 s on EPYC 7443
 
 # Binaries whose OpenMP team is busy for most of their run, so a parallel ctest counts them as a
 # team's worth of slots rather than one.

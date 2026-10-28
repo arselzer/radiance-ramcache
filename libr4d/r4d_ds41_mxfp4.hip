@@ -332,7 +332,7 @@ __global__ __launch_bounds__(kMxThreads) void mx_gemv_kernel(MxGemvArgs A) {
     const int nrg = (A.N + RG - 1) / RG;
     const int UK = A.K / Q::QK;                       /* blocks a row */
     const int XRC = A.KC + A.KC / 8;                  /* floats a chunked row */
-    int n_items = A.ipe;
+    int n_items = A.ipe, rgpi = A.rgpi, ipe = A.ipe;
     if constexpr (MOE) {
         /* The experts with rows, in ascending order. */
         if (wave == 0) {
@@ -349,7 +349,14 @@ __global__ __launch_bounds__(kMxThreads) void mx_gemv_kernel(MxGemvArgs A) {
             if (lane == 0) s_nlive = cnt;
         }
         __syncthreads();
-        n_items = s_nlive * A.ipe;
+        /* The host sized rgpi and ipe for min(n_expert, T) experts, but a decode pass on one EP
+         * rank usually has one or two live: spread the live experts' row groups over every
+         * launched block instead. A row is still one wave's, in the same order, so the bits are
+         * those of any other split. */
+        const int total = s_nlive * nrg;
+        rgpi = total > (int)gridDim.x ? (total + (int)gridDim.x - 1) / (int)gridDim.x : 1;
+        ipe = (nrg + rgpi - 1) / rgpi;
+        n_items = s_nlive * ipe;
     } else {
         __syncthreads();
     }
@@ -359,13 +366,13 @@ __global__ __launch_bounds__(kMxThreads) void mx_gemv_kernel(MxGemvArgs A) {
         int e = 0, ri = it, rs = 0, re = A.M;
         const uint8_t* wb = A.w;
         if constexpr (MOE) {
-            e = live[it / A.ipe];
-            ri = it - (it / A.ipe) * A.ipe;
+            e = live[it / ipe];
+            ri = it - (it / ipe) * ipe;
             if(A.live_end)ds41_live_tail::range(A.off,e,A.M,&rs,&re);else mx_range(A.off, e, A.n_expert, A.M, &rs, &re);
             wb = A.wtab ? A.wtab[e] : A.w + (long long)e * A.w_es;
         }
         did_work=true;if constexpr(PROBE)if(ri==0)owned_rows+=(unsigned long long)(re-rs);
-        const int rg0 = ri * A.rgpi, rg1 = min(rg0 + A.rgpi, nrg);
+        const int rg0 = ri * rgpi, rg1 = min(rg0 + rgpi, nrg);
         for (int p0 = rs; p0 < re; p0 += A.XM) {
             const int mc = min(A.XM, re - p0);
             const bool whole = mc <= A.XLM;            /* block-uniform */
@@ -815,7 +822,9 @@ int mx_moe(const RadArgs* a, RadStream s, bool gemv,bool baseline=false,unsigned
         A.live_off = (int)tb;
         A.x_off = (int)(tb + mx_r16(ne * 4));
         const long long lds = A.x_off + xbuf * 4;
-        const long long items = L * ipe;
+        /* Enough blocks for every row group of L experts: the kernel spreads whichever experts
+         * turn out live over all of them. */
+        const long long items = L * nrg;
         const unsigned grid = (unsigned)(items < 256 ? items : 256);
         if(!tail)return mx_launch_gemv(s,ty,rpw,true,A,grid,(unsigned)lds);
         const int rc=mx_tail_gemv(s,rpw,A,grid,(unsigned)lds);if(rc!=RAD_OK)return rc;

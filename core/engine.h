@@ -33,6 +33,7 @@
 #include "text/tokenizer.h"
 #include "format/radfile.h"
 #include "format/table_copy.h"
+#include "format/dspark_rad_banks.h"
 #include "lora/adapter.h"
 #include "lora/slots.h"
 
@@ -142,6 +143,10 @@ private:
      * the mapped and file tiers read it in place (spec §4.3). A checkpoint served directly also
      * stays mapped and is read once, at load (spec §4.3). */
     std::unique_ptr<RadFile> file_;
+    /* Both borrowed owners outlive every rank, queued copy and cached source reference. */
+    std::unique_ptr<RadFile> draft_file_;
+    std::unique_ptr<DsparkRadBanks> source_banks_;
+    const RadFileEntry* source_entry(const std::string& name) const;
     std::unique_ptr<Checkpoint> ckpt_;
     std::unique_ptr<CheckpointSources> ckpt_src_;
     /* The source rad_weight_encoding answers from: container entries or checkpoint tensors. */
@@ -241,7 +246,7 @@ private:
     /* --ngram-placement ram: one copy of the container's [src, src + n) at file offset `foff`,
      * shared by every rank. Locked for the host gather, or pinned for a device kernel to read
      * over the link (`card`). */
-    int copy_table(const uint8_t* src, int64_t n, int64_t foff, bool card, void** out,
+    int copy_table(const RadFile& owner, const uint8_t* src, int64_t n, int64_t foff, bool card, void** out,
                    std::string* why);
     /* An auto-chosen pinned copy failed: move every rank's n-gram gather to the host. */
     bool ngram_gather_to_host();

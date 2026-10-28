@@ -86,6 +86,7 @@
 #include "mover.h"
 #include "planner.h"
 #include "ep_route_counts.h"
+#include "dspark_head_tail.h"
 
 #include <deque>
 #include <functional>
@@ -278,6 +279,8 @@ public:
     bool begin_pass(const RadBatch* b) override;
     int  before_op(rad_op h, RadStream s, bool* resync) override;
     int  end_pass(RadStream s) override;
+    //Must run before Ctx::shutdown and before Mover/bank/buffer owners disappear.
+    int shutdown_head_cache();
 
 private:
     friend struct EpCountsHostProbe;
@@ -328,6 +331,19 @@ private:
     std::vector<uint8_t> ep_layer_eligible_;
     EpStats ep_stats_;
     int  finish(int32_t b, RadStream s);
+    struct HeadOps;
+    DsparkHeadTailOwner head_;
+    std::vector<int32_t> head_units_, head_staged_;
+    RadEvent head_done_ = nullptr;
+    RadStream head_compute_ = nullptr;
+    using HeadPass = DsparkHeadTailPass;
+    HeadPass head_pass_ = HeadPass::Unknown;
+    bool head_first_ = false;
+    bool head_closed_ = false;
+    int head_status_ = RAD_OK;
+    int init_head_cache(const Program& prog, const Plan& plan);
+    int head_prepare(RadStream s, bool* resync);
+    int head_revoke();
 };
 
 }  /* namespace rad */

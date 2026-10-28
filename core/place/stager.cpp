@@ -1,5 +1,6 @@
 /* stager.cpp -- see stager.h. */
 #include "place/stager.h"
+#include "place/dspark_native_scope.h"
 
 #include <algorithm>
 #include <cstring>
@@ -368,7 +369,109 @@ int PrefillStager::end_pass(RadStream s) {
 }
 
 /* ================================================================== the file stager */
+struct FileStager::HeadOps {
+    FileStager& f;
+    bool epochs_current() const { return f.mover_ && f.mover_->source_epochs_current(); }
+    int drain_copy() const { return rad_stream_sync(f.mover_->transfer_stream()); }
+    int drain_compute() const { return f.head_compute_ ? rad_stream_sync(f.head_compute_) : RAD_E_STATE; }
+    void withdraw() { f.mover_->unstage_units(f.head_staged_); f.head_staged_.clear(); }
+    int stage(const DsparkHeadTailOwner::Budget& b) {
+        if (f.mover_->stage_need(f.head_units_) != b.head_bytes) return RAD_E_STATE;
+        const RadStream copy = f.mover_->transfer_stream();
+        Mover::StageSpan spans[2];
+        for (int i=0;i<2;++i) {
+            //Valid native zero dummy on the first local-zero layer, plus both reader guards.
+            RAD_TRY(rad_memset_async(f.buf_[i],0,b.serving_bytes,copy));
+            RAD_TRY(rad_memset_async(f.buf_[i]+b.capacity[size_t(i)]-DsparkHeadTailOwner::guard,
+                                    0,DsparkHeadTailOwner::guard,copy));
+            spans[i]={reinterpret_cast<char*>(b.tail[size_t(i)]),b.tail_capacity[size_t(i)]};
+        }
+        RAD_TRY(f.mover_->stage_units(f.head_units_,spans,2,nullptr,f.head_done_,&f.head_staged_));
+        auto actual=f.head_staged_,expected=f.head_units_;
+        std::sort(actual.begin(),actual.end());std::sort(expected.begin(),expected.end());
+        return actual==expected ? RAD_OK : RAD_E_STATE;
+    }
+    int wait_done() const { return rad_event_wait(f.head_compute_,f.head_done_); }
+};
+
+int FileStager::init_head_cache(const Program& prog,const Plan& plan) {
+    if (!dspark_exact_one(std::getenv(kDsparkHeadTailEnv))) return RAD_OK;
+    if (!mover_ || plan.dynamic || plan.world_size!=4 || plan.rank!=prog.ctx.rank ||
+        prog.ctx.max_tok!=16 || !counts_ || !ep_counts_ || !dspark_native_program_scope(prog) ||
+        layers_.empty() || !mover_->source_epochs_current()) return RAD_E_UNSUPPORTED;
+    for (size_t i=0;i<layers_.size();++i)
+        if (layers_[i].layer<0 || layers_[i].layer>=40 || !ep_layer_eligible_[i]) return RAD_E_UNSUPPORTED;
+    int64_t actual_bytes=0;uint64_t generation=0;
+    std::array<std::array<bool,32>,3> seen{};
+    for (size_t u=0;u<plan.units.size();++u) {
+        const auto& mu=plan.units[u];
+        if (mu.layer<40 || mu.expert<0) continue;
+        if (mu.layer>=43 || mu.expert>=32 || mu.weights.size()!=2 || mu.movable || !mu.host_forced ||
+            mu.tier!=Tier::HostPinned || mu.site!=Site::DeviceZeroCopy ||
+            mu.bytes!=DsparkHeadTailOwner::pair_bytes || mu.slot_bytes!=DsparkHeadTailOwner::pair_bytes)
+            return RAD_E_UNSUPPORTED;
+        if (seen[size_t(mu.layer-40)][size_t(mu.expert)]) return RAD_E_STATE;
+        seen[size_t(mu.layer-40)][size_t(mu.expert)]=true;
+        unsigned slots=0;
+        for (auto h:mu.weights) {
+            if (!h || size_t(h)>=prog.weights.size()) return RAD_E_STATE;
+            const auto& w=prog.weights[h];
+            if (!dspark_native_weight_scope(w) || w.file_id!=1 || !w.source_bank_generation ||
+                w.decl.group.layer!=mu.layer || w.decl.group.expert!=mu.expert ||
+                (slots&(1u<<w.decl.group.slot)))
+                return RAD_E_UNSUPPORTED;
+            slots|=1u<<w.decl.group.slot;
+            if (!generation) generation=w.source_bank_generation;
+            if (w.source_bank_generation!=generation) return RAD_E_STATE;
+        }
+        if (slots!=3) return RAD_E_UNSUPPORTED;
+        head_units_.push_back(int32_t(u));actual_bytes+=mu.slot_bytes;
+    }
+    for (const auto& layer:seen) for (bool present:layer) if (!present) return RAD_E_STATE;
+    int64_t largest=0;
+    const int64_t available_need=mover_->stage_need(head_units_,&largest);
+    if (actual_bytes!=available_need || !head_.configure(
+        {reinterpret_cast<uintptr_t>(buf_[0]),reinterpret_cast<uintptr_t>(buf_[1])},
+        {cap_,cap_},available_need,largest,int(head_units_.size()))) return RAD_E_NOMEM;
+    RAD_TRY(rad_event_create_local(&head_done_));
+    const auto& b=head_.budget();
+    RAD_INFO("DSpark fixed head tail: rank=%d actual buffers=%lld/%lld bytes, serving=%lld bytes "
+             "each, tail capacities=%lld/%lld bytes, staged need=%lld bytes for96 immutable "
+             "pinned pairs; same-address copies, no added VRAM",plan.rank,
+             (long long)b.capacity[0],(long long)b.capacity[1],(long long)b.serving_bytes,
+             (long long)b.tail_capacity[0],(long long)b.tail_capacity[1],(long long)b.head_bytes);
+    return RAD_OK;
+}
+
+int FileStager::head_revoke() {
+    if (!head_.configured() || !head_.pending()) return RAD_OK;
+    HeadOps ops{*this};return head_.revoke(ops);
+}
+
+int FileStager::head_prepare(RadStream s,bool* resync) {
+    const bool before=head_.pending();
+    HeadOps ops{*this};
+    int rc=RAD_OK;
+    if (head_pass_==HeadPass::Unknown) rc=head_.revoke(ops);
+    else if (head_pass_==HeadPass::Query || head_.pending()) rc=head_.ensure(ops,reinterpret_cast<uintptr_t>(s));
+    if (before!=head_.pending() || head_pass_==HeadPass::Query) *resync=true;
+    return rc;
+}
+
+int FileStager::shutdown_head_cache() {
+    if (!head_.configured() || head_closed_) return RAD_OK;
+    RAD_TRY(head_revoke());
+    if (head_done_) { rad_event_destroy(head_done_); head_done_=nullptr; }
+    const auto& s=head_.stats();
+    RAD_INFO("DSpark fixed head tail: %llu copy-ordered publications, %llu revoked generations, "
+             "%llu warm pass keeps; checked copy+compute drain before tail reuse; no speed claim",
+             (unsigned long long)s.copies,(unsigned long long)s.revokes,(unsigned long long)s.keeps);
+    head_closed_=true;return RAD_OK;
+}
+
 FileStager::~FileStager() {
+    //Engine normally closes this before Ctx. Partial-init destruction has the same obligation.
+    if (shutdown_head_cache() < 0) std::_Exit(88);
     for (int b = 0; b < 2; ++b) {
         if (done_[b]) rad_event_destroy(done_[b]);
         if (free_[b]) rad_event_destroy(free_[b]);
@@ -379,6 +482,9 @@ FileStager::~FileStager() {
 
 int FileStager::init(const Program& prog, const Plan& plan, Mover* mover, CountsRow counts,
                       EpCountsRow ep_counts) {
+    //No owner/program switch while temporary addresses or old copy generations survive.
+    RAD_TRY(shutdown_head_cache());
+    if (head_.configured()) return RAD_E_STATE; //a head-cache FileStager is single-initialization
     layers_.clear();
     ep_counts_ = std::move(ep_counts);
     ep_program_ = &prog;
@@ -390,7 +496,7 @@ int FileStager::init(const Program& prog, const Plan& plan, Mover* mover, Counts
     layers_ = routed_layers(plan, [](const MoveUnit& mu) {
         return mu.tier == Tier::SSD && mu.access == RAD_ACCESS_CONDITIONAL;
     }, &c);
-    if (layers_.empty()) return RAD_OK;
+    if (layers_.empty()) return dspark_exact_one(std::getenv(kDsparkHeadTailEnv)) ? RAD_E_UNSUPPORTED : RAD_OK;
     ep_layer_eligible_.assign(layers_.size(), 0);
     if (ep_counts_ && prog.meta.arch_id && std::strcmp(prog.meta.arch_id, "deepseek41") == 0 &&
         prog.meta.n_layers == 40 && prog.meta.n_embd == 5120 && prog.meta.n_expert == 384 &&
@@ -466,12 +572,17 @@ int FileStager::init(const Program& prog, const Plan& plan, Mover* mover, Counts
             counts_ev_ = nullptr;
         }
     }
-    return RAD_OK;
+    return init_head_cache(prog, plan);
 }
 
 /* Arms for every pass: a file-tier unit has no other address, so an unarmed pass would reach its
  * first routed layer with null expert pointers. */
 bool FileStager::begin_pass(const RadBatch* b) {
+    head_first_ = head_.configured();
+    head_pass_ = head_.configured() ? dspark_head_tail_pass(b) : HeadPass::Unknown;
+    //Unknown/prefill scope gives addresses back BEFORE Ctx's pass-wide residency refresh,
+    //even when the architecture issues no op. A bool seam cannot return the error, so retain it.
+    head_status_ = head_pass_==HeadPass::Unknown ? head_revoke() : RAD_OK;
     pass_cache_policy_ = native_file_cache_prefill_policy(
         std::getenv(kNativeCachePrefillReadOnlyEnv), b, true);
     armed_ = enabled() && b;
@@ -494,6 +605,8 @@ bool FileStager::will_issue(int32_t li) const {
 }
 
 int FileStager::start(int32_t li) {
+    //EVERY full-layer/read-ahead/repeated-slice path acquires the complete buffer here.
+    RAD_TRY(head_revoke());
     const int b = li & 1;
     if (holds_[b] >= 0) return RAD_E_STATE;     /* released before the next read, by construction */
     const int32_t layer = layers_[(size_t)li].layer;
@@ -524,7 +637,7 @@ int FileStager::start_ep_routed(int32_t li, RadStream s, bool* read) {
     EpRouteCounts v;
     if (!ep_counts_(L.layer, &v)) return RAD_OK;
     if (!ep_route_current(v, ep_program_, s, v.generation, L.layer, pass_tok_) ||
-        v.rank != plan_->rank) return RAD_E_STATE;
+        v.rank != plan_->rank) { RAD_TRY(head_revoke()); return RAD_E_STATE; }
     const int b = li & 1;
     if (holds_[b] >= 0 || counts_cap_ < 96) return RAD_E_STATE;
     /* Same actual producer stream; this host-wait event is the completion proof.
@@ -535,6 +648,7 @@ int FileStager::start_ep_routed(int32_t li, RadStream s, bool* read) {
     int64_t total = 0;
     if (!ep_route_counts_valid(v, counts_host_, counts_cap_, &total)) {
         ++ep_stats_.corrupt;
+        RAD_TRY(head_revoke());
         return RAD_E_STATE;
     }
     want_.clear(); skip_.clear();
@@ -544,7 +658,11 @@ int FileStager::start_ep_routed(int32_t li, RadStream s, bool* read) {
             return RAD_E_STATE;
         (selected ? want_ : skip_).push_back(u);
     }
-    RAD_TRY(mover_->stage_file_units(want_, buf_[b], cap_, free_rec_[b] ? free_[b] : nullptr,
+    const int64_t need = int64_t(want_.size()) * DsparkHeadTailOwner::pair_bytes;
+    if (head_.pending() && (head_pass_ != HeadPass::Verify ||
+        !head_.selected_fits(int64_t(want_.size()), need))) RAD_TRY(head_revoke());
+    const int64_t available = head_.pending() ? head_.budget().serving_bytes : cap_;
+    RAD_TRY(mover_->stage_file_units(want_, buf_[b], available, free_rec_[b] ? free_[b] : nullptr,
                                      done_[b], &staged_[b]));
     pending_[b] = !staged_[b].empty();
     mover_->alias_file_units(skip_, buf_[b], &staged_[b]);
@@ -558,6 +676,8 @@ int FileStager::start_ep_routed(int32_t li, RadStream s, bool* read) {
 }
 
 int FileStager::start_routed(int32_t li, RadStream s, bool* read) {
+    //Generic/global rows cannot authorize the fixed local96/query6 reservation.
+    RAD_TRY(head_revoke());
     *read = false;
     const Layer& L = layers_[(size_t)li];
     int64_t ne = 0, top_k = 0;
@@ -618,6 +738,13 @@ int FileStager::finish(int32_t b, RadStream s) {
 
 int FileStager::before_op(rad_op h, RadStream s, bool* resync) {
     *resync = false;
+    if (head_status_<0) return head_status_;
+    if (head_.configured()) {
+        //Preserve the OLD owner stream until its head readers are actually drained.
+        if (head_.pending() && head_compute_ != s) { RAD_TRY(head_revoke()); *resync=true; }
+        head_compute_ = s;
+        if (head_first_) { head_first_ = false; RAD_TRY(head_prepare(s, resync)); }
+    }
     if ((int32_t)h > last_issued_) last_issued_ = (int32_t)h;
 
     /* Read the pass's first routed layer at its first op of any kind -- unless the pass reads
@@ -688,7 +815,7 @@ int FileStager::end_pass(RadStream s) {
             if (r < 0 && rc >= 0) rc = r;
         }
     cur_ = -1;
-    return rc;
+    return rc<0 ? rc : head_status_;
 }
 
 }  /* namespace rad */

@@ -18,6 +18,10 @@
 #include "place/expert_profile_map.h"
 #include "place/native_decode_profile.h"
 #include "format/radfile.h"
+#include "dspark_bank_plan_fixture.h"
+#include "format/dspark_rad_banks.h"
+#include <filesystem>
+#include <stdexcept>
 #include <fstream>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -4763,6 +4767,391 @@ TEST(the_draft_floor_charges_only_the_trunk) {
     /* No drafter: the two floors agree. */
     wf.draft_experts = 0;
     CHECK_EQ(expert_vram_floor_draft_hosted(wf, 80), expert_vram_floor(wf, 80));
+}
+
+namespace {
+Program bank_placement_program(int rank) {
+    Program p = dspark_scope_fixture::make(rank);
+    g_dev_row.info = &g_dev_info;
+    for (auto& op : p.ops) {
+        Band b; b.hi = 1 << 20; b.dom[RAD_DOMAIN_DEVICE].row = &g_dev_row;
+        op.bands.push_back(b);
+        for (auto w : op.weights) {
+            p.weights[w].align = RAD_ALIGN_UNIT;
+            p.weights[w].first_use_op = p.weights[w].last_use_op = op.index;
+        }
+    }
+    WeightInfo trunk;
+    trunk.name = trunk.source = "bank_test.trunk";
+    trunk.decl.dtype = RAD_U8; trunk.decl.rank = 1; trunk.decl.shape[0] = 4096;
+    trunk.decl.access = RAD_ACCESS_PER_TOKEN;
+    trunk.decl.group.layer = 0; trunk.decl.group.expert = -1;
+    trunk.stored_bytes = 4096; trunk.align = RAD_ALIGN_UNIT;
+    trunk.first_use_op = trunk.last_use_op = int(p.ops.size());
+    OpInfo op; op.index = int(p.ops.size()); op.op = "gemm";
+    op.weights.push_back(rad_weight(p.weights.size())); p.weights.push_back(std::move(trunk));
+    Band b; b.hi = 1 << 20; b.dom[RAD_DOMAIN_DEVICE].row = &g_dev_row;
+    op.bands.push_back(b); p.ops.push_back(std::move(op));
+    return p;
+}
+Config bank_placement_config() {
+    Config c; c.deterministic = true; c.placement = "all_vram";
+    c.vram_weights_mib = 8192; c.host_pool_mib = 4096;
+    c.draft_bank = "synthetic-head.rad";
+    c.tp=4;c.max_seqs=1;c.max_tok=16;c.n_spec=5;c.kv_cache_dtype="bf16";
+    return c;
+}
+}
+TEST(dspark_bank_host_placement_charges_existing_pool_and_preserves_trunk_on_all_ranks) {
+    for (int rank = 0; rank < 4; ++rank) {
+        Program prog = bank_placement_program(rank);
+        Config cfg = bank_placement_config();
+        cfg.draft_bank_expert_placement = "host";
+        PlannerInput in{&prog, &cfg, rank, 4, nullptr, 0};
+        Plan p; REQUIRE(Planner(in).plan(&p) == RAD_OK);
+        int64_t charged = 0; int pairs = 0;
+        for (const auto& mu : p.units) {
+            if (mu.layer >= 40 && mu.expert >= 0) {
+                CHECK(mu.tier == Tier::HostPinned); CHECK(mu.site == Site::DeviceZeroCopy);
+                CHECK(mu.host_forced); CHECK(!mu.movable); CHECK_EQ(mu.slab_slot, -1);
+                CHECK_EQ(mu.weights.size(), size_t(2)); charged += mu.slot_bytes; ++pairs;
+                for (auto w : mu.weights) {
+                    CHECK(p.weight[w].tier == Tier::HostPinned);
+                    CHECK(p.weight[w].site == Site::DeviceZeroCopy);
+                }
+            } else {
+                CHECK(mu.tier == Tier::VRAM); CHECK(!mu.host_forced);
+            }
+        }
+        CHECK_EQ(pairs, 96); CHECK(charged >= int64_t(1804861440));
+        CHECK_EQ(p.host_budget, int64_t(4096) * MiB - charged);
+        CHECK_EQ(cfg.host_pool_mib, int64_t(4096));
+    }
+}
+TEST(dspark_bank_default_does_not_force_or_charge_host_experts) {
+    Program prog = bank_placement_program(0); Config cfg = bank_placement_config();
+    CHECK(cfg.draft_bank_expert_placement == "auto");
+    PlannerInput in{&prog, &cfg, 0, 4, nullptr, 0}; Plan p;
+    REQUIRE(Planner(in).plan(&p) == RAD_OK);
+    CHECK_EQ(p.host_budget, int64_t(4096) * MiB);
+    for (const auto& mu : p.units) { CHECK(mu.tier == Tier::VRAM); CHECK(!mu.host_forced); }
+}
+TEST(dspark_bank_host_refuses_insufficient_budget_without_partial_pinning_or_growth) {
+    Program prog = bank_placement_program(0); Config cfg = bank_placement_config();
+    cfg.draft_bank_expert_placement = "host"; cfg.host_pool_mib = 128;
+    PlannerInput in{&prog, &cfg, 0, 4, nullptr, 0}; Plan p;
+    CHECK_EQ(Planner(in).plan(&p), RAD_E_NOMEM);
+    CHECK_EQ(cfg.host_pool_mib, int64_t(128)); CHECK_EQ(p.host_budget, int64_t(128) * MiB);
+    for (const auto& mu : p.units) CHECK(!mu.host_forced);
+}
+TEST(dspark_bank_host_refuses_wrong_declaration_and_missing_bank) {
+    for (int bad = 0; bad < 4; ++bad) {
+        Program prog = bank_placement_program(0); Config cfg = bank_placement_config();
+        cfg.draft_bank_expert_placement = "host";
+        if (bad == 0) cfg.draft_bank.clear();
+        if (bad == 1) prog.ctx.max_spec = 4;
+        if (bad == 2) prog.weights[1].layout_tag = "other";
+        if (bad == 3) prog.ops.front().bands.clear();
+        PlannerInput in{&prog, &cfg, 0, 4, nullptr, 0}; Plan p;
+        CHECK_EQ(Planner(in).plan(&p), RAD_E_UNSUPPORTED);
+        for (const auto& mu : p.units) CHECK(!mu.host_forced);
+    }
+}
+
+namespace {
+/* Real ordinary files + actual HOST Mover transport; synthetic group attributes deliberately
+ * differ from native DSpark. This proves only source ownership/IO/cache publication, not a full
+ * donor, learned MTP, native math or a TP4 model. No finish_coverage bypass exists in Engine. */
+struct BankIoTemp {
+    std::string dir;
+    BankIoTemp() {
+        std::string pattern = radtest::tmpdir() + "/bank-mover-XXXXXX";
+        char* got = ::mkdtemp(pattern.data());
+        if (!got) throw std::runtime_error("bank Mover mkdtemp");
+        dir = got;
+    }
+    ~BankIoTemp() { std::error_code ec; std::filesystem::remove_all(dir, ec); }
+    std::string path(const char* name) const { return dir + "/" + name; }
+};
+void bank_io_good(int st) { if (st != RAD_OK) throw std::runtime_error(rad_strerror(st)); }
+void bank_io_metadata(RadWriter& w) {
+    w.set_arch("deepseek41"); w.set_model_name("synthetic-bank-Mover"); w.set_quant("");
+    w.meta_i("n_layers",40); w.meta_i("n_embd",5120); w.meta_i("n_ff",2304);
+    w.meta_i("n_expert",384); w.meta_i("n_expert_used",6); w.meta_i("n_vocab",129280);
+    w.meta_i("num_nextn_predict_layers",3); w.meta_i("dspark_block_size",5);
+    w.meta_i("dspark_n_routed_experts",128); w.meta_i("dspark_num_experts_per_tok",3);
+}
+void bank_io_add(RadWriter& writer, const std::string& name, const std::vector<uint8_t>& bytes) {
+    RadWriter::Weight w; w.name = name; w.enc = rad_enc_plain(RAD_U8);
+    w.rank = 1; w.shape[0] = int64_t(bytes.size());
+    const void* planes[] = {bytes.data()};
+    if (writer.add_weight(w, planes) < 0) throw std::runtime_error("bank Mover write tiny weight");
+}
+struct BankIoFixture {
+    BankIoTemp temp;
+    Fixture f;
+    RadFile main, donor;
+    DsparkRadBanks banks;
+    std::vector<std::vector<uint8_t>> payload;
+    Plan plan;
+    BankIoFixture() {
+        build_moe_layers(f,3,2,768*KiB+17,256*KiB-17);
+        payload.resize(f.prog.weights.size());
+        for (size_t h=1;h<f.prog.weights.size();++h) {
+            auto& w=f.prog.weights[h];
+            const bool draft=w.decl.group.expert>=0&&(w.decl.group.expert&1);
+            w.source=draft?"dspark.synthetic."+w.name:w.name;
+            w.enc=rad_enc_plain(RAD_U8); w.stored_bytes=w.logical_bytes;
+            w.n_sel=1; w.sel[0]=0; w.sel_rows[0]=1; w.sel_cols[0]=w.stored_bytes;
+            payload[h].resize(size_t(w.stored_bytes));
+            for(size_t j=0;j<payload[h].size();++j)
+                payload[h][j]=uint8_t(container_byte(int64_t(j)+int64_t(h)*1048583)^(draft?0xa5:0x3c));
+        }
+        {
+            RadWriter writer; bank_io_good(writer.begin(temp.path("main.rad").c_str()));
+            bank_io_metadata(writer);
+            for(size_t h=1;h<f.prog.weights.size();++h) {
+                const auto& w=f.prog.weights[h];
+                if(w.decl.group.expert<0||!(w.decl.group.expert&1))bank_io_add(writer,w.source,payload[h]);
+            }
+            bank_io_good(writer.finish()); bank_io_good(main.open(temp.path("main.rad").c_str()));
+        }
+        {
+            RadWriter writer; bank_io_good(writer.begin(temp.path("draft.rad").c_str()));
+            bank_io_metadata(writer); std::string digest;
+            bank_io_good(DsparkRadBanks::metadata_digest(main,&digest));
+            writer.meta_i("draft_bank.version",1); writer.meta_s("draft_bank.kind","deepseek41.dspark");
+            writer.meta_s("draft_bank.parent_metadata_sha256",digest);
+            writer.meta_i("draft_bank.parent_file_bytes",main.size());
+            writer.meta_s("draft_bank.parent_payload_sha256",std::string(64,'a'));
+            writer.meta_s("draft_bank.source_identity","synthetic-only-not-a-model-payload-proof");
+            bank_io_add(writer,"dspark.synthetic.padding",payload[1]); // same plane alignment as canonical embedding
+            for(size_t h=1;h<f.prog.weights.size();++h) {
+                const auto& w=f.prog.weights[h];
+                if(w.decl.group.expert>=0&&(w.decl.group.expert&1))bank_io_add(writer,w.source,payload[h]);
+            }
+            bank_io_good(writer.finish()); bank_io_good(donor.open(temp.path("draft.rad").c_str()));
+        }
+        bank_io_good(banks.bind(main,&donor)); bank_io_good(banks.bind_weights(f.prog.weights));
+        for(size_t h=1;h<f.prog.weights.size();++h) {
+            auto& w=f.prog.weights[h]; DsparkRadBanks::Entry src;
+            bank_io_good(banks.bound(w,&src));
+            w.file_offset=src.file->plane(*src.entry,0).offset;
+            w.file_plane_offset[0]=w.file_offset;
+        }
+        Config cfg=base_config(); cfg.placement="expert_tiered";cfg.deterministic=true;
+        cfg.vram_weights_mib=6;cfg.host_pool_mib=133;cfg.weights_disk_tier=true;
+        PlannerInput in{&f.prog,&cfg,0,1,nullptr,0};
+        bank_io_good(Planner(in).plan(&plan));
+    }
+    std::vector<int32_t> pair() const {
+        for(int layer=0;layer<3;++layer) {
+            std::vector<int32_t> units;
+            for(size_t u=0;u<plan.units.size();++u)
+                if(plan.units[u].layer==layer&&plan.units[u].expert>=0&&plan.units[u].tier==Tier::SSD)
+                    units.push_back(int32_t(u));
+            if(units.size()==2)return units;
+        }
+        throw std::runtime_error("bank Mover fixture requires actual two-owner SSD pair");
+    }
+};
+struct BankIoTransport {
+    // The owners in BankIoFixture outlive this whole stream/Mover scope.
+    RadStream compute=nullptr; RadEvent done=nullptr; std::unique_ptr<Mover> mover;
+    ~BankIoTransport() {
+        if(mover&&mover->transfer_stream()&&rad_stream_sync(mover->transfer_stream())<0)std::abort();
+        if(compute&&rad_stream_sync(compute)<0)std::abort();
+        mover.reset(); if(done)rad_event_destroy(done); if(compute)rad_stream_destroy(compute);
+    }
+    void start(BankIoFixture& f,int64_t cache) {
+        bank_io_good(rad_stream_create(&compute,0)); bank_io_good(rad_event_create(&done));
+        mover=std::make_unique<Mover>(); MoverConfig c;
+        c.container_path=f.main.path();c.source_banks=&f.banks;c.native_file_cache_bytes=cache;
+        bank_io_good(mover->init(f.f.prog,f.plan,c));
+        bank_io_good(mover->bind_compute_stream(compute));
+    }
+    void pass(BankIoFixture& f,const std::vector<int32_t>& units,NativeFileCacheReadPolicy policy=NativeFileCacheReadPolicy::Normal) {
+        std::vector<int32_t> staged;
+        bank_io_good(mover->stage_file_units(units,mover->file_buffer(0),mover->file_buffer_bytes(),nullptr,done,&staged,policy));
+        REQUIRE(staged==units); bank_io_good(rad_event_wait(compute,done));
+        for(auto u:units)for(auto h:f.plan.units[size_t(u)].weights) {
+            const auto* slot=mover->residency()->lookup(h); REQUIRE(slot&&slot->ptr);
+            std::vector<uint8_t> got(f.payload[h].size());
+            bank_io_good(rad_memcpy_async(got.data(),slot->ptr,int64_t(got.size()),compute));
+            bank_io_good(rad_stream_sync(compute)); CHECK(got==f.payload[h]);
+        }
+        bank_io_good(rad_stream_sync(mover->transfer_stream()));
+        mover->unstage_units(staged);
+    }
+};
+struct BankIoLegacyCacheEnv {
+    const char* key="RADIANCE_EXPERIMENTAL_NATIVE_CACHE_MAPPED_SOURCE";
+    bool present; std::string old;
+    BankIoLegacyCacheEnv():present(std::getenv(key)!=nullptr),old(present?std::getenv(key):"") {
+        if(::setenv(key,"0",1))throw std::runtime_error("bank fixture cache selection");
+    }
+    ~BankIoLegacyCacheEnv() { if(present)::setenv(key,old.c_str(),1);else ::unsetenv(key); }
+};
+void bank_io_case(bool cached) {
+    REQUIRE(device_is_host());
+    BankIoLegacyCacheEnv legacy; // explicit legacy-cache control; mapped-native shape proof is separate
+
+    BankIoFixture f; const auto units=f.pair();
+    const auto& a=f.plan.units[size_t(units[0])];const auto& b=f.plan.units[size_t(units[1])];
+    REQUIRE_EQ(f.f.prog.weights[a.weights[0]].file_id,uint32_t(0));
+    REQUIRE_EQ(f.f.prog.weights[b.weights[0]].file_id,uint32_t(1));
+    // Equal numeric file offsets from different immutable owners must never be coalesced or aliased.
+    REQUIRE_EQ(f.f.prog.weights[a.weights[0]].file_offset,f.f.prog.weights[b.weights[0]].file_offset);
+    BankIoTransport t;t.start(f,cached?4*MiB:0);
+    t.pass(f,units);const auto before=t.mover->stats();
+    t.pass(f,units,cached?NativeFileCacheReadPolicy::ReadOnly:NativeFileCacheReadPolicy::Normal);
+    if(cached)CHECK_EQ(t.mover->stats().file_prefill_ro_hits-before.file_prefill_ro_hits,uint64_t(4));
+    else CHECK(t.mover->stats().file_preads>before.file_preads);
+    if(cached) {
+        const auto old=t.mover->stats();
+        const int fd=::open(f.donor.path(),O_WRONLY|O_CLOEXEC);REQUIRE(fd>=0);
+        const int changed=::ftruncate(fd,off_t(f.donor.size()+1));const int closed=::close(fd);
+        REQUIRE_EQ(changed,0);REQUIRE_EQ(closed,0);
+        std::vector<int32_t> staged;
+        CHECK_EQ(t.mover->stage_file_units({units[0]},t.mover->file_buffer(0),t.mover->file_buffer_bytes(),nullptr,t.done,&staged),RAD_E_STATE);
+        CHECK_EQ(t.mover->stats().h2d_bytes,old.h2d_bytes); CHECK(staged.empty());
+    }
+}
+}
+TEST(dspark_two_bank_actual_HOST_mover_direct_extents_keep_equal_offsets_separate) { bank_io_case(false); }
+TEST(dspark_two_bank_actual_HOST_mover_cache_hit_checks_donor_epoch_for_main_source) { bank_io_case(true); }
+TEST(dspark_two_bank_actual_HOST_mover_refuses_wrong_open_owner_and_stale_generation) {
+    REQUIRE(device_is_host()); BankIoFixture f;
+    {
+        Mover m;MoverConfig c;c.container_path=f.donor.path();c.source_banks=&f.banks;
+        CHECK_EQ(m.init(f.f.prog,f.plan,c),RAD_E_STATE);
+    }
+    auto& w=f.f.prog.weights[1];++w.source_bank_generation;
+    Mover m;MoverConfig c;c.container_path=f.main.path();c.source_banks=&f.banks;
+    CHECK_EQ(m.init(f.f.prog,f.plan,c),RAD_E_STATE);
+}
+
+namespace {
+//Pure actual Planner regression: native-sized metadata only, no allocations or payload IO.
+//The forced heads deliberately retain identity=false/no-relayout, so losing their
+//preplacement cannot silently fall back to a synthetic SSD encoding.
+Program bank_expert_tiered_program(int rank) {
+    Program p = bank_placement_program(rank);
+    for (int layer=0; layer<40; ++layer) for (int slot=0; slot<2; ++slot) {
+        OpInfo op; op.op="moe_gemm_ggml"; op.index=int32_t(p.ops.size());
+        op.base.set_i("n_expert",96); op.base.set_i("top_k",6);
+        op.base.set_i("N",slot?5120:4608); op.base.set_i("K",slot?2304:5120);
+        op.base.set_s("type","mxfp4"); op.base.set_s("dtype","bf16");
+        op.base.set_s("a_order",slot?"sorted":"token");
+        Band band; band.hi=1<<20; band.dom[RAD_DOMAIN_DEVICE].row=&g_dev_row;
+        op.bands.push_back(band);
+        for (int expert=0; expert<96; ++expert) {
+            WeightInfo w;
+            w.name=w.source="blk."+std::to_string(layer)+
+                (slot?".ffn_down_exps.":".ffn_gate_up_exps.")+std::to_string(rank*96+expert)+".weight";
+            w.decl.dtype=RAD_U8; w.decl.rank=2;
+            w.decl.shape[0]=slot?5120:4608; w.decl.shape[1]=slot?2304:5120;
+            w.decl.access=RAD_ACCESS_CONDITIONAL; w.decl.shard=RAD_SHARD_NONE;
+            w.decl.group.layer=layer; w.decl.group.expert=expert; w.decl.group.slot=slot;
+            w.stored_bytes=slot?6266880:12533760; w.align=RAD_ALIGN_UNIT;
+            w.layout_tag="ggml_mxfp4"; w.identity=true;
+            w.first_use_op=w.last_use_op=op.index;
+            op.weights.push_back(rad_weight(p.weights.size())); p.weights.push_back(std::move(w));
+        }
+        p.ops.push_back(std::move(op));
+    }
+    return p;
+}
+Config bank_expert_tiered_config() {
+    Config cfg=bank_placement_config();
+    cfg.placement="expert_tiered"; cfg.vram_weights_mib=4096;
+    cfg.host_pool_mib=4096; cfg.weights_disk_tier=true;
+    cfg.draft_bank_expert_placement="host";
+    return cfg;
+}
+void check_bank_expert_tiered_forced_heads(const Program& prog,const Config& cfg,const Plan& p) {
+    constexpr int64_t P=18800640;
+    int heads=0,main_vram=0,main_pinned=0,main_ssd=0;
+    int64_t head_bytes=0;
+    CHECK(p.strategy==Strategy::ExpertTiered); CHECK(!p.dynamic); CHECK(p.fits());
+    for (const auto&mu:p.units) {
+        if (mu.expert<0) continue;
+        if (mu.layer>=40) {
+            ++heads; head_bytes+=mu.slot_bytes;
+            CHECK(mu.layer<43); CHECK(mu.expert>=0&&mu.expert<32);
+            CHECK(mu.host_forced); CHECK(mu.preplaced()); CHECK(!mu.movable);
+            CHECK(mu.tier==Tier::HostPinned); CHECK(mu.site==Site::DeviceZeroCopy);
+            CHECK_EQ(mu.slab_slot,-1); CHECK_EQ(mu.slot_bytes,P); CHECK_EQ(mu.weights.size(),size_t(2));
+            for (auto h:mu.weights) {
+                CHECK(prog.weights[h].decl.access==RAD_ACCESS_CONDITIONAL);
+                CHECK(!prog.weights[h].identity); //not a file-tier escape hatch
+                CHECK(p.weight[h].tier==Tier::HostPinned);
+                CHECK(p.weight[h].site==Site::DeviceZeroCopy);
+            }
+        } else {
+            CHECK(!mu.host_forced);
+            if (mu.tier==Tier::VRAM) ++main_vram;
+            else if (mu.tier==Tier::HostPinned) ++main_pinned;
+            else if (mu.tier==Tier::SSD) ++main_ssd;
+            else CHECK(false);
+        }
+    }
+    CHECK_EQ(heads,96); CHECK_EQ(head_bytes,96*P); CHECK_EQ(p.forced_host_used,96*P);
+    CHECK_EQ(main_vram+main_pinned+main_ssd,40*96);
+    CHECK(main_vram>0); CHECK(main_pinned>0); CHECK(main_ssd>0);
+    CHECK(p.file_layer_max>0); CHECK(p.file_stage_vram>0);
+    CHECK_EQ(p.host_budget,cfg.host_pool_mib*MiB-p.file_stage_reserve-96*P);
+    CHECK(p.totals.bytes[int(Tier::HostPinned)]+p.file_stage_reserve<=cfg.host_pool_mib*MiB);
+    CHECK(p.totals.bytes[int(Tier::VRAM)]+p.slab_overhead+p.file_stage_vram<=cfg.vram_weights_mib*MiB);
+    CHECK_EQ(cfg.host_pool_mib,int64_t(4096));
+}
+}
+TEST(dspark_bank_expert_tiered_preserves_forced_heads_with_SSD_trunk_all_ranks) {
+    for (int rank=0; rank<4; ++rank) {
+        Program prog=bank_expert_tiered_program(rank); Config cfg=bank_expert_tiered_config();
+        PlannerInput input{&prog,&cfg,rank,4,nullptr,0}; input.container=true;
+        Plan p; REQUIRE(Planner(input).plan(&p)==RAD_OK);
+        check_bank_expert_tiered_forced_heads(prog,cfg,p);
+    }
+}
+TEST(dspark_bank_expert_tiered_hot_head_profile_cannot_override_forced_placement) {
+    for (int rank=0; rank<4; ++rank) {
+        Program prog=bank_expert_tiered_program(rank); Config cfg=bank_expert_tiered_config();
+        PlannerInput input{&prog,&cfg,rank,4,nullptr,0}; input.container=true;
+        Plan cold; REQUIRE(Planner(input).plan(&cold)==RAD_OK);
+        std::vector<RadFileProfile> only_heads;
+        for (int layer=40;layer<43;++layer) for (int expert=0;expert<32;++expert) {
+            RadFileProfile row{}; row.layer=layer; row.expert=expert; row.share=1.0f/32.0f;
+            only_heads.push_back(row);
+        }
+        input.profile=only_heads.data(); input.n_profile=int64_t(only_heads.size());
+        Plan hot; REQUIRE(Planner(input).plan(&hot)==RAD_OK);
+        check_bank_expert_tiered_forced_heads(prog,cfg,hot);
+        REQUIRE(cold.units.size()==hot.units.size());
+        for (size_t u=0;u<cold.units.size();++u) {
+            CHECK(cold.units[u].tier==hot.units[u].tier); CHECK(cold.units[u].site==hot.units[u].site);
+            CHECK_EQ(cold.units[u].movable,hot.units[u].movable);
+            CHECK_EQ(cold.units[u].host_forced,hot.units[u].host_forced);
+            if (hot.units[u].layer>=40) CHECK_EQ(hot.units[u].profile_share,1.0f/32.0f);
+        }
+        CHECK_EQ(cold.host_budget,hot.host_budget); CHECK_EQ(cold.file_layer_max,hot.file_layer_max);
+        CHECK_EQ(cold.file_stage_vram,hot.file_stage_vram);
+    }
+}
+
+TEST(dspark_bank_manual_collision_refuses_before_any_direct_plan_or_budget_mutation) {
+    Program prog=bank_placement_program(0);
+    for(bool explicit_auto : {false,true}) {
+        Config cfg=bank_placement_config();cfg.draft_bank_expert_placement="host";
+        cfg.draft_expert_placement=explicit_auto?"auto":"host";
+        cfg.draft_expert_placement_given=explicit_auto;
+        Plan out;out.host_budget=123;out.vram_budget=456;out.notes.push_back("unchanged");
+        PlannerInput in{&prog,&cfg,0,4,nullptr,0};
+        CHECK_EQ(Planner(in).plan(&out),RAD_E_INVAL);
+        CHECK_EQ(out.host_budget,int64_t(123));CHECK_EQ(out.vram_budget,int64_t(456));
+        CHECK(out.units.empty());CHECK_EQ(out.notes.size(),size_t(1));CHECK(out.notes[0]=="unchanged");
+        CHECK_EQ(cfg.host_pool_mib,int64_t(4096));
+    }
 }
 
 RAD_TEST_MAIN()

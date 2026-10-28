@@ -7,6 +7,13 @@ Included optimizations: selected native expert reads, retained mapped RAM
 slabs, SSE2 expert repacking, and live-tail padding skips. Existing defaults
 remain unchanged. Experimental switches require explicit opt-in.
 
+This branch also includes an experimental missing-only DSpark RAD bank loader
+and converter, explicit pinned-host placement for the three draft heads, and
+an optional head cache that borrows spare space in existing file buffers.
+The canonical model metadata is preserved. The loader validates both files'
+identity and ownership; manual generic and bank-specific draft placement modes
+cannot be combined. Final head placement is checked after the placement strategy.
+
 Validated on four RX 9070 XT cards: TP4 exact, one sequence, context 512,
 M16, 80 GiB host expert cache and a separately calibrated placement profile.
 The eight-request model checks preserved complete reply choices. Retained
@@ -19,7 +26,7 @@ not established. Tiny numerical and transport checks were also run.
 Those GPU measurements used a freshly built Core with separately linked,
 compatible kernel objects, before the latest upstream source merge.
 
-The complete merged checkout now builds with RAD_WITH_HIP=OFF and
+Before the bank/head port, base commit 64f09436 built with RAD_WITH_HIP=OFF and
 RAD_WITH_FFMPEG=OFF. Of 97 fast CPU test targets, 95 passed. The two failures
 are images_test and videos_test: their media success paths require FFmpeg,
 which was disabled in this build. The original failing receipts are preserved;
@@ -29,7 +36,16 @@ checkpoint, configuration, conversion, scheduler and ABI checks passed.
 The latest merge includes upstream placement, prefix and hc_read improvements.
 It also fixes expert-pin-top for normalized profile shares and rejects non-finite
 fractions, with regression coverage. It has not been GPU-benchmarked.
-No learned DSpark MTP or second model bank is included yet.
+
+The bank/head port is applied here but has not yet been built or tested on this
+branch. A separate frozen Core completed two 64-token learned-MTP replies with
+all 128 token IDs matching the target reference. With depth five and final head
+placement verified, it measured 4.62 tokens/s using a 72 GiB RAM expert cache,
+6144 MiB pinned pool per rank, M16 and context 512. The optional head cache
+measured 4.70 tokens/s in one ordered pair; it remains off by default. These
+figures are not a matched MTP-off comparison with the earlier 5.36 tokens/s run.
+Runtime depth controls and the new sparse-GEMV/WMMA experiments are not ported
+to this branch yet.
 
 No model weights, checkpoint data, deployment credentials or local runtime
 receipts are included. The production QFN service has not been upgraded.

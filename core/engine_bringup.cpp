@@ -23,6 +23,7 @@
 #include "mem/vram_budget.h"
 #include "place/expert_profile_map.h"
 #include "place/native_decode_profile.h"
+#include "place/dspark_native_scope.h"
 #include "kvstream/bringup.h"
 #include "kvstream/plan.h"
 #include "runtime/arena.h"
@@ -413,8 +414,9 @@ static int64_t lockable_bytes(int64_t still, int64_t margin, std::string* limit)
 /* The copy is table_copy_make's (core/format/table_copy.h), or for a card, table_copy_fill into
  * pinned memory every card maps (rad_dev_alloc RAD_MEM_HOST_MAPPED, locked in pieces). One copy
  * per container address, shared by every rank; freed in ~Engine. */
-int Engine::copy_table(const uint8_t* src, int64_t n, int64_t foff, bool card, void** out,
+int Engine::copy_table(const RadFile& owner,const uint8_t* src, int64_t n, int64_t foff, bool card, void** out,
                        std::string* why) {
+    if(source_banks_&&!source_banks_->same_epoch())return RAD_E_STATE;
     for (const auto& c : table_copy_of_)
         if (c.first == src) { *out = c.second; return RAD_OK; }
     const auto t0 = std::chrono::steady_clock::now();
@@ -425,7 +427,7 @@ int Engine::copy_table(const uint8_t* src, int64_t n, int64_t foff, bool card, v
             *why = fmt("pinning %s: %s", humanb(n).c_str(), rad_dev_last_error());
             return RAD_E_NOMEM;
         }
-        const int rc = table_copy_fill(*file_, src, n, foff, static_cast<uint8_t*>(base), why);
+        const int rc = table_copy_fill(owner, src, n, foff, static_cast<uint8_t*>(base), why);
         if (rc != RAD_OK) {
             rad_dev_free(base, RAD_MEM_HOST_MAPPED);
             return rc;
@@ -433,7 +435,7 @@ int Engine::copy_table(const uint8_t* src, int64_t n, int64_t foff, bool card, v
         card_copies_.push_back(base);
     } else {
         TableCopy tc;
-        const int rc = table_copy_make(*file_, src, n, foff, &tc, why);
+        const int rc = table_copy_make(owner, src, n, foff, &tc, why);
         if (rc != RAD_OK) return rc;
         table_copies_.push_back(tc);
         base = tc.base;
@@ -441,6 +443,7 @@ int Engine::copy_table(const uint8_t* src, int64_t n, int64_t foff, bool card, v
     RAD_INFO("placement: n-gram table copied into %s, %s in %.1f s",
              card ? "pinned memory the cards read" : "locked memory", humanb(n).c_str(),
              std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    if(source_banks_&&!source_banks_->same_epoch())return RAD_E_STATE;
     table_copy_of_.push_back({ src, base });
     *out = base;
     return RAD_OK;
@@ -722,18 +725,39 @@ bool is_container(const std::string& path) {
 
 }  /* namespace */
 
+const RadFileEntry* Engine::source_entry(const std::string& name) const {
+    if(source_banks_){DsparkRadBanks::Entry ref;return source_banks_->find(name,&ref)==RAD_OK?ref.entry:nullptr;}
+    return file_?file_->find(name):nullptr;
+}
 WeightSourceFn Engine::sources() const {
+    if (source_banks_) return source_banks_->sources();
     if (file_) return rad_container_sources(*file_);
     return ckpt_src_ ? ckpt_src_->fn() : WeightSourceFn{};
 }
 
 int Engine::read_metadata() {
-    if (!is_container(cfg_.model)) return read_checkpoint_metadata();
+    if(cfg_.draft_bank_expert_placement=="host"&&cfg_.draft_bank.empty()){
+        RAD_ERR("--draft-bank-expert-placement host requires --draft-bank");return RAD_E_INVAL;
+    }
+    if (!is_container(cfg_.model)) {
+        if(!cfg_.draft_bank.empty()){RAD_ERR("--draft-bank requires an ordinary canonical .rad");return RAD_E_INVAL;}
+        return read_checkpoint_metadata();
+    }
     file_ = std::make_unique<RadFile>();
     RAD_TRY(file_->open(cfg_.model.c_str()));
+    if(!cfg_.draft_bank.empty()){
+        const char* opt=std::getenv("RADIANCE_EXPERIMENTAL_DS41_DSPARK_RAD_BANK");
+        if(!opt||std::strcmp(opt,"1")||cfg_.tp!=4||cfg_.max_seqs!=1||cfg_.max_tok<5||cfg_.n_spec!=5||cfg_.spec_ngram!=0||cfg_.kv_cache_dtype!="bf16"){
+            RAD_ERR("--draft-bank first scope requires opt-in, EP4, one sequence, batch>=5, depth5, lookup0 and BF16 KV");return RAD_E_INVAL;}
+        draft_file_=std::make_unique<RadFile>();RAD_TRY(draft_file_->open(cfg_.draft_bank.c_str()));
+        source_banks_=std::make_unique<DsparkRadBanks>();std::string why;
+        const int st=source_banks_->bind(*file_,draft_file_.get(),&why);
+        if(st<0){RAD_ERR("--draft-bank binding refused: %s",why.c_str());return st;}
+    }
+
     /* What an earlier run left cached of the container, recorded before anything here allocates,
      * for the mapped tier's rewarm after the load (RadFile::rewarm). */
-    if (cfg_.mapped_rewarm) file_->snapshot_resident();
+    if (cfg_.mapped_rewarm) {file_->snapshot_resident();if(draft_file_)draft_file_->snapshot_resident();}
 
     const RadFileHeader& h = file_->header();
     meta_ = RadModelMeta{};
@@ -1369,6 +1393,16 @@ int Engine::declare() {
         }
     }
     for (size_t i = 0; i < st.size(); ++i) if (st[i] < 0) return st[i];
+    if(source_banks_){
+        std::set<int64_t> consumed;
+        for(auto&r:ranks_){
+            if(!dspark_native_program_scope(r->program)){RAD_ERR("--draft-bank requires the exact native DSpark three-stage declaration");return RAD_E_UNSUPPORTED;}
+            RAD_TRY(source_banks_->bind_weights(r->program.weights,&consumed));
+        }
+        RAD_TRY(source_banks_->finish_coverage(consumed));
+        RAD_INFO("DSpark draft bank: canonical metadata unchanged; %zu donor entries bound across %zu rank declarations",consumed.size(),ranks_.size());
+    }
+
     RAD_INFO("declare: %zu ops, %zu weights, %zu buffers, %zu KV groups",
              ranks_[0]->program.ops.size() - 1, ranks_[0]->program.weights.size() - 1,
              ranks_[0]->program.buffers.size() - 1, ranks_[0]->program.kv_groups.size());
@@ -2006,7 +2040,7 @@ int Engine::plan() {
         // The tested adapter resolves every GU/DN contributor through WeightInfo.source.
         if (in.n_profile && file_ && meta_.arch_id && !std::strcmp(meta_.arch_id, "deepseek41")) {
             const auto mapped = local_expert_profile(r->program.weights,
-                [&](const std::string& source) { return file_->find(source); },
+                [&](const std::string& source) { return source_entry(source); },
                 in.profile, in.n_profile, meta_.n_layers, meta_.n_expert, &rank_profile);
             if (mapped != ExpertProfileMapStatus::Complete ||
                 (!decode_profile.rows.empty() && rank_profile.size() != 40 * 96)) {
@@ -2062,7 +2096,7 @@ int Engine::plan() {
                 for (const auto weight : unit.weights) {
                     if (weight <= 0 || (size_t)weight >= r->program.weights.size()) { valid = false; break; }
                     const auto& wi = r->program.weights[(size_t)weight];
-                    const auto* entry = file_->find(wi.source);
+                    const auto* entry = source_entry(wi.source);
                     if (!entry || entry->layer != unit.layer || entry->expert < 0 || entry->expert >= 384 ||
                         (global >= 0 && global != entry->expert)) { valid = false; break; }
                     global = entry->expert;
@@ -2591,8 +2625,10 @@ private:
 static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
                            const std::vector<int>& devices, RelayoutPool* pool,
                            int64_t* read_out,
-                           const std::vector<std::pair<int64_t, int64_t>>& keep_cached) {
+                           const std::vector<std::pair<int64_t, int64_t>>& keep_cached,
+                           const DsparkRadBanks* banks=nullptr,uint32_t bank=0,int64_t* rewarm_remaining=nullptr) {
     *read_out = 0;
+    if(banks&&!banks->same_epoch())return RAD_E_STATE;
     if (runs.empty()) return RAD_OK;
 
     /* Sort by file offset into a reading order; the span tie-break makes the order total, so the
@@ -2655,6 +2691,7 @@ static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
          * runs do, so a window is read from the block below the chunk to the block above it (two
          * blocks wider). A filesystem that refuses O_DIRECT is read buffered. */
         RAD_TRY(dio.open(file->path(), RAD_DIO_READ | RAD_DIO_ALLOW_BUFFERED));
+        if(banks)RAD_TRY(banks->direct_owner_matches(bank,dio.fd()));
         for (int b = 0; b < kWin; ++b) {
             buf[b] = rad_dev_alloc(window + 2 * kBlk, RAD_MEM_HOST_PINNED);
             if (!buf[b]) {
@@ -2838,7 +2875,9 @@ static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
             std::fclose(mi);
         }
         const auto w0 = std::chrono::steady_clock::now();
-        const int64_t asked = file->rewarm(keep_cached, avail / 2);
+        const int64_t limit=rewarm_remaining?std::min(avail/2,*rewarm_remaining):avail/2;
+        const int64_t asked = file->rewarm(keep_cached,limit);
+        if(rewarm_remaining)*rewarm_remaining=std::max<int64_t>(0,*rewarm_remaining-asked);
         if (asked > 0)
             RAD_INFO("mapped tier: asked the page cache again for %s an earlier run had cached (%.0f ms; "
                      "--mapped-rewarm off turns it off)", humanb(asked).c_str(),
@@ -2850,6 +2889,7 @@ static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
     for (size_t k = 0; k < ev.size(); ++k) if (ev[k]) rad_event_destroy(ev[k]);
     for (size_t k = 0; k < nr; ++k) if (st[k]) rad_stream_destroy(st[k]);
     *read_out = read_bytes;
+    if(banks&&!banks->same_epoch())return RAD_E_STATE;
     return rc;
 }
 
@@ -2906,13 +2946,13 @@ int Engine::load_weights() {
     int64_t total = 0, n_loaded = 0, n_missing = 0;
     /* Counted apart from `n_loaded`: mapped weights are published in place, not loaded. */
     int64_t n_mapped = 0, mapped_bytes = 0;
-    std::vector<std::pair<int64_t, int64_t>> mapped_ranges;   /* kept cached by the sweep's drop */
+    std::array<std::vector<std::pair<int64_t, int64_t>>,2> mapped_ranges;   /* kept cached by the sweep's drop */
 
     /* Two phases. The walk decides which rank wants which bytes, where they land, and what is
      * refused, without touching the disk; sweep_container then reads the container once in file
      * order (reading per rank in declaration order would run far below the sequential rate and
      * read replicated weights once per rank). */
-    std::vector<LoadRun> runs;
+    std::array<std::vector<LoadRun>,2> bank_runs;
     std::vector<StagedWeight> staged;
     int64_t n_out = 0;      /* destination overruns reported, capped */
 
@@ -2928,6 +2968,7 @@ int Engine::load_weights() {
         MoverConfig mc{};
         mc.native_cache_allocation_device = r->device;
         mc.container_path = file_ ? cfg_.model : std::string();
+        mc.source_banks = source_banks_.get();
         if (cfg_.expert_ram_cache_total_mib > 0) {
             const int64_t MiB = (int64_t)1 << 20;
             if (cfg_.tp <= 0 || cfg_.expert_ram_cache_total_mib > INT64_MAX / MiB)
@@ -2983,13 +3024,18 @@ int Engine::load_weights() {
         /* And every source range must lie inside its plane. Offsets depend on the rank index
          * (rank 0 always starts at the plane's start, so it never exercises the arithmetic), and
          * an overrun would read the wrong weight. */
-        const int64_t file_bytes = file_ ? file_->size() : 0;
 
         for (size_t i = 1; i < r->program.weights.size(); ++i) {
             WeightInfo& w = r->program.weights[i];
             /* The planes' source: a container entry or the checkpoint tensors declare resolved,
              * giving the encoding and logical shape the share is cut in. */
-            const RadFileEntry* e = file_ ? file_->find(w.source) : nullptr;
+            const RadFile* source=file_.get();
+            const RadFileEntry* e=nullptr;
+            if(source_banks_){
+                if(w.decl.optional&&w.source_entry_index<0)continue;
+                DsparkRadBanks::Entry ref;RAD_TRY(source_banks_->bound(w,&ref));source=ref.file;e=ref.entry;
+            }else e=source?source->find(w.source):nullptr;
+            const int64_t file_bytes=source?source->size():0;
             const CkptWeight* cw = ckpt_src_ ? ckpt_src_->find(w.source) : nullptr;
             if (!e && !cw) {
                 if (w.decl.optional) continue;
@@ -3003,7 +3049,7 @@ int Engine::load_weights() {
                 ++n_missing;
                 continue;
             }
-            const RadEncoding& src_enc = e ? file_->encoding(*e) : cw->enc;
+            const RadEncoding& src_enc = e ? source->encoding(*e) : cw->enc;
             const uint32_t src_rank = e ? e->rank : cw->rank;
             const int64_t* src_shape = e ? e->shape : cw->shape;
 
@@ -3028,22 +3074,22 @@ int Engine::load_weights() {
             w.tier        = r->plan.weight[i].tier;
             w.site        = r->plan.weight[i].site;
             w.slab_slot   = r->plan.weight[i].slab_slot;
-            w.file_offset = e ? file_->plane(*e, w.sel[0]).offset : 0;
+            w.file_offset = e ? source->plane(*e, w.sel[0]).offset : 0;
             for (int k = 0; k < w.n_sel && e; ++k)
-                w.file_plane_offset[k] = file_->plane(*e, w.sel[k]).offset;
+                w.file_plane_offset[k] = source->plane(*e, w.sel[k]).offset;
             const bool direct = weight_file_direct(w, cfg_.tp);
             /* The file tier also serves a weight it relays on every read (weight_file_relaid):
              * each selected plane whole in the container, as many bytes as the plane holds. */
             const bool relaid = w.tier == Tier::SSD && e && weight_file_relaid(r->program, w, cfg_.tp);
             if (relaid)
                 for (int k = 0; k < w.n_sel; ++k) {
-                    const RadFilePlane& pk = file_->plane(*e, w.sel[k]);
+                    const RadFilePlane& pk = source->plane(*e, w.sel[k]);
                     const int64_t want = w.sel_rows[k] *
-                        rad_dtype_bytes(file_->encoding(*e).plane[w.sel[k]].dtype, w.sel_cols[k]);
+                        rad_dtype_bytes(source->encoding(*e).plane[w.sel[k]].dtype, w.sel_cols[k]);
                     if ((int64_t)pk.bytes != want) {
                         RAD_ERR("rank %d: '%s' is relaid from the file tier, and its '%s' plane "
                                 "holds %lld bytes where the whole plane is %lld", r->index,
-                                w.name.c_str(), file_->encoding(*e).plane[w.sel[k]].role,
+                                w.name.c_str(), source->encoding(*e).plane[w.sel[k]].role,
                                 (long long)pk.bytes, (long long)want);
                         return RAD_E_FORMAT;
                     }
@@ -3064,15 +3110,15 @@ int Engine::load_weights() {
              * Publish through the residency table too, not only WeightInfo::ptr, because
              * Ctx::resolve_weight reads the table whenever a mover exists. */
             if (w.tier == Tier::Mapped) {
-                const RadFilePlane& p0 = file_->plane(*e, w.sel[0]);
+                const RadFilePlane& p0 = source->plane(*e, w.sel[0]);
                 const int64_t n = (int64_t)p0.bytes;
                 if (n != w.stored_bytes) {
                     RAD_ERR("'%s': the container's '%s' plane has %lld bytes, the declaration "
-                            "wants %lld", w.name.c_str(), file_->encoding(*e).plane[w.sel[0]].role,
+                            "wants %lld", w.name.c_str(), source->encoding(*e).plane[w.sel[0]].role,
                             (long long)n, (long long)w.stored_bytes);
                     return RAD_E_FORMAT;
                 }
-                w.ptr = (void*)file_->data(p0);
+                w.ptr = (void*)source->data(p0);
                 w.host_ptr = w.ptr;
                 /* --ngram-placement ram: the gather reads a copy instead of the mapping: pinned
                  * memory for a device kernel on the zero-copy site, or locked memory for the host
@@ -3083,7 +3129,7 @@ int Engine::load_weights() {
                     const bool card = w.site == Site::DeviceZeroCopy;
                     void* copy = nullptr;
                     std::string why;
-                    const int cs = copy_table((const uint8_t*)w.ptr, n, (int64_t)p0.offset, card,
+                    const int cs = copy_table(*source,(const uint8_t*)w.ptr, n, (int64_t)p0.offset, card,
                                               &copy, &why);
                     if (cs == RAD_OK) {
                         void* on_card = card ? rad_dev_device_ptr(copy) : nullptr;
@@ -3120,7 +3166,7 @@ int Engine::load_weights() {
                  * container keeps sequential readahead. The effect shows only with a cold cache. */
                 posix_madvise(w.ptr, (size_t)n, POSIX_MADV_RANDOM);
                 r->mover.publish_mapped((rad_weight)i, w.ptr);
-                mapped_ranges.emplace_back((int64_t)((const uint8_t*)w.ptr - file_->base()), n);
+                mapped_ranges[w.file_id].emplace_back((int64_t)((const uint8_t*)w.ptr - source->base()), n);
                 ++n_mapped;
                 mapped_bytes += n;
                 continue;
@@ -3219,7 +3265,7 @@ int Engine::load_weights() {
                 return RAD_E_FORMAT;
             }
             for (int k = 0; k < w.n_sel; ++k) {
-                const RadFilePlane& pk = file_->plane(*e, w.sel[k]);
+                const RadFilePlane& pk = source->plane(*e, w.sel[k]);
                 int64_t doff = stage >= 0 ? staged[(size_t)stage].plane_off[k] : 0;
                 for (const PlaneShare::Rect& q : sh[k].rects) {
                     const int64_t foff = (int64_t)pk.offset + q.row0 * sh[k].row_bytes + q.byte0;
@@ -3229,7 +3275,7 @@ int Engine::load_weights() {
                         foff + len > (int64_t)(pk.offset + pk.bytes)) {
                         RAD_ERR("rank %d: '%s' would read [%lld, %lld), outside its '%s' plane "
                                 "[%llu, %llu)", r->index, w.name.c_str(), (long long)foff,
-                                (long long)(foff + len), file_->encoding(*e).plane[w.sel[k]].role,
+                                (long long)(foff + len), source->encoding(*e).plane[w.sel[k]].role,
                                 (unsigned long long)pk.offset,
                                 (unsigned long long)(pk.offset + pk.bytes));
                         return RAD_E_FORMAT;
@@ -3237,11 +3283,11 @@ int Engine::load_weights() {
                     uint8_t* dst = stage >= 0 ? (uint8_t*)(intptr_t)doff : (uint8_t*)slot->ptr + doff;
                     const bool dense = q.byte0 == 0 && q.bytes == sh[k].row_bytes;
                     if (dense)
-                        runs.push_back(LoadRun{ foff, q.rows * q.bytes, dst, q.rows * q.bytes,
+                        bank_runs[w.file_id].push_back(LoadRun{ foff, q.rows * q.bytes, dst, q.rows * q.bytes,
                                                 q.rows * q.bytes, 1, r->index,
                                                 stage >= 0 ? 0 : (dev ? 1 : 0), stage });
                     else
-                        runs.push_back(LoadRun{ foff, len, dst, q.bytes, sh[k].row_bytes, q.rows,
+                        bank_runs[w.file_id].push_back(LoadRun{ foff, len, dst, q.bytes, sh[k].row_bytes, q.rows,
                                                 r->index, stage >= 0 ? 0 : (dev ? 1 : 0), stage });
                     total += q.rows * q.bytes;
                     doff += q.rows * q.bytes;
@@ -3272,7 +3318,13 @@ int Engine::load_weights() {
     const auto rt0 = std::chrono::steady_clock::now();
     int sw_st = RAD_OK;
     if (file_) {
-        sw_st = sweep_container(file_.get(), runs, devices, &pool, &read_bytes, mapped_ranges);
+        if(source_banks_){
+            int64_t rewarm_remaining=std::max<int64_t>(0,meminfo_bytes("MemAvailable")/2);
+            for(uint32_t bank=0;bank<2&&sw_st==RAD_OK;++bank){
+                int64_t n=0;sw_st=sweep_container(const_cast<RadFile*>(source_banks_->file(bank)),bank_runs[bank],devices,&pool,&n,mapped_ranges[bank],source_banks_.get(),bank,&rewarm_remaining);
+                read_bytes+=n;
+            }
+        }else sw_st=sweep_container(file_.get(),bank_runs[0],devices,&pool,&read_bytes,mapped_ranges[0]);
     } else {
         /* Every weight to the workers in declaration order, as the budget allows. */
         for (size_t k = 0; k < staged.size() && !pool.failed(); ++k) {
@@ -3285,6 +3337,7 @@ int Engine::load_weights() {
     const int pool_st = pool.finish();
     RAD_TRY(sw_st);
     RAD_TRY(pool_st);
+    if(source_banks_&&!source_banks_->same_epoch())return RAD_E_STATE;
     if (!staged.empty() && file_)
         RAD_INFO("load: %zu weight(s), %s of planes, rearranged for their kernels by %d worker(s) "
                  "behind the read, %s held at most; done %.1f s after the read began",
@@ -3729,6 +3782,11 @@ int Engine::configure_kv() {
 
 /* ================================================================== start */
 int Engine::start() {
+    // Before device discovery, model open or generic draft-host automatic pool growth.
+    if (draft_placement_modes_conflict(cfg_)) {
+        RAD_ERR("draft placement: experimental bank and generic manual modes cannot be combined");
+        return RAD_E_INVAL;
+    }
     startup_begin_ns_ = rad_mono_ns();
     std::vector<int> devs;
     std::string inventory;

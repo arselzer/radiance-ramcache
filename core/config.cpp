@@ -210,6 +210,8 @@ static const Flag g_flags[] = {
     "                                    requests, the same output law, other tokens than off for a fixed\n"
     "                                    seed" },
     { "--draft-model",        "PATH",   "NOT IMPLEMENTED -- merge the drafter at convert time" },
+    { "--draft-bank",         "FILE",   "experimental missing-only DSpark RAD; requires RADIANCE_EXPERIMENTAL_DS41_DSPARK_RAD_BANK=1" },
+    { "--draft-bank-expert-placement", "auto|host", "experimental DSpark expert placement; host charges the existing pinned pool" },
 
     { "--host",               "ADDR",   "listen address" },
     { "--port",               "N",      "listen port" },
@@ -793,6 +795,25 @@ int config_parse(int argc, char** argv, Config* c) {
                 return RAD_E_INVAL;
             }
         }
+        else if (S("--draft-bank")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            const char* enabled = std::getenv("RADIANCE_EXPERIMENTAL_DS41_DSPARK_RAD_BANK");
+            if (!enabled || std::strcmp(enabled,"1")) {
+                RAD_ERR("--draft-bank requires experimental DS4.1 DSpark two-bank opt-in");
+                return RAD_E_INVAL;
+            }
+            c->draft_bank = v;
+        }
+        else if (S("--draft-bank-expert-placement")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            const char* enabled = std::getenv("RADIANCE_EXPERIMENTAL_DS41_DSPARK_RAD_BANK");
+            if (!enabled || std::strcmp(enabled,"1") ||
+                (std::strcmp(v,"auto") && std::strcmp(v,"host"))) {
+                RAD_ERR("--draft-bank-expert-placement takes auto or host under the exact bank opt-in");
+                return RAD_E_INVAL;
+            }
+            c->draft_bank_expert_placement = v;
+        }
         else if (S("--draft-model")) {
             /* Refused, not ignored: separate draft models are not supported (spec §10), and the
              * drafter comes from the container (rad-convert --draft-model merges one in; an MTP
@@ -1049,6 +1070,11 @@ int config_parse(int argc, char** argv, Config* c) {
      * rank the installed one behind the reference implementation. An empty hierarchy loads every
      * library found, ordered with the reference last (core/plugin/loader.cpp). A list loads only
      * the named libraries, in its order. */
+    if (draft_placement_modes_conflict(*c)) {
+        RAD_ERR("--draft-bank-expert-placement and --draft-expert-placement are separate manual "
+                "placement modes; give only one");
+        return RAD_E_INVAL;
+    }
     if (c->model.empty()) {
         RAD_ERR("--model is required");
         return RAD_E_INVAL;
@@ -1290,6 +1316,8 @@ const ShowRow kShow[] = {
           return c.draft_short_from > 0 ? num(c.draft_short_from) : std::string("0 (never)"); } },
     { "--draft-coupling",     [](const Config& c) { return onoff(c.draft_coupling); } },
     { "--draft-model",        [](const Config&) { return std::string("not implemented (the container's own drafter)"); } },
+    { "--draft-bank",         [](const Config& c) { return or_none(c.draft_bank,"off"); } },
+    { "--draft-bank-expert-placement", [](const Config& c) { return c.draft_bank_expert_placement; } },
     { "--host",               [](const Config& c) { return c.host; } },
     { "--port",               [](const Config& c) { return num(c.port); } },
     /* Never print the secret, only whether it is set. */

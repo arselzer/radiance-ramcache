@@ -329,6 +329,7 @@ private:
     int  pin_embedding(const Program& prog, const Config& cfg, Plan* p) const;
     int  pin_towers(const Config& cfg, Plan* p) const;
     int  pin_draft_experts(const Program& prog, const Config& cfg, Plan* p) const;
+    int  pin_draft_bank_experts(const Program& prog, const Config& cfg, Plan* p) const;
     void pin_hot(const Config& cfg, Plan* p) const;
     void build_classes(Plan* p);
     void rank_units(Plan* p, std::vector<int32_t>* order) const;

@@ -16,6 +16,7 @@
  */
 #include "iface.h"
 #include "format/checkpoint.h"
+#include "format/dspark_bank_writer.h"
 #include "format/encoding.h"
 #include "format/imatrix.h"
 #include "format/quantise.h"
@@ -99,6 +100,15 @@ bool plan_less(const Logical* a, const Logical* b) {
     return key(a) < key(b);
 }
 
+RadWriter::Weight writer_weight(const Logical& L) {
+    RadWriter::Weight w;w.name=L.src.name;
+    const RecipeRule* rule=L.rule?L.rule->rule:L.import_rule;
+    w.quantizer=rule?rule->quantizer:"";w.options=rule?rule->options_text():"";
+    w.enc=L.enc;w.rank=L.src.rank;
+    for(uint32_t i=0;i<RAD_MAX_RANK;++i)w.shape[i]=L.src.shape[i];
+    w.layer=L.layer;w.expert=L.expert;w.slot=L.slot;return w;
+}
+
 void usage() {
     std::printf(
         "rad-convert -- safetensors or GGUF in, .rad out\n"
@@ -151,6 +161,11 @@ void usage() {
         "      --max-spec N     the max_spec declare is run at (default 4, or the block a\n"
         "                       drafter states; a number given here is used as given); 0\n"
         "                       leaves a draft head out\n"
+        "      --draft-bank-for FILE  private native DSpark missing-only bank for immutable FILE;\n"
+        "                       requires --max-spec 5 and --max-tok 5..64; no canonical payload copy\n"
+        "      --draft-bank-parent-sha256 SHA  established full parent-file SHA (operator lineage;\n"
+        "                       not freshly rehashed by this converter)\n"
+        "      --draft-bank-source-identity TEXT  established checkpoint/source lineage, max1024 bytes\n"
         "      --reuse FILE     a container converted earlier from the SAME checkpoint. A weight\n"
         "                       it holds with the same encoding, quantiser, options and shape is\n"
         "                       copied from it instead of quantised again\n"
@@ -226,6 +241,7 @@ int main(int argc, char** argv) {
     int      report_n = 20;
     bool     verbose = false, plan_only = false, list_quant = false;
     std::string reuse_path, changed_path, sources_path, dump_spec, dump_out;
+    std::string draft_bank_for,draft_bank_parent_sha,draft_bank_source_identity;
     std::vector<std::string> lora_paths;
     double      lora_strength = 1.0;
     std::string lora_map;
@@ -284,6 +300,9 @@ int main(int argc, char** argv) {
             dump_out = v.substr(c + 1);
         }
         else if (a == "--report")    report_n = (int)num("--report", 0, INT32_MAX);
+        else if (a == "--draft-bank-for") draft_bank_for=next("--draft-bank-for");
+        else if (a == "--draft-bank-parent-sha256") draft_bank_parent_sha=next("--draft-bank-parent-sha256");
+        else if (a == "--draft-bank-source-identity") draft_bank_source_identity=next("--draft-bank-source-identity");
         else if (a == "--reuse")     reuse_path = next("--reuse");
         else if (a == "--changed")   changed_path = next("--changed");
         else if (a == "--lora")      lora_paths.push_back(next("--lora"));
@@ -350,6 +369,19 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    const bool draft_bank=!draft_bank_for.empty();
+    if(draft_bank) {
+        if(!reuse_path.empty() || in_place || !changed_path.empty() || !lora_paths.empty() ||
+           !draft_dir.empty() || !imat_path.empty() || !tokjson.empty() || !tokjson2.empty() || !dump_spec.empty() ||
+           !max_spec_given || max_spec!=5 || !max_tok_given || max_tok<5 || max_tok>64 ||
+           draft_bank_parent_sha.empty() || draft_bank_source_identity.empty()) {
+            RAD_ERR("--draft-bank-for needs explicit max-spec5/max-tok5..64 and parent/source lineage; "
+                    "cannot combine reuse/in-place/changed/LoRA/draft-model/imatrix/tokenizer/dump-f32");return 2;
+        }
+        reuse_path=draft_bank_for; // metadata identity only; selected jobs never copy its planes
+    } else if(!draft_bank_parent_sha.empty() || !draft_bank_source_identity.empty()) {
+        RAD_ERR("draft-bank lineage options require --draft-bank-for");return 2;
+    }
     if (!changed_path.empty() && (reuse_path.empty() || in_place)) {
         std::fprintf(stderr, "rad-convert: --changed says which weights not to copy from the "
                              "container --reuse names, and needs --reuse without --in-place (a "
@@ -451,6 +483,10 @@ int main(int argc, char** argv) {
     /* The --reuse container, read with pread, never through its mapping. */
     RadFile reuse;
     if (!reuse_path.empty() && reuse.open(reuse_path.c_str()) != RAD_OK) return 1;
+    DsparkBankWriterPlan bank_plan;
+    if(draft_bank && bank_plan.begin(reuse,draft_bank_parent_sha,draft_bank_source_identity)<0) {
+        RAD_ERR("draft-bank parent geometry/ordinary metadata/lineage is unsupported");return 1;
+    }
     /* --changed lists the checkpoint tensors that differ from the --reuse container's source
      * (e.g. a partial fine-tune). --reuse matches on how a weight was converted, not on its
      * source bytes, so without the list it would copy the stale weights. */
@@ -527,6 +563,9 @@ int main(int argc, char** argv) {
     if (imported) {
         meta.quant = plugins.arch_quant;
         meta.finish();
+    }
+    if(draft_bank && meta.quant!=reuse.str(reuse.header().quant)) {
+        RAD_ERR("draft-bank serving quantization descriptor differs from canonical parent");return 1;
     }
     Registry& reg = rad_tools_registry();
     std::deque<CompiledRule> compiled;
@@ -798,6 +837,30 @@ int main(int argc, char** argv) {
         }
     }
 
+    if(draft_bank) {
+        if(prog.drafter_name!="dspark" || prog.drafter.kind!=RAD_DRAFT_BLOCK || prog.drafter.depth!=5 ||
+           prog.drafter.block!=5 || prog.drafter.proposal_pitch!=5 || prog.drafter.mask_token!=128799 ||
+           prog.drafter.window!=129 || prog.ctx.max_spec!=5) {
+            RAD_ERR("draft-bank conversion requires the actual native DSpark block5 declaration");return 1;
+        }
+        std::vector<Logical*> missing;missing.reserve(plan.size());
+        for(Logical* logical_weight:plan) {
+            bool write=false;const auto weight=writer_weight(*logical_weight);
+            if(bank_plan.consider(weight,&write)<0) {
+                RAD_ERR("draft-bank incompatible canonical weight or foreign/non-native missing source '%s'",weight.name.c_str());return 1;
+            }
+            if(write)missing.push_back(logical_weight);
+        }
+        if(bank_plan.finish_plan()<0) {
+            RAD_ERR("draft-bank needs complete canonical coverage and all three128x2 native expert groups");return 1;
+        }
+        plan.swap(missing);const auto& counts=bank_plan.stats();
+        RAD_INFO("draft-bank plan: %llu canonical weights/%llu payload bytes omitted without reading planes; "
+                 "%llu missing DSpark weights/%llu payload bytes selected; parent full SHA/source are declared lineage",
+                 (unsigned long long)counts.omitted_weights,(unsigned long long)counts.omitted_payload_bytes,
+                 (unsigned long long)counts.draft_weights,(unsigned long long)counts.draft_payload_bytes);
+    }
+
     /* ---------------------------------------------------------------- --sources, --dump-f32 */
     if (!sources_path.empty()) {
         std::ofstream so(sources_path);
@@ -909,13 +972,18 @@ int main(int argc, char** argv) {
         }
         RAD_INFO("--plan-only: about %s would be written; nothing was written to %s.",
                  humanb(bytes).c_str(), out.c_str());
+        if(draft_bank && bank_plan.check_parent(true)<0)return 1;
         return 0;
     }
 
     /* ---------------------------------------------------------------- write */
     RadWriter w;
-    RAD_TRY(in_place ? w.begin_append(out.c_str(), reuse) : w.begin(out.c_str()));
+    RAD_TRY(draft_bank?w.begin_exclusive(out.c_str()):(in_place ? w.begin_append(out.c_str(), reuse) : w.begin(out.c_str())));
 
+    if(draft_bank) {
+        if(bank_plan.header(w)<0){w.abort();return 1;}
+        w.set_recipe(recipe.text());
+    } else {
     w.set_arch(meta.arch);
     /* An extended container keeps its name; this run's checkpoint need not be its original. */
     w.set_model_name(in_place ? std::string(reuse.str(reuse.header().model_name))
@@ -923,6 +991,7 @@ int main(int argc, char** argv) {
     w.set_quant(meta.quant);
     w.set_recipe(in_place && recipe.empty() ? std::string(reuse.str(reuse.header().recipe))
                                             : recipe.text());
+    }
     /* Record the checkpoint as its last two path components (a Hugging Face repository id), not
      * a machine-local path. */
     std::string ck_id = ck.path();
@@ -935,6 +1004,7 @@ int main(int argc, char** argv) {
               reuse.str(reuse.header().created_by), ck_id.c_str())
         : fmt("rad-convert " __DATE__ " from %s", ck_id.c_str()));
 
+    if(!draft_bank) {
     w.meta_i("n_layers",       meta.m.n_layers);
     w.meta_i("n_embd",         meta.m.n_embd);
     w.meta_i("n_head",         meta.m.n_head);
@@ -957,6 +1027,8 @@ int main(int argc, char** argv) {
         if (prog.audio_encoder.modalities != 0)
             enc += (enc.empty() ? "" : ",") + prog.audio_encoder_name;
         if (!enc.empty()) w.meta_s("radiance.encoder", enc.c_str());
+    }
+
     }
 
     /* ---------------------------------------------------------------- the weights
@@ -987,17 +1059,7 @@ int main(int argc, char** argv) {
 
     for (Logical* Lp : plan) {
         Logical& L = *Lp;
-        RadWriter::Weight ww;
-        ww.name = L.src.name;
-        const RecipeRule* rr = L.rule ? L.rule->rule : L.import_rule;
-        ww.quantizer = rr ? rr->quantizer : "";
-        ww.options = rr ? rr->options_text() : "";
-        ww.enc = L.enc;
-        ww.rank = L.src.rank;
-        for (uint32_t i = 0; i < RAD_MAX_RANK; ++i) ww.shape[i] = L.src.shape[i];
-        ww.layer = L.layer;
-        ww.expert = L.expert;
-        ww.slot = L.slot;
+        RadWriter::Weight ww=writer_weight(L);
         int64_t plane_total = 0;
         for (int k = 0; k < L.enc.n_planes; ++k)
             plane_total += rad_enc_plane_bytes(&L.enc.plane[k], L.src.rows, L.src.cols);
@@ -1006,6 +1068,9 @@ int main(int argc, char** argv) {
          * the same planes, assuming the same checkpoint (the operator's responsibility; neither
          * container records e.g. a Hessian's contents). */
         const RadFileEntry* re = reuse.is_open() ? reuse.find(ww.name) : nullptr;
+        if(draft_bank && (re || bank_plan.check_parent()<0)) {
+            RAD_ERR("draft-bank canonical reuse-copy job or changed parent refused");w.abort();return 1;
+        }
         const bool reads_changed =
             !changed.empty() && ckpt_reads_any(L.src, changed, &changed_read);
         if (re && reads_changed) {
@@ -1073,6 +1138,7 @@ int main(int argc, char** argv) {
     sink.w = &w;
 
     VocabBuild vb;
+    if(!draft_bank) {
     if (!tokjson.empty()) {
         if (parse_tokenizer_json(tokjson.c_str(), vb) < 0) { w.abort(); return 1; }
     } else if (ck.is_gguf()) {
@@ -1120,8 +1186,10 @@ int main(int argc, char** argv) {
         }
     }
 
+    }
+
     /* ---------------------------------------------------------------- expert profile */
-    if (im.entries().size()) {
+    if (!draft_bank && im.entries().size()) {
         /* Shares are normalised per layer, so experts are compared within a layer. */
         std::map<int, std::vector<std::pair<int, double>>> per_layer;
         for (const auto& e : im.entries()) {
@@ -1167,6 +1235,7 @@ int main(int argc, char** argv) {
 
     /* One weight, start to finish. Its own buffers, so any thread may run it. */
     auto run_job = [&](const Job& j) -> int {
+        if(draft_bank && (j.re || bank_plan.check_parent()<0))return RAD_E_STATE;
         Logical& L = *j.L;
         const std::string& name = L.src.name;
         const int64_t idx = j.idx;
@@ -1337,7 +1406,14 @@ int main(int argc, char** argv) {
                               .count(), small.size(), large.size());
 
     const auto tf = std::chrono::steady_clock::now();
+    if(draft_bank && bank_plan.check_parent(true)<0){w.abort();return 1;}
     if (w.finish() < 0) return 1;
+    if(draft_bank) {
+        RadFile donor;
+        if(donor.open(out.c_str())<0 || bank_plan.validate_output(donor)<0) {
+            RAD_ERR("draft-bank finished output failed actual reader/coverage/parent checks; not usable");return 1;
+        }
+    }
     RAD_INFO("finish   %.0f s", std::chrono::duration<double>(std::chrono::steady_clock::now() - tf)
                                     .count());
 
@@ -1349,6 +1425,9 @@ int main(int argc, char** argv) {
         RAD_INFO("--in-place: %lld weight(s), %s, kept where they were in %s; %lld added past "
                  "its end", (long long)n_reused.load(), humanb(reused.load()).c_str(),
                  reuse_path.c_str(), (long long)(w.weight_count() - n_reused.load()));
+    else if(draft_bank)
+        RAD_INFO("draft-bank: zero canonical payload bytes copied; canonical model/tokenizer/profile preserved; "
+                 "donor owns only the missing DSpark weights");
     else if (reuse.is_open())
         RAD_INFO("--reuse: %lld weight(s), %s, copied from %s; the other %lld were written",
                  (long long)n_reused.load(), humanb(reused.load()).c_str(), reuse_path.c_str(),

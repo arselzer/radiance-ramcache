@@ -606,7 +606,10 @@ const char* RadFile::get_s(const char* key, const char* dflt) const {
 
 RadWriter::~RadWriter() { if (began_) abort(); }
 
-int RadWriter::begin(const char* path) {
+int RadWriter::begin(const char* path) { return begin_flags(path,false); }
+int RadWriter::begin_exclusive(const char* path) { return begin_flags(path,true); }
+
+int RadWriter::begin_flags(const char* path,bool exclusive) {
     if (began_) return RAD_E_STATE;
     if (!path || !*path) return RAD_E_INVAL;
 
@@ -614,17 +617,26 @@ int RadWriter::begin(const char* path) {
     spill_path_ = path_ + ".blob.tmp";
     sealed_ = late_ = false;
 
-    fd_out_ = ::open(path_.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-    if (fd_out_ < 0) { RAD_ERR("%s: %s", path_.c_str(), std::strerror(errno)); return RAD_E_IO; }
+    const int create=exclusive?(O_EXCL|O_NOFOLLOW):O_TRUNC;
+    fd_out_ = ::open(path_.c_str(), O_WRONLY | O_CREAT | create | O_CLOEXEC, exclusive?0600:0644);
+    if (fd_out_ < 0) {
+        RAD_ERR("%s: %s", path_.c_str(), std::strerror(errno));
+        if(exclusive){path_.clear();spill_path_.clear();} //abort must never unlink a rejected existing path
+        return RAD_E_IO;
+    }
 
     /* The blob is spilled beside the target and spliced in at finish() (unless sealed): the
      * tables in front cannot be sized until every weight is added, and the blob is not held in
      * RAM. */
-    fd_spill_ = ::open(spill_path_.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    fd_spill_ = ::open(spill_path_.c_str(), O_RDWR | O_CREAT | create | O_CLOEXEC, 0600);
     spill_base_ = 0;
     if (fd_spill_ < 0) {
         RAD_ERR("%s: %s", spill_path_.c_str(), std::strerror(errno));
         ::close(fd_out_); fd_out_ = -1;
+        if(exclusive){
+            ::unlink(path_.c_str()); // only this just-created output; never the existing spill
+            path_.clear();spill_path_.clear(); //later abort cannot touch a rejected existing spill
+        }
         return RAD_E_IO;
     }
 

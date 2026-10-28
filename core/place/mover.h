@@ -50,6 +50,7 @@
 #include <sys/stat.h>
 
 namespace rad {
+class DsparkRadBanks; //borrowed immutable two-bank directory/epoch owner
 
 /* ------------------------------------------------------------------ slot bookkeeping */
 /* Free-list bookkeeping for the VRAM slab and the pinned host pool. Pure host state, testable
@@ -237,6 +238,7 @@ public:
      * whose latency cannot be budgeted. */
     int  open(const std::string& path);
     bool ok() const { return f_.is_open(); }
+    int borrowed_fd_for_owner_identity() const { return f_.fd(); }
     void close() { f_.close(); epoch_ready_ = false; }
     int remember_epoch();
     bool same_epoch() const;
@@ -317,6 +319,9 @@ struct MoverConfig {
     /* The container, for the file tier. Empty means no file tier; a unit planned there is then
      * an error. */
     std::string container_path;
+    /* Optional immutable source owner. Must outlive Mover and every checked copy/lease drain.
+     * Empty preserves the single-container path. Committed only after old cache retirement. */
+    const DsparkRadBanks* source_banks = nullptr;
     /* Pinned staging buffers for file-tier reads, one class stride each; the count the planner
      * charged to --host-pool-mib. */
     int stage_slots = RAD_PLACE_FILE_STAGE_SLOTS;
@@ -405,6 +410,8 @@ public:
      * The run phase issues here too, so a sharer's large copy delays transfers the compute stream
      * waits on; gate the two rather than add a queue. */
     RadStream transfer_stream() const { return mover_; }
+    //Private fixed-head tail owner validates BOTH immutable source banks on warm reuse too.
+    bool source_epochs_current() const { return source_file_epoch(); }
 
     ResidencyTable* residency() { return &res_; }
     /* For Tier::Mapped weights, which live in the container mapping the load phase holds: the
@@ -717,6 +724,9 @@ private:
     int64_t pageable_bytes_ = 0;
 
     FileTier file_;
+    FileTier draft_file_;
+    bool source_file_epoch() const;
+    int read_source_file(uint32_t bank,uint64_t offset,int64_t bytes,void*dst,int64_t cap);
     void*    stage_ = nullptr;          /* pinned staging ring for file-tier reads */
     int64_t  stage_stride_ = 0;
     int      stage_next_ = 0;

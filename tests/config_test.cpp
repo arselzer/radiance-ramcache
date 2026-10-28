@@ -54,6 +54,15 @@ struct LogGuard {
 
 }  /* namespace */
 
+namespace {
+struct DraftBankEnv {
+    const char*key="RADIANCE_EXPERIMENTAL_DS41_DSPARK_RAD_BANK";
+    bool present;std::string value;
+    DraftBankEnv():present(std::getenv(key)!=nullptr),value(present?std::getenv(key):""){}
+    ~DraftBankEnv(){if(present)::setenv(key,value.c_str(),1);else ::unsetenv(key);}
+};
+}
+
 /* ================================================================== the shape of the call */
 
 TEST(help_is_reported_separately_from_an_error) {
@@ -408,10 +417,12 @@ std::vector<std::pair<std::string, std::string>> usage_options() {
         std::string name, arg;
         in >> name >> arg;
         /* The help starts after the padded column; a metavariable is upper case. */
+        // This one experimental help row prints its closed enum, not an uppercase metavariable.
+        const bool bank_enum = name == "--draft-bank-expert-placement" && arg == "auto|host";
         const bool is_arg = !arg.empty() && line.find(name + " " + arg) == 2 &&
-                            std::all_of(arg.begin(), arg.end(), [](char ch) {
+                            (bank_enum || std::all_of(arg.begin(), arg.end(), [](char ch) {
                                 return (ch >= 'A' && ch <= 'Z') || ch == '_';
-                            });
+                            }));
         out.emplace_back(name, is_arg ? arg : "");
     }
     return out;
@@ -447,6 +458,8 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--spec-ngram-min", { "1" } }, { "--spec-ngram-max", { "6" } },
         { "--draft-window", { "fixed" } }, { "--draft-short-from", { "4" } },
         { "--draft-coupling", { "on" } },
+        { "--draft-bank", { "/d/head.rad" } },
+        { "--draft-bank-expert-placement", { "host", "--draft-bank", "/d/head.rad" } },
         { "--host", { "127.0.0.1" } }, { "--port", { "8001" } }, { "--api-key", { "k" } },
         { "--served-model-name", { "m" } }, { "--mm-max-patches", { "1024" } },
         { "--control-vector", { "off" } },
@@ -498,6 +511,8 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
  * setting. */
 TEST(every_listed_option_parses_and_is_reported_as_given) {
     LogGuard lg;
+    DraftBankEnv bank_opt;
+    REQUIRE(::setenv(bank_opt.key,"1",1)==0); // scoped only to legal-example parsing; negative cases retain their own gates
     const auto opts = usage_options();
     CHECK(opts.size() > 90);
     const std::vector<std::string> names = diag::config_option_names();
@@ -1466,6 +1481,48 @@ TEST(expert_pin_top_requires_a_finite_fraction) {
         CHECK(!c.expert_pin_top_given);
         CHECK_EQ(c.expert_pin_top, 0.0f);
     }
+}
+
+TEST(dspark_rad_bank_requires_exact_explicit_opt_in) {
+    DraftBankEnv old;
+    for(const char*v:{static_cast<const char*>(nullptr),"0","true","1junk",""}){
+        if(v)::setenv(old.key,v,1);else ::unsetenv(old.key);
+        CHECK_EQ(parse_fresh({"--draft-bank","head.rad"}),RAD_E_INVAL);
+    }
+    REQUIRE(::setenv(old.key,"1",1)==0);
+    Config c;CHECK_OK(parse({"--draft-bank","head.rad"},&c));CHECK(c.draft_bank=="head.rad");
+    CHECK_EQ(parse_fresh({"--draft-bank"}),RAD_E_INVAL);
+}
+TEST(dspark_bank_keeps_single_file_defaults_and_generic_draft_model_refused) {
+    DraftBankEnv old;REQUIRE(::setenv(old.key,"1",1)==0);
+    Config c;CHECK_OK(parse({},&c));CHECK(c.draft_bank.empty());
+    CHECK_EQ(parse_fresh({"--draft-model","head.rad"}),RAD_E_INVAL);
+    CHECK(c.n_spec==-1);CHECK_EQ(c.spec_ngram,0);
+}
+
+TEST(dspark_bank_expert_placement_is_explicit_and_keeps_automatic_budgeting_off) {
+    DraftBankEnv old; ::unsetenv(old.key);
+    CHECK_EQ(parse_fresh({"--draft-bank-expert-placement","host"}), RAD_E_INVAL);
+    REQUIRE(::setenv(old.key,"1",1)==0);
+    for (const char* mode : {"auto","host"}) {
+        Config c; CHECK_OK(parse({"--draft-bank-expert-placement",mode},&c));
+        CHECK(c.draft_bank_expert_placement == mode); CHECK(c.draft_bank.empty());
+    }
+    CHECK_EQ(parse_fresh({"--draft-bank-expert-placement","all"}),RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({"--draft-bank-expert-placement"}),RAD_E_INVAL);
+    Config d; CHECK(d.draft_bank_expert_placement == "auto");
+}
+
+TEST(dspark_bank_and_generic_manual_placement_modes_refuse_both_orders) {
+    DraftBankEnv env; REQUIRE(::setenv(env.key,"1",1)==0);
+    for(const char* bank : {"auto","host"})for(const char* generic : {"auto","host"}) {
+        CHECK_EQ(parse_fresh({"--draft-bank-expert-placement",bank,"--draft-expert-placement",generic}),RAD_E_INVAL);
+        CHECK_EQ(parse_fresh({"--draft-expert-placement",generic,"--draft-bank-expert-placement",bank}),RAD_E_INVAL);
+    }
+    Config bank;CHECK_OK(parse({"--draft-bank-expert-placement","host"},&bank));
+    CHECK_EQ(bank.host_pool_mib,Config{}.host_pool_mib);CHECK(bank.draft_expert_placement=="auto");
+    Config standard;CHECK_OK(parse({"--draft-expert-placement","host"},&standard));
+    CHECK(standard.draft_bank_expert_placement=="auto");
 }
 
 RAD_TEST_MAIN()

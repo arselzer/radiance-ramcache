@@ -10,6 +10,8 @@
  * RadDeviceProps::arch, never on index or capacity.
  */
 #include "planner.h"
+#include "dspark_native_scope.h"
+#include <array>
 
 #include <algorithm>
 #include <cmath>
@@ -1154,11 +1156,69 @@ void Planner::pin_hot(const Config& cfg, Plan* p) const {
              (double)threshold, (long long)left);
 }
 
+/* Experimental first learned-MTP path: all exact native DSpark expert pairs live in
+ * the already budgeted pinned pool and the DEVICE kernel reads them in place. This
+ * does not grow a pool or change trunk placement. The ordinary default is byte-for-byte
+ * unchanged. A whole pair stays immutable, so draft file staging is unnecessary. */
+int Planner::pin_draft_bank_experts(const Program& prog, const Config& cfg, Plan* p) const {
+    if (cfg.draft_bank_expert_placement == "auto") return RAD_OK;
+    if (cfg.draft_bank_expert_placement != "host" || cfg.draft_bank.empty() ||
+        in_.host_backend || in_.world_size != 4 || in_.rank != prog.ctx.rank ||
+        !dspark_native_program_scope(prog)) {
+        RAD_ERR("draft-bank host experts require the exact native DSpark EP4 DEVICE declaration");
+        return RAD_E_UNSUPPORTED;
+    }
+    int64_t need = 0, count = 0;
+    for (const MoveUnit& mu : p->units) {
+        if (mu.layer < 40 || mu.expert < 0) continue;
+        if (mu.layer >= 43 || mu.expert >= 32 || mu.weights.size() != 2 ||
+            mu.tier == Tier::Mapped || mu.host_forced || mu.slot_bytes <= 0 ||
+            need > std::numeric_limits<int64_t>::max() - mu.slot_bytes)
+            return RAD_E_UNSUPPORTED;
+        unsigned slots = 0;
+        for (rad_weight h : mu.weights) {
+            if (!h || size_t(h) >= prog.weights.size() || h >= device_ok_.size() ||
+                !device_ok_[h] || !dspark_native_weight_scope(prog.weights[h]))
+                return RAD_E_UNSUPPORTED;
+            const auto& g = prog.weights[h].decl.group;
+            if (g.layer != mu.layer || g.expert != mu.expert || (slots & (1u << g.slot)))
+                return RAD_E_UNSUPPORTED;
+            slots |= 1u << g.slot;
+        }
+        if (slots != 3) return RAD_E_UNSUPPORTED;
+        need += mu.slot_bytes;
+        ++count;
+    }
+    if (count != 96) return RAD_E_UNSUPPORTED;
+    if (need > p->host_budget) {
+        RAD_ERR("draft-bank host experts need %s of the remaining pinned pool, only %s available; "
+                "adjust the explicit cache/pool budgets", humanb(need).c_str(),
+                humanb(p->host_budget).c_str());
+        p->notes.push_back("draft-bank experts do not fit the explicit pinned pool");
+        return RAD_E_NOMEM;
+    }
+    for (MoveUnit& mu : p->units) {
+        if (mu.layer < 40 || mu.expert < 0) continue;
+        p->host_budget -= mu.slot_bytes;
+        mu.tier = Tier::HostPinned;
+        mu.site = Site::DeviceZeroCopy;
+        mu.movable = false;
+        mu.host_forced = true;
+        mu.reason = "--draft-bank-expert-placement host; read in place";
+    }
+    RAD_INFO("draft-bank experts: %lld rank-local pairs (%s) in the existing pinned pool; "
+             "DEVICE zero-copy, immutable; no automatic budget growth", (long long)count,
+             humanb(need).c_str());
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------------ plan */
 int Planner::plan(Plan* out) {
     if (!out || !in_.program || !in_.config) return RAD_E_INVAL;
     const Program& prog = *in_.program;
     const Config& cfg = *in_.config;
+    // Direct Config callers receive the same refusal before any Plan/budget mutation.
+    if (draft_placement_modes_conflict(cfg)) return RAD_E_INVAL;
 
     *out = Plan{};
     out->rank = in_.rank;
@@ -1224,11 +1284,45 @@ int Planner::plan(Plan* out) {
     /* Not RAD_TRY: a refusal still leaves `out` filled in far enough to print. The pins ran above,
      * once slot_bytes was known. */
 
+    // Custom bank mode uses only the remaining explicitly budgeted host pool.
+    if (hrc >= 0) hrc = pin_draft_bank_experts(prog, cfg, out);
     int rc = assign(out);
     enforce_op_site_agreement(prog, out);
     schedule_prefetch(out);
     /* After the strategy: it has put the hot set in VRAM, and pinning marks those resident. */
     pin_hot(cfg, out);
+    //The preassignment pin log is an intent, not final-residency evidence. Refuse
+    //a successful strategy that has moved any already-charged native bank head.
+    //Keep the original error class when pinning or the strategy itself refused.
+    if (hrc >= 0 && rc >= 0 && cfg.draft_bank_expert_placement == "host") {
+        constexpr int64_t pair_bytes = 18800640;
+        int64_t heads = 0, bytes = 0;
+        bool valid = true;
+        std::array<std::array<bool,32>,3> seen{};
+        for (const MoveUnit& mu : out->units) {
+            if (mu.layer < 40 || mu.expert < 0) continue;
+            ++heads;
+            if (mu.layer >= 43 || mu.expert >= 32 || mu.weights.size() != 2 ||
+                mu.slot_bytes != pair_bytes || mu.tier != Tier::HostPinned ||
+                mu.site != Site::DeviceZeroCopy || !mu.host_forced || mu.movable) {
+                valid = false;
+                continue;
+            }
+            auto& present = seen[size_t(mu.layer-40)][size_t(mu.expert)];
+            if (present) valid = false;
+            present = true;
+            bytes += mu.slot_bytes;
+        }
+        for (const auto& layer : seen) for (bool present : layer) valid = valid && present;
+        if (!valid || heads != 96 || bytes != 96*pair_bytes) {
+            RAD_ERR("draft-bank final placement: rank=%d refused after assignment; expected96 "
+                    "immutable HostPinned/DeviceZeroCopy pairs", out->rank);
+            return RAD_E_STATE;
+        }
+        RAD_INFO("draft-bank final placement: rank=%d strategy=%s heads=%lld bytes=%lld "
+                 "HostPinned/DeviceZeroCopy; host_forced=1 movable=0; checked after assignment",
+                 out->rank, strategy_name(out->strategy), (long long)heads, (long long)bytes);
+    }
     finish(prog, out);
     return hrc < 0 ? hrc : rc;
 }

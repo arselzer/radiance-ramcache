@@ -206,6 +206,7 @@ public:
     RadWriter& operator=(const RadWriter&) = delete;
 
     int  begin(const char* path);
+    int  begin_exclusive(const char* path); // new ordinary output and spill; never truncate an existing path
     void abort();                       /* discard, unlink both the target and the spill -- or, in
                                          * append mode, cut the file back to its old length */
 
@@ -281,6 +282,7 @@ public:
     int64_t weight_count() const { return (int64_t)dir_.size(); }
 
 private:
+    int begin_flags(const char* path,bool exclusive);
     rad_stroff intern(std::string_view s);
     void       layout(RadFileHeader* h);
     uint32_t   intern_encoding(const RadEncoding& e);

@@ -225,6 +225,11 @@ struct WeightInfo {
      * scheduling rather than prediction (spec §5). */
     int32_t        first_use_op = -1;
     int32_t        last_use_op  = -1;
+    /* Private immutable source owner;0 is canonical/legacy,1 is an admitted DSpark bank.
+     * These are not public ABI fields and never encode a bank in a payload offset. */
+    uint32_t       file_id = 0;
+    uint64_t       source_bank_generation = 0;
+    int64_t        source_entry_index = -1;
 };
 
 /* This rank's selected planes as a layout hook sees them: dense rank-2 geometry, `data` null
@@ -795,6 +800,8 @@ enum { RAD_P2P_AUTO = 0, RAD_P2P_ON = 1, RAD_P2P_OFF = 2 };
 
 struct Config {
     std::string model;                 /* path to the .rad, or a Hugging Face repo id (hf_model.h) */
+    std::string draft_bank;            /* experimental missing-only ordinary DSpark RAD */
+    std::string draft_bank_expert_placement = "auto"; /* existing pinned pool; no automatic growth */
     LoraConfig  lora;                  /* --lora, --max-loras, --max-lora-rank, --lora-target-modules */
     std::string download_dir;          /* where a repo id is fetched to; empty = the XDG cache */
     std::string radiance_home;
@@ -1166,6 +1173,17 @@ struct Config {
      * the startup report (core/diag/diag.h) prints this beside every value. */
     std::map<std::string, std::string> given;
 };
+
+/* Two distinct manual host-placement contracts must never charge the same draft units.
+ * The generic mode grows a host pool; the experimental bank mode never grows it.
+ * Value checks also protect directly constructed Configs, whose `given` map is empty. */
+inline bool draft_placement_modes_conflict(const Config& cfg) {
+    const bool bank_manual = cfg.draft_bank_expert_placement == "host" ||
+                            cfg.given.count("--draft-bank-expert-placement") != 0;
+    const bool standard_manual = cfg.draft_expert_placement == "host" ||
+                                 cfg.draft_expert_placement_given;
+    return bank_manual && standard_manual;
+}
 
 }  /* namespace rad */
 

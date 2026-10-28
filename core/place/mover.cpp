@@ -5,6 +5,7 @@
  * applied by this thread at a layer boundary (see Mover::Move).
  */
 #include "mover.h"
+#include "format/dspark_rad_banks.h"
 #include "../device/device.h"
 
 #include <algorithm>
@@ -134,8 +135,25 @@ void* Mover::reserve(const char* what, int64_t bytes, int kind) {
     return rad_dev_alloc(bytes, kind);
 }
 
+bool Mover::source_file_epoch() const {
+    if(!cfg_.source_banks)return file_.same_epoch();
+    return cfg_.source_banks->same_epoch()&&(!file_.ok()||file_.same_epoch())&&
+        (!draft_file_.ok()||draft_file_.same_epoch());
+}
+int Mover::read_source_file(uint32_t bank,uint64_t offset,int64_t bytes,void*dst,int64_t cap) {
+    if(bank>1||(bank&&!cfg_.source_banks))return RAD_E_STATE;
+    if(cfg_.source_banks&&!source_file_epoch())return RAD_E_STATE;
+    const int st=(bank?draft_file_:file_).read(offset,bytes,dst,cap);if(st<0)return st;
+    return cfg_.source_banks&&!source_file_epoch()?RAD_E_STATE:RAD_OK;
+}
 int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, Pools* budget) {
     if (cfg.native_file_cache_bytes < 0) return RAD_E_INVAL;
+    if(cfg.source_banks){
+        if(!cfg.source_banks->dual()||!cfg.source_banks->same_epoch())return RAD_E_STATE;
+        for(size_t i=1;i<prog.weights.size();++i){const auto&w=prog.weights[i];
+            if(w.decl.optional&&w.source_entry_index<0)continue;
+            DsparkRadBanks::Entry owner;RAD_TRY(cfg.source_banks->bound(w,&owner));}
+    }else for(const auto&w:prog.weights)if(w.file_id||w.source_bank_generation)return RAD_E_STATE;
     const bool want_native_file_workers = native_read_workers_opt_in(
         std::getenv("RADIANCE_EXPERIMENTAL_NATIVE_FILE_WORKERS"));
     const char* mapped_env = std::getenv("RADIANCE_EXPERIMENTAL_NATIVE_CACHE_MAPPED_SOURCE");
@@ -152,6 +170,7 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
     prog_ = &prog;
     plan_ = &plan;
     cfg_ = cfg;
+    draft_file_.close(); //old copies/cache users are proven retired before owner replacement
     budget_ = budget;
     stats_ = MoverStats{};
     if (!budget_)
@@ -296,8 +315,17 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
             return RAD_E_INVAL;
         }
         RAD_TRY(file_.open(cfg_.container_path));
+        if(cfg_.source_banks){
+            RAD_TRY(cfg_.source_banks->direct_owner_matches(0,file_.borrowed_fd_for_owner_identity()));
+            bool want_draft=false;
+            for(const auto&mu:plan.units)if(mu.tier==Tier::SSD)for(const auto h:mu.weights)
+                if(prog.weights[h].file_id==1)want_draft=true;
+            if(want_draft){RAD_TRY(draft_file_.open(cfg_.source_banks->file(1)->path()));
+                RAD_TRY(cfg_.source_banks->direct_owner_matches(1,draft_file_.borrowed_fd_for_owner_identity()));
+                RAD_TRY(draft_file_.remember_epoch());}
+        }
+        if(cfg_.native_file_cache_bytes>0||cfg_.source_banks)RAD_TRY(file_.remember_epoch());
         if (cfg_.native_file_cache_bytes > 0) {
-            RAD_TRY(file_.remember_epoch());
             if (want_mapped) {
                 RAD_TRY(mapped_file_cache_.configure(size_t(cfg_.native_file_cache_bytes),
                                                      prog.weights.size(),sizeof(mapped_windows_) +
@@ -611,7 +639,7 @@ int Mover::start_stage(int32_t unit, int64_t slab_slot) {
                 }
                 continue;
             }
-            RAD_TRY(file_.read(w.file_offset, w.stored_bytes, stage + mu.offset[k],
+            RAD_TRY(read_source_file(w.file_id,w.file_offset, w.stored_bytes, stage + mu.offset[k],
                                stage_stride_ - mu.offset[k]));
         }
         ++stats_.ssd_reads;
@@ -757,6 +785,7 @@ namespace {
 
 /* One weight's bytes: where they are in the container and where they go. */
 struct FileExt {
+    uint32_t bank = 0;
     int64_t foff = 0, bytes = 0;
     char*   dst = nullptr;
 };
@@ -797,7 +826,7 @@ int Mover::read_relaid(const WeightInfo& w, void* dst, int64_t dst_cap, RelayIn*
         in->cap = in->p ? n : 0;
         if (!in->p) return RAD_E_NOMEM;
     }
-    RAD_TRY(file_.read((uint64_t)a0, hi - a0, in->p, in->cap));   /* reads n, needs hi - a0 */
+    RAD_TRY(read_source_file(w.file_id,(uint64_t)a0, hi - a0, in->p, in->cap));   /* reads n, needs hi - a0 */
     for (int k = 0; k < w.n_sel; ++k) pt[k].data = in->p + ((int64_t)w.file_plane_offset[k] - a0);
     const int st = relayout_(w, pt, dst, w.stored_bytes);
     if (st < 0)
@@ -890,12 +919,12 @@ int Mover::read_native_file(const WeightInfo& w, void* dst, int64_t dst_cap, Rel
     *cache_hit = false;
     const size_t key = (size_t)(&w - prog_->weights.data());
     const bool mapped_scope = mapped_file_cache_on_ && mapped_file_eligible(w);
-    if (mapped_scope && !file_.same_epoch()) return RAD_E_STATE;
+    if (mapped_scope && !source_file_epoch()) return RAD_E_STATE;
     //The unchanged lease helper touches on borrow. ReadOnly deliberately bypasses it entirely,
     //preserving no-touch/no-admission rather than claiming accelerated prefill cache hits.
     const bool mapped = mapped_scope && policy == NativeFileCacheReadPolicy::Normal;
     if (mapped) {
-        if (!file_.same_epoch()) return RAD_E_STATE;
+        if (!source_file_epoch()) return RAD_E_STATE;
         NativeMappedFileCache::Lease local;
         auto* lease = mapped_lease ? mapped_lease : &local;
         const auto rc = mapped_file_cache_.borrow(key,size_t(w.stored_bytes),lease);
@@ -903,14 +932,14 @@ int Mover::read_native_file(const WeightInfo& w, void* dst, int64_t dst_cap, Rel
             *cache_hit = true;
             //Demand promotion still uses its pinned stage; routed copies keep this lease.
             if (!mapped_lease) std::memcpy(dst,lease->host(),size_t(w.stored_bytes));
-            return file_.same_epoch() ? RAD_OK : RAD_E_STATE;
+            return source_file_epoch() ? RAD_OK : RAD_E_STATE;
         }
         if (rc != NativeMappedFileCache::Status::Miss) return RAD_E_STATE;
     }
     if (native_file_cache_on_) {
-        if (!file_.same_epoch()) return RAD_E_STATE;
+        if (!source_file_epoch()) return RAD_E_STATE;
         RAD_TRY(native_file_cache_.copy(key, w.stored_bytes, dst, dst_cap, cache_hit, policy));
-        if (*cache_hit) return file_.same_epoch() ? RAD_OK : RAD_E_STATE;
+        if (*cache_hit) return source_file_epoch() ? RAD_OK : RAD_E_STATE;
     }
     if (!w.identity) {
         RAD_TRY(read_relaid(w, dst, dst_cap, in));
@@ -926,24 +955,24 @@ int Mover::read_native_file(const WeightInfo& w, void* dst, int64_t dst_cap, Rel
             in->cap = in->p ? allocation : 0;
             if (!in->p) return RAD_E_NOMEM;
         }
-        RAD_TRY(file_.read((uint64_t)lo, need, in->p, in->cap));
+        RAD_TRY(read_source_file(w.file_id,(uint64_t)lo, need, in->p, in->cap));
         std::memcpy(dst, in->p + delta, (size_t)w.stored_bytes);
     }
-    if (mapped_scope && !file_.same_epoch()) return RAD_E_STATE;
+    if (mapped_scope && !source_file_epoch()) return RAD_E_STATE;
     if (mapped) {
-        if (!file_.same_epoch()) return RAD_E_STATE;
+        if (!source_file_epoch()) return RAD_E_STATE;
         const auto rc = mapped_file_cache_.insert(key,dst,size_t(w.stored_bytes));
         //Admission pressure and a failed new allocation preserve the original window fallback.
         using S = NativeMappedFileCache::Status;
         if (rc != S::Ok && rc != S::Existing && rc != S::Bypass && rc != S::Allocation)
             return RAD_E_STATE;
-        if (!file_.same_epoch()) return RAD_E_STATE;
+        if (!source_file_epoch()) return RAD_E_STATE;
     }
     if (native_file_cache_on_) {
-        if (!file_.same_epoch()) return RAD_E_STATE;
+        if (!source_file_epoch()) return RAD_E_STATE;
         if (policy == NativeFileCacheReadPolicy::Normal)
             RAD_TRY(native_file_cache_.insert(key, dst, w.stored_bytes));
-        if (!file_.same_epoch()) return RAD_E_STATE;
+        if (!source_file_epoch()) return RAD_E_STATE;
     }
     return RAD_OK;
 }
@@ -1064,6 +1093,7 @@ int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_
     const auto cache_policy = (native_file_cache_on_ || mapped_file_cache_on_) ? policy : NativeFileCacheReadPolicy::Normal;
     staged->clear();
     if (!file_.ok() || !windows_ || n_windows_ <= 0) return RAD_E_STATE;
+    if(cfg_.source_banks&&!source_file_epoch())return RAD_E_STATE;
 
     /* The layout in `dst`, unit by unit in the order given, and every weight's extent; a weight
      * the read relays goes through stage_relaid instead of the windows' direct copies. */
@@ -1089,7 +1119,7 @@ int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_
                 relaid.push_back(Relaid{ &w, dst + off + mu.offset[k] });
                 continue;
             }
-            ext.push_back(FileExt{ (int64_t)w.file_offset, w.stored_bytes, dst + off + mu.offset[k] });
+            ext.push_back(FileExt{ w.file_id,(int64_t)w.file_offset, w.stored_bytes, dst + off + mu.offset[k] });
         }
         staged->push_back(u);
         at.push_back(off);
@@ -1098,13 +1128,13 @@ int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_
     if (staged->empty()) return RAD_OK;
     /* Container order, so a window is one long run of the drive rather than a seek per weight. */
     std::stable_sort(ext.begin(), ext.end(),
-                     [](const FileExt& a, const FileExt& b) { return a.foff < b.foff; });
+                     [](const FileExt& a, const FileExt& b) { return a.bank!=b.bank?a.bank<b.bank:a.foff<b.foff; });
 
     if (after) RAD_TRY(rad_event_wait(mover_, after));
 
     const int64_t A = DirectFile::alignment();
     const int64_t W = RAD_PLACE_FILE_WINDOW_BYTES;
-    struct Seg { int64_t fs = 0, fe = 0, ws = 0; };     /* file [fs, fe) read to window offset ws */
+    struct Seg { uint32_t bank=0; int64_t fs = 0, fe = 0, ws = 0; };     /* file [fs, fe) read to window offset ws */
     struct Cp  { int64_t wo = 0, bytes = 0; char* dst = nullptr; };
     std::vector<Seg> segs;
     std::vector<Cp>  cps;
@@ -1132,7 +1162,7 @@ int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_
             const FileExt& e = ext[i];
             const int64_t fo = e.foff + piece, left = e.bytes - piece;
             int64_t wo;
-            if (!segs.empty() && fo >= segs.back().fs && fo <= segs.back().fe + kReadThrough) {
+            if (!segs.empty() && e.bank==segs.back().bank && fo >= segs.back().fs && fo <= segs.back().fe + kReadThrough) {
                 wo = segs.back().ws + (fo - segs.back().fs);
             } else {
                 const int64_t ws = segs.empty()
@@ -1140,7 +1170,7 @@ int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_
                 const int64_t fs = fo / A * A;
                 wo = ws + (fo - fs);
                 if (wo >= W) break;
-                segs.push_back(Seg{ fs, fs, ws });
+                segs.push_back(Seg{ e.bank,fs,fs,ws });
             }
             const int64_t take = std::min(left, W - wo);
             if (take <= 0) break;
@@ -1155,7 +1185,7 @@ int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_
 
         const auto t0 = std::chrono::steady_clock::now();
         for (const Seg& s : segs) {
-            RAD_TRY(file_.read((uint64_t)s.fs, s.fe - s.fs, win + s.ws, W - s.ws));
+            RAD_TRY(read_source_file(s.bank,(uint64_t)s.fs, s.fe - s.fs, win + s.ws, W - s.ws));
             ++stats_.file_preads;
         }
         stats_.file_read_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(

@@ -106,6 +106,10 @@ Engine::~Engine() {
      * stager's ring, lent slab slots) and would otherwise drain only later, with the mover. A fill
      * landing in a freed arena is a GPU memory fault. */
     for (auto& r : ranks_) {
+        if (r->fstager.shutdown_head_cache() != RAD_OK) {
+            RAD_ERR("DSpark head tail: completion unknown; retaining process owners");
+            std::_Exit(88);
+        }
         //Mapped-source leases must retire before any context arena or stager event disappears.
         //A failed completion proof cannot be followed by ordinary member destruction.
         if (r->mover.mapped_file_drain() != RAD_OK) {
@@ -364,7 +368,7 @@ int Engine::xstats_open() {
             if (l < 0 || l >= n_layer || e < 0) continue;
             std::vector<int32_t>& row = layers[(size_t)l];
             if ((size_t)e >= row.size()) row.resize((size_t)e + 1, kUnset);
-            const RadFileEntry* fe = file_ ? file_->find(wi.source) : nullptr;
+            const RadFileEntry* fe = source_entry(wi.source);
             const int32_t g = fe && fe->layer == l && fe->expert >= 0 ? fe->expert : -1;
             int32_t& at = row[(size_t)e];
             /* Every weight of one unit must name the same expert. */

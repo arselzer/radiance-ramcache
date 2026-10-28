@@ -1,6 +1,6 @@
 DeepSeek V4.1 Flash native MXFP4 development
 
-This branch combines upstream main 6c33ee4e and DeepSeek WIP PR266
+This branch combines upstream main 9497bf90 and DeepSeek WIP PR266
 (bd65d4e5) with the private ABI32 RAM-cache development. It is experimental.
 
 Included optimizations: selected native expert reads, retained mapped RAM
@@ -17,7 +17,9 @@ These are single sweeps; long context, concurrency and broad quality are
 not established. Tiny numerical and transport checks were also run.
 
 Validation used a freshly built Core with separately linked, compatible
-kernel objects. A clean full build of this published checkout is pending.
+kernel objects. A clean full build of this published checkout is pending. The newest upstream
+merge adds grammar reuse, diagnostics, documentation and test improvements;
+it has not yet been included in a GPU benchmark.
 No learned DSpark MTP or second model bank is included yet.
 
 No model weights, checkpoint data, deployment credentials or local runtime

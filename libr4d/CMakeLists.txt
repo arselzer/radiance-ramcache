@@ -201,6 +201,13 @@ set(R4D_UNITS
   # Routed MoE: router, scatter, the grouped block-scaled fp8 GEMM and gather, in one unit because
   # the other three only feed the GEMM.
   "r4d_moe|"
+  # DeepSeek-V4.1-Flash: the elementwise and small ops, the sparse attention and its indexer, and
+  # the GEMMs over llama.cpp's native blocks (GGUF imports), MXFP4's in a unit of their own.
+  "r4d_ds41_elem|"
+  "r4d_ds41_sparse|"
+  "r4d_ds41_ggml|"
+  # GGUF MXFP4 blocks (type=mxfp4) for gemm_nt_ggml and moe_gemm_ggml: the DSpark drafter's experts.
+  "r4d_ds41_mxfp4|"
 )
 
 set(R4D_SRC "")
@@ -226,12 +233,24 @@ endforeach()
 # descriptions and fusion claims. They are pure host C++ that includes neither r4d.h nor
 # hip_runtime.h, so these tables compile and can be inspected without ROCm.
 set(R4D_DECLARATION r4d_rows.cpp r4d_layout.cpp r4d_fp8_layout.cpp r4d_shapes.cpp r4d_fuse.cpp)
+# The native-block GEMMs' layout (planes -> llama.cpp's blocks) uses libquant's one definition of the
+# blocks, compiled in when libquant's sources are beside libr4d (in radiance's tree).
+set(R4D_GGML_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../libquant)
+if(EXISTS ${R4D_GGML_DIR}/lq_ggml_planes.cpp)
+  list(APPEND R4D_DECLARATION r4d_ds41_ggml_layout.cpp ${R4D_GGML_DIR}/lq_ggml_planes.cpp
+       ${R4D_GGML_DIR}/lq_ggml_dequant.cpp ${R4D_GGML_DIR}/lq_ggml_tables.cpp)
+  set(R4D_HAVE_GGML 1)
+endif()
 
 rad_add_plugin(libr4d kernels
   SOURCES     ${R4D_DECLARATION}
   HIP_SOURCES ${R4D_SRC}
   GPU_TARGETS ${R4D_GPU_TARGETS}
   INCLUDES    ${CMAKE_CURRENT_SOURCE_DIR})
+if(R4D_HAVE_GGML)
+  target_compile_definitions(libr4d PRIVATE R4D_HAVE_GGML=1)
+  target_include_directories(libr4d PRIVATE ${R4D_GGML_DIR})
+endif()
 
 # Catalogue dump: prints every row and, on a card, calls each launch with a minimal valid input, to
 # catch transcription errors in the constraint table. It dlopens the plugin so an undefined symbol

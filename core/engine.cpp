@@ -84,14 +84,22 @@ Engine::~Engine() {
      * residency histogram shows whether the global ranking starved a layer, which a hit rate
      * cannot. */
     for (auto& r : ranks_) {
-        if (!r->heat.enabled()) continue;
+        if (!r->heat.enabled() && r->plan.file_layer_max <= 0) continue;
         LogRank lr(r->index);
+        if (r->heat.enabled()) {
         RAD_INFO("%s", r->heat.report().c_str());
         RAD_INFO("  routing evidence: %llu layer-histograms credited, %llu layer-sweeps found "
                  "nothing new, %llu dropped by a ring shallower than the run-ahead",
                  (unsigned long long)r->heat_credited, (unsigned long long)r->heat_idle,
                  (unsigned long long)r->ctx.route_dropped());
+        }
         RAD_INFO("%s", r->mover.report().c_str());
+        const auto& ep = r->fstager.ep_stats();
+        if (ep.reads || ep.corrupt)
+            RAD_INFO("EP scoped file staging: %llu count rows completed, %llu local-zero, "
+                     "%llu SSD units submitted, %llu corrupt rows refused",
+                     (unsigned long long)ep.reads, (unsigned long long)ep.zero_local,
+                     (unsigned long long)ep.units, (unsigned long long)ep.corrupt);
     }
     /* Drain the transfer streams before the contexts. Ctx::shutdown drains the compute streams
      * and frees the arena, but the mover's stream also copies into the arena (the prefill

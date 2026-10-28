@@ -374,7 +374,11 @@ void Planner::build_units(const Program& prog, Plan* p) {
         mu.weights.push_back(w);
         mu.offset.push_back(at);
         mu.bytes = at + weight_bytes(wi);
-        if (!in_.container || !weight_file_direct(wi, prog.ctx.world_size)) mu.file_direct = false;
+        if (!in_.container ||
+            !(weight_file_direct(wi, prog.ctx.world_size) ||
+              (in_.file_relayout && weight_file_relaid(prog, wi, prog.ctx.world_size) &&
+               weight_bytes(wi) <= RAD_PLACE_FILE_WINDOW_BYTES)))
+            mu.file_direct = false;
         if (wi.first_use_op >= 0 && (mu.first_use_op < 0 || wi.first_use_op < mu.first_use_op))
             mu.first_use_op = wi.first_use_op;
         if (wi.last_use_op > mu.last_use_op) mu.last_use_op = wi.last_use_op;
@@ -498,7 +502,8 @@ struct HostFall {
             }
             return true;
         }
-        /* The file tier, for a unit stored in the container as its kernel reads it. A Tier::SSD
+        /* The file tier, for a unit stored in the container as its kernel reads it or relaid on
+         * each read (MoveUnit::file_direct). A Tier::SSD
          * unit has no address until staged. A scheduled unit is staged by Plan::prefetch. A routed
          * one cannot be scheduled, since a grouped MoE GEMM needs every expert's pointer at issue,
          * so the file stager reads all of a routed layer's file-tier experts into a VRAM buffer
@@ -697,9 +702,10 @@ int Planner::assign_expert_tiered(Plan* p) {
                 mu.reason = "fits in no tier";
                 /* With the file tier on, only a non-file-direct unit gets here (HostFall::place). */
                 note_unfit(p, mu, ssd_ ? "neither VRAM nor the host pool has room, and its "
-                                         "stored form is not the container's (a relayout, a "
-                                         "dtype conversion or a shard), so the file tier cannot "
-                                         "read it in place"
+                                         "stored form is not the container's in a way a file "
+                                         "read cannot make (a widening, a shard, or a relayout "
+                                         "whose kernel has no relayout function), so the file "
+                                         "tier cannot serve it"
                                        : "the host pool is full and no --weights-disk-tier was "
                                          "given");
                 rc = RAD_E_NOMEM;

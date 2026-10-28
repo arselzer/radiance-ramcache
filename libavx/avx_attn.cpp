@@ -1635,6 +1635,54 @@ AVX_KERNEL(rope_table) {
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------------ rope_rows */
+/* rope from a rope_table plane over columns [off, off + rot) of each head_dim-wide head of x, in
+ * place (libref's rope_rows): gptj pairs adjacent columns, neox i with i + rot/2; (a, b)(c + is)
+ * in f32, rounded once; `inverse` conjugates. A negative or out-of-table position leaves its row.
+ * The row is widened once, every head rotated, then narrowed back. */
+AVX_KERNEL(rope_rows) {
+    if (!rad_args_have(a, 3)) return RAD_E_INVAL;
+    const RadTensor &x = a->t[0], &cs = a->t[1], &pos = a->t[2];
+    const int64_t nh = p_int(a, "n_head", 0), hd = p_int(a, "head_dim", 0);
+    const int64_t rot = p_int(a, "rot", 0), off = p_int(a, "off", -1);
+    const int64_t inv = p_int(a, "inverse", -1);
+    const char* mode = p_str(a, "mode", "");
+    const bool gptj = !std::strcmp(mode, "gptj");
+    if (!gptj && std::strcmp(mode, "neox")) return RAD_E_UNSUPPORTED;
+    if (nh < 1 || hd < 2 || rot < 2 || (rot & 1) || off < 0 || off + rot > hd ||
+        (inv != 0 && inv != 1))
+        return RAD_E_SHAPE;
+    if (!x.data || !cs.data || !pos.data || x.rank != 2 || x.shape[0] < 1 ||
+        x.shape[1] != nh * hd || cs.rank != 2 || cs.shape[1] != rot || numel(&pos) != x.shape[0])
+        return RAD_E_SHAPE;
+    const int64_t M = x.shape[0], rows = cs.shape[0], half = rot / 2, n = nh * hd;
+    const float sign = inv ? -1.0f : 1.0f;
+    AVX_PARALLEL_FOR_IF(M * n >= AVX_PAR_MIN)
+    for (int64_t m = 0; m < M; ++m) {
+        const int64_t p = ldi(&pos, offlin(&pos, m));
+        if (p < 0 || p >= rows) continue;
+        float* buf = scratch_f32((size_t)(n + rot));
+        float* xv = buf;
+        float* cv = buf + n;
+        const int64_t xb = rowoff(&x, m, n);
+        const float* in = in_row(&x, xb, n, xv);
+        if (in != xv) std::memcpy(xv, in, (size_t)n * sizeof(float));
+        const float* c = in_row(&cs, rowoff(&cs, p, rot), rot, cv);
+        for (int64_t h = 0; h < nh; ++h) {
+            float* hx = xv + h * hd + off;
+            for (int64_t i = 0; i < half; ++i) {
+                const int64_t ia = gptj ? 2 * i : i, ib = gptj ? ia + 1 : ia + half;
+                const float co = c[i], si = sign * c[half + i];
+                const float va = hx[ia], vb = hx[ib];
+                hx[ia] = va * co - vb * si;
+                hx[ib] = va * si + vb * co;
+            }
+        }
+        out_row(&x, xb, n, xv);
+    }
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------------ qsa_block_key */
 /* QSA's compressed key (docs/OPS.md): a block's `ratio` rows of k averaged in f32 and rounded to
  * k's dtype, RMS-normed with gain (wadd + w), then NeoX-rotated over `rotary_dim` at the block's

@@ -483,6 +483,16 @@ inline int map_tap(RadBuilder* b, const char* declared, const char* src, int dim
     return rad_decl_name_map(b, &m);
 }
 
+/* The elementwise product of two checkpoint tensors of one shape (RAD_MAP_MUL): a gain shipped as
+ * two factors. */
+inline int map_mul(RadBuilder* b, const char* declared, const char* a, const char* c) {
+    RadNameMap m = map_base(declared, RAD_MAP_MUL);
+    m.n_src  = 2;
+    m.src[0] = a;
+    m.src[1] = c;
+    return rad_decl_name_map(b, &m);
+}
+
 /* An EMA codebook: the embedding sums over max(cluster usage, 1e-5), row by row (RAD_MAP_EMA). */
 inline int map_ema(RadBuilder* b, const char* declared, const char* sums, const char* usage) {
     RadNameMap m = map_base(declared, RAD_MAP_EMA);

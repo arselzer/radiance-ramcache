@@ -869,7 +869,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     /* The auxiliary taps, only when the container carries the drafter and the deployment
      * speculates: one residual stream per tap, 100 MiB at a 2048-token chunk and five taps. `cast`
      * does the copy into a column slice (libr4d/r4d_rows.cpp). */
-    if (ctx->max_spec > 0) {
+    if (rad_ctx_draft_head(ctx)) {
         const char* da = rad_meta_gets(meta, "draft.architectures", "");
         if (da && std::strstr(da, "DFlash")) {
             m.n_taps = parse_layer_ids(
@@ -1128,7 +1128,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      *
      * Also only when there is no DFlash2 drafter (`n_taps` == 0): a deployment drafts with one,
      * and DFlash2 (one forward per block rather than one per token) is the better one here. */
-    if (nextn > 0 && g.max_spec > 0 && m.n_taps == 0) {
+    if (nextn > 0 && rad_ctx_draft_head(ctx) && m.n_taps == 0) {
         /* Sized at max_tok, not max_logit_rows: a draft round is one row per sequence, but the
          * history pass that fills the head's own K and V is one row per token over a whole prefill
          * chunk (26 MiB at a 512-token chunk, beside 477 MiB of head weights). */

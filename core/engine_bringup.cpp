@@ -53,6 +53,7 @@
 #include <memory>
 #include <mutex>
 #include <chrono>
+#include <cstdio>
 
 namespace rad {
 
@@ -334,6 +335,10 @@ static void memory_cgroups(const std::function<bool(const std::string&, int64_t)
 /* See engine_hostmem.h. */
 bool lockable_room(int64_t need, int64_t still, int64_t margin, bool mlocks,
                    std::string* why) {
+    if (need < 0 || still < 0 || margin < 0) {
+        *why = "negative host allocation or reserve";
+        return false;
+    }
     long long locked_kb = 0;
     unsigned long long caps = 0;
     {
@@ -346,14 +351,14 @@ bool lockable_room(int64_t need, int64_t still, int64_t margin, bool mlocks,
     }
     struct rlimit rl {};
     if (mlocks && !((caps >> 14) & 1) && ::getrlimit(RLIMIT_MEMLOCK, &rl) == 0 &&
-        rl.rlim_cur != RLIM_INFINITY && (int64_t)rl.rlim_cur < locked_kb * 1024 + need) {
+        rl.rlim_cur != RLIM_INFINITY && (__int128)rl.rlim_cur < (__int128)locked_kb * 1024 + need) {
         *why = fmt("RLIMIT_MEMLOCK allows %s locked and the copy locks %s (Docker: --ulimit "
                    "memlock=-1; systemd: LimitMEMLOCK=infinity)", humanb((int64_t)rl.rlim_cur).c_str(),
                    humanb(need).c_str());
         return false;
     }
     if (const int64_t avail = meminfo_bytes("MemAvailable");
-        avail >= 0 && avail - still - margin < need) {
+        avail >= 0 && (__int128)avail - still - margin < need) {
         *why = fmt("%s of memory is available, %s more is still to be allocated (the pinned host "
                    "pools, the prefix cache's host tier, the checkpoint slots and the host "
                    "activation arenas), and this wants %s with %s to spare "
@@ -364,7 +369,7 @@ bool lockable_room(int64_t need, int64_t still, int64_t margin, bool mlocks,
     }
     bool fits = true;
     memory_cgroups([&](const std::string& dir, int64_t room) {
-        if (room - still - margin >= need) return true;
+        if ((__int128)room - still - margin >= need) return true;
         *why = fmt("the memory cgroup at %s leaves %s, %s more is still to be allocated, "
                    "and this wants %s with %s to spare (--host-headroom-mib)", dir.c_str(),
                    humanb(room).c_str(), humanb(still).c_str(), humanb(need).c_str(),
@@ -378,16 +383,21 @@ bool lockable_room(int64_t need, int64_t still, int64_t margin, bool mlocks,
 /* The most lockable_room(need, still, margin, false) admits, and in `limit` the bound that
  * decides it. INT64_MAX when no limit can be read. */
 static int64_t lockable_bytes(int64_t still, int64_t margin, std::string* limit) {
+    if (still < 0 || margin < 0) { *limit = "negative host allocation or reserve"; return 0; }
+    auto remaining = [&](int64_t room) {
+        const __int128 left = (__int128)room - still - margin;
+        return left <= 0 ? int64_t{0} : left >= INT64_MAX ? int64_t{INT64_MAX} : (int64_t)left;
+    };
     int64_t most = INT64_MAX;
     *limit = "no readable memory limit";
     if (const int64_t avail = meminfo_bytes("MemAvailable"); avail >= 0) {
-        most = avail - still - margin;
+        most = remaining(avail);
         *limit = fmt("%s of memory available, less %s still to be allocated and %s to spare",
                      humanb(avail).c_str(), humanb(still).c_str(), humanb(margin).c_str());
     }
     memory_cgroups([&](const std::string& dir, int64_t room) {
-        if (room - still - margin < most) {
-            most = room - still - margin;
+        if (remaining(room) < most) {
+            most = remaining(room);
             *limit = fmt("the memory cgroup at %s, which leaves %s, less %s still to be allocated "
                          "and %s to spare", dir.c_str(), humanb(room).c_str(),
                          humanb(still).c_str(), humanb(margin).c_str());
@@ -718,6 +728,9 @@ int Engine::read_metadata() {
     if (!is_container(cfg_.model)) return read_checkpoint_metadata();
     file_ = std::make_unique<RadFile>();
     RAD_TRY(file_->open(cfg_.model.c_str()));
+    /* What an earlier run left cached of the container, recorded before anything here allocates,
+     * for the mapped tier's rewarm after the load (RadFile::rewarm). */
+    if (cfg_.mapped_rewarm) file_->snapshot_resident();
 
     const RadFileHeader& h = file_->header();
     meta_ = RadModelMeta{};
@@ -906,6 +919,7 @@ RadBuildCtx Engine::build_ctx(int rank, int64_t max_tok) const {
     bc.weight_prefetch_off = cfg_.weight_prefetch ? 0 : 1;
     bc.state_dtype = cfg_.state_cache_dtype == "f16" ? RAD_F16 : 0;
     bc.draft_coupling = cfg_.draft_coupling ? 1 : 0;
+    bc.draft_head_off = cfg_.spec_ngram > 0 ? 1 : 0;
     bc.tp_wire_min_bytes = cfg_.tp_wire_min_kb * 1024;
     bc.scope      = "";
     bc.max_enc_patches = cfg_.mm_max_patches > 0 ? cfg_.mm_max_patches : 0;
@@ -1362,6 +1376,41 @@ int Engine::declare() {
     drafter_       = p0.drafter;
     drafter_name_  = p0.drafter_name;
     drafter_.name  = drafter_name_.c_str();
+    /* Every rank declared its own drafter, and the engine drives one from rank 0's: they must
+     * agree in everything but the proposal's handle, which indexes each rank's own program (a
+     * plugin may declare different buffers per rank) and is resolved per rank (advance_all). */
+    for (size_t i = 1; i < ranks_.size(); ++i) {
+        const Program& pr = ranks_[i]->program;
+        const RadDrafterDecl& d = pr.drafter;
+        bool same = d.kind == drafter_.kind && d.depth == drafter_.depth && d.block == drafter_.block &&
+                    d.proposal_pitch == drafter_.proposal_pitch && d.mask_token == drafter_.mask_token &&
+                    d.window == drafter_.window && !d.proposal == !drafter_.proposal;
+        if (same && d.proposal) {
+            const RadBufDecl& a = p0.buffers[(size_t)drafter_.proposal].decl;
+            const RadBufDecl& b = pr.buffers[(size_t)d.proposal].decl;
+            same = a.dtype == b.dtype && a.rank == b.rank &&
+                   std::equal(a.shape, a.shape + a.rank, b.shape);
+        }
+        if (!same) {
+            RAD_ERR("rank %zu declared drafter '%s' (kind %d, depth %d, block %lld, proposal %s) unlike "
+                    "rank 0's '%s' (kind %d, depth %d, block %lld, proposal %s); every rank runs the "
+                    "same passes", i, pr.drafter_name.c_str(), d.kind, d.depth, (long long)d.block,
+                    d.proposal ? pr.buffers[(size_t)d.proposal].name.c_str() : "none",
+                    drafter_name_.c_str(), drafter_.kind, drafter_.depth, (long long)drafter_.block,
+                    drafter_.proposal ? p0.buffers[(size_t)drafter_.proposal].name.c_str() : "none");
+            return RAD_E_STATE;
+        }
+    }
+    /* --spec-ngram asked the plugin to leave its head out (RadBuildCtx::draft_head_off). One that
+     * declared it anyway would hold its weights and passes for nothing, so startup stops. */
+    if (cfg_.spec_ngram > 0 && drafter_.kind != RAD_DRAFT_NONE) {
+        RAD_ERR("--spec-ngram %d: the '%s' plugin declared its draft head '%s' although the "
+                "deployment drafts by prompt lookup alone (it does not read "
+                "RadBuildCtx::draft_head_off). Use --num-speculative-tokens N instead: the head "
+                "drafts and prompt lookup fills in for any sequence it declines",
+                cfg_.spec_ngram, plugins_.arch_plugin.c_str(), drafter_name_.c_str());
+        return RAD_E_UNSUPPORTED;
+    }
     if (cfg_.n_spec <= 0) drafter_ = RadDrafterDecl{};
     drafter_short_ = drafter_.kind == RAD_DRAFT_BLOCK && cfg_.draft_short_from > 0
                    ? p0.drafter_short_block : 0;
@@ -1393,8 +1442,18 @@ int Engine::declare() {
                  : fmt("'%s' drafts %d token(s) a step in %d serial pass(es); prompt lookup fills "
                        "in for any sequence it declines",
                        drafter_.name, drafter_.depth, drafter_.depth).c_str());
+    } else if (cfg_.spec_ngram > 0) {
+        RAD_INFO("speculation: prompt lookup only (--spec-ngram %d) -- up to %d draft(s) a step "
+                 "from the latest earlier occurrence of the sequence's last %d..%d tokens; no "
+                 "draft head is declared", cfg_.spec_ngram, cfg_.n_spec, cfg_.spec_ngram_max,
+                 cfg_.spec_ngram_min);
+        decide("--spec-ngram", std::to_string(cfg_.spec_ngram),
+               fmt("prompt lookup alone, patterns of %d..%d tokens, longest first; the "
+                   "container's draft head (if any) is not declared",
+                   cfg_.spec_ngram_max, cfg_.spec_ngram_min));
     } else if (cfg_.n_spec > 0) {
-        RAD_INFO("speculation: prompt lookup only -- this container declares no draft head");
+        RAD_INFO("speculation: prompt lookup only -- this container declares no draft head "
+                 "(patterns of %d..%d tokens)", cfg_.spec_ngram_max, cfg_.spec_ngram_min);
     }
     probe_arena_levels();
     return RAD_OK;
@@ -1695,6 +1754,25 @@ int Engine::plan() {
         for (VramFacts& f : facts) f.held_out = cvec_bytes;
         RAD_TRY(resolve_table_placement(facts, emb_bytes, wfs, kv_floor, ngram_bytes,
                                         ngram_device, ngram_host, ck_store + host_arenas));
+        if (cfg_.expert_ram_cache_total_mib > 0) {
+            /* Always check the joint future HOST allocation, even with all optional RAM tables
+             * and checkpoint storage off. Conditional table checks alone can skip every memory
+             * probe. host_headroom_bytes reserves both the configured cache and system margin. */
+            const int64_t MiB = (int64_t)1 << 20;
+            const __int128 pool_mib = (__int128)cfg_.host_pool_mib +
+                                       cfg_.embedding_host_mib + cfg_.tower_host_mib;
+            __int128 pending = pool_mib * cfg_.tp * MiB +
+                               (__int128)cfg_.prefix_cache_mib * MiB + ck_store + host_arenas;
+            if (cfg_.ngram_resolved == TablePlacement::Ram) pending += ngram_bytes;
+            if (cfg_.tp <= 0 || pending < 0 || pending > INT64_MAX) return RAD_E_INVAL;
+            std::string cache_room_why;
+            if (!lockable_room((int64_t)pending, 0, host_headroom_bytes(), false,
+                               &cache_room_why)) {
+                RAD_ERR("native expert RAM cache: cache, remaining host allocations and "
+                        "--host-headroom-mib do not fit: %s", cache_room_why.c_str());
+                return RAD_E_NOMEM;
+            }
+        }
         /* The n-gram table was counted off the card; on it, every rank holds the whole table. */
         if (cfg_.ngram_resolved == TablePlacement::Vram)
             for (VramFacts& f : facts) f.statics += ngram_bytes;
@@ -1845,6 +1923,7 @@ int Engine::plan() {
         }
         in.container = file_ != nullptr;
         in.host_backend = device_is_host();
+        in.file_relayout = true;    /* the mover relays on the read (Mover::set_file_relayout) */
         Planner planner(in);
         s = planner.plan(&r->plan);
         if (cfg_.debug_placement || s < 0)
@@ -2346,7 +2425,8 @@ private:
  * card. */
 static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
                            const std::vector<int>& devices, RelayoutPool* pool,
-                           int64_t* read_out) {
+                           int64_t* read_out,
+                           const std::vector<std::pair<int64_t, int64_t>>& keep_cached) {
     *read_out = 0;
     if (runs.empty()) return RAD_OK;
 
@@ -2578,9 +2658,27 @@ static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
         return RAD_OK;
     }();
 
-    /* Release the page cache of weights never read from the file again, leaving it to the mapped
-     * tier (e.g. a mapped n-gram table, read from its mapping for the process lifetime). */
-    file->drop_blob_cache();
+    /* Release the page cache of weights never read from the file again, leaving the mapped tier's
+     * (e.g. a mapped n-gram table, read from its mapping for the process lifetime): what an earlier
+     * run brought in stays, so its gathers do not start cold after a restart. */
+    file->drop_blob_cache(keep_cached);
+    /* ... and what the load's allocations reclaimed of it comes back (RadFile::rewarm), at most half
+     * of what the kernel calls available, so the re-read cannot itself push the host into reclaim. */
+    if (!keep_cached.empty()) {
+        int64_t avail = 0;
+        if (FILE* mi = std::fopen("/proc/meminfo", "r")) {
+            char line[256];
+            while (std::fgets(line, sizeof line, mi))
+                if (std::sscanf(line, "MemAvailable: %lld kB", (long long*)&avail) == 1) { avail *= 1024; break; }
+            std::fclose(mi);
+        }
+        const auto w0 = std::chrono::steady_clock::now();
+        const int64_t asked = file->rewarm(keep_cached, avail / 2);
+        if (asked > 0)
+            RAD_INFO("mapped tier: asked the page cache again for %s an earlier run had cached (%.0f ms; "
+                     "--mapped-rewarm off turns it off)", humanb(asked).c_str(),
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count());
+    }
     /* Drain before freeing: a sweep that failed part-way may have copies outstanding. */
     for (int b = 0; b < kWin; ++b) pool->drain(b);
     for (int b = 0; b < kWin; ++b) if (buf[b]) rad_dev_free(buf[b], RAD_MEM_HOST_PINNED);
@@ -2643,6 +2741,7 @@ int Engine::load_weights() {
     int64_t total = 0, n_loaded = 0, n_missing = 0;
     /* Counted apart from `n_loaded`: mapped weights are published in place, not loaded. */
     int64_t n_mapped = 0, mapped_bytes = 0;
+    std::vector<std::pair<int64_t, int64_t>> mapped_ranges;   /* kept cached by the sweep's drop */
 
     /* Two phases. The walk decides which rank wants which bytes, where they land, and what is
      * refused, without touching the disk; sweep_container then reads the container once in file
@@ -2663,6 +2762,27 @@ int Engine::load_weights() {
          * aligned (rad_format.h), DirectFile's alignment, so stages take the no-bounce path. */
         MoverConfig mc{};
         mc.container_path = file_ ? cfg_.model : std::string();
+        if (cfg_.expert_ram_cache_total_mib > 0) {
+            const int64_t MiB = (int64_t)1 << 20;
+            if (cfg_.tp <= 0 || cfg_.expert_ram_cache_total_mib > INT64_MAX / MiB)
+                return RAD_E_INVAL;
+            const int64_t total = cfg_.expert_ram_cache_total_mib * MiB;
+            mc.native_file_cache_bytes = total / cfg_.tp / RAD_ALIGN_UNIT * RAD_ALIGN_UNIT;
+        }
+        /* A file-tier weight the kernel relayouts is relaid on every read, by the kernel's own
+         * relayout, as the relayout pool does once for a resident one. */
+        {
+            const Program* prog = &r->program;
+            r->mover.set_file_relayout([prog](const WeightInfo& w, const RadTensor* planes,
+                                              void* dst, int64_t dst_bytes) {
+                const RadKernelInfo* ki = weight_layout_kernel(*prog, w);
+                if (!ki || !ki->relayout) return (int)RAD_E_STATE;
+                const Resolved& rs =
+                    prog->ops[(size_t)w.lay_op].bands[(size_t)w.lay_band].dom[w.lay_dom];
+                return ki->relayout(rs.geom.params(), rs.geom.n_params(), w.lay_operand, &w.enc,
+                                    w.sel, planes, w.n_sel, dst, dst_bytes);
+            });
+        }
         RAD_TRY(r->mover.init(r->program, r->plan, mc, &r->pools));
         /* What the mover took, before the first copy. Its slabs are allocated in init, so the pool
          * is as full as it will get; a load stopping with zero free is a placement failure, not
@@ -2743,8 +2863,26 @@ int Engine::load_weights() {
             w.site        = r->plan.weight[i].site;
             w.slab_slot   = r->plan.weight[i].slab_slot;
             w.file_offset = e ? file_->plane(*e, w.sel[0]).offset : 0;
+            for (int k = 0; k < w.n_sel && e; ++k)
+                w.file_plane_offset[k] = file_->plane(*e, w.sel[k]).offset;
             const bool direct = weight_file_direct(w, cfg_.tp);
-            if ((w.tier == Tier::Mapped || w.tier == Tier::SSD) && (!direct || !e)) {
+            /* The file tier also serves a weight it relays on every read (weight_file_relaid):
+             * each selected plane whole in the container, as many bytes as the plane holds. */
+            const bool relaid = w.tier == Tier::SSD && e && weight_file_relaid(r->program, w, cfg_.tp);
+            if (relaid)
+                for (int k = 0; k < w.n_sel; ++k) {
+                    const RadFilePlane& pk = file_->plane(*e, w.sel[k]);
+                    const int64_t want = w.sel_rows[k] *
+                        rad_dtype_bytes(file_->encoding(*e).plane[w.sel[k]].dtype, w.sel_cols[k]);
+                    if ((int64_t)pk.bytes != want) {
+                        RAD_ERR("rank %d: '%s' is relaid from the file tier, and its '%s' plane "
+                                "holds %lld bytes where the whole plane is %lld", r->index,
+                                w.name.c_str(), file_->encoding(*e).plane[w.sel[k]].role,
+                                (long long)pk.bytes, (long long)want);
+                        return RAD_E_FORMAT;
+                    }
+                }
+            if ((w.tier == Tier::Mapped || w.tier == Tier::SSD) && (!direct || !e) && !relaid) {
                 RAD_ERR("rank %d: '%s' was placed on the %s tier, which reads the container where "
                         "it lies, and its stored form is not the container's (%s)", r->index,
                         w.name.c_str(), tier_name(w.tier),
@@ -2816,6 +2954,7 @@ int Engine::load_weights() {
                  * container keeps sequential readahead. The effect shows only with a cold cache. */
                 posix_madvise(w.ptr, (size_t)n, POSIX_MADV_RANDOM);
                 r->mover.publish_mapped((rad_weight)i, w.ptr);
+                mapped_ranges.emplace_back((int64_t)((const uint8_t*)w.ptr - file_->base()), n);
                 ++n_mapped;
                 mapped_bytes += n;
                 continue;
@@ -2967,7 +3106,7 @@ int Engine::load_weights() {
     const auto rt0 = std::chrono::steady_clock::now();
     int sw_st = RAD_OK;
     if (file_) {
-        sw_st = sweep_container(file_.get(), runs, devices, &pool, &read_bytes);
+        sw_st = sweep_container(file_.get(), runs, devices, &pool, &read_bytes, mapped_ranges);
     } else {
         /* Every weight to the workers in declaration order, as the budget allows. */
         for (size_t k = 0; k < staged.size() && !pool.failed(); ++k) {
@@ -3572,6 +3711,8 @@ int Engine::start() {
         d.residency   = r->plan.strategy == Strategy::AllVram ? nullptr : r->mover.residency();
         d.arch_step   = arch_step_;
         d.profile_ops = cfg_.profile_ops;
+        d.row_prefetch = cfg_.row_prefetch;
+        d.tape_dump   = cfg_.debug_tape_dump;
         bind_kv_pools(r->program, [&](int32_t g) { return r->kv.plan(g); }, &d.kv);
         d.registry    = &rad_tools_registry();
         RAD_TRY(r->ctx.init(d));
@@ -3608,13 +3749,24 @@ int Engine::start() {
                          r->stager.n_layers(), (int)PrefillStager::lead());
         }
         /* The file stager, wherever a routed expert is on the file tier (static or dynamic plan;
-         * such a unit has no other address). */
-        RAD_TRY(r->fstager.init(r->program, r->plan, &r->mover));
+         * such a unit has no other address). A small pass reads only the experts its router
+         * picked, from the core's counts row (Ctx::route_counts_live). */
+        Ctx* const rctx = &r->ctx;
+        RAD_TRY(r->fstager.init(r->program, r->plan, &r->mover,
+                                [rctx](int32_t layer, int64_t* ne, int64_t* top_k) {
+                                    return rctx->route_counts_live(layer, ne, top_k);
+                                },
+                                [rctx](int32_t layer, EpRouteCounts* out) {
+                                    return rctx->ep_route_counts_live(layer, out);
+                                }));
         if (r->fstager.enabled() && r->index == 0)
             RAD_INFO("file stager: %zu routed layers hold experts read from the container; each "
                      "pass reads a layer's (up to %s) into one of two VRAM buffers before its "
-                     "first expert op, so every step is paced by the drive",
-                     r->fstager.n_layers(), humanb(r->plan.file_layer_max).c_str());
+                     "first expert op, so every step is paced by the drive%s",
+                     r->fstager.n_layers(), humanb(r->plan.file_layer_max).c_str(),
+                     r->fstager.routed_reads() ? "; a pass of at most 64 tokens reads only the "
+                                                 "experts it routes to"
+                                               : "");
         if (r->stager.enabled() && r->fstager.enabled()) {
             r->stagers.set(&r->stager, &r->fstager);
             r->ctx.set_stager(&r->stagers);

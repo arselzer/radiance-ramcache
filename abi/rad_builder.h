@@ -261,7 +261,26 @@ typedef struct RadBuildCtx {
      *
      * Trailing and zero-defaulted, so a plugin built against the older struct is unchanged. */
     int      weight_prefetch_off;
+
+    /* ---- appended in private ABI 32 (prompt lookup alone, after upstream ABI 31) */
+    /* Nonzero from --spec-ngram: the deployment drafts by prompt lookup only, in the core, and
+     * verifies up to `max_spec` drafts a step. The plugin declares no draft head, so a head the
+     * container carries stays off the card, but sizes every verify buffer, state ring and kernel
+     * band for `max_spec` as at any speculative serve. rad_ctx_draft_head() below is the test.
+     * The engine refuses to start when a head is declared anyway, rather than load one it was
+     * told to leave out.
+     *
+     * Trailing and zero-defaulted. It follows weight_prefetch_off, so that upstream field keeps
+     * its offset and the two independent controls cannot be mistaken for one another. The
+     * structure grows, so every engine and plugin must be rebuilt against private ABI 32. */
+    int      draft_head_off;
 } RadBuildCtx;
+
+/* Whether a declare should include the container's draft head: the deployment speculates and
+ * does not draft by prompt lookup alone. */
+static inline int rad_ctx_draft_head(const RadBuildCtx* ctx) {
+    return ctx && ctx->max_spec > 0 && !ctx->draft_head_off;
+}
 
 /* ================================================================== control vectors */
 /* A direction per layer, in the shape llama.cpp's `--cvec-mode project` applies it:
@@ -580,7 +599,8 @@ int rad_op_declared(RadBuilder* b, const char* op);
  * convert-time fusions (q/k/v into one qkv, gate and up into gate_up). It is the only component
  * that knows both sides, and rad-convert reads the map from it (spec §2.4). */
 enum { RAD_MAP_COPY = 0, RAD_MAP_CONCAT = 1, RAD_MAP_WNORM = 2, RAD_MAP_ROWS = 3,
-       RAD_MAP_TRANSPOSE = 4, RAD_MAP_EMA = 5, RAD_MAP_TAP = 6, RAD_MAP_COLS = 7 };
+       RAD_MAP_TRANSPOSE = 4, RAD_MAP_EMA = 5, RAD_MAP_TAP = 6, RAD_MAP_COLS = 7,
+       RAD_MAP_MUL = 8 };
 
 typedef struct RadNameMap {
     const char* declared;        /* the name given to rad_decl_weight */
@@ -641,8 +661,13 @@ typedef struct RadNameMap {
  * run on a single frame reads only its last temporal tap, so [cout, cin, kt, kh, kw] read at tap -1
  * of dimension 2 is the 2-D convolution it then is.
  *
- * TRANSPOSE, EMA, TAP and COLS are computed at convert in f32, like WNORM, and stored as the recipe
- * says. */
+ * RAD_MAP_MUL is the elementwise product of src[0] and src[1], two tensors of one shape: a gain a
+ * checkpoint ships as two factors that the model only ever multiplies (DeepSeek-V4.1's Engram gate,
+ * q_weight * k_weight, which llama.cpp's converter folds into one engram_gate the same way). Two
+ * bf16 factors multiply exactly in f32.
+ *
+ * TRANSPOSE, EMA, TAP, COLS and MUL are computed at convert in f32, like WNORM, and stored as the
+ * recipe says. */
 
 int rad_decl_name_map(RadBuilder* b, const RadNameMap* m);
 

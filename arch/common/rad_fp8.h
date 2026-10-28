@@ -38,6 +38,7 @@
 #define RAD_FP8_H
 
 #include "rad_arch.h"
+#include "rad_ggml.h"
 
 #include <cstring>
 #include <vector>
@@ -717,6 +718,10 @@ struct LinearFP8 {
     /* Plain bf16 weight read by `gemm_nt` over the bf16 activation (Geom::w_bf16): no scale plane,
      * no quantiser. */
     bool       bf16 = false;
+    /* A GGUF weight in llama.cpp's blocks (rad_ggml.h), read by `gemm_nt_ggml` over the bf16
+     * activation like `bf16`: the type's name, and the values one block covers along K. */
+    const char* ggml = nullptr;
+    int64_t    ggml_block = 0;
     /* Block-fp8 weight whose scale plane is f32 rather than bf16 (GLM's checkpoints), read by
      * `gemm_nt_q` at dtype fp8a8f32. Read from the weight's encoding. */
     bool       f32_scale = false;
@@ -990,7 +995,8 @@ inline int LinearFP8::probe(RadBuilder* b, Names& nm, const Geom& g, const char*
      * quantises it. */
     const bool rotated = known && (linear_is_paro_mxfp4(enc) || linear_is_paro_w5(enc) ||
                                    linear_is_paro_m2xfp4(enc));
-    reads_x = g.w_bf16 || plain || probed_i8 || rotated || (known && linear_is_w4(enc));
+    const bool blocks = known && ggml_type_of(enc);
+    reads_x = g.w_bf16 || plain || probed_i8 || rotated || blocks || (known && linear_is_w4(enc));
     return RAD_OK;
 }
 
@@ -1108,6 +1114,44 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
     const bool known = weight_enc(b, sw, &enc);
     const bool plain = known && rad_enc_is(&enc, "plain") && enc.n_planes == 1 &&
                        enc.plane[0].dtype == RAD_BF16;
+
+    /* ---- A GGUF weight, imported as its type's planes: `gemm_nt_ggml` over `a.x`, the planes
+     * relayouted into llama.cpp's native blocks at load (docs/OPS.md). Ahead of the bf16 branch,
+     * since a bf16 model (g.w_bf16) imported from a GGUF ships its linears this way. A block's
+     * values run along K, so row parts and row slices apply as for bf16; a column slice (and this
+     * rank's K) must be whole blocks. */
+    ggml = known ? ggml_type_of(enc, &ggml_block) : nullptr;
+    if (ggml) {
+        if (stored) {
+            fprintf(stderr, "radiance: '%s' views '%s', which only a block-fp8 linear may\n", wn,
+                    stored);
+            return RAD_E_INVAL;
+        }
+        if (!a.x) {
+            fprintf(stderr, "radiance: '%s' is llama.cpp's %s blocks and its input has no bf16 "
+                            "plane in this model\n", wn, ggml);
+            return RAD_E_DTYPE;
+        }
+        const bool col = shard == RAD_SHARD_COL && span_hi > 0;
+        if (K % ggml_block || (col && (span_lo % ggml_block || span_hi % ggml_block))) {
+            fprintf(stderr, "radiance: '%s' is %s, whose blocks cover %lld of K, and this rank "
+                            "reads %lld columns%s\n", wn, ggml, (long long)ggml_block,
+                    (long long)K, col ? " from a slice that cuts a block" : "");
+            return RAD_E_INVAL;
+        }
+        RowParts rp;
+        RAD_ARCH_TRY(rp.set(row_parts, 1, 1, base, "rows"));
+        w = decl_w_n(b, wn, ggml_codes_dtype(enc), { N, K }, access, shard, grp, 0, rp.w, rp.n);
+        if (!w) return RAD_E_INVAL;
+        if (span_hi > 0) RAD_ARCH_TRY(rad_weight_shard_span(b, w, span_lo, span_hi));
+        op = rw(b, RAD_OP(b, "gemm_nt_ggml",
+                   RAD_PARAMS(RAD_RANGE("M", 1, max_rows > 0 ? max_rows : g.max_tok),
+                              RAD_INT("N", N), RAD_INT("K", K), RAD_STR("type", ggml),
+                              RAD_STR("dtype", g.dtype)),
+                   RAD_WEIGHTS(w)),
+               { a.x }, { y });
+        return op ? RAD_OK : RAD_E_INVAL;
+    }
 
     /* ---- bf16 weight, `gemm_nt` over `a.x`: every linear of a bf16 model, or one a quantised
      * container keeps at checkpoint precision (e.g. the QSA indexer's projection, whose top-k is a
@@ -1524,7 +1568,7 @@ inline void LinearFP8::step(RadCtx* c, const ActFP8& a, rad_buf y, int64_t T, in
                             int64_t rows, int64_t y0) const {
     if (rows <= 0) rows = T - r0;
     const int64_t yr = y0 < 0 ? r0 : y0;
-    if (bf16) {
+    if (bf16 || ggml) {
         RAD_ISSUE_N(c, op, rows, brow_slice(a.x, r0, rows, K), RAD_W(w), brow_slice(y, yr, rows, N));
         return;
     }

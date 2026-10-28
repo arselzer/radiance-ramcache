@@ -148,6 +148,14 @@ struct SchedMetrics {
     bool    draft_adaptive = false;
     float   draft_depth_adaptive = 0.0f;
     int64_t draft_verify_depth[RAD_METRICS_MAX_SPEC + 1] = {};
+    /* Prompt lookup's verify gate (sched/lookup.h), when lookup is the only drafter: proposals
+     * made, proposals held back unverified and their drafts, and of the held proposals scored
+     * against the text that followed, the drafts that came true (what a verify would have
+     * accepted). */
+    int64_t lookup_proposals = 0;
+    int64_t lookup_held = 0;
+    int64_t lookup_held_drafts = 0;
+    int64_t lookup_held_hits = 0;
 };
 
 

@@ -1197,7 +1197,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     RAD_ARCH_TRY(rad_declare_logits(b, m.b_logits));
 
     /* The drafter's taps: one residual stream per tapped layer, copied into a column slice. */
-    if (ctx->max_spec > 0) {
+    if (rad_ctx_draft_head(ctx)) {
         const char* da = rad_meta_gets(meta, "draft.architectures", "");
         if (da && std::strstr(da, "DFlash")) {
             m.n_taps = parse_layer_ids(rad_meta_gets(meta, "draft.dflash_config.target_layer_ids", nullptr),

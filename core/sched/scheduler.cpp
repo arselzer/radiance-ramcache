@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 
 namespace rad {
 
@@ -152,17 +153,47 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
      * A block drafter proposes its block in one pass, but each verified draft is still a verify
      * row, which is not free on a MoE that reads each row's routed experts. So it takes the same
      * policy with fixed rounds: each sequence verifies the first min(D, its stop) of the block.
-     * Prompt lookup runs no pass and keeps the fixed window; the outcome is logged either way. */
+     * Prompt lookup as the only drafter runs no pass either, and takes the policy the same way:
+     * its drafts feed each sequence's estimate and its proposal is cut to the sequence's window.
+     * As a fallback beside a head it keeps the step's window and stays out of the head's
+     * estimate. The outcome is logged either way. */
+    lookup_adapt_ = false;
+    /* The verify-path harness (scheduler.h): --debug-draft-oracle names a file of token ids,
+     * whitespace or comma separated, a plain greedy run's continuation of the one prompt the test
+     * sends; kDebugMiss of the drafts are corrupted. The text must stay the plain run's whatever is
+     * accepted. */
+    debug_oracle_.clear();
+    if (const char* f = cfg.debug_draft_oracle.c_str(); *f && cfg.n_spec > 0) {
+        if (FILE* fp = std::fopen(f, "r")) {
+            std::string text;
+            char buf[4096];
+            for (size_t k; (k = std::fread(buf, 1, sizeof buf, fp)) > 0;) text.append(buf, k);
+            std::fclose(fp);
+            for (char& ch : text)
+                if ((ch < '0' || ch > '9') && ch != '-') ch = ' ';
+            const char* q = text.c_str();
+            for (char* e = nullptr;; q = e) {
+                const long long v = std::strtoll(q, &e, 10);
+                if (e == q) break;
+                if (v >= 0 && v < prog.meta.n_vocab) debug_oracle_.push_back((int32_t)v);
+            }
+        }
+        RAD_WARN("--debug-draft-oracle: prompt lookup proposes from %zu fixed ids in %s, "
+                 "%.0f%% of drafts corrupted -- a verify-path test, not a drafter",
+                 debug_oracle_.size(), f, 100.0 * kDebugMiss);
+    }
     if (cfg.draft_window == DraftWindow::Adaptive) {
         const RadDrafterDecl& dd = prog.drafter;
         if (cfg.n_spec <= 0)
             RAD_WARN("--draft-window adaptive: this deployment does not speculate "
                      "(--num-speculative-tokens %d), so there is no window to adapt", cfg.n_spec);
-        else if ((dd.kind != RAD_DRAFT_SERIAL && dd.kind != RAD_DRAFT_BLOCK) || dd.depth <= 0)
-            RAD_WARN("--draft-window adaptive: the window is fixed at %d with prompt lookup only "
-                     "-- the adaptive window prices draft passes and verify rows, and prompt "
-                     "lookup runs no pass", cfg.n_spec);
-        else {
+        else if ((dd.kind != RAD_DRAFT_SERIAL && dd.kind != RAD_DRAFT_BLOCK) || dd.depth <= 0) {
+            dp.adapt = true;
+            lookup_adapt_ = true;
+            RAD_INFO("--draft-window adaptive with prompt lookup only: each sequence verifies its "
+                     "lookup's first min(D, its stop) drafts, %d at most, priced like a head's",
+                     cfg.n_spec);
+        } else {
             dp.adapt = true;
             if (dd.kind == RAD_DRAFT_BLOCK)
                 RAD_INFO("--draft-window adaptive with a block drafter: the block of %d is "
@@ -171,6 +202,20 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
         }
     }
     RAD_TRY(draft_.configure(dp));
+    /* Prompt lookup as the deployment's only drafter verifies a proposal only when it pays
+     * (lookup.h). Not configurable: the one deployment property it needs, the cost of a verify
+     * row, is measured. */
+    {
+        const RadDrafterDecl& dd = prog.drafter;
+        const bool head =
+            (dd.kind == RAD_DRAFT_SERIAL || dd.kind == RAD_DRAFT_BLOCK) && dd.depth > 0;
+        lookup_gate_on_ = cfg.n_spec > 0 && !head;
+        lookup_.configure(lookup_gate_on_ ? cfg.n_spec : 0);
+        if (lookup_gate_on_)
+            RAD_INFO("prompt lookup: a proposal is verified when its sequence's record says it "
+                     "pays for its verify rows at the measured step cost; one held back is still "
+                     "scored against the text that follows");
+    }
     draft_est_.clear();
     draft_est_.reserve((size_t)cfg.max_seqs);
 
@@ -298,6 +343,7 @@ int Scheduler::add_locked(std::unique_ptr<Request> r) {
     /* A new request's text, so a new estimate. */
     s.adapt.depth = 0;
     s.adapt.held  = 0;
+    s.look.started = false;
     s.sched_tokens = 0;
     s.entry = -1;
     s.entry_next = -1;
@@ -514,6 +560,16 @@ void Scheduler::close_request(SchedReq& s, ReqState st, const char* reason, bool
     }
 
     if (cfg_.prefix_cache && pc_) pc_->release(*s.req);
+    /* Prompt lookup's index is this text's alone. */
+    s.ngram_ix.reset();
+    if (lookup_gate_on_ && s.look.started && s.look.proposed > 0)
+        RAD_DEBUG("prompt lookup: request %llu made %lld proposals, held back %lld (%lld drafts, "
+                  "%lld of those scored came true); a %d-draft verify costs %.2f plain steps",
+                  (unsigned long long)s.req->id, (long long)s.look.proposed,
+                  (long long)s.look.held, (long long)s.look.held_drafts,
+                  (long long)s.look.held_hits, lookup_.max_depth(),
+                  lookup_.step_cost(1 + lookup_.max_depth()) / lookup_.step_cost(1));
+    s.look.started = false;
     /* Fold what the draft head did on this text into the next text's starting estimate, once:
      * marking it unstarted makes a second close add nothing. */
     if (draft_.adaptive()) {
@@ -805,28 +861,40 @@ int Scheduler::requests_locked(ReqStat* out, int max) const {
  *
  * Longest pattern and most recent occurrence first: a longer match predicts better, and falling
  * back to shorter ones only on a miss keeps common bigrams from dragging acceptance down. A
- * declared draft head calls set_draft() before step(), so this only fills an empty proposal. */
-int Scheduler::draft_ngram(SchedReq& s, int depth) const {
+ * declared draft head calls set_draft() before step(), so this only fills an empty proposal.
+ *
+ * The occurrence comes from the sequence's own index (ngram.h): O(pattern) a lookup, plus the
+ * n-grams the last commit added, rather than a scan of the context. */
+int Scheduler::draft_ngram(SchedReq& s, int depth, int* match) const {
+    if (match) *match = -1;
     if (depth <= 0 || !s.req) return 0;
     const Request& r = *s.req;
-    const int64_t np = (int64_t)r.prompt.size(), no = (int64_t)r.output.size();
-    const int64_t n  = np + no;
-    if (n < 2) return 0;
-    auto at = [&](int64_t i) -> int32_t {
-        return i < np ? r.prompt[(size_t)i] : r.output[(size_t)(i - np)];
-    };
-    for (int k = kNgramMax; k >= kNgramMin; --k) {
-        if (n < (int64_t)k + 1) continue;
-        for (int64_t j = n - k - 1; j >= 0; --j) {
-            bool hit = true;
-            for (int t = 0; t < k && hit; ++t) hit = (at(j + t) == at(n - k + t));
-            if (!hit) continue;
-            int d = 0;
-            while (d < depth && j + k + d < n) { s.draft[d] = at(j + k + d); ++d; }
-            return d;
+    TokenSeq seq;
+    seq.a = r.prompt.data();
+    seq.na = (int64_t)r.prompt.size();
+    seq.b = r.output.data();
+    seq.nb = (int64_t)r.output.size();
+    if (seq.size() < 2) return 0;
+    if (depth > RAD_SCHED_MAX_SPEC) depth = RAD_SCHED_MAX_SPEC;
+    if (!debug_oracle_.empty()) {
+        /* The harness: ids n.. of the plain run's continuation, each replaced by its neighbour id
+         * where a hash of (n, position) falls under the miss rate. */
+        const int64_t n = seq.nb;
+        int d = 0;
+        for (; d < depth && n + d < (int64_t)debug_oracle_.size(); ++d) {
+            uint64_t h = (uint64_t)(n * RAD_SCHED_MAX_SPEC + d + 1) * 0x9E3779B97F4A7C15ull;
+            h ^= h >> 31;
+            h *= 0xbf58476d1ce4e5b9ull;
+            h ^= h >> 29;
+            const bool miss = (double)(h >> 11) * 0x1.0p-53 < kDebugMiss;
+            const int32_t t = debug_oracle_[(size_t)(n + d)];
+            s.draft[d] = miss ? (int32_t)((t + 1) % (int32_t)prog_->meta.n_vocab) : t;
         }
+        return d;
     }
-    return 0;
+    if (s.ngram_ix.owner() != r.id) s.ngram_ix.reset(r.id);
+    return s.ngram_ix.propose(seq, cfg_.spec_ngram_min, cfg_.spec_ngram_max, depth, s.draft, match,
+                              LookupGate::kLongMatch);
 }
 
 /* ------------------------------------------------------------------ chunking */
@@ -1417,6 +1485,19 @@ const RadBatch* Scheduler::step() {
     int32_t capped_at = -1;
     int64_t capped_full = 0;
 
+    /* The verify gate's view of the step: every decoding sequence's own row, before any drafts. */
+    if (lookup_gate_on_) {
+        gate_rows_ = 0;
+        for (int32_t slot : running_) {
+            const SchedReq& g = *reqs_[(size_t)slot];
+            if (!g.req) continue;
+            const Request& gr = *g.req;
+            if (gr.n_computed >= (int64_t)gr.prompt.size() && gr.n_computed + 1 >= g.seq_len())
+                ++gate_rows_;
+        }
+        gate_tokens_ = (double)gate_rows_;
+    }
+
     /* ---------------------------------------------------------- running requests first */
     /* Continuous batching: requests already holding blocks are served before new ones are
      * admitted, so new work never preempts work half done. */
@@ -1469,8 +1550,29 @@ const RadBatch* Scheduler::step() {
             bool ngram = false;
             if (!r.may_speculate) s.n_draft = 0;
             else if (s.n_draft == 0) {
-                s.n_draft = (int32_t)draft_ngram(s, draft_.step_window());
+                /* As the only drafter under the adaptive window, the lookup is the head: its
+                 * proposal is cut to the sequence's own window. */
+                int match = -1;
+                s.n_draft = (int32_t)draft_ngram(s, lookup_adapt_ ? cap : draft_.step_window(),
+                                                 &match);
                 ngram = s.n_draft > 0;
+                /* The verify gate (lookup.h). Every proposal is offered, so a held one is still
+                 * scored against the text; the --debug-draft-oracle harness (match < 0) is a
+                 * verify-path test and always verified. */
+                if (ngram && lookup_gate_on_ && match >= 0) {
+                    const int64_t pos = (int64_t)r.prompt.size() + (int64_t)r.output.size();
+                    lookup_.offer(s.look, pos, s.draft, s.n_draft, match);
+                    const double gain =
+                        lookup_.expect(s.look, LookupGate::class_of(match), s.n_draft);
+                    if (lookup_.pays(gain, s.n_draft, gate_rows_, gate_tokens_)) {
+                        gate_rows_ += s.n_draft;
+                        gate_tokens_ += gain;
+                    } else {
+                        lookup_.held(s.look, s.n_draft);
+                        s.n_draft = 0;
+                        ngram = false;
+                    }
+                }
             }
             if (!ngram && s.n_draft > cap) s.n_draft = cap;
             s.draft_ngram = ngram;
@@ -2167,6 +2269,15 @@ int Scheduler::commit(StepResult& res) {
             for (int32_t j = 0; j < a; ++j) emit(s.draft[j], j);
             if (res.token) emit(res.token[i], a);
             r.n_computed = valid;
+            /* The gate's pending proposal against what this step emitted (lookup.h). */
+            if (lookup_gate_on_ && s.look.started) {
+                TokenSeq ts;
+                ts.a = r.prompt.data();
+                ts.na = (int64_t)r.prompt.size();
+                ts.b = r.output.data();
+                ts.nb = (int64_t)r.output.size();
+                lookup_.advance(s.look, ts);
+            }
             step_decode_tok_ += 1 + a;
 
             if (e.n_spec > 0) {
@@ -2174,7 +2285,7 @@ int Scheduler::commit(StepResult& res) {
                 /* And this sequence's own estimate under the adaptive window, only when the head
                  * drafted: a prompt-lookup proposal is accepted on different text by a different
                  * rule. A move takes effect at the next draft; this step's drafter already ran. */
-                if (draft_.adaptive() && !e.ngram) {
+                if (draft_.adaptive() && (!e.ngram || lookup_adapt_)) {
                     const int was = s.adapt.depth;
                     const int now = draft_.adapt_observe(s.adapt, e.n_spec, a);
                     if (now != was && was > 0 && (int)log_level() >= (int)Log::Debug) {
@@ -2310,6 +2421,13 @@ void Scheduler::step_finished() {
         /* The decay never reaches zero; below 0.05 tok/s it reads as zero. */
         if (m_.prefill_tps < 0.05f) m_.prefill_tps = 0.0f;
         if (m_.decode_tps  < 0.05f) m_.decode_tps  = 0.0f;
+    }
+    /* The step's cost by query rows, for the prompt-lookup gate (lookup.h): every pure decode
+     * step, drafting or not, since the plain step is what a verify is weighed against. */
+    if (lookup_gate_on_ && plan_.phase == RAD_PHASE_DECODE && wall > 0) {
+        int64_t rows = 0;
+        for (const StepEntry& e : plan_.e) rows += e.is_prefill ? 0 : e.n_tokens;
+        if (rows > 0) lookup_.step_time(rows, wall * 1e3);
     }
     /* The step's cost at its depth, for the adaptive window (draft.h): the same wall time,
      * including the draft rounds after it, with a step issued ahead counted once. Decode steps
@@ -2935,6 +3053,10 @@ SchedMetrics Scheduler::metrics_locked() const {
         m.draft_pos_reached [j] = draft_.reached(j);
         m.draft_pos_accepted[j] = draft_.hits(j);
     }
+    m.lookup_proposals   = lookup_.proposed();
+    m.lookup_held        = lookup_.held_count();
+    m.lookup_held_drafts = lookup_.held_drafts();
+    m.lookup_held_hits   = lookup_.held_hits();
     if (draft_.adaptive()) {
         m.draft_adaptive = true;
         /* Over the running sequences whose estimate has started; one that has not drafted yet

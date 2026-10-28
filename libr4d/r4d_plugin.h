@@ -493,6 +493,8 @@ int r4d_rad_dequant_w4      (const RadArgs*, RadStream);
 int r4d_rad_rowtopk         (const RadArgs*, RadStream);
 int64_t r4d_rad_rowtopk_scratch(const RadArgs*);
 int r4d_rad_rowtopk_merge   (const RadArgs*, RadStream);
+int r4d_rad_rowtopk_f32     (const RadArgs*, RadStream);
+int64_t r4d_rad_rowtopk_f32_scratch(const RadArgs*);
 int r4d_rad_logit_rerank    (const RadArgs*, RadStream);
 int r4d_rad_logit_rerank_i8 (const RadArgs*, RadStream);
 
@@ -966,6 +968,12 @@ int r4d_fuse_qk_norm_rope_gate_kv_store_streamed(const RadParam*, int, uint64_t,
 int r4d_fuse_ar_rmsnorm_quant_fp8(const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_ar_gather_hc_write  (const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_attn_paged_gate_quant(const RadParam*, int, uint64_t, int, RadFuseStep*);
+
+/* DeepSeek-V4.1's ops: launches (r4d_ds41_<group>.hip) and shapes (r4d_ds41_<group>_shapes.inc). */
+#include "r4d_ds41_elem.h"
+#include "r4d_ds41_sparse.h"
+#include "r4d_ds41_ggml.h"
+#include "r4d_ds41_mxfp4.h"
 
 }  /* extern "C" */
 

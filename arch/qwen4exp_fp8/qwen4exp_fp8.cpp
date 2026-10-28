@@ -1235,7 +1235,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * rad-convert declares at a non-zero max_spec). */
     const int64_t nextn = meta_int2(meta, "qwen4exp.mtp_num_hidden_layers",
                                     "mtp_num_hidden_layers", 0);
-    if (nextn > 0 && g.max_spec > 0) {
+    if (nextn > 0 && rad_ctx_draft_head(ctx)) {
         const char* mpre = "mtp";
         /* Sized at max_tok, not max_logit_rows: the history pass that fills the head's own K and V
          * has one row per token over a whole prefill chunk. */

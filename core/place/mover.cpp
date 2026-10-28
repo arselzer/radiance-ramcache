@@ -8,10 +8,12 @@
 #include "../device/device.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <map>
 #include <queue>
+#include <thread>
 #include <unordered_map>
 
 namespace rad {
@@ -32,15 +34,34 @@ int FileTier::read(uint64_t offset, int64_t bytes, void* dst, int64_t dst_cap) {
     if (!f_.is_open()) return RAD_E_STATE;
     if (!dst || bytes <= 0) return RAD_E_INVAL;
     /* The extent rounded up to the alignment: the unit stride already covers it, and reading
-     * one extra block is cheaper than a branch on the step path. */
+     * one extra block is cheaper than a branch on the step path. The rounding may pass end of
+     * file when the extent is the container's last; only `bytes` must arrive. */
     const int64_t want = direct_align(bytes);
     if (want > dst_cap) {
         RAD_ERR("file tier: a %s read needs a %s aligned buffer, the staging slot is %s",
                 humanb(bytes).c_str(), humanb(want).c_str(), humanb(dst_cap).c_str());
         return RAD_E_SCRATCH;
     }
-    RAD_TRY(f_.read_at(dst, (int64_t)offset, want));
+    RAD_TRY(f_.read_covering(dst, (int64_t)offset, want, bytes));
     return RAD_OK;
+}
+
+int FileTier::remember_epoch() {
+    epoch_ready_ = false;
+    if (!f_.is_open() || ::fstat(f_.fd(), &epoch_) || !S_ISREG(epoch_.st_mode))
+        return RAD_E_IO;
+    epoch_ready_ = true;
+    return RAD_OK;
+}
+
+bool FileTier::same_epoch() const {
+    struct stat current{};
+    return epoch_ready_ && f_.is_open() && !::fstat(f_.fd(), &current) &&
+        current.st_dev == epoch_.st_dev && current.st_ino == epoch_.st_ino &&
+        current.st_size == epoch_.st_size && current.st_mtim.tv_sec == epoch_.st_mtim.tv_sec &&
+        current.st_mtim.tv_nsec == epoch_.st_mtim.tv_nsec &&
+        current.st_ctim.tv_sec == epoch_.st_ctim.tv_sec &&
+        current.st_ctim.tv_nsec == epoch_.st_ctim.tv_nsec;
 }
 
 /* ------------------------------------------------------------------ residency */
@@ -107,6 +128,9 @@ void* Mover::reserve(const char* what, int64_t bytes, int kind) {
 }
 
 int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, Pools* budget) {
+    if (cfg.native_file_cache_bytes < 0) return RAD_E_INVAL;
+    native_file_cache_on_ = false;
+    RAD_TRY(native_file_cache_.clear());
     prog_ = &prog;
     plan_ = &plan;
     cfg_ = cfg;
@@ -254,6 +278,40 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
             return RAD_E_INVAL;
         }
         RAD_TRY(file_.open(cfg_.container_path));
+        if (cfg_.native_file_cache_bytes > 0) {
+            RAD_TRY(file_.remember_epoch());
+            RAD_TRY(native_file_cache_.configure(cfg_.native_file_cache_bytes, prog.weights.size()));
+            native_file_cache_on_ = true;
+            RAD_INFO("native file RAM cache: %s for this rank, including %s of entry metadata",
+                     humanb(cfg_.native_file_cache_bytes).c_str(),
+                     humanb(native_file_cache_.stats().metadata_bytes).c_str());
+        }
+        /* A weight the file tier relays on each read needs the relayout (set_file_relayout). */
+        int64_t relaid = 0;
+        for (const MoveUnit& mu : plan.units) {
+            if (mu.tier != Tier::SSD) continue;
+            for (rad_weight w : mu.weights) {
+                const WeightInfo& wi = prog.weights[w];
+                if (wi.widen) {
+                    RAD_ERR("mover: '%s' is on the file tier and widened at load, which a file "
+                            "read does not do", wi.name.c_str());
+                    return RAD_E_STATE;
+                }
+                if (!wi.identity) ++relaid;
+            }
+        }
+        if (relaid && !relayout_) {
+            RAD_ERR("mover: the plan puts %lld weight(s) whose stored form is a relayout on the "
+                    "file tier, and the mover was given no relayout to make it on a read",
+                    (long long)relaid);
+            return RAD_E_STATE;
+        }
+        if (relaid) {
+            const unsigned hw = std::thread::hardware_concurrency();
+            relay_threads_ = (int)std::max(1u, std::min(8u, hw / 2));
+            relay_in_.clear();
+            relay_in_.resize((size_t)relay_threads_);
+        }
         /* Staging slots are sized by the widest unit actually on the file tier, not the widest
          * class. The widest class is usually the embedding table (gigabytes, and never on the
          * file tier), and sizing on it would reserve pinned memory for a weight that never
@@ -514,6 +572,17 @@ int Mover::start_stage(int32_t unit, int64_t slab_slot) {
         const MoveUnit& mu = plan_->units[(size_t)unit];
         for (size_t k = 0; k < mu.weights.size(); ++k) {
             const WeightInfo& w = prog_->weights[mu.weights[k]];
+            if (!w.identity || (native_file_cache_on_ && w.stored_bytes <= RAD_PLACE_FILE_WINDOW_BYTES)) {
+                if (relay_in_.empty()) relay_in_.resize(1);
+                bool cached = false;
+                RAD_TRY(read_native_file(w, stage + mu.offset[k], stage_stride_ - mu.offset[k],
+                                        &relay_in_[0], &cached));
+                if (!w.identity && !cached) {
+                    ++stats_.file_relaid;
+                    stats_.file_relaid_bytes += (uint64_t)w.stored_bytes;
+                }
+                continue;
+            }
             RAD_TRY(file_.read(w.file_offset, w.stored_bytes, stage + mu.offset[k],
                                stage_stride_ - mu.offset[k]));
         }
@@ -628,6 +697,20 @@ void Mover::unstage_units(const std::vector<int32_t>& staged) {
     for (int32_t u : staged) republish(u);
 }
 
+void Mover::alias_file_units(const std::vector<int32_t>& units, char* base,
+                             std::vector<int32_t>* staged) {
+    if (!plan_ || !base || !staged) return;
+    for (int32_t u : units) {
+        if (u < 0 || (size_t)u >= unit_.size()) continue;
+        const UnitState& us = unit_[(size_t)u];
+        if (us.tier != Tier::SSD || us.slab_slot >= 0 || us.klass < 0) continue;
+        const MoveUnit& mu = plan_->units[(size_t)u];
+        for (rad_weight w : mu.weights) res_.publish(w, base);
+        staged->push_back(u);
+        ++stats_.file_aliased;
+    }
+}
+
 /* The same choice of units as stage_units, without a cap. */
 int64_t Mover::stage_need(const std::vector<int32_t>& units, int64_t* largest) const {
     int64_t total = 0, most = 0;
@@ -659,14 +742,167 @@ constexpr int64_t kReadThrough = (int64_t)256 << 10;
 
 }  /* namespace */
 
+/* One weight relaid on the read: its selected planes' span, aligned out to the O_DIRECT block,
+ * read into this thread's host input in one pread (the aligned path, which touches no shared
+ * bounce, so threads read at once), then the relayout writes the stored form to `dst`. Each plane
+ * is whole (weight_file_relaid), so it is one range of the container. */
+int Mover::read_relaid(const WeightInfo& w, void* dst, int64_t dst_cap, RelayIn* in) {
+    if (!relayout_ || !in || w.n_sel <= 0) return RAD_E_STATE;
+    if (w.stored_bytes > dst_cap) {
+        RAD_ERR("file tier: '%s' relays to %s and the pinned space for it is %s", w.name.c_str(),
+                humanb(w.stored_bytes).c_str(), humanb(dst_cap).c_str());
+        return RAD_E_SCRATCH;
+    }
+    RadTensor pt[RAD_ENC_MAX_PLANES];
+    weight_planes(w, pt);
+    int64_t lo = INT64_MAX, hi = 0;
+    for (int k = 0; k < w.n_sel; ++k) {
+        const int64_t len = pt[k].shape[0] * rad_dtype_bytes(pt[k].dtype, pt[k].shape[1]);
+        lo = std::min(lo, (int64_t)w.file_plane_offset[k]);
+        hi = std::max(hi, (int64_t)w.file_plane_offset[k] + len);
+    }
+    const int64_t A = DirectFile::alignment();
+    const int64_t a0 = lo / A * A, n = align_up(hi - a0, A);
+    if (in->cap < n) {
+        std::free(in->p);
+        in->p = (uint8_t*)std::aligned_alloc((size_t)A, (size_t)n);
+        in->cap = in->p ? n : 0;
+        if (!in->p) return RAD_E_NOMEM;
+    }
+    RAD_TRY(file_.read((uint64_t)a0, hi - a0, in->p, in->cap));   /* reads n, needs hi - a0 */
+    for (int k = 0; k < w.n_sel; ++k) pt[k].data = in->p + ((int64_t)w.file_plane_offset[k] - a0);
+    const int st = relayout_(w, pt, dst, w.stored_bytes);
+    if (st < 0)
+        RAD_ERR("file tier: relaying '%s' (%s) on the read failed: %s", w.name.c_str(),
+                w.layout_tag.c_str(), rad_strerror(st));
+    return st;
+}
+
+/* The cache stores the final native bytes, not their container encoding. Its lock covers only
+ * CPU copies; GPU copies still use the existing pinned windows and their existing drain events.
+ * The one-Mover Program and held file epoch define the namespace, so a hit requires no payload
+ * hash or relayout. Direct-layout weights use each worker's aligned input, avoiding a shared
+ * O_DIRECT bounce buffer when several workers fill differently aligned window offsets. */
+int Mover::read_native_file(const WeightInfo& w, void* dst, int64_t dst_cap, RelayIn* in,
+                            bool* cache_hit) {
+    if (!in || !dst || !cache_hit || w.stored_bytes <= 0 || dst_cap < w.stored_bytes)
+        return RAD_E_INVAL;
+    *cache_hit = false;
+    const size_t key = (size_t)(&w - prog_->weights.data());
+    if (native_file_cache_on_) {
+        if (!file_.same_epoch()) return RAD_E_STATE;
+        RAD_TRY(native_file_cache_.copy(key, w.stored_bytes, dst, dst_cap, cache_hit));
+        if (*cache_hit) return file_.same_epoch() ? RAD_OK : RAD_E_STATE;
+    }
+    if (!w.identity) {
+        RAD_TRY(read_relaid(w, dst, dst_cap, in));
+    } else {
+        const int64_t A = DirectFile::alignment();
+        if (w.file_offset > (uint64_t)INT64_MAX) return RAD_E_INVAL;
+        const int64_t offset = (int64_t)w.file_offset, lo = offset / A * A, delta = offset - lo;
+        if (w.stored_bytes > INT64_MAX - delta - A) return RAD_E_INVAL;
+        const int64_t need = delta + w.stored_bytes, allocation = align_up(need, A);
+        if (in->cap < allocation) {
+            std::free(in->p);
+            in->p = (uint8_t*)std::aligned_alloc((size_t)A, (size_t)allocation);
+            in->cap = in->p ? allocation : 0;
+            if (!in->p) return RAD_E_NOMEM;
+        }
+        RAD_TRY(file_.read((uint64_t)lo, need, in->p, in->cap));
+        std::memcpy(dst, in->p + delta, (size_t)w.stored_bytes);
+    }
+    if (native_file_cache_on_) {
+        if (!file_.same_epoch()) return RAD_E_STATE;
+        RAD_TRY(native_file_cache_.insert(key, dst, w.stored_bytes));
+        if (!file_.same_epoch()) return RAD_E_STATE;
+    }
+    return RAD_OK;
+}
+
+/* The file stager's relaid weights (stage_file_units): packed into the read windows, each
+ * window's weights read and relaid on up to relay_threads_ threads at once, then copied to the
+ * layer buffer on the mover's stream like the direct runs, the window's event recorded behind
+ * them. A window comes round again only after its copies drained, as for the direct runs. */
+int Mover::stage_relaid(const std::vector<Relaid>& rl) {
+    const int64_t W = RAD_PLACE_FILE_WINDOW_BYTES;
+    if (!windows_ || n_windows_ <= 0) return RAD_E_STATE;
+    if ((int)relay_in_.size() < relay_threads_) relay_in_.resize((size_t)relay_threads_);
+    const auto t_all = std::chrono::steady_clock::now();
+    struct Job { size_t r; int64_t wo; };
+    std::vector<Job> jobs;
+    size_t i = 0;
+    while (i < rl.size()) {
+        const int w = win_next_;
+        win_next_ = (win_next_ + 1) % n_windows_;
+        char* win = windows_ + (int64_t)w * W;
+        if (win_rec_[(size_t)w]) {
+            const auto t0 = std::chrono::steady_clock::now();
+            RAD_TRY(rad_event_sync(win_ev_[(size_t)w]));
+            stats_.file_wait_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                       std::chrono::steady_clock::now() - t0).count();
+            win_rec_[(size_t)w] = 0;
+        }
+        jobs.clear();
+        int64_t used = 0;
+        while (i < rl.size()) {
+            const WeightInfo& wi = *rl[i].w;
+            const int64_t a = std::max<int64_t>(wi.align > 0 ? wi.align : RAD_ALIGN_UNIT, 256);
+            const int64_t wo = align_up(used, a);
+            if (wo + wi.stored_bytes > W) break;
+            jobs.push_back(Job{ i, wo });
+            used = wo + wi.stored_bytes;
+            ++i;
+        }
+        if (jobs.empty()) {
+            RAD_ERR("file tier: '%s' relays to %s, more than a %s read window", rl[i].w->name.c_str(),
+                    humanb(rl[i].w->stored_bytes).c_str(), humanb(W).c_str());
+            return RAD_E_SCRATCH;
+        }
+        std::vector<int> rc(jobs.size(), RAD_OK);
+        std::vector<uint8_t> cache_hits(jobs.size(), 0);
+        std::atomic<size_t> next{ 0 };
+        auto work = [&](int t) {
+            for (size_t j; (j = next.fetch_add(1)) < jobs.size();) {
+                const Job& jb = jobs[j];
+                bool cached = false;
+                rc[j] = read_native_file(*rl[jb.r].w, win + jb.wo, W - jb.wo,
+                                         &relay_in_[(size_t)t], &cached);
+                cache_hits[j] = cached;
+            }
+        };
+        const int nt = (int)std::min<size_t>((size_t)relay_threads_, jobs.size());
+        std::vector<std::thread> th;
+        for (int t = 1; t < nt; ++t) th.emplace_back(work, t);
+        work(0);
+        for (std::thread& x : th) x.join();
+        for (size_t j = 0; j < jobs.size(); ++j) RAD_TRY(rc[j]);
+        for (size_t j = 0; j < jobs.size(); ++j) {
+            const Job& jb = jobs[j];
+            const WeightInfo& wi = *rl[jb.r].w;
+            RAD_TRY(rad_memcpy_async(rl[jb.r].dst, win + jb.wo, wi.stored_bytes, mover_));
+            if (!wi.identity && !cache_hits[j]) {
+                ++stats_.file_relaid;
+                stats_.file_relaid_bytes += (uint64_t)wi.stored_bytes;
+            }
+        }
+        RAD_TRY(rad_event_record(win_ev_[(size_t)w], mover_));
+        win_rec_[(size_t)w] = 1;
+    }
+    stats_.file_relayout_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   std::chrono::steady_clock::now() - t_all).count();
+    return RAD_OK;
+}
+
 int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_t cap,
                             RadEvent after, RadEvent done, std::vector<int32_t>* staged) {
     if (!plan_ || !dst || !staged || !done) return RAD_E_INVAL;
     staged->clear();
     if (!file_.ok() || !windows_ || n_windows_ <= 0) return RAD_E_STATE;
 
-    /* The layout in `dst`, unit by unit in the order given, and every weight's extent. */
+    /* The layout in `dst`, unit by unit in the order given, and every weight's extent; a weight
+     * the read relays goes through stage_relaid instead of the windows' direct copies. */
     std::vector<FileExt> ext;
+    std::vector<Relaid>  relaid;
     std::vector<int64_t> at;
     int64_t off = 0;
     for (int32_t u : units) {
@@ -683,6 +919,10 @@ int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_
         for (size_t k = 0; k < mu.weights.size(); ++k) {
             const WeightInfo& w = prog_->weights[mu.weights[k]];
             if (w.stored_bytes <= 0) continue;          /* nothing to read, and nothing to place */
+            if (!w.identity || (native_file_cache_on_ && w.stored_bytes <= RAD_PLACE_FILE_WINDOW_BYTES)) {
+                relaid.push_back(Relaid{ &w, dst + off + mu.offset[k] });
+                continue;
+            }
             ext.push_back(FileExt{ (int64_t)w.file_offset, w.stored_bytes, dst + off + mu.offset[k] });
         }
         staged->push_back(u);
@@ -758,6 +998,7 @@ int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_
         RAD_TRY(rad_event_record(win_ev_[(size_t)w], mover_));
         win_rec_[(size_t)w] = 1;
     }
+    if (!relaid.empty()) RAD_TRY(stage_relaid(relaid));
     RAD_TRY(rad_event_record(done, mover_));
 
     for (size_t k = 0; k < staged->size(); ++k) {
@@ -1612,12 +1853,31 @@ std::string Mover::report() const {
      * window whose copies had not drained when it came round again. */
     if (stats_.file_layers) {
         const double rs = (double)stats_.file_read_ns * 1e-9;
-        s += fmt("  file stager: %llu routed layers read, %llu units, %.2f GiB in %llu preads; "
+        if (native_file_cache_on_)
+            s += fmt("  file stager: %llu routed layers, %llu units, %.2f GiB native bytes staged "
+                     "from RAM or disk; %.2f s waiting on windows\n",
+                     (unsigned long long)stats_.file_layers, (unsigned long long)stats_.file_units,
+                     (double)stats_.file_bytes * gib, (double)stats_.file_wait_ns * 1e-9);
+        else s += fmt("  file stager: %llu routed layers read, %llu units, %.2f GiB in %llu preads; "
                  "%.2f s reading (%.2f GB/s), %.2f s waiting on windows\n",
                  (unsigned long long)stats_.file_layers, (unsigned long long)stats_.file_units,
                  (double)stats_.file_bytes * gib, (unsigned long long)stats_.file_preads, rs,
                  rs > 0 ? (double)stats_.file_bytes / rs * 1e-9 : 0.0,
                  (double)stats_.file_wait_ns * 1e-9);
+    }
+    if (stats_.file_relaid)
+        s += fmt("  file tier relayout: %llu weights relaid on the read (%.2f GiB), %.2f s of the "
+                 "issuing thread in the file stager's read+relayout\n",
+                 (unsigned long long)stats_.file_relaid, (double)stats_.file_relaid_bytes * gib,
+                 (double)stats_.file_relayout_ns * 1e-9);
+    if (native_file_cache_on_) {
+        const NativeFileCache::Stats c = native_file_cache_.stats();
+        s += fmt("  native file RAM cache: %llu hits (%.2f GiB), %llu misses (%.2f GiB), "
+                 "%llu evictions, %llu bypasses; %s charged of %s\n",
+                 (unsigned long long)c.hits, (double)c.hit_bytes * gib,
+                 (unsigned long long)c.misses, (double)c.miss_bytes * gib,
+                 (unsigned long long)c.evictions, (unsigned long long)c.bypasses,
+                 humanb(c.metadata_bytes + c.payload_charge).c_str(), humanb(c.budget_bytes).c_str());
     }
     return s;
 }

@@ -1316,6 +1316,43 @@ bool anchor_replays_per_candidate(const Check& ck, int64_t K, int64_t V, int64_t
 }
 
 /* ================================================================== packed stores */
+/* embed_lookup_planes over the forms libref's description does not draw (it draws i8 codes and no
+ * table): u4 codes through a 16-entry table, the served form libavx decodes sixteen at a time,
+ * with group 32 and 16, a multiplier, a padded and out-of-slice id; u4 without a table and i4
+ * (signed, element loop); a group of 8 (element loop). Bit for bit: both sides multiply the same
+ * f32 operands in the same order. */
+void planes_gather_cases(std::vector<Hand>& hs) {
+    static const float kNl[16] = { -127, -104, -83, -65, -49, -35, -22, -10,
+                                   1, 13, 25, 38, 53, 69, 89, 113 };
+    struct F { const char* name; uint32_t cdt; bool tab; int64_t E, G, voff; float mult; };
+    const F fs[] = {
+        { "u4 + table, group 32 (sixteen at a time)", RAD_U4, true, 256, 32, 0, 1.0f },
+        { "u4 + table, group 16, mult, vocab slice", RAD_U4, true, 64, 16, 5, 0.375f },
+        { "u4, no table", RAD_U4, false, 64, 32, 0, 1.0f },
+        { "i4, no table", RAD_I4, false, 64, 32, 0, 2.0f },
+        { "u4 + table, group 8 (element loop)", RAD_U4, true, 64, 8, 0, 1.0f },
+    };
+    for (const F& f : fs) {
+        const int64_t V = 61, M = 37;
+        std::vector<uint8_t> codes((size_t)(V * f.E / 2));
+        uint32_t st = 0x9e3779b9u ^ (uint32_t)f.E;
+        for (auto& c : codes) { st = st * 1664525u + 1013904223u; c = (uint8_t)(st >> 24); }
+        std::vector<int64_t> ids((size_t)M);
+        for (int64_t m = 0; m < M; ++m) ids[(size_t)m] = (m * 17 + 3) % (V + f.voff) ;
+        ids[3] = -1;
+        Hand hd((std::string("embed_lookup_planes: ") + f.name).c_str(), "embed_lookup_planes", 0.0);
+        hd.idx(ids)
+          .raw(f.cdt, { V, f.E }, codes.data())
+          .dense(RAD_F16, { V, f.E / f.G }, [](int64_t i) { return 0.00048828125f * (float)((i * 7) % 23 + 1) * ((i & 1) ? -1.0f : 1.0f); });
+        if (f.tab) hd.dense(RAD_F32, { 16 }, [](int64_t i) { return kNl[i]; });
+        else       hd.none();
+        hd.dense(RAD_BF16, { M, f.E }, [](int64_t) { return 0.0f; }, true)
+          .pi("M", M).pi("n_embd", f.E).pi("n_vocab", V).pi("group", f.G).ps("dtype", "bf16")
+          .pi("vocab_offset", f.voff).pf("mult", f.mult);
+        hs.push_back(std::move(hd));
+    }
+}
+
 void packed_cases(std::vector<Hand>& hs) {
     /* Nearest code, ties to the even code, saturation and NaN, into e2m1, int4 and int2: the
      * stores a gather or a cast of packed rows rests on. 27 values, so the last byte is half
@@ -4923,6 +4960,249 @@ void audio_cases(std::vector<Hand>& hs) {
     }
 }
 
+/* ================================================================== DeepSeek-V4.1
+ *
+ * The ops' descriptions draw what the model hands them, but not llama.cpp's native blocks (the
+ * weight is described in its float logical form), nor the optional operands and the negative ids
+ * that skip a row. */
+void ds41_cases(std::vector<Hand>& hs) {
+    /* ---- the GEMMs and the lookup over native blocks ------------------------------------ */
+    /* Random blocks, each f16 scale set to a finite value near 1 and each E8M0 exponent near 2^0,
+     * so every dequantised value is a number of the size the type stores. The offsets are the
+     * types' llama.cpp block layouts (libquant/lq_ggml_port.h). */
+    struct Ty { const char* name; int64_t block, bytes; std::vector<int64_t> f16_at, e8_at; };
+    const Ty types[] = {
+        { "q8_0",    32,  34,  { 0 },    {} },
+        { "q5_K",    256, 176, { 0, 2 }, {} },
+        { "q6_K",    256, 210, { 208 },  {} },
+        { "iq4_nl",  32,  18,  { 0 },    {} },
+        { "iq2_xxs", 256, 66,  { 0 },    {} },
+        { "iq1_s",   256, 50,  { 0 },    {} },
+        { "mxfp4",   32,  17,  {},       { 0 } },
+    };
+    uint64_t seed = 0x2545F4914F6CDD1Dull;
+    auto rnd = [&]() { seed = seed * 6364136223846793005ull + 1442695040888963407ull; return seed >> 33; };
+    auto blocks = [&](const Ty& ty, int64_t rows, int64_t K) {
+        const int64_t nb = K / ty.block;
+        std::vector<uint8_t> b((size_t)(rows * nb * ty.bytes));
+        for (uint8_t& v : b) v = (uint8_t)rnd();
+        for (int64_t i = 0; i < rows * nb; ++i) {
+            for (int64_t off : ty.f16_at) {
+                const uint16_t h = (uint16_t)((rnd() & 0x8000u) | ((8u + rnd() % 8u) << 10) | (rnd() & 0x3FFu));
+                std::memcpy(b.data() + i * ty.bytes + off, &h, 2);
+            }
+            for (int64_t off : ty.e8_at) b[(size_t)(i * ty.bytes + off)] = (uint8_t)(122u + rnd() % 8u);
+        }
+        return b;
+    };
+    for (const Ty& ty : types) {
+        for (const char* dt : { "f32", "bf16" }) {
+            const uint32_t D = std::strcmp(dt, "f32") ? RAD_BF16 : RAD_F32;
+            const double tol = D == RAD_F32 ? 2e-5 : 8e-3;
+            const int64_t K = 2 * ty.block, N = 37, M = 5, rb = K / ty.block * ty.bytes;
+            {
+                const std::vector<uint8_t> w = blocks(ty, N, K);
+                std::string nm = std::string("native ") + ty.name + " blocks, " + dt;
+                Hand h(nm.c_str(), "gemm_nt_ggml", tol);
+                h.dense(D, { M, K }, hfill(51))
+                 .raw(RAD_U8, { N, rb }, w.data())
+                 .dense(D, { M, N }, hfill(52), true)
+                 .pi("M", M).pi("N", N).pi("K", K).ps("type", ty.name).ps("dtype", dt);
+                hs.push_back(std::move(h));
+            }
+            {
+                /* The engine's form: the stored bytes at the declared shape [N, K]. */
+                const std::vector<uint8_t> w = blocks(ty, N, K);
+                std::string nm = std::string("native ") + ty.name + " blocks at the declared shape, " + dt;
+                Hand h(nm.c_str(), "logits_gemm_ggml", tol);
+                h.dense(D, { 1, K }, hfill(53))
+                 .bytes(RAD_U8, { N, K }, { K, 1 }, N * rb, w, false)
+                 .dense(RAD_F32, { 1, N }, hfill(54), true)
+                 .pi("M", 1).pi("n_vocab", N).pi("n_embd", K).ps("type", ty.name).ps("dtype", dt);
+                hs.push_back(std::move(h));
+            }
+            {
+                const int64_t V = 11;
+                const std::vector<uint8_t> w = blocks(ty, V, K);
+                std::string nm = std::string("native ") + ty.name + " rows, a padded id, mult, " + dt;
+                Hand h(nm.c_str(), "embed_lookup_ggml", D == RAD_F32 ? 0.0 : 4e-3);
+                h.idx({ 3, 10, -1, 0, 7, 3 })
+                 .raw(RAD_U8, { V, rb }, w.data())
+                 .dense(D, { 6, K }, hfill(55), true)
+                 .pi("M", 6).pi("n_embd", K).pi("n_vocab", V).ps("type", ty.name).ps("dtype", dt)
+                 .pf("mult", 1.75);
+                hs.push_back(std::move(h));
+            }
+            {
+                /* Five tokens, top 2, four experts stacked; one dropped slot, one expert idle. */
+                const int64_t NE = 4, TK = 2, T = M * TK, NN = 24;
+                const std::vector<uint8_t> w = blocks(ty, NE * NN, K);
+                std::string nm = std::string("native ") + ty.name + " experts stacked, " + dt;
+                Hand h(nm.c_str(), "moe_gemm_ggml", tol);
+                h.dense(D, { M, K }, hfill(56))
+                 .raw(RAD_U8, { NE, NN, rb }, w.data())
+                 .idx({ 7, 0, 4, 9, -1, 2, 5, 1, 8, 3 })
+                 .idx({ 0, 4, 4, 7, T })
+                 .dense(D, { T, NN }, hfill(57), true)
+                 .pi("M", M).pi("N", NN).pi("K", K).pi("n_expert", NE).pi("top_k", TK)
+                 .ps("a_order", "token").ps("type", ty.name).ps("dtype", dt);
+                hs.push_back(std::move(h));
+            }
+        }
+    }
+
+    /* ---- the selections' optional operands and skipped rows ------------------------------ */
+    {
+        /* keep as index_candidates writes it, a bit a block of four: two blocks kept a row, one
+         * row keeping none it can reach. Positions past the width, before it and at its edge. */
+        const int64_t M = 4, C = 16, K = 5;
+        Hand h("keep given; reach 0, 8, 5 and past the width", "index_topk", 0.0);
+        h.dense(RAD_F32, { M, C }, hfill(61))
+         .dense(RAD_I32, { M, 1 },
+                [](int64_t m) { return (float)(m == 3 ? 0b1000 : 0b0101 << (m % 2)); })
+         .idx({ 0, 15, 40, 9 })
+         .dense(RAD_I32, { M, K }, [](int64_t) { return 7.0f; }, true)
+         .pi("M", M).pi("width", C).pi("topk", K).pi("ratio", 2).pi("block", 4);
+        hs.push_back(std::move(h));
+    }
+    {
+        /* Blocks of one over 40 positions, two words a row: bit 31 (the word's sign) beside bits
+         * of the second word; every bit, the row reaching two; the second word alone. */
+        const int64_t M = 3, C = 40, K = 4;
+        const int32_t keep[] = { (int32_t)0x80000080u, 0x5, -1, -1, 0, 0x90 };
+        Hand h("keep a bit a position across two words", "index_topk", 0.0);
+        h.dense(RAD_F32, { M, C }, hfill(520))
+         .raw(RAD_I32, { M, 2 }, keep)
+         .idx({ 39, 1, 60 })
+         .dense(RAD_I32, { M, K }, [](int64_t) { return 7.0f; }, true)
+         .expect(3, { 7, 31, 32, 34, 0, 1, -1, -1, 36, 39, -1, -1 })
+         .pi("M", M).pi("width", C).pi("topk", K).pi("ratio", 1).pi("block", 1);
+        hs.push_back(std::move(h));
+    }
+    {
+        /* keep's words are read only with `block`: without it they are refused, nothing written. */
+        Hand h("keep without block is refused", "index_topk", 0.0);
+        h.dense(RAD_F32, { 2, 8 }, hfill(521))
+         .dense(RAD_I32, { 2, 1 }, [](int64_t) { return 3.0f; })
+         .idx({ 7, 7 })
+         .dense(RAD_I32, { 2, 2 }, [](int64_t) { return 7.0f; }, true)
+         .refuses(RAD_E_SHAPE)
+         .pi("M", 2).pi("width", 8).pi("topk", 2).pi("ratio", 1);
+        hs.push_back(std::move(h));
+    }
+    {
+        /* Ties: equal scores in a block and across blocks pick the lower index. */
+        const int64_t M = 2, C = 12;
+        Hand h("tied block maxima, the newest reachable block pinned", "index_candidates", 0.0);
+        h.dense(RAD_F32, { M, C }, [](int64_t i) { return (float)((i % 5) == 0 ? 2 : (i % 3)); })
+         .idx({ 11, 2 })
+         .dense(RAD_I32, { M, 1 }, [](int64_t) { return 9.0f; }, true)
+         .pi("M", M).pi("width", C).pi("block", 3).pi("topk_blocks", 2).pi("ratio", 1);
+        hs.push_back(std::move(h));
+    }
+    {
+        /* keep's bit layout by hand: 35 blocks of two, block 33 the best and block 34 (the newest
+         * reachable) pinned, so word 0 is clear and word 1 holds bits 1 and 2; the bits past the
+         * last block, preset, are cleared. */
+        const int64_t C = 70;
+        Hand h("keep's bits: blocks 33 and 34 in the second word", "index_candidates", 0.0);
+        h.dense(RAD_F32, { 1, C },
+                [](int64_t j) { return j == 66 ? 5.0f : 0.01f * (float)(j % 7); })
+         .idx({ 69 })
+         .dense(RAD_I32, { 1, 2 }, [](int64_t) { return -1.0f; }, true)
+         .expect_bytes(2, { 0, 0, 0, 0, 6, 0, 0, 0 })
+         .pi("M", 1).pi("width", C).pi("block", 2).pi("topk_blocks", 2).pi("ratio", 1);
+        hs.push_back(std::move(h));
+    }
+    for (int part : { 0, 1, 2 }) {
+        /* index_score's runs (row_part): five rows of two sequences (rows 0-2 and 3-4) in runs of
+         * two. Run 0 is a split step's first, run 1 straddles the sequences, run 2's second row
+         * is past the step and scores -inf. Blocks unmapped (-1) and past the cache (9). */
+        const char* nm[] = { "index scorer row_part: a split step's first run",
+                             "index scorer row_part: a run across two sequences",
+                             "index scorer row_part: a run past the step's last row" };
+        const int64_t Mq = 5, H = 2, Dm = 64, R = 4, C = 6;
+        Hand h(nm[part], "index_score", 1e-5);
+        h.dense(RAD_F32, { Mq, H * Dm }, hfill(522 + part))
+         .dense(RAD_F32, { Mq, H }, hfill(525 + part))
+         .dense(RAD_F32, { 4, 1, R, Dm / R }, hfill(528 + part))
+         .dense(RAD_I32, { 2, C }, [](int64_t i) {
+             const int64_t t[] = { 0, 2, 1, -1, 3, 0, 3, 1, 9, 2, -1, 1 };
+             return (float)t[i];
+         })
+         .idx({ 13, 14, 15, 20, 22 })
+         .idx({ 0, 3, 5 })
+         .dense(RAD_F32, { 2, C }, [](int64_t) { return 0.0f; }, true)
+         .pi("M", 2).pi("heads", H).pi("dim", Dm).pi("ratio", R).pi("width", C)
+         .pf("wscale", 0.5).ps("dtype", "f32").pi("row_part", part);
+        hs.push_back(std::move(h));
+    }
+    {
+        /* Without row_part score holds every row of q: fewer rows are refused, nothing written. */
+        Hand h("index scorer refuses a short score without row_part", "index_score", 1e-5);
+        h.dense(RAD_F32, { 3, 2 * 64 }, hfill(531))
+         .dense(RAD_F32, { 3, 2 }, hfill(532))
+         .dense(RAD_F32, { 2, 1, 4, 16 }, hfill(533))
+         .dense(RAD_I32, { 1, 2 }, [](int64_t i) { return (float)i; })
+         .idx({ 9, 10, 11 })
+         .idx({ 0, 3 })
+         .dense(RAD_F32, { 2, 3 }, [](int64_t) { return 0.0f; }, true)
+         .refuses(RAD_E_SHAPE)
+         .pi("M", 2).pi("heads", 2).pi("dim", 64).pi("ratio", 4).pi("width", 3)
+         .pf("wscale", 0.5).ps("dtype", "f32");
+        hs.push_back(std::move(h));
+    }
+    {
+        Hand h("a negative page skips its entry", "softmax_pool", 1e-6);
+        h.dense(RAD_F32, { 3 * 4, 2 * 40 }, hfill(62, 2.0f))
+         .dense(RAD_BF16, { 3, 40 }, hfill(63), true)
+         .idx({ 2, -1, 0 })
+         .pi("M", 3).pi("n", 40).pi("ratio", 4).ps("dtype", "bf16");
+        hs.push_back(std::move(h));
+    }
+    {
+        Hand h("a negative page writes nothing", "entry_store", 0.0);
+        h.dense(RAD_BF16, { 3, 32 }, hfill(64))
+         .idx({ 4, -1, 1 })
+         .dense(RAD_BF16, { 6, 1, 4, 8 }, hfill(65), true)
+         .pi("M", 3).pi("n", 32).pi("block_size", 4).ps("dtype", "bf16");
+        hs.push_back(std::move(h));
+    }
+    {
+        Hand h("a page past the cache is refused before any write", "entry_store", 0.0);
+        h.dense(RAD_BF16, { 2, 32 }, hfill(66))
+         .idx({ 6, 1 })
+         .dense(RAD_BF16, { 6, 1, 4, 8 }, hfill(67), true)
+         .pi("M", 2).pi("n", 32).pi("block_size", 4).ps("dtype", "bf16")
+         .refuses(RAD_E_INVAL);
+        hs.push_back(std::move(h));
+    }
+    {
+        /* Two sequences, the second's window partly evicted (window_used short of its length),
+         * absent selections (-1) and a selection past the compressed table. */
+        const int64_t M = 6, H = 2, Dm = 16, win = 4, ratio = 4, topk = 3, bs = 2, nb = 6, ncb = 4;
+        Hand h("two sequences, a short window, absent and out-of-table selections",
+               "attn_sparse_sink", 1e-4);
+        h.dense(RAD_F32, { M, H * Dm }, hfill(71))
+         .dense(RAD_F32, { nb, 1, bs, Dm }, hfill(72))
+         .dense(RAD_I32, { 2, 3 }, [](int64_t i) { const float t[6] = { 0, 1, 2, 3, 5, -1 }; return t[i]; })
+         .idx({ 3, 2 })
+         .dense(RAD_F32, { ncb, 1, ratio, Dm / ratio }, hfill(73))
+         .dense(RAD_I32, { 2, 2 }, [](int64_t i) { const float t[4] = { 1, 0, 3, 2 }; return t[i]; })
+         .dense(RAD_I32, { M, topk }, [](int64_t i) { const float t[18] = { 0, 1, -1, 1, 0, 7,
+                                                                         -1, -1, -1, 0, 1, 2,
+                                                                         1, -1, 0, 3, 2, 1 };
+                                                     return t[i]; })
+         .idx({ 0, 1, 2, 0, 1, 2 })
+         .idx({ 0, 3, 6 })
+         .dense(RAD_F32, { H }, hfill(74))
+         .dense(RAD_F32, { M, H * Dm }, hfill(75), true)
+         .pi("M", M).pi("heads", H).pi("dim", Dm).pi("window", win).pi("ratio", ratio)
+         .pi("topk", topk).pf("scale", 0.25).ps("dtype", "f32");
+        hs.push_back(std::move(h));
+    }
+}
+
 }  // namespace
 
 bool hand_cases(const Check& ck) {
@@ -4931,6 +5211,7 @@ bool hand_cases(const Check& ck) {
     format_cases(hs);
     anchor_cases(hs);
     packed_cases(hs);
+    planes_gather_cases(hs);
     gen_cases(hs);
     video_cases(hs);
     upscaler_cases(hs);
@@ -4940,6 +5221,7 @@ bool hand_cases(const Check& ck) {
     kvstream_cases(hs);
     encoder_cases(hs);
     audio_cases(hs);
+    ds41_cases(hs);
     Broken broken;
     planes_cases(ck, hs, broken);
 

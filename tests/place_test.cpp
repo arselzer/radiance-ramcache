@@ -27,6 +27,7 @@
 #include <cstring>
 #include <string>
 #include <thread>
+#include <atomic>
 #include <vector>
 
 using namespace rad;
@@ -1451,6 +1452,343 @@ TEST(the_file_stager_reads_each_routed_layer_from_the_container) {
     CHECK_EQ(m.stats().file_layers, (uint64_t)(2 * L));
     CHECK_EQ(m.stats().file_units, (uint64_t)(2 * L * 2));
     CHECK(m.stats().file_preads >= (uint64_t)(2 * L * 2));
+    rad_stream_sync(m.transfer_stream());
+    rad_stream_destroy(s);
+    std::remove(path.c_str());
+}
+
+namespace {
+/* A relayout a test can predict, standing in for a kernel's (RadRelayoutFn): the first plane's
+ * bytes reversed and xored, then the second plane as it is. Refuses a size that is not the two
+ * planes', so a weight handed the wrong geometry fails loudly. */
+int reversing_relayout(const RadParam*, int, int, const RadEncoding*, const int*,
+                       const RadTensor* planes, int n_planes, void* dst, int64_t dst_bytes) {
+    if (n_planes != 2) return RAD_E_SHAPE;
+    const int64_t n0 = planes[0].shape[0] * planes[0].shape[1];
+    const int64_t n1 = planes[1].shape[0] * planes[1].shape[1];
+    if (n0 + n1 != dst_bytes || !planes[0].data || !planes[1].data) return RAD_E_SHAPE;
+    const uint8_t* a = (const uint8_t*)planes[0].data;
+    uint8_t* d = (uint8_t*)dst;
+    for (int64_t i = 0; i < n0; ++i) d[i] = (uint8_t)(a[n0 - 1 - i] ^ 0x5a);
+    std::memcpy(d + n0, planes[1].data, (size_t)n1);
+    return RAD_OK;
+}
+}  /* namespace */
+
+/* A weight whose kernel stores a relayout of the container's planes goes to the file tier too
+ * (weight_file_relaid, PlannerInput::file_relayout) and is relaid on every read, by the kernel's
+ * own relayout, into the read windows the copy to the card reads. Three routed layers of four
+ * experts, two planes per weight: the second starts 256 bytes past the first's end, so not on an
+ * O_DIRECT block, and a layer's relaid bytes span two read windows. Experts 0 and 2 stay resident.
+ * Refused without the planner's flag, and by a mover with no relayout. */
+TEST(the_file_tier_relays_a_weight_its_kernel_relayouts_on_every_read) {
+    Fixture f;
+    const int64_t tail = 600;                         /* the second plane */
+    const int64_t gu = 20 * MiB + 1000 + tail, dn = 1 * MiB + 24 + tail;
+    const int L = 3;    /* with two, the two layer buffers cost what the file-tier experts would */
+    build_moe_layers(f, L, 4, gu, dn);
+    RadKernelInfo info = g_dev_info;
+    info.relayout = reversing_relayout;
+    KernelRow row;
+    row.info = &info;
+    for (OpInfo& o : f.prog.ops)
+        if (o.op == "moe_gemm") o.bands[0].dom[RAD_DOMAIN_DEVICE].row = &row;
+
+    int64_t off = 4 * (int64_t)RAD_ALIGN_UNIT;
+    std::vector<rad_weight> relaid;
+    for (rad_weight w = 1; (size_t)w < f.prog.weights.size(); ++w) {
+        WeightInfo& wi = f.prog.weights[w];
+        wi.stored_bytes = wi.logical_bytes;
+        wi.file_offset = (uint64_t)off;
+        if (wi.decl.group.expert < 0) {
+            off = align_up(off + wi.stored_bytes, RAD_ALIGN_UNIT);
+            continue;
+        }
+        const int64_t n0 = wi.logical_bytes - tail;
+        wi.identity = false;
+        wi.layout_tag = "test.reversed";
+        wi.lay_op = wi.first_use_op;
+        wi.lay_band = 0;
+        wi.lay_dom = RAD_DOMAIN_DEVICE;
+        wi.lay_operand = 0;
+        wi.enc.n_planes = 2;
+        wi.enc.plane[0].dtype = RAD_U8;
+        wi.enc.plane[1].dtype = RAD_U8;
+        wi.n_sel = 2;
+        wi.sel[0] = 0;
+        wi.sel[1] = 1;
+        wi.sel_rows[0] = 1; wi.sel_cols[0] = n0;
+        wi.sel_rows[1] = 1; wi.sel_cols[1] = tail;
+        wi.file_plane_offset[0] = (uint64_t)off;
+        wi.file_plane_offset[1] = (uint64_t)align_up(off + n0, 256);
+        off = align_up((int64_t)wi.file_plane_offset[1] + tail, RAD_ALIGN_UNIT);
+        relaid.push_back(w);
+    }
+    std::vector<uint8_t> img((size_t)off);
+    for (int64_t i = 0; i < off; ++i) img[(size_t)i] = container_byte(i);
+    const std::string path = "place_test_file_relay.rad";
+    {
+        FILE* fp = std::fopen(path.c_str(), "wb");
+        CHECK(fp != nullptr);
+        if (!fp) return;
+        CHECK_EQ(std::fwrite(img.data(), 1, img.size(), fp), img.size());
+        std::fclose(fp);
+    }
+    {
+        DirectFile probe;
+        if (probe.open(path.c_str(), RAD_DIO_READ) < 0) {
+            std::printf("  SKIP the working directory has no O_DIRECT\n");
+            std::remove(path.c_str());
+            return;
+        }
+    }
+    /* What the relayout makes of weight w's planes. */
+    auto expect = [&](rad_weight w) {
+        const WeightInfo& wi = f.prog.weights[w];
+        const int64_t n0 = wi.sel_cols[0];
+        std::vector<uint8_t> e((size_t)wi.stored_bytes);
+        for (int64_t i = 0; i < n0; ++i)
+            e[(size_t)i] = (uint8_t)(img[(size_t)(wi.file_plane_offset[0] + n0 - 1 - i)] ^ 0x5a);
+        std::memcpy(e.data() + n0, img.data() + wi.file_plane_offset[1], (size_t)tail);
+        return e;
+    };
+
+    std::vector<RadFileProfile> prof;
+    for (int l = 0; l < L; ++l)
+        for (int e = 0; e < 4; ++e)
+            prof.push_back(RadFileProfile{l, e, e == 0 ? 0.5f : e == 2 ? 0.4f : 0.01f, 0.0f});
+    Config c = base_config();
+    c.placement = "expert_tiered";
+    c.deterministic = true;
+    c.vram_weights_mib = 222;
+    c.host_pool_mib = (4 * 22 * MiB + RAD_PLACE_FILE_WINDOWS * RAD_PLACE_FILE_WINDOW_BYTES) / MiB + 1;
+    c.weights_disk_tier = true;
+    PlannerInput in{&f.prog, &c, 0, 1, prof.data(), (int64_t)prof.size()};
+    {
+        /* Without the flag a relaid unit fits in no tier, as before. */
+        Plan refused;
+        CHECK(Planner(in).plan(&refused) < 0);
+    }
+    in.file_relayout = true;
+    Plan p;
+    CHECK_OK(Planner(in).plan(&p));
+    std::vector<std::vector<rad_weight>> file_w((size_t)L);
+    for (const MoveUnit& mu : p.units) {
+        if (mu.expert < 0) continue;
+        CHECK(mu.tier == ((mu.expert & 1) ? Tier::SSD : Tier::VRAM));
+        if (mu.tier == Tier::SSD)
+            for (rad_weight w : mu.weights) file_w[(size_t)mu.layer].push_back(w);
+    }
+
+    MoverConfig mc;
+    mc.container_path = path;
+    {
+        /* A mover with no relayout refuses the plan rather than copy the planes as they lie. */
+        Mover bare;
+        CHECK(bare.init(f.prog, p, mc) < 0);
+    }
+    Mover m;
+    std::atomic<int> calls{ 0 };
+    m.set_file_relayout([&](const WeightInfo& w, const RadTensor* planes, void* dst, int64_t n) {
+        ++calls;
+        const RadKernelInfo* ki = weight_layout_kernel(f.prog, w);
+        if (!ki || !ki->relayout) return (int)RAD_E_STATE;
+        return ki->relayout(nullptr, 0, w.lay_operand, &w.enc, w.sel, planes, w.n_sel, dst, n);
+    });
+    CHECK_OK(m.init(f.prog, p, mc));
+    RadStream s = nullptr;
+    CHECK_OK(rad_stream_create(&s, 0));
+    CHECK_OK(m.bind_compute_stream(s));
+    FileStager fs;
+    CHECK_OK(fs.init(f.prog, p, &m));
+    CHECK(fs.enabled());
+
+    /* Every file-tier weight of layer l is published holding its relayout. */
+    auto relaid_ok = [&](int l) {
+        int ok = 0;
+        for (rad_weight w : file_w[(size_t)l]) {
+            const WeightSlot* slot = m.residency()->lookup(w);
+            if (!slot || !slot->ptr) continue;
+            const WeightInfo& wi = f.prog.weights[w];
+            std::vector<uint8_t> got((size_t)wi.stored_bytes);
+            rad_stream_sync(m.transfer_stream());
+            if (rad_memcpy_async(got.data(), slot->ptr, wi.stored_bytes, s) < 0) continue;
+            rad_stream_sync(s);
+            if (got == expect(w)) ++ok;
+        }
+        return ok == (int)file_w[(size_t)l].size() && ok > 0;
+    };
+    for (int pass = 0; pass < 2; ++pass) {
+        RadBatch b{};
+        CHECK(fs.begin_pass(&b));
+        bool resync = false;
+        CHECK_OK(fs.before_op(0, s, &resync));          /* layer 0 */
+        CHECK(relaid_ok(0));
+        CHECK_OK(fs.before_op(1, s, &resync));          /* layer 1 read ahead */
+        CHECK(relaid_ok(1));
+        CHECK_OK(fs.before_op(2, s, &resync));
+        CHECK_OK(fs.before_op(3, s, &resync));          /* layer 2 read ahead */
+        CHECK(relaid_ok(1) && relaid_ok(2));
+        CHECK_OK(fs.before_op(4, s, &resync));
+        CHECK_OK(fs.before_op(5, s, &resync));
+        CHECK(relaid_ok(2));
+        CHECK_OK(fs.before_op(6, s, &resync));
+        CHECK_OK(fs.end_pass(s));
+    }
+    /* Two passes over three layers of two file-tier experts of two weights, every one relaid. */
+    CHECK_EQ(m.stats().file_relaid, (uint64_t)(2 * L * 2 * 2));
+    CHECK_EQ((uint64_t)calls.load(), m.stats().file_relaid);
+    CHECK_EQ(m.stats().file_units, (uint64_t)(2 * L * 2));
+    rad_stream_sync(m.transfer_stream());
+    rad_stream_destroy(s);
+    std::remove(path.c_str());
+}
+
+TEST(the_file_stager_reads_only_the_experts_a_small_pass_routes_to) {
+    /* The fixture above: three routed layers of four experts, 1 and 3 of each on the file tier.
+     * A one-token pass at top_k 2 routes, per layer, to the counts below. Layer 0 routes to
+     * expert 1 and is then sliced (its first op issued again), so the whole layer is read
+     * behind it; layer 1 routes to 3; layer 2's counts do not add up to the pass, so it is read
+     * whole. */
+    Fixture f;
+    const int64_t gu = 14 * MiB + 1000, dn = 6 * MiB + 24;
+    const int L = 3;
+    build_moe_layers(f, L, 4, gu, dn);
+
+    int64_t off = 4 * (int64_t)RAD_ALIGN_UNIT;
+    int32_t prev = -1;
+    for (rad_weight w = 1; (size_t)w < f.prog.weights.size(); ++w) {
+        WeightInfo& wi = f.prog.weights[w];
+        if (prev >= 0 && wi.decl.group.layer != prev) off += 2 * MiB;
+        prev = wi.decl.group.layer;
+        wi.stored_bytes = wi.logical_bytes;
+        wi.file_offset = (uint64_t)off;
+        off = align_up(off + wi.stored_bytes, RAD_ALIGN_UNIT);
+    }
+    std::vector<uint8_t> img((size_t)off);
+    for (int64_t i = 0; i < off; ++i) img[(size_t)i] = container_byte(i);
+    const std::string path = "place_test_file_routed.rad";
+    {
+        FILE* fp = std::fopen(path.c_str(), "wb");
+        CHECK(fp != nullptr);
+        if (!fp) return;
+        CHECK_EQ(std::fwrite(img.data(), 1, img.size(), fp), img.size());
+        std::fclose(fp);
+    }
+    {
+        DirectFile probe;
+        if (probe.open(path.c_str(), RAD_DIO_READ) < 0) {
+            std::printf("  SKIP the working directory has no O_DIRECT\n");
+            std::remove(path.c_str());
+            return;
+        }
+    }
+
+    std::vector<RadFileProfile> prof;
+    for (int l = 0; l < L; ++l)
+        for (int e = 0; e < 4; ++e)
+            prof.push_back(RadFileProfile{l, e, e == 0 ? 0.5f : e == 2 ? 0.4f : 0.01f, 0.0f});
+    Config c = base_config();
+    c.placement = "expert_tiered";
+    c.deterministic = true;
+    c.vram_weights_mib = 210;
+    c.host_pool_mib = (4 * 21 * MiB + RAD_PLACE_FILE_WINDOWS * RAD_PLACE_FILE_WINDOW_BYTES) / MiB + 1;
+    c.weights_disk_tier = true;
+    PlannerInput in{&f.prog, &c, 0, 1, prof.data(), (int64_t)prof.size()};
+    Plan p;
+    CHECK_OK(Planner(in).plan(&p));
+    /* file_w[l][e]: the file-tier weights of expert e of layer l. */
+    std::vector<std::vector<std::vector<rad_weight>>> file_w(
+        (size_t)L, std::vector<std::vector<rad_weight>>(4));
+    for (const MoveUnit& mu : p.units)
+        if (mu.expert >= 0 && mu.tier == Tier::SSD)
+            for (rad_weight w : mu.weights) file_w[(size_t)mu.layer][(size_t)mu.expert].push_back(w);
+
+    Mover m;
+    MoverConfig mc;
+    mc.container_path = path;
+    CHECK_OK(m.init(f.prog, p, mc));
+    RadStream s = nullptr;
+    CHECK_OK(rad_stream_create(&s, 0));
+    CHECK_OK(m.bind_compute_stream(s));
+
+    int32_t counts[L][4] = { { 1, 1, 0, 0 }, { 0, 0, 1, 1 }, { 1, 0, 0, 0 } };
+    FileStager fs;
+    CHECK_OK(fs.init(f.prog, p, &m, [&](int32_t layer, int64_t* ne, int64_t* top_k) {
+        *ne = 4;
+        *top_k = 2;
+        return (layer >= 0 && layer < L) ? (const int32_t*)counts[layer] : nullptr;
+    }));
+    CHECK(fs.enabled());
+    CHECK(fs.routed_reads());
+
+    /* 0: no address; 1: its container bytes; 2: an alias into the layer's file buffer. */
+    auto state = [&](int l, int e) {
+        int got = -1;
+        for (rad_weight w : file_w[(size_t)l][(size_t)e]) {
+            const WeightSlot* slot = m.residency()->lookup(w);
+            int st = 0;
+            if (slot && slot->ptr) {
+                if (published_matches(m, f.prog, w, img, s)) st = 1;
+                else if (slot->ptr == m.file_buffer(l & 1)) st = 2;
+                else st = 3;
+            }
+            if (got >= 0 && st != got) return 4;          /* the unit's weights disagree */
+            got = st;
+        }
+        return got;
+    };
+
+    RadBatch b{};
+    b.n_tok = 1;
+    CHECK(fs.begin_pass(&b));
+    bool resync = false;
+    CHECK_OK(fs.before_op(0, s, &resync));     /* no read before layer 0's router has run */
+    CHECK(!resync);
+    CHECK_EQ(state(0, 1), 0);
+    CHECK_OK(fs.before_op(1, s, &resync));     /* layer 0: expert 1 read, 3 aliased, no read-ahead */
+    CHECK(resync);
+    CHECK_EQ(state(0, 1), 1);
+    CHECK_EQ(state(0, 3), 2);
+    CHECK_EQ(state(1, 1), 0);
+    CHECK_OK(fs.after_op(1, s));
+    CHECK_OK(fs.before_op(1, s, &resync));     /* a second slice: the whole layer */
+    CHECK(resync);
+    CHECK_EQ(state(0, 1), 1);
+    CHECK_EQ(state(0, 3), 1);
+    CHECK_OK(fs.before_op(2, s, &resync));
+    CHECK_OK(fs.before_op(3, s, &resync));     /* layer 1: 0 released, expert 3 read, 1 aliased */
+    CHECK_EQ(state(0, 1), 0);
+    CHECK_EQ(state(0, 3), 0);
+    CHECK_EQ(state(1, 3), 1);
+    CHECK_EQ(state(1, 1), 2);
+    CHECK_OK(fs.before_op(4, s, &resync));
+    CHECK_OK(fs.before_op(5, s, &resync));     /* layer 2: counts sum to 1, not 2: read whole */
+    CHECK_EQ(state(1, 1), 0);
+    CHECK_EQ(state(2, 1), 1);
+    CHECK_EQ(state(2, 3), 1);
+    CHECK_OK(fs.before_op(6, s, &resync));
+    CHECK_OK(fs.end_pass(s));
+    for (int l = 0; l < L; ++l) {
+        CHECK_EQ(state(l, 1), 0);
+        CHECK_EQ(state(l, 3), 0);
+    }
+    /* Units read: 1 + 2 (layer 0, routed then whole) + 1 + 2; aliased: one each in layers 0, 1. */
+    CHECK_EQ(m.stats().file_units, (uint64_t)6);
+    CHECK_EQ(m.stats().file_aliased, (uint64_t)2);
+
+    /* A prefill-sized pass keeps the whole-layer read and its read-ahead. */
+    RadBatch big{};
+    big.n_tok = FileStager::kRoutedRows + 1;
+    CHECK(fs.begin_pass(&big));
+    CHECK_OK(fs.before_op(0, s, &resync));
+    CHECK(resync);
+    CHECK_EQ(state(0, 1), 1);
+    CHECK_EQ(state(0, 3), 1);
+    CHECK_OK(fs.before_op(1, s, &resync));
+    CHECK_EQ(state(1, 1), 1);
+    CHECK_OK(fs.end_pass(s));
+
     rad_stream_sync(m.transfer_stream());
     rad_stream_destroy(s);
     std::remove(path.c_str());

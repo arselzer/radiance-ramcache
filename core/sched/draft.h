@@ -25,8 +25,10 @@
  * shape that must be recorded before it plays (runtime/ctx.h). `max_depth` stays the ceiling and
  * everything is sized for it.
  *
- * The policy is for serial drafters only (Scheduler::init): a block drafter proposes its block in
- * one pass and prompt lookup runs none, so neither pays per-round cost.
+ * D pays for serial head rounds; a block drafter proposes its block in one pass and prompt lookup
+ * runs none, so for those the policy prices only the verify rows (Scheduler::init): each sequence
+ * verifies the first min(D, its stop) of its proposal, which on a MoE that reads each row's routed
+ * experts is still the cost that matters.
  *
  * It changes only how many drafts a step verifies. Acceptance follows core/sample/accept.h, so
  * every emitted token is the target's own; at temperature 0 the text matches a plain run as far

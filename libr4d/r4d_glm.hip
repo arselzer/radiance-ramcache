@@ -91,7 +91,9 @@ int gemm_f32_body(const RadArgs* a, RadStream stream) {
     const long n = r4d_geti_or(a, "N", 0), k = r4d_geti_or(a, "K", 0);
     if (x.dtype != RAD_BF16 || w.dtype != RAD_F32 || y.dtype != RAD_F32) return RAD_E_DTYPE;
     if (!x.data || !w.data || !y.data) return RAD_E_INVAL;
-    if (n < 1 || n > 512 || k < 1 || k > 16384 || x.rank != 2 || w.rank != 2 || y.rank != 2 ||
+    /* Any width: the grid spans n (a wave a C-column tile), so 512 was only the router's own. A
+     * compressor's fused kv|gate projection is 1024 wide. */
+    if (n < 1 || n > 65536 || k < 1 || k > 16384 || x.rank != 2 || w.rank != 2 || y.rank != 2 ||
         x.shape[0] < 1 || x.shape[0] > 65535 || x.shape[1] != k || w.shape[0] != n ||
         w.shape[1] != k || y.shape[0] != x.shape[0] || y.shape[1] != n || x.stride[1] != 1 ||
         w.stride[1] != 1 || y.stride[1] != 1 || x.stride[0] < k || w.stride[0] < k ||

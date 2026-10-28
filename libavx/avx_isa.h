@@ -81,6 +81,17 @@ int         avx_par_force(int threads);
     X(mla_project)                                                                                \
     X(dsa_score)                                                                                  \
     X(mla_attn)                                                                                   \
+    X(mhc_mix)              X(mhc_collapse)                                                       \
+    X(router_scored_topk)                                                                         \
+    X(rope_rows)                                                                                  \
+    X(quant_roundtrip)      X(softmax_pool)                                                       \
+    X(attn_sparse_sink)                                                                           \
+    X(index_score)          X(index_candidates)     X(index_topk)                                 \
+    X(entry_store)                                                                                \
+    X(token_map)            X(stream_gate_add)                                                    \
+    X(gemm_nt_ggml)                                                                               \
+    X(moe_gemm_ggml)                                                                              \
+    X(logits_gemm_ggml)     X(embed_lookup_ggml)                                          \
     X(add)                  X(grid_embed)           X(grid_embed_aa)        X(causal_conv1d)      \
     X(mul)                  X(silu_mul)             X(gelu_mul)             X(gelu)               \
     X(silu)                 X(sigmoid)              X(logit_softcap)        X(gather_rows)        \
@@ -98,6 +109,7 @@ int         avx_par_force(int threads);
     /* ---- gemm and the vocabulary edges */                                                      \
     X(gemm_nt)              X(gemm_nt_bias)         X(gemm_nt_q)            X(gemm_nt_q_bias)     \
     X(gemm_nt_q_gated)      X(embed_lookup)         X(embed_lookup_q)       X(logits_gemm)        \
+    X(embed_lookup_planes)                                                                       \
     X(lora_shrink)          X(lora_expand)          X(lora_expand_mm)                             \
     /* ---- attention */                                                                          \
     X(attn_paged)           X(attn_dense)           X(attn_cross) X(attn_na3d) X(table_add) X(mix_rows) X(chan_stats) X(kv_store) X(kv_store_streamed) X(kv_resolve)             X(rope)               \

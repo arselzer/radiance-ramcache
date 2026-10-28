@@ -198,6 +198,10 @@ at once. Run it before adding a kernel plugin; the loader names only the first c
 | `mhc_pre_finish` | `M`(range) `n` `hc` `iterations` `eps`:f64 `hc_eps`:f64 `chunk` `dtype` | `part`, `h`, `scale`w, `base`w → `x`, `post`, `comb` |
 | `mhc_post` | `M`(range) `n` `hc` `dtype` | `x`, `h`, `post`, `comb` → `out` |
 | `mhc_contract` | `M`(range) `n` `hc` `dtype` | `h` → `x` |
+| `mhc_mix` | `M`(range) `n` `hc` `iterations` `eps`:f64 `hc_eps`:f64 `dtype` | `h`, `fn`w, `scale`w, `base`w → `pre`, `post`, `comb` |
+| `mhc_collapse` | `M`(range) `n` `hc` `dtype` | `h`, `pre` → `x` |
+| `mhc_collapse_rmsnorm` | `M`(range) `n` `hc` `eps`:f64 `dtype` `wadd`:f64/opt `mult`:f64/opt | `h`, `pre` → `x`; `w`w → `y` (device-only: mhc_collapse then rmsnorm, x rounded before the norm reads it) |
+| `mhc_post_collapse_rmsnorm` | `M`(range) `n` `hc` `eps`:f64 `dtype` `wadd`:f64/opt `mult`:f64/opt | `x`, `h`, `post`, `comb` → `out`; `pre` → `xc`; `w`w → `y` (device-only: mhc_post, mhc_collapse over out, rmsnorm over xc; each rounded before the next reads it; out must not alias h) |
 | `hc_read` | `M`(range) `n` `hc` `lowrank` `eps`:f64 `dtype` `wadd`:f64/opt `inject`/opt `group`/opt `rotate`/opt `mix`/opt | `h`, `w`w, `mix_down`w, `mix_up`w, `inject_w`w? → `x`, `inj`?, `q`?, `scale`?, `rq`?, `rscale`? |
 | `hc_write` | `M`(range) `n` `hc` `dtype` | `y`, `inj`, `h`:inout |
 | `hc_project` | `M`(range) `n` `hc` `scale`:f64 `dtype` | `h`:inout, `v`, `on` |
@@ -249,6 +253,14 @@ no plane to feed `rmsnorm` as a gain.
 
 **`rmsnorm_add`** is the residual add and the next norm in one pass, as every real implementation
 does it. A plugin asks for it first and falls back to `add` + `rmsnorm` (`spec.md` §2.3).
+
+**`mhc_collapse_rmsnorm`** and **`mhc_post_collapse_rmsnorm`** (device-only) are DeepSeek-V4.1's
+sublayer entry in one launch: `mhc_collapse` then `rmsnorm`, and `mhc_post`, `mhc_collapse` over its
+`out` and `rmsnorm`. Each step stores its output in the activation dtype before the next reads it,
+so they are bit-identical to the chain. libr4d declares them with `replaces`, and `rad-kbench`'s
+fusion oracle holds each to libr4d's own chain byte for byte. libref has no row: an architecture
+asks `rad_op_declared` and `rad_op_resolved` and declares the chain where they do not resolve, so a
+host deployment runs the chain.
 
 **`gelu_mul`** is `silu_mul` with the tanh GELU: Gemma's gated FFN is trained with
 `gelu_pytorch_tanh`, while the unary `gelu` is the exact erf form. Both split the fused `gate_up`
@@ -713,6 +725,7 @@ may not have arrived.
 | `gemm_nt_bias` | `M`(range) `N` `K` `dtype` `act`/opt | `a`, `b`w, `bias`w, `res`? → `y` |
 | `gemm_nt_q` | `M`(range) `N` `K` `group` `dtype` `pb1`/opt `pb2`/opt `split_n`/opt | `a`, `a_scale`?, `b`w, `b_scale`w → `y`; `a_sum`?, `b_ref`w? |
 | `gemm_nt_q_bias` | `M`(range) `N` `K` `group` `dtype` | `a`, `a_scale`, `b`w, `b_scale`w, `bias`w → `y` |
+| `gemm_nt_ggml` | `M`(range) `N` `K` `type` `dtype` | `a`, `w`w → `y` |
 
 `nt` is A row-major `[M,K]` times B transposed `[N,K]`, giving `[M,N]`: the layout every weight in
 a transformer already has. `gemm_nt_q`'s `dtype` names the operand combination, so one op covers
@@ -876,6 +889,18 @@ as the weight's GEMM stored them and claims no form. It changes no value.
 | `kv_store_streamed` | `M`(range) `head_dim` `n_head_kv` `block_size` `kv_dtype` `k_scale`:f64/opt `v_scale`:f64/opt | `k`, `v`, `slot_mapping`, `kv_cache`:inout, `res`, `host`:inout |
 | `rope` | `M`(range) `head_dim` `n_head` `n_head_kv` `theta`:f64 `scale`:f64 `mode` `rotary_dim`/opt `sections`/opt `yarn_factor`:f64/opt `yarn_low`:f64/opt `yarn_high`:f64/opt `yarn_magnitude`:f64/opt `ladder`/opt `llama3_factor`:f64/opt `llama3_low`:f64/opt `llama3_high`:f64/opt `llama3_orig`:f64/opt | `qkv`:inout, `positions` |
 | `rope_table` | `M`(range) `rot` `theta`:f64 `scale`:f64 `dtype` `yarn_factor`:f64/opt `yarn_low`:f64/opt `yarn_high`:f64/opt `yarn_magnitude`:f64/opt `head_dim`/opt `ladder`/opt | `positions` → `cos_sin` |
+| `rope_rows` | `M`(range) `n_head` `head_dim` `rot` `off` `mode` `inverse` `dtype` | `x`:inout, `cos_sin`, `positions` |
+| `quant_roundtrip` | `M`(range) `n` `block` `format`:str `scale`:str `dtype` | `x`:inout |
+| `rope_rows_roundtrip` | `M`(range) `n_head` `head_dim` `rot` `off` `mode` `inverse` `block` `format`:str `scale`:str `dtype` | `x`:inout, `cos_sin`, `positions` (device-only: rope_rows then quant_roundtrip over n_head * head_dim columns) |
+| `rmsnorm_rope_roundtrip` | `M`(range) `n` `eps`:f64 `n_head` `head_dim` `rot` `off` `mode` `inverse` `block` `format`:str `scale`:str `dtype` `wadd`:f64/opt `mult`:f64/opt | `x`, `w`w → `y`; `cos_sin`, `positions` (device-only: rmsnorm, then rope_rows and quant_roundtrip over y; n = n_head * head_dim) |
+| `softmax_pool` | `M`(range) `n` `ratio` `dtype` | `stage` → `out`; `page`? |
+| `attn_sparse_sink` | `M`(range) `heads` `dim` `window` `ratio` `topk` `scale`:f64 `dtype` | `q`, `window_cache`, `window_bt`, `window_used`, `comp_cache`?, `comp_bt`?, `sel`?, `positions`, `cu_seqlens`, `sinks`w → `out` |
+| `index_score` | `M`(range) `heads` `dim` `ratio` `width` `wscale`:f64 `dtype` `row_part`/opt | `q`, `w`, `index_cache`, `bt`, `positions`, `cu_seqlens` → `score` |
+| `index_candidates` | `M`(range) `width` `block` `topk_blocks` `ratio` | `score`, `positions` → `keep` |
+| `index_topk` | `M`(range) `width` `topk` `ratio` `block`/opt | `score`, `keep`?, `positions` → `sel` |
+| `entry_store` | `M`(range) `n` `block_size` `dtype` | `x`, `page`, `cache`:inout |
+| `token_map` | `M`(range) `n_vocab` | `ids`, `table`w → `mapped` |
+| `stream_gate_add` | `M`(range) `n` `hc` `eps`:f64 `gate_eps`:f64 `dtype` | `h`, `k`, `v`, `w`w → `out` |
 | `qk_norm_rope` | `M`(range) `head_dim` `n_head` `n_head_kv` `theta`:f64 `eps`:f64 `scale`:f64/opt `mode`/opt `rotary_dim`/opt `wadd`:f64/opt `v_norm`/opt `sections`/opt `comps`/opt | `qkv`:inout, `positions`?, `q_w`w?, `k_w`w? |
 | `qkv_norm_rope` | `M`(range) `head_dim` `n_head` `n_head_kv` `theta`:f64 `eps`:f64 `scale`:f64/opt `mode`/opt `rotary_dim`/opt `ladder`/opt `wadd`:f64/opt `v_from_k`/opt `v_norm`/opt `dtype` | `q`:inout, `k`:inout, `v`:inout, `positions`, `q_w`w, `k_w`w |
 | `qkv_norm_rope_kv_store` | `M`(range) `head_dim` `n_head` `n_head_kv` `theta`:f64 `eps`:f64 `scale`:f64/opt `mode`/opt `rotary_dim`/opt `ladder`/opt `wadd`:f64/opt `v_from_k`/opt `dtype` `v_norm`/opt `block_size` `kv_dtype` `k_scale`:f64/opt `v_scale`:f64/opt | `q`:inout, `k`:inout, `v`:inout, `positions`, `q_w`w, `k_w`w, `slot_mapping`, `kv_cache`:inout |
@@ -900,6 +925,17 @@ length and the total query rows must be a multiple of `n_seq`. Pass it: the sche
 steps (one sequence's prefill chunk beside other sequences' decode rows, each with its own verify
 window) whenever prefill and decode coexist, and those are not uniform. `q_len` is then the batch
 maximum, which selects the band; the per-sequence lengths come from `cu_seqlens` alone.
+
+**`index_score`**, **`index_candidates`** and **`index_topk`** are DeepSeek-V4's two-level
+indexer. A score row is as wide as the context, so a whole prefill chunk's plane is chunk x context
+f32: an architecture scores a step in runs of rows instead, each into one run-sized plane, and
+selects from it before the next run. `row_part` p makes `score` one run of R rows: score row `i` is
+step row `p R + i`, read from the step's `q`, `w` and `positions` and found in `cu_seqlens` as that
+row, and a row past the step scores `-inf` everywhere. Every row is the unsplit op's row, so runs of
+equal height score the step bit for bit. `keep` lives from the candidate layer to the last layer that
+reads it, for every row of the step, so it is one bit a block: i32 `[M, ceil(ceil(width / block) /
+32)]`, bit `b % 32` of word `b / 32` set when block `b` is kept and the bits past the last block 0.
+`index_topk` reads it with the same `block`.
 
 **`attn_dense`** serves vision towers and encoders: nothing paged, `cu_seqlens` bounding one image
 or one input per entry so a whole batch is one launch. `window` is `attn_paged`'s rule over a
@@ -1033,6 +1069,13 @@ holding its token's finished head, so it also writes it into the paged cache at 
 Its parameters are the two ops' own, its operands the prologue's followed by `slot_mapping` and
 `kv_cache`. Byte-identical to the pair at either cache width: the store converts each element as
 `kv_store` does, and q, k and v are still written in place as the prologue leaves them.
+
+**`rope_rows_roundtrip`** (device-only) is `rope_rows` then `quant_roundtrip` over all `n_head *
+head_dim` columns of `x`, in place; **`rmsnorm_rope_roundtrip`** (device-only) is `rmsnorm` (`x`,
+`w` → `y`) followed by the same two over `y`. They are DeepSeek-V4.1's attention output, compressed
+latent and index query, and its window and index keys. Each step rounds where its own op stores, so
+both are bit-identical to the chain; as with `mhc_collapse_rmsnorm`, libr4d declares them with
+`replaces`, libref has no row, and an architecture declares the chain where they do not resolve.
 
 | op | params | operands |
 |---|---|---|
@@ -1942,7 +1985,9 @@ The VAEs' convolutions are `conv3d_ndhwc` with `tpad` and the audio VAE's `conv2
 | `router_topk_scatter` | `M`(range) `n_expert` `n_local`/opt `top_k` `norm` `dtype` `expert_base`/opt `protect`:str/opt | `logits` → `expert_ids`, `expert_w`, `sorted_tok`, `expert_offset`, `expert_count` |
 | `router_gemm_topk_scatter` | `M`(range) `K` `n_expert` `n_local`/opt `top_k` `norm` `dtype` `expert_base`/opt `protect`:str/opt | `a`, `b`w, `gate_b`w? → `logits`, `expert_ids`, `expert_w`, `sorted_tok`, `expert_offset`, `expert_count`, `gate`? |
 | `moe_gemm` | `M`(range) `N` `K` `n_expert` `top_k` `a_order` `dtype` | `a`, `w`wt, `sorted_tok`, `expert_offset` → `y` |
+| `moe_gemm_ggml` | `M`(range) `N` `K` `n_expert` `top_k` `a_order` `type` `dtype` | `a`, `w`wt, `sorted_tok`, `expert_offset` → `y` |
 | `router_sigmoid_topk` | `M`(range) `n_expert` `top_k` `norm` `route_scale`:f64 `dtype` | `logits`, `bias`w → `ids`, `weights` |
+| `router_scored_topk` | `M`(range) `n_expert` `top_k` `norm` `route_scale`:f64 `score`:str `dtype` | `logits`, `bias`w → `ids`, `weights` |
 | `router_sigmoid_topk_scatter` | `M`(range) `n_expert` `n_local`/opt `top_k` `norm` `route_scale`:f64 `dtype` `expert_base`/opt `protect`:str/opt | `logits`, `bias`w → `ids`, `weights`, `sorted_tok`, `expert_offset`, `expert_count`, `gate`?, `inverse`? |
 | `moe_scatter_inv` | `M`(range) `n_expert` `top_k` `expert_base`/opt `protect`:str/opt | `expert_ids` → `sorted_tok`, `expert_offset`, `expert_count`, `inverse` |
 | `moe_gather_inv` | `M`(range) `n` `top_k` `dtype` `act`:str/opt | `y_expert`, `expert_w`, `inverse`, `shared`?, `shared_gate`? → `y` |
@@ -2081,6 +2126,13 @@ holds its experts as order-preserving keys (`-0` as `+0`, ties to the lower expe
 takes the largest key below round `j-1`'s winner. A row without NaN ranks gives the bytes of a
 serial scan with a strict `>`. A NaN rank is never selected, and a row with fewer than `top_k`
 other ranks names expert 0 in its empty slots, weighted by expert 0's `p`.
+
+**`router_scored_topk`** is `router_sigmoid_topk` with the score function named, and required so
+that a kernel compiled for one function never resolves for another: `sigmoid` is
+`router_sigmoid_topk`, `sqrtsoftplus` is `sqrt(softplus(logit))` with softplus linear above 20
+(torch's default threshold; DeepSeek-V4 routes 6 of 384 this way with `route_scale` 1.5), and
+`softmax` is over all `n_expert` logits. Selection, ties, weights and `norm` are
+`router_sigmoid_topk`'s.
 
 **`router_sigmoid_topk_scatter`** (device-only) is `router_sigmoid_topk` and `moe_scatter` over its
 `ids` in one launch, and with `gate` `[M, 1]` also the `fill` of an ungated shared arm's gate with
@@ -2420,8 +2472,11 @@ whole form elsewhere (the host mailbox included), which keeps every promise `sp`
 | op | params | operands |
 |---|---|---|
 | `embed_lookup` | `M`(range) `n_embd` `n_vocab` `dtype` `vocab_offset`/opt `wscale`:f64/opt `mult`:f64/opt | `tokens`, `wte`w → `x` |
+| `embed_lookup_planes` | `M`(range) `n_embd` `n_vocab` `group` `dtype` `vocab_offset`/opt `mult`:f64/opt | `tokens`, `codes`w, `scale`w, `table`w? → `x` |
 | `embed_lookup_q` | `M`(range) `n_embd` `n_vocab` `dtype` `vocab_offset`/opt `wscale`:f64/opt | `tokens`, `wte`w, `scale`w? → `x`, `ahead`? |
 | `logits_gemm` | `M`(range) `n_vocab` `n_embd` `dtype` | `x`, `lm_head`w → `logits` |
+| `logits_gemm_ggml` | `M`(range) `n_vocab` `n_embd` `type` `dtype` | `x`, `lm_head`w → `logits` |
+| `embed_lookup_ggml` | `M`(range) `n_embd` `n_vocab` `type` `dtype` `vocab_offset`/opt `mult`:f64/opt | `tokens`, `wte`w → `x` |
 | `ngram_ids` | `M`(range) `heads` `ngram` `eos` | `tok`, `state`:inout, `cu`, `mult`w, `vocab_sizes`w, `offsets`w, `cache_idx`?, `has_init`?, `num_accepted`? → `ids`, `ahead_ids`? |
 | `ple_gate` | `M`(range) `n` `hc` `eps`:f64 `dtype` `wadd`:f64/opt `gate_eps`:f64/opt | `k`, `q`, `v`, `w_key`w, `w_query`w, `w_conv`w → `gv`, `gvn` |
 | `ple_conv` | `M`(range) `n` `width` `dilation` `dtype` | `x`, `w`w, `conv_state`:inout, `cu`, `resid`?, `cache_idx`?, `has_init`?, `num_accepted`? → `y` |

@@ -16,8 +16,13 @@ extern "C" {
  * rad_builder.h, rad_runtime.h, rad_device.h, rad_encoding.h, rad_quant.h, rad_sample.h or
  * rad_spechub.h. Every kind of plugin reports it, and a plugin that does not report exactly this
  * version is refused at load with both versions printed. A new optional export (e.g.
- * rad_plugin_reference) is not a change of shape: a plugin without it gets the default. */
-#define RAD_ABI_VERSION 31u
+ * rad_plugin_reference) is not a change of shape: a plugin without it gets the default.
+ *
+ * Private 32 combines upstream 31 with the DeepSeek-V4.1 integration: RadBuildCtx keeps
+ * upstream's weight_prefetch_off and appends draft_head_off for prompt lookup alone. The
+ * structure grows; upstream 31 and earlier private plugin binaries must be rebuilt rather
+ * than loaded under this version. The .rad container format is unchanged. */
+#define RAD_ABI_VERSION 32u
 
 /* ================================================================== plugin identity */
 /* One value per plugin, not flags (QUANT is 3). RAD_PLUGIN_QUANT is a quantiser plugin:
@@ -540,6 +545,16 @@ typedef int  (*RadKernelChainFn)(int i);
  * hold behind the launch, so a path that ignores the word is always safe. */
 typedef int  (*RadKernelCollectiveFn)(int i);
 #define RAD_LINK_ENDED 1
+
+/* Optional promise about kernel `i` of rad_kernel_at: nonzero means that, gathering rows of a table
+ * the engine reads in place from the container (the mapped tier, e.g. --ngram-placement disk), it
+ * fetches them itself -- direct reads into a row cache of its own -- rather than by touching the
+ * mapping. The engine then leaves those rows alone. Without the symbol, or with 0, the engine asks
+ * the page cache for every page a host gather's rows cover before the launch, so the kernel's page
+ * faults wait on reads issued together rather than one at a time (core/runtime/rowprefetch.h); for
+ * a kernel that reads the file itself that would read each row twice. Symbol name:
+ * `rad_kernel_fetches_rows`. */
+typedef int  (*RadKernelFetchesRowsFn)(int i);
 
 /* Optional: nonzero declares this kernel library a reference implementation, written to be
  * plainly correct rather than fast. For any library that says so, whatever its name:

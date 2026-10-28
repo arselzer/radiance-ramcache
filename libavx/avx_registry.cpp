@@ -80,6 +80,9 @@ static const RadOperandSpec oMhcPreFinish[] = { OPD("part"), OPD("h"), WGT("scal
     OUT("x"), OUT("post"), OUT("comb") };
 static const RadOperandSpec oMhcPost[] = { OPD("x"), OPD("h"), OPD("post"), OPD("comb"), OUT("out") };
 static const RadOperandSpec oMhcContract[] = { OPD("h"), OUT("x") };
+static const RadOperandSpec oMhcMix[] = { OPD("h"), WGT("fn"), WGT("scale"), WGT("base"),
+    OUT("pre"), OUT("post"), OUT("comb") };
+static const RadOperandSpec oMhcCollapse[] = { OPD("h"), OPD("pre"), OUT("x") };
 static const RadParamSpec pKdaUpdate[] = { P_INT("M"), P_INT("heads"), P_INT("head_k"),
     P_INT("head_v"), P_F64("lower_bound"), P_F64("scale"), P_F64("l2_eps"),
     P_STR("mode"), P_STR("dtype"), P_STRO("state_form") };
@@ -150,6 +153,8 @@ static const RadOperandSpec oDsaPool[] = { OPD("kg"), WGT("ape"), OUT("q"), OUT(
 static const RadParamSpec pRouterSigmoid[] = { P_INT("M"), P_INT("n_expert"), P_INT("top_k"),
     P_INT("norm"), P_F64("route_scale"), P_STR("dtype") };
 static const RadOperandSpec oRouterSigmoid[] = { OPD("logits"), WGT("bias"), OUT("ids"), OUT("weights") };
+static const RadParamSpec pRouterScored[] = { P_INT("M"), P_INT("n_expert"), P_INT("top_k"),
+    P_INT("norm"), P_F64("route_scale"), P_STR("score"), P_STR("dtype") };
 static const RadParamSpec pMnD[]      = { P_INT("M"), P_INT("n"), P_STR("dtype") };
 /* `add`'s `div` divides the rounded sum (libref's pAdd). */
 static const RadParamSpec pAdd[]      = { P_INT("M"), P_INT("n"), P_STR("dtype"), P_F64O("div") };
@@ -359,6 +364,51 @@ static const RadParamSpec pRopeTable[]   = { P_INT("M"), P_INT("rot"), P_F64("th
                                              P_F64O("yarn_high"), P_F64O("yarn_magnitude"),
                                              P_INTO("head_dim"), P_STRO("ladder") };
 static const RadOperandSpec oRopeTable[] = { OPD("positions"), OUT("cos_sin") };
+
+/* DeepSeek-V4.1's ops, libref's schemas. */
+static const RadParamSpec pRopeRows[] = { P_INT("M"), P_INT("n_head"), P_INT("head_dim"),
+    P_INT("rot"), P_INT("off"), P_STR("mode"), P_INT("inverse"), P_STR("dtype") };
+static const RadOperandSpec oRopeRows[] = { INOUT("x"), OPD("cos_sin"), OPD("positions") };
+static const RadParamSpec pQuantRoundtrip[] = { P_INT("M"), P_INT("n"), P_INT("block"),
+    P_STR("format"), P_STR("scale"), P_STR("dtype") };
+static const RadOperandSpec oQuantRoundtrip[] = { INOUT("x") };
+static const RadParamSpec pSoftmaxPool[] = { P_INT("M"), P_INT("n"), P_INT("ratio"), P_STR("dtype") };
+static const RadOperandSpec oSoftmaxPool[] = { OPD("stage"), OUT("out"), OPD_O("page") };
+static const RadParamSpec pAttnSparseSink[] = { P_INT("M"), P_INT("heads"), P_INT("dim"),
+    P_INT("window"), P_INT("ratio"), P_INT("topk"), P_F64("scale"), P_STR("dtype") };
+static const RadOperandSpec oAttnSparseSink[] = { OPD("q"), OPD("window_cache"), OPD("window_bt"),
+    OPD("window_used"), OPD_O("comp_cache"), OPD_O("comp_bt"), OPD_O("sel"), OPD("positions"),
+    OPD("cu_seqlens"), WGT("sinks"), OUT("out") };
+static const RadParamSpec pIndexScore[] = { P_INT("M"), P_INT("heads"), P_INT("dim"),
+    P_INT("ratio"), P_INT("width"), P_F64("wscale"), P_STR("dtype"), P_INTO("row_part") };
+static const RadOperandSpec oIndexScore[] = { OPD("q"), OPD("w"), OPD("index_cache"), OPD("bt"),
+    OPD("positions"), OPD("cu_seqlens"), OUT("score") };
+static const RadParamSpec pIndexCand[] = { P_INT("M"), P_INT("width"), P_INT("block"),
+    P_INT("topk_blocks"), P_INT("ratio") };
+static const RadOperandSpec oIndexCand[] = { OPD("score"), OPD("positions"), OUT("keep") };
+static const RadParamSpec pIndexTopk[] = { P_INT("M"), P_INT("width"), P_INT("topk"), P_INT("ratio"),
+    P_INTO("block") };
+static const RadOperandSpec oIndexTopk[] = { OPD("score"), OPD_O("keep"), OPD("positions"), OUT("sel") };
+static const RadParamSpec pEntryStore[] = { P_INT("M"), P_INT("n"), P_INT("block_size"), P_STR("dtype") };
+static const RadOperandSpec oEntryStore[] = { OPD("x"), OPD("page"), INOUT("cache") };
+static const RadParamSpec pTokenMap[] = { P_INT("M"), P_INT("n_vocab") };
+static const RadOperandSpec oTokenMap[] = { OPD("ids"), WGT("table"), OUT("mapped") };
+static const RadParamSpec pStreamGate[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_F64("eps"),
+    P_F64("gate_eps"), P_STR("dtype") };
+static const RadOperandSpec oStreamGate[] = { OPD("h"), OPD("k"), OPD("v"), WGT("w"), OUT("out") };
+static const RadParamSpec pGemmGgml[] = { P_INT("M"), P_INT("N"), P_INT("K"), P_STR("type"),
+    P_STR("dtype") };
+static const RadOperandSpec oGemmGgml[] = { OPD("a"), WGT("w"), OUT("y") };
+static const RadParamSpec pMoeGemmGgml[] = { P_INT("M"), P_INT("N"), P_INT("K"), P_INT("n_expert"),
+    P_INT("top_k"), P_STR("a_order"), P_STR("type"), P_STR("dtype") };
+static const RadOperandSpec oMoeGemmGgml[] = { OPD("a"), WTAB("w"), OPD("sorted_tok"),
+                                               OPD("expert_offset"), OUT("y") };
+static const RadParamSpec pLogitsGgml[] = { P_INT("M"), P_INT("n_vocab"), P_INT("n_embd"),
+    P_STR("type"), P_STR("dtype") };
+static const RadOperandSpec oLogitsGgml[] = { OPD("x"), WGT("lm_head"), OUT("logits") };
+static const RadParamSpec pEmbedGgml[] = { P_INT("M"), P_INT("n_embd"), P_INT("n_vocab"),
+    P_STR("type"), P_STR("dtype"), P_INTO("vocab_offset"), P_F64O("mult") };
+static const RadOperandSpec oEmbedGgml[] = { OPD("tokens"), WGT("wte"), OUT("x") };
 
 /* QSA's compressed key, libr4d's schema (libr4d/r4d_rows.cpp): `block_size` is `ratio` under the
  * name the block-key store's KV group uses; `page` and `pos` are optional. */
@@ -834,6 +884,11 @@ static const RadParamSpec pEmbedM[]   = { P_INT("M"), P_INT("n_embd"), P_INT("n_
                                           P_STR("dtype"), P_INTO("vocab_offset"),
                                           P_F64O("wscale"), P_F64O("mult") };
 static const RadOperandSpec oEmbed[]  = { OPD("tokens"), WGT("wte"), OUT("x") };
+static const RadParamSpec pEmbedPlanes[] = { P_INT("M"), P_INT("n_embd"), P_INT("n_vocab"),
+                                             P_INT("group"), P_STR("dtype"), P_INTO("vocab_offset"),
+                                             P_F64O("mult") };
+static const RadOperandSpec oEmbedPlanes[] = { OPD("tokens"), WGT("codes"), WGT("scale"),
+                                               WGT_O("table"), OUT("x") };
 static const RadOperandSpec oEmbedQ[] = { OPD("tokens"), WGT("wte"), WGT_O("scale"), OUT("x"),
                                           OPD_O("ahead") };
 
@@ -905,6 +960,11 @@ static const RadOpSchema kSchemas[] = {
   "mhc_pre from every chunk's partials: chunk sums, gates, Sinkhorn mixing, collapse." },
 { "mhc_post", ARR(pHcWrite), ARR(oMhcPost), "Source-to-destination manifold residual update." },
 { "mhc_contract", ARR(pHcWrite), ARR(oMhcContract), "Mean over manifold residual streams." },
+{ "mhc_mix", ARR(pMhcPre), ARR(oMhcMix),
+  "mhc_pre without the collapse: the gates and Sinkhorn mixing, the pre gates written to `pre` "
+  "(f32 [M, hc]) for a later mhc_collapse." },
+{ "mhc_collapse", ARR(pHcWrite), ARR(oMhcCollapse),
+  "x[i] = sum over hc streams of pre[stream] * h[stream, i], accumulated in f32 and rounded once." },
 { "kda_update", ARR(pKdaUpdate), ARR(oKdaUpdate), "Bounded per-channel KDA with candidate-state rollback." },
 { "hc_read", ARR(pHcRead), ARR(oHcRead),
   "The read half of a gated residual: grouped norm, low-rank gate, stream mix, and optionally the "
@@ -1081,6 +1141,36 @@ static const RadOpSchema kSchemas[] = {
   "that cannot place every miss latches ctl[3] and leaves those entries naming blocks, never a "
   "fabricated slot." },
 { "rope_table", ARR(pRopeTable), ARR(oRopeTable), "cos/sin at each position's own row." },
+{ "rope_rows", ARR(pRopeRows), ARR(oRopeRows),
+  "rope from a rope_table plane over columns [off, off+rot) of each head, in place." },
+{ "quant_roundtrip", ARR(pQuantRoundtrip), ARR(oQuantRoundtrip),
+  "block-scaled fp8 / fp4 quantise then dequantise in place, libref's scales and codes." },
+{ "softmax_pool", ARR(pSoftmaxPool), ARR(oSoftmaxPool),
+  "channel-wise softmax pooling of `ratio` rows into one entry; a negative page skips it." },
+{ "attn_sparse_sink", ARR(pAttnSparseSink), ARR(oAttnSparseSink),
+  "latent attention with a per-head sink over the window and the selected compressed entries." },
+{ "index_score", ARR(pIndexScore), ARR(oIndexScore),
+  "the indexer's relu-gated head sum per row and compressed position, -inf where not passed; "
+  "with row_part p, score row i is step row p M + i." },
+{ "index_candidates", ARR(pIndexCand), ARR(oIndexCand),
+  "level one of the two-level top-k: the kept blocks, the newest reachable pinned; keep a bit a "
+  "block." },
+{ "index_topk", ARR(pIndexTopk), ARR(oIndexTopk),
+  "the topk best passed positions inside keep's blocks of `block`, in position order, then -1." },
+{ "entry_store", ARR(pEntryStore), ARR(oEntryStore),
+  "x[w] into the whole of block page[w] of a paged cache; a negative page writes nothing." },
+{ "token_map", ARR(pTokenMap), ARR(oTokenMap),
+  "mapped[m] = table[ids[m]], -1 for an id outside [0, n_vocab)." },
+{ "stream_gate_add", ARR(pStreamGate), ARR(oStreamGate),
+  "a normalised-dot sigmoid gate per row and stream, out = h + gate v." },
+{ "gemm_nt_ggml", ARR(pGemmGgml), ARR(oGemmGgml),
+  "y = a . w^T with w llama.cpp's own blocks of GGUF type `type`, or the float [N, K] form." },
+{ "moe_gemm_ggml", ARR(pMoeGemmGgml), ARR(oMoeGemmGgml),
+  "moe_gemm with each expert's weight in llama.cpp's blocks of GGUF type `type`." },
+{ "logits_gemm_ggml", ARR(pLogitsGgml), ARR(oLogitsGgml),
+  "logits_gemm with lm_head in llama.cpp's blocks of GGUF type `type`." },
+{ "embed_lookup_ggml", ARR(pEmbedGgml), ARR(oEmbedGgml),
+  "embed_lookup from a table in llama.cpp's blocks of GGUF type `type`." },
 { "qsa_block_key", ARR(pQsaBlockKey), ARR(oQsaBlockKey),
   "QSA's compressed key: the mean of a block's `ratio` rows rounded to k's dtype, RMS-normed with "
   "gain (wadd + w), rotated at the block's position with `rope`'s ladder and YaRN; libref's "
@@ -1106,6 +1196,8 @@ static const RadOpSchema kSchemas[] = {
   "one scalar per row, optionally through an activation, broadcast across the row." },
 { "router_sigmoid_topk", ARR(pRouterSigmoid), ARR(oRouterSigmoid),
   "Single-group sigmoid routing; correction bias selects experts, original scores weight them." },
+{ "router_scored_topk", ARR(pRouterScored), ARR(oRouterSigmoid),
+  "router_sigmoid_topk with the score function named: sigmoid, sqrtsoftplus or softmax." },
 { "router_topk", ARR(pRouter), ARR(oRouter), "softmax then exact top-k routing." },
 { "router_topk_scatter", ARR(pRouterTopkScatter), ARR(oRouterTopkScatter),
   "the selection and the sort in one op, run as exactly the pair." },
@@ -1352,6 +1444,11 @@ static const RadOpSchema kSchemas[] = {
   "embedding gather, vocab-parallel with an offset; `mult` multiplies every row (rounded once)." },
 { "embed_lookup_q", ARR(pEmbed), ARR(oEmbedQ),
   "embedding gather, one scale for the table; without a scale the table is read as it is." },
+{ "embed_lookup_planes", ARR(pEmbedPlanes), ARR(oEmbedPlanes),
+  "A gather from a table stored as single-level affine planes, read in place: x[m, i] = v * "
+  "scale[id, i / group] * mult, v = table[code] when a table is given, else the code. Codes are i8, "
+  "u8, or 4-bit elements of a bit stream along the row, lowest bits first; a table is indexed by an "
+  "unsigned code and holds every value. Padding, bounds and vocab_offset as embed_lookup." },
 { "logits_gemm", ARR(pLogits), ARR(oLogits), "the lm_head projection." },
 { "sample_penalties", ARR(pPenal), ARR(oPenalties),
   "repetition, frequency and presence penalties." },
@@ -1481,6 +1578,119 @@ static int avx_moe_cb_unrelayout(const RadParam* p, int n_p, int operand, const 
       avxp::avx_relayout_planes<avxp::lay>, nullptr, avxp::avx_unrelayout_planes<avxp::lay>,     \
       nullptr }
 
+/* ---- the GEMMs over llama.cpp's native blocks (avx_ggml.cpp): libref's hooks, restated
+ *
+ * The layout hook asks for all of a GGUF type's planes and relayouts them into the type's native
+ * blocks with libquant's pack_of, [N, K / block * block_bytes] bytes; the unrelayout unpacks them.
+ * The selection accepted, the tag and the bytes are libref's (libref/ref_ggml.cpp), so both
+ * libraries store one form under one tag. */
+#ifdef AVX_HAVE_GGML
+#include "lq_ggml_dequant.h"
+#include "lq_ggml_planes.h"
+
+static const lq::ggml::PlaneKind* ggml_kind_named(const char* s) {
+    if (!s) return nullptr;
+    for (uint32_t t = 0; t < 64; ++t) {
+        const lq::ggml::PlaneKind* k = lq::ggml::plane_kind(t);
+        if (k && !std::strcmp(k->name, s) && lq::ggml::pack_of(t) && lq::ggml::dequant_of(t)) return k;
+    }
+    return nullptr;
+}
+static int64_t ggml_pint(const RadParam* p, int n_p, const char* key) {
+    const RadParam* q = rad_param_find(p, n_p, key);
+    if (!q) return 0;
+    if (q->kind == RAD_P_RANGE) return (int64_t)q->ihi;
+    return q->kind == RAD_P_INT ? (int64_t)q->ival : 0;
+}
+/* The values a weight row holds: `K` for the GEMMs, `n_embd` for the vocabulary ops. */
+static int64_t ggml_row_len(const RadParam* p, int n_p) {
+    const int64_t K = ggml_pint(p, n_p, "K");
+    return K > 0 ? K : ggml_pint(p, n_p, "n_embd");
+}
+static int ggml_check(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
+                      const int* sel, int n_planes, const lq::ggml::PlaneKind** out) {
+    const RadParam* t = rad_param_find(p, n_p, "type");
+    const lq::ggml::PlaneKind* k = ggml_kind_named(t && t->kind == RAD_P_STR ? t->sval : nullptr);
+    if (operand != 1 || !k || !enc || !sel) return RAD_E_DTYPE;
+    const RadEncoding want = lq::ggml::encoding_of(k->type);
+    if (!rad_enc_equal(enc, &want) || n_planes != want.n_planes) return RAD_E_DTYPE;
+    for (int i = 0; i < n_planes; ++i)
+        if (sel[i] != i) return RAD_E_SHAPE;
+    *out = k;
+    return RAD_OK;
+}
+/* Plane i's row r, or null for a TABLE or per-tensor plane (pack and unpack do not touch those). */
+static uint8_t* ggml_plane_row(const RadEncoding* enc, const RadTensor* planes, int i, int64_t r) {
+    const RadEncPlane& pl = enc->plane[i];
+    if (pl.kind == RAD_PLANE_TABLE || (pl.block[0] == 0 && pl.block[1] == 0)) return nullptr;
+    const int64_t cols = planes[i].rank >= 2 ? planes[i].shape[1] : 0;
+    return (uint8_t*)planes[i].data + r * rad_enc_row_bytes(pl.dtype, cols);
+}
+static int avx_ggml_layout(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
+                           const int* sel, const RadTensor* planes, int n_planes, RadLayout* out) {
+    if (n_planes <= 1) return RAD_E_UNSUPPORTED;
+    const lq::ggml::PlaneKind* k = nullptr;
+    const int rc = ggml_check(p, n_p, operand, enc, sel, n_planes, &k);
+    if (rc < 0) return rc;
+    const int64_t K = ggml_row_len(p, n_p), rows = planes[0].rank >= 1 ? planes[0].shape[0] : 0;
+    if (K <= 0 || K % k->block || rows <= 0) return RAD_E_SHAPE;
+    static thread_local char tag[32];
+    snprintf(tag, sizeof tag, "ggml_%s", k->name);
+    std::memset(out, 0, sizeof *out);
+    out->tag = tag;
+    out->dtype = RAD_U8;
+    out->rank = 2;
+    out->shape[0] = rows;
+    out->shape[1] = K / k->block * (int64_t)k->block_bytes;
+    out->align = 64;
+    out->bytes = out->shape[0] * out->shape[1];
+    return RAD_OK;
+}
+static int avx_ggml_relayout(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
+                             const int* sel, const RadTensor* planes, int n_planes, void* dst,
+                             int64_t dst_bytes) {
+    if (n_planes <= 1) return RAD_E_UNSUPPORTED;
+    const lq::ggml::PlaneKind* k = nullptr;
+    const int rc = ggml_check(p, n_p, operand, enc, sel, n_planes, &k);
+    if (rc < 0) return rc;
+    const int64_t K = ggml_row_len(p, n_p), rows = planes[0].rank >= 1 ? planes[0].shape[0] : 0;
+    const int64_t nb = K / k->block, rb = nb * (int64_t)k->block_bytes;
+    if (K <= 0 || K % k->block || rows <= 0 || dst_bytes < rows * rb) return RAD_E_SHAPE;
+    const lq::ggml::PackFn pack = lq::ggml::pack_of(k->type);
+    const uint8_t* row[RAD_ENC_MAX_PLANES];
+    for (int64_t r = 0; r < rows; ++r) {
+        for (int i = 0; i < n_planes; ++i) row[i] = ggml_plane_row(enc, planes, i, r);
+        pack(row, nb, (uint8_t*)dst + r * rb);
+    }
+    return RAD_OK;
+}
+static int avx_ggml_unrelayout(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
+                               const int* sel, const void* src, int64_t src_bytes,
+                               const RadTensor* planes, int n_planes) {
+    if (n_planes <= 1) return RAD_E_UNSUPPORTED;
+    const lq::ggml::PlaneKind* k = nullptr;
+    const int rc = ggml_check(p, n_p, operand, enc, sel, n_planes, &k);
+    if (rc < 0) return rc;
+    const int64_t K = ggml_row_len(p, n_p), rows = planes[0].rank >= 1 ? planes[0].shape[0] : 0;
+    const int64_t nb = K / k->block, rb = nb * (int64_t)k->block_bytes;
+    if (K <= 0 || K % k->block || rows <= 0 || src_bytes < rows * rb) return RAD_E_SHAPE;
+    uint8_t* row[RAD_ENC_MAX_PLANES];
+    void* all[RAD_ENC_MAX_PLANES];
+    for (int i = 0; i < n_planes; ++i) all[i] = planes[i].data;
+    for (int64_t r = 0; r < rows; ++r) {
+        for (int i = 0; i < n_planes; ++i) row[i] = ggml_plane_row(enc, planes, i, r);
+        k->unpack((const uint8_t*)src + r * rb, nb, row);
+    }
+    lq::ggml::write_shared(k->type, *enc, all);
+    return RAD_OK;
+}
+/* The kernel checks its own operands: the weight is u8 blocks or a float logical form. */
+#define ROW_GGML(nm, opname, fam, what, dts, fn)                                                  \
+    { nm, opname, fam, what, SHAPE_ANY, dts, RAD_DOMAIN_HOST, 0,                                  \
+      nullptr, 0, nullptr, 0, nullptr, nullptr, nullptr, fn, nullptr, avx_ggml_layout,            \
+      avx_ggml_relayout, nullptr, avx_ggml_unrelayout, nullptr }
+#endif
+
 #define DT_FLOAT "bf16 f16 f32 fp8_e4m3 fp8_e5m2 i8 i32, chosen per operand from its own dtype"
 #define DT_ANY   "any dtype rad_types.h names, per operand"
 #define DT_FLOAT_CB DT_FLOAT "; or u4 / u5 codes into an f32 table, joined (w4nl* / w5nl*)"
@@ -1505,6 +1715,10 @@ SIMPLE("avx_mhc_pre_partial", "mhc_pre_partial", "norm", "manifold projection pa
 SIMPLE("avx_mhc_pre_finish", "mhc_pre_finish", "norm", "manifold gates from projection partials", DT_FLOAT, L(mhc_pre_finish)),
 SIMPLE("avx_mhc_post", "mhc_post", "norm", "manifold residual update", DT_FLOAT, L(mhc_post)),
 SIMPLE("avx_mhc_contract", "mhc_contract", "norm", "mean of residual streams", DT_FLOAT, L(mhc_contract)),
+SIMPLE("avx_mhc_mix", "mhc_mix", "norm", "manifold gates and Sinkhorn mixing, pre gates out",
+       DT_FLOAT, L(mhc_mix)),
+SIMPLE("avx_mhc_collapse", "mhc_collapse", "norm", "residual streams collapsed by given gates",
+       DT_FLOAT, L(mhc_collapse)),
 SIMPLE("avx_kda_update", "kda_update", "gdn", "bounded KDA and candidate-state rollback", DT_FLOAT, L(kda_update)),
 ROWL("avx_hc_read", "hc_read", "norm",
      "gated residual read: grouped norm, low-rank gate, stream mix",
@@ -1689,6 +1903,35 @@ SIMPLE("avx_kv_resolve", "kv_resolve", "attn",
 SIMPLE("avx_rope", "rope", "attn", "rotary embedding in place", DT_FLOAT, L(rope)),
 SIMPLE("avx_rope_table", "rope_table", "attn", "cos/sin at each position's own row", DT_FLOAT,
        L(rope_table)),
+SIMPLE("avx_rope_rows", "rope_rows", "attn", "rope from a cos/sin plane over a window of each head",
+       DT_FLOAT, L(rope_rows)),
+SIMPLE("avx_quant_roundtrip", "quant_roundtrip", "quant",
+       "block-scaled fp8 / fp4 quantise-dequantise in place", DT_FLOAT, L(quant_roundtrip)),
+SIMPLE("avx_softmax_pool", "softmax_pool", "attn", "channel-wise softmax pooling of ratio rows",
+       DT_FLOAT, L(softmax_pool)),
+SIMPLE("avx_attn_sparse_sink", "attn_sparse_sink", "attn",
+       "window plus selected compressed latent attention with sinks", DT_FLOAT, L(attn_sparse_sink)),
+SIMPLE("avx_index_score", "index_score", "attn",
+       "indexer relu-gated head scores over a paged index cache", DT_FLOAT, L(index_score)),
+SIMPLE("avx_index_candidates", "index_candidates", "attn", "two-level top-k: kept candidate blocks",
+       DT_ANY, L(index_candidates)),
+SIMPLE("avx_index_topk", "index_topk", "attn", "top-k passed positions in position order", DT_ANY,
+       L(index_topk)),
+SIMPLE("avx_entry_store", "entry_store", "attn", "one entry a block into a paged cache", DT_FLOAT,
+       L(entry_store)),
+SIMPLE("avx_token_map", "token_map", "embed", "ids through an id table", DT_ANY, L(token_map)),
+SIMPLE("avx_stream_gate_add", "stream_gate_add", "norm", "normalized-dot gated write into hc streams",
+       DT_FLOAT, L(stream_gate_add)),
+#ifdef AVX_HAVE_GGML
+ROW_GGML("avx_gemm_nt_ggml", "gemm_nt_ggml", "gemm", "llama.cpp native-block linear", DT_FLOAT,
+         L(gemm_nt_ggml)),
+ROW_GGML("avx_moe_gemm_ggml", "moe_gemm_ggml", "moe", "grouped GEMM over llama.cpp native-block experts",
+         DT_FLOAT, L(moe_gemm_ggml)),
+ROW_GGML("avx_logits_gemm_ggml", "logits_gemm_ggml", "vocab", "lm_head over llama.cpp native blocks",
+         DT_FLOAT, L(logits_gemm_ggml)),
+ROW_GGML("avx_embed_lookup_ggml", "embed_lookup_ggml", "vocab",
+         "embedding gather from llama.cpp native blocks", DT_FLOAT, L(embed_lookup_ggml)),
+#endif  /* AVX_HAVE_GGML: the native-block rows */
 SIMPLE("avx_qsa_block_key", "qsa_block_key", "attn",
        "QSA compressed key: pooled, normed and rotated at the block's position", DT_FLOAT,
        L(qsa_block_key)),
@@ -1709,6 +1952,8 @@ SIMPLE("avx_router_topk", "router_topk", "moe", "softmax then exact top-k routin
        L(router_topk)),
 SIMPLE("avx_router_sigmoid_topk", "router_sigmoid_topk", "moe", "sigmoid correction-bias routing", DT_FLOAT,
        L(router_sigmoid_topk)),
+SIMPLE("avx_router_scored_topk", "router_scored_topk", "moe",
+       "correction-bias routing over a named score", DT_FLOAT, L(router_scored_topk)),
 SIMPLE("avx_router_topk_scatter", "router_topk_scatter", "moe",
        "the selection and the sort in one op, run as exactly the pair", DT_FLOAT,
        L(router_topk_scatter)),
@@ -1921,6 +2166,10 @@ SIMPLE("avx_sub_i32", "sub_i32", "elem", "a device int32 vector less a device sc
        L(sub_i32)),
 
 SIMPLE("avx_embed_lookup", "embed_lookup", "vocab", "embedding gather", DT_FLOAT, L(embed_lookup)),
+SIMPLE("avx_embed_lookup_planes", "embed_lookup_planes", "vocab",
+       "embedding gather from a table's affine planes in place: u4 codes through a 16-entry table "
+       "sixteen at a time at AVX-512, every other form element by element",
+       "i8 u8 i4 u4 codes, any float scale and table, per operand", L(embed_lookup_planes)),
 /* Its layout hook only validates: the table is read as stored and other encodings are refused
  * (avx_ngram.cpp). An E4M3 table into bf16 goes through the row cache; other dtype pairs take
  * the general gather. The init hook refuses, at declare, a process that cannot create the
@@ -2000,3 +2249,10 @@ extern "C" const RadKernelInfo* rad_kernel_at(int i) {
     if (i < 0 || i >= rad_kernel_count()) return nullptr;
     return &kKernels[i];
 }
+/* embed_lookup_q reads a file-backed table's rows itself (avx_ngram.cpp: direct reads into its row
+ * cache), so the engine must not read them ahead through the page cache as well. */
+extern "C" int rad_kernel_fetches_rows(int i) {
+    const RadKernelInfo* k = rad_kernel_at(i);
+    return k && k->init == avx_init_ngram;
+}
+[[maybe_unused]] static const RadKernelFetchesRowsFn kFetchesRowsCheck = rad_kernel_fetches_rows;

@@ -2881,7 +2881,21 @@ static const RadOperandSpec oQuantCols[] = {
     { "x", RAD_OPD_IN, 0 }, { "y", RAD_OPD_OUT, 0 }, { "scale", RAD_OPD_OUT, 0 },
 };
 
+/* DeepSeek-V4.1's ops (r4d_ds41_*.inc): parameter and operand specs, constraints. */
+#define R4D_DS41_SPECS
+#include "r4d_ds41_elem.inc"
+#include "r4d_ds41_sparse.inc"
+#include "r4d_ds41_ggml.inc"
+#include "r4d_ds41_mxfp4.inc"
+#undef R4D_DS41_SPECS
+
 static const RadOpSchema kSchemas[] = {
+#define R4D_DS41_SCHEMAS
+#include "r4d_ds41_elem.inc"
+#include "r4d_ds41_sparse.inc"
+#include "r4d_ds41_ggml.inc"
+#include "r4d_ds41_mxfp4.inc"
+#undef R4D_DS41_SCHEMAS
     SCHEMA("rmsnorm", pRmsNorm, oRmsNorm,
            "y = x * rsqrt(mean(x^2) + eps) * (w + wadd). `wadd` is GemmaRMSNorm's `1 +`, added in "
            "f32 after the load because forming it in bf16 first costs 0.3% per channel."),
@@ -4545,7 +4559,7 @@ static const RadConstraint cFp8F32Scale[] = {
     C_DIV("K", 128), C_EQ("group", 128), C_IN("dtype", "fp8a8f32")
 };
 static const RadConstraint cGemmNtF32[] = { C_GE("M", 1),         C_LE("M", 65535),
-                                            C_GE("N", 1),         C_LE("N", 512),
+                                            C_GE("N", 1),         C_LE("N", 65536),
                                             C_GE("K", 1),         C_LE("K", 16384),
                                             C_IN("dtype", "bf16") };
 static const RadConstraint cDsaScore[] = {
@@ -4670,8 +4684,15 @@ static const RadConstraint cMoeGather[] = {
 static const RadConstraint cRowTopK[] = {
     C_DIV("N", 8), C_GE("M", 1), C_GE("R", 1), C_LE("R", 32), C_IN("dtype", "bf16"),
 };
+/* rowtopk_f32 is exact for any N (no vector-width rule) and needs no tunable: RC = R, PT >= R. */
+static const RadConstraint cRowTopKF32[] = {
+    C_GE("N", 1), C_GE("M", 1), C_LE("M", 65535), C_GE("R", 1), C_LE("R", 32),
+    C_IN("dtype", "f32"),
+};
+/* `dtype` names the source logits' type; the gathered plane is f32 pairs either way and neither
+ * implementation rounds to it, so a bf16 and an f32 head merge alike. */
 static const RadConstraint cRowTopKMerge[] = {
-    C_GE("M", 1), C_GE("R", 1), C_LE("R", 32), C_GE("world_size", 1), C_IN("dtype", "bf16"),
+    C_GE("M", 1), C_GE("R", 1), C_LE("R", 32), C_GE("world_size", 1), C_IN("dtype", "bf16 f32"),
 };
 static const RadConstraint cLogitRerank[] = {
     C_GE("M", 1), C_GE("R", 1), C_LE("R", 32), C_GE("n_vocab", 1), C_GE("n_embd", 1),
@@ -4781,6 +4802,14 @@ static const RadConstraint cQsaWork[] = {
 
 static const RadConstraint cQsaTailStore[] = {
     C_GE("n", 1), C_GE("ratio", 1), C_GE("seqs", 1), C_IN("dtype", "bf16"),
+};
+/* The same two copies over f32 planes (a compressor that stages its windows at full precision);
+ * the launchers take either element width. */
+static const RadConstraint cQsaWorkF32[] = {
+    C_GE("n", 1), C_GE("ratio", 1), C_GE("seqs", 1), C_GE("work", 1), C_IN("dtype", "f32"),
+};
+static const RadConstraint cQsaTailStoreF32[] = {
+    C_GE("n", 1), C_GE("ratio", 1), C_GE("seqs", 1), C_IN("dtype", "f32"),
 };
 
 /* No dtype: every operand is f32 or i32. */
@@ -5334,6 +5363,7 @@ static const RadTunable tRmsQ8[] = {
  * power-of-two padding. */
 static const RadConstraint cBf16Row[]   = { C_IN("dtype", "bf16") };
 static const RadConstraint cF32Row[]    = { C_IN("dtype", "f32") };
+static const RadConstraint cI32Row[]    = { C_IN("dtype", "i32") };
 /* bf16 rows over the byte copy, which moves four bytes a thread: an even width. */
 static const RadConstraint cBf16Row2[]  = { C_IN("dtype", "bf16"), C_DIV("n", 2) };
 /* Opaque byte rows, four at a time: the vectorised copy's alignment, stated so the selector
@@ -5487,6 +5517,12 @@ static const RadConstraint cVsa[] = {
 static const RadConstraint cQuantCols[] = { C_DIV("n", 8), C_IN("dtype", "bf16") };
 
 static const RadKernelInfo kKernels[] = {
+#define R4D_DS41_ROWS
+#include "r4d_ds41_elem.inc"
+#include "r4d_ds41_sparse.inc"
+#include "r4d_ds41_ggml.inc"
+#include "r4d_ds41_mxfp4.inc"
+#undef R4D_DS41_ROWS
 /* ---------------------------------- the small model ops (r4d_model_bf16.hip) ----------------
  *
  * The ops between the larger kernels. They need device rows because the engine's buffers live in
@@ -5860,6 +5896,17 @@ static const RadKernelInfo kKernels[] = {
   nullptr, nullptr, r4d_rad_add, nullptr, nullptr, nullptr,
   r4d_shape_binary },
 
+{ "add_i32", "add", "elem",
+  "elementwise int32 sum (a drafter's ids and positions) as libref computes it: operands read as "
+  "f32, the f32 sum rounded to nearest and saturated into int32; `div` divides the rounded sum",
+  "any M and n, the same one row-broadcast form, flat over the extent; equal to a wrapping int32 "
+  "add while |a|, |b|, |a + b| < 2^24",
+  "i32 in and out",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cI32Row), NOTUNE,
+  nullptr, nullptr, r4d_rad_add, nullptr, nullptr, nullptr,
+  r4d_shape_binary },
+
 { "mul_bf16", "mul", "elem",
   "elementwise product, with the one row-broadcast form",
   "any n; the same broadcast rule as add",
@@ -5985,7 +6032,7 @@ static const RadKernelInfo kKernels[] = {
   nullptr, nullptr, r4d_rad_dsa_query, nullptr, nullptr, nullptr,
   r4d_shape_dsa_query },
 { "gemm_nt_f32_bf16", "gemm_nt_f32", "gemm", "F32 routing and index gate projection",
-  "N<=512, K<=16384; pitched rows", "bf16 input, f32 weights and output",
+  "N<=65536, K<=16384; pitched rows", "bf16 input, f32 weights and output",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cGemmNtF32), NOTUNE,
   nullptr, nullptr, r4d_rad_gemm_nt_f32, nullptr, nullptr, nullptr,
   r4d_shape_gemm_nt_f32 },
@@ -8244,6 +8291,17 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   nullptr, nullptr, r4d_rad_rowtopk, r4d_rad_rowtopk_scratch, nullptr, nullptr,
   r4d_shape_row_topk },
 
+{ "rowtopk_f32", "row_topk", "select",
+  "exact per-row top-R of an f32 matrix (a GGUF head's logits), descending, ties to the lower "
+  "column; -0 ties +0 as libref's float compare does",
+  "any M <= 65535, any N (uneven vocab shards), R <= 32; two launches (1024-column chunks keeping "
+  "their top-R, then one wave a row), caller-sized partial buffer, exact for any non-NaN data",
+  "f32 in, f32 values + i32 columns out (-1 / -inf for a slot past N)",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cRowTopKF32), NOTUNE,
+  nullptr, nullptr, r4d_rad_rowtopk_f32, r4d_rad_rowtopk_f32_scratch, nullptr, nullptr,
+  r4d_shape_row_topk },
+
 { "logit_rerank", "logit_rerank", "select",
   "R candidates a row rescored exactly against the full-precision head",
   "any M, R <= 32, bf16 x and the E4M3 lm_head plane logits_gemm_fp8 stores; one block a row with "
@@ -8272,7 +8330,7 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   "the global top-R of world_size all-gathered per-rank candidate sets",
   "any M, R <= 32; `gathered` is [M, world_size * R, 2] f32 pairs, an int32 id in the first slot; "
   "one wave a row, one launch, no scratch",
-  "f32 pairs in, f32 values + i32 ids out, ties to the lower id",
+  "f32 pairs in (from a bf16 or an f32 head), f32 values + i32 ids out, ties to the lower id",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cRowTopKMerge), NOTUNE,
   nullptr, nullptr, r4d_rad_rowtopk_merge, nullptr, nullptr, nullptr,
@@ -8371,6 +8429,22 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   "bf16 keys in, an i32 position and an i32 cu_seqlens; the bf16 tail written in place",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cQsaTailStore), NOTUNE,
+  nullptr, nullptr, r4d_rad_qsa_tail_store, nullptr, nullptr, nullptr,
+  r4d_shape_qsa_tail_store },
+{ "qsa_work_f32", "qsa_work", "attn",
+  "qsa_work_bf16's gather over f32 planes: the same kernel at 32-bit elements",
+  "as qsa_work_bf16",
+  "f32 keys and an f32 tail in; an f32 staging plane out; the i32 operands as qsa_work_bf16",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cQsaWorkF32), NOTUNE,
+  nullptr, nullptr, r4d_rad_qsa_work, nullptr, nullptr, nullptr,
+  r4d_shape_qsa_work },
+{ "qsa_tail_store_f32", "qsa_tail_store", "attn",
+  "qsa_tail_store_bf16's store over f32 planes: the same kernel at 32-bit elements",
+  "as qsa_tail_store_bf16",
+  "f32 keys in, the f32 tail written in place; the i32 operands as qsa_tail_store_bf16",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cQsaTailStoreF32), NOTUNE,
   nullptr, nullptr, r4d_rad_qsa_tail_store, nullptr, nullptr, nullptr,
   r4d_shape_qsa_tail_store },
 

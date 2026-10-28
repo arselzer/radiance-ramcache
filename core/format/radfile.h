@@ -21,6 +21,7 @@
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace rad {
@@ -68,8 +69,20 @@ public:
 
     /* Drop the blob from the page cache and this process's page tables, so a container larger
      * than RAM does not leave the cache full of pages nothing will read. Only the blob: the tables
-     * are small and read constantly. Advisory; the kernel may decline. */
-    void drop_blob_cache() const;
+     * are small and read constantly. `keep` (file offset, bytes) is left alone: the mapped tier,
+     * read through the mapping for the engine's life, whose cached pages a restart would otherwise
+     * throw away (every gather from it then starts cold). Advisory; the kernel may decline. */
+    void drop_blob_cache(const std::vector<std::pair<int64_t, int64_t>>& keep = {}) const;
+
+    /* What an earlier process left cached of the blob comes back: snapshot_resident(), called
+     * right after open() and before anything allocates, records the blob's pages resident in the
+     * page cache (mincore, as page runs), because the load's own pinned pools can push the kernel
+     * into direct reclaim that takes them; rewarm() asks the kernel (MADV_WILLNEED) for the
+     * recorded pages inside `ranges` -- the mapped tier, whose host gathers otherwise start cold
+     * after every restart -- up to `max_bytes`, and drops the record. Bytes asked for; 0 with no
+     * record. Advisory. The engine takes the snapshot unless --mapped-rewarm off. */
+    void    snapshot_resident();
+    int64_t rewarm(const std::vector<std::pair<int64_t, int64_t>>& ranges, int64_t max_bytes);
 
     /* Drop one range of the blob behind a single forward cursor. A buffered front-to-back read of
      * a container larger than RAM otherwise builds reclaim pressure that slows the read itself.
@@ -166,6 +179,7 @@ private:
     VocabSection                                  vocab_, aux_vocab_;
     std::vector<ExpertGroup>                      groups_;
     std::unordered_map<std::string_view, int64_t> by_name_;
+    std::vector<std::pair<int64_t, int64_t>>      resident_;   /* page runs cached at the snapshot */
 };
 
 /* ================================================================== writer */

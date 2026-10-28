@@ -73,16 +73,25 @@ int Engine::step_state_init() {
             return RAD_E_UNSUPPORTED;
         }
         const Program& prog = ranks_[0]->program;
-        for (size_t i = 0; i < prog.buffers.size(); ++i) {
-            const std::string& name = prog.buffers[i].name;
-            auto ends = [&](const char* suffix) {
-                const size_t n = std::strlen(suffix);
-                return name.size() >= n && name.compare(name.size() - n, n, suffix) == 0;
-            };
-            if (ends("mtp_couple_draws")) couple_draws_buf_ = (rad_buf)i;
-            if (ends("mtp_couple_state")) couple_state_buf_ = (rad_buf)i;
+        /* By name in each rank's own program: handles index the program that declared them
+         * (advance_all), and the draws are staged on every rank. */
+        couple_draws_rank_.assign(ranks_.size(), 0);
+        for (size_t r = 0; r < ranks_.size(); ++r) {
+            const Program& pr = ranks_[r]->program;
+            for (size_t i = 0; i < pr.buffers.size(); ++i) {
+                const std::string& name = pr.buffers[i].name;
+                auto ends = [&](const char* suffix) {
+                    const size_t n = std::strlen(suffix);
+                    return name.size() >= n && name.compare(name.size() - n, n, suffix) == 0;
+                };
+                if (ends("mtp_couple_draws")) couple_draws_rank_[r] = (rad_buf)i;
+                if (r == 0 && ends("mtp_couple_state")) couple_state_buf_ = (rad_buf)i;
+            }
         }
-        if (!couple_draws_buf_ || !couple_state_buf_) {
+        couple_draws_buf_ = couple_draws_rank_[0];
+        bool all_draws = true;
+        for (rad_buf h : couple_draws_rank_) all_draws = all_draws && h;
+        if (!all_draws || !couple_state_buf_) {
             RAD_ERR("--draft-coupling on, but the architecture declared no coupled MTP planes; "
                     "this model's drafter cannot couple");
             return RAD_E_STATE;
@@ -171,10 +180,15 @@ int Engine::advance_all(int mode, int round, bool from_proposal, int rows) {
         a.eog   = rk.eog;
         a.n_eog = rk.n_eog;
         if (from_proposal) {
-            a.src = static_cast<const int32_t*>(drafter_.proposal ? rk.ctx.buf_ptr(drafter_.proposal)
-                                                                  : rk.ctx.buf_ptr(rk.tok_buf));
-            a.src_pitch = (drafter_.proposal && drafter_.proposal_pitch > 0)
-                              ? drafter_.proposal_pitch : 1;
+            /* This rank's own handle: a buffer handle indexes the program that declared it, and a
+             * plugin may declare a different buffer list on each rank (DeepSeek-V4.1's drafter
+             * source rows exist on its attention ranks only), so rank 0's handle can name another
+             * buffer here -- an attention-zero rank then verified garbage proposals at positions
+             * of its own while the other ranks verified the head's. */
+            const RadDrafterDecl& dd = rk.program.drafter;
+            a.src = static_cast<const int32_t*>(dd.proposal ? rk.ctx.buf_ptr(dd.proposal)
+                                                            : rk.ctx.buf_ptr(rk.tok_buf));
+            a.src_pitch = (dd.proposal && dd.proposal_pitch > 0) ? dd.proposal_pitch : 1;
         } else {
             a.src = static_cast<const int32_t*>(rk.ctx.buf_ptr(rk.tok_buf));
         }
@@ -424,7 +438,7 @@ int Engine::stage_couple_draws(const Row* rows, int n) {
         return stg;
     }
     for (auto& rk : ranks_) {
-        void* dst = rk->ctx.buf_ptr(couple_draws_buf_);
+        void* dst = rk->ctx.buf_ptr(couple_draws_rank_[(size_t)rk->index]);
         if (!dst) return RAD_E_STATE;
         RAD_TRY(rad_memcpy_async(dst, couple_draw_stage_,
                                  n * (int64_t)sizeof(RadMtpCoupleDraw), rk->ctx.stream()));

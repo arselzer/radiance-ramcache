@@ -11,6 +11,10 @@
  * The plugin is reached through RadKernelInfo::launch with a hand-built RadArgs, as the engine
  * reaches it, so the operand order and parameter names in libref/ref_registry.cpp are tested too.
  */
+#include "../libquant/lq_ggml_dequant.h"
+#include "../libquant/lq_ggml_planes.h"
+#include "../libquant/lq_ggml_port.h"
+#include <cstddef>
 #include "rad_test.h"
 #include "rad_abi.h"
 #include "../libref/ref_common.h"
@@ -152,6 +156,7 @@ struct T {
         for (size_t i = 0; i < v.size(); ++i) st_int(t.dtype, t.data, (int64_t)i, v[i]);
         return *this;
     }
+    void     set(int64_t i, float v) { st_dt(t.dtype, t.data, i, v); }
     float    at(int64_t i) const  { return ld_dt(t.dtype, t.data, i); }
     int64_t  iat(int64_t i) const { return ld_int(t.dtype, t.data, i); }
 };
@@ -316,6 +321,741 @@ TEST(manifold_post_mixes_sources_into_destinations_and_contracts_by_mean) {
     REQUIRE_EQ(run("mhc_contract", c), RAD_OK);
     CHECK_EQ(contracted.at(0), 30.0f);
     CHECK_EQ(contracted.at(1), 40.0f);
+}
+
+/* mhc_mix is mhc_pre with the collapse moved out: its post and comb are mhc_pre's, its pre gates
+ * collapse h through mhc_collapse into mhc_pre's x, and with every gate 1/hc the collapse is
+ * mhc_contract. */
+TEST(manifold_mix_and_collapse_are_mhc_pre_split_in_two) {
+    const int64_t M = 3, n = 5, hc = 4, W = hc * n, mix = hc * (hc + 2);
+    T h(RAD_F32, {M, W}), fn(RAD_F32, {mix, W}), scale(RAD_F32, {3}), base(RAD_F32, {mix});
+    for (int64_t i = 0; i < M * W; ++i) h.set(i, std::sin(0.37f * (float)i) * 2.0f);
+    for (int64_t i = 0; i < mix * W; ++i) fn.set(i, std::cos(0.11f * (float)i) * 0.3f);
+    scale.f({0.7f, 1.3f, 0.9f});
+    for (int64_t i = 0; i < mix; ++i) base.set(i, 0.05f * (float)(i % 7) - 0.1f);
+    T x(RAD_F32, {M, n}), post(RAD_F32, {M, hc}), comb(RAD_F32, {M, hc * hc});
+    A a; a.t(h).t(fn).t(scale).t(base).t(x).t(post).t(comb).i("M", M).i("n", n).i("hc", hc)
+        .i("iterations", 20).d("eps", 1e-6).d("hc_eps", 1e-6).s("dtype", "f32");
+    REQUIRE_EQ(run("mhc_pre", a), RAD_OK);
+    T pre(RAD_F32, {M, hc}), post2(RAD_F32, {M, hc}), comb2(RAD_F32, {M, hc * hc});
+    A b; b.t(h).t(fn).t(scale).t(base).t(pre).t(post2).t(comb2).i("M", M).i("n", n).i("hc", hc)
+        .i("iterations", 20).d("eps", 1e-6).d("hc_eps", 1e-6).s("dtype", "f32");
+    REQUIRE_EQ(run("mhc_mix", b), RAD_OK);
+    for (int64_t i = 0; i < M * hc; ++i) CHECK_EQ(post2.at(i), post.at(i));
+    for (int64_t i = 0; i < M * hc * hc; ++i) CHECK_EQ(comb2.at(i), comb.at(i));
+    for (int64_t i = 0; i < M * hc; ++i) CHECK(pre.at(i) > 0.0f && pre.at(i) < 1.01f);
+    T x2(RAD_F32, {M, n});
+    A c; c.t(h).t(pre).t(x2).i("M", M).i("n", n).i("hc", hc).s("dtype", "f32");
+    REQUIRE_EQ(run("mhc_collapse", c), RAD_OK);
+    for (int64_t i = 0; i < M * n; ++i) CHECK_EQ(x2.at(i), x.at(i));
+    /* Uniform gates are the mean. */
+    for (int64_t i = 0; i < M * hc; ++i) pre.set(i, 1.0f / (float)hc);
+    T x3(RAD_F32, {M, n}), xm(RAD_F32, {M, n});
+    A d; d.t(h).t(pre).t(x3).i("M", M).i("n", n).i("hc", hc).s("dtype", "f32");
+    REQUIRE_EQ(run("mhc_collapse", d), RAD_OK);
+    A e; e.t(h).t(xm).i("M", M).i("n", n).i("hc", hc).s("dtype", "f32");
+    REQUIRE_EQ(run("mhc_contract", e), RAD_OK);
+    for (int64_t i = 0; i < M * n; ++i) CHECK(std::fabs(x3.at(i) - xm.at(i)) <= 1e-6f * (1 + std::fabs(xm.at(i))));
+    /* A gate matrix of the wrong width is refused. */
+    T badpre(RAD_F32, {M, hc + 1});
+    A f; f.t(h).t(badpre).t(x3).i("M", M).i("n", n).i("hc", hc).s("dtype", "f32");
+    CHECK_EQ(run("mhc_collapse", f), RAD_E_SHAPE);
+}
+
+/* router_scored_topk: "sigmoid" is router_sigmoid_topk byte for byte; "sqrtsoftplus" weights the
+ * picks by sqrt(softplus(logit)) while the bias alone moves the pick; an unknown name is refused. */
+TEST(router_scored_topk_names_its_score_function) {
+    T lg(RAD_F32, {2, 5}); lg.f({0.3f, -1.0f, 2.0f, 25.0f, -30.0f, 1.0f, 1.0f, -2.0f, 0.5f, 0.0f});
+    T bias(RAD_F32, {5}); bias.f({0, 0.5f, 0, 0, 0});
+    T ids(RAD_I32, {2, 3}), w(RAD_F32, {2, 3}), ids2(RAD_I32, {2, 3}), w2(RAD_F32, {2, 3});
+    A a; a.t(lg).t(bias).t(ids).t(w).i("M", 2).i("n_expert", 5).i("top_k", 3).i("norm", 1)
+        .d("route_scale", 1.5).s("score", "sigmoid").s("dtype", "f32");
+    REQUIRE_EQ(run("router_scored_topk", a), RAD_OK);
+    A b; b.t(lg).t(bias).t(ids2).t(w2).i("M", 2).i("n_expert", 5).i("top_k", 3).i("norm", 1)
+        .d("route_scale", 1.5).s("dtype", "f32");
+    REQUIRE_EQ(run("router_sigmoid_topk", b), RAD_OK);
+    for (int i = 0; i < 6; ++i) { CHECK_EQ(ids.iat(i), ids2.iat(i)); CHECK_EQ(w.at(i), w2.at(i)); }
+    A c; c.t(lg).t(bias).t(ids).t(w).i("M", 2).i("n_expert", 5).i("top_k", 3).i("norm", 1)
+        .d("route_scale", 1.5).s("score", "sqrtsoftplus").s("dtype", "f32");
+    REQUIRE_EQ(run("router_scored_topk", c), RAD_OK);
+    auto sp = [](double x) { return x > 20 ? x : std::log1p(std::exp(x)); };
+    /* Row 0: sqrt(softplus): 25 -> 5, 2 -> 1.46, .3 -> .92, -1 -> .56 (+.5 bias = 1.06). */
+    const int e0[3] = {3, 2, 1};
+    double s0[3], sum0 = 0;
+    for (int j = 0; j < 3; ++j) { s0[j] = std::sqrt(sp(lg.at(e0[j]))); sum0 += s0[j]; }
+    for (int j = 0; j < 3; ++j) {
+        CHECK_EQ(ids.iat(j), e0[j]);
+        CHECK(std::fabs(w.at(j) - s0[j] * 1.5 / sum0) < 1e-6);
+    }
+    /* Row 1: scores 1.15, 1.15, .36, .99, .83; the +.5 bias puts expert 1 first, ahead of its tie
+     * with expert 0, yet it is weighted by its own unbiased score. */
+    const int e1[3] = {1, 0, 3};
+    double s1[3], sum1 = 0;
+    for (int j = 0; j < 3; ++j) { s1[j] = std::sqrt(sp(lg.at(5 + e1[j]))); sum1 += s1[j]; }
+    for (int j = 0; j < 3; ++j) {
+        CHECK_EQ(ids.iat(3 + j), e1[j]);
+        CHECK(std::fabs(w.at(3 + j) - s1[j] * 1.5 / sum1) < 1e-6);
+    }
+    A d; d.t(lg).t(bias).t(ids).t(w).i("M", 2).i("n_expert", 5).i("top_k", 3).i("norm", 1)
+        .d("route_scale", 1.5).s("score", "relu").s("dtype", "f32");
+    CHECK_EQ(run("router_scored_topk", d), RAD_E_UNSUPPORTED);
+}
+
+/* rope_rows over DeepSeek-V4's layout: the last rot columns of each head, adjacent pairs, angles
+ * from rope_table with YaRN. The rotation is the complex product, the inverse undoes it, the head's
+ * other columns and a row with a negative position are untouched, and neox pairs i with i+rot/2. */
+TEST(rope_rows_rotates_a_window_of_each_head_and_inverts) {
+    const int64_t M = 4, nh = 3, hd = 16, rot = 8, off = hd - rot;
+    T pos(RAD_I32, {M}); pos.n({0, 5, 1000, -1});
+    T cs(RAD_F32, {1024, rot});
+    T tp(RAD_I32, {M}); tp.n({0, 5, 1000, 3});
+    A ta; ta.t(tp).t(cs).i("M", M).i("rot", rot).d("theta", 160000.0).d("scale", 1.0)
+        .s("dtype", "f32").d("yarn_factor", 16.0).d("yarn_low", 0.0).d("yarn_high", 3.0);
+    REQUIRE_EQ(run("rope_table", ta), RAD_OK);
+    T x(RAD_F32, {M, nh * hd}), x0(RAD_F32, {M, nh * hd});
+    for (int64_t i = 0; i < M * nh * hd; ++i) { x.set(i, std::sin(0.7f * (float)i + 0.1f)); x0.set(i, x.at(i)); }
+    A a; a.t(x).t(cs).t(pos).i("M", M).i("n_head", nh).i("head_dim", hd).i("rot", rot).i("off", off)
+        .s("mode", "gptj").i("inverse", 0).s("dtype", "f32");
+    REQUIRE_EQ(run("rope_rows", a), RAD_OK);
+    for (int64_t m = 0; m < M; ++m)
+        for (int64_t h = 0; h < nh; ++h) {
+            const int64_t b = m * nh * hd + h * hd;
+            for (int64_t c = 0; c < off; ++c) CHECK_EQ(x.at(b + c), x0.at(b + c));
+            const int64_t p = pos.iat(m);
+            for (int64_t i = 0; i < rot / 2; ++i) {
+                const float va = x0.at(b + off + 2 * i), vb = x0.at(b + off + 2 * i + 1);
+                if (p < 0) { CHECK_EQ(x.at(b + off + 2 * i), va); continue; }
+                const float c = cs.at(p * rot + i), s = cs.at(p * rot + rot / 2 + i);
+                CHECK_EQ(x.at(b + off + 2 * i), va * c - vb * s);
+                CHECK_EQ(x.at(b + off + 2 * i + 1), va * s + vb * c);
+            }
+        }
+    a.ps[6].ival = 1;   /* inverse */
+    REQUIRE_EQ(run("rope_rows", a), RAD_OK);
+    for (int64_t i = 0; i < M * nh * hd; ++i) CHECK(std::fabs(x.at(i) - x0.at(i)) < 1e-5f);
+    /* neox pairs i with i + rot/2. */
+    T y(RAD_F32, {M, nh * hd});
+    for (int64_t i = 0; i < M * nh * hd; ++i) y.set(i, x0.at(i));
+    A n; n.t(y).t(cs).t(pos).i("M", M).i("n_head", nh).i("head_dim", hd).i("rot", rot).i("off", off)
+        .s("mode", "neox").i("inverse", 0).s("dtype", "f32");
+    REQUIRE_EQ(run("rope_rows", n), RAD_OK);
+    {
+        const int64_t b = 1 * nh * hd + 2 * hd;   /* row 1 (position 5), head 2 */
+        const float va = x0.at(b + off + 1), vb = x0.at(b + off + 1 + rot / 2);
+        const float c = cs.at(5 * rot + 1), s = cs.at(5 * rot + rot / 2 + 1);
+        CHECK_EQ(y.at(b + off + 1), va * c - vb * s);
+        CHECK_EQ(y.at(b + off + 1 + rot / 2), va * s + vb * c);
+    }
+    /* A window past the head is refused, as is an unknown mode. */
+    A w; w.t(x).t(cs).t(pos).i("M", M).i("n_head", nh).i("head_dim", hd).i("rot", rot).i("off", off + 2)
+        .s("mode", "gptj").i("inverse", 0).s("dtype", "f32");
+    CHECK_EQ(run("rope_rows", w), RAD_E_SHAPE);
+    A u; u.t(x).t(cs).t(pos).i("M", M).i("n_head", nh).i("head_dim", hd).i("rot", rot).i("off", off)
+        .s("mode", "spiral").i("inverse", 0).s("dtype", "f32");
+    CHECK_EQ(run("rope_rows", u), RAD_E_UNSUPPORTED);
+}
+
+/* quant_roundtrip against hand-worked blocks: fp8 with a power-of-two scale, fp4 with an e4m3
+ * scale (and an all-zero block floored, not divided by zero), fp4 with a power-of-two scale and
+ * ties to the even code; a second pass changes nothing. */
+TEST(quant_roundtrip_rounds_blocks_as_the_reference_kernels_do) {
+    T x(RAD_F32, {1, 8}); x.f({0.1f, -0.2f, 0.3f, 0.4f, 0, 0, 0, 0});
+    A a; a.t(x).i("M", 1).i("n", 8).i("block", 4).s("format", "fp8_e4m3").s("scale", "ue8m0")
+        .s("dtype", "f32");
+    REQUIRE_EQ(run("quant_roundtrip", a), RAD_OK);
+    /* amax .4: scale 2^-10; 102.4 -> 104, 204.8 -> 208, 307.2 -> 320, 409.6 -> 416. */
+    const float e8[8] = {104 / 1024.0f, -208 / 1024.0f, 320 / 1024.0f, 416 / 1024.0f, 0, 0, 0, 0};
+    for (int i = 0; i < 8; ++i) CHECK_EQ(x.at(i), e8[i]);
+    REQUIRE_EQ(run("quant_roundtrip", a), RAD_OK);
+    for (int i = 0; i < 8; ++i) CHECK_EQ(x.at(i), e8[i]);
+
+    T y(RAD_BF16, {1, 32});
+    std::vector<float> yv(32, 0.0f);
+    yv[0] = 0.6f; yv[1] = 1.2f; yv[2] = -3.0f;
+    y.f(yv);
+    A b; b.t(y).i("M", 1).i("n", 32).i("block", 16).s("format", "fp4_e2m1").s("scale", "e4m3")
+        .s("dtype", "bf16");
+    REQUIRE_EQ(run("quant_roundtrip", b), RAD_OK);
+    /* amax 3: scale fp8(.5) = .5; 1.19.. -> 1, 2.39.. -> 2, -6 -> -6. The zero block stays zero. */
+    CHECK_EQ(y.at(0), 0.5f);
+    CHECK_EQ(y.at(1), 1.0f);
+    CHECK_EQ(y.at(2), -3.0f);
+    for (int i = 3; i < 32; ++i) CHECK_EQ(y.at(i), 0.0f);
+
+    T z(RAD_F32, {1, 32});
+    std::vector<float> zv(32, 0.0f);
+    zv[0] = 5.0f; zv[1] = 0.75f; zv[2] = 2.5f; zv[3] = -0.25f; zv[4] = 0.7f;
+    z.f(zv);
+    A c; c.t(z).i("M", 1).i("n", 32).i("block", 32).s("format", "fp4_e2m1").s("scale", "ue8m0")
+        .s("dtype", "f32");
+    REQUIRE_EQ(run("quant_roundtrip", c), RAD_OK);
+    /* amax 5: scale 1; the ties 5, .75, 2.5 and .25 go to the even code: 4, 1, 2, 0. */
+    CHECK_EQ(z.at(0), 4.0f);
+    CHECK_EQ(z.at(1), 1.0f);
+    CHECK_EQ(z.at(2), 2.0f);
+    CHECK_EQ(z.at(3), 0.0f);
+    CHECK_EQ(z.at(4), 0.5f);
+    /* fp4 has no f32 scale and fp8 no e4m3 one; a block that does not divide the row is refused. */
+    A d; d.t(z).i("M", 1).i("n", 32).i("block", 32).s("format", "fp4_e2m1").s("scale", "f32")
+        .s("dtype", "f32");
+    CHECK_EQ(run("quant_roundtrip", d), RAD_E_UNSUPPORTED);
+    A e; e.t(z).i("M", 1).i("n", 32).i("block", 12).s("format", "fp4_e2m1").s("scale", "ue8m0")
+        .s("dtype", "f32");
+    CHECK_EQ(run("quant_roundtrip", e), RAD_E_SHAPE);
+}
+
+/* softmax_pool: per channel, the softmax of the scores weights the values; a negative page skips
+ * the entry. */
+TEST(softmax_pool_weights_each_channel_by_its_own_softmax) {
+    T st(RAD_F32, {4, 4});
+    st.f({1, 2, 0, 0,                       /* entry 0, row 0: values 1 2, scores 0 0 */
+          3, 4, 0, std::log(3.0f),          /* entry 0, row 1: values 3 4, scores 0 ln3 */
+          5, 6, 1, 1,
+          7, 8, 1, 1});
+    T out(RAD_F32, {2, 2}); out.f({99, 99, 99, 99});
+    T page(RAD_I32, {2}); page.n({0, -1});
+    A a; a.t(st).t(out).t(page).i("M", 2).i("n", 2).i("ratio", 2).s("dtype", "f32");
+    REQUIRE_EQ(run("softmax_pool", a), RAD_OK);
+    CHECK_EQ(out.at(0), 2.0f);
+    CHECK(std::fabs(out.at(1) - 3.5f) < 1e-6f);
+    CHECK_EQ(out.at(2), 99.0f);
+    CHECK_EQ(out.at(3), 99.0f);
+    A b; b.t(st).t(out).i("M", 2).i("n", 2).i("ratio", 2).s("dtype", "f32");
+    REQUIRE_EQ(run("softmax_pool", b), RAD_OK);
+    CHECK_EQ(out.at(2), 6.0f);
+    CHECK_EQ(out.at(3), 7.0f);
+}
+
+/* attn_sparse_sink against keys listed by hand: row 0 (position 4, window 3) reads window slots
+ * 4, 5 (block 1 -> 2) and 2 (block 2 -> 1) plus compressed entries 0 (block 2) and 2 (block 0);
+ * row 1 (position 1) reads window slots 6, 7 (block 0 -> 3), skips position -1, skips the -1
+ * selection and entry 1, whose block is unmapped. The sink joins only the denominator. Then the
+ * window table rebased at position 2 (a window group that dropped its first block): row 0 reads
+ * positions 2, 3 in table block 0 (-> 3) and 4 in table block 1 (-> 2); row 1's positions all lie
+ * before the table, so with no compressed key either its row is zero. */
+TEST(attn_sparse_sink_reads_the_window_and_the_selected_entries) {
+    const int64_t D = 4, H = 2;
+    T q(RAD_F32, {2, H * D}), wc(RAD_F32, {4, 1, 2, D}), cc(RAD_F32, {3, 1, 2, D / 2});
+    for (int64_t i = 0; i < 2 * H * D; ++i) q.set(i, std::sin(0.9f * (float)i + 0.3f));
+    for (int64_t i = 0; i < 4 * 2 * D; ++i) wc.set(i, std::cos(0.37f * (float)i));
+    for (int64_t i = 0; i < 3 * 2 * (D / 2); ++i) cc.set(i, std::sin(0.53f * (float)i - 1.0f));
+    T wbt(RAD_I32, {1, 4}); wbt.n({3, 2, 1, 0});
+    T cbt(RAD_I32, {1, 3}); cbt.n({2, -1, 0});
+    T sel(RAD_I32, {2, 2}); sel.n({0, 2, -1, 1});
+    T pos(RAD_I32, {2}); pos.n({4, 1});
+    T cu(RAD_I32, {2}); cu.n({0, 2});
+    T used(RAD_I32, {1}); used.n({2});          /* last row at position 1 holds 2: first = 0 */
+    T sink(RAD_F32, {H}); sink.f({0.3f, -0.5f});
+    T out(RAD_F32, {2, H * D});
+    A a; a.t(q).t(wc).t(wbt).t(used).t(cc).t(cbt).t(sel).t(pos).t(cu).t(sink).t(out).i("M", 2).i("heads", H)
+        .i("dim", D).i("window", 3).i("ratio", 2).i("topk", 2).d("scale", 0.5).s("dtype", "f32");
+    REQUIRE_EQ(run("attn_sparse_sink", a), RAD_OK);
+    struct Key { const T* t; int64_t off; };
+    auto expect = [&](const std::vector<std::vector<Key>>& keys) {
+        for (int64_t m = 0; m < 2; ++m)
+            for (int64_t h = 0; h < H; ++h) {
+                if (keys[(size_t)m].empty()) {
+                    for (int64_t d = 0; d < D; ++d) CHECK_EQ(out.at(m * H * D + h * D + d), 0.0f);
+                    continue;
+                }
+                std::vector<double> sc;
+                double mx = -1e30;
+                for (const Key& k : keys[(size_t)m]) {
+                    double dot = 0;
+                    for (int64_t d = 0; d < D; ++d) dot += (double)q.at(m * H * D + h * D + d) * k.t->at(k.off + d);
+                    sc.push_back(dot * 0.5);
+                    mx = std::max(mx, sc.back());
+                }
+                double den = std::exp((double)sink.at(h) - mx);
+                std::vector<double> acc((size_t)D, 0.0);
+                for (size_t i = 0; i < sc.size(); ++i) {
+                    const double pk = std::exp(sc[i] - mx);
+                    den += pk;
+                    for (int64_t d = 0; d < D; ++d) acc[(size_t)d] += pk * keys[(size_t)m][i].t->at(keys[(size_t)m][i].off + d);
+                }
+                for (int64_t d = 0; d < D; ++d)
+                    CHECK(std::fabs(out.at(m * H * D + h * D + d) - acc[(size_t)d] / den) < 1e-5);
+            }
+    };
+    expect({ {{&wc, 16}, {&wc, 20}, {&wc, 8}, {&cc, 8}, {&cc, 0}}, {{&wc, 24}, {&wc, 28}} });
+    /* Rebased at 2: the last row (position 1) holds nothing of the table, used = 0. */
+    T used2(RAD_I32, {1}); used2.n({0});
+    A r; r.t(q).t(wc).t(wbt).t(used2).t(cc).t(cbt).t(sel).t(pos).t(cu).t(sink).t(out).i("M", 2).i("heads", H)
+        .i("dim", D).i("window", 3).i("ratio", 2).i("topk", 2).d("scale", 0.5).s("dtype", "f32");
+    REQUIRE_EQ(run("attn_sparse_sink", r), RAD_OK);
+    expect({ {{&wc, 24}, {&wc, 28}, {&wc, 16}, {&cc, 8}, {&cc, 0}}, {} });
+    /* Window only (ratio 0): the compressed operands may be absent. */
+    A w; w.t(q).t(wc).t(wbt).t(used).tnull().tnull().tnull().t(pos).t(cu).t(sink).t(out).i("M", 2).i("heads", H)
+        .i("dim", D).i("window", 3).i("ratio", 0).i("topk", 0).d("scale", 0.5).s("dtype", "f32");
+    REQUIRE_EQ(run("attn_sparse_sink", w), RAD_OK);
+    /* A compressed entry wider than the cache's block is refused. */
+    A b; b.t(q).t(wc).t(wbt).t(used).t(cc).t(cbt).t(sel).t(pos).t(cu).t(sink).t(out).i("M", 2).i("heads", H)
+        .i("dim", D).i("window", 3).i("ratio", 4).i("topk", 2).d("scale", 0.5).s("dtype", "f32");
+    CHECK_EQ(run("attn_sparse_sink", b), RAD_E_SHAPE);
+}
+
+/* index_score: row 0 (position 3, ratio 2) has passed entries 0 (block 1) and 1 (block 0) and
+ * scores entry 2 -inf; row 1 (position 0) has passed none. */
+TEST(index_score_gates_relu_dots_per_head_and_masks_the_future) {
+    const int64_t H = 2, D = 4;
+    T q(RAD_F32, {2, H * D}), w(RAD_F32, {2, H}), kc(RAD_F32, {3, 1, 2, D / 2});
+    for (int64_t i = 0; i < 2 * H * D; ++i) q.set(i, std::sin(1.3f * (float)i));
+    w.f({0.7f, -0.4f, 1.0f, 1.0f});
+    for (int64_t i = 0; i < 3 * D; ++i) kc.set(i, std::cos(0.8f * (float)i + 0.2f));
+    T bt(RAD_I32, {1, 3}); bt.n({1, 0, 2});
+    T pos(RAD_I32, {2}); pos.n({3, 0});
+    T cu(RAD_I32, {2}); cu.n({0, 2});
+    T sc(RAD_F32, {2, 3});
+    A a; a.t(q).t(w).t(kc).t(bt).t(pos).t(cu).t(sc).i("M", 2).i("heads", H).i("dim", D).i("ratio", 2)
+        .i("width", 3).d("wscale", 0.5).s("dtype", "f32");
+    REQUIRE_EQ(run("index_score", a), RAD_OK);
+    const int64_t koff[2] = {4, 0};   /* entry 0 -> block 1, entry 1 -> block 0 */
+    for (int j = 0; j < 2; ++j) {
+        double e = 0;
+        for (int64_t h = 0; h < H; ++h) {
+            double dot = 0;
+            for (int64_t d = 0; d < D; ++d) dot += (double)q.at(h * D + d) * kc.at(koff[j] + d);
+            e += std::max(dot, 0.0) * (w.at(h) * 0.5);
+        }
+        CHECK(std::fabs(sc.at(j) - e) < 1e-5);
+    }
+    CHECK(std::isinf(sc.at(2)) && sc.at(2) < 0);
+    for (int j = 0; j < 3; ++j) CHECK(std::isinf(sc.at(3 + j)) && sc.at(3 + j) < 0);
+}
+
+/* index_candidates: blocks of 8 over 20 positions. Row 0 (position 17, ratio 1) pins block 2 and
+ * keeps the better of blocks 0 and 1; row 1 (position 3) pins block 0, and the -inf blocks it
+ * could also pick stay out. keep is a bit a block: one word for 3 blocks. */
+TEST(index_candidates_keeps_the_best_blocks_and_pins_the_newest) {
+    const int64_t C = 20;
+    T sc(RAD_F32, {2, C});
+    for (int64_t j = 0; j < C; ++j) sc.set(j, j < 18 ? (j == 5 ? 5.0f : (j == 12 ? 7.0f : 0.0f)) : -INFINITY);
+    for (int64_t j = 0; j < C; ++j) sc.set(C + j, j < 4 ? 1.0f : -INFINITY);
+    T pos(RAD_I32, {2}); pos.n({17, 3});
+    T keep(RAD_I32, {2, 1}); keep.n({-1, -1});
+    A a; a.t(sc).t(pos).t(keep).i("M", 2).i("width", C).i("block", 8).i("topk_blocks", 2).i("ratio", 1);
+    REQUIRE_EQ(run("index_candidates", a), RAD_OK);
+    CHECK_EQ(keep.iat(0), 6);   /* blocks 1 and 2 */
+    CHECK_EQ(keep.iat(1), 1);   /* block 0 */
+    /* A mask as wide as the positions (the old form) is refused. */
+    T wide(RAD_I32, {2, C});
+    A b; b.t(sc).t(pos).t(wide).i("M", 2).i("width", C).i("block", 8).i("topk_blocks", 2).i("ratio", 1);
+    CHECK_EQ(run("index_candidates", b), RAD_E_SHAPE);
+}
+
+/* index_candidates over 70 blocks (three words): the kept blocks' bits, block 69's word padded
+ * with zeros past it. Scores rise with the block, so the top 33 are blocks 37..69. */
+TEST(index_candidates_packs_a_bit_a_block_across_words) {
+    const int64_t block = 2, nb = 70, C = nb * block - 1;   /* a short last block */
+    T sc(RAD_F32, {1, C});
+    for (int64_t j = 0; j < C; ++j) sc.set(j, (float)(j / block));
+    T pos(RAD_I32, {1}); pos.n({C - 1});
+    T keep(RAD_I32, {1, 3}); keep.n({-1, -1, -1});
+    A a; a.t(sc).t(pos).t(keep).i("M", 1).i("width", C).i("block", block).i("topk_blocks", 33)
+        .i("ratio", 1);
+    REQUIRE_EQ(run("index_candidates", a), RAD_OK);
+    for (int64_t wd = 0; wd < 3; ++wd) {
+        uint32_t e = 0;
+        for (int64_t b = wd * 32; b < std::min<int64_t>(nb, wd * 32 + 32); ++b)
+            if (b >= nb - 33) e |= 1u << (b % 32);
+        CHECK_EQ((uint32_t)keep.iat(wd), e);
+    }
+}
+
+/* index_topk: the passed positions only, inside keep, ties to the lower position, ascending, -1
+ * padded. */
+TEST(index_topk_selects_passed_positions_in_order) {
+    T sc(RAD_F32, {3, 6});
+    sc.f({1, 5, 3, 5, 2, 9,   1, 5, 3, 5, 2, 9,   4, 4, 4, 4, 4, 4});
+    T pos(RAD_I32, {3}); pos.n({9, 9, 7});
+    T sel(RAD_I32, {3, 3});
+    A a; a.t(sc).tnull().t(pos).t(sel).i("M", 3).i("width", 6).i("topk", 3).i("ratio", 2);
+    REQUIRE_EQ(run("index_topk", a), RAD_OK);
+    const int64_t e0[9] = {1, 2, 3,  1, 2, 3,  0, 1, 2};
+    for (int i = 0; i < 9; ++i) CHECK_EQ(sel.iat(i), e0[i]);
+    /* keep as index_candidates writes it, blocks of 1: positions {0,1,3,4,5}, all, {3}. */
+    T keep(RAD_I32, {3, 1}); keep.n({0x3b, 0x3f, 0x08});
+    T pos2(RAD_I32, {3}); pos2.n({9, 2, 7});
+    A b; b.t(sc).t(keep).t(pos2).t(sel).i("M", 3).i("width", 6).i("topk", 3).i("ratio", 2).i("block", 1);
+    REQUIRE_EQ(run("index_topk", b), RAD_OK);
+    const int64_t e1[9] = {1, 3, 4,  0, -1, -1,  3, -1, -1};
+    for (int i = 0; i < 9; ++i) CHECK_EQ(sel.iat(i), e1[i]);
+    /* Blocks of 2 at the first positions: row 0 keeps blocks 0 and 2 (positions 0, 1, 4; 5 is not
+     * passed), row 1 block 1, row 2 none. */
+    T keep2(RAD_I32, {3, 1}); keep2.n({0x5, 0x2, 0x0});
+    A c; c.t(sc).t(keep2).t(pos).t(sel).i("M", 3).i("width", 6).i("topk", 3).i("ratio", 2).i("block", 2);
+    REQUIRE_EQ(run("index_topk", c), RAD_OK);
+    const int64_t e2[9] = {0, 1, 4,  2, 3, -1,  -1, -1, -1};
+    for (int i = 0; i < 9; ++i) CHECK_EQ(sel.iat(i), e2[i]);
+    /* keep without block is refused. */
+    A d; d.t(sc).t(keep2).t(pos).t(sel).i("M", 3).i("width", 6).i("topk", 3).i("ratio", 2);
+    CHECK_EQ(run("index_topk", d), RAD_E_SHAPE);
+}
+
+/* index_score's runs (row_part): five rows of two sequences scored in runs of two rows into one
+ * two-row plane are the unsplit op's rows bit for bit; the run past the step's fifth row scores
+ * -inf there. */
+TEST(index_score_runs_are_the_unsplit_rows) {
+    const int64_t H = 2, D = 4, M = 5, C = 4, R = 2;
+    T q(RAD_BF16, {M, H * D}), w(RAD_BF16, {M, H}), kc(RAD_BF16, {4, 1, 2, D / 2});
+    for (int64_t i = 0; i < M * H * D; ++i) q.set(i, std::sin(1.3f * (float)i));
+    for (int64_t i = 0; i < M * H; ++i) w.set(i, std::cos(0.9f * (float)i));
+    for (int64_t i = 0; i < 4 * D; ++i) kc.set(i, std::cos(0.8f * (float)i + 0.2f));
+    T bt(RAD_I32, {2, 2}); bt.n({1, 0,  3, 2});
+    T pos(RAD_I32, {M}); pos.n({5, 6, 7, 1, 2});   /* sequence 0 rows 0-2, sequence 1 rows 3-4 */
+    T cu(RAD_I32, {3}); cu.n({0, 3, 5});
+    T whole(RAD_F32, {M, C});
+    A a; a.t(q).t(w).t(kc).t(bt).t(pos).t(cu).t(whole).i("M", M).i("heads", H).i("dim", D)
+        .i("ratio", 2).i("width", C).d("wscale", 0.5).s("dtype", "bf16");
+    REQUIRE_EQ(run("index_score", a), RAD_OK);
+    for (int64_t p = 0; p < 3; ++p) {
+        T part(RAD_F32, {R, C});
+        A b; b.t(q).t(w).t(kc).t(bt).t(pos).t(cu).t(part).i("M", R).i("heads", H).i("dim", D)
+            .i("ratio", 2).i("width", C).d("wscale", 0.5).s("dtype", "bf16").i("row_part", p);
+        REQUIRE_EQ(run("index_score", b), RAD_OK);
+        for (int64_t i = 0; i < R; ++i)
+            for (int64_t j = 0; j < C; ++j) {
+                const float got = part.at(i * C + j);
+                if (p * R + i < M) {
+                    const float want = whole.at((p * R + i) * C + j);
+                    CHECK(std::memcmp(&got, &want, 4) == 0);
+                } else {
+                    CHECK(std::isinf(got) && got < 0);
+                }
+            }
+    }
+    /* Without row_part the plane must hold the step's rows. */
+    T short_(RAD_F32, {R, C});
+    A c; c.t(q).t(w).t(kc).t(bt).t(pos).t(cu).t(short_).i("M", R).i("heads", H).i("dim", D)
+        .i("ratio", 2).i("width", C).d("wscale", 0.5).s("dtype", "bf16");
+    CHECK_EQ(run("index_score", c), RAD_E_SHAPE);
+}
+
+/* entry_store writes whole blocks at their pages and skips a negative page. */
+TEST(entry_store_writes_one_entry_a_block) {
+    T x(RAD_F32, {3, 4}); x.f({1, 2, 3, 4,  5, 6, 7, 8,  9, 10, 11, 12});
+    T page(RAD_I32, {3}); page.n({2, -1, 0});
+    T cache(RAD_F32, {3, 1, 2, 2}); cache.f({0, 0, 0, 0,  -1, -1, -1, -1,  0, 0, 0, 0});
+    A a; a.t(x).t(page).t(cache).i("M", 3).i("n", 4).i("block_size", 2).s("dtype", "f32");
+    REQUIRE_EQ(run("entry_store", a), RAD_OK);
+    const float e[12] = {9, 10, 11, 12,  -1, -1, -1, -1,  1, 2, 3, 4};
+    for (int i = 0; i < 12; ++i) CHECK_EQ(cache.at(i), e[i]);
+}
+
+/* token_map: ids through a table, -1 outside it. stream_gate_add against Engram.forward worked in
+ * double: each stream's own normalized dot gates the shared value row. */
+TEST(token_map_and_stream_gate_add) {
+    T ids(RAD_I32, {4}); ids.n({0, 3, 7, 2});
+    T tab(RAD_I32, {5}); tab.n({10, 11, 2, 2, 14});
+    T y(RAD_I32, {4});
+    A a; a.t(ids).t(tab).t(y).i("M", 4).i("n_vocab", 5);
+    REQUIRE_EQ(run("token_map", a), RAD_OK);
+    const int64_t e[4] = {10, 2, -1, 2};
+    for (int i = 0; i < 4; ++i) CHECK_EQ(y.iat(i), e[i]);
+
+    const int64_t M = 2, n = 6, hc = 3;
+    T h(RAD_F32, {M, hc * n}), k(RAD_F32, {M, hc * n}), v(RAD_F32, {M, n}), w(RAD_F32, {hc * n});
+    T out(RAD_F32, {M, hc * n});
+    for (int64_t i = 0; i < M * hc * n; ++i) { h.set(i, std::sin(0.9f * (float)i)); k.set(i, std::cos(0.4f * (float)i)); }
+    for (int64_t i = 0; i < M * n; ++i) v.set(i, 0.1f * (float)i - 0.3f);
+    for (int64_t i = 0; i < hc * n; ++i) w.set(i, 0.5f + 0.05f * (float)i);
+    A g; g.t(h).t(k).t(v).t(w).t(out).i("M", M).i("n", n).i("hc", hc).d("eps", 1e-20).d("gate_eps", 1e-6)
+        .s("dtype", "f32");
+    REQUIRE_EQ(run("stream_gate_add", g), RAD_OK);
+    for (int64_t m = 0; m < M; ++m)
+        for (int64_t s = 0; s < hc; ++s) {
+            double sh = 0, sk = 0, dot = 0;
+            for (int64_t i = 0; i < n; ++i) {
+                const double hv = h.at(m * hc * n + s * n + i), kv = k.at(m * hc * n + s * n + i);
+                sh += hv * hv; sk += kv * kv; dot += hv * w.at(s * n + i) * kv;
+            }
+            dot *= 1.0 / std::sqrt(sh / n + 1e-20) / std::sqrt(sk / n + 1e-20) / std::sqrt((double)n);
+            const double gate = 1.0 / (1.0 + std::exp(-std::copysign(std::sqrt(std::max(std::fabs(dot), 1e-6)), dot)));
+            for (int64_t i = 0; i < n; ++i)
+                CHECK(std::fabs(out.at(m * hc * n + s * n + i) -
+                                (h.at(m * hc * n + s * n + i) + gate * v.at(m * n + i))) < 1e-5);
+        }
+}
+
+/* gemm_nt_ggml over native blocks of every type it reads: each weight row dequantised as
+ * llama.cpp's dequantize_row_<type> does, dotted in f32 in index order, so the product equals a
+ * dot over those dequantised values bit for bit -- and the logical f32 form of the same weight
+ * gives the same bits. Random blocks, each f16 super-scale set finite. */
+TEST(gemm_nt_ggml_reads_native_blocks_as_llama_cpp_dequantises) {
+    struct Ty { const char* name; uint32_t type; std::vector<size_t> f16_at; std::vector<size_t> e8_at = {}; };
+    const Ty types[] = {
+        { "q8_0",    8,  { offsetof(lq::ggml::block_q8_0, d) } },
+        { "q5_K",    13, { offsetof(lq::ggml::block_q5_K, d), offsetof(lq::ggml::block_q5_K, dmin) } },
+        { "q6_K",    14, { offsetof(lq::ggml::block_q6_K, d) } },
+        { "iq4_nl",  20, { offsetof(lq::ggml::block_iq4_nl, d) } },
+        { "iq2_xxs", 16, { offsetof(lq::ggml::block_iq2_xxs, d) } },
+        { "iq1_s",   19, { offsetof(lq::ggml::block_iq1_s, d) } },
+        { "mxfp4",   39, {}, { offsetof(lq::ggml::block_mxfp4, e) } },
+    };
+    uint64_t seed = 0x2545F4914F6CDD1Dull;
+    auto rnd = [&]() { seed = seed * 6364136223846793005ull + 1442695040888963407ull; return seed >> 33; };
+    for (const Ty& ty : types) {
+        const lq::ggml::PlaneKind* k = lq::ggml::plane_kind(ty.type);
+        REQUIRE(k != nullptr);
+        const int64_t M = 3, N = 4, K = 2 * k->block, nb = K / k->block;
+        const int64_t rb = nb * (int64_t)k->block_bytes;
+        std::vector<uint8_t> blocks((size_t)(N * rb));
+        for (uint8_t& b : blocks) b = (uint8_t)rnd();
+        for (int64_t i = 0; i < N * nb; ++i)
+            for (size_t off : ty.f16_at) {
+                const uint16_t h = (uint16_t)((rnd() & 0x8000u) | ((8u + rnd() % 8u) << 10) | (rnd() & 0x3FFu));
+                std::memcpy(blocks.data() + i * (int64_t)k->block_bytes + off, &h, 2);
+            }
+        /* an e8m0 exponent near 2^0 (MXFP4: 2^(e - 128) times codes up to 12) */
+        for (int64_t i = 0; i < N * nb; ++i)
+            for (size_t off : ty.e8_at) blocks[(size_t)(i * (int64_t)k->block_bytes + off)] = (uint8_t)(122u + rnd() % 8u);
+        T w(RAD_U8, {N, rb}); w.raw(blocks);
+        T wl(RAD_F32, {N, K});
+        std::vector<float> deq((size_t)(N * K));
+        for (int64_t n = 0; n < N; ++n) lq::ggml::dequant_of(ty.type)(blocks.data() + n * rb, deq.data() + n * K, K);
+        for (int64_t i = 0; i < N * K; ++i) wl.set(i, deq[(size_t)i]);
+        T x(RAD_F32, {M, K});
+        for (int64_t i = 0; i < M * K; ++i) x.set(i, std::sin(0.37f * (float)i + 0.1f));
+        T y(RAD_F32, {M, N}), yl(RAD_F32, {M, N});
+        A a; a.t(x).t(w).t(y).i("M", M).i("N", N).i("K", K).s("type", ty.name).s("dtype", "f32");
+        REQUIRE_EQ(run("gemm_nt_ggml", a), RAD_OK);
+        A b; b.t(x).t(wl).t(yl).i("M", M).i("N", N).i("K", K).s("type", ty.name).s("dtype", "f32");
+        REQUIRE_EQ(run("gemm_nt_ggml", b), RAD_OK);
+        /* the engine's form: the relayouted bytes at the declared shape [N, K] (core/runtime/ctx.cpp) */
+        T we(RAD_U8, {N, rb}); we.raw(blocks);              /* the stored bytes ... */
+        we.t.shape[1] = K;                                   /* ... at the declared shape */
+        we.t.stride[0] = K;
+        T ye(RAD_F32, {M, N});
+        A e; e.t(x).t(we).t(ye).i("M", M).i("N", N).i("K", K).s("type", ty.name).s("dtype", "f32");
+        REQUIRE_EQ(run("gemm_nt_ggml", e), RAD_OK);
+        for (int64_t i = 0; i < M * N; ++i) CHECK_EQ(ye.at(i), y.at(i));
+        for (int64_t m = 0; m < M; ++m)
+            for (int64_t n = 0; n < N; ++n) {
+                float acc = 0.0f;
+                for (int64_t i = 0; i < K; ++i) acc += x.at(m * K + i) * deq[(size_t)(n * K + i)];
+                CHECK_EQ(y.at(m * N + n), acc);
+                CHECK_EQ(yl.at(m * N + n), acc);
+            }
+        /* a K that is not whole blocks is refused */
+        A c; c.t(x).t(w).t(y).i("M", M).i("N", N).i("K", K - 1).s("type", ty.name).s("dtype", "f32");
+        CHECK(run("gemm_nt_ggml", c) < 0);
+    }
+}
+
+/* moe_gemm_ggml over native blocks of every type it reads: real routing from moe_scatter (one slot
+ * then dropped), both activation orders, and the float logical form. Each live row must equal the
+ * f32 index-order dot of its activation row with its expert's dequantised weight row, bit for bit;
+ * a dropped row is zeros. */
+TEST(moe_gemm_ggml_routes_rows_to_native_block_experts) {
+    struct Ty { const char* name; uint32_t type; std::vector<size_t> f16_at; std::vector<size_t> e8_at = {}; };
+    const Ty types[] = {
+        { "q8_0",    8,  { offsetof(lq::ggml::block_q8_0, d) } },
+        { "q6_K",    14, { offsetof(lq::ggml::block_q6_K, d) } },
+        { "iq2_xxs", 16, { offsetof(lq::ggml::block_iq2_xxs, d) } },
+        { "iq1_s",   19, { offsetof(lq::ggml::block_iq1_s, d) } },
+        { "mxfp4",   39, {}, { offsetof(lq::ggml::block_mxfp4, e) } },
+    };
+    uint64_t seed = 0x9E3779B97F4A7C15ull;
+    auto rnd = [&]() { seed = seed * 6364136223846793005ull + 1442695040888963407ull; return seed >> 33; };
+    const int64_t M = 3, TK = 2, NE = 3, NR = M * TK;
+    /* token 0 -> experts 2, 0; token 1 -> 0, 1; token 2 -> 2, 1 */
+    T ids(RAD_I32, {M, TK}); ids.n({2, 0, 0, 1, 2, 1});
+    T sorted(RAD_I32, {NR}), off(RAD_I32, {NE + 1}), cnt(RAD_I32, {NE});
+    A sc; sc.t(ids).t(sorted).t(off).t(cnt).i("M", M).i("n_expert", NE).i("top_k", TK);
+    REQUIRE_EQ(run("moe_scatter", sc), RAD_OK);
+    const int64_t dropped = 3;                       /* a sorted position whose slot is dropped */
+    st_int(sorted.t.dtype, sorted.t.data, dropped, -1);
+    for (const Ty& ty : types) {
+        const lq::ggml::PlaneKind* k = lq::ggml::plane_kind(ty.type);
+        REQUIRE(k != nullptr);
+        const int64_t N = 4, K = 2 * k->block, nb = K / k->block;
+        const int64_t rb = nb * (int64_t)k->block_bytes;
+        std::vector<uint8_t> blocks((size_t)(NE * N * rb));
+        for (uint8_t& b : blocks) b = (uint8_t)rnd();
+        for (int64_t i = 0; i < NE * N * nb; ++i)
+            for (size_t o : ty.f16_at) {
+                const uint16_t h = (uint16_t)((rnd() & 0x8000u) | ((8u + rnd() % 8u) << 10) | (rnd() & 0x3FFu));
+                std::memcpy(blocks.data() + i * (int64_t)k->block_bytes + o, &h, 2);
+            }
+        for (int64_t i = 0; i < NE * N * nb; ++i)
+            for (size_t o : ty.e8_at) blocks[(size_t)(i * (int64_t)k->block_bytes + o)] = (uint8_t)(122u + rnd() % 8u);
+        T w(RAD_U8, {NE, N, rb}); w.raw(blocks);
+        std::vector<float> deq((size_t)(NE * N * K));
+        for (int64_t r = 0; r < NE * N; ++r)
+            lq::ggml::dequant_of(ty.type)(blocks.data() + r * rb, deq.data() + r * K, K);
+        T wl(RAD_F32, {NE, N, K});
+        for (int64_t i = 0; i < NE * N * K; ++i) wl.set(i, deq[(size_t)i]);
+        for (const char* order : { "token", "sorted" }) {
+            const bool srt = !std::strcmp(order, "sorted");
+            const int64_t AR = srt ? NR : M;
+            T x(RAD_F32, {AR, K});
+            for (int64_t i = 0; i < AR * K; ++i) x.set(i, std::sin(0.29f * (float)i + 0.3f));
+            T y(RAD_F32, {NR, N}), yl(RAD_F32, {NR, N});
+            for (int64_t i = 0; i < NR * N; ++i) { y.set(i, 7.0f); yl.set(i, 7.0f); }  /* stale bytes */
+            A a; a.t(x).t(w).t(sorted).t(off).t(y).i("M", M).i("N", N).i("K", K).i("n_expert", NE)
+                 .i("top_k", TK).s("a_order", order).s("type", ty.name).s("dtype", "f32");
+            REQUIRE_EQ(run("moe_gemm_ggml", a), RAD_OK);
+            A b; b.t(x).t(wl).t(sorted).t(off).t(yl).i("M", M).i("N", N).i("K", K).i("n_expert", NE)
+                 .i("top_k", TK).s("a_order", order).s("type", ty.name).s("dtype", "f32");
+            REQUIRE_EQ(run("moe_gemm_ggml", b), RAD_OK);
+            /* the engine's form: a WEIGHT TABLE (leading stride 0, one pointer an expert) whose
+             * entries are relayouted bytes at the declared shape [N, K] */
+            std::vector<void*> ptrs((size_t)NE);
+            for (int64_t e = 0; e < NE; ++e) ptrs[(size_t)e] = blocks.data() + e * N * rb;
+            T tab(RAD_U8, {NE, N, K});
+            tab.t.data = ptrs.data();
+            tab.t.stride[0] = 0;
+            T yt(RAD_F32, {NR, N});
+            A tb; tb.t(x).t(tab).t(sorted).t(off).t(yt).i("M", M).i("N", N).i("K", K).i("n_expert", NE)
+                  .i("top_k", TK).s("a_order", order).s("type", ty.name).s("dtype", "f32");
+            REQUIRE_EQ(run("moe_gemm_ggml", tb), RAD_OK);
+            for (int64_t i = 0; i < NR * N; ++i) CHECK_EQ(yt.at(i), y.at(i));
+            for (int64_t i = 0; i < NR; ++i) {
+                const int64_t flat = sorted.iat(i);
+                int64_t e = 0;
+                while (e + 1 < NE && off.iat(e + 1) <= i) ++e;
+                const int64_t row = srt ? i : flat / TK;
+                for (int64_t n = 0; n < N; ++n) {
+                    float want = 0.0f;
+                    if (flat >= 0)
+                        for (int64_t c = 0; c < K; ++c) want += x.at(row * K + c) * deq[(size_t)((e * N + n) * K + c)];
+                    CHECK_EQ(y.at(i * N + n), want);
+                    CHECK_EQ(yl.at(i * N + n), want);
+                }
+            }
+        }
+        /* a K that is not whole blocks, or a table narrower than N, is refused */
+        T x(RAD_F32, {M, K}), y(RAD_F32, {NR, N});
+        A c; c.t(x).t(w).t(sorted).t(off).t(y).i("M", M).i("N", N).i("K", K - 1).i("n_expert", NE)
+             .i("top_k", TK).s("a_order", "token").s("type", ty.name).s("dtype", "f32");
+        CHECK(run("moe_gemm_ggml", c) < 0);
+        T y5(RAD_F32, {NR, N + 1});
+        A d; d.t(x).t(w).t(sorted).t(off).t(y5).i("M", M).i("N", N + 1).i("K", K).i("n_expert", NE)
+             .i("top_k", TK).s("a_order", "token").s("type", ty.name).s("dtype", "f32");
+        CHECK(run("moe_gemm_ggml", d) < 0);
+    }
+}
+
+/* The vocabulary ops over native blocks, in the engine's form (relayouted bytes at the declared
+ * shape): logits_gemm_ggml equals gemm_nt_ggml over the same head bit for bit (f32 logits), and
+ * embed_lookup_ggml writes each id's dequantised row times `mult`, zeros for padding and for ids
+ * outside a vocab-parallel slice, and refuses an id past a whole vocabulary. */
+TEST(vocab_ggml_ops_read_native_blocks) {
+    const uint32_t type = 14;                                  /* q6_K */
+    const lq::ggml::PlaneKind* k = lq::ggml::plane_kind(type);
+    REQUIRE(k != nullptr);
+    uint64_t seed = 0x51AB7E5u;
+    auto rnd = [&]() { seed = seed * 6364136223846793005ull + 1442695040888963407ull; return seed >> 33; };
+    const int64_t V = 6, E = k->block, M = 4, rb = (int64_t)k->block_bytes;
+    std::vector<uint8_t> blocks((size_t)(V * rb));
+    for (uint8_t& b : blocks) b = (uint8_t)rnd();
+    for (int64_t r = 0; r < V; ++r) {
+        const uint16_t h = (uint16_t)((rnd() & 0x8000u) | ((8u + rnd() % 8u) << 10) | (rnd() & 0x3FFu));
+        std::memcpy(blocks.data() + r * rb + offsetof(lq::ggml::block_q6_K, d), &h, 2);
+    }
+    std::vector<float> deq((size_t)(V * E));
+    for (int64_t r = 0; r < V; ++r) lq::ggml::dequant_of(type)(blocks.data() + r * rb, deq.data() + r * E, E);
+    T w(RAD_U8, {V, rb}); w.raw(blocks); w.t.shape[1] = E; w.t.stride[0] = E;
+    T x(RAD_F32, {M, E});
+    for (int64_t i = 0; i < M * E; ++i) x.set(i, std::cos(0.13f * (float)i));
+    T lg(RAD_F32, {M, V}), y(RAD_F32, {M, V});
+    A a; a.t(x).t(w).t(lg).i("M", M).i("n_vocab", V).i("n_embd", E).s("type", "q6_K").s("dtype", "f32");
+    REQUIRE_EQ(run("logits_gemm_ggml", a), RAD_OK);
+    A g; g.t(x).t(w).t(y).i("M", M).i("N", V).i("K", E).s("type", "q6_K").s("dtype", "f32");
+    REQUIRE_EQ(run("gemm_nt_ggml", g), RAD_OK);
+    for (int64_t i = 0; i < M * V; ++i) CHECK_EQ(lg.at(i), y.at(i));
+    /* the gather: ids 4, -1 (padding), 0, 5 on the whole vocabulary, mult 0.5 */
+    T tok(RAD_I32, {M}); tok.n({4, -1, 0, 5});
+    T e(RAD_F32, {M, E});
+    A b; b.t(tok).t(w).t(e).i("M", M).i("n_embd", E).i("n_vocab", V).s("type", "q6_K").s("dtype", "f32").d("mult", 0.5);
+    REQUIRE_EQ(run("embed_lookup_ggml", b), RAD_OK);
+    const int64_t ids[] = {4, -1, 0, 5};
+    for (int64_t m = 0; m < M; ++m)
+        for (int64_t i = 0; i < E; ++i)
+            CHECK_EQ(e.at(m * E + i), ids[m] < 0 ? 0.0f : deq[(size_t)(ids[m] * E + i)] * 0.5f);
+    /* a slice [3, 6) of a larger vocabulary: id 4 is its row 1, ids 0 and -1 zeros */
+    T e2(RAD_F32, {M, E});
+    A c; c.t(tok).t(w).t(e2).i("M", M).i("n_embd", E).i("n_vocab", 3).i("vocab_offset", 3)
+           .s("type", "q6_K").s("dtype", "f32");
+    REQUIRE_EQ(run("embed_lookup_ggml", c, 0, 2), RAD_OK);
+    for (int64_t i = 0; i < E; ++i) {
+        CHECK_EQ(e2.at(0 * E + i), deq[(size_t)(1 * E + i)]);
+        CHECK_EQ(e2.at(1 * E + i), 0.0f);
+        CHECK_EQ(e2.at(2 * E + i), 0.0f);
+        CHECK_EQ(e2.at(3 * E + i), deq[(size_t)(2 * E + i)]);
+    }
+    /* an id past a whole vocabulary fails */
+    T bad(RAD_I32, {M}); bad.n({0, 1, 6, 2});
+    A d; d.t(bad).t(w).t(e).i("M", M).i("n_embd", E).i("n_vocab", V).s("type", "q6_K").s("dtype", "f32");
+    CHECK(run("embed_lookup_ggml", d) < 0);
+}
+
+/* embed_lookup_planes over the planes libquant imports a GGUF table as (llama.cpp's blocks
+ * unpacked: IQ4_NL's u4 codes into a 16-entry table with an f16 scale per 32, Q8_0's i8 codes and
+ * Q4_0's i4 codes with no table) gathers each id's row equal to llama.cpp's dequantize_row_<type>
+ * of the same blocks, bit for bit; padding and an id past the vocabulary as embed_lookup. */
+TEST(embed_lookup_planes_gathers_imported_ggml_tables_in_place) {
+    uint64_t seed = 0xE16A11u;
+    auto rnd = [&]() { seed = seed * 6364136223846793005ull + 1442695040888963407ull; return seed >> 33; };
+    int ran = 0;
+    for (uint32_t type : { 20u /* iq4_nl */, 8u /* q8_0 */, 2u /* q4_0, when its dequant is ported */ }) {
+        const lq::ggml::PlaneKind* k = lq::ggml::plane_kind(type);
+        if (!k || !lq::ggml::dequant_of(type)) continue;
+        ++ran;
+        const RadEncoding e = lq::ggml::encoding_of(k->type);
+        const int64_t V = 5, E = 2 * k->block, nb = E / k->block, rb = nb * (int64_t)k->block_bytes;
+        std::vector<uint8_t> blocks((size_t)(V * rb));
+        for (uint8_t& b : blocks) b = (uint8_t)rnd();
+        for (int64_t i = 0; i < V * nb; ++i) {      /* every type here has its f16 d first */
+            const uint16_t h = (uint16_t)((rnd() & 0x8000u) | ((8u + rnd() % 8u) << 10) | (rnd() & 0x3FFu));
+            std::memcpy(blocks.data() + i * (int64_t)k->block_bytes, &h, 2);
+        }
+        /* the planes, as the import writes them */
+        std::vector<std::vector<uint8_t>> planes((size_t)e.n_planes);
+        std::vector<int64_t> prb((size_t)e.n_planes, 0);
+        for (int i = 0; i < e.n_planes; ++i) {
+            const RadEncPlane& pl = e.plane[i];
+            int64_t pr = 0, pc = 0;
+            if (pl.kind == RAD_PLANE_TABLE) { pr = pl.extent[0]; pc = pl.extent[1]; }
+            else rad_enc_plane_dims(&pl, V, E, &pr, &pc);
+            prb[(size_t)i] = rad_enc_row_bytes(pl.dtype, pc);
+            planes[(size_t)i].assign((size_t)(pr * prb[(size_t)i] + 8), 0);
+        }
+        std::vector<uint8_t*> row((size_t)e.n_planes);
+        for (int64_t r = 0; r < V; ++r) {
+            for (int i = 0; i < e.n_planes; ++i)
+                row[(size_t)i] = e.plane[i].kind == RAD_PLANE_TABLE ? nullptr
+                                                                    : planes[(size_t)i].data() + r * prb[(size_t)i];
+            k->unpack(blocks.data() + r * rb, nb, row.data());
+        }
+        std::vector<void*> all((size_t)e.n_planes);
+        for (int i = 0; i < e.n_planes; ++i) all[(size_t)i] = planes[(size_t)i].data();
+        lq::ggml::write_shared(k->type, e, all.data());
+        const int ic = rad_enc_find(&e, "codes"), is = rad_enc_find(&e, "scale"), it = rad_enc_find(&e, "table");
+        REQUIRE(ic >= 0 && is >= 0);
+        const int64_t G = e.plane[is].block[1];
+        T codes(e.plane[ic].dtype, {V, E}); codes.raw(planes[(size_t)ic]);
+        T scale(e.plane[is].dtype, {V, E / G}); scale.raw(planes[(size_t)is]);
+        std::vector<float> deq((size_t)(V * E));
+        for (int64_t r = 0; r < V; ++r) lq::ggml::dequant_of(type)(blocks.data() + r * rb, deq.data() + r * E, E);
+        T tok(RAD_I32, {4}); tok.n({3, -1, 0, 4});
+        T x(RAD_F32, {4, E});
+        A a; a.t(tok).t(codes).t(scale);
+        T table(it >= 0 ? e.plane[it].dtype : RAD_I8, {1, it >= 0 ? e.plane[it].extent[1] : 1});
+        if (it >= 0) { table.raw(planes[(size_t)it]); a.t(table); } else a.tnull();
+        a.t(x).i("M", 4).i("n_embd", E).i("n_vocab", V).i("group", G).s("dtype", "f32");
+        REQUIRE_EQ(run("embed_lookup_planes", a), RAD_OK);
+        const int64_t ids[] = {3, -1, 0, 4};
+        for (int64_t m = 0; m < 4; ++m)
+            for (int64_t i = 0; i < E; ++i)
+                CHECK_EQ(x.at(m * E + i), ids[m] < 0 ? 0.0f : deq[(size_t)(ids[m] * E + i)]);
+        T bad(RAD_I32, {4}); bad.n({0, 5, 1, 2});
+        A b; b.t(bad).t(codes).t(scale);
+        if (it >= 0) b.t(table); else b.tnull();
+        b.t(x).i("M", 4).i("n_embd", E).i("n_vocab", V).i("group", G).s("dtype", "f32");
+        CHECK(run("embed_lookup_planes", b) < 0);
+    }
+    CHECK(ran >= 2);
 }
 
 TEST(manifold_sinkhorn_first_pass_and_epsilon_are_distinct) {
@@ -965,7 +1705,8 @@ TEST(op_vocabulary) {
     static const char* kOps[] = {
         "rmsnorm", "rmsnorm_p", "rmsnorm_add", "hc_enter", "hc_read", "hc_write", "hc_project",
         "mtp_enter",
-        "mhc_pre", "mhc_pre_partial", "mhc_pre_finish", "mhc_post", "mhc_contract", "swiglu_clamped", "router_sigmoid_topk", "dsa_pool", "dsa_query", "dsa_score", "mla_attn", "mla_project", "gemm_nt_f32",
+        "mhc_pre", "mhc_pre_partial", "mhc_pre_finish", "mhc_post", "mhc_contract",
+        "mhc_mix", "mhc_collapse", "swiglu_clamped", "router_sigmoid_topk", "router_scored_topk", "rope_rows", "quant_roundtrip", "softmax_pool", "attn_sparse_sink", "index_score", "index_candidates", "index_topk", "entry_store", "token_map", "stream_gate_add", "gemm_nt_ggml", "moe_gemm_ggml", "logits_gemm_ggml", "embed_lookup_ggml", "embed_lookup_planes", "dsa_pool", "dsa_query", "dsa_score", "mla_attn", "mla_project", "gemm_nt_f32",
         "kda_update",
         "layernorm", "add", "mul", "mul_weight", "silu_mul", "gelu_mul", "act_mul", "seg_mean",
         "pool_rows", "pool_cols", "relu", "clamp", "conv2d", "conv2d_unfold", "conv1d_dw",
@@ -9699,6 +10440,26 @@ std::vector<Geo> geometries() {
                                   .d("theta", 1e4).d("eps", 1e-6)),
         G("rope_table", "M", 3, a.i("M", R).i("rot", 8).d("theta", 1e4).d("scale", 1.0)
                                 .s("dtype", "f32")),
+        G("quant_roundtrip", "M", 3, a.i("M", R).i("n", 64).i("block", 32).s("format", "fp4_e2m1")
+                                     .s("scale", "ue8m0").s("dtype", "bf16")),
+        G("softmax_pool", "M", 3, a.i("M", R).i("n", 8).i("ratio", 2).s("dtype", "bf16")),
+        G("attn_sparse_sink", "M", 3, a.i("M", R).i("heads", 2).i("dim", 8).i("window", 4).i("ratio", 2)
+                                      .i("topk", 3).d("scale", 0.35).s("dtype", "f32")),
+        G("index_score", "M", 3, a.i("M", R).i("heads", 2).i("dim", 8).i("ratio", 2).i("width", 5)
+                                 .d("wscale", 0.25).s("dtype", "bf16")),
+        G("index_candidates", "M", 3, a.i("M", R).i("width", 20).i("block", 8).i("topk_blocks", 2)
+                                      .i("ratio", 1)),
+        G("index_topk", "M", 3, a.i("M", R).i("width", 9).i("topk", 4).i("ratio", 2)),
+        G("index_topk", "M", 3, a.i("M", R).i("width", 9).i("topk", 4).i("ratio", 2).i("block", 2)),
+        G("index_score", "M", 3, a.i("M", R).i("heads", 2).i("dim", 8).i("ratio", 2).i("width", 5)
+                                 .d("wscale", 0.25).s("dtype", "bf16").i("row_part", 2)),
+        G("entry_store", "M", 3, a.i("M", R).i("n", 8).i("block_size", 2).s("dtype", "bf16")),
+        G("token_map", "M", 3, a.i("M", R).i("n_vocab", 11)),
+        G("gemm_nt_ggml", "M", 3, a.i("M", R).i("N", 5).i("K", 64).s("type", "q8_0").s("dtype", "bf16")),
+        G("stream_gate_add", "M", 3, a.i("M", R).i("n", 8).i("hc", 4).d("eps", 1e-6).d("gate_eps", 1e-6)
+                                     .s("dtype", "bf16")),
+        G("rope_rows", "M", 3, a.i("M", R).i("n_head", 2).i("head_dim", 12).i("rot", 8).i("off", 4)
+                               .s("mode", "gptj").i("inverse", 0).s("dtype", "f32")),
         G("qsa_block_key", "M", 2, a.i("M", R).i("n", 32).i("ratio", 4).i("rotary_dim", 8)
                                    .d("eps", 1e-6).d("theta", 1e4).s("dtype", "bf16")),
         G("qsa_score", "M", 4, a.i("M", R).i("n", 32).i("heads", 2).i("blocks", 6).i("seqs", 2)
@@ -9723,6 +10484,8 @@ std::vector<Geo> geometries() {
         G("moe_scatter", "M", 3, a.i("M", R).i("n_expert", 6).i("top_k", 2)),
         G("moe_gemm", "M", 3, a.i("M", R).i("N", 16).i("K", 32).i("n_expert", 4).i("top_k", 2)
                               .s("a_order", "token").s("dtype", "f32")),
+        G("moe_gemm_ggml", "M", 3, a.i("M", R).i("N", 16).i("K", 64).i("n_expert", 4).i("top_k", 2)
+                                   .s("a_order", "token").s("type", "q8_0").s("dtype", "f32")),
         G("moe_gemm_q", "M", 3, a.i("M", R).i("N", 16).i("K", 128).i("n_expert", 4).i("top_k", 2)
                                 .i("group", 128).s("a_order", "token").s("dtype", "fp8a8")),
         G("moe_gemm_q_mod4", "M", 3, a.i("M", R).i("N", 16).i("K", 128).i("n_expert", 5)
@@ -9758,6 +10521,9 @@ std::vector<Geo> geometries() {
         G("embed_lookup_q", "M", 3, a.i("M", R).i("n_embd", 8).i("n_vocab", 20)
                                     .s("dtype", "fp8_e4m3")),
         G("logits_gemm", "M", 3, a.i("M", R).i("n_vocab", 20).i("n_embd", 8).s("dtype", "f32")),
+        G("logits_gemm_ggml", "M", 3, a.i("M", R).i("n_vocab", 20).i("n_embd", 64).s("type", "q8_0").s("dtype", "f32")),
+        G("embed_lookup_planes", "M", 3, a.i("M", R).i("n_embd", 64).i("n_vocab", 20).i("group", 32).s("dtype", "f32")),
+        G("embed_lookup_ggml", "M", 3, a.i("M", R).i("n_embd", 64).i("n_vocab", 20).s("type", "q8_0").s("dtype", "f32")),
         G("sample_penalties", "M", 2, a.i("M", R).i("n_vocab", 64)),
         G("sample_dry", "M", 2, a.i("M", R).i("n_vocab", 64)),
         G("sample_ngram_ban", "M", 2, a.i("M", R).i("n_vocab", 64)),
@@ -9814,6 +10580,9 @@ std::vector<Geo> geometries() {
                                     .s("dtype", "f32")),
         G("mhc_post", "M", 3, a.i("M", R).i("n", 8).i("hc", 4).s("dtype", "f32")),
         G("mhc_contract", "M", 3, a.i("M", R).i("n", 8).i("hc", 4).s("dtype", "f32")),
+        G("mhc_mix", "M", 3, a.i("M", R).i("n", 8).i("hc", 4).i("iterations", 20).d("eps", 1e-5)
+                             .d("hc_eps", 1e-6).s("dtype", "f32")),
+        G("mhc_collapse", "M", 3, a.i("M", R).i("n", 8).i("hc", 4).s("dtype", "f32")),
         G("kda_update", "M", 3, a.i("M", R).i("heads", 2).i("head_k", 8).i("head_v", 8)
                                 .d("lower_bound", -5.0).d("scale", 0.35).d("l2_eps", 1e-6)
                                 .s("mode", "prefill").s("dtype", "f32")),
@@ -9829,6 +10598,9 @@ std::vector<Geo> geometries() {
         G("swiglu_clamped", "M", 3, a.i("M", R).i("n", 8).d("limit", 0.5).s("dtype", "f32")),
         G("router_sigmoid_topk", "M", 3, a.i("M", R).i("n_expert", 6).i("top_k", 2).i("norm", 1)
                                          .d("route_scale", 2.5).s("dtype", "f32")),
+        G("router_scored_topk", "M", 3, a.i("M", R).i("n_expert", 6).i("top_k", 2).i("norm", 1)
+                                        .d("route_scale", 1.5).s("score", "sqrtsoftplus")
+                                        .s("dtype", "f32")),
         G("conv1d", "M", 8, a.i("M", R).i("cin", 2).i("cout", 3).i("k", 3).i("dil", 1)
                             .s("dtype", "f32")),
         G("conv_t1d", "M", 8, a.i("M", R).i("cin", 2).i("cout", 3).i("stride", 2).s("dtype", "f32")),

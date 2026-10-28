@@ -1,5 +1,6 @@
 /* GLM noaux_tc router. Correction bias changes selection only; mixture weights
- * come from the uncorrected sigmoid probabilities. All routing arithmetic is F32. */
+ * come from the uncorrected probabilities -- sigmoid, or the score Config::score names
+ * (DeepSeek-V4's sqrt(softplus)). All routing arithmetic is F32. */
 #ifndef RAD_BLOCK_GLM_ROUTER_H
 #define RAD_BLOCK_GLM_ROUTER_H
 #include "rad_glm_tp.h"
@@ -12,6 +13,9 @@ struct GlmRouter {
         int64_t experts = 288, top_k = 8, rows = 32;
         int norm = 1;
         double route_scale = 2.5;
+        /* The score function by name (router_scored_topk: "sqrtsoftplus" for DeepSeek-V4); null is
+         * GLM's sigmoid (router_sigmoid_topk). */
+        const char* score = nullptr;
     };
     struct Src {
         const char *weight = nullptr, *correction = nullptr;
@@ -52,14 +56,25 @@ struct GlmRouter {
                         { w.input }, { w.logits });
         RAD_ARCH_TRY(split.declare(b, nm, g, name, c.rows, c.experts, g.n_embd, projection, w.input,
                                    w.logits));
-        op_select =
-            rw(b,
-               RAD_OP(b, "router_sigmoid_topk",
-                      RAD_PARAMS(RAD_RANGE("M", 1, c.rows), RAD_INT("n_expert", c.experts),
-                                 RAD_INT("top_k", c.top_k), RAD_INT("norm", c.norm),
-                                 RAD_F64("route_scale", c.route_scale), RAD_STR("dtype", "f32")),
-                      RAD_WEIGHTS(correction)),
-               { w.logits }, { w.ids, w.weights });
+        if (c.score)
+            op_select =
+                rw(b,
+                   RAD_OP(b, "router_scored_topk",
+                          RAD_PARAMS(RAD_RANGE("M", 1, c.rows), RAD_INT("n_expert", c.experts),
+                                     RAD_INT("top_k", c.top_k), RAD_INT("norm", c.norm),
+                                     RAD_F64("route_scale", c.route_scale),
+                                     RAD_STR("score", c.score), RAD_STR("dtype", "f32")),
+                          RAD_WEIGHTS(correction)),
+                   { w.logits }, { w.ids, w.weights });
+        else
+            op_select =
+                rw(b,
+                   RAD_OP(b, "router_sigmoid_topk",
+                          RAD_PARAMS(RAD_RANGE("M", 1, c.rows), RAD_INT("n_expert", c.experts),
+                                     RAD_INT("top_k", c.top_k), RAD_INT("norm", c.norm),
+                                     RAD_F64("route_scale", c.route_scale), RAD_STR("dtype", "f32")),
+                          RAD_WEIGHTS(correction)),
+                   { w.logits }, { w.ids, w.weights });
         return op_project && op_select ? RAD_OK : RAD_E_INVAL;
     }
     void project(RadCtx* ctx, int64_t first, int64_t rows, int64_t output_first = 0) const {

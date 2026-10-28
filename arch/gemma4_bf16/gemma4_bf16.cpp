@@ -2599,7 +2599,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 
     /* ---- the assistant head, when the container carries one (`rad-convert --draft-model`) and
      * the deployment speculates; otherwise its ~0.5 GB of weights stay off the card. */
-    if (ctx->max_spec > 0 && has_assistant(meta)) {
+    if (rad_ctx_draft_head(ctx) && has_assistant(meta)) {
         int last_s = -1, last_f = -1;
         /* the last layer of each class that keeps a cache (a KV-shared layer reads another's) */
         for (int64_t l = 0; l < m.n_main; ++l)

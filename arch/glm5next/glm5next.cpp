@@ -512,7 +512,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                              RAD_INT("n_embd", 4096), RAD_STR("dtype", "bf16")),
                   RAD_WEIGHTS(m.head)),
            { m.logit_input }, { m.logits });
-    if (g.max_spec > 0) {
+    if (rad_ctx_draft_head(ctx)) {
         GlmMtp::Wire tw{ m.final_hidden, m.logits, m.token, m.head };
         RAD_ARCH_TRY(m.mtp.declare_inputs(b, g, tw, m.media));
         RAD_ARCH_TRY(layer(b, m, m.draft, m.mtp.nm, 45, true));

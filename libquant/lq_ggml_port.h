@@ -25,16 +25,17 @@
  *
  *   ggml/src/ggml-common.h   the block structs below, and the tables in lq_ggml_tables.cpp:
  *                            kmask_iq2xs, ksigns_iq2xs, iq2xxs_grid, iq2xs_grid, iq2s_grid,
- *                            iq3xxs_grid, iq3s_grid, kvalues_iq4nl, iq1s_grid
- *   ggml/src/ggml-impl.h     the f32 <-> f16 conversion (Maratyszcza's, round to nearest even)
+ *                            iq3xxs_grid, iq3s_grid, kvalues_iq4nl, kvalues_mxfp4, iq1s_grid
+ *   ggml/src/ggml-impl.h     the f32 <-> f16 conversion (Maratyszcza's, round to nearest even) and
+ *                            ggml_e8m0_to_fp32_half
  *   ggml/src/ggml-quants.c   everything in lq_ggml_port.cpp: best_index_int8, nearest_int,
  *                            make_qx_quants, make_q3_quants, make_qkx2_quants, make_qkx3_quants,
  *                            make_qp_quants, get_scale_min_k4, quantize_row_<t>_ref and _impl for
  *                            the legacy and K types, iq2xs_init_impl and iq3xs_init_impl with
  *                            their kgrid tables, iq2/iq3_find_best_neighbour,
  *                            iq1_find_best_neighbour2, iq1_sort_helper, quantize_row_iq4_nl_impl,
- *                            the quantize_row_<t>_impl of every I type, and the quantize_<t>
- *                            entry points below
+ *                            the quantize_row_<t>_impl of every I type, best_index_mxfp4 and
+ *                            quantize_row_mxfp4_ref, and the quantize_<t> entry points below
  *   ggml/src/ggml.c          ggml_quantize_init's choice of table per type, and
  *                            ggml_quantize_requires_imatrix's list
  *
@@ -89,6 +90,7 @@ enum ggml_type {
     GGML_TYPE_IQ2_S   = 22,
     GGML_TYPE_IQ4_XS  = 23,
     GGML_TYPE_IQ1_M   = 29,
+    GGML_TYPE_MXFP4   = 39,   /* OCP MXFP4: e2m1 codes, one e8m0 exponent per 32 */
 };
 
 /* ================================================================== ggml-common.h's blocks */
@@ -280,6 +282,16 @@ struct block_iq4_xs {
 };
 static_assert(sizeof(block_iq4_xs) == sizeof(ggml_half) + sizeof(uint16_t) + QK_K/64 + QK_K/2, "wrong iq4_xs block size/padding");
 
+// MXFP4 (OCP MX): 32 e2m1 values sharing one e8m0 exponent. y = kvalues_mxfp4[nibble] * 2^(e - 128),
+// value j the low nibble of qs[j], value j + 16 the high one (kvalues_mxfp4 is e2m1 doubled, hence
+// the half scale: the same numbers as e2m1 * 2^(e - 127)).
+constexpr int QK_MXFP4 = 32;
+struct block_mxfp4 {
+    uint8_t e;               // E8M0
+    uint8_t qs[QK_MXFP4/2];
+};
+static_assert(sizeof(block_mxfp4) == sizeof(uint8_t) + QK_MXFP4/2, "wrong mxfp4 block size/padding");
+
 /* ================================================================== ggml-common.h's tables */
 
 constexpr int   NGRID_IQ1S = 2048;
@@ -294,6 +306,7 @@ extern const uint64_t iq2s_grid[1024];
 extern const uint32_t iq3xxs_grid[256];
 extern const uint32_t iq3s_grid[512];
 extern const int8_t   kvalues_iq4nl[16];
+extern const int8_t   kvalues_mxfp4[16];   /* ggml-common.h's kvalues_fp4: e2m1 doubled */
 extern const uint64_t iq1s_grid[NGRID_IQ1S];
 
 /* ================================================================== the quantisers */
@@ -349,5 +362,9 @@ size_t quantize_iq4_nl(const float * src, void * dst, int64_t nrow, int64_t n_pe
                        const float * quant_weights);
 size_t quantize_iq4_xs(const float * src, void * dst, int64_t nrow, int64_t n_per_row,
                        const float * quant_weights);
+/* quant_weights is ignored, as upstream: MXFP4 has one round-to-nearest path. */
+size_t quantize_mxfp4(const float * src, void * dst, int64_t nrow, int64_t n_per_row,
+                      const float * quant_weights);
+
 
 }  /* namespace lq::ggml */

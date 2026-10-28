@@ -886,3 +886,96 @@ extern "C" int r4d_fuse_ar_rmsnorm_quant_fp8(const RadParam* p, int n_p, uint64_
         return RAD_E_NOTFOUND;
     }
 }
+
+/* ==========================================================================================
+ * DeepSeek-V4.1's chains (kernels: libr4d/r4d_ds41_elem.hip, "fused chains").
+ *
+ * rmsnorm_rope_roundtrip  [0] x  [1] w  [2] y  [3] cos_sin  [4] positions
+ *     rmsnorm_bf16 (x, w -> y), rope_rows_bf16 over y, quant_roundtrip over y. The kernel takes
+ *     the norm's width from r4d_act_threads(M, n) as rmsnorm_bf16 does, so `M` is mirrored.
+ * rope_rows_roundtrip     [0] x  [1] cos_sin  [2] positions
+ *     rope_rows_bf16 then quant_roundtrip over x's n_head * head_dim columns, in place.
+ * mhc_collapse_rmsnorm    [0] h  [1] pre  [2] x  [3] w  [4] y
+ *     mhc_collapse_bf16 (h, pre -> x), then rmsnorm_bf16 (x, w -> y).
+ * mhc_post_collapse_rmsnorm  [0] x  [1] h  [2] post  [3] comb  [4] out  [5] pre  [6] xc  [7] w  [8] y
+ *     mhc_post_bf16 (x, h, post, comb -> out), mhc_collapse_bf16 (out, pre -> xc), rmsnorm_bf16
+ *     (xc, w -> y).
+ * Each step's output is the bf16 its own row stores; the fused kernels keep exactly those values
+ * between steps (in LDS, a register, or the stored x).
+ */
+namespace {
+void mirror_rope(Step& s, const RadParam* p, int n_p) {
+    s.mirror(p, n_p, "M").mirror(p, n_p, "n_head").mirror(p, n_p, "head_dim")
+     .mirror(p, n_p, "rot").mirror(p, n_p, "off").mirror(p, n_p, "mode")
+     .mirror(p, n_p, "inverse").mirror(p, n_p, "dtype");
+}
+void mirror_quant(Step& s, const RadParam* p, int n_p, int64_t n) {
+    s.mirror(p, n_p, "M").pint("n", (long long)n).mirror(p, n_p, "block")
+     .mirror(p, n_p, "format").mirror(p, n_p, "scale").mirror(p, n_p, "dtype");
+}
+void mirror_norm(Step& s, const RadParam* p, int n_p) {
+    s.mirror(p, n_p, "M").mirror(p, n_p, "n").mirror(p, n_p, "eps").mirror(p, n_p, "dtype")
+     .mirror_opt(p, n_p, "wadd").mirror_opt(p, n_p, "mult");
+}
+}  /* namespace */
+
+extern "C" int r4d_fuse_rmsnorm_rope_roundtrip(const RadParam* p, int n_p, uint64_t present,
+                                               int step, RadFuseStep* out) {
+    if (!out) return RAD_E_INVAL;
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n");
+    if (M <= 0 || n <= 0 || n != pi(p, n_p, "n_head") * pi(p, n_p, "head_dim"))
+        return RAD_E_UNSUPPORTED;
+    switch (step) {
+    case 0: { Step s(out, "rmsnorm"); mirror_norm(s, p, n_p); return s.wire({ 0, 1, 2 }); }
+    case 1: { Step s(out, "rope_rows"); mirror_rope(s, p, n_p); return s.wire({ 2, 3, 4 }); }
+    case 2: { Step s(out, "quant_roundtrip"); mirror_quant(s, p, n_p, n); return s.wire({ 2 }); }
+    default: return RAD_E_NOTFOUND;
+    }
+}
+
+extern "C" int r4d_fuse_rope_rows_roundtrip(const RadParam* p, int n_p, uint64_t present, int step,
+                                            RadFuseStep* out) {
+    if (!out) return RAD_E_INVAL;
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n_head") * pi(p, n_p, "head_dim");
+    if (M <= 0 || n <= 0) return RAD_E_UNSUPPORTED;
+    switch (step) {
+    case 0: { Step s(out, "rope_rows"); mirror_rope(s, p, n_p); return s.wire({ 0, 1, 2 }); }
+    case 1: { Step s(out, "quant_roundtrip"); mirror_quant(s, p, n_p, n); return s.wire({ 0 }); }
+    default: return RAD_E_NOTFOUND;
+    }
+}
+
+extern "C" int r4d_fuse_mhc_collapse_rmsnorm(const RadParam* p, int n_p, uint64_t present,
+                                             int step, RadFuseStep* out) {
+    if (!out) return RAD_E_INVAL;
+    if (pi(p, n_p, "M") <= 0 || pi(p, n_p, "n") <= 0) return RAD_E_UNSUPPORTED;
+    switch (step) {
+    case 0: {
+        Step s(out, "mhc_collapse");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "n").mirror(p, n_p, "hc").mirror(p, n_p, "dtype");
+        return s.wire({ 0, 1, 2 });                 /* h, pre, x */
+    }
+    case 1: { Step s(out, "rmsnorm"); mirror_norm(s, p, n_p); return s.wire({ 2, 3, 4 }); }
+    default: return RAD_E_NOTFOUND;
+    }
+}
+
+extern "C" int r4d_fuse_mhc_post_collapse_rmsnorm(const RadParam* p, int n_p, uint64_t present,
+                                                  int step, RadFuseStep* out) {
+    if (!out) return RAD_E_INVAL;
+    if (pi(p, n_p, "M") <= 0 || pi(p, n_p, "n") <= 0) return RAD_E_UNSUPPORTED;
+    switch (step) {
+    case 0: {
+        Step s(out, "mhc_post");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "n").mirror(p, n_p, "hc").mirror(p, n_p, "dtype");
+        return s.wire({ 0, 1, 2, 3, 4 });           /* x, h, post, comb, out */
+    }
+    case 1: {
+        Step s(out, "mhc_collapse");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "n").mirror(p, n_p, "hc").mirror(p, n_p, "dtype");
+        return s.wire({ 4, 5, 6 });                 /* out, pre, xc */
+    }
+    case 2: { Step s(out, "rmsnorm"); mirror_norm(s, p, n_p); return s.wire({ 6, 7, 8 }); }
+    default: return RAD_E_NOTFOUND;
+    }
+}

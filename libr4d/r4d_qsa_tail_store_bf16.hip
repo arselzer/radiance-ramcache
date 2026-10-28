@@ -30,10 +30,12 @@ namespace {
 
 constexpr int kThreads = 256;
 
+/* A store that moves element bits: E is uint16_t for bf16, uint32_t for f32. */
+template <typename E>
 __global__ __launch_bounds__(kThreads) void qsa_tail_store_kernel(
-    const uint16_t* __restrict__ k, const int32_t* __restrict__ pos,
+    const E* __restrict__ k, const int32_t* __restrict__ pos,
     const int32_t* __restrict__ cu, const int32_t* __restrict__ sidx,
-    uint16_t* __restrict__ state,
+    E* __restrict__ state,
     int T, int n, int ring, int seqs, int k_ld, int s_slot, int s_row, int sidx_ld) {
 
     const int t = (int)blockIdx.x;
@@ -68,13 +70,18 @@ __global__ __launch_bounds__(kThreads) void qsa_tail_store_kernel(
 //                                keep their contents
 static int r4d_qsa_tail_store_bf16_emit(long k, long pos, long cu, long sidx, long state, int T,
                                        int n, int ring, int seqs, int k_ld, int s_slot, int s_row,
-                                       int sidx_ld, RadStream stream) {
+                                       int sidx_ld, bool wide, RadStream stream) {
     if (!k || !pos || !cu || !sidx || !state) return R4D_NO(RAD_E_INVAL);
     if (T <= 0 || n <= 0 || ring <= 0 || seqs <= 0) return R4D_NO(RAD_E_SHAPE);
     if (!k_ld) k_ld = n;
     if (!s_row) s_row = n;
     if (!sidx_ld) sidx_ld = 1;
-    return R4D_EMIT(stream, qsa_tail_store_kernel, dim3((unsigned)T), dim3(kThreads), 0,
+    if (wide)
+        return R4D_EMIT(stream, qsa_tail_store_kernel<uint32_t>, dim3((unsigned)T), dim3(kThreads),
+                        0, (const uint32_t*)k, (const int32_t*)pos, (const int32_t*)cu,
+                        (const int32_t*)sidx, (uint32_t*)state, T, n, ring, seqs, k_ld, s_slot,
+                        s_row, sidx_ld);
+    return R4D_EMIT(stream, qsa_tail_store_kernel<uint16_t>, dim3((unsigned)T), dim3(kThreads), 0,
                     (const uint16_t*)k, (const int32_t*)pos, (const int32_t*)cu,
                     (const int32_t*)sidx, (uint16_t*)state, T, n, ring, seqs, k_ld, s_slot, s_row,
                     sidx_ld);
@@ -111,10 +118,11 @@ extern "C" int r4d_rad_qsa_tail_store(const RadArgs* a, RadStream stream) {
     if (sxp < 1 || r4d_dim(sx, 0) < seqs) return R4D_NO(RAD_E_SHAPE);
     const long long kp = r4d_row_pitch(k);
     if (kp < 0) return R4D_NO(RAD_E_STRIDE);
-    if (k->dtype != RAD_BF16 || st->dtype != RAD_BF16) return R4D_NO(RAD_E_DTYPE);
+    if ((k->dtype != RAD_BF16 && k->dtype != RAD_F32) || st->dtype != k->dtype)
+        return R4D_NO(RAD_E_DTYPE);
     return r4d_qsa_tail_store_bf16_emit(r4d_addr(k), r4d_addr(po), r4d_addr(cu), r4d_addr(sx),
                                         r4d_addr(st), (int)T, (int)n, (int)ring, (int)seqs,
                                         (int)kp, (int)st->stride[0], (int)st->stride[2],
-                                        (int)sxp, stream);
+                                        (int)sxp, k->dtype == RAD_F32, stream);
 }
 

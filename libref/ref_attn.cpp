@@ -30,6 +30,7 @@
 #include "ref_ops.h"
 
 #include <algorithm>
+#include <cstring>
 
 using namespace ref;
 
@@ -1113,6 +1114,50 @@ int ref_rope_table(const RadArgs* a, RadStream) {
             stt(cs, offlin(cs, pp * rot + i),        ref_cos(ang) * yarn.magnitude);
             stt(cs, offlin(cs, pp * rot + half + i), ref_sin(ang) * yarn.magnitude);
         }
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ rope_rows */
+/* Rotary embedding from a rope_table plane over a window of each head: columns [off, off+rot) of
+ * every head_dim-wide head of x [M, n_head*head_dim], in place. "gptj" pairs adjacent columns,
+ * "neox" pairs i with i + rot/2. The pair (a, b) times (c + i s) is (a c - b s, a s + b c) in f32,
+ * rounded once to x's dtype; `inverse` 1 conjugates (s -> -s), which undoes the rotation. A row
+ * whose position is negative or past the table is left as it is. DeepSeek-V4 rotates the last 64
+ * of each 512-wide head and un-rotates the attention output the same way. */
+int ref_rope_rows(const RadArgs* a, RadStream) {
+    if (!have(a, 3)) return RAD_E_INVAL;
+    const RadTensor &x = a->t[0], &cs = a->t[1], &pos = a->t[2];
+    const int64_t nh = p_int(a, "n_head", 0), hd = p_int(a, "head_dim", 0);
+    const int64_t rot = p_int(a, "rot", 0), off = p_int(a, "off", -1);
+    const int64_t inv = p_int(a, "inverse", -1);
+    const char* mode = p_str(a, "mode", "");
+    const bool gptj = !std::strcmp(mode, "gptj");
+    if (!gptj && std::strcmp(mode, "neox")) return RAD_E_UNSUPPORTED;
+    if (nh < 1 || hd < 2 || rot < 2 || (rot & 1) || off < 0 || off + rot > hd ||
+        (inv != 0 && inv != 1))
+        return RAD_E_SHAPE;
+    if (!x.data || !cs.data || !pos.data || x.rank != 2 || x.shape[0] < 1 || x.shape[1] != nh * hd ||
+        cs.rank != 2 ||
+        cs.shape[1] != rot || numel(&pos) != x.shape[0])
+        return RAD_E_SHAPE;
+    const int64_t M = x.shape[0], rows = cs.shape[0], half = rot / 2;
+    const float sign = inv ? -1.0f : 1.0f;
+#pragma omp parallel for schedule(static)
+    for (int64_t m = 0; m < M; ++m) {
+        const int64_t p = ld_int(pos.dtype, pos.data, offlin(&pos, m));
+        if (p < 0 || p >= rows) continue;
+        const int64_t cb = rowoff(&cs, p, rot), css = laststride(&cs);
+        const int64_t xb = rowoff(&x, m, nh * hd), xs = laststride(&x);
+        for (int64_t h = 0; h < nh; ++h)
+            for (int64_t i = 0; i < half; ++i) {
+                const int64_t ia = h * hd + off + (gptj ? 2 * i : i);
+                const int64_t ib = gptj ? ia + 1 : ia + half;
+                const float c = ldt(&cs, cb + i * css), s = sign * ldt(&cs, cb + (half + i) * css);
+                const float va = ldt(&x, xb + ia * xs), vb = ldt(&x, xb + ib * xs);
+                stt(&x, xb + ia * xs, va * c - vb * s);
+                stt(&x, xb + ib * xs, va * s + vb * c);
+            }
     }
     return RAD_OK;
 }

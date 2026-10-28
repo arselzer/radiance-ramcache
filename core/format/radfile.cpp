@@ -71,13 +71,40 @@ int RadFile::read_at(void* dst, int64_t bytes, int64_t off) const {
     return RAD_OK;
 }
 
-void RadFile::drop_blob_cache() const {
+void RadFile::drop_blob_cache(const std::vector<std::pair<int64_t, int64_t>>& keep) const {
     if (!base_ || !hdr_ || fd_ < 0) return;
     const int64_t tables = (int64_t)hdr_->data_off < size_ ? (int64_t)hdr_->data_off : size_;
     if (tables >= size_) return;
-    /* Unmap first, then drop the cache: the kernel cannot drop a page still mapped here. */
-    ::madvise(base_ + tables, (size_t)(size_ - tables), MADV_DONTNEED);
-    ::posix_fadvise(fd_, (off_t)tables, (off_t)(size_ - tables), POSIX_FADV_DONTNEED);
+    /* The kept ranges, clipped to the blob, sorted and merged. */
+    std::vector<std::pair<int64_t, int64_t>> k;
+    for (const auto& r : keep) {
+        const int64_t a = std::max(r.first, tables), b = std::min(r.first + r.second, size_);
+        if (b > a) k.emplace_back(a, b);
+    }
+    std::sort(k.begin(), k.end());
+    size_t m = 0;
+    for (size_t i = 0; i < k.size(); ++i) {
+        if (m && k[i].first <= k[m - 1].second) k[m - 1].second = std::max(k[m - 1].second, k[i].second);
+        else k[m++] = k[i];
+    }
+    k.resize(m);
+    /* Whole pages only, so a page that holds kept bytes stays: a gap's start rounds up and its
+     * end rounds down (the blob's own end is the mapping's). Unmap first, then drop the cache:
+     * the kernel cannot drop a page still mapped here. */
+    const int64_t pg = 4096;
+    auto drop = [&](int64_t a, int64_t b) {
+        a = (a + pg - 1) / pg * pg;
+        if (b < size_) b = b / pg * pg;
+        if (b <= a) return;
+        ::madvise(base_ + a, (size_t)(b - a), MADV_DONTNEED);
+        ::posix_fadvise(fd_, (off_t)a, (off_t)(b - a), POSIX_FADV_DONTNEED);
+    };
+    int64_t cur = tables;
+    for (const auto& r : k) {
+        if (r.first > cur) drop(cur, r.first);
+        cur = std::max(cur, r.second);
+    }
+    if (cur < size_) drop(cur, size_);
 }
 
 /* Advisory, with no madvise: the load reads with pread and never maps these pages. The one region
@@ -85,6 +112,51 @@ void RadFile::drop_blob_cache() const {
 void RadFile::drop_range(int64_t off, int64_t bytes) const {
     if (fd_ < 0 || bytes <= 0) return;
     ::posix_fadvise(fd_, (off_t)off, (off_t)bytes, POSIX_FADV_DONTNEED);
+}
+
+void RadFile::snapshot_resident() {
+    resident_.clear();
+    if (!base_ || !hdr_) return;
+    const int64_t pg = 4096;
+    const int64_t tables = (int64_t)hdr_->data_off < size_ ? (int64_t)hdr_->data_off : size_;
+    const int64_t chunk = 1ll << 30;
+    std::vector<unsigned char> vec((size_t)(chunk / pg));
+    int64_t run0 = -1;
+    for (int64_t off = tables / pg * pg; off < size_; off += chunk) {
+        const int64_t len = std::min(chunk, size_ - off);
+        if (::mincore(base_ + off, (size_t)len, vec.data()) != 0) break;   /* advisory: stop quietly */
+        const int64_t np = (len + pg - 1) / pg;
+        for (int64_t i = 0; i < np; ++i) {
+            const int64_t at = off + i * pg;
+            if (vec[(size_t)i] & 1) { if (run0 < 0) run0 = at; }
+            else if (run0 >= 0) { resident_.emplace_back(run0, at - run0); run0 = -1; }
+        }
+    }
+    if (run0 >= 0) resident_.emplace_back(run0, size_ - run0);
+}
+
+int64_t RadFile::rewarm(const std::vector<std::pair<int64_t, int64_t>>& ranges, int64_t max_bytes) {
+    std::vector<std::pair<int64_t, int64_t>> rec;
+    rec.swap(resident_);
+    if (!base_ || rec.empty() || ranges.empty() || max_bytes <= 0) return 0;
+    std::vector<std::pair<int64_t, int64_t>> rg;
+    for (const auto& r : ranges) if (r.second > 0) rg.emplace_back(r.first, r.first + r.second);
+    std::sort(rg.begin(), rg.end());
+    int64_t asked = 0;
+    size_t j = 0;
+    for (const auto& r : rec) {                       /* both sorted by offset */
+        const int64_t a0 = r.first, a1 = r.first + r.second;
+        while (j < rg.size() && rg[j].second <= a0) ++j;
+        for (size_t k = j; k < rg.size() && rg[k].first < a1; ++k) {
+            const int64_t a = std::max(a0, rg[k].first) / 4096 * 4096, b = std::min(a1, rg[k].second);
+            if (b <= a) continue;
+            const int64_t n = std::min(b - a, max_bytes - asked);
+            ::madvise(base_ + a, (size_t)n, MADV_WILLNEED);
+            asked += n;
+            if (asked >= max_bytes) return asked;
+        }
+    }
+    return asked;
 }
 
 int RadFile::open(const char* path) {

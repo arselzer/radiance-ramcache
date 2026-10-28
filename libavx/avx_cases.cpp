@@ -336,6 +336,10 @@ std::vector<Case> build_cases() {
                                 HI("vocab_offset", 0), HF("mult", 22.625) });
         add("embed_lookup_q", { HI("M", 9), HI("n_embd", 128), HI("n_vocab", 64), HS("dtype", dt),
                                 HI("vocab_offset", 0), HF("wscale", 0.01) });
+        add("embed_lookup_planes", { HI("M", 9), HI("n_embd", 128), HI("n_vocab", 64), HI("group", 32),
+                                     HS("dtype", dt), HI("vocab_offset", 0), HF("mult", 1) });
+        add("embed_lookup_planes", { HI("M", 9), HI("n_embd", 96), HI("n_vocab", 64), HI("group", 8),
+                                     HS("dtype", dt), HI("vocab_offset", 0), HF("mult", 22.625) });
     }
 
     /* Attention. q_len 1 is decode, 17 a ragged verify window, 64 the prefill panel form
@@ -1192,6 +1196,77 @@ std::vector<Case> build_cases() {
                         HS("add", "-1 7 -7 -3") });
     add("sub_i32", { HI("M", 1) });
     add("sub_i32", { HI("M", 37) });
+
+    /* DeepSeek-V4.1's ops, scaled down from the model (hc 4, 512-wide latent heads of 64-dim rope,
+     * a 4:1 and a 128:1 compressor, top-k over the compressed positions). */
+    for (const char* dt : { "f32", "bf16" }) {
+        add("mhc_mix", { HI("M", 3), HI("n", 129), HI("hc", 4), HI("iterations", 20),
+                         HF("eps", 1e-5), HF("hc_eps", 1e-6), HS("dtype", dt) });
+        add("mhc_collapse", { HI("M", 3), HI("n", 129), HI("hc", 4), HS("dtype", dt) });
+        for (const char* score : { "sigmoid", "sqrtsoftplus", "softmax" })
+            add("router_scored_topk",
+                { HI("M", 5), HI("n_expert", 256), HI("top_k", 6), HI("norm", 1),
+                  HF("route_scale", 1.5), HS("score", score), HS("dtype", dt) });
+        for (const char* mode : { "gptj", "neox" })
+            for (int inv : { 0, 1 })
+                add("rope_rows", { HI("M", 5), HI("n_head", 3), HI("head_dim", 96), HI("rot", 32),
+                                   HI("off", 64), HS("mode", mode), HI("inverse", inv),
+                                   HS("dtype", dt) });
+        add("rope_rows", { HI("M", 4), HI("n_head", 2), HI("head_dim", 64), HI("rot", 64),
+                           HI("off", 0), HS("mode", "gptj"), HI("inverse", 0), HS("dtype", dt) });
+        add("quant_roundtrip", { HI("M", 5), HI("n", 448), HI("block", 64), HS("format", "fp8_e4m3"),
+                                 HS("scale", "ue8m0"), HS("dtype", dt) });
+        add("quant_roundtrip", { HI("M", 5), HI("n", 192), HI("block", 64), HS("format", "fp8_e4m3"),
+                                 HS("scale", "f32"), HS("dtype", dt) });
+        add("quant_roundtrip", { HI("M", 5), HI("n", 160), HI("block", 32), HS("format", "fp4_e2m1"),
+                                 HS("scale", "ue8m0"), HS("dtype", dt) });
+        add("quant_roundtrip", { HI("M", 5), HI("n", 144), HI("block", 16), HS("format", "fp4_e2m1"),
+                                 HS("scale", "e4m3"), HS("dtype", dt) });
+        for (int ratio : { 4, 64 })
+            add("softmax_pool", { HI("M", 5), HI("n", 131), HI("ratio", ratio), HS("dtype", dt) });
+        /* The window alone, then with the compressed entries. A drawn window_used of 0 leaves a
+         * row no key, so the window-only geometry is one whose draw holds some. */
+        add("attn_sparse_sink", { HI("M", 12), HI("heads", 3), HI("dim", 64), HI("window", 6),
+                                  HI("ratio", 0), HI("topk", 0), HF("scale", 0.125), HS("dtype", dt) });
+        add("attn_sparse_sink", { HI("M", 9), HI("heads", 3), HI("dim", 64), HI("window", 8),
+                                  HI("ratio", 4), HI("topk", 5), HF("scale", 0.125), HS("dtype", dt) });
+        add("index_score", { HI("M", 9), HI("heads", 4), HI("dim", 64), HI("ratio", 4),
+                             HI("width", 13), HF("wscale", 0.25), HS("dtype", dt) });
+        /* A run of a step scored in runs (row_part): rows 2 M .. 3 M - 1 of a 3 M-row step. */
+        add("index_score", { HI("M", 4), HI("heads", 4), HI("dim", 64), HI("ratio", 4),
+                             HI("width", 13), HF("wscale", 0.25), HS("dtype", dt),
+                             HI("row_part", 2) });
+        add("entry_store", { HI("M", 5), HI("n", 128), HI("block_size", 4), HS("dtype", dt) });
+        add("stream_gate_add", { HI("M", 5), HI("n", 129), HI("hc", 4), HF("eps", 1e-6),
+                                 HF("gate_eps", 1e-6), HS("dtype", dt) });
+        for (const char* ty : { "q8_0", "q6_K", "iq4_nl" }) {
+            const int K = std::strcmp(ty, "q6_K") ? 96 : 256;
+            add("gemm_nt_ggml", { HI("M", 4), HI("N", 33), HI("K", K), HS("type", ty), HS("dtype", dt) });
+            add("logits_gemm_ggml", { HI("M", 3), HI("n_vocab", 40), HI("n_embd", K), HS("type", ty),
+                                      HS("dtype", dt) });
+            add("embed_lookup_ggml", { HI("M", 7), HI("n_embd", K), HI("n_vocab", 20), HS("type", ty),
+                                       HS("dtype", dt) });
+        }
+        for (const char* order : { "token", "sorted" })
+            add("moe_gemm_ggml", { HI("M", 5), HI("N", 16), HI("K", 64), HI("n_expert", 4),
+                                   HI("top_k", 2), HS("a_order", order), HS("type", "q8_0"),
+                                   HS("dtype", dt) });
+    }
+    add("index_candidates", { HI("M", 9), HI("width", 40), HI("block", 8), HI("topk_blocks", 2),
+                              HI("ratio", 1) });
+    add("index_candidates", { HI("M", 6), HI("width", 21), HI("block", 4), HI("topk_blocks", 3),
+                              HI("ratio", 1) });
+    /* 35 blocks: keep is two words a row. */
+    add("index_candidates", { HI("M", 5), HI("width", 140), HI("block", 4), HI("topk_blocks", 20),
+                              HI("ratio", 1) });
+    add("index_topk", { HI("M", 9), HI("width", 17), HI("topk", 4), HI("ratio", 1) });
+    add("index_topk", { HI("M", 9), HI("width", 9), HI("topk", 4), HI("ratio", 2) });
+    /* keep's bits over blocks of 3 (a short last block) and of 2 across two words. */
+    add("index_topk", { HI("M", 9), HI("width", 17), HI("topk", 4), HI("ratio", 1),
+                        HI("block", 3) });
+    add("index_topk", { HI("M", 6), HI("width", 90), HI("topk", 6), HI("ratio", 1),
+                        HI("block", 2) });
+    add("token_map", { HI("M", 9), HI("n_vocab", 50) });
 
     /* ================================================================== speed-only, at model size
      *

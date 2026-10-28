@@ -64,6 +64,8 @@ int ref_mhc_pre_partial    (const RadArgs*, RadStream);
 int ref_mhc_pre_finish     (const RadArgs*, RadStream);
 int ref_mhc_post           (const RadArgs*, RadStream);
 int ref_mhc_contract       (const RadArgs*, RadStream);
+int ref_mhc_mix            (const RadArgs*, RadStream);
+int ref_mhc_collapse       (const RadArgs*, RadStream);
 int ref_kda_update         (const RadArgs*, RadStream);
 int ref_hc_read            (const RadArgs*, RadStream);
 int ref_hc_write           (const RadArgs*, RadStream);
@@ -77,6 +79,7 @@ int ref_mul                (const RadArgs*, RadStream);
 int ref_silu_mul           (const RadArgs*, RadStream);
 int ref_swiglu_clamped     (const RadArgs*, RadStream);
 int ref_router_sigmoid_topk(const RadArgs*, RadStream);
+int ref_router_scored_topk(const RadArgs*, RadStream);
 int ref_dsa_pool(const RadArgs*, RadStream);
 int ref_dsa_query(const RadArgs*, RadStream);
 int ref_gemm_nt_f32(const RadArgs*, RadStream);
@@ -158,6 +161,27 @@ int ref_kv_store           (const RadArgs*, RadStream);
 int ref_kv_store_streamed  (const RadArgs*, RadStream);
 int ref_rope               (const RadArgs*, RadStream);
 int ref_rope_table         (const RadArgs*, RadStream);
+int ref_rope_rows          (const RadArgs*, RadStream);
+int ref_quant_roundtrip    (const RadArgs*, RadStream);
+int ref_softmax_pool       (const RadArgs*, RadStream);
+int ref_attn_sparse_sink   (const RadArgs*, RadStream);
+int ref_index_score        (const RadArgs*, RadStream);
+int ref_index_candidates   (const RadArgs*, RadStream);
+int ref_index_topk         (const RadArgs*, RadStream);
+/* index_candidates' keep: one bit a block of `block` positions over `width`, 32 to an i32 word. */
+static inline int64_t ref_keep_words(int64_t width, int64_t block) {
+    return block < 1 || width < 1 ? 0 : ((width + block - 1) / block + 31) / 32;
+}
+int ref_entry_store        (const RadArgs*, RadStream);
+#ifdef REF_HAVE_GGML
+int ref_gemm_nt_ggml       (const RadArgs*, RadStream);
+int ref_moe_gemm_ggml      (const RadArgs*, RadStream);
+int ref_logits_gemm_ggml   (const RadArgs*, RadStream);
+int ref_embed_lookup_ggml  (const RadArgs*, RadStream);
+#endif
+int ref_token_map          (const RadArgs*, RadStream);
+int ref_embed_lookup_planes(const RadArgs*, RadStream);
+int ref_stream_gate_add    (const RadArgs*, RadStream);
 int ref_qk_norm_rope       (const RadArgs*, RadStream);
 /* image generation (ref_gen.cpp) */
 int ref_ln_mod(const RadArgs*, RadStream);
@@ -332,6 +356,8 @@ REF_SHAPE_FN(ref_mhc_pre_partial);
 REF_SHAPE_FN(ref_mhc_pre_finish);
 REF_SHAPE_FN(ref_mhc_post);
 REF_SHAPE_FN(ref_mhc_contract);
+REF_SHAPE_FN(ref_mhc_mix);
+REF_SHAPE_FN(ref_mhc_collapse);
 REF_SHAPE_FN(ref_kda_update);
 REF_SHAPE_FN(ref_hc_read);
 REF_SHAPE_FN(ref_hc_write);
@@ -345,6 +371,7 @@ REF_SHAPE_FN(ref_mul);
 REF_SHAPE_FN(ref_silu_mul);
 REF_SHAPE_FN(ref_swiglu_clamped);
 REF_SHAPE_FN(ref_router_sigmoid_topk);
+REF_SHAPE_FN(ref_router_scored_topk);
 REF_SHAPE_FN(ref_dsa_pool);
 REF_SHAPE_FN(ref_dsa_query);
 REF_SHAPE_FN(ref_gemm_nt_f32);
@@ -420,6 +447,23 @@ REF_SHAPE_FN(ref_kv_store);
 REF_SHAPE_FN(ref_kv_store_streamed);
 REF_SHAPE_FN(ref_rope);
 REF_SHAPE_FN(ref_rope_table);
+REF_SHAPE_FN(ref_rope_rows);
+REF_SHAPE_FN(ref_quant_roundtrip);
+REF_SHAPE_FN(ref_softmax_pool);
+REF_SHAPE_FN(ref_attn_sparse_sink);
+REF_SHAPE_FN(ref_index_score);
+REF_SHAPE_FN(ref_index_candidates);
+REF_SHAPE_FN(ref_index_topk);
+REF_SHAPE_FN(ref_entry_store);
+#ifdef REF_HAVE_GGML
+REF_SHAPE_FN(ref_gemm_nt_ggml);
+REF_SHAPE_FN(ref_moe_gemm_ggml);
+REF_SHAPE_FN(ref_logits_gemm_ggml);
+REF_SHAPE_FN(ref_embed_lookup_ggml);
+#endif
+REF_SHAPE_FN(ref_token_map);
+REF_SHAPE_FN(ref_embed_lookup_planes);
+REF_SHAPE_FN(ref_stream_gate_add);
 REF_SHAPE_FN(ref_qk_norm_rope);
 REF_SHAPE_FN(ref_ln_mod);
 REF_SHAPE_FN(ref_ln_mod_quant_fp8);

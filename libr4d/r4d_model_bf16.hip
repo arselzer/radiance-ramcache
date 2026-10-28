@@ -379,6 +379,30 @@ __global__ __launch_bounds__(kThreads) void binary_f32_kernel(
     }
 }
 
+// ref_add / ref_mul over int32 (a drafter's ids and positions), computed as libref computes them:
+// each operand read as f32, the f32 sum (or product), `div` applied to that rounded back to int32,
+// then st_dt's integer store -- round to nearest even, saturate to [-2^31, 2^31 - 1], NaN to 0.
+// Not a wrapping integer add: identical to one while |a|, |b| and |a + b| stay below 2^24.
+__device__ __forceinline__ float i32_sat_round(float v) {
+    if (v != v) return 0.0f;
+    const float r = rintf(v);
+    return r < -0x1p31f ? -0x1p31f : (r > 0x1p31f ? 0x1p31f : r);
+}
+__global__ __launch_bounds__(kThreads) void binary_i32_kernel(
+    const int32_t* __restrict__ a, const int32_t* __restrict__ b, int32_t* y, uint32_t n,
+    uint32_t a_ld, uint32_t b_ld, uint32_t y_ld, int mul, float div, uint64_t total) {
+    for (uint64_t t = (uint64_t)blockIdx.x * kThreads + threadIdx.x; t < total;
+         t += (uint64_t)gridDim.x * kThreads) {
+        const uint64_t m = t / n;
+        const uint32_t i = (uint32_t)(t - m * n);
+        const float u = (float)a[m * a_ld + i], v = (float)b[m * b_ld + i];
+        float r = mul ? u * v : u + v;
+        if (div != 1.0f) r = i32_sat_round(r) / div;
+        const float q = i32_sat_round(r);
+        y[m * y_ld + i] = q >= 0x1p31f ? INT32_MAX : (int32_t)q;
+    }
+}
+
 // ref_mul_weight over an f32 weight (a layer scale kept f32): y = x * w, one row of n elements
 // broadcast down the rows, or with `w_step` 0 one element for the whole op.
 __global__ __launch_bounds__(kThreads) void mul_wf32_kernel(
@@ -1831,14 +1855,16 @@ extern "C" int r4d_rad_rmsnorm_p(const RadArgs* a, RadStream s) {
 
 enum { BI_A = 0, BI_B, BI_Y };
 
-/* Both rows of each op share this: every operand bf16, or (add_f32) every operand f32. */
+/* Every row of each op shares this: every operand bf16, or (add_f32) every operand f32, or
+ * (add_i32) every operand int32. */
 static int binary(const RadArgs* a, int mul, RadStream s) {
     const RadTensor* A = r4d_opt(a, BI_A);
     const RadTensor* B = r4d_opt(a, BI_B);
     const RadTensor* Y = r4d_opt(a, BI_Y);
     if (!A || !B || !Y) return R4D_NO(RAD_E_INVAL);
     const bool f32 = Y->dtype == RAD_F32;
-    const uint32_t dt = f32 ? (uint32_t)RAD_F32 : (uint32_t)RAD_BF16;
+    const bool i32 = Y->dtype == RAD_I32;
+    const uint32_t dt = f32 ? (uint32_t)RAD_F32 : i32 ? (uint32_t)RAD_I32 : (uint32_t)RAD_BF16;
     if (A->dtype != dt || B->dtype != dt || Y->dtype != dt) return R4D_NO(RAD_E_DTYPE);
     /* `div` is add's alone (mul's schema has none); 0 and non-finite values are refused, as libref
      * refuses them. */
@@ -1866,6 +1892,15 @@ static int binary(const RadArgs* a, int mul, RadStream s) {
         if (b_ld == 0) return R4D_NO(RAD_E_STRIDE);   /* 0 means broadcast; a real pitch cannot be 0 */
     }
 
+    if (i32) {
+        const uint64_t total = (uint64_t)M * (uint64_t)n;
+        const uint64_t blocks = std::min<uint64_t>((total + kThreads - 1) / kThreads, 65536u);
+        hipLaunchKernelGGL(binary_i32_kernel, dim3((uint32_t)blocks), dim3(kThreads), 0,
+                           (hipStream_t)s, (const int32_t*)A->data, (const int32_t*)B->data,
+                           (int32_t*)Y->data, (uint32_t)n, (uint32_t)a_ld, (uint32_t)b_ld,
+                           (uint32_t)y_ld, mul, (float)div, total);
+        return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+    }
     if (f32) {
         const uint64_t total = (uint64_t)M * (uint64_t)n;
         const uint64_t blocks = std::min<uint64_t>((total + kThreads - 1) / kThreads, 65536u);

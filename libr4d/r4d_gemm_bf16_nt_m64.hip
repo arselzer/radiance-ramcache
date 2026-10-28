@@ -54,7 +54,7 @@ constexpr int KU = 8;
 template <int MT, bool CHAIN>
 __device__ __forceinline__ void r4d_gemm_bf16_nt_m64_body(
     const unsigned short* __restrict__ A, const unsigned short* __restrict__ W,
-    __hip_bfloat16* __restrict__ C, int M, int K, int N, int WV, int SK) {
+    __hip_bfloat16* __restrict__ C, int M, int K, int N, int WV, int SK, int LDA, int LDC) {
   if (CHAIN) r4d_chain_wait();
   extern __shared__ float red[];              // WV*SK*256 floats: one 16x16 tile per (column, split)
   const int tid = threadIdx.x, wave = tid / WAVE32, lane = tid % WAVE32;
@@ -74,7 +74,7 @@ __device__ __forceinline__ void r4d_gemm_bf16_nt_m64_body(
   unsigned aoff[MT];
 #pragma unroll
   for (int i = 0; i < MT; i++)
-    aoff[i] = rowGo((unsigned)K, (mt0 + i) * 16, M - 1, lane) + (unsigned)kbase;
+    aoff[i] = rowGo((unsigned)LDA, (mt0 + i) * 16, M - 1, lane) + (unsigned)kbase;
 
   // Unrolled so the k step is a load immediate (the 13-bit field of global_load_b64) and the base
   // pointers advance once per KU steps; rolled, LLVM rebuilds a 64-bit address every step.
@@ -125,7 +125,7 @@ __device__ __forceinline__ void r4d_gemm_bf16_nt_m64_body(
       const int m = (mt0 + i) * 16 + 8 * (l >> 4) + (off >> 5);
       // The language's float-to-bf16 conversion on purpose; the header's f2bf rounds half away
       // from zero.
-      if (n < N && m < M) C[(size_t)m * N + n] = (__hip_bfloat16)v;
+      if (n < N && m < M) C[(size_t)m * LDC + n] = (__hip_bfloat16)v;
     }
   }
   if (CHAIN) r4d_chain_done();
@@ -134,28 +134,33 @@ __device__ __forceinline__ void r4d_gemm_bf16_nt_m64_body(
 template <int MT>
 __global__ __launch_bounds__(1024) void r4d_gemm_bf16_nt_m64_kernel(
     const unsigned short* __restrict__ A, const unsigned short* __restrict__ W,
-    __hip_bfloat16* __restrict__ C, int M, int K, int N, int WV, int SK) {
-  r4d_gemm_bf16_nt_m64_body<MT, false>(A, W, C, M, K, N, WV, SK);
+    __hip_bfloat16* __restrict__ C, int M, int K, int N, int WV, int SK, int LDA, int LDC) {
+  r4d_gemm_bf16_nt_m64_body<MT, false>(A, W, C, M, K, N, WV, SK, LDA, LDC);
 }
 template <int MT>
 __global__ __launch_bounds__(1024) void r4dchain_gemm_bf16_nt_m64(
     const unsigned short* __restrict__ A, const unsigned short* __restrict__ W,
-    __hip_bfloat16* __restrict__ C, int M, int K, int N, int WV, int SK) {
-  r4d_gemm_bf16_nt_m64_body<MT, true>(A, W, C, M, K, N, WV, SK);
+    __hip_bfloat16* __restrict__ C, int M, int K, int N, int WV, int SK, int LDA, int LDC) {
+  r4d_gemm_bf16_nt_m64_body<MT, true>(A, W, C, M, K, N, WV, SK, LDA, LDC);
 }
 
 // grid = ceil(ceil(N/16)/WV) x ceil(ceil(M/16)/MB) blocks; block = WV*SK waves. MT = MB is
 // compile-time so the accumulators are sized exactly.
 static void gemm_bf16_m64_launch(long a, long w, long c, int M, int K, int N, int WV, int SK,
-                                 int MB, long stream, bool chain);
+                                 int MB, long stream, bool chain, long long lda, long long ldc);
 void r4d_gemm_bf16_nt_m64(long a, long w, long c, int M, int K, int N, int WV, int SK, int MB,
                           long stream) {
-  gemm_bf16_m64_launch(a, w, c, M, K, N, WV, SK, MB, stream, false);
+  gemm_bf16_m64_launch(a, w, c, M, K, N, WV, SK, MB, stream, false, K, N);
 }
 /* `chain`: the chained form (r4d_rad_gemm_bf16_m64 passes the row's parameter; M <= 64 always). */
+/* `lda` / `ldc`: the rows' pitches in elements (K and N for contiguous planes). A's fragments are
+ * 8-byte loads, so its pitch is a multiple of 4; the offsets are 32-bit, so its last row is
+ * addressable in 2^32 elements. */
 static void gemm_bf16_m64_launch(long a, long w, long c, int M, int K, int N, int WV, int SK,
-                                 int MB, long stream, bool chain) {
+                                 int MB, long stream, bool chain, long long lda, long long ldc) {
   if (M < 1 || M > R4D_GEMM64_MAX_M) throw std::runtime_error("r4d gemm_bf16_nt_m64: M out of range");
+  if (lda < K || ldc < N || lda % 4 || (long long)(M - 1) * lda + K >= (1ll << 32) || ldc > INT32_MAX)
+    throw std::runtime_error("r4d gemm_bf16_nt_m64: row pitch unsupported");
   if (K % (SK * 16)) throw std::runtime_error("r4d gemm_bf16_nt_m64: K must be divisible by SK*16");
   if (WV * SK * WAVE32 > 1024) throw std::runtime_error("r4d gemm_bf16_nt_m64: threads/block > 1024");
   const int ntiles = (N + 15) / 16, mtiles = (M + 15) / 16;
@@ -167,7 +172,8 @@ static void gemm_bf16_m64_launch(long a, long w, long c, int M, int K, int N, in
   hipStream_t st = (hipStream_t)stream;
 #define LAUNCH(MT) hipLaunchKernelGGL((chain ? r4dchain_gemm_bf16_nt_m64<MT>                  \
                                              : r4d_gemm_bf16_nt_m64_kernel<MT>),              \
-                                      grid, block, smem, st, Ap, Wp, Cp, M, K, N, WV, SK)
+                                      grid, block, smem, st, Ap, Wp, Cp, M, K, N, WV, SK,   \
+                                      (int)lda, (int)ldc)
   switch (MB) {
     case 1: LAUNCH(1); break;
     case 2: LAUNCH(2); break;
@@ -185,16 +191,17 @@ int r4d_gemm_bf16_nt_m64_max_m(void) { return R4D_GEMM64_MAX_M; }
 // The operand reader and the split law are in r4d_gemm_args.h; see libr4d/r4d_args.h.
 extern "C" int r4d_rad_gemm_bf16_m64(const RadArgs* a, RadStream s) {
     GemmOps g;
-    int rc = gemm_ops(a, &g, 0);
+    int rc = gemm_ops(a, &g, 0, 0, /*pitched=*/1);
     if (rc != RAD_OK) return rc;
     if (g.M > r4d_gemm_bf16_nt_m64_max_m()) return R4D_NO(RAD_E_SHAPE);
+    if (g.lda % 4 || (g.M - 1) * g.lda + g.K >= (1ll << 32) || g.ldc > INT32_MAX) return R4D_NO(RAD_E_STRIDE);
     Cfg c;
     rc = cfg_for(a, g.K, g.M, 16, BR_FLAT, &c, (g.N + 15) / 16);  /* "K divisible by SK*16" */
     if (rc != RAD_OK) return rc;
     R4D_TRY("gemm_bf16_nt_m64",
         gemm_bf16_m64_launch(r4d_addr(g.a), r4d_addr(g.b), r4d_addr(g.y),
                              (int)g.M, (int)g.K, (int)g.N, c.wv, c.sk, c.mb,
-                             (long)(uintptr_t)s, r4d_geti_or(a, "chain", 0) != 0));
+                             (long)(uintptr_t)s, r4d_geti_or(a, "chain", 0) != 0, g.lda, g.ldc));
     return RAD_OK;
 }
 

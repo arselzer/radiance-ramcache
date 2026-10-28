@@ -217,7 +217,17 @@ private:
     /* --host-headroom-mib in bytes: the host RAM startup leaves free for the system when it
      * pins host memory (engine_bringup.cpp). 4 GiB suits a busy server; a small host wants to
      * leave less to make room for its tiers, which is why it is a flag and not a constant. */
-    int64_t host_headroom_bytes() const { return cfg_.host_headroom_mib * ((int64_t)1 << 20); }
+    int64_t host_headroom_bytes() const {
+        /* All callers are startup allocation checks. Reserve the lazy native cache before a
+         * whole table or prefix pool can consume its future capacity. The cache's small entry
+         * metadata may already exist at the later checks; counting it again is conservative. */
+        const int64_t cache = cfg_.expert_ram_cache_total_mib;
+        if (!cache) return cfg_.host_headroom_mib * ((int64_t)1 << 20);
+        const int64_t limit = INT64_MAX / ((int64_t)1 << 20);
+        if (cache < 0 || cfg_.host_headroom_mib < 0 || cache > limit ||
+            cfg_.host_headroom_mib > limit - cache) return INT64_MAX;
+        return (cfg_.host_headroom_mib + cache) * ((int64_t)1 << 20);
+    }
     /* Resolves --embedding-placement, --vision-tower-placement and --ngram-placement into Config
      * before the card is split (engine_bringup.cpp describes how auto chooses). `wfs` is every
      * rank's footprint, read for its towers. `host_late` is the pinned host memory startup
@@ -440,7 +450,8 @@ private:
      * `mtp_couple_state`; the engine stages one draw per drafting row before the serial passes and
      * reads the states back once, then binds each to the verify row it will be coupled at. */
     bool     mtp_couple_ = false;
-    rad_buf  couple_draws_buf_ = 0, couple_state_buf_ = 0;
+    rad_buf  couple_draws_buf_ = 0, couple_state_buf_ = 0;   /* rank 0's handles */
+    std::vector<rad_buf> couple_draws_rank_;           /* the draws plane, by rank */
     int64_t  couple_rows_ = 0;                       /* the state plane's rows per round */
     RadMtpCoupleDraw*  couple_draw_stage_ = nullptr;   /* pinned [max_seqs] */
     RadMtpCoupleState* couple_readback_  = nullptr;    /* pinned [rounds, couple_rows_] */

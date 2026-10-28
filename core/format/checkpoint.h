@@ -49,6 +49,11 @@ struct SrcTensor {
     std::vector<int64_t> shape;                        /* row-major */
     const void*          data = nullptr;
     int64_t              bytes = 0;
+    /* Only explicit ISTA Engram supplements use this provenance. Copies/slices
+     * retain the actual owner and original directory row; global Fp8Mx import
+     * must never reinterpret these GGUF pieces. */
+    const GgufFile*      supplemental_gguf = nullptr;
+    std::string          supplemental_tensor;
     /* GPTQ-packed (auto_gptq's layout, shared by AutoRound's `auto_round:auto_gptq` export):
      * `data` is the qweight's int32 words [K * bits / 32, N], each packing 32 / bits codes along K
      * from the low bits up, unsigned with zero point 2^(bits-1). The tensor described is the
@@ -125,6 +130,10 @@ public:
      * as separate single files (ComfyUI's split_files: a diffusion model, a text encoder and a
      * VAE). A name already present is refused. */
     int add_file(const std::string& path);
+    /* Opt-in before supplements, never a metadata/import-mode replacement.
+     * GGUF additions expose only the six fixed ISTA control/table roles. */
+    void enable_ista_engram_source(bool enabled) { ista_engram_source_ = enabled; }
+    bool ista_engram_source_complete() const;
     /* Before open(): read config.json, generation_config.json and the tokenizer from `dir` rather
      * than from beside the checkpoint, for a single-file checkpoint that ships none of them (the
      * text encoder's repository describes such a release). */
@@ -181,11 +190,19 @@ public:
      * (detect_import). ModelOpt: NVIDIA ModelOpt's NVFP4, FP8, or both per layer
      * (MIXED_PRECISION). In an Nvfp4, CtFp8 or ModelOpt release every weight without the NVFP4
      * tensors reads stock, so FP8 and bf16 linears beside the NVFP4 ones read by their own form.
+     * Gguf: a GGUF holding llama.cpp block types (K-, I- and legacy quants): every such tensor is
+     * imported block for block as the affine planes libquant's `ggml` quantiser writes for the
+     * same blocks (libquant/lq_ggml_planes.h); its float tensors read as they are.
+     * Fp8Mx: DeepSeek-V4's release form (quant_method fp8, scale_fmt ue8m0, expert_dtype fp4):
+     * block-FP8 linears with an e8m0 scale per weight_block_size block, read stock beside their
+     * `X.scale` (DeepSeek's spelling of the scale plane), and routed experts as `X.weight` I8
+     * [N, K/2] (two e2m1 codes a byte, element 2j in the low nibble) with `X.scale` e8m0
+     * [N, K/32]: `fp4_e2m1*e8m0[1x32]` byte for byte, as Quark's MXFP4.
      * An unreadable form of these stays None, with the reason in import_refusal(). The
      * quantization_config keys are then renamed `imported_quantization_config.*`, since they
      * describe the tool, not a served format. */
     enum class Import { None, Gptq, QuarkMx, CtInt4, ParoMx, ParoM2, ParoI5, ParoI4, Nvfp4, CtFp8,
-                        ModelOpt };
+                        ModelOpt, Gguf, Fp8Mx };
     Import imports() const { return import_; }
     const std::string& import_refusal() const { return import_why_; }
 
@@ -212,11 +229,18 @@ private:
     int add_companions();
     int add_torch_files();
     int open_gguf(const std::string& path);
+    int add_ista_engram_gguf(const std::string& path);
     void detect_import();
 
     enum Kind { None, Gguf, SafeT } kind_ = None;
     std::string path_, dir_, tok_dir_, meta_dir_;
     GgufFile    gguf_;
+    /* A split GGUF's shards after the first (llama.cpp's gguf-split): tensors only. */
+    std::vector<std::unique_ptr<GgufFile>> gguf_more_;
+    std::vector<std::unique_ptr<GgufFile>> ista_gguf_;
+    bool ista_engram_source_ = false;
+    /* Long integer metadata arrays as tensor bytes (open_gguf); a deque, so data never moves. */
+    std::deque<std::vector<uint8_t>> gguf_arrays_;
     MetaOwn     meta_;
     std::vector<std::unique_ptr<SafeTensorsFile>> shards_;
     std::vector<std::unique_ptr<TorchZipFile>>    torch_;

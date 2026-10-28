@@ -34,14 +34,17 @@
 #include "../device/directio.h"
 #include "../mem/pools.h"
 #include "heat.h"
+#include "native_file_cache.h"
 #include "planner.h"
 #include "residency_iface.h"
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <functional>
 #include <string>
 #include <vector>
+#include <sys/stat.h>
 
 namespace rad {
 
@@ -231,7 +234,9 @@ public:
      * whose latency cannot be budgeted. */
     int  open(const std::string& path);
     bool ok() const { return f_.is_open(); }
-    void close() { f_.close(); }
+    void close() { f_.close(); epoch_ready_ = false; }
+    int remember_epoch();
+    bool same_epoch() const;
 
     /* One expert-sized read into a pinned buffer. Blocking and counted: a dispatch that meets a
      * file-tier unit stalls until the read returns. This is the cost the plan accepted by putting
@@ -244,6 +249,8 @@ public:
 
 private:
     DirectFile f_;
+    struct stat epoch_{};
+    bool epoch_ready_ = false;
 };
 
 /* ------------------------------------------------------------------ residency */
@@ -310,6 +317,9 @@ struct MoverConfig {
     /* Pinned staging buffers for file-tier reads, one class stride each; the count the planner
      * charged to --host-pool-mib. */
     int stage_slots = RAD_PLACE_FILE_STAGE_SLOTS;
+    /* Native RAM cache capacity for THIS rank, including its entry metadata. Zero disables it.
+     * Engine divides the configured server-wide capacity; it is separate from the fixed pool. */
+    int64_t native_file_cache_bytes = 0;
 };
 
 /* ------------------------------------------------------------------ the loan */
@@ -347,6 +357,11 @@ struct MoverStats {
      * for a window's copies to drain. */
     uint64_t file_layers = 0, file_units = 0, file_bytes = 0, file_preads = 0;
     uint64_t file_read_ns = 0, file_wait_ns = 0;
+    /* Units a routed-only read left unread (alias_file_units): the pass did not route to them. */
+    uint64_t file_aliased = 0;
+    /* File-tier weights relaid on the read (Mover::set_file_relayout), and the issuing thread's
+     * time in those reads and relayouts, which run on several threads at once. */
+    uint64_t file_relaid = 0, file_relaid_bytes = 0, file_relayout_ns = 0;
 };
 
 /* ------------------------------------------------------------------ the mover */
@@ -538,6 +553,26 @@ public:
      * file_buffer       buffer 0 or 1 of the plan's two, or null when the plan has none. */
     int   stage_file_units(const std::vector<int32_t>& units, char* dst, int64_t cap,
                            RadEvent after, RadEvent done, std::vector<int32_t>* staged);
+    /* alias_file_units  publishes every file-tier weight of `units` at `base` without reading
+     *                   it, for experts a pass does not route to: the grouped GEMM is handed
+     *                   every expert's pointer and reads none of a zero-row expert's bytes, so
+     *                   the pointer only has to name memory the card owns (the file buffer, at
+     *                   least one unit long). Appends them to `staged`; unstage_units takes them
+     *                   back like read ones. */
+    void  alias_file_units(const std::vector<int32_t>& units, char* base,
+                           std::vector<int32_t>* staged);
+    /* set_file_relayout  the function that makes a file-tier weight's stored form from its
+     *                    container planes when the two differ (weight_file_relaid): the kernel's
+     *                    relayout, as the loader's relayout pool calls it once for a resident
+     *                    weight. Every read of such a weight -- a staging slot (stage) or the
+     *                    file stager -- reads its planes into a host input, relays them into the
+     *                    pinned memory the copy to the card reads (the staging slot, or a read
+     *                    window), and copies as usual. Must be pure and thread-safe: the file
+     *                    stager relays a window's weights on several threads. Set before init;
+     *                    without it a plan with such a weight on the file tier is refused. */
+    using FileRelayout = std::function<int(const WeightInfo& w, const RadTensor* planes,
+                                           void* dst, int64_t dst_bytes)>;
+    void  set_file_relayout(FileRelayout fn) { relayout_ = std::move(fn); }
     char* file_buffer(int i) const {
         return (file_vram_ && (i == 0 || i == 1)) ? file_vram_ + i * file_buf_bytes_ : nullptr;
     }
@@ -678,6 +713,26 @@ private:
      * through, each with the event behind the copies out of it. */
     char*    file_vram_ = nullptr;
     int64_t  file_buf_bytes_ = 0;
+    /* The file tier's relayout (set_file_relayout): a host input per thread, which holds the
+     * planes' aligned span as read. */
+    struct RelayIn {
+        uint8_t* p = nullptr;
+        int64_t  cap = 0;
+        RelayIn() = default;
+        RelayIn(RelayIn&& o) noexcept : p(o.p), cap(o.cap) { o.p = nullptr; o.cap = 0; }
+        RelayIn(const RelayIn&) = delete;
+        ~RelayIn() { std::free(p); }
+    };
+    struct Relaid { const WeightInfo* w; char* dst; };
+    FileRelayout         relayout_;
+    NativeFileCache      native_file_cache_;
+    bool                 native_file_cache_on_ = false;
+    std::vector<RelayIn> relay_in_;
+    int                  relay_threads_ = 1;
+    int  read_relaid(const WeightInfo& w, void* dst, int64_t dst_cap, RelayIn* in);
+    int  read_native_file(const WeightInfo& w, void* dst, int64_t dst_cap, RelayIn* in,
+                          bool* cache_hit);
+    int  stage_relaid(const std::vector<Relaid>& rl);
     char*    windows_ = nullptr;
     int      n_windows_ = 0;
     int      win_next_ = 0;

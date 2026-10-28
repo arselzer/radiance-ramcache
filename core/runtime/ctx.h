@@ -17,9 +17,11 @@
  */
 #pragma once
 #include "../rad_core.h"
+#include "../place/ep_route_counts.h"
 #include "arena.h"
 #include "rank_barrier.h"
 #include "residency.h"
+#include "rowprefetch.h"
 #include "stager.h"
 #include "device/device.h"
 
@@ -93,6 +95,9 @@ struct OpPlan {
     /* Its position in the declared order, or its anchor's for a core-appended op: what the second
      * lane's window (Program::lane1_w0..lane1_w1) is checked against. */
     int32_t       order = 0;
+    /* A row gather (runtime/rowprefetch.h): on the host, its rows on the mapped tier are read
+     * ahead before the kernel runs. Matched by name once here, like `billed`. */
+    bool          row_gather = false;
 };
 
 /* ------------------------------------------------------------------ routing handoff */
@@ -188,6 +193,12 @@ struct CtxDesc {
     ResidencyTable* residency   = nullptr;  /* null in the all-in-VRAM case */
     ArchStepFn      arch_step   = nullptr;  /* the architecture plugin's rad_arch_step */
     bool            profile_ops = false;    /* spec §16, and it changes what you measure */
+    /* --row-prefetch: a host gather's rows on the mapped tier are read ahead of (or beside) its
+     * kernel (runtime/rowprefetch.h). */
+    bool            row_prefetch = true;
+    /* --debug-tape-dump: the first recording of each draft pass kind lists its dispatches on
+     * stderr (TAPEDUMP lines) and which of them start unordered behind the one before. */
+    bool            tape_dump = false;
     /* Whether a repeated pass may be recorded and played back. False for a caller whose pass
      * issues work the batch does not describe (e.g. a test driving another component through
      * run_step), since a recording keyed on the batch would replay the wrong pass. */
@@ -292,6 +303,24 @@ public:
     /* How many layers report routing (the heat engine's sweep). Zero on a dense model. */
     int               n_route_layers() const { return (int)route_.size(); }
     int64_t           route_n_expert() const { return route_n_expert_; }
+    /* Layer `layer`'s card-side counts row when the layer's last report named that row, i.e. its
+     * router writes this pass's counts there in stream order (rad_route_counts); null otherwise,
+     * including before the layer's first report. `n_expert` and `top_k` are that report's. The
+     * file stager reads it to fetch only the experts a small pass routes to. */
+    const int32_t* route_counts_live(int layer, int64_t* n_expert, int64_t* top_k) const {
+        if (!route_dev_ || layer < 0 || (size_t)layer >= route_.size()) return nullptr;
+        const int32_t* row = route_dev_ + (int64_t)layer * route_n_expert_;
+        const RadRouting& r = route_[(size_t)layer].routing;
+        if (r.expert_count != row || r.n_expert <= 0 || r.n_expert > route_n_expert_ ||
+            r.top_k <= 0)
+            return nullptr;
+        if (n_expert) *n_expert = r.n_expert;
+        if (top_k) *top_k = r.top_k;
+        return row;
+    }
+    /* Private EP view: queued by THIS pass's actual successful count producer, not by
+     * a previous RadRouting report. The file stager supplies the completion event. */
+    bool ep_route_counts_live(int layer, EpRouteCounts* out) const;
 
     /* ---------------------------------------------------- the next-layer expert prefetch
      * (xprefetch.h). xp_open at bringup, after placement has made its pinned pools, with their
@@ -344,6 +373,16 @@ public:
     /* Host synchronisations on the step path. Always zero unless per-op timing is on (spec §16);
      * tests read it. Teardown's drain is not counted. */
     int64_t     host_syncs()   const { return n_host_syncs_; }
+    /* Of those, the host-op joins that drained the stream because an operand is untracked by the
+     * host arena (host_join_drains); tests read it. */
+    int64_t     host_drains()  const { return n_host_drains_; }
+    /* Host gathers whose rows were read ahead from the mapped tier, and the pages they advised
+     * (runtime/rowprefetch.h); tests read them. */
+    int64_t     row_prefetch_calls() const { return rowpf_calls_; }
+    int64_t     row_prefetch_pages() const { return rowpf_pages_; }
+    /* Of the calls, those whose read-ahead ran beside the kernel (runtime/rowprefetch.h). */
+    int64_t     row_prefetch_beside_calls() const { return rowpf_beside_calls_; }
+    bool        row_prefetch_busy() const { return rowpf_worker_ && rowpf_worker_->busy(); }
     /* This rank's all-reduce traffic. The inter-card link carries both the tensor-parallel
      * all-reduce and the expert mover's transfers; the mover counts its own (MoverStats), so the
      * two can be told apart.
@@ -400,6 +439,7 @@ public:
     uint64_t    pass_key(const RadBatch* b) const;
 
 private:
+    friend struct EpCountsHostProbe;
     int  prepare();
     int  bind_arena();
     int  bind_buffers();
@@ -504,6 +544,11 @@ private:
         RadTensor        t[MAX_OPERANDS] = {};
         int64_t          n = 0;
         bool             drain = false;    /* an operand the arena does not track: drain instead */
+        /* The lanes whose last host-arena toucher its join waited on when recorded. A play
+         * re-records those events in the played stretches, but only the issue path raises
+         * host_touch_pending_, so a pass with two host ops would run the second unjoined. */
+        bool             touch[2] = { false, false };
+        RowPrefetch      rp{};             /* its rows read ahead at every play (rowprefetch.h) */
     };
     struct PassTape {
         uint64_t key = 0;
@@ -533,6 +578,7 @@ private:
         int32_t  rec0 = 0, rec1 = 0;      /* its dispatches in the tape */
         uint32_t op = 0;
         bool     opaque = false;
+        const KernelRow* row = nullptr;   /* for --debug-tape-dump only */
         uint32_t rd = 0, n_rd = 0, wr = 0, n_wr = 0;   /* into haz_rng_ */
     };
     std::vector<HazOp> haz_ops_;
@@ -540,6 +586,8 @@ private:
     void haz_note(const OpPlan& p, const IssuePlan& ip, const RadTensor* t, int n_opd, int rec0,
                   int rec1);
     int  haz_mark(PassTape& t);
+    bool tape_dump_ = false;  /* --debug-tape-dump (CtxDesc::tape_dump) */
+    bool haz_dump_ = false;   /* haz_mark lists this recording's dispatches (tape_dump_) */
 
     static constexpr size_t  kTapes      = 24;     /* recorded passes kept, least recently used out */
     static constexpr int64_t kAuditPlays = 1024;
@@ -711,6 +759,20 @@ private:
     int       host_join(const RadOperand* opd, int n_opd);
     bool      host_join_drains(const RadOperand* opd, int n_opd) const;
     int       host_join_wait(bool drain);
+    /* Read ahead a host gather's rows on the mapped tier (runtime/rowprefetch.h): which tables
+     * this issue reads there, then the madvise over the rows `t[0]` names -- in front of the
+     * kernel, or beside it on rowpf_worker_ when longer than kRowAheadInline and its sampled rows
+     * are resident; row_prefetch_done() after the kernel returns stops and joins that. Off with
+     * --row-prefetch off (CtxDesc::row_prefetch). */
+    bool      row_prefetch_on_ = true;
+    RowPrefetchScratch rowpf_;
+    int64_t   rowpf_calls_ = 0, rowpf_pages_ = 0, rowpf_beside_calls_ = 0;
+    std::unique_ptr<RowPrefetchWorker> rowpf_worker_;
+    bool      rowpf_beside_ = false;   /* a read-ahead runs beside the kernel being launched */
+    void      row_prefetch_plan(const RadArgs& a, const RadOperand* opd, int n_opd,
+                                const RadTensor* t, RowPrefetch* out) const;
+    void      row_prefetch_run(const RowPrefetch& rp, const RadTensor* t, int64_t n);
+    void      row_prefetch_done();
     /* A lane issued a scratch user and the other lane has not been joined behind it since. Keeps
      * two lanes off the shared region at once; lane_join clears its `from` side. See the scratch
      * block in Ctx::issue. */
@@ -763,6 +825,11 @@ private:
     std::vector<std::atomic<uint8_t>>   op_domain_;   /* sized once, never resized */
 
     std::vector<RouteSlot> route_;
+    std::vector<EpRouteCounts> ep_route_;
+    uint64_t ep_route_generation_ = 0, ep_route_serial_ = 0;
+    int begin_ep_route_generation();
+    void note_ep_route_producer(const OpInfo& op, const RadTensor* t, int n_t,
+                                int64_t rows, RadStream issued_stream);
     int64_t                route_n_expert_ = 0;
     /* A bank is one step's histograms for every layer: [kRouteBanks][n_layer][n_expert] in pinned
      * host memory. A report copies a layer's counts into its row of the card-side
@@ -802,6 +869,7 @@ private:
     int64_t n_issues_ = 0;
     int64_t n_stream_waits_ = 0;
     int64_t n_host_syncs_ = 0;
+    int64_t n_host_drains_ = 0;
     std::atomic<int64_t> ar_calls_{0}, ar_bytes_{0};
     std::atomic<int64_t> pc_played_{0}, pc_recorded_{0}, pc_audited_{0};
     std::atomic<int64_t> pc_unkeyed_{0}, pc_refused_{0}, pc_first_{0};

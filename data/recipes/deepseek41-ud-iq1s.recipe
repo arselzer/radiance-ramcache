@@ -4,6 +4,7 @@
 # float type, the DSpark drafter's experts kept as the release's MXFP4 (no rule). The `ggml` quantiser runs llama.cpp's
 # own searches, so the encodings are the ones the GGUF gives; iq1_s and iq2_xxs need --imatrix. 251.07 GiB.
 #
+#   data/engram_tables.py <DeepSeek-V4.1-Flash-1017 dir> engram-tables.safetensors   (the release ships none)
 #   rad-convert <DeepSeek-V4.1-Flash-1017 dir> --add engram-tables.safetensors \
 #     --recipe data/recipes/deepseek41-ud-iq1s.recipe --imatrix <imatrix.gguf> -o deepseek41-ud-iq1s.rad
 #

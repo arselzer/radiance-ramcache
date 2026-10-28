@@ -16,6 +16,7 @@
 #include "diag/diag.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <map>
 #include <regex>
@@ -441,6 +442,7 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--placement", { "all_vram" } }, { "--checkpoint-interval", { "256" } },
         { "--prefill-span", { "2" } },
         { "--checkpoint-slots", { "4" } }, { "--checkpoint-policy", { "tip-only" } },
+        { "--prefix-resume", { "nearest" } },
         { "--num-speculative-tokens", { "2" } }, { "--spec-ngram", { "4" } },
         { "--spec-ngram-min", { "1" } }, { "--spec-ngram-max", { "6" } },
         { "--draft-window", { "fixed" } }, { "--draft-short-from", { "4" } },
@@ -472,6 +474,8 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--video-max-frame-tokens", { "70" } }, { "--image-tokens", { "280" } },
         { "--max-source-pixels", { "1000000" } },
         { "--expert-stats", { "/s/experts.json" } },
+        { "--expert-pin-top", { "0.2" } },
+        { "--draft-expert-placement", { "host" } },
         { "--kld-record", { "/r", "--kld-corpus", "/c.jsonl" } }, { "--kld-ref", { "/r" } },
         { "--kld-corpus", { "/c.jsonl", "--kld-record", "/r" } },
         { "--kld-out", { "/o.json", "--kld-ref", "/r" } },
@@ -867,6 +871,20 @@ TEST(expert_stats_is_off_until_it_names_a_file) {
     CHECK_EQ(row(c).value, std::string("/s/experts.json"));
     CHECK_EQ(row(c).source, std::string("command line"));
     CHECK(parse_fresh({ "--expert-stats" }) < 0);
+}
+
+/* A prefix hit resumes on the cold run's chunk grid unless the operator trades that for a shorter
+ * re-prefill; any other word is refused. */
+TEST(prefix_resume_is_exact_unless_nearest_is_asked_for) {
+    Config d;
+    CHECK_EQ(parse({}, &d), RAD_OK);
+    CHECK(d.prefix_exact);
+    Config c;
+    CHECK_EQ(parse({ "--prefix-resume", "nearest" }, &c), RAD_OK);
+    CHECK(!c.prefix_exact);
+    CHECK_EQ(parse({ "--prefix-resume", "exact" }, &c), RAD_OK);
+    CHECK(c.prefix_exact);
+    CHECK_EQ(parse({ "--prefix-resume", "deepest" }, &c), RAD_E_INVAL);
 }
 
 /* --checkpoint-slots is auto by default, resolved by the engine once a snapshot's size is known;
@@ -1419,10 +1437,35 @@ TEST(rope_scaling_takes_yarn_with_a_factor_above_one_or_none) {
 TEST(external_expert_profile_is_off_until_an_explicit_input_is_given) {
     Config c;
     CHECK(c.expert_profile.empty());
+    CHECK(!c.expert_profile_given);
     CHECK_OK(parse({ "--expert-profile", "decode-profile.json" }, &c));
     CHECK(c.expert_profile == "decode-profile.json");
+    CHECK(c.expert_profile_given);
     CHECK(c.expert_stats.empty());
     CHECK_EQ(parse_fresh({ "--expert-profile" }), RAD_E_INVAL);
+}
+
+TEST(expert_pin_top_requires_a_finite_fraction) {
+    Config defaults;
+    CHECK_OK(parse({}, &defaults));
+    CHECK_EQ(defaults.expert_pin_top, 0.0f);
+    CHECK(!defaults.expert_pin_top_given);
+    CHECK_EQ(defaults.draft_expert_placement, std::string("auto"));
+    CHECK(!defaults.draft_expert_placement_given);
+    for (const char* value : {"0", "0.25", "1"}) {
+        Config c;
+        CHECK_OK(parse({"--expert-pin-top", value}, &c));
+        CHECK(c.expert_pin_top_given);
+        CHECK(std::isfinite(c.expert_pin_top));
+        CHECK(c.expert_pin_top >= 0.0f && c.expert_pin_top <= 1.0f);
+    }
+    for (const char* value : {"nan", "NaN", "nan(payload)", "inf", "+inf", "-inf",
+                              "1e309", "-0.1", "1.1", "0.25x"}) {
+        Config c;
+        CHECK_EQ(parse({"--expert-pin-top", value}, &c), RAD_E_INVAL);
+        CHECK(!c.expert_pin_top_given);
+        CHECK_EQ(c.expert_pin_top, 0.0f);
+    }
 }
 
 RAD_TEST_MAIN()

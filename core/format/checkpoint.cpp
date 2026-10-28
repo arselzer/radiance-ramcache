@@ -2786,6 +2786,7 @@ int ckpt_resolve(Checkpoint& ck, const Program& prog, const std::string& name, b
                        " blocks of " + std::to_string(kind->block);
         } else {
             out->imported = true;
+            out->ggml_blocks = true;
             out->enc = lq::ggml::encoding_of(kind->type);
             out->why = "it is GGUF " + tn + ", which rad-convert imports block for block -- "
                        "serve the container it writes";

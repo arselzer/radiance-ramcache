@@ -39,6 +39,7 @@
 
 #include <cstring>
 #include <fstream>
+#include <numeric>
 #include <sstream>
 #include <cstdint>
 #include <cstdlib>
@@ -1587,7 +1588,8 @@ static int declare_ring_windows(KVManager& kv, const Program& prog) {
 int Engine::plan() {
     // The external DECODE vector owns its rows until every rank's Planner has consumed them.
     NativeDecodeProfile decode_profile;
-    if (!cfg_.expert_profile.empty()) {
+    const bool native_profile = meta_.arch_id && !std::strcmp(meta_.arch_id, "deepseek41");
+    if (!cfg_.expert_profile.empty() && native_profile) {
         if (!file_ || cfg_.tp != 4 || ranks_.size() != 4 || !meta_.arch_id ||
             std::strcmp(meta_.arch_id, "deepseek41") || meta_.n_layers != 40 ||
             meta_.n_embd != 5120 || meta_.n_expert != 384 || meta_.n_expert_used != 6) {
@@ -1611,6 +1613,10 @@ int Engine::plan() {
                  "source metadata %s; placement ranking only, no weight/precision change",
                  (unsigned long long)decode_profile.decode_tokens, decode_profile.rows.size(),
                  (unsigned long long)decode_profile.nonzero_rows, identity.metadata_sha256.c_str());
+    }
+    if (!cfg_.expert_profile.empty() && !native_profile) {
+        int32_t trunk = -1;
+        RAD_TRY(xs_profile_load(cfg_.expert_profile, &expert_profile_, &trunk));
     }
     /* The budget is resolved once, for every rank, before any rank allocates. vram_budget_resolve
      * folds the smallest capacity with the largest program so one split fits every card, and
@@ -1740,16 +1746,21 @@ int Engine::plan() {
             int64_t lazy = r->program.scratch_regions > 1 ? f.queue_bytes : 0;
             /* The KV tiers' copy staging, built by TierExec::device_init on the first copy out.
              * The cached groups are settled later, so every paged group is counted (an upper
-             * bound). */
+             * bound), each with the blocks an entry at the lcm of their block sizes holds
+             * (PrefixCache::entry_groups). */
             if (cfg_.prefix_cache_mib > 0) {
                 int64_t entry = 0, bs = 0;
                 int ng = 0;
                 for (size_t g = 0; g < r->program.kv_groups.size(); ++g) {
                     const KVGroupPlan* p = probe.plan((int32_t)g);
-                    if (!p || !p->paged() || p->bytes_per_block <= 0) continue;
-                    entry += p->bytes_per_block;
-                    bs = bs > 0 ? std::min<int64_t>(bs, p->block_size) : p->block_size;
-                    ++ng;
+                    if (!p || !p->paged() || p->bytes_per_block <= 0 || p->block_size <= 0) continue;
+                    bs = bs > 0 ? std::lcm<int64_t>(bs, p->block_size) : p->block_size;
+                }
+                for (size_t g = 0; g < r->program.kv_groups.size() && bs > 0; ++g) {
+                    const KVGroupPlan* p = probe.plan((int32_t)g);
+                    if (!p || !p->paged() || p->bytes_per_block <= 0 || p->block_size <= 0) continue;
+                    entry += p->bytes_per_block * (bs / p->block_size);
+                    ng += (int)(bs / p->block_size);
                 }
                 const int64_t tier = TierExec::device_bytes(entry, ng, TierExec::sizes(entry, ctx, bs));
                 f.staging += tier;
@@ -1783,6 +1794,39 @@ int Engine::plan() {
         for (VramFacts& f : facts) f.held_out = cvec_bytes;
         RAD_TRY(resolve_table_placement(facts, emb_bytes, wfs, kv_floor, ngram_bytes,
                                         ngram_device, ngram_host, ck_store + host_arenas));
+        /* --draft-expert-placement host: the drafter's experts are pinned in the host pool before
+         * the strategy runs, so they are not part of the elastic plane the card must hold and the
+         * pool must have room for them on top of the trunk's spill. Growing the pool here, before
+         * the split, is what lets a drafter fit beside a trunk that already fills the card. */
+        if (cfg_.draft_expert_placement == "host") {
+            const int64_t MiB = (int64_t)1 << 20;
+            int64_t draft_max = 0;
+            for (const WeightFootprint& wf : wfs) draft_max = std::max(draft_max, wf.draft_experts);
+            if (draft_max == 0 && cfg_.draft_expert_placement_given) {
+                RAD_ERR("--draft-expert-placement host: this model declares no draft head with "
+                        "routed experts");
+                return RAD_E_INVAL;
+            }
+            if (draft_max > 0) {
+                /* The pool must hold the drafter on top of the trunk's own spill, so it grows by
+                 * the drafter's bytes and the floor is recomputed against that larger room with
+                 * the drafter taken out of the plane the card places. */
+                const int64_t add = (align_up(draft_max, MiB) + MiB - 1) / MiB;
+                cfg_.host_pool_mib += add;
+                for (size_t i = 0; i < facts.size(); ++i) {
+                    int64_t room = cfg_.host_pool_mib * MiB;
+                    if (cfg_.weights_disk_tier)
+                        room -= file_stage_reserve(wfs[i].layer_unit_max, wfs[i].routed);
+                    facts[i].expert_floor = expert_vram_floor_draft_hosted(
+                        wfs[i], std::max<int64_t>(room - align_up(wfs[i].draft_experts, MiB), 0));
+                    facts[i].experts = std::max<int64_t>(wfs[i].experts - wfs[i].draft_experts, 0);
+                }
+                RAD_INFO("placement: --draft-expert-placement host pins %s of drafter experts a "
+                         "rank in the host pool; --host-pool-mib grows by %lld to hold them, and "
+                         "the card places only the trunk's experts",
+                         humanb(draft_max).c_str(), (long long)add);
+            }
+        }
         if (cfg_.expert_ram_cache_total_mib > 0) {
             /* Always check the joint future HOST allocation, even with all optional RAM tables
              * and checkpoint storage off. Conditional table checks alone can skip every memory
@@ -1954,6 +1998,10 @@ int Engine::plan() {
             in.profile = file_->profile();
             in.n_profile = (int64_t)file_->header().prof_count;
         }
+        if (!expert_profile_.empty()) {
+            in.profile = expert_profile_.data();
+            in.n_profile = (int64_t)expert_profile_.size();
+        }
         // DeepSeek EP movement groups are local; container/profile expert keys are global.
         // The tested adapter resolves every GU/DN contributor through WeightInfo.source.
         if (in.n_profile && file_ && meta_.arch_id && !std::strcmp(meta_.arch_id, "deepseek41")) {
@@ -2059,7 +2107,8 @@ int Engine::plan() {
                        humanb(r->plan.totals.bytes[(int)Tier::Mapped]).c_str()),
                    r->plan.forced_host_used > 0
                        ? fmt("the host pool holds the %s the placement flags put there (the token "
-                             "embedding, the encoder towers) beside the weights placed in it",
+                             "embedding, the encoder towers, the drafter's experts) beside the "
+                             "weights placed in it",
                              humanb(r->plan.forced_host_used).c_str())
                        : std::string());
         }
@@ -3440,8 +3489,11 @@ int Engine::configure_kv() {
             shard_off[i] = slot;
             slot += ranks_[i]->kv.checkpoint_bytes();
         }
-        /* A slot holds linear state or a trunk's window, never both (KVGroupPlan::win_snap). */
-        const char* what = ranks_[0]->kv.has_window_snapshot() ? "sliding-window" : "linear-state";
+        /* A slot holds linear state, a trunk's window (KVGroupPlan::win_snap), or both. */
+        bool linear = false;
+        for (const KVGroupPlan& p : ranks_[0]->kv.plans()) linear = linear || p.stateful();
+        const char* what = !ranks_[0]->kv.has_window_snapshot() ? "linear-state"
+                           : linear ? "linear-state + sliding-window" : "sliding-window";
         const bool sized_auto = cfg_.checkpoint_slots < 0;
         if (sized_auto) RAD_TRY(size_checkpoint_store(slot, what));
         const int64_t n = cfg_.checkpoint_slots > 0 ? cfg_.checkpoint_slots : 0;
@@ -3491,7 +3543,9 @@ int Engine::configure_kv() {
      * sessions view reads. The flags gate only the mover, below. */
     {
         const bool tier_asked = cfg_.prefix_cache_mib > 0;
-        const std::vector<int32_t>& cg = ranks_[0]->prefix.cached_groups();
+        /* An entry's blocks, one group per block: a cached group whose blocks are shorter than
+         * the entry appears once for each of its blocks (PrefixCache::entry_groups). */
+        const std::vector<int32_t>& cg = ranks_[0]->prefix.entry_groups();
         /* One slot holds the whole engine's entry: the groups every rank holds alike
          * (rad_kv_group_replicated) once, at the front, then every rank's own shard in its own
          * window. Shards can differ or be empty (uneven heads, rad_kv_group_zero). The layout is

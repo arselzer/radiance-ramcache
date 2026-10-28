@@ -939,6 +939,14 @@ struct Config {
      * store is opened (checkpoint_slots_auto in core/mem/prefix.h). */
     int64_t checkpoint_slots = -1;
     bool    prefix_cache = true;
+    /* --prefix-resume exact|nearest. Exact (the default) resumes a prefix hit only on the grid an
+     * idle server's cold prefill chunks the same prompt on (ChunkGeometry::grid), and takes a
+     * prompt's tail snapshot where its last chunk starts: the hit recomputes the cold run's own
+     * chunks, so its output is the cold run's bit for bit, where a kernel rounds a row differently
+     * at another chunk length. Nearest resumes at the deepest snapshot or block, a prompt's tail
+     * snapshot at its last quantum boundary: up to a chunk less re-prefilled a turn, and a hit that
+     * can differ from a cold run in the last bits (a near-tie in greedy text). */
+    bool    prefix_exact = true;
     /* geometric-backoff | tip-only | keep-all. §19.1 records the default as unmeasured;
      * core/mem/prefix.h ships the two extremes so they can be compared. */
     std::string checkpoint_policy = "geometric-backoff";
@@ -1129,8 +1137,22 @@ struct Config {
     /* --expert-stats FILE: count the routed experts every layer selects, by step kind, and write
      * the counts to FILE as JSON every 30 s and at shutdown (place/xstats.h). Empty is off. */
     std::string expert_stats;
-    /* --expert-profile FILE: experimental decode-only native DS4.1 EP4 startup ranking. */
+    /* --expert-profile FILE: a radiance-expert-stats JSON (place/xstats.h) whose `decode` counts
+     * rank the expert plane, instead of the container's activation profile. Empty serves the
+     * container's profile. The native DS4.1 EP4 path additionally checks its sealed DECODE
+     * profile against the immutable source identity before localizing the ranking. */
     std::string expert_profile;
+    bool    expert_profile_given = false;
+    /* --expert-pin-top F: pin the hottest F of the routed experts (0 < F <= 1) by the profile's
+     * share, keeping them resident: heat never demotes them. 0 is off. */
+    float   expert_pin_top = 0.0f;
+    bool    expert_pin_top_given = false;
+    /* --draft-expert-placement auto|host: a draft head's (MTP/DSpark) routed experts are pinned in
+     * the host pool before any strategy runs, streamed in place like a pooled expert. `auto` (the
+     * default) leaves them to the strategy. `host` is what lets a drafter's experts fit beside a
+     * trunk that already fills the card. */
+    std::string draft_expert_placement = "auto";
+    bool    draft_expert_placement_given = false;
     /* --live: the live view (spec §16). Off by default like everything else in that section. */
     bool    live_view = false;
 

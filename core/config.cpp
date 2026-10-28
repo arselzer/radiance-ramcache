@@ -323,6 +323,8 @@ static const Flag g_flags[] = {
       "                              implementation is an oracle and a last resort, and falling back\n"
       "                              to it is orders of magnitude of speed with nothing to say so." },
     { "--profile-ops",        nullptr,  "per-op device timing (see the caveat it prints)" },
+    { "--expert-profile",     "FILE",   "experimental native DeepSeek4.1 EP4 startup placement from a sealed\n"
+    "                                    DECODE expert-stats JSON profile; does not change model weights" },
     { "--expert-stats",       "FILE",   "count the routed experts every layer selects, apart for prefill, decode,\n"
     "                                    mixed steps and draft-head passes, and write the counts to FILE as\n"
     "                                    JSON every 30 s and at shutdown. From the routing histograms the core\n"
@@ -970,6 +972,7 @@ int config_parse(int argc, char** argv, Config* c) {
         else if (S("--debug-accept-reference-kernels")) c->accept_reference_kernels = true;
         else if (S("--profile-ops"))           c->profile_ops = true;
         else if (S("--expert-stats"))          { if (!(v = need(i))) return RAD_E_INVAL; c->expert_stats = v; }
+        else if (S("--expert-profile"))        { if (!(v = need(i))) return RAD_E_INVAL; c->expert_profile = v; }
         else if (S("--live"))                  c->live_view = true;
         else {
             RAD_ERR("unknown option '%s'", a.c_str());
@@ -1320,6 +1323,7 @@ const ShowRow kShow[] = {
     { "--debug-accept-reference-kernels", [](const Config& c) { return onoff(c.accept_reference_kernels); } },
     { "--profile-ops",        [](const Config& c) { return onoff(c.profile_ops); } },
     { "--expert-stats",       [](const Config& c) { return or_none(c.expert_stats, "off"); } },
+    { "--expert-profile",     [](const Config& c) { return or_none(c.expert_profile, "off"); } },
     { "--live",               [](const Config& c) { return onoff(c.live_view); } },
     { "-v",                   [](const Config& c) { return onoff(c.given.count("-v") > 0); } },
     { "-vv",                  [](const Config& c) { return onoff(c.given.count("-vv") > 0); } },

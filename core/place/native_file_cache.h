@@ -1,10 +1,14 @@
 /* Native file-weight cache. No cache pointer escapes copy(): hits complete an ordinary CPU
- * copy into the existing pinned Mover window while locked, before any subsequent DMA. */
+ * copy into the existing pinned Mover window before any subsequent DMA. Optional concurrent
+ * hits retain a shared payload lifetime lock while metadata locking stays short. */
 #pragma once
+#include "native_file_cache_policy.h"
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 
 namespace rad {
 
@@ -19,6 +23,9 @@ public:
         uint64_t map_failures = 0, unmap_failures = 0;
         int64_t mapped_bytes = 0, peak_mapped_bytes = 0, page_bytes = 0;
         bool mmap_reuse_enabled = false;
+        bool concurrent_copy_enabled = false;
+        uint64_t concurrent_copies = 0;
+        size_t active_copy_leases = 0, peak_copy_leases = 0;
     };
 
     ~NativeFileCache();
@@ -27,11 +34,12 @@ public:
     int configure(int64_t budget_bytes, size_t weight_count);
     /* An unmap failure is an error: its owner and charge remain, allowing a later retry. */
     int clear();
-    int copy(size_t weight, int64_t bytes, void* dst, int64_t dst_cap, bool* hit);
+    int copy(size_t weight, int64_t bytes, void* dst, int64_t dst_cap, bool* hit, NativeFileCacheReadPolicy policy = NativeFileCacheReadPolicy::Normal);
     int insert(size_t weight, const void* src, int64_t bytes);
     Stats stats() const;
 
 private:
+    friend struct NativeFileCacheConcurrentTest; // private HOST lifetime/overlap seam
     friend struct NativeFileCacheMmapTest; // private class-only allocation-failure seam
     using Map = uint8_t* (*)(void*, size_t);
     using Unmap = int (*)(void*, uint8_t*, size_t);
@@ -57,6 +65,7 @@ private:
         size_t previous = none, next = none;
         uint8_t* payload() const { return mapping.ptr ? mapping.ptr : data.get(); }
     };
+    int copy_shared(size_t weight, int64_t bytes, void* dst, bool* hit, NativeFileCacheReadPolicy policy);
     int reset_locked();
     void unlink_locked(size_t weight);
     void touch_locked(size_t weight);
@@ -64,7 +73,10 @@ private:
     void account_eviction_locked(size_t weight);
     int insert_mapped_locked(size_t weight, const void* src, int64_t bytes);
 
+    // Writers always acquire payload lifetime before metadata. stats() only takes metadata.
+    mutable std::shared_mutex payload_mutex_;
     mutable std::mutex mutex_;
+    std::atomic<bool> concurrent_copy_{false};
     std::unique_ptr<Entry[]> entries_;
     size_t count_ = 0, first_ = none, last_ = none;
     Stats stats_;
@@ -73,6 +85,9 @@ private:
     void* mapping_context_ = nullptr;
     int test_mode_ = -1; // private fixture only; -1 is normal environment selection
     int64_t test_page_bytes_ = 0;
+    int test_concurrent_mode_ = -1; // private fixture only; -1 selects exact environment value
+    void (*test_copy_lease_)(void*) noexcept = nullptr;
+    void* test_copy_context_ = nullptr;
 };
 
 } // namespace rad

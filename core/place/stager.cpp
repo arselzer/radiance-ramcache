@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <cstdlib>
 
 namespace rad {
 
@@ -471,6 +472,8 @@ int FileStager::init(const Program& prog, const Plan& plan, Mover* mover, Counts
 /* Arms for every pass: a file-tier unit has no other address, so an unarmed pass would reach its
  * first routed layer with null expert pointers. */
 bool FileStager::begin_pass(const RadBatch* b) {
+    pass_cache_policy_ = native_file_cache_prefill_policy(
+        std::getenv(kNativeCachePrefillReadOnlyEnv), b, true);
     armed_ = enabled() && b;
     if (!armed_) return false;
     holds_[0] = holds_[1] = -1;
@@ -493,9 +496,12 @@ bool FileStager::will_issue(int32_t li) const {
 int FileStager::start(int32_t li) {
     const int b = li & 1;
     if (holds_[b] >= 0) return RAD_E_STATE;     /* released before the next read, by construction */
+    const int32_t layer = layers_[(size_t)li].layer;
+    const auto cache_policy = layer >= 0 && layer < 40 && (size_t)li < ep_layer_eligible_.size() &&
+        ep_layer_eligible_[(size_t)li] ? pass_cache_policy_ : NativeFileCacheReadPolicy::Normal;
     const int rc = mover_->stage_file_units(layers_[(size_t)li].units, buf_[b], cap_,
                                             free_rec_[b] ? free_[b] : nullptr, done_[b],
-                                            &staged_[b]);
+                                            &staged_[b], cache_policy);
     if (rc < 0) return rc;
     partial_[b] = false;
     pending_[b] = !staged_[b].empty();

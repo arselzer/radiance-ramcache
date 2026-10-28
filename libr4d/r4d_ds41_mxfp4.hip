@@ -34,6 +34,7 @@
 #include "r4d_emit.h"
 #include "r4d_launch.h"
 #include "r4d_plugin.h"
+#include "r4d_ds41_live_tail_policy.h"
 
 #include <cstdint>
 #include <cstdlib>
@@ -214,6 +215,8 @@ struct MxGemvArgs {
     int ipe;                             /* work items an expert (GEMM: in all) */
     int n_expert, top_k, a_sorted, AR, x_al;
     int live_off, x_off;                 /* LDS byte offsets of the live list and the rows */
+    int live_end;
+    unsigned long long* probe;
 };
 
 /* A staged row: its values with 4 floats of pad after every 32, so the lanes' blocks read different banks. */
@@ -314,7 +317,7 @@ __device__ __forceinline__ void mx_row(const MxGemvArgs& A, const uint8_t* wb, c
     }
 }
 
-template <int T, int RPW, bool MOE>
+template <int T, int RPW, bool MOE, bool PROBE=false>
 __global__ __launch_bounds__(kMxThreads) void mx_gemv_kernel(MxGemvArgs A) {
     using Q = Mx<T>;
     R4D_DYN_LDS(r4d_u32x4, mx_lds);
@@ -337,7 +340,7 @@ __global__ __launch_bounds__(kMxThreads) void mx_gemv_kernel(MxGemvArgs A) {
             for (int e0 = 0; e0 < A.n_expert; e0 += 32) {
                 const int e = e0 + lane;
                 int s = 0, t = 0;
-                if (e < A.n_expert) mx_range(A.off, e, A.n_expert, A.M, &s, &t);
+                if (e < A.n_expert) { if(A.live_end)ds41_live_tail::range(A.off,e,A.M,&s,&t);else mx_range(A.off, e, A.n_expert, A.M, &s, &t); }
                 const bool nz = e < A.n_expert && t > s;
                 const uint32_t bal = __builtin_amdgcn_ballot_w32(nz);
                 if (nz) live[cnt + __builtin_popcount(bal & ((1u << lane) - 1u))] = e;
@@ -350,6 +353,7 @@ __global__ __launch_bounds__(kMxThreads) void mx_gemv_kernel(MxGemvArgs A) {
     } else {
         __syncthreads();
     }
+    bool did_work=false;unsigned long long owned_rows=0;
     int cur_e = -1, cur_p = -1;                       /* the rows the LDS buffer holds whole */
     for (int it = (int)blockIdx.x; it < n_items; it += (int)gridDim.x) {
         int e = 0, ri = it, rs = 0, re = A.M;
@@ -357,9 +361,10 @@ __global__ __launch_bounds__(kMxThreads) void mx_gemv_kernel(MxGemvArgs A) {
         if constexpr (MOE) {
             e = live[it / A.ipe];
             ri = it - (it / A.ipe) * A.ipe;
-            mx_range(A.off, e, A.n_expert, A.M, &rs, &re);
+            if(A.live_end)ds41_live_tail::range(A.off,e,A.M,&rs,&re);else mx_range(A.off, e, A.n_expert, A.M, &rs, &re);
             wb = A.wtab ? A.wtab[e] : A.w + (long long)e * A.w_es;
         }
+        did_work=true;if constexpr(PROBE)if(ri==0)owned_rows+=(unsigned long long)(re-rs);
         const int rg0 = ri * A.rgpi, rg1 = min(rg0 + A.rgpi, nrg);
         for (int p0 = rs; p0 < re; p0 += A.XM) {
             const int mc = min(A.XM, re - p0);
@@ -415,6 +420,7 @@ __global__ __launch_bounds__(kMxThreads) void mx_gemv_kernel(MxGemvArgs A) {
             }
         }
     }
+    if constexpr(PROBE){__syncthreads();if(tid==0){atomicAdd(A.probe+(did_work?1:4),1ull);atomicAdd(A.probe,owned_rows);}}
 }
 
 /* ================================================================== tiled (prefill) */
@@ -432,11 +438,13 @@ struct MxTiledArgs {
     const int32_t* off;
     int M, N, K;                         /* MoE: M is T, the output rows */
     int n_expert, top_k, a_sorted, AR, x_al, tab_bytes;
+    int live_end;
+    unsigned long long* probe;
 };
 
 /* BM activation rows x 128 weight rows a block. BM 128: 8 x 8 outputs a thread; BM 32: 4 x 4. Each output is the
  * same chain at either height (slabs in order, the slab's 32 values in order), so the bits do not depend on BM. */
-template <int T, int BM, bool MOE>
+template <int T, int BM, bool MOE, bool PROBE=false>
 __global__ __launch_bounds__(kMxThreads) void mx_tiled_kernel(MxTiledArgs A) {
     using Q = Mx<T>;
     static_assert(BM == 32 || BM == 128, "a tile is 32 or 128 rows");
@@ -462,7 +470,7 @@ __global__ __launch_bounds__(kMxThreads) void mx_tiled_kernel(MxTiledArgs A) {
             for (int e0 = 0; e0 < A.n_expert; e0 += 32) {
                 const int ee = e0 + lane;
                 int s = 0, t = 0;
-                if (ee < A.n_expert) mx_range(A.off, ee, A.n_expert, A.M, &s, &t);
+                if (ee < A.n_expert) { if(A.live_end)ds41_live_tail::range(A.off,ee,A.M,&s,&t);else mx_range(A.off, ee, A.n_expert, A.M, &s, &t); }
                 const uint32_t tiles = (uint32_t)((t - s + BM - 1) / BM);
                 const uint32_t inc = r4d_wave_prefix_u32(tiles, lane);
                 const uint32_t tot = (uint32_t)__builtin_amdgcn_readlane((int)inc, 31);
@@ -479,7 +487,7 @@ __global__ __launch_bounds__(kMxThreads) void mx_tiled_kernel(MxTiledArgs A) {
         }
         __syncthreads();
         e = s_e;
-        if (e < 0) return;
+        if (e < 0) {if constexpr(PROBE)if(tid==0)atomicAdd(A.probe+4,1ull);return;}
         r0 = s_r0;
         r1 = s_r1;
     } else {
@@ -586,6 +594,15 @@ __global__ __launch_bounds__(kMxThreads) void mx_tiled_kernel(MxTiledArgs A) {
             if (n < A.N) mx_put(yr + n, live_row ? acc[i][j] : 0.0f);
         }
     }
+    if constexpr(PROBE){__syncthreads();if(tid==0){atomicAdd(A.probe+1,1ull);if(blockIdx.y==0)atomicAdd(A.probe,(unsigned long long)(r1-r0));}}
+}
+
+struct MxTailArgs{uint16_t*y;long long y_ld;const int32_t*off;int ne,total,N;unsigned long long*probe;};
+template<bool PROBE> __global__ void mx_zero_tail_kernel(MxTailArgs a){
+ const int row=(int)blockIdx.x,first=ds41_live_tail::end(a.off,a.ne,a.total);
+ if(row<first||row>=a.total)return; // Block-uniform; no weight-bearing argument exists.
+ for(int n=(int)threadIdx.x;n<a.N;n+=(int)blockDim.x)a.y[(long long)row*a.y_ld+n]=0;
+ if constexpr(PROBE){__syncthreads();if(threadIdx.x==0){atomicAdd(a.probe+2,1ull);atomicAdd(a.probe+3,(unsigned long long)a.N);}}
 }
 
 /* ================================================================== host side */
@@ -641,6 +658,22 @@ int mx_launch_gemv(RadStream s, int ty, int rpw, bool moe, const MxGemvArgs& A, 
 int mx_launch_tiled(RadStream s, int ty, int bm, bool moe, const MxTiledArgs& A, dim3 grid, unsigned lds) {
     return ty == MX_FP4 ? mx_launch_tiled_t<MX_FP4>(s, bm, moe, A, grid, lds)
                         : mx_launch_tiled_t<MX_F32>(s, bm, moe, A, grid, lds);
+}
+
+bool mx_tail_opt_in(){static const bool on=ds41_live_tail::opt_in(std::getenv("RADIANCE_EXPERIMENTAL_DS41_LIVE_TAIL"));return on;}
+int mx_tail_zero(RadStream s,uint16_t*y,long long ld,const int32_t*off,int ne,int total,int N,unsigned long long*p){
+ MxTailArgs a{y,ld,off,ne,total,N,p};
+ return p?R4D_EMIT(s,(mx_zero_tail_kernel<true>),dim3((unsigned)total),dim3(kMxThreads),0,a):R4D_EMIT(s,(mx_zero_tail_kernel<false>),dim3((unsigned)total),dim3(kMxThreads),0,a);
+}
+int mx_tail_gemv(RadStream s,int rpw,const MxGemvArgs&a,unsigned grid,unsigned lds){
+ if(!a.probe)return mx_launch_gemv(s,MX_FP4,rpw,true,a,grid,lds);
+ if(rpw==2)return R4D_EMIT(s,(mx_gemv_kernel<MX_FP4,2,true,true>),dim3(grid),dim3(kMxThreads),lds,a);
+ return R4D_EMIT(s,(mx_gemv_kernel<MX_FP4,1,true,true>),dim3(grid),dim3(kMxThreads),lds,a);
+}
+int mx_tail_tiled(RadStream s,int bm,const MxTiledArgs&a,dim3 grid,unsigned lds){
+ if(!a.probe)return mx_launch_tiled(s,MX_FP4,bm,true,a,grid,lds);
+ if(bm==32)return R4D_EMIT(s,(mx_tiled_kernel<MX_FP4,32,true,true>),grid,dim3(kMxThreads),lds,a);
+ return R4D_EMIT(s,(mx_tiled_kernel<MX_FP4,128,true,true>),grid,dim3(kMxThreads),lds,a);
 }
 
 /* The `type` parameter must name MXFP4. */
@@ -710,7 +743,7 @@ int mx_gemm(const RadArgs* a, RadStream s, bool gemv) {
 }
 
 /* moe_gemm_ggml type=mxfp4: y[i] = a[row(i)] . w[e(i)]^T over the expert-sorted rows. */
-int mx_moe(const RadArgs* a, RadStream s, bool gemv) {
+int mx_moe(const RadArgs* a, RadStream s, bool gemv,bool baseline=false,unsigned long long* probe=nullptr) {
     if (!a || a->n_t < 5) return R4D_NO(RAD_E_INVAL);
     const RadTensor *A_ = r4d_opt(a, 0), *W = r4d_opt(a, 1), *so = r4d_opt(a, 2), *of = r4d_opt(a, 3),
                     *Y = r4d_opt(a, 4);
@@ -753,6 +786,8 @@ int mx_moe(const RadArgs* a, RadStream s, bool gemv) {
     const long long x_ld = AR > 1 ? A_->stride[0] : K, y_ld = T > 1 ? Y->stride[0] : N;
     const long long tb = mx_r16(mx_tab_bytes(ty));
     const long long tokens = a_sorted ? (T + top_k - 1) / top_k : AR;
+    const bool tail=!baseline&&ty==MX_FP4&&ds41_live_tail::geometry(tokens,N,K,ne,top_k,T,AR,a_sorted)&&mx_tail_opt_in();
+    if(probe&&!tail)return R4D_NO(RAD_E_UNSUPPORTED); // Refuse before any enqueue.
     const long long L = ne < T ? ne : T;       /* experts that can have rows */
     if (gemv && tokens <= 16) {
         MxGemvArgs A{};
@@ -775,13 +810,17 @@ int mx_moe(const RadArgs* a, RadStream s, bool gemv) {
         const long long ipe = (nrg + rgpi - 1) / rgpi;
         A.rgpi = (int)rgpi; A.ipe = (int)ipe;
         A.n_expert = (int)ne; A.top_k = (int)top_k; A.a_sorted = a_sorted ? 1 : 0; A.AR = (int)AR;
+        A.live_end=tail?1:0;A.probe=probe;
         A.x_al = mx_al16(A_->data, x_ld) ? 1 : 0;
         A.live_off = (int)tb;
         A.x_off = (int)(tb + mx_r16(ne * 4));
         const long long lds = A.x_off + xbuf * 4;
         const long long items = L * ipe;
         const unsigned grid = (unsigned)(items < 256 ? items : 256);
-        return mx_launch_gemv(s, ty, rpw, true, A, grid, (unsigned)lds);
+        if(!tail)return mx_launch_gemv(s,ty,rpw,true,A,grid,(unsigned)lds);
+        const int rc=mx_tail_gemv(s,rpw,A,grid,(unsigned)lds);if(rc!=RAD_OK)return rc;
+        // No fallback or replay after a submitted prefix; existing stream owner retires both.
+        return mx_tail_zero(s,A.y,A.y_ld,A.off,A.n_expert,A.M,A.N,probe);
     }
     MxTiledArgs A{};
     A.x = (const uint16_t*)A_->data; A.x_ld = x_ld;
@@ -792,14 +831,16 @@ int mx_moe(const RadArgs* a, RadStream s, bool gemv) {
     A.sorted = (const int32_t*)so->data; A.off = (const int32_t*)of->data;
     A.M = (int)T; A.N = (int)N; A.K = (int)K;
     A.n_expert = (int)ne; A.top_k = (int)top_k; A.a_sorted = a_sorted ? 1 : 0; A.AR = (int)AR;
+    A.live_end=tail?1:0;A.probe=probe;
     A.x_al = mx_al16(A_->data, x_ld) ? 1 : 0;
     A.tab_bytes = (int)tb;
     /* 32-row tiles while the experts' runs average under 64 rows (prefill over many experts). */
     const int bm = T < 64 * L ? 32 : 128;
     const long long gx = (T + bm - 1) / bm + L, gy = (N + kTN - 1) / kTN;
     if (gy > 65535 || gx > 0x7fffffffLL) return R4D_NO(RAD_E_SHAPE);
-    return mx_launch_tiled(s, ty, bm, true, A, dim3((unsigned)gx, (unsigned)gy),
-                           (unsigned)(tb + 32 * (kTP + bm + 4) * 4));
+    if(!tail)return mx_launch_tiled(s,ty,bm,true,A,dim3((unsigned)gx,(unsigned)gy),(unsigned)(tb+32*(kTP+bm+4)*4));
+    const int rc=mx_tail_tiled(s,bm,A,dim3((unsigned)gx,(unsigned)gy),(unsigned)(tb+32*(kTP+bm+4)*4));if(rc!=RAD_OK)return rc;
+    return mx_tail_zero(s,A.y,A.y_ld,A.off,A.n_expert,A.M,A.N,probe);
 }
 
 }  // namespace
@@ -808,3 +849,9 @@ extern "C" int r4d_rad_gemm_nt_mxfp4_gemv(const RadArgs* a, RadStream s) { retur
 extern "C" int r4d_rad_gemm_nt_mxfp4_tiled(const RadArgs* a, RadStream s) { return mx_gemm(a, s, false); }
 extern "C" int r4d_rad_moe_gemm_mxfp4_gemv(const RadArgs* a, RadStream s) { return mx_moe(a, s, true); }
 extern "C" int r4d_rad_moe_gemm_mxfp4_tiled(const RadArgs* a, RadStream s) { return mx_moe(a, s, false); }
+
+// Checker-only exports do not alter registered rows/public ABI.
+extern "C" int r4d_rad_moe_gemm_mxfp4_live_tail_baseline(const RadArgs*a,RadStream s,int gemv){return mx_moe(a,s,gemv!=0,true);}
+extern "C" int r4d_rad_moe_gemm_mxfp4_live_tail_probe(const RadArgs*a,RadStream s,int gemv,unsigned long long*p){
+ if(!p||((uintptr_t)p&7u))return RAD_E_INVAL;return mx_moe(a,s,gemv!=0,false,p);
+}

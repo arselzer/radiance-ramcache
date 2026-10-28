@@ -46,15 +46,18 @@ int NativeFileCache::reset_locked() {
     count_ = 0;
     first_ = last_ = none;
     stats_ = {};
+    concurrent_copy_.store(false, std::memory_order_release);
     return RAD_OK;
 }
 
 int NativeFileCache::clear() {
+    std::unique_lock<std::shared_mutex> lifetime(payload_mutex_);
     std::lock_guard<std::mutex> lock(mutex_);
     return reset_locked();
 }
 
 int NativeFileCache::configure(int64_t budget_bytes, size_t weight_count) {
+    std::unique_lock<std::shared_mutex> lifetime(payload_mutex_);
     std::lock_guard<std::mutex> lock(mutex_);
     const int cleared = reset_locked();
     if (cleared != RAD_OK) return cleared;
@@ -79,6 +82,11 @@ int NativeFileCache::configure(int64_t budget_bytes, size_t weight_count) {
     stats_.peak_charge = metadata;
     stats_.mmap_reuse_enabled = mapped;
     stats_.page_bytes = page;
+    const char* parallel = std::getenv("RADIANCE_EXPERIMENTAL_NATIVE_CACHE_CONCURRENT_COPY");
+    const bool concurrent = test_concurrent_mode_ >= 0 ? test_concurrent_mode_ == 1
+        : parallel && std::strcmp(parallel, "1") == 0;
+    stats_.concurrent_copy_enabled = concurrent;
+    concurrent_copy_.store(concurrent, std::memory_order_release);
     return RAD_OK;
 }
 
@@ -124,9 +132,13 @@ int NativeFileCache::evict_locked(size_t weight) {
     return RAD_OK;
 }
 
-int NativeFileCache::copy(size_t weight, int64_t bytes, void* dst, int64_t dst_cap, bool* hit) {
-    if (!hit || !dst || bytes <= 0 || dst_cap < bytes) return RAD_E_INVAL;
+int NativeFileCache::copy(size_t weight, int64_t bytes, void* dst, int64_t dst_cap, bool* hit,
+                          NativeFileCacheReadPolicy policy) {
+    if (!hit || !dst || bytes <= 0 || dst_cap < bytes || !native_file_cache_policy_valid(policy))
+        return RAD_E_INVAL;
     *hit = false;
+    if (concurrent_copy_.load(std::memory_order_acquire))
+        return copy_shared(weight, bytes, dst, hit, policy);
     std::lock_guard<std::mutex> lock(mutex_);
     if (!entries_) return RAD_OK;
     if (weight >= count_) return RAD_E_INVAL;
@@ -138,9 +150,42 @@ int NativeFileCache::copy(size_t weight, int64_t bytes, void* dst, int64_t dst_c
     }
     if (e.bytes != bytes) return RAD_E_STATE; // Program/native layout must not change in place.
     std::memcpy(dst, e.payload(), (size_t)bytes);
-    touch_locked(weight);
+    if (policy == NativeFileCacheReadPolicy::Normal) touch_locked(weight);
     ++stats_.hits;
     stats_.hit_bytes += (uint64_t)bytes;
+    *hit = true;
+    return RAD_OK;
+}
+
+
+int NativeFileCache::copy_shared(size_t weight, int64_t bytes, void* dst, bool* hit,
+                                 NativeFileCacheReadPolicy policy) {
+    // A writer cannot evict, reuse, replace or clear any payload until this lease ends.
+    // Metadata is released during memcpy, allowing disjoint destination copies to overlap.
+    std::shared_lock<std::shared_mutex> lifetime(payload_mutex_);
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (!entries_) return RAD_OK;
+    if (weight >= count_) return RAD_E_INVAL;
+    Entry& e = entries_[weight];
+    if (!e.payload()) {
+        ++stats_.misses;
+        stats_.miss_bytes += uint64_t(bytes);
+        return RAD_OK;
+    }
+    if (e.bytes != bytes) return RAD_E_STATE;
+    const uint8_t* source = e.payload();
+    ++stats_.active_copy_leases;
+    stats_.peak_copy_leases = std::max(stats_.peak_copy_leases, stats_.active_copy_leases);
+    lock.unlock();
+    if (test_copy_lease_) test_copy_lease_(test_copy_context_);
+    std::memcpy(dst, source, size_t(bytes));
+    lock.lock();
+    --stats_.active_copy_leases;
+    ++stats_.concurrent_copies;
+    // Completion order defines LRU ordering among concurrent hits. No pointer escapes.
+    if (policy == NativeFileCacheReadPolicy::Normal) touch_locked(weight);
+    ++stats_.hits;
+    stats_.hit_bytes += uint64_t(bytes);
     *hit = true;
     return RAD_OK;
 }
@@ -195,6 +240,7 @@ int NativeFileCache::insert_mapped_locked(size_t weight, const void* src, int64_
 
 int NativeFileCache::insert(size_t weight, const void* src, int64_t bytes) {
     if (!src || bytes <= 0 || bytes > INT64_MAX - 127) return RAD_E_INVAL;
+    std::unique_lock<std::shared_mutex> lifetime(payload_mutex_);
     std::lock_guard<std::mutex> lock(mutex_);
     if (!entries_) return RAD_OK;
     if (weight >= count_) return RAD_E_INVAL;

@@ -431,6 +431,8 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--state-cache-dtype", { "f16" } }, { "--attn-prefill-fp8", { "both" } },
         { "--kv-resident", { "65536" } },
         { "--host-pool-mib", { "1024" } }, { "--host-headroom-mib", { "2048" } },
+        { "--expert-ram-cache-total-mib", { "64", "--weights-disk-tier" } },
+        { "--expert-profile", { "decode-profile.json" } },
         { "--embedding-placement", { "vram" } },
         { "--vision-tower-placement", { "ram" } }, { "--ngram-placement", { "disk" } },
         { "--row-prefetch", { "off" } }, { "--mapped-rewarm", { "off" } },
@@ -1412,6 +1414,15 @@ TEST(rope_scaling_takes_yarn_with_a_factor_above_one_or_none) {
     Config d;
     CHECK_EQ(parse({}, &d), RAD_OK);
     CHECK(d.rope_scaling.empty());
+}
+
+TEST(external_expert_profile_is_off_until_an_explicit_input_is_given) {
+    Config c;
+    CHECK(c.expert_profile.empty());
+    CHECK_OK(parse({ "--expert-profile", "decode-profile.json" }, &c));
+    CHECK(c.expert_profile == "decode-profile.json");
+    CHECK(c.expert_stats.empty());
+    CHECK_EQ(parse_fresh({ "--expert-profile" }), RAD_E_INVAL);
 }
 
 RAD_TEST_MAIN()

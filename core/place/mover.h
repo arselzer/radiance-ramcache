@@ -35,6 +35,9 @@
 #include "../mem/pools.h"
 #include "heat.h"
 #include "native_file_cache.h"
+#include "native_mapped_file_cache.h"
+#include <array>
+#include "native_read_workers.h"
 #include "planner.h"
 #include "residency_iface.h"
 
@@ -320,6 +323,7 @@ struct MoverConfig {
     /* Native RAM cache capacity for THIS rank, including its entry metadata. Zero disables it.
      * Engine divides the configured server-wide capacity; it is separate from the fixed pool. */
     int64_t native_file_cache_bytes = 0;
+    int native_cache_allocation_device = 0; //Engine actual device, never EP rank ordinal
 };
 
 /* ------------------------------------------------------------------ the loan */
@@ -362,10 +366,17 @@ struct MoverStats {
     /* File-tier weights relaid on the read (Mover::set_file_relayout), and the issuing thread's
      * time in those reads and relayouts, which run on several threads at once. */
     uint64_t file_relaid = 0, file_relaid_bytes = 0, file_relayout_ns = 0;
+    uint64_t mapped_source_copies = 0, mapped_source_bytes = 0;
+    /* Existing read-only prefill accounting, aggregated after reader retirement. */
+    uint64_t file_prefill_ro_hits = 0, file_prefill_ro_hit_bytes = 0;
+    uint64_t file_prefill_ro_misses = 0, file_prefill_ro_miss_bytes = 0;
 };
 
 /* ------------------------------------------------------------------ the mover */
+struct NativeMappedMoverHostTest;
 class Mover {
+    friend struct NativeMappedMoverHostTest; //private HOST-only fixture seam
+    friend class Engine; //drain mapped source consumers before Engine tears down arenas/events
 public:
     ~Mover();
     Mover() = default;
@@ -552,7 +563,8 @@ public:
      *                   thread.
      * file_buffer       buffer 0 or 1 of the plan's two, or null when the plan has none. */
     int   stage_file_units(const std::vector<int32_t>& units, char* dst, int64_t cap,
-                           RadEvent after, RadEvent done, std::vector<int32_t>* staged);
+                           RadEvent after, RadEvent done, std::vector<int32_t>* staged,
+                           NativeFileCacheReadPolicy policy = NativeFileCacheReadPolicy::Normal);
     /* alias_file_units  publishes every file-tier weight of `units` at `base` without reading
      *                   it, for experts a pass does not route to: the grouped GEMM is handed
      *                   every expert's pointer and reads none of a zero-row expert's bytes, so
@@ -726,13 +738,39 @@ private:
     struct Relaid { const WeightInfo* w; char* dst; };
     FileRelayout         relayout_;
     NativeFileCache      native_file_cache_;
+    //Allocator context must outlive every window lease. Destruction drains explicitly first.
+    NativeMappedFileCache mapped_file_cache_;
+    bool mapped_file_cache_on_ = false;
+    static constexpr size_t kMappedPerWindow = size_t(RAD_PLACE_FILE_WINDOW_BYTES) / NativeMappedFileCache::DN;
+    struct MappedWindow {
+        std::array<NativeMappedFileCache::Lease,kMappedPerWindow> leases;
+        bool copy_may_be_queued = false;
+    };
+    std::array<MappedWindow,RAD_PLACE_FILE_WINDOWS> mapped_windows_;
+    struct MappedCopyHooks {
+        void* context = nullptr;
+        int (*copy)(void*,void*,const void*,int64_t,RadStream) = nullptr;
+        int (*record)(void*,RadEvent,RadStream) = nullptr;
+        int (*sync)(void*,RadEvent) = nullptr;
+        int (*drain)(void*,RadStream) = nullptr;
+    } mapped_copy_hooks_; //only the friend fixture can change these; default real device API
+    static bool mapped_file_eligible(const WeightInfo& w);
+    int mapped_file_drain();
+    int retire_file_window(int window);
+    int file_copy_event_record(RadEvent event);
+    int file_copy_event_sync(RadEvent event);
+    int file_copy_stream_sync();
+    int mapped_copy_to_vram(void* dst,const void* src,int64_t bytes);
     bool                 native_file_cache_on_ = false;
     std::vector<RelayIn> relay_in_;
     int                  relay_threads_ = 1;
+    NativeReadWorkers    relay_workers_;
+    bool                 native_file_workers_on_ = false;
     int  read_relaid(const WeightInfo& w, void* dst, int64_t dst_cap, RelayIn* in);
     int  read_native_file(const WeightInfo& w, void* dst, int64_t dst_cap, RelayIn* in,
-                          bool* cache_hit);
-    int  stage_relaid(const std::vector<Relaid>& rl);
+                          bool* cache_hit, NativeFileCacheReadPolicy policy = NativeFileCacheReadPolicy::Normal,
+                          NativeMappedFileCache::Lease* mapped_lease = nullptr);
+    int  stage_relaid(const std::vector<Relaid>& rl, NativeFileCacheReadPolicy policy);
     char*    windows_ = nullptr;
     int      n_windows_ = 0;
     int      win_next_ = 0;

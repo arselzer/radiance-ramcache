@@ -66,6 +66,8 @@ public:
     const RadFileHeader& header() const { return *hdr_; }
     const uint8_t*       base()   const { return base_; }
     int64_t              size()   const { return size_; }
+    /* Borrowed, metadata identity only. The caller must never close this descriptor. */
+    int fd_for_metadata_identity() const { return fd_; }
 
     /* Drop the blob from the page cache and this process's page tables, so a container larger
      * than RAM does not leave the cache full of pages nothing will read. Only the blob: the tables

@@ -105,8 +105,15 @@ Engine::~Engine() {
      * and frees the arena, but the mover's stream also copies into the arena (the prefill
      * stager's ring, lent slab slots) and would otherwise drain only later, with the mover. A fill
      * landing in a freed arena is a GPU memory fault. */
-    for (auto& r : ranks_)
+    for (auto& r : ranks_) {
+        //Mapped-source leases must retire before any context arena or stager event disappears.
+        //A failed completion proof cannot be followed by ordinary member destruction.
+        if (r->mover.mapped_file_drain() != RAD_OK) {
+            RAD_ERR("mapped file cache: Engine transfer completion unknown; retaining process owners");
+            std::_Exit(88);
+        }
         if (RadStream s = r->mover.transfer_stream()) (void)rad_stream_sync(s);
+    }
     for (auto& r : ranks_) r->ctx.shutdown();
     /* The streamed groups' host mirrors are pinned outside every pool; freed after the contexts,
      * since a pass reads them. Safe after a failed bring-up. */

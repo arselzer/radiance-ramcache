@@ -15,6 +15,12 @@
 #include "place/mover.h"
 #include "place/stager.h"
 #include "place/planner.h"
+#include "place/expert_profile_map.h"
+#include "place/native_decode_profile.h"
+#include "format/radfile.h"
+#include <fstream>
+#include <fcntl.h>
+#include <sys/stat.h>
 
 #include <dirent.h>
 #include <unistd.h>
@@ -4244,6 +4250,226 @@ TEST(a_mover_gives_back_every_event_and_device_byte) {
     run();
     CHECK_OK(settled_vram(&vram1));
     CHECK(vram1 - vram0 <= 2 * MiB + 4096);
+}
+
+TEST(source_localized_decode_profile_ranks_whole_GU_DN_units_without_budget_changes) {
+    Fixture f;
+    build_moe_layers(f, 1, 8, 2 * MiB, 1 * MiB);
+    f.prog.ctx.rank = 1;
+    f.prog.ctx.world_size = 4;
+    std::map<std::string, RadFileEntry> directory;
+    for (size_t i = 1; i < f.prog.weights.size(); ++i) {
+        auto& w = f.prog.weights[i];
+        if (w.decl.group.expert < 0) continue;
+        const int local = w.decl.group.expert;
+        const int slot = w.logical_bytes == 2 * MiB ? 0 : 1;
+        w.decl.group.slot = slot;
+        w.source = "source." + std::to_string(96 + local) + "." + std::to_string(slot);
+        RadFileEntry entry{};
+        entry.layer = 0; entry.expert = 96 + local; entry.slot = slot;
+        directory[w.source] = entry;
+    }
+    Config c = base_config();
+    c.placement = "expert_tiered"; c.deterministic = true;
+    c.vram_weights_mib = 10; c.host_pool_mib = 64;
+    PlannerInput input{};
+    input.program = &f.prog; input.config = &c; input.rank = 1; input.world_size = 4;
+    Plan baseline;
+    CHECK_OK(Planner(input).plan(&baseline));
+    for (const auto& u : baseline.units) if (u.expert >= 0)
+        CHECK((u.expert < 3) == (u.tier == Tier::VRAM));
+
+    std::vector<RadFileProfile> global;
+    for (int e = 0; e < 384; ++e)
+        global.push_back({0, e, e >= 100 && e <= 102 ? float(103-e)/10.0f : 0.0f, 0.0f});
+    std::vector<RadFileProfile> local;
+    const auto find = [&](const std::string& source) -> const RadFileEntry* {
+        const auto at = directory.find(source); return at == directory.end() ? nullptr : &at->second;
+    };
+    CHECK(local_expert_profile(f.prog.weights, find, global.data(), (int64_t)global.size(),
+                              40, 384, &local) == ExpertProfileMapStatus::Complete);
+    CHECK_EQ(local.size(), size_t(8));
+    input.profile = local.data(); input.n_profile = (int64_t)local.size();
+    Plan ranked, repeated;
+    CHECK_OK(Planner(input).plan(&ranked));
+    CHECK_OK(Planner(input).plan(&repeated));
+    CHECK(digest(f.prog, ranked) == digest(f.prog, repeated));
+    for (const auto& u : ranked.units) if (u.expert >= 0) {
+        CHECK_EQ(u.weights.size(), size_t(2));
+        CHECK((u.expert >= 4 && u.expert <= 6) == (u.tier == Tier::VRAM));
+        CHECK_EQ(u.bytes, int64_t(3 * MiB));
+    }
+    CHECK_EQ(ranked.totals.bytes[(int)Tier::VRAM], baseline.totals.bytes[(int)Tier::VRAM]);
+    CHECK_EQ(ranked.totals.bytes[(int)Tier::HostPinned], baseline.totals.bytes[(int)Tier::HostPinned]);
+    CHECK(!ranked.dynamic);
+    // One conflicting GU source must refuse localization transactionally, not rank it silently.
+    for (auto& [name, entry] : directory) if (entry.expert == 100 && entry.slot == 0) entry.expert = 200;
+    auto preserved = local;
+    CHECK(local_expert_profile(f.prog.weights, find, global.data(), (int64_t)global.size(),
+                              40, 384, &local) == ExpertProfileMapStatus::ConflictingGroup);
+    CHECK_EQ(local.size(), preserved.size());
+    for (size_t i = 0; i < local.size(); ++i) {
+        CHECK_EQ(local[i].expert, preserved[i].expert);
+        CHECK_EQ(local[i].share, preserved[i].share);
+    }
+}
+
+/* A real sidecar fd and RadFile directory feed the actual parser, tested key mapper,
+ * and actual Planner for all four EP ranks. Only tiny synthetic 1x32 expert blocks
+ * are written: planned real native GU/DN dimensions are metadata, never allocated
+ * as model payload or executed. No Engine, GPU, serving process or real model. */
+TEST(decode_profile_file_to_four_rank_planner_checks_local_identity_and_source_generation) {
+    struct Files {
+        std::string directory, model, profile, link, backup;
+        Files() {
+            std::string name = radtest::tmpdir() + "/decode_profile.XXXXXX";
+            if (::mkdtemp(name.data())) {
+                directory = name; model = name + "/metadata.rad";
+                profile = name + "/profile.json"; link = name + "/profile-link";
+                backup = name + "/metadata-old.rad";
+            }
+        }
+        ~Files() {
+            for (const auto* path : {&link, &profile, &model, &backup})
+                if (!path->empty()) ::unlink(path->c_str());
+            if (!directory.empty()) ::rmdir(directory.c_str());
+        }
+    } files;
+    REQUIRE(!files.directory.empty());
+    const auto source_name = [](int layer, int global, int slot) {
+        return "blk." + std::to_string(layer) + (slot ? ".ffn_down_exps." : ".ffn_gate_up_exps.") +
+               std::to_string(global) + ".weight";
+    };
+    RadEncoding encoding{};
+    rad_enc_copy_str(encoding.scheme, "affine");
+    rad_enc_add_plane(&encoding, "codes", RAD_FP4E2M1, 1, 1);
+    rad_enc_add_plane(&encoding, "scale", RAD_E8M0, 1, 32);
+    {
+        RadWriter writer;
+        REQUIRE(writer.begin(files.model.c_str()) == RAD_OK);
+        writer.set_arch("deepseek41"); writer.set_model_name("profile-pipeline-fixture");
+        writer.set_quant("synthetic-native-MXFP4-metadata");
+        writer.meta_i("n_layers", 40); writer.meta_i("n_embd", 5120);
+        writer.meta_i("n_expert", 384); writer.meta_i("n_expert_used", 6);
+        const uint8_t codes[16] = {}; const uint8_t scale = 127;
+        const void* planes[2] = {codes, &scale};
+        for (int layer = 0; layer < 40; ++layer)
+            for (int global = 0; global < 384; ++global)
+                for (int slot = 0; slot < 2; ++slot) {
+                    RadWriter::Weight w;
+                    w.name = source_name(layer, global, slot); w.enc = encoding;
+                    w.rank = 2; w.shape[0] = 1; w.shape[1] = 32;
+                    w.layer = layer; w.expert = global; w.slot = slot;
+                    REQUIRE(writer.add_weight(w, planes) >= 0);
+                }
+        REQUIRE(writer.finish() == RAD_OK);
+    }
+    RadFile source;
+    REQUIRE(source.open(files.model.c_str()) == RAD_OK);
+    REQUIRE(source.entry_count() == 40 * 384 * 2);
+    NativeProfileIdentity identity;
+    REQUIRE(native_profile_identity(source, &identity) == RAD_OK);
+    using Json = nlohmann::json;
+    Json doc = {{"format", "radiance-expert-stats/1"}, {"final", true},
+        {"model", identity.model}, {"container", identity.container}, {"arch", "deepseek41"},
+        {"tp", 4}, {"n_layers", 40}, {"n_trunk_layers", 40}, {"n_experts", 384},
+        {"source_identity", {{"format", "rad-metadata-prefix-sha256/1"},
+            {"file_bytes", identity.file_bytes}, {"metadata_bytes", identity.metadata_bytes},
+            {"device", identity.device}, {"inode", identity.inode},
+            {"mtime_ns", identity.mtime_ns}, {"ctime_ns", identity.ctime_ns},
+            {"sha256", identity.metadata_sha256}}},
+        {"tokens", {{"decode", 1}}}, {"steps", {{"decode", 1}}}};
+    doc["layer_experts"] = std::vector<int>(40, 384);
+    doc["top_k"] = std::vector<int>(40, 6);
+    doc["map"] = std::vector<std::string>(40, "container");
+    for (const char* key : {"observed_tokens", "histograms", "passes"})
+        doc[key]["decode"] = std::vector<int>(40, 1);
+    doc["selections"]["decode"] = std::vector<int>(40, 6);
+    doc["counts"]["decode"] = std::vector<std::vector<int>>(40, std::vector<int>(384));
+    // Deliberately different local hot id on every rank: 1,4,8,12. None is local0.
+    for (int layer = 0; layer < 40; ++layer)
+        for (int expert : {1, 2, 3, 100, 200, 300}) doc["counts"]["decode"][layer][expert] = 1;
+    for (const char* key : {"credited", "unmapped", "unclassified", "dropped"})
+        doc["ranks"][key] = std::vector<int>(4, std::strcmp(key, "credited") == 0 ? 40 : 0);
+    {
+        std::ofstream output(files.profile, std::ios::binary | std::ios::trunc);
+        REQUIRE(bool(output)); output << doc.dump(); output.close(); REQUIRE(bool(output));
+    }
+    NativeDecodeProfile full;
+    std::string reason;
+    REQUIRE(read_native_decode_profile(files.profile, identity, &full, &reason) == RAD_OK);
+    REQUIRE(full.rows.size() == 40 * 384);
+    const std::array<int, 4> hot_local{1, 4, 8, 12};
+    for (int rank = 0; rank < 4; ++rank) {
+        Fixture f;
+        build_moe_layers(f, 40, 96, 12533760, 6266880);
+        f.prog.ctx.rank = rank; f.prog.ctx.world_size = 4;
+        for (size_t i = 1; i < f.prog.weights.size(); ++i) {
+            auto& w = f.prog.weights[i];
+            if (w.decl.group.expert < 0) continue;
+            const int layer = w.decl.group.layer, local = w.decl.group.expert;
+            const int slot = w.logical_bytes == 12533760 ? 0 : 1;
+            w.decl.group.slot = slot;
+            w.source = source_name(layer, rank * 96 + local, slot);
+            const auto* entry = source.find(w.source);
+            REQUIRE(entry != nullptr);
+            w.enc = source.encoding(*entry); w.enc_known = true;
+            w.n_sel = 2; w.sel[0] = 0; w.sel[1] = 1;
+            w.decl.dtype = RAD_FP4E2M1; w.decl.rank = 2;
+            w.decl.shape[0] = slot ? 5120 : 4608; w.decl.shape[1] = slot ? 2304 : 5120;
+            w.stored_bytes = slot ? 6266880 : 12533760;
+            w.layout_tag = "ggml_mxfp4";
+        }
+        REQUIRE(native_decode_profile_geometry(f.prog.weights));
+        std::vector<RadFileProfile> local;
+        REQUIRE(local_expert_profile(f.prog.weights,
+            [&](const std::string& name) { return source.find(name); }, full.rows.data(),
+            (int64_t)full.rows.size(), 40, 384, &local) == ExpertProfileMapStatus::Complete);
+        REQUIRE(local.size() == 40 * 96);
+        Config c = base_config(); c.placement = "expert_tiered"; c.deterministic = true; c.tp = 4;
+        c.vram_weights_mib = 32;
+        // Planner-only virtual budget. No host pool, tensor payload or device is allocated.
+        c.host_pool_mib = 128 * 1024;
+        PlannerInput input{};
+        input.program = &f.prog; input.config = &c; input.rank = rank; input.world_size = 4;
+        Plan baseline, ranked;
+        REQUIRE(Planner(input).plan(&baseline) == RAD_OK);
+        input.profile = local.data(); input.n_profile = (int64_t)local.size();
+        REQUIRE(Planner(input).plan(&ranked) == RAD_OK);
+        size_t baseline_residents = 0, profile_residents = 0;
+        for (const auto& u : baseline.units) if (u.expert >= 0 && u.tier == Tier::VRAM) {
+            ++baseline_residents; CHECK_EQ(u.layer, 0); CHECK_EQ(u.expert, 0);
+        }
+        for (const auto& u : ranked.units) if (u.expert >= 0 && u.tier == Tier::VRAM) {
+            ++profile_residents; CHECK_EQ(u.layer, 0); CHECK_EQ(u.expert, hot_local[size_t(rank)]);
+            CHECK_EQ(u.weights.size(), size_t(2)); CHECK_EQ(u.bytes, int64_t(18800640));
+        }
+        CHECK_EQ(baseline_residents, size_t(1)); CHECK_EQ(profile_residents, size_t(1));
+        CHECK_EQ(ranked.rank, rank); CHECK(!ranked.dynamic);
+        CHECK_EQ(ranked.totals.bytes[(int)Tier::VRAM], baseline.totals.bytes[(int)Tier::VRAM]);
+    }
+    NativeDecodeProfile unchanged;
+    unchanged.decode_tokens = 777; unchanged.rows.push_back({7, 13, 0.25f, 0.0f});
+    REQUIRE(::symlink(files.profile.c_str(), files.link.c_str()) == 0);
+    CHECK(read_native_decode_profile(files.link, identity, &unchanged, &reason) < 0);
+    CHECK_EQ(unchanged.decode_tokens, uint64_t(777)); CHECK_EQ(unchanged.rows.size(), size_t(1));
+    NativeProfileIdentity wrong = identity; ++wrong.inode;
+    CHECK(read_native_decode_profile(files.profile, wrong, &unchanged, &reason) == RAD_E_FORMAT);
+    CHECK_EQ(unchanged.rows[0].expert, 13);
+    struct stat before{};
+    REQUIRE(::fstat(source.fd_for_metadata_identity(), &before) == 0);
+    const timespec times[2] = {{0, UTIME_OMIT}, {before.st_mtim.tv_sec - 1, before.st_mtim.tv_nsec}};
+    REQUIRE(::utimensat(AT_FDCWD, files.model.c_str(), times, 0) == 0);
+    NativeProfileIdentity changed;
+    REQUIRE(native_profile_identity(source, &changed) == RAD_OK);
+    CHECK(changed.mtime_ns != identity.mtime_ns);
+    CHECK(read_native_decode_profile(files.profile, changed, &unchanged, &reason) == RAD_E_FORMAT);
+    CHECK_EQ(unchanged.decode_tokens, uint64_t(777));
+    // Same path with a different inode must not be mistaken for the held RadFile.
+    REQUIRE(::rename(files.model.c_str(), files.backup.c_str()) == 0);
+    const int replacement = ::open(files.model.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    REQUIRE(replacement >= 0); REQUIRE(::close(replacement) == 0);
+    CHECK(native_profile_identity(source, &changed) == RAD_E_FORMAT);
 }
 
 RAD_TEST_MAIN()

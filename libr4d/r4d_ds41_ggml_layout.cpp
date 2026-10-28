@@ -15,6 +15,7 @@
 
 #include "lq_ggml_dequant.h"
 #include "lq_ggml_planes.h"
+#include "r4d_ds41_mxfp4_pack_sse2.h"
 
 #include <cstring>
 #include <vector>
@@ -118,7 +119,13 @@ extern "C" int r4d_ds41_ggml_relayout(const RadParam* p, int n_p, int operand,
     const int64_t K = gg_row_len(p, n_p), rows = gg_rows(planes);
     const int64_t nb = K / k->block, rb = nb * (int64_t)k->block_bytes;
     if (K <= 0 || K % k->block || rows <= 0 || dst_bytes < rows * rb) return RAD_E_SHAPE;
-    const lq::ggml::PackFn pack = lq::ggml::pack_of(k->type);
+    const bool native_sse2 = k->type == lq::ggml::GGML_TYPE_MXFP4 &&
+        ds41_mxfp4_pack_sse2::eligible(planes, n_planes, rows, nb, dst, dst_bytes);
+    const lq::ggml::PackFn pack = native_sse2 ? ds41_mxfp4_pack_sse2::pack :
+                                               lq::ggml::pack_of(k->type);
+#ifdef RADIANCE_DS41_PACK_HOST_TEST
+    if (native_sse2) ds41_mxfp4_pack_sse2::note(rows);
+#endif
     std::vector<const uint8_t*> row((size_t)n_planes);
     for (int64_t r = 0; r < rows; ++r) {
         for (int i = 0; i < n_planes; ++i) row[(size_t)i] = gg_plane_row(enc, planes, i, r);

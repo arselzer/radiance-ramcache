@@ -21,6 +21,8 @@
 #include "format/table_copy.h"
 #include "rad_plugin.h"
 #include "mem/vram_budget.h"
+#include "place/expert_profile_map.h"
+#include "place/native_decode_profile.h"
 #include "kvstream/bringup.h"
 #include "kvstream/plan.h"
 #include "runtime/arena.h"
@@ -1583,6 +1585,33 @@ static int declare_ring_windows(KVManager& kv, const Program& prog) {
 }
 
 int Engine::plan() {
+    // The external DECODE vector owns its rows until every rank's Planner has consumed them.
+    NativeDecodeProfile decode_profile;
+    if (!cfg_.expert_profile.empty()) {
+        if (!file_ || cfg_.tp != 4 || ranks_.size() != 4 || !meta_.arch_id ||
+            std::strcmp(meta_.arch_id, "deepseek41") || meta_.n_layers != 40 ||
+            meta_.n_embd != 5120 || meta_.n_expert != 384 || meta_.n_expert_used != 6) {
+            RAD_ERR("--expert-profile initially supports only native DeepSeek4.1 Flash EP4");
+            return RAD_E_UNSUPPORTED;
+        }
+        for (const auto& rank : ranks_)
+            if (rank->program.ctx.world_size != 4 || !native_decode_profile_geometry(rank->program.weights)) {
+                RAD_ERR("--expert-profile: unsupported native GU/DN layout or local EP geometry");
+                return RAD_E_UNSUPPORTED;
+            }
+        NativeProfileIdentity identity;
+        RAD_TRY(native_profile_identity(*file_, &identity));
+        std::string reason;
+        const int profile_status = read_native_decode_profile(cfg_.expert_profile, identity, &decode_profile, &reason);
+        if (profile_status < 0) {
+            RAD_ERR("--expert-profile '%s' refused: %s", cfg_.expert_profile.c_str(), reason.c_str());
+            return profile_status;
+        }
+        RAD_INFO("expert profile: phase=decode, %llu tokens, %zu global rows (%llu nonzero); "
+                 "source metadata %s; placement ranking only, no weight/precision change",
+                 (unsigned long long)decode_profile.decode_tokens, decode_profile.rows.size(),
+                 (unsigned long long)decode_profile.nonzero_rows, identity.metadata_sha256.c_str());
+    }
     /* The budget is resolved once, for every rank, before any rank allocates. vram_budget_resolve
      * folds the smallest capacity with the largest program so one split fits every card, and
      * writes it into Config; per-rank resolution would let rank 1 measure a card rank 0 already
@@ -1917,9 +1946,31 @@ int Engine::plan() {
         in.config     = &rc;
         in.rank       = r->index;
         in.world_size = cfg_.tp;
-        if (file_ && file_->header().prof_count) {
-            in.profile   = file_->profile();
+        std::vector<RadFileProfile> rank_profile;
+        if (!decode_profile.rows.empty()) {
+            in.profile = decode_profile.rows.data();
+            in.n_profile = (int64_t)decode_profile.rows.size();
+        } else if (file_ && file_->header().prof_count) {
+            in.profile = file_->profile();
             in.n_profile = (int64_t)file_->header().prof_count;
+        }
+        // DeepSeek EP movement groups are local; container/profile expert keys are global.
+        // The tested adapter resolves every GU/DN contributor through WeightInfo.source.
+        if (in.n_profile && file_ && meta_.arch_id && !std::strcmp(meta_.arch_id, "deepseek41")) {
+            const auto mapped = local_expert_profile(r->program.weights,
+                [&](const std::string& source) { return file_->find(source); },
+                in.profile, in.n_profile, meta_.n_layers, meta_.n_expert, &rank_profile);
+            if (mapped != ExpertProfileMapStatus::Complete ||
+                (!decode_profile.rows.empty() && rank_profile.size() != 40 * 96)) {
+                RAD_ERR("rank %d: expert profile source-key mapping refused: %s (%zu rows)",
+                        r->index, expert_profile_map_status(mapped), rank_profile.size());
+                return mapped == ExpertProfileMapStatus::NoMemory ? RAD_E_NOMEM : RAD_E_FORMAT;
+            }
+            in.profile = rank_profile.empty() ? nullptr : rank_profile.data();
+            in.n_profile = (int64_t)rank_profile.size();
+            if (!decode_profile.rows.empty())
+                RAD_INFO("expert profile: rank %d source-mapped %zu/3840 rows, phase=decode; "
+                         "per-rank shares are not renormalized", r->index, rank_profile.size());
         }
         in.container = file_ != nullptr;
         in.host_backend = device_is_host();
@@ -1929,6 +1980,71 @@ int Engine::plan() {
         if (cfg_.debug_placement || s < 0)
             fputs(r->plan.report(r->program).c_str(), stderr);
         if (s < 0) return s;
+        if (!decode_profile.rows.empty()) {
+            size_t vram_units = 0, pinned_units = 0, disk_units = 0;
+            double vram_mass = 0, pinned_mass = 0, disk_mass = 0;
+            for (const auto& unit : r->plan.units) {
+                if (unit.expert < 0 || unit.layer < 0 || unit.layer >= 40) continue;
+                if (unit.tier == Tier::VRAM) { ++vram_units; vram_mass += unit.profile_share; }
+                else if (unit.tier == Tier::HostPinned || unit.tier == Tier::HostPageable) {
+                    ++pinned_units; pinned_mass += unit.profile_share;
+                } else if (unit.tier == Tier::SSD) { ++disk_units; disk_mass += unit.profile_share; }
+            }
+            RAD_INFO("expert profile: rank %d planned units VRAM=%zu pinned=%zu SSD=%zu; "
+                     "decode calibration mass %.6f/%.6f/%.6f; two file buffers %s; "
+                     "calibration coverage is not held-out performance",
+                     r->index, vram_units, pinned_units, disk_units, vram_mass, pinned_mass,
+                     disk_mass, humanb(r->plan.file_stage_vram).c_str());
+        }
+        // Diagnostic only: the global-id counts can be joined to this INITIAL placement.
+        // No table, pointer, placement decision or GPU operation is changed here.
+        if (!cfg_.expert_stats.empty() && file_ && cfg_.tp == 4 && ranks_.size() == 4 &&
+            meta_.arch_id && !std::strcmp(meta_.arch_id, "deepseek41") && meta_.n_layers == 40 &&
+            meta_.n_expert == 384 && meta_.n_expert_used == 6 &&
+            native_decode_profile_geometry(r->program.weights)) {
+            struct PlacementIds { std::vector<int> vram, pinned, disk; };
+            std::array<PlacementIds, 40> ids;
+            std::array<std::array<bool, 96>, 40> local_seen{};
+            std::array<std::array<bool, 384>, 40> global_seen{};
+            bool valid = true;
+            for (const auto& unit : r->plan.units) {
+                if (unit.expert < 0 || unit.layer < 0 || unit.layer >= 40) continue;
+                if (unit.expert >= 96 || local_seen[(size_t)unit.layer][(size_t)unit.expert]) { valid = false; break; }
+                int global = -1;
+                for (const auto weight : unit.weights) {
+                    if (weight <= 0 || (size_t)weight >= r->program.weights.size()) { valid = false; break; }
+                    const auto& wi = r->program.weights[(size_t)weight];
+                    const auto* entry = file_->find(wi.source);
+                    if (!entry || entry->layer != unit.layer || entry->expert < 0 || entry->expert >= 384 ||
+                        (global >= 0 && global != entry->expert)) { valid = false; break; }
+                    global = entry->expert;
+                }
+                if (!valid || global < 0 || global_seen[(size_t)unit.layer][(size_t)global]) { valid = false; break; }
+                local_seen[(size_t)unit.layer][(size_t)unit.expert] = true;
+                global_seen[(size_t)unit.layer][(size_t)global] = true;
+                auto& row = ids[(size_t)unit.layer];
+                if (unit.tier == Tier::VRAM) row.vram.push_back(global);
+                else if (unit.tier == Tier::HostPinned || unit.tier == Tier::HostPageable) row.pinned.push_back(global);
+                else if (unit.tier == Tier::SSD) row.disk.push_back(global);
+                else { valid = false; break; }
+            }
+            for (const auto& layer : local_seen) for (bool present : layer) valid = valid && present;
+            if (valid) {
+                const auto render = [](std::vector<int>& values) {
+                    std::sort(values.begin(), values.end()); std::string result = "[";
+                    for (size_t i = 0; i < values.size(); ++i) {
+                        if (i) result += ','; result += std::to_string(values[i]);
+                    }
+                    return result + ']';
+                };
+                for (size_t layer = 0; layer < ids.size(); ++layer) {
+                    auto& row = ids[layer];
+                    RAD_INFO("EXPERT_PLACEMENT v=1 rank=%d layer=%zu static=%d ids=source-global "
+                             "vram=%s pinned=%s ssd=%s", r->index, layer, r->plan.dynamic ? 0 : 1,
+                             render(row.vram).c_str(), render(row.pinned).c_str(), render(row.disk).c_str());
+                }
+            } else RAD_WARN("expert placement ids unavailable for rank %d: inconsistent source/local units", r->index);
+        }
         /* The planner's slab must match the weights pool the mover fills. */
         RAD_TRY(plan_check_weights_pool(r->plan, r->pools.weights().bytes()));
         if (r->index == 0) {
@@ -2761,6 +2877,7 @@ int Engine::load_weights() {
          * mover needs its path. It reads the container with O_DIRECT: weights are RAD_ALIGN_UNIT-
          * aligned (rad_format.h), DirectFile's alignment, so stages take the no-bounce path. */
         MoverConfig mc{};
+        mc.native_cache_allocation_device = r->device;
         mc.container_path = file_ ? cfg_.model : std::string();
         if (cfg_.expert_ram_cache_total_mib > 0) {
             const int64_t MiB = (int64_t)1 << 20;

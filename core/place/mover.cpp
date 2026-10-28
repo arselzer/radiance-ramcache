@@ -87,6 +87,13 @@ void Residency::begin_transfer(rad_weight w, void* ptr, RadEvent ready) {
 
 /* ------------------------------------------------------------------ the mover */
 Mover::~Mover() {
+    /* No CPU reader may retain RelayIn/window/cache references through teardown. */
+    relay_workers_.reset();
+    //No error path may destroy a mapped owner while an uncertain queued copy can read it.
+    if (mapped_file_drain() != RAD_OK) {
+        RAD_ERR("mapped file cache: transfer completion unknown at teardown; retaining process owners");
+        std::_Exit(88);
+    }
     /* Drain the stream first: its queued gate waits, event records and copies refer to the
      * events and memory freed below. */
     if (mover_) {
@@ -129,8 +136,19 @@ void* Mover::reserve(const char* what, int64_t bytes, int kind) {
 
 int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, Pools* budget) {
     if (cfg.native_file_cache_bytes < 0) return RAD_E_INVAL;
+    const bool want_native_file_workers = native_read_workers_opt_in(
+        std::getenv("RADIANCE_EXPERIMENTAL_NATIVE_FILE_WORKERS"));
+    const char* mapped_env = std::getenv("RADIANCE_EXPERIMENTAL_NATIVE_CACHE_MAPPED_SOURCE");
+    const bool want_mapped = mapped_env && std::strcmp(mapped_env,"1") == 0;
+    /* Retire all callbacks before cache/RelayIn/window/namespace lifetimes change. */
+    relay_workers_.reset();
+    RAD_TRY(mapped_file_drain());
+    RAD_TRY(mapped_file_cache_.clear());
+    mapped_file_cache_on_ = false;
     native_file_cache_on_ = false;
     RAD_TRY(native_file_cache_.clear());
+    /* A refused cache clear must retain the previous namespace and worker policy. */
+    native_file_workers_on_ = want_native_file_workers;
     prog_ = &prog;
     plan_ = &plan;
     cfg_ = cfg;
@@ -280,11 +298,21 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
         RAD_TRY(file_.open(cfg_.container_path));
         if (cfg_.native_file_cache_bytes > 0) {
             RAD_TRY(file_.remember_epoch());
-            RAD_TRY(native_file_cache_.configure(cfg_.native_file_cache_bytes, prog.weights.size()));
-            native_file_cache_on_ = true;
-            RAD_INFO("native file RAM cache: %s for this rank, including %s of entry metadata",
-                     humanb(cfg_.native_file_cache_bytes).c_str(),
-                     humanb(native_file_cache_.stats().metadata_bytes).c_str());
+            if (want_mapped) {
+                RAD_TRY(mapped_file_cache_.configure(size_t(cfg_.native_file_cache_bytes),
+                                                     prog.weights.size(),sizeof(mapped_windows_) +
+                                                         sizeof(mapped_copy_hooks_) + 128,cfg_.native_cache_allocation_device)); //fixed flags/stats/alignment reserve
+                mapped_file_cache_on_ = true;
+                RAD_INFO("native mapped COPY-source cache: %s policy cap/rank; conservative no-SVM "
+                         "retained backing + metadata (not physical RSS); legacy cache disabled",
+                         humanb(cfg_.native_file_cache_bytes).c_str());
+            } else {
+                RAD_TRY(native_file_cache_.configure(cfg_.native_file_cache_bytes, prog.weights.size()));
+                native_file_cache_on_ = true;
+                RAD_INFO("native file RAM cache: %s for this rank, including %s of entry metadata",
+                         humanb(cfg_.native_file_cache_bytes).c_str(),
+                         humanb(native_file_cache_.stats().metadata_bytes).c_str());
+            }
         }
         /* A weight the file tier relays on each read needs the relayout (set_file_relayout). */
         int64_t relaid = 0;
@@ -572,7 +600,7 @@ int Mover::start_stage(int32_t unit, int64_t slab_slot) {
         const MoveUnit& mu = plan_->units[(size_t)unit];
         for (size_t k = 0; k < mu.weights.size(); ++k) {
             const WeightInfo& w = prog_->weights[mu.weights[k]];
-            if (!w.identity || (native_file_cache_on_ && w.stored_bytes <= RAD_PLACE_FILE_WINDOW_BYTES)) {
+            if (!w.identity || ((native_file_cache_on_ || (mapped_file_cache_on_ && mapped_file_eligible(w))) && w.stored_bytes <= RAD_PLACE_FILE_WINDOW_BYTES)) {
                 if (relay_in_.empty()) relay_in_.resize(1);
                 bool cached = false;
                 RAD_TRY(read_native_file(w, stage + mu.offset[k], stage_stride_ - mu.offset[k],
@@ -778,20 +806,110 @@ int Mover::read_relaid(const WeightInfo& w, void* dst, int64_t dst_cap, RelayIn*
     return st;
 }
 
+bool Mover::mapped_file_eligible(const WeightInfo& w) {
+    //Only byte transport changes. The Program/file epoch/key still select exact original bytes.
+    //Keep this first experiment inside the native DS4.1 trunk expert representation.
+    return w.decl.access == RAD_ACCESS_CONDITIONAL && w.decl.shard == RAD_SHARD_NONE &&
+        w.decl.group.layer >= 0 && w.decl.group.layer < 40 &&
+        w.decl.group.expert >= 0 && w.decl.group.expert < 96 &&
+        !w.widen && !w.narrow && w.layout_tag == "ggml_mxfp4" &&
+        (w.stored_bytes == int64_t(NativeMappedFileCache::GU) ||
+         w.stored_bytes == int64_t(NativeMappedFileCache::DN));
+}
+
+int Mover::file_copy_event_record(RadEvent event) {
+    if (mapped_file_cache_on_ && mapped_copy_hooks_.record)
+        return mapped_copy_hooks_.record(mapped_copy_hooks_.context,event,mover_);
+    return rad_event_record(event,mover_);
+}
+int Mover::file_copy_event_sync(RadEvent event) {
+    if (mapped_file_cache_on_ && mapped_copy_hooks_.sync)
+        return mapped_copy_hooks_.sync(mapped_copy_hooks_.context,event);
+    return rad_event_sync(event);
+}
+int Mover::file_copy_stream_sync() {
+    if (mapped_file_cache_on_ && mapped_copy_hooks_.drain)
+        return mapped_copy_hooks_.drain(mapped_copy_hooks_.context,mover_);
+    return mover_ ? rad_stream_sync(mover_) : RAD_E_STATE;
+}
+int Mover::mapped_copy_to_vram(void* dst,const void* src,int64_t bytes) {
+    if (mapped_file_cache_on_ && mapped_copy_hooks_.copy)
+        return mapped_copy_hooks_.copy(mapped_copy_hooks_.context,dst,src,bytes,mover_);
+    return rad_memcpy_async(dst,src,bytes,mover_);
+}
+
+int Mover::retire_file_window(int window) {
+    if (window < 0 || window >= n_windows_) return RAD_E_INVAL;
+    auto& batch = mapped_windows_[(size_t)window];
+    if (win_rec_[(size_t)window]) {
+        //This exact event generation follows every copy consuming these leases.
+        RAD_TRY(file_copy_event_sync(win_ev_[(size_t)window]));
+    } else if (batch.copy_may_be_queued) {
+        //An enqueue or event-record failure may have left a prefix of copies queued.
+        RAD_TRY(file_copy_stream_sync());
+    }
+    //No copy was issued, or its event/drain is proven complete. A failure above retains all.
+    for (auto& lease : batch.leases) {
+        const auto rc = lease.release();
+        if (rc != NativeMappedFileCache::Status::Ok && rc != NativeMappedFileCache::Status::Empty)
+            return RAD_E_STATE;
+    }
+    batch.copy_may_be_queued = false;
+    win_rec_[(size_t)window] = 0;
+    return RAD_OK;
+}
+
+int Mover::mapped_file_drain() {
+    bool pending = false;
+    for (const auto& batch : mapped_windows_) pending = pending || batch.copy_may_be_queued;
+    //On init/error/destruction, a single successful stream drain closes all generations.
+    if (pending) RAD_TRY(file_copy_stream_sync());
+    for (auto& batch : mapped_windows_) {
+        for (auto& lease : batch.leases) {
+            const auto rc = lease.release();
+            if (rc != NativeMappedFileCache::Status::Ok && rc != NativeMappedFileCache::Status::Empty)
+                return RAD_E_STATE;
+        }
+        batch.copy_may_be_queued = false;
+    }
+    if (pending) std::fill(win_rec_.begin(),win_rec_.end(),0);
+    return RAD_OK;
+}
+
 /* The cache stores the final native bytes, not their container encoding. Its lock covers only
  * CPU copies; GPU copies still use the existing pinned windows and their existing drain events.
  * The one-Mover Program and held file epoch define the namespace, so a hit requires no payload
  * hash or relayout. Direct-layout weights use each worker's aligned input, avoiding a shared
  * O_DIRECT bounce buffer when several workers fill differently aligned window offsets. */
 int Mover::read_native_file(const WeightInfo& w, void* dst, int64_t dst_cap, RelayIn* in,
-                            bool* cache_hit) {
-    if (!in || !dst || !cache_hit || w.stored_bytes <= 0 || dst_cap < w.stored_bytes)
+                            bool* cache_hit, NativeFileCacheReadPolicy policy,
+                            NativeMappedFileCache::Lease* mapped_lease) {
+    if (!in || !dst || !cache_hit || w.stored_bytes <= 0 || dst_cap < w.stored_bytes ||
+        !native_file_cache_policy_valid(policy))
         return RAD_E_INVAL;
     *cache_hit = false;
     const size_t key = (size_t)(&w - prog_->weights.data());
+    const bool mapped_scope = mapped_file_cache_on_ && mapped_file_eligible(w);
+    if (mapped_scope && !file_.same_epoch()) return RAD_E_STATE;
+    //The unchanged lease helper touches on borrow. ReadOnly deliberately bypasses it entirely,
+    //preserving no-touch/no-admission rather than claiming accelerated prefill cache hits.
+    const bool mapped = mapped_scope && policy == NativeFileCacheReadPolicy::Normal;
+    if (mapped) {
+        if (!file_.same_epoch()) return RAD_E_STATE;
+        NativeMappedFileCache::Lease local;
+        auto* lease = mapped_lease ? mapped_lease : &local;
+        const auto rc = mapped_file_cache_.borrow(key,size_t(w.stored_bytes),lease);
+        if (rc == NativeMappedFileCache::Status::Hit) {
+            *cache_hit = true;
+            //Demand promotion still uses its pinned stage; routed copies keep this lease.
+            if (!mapped_lease) std::memcpy(dst,lease->host(),size_t(w.stored_bytes));
+            return file_.same_epoch() ? RAD_OK : RAD_E_STATE;
+        }
+        if (rc != NativeMappedFileCache::Status::Miss) return RAD_E_STATE;
+    }
     if (native_file_cache_on_) {
         if (!file_.same_epoch()) return RAD_E_STATE;
-        RAD_TRY(native_file_cache_.copy(key, w.stored_bytes, dst, dst_cap, cache_hit));
+        RAD_TRY(native_file_cache_.copy(key, w.stored_bytes, dst, dst_cap, cache_hit, policy));
         if (*cache_hit) return file_.same_epoch() ? RAD_OK : RAD_E_STATE;
     }
     if (!w.identity) {
@@ -811,9 +929,20 @@ int Mover::read_native_file(const WeightInfo& w, void* dst, int64_t dst_cap, Rel
         RAD_TRY(file_.read((uint64_t)lo, need, in->p, in->cap));
         std::memcpy(dst, in->p + delta, (size_t)w.stored_bytes);
     }
+    if (mapped_scope && !file_.same_epoch()) return RAD_E_STATE;
+    if (mapped) {
+        if (!file_.same_epoch()) return RAD_E_STATE;
+        const auto rc = mapped_file_cache_.insert(key,dst,size_t(w.stored_bytes));
+        //Admission pressure and a failed new allocation preserve the original window fallback.
+        using S = NativeMappedFileCache::Status;
+        if (rc != S::Ok && rc != S::Existing && rc != S::Bypass && rc != S::Allocation)
+            return RAD_E_STATE;
+        if (!file_.same_epoch()) return RAD_E_STATE;
+    }
     if (native_file_cache_on_) {
         if (!file_.same_epoch()) return RAD_E_STATE;
-        RAD_TRY(native_file_cache_.insert(key, dst, w.stored_bytes));
+        if (policy == NativeFileCacheReadPolicy::Normal)
+            RAD_TRY(native_file_cache_.insert(key, dst, w.stored_bytes));
         if (!file_.same_epoch()) return RAD_E_STATE;
     }
     return RAD_OK;
@@ -823,33 +952,37 @@ int Mover::read_native_file(const WeightInfo& w, void* dst, int64_t dst_cap, Rel
  * window's weights read and relaid on up to relay_threads_ threads at once, then copied to the
  * layer buffer on the mover's stream like the direct runs, the window's event recorded behind
  * them. A window comes round again only after its copies drained, as for the direct runs. */
-int Mover::stage_relaid(const std::vector<Relaid>& rl) {
+int Mover::stage_relaid(const std::vector<Relaid>& rl, NativeFileCacheReadPolicy policy) {
     const int64_t W = RAD_PLACE_FILE_WINDOW_BYTES;
     if (!windows_ || n_windows_ <= 0) return RAD_E_STATE;
     if ((int)relay_in_.size() < relay_threads_) relay_in_.resize((size_t)relay_threads_);
     const auto t_all = std::chrono::steady_clock::now();
-    struct Job { size_t r; int64_t wo; };
+    struct Job { size_t r; int64_t wo; int mapped_slot; };
     std::vector<Job> jobs;
     size_t i = 0;
     while (i < rl.size()) {
         const int w = win_next_;
         win_next_ = (win_next_ + 1) % n_windows_;
         char* win = windows_ + (int64_t)w * W;
-        if (win_rec_[(size_t)w]) {
+        if (win_rec_[(size_t)w] || mapped_file_cache_on_) {
             const auto t0 = std::chrono::steady_clock::now();
-            RAD_TRY(rad_event_sync(win_ev_[(size_t)w]));
+            RAD_TRY(retire_file_window(w));
             stats_.file_wait_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
                                        std::chrono::steady_clock::now() - t0).count();
             win_rec_[(size_t)w] = 0;
         }
         jobs.clear();
         int64_t used = 0;
+        size_t mapped_slots = 0;
         while (i < rl.size()) {
             const WeightInfo& wi = *rl[i].w;
             const int64_t a = std::max<int64_t>(wi.align > 0 ? wi.align : RAD_ALIGN_UNIT, 256);
             const int64_t wo = align_up(used, a);
             if (wo + wi.stored_bytes > W) break;
-            jobs.push_back(Job{ i, wo });
+            const bool eligible = mapped_file_cache_on_ && mapped_file_eligible(wi) &&
+                policy == NativeFileCacheReadPolicy::Normal;
+            if (eligible && mapped_slots >= kMappedPerWindow) return RAD_E_STATE;
+            jobs.push_back(Job{ i, wo, eligible ? int(mapped_slots++) : -1 });
             used = wo + wi.stored_bytes;
             ++i;
         }
@@ -861,31 +994,62 @@ int Mover::stage_relaid(const std::vector<Relaid>& rl) {
         std::vector<int> rc(jobs.size(), RAD_OK);
         std::vector<uint8_t> cache_hits(jobs.size(), 0);
         std::atomic<size_t> next{ 0 };
-        auto work = [&](int t) {
+        auto work = [&, policy](int t) {
             for (size_t j; (j = next.fetch_add(1)) < jobs.size();) {
                 const Job& jb = jobs[j];
                 bool cached = false;
                 rc[j] = read_native_file(*rl[jb.r].w, win + jb.wo, W - jb.wo,
-                                         &relay_in_[(size_t)t], &cached);
+                                         &relay_in_[(size_t)t], &cached, policy,
+                                         jb.mapped_slot < 0 ? nullptr :
+                                             &mapped_windows_[(size_t)w].leases[(size_t)jb.mapped_slot]);
                 cache_hits[j] = cached;
             }
         };
         const int nt = (int)std::min<size_t>((size_t)relay_threads_, jobs.size());
-        std::vector<std::thread> th;
-        for (int t = 1; t < nt; ++t) th.emplace_back(work, t);
-        work(0);
-        for (std::thread& x : th) x.join();
+        if (native_file_workers_on_) {
+            const auto result = relay_workers_.run(relay_threads_, nt, work);
+            if (result == NativeReadWorkers::Result::Invalid ||
+                result == NativeReadWorkers::Result::CallbackFailed)
+                return RAD_E_STATE;  /* run() has already retired every CPU reader */
+        } else {
+            std::vector<std::thread> th;
+            for (int t = 1; t < nt; ++t) th.emplace_back(work, t);
+            work(0);
+            for (std::thread& x : th) x.join();
+        }
         for (size_t j = 0; j < jobs.size(); ++j) RAD_TRY(rc[j]);
+        if (policy == NativeFileCacheReadPolicy::ReadOnly) {
+            for (size_t j = 0; j < jobs.size(); ++j) {
+                const uint64_t bytes = uint64_t(rl[jobs[j].r].w->stored_bytes);
+                if (cache_hits[j]) { ++stats_.file_prefill_ro_hits; stats_.file_prefill_ro_hit_bytes += bytes; }
+                else { ++stats_.file_prefill_ro_misses; stats_.file_prefill_ro_miss_bytes += bytes; }
+            }
+        }
+        if (mapped_file_cache_on_) {
+            //All CPU readers/packers retired. Publish CPU writes before DEVICE reads.
+            rad_dev_host_wrote();
+            //Also retain ordinary fallback windows on partial enqueue/record failure.
+            mapped_windows_[(size_t)w].copy_may_be_queued = true;
+        }
         for (size_t j = 0; j < jobs.size(); ++j) {
             const Job& jb = jobs[j];
             const WeightInfo& wi = *rl[jb.r].w;
-            RAD_TRY(rad_memcpy_async(rl[jb.r].dst, win + jb.wo, wi.stored_bytes, mover_));
+            const auto* lease = jb.mapped_slot < 0 ? nullptr :
+                &mapped_windows_[(size_t)w].leases[(size_t)jb.mapped_slot];
+            if (lease && lease->active()) {
+                //Ownership was already transferred into this persistent window before enqueue.
+                RAD_TRY(mapped_copy_to_vram(rl[jb.r].dst,lease->device(),wi.stored_bytes));
+                ++stats_.mapped_source_copies;
+                stats_.mapped_source_bytes += uint64_t(wi.stored_bytes);
+            } else {
+                RAD_TRY(mapped_copy_to_vram(rl[jb.r].dst, win + jb.wo, wi.stored_bytes));
+            }
             if (!wi.identity && !cache_hits[j]) {
                 ++stats_.file_relaid;
                 stats_.file_relaid_bytes += (uint64_t)wi.stored_bytes;
             }
         }
-        RAD_TRY(rad_event_record(win_ev_[(size_t)w], mover_));
+        RAD_TRY(file_copy_event_record(win_ev_[(size_t)w]));
         win_rec_[(size_t)w] = 1;
     }
     stats_.file_relayout_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -894,8 +1058,10 @@ int Mover::stage_relaid(const std::vector<Relaid>& rl) {
 }
 
 int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_t cap,
-                            RadEvent after, RadEvent done, std::vector<int32_t>* staged) {
-    if (!plan_ || !dst || !staged || !done) return RAD_E_INVAL;
+                            RadEvent after, RadEvent done, std::vector<int32_t>* staged,
+                            NativeFileCacheReadPolicy policy) {
+    if (!plan_ || !dst || !staged || !done || !native_file_cache_policy_valid(policy)) return RAD_E_INVAL;
+    const auto cache_policy = (native_file_cache_on_ || mapped_file_cache_on_) ? policy : NativeFileCacheReadPolicy::Normal;
     staged->clear();
     if (!file_.ok() || !windows_ || n_windows_ <= 0) return RAD_E_STATE;
 
@@ -919,7 +1085,7 @@ int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_
         for (size_t k = 0; k < mu.weights.size(); ++k) {
             const WeightInfo& w = prog_->weights[mu.weights[k]];
             if (w.stored_bytes <= 0) continue;          /* nothing to read, and nothing to place */
-            if (!w.identity || (native_file_cache_on_ && w.stored_bytes <= RAD_PLACE_FILE_WINDOW_BYTES)) {
+            if (!w.identity || ((native_file_cache_on_ || (mapped_file_cache_on_ && mapped_file_eligible(w))) && w.stored_bytes <= RAD_PLACE_FILE_WINDOW_BYTES)) {
                 relaid.push_back(Relaid{ &w, dst + off + mu.offset[k] });
                 continue;
             }
@@ -948,10 +1114,10 @@ int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_
         const int w = win_next_;
         win_next_ = (win_next_ + 1) % n_windows_;
         char* win = windows_ + (int64_t)w * W;
-        if (win_rec_[(size_t)w]) {
+        if (win_rec_[(size_t)w] || mapped_file_cache_on_) {
             /* The window's copies from the round before must have left it. */
             const auto t0 = std::chrono::steady_clock::now();
-            RAD_TRY(rad_event_sync(win_ev_[(size_t)w]));
+            RAD_TRY(retire_file_window(w));
             stats_.file_wait_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
                                        std::chrono::steady_clock::now() - t0).count();
             win_rec_[(size_t)w] = 0;
@@ -994,11 +1160,12 @@ int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_
         }
         stats_.file_read_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
                                    std::chrono::steady_clock::now() - t0).count();
-        for (const Cp& c : cps) RAD_TRY(rad_memcpy_async(c.dst, win + c.wo, c.bytes, mover_));
-        RAD_TRY(rad_event_record(win_ev_[(size_t)w], mover_));
+        if (mapped_file_cache_on_) mapped_windows_[(size_t)w].copy_may_be_queued = true;
+        for (const Cp& c : cps) RAD_TRY(mapped_copy_to_vram(c.dst, win + c.wo, c.bytes));
+        RAD_TRY(file_copy_event_record(win_ev_[(size_t)w]));
         win_rec_[(size_t)w] = 1;
     }
-    if (!relaid.empty()) RAD_TRY(stage_relaid(relaid));
+    if (!relaid.empty()) RAD_TRY(stage_relaid(relaid,cache_policy));
     RAD_TRY(rad_event_record(done, mover_));
 
     for (size_t k = 0; k < staged->size(); ++k) {
@@ -1853,7 +2020,7 @@ std::string Mover::report() const {
      * window whose copies had not drained when it came round again. */
     if (stats_.file_layers) {
         const double rs = (double)stats_.file_read_ns * 1e-9;
-        if (native_file_cache_on_)
+        if (native_file_cache_on_ || mapped_file_cache_on_)
             s += fmt("  file stager: %llu routed layers, %llu units, %.2f GiB native bytes staged "
                      "from RAM or disk; %.2f s waiting on windows\n",
                      (unsigned long long)stats_.file_layers, (unsigned long long)stats_.file_units,
@@ -1878,6 +2045,63 @@ std::string Mover::report() const {
                  (unsigned long long)c.misses, (double)c.miss_bytes * gib,
                  (unsigned long long)c.evictions, (unsigned long long)c.bypasses,
                  humanb(c.metadata_bytes + c.payload_charge).c_str(), humanb(c.budget_bytes).c_str());
+    }
+    if (stats_.file_prefill_ro_hits || stats_.file_prefill_ro_misses) {
+        s += fmt("  native prefill read-only: %llu cached weights (%.2f GiB), "
+                 "%llu read/relayout weights (%.2f GiB) not admitted; completed CPU windows, no LRU touch\n",
+                 (unsigned long long)stats_.file_prefill_ro_hits, (double)stats_.file_prefill_ro_hit_bytes * gib,
+                 (unsigned long long)stats_.file_prefill_ro_misses, (double)stats_.file_prefill_ro_miss_bytes * gib);
+    }
+    if (mapped_file_cache_on_) {
+        const auto c = mapped_file_cache_.stats();
+        s += "  mapped cache ReadOnly policy: bypass to original read/pack windows; no lease/LRU touch/admission\n";
+        s += fmt(c.slab_policy ?
+                 "  mapped retained-slab COPY-source cache: %llu hits, %llu misses, %llu evictions, %llu bypasses; "
+                 "%s owned logical payload (resident/idle), %s conservative mapped backing, %s metadata, %s policy cap; "
+                 "%llu copies/%.2f GiB without CPU bounce; %llu mapped allocations/%llu public free calls\n" :
+                 "  mapped COPY-source cache: %llu hits, %llu misses, %llu evictions, %llu bypasses; "
+                 "%s owned logical payload (resident/idle), %s conservative mapped backing, %s metadata, %s policy cap; "
+                 "%llu copies/%.2f GiB without CPU bounce; %llu mapped allocations/%llu public free calls\n",
+                 (unsigned long long)c.cache.hits,(unsigned long long)c.cache.misses,
+                 (unsigned long long)c.cache.evictions,(unsigned long long)c.cache.bypasses,
+                 humanb(c.logical_payload).c_str(),humanb(c.mapped_policy_charge).c_str(),
+                 humanb(c.external_metadata+c.cache.metadata).c_str(),
+                 humanb(c.external_metadata+c.cache.budget).c_str(),
+                 (unsigned long long)stats_.mapped_source_copies,double(stats_.mapped_source_bytes)*gib,
+                 (unsigned long long)c.allocations,(unsigned long long)c.public_free_invocations);
+        if(c.slab_policy){
+            const auto& a=c.slabs;
+            s += fmt("  mapped retained-slab ledger: %zu owners/%zu terminal free-invoked; %s retained backing, %s terminal charge, %s growth reserved; "
+                     "%llu growth attempts/%llu failures; %llu device-bind failures; same-class LRU, no per-eviction public free; policy charge is not RSS/unpin proof\n",
+                     a.retained_slab_owners,a.terminal_free_invoked_owners,humanb(a.retained_backing_charge).c_str(),
+                     humanb(a.terminal_backing_charge).c_str(),humanb(a.cache.reserved_charge).c_str(),
+                     (unsigned long long)a.growth_attempts,(unsigned long long)a.growth_failures,(unsigned long long)c.api.device_bind_failures);
+            for(int k=0;k<2;++k){const auto& cl=a.classes[k];
+                s += fmt("  mapped retained-slab class %s: %zu capacity/%zu resident/%zu idle/%zu busy/%zu leased slots; "
+                         "%s logical capacity/%s resident/%s idle/%s leased bytes; %llu class bypasses/%llu leased-tail bypasses\n",
+                         k==0?"GU":"DN",cl.capacity_slots,cl.resident_slots,cl.idle_slots,cl.busy_slots,cl.leased_slots,
+                         humanb(cl.capacity_logical_bytes).c_str(),humanb(cl.resident_logical_bytes).c_str(),
+                         humanb(cl.idle_logical_bytes).c_str(),humanb(cl.leased_logical_bytes).c_str(),
+                         (unsigned long long)cl.bypasses,(unsigned long long)cl.leased_tail_bypasses);
+            }
+        }
+        s += fmt("  mapped cache API timing (aggregate before final clear): %llu alloc attempts, "
+                 "%llu null returns, %llu alias rejections; alloc %llu ns total/%llu ns max; "
+                 "%llu free invocations, %llu ns total/%llu ns max; monotonic HOST elapsed, "
+                 "not per-request/pure pin time/confirmed unpin\n",
+                 (unsigned long long)c.api.allocate_attempts,(unsigned long long)c.api.allocate_null_returns,
+                 (unsigned long long)c.api.alias_rejections,(unsigned long long)c.api.allocate_ns,
+                 (unsigned long long)c.api.allocate_max_ns,(unsigned long long)c.api.free_invocations,
+                 (unsigned long long)c.api.free_ns,(unsigned long long)c.api.free_max_ns);
+    }
+    if (native_file_workers_on_) {
+        const auto readers = relay_workers_.stats();
+        s += fmt("  native read workers: %llu pooled windows, %llu serial windows, "
+                 "%llu startup-fallback windows, %llu threads started\n",
+                 (unsigned long long)readers.pooled_dispatches,
+                 (unsigned long long)readers.serial_dispatches,
+                 (unsigned long long)readers.fallback_dispatches,
+                 (unsigned long long)readers.thread_starts);
     }
     return s;
 }

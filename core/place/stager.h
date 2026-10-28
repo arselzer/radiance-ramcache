@@ -305,6 +305,9 @@ private:
     RadEvent  counts_ev_ = nullptr;
     bool      routed_ = false;                   /* this pass reads routed experts only */
     int64_t   pass_tok_ = 0;
+    /* Batch eligibility only. start() additionally requires this exact native EP layer;
+     * selected-routed starts always use Normal. Immutable copy passed per mover call. */
+    NativeFileCacheReadPolicy pass_cache_policy_ = NativeFileCacheReadPolicy::Normal;
     bool      warned_sum_ = false, told_ = false;
     std::vector<int32_t> want_, skip_;
 

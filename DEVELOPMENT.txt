@@ -37,8 +37,16 @@ The latest merge includes upstream placement, prefix and hc_read improvements.
 It also fixes expert-pin-top for normalized profile shares and rejects non-finite
 fractions, with regression coverage. It has not been GPU-benchmarked.
 
-The bank/head/control port is applied here but has not yet been built or tested on
-this branch. A separate frozen Core completed two 64-token learned-MTP replies with
+The bank/head/control, cache-fill and observer ports build on this branch with
+HIP and FFmpeg disabled. All 12 affected CPU test targets passed across the
+initial run and a scoped rerun. The expanded mapped-mover suite passed all 928
+checks in 29 cases but initially exceeded its old 10-second CPU budget; the
+rerun passed with a suite-specific 20-second budget and unchanged test binaries.
+Separate bank reader/writer, cache reservation/lifetime, draft policy/scope,
+trace policy and 15 offline analyzer controls passed. This is CPU validation;
+the combined current branch still needs GPU transport and model checks.
+
+A separate frozen Core completed two 64-token learned-MTP replies with
 all 128 token IDs matching the target reference. With depth five and final head
 placement verified, it measured 4.62 tokens/s using a 72 GiB RAM expert cache,
 6144 MiB pinned pool per rank, M16 and context 512. The optional head cache
@@ -49,7 +57,12 @@ memory allocation retained, verification caps 0 through 5, and separate committe
 learned/fallback counters. An absent cap preserves the legacy behavior; explicit
 zero disables draft work and restores ordinary target pipelining. The same control
 implementation passed the portable checks, 549 HOST cases and the C/CXX ABI check
-in the frozen experiment. The current merged source still needs its own tests.
+in the frozen experiment. A matched, fixed-order cap sweep on that frozen Core
+measured 4.43 tokens/s with drafting off, 4.76 at cap one, 5.24 at cap three and
+4.61 at cap five. All 128 token IDs matched. Graph, placement and memory settings
+were held fixed; main live-tail skipping was off. This short pilot does not
+establish long-context, concurrent or broad quality behavior. Positive caps
+still generate all five draft candidates, then cap the verification prefix.
 The new sparse-GEMV/WMMA experiments remain separate from this branch.
 
 The mapped expert cache now has an opt-in direct-fill path: a miss reserves an
@@ -57,8 +70,9 @@ unpublished charged slot, packs into it without holding the writer lock, then
 publishes the complete bytes together with the first reader lease. Allocation
 pressure uses the existing staging-window fallback. Read-only prefill can borrow
 warm slab entries without changing their recency and never admits a cold entry.
-These changes and their portable/lifecycle controls await current-branch build
-and GPU transport validation. The direct-fill switch remains off by default.
+The portable and actual HOST mover/lifecycle controls passed. GPU transport
+validation remains required. Direct fill removes the second cache insertion
+copy; CPU repacking and H2D transfers remain. The switch is off by default.
 
 A separate opt-in M1 route/demand trace records bounded by-value metadata for
 offline prefetch evaluation. It observes the existing count readback and demand

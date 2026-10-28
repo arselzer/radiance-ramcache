@@ -156,6 +156,20 @@ void gemv_avx2(const Mx& w, const uint16_t* x, uint16_t* y, int n0, int n1) {
     for (int k = 0; k < w.K; ++k) xf[(size_t)k] = bf16_to_f32(x[k]);
     alignas(32) int8_t kvi[4][32 * 8];
     alignas(32) float dsc[4][8];
+    /* Eight consecutive rows are one contiguous range in either layout. The lanes visit it out
+     * of order, so the next group's range is prefetched in eight slices while this one runs. */
+    const size_t code_bytes = w.blocks ? (size_t)UK * 17 : (size_t)w.K / 2;
+    const uint8_t* const code_base = w.blocks ? w.blocks : w.codes;
+    auto prefetch = [&](int n, int slice) {
+        if (n >= n1) return;
+        const uint8_t* p = code_base + (size_t)n * code_bytes;
+        const size_t len = 8 * code_bytes, a = len * (size_t)slice / 8, b = len * (size_t)(slice + 1) / 8;
+        for (size_t off = a; off < b; off += 64) _mm_prefetch(reinterpret_cast<const char*>(p + off), _MM_HINT_T0);
+        if (!w.blocks && slice == 0)
+            for (size_t off = 0; off < (size_t)8 * UK; off += 64)
+                _mm_prefetch(reinterpret_cast<const char*>(w.scales + (size_t)n * UK + off), _MM_HINT_T0);
+    };
+    for (int s = 0; s < 8; ++s) prefetch(n0, s);
     for (int n = n0; n < n1; n += 8) {
         Row rows[8];
         for (int i = 0; i < 8; ++i) rows[i] = row_of(w, n + i);
@@ -163,6 +177,7 @@ void gemv_avx2(const Mx& w, const uint16_t* x, uint16_t* y, int n0, int n1) {
         /* Four adjacent lanes at once: four independent sums, so the adds do not wait on each
          * other. Each lane still sees its own blocks in increasing order. */
         for (int l0 = 0; l0 < 32; l0 += 4) {
+            prefetch(n + 8, l0 / 4);
             __m256 acc[4] = { _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(),
                               _mm256_setzero_ps() };
             for (int base = l0; base < UK; base += 32) {

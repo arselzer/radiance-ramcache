@@ -44,7 +44,10 @@ Mat make_mat(int N, int K, uint64_t seed, bool adversarial, bool with_planes = t
     m.blocks.resize((size_t)N * UK * 17);
     if (with_planes) { m.codes.resize((size_t)N * K / 2); m.scales.resize((size_t)N * UK); }
     std::mt19937_64 rng(seed);
-    static const uint8_t edge[] = { 0, 1, 2, 3, 100, 126, 127, 128, 129, 200, 252, 253, 254, 255 };
+    /* Finite edges: the subnormal scales, tiny and large ones that stay finite through the sums.
+     * Scales near 255 overflow to inf and give NaN rows, whose sign and payload x86 and the card
+     * may legitimately produce differently. */
+    static const uint8_t edge[] = { 0, 1, 2, 3, 60, 100, 126, 127, 128, 129, 135, 140 };
     for (int n = 0; n < N; ++n)
         for (int u = 0; u < UK; ++u) {
             const uint64_t r = rng();
@@ -68,7 +71,7 @@ std::vector<uint16_t> make_x(int K, uint64_t seed, bool adversarial) {
     std::mt19937_64 rng(seed);
     std::normal_distribution<float> nd(0.f, 0.5f);
     std::vector<uint16_t> x((size_t)K);
-    static const uint16_t special[] = { 0x0000, 0x8000, 0x0001, 0x8001, 0x0080, 0x7f7f, 0xff7f, 0x3f80, 0x0040, 0x00ff };
+    static const uint16_t special[] = { 0x0000, 0x8000, 0x0001, 0x8001, 0x0080, 0x3f80, 0x0040, 0x00ff, 0x4120 };
     for (int k = 0; k < K; ++k) {
         x[(size_t)k] = f32_to_bf16(nd(rng));
         if (adversarial && rng() % 7 == 0) x[(size_t)k] = special[rng() % (sizeof special / 2)];

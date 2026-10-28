@@ -7,12 +7,12 @@ Included optimizations: selected native expert reads, retained mapped RAM
 slabs, SSE2 expert repacking, and live-tail padding skips. Existing defaults
 remain unchanged. Experimental switches require explicit opt-in.
 
-Validated on four RX 9070 XT cards: TP4 exact, one sequence, context512,
-M16, 80GiB host expert cache and a separately calibrated placement profile.
+Validated on four RX 9070 XT cards: TP4 exact, one sequence, context 512,
+M16, 80 GiB host expert cache and a separately calibrated placement profile.
 The eight-request model checks preserved complete reply choices. Retained
-slabs increased weighted decode from3.19 to5.13tokens/s against the older
-80GiB allocator. With SSE2 enabled in both arms, tail skipping increased
-decode4.97 to5.36tokens/s and reduced total prefill60.13 to40.87seconds.
+slabs increased weighted decode from 3.19 to 5.13 tokens/s against the older
+80 GiB allocator. With SSE2 enabled in both arms, tail skipping increased
+decode from 4.97 to 5.36 tokens/s and reduced total prefill from 60.13 to 40.87 seconds.
 These are single sweeps; long context, concurrency and broad quality are
 not established. Tiny numerical and transport checks were also run.
 

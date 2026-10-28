@@ -158,11 +158,19 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
         std::getenv("RADIANCE_EXPERIMENTAL_NATIVE_FILE_WORKERS"));
     const char* mapped_env = std::getenv("RADIANCE_EXPERIMENTAL_NATIVE_CACHE_MAPPED_SOURCE");
     const bool want_mapped = mapped_env && std::strcmp(mapped_env,"1") == 0;
+    const char* fill_env=std::getenv("RADIANCE_EXPERIMENTAL_NATIVE_CACHE_DIRECT_FILL");
+    const bool want_direct_fill=fill_env&&std::strcmp(fill_env,"1")==0;
+    const char* slabs_env=std::getenv("RADIANCE_EXPERIMENTAL_NATIVE_CACHE_MAPPED_SLABS");
+    if(want_direct_fill&&(!want_mapped||cfg.native_file_cache_bytes<=0||!slabs_env||std::strcmp(slabs_env,"1")||
+        !std::any_of(plan.units.begin(),plan.units.end(),[](const MoveUnit& mu){return mu.tier==Tier::SSD;}))){
+        RAD_ERR("mapped direct fill requires mapped COPY-source cache and retained slabs");return RAD_E_UNSUPPORTED;
+    }
     /* Retire all callbacks before cache/RelayIn/window/namespace lifetimes change. */
     relay_workers_.reset();
     RAD_TRY(mapped_file_drain());
     RAD_TRY(mapped_file_cache_.clear());
     mapped_file_cache_on_ = false;
+    mapped_direct_fill_on_ = want_direct_fill;
     native_file_cache_on_ = false;
     RAD_TRY(native_file_cache_.clear());
     /* A refused cache clear must retain the previous namespace and worker policy. */
@@ -331,6 +339,7 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
                                                      prog.weights.size(),sizeof(mapped_windows_) +
                                                          sizeof(mapped_copy_hooks_) + 128,cfg_.native_cache_allocation_device)); //fixed flags/stats/alignment reserve
                 mapped_file_cache_on_ = true;
+                if(mapped_direct_fill_on_)RAD_INFO("native mapped direct fill: whole-weight unpublished reservation, parallel CPU fill, atomic first lease; unchanged H2D event retirement");
                 RAD_INFO("native mapped COPY-source cache: %s policy cap/rank; conservative no-SVM "
                          "retained backing + metadata (not physical RSS); legacy cache disabled",
                          humanb(cfg_.native_file_cache_bytes).c_str());
@@ -920,14 +929,16 @@ int Mover::read_native_file(const WeightInfo& w, void* dst, int64_t dst_cap, Rel
     const size_t key = (size_t)(&w - prog_->weights.data());
     const bool mapped_scope = mapped_file_cache_on_ && mapped_file_eligible(w);
     if (mapped_scope && !source_file_epoch()) return RAD_E_STATE;
-    //The unchanged lease helper touches on borrow. ReadOnly deliberately bypasses it entirely,
-    //preserving no-touch/no-admission rather than claiming accelerated prefill cache hits.
-    const bool mapped = mapped_scope && policy == NativeFileCacheReadPolicy::Normal;
+    //Slab ReadOnly borrows preserve decode LRU order. Per-entry ReadOnly still bypasses.
+    const bool mapped = mapped_scope && (policy == NativeFileCacheReadPolicy::Normal ||
+                                        mapped_file_cache_.supports_readonly_borrow());
     if (mapped) {
         if (!source_file_epoch()) return RAD_E_STATE;
         NativeMappedFileCache::Lease local;
         auto* lease = mapped_lease ? mapped_lease : &local;
-        const auto rc = mapped_file_cache_.borrow(key,size_t(w.stored_bytes),lease);
+        const auto rc = policy == NativeFileCacheReadPolicy::ReadOnly ?
+            mapped_file_cache_.borrow_readonly(key,size_t(w.stored_bytes),lease) :
+            mapped_file_cache_.borrow(key,size_t(w.stored_bytes),lease);
         if (rc == NativeMappedFileCache::Status::Hit) {
             *cache_hit = true;
             //Demand promotion still uses its pinned stage; routed copies keep this lease.
@@ -935,6 +946,42 @@ int Mover::read_native_file(const WeightInfo& w, void* dst, int64_t dst_cap, Rel
             return source_file_epoch() ? RAD_OK : RAD_E_STATE;
         }
         if (rc != NativeMappedFileCache::Status::Miss) return RAD_E_STATE;
+    }
+    bool skip_mapped_insert=false;
+    if(mapped&&mapped_direct_fill_on_&&mapped_lease&&policy==NativeFileCacheReadPolicy::Normal){
+        NativeMappedFileCache::Write write;
+        const auto reserved=mapped_file_cache_.reserve_fill(key,size_t(w.stored_bytes),&write);
+        using S=NativeMappedFileCache::Status;
+        if(reserved==S::Ok){
+            // The charged unpublished slot is owned exclusively by this retired-before-return reader.
+            // No owner/state/writer cache lock spans disk input or whole-weight native relayout.
+            int rc=RAD_OK;
+            if(!w.identity)rc=read_relaid(w,write.host(),int64_t(write.bytes()),in);
+            else{
+                const int64_t A=DirectFile::alignment();
+                if(w.file_offset>uint64_t(INT64_MAX))return RAD_E_INVAL;
+                const int64_t offset=int64_t(w.file_offset),lo=offset/A*A,delta=offset-lo;
+                if(w.stored_bytes>INT64_MAX-delta-A)return RAD_E_INVAL;
+                const int64_t need=delta+w.stored_bytes,allocation=align_up(need,A);
+                if(in->cap<allocation){std::free(in->p);in->p=(uint8_t*)std::aligned_alloc(size_t(A),size_t(allocation));in->cap=in->p?allocation:0;}
+                if(!in->p)return RAD_E_NOMEM;
+                rc=read_source_file(w.file_id,uint64_t(lo),need,in->p,in->cap);
+                if(rc>=0)std::memcpy(write.host(),in->p+delta,size_t(w.stored_bytes));
+            }
+            if(rc<0)return rc; // Write destructor cancels; a partial payload is never published
+            if(!source_file_epoch())return RAD_E_STATE;
+            const auto published=write.publish(mapped_lease); // atomic publication + consumer pin
+            if(published!=S::Ok)return RAD_E_STATE;
+            return source_file_epoch()?RAD_OK:RAD_E_STATE;
+        }
+        if(reserved==S::Existing){
+            const auto hit=mapped_file_cache_.borrow(key,size_t(w.stored_bytes),mapped_lease);
+            if(hit==S::Hit){*cache_hit=true;return source_file_epoch()?RAD_OK:RAD_E_STATE;}
+            if(hit!=S::Miss)return RAD_E_STATE;
+        }else if(reserved!=S::Bypass&&reserved!=S::Allocation)return RAD_E_STATE;
+        // Gross cap/class/held-tail/allocation pressure keeps the original window path, without
+        // repeating a failed reservation or copying that fallback into the cache a second time.
+        skip_mapped_insert=true;
     }
     if (native_file_cache_on_) {
         if (!source_file_epoch()) return RAD_E_STATE;
@@ -959,7 +1006,7 @@ int Mover::read_native_file(const WeightInfo& w, void* dst, int64_t dst_cap, Rel
         std::memcpy(dst, in->p + delta, (size_t)w.stored_bytes);
     }
     if (mapped_scope && !source_file_epoch()) return RAD_E_STATE;
-    if (mapped) {
+    if (mapped && !skip_mapped_insert && policy == NativeFileCacheReadPolicy::Normal) {
         if (!source_file_epoch()) return RAD_E_STATE;
         const auto rc = mapped_file_cache_.insert(key,dst,size_t(w.stored_bytes));
         //Admission pressure and a failed new allocation preserve the original window fallback.
@@ -1009,7 +1056,7 @@ int Mover::stage_relaid(const std::vector<Relaid>& rl, NativeFileCacheReadPolicy
             const int64_t wo = align_up(used, a);
             if (wo + wi.stored_bytes > W) break;
             const bool eligible = mapped_file_cache_on_ && mapped_file_eligible(wi) &&
-                policy == NativeFileCacheReadPolicy::Normal;
+                (policy == NativeFileCacheReadPolicy::Normal || mapped_file_cache_.supports_readonly_borrow());
             if (eligible && mapped_slots >= kMappedPerWindow) return RAD_E_STATE;
             jobs.push_back(Job{ i, wo, eligible ? int(mapped_slots++) : -1 });
             used = wo + wi.stored_bytes;
@@ -2084,7 +2131,9 @@ std::string Mover::report() const {
     }
     if (mapped_file_cache_on_) {
         const auto c = mapped_file_cache_.stats();
-        s += "  mapped cache ReadOnly policy: bypass to original read/pack windows; no lease/LRU touch/admission\n";
+        s += c.slab_policy ?
+            "  mapped cache ReadOnly policy: retained-slab hit lease without LRU touch; miss read/pack windows without admission\n" :
+            "  mapped cache ReadOnly policy: bypass to original read/pack windows; no lease/LRU touch/admission\n";
         s += fmt(c.slab_policy ?
                  "  mapped retained-slab COPY-source cache: %llu hits, %llu misses, %llu evictions, %llu bypasses; "
                  "%s owned logical payload (resident/idle), %s conservative mapped backing, %s metadata, %s policy cap; "
@@ -2101,6 +2150,9 @@ std::string Mover::report() const {
                  (unsigned long long)c.allocations,(unsigned long long)c.public_free_invocations);
         if(c.slab_policy){
             const auto& a=c.slabs;
+            if(mapped_direct_fill_on_)s+=fmt("  mapped direct fill: %llu reservations, %llu committed (%s), %llu cancelled (%s), %zu active; %llu same-key busy bypasses; no fill-duration cache locks; full-weight only\n",
+                (unsigned long long)a.fill_reservations,(unsigned long long)a.fill_commits,humanb(a.fill_bytes).c_str(),
+                (unsigned long long)a.fill_aborts,humanb(a.fill_abort_bytes).c_str(),a.fills_active,(unsigned long long)a.fill_busy_bypasses);
             s += fmt("  mapped retained-slab ledger: %zu owners/%zu terminal free-invoked; %s retained backing, %s terminal charge, %s growth reserved; "
                      "%llu growth attempts/%llu failures; %llu device-bind failures; same-class LRU, no per-eviction public free; policy charge is not RSS/unpin proof\n",
                      a.retained_slab_owners,a.terminal_free_invoked_owners,humanb(a.retained_backing_charge).c_str(),

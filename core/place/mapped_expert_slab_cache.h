@@ -29,6 +29,8 @@ public:
         size_t retained_slab_owners=0,terminal_free_invoked_owners=0;
         size_t retained_backing_charge=0,terminal_backing_charge=0;
         uint64_t growth_attempts=0,growth_failures=0,hit_bytes=0,miss_bytes=0;
+        uint64_t fill_reservations=0,fill_commits=0,fill_aborts=0,fill_busy_bypasses=0,fill_bytes=0,fill_abort_bytes=0;
+        size_t fills_active=0;
         bool terminal=false;
         size_t charge()const noexcept{return cache.charge();}
     };
@@ -38,7 +40,7 @@ private:
         size_t slab=none,slot=none,previous=none,next=none,leases=0;
         uint64_t generation=0;
         int klass=-1;
-        bool present=false;
+        bool present=false,filling=false;
     };
     struct Slab {
         Allocation allocation{};
@@ -125,7 +127,7 @@ private:
         return out;
     }
     static Status retire(State&s,std::unique_lock<std::mutex>&lock)noexcept{
-        if(s.stats.cache.lease_refs)return Status::Busy;
+        if(s.stats.cache.lease_refs||s.stats.fills_active)return Status::Busy;
         //Validate all owned live slots before the first terminal callback.
         for(size_t i=0;i<s.used_slabs;++i){const Slab&b=s.slabs[i];if(!b.present||b.free_invoked)continue;
             if(!b.free_safe)return Status::AllocatorContract;
@@ -153,8 +155,10 @@ private:
         std::fputs("mapped slab cache: final owner retirement failed; backing retained, NOT confirmed freed\n",stderr);
     }
 public:
+    class Write;
     class Lease {
         friend class SlabCache;
+        friend class Write;
         State*state_=nullptr;size_t key_=none,bytes_=0;uint64_t generation_=0;
         const uint8_t*host_=nullptr;const void*device_=nullptr;bool active_=false;
     public:
@@ -175,7 +179,51 @@ public:
                 --e.leases;--s->stats.cache.lease_refs;
                 if(!e.leases){--s->stats.cache.leased_entries;s->stats.cache.leased_charge-=stride_for(e.klass);}
                 active_=false;host_=nullptr;device_=nullptr;bytes_=0;}
-            if(s->owner_alive||s->stats.cache.lease_refs){state_=nullptr;return Status::Ok;}
+            if(s->owner_alive||s->stats.cache.lease_refs||s->stats.fills_active){state_=nullptr;return Status::Ok;}
+            const auto rc=retire(*s,l);if(rc!=Status::Ok)return rc;
+            state_=nullptr;l.unlock();delete s;return Status::Ok;
+        }
+    };
+    // Move-only producer reservation. Allocator/context lifetime is the same as Lease.
+    // Unpublished bytes are exclusively writable; no payload copy runs under a cache lock.
+    class Write {
+        friend class SlabCache;
+        State*state_=nullptr;size_t key_=none,bytes_=0;uint64_t generation_=0;bool active_=false;
+    public:
+        Write()=default;Write(const Write&)=delete;Write&operator=(const Write&)=delete;
+        Write(Write&&o)noexcept:state_(o.state_),key_(o.key_),bytes_(o.bytes_),generation_(o.generation_),active_(o.active_){o.state_=nullptr;o.active_=false;o.bytes_=0;}
+        Write&operator=(Write&&)=delete;
+        ~Write(){const auto rc=abort();if(rc!=Status::Ok&&rc!=Status::Empty)warn_retained();}
+        bool empty()const noexcept{return !state_;}
+        bool active()const noexcept{return active_;}
+        uint8_t*host()const noexcept{return active_?SlabCache::host(state_->slabs[state_->entries[key_].slab],state_->entries[key_].slot):nullptr;}
+        size_t bytes()const noexcept{return active_?bytes_:0;}
+        Status publish(Lease*out)noexcept {
+            if(!state_||!active_||!out||!out->empty())return Status::Invalid;
+            State&s=*state_;std::unique_lock<std::mutex>l(s.mutex);Entry&e=s.entries[key_];
+            if(!s.owner_alive||s.retiring)return Status::Namespace;
+            if(s.stats.cache.allocator_contract_broken)return Status::AllocatorContract;
+            if(!e.filling||e.present||e.generation!=generation_||!s.stats.fills_active)return Status::Invalid;
+            Slab&b=s.slabs[e.slab];if(b.keys[e.slot]!=busy||!guards_ok(b,e.slot))return Status::Layout;
+            if(s.stats.cache.lease_refs==SIZE_MAX)return Status::Invalid;
+            // Publication AND the first immutable consumer pin commit in the SAME state lock.
+            e.filling=false;e.present=true;e.leases=1;b.keys[e.slot]=key_;
+            --s.stats.fills_active;++s.stats.fill_commits;s.stats.fill_bytes+=bytes_;++s.stats.cache.resident_entries;++s.stats.cache.inserts;
+            ++s.stats.cache.lease_refs;++s.stats.cache.leased_entries;s.stats.cache.leased_charge+=stride_for(e.klass);
+            s.stats.cache.peak_leased_charge=std::max(s.stats.cache.peak_leased_charge,s.stats.cache.leased_charge);touch(s,key_);
+            out->state_=&s;out->key_=key_;out->bytes_=bytes_;out->generation_=generation_;
+            out->host_=SlabCache::host(b,e.slot);out->device_=SlabCache::device(b,e.slot);out->active_=true;
+            state_=nullptr;active_=false;bytes_=0;return Status::Ok;
+        }
+        Status abort()noexcept {
+            if(!state_)return Status::Empty;State*s=state_;std::unique_lock<std::mutex>l(s->mutex);
+            if(active_){Entry&e=s->entries[key_];
+                if(!e.filling||e.present||e.generation!=generation_||!s->stats.fills_active)return Status::Invalid;
+                Slab&b=s->slabs[e.slab];if(b.keys[e.slot]!=busy||!guards_ok(b,e.slot))return Status::Layout;
+                b.keys[e.slot]=none;e.filling=false;e.slab=e.slot=none;e.klass=-1;
+                --s->stats.fills_active;++s->stats.fill_aborts;s->stats.fill_abort_bytes+=bytes_;active_=false;bytes_=0;
+            }
+            if(s->owner_alive||s->stats.cache.lease_refs||s->stats.fills_active){state_=nullptr;return Status::Ok;}
             const auto rc=retire(*s,l);if(rc!=Status::Ok)return rc;
             state_=nullptr;l.unlock();delete s;return Status::Ok;
         }
@@ -184,7 +232,7 @@ public:
     ~SlabCache(){
         std::lock_guard<std::mutex>w(writer_mutex_);std::lock_guard<std::mutex>o(owner_mutex_);State*s=state_;if(!s)return;
         std::unique_lock<std::mutex>l(s->mutex);state_=nullptr;s->owner_alive=false;
-        if(s->stats.cache.lease_refs)return;
+        if(s->stats.cache.lease_refs||s->stats.fills_active)return;
         const auto rc=retire(*s,l);l.unlock();if(rc==Status::Ok)delete s;else warn_retained();
     }
     static size_t maximum_slab_records(size_t count,size_t budget,Allocator a)noexcept{
@@ -203,7 +251,7 @@ public:
         if(!m||m>=budget)return Status::Metadata;
         std::lock_guard<std::mutex>w(writer_mutex_);std::lock_guard<std::mutex>o(owner_mutex_);
         if(state_){std::unique_lock<std::mutex>l(state_->mutex);
-            if(state_->stats.cache.lease_refs)return Status::Busy;
+            if(state_->stats.cache.lease_refs||state_->stats.fills_active)return Status::Busy;
             if(state_->used_slabs)return Status::Namespace; //terminal/free-unknown budget cannot be spent again
             State*old=state_;state_=nullptr;l.unlock();delete old;}
         auto*s=new(std::nothrow)State;if(!s)return Status::Metadata;
@@ -218,7 +266,11 @@ public:
         std::unique_lock<std::mutex>l(state_->mutex);return retire(*state_,l);
     }
     Stats stats()const{std::lock_guard<std::mutex>o(owner_mutex_);if(!state_)return{};std::lock_guard<std::mutex>l(state_->mutex);return snapshot(*state_);}
-    Status borrow(uint64_t ns,size_t key,size_t n,Lease*out){
+    Status borrow(uint64_t ns,size_t key,size_t n,Lease*out){return borrow_policy(ns,key,n,out,true);}
+    //Read-only scans still own immutable bytes and account hits, but preserve decode LRU order.
+    Status borrow_no_touch(uint64_t ns,size_t key,size_t n,Lease*out){return borrow_policy(ns,key,n,out,false);}
+private:
+    Status borrow_policy(uint64_t ns,size_t key,size_t n,Lease*out,bool touch_lru){
         if(!out||!out->empty()||klass_for(n)<0)return Status::Invalid;
         std::lock_guard<std::mutex>o(owner_mutex_);if(!state_)return Status::Miss;State&s=*state_;std::lock_guard<std::mutex>l(s.mutex);
         if(ns!=s.stats.cache.namespace_id||s.retiring)return Status::Namespace;
@@ -229,10 +281,11 @@ public:
         if(e.leases==SIZE_MAX||s.stats.cache.lease_refs==SIZE_MAX)return Status::Invalid;
         if(!e.leases){++s.stats.cache.leased_entries;s.stats.cache.leased_charge+=stride_for(c);
             s.stats.cache.peak_leased_charge=std::max(s.stats.cache.peak_leased_charge,s.stats.cache.leased_charge);}
-        ++e.leases;++s.stats.cache.lease_refs;++s.stats.cache.hits;++s.stats.classes[c].hits;s.stats.hit_bytes+=n;touch(s,key);
+        ++e.leases;++s.stats.cache.lease_refs;++s.stats.cache.hits;++s.stats.classes[c].hits;s.stats.hit_bytes+=n;if(touch_lru)touch(s,key);
         const Slab&b=s.slabs[e.slab];out->state_=&s;out->key_=key;out->bytes_=n;out->generation_=e.generation;
         out->host_=host(b,e.slot);out->device_=device(b,e.slot);out->active_=true;return Status::Hit;
     }
+public:
     Status insert(uint64_t ns,size_t key,const void*src,size_t n){
         const int c=klass_for(n);uintptr_t end=0;if(c<0||!span(src,n,&end))return Status::Invalid;
         std::lock_guard<std::mutex>w(writer_mutex_);std::unique_lock<std::mutex>o(owner_mutex_);if(!state_)return Status::Bypass;
@@ -240,6 +293,7 @@ public:
         if(ns!=s.stats.cache.namespace_id||s.retiring)return Status::Namespace;
         if(key>=s.count)return Status::Invalid;if(s.stats.cache.allocator_contract_broken)return Status::AllocatorContract;
         Entry&e=s.entries[key];if(e.present){if(e.klass!=c)return Status::Layout;touch(s,key);return Status::Existing;}
+        if(e.filling){++s.stats.fill_busy_bypasses;++s.stats.cache.bypasses;++s.stats.classes[c].bypasses;return Status::Bypass;}
         if(e.generation==UINT64_MAX)return Status::Invalid;
         for(size_t i=0;i<s.used_slabs;++i){const Slab&b=s.slabs[i];if(!b.free_invoked&&overlap(src,n,b.allocation.host,b.allocation.bytes))return Status::Invalid;}
         size_t bi=none,si=none;
@@ -290,6 +344,66 @@ public:
         l.unlock();initialize_slot(b,si);if(hook)hook(context);std::memcpy(host(b,si),src,n);l.lock();
         e.slab=bi;e.slot=si;e.klass=c;e.present=true;e.leases=0;++e.generation;b.keys[si]=key;
         ++s.stats.cache.resident_entries;++s.stats.cache.inserts;touch(s,key);return Status::Ok;
+    }
+
+    // Same paired geometry, gross charge, held-tail and namespace checks as insert.
+    Status reserve(uint64_t ns,size_t key,size_t n,Write*out){
+        const int c=klass_for(n);if(c<0||!out||!out->empty())return Status::Invalid;
+        std::lock_guard<std::mutex>w(writer_mutex_);std::unique_lock<std::mutex>o(owner_mutex_);if(!state_)return Status::Bypass;
+        State&s=*state_;std::unique_lock<std::mutex>l(s.mutex);o.unlock();
+        if(ns!=s.stats.cache.namespace_id||s.retiring)return Status::Namespace;
+        if(key>=s.count)return Status::Invalid;if(s.stats.cache.allocator_contract_broken)return Status::AllocatorContract;
+        Entry&e=s.entries[key];if(e.present){if(e.klass!=c)return Status::Layout;touch(s,key);return Status::Existing;}
+        if(e.filling){++s.stats.fill_busy_bypasses;++s.stats.cache.bypasses;++s.stats.classes[c].bypasses;return Status::Bypass;}
+        if(e.generation==UINT64_MAX)return Status::Invalid;
+        size_t bi=none,si=none;
+        for(size_t i=0;i<s.used_slabs&&bi==none;++i){const Slab&b=s.slabs[i];if(!b.ready||b.free_invoked)continue;
+            for(size_t j=size_t(c)*b.pairs;j<size_t(c+1)*b.pairs;++j)if(b.keys[j]==none){bi=i;si=j;break;}}
+        if(bi==none&&s.used_slabs<s.slab_records){
+            const size_t room=s.stats.cache.budget-s.stats.cache.charge();size_t p=std::min(s.next_pairs,max_pairs),quote=0;
+            for(;p;--p){quote=s.allocator.quote(s.allocator.context,request_for(p));
+                if(quote&&(quote<s.minimum_quote||quote<request_for(p))){s.stats.cache.allocator_contract_broken=true;++s.stats.cache.contract_refusals;return Status::AllocatorContract;}
+                if(quote&&quote<=room)break;}
+            if(p){
+                const size_t request=request_for(p);s.stats.cache.reserved_charge=quote;++s.stats.growth_attempts;peak(s);
+                Allocation a{};l.unlock();const bool got=s.allocator.allocate(s.allocator.context,request,quote,&a);l.lock();
+                s.stats.cache.reserved_charge=0;
+                const bool empty=!a.token&&!a.host&&!a.device&&!a.bytes&&!a.charged_bytes;
+                if(!got&&empty){++s.stats.cache.allocation_failures;++s.stats.growth_failures;return Status::Allocation;}
+                bi=s.used_slabs++;Slab&b=s.slabs[bi];b.present=true;b.pairs=p;b.request=request;b.allocation=a;b.keys.fill(none);b.free_safe=a.token!=nullptr;
+                //Only a credible actual charge can refund a conservative quote.
+                //An undercharge/missing charge keeps the reservation as a lower bound.
+                b.ledger_charge=a.charged_bytes&&a.charged_bytes>=a.bytes?
+                    std::max(a.bytes,a.charged_bytes):std::max(quote,a.bytes);
+                s.stats.cache.payload_charge=sat_add(s.stats.cache.payload_charge,b.ledger_charge);
+                s.stats.retained_backing_charge=sat_add(s.stats.retained_backing_charge,b.ledger_charge);++s.stats.retained_slab_owners;
+                uintptr_t he=0,de=0;bool valid=got&&a.token&&span(a.host,a.bytes,&he)&&span(a.device,a.bytes,&de)&&a.bytes>=request&&
+                    a.charged_bytes>=a.bytes&&a.charged_bytes<=quote&&uintptr_t(a.host)%64==0&&uintptr_t(a.device)%64==0;
+                if(!a.charged_bytes||a.charged_bytes<a.bytes||a.charged_bytes>quote||!a.token)s.stats.cache.actual_charge_known=false;
+                for(size_t i=0;i<bi;++i){const Slab&old=s.slabs[i];
+                    if(a.token==old.allocation.token||overlap(a.host,a.bytes,old.allocation.host,old.allocation.bytes)||
+                       overlap(a.device,a.bytes,old.allocation.device,old.allocation.bytes)){valid=false;b.free_safe=false;s.stats.cache.actual_charge_known=false;}}
+                peak(s);
+                if(!valid){s.stats.cache.allocator_contract_broken=true;++s.stats.cache.contract_refusals;return Status::AllocatorContract;}
+                l.unlock();for(size_t j=0;j<2*p;++j)initialize_slot(b,j);l.lock();b.ready=true;
+                s.next_pairs=std::min(size_t(32),s.next_pairs*2);si=size_t(c)*p;
+            }
+        }
+        if(bi==none){
+            const size_t victim=s.last[c];
+            if(victim==none||s.entries[victim].leases){++s.stats.cache.bypasses;++s.stats.classes[c].bypasses;
+                if(victim!=none){++s.stats.cache.leased_tail_bypasses;++s.stats.classes[c].leased_tail_bypasses;}return Status::Bypass;}
+            Entry&v=s.entries[victim];bi=v.slab;si=v.slot;
+            if(!guards_ok(s.slabs[bi],si))return Status::Layout;
+            unlink(s,victim);v.present=false;v.slab=v.slot=none;v.klass=-1;
+            --s.stats.cache.resident_entries;++s.stats.cache.evictions;
+        }
+        Slab&b=s.slabs[bi];if(!guards_ok(b,si))return Status::Layout;
+        if(s.stats.fills_active==SIZE_MAX)return Status::Invalid;
+        initialize_slot(b,si);b.keys[si]=busy;e.slab=bi;e.slot=si;e.klass=c;e.filling=true;e.leases=0;++e.generation;
+        ++s.stats.fills_active;++s.stats.fill_reservations;
+        out->state_=&s;out->key_=key;out->bytes_=n;out->generation_=e.generation;out->active_=true;
+        return Status::Ok; // writer/owner/state locks all leave scope before caller fills payload
     }
 };
 } // namespace ds41_mapped

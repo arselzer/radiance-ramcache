@@ -52,5 +52,13 @@ implementation passed the portable checks, 549 HOST cases and the C/CXX ABI chec
 in the frozen experiment. The current merged source still needs its own tests.
 The new sparse-GEMV/WMMA experiments remain separate from this branch.
 
+The mapped expert cache now has an opt-in direct-fill path: a miss reserves an
+unpublished charged slot, packs into it without holding the writer lock, then
+publishes the complete bytes together with the first reader lease. Allocation
+pressure uses the existing staging-window fallback. Read-only prefill can borrow
+warm slab entries without changing their recency and never admits a cold entry.
+These changes and their portable/lifecycle controls await current-branch build
+and GPU transport validation. The direct-fill switch remains off by default.
+
 No model weights, checkpoint data, deployment credentials or local runtime
 receipts are included. The production QFN service has not been upgraded.

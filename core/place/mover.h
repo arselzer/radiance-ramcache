@@ -751,6 +751,7 @@ private:
     //Allocator context must outlive every window lease. Destruction drains explicitly first.
     NativeMappedFileCache mapped_file_cache_;
     bool mapped_file_cache_on_ = false;
+    bool mapped_direct_fill_on_ = false; // captured at init; only slab/Normal/routed leases
     static constexpr size_t kMappedPerWindow = size_t(RAD_PLACE_FILE_WINDOW_BYTES) / NativeMappedFileCache::DN;
     struct MappedWindow {
         std::array<NativeMappedFileCache::Lease,kMappedPerWindow> leases;

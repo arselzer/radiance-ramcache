@@ -720,6 +720,92 @@ TEST(mapped_slab_real_HOST_adapter_alias_failure_is_owned_until_terminal_cleanup
     AdapterTest::reject_alias(adapter,false);need(adapter.clear(),"malformed independent owner retired once");
     CHECK_EQ(adapter.stats().api.free_invocations,uint64_t(1));CHECK_EQ(adapter.stats().slabs.terminal_free_invoked_owners,size_t(1));
 }
+
+namespace {
+void slab_readonly_hot_cold_case(bool relaid){
+    Case c(relaid,22*MiB,"1",true,"1");const std::vector<int32_t>a{c.units[0]},b{c.units[1]};
+    const auto RO=NativeFileCacheReadPolicy::ReadOnly;
+    c.stage(a);c.check(a);const auto initial=Access::stats(*c.transport.mover);
+    REQUIRE(initial.slab_policy);REQUIRE_EQ(initial.slabs.classes[0].capacity_slots,size_t(1));
+    REQUIRE_EQ(initial.slabs.classes[1].capacity_slots,size_t(1));
+    const auto callbacks=c.calls.load();const auto warm0=Io::capture();c.stage(a,0,RO);const auto warm1=Io::capture();
+    CHECK_EQ(delta(warm0,warm1).calls,uint64_t(0));CHECK_EQ(c.calls.load(),callbacks);
+    CHECK_EQ(Access::stats(*c.transport.mover).cache.lease_refs,size_t(2));
+    REQUIRE(c.driver.copies.size()>=2);CHECK(c.driver.copies[c.driver.copies.size()-1].mapped);
+    CHECK(c.driver.copies[c.driver.copies.size()-2].mapped);CHECK_EQ(Access::clear(*c.transport.mover),RAD_E_STATE);
+    //Both real source leases stay live while a different RO expert reads into the
+    //other pinned window. No insertion, allocator call or GPU-duration mutex wait.
+    const auto miss0=Io::capture();c.stage(b,1,RO);const auto miss1=Io::capture();
+    CHECK(delta(miss0,miss1).calls>=2);CHECK_EQ(Access::stats(*c.transport.mover).cache.lease_refs,size_t(2));
+    CHECK_EQ(c.driver.pending(),size_t(4));c.check(b);c.check(a);
+    const auto again0=Io::capture();c.stage(b,1,RO);const auto again1=Io::capture();
+    CHECK(delta(again0,again1).calls>=2);c.check(b);
+    const auto readonly=Access::stats(*c.transport.mover);
+    CHECK_EQ(readonly.cache.inserts,initial.cache.inserts);CHECK_EQ(readonly.cache.evictions,initial.cache.evictions);
+    CHECK_EQ(readonly.allocations,initial.allocations);CHECK_EQ(readonly.public_free_invocations,uint64_t(0));
+    CHECK_EQ(readonly.cache.payload_charge,initial.cache.payload_charge);
+    CHECK_EQ(readonly.cache.hits,initial.cache.hits+2);CHECK_EQ(readonly.cache.misses,initial.cache.misses+4);
+    CHECK_EQ(c.calls.load(),callbacks+(relaid?4:0));
+    CHECK_EQ(c.transport.mover->stats().file_prefill_ro_hits,uint64_t(2));
+    CHECK_EQ(c.transport.mover->stats().file_prefill_ro_misses,uint64_t(4));
+    CHECK_EQ(c.transport.mover->stats().file_prefill_ro_hit_bytes,uint64_t(18800640));
+    CHECK_EQ(c.transport.mover->stats().file_prefill_ro_miss_bytes,uint64_t(37601280));
+    const auto a0=Io::capture();c.stage(a);const auto a1=Io::capture();
+    CHECK_EQ(delta(a0,a1).calls,uint64_t(0));c.check(a); //RO B did not replace A.
+    const auto b0=Io::capture();c.stage(b);const auto b1=Io::capture();
+    CHECK(delta(b0,b1).calls>=2);c.check(b); //Normal still admits and evicts both A shapes.
+    const auto cold0=Io::capture();c.stage(a,0,RO);const auto cold1=Io::capture();
+    CHECK(delta(cold0,cold1).calls>=2);c.check(a);
+    const auto hot0=Io::capture();c.stage(b,1,RO);const auto hot1=Io::capture();
+    CHECK_EQ(delta(hot0,hot1).calls,uint64_t(0));c.check(b); //RO miss A left B resident.
+    const auto normal0=Io::capture();c.stage(a);const auto normal1=Io::capture();
+    CHECK(delta(normal0,normal1).calls>=2);c.check(a);
+    const auto final=Access::stats(*c.transport.mover);
+    CHECK_EQ(final.cache.evictions,initial.cache.evictions+4);CHECK_EQ(final.cache.inserts,initial.cache.inserts+4);
+    CHECK_EQ(final.allocations,uint64_t(1));CHECK_EQ(final.api.free_invocations,uint64_t(0));
+    CHECK(has(c.transport.mover->report(),"retained-slab hit lease without LRU touch"));
+}
+} //namespace
+TEST(mapped_slab_ReadOnly_identity_warm_lease_and_cold_miss_never_admits){slab_readonly_hot_cold_case(false);}
+TEST(mapped_slab_ReadOnly_relayout_warm_lease_and_cold_miss_never_admits){slab_readonly_hot_cold_case(true);}
+
+TEST(mapped_slab_ReadOnly_warm_copy_record_failure_retains_until_checked_drain){
+    Case c(true,22*MiB,"1",true,"1");const std::vector<int32_t>a{c.units[0]};c.stage(a);c.check(a);
+    const auto RO=NativeFileCacheReadPolicy::ReadOnly;const auto before=Access::stats(*c.transport.mover);
+    c.driver.fail_record=true;std::vector<int32_t>staged;
+    CHECK_EQ(c.transport.mover->stage_file_units(a,c.transport.mover->file_buffer(0),
+        c.transport.mover->file_buffer_bytes(),nullptr,c.transport.done,&staged,RO),RAD_E_STATE);
+    CHECK_EQ(c.driver.pending(),size_t(2));CHECK_EQ(Access::stats(*c.transport.mover).cache.lease_refs,size_t(2));
+    const int window=Access::last_window(*c.transport.mover);const auto attempts=c.driver.copy_attempts;
+    c.driver.fail_drain=true;CHECK_EQ(Access::retire(*c.transport.mover,window),RAD_E_STATE);
+    Access::next_window(*c.transport.mover,window);const auto io0=Io::capture();
+    CHECK_EQ(c.transport.mover->stage_file_units(a,c.transport.mover->file_buffer(0),
+        c.transport.mover->file_buffer_bytes(),nullptr,c.transport.done,&staged,RO),RAD_E_STATE);
+    const auto io1=Io::capture();CHECK_EQ(delta(io0,io1).calls,uint64_t(0));
+    CHECK_EQ(c.driver.copy_attempts,attempts);CHECK_EQ(Access::stats(*c.transport.mover).cache.lease_refs,size_t(2));
+    CHECK_EQ(Access::clear(*c.transport.mover),RAD_E_STATE);
+    for(auto h:c.plan.units[size_t(a[0])].weights)CHECK(c.transport.mover->residency()->lookup(h)->ptr==nullptr);
+    c.driver.fail_drain=c.driver.fail_record=false;need(Access::retire(*c.transport.mover,window),"RO source copies drained before release");
+    CHECK_EQ(c.driver.pending(),size_t(0));CHECK_EQ(Access::stats(*c.transport.mover).cache.lease_refs,size_t(0));
+    c.stage(a,0,RO);c.check(a);const auto after=Access::stats(*c.transport.mover);
+    CHECK_EQ(after.allocations,before.allocations);CHECK_EQ(after.cache.evictions,before.cache.evictions);
+    CHECK_EQ(after.cache.inserts,before.cache.inserts);CHECK_EQ(after.public_free_invocations,uint64_t(0));
+}
+
+TEST(mapped_slab_ReadOnly_changed_file_epoch_refuses_before_borrow_IO_copy_or_publish){
+    Case c(false,22*MiB,"1",true,"1");const std::vector<int32_t>a{c.units[0]};c.stage(a);c.check(a);
+    REQUIRE_EQ(::ftruncate(c.image->fd,off_t(c.image->bytes.size()+1)),0);REQUIRE_EQ(::fsync(c.image->fd),0);
+    const auto before=Access::stats(*c.transport.mover);const auto attempts=c.driver.copy_attempts;
+    const auto h2d=c.transport.mover->stats().h2d_bytes;std::vector<int32_t>staged;const auto io0=Io::capture();
+    CHECK_EQ(c.transport.mover->stage_file_units(a,c.transport.mover->file_buffer(0),
+        c.transport.mover->file_buffer_bytes(),nullptr,c.transport.done,&staged,NativeFileCacheReadPolicy::ReadOnly),RAD_E_STATE);
+    const auto io1=Io::capture();const auto after=Access::stats(*c.transport.mover);
+    CHECK_EQ(delta(io0,io1).calls,uint64_t(0));CHECK_EQ(c.driver.copy_attempts,attempts);CHECK_EQ(c.driver.pending(),size_t(0));
+    CHECK_EQ(after.cache.hits,before.cache.hits);CHECK_EQ(after.cache.misses,before.cache.misses);
+    CHECK_EQ(after.cache.lease_refs,size_t(0));CHECK_EQ(c.transport.mover->stats().h2d_bytes,h2d);
+    for(auto h:c.plan.units[size_t(a[0])].weights)CHECK(c.transport.mover->residency()->lookup(h)->ptr==nullptr);
+}
+
 int main(int argc,char** argv){
 #ifdef RAD_HAVE_HIP
     std::fprintf(stderr,"HOST-only matching fresh Core required; refusing GPU binary.\n");return 2;
@@ -727,4 +813,92 @@ int main(int argc,char** argv){
     if(!device_is_host()){std::fprintf(stderr,"HOST backend required.\n");return 2;}
     return radtest::run_all(argc,argv);
 #endif
+}
+
+namespace {
+struct DirectFillEnvironment {
+    bool had=false;std::string old;
+    DirectFillEnvironment(){const auto*p=std::getenv("RADIANCE_EXPERIMENTAL_NATIVE_CACHE_DIRECT_FILL");had=p;old=p?p:"";::setenv("RADIANCE_EXPERIMENTAL_NATIVE_CACHE_DIRECT_FILL","1",1);}
+    ~DirectFillEnvironment(){if(had)::setenv("RADIANCE_EXPERIMENTAL_NATIVE_CACHE_DIRECT_FILL",old.c_str(),1);else::unsetenv("RADIANCE_EXPERIMENTAL_NATIVE_CACHE_DIRECT_FILL");}
+};
+struct FillResidency {
+    ResidencyTable* table;uint64_t epoch;std::vector<std::pair<rad_weight,WeightSlot>> slots;
+    FillResidency(Case&c,const std::vector<int32_t>& units):table(c.transport.mover->residency()),epoch(table->epoch()){
+        for(auto u:units)for(auto h:c.plan.units[size_t(u)].weights){const auto*w=table->lookup(h);REQUIRE(w);slots.push_back({h,*w});}}
+    void unchanged(){CHECK_EQ(table->epoch(),epoch);for(const auto&x:slots){const auto*w=table->lookup(x.first);REQUIRE(w);
+        CHECK(w->ptr==x.second.ptr);CHECK(w->ready==x.second.ready);CHECK_EQ(w->generation,x.second.generation);}}
+};
+void restore_relayout(Case&c){c.transport.mover->set_file_relayout([&c](const WeightInfo&w,const RadTensor*ps,void*dst,int64_t n){
+    c.calls.fetch_add(1,std::memory_order_relaxed);const auto*k=weight_layout_kernel(c.fixture.prog,w);
+    return k&&k->relayout?k->relayout(nullptr,0,w.lay_operand,&w.enc,w.sel,ps,w.n_sel,dst,n):RAD_E_STATE;});}
+}
+TEST(mapped_direct_fill_cold_identity_and_relayout_pin_cache_source_without_window_insertion_copy){
+    for(bool relaid:{false,true}){DirectFillEnvironment direct;Case c(relaid,80*MiB,"1",true,"1");const std::vector<int32_t>a{c.units[0]};
+        c.stage(a);const auto cold=Access::stats(*c.transport.mover);
+        CHECK_EQ(cold.slabs.fill_reservations,uint64_t(2));CHECK_EQ(cold.slabs.fill_commits,uint64_t(2));CHECK_EQ(cold.slabs.fill_bytes,uint64_t(18800640));
+        CHECK_EQ(cold.slabs.fills_active,size_t(0));CHECK_EQ(cold.cache.lease_refs,size_t(2));CHECK_EQ(c.driver.pending(),size_t(2));
+        CHECK_EQ(c.transport.mover->stats().mapped_source_copies,uint64_t(2));c.check(a);
+        const auto callbacks=c.calls.load();const auto before=Io::capture();c.stage(a);const auto after=Io::capture();
+        CHECK_EQ(delta(before,after).calls,uint64_t(0));CHECK_EQ(c.calls.load(),callbacks);CHECK_EQ(Access::stats(*c.transport.mover).slabs.fill_commits,uint64_t(2));c.check(a);
+    }
+}
+TEST(mapped_direct_fill_ReadOnly_miss_does_not_reserve_or_admit_then_warm_lease_works){
+    DirectFillEnvironment direct;Case c(true,80*MiB,"1",true,"1");const std::vector<int32_t>a{c.units[0]};
+    c.stage(a,0,NativeFileCacheReadPolicy::ReadOnly);auto cold=Access::stats(*c.transport.mover);
+    CHECK_EQ(cold.slabs.fill_reservations,uint64_t(0));CHECK_EQ(cold.cache.resident_entries,size_t(0));CHECK_EQ(cold.cache.lease_refs,size_t(0));c.check(a);
+    c.stage(a);c.check(a);const auto before=Io::capture();c.stage(a,0,NativeFileCacheReadPolicy::ReadOnly);const auto after=Io::capture();
+    CHECK_EQ(delta(before,after).calls,uint64_t(0));CHECK_EQ(Access::stats(*c.transport.mover).slabs.fill_commits,uint64_t(2));
+    CHECK_EQ(Access::stats(*c.transport.mover).cache.lease_refs,size_t(2));c.check(a);
+}
+TEST(mapped_direct_fill_partial_relayout_error_cancels_before_H2D_or_Residency_then_reuses){
+    DirectFillEnvironment direct;Case c(true,80*MiB,"1",true,"1");Access::serial_reader(*c.transport.mover);const std::vector<int32_t>a{c.units[0]};FillResidency old(c,a);
+    c.transport.mover->set_file_relayout([](const WeightInfo&,const RadTensor*,void*dst,int64_t n){std::memset(dst,0x9b,size_t(n/3));return RAD_E_STATE;});
+    std::vector<int32_t>scratch;CHECK_EQ(c.transport.mover->stage_file_units(a,c.transport.mover->file_buffer(0),c.transport.mover->file_buffer_bytes(),nullptr,c.transport.done,&scratch),RAD_E_STATE);
+    old.unchanged();auto failed=Access::stats(*c.transport.mover);
+    CHECK_EQ(failed.slabs.fill_aborts,uint64_t(2));CHECK_EQ(failed.slabs.fills_active,size_t(0));CHECK_EQ(failed.cache.resident_entries,size_t(0));CHECK_EQ(c.driver.copy_attempts,size_t(0));
+    const auto allocations=failed.allocations;restore_relayout(c);c.stage(a);c.check(a);CHECK_EQ(Access::stats(*c.transport.mover).allocations,allocations);
+}
+TEST(mapped_direct_fill_epoch_change_after_pack_aborts_unpublished_reservation){
+    DirectFillEnvironment direct;Case c(true,80*MiB,"1",true,"1");Access::serial_reader(*c.transport.mover);const std::vector<int32_t>a{c.units[0]};FillResidency old(c,a);
+    c.transport.mover->set_file_relayout([&c](const WeightInfo&w,const RadTensor*ps,void*dst,int64_t n){
+        const auto*k=weight_layout_kernel(c.fixture.prog,w);if(!k||!k->relayout)return int(RAD_E_STATE);
+        const int rc=k->relayout(nullptr,0,w.lay_operand,&w.enc,w.sel,ps,w.n_sel,dst,n);if(rc<0)return rc;
+        if(::ftruncate(c.image->fd,off_t(c.image->bytes.size()+1))||::fsync(c.image->fd))return int(RAD_E_STATE);return int(RAD_OK);});
+    std::vector<int32_t>scratch;CHECK_EQ(c.transport.mover->stage_file_units(a,c.transport.mover->file_buffer(0),c.transport.mover->file_buffer_bytes(),nullptr,c.transport.done,&scratch),RAD_E_STATE);
+    old.unchanged();auto failed=Access::stats(*c.transport.mover);CHECK_EQ(failed.slabs.fill_aborts,uint64_t(1));
+    CHECK_EQ(failed.slabs.fill_commits,uint64_t(0));CHECK_EQ(failed.slabs.fills_active,size_t(0));CHECK_EQ(failed.cache.resident_entries,size_t(0));CHECK_EQ(c.driver.copy_attempts,size_t(0));
+}
+TEST(mapped_direct_fill_cold_and_warm_record_drain_faults_keep_first_consumer_pin){
+    for(bool warm:{false,true}){DirectFillEnvironment direct;Case c(false,80*MiB,"1",true,"1");const std::vector<int32_t>a{c.units[0]};
+        if(warm){c.stage(a);c.check(a);}FillResidency old(c,a);c.driver.fail_record=true;std::vector<int32_t>scratch;
+        CHECK_EQ(c.transport.mover->stage_file_units(a,c.transport.mover->file_buffer(0),c.transport.mover->file_buffer_bytes(),nullptr,c.transport.done,&scratch),RAD_E_STATE);
+        old.unchanged();CHECK_EQ(c.driver.pending(),size_t(2));CHECK_EQ(Access::stats(*c.transport.mover).cache.lease_refs,size_t(2));
+        c.driver.fail_drain=true;CHECK_EQ(Access::drain(*c.transport.mover),RAD_E_STATE);CHECK_EQ(Access::clear(*c.transport.mover),RAD_E_STATE);old.unchanged();
+        CHECK_EQ(Access::stats(*c.transport.mover).api.free_invocations,uint64_t(0));CHECK_EQ(Access::stats(*c.transport.mover).cache.lease_refs,size_t(2));
+        c.driver.fail_drain=c.driver.fail_record=false;need(Access::drain(*c.transport.mover),"actual fake-consumer completion acknowledged");
+        CHECK_EQ(Access::stats(*c.transport.mover).cache.lease_refs,size_t(0));c.stage(a);c.check(a);
+    }
+}
+TEST(mapped_direct_fill_held_class_pressure_uses_original_window_without_second_admission){
+    DirectFillEnvironment direct;Case c(false,26*MiB,"1",true,"1");const std::vector<int32_t>a{c.units[0]},b{c.units[1]};
+    c.stage(a);const auto first=Access::stats(*c.transport.mover);CHECK_EQ(first.cache.lease_refs,size_t(2));
+    c.stage(b,1);auto pressure=Access::stats(*c.transport.mover);
+    CHECK_EQ(pressure.slabs.fill_commits,uint64_t(2));CHECK_EQ(pressure.cache.leased_tail_bypasses,uint64_t(2));
+    CHECK_EQ(pressure.allocations,first.allocations);CHECK_EQ(pressure.cache.lease_refs,size_t(2));CHECK_EQ(c.driver.pending(),size_t(4));
+    c.check(b);c.check(a);CHECK_EQ(Access::stats(*c.transport.mover).slabs.fills_active,size_t(0));
+}
+TEST(mapped_direct_fill_worker_callback_exception_retires_all_unpublished_producers){
+    Environment mapped("1","1");DirectFillEnvironment direct;
+    struct WorkersOn {bool had;std::string old;WorkersOn(){const auto*p=std::getenv("RADIANCE_EXPERIMENTAL_NATIVE_FILE_WORKERS");had=p;old=p?p:"";::setenv("RADIANCE_EXPERIMENTAL_NATIVE_FILE_WORKERS","1",1);}
+        ~WorkersOn(){if(had)::setenv("RADIANCE_EXPERIMENTAL_NATIVE_FILE_WORKERS",old.c_str(),1);else::unsetenv("RADIANCE_EXPERIMENTAL_NATIVE_FILE_WORKERS");}}workers;
+    Fixture f;f.experts();Image image(f.lay_out(true));Config cfg=plan_config(false);Plan plan=planned(f,cfg,true);
+    const std::vector<int32_t> selected{two_ssd_experts(plan)[0]};std::atomic<uint64_t>calls{0};Access::Driver driver;Transport t;
+    t.open(f,plan,image,80*MiB,calls);Access::attach(*t.mover,driver);
+    t.mover->set_file_relayout([](const WeightInfo&,const RadTensor*,void*dst,int64_t n)->int{std::memset(dst,0xaf,size_t(n/4));throw std::runtime_error("actual CPU worker fill failed");});
+    const auto before=t.mover->residency()->epoch();std::vector<int32_t>scratch;
+    CHECK_EQ(t.mover->stage_file_units(selected,t.mover->file_buffer(0),t.mover->file_buffer_bytes(),nullptr,t.done,&scratch),RAD_E_STATE);
+    CHECK_EQ(t.mover->residency()->epoch(),before);const auto stats=Access::stats(*t.mover);
+    CHECK(stats.slabs.fill_aborts>0);CHECK_EQ(stats.slabs.fills_active,size_t(0));CHECK_EQ(stats.slabs.fill_commits,uint64_t(0));
+    CHECK_EQ(stats.cache.resident_entries,size_t(0));CHECK_EQ(stats.cache.lease_refs,size_t(0));CHECK_EQ(driver.copy_attempts,size_t(0));
+    for(auto u:selected)for(auto h:plan.units[size_t(u)].weights)CHECK(t.mover->residency()->lookup(h)->ptr==nullptr);
 }

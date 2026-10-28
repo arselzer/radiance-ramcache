@@ -19,8 +19,10 @@ class NativeMappedFileCache {
 public:
     using Cache=ds41_mapped::Cache;
     using SlabCache=ds41_mapped::SlabCache;
+    class Write;
     class Lease {
         friend class NativeMappedFileCache;
+        friend class Write;
         Cache::Lease regular_;
         SlabCache::Lease slab_;
     public:
@@ -37,6 +39,22 @@ public:
             const auto b=slab_.release();return b==Cache::Status::Empty?a:b;
         }
         Cache::Stats stats()const{return slab_.empty()?regular_.stats():slab_.stats().cache;}
+    };
+    class Write {
+        friend class NativeMappedFileCache;
+        SlabCache::Write slab_;
+    public:
+        Write()=default;Write(const Write&)=delete;Write&operator=(const Write&)=delete;
+        Write(Write&&)=default;Write&operator=(Write&&)=delete;
+        bool active()const noexcept{return slab_.active();}
+        bool empty()const noexcept{return slab_.empty();}
+        uint8_t*host()const noexcept{return slab_.host();}
+        size_t bytes()const noexcept{return slab_.bytes();}
+        Cache::Status abort()noexcept{return slab_.abort();}
+        Cache::Status publish(Lease*out)noexcept {
+            if(!out||!out->empty())return Cache::Status::Invalid;
+            return slab_.publish(&out->slab_);
+        }
     };
     using Status=Cache::Status;
     static constexpr size_t GU=12533760,DN=6266880;
@@ -228,6 +246,16 @@ public:
     Status borrow(size_t key,size_t bytes,Lease* lease) noexcept {
         if(!lease||!lease->empty())return Status::Invalid;
         return slab_policy_?slab_cache_.borrow(1,key,bytes,&lease->slab_):cache_.borrow(1,key,bytes,&lease->regular_);
+    }
+    //Configuration is quiescent; legacy per-entry ReadOnly remains the existing bypass.
+    bool supports_readonly_borrow()const noexcept{return slab_policy_;}
+    Status borrow_readonly(size_t key,size_t bytes,Lease*lease)noexcept{
+        if(!lease||!lease->empty())return Status::Invalid;
+        return slab_policy_?slab_cache_.borrow_no_touch(1,key,bytes,&lease->slab_):Status::Miss;
+    }
+    Status reserve_fill(size_t key,size_t bytes,Write*out)noexcept {
+        if(!out||!out->empty())return Status::Invalid;
+        return slab_policy_?slab_cache_.reserve(1,key,bytes,&out->slab_):Status::Bypass;
     }
     Status insert(size_t key,const void* source,size_t bytes) noexcept {
         return slab_policy_?slab_cache_.insert(1,key,source,bytes):cache_.insert(1,key,source,bytes);

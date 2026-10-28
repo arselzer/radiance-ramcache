@@ -1,6 +1,6 @@
 DeepSeek V4.1 Flash native MXFP4 development
 
-This branch combines upstream main 9497bf90 and DeepSeek WIP PR266
+This branch combines upstream main 4374bea1 and DeepSeek WIP PR266
 (bd65d4e5) with the private ABI32 RAM-cache development. It is experimental.
 
 Included optimizations: selected native expert reads, retained mapped RAM
@@ -16,10 +16,19 @@ decode from 4.97 to 5.36 tokens/s and reduced total prefill from 60.13 to 40.87 
 These are single sweeps; long context, concurrency and broad quality are
 not established. Tiny numerical and transport checks were also run.
 
-Validation used a freshly built Core with separately linked, compatible
-kernel objects. A clean full build of this published checkout is pending. The newest upstream
-merge adds grammar reuse, diagnostics, documentation and test improvements;
-it has not yet been included in a GPU benchmark.
+Those GPU measurements used a freshly built Core with separately linked,
+compatible kernel objects, before the latest upstream source merge.
+
+The complete merged checkout now builds with RAD_WITH_HIP=OFF and
+RAD_WITH_FFMPEG=OFF. Of 97 fast CPU test targets, 95 passed. The two failures
+are images_test and videos_test: their media success paths require FFmpeg,
+which was disabled in this build. The original failing receipts are preserved;
+this is not an all-green media or GPU validation. Text-inference, placement,
+checkpoint, configuration, conversion, scheduler and ABI checks passed.
+
+The latest merge includes upstream placement, prefix and hc_read improvements.
+It also fixes expert-pin-top for normalized profile shares and rejects non-finite
+fractions, with regression coverage. It has not been GPU-benchmarked.
 No learned DSpark MTP or second model bank is included yet.
 
 No model weights, checkpoint data, deployment credentials or local runtime

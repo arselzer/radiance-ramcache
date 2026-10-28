@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <map>
 #include <queue>
@@ -919,7 +920,63 @@ int Mover::mapped_file_drain() {
  * The one-Mover Program and held file epoch define the namespace, so a hit requires no payload
  * hash or relayout. Direct-layout weights use each worker's aligned input, avoiding a shared
  * O_DIRECT bounce buffer when several workers fill differently aligned window offsets. */
-int Mover::read_native_file(const WeightInfo& w, void* dst, int64_t dst_cap, RelayIn* in,
+bool Mover::prefetch_trace_slot(const M1PrefetchTrace& t) {
+    if(!m1_trace_tag_valid(t))return false;
+    const uint64_t n=prefetch_trace_lines_.fetch_add(1,std::memory_order_relaxed);
+    if(n==kM1PrefetchTraceMaxLines)
+        RAD_INFO("DS41M1TRACE v=1 kind=truncated rank=%lld limit=%llu; incomplete trace, no recall estimate",
+            (long long)t.rank,(unsigned long long)kM1PrefetchTraceMaxLines);
+    return n<kM1PrefetchTraceMaxLines;
+}
+
+void Mover::prefetch_trace_route(const M1PrefetchTrace& t,const int32_t* counts,size_t SSD_units) {
+    if(!m1_trace_tag_valid(t) || !counts || SSD_units>6)return;
+    char ids[128]{};size_t at=0;int sum=0;
+    for(int e=0;e<96;++e){
+        if(counts[e]<0 || counts[e]>1)return;
+        sum+=counts[e];if(sum>6)return;
+        if(counts[e]){
+            const int n=std::snprintf(ids+at,sizeof(ids)-at,"%s%d",at?",":"",e);
+            if(n<0 || size_t(n)>=sizeof(ids)-at)return;
+            at+=size_t(n);
+        }
+    }
+    if(prefetch_trace_slot(t))
+        RAD_INFO("DS41M1TRACE v=1 kind=route rank=%lld gen=%llu producer=%llu layer=%lld ready_ns=%llu base=%lld local=[%s] ssd_units=%zu",
+            (long long)t.rank,(unsigned long long)t.generation,(unsigned long long)t.producer,(long long)t.layer,
+            (unsigned long long)t.ready_ns,(long long)t.expert_base,ids,SSD_units);
+}
+
+void Mover::prefetch_trace_stage_done(const M1PrefetchTrace& t,int status) {
+    if(prefetch_trace_slot(t))
+        RAD_INFO("DS41M1TRACE v=1 kind=stage_return rank=%lld gen=%llu producer=%llu layer=%lld cpu_return_ns=%llu rc=%d; not GPU completion",
+            (long long)t.rank,(unsigned long long)t.generation,(unsigned long long)t.producer,
+            (long long)t.layer,(unsigned long long)m1_trace_now_ns(),status);
+}
+
+int Mover::read_native_file(const WeightInfo& w,void* dst,int64_t dst_cap,RelayIn* in,
+                            bool* cache_hit,NativeFileCacheReadPolicy policy,
+                            NativeMappedFileCache::Lease* mapped_lease,M1PrefetchTrace trace) {
+    if(!m1_trace_weight(trace,w.decl.group.layer,w.decl.group.expert,w.decl.group.slot,w.stored_bytes) ||
+        w.layout_tag!="ggml_mxfp4" || policy!=NativeFileCacheReadPolicy::Normal)
+        return read_native_file_impl(w,dst,dst_cap,in,cache_hit,policy,mapped_lease);
+    const uint64_t began=m1_trace_now_ns();
+    const bool eligible=native_file_cache_on_ || (mapped_file_cache_on_ && mapped_file_eligible(w));
+    const int rc=read_native_file_impl(w,dst,dst_cap,in,cache_hit,policy,mapped_lease);
+    const uint64_t ended=m1_trace_now_ns();
+    // Eligibility is not an entered-probe claim on error. Known0+eligible means
+    // the existing cache API was consulted; hit is its actual returned outcome.
+    if(prefetch_trace_slot(trace))
+        RAD_INFO("DS41M1TRACE v=1 kind=read rank=%lld gen=%llu producer=%llu layer=%lld expert=%lld slot=%lld key=%zu bank=%u bank_generation=%llu entry=%lld bytes=%lld begin_ns=%llu end_ns=%llu rc=%d cache_eligible=%d hit=%d identity=%d",
+            (long long)trace.rank,(unsigned long long)trace.generation,(unsigned long long)trace.producer,
+            (long long)trace.layer,(long long)w.decl.group.expert,(long long)w.decl.group.slot,
+            size_t(&w-prog_->weights.data()),unsigned(w.file_id),(unsigned long long)w.source_bank_generation,
+            (long long)w.source_entry_index,(long long)w.stored_bytes,(unsigned long long)began,
+            (unsigned long long)ended,rc,int(eligible),rc==RAD_OK && cache_hit?int(*cache_hit):-1,int(w.identity));
+    return rc;
+}
+
+int Mover::read_native_file_impl(const WeightInfo& w, void* dst, int64_t dst_cap, RelayIn* in,
                             bool* cache_hit, NativeFileCacheReadPolicy policy,
                             NativeMappedFileCache::Lease* mapped_lease) {
     if (!in || !dst || !cache_hit || w.stored_bytes <= 0 || dst_cap < w.stored_bytes ||
@@ -1077,7 +1134,7 @@ int Mover::stage_relaid(const std::vector<Relaid>& rl, NativeFileCacheReadPolicy
                 rc[j] = read_native_file(*rl[jb.r].w, win + jb.wo, W - jb.wo,
                                          &relay_in_[(size_t)t], &cached, policy,
                                          jb.mapped_slot < 0 ? nullptr :
-                                             &mapped_windows_[(size_t)w].leases[(size_t)jb.mapped_slot]);
+                                             &mapped_windows_[(size_t)w].leases[(size_t)jb.mapped_slot],rl[jb.r].trace);
                 cache_hits[j] = cached;
             }
         };
@@ -1135,7 +1192,7 @@ int Mover::stage_relaid(const std::vector<Relaid>& rl, NativeFileCacheReadPolicy
 
 int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_t cap,
                             RadEvent after, RadEvent done, std::vector<int32_t>* staged,
-                            NativeFileCacheReadPolicy policy) {
+                            NativeFileCacheReadPolicy policy, M1PrefetchTrace trace) {
     if (!plan_ || !dst || !staged || !done || !native_file_cache_policy_valid(policy)) return RAD_E_INVAL;
     const auto cache_policy = (native_file_cache_on_ || mapped_file_cache_on_) ? policy : NativeFileCacheReadPolicy::Normal;
     staged->clear();
@@ -1163,7 +1220,7 @@ int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_
             const WeightInfo& w = prog_->weights[mu.weights[k]];
             if (w.stored_bytes <= 0) continue;          /* nothing to read, and nothing to place */
             if (!w.identity || ((native_file_cache_on_ || (mapped_file_cache_on_ && mapped_file_eligible(w))) && w.stored_bytes <= RAD_PLACE_FILE_WINDOW_BYTES)) {
-                relaid.push_back(Relaid{ &w, dst + off + mu.offset[k] });
+                relaid.push_back(Relaid{ &w, dst + off + mu.offset[k], trace });
                 continue;
             }
             ext.push_back(FileExt{ w.file_id,(int64_t)w.file_offset, w.stored_bytes, dst + off + mu.offset[k] });

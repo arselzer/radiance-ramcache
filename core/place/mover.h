@@ -30,6 +30,7 @@
  * launch that could name the slot has retired.
  */
 #pragma once
+#include "prefetch_trace.h"
 #include "../device/device.h"
 #include "../device/directio.h"
 #include "../mem/pools.h"
@@ -571,7 +572,10 @@ public:
      * file_buffer       buffer 0 or 1 of the plan's two, or null when the plan has none. */
     int   stage_file_units(const std::vector<int32_t>& units, char* dst, int64_t cap,
                            RadEvent after, RadEvent done, std::vector<int32_t>* staged,
-                           NativeFileCacheReadPolicy policy = NativeFileCacheReadPolicy::Normal);
+                           NativeFileCacheReadPolicy policy = NativeFileCacheReadPolicy::Normal,
+                           M1PrefetchTrace trace = {});
+    void prefetch_trace_route(const M1PrefetchTrace& trace, const int32_t* counts, size_t SSD_units);
+    void prefetch_trace_stage_done(const M1PrefetchTrace& trace, int status);
     /* alias_file_units  publishes every file-tier weight of `units` at `base` without reading
      *                   it, for experts a pass does not route to: the grouped GEMM is handed
      *                   every expert's pointer and reads none of a zero-row expert's bytes, so
@@ -745,7 +749,7 @@ private:
         RelayIn(const RelayIn&) = delete;
         ~RelayIn() { std::free(p); }
     };
-    struct Relaid { const WeightInfo* w; char* dst; };
+    struct Relaid { const WeightInfo* w; char* dst; M1PrefetchTrace trace{}; };
     FileRelayout         relayout_;
     NativeFileCache      native_file_cache_;
     //Allocator context must outlive every window lease. Destruction drains explicitly first.
@@ -780,7 +784,11 @@ private:
     int  read_relaid(const WeightInfo& w, void* dst, int64_t dst_cap, RelayIn* in);
     int  read_native_file(const WeightInfo& w, void* dst, int64_t dst_cap, RelayIn* in,
                           bool* cache_hit, NativeFileCacheReadPolicy policy = NativeFileCacheReadPolicy::Normal,
-                          NativeMappedFileCache::Lease* mapped_lease = nullptr);
+                          NativeMappedFileCache::Lease* mapped_lease = nullptr, M1PrefetchTrace trace = {});
+    int  read_native_file_impl(const WeightInfo& w, void* dst, int64_t dst_cap, RelayIn* in,
+                          bool* cache_hit, NativeFileCacheReadPolicy policy, NativeMappedFileCache::Lease* mapped_lease);
+    bool prefetch_trace_slot(const M1PrefetchTrace& trace);
+    std::atomic<uint64_t> prefetch_trace_lines_{0};
     int  stage_relaid(const std::vector<Relaid>& rl, NativeFileCacheReadPolicy policy);
     char*    windows_ = nullptr;
     int      n_windows_ = 0;

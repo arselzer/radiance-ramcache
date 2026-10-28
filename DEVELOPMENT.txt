@@ -60,5 +60,10 @@ warm slab entries without changing their recency and never admits a cold entry.
 These changes and their portable/lifecycle controls await current-branch build
 and GPU transport validation. The direct-fill switch remains off by default.
 
+A separate opt-in M1 route/demand trace records bounded by-value metadata for
+offline prefetch evaluation. It observes the existing count readback and demand
+result; it does not predict routes, prefetch weights or change cache policy.
+Prediction accuracy, useful miss coverage and timing remain unmeasured.
+
 No model weights, checkpoint data, deployment credentials or local runtime
 receipts are included. The production QFN service has not been upgraded.

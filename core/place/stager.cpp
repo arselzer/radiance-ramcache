@@ -486,6 +486,7 @@ int FileStager::init(const Program& prog, const Plan& plan, Mover* mover, Counts
     RAD_TRY(shutdown_head_cache());
     if (head_.configured()) return RAD_E_STATE; //a head-cache FileStager is single-initialization
     layers_.clear();
+    trace_requested_ = m1_trace_opt_in(std::getenv(kM1PrefetchTraceEnv));
     ep_counts_ = std::move(ep_counts);
     ep_program_ = &prog;
     ep_stats_ = {};
@@ -578,6 +579,8 @@ int FileStager::init(const Program& prog, const Plan& plan, Mover* mover, Counts
 /* Arms for every pass: a file-tier unit has no other address, so an unarmed pass would reach its
  * first routed layer with null expert pointers. */
 bool FileStager::begin_pass(const RadBatch* b) {
+    trace_target_m1_ = b && m1_trace_target(b->phase==RAD_PHASE_DECODE,b->draft_pass!=0,
+        b->n_tok,b->n_seq,b->n_spec,b->n_tok_decode,b->n_seq_decode);
     head_first_ = head_.configured();
     head_pass_ = head_.configured() ? dspark_head_tail_pass(b) : HeadPass::Unknown;
     //Unknown/prefill scope gives addresses back BEFORE Ctx's pass-wide residency refresh,
@@ -662,8 +665,12 @@ int FileStager::start_ep_routed(int32_t li, RadStream s, bool* read) {
     if (head_.pending() && (head_pass_ != HeadPass::Verify ||
         !head_.selected_fits(int64_t(want_.size()), need))) RAD_TRY(head_revoke());
     const int64_t available = head_.pending() ? head_.budget().serving_bytes : cap_;
-    RAD_TRY(mover_->stage_file_units(want_, buf_[b], available, free_rec_[b] ? free_[b] : nullptr,
-                                     done_[b], &staged_[b]));
+    const auto trace = m1_trace_scope(trace_requested_,trace_target_m1_,v);
+    mover_->prefetch_trace_route(trace,counts_host_,want_.size());
+    const int stage_status = mover_->stage_file_units(want_, buf_[b], available,
+        free_rec_[b] ? free_[b] : nullptr, done_[b], &staged_[b], NativeFileCacheReadPolicy::Normal,trace);
+    mover_->prefetch_trace_stage_done(trace,stage_status);
+    if(stage_status<0)return stage_status;
     pending_[b] = !staged_[b].empty();
     mover_->alias_file_units(skip_, buf_[b], &staged_[b]);
     partial_[b] = !skip_.empty();

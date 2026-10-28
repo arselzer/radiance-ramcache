@@ -6139,3 +6139,50 @@ TEST(a_fault_in_a_realtime_session_ends_the_session_not_the_server) {
 }
 
 RAD_TEST_MAIN()
+
+TEST(draft_origin_metrics_are_absent_when_observation_is_off) {
+    Metrics metrics("origin-test",1024); server::SchedMetrics s;
+    s.draft_tokens=7; s.draft_accepted=3; metrics.sample(s);
+    const auto raw=metrics.render();
+    CHECK(raw.find("radiance:experimental_draft_")==std::string::npos);
+    CHECK(raw.find("radiance:draft_tokens_total")!=std::string::npos);
+}
+TEST(draft_origin_metrics_export_only_exact_owner_counters) {
+    Metrics metrics("origin-test",1024); server::SchedMetrics s;
+    s.draft_origin.enabled=true; s.draft_origin.compute_off=true;s.draft_origin.verify_cap=0;
+    s.draft_origin.learned_publications=2; s.draft_origin.learned_published_tokens=8;
+    s.draft_origin.learned_verified_tokens=4; s.draft_origin.learned_accepted_tokens=2;
+    s.draft_origin.fallback_offers=3; s.draft_origin.fallback_offered_tokens=10;
+    s.draft_origin.fallback_publications=2; s.draft_origin.fallback_published_tokens=5;
+    s.draft_origin.fallback_verified_tokens=5; s.draft_origin.fallback_accepted_tokens=1;
+    s.draft_origin.block_context_issues=7; s.draft_origin.block_context_rows=100;
+    s.draft_origin.block_query_issues=6; s.draft_origin.block_query_rows=30;
+    metrics.sample(s); const auto raw=metrics.render();
+    CHECK(raw.find("radiance:experimental_draft_compute_off")!=std::string::npos);
+    CHECK(raw.find("radiance:experimental_draft_learned_publications_total")!=std::string::npos);
+    CHECK(raw.find("radiance:experimental_draft_learned_verified_tokens_total")!=std::string::npos);
+    CHECK(raw.find("radiance:experimental_draft_fallback_accepted_tokens_total")!=std::string::npos);
+    CHECK(raw.find("radiance:experimental_draft_block_context_rows_total")!=std::string::npos);
+    CHECK(raw.find("per_depth_origin")==std::string::npos);
+    const PromDoc d=parse_prom(raw); CHECK_EQ(d.errors.size(),size_t(0));
+    auto value=[&](const std::string& name){
+        for(const auto& v:d.samples)if(v.first.rfind(name+"{",0)==0)return v.second;
+        return -1.0;
+    };
+    CHECK_EQ(value("radiance:experimental_draft_compute_off"),1.0);
+    CHECK_EQ(value("radiance:experimental_draft_verify_cap"),0.0);
+    CHECK_EQ(value("radiance:experimental_draft_learned_publications_total"),2.0);
+    CHECK_EQ(value("radiance:experimental_draft_learned_published_tokens_total"),8.0);
+    CHECK_EQ(value("radiance:experimental_draft_fallback_offers_total"),3.0);
+    CHECK_EQ(value("radiance:experimental_draft_fallback_offered_tokens_total"),10.0);
+    CHECK_EQ(value("radiance:experimental_draft_fallback_publications_total"),2.0);
+    CHECK_EQ(value("radiance:experimental_draft_fallback_published_tokens_total"),5.0);
+    CHECK_EQ(value("radiance:experimental_draft_learned_verified_tokens_total"),4.0);
+    CHECK_EQ(value("radiance:experimental_draft_learned_accepted_tokens_total"),2.0);
+    CHECK_EQ(value("radiance:experimental_draft_fallback_verified_tokens_total"),5.0);
+    CHECK_EQ(value("radiance:experimental_draft_fallback_accepted_tokens_total"),1.0);
+    CHECK_EQ(value("radiance:experimental_draft_block_context_issues_total"),7.0);
+    CHECK_EQ(value("radiance:experimental_draft_block_context_rows_total"),100.0);
+    CHECK_EQ(value("radiance:experimental_draft_block_query_issues_total"),6.0);
+    CHECK_EQ(value("radiance:experimental_draft_block_query_rows_total"),30.0);
+}

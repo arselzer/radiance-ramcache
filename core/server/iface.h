@@ -10,6 +10,7 @@
  */
 #pragma once
 #include "rad_core.h"
+#include "../sched/draft_experiment.h" // plain private attribution numbers only
 
 #include <nlohmann/json_fwd.hpp>
 
@@ -99,6 +100,7 @@ struct SchedMetrics {
     int64_t decode_tokens = 0;
     double  draft_acceptance = 0.0;   /* 0..1, spec §10 */
     /* The exact pair the ratio is computed from. */
+    rad::DraftOriginStats draft_origin;
     int64_t draft_tokens = 0;
     int64_t draft_accepted = 0;
     /* Prefix hits ended early for a windowed block drafter, and the tokens they gave back. */

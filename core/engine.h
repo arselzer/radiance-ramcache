@@ -131,6 +131,7 @@ private:
     std::vector<std::thread>           rank_threads_;
 
     Config cfg_;
+    const DraftExperiment draft_experiment_; // one construction-time environment snapshot
     /* The VRAM split each rank actually takes, filled by Engine::plan. Equal to cfg_ on every
      * rank whose cache costs as much per token as the dearest rank's. A cheaper rank (an
      * attention-zero rank) gets a KV pool sized for the common token count and the difference in

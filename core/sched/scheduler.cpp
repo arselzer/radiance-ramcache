@@ -51,8 +51,17 @@ void Scheduler::queue_erase(std::vector<int32_t>& q, int32_t slot) {
 
 /* ------------------------------------------------------------------ init */
 int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCache* pc,
-                    const std::vector<BatchBuilder::RankIO>& ranks, const ChunkGeometry* geo) {
+                    const std::vector<BatchBuilder::RankIO>& ranks, const ChunkGeometry* geo,
+                    const DraftExperiment* experiment) {
     if (!kv || !pc) return RAD_E_INVAL;
+    draft_experiment_ = experiment ? *experiment : DraftExperiment{};
+    if (!draft_experiment_.valid()) return RAD_E_INVAL;
+    // The owning Engine is the authority for bank/Program/final-Plan scope. Standalone
+    // Scheduler component tests explicitly inject this private option, never read getenv.
+    m_.draft_origin = {};
+    m_.draft_origin.enabled = draft_experiment_.observe();
+    m_.draft_origin.compute_off = draft_experiment_.compute_off();
+    m_.draft_origin.verify_cap = draft_experiment_.verify_cap();
     prog_ = &prog;
     cfg_ = cfg;
     kv_ = kv;
@@ -141,7 +150,7 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     interleave_left_ = 0;
     held_prefill_ = 0;
     draft_refill_ = 0;
-    if (cfg.n_spec > 0 && prog.drafter.kind == RAD_DRAFT_BLOCK && prog.drafter.window > 0 &&
+    if (!draft_experiment_.compute_off() && cfg.n_spec > 0 && prog.drafter.kind == RAD_DRAFT_BLOCK && prog.drafter.window > 0 &&
         hit_holes_draft_) {
         draft_refill_ = prog.drafter.window;
         RAD_INFO("draft refill: a prefix hit ends %lld tokens before the prompt's end, so the "
@@ -415,6 +424,18 @@ int Scheduler::set_draft(uint64_t id, const int32_t* tokens, int n) {
     if (it == by_id_.end()) return RAD_E_NOTFOUND;
     SchedReq& s = *reqs_[(size_t)it->second];
     if (n < 0) return RAD_E_INVAL;
+    if (draft_experiment_.compute_off()) {
+        if (n > 0) return RAD_E_UNSUPPORTED;
+        s.n_draft = 0; s.req->n_draft = 0; s.req->draft = nullptr;
+        return RAD_OK;
+    }
+
+    // Full5 head generation is retained. Only this explicitly configured control
+    // installs a prefix before fixed-ahead exact-count validation (as adaptive does).
+    if (draft_experiment_.verify_cap() >= 0) {
+        if (n > cfg_.n_spec) return RAD_E_STATE; // malformed producer, not a longer legal prefix
+        n = draft_experiment_.runtime_depth(n);
+    }
 
     /* The step issued ahead already verifies these: it was planned with the drafter's count and
      * the card has the tokens. The host copy is what its commit emits accepted tokens from, so it
@@ -432,6 +453,7 @@ int Scheduler::set_draft(uint64_t id, const int32_t* tokens, int n) {
         s.n_draft = n;
         s.req->n_draft = n;
         s.req->draft = n ? s.draft : nullptr;
+        m_.draft_origin.learned_publish(n);
         return RAD_OK;
     }
 
@@ -450,7 +472,13 @@ int Scheduler::set_draft(uint64_t id, const int32_t* tokens, int n) {
     s.n_draft = n;
     s.req->n_draft = n;
     s.req->draft = s.draft;
+    m_.draft_origin.learned_publish(n);
     return RAD_OK;
+}
+
+void Scheduler::note_block_issue(int draft_pass, int64_t rows) {
+    std::lock_guard<std::mutex> lk(mu_);
+    m_.draft_origin.block_issue(draft_pass, rows);
 }
 
 /* ------------------------------------------------------------------ cancellation */
@@ -888,7 +916,7 @@ int Scheduler::requests_locked(ReqStat* out, int max) const {
  * n-grams the last commit added, rather than a scan of the context. */
 int Scheduler::draft_ngram(SchedReq& s, int depth, int* match) const {
     if (match) *match = -1;
-    if (depth <= 0 || !s.req) return 0;
+    if (draft_experiment_.compute_off() || depth <= 0 || !s.req) return 0;
     const Request& r = *s.req;
     TokenSeq seq;
     seq.a = r.prompt.data();
@@ -1535,7 +1563,7 @@ const RadBatch* Scheduler::step() {
      * decode rows and the chunked path over its prefill rows, so a verifying row rolls back as in
      * a pure decode step. Run through the chunked path (which has no num_accepted operand), its
      * rejected tokens would stay folded into the recurrent state and conv window. */
-    const int depth = draft_.next_depth();
+    const int depth = draft_experiment_.runtime_depth(draft_.next_depth());
 
     /* What else wants into this step, for --busy-prefill-chunk (busy_cap): each decode row still
      * to be walked needs 1 + the deepest window it can take, each prefill row a share, plus one
@@ -1545,7 +1573,7 @@ const RadBatch* Scheduler::step() {
     const int64_t Q = std::max<int64_t>(geo_.quantum, 1);
     /* An eighth of this step's budget, which under a span is shared_tok for a shared step. */
     const int64_t share_tok = std::max<int64_t>(Q, budget / 8 / Q * Q);
-    const int64_t dec_row_tok = 1 + std::max<int64_t>(depth, draft_.step_window());
+    const int64_t dec_row_tok = 1 + std::max<int64_t>(depth, draft_experiment_.runtime_depth(draft_.step_window()));
     int64_t behind_dec = 0, behind_pf = 0;
     if (share_step) {
         for (int32_t slot : running_) {
@@ -1625,14 +1653,15 @@ const RadBatch* Scheduler::step() {
              * drafts this step and no deeper. */
             const int cap = draft_.adaptive() ? draft_cap(s) : depth;
             bool ngram = false;
-            if (!r.may_speculate) s.n_draft = 0;
+            if (draft_experiment_.compute_off() || !r.may_speculate) s.n_draft = 0;
             else if (s.n_draft == 0) {
                 /* As the only drafter under the adaptive window, the lookup is the head: its
                  * proposal is cut to the sequence's own window. */
                 int match = -1;
-                s.n_draft = (int32_t)draft_ngram(s, lookup_adapt_ ? cap : draft_.step_window(),
-                                                 &match);
+                s.n_draft = (int32_t)draft_ngram(s, draft_experiment_.runtime_depth(
+                                                 lookup_adapt_ ? cap : draft_.step_window()), &match);
                 ngram = s.n_draft > 0;
+                m_.draft_origin.fallback_offer(s.n_draft);
                 /* The verify gate (lookup.h). Every proposal is offered, so a held one is still
                  * scored against the text; the --debug-draft-oracle harness (match < 0) is a
                  * verify-path test and always verified. */
@@ -1736,6 +1765,7 @@ const RadBatch* Scheduler::step() {
         s.entry = (int32_t)plan_.e.size();
         s.sched_tokens = (int32_t)want;
         plan_.e.push_back(e);
+        if (e.ngram) m_.draft_origin.fallback_publish(e.n_spec);
         plan_.n_tok += want;
         if (!prefill && s.n_draft > plan_.n_spec) plan_.n_spec = s.n_draft;
         budget -= want;
@@ -2018,7 +2048,7 @@ void Scheduler::take_encodes(std::vector<std::shared_ptr<mm::Item>>* out) {
 
 /* ------------------------------------------------------------------ the step's head depth */
 void Scheduler::draft_cycle() {
-    if (!draft_.adaptive()) return;
+    if (draft_experiment_.compute_off() || !draft_.adaptive()) return;
     /* The rows the opening step will decode: every running sequence past its prompt. Those that
      * may speculate choose D through their estimates; the rest emit one token each, which still
      * counts in the step's yield and cost. A sequence still prefilling is neither. */
@@ -2041,6 +2071,7 @@ void Scheduler::expect_draft(uint64_t id, int n) {
     auto it = by_id_.find(id);
     if (it == by_id_.end()) return;
     SchedReq& s = *reqs_[(size_t)it->second];
+    if (draft_experiment_.compute_off()) { s.draft_next = 0; return; }
     /* Under the adaptive window the rounds ran for the deepest sequence; this one verifies the
      * first of them up to its own window. That is the cap serial_begin used: nothing commits
      * between the two, and D is the cycle's (draft_cycle). */
@@ -2048,6 +2079,7 @@ void Scheduler::expect_draft(uint64_t id, int n) {
         const int cap = draft_cap(s);
         if (n > cap) n = cap;
     }
+    n = draft_experiment_.runtime_depth(n);
     s.draft_next = n > 0 ? n : 0;
 }
 
@@ -2120,7 +2152,7 @@ const RadBatch* Scheduler::step_next_locked() {
          * window of slack per step issued ahead). The card knows the real position; this sizes
          * the pool, the block tables and every host-side ceiling. */
         const int64_t ctx_up = r.n_computed + e.n_tokens;
-        const int32_t d      = s.draft_next;
+        const int32_t d      = draft_experiment_.runtime_depth(s.draft_next);
         const int64_t want   = 1 + d;
         if (ctx_limit_ > 0 && ctx_up + want > ctx_limit_) return nullptr;
         if (kv_->ensure_from(r.id, ctx_up + want, r.n_computed) < 0) return nullptr;
@@ -2380,6 +2412,7 @@ int Scheduler::commit(StepResult& res) {
                 }
                 m_.draft_tokens += e.n_spec;
                 m_.draft_accepted += a;
+                m_.draft_origin.committed(e.ngram, e.n_spec, a);
                 server::sink_drafts(r.sink, e.n_spec, a);
             }
         }
@@ -2532,13 +2565,14 @@ void Scheduler::step_finished() {
 int Scheduler::serial_begin(int* rounds, SerialRow* out, int max) {
     std::lock_guard<std::mutex> lk(mu_);
     serial_.clear();
+    if (draft_experiment_.compute_off()) { if (rounds) *rounds = 0; return 0; }
     if (!rounds || *rounds <= 0 || !out || max <= 0) return 0;
 
     /* May anything draft? The controller sets depth from measured acceptance; 0 means drafting is
      * off. A step carrying a prefill chunk is no reason to refuse, since its decode rows still
      * take the recurrent path. Neither answer skips the history pass: the head's K and V must be
      * filled either way, e.g. for a sequence still in the middle of a long prompt. */
-    const int depth = draft_.next_depth();
+    const int depth = draft_experiment_.runtime_depth(draft_.next_depth());
     bool may_draft = depth > 0;
     if (depth > 0 && *rounds > depth) *rounds = depth;
     if (*rounds > RAD_SCHED_MAX_SPEC) *rounds = RAD_SCHED_MAX_SPEC;
@@ -2783,6 +2817,7 @@ int Scheduler::block_begin(int block, int depth, int window, int32_t mask, Block
     block_.clear();
     block_len_ = 0;
     block_depth_ = 0;
+    if (draft_experiment_.compute_off()) return 0;
     if (block < 2 || depth <= 0 || depth > block || !out || max <= 0) return 0;
     block_len_   = (int32_t)block;
     block_depth_ = (int32_t)depth;
@@ -3119,7 +3154,7 @@ SchedMetrics Scheduler::metrics_locked() const {
     m.linear_hit_rate = m.prompt_tokens
         ? (float)((double)m.linear_cached_tokens / (double)m.prompt_tokens) : 0.0f;
     m.draft_acceptance = draft_.acceptance();
-    m.draft_depth = draft_.next_depth();
+    m.draft_depth = draft_experiment_.runtime_depth(draft_.next_depth());
     /* The loop bound is the array's extent, not RAD_SCHED_MAX_SPEC: the values are equal, but gcc
      * cannot prove the boundary index safe through the inlined accessors (which guard with
      * `j < RAD_SCHED_MAX_SPEC ? reach_[j] : 0`) and warns. */

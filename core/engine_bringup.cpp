@@ -24,6 +24,7 @@
 #include "place/expert_profile_map.h"
 #include "place/native_decode_profile.h"
 #include "place/dspark_native_scope.h"
+#include "place/dspark_draft_control_scope.h"
 #include "kvstream/bringup.h"
 #include "kvstream/plan.h"
 #include "runtime/arena.h"
@@ -3788,6 +3789,10 @@ int Engine::start() {
         return RAD_E_INVAL;
     }
     startup_begin_ns_ = rad_mono_ns();
+    if (!draft_experiment_.valid()) {
+        RAD_ERR("experimental draft control: stats/OFF must be absent or0|1, verify cap absent or0..5, with no positive-cap/OFF conflict");
+        return RAD_E_INVAL;
+    }
     std::vector<int> devs;
     std::string inventory;
     std::string devnote;
@@ -3925,6 +3930,26 @@ int Engine::start() {
     }
 
     RAD_TRY(plan());
+    if (draft_experiment_.scope_required()) {
+        if (ranks_.size() != 4) return RAD_E_UNSUPPORTED;
+        for (const auto& r : ranks_) {
+            if (!dspark_draft_control_scope(r->program, r->plan, cfg_, bool(source_banks_)) ||
+                (draft_experiment_.verify_cap() >= 0 && cfg_.draft_short_from != 0)) {
+                RAD_ERR("experimental draft control requires a bound native DSpark EP4 "
+                        "fixed-depth5 bank and all96 final immutable host-pinned head pairs (verify cap "
+                        "also requires draft-short-from0)");
+                return RAD_E_UNSUPPORTED;
+            }
+        }
+        if (draft_experiment_.compute_off())
+            RAD_INFO("experimental draft compute OFF: configured depth5, Program, banks and pools "
+                     "retained; learned context/query and scheduler fallback disabled; "
+                     "ordinary target pipelining restored");
+        else
+            RAD_INFO("experimental draft verify cap: k=%d; configured depth5, full5 query/proposal, "
+                     "Program, banks and pools retained; only the verified prefix is capped",
+                     draft_experiment_.verify_cap());
+    }
     RAD_TRY(load_weights());
     RAD_TRY(configure_kv());
 

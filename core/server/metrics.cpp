@@ -180,6 +180,25 @@ void Metrics::sample(const SchedMetrics& m) {
     c_decode_tokens_.advance_to(m.decode_tokens);
     c_draft_tokens_.advance_to(m.draft_tokens);
     c_draft_accepted_.advance_to(m.draft_accepted);
+    if (m.draft_origin.enabled) {
+        g_draft_compute_off_.set(m.draft_origin.compute_off ? 1 : 0);
+        g_draft_verify_cap_.set(m.draft_origin.verify_cap);
+        c_origin_learned_publications.advance_to(m.draft_origin.learned_publications);
+        c_origin_learned_published_tokens.advance_to(m.draft_origin.learned_published_tokens);
+        c_origin_fallback_offers.advance_to(m.draft_origin.fallback_offers);
+        c_origin_fallback_offered_tokens.advance_to(m.draft_origin.fallback_offered_tokens);
+        c_origin_fallback_publications.advance_to(m.draft_origin.fallback_publications);
+        c_origin_fallback_published_tokens.advance_to(m.draft_origin.fallback_published_tokens);
+        c_origin_learned_verified_tokens.advance_to(m.draft_origin.learned_verified_tokens);
+        c_origin_learned_accepted_tokens.advance_to(m.draft_origin.learned_accepted_tokens);
+        c_origin_fallback_verified_tokens.advance_to(m.draft_origin.fallback_verified_tokens);
+        c_origin_fallback_accepted_tokens.advance_to(m.draft_origin.fallback_accepted_tokens);
+        c_origin_block_context_issues.advance_to(m.draft_origin.block_context_issues);
+        c_origin_block_context_rows.advance_to(m.draft_origin.block_context_rows);
+        c_origin_block_query_issues.advance_to(m.draft_origin.block_query_issues);
+        c_origin_block_query_rows.advance_to(m.draft_origin.block_query_rows);
+        draft_origin_on_.store(true, std::memory_order_release);
+    }
     c_draft_refills_.advance_to(m.draft_refills);
     c_draft_refill_tokens_.advance_to(m.draft_refill_tokens);
     c_lookup_proposals_.advance_to(m.lookup_proposals);
@@ -414,6 +433,42 @@ std::string Metrics::render() const {
     w.counter("radiance:draft_accepted_total",
               "Speculative tokens accepted; the pair the acceptance ratio is computed from.",
               L, c_draft_accepted_.get());
+    if (draft_origin_on_.load(std::memory_order_acquire)) {
+        w.gauge("radiance:experimental_draft_compute_off",
+                "Runtime drafting disabled while declared speculative geometry is retained.",
+                L, g_draft_compute_off_.get());
+        w.gauge("radiance:experimental_draft_verify_cap",
+                "Configured private verify cap0..5, or minus1 for no experimental cap; not a measured depth histogram.",
+                L, g_draft_verify_cap_.get());
+        w.counter("radiance:experimental_draft_learned_publications_total",
+                  "Positive head proposals successfully installed on the host; may be overwritten or unused.", L, c_origin_learned_publications.get());
+        w.counter("radiance:experimental_draft_learned_published_tokens_total",
+                  "Head tokens successfully installed, after caps; not necessarily verified.", L, c_origin_learned_published_tokens.get());
+        w.counter("radiance:experimental_draft_fallback_offers_total",
+                  "Positive lookup or debug-oracle offers before gate, budget and context caps.", L, c_origin_fallback_offers.get());
+        w.counter("radiance:experimental_draft_fallback_offered_tokens_total",
+                  "Lookup or debug-oracle tokens offered before final caps; not necessarily verified.", L, c_origin_fallback_offered_tokens.get());
+        w.counter("radiance:experimental_draft_fallback_publications_total",
+                  "Lookup or debug-oracle proposals installed in a StepPlan after gates, caps and KV reservation; not necessarily issued or committed.", L, c_origin_fallback_publications.get());
+        w.counter("radiance:experimental_draft_fallback_published_tokens_total",
+                  "Lookup or debug-oracle tokens installed in a StepPlan after final caps; not necessarily issued or committed.", L, c_origin_fallback_published_tokens.get());
+        w.counter("radiance:experimental_draft_learned_verified_tokens_total",
+                  "Committed verify tokens tagged head-origin by the immutable step entry.", L, c_origin_learned_verified_tokens.get());
+        w.counter("radiance:experimental_draft_learned_accepted_tokens_total",
+                  "Accepted head-origin tokens at the aggregate draft commit point.", L, c_origin_learned_accepted_tokens.get());
+        w.counter("radiance:experimental_draft_fallback_verified_tokens_total",
+                  "Committed verify tokens tagged lookup or debug-oracle origin.", L, c_origin_fallback_verified_tokens.get());
+        w.counter("radiance:experimental_draft_fallback_accepted_tokens_total",
+                  "Accepted lookup or debug-oracle tokens at the aggregate draft commit point.", L, c_origin_fallback_accepted_tokens.get());
+        w.counter("radiance:experimental_draft_block_context_issues_total",
+                  "Block context passes issued with known0 status on every rank, not completed GPU passes.", L, c_origin_block_context_issues.get());
+        w.counter("radiance:experimental_draft_block_context_rows_total",
+                  "Rows in known0 all-rank block context issues, counted once rather than per rank.", L, c_origin_block_context_rows.get());
+        w.counter("radiance:experimental_draft_block_query_issues_total",
+                  "Block query passes issued with known0 status on every rank, not completed GPU passes.", L, c_origin_block_query_issues.get());
+        w.counter("radiance:experimental_draft_block_query_rows_total",
+                  "Rows in known0 all-rank block query issues, counted once rather than per rank.", L, c_origin_block_query_rows.get());
+    }
     w.counter("radiance:draft_refills_total",
               "Prefix hits ended a drafter window early so a windowed block drafter has context.",
               L, c_draft_refills_.get());

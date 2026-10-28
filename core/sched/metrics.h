@@ -5,6 +5,7 @@
  */
 #pragma once
 #include "rad_core.h"
+#include "draft_experiment.h"
 
 namespace rad {
 
@@ -127,6 +128,7 @@ struct SchedMetrics {
     float   decode_tps = 0.0f;
 
     /* Speculation (§10). */
+    DraftOriginStats draft_origin; // private additive opt-in snapshot, no SDK change
     int64_t draft_tokens = 0;
     int64_t draft_accepted = 0;
     /* Prefix hits ended early so a windowed block drafter has context (Scheduler::draft_refill_),

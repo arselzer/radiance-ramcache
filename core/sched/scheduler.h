@@ -165,7 +165,8 @@ public:
      * resolve one here. */
     int  init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCache* pc,
               const std::vector<BatchBuilder::RankIO>& ranks,
-              const ChunkGeometry* geo = nullptr);
+              const ChunkGeometry* geo = nullptr,
+              const DraftExperiment* experiment = nullptr);
 
     /* The batch the last build produced for one rank; see BatchBuilder::batch_for. */
     const RadBatch* batch_for(int rank) const { return builder_.batch_for(rank); }
@@ -272,6 +273,8 @@ public:
     /* The drafter's proposal for a request's next step. n is clamped to the sequence's window
      * (draft_cap): the controller's depth, or what the adaptive policy gives the sequence. */
     int      set_draft(uint64_t id, const int32_t* tokens, int n);
+    // Engine calls only after a block pass has returned known0 on all ranks.
+    void     note_block_issue(int draft_pass, int64_t rows);
 
     /* ---------------------------------------------------------- media the encoder owes
      * A request carrying media is admitted only once every item is encoded; until then it keeps
@@ -532,6 +535,7 @@ private:
     int32_t       serial_rot_shift_ = 0;
     BatchBuilder  builder_;
     DraftController draft_;
+    DraftExperiment draft_experiment_; // Engine validates OFF scope before load/serve
 
     /* Where this sequence's block-drafter cache begins; block_begin's guard reads it and
      * block_end records it. */
@@ -545,7 +549,9 @@ private:
      * Every site that caps a proposal applies it: step(), set_draft(), expect_draft() and the
      * rounds in serial_begin(). With the policy off it is next_depth(). */
     int draft_cap(SchedReq& s) const {
-        return draft_.adaptive() ? draft_.window_for(s.adapt) : draft_.next_depth();
+        if (draft_experiment_.compute_off()) return 0;
+        return draft_experiment_.runtime_depth(
+            draft_.adaptive() ? draft_.window_for(s.adapt) : draft_.next_depth());
     }
 
     /* The step's head depth D is chosen once per cycle by draft_cycle(), the first thing step()

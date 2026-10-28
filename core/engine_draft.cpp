@@ -164,7 +164,7 @@ void Engine::step_state_fini() {
  * sequence the head declined keeps n_draft 0, leaving it to the n-gram drafter.
  */
 bool Engine::serial_drafting() const {
-    return drafter_.kind == RAD_DRAFT_SERIAL && drafter_.depth > 0;
+    return draft_experiment_.head_enabled(drafter_.kind == RAD_DRAFT_SERIAL && drafter_.depth > 0);
 }
 
 /* One advance on every rank against the scheduler's latest build, over its first `rows` rows
@@ -486,12 +486,13 @@ int Engine::block_pass(const RadBatch* db, const char* what, int step) {
         RAD_ERR("drafter '%s': %s pass of step %d failed: %s -- the engine cannot continue",
                 drafter_.name, what, step, rad_strerror(s));
     /* Probe after each pass; by the step loop's dump these buffers hold stale values. */
+    if (s == RAD_OK) sched_.note_block_issue(db->draft_pass, db->n_tok);
     if (s >= 0) dump_buffers(ranks_[0]->ctx, step, what);
     return s;
 }
 
 bool Engine::block_drafting() const {
-    return drafter_.kind == RAD_DRAFT_BLOCK && drafter_.depth > 0;
+    return draft_experiment_.head_enabled(drafter_.kind == RAD_DRAFT_BLOCK && drafter_.depth > 0);
 }
 
 /* Both passes behind the step, without waiting. After the trunk's ranks join, the acceptance runs

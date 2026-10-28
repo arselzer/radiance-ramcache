@@ -199,10 +199,10 @@ struct Fixture {
         prog.buffers.push_back(b);
     }
 
-    int start() {
+    int start(const DraftExperiment* experiment = nullptr) {
         std::vector<BatchBuilder::RankIO> rio;
         rio.push_back({ 0, nullptr, &prog });
-        return sch.init(prog, cfg, &kv, &pc, rio);
+        return sch.init(prog, cfg, &kv, &pc, rio, nullptr, experiment);
     }
 
     const int32_t* derived(const char* name) const {
@@ -6677,5 +6677,233 @@ TEST(without_a_span_the_scheduler_plans_and_stages_the_pinned_steps) {
                 (unsigned long long)h);
         CHECK(n > 20);
         CHECK_EQ(h, c.want);
+    }
+}
+
+/* ===== source-authored origin/OFF component controls; no Engine/GPU/bank proof ===== */
+TEST(draft_origin_default_off_preserves_aggregate_counting) {
+    Fixture f; f.build(); f.cfg.n_spec = 4; CHECK_OK(f.start());
+    const auto id = f.submit(160); REQUIRE(f.sch.step()); f.commit_plain(11);
+    const int32_t draft[] = {21,22,23,24}; CHECK_OK(f.sch.set_draft(id,draft,4));
+    REQUIRE(f.sch.step()); CHECK_OK(f.commit(99,0,[](const StepEntry&){return 2;}));
+    const auto m = f.sch.metrics(); CHECK_EQ(m.draft_tokens,4); CHECK_EQ(m.draft_accepted,2);
+    CHECK(!m.draft_origin.enabled); CHECK_EQ(m.draft_origin.learned_verified_tokens,0);
+}
+TEST(draft_origin_publication_counts_actual_caps_and_refusals) {
+    Fixture f; f.build(); f.cfg.n_spec = 4;
+    const auto x = DraftExperiment::capture("1","0"); CHECK_OK(f.start(&x));
+    const auto id = f.submit(160); REQUIRE(f.sch.step()); f.commit_plain(11);
+    const int32_t draft[] = {21,22,23,24,25,26,27,28};
+    CHECK_EQ(f.sch.set_draft(id,draft,-1),RAD_E_INVAL);
+    CHECK_EQ(f.sch.set_draft(id+1000,draft,4),RAD_E_NOTFOUND);
+    CHECK_OK(f.sch.set_draft(id,draft,8)); // installed cap4, not requested8
+    auto o = f.sch.metrics().draft_origin;
+    CHECK_EQ(o.learned_publications,1); CHECK_EQ(o.learned_published_tokens,4);
+    f.sch.find(id)->may_speculate = false; CHECK_OK(f.sch.set_draft(id,draft,4));
+    o=f.sch.metrics().draft_origin; CHECK_EQ(o.learned_publications,1);
+    CHECK_EQ(f.sch.find(id)->n_draft,0);
+}
+TEST(draft_origin_committed_learned_matches_existing_aggregate) {
+    Fixture f; f.build(); f.cfg.n_spec = 4;
+    const auto x = DraftExperiment::capture("1","0"); CHECK_OK(f.start(&x));
+    const auto id=f.submit(160); REQUIRE(f.sch.step()); f.commit_plain(11);
+    const int32_t draft[]={21,22,23,24}; CHECK_OK(f.sch.set_draft(id,draft,4));
+    REQUIRE(f.sch.step()); CHECK(!f.sch.plan().e[0].ngram);
+    CHECK_OK(f.commit(99,0,[](const StepEntry&){return 2;}));
+    const auto m=f.sch.metrics(); const auto& o=m.draft_origin;
+    CHECK_EQ(o.learned_verified_tokens,4); CHECK_EQ(o.learned_accepted_tokens,2);
+    CHECK_EQ(o.fallback_verified_tokens,0);
+    CHECK_EQ(o.learned_verified_tokens+o.fallback_verified_tokens,m.draft_tokens);
+    CHECK_EQ(o.learned_accepted_tokens+o.fallback_accepted_tokens,m.draft_accepted);
+}
+TEST(draft_origin_overwrite_and_cancellation_do_not_invent_consumption) {
+    Fixture f; f.build(); f.cfg.n_spec=4;
+    const auto x=DraftExperiment::capture("1","0"); CHECK_OK(f.start(&x));
+    const auto id=f.submit(160); REQUIRE(f.sch.step()); f.commit_plain(11);
+    const int32_t d[]={21,22,23,24}; CHECK_OK(f.sch.set_draft(id,d,4));
+    CHECK_OK(f.sch.set_draft(id,d,4)); CHECK_OK(f.sch.cancel(id));
+    const auto o=f.sch.metrics().draft_origin;
+    CHECK_EQ(o.learned_publications,2); CHECK_EQ(o.learned_published_tokens,8);
+    CHECK_EQ(o.learned_verified_tokens,0); CHECK_EQ(o.learned_accepted_tokens,0);
+}
+TEST(draft_origin_empty_head_uses_separately_tagged_lookup) {
+    Fixture f; f.build(); f.cfg.n_spec=4;
+    f.prog.drafter.kind=RAD_DRAFT_BLOCK; f.prog.drafter.depth=4; // fallback beside a head
+    const auto x=DraftExperiment::capture("1","0"); CHECK_OK(f.start(&x));
+    auto r=f.request(160,2000); for(int i=0;i<160;++i)r->prompt[size_t(i)]=100+i%8;
+    const auto id=f.add(std::move(r)); REQUIRE(id); REQUIRE(f.sch.step()); f.commit_plain(100);
+    CHECK_OK(f.sch.set_draft(id,nullptr,0)); REQUIRE(f.sch.step());
+    REQUIRE(f.sch.plan().e[0].ngram); const int n=f.sch.plan().e[0].n_spec; REQUIRE(n>0);
+    CHECK_OK(f.commit(101,0,[](const StepEntry& e){return e.n_spec>1?1:0;}));
+    const auto m=f.sch.metrics(); const auto& o=m.draft_origin;
+    CHECK_EQ(o.learned_publications,0); CHECK_EQ(o.learned_verified_tokens,0);
+    CHECK_EQ(o.fallback_offers,1); CHECK(o.fallback_offered_tokens>=n);
+    CHECK_EQ(o.fallback_publications,1); CHECK_EQ(o.fallback_published_tokens,n);
+    CHECK_EQ(o.fallback_verified_tokens,n); CHECK_EQ(o.fallback_accepted_tokens,m.draft_accepted);
+    CHECK_EQ(o.fallback_verified_tokens,m.draft_tokens);
+}
+TEST(draft_origin_ahead_publication_counts_only_matching_installs) {
+    Fixture f; f.build(); f.cfg.n_spec=4;
+    const auto x=DraftExperiment::capture("1","0"); CHECK_OK(f.start(&x));
+    const auto id=f.submit(160); REQUIRE(f.sch.step()); f.commit_plain(11);
+    REQUIRE(f.sch.step()); f.sch.find(id)->speculation_fixed=true;
+    f.sch.expect_draft(id,4); REQUIRE(f.sch.step_next());
+    const int32_t d[]={21,22,23,24};
+    CHECK_EQ(f.sch.set_draft(id,d,3),RAD_E_STATE);
+    CHECK_EQ(f.sch.metrics().draft_origin.learned_publications,0);
+    CHECK_OK(f.sch.set_draft(id,d,4));
+    CHECK_EQ(f.sch.metrics().draft_origin.learned_publications,1);
+    CHECK_EQ(f.sch.metrics().draft_origin.learned_published_tokens,4);
+    CHECK_OK(f.commit(12)); f.sch.promote_next();
+    CHECK_OK(f.commit(99,0,[](const StepEntry&){return 2;}));
+    CHECK_EQ(f.sch.metrics().draft_origin.learned_verified_tokens,4);
+}
+TEST(draft_compute_off_keeps_configured_depth_but_suppresses_all_scheduler_sources) {
+    Fixture f; f.build(); f.cfg.n_spec=5;
+    f.prog.drafter.kind=RAD_DRAFT_BLOCK; f.prog.drafter.depth=5;
+    f.prog.drafter.window=129;
+    // Private component injection only. Engine separately requires full EP4 bank/final-Plan scope.
+    const auto x=DraftExperiment::capture("0","1"); CHECK_OK(f.start(&x));
+    CHECK_EQ(f.cfg.n_spec,5); CHECK_EQ(f.sch.draft().next_depth(),5);
+    auto r=f.request(160,2000); for(int i=0;i<160;++i)r->prompt[size_t(i)]=100+i%8;
+    const auto id=f.add(std::move(r)); REQUIRE(f.sch.step()); f.commit_plain(100);
+    const int32_t d[]={101,102,103,104,105};
+    CHECK_EQ(f.sch.set_draft(id,d,5),RAD_E_UNSUPPORTED);
+    int rounds=5; Scheduler::SerialRow serial[1];
+    CHECK_EQ(f.sch.serial_begin(&rounds,serial,1),0); CHECK_EQ(rounds,0);
+    Scheduler::BlockRow block[1]; CHECK_EQ(f.sch.block_begin(5,5,129,128799,block,1),0);
+    CHECK(f.sch.block_context(1)==nullptr); CHECK(f.sch.block_query(1)==nullptr);
+    REQUIRE(f.sch.step()); CHECK_EQ(f.sch.plan().n_spec,0); CHECK_EQ(f.sch.plan().n_tok,1);
+    f.sch.find(id)->speculation_fixed=true; f.sch.expect_draft(id,5);
+    const RadBatch* ahead=f.sch.step_next(); REQUIRE(ahead); CHECK_EQ(ahead->n_spec,0);
+    CHECK_EQ(ahead->n_tok,1); CHECK_OK(f.commit(101)); f.sch.promote_next();
+    CHECK_OK(f.commit(102));
+    const auto m=f.sch.metrics(); const auto& o=m.draft_origin;
+    CHECK(o.enabled); CHECK(o.compute_off); CHECK_EQ(m.draft_depth,0);
+    CHECK_EQ(m.draft_tokens,0); CHECK_EQ(m.draft_refills,0);
+    CHECK_EQ(o.learned_publications,0); CHECK_EQ(o.fallback_offers,0);
+    CHECK_EQ(o.learned_verified_tokens+o.fallback_verified_tokens,0);
+}
+TEST(draft_origin_issue_evidence_remains_visible_even_in_off_control) {
+    Fixture f; f.build(); f.cfg.n_spec=5;
+    const auto x=DraftExperiment::capture("0","1"); CHECK_OK(f.start(&x));
+    // Defensive observation: OFF must not hide unexpected actual Engine issues.
+    f.sch.note_block_issue(-1,160); f.sch.note_block_issue(1,5);
+    f.sch.note_block_issue(0,8); f.sch.note_block_issue(1,0);
+    const auto o=f.sch.metrics().draft_origin;
+    CHECK_EQ(o.block_context_issues,1); CHECK_EQ(o.block_context_rows,160);
+    CHECK_EQ(o.block_query_issues,1); CHECK_EQ(o.block_query_rows,5);
+}
+
+TEST(draft_origin_held_lookup_offer_is_not_a_publication_or_consume) {
+    Fixture f; f.build(); f.cfg.n_spec=4;
+    const auto x=DraftExperiment::capture("1","0"); CHECK_OK(f.start(&x));
+    auto r=f.request(160,2000); for(int i=0;i<160;++i)r->prompt[size_t(i)]=100+i%8;
+    REQUIRE(f.add(std::move(r))); REQUIRE(f.sch.step()); f.commit_plain(100);
+    // Make a five-row verify far more costly than any four-token offer can repay.
+    for(int i=0;i<8;++i){f.sch.lookup_gate().step_time(1,10.0);f.sch.lookup_gate().step_time(5,1000.0);}
+    REQUIRE(f.sch.step()); CHECK_EQ(f.sch.plan().n_spec,0);
+    const auto o=f.sch.metrics().draft_origin;
+    CHECK_EQ(o.fallback_offers,1); CHECK(o.fallback_offered_tokens>0);
+    CHECK_EQ(o.fallback_publications,0);CHECK_EQ(o.fallback_published_tokens,0);
+    CHECK_EQ(o.fallback_verified_tokens,0);
+}
+
+/* ===== fixed verify-prefix successor controls: full5 generation, capped consumption ===== */
+TEST(fixed_verify_cap_installs_only_prefix_and_caps_lookup_at_every_positive_depth) {
+    for(int cap:{1,2,3,4,5}){
+        const char text[2]={char('0'+cap),0};const auto x=DraftExperiment::capture("0","0",text);
+        Fixture f;f.build();f.cfg.n_spec=5;f.prog.drafter.kind=RAD_DRAFT_BLOCK;f.prog.drafter.depth=5;
+        CHECK_OK(f.start(&x));auto r=f.request(160,2000);
+        for(int i=0;i<160;++i)r->prompt[size_t(i)]=100+i%8;
+        const auto id=f.add(std::move(r));REQUIRE(f.sch.step());f.commit_plain(100);
+        const int32_t generated[5]={201,202,203,204,205};
+        CHECK_EQ(f.sch.set_draft(id,generated,6),RAD_E_STATE); // refuses before reading six words
+        CHECK_OK(f.sch.set_draft(id,generated,5));
+        REQUIRE(f.sch.step());CHECK_EQ(f.sch.plan().n_spec,cap);CHECK_EQ(f.sch.plan().n_tok,1+cap);
+        CHECK_EQ(f.sch.find(id)->n_draft,cap);
+        CHECK_OK(f.commit(101,0,[](const StepEntry&){return 0;}));
+        const auto m=f.sch.metrics();CHECK_EQ(m.draft_tokens,cap);CHECK_EQ(m.draft_origin.learned_published_tokens,cap);
+        CHECK_EQ(m.draft_origin.verify_cap,cap);CHECK_EQ(f.cfg.n_spec,5);CHECK_EQ(f.sch.draft().next_depth(),5);
+        // Resume the original repeated pattern; no head publication means a lookup fallback.
+        REQUIRE(f.sch.step());CHECK(f.sch.plan().n_spec<=cap);
+        if(f.sch.plan().e[0].ngram)CHECK(f.sch.plan().e[0].n_spec<=cap);
+    }
+}
+TEST(fixed_verify_cap_preserves_full5_query_and_exact_ahead_prefix_transport) {
+    for(int cap:{1,2,3,4,5}){
+        const char text[2]={char('0'+cap),0};const auto x=DraftExperiment::capture("0","0",text);
+        Fixture f;f.build();f.cfg.n_spec=5;f.cfg.max_seqs=1;
+        f.prog.drafter.kind=RAD_DRAFT_BLOCK;f.prog.drafter.depth=5;
+        CHECK_OK(f.start(&x));auto r=f.request(40,0);r->speculation_fixed=true;
+        const auto id=f.add(std::move(r));const RadBatch* b=f.sch.step();REQUIRE(b);
+        std::vector<StepSlot> slots(size_t(f.cfg.max_seqs));std::vector<int32_t> expected;
+        for(int t=0;t<12;++t){
+            const StepEntry entry=f.sch.plan().e[0];
+            CHECK_EQ(entry.n_spec,t?cap:0);
+            const int accepted=ahead_acc(id,t,entry.n_spec);
+            std::vector<int32_t> sampled(size_t(b->n_out)+1,-1);
+            for(int j=0;j<=entry.n_spec;++j)sampled[size_t(entry.dev_out+j)]=
+                j<accepted?ahead_draft(id,t,j):ahead_tok(id,t);
+            AdvanceArgs accept=f.sch.advance_args(0);accept.mode=ADV_ACCEPT;
+            accept.st=slots.data();accept.src=sampled.data();adv_row(accept,0);
+            CHECK_EQ(slots[size_t(entry.card)].acc,accepted);
+            CHECK_EQ(slots[size_t(entry.card)].tok[0],ahead_tok(id,t));
+            Scheduler::BlockRow row[1];CHECK_EQ(f.sch.block_begin(5,5,129,128799,row,1,true),1);
+            const RadBatch* context=f.sch.block_context(t+1);REQUIRE(context);
+            CHECK_EQ(context->n_tok,entry.n_tokens);
+            const RadBatch* query=f.sch.block_query(t+1);REQUIRE(query);
+            CHECK_EQ(query->draft_pass,1);CHECK_EQ(query->n_tok,5);CHECK_EQ(query->n_spec,0);
+            AdvanceArgs q=f.sch.advance_args(0);q.mode=ADV_BLOCK;q.st=slots.data();adv_row(q,0);
+            int32_t generated[5];for(int j=0;j<5;++j)generated[j]=ahead_draft(id,t+1,j);
+            AdvanceArgs take=f.sch.advance_args(0);take.mode=ADV_BTAKE;take.round=5;
+            take.src=generated;take.src_pitch=5;take.st=slots.data();adv_row(take,0);
+            for(int j=0;j<5;++j)CHECK_EQ(slots[size_t(entry.card)].tok[1+j],generated[j]);
+            f.sch.expect_draft(id,5);const RadBatch* next=f.sch.step_next();REQUIRE(next);
+            CHECK_EQ(next->n_spec,cap);CHECK_EQ(next->n_tok,1+cap);
+            AdvanceArgs tr=f.sch.advance_args(0);tr.mode=ADV_TRUNK;tr.st=slots.data();adv_row(tr,0);
+            CHECK_EQ(next->token_ids[0],ahead_tok(id,t));
+            for(int j=0;j<cap;++j)CHECK_EQ(next->token_ids[1+j],generated[j]);
+            for(int j=0;j<accepted;++j)expected.push_back(ahead_draft(id,t,j));
+            expected.push_back(ahead_tok(id,t));
+            CHECK_OK(f.commit(ahead_tok(id,t),0,[accepted](const StepEntry&){return accepted;}));
+            f.sch.block_end();
+            // Fixed-ahead installation must accept generated5 ONLY as its exact planned prefix.
+            CHECK_EQ(f.sch.set_draft(id,generated,cap-1),RAD_E_STATE);
+            CHECK_OK(f.sch.set_draft(id,generated,5));f.sch.promote_next();b=next;
+            CHECK(f.sch.find(id)->output==expected);
+        }
+        const auto m=f.sch.metrics();CHECK_EQ(m.draft_tokens,11*cap);
+        CHECK_EQ(m.draft_origin.learned_verified_tokens,m.draft_tokens);
+        CHECK_EQ(m.draft_origin.learned_published_tokens,12*cap);
+        CHECK_EQ(f.cfg.n_spec,5);CHECK_EQ(f.sch.draft().next_depth(),5);
+    }
+}
+TEST(fixed_verify_cap_partial_rejection_rolls_back_only_committed_prefix) {
+    for(int cap:{1,2,3,4,5}){
+        const char text[2]={char('0'+cap),0};const auto x=DraftExperiment::capture("0","0",text);
+        Fixture f;f.build();f.cfg.n_spec=5;CHECK_OK(f.start(&x));
+        const auto id=f.submit(160,2000);REQUIRE(f.sch.step());f.commit_plain(11);
+        const int32_t generated[5]={21,22,23,24,25};CHECK_OK(f.sch.set_draft(id,generated,5));
+        REQUIRE(f.sch.step());const auto e=f.sch.plan().e[0];const int a=cap-1;
+        CHECK_OK(f.commit(99,0,[a](const StepEntry&){return a;}));
+        CHECK_EQ(f.sch.find(id)->n_computed,int64_t(e.ctx_len+1+a));
+        CHECK_EQ(f.kv.seqs.at(id).n,int64_t(e.ctx_len+1+a));
+        const auto& out=f.sch.find(id)->output;CHECK_EQ(out.size(),size_t(2+a));
+        for(int j=0;j<a;++j){CHECK_EQ(out[size_t(1+j)],generated[j]);}
+        CHECK_EQ(out.back(),99);
+        for(size_t j=1;j<out.size();++j)CHECK(out[j]!=25); // unused tail never emitted (target99)
+    }
+}
+TEST(fixed_verify_cap_zero_is_the_same_runtime_off_and_preserves_declared_depth) {
+    const auto a=DraftExperiment::capture("0","0","0"),b=DraftExperiment::capture("0","1");
+    CHECK(a.compute_off()&&b.compute_off());CHECK(a.observe()&&b.observe());
+    for(int mode=0;mode<2;++mode){
+        const auto& x=mode?a:b;Fixture f;f.build();f.cfg.n_spec=5;CHECK_OK(f.start(&x));
+        const auto id=f.submit(40);REQUIRE(f.sch.step());f.commit_plain(11);
+        const int32_t d[5]={21,22,23,24,25};CHECK_EQ(f.sch.set_draft(id,d,5),RAD_E_UNSUPPORTED);
+        REQUIRE(f.sch.step());CHECK_EQ(f.sch.plan().n_spec,0);CHECK_EQ(f.sch.plan().n_tok,1);
+        CHECK_EQ(f.cfg.n_spec,5);CHECK_EQ(f.sch.draft().next_depth(),5);
+        CHECK(x.target_pipelining(true,false,false,5));
     }
 }

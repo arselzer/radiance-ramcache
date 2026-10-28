@@ -46,7 +46,10 @@ namespace rad {
 
 /* The operator's RADIANCE_* names, captured at construction for the diagnostics report. */
 Engine::Engine(Config cfg)
-    : cfg_(std::move(cfg)), env_set_(diag::env_names(environ, "RADIANCE_")) {}
+    : cfg_(std::move(cfg)),
+      draft_experiment_(DraftExperiment::capture(std::getenv(kDraftOriginEnv),
+                                                  std::getenv(kDraftComputeOffEnv),
+                                                  std::getenv(kDraftVerifyCapEnv))), env_set_(diag::env_names(environ, "RADIANCE_")) {}
 
 int32_t* Engine::Readback::reserve(int64_t count) {
     if (count <= n) return p;
@@ -569,8 +572,8 @@ int Engine::step_loop() {
     std::vector<uint64_t> cancel;
     /* Not in KL mode: its scored rows are copied out of the logits buffer after collection, and a
      * pass issued ahead would overwrite them. */
-    pipelining_ = !cfg_.kld() && !embedding_ &&
-                  (serial_drafting() || block_drafting() || cfg_.n_spec <= 0);
+    pipelining_ = draft_experiment_.target_pipelining(!cfg_.kld() && !embedding_,
+                              serial_drafting(), block_drafting(), cfg_.n_spec);
     early_ids_ = !cfg_.kld() && !embedding_;
     const bool t_on = (int)log_level() >= (int)Log::Debug;
     /* The next step's forward pass when already issued behind the previous step, before its
@@ -1907,7 +1910,7 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
         gen_ = std::move(d);
         RAD_TRY(rad_dev_set(ranks_[0]->device));
     } else
-    RAD_TRY(sched_.init(ranks_[0]->program, cfg_, kv_iface_.get(), pc_iface_.get(), rio, &geo_));
+    RAD_TRY(sched_.init(ranks_[0]->program, cfg_, kv_iface_.get(), pc_iface_.get(), rio, &geo_, &draft_experiment_));
     /* The smallest step the prefill stager overlaps. A chunk held back for other work
      * (--busy-prefill-chunk) stays at or above it; below it every routed layer reads its pooled
      * experts synchronously, which costs far more than sharing the step saves. The maximum over

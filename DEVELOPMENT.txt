@@ -37,15 +37,20 @@ The latest merge includes upstream placement, prefix and hc_read improvements.
 It also fixes expert-pin-top for normalized profile shares and rejects non-finite
 fractions, with regression coverage. It has not been GPU-benchmarked.
 
-The bank/head port is applied here but has not yet been built or tested on this
-branch. A separate frozen Core completed two 64-token learned-MTP replies with
+The bank/head/control port is applied here but has not yet been built or tested on
+this branch. A separate frozen Core completed two 64-token learned-MTP replies with
 all 128 token IDs matching the target reference. With depth five and final head
 placement verified, it measured 4.62 tokens/s using a 72 GiB RAM expert cache,
 6144 MiB pinned pool per rank, M16 and context 512. The optional head cache
 measured 4.70 tokens/s in one ordered pair; it remains off by default. These
 figures are not a matched MTP-off comparison with the earlier 5.36 tokens/s run.
-Runtime depth controls and the new sparse-GEMV/WMMA experiments are not ported
-to this branch yet.
+Constructor-captured controls now support MTP compute-off with the full graph and
+memory allocation retained, verification caps 0 through 5, and separate committed
+learned/fallback counters. An absent cap preserves the legacy behavior; explicit
+zero disables draft work and restores ordinary target pipelining. The same control
+implementation passed the portable checks, 549 HOST cases and the C/CXX ABI check
+in the frozen experiment. The current merged source still needs its own tests.
+The new sparse-GEMV/WMMA experiments remain separate from this branch.
 
 No model weights, checkpoint data, deployment credentials or local runtime
 receipts are included. The production QFN service has not been upgraded.

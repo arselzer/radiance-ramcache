@@ -149,6 +149,22 @@ private:
     Counter c_step_secs_, c_step_secs_decode_;
     /* Exact totals behind the rate gauges; see render(). */
     Counter c_prefill_tokens_, c_decode_tokens_, c_draft_tokens_, c_draft_accepted_;
+    std::atomic<bool> draft_origin_on_{false};
+    Gauge g_draft_compute_off_, g_draft_verify_cap_;
+    Counter c_origin_learned_publications;
+    Counter c_origin_learned_published_tokens;
+    Counter c_origin_fallback_offers;
+    Counter c_origin_fallback_offered_tokens;
+    Counter c_origin_fallback_publications;
+    Counter c_origin_fallback_published_tokens;
+    Counter c_origin_learned_verified_tokens;
+    Counter c_origin_learned_accepted_tokens;
+    Counter c_origin_fallback_verified_tokens;
+    Counter c_origin_fallback_accepted_tokens;
+    Counter c_origin_block_context_issues;
+    Counter c_origin_block_context_rows;
+    Counter c_origin_block_query_issues;
+    Counter c_origin_block_query_rows;
     Counter c_draft_refills_, c_draft_refill_tokens_;
     Counter c_lookup_proposals_, c_lookup_held_, c_lookup_held_drafts_, c_lookup_held_hits_;
     Counter c_attn_cached_, c_linear_cached_, c_checkpoints_;

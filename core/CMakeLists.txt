@@ -25,6 +25,13 @@ list(APPEND RAD_CORE_SRC ${_top})
 list(APPEND RAD_CORE_SRC ${CMAKE_SOURCE_DIR}/libquant/lq_ggml_planes.cpp
                          ${CMAKE_SOURCE_DIR}/libquant/lq_ggml_dequant.cpp
                          ${CMAKE_SOURCE_DIR}/libquant/lq_ggml_tables.cpp)
+# DeepSeek-V4.1 experts computed on the host (place/host_expert_pool.h), from the kernels
+# tools/ds41-host-experts proves bit-identical to the card's. AVX2 without FMA contraction, so each
+# product and sum stays a separate rounded operation as on the card.
+set(RAD_DS41_HX_SRC ${CMAKE_SOURCE_DIR}/tools/ds41-host-experts/ds41_host_experts.cpp)
+list(APPEND RAD_CORE_SRC ${RAD_DS41_HX_SRC})
+set_source_files_properties(${RAD_DS41_HX_SRC} PROPERTIES
+                            COMPILE_OPTIONS "-mavx2;-ffp-contract=off;-fno-fast-math")
 
 add_library(rad_core STATIC ${RAD_CORE_SRC})
 target_link_libraries(rad_core PUBLIC rad_abi ${CMAKE_DL_LIBS} Threads::Threads)
@@ -33,7 +40,8 @@ target_include_directories(rad_core PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}
   ${CMAKE_SOURCE_DIR}/abi
   ${CMAKE_SOURCE_DIR}/vendor)
-target_include_directories(rad_core PRIVATE ${CMAKE_SOURCE_DIR}/libquant)
+target_include_directories(rad_core PRIVATE ${CMAKE_SOURCE_DIR}/libquant
+                                            ${CMAKE_SOURCE_DIR}/tools/ds41-host-experts)
 
 if(TARGET rad_vendor)
   target_link_libraries(rad_core PUBLIC rad_vendor)

@@ -103,6 +103,18 @@ Engine::~Engine() {
                      "%llu SSD units submitted, %llu corrupt rows refused",
                      (unsigned long long)ep.reads, (unsigned long long)ep.zero_local,
                      (unsigned long long)ep.units, (unsigned long long)ep.corrupt);
+        const auto& hx = r->fstager.host_stats();
+        if (r->fstager.host_experts())
+            RAD_INFO("host experts: %llu layers handed %llu experts (%llu rows) to the CPU; "
+                     "%llu cached experts went over the copy link, %llu routed experts were not "
+                     "cached; %.1f ms waiting at gathers; verify: %llu rows compared, %llu differ; "
+                     "%llu gate_up operand moves; %llu units probed (the mapped cache's hit "
+                     "and miss counts above include these probes)",
+                     (unsigned long long)hx.layers, (unsigned long long)hx.units,
+                     (unsigned long long)hx.rows, (unsigned long long)hx.linked,
+                     (unsigned long long)hx.missed, (double)hx.wait_ns / 1e6,
+                     (unsigned long long)hx.verified, (unsigned long long)hx.differ,
+                     (unsigned long long)hx.moved, (unsigned long long)hx.probed);
     }
     /* Drain the transfer streams before the contexts. Ctx::shutdown drains the compute streams
      * and frees the arena, but the mover's stream also copies into the arena (the prefill

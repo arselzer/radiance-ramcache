@@ -777,6 +777,44 @@ void Mover::alias_file_units(const std::vector<int32_t>& units, char* base,
     }
 }
 
+bool Mover::borrow_host_unit(int32_t u, HostUnit* out) {
+    if (!out || out->n != 0 || !plan_ || !prog_ || !mapped_file_cache_on_ || u < 0 ||
+        (size_t)u >= unit_.size())
+        return false;
+    const UnitState& us = unit_[(size_t)u];
+    if (us.tier != Tier::SSD || us.slab_slot >= 0 || us.klass < 0) return false;
+    const MoveUnit& mu = plan_->units[(size_t)u];
+    if (mu.weights.empty() || mu.weights.size() > 2 || !source_file_epoch()) return false;
+    for (rad_weight h : mu.weights) {
+        const WeightInfo& w = prog_->weights[h];
+        NativeMappedFileCache::Lease& l = out->lease[out->n];
+        if (w.stored_bytes <= 0 || !mapped_file_eligible(w) ||
+            mapped_file_cache_.borrow((size_t)(&w - prog_->weights.data()), (size_t)w.stored_bytes,
+                                      &l) != NativeMappedFileCache::Status::Hit ||
+            !l.active() || !l.host() || l.bytes() != (size_t)w.stored_bytes) {
+            (void)l.release();
+            release_host_unit(out);
+            return false;
+        }
+        out->host[out->n] = l.host();
+        out->bytes[out->n] = w.stored_bytes;
+        ++out->n;
+    }
+    out->unit = u;
+    return true;
+}
+
+void Mover::release_host_unit(HostUnit* hu) {
+    if (!hu) return;
+    for (int i = 0; i < hu->n; ++i) {
+        (void)hu->lease[i].release();
+        hu->host[i] = nullptr;
+        hu->bytes[i] = 0;
+    }
+    hu->n = 0;
+    hu->unit = -1;
+}
+
 /* The same choice of units as stage_units, without a cap. */
 int64_t Mover::stage_need(const std::vector<int32_t>& units, int64_t* largest) const {
     int64_t total = 0, most = 0;

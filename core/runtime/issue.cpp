@@ -857,6 +857,14 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
     p.issued    = true;
     ++n_issues_;
 
+    /* The stager sees the resolved operands before the launch; what it queues on the stream runs
+     * right before the op (OpStager::operands). */
+    if (staging_ && stager_ && dom == RAD_DOMAIN_DEVICE) {
+        const int so = stager_->operands(h, cur_stream(), t, ip.args.n_t);
+        if (so < 0)
+            return abort_step_msg(h, so, "the weight stager could not prepare this op's operands");
+    }
+
     /* All-reduce link accounting: `n` is the collective's numel (its ranged parameter) and operand
      * 0's dtype is the wire element type. The op's `dtype` key ("w4a8") is not an element
      * width. */

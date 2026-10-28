@@ -87,10 +87,12 @@
 #include "planner.h"
 #include "ep_route_counts.h"
 #include "dspark_head_tail.h"
+#include "host_expert_pool.h"
 
 #include <deque>
 #include <functional>
 #include <map>
+#include <memory>
 #include <vector>
 
 namespace rad {
@@ -249,6 +251,19 @@ public:
     using EpCountsRow = std::function<bool(int32_t layer, EpRouteCounts* out)>;
     struct EpStats { uint64_t reads = 0, zero_local = 0, units = 0, corrupt = 0; };
     const EpStats& ep_stats() const { return ep_stats_; }
+    /* Routed experts the CPU computed (HostExpertPool) instead of a copy to the card. */
+    struct HostStats {
+        uint64_t layers = 0, units = 0, rows = 0;
+        uint64_t linked = 0;          /* cached experts the schedule left on the copy link */
+        uint64_t missed = 0;          /* routed experts the RAM cache did not hold */
+        uint64_t wait_ns = 0;         /* the issuing thread waiting at gathers for the CPU */
+        uint64_t verified = 0, differ = 0;   /* ..._POLICY=verify: rows compared with the card's */
+        uint64_t moved = 0;           /* a gate_up's operands at new addresses (kept the newest) */
+        uint64_t probed = 0;          /* selected units hx_choose borrowed to test for the cache:
+                                       * the mapped cache's own hit/miss counts include these */
+    };
+    const HostStats& host_stats() const { return hx_stats_; }
+    bool host_experts() const { return hx_pool_ != nullptr; }
 
     /* The routed layers of `plan` that hold a unit on the file tier and the ops that read them,
      * over the mover's two file buffers. Leaves it disabled -- enabled() false -- when the plan
@@ -278,6 +293,7 @@ public:
 
     bool begin_pass(const RadBatch* b) override;
     int  before_op(rad_op h, RadStream s, bool* resync) override;
+    int  operands(rad_op h, RadStream s, const RadTensor* t, int n_t) override;
     int  end_pass(RadStream s) override;
     //Must run before Ctx::shutdown and before Mover/bank/buffer owners disappear.
     int shutdown_head_cache();
@@ -331,6 +347,63 @@ private:
     const Program* ep_program_ = nullptr;
     std::vector<uint8_t> ep_layer_eligible_;
     EpStats ep_stats_;
+
+    /* ---- routed experts computed on the CPU (host_expert_pool.h) ----------------------------
+     *
+     * In an EP-routed pass, start_ep_routed copies the pass's token rows, sorted order and expert
+     * offsets to the host with the counts row (hx_fetch, one wait for all), gives each selected
+     * unit the RAM cache holds to the pool or to the copy link, whichever the schedule expects
+     * free sooner (hx_choose), and starts the pool's jobs (hx_submit) before the drive reads that
+     * block the thread. The pool's units are aliased like unrouted ones, so the card's GEMMs
+     * compute rows from stray bytes for them. At the layer's gather (operands) the stager waits
+     * for the pool and copies the CPU's rows over the card's before the gather reads them.
+     *
+     * The rows' addresses are the gate_up's operands, which hx_capture records at every pass's
+     * gate_up and checks against what hx_fetch read; a layer gets CPU units from its second pass
+     * on. One layer is in flight at a time; its leases are given back once the pool read them. */
+    enum { kHxGreedy, kHxAll, kHxVerify };
+    /* gather: the ops that may read the layer's down rows first -- its moe_gather, or the
+     * reduction that folds it in (ar_gather_hc_write, a form a wire), whichever the pass issues.
+     * x .. off: the gate_up's operands as last issued. */
+    struct HxOps {
+        int32_t gu = -1;
+        int32_t gather[3] = { -1, -1, -1 };
+        int64_t n_expert = 0, top_k = 0;
+        const void* x = nullptr;
+        int64_t     x_ld = 0;
+        const void* sorted = nullptr;
+        const void* off = nullptr;
+    };
+    static constexpr int kHxUnits = 96;
+    static constexpr int kHxRows = (int)kEpRouteMaxRows * 6;
+    HostExpertPool* hx_pool_ = nullptr;
+    int  hx_policy_ = kHxGreedy;
+    std::vector<HxOps> hx_ops_;                   /* by routed layer; gu < 0: the card only */
+    int32_t hx_li_ = -1;                          /* the layer with CPU units, or -1 */
+    int  hx_stage_ = 0;                           /* 1: chosen, 2: handed to the pool */
+    bool hx_confirmed_ = false;                   /* its gate_up read the rows the pool was given */
+    std::unique_ptr<Mover::HostUnit[]> hx_units_;
+    int  hx_n_ = 0;                               /* slots used; a released one has n == 0 */
+    int64_t hx_reserved_ = 0;                     /* pool backlog reserved, not yet submitted */
+    std::vector<int32_t> hx_keep_, hx_slot_;
+    std::vector<HostExpertPool::Job> hx_jobs_;
+    std::vector<int32_t> hx_rows_;                /* the sorted row each job writes */
+    HostExpertPool::Ticket hx_ticket_;
+    uint16_t* hx_x_ = nullptr;                    /* pinned [kEpRouteMaxRows, 5120] token rows */
+    int32_t*  hx_idx_ = nullptr;                  /* pinned sorted_tok [kHxRows], expert_offset */
+    uint16_t* hx_out_ = nullptr;                  /* pinned [kHxRows, 5120]: the CPU's rows */
+    uint16_t* hx_chk_ = nullptr;                  /* pinned [kHxRows, 5120]: the card's (verify) */
+    RadEvent  hx_in_ev_ = nullptr, hx_out_ev_ = nullptr;
+    bool      hx_out_rec_ = false;
+    int       hx_told_ = 0;
+    HostStats hx_stats_;
+    int  hx_init(const Program& prog);
+    int  hx_fetch(int32_t li, RadStream s);
+    void hx_choose(int32_t li);
+    int  hx_submit();
+    int  hx_capture(int32_t li, const RadTensor* t, int n_t);
+    int  hx_finish(RadStream s, const RadTensor* t, int n_t);
+    void hx_drain();
     int  finish(int32_t b, RadStream s);
     struct HeadOps;
     DsparkHeadTailOwner head_;

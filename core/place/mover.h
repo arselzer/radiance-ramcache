@@ -584,6 +584,21 @@ public:
      *                   back like read ones. */
     void  alias_file_units(const std::vector<int32_t>& units, char* base,
                            std::vector<int32_t>* staged);
+    /* borrow_host_unit  for a reader on the host (place/host_expert_pool.h): when the mapped RAM
+     *                   cache holds every weight of file-tier unit `u`, a lease on each, which
+     *                   keeps its bytes in place until release_host_unit, and their host
+     *                   addresses in the unit's weight order. False, with nothing held, when a
+     *                   weight is not cached or the cache is off. Borrowing touches the entries,
+     *                   as a staged read does. */
+    struct HostUnit {
+        int32_t        unit = -1;
+        int            n = 0;
+        const uint8_t* host[2] = { nullptr, nullptr };
+        int64_t        bytes[2] = { 0, 0 };
+        NativeMappedFileCache::Lease lease[2];
+    };
+    bool  borrow_host_unit(int32_t u, HostUnit* out);
+    void  release_host_unit(HostUnit* hu);
     /* set_file_relayout  the function that makes a file-tier weight's stored form from its
      *                    container planes when the two differ (weight_file_relaid): the kernel's
      *                    relayout, as the loader's relayout pool calls it once for a resident

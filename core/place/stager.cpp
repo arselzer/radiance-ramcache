@@ -3,6 +3,7 @@
 #include "place/dspark_native_scope.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <cstdlib>
 
@@ -478,6 +479,12 @@ FileStager::~FileStager() {
     }
     if (counts_ev_) rad_event_destroy(counts_ev_);
     if (counts_host_) rad_dev_free(counts_host_, RAD_MEM_HOST_PINNED);
+    hx_drain();
+    if (hx_out_rec_ && hx_out_ev_) (void)rad_event_sync(hx_out_ev_);
+    if (hx_in_ev_) rad_event_destroy(hx_in_ev_);
+    if (hx_out_ev_) rad_event_destroy(hx_out_ev_);
+    for (void* p : { (void*)hx_x_, (void*)hx_idx_, (void*)hx_out_, (void*)hx_chk_ })
+        if (p) rad_dev_free(p, RAD_MEM_HOST_PINNED);
 }
 
 int FileStager::init(const Program& prog, const Plan& plan, Mover* mover, CountsRow counts,
@@ -573,7 +580,8 @@ int FileStager::init(const Program& prog, const Plan& plan, Mover* mover, Counts
             counts_ev_ = nullptr;
         }
     }
-    return init_head_cache(prog, plan);
+    RAD_TRY(init_head_cache(prog, plan));
+    return hx_init(prog);
 }
 
 /* Arms for every pass: a file-tier unit has no other address, so an unarmed pass would reach its
@@ -643,9 +651,24 @@ int FileStager::start_ep_routed(int32_t li, RadStream s, bool* read) {
         v.rank != plan_->rank) { RAD_TRY(head_revoke()); return RAD_E_STATE; }
     const int b = li & 1;
     if (holds_[b] >= 0 || counts_cap_ < 96) return RAD_E_STATE;
+    /* A layer whose CPU rows were computed and never copied means its gather read the card's
+     * stray rows for them. */
+    if (hx_li_ >= 0) {
+        const bool lost = hx_stage_ == 2;
+        const int32_t was = layers_[(size_t)hx_li_].layer;
+        hx_drain();
+        if (lost) {
+            RAD_ERR("host experts: layer %d's CPU rows reached no gather", was);
+            return RAD_E_STATE;
+        }
+    }
+    /* With the pool, the pass's token rows and sorted order ride the same wait (hx_fetch). */
+    const bool hx = hx_pool_ && !head_.configured() && (size_t)li < hx_ops_.size() &&
+                    hx_ops_[(size_t)li].gu >= 0 && hx_ops_[(size_t)li].x;
     /* Same actual producer stream; this host-wait event is the completion proof.
      * The Ctx witness means successfully issued, never completed before this wait. */
     RAD_TRY(rad_memcpy_async(counts_host_, v.row, 96 * (int64_t)sizeof(int32_t), s));
+    if (hx) RAD_TRY(hx_fetch(li, s));
     RAD_TRY(rad_event_record(counts_ev_, s));
     RAD_TRY(rad_event_sync(counts_ev_));
     int64_t total = 0;
@@ -661,6 +684,12 @@ int FileStager::start_ep_routed(int32_t li, RadStream s, bool* read) {
             return RAD_E_STATE;
         (selected ? want_ : skip_).push_back(u);
     }
+    /* The selected units the CPU computes leave want_ and start on the pool before the drive
+     * reads below block this thread (host_expert_pool.h). */
+    if (hx) {
+        hx_choose(li);
+        if (hx_li_ == li) RAD_TRY(hx_submit());
+    }
     const int64_t need = int64_t(want_.size()) * DsparkHeadTailOwner::pair_bytes;
     if (head_.pending() && (head_pass_ != HeadPass::Verify ||
         !head_.selected_fits(int64_t(want_.size()), need))) RAD_TRY(head_revoke());
@@ -673,7 +702,15 @@ int FileStager::start_ep_routed(int32_t li, RadStream s, bool* read) {
     if(stage_status<0)return stage_status;
     pending_[b] = !staged_[b].empty();
     mover_->alias_file_units(skip_, buf_[b], &staged_[b]);
-    partial_[b] = !skip_.empty();
+    bool cpu_aliased = false;
+    if (hx_li_ == li && hx_policy_ != kHxVerify) {
+        hx_keep_.clear();
+        for (int k = 0; k < hx_n_; ++k)
+            if (hx_units_[k].n) hx_keep_.push_back(hx_units_[k].unit);
+        mover_->alias_file_units(hx_keep_, buf_[b], &staged_[b]);
+        cpu_aliased = !hx_keep_.empty();
+    }
+    partial_[b] = !skip_.empty() || cpu_aliased;
     if (!staged_[b].empty()) holds_[b] = li;
     ++ep_stats_.reads;
     ep_stats_.units += want_.size();
@@ -732,6 +769,404 @@ int FileStager::start_routed(int32_t li, RadStream s, bool* read) {
     return RAD_OK;
 }
 
+/* ---- routed experts computed on the CPU (see stager.h and host_expert_pool.h) ------------------ */
+
+namespace {
+constexpr int64_t kHxEmbd = HostExpertPool::kEmbd;
+
+int64_t hx_numel(const RadTensor& t) {
+    int64_t n = 1;
+    for (int i = 0; i < t.rank; ++i) n *= t.shape[i];
+    return t.rank > 0 ? n : 0;
+}
+}  /* namespace */
+
+/* Which layers can hand units to the pool: the EP-routed ones whose first expert op is a decode
+ * gate_up (moe_gemm_ggml mxfp4 [4608, 5120], token order), whose last is the down projection
+ * ([5120, 2304], sorted order) with a swiglu_clamped at the pool's limit between, and whose
+ * gathers (moe_gather, or ar_gather_hc_write folding it in, up to the next routed layer) read the
+ * down projection's rows as operand 0. */
+int FileStager::hx_init(const Program& prog) {
+    hx_drain();
+    hx_pool_ = nullptr;
+    hx_ops_.assign(layers_.size(), HxOps{});
+    /* The DSpark head tail owns the routed layers' file buffers and their copy budget. */
+    if (head_.configured()) {
+        if (plan_ && plan_->rank == 0 && std::getenv("RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS"))
+            RAD_INFO("host experts: off; the DSpark head tail serves the routed layers");
+        return RAD_OK;
+    }
+    HostExpertPool* pool = HostExpertPool::get();
+    if (!pool || !ep_counts_ || !counts_host_ || !plan_) return RAD_OK;
+    const char* pol = std::getenv("RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_POLICY");
+    hx_policy_ = !pol || !*pol || !std::strcmp(pol, "greedy") ? kHxGreedy
+               : !std::strcmp(pol, "all")                    ? kHxAll
+               : !std::strcmp(pol, "verify")                 ? kHxVerify : -1;
+    if (hx_policy_ < 0) {
+        RAD_ERR("RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_POLICY=%s: greedy, all or verify", pol);
+        return RAD_E_INVAL;
+    }
+    auto gemm = [&](int32_t h, long long n, long long k, const char* order, HxOps* o) {
+        if (h < 0 || (size_t)h >= prog.ops.size()) return false;
+        const OpInfo& op = prog.ops[(size_t)h];
+        long long N = 0, K = 0, ne = 0, tk = 0;
+        const char* ord = op.base.get_s("a_order");
+        const char* ty = op.base.get_s("type");
+        if (op.op != "moe_gemm_ggml" || !op.base.get_i("N", &N) || !op.base.get_i("K", &K) ||
+            !op.base.get_i("n_expert", &ne) || !op.base.get_i("top_k", &tk) || N != n || K != k ||
+            ne != 96 || tk != 6 || !ord || std::strcmp(ord, order) || !ty || std::strcmp(ty, "mxfp4"))
+            return false;
+        if (o) { o->n_expert = ne; o->top_k = tk; }
+        return true;
+    };
+    size_t n_ok = 0;
+    for (size_t li = 0; li < layers_.size(); ++li) {
+        if (li >= ep_layer_eligible_.size() || !ep_layer_eligible_[li]) continue;
+        const Layer& L = layers_[li];
+        HxOps o;
+        if (!gemm(L.first_op, 2 * HostExpertPool::kFf, kHxEmbd, "token", &o) ||
+            !gemm(L.last_op, kHxEmbd, HostExpertPool::kFf, "sorted", nullptr))
+            continue;
+        bool limit = false;
+        for (int32_t h = L.first_op + 1; h < L.last_op; ++h) {
+            const OpInfo& op = prog.ops[(size_t)h];
+            double v = 0;
+            if (op.op == "swiglu_clamped")
+                limit = op.base.get_f("limit", &v) && (float)v == pool->limit();
+        }
+        /* Every reader of the down rows up to the next routed layer must be one of these. */
+        const int32_t end = li + 1 < layers_.size() ? layers_[li + 1].first_op
+                                                    : (int32_t)prog.ops.size();
+        int n_gather = 0;
+        bool shape = true;
+        for (int32_t h = L.last_op + 1; h < end && shape; ++h) {
+            const OpInfo& op = prog.ops[(size_t)h];
+            if (op.op != "moe_gather" && op.op != "ar_gather_hc_write") continue;
+            const RadOpSchema* sc = op.schema;
+            shape = n_gather < 3 && sc && sc->n_operands >= 1 && sc->operands[0].name &&
+                    !std::strcmp(sc->operands[0].name, "y_expert");
+            if (shape) o.gather[n_gather++] = h;
+        }
+        if (!limit || !shape || !n_gather) continue;
+        o.gu = L.first_op;
+        hx_ops_[li] = o;
+        ++n_ok;
+    }
+    if (!n_ok) {
+        if (plan_->rank == 0)
+            RAD_WARN("host experts: no routed layer has the DeepSeek-V4.1 decode shape the pool "
+                     "computes; every expert stays on the card");
+        return RAD_OK;
+    }
+    const int64_t rows = (int64_t)kHxRows * kHxEmbd * (int64_t)sizeof(uint16_t);
+    if (!hx_x_) hx_x_ = (uint16_t*)rad_dev_alloc(kEpRouteMaxRows * kHxEmbd * 2, RAD_MEM_HOST_PINNED);
+    if (!hx_idx_) hx_idx_ = (int32_t*)rad_dev_alloc((kHxRows + 128) * 4, RAD_MEM_HOST_PINNED);
+    if (!hx_out_) hx_out_ = (uint16_t*)rad_dev_alloc(rows, RAD_MEM_HOST_PINNED);
+    if (!hx_chk_ && hx_policy_ == kHxVerify)
+        hx_chk_ = (uint16_t*)rad_dev_alloc(rows, RAD_MEM_HOST_PINNED);
+    if (!hx_in_ev_ && rad_event_create(&hx_in_ev_) < 0) hx_in_ev_ = nullptr;
+    if (!hx_out_ev_ && rad_event_create(&hx_out_ev_) < 0) hx_out_ev_ = nullptr;
+    if (!hx_units_) hx_units_.reset(new (std::nothrow) Mover::HostUnit[kHxUnits]);
+    if (!hx_x_ || !hx_idx_ || !hx_out_ || (hx_policy_ == kHxVerify && !hx_chk_) || !hx_in_ev_ ||
+        !hx_out_ev_ || !hx_units_) {
+        RAD_ERR("host experts: pinned staging or events failed; every expert stays on the card");
+        return RAD_OK;
+    }
+    hx_pool_ = pool;
+    if (plan_->rank == 0)
+        RAD_INFO("host experts: %zu of %zu routed layers give the CPU %s cached experts%s", n_ok,
+                 layers_.size(), hx_policy_ == kHxAll ? "every one of their" : "some of their",
+                 hx_policy_ == kHxVerify ? " and still compute them on the card, comparing the rows"
+                 : hx_policy_ == kHxGreedy ? " (whichever of the pool and the copy link frees sooner)"
+                                           : "");
+    return RAD_OK;
+}
+
+/* Splits want_ (the layer's selected units, in container order) between the copy path and the
+ * pool: every unit the RAM cache holds is borrowed; then each borrowed one goes to the pool when
+ * the pool's backlog, including what other ranks reserved, would finish it no later than this
+ * rank's copy link would finish its copies. Misses always take the copy path. */
+void FileStager::hx_choose(int32_t li) {
+    hx_n_ = 0;
+    hx_reserved_ = 0;
+    hx_slot_.assign(want_.size(), -1);
+    const double cb = hx_pool_->cpu_bytes_per_ns(), lb = hx_pool_->link_bytes_per_ns();
+    int64_t link = 0;
+    for (size_t i = 0; i < want_.size(); ++i) {
+        const int32_t u = want_[i];
+        Mover::HostUnit* hu = hx_n_ < kHxUnits ? &hx_units_[hx_n_] : nullptr;
+        ++hx_stats_.probed;
+        if (hu && mover_->borrow_host_unit(u, hu)) {
+            bool gu = false, dn = false;
+            for (int k = 0; k < hu->n; ++k) {
+                gu = gu || hu->bytes[k] == HostExpertPool::kGuBytes;
+                dn = dn || hu->bytes[k] == HostExpertPool::kDnBytes;
+            }
+            if (hu->n == 2 && gu && dn) {
+                hx_slot_[i] = hx_n_++;
+                continue;
+            }
+            mover_->release_host_unit(hu);
+        }
+        ++hx_stats_.missed;
+        link += plan_->units[(size_t)u].bytes;
+    }
+    int n_cpu = 0;
+    for (size_t i = 0; i < want_.size(); ++i) {
+        if (hx_slot_[i] < 0) continue;
+        Mover::HostUnit& hu = hx_units_[hx_slot_[i]];
+        const int32_t e = plan_->units[(size_t)hu.unit].expert;
+        const int64_t rows = e >= 0 && e < counts_cap_ ? std::max<int32_t>(counts_host_[e], 1) : 1;
+        const int64_t cost = rows * HostExpertPool::kExpertBytes, bytes = plan_->units[(size_t)hu.unit].bytes;
+        const bool cpu = hx_policy_ != kHxGreedy ||
+                         (double)(hx_pool_->backlog() + cost) / cb <= (double)(link + bytes) / lb;
+        if (cpu) {
+            hx_pool_->reserve(cost);
+            hx_reserved_ += cost;
+            ++n_cpu;
+            continue;
+        }
+        mover_->release_host_unit(&hu);
+        hx_slot_[i] = -1;
+        ++hx_stats_.linked;
+        link += bytes;
+    }
+    if (!n_cpu) {
+        hx_n_ = 0;
+        return;
+    }
+    if (hx_policy_ != kHxVerify) {
+        hx_keep_.clear();
+        for (size_t i = 0; i < want_.size(); ++i)
+            if (hx_slot_[i] < 0) hx_keep_.push_back(want_[i]);
+        want_.swap(hx_keep_);
+    }
+    hx_li_ = li;
+    hx_stage_ = 1;
+}
+
+/* The pass's token rows, sorted order and expert offsets to the host, queued behind the counts
+ * row so the counts' wait covers them: the router and its scatter wrote them, and the router read
+ * the rows. Their addresses are the gate_up operands hx_capture saw on an earlier pass, which
+ * hx_capture checks again on this one. */
+int FileStager::hx_fetch(int32_t li, RadStream s) {
+    const HxOps& o = hx_ops_[(size_t)li];
+    if (pass_tok_ < 1 || pass_tok_ > kEpRouteMaxRows) return RAD_E_STATE;
+    if (o.x_ld == kHxEmbd) {
+        RAD_TRY(rad_memcpy_async(hx_x_, o.x, pass_tok_ * kHxEmbd * 2, s));
+    } else {
+        for (int64_t r = 0; r < pass_tok_; ++r)
+            RAD_TRY(rad_memcpy_async(hx_x_ + r * kHxEmbd, (const char*)o.x + r * o.x_ld * 2,
+                                     kHxEmbd * 2, s));
+    }
+    RAD_TRY(rad_memcpy_async(hx_idx_, o.sorted, pass_tok_ * o.top_k * 4, s));
+    RAD_TRY(rad_memcpy_async(hx_idx_ + kHxRows, o.off, (o.n_expert + 1) * 4, s));
+    return RAD_OK;
+}
+
+/* One pool job for each row a CPU unit owns. Expert e's rows are moe_gemm_ggml's (mx_range):
+ * [off[e], off[e + 1]), the first expert from 0 and the last to T; a slot whose sorted entry is
+ * negative or past the pass's tokens is a row of zeros on the card and stays the card's. */
+int FileStager::hx_submit() {
+    const HxOps& o = hx_ops_[(size_t)hx_li_];
+    const int64_t AR = pass_tok_, T = pass_tok_ * o.top_k;
+    const int32_t* const sorted = hx_idx_;
+    const int32_t* const off = hx_idx_ + kHxRows;
+    /* The rows' last copies to the card are behind the counts this layer waited for. */
+    if (hx_out_rec_) {
+        RAD_TRY(rad_event_sync(hx_out_ev_));
+        hx_out_rec_ = false;
+    }
+    hx_jobs_.clear();
+    hx_rows_.clear();
+    const int ne = (int)o.n_expert;
+    for (int k = 0; k < hx_n_; ++k) {
+        const Mover::HostUnit& hu = hx_units_[k];
+        if (!hu.n) continue;
+        const int e = plan_->units[(size_t)hu.unit].expert;
+        int lo = e == 0 ? 0 : off[e], hi = e == ne - 1 ? (int)T : off[e + 1];
+        lo = std::clamp(lo, 0, (int)T);
+        hi = std::clamp(hi, lo, (int)T);
+        HostExpertPool::Job j;
+        j.gu = hu.bytes[0] == HostExpertPool::kGuBytes ? hu.host[0] : hu.host[1];
+        j.dn = hu.bytes[0] == HostExpertPool::kGuBytes ? hu.host[1] : hu.host[0];
+        int32_t n = 0;
+        for (int i = lo; i < hi; ++i) {
+            if (sorted[i] < 0 || sorted[i] / o.top_k >= AR) continue;
+            j.x = hx_x_ + (int64_t)(sorted[i] / o.top_k) * kHxEmbd;
+            j.y = hx_out_ + (int64_t)i * kHxEmbd;
+            hx_jobs_.push_back(j);
+            hx_rows_.push_back(i);
+            ++n;
+        }
+        /* The scatter's own count for the expert, which chose it: a different number of rows
+         * means the sorted order was not read as the card reads it. */
+        if (e < 0 || e >= counts_cap_ || n != counts_host_[e]) {
+            RAD_ERR("host experts: layer %d expert %d has %d rows in the sorted order and %d in "
+                    "its count", layers_[(size_t)hx_li_].layer, e, n,
+                    e >= 0 && e < counts_cap_ ? counts_host_[e] : -1);
+            return RAD_E_STATE;
+        }
+    }
+    const int64_t submitted = (int64_t)hx_jobs_.size() * HostExpertPool::kExpertBytes;
+    if (submitted != hx_reserved_) hx_pool_->unreserve(hx_reserved_ - submitted);
+    hx_reserved_ = 0;
+    RAD_TRY(hx_pool_->submit(hx_jobs_.data(), (int)hx_jobs_.size(), &hx_ticket_));
+    hx_stage_ = 2;
+    hx_confirmed_ = false;
+    ++hx_stats_.layers;
+    hx_stats_.rows += hx_jobs_.size();
+    for (int k = 0; k < hx_n_; ++k) hx_stats_.units += hx_units_[k].n ? 1 : 0;
+    return RAD_OK;
+}
+
+/* A layer's gate_up op, before its launch, on every pass: the addresses of its token rows,
+ * sorted order and expert offsets (moe_gemm_ggml: a, w, sorted_tok, expert_offset, y), which
+ * the next pass's hx_fetch reads. With CPU rows in flight they must be the ones hx_fetch read on
+ * this pass, or the pool computed from the wrong bytes. */
+int FileStager::hx_capture(int32_t li, const RadTensor* t, int n_t) {
+    HxOps& o = hx_ops_[(size_t)li];
+    if (n_t < 5) return RAD_E_STATE;
+    const RadTensor &A = t[0], &so = t[2], &of = t[3], &Y = t[4];
+    const int64_t AR = A.rank == 2 ? A.shape[0] : 0, T = Y.rank == 2 ? Y.shape[0] : 0;
+    const int64_t x_ld = AR > 1 ? A.stride[0] : kHxEmbd;
+    const bool shape = A.data && so.data && of.data && A.dtype == RAD_BF16 && A.rank == 2 &&
+        A.shape[1] == kHxEmbd && A.stride[1] == 1 && x_ld >= kHxEmbd &&
+        (so.dtype == RAD_I32 || so.dtype == RAD_U32) && (of.dtype == RAD_I32 || of.dtype == RAD_U32) &&
+        hx_numel(of) >= o.n_expert + 1;
+    const bool live = hx_li_ == li && hx_stage_ == 2;
+    if (live) {
+        if (!shape || A.data != o.x || x_ld != o.x_ld || so.data != o.sorted || of.data != o.off ||
+            AR != pass_tok_ || T != pass_tok_ * o.top_k || hx_numel(so) < T) {
+            RAD_ERR("host experts: layer %d's gate_up reads rows other than the ones the pool was "
+                    "given (%lld rows of %lld sorted, a pass of %lld)", layers_[(size_t)li].layer,
+                    (long long)AR, (long long)T, (long long)pass_tok_);
+            return RAD_E_STATE;
+        }
+        hx_confirmed_ = true;
+        return RAD_OK;
+    }
+    /* Only the addresses of a routed pass that reads all its rows at once (no slice, so from row
+     * 0) are kept: what hx_fetch reads from on such a pass. */
+    if (shape && routed_ && AR == pass_tok_ && AR >= 1 && AR <= kEpRouteMaxRows &&
+        T == AR * o.top_k && hx_numel(so) >= T) {
+        if (o.x && (A.data != o.x || x_ld != o.x_ld || so.data != o.sorted || of.data != o.off))
+            ++hx_stats_.moved;
+        o.x = A.data;
+        o.x_ld = x_ld;
+        o.sorted = so.data;
+        o.off = of.data;
+    }
+    return RAD_OK;
+}
+
+/* The layer's gather, before its launch: the pool's rows over the card's in its y_expert, on
+ * the gather's stream, or with ..._POLICY=verify the card's rows compared with the pool's. */
+int FileStager::hx_finish(RadStream s, const RadTensor* t, int n_t) {
+    const auto t0 = std::chrono::steady_clock::now();
+    hx_pool_->wait(&hx_ticket_);
+    hx_stats_.wait_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::steady_clock::now() - t0).count();
+    for (int k = 0; k < hx_n_; ++k) mover_->release_host_unit(&hx_units_[k]);
+    hx_n_ = 0;
+    const int32_t li = hx_li_;
+    const bool confirmed = hx_confirmed_;
+    hx_li_ = -1;
+    hx_stage_ = 0;
+    hx_confirmed_ = false;
+    if (!confirmed) {
+        RAD_ERR("host experts: layer %d reached its gather with no gate_up seen to read the rows "
+                "the pool was given", layers_[(size_t)li].layer);
+        return RAD_E_STATE;
+    }
+    const RadTensor* Y = n_t >= 1 ? &t[0] : nullptr;
+    const int64_t last = hx_rows_.empty() ? -1 : hx_rows_.back();
+    if (!Y || !Y->data || Y->rank != 2 || Y->dtype != RAD_BF16 || Y->shape[1] != kHxEmbd ||
+        Y->stride[1] != 1 || Y->shape[0] <= last || (Y->shape[0] > 1 && Y->stride[0] < kHxEmbd)) {
+        RAD_ERR("host experts: layer %d's gather does not read the down projection's rows as the "
+                "pool wrote them", layers_[(size_t)li].layer);
+        return RAD_E_STATE;
+    }
+    const int64_t ld = Y->shape[0] > 1 ? Y->stride[0] : kHxEmbd;
+    const int64_t row_bytes = kHxEmbd * (int64_t)sizeof(uint16_t);
+    /* Runs of consecutive rows, one copy each when the rows are packed. */
+    auto runs = [&](auto&& copy) -> int {
+        for (size_t i = 0; i < hx_rows_.size();) {
+            size_t j = i + 1;
+            while (j < hx_rows_.size() && hx_rows_[j] == hx_rows_[j - 1] + 1) ++j;
+            const int64_t r0 = hx_rows_[i], n = (int64_t)(j - i);
+            if (ld == kHxEmbd) {
+                RAD_TRY(copy(r0, n));
+            } else {
+                for (int64_t r = r0; r < r0 + n; ++r) RAD_TRY(copy(r, 1));
+            }
+            i = j;
+        }
+        return RAD_OK;
+    };
+    char* const ydev = (char*)Y->data;
+    if (hx_policy_ == kHxVerify) {
+        RAD_TRY(runs([&](int64_t r, int64_t n) {
+            return rad_memcpy_async(hx_chk_ + r * kHxEmbd, ydev + r * ld * 2, n * row_bytes, s);
+        }));
+        RAD_TRY(rad_event_record(hx_in_ev_, s));
+        RAD_TRY(rad_event_sync(hx_in_ev_));
+        for (int32_t r : hx_rows_) {
+            const uint16_t* a = hx_out_ + (int64_t)r * kHxEmbd;
+            const uint16_t* c = hx_chk_ + (int64_t)r * kHxEmbd;
+            int bad = 0, first = -1;
+            for (int i = 0; i < kHxEmbd; ++i)
+                if (a[i] != c[i]) { ++bad; if (first < 0) first = i; }
+            ++hx_stats_.verified;
+            if (!bad) continue;
+            if (++hx_stats_.differ <= 8)
+                RAD_WARN("host experts: layer %d sorted row %d: %d of %lld values differ from the "
+                         "card's (first at %d: 0x%04x on the CPU, 0x%04x on the card)",
+                         layers_[(size_t)li].layer, r, bad, (long long)kHxEmbd, first, a[first],
+                         c[first]);
+        }
+        return RAD_OK;
+    }
+    rad_dev_host_wrote();
+    RAD_TRY(runs([&](int64_t r, int64_t n) {
+        return rad_memcpy_async(ydev + r * ld * 2, hx_out_ + r * kHxEmbd, n * row_bytes, s);
+    }));
+    RAD_TRY(rad_event_record(hx_out_ev_, s));
+    hx_out_rec_ = true;
+    if (hx_told_++ == 0 && plan_->rank == 0)
+        RAD_INFO("host experts: layer %d's first CPU rows (%zu) copied over the card's before its "
+                 "gather", layers_[(size_t)li].layer, hx_rows_.size());
+    return RAD_OK;
+}
+
+/* Gives back whatever a layer still holds: waits for its jobs, returns its leases and its
+ * unsubmitted reservation. */
+void FileStager::hx_drain() {
+    if (hx_stage_ == 2 && hx_pool_) hx_pool_->wait(&hx_ticket_);
+    if (hx_reserved_ && hx_pool_) hx_pool_->unreserve(hx_reserved_);
+    hx_reserved_ = 0;
+    if (hx_units_)
+        for (int k = 0; k < hx_n_; ++k) mover_->release_host_unit(&hx_units_[k]);
+    hx_n_ = 0;
+    hx_li_ = -1;
+    hx_stage_ = 0;
+    hx_confirmed_ = false;
+}
+
+int FileStager::operands(rad_op h, RadStream s, const RadTensor* t, int n_t) {
+    if (!hx_pool_) return RAD_OK;
+    if ((size_t)h < first_of_.size() && first_of_[(size_t)h] >= 0) {
+        const int32_t li = first_of_[(size_t)h];
+        if ((size_t)li < hx_ops_.size() && hx_ops_[(size_t)li].gu == (int32_t)h)
+            return hx_capture(li, t, n_t);
+        return RAD_OK;
+    }
+    if (hx_li_ < 0 || hx_stage_ != 2) return RAD_OK;
+    for (int32_t g : hx_ops_[(size_t)hx_li_].gather)
+        if (g >= 0 && (int32_t)h == g) return hx_finish(s, t, n_t);
+    return RAD_OK;
+}
+
 int FileStager::finish(int32_t b, RadStream s) {
     RAD_TRY(rad_event_record(free_[b], s));
     free_rec_[b] = true;
@@ -778,6 +1213,13 @@ int FileStager::before_op(rad_op h, RadStream s, bool* resync) {
          * the ops already issued (finish records them; the copies wait on it). */
         const int b = li & 1;
         if (holds_[b] != li || !partial_[b]) return RAD_OK;
+        /* CPU rows of the slice before not yet copied: a slice's gate_up ahead of its gather. */
+        if (hx_li_ == li && hx_stage_ == 2) {
+            RAD_ERR("host experts: layer %d's gate_up issued again before its gather",
+                    layers_[(size_t)li].layer);
+            return RAD_E_STATE;
+        }
+        hx_drain();
         RAD_TRY(finish(b, s));
         RAD_TRY(start(li));
         if (holds_[b] == li && pending_[b]) RAD_TRY(rad_event_wait(s, done_[b]));
@@ -814,8 +1256,12 @@ int FileStager::before_op(rad_op h, RadStream s, bool* resync) {
 int FileStager::end_pass(RadStream s) {
     if (!armed_) return RAD_OK;
     armed_ = false;
+    const bool lost = hx_li_ >= 0 && hx_stage_ == 2;
+    if (lost) RAD_ERR("host experts: layer %d's CPU rows reached no gather before the pass ended",
+                      layers_[(size_t)hx_li_].layer);
+    hx_drain();
     pass_last_[pass_kind_] = last_issued_;
-    int rc = RAD_OK;
+    int rc = lost ? RAD_E_STATE : RAD_OK;
     for (int b = 0; b < 2; ++b)
         if (holds_[b] >= 0) {
             const int r = finish(b, s);

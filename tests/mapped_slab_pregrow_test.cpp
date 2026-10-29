@@ -169,4 +169,46 @@ TEST(mapped_slab_runtime_class_sizes) {
     CHECK_EQ(hx.granted, 0);
 }
 
+/* present_many (the routing trace's residency snapshot, RADIANCE_EXPERIMENTAL_DS41_ROUTE_TRACE)
+ * answers present() for every key under one lock: residents, evicted keys, keys never inserted,
+ * keys past the cache's count, another namespace, and an unconfigured cache. It touches nothing:
+ * the LRU order after it is the one before (the same victim next). */
+TEST(mapped_slab_present_many_is_present_for_each_key) {
+    std::vector<uint8_t> gu(SlabCache::GU, 5), dn(SlabCache::DN, 6);
+    Host h;
+    SlabCache c;
+    CHECK(c.configure(1, kBudget, kKeys, { &h, quote, allocate, release }) == S::Ok);
+    size_t added = 0;
+    CHECK(c.pregrow(1, &added) == S::Ok);
+    const size_t cap = c.stats().classes[0].capacity_slots, pairs = cap + 5;
+    for (size_t k = 0; k < pairs; ++k) {   /* the first five pairs are evicted */
+        CHECK(c.insert(1, 2 * k, gu.data(), gu.size()) == S::Ok);
+        CHECK(c.insert(1, 2 * k + 1, dn.data(), dn.size()) == S::Ok);
+    }
+    std::vector<size_t> keys;
+    for (size_t k = 0; k < 2 * pairs + 7; ++k) keys.push_back(k);   /* resident, evicted, never */
+    keys.push_back(kKeys + 3);                                        /* past the count */
+    std::vector<uint8_t> got(keys.size(), 9);
+    c.present_many(1, keys.data(), keys.size(), got.data());
+    size_t resident = 0;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        CHECK_EQ(got[i], (uint8_t)(c.present(1, keys[i]) ? 1 : 0));
+        resident += got[i];
+    }
+    CHECK_EQ(resident, 2 * cap);
+    CHECK_EQ(got[0], (uint8_t)0);
+    CHECK_EQ(got[2 * pairs - 1], (uint8_t)1);
+    std::fill(got.begin(), got.end(), 9);
+    c.present_many(2, keys.data(), keys.size(), got.data());   /* another namespace: nothing */
+    CHECK(std::all_of(got.begin(), got.end(), [](uint8_t v) { return v == 0; }));
+    /* Untouched: the next insert evicts the oldest resident pair's gate_up, as without the call. */
+    CHECK(c.insert(1, 2 * pairs, gu.data(), gu.size()) == S::Ok);
+    CHECK(!c.present(1, 10));
+    CHECK(c.present(1, 11));
+    SlabCache none;
+    std::fill(got.begin(), got.end(), 9);
+    none.present_many(1, keys.data(), 3, got.data());
+    CHECK(got[0] == 0 && got[1] == 0 && got[2] == 0);
+}
+
 RAD_TEST_MAIN()

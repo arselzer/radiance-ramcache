@@ -313,6 +313,14 @@ public:
     bool present(uint64_t ns,size_t key){
         std::lock_guard<std::mutex>o(owner_mutex_);if(!state_)return false;State&s=*state_;std::lock_guard<std::mutex>l(s.mutex);
         return ns==s.stats.cache.namespace_id&&!s.retiring&&key<s.count&&s.entries[key].present;}
+    // present() for n keys under one lock (out[i] 0/1): the routing trace's snapshot of a layer's
+    // ~90 units at its choice, which 2n lock round trips would make cost tens of microseconds.
+    void present_many(uint64_t ns,const size_t*keys,size_t n,uint8_t*out){
+        std::lock_guard<std::mutex>o(owner_mutex_);
+        if(!state_){for(size_t i=0;i<n;++i)out[i]=0;return;}
+        State&s=*state_;std::lock_guard<std::mutex>l(s.mutex);
+        const bool live=ns==s.stats.cache.namespace_id&&!s.retiring;
+        for(size_t i=0;i<n;++i)out[i]=live&&keys[i]<s.count&&s.entries[keys[i]].present?1:0;}
     // Pins slabs until the next would not fit the budget, so a cache that grows as it fills pays
     // for the pinning once, at startup, instead of inside the requests that fill it (under memory
     // pressure one slab took seconds). The slabs are the ones insert would grow, in the same order

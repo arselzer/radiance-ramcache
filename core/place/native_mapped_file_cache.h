@@ -272,6 +272,11 @@ public:
     SlabCache::Sizes slot_bytes() const noexcept { return slab_sizes_; }
     // Resident without a lease, an LRU touch or a statistic; slab policy only (false otherwise).
     bool present(size_t key) noexcept { return slab_policy_&&slab_cache_.present(1,key); }
+    // present() for n keys under one lock of the slab cache (out[i] 0/1); slab policy only.
+    void present_many(const size_t* keys,size_t n,uint8_t* out) noexcept {
+        if(!slab_policy_){for(size_t i=0;i<n;++i)out[i]=0;return;}
+        slab_cache_.present_many(1,keys,n,out);
+    }
     // Slab policy only: pins the budget's slabs now (MappedExpertSlabCache::pregrow). A refused
     // allocation stops the growth and is not an error; the cache grows on demand from there.
     int pregrow(size_t* slabs) noexcept {

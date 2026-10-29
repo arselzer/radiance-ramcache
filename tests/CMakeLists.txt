@@ -15,7 +15,7 @@
 # builder. With the archive linked, a new ABI call missing from the fake would pull in
 # rad_builder.cpp.o and collide on every rad_decl_* symbol; without it the error is a single
 # undefined reference.
-set(RAD_TESTS_NO_CORE arch_test glm5next_test)
+set(RAD_TESTS_NO_CORE arch_test glm5next_test mapped_slab_pregrow_test)
 
 # fixture_test tests tools/kfixture.cpp and tools/opshapes.cpp (the seeded draw, the reduction and
 # the on-disk recording) directly, kbench_test tools/kbench_core.cpp (rad-kbench's rules), and

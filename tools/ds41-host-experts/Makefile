@@ -18,6 +18,12 @@ $(O)/ds41_dense_fp8_scan: $(SCAN_SRC) $(TREE)/libr4d/r4d_bf16f8_layout.h
 	  -I$(TREE)/libr4d -I$(TREE)/vendor -o $@ $(SCAN_SRC)
 scan: $(O)/ds41_dense_fp8_scan
 
+# The read-ahead predictor's quantized scoring against its bf16 scoring, offline, on a container's
+# routers (see its header): the predictor's own arithmetic (core/place/router_score.h).
+$(O)/router_score_eval: router_score_eval.cpp $(TREE)/core/place/router_score.h
+	$(CXX) -O2 -std=c++17 -mavx2 -mfma -Wall -Wextra -pthread -I$(TREE)/core/place -o $@ router_score_eval.cpp
+router-eval: $(O)/router_score_eval
+
 # The card check of gemm_nt_bf16f8 against gemm_nt (run it in a GPU window; see its header). The
 # fragment probe includes the kernel's own expansion (libr4d/r4d_bf16f8_frag.h), compiled as
 # libr4d's plugin flags compile it: no FMA contraction, no fast math.
@@ -47,4 +53,4 @@ mxfp4-check: $(O)/ds41_mxfp4_device_check
 clean:
 	rm -f ds41_host_experts_test ds41_dense_fp8_scan ds41_bf16f8_device_check
 
-.PHONY: clean scan device-check mxfp4-check
+.PHONY: clean scan device-check mxfp4-check router-eval

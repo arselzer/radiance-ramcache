@@ -335,6 +335,39 @@ Engine::~Engine() {
                  (double)s.ready_ns / 1e6,
                  s.computed ? (double)s.ready_ns / 1e3 / (double)s.computed : 0.0);
     }
+    /* ..._PREFETCH_RECORD: the inputs written for offline scoring (router_predictor.h). */
+    if (RouterPredictor* rp = RouterPredictor::get(); rp && !rp->record_path().empty()) {
+        rp->flush_record();
+        RAD_INFO("router predictor record: %llu router inputs written to %s",
+                 (unsigned long long)rp->stats().recorded, rp->record_path().c_str());
+    }
+    /* ..._PREFETCH_SCORE=int8|int4: the scoring's parts, and with ..._SCORE_CHECK the predictions
+     * against bf16 alone (router_predictor.h). */
+    if (RouterPredictor* rp = RouterPredictor::get(); rp && rp->score_mode() != RouterPredictor::kScoreBf16) {
+        const RouterPredictor::Stats s = rp->stats();
+        const char* q = rp->score_mode() == RouterPredictor::kScoreInt8 ? "int8" : "int4";
+        const double n = s.computed ? (double)s.computed : 1.0;
+        RAD_INFO("router predictor scoring: %s (%.0f MB, one scale an expert), the best %d scored again "
+                 "in bf16: %llu predictions, %.1f us a prediction in the %s pass and %.1f us rescoring",
+                 q, (double)rp->quant_bytes() / 1e6, rp->rescore(), (unsigned long long)s.computed,
+                 (double)s.quant_ns / 1e3 / n, q, (double)s.rescore_ns / 1e3 / n);
+        if (s.checked) {
+            std::string ranks;
+            for (int b = 0; b < RouterPredictor::kRankBuckets; ++b)
+                ranks += b < RouterPredictor::kRankBuckets - 1
+                    ? fmt(" under %d %llu,", RouterPredictor::kRankEdge[b], (unsigned long long)s.check_rank[b])
+                    : fmt(" %d or more %llu", RouterPredictor::kRankEdge[b - 1], (unsigned long long)s.check_rank[b]);
+            const double c = (double)s.checked;
+            RAD_INFO("router predictor check against bf16 alone: %llu predictions checked (one in %d); "
+                     "bf16's top %d the same set in %llu (%.2f%%) and in the same order in %llu (%.2f%%); "
+                     "bf16's picks by their rank in the %s scores:%s; %llu at or past the %d rescored; "
+                     "%.1f ms checking", (unsigned long long)s.checked, rp->check_every(),
+                     rp->k(), (unsigned long long)s.check_set,
+                     100.0 * (double)s.check_set / c, (unsigned long long)s.check_order,
+                     100.0 * (double)s.check_order / c, q, ranks.c_str(),
+                     (unsigned long long)s.check_outside, rp->rescore(), (double)s.check_ns / 1e6);
+        }
+    }
     /* Drain the transfer streams before the contexts. Ctx::shutdown drains the compute streams
      * and frees the arena, but the mover's stream also copies into the arena (the prefill
      * stager's ring, lent slab slots) and would otherwise drain only later, with the mover. A fill

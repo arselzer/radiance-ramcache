@@ -287,13 +287,14 @@ arm() {   # name, then env assignments for the server; CACHE_MIB the RAM cache (
   # Pi8 / Pi4, PkN, Pw, NsN, Pv: each switch's startup line, and an arm must have exactly what its name
   # says (a radiance without the switch prints none; a plain arm with one took it from elsewhere).
   # A row a switch: the part, set when the arm has it, the line's pattern.
-  local sw_bad="" sw_part sw_on sw_pat sw_n
+  local sw_bad="" sw_part sw_on sw_pat sw_n pi_n=${ARM_PSC:+${ARM_PRS:-12}}
+  pi_n=${pi_n:-[0-9]+}   # a Pi arm's rescore count; any, for the line no other arm may have
   while IFS='|' read -r sw_part sw_on sw_pat; do
     sw_n=$(grep -cE "$sw_pat" "$OUT/$name.server.log")
     if [[ -n "$sw_on" && "$sw_n" == 0 ]]; then sw_bad+=" $sw_part, but no '$sw_pat' line;"
     elif [[ -z "$sw_on" && "$sw_n" != 0 ]]; then sw_bad+=" no $sw_part part, but a '$sw_pat' line (the switch set for the window?);"; fi
   done <<EOF2
-Pi${ARM_PSC:-}|${ARM_PSC:-}|router predictor: [0-9]+ routers loaded \(bf16, [0-9]+ MB\); scored in int${ARM_PSC:-[48]} 
+Pi${ARM_PSC:-}|${ARM_PSC:-}|router predictor: [0-9]+ routers loaded \(bf16, [0-9]+ MB\); scored in int${ARM_PSC:-[48]} \([^)]*\), the best $pi_n scored again in bf16
 Pk${ARM_PK:-}|${ARM_PK:-}|router predictor: .*one prediction in [0-9]+ checked against bf16 alone
 Pw|${ARM_PW:-}|rank 0 posts the read-ahead's router input once a layer's CPU work is submitted
 Ns${ARM_NS:-}|${ARM_NS:-}|side store: the planes of up to [0-9]+ units a rank
@@ -702,9 +703,11 @@ for a in $ARMS; do
 # only on the libr4d.so whose gemm_nt_f32bf16 passed SELFTEST_F32BF16's card checks in this window.
 # An arm with a predictor part (Ps, Po, Pt, Pp) is measured only if the router predictor loaded.
 # Pi8 / Pi4 the predictor scores every expert from an int8 / int4 copy of the routers first (one
-# scale an expert, 79 / 39 MB beside the bf16 copy) and its best 12 again in bf16
-# (RADIANCE_EXPERIMENTAL_DS41_PREFETCH_SCORE=int8|int4, ..._PREFETCH_RESCORE pinned to 12; needs a
-# predictor part; only reads ahead change, never a reply); PkN with Pi8 / Pi4 one prediction in N is
+# scale an expert, 79 / 39 MB beside the bf16 copy) and its best 12 again in bf16, Pi8rN / Pi4rN its
+# best N (4-64) (RADIANCE_EXPERIMENTAL_DS41_PREFETCH_SCORE=int8|int4, ..._PREFETCH_RESCORE, 12 in
+# every arm without rN; needs a predictor part; only reads ahead change, never a reply; offline on
+# the container's routers int8 at 12 gave bf16's top 4 every time, int4 needs ~24: router_score_eval);
+# PkN with Pi8 / Pi4 one prediction in N is
 # also scored in bf16 alone after it was handed over and compared (..._PREFETCH_SCORE_CHECK=N; the
 # shutdown's "router predictor check" line: the same set, the same order, where bf16's picks ranked):
 # a precision arm, not a timed one; Pw at an early-issued layer (Ei) rank 0 posts the read-ahead's
@@ -724,7 +727,7 @@ for a in $ARMS; do
   pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 HOST_POOL_MIB=4096 EXTRA_ARGS="" ARM_HOME="$RHOME" ARM_CONC=
   ARM_PROMPTS= ARM_N= ARM_LQ= rt=
   power="" skip="" ARGS=() f8="" f8x="" rb="" rbf=0 pred="" cs="" kh="" pc="" pcopt=""
-  psc="" pk="" pw="" ns="" pv=""
+  psc="" prs=12 pk="" pw="" ns="" pv=""
   unset ARM_NOPC   # --no-prefix-cache unless a Pc part sets it empty
   for p in "${parts[@]:1}"; do
     case $p in
@@ -831,7 +834,12 @@ for a in $ARMS; do
       Lq)      ARM_LQ=1 ;;                 # the quality harness after the timed requests
       Cs)      cs=1 ;;                     # the exact consumer-suffix skip (checked in the server log)
       Kh)      kh=1 ;;                     # KV and logits hashes at each prompt's end
-      Pi8|Pi4) psc=${p#Pi} ;;              # the predictor scores in int8 / int4 first, its best 12 again in bf16
+      Pi8|Pi4|Pi8r[0-9]*|Pi4r[0-9]*)      # the predictor scores in int8 / int4 first, its best 12 (rN: N) again in bf16
+               psc=${p:2:1}
+               if [[ $p == Pi?r* ]]; then
+                 if [[ ${p#Pi?r} =~ ^[0-9]+$ ]] && (( 10#${p#Pi?r} >= 4 && 10#${p#Pi?r} <= 64 )); then prs=$((10#${p#Pi?r}))
+                 else log "arm $a: $p: the rescore count takes 4-64; the arm is skipped"; skip=1; fi
+               fi ;;
       Pk[0-9]*) # ...one prediction in N also scored in bf16 alone and compared (a precision arm)
                if [[ ${p#Pk} =~ ^[0-9]+$ ]]; then pk=$((10#${p#Pk})); else log "arm $a: $p: PkN takes a number; the arm is skipped"; skip=1; fi ;;
       Pw)      pw=1 ;;                     # Ei: the read-ahead's post after the layer's CPU work is submitted
@@ -901,10 +909,10 @@ for a in $ARMS; do
   fi
   if [[ -n "$psc" ]]; then env+=(RADIANCE_EXPERIMENTAL_DS41_PREFETCH_SCORE=int$psc)
   else env+=(RADIANCE_EXPERIMENTAL_DS41_PREFETCH_SCORE=0); fi
-  env+=(RADIANCE_EXPERIMENTAL_DS41_PREFETCH_RESCORE=12 RADIANCE_EXPERIMENTAL_DS41_PREFETCH_SCORE_CHECK=${pk:-0}
+  env+=(RADIANCE_EXPERIMENTAL_DS41_PREFETCH_RESCORE=$prs RADIANCE_EXPERIMENTAL_DS41_PREFETCH_SCORE_CHECK=${pk:-0}
         RADIANCE_EXPERIMENTAL_DS41_PREFETCH_POST_LATE=${pw:-0} RADIANCE_EXPERIMENTAL_DS41_SIDE_STORE=${ns:-0}
         RADIANCE_EXPERIMENTAL_DS41_PREFETCH_RECORD=${pv:+$(cd "$OUT" && pwd)/pred-$a.bin})
-  ARM_PSC=$psc ARM_PK=$pk ARM_PW=$pw ARM_NS=$ns ARM_PV=$pv
+  ARM_PSC=$psc ARM_PRS=$prs ARM_PK=$pk ARM_PW=$pw ARM_NS=$ns ARM_PV=$pv
   [[ -z "$rt" ]] && env+=(RADIANCE_EXPERIMENTAL_DS41_ROUTE_TRACE=)   # traced only with Rt
   if [[ -n "$cs" ]]; then env+=(RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP=1); else env+=(RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP=0); fi
   ARM_CS=$cs

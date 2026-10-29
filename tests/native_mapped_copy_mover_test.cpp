@@ -706,6 +706,46 @@ TEST(mapped_slab_real_HOST_adapter_full_payload_guards_reuse_and_terminal_once){
     need(adapter.clear(),"idempotent terminal cleanup");CHECK_EQ(adapter.stats().api.free_invocations,uint64_t(1));
     CHECK_EQ(adapter.configure(22*MiB,4,0),RAD_E_STATE); //no spend-after-void-free refund
 }
+/* The packed layout (RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE) is a hard tag: its slots have their
+ * own sizes, only reserve_packed/borrow_packed reach them and their leases say packed(), and every
+ * block_mxfp4 call -- the card's copy path -- misses or bypasses (counted), even for a resident key,
+ * so a packed slot is never copied to a card and no block bytes land in one. A block cache refuses
+ * the packed calls; the packed layout needs slabs and valid sizes. */
+TEST(mapped_slab_real_HOST_adapter_packed_layout_is_CPU_only){
+    const ds41_mapped::SlabCache::Sizes packed{11999296,6001984};
+    {Environment noslabs("1","0");Adapter a;CHECK_EQ(a.configure(22*MiB,4,0,0,Adapter::Layout::Packed,packed),RAD_E_INVAL);}
+    Environment environment("1","1");
+    {Adapter a;CHECK_EQ(a.configure(22*MiB,4,0,0,Adapter::Layout::Packed,{packed[0],packed[0]}),RAD_E_INVAL);}
+    Adapter adapter;need(adapter.configure(22*MiB,4,0,0,Adapter::Layout::Packed,packed),"packed one-pair slab");
+    CHECK(adapter.packed());CHECK(adapter.slot_bytes()==packed);CHECK(adapter.stats().slab_policy);
+    const auto gu=adapter_pattern(Adapter::GU,15001);
+    CHECK(adapter.insert(0,gu.data(),gu.size())==Adapter::Status::Bypass);
+    {Adapter::Write w;CHECK(adapter.reserve_fill(0,Adapter::GU,&w)==Adapter::Status::Bypass);CHECK(w.empty());}
+    Adapter::Lease none;CHECK(adapter.borrow(0,Adapter::GU,&none)==Adapter::Status::Miss);CHECK(none.empty());
+    CHECK(adapter.borrow_readonly(0,Adapter::GU,&none)==Adapter::Status::Miss);
+    Adapter::Write w;REQUIRE(adapter.reserve_packed(0,0,&w)==Adapter::Status::Ok);
+    CHECK(w.packed());CHECK_EQ(w.bytes(),packed[0]);REQUIRE(w.host()!=nullptr);
+    CHECK_EQ(reinterpret_cast<uintptr_t>(w.host())%64,uintptr_t(0));
+    std::memset(w.host(),0x5a,packed[0]);
+    Adapter::Lease first;REQUIRE(w.publish(&first)==Adapter::Status::Ok);
+    CHECK(first.packed());CHECK_EQ(first.bytes(),packed[0]);CHECK(first.release()==Adapter::Status::Ok);CHECK(!first.packed());
+    Adapter::Lease hit;REQUIRE(adapter.borrow_packed(0,0,&hit)==Adapter::Status::Hit);
+    CHECK(hit.packed());CHECK_EQ(hit.bytes(),packed[0]);CHECK(hit.host()[0]==0x5a&&hit.host()[packed[0]-1]==0x5a);
+    CHECK(guard_tail_intact(hit.host(),packed[0]));
+    Adapter::Lease blockwise;CHECK(adapter.borrow(0,packed[0],&blockwise)==Adapter::Status::Miss);   //resident, still refused
+    CHECK(adapter.present(0));
+    Adapter::Lease cls;CHECK(adapter.borrow_packed(0,1,&cls)==Adapter::Status::Layout);   //another class than the entry's
+    CHECK(adapter.borrow_packed(0,2,&cls)==Adapter::Status::Invalid);
+    CHECK(hit.release()==Adapter::Status::Ok);
+    const auto st=adapter.stats();CHECK(st.packed);CHECK(st.slot_bytes==packed);CHECK_EQ(st.layout_refusals,uint64_t(5));
+    CHECK_EQ(st.slabs.classes[0].capacity_logical_bytes,packed[0]*st.slabs.classes[0].capacity_slots);
+    need(adapter.clear(),"packed terminal cleanup");
+    Adapter block;need(block.configure(22*MiB,4,0),"block one-pair slab");CHECK(!block.packed());
+    Adapter::Lease bl;CHECK(block.borrow_packed(0,0,&bl)==Adapter::Status::Layout);
+    Adapter::Write bw;CHECK(block.reserve_packed(0,0,&bw)==Adapter::Status::Layout);
+    CHECK(block.slot_bytes()==ds41_mapped::SlabCache::block_sizes);
+    need(block.clear(),"block terminal cleanup");
+}
 TEST(mapped_slab_real_HOST_adapter_alias_failure_is_owned_until_terminal_cleanup){
     for(const char* flag:{static_cast<const char*>(nullptr),"0","true","01"}){
         Environment off("1",flag);Adapter a;need(a.configure(22*MiB,4,0),"slabs default off");CHECK(!a.stats().slab_policy);

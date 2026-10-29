@@ -1,11 +1,17 @@
 /* Private copy-source cache adapter. Immutable leases use the unchanged HOST/GPU-proven
  * helper. This adapter does NOT prove consumer completion; Mover owns that obligation.
- * V6 adds opt-in paired retained slabs; V5 per-entry owners remain default. */
+ * V6 adds opt-in paired retained slabs; V5 per-entry owners remain default.
+ * Layout::Packed (slabs only) holds the CPU-only packed form (tools/ds41-host-experts
+ * ds41_host_experts.h) in slots of the configured sizes. Only borrow_packed and reserve_packed
+ * reach it, and their leases say packed(); every block_mxfp4 call (borrow, borrow_readonly,
+ * reserve_fill, insert: the card's copy path) is turned away as a miss or bypass and counted, so
+ * no copy to the card ever reads a packed slot and no block bytes ever land in one. */
 #pragma once
 #include "mapped_expert_cache.h"
 #include "mapped_expert_slab_cache.h"
 #include "../rad_internal.h"
 #include "../device/device.h"
+#include <atomic>
 #include <cstdlib>
 #include <chrono>
 #include <memory>
@@ -25,39 +31,47 @@ public:
         friend class Write;
         Cache::Lease regular_;
         SlabCache::Lease slab_;
+        bool packed_=false;
     public:
         Lease()=default;Lease(const Lease&)=delete;Lease&operator=(const Lease&)=delete;
-        Lease(Lease&&o)noexcept:regular_(std::move(o.regular_)),slab_(std::move(o.slab_)){}
+        Lease(Lease&&o)noexcept:regular_(std::move(o.regular_)),slab_(std::move(o.slab_)),packed_(o.packed_){o.packed_=false;}
         Lease&operator=(Lease&&)=delete;
         bool active()const noexcept{return regular_.active()||slab_.active();}
         bool empty()const noexcept{return regular_.empty()&&slab_.empty();}
+        //The slot holds the packed form, which only the host expert path may read.
+        bool packed()const noexcept{return packed_&&slab_.active();}
         const uint8_t*host()const noexcept{return slab_.active()?slab_.host():regular_.host();}
         const void*device()const noexcept{return slab_.active()?slab_.device():regular_.device();}
         size_t bytes()const noexcept{return slab_.active()?slab_.bytes():regular_.bytes();}
         Cache::Status release()noexcept{
             const auto a=regular_.release();if(a!=Cache::Status::Ok&&a!=Cache::Status::Empty)return a;
-            const auto b=slab_.release();return b==Cache::Status::Empty?a:b;
+            const auto b=slab_.release();if(!slab_.active())packed_=false;return b==Cache::Status::Empty?a:b;
         }
         Cache::Stats stats()const{return slab_.empty()?regular_.stats():slab_.stats().cache;}
     };
     class Write {
         friend class NativeMappedFileCache;
         SlabCache::Write slab_;
+        bool packed_=false;
     public:
         Write()=default;Write(const Write&)=delete;Write&operator=(const Write&)=delete;
         Write(Write&&)=default;Write&operator=(Write&&)=delete;
         bool active()const noexcept{return slab_.active();}
         bool empty()const noexcept{return slab_.empty();}
+        bool packed()const noexcept{return packed_&&slab_.active();}
         uint8_t*host()const noexcept{return slab_.host();}
         size_t bytes()const noexcept{return slab_.bytes();}
         Cache::Status abort()noexcept{return slab_.abort();}
         Cache::Status publish(Lease*out)noexcept {
             if(!out||!out->empty())return Cache::Status::Invalid;
-            return slab_.publish(&out->slab_);
+            const bool packed=packed_;const auto rc=slab_.publish(&out->slab_);
+            if(rc==Cache::Status::Ok)out->packed_=packed;
+            return rc;
         }
     };
     using Status=Cache::Status;
     static constexpr size_t GU=12533760,DN=6266880;
+    enum class Layout { Block, Packed };
     struct ApiTiming {
         uint64_t allocate_attempts=0,allocate_null_returns=0,alias_rejections=0,device_bind_failures=0;
         uint64_t allocate_ns=0,allocate_max_ns=0,free_invocations=0,free_ns=0,free_max_ns=0;
@@ -65,7 +79,9 @@ public:
     struct Snapshot {
         Cache::Stats cache{};
         SlabCache::Stats slabs{};
-        bool slab_policy=false;
+        bool slab_policy=false,packed=false;
+        SlabCache::Sizes slot_bytes=SlabCache::block_sizes;
+        uint64_t layout_refusals=0;   //block_mxfp4 calls a packed cache turned away
         ApiTiming api{};
         size_t external_metadata=0,logical_payload=0,mapped_policy_charge=0;
         uint64_t allocations=0,public_free_invocations=0;
@@ -87,6 +103,9 @@ private:
     Cache cache_;
     SlabCache slab_cache_;
     bool slab_policy_=false;
+    Layout layout_=Layout::Block;
+    SlabCache::Sizes slab_sizes_=SlabCache::block_sizes; //read by quoted_slab; set before slab_cache_ is configured
+    std::atomic<uint64_t> layout_refusals_{0};
     int allocator_device_=0;
     static constexpr size_t guard=64,MiB=1u<<20;
     static size_t quoted(void*,size_t bytes) noexcept {
@@ -155,8 +174,9 @@ private:
         self.logical_-=r.payload;self.charged_-=r.charge;
         r={};r.next=self.first_free_;self.first_free_=index;return true;
     }
-    static size_t quoted_slab(void*,size_t bytes) noexcept {
-        constexpr size_t pair=GU+DN+6*guard;
+    static size_t quoted_slab(void* context,size_t bytes) noexcept {
+        const auto& sizes=static_cast<NativeMappedFileCache*>(context)->slab_sizes_;
+        const size_t pair=sizes[0]+sizes[1]+6*guard;
         if(!bytes||bytes%pair||bytes>32*pair)return 0;
         const size_t pages=(bytes+4095)/4096*4096;
         return (pages+2*MiB-1)/(2*MiB)*(2*MiB)+2*MiB;
@@ -221,10 +241,13 @@ public:
         if(logical_||charged_)return RAD_E_STATE;
         records_.reset();count_=metadata_=0;first_free_=SIZE_MAX;return RAD_OK;
     }
-    int configure(size_t budget,size_t count,size_t window_metadata,int actual_device=0) noexcept {
+    //layout Packed: slabs only, with slots of packed_sizes (gate_up, down) bytes.
+    int configure(size_t budget,size_t count,size_t window_metadata,int actual_device=0,
+                  Layout layout=Layout::Block,SlabCache::Sizes packed_sizes=SlabCache::block_sizes) noexcept {
         const char* env=std::getenv("RADIANCE_EXPERIMENTAL_NATIVE_CACHE_MAPPED_SLABS");
         const bool want_slabs=env&&std::strcmp(env,"1")==0;
         if(actual_device<0)return RAD_E_INVAL;
+        if(layout==Layout::Packed&&(!want_slabs||!SlabCache::sizes_valid(packed_sizes)))return RAD_E_INVAL;
         RAD_TRY(clear());
         //A previous terminal void-free cannot establish reclaimed physical capacity.
         //Start a new owning Engine/process rather than spend that backing again.
@@ -238,11 +261,15 @@ public:
         for(size_t i=0;i<count;++i)records[i].next=i+1<count?i+1:SIZE_MAX;
         records_=std::move(records);count_=count;first_free_=0;metadata_=external;
         allocations_=frees_=0;api_={};allocator_device_=actual_device;
-        const auto rc=want_slabs?slab_cache_.configure(1,budget-external,count,{this,quoted_slab,allocate_slab,free_slab}):
+        slab_sizes_=layout==Layout::Packed?packed_sizes:SlabCache::block_sizes;layout_=Layout::Block;layout_refusals_=0;
+        const auto rc=want_slabs?slab_cache_.configure(1,budget-external,count,{this,quoted_slab,allocate_slab,free_slab},slab_sizes_):
                                   cache_.configure(1,budget-external,count,{this,quoted,allocate,free});
-        if(rc!=Status::Ok){records_.reset();count_=metadata_=0;first_free_=SIZE_MAX;return RAD_E_NOMEM;}
-        slab_policy_=want_slabs;return RAD_OK;
+        if(rc!=Status::Ok){records_.reset();count_=metadata_=0;first_free_=SIZE_MAX;slab_sizes_=SlabCache::block_sizes;return RAD_E_NOMEM;}
+        slab_policy_=want_slabs;layout_=layout;return RAD_OK;
     }
+    bool packed() const noexcept { return layout_==Layout::Packed; }
+    //The slots' payload bytes: gate_up's and down's (block_mxfp4's GU and DN unless packed).
+    SlabCache::Sizes slot_bytes() const noexcept { return slab_sizes_; }
     // Resident without a lease, an LRU touch or a statistic; slab policy only (false otherwise).
     bool present(size_t key) noexcept { return slab_policy_&&slab_cache_.present(1,key); }
     // Slab policy only: pins the budget's slabs now (MappedExpertSlabCache::pregrow). A refused
@@ -255,23 +282,43 @@ public:
     }
     Status borrow(size_t key,size_t bytes,Lease* lease) noexcept {
         if(!lease||!lease->empty())return Status::Invalid;
+        if(packed()){layout_refusals_.fetch_add(1,std::memory_order_relaxed);return Status::Miss;}
         return slab_policy_?slab_cache_.borrow(1,key,bytes,&lease->slab_):cache_.borrow(1,key,bytes,&lease->regular_);
+    }
+    //The packed layout's own calls, for the host expert path: klass 0 (gate_up) or 1 (down).
+    Status borrow_packed(size_t key,int klass,Lease* lease) noexcept {
+        if(!lease||!lease->empty()||klass<0||klass>1)return Status::Invalid;
+        if(!packed())return Status::Layout;
+        const auto rc=slab_cache_.borrow(1,key,slab_sizes_[size_t(klass)],&lease->slab_);
+        if(rc==Status::Hit)lease->packed_=true;
+        return rc;
+    }
+    Status reserve_packed(size_t key,int klass,Write* out) noexcept {
+        if(!out||!out->empty()||klass<0||klass>1)return Status::Invalid;
+        if(!packed())return Status::Layout;
+        const auto rc=slab_cache_.reserve(1,key,slab_sizes_[size_t(klass)],&out->slab_);
+        if(rc==Status::Ok)out->packed_=true;
+        return rc;
     }
     //Configuration is quiescent; legacy per-entry ReadOnly remains the existing bypass.
     bool supports_readonly_borrow()const noexcept{return slab_policy_;}
     Status borrow_readonly(size_t key,size_t bytes,Lease*lease)noexcept{
         if(!lease||!lease->empty())return Status::Invalid;
+        if(packed()){layout_refusals_.fetch_add(1,std::memory_order_relaxed);return Status::Miss;}
         return slab_policy_?slab_cache_.borrow_no_touch(1,key,bytes,&lease->slab_):Status::Miss;
     }
     Status reserve_fill(size_t key,size_t bytes,Write*out)noexcept {
         if(!out||!out->empty())return Status::Invalid;
+        if(packed()){layout_refusals_.fetch_add(1,std::memory_order_relaxed);return Status::Bypass;}
         return slab_policy_?slab_cache_.reserve(1,key,bytes,&out->slab_):Status::Bypass;
     }
     Status insert(size_t key,const void* source,size_t bytes) noexcept {
+        if(packed()){layout_refusals_.fetch_add(1,std::memory_order_relaxed);return Status::Bypass;}
         return slab_policy_?slab_cache_.insert(1,key,source,bytes):cache_.insert(1,key,source,bytes);
     }
     Snapshot stats() const noexcept {
-        Snapshot result;result.slab_policy=slab_policy_;
+        Snapshot result;result.slab_policy=slab_policy_;result.packed=packed();result.slot_bytes=slab_sizes_;
+        result.layout_refusals=layout_refusals_.load(std::memory_order_relaxed);
         if(slab_policy_){result.slabs=slab_cache_.stats();result.cache=result.slabs.cache;}
         else result.cache=cache_.stats();
         std::lock_guard<std::mutex> lock(mutex_);

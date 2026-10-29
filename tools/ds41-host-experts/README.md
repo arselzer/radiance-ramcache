@@ -78,6 +78,8 @@ the engine or the scripts assumes where the checkpoint is. `ab_window.sh` takes 
 | `..._CACHE_SECOND_CHANCE=N` | N=1 +3.9%, N=2 +5.1% (TTFT −1.5% / +1.2%) | a cached unit the decode profile calls hot (`..._CACHE_PROTECT_SHARE`, default 6 of the sealed profile's 4326 selections a layer: ~1150 units a rank) moves to the front up to N times between uses before an insert may evict it. The held-out prompts share task families with the profile; replayed on the 16 chat prompts too, critical decode misses fell 7.9% (N=1) |
 | `..._PACKED_CACHE=1` | +3.2% alone, TTFT −5.5%; with `..._CACHE_SECOND_CHANCE=2` 15.52 / 15.48 tok/s (+8.2%) | the RAM cache holds each expert's codes plane plus its e8m0 scales packed to 2 bits from one base a weight (raw rounds beside, budget 512 / 320, `..._PACKED_CACHE_RAW`): x1.0444 slots and 4.4% fewer bytes a CPU hit; 7 of 15,360 experts never fit and stay misses. Refused unless the CPU takes every routed unit (all, M16, B1); the card's copy path never reads or fills it |
 | `RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE=1` | not yet measured on the engine | the RAM cache in a CPU-only packed form: x1.044 the pairs, kernel −8.5% a cached expert (below); refused unless the CPU takes every routed unit (all, M16, B1); arm part `K` |
+| `RADIANCE_EXPERIMENTAL_DS41_CHAIN_OVERLAP=1` (`=2`) | not yet measured on the engine (estimate +1.2 to +3.5%) | in decode passes (in every pass issued live), a device launch whose first dispatch reads nothing the dispatches in flight on its queue write, and writes nothing they read or write, goes without the AQL barrier bit (`core/runtime/live_chain.h`): what `haz_mark` does for recorded passes, which a staged pass never is. Exact: only start order changes. Anything on the queue the issue path did not write (events, waits, copies, table patches) orders the next launch; collectives, kernels without `rad_kernel_concurrent` and host-visible launches never go unordered. Shutdown line `live chain: ...`; arm parts `Ov` / `Ov2` |
+| `RADIANCE_EXPERIMENTAL_DS41_CHAIN_TRACE=N` | instrument | one trunk decode pass in N on rank 0: every launch (layer, op, kernel, queue and packets, `would` / `why` / `clash`, its dependences on earlier launches, the buffers it reads and writes) into `<prefix>.ops.csv`, every kernel's start and end on card 0 into `<prefix>.stamps.csv` (`..._CHAIN_TRACE_OUT`, default `/tmp/radiance-chain-<pid>`); `chain_report.py` joins them. Without `..._CHAIN_OVERLAP` it changes nothing (the dump-only arm). Arm part `Ct` / `CtN` (N 16) |
 
 ## The packed RAM cache
 
@@ -138,6 +140,10 @@ round at every block position (down's tail included), widened rounds on the gene
 - `ab_requests.py`: sends a receipt's requests (token ids, `chat_text` framed like the held-out
   prompts, or `messages`) and compares arms.
 - `cache_sim.py`: replays an access trace against LRU, SLRU, 2Q, aged LFU and Belady.
+- `chain_report.py PREFIX`: reads a `Ct` arm's `PREFIX.ops.csv` and `PREFIX.stamps.csv`: per layer
+  kind the dispatches before the routing-counts sync, how many went (or would go) unordered and why
+  the rest waited, the card's busy time and gaps, the critical chain, and the fusion candidates
+  (dependent pairs whose second launch is short and reads only the first's output).
 - `ds41_mxfp4_device_check.hip`: the kernels against the card (chain check, exhaustive SwiGLU,
   GEMV timing against two libr4d builds).
 - `ds41_host_experts_test.cpp`: host tests of the kernels against the scalar reference.

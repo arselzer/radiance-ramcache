@@ -19,6 +19,7 @@
 #include "../rad_core.h"
 #include "../place/ep_route_counts.h"
 #include "arena.h"
+#include "live_chain.h"
 #include "rank_barrier.h"
 #include "residency.h"
 #include "rowprefetch.h"
@@ -416,6 +417,11 @@ public:
         c.unordered      = pc_unordered_.load(std::memory_order_relaxed);
         return c;
     }
+    /* The live issue path's overlap and trace (runtime/live_chain.h): the shutdown line, empty
+     * when RADIANCE_EXPERIMENTAL_DS41_CHAIN_OVERLAP and _TRACE are both off. Read after the rank's
+     * thread stopped issuing. */
+    std::string live_report() const { return live_.report(); }
+    const LiveStats& live_stats() const { return live_.stats(); }
     void*       arena_base()   const { return arena_.base(); }
     void*       scratch()      const { return arena_.scratch(); }
 
@@ -586,6 +592,20 @@ private:
     void haz_note(const OpPlan& p, const IssuePlan& ip, const RadTensor* t, int n_opd, int rec0,
                   int rec1);
     int  haz_mark(PassTape& t);
+    /* The live issue path's counterpart of haz_note / haz_mark, per launch (runtime/live_chain.h):
+     * live_before checks the launch against what is in flight on its queue and opens the backend's
+     * window, live_after closes it and books what the launch wrote. Only for device launches of a
+     * pass issued live (not while a tape records). */
+    LiveChain live_;
+    void live_before(const OpPlan& p, const IssuePlan& ip, const RadTensor* t,
+                     const RadOperand* opd, int n_opd, bool touches_host, LiveCall* c);
+    void live_after(LiveCall* c);
+    /* An architecture step issued live, between the trace's and the counters' pass marks. */
+    void live_step(const RadBatch* b) {
+        live_.pass_begin(b);
+        arch_step_(this, b);
+        live_.pass_end();
+    }
     bool tape_dump_ = false;  /* --debug-tape-dump (CtxDesc::tape_dump) */
     bool haz_dump_ = false;   /* haz_mark lists this recording's dispatches (tape_dump_) */
 

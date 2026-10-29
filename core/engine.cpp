@@ -83,6 +83,15 @@ Engine::~Engine() {
     for (float* p : kld_host_) if (p) rad_dev_free(p, RAD_MEM_HOST_PINNED);
     if (pooled_host_) rad_dev_free(pooled_host_, RAD_MEM_HOST_PINNED);
     for (auto& r : ranks_) if (r->score_host) rad_dev_free(r->score_host, RAD_MEM_HOST_PINNED);
+    /* The live issue path's overlap and chain trace (runtime/live_chain.h), when
+     * RADIANCE_EXPERIMENTAL_DS41_CHAIN_OVERLAP or _TRACE is on: launches checked, how many went
+     * unordered (or would, dump only), and why the rest kept the barrier bit. */
+    for (auto& r : ranks_) {
+        const std::string line = r->ctx.live_report();
+        if (line.empty()) continue;
+        LogRank lr(r->index);
+        RAD_INFO("%s", line.c_str());
+    }
     /* The tiering summary, here for the same reason, and only for a dynamic plan. Its per-layer
      * residency histogram shows whether the global ranking starved a layer, which a hit rate
      * cannot. */

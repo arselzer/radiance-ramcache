@@ -339,6 +339,33 @@ struct DeviceBackend {
 
     /* ---- rad_event_dma; null on a backend with no DMA queue. */
     int     (*event_dma)(RadEvent e, RadStream s, uint32_t** word);
+
+    /* ---- the live issue path's overlap and timestamps (Ctx::issue_body, runtime/live_chain.h).
+     * A recorded pass leaves independent dispatches unordered (tape_set_overlap); a pass issued
+     * live, which is every pass a stager arms, keeps the barrier bit on every packet. These let
+     * the issue path do per launch what haz_mark does per tape. Null on a backend whose queues
+     * run work as issued; last in the table, so the positional backends leave them null.
+     *
+     * `live_pos`: where `s` stands: its queue's id, the index its next packet goes to, and the
+     * tag of the launch that wrote the packet before that one (0: a packet written outside a
+     * tagged launch -- a copy, an event, a wait, another thread's -- or none).
+     * `live_open`: until live_close, this thread's packets on `s` carry `tag`, and the first may
+     * go without the barrier bit when `permit` is set, it is written at index `at`, and the
+     * backend's own conditions hold: a kernel dispatch with no ride or record on it, no
+     * system-scope fence, not chained and not behind a chained kernel, not inside a tape capture,
+     * and fewer than kTapeOverlapRun packets without the bit at the queue's tail (whoever wrote
+     * them), so reserve()'s margin holds for live packets as for played ones.
+     * `live_close`: what the window wrote on its stream: the first packet's index, how many, and
+     * flags (LIVE_FIRST_UNORDERED: the first went without the barrier bit; LIVE_BARRIER: one of
+     * them was a barrier packet).
+     * `live_stamp`: while on, every kernel this thread writes on card 0 gets a completion signal
+     * the packet processor writes its start and end into, read later without waiting and written
+     * to `path` (the first call's) as one line per dispatch under pass `pass`. Ordering is
+     * unchanged: a stamp's signal never sets or clears a barrier bit. */
+    int     (*live_pos)(RadStream s, uint32_t* queue, uint64_t* wr, uint64_t* last_tag);
+    void    (*live_open)(RadStream s, uint64_t tag, uint64_t at, int permit);
+    void    (*live_close)(uint64_t* first, int32_t* packets, int* flags);
+    void    (*live_stamp)(int on, uint64_t pass, const char* path);
 };
 
 
@@ -356,6 +383,16 @@ int     tape_diff(RadTape a, RadTape b, std::string* why);
 void    tape_destroy(RadTape t);
 int     tape_record(RadTape t, int i, int* kind, uint32_t* queue);
 int     tape_set_overlap(RadTape t, int i, bool on);
+
+/* The current backend's live entries (DeviceBackend::live_pos ...); live_supported() is false and
+ * the calls are inert on a backend without them. LIVE_FIRST_UNORDERED and LIVE_BARRIER are
+ * live_close's flags. */
+enum : int { LIVE_FIRST_UNORDERED = 1, LIVE_BARRIER = 2 };
+bool    live_supported();
+int     live_pos(RadStream s, uint32_t* queue, uint64_t* wr, uint64_t* last_tag);
+void    live_open(RadStream s, uint64_t tag, uint64_t at, bool permit);
+void    live_close(uint64_t* first, int32_t* packets, int* flags);
+void    live_stamp(bool on, uint64_t pass, const char* path);
 
 /* The current backend's DeviceBackend::peer_access. */
 int     dev_peer_access(int self, int peer);

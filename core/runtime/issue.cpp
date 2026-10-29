@@ -1016,6 +1016,12 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
         }
     }
 
+    /* The live issue path's overlap and trace (runtime/live_chain.h), last before the launch so
+     * that whatever the steps above put on the stream counts as in front of it. */
+    LiveCall lc;
+    if (live_.checking() && dom == RAD_DOMAIN_DEVICE && !rec_)
+        live_before(p, ip, t, opd, n_opd, touches_host, &lc);
+
     int s;
     if (profiling_ && dom == RAD_DOMAIN_HOST) {
 
@@ -1094,6 +1100,8 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
     } else {
         s = ip.launch(la, cur_stream());
     }
+    /* Closed whatever the launch returned: the link hold's release below is not the op's. */
+    if (lc.on) live_after(&lc);
     /* A read-ahead beside a host gather stops with its kernel (runtime/rowprefetch.h). */
     if (rowpf_beside_) row_prefetch_done();
     if (hold) {
@@ -1185,6 +1193,143 @@ void Ctx::haz_note(const OpPlan& p, const IssuePlan& ip, const RadTensor* t, int
     o.n_wr = (uint32_t)n_wr;
     for (int i = 0; i < n_wr; ++i) haz_rng_.push_back(wr[i]);
     haz_ops_.push_back(o);
+}
+
+/* ---------------------------------------------------------------- the live issue path
+ *
+ * What one device launch of a pass issued live reads and writes (runtime/live_chain.h), by
+ * haz_note's rules with three differences, each on the safe side or neutral:
+ *   - fewer operands than the schema are fine: the issue path nulls the trailing ones, and a null
+ *     operand touches nothing;
+ *   - a buffer, raw pointer or cache passed in a weight's slot is read like any input, since only
+ *     a declared weight is known never to be written in a pass; an unknown role is opaque;
+ *   - a write through a raw pointer (memory the core cannot place, possibly the host's) or any
+ *     host-arena operand makes the launch host-visible: it keeps its bit and orders the next. */
+static void live_ranges(const OpPlan& p, const IssuePlan& ip, const RadTensor* t,
+                        const RadOperand* opd, int n_opd, bool touches_host, LiveOp* o) {
+    const RadOpSchema* sc = p.info ? p.info->schema : nullptr;
+    o->host = touches_host;
+    o->opaque = p.collective || !sc || n_opd > (int)sc->n_operands || !ip.row || !ip.row->concurrent;
+    for (int i = 0; i < n_opd && !o->opaque; ++i) {
+        const RadTensor& tt = t[i];
+        if (!tt.data) continue;
+        const int role = sc->operands[i].role;
+        if (role == RAD_OPD_WEIGHT && opd[i].kind == RAD_OPK_WEIGHT) continue;
+        const uintptr_t lo = (uintptr_t)tt.data;
+        if (role == RAD_OPD_WTAB) {
+            /* The pointer array itself; the experts it names are weights. */
+            if (tt.rank < 1 || tt.shape[0] <= 0) { o->opaque = true; break; }
+            o->read(lo, lo + (uintptr_t)tt.shape[0] * sizeof(void*));
+            continue;
+        }
+        if (role != RAD_OPD_IN && role != RAD_OPD_OUT && role != RAD_OPD_INOUT &&
+            role != RAD_OPD_WEIGHT) {
+            o->opaque = true;
+            break;
+        }
+        const int bits = rad_dtype_bits(tt.dtype);
+        if (tt.rank == 0 || bits <= 0) { o->opaque = true; break; }
+        int64_t span = 1;
+        bool empty = false;
+        for (uint32_t d = 0; d < tt.rank; ++d) {
+            if (tt.shape[d] <= 0) { empty = true; break; }
+            if (tt.stride[d] < 0) { o->opaque = true; break; }
+            span += (tt.shape[d] - 1) * tt.stride[d];
+        }
+        if (o->opaque) break;
+        if (empty) continue;
+        const uintptr_t hi = lo + (uintptr_t)((span * bits + 7) / 8);
+        const bool writes = role == RAD_OPD_OUT || role == RAD_OPD_INOUT;
+        if (writes && opd[i].kind == RAD_OPK_RAW) o->host = true;
+        if (role != RAD_OPD_OUT) o->read(lo, hi);
+        if (writes) o->write(lo, hi);
+    }
+    if (!o->opaque && ip.args.scratch_bytes > 0 && ip.args.scratch) {
+        const uintptr_t lo = (uintptr_t)ip.args.scratch;
+        o->read(lo, lo + (uintptr_t)ip.args.scratch_bytes);
+        o->write(lo, lo + (uintptr_t)ip.args.scratch_bytes);
+    }
+}
+
+/* Checks the launch against what is in flight on its queue and opens the backend's window: the
+ * first packet goes unordered only with the overlap on, the check clear, and the backend agreeing
+ * (DeviceBackend::live_open). With the overlap off the check still runs and is counted, which is
+ * the dump-only arm. */
+void Ctx::live_before(const OpPlan& p, const IssuePlan& ip, const RadTensor* t,
+                      const RadOperand* opd, int n_opd, bool touches_host, LiveCall* c) {
+    c->on = false;
+    c->s = cur_stream();
+    if (live_pos(c->s, &c->before.queue, &c->before.wr, &c->before.last_tag) < 0) return;
+    LiveQueues& q = live_.queues();
+    c->slot = q.claim();
+    LiveOp& o = q.op(c->slot);
+    o.reset(live_.next_tag());
+    live_ranges(p, ip, t, opd, n_opd, touches_host, &o);
+    c->why = q.check(c->slot, c->before, &c->clash, &c->foreign);
+    c->permit = live_.overlap() && c->why == kLiveFree;
+    c->row = nullptr;
+    if (live_.tracing()) {
+        LiveTraceRow& r = live_.trace_row();
+        r.op = (uint32_t)(&p - plans_.data());
+        r.info = p.info;
+        r.row = ip.row;
+        r.lane = (uint8_t)lane_;
+        r.scratch = ip.args.scratch_bytes > 0 && ip.args.scratch;
+        const RadOpSchema* sc = p.info ? p.info->schema : nullptr;
+        r.n_opd = std::min(n_opd, (int)(sizeof r.opd / sizeof r.opd[0]));
+        for (int i = 0; i < r.n_opd; ++i) {
+            r.opd[i].kind = (uint8_t)opd[i].kind;
+            r.opd[i].role = sc && i < (int)sc->n_operands ? (uint8_t)sc->operands[i].role : 255;
+            r.opd[i].handle = opd[i].handle;
+            r.opd[i].offset = opd[i].offset;
+        }
+        c->row = &r;
+    }
+    c->on = true;
+    live_open(c->s, o.tag, c->before.wr, c->permit);
+}
+
+/* Closes the window and books what the launch wrote: the queue's in-flight set, the counters, the
+ * trace's row. */
+void Ctx::live_after(LiveCall* c) {
+    LiveQueues::Win w;
+    live_close(&w.first, &w.packets, &w.flags);
+    LiveQueues::Pos after;
+    if (live_pos(c->s, &after.queue, &after.wr, &after.last_tag) < 0) after = LiveQueues::Pos{};
+    LiveQueues& q = live_.queues();
+    q.commit(c->slot, c->before, w, after);
+    LiveStats& st = live_.stats();
+    const bool decode = batch_ && batch_->phase == RAD_PHASE_DECODE;
+    const bool unord = (w.flags & LIVE_FIRST_UNORDERED) != 0;
+    ++st.launches;
+    if (decode) ++st.decode_launches;
+    if (c->why == kLiveFree) {
+        ++st.free;
+        if (decode) ++st.decode_free;
+    } else {
+        ++st.why[c->why];
+    }
+    if (unord) {
+        ++st.unordered;
+        if (decode) ++st.decode_unordered;
+    } else if (c->permit && w.packets > 0) {
+        ++st.refused;
+    }
+    if (w.packets > 1) ++st.multi;
+    if (w.packets == 0) ++st.silent;
+    if (LiveTraceRow* r = c->row) {
+        r->queue = c->before.queue;
+        r->first = w.first;
+        r->packets = w.packets;
+        r->unordered = unord;
+        r->would = c->why == kLiveFree;
+        r->why = (uint8_t)c->why;
+        r->foreign = c->foreign;
+        const uint64_t t0 = live_.pass_first_tag();
+        r->clash = c->why == kLiveClash && c->clash >= t0 ? (int64_t)(c->clash - t0) : -1;
+        r->ranges = q.op(c->slot);
+    }
+    c->on = false;
 }
 
 /* See "a host launch is a join" in Ctx::issue_body. */

@@ -6,6 +6,7 @@
 #include "../rad_internal.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cinttypes>
 #include <cstdlib>
@@ -86,7 +87,8 @@ LiveWhy LiveQueues::check(int s, const Pos& at, uint64_t* clash, int64_t* foreig
         const LiveOp& o = ring_[(size_t)f.slot];
         /* Its slot was reused: the launch is no longer known, so it could touch anything. */
         if (o.tag != f.tag) return kLiveAfter;
-        if (live_dep(op, o)) {
+        /* Disjoint operands, but the same op: the row's instance state is shared (LiveOp::op). */
+        if (live_dep(op, o) || (op.op != 0 && op.op == o.op)) {
             *clash = o.tag;
             return kLiveClash;
         }
@@ -164,9 +166,12 @@ void LiveChain::init(int rank, const Program* prog) {
     }
     const char* o = std::getenv("RADIANCE_EXPERIMENTAL_DS41_CHAIN_TRACE_OUT");
     prefix_ = o && *o ? std::string(o) : fmt("/tmp/radiance-chain-%d", (int)getpid());
-    /* Unique per rank's thread, never 0: the backend's "untracked" tag. */
-    tag_base_ = (uint64_t)(rank + 1) << 48;
+    /* Unique per Ctx in the process, never 0 (the backend's "untracked"): two contexts sharing a
+     * stream (CtxDesc::stream) must not mistake each other's packets for their own. */
+    static std::atomic<uint64_t> contexts{0};
+    tag_base_ = (contexts.fetch_add(1, std::memory_order_relaxed) + 1) << 40;
     tag_n_ = 0;
+    q_.reset();
     if (every_ > 0 && rank_ == 0) rows_.resize(2048);
     if (rank_ == 0) {
         const char* what = mode_ == 1   ? "independent dispatches overlap in decode passes"
@@ -261,11 +266,15 @@ void LiveChain::write_trace() {
     }
     const Program& P = *prog_;
     std::string line;
-    int layer = -1;
+    /* A launch's layer is its first weight's; one with no weight takes the last one's on its lane,
+     * so the next layer's weights read ahead on lane 1 (DS41's pf_attn_tail) do not pull this
+     * layer's later launches into the next one. */
+    int lane_layer[2] = { -1, -1 };
     /* How far back a dependence is looked for: a layer is ~40 launches, two lanes' worth. */
     constexpr size_t kBack = 96;
     for (size_t j = 0; j < n_rows_; ++j) {
         const LiveTraceRow& r = rows_[j];
+        int& layer = lane_layer[r.lane ? 1 : 0];
         std::string label;
         if (r.info && !r.info->weights.empty() && (size_t)r.info->weights[0] < P.weights.size()) {
             label = P.weights[(size_t)r.info->weights[0]].name;

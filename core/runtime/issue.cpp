@@ -1263,7 +1263,7 @@ void Ctx::live_before(const OpPlan& p, const IssuePlan& ip, const RadTensor* t,
     LiveQueues& q = live_.queues();
     c->slot = q.claim();
     LiveOp& o = q.op(c->slot);
-    o.reset(live_.next_tag());
+    o.reset(live_.next_tag(), (uint32_t)(&p - plans_.data()));
     live_ranges(p, ip, t, opd, n_opd, touches_host, &o);
     c->why = q.check(c->slot, c->before, &c->clash, &c->foreign);
     c->permit = live_.overlap() && c->why == kLiveFree;

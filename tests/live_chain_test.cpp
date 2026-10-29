@@ -275,6 +275,25 @@ TEST(opaque_and_host_visible_launches_order_themselves_and_the_next) {
     CHECK_EQ((int)again.why, (int)rad::kLiveFree);
 }
 
+TEST(a_launch_never_joins_one_of_its_own_op) {
+    /* The same op on disjoint slices (the stream expansion, an output projection's groups if they
+     * were one op): independent by operands, but a row's per-instance state is shared. */
+    Arena a;
+    Issuer is;
+    is.fq.foreign();
+    LiveOp first = op(a, { "src" }, { "dst0" });
+    first.op = 42;
+    is.issue(first);
+    LiveOp again = op(a, { "src" }, { "dst1" });
+    again.op = 42;
+    const Issuer::Out r = is.issue(again);
+    CHECK_EQ((int)r.why, (int)rad::kLiveClash);
+    CHECK(!r.unordered);
+    LiveOp other = op(a, { "src" }, { "dst2" });
+    other.op = 43;
+    CHECK_EQ((int)is.issue(other).why, (int)rad::kLiveFree);
+}
+
 TEST(a_run_stops_at_the_overlap_cap) {
     Arena a;
     Issuer is;

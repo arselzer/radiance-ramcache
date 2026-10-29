@@ -41,7 +41,9 @@
  *     as an event), but a buffer passed in a weight's slot still counts as a read;
  *   - an op's later dispatches keep the bit (they depend on its first), and the backend refuses a
  *     permit it cannot honour: a ride or record on the packet, a system-scope fence, chaining, a
- *     tape capture, or a queue that already has kTapeOverlapRun unordered packets at its tail.
+ *     tape capture, or a queue that already has kTapeOverlapRun unordered packets at its tail;
+ *   - a launch never runs beside another launch of its own op, whatever their operands: a row may
+ *     keep per-instance state (an arrival counter taken at init, one per op and band).
  * Scratch is a range like any other, so two split-K GEMVs on one lane overlap only while
  * scratch_take hands them disjoint slices; arena buffers that share bytes through the liveness
  * packing clash by address, whatever their names.
@@ -59,7 +61,8 @@
  * RADIANCE_EXPERIMENTAL_DS41_CHAIN_TRACE_OUT, default /tmp/radiance-chain-<pid>.
  * tools/ds41-host-experts/chain_report.py joins the two files: per layer the dispatches, their gaps
  * and the critical chain to the counts sync, and the fusion candidates. With the overlap off the
- * trace is the dump-only arm: `would` shows which dispatches the check frees, and nothing changes.
+ * trace is the dump-only arm: `would` shows which dispatches the check frees, and no packet
+ * changes (the host pays the bookkeeping and the stamps, so it is not a timing arm).
  *
  * Either switch prints a summary line per rank at shutdown (Engine's report, Ctx::live_report).
  */
@@ -89,14 +92,19 @@ struct LiveRange {
 /* One launch as the hazard check sees it. */
 struct LiveOp {
     uint64_t  tag = 0;            /* the backend's packet tag; never 0 */
+    /* Its op handle, 0 for none. A row's per-instance state (an arrival counter taken at init,
+     * one per declared op and band) is shared by every launch of the op, so a launch never joins
+     * one of its own op still in flight, whatever their operands. */
+    uint32_t  op = 0;
     bool      opaque = false;     /* its operands do not bound what it touches */
     bool      host = false;       /* it touches host-visible memory */
     int       n_rd = 0, n_wr = 0;
     LiveRange rd[kLiveRanges];
     LiveRange wr[kLiveRanges];
 
-    void reset(uint64_t t) {
+    void reset(uint64_t t, uint32_t h = 0) {
         tag = t;
+        op = h;
         opaque = host = false;
         n_rd = n_wr = 0;
     }

@@ -124,10 +124,13 @@ def stretches(rows):
     out = {}
     for l, rs in by_layer.items():
         rs.sort(key=lambda r: r["seq"])
+        # From the layer's first launch on lane 0: the next layer's weights read ahead on lane 1
+        # (DS41's pf_attn_tail) carry its number but run inside this layer's MoE.
+        start = next((i for i, r in enumerate(rs) if r["lane"] == 0), None)
         end = next((i for i, r in enumerate(rs) if r["op"] in SYNC_OPS), None)
-        if end is None:
+        if start is None or end is None or end < start:
             continue
-        out[l] = (rs[: end + 1], rs)
+        out[l] = (rs[start: end + 1], rs)
     return out
 
 
@@ -187,22 +190,36 @@ EPILOGUE_MAX_NS = 15000   # a row-wise follow-up (rope, norm, round trip, top-k,
 
 
 def fusion_candidates(seg):
+    """`epilogue`: a short row-wise launch B whose one producer in the stretch is A, on A's queue,
+    reading nothing else but tables, positions and caches, and with no launch between them reading
+    what B rewrites in place (that reader would see B's output once B moves into A).
+    `shared input`: two GEMMs reading one buffer, neither reading what the other writes."""
     out = []
-    for a, b in zip(seg, seg[1:]):
-        if a["queue"] != b["queue"] or not b["t"] or not a["t"]:
+    by_seq = {r["seq"]: r for r in seg}
+    for b in seg:
+        if not b["t"] or b["op"].startswith(("gemm", "moe_gemm", "attn", "logits")) or \
+                b["t"][2] > EPILOGUE_MAX_NS:
             continue
-        if b["op"].startswith(("gemm", "moe_gemm", "attn", "logits")) or b["t"][2] > EPILOGUE_MAX_NS:
+        prods = [by_seq[s] for s, k in b["deps_l"] if "r" in k and s in by_seq]
+        if len(prods) != 1:
             continue
-        dep = [k for s, k in b["deps_l"] if s == a["seq"]]
-        if not dep or "r" not in dep[0]:
+        a = prods[0]
+        if a["queue"] != b["queue"] or not a["t"]:
             continue
         side = [x for x in b["reads_l"] if x not in a["writes_l"] and not x.startswith(SIDE_INPUTS)
                 and x != "scratch"]
         if side:
             continue
+        inplace = set(b["writes_l"]) & set(a["writes_l"]) - {"scratch"}
+        between = [r for r in seg if a["seq"] < r["seq"] < b["seq"]]
+        if inplace and any(inplace & set(r["reads_l"]) for r in between):
+            continue
         dur = b["t"][2]
         gap = max(0, b["t"][0] - a["t"][1])
-        out.append(("epilogue", name(a), name(b), dur, gap))
+        # A follow-up that reduces over the whole row (a norm, a top-k) cannot run in a GEMV's
+        # per-tile epilogue: it needs a last-block finisher that keeps the reduction's order.
+        kind = "epilogue*" if any(w in b["op"] for w in ("norm", "topk", "mix")) else "epilogue"
+        out.append((kind, name(a), name(b), dur, gap))
     gemv = [r for r in seg if r["op"].startswith("gemm") and r["t"]]
     for i, a in enumerate(gemv):
         for b in gemv[i + 1:]:
@@ -255,7 +272,8 @@ def report(prefix, layer=None, top=12):
         print("  critical chain (%d launches): %s" % (len(ch), " > ".join(name(r) for r in ch)))
     if cands:
         print("\nfusion candidates (median us over occurrences; the saving is at most the gap plus a "
-              "launch, the second kernel's own work stays unless its epilogue is cheaper)")
+              "launch, the second kernel's own work stays unless its epilogue is cheaper; "
+              "epilogue* reduces over a whole row: a last-block finisher keeping the order)")
         rows = []
         for key, v in cands.items():
             rows.append((len(v) * (med(x[1] for x in v) + 2.5), key, len(v), med(x[0] for x in v),

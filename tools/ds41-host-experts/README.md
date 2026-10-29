@@ -264,3 +264,37 @@ order, so the bits do not change, and an extra row costs 0.37–0.46 of a row in
 28,413 with the plane mirror's bytes) with no difference. Every A/B arm's replies are compared with
 the base engine's; the final configuration also matched it on 16 chat-framed prompts, on the eight
 prompts three times on one server, and on 256-token replies.
+
+## Many token rows of one expert
+
+`gemv_avx2_many` computes up to 32 token rows of one matrix in one call, for prefill passes whose
+rows meet in one expert. A tile's output rows go in blocks of 16; each round of each row is decoded
+once into f32 weights (w = kv · 2^(e−128), exact), and each token row adds x · w value by value in
+register blocks of two output rows by four token rows. Those are the card's two operations a value,
+in its order, so every row equals `gemv_avx2` on that row alone: `ds41_host_experts_test check`
+holds that at 1–33 rows in every layout (block_mxfp4, planes, packed) of every case (the release's
+scales, the edges with NaN and Inf rows, partial rounds) and over output rows [8, N); `packed` adds
+nine rows on every packed case.
+
+`RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MAX_ROWS=N` (1–32; default 4, the behaviour so far) lets a
+pool job carry up to N token rows of one expert; with N above 4, jobs of four or more rows run
+`gemv_avx2_many` and smaller ones `gemv_avx2_few` (at four rows the many-row kernel is 10–18%
+faster, at three about even, at one or two slower). Arm part `MrN`. The startup line names the
+limit; each rank's shutdown report counts the jobs that ran the many-row kernel. A 16-token pass
+gives an expert at most 16 rows, so `Mr16` and `Mr32` act alike there.
+
+In the pool's shape (`ds41_host_experts_test rbench 32 40 packed`: 40 threads, 64-row tiles, 32
+experts with the sample's scales streamed from DRAM and queued at once; medians of seven), ms an
+expert:
+
+| token rows | 1 | 2 | 4 | 8 | 16 | 32 |
+|---|---|---|---|---|---|---|
+| jobs of up to four (`gemv_avx2_few`, today) | 0.37 | 0.34 | 0.49 | 0.99 | 1.91 | 3.80 |
+| one job (`gemv_avx2_many`) | 0.38 | 0.35 | 0.40 | 0.60 | 1.01 | 1.85 |
+
+A further row costs 0.050–0.053 ms with the many-row kernel (from 4 to 32 rows) against
+0.115–0.118 ms in jobs of four; planes and block_mxfp4 measure within 6% of packed (16 → 32 rows:
+0.054 and 0.052 ms a row). That is under the prefill critique's 0.06 ms gate, so 1,024-token chunks
+can stay on the CPU, whose floor becomes about 8 ms a token (158 non-resident rows a token × 0.052
+ms). One thread with the matrix in L3 (`rhot`): 0.100 cycles a row-weight at 32 rows against 0.189
+for `gemv_avx2_few`, where Zen 3's two multiply and two add pipes allow 0.0625.

@@ -165,6 +165,10 @@ Engine::~Engine() {
         if (hx.async_wait_ns)
             RAD_INFO("host experts: %.1f ms waiting at gathers for misses still being read on the worker "
                      "(not in the gather waits above)", (double)hx.async_wait_ns / 1e6);
+        if (hx.many_jobs)
+            RAD_INFO("host experts: %llu jobs of four or more rows of one expert (%llu rows) went "
+                     "through the many-row kernel", (unsigned long long)hx.many_jobs,
+                     (unsigned long long)hx.many_rows);
         if (hx.early)
             RAD_INFO("host experts, early issue: %llu layers issued their card ops ahead of their counts "
                      "sync and waited %.1f ms for the counts at their gathers (%.1f us a layer; also in "

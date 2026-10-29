@@ -9,6 +9,11 @@
  *   ds41_host_experts_test tiles [experts] [threads...]  as bench, 64-row tiles from a shared counter
  *   ds41_host_experts_test pkbench [experts] [threads...]  as tiles: block_mxfp4, packed, planes in turn
  *   ds41_host_experts_test hot [reps] [rows] [planes]  one matrix in cache, one thread (perf stat)
+ *   ds41_host_experts_test rbench [experts] [threads] [block|packed|planes] [rows...]  the pool's shape
+ *                                           at 1, 2, 4, 8, 16, 32 token rows an expert: today's jobs of
+ *                                           four rows against one job of every row (gemv_avx2_many)
+ *   ds41_host_experts_test rhot [reps] [rows] [block|packed|planes] [n] [tile]  few and many rows, one
+ *                                           matrix in cache, one thread, in 64-row tiles
  *
  * The bench streams `experts` distinct DeepSeek-V4.1 experts (gate_up 4608 x 5120 and down
  * 5120 x 2304, 18.8 MB each) so the weights come from DRAM, as they would from the RAM cache. */
@@ -21,6 +26,7 @@
 #include <algorithm>
 #include <atomic>
 #include <functional>
+#include <memory>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -235,29 +241,56 @@ int check() {
         std::printf("%-26s packed (%d of %d rounds raw, base %d): ref %zu, avx2 %zu differing rows; scales round trip %s\n",
                     c.name, pk.plan.n_exc, rounds_of(c.N, c.K), pk.plan.e0, d4, d5, rt ? "exact" : "FAILED");
         failures += !pk.ok() || d4 || d5 || !rt;
-        /* gemv_avx2_rows on 2 .. 5 token rows (5: a call of four and one of one), the case's x and
-         * more of its kind: each row as gemv_avx2 gives it, in every layout. */
-        std::vector<std::vector<uint16_t>> xr(5);
-        for (int i = 0; i < 5; ++i)
+        /* Several token rows of the matrix, the case's x and more of its kind, each row as gemv_avx2
+         * gives it alone, in every layout: gemv_avx2_few on 2 .. 5 rows (5: a call of four and one of
+         * one), gemv_avx2_many on 1 .. 33 (33: a call of 32 and one of one; every remainder of its
+         * register blocks of four rows), also over output rows [8, N) only, and gemv_avx2_rows, which
+         * takes one or the other, on 1 .. 33. */
+        constexpr int kRowsMax = 33;
+        std::vector<std::vector<uint16_t>> xr(kRowsMax);
+        for (int i = 0; i < kRowsMax; ++i)
             xr[(size_t)i] = i ? make_x(c.K, 31u * (uint64_t)i + (uint64_t)c.K + 3u * (uint64_t)c.act, c.act) : x;
-        size_t dr = 0;
-        for (int rows = 2; rows <= 5; ++rows)
-            for (int lay = 0; lay < (pk.ok() ? 3 : 2); ++lay) {
-                const Mx mx = lay == 2 ? pk.view() : lay ? m.planes() : m.ggml();
-                std::vector<std::vector<uint16_t>> one((size_t)rows, std::vector<uint16_t>((size_t)c.N)),
-                                                   many((size_t)rows, std::vector<uint16_t>((size_t)c.N, 0xffff));
-                const uint16_t* xs[5];
-                uint16_t* ys[5];
-                for (int i = 0; i < rows; ++i) {
-                    gemv_avx2(mx, xr[(size_t)i].data(), one[(size_t)i].data(), 0, c.N);
-                    xs[i] = xr[(size_t)i].data();
-                    ys[i] = many[(size_t)i].data();
-                }
-                gemv_avx2_rows(mx, xs, ys, rows, 0, c.N);
-                for (int i = 0; i < rows; ++i) dr += diff(one[(size_t)i], many[(size_t)i]);
+        size_t dfew = 0, dmany = 0, drows = 0;
+        for (int lay = 0; lay < (pk.ok() ? 3 : 2); ++lay) {
+            const Mx mx = lay == 2 ? pk.view() : lay ? m.planes() : m.ggml();
+            std::vector<std::vector<uint16_t>> one(kRowsMax, std::vector<uint16_t>((size_t)c.N));
+            const uint16_t* xs[kRowsMax];
+            for (int i = 0; i < kRowsMax; ++i) {
+                gemv_avx2(mx, xr[(size_t)i].data(), one[(size_t)i].data(), 0, c.N);
+                xs[i] = xr[(size_t)i].data();
             }
-        std::printf("%-26s avx2 rows 2..5, every layout: %zu differing values\n", c.name, dr);
-        failures += dr != 0;
+            auto run = [&](void (*f)(const Mx&, const uint16_t* const*, uint16_t* const*, int, int, int), int rows) {
+                std::vector<std::vector<uint16_t>> got((size_t)rows, std::vector<uint16_t>((size_t)c.N, 0xffff));
+                uint16_t* ys[kRowsMax];
+                for (int i = 0; i < rows; ++i) ys[i] = got[(size_t)i].data();
+                f(mx, xs, ys, rows, 0, c.N);
+                size_t d = 0;
+                for (int i = 0; i < rows; ++i) d += diff(one[(size_t)i], got[(size_t)i]);
+                return d;
+            };
+            /* Output rows [8, N) only: a block of eight output rows at the end and a packed cursor
+             * that starts past row 0; rows [0, 8) must stay untouched. */
+            auto run_from8 = [&](int rows) {
+                std::vector<std::vector<uint16_t>> got((size_t)rows, std::vector<uint16_t>((size_t)c.N, 0xffff));
+                uint16_t* ys[kRowsMax];
+                for (int i = 0; i < rows; ++i) ys[i] = got[(size_t)i].data();
+                gemv_avx2_many(mx, xs, ys, rows, 8, c.N);
+                size_t d = 0;
+                for (int i = 0; i < rows; ++i)
+                    for (int n = 0; n < c.N; ++n)
+                        d += got[(size_t)i][(size_t)n] != (n < 8 ? (uint16_t)0xffff : one[(size_t)i][(size_t)n]);
+                return d;
+            };
+            for (int rows = 2; rows <= 5; ++rows) dfew += run(gemv_avx2_few, rows);
+            for (int rows = 1; rows <= kRowsMax; ++rows) {
+                dmany += run(gemv_avx2_many, rows);
+                drows += run(gemv_avx2_rows, rows);
+            }
+            for (int rows : { 1, 3, 4, 6, 32, 33 }) dmany += run_from8(rows);
+        }
+        std::printf("%-26s every layout: avx2 few 2..5 rows %zu, many 1..33 %zu, rows 1..33 %zu differing values\n",
+                    c.name, dfew, dmany, drows);
+        failures += dfew || dmany || drows;
     }
     /* A whole expert: gate_up, swiglu_clamped and down, scalar vs AVX2 at four threads. */
     const Mat gu = make_mat(2 * kFf, kEmbd, 7u, kReal), dn = make_mat(kEmbd, kFf, 8u, kReal);
@@ -323,28 +356,46 @@ int check() {
 
 /* ---- the packed form against the planes ------------------------------------------------------ */
 
-/* y for x under w: gemv_ref (unless with_ref is false), gemv_avx2, and gemv_avx2_rows on four token
- * rows (x, then x reversed, halved and doubled); `rows_off` counts the values where a row of the
- * four differs from gemv_avx2 on that row alone. */
+/* y for x under w: gemv_ref (unless with_ref is false), gemv_avx2, gemv_avx2_few on four token rows
+ * (x, then x reversed, halved and doubled) and gemv_avx2_many on nine (those, then x negated, rotated
+ * by one and by seven values, reversed and negated, halved and rotated); `rows_off` counts the values
+ * where a row differs from gemv_avx2 on that row alone. `rows` holds the four rows of each, few first. */
 struct Outs { std::vector<uint16_t> ref, avx2, rows; size_t rows_off = 0; };
 Outs run_all(const Mx& w, const std::vector<uint16_t>& x, bool with_ref) {
     const int N = w.N;
+    constexpr int kMany = 9;
     Outs o;
     o.ref.assign((size_t)N, 0);
     o.avx2.assign((size_t)N, 0);
-    o.rows.assign((size_t)N * 4, 0xffff);
+    o.rows.assign((size_t)N * 8, 0xffff);
     if (with_ref) gemv_ref(w, x.data(), o.ref.data(), 0, N);
     gemv_avx2(w, x.data(), o.avx2.data(), 0, N);
-    std::vector<uint16_t> x1(x.rbegin(), x.rend()), x2(x), x3(x);
-    for (auto& h : x2) h = f32_to_bf16(bf16_to_f32(h) * 0.5f);
-    for (auto& h : x3) h = f32_to_bf16(bf16_to_f32(h) * 2.0f);
-    const uint16_t* xs[4] = { x.data(), x1.data(), x2.data(), x3.data() };
-    uint16_t* ys[4] = { o.rows.data(), o.rows.data() + N, o.rows.data() + 2 * N, o.rows.data() + 3 * N };
-    gemv_avx2_rows(w, xs, ys, 4, 0, N);
-    for (int i = 0; i < 4; ++i) {
+    std::vector<std::vector<uint16_t>> xv(kMany, x);
+    std::reverse(xv[1].begin(), xv[1].end());
+    for (auto& h : xv[2]) h = f32_to_bf16(bf16_to_f32(h) * 0.5f);
+    for (auto& h : xv[3]) h = f32_to_bf16(bf16_to_f32(h) * 2.0f);
+    for (auto& h : xv[4]) h ^= 0x8000;
+    std::rotate(xv[5].begin(), xv[5].begin() + 1, xv[5].end());
+    std::rotate(xv[6].begin(), xv[6].begin() + 7, xv[6].end());
+    xv[7] = xv[1];
+    for (auto& h : xv[7]) h ^= 0x8000;
+    xv[8] = xv[2];
+    std::rotate(xv[8].begin(), xv[8].begin() + 3, xv[8].end());
+    const uint16_t* xs[kMany];
+    for (int i = 0; i < kMany; ++i) xs[i] = xv[(size_t)i].data();
+    std::vector<std::vector<uint16_t>> many(kMany, std::vector<uint16_t>((size_t)N, 0xffff));
+    uint16_t* ys[kMany];
+    for (int i = 0; i < kMany; ++i) ys[i] = i < 4 ? o.rows.data() + (size_t)i * N : many[(size_t)i].data();
+    gemv_avx2_few(w, xs, ys, 4, 0, N);
+    for (int i = 0; i < 4; ++i) ys[i] = many[(size_t)i].data();
+    gemv_avx2_many(w, xs, ys, kMany, 0, N);
+    for (int i = 0; i < 4; ++i) std::copy(many[(size_t)i].begin(), many[(size_t)i].end(), o.rows.begin() + (ptrdiff_t)(4 + i) * N);
+    for (int i = 0; i < kMany; ++i) {
         std::vector<uint16_t> one((size_t)N);
         gemv_avx2(w, xs[i], one.data(), 0, N);
-        for (int n = 0; n < N; ++n) o.rows_off += one[(size_t)n] != ys[i][n];
+        if (i < 4)
+            for (int n = 0; n < N; ++n) o.rows_off += one[(size_t)n] != o.rows[(size_t)i * N + (size_t)n];
+        o.rows_off += diff(one, many[(size_t)i]);
     }
     return o;
 }
@@ -813,6 +864,179 @@ int pkbench(int experts, const std::vector<int>& counts, const std::string& dir)
     return 0;
 }
 
+/* ---- rbench: what a token row more costs the pool ---------------------------------------------------
+ *
+ * `experts` distinct experts in one layout (block, packed or planes; the research sample's real scales
+ * as in pkbench, cycled), streamed from DRAM, each with R token rows for each R of the list. The
+ * pool's shape (core/place/host_expert_pool.cpp): an expert's rows as jobs of at most `per` rows, all
+ * queued at once; workers claim 64-row tiles of the oldest job with one left, its gate_up tiles first;
+ * the worker that ends a job's last gate_up tile runs its rows' swiglu and opens its down tiles.
+ *   four  jobs of up to four rows through gemv_avx2_few (today's pool),
+ *   rows  one job of all R rows through gemv_avx2_rows (gemv_avx2_many above kFewRows),
+ *   many  one job of all R rows through gemv_avx2_many, at any R.
+ * Seven samples of each, interleaved; the median ms an expert, and what each row past the first costs
+ * against four's one-row expert. Every variant's rows are checked against four's. */
+struct RJob {
+    const Mx* gu = nullptr;
+    const Mx* dn = nullptr;
+    int rows = 0;
+    const uint16_t* x[kGemvRows] = {};
+    uint16_t* y[kGemvRows] = {};
+    uint16_t* gate_up[kGemvRows] = {};
+    uint16_t* act[kGemvRows] = {};
+    std::atomic<int> next{ 0 }, gu_left{ 0 }, dn_left{ 0 };
+    std::atomic<bool> open{ false };
+};
+
+int rbench(int experts, int threads, const char* layout, const std::vector<int>& row_counts, const std::string& dir) {
+    const int lay = !std::strcmp(layout, "block") ? 0 : !std::strcmp(layout, "planes") ? 2 : 1;
+    const char* const lname[3] = { "block_mxfp4", "packed", "planes" };
+    std::printf("building %d distinct experts as %s (%.1f GB)...\n", experts, lname[lay], experts * 18.8e6 / 1e9);
+    const auto ids = sample_ids(dir);
+    std::vector<Mat> gu((size_t)experts), dn((size_t)experts);
+    std::vector<Packed> pgu((size_t)experts), pdn((size_t)experts);
+    std::vector<Mx> G((size_t)experts), D((size_t)experts);
+    for (int i = 0; i < experts; ++i) {
+        SampleExpert s;
+        const bool real = !ids.empty() && load_expert(dir, ids[(size_t)i % ids.size()].first, ids[(size_t)i % ids.size()].second, &s);
+        if (!real) {
+            auto mix = [](int, int, uint64_t r) { return release_like(r, 119, 3000); };
+            s.gu = make_mat_with(2 * kFf, kEmbd, 100u + (uint64_t)i, mix);
+            s.dn = make_mat_with(kEmbd, kFf, 900u + (uint64_t)i, mix);
+        }
+        if (lay == 1) {
+            pgu[(size_t)i] = pack(s.gu);
+            pdn[(size_t)i] = pack(s.dn);
+            if (!pgu[(size_t)i].ok() || !pdn[(size_t)i].ok()) { std::printf("packing failed\n"); return 1; }
+            G[(size_t)i] = pgu[(size_t)i].view();
+            D[(size_t)i] = pdn[(size_t)i].view();
+            continue;
+        }
+        gu[(size_t)i] = std::move(s.gu);
+        dn[(size_t)i] = std::move(s.dn);
+        Mat& a = gu[(size_t)i];
+        Mat& b = dn[(size_t)i];
+        if (lay == 0) { std::vector<uint8_t>().swap(a.codes); std::vector<uint8_t>().swap(a.scales); std::vector<uint8_t>().swap(b.codes); std::vector<uint8_t>().swap(b.scales); }
+        else { std::vector<uint8_t>().swap(a.blocks); std::vector<uint8_t>().swap(b.blocks); }
+        G[(size_t)i] = lay == 0 ? a.ggml() : a.planes();
+        D[(size_t)i] = lay == 0 ? b.ggml() : b.planes();
+    }
+    std::printf("scales: %s\n", ids.empty() ? "synthetic release mix" : "the research sample's");
+    std::vector<float> silu(65536);
+    silu_table_host(silu.data(), kLimit);
+    int rmax = 1;
+    for (int r : row_counts) rmax = std::max(rmax, std::min(r, kGemvRows));
+    std::vector<std::vector<uint16_t>> xs((size_t)rmax);
+    for (int i = 0; i < rmax; ++i) xs[(size_t)i] = make_x(kEmbd, 500u + (uint64_t)i, kNormal);
+    /* y, gate_up and act of every expert and row; four's y kept for the check */
+    const size_t per_e = (size_t)rmax * kEmbd;
+    std::vector<uint16_t> yb((size_t)experts * per_e), y4((size_t)experts * per_e);
+    std::vector<uint16_t> gub((size_t)experts * rmax * 2 * kFf), acb((size_t)experts * rmax * kFf);
+    Pool pool(threads);
+    using Kern = void (*)(const Mx&, const uint16_t* const*, uint16_t* const*, int, int, int);
+    const char* const vname[3] = { "four", "rows", "many" };
+    const Kern kern[3] = { gemv_avx2_few, gemv_avx2_rows, gemv_avx2_many };
+    double one_row = 0;   /* four's ms an expert at one row */
+    for (int R : row_counts) {
+        R = std::max(1, std::min(R, kGemvRows));
+        const double bytes = 18.80064e6;
+        auto build = [&](int v, std::vector<std::unique_ptr<RJob>>& jobs) {
+            jobs.clear();
+            const int per = v == 0 ? kFewRows : kGemvRows;
+            for (int e = 0; e < experts; ++e)
+                for (int r0 = 0; r0 < R; r0 += per) {
+                    auto j = std::make_unique<RJob>();
+                    j->gu = &G[(size_t)e];
+                    j->dn = &D[(size_t)e];
+                    j->rows = std::min(per, R - r0);
+                    for (int i = 0; i < j->rows; ++i) {
+                        const int r = r0 + i;
+                        j->x[i] = xs[(size_t)r].data();
+                        j->y[i] = yb.data() + (size_t)e * per_e + (size_t)r * kEmbd;
+                        j->gate_up[i] = gub.data() + ((size_t)e * rmax + (size_t)r) * 2 * kFf;
+                        j->act[i] = acb.data() + ((size_t)e * rmax + (size_t)r) * kFf;
+                    }
+                    jobs.push_back(std::move(j));
+                }
+        };
+        std::vector<std::unique_ptr<RJob>> jobs[3];
+        for (int v = 0; v < 3; ++v) build(v, jobs[v]);
+        auto run = [&](int v) {
+            std::vector<std::unique_ptr<RJob>>& js = jobs[v];
+            for (auto& j : js) {
+                j->next.store(0, std::memory_order_relaxed);
+                j->gu_left.store(72, std::memory_order_relaxed);
+                j->dn_left.store(80, std::memory_order_relaxed);
+                j->open.store(false, std::memory_order_relaxed);
+            }
+            std::atomic<int> done{ 0 };
+            const int nj = (int)js.size();
+            const Kern k = kern[v];
+            const auto t0 = std::chrono::steady_clock::now();
+            pool.run([&](int) {
+                while (done.load(std::memory_order_acquire) < nj) {
+                    bool got = false;
+                    for (int q = 0; q < nj && !got; ++q) {
+                        RJob& j = *js[(size_t)q];
+                        int t = j.next.load(std::memory_order_acquire);
+                        while (t < 152 && (t < 72 || j.open.load(std::memory_order_acquire))) {
+                            if (!j.next.compare_exchange_weak(t, t + 1, std::memory_order_acq_rel)) continue;
+                            got = true;
+                            break;
+                        }
+                        if (!got) continue;
+                        if (t < 72) {
+                            k(*j.gu, j.x, j.gate_up, j.rows, t * 64, t * 64 + 64);
+                            if (j.gu_left.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                                for (int i = 0; i < j.rows; ++i) swiglu_avx2(silu.data(), j.gate_up[i], j.act[i], kFf, kLimit);
+                                j.open.store(true, std::memory_order_release);
+                            }
+                        } else {
+                            const int d = t - 72;
+                            k(*j.dn, j.act, j.y, j.rows, d * 64, d * 64 + 64);
+                            if (j.dn_left.fetch_sub(1, std::memory_order_acq_rel) == 1) done.fetch_add(1, std::memory_order_acq_rel);
+                        }
+                    }
+                    if (!got) _mm_pause();
+                }
+            });
+            return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        };
+        const int passes = std::max(1, 64 / (experts * R) + 1), samples = 7;
+        auto timed = [&](int v) {
+            double s = 0;
+            for (int p = 0; p < passes; ++p) s += run(v);
+            return s / passes;
+        };
+        for (int v = 0; v < 3; ++v) timed(v);   /* warm the code and the pages, not the caches */
+        std::vector<double> ts[3];
+        size_t bad[3] = {};
+        for (int rep = 0; rep < samples; ++rep)
+            for (int v = 0; v < 3; ++v) {
+                std::fill(yb.begin(), yb.end(), (uint16_t)0xffff);
+                ts[v].push_back(timed(v));
+                if (v == 0 && rep == 0) y4 = yb;
+                else
+                    for (int e = 0; e < experts; ++e)
+                        for (size_t i = 0; i < (size_t)R * kEmbd; ++i) bad[v] += yb[(size_t)e * per_e + i] != y4[(size_t)e * per_e + i];
+            }
+        double med[3];
+        for (int v = 0; v < 3; ++v) {
+            std::sort(ts[v].begin(), ts[v].end());
+            med[v] = 1e3 * ts[v][(size_t)samples / 2] / experts;
+        }
+        if (R == 1 || one_row == 0) one_row = med[0];
+        std::printf("%2d rows, %d threads, %d experts, %s: median ms an expert (best, worst), per row past the first:\n", R, threads,
+                    experts, lname[lay]);
+        for (int v = 0; v < 3; ++v)
+            std::printf("   %-4s %8.4f (%.4f, %.4f)  %.4f ms a row, %+.4f ms each row more%s  %5.1f GB/s  rows %s\n", vname[v], med[v],
+                        1e3 * ts[v][0] / experts, 1e3 * ts[v][(size_t)samples - 1] / experts, med[v] / R,
+                        R > 1 ? (med[v] - one_row) / (R - 1) : 0.0, R > 1 ? "" : " (one row)", bytes * (v == 0 ? (R + 3) / 4 : 1) / (med[v] * 1e-3) / 1e9,
+                        bad[v] ? "DIFFER" : "identical");
+    }
+    return 0;
+}
+
 /* AMD APERF: core cycles of this CPU (RDPRU, user mode), 0 where unsupported. */
 uint64_t aperf() {
 #if defined(__x86_64__)
@@ -845,9 +1069,59 @@ int hot(int reps, int rows, bool planes) {
     return 0;
 }
 
+/* rhot: gemv_avx2_few and gemv_avx2_many on `rows` token rows of one matrix of `n` x 5120 in one
+ * layout (12.5 MB at 4608 rows: in one CCD's L3), one pinned thread, `reps` passes over it in calls of
+ * `tile` output rows (64, the pool's; 0: one call): the kernels' own cost a row and weight. */
+int rhot(int reps, int rows, const char* layout, int n, int tile) {
+    if (tile <= 0 || tile > n) tile = n;
+    rows = std::max(1, std::min(rows, kGemvRows));
+    const int lay = !std::strcmp(layout, "block") ? 0 : !std::strcmp(layout, "planes") ? 2 : 1;
+    auto mix = [](int, int, uint64_t r) { return release_like(r, 119, 3000); };
+    const Mat m = make_mat_with(n, kEmbd, 77u, mix);
+    const Packed p = lay == 1 ? pack(m) : Packed{};
+    const Mx w = lay == 0 ? m.ggml() : lay == 2 ? m.planes() : p.view();
+    std::vector<std::vector<uint16_t>> xv((size_t)rows), yv((size_t)rows, std::vector<uint16_t>((size_t)n));
+    const uint16_t* xs[kGemvRows];
+    uint16_t* ys[kGemvRows];
+    for (int i = 0; i < rows; ++i) {
+        xv[(size_t)i] = make_x(kEmbd, 3u + (uint64_t)i, kNormal);
+        xs[i] = xv[(size_t)i].data();
+        ys[i] = yv[(size_t)i].data();
+    }
+    Pool::pin(0);
+    using Kern = void (*)(const Mx&, const uint16_t* const*, uint16_t* const*, int, int, int);
+    const Kern kern[2] = { gemv_avx2_few, gemv_avx2_many };
+    const char* const name[2] = { "few", "many" };
+    for (int k = 0; k < 2; ++k) {
+        auto pass = [&] { for (int t = 0; t < n; t += tile) kern[k](w, xs, ys, rows, t, std::min(n, t + tile)); };
+        pass();   /* warm */
+        const auto t0 = std::chrono::steady_clock::now();
+        const uint64_t c0 = aperf();
+        for (int r = 0; r < reps; ++r) pass();
+        const uint64_t c1 = aperf();
+        const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        const double rw = (double)reps * rows * n * kEmbd;   /* row-weights */
+        std::printf("rhot %-4s %s %dx%d in tiles of %d, %d rows x %d: %.3f ms a pass, %.4f ns and %.4f cycles a row-weight (%.2f GHz)\n",
+                    name[k], layout, n, kEmbd, tile, rows, reps, 1e3 * s / reps, 1e9 * s / rw, (double)(c1 - c0) / rw,
+                    (double)(c1 - c0) / s / 1e9);
+    }
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (argc > 1 && !std::strcmp(argv[1], "rbench")) {
+        /* rbench [experts] [threads] [block|packed|planes] [rows...] */
+        std::vector<int> rows;
+        for (int i = 5; i < argc; ++i) rows.push_back(std::atoi(argv[i]));
+        if (rows.empty()) rows = { 1, 2, 4, 8, 16, 32 };
+        return rbench(argc > 2 ? std::atoi(argv[2]) : 32, argc > 3 ? std::atoi(argv[3]) : 40, argc > 4 ? argv[4] : "packed", rows,
+                      sample_dir(0, argv, 1));
+    }
+    if (argc > 1 && !std::strcmp(argv[1], "rhot"))   /* rhot [reps] [rows] [block|packed|planes] [n] [tile] */
+        return rhot(argc > 2 ? std::atoi(argv[2]) : 20, argc > 3 ? std::atoi(argv[3]) : 32, argc > 4 ? argv[4] : "packed",
+                    argc > 5 ? std::atoi(argv[5]) : 2 * kFf, argc > 6 ? std::atoi(argv[6]) : 64);
     if (argc > 1 && !std::strcmp(argv[1], "bench")) {
         /* bench [experts] [thread counts...]; counts past 24 use SMT siblings */
         std::vector<int> counts;

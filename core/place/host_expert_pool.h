@@ -17,7 +17,8 @@
  * the table is captured on the card (ds41_mxfp4_device_check swiglu) rather than computed here.
  * Optional: ..._CPUS=<list> pins the workers ("4-23" or "4,5,6"), ..._GBPS and ..._LINK_GBPS set
  * the scheduling estimates (4.2 GB/s a thread up to 78, and 20), ..._SPIN_US how long an idle
- * worker spins before it sleeps (200), ..._NICE the workers' nice value (0). */
+ * worker spins before it sleeps (200), ..._NICE the workers' nice value (0), ..._MAX_ROWS the most
+ * token rows of one expert a job carries (4; up to 32, see max_rows). */
 #pragma once
 #include <atomic>
 #include <condition_variable>
@@ -40,7 +41,17 @@ public:
      * [N, K/2] and e8m0 scales [N, K/32], or with `packed` set packed slots of gu_bytes and
      * dn_bytes (the packed RAM cache: ds41_host_experts.h packed_view, checked at submit). An
      * urgent job (a missed expert, on the critical path) is claimed before every other. */
-    static constexpr int kMaxRows = 4;
+    static constexpr int kMaxRowsCap = 32;     /* ds41hx::kGemvRows */
+    static constexpr int kMaxRowsDefault = 4;  /* ds41hx::kFewRows */
+    /* The most token rows a job carries: RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MAX_ROWS, 1 ..
+     * kMaxRowsCap (default 4), read once; an unusable value turns the pool off (get() says so) and
+     * reads as the default here. With more than four allowed, a job of four or more rows runs the
+     * many-row kernel (ds41hx::gemv_avx2_many), for prefill passes whose rows meet in one expert;
+     * every other job runs ds41hx::gemv_avx2_few, as with the default. */
+    static int max_rows();
+    /* The fewest rows of a job that runs the many-row kernel: 4 when max_rows() > 4 (rbench, 40
+     * threads: 10-18% under gemv_avx2_few at four rows, about even at three), else none. */
+    static int many_from() { return max_rows() > kMaxRowsDefault ? kMaxRowsDefault : kMaxRowsCap + 1; }
     struct Job {
         const uint8_t*  gu = nullptr;   /* [2 * kFf, kEmbd] */
         const uint8_t*  dn = nullptr;   /* [kEmbd, kFf] */
@@ -50,22 +61,27 @@ public:
         int64_t         gu_bytes = 0, dn_bytes = 0;   /* packed: the slots' sizes */
         const uint16_t* x = nullptr;    /* kEmbd bf16 */
         uint16_t*       y = nullptr;    /* kEmbd bf16 */
-        /* Up to kMaxRows - 1 more token rows of the same expert: each weight tile is read once for
-         * all of them (it stays in L2) and each round of its codes decoded once
-         * (ds41hx::gemv_avx2_rows), each row's arithmetic unchanged. */
-        const uint16_t* xs[kMaxRows - 1] = {};
-        uint16_t*       ys[kMaxRows - 1] = {};
+        /* Up to max_rows() - 1 more token rows of the same expert: each weight tile is read once for
+         * all of them and each round of its codes decoded once (gemv_avx2_few, or gemv_avx2_many from
+         * many_from() rows), each row's arithmetic unchanged. */
+        const uint16_t* xs[kMaxRowsCap - 1] = {};
+        uint16_t*       ys[kMaxRowsCap - 1] = {};
         int             more = 0;
         bool            urgent = false;
         int64_t         cost = 0;       /* backlog bytes it stands for; 0: cost_rows(1 + more) */
     };
-    /* The backlog a job of `rows` rows stands for: the expert's bytes for the first row, half
-     * of them for each more (computed from L2). */
-    static int64_t job_cost(int rows) { return kExpertBytes + (int64_t)(rows - 1) * kExpertBytes / 2; }
-    /* An expert's `rows` rows as jobs of at most kMaxRows. */
+    /* The backlog a job of `rows` rows stands for: the expert's bytes for the first row and for
+     * each more half of them in a job of up to four rows (computed from L2), an eighth in a larger
+     * one (the many-row kernel: ~0.05 ms a further row against ~0.38 ms for an expert's first, 40
+     * threads; ds41_host_experts_test rbench). */
+    static int64_t job_cost(int rows) {
+        return kExpertBytes + (int64_t)(rows - 1) * (rows <= kMaxRowsDefault ? kExpertBytes / 2 : kExpertBytes / 8);
+    }
+    /* An expert's `rows` rows as jobs of at most max_rows(). */
     static int64_t cost_rows(int rows) {
+        const int m = max_rows();
         int64_t c = 0;
-        for (; rows > 0; rows -= kMaxRows) c += job_cost(rows < kMaxRows ? rows : kMaxRows);
+        for (; rows > 0; rows -= m) c += job_cost(rows < m ? rows : m);
         return c;
     }
     /* The jobs one caller waits for: submit adds them, the pool counts them down. */
@@ -110,7 +126,9 @@ private:
     /* claim: the job's sequence number (low 32 bits) over the next tile to hand out, gate_up
      * tiles first. kDone, or any tile index past the last, hands out nothing. */
     static constexpr uint64_t kDone = (uint64_t)(kGuTiles + kDnTiles);
-    struct Slot {
+    /* Cache-line aligned, as when the row buffers lived inside: a slot's claim word, which workers
+     * swap for every tile, shares no line with another slot's fields. */
+    struct alignas(64) Slot {
         std::atomic<int>      state{ 0 };   /* 0 free, 1 taken (guarded by submit_mu_ for takers) */
         std::atomic<uint64_t> claim{ kDone };
         std::atomic<uint64_t> seq{ 0 };
@@ -119,8 +137,8 @@ private:
         std::atomic<int>      urgent{ 0 };
         Job      job;
         Ticket*  ticket = nullptr;
-        alignas(64) uint16_t gate_up[kMaxRows][2 * kFf];
-        uint16_t act[kMaxRows][kFf];
+        uint16_t* gate_up = nullptr;   /* max_rows() rows of 2 * kFf, in rows_ */
+        uint16_t* act = nullptr;       /* max_rows() rows of kFf */
     };
 
     HostExpertPool() = default;
@@ -132,6 +150,7 @@ private:
     void drained(int64_t left);      /* backlog_ now `left`: wake wait_idle at 0 */
 
     std::unique_ptr<Slot[]> slots_;
+    std::unique_ptr<uint16_t, void (*)(void*)> rows_{ nullptr, nullptr };   /* the slots' row buffers */
     std::vector<float>      silu_;
     float  limit_ = 10.0f;
     double cpu_bpns_ = 67.0, link_bpns_ = 20.0;

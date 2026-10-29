@@ -1,7 +1,11 @@
 /* host_expert_pool_test.cpp -- the CPU pool for DeepSeek-V4.1 routed experts
  * (core/place/host_expert_pool.h): every row equals the scalar reference's (tools/ds41-host-experts,
  * gemv_ref) bit for bit with four submitters at once and more jobs than slots, and the backlog
- * returns to zero. The silu table here is the host's; the served one comes from the card. */
+ * returns to zero. The silu table here is the host's; the served one comes from the card.
+ *
+ * Jobs carry up to 32 token rows here (RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MAX_ROWS, set before
+ * the pool reads it unless the environment already sets it: run with ..._MAX_ROWS=4 for the default
+ * limit, where the many-row case skips). */
 #include "rad_test.h"
 
 #include "place/host_expert_pool.h"
@@ -47,6 +51,9 @@ struct Expert {
 
 std::vector<float> g_silu;
 
+/* Before anything reads it (max_rows() reads it once); an outside setting wins. */
+const bool g_max_rows_set = setenv("RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MAX_ROWS", "32", 0) == 0;
+
 /* The pool reads its configuration once: four workers and the host's silu table. */
 HostExpertPool* pool() {
     static HostExpertPool* p = [] {
@@ -69,6 +76,17 @@ std::vector<uint16_t> reference(const Expert& e, const std::vector<uint16_t>& x)
     ex.dn.N = kEmbd;   ex.dn.K = kFf;   ex.dn.blocks = e.dn.data();
     std::vector<uint16_t> g(2 * kFf), a(kFf), d(kEmbd);
     ds41hx::expert_forward(ex, g_silu.data(), 10.0f, x.data(), g.data(), a.data(), d.data(), 1, false);
+    return d;
+}
+
+/* The same through the one-row AVX2 kernel (gemv_avx2, proven equal to gemv_ref by
+ * ds41_host_experts_test check): for many rows within the CPU budget. */
+std::vector<uint16_t> reference_avx2(const Expert& e, const std::vector<uint16_t>& x) {
+    ds41hx::Expert ex;
+    ex.gu.N = 2 * kFf; ex.gu.K = kEmbd; ex.gu.blocks = e.gu.data();
+    ex.dn.N = kEmbd;   ex.dn.K = kFf;   ex.dn.blocks = e.dn.data();
+    std::vector<uint16_t> g(2 * kFf), a(kFf), d(kEmbd);
+    ds41hx::expert_forward(ex, g_silu.data(), 10.0f, x.data(), g.data(), a.data(), d.data(), 1, true);
     return d;
 }
 
@@ -221,9 +239,13 @@ TEST(host_expert_pool_multi_row_jobs_match) {
     HostExpertPool::Ticket t2;
     CHECK(p->submit(&bad, 1, &t2) < 0);
     bad = j[0];
-    bad.more = HostExpertPool::kMaxRows;
+    bad.more = HostExpertPool::max_rows();
     CHECK(p->submit(&bad, 1, &t2) < 0);
-    CHECK_EQ(HostExpertPool::cost_rows(9), 2 * HostExpertPool::job_cost(4) + HostExpertPool::job_cost(1));
+    /* An expert's rows as jobs of max_rows(): nine rows are one job at 32, three at four. */
+    const int m = HostExpertPool::max_rows();
+    CHECK_EQ(HostExpertPool::cost_rows(9), m >= 9 ? HostExpertPool::job_cost(9)
+                                                  : 2 * HostExpertPool::job_cost(4) + HostExpertPool::job_cost(1));
+    CHECK_EQ(HostExpertPool::job_cost(4), HostExpertPool::kExpertBytes + 3 * (HostExpertPool::kExpertBytes / 2));
 }
 
 /* block_mxfp4 rows with the release's scales: e8m0 120 or 121, now and then 119 or 122, and one
@@ -308,6 +330,74 @@ TEST(host_expert_pool_packed_jobs_match) {
     CHECK(p->submit(&bad, 1, &t2) < 0);
     CHECK_EQ(t2.left.load(), 0);
     CHECK_EQ(p->backlog(), (int64_t)0);
+}
+
+/* Jobs of many rows (the many-row kernel, ..._MAX_ROWS=32): 32 rows of block_mxfp4, 17 packed (urgent)
+ * and 9 planar of one expert, submitted with a one-row and a four-row job beside them, from two
+ * submitters at once: every row as the one-row kernel gives it; then one row past the limit is
+ * refused and the backlog drains. */
+TEST(host_expert_pool_many_row_jobs_match) {
+    HostExpertPool* p = pool();
+    if (!p || !__builtin_cpu_supports("avx2")) { SKIP("no AVX2 or no pool"); return; }
+    CHECK(g_max_rows_set);
+    if (HostExpertPool::max_rows() < 32) { SKIP("..._MAX_ROWS below 32 in the environment"); return; }
+    Expert e{ release_blocks(2 * kFf, kEmbd, 71, 1500), release_blocks(kEmbd, kFf, 72, 1500) };
+    std::vector<uint8_t> guc, gus, dnc, dns;
+    planes_of(e.gu, 2 * kFf, kEmbd, &guc, &gus);
+    planes_of(e.dn, kEmbd, kFf, &dnc, &dns);
+    ds41hx::PackInfo gp, dp;
+    REQUIRE(ds41hx::pack_plan(gus.data(), 2 * kFf, kEmbd, &gp) && ds41hx::pack_plan(dns.data(), kEmbd, kFf, &dp));
+    std::vector<uint8_t> gk(ds41hx::packed_bytes(2 * kFf, kEmbd, gp.n_exc)), dk(ds41hx::packed_bytes(kEmbd, kFf, dp.n_exc));
+    REQUIRE(ds41hx::pack_planes(guc.data(), gus.data(), 2 * kFf, kEmbd, gp.n_exc, gp, gk.data(), gk.size()) == ds41hx::kPackOk);
+    REQUIRE(ds41hx::pack_planes(dnc.data(), dns.data(), kEmbd, kFf, dp.n_exc, dp, dk.data(), dk.size()) == ds41hx::kPackOk);
+    constexpr int kRows = 32;
+    std::vector<std::vector<uint16_t>> xs, want;
+    for (int r = 0; r < kRows; ++r) {
+        xs.push_back(row(300 + (uint64_t)r));
+        want.push_back(reference_avx2(e, xs.back()));
+    }
+    /* job: layout (0 blocks, 1 packed, 2 planes), first row, rows, urgent */
+    struct Spec { int lay, r0, rows; bool urgent; };
+    const Spec spec[5] = { { 0, 0, 32, false }, { 1, 5, 17, true }, { 2, 20, 9, false }, { 1, 31, 1, false }, { 2, 3, 4, false } };
+    std::vector<std::vector<std::vector<uint16_t>>> got(5);
+    HostExpertPool::Job j[5];
+    int64_t cost = 0;
+    for (int k = 0; k < 5; ++k) {
+        const Spec& sp = spec[k];
+        got[(size_t)k].assign((size_t)sp.rows, std::vector<uint16_t>(kEmbd, 0xffff));
+        HostExpertPool::Job& q = j[k];
+        if (sp.lay == 0) { q.gu = e.gu.data(); q.dn = e.dn.data(); }
+        else if (sp.lay == 1) {
+            q.gu = gk.data(); q.dn = dk.data(); q.packed = true;
+            q.gu_bytes = (int64_t)gk.size(); q.dn_bytes = (int64_t)dk.size();
+        } else { q.gu = guc.data(); q.gu_scales = gus.data(); q.dn = dnc.data(); q.dn_scales = dns.data(); }
+        q.x = xs[(size_t)sp.r0].data();
+        q.y = got[(size_t)k][0].data();
+        for (int i = 1; i < sp.rows; ++i) {
+            q.xs[i - 1] = xs[(size_t)(sp.r0 + i)].data();
+            q.ys[i - 1] = got[(size_t)k][(size_t)i].data();
+        }
+        q.more = sp.rows - 1;
+        q.urgent = sp.urgent;
+        cost += HostExpertPool::job_cost(sp.rows);
+    }
+    p->reserve(cost);
+    HostExpertPool::Ticket t1, t2;
+    std::thread other([&] { CHECK_EQ(p->submit(j + 3, 2, &t2), 0); p->wait(&t2); });
+    CHECK_EQ(p->submit(j, 3, &t1), 0);
+    p->wait(&t1);
+    other.join();
+    int bad = 0;
+    for (int k = 0; k < 5; ++k)
+        for (int i = 0; i < spec[k].rows; ++i) bad += got[(size_t)k][(size_t)i] != want[(size_t)(spec[k].r0 + i)];
+    CHECK_EQ(bad, 0);
+    CHECK_EQ(p->backlog(), (int64_t)0);
+    HostExpertPool::Job over = j[0];
+    over.more = HostExpertPool::max_rows();   /* 33 rows */
+    HostExpertPool::Ticket t3;
+    CHECK(p->submit(&over, 1, &t3) < 0);
+    CHECK_EQ(t3.left.load(), 0);
+    CHECK_EQ(HostExpertPool::cost_rows(40), HostExpertPool::job_cost(32) + HostExpertPool::job_cost(8));
 }
 
 TEST(host_expert_pool_refuses_incomplete_jobs) {

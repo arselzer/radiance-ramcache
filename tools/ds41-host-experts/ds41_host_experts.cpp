@@ -322,20 +322,23 @@ __attribute__((noinline)) void general_round(__m256 (&acc)[4], const uint8_t* co
 
 /* ---- rounds and rows ---- */
 
-/* xt[(r * 32 + v) * 32 + g * 8 + j] = x / 2 of value v of block 32r + 8g + kLane[j], 0 past the row. */
-inline void x_lanes(const uint16_t* x, int UK, float* xt) {
+/* x's lanes: dst(r, g, v)[j] = x / 2 (kHalf) or x of value v of block 32r + 8g + kLane[j], 0 past the
+ * row, where dst(r, g, v) = xt + r * rs + g * gs + v * vs. */
+template <bool kHalf>
+inline void x_lanes_t(const uint16_t* x, int UK, float* xt, size_t vs, size_t gs, size_t rs) {
     const int R = (UK + 31) / 32;
     const __m256i zero = _mm256_setzero_si256();
     const __m256 half = _mm256_set1_ps(0.5f);
     for (int r = 0; r < R; ++r)
         for (int g = 0; g < 4; ++g) {
             const int u0 = 32 * r + 8 * g;
-            float* dst = xt + (size_t)r * 1024 + g * 8;
+            float* dst = xt + (size_t)r * rs + (size_t)g * gs;
             if (u0 + 8 > UK) {
                 for (int v = 0; v < 32; ++v)
                     for (int j = 0; j < 8; ++j) {
                         const int u = u0 + kLane[j];
-                        dst[v * 32 + j] = u < UK ? bf16_to_f32(x[(size_t)u * 32 + v]) * 0.5f : 0.f;
+                        const float f = u < UK ? bf16_to_f32(x[(size_t)u * 32 + v]) : 0.f;
+                        dst[(size_t)v * vs + (size_t)j] = kHalf ? f * 0.5f : f;
                     }
                 continue;
             }
@@ -358,12 +361,16 @@ inline void x_lanes(const uint16_t* x, int UK, float* xt) {
                                        _mm256_unpacklo_epi64(s5, s7), _mm256_unpackhi_epi64(s5, s7) };
                 for (int m = 0; m < 8; ++m) {   /* bf16 to f32: the bits to the high half */
                     const __m256i lo = _mm256_unpacklo_epi16(zero, o[m]), hi = _mm256_unpackhi_epi16(zero, o[m]);
-                    _mm256_store_ps(dst + (16 * h + m) * 32, _mm256_mul_ps(_mm256_castsi256_ps(_mm256_permute2x128_si256(lo, hi, 0x20)), half));
-                    _mm256_store_ps(dst + (16 * h + 8 + m) * 32, _mm256_mul_ps(_mm256_castsi256_ps(_mm256_permute2x128_si256(lo, hi, 0x31)), half));
+                    const __m256 a = _mm256_castsi256_ps(_mm256_permute2x128_si256(lo, hi, 0x20));
+                    const __m256 b = _mm256_castsi256_ps(_mm256_permute2x128_si256(lo, hi, 0x31));
+                    _mm256_store_ps(dst + (size_t)(16 * h + m) * vs, kHalf ? _mm256_mul_ps(a, half) : a);
+                    _mm256_store_ps(dst + (size_t)(16 * h + 8 + m) * vs, kHalf ? _mm256_mul_ps(b, half) : b);
                 }
             }
         }
 }
+/* xt[(r * 32 + v) * 32 + g * 8 + j] = x / 2 of value v of block 32r + 8g + kLane[j], 0 past the row. */
+inline void x_lanes(const uint16_t* x, int UK, float* xt) { x_lanes_t<true>(x, UK, xt, 32, 8, 1024); }
 
 /* Whether a round's e8m0 bytes (e_pair of groups 0 and 1, and of 2 and 3) all lie in the fast
  * path's window. */
@@ -492,7 +499,7 @@ __attribute__((noinline)) void add_round_rows(__m256 (*acc)[4], const uint8_t* c
     for (int i = 0; i < rows; ++i) add_round16<4>(acc[i], w16, xr[i]);
 }
 
-/* gemv_avx2_t for 2 .. kGemvRows rows: x transposed once a row, the full rounds through
+/* gemv_avx2_t for 2 .. kFewRows rows: x transposed once a row, the full rounds through
  * add_round_rows, each row's last, partial round (down's eight blocks) on its own. */
 template <bool kGgml>
 void gemv_avx2_rows_t(const Mx& w, const uint16_t* const* x, uint16_t* const* y, int rows, int n0, int n1) {
@@ -500,8 +507,8 @@ void gemv_avx2_rows_t(const Mx& w, const uint16_t* const* x, uint16_t* const* y,
     const int UK = w.K / 32, R = (UK + 31) / 32, RF = UK / 32;
     struct alignas(32) X8 { float f[8]; };
     thread_local std::vector<X8> xbuf;
-    xbuf.resize((size_t)kGemvRows * R * 128);
-    float* xt[kGemvRows];
+    xbuf.resize((size_t)kFewRows * R * 128);
+    float* xt[kFewRows];
     for (int i = 0; i < rows; ++i) {
         xt[i] = xbuf.data()->f + (size_t)i * R * 1024;
         x_lanes(x[i], UK, xt[i]);
@@ -509,14 +516,14 @@ void gemv_avx2_rows_t(const Mx& w, const uint16_t* const* x, uint16_t* const* y,
     for (int n = n0; n < n1; ++n) {
         const uint8_t* const codes = kGgml ? w.blocks + (size_t)n * UK * 17 + 1 : w.codes + (size_t)n * (size_t)(w.K / 2);
         const uint8_t* const scl = kGgml ? codes - 1 : w.scales + (size_t)n * UK;
-        __m256 acc[kGemvRows][4];
+        __m256 acc[kFewRows][4];
         for (int i = 0; i < rows; ++i)
             for (int g = 0; g < 4; ++g) acc[i][g] = _mm256_setzero_ps();
         for (int r = 0; r < RF; ++r) {
             const size_t u0 = (size_t)r * 32;
             const uint8_t* const gc[4] = { codes + u0 * BS, codes + (u0 + 8) * BS, codes + (u0 + 16) * BS, codes + (u0 + 24) * BS };
             const uint8_t* const gs[4] = { scl + u0 * SS, scl + (u0 + 8) * SS, scl + (u0 + 16) * SS, scl + (u0 + 24) * SS };
-            const float* xr[kGemvRows];
+            const float* xr[kFewRows];
             for (int i = 0; i < rows; ++i) xr[i] = xt[i] + (size_t)r * 1024;
             add_round_rows<kGgml>(acc, gc, gs, xr, rows);
         }
@@ -603,8 +610,8 @@ void gemv_avx2_rows_pk(const Mx& w, const uint16_t* const* x, uint16_t* const* y
     const size_t PB = (size_t)(8 * RF + (t + 3) / 4);
     struct alignas(32) X8 { float f[8]; };
     thread_local std::vector<X8> xbuf;
-    xbuf.resize((size_t)kGemvRows * R * 128);
-    float* xt[kGemvRows];
+    xbuf.resize((size_t)kFewRows * R * 128);
+    float* xt[kFewRows];
     for (int i = 0; i < rows; ++i) {
         xt[i] = xbuf.data()->f + (size_t)i * R * 1024;
         x_lanes(x[i], UK, xt[i]);
@@ -615,7 +622,7 @@ void gemv_avx2_rows_pk(const Mx& w, const uint16_t* const* x, uint16_t* const* y
         const uint8_t* const codes = w.codes + (size_t)n * (size_t)(w.K / 2);
         const uint8_t* const pk = w.pk + (size_t)n * PB;
         const uint32_t g = (uint32_t)n * (uint32_t)R;
-        __m256 acc[kGemvRows][4];
+        __m256 acc[kFewRows][4];
         for (int i = 0; i < rows; ++i)
             for (int k = 0; k < 4; ++k) acc[i][k] = _mm256_setzero_ps();
         for (int r = 0; r < RF; ++r) {
@@ -623,7 +630,7 @@ void gemv_avx2_rows_pk(const Mx& w, const uint16_t* const* x, uint16_t* const* y
             const size_t u0 = (size_t)r * 32;
             const uint8_t* const gc[4] = { codes + u0 * 16, codes + (u0 + 8) * 16, codes + (u0 + 16) * 16, codes + (u0 + 24) * 16 };
             const uint8_t* const gs[4] = { s, s + 8, s + 16, s + 24 };
-            const float* xr[kGemvRows];
+            const float* xr[kFewRows];
             for (int i = 0; i < rows; ++i) xr[i] = xt[i] + (size_t)r * 1024;
             add_round_rows<false>(acc, gc, gs, xr, rows);
         }
@@ -632,6 +639,258 @@ void gemv_avx2_rows_pk(const Mx& w, const uint16_t* const* x, uint16_t* const* y
             if (st) add_tail<false>(acc[i], codes + (size_t)RF * 32 * 16, st, 0, t, xt[i] + (size_t)RF * 1024);
             y[i][n] = bf16_rne_nan(wave_sum4(acc[i]));
         }
+    }
+}
+
+/* ---- many token rows of one matrix (gemv_avx2_many) ------------------------------------------------
+ *
+ * For a prefill pass whose rows meet in one expert. The output rows go in blocks of kMb; in a block,
+ * each round of each output row is decoded once into f32 weights w = kv * d, the device's w: on the
+ * fast path kv_pair16's fp16 2w widened (exact) and halved (exact: 2w >= 2^-14 or a zero), elsewhere
+ * kv * d formed as general_round forms it. Every token row then adds p = x * w with x unhalved, value
+ * by value in each lane, and sum + p: the device's two operations (the one-row kernel's (x / 2) * (2w)
+ * is the same real product, rounded once to the same f32). A zero code is -0 on the fast path, as in
+ * the one-row kernel: x * -0 and x * +0 differ only in a zero's sign, and a sum, which starts at +0,
+ * is never -0, so sum + p is the same. So each row's sums see the one-row kernel's operations in its
+ * order, and the same wave_sum4 gives its bits.
+ *
+ * The products go in register blocks of two output rows by four token rows: each weight vector
+ * loaded serves four token rows and each x vector two output rows. x lies by (round, group, four
+ * token rows, value), so one group of a round for four token rows is 4 KiB in a row and stays in L1
+ * while the block's 16 output rows pass over it; their weights lie by (group, output row, value), so
+ * a group's are 16 KiB in a row (in L1 too, no two rows on the same sets). The sums of each (group,
+ * output row, token row) wait in a buffer between rounds: round 0 starts them at +0 (as the one-row
+ * kernel's accumulators start), and each later call fetches the next call's sums ahead.
+ *
+ * Measured (ds41_host_experts_test rhot, one thread, 32 rows): 0.100 cycles a row-weight, where Zen 3's
+ * pipes allow 0.0625 for a separate multiply and add (a loop of 8 vmulps and 8 vaddps runs in 4.1
+ * cycles on the EPYC 7443, with the block's six loads too); the rest is the calls' entry and exit, the
+ * decode (~0.3 cycles a weight, once for all rows) and x's transpose. Blocks of 8 or 32 rows, register
+ * blocks of 1 x 8 and 1 x 12 (x folded into the multiplies), other unrolls and all of a block's
+ * rounds decoded first (the sums kept in registers across rounds) measured no better or worse. */
+
+constexpr int kMb = 16;   /* output rows a block */
+
+/* Round u0 / 32 of a row of UK blocks (`codes` / `scl` the row's code bytes and e8m0 bytes): its groups,
+ * a partial one padded as add_tail pads it (into `pad`, 8 * 17 + 32 bytes, and `pad_sc`, 8), groups past
+ * the round repeating group 0 (decoded, never added). Returns the round's groups. */
+template <bool kGgml>
+HX_INLINE int round_groups(const uint8_t* codes, const uint8_t* scl, int u0, int UK, const uint8_t* (&gc)[4],
+                           const uint8_t* (&gs)[4], uint8_t* pad, uint8_t* pad_sc) {
+    constexpr size_t BS = kGgml ? 17 : 16, SS = kGgml ? 17 : 1;
+    const int nb = UK - u0 < 32 ? UK - u0 : 32, ng = (nb + 7) / 8;
+    for (int g = 0; g < ng; ++g) {
+        const size_t ub = (size_t)u0 + 8 * g;
+        const int live = nb - 8 * g < 8 ? nb - 8 * g : 8;
+        gc[g] = codes + ub * BS;
+        gs[g] = scl + ub * SS;
+        if (live < 8) {   /* the round's last group: zero codes and e = 127 after the row's last block */
+            std::memset(pad, 0, 8 * 17 + 32);
+            std::memset(pad_sc, kFastHi, 8);
+            if (kGgml) {
+                std::memcpy(pad, scl + ub * 17, (size_t)live * 17);
+                for (int i = live; i < 8; ++i) pad[i * 17] = kFastHi;
+                gc[g] = pad + 1;
+                gs[g] = pad;
+            } else {
+                std::memcpy(pad, codes + ub * 16, (size_t)live * 16);
+                std::memcpy(pad_sc, scl + ub, (size_t)live);
+                gc[g] = pad;
+                gs[g] = pad_sc;
+            }
+        }
+    }
+    for (int g = ng; g < 4; ++g) { gc[g] = gc[0]; gs[g] = gs[0]; }
+    return ng;
+}
+
+/* kv_pair16's weights of groups A and B widened (exact) and halved (exact: 2w >= 2^-14 or a zero)
+ * straight to f32, w = kv * 2^(e - 128): value v of A's lanes at wa + v * 8, of B's at wb + v * 8.
+ * The fp16 of a value's 16 lanes never goes through memory: its low half is A's eight, its high
+ * half B's, as kv_pair16 stores them. */
+template <bool kGgml>
+HX_INLINE void kv_pair_f32(const uint8_t* ca, const uint8_t* cb, __m256i s8, float* wa, float* wb) {
+    const __m256i lut = _mm256_setr_epi8(-128, 0x3C, 0x40, 0x42, 0x44, 0x46, 0x48, 0x4A,
+                                         -128, -68, -64, -62, -60, -58, -56, -54,   /* as kv_pair16 */
+                                         -128, 0x3C, 0x40, 0x42, 0x44, 0x46, 0x48, 0x4A,
+                                         -128, -68, -64, -62, -60, -58, -56, -54);
+    const __m256i lo4 = _mm256_set1_epi8(15), zero = _mm256_setzero_si256();
+    const __m256 half = _mm256_set1_ps(0.5f);
+    transpose_pair<kGgml>(ca, cb, [&](int j, __m256i r) __attribute__((always_inline)) {
+        const __m256i lo = _mm256_adds_epi8(_mm256_shuffle_epi8(lut, _mm256_and_si256(r, lo4)), s8);
+        const __m256i hi = _mm256_adds_epi8(_mm256_shuffle_epi8(lut, _mm256_and_si256(_mm256_srli_epi16(r, 4), lo4)), s8);
+        auto put = [&](int v, __m256i h) __attribute__((always_inline)) {   /* one value's 16 lanes */
+            _mm256_store_ps(wa + v * 8, _mm256_mul_ps(_mm256_cvtph_ps(_mm256_castsi256_si128(h)), half));
+            _mm256_store_ps(wb + v * 8, _mm256_mul_ps(_mm256_cvtph_ps(_mm256_extracti128_si256(h, 1)), half));
+        };
+        put(value_of<kGgml>(2 * j, 0), _mm256_unpacklo_epi8(zero, lo));
+        put(value_of<kGgml>(2 * j + 1, 0), _mm256_unpackhi_epi8(zero, lo));
+        put(value_of<kGgml>(2 * j, 1), _mm256_unpacklo_epi8(zero, hi));
+        put(value_of<kGgml>(2 * j + 1, 1), _mm256_unpackhi_epi8(zero, hi));
+    });
+}
+
+/* A round's first ng groups as f32 weights w = kv * d: w[g * gw + v * 8 + j] for value v of block
+ * 8g + kLane[j], the lanes of x_lanes (w has room for four groups: a pair's second group may be
+ * written past ng, never read). */
+template <bool kGgml>
+HX_INLINE void decode_round(const uint8_t* const (&gc)[4], const uint8_t* const (&gs)[4], int ng, float* w, size_t gw) {
+    const __m256i e01 = e_pair<kGgml>(gs[0], gs[1]), e23 = ng > 2 ? e_pair<kGgml>(gs[2], gs[3]) : e01;
+    if (fast_round(e01, e23)) {
+        kv_pair_f32<kGgml>(gc[0], gc[1], s8_of(e01), w, w + gw);
+        if (ng > 2) kv_pair_f32<kGgml>(gc[2], gc[3], s8_of(e23), w + 2 * gw, w + 3 * gw);
+        return;
+    }
+    alignas(32) int8_t kv[1024];
+    kv_pair<kGgml>(gc[0], gc[1], kv);
+    if (ng > 2) kv_pair<kGgml>(gc[2], gc[3], kv + 512);
+    for (int g = 0; g < ng; ++g) {
+        const __m256 d = scales8<kGgml>(gs[g]);
+        for (int v = 0; v < 32; ++v) {
+            const __m128i b = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(kv + kv_off<kGgml>(v) + (g >> 1) * 512 + (g & 1) * 16));
+            _mm256_store_ps(w + (size_t)g * gw + (size_t)v * 8, _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(b)), d));
+        }
+    }
+}
+
+/* One group of one round: a[n][i] += x_i * w_n over its 32 values, for NN output rows (w: a value 8
+ * floats on, the next row 256) and NI <= 4 token rows (x: the next row 8 floats on, a value 32). The
+ * sums start at +0 in the first round (kFirst) and otherwise come from `acc` (the next token row 8
+ * floats on, the next output row `as`); they return there. `pf`: the next call's sums, fetched into
+ * L1 while this call runs (they were last stored a round ago). */
+template <int NN, int NI, bool kFirst>
+HX_INLINE void mac_rows(float* acc, size_t as, const float* w, const float* x, const float* pf) {
+    __m256 a[NN][NI];
+    if (!kFirst && pf)
+#pragma GCC unroll 8
+        for (int n = 0; n < NN; ++n) {
+            _mm_prefetch(reinterpret_cast<const char*>(pf + (size_t)n * as), _MM_HINT_T0);
+            _mm_prefetch(reinterpret_cast<const char*>(pf + (size_t)n * as + 16), _MM_HINT_T0);
+        }
+#pragma GCC unroll 8
+    for (int n = 0; n < NN; ++n)
+#pragma GCC unroll 8
+        for (int i = 0; i < NI; ++i)
+            a[n][i] = kFirst ? _mm256_setzero_ps() : _mm256_load_ps(acc + (size_t)n * as + (size_t)i * 8);
+#pragma GCC unroll 4
+    for (int v = 0; v < 32; ++v, w += 8, x += 32) {
+        __m256 wv[NN];
+#pragma GCC unroll 8
+        for (int n = 0; n < NN; ++n) wv[n] = _mm256_load_ps(w + (size_t)n * 256);
+#pragma GCC unroll 8
+        for (int i = 0; i < NI; ++i) {
+            const __m256 xv = _mm256_load_ps(x + (size_t)i * 8);
+#pragma GCC unroll 8
+            for (int n = 0; n < NN; ++n) a[n][i] = _mm256_add_ps(a[n][i], _mm256_mul_ps(xv, wv[n]));
+        }
+    }
+#pragma GCC unroll 8
+    for (int n = 0; n < NN; ++n)
+#pragma GCC unroll 8
+        for (int i = 0; i < NI; ++i) _mm256_store_ps(acc + (size_t)n * as + (size_t)i * 8, a[n][i]);
+}
+
+/* A group of a round for every token row and the block's mb output rows: four token rows at a time
+ * against two output rows, the last one to three against two or four. ag: the group's sums (output
+ * row k, token row i at (k * rows + i) * 8); wg: its weights (row k at k * 256); xg: its x (token rows
+ * 4b .. 4b + 3 at b * 1024). kFirst: the round that starts the sums. */
+template <bool kFirst>
+HX_INLINE void mac_group(float* ag, const float* wg, const float* xg, int rows, int mb) {
+    const size_t as = (size_t)rows * 8;
+    int i = 0;
+    for (; i + 4 <= rows; i += 4)
+        for (int k = 0; k < mb; k += 2) {
+            float* const a = ag + (size_t)k * as + (size_t)i * 8;
+            const float* const next = k + 2 < mb ? a + 2 * as : ag + (size_t)(i + 4) * 8;
+            mac_rows<2, 4, kFirst>(a, as, wg + (size_t)k * 256, xg + (size_t)i * 256, next);
+        }
+    switch (rows - i) {
+        case 3:
+            for (int k = 0; k < mb; k += 2)
+                mac_rows<2, 3, kFirst>(ag + (size_t)k * as + (size_t)i * 8, as, wg + (size_t)k * 256, xg + (size_t)i * 256, nullptr);
+            break;
+        case 2:
+            for (int k = 0; k < mb; k += 4)
+                mac_rows<4, 2, kFirst>(ag + (size_t)k * as + (size_t)i * 8, as, wg + (size_t)k * 256, xg + (size_t)i * 256, nullptr);
+            break;
+        case 1:
+            for (int k = 0; k < mb; k += 4)
+                mac_rows<4, 1, kFirst>(ag + (size_t)k * as + (size_t)i * 8, as, wg + (size_t)k * 256, xg + (size_t)i * 256, nullptr);
+            break;
+        default: break;
+    }
+}
+
+/* The many-row kernel's buffers, one set a thread for every layout (x for 32 rows of gate_up is
+ * 640 KiB). They only grow: a vector that shrank would zero what it grows back into, and a pool
+ * thread alternates gate_up and down tiles of jobs of any size. */
+struct alignas(32) V8 { float f[8]; };
+struct ManyBufs { std::vector<V8> x, w, a; };
+inline ManyBufs& many_bufs() {
+    thread_local ManyBufs b;
+    return b;
+}
+inline float* at_least(std::vector<V8>& v, size_t n) {
+    if (v.size() < n) v.resize(n);
+    return v.data()->f;
+}
+
+/* L: 0 block_mxfp4, 1 planes, 2 packed; rows <= kGemvRows. */
+template <int L>
+void gemv_avx2_many_t(const Mx& w, const uint16_t* const* x, uint16_t* const* y, int rows, int n0, int n1) {
+    constexpr bool kGgml = L == 0;
+    const int UK = w.K / 32, R = (UK + 31) / 32, RF = UK / 32, t = UK % 32;
+    const size_t PB = (size_t)(8 * RF + (t + 3) / 4);   /* packed: 2-bit code bytes a row */
+    /* x[(r * 4 + g) * gx + (i / 4) * 1024 + v * 32 + (i % 4) * 8 + j]: round r, group g, token row i,
+     * value v, lane j */
+    const size_t gx = (size_t)(rows + 3) / 4 * 1024;
+    ManyBufs& bufs = many_bufs();
+    float* const xt = at_least(bufs.x, (size_t)R * 4 * gx / 8);
+    float* const wb = at_least(bufs.w, (size_t)kMb * 128);   /* wb[(g * kMb + k) * 256 + v * 8 + j]: group g, output row k */
+    float* const ab = at_least(bufs.a, (size_t)4 * kMb * (size_t)rows);
+    for (int i = 0; i < rows; ++i) x_lanes_t<false>(x[i], UK, xt + (size_t)(i / 4) * 1024 + (size_t)(i % 4) * 8, 32, gx, 4 * gx);
+    alignas(32) uint8_t pad[8 * 17 + 32], pad_sc[8], sb[32];
+    PkRounds cur[kMb];
+    for (int nb = n0; nb < n1; nb += kMb) {
+        const int mb = n1 - nb < kMb ? n1 - nb : kMb;   /* a multiple of 8 */
+        /* ab[((g * mb + k) * rows + i) * 8 + j]: the sums of group g, output row nb + k, token row i; round 0
+         * starts them, so only groups past a single partial round's are zeroed */
+        if (L == 2)
+            for (int k = 0; k < mb; ++k) cur[k] = pk_rounds_from(w, (uint32_t)(nb + k) * (uint32_t)R);
+        for (int r = 0; r < R; ++r) {
+            int ng = 4;
+            for (int k = 0; k < mb; ++k) {
+                const int n = nb + k;
+                const uint8_t* gc[4] = {};   /* round_groups sets all four (a round has a block) */
+                const uint8_t* gs[4] = {};
+                if (L == 0) {
+                    const uint8_t* const codes = w.blocks + (size_t)n * UK * 17 + 1;
+                    ng = round_groups<true>(codes, codes - 1, 32 * r, UK, gc, gs, pad, pad_sc);
+                } else if (L == 1) {
+                    ng = round_groups<false>(w.codes + (size_t)n * (size_t)(w.K / 2), w.scales + (size_t)n * UK, 32 * r, UK,
+                                             gc, gs, pad, pad_sc);
+                } else {
+                    const int tb = r < RF ? 32 : t;
+                    const uint8_t* const s = pk_round(cur[k], (uint32_t)n * (uint32_t)R + (uint32_t)r,
+                                                      w.pk + (size_t)n * PB + (size_t)8 * r, tb, w.e0, sb);
+                    ng = round_groups<false>(w.codes + (size_t)n * (size_t)(w.K / 2) + (size_t)r * 32 * 16, s, 0, tb,
+                                             gc, gs, pad, pad_sc);
+                }
+                decode_round<kGgml>(gc, gs, ng, wb + (size_t)k * 256, (size_t)kMb * 256);
+            }
+            for (int g = 0; g < ng; ++g) {
+                float* const ag = ab + (size_t)g * mb * rows * 8;
+                if (r == 0) mac_group<true>(ag, wb + (size_t)g * kMb * 256, xt + (size_t)g * gx, rows, mb);
+                else mac_group<false>(ag, wb + (size_t)g * kMb * 256, xt + (size_t)(r * 4 + g) * gx, rows, mb);
+            }
+            if (r == 0 && ng < 4) std::memset(ab + (size_t)ng * mb * rows * 8, 0, (size_t)(4 - ng) * mb * rows * 32);
+        }
+        for (int k = 0; k < mb; ++k)
+            for (int i = 0; i < rows; ++i) {
+                __m256 a[4];
+                for (int g = 0; g < 4; ++g) a[g] = _mm256_load_ps(ab + (((size_t)g * mb + k) * rows + i) * 8);
+                y[i][nb + k] = bf16_rne_nan(wave_sum4(a));
+            }
     }
 }
 
@@ -823,14 +1082,28 @@ void gemv_avx2(const Mx& w, const uint16_t* x, uint16_t* y, int n0, int n1) {
     else gemv_avx2_t<false>(w, x, y, n0, n1);
 }
 
-void gemv_avx2_rows(const Mx& w, const uint16_t* const* x, uint16_t* const* y, int rows, int n0, int n1) {
-    for (int i = 0; i < rows; i += kGemvRows) {
-        const int m = rows - i < kGemvRows ? rows - i : kGemvRows;
+void gemv_avx2_few(const Mx& w, const uint16_t* const* x, uint16_t* const* y, int rows, int n0, int n1) {
+    for (int i = 0; i < rows; i += kFewRows) {
+        const int m = rows - i < kFewRows ? rows - i : kFewRows;
         if (m == 1) gemv_avx2(w, x[i], y[i], n0, n1);
         else if (w.blocks) gemv_avx2_rows_t<true>(w, x + i, y + i, m, n0, n1);
         else if (w.pk) gemv_avx2_rows_pk(w, x + i, y + i, m, n0, n1);
         else gemv_avx2_rows_t<false>(w, x + i, y + i, m, n0, n1);
     }
+}
+
+void gemv_avx2_many(const Mx& w, const uint16_t* const* x, uint16_t* const* y, int rows, int n0, int n1) {
+    for (int i = 0; i < rows; i += kGemvRows) {
+        const int m = rows - i < kGemvRows ? rows - i : kGemvRows;
+        if (w.blocks) gemv_avx2_many_t<0>(w, x + i, y + i, m, n0, n1);
+        else if (w.pk) gemv_avx2_many_t<2>(w, x + i, y + i, m, n0, n1);
+        else gemv_avx2_many_t<1>(w, x + i, y + i, m, n0, n1);
+    }
+}
+
+void gemv_avx2_rows(const Mx& w, const uint16_t* const* x, uint16_t* const* y, int rows, int n0, int n1) {
+    if (rows <= kFewRows) gemv_avx2_few(w, x, y, rows, n0, n1);
+    else gemv_avx2_many(w, x, y, rows, n0, n1);
 }
 
 /* ---- the packed form ---- */

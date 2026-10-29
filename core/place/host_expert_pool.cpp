@@ -20,6 +20,9 @@
 
 namespace rad {
 
+static_assert(HostExpertPool::kMaxRowsCap == ds41hx::kGemvRows, "a job's rows are one many-row kernel call");
+static_assert(HostExpertPool::kMaxRowsDefault == ds41hx::kFewRows, "jobs of up to four rows can take the few-row kernel");
+
 namespace {
 
 constexpr const char* kEnvThreads = "RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS";
@@ -29,6 +32,16 @@ constexpr const char* kEnvGbps    = "RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_GBP
 constexpr const char* kEnvLink    = "RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_LINK_GBPS";
 constexpr const char* kEnvSpin    = "RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SPIN_US";
 constexpr const char* kEnvNice    = "RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_NICE";
+constexpr const char* kEnvMaxRows = "RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MAX_ROWS";
+
+/* MAX_ROWS: 1 .. cap, or 0 for a value that is not one (unset: the default). */
+int parse_max_rows(int dflt, int cap) {
+    const char* s = std::getenv(kEnvMaxRows);
+    if (!s || !*s) return dflt;
+    char* e = nullptr;
+    const long v = std::strtol(s, &e, 10);
+    return e != s && !*e && v >= 1 && v <= cap ? (int)v : 0;
+}
 
 /* "4-23" or "4,5,6" or "0-5,12-17"; empty on a malformed list. */
 std::vector<int> parse_cpus(const char* s) {
@@ -66,6 +79,14 @@ int     g_nice = 0;     /* workers' nice value: positive yields the cores to the
 
 }  /* namespace */
 
+int HostExpertPool::max_rows() {
+    static const int m = [] {
+        const int v = parse_max_rows(kMaxRowsDefault, kMaxRowsCap);
+        return v > 0 ? v : kMaxRowsDefault;
+    }();
+    return m;
+}
+
 HostExpertPool* HostExpertPool::get() {
     static HostExpertPool* pool = [] () -> HostExpertPool* {
         const char* t = std::getenv(kEnvThreads);
@@ -84,6 +105,11 @@ HostExpertPool* HostExpertPool::get() {
         if (!path || !*path) {
             RAD_ERR("%s is set without %s, the card's silu table; host experts off", kEnvThreads,
                     kEnvSilu);
+            return nullptr;
+        }
+        if (parse_max_rows(kMaxRowsDefault, kMaxRowsCap) <= 0) {
+            RAD_ERR("%s=%s: token rows a job, 1 .. %d; host experts off", kEnvMaxRows,
+                    std::getenv(kEnvMaxRows), kMaxRowsCap);
             return nullptr;
         }
         auto* p = new HostExpertPool();
@@ -116,6 +142,9 @@ HostExpertPool* HostExpertPool::get() {
                  "(silu table %s; scheduling at %.0f GB/s against %.0f GB/s a copy link)",
                  threads, cpus.empty() ? "" : (" pinned to " + std::string(cl)).c_str(), path,
                  p->cpu_bpns_, p->link_bpns_);
+        if (max_rows() != kMaxRowsDefault)
+            RAD_INFO("host experts: jobs of up to %d token rows of one expert (%s)%s", max_rows(), kEnvMaxRows,
+                     max_rows() > kMaxRowsDefault ? "; four or more through the many-row kernel" : "");
         return p;
     }();
     return pool;
@@ -124,7 +153,17 @@ HostExpertPool* HostExpertPool::get() {
 int HostExpertPool::start(int threads, const std::vector<int>& cpus) {
     slots_.reset(new (std::nothrow) Slot[kSlots]);
     if (!slots_) return RAD_E_NOMEM;
-    for (int i = 0; i < kSlots; ++i) slots_[i].claim.store(kDone, std::memory_order_relaxed);
+    /* Each slot's gate_up and act rows, 64-byte aligned (a slot's rows take max_rows() * 13824 bytes:
+     * 7 MB in all at four rows, 57 MB at 32). */
+    const size_t per = (size_t)max_rows() * 3 * kFf;
+    void* rb = nullptr;
+    if (posix_memalign(&rb, 64, (size_t)kSlots * per * sizeof(uint16_t)) != 0) return RAD_E_NOMEM;
+    rows_ = std::unique_ptr<uint16_t, void (*)(void*)>(static_cast<uint16_t*>(rb), std::free);
+    for (int i = 0; i < kSlots; ++i) {
+        slots_[i].claim.store(kDone, std::memory_order_relaxed);
+        slots_[i].gate_up = rows_.get() + (size_t)i * per;
+        slots_[i].act = slots_[i].gate_up + (size_t)max_rows() * 2 * kFf;
+    }
     try {
         for (int i = 0; i < threads; ++i)
             workers_.emplace_back(&HostExpertPool::worker, this, i,
@@ -158,7 +197,7 @@ int HostExpertPool::submit(const Job* jobs, int n, Ticket* t) {
     for (int j = 0; j < n; ++j) {
         const Job& b = jobs[j];
         if (!b.gu || !b.dn || !b.x || !b.y || (!b.gu_scales) != (!b.dn_scales) || b.more < 0 ||
-            b.more >= kMaxRows)
+            b.more >= max_rows())
             return RAD_E_INVAL;
         for (int r = 0; r < b.more; ++r)
             if (!b.xs[r] || !b.ys[r]) return RAD_E_INVAL;
@@ -273,10 +312,11 @@ void HostExpertPool::tile(Slot& s, uint32_t gen, int k) {
         if (s.job.packed) packed_or_die(s.job.gu, s.job.gu_bytes, 2 * kFf, kEmbd, &m);
         else if (planes) { m.codes = s.job.gu; m.scales = s.job.gu_scales; }
         else m.blocks = s.job.gu;
-        const uint16_t* xs[kMaxRows];
-        uint16_t* ys[kMaxRows];
-        for (int r = 0; r <= s.job.more; ++r) { xs[r] = r ? s.job.xs[r - 1] : s.job.x; ys[r] = s.gate_up[r]; }
-        ds41hx::gemv_avx2_rows(m, xs, ys, 1 + s.job.more, k * kTile, (k + 1) * kTile);
+        const uint16_t* xs[kMaxRowsCap];
+        uint16_t* ys[kMaxRowsCap];
+        for (int r = 0; r <= s.job.more; ++r) { xs[r] = r ? s.job.xs[r - 1] : s.job.x; ys[r] = s.gate_up + (size_t)r * 2 * kFf; }
+        (1 + s.job.more >= many_from() ? ds41hx::gemv_avx2_many : ds41hx::gemv_avx2_few)(m, xs, ys, 1 + s.job.more, k * kTile,
+                                                                                         (k + 1) * kTile);
         if (s.gu_left.fetch_sub(1, std::memory_order_acq_rel) == 1) {
             /* The job's down tiles wait for this, so it runs eight values a step (12 -> ~2 us a
              * row); RADIANCE_EXPERIMENTAL_DS41_SWIGLU_SCALAR=1 keeps the scalar loop (an A/B switch). */
@@ -285,7 +325,8 @@ void HostExpertPool::tile(Slot& s, uint32_t gen, int k) {
                 return v && !std::strcmp(v, "1");
             }();
             for (int r = 0; r <= s.job.more; ++r)
-                (scalar ? ds41hx::swiglu : ds41hx::swiglu_avx2)(silu_.data(), s.gate_up[r], s.act[r], kFf, limit_);
+                (scalar ? ds41hx::swiglu : ds41hx::swiglu_avx2)(silu_.data(), s.gate_up + (size_t)r * 2 * kFf,
+                                                                 s.act + (size_t)r * kFf, kFf, limit_);
             s.open.store(gen, std::memory_order_release);
             wake();   /* workers that slept through the gate_up tail take down tiles too */
         }
@@ -297,10 +338,11 @@ void HostExpertPool::tile(Slot& s, uint32_t gen, int k) {
     if (s.job.packed) packed_or_die(s.job.dn, s.job.dn_bytes, kEmbd, kFf, &m);
     else if (planes) { m.codes = s.job.dn; m.scales = s.job.dn_scales; }
     else m.blocks = s.job.dn;
-    const uint16_t* xs[kMaxRows];
-    uint16_t* ys[kMaxRows];
-    for (int r = 0; r <= s.job.more; ++r) { xs[r] = s.act[r]; ys[r] = r ? s.job.ys[r - 1] : s.job.y; }
-    ds41hx::gemv_avx2_rows(m, xs, ys, 1 + s.job.more, d * kTile, (d + 1) * kTile);
+    const uint16_t* xs[kMaxRowsCap];
+    uint16_t* ys[kMaxRowsCap];
+    for (int r = 0; r <= s.job.more; ++r) { xs[r] = s.act + (size_t)r * kFf; ys[r] = r ? s.job.ys[r - 1] : s.job.y; }
+    (1 + s.job.more >= many_from() ? ds41hx::gemv_avx2_many : ds41hx::gemv_avx2_few)(m, xs, ys, 1 + s.job.more, d * kTile,
+                                                                                     (d + 1) * kTile);
     if (s.dn_left.fetch_sub(1, std::memory_order_acq_rel) != 1) return;
     /* The job's last tile: nothing reads the slot after this. */
     Ticket* t = s.ticket;

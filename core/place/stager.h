@@ -278,6 +278,9 @@ public:
     struct HostStats {
         uint64_t layers = 0, units = 0, rows = 0;
         uint64_t miss_units = 0, miss_rows = 0, miss_read_ns = 0;   /* misses computed from planes */
+        /* Pool jobs that run the many-row kernel (HostExpertPool::many_from: four or more rows of
+         * one expert with ..._HOST_EXPERTS_MAX_ROWS above 4), and their rows. */
+        uint64_t many_jobs = 0, many_rows = 0;
         /* The next-layer predictor (router_predictor.h) against one-token layers: predictions on
          * time, the layers' misses, the misses predicted, the file-tier experts predicted, and of
          * those the ones the layer selected. */

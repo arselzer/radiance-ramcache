@@ -101,10 +101,18 @@ void gemv_ref(const Mx& w, const uint16_t* x, uint16_t* y, int n0, int n1);
 /* The same bits, AVX2: eight rows at once, one row a vector lane. n0 and n1 multiples of 8.
  * Every layout, the packed one included. */
 void gemv_avx2(const Mx& w, const uint16_t* x, uint16_t* y, int n0, int n1);
-/* gemv_avx2 for `rows` token rows of one matrix, x[r] -> y[r], each with gemv_avx2's bits: each
- * round of codes is decoded once for up to kGemvRows of them instead of once a row. */
-constexpr int kGemvRows = 4;
+/* gemv_avx2 for `rows` token rows of one matrix, x[r] -> y[r], each with gemv_avx2's bits: up to
+ * kFewRows rows through gemv_avx2_few, more through gemv_avx2_many. */
 void gemv_avx2_rows(const Mx& w, const uint16_t* const* x, uint16_t* const* y, int rows, int n0, int n1);
+/* Each round of codes decoded once for up to kFewRows rows (more go in calls of kFewRows), and each
+ * row's sums then run gemv_avx2's own round code. */
+constexpr int kFewRows = 4;
+void gemv_avx2_few(const Mx& w, const uint16_t* const* x, uint16_t* const* y, int rows, int n0, int n1);
+/* Up to kGemvRows rows at once (more go in calls of kGemvRows), for a prefill pass's many rows of one
+ * expert: the output rows in blocks of 16, each round of each of them decoded once into f32 weights,
+ * the token rows' sums in register blocks of two output rows by four token rows. */
+constexpr int kGemvRows = 32;
+void gemv_avx2_many(const Mx& w, const uint16_t* const* x, uint16_t* const* y, int rows, int n0, int n1);
 
 /* swiglu_clamped over one row: gu is [gate n | up n], y is n. `silu` has 65536 entries. */
 void swiglu(const float* silu, const uint16_t* gu, uint16_t* y, int n, float limit);

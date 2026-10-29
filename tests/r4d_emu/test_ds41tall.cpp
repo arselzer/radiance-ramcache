@@ -27,6 +27,7 @@
 #include "r4d_ds41_tall.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -132,14 +133,15 @@ int row_of(const Routing& r, int tok, int k) {
     return -1;
 }
 
-/* An expert: gate_up [2 ff, embd] over token rows of embd, down [embd, ff] over sorted rows of ff. */
+/* An expert: gate_up [2 ff, embd] over token rows of embd, down [embd, ff] over sorted rows of ff;
+ * `projs` the projections launched (1 the gate_up, 2 the down). */
 struct Shape {
     const char* name;
-    int ff, embd;
+    int ff, embd, projs;
 };
 
-/* T tokens picking from a pool of P of the 384 experts; both projections at the tall height and as
- * passes of at most 16 tokens. Returns the number of differing (token, slot) rows. */
+/* T tokens picking from a pool of P of the 384 experts; the shape's projections at the tall height
+ * and as passes of at most 16 tokens. Returns the number of differing (token, slot) rows. */
 int check(const Shape& sh, int T, int P, uint32_t seed, int* rows_checked) {
     std::mt19937_64 rng(seed);
     std::vector<int> pool;
@@ -189,6 +191,7 @@ int check(const Shape& sh, int T, int P, uint32_t seed, int* rows_checked) {
 
     int bad = 0;
     for (int proj = 0; proj < 2; ++proj) {
+        if (!((sh.projs >> proj) & 1)) continue;
         const bool g = proj == 0;
         const int N = g ? 2 * sh.ff : sh.embd, K = g ? sh.embd : sh.ff;
         const auto& table = g ? tgu : tdn;
@@ -331,6 +334,7 @@ int norm_heights(NormCase& c, int reach, int* above) {
 }
 
 int norms(int* above_out) {
+    const auto t0 = std::chrono::steady_clock::now();
     const int reach = r4d_ds41_exact_tall() ? kR4dDs41TallRows : 32;
     const int n = 5120, hc = 4, rot = 64, P = 512;
     std::mt19937_64 rng(77);
@@ -423,9 +427,10 @@ int norms(int* above_out) {
         }
     }
     std::printf("%s: norms at pass heights 1..48 against rows alone and launches of 16, every row's bytes "
-                "kept up to %d rows (%s); %d rows differed above it\n", fails ? "FAIL" : "PASS", reach,
+                "kept up to %d rows (%s); %d rows differed above it (%.1f s)\n", fails ? "FAIL" : "PASS", reach,
                 r4d_ds41_exact_tall() ? "RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=1: libr4d's reach"
-                                      : "no switch: the width r4d_act_threads keeps to 32 rows", above);
+                                      : "no switch: the width r4d_act_threads keeps to 32 rows", above,
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     *above_out = above;
     return fails;
 }
@@ -433,14 +438,16 @@ int norms(int* above_out) {
 }  // namespace
 
 int main() {
-    /* ds41's experts are ff 2304, embd 5120. Each keeps one of the two K: the gate_up's 5120 (one
-     * activation row staged at a time) or the down's 2304 (three), the other side cut short, which
-     * changes no output's sum (each is its own weight row's); and a short K (eight rows staged) with
-     * the gate_up wide enough for two weight rows a wave. */
+    /* ds41's experts are ff 2304, embd 5120. Each shape keeps one of the two K and launches that
+     * projection only: the gate_up's 5120 (one activation row staged at a time) or the down's 2304
+     * (three), the other side cut short, which changes no output's sum (each is its own weight
+     * row's), and whose projection would have the other's wide N (an emulated wave sum an output);
+     * and a short K (eight rows staged), both projections, the gate_up wide enough for two weight
+     * rows a wave. */
     const Shape shapes[] = {
-        { "gate_up K 5120 (one row staged at a time)", 32, 5120 },
-        { "down K 2304 (three rows staged)", 2304, 64 },
-        { "K 512 (eight rows staged), two weight rows a wave", 512, 512 },
+        { "gate_up K 5120 (one row staged at a time)", 32, 5120, 1 },
+        { "down K 2304 (three rows staged)", 2304, 64, 2 },
+        { "K 512 (eight rows staged), two weight rows a wave", 512, 512, 3 },
     };
     /* Heights by shape: the gate_up's K takes the most (one row staged at a time); the others one
      * height over 16 and the CPU path's largest. */
@@ -450,7 +457,11 @@ int main() {
         for (int T : heights[si])
             for (int P : { 9, 384 }) {
                 const Shape& sh = shapes[si];
+                const auto t0 = std::chrono::steady_clock::now();
+                const int r0 = rows;
                 const int bad = check(sh, T, P, 1000u * (uint32_t)T + (uint32_t)P + 7u * (uint32_t)si, &rows);
+                std::printf("  %s T=%d P=%d: %d rows, %.1f s\n", sh.name, T, P, rows - r0,
+                            std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
                 ++cases;
                 if (bad) {
                     std::printf("FAIL %s T=%d P=%d: %d differing rows\n", sh.name, T, P, bad);

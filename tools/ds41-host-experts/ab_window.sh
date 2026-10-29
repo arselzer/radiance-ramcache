@@ -410,7 +410,7 @@ arm() {   # name, then env assignments for the server; CACHE_MIB the RAM cache (
   grep -E 'route trace' "$OUT/$name.server.log" | tail -6 | tee -a "$OUT/window.log"   # Rt: per rank, and the files
   grep -E 'consumer skip: [0-9]+ (prefill|cut) passes|rank 0: consumer skip' "$OUT/$name.server.log" | tee -a "$OUT/window.log"   # Cs: what the cut ran
   grep -E 'prefill hash: seq [0-9]+, [0-9]+ tokens: all ranks' "$OUT/$name.server.log" | tee -a "$OUT/window.log"   # Kh: a digest a prompt
-  grep -E 'DS41_DRAFT_GEMV' "$OUT/$name.server.log" | tail -2 | tee -a "$OUT/window.log"   # Dk/Dkt: calls taken
+  grep -E '^libr4d: RADIANCE_EXPERIMENTAL_DS41_DRAFT_GEMV' "$OUT/$name.server.log" | tail -2 | tee -a "$OUT/window.log"   # Dk/Dkt: calls taken
   grep -E 'end-of-request snapshots: [0-9]+ reserved' "$OUT/$name.server.log" | tail -1 | tee -a "$OUT/window.log"   # Pce/Pcl: stored, hits, store
 }
 
@@ -434,19 +434,40 @@ if [[ "${DEVICE_CHECKS:-1}" == ptime && -x "$HERE/build/ds41_mxfp4_device_check"
     echo "ptime exit $?" >>"$OUT/ptime.log" )
   grep -E 'prefill|exit' "$OUT/ptime.log" | tee -a "$OUT/window.log"
 fi
-if [[ "${DEVICE_CHECKS:-1}" == tall ]]; then
+# The Xt arms' gate (RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL), like Dk's: an Xt arm runs only on the
+# libr4d.so (sha256) the tall checks passed on in this window.
+TALL_OK="" TALL_LIB="" TALL_SUM="" TALL_WHY="no exact-tall device checks in this window (DEVICE_CHECKS=tall with TALL_CHECK and TALL_LIBR4D)"
+if [[ " ${DEVICE_CHECKS:-1} " == *" tall "* ]]; then
   # RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL on card 0: the twin row and the sparse ops at tall heights
   # (`tall`), and every other height-dependent op with the switch (`sweep`) and without (`sweep0`),
   # each row against the same row alone and in launches of 16. TALL_LIBR4D: the plugin the Xt arms
-  # load (default the run home's); TALL_CHECK: a harness built with these modes.
-  TL=${TALL_LIBR4D:-$RHOME/kernels/libr4d.so} TC=${TALL_CHECK:-$HERE/build/ds41_mxfp4_device_check}
-  log "exact-tall device checks on card 0 with $TL ($TC)"
-  for m in tall sweep sweep0; do
-    ( export HIP_VISIBLE_DEVICES=0
-      timeout 900 "$TC" "$TL" $m >"$OUT/devcheck-$m.log" 2>&1
-      echo "$m exit $?" >>"$OUT/devcheck-$m.log" )
-    grep -E '^(PASS|FAIL)|exit|norm rows' "$OUT/devcheck-$m.log" | tail -8 | tee -a "$OUT/window.log"
-  done
+  # load; TALL_CHECK: a harness built with these modes (both must be named: the window runs from a
+  # snapshot directory, so no default exists).
+  TL=${TALL_LIBR4D:-} TC=${TALL_CHECK:-}
+  if [[ ! -x "$TC" || ! -f "$TL" ]]; then
+    TALL_WHY="TALL_CHECK=$TC is not an executable or TALL_LIBR4D=$TL is not a file"
+    log "exact-tall device checks: $TALL_WHY; no Xt arm is measured"
+  else
+    log "exact-tall device checks on card 0 with $TL ($TC)"
+    tall_bad=""
+    for m in tall sweep sweep0; do
+      ( export HIP_VISIBLE_DEVICES=0
+        timeout 900 "$TC" "$TL" $m >"$OUT/devcheck-$m.log" 2>&1
+        echo "$m exit $?" >>"$OUT/devcheck-$m.log" )
+      grep -E '^(PASS|FAIL)|exit|norm rows' "$OUT/devcheck-$m.log" | tail -8 | tee -a "$OUT/window.log"
+      grep -qx "$m exit 0" "$OUT/devcheck-$m.log" || tall_bad+=" $m exited non-zero;"
+      grep -q '^FAIL' "$OUT/devcheck-$m.log" && tall_bad+=" $m printed FAIL;"
+    done
+    grep -q "^PASS: tall passes give 16-token passes' bits" "$OUT/devcheck-tall.log" || tall_bad+=" tall has no PASS line;"
+    grep -q '^PASS: sweep' "$OUT/devcheck-sweep.log" || tall_bad+=" sweep has no PASS line;"
+    if [[ -z "$tall_bad" ]]; then
+      TALL_OK=1 TALL_LIB=$TL TALL_SUM=$(sha256sum "$TL" 2>/dev/null | cut -d' ' -f1)
+      log "exact-tall device checks passed on $TL, sha256 ${TALL_SUM:0:16}: Xt arms on it are measured"
+    else
+      TALL_WHY="the exact-tall device checks did not pass on $TL:$tall_bad"
+      log "$TALL_WHY no Xt arm is measured"
+    fi
+  fi
 fi
 if [[ "${DEVICE_CHECKS:-1}" == 1 && -x "$HERE/build/ds41_mxfp4_device_check" ]]; then
   # The served plugin's swiglu over every (gate, up) pair, mismatches classified, and the
@@ -465,7 +486,7 @@ fi
 # wrong draft GEMV only moves acceptance and speed, never a reply; the card check is its exactness
 # proof. A Dk arm runs only on the libr4d.so (sha256) this check passed on in the window.
 DK_OK="" DK_LIB="" DK_SUM="" DK_WHY="no draft GEMV device check in this window (DEVICE_CHECKS=draft with DRAFT_CHECK_BIN and DRAFT_CHECK_LIB)"
-if [[ "${DEVICE_CHECKS:-1}" == draft ]]; then
+if [[ " ${DEVICE_CHECKS:-1} " == *" draft "* ]]; then
   # RADIANCE_EXPERIMENTAL_DS41_DRAFT_GEMV (Dk) on card 0: the draft bank's grouped GEMMs in every
   # mode against the host experts, experts in pinned host memory and in VRAM, then each mode's
   # time a call at a 5-row query pass. DRAFT_CHECK_BIN is a ds41_mxfp4_device_check with the draft
@@ -932,6 +953,16 @@ for a in $ARMS; do
     fi
   fi
   ARM_DK=$dk ARM_DB=$db
+  if [[ -n "$xt" && -z "$skip" ]]; then
+    IFS=: read -r -a homes <<< "$ARM_HOME"
+    lib=""
+    for h in "${homes[@]}"; do [[ -f "$h/kernels/libr4d.so" ]] && { lib=$h/kernels/libr4d.so; break; }; done
+    if [[ -z "$TALL_OK" ]]; then
+      log "arm $a: Xt refused: $TALL_WHY"; skip=1
+    elif [[ -z "$lib" || "$(sha256sum "$lib" 2>/dev/null | cut -d' ' -f1)" != "$TALL_SUM" ]]; then
+      log "arm $a: Xt refused: its libr4d.so (${lib:-none under $ARM_HOME}) is not the one the tall checks passed on ($TALL_LIB, sha256 ${TALL_SUM:0:16})"; skip=1
+    fi
+  fi
   # RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL: on only in an Xt arm, explicitly off in every other one.
   if [[ -n "$xt" ]]; then env+=(RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=1); else env+=(RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=0); fi
   if [[ -n "$kld" ]]; then

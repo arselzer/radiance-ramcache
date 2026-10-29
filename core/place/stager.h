@@ -284,6 +284,7 @@ public:
         uint64_t linked = 0;          /* cached experts the schedule left on the copy link */
         uint64_t missed = 0;          /* routed experts the RAM cache did not hold */
         uint64_t wait_ns = 0;         /* the issuing thread waiting at gathers for the CPU */
+        uint64_t async_wait_ns = 0;   /* ...for a miss read still on hx_mw_ (async), before that */
         uint64_t verified = 0, differ = 0;   /* ..._POLICY=verify: rows compared with the card's */
         uint64_t moved = 0;           /* a gate_up's operands at new addresses (kept the newest) */
         uint64_t probed = 0;          /* selected units hx_choose borrowed to test for the cache:
@@ -443,6 +444,21 @@ private:
     /* The first pass's CPU work, at its gate_up's operands (start_ep_routed deferred it). */
     int  hx_deferred(int32_t li, RadStream s);
     int  hx_warm();
+    int  hx_submit_misses_now(int rows);
+    /* RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_ASYNC_MISSES=N: in passes of N or more tokens a
+     * layer's missed planes are read and their jobs submitted on hx_mw_ (a thread a rank) while
+     * the issuing thread goes on issuing the layer's card ops; hx_finish and hx_drain wait for it
+     * before the pool's ticket. Measured: prefill gains (the card computes a chunk's resident
+     * experts during the reads, TTFT -23%); decode does not (-1%), hence N=2. */
+    void hx_mw_loop();
+    int  hx_mw_wait();
+    bool hx_async_ = false;
+    int  hx_async_rows_ = 2;
+    std::thread hx_mw_;
+    std::mutex hx_mw_mu_;
+    std::condition_variable hx_mw_cv_;
+    bool hx_mw_req_ = false, hx_mw_stop_ = false;
+    int  hx_mw_rc_ = 0, hx_mw_rows_ = 0;
     int  hx_fetch(int32_t li, RadStream s);
     void hx_choose(int32_t li);
     int  hx_submit();

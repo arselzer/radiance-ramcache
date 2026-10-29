@@ -17,11 +17,21 @@ def run(receipt, url, n, out):
     rows = []
     for b in reqs:
         body = dict(b["request"])
+        if "chat_text" in body:
+            # DeepSeek-V4.1's chat framing around the server's own tokens for the text, as the
+            # held-out prompts are built: BOS, <|User|>, the text, <|Assistant|>, </think>.
+            text = body.pop("chat_text")
+            tq = urllib.request.Request(url + "/tokenize", data=json.dumps({"content": text}).encode(),
+                                        headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(tq, timeout=60) as r:
+                ids = json.load(r)["tokens"]
+            body["prompt"] = [0, 128803] + ids + [128804, 128822]
         if os.environ.get("AB_MAX_TOKENS"):
             body["max_tokens"] = int(os.environ["AB_MAX_TOKENS"])
         t0 = time.time()
-        req = urllib.request.Request(url + "/v1/completions", data=json.dumps(body).encode(),
-                                     headers={"Content-Type": "application/json"})
+        chat = "messages" in body   # a chat request goes through the server's chat template
+        req = urllib.request.Request(url + ("/v1/chat/completions" if chat else "/v1/completions"),
+                                     data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
         try:
             with urllib.request.urlopen(req, timeout=300) as r:
                 resp = json.load(r)
@@ -29,7 +39,8 @@ def run(receipt, url, n, out):
             resp = {"error": repr(e)}
         wall = time.time() - t0
         t = resp.get("timings", {})
-        text = resp.get("choices", [{}])[0].get("text") if "choices" in resp else None
+        choice = resp.get("choices", [{}])[0] if "choices" in resp else None
+        text = None if choice is None else (choice.get("message", {}).get("content") if chat else choice.get("text"))
         rows.append({"name": b["name"], "wall_s": wall, "text": text, "timings": t,
                      "error": resp.get("error")})
         print("%s: %.1f s, decode %.2f tok/s, prefill %.0f ms%s" % (

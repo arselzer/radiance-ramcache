@@ -473,6 +473,14 @@ int FileStager::shutdown_head_cache() {
 }
 
 FileStager::~FileStager() {
+    if (hx_mw_.joinable()) {
+        {
+            std::lock_guard<std::mutex> lk(hx_mw_mu_);
+            hx_mw_stop_ = true;
+        }
+        hx_mw_cv_.notify_all();
+        hx_mw_.join();
+    }
     //Engine normally closes this before Ctx. Partial-init destruction has the same obligation.
     if (shutdown_head_cache() < 0) std::_Exit(88);
     for (int b = 0; b < 2; ++b) {
@@ -1049,6 +1057,16 @@ int FileStager::hx_init_impl(const Program& prog) {
                      hx_miss_rows_);
         /* A second copy of the planes on another drive, read beside the container (plane_mirror.h). */
         RAD_TRY(mover_->mirror_init());
+        if (const char* a = std::getenv("RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_ASYNC_MISSES");
+            a && std::atoi(a) > 0 && !hx_mw_.joinable()) {
+            hx_async_rows_ = std::atoi(a);
+            hx_mw_stop_ = false;
+            hx_mw_ = std::thread(&FileStager::hx_mw_loop, this);
+            hx_async_ = true;
+            if (plan_->rank == 0)
+                RAD_INFO("host experts: passes of %d+ tokens read their misses on a worker while the "
+                         "card's ops are issued", hx_async_rows_);
+        }
         if (const char* w = std::getenv("RADIANCE_EXPERIMENTAL_DS41_CACHE_WARM"); w && !std::strcmp(w, "1"))
             RAD_TRY(hx_warm());
     }
@@ -1308,11 +1326,48 @@ int FileStager::hx_submit() {
  * relays them into the RAM cache. The jobs and the inserts share the buffers (shared_ptr). */
 int FileStager::hx_submit_misses() {
     if (hx_miss_.empty()) return RAD_OK;
+    if (!hx_async_ || pass_tok_ < hx_async_rows_) return hx_submit_misses_now((int)pass_tok_);
+    {
+        std::lock_guard<std::mutex> lk(hx_mw_mu_);
+        hx_mw_req_ = true;
+        hx_mw_rc_ = RAD_OK;
+        hx_mw_rows_ = (int)pass_tok_;
+    }
+    hx_mw_cv_.notify_all();
+    return RAD_OK;
+}
+
+/* The request's result (RAD_OK when there was none), once hx_mw_ is idle. */
+int FileStager::hx_mw_wait() {
+    std::unique_lock<std::mutex> lk(hx_mw_mu_);
+    hx_mw_cv_.wait(lk, [&] { return !hx_mw_req_; });
+    const int rc = hx_mw_rc_;
+    hx_mw_rc_ = RAD_OK;
+    return rc;
+}
+
+void FileStager::hx_mw_loop() {
+    std::unique_lock<std::mutex> lk(hx_mw_mu_);
+    for (;;) {
+        hx_mw_cv_.wait(lk, [&] { return hx_mw_stop_ || hx_mw_req_; });
+        if (!hx_mw_req_) return;   /* stopping, nothing asked */
+        const int rows = hx_mw_rows_;
+        lk.unlock();
+        const int rc = hx_submit_misses_now(rows);
+        lk.lock();
+        hx_mw_rc_ = rc;
+        hx_mw_req_ = false;
+        hx_mw_cv_.notify_all();
+    }
+}
+
+/* Reads the misses' planes (rows: the pass's tokens) and submits their jobs to the pool. */
+int FileStager::hx_submit_misses_now(int rows) {
     std::vector<Mover::HostPlanes*> ptrs;
     for (size_t i = 0; i < hx_miss_.size(); ++i)
         if (i >= hx_miss_ready_.size() || !hx_miss_ready_[i]) ptrs.push_back(hx_miss_[i].get());
     const auto t0 = std::chrono::steady_clock::now();
-    if (!ptrs.empty() && !mover_->read_unit_planes(ptrs.data(), (int)ptrs.size(), (int)pass_tok_)) {
+    if (!ptrs.empty() && !mover_->read_unit_planes(ptrs.data(), (int)ptrs.size(), rows)) {
         RAD_ERR("host experts: reading layer %d's missed units for the CPU failed",
                 layers_[(size_t)hx_li_].layer);
         return RAD_E_IO;
@@ -1591,6 +1646,16 @@ int FileStager::hx_capture(int32_t li, const RadTensor* t, int n_t) {
 /* The layer's gather, before its launch: the pool's rows over the card's in its y_expert, on
  * the gather's stream, or with ..._POLICY=verify the card's rows compared with the pool's. */
 int FileStager::hx_finish(RadStream s, const RadTensor* t, int n_t) {
+    if (hx_async_) {   /* the misses' jobs join the ticket first */
+        const auto w0 = std::chrono::steady_clock::now();
+        const int rc = hx_mw_wait();
+        hx_stats_.async_wait_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                       std::chrono::steady_clock::now() - w0).count();
+        if (rc < 0) {
+            hx_drain();   /* the layer is given up: no second report of rows that reached no gather */
+            return rc;
+        }
+    }
     const auto t0 = std::chrono::steady_clock::now();
     hx_pool_->wait(&hx_ticket_);
     hx_stats_.wait_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1671,6 +1736,7 @@ int FileStager::hx_finish(RadStream s, const RadTensor* t, int n_t) {
 /* Gives back whatever a layer still holds: waits for its jobs, returns its leases and its
  * unsubmitted reservation. */
 void FileStager::hx_drain() {
+    if (hx_async_) (void)hx_mw_wait();
     if (hx_stage_ == 2 && hx_pool_) hx_pool_->wait(&hx_ticket_);
     if (hx_reserved_ && hx_pool_) hx_pool_->unreserve(hx_reserved_);
     hx_reserved_ = 0;

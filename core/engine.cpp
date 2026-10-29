@@ -129,6 +129,9 @@ Engine::~Engine() {
                      (unsigned long long)hx.moved, (unsigned long long)hx.probed,
                      (unsigned long long)hx.miss_units, (unsigned long long)hx.miss_rows,
                      (double)hx.miss_read_ns / 1e6);
+        if (hx.async_wait_ns)
+            RAD_INFO("host experts: %.1f ms waiting at gathers for misses still being read on the worker "
+                     "(not in the gather waits above)", (double)hx.async_wait_ns / 1e6);
         if (hx.pred_layers)
             RAD_INFO("next-layer predictor: on time for %llu of %llu one-token layers; %llu of %llu "
                      "misses predicted (%.1f%%); %llu file-tier experts predicted, %llu of them "

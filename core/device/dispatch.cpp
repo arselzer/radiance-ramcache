@@ -492,6 +492,22 @@ int     tape_record(RadTape t, int i, int* kind, uint32_t* queue) {
 int     tape_set_overlap(RadTape t, int i, bool on) {
     return dev()->tape_set_overlap ? dev()->tape_set_overlap(t, i, on ? 1 : 0) : RAD_E_UNSUPPORTED;
 }
+bool    live_supported() { return dev()->live_pos && dev()->live_open && dev()->live_close; }
+int     live_pos(RadStream s, uint32_t* queue, uint64_t* wr, uint64_t* last_tag) {
+    return dev()->live_pos ? dev()->live_pos(s, queue, wr, last_tag) : RAD_E_UNSUPPORTED;
+}
+void    live_open(RadStream s, uint64_t tag, uint64_t at, bool permit) {
+    if (dev()->live_open) dev()->live_open(s, tag, at, permit ? 1 : 0);
+}
+void    live_close(uint64_t* first, int32_t* packets, int* flags) {
+    if (dev()->live_close) { dev()->live_close(first, packets, flags); return; }
+    *first = 0;
+    *packets = 0;
+    *flags = 0;
+}
+void    live_stamp(bool on, uint64_t pass, const char* path) {
+    if (dev()->live_stamp) dev()->live_stamp(on ? 1 : 0, pass, path);
+}
 bool    dev_integrated(int device) { return dev()->integrated && dev()->integrated(device) > 0; }
 /* These getters answer "" on failure and restore the error slot, so the next
  * rad_dev_last_error reader does not see an unrelated error. `get` fills a buffer of `n` bytes. */

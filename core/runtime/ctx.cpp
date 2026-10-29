@@ -56,6 +56,8 @@ int Ctx::init(const CtxDesc& d) {
 
     int s = prepare();
     if (s < 0) { shutdown(); return s; }
+    /* RADIANCE_EXPERIMENTAL_DS41_CHAIN_OVERLAP / _TRACE (runtime/live_chain.h); inert when off. */
+    live_.init(rank_, program_);
     return RAD_OK;
 }
 
@@ -1394,13 +1396,14 @@ int Ctx::play_pass(PassTape& t) {
 int Ctx::run_pass(const RadBatch* b) {
     const auto bump = [](std::atomic<int64_t>& c) { c.fetch_add(1, std::memory_order_relaxed); };
     scratch_cur_[0] = scratch_cur_[1] = 0;
-    /* A pass the stager armed for is issued live: see runtime/stager.h. */
-    if (!tape_on_ || staging_) { bump(pc_unkeyed_); arch_step_(this, b); return RAD_OK; }
+    /* A pass the stager armed for is issued live: see runtime/stager.h. Every pass issued live
+     * goes through live_step, where the live chain (runtime/live_chain.h) marks its ends. */
+    if (!tape_on_ || staging_) { bump(pc_unkeyed_); live_step(b); return RAD_OK; }
     const uint64_t key = pass_key(b);
-    if (key == 0) { bump(pc_unkeyed_); arch_step_(this, b); return RAD_OK; }
+    if (key == 0) { bump(pc_unkeyed_); live_step(b); return RAD_OK; }
     if (std::find(tape_refused_.begin(), tape_refused_.end(), key) != tape_refused_.end()) {
         bump(pc_refused_);
-        arch_step_(this, b);
+        live_step(b);
         return RAD_OK;
     }
     PassTape* t = nullptr;
@@ -1443,7 +1446,7 @@ int Ctx::run_pass(const RadBatch* b) {
      * bound crosses its bucket, so they are recorded on first sight. */
     if (b->phase != RAD_PHASE_DECODE && !tape_seen(key)) {
         bump(pc_first_);
-        arch_step_(this, b);
+        live_step(b);
         return RAD_OK;
     }
 

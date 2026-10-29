@@ -829,9 +829,20 @@ int FileStager::start_ep_routed(int32_t li, RadStream s, bool* read) {
     /* The selected units the CPU computes leave want_ and start on the pool before the drive
      * reads below block this thread (host_expert_pool.h). */
     auto t_chosen = t_retired, t_submitted = t_retired, t_posted = t_retired;
+    auto t_miss_posted = t_retired;
+    /* ..._MISS_POST: misses posted to the readers below are joined on every way out of here;
+     * hx_submit_misses_now joins them first on the way that computes them. */
+    const HxMissPostJoin miss_post_join{ this };
     if (hx) {
         hx_choose(li);
         t_chosen = std::chrono::steady_clock::now();
+        t_miss_posted = t_chosen;
+        /* ..._MISS_POST: the misses' reads start now, ahead of the pool's wake in hx_submit and
+         * of the copy path's staging (timed on its own: d_miss_post_ns). */
+        if (hx_miss_post_on_ && hx_li_ == li) {
+            hx_post_misses();
+            t_miss_posted = std::chrono::steady_clock::now();
+        }
         if (hx_li_ == li) RAD_TRY(hx_submit());
         t_submitted = std::chrono::steady_clock::now();
         t_posted = t_submitted;
@@ -850,7 +861,8 @@ int FileStager::start_ep_routed(int32_t li, RadStream s, bool* read) {
         auto ns = [](auto a, auto b) { return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count(); };
         ep_stats_.d_retire_ns += ns(t_counts, t_retired);
         ep_stats_.d_choose_ns += ns(t_retired, t_chosen);
-        ep_stats_.d_submit_ns += ns(t_chosen, t_submitted);
+        ep_stats_.d_miss_post_ns += ns(t_chosen, t_miss_posted);
+        ep_stats_.d_submit_ns += ns(t_miss_posted, t_submitted);
         ep_stats_.d_post_ns += ns(t_submitted, t_posted);
         ep_stats_.d_decide_ns += ns(t_counts, t_stage);
     }
@@ -1357,6 +1369,17 @@ int FileStager::hx_init_impl(const Program& prog) {
                 RAD_INFO("host experts: passes of %d+ tokens read their misses on a worker while the "
                          "card's ops are issued", hx_async_rows_);
         }
+        /* RADIANCE_EXPERIMENTAL_DS41_MISS_POST=1: a one-token pass's misses start on the kept
+         * readers at the choice instead of after hx_submit (its pool wake, 28-32 us a layer) and
+         * the copy path's staging; the same reads, so the same bytes. Units read ahead whole and
+         * the ones the piece readers finish (..._PREFETCH=pieces) are not among them, as in
+         * hx_submit_misses_now (hx_unread_misses). */
+        if (const char* mp = std::getenv("RADIANCE_EXPERIMENTAL_DS41_MISS_POST"); mp && !std::strcmp(mp, "1")) {
+            hx_miss_post_on_ = true;
+            if (plan_->rank == 0)
+                RAD_INFO("host experts: a one-token pass's missed planes start on the kept readers "
+                         "as soon as the layer's choice is made (RADIANCE_EXPERIMENTAL_DS41_MISS_POST)");
+        }
         /* RADIANCE_EXPERIMENTAL_DS41_CACHE_SECOND_CHANCE=N: a cached unit the decode profile calls
          * hot (a share of its layer's selections of at least ..._CACHE_PROTECT_SHARE, default
          * 6 of the sealed profile's 4326) moves to the front up to N times between uses before
@@ -1777,6 +1800,14 @@ int FileStager::hx_early_decide() {
                 "went ahead with aliases for all of them", L.layer, want_.size(), selected);
         return RAD_E_STATE;
     }
+    /* ..._MISS_POST, as in start_ep_routed: the misses' reads start before the pool's wake, and are
+     * joined on every way out of here (hx_submit_misses_now first). */
+    const HxMissPostJoin miss_post_join{ this };
+    auto t_miss_posted = t_chosen;
+    if (hx_miss_post_on_ && hx_li_ == li) {
+        hx_post_misses();
+        t_miss_posted = std::chrono::steady_clock::now();
+    }
     if (hx_li_ == li) RAD_TRY(hx_submit());
     const auto t_submitted = std::chrono::steady_clock::now();
     /* This layer took its read-ahead entries: now the next layer's (predicted from this one). */
@@ -1786,7 +1817,8 @@ int FileStager::hx_early_decide() {
     if (pass_tok_ == 1) {
         ep_stats_.d_retire_ns += ns(t_counts, t_retired);
         ep_stats_.d_choose_ns += ns(t_retired, t_chosen);
-        ep_stats_.d_submit_ns += ns(t_chosen, t_submitted);
+        ep_stats_.d_miss_post_ns += ns(t_chosen, t_miss_posted);
+        ep_stats_.d_submit_ns += ns(t_miss_posted, t_submitted);
         ep_stats_.d_decide_ns += ns(t_counts, t_stage);
     }
     /* Nothing is staged (the card reads only aliases); the misses' drive reads count as the
@@ -1936,21 +1968,48 @@ void FileStager::hx_mw_loop() {
     }
 }
 
-/* Reads the misses' planes (rows: the pass's tokens) and submits their jobs to the pool. */
-int FileStager::hx_submit_misses_now(int rows) {
-    std::vector<Mover::HostPlanes*> ptrs;
+/* The misses hx_submit_misses_now reads (stager.h): neither read ahead whole nor urgent. */
+bool FileStager::hx_unread_misses(std::vector<Mover::HostPlanes*>* out) const {
     bool urgent = false;   /* units the piece readers are finishing for this layer */
     for (size_t i = 0; i < hx_miss_.size(); ++i) {
         if (i < hx_miss_ra_.size() && hx_miss_ra_[i]) urgent = true;
-        else if (i >= hx_miss_ready_.size() || !hx_miss_ready_[i]) ptrs.push_back(hx_miss_[i].get());
+        else if (i >= hx_miss_ready_.size() || !hx_miss_ready_[i]) out->push_back(hx_miss_[i].get());
     }
+    return urgent;
+}
+
+/* Reads the misses' planes (rows: the pass's tokens) and submits their jobs to the pool. */
+int FileStager::hx_submit_misses_now(int rows) {
+    std::vector<Mover::HostPlanes*> ptrs;
+    const bool urgent = hx_unread_misses(&ptrs);
     const auto t0 = std::chrono::steady_clock::now();
-    if (!ptrs.empty() || urgent) {
+    Mover::PlaneReadTiming tm;
+    bool read = false;
+    if (hx_miss_posted_ || !ptrs.empty() || urgent) {
         /* A demand read in flight: every rank's read-ahead holds back (hx_pf_loop, readahead.h).
-         * The urgent units' last pieces are part of it. */
+         * The urgent units' last pieces are part of it. A read posted at the choice (..._MISS_POST,
+         * hx_post_misses) entered the count there, with these same units. */
         PieceReader& demand = PieceReader::process();
-        demand.demand_enter();
-        bool ok = ptrs.empty() || mover_->read_unit_planes(ptrs.data(), (int)ptrs.size(), rows);
+        bool ok = true;
+        if (hx_miss_posted_) {
+            /* Finished before hx_ra_settle, which may read on the same readers (read_unit_planes):
+             * the post holds their call until this finish. */
+            hx_miss_posted_ = false;
+            ok = mover_->finish_unit_planes(&tm);
+            read = true;
+            if (ptrs != hx_miss_post_ptrs_) {
+                demand.demand_leave();
+                RAD_ERR("host experts: layer %d's misses changed after their reads were posted",
+                        layers_[(size_t)hx_li_].layer);
+                return RAD_E_STATE;
+            }
+        } else {
+            demand.demand_enter();
+            if (!ptrs.empty()) {
+                ok = mover_->read_unit_planes(ptrs.data(), (int)ptrs.size(), rows, &tm);
+                read = true;
+            }
+        }
         if (ok && urgent) ok = hx_ra_settle(rows);
         demand.demand_leave();
         if (!ok) {
@@ -1967,6 +2026,7 @@ int FileStager::hx_submit_misses_now(int rows) {
     }
     hx_stats_.miss_read_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
                                   std::chrono::steady_clock::now() - t0).count();
+    if (read && rows == 1) hx_note_reads(tm);
     const size_t first = hx_jobs_.size();
     for (auto& p : hx_miss_) {
         if (p->n != 2) return RAD_E_STATE;
@@ -1998,6 +2058,66 @@ int FileStager::hx_submit_misses_now(int rows) {
     }
     hx_bg_cv_.notify_all();
     return RAD_OK;
+}
+
+/* RADIANCE_EXPERIMENTAL_DS41_MISS_POST: the layer's unread misses (hx_unread_misses: the set
+ * hx_submit_misses_now reads) handed to the mover's kept readers right after hx_choose. A decode
+ * miss layer used to start its reads only after hx_submit had woken the pool (28-32 us a layer) and
+ * the copy path's staging and aliases had run; the readers' own wake-up now overlaps that work too.
+ * Only where hx_submit_misses_now reads on this thread (one-token passes, not on hx_mw_). Never a
+ * unit read ahead (..._PREFETCH): whole ones are not read again, and an urgent one is the piece
+ * readers' until hx_ra_settle, which may give its slot fresh planes and the old ones back to the
+ * free list. A demand read from the post on (PieceReader's count: no read-ahead piece starts) until
+ * hx_submit_misses_now or hx_join_miss_post leaves it. Nothing posted (one in flight, no kept
+ * readers, the readers busy with another thread's call): hx_submit_misses_now reads as before. */
+void FileStager::hx_post_misses() {
+    if (hx_miss_posted_ || pass_tok_ != 1 || (hx_async_ && pass_tok_ >= hx_async_rows_)) return;
+    hx_miss_post_ptrs_.clear();
+    (void)hx_unread_misses(&hx_miss_post_ptrs_);
+    if (hx_miss_post_ptrs_.empty()) return;
+    PieceReader& demand = PieceReader::process();
+    demand.demand_enter();
+    hx_miss_posted_ = mover_->start_unit_planes(hx_miss_post_ptrs_.data(),
+                                                (int)hx_miss_post_ptrs_.size(), (int)pass_tok_);
+    if (!hx_miss_posted_) demand.demand_leave();
+}
+
+/* A posted read not finished by hx_submit_misses_now (an error on the way): wait for it, so no
+ * reader writes into planes the layer has let go, and end its demand read. */
+void FileStager::hx_join_miss_post() {
+    if (!hx_miss_posted_) return;
+    hx_miss_posted_ = false;
+    (void)mover_->finish_unit_planes();
+    PieceReader::process().demand_leave();
+}
+
+/* One one-token miss read's timing into hx_stats_.mr (see HostStats::MissReads). */
+void FileStager::hx_note_reads(const Mover::PlaneReadTiming& t) {
+    HostStats::MissReads& s = hx_stats_.mr[t.units == 1 ? 0 : 1];
+    ++s.calls;
+    s.posted += t.posted;
+    s.split += t.mirror_reads > t.units;
+    if (t.mirror_reads && t.container_ns) {
+        ++s.mirror_calls;
+        if (t.mirror_ns > t.container_ns) {
+            ++s.mirror_last;
+            s.mirror_by_ns += (uint64_t)(t.mirror_ns - t.container_ns);
+        } else {
+            s.container_by_ns += (uint64_t)(t.container_ns - t.mirror_ns);
+        }
+        s.mirror_ns += (uint64_t)t.mirror_ns;
+        s.copy_ns += (uint64_t)t.copy_ns;
+        s.copy_sum_ns += (uint64_t)t.copy_sum_ns;
+    }
+    s.container_ns += (uint64_t)t.container_ns;
+    s.first_ns += (uint64_t)t.first_ns;
+    s.first_container_ns += (uint64_t)t.first_container_ns;
+    s.last_start_ns += (uint64_t)t.last_start_ns;
+    /* After every read landed, or after a posted call's caller came to wait if that was later. */
+    s.back_ns += (uint64_t)std::max<int64_t>(
+        t.return_ns - std::max({ t.mirror_ns, t.container_ns, t.join_ns }), 0);
+    s.join_ns += (uint64_t)t.join_ns;
+    s.total_ns += (uint64_t)t.return_ns;
 }
 
 /* A HostPlanes whose buffers are reused: the deleter returns it to the free list. */
@@ -2563,6 +2683,7 @@ int FileStager::hx_finish(RadStream s, const RadTensor* t, int n_t) {
 /* Gives back whatever a layer still holds: waits for its jobs, returns its leases and its
  * unsubmitted reservation. */
 void FileStager::hx_drain() {
+    hx_join_miss_post();   /* before hx_miss_ lets the planes go */
     if (hx_async_) (void)hx_mw_wait();
     if (hx_stage_ == 2 && hx_pool_) hx_pool_->wait(&hx_ticket_);
     if (hx_reserved_ && hx_pool_) hx_pool_->unreserve(hx_reserved_);

@@ -16,6 +16,14 @@ struct GlmRouter {
         /* The score function by name (router_scored_topk: "sqrtsoftplus" for DeepSeek-V4); null is
          * GLM's sigmoid (router_sigmoid_topk). */
         const char* score = nullptr;
+        /* The projection read through gemm_nt_f32bf16: a weight whose values are bf16
+         * (DeepSeek-V4.1 ships its routers bf16 and the container holds them widened to f32),
+         * stored as its bf16 halves, half the bytes for every logit bit unchanged. The declared
+         * dtype follows the source: an f32 plane stays declared f32 and the kernel's layout keeps
+         * its high halves, refusing the load if any low half is not zero; a bf16 plane is declared
+         * bf16 and read as it is. Off (GLM's f32 routers): gemm_nt_f32 over the f32 weight, as
+         * before. */
+        bool bf16_halves = false;
     };
     struct Src {
         const char *weight = nullptr, *correction = nullptr;
@@ -43,19 +51,34 @@ struct GlmRouter {
         const char *pn = nm.f("%s.weight", name), *cn = nm.f("%s.correction", name);
         RAD_ARCH_TRY(map_copy(b, pn, src.weight));
         RAD_ARCH_TRY(map_copy(b, cn, src.correction));
-        projection = decl_w(b, pn, RAD_F32, { c.experts, g.n_embd }, RAD_ACCESS_PER_TOKEN,
+        const char* gemm = "gemm_nt_f32";
+        uint32_t wdt = RAD_F32;
+        if (c.bf16_halves) {
+            /* Refused rather than served as f32: a library without the op would leave the switch
+             * silently off. */
+            if (!rad_op_declared(b, "gemm_nt_f32bf16")) {
+                fprintf(stderr, "radiance: %s: the router's bf16 halves need gemm_nt_f32bf16, "
+                                "which no loaded kernel library declares\n", name);
+                return RAD_E_UNSUPPORTED;
+            }
+            gemm = "gemm_nt_f32bf16";
+            RadEncoding e{};
+            if (weight_enc(b, pn, &e) && e.n_planes == 1 && e.plane[0].dtype == RAD_BF16)
+                wdt = RAD_BF16;
+        }
+        projection = decl_w(b, pn, wdt, { c.experts, g.n_embd }, RAD_ACCESS_PER_TOKEN,
                             RAD_SHARD_NONE, grp_layer(layer));
         correction = decl_w(b, cn, RAD_F32, { c.experts }, RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE,
                             grp_layer(layer));
         if (!projection || !correction) return RAD_E_INVAL;
         op_project = rw(b,
-                        RAD_OP(b, "gemm_nt_f32",
+                        RAD_OP(b, gemm,
                                RAD_PARAMS(RAD_RANGE("M", 1, c.rows), RAD_INT("N", c.experts),
                                           RAD_INT("K", g.n_embd), RAD_STR("dtype", "bf16")),
                                RAD_WEIGHTS(projection)),
                         { w.input }, { w.logits });
         RAD_ARCH_TRY(split.declare(b, nm, g, name, c.rows, c.experts, g.n_embd, projection, w.input,
-                                   w.logits));
+                                   w.logits, gemm));
         if (c.score)
             op_select =
                 rw(b,

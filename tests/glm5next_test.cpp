@@ -284,6 +284,89 @@ TEST(glm_router_and_index_head_split_columns_over_ranks_from_the_row_threshold) 
         }
 }
 
+/* GlmRouter::Config::bf16_halves (DeepSeek-V4.1 under RADIANCE_EXPERIMENTAL_DS41_ROUTER_BF16): the
+ * projection and its split part go through gemm_nt_f32bf16 with the same geometry, the weight
+ * declared at its source's dtype (f32 from the container, whose layout keeps the halves; bf16 from
+ * a checkpoint, read as it is); without a library declaring the op the declare is refused rather
+ * than served as f32. Off, GLM's router declares exactly what it did. */
+TEST(glm_router_bf16_halves_declares_gemm_nt_f32bf16_at_the_source_dtype) {
+    using namespace rad::arch;
+    struct Case {
+        bool halves;
+        int source;   /* 0: no model, else the plane's dtype */
+        const char* op;
+        uint32_t dtype;
+    };
+    const Case cases[] = { { false, 0, "gemm_nt_f32", RAD_F32 },
+                           { false, RAD_BF16, "gemm_nt_f32", RAD_F32 },
+                           { true, 0, "gemm_nt_f32bf16", RAD_F32 },
+                           { true, RAD_F32, "gemm_nt_f32bf16", RAD_F32 },
+                           { true, RAD_BF16, "gemm_nt_f32bf16", RAD_BF16 } };
+    for (const Case& k : cases) {
+        RadBuilder b;
+        if (k.source)
+            b.encs.push_back({ "blk.3.router.weight", rad_enc_plain((uint32_t)k.source) });
+        Names nm("");
+        Geom g{};
+        g.n_embd = 5120;
+        g.max_tok = 512;
+        g.world = 4;
+        g.rank = 1;
+        GlmRouter::Config cfg;
+        cfg.experts = 384;
+        cfg.top_k = 6;
+        cfg.rows = 512;
+        cfg.score = "sqrtsoftplus";
+        cfg.bf16_halves = k.halves;
+        GlmRouter::Wire w;
+        w.input = decl_b(&b, "hidden", RAD_BF16, { 512, 5120 });
+        w.logits = decl_b(&b, "logits", RAD_F32, { 512, 384 });
+        w.ids = decl_b(&b, "ids", RAD_I32, { 512, 6 });
+        w.weights = decl_b(&b, "weights", RAD_F32, { 512, 6 });
+        GlmRouter::Src src{ "layers.3.ffn.gate.weight", "layers.3.ffn.gate.bias" };
+        GlmRouter router;
+        REQUIRE_EQ(router.declare(&b, nm, g, 3, "blk.3.router", cfg, w, src), RAD_OK);
+        REQUIRE_EQ(b.weights.size(), (size_t)2);
+        CHECK_EQ(b.weights[0].d.dtype, k.dtype);
+        CHECK_EQ(b.weights[0].d.shape[0], 384);
+        CHECK_EQ(b.weights[0].d.shape[1], 5120);
+        CHECK_EQ(b.weights[0].d.shard, RAD_SHARD_NONE);
+        CHECK_EQ(b.weights[1].d.dtype, RAD_F32);
+        CHECK_EQ(b.ops[router.op_project - 1].op, std::string(k.op));
+        CHECK_EQ(count_op(b, k.op), 2);
+        CHECK_EQ(count_op(b, k.halves ? "gemm_nt_f32" : "gemm_nt_f32bf16"), 0);
+        const RecOp* part = find_op(b, k.op, 1);
+        REQUIRE(part);
+        CHECK_EQ(pint(part, "N"), 96);
+        CHECK_EQ(pint(part, "K"), 5120);
+        CHECK_EQ(pstr(part, "dtype"), "bf16");
+        CHECK(part->w == std::vector<rad_weight>({ router.projection }));
+        CHECK_EQ(b.ops[router.op_select - 1].op, std::string("router_scored_topk"));
+    }
+    RadBuilder b;
+    b.undeclared.insert("gemm_nt_f32bf16");
+    Names nm("");
+    Geom g{};
+    g.n_embd = 5120;
+    g.max_tok = 16;
+    g.world = 1;
+    GlmRouter::Config cfg;
+    cfg.experts = 384;
+    cfg.top_k = 6;
+    cfg.rows = 16;
+    cfg.bf16_halves = true;
+    GlmRouter::Wire w;
+    w.input = decl_b(&b, "hidden", RAD_BF16, { 16, 5120 });
+    w.logits = decl_b(&b, "logits", RAD_F32, { 16, 384 });
+    w.ids = decl_b(&b, "ids", RAD_I32, { 16, 6 });
+    w.weights = decl_b(&b, "weights", RAD_F32, { 16, 6 });
+    GlmRouter::Src src{ "layers.3.ffn.gate.weight", "layers.3.ffn.gate.bias" };
+    GlmRouter router;
+    CHECK_EQ(router.declare(&b, nm, g, 3, "blk.3.router", cfg, w, src), RAD_E_UNSUPPORTED);
+    CHECK_EQ(count_op(b, "gemm_nt_f32"), 0);
+    CHECK(b.weights.empty());
+}
+
 TEST(absorbed_mla_shards_complete_heads_and_reads_one_latent_cache) {
     using namespace rad::arch;
     for (int rank = 0; rank < 4; ++rank) {

@@ -14,8 +14,11 @@
 # declare-phase C ABI (arch_fakes.h), so plugins are tested without depending on core/build/'s
 # builder. With the archive linked, a new ABI call missing from the fake would pull in
 # rad_builder.cpp.o and collide on every rad_decl_* symbol; without it the error is a single
-# undefined reference.
-set(RAD_TESTS_NO_CORE arch_test glm5next_test mapped_slab_pregrow_test)
+# undefined reference. ds41_prefetch_arch_test is deepseek41's on-die reads on that fake (its own
+# binary: arch_test does not carry deepseek41), and ds41_prefetch_plan_test their plan
+# (arch/deepseek41/ds41_prefetch_plan.h), pure host logic with no ABI.
+set(RAD_TESTS_NO_CORE arch_test glm5next_test mapped_slab_pregrow_test ds41_prefetch_arch_test
+                      ds41_prefetch_plan_test)
 
 # fixture_test tests tools/kfixture.cpp and tools/opshapes.cpp (the seeded draw, the reduction and
 # the on-disk recording) directly, kbench_test tools/kbench_core.cpp (rad-kbench's rules), and
@@ -48,7 +51,10 @@ set(RAD_TESTS_WITH_LEGACY chatparse_test chatparse_gemma4_test)
 # with -ffp-contract=off as libr4d uses, so scale conversions round identically.
 # r4d_ar_links_test checks libr4d's header-only link reader, so it needs only the include path.
 # bf16f8_layout_test checks gemm_nt_bf16f8's stored form and its hooks the same way.
-set(RAD_TESTS_WITH_R4D_HOST relayout_parity_test r4d_ar_links_test bf16f8_layout_test)
+# f32bf16_relayout_test checks gemm_nt_f32bf16's stored form (an f32 weight as its bf16 halves) and
+# its refusal of a weight that is not exactly bf16, from the same layout sources.
+set(RAD_TESTS_WITH_R4D_HOST relayout_parity_test r4d_ar_links_test bf16f8_layout_test
+                            f32bf16_relayout_test)
 
 # ref2va_pack_test checks the Ref2VA sequence packing (arch/minimaxh3/rad_ref2va_pack.cpp, a
 # device-free TU of the plugin) against golden vectors generated from the reference implementation

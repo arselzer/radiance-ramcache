@@ -269,6 +269,9 @@ public:
          * (decide), and its parts: the read windows' leases returned, hx_choose, hx_submit, and
          * (..._PREFETCH=pieces, rank 0) the predictor's post after it. */
         uint64_t d_decide_ns = 0, d_retire_ns = 0, d_choose_ns = 0, d_submit_ns = 0, d_post_ns = 0;
+        /* ..._MISS_POST: the misses' reads handed to the kept readers, between hx_choose and
+         * hx_submit (hx_post_misses; neither part of choose nor the predictor's post above). */
+        uint64_t d_miss_post_ns = 0;
     };
     const EpStats& ep_stats() const { return ep_stats_; }
     /* Routed experts the CPU computed (HostExpertPool) instead of a copy to the card. */
@@ -326,6 +329,22 @@ public:
         /* ..._FETCH_LIST: round trips copied in one ranged dispatch, range lists (re)written, and
          * round trips left as separate copies (addresses the copy kernel cannot take). */
         uint64_t fl_copies = 0, fl_armed = 0, fl_plain = 0;
+        /* One-token passes' miss reads (Mover::PlaneReadTiming), [0] those of one missed unit and
+         * [1] of more: calls; posted at the choice (..._MISS_POST); with the mirror's tail in
+         * pieces (..._MIRROR_SPLIT). Of the calls with a mirror leg and a container leg: those the
+         * mirror landed last in, and how far the last leg trailed the other, summed by which one
+         * it was. Then sums from the dispatch: the mirror leg (its copy included), its longest
+         * copy and all its copies, the container leg; the first read, the first container read
+         * and the last read begun; the caller back after every read landed (a done_ wake when a
+         * reader finished last); a posted call's caller coming to wait; the caller back. */
+        struct MissReads {
+            uint64_t calls = 0, posted = 0, split = 0;
+            uint64_t mirror_calls = 0, mirror_last = 0, mirror_by_ns = 0, container_by_ns = 0;
+            uint64_t mirror_ns = 0, copy_ns = 0, copy_sum_ns = 0, container_ns = 0;
+            uint64_t first_ns = 0, first_container_ns = 0, last_start_ns = 0, back_ns = 0;
+            uint64_t join_ns = 0, total_ns = 0;
+        };
+        MissReads mr[2];
     };
     const HostStats& host_stats() const { return hx_stats_; }
     bool host_experts() const { return hx_pool_ != nullptr; }
@@ -649,6 +668,28 @@ private:
     std::mutex hx_planes_mu_;
     std::shared_ptr<Mover::HostPlanes> hx_planes_get(int32_t unit);
     int  hx_submit_misses();
+    /* The misses hx_submit_misses_now reads, into *out: the layer's not read ahead whole and not
+     * being finished by the piece readers. True when some are (urgent: hx_ra_settle waits for
+     * them, and may give their slots fresh planes). */
+    bool hx_unread_misses(std::vector<Mover::HostPlanes*>* out) const;
+    /* RADIANCE_EXPERIMENTAL_DS41_MISS_POST=1: a one-token pass's missed planes start on the
+     * mover's kept readers as soon as hx_choose knows them (hx_post_misses, before hx_submit), and
+     * hx_submit_misses_now waits for them before anything else reads on those readers
+     * (hx_ra_settle); hx_join_miss_post on every other way out (HxMissPostJoin in start_ep_routed
+     * and hx_early_decide, hx_drain). The post takes hx_unread_misses' set -- never an urgent unit,
+     * whose slot hx_ra_settle may refill -- and is a demand read from the post on
+     * (PieceReader::demand_enter; left after the finish). hx_miss_posted_: a posted read awaits its
+     * finish; only the issuing thread. (Not the predictor's post: hx_pred_->post, d_post_ns.) */
+    bool hx_miss_post_on_ = false;
+    bool hx_miss_posted_ = false;
+    std::vector<Mover::HostPlanes*> hx_miss_post_ptrs_;
+    void hx_post_misses();
+    void hx_join_miss_post();
+    struct HxMissPostJoin {
+        FileStager* s;
+        ~HxMissPostJoin() { s->hx_join_miss_post(); }
+    };
+    void hx_note_reads(const Mover::PlaneReadTiming& t);
     std::vector<std::thread> hx_bg_;   /* ..._INSERT_THREADS of them (4) */
     std::mutex hx_bg_mu_;
     std::condition_variable hx_bg_cv_;

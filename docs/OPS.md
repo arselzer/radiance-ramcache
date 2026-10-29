@@ -722,6 +722,7 @@ may not have arrived.
 |---|---|---|
 | `gemm_nt` | `M`(range) `N` `K` `dtype` | `a`, `b`w → `y` |
 | `gemm_nt_f32` | `M`(range) `N` `K` `dtype` | `a`, `b`w → `y` |
+| `gemm_nt_f32bf16` | `M`(range) `N` `K` `dtype` | `a`, `b`w → `y` |
 | `gemm_nt_bias` | `M`(range) `N` `K` `dtype` `act`/opt | `a`, `b`w, `bias`w, `res`? → `y` |
 | `gemm_nt_q` | `M`(range) `N` `K` `group` `dtype` `pb1`/opt `pb2`/opt `split_n`/opt | `a`, `a_scale`?, `b`w, `b_scale`w → `y`; `a_sum`?, `b_ref`w? |
 | `gemm_nt_q_bias` | `M`(range) `N` `K` `group` `dtype` | `a`, `a_scale`, `b`w, `b_scale`w, `bias`w → `y` |
@@ -797,6 +798,14 @@ rows. A wave computes a tile of rows by columns, chosen by `M` and `N` (a single
 at one row, eight rows by four columns from 64 rows, four rows by one column at `N <= 8`); each
 output keeps one order (lane `l` sums `k = l, l+32, ...` with fused multiply-add, then a fixed
 butterfly), so every tile is byte-identical (`tests/r4d_emu/test_f32.cpp`).
+
+`gemm_nt_f32bf16` is `gemm_nt_f32` over an f32 weight every element of which is a bf16 value: its
+low 16 bits are zero, as in a weight that ships bf16 and was widened to f32 for `gemm_nt_f32`
+(DeepSeek-V4.1's routers and compressor projections). The output is `gemm_nt_f32`'s, bit for bit.
+libr4d's `gemm_nt_f32bf16_bf16` stores the high halves (layout `r4d.f32bf16.rowmajor`, row-major
+bf16) and widens each back by a shift inside `gemm_nt_f32_bf16`'s tiles, reading half the bytes.
+Its relayout checks every element and refuses the weight at the load if any low half is not zero:
+narrowing it would change the model. A bf16 plane is read as it is. No library has a host form.
 
 `gemm_nt_bf16f8` (device-only) is `gemm_nt` with the same schema and the same bytes, over a bf16
 weight every 32x32 block of which is E4M3 codes times one power of two: an FP8-sourced checkpoint's

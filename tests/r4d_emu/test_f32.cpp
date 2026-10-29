@@ -5,7 +5,12 @@
  * butterfly over 16, 8, 4, 2, 1. Tail rows and columns and the pitch's padding stay untouched.
  *
  * router_sigmoid_topk from the same unit: the wave-per-row select must match a serial scan written
- * out here bit for bit, on random and on tied ranks, with the outputs' pitch padding untouched. */
+ * out here bit for bit, on random and on tied ranks, with the outputs' pitch padding untouched.
+ *
+ * gemm_nt_f32bf16 from the same unit: an f32 weight whose values are bf16, handed over as its bf16
+ * halves (the form its layout stores), must give gemm_nt_f32's bytes over the widened weight in
+ * every tile form, the ones the rule takes and the four more r4d_selftest's sweep times
+ * (`form`). */
 #include "rad_abi.h"
 #include "rad_plugin.h"
 #include "r4d_plugin.h"
@@ -140,6 +145,164 @@ static void router_cases(std::mt19937& rng, int& cases, int& fails) {
     }
 }
 
+/* One launch of gemm_nt_f32 (f32 weight) or gemm_nt_f32bf16 (`halves`: the bf16 halves) at tile
+ * form `form` (0: the rule), into a filled pitched output; the words that differ from the model
+ * and the padding words written, or -1 when the launch refused. */
+static int f32_launch(const std::vector<uint16_t>& x, const void* w, bool halves, int M, int N,
+                      int K, int xp, int yp, int form, const std::vector<float>& want) {
+    RadTensor t[3]{};
+    t[0].data = const_cast<uint16_t*>(x.data());
+    t[0].dtype = RAD_BF16;
+    t[0].rank = 2;
+    t[0].shape[0] = M;
+    t[0].shape[1] = K;
+    t[0].stride[0] = xp;
+    t[0].stride[1] = 1;
+    t[1].data = const_cast<void*>(w);
+    t[1].dtype = halves ? RAD_BF16 : RAD_F32;
+    t[1].rank = 2;
+    t[1].shape[0] = N;
+    t[1].shape[1] = K;
+    t[1].stride[0] = K;
+    t[1].stride[1] = 1;
+    t[2].dtype = RAD_F32;
+    t[2].rank = 2;
+    t[2].shape[0] = M;
+    t[2].shape[1] = N;
+    t[2].stride[0] = yp;
+    t[2].stride[1] = 1;
+    RadParam p[5]{};
+    p[0] = { "M", RAD_P_INT, M };
+    p[1] = { "N", RAD_P_INT, N };
+    p[2] = { "K", RAD_P_INT, K };
+    p[3].key = "dtype";
+    p[3].kind = RAD_P_STR;
+    p[3].sval = "bf16";
+    p[4] = { "form", RAD_P_INT, form };
+    RadArgs a{};
+    a.t = t;
+    a.n_t = 3;
+    a.p = p;
+    a.n_p = form ? 5 : 4;
+    std::vector<float> y((size_t)M * yp, -7.25f);
+    t[2].data = y.data();
+    const int rc = halves ? r4d_rad_gemm_nt_f32bf16(&a, nullptr) : r4d_rad_gemm_nt_f32(&a, nullptr);
+    if (rc != RAD_OK) return -1;
+    int bad = 0;
+    for (int r = 0; r < M; ++r) {
+        bad += std::memcmp(&want[(size_t)r * N], &y[(size_t)r * yp], (size_t)N * 4) != 0;
+        for (int c = N; c < yp; ++c) bad += y[(size_t)r * yp + c] != -7.25f;
+    }
+    return bad;
+}
+
+static void halves_cases(std::mt19937& rng, int& cases, int& fails) {
+    std::normal_distribution<float> nd(0.f, 1.f);
+    struct Shape {
+        int M, N, K;
+    };
+    // The router's decode GEMV at a reduced K, the few-column and odd-K tails, and rows above the
+    // 2x2 band; every form at each.
+    const Shape shapes[] = { { 1, 384, 640 }, { 2, 36, 129 }, { 1, 8, 1056 },
+                             { 3, 13, 130 },  { 16, 64, 544 }, { 70, 36, 129 } };
+    for (const Shape& sh : shapes) {
+        const int M = sh.M, N = sh.N, K = sh.K, xp = K + 5, yp = N + 3;
+        std::vector<uint16_t> x((size_t)M * xp), w16((size_t)N * K);
+        std::vector<float> w32((size_t)N * K), want((size_t)M * N);
+        for (auto& v : x) v = f2b(nd(rng));
+        for (size_t i = 0; i < w16.size(); ++i) {
+            w16[i] = f2b(nd(rng) * 0.03f);
+            w32[i] = b2f(w16[i]);
+        }
+        for (int r = 0; r < M; ++r)
+            for (int c = 0; c < N; ++c)
+                want[(size_t)r * N + c] = gemm_model(&x[(size_t)r * xp], &w32[(size_t)c * K], K);
+        for (int form = 0; form <= 8; ++form)
+            for (int halves = 0; halves < 2; ++halves) {
+                ++cases;
+                const int bad = f32_launch(x, halves ? (const void*)w16.data() : w32.data(),
+                                           halves != 0, M, N, K, xp, yp, form, want);
+                if (bad) {
+                    std::printf("FAIL %s (%s weight, form %d) at M=%d N=%d K=%d against the model: "
+                                "%d\n", emu_last_kernel, halves ? "bf16-halves" : "f32", form, M,
+                                N, K, bad);
+                    ++fails;
+                }
+            }
+    }
+    // gemm_nt_f32 refuses a bf16 weight; gemm_nt_f32bf16 also takes an f32 one (a bf16 plane the
+    // loader widened, which its layout leaves as it is), as the f32 form.
+    const int M = 2, N = 16, K = 64, xp = K, yp = N;
+    std::vector<uint16_t> x((size_t)M * xp), w16((size_t)N * K);
+    std::vector<float> w32((size_t)N * K), want((size_t)M * N);
+    for (auto& v : x) v = f2b(nd(rng));
+    for (size_t i = 0; i < w16.size(); ++i) {
+        w16[i] = f2b(nd(rng));
+        w32[i] = b2f(w16[i]);
+    }
+    for (int r = 0; r < M; ++r)
+        for (int c = 0; c < N; ++c)
+            want[(size_t)r * N + c] = gemm_model(&x[(size_t)r * xp], &w32[(size_t)c * K], K);
+    RadTensor t[3]{};
+    t[0].data = x.data();
+    t[0].dtype = RAD_BF16;
+    t[0].rank = 2;
+    t[0].shape[0] = M;
+    t[0].shape[1] = K;
+    t[0].stride[0] = xp;
+    t[0].stride[1] = 1;
+    t[1].data = w16.data();
+    t[1].dtype = RAD_BF16;
+    t[1].rank = 2;
+    t[1].shape[0] = N;
+    t[1].shape[1] = K;
+    t[1].stride[0] = K;
+    t[1].stride[1] = 1;
+    std::vector<float> y((size_t)M * yp);
+    t[2].data = y.data();
+    t[2].dtype = RAD_F32;
+    t[2].rank = 2;
+    t[2].shape[0] = M;
+    t[2].shape[1] = N;
+    t[2].stride[0] = yp;
+    t[2].stride[1] = 1;
+    RadParam p[4]{};
+    p[0] = { "M", RAD_P_INT, M };
+    p[1] = { "N", RAD_P_INT, N };
+    p[2] = { "K", RAD_P_INT, K };
+    p[3].key = "dtype";
+    p[3].kind = RAD_P_STR;
+    p[3].sval = "bf16";
+    RadArgs a{};
+    a.t = t;
+    a.n_t = 3;
+    a.p = p;
+    a.n_p = 4;
+    ++cases;
+    if (r4d_rad_gemm_nt_f32(&a, nullptr) != RAD_E_DTYPE) {
+        std::printf("FAIL gemm_nt_f32 took a bf16 weight\n");
+        ++fails;
+    }
+    ++cases;
+    t[1].data = w32.data();
+    t[1].dtype = RAD_F32;
+    if (r4d_rad_gemm_nt_f32bf16(&a, nullptr) != RAD_OK ||
+        std::memcmp(y.data(), want.data(), want.size() * 4) != 0) {
+        std::printf("FAIL gemm_nt_f32bf16 over an f32 weight is not the f32 form\n");
+        ++fails;
+    }
+    ++cases;
+    RadParam q[5];
+    for (int i = 0; i < 4; ++i) q[i] = p[i];
+    q[4] = { "form", RAD_P_INT, 9 };
+    a.p = q;
+    a.n_p = 5;
+    if (r4d_rad_gemm_nt_f32bf16(&a, nullptr) != RAD_E_INVAL) {
+        std::printf("FAIL a form past the last was not refused\n");
+        ++fails;
+    }
+}
+
 int main() {
     std::mt19937 rng(17);
     std::normal_distribution<float> nd(0.f, 1.f);
@@ -210,6 +373,7 @@ int main() {
         }
     }
     router_cases(rng, cases, fails);
+    halves_cases(rng, cases, fails);
     std::printf("%d case(s), %d failure(s)\n", cases, fails);
     return fails ? 1 : 0;
 }

@@ -2925,6 +2925,10 @@ static const RadOpSchema kSchemas[] = {
            "Normalized Hadamard, BF16 boundary and power-of-two E4M3 quantization per query head."),
     SCHEMA("gemm_nt_f32", pGemmNt, oGemmNt,
            "BF16 activations times F32 weights, F32 accumulation and output; preserves routing and index gate precision."),
+    SCHEMA("gemm_nt_f32bf16", pGemmNt, oGemmNt,
+           "gemm_nt_f32 over an F32 weight every element of which is a BF16 value (low 16 bits "
+           "zero): gemm_nt_f32's bytes out; the kernel stores the BF16 halves, and a weight not "
+           "exactly so is refused at load."),
     SCHEMA("swiglu_clamped", pSwigluClamped, oGateUp,
            "silu(min(gate,limit))*clamp(up,-limit,limit); gate is the first half."),
     SCHEMA("swiglu_clamped_quant_fp8", pSwigluClampedQuant, oGatedQuantFp8,
@@ -6060,6 +6064,16 @@ static const RadKernelInfo kKernels[] = {
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cGemmNtF32), NOTUNE,
   nullptr, nullptr, r4d_rad_gemm_nt_f32, nullptr, nullptr, nullptr,
   r4d_shape_gemm_nt_f32 },
+/* The same tiles over the weight's bf16 halves (r4d_layout.cpp, f32bf16): half the bytes, every
+ * output bit gemm_nt_f32_bf16's. */
+{ "gemm_nt_f32bf16_bf16", "gemm_nt_f32bf16", "gemm",
+  "F32 routing projection over a weight stored as its bf16 halves",
+  "N<=65536, K<=16384; pitched rows",
+  "bf16 input, f32 weight held as bf16 (low halves checked zero at load), f32 arithmetic and "
+  "output. BYTE-IDENTICAL to gemm_nt_f32_bf16",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cGemmNtF32), NOTUNE,
+  nullptr, nullptr, r4d_rad_gemm_nt_f32bf16, nullptr, r4d_rad_layout_f32bf16,
+  r4d_rad_relayout_f32bf16, r4d_shape_gemm_nt_f32bf16, r4d_rad_unrelayout_f32bf16 },
 { "dsa_pool_fp8", "dsa_pool", "attn", "learned compressed index keys in wave-local registers",
   "n=128, ratio=4; pitched rows", "bf16 keys/gates, f32 position bias; FP8 codes and f32 scale",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cDsaPool), NOTUNE,

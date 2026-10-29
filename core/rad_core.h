@@ -255,6 +255,17 @@ inline bool weight_file_direct(const WeightInfo& w, int world_size) {
            (w.decl.shard == RAD_SHARD_NONE || world_size <= 1);
 }
 
+/* A weight's bytes as the container holds them, for a host reader of the file (the router
+ * predictor, Mover::read_weight_file): the stored bytes of a weight stored as is, or the one plane
+ * a kernel's relayout reads (gemm_nt_f32bf16 keeps an f32 router as its bf16 halves under
+ * RADIANCE_EXPERIMENTAL_DS41_ROUTER_BF16). 0 for anything else, a weight the loader widens or
+ * narrows among them: its stored bytes are not the file's. */
+inline int64_t weight_file_bytes(const WeightInfo& w) {
+    if (w.identity) return !w.widen && !w.narrow && w.stored_bytes > 0 ? w.stored_bytes : 0;
+    if (w.n_sel != 1 || !w.enc_known) return 0;
+    return w.sel_rows[0] * rad_enc_row_bytes(w.enc.plane[w.sel[0]].dtype, w.sel_cols[0]);
+}
+
 struct BufferInfo {
     std::string name;
     RadBufDecl  decl{};

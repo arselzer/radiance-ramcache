@@ -106,6 +106,10 @@ struct RadBuilder {
         return vocab ? vocab->count(op) != 0 : undeclared.count(op) == 0;
     }
     int64_t kv_block = 16;
+    /* A group's own block size where an op fixes it (deepseek41's compressed groups, whose
+     * entry_store makes it the layer's ratio): by the group's name, 0 for kv_block. Unset: every
+     * group has kv_block. */
+    std::function<int64_t(const std::string&)> kv_block_of;
 
     /* The buffer the plugin named as this step's logits (rad_declare_logits), or as its pooled
      * output (rad_declare_pooled). */
@@ -248,7 +252,11 @@ extern "C" rad_kvgroup rad_decl_kv_group(RadBuilder* b, const char* name,
     return (rad_kvgroup)b->kv_groups.size();
 }
 
-extern "C" int64_t rad_kv_block_size(RadBuilder* b, rad_kvgroup g) { (void)g; return b->kv_block; }
+extern "C" int64_t rad_kv_block_size(RadBuilder* b, rad_kvgroup g) {
+    if (b->kv_block_of && g && g <= b->kv_groups.size())
+        if (const int64_t v = b->kv_block_of(b->kv_groups[g - 1].name); v > 0) return v;
+    return b->kv_block;
+}
 
 extern "C" int64_t rad_kv_layer_bytes(RadBuilder* b, rad_kvgroup g) {
     if (!b || !g || g > b->kv_groups.size()) return 0;

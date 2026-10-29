@@ -139,6 +139,12 @@ Engine::~Engine() {
                          (double)ep.d_choose_ns * 1e-3 / (double)ep.d_reads,
                          (double)ep.d_submit_ns * 1e-3 / (double)ep.d_reads,
                          (double)ep.d_post_ns * 1e-3 / (double)ep.d_reads);
+            /* ..._MISS_POST: the misses' reads handed to the readers, between choose and submit
+             * (in the decision above, not in its parts). */
+            if (ep.d_reads && ep.d_miss_post_ns)
+                RAD_INFO("EP decision, one-token passes: %.1f us a layer posting the misses' reads to the "
+                         "kept readers (..._MISS_POST; between choose and submit, in neither)",
+                         (double)ep.d_miss_post_ns * 1e-3 / (double)ep.d_reads);
         }
         const auto& hx = r->fstager.host_stats();
         if (r->fstager.host_experts())
@@ -171,6 +177,37 @@ Engine::~Engine() {
                      "lists written, %llu fetches left as separate copies",
                      (unsigned long long)hx.fl_copies, (unsigned long long)hx.fl_armed,
                      (unsigned long long)hx.fl_plain);
+        /* The miss reads' legs and handoffs (FileStager::HostStats::MissReads): the gates of
+         * ..._MIRROR_SPLIT (how often the mirror's leg lands last, its copy) and ..._MISS_POST (the
+         * readers' start, the caller's return). Means a call, or a call with a mirror leg. */
+        for (int k = 0; k < 2; ++k) {
+            const auto& m = hx.mr[k];
+            if (!m.calls) continue;
+            const double c = (double)m.calls, mc = (double)(m.mirror_calls ? m.mirror_calls : 1);
+            const uint64_t cl = m.mirror_calls - m.mirror_last;
+            RAD_INFO("host experts' one-token miss reads, %s: %llu calls, %llu posted at the choice, "
+                     "%llu with the mirror's tail in pieces; of %llu with a mirror leg the mirror landed "
+                     "last in %llu (%.1f%%, %.3f ms after the container) and the container in %llu "
+                     "(%.3f ms after the mirror); from the dispatch: mirror leg %.3f ms (its copy %.3f ms, "
+                     "all its copies %.3f), container leg %.3f ms, the caller back %.3f ms",
+                     k ? "two or more units" : "one unit", (unsigned long long)m.calls,
+                     (unsigned long long)m.posted, (unsigned long long)m.split,
+                     (unsigned long long)m.mirror_calls, (unsigned long long)m.mirror_last,
+                     100.0 * (double)m.mirror_last / mc,
+                     m.mirror_last ? (double)m.mirror_by_ns * 1e-6 / (double)m.mirror_last : 0.0,
+                     (unsigned long long)cl, cl ? (double)m.container_by_ns * 1e-6 / (double)cl : 0.0,
+                     (double)m.mirror_ns * 1e-6 / mc, (double)m.copy_ns * 1e-6 / mc,
+                     (double)m.copy_sum_ns * 1e-6 / mc, (double)m.container_ns * 1e-6 / c,
+                     (double)m.total_ns * 1e-6 / c);
+            RAD_INFO("host experts' one-token miss reads, %s, readers: the first read begun %.1f us "
+                     "after the dispatch, the first container read %.1f us, the last read %.1f us; the "
+                     "caller back %.1f us after the last read landed%s",
+                     k ? "two or more units" : "one unit", (double)m.first_ns * 1e-3 / c,
+                     (double)m.first_container_ns * 1e-3 / c, (double)m.last_start_ns * 1e-3 / c,
+                     (double)m.back_ns * 1e-3 / c,
+                     m.posted ? fmt("; posted calls: the caller came to wait %.1f us after the dispatch",
+                                    (double)m.join_ns * 1e-3 / (double)m.posted).c_str() : "");
+        }
         if (hx.pred_layers)
             RAD_INFO("next-layer predictor: on time for %llu of %llu one-token layers; %llu of %llu "
                      "misses predicted (%.1f%%); %llu file-tier experts predicted, %llu of them "

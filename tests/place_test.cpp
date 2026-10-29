@@ -3224,6 +3224,41 @@ TEST(weight_bytes_prefers_the_stored_layout_then_the_logical_then_the_shape) {
     CHECK_EQ(weight_bytes(z), 0ll);
 }
 
+/* What a host reader of the container (the router predictor, through Mover::read_weight_file)
+ * reads of a weight: the stored bytes of one stored as it is, or the selected plane a kernel's
+ * relayout reads. DeepSeek-V4.1's router under RADIANCE_EXPERIMENTAL_DS41_ROUTER_BF16 is the second
+ * kind: gemm_nt_f32bf16 keeps its bf16 halves on the card (half the bytes), and the predictor still
+ * reads the container's f32 plane, [384, 5120], so read-ahead (..._PREFETCH) keeps working with the
+ * switch on. Nothing for a weight the loader widens or narrows, whose stored bytes are not the
+ * file's, nor for one joining several planes or of unknown encoding. */
+TEST(weight_file_bytes_is_the_container_plane_not_the_stored_form) {
+    WeightInfo w;
+    w.stored_bytes = 384ll * 5120 * 4;
+    CHECK_EQ(weight_file_bytes(w), 384ll * 5120 * 4);   /* identity, as without the switch */
+    w.widen = true;
+    CHECK_EQ(weight_file_bytes(w), 0ll);
+    w.widen = false;
+    w.narrow = true;
+    CHECK_EQ(weight_file_bytes(w), 0ll);
+
+    WeightInfo r;   /* relaid: the f32 plane held on the card as its bf16 halves */
+    r.identity = false;
+    r.stored_bytes = 384ll * 5120 * 2;
+    r.enc = rad_enc_plain(RAD_F32);
+    r.enc_known = true;
+    r.n_sel = 1;
+    r.sel_rows[0] = 384;
+    r.sel_cols[0] = 5120;
+    CHECK_EQ(weight_file_bytes(r), 384ll * 5120 * 4);
+    r.enc = rad_enc_plain(RAD_BF16);   /* a bf16 plane: two bytes an element in the file */
+    CHECK_EQ(weight_file_bytes(r), 384ll * 5120 * 2);
+    r.enc_known = false;
+    CHECK_EQ(weight_file_bytes(r), 0ll);
+    r.enc_known = true;
+    r.n_sel = 2;
+    CHECK_EQ(weight_file_bytes(r), 0ll);
+}
+
 /* The footprint must agree with the planner: the VRAM budget resolver calls it before a Planner
  * exists and gives the planner a budget computed from it. It must reproduce the unit grouping, the
  * per-unit alignment and the mapped-tier pin. */

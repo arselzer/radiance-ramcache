@@ -33,6 +33,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 R=/home/as/radiance-setup/research/deepseek-v41-1017-20261024
 MODEL=$R/native-models/ds41-native-mxfp4-v3-20261027T121600Z/model.rad
 MIRROR=${MIRROR:-}   # the checkpoint's model-*.safetensors for R arms; no default
+DRAFT_BANK=${DRAFT_BANK:-}   # a DSpark draft bank (draft.rad) bound to $MODEL, for Ds arms; no default
 PROFILE=$R/ds41-dev-window-profile-calibration-20261028T034300Z/sealed-decode-profile.json
 PROMPTS=${PROMPTS:-$R/ds41-pack-tail-dev-window-tail1-heldout-20261028T085400Z/receipt.json}
 PORT=18089
@@ -216,8 +217,11 @@ for a in $ARMS; do
 # tokens; A is every pass); Q[gnc] the arm's power settings (see power_set); SgK / SgaK prompt-lookup
 # speculation, K drafts a step (fixed / adaptive window); Er the token embedding in host RAM; Xp / Xh
 # / Xi miss reads on threads started per call / on 4 KiB pages / relaid via scratch (the old ways,
-# as A/B switches); H3 the third run home (RADIANCE_HOME_DIR3); Es engram_kv's rows split over the
-# ranks (needs a deepseek41 plugin that has it); rN a repeat (ignored).
+# as A/B switches); Ds / DsN / Dsa DSpark speculation from $DRAFT_BANK at depth 5 / capped at N
+# drafts a step (Ds0: the bank loaded, drafting off) / with the adaptive window (the bank pins its
+# experts in the host pool: give the arm pN of ~2048); H3 the third run home (RADIANCE_HOME_DIR3); Es
+# engram_kv's rows split over the ranks (needs a deepseek41 plugin that has it); rN a repeat
+# (ignored).
   IFS=- read -r -a parts <<< "$a"
   pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 HOST_POOL_MIB=4096 EXTRA_ARGS="" ARM_HOME="$RHOME"
   power="" skip="" ARGS=()
@@ -260,6 +264,15 @@ for a in $ARMS; do
       Xp)      env+=(RADIANCE_EXPERIMENTAL_DS41_READ_POOL=0) ;;        # miss reads on threads started a call
       Xh)      env+=(RADIANCE_EXPERIMENTAL_DS41_PLANE_HUGEPAGES=0) ;;  # miss buffers on 4 KiB pages
       Xi)      env+=(RADIANCE_EXPERIMENTAL_DS41_INSERT_DIRECT=0) ;;    # missed units relaid via scratch
+      Ds|Ds[0-9]|Dsa)
+               if [[ -z "$DRAFT_BANK" ]]; then log "arm $a: $p needs DRAFT_BANK=<draft.rad>"; skip=1; fi
+               env+=(RADIANCE_EXPERIMENTAL_DS41_DSPARK_RAD_BANK=1)
+               # host: the bank's 96 expert pairs pinned in the host pool and read in place by the card,
+               # never file-tier units (the file-buffer cap needs every file-tier unit to be the CPU's)
+               ARGS+=(--draft-bank "$DRAFT_BANK" --draft-bank-expert-placement host
+                      --num-speculative-tokens 5 --spec-ngram 0)
+               [[ $p == Ds[0-9] ]] && env+=(RADIANCE_EXPERIMENTAL_DS41_DSPARK_VERIFY_CAP=${p#Ds})
+               [[ $p == Dsa ]] && ARGS+=(--draft-window adaptive) ;;
       *)       log "arm $a: unknown part $p" ;;
     esac
   done

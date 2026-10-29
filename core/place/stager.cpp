@@ -997,13 +997,16 @@ int FileStager::hx_init_impl(const Program& prog) {
             if (op.op == "swiglu_clamped")
                 limit = op.base.get_f("limit", &v) && (float)v == pool->limit();
         }
-        /* Every reader of the down rows up to the next routed layer must be one of these. */
+        /* Every reader of the down rows up to the next routed layer must be one of these: up to
+         * the next layer staged here, or the next MoE block this stager does not stage (a DSpark
+         * draft head's host-pinned experts after the last layer), whichever comes first. */
         const int32_t end = li + 1 < layers_.size() ? layers_[li + 1].first_op
                                                     : (int32_t)prog.ops.size();
         int n_gather = 0;
         bool shape = true;
         for (int32_t h = L.last_op + 1; h < end && shape; ++h) {
             const OpInfo& op = prog.ops[(size_t)h];
+            if (op.op.compare(0, 8, "moe_gemm") == 0) break;
             if (op.op != "moe_gather" && op.op != "ar_gather_hc_write") continue;
             const RadOpSchema* sc = op.schema;
             shape = n_gather < 3 && sc && sc->n_operands >= 1 && sc->operands[0].name &&

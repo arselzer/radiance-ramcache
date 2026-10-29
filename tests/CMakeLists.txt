@@ -47,7 +47,8 @@ set(RAD_TESTS_WITH_LEGACY chatparse_test chatparse_gemma4_test)
 # recorded hash of the stored bytes. libr4d's layout sources are host-only, so they are compiled in,
 # with -ffp-contract=off as libr4d uses, so scale conversions round identically.
 # r4d_ar_links_test checks libr4d's header-only link reader, so it needs only the include path.
-set(RAD_TESTS_WITH_R4D_HOST relayout_parity_test r4d_ar_links_test)
+# bf16f8_layout_test checks gemm_nt_bf16f8's stored form and its hooks the same way.
+set(RAD_TESTS_WITH_R4D_HOST relayout_parity_test r4d_ar_links_test bf16f8_layout_test)
 
 # ref2va_pack_test checks the Ref2VA sequence packing (arch/minimaxh3/rad_ref2va_pack.cpp, a
 # device-free TU of the plugin) against golden vectors generated from the reference implementation

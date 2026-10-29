@@ -260,7 +260,11 @@ enum {
     R4D_DT_MOEW5      = RAD_DT_PLUGIN_BASE + 8,
     /* The M2XFP4 GEMMs' stored weight: R4D_DT_MXFP4_FRAG's fragment-order e2m1 codes, then the
      * [K/32][N] meta plane the kernel reads beside the E8M0 exponents (r4d_layout.cpp, m2xfp4). */
-    R4D_DT_M2XFP4_FRAG = RAD_DT_PLUGIN_BASE + 9
+    R4D_DT_M2XFP4_FRAG = RAD_DT_PLUGIN_BASE + 9,
+    /* A bf16 weight every 32x32 block of which is E4M3 codes times one power of two, stored as
+     * those codes in fragment order and an E8M0 exponent a block (r4d_bf16f8_layout.h), and read
+     * by gemm_nt_bf16f8 as the same bf16 values. */
+    R4D_DT_BF16F8      = RAD_DT_PLUGIN_BASE + 10
 };
 
 /* The grouped MoE GEMM's code tables, as the four dwords w4_e4m3's byte permutes read

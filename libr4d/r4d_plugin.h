@@ -622,6 +622,9 @@ R4D_HOOKS(w4)
 R4D_HOOKS(w2a8)
 R4D_HOOKS(moe_w4)
 R4D_HOOKS(moe_w4_mod4)
+/* gemm_nt_bf16f8's E4M3 codes and E8M0 32x32 exponents from a plain bf16 weight (r4d_layout.cpp,
+ * r4d_bf16f8_layout.h): refused at load unless every element re-encodes exactly. */
+R4D_HOOKS(bf16f8)
 #undef R4D_HOOKS
 int r4d_rad_layout_fp8_rowmajor(const RadParam*, int, int, const RadEncoding*, const int*,
                                 const RadTensor*, int, RadLayout*);

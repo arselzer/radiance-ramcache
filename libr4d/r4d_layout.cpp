@@ -21,6 +21,7 @@
 
 #include "r4d_plugin.h"
 #include "r4d_enc.h"
+#include "r4d_bf16f8_layout.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -752,6 +753,131 @@ extern "C" int r4d_rad_relayout_w8a8(const RadParam* p, int n_p, int operand,
                                      const RadEncoding* enc, const int* sel, const RadTensor* pl,
                                      int n, void* dst, int64_t dst_bytes) {
     return w8_relayout(p, n_p, operand, enc, sel, pl, n, dst, dst_bytes, 0);
+}
+
+/* ---- bf16f8: a plain bf16 weight every 32x32 block of which is E4M3 codes times one power of
+ * two, stored as those codes in the w8 fragment order above (32 K a packet, no +128) and one E8M0
+ * exponent a block (r4d_bf16f8_layout.h), for gemm_nt_bf16f8: gemm_nt's products from half the
+ * bytes. Operand 1 of gemm_nt's schema (`b`).
+ *
+ * The container keeps the bf16 plane. The exponent is derived from it as mxfp4's row reference is,
+ * a block's maximum, and every element is then re-encoded and checked, so a weight that is not
+ * exactly so is refused at load (RAD_E_FORMAT), never rounded: the stored form decodes to the
+ * plane's own bits, signed zeros included. */
+namespace {
+constexpr int BF8_OPERAND = 1;
+
+int bf8_geom(const RadParam* p, int n_p, int operand, const RadEncoding* enc, const int* sel,
+             const RadTensor* pl, int n, int64_t* N, int64_t* K) {
+    if (!pl) return RAD_E_INVAL;
+    if (operand != BF8_OPERAND) return RAD_E_UNSUPPORTED;
+    if (!enc || !rad_enc_is(enc, "plain") || enc->n_planes != 1 || enc->plane[0].dtype != RAD_BF16)
+        return RAD_E_DTYPE;
+    *N = r4d_pgeti_or(p, n_p, "N", 0);
+    *K = r4d_pgeti_or(p, n_p, "K", 0);
+    if (*N <= 0 || *K <= 0) return RAD_E_INVAL;
+    if (n != 1 || !selects(enc, sel, n, "codes") || pl[0].dtype != RAD_BF16 || !dims(pl[0], *N, *K))
+        return RAD_E_SHAPE;
+    if (*N % R4D_NTILE || *K % R4D_BF16F8_BLOCK) return RAD_E_SHAPE;
+    return RAD_OK;
+}
+
+/* r4d_bf16f8_slot's offset inside a 512-byte packet, for row r of a 16-row tile and k of a 32-K
+ * block. */
+struct Bf8Perm {
+    uint16_t at[16][32];
+    Bf8Perm() {
+        for (int r = 0; r < 16; ++r)
+            for (int c = 0; c < 32; ++c) at[r][c] = (uint16_t)r4d_bf16f8_slot(32, r, c);
+    }
+};
+const Bf8Perm& bf8_perm() {
+    static const Bf8Perm p;
+    return p;
+}
+
+int bf8_refused(int64_t n, int64_t k, uint16_t x, int s) {
+    if (s > R4D_BF16F8_SMAX)
+        std::fprintf(stderr, "[r4d] bf16f8: the 32x32 block at (%lld, %lld) needs 2^(%d-127), past "
+                             "E8M0's 2^(%d-127)\n", (long long)n, (long long)k, s, R4D_BF16F8_SMAX);
+    else
+        std::fprintf(stderr, "[r4d] bf16f8: element (%lld, %lld) = 0x%04x is not an E4M3 code times "
+                             "2^(%d-127), its block's exponent\n", (long long)n, (long long)k,
+                     (unsigned)x, s);
+    return RAD_E_FORMAT;
+}
+}  /* namespace */
+
+extern "C" int r4d_rad_layout_bf16f8(const RadParam* p, int n_p, int operand,
+                                     const RadEncoding* enc, const int* sel, const RadTensor* pl,
+                                     int n, RadLayout* out) {
+    if (!out) return RAD_E_INVAL;
+    int64_t N, K;
+    const int rc = bf8_geom(p, n_p, operand, enc, sel, pl, n, &N, &K);
+    if (rc != RAD_OK) return rc;
+    fill(out, "r4d.bf16f8.e4m3.e8m0b32.frag32", R4D_DT_BF16F8, N, K, r4d_bf16f8_bytes(N, K));
+    return RAD_OK;
+}
+
+extern "C" int r4d_rad_relayout_bf16f8(const RadParam* p, int n_p, int operand,
+                                       const RadEncoding* enc, const int* sel, const RadTensor* pl,
+                                       int n, void* dst, int64_t dst_bytes) {
+    int64_t N, K;
+    const int rc = bf8_geom(p, n_p, operand, enc, sel, pl, n, &N, &K);
+    if (rc != RAD_OK) return rc;
+    if (!dst || !pl[0].data || dst_bytes != r4d_bf16f8_bytes(N, K)) return RAD_E_SHAPE;
+    const uint16_t* W = (const uint16_t*)pl[0].data;
+    uint8_t* q = (uint8_t*)dst;
+    const int64_t kpb = K / R4D_BF16F8_BLOCK, ldws = r4d_bf16f8_ldws(K);
+    /* The codes cover [0, N*K) exactly (the slot map is a bijection there); the pads and the
+     * scales' row padding are zeros. */
+    std::memset(q + N * K, 0, (size_t)(dst_bytes - N * K));
+    uint8_t* sc = q + r4d_bf16f8_scale_off(N, K);
+    const Bf8Perm& P = bf8_perm();
+    for (int64_t n0 = 0; n0 < N; n0 += R4D_BF16F8_BLOCK) {
+        const int rows = N - n0 < R4D_BF16F8_BLOCK ? (int)(N - n0) : R4D_BF16F8_BLOCK;
+        for (int64_t kb = 0; kb < kpb; ++kb) {
+            const uint16_t* blk = W + n0 * K + kb * R4D_BF16F8_BLOCK;
+            const int s = r4d_bf16f8_block_exp(blk, K, rows);
+            if (s > R4D_BF16F8_SMAX) return bf8_refused(n0, kb * R4D_BF16F8_BLOCK, 0, s);
+            sc[(n0 / R4D_BF16F8_BLOCK) * ldws + kb] = (uint8_t)s;
+            for (int i = 0; i < rows; ++i) {
+                const int64_t row = n0 + i;
+                uint8_t* pk = q + ((row / R4D_NTILE) * kpb + kb) * 512;
+                const uint16_t* x = blk + i * K;
+                const uint16_t* at = P.at[row % R4D_NTILE];
+                for (int j = 0; j < R4D_BF16F8_BLOCK; ++j) {
+                    const int c = r4d_bf16f8_encode(x[j], (uint32_t)s);
+                    if (c < 0) return bf8_refused(row, kb * R4D_BF16F8_BLOCK + j, x[j], s);
+                    pk[at[j]] = (uint8_t)c;
+                }
+            }
+        }
+    }
+    return RAD_OK;
+}
+
+/* The bf16 plane back from the stored form, for tools (RadUnrelayoutFn). A NaN code or an exponent
+ * the relayout never writes is refused rather than expanded. */
+extern "C" int r4d_rad_unrelayout_bf16f8(const RadParam* p, int n_p, int operand,
+                                         const RadEncoding* enc, const int* sel, const void* src,
+                                         int64_t src_bytes, const RadTensor* pl, int n) {
+    int64_t N, K;
+    const int rc = bf8_geom(p, n_p, operand, enc, sel, pl, n, &N, &K);
+    if (rc != RAD_OK) return rc;
+    if (!src || !pl[0].data || src_bytes != r4d_bf16f8_bytes(N, K)) return RAD_E_SHAPE;
+    const uint8_t* q = (const uint8_t*)src;
+    const uint8_t* sc = q + r4d_bf16f8_scale_off(N, K);
+    const int64_t ldws = r4d_bf16f8_ldws(K);
+    uint16_t* W = (uint16_t*)pl[0].data;
+    for (int64_t nn = 0; nn < N; ++nn)
+        for (int64_t k = 0; k < K; ++k) {
+            const uint32_t s = sc[(nn / R4D_BF16F8_BLOCK) * ldws + k / R4D_BF16F8_BLOCK];
+            const uint32_t c = q[r4d_bf16f8_slot(K, nn, k)];
+            if ((c & 0x7F) == 0x7F || s < R4D_BF16F8_SMIN || s > R4D_BF16F8_SMAX) return RAD_E_FORMAT;
+            W[nn * K + k] = r4d_bf16f8_expand(c, s);
+        }
+    return RAD_OK;
 }
 
 /* ---- w2a8: u2 codes, asymmetric, an f16 scale and an integer zero per group, both streams

@@ -481,6 +481,11 @@ struct MoeFP8 {
     struct Beside {
         void (*fn)(RadCtx*, void*) = nullptr;
         void* arg = nullptr;
+        /* Optional, called with `arg` once the block's card work before the gather is issued
+         * (after the shared arm's down): work that should overlap the wait for the gather's
+         * inputs, such as reads of the next layer's weights into the on-die cache. Same rule:
+         * it touches nothing the block reads or writes. */
+        void (*tail)(RadCtx*, void*) = nullptr;
     };
     void step(RadCtx* c, const RadBatch* batch, const Beside& beside) const;
     /* The block over the first `T` rows of its buffers, for passes that need fewer rows than the
@@ -1829,6 +1834,7 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
                     brows(w.sorted, rows * k), poff, brows(w.edn, rows * k));
     }
     if (shared) sh_down.step(c_, w.sff, w.sout, T, r0, rows);
+    if (beside && beside->tail && r0 == 0) beside->tail(c_, beside->arg);
     /* The calibration tap reads the GEMMs' operands and writes nothing they touch, so it does not
      * change the model's output. */
     if (op_gram_gu && !calib_done) {

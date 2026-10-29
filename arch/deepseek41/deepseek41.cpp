@@ -39,6 +39,15 @@
 namespace deepseek41 {
 using namespace rad::arch;
 
+/* RADIANCE_EXPERIMENTAL_DS41_PREFETCH_ATTN=1: see Layer::pf_qa. */
+static bool prefetch_attn_on() {
+    static const bool on = [] {
+        const char* s = std::getenv("RADIANCE_EXPERIMENTAL_DS41_PREFETCH_ATTN");
+        return s && !std::strcmp(s, "1");
+    }();
+    return on;
+}
+
 /* RAD_ARCH_TRY that names the call that failed: a refused declaration otherwise surfaces only as
  * the plugin's return code. */
 #define DS_TRY(e)                                                                                \
@@ -346,6 +355,10 @@ struct Layer {
     std::vector<rad_weight> wo_a;
     rad_weight comp_w = 0, comp_norm = 0, ik_w = 0, ik_norm = 0, iq_w = 0, iproj = 0;
     rad_weight e_mult = 0, e_vsz = 0, e_off = 0, e_kv = 0, e_gate = 0;
+    /* Reads of this layer's q_a, kv, q_b and wo_a into the card's on-die cache, issued by the layer
+     * before it (pf_attn_tail); 0 unless RADIANCE_EXPERIMENTAL_DS41_PREFETCH_ATTN=1. */
+    rad_op pf_qa = 0, pf_kv = 0, pf_qb = 0;
+    std::vector<rad_op> pf_oa;
     /* ops, in issue order */
     rad_op e_ids = 0, e_emb = 0, e_copy = 0, e_gemm = 0, e_gather = 0, e_gate_op = 0, e_back = 0;
     /* This Engram layer's row ids [T, heads]: one buffer a layer, since step() writes every
@@ -1376,6 +1389,12 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
         L.wo_b = lw(b, m, nm.f("blk.%d.attn_output_b.weight", l), D, ok, grp, RAD_SHARD_COL,
                     m.ar * ok, (m.ar + 1) * ok);
         L.o_b = linear(b, m, T, L.wo_b, D, ok, m.oa, m.attn_out);
+        if (prefetch_attn_on() && !m.wty.count(L.wq_a)) {
+            L.pf_qa = decl_prefetch(b, L.wq_a, c.q_lora * D * 2);
+            L.pf_kv = decl_prefetch(b, L.wkv, hd * D * 2);
+            L.pf_qb = decl_prefetch(b, L.wq_b, HD * c.q_lora * 2);
+            for (rad_weight wa : L.wo_a) L.pf_oa.push_back(decl_prefetch(b, wa, c.o_rank * gd * 2));
+        }
     }
     /* The heads' partial outputs (zeros on an attention-zero rank) summed over every rank. */
     if (g.world > 1)
@@ -2163,7 +2182,27 @@ struct MixBeside {
     const Layer* L;
     const Model* m;
     int64_t T;
+    const Layer* next = nullptr;   /* whose attention weights pf_attn_tail reads; null: none */
 };
+/* The next layer's q_a, kv, q_b and wo_a read into the on-die cache while the card waits for this
+ * layer's CPU rows (MoeFP8::Beside::tail), on lane 1 behind a join, as prefetch_beside does
+ * (rad_arch.h). They only read, so no value changes. */
+static void pf_attn_tail(RadCtx* x, void* a) {
+    const Layer* nx = ((const MixBeside*)a)->next;
+    if (!nx || !nx->pf_qa) return;
+    const bool l0 = prefetch_lane0();
+    if (!l0 && (rad_lane_join(x, 0, 1) != RAD_OK || rad_lane(x, 1) != RAD_OK)) {
+        rad_lane(x, 0);
+        return;
+    }
+    RAD_ISSUE(x, nx->pf_qa, RAD_W(nx->wq_a));
+    if (nx->pf_kv) RAD_ISSUE(x, nx->pf_kv, RAD_W(nx->wkv));
+    if (nx->pf_qb) RAD_ISSUE(x, nx->pf_qb, RAD_W(nx->wq_b));
+    for (size_t j = 0; j < nx->pf_oa.size() && j < nx->wo_a.size(); ++j)
+        if (nx->pf_oa[j]) RAD_ISSUE(x, nx->pf_oa[j], RAD_W(nx->wo_a[j]));
+    if (!l0) rad_lane(x, 0);
+}
+
 static void mix_f_beside(RadCtx* x, void* a) {
     const MixBeside& p = *(const MixBeside*)a;
     const Layer& L = *p.L;
@@ -2546,9 +2585,15 @@ static void step(RadCtx* x, const RadBatch* batch) {
         };
         col_f();
         MixBeside mb{ &L, &m, T };
+        /* Decode passes only (prompt steps keep their reads to themselves, rad_arch.h), and not
+         * ahead of an Engram layer, whose 79 MB GEMM would evict the reads before attention. */
+        const Layer* nl = L.l + 1 < c.n_layer ? &m.layers[(size_t)L.l + 1] : nullptr;
+        if (nl && nl->pf_qa && !nl->e_gemm && batch->phase == RAD_PHASE_DECODE && T <= kPrefetchRows)
+            mb.next = nl;
         MoeFP8::Beside bs;
         bs.fn = mix_f_beside;
         bs.arg = &mb;
+        bs.tail = pf_attn_tail;
         L.moe.step(x, batch, bs);
         /* post_f, or post_f with the next collapse + norm (the next layer's pcn_a, or pcn_fin). */
         const Layer* nx = L.l + 1 < c.n_layer ? &m.layers[(size_t)L.l + 1] : nullptr;

@@ -306,6 +306,15 @@ typedef struct RadBatch {
      * exact (the end of the prompt, or the deepest checkpoint below it); 0 without a cut. For
      * checks and logs: what a step issues depends on consumer_full alone. */
     int64_t consumer_end;
+
+    /* ---- appended (private; RAD_ABI_VERSION does not move): large-chunk prefill
+     * (RADIANCE_EXPERIMENTAL_DS41_LCP, core/place/ep_route_counts.h). Trailing, and zero or null on
+     * every step a plugin or stager that does not know them can see. */
+    /* Host. A pure prefill step of one sequence under LCP: the first of its rows whose routed units
+     * the RAM cache admits (the rows inside the prompt's last N tokens, ..._LCP_ADMIT); rows before it
+     * borrow read-only and insert nothing. 0 on every other step: everything admitted, as before. */
+    int32_t lcp_admit_row;
+    int32_t lcp_rsv;               /* zero */
 } RadBatch;
 
 /* What a generator pass carries beside the step batch's own fields, which keep their meanings:

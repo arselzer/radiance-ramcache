@@ -1143,6 +1143,17 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
         }
     }
 
+    /* Large-chunk prefill's admission (RadBatch::lcp_admit_row): a step whose only entry is a pure
+     * prefill chunk (no decode or speculative rows, no draft pass, more than 16 tokens: the predicate
+     * of native_file_cache_prefill_policy) admits only its rows inside the prompt's last N tokens into
+     * the RAM cache; every other step admits everything, as before. */
+    int32_t lcp_admit = 0;
+    if (lcp_ > 0 && plan.draft_pass == 0 && plan.e.size() == 1 && plan.n_seq_decode == 0 && plan.n_spec == 0) {
+        const StepEntry& e = plan.e[0];
+        if (e.is_prefill && e.n_tokens > 16 && e.prompt_end > 0)
+            lcp_admit = lcp_admit_row_for(lcp_admit_, e.ctx_len, e.n_tokens, e.prompt_end);
+    }
+
     /* build_groups consumes the manager's change marks, so any failure before every rank's
      * upload is issued must forget_tables(). */
     if (int st = build_groups(plan, kv, s, o); st < 0) {
@@ -1263,6 +1274,8 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
         B.consumer_full = cs_full;
         B.consumer_rsv = 0;
         B.consumer_end = cs_end;
+        B.lcp_admit_row = lcp_admit;
+        B.lcp_rsv = 0;
     }
     /* Record the flight behind everything reading this span: the upload and the derivation
      * copies. */

@@ -172,6 +172,25 @@ Engine::~Engine() {
             RAD_INFO("host experts: %llu jobs of four or more rows of one expert (%llu rows) went "
                      "through the many-row kernel", (unsigned long long)hx.many_jobs,
                      (unsigned long long)hx.many_rows);
+        if (r->index == 0 && r->fstager.host_experts())
+            if (const HostExpertPool* pool = HostExpertPool::get(); pool && pool->submit_waits())
+                RAD_INFO("host experts: submitters waited %llu times for a free job slot (%d slots), %.1f ms "
+                         "in all, outside the submit lock", (unsigned long long)pool->submit_waits(),
+                         HostExpertPool::slots(), (double)pool->submit_wait_ns() / 1e6);
+        if (hx.lcp_layers)
+            RAD_INFO("large-chunk prefill, rank %d: %llu layers streamed their misses in %llu read waves; "
+                     "%llu units went to the pool as their reads landed, %llu after the call (a leg read "
+                     "again); %.1f ms waiting for a wave's jobs before reusing its planes",
+                     r->index, (unsigned long long)hx.lcp_layers, (unsigned long long)hx.lcp_waves,
+                     (unsigned long long)hx.lcp_landed, (unsigned long long)hx.lcp_late,
+                     (double)hx.lcp_wave_wait_ns / 1e6);
+        if (hx.lcp_hit_admit || hx.lcp_hit_ro || hx.lcp_miss_admit || hx.lcp_miss_ro || hx.lcp_miss_dropped)
+            RAD_INFO("large-chunk prefill, rank %d: RAM cache admission over chunks: %llu cached units leased "
+                     "admitted (LRU touch) and %llu read-only; %llu misses relaid into the cache, %llu computed "
+                     "and let go (read-only), %llu admitted but dropped at the insert queue's cap",
+                     r->index, (unsigned long long)hx.lcp_hit_admit, (unsigned long long)hx.lcp_hit_ro,
+                     (unsigned long long)hx.lcp_miss_admit, (unsigned long long)hx.lcp_miss_ro,
+                     (unsigned long long)hx.lcp_miss_dropped);
         if (hx.early)
             RAD_INFO("host experts, early issue: %llu layers issued their card ops ahead of their counts "
                      "sync and waited %.1f ms for the counts at their gathers (%.1f us a layer; also in "

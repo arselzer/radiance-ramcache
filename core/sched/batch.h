@@ -8,6 +8,8 @@
  * tear a block table) and the host can stage several passes ahead of the card.
  */
 #pragma once
+#include <algorithm>
+
 #include "advance.h"
 #include "consumer_skip.h"
 #include "device/device.h"
@@ -72,6 +74,9 @@ struct StepEntry {
      * builder derives the step's RadBatch::consumer_full from when the entry is the step's only
      * one; 0 otherwise. */
     int64_t consumer_end = 0;
+    /* A prefill entry: the position its prompt's prefill ends at (SchedReq::seq_len()), 0 for any
+     * other entry. Large-chunk prefill's admission (RadBatch::lcp_admit_row) counts back from it. */
+    int64_t prompt_end = 0;
 };
 
 struct StepPlan {
@@ -161,6 +166,20 @@ public:
         uint64_t off_grid = 0;
     };
     const ConsumerStats& consumer_stats() const { return cs_stats_; }
+    /* Large-chunk prefill (RADIANCE_EXPERIMENTAL_DS41_LCP=C, Scheduler::lcp_init): a step whose only
+     * entry is a pure prefill chunk carries RadBatch::lcp_admit_row, the first of its rows whose units
+     * the RAM cache admits: those within the prompt's last `admit` tokens (0 none, -1 all). Off
+     * (C 0): every step's is 0, the cache's policy as before. */
+    void set_lcp(int64_t C, int64_t admit) {
+        lcp_ = C;
+        lcp_admit_ = admit;
+    }
+    /* RadBatch::lcp_admit_row for a step of one prefill entry `e` (and nothing else beside it). */
+    static int32_t lcp_admit_row_for(int64_t admit, int64_t ctx_len, int64_t n_tokens, int64_t prompt_end) {
+        if (admit < 0 || n_tokens <= 0) return 0;
+        const int64_t first = prompt_end - admit - ctx_len;   /* the chunk's first row in the last `admit` */
+        return (int32_t)std::clamp<int64_t>(first, 0, n_tokens);
+    }
 
     /* An encoder pass (RadBatch::enc): patches of whole segments of one or more media items,
      * staged into every rank's encoder input, since each rank runs the tower itself. Returns rank
@@ -300,6 +319,7 @@ private:
      * the counters. */
     ConsumerShape cs_{};
     bool          cs_on_ = false;
+    int64_t       lcp_ = 0, lcp_admit_ = 128;   /* set_lcp */
     int64_t       cs_end_ = -1;
     std::vector<int64_t> cs_f_;
     ConsumerStats cs_stats_;

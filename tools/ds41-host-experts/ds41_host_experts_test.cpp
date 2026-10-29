@@ -10,8 +10,10 @@
  *   ds41_host_experts_test pkbench [experts] [threads...]  as tiles: block_mxfp4, packed, planes in turn
  *   ds41_host_experts_test hot [reps] [rows] [planes]  one matrix in cache, one thread (perf stat)
  *   ds41_host_experts_test rbench [experts] [threads] [block|packed|planes] [rows...]  the pool's shape
- *                                           at 1, 2, 4, 8, 16, 32 token rows an expert: today's jobs of
- *                                           four rows against one job of every row (gemv_avx2_many)
+ *                                           at 1, 2, 4, 8, 16, 32 token rows an expert (up to 128):
+ *                                           today's jobs of four rows against one job of every row
+ *                                           (gemv_avx2_many) and the pool's even cuts at 32 and 64
+ *                                           rows a job (..._MAX_ROWS)
  *   ds41_host_experts_test rhot [reps] [rows] [block|packed|planes] [n] [tile]  few and many rows, one
  *                                           matrix in cache, one thread, in 64-row tiles
  *
@@ -244,9 +246,10 @@ int check() {
         /* Several token rows of the matrix, the case's x and more of its kind, each row as gemv_avx2
          * gives it alone, in every layout: gemv_avx2_few on 2 .. 5 rows (5: a call of four and one of
          * one), gemv_avx2_many on 1 .. 33 (33: a call of 32 and one of one; every remainder of its
-         * register blocks of four rows), also over output rows [8, N) only, and gemv_avx2_rows, which
-         * takes one or the other, on 1 .. 33. */
-        constexpr int kRowsMax = 33;
+         * register blocks of four rows) and on the pool's jobs of up to 64 rows (..._MAX_ROWS=64:
+         * two calls of 32, and every split of a job between 33 and 64), also over output rows [8, N)
+         * only, and gemv_avx2_rows, which takes one or the other, on 1 .. 33. */
+        constexpr int kRowsMax = 64;
         std::vector<std::vector<uint16_t>> xr(kRowsMax);
         for (int i = 0; i < kRowsMax; ++i)
             xr[(size_t)i] = i ? make_x(c.K, 31u * (uint64_t)i + (uint64_t)c.K + 3u * (uint64_t)c.act, c.act) : x;
@@ -282,13 +285,17 @@ int check() {
                 return d;
             };
             for (int rows = 2; rows <= 5; ++rows) dfew += run(gemv_avx2_few, rows);
-            for (int rows = 1; rows <= kRowsMax; ++rows) {
+            for (int rows = 1; rows <= 33; ++rows) {
                 dmany += run(gemv_avx2_many, rows);
                 drows += run(gemv_avx2_rows, rows);
             }
-            for (int rows : { 1, 3, 4, 6, 32, 33 }) dmany += run_from8(rows);
+            for (int rows : { 34, 40, 47, 48, 63, 64 }) {
+                dmany += run(gemv_avx2_many, rows);
+                drows += run(gemv_avx2_rows, rows);
+            }
+            for (int rows : { 1, 3, 4, 6, 32, 33, 64 }) dmany += run_from8(rows);
         }
-        std::printf("%-26s every layout: avx2 few 2..5 rows %zu, many 1..33 %zu, rows 1..33 %zu differing values\n",
+        std::printf("%-26s every layout: avx2 few 2..5 rows %zu, many 1..33 and 34..64 %zu, rows 1..64 %zu differing values\n",
                     c.name, dfew, dmany, drows);
         failures += dfew || dmany || drows;
     }
@@ -873,17 +880,21 @@ int pkbench(int experts, const std::vector<int>& counts, const std::string& dir)
  * the worker that ends a job's last gate_up tile runs its rows' swiglu and opens its down tiles.
  *   four  jobs of up to four rows through gemv_avx2_few (today's pool),
  *   rows  one job of all R rows through gemv_avx2_rows (gemv_avx2_many above kFewRows),
- *   many  one job of all R rows through gemv_avx2_many, at any R.
- * Seven samples of each, interleaved; the median ms an expert, and what each row past the first costs
- * against four's one-row expert. Every variant's rows are checked against four's. */
+ *   many  one job of all R rows through gemv_avx2_many, at any R (in calls of 32),
+ *   m32   the pool at ..._MAX_ROWS=32: ceil(R / 32) jobs as even as R allows, gemv_avx2_many,
+ *   m64   the same at ..._MAX_ROWS=64 (large-chunk prefill's choice: a hot expert's weight tile read
+ *         from DRAM once for 33 to 64 rows, where two 32-row jobs read it twice).
+ * R up to kRbRows (128). Seven samples of each, interleaved; the median ms an expert, and what each row
+ * past the first costs against four's one-row expert. Every variant's rows are checked against four's. */
+constexpr int kRbRows = 128;
 struct RJob {
     const Mx* gu = nullptr;
     const Mx* dn = nullptr;
     int rows = 0;
-    const uint16_t* x[kGemvRows] = {};
-    uint16_t* y[kGemvRows] = {};
-    uint16_t* gate_up[kGemvRows] = {};
-    uint16_t* act[kGemvRows] = {};
+    const uint16_t* x[kRbRows] = {};
+    uint16_t* y[kRbRows] = {};
+    uint16_t* gate_up[kRbRows] = {};
+    uint16_t* act[kRbRows] = {};
     std::atomic<int> next{ 0 }, gu_left{ 0 }, dn_left{ 0 };
     std::atomic<bool> open{ false };
 };
@@ -925,7 +936,7 @@ int rbench(int experts, int threads, const char* layout, const std::vector<int>&
     std::vector<float> silu(65536);
     silu_table_host(silu.data(), kLimit);
     int rmax = 1;
-    for (int r : row_counts) rmax = std::max(rmax, std::min(r, kGemvRows));
+    for (int r : row_counts) rmax = std::max(rmax, std::min(r, kRbRows));
     std::vector<std::vector<uint16_t>> xs((size_t)rmax);
     for (int i = 0; i < rmax; ++i) xs[(size_t)i] = make_x(kEmbd, 500u + (uint64_t)i, kNormal);
     /* y, gate_up and act of every expert and row; four's y kept for the check */
@@ -934,21 +945,24 @@ int rbench(int experts, int threads, const char* layout, const std::vector<int>&
     std::vector<uint16_t> gub((size_t)experts * rmax * 2 * kFf), acb((size_t)experts * rmax * kFf);
     Pool pool(threads);
     using Kern = void (*)(const Mx&, const uint16_t* const*, uint16_t* const*, int, int, int);
-    const char* const vname[3] = { "four", "rows", "many" };
-    const Kern kern[3] = { gemv_avx2_few, gemv_avx2_rows, gemv_avx2_many };
+    constexpr int kV = 5;
+    const char* const vname[kV] = { "four", "rows", "many", "m32", "m64" };
+    const Kern kern[kV] = { gemv_avx2_few, gemv_avx2_rows, gemv_avx2_many, gemv_avx2_many, gemv_avx2_many };
     double one_row = 0;   /* four's ms an expert at one row */
     for (int R : row_counts) {
-        R = std::max(1, std::min(R, kGemvRows));
+        R = std::max(1, std::min(R, kRbRows));
         const double bytes = 18.80064e6;
         auto build = [&](int v, std::vector<std::unique_ptr<RJob>>& jobs) {
             jobs.clear();
-            const int per = v == 0 ? kFewRows : kGemvRows;
+            /* Rows a job: four; all R (rows, many); or the pool's even cut at 32 or 64. */
+            const int per = v == 0 ? kFewRows : v == 3 ? 32 : v == 4 ? 64 : R;
+            const int nj = (R + per - 1) / per;
             for (int e = 0; e < experts; ++e)
-                for (int r0 = 0; r0 < R; r0 += per) {
+                for (int q = 0, r0 = 0; q < nj; ++q) {
                     auto j = std::make_unique<RJob>();
                     j->gu = &G[(size_t)e];
                     j->dn = &D[(size_t)e];
-                    j->rows = std::min(per, R - r0);
+                    j->rows = v == 0 ? std::min(per, R - r0) : R / nj + (q < R % nj ? 1 : 0);
                     for (int i = 0; i < j->rows; ++i) {
                         const int r = r0 + i;
                         j->x[i] = xs[(size_t)r].data();
@@ -956,11 +970,12 @@ int rbench(int experts, int threads, const char* layout, const std::vector<int>&
                         j->gate_up[i] = gub.data() + ((size_t)e * rmax + (size_t)r) * 2 * kFf;
                         j->act[i] = acb.data() + ((size_t)e * rmax + (size_t)r) * kFf;
                     }
+                    r0 += j->rows;
                     jobs.push_back(std::move(j));
                 }
         };
-        std::vector<std::unique_ptr<RJob>> jobs[3];
-        for (int v = 0; v < 3; ++v) build(v, jobs[v]);
+        std::vector<std::unique_ptr<RJob>> jobs[kV];
+        for (int v = 0; v < kV; ++v) build(v, jobs[v]);
         auto run = [&](int v) {
             std::vector<std::unique_ptr<RJob>>& js = jobs[v];
             for (auto& j : js) {
@@ -1008,11 +1023,11 @@ int rbench(int experts, int threads, const char* layout, const std::vector<int>&
             for (int p = 0; p < passes; ++p) s += run(v);
             return s / passes;
         };
-        for (int v = 0; v < 3; ++v) timed(v);   /* warm the code and the pages, not the caches */
-        std::vector<double> ts[3];
-        size_t bad[3] = {};
+        for (int v = 0; v < kV; ++v) timed(v);   /* warm the code and the pages, not the caches */
+        std::vector<double> ts[kV];
+        size_t bad[kV] = {};
         for (int rep = 0; rep < samples; ++rep)
-            for (int v = 0; v < 3; ++v) {
+            for (int v = 0; v < kV; ++v) {
                 std::fill(yb.begin(), yb.end(), (uint16_t)0xffff);
                 ts[v].push_back(timed(v));
                 if (v == 0 && rep == 0) y4 = yb;
@@ -1020,19 +1035,21 @@ int rbench(int experts, int threads, const char* layout, const std::vector<int>&
                     for (int e = 0; e < experts; ++e)
                         for (size_t i = 0; i < (size_t)R * kEmbd; ++i) bad[v] += yb[(size_t)e * per_e + i] != y4[(size_t)e * per_e + i];
             }
-        double med[3];
-        for (int v = 0; v < 3; ++v) {
+        double med[kV];
+        for (int v = 0; v < kV; ++v) {
             std::sort(ts[v].begin(), ts[v].end());
             med[v] = 1e3 * ts[v][(size_t)samples / 2] / experts;
         }
         if (R == 1 || one_row == 0) one_row = med[0];
         std::printf("%2d rows, %d threads, %d experts, %s: median ms an expert (best, worst), per row past the first:\n", R, threads,
                     experts, lname[lay]);
-        for (int v = 0; v < 3; ++v)
+        for (int v = 0; v < kV; ++v) {
+            const int reads = v == 0 ? (R + 3) / 4 : v == 3 ? (R + 31) / 32 : v == 4 ? (R + 63) / 64 : 1;
             std::printf("   %-4s %8.4f (%.4f, %.4f)  %.4f ms a row, %+.4f ms each row more%s  %5.1f GB/s  rows %s\n", vname[v], med[v],
                         1e3 * ts[v][0] / experts, 1e3 * ts[v][(size_t)samples - 1] / experts, med[v] / R,
-                        R > 1 ? (med[v] - one_row) / (R - 1) : 0.0, R > 1 ? "" : " (one row)", bytes * (v == 0 ? (R + 3) / 4 : 1) / (med[v] * 1e-3) / 1e9,
+                        R > 1 ? (med[v] - one_row) / (R - 1) : 0.0, R > 1 ? "" : " (one row)", bytes * reads / (med[v] * 1e-3) / 1e9,
                         bad[v] ? "DIFFER" : "identical");
+        }
     }
     return 0;
 }

@@ -20,7 +20,8 @@
 
 namespace rad {
 
-static_assert(HostExpertPool::kMaxRowsCap == ds41hx::kGemvRows, "a job's rows are one many-row kernel call");
+static_assert(HostExpertPool::kMaxRowsCap % ds41hx::kGemvRows == 0 && HostExpertPool::kMaxRowsCap >= ds41hx::kGemvRows,
+              "a job's rows are whole many-row kernel calls (gemv_avx2_many runs more in calls of kGemvRows)");
 static_assert(HostExpertPool::kMaxRowsDefault == ds41hx::kFewRows, "jobs of up to four rows can take the few-row kernel");
 
 namespace {
@@ -154,7 +155,7 @@ int HostExpertPool::start(int threads, const std::vector<int>& cpus) {
     slots_.reset(new (std::nothrow) Slot[kSlots]);
     if (!slots_) return RAD_E_NOMEM;
     /* Each slot's gate_up and act rows, 64-byte aligned (a slot's rows take max_rows() * 13824 bytes:
-     * 7 MB in all at four rows, 57 MB at 32). */
+     * 14 MB in all at four rows, 113 MB at 32, 226 MB at 64). */
     const size_t per = (size_t)max_rows() * 3 * kFf;
     void* rb = nullptr;
     if (posix_memalign(&rb, 64, (size_t)kSlots * per * sizeof(uint16_t)) != 0) return RAD_E_NOMEM;
@@ -218,10 +219,20 @@ int HostExpertPool::submit(const Job* jobs, int n, Ticket* t) {
                 if (slots_[slot].state.load(std::memory_order_acquire) == 0) break;
             if (slot < kSlots) break;
             /* Every slot taken: the workers must be awake to free one, including for the jobs
-             * this call has published so far. */
+             * this call has published so far. Waited outside the submit lock, so another caller
+             * (another rank's urgent misses) can take the next slot that frees meanwhile. */
+            lk.unlock();
             wake();
-            std::unique_lock<std::mutex> sl(slot_mu_);
-            slot_cv_.wait_for(sl, std::chrono::microseconds(50));
+            const auto w0 = std::chrono::steady_clock::now();
+            {
+                std::unique_lock<std::mutex> sl(slot_mu_);
+                slot_cv_.wait_for(sl, std::chrono::microseconds(50));
+            }
+            submit_waits_.fetch_add(1, std::memory_order_relaxed);
+            submit_wait_ns_.fetch_add((uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                          std::chrono::steady_clock::now() - w0).count(),
+                                      std::memory_order_relaxed);
+            lk.lock();
             slot = 0;
         }
         Slot& s = slots_[slot];

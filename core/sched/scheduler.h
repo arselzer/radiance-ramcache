@@ -476,6 +476,8 @@ public:
      * end, or the deepest checkpoint below it its idle prefill writes (idle_prefill_checkpoint)
      * when the prefix cache is on. */
     bool    consumer_on() const { return cs_on_; }
+    /* Large-chunk prefill (RADIANCE_EXPERIMENTAL_DS41_LCP): C once init admitted it, else 0. */
+    int64_t lcp_rows() const { return lcp_; }
     int64_t consumer_target(const SchedReq& s) const;
     /* The deepest checkpoint plan_chunk's chunks write for `r` from its computed tokens to `end`
      * at the whole step budget, or -1. */
@@ -783,6 +785,9 @@ private:
     int64_t pf_skipped_ = 0;
     /* The consumer skip, as init decided it (consumer_on). */
     bool    cs_on_ = false;
+    /* Large-chunk prefill, as lcp_init decided it (lcp_rows). */
+    int64_t lcp_ = 0;
+    int     lcp_init(const Program& prog, const Config& cfg, size_t world);
     /* RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH=1 (read at init; acts under --prefix-resume
      * exact): a finished sequence publishes only up to SchedReq::grid_upto. An exact hit resumes
      * where a cold prefill starts a chunk and recomputes the cold chunks from there, but it also

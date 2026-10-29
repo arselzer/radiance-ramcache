@@ -5,6 +5,7 @@
 
 #include "mm/processor.h"
 #include "sched/mtp_couple_bind.h"
+#include "place/ep_route_counts.h"
 #include "sched/scheduler.h"
 #include "sched/advance_impl.h"
 #include "sched/derive.h"
@@ -7726,5 +7727,160 @@ TEST(consumer_skip_is_refused_for_unlike_ranks_and_kv_streaming) {
         f.cfg.kv_resident = 1024;
         REQUIRE_EQ(f.start(), RAD_OK);
         CHECK(!f.sch.consumer_on());
+    }
+}
+
+/* ================================================================== large-chunk prefill */
+/* RADIANCE_EXPERIMENTAL_DS41_LCP=<C> on the scheduler (Scheduler::lcp_init; the kernels' side is
+ * FileStager::lcp_init, tests/ds41_tall_test.cpp): in DeepSeek-V4.1's shape (linear state beside the
+ * window, so the checkpoint interval caps chunks even without the prefix cache) a lone prompt runs
+ * in chunks of C, split only at the interval and the tail; the deployments that would cut chunks
+ * short, share a chunk's step or speculate are refused, and so is LCP no file stager took. */
+namespace {
+
+/* Forces the switch (and the ranks whose stager admitted it) for one case. */
+struct LcpOn {
+    LcpOn(int64_t c, int admitted) {
+        ds41_lcp_set_for_test(c);
+        lcp_admitted_reset_for_test(admitted);
+    }
+    ~LcpOn() {
+        ds41_lcp_set_for_test(-2);
+        lcp_admitted_reset_for_test(0);
+    }
+};
+
+/* ds41_fixture's shape (linear state beside the window, the state chunk 1) at chunks of C and 8,192
+ * tokens of context, the prefix cache off (the A/B's). */
+void lcp_fixture(Fixture& f, int64_t C, int64_t interval) {
+    f.build(8192, 64, /*max_tok=*/C, 8192, /*windowed=*/true, /*linear=*/true);
+    f.prog.meta.n_ctx_train = 8192;
+    f.prog.ops.resize(1);
+    f.kv.snap = { 3 };
+    f.pc.groups = { 0 };
+    f.cfg.checkpoint_interval = interval;
+    f.cfg.prefix_exact = true;
+    f.cfg.max_seqs = 1;
+    f.cfg.prefix_cache = false;
+}
+
+}  /* namespace */
+
+TEST(lcp_runs_a_lone_prompt_in_chunks_of_c) {
+    for (const int64_t C : { 256, 512, 1024, 2048 }) {
+        LcpOn on(C, 1);
+        Fixture f;
+        lcp_fixture(f, C, 2048);
+        REQUIRE_EQ(f.start(), RAD_OK);
+        CHECK_EQ(f.sch.lcp_rows(), C);
+        CHECK_EQ(f.sch.geometry().quantum, 16);
+        /* 3,086 and 6,817 tokens: chunks of C up to the interval grid, the tail chunk split at its last
+         * quantum boundary as at 16-token chunks. */
+        for (const int64_t n : { 933, 3086, 6817 }) {
+            const Cut c = cut_from(f.sch, 0, n, C);
+            REQUIRE(!c.ends.empty());
+            int64_t prev = 0, short_chunks = 0;
+            for (size_t i = 0; i < c.ends.size(); ++i) {
+                const int64_t len = c.ends[i] - prev;
+                CHECK(len <= C);
+                CHECK_EQ(prev % 16, (int64_t)0);
+                if (len < C && i + 2 < c.ends.size()) ++short_chunks;   /* only the last two may be short */
+                prev = c.ends[i];
+            }
+            CHECK_EQ(prev, n);
+            CHECK_EQ(short_chunks, (int64_t)0);
+        }
+    }
+    /* At 1,024 a 3,086-token prompt: [0, 1024), [1024, 2048), [2048, 3072), [3072, 3086). */
+    {
+        LcpOn on(1024, 1);
+        Fixture f;
+        lcp_fixture(f, 1024, 2048);
+        REQUIRE_EQ(f.start(), RAD_OK);
+        const Cut c = cut_from(f.sch, 0, 3086, 1024);
+        CHECK(c.ends == std::vector<int64_t>({ 1024, 2048, 3072, 3086 }));
+    }
+    /* A span over a smaller interval: chunks of C after the first interval. */
+    {
+        LcpOn on(1024, 1);
+        Fixture f;
+        lcp_fixture(f, 1024, 256);
+        f.cfg.prefix_cache = true;
+        f.cfg.prefill_span = 4;
+        REQUIRE_EQ(f.start(), RAD_OK);
+        CHECK_EQ(f.sch.lcp_rows(), (int64_t)1024);
+    }
+    /* Off: no LCP whatever the budget. */
+    {
+        LcpOn off(0, 0);
+        Fixture f;
+        lcp_fixture(f, 1024, 2048);
+        REQUIRE_EQ(f.start(), RAD_OK);
+        CHECK_EQ(f.sch.lcp_rows(), (int64_t)0);
+    }
+}
+
+TEST(lcp_is_refused_where_chunks_would_not_be_c_or_share_a_step) {
+    auto refused = [](Fixture& f, const char* what) {
+        std::string err;
+        int rc = 0;
+        err = stderr_of([&] { rc = f.start(); });
+        CHECK_EQ(rc, (int)RAD_E_INVAL);
+        CHECK(has(err, "large-chunk prefill) refused"));
+        CHECK(has(err, what));
+    };
+    {   /* the budget is not C */
+        LcpOn on(1024, 1);
+        Fixture f;
+        lcp_fixture(f, 512, 2048);
+        refused(f, "--max-num-batched-tokens 512");
+    }
+    {   /* an interval below C with no span: chunks of the interval */
+        LcpOn on(1024, 1);
+        Fixture f;
+        lcp_fixture(f, 1024, 256);
+        refused(f, "below the chunk");
+    }
+    {   /* an interval past C and not a multiple of it */
+        LcpOn on(1024, 1);
+        Fixture f;
+        lcp_fixture(f, 1024, 1536);
+        refused(f, "not a multiple of the chunk");
+    }
+    {   /* a span too short for C */
+        LcpOn on(1024, 1);
+        Fixture f;
+        lcp_fixture(f, 1024, 256);
+        f.cfg.prefix_cache = true;
+        f.cfg.prefill_span = 2;
+        refused(f, "--prefill-span 2");
+    }
+    {   /* concurrent sequences without prefill-alone steps */
+        LcpOn on(1024, 1);
+        Fixture f;
+        lcp_fixture(f, 1024, 2048);
+        f.cfg.max_seqs = 4;
+        refused(f, "--max-num-seqs 4");
+    }
+    {   /* speculation */
+        LcpOn on(1024, 1);
+        Fixture f;
+        lcp_fixture(f, 1024, 2048);
+        f.cfg.n_spec = 2;
+        refused(f, "speculation");
+    }
+    {   /* no file stager took it */
+        LcpOn on(1024, 0);
+        Fixture f;
+        lcp_fixture(f, 1024, 2048);
+        refused(f, "took it on 0 of 1 ranks");
+    }
+    {   /* a value outside the switch's range */
+        LcpOn on(-1, 1);
+        Fixture f;
+        lcp_fixture(f, 1024, 2048);
+        int rc = 0;
+        (void)stderr_of([&] { rc = f.start(); });
+        CHECK_EQ(rc, (int)RAD_E_INVAL);
     }
 }

@@ -1,5 +1,6 @@
 /* Private counts contract for released DeepSeek native EP4, M<=16 (M<=48 under
- * RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=1, as far as the step goes). No SDK ABI change. */
+ * RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=1, as far as the step goes; M<=C under
+ * RADIANCE_EXPERIMENTAL_DS41_LCP=C). No SDK ABI change. */
 #pragma once
 #include <atomic>
 #include <cstdint>
@@ -46,9 +47,60 @@ inline int ds41_exact_tall_state() {
 inline void ds41_exact_tall_set_for_test(int state) {
     detail::g_exact_tall_forced.store(state, std::memory_order_relaxed);
 }
-/* The largest pass the counts contract admits: kEpRouteTallRows with the switch, else
+/* ---- large-chunk prefill: RADIANCE_EXPERIMENTAL_DS41_LCP=<C> (FileStager::lcp_init) ----------------
+ *
+ * Prefill in chunks of C tokens (a multiple of 16 in [kEpRouteLcpMin, kEpRouteLcpMax]), each giving
+ * the bits of the same tokens in 16-token passes: libr4d keeps EXACT_TALL's pins at every height (its
+ * twin row reaches kEpRouteLcpMax, libr4d/r4d_ds41_tall.h), and the core admits a step only when the
+ * bands it resolved say so (lcp_init: the routed GEMMs on the gemv rows to C, every other op on one
+ * kernel or on a pair known to give the same bits), --max-num-batched-tokens is C, the chunk geometry
+ * makes chunks of C, and the CPU computes every routed unit of every pass. The counts witness then
+ * admits passes of up to C tokens. */
+inline constexpr int64_t kEpRouteLcpMin = 64;
+inline constexpr int64_t kEpRouteLcpMax = 2048;
+inline constexpr const char* kLcpEnv = "RADIANCE_EXPERIMENTAL_DS41_LCP";
+
+namespace detail {
+/* Tests only (ds41_lcp_set_for_test): -2 reads the environment. */
+inline std::atomic<int64_t> g_lcp_forced{ -2 };
+/* The ranks whose file stager admitted LCP (FileStager::lcp_init and hx_init): the scheduler refuses
+ * LCP unless every rank's did (lcp_admitted_ranks). */
+inline std::atomic<int> g_lcp_admitted{ 0 };
+}  // namespace detail
+
+/* The switch: C when it is a multiple of 16 in [kEpRouteLcpMin, kEpRouteLcpMax], 0 off (unset,
+ * empty or "0"), -1 any other value (refused at FileStager::init). The environment is read once. */
+inline int64_t ds41_lcp_state() {
+    const int64_t forced = detail::g_lcp_forced.load(std::memory_order_relaxed);
+    if (forced != -2) return forced;
+    static const int64_t from_env = [] () -> int64_t {
+        const char* e = std::getenv(kLcpEnv);
+        if (!e || !*e || !std::strcmp(e, "0")) return 0;
+        char* end = nullptr;
+        const long long v = std::strtoll(e, &end, 10);
+        if (end == e || *end || v < kEpRouteLcpMin || v > kEpRouteLcpMax || v % 16) return -1;
+        return (int64_t)v;
+    }();
+    return from_env;
+}
+/* Tests: the switch as `state` (C, 0 or -1) until called again with -2, which goes back to the
+ * environment. Set before anything sized by the limit is made. */
+inline void ds41_lcp_set_for_test(int64_t state) {
+    detail::g_lcp_forced.store(state, std::memory_order_relaxed);
+}
+/* C, or 0 without (a valid) LCP. */
+inline int64_t ds41_lcp_rows() {
+    const int64_t s = ds41_lcp_state();
+    return s > 0 ? s : 0;
+}
+inline int  lcp_admitted_ranks() { return detail::g_lcp_admitted.load(std::memory_order_acquire); }
+inline void lcp_note_admitted() { detail::g_lcp_admitted.fetch_add(1, std::memory_order_acq_rel); }
+inline void lcp_admitted_reset_for_test(int ranks) { detail::g_lcp_admitted.store(ranks, std::memory_order_release); }
+
+/* The largest pass the counts contract admits: C under LCP, kEpRouteTallRows with EXACT_TALL, else
  * kEpRouteMaxRows. */
 inline int64_t ep_route_max_rows() {
+    if (const int64_t c = ds41_lcp_rows()) return c;
     return ds41_exact_tall_state() == 1 ? kEpRouteTallRows : kEpRouteMaxRows;
 }
 

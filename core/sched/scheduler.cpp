@@ -2,6 +2,7 @@
  */
 #include "scheduler.h"
 #include "mm/processor.h"
+#include "place/ep_route_counts.h"
 
 #include "server/sink.h"
 
@@ -48,6 +49,85 @@ void Scheduler::queue_insert(std::vector<int32_t>& q, int32_t slot) {
 void Scheduler::queue_erase(std::vector<int32_t>& q, int32_t slot) {
     auto it = std::find(q.begin(), q.end(), slot);
     if (it != q.end()) q.erase(it);
+}
+
+/* ------------------------------------------------------------------ large-chunk prefill */
+/* RADIANCE_EXPERIMENTAL_DS41_LCP=<C> (core/place/ep_route_counts.h; the file stager's lcp_init holds
+ * the kernels' side): the scheduler's half. Every chunk a lone prefill takes must be C tokens, the
+ * pass the bands were checked at, except a prompt's first interval under a span and its last
+ * chunk: --max-num-batched-tokens C, and a checkpoint interval (which caps chunks with linear state
+ * even without the prefix cache) that is a multiple of C, or with --prefill-span one that C is a
+ * multiple of, spanned to at least C. A step holds one sequence's chunk unless prefill runs alone
+ * (a C-token chunk holds the card ~10 s, and decode rows beside it would wait that long anyway).
+ * Refused, too, with speculation, and unless every rank's file stager took it (its line says
+ * what it admitted, or why not). `world` 0 skips that last check (tests). */
+int Scheduler::lcp_init(const Program& prog, const Config& cfg, size_t world) {
+    lcp_ = 0;
+    const int64_t C = ds41_lcp_rows();
+    if (ds41_lcp_state() < 0) {
+        RAD_ERR("%s: large-chunk prefill takes a chunk C, a multiple of 16 from %lld to %lld", kLcpEnv,
+                (long long)kEpRouteLcpMin, (long long)kEpRouteLcpMax);
+        return RAD_E_INVAL;
+    }
+    if (!C) return RAD_OK;
+    const int64_t I = geo_.checkpoint_interval;
+    const bool periodic = I > 0 && (!geo_.window_ckpt || geo_.window_periodic);
+    const bool spans = geo_.span > 1;
+    std::string why;
+    if (cfg.max_tok != C)
+        why = fmt("--max-num-batched-tokens %lld: give %lld", (long long)cfg.max_tok, (long long)C);
+    else if (periodic && !spans && I % C != 0)
+        why = fmt("the checkpoint interval %lld (it caps chunks: the model has linear state) is %s %lld: give "
+                  "--checkpoint-interval as a multiple of %lld, or --prefill-span %lld beside an interval that "
+                  "divides it", (long long)I, I < C ? "below the chunk" : "not a multiple of the chunk",
+                  (long long)C, (long long)C, (long long)((C + I - 1) / std::max<int64_t>(I, 1)));
+    else if (periodic && spans && I < C && (C % I != 0 || geo_.span * I < C))
+        why = fmt("--prefill-span %lld over the checkpoint interval %lld makes chunks of %lld tokens: give a span "
+                  "of at least %lld and an interval that divides %lld", (long long)geo_.span, (long long)I,
+                  (long long)(geo_.span * I), (long long)((C + I - 1) / I), (long long)C);
+    else if (periodic && spans && I >= C && I % C != 0)
+        why = fmt("the checkpoint interval %lld is not a multiple of the chunk %lld", (long long)I, (long long)C);
+    else if (cfg.n_spec != 0 || prog.drafter.kind != RAD_DRAFT_NONE)
+        why = "speculation is on: verify steps and a drafter's passes are not covered";
+    else if (cfg.max_seqs > 1 && !prefill_alone_)
+        why = fmt("--max-num-seqs %lld: a chunk would share its step with decode rows; run "
+                  "RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE=1 (a %lld-token chunk then holds the decode rows "
+                  "for its whole step) or --max-num-seqs 1", (long long)cfg.max_seqs, (long long)C);
+    else if (world > 0 && lcp_admitted_ranks() < (int)world)
+        why = fmt("the file stager took it on %d of %zu ranks (its line above says why; LCP needs the CPU path "
+                  "on every routed layer)", lcp_admitted_ranks(), world);
+    if (!why.empty()) {
+        RAD_ERR("%s=%lld (large-chunk prefill) refused: %s", kLcpEnv, (long long)C, why.c_str());
+        return RAD_E_INVAL;
+    }
+    lcp_ = C;
+    /* RADIANCE_EXPERIMENTAL_DS41_LCP_ADMIT: the RAM cache admits a chunk's units from the prompt's last
+     * N tokens only (128), none (0) or all (`all`, as at 16-token passes). */
+    int64_t admit = 128;
+    if (const char* a = std::getenv("RADIANCE_EXPERIMENTAL_DS41_LCP_ADMIT"); a && *a) {
+        char* end = nullptr;
+        const long long v = std::strtoll(a, &end, 10);
+        if (!std::strcmp(a, "all")) admit = -1;
+        else if (end != a && !*end && v >= 0 && v <= (1ll << 30)) admit = v;
+        else {
+            RAD_ERR("RADIANCE_EXPERIMENTAL_DS41_LCP_ADMIT=%s: the prompt's last N tokens' units are admitted "
+                    "into the RAM cache (N >= 0; 0 none, `all` every unit)", a);
+            return RAD_E_INVAL;
+        }
+    }
+    builder_.set_lcp(C, admit);
+    RAD_INFO("large-chunk prefill: a lone prompt's chunks are %lld tokens (checkpoint interval %lld%s%s), each "
+             "with the bits of the same tokens in 16-token passes; the RAM cache admits %s%s",
+             (long long)C, (long long)I, spans ? fmt(", span %lld", (long long)geo_.span).c_str() : "",
+             geo_.exact ? fmt("; --prefix-resume exact resumes on a %lld-token grid, so a hit recomputes up to "
+                              "%lld tokens", (long long)geo_.grid, (long long)(geo_.grid - 1)).c_str()
+                        : "",
+             admit < 0 ? "every unit a chunk selects, as 16-token passes do (RADIANCE_EXPERIMENTAL_DS41_LCP_ADMIT=all)"
+             : admit == 0 ? "nothing a chunk selects: chunks borrow read-only (RADIANCE_EXPERIMENTAL_DS41_LCP_ADMIT=0)"
+             : fmt("the units the prompt's last %lld tokens select, as the chunks reach them; earlier rows borrow "
+                   "read-only (RADIANCE_EXPERIMENTAL_DS41_LCP_ADMIT=%lld)", (long long)admit, (long long)admit).c_str(),
+             cfg.max_seqs > 1 ? "; a chunk runs alone in its step (decode rows wait for it)" : "");
+    return RAD_OK;
 }
 
 /* ------------------------------------------------------------------ init */
@@ -269,6 +349,7 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     draft_est_.reserve((size_t)cfg.max_seqs);
 
     RAD_TRY(builder_.init(prog, cfg, geo_, kvgeom_, ranks));
+    RAD_TRY(lcp_init(prog, cfg, ranks.size()));
     /* The consumer skip (consumer_skip.h): off unless asked for, and refused, with the reason,
      * wherever its derivation does not cover the deployment. Read here, beside the other
      * scheduler switch, so a test sets Config::consumer_skip instead of the environment. */
@@ -1978,6 +2059,7 @@ replan:
         e.n_draft = s.n_draft;
         e.is_prefill = prefill;
         e.consumer_end = prefill ? s.consumer_end : 0;
+        e.prompt_end = prefill ? target : 0;
         e.ngram = !prefill && s.draft_ngram && s.n_draft > 0;
         e.produces_token = (r.n_computed + want >= target);
         /* The snapshot a hit resumes from, consumed once: the state is in the slot for the whole
@@ -2063,6 +2145,7 @@ replan:
             e.n_draft = 0;
             e.is_prefill = true;
             e.consumer_end = s.consumer_end;
+            e.prompt_end = s.seq_len();
             e.produces_token = (r.n_computed + s.sched_tokens >= s.seq_len());
             /* admit_one just set ckpt_src, and this is the entry it applies to. Consumed once:
              * restoring again on a later chunk would rewind the recurrence to the hit. */

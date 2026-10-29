@@ -650,6 +650,7 @@ int FileStager::init(const Program& prog, const Plan& plan, Mover* mover, Counts
         if (!trace_fp_) RAD_WARN("access trace: cannot open %s", path.c_str());
         else if (plan.rank == 0) RAD_INFO("access trace: each routed layer's selected units to %s/rank<r>.bin", td);
     }
+    n_model_layers_ = (int32_t)prog.meta.n_layers;
     RAD_TRY(tall_init(prog));
     RAD_TRY(init_head_cache(prog, plan));
     RAD_TRY(hx_init(prog));
@@ -679,10 +680,15 @@ bool FileStager::begin_pass(const RadBatch* b) {
     last_issued_ = -1;
     pass_tok_ = b->n_tok;
     pass_full_ = b->consumer_full > 0 ? b->consumer_full : INT32_MAX;
+    lcp_admit_row_ = lcp_ ? std::max<int32_t>(b->lcp_admit_row, 0) : 0;
+    pass_row0_.clear();
     hx_defer_li_ = -1;
     ++trace_pass_;
     if (rt_) rt_pass(b);
-    routed_ = counts_host_ && b->n_tok > 0 && b->n_tok <= kRoutedRows;
+    /* Under LCP every routed unit is the CPU's (hx_capped_), so a chunk of up to C tokens reads only
+     * what it routes to as well: the card's copy path has no room for a whole layer. */
+    routed_ = counts_host_ && b->n_tok > 0 &&
+              (b->n_tok <= kRoutedRows || (lcp_ && hx_capped_ && b->n_tok <= ep_rows_));
     if (hx_ra_) {   /* predictions for this pass may come; units of earlier ones are stale */
         hx_ra_at_.store((uint64_t)trace_pass_ << 32, std::memory_order_release);
         hx_ra_drop_stale(trace_pass_, -1);
@@ -735,7 +741,7 @@ int FileStager::start_ep_routed(int32_t li, RadStream s, bool* read) {
     const Layer& L = layers_[(size_t)li];
     EpRouteCounts v;
     if (!ep_counts_(L.layer, &v)) return RAD_OK;
-    if (!ep_route_current(v, ep_program_, s, v.generation, L.layer, pass_tok_) ||
+    if (!ep_route_current(v, ep_program_, s, v.generation, L.layer, layer_rows(li)) ||
         v.rank != plan_->rank) { RAD_TRY(head_revoke()); return RAD_E_STATE; }
     const int b = li & 1;
     if (holds_[b] >= 0 || counts_cap_ < 96) return RAD_E_STATE;
@@ -1366,10 +1372,196 @@ const char* row_name(const Band& b) {
     const KernelRow* r = b.dom[RAD_DOMAIN_DEVICE].row;
     return r && r->info && r->info->name ? r->info->name : nullptr;
 }
+
+/* ---- large-chunk prefill's pairs: kernels of one op that give a row the same bits ----------------
+ *
+ * Under RADIANCE_EXPERIMENTAL_DS41_LCP an op may resolve to more than one kernel over [1, C] only
+ * where the kernels are known to agree byte for byte, row by row:
+ *   - gemm_nt: gemm_bf16_nt_m16 forwards to gemm_bf16_nt_m64, and gemm_bf16_nt_tiled is
+ *     byte-identical to m64 by contract (the same WMMA sequence a tile, the same split, the slices
+ *     summed in the same order from 0.f; r4d_gemm_bf16_nt_tiled.hip);
+ *   - all_reduce: the exact one-shot and two-shot of one rank count, with or without their narrow
+ *     (`_lane`) launch, fold every element in f32 from 0 in ascending rank order (the one-shot
+ *     already hands messages from ts_min elements to the two-shot on the same instance; a band
+ *     above 102 rows of 5120 resolves to the two-shot row itself).
+ * The family a kernel belongs to, or null for any other. */
+const char* lcp_family(const std::string& op, const char* name) {
+    if (!name) return nullptr;
+    if (op == "gemm_nt" && (!std::strcmp(name, "gemm_bf16_nt_m16") || !std::strcmp(name, "gemm_bf16_nt_m64") ||
+                            !std::strcmp(name, "gemm_bf16_nt_tiled")))
+        return "gemm_nt bf16 (m16 / m64 / tiled)";
+    if (op == "all_reduce") {
+        int ranks = 0, used = 0;
+        char kind[16] = {};
+        if (std::sscanf(name, "ar_%15[a-z]_%drank_exact%n", kind, &ranks, &used) == 2 && used > 0 &&
+            (!std::strcmp(kind, "oneshot") || !std::strcmp(kind, "twoshot"))) {
+            const char* rest = name + used;
+            static const char* const fam[9] = { nullptr, nullptr, "all_reduce exact (2 ranks)",
+                                                "all_reduce exact (3 ranks)", "all_reduce exact (4 ranks)",
+                                                nullptr, nullptr, nullptr, "all_reduce exact (8 ranks)" };
+            if ((!*rest || !std::strcmp(rest, "_lane")) && ranks > 0 && ranks < 9) return fam[ranks];
+        }
+    }
+    return nullptr;
+}
 }  /* namespace */
+
+/* RADIANCE_EXPERIMENTAL_DS41_LCP=<C> (ep_route_counts.h): chunks of C tokens with a 16-token pass's
+ * bits. Everything EXACT_TALL checks, at C rows: the step is C, every band of every routed MXFP4 GEMM
+ * resolved to the gemv or its twin, and the twin as this libr4d declares it reaches C (a libr4d that
+ * does not know the switch has no twin, or one bounded at 48, and is refused here: the switch is
+ * verified, not assumed); every other op runs one kernel at every height or one of lcp_family's
+ * pairs. Refused with the reason, too: EXACT_TALL set to anything but 1 beside it, speculation, the
+ * fetch lists (sized for 48 rows) and the packed VRAM residents (whose gemv serves 16 rows). What
+ * the CPU path needs (every routed unit the CPU's: ..._POLICY=all, ..._MISSES >= C, the file buffers
+ * capped) is hx_init's; the chunk geometry and the sequences a step holds are the scheduler's
+ * (Scheduler::init, which also refuses LCP unless every rank's stager admitted it). */
+int FileStager::lcp_init(const Program& prog, int64_t C) {
+    const char* xt = std::getenv(kExactTallEnv);
+    std::string why;
+    const int64_t T = prog.ctx.max_tok;
+    if (xt && *xt && std::strcmp(xt, "1") != 0)
+        why = fmt("%s=%s beside it: large-chunk prefill keeps EXACT_TALL's pins at every height; leave it unset "
+                  "(or empty) or 1", kExactTallEnv, xt);
+    else if (T != C)
+        why = fmt("--max-num-batched-tokens is %lld: give %lld, the chunk the switch was set for (a step of "
+                  "another size would run passes the bands below were not checked at, or fewer rows a chunk)",
+                  (long long)T, (long long)C);
+    else if (prog.ctx.max_spec > 0)
+        why = fmt("speculation is on (a window of %d): verify steps and DSpark's drafter are not covered",
+                  prog.ctx.max_spec);
+    else if (const char* fl = std::getenv("RADIANCE_EXPERIMENTAL_DS41_FETCH_LIST"); fl && !std::strcmp(fl, "1"))
+        why = "RADIANCE_EXPERIMENTAL_DS41_FETCH_LIST=1: its range lists are sized for passes of up to 48 tokens";
+    else if (const char* vp = std::getenv("RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED"); vp && !std::strcmp(vp, "1"))
+        why = "RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED=1: the packed residents' gemv_vp serves passes of up to 16 "
+              "tokens";
+    if (!why.empty()) {
+        RAD_ERR("%s=%lld (large-chunk prefill) refused: %s", kLcpEnv, (long long)C, why.c_str());
+        return RAD_E_INVAL;
+    }
+    int n_moe = 0, n_twin = 0, n_ops = 0, n_split = 0, n_runs = 0;
+    int64_t reach = 0;
+    /* The multi-kernel ops admitted, by family: ops and the kernels seen. */
+    std::map<std::string, std::pair<int, std::vector<std::string>>> fams;
+    for (size_t h = 1; h < prog.ops.size(); ++h) {
+        const OpInfo& op = prog.ops[h];
+        if (op.bands.empty()) continue;
+        ++n_ops;
+        long long N = 0, K = 0, part = 0;
+        (void)op.base.get_i("N", &N);
+        (void)op.base.get_i("K", &K);
+        /* The plugin's own height switches, for the startup line: the router's column split (a
+         * gemm_nt_f32 over a rank's 96 of 384 columns) and the indexer's runs (row_part > 0). */
+        if ((op.op == "gemm_nt_f32" || op.op == "gemm_nt_f32bf16") && N == 96) ++n_split;
+        if (op.op == "index_score" && op.base.get_i("row_part", &part) && part > 0) ++n_runs;
+        const char* ty = op.base.get_s("type");
+        if (op.op == "moe_gemm_ggml" && ty && !std::strcmp(ty, "mxfp4")) {
+            ++n_moe;
+            for (const Band& b : op.bands) {
+                const char* name = row_name(b);
+                const bool gemv = name && !std::strcmp(name, "moe_gemm_ggml_mxfp4_gemv");
+                const bool twin = name && !std::strcmp(name, "moe_gemm_ggml_mxfp4_gemv_tall");
+                if (!gemv && !twin) {
+                    RAD_ERR("%s=%lld (large-chunk prefill) refused: op %zu (moe_gemm_ggml, N %lld K %lld) "
+                            "resolves %s to %s, not to the decode band's kernel (moe_gemm_ggml_mxfp4_gemv, or "
+                            "its twin moe_gemm_ggml_mxfp4_gemv_tall above 16 tokens), so a %lld-token chunk "
+                            "would not give 16-token passes' bits. Load a libr4d.so whose twin reaches %lld "
+                            "tokens (one built with %s), with the switch in its environment",
+                            kLcpEnv, (long long)C, h, N, K, b.span.empty() ? "a band" : b.span.c_str(),
+                            name ? name : "nothing", (long long)b.hi, (long long)C, kLcpEnv);
+                    return RAD_E_INVAL;
+                }
+                if (twin) {
+                    ++n_twin;
+                    const int64_t r = row_m_bound(b.dom[RAD_DOMAIN_DEVICE].row);
+                    reach = reach ? std::min(reach, r) : r;
+                }
+            }
+            continue;
+        }
+        const char* first = nullptr;
+        const char* fam = nullptr;
+        std::vector<std::string> kernels;
+        for (const Band& b : op.bands) {
+            const char* name = row_name(b);
+            if (!name) continue;
+            if (!first) {
+                first = name;
+                fam = lcp_family(op.op, name);
+                kernels.emplace_back(name);
+                continue;
+            }
+            if (std::find(kernels.begin(), kernels.end(), name) != kernels.end()) continue;
+            const char* f2 = lcp_family(op.op, name);
+            if (!fam || !f2 || std::strcmp(fam, f2)) {
+                RAD_ERR("%s=%lld (large-chunk prefill) refused: op %zu (%s) runs %s in one band and %s in %s: "
+                        "nothing here says the two give a row the same bits, so a chunk of another height "
+                        "could change it. Admitted pairs: gemm_nt's gemm_bf16_nt_m16 / _m64 / _tiled and "
+                        "all_reduce's exact one- and two-shot",
+                        kLcpEnv, (long long)C, h, op.op.c_str(), first, name,
+                        b.span.empty() ? "another" : b.span.c_str());
+                return RAD_E_INVAL;
+            }
+            kernels.emplace_back(name);
+        }
+        if (kernels.size() > 1) {
+            auto& e = fams[fam];
+            ++e.first;
+            for (const std::string& k : kernels)   /* every kernel the family showed, once */
+                if (std::find(e.second.begin(), e.second.end(), k) == e.second.end()) e.second.push_back(k);
+        }
+    }
+    if (n_moe == 0 || (C > kEpRouteMaxRows && n_twin == 0) || (n_twin && reach < C)) {
+        RAD_ERR("%s=%lld (large-chunk prefill) refused: %s", kLcpEnv, (long long)C,
+                n_moe == 0 ? "the program has no routed MXFP4 GEMM (not DeepSeek-V4.1's EP graph)"
+                : n_twin == 0
+                    ? "no band resolved to moe_gemm_ggml_mxfp4_gemv_tall: load a libr4d.so with the twin, with the "
+                      "switch in its environment"
+                    : fmt("this libr4d's twin moe_gemm_ggml_mxfp4_gemv_tall reaches %lld tokens, short of the "
+                          "chunk: a libr4d that knows %s declares it to %lld", (long long)reach, kLcpEnv,
+                          (long long)kEpRouteLcpMax).c_str());
+        return RAD_E_INVAL;
+    }
+    ep_rows_ = C;
+    lcp_ = C;
+    lcp_reach_ = reach;
+    /* RADIANCE_EXPERIMENTAL_DS41_LCP_PLANES: missed units read at once a layer (hx_stream_misses). */
+    hx_lcp_planes_ = 48;
+    if (const char* pl = std::getenv("RADIANCE_EXPERIMENTAL_DS41_LCP_PLANES"); pl && *pl)
+        hx_lcp_planes_ = std::clamp(std::atoi(pl), 1, 96);
+    /* RADIANCE_EXPERIMENTAL_DS41_LCP_INSERTQ: admitted misses queued for the insert threads at once. */
+    hx_lcp_insertq_ = 16;
+    if (const char* iq = std::getenv("RADIANCE_EXPERIMENTAL_DS41_LCP_INSERTQ"); iq && *iq)
+        hx_lcp_insertq_ = std::clamp(std::atoi(iq), 0, 1024);
+    lcp_moe_ = n_moe;
+    lcp_twin_ = n_twin;
+    lcp_split_ = n_split;
+    lcp_runs_ = n_runs;
+    lcp_ops_ = n_ops;
+    lcp_pairs_.clear();
+    int n_pairs = 0;
+    for (const auto& f : fams) {
+        std::string ks;
+        for (const std::string& k : f.second.second) ks += (ks.empty() ? "" : ", ") + k;
+        lcp_pairs_ += fmt("%s%d %s on %s", lcp_pairs_.empty() ? "" : "; ", f.second.first, f.first.c_str(),
+                          ks.c_str());
+        n_pairs += f.second.first;
+    }
+    lcp_pair_ops_ = n_pairs;
+    return RAD_OK;
+}
 
 int FileStager::tall_init(const Program& prog) {
     ep_rows_ = kEpRouteMaxRows;
+    lcp_ = 0;
+    const int64_t lcp = ds41_lcp_state();
+    if (lcp < 0) {
+        const char* v = std::getenv(kLcpEnv);
+        RAD_ERR("%s=%s: large-chunk prefill takes a chunk C, a multiple of 16 from %lld to %lld (0 or unset is "
+                "off)", kLcpEnv, v ? v : "", (long long)kEpRouteLcpMin, (long long)kEpRouteLcpMax);
+        return RAD_E_INVAL;
+    }
+    if (lcp > 0) return lcp_init(prog, lcp);
     const int st = ds41_exact_tall_state();
     if (st < 0) {
         const char* v = std::getenv(kExactTallEnv);
@@ -1487,7 +1679,16 @@ int FileStager::hx_init(const Program& prog) {
         return RAD_E_INVAL;
     };
     const char* cap = std::getenv("RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS");
-    if (!cap || std::atoi(cap) <= 0 || layers_.empty()) return packed_ok();
+    if (!cap || std::atoi(cap) <= 0 || layers_.empty()) {
+        if (lcp_) {
+            RAD_ERR("%s=%lld (large-chunk prefill) refused: the CPU must compute every routed unit of every "
+                    "chunk (the card's copy path has no room for a chunk's experts): host experts with "
+                    "..._POLICY=all, ..._MISSES=%lld and RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS set",
+                    kLcpEnv, (long long)lcp_, (long long)lcp_);
+            return RAD_E_INVAL;
+        }
+        return packed_ok();
+    }
     bool every = hx_pool_ != nullptr;
     for (size_t li = 0; every && li < layers_.size(); ++li) {
         every = li < ep_layer_eligible_.size() && ep_layer_eligible_[li] && li < hx_ops_.size() &&
@@ -1496,11 +1697,13 @@ int FileStager::hx_init(const Program& prog) {
             every = every && mover_->host_planes_eligible(u);
     }
     if (!every || !hx_defer_ok_ || hx_miss_rows_ < need || prog.ctx.max_tok > ep_rows_) {
-        RAD_ERR("RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS=%s: the file buffers then hold no layer's "
+        RAD_ERR("%sRADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS=%s: the file buffers then hold no layer's "
                 "units, so the CPU must compute every routed unit of every pass: host experts with "
                 "..._POLICY=all and ..._MISSES=%lld on every routed layer, and passes of at most %lld "
-                "tokens (--max-num-batched-tokens%s)", cap, (long long)need, (long long)ep_rows_,
-                ds41_exact_tall_state() == 1
+                "tokens (--max-num-batched-tokens%s)",
+                lcp_ ? fmt("%s=%lld (large-chunk prefill) refused: ", kLcpEnv, (long long)lcp_).c_str() : "",
+                cap, (long long)need, (long long)ep_rows_,
+                lcp_ || ds41_exact_tall_state() == 1
                     ? "" : "; taller with RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=1, as far as libr4d keeps a "
                            "16-token pass's bits");
         return RAD_E_INVAL;
@@ -1508,7 +1711,38 @@ int FileStager::hx_init(const Program& prog) {
     hx_capped_ = true;
     if (plan_->rank == 0)
         RAD_INFO("host experts: file buffers capped at %s units; every routed unit is the CPU's", cap);
-    return packed_ok();
+    const int rc = packed_ok();
+    if (rc >= 0 && lcp_) {
+        lcp_note_admitted();
+        if (plan_->rank == 0) lcp_report();
+    }
+    return rc;
+}
+
+/* The startup line of an admitted LCP (rank 0): ab_window.sh measures an Lc arm only with it, and a
+ * plain arm only without it. */
+void FileStager::lcp_report() const {
+    RAD_INFO("large-chunk prefill: passes of up to %lld tokens (%s=%lld): %d routed MXFP4 GEMMs on "
+             "moe_gemm_ggml_mxfp4_gemv to 16 tokens and its twin moe_gemm_ggml_mxfp4_gemv_tall above (%d bands; "
+             "this libr4d's twin reaches %lld); multi-kernel ops admitted: %s; the other %d of %d ops on one "
+             "kernel at every height; the plugin's own height switches: the router split by columns (%d "
+             "ops)%s, the indexer in %d extra runs; libr4d keeps the sparse attention, the indexer and the norms "
+             "on their decode-band arithmetic; the CPU path takes every routed unit of passes of up to %lld "
+             "tokens in jobs of up to %d rows over %d pool slots, a chunk's misses streamed to the pool as "
+             "they land, at most %d units read at once and %d admitted ones queued for the RAM cache%s",
+             (long long)lcp_, kLcpEnv, (long long)lcp_, lcp_moe_, lcp_twin_, (long long)lcp_reach_,
+             lcp_pairs_.empty() ? "none" : lcp_pairs_.c_str(), lcp_ops_ - lcp_moe_ - lcp_pair_ops_, lcp_ops_,
+             lcp_split_, lcp_split_ ? " from 256 rows" : "", lcp_runs_, (long long)ep_rows_,
+             HostExpertPool::max_rows(), HostExpertPool::slots(), hx_lcp_planes_, hx_lcp_insertq_,
+             std::getenv("RADIANCE_EXPERIMENTAL_DS41_ROUTE_TRACE")
+                 ? "; the route trace records passes over 16 tokens as uncaptured" : "");
+    /* Not a matter of bits (gemv_avx2_few and gemv_avx2_many give a row the same ones), so a warning:
+     * a chunk puts tens of rows on a hot expert, which 4-row jobs read the weights for again and again. */
+    if (HostExpertPool::max_rows() <= HostExpertPool::kMaxRowsDefault)
+        RAD_WARN("large-chunk prefill: pool jobs of at most %d rows (RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MAX_ROWS "
+                 "unset or <= %d): a chunk's experts then run through gemv_avx2_few, about twice the CPU time a "
+                 "row of the many-row kernel takes in jobs of 32 or 64 (the same bits); set it to 32 or 64",
+                 HostExpertPool::max_rows(), HostExpertPool::kMaxRowsDefault);
 }
 
 int FileStager::hx_init_impl(const Program& prog) {
@@ -1761,8 +1995,11 @@ void FileStager::hx_choose(int32_t li) {
     hx_miss_.clear();
     hx_miss_ready_.clear();
     hx_miss_ra_.clear();
+    hx_miss_admit_.clear();
     hx_ra_handed_ = 0;
     hx_slot_.assign(want_.size(), -1);
+    /* Large-chunk prefill: whether the cache admits what this unit's rows select (lcp_admit_row_). */
+    const bool lcp_chunk = lcp_ && pass_tok_ > kEpRouteMaxRows;
     const bool ra = hx_ra_ && pass_tok_ == 1;   /* read-ahead in pieces: this layer's units */
     if (ra) hx_ra_begin(li);
     const double cb = hx_pool_->cpu_bytes_per_ns(), lb = hx_pool_->link_bytes_per_ns();
@@ -1772,7 +2009,9 @@ void FileStager::hx_choose(int32_t li) {
         const int32_t u = want_[i];
         Mover::HostUnit* hu = hx_n_ < kHxUnits ? &hx_units_[hx_n_] : nullptr;
         ++hx_stats_.probed;
-        if (hu && mover_->borrow_host_unit(u, hu)) {
+        const bool admit = hx_admits(li, plan_->units[(size_t)u].expert);
+        if (hu && mover_->borrow_host_unit(u, hu, admit)) {
+            if (lcp_chunk) ++(admit ? hx_stats_.lcp_hit_admit : hx_stats_.lcp_hit_ro);
             bool gu = false, dn = false;
             for (int k = 0; k < hu->n; ++k) {
                 gu = gu || hu->bytes[k] == HostExpertPool::kGuBytes;
@@ -1826,6 +2065,7 @@ void FileStager::hx_choose(int32_t li) {
                 ahead = hx_ra_take(u, &ready, &urgent);
             }
             hx_miss_ready_.push_back(ready ? 1 : 0);
+            hx_miss_admit_.push_back(admit ? 1 : 0);
             if (hx_ra_) hx_miss_ra_.push_back(std::move(urgent));
             hx_miss_.push_back(ahead ? ahead : hx_planes_get(u));
             const int rows = e >= 0 && e < counts_cap_ ? std::max<int32_t>(counts_host_[e], 1) : 1;
@@ -1945,15 +2185,18 @@ void FileStager::hx_choose(int32_t li) {
  * hx_capture checks again on this one. */
 int FileStager::hx_fetch(int32_t li, RadStream s) {
     const HxOps& o = hx_ops_[(size_t)li];
-    if (pass_tok_ < 1 || pass_tok_ > ep_rows_ || ep_rows_ > hx_alloc_rows_) return RAD_E_STATE;
+    /* The layer's rows: the pass's, or under the per-row cut its suffix from layer_r0 (o.x is row 0's
+     * address, hx_capture). */
+    const int64_t rows = layer_rows(li);
+    const char* const x = (const char*)o.x + layer_r0(li) * o.x_ld * 2;
+    if (rows < 1 || pass_tok_ > ep_rows_ || ep_rows_ > hx_alloc_rows_) return RAD_E_STATE;
     if (o.x_ld == kHxEmbd) {
-        RAD_TRY(rad_memcpy_async(hx_x_, o.x, pass_tok_ * kHxEmbd * 2, s));
+        RAD_TRY(rad_memcpy_async(hx_x_, x, rows * kHxEmbd * 2, s));
     } else {
-        for (int64_t r = 0; r < pass_tok_; ++r)
-            RAD_TRY(rad_memcpy_async(hx_x_ + r * kHxEmbd, (const char*)o.x + r * o.x_ld * 2,
-                                     kHxEmbd * 2, s));
+        for (int64_t r = 0; r < rows; ++r)
+            RAD_TRY(rad_memcpy_async(hx_x_ + r * kHxEmbd, x + r * o.x_ld * 2, kHxEmbd * 2, s));
     }
-    RAD_TRY(rad_memcpy_async(hx_idx_, o.sorted, pass_tok_ * o.top_k * 4, s));
+    RAD_TRY(rad_memcpy_async(hx_idx_, o.sorted, rows * o.top_k * 4, s));
     RAD_TRY(rad_memcpy_async(hx_idx_ + hx_sorted_max(), o.off, (o.n_expert + 1) * 4, s));
     return RAD_OK;
 }
@@ -2188,10 +2431,13 @@ int FileStager::hx_early_decide() {
 /* The jobs for local expert e: one a row it owns in the pass's sorted order. Expert e's rows are
  * moe_gemm_ggml's (mx_range): [off[e], off[e + 1]), the first expert from 0 and the last to T; a
  * slot whose sorted entry is negative or past the pass's tokens is a row of zeros on the card and
- * stays the card's. Returns the rows, or an error when they disagree with the expert's count. */
+ * stays the card's. The rows go in HostExpertPool::jobs_for(n) jobs as even as the count allows
+ * (job_rows: 40 rows at 32 a job are 20 and 20), so no job of a hot expert is a short tail that
+ * reads the weights again for a few rows. Returns the rows, or an error when they disagree with the
+ * expert's count. */
 int FileStager::hx_jobs_for(int e, const HostExpertPool::Job& proto) {
     const HxOps& o = hx_ops_[(size_t)hx_li_];
-    const int64_t AR = pass_tok_, T = pass_tok_ * o.top_k;
+    const int64_t AR = layer_rows(hx_li_), T = AR * o.top_k;
     const int32_t* const sorted = hx_idx_;
     const int32_t* const off = hx_idx_ + hx_sorted_max();
     const int ne = (int)o.n_expert;
@@ -2199,10 +2445,11 @@ int FileStager::hx_jobs_for(int e, const HostExpertPool::Job& proto) {
     int lo = e == 0 ? 0 : off[e], hi = e == ne - 1 ? (int)T : off[e + 1];
     lo = std::clamp(lo, 0, (int)T);
     hi = std::clamp(hi, lo, (int)T);
+    auto live = [&](int i) { return sorted[i] >= 0 && sorted[i] / o.top_k < AR; };
     int32_t n = 0;
+    for (int i = lo; i < hi; ++i) n += live(i);
     HostExpertPool::Job j = proto;
-    int in_job = 0;
-    const int per_job = HostExpertPool::max_rows();   /* 4, or up to 32 (..._HOST_EXPERTS_MAX_ROWS) */
+    int in_job = 0, k = 0, want = HostExpertPool::job_rows(n, 0);
     auto flush = [&] {
         if (!in_job) return;
         j.more = in_job - 1;
@@ -2214,16 +2461,16 @@ int FileStager::hx_jobs_for(int e, const HostExpertPool::Job& proto) {
         hx_jobs_.push_back(j);
         j = proto;
         in_job = 0;
+        want = HostExpertPool::job_rows(n, ++k);
     };
     for (int i = lo; i < hi; ++i) {
-        if (sorted[i] < 0 || sorted[i] / o.top_k >= AR) continue;
+        if (!live(i)) continue;
         const uint16_t* x = hx_x_ + (int64_t)(sorted[i] / o.top_k) * kHxEmbd;
         uint16_t* y = hx_out_ + (int64_t)i * kHxEmbd;
         if (!in_job) { j.x = x; j.y = y; }
         else { j.xs[in_job - 1] = x; j.ys[in_job - 1] = y; }
-        if (++in_job == per_job) flush();
+        if (++in_job == want) flush();
         hx_rows_.push_back(i);
-        ++n;
     }
     flush();
     /* The scatter's own count for the expert, which chose it: a different number of rows means the
@@ -2246,7 +2493,18 @@ int FileStager::hx_submit() {
     }
     hx_jobs_.clear();
     hx_rows_.clear();
-    for (int k = 0; k < hx_n_; ++k) {
+    /* Longest first (an LPT order): the pool takes the oldest job first, so an expert with hundreds of
+     * a chunk's rows starts before the ones with a few, and the layer's last job to finish is short.
+     * The same jobs and rows whatever the order. */
+    hx_order_.clear();
+    for (int k = 0; k < hx_n_; ++k) hx_order_.push_back(k);
+    auto rows_of = [&](int k) {
+        const int32_t e = plan_->units[(size_t)hx_units_[k].unit].expert;
+        return e >= 0 && e < counts_cap_ ? counts_host_[e] : 0;
+    };
+    if (pass_tok_ > 1)
+        std::stable_sort(hx_order_.begin(), hx_order_.end(), [&](int a, int b) { return rows_of(a) > rows_of(b); });
+    for (int k : hx_order_) {
         const Mover::HostUnit& hu = hx_units_[k];
         if (!hu.n) continue;
         HostExpertPool::Job proto;
@@ -2273,6 +2531,8 @@ int FileStager::hx_submit() {
     if (hx_reserved_ - miss_res != submitted) hx_pool_->unreserve(hx_reserved_ - miss_res - submitted);
     hx_reserved_ = miss_res;
     RAD_TRY(hx_pool_->submit(hx_jobs_.data(), (int)hx_jobs_.size(), &hx_ticket_));
+    /* hx_finish copies the rows in runs, from the lowest: the order above is the pool's only. */
+    std::sort(hx_rows_.begin(), hx_rows_.end());
     hx_stage_ = 2;
     hx_confirmed_ = false;
     ++hx_stats_.layers;
@@ -2330,8 +2590,171 @@ bool FileStager::hx_unread_misses(std::vector<Mover::HostPlanes*>* out) const {
     return urgent;
 }
 
+/* ---- large-chunk prefill's misses ------------------------------------------------------------------
+ *
+ * A chunk of C tokens misses tens of units a layer and rank. Read in one call and computed after the
+ * last read landed, a layer's misses would serialise ~100 ms of pool work behind its reads. Here each
+ * unit's jobs are built before the reads (its planes laid out where the read puts them), and the
+ * reader that lands a unit's last extent hands its jobs to the pool (Mover::read_unit_planes'
+ * `landed`; HostExpertPool::submit is thread-safe), so the pool computes a unit while the next ones
+ * are read. Units go to the readers longest first, as their jobs go to the pool. At most
+ * ..._LCP_PLANES units (48, ~0.9 GB) are read at once: more go in waves, each wave's jobs waited for
+ * before its planes go back to the free list for the next wave. The same planes and the same jobs as
+ * the call-then-submit path, so the same bytes. */
+namespace {
+struct LandedCtx {
+    HostExpertPool* pool = nullptr;
+    HostExpertPool::Ticket* ticket = nullptr;
+    const HostExpertPool::Job* jobs = nullptr;
+    const std::pair<size_t, int>* ranges = nullptr;   /* by unit of the call: first job, jobs */
+    std::atomic<uint8_t>* done = nullptr;
+    std::atomic<int> rc{ 0 };
+};
+void hx_landed(void* ctx, int i) {
+    LandedCtx& c = *(LandedCtx*)ctx;
+    const std::pair<size_t, int>& r = c.ranges[i];
+    c.done[i].store(1, std::memory_order_relaxed);
+    if (r.second <= 0) return;
+    const int st = c.pool->submit(c.jobs + r.first, r.second, c.ticket);
+    if (st < 0) c.rc.store(st, std::memory_order_relaxed);
+}
+}  /* namespace */
+
+int FileStager::hx_stream_misses(int rows) {
+    const auto t0 = std::chrono::steady_clock::now();
+    /* Longest first. */
+    std::vector<size_t> order(hx_miss_.size());
+    for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+    auto rows_of = [&](size_t i) {
+        const int32_t e = plan_->units[(size_t)hx_miss_[i]->unit].expert;
+        return e >= 0 && e < counts_cap_ ? counts_host_[e] : 0;
+    };
+    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) { return rows_of(a) > rows_of(b); });
+    const size_t cap = (size_t)std::max(1, hx_lcp_planes_);
+    /* The reservation hx_choose made for the misses becomes the jobs' own costs, wave by wave. */
+    int64_t reserved = hx_reserved_;
+    hx_reserved_ = 0;
+    ++hx_stats_.lcp_layers;
+    for (size_t w0 = 0; w0 < order.size(); w0 += cap) {
+        const size_t w1 = std::min(order.size(), w0 + cap);
+        const bool last = w1 == order.size();
+        ++hx_stats_.lcp_waves;
+        std::vector<Mover::HostPlanes*> ptrs;
+        std::vector<std::pair<size_t, int>> ranges;
+        std::vector<int64_t> costs;
+        int64_t cost = 0;
+        for (size_t q = w0; q < w1; ++q) {
+            std::shared_ptr<Mover::HostPlanes>& sp = hx_miss_[order[q]];
+            /* Past the first wave, a unit without buffers takes planes an earlier wave gave back. */
+            if (w0 > 0 && !sp->buf[0] && !sp->buf[1]) {
+                std::shared_ptr<Mover::HostPlanes> b = hx_planes_backed(sp->unit);
+                if (b) sp = std::move(b);
+            }
+            Mover::HostPlanes* p = sp.get();
+            PlaneExtent ext[2];
+            const int g = p && mover_->lay_out_unit_planes(p, ext) && p->n == 2 &&
+                          p->rows[0] == 2 * HostExpertPool::kFf ? 0 : 1, d = 1 - g;
+            if (!p || p->n != 2 || p->rows[g] != 2 * HostExpertPool::kFf || p->cols[g] != kHxEmbd ||
+                p->rows[d] != kHxEmbd || p->cols[d] != HostExpertPool::kFf) {
+                hx_pool_->unreserve(reserved);
+                RAD_ERR("host experts: layer %d's missed unit %d cannot be laid out for the CPU",
+                        layers_[(size_t)hx_li_].layer, p ? p->unit : -1);
+                return RAD_E_STATE;
+            }
+            HostExpertPool::Job proto;
+            proto.gu = p->codes[g];
+            proto.gu_scales = p->scales[g];
+            proto.dn = p->codes[d];
+            proto.dn_scales = p->scales[d];
+            proto.urgent = true;
+            const size_t first = hx_jobs_.size();
+            const int n = hx_jobs_for(plan_->units[(size_t)p->unit].expert, proto);
+            if (n < 0) {
+                hx_pool_->unreserve(reserved);
+                return n;
+            }
+            ++hx_stats_.miss_units;
+            hx_stats_.miss_rows += (uint64_t)n;
+            int64_t c = 0;
+            for (size_t k = first; k < hx_jobs_.size(); ++k) c += hx_jobs_[k].cost;
+            ranges.emplace_back(first, (int)(hx_jobs_.size() - first));
+            costs.push_back(c);
+            cost += c;
+            ptrs.push_back(p);
+        }
+        /* The wave's jobs take over their part of the reservation; the last wave the rest. */
+        if (last) {
+            if (reserved != cost) hx_pool_->unreserve(reserved - cost);
+            reserved = 0;
+        } else {
+            if (cost > reserved) hx_pool_->reserve(cost - reserved);
+            reserved = std::max<int64_t>(reserved - cost, 0);
+        }
+        HostExpertPool::Ticket wave;
+        HostExpertPool::Ticket* const t = last ? &hx_ticket_ : &wave;
+        std::unique_ptr<std::atomic<uint8_t>[]> done(new std::atomic<uint8_t>[ptrs.size()]);
+        for (size_t i = 0; i < ptrs.size(); ++i) done[i].store(0, std::memory_order_relaxed);
+        LandedCtx ctx;
+        ctx.pool = hx_pool_;
+        ctx.ticket = t;
+        ctx.jobs = hx_jobs_.data();   /* no job is added while the readers run */
+        ctx.ranges = ranges.data();
+        ctx.done = done.get();
+        Mover::PlaneReadTiming tm;
+        PieceReader& demand = PieceReader::process();
+        demand.demand_enter();
+        const bool ok = mover_->read_unit_planes(ptrs.data(), (int)ptrs.size(), rows, &tm, hx_landed, &ctx);
+        demand.demand_leave();
+        int rc = ctx.rc.load();
+        /* Units the readers did not hand over (a leg read again after them): theirs now. */
+        for (size_t i = 0; i < ptrs.size() && ok && rc >= 0; ++i) {
+            if (done[i].load(std::memory_order_relaxed)) {
+                ++hx_stats_.lcp_landed;
+                continue;
+            }
+            ++hx_stats_.lcp_late;
+            if (ranges[i].second > 0) rc = hx_pool_->submit(hx_jobs_.data() + ranges[i].first, ranges[i].second, t);
+            if (rc >= 0) done[i].store(1, std::memory_order_relaxed);
+        }
+        if (!ok || rc < 0) {
+            /* The jobs never handed over give their reservation back, and the ones that were finish
+             * before their planes may go (the last wave's are hx_ticket_'s: hx_drain waits). */
+            int64_t left = reserved;
+            for (size_t i = 0; i < ptrs.size(); ++i)
+                if (!done[i].load(std::memory_order_relaxed)) left += costs[i];
+            if (left) hx_pool_->unreserve(left);
+            if (!last) hx_pool_->wait(&wave);
+            RAD_ERR("host experts: reading layer %d's missed units for the CPU failed%s",
+                    layers_[(size_t)hx_li_].layer, rc < 0 ? " (the pool refused a job)" : "");
+            return rc < 0 ? rc : RAD_E_IO;
+        }
+        if (last) break;
+        /* Before the next wave reads into planes again: this wave's jobs done, its planes to the
+         * insert threads and, once inserted, to the free list (hx_planes_backed). */
+        const auto w = std::chrono::steady_clock::now();
+        hx_pool_->wait(&wave);
+        hx_stats_.lcp_wave_wait_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                          std::chrono::steady_clock::now() - w).count();
+        hx_queue_inserts(order.data() + w0, w1 - w0);
+        for (size_t q = w0; q < w1; ++q) hx_miss_[order[q]].reset();   /* not admitted: to the free list now */
+    }
+    hx_stats_.miss_read_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                  std::chrono::steady_clock::now() - t0).count();
+    std::sort(hx_rows_.begin(), hx_rows_.end());
+    /* The last wave's (the earlier ones went above). */
+    const size_t from = order.empty() ? 0 : (order.size() - 1) / cap * cap;
+    hx_queue_inserts(order.data() + from, order.size() - from);
+    return RAD_OK;
+}
+
 /* Reads the misses' planes (rows: the pass's tokens) and submits their jobs to the pool. */
 int FileStager::hx_submit_misses_now(int rows) {
+    /* A large-chunk prefill's chunk: streamed (above). Never a posted read or one with units read
+     * ahead (both are one-token passes'). */
+    if (lcp_ && rows > (int)kEpRouteMaxRows && !hx_miss_posted_ &&
+        std::none_of(hx_miss_ready_.begin(), hx_miss_ready_.end(), [](uint8_t r) { return r != 0; }) &&
+        std::none_of(hx_miss_ra_.begin(), hx_miss_ra_.end(), [](const auto& r) { return r != nullptr; }))
+        return hx_stream_misses(rows);
     std::vector<Mover::HostPlanes*> ptrs;
     const bool urgent = hx_unread_misses(&ptrs);
     const auto t0 = std::chrono::steady_clock::now();
@@ -2404,12 +2827,51 @@ int FileStager::hx_submit_misses_now(int rows) {
     hx_reserved_ = 0;
     RAD_TRY(hx_pool_->submit(hx_jobs_.data() + first, n, &hx_ticket_));
     std::sort(hx_rows_.begin(), hx_rows_.end());
+    std::vector<size_t> all(hx_miss_.size());
+    for (size_t i = 0; i < all.size(); ++i) all[i] = i;
+    hx_queue_inserts(all.data(), all.size());
+    return RAD_OK;
+}
+
+/* The admission row: the units whose rows include one at or past it are admitted (stager.h). */
+bool FileStager::hx_admits(int32_t li, int32_t e) const {
+    if (lcp_admit_row_ <= 0 || !lcp_ || li < 0 || (size_t)li >= hx_ops_.size()) return true;
+    const HxOps& o = hx_ops_[(size_t)li];
+    if (e < 0 || e >= (int32_t)o.n_expert || !hx_idx_ || o.top_k <= 0) return true;
+    /* The layer's rows are the pass's from layer_r0 (the per-row cut); the admission row is the pass's. */
+    const int64_t rows = layer_rows(li), T = rows * o.top_k, from = lcp_admit_row_ - layer_r0(li);
+    const int32_t* const sorted = hx_idx_;
+    const int32_t* const off = hx_idx_ + hx_sorted_max();
+    int lo = e == 0 ? 0 : off[e], hi = e == (int32_t)o.n_expert - 1 ? (int)T : off[e + 1];
+    lo = std::clamp(lo, 0, (int)T);
+    hi = std::clamp(hi, lo, (int)T);
+    for (int i = lo; i < hi; ++i)
+        if (sorted[i] >= 0 && sorted[i] / o.top_k >= from && sorted[i] / o.top_k < rows) return true;
+    return false;
+}
+
+void FileStager::hx_queue_inserts(const size_t* idx, size_t n) {
+    const bool chunk = lcp_ && pass_tok_ > kEpRouteMaxRows;
+    bool any = false;
     {
         std::lock_guard<std::mutex> lk(hx_bg_mu_);
-        for (auto& p : hx_miss_) hx_bg_q_.push_back(p);
+        for (size_t k = 0; k < n; ++k) {
+            const size_t i = idx[k];
+            if (i >= hx_miss_.size() || !hx_miss_[i]) continue;
+            if (i < hx_miss_admit_.size() && !hx_miss_admit_[i]) {
+                ++hx_stats_.lcp_miss_ro;   /* computed, and let go with the layer */
+                continue;
+            }
+            if (chunk && (int64_t)hx_bg_q_.size() + hx_bg_busy_ >= hx_lcp_insertq_) {
+                ++hx_stats_.lcp_miss_dropped;
+                continue;
+            }
+            if (chunk) ++hx_stats_.lcp_miss_admit;
+            hx_bg_q_.push_back(hx_miss_[i]);
+            any = true;
+        }
     }
-    hx_bg_cv_.notify_all();
-    return RAD_OK;
+    if (any) hx_bg_cv_.notify_all();
 }
 
 /* RADIANCE_EXPERIMENTAL_DS41_MISS_POST: the layer's unread misses (hx_unread_misses: the set
@@ -2483,6 +2945,29 @@ std::shared_ptr<Mover::HostPlanes> FileStager::hx_planes_get(int32_t unit) {
         }
     }
     if (!p) p.reset(new Mover::HostPlanes());
+    p->unit = unit;
+    p->n = 0;
+    return std::shared_ptr<Mover::HostPlanes>(p.release(), [this](Mover::HostPlanes* q) {
+        std::lock_guard<std::mutex> lk(hx_planes_mu_);
+        hx_planes_free_.emplace_back(q);
+    });
+}
+
+/* hx_planes_get, but only a HostPlanes on the free list that still holds buffers (an earlier wave's,
+ * given back once inserted), or null: a later wave of large-chunk misses reads into those rather
+ * than growing new ones. */
+std::shared_ptr<Mover::HostPlanes> FileStager::hx_planes_backed(int32_t unit) {
+    std::unique_ptr<Mover::HostPlanes> p;
+    {
+        std::lock_guard<std::mutex> lk(hx_planes_mu_);
+        for (size_t i = hx_planes_free_.size(); i-- > 0;)
+            if (hx_planes_free_[i]->buf[0] || hx_planes_free_[i]->buf[1]) {
+                p = std::move(hx_planes_free_[i]);
+                hx_planes_free_.erase(hx_planes_free_.begin() + (ptrdiff_t)i);
+                break;
+            }
+    }
+    if (!p) return nullptr;
     p->unit = unit;
     p->n = 0;
     return std::shared_ptr<Mover::HostPlanes>(p.release(), [this](Mover::HostPlanes* q) {
@@ -2890,18 +3375,22 @@ int FileStager::hx_capture(int32_t li, RadStream s, const RadTensor* t, int n_t)
     if (n_t < 5) return RAD_E_STATE;
     const RadTensor &A = t[0], &so = t[2], &of = t[3], &Y = t[4];
     const int64_t AR = A.rank == 2 ? A.shape[0] : 0, T = Y.rank == 2 ? Y.shape[0] : 0;
-    const int64_t x_ld = AR > 1 ? A.stride[0] : kHxEmbd;
+    const int64_t x_ld = AR > 1 ? A.stride[0] : (o.x ? o.x_ld : kHxEmbd);
+    /* The layer's rows, and the address of the step's row 0 its operand starts r0 rows past (the
+     * per-row cut slices it from layer_r0; every other pass reads from row 0). */
+    const int64_t rows = layer_rows(li), r0 = layer_r0(li);
+    const void* const x0 = A.data ? (const char*)A.data - r0 * x_ld * 2 : nullptr;
     const bool shape = A.data && so.data && of.data && A.dtype == RAD_BF16 && A.rank == 2 &&
         A.shape[1] == kHxEmbd && A.stride[1] == 1 && x_ld >= kHxEmbd &&
         (so.dtype == RAD_I32 || so.dtype == RAD_U32) && (of.dtype == RAD_I32 || of.dtype == RAD_U32) &&
         hx_numel(of) >= o.n_expert + 1;
     const bool live = hx_li_ == li && hx_stage_ == 2;
     if (live) {
-        if (!shape || A.data != o.x || x_ld != o.x_ld || so.data != o.sorted || of.data != o.off ||
-            AR != pass_tok_ || T != pass_tok_ * o.top_k || hx_numel(so) < T) {
+        if (!shape || x0 != o.x || x_ld != o.x_ld || so.data != o.sorted || of.data != o.off ||
+            AR != rows || T != rows * o.top_k || hx_numel(so) < T) {
             RAD_ERR("host experts: layer %d's gate_up reads rows other than the ones the pool was "
-                    "given (%lld rows of %lld sorted, a pass of %lld)", layers_[(size_t)li].layer,
-                    (long long)AR, (long long)T, (long long)pass_tok_);
+                    "given (%lld rows of %lld sorted from row %lld, a pass of %lld)", layers_[(size_t)li].layer,
+                    (long long)AR, (long long)T, (long long)r0, (long long)pass_tok_);
             return RAD_E_STATE;
         }
         hx_confirmed_ = true;
@@ -2914,16 +3403,16 @@ int FileStager::hx_capture(int32_t li, RadStream s, const RadTensor* t, int n_t)
      * range list (..._FETCH_LIST) is armed for the old addresses and is written again at its next
      * fetch, once the copy reading it has run. */
     if (hx_early_li_ == li) {
-        if (!shape || AR != pass_tok_ || T != pass_tok_ * o.top_k || hx_numel(so) < T) {
+        if (!shape || AR != rows || T != rows * o.top_k || hx_numel(so) < T) {
             RAD_ERR("host experts: layer %d's gate_up reads rows the CPU path cannot (%lld rows of "
                     "%lld sorted, a pass of %lld), and its card ops went ahead of its counts",
                     layers_[(size_t)li].layer, (long long)AR, (long long)T, (long long)pass_tok_);
             return RAD_E_STATE;
         }
-        if (A.data != o.x || x_ld != o.x_ld || so.data != o.sorted || of.data != o.off) {
+        if (x0 != o.x || x_ld != o.x_ld || so.data != o.sorted || of.data != o.off) {
             ++hx_stats_.moved;
             ++hx_stats_.early_refetch;
-            o.x = A.data;
+            o.x = x0;
             o.x_ld = x_ld;
             o.sorted = so.data;
             o.off = of.data;
@@ -2935,11 +3424,11 @@ int FileStager::hx_capture(int32_t li, RadStream s, const RadTensor* t, int n_t)
     }
     /* Only the addresses of a routed pass that reads all its rows at once (no slice, so from row
      * 0) are kept: what hx_fetch reads from on such a pass. */
-    if (shape && routed_ && AR == pass_tok_ && AR >= 1 && AR <= ep_rows_ &&
+    if (shape && routed_ && AR == rows && AR >= 1 && AR <= ep_rows_ &&
         T == AR * o.top_k && hx_numel(so) >= T) {
-        if (o.x && (A.data != o.x || x_ld != o.x_ld || so.data != o.sorted || of.data != o.off))
+        if (o.x && (x0 != o.x || x_ld != o.x_ld || so.data != o.sorted || of.data != o.off))
             ++hx_stats_.moved;
-        o.x = A.data;
+        o.x = x0;
         o.x_ld = x_ld;
         o.sorted = so.data;
         o.off = of.data;

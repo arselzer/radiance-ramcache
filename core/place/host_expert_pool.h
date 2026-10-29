@@ -18,7 +18,7 @@
  * Optional: ..._CPUS=<list> pins the workers ("4-23" or "4,5,6"), ..._GBPS and ..._LINK_GBPS set
  * the scheduling estimates (4.2 GB/s a thread up to 78, and 20), ..._SPIN_US how long an idle
  * worker spins before it sleeps (200), ..._NICE the workers' nice value (0), ..._MAX_ROWS the most
- * token rows of one expert a job carries (4; up to 32, see max_rows). */
+ * token rows of one expert a job carries (4; up to 64, see max_rows). */
 #pragma once
 #include <atomic>
 #include <condition_variable>
@@ -41,13 +41,17 @@ public:
      * [N, K/2] and e8m0 scales [N, K/32], or with `packed` set packed slots of gu_bytes and
      * dn_bytes (the packed RAM cache: ds41_host_experts.h packed_view, checked at submit). An
      * urgent job (a missed expert, on the critical path) is claimed before every other. */
-    static constexpr int kMaxRowsCap = 32;     /* ds41hx::kGemvRows */
+    /* Two of ds41hx's many-row calls (kGemvRows each): a job of 33 to 64 rows reads each 64-row
+     * weight tile from DRAM once and again from L2 for its second call (a tile of gate_up is ~170 KB),
+     * where two jobs of up to 32 rows each read it from DRAM. For large-chunk prefill
+     * (RADIANCE_EXPERIMENTAL_DS41_LCP), whose chunks put hundreds of rows on a hot expert. */
+    static constexpr int kMaxRowsCap = 64;
     static constexpr int kMaxRowsDefault = 4;  /* ds41hx::kFewRows */
     /* The most token rows a job carries: RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MAX_ROWS, 1 ..
      * kMaxRowsCap (default 4), read once; an unusable value turns the pool off (get() says so) and
      * reads as the default here. With more than four allowed, a job of four or more rows runs the
-     * many-row kernel (ds41hx::gemv_avx2_many), for prefill passes whose rows meet in one expert;
-     * every other job runs ds41hx::gemv_avx2_few, as with the default. */
+     * many-row kernel (ds41hx::gemv_avx2_many, in calls of up to 32 rows), for prefill passes whose
+     * rows meet in one expert; every other job runs ds41hx::gemv_avx2_few, as with the default. */
     static int max_rows();
     /* The fewest rows of a job that runs the many-row kernel: 4 when max_rows() > 4 (rbench, 40
      * threads: 10-18% under gemv_avx2_few at four rows, about even at three), else none. */
@@ -77,11 +81,22 @@ public:
     static int64_t job_cost(int rows) {
         return kExpertBytes + (int64_t)(rows - 1) * (rows <= kMaxRowsDefault ? kExpertBytes / 2 : kExpertBytes / 8);
     }
-    /* An expert's `rows` rows as jobs of at most max_rows(). */
-    static int64_t cost_rows(int rows) {
+    /* How an expert's `rows` rows are cut into jobs: ceil(rows / max_rows()) of them, as even as the
+     * count allows (40 rows at 32 a job: 20 and 20, not 32 and 8), the larger ones first. Job k of
+     * jobs_for(rows) holds job_rows(rows, k) rows. */
+    static int jobs_for(int rows) {
         const int m = max_rows();
+        return rows <= 0 ? 0 : (rows + m - 1) / m;
+    }
+    static int job_rows(int rows, int k) {
+        const int n = jobs_for(rows);
+        return n ? rows / n + (k < rows % n ? 1 : 0) : 0;
+    }
+    /* An expert's `rows` rows as jobs_for(rows) jobs. */
+    static int64_t cost_rows(int rows) {
         int64_t c = 0;
-        for (; rows > 0; rows -= m) c += job_cost(rows < m ? rows : m);
+        const int n = jobs_for(rows);
+        for (int k = 0; k < n; ++k) c += job_cost(job_rows(rows, k));
         return c;
     }
     /* The jobs one caller waits for: submit adds them, the pool counts them down. */
@@ -114,11 +129,18 @@ public:
     double  link_bytes_per_ns() const { return link_bpns_; }
     float   limit() const { return limit_; }
     int     threads() const { return (int)workers_.size(); }
+    /* Jobs queued at once over every caller; submit blocks for a free one past that. */
+    static int slots() { return kSlots; }
+    /* submit's waits for a free slot (a burst past kSlots): how many, and their time. Waited
+     * outside the submit lock, so another caller's urgent jobs are not held behind one. */
+    uint64_t submit_waits() const { return submit_waits_.load(std::memory_order_relaxed); }
+    uint64_t submit_wait_ns() const { return submit_wait_ns_.load(std::memory_order_relaxed); }
 
     ~HostExpertPool();
 
 private:
-    static constexpr int kSlots = 128;
+    /* 256 rather than 128: a large-chunk prefill layer queues ~100 jobs a rank, four ranks at once. */
+    static constexpr int kSlots = 256;
     static constexpr int kTile = 64;                       /* output rows a tile */
     static constexpr int kGuTiles = 2 * kFf / kTile;       /* 72 */
     static constexpr int kDnTiles = kEmbd / kTile;         /* 80 */
@@ -161,6 +183,7 @@ private:
     std::atomic<uint64_t> work_gen_{ 0 };
     std::mutex              submit_mu_;
     uint64_t                seq_ = 0;
+    std::atomic<uint64_t>   submit_waits_{ 0 }, submit_wait_ns_{ 0 };
     std::mutex              idle_mu_;
     std::condition_variable idle_cv_;
     std::atomic<int>        sleepers_{ 0 };

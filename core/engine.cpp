@@ -9,6 +9,7 @@
 #include "kld.h"
 #include "mm/processor.h"
 #include "mm/media.h"
+#include "place/host_expert_pool.h"
 #include "place/readahead.h"
 #include "place/route_trace.h"
 #include "place/router_predictor.h"
@@ -168,6 +169,20 @@ Engine::~Engine() {
         if (hx.async_wait_ns)
             RAD_INFO("host experts: %.1f ms waiting at gathers for misses still being read on the worker "
                      "(not in the gather waits above)", (double)hx.async_wait_ns / 1e6);
+        /* The background inserts of missed units (FileStager::InsertStats); the non-temporal and
+         * piece counts are RADIANCE_EXPERIMENTAL_DS41_INSERT_NT's / ..._INSERT_SLICE_KIB's, 0
+         * without them (ab_window.sh holds an In / Is arm to them). */
+        if (const FileStager::InsertStats is = r->fstager.insert_stats(); is.units)
+            RAD_INFO("host experts' background inserts: %llu units relaid from passes, %.3f ms a unit from "
+                     "the queue to published (%llu from one-token passes, %.3f ms a unit); non-temporal: "
+                     "%llu pieces, %.0f MB of codes; waited before %llu pieces, %.1f ms asleep, %llu inserts "
+                     "out of their wait; %.0f MB in %.1f ms copied while the pool had work queued or reserved",
+                     (unsigned long long)is.units, (double)is.ns * 1e-6 / (double)is.units,
+                     (unsigned long long)is.d_units,
+                     is.d_units ? (double)is.d_ns * 1e-6 / (double)is.d_units : 0.0,
+                     (unsigned long long)is.pieces, (double)is.nt_bytes / 1e6,
+                     (unsigned long long)is.waited, (double)is.wait_ns / 1e6,
+                     (unsigned long long)is.capped, (double)is.busy_bytes / 1e6, (double)is.busy_ns / 1e6);
         if (hx.many_jobs)
             RAD_INFO("host experts: %llu jobs of four or more rows of one expert (%llu rows) went "
                      "through the many-row kernel", (unsigned long long)hx.many_jobs,
@@ -307,6 +322,20 @@ Engine::~Engine() {
     if (RouteTrace* rt = RouteTrace::get()) {
         rt->close();
         RAD_INFO("%s", rt->report().c_str());
+    }
+    /* The CPU pool serves every rank: RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_LEAN_TILES's counts,
+     * once for the process (ab_window.sh holds a Ph arm to them). */
+    bool hx_any = false;
+    for (auto& r : ranks_) hx_any = hx_any || r->fstager.host_experts();
+    if (HostExpertPool* hp = hx_any ? HostExpertPool::get() : nullptr; hp && hp->lean()) {
+        const HostExpertPool::LeanStats ls = hp->lean_stats();
+        RAD_INFO("host expert pool, lean tiles: %llu tiles claimed, %.2f slots looked at a claim (all %d "
+                 "without the switch); x lanes laid out for %llu tiles, reused on %llu (%.1f%%)",
+                 (unsigned long long)ls.claims,
+                 ls.claims ? (double)ls.scanned / (double)ls.claims : 0.0, 128,
+                 (unsigned long long)ls.lanes_built, (unsigned long long)ls.lanes_reused,
+                 ls.lanes_built + ls.lanes_reused
+                     ? 100.0 * (double)ls.lanes_reused / (double)(ls.lanes_built + ls.lanes_reused) : 0.0);
     }
     /* The read-ahead's readers and the predictor serve every rank: one report for the process. */
     if (PieceReader& pr = PieceReader::process(); pr.started()) {

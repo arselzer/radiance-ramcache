@@ -11,6 +11,7 @@
 #include "place/host_expert_pool.h"
 #include "../tools/ds41-host-experts/ds41_host_experts.h"
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -398,6 +399,81 @@ TEST(host_expert_pool_many_row_jobs_match) {
     CHECK(p->submit(&over, 1, &t3) < 0);
     CHECK_EQ(t3.left.load(), 0);
     CHECK_EQ(HostExpertPool::cost_rows(40), HostExpertPool::job_cost(32) + HostExpertPool::job_cost(8));
+}
+
+/* RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_LEAN_TILES (the host_expert_pool_test_lean entry runs every
+ * case with it): a job alone has its 152 tiles claimed through the active-slot bitmap, one slot looked
+ * at a claim, each tile laying x out or reusing it, and a worker lays it out at most once a
+ * projection; the rows are the reference's. Without the switch nothing is counted. */
+TEST(host_expert_pool_lean_tiles_claim_through_the_bitmap_and_reuse_lanes) {
+    HostExpertPool* p = pool();
+    if (!p || !__builtin_cpu_supports("avx2")) { SKIP("no AVX2 or no pool"); return; }
+    Expert e{ release_blocks(2 * kFf, kEmbd, 81, 2000), release_blocks(kEmbd, kFf, 82, 2000) };
+    std::vector<uint8_t> guc, gus, dnc, dns;
+    planes_of(e.gu, 2 * kFf, kEmbd, &guc, &gus);
+    planes_of(e.dn, kEmbd, kFf, &dnc, &dns);
+    std::vector<std::vector<uint16_t>> xs, want;
+    for (int r = 0; r < 3; ++r) {
+        xs.push_back(row(400 + (uint64_t)r));
+        want.push_back(reference(e, xs.back()));
+    }
+    /* One row of blocks, then three rows of planes: the one-row and the multi-row kernels' lanes. */
+    for (int rows : { 1, 3 }) {
+        const HostExpertPool::LeanStats a = p->lean_stats();
+        std::vector<std::vector<uint16_t>> got((size_t)rows, std::vector<uint16_t>(kEmbd, 0xffff));
+        HostExpertPool::Job j;
+        if (rows == 1) { j.gu = e.gu.data(); j.dn = e.dn.data(); }
+        else { j.gu = guc.data(); j.gu_scales = gus.data(); j.dn = dnc.data(); j.dn_scales = dns.data(); }
+        j.x = xs[0].data();
+        j.y = got[0].data();
+        for (int r = 1; r < rows; ++r) { j.xs[r - 1] = xs[(size_t)r].data(); j.ys[r - 1] = got[(size_t)r].data(); }
+        j.more = rows - 1;
+        HostExpertPool::Ticket t;
+        p->reserve(HostExpertPool::job_cost(rows));
+        CHECK_EQ(p->submit(&j, 1, &t), 0);
+        p->wait(&t);
+        for (int r = 0; r < rows; ++r) CHECK(got[(size_t)r] == want[(size_t)r]);
+        const HostExpertPool::LeanStats b = p->lean_stats();
+        if (!p->lean()) {
+            CHECK_EQ(b.claims + b.scanned + b.lanes_built + b.lanes_reused, (uint64_t)0);
+            continue;
+        }
+        CHECK_EQ(b.claims - a.claims, (uint64_t)152);
+        CHECK_EQ(b.scanned - a.scanned, (uint64_t)152);
+        CHECK_EQ(b.lanes_built - a.lanes_built + (b.lanes_reused - a.lanes_reused), (uint64_t)152);
+        CHECK(b.lanes_built - a.lanes_built <= 2 * (uint64_t)p->threads());
+    }
+    CHECK_EQ(p->backlog(), (int64_t)0);
+}
+
+/* quiet_after_tickets (the sliced background inserts, ..._INSERT_SLICE_KIB): a wait_idle sleeper is
+ * still woken when the pool drains, now after the draining job's ticket has counted down, never
+ * left to its timeout. */
+TEST(host_expert_pool_wait_idle_wakes_after_the_ticket) {
+    HostExpertPool* p = pool();
+    if (!p || !__builtin_cpu_supports("avx2")) { SKIP("no AVX2 or no pool"); return; }
+    p->quiet_after_tickets();
+    Expert e{ blocks(2 * kFf, kEmbd, 91), blocks(kEmbd, kFf, 92) };
+    const auto x = row(93);
+    const auto want = reference(e, x);
+    for (int round = 0; round < 3; ++round) {
+        std::vector<uint16_t> y(kEmbd, 0xffff);
+        HostExpertPool::Job j;
+        j.gu = e.gu.data();
+        j.dn = e.dn.data();
+        j.x = x.data();
+        j.y = y.data();
+        HostExpertPool::Ticket t;
+        p->reserve(HostExpertPool::kExpertBytes);   /* the sleeper sees work from here */
+        const auto t0 = std::chrono::steady_clock::now();
+        std::thread sleeper([&] { p->wait_idle(4000000000LL); });
+        CHECK_EQ(p->submit(&j, 1, &t), 0);
+        p->wait(&t);
+        sleeper.join();
+        CHECK(std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() < 2.0);
+        CHECK(y == want);
+        CHECK_EQ(p->backlog(), (int64_t)0);
+    }
 }
 
 TEST(host_expert_pool_refuses_incomplete_jobs) {

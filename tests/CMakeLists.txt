@@ -258,6 +258,15 @@ foreach(t ${RAD_TESTS})
          "rad_perf_entry(${n} [==[${t}]==] [==[${CMAKE_BINARY_DIR}/tests/${n}]==])\n")
 endforeach()
 
+# host_expert_pool_test again with RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_LEAN_TILES=1: every case on
+# the pool's lean tiles (a worker's x lanes reused over a job's tiles, claims through the active-slot
+# bitmap), whose rows must be the reference's as well. The plain entry states the switch off.
+rad_unit_test(host_expert_pool_test_lean host_expert_pool_test)
+set_property(TEST host_expert_pool_test APPEND PROPERTY ENVIRONMENT
+             "RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_LEAN_TILES=0")
+set_property(TEST host_expert_pool_test_lean APPEND PROPERTY ENVIRONMENT
+             "RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_LEAN_TILES=1")
+
 # ================================================================== perf_ cases
 #
 # A case named perf_... asserts a wall-clock cost, which tests running beside it would distort. The

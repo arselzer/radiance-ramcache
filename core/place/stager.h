@@ -93,6 +93,7 @@
 #include "route_trace.h"
 
 #include <array>
+#include <atomic>
 #include <condition_variable>
 #include <cstdio>
 #include <deque>
@@ -352,6 +353,19 @@ public:
     };
     const HostStats& host_stats() const { return hx_stats_; }
     bool host_experts() const { return hx_pool_ != nullptr; }
+    /* The background inserts of missed units (hx_bg_loop), a pass's (not the warm-up's): units
+     * relaid into the RAM cache, of them from one-token passes, and their time from the queue's
+     * front to published (waits included). With RADIANCE_EXPERIMENTAL_DS41_INSERT_NT or
+     * ..._INSERT_SLICE_KIB: the pieces of the codes planes written by non-temporal stores and their
+     * bytes, the pieces that first waited for an idle pool and the time asleep, the inserts whose
+     * wait budget ran out with the pool still busy, and the bytes (and time) copied while the pool
+     * had work queued or reserved. */
+    struct InsertStats {
+        uint64_t units = 0, d_units = 0, ns = 0, d_ns = 0;
+        uint64_t pieces = 0, nt_bytes = 0, waited = 0, wait_ns = 0, capped = 0;
+        uint64_t busy_bytes = 0, busy_ns = 0;
+    };
+    InsertStats insert_stats() const;
     /* RADIANCE_EXPERIMENTAL_DS41_ROUTE_TRACE (route_trace.h): this rank's part. Passes and layer
      * records written; of the layers, one-token ones; layers with rank 0's router outputs, with
      * its logits, with a RAM-cache snapshot; bias records; layers whose router op this pass did
@@ -767,10 +781,32 @@ private:
     std::vector<std::thread> hx_bg_;   /* ..._INSERT_THREADS of them (4) */
     std::mutex hx_bg_mu_;
     std::condition_variable hx_bg_cv_;
-    std::deque<std::shared_ptr<Mover::HostPlanes>> hx_bg_q_;
+    /* A unit to relay and the tokens of the pass that missed it (0: the warm-up's). */
+    struct HxInsert {
+        std::shared_ptr<Mover::HostPlanes> p;
+        int rows = 0;
+    };
+    std::deque<HxInsert> hx_bg_q_;
     bool hx_bg_stop_ = false;
     int  hx_bg_busy_ = 0;
     void hx_bg_loop();
+    /* RADIANCE_EXPERIMENTAL_DS41_INSERT_NT=1: the background inserts write a unit's codes planes
+     * into the packed RAM cache by non-temporal stores (ds41hx::PackCopy), so the ~18 MB neither
+     * reads each line first nor fills the caches the pool reads through. ..._INSERT_SLICE_KIB=N
+     * (implies it): in pieces of N KiB, and a one-token pass's insert sleeps before each piece while
+     * the pool has work queued or reserved (HostExpertPool::wait_idle), at most ..._INSERT_WAIT_US
+     * (4000) an insert; the slot is published whole, after the last piece's sfence, as before.
+     * Read by hx_ins_init; only with the packed cache. */
+    bool    hx_ins_nt_ = false;
+    size_t  hx_ins_slice_ = 0;
+    int64_t hx_ins_wait_ns_ = 0;
+    void    hx_ins_init();
+    struct InsertCounts {
+        std::atomic<uint64_t> units{ 0 }, d_units{ 0 }, ns{ 0 }, d_ns{ 0 };
+        std::atomic<uint64_t> pieces{ 0 }, nt_bytes{ 0 }, waited{ 0 }, wait_ns{ 0 }, capped{ 0 };
+        std::atomic<uint64_t> busy_bytes{ 0 }, busy_ns{ 0 };
+    };
+    InsertCounts hx_ins_;   /* the insert threads add to it */
 public:
     /* Waits for the background relayouts of missed units; before the mover drains its cache. */
     void drain_host_inserts();

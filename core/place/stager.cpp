@@ -2,6 +2,7 @@
 #include "place/stager.h"
 #include "place/dspark_native_scope.h"
 #include "place/router_predictor.h"
+#include "ds41_host_experts.h"
 
 #include <algorithm>
 #include <chrono>
@@ -1692,6 +1693,7 @@ int FileStager::hx_init_impl(const Program& prog) {
         int n = 4;
         if (const char* t = std::getenv("RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_INSERT_THREADS"); t && *t)
             n = std::clamp(std::atoi(t), 1, 16);
+        hx_ins_init();
         for (int i = 0; i < n; ++i) hx_bg_.emplace_back(&FileStager::hx_bg_loop, this);
         if (plan_->rank == 0)
             RAD_INFO("host experts: passes of at most %d token(s) compute missed experts on the CPU "
@@ -2406,7 +2408,7 @@ int FileStager::hx_submit_misses_now(int rows) {
     std::sort(hx_rows_.begin(), hx_rows_.end());
     {
         std::lock_guard<std::mutex> lk(hx_bg_mu_);
-        for (auto& p : hx_miss_) hx_bg_q_.push_back(p);
+        for (auto& p : hx_miss_) hx_bg_q_.push_back(HxInsert{ p, rows });
     }
     hx_bg_cv_.notify_all();
     return RAD_OK;
@@ -2758,6 +2760,110 @@ bool FileStager::hx_ra_settle(int rows) {
     return mover_->source_epochs_current();
 }
 
+namespace {
+
+/* One background insert's ds41hx::PackCopy::before (..._INSERT_NT, ..._INSERT_SLICE_KIB): before
+ * each piece of a weight's codes it sleeps while the pool has work queued or reserved, for what is
+ * left of the insert's budget (0: never), and it tallies the pieces, their bytes, and the bytes
+ * and time copied while the pool had work. */
+struct InsertGate {
+    using Clock = std::chrono::steady_clock;
+    HostExpertPool* pool = nullptr;
+    int64_t budget_ns = 0;
+    uint64_t pieces = 0, bytes = 0, waited = 0, wait_ns = 0, busy_bytes = 0, busy_ns = 0;
+    bool capped = false;   /* the budget ran out with the pool still busy */
+    bool busy = false;     /* the piece being copied began while the pool had work, at t0 */
+    Clock::time_point t0{};
+
+    static void before(void* ctx, size_t n) { static_cast<InsertGate*>(ctx)->piece(n); }
+    void piece(size_t n) {
+        Clock::time_point now = end(Clock::now());
+        if (budget_ns > 0 && pool->backlog() > 0) {
+            pool->wait_idle(budget_ns);
+            const Clock::time_point t = Clock::now();
+            const int64_t w = std::chrono::duration_cast<std::chrono::nanoseconds>(t - now).count();
+            ++waited;
+            wait_ns += (uint64_t)w;
+            budget_ns -= w;
+            capped = capped || (budget_ns <= 0 && pool->backlog() > 0);
+            now = t;
+        }
+        ++pieces;
+        bytes += n;
+        busy = pool->backlog() > 0;
+        if (busy) busy_bytes += n;
+        t0 = now;
+    }
+    /* The piece being copied ended at `now`. */
+    Clock::time_point end(Clock::time_point now) {
+        if (busy) busy_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(now - t0).count();
+        busy = false;
+        return now;
+    }
+};
+
+}  // namespace
+
+/* RADIANCE_EXPERIMENTAL_DS41_INSERT_NT=1 and ..._INSERT_SLICE_KIB=N (stager.h, hx_ins_nt_). The
+ * critical-path and DRAM reviews' sliced inserts: each of ~9.6 misses a decode token relays ~18 MB
+ * into the RAM cache beside the pool's bursts, which are DRAM-bound. Cached stores read every line
+ * of the slot first (glibc's memcpy streams only from 24 MiB: about 53 MB of traffic an insert,
+ * 35 with streaming stores), and one insert of 3-5 ms spans several bursts, so a single wait before
+ * it (..._INSERT_YIELD_US) could not keep it out of them. */
+void FileStager::hx_ins_init() {
+    hx_ins_nt_ = false;
+    hx_ins_slice_ = 0;
+    hx_ins_wait_ns_ = 0;
+    const char* nt = std::getenv("RADIANCE_EXPERIMENTAL_DS41_INSERT_NT");
+    const char* sl = std::getenv("RADIANCE_EXPERIMENTAL_DS41_INSERT_SLICE_KIB");
+    const int64_t kib = sl && *sl ? std::clamp<int64_t>(std::atoll(sl), 0, (int64_t)1 << 20) : 0;
+    if (!(nt && !std::strcmp(nt, "1")) && kib <= 0) return;
+    if (!mover_->packed_cache()) {
+        if (plan_->rank == 0)
+            RAD_WARN("host experts: ..._INSERT_NT / ..._INSERT_SLICE_KIB write into the packed RAM cache only "
+                     "(RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE=1); the background inserts copy as before");
+        return;
+    }
+    hx_ins_nt_ = true;
+    hx_ins_slice_ = (size_t)kib << 10;
+    if (kib > 0) {
+        int64_t us = 4000;
+        if (const char* w = std::getenv("RADIANCE_EXPERIMENTAL_DS41_INSERT_WAIT_US"); w && *w)
+            us = std::clamp<int64_t>(std::atoll(w), 0, 100000);
+        hx_ins_wait_ns_ = us * 1000;
+        /* The pool's last tile would otherwise wake the sleeping inserts before the rank waiting
+         * for it goes on (HostExpertPool::quiet_after_tickets). */
+        hx_pool_->quiet_after_tickets();
+    }
+    if (plan_->rank == 0) {
+        if (kib > 0)
+            RAD_INFO("host experts: background inserts write a missed unit's codes by non-temporal stores in "
+                     "pieces of %lld KiB; a one-token pass's insert sleeps before each piece while the pool has "
+                     "work, at most %lld us an insert (RADIANCE_EXPERIMENTAL_DS41_INSERT_SLICE_KIB)",
+                     (long long)kib, (long long)(hx_ins_wait_ns_ / 1000));
+        else
+            RAD_INFO("host experts: background inserts write a missed unit's codes by non-temporal stores "
+                     "(RADIANCE_EXPERIMENTAL_DS41_INSERT_NT)");
+    }
+}
+
+FileStager::InsertStats FileStager::insert_stats() const {
+    InsertStats st;
+    const auto get = [](const std::atomic<uint64_t>& v) { return v.load(std::memory_order_relaxed); };
+    st.units = get(hx_ins_.units);
+    st.d_units = get(hx_ins_.d_units);
+    st.ns = get(hx_ins_.ns);
+    st.d_ns = get(hx_ins_.d_ns);
+    st.pieces = get(hx_ins_.pieces);
+    st.nt_bytes = get(hx_ins_.nt_bytes);
+    st.waited = get(hx_ins_.waited);
+    st.wait_ns = get(hx_ins_.wait_ns);
+    st.capped = get(hx_ins_.capped);
+    st.busy_bytes = get(hx_ins_.busy_bytes);
+    st.busy_ns = get(hx_ins_.busy_ns);
+    return st;
+}
+
 void FileStager::hx_bg_loop() {
     std::vector<uint8_t> scratch;
     bool told = false;
@@ -2765,10 +2871,11 @@ void FileStager::hx_bg_loop() {
     for (;;) {
         hx_bg_cv_.wait(lk, [&] { return hx_bg_stop_ || !hx_bg_q_.empty(); });
         if (hx_bg_q_.empty()) return;   /* stopping, nothing left */
-        std::shared_ptr<Mover::HostPlanes> p = std::move(hx_bg_q_.front());
+        HxInsert job = std::move(hx_bg_q_.front());
         hx_bg_q_.pop_front();
         ++hx_bg_busy_;
         lk.unlock();
+        const auto t0 = std::chrono::steady_clock::now();
         /* RADIANCE_EXPERIMENTAL_DS41_INSERT_YIELD_US=N: an insert streams ~37 MB through DRAM, which
          * the pool's workers are bound by; it waits (asleep) up to N us for the pool to drain. */
         static const int64_t yield_ns = [] {
@@ -2776,13 +2883,48 @@ void FileStager::hx_bg_loop() {
             return y && *y ? (int64_t)std::clamp(std::atoi(y), 0, 100000) * 1000 : (int64_t)0;
         }();
         if (yield_ns > 0 && hx_pool_) hx_pool_->wait_idle(yield_ns);
-        const int rc = mover_->insert_unit_planes(*p, &scratch);
+        int rc;
+        if (hx_ins_nt_ && hx_pool_) {
+            /* Only a one-token pass's insert waits: prefill's misses come ~200 units a chunk and
+             * would pile up behind the pool's bursts. */
+            InsertGate g;
+            g.pool = hx_pool_;
+            g.budget_ns = hx_ins_slice_ > 0 && job.rows == 1 ? hx_ins_wait_ns_ : 0;
+            ds41hx::PackCopy cp;
+            cp.nt = true;
+            cp.slice = hx_ins_slice_;
+            cp.before = &InsertGate::before;
+            cp.ctx = &g;
+            rc = mover_->insert_unit_planes(*job.p, &scratch, &cp);
+            g.end(std::chrono::steady_clock::now());
+            if (job.rows > 0) {
+                hx_ins_.pieces.fetch_add(g.pieces, std::memory_order_relaxed);
+                hx_ins_.nt_bytes.fetch_add(g.bytes, std::memory_order_relaxed);
+                hx_ins_.waited.fetch_add(g.waited, std::memory_order_relaxed);
+                hx_ins_.wait_ns.fetch_add(g.wait_ns, std::memory_order_relaxed);
+                hx_ins_.capped.fetch_add(g.capped ? 1 : 0, std::memory_order_relaxed);
+                hx_ins_.busy_bytes.fetch_add(g.busy_bytes, std::memory_order_relaxed);
+                hx_ins_.busy_ns.fetch_add(g.busy_ns, std::memory_order_relaxed);
+            }
+        } else {
+            rc = mover_->insert_unit_planes(*job.p, &scratch);
+        }
+        if (job.rows > 0) {
+            const uint64_t dt = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now() - t0).count();
+            hx_ins_.units.fetch_add(1, std::memory_order_relaxed);
+            hx_ins_.ns.fetch_add(dt, std::memory_order_relaxed);
+            if (job.rows == 1) {
+                hx_ins_.d_units.fetch_add(1, std::memory_order_relaxed);
+                hx_ins_.d_ns.fetch_add(dt, std::memory_order_relaxed);
+            }
+        }
         if (rc < 0 && !told) {
             RAD_WARN("host experts: relaying a missed unit into the RAM cache failed (%s); it stays "
                      "a miss", rad_strerror(rc));
             told = true;
         }
-        p.reset();
+        job.p.reset();
         lk.lock();
         --hx_bg_busy_;
         hx_bg_cv_.notify_all();
@@ -2839,7 +2981,7 @@ int FileStager::hx_warm() {
         }
         {
             std::lock_guard<std::mutex> lk(hx_bg_mu_);
-            for (auto& p : batch) hx_bg_q_.push_back(p);
+            for (auto& p : batch) hx_bg_q_.push_back(HxInsert{ p, 0 });
         }
         hx_bg_cv_.notify_all();
         done += batch.size();

@@ -52,6 +52,8 @@
 #include <vector>
 #include <sys/stat.h>
 
+namespace ds41hx { struct PackCopy; }
+
 namespace rad {
 class DsparkRadBanks; //borrowed immutable two-bank directory/epoch owner
 
@@ -702,7 +704,11 @@ public:
     /* unit_cached for n units under one lock of the cache (out[i] 0/1): the routing trace's
      * residency snapshot (route_trace.h). */
     void  units_cached(const int32_t* units, int n, uint8_t* out);
-    int   insert_unit_planes(const HostPlanes& p, std::vector<uint8_t>* scratch);
+    /* `copy`: how the packed cache's insert writes each weight's codes plane (ds41hx::PackCopy:
+     * non-temporal stores, pieces, a hook before each; the background inserts' ..._INSERT_NT and
+     * ..._INSERT_SLICE_KIB). The slot's bytes are the same; a block_mxfp4 cache ignores it. */
+    int   insert_unit_planes(const HostPlanes& p, std::vector<uint8_t>* scratch,
+                             const ds41hx::PackCopy* copy = nullptr);
     /* The packed cache's outcomes, all ranks' threads: weights packed and published; units not
      * cached because a weight had more raw rounds than its slot takes (attempts, and distinct
      * units); weights whose packed scales failed the round trip (never published). */
@@ -963,7 +969,7 @@ private:
     std::unique_ptr<std::atomic<uint8_t>[]> packed_refused_;   /* by unit: refused once already */
     std::atomic<uint64_t> packed_inserts_{0}, packed_over_budget_{0}, packed_over_budget_units_{0},
                           packed_round_trip_failed_{0};
-    int  insert_unit_packed(const HostPlanes& p);
+    int  insert_unit_packed(const HostPlanes& p, const ds41hx::PackCopy* copy);
     /* Weight k (handle h) of a unit's planes laid out in p, its buffer grown as needed: where
      * read_unit_planes reads it. False when it is not a plain pair of MXFP4 planes. */
     bool lay_out_weight(HostPlanes* p, int k, rad_weight h);

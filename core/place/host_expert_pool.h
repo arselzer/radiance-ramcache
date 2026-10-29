@@ -18,7 +18,8 @@
  * Optional: ..._CPUS=<list> pins the workers ("4-23" or "4,5,6"), ..._GBPS and ..._LINK_GBPS set
  * the scheduling estimates (4.2 GB/s a thread up to 78, and 20), ..._SPIN_US how long an idle
  * worker spins before it sleeps (200), ..._NICE the workers' nice value (0), ..._MAX_ROWS the most
- * token rows of one expert a job carries (4; up to 32, see max_rows). */
+ * token rows of one expert a job carries (4; up to 32, see max_rows), ..._LEAN_TILES=1 the per-tile
+ * work cut (see lean()). */
 #pragma once
 #include <atomic>
 #include <condition_variable>
@@ -27,6 +28,8 @@
 #include <mutex>
 #include <thread>
 #include <vector>
+
+namespace ds41hx { struct Mx; }
 
 namespace rad {
 
@@ -110,6 +113,21 @@ public:
     /* Sleeps until the pool has nothing queued or reserved, or `max_ns` has passed: for work that
      * should not share DRAM with the pool's streaming (the RAM cache's background inserts). */
     void    wait_idle(int64_t max_ns);
+    /* From now on wait_idle's sleepers are woken after the job that drained the pool has counted
+     * its ticket down, not before: the lock and the broadcast to every sleeping insert thread then
+     * stay off the path of the rank waiting for that ticket (the sliced background inserts,
+     * RADIANCE_EXPERIMENTAL_DS41_INSERT_SLICE_KIB, which wait before every piece). */
+    void    quiet_after_tickets() { quiet_late_.store(true, std::memory_order_relaxed); }
+    /* RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_LEAN_TILES=1, read once: two costs a tile pays come
+     * off. A worker keeps the x lanes it laid out for its last tile (ds41hx::few_lanes) and runs
+     * its next tile on them when that tile is of the same job and projection, instead of laying x
+     * out again (~1.3 us at K 5120, ~0.8 at 2304; the same lanes, so the same bits). And a claim
+     * looks only at the slots holding a job, from a bitmap submit sets and a job's last tile
+     * clears, instead of all 128 slot headers. Counted per worker (lean_stats): tiles claimed, the
+     * slots the scans that claimed them looked at, and the tiles that laid x out or reused it. */
+    bool    lean() const { return lean_; }
+    struct LeanStats { uint64_t claims = 0, scanned = 0, lanes_built = 0, lanes_reused = 0; };
+    LeanStats lean_stats() const;
     double  cpu_bytes_per_ns() const { return cpu_bpns_; }
     double  link_bytes_per_ns() const { return link_bpns_; }
     float   limit() const { return limit_; }
@@ -148,6 +166,10 @@ private:
     bool run_one();                  /* one tile of the oldest job with work; false when none */
     void tile(Slot& s, uint32_t gen, int k);
     void drained(int64_t left);      /* backlog_ now `left`: wake wait_idle at 0 */
+    /* lean_: gemv_avx2_few for a tile of job s's projection `down`, on this worker's lanes of
+     * it, laid out again only when its last tile was of another job or projection. */
+    void lanes_gemv(const Slot& s, bool down, const ds41hx::Mx& m, const uint16_t* const* xs,
+                    uint16_t* const* ys, int rows, int n0, int n1);
 
     std::unique_ptr<Slot[]> slots_;
     std::unique_ptr<uint16_t, void (*)(void*)> rows_{ nullptr, nullptr };   /* the slots' row buffers */
@@ -169,6 +191,17 @@ private:
     std::mutex              quiet_mu_;   /* wait_idle */
     std::condition_variable quiet_cv_;
     std::atomic<int>        quiet_waiters_{ 0 };
+    std::atomic<bool>       quiet_late_{ false };   /* quiet_after_tickets */
+    /* lean_ (..._LEAN_TILES): the slots holding a job, bit i of word i / 64 for slot i (a line of
+     * its own: every claim reads it, every submit and job end writes it); and each worker's
+     * counts, written by that worker alone. */
+    bool lean_ = false;
+    alignas(64) std::atomic<uint64_t> active_[kSlots / 64] = {};
+    struct alignas(64) WorkerCounts {
+        std::atomic<uint64_t> claims{ 0 }, scanned{ 0 }, built{ 0 }, reused{ 0 };
+    };
+    std::unique_ptr<WorkerCounts[]> counts_;
+    static thread_local WorkerCounts* t_counts_;   /* a lean_ pool's worker's own */
 };
 
 }  /* namespace rad */

@@ -519,6 +519,10 @@ FileStager::~FileStager() {
     if (hx_out_ev_) rad_event_destroy(hx_out_ev_);
     for (void* p : { (void*)hx_x_, (void*)hx_idx_, (void*)hx_out_, (void*)hx_chk_ })
         if (p) rad_dev_free(p, RAD_MEM_HOST_PINNED);
+    if (hx_fl_rec_ && hx_fl_ev_) (void)rad_event_sync(hx_fl_ev_);
+    if (hx_fl_ev_) rad_event_destroy(hx_fl_ev_);
+    if (hx_fl_dev_) rad_dev_free(hx_fl_dev_, RAD_MEM_DEVICE);
+    if (hx_fl_pin_) rad_dev_free(hx_fl_pin_, RAD_MEM_HOST_PINNED);
 }
 
 int FileStager::init(const Program& prog, const Plan& plan, Mover* mover, CountsRow counts,
@@ -700,6 +704,15 @@ int FileStager::start_ep_routed(int32_t li, RadStream s, bool* read) {
         v.rank != plan_->rank) { RAD_TRY(head_revoke()); return RAD_E_STATE; }
     const int b = li & 1;
     if (holds_[b] >= 0 || counts_cap_ < 96) return RAD_E_STATE;
+    /* An early-issued layer (..._EARLY_ISSUE) that no gather of it followed: its CPU share was never
+     * decided, so whatever read its down rows read the card's stray rows for the CPU's units. */
+    if (hx_early_li_ >= 0) {
+        const int32_t was = layers_[(size_t)hx_early_li_].layer;
+        hx_drain();
+        RAD_ERR("host experts: layer %d's card ops went ahead of its counts and none of its gathers "
+                "followed", was);
+        return RAD_E_STATE;
+    }
     /* A layer whose CPU rows were computed and never copied means its gather read the card's
      * stray rows for them. */
     if (hx_li_ >= 0) {
@@ -720,10 +733,32 @@ int FileStager::start_ep_routed(int32_t li, RadStream s, bool* read) {
                        (size_t)li < hx_ops_.size() && hx_ops_[(size_t)li].gu >= 0 &&
                        pass_tok_ <= hx_miss_rows_;
     /* Same actual producer stream; this host-wait event is the completion proof.
-     * The Ctx witness means successfully issued, never completed before this wait. */
-    RAD_TRY(rad_memcpy_async(counts_host_, v.row, 96 * (int64_t)sizeof(int32_t), s));
-    if (hx) RAD_TRY(hx_fetch(li, s));
+     * The Ctx witness means successfully issued, never completed before this wait.
+     * With ..._FETCH_LIST the counts row and the pool's rows go as one ranged copy. */
+    int listed = 0;
+    if (hx && hx_fl_) RAD_TRY(listed = hx_fetch_list(li, v.row, s));
+    if (!listed) {
+        RAD_TRY(rad_memcpy_async(counts_host_, v.row, 96 * (int64_t)sizeof(int32_t), s));
+        if (hx) RAD_TRY(hx_fetch(li, s));
+    }
     RAD_TRY(rad_event_record(counts_ev_, s));
+    /* ..._EARLY_ISSUE (stager.h): capped, every file-tier unit is the CPU's, so the card's aliases
+     * are the same whichever units the router picked. Publish them for the whole layer and return
+     * without waiting: the card runs the layer's resident experts, the shared expert and the ffn
+     * mix while the copies above land and this thread waits for them at the gather. A requested
+     * M1 trace keeps the ordinary path, which feeds it. */
+    if (hx && hx_early_ && hx_capped_ && !trace_requested_) {
+        staged_[b].clear();
+        mover_->alias_file_units(L.units, buf_[b], &staged_[b]);
+        partial_[b] = true;
+        pending_[b] = false;
+        if (!staged_[b].empty()) holds_[b] = li;
+        hx_early_li_ = li;
+        hx_early_seen_ = false;
+        hx_early_v_ = v;
+        *read = true;
+        return RAD_OK;
+    }
     const auto t_sync = std::chrono::steady_clock::now();
     RAD_TRY(rad_event_sync(counts_ev_));
     const auto t_counts = std::chrono::steady_clock::now();
@@ -924,8 +959,8 @@ int64_t hx_numel(const RadTensor& t) {
  * card cannot read its slots, so the CPU must compute every unit it holds. */
 int FileStager::hx_init(const Program& prog) {
     RAD_TRY(hx_init_impl(prog));
-    auto packed_ok = [&] {
-        if (!mover_ || !mover_->packed_cache() || hx_capped_) return RAD_OK;
+    auto packed_ok = [&]() -> int {
+        if (!mover_ || !mover_->packed_cache() || hx_capped_) return hx_init_fetch();
         RAD_ERR("RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE=1: the RAM cache then holds a form only the CPU "
                 "reads, so the CPU must compute every routed unit: host experts with ..._POLICY=all and "
                 "..._MISSES=%lld, and RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS set",
@@ -1314,6 +1349,215 @@ int FileStager::hx_fetch(int32_t li, RadStream s) {
     }
     RAD_TRY(rad_memcpy_async(hx_idx_, o.sorted, pass_tok_ * o.top_k * 4, s));
     RAD_TRY(rad_memcpy_async(hx_idx_ + kHxRows, o.off, (o.n_expert + 1) * 4, s));
+    return RAD_OK;
+}
+
+/* ..._FETCH_LIST: layer li's counts row (`row`, its witness's) and the copies hx_fetch makes, as
+ * one ranged copy on s from the list armed for the layer at this pass's size. The list is written
+ * first when it was armed for other addresses (the gate_up operands hx_capture keeps, the counts
+ * row, the stream) or never. Each separate copy is a dispatch behind the one before with its own
+ * system-scope release (the destination is host memory), on the path from the scatter to the
+ * host's wake-up; the ranged copy is one, and with its list on the card it acquires at agent scope
+ * as the separate copies did. Returns 1 when the copy is queued, 0 when the caller must make the
+ * separate copies (an address the copy kernel cannot take; counted). */
+int FileStager::hx_fetch_list(int32_t li, const int32_t* row, RadStream s) {
+    const HxOps& o = hx_ops_[(size_t)li];
+    const int64_t T = pass_tok_;
+    const size_t at = (size_t)li * (size_t)kEpRouteMaxRows + (size_t)(T - 1);
+    if (T < 1 || T > kEpRouteMaxRows || at >= hx_fl_key_.size() || at >= hx_fl_cap_) {
+        ++hx_stats_.fl_plain;
+        return 0;
+    }
+    HxFl& k = hx_fl_key_[at];
+    RadCopyRange* const dev = hx_fl_dev_ + at * (size_t)kHxFlSlot;
+    if (k.n <= 0 || k.row != row || k.x != o.x || k.x_ld != o.x_ld || k.sorted != o.sorted ||
+        k.off != o.off || k.s != s) {
+        HxFetch f;
+        f.counts = row;
+        f.counts_host = counts_host_;
+        f.n_counts = 96;
+        f.x = o.x;
+        f.x_ld = o.x_ld;
+        f.x_host = hx_x_;
+        f.embd = kHxEmbd;
+        f.rows = T;
+        f.sorted = o.sorted;
+        f.sorted_host = hx_idx_;
+        f.n_sorted = T * o.top_k;
+        f.off = o.off;
+        f.off_host = hx_idx_ + kHxRows;
+        f.n_off = o.n_expert + 1;
+        RadCopyRange r[kHxFlSlot] = {};
+        const int n = hx_fetch_ranges(f, r, kHxFlRanges);
+        k = HxFl{};
+        if (n <= 0) {
+            ++hx_stats_.fl_plain;
+            return 0;
+        }
+        /* The staging slots' last write may still be reading one (a list is written once a layer
+         * and pass size, and again after an operand move, so this wait is rare and short). */
+        if (hx_fl_rec_) {
+            RAD_TRY(rad_event_sync(hx_fl_ev_));
+            hx_fl_rec_ = false;
+        }
+        /* Whole pairs of ranges (48 bytes), so the write is a 16-byte copy. */
+        const int64_t bytes = (int64_t)((n + 1) & ~1) * (int64_t)sizeof(RadCopyRange);
+        RadCopyRange* const pin = hx_fl_pin_ + at * (size_t)kHxFlSlot;
+        std::memcpy(pin, r, (size_t)bytes);
+        RAD_TRY(rad_memcpy_async(dev, pin, bytes, s));
+        RAD_TRY(rad_event_record(hx_fl_ev_, s));
+        hx_fl_rec_ = true;
+        k = HxFl{ row, o.x, o.x_ld, o.sorted, o.off, s, n };
+        ++hx_stats_.fl_armed;
+    }
+    RAD_TRY(rad_memcpy_ranges_async(counts_host_, row, 0, dev, k.n, s));
+    ++hx_stats_.fl_copies;
+    return 1;
+}
+
+/* The two switches of a routed layer's host round trip (stager.h), once hx_init knows whether the
+ * file buffers are capped. A switch the configuration cannot honour is refused rather than ignored,
+ * so an A/B arm never runs without what its name says. */
+int FileStager::hx_init_fetch() {
+    hx_early_ = false;
+    hx_fl_ = false;
+    auto asked = [](const char* name, const char** v) {
+        *v = std::getenv(name);
+        return *v && **v && std::strcmp(*v, "0") != 0;
+    };
+    const char* e = nullptr;
+    if (asked("RADIANCE_EXPERIMENTAL_DS41_EARLY_ISSUE", &e)) {
+        if (std::strcmp(e, "1") != 0 || !hx_pool_ || !hx_capped_) {
+            RAD_ERR("RADIANCE_EXPERIMENTAL_DS41_EARLY_ISSUE=%s: 1 issues a routed layer's card ops ahead "
+                    "of its counts sync, which needs every file-tier unit to be the CPU's: host experts "
+                    "with ..._POLICY=all and ..._MISSES=%lld, and RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS "
+                    "set", e, (long long)kEpRouteMaxRows);
+            return RAD_E_INVAL;
+        }
+        hx_early_ = true;
+        if (plan_->rank == 0)
+            RAD_INFO("host experts: early issue: a routed layer's card ops go ahead of its counts sync, "
+                     "and its CPU share is chosen at its gather");
+    }
+    const char* f = nullptr;
+    if (asked("RADIANCE_EXPERIMENTAL_DS41_FETCH_LIST", &f)) {
+        if (std::strcmp(f, "1") != 0 || !hx_pool_) {
+            RAD_ERR("RADIANCE_EXPERIMENTAL_DS41_FETCH_LIST=%s: 1 copies a routed layer's counts and the "
+                    "CPU's rows to the host in one ranged copy, which needs host experts", f);
+            return RAD_E_INVAL;
+        }
+        const size_t n = layers_.size() * (size_t)kEpRouteMaxRows;
+        const int64_t bytes = (int64_t)n * kHxFlSlot * (int64_t)sizeof(RadCopyRange);
+        if (n != hx_fl_cap_) {
+            if (hx_fl_rec_ && hx_fl_ev_) (void)rad_event_sync(hx_fl_ev_);
+            hx_fl_rec_ = false;
+            if (hx_fl_dev_) rad_dev_free(hx_fl_dev_, RAD_MEM_DEVICE);
+            if (hx_fl_pin_) rad_dev_free(hx_fl_pin_, RAD_MEM_HOST_PINNED);
+            hx_fl_dev_ = (RadCopyRange*)rad_dev_alloc(bytes, RAD_MEM_DEVICE);
+            hx_fl_pin_ = (RadCopyRange*)rad_dev_alloc(bytes, RAD_MEM_HOST_PINNED);
+            hx_fl_cap_ = hx_fl_dev_ && hx_fl_pin_ ? n : 0;
+            if (hx_fl_pin_) std::memset(hx_fl_pin_, 0, (size_t)bytes);
+        }
+        if (!hx_fl_ev_ && rad_event_create(&hx_fl_ev_) < 0) hx_fl_ev_ = nullptr;
+        if (!hx_fl_cap_ || !hx_fl_ev_) {
+            RAD_ERR("RADIANCE_EXPERIMENTAL_DS41_FETCH_LIST=1: %s of range lists or their event failed: %s",
+                    humanb(bytes).c_str(), rad_dev_last_error());
+            return RAD_E_NOMEM;
+        }
+        hx_fl_key_.assign(n, HxFl{});
+        hx_fl_ = true;
+        if (plan_->rank == 0)
+            RAD_INFO("host experts: fetch lists: a routed layer's counts and the CPU's rows reach the "
+                     "host in one ranged copy (%zu lists a rank, %s on the card)", n,
+                     humanb(bytes).c_str());
+    }
+    return RAD_OK;
+}
+
+/* ..._EARLY_ISSUE: layer hx_early_li_'s first gather, before its launch. The layer's card ops are
+ * queued ahead of it (start_ep_routed returned without waiting), so now comes what start_ep_routed
+ * does after its counts sync without the switch: wait for the counts and rows, choose the CPU's
+ * share and submit it, read the misses. Every selected unit must go to the CPU, since the card
+ * computed all of them from aliases (as on a first pass, hx_deferred). operands() then waits for
+ * the CPU's rows and copies them over the card's (hx_finish). The wait here is shorter than the
+ * one it replaces by the time the thread spent issuing the layer's card ops; what the card gains
+ * is the time from its counts copy to the gate_up: the thread's wake-up, the choice and submission
+ * (~35 us a layer), and in a decode pass the misses' drive reads (~2.4 ms a missed expert). */
+int FileStager::hx_early_decide() {
+    const int32_t li = hx_early_li_;
+    hx_early_li_ = -1;
+    const Layer& L = layers_[(size_t)li];
+    if (!hx_early_seen_) {
+        RAD_ERR("host experts: layer %d reached its gather with no gate_up seen to read the rows "
+                "its counts sync fetched", L.layer);
+        return RAD_E_STATE;
+    }
+    auto ns = [](auto a, auto b) {
+        return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count();
+    };
+    /* Counts already in: this thread was behind the card, so the card ops it issued first held
+     * back the CPU's start by their issue time (what the switch can lose). */
+    if (rad_event_query(counts_ev_) == 1) ++hx_stats_.early_ready;
+    const auto t_sync = std::chrono::steady_clock::now();
+    RAD_TRY(rad_event_sync(counts_ev_));
+    const auto t_counts = std::chrono::steady_clock::now();
+    const uint64_t sync_ns = ns(t_sync, t_counts);
+    ep_stats_.sync_ns += sync_ns;
+    if (pass_tok_ == 1) { ++ep_stats_.d_reads; ep_stats_.d_sync_ns += sync_ns; }
+    ++hx_stats_.early;
+    hx_stats_.early_wait_ns += sync_ns;
+    RAD_TRY(mover_->retire_file_windows());
+    const auto t_retired = std::chrono::steady_clock::now();
+    if (hx_pred_ && pass_tok_ == 1 && plan_->rank == 0)
+        hx_pred_->post(trace_pass_, L.layer, hx_x_);
+    int64_t total = 0;
+    if (!ep_route_counts_valid(hx_early_v_, counts_host_, counts_cap_, &total)) {
+        ++ep_stats_.corrupt;
+        return RAD_E_STATE;
+    }
+    want_.clear();
+    skip_.clear();
+    for (int32_t u : L.units) {
+        bool selected = false;
+        if (!ep_route_unit_selected(counts_host_, plan_->units[(size_t)u].expert, &selected))
+            return RAD_E_STATE;
+        (selected ? want_ : skip_).push_back(u);
+    }
+    if (trace_fp_) trace_units_ = want_;
+    const size_t selected = want_.size();
+    hx_choose(li);
+    const auto t_chosen = std::chrono::steady_clock::now();
+    if (!want_.empty() || (selected && hx_li_ != li)) {
+        RAD_ERR("host experts: layer %d left %zu of %zu selected units off the CPU, and its card ops "
+                "went ahead with aliases for all of them", L.layer, want_.size(), selected);
+        return RAD_E_STATE;
+    }
+    if (hx_li_ == li) RAD_TRY(hx_submit());
+    const auto t_submitted = std::chrono::steady_clock::now();
+    /* This layer took its read-ahead entries: now the next layer's (predicted from this one). */
+    if (hx_pf_.joinable() && pass_tok_ == 1) hx_pf_target(li + hx_pf_ahead_);
+    const auto t_stage = std::chrono::steady_clock::now();
+    ep_stats_.hx_ns += ns(t_counts, t_stage);
+    if (pass_tok_ == 1) {
+        ep_stats_.d_retire_ns += ns(t_counts, t_retired);
+        ep_stats_.d_choose_ns += ns(t_retired, t_chosen);
+        ep_stats_.d_submit_ns += ns(t_chosen, t_submitted);
+        ep_stats_.d_decide_ns += ns(t_counts, t_stage);
+    }
+    /* Nothing is staged (the card reads only aliases); the misses' drive reads count as the
+     * ordinary path counts them, two weights a missed unit. */
+    const uint64_t missed = hx_li_ == li ? 2 * (uint64_t)hx_miss_.size() : 0;
+    if (missed) {
+        ++ep_stats_.miss_layers;
+        if (pass_tok_ == 1) ++ep_stats_.d_miss_layers;
+    }
+    if (trace_fp_) trace_layer(L.layer, (uint32_t)missed);
+    if (hx_li_ == li) {
+        RAD_TRY(hx_submit_misses());
+        hx_confirmed_ = true;   /* hx_capture saw this pass's gate_up read the rows fetched */
+    }
+    ++ep_stats_.reads;
+    if (!total) ++ep_stats_.zero_local;
     return RAD_OK;
 }
 
@@ -1722,7 +1966,7 @@ int FileStager::hx_deferred(int32_t li, RadStream s) {
     return RAD_OK;
 }
 
-int FileStager::hx_capture(int32_t li, const RadTensor* t, int n_t) {
+int FileStager::hx_capture(int32_t li, RadStream s, const RadTensor* t, int n_t) {
     HxOps& o = hx_ops_[(size_t)li];
     if (n_t < 5) return RAD_E_STATE;
     const RadTensor &A = t[0], &so = t[2], &of = t[3], &Y = t[4];
@@ -1742,6 +1986,32 @@ int FileStager::hx_capture(int32_t li, const RadTensor* t, int n_t) {
             return RAD_E_STATE;
         }
         hx_confirmed_ = true;
+        return RAD_OK;
+    }
+    /* An early-issued layer (..._EARLY_ISSUE): its rows' copies are queued from the addresses an
+     * earlier pass's gate_up read, and the pool has not started, so rows found at new addresses are
+     * fetched again from there, behind the first copies on the same stream (the router and the
+     * scatter wrote them ahead of this op), and the counts' event moves behind them. The layer's
+     * range list (..._FETCH_LIST) is armed for the old addresses and is written again at its next
+     * fetch, once the copy reading it has run. */
+    if (hx_early_li_ == li) {
+        if (!shape || AR != pass_tok_ || T != pass_tok_ * o.top_k || hx_numel(so) < T) {
+            RAD_ERR("host experts: layer %d's gate_up reads rows the CPU path cannot (%lld rows of "
+                    "%lld sorted, a pass of %lld), and its card ops went ahead of its counts",
+                    layers_[(size_t)li].layer, (long long)AR, (long long)T, (long long)pass_tok_);
+            return RAD_E_STATE;
+        }
+        if (A.data != o.x || x_ld != o.x_ld || so.data != o.sorted || of.data != o.off) {
+            ++hx_stats_.moved;
+            ++hx_stats_.early_refetch;
+            o.x = A.data;
+            o.x_ld = x_ld;
+            o.sorted = so.data;
+            o.off = of.data;
+            RAD_TRY(hx_fetch(li, s));
+            RAD_TRY(rad_event_record(counts_ev_, s));
+        }
+        hx_early_seen_ = true;
         return RAD_OK;
     }
     /* Only the addresses of a routed pass that reads all its rows at once (no slice, so from row
@@ -1862,6 +2132,8 @@ void FileStager::hx_drain() {
     hx_li_ = -1;
     hx_stage_ = 0;
     hx_confirmed_ = false;
+    hx_early_li_ = -1;
+    hx_early_seen_ = false;
 }
 
 int FileStager::operands(rad_op h, RadStream s, const RadTensor* t, int n_t) {
@@ -1869,11 +2141,19 @@ int FileStager::operands(rad_op h, RadStream s, const RadTensor* t, int n_t) {
     if ((size_t)h < first_of_.size() && first_of_[(size_t)h] >= 0) {
         const int32_t li = first_of_[(size_t)h];
         if ((size_t)li < hx_ops_.size() && hx_ops_[(size_t)li].gu == (int32_t)h) {
-            RAD_TRY(hx_capture(li, t, n_t));
+            RAD_TRY(hx_capture(li, s, t, n_t));
             return hx_defer_li_ == li ? hx_deferred(li, s) : RAD_OK;
         }
         return RAD_OK;
     }
+    /* An early-issued layer's CPU share is decided at the first of its gathers the pass issues,
+     * behind its card ops; then that gather waits for the CPU rows below as any other. */
+    if (hx_early_li_ >= 0)
+        for (int32_t g : hx_ops_[(size_t)hx_early_li_].gather)
+            if (g >= 0 && (int32_t)h == g) {
+                RAD_TRY(hx_early_decide());
+                break;
+            }
     if (hx_li_ < 0 || hx_stage_ != 2) return RAD_OK;
     for (int32_t g : hx_ops_[(size_t)hx_li_].gather)
         if (g >= 0 && (int32_t)h == g) return hx_finish(s, t, n_t);
@@ -1926,8 +2206,9 @@ int FileStager::before_op(rad_op h, RadStream s, bool* resync) {
          * the ops already issued (finish records them; the copies wait on it). */
         const int b = li & 1;
         if (holds_[b] != li || !partial_[b]) return RAD_OK;
-        /* CPU rows of the slice before not yet copied: a slice's gate_up ahead of its gather. */
-        if (hx_li_ == li && hx_stage_ == 2) {
+        /* CPU rows of the slice before not yet copied (or, early-issued, not yet chosen): a slice's
+         * gate_up ahead of its gather. */
+        if ((hx_li_ == li && hx_stage_ == 2) || hx_early_li_ == li) {
             RAD_ERR("host experts: layer %d's gate_up issued again before its gather",
                     layers_[(size_t)li].layer);
             return RAD_E_STATE;
@@ -1969,9 +2250,10 @@ int FileStager::before_op(rad_op h, RadStream s, bool* resync) {
 int FileStager::end_pass(RadStream s) {
     if (!armed_) return RAD_OK;
     armed_ = false;
-    const bool lost = hx_li_ >= 0 && hx_stage_ == 2;
+    /* An early-issued layer whose gather never came is lost too: its card ops ran on aliases. */
+    const bool lost = (hx_li_ >= 0 && hx_stage_ == 2) || hx_early_li_ >= 0;
     if (lost) RAD_ERR("host experts: layer %d's CPU rows reached no gather before the pass ended",
-                      layers_[(size_t)hx_li_].layer);
+                      layers_[(size_t)(hx_early_li_ >= 0 ? hx_early_li_ : hx_li_)].layer);
     hx_drain();
     pass_last_[pass_kind_] = last_issued_;
     int rc = lost ? RAD_E_STATE : RAD_OK;

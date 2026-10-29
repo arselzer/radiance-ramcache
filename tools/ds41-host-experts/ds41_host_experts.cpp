@@ -5,6 +5,7 @@
 
 #include <immintrin.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <thread>
@@ -12,6 +13,44 @@
 
 namespace ds41hx {
 namespace {
+
+/* ---- the packed form's layout (ds41_host_experts.h) ---- */
+constexpr uint32_t kPkMagic = 0x32505848u;   /* "HXP2" */
+constexpr uint32_t kPkVersion = 1;
+struct PkHeader {
+    uint32_t magic, version;
+    int32_t  N, K, cap, n_exc;
+    uint32_t e0, reserved0;
+    uint64_t total;
+    uint8_t  reserved[24];
+};
+static_assert(sizeof(PkHeader) == 64, "the packed header is one cache line");
+struct PkLayout { size_t codes = 0, pk = 0, idx = 0, raw = 0, total = 0; };
+inline size_t up64(size_t v) { return (v + 63) & ~(size_t)63; }
+/* The sections' offsets: false for K not a multiple of 32, more rounds than an int counts, or a
+ * cap outside 0 .. rounds. */
+bool pk_layout(int N, int K, int cap, PkLayout* l) {
+    if (N <= 0 || K <= 0 || K % 32 || cap < 0) return false;
+    const int UK = K / 32, R = (UK + 31) / 32;
+    if ((uint64_t)N * (uint64_t)R > (uint64_t)INT32_MAX || (uint64_t)cap > (uint64_t)N * (uint64_t)R) return false;
+    l->codes = sizeof(PkHeader);
+    l->pk = up64(l->codes + (size_t)N * (size_t)(K / 2));
+    l->idx = up64(l->pk + (size_t)N * (size_t)(8 * (UK / 32) + (UK % 32 + 3) / 4));
+    l->raw = up64(l->idx + (size_t)4 * (size_t)cap);
+    l->total = up64(l->raw + (size_t)32 * (size_t)cap);
+    return true;
+}
+/* Block u of row n of a packed weight, decoded on its own: the scalar reference's way, which
+ * shares nothing with the kernels' widening. */
+uint32_t pk_scale(const Mx& w, int n, int u) {
+    const int UK = w.K / 32, R = (UK + 31) / 32, r = u / 32, j = u % 32;
+    const uint32_t g = (uint32_t)n * (uint32_t)R + (uint32_t)r;
+    const uint32_t* const e = std::lower_bound(w.exc_idx, w.exc_idx + w.n_exc, g);
+    if (e != w.exc_idx + w.n_exc && *e == g) return w.exc_raw[(size_t)(e - w.exc_idx) * 32 + (size_t)j];
+    const int t = r < UK / 32 ? 32 : UK % 32, tb = (t + 3) / 4;
+    const uint8_t b = w.pk[(size_t)n * (size_t)(8 * (UK / 32) + (UK % 32 + 3) / 4) + (size_t)8 * r + (size_t)(j % tb)];
+    return (uint32_t)w.e0 + ((uint32_t)(b >> (2 * (j / tb))) & 3u);
+}
 
 /* r4d_ds41_mxfp4.hip kMxValues: e2m1 doubled. Code 8 is +0 there, so it is +0 here. */
 constexpr float kKv[16] = { 0.f, 1.f, 2.f, 3.f, 4.f, 6.f, 8.f, 12.f,
@@ -23,18 +62,21 @@ inline uint32_t f_bits(float f) { uint32_t b; std::memcpy(&b, &f, 4); return b; 
 /* mx_e8m0_half: 2^(e - 128), the two subnormals (e = 0, 1) as their bit patterns. */
 inline float e8m0_half(uint32_t e) { return bits_f(e < 2u ? (0x00200000u << e) : ((e - 1u) << 23)); }
 
-/* One row of either layout. */
+/* One row of any layout. */
 struct Row {
     const uint8_t* blk = nullptr;
     const uint8_t* codes = nullptr;
     const uint8_t* sc = nullptr;
+    const Mx*      pkw = nullptr;   /* packed: the weight, and the row's number */
+    int            n = 0;
 };
 inline Row row_of(const Mx& w, int n) {
     Row r;
     if (w.blocks) r.blk = w.blocks + (size_t)n * (size_t)(w.K / 32) * 17;
     else {
         r.codes = w.codes + (size_t)n * (size_t)(w.K / 2);
-        r.sc = w.scales + (size_t)n * (size_t)(w.K / 32);
+        if (w.pk) { r.pkw = &w; r.n = n; }
+        else r.sc = w.scales + (size_t)n * (size_t)(w.K / 32);
     }
     return r;
 }
@@ -47,7 +89,9 @@ inline int code(const Row& r, int u, int v) {
     const uint8_t c = r.codes[(size_t)u * 16 + (v >> 1)];
     return (v & 1) ? (c >> 4) : (c & 15);
 }
-inline uint32_t scale_of(const Row& r, int u) { return r.blk ? r.blk[(size_t)u * 17] : r.sc[u]; }
+inline uint32_t scale_of(const Row& r, int u) {
+    return r.blk ? r.blk[(size_t)u * 17] : r.pkw ? pk_scale(*r.pkw, r.n, u) : r.sc[u];
+}
 
 /* r4d_wave_sum over 32 lane partials: xor 16, then 8, 4, 2, 1. Only lane 0's result is kept, and
  * every lane's is the same because each pair is added in both orders, which is exact. */
@@ -483,6 +527,226 @@ void gemv_avx2_rows_t(const Mx& w, const uint16_t* const* x, uint16_t* const* y,
     }
 }
 
+/* ---- the packed form: a round's codes widened into its e8m0 bytes, then the planar rounds ----
+ *
+ * gemv_avx2_pk and gemv_avx2_rows_pk are gemv_avx2_t<false> and gemv_avx2_rows_t<false> with one
+ * change: a round's scales come from pk_round, which widens its 2-bit codes (or takes its raw bytes)
+ * into the 32 bytes the planar plane would hold there, and the planar round code then runs on
+ * them unchanged. The same bytes through the same code: the planar weight's bits. */
+
+/* A full round: its 8 code bytes, lane i of four 64-bit lanes shifted right by 2i, hold block
+ * 8i + k's code in bits 0 .. 1 of byte k. */
+HX_INLINE void pk_widen32(const uint8_t* p, uint8_t e0, uint8_t* out) {
+    uint64_t v;
+    std::memcpy(&v, p, 8);
+    const __m256i q = _mm256_srlv_epi64(_mm256_set1_epi64x((long long)v), _mm256_setr_epi64x(0, 2, 4, 6));
+    _mm256_store_si256(reinterpret_cast<__m256i*>(out),
+                       _mm256_add_epi8(_mm256_and_si256(q, _mm256_set1_epi8(3)), _mm256_set1_epi8((char)e0)));
+}
+/* A row's last round of t < 32 blocks, (t + 3) / 4 bytes. */
+inline void pk_widen_part(const uint8_t* p, int t, uint8_t e0, uint8_t* out) {
+    const int tb = (t + 3) / 4;
+    for (int j = 0; j < t; ++j) out[j] = (uint8_t)(e0 + ((p[j % tb] >> (2 * (j / tb))) & 3));
+}
+
+/* The raw rounds, walked in the order rows n0, n0 + 1, ... visit their rounds. */
+struct PkRounds {
+    const uint32_t* idx;
+    const uint8_t*  raw;
+    int n, i;
+};
+inline PkRounds pk_rounds_from(const Mx& w, uint32_t g0) {
+    PkRounds c{ w.exc_idx, w.exc_raw, w.n_exc, 0 };
+    c.i = w.n_exc > 0 ? (int)(std::lower_bound(w.exc_idx, w.exc_idx + w.n_exc, g0) - w.exc_idx) : 0;
+    return c;
+}
+/* The e8m0 bytes of round g (t blocks, its codes at p): its raw bytes, or widened into buf. */
+HX_INLINE const uint8_t* pk_round(PkRounds& c, uint32_t g, const uint8_t* p, int t, uint8_t e0, uint8_t* buf) {
+    if (c.i < c.n && c.idx[c.i] == g) return c.raw + (size_t)32 * (size_t)c.i++;
+    if (t == 32) pk_widen32(p, e0, buf);
+    else pk_widen_part(p, t, e0, buf);
+    return buf;
+}
+
+void gemv_avx2_pk(const Mx& w, const uint16_t* x, uint16_t* y, int n0, int n1) {
+    const int UK = w.K / 32, R = (UK + 31) / 32, RF = UK / 32, t = UK % 32;
+    const size_t PB = (size_t)(8 * RF + (t + 3) / 4);
+    struct alignas(32) X8 { float f[8]; };
+    thread_local std::vector<X8> xbuf;
+    xbuf.resize((size_t)R * 128);
+    float* const xt = xbuf.data()->f;
+    x_lanes(x, UK, xt);
+    PkRounds ex = pk_rounds_from(w, (uint32_t)n0 * (uint32_t)R);
+    alignas(32) uint8_t sb[32];
+    for (int n = n0; n < n1; ++n) {
+        const uint8_t* const codes = w.codes + (size_t)n * (size_t)(w.K / 2);
+        const uint8_t* const pk = w.pk + (size_t)n * PB;
+        const uint32_t g = (uint32_t)n * (uint32_t)R;
+        __m256 acc[4] = { _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps() };
+        for (int r = 0; r < RF; ++r) {
+            const uint8_t* const s = pk_round(ex, g + (uint32_t)r, pk + (size_t)8 * r, 32, w.e0, sb);
+            const size_t u0 = (size_t)r * 32;
+            const uint8_t* const gc[4] = { codes + u0 * 16, codes + (u0 + 8) * 16, codes + (u0 + 16) * 16, codes + (u0 + 24) * 16 };
+            const uint8_t* const gs[4] = { s, s + 8, s + 16, s + 24 };
+            add_any_round<false>(acc, gc, gs, 4, xt + (size_t)r * 1024);
+        }
+        if (RF < R) {
+            const uint8_t* const s = pk_round(ex, g + (uint32_t)RF, pk + (size_t)8 * RF, t, w.e0, sb);
+            add_tail<false>(acc, codes + (size_t)RF * 32 * 16, s, 0, t, xt + (size_t)RF * 1024);
+        }
+        y[n] = bf16_rne_nan(wave_sum4(acc));
+    }
+}
+
+void gemv_avx2_rows_pk(const Mx& w, const uint16_t* const* x, uint16_t* const* y, int rows, int n0, int n1) {
+    const int UK = w.K / 32, R = (UK + 31) / 32, RF = UK / 32, t = UK % 32;
+    const size_t PB = (size_t)(8 * RF + (t + 3) / 4);
+    struct alignas(32) X8 { float f[8]; };
+    thread_local std::vector<X8> xbuf;
+    xbuf.resize((size_t)kGemvRows * R * 128);
+    float* xt[kGemvRows];
+    for (int i = 0; i < rows; ++i) {
+        xt[i] = xbuf.data()->f + (size_t)i * R * 1024;
+        x_lanes(x[i], UK, xt[i]);
+    }
+    PkRounds ex = pk_rounds_from(w, (uint32_t)n0 * (uint32_t)R);
+    alignas(32) uint8_t sb[32];
+    for (int n = n0; n < n1; ++n) {
+        const uint8_t* const codes = w.codes + (size_t)n * (size_t)(w.K / 2);
+        const uint8_t* const pk = w.pk + (size_t)n * PB;
+        const uint32_t g = (uint32_t)n * (uint32_t)R;
+        __m256 acc[kGemvRows][4];
+        for (int i = 0; i < rows; ++i)
+            for (int k = 0; k < 4; ++k) acc[i][k] = _mm256_setzero_ps();
+        for (int r = 0; r < RF; ++r) {
+            const uint8_t* const s = pk_round(ex, g + (uint32_t)r, pk + (size_t)8 * r, 32, w.e0, sb);
+            const size_t u0 = (size_t)r * 32;
+            const uint8_t* const gc[4] = { codes + u0 * 16, codes + (u0 + 8) * 16, codes + (u0 + 16) * 16, codes + (u0 + 24) * 16 };
+            const uint8_t* const gs[4] = { s, s + 8, s + 16, s + 24 };
+            const float* xr[kGemvRows];
+            for (int i = 0; i < rows; ++i) xr[i] = xt[i] + (size_t)r * 1024;
+            add_round_rows<false>(acc, gc, gs, xr, rows);
+        }
+        const uint8_t* const st = RF < R ? pk_round(ex, g + (uint32_t)RF, pk + (size_t)8 * RF, t, w.e0, sb) : nullptr;
+        for (int i = 0; i < rows; ++i) {
+            if (st) add_tail<false>(acc[i], codes + (size_t)RF * 32 * 16, st, 0, t, xt[i] + (size_t)RF * 1024);
+            y[i][n] = bf16_rne_nan(wave_sum4(acc[i]));
+        }
+    }
+}
+
+/* ---- packing: a round's extremes for the plan, and pk_widen32's inverse ---- */
+
+/* The least and greatest of a full round's 32 e8m0 bytes. */
+HX_INLINE void pk_minmax32(const uint8_t* s, int* lo, int* hi) {
+    const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s));
+    __m128i mn = _mm_min_epu8(_mm256_castsi256_si128(v), _mm256_extracti128_si256(v, 1));
+    __m128i mx = _mm_max_epu8(_mm256_castsi256_si128(v), _mm256_extracti128_si256(v, 1));
+    mn = _mm_min_epu8(mn, _mm_srli_si128(mn, 8));
+    mx = _mm_max_epu8(mx, _mm_srli_si128(mx, 8));
+    mn = _mm_min_epu8(mn, _mm_srli_si128(mn, 4));
+    mx = _mm_max_epu8(mx, _mm_srli_si128(mx, 4));
+    mn = _mm_min_epu8(mn, _mm_srli_si128(mn, 2));
+    mx = _mm_max_epu8(mx, _mm_srli_si128(mx, 2));
+    mn = _mm_min_epu8(mn, _mm_srli_si128(mn, 1));
+    mx = _mm_max_epu8(mx, _mm_srli_si128(mx, 1));
+    *lo = _mm_cvtsi128_si32(mn) & 255;
+    *hi = _mm_cvtsi128_si32(mx) & 255;
+}
+/* A full round's 32 e8m0 bytes as codes from e0 into the 8 bytes at p (byte k: blocks k, k + 8,
+ * k + 16, k + 24 in bits 0, 2, 4, 6, which pk_widen32 takes apart); false, writing nothing, when a
+ * byte lies outside e0 .. e0 + 3. Each code is at most 3, so a 64-bit lane shifted left by 2i keeps
+ * every code inside its byte. */
+HX_INLINE bool pk_pack32(const uint8_t* s, uint8_t e0, uint8_t* p) {
+    const __m256i c = _mm256_sub_epi8(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(s)), _mm256_set1_epi8((char)e0));
+    if (_mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_min_epu8(c, _mm256_set1_epi8(3)), c)) != -1) return false;
+    const __m256i q = _mm256_sllv_epi64(c, _mm256_setr_epi64x(0, 2, 4, 6));
+    const __m128i h = _mm_or_si128(_mm256_castsi256_si128(q), _mm256_extracti128_si256(q, 1));
+    _mm_storel_epi64(reinterpret_cast<__m128i*>(p), _mm_or_si128(h, _mm_srli_si128(h, 8)));
+    return true;
+}
+
+/* pack_plan: each round fits every e0 in [greatest - 3, least]; the e0 most rounds fit. */
+void pk_plan_rounds(const uint8_t* scales, int N, int K, PackInfo* plan) {
+    const int UK = K / 32, R = (UK + 31) / 32, RF = UK / 32, t = UK % 32;
+    int64_t cover[254] = {};
+    for (int n = 0; n < N; ++n) {
+        const uint8_t* const row = scales + (size_t)n * (size_t)UK;
+        for (int r = 0; r < R; ++r) {
+            int lo = 255, hi = 0;
+            if (r < RF) pk_minmax32(row + (size_t)32 * r, &lo, &hi);
+            else
+                for (int j = 0; j < t; ++j) {
+                    lo = std::min(lo, (int)row[(size_t)32 * r + (size_t)j]);
+                    hi = std::max(hi, (int)row[(size_t)32 * r + (size_t)j]);
+                }
+            const int a = std::max(hi - 3, 0), b = std::min(lo, 252);
+            if (a <= b) { ++cover[a]; --cover[b + 1]; }
+        }
+    }
+    int e0 = 0;
+    int64_t run = 0, best = -1;
+    for (int v = 0; v <= 252; ++v) {
+        run += cover[v];
+        if (run > best) { best = run; e0 = v; }
+    }
+    plan->e0 = e0;
+    plan->n_exc = (int)((int64_t)N * R - best);
+}
+
+/* pack_planes' sections after the header, every byte written; the raw rounds, or -1 past cap. */
+int pk_pack_rounds(const uint8_t* codes, const uint8_t* scales, int N, int K, int cap, uint8_t e0,
+                   uint8_t* dst, const PkLayout& L) {
+    const int UK = K / 32, R = (UK + 31) / 32, RF = UK / 32, t = UK % 32, tb = (t + 3) / 4;
+    const size_t PB = (size_t)(8 * RF + tb), cb = (size_t)N * (size_t)(K / 2);
+    std::memcpy(dst + L.codes, codes, cb);
+    std::memset(dst + L.codes + cb, 0, L.pk - L.codes - cb);
+    std::memset(dst + L.pk, 0, L.total - L.pk);
+    uint8_t* const pk = dst + L.pk;
+    uint32_t* const idx = reinterpret_cast<uint32_t*>(dst + L.idx);
+    uint8_t* const raw = dst + L.raw;
+    int ne = 0;
+    for (int n = 0; n < N; ++n) {
+        const uint8_t* const row = scales + (size_t)n * (size_t)UK;
+        uint8_t* const p = pk + (size_t)n * PB;
+        for (int r = 0; r < R; ++r) {
+            const uint8_t* const s = row + (size_t)32 * r;
+            bool in;
+            if (r < RF) in = pk_pack32(s, e0, p + (size_t)8 * r);
+            else {
+                in = true;
+                for (int j = 0; j < t; ++j) in = in && (uint8_t)(s[j] - e0) <= 3;
+                for (int j = 0; in && j < t; ++j)
+                    p[(size_t)8 * r + (size_t)(j % tb)] |= (uint8_t)(((s[j] - e0) & 3) << (2 * (j / tb)));
+            }
+            if (in) continue;
+            if (ne == cap) return -1;   /* raw: its codes stay 0 */
+            idx[ne] = (uint32_t)n * (uint32_t)R + (uint32_t)r;
+            std::memcpy(raw + (size_t)32 * (size_t)ne, s, (size_t)(r < RF ? 32 : t));
+            ++ne;
+        }
+    }
+    return ne;
+}
+
+/* packed_scales_equal: every round through pk_round, against the planar scales. */
+bool pk_check(const Mx& w, const uint8_t* scales) {
+    const int UK = w.K / 32, R = (UK + 31) / 32, RF = UK / 32, t = UK % 32;
+    const size_t PB = (size_t)(8 * RF + (t + 3) / 4);
+    PkRounds ex = pk_rounds_from(w, 0);
+    alignas(32) uint8_t sb[32];
+    for (int n = 0; n < w.N; ++n) {
+        const uint8_t* const pk = w.pk + (size_t)n * PB;
+        const uint8_t* const sc = scales + (size_t)n * (size_t)UK;
+        for (int r = 0; r < R; ++r) {
+            const int tb = r < RF ? 32 : t;
+            const uint8_t* const s = pk_round(ex, (uint32_t)n * (uint32_t)R + (uint32_t)r, pk + (size_t)8 * r, tb, w.e0, sb);
+            if (std::memcmp(s, sc + (size_t)32 * r, (size_t)tb) != 0) return false;
+        }
+    }
+    return ex.i == ex.n;   /* each raw round used once, in order: the list is ascending */
+}
+
 #undef HX_INLINE
 #if defined(__clang__)
 #pragma clang attribute pop
@@ -528,6 +792,7 @@ void gemv_ref(const Mx& w, const uint16_t* x, uint16_t* y, int n0, int n1) {
 
 void gemv_avx2(const Mx& w, const uint16_t* x, uint16_t* y, int n0, int n1) {
     if (w.blocks) gemv_avx2_t<true>(w, x, y, n0, n1);
+    else if (w.pk) gemv_avx2_pk(w, x, y, n0, n1);
     else gemv_avx2_t<false>(w, x, y, n0, n1);
 }
 
@@ -536,8 +801,81 @@ void gemv_avx2_rows(const Mx& w, const uint16_t* const* x, uint16_t* const* y, i
         const int m = rows - i < kGemvRows ? rows - i : kGemvRows;
         if (m == 1) gemv_avx2(w, x[i], y[i], n0, n1);
         else if (w.blocks) gemv_avx2_rows_t<true>(w, x + i, y + i, m, n0, n1);
+        else if (w.pk) gemv_avx2_rows_pk(w, x + i, y + i, m, n0, n1);
         else gemv_avx2_rows_t<false>(w, x + i, y + i, m, n0, n1);
     }
+}
+
+/* ---- the packed form ---- */
+
+size_t pk_row_bytes(int K) {
+    const int UK = K / 32;
+    return (size_t)(8 * (UK / 32) + (UK % 32 + 3) / 4);
+}
+
+size_t packed_bytes(int N, int K, int cap) {
+    PkLayout l;
+    return pk_layout(N, K, cap, &l) ? l.total : 0;
+}
+
+bool pack_plan(const uint8_t* scales, int N, int K, PackInfo* plan) {
+    PkLayout L;
+    if (!scales || !plan || !pk_layout(N, K, 0, &L)) return false;
+    pk_plan_rounds(scales, N, K, plan);
+    return true;
+}
+
+int pack_planes(const uint8_t* codes, const uint8_t* scales, int N, int K, int cap,
+                const PackInfo& plan, uint8_t* dst, size_t dst_bytes) {
+    PkLayout L;
+    if (!codes || !scales || !dst || !pk_layout(N, K, cap, &L) || dst_bytes < L.total ||
+        plan.e0 < 0 || plan.e0 > 252 || plan.n_exc < 0)
+        return kPackInvalid;
+    if (plan.n_exc > cap) return kPackOverBudget;
+    /* With the plan's count within cap, more raw rounds than cap, or another count, means the plan
+     * is not these scales'. */
+    const int ne = pk_pack_rounds(codes, scales, N, K, cap, (uint8_t)plan.e0, dst, L);
+    if (ne != plan.n_exc) return kPackInvalid;
+    PkHeader h{};
+    h.magic = kPkMagic;
+    h.version = kPkVersion;
+    h.N = N;
+    h.K = K;
+    h.cap = cap;
+    h.n_exc = ne;
+    h.e0 = (uint32_t)plan.e0;
+    h.total = L.total;
+    std::memcpy(dst, &h, sizeof h);
+    return kPackOk;
+}
+
+bool packed_view(const uint8_t* p, size_t bytes, int N, int K, Mx* out) {
+    PkHeader h;
+    PkLayout L;
+    if (!p || !out || bytes < sizeof h) return false;
+    std::memcpy(&h, p, sizeof h);
+    if (h.magic != kPkMagic || h.version != kPkVersion || h.N != N || h.K != K || h.e0 > 252 ||
+        h.n_exc < 0 || h.n_exc > h.cap || !pk_layout(N, K, h.cap, &L) || h.total != L.total ||
+        L.total > bytes)
+        return false;
+    Mx m;
+    m.N = N;
+    m.K = K;
+    m.codes = p + L.codes;
+    m.pk = p + L.pk;
+    m.exc_idx = reinterpret_cast<const uint32_t*>(p + L.idx);
+    m.exc_raw = p + L.raw;
+    m.n_exc = h.n_exc;
+    m.e0 = (uint8_t)h.e0;
+    *out = m;
+    return true;
+}
+
+bool packed_scales_equal(const Mx& w, const uint8_t* scales) {
+    if (!w.pk || !w.codes || !scales || w.N <= 0 || w.K <= 0 || w.K % 32 || w.n_exc < 0 ||
+        (w.n_exc && (!w.exc_idx || !w.exc_raw)))
+        return false;
+    return pk_check(w, scales);
 }
 
 void swiglu(const float* silu, const uint16_t* gu, uint16_t* y, int n, float limit) {

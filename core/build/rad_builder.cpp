@@ -826,6 +826,18 @@ rad_op Builder::decl_op(const char* opname, const RadParam* p, int n_p,
     for (const Band& b : oi.bands)
         if (!b.dom[RAD_DOMAIN_DEVICE] && !b.dom[RAD_DOMAIN_HOST]) resolved = false;
 
+    /* An op that resolved nowhere owns no weight either, as a declined one does (above): no handle
+     * reaches the plugin, so it never runs, and the plugin declares its fallback over the same
+     * weights. Kept, its weights would steer what reads them although nothing it serves will: the
+     * planner reads every op's weights to decide where a weight may be read (a band with no device
+     * kernel moves the weight's whole unit off the card), and the layout pass would let its resolved
+     * bands' kernels claim a stored form the fallback does not read. It stays in the list by name,
+     * with its bands and misses. */
+    if (!resolved) {
+        oi.weights.clear();
+        oi.weight_opd.clear();
+    }
+
     prog_.ops.push_back(std::move(oi));
     op_bufs_.emplace_back();
 

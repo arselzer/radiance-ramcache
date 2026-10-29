@@ -726,6 +726,7 @@ may not have arrived.
 | `gemm_nt_q` | `M`(range) `N` `K` `group` `dtype` `pb1`/opt `pb2`/opt `split_n`/opt | `a`, `a_scale`?, `b`w, `b_scale`w → `y`; `a_sum`?, `b_ref`w? |
 | `gemm_nt_q_bias` | `M`(range) `N` `K` `group` `dtype` | `a`, `a_scale`, `b`w, `b_scale`w, `bias`w → `y` |
 | `gemm_nt_ggml` | `M`(range) `N` `K` `type` `dtype` | `a`, `w`w → `y` |
+| `gemm_nt_bf16f8` | `M`(range) `N` `K` `dtype` | `a`, `b`w → `y` |
 
 `nt` is A row-major `[M,K]` times B transposed `[N,K]`, giving `[M,N]`: the layout every weight in
 a transformer already has. `gemm_nt_q`'s `dtype` names the operand combination, so one op covers
@@ -796,6 +797,20 @@ rows. A wave computes a tile of rows by columns, chosen by `M` and `N` (a single
 at one row, eight rows by four columns from 64 rows, four rows by one column at `N <= 8`); each
 output keeps one order (lane `l` sums `k = l, l+32, ...` with fused multiply-add, then a fixed
 butterfly), so every tile is byte-identical (`tests/r4d_emu/test_f32.cpp`).
+
+`gemm_nt_bf16f8` (device-only) is `gemm_nt` with the same schema and the same bytes, over a bf16
+weight every 32x32 block of which is E4M3 codes times one power of two: an FP8-sourced checkpoint's
+dense linears, which the container holds cast to bf16. libr4d's row (`gemm_bf16f8_nt_m64`, every
+M) stores each block's codes in WMMA fragment order and one E8M0 exponent, derived from the block's
+largest magnitude, and its relayout re-encodes every element and checks it: a weight that is not
+exactly so is refused at load, never rounded. The kernel expands a lane's codes in registers to the
+bf16 bits gemm_bf16_nt_m64 reads from the plane and keeps that kernel's wave geometry, split law,
+WMMA sequence, reduction and store, so its output is gemm_nt's byte for byte at half the weight
+bytes. A separate op rather than a `dtype` on `gemm_nt`: an architecture plugin declares it only
+where it knows a weight is FP8-sourced (deepseek41 behind `RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8`),
+and where no library declares it the plugin declares `gemm_nt`. libref declares no row, so the op
+oracle and rad-kbench leave it out; the row's inverse relayout serves tools holding the stored
+bytes.
 
 ### Runtime LoRA: `lora_shrink` and `lora_expand`
 

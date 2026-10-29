@@ -15,6 +15,7 @@
 
 #include "build/rad_build.h"
 #include "build/startup.h"
+#include "place/planner.h"
 #include "rad_internal.h"
 
 #include <cstdlib>
@@ -592,6 +593,42 @@ TEST(a_hole_in_the_range_is_reported_as_that_band) {
     const std::string s = dump_graph_str(b.program());
     CHECK(has(s, "(nothing)"));
     CHECK(has(s, "---- unresolved:"));
+}
+
+/* An op that resolved nowhere owns no weight, as a runtime-LoRA decline does: no handle reaches
+ * the plugin, which declares its fallback over the same weight. Kept, the weight would follow the
+ * probe's hole: the planner reads every op's weights (resolve_sites), and a band with no device
+ * kernel puts the weight's whole unit in the container's mapping although the op that runs reads
+ * it on the card. The probe stays in the list, with its bands and misses. */
+TEST(an_op_that_resolved_nowhere_owns_no_weight) {
+    NEED_PLUGIN(reg)
+    Builder b(reg, make_meta(), make_ctx());
+
+    rad_weight w = decl_w(b, "w");
+    const RadParam p[] = { RAD_RANGE("M", 1, 8192), RAD_INT("N", 4096), RAD_INT("K", 4096),
+                           RAD_STR("dtype", "bf16") };
+    CHECK_EQ(b.decl_op("t_skinny", p, 4, &w, 1), RAD_NULL_HANDLE);   /* the hole at 64 < M < 4096 */
+    const rad_op fallback = decl_gemm(b, w);
+    REQUIRE(fallback != RAD_NULL_HANDLE);
+    CHECK_OK(b.finish());
+
+    const Program& P = b.program();
+    REQUIRE_EQ((int)P.ops.size(), 3);
+    CHECK_EQ(P.ops[1].op, std::string("t_skinny"));
+    CHECK(P.ops[1].weights.empty());
+    CHECK(P.ops[1].weight_opd.empty());
+    CHECK(P.ops[1].bands.size() >= 3);                 /* its bands and misses stay */
+    bool missed = false;
+    for (const auto& m : P.misses) missed = missed || m.op == "t_skinny";
+    CHECK(missed);
+    REQUIRE_EQ((int)P.ops[2].weights.size(), 1);
+    CHECK_EQ(P.ops[2].weights[0], w);
+
+    /* The weight the fallback reads stays a static on the card. */
+    WeightFootprint wf;
+    weight_footprint(P, &wf, TablePlacement::Vram, TablePlacement::Disk, false, true);
+    CHECK_EQ(wf.mapped, 0);
+    CHECK(wf.statics >= 4096LL * 4096 * 2);
 }
 
 TEST(an_op_with_no_host_kernel_is_a_miss_per_band_not_a_failure) {

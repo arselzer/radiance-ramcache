@@ -77,7 +77,6 @@ the engine or the scripts assumes where the checkpoint is. `ab_window.sh` takes 
 | `..._PREFETCH_ATTN=1` | +2.8% | in the deepseek41 plugin: while the card waits for a layer's CPU rows, lane 1 reads the next layer's q_a, kv, q_b and wo_a (~56 MB a card) into the 64 MB on-die cache (libr4d `prefetch`, read-only); decode passes only, and not ahead of an Engram layer |
 | `..._CACHE_SECOND_CHANCE=N` | N=1 +3.9%, N=2 +5.1% (TTFT −1.5% / +1.2%) | a cached unit the decode profile calls hot (`..._CACHE_PROTECT_SHARE`, default 6 of the sealed profile's 4326 selections a layer: ~1150 units a rank) moves to the front up to N times between uses before an insert may evict it. The held-out prompts share task families with the profile; replayed on the 16 chat prompts too, critical decode misses fell 7.9% (N=1) |
 | `..._PACKED_CACHE=1` | +3.2% alone, TTFT −5.5%; with `..._CACHE_SECOND_CHANCE=2` 15.52 / 15.48 tok/s (+8.2%) | the RAM cache holds each expert's codes plane plus its e8m0 scales packed to 2 bits from one base a weight (raw rounds beside, budget 512 / 320, `..._PACKED_CACHE_RAW`): x1.0444 slots and 4.4% fewer bytes a CPU hit; 7 of 15,360 experts never fit and stay misses. Refused unless the CPU takes every routed unit (all, M16, B1); the card's copy path never reads or fills it |
-| `RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE=1` | not yet measured on the engine | the RAM cache in a CPU-only packed form: x1.044 the pairs, kernel −8.5% a cached expert (below); refused unless the CPU takes every routed unit (all, M16, B1); arm part `K` |
 
 ## The packed RAM cache
 
@@ -119,6 +118,7 @@ research sample's real scales; `ds41_host_experts_test pkbench 32 40 24`, median
 | block_mxfp4 | 0.416 | 0.387 |
 | planes | 0.387 (−6.9%) | 0.354 (−8.6%) |
 | packed | 0.381 (−8.5%) | 0.324 (−16.3%) |
+| `..._DENSE_FP8=1` | not yet measured | in the deepseek41 plugin and libr4d of the fp8 branch: the trunk's dense linears the release ships as E4M3 codes with an E8M0 exponent a 32x32 block (q_a, q_b, kv, wo_a's groups, wo_b, the indexer's q_b, engram_kv and the shared expert; 330 weights a rank, 570 container entries) are read by `gemm_nt_bf16f8`, which stores those codes and exponents (1.001 bytes a value) and writes `gemm_nt`'s bytes. VRAM per rank: rank 0 4520 → 2262 MiB of these weights, ranks 1-3 4220 → 2112 MiB (−2.21 / −2.06 GiB; 225 MiB less with `..._ENGRAM_SPLIT=1`, 450 / 300 MiB less without the shared expert), which go to resident experts. The load re-encodes each weight and refuses one that is not exactly so (`ds41_dense_fp8_scan` checks ahead; all 570 are). Requires: no tune rows or `RADIANCE_TUNE` pin for the bf16 GEMMs (the op always takes the split law), the libr4d row (`gemm_bf16f8_nt_m64`), and the checkpoint's `imported_quantization_config` (fp8, ue8m0, 32x32); otherwise a note and everything stays bf16. `..._DENSE_FP8_EXCLUDE=name,*suffix` keeps weights bf16 (`*_shexp.weight`: the shared expert). Startup logs `deepseek41: rank R: N dense weights read by gemm_nt_bf16f8 ...` per rank |
 
 `ds41_host_experts_test packed` holds packed to planar bit for bit: the 27 sampled experts, a raw
 round at every block position (down's tail included), widened rounds on the general path (126 ..
@@ -133,13 +133,33 @@ round at every block position (down's tail included), widened rounds on the gene
   never launch it from a shell that hides the cards (`ROCR_VISIBLE_DEVICES`). An arm is
   `POLICY[-part...]`; the parts are listed in the script (threads `tN`, cache `mMIB`, misses `MR`,
   pool `pMIB`, pregrow `G`, mirror `R`/`RNN`, file buffer cap `BN`, warm `W`, async `A`/`AN`, fault
-  `ZN`, predictor `PsK`/`PoK`, ...). `PROMPTS`, `AB_REQUESTS`, `AB_MAX_TOKENS`, `AB_CONCURRENCY`
-  and `MAX_SEQS` change the workload.
+  `ZN`, predictor `PsK`/`PoK`, FP8-stored dense weights `F8` / `F8n` (shared expert bf16), ...);
+  an arm with a part the script does not know is skipped. An `F8` arm is refused under
+  `RADIANCE_TUNE` or with a tune cache in its home, and is not measured unless its server log
+  names the weights read by `gemm_nt_bf16f8`; every other arm runs with the knob off.
+  `PROMPTS`, `AB_REQUESTS`, `AB_MAX_TOKENS`, `AB_CONCURRENCY` and `MAX_SEQS` change the workload.
 - `ab_requests.py`: sends a receipt's requests (token ids, `chat_text` framed like the held-out
   prompts, or `messages`) and compares arms.
 - `cache_sim.py`: replays an access trace against LRU, SLRU, 2Q, aged LFU and Belady.
 - `ds41_mxfp4_device_check.hip`: the kernels against the card (chain check, exhaustive SwiGLU,
   GEMV timing against two libr4d builds).
+- `ds41_bf16f8_device_check.hip` (`make device-check O=<dir>`): `gemm_nt_bf16f8` on the card
+  against `gemm_nt`, from a built libr4d.so: the weight fragments the kernel expands for all 254
+  E4M3 codes at all 237 exponents (`frag`, which sees the sign of a zero), one-hot GEMMs over
+  every (code, exponent) pair, signed zeros and cancelling pairs through the slices that start
+  mid-block (`zeros`), ds41's per-rank shapes at every split and row count, container tensors and a
+  timing table. Exit 0 when every output bit is equal. Run it in a GPU window under both locks:
+  `HIP_VISIBLE_DEVICES=0 ds41_bf16f8_device_check <libr4d.so> all <model.rad>`.
+- `ds41_dense_fp8_scan.cpp` (`make scan O=<dir>`, host only): the exactness scan behind
+  `RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8`. It runs libr4d's own bf16f8 layout hooks over every
+  dense weight deepseek41 would store as E4M3 codes (the 570 container entries of q_a, q_b, kv,
+  wo_a's groups, wo_b, the shared expert, the indexer's q_b and engram_kv) in 1024-row bands, checks
+  the inverse gives every band back, cross-checks the conversion's `sources.jsonl` (`--census`) and
+  the tensor-parallel cuts at 2..4 ranks, and prints the `..._DENSE_FP8_EXCLUDE` list of any entry
+  the load would refuse. Read-only, idle I/O priority, and it pauses while `ab_window.sh` runs. On
+  `ds41-native-mxfp4-v3` (2026-10-29): 570 / 570 entries exact, 6,676,480 blocks, 0 refused
+  (970,434 subnormal codes, 35,738 +0, 36,130 -0, block exponents 109..121), 610 E4M3 pieces in
+  the census, 57 cuts all on 32; 13.7 GB in 17 s with 4 threads.
 - `ds41_host_experts_test.cpp`: host tests of the kernels against the scalar reference.
 
 ## Correctness

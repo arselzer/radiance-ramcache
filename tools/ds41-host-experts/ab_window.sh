@@ -17,6 +17,8 @@
 # card 0: swiglu over every (gate, up) pair with mismatches classified, and the host chain.
 #
 # Arms are named POLICY[-tN][-gG][-sS][-nP][-mM][-MR][-PsK|-PoK][-f][-x] (see the loop below), e.g. "base greedy-t20-g65 all-t24".
+# An arm with an unknown part is skipped, not run without it; F8 (the FP8-stored dense weights) is
+# also checked in the server log.
 #
 # Environment: RADIANCE_BIN (the binary), RADIANCE_HOME_DIR (kernels/ and architectures/ for it),
 # SILU_TABLE (the card's silu table), ARMS (default "base verify greedy"), HX_THREADS (16),
@@ -156,6 +158,25 @@ arm() {   # name, then env assignments for the server; CACHE_MIB the RAM cache (
     if (( t > 600 )); then log "arm $name: no server after 600 s"; stop_server; return 1; fi
   done
   log "arm $name: serving after ${t}s"
+  # RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8 (the F8 parts): the plugin names the weights it reads from
+  # E4M3 codes on each rank, and an arm must have exactly what its name says. An F8 arm whose
+  # plugin did not take the knob, or a plain arm that took it from the window's environment, is
+  # not measured. A tune cache would give the bf16 GEMMs another split than gemm_nt_bf16f8's, which
+  # always takes the split law, so an F8 arm with one is not measured either.
+  local f8_lines; f8_lines=$(grep -cE '[1-9][0-9]* dense weights read by gemm_nt_bf16f8' "$OUT/$name.server.log")
+  if [[ -n "${ARM_F8:-}" && "$f8_lines" == 0 ]]; then
+    log "arm $name: F8, but the server log has no 'dense weights read by gemm_nt_bf16f8' line (a plugin without the knob?); not measured"
+    stop_server; return 1
+  fi
+  if [[ -z "${ARM_F8:-}" && "$f8_lines" != 0 ]]; then
+    log "arm $name: no F8 part, but the server read dense weights from E4M3 codes (the knob set for the window?); not measured"
+    stop_server; return 1
+  fi
+  if [[ -n "${ARM_F8:-}" ]] && grep -q 'tune cache: [0-9]* row' "$OUT/$name.server.log"; then
+    log "arm $name: F8 with a tune cache loaded ($(grep -m1 'tune cache:' "$OUT/$name.server.log")); not measured"
+    stop_server; return 1
+  fi
+  [[ -n "${ARM_F8:-}" ]] && grep -E 'dense weights read by gemm_nt_bf16f8' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   python3 -I "$HERE/ab_requests.py" "$PROMPTS" "http://127.0.0.1:$PORT" "$n" "$OUT/$name.json" >>"$OUT/window.log" 2>&1
   log "arm $name: requests exit $?"
   stop_server
@@ -221,11 +242,14 @@ for a in $ARMS; do
 # drafts a step (Ds0: the bank loaded, drafting off) / with the adaptive window (the bank pins its
 # experts in the host pool: give the arm pN of ~2048); H3 the third run home (RADIANCE_HOME_DIR3); Es
 # engram_kv's rows split over the ranks (needs a deepseek41 plugin that has it); Pa the next layer's
-# attention weights read into the card's on-die cache during the CPU-row wait (same); rN a repeat
-# (ignored).
+# attention weights read into the card's on-die cache during the CPU-row wait (same); F8 the
+# FP8-sourced dense linears read from E4M3 codes (RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8, gemm_nt_bf16f8;
+# the deepseek41 and libr4d of the fp8 branch), F8n the same with the shared expert left bf16, both
+# with $F8_EXCLUDE as ..._DENSE_FP8_EXCLUDE when set; an F8 arm is refused under RADIANCE_TUNE or a
+# tune cache in its home, every other arm runs with the knob off; rN a repeat (ignored).
   IFS=- read -r -a parts <<< "$a"
   pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 HOST_POOL_MIB=4096 EXTRA_ARGS="" ARM_HOME="$RHOME"
-  power="" skip="" ARGS=()
+  power="" skip="" ARGS=() f8="" f8x=""
   for p in "${parts[@]:1}"; do
     case $p in
       Q[gnc]*) power=${p#Q} ;;
@@ -243,6 +267,8 @@ for a in $ARMS; do
       H3)      ARM_HOME=${RADIANCE_HOME_DIR3:?H3 needs RADIANCE_HOME_DIR3} ;;
       Es)      env+=(RADIANCE_EXPERIMENTAL_DS41_ENGRAM_SPLIT=1) ;;   # engram_kv rows split over the ranks
       Pa)      env+=(RADIANCE_EXPERIMENTAL_DS41_PREFETCH_ATTN=1) ;;   # next layer's attention weights into the on-die cache
+      F8)      f8=1 ;;                     # FP8-sourced dense linears from E4M3 codes (gemm_nt_bf16f8)
+      F8n)     f8=1 f8x='*_shexp.weight' ;;   # the same, the shared expert left bf16
       i[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_INSERT_THREADS=${p#i}) ;;
       p[0-9]*) HOST_POOL_MIB=${p#p} ;;
       G)       env+=(RADIANCE_EXPERIMENTAL_NATIVE_CACHE_PREGROW=1) ;;
@@ -275,9 +301,24 @@ for a in $ARMS; do
                       --num-speculative-tokens 5 --spec-ngram 0)
                [[ $p == Ds[0-9] ]] && env+=(RADIANCE_EXPERIMENTAL_DS41_DSPARK_VERIFY_CAP=${p#Ds})
                [[ $p == Dsa ]] && ARGS+=(--draft-window adaptive) ;;
-      *)       log "arm $a: unknown part $p" ;;
+      *)       log "arm $a: unknown part $p; the arm is skipped (it would run without what its name says)"; skip=1 ;;
     esac
   done
+  # gemm_nt_bf16f8 always takes gemm_bf16_nt_m64's split law; a tuned split for the bf16 rows (a
+  # pin, or a tune cache in the arm's home) would make the F8 arm's bytes differ from the others'.
+  if [[ -n "$f8" ]]; then
+    if [[ -n "${RADIANCE_TUNE+x}" ]]; then log "arm $a: F8 refused: RADIANCE_TUNE is set"; skip=1; fi
+    IFS=: read -r -a homes <<< "$ARM_HOME"
+    for h in "${homes[@]}"; do
+      if compgen -G "$h/tune/*" >/dev/null; then log "arm $a: F8 refused: $h/tune holds a tune cache"; skip=1; fi
+    done
+    ex=${F8_EXCLUDE:-}
+    [[ -n "$f8x" ]] && ex=${ex:+$ex,}$f8x
+    env+=(RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8=1 "RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8_EXCLUDE=$ex")
+  else
+    env+=(RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8=0)
+  fi
+  ARM_F8=$f8
   [[ -n "$skip" ]] && continue
   [[ -n "$power" ]] && power_set "$power"
   case $pol in

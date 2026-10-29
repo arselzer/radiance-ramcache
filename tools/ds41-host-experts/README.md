@@ -84,8 +84,11 @@ the engine or the scripts assumes where the checkpoint is. `ab_window.sh` takes 
   never launch it from a shell that hides the cards (`ROCR_VISIBLE_DEVICES`). An arm is
   `POLICY[-part...]`; the parts are listed in the script (threads `tN`, cache `mMIB`, misses `MR`,
   pool `pMIB`, pregrow `G`, mirror `R`/`RNN`, file buffer cap `BN`, warm `W`, async `A`/`AN`, fault
-  `ZN`, predictor `PsK`/`PoK`, ...). `PROMPTS`, `AB_REQUESTS`, `AB_MAX_TOKENS`, `AB_CONCURRENCY`
-  and `MAX_SEQS` change the workload.
+  `ZN`, predictor `PsK`/`PoK`, FP8-stored dense weights `F8` / `F8n` (shared expert bf16), ...);
+  an arm with a part the script does not know is skipped. An `F8` arm is refused under
+  `RADIANCE_TUNE` or with a tune cache in its home, and is not measured unless its server log
+  names the weights read by `gemm_nt_bf16f8`; every other arm runs with the knob off.
+  `PROMPTS`, `AB_REQUESTS`, `AB_MAX_TOKENS`, `AB_CONCURRENCY` and `MAX_SEQS` change the workload.
 - `ab_requests.py`: sends a receipt's requests (token ids, `chat_text` framed like the held-out
   prompts, or `messages`) and compares arms.
 - `cache_sim.py`: replays an access trace against LRU, SLRU, 2Q, aged LFU and Belady.

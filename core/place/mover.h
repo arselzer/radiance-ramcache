@@ -628,8 +628,34 @@ public:
         HostPlanes& operator=(const HostPlanes&) = delete;
         ~HostPlanes() { for (uint8_t* b : buf) std::free(b); }
     };
+    /* One read_unit_planes call's timing, in ns from its dispatch (the readers handed the reads),
+     * for the CPU path's counters: which leg lands last, the mirror's copy out of its bounce
+     * buffer, the readers' start and the caller's return (RESEARCH-2-RANKED-PLAN #7's gates). */
+    struct PlaneReadTiming {
+        int     units = 0, reads = 0;
+        int     mirror_reads = 0;   /* the mirror's tail reads (pieces, with ..._MIRROR_SPLIT) */
+        bool    posted = false;     /* start_unit_planes .. finish_unit_planes */
+        int64_t first_ns = 0;       /* the first read begun */
+        int64_t first_container_ns = 0, last_start_ns = 0;   /* the first container read, the last of all, begun */
+        int64_t container_ns = 0;   /* the last container read landed (0: none) */
+        int64_t mirror_ns = 0;      /* the last mirror read landed, its copy included (0: none) */
+        int64_t copy_ns = 0;        /* the longest mirror copy (pieces copy at once) */
+        int64_t copy_sum_ns = 0;    /* the mirror copies, summed */
+        int64_t join_ns = 0;        /* posted: the caller came to wait (finish_unit_planes) */
+        int64_t return_ns = 0;      /* the caller back, every read landed */
+    };
     /* `rows`: the pass's tokens, which decide whether the plane mirror takes a share. */
-    bool  read_unit_planes(HostPlanes* const* units, int n, int rows = 1);
+    bool  read_unit_planes(HostPlanes* const* units, int n, int rows = 1, PlaneReadTiming* timing = nullptr);
+    /* read_unit_planes in two halves, for the issuing thread (RADIANCE_EXPERIMENTAL_DS41_MISS_POST):
+     * start_unit_planes hands the reads to the kept readers and returns at once, so they run while
+     * the caller goes on (the pool's jobs for the cached units); finish_unit_planes reads whatever
+     * no reader has begun, waits for the rest and returns what read_unit_planes would have. False
+     * from start: nothing started (one already in flight, no kept readers, a unit not eligible),
+     * read as before. One call in flight a Mover; the same thread calls both, and calls nothing
+     * else that reads planes between them; the units' buffers stay put until the finish. */
+    bool  start_unit_planes(HostPlanes* const* units, int n, int rows);
+    bool  finish_unit_planes(PlaneReadTiming* timing = nullptr);
+    bool  unit_planes_started() const { return plane_posted_; }
     bool  host_planes_eligible(int32_t u) const;   /* what read_unit_planes accepts */
     /* lay_out_unit_planes  for a read-ahead (readahead.h): unit p->unit laid out in p exactly as
      *                      read_unit_planes lays it out before reading, and each weight's container
@@ -884,6 +910,31 @@ private:
      * thread's bounce buffer warm (RADIANCE_EXPERIMENTAL_DS41_READ_POOL=0: a thread a read, as
      * before). */
     NativeReadWorkers    plane_workers_;
+    /* One read_unit_planes call: its reads, which the readers take in order (the mirror's first:
+     * they take the longest), each read's outcome and when it began and landed (ns from t0, the
+     * dispatch). The reader is operator(); a posted call (start_unit_planes) lives in plane_call_
+     * until its finish. */
+    struct PlaneCall {
+        struct Read {
+            uint32_t file = 0; int64_t off = 0, len = 0; uint8_t* dst = nullptr; int64_t cap = 0;
+            const PlaneMirror::Ref* m = nullptr; uint64_t from = 0;   /* m: the mirror's bytes [from, from+len) */
+            int rc = 0;
+            int64_t start_ns = 0, end_ns = 0, copy_ns = 0;
+        };
+        Mover* mover = nullptr;
+        PlaneMirror* mirror = nullptr;
+        std::vector<Read> reads;
+        std::atomic<size_t> next{ 0 };
+        int weights = 0, units = 0;
+        bool posted = false;
+        int64_t t0 = 0;        /* steady_clock ns: the dispatch */
+        int64_t join_ns = 0;   /* posted: the caller came to wait, from t0 */
+        void operator()(int);
+    };
+    PlaneCall plane_call_;
+    bool      plane_posted_ = false;
+    bool plane_reads(HostPlanes* const* units, int n, int rows, PlaneCall* c);
+    bool plane_reads_done(PlaneCall* c, bool readers_failed, PlaneReadTiming* timing);
     bool                 native_file_workers_on_ = false;
     int  read_relaid(const WeightInfo& w, void* dst, int64_t dst_cap, RelayIn* in);
     int  read_native_file(const WeightInfo& w, void* dst, int64_t dst_cap, RelayIn* in,

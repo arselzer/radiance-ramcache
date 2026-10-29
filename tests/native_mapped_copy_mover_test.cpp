@@ -1019,6 +1019,43 @@ void read_ahead_case(bool packed){
 } //namespace
 TEST(mapped_read_ahead_pieces_read_and_insert_as_the_demand_read){read_ahead_case(false);}
 TEST(mapped_packed_read_ahead_pieces_read_and_insert_as_the_demand_read){read_ahead_case(true);}
+/* read_unit_planes and its two halves (start_unit_planes / finish_unit_planes, which
+ * RADIANCE_EXPERIMENTAL_DS41_MISS_POST uses) land the container's planes byte for byte and report the
+ * call's timing; a second start while one is in flight (before it touches any buffer) and a finish
+ * with none are refused; the kept readers serve both ways in turn. */
+TEST(mapped_actual_mover_unit_planes_read_whole_or_posted_land_the_same_bytes){
+    Environment mapped("1","1");
+    Fixture f;f.experts();f.info.relayout=mx_relayout;Image image(lay_out_mxfp4(f));write_scales(f,image);
+    Config cfg=plan_config(false);Plan plan=planned(f,cfg,true);const auto units=two_ssd_experts(plan);
+    std::atomic<uint64_t> calls{0};Access::Driver driver;Transport t;t.open(f,plan,image,80*MiB,calls);Access::attach(*t.mover,driver);
+    for(int32_t u:units)REQUIRE(t.mover->host_planes_eligible(u));
+    auto same=[&](const Mover::HostPlanes& p){
+        if(p.n!=2)return false;
+        for(int k=0;k<2;++k){const auto& w=f.prog.weights[p.w[k]];const size_t N=size_t(mx_rows(w)),K=size_t(mx_cols(w));
+            if(std::memcmp(p.codes[k],image.bytes.data()+w.file_plane_offset[0],N*K/2)||
+               std::memcmp(p.scales[k],image.bytes.data()+w.file_plane_offset[1],N*(K/32)))return false;}
+        return true;};
+    for(int round=0;round<3;++round){
+        Mover::HostPlanes a0,a1;a0.unit=units[0];a1.unit=units[1];Mover::HostPlanes* pa[2]={&a0,&a1};
+        Mover::PlaneReadTiming ta;
+        REQUIRE(t.mover->read_unit_planes(pa,2,1,&ta));
+        CHECK(same(a0));CHECK(same(a1));
+        CHECK_EQ(ta.units,2);CHECK_EQ(ta.reads,4);CHECK_EQ(ta.mirror_reads,0);CHECK(!ta.posted);
+        CHECK(ta.container_ns>0);CHECK(ta.return_ns>=ta.container_ns);CHECK(ta.last_start_ns>=ta.first_ns);
+        Mover::HostPlanes b0,b1;b0.unit=units[0];b1.unit=units[1];Mover::HostPlanes* pb[2]={&b0,&b1};
+        REQUIRE(t.mover->start_unit_planes(pb,2,1));
+        CHECK(t.mover->unit_planes_started());
+        Mover::HostPlanes c0;c0.unit=units[0];Mover::HostPlanes* pc[1]={&c0};
+        CHECK(!t.mover->start_unit_planes(pc,1,1));CHECK(c0.buf[0]==nullptr);   //one in flight
+        Mover::PlaneReadTiming tb;
+        REQUIRE(t.mover->finish_unit_planes(&tb));
+        CHECK(!t.mover->unit_planes_started());
+        CHECK(same(b0));CHECK(same(b1));
+        CHECK(tb.posted);CHECK_EQ(tb.units,2);CHECK_EQ(tb.reads,4);CHECK(tb.return_ns>=tb.join_ns);
+        CHECK(!t.mover->finish_unit_planes(&tb));   //none in flight
+    }
+    CHECK(has(t.mover->report(),"kept plane readers"));
+}
 
 int main(int argc,char** argv){
 #ifdef RAD_HAVE_HIP

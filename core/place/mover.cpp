@@ -910,22 +910,78 @@ bool Mover::borrow_host_unit(int32_t u, HostUnit* out) {
     return true;
 }
 
-bool Mover::read_unit_planes(HostPlanes* const* units, int n, int rows) {
+namespace {
+
+int64_t steady_ns() {
+    return (int64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+/* Miss reads on the kept readers (plane_workers_), unless RADIANCE_EXPERIMENTAL_DS41_READ_POOL=0:
+ * threads started a call, as before. */
+bool plane_read_pool() {
+    static const bool pooled = [] {
+        const char* s = std::getenv("RADIANCE_EXPERIMENTAL_DS41_READ_POOL");
+        return !s || std::strcmp(s, "0") != 0;
+    }();
+    return pooled;
+}
+
+/* RADIANCE_EXPERIMENTAL_DS41_MIRROR_SPLIT=N (2 to 4; designed for 3, one a drive of the SATA
+ * stripe): a pass of fewer than the mirror's min_rows tokens (decode) that misses one unit reads
+ * the mirror's tail of its gate_up in N pieces (PlaneMirror::split), each on its own reader, beside
+ * the container's three reads. The tail leg is one pread into a bounce buffer and then a copy out
+ * of it, 2.4 MB at decode share 0.13, and a lone miss waits for its slowest leg: in pieces the
+ * preads overlap and so do the copies. Measured on the drives (research mrp/landbench2, warm
+ * bounces, medians of 4 rounds a rank): the call 2629 -> 2400 us, the mirror leg 2246 -> 2150 us,
+ * its copy 216 -> 101 us. The same bytes land in the same places; a piece that fails is read from
+ * the container like a whole tail (its start is on the container's 4 KiB grid). 0 or 1: one read. */
+int mirror_split() {
+    static const int n = [] {
+        const char* s = std::getenv("RADIANCE_EXPERIMENTAL_DS41_MIRROR_SPLIT");
+        return s && *s ? std::clamp(std::atoi(s), 1, 4) : 1;
+    }();
+    return n;
+}
+
+}  /* namespace */
+
+/* A reader: takes the next read until none is left, and notes when it began and landed. */
+void Mover::PlaneCall::operator()(int) {
+    for (size_t j; (j = next.fetch_add(1)) < reads.size();) {
+        Read& r = reads[j];
+        r.start_ns = steady_ns() - t0;
+        uint64_t copy = 0;
+        r.rc = r.m ? mirror->read(*r.m, r.from, (uint64_t)r.len, r.dst, &copy)
+                   : mover->read_source_file(r.file, (uint64_t)r.off, r.len, r.dst, r.cap);
+        r.copy_ns = (int64_t)copy;
+        r.end_ns = steady_ns() - t0;
+    }
+}
+
+/* The call's reads: each unit's buffers sized and its planes' pointers set, a read an extent. */
+bool Mover::plane_reads(HostPlanes* const* units, int n, int rows, PlaneCall* c) {
     if (!units || n <= 0 || !plan_ || !prog_ || !relayout_ || !file_.ok() || !mapped_file_cache_on_)
         return false;
     /* As read_native_file: the container must still be the one the Program was loaded from,
      * before the reads and after them. */
     if (!source_file_epoch()) return false;
-    /* A container extent [off, off+len) into dst (cap bytes there), or with m the mirror's bytes
-     * [from, from+len) of *m, which are the container's extent if the mirror fails. */
-    struct Read { uint32_t file; int64_t off, len; uint8_t* dst; int64_t cap;
-                  const PlaneMirror::Ref* m; uint64_t from; };
-    std::vector<Read> reads;
+    using Read = PlaneCall::Read;
+    std::vector<Read>& reads = c->reads;
+    reads.clear();
+    c->mover = this;
+    c->next.store(0);
+    c->weights = 0;
+    c->units = n;
+    c->posted = false;
+    c->join_ns = 0;
     /* Passes of min_rows or more take the mirror's share, smaller ones (decode) its decode share. */
     PlaneMirror* const pm = PlaneMirror::get();
     const int64_t tail = !pm ? 0 : rows >= pm->min_rows() ? mirror_tail_ : mirror_tail_decode_;
     PlaneMirror* const mirror = tail > 0 && pm->on() ? pm : nullptr;
-    int weights = 0;
+    c->mirror = mirror;
+    /* A lone decode miss's tail in pieces (mirror_split; the default 1 is one read, as before). */
+    const int pieces = mirror && n == 1 && rows < pm->min_rows() ? mirror_split() : 1;
     for (int i = 0; i < n; ++i) {
         HostPlanes* p = units[i];
         const int32_t u = p ? p->unit : -1;
@@ -939,7 +995,7 @@ bool Mover::read_unit_planes(HostPlanes* const* units, int n, int rows) {
             if (!lay_out_weight(p, k, mu.weights[(size_t)k])) return false;
             const WeightInfo& w = prog_->weights[mu.weights[(size_t)k]];
             const int64_t a0 = p->a0[k], hi = a0 + p->len[k];
-            ++weights;
+            ++c->weights;
             /* The gate_up codes' tail from the mirror (mirror_init checked the layout: codes, then
              * scales, both 4 KiB-aligned): the container reads the head and the scales. */
             const PlaneMirror::Ref* m = mirror && (size_t)u < mirror_ref_.size() &&
@@ -947,8 +1003,14 @@ bool Mover::read_unit_planes(HostPlanes* const* units, int n, int rows) {
             if (m) {
                 const int64_t codes = (int64_t)w.file_plane_offset[0] - a0;
                 const int64_t end = codes + (int64_t)(2 * m->bytes), cut = end - tail;
-                reads.insert(reads.begin(), Read{ w.file_id, a0 + cut, tail, p->buf[k] + cut,
-                                                  tail, m, m->bytes - (uint64_t)tail });
+                /* At the front, in order; one piece (no split) as the unit's one mirror read. */
+                int64_t piece[4];
+                const int np = PlaneMirror::split(tail, pieces, piece);
+                int64_t at = 0;
+                for (int q = 0; q < np; at += piece[q], ++q)
+                    reads.insert(reads.begin() + q, Read{ w.file_id, a0 + cut + at, piece[q],
+                                                          p->buf[k] + cut + at, piece[q], m,
+                                                          m->bytes - (uint64_t)(tail - at) });
                 reads.push_back(Read{ w.file_id, a0, cut, p->buf[k], cut, nullptr, 0 });
                 reads.push_back(Read{ w.file_id, a0 + end, hi - a0 - end, p->buf[k] + end,
                                       p->cap[k] - end, nullptr, 0 });
@@ -957,48 +1019,92 @@ bool Mover::read_unit_planes(HostPlanes* const* units, int n, int rows) {
             reads.push_back(Read{ w.file_id, a0, hi - a0, p->buf[k], p->cap[k], nullptr, 0 });
         }
     }
-    const auto t0 = std::chrono::steady_clock::now();
-    std::vector<int> rc(reads.size(), RAD_OK);
+    return true;
+}
+
+/* After the readers: a failed mirror read again from the container, the counters, the result. */
+bool Mover::plane_reads_done(PlaneCall* c, bool readers_failed, PlaneReadTiming* timing) {
+    if (readers_failed) return false;   /* reads left undone */
+    /* A mirror read that failed: the mirror is off for good, and the container has the bytes. */
+    for (PlaneCall::Read& r : c->reads)
+        if (r.m && r.rc < 0) {
+            c->mirror->turn_off(r.rc);
+            r.rc = read_source_file(r.file, (uint64_t)r.off, r.len, r.dst, r.cap);
+        }
+    const int64_t back = steady_ns() - c->t0;
+    /* The issuing thread's time in the reads: a posted call's from the finish on. */
+    host_plane_read_ns_.fetch_add((uint64_t)std::max<int64_t>(back - c->join_ns, 0), std::memory_order_relaxed);
+    host_plane_reads_.fetch_add((uint64_t)c->weights, std::memory_order_relaxed);
+    if (timing) {
+        PlaneReadTiming t;
+        t.units = c->units;
+        t.reads = (int)c->reads.size();
+        t.posted = c->posted;
+        t.first_ns = t.first_container_ns = INT64_MAX;
+        for (const PlaneCall::Read& r : c->reads) {
+            t.first_ns = std::min(t.first_ns, r.start_ns);
+            t.last_start_ns = std::max(t.last_start_ns, r.start_ns);
+            if (r.m) {
+                ++t.mirror_reads;
+                t.mirror_ns = std::max(t.mirror_ns, r.end_ns);
+                t.copy_ns = std::max(t.copy_ns, r.copy_ns);
+                t.copy_sum_ns += r.copy_ns;
+            } else {
+                t.first_container_ns = std::min(t.first_container_ns, r.start_ns);
+                t.container_ns = std::max(t.container_ns, r.end_ns);
+            }
+        }
+        if (t.first_ns == INT64_MAX) t.first_ns = 0;
+        if (t.first_container_ns == INT64_MAX) t.first_container_ns = 0;
+        t.join_ns = c->join_ns;
+        t.return_ns = back;
+        *timing = t;
+    }
+    for (const PlaneCall::Read& r : c->reads) if (r.rc < 0) return false;
+    return source_file_epoch();
+}
+
+bool Mover::read_unit_planes(HostPlanes* const* units, int n, int rows, PlaneReadTiming* timing) {
+    PlaneCall c;
+    if (!plane_reads(units, n, rows, &c)) return false;
+    c.t0 = steady_ns();
     /* Readers each take the next read (the mirror's first: they take the longest): up to 8 kept
      * workers (plane_workers_, this thread one of them), or with ..._READ_POOL=0 up to 16 threads
      * started for the call; a reader that cannot be started leaves its share to the others. */
-    static const bool pooled = [] {
-        const char* s = std::getenv("RADIANCE_EXPERIMENTAL_DS41_READ_POOL");
-        return !s || std::strcmp(s, "0") != 0;
-    }();
-    std::atomic<size_t> next{ 0 };
-    auto reader = [&](int) {
-        for (size_t j; (j = next.fetch_add(1)) < reads.size();) {
-            const Read& r = reads[j];
-            rc[j] = r.m ? mirror->read(*r.m, r.from, (uint64_t)r.len, r.dst)
-                        : read_source_file(r.file, (uint64_t)r.off, r.len, r.dst, r.cap);
-        }
-    };
-    const NativeReadWorkers::Result pr = !pooled || reads.size() < 2
+    const NativeReadWorkers::Result pr = !plane_read_pool() || c.reads.size() < 2
         ? NativeReadWorkers::Result::Invalid
-        : plane_workers_.run(8, (int)std::min<size_t>(reads.size(), 8), reader);
-    if (pr == NativeReadWorkers::Result::CallbackFailed) return false;   /* reads left undone */
+        : plane_workers_.run(8, (int)std::min<size_t>(c.reads.size(), 8), c);
     if (pr == NativeReadWorkers::Result::Invalid) {
         std::vector<std::thread> th;
         try {
-            for (size_t t = 1; t < std::min<size_t>(reads.size(), 16); ++t) th.emplace_back(reader, (int)t);
+            for (size_t t = 1; t < std::min<size_t>(c.reads.size(), 16); ++t) th.emplace_back(std::ref(c), (int)t);
         } catch (...) {
         }
-        reader(0);
+        c(0);
         for (std::thread& t : th) t.join();
     }
-    /* A mirror read that failed: the mirror is off for good, and the container has the bytes. */
-    for (size_t j = 0; j < reads.size(); ++j)
-        if (reads[j].m && rc[j] < 0) {
-            mirror->turn_off(rc[j]);
-            const Read& r = reads[j];
-            rc[j] = read_source_file(r.file, (uint64_t)r.off, r.len, r.dst, r.cap);
-        }
-    host_plane_read_ns_.fetch_add((uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                      std::chrono::steady_clock::now() - t0).count(), std::memory_order_relaxed);
-    host_plane_reads_.fetch_add((uint64_t)weights, std::memory_order_relaxed);
-    for (int r : rc) if (r < 0) return false;
-    return source_file_epoch();
+    return plane_reads_done(&c, pr == NativeReadWorkers::Result::CallbackFailed, timing);
+}
+
+bool Mover::start_unit_planes(HostPlanes* const* units, int n, int rows) {
+    if (plane_posted_ || !plane_read_pool()) return false;
+    PlaneCall& c = plane_call_;
+    if (!plane_reads(units, n, rows, &c) || c.reads.empty()) return false;
+    c.posted = true;
+    c.t0 = steady_ns();
+    /* A reader a read, seven at most (the eighth worker is the caller, in finish_unit_planes). */
+    if (!plane_workers_.post(8, (int)std::min<size_t>(c.reads.size(), 7), c)) return false;
+    plane_posted_ = true;
+    return true;
+}
+
+bool Mover::finish_unit_planes(PlaneReadTiming* timing) {
+    if (!plane_posted_) return false;
+    plane_posted_ = false;
+    PlaneCall& c = plane_call_;
+    c.join_ns = steady_ns() - c.t0;
+    const NativeReadWorkers::Result pr = plane_workers_.join();
+    return plane_reads_done(&c, pr != NativeReadWorkers::Result::Complete, timing);
 }
 
 bool Mover::lay_out_weight(HostPlanes* p, int k, rad_weight h) {
@@ -2736,12 +2842,18 @@ std::string Mover::report() const {
                  "issuing thread in the file stager's read+relayout\n",
                  (unsigned long long)stats_.file_relaid, (double)stats_.file_relaid_bytes * gib,
                  (double)stats_.file_relayout_ns * 1e-9);
-    if (host_plane_reads_.load())
+    if (host_plane_reads_.load()) {
         s += fmt("  host experts' plane reads: %llu weights read for the CPU in %.2f s of issuing-thread "
                  "time (%.2f ms a batch weight), %llu relaid into the RAM cache beside it\n",
                  (unsigned long long)host_plane_reads_.load(), (double)host_plane_read_ns_.load() * 1e-9,
                  (double)host_plane_read_ns_.load() * 1e-6 / (double)host_plane_reads_.load(),
                  (unsigned long long)host_plane_inserts_.load());
+        const NativeReadWorkers::Stats k = plane_workers_.stats();
+        s += fmt("  host experts' kept plane readers: %llu calls on them (%llu posted ahead of the "
+                 "pool's jobs, ..._MISS_POST), %llu that could not start them; %llu threads started\n",
+                 (unsigned long long)k.pooled_dispatches, (unsigned long long)k.posted_dispatches,
+                 (unsigned long long)k.fallback_dispatches, (unsigned long long)k.thread_starts);
+    }
     if (packed_cache()) {
         const PackedStats ps = packed_stats();
         const auto c = mapped_file_cache_.stats();
@@ -2757,8 +2869,10 @@ std::string Mover::report() const {
     if (mirror_tail_ > 0 && PlaneMirror::get()) {
         const PlaneMirror::Stats ms = PlaneMirror::get()->stats();
         if (ms.reads)
-            s += fmt("  plane mirror (all ranks): %llu reads, %.2f GiB, %.2f ms a read\n",
-                     (unsigned long long)ms.reads, (double)ms.bytes * gib, (double)ms.ns * 1e-6 / (double)ms.reads);
+            s += fmt("  plane mirror (all ranks): %llu reads, %.2f GiB, %.2f ms a read, %.3f ms of it "
+                     "copying out of the bounce buffer\n",
+                     (unsigned long long)ms.reads, (double)ms.bytes * gib, (double)ms.ns * 1e-6 / (double)ms.reads,
+                     (double)ms.copy_ns * 1e-6 / (double)ms.reads);
     }
     if (relaid_reads_.load())
         s += fmt("  file tier relayout split: %llu reads; %.2f s in preads and %.2f s relaying, summed "

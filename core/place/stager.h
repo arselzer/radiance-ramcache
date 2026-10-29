@@ -263,6 +263,9 @@ public:
         uint64_t sync_ns = 0, stage_ns = 0, miss_layers = 0, miss_stage_ns = 0, hx_ns = 0;
         /* The same split for one-token passes (decode) alone. */
         uint64_t d_reads = 0, d_sync_ns = 0, d_stage_ns = 0, d_miss_layers = 0, d_miss_stage_ns = 0;
+        /* One-token passes with the CPU path, from the counts to the CPU's work submitted: in all
+         * (decide), and its parts: the read windows' leases returned, hx_choose, hx_submit. */
+        uint64_t d_decide_ns = 0, d_retire_ns = 0, d_choose_ns = 0, d_submit_ns = 0;
     };
     const EpStats& ep_stats() const { return ep_stats_; }
     /* Routed experts the CPU computed (HostExpertPool) instead of a copy to the card. */
@@ -278,9 +281,17 @@ public:
         /* By the prediction's rank (best first): uncached file-tier experts predicted, and of them
          * the ones the layer selected -- a read-ahead's precision at each rank. */
         uint64_t pred_pos_unc[16] = {}, pred_pos_hit[16] = {};
+        /* The same from two layers back (RouterPredictor::predicted2, shadow mode): layers with
+         * the prediction on time, their misses, the misses predicted, and by rank the uncached
+         * predictions and the ones the layer selected. */
+        uint64_t pred2_ready = 0, pred2_misses = 0, pred2_hit = 0;
+        uint64_t pred2_pos_unc[16] = {}, pred2_pos_hit[16] = {};
         /* Read-ahead (..._PREFETCH=on): units read ahead, of them used by a miss, the misses that
          * found theirs still being read and how long they waited. */
         uint64_t pf_read = 0, pf_used = 0, pf_waited = 0, pf_wait_ns = 0;
+        /* ...and the entries their layer took before their read began, and the read-ahead's time
+         * holding back for demand reads. */
+        uint64_t pf_taken = 0, pf_yield_ns = 0;
         uint64_t linked = 0;          /* cached experts the schedule left on the copy link */
         uint64_t missed = 0;          /* routed experts the RAM cache did not hold */
         uint64_t wait_ns = 0;         /* the issuing thread waiting at gathers for the CPU */
@@ -473,17 +484,22 @@ private:
     /* By routed layer: each local expert's file-tier unit, or -1 (on the card or pinned). */
     std::vector<std::array<int32_t, 96>> hx_unit_of_;
     class RouterPredictor* hx_pred_ = nullptr;
-    /* Read-ahead: a thread a rank reads the next layer's predicted uncached units (hx_pf_loop) for
-     * hx_choose to take instead of reading them. hx_miss_ready_ is parallel to hx_miss_: the
+    /* Read-ahead: a thread a rank reads the predicted uncached units of the layer hx_pf_ahead_
+     * layers on (hx_pf_loop) for hx_choose to take instead of reading them. One batch a target
+     * layer, two kept (by the layer's parity) so a read for L+2 leaves L+1's alone. An entry is
+     * queued (0), being read (1), read (2), or taken by its layer before its read began (3): the
+     * layer then reads it as any miss. The thread starts no read while a demand read of any rank
+     * is in flight (hx_demand_reads, up to 2 ms). hx_miss_ready_ is parallel to hx_miss_: the
      * planes are in already (read ahead). */
-    struct PfEntry { int32_t unit = -1; std::shared_ptr<Mover::HostPlanes> p; bool done = false, ok = false; };
+    struct PfEntry { int32_t unit = -1; std::shared_ptr<Mover::HostPlanes> p; int state = 0; bool ok = false; };
+    struct PfBatch { uint32_t pass = 0; int32_t li = -1; uint64_t seq = 0; std::vector<PfEntry> entries; };
     std::thread hx_pf_;
     std::mutex hx_pf_mu_;
     std::condition_variable hx_pf_cv_;
-    uint32_t hx_pf_pass_ = 0;
-    int32_t  hx_pf_li_ = -1;
+    int      hx_pf_ahead_ = 1;          /* ..._PREFETCH_AHEAD: 1 or 2 layers */
     uint64_t hx_pf_seq_ = 0;
-    std::vector<PfEntry> hx_pf_entries_;
+    PfBatch  hx_pf_batch_[2];
+    std::deque<uint64_t> hx_pf_queue_;  /* batches to read, by seq, oldest first */
     bool hx_pf_stop_ = false;
     std::vector<uint8_t> hx_miss_ready_;
     void hx_pf_loop();

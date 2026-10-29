@@ -37,6 +37,8 @@ public:
     static RouterPredictor* get();
     bool shadow() const { return shadow_; }
     int  k() const { return k_; }
+    /* ..._PREFETCH_AHEAD: how many layers ahead the read-ahead reads (1, or 2 from predicted2). */
+    int  ahead() const { return ahead_; }
 
     /* Once for the process (later calls return the first's answer): every layer's router weight,
      * correction and ffn_norm gain, each read through `read` (the weight's stored bytes). */
@@ -47,6 +49,9 @@ public:
     void post(uint32_t pass, int layer, const uint16_t* x);
     /* The k predicted global experts of `layer` for `pass`, best first; false until ready. */
     bool predicted(uint32_t pass, int layer, int32_t* experts) const;
+    /* The same from two layers back (layer - 2's router input, rescaled by g_layer / g_{layer-2}):
+     * a longer lead for a read, computed in shadow mode only. */
+    bool predicted2(uint32_t pass, int layer, int32_t* experts) const;
 
     struct Stats { uint64_t posted = 0, computed = 0, dropped = 0, compute_ns = 0; };
     Stats stats() const;
@@ -59,6 +64,7 @@ private:
 
     bool shadow_ = true;
     int  k_ = 10;
+    int  ahead_ = 1;
     bool avx2_ = false;
     std::once_flag load_once_;
     std::atomic<bool> loaded_{ false };
@@ -66,9 +72,12 @@ private:
     std::vector<uint16_t> w_;      /* [kLayers][kExperts][kEmbd] bf16 */
     std::vector<float>    corr_;   /* [kLayers][kExperts] */
     std::vector<float>    ratio_;  /* [kLayers][kEmbd]: g_{L+1} / g_L, the stand-in's rescale */
+    std::vector<float>    ratio2_; /* [kLayers][kEmbd]: g_{L+2} / g_L */
 
     struct Result { uint32_t pass = 0; bool valid = false; int32_t e[kMaxK] = {}; };
     Result res_[kLayers];
+    Result res2_[kLayers];         /* by target layer, from two layers back */
+    void score(int target, const float* xh, Result* out, uint32_t pass);
     mutable std::mutex res_mu_;
 
     struct Req { uint32_t pass = 0; int layer = 0; std::vector<uint16_t> x; };

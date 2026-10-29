@@ -113,6 +113,13 @@ Engine::~Engine() {
                      (unsigned long long)ep.d_reads, (double)ep.d_sync_ns * 1e-9,
                      (double)ep.d_stage_ns * 1e-9, (unsigned long long)ep.d_miss_layers,
                      (double)ep.d_miss_stage_ns * 1e-9);
+            if (ep.d_reads && ep.d_decide_ns)
+                RAD_INFO("EP decision, one-token passes: %.1f us a layer from the counts to the CPU's "
+                         "work submitted (read windows %.1f, choose %.1f, submit %.1f)",
+                         (double)ep.d_decide_ns * 1e-3 / (double)ep.d_reads,
+                         (double)ep.d_retire_ns * 1e-3 / (double)ep.d_reads,
+                         (double)ep.d_choose_ns * 1e-3 / (double)ep.d_reads,
+                         (double)ep.d_submit_ns * 1e-3 / (double)ep.d_reads);
         }
         const auto& hx = r->fstager.host_stats();
         if (r->fstager.host_experts())
@@ -151,12 +158,26 @@ Engine::~Engine() {
                 RAD_INFO("next-layer predictor, uncached predictions by rank (selected/predicted):%s",
                          pos.c_str());
         }
+        if (hx.pred2_ready) {
+            std::string pos;
+            for (int k = 0; k < 16 && hx.pred2_pos_unc[k]; ++k)
+                pos += fmt(" %d:%llu/%llu", k + 1, (unsigned long long)hx.pred2_pos_hit[k],
+                           (unsigned long long)hx.pred2_pos_unc[k]);
+            RAD_INFO("two-ahead predictor: on time for %llu one-token layers; %llu of %llu misses "
+                     "predicted (%.1f%%); uncached predictions by rank (selected/predicted):%s",
+                     (unsigned long long)hx.pred2_ready, (unsigned long long)hx.pred2_hit,
+                     (unsigned long long)hx.pred2_misses,
+                     hx.pred2_misses ? 100.0 * (double)hx.pred2_hit / (double)hx.pred2_misses : 0.0,
+                     pos.c_str());
+        }
         if (hx.pf_read)
             RAD_INFO("read-ahead: %llu units read ahead, %llu used by a miss (%.1f%%); %llu misses "
-                     "waited for theirs, %.1f ms in all",
+                     "waited for theirs, %.1f ms in all; %llu taken by their layer before their read "
+                     "began; %.1f ms holding back for demand reads",
                      (unsigned long long)hx.pf_read, (unsigned long long)hx.pf_used,
                      100.0 * (double)hx.pf_used / (double)hx.pf_read,
-                     (unsigned long long)hx.pf_waited, (double)hx.pf_wait_ns / 1e6);
+                     (unsigned long long)hx.pf_waited, (double)hx.pf_wait_ns / 1e6,
+                     (unsigned long long)hx.pf_taken, (double)hx.pf_yield_ns / 1e6);
     }
     /* Drain the transfer streams before the contexts. Ctx::shutdown drains the compute streams
      * and frees the arena, but the mover's stream also copies into the arena (the prefill

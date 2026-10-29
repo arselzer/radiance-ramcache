@@ -72,6 +72,8 @@ RouterPredictor* RouterPredictor::get() {
         r->shadow_ = std::strcmp(m, "on") != 0;
         if (const char* k = std::getenv("RADIANCE_EXPERIMENTAL_DS41_PREFETCH_K"); k && *k)
             r->k_ = std::clamp(std::atoi(k), 1, (int)kMaxK);
+        if (const char* a = std::getenv("RADIANCE_EXPERIMENTAL_DS41_PREFETCH_AHEAD"); a && *a)
+            r->ahead_ = std::atoi(a) == 2 ? 2 : 1;
         r->avx2_ = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
         r->worker_ = std::thread(&RouterPredictor::loop, r);
         return r;
@@ -99,6 +101,7 @@ bool RouterPredictor::load(const Program& prog,
         w_.assign((size_t)kLayers * kExperts * kEmbd, 0);
         corr_.assign((size_t)kLayers * kExperts, 0.0f);
         ratio_.assign((size_t)kLayers * kEmbd, 1.0f);
+        ratio2_.assign((size_t)kLayers * kEmbd, 1.0f);
         std::vector<float> wf((size_t)kExperts * kEmbd), gain((size_t)kLayers * kEmbd);
         for (int l = 0; l < kLayers; ++l) {
             const std::string b = "blk." + std::to_string(l) + ".";
@@ -120,6 +123,10 @@ bool RouterPredictor::load(const Program& prog,
             for (int k = 0; k < kEmbd; ++k) {
                 const float a = gain[(size_t)l * kEmbd + k], b = gain[(size_t)(l + 1) * kEmbd + k];
                 ratio_[(size_t)l * kEmbd + k] = a != 0.0f ? b / a : 0.0f;
+                if (l + 2 < kLayers) {
+                    const float c = gain[(size_t)(l + 2) * kEmbd + k];
+                    ratio2_[(size_t)l * kEmbd + k] = a != 0.0f ? c / a : 0.0f;
+                }
             }
         load_ok_ = true;
         loaded_.store(true, std::memory_order_release);
@@ -161,12 +168,8 @@ void RouterPredictor::loop() {
     }
 }
 
-void RouterPredictor::compute(uint32_t pass, int layer, const uint16_t* x) {
-    const auto t0 = std::chrono::steady_clock::now();
-    const int target = layer + 1;
-    float xh[kEmbd];
-    const float* ratio = &ratio_[(size_t)layer * kEmbd];
-    for (int k = 0; k < kEmbd; ++k) xh[k] = bf16_to_f32(x[k]) * ratio[k];
+/* Layer `target`'s router on the stand-in input xh: its best k into *out. */
+void RouterPredictor::score(int target, const float* xh, Result* out, uint32_t pass) {
     const uint16_t* w = &w_[(size_t)target * kExperts * kEmbd];
     const float* corr = &corr_[(size_t)target * kExperts];
     std::pair<float, int32_t> key[kExperts];
@@ -179,12 +182,24 @@ void RouterPredictor::compute(uint32_t pass, int layer, const uint16_t* x) {
     }
     std::partial_sort(key, key + k_, key + kExperts,
                       [](const auto& a, const auto& b) { return a.first > b.first; });
-    {
-        std::lock_guard<std::mutex> lk(res_mu_);
-        Result& res = res_[target];
-        res.pass = pass;
-        res.valid = true;
-        for (int i = 0; i < k_; ++i) res.e[i] = key[i].second;
+    std::lock_guard<std::mutex> lk(res_mu_);
+    out->pass = pass;
+    out->valid = true;
+    for (int i = 0; i < k_; ++i) out->e[i] = key[i].second;
+}
+
+void RouterPredictor::compute(uint32_t pass, int layer, const uint16_t* x) {
+    const auto t0 = std::chrono::steady_clock::now();
+    float xh[kEmbd];
+    const float* ratio = &ratio_[(size_t)layer * kEmbd];
+    for (int k = 0; k < kEmbd; ++k) xh[k] = bf16_to_f32(x[k]) * ratio[k];
+    score(layer + 1, xh, &res_[layer + 1], pass);
+    /* Two layers ahead from the same input: in shadow mode for the statistics, and for a read-ahead
+     * two layers on. */
+    if ((shadow_ || ahead_ == 2) && layer + 2 < kLayers) {
+        const float* ratio2 = &ratio2_[(size_t)layer * kEmbd];
+        for (int k = 0; k < kEmbd; ++k) xh[k] = bf16_to_f32(x[k]) * ratio2[k];
+        score(layer + 2, xh, &res2_[layer + 2], pass);
     }
     computed_.fetch_add(1, std::memory_order_relaxed);
     ns_.fetch_add((uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -195,6 +210,15 @@ bool RouterPredictor::predicted(uint32_t pass, int layer, int32_t* experts) cons
     if (layer < 0 || layer >= kLayers) return false;
     std::lock_guard<std::mutex> lk(res_mu_);
     const Result& r = res_[layer];
+    if (!r.valid || r.pass != pass) return false;
+    std::memcpy(experts, r.e, sizeof(int32_t) * (size_t)k_);
+    return true;
+}
+
+bool RouterPredictor::predicted2(uint32_t pass, int layer, int32_t* experts) const {
+    if (layer < 0 || layer >= kLayers) return false;
+    std::lock_guard<std::mutex> lk(res_mu_);
+    const Result& r = res2_[layer];
     if (!r.valid || r.pass != pass) return false;
     std::memcpy(experts, r.e, sizeof(int32_t) * (size_t)k_);
     return true;

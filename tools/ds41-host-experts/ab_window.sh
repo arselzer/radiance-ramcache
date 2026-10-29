@@ -266,6 +266,9 @@ if [[ -n "${SELFTEST_F32BF16:-}" && -x "${SELFTEST_F32BF16}" ]]; then
   log "gemm_nt_f32bf16 checks on card 0 with $L4"
   RB_SUM=$(sha256sum "$L4" 2>/dev/null | cut -d' ' -f1)
   ( export HIP_VISIBLE_DEVICES=0
+    # The bf16 halves' tile form is read once a process from this variable; left set, the
+    # sweep's "rule" row and its gate reading would time that form instead of the default.
+    unset RADIANCE_EXPERIMENTAL_DS41_ROUTER_BF16_FORM
     timeout 900 "$SELFTEST_F32BF16" "$L4" --case gemm_nt_f32bf16_bf16 >"$OUT/f32bf16_check.log" 2>&1
     echo "check exit $?" >>"$OUT/f32bf16_check.log"
     : >"$OUT/f32bf16_perf.log"

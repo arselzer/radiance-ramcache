@@ -156,7 +156,7 @@ round at every block position (down's tail included), widened rounds on the gene
   request's time to first token and cached prompt tokens (see Prefix caching).
 - `make_prefix_receipt.py OUT MPL-2.0 core/mem/prefix.cpp` and `make_prefix_receipt.py --long OUT
   long-receipt.json`: the prefix-cache receipts in `/home/as/ds41-claude-build/work/extra-prompts/`
-  (`prefix-chat-receipt.json`, part `Uprefix-chat`; `pfxlong-receipt.json`, part `Upfxlong`).
+  (`pfxchat-receipt.json`, part `Upfxchat`; `pfxlong-receipt.json`, part `Upfxlong`).
 - `cache_sim.py`: replays an access trace against LRU, SLRU, 2Q, aged LFU and Belady.
 - `chain_report.py PREFIX`: reads a `Ct` arm's `PREFIX.ops.csv` and `PREFIX.stamps.csv`: per layer
   kind the dispatches before the routing-counts sync, how many went (or would go) unordered and why
@@ -222,7 +222,7 @@ switches:
 
 | Setting | Effect | Arm part |
 |---|---|---|
-| `--no-prefix-cache` dropped | the cache on | `Pc` (also sets the next row) |
+| `--no-prefix-cache` dropped, `--prefix-resume exact` (the default) named | the cache on | `Pc` (also sets the next row) |
 | `RADIANCE_EXPERIMENTAL_CACHE_HEADROOM_BACKED=1` | the host checks after the load stop reserving what the cache's slabs already hold (`host headroom:` startup line); unchanged before the load | `Pc` (`Pc0`: the cache on without it, the control) |
 | `--checkpoint-interval N` | snapshots every N tokens (a multiple of 16); a prompt needs more than N tokens for its tail snapshot | `PciN` |
 | `--checkpoint-slots N` | the store's size (auto otherwise) | `PcsN` |
@@ -241,7 +241,7 @@ the long receipt's measured 82/272/933/1,890/3,086 exactly), each request capped
 
 | Receipt (part) | Requests | Prompt tokens, cold | With the cache (modelled) |
 |---|---|---|---|
-| `prefix-chat` (`Uprefix-chat`) | F1-F2 (19 tokens, repeat), A1-A5 (1,207-1,221: one license text, four questions, A1 again), B1-B4 (651-991: a four-turn chat with fixed replies), D1 (B3 edited), C1-C3 (338-470: a story whose turns send the model's replies back) | 11,447 | 2,855 at `Pci16`, 3,415 at `Pci256` |
+| `pfxchat` (`Upfxchat`) | F1-F2 (19 tokens, repeat), A1-A5 (1,207-1,221: one license text, four questions, A1 again), B1-B4 (651-991: a four-turn chat with fixed replies), D1 (B3 edited), C1-C3 (338-470: a story whose turns send the model's replies back) | 11,447 | 2,855 at `Pci16`, 3,415 at `Pci256` |
 | `pfxlong` (`Upfxlong`) | L1 (= `long-3500`, 3,086), L2 (repeat), L3 (cut to 2,655), L4-L5 (3,163-3,232: L1, its reply, more questions) | 15,222 | 3,366 |
 
 What each request should take from the cache (`cache_n` in the `--ttft` table), from an offline

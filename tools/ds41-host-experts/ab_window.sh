@@ -29,8 +29,9 @@
 # idle cold prefill cuts alike (RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH: no KV of a short last
 # chunk or a decode step under a later hit). The window prints a Pc arm's prefix-cache startup
 # lines, and at the end each request's TTFT and cached prompt tokens (ab_requests.py --ttft), for
-# the receipts work/extra-prompts/prefix-chat-receipt.json and pfxlong-receipt.json (U parts
-# Uprefix-chat, Upfxlong; with Lm4096). Put the same arm without Pc first: it is the cold reference.
+# the receipts work/extra-prompts/pfxchat-receipt.json and pfxlong-receipt.json (U parts Upfxchat
+# and Upfxlong, with Lm4096; a U part's receipt name holds no "-", which splits parts). Put the
+# same arm without Pc first: it is the cold reference.
 #
 # Environment: RADIANCE_BIN (the binary), RADIANCE_HOME_DIR (kernels/ and architectures/ for it),
 # SILU_TABLE (the card's silu table), ARMS (default "base verify greedy"), HX_THREADS (16),
@@ -362,8 +363,9 @@ for a in $ARMS; do
                [[ $p == Dsa ]] && ARGS+=(--draft-window adaptive) ;;
       K)       env+=(RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE=1) ;;     # the RAM cache packed for the CPU only
       Lm[0-9]*) ARGS+=(--max-model-len "${p#Lm}") ;;   # a longer context (default 512), e.g. for long-prompt TTFT
-      Pc)      ARM_NOPC= ; env+=(RADIANCE_EXPERIMENTAL_CACHE_HEADROOM_BACKED=1) ;;   # prefix cache on; pinned slabs not reserved twice
-      Pc0)     ARM_NOPC= ;;                                                         # prefix cache on, the margin as before (the control)
+      Pc)      ARM_NOPC= ; ARGS+=(--prefix-resume exact)                            # prefix cache on (exact resume, the default, named)
+               env+=(RADIANCE_EXPERIMENTAL_CACHE_HEADROOM_BACKED=1) ;;              # ... and pinned slabs not reserved twice
+      Pc0)     ARM_NOPC= ; ARGS+=(--prefix-resume exact) ;;                         # prefix cache on, the margin as before (the control)
       Pci[0-9]*) ARGS+=(--checkpoint-interval "${p#Pci}") ;;                      # snapshot interval (2048)
       Pcs[0-9]*) ARGS+=(--checkpoint-slots "${p#Pcs}") ;;                         # snapshot store slots (auto)
       Pcx)     env+=(RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH=1) ;;             # publish only cold-cut chunks

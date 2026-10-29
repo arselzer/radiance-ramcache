@@ -3,7 +3,7 @@ so a window can compare each reply with a cold server's byte for byte (the same 
 and read each request's TTFT and cached prompt tokens (ab_requests.py --ttft).
 
   python3 -I make_prefix_receipt.py OUT.json [MPL-2.0 text] [prefix.cpp]
-      the chat receipt (work/extra-prompts/prefix-chat-receipt.json, part Uprefix-chat)
+      the chat receipt (work/extra-prompts/pfxchat-receipt.json, part Upfxchat)
   python3 -I make_prefix_receipt.py --long OUT.json LONG_RECEIPT.json
       the long-context receipt (work/extra-prompts/pfxlong-receipt.json, part Upfxlong), from
       long-receipt.json's 3,086-token document

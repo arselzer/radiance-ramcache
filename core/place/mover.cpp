@@ -2850,9 +2850,11 @@ std::string Mover::report() const {
                  (unsigned long long)host_plane_inserts_.load());
         const NativeReadWorkers::Stats k = plane_workers_.stats();
         s += fmt("  host experts' kept plane readers: %llu calls on them (%llu posted ahead of the "
-                 "pool's jobs, ..._MISS_POST), %llu that could not start them; %llu threads started\n",
+                 "pool's jobs, ..._MISS_POST; %llu posts read the normal way, the readers on another "
+                 "thread's call), %llu that could not start them; %llu threads started\n",
                  (unsigned long long)k.pooled_dispatches, (unsigned long long)k.posted_dispatches,
-                 (unsigned long long)k.fallback_dispatches, (unsigned long long)k.thread_starts);
+                 (unsigned long long)k.busy_posts, (unsigned long long)k.fallback_dispatches,
+                 (unsigned long long)k.thread_starts);
     }
     if (packed_cache()) {
         const PackedStats ps = packed_stats();

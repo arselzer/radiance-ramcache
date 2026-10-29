@@ -2,8 +2,9 @@
  * split the mover's plane reads use (RADIANCE_EXPERIMENTAL_DS41_MISS_POST). Every item is taken
  * exactly once, by readers 1 .. N after a post and by the caller in the join; arguments out of range
  * post nothing and hold nothing; a reader's exception comes back from the join; a run() on another
- * thread waits for the join (one call at a time); post and run share the threads (no restart); a
- * failed thread start posts nothing. Host threads only, at most 8. */
+ * thread waits for the join (one call at a time), while a post() never waits for another thread's
+ * call (it posts nothing); post and run share the threads (no restart); a failed thread start posts
+ * nothing. Host threads only, at most 8. */
 #include "rad_test.h"
 
 #include "place/native_read_workers.h"
@@ -147,6 +148,82 @@ TEST(native_read_workers_a_run_on_another_thread_waits_for_the_join) {
     other.join();
     CHECK_EQ(saw_joining.load(), 1);
     CHECK(posted.each_once());
+}
+
+TEST(native_read_workers_a_post_never_waits_for_another_threads_call) {
+    NativeReadWorkers w;
+    /* Another thread's run, held in its caller's share until released (after 2 s at the latest, so
+     * a post that waited would fail the check below instead of hanging). */
+    std::atomic<bool> inside{ false }, release{ false };
+    struct Hold {
+        std::atomic<bool>* inside;
+        std::atomic<bool>* release;
+        void operator()(int id) {
+            if (id != 0) return;
+            inside->store(true);
+            while (!release->load()) std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
+    } hold{ &inside, &release };
+    std::thread other([&] { (void)w.run(8, 2, hold); });
+    std::thread watchdog([&] {
+        const auto t0 = std::chrono::steady_clock::now();
+        while (!release.load() && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(2))
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        release.store(true);
+    });
+    const auto t0 = std::chrono::steady_clock::now();
+    while (!inside.load() && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5))
+        std::this_thread::yield();
+    if (!inside.load()) {   /* no thread left behind a REQUIRE */
+        release.store(true);
+        watchdog.join();
+        other.join();
+    }
+    REQUIRE(inside.load());
+    Items it(4);
+    CHECK(!w.post(8, 3, it));
+    CHECK(!release.load());   /* it came back while the run still held the readers */
+    CHECK_EQ(it.next.load(), (size_t)0);
+    CHECK_EQ(w.join(), NativeReadWorkers::Result::Invalid);   /* nothing posted, nothing held */
+    release.store(true);
+    watchdog.join();
+    other.join();
+    CHECK_EQ(w.stats().busy_posts, (uint64_t)1);
+    /* Free again: the post goes through. */
+    REQUIRE(w.post(8, 3, it));
+    CHECK_EQ(w.join(), NativeReadWorkers::Result::Complete);
+    CHECK(it.each_once());
+
+    /* A post on another thread holds the readers the same way until its join. */
+    std::atomic<bool> posted{ false }, go{ false }, joined{ false };
+    Items theirs(3);
+    std::thread poster([&] {
+        if (!w.post(8, 2, theirs)) return;
+        posted.store(true);
+        const auto p0 = std::chrono::steady_clock::now();
+        while (!go.load() && std::chrono::steady_clock::now() - p0 < std::chrono::seconds(2))
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        (void)w.join();
+        joined.store(true);
+    });
+    const auto t1 = std::chrono::steady_clock::now();
+    while (!posted.load() && std::chrono::steady_clock::now() - t1 < std::chrono::seconds(5))
+        std::this_thread::yield();
+    if (!posted.load()) {
+        go.store(true);
+        poster.join();
+    }
+    REQUIRE(posted.load());
+    Items mine(2);
+    CHECK(!w.post(8, 1, mine));
+    CHECK(!joined.load());   /* it came back while the other post still held the readers */
+    CHECK_EQ(mine.next.load(), (size_t)0);
+    go.store(true);
+    poster.join();
+    CHECK(theirs.each_once());
+    const auto st = w.stats();
+    CHECK_EQ(st.busy_posts, (uint64_t)2);
+    CHECK_EQ(st.posted_dispatches, (uint64_t)2);
 }
 
 TEST(native_read_workers_a_failed_start_posts_nothing) {

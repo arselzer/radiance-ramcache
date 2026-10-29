@@ -650,7 +650,8 @@ public:
      * start_unit_planes hands the reads to the kept readers and returns at once, so they run while
      * the caller goes on (the pool's jobs for the cached units); finish_unit_planes reads whatever
      * no reader has begun, waits for the rest and returns what read_unit_planes would have. False
-     * from start: nothing started (one already in flight, no kept readers, a unit not eligible),
+     * from start: nothing started (one already in flight, no kept readers, the readers busy with
+     * another thread's read_unit_planes -- start never waits for them -- or a unit not eligible),
      * read as before. One call in flight a Mover; the same thread calls both, and calls nothing
      * else that reads planes between them; the units' buffers stay put until the finish. */
     bool  start_unit_planes(HostPlanes* const* units, int n, int rows);

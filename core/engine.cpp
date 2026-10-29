@@ -9,6 +9,8 @@
 #include "kld.h"
 #include "mm/processor.h"
 #include "mm/media.h"
+#include "place/readahead.h"
+#include "place/router_predictor.h"
 
 #include "build/startup.h"
 #include "build/rad_build.h"
@@ -113,13 +115,21 @@ Engine::~Engine() {
                      (unsigned long long)ep.d_reads, (double)ep.d_sync_ns * 1e-9,
                      (double)ep.d_stage_ns * 1e-9, (unsigned long long)ep.d_miss_layers,
                      (double)ep.d_miss_stage_ns * 1e-9);
-            if (ep.d_reads && ep.d_decide_ns)
+            if (ep.d_reads && ep.d_decide_ns && !ep.d_post_ns)
                 RAD_INFO("EP decision, one-token passes: %.1f us a layer from the counts to the CPU's "
                          "work submitted (read windows %.1f, choose %.1f, submit %.1f)",
                          (double)ep.d_decide_ns * 1e-3 / (double)ep.d_reads,
                          (double)ep.d_retire_ns * 1e-3 / (double)ep.d_reads,
                          (double)ep.d_choose_ns * 1e-3 / (double)ep.d_reads,
                          (double)ep.d_submit_ns * 1e-3 / (double)ep.d_reads);
+            if (ep.d_reads && ep.d_decide_ns && ep.d_post_ns)
+                RAD_INFO("EP decision, one-token passes: %.1f us a layer from the counts to the CPU's "
+                         "work submitted (read windows %.1f, choose %.1f, submit %.1f, predictor post %.1f)",
+                         (double)ep.d_decide_ns * 1e-3 / (double)ep.d_reads,
+                         (double)ep.d_retire_ns * 1e-3 / (double)ep.d_reads,
+                         (double)ep.d_choose_ns * 1e-3 / (double)ep.d_reads,
+                         (double)ep.d_submit_ns * 1e-3 / (double)ep.d_reads,
+                         (double)ep.d_post_ns * 1e-3 / (double)ep.d_reads);
         }
         const auto& hx = r->fstager.host_stats();
         if (r->fstager.host_experts())
@@ -178,6 +188,56 @@ Engine::~Engine() {
                      100.0 * (double)hx.pf_used / (double)hx.pf_read,
                      (unsigned long long)hx.pf_waited, (double)hx.pf_wait_ns / 1e6,
                      (unsigned long long)hx.pf_taken, (double)hx.pf_yield_ns / 1e6);
+        if (hx.ra_planned || hx.ra_misses) {
+            const uint64_t used = hx.ra_whole + hx.ra_finished;
+            RAD_INFO("read-ahead in pieces: %llu units planned (%llu more too late, %llu over the "
+                     "live cap); at their layer %llu used (%llu whole, %llu finished while the layer "
+                     "waited %.1f ms in all, %.3f ms each), %llu read as any miss, %llu re-read after a "
+                     "failed piece; %llu dropped (%llu not selected, %llu cache hits, %llu stale); "
+                     "%llu of %llu one-token misses planned (%.1f%%), %llu used (%.1f%%); read ahead "
+                     "%.0f MB for units used, %.0f MB for units dropped",
+                     (unsigned long long)hx.ra_planned, (unsigned long long)hx.ra_late,
+                     (unsigned long long)hx.ra_capped, (unsigned long long)used,
+                     (unsigned long long)hx.ra_whole, (unsigned long long)hx.ra_finished,
+                     (double)hx.ra_wait_ns / 1e6,
+                     hx.ra_finished ? (double)hx.ra_wait_ns / 1e6 / (double)hx.ra_finished : 0.0,
+                     (unsigned long long)hx.ra_fresh, (unsigned long long)hx.ra_refetched,
+                     (unsigned long long)(hx.ra_unselected + hx.ra_cached + hx.ra_stale),
+                     (unsigned long long)hx.ra_unselected, (unsigned long long)hx.ra_cached,
+                     (unsigned long long)hx.ra_stale, (unsigned long long)hx.ra_miss_planned,
+                     (unsigned long long)hx.ra_misses,
+                     hx.ra_misses ? 100.0 * (double)hx.ra_miss_planned / (double)hx.ra_misses : 0.0,
+                     (unsigned long long)used,
+                     hx.ra_misses ? 100.0 * (double)used / (double)hx.ra_misses : 0.0,
+                     (double)hx.ra_used_bytes / 1e6, (double)hx.ra_dropped_bytes / 1e6);
+        }
+    }
+    /* The read-ahead's readers and the predictor serve every rank: one report for the process. */
+    if (PieceReader& pr = PieceReader::process(); pr.started()) {
+        const PieceReader::Stats s = pr.stats();
+        RAD_INFO("read-ahead readers: %d readers, %llu KiB pieces; %llu pieces read (%llu urgent, %llu "
+                 "failed), %.0f MB in %.1f ms of reads (%.3f ms a piece), at most %llu in flight; "
+                 "%.1f ms of reader time held back by demand reads; %llu demand reads, %llu of them "
+                 "started with read-ahead pieces in flight, %.1f ms in all until those pieces were in "
+                 "(%.3f ms each)", pr.readers(), (unsigned long long)(pr.piece_bytes() >> 10),
+                 (unsigned long long)s.pieces, (unsigned long long)s.urgent_pieces,
+                 (unsigned long long)s.failed, (double)s.bytes / 1e6, (double)s.read_ns / 1e6,
+                 s.pieces ? (double)s.read_ns / 1e6 / (double)s.pieces : 0.0,
+                 (unsigned long long)s.max_in_flight, (double)s.held_ns / 1e6,
+                 (unsigned long long)s.demand_reads, (unsigned long long)s.demand_met,
+                 (double)s.demand_wait_ns / 1e6,
+                 s.demand_met ? (double)s.demand_wait_ns / 1e6 / (double)s.demand_met : 0.0);
+    }
+    if (RouterPredictor* rp = RouterPredictor::get(); rp && rp->pieces()) {
+        const RouterPredictor::Stats s = rp->stats();
+        RAD_INFO("router predictor (two ahead, top %d): %llu inputs posted, %llu predictions, %llu "
+                 "dropped behind a full queue; %.1f ms scoring (%.1f us a prediction), %.1f ms "
+                 "planning the read-ahead (%.1f us a prediction)", rp->k(),
+                 (unsigned long long)s.posted, (unsigned long long)s.computed,
+                 (unsigned long long)s.dropped, (double)s.compute_ns / 1e6,
+                 s.computed ? (double)s.compute_ns / 1e3 / (double)s.computed : 0.0,
+                 (double)s.ready_ns / 1e6,
+                 s.computed ? (double)s.ready_ns / 1e3 / (double)s.computed : 0.0);
     }
     /* Drain the transfer streams before the contexts. Ctx::shutdown drains the compute streams
      * and frees the arena, but the mover's stream also copies into the arena (the prefill

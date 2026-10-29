@@ -16,7 +16,7 @@
 # Before the arms (DEVICE_CHECKS=1, the default), the device harness checks the served libr4d.so on
 # card 0: swiglu over every (gate, up) pair with mismatches classified, and the host chain.
 #
-# Arms are named POLICY[-tN][-gG][-sS][-nP][-mM][-MR][-PsK|-PoK][-f][-x] (see the loop below), e.g. "base greedy-t20-g65 all-t24".
+# Arms are named POLICY[-tN][-gG][-sS][-nP][-mM][-MR][-PsK|-PoK|-PpK][-f][-x] (see the loop below), e.g. "base greedy-t20-g65 all-t24".
 #
 # Environment: RADIANCE_BIN (the binary), RADIANCE_HOME_DIR (kernels/ and architectures/ for it),
 # SILU_TABLE (the card's silu table), ARMS (default "base verify greedy"), HX_THREADS (16),
@@ -156,10 +156,19 @@ arm() {   # name, then env assignments for the server; CACHE_MIB the RAM cache (
     if (( t > 600 )); then log "arm $name: no server after 600 s"; stop_server; return 1; fi
   done
   log "arm $name: serving after ${t}s"
+  # The NVMe drive's busy time (io_ticks, ms) and temperature over the requests: read-ahead arms
+  # move it from ~45% busy towards saturation.
+  local d0 d1 t0 t1 rc temp
+  d0=$(awk '{print $10}' /sys/block/nvme0n1/stat 2>/dev/null); t0=$(date +%s%N)
   python3 -I "$HERE/ab_requests.py" "$PROMPTS" "http://127.0.0.1:$PORT" "$n" "$OUT/$name.json" >>"$OUT/window.log" 2>&1
-  log "arm $name: requests exit $?"
+  rc=$?
+  log "arm $name: requests exit $rc"
+  d1=$(awk '{print $10}' /sys/block/nvme0n1/stat 2>/dev/null); t1=$(date +%s%N)
+  temp=$(cat /sys/class/nvme/nvme0/hwmon*/temp1_input 2>/dev/null | head -1)
+  [[ -n "$d0" && -n "$d1" ]] && log "arm $name: NVMe busy $(( (d1 - d0) * 100000000 / (t1 - t0 + 1) ))% of the requests' $(( (t1 - t0) / 1000000 )) ms${temp:+, drive at $(( temp / 1000 )) C}"
   stop_server
   grep -E 'host experts|EP scoped|error|ERR' "$OUT/$name.server.log" | tail -12 | tee -a "$OUT/window.log"
+  grep -E 'read-ahead (in pieces|readers)|router predictor \(' "$OUT/$name.server.log" | tail -6 | tee -a "$OUT/window.log"
 }
 
 if [[ "$("${DOCKER[@]}" inspect "$NAME" --format '{{.State.Status}}' 2>/dev/null)" != running ]]; then
@@ -204,7 +213,12 @@ for a in $ARMS; do
   # threads; G GB/s the schedule assumes for the CPU; S us the idle pool spins; P the pool's nice
   # value; M MiB of RAM cache (81920); R: passes of at most R tokens compute their missed experts on
   # the CPU from the container's planes; f the mover's direct cache fill; x an access trace;
-  # PsK / PoK the next-layer predictor in shadow / on mode keeping K experts; o --profile-ops;
+  # PsK / PoK the next-layer predictor in shadow / on mode keeping K experts; PtK the same read ahead
+  # two layers ahead (whole units); PpK read-ahead in pieces (RADIANCE_EXPERIMENTAL_DS41_PREFETCH=pieces):
+  # at layer L each rank's uncached units among layer L+2's top K predicted experts, read in 512 KiB
+  # pieces, 4 in flight over the process, none started while a demand read is in flight, handed to
+  # their layer only whole (the rest read at once when the layer needs a partly read one); PqN its
+  # readers (pieces in flight, 4) and PbN its piece size in KiB (512), with PpK; o --profile-ops;
   # H the second run home (RADIANCE_HOME_DIR2); iN background insert threads for missed units;
 # pN --host-pool-mib (4096: a rank's pinned expert slots and the file tier's staging); G pin the
 # RAM cache's slabs at startup; R / RNN read part of each missed expert from the checkpoint's
@@ -264,6 +278,9 @@ for a in $ARMS; do
       Ps[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_PREFETCH=shadow RADIANCE_EXPERIMENTAL_DS41_PREFETCH_K=${p#Ps}) ;;
       Po[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_PREFETCH=on RADIANCE_EXPERIMENTAL_DS41_PREFETCH_K=${p#Po}) ;;
       Pt[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_PREFETCH=on RADIANCE_EXPERIMENTAL_DS41_PREFETCH_AHEAD=2 RADIANCE_EXPERIMENTAL_DS41_PREFETCH_K=${p#Pt}) ;;
+      Pp[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_PREFETCH=pieces RADIANCE_EXPERIMENTAL_DS41_PREFETCH_K=${p#Pp}) ;;   # read-ahead in pieces, top K
+      Pq[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_PREFETCH_QD=${p#Pq}) ;;          # ...its readers (4)
+      Pb[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_PREFETCH_PIECE_KB=${p#Pb}) ;;    # ...its piece size in KiB (512)
       Er)      ARGS+=(--embedding-placement ram) ;;   # the token embedding pinned in host RAM, its VRAM to experts
       Xp)      env+=(RADIANCE_EXPERIMENTAL_DS41_READ_POOL=0) ;;        # miss reads on threads started a call
       Xh)      env+=(RADIANCE_EXPERIMENTAL_DS41_PLANE_HUGEPAGES=0) ;;  # miss buffers on 4 KiB pages

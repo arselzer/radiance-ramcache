@@ -88,6 +88,7 @@
 #include "ep_route_counts.h"
 #include "dspark_head_tail.h"
 #include "host_expert_pool.h"
+#include "readahead.h"
 
 #include <array>
 #include <condition_variable>
@@ -264,8 +265,9 @@ public:
         /* The same split for one-token passes (decode) alone. */
         uint64_t d_reads = 0, d_sync_ns = 0, d_stage_ns = 0, d_miss_layers = 0, d_miss_stage_ns = 0;
         /* One-token passes with the CPU path, from the counts to the CPU's work submitted: in all
-         * (decide), and its parts: the read windows' leases returned, hx_choose, hx_submit. */
-        uint64_t d_decide_ns = 0, d_retire_ns = 0, d_choose_ns = 0, d_submit_ns = 0;
+         * (decide), and its parts: the read windows' leases returned, hx_choose, hx_submit, and
+         * (..._PREFETCH=pieces, rank 0) the predictor's post after it. */
+        uint64_t d_decide_ns = 0, d_retire_ns = 0, d_choose_ns = 0, d_submit_ns = 0, d_post_ns = 0;
     };
     const EpStats& ep_stats() const { return ep_stats_; }
     /* Routed experts the CPU computed (HostExpertPool) instead of a copy to the card. */
@@ -292,6 +294,20 @@ public:
         /* ...and the entries their layer took before their read began, and the read-ahead's time
          * holding back for demand reads. */
         uint64_t pf_taken = 0, pf_yield_ns = 0;
+        /* Read-ahead in pieces (..._PREFETCH=pieces, readahead.h), one-token layers: units
+         * planned (predicted, uncached, eligible); planned for a layer this rank had decided
+         * already, or past the cap of live units. At their layer, the selected misses: whole
+         * (every piece read), finished (partly read, the rest read urgently while the layer
+         * waited), read by the layer as any miss (no piece started, or fewer bytes than the plane
+         * mirror's share), and re-read whole after a failed piece. Dropped: not selected, selected
+         * but a RAM-cache hit, or stale (their layer passed without a decision). The layer's
+         * misses, and of them the ones with a planned unit. Bytes the readers had read of the
+         * units used and of the ones dropped; the layers' waits for the rest of finished units. */
+        uint64_t ra_planned = 0, ra_late = 0, ra_capped = 0;
+        uint64_t ra_whole = 0, ra_finished = 0, ra_fresh = 0, ra_refetched = 0;
+        uint64_t ra_unselected = 0, ra_cached = 0, ra_stale = 0;
+        uint64_t ra_misses = 0, ra_miss_planned = 0;
+        uint64_t ra_used_bytes = 0, ra_dropped_bytes = 0, ra_wait_ns = 0;
         uint64_t linked = 0;          /* cached experts the schedule left on the copy link */
         uint64_t missed = 0;          /* routed experts the RAM cache did not hold */
         uint64_t wait_ns = 0;         /* the issuing thread waiting at gathers for the CPU */
@@ -489,7 +505,7 @@ private:
      * layer, two kept (by the layer's parity) so a read for L+2 leaves L+1's alone. An entry is
      * queued (0), being read (1), read (2), or taken by its layer before its read began (3): the
      * layer then reads it as any miss. The thread starts no read while a demand read of any rank
-     * is in flight (hx_demand_reads, up to 2 ms). hx_miss_ready_ is parallel to hx_miss_: the
+     * is in flight (PieceReader::process()'s count, up to 2 ms). hx_miss_ready_ is parallel to hx_miss_: the
      * planes are in already (read ahead). */
     struct PfEntry { int32_t unit = -1; std::shared_ptr<Mover::HostPlanes> p; int state = 0; bool ok = false; };
     struct PfBatch { uint32_t pass = 0; int32_t li = -1; uint64_t seq = 0; std::vector<PfEntry> entries; };
@@ -504,6 +520,51 @@ private:
     std::vector<uint8_t> hx_miss_ready_;
     void hx_pf_loop();
     void hx_pf_target(int32_t li);
+    /* ---- read-ahead in pieces (RADIANCE_EXPERIMENTAL_DS41_PREFETCH=pieces, readahead.h) -----
+     *
+     * The predictor's thread plans this rank's predicted uncached units of layer L+2 as soon as
+     * layer L's prediction is ready (hx_ra_plan, through the process's list of stagers) and queues
+     * them on the process's PieceReader. hx_choose decides each of a layer's units once its
+     * routing is known (hx_ra_take; the rest are cancelled), and hx_submit_misses_now waits for
+     * the urgent ones inside its demand read. ..._PREFETCH_QD readers (4) read pieces of
+     * ..._PREFETCH_PIECE_KB (512); at most ..._PREFETCH_LIVE units a rank are live (12). */
+    struct RaEntry {
+        std::shared_ptr<ReadAheadUnit>     u;
+        std::shared_ptr<Mover::HostPlanes> p;
+        uint32_t pass = 0;
+        int32_t  li = -1, unit = -1;
+    };
+    PieceReader* hx_ra_ = nullptr;           /* set in pieces mode once the readers run */
+    std::mutex   hx_ra_mu_;                  /* hx_ra_live_, and the ra_ counters the planner bumps */
+    std::vector<RaEntry> hx_ra_live_;        /* planned, not yet decided by their layer */
+    std::vector<RaEntry> hx_ra_here_;        /* the deciding layer's, taken out of hx_ra_live_ */
+    std::vector<int32_t> hx_ra_li_;          /* by model layer: its routed layer index, or -1 */
+    std::vector<uint8_t> hx_ra_ok_;          /* by plan unit: read_unit_planes reads it (at init) */
+    /* The pass and routed layer this rank last decided, (pass << 32) | (li + 1): a prediction for
+     * a layer at or before it is too late to read ahead. */
+    std::atomic<uint64_t> hx_ra_at_{ 0 };
+    int     hx_ra_cap_ = 12;
+    int64_t hx_ra_fresh_below_ = 0;          /* bytes started under which a miss reads afresh */
+    int     hx_ra_handed_ = 0;               /* whole units handed to this layer: no drive read at
+                                              * the layer; the epoch is checked before their jobs */
+    /* Parallel to hx_miss_: the unit the readers are finishing for this layer, or null. */
+    std::vector<std::shared_ptr<ReadAheadUnit>> hx_miss_ra_;
+    static void hx_ra_ready(void* ctx, uint32_t pass, int layer, const int32_t* experts, int k);
+    static int  hx_ra_read(void* ctx, const PlaneExtent& piece);
+    void hx_ra_plan(uint32_t pass, int layer, const int32_t* experts, int k);
+    /* At layer li's routing: its live units into hx_ra_here_, stale ones dropped. */
+    void hx_ra_begin(int32_t li);
+    /* Layer li's selected miss u: its planes when read ahead (whole: *ready; partly read: *urgent,
+     * the readers finish it), or null when the layer reads it as any miss. */
+    std::shared_ptr<Mover::HostPlanes> hx_ra_take(int32_t u, bool* ready,
+                                                  std::shared_ptr<ReadAheadUnit>* urgent);
+    /* Drops a unit the layer does not read (hit: a RAM-cache hit, else not selected). */
+    void hx_ra_drop(RaEntry& e, bool hit);
+    /* Cancels this rank's live units of passes before `pass`, and of `pass` up to routed layer li. */
+    void hx_ra_drop_stale(uint32_t pass, int32_t li);
+    /* hx_submit_misses_now's part: waits for the urgent units, re-reads failed ones whole, checks
+     * the container's epoch. False on a failed read. */
+    bool hx_ra_settle(int rows);
     std::vector<std::shared_ptr<Mover::HostPlanes>> hx_miss_;     /* this layer's */
     std::vector<std::unique_ptr<Mover::HostPlanes>> hx_planes_free_;
     std::mutex hx_planes_mu_;

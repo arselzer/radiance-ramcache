@@ -13,7 +13,11 @@
  *
  * RADIANCE_EXPERIMENTAL_DS41_PREFETCH=shadow predicts and compares with what the layer then misses,
  * reading nothing; =on also reads the predicted misses (file stager). ..._PREFETCH_K: experts kept
- * (10; at most 16). */
+ * (10; at most 16).
+ *
+ * =pieces (readahead.h): layer L's input predicts layer L+2 only (the read-ahead's lead), posted
+ * once layer L's CPU work is submitted, and each prediction goes straight to the callback
+ * (on_ready) instead of waiting to be polled. ..._PREFETCH_K defaults to 4 there. */
 #pragma once
 #include <atomic>
 #include <condition_variable>
@@ -39,6 +43,13 @@ public:
     int  k() const { return k_; }
     /* ..._PREFETCH_AHEAD: how many layers ahead the read-ahead reads (1, or 2 from predicted2). */
     int  ahead() const { return ahead_; }
+    /* ..._PREFETCH=pieces: two layers ahead only, each prediction handed to on_ready. */
+    bool pieces() const { return pieces_; }
+    /* The function a finished prediction is handed to (pieces mode), on the predictor's thread:
+     * the pass, the layer predicted and its k() best global experts, best first. Set before the
+     * first post; null stops the calls. */
+    using ReadyFn = void (*)(void* ctx, uint32_t pass, int layer, const int32_t* experts, int k);
+    void on_ready(ReadyFn fn, void* ctx);
 
     /* Once for the process (later calls return the first's answer): every layer's router weight,
      * correction and ffn_norm gain, each read through `read` (the weight's stored bytes). */
@@ -53,7 +64,8 @@ public:
      * a longer lead for a read, computed in shadow mode only. */
     bool predicted2(uint32_t pass, int layer, int32_t* experts) const;
 
-    struct Stats { uint64_t posted = 0, computed = 0, dropped = 0, compute_ns = 0; };
+    /* posted, computed, dropped (a full queue); compute_ns scoring, ready_ns in on_ready. */
+    struct Stats { uint64_t posted = 0, computed = 0, dropped = 0, compute_ns = 0, ready_ns = 0; };
     Stats stats() const;
     ~RouterPredictor();
 
@@ -63,8 +75,12 @@ private:
     void compute(uint32_t pass, int layer, const uint16_t* x);
 
     bool shadow_ = true;
+    bool pieces_ = false;
     int  k_ = 10;
     int  ahead_ = 1;
+    std::mutex ready_mu_;
+    ReadyFn    ready_fn_ = nullptr;
+    void*      ready_ctx_ = nullptr;
     bool avx2_ = false;
     std::once_flag load_once_;
     std::atomic<bool> loaded_{ false };
@@ -86,7 +102,7 @@ private:
     std::condition_variable q_cv_;
     bool stop_ = false;
     std::thread worker_;
-    std::atomic<uint64_t> posted_{ 0 }, computed_{ 0 }, dropped_{ 0 }, ns_{ 0 };
+    std::atomic<uint64_t> posted_{ 0 }, computed_{ 0 }, dropped_{ 0 }, ns_{ 0 }, ready_ns_{ 0 };
 };
 
 }  /* namespace rad */

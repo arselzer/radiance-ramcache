@@ -245,6 +245,14 @@ public:
     }
     // Resident without a lease, an LRU touch or a statistic; slab policy only (false otherwise).
     bool present(size_t key) noexcept { return slab_policy_&&slab_cache_.present(1,key); }
+    // Slab policy only: pins the budget's slabs now (MappedExpertSlabCache::pregrow). A refused
+    // allocation stops the growth and is not an error; the cache grows on demand from there.
+    int pregrow(size_t* slabs) noexcept {
+        if(slabs)*slabs=0;
+        if(!slab_policy_)return RAD_OK;
+        const auto rc=slab_cache_.pregrow(1,slabs);
+        return rc==Status::Ok||rc==Status::Allocation?RAD_OK:RAD_E_STATE;
+    }
     Status borrow(size_t key,size_t bytes,Lease* lease) noexcept {
         if(!lease||!lease->empty())return Status::Invalid;
         return slab_policy_?slab_cache_.borrow(1,key,bytes,&lease->slab_):cache_.borrow(1,key,bytes,&lease->regular_);

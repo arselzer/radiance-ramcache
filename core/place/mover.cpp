@@ -341,6 +341,15 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
                                                          sizeof(mapped_copy_hooks_) + 128,cfg_.native_cache_allocation_device)); //fixed flags/stats/alignment reserve
                 mapped_file_cache_on_ = true;
                 if(mapped_direct_fill_on_)RAD_INFO("native mapped direct fill: whole-weight unpublished reservation, parallel CPU fill, atomic first lease; unchanged H2D event retirement");
+                if (const char* pg = std::getenv("RADIANCE_EXPERIMENTAL_NATIVE_CACHE_PREGROW");
+                    pg && !std::strcmp(pg, "1")) {
+                    const auto t0 = std::chrono::steady_clock::now();
+                    size_t slabs = 0;
+                    RAD_TRY(mapped_file_cache_.pregrow(&slabs));
+                    RAD_INFO("native mapped cache: %zu slabs pinned at startup in %.2f s, so no "
+                             "request pays for growing them", slabs,
+                             std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+                }
                 RAD_INFO("native mapped COPY-source cache: %s policy cap/rank; conservative no-SVM "
                          "retained backing + metadata (not physical RSS); legacy cache disabled",
                          humanb(cfg_.native_file_cache_bytes).c_str());

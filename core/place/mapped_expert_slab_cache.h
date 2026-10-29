@@ -273,6 +273,47 @@ public:
     bool present(uint64_t ns,size_t key){
         std::lock_guard<std::mutex>o(owner_mutex_);if(!state_)return false;State&s=*state_;std::lock_guard<std::mutex>l(s.mutex);
         return ns==s.stats.cache.namespace_id&&!s.retiring&&key<s.count&&s.entries[key].present;}
+    // Pins slabs until the next would not fit the budget, so a cache that grows as it fills pays
+    // for the pinning once, at startup, instead of inside the requests that fill it (under memory
+    // pressure one slab took seconds). The slabs are the ones insert would grow, in the same order
+    // and sizes, so the cache then behaves as before. Allocation: the host refused one; the slabs
+    // grown so far stay.
+    Status pregrow(uint64_t ns,size_t*slabs_added){
+        if(slabs_added)*slabs_added=0;
+        for(;;){
+            std::lock_guard<std::mutex>w(writer_mutex_);std::unique_lock<std::mutex>o(owner_mutex_);if(!state_)return Status::Bypass;
+            State&s=*state_;std::unique_lock<std::mutex>l(s.mutex);o.unlock();
+            if(ns!=s.stats.cache.namespace_id||s.retiring)return Status::Namespace;
+            if(s.stats.cache.allocator_contract_broken)return Status::AllocatorContract;
+            if(s.used_slabs>=s.slab_records)return Status::Ok;
+            const size_t room=s.stats.cache.budget-s.stats.cache.charge();size_t p=std::min(s.next_pairs,max_pairs),quote=0;
+            for(;p;--p){quote=s.allocator.quote(s.allocator.context,request_for(p));
+                if(quote&&(quote<s.minimum_quote||quote<request_for(p))){s.stats.cache.allocator_contract_broken=true;++s.stats.cache.contract_refusals;return Status::AllocatorContract;}
+                if(quote&&quote<=room)break;}
+            if(!p)return Status::Ok;
+            const size_t request=request_for(p);s.stats.cache.reserved_charge=quote;++s.stats.growth_attempts;peak(s);
+            Allocation a{};l.unlock();const bool got=s.allocator.allocate(s.allocator.context,request,quote,&a);l.lock();
+            s.stats.cache.reserved_charge=0;
+            const bool empty=!a.token&&!a.host&&!a.device&&!a.bytes&&!a.charged_bytes;
+            if(!got&&empty){++s.stats.cache.allocation_failures;++s.stats.growth_failures;return Status::Allocation;}
+            const size_t bi=s.used_slabs++;Slab&b=s.slabs[bi];b.present=true;b.pairs=p;b.request=request;b.allocation=a;b.keys.fill(none);b.free_safe=a.token!=nullptr;
+            b.ledger_charge=a.charged_bytes&&a.charged_bytes>=a.bytes?
+                std::max(a.bytes,a.charged_bytes):std::max(quote,a.bytes);
+            s.stats.cache.payload_charge=sat_add(s.stats.cache.payload_charge,b.ledger_charge);
+            s.stats.retained_backing_charge=sat_add(s.stats.retained_backing_charge,b.ledger_charge);++s.stats.retained_slab_owners;
+            uintptr_t he=0,de=0;bool valid=got&&a.token&&span(a.host,a.bytes,&he)&&span(a.device,a.bytes,&de)&&a.bytes>=request&&
+                a.charged_bytes>=a.bytes&&a.charged_bytes<=quote&&uintptr_t(a.host)%64==0&&uintptr_t(a.device)%64==0;
+            if(!a.charged_bytes||a.charged_bytes<a.bytes||a.charged_bytes>quote||!a.token)s.stats.cache.actual_charge_known=false;
+            for(size_t i=0;i<bi;++i){const Slab&old=s.slabs[i];
+                if(a.token==old.allocation.token||overlap(a.host,a.bytes,old.allocation.host,old.allocation.bytes)||
+                   overlap(a.device,a.bytes,old.allocation.device,old.allocation.bytes)){valid=false;b.free_safe=false;s.stats.cache.actual_charge_known=false;}}
+            peak(s);
+            if(!valid){s.stats.cache.allocator_contract_broken=true;++s.stats.cache.contract_refusals;return Status::AllocatorContract;}
+            l.unlock();for(size_t j=0;j<2*p;++j)initialize_slot(b,j);l.lock();b.ready=true;
+            s.next_pairs=std::min(size_t(32),s.next_pairs*2);
+            if(slabs_added)++*slabs_added;
+        }
+    }
 private:
     Status borrow_policy(uint64_t ns,size_t key,size_t n,Lease*out,bool touch_lru){
         if(!out||!out->empty()||klass_for(n)<0)return Status::Invalid;

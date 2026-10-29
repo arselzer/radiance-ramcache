@@ -347,7 +347,7 @@ struct Layer {
     rad_weight comp_w = 0, comp_norm = 0, ik_w = 0, ik_norm = 0, iq_w = 0, iproj = 0;
     rad_weight e_mult = 0, e_vsz = 0, e_off = 0, e_kv = 0, e_gate = 0;
     /* ops, in issue order */
-    rad_op e_ids = 0, e_emb = 0, e_copy = 0, e_gemm = 0, e_gate_op = 0, e_back = 0;
+    rad_op e_ids = 0, e_emb = 0, e_copy = 0, e_gemm = 0, e_gather = 0, e_gate_op = 0, e_back = 0;
     /* This Engram layer's row ids [T, heads]: one buffer a layer, since step() writes every
      * layer's ids before the first block runs (see there). */
     rad_buf ids = 0;
@@ -452,7 +452,9 @@ struct Model {
     rad_buf kvs = 0, stage = 0, page = 0, bpos = 0, nc = 0, pooled = 0, lat = 0, latn = 0,
             ik = 0, ikn = 0;
     rad_buf iq = 0, iw = 0, score = 0, keep = 0, sel = 0, cs_a = 0, cs_b = 0;
-    rad_buf ctok = 0, emb = 0, embd = 0, ekv = 0;
+    rad_buf ctok = 0, emb = 0, embd = 0, ekv = 0, ekv_part = 0;
+    /* engram_kv's rows a rank computes when they are split over the ranks (0: replicated). */
+    int64_t esplit = 0;
     rad_buf final_hidden = 0, logit_input = 0, logits = 0;
     ActFP8 act{};
     MoeFP8::Wire mw{};
@@ -892,6 +894,18 @@ static int buffers(RadBuilder* b, Model& m) {
                        RAD_BUF_TRANSIENT, RAD_DOMAIN_HOST);
         m.embd = bf("engram_rows_dev", { T, c.ple_heads * c.ple_dim });
         m.ekv = bf("engram_kv", { T, (c.hc + 1) * D });
+        /* RADIANCE_EXPERIMENTAL_DS41_ENGRAM_SPLIT=1: each rank holds and computes 1/world of
+         * engram_kv's rows (a 315 MB GEMV every rank otherwise repeats) and a row-interleaved
+         * all_gather lays the slices out as the full row. Each output column is computed exactly
+         * as before (one wave a 16-column tile walks K in the same order, split-K 1 at either
+         * width) and the gather only moves bytes, so the values are bit-identical. */
+        const int64_t en = (c.hc + 1) * D;
+        if (const char* es = std::getenv("RADIANCE_EXPERIMENTAL_DS41_ENGRAM_SPLIT");
+            es && !std::strcmp(es, "1") && g.world > 1 && m.aw == g.world && !m.zero &&
+            en % g.world == 0 && (en / g.world) % 32 == 0) {
+            m.esplit = en / g.world;
+            m.ekv_part = bf("engram_kv_part", { T, m.esplit });
+        }
     }
     /* The routed FFN's wires (rad_block_moe_fp8.h), bf16 throughout. */
     /* bf16 linears: each ActFP8 carries only its activation (`x`); the plugin norms the FFN input
@@ -1025,7 +1039,9 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
                          RAD_SHARD_NONE, grp);
         L.e_off = decl_w(b, nm.f("blk.%d.engram_off", l), RAD_I64, { H }, RAD_ACCESS_PER_TOKEN,
                          RAD_SHARD_NONE, grp);
-        L.e_kv = lw(b, m, nm.f("blk.%d.engram_kv.weight", l), (c.hc + 1) * D, H * c.ple_dim, grp);
+        L.e_kv = m.esplit ? lw(b, m, nm.f("blk.%d.engram_kv.weight", l), m.esplit, H * c.ple_dim, grp,
+                               RAD_SHARD_ROW, m.ar * m.esplit, (m.ar + 1) * m.esplit)
+                          : lw(b, m, nm.f("blk.%d.engram_kv.weight", l), (c.hc + 1) * D, H * c.ple_dim, grp);
         if (m.release || m.ista) {
             /* The release ships the gate as two factors, k_weight and q_weight, that the model only
              * multiplies (model.py Engram): one gain, as llama.cpp's converter folds it. */
@@ -1080,7 +1096,16 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
                       { RAD_RANGE("M", 1, T), RAD_INT("n", H * c.ple_dim), RAD_STR("from", "bf16"),
                         RAD_STR("to", "bf16") },
                       {}, { m.emb }, { m.embd });
-        L.e_gemm = linear(b, m, T, L.e_kv, (c.hc + 1) * D, H * c.ple_dim, m.embd, m.ekv);
+        if (m.esplit) {
+            L.e_gemm = linear(b, m, T, L.e_kv, m.esplit, H * c.ple_dim, m.embd, m.ekv_part);
+            L.e_gather = op(b, "all_gather",
+                            { RAD_INT("world_size", g.world), RAD_RANGE("numel", m.esplit, T * m.esplit),
+                              RAD_STR("dtype", "bf16"), RAD_INT("row", m.esplit) },
+                            {}, { m.ekv_part }, { m.ekv });
+            if (!L.e_gather) return RAD_E_INVAL;
+        } else {
+            L.e_gemm = linear(b, m, T, L.e_kv, (c.hc + 1) * D, H * c.ple_dim, m.embd, m.ekv);
+        }
         L.e_gate_op = op(b, "stream_gate_add",
                          { RAD_RANGE("M", 1, T), RAD_INT("n", D), RAD_INT("hc", c.hc),
                            RAD_F64("eps", c.eps), RAD_F64("gate_eps", 1e-6),
@@ -2244,7 +2269,12 @@ static void step(RadCtx* x, const RadBatch* batch) {
             else
                 RAD_ISSUE_N(x, L.e_emb, T * H, brows(L.ids, T), RAD_W(eplain), brows(m.emb, T));
             RAD_ISSUE_N(x, L.e_copy, T, brows(m.emb, T), brows(m.embd, T));
-            RAD_ISSUE_N(x, L.e_gemm, T, brows(m.embd, T), RAD_W(L.e_kv), brows(m.ekv, T));
+            if (L.e_gather) {
+                RAD_ISSUE_N(x, L.e_gemm, T, brows(m.embd, T), RAD_W(L.e_kv), brows(m.ekv_part, T));
+                RAD_ISSUE_N(x, L.e_gather, T * m.esplit, brows(m.ekv_part, T), brows(m.ekv, T));
+            } else {
+                RAD_ISSUE_N(x, L.e_gemm, T, brows(m.embd, T), RAD_W(L.e_kv), brows(m.ekv, T));
+            }
             RAD_ISSUE_N(x, L.e_gate_op, T, brows(m.h0, T), bcol(m.ekv, 0, c.hc * D, T),
                         bcol(m.ekv, c.hc * D, D, T), RAD_W(L.e_gate), brows(m.h1, T));
             RAD_ISSUE_N(x, L.e_back, T, brows(m.h1, T), brows(m.h0, T));

@@ -216,7 +216,8 @@ for a in $ARMS; do
 # tokens; A is every pass); Q[gnc] the arm's power settings (see power_set); SgK / SgaK prompt-lookup
 # speculation, K drafts a step (fixed / adaptive window); Er the token embedding in host RAM; Xp / Xh
 # / Xi miss reads on threads started per call / on 4 KiB pages / relaid via scratch (the old ways,
-# as A/B switches); rN a repeat (ignored).
+# as A/B switches); H3 the third run home (RADIANCE_HOME_DIR3); Es engram_kv's rows split over the
+# ranks (needs a deepseek41 plugin that has it); rN a repeat (ignored).
   IFS=- read -r -a parts <<< "$a"
   pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 HOST_POOL_MIB=4096 EXTRA_ARGS="" ARM_HOME="$RHOME"
   power="" skip="" ARGS=()
@@ -234,6 +235,8 @@ for a in $ARMS; do
       M[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MISSES=${p#M}) ;;
       o)       EXTRA_ARGS="--profile-ops" ;;
       H)       ARM_HOME=${RADIANCE_HOME_DIR2:?H needs RADIANCE_HOME_DIR2} ;;
+      H3)      ARM_HOME=${RADIANCE_HOME_DIR3:?H3 needs RADIANCE_HOME_DIR3} ;;
+      Es)      env+=(RADIANCE_EXPERIMENTAL_DS41_ENGRAM_SPLIT=1) ;;   # engram_kv rows split over the ranks
       i[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_INSERT_THREADS=${p#i}) ;;
       p[0-9]*) HOST_POOL_MIB=${p#p} ;;
       G)       env+=(RADIANCE_EXPERIMENTAL_NATIVE_CACHE_PREGROW=1) ;;

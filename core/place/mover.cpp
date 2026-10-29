@@ -1036,21 +1036,45 @@ int Mover::mirror_init() {
 
 int Mover::insert_unit_planes(const HostPlanes& p, std::vector<uint8_t>* scratch) {
     if (!scratch || !relayout_ || !mapped_file_cache_on_) return RAD_E_STATE;
+    using S = NativeMappedFileCache::Status;
     for (int k = 0; k < p.n; ++k) {
         /* The check-insert-check bracket of read_native_file: never admit another epoch's bytes. */
         if (!source_file_epoch()) return RAD_E_STATE;
         const WeightInfo& w = prog_->weights[p.w[k]];
+        const size_t key = (size_t)(&w - prog_->weights.data());
         RadTensor pt[RAD_ENC_MAX_PLANES];
         weight_planes(w, pt);
         pt[0].data = const_cast<uint8_t*>(p.codes[k]);
         pt[1].data = const_cast<uint8_t*>(p.scales[k]);
-        if ((int64_t)scratch->size() < w.stored_bytes) scratch->resize((size_t)w.stored_bytes);
-        const int st = relayout_(w, pt, scratch->data(), w.stored_bytes);
-        if (st < 0) return st;
-        using S = NativeMappedFileCache::Status;
-        const auto rc = mapped_file_cache_.insert((size_t)(&w - prog_->weights.data()), scratch->data(),
-                                                  (size_t)w.stored_bytes);
-        if (rc != S::Ok && rc != S::Existing && rc != S::Bypass && rc != S::Allocation) return RAD_E_STATE;
+        /* With direct fill the weight is relaid straight into a reserved slot: one pass over its
+         * stored bytes instead of one into scratch and a second copying scratch into the cache
+         * (under the cache's writer lock). A reservation the cache turns away (busy key, held
+         * tail, no room) is the same refusal insert would give, so there is no second try.
+         * RADIANCE_EXPERIMENTAL_DS41_INSERT_DIRECT=0: through scratch, as before (an A/B switch). */
+        static const bool direct = [] {
+            const char* s = std::getenv("RADIANCE_EXPERIMENTAL_DS41_INSERT_DIRECT");
+            return !s || std::strcmp(s, "0") != 0;
+        }();
+        if (mapped_direct_fill_on_ && direct) {
+            NativeMappedFileCache::Write write;
+            const auto reserved = mapped_file_cache_.reserve_fill(key, (size_t)w.stored_bytes, &write);
+            if (reserved == S::Ok) {
+                const int st = relayout_(w, pt, write.host(), w.stored_bytes);
+                if (st < 0) return st;   /* the Write's destructor gives the slot back */
+                if (!source_file_epoch()) return RAD_E_STATE;
+                NativeMappedFileCache::Lease lease;
+                if (write.publish(&lease) != S::Ok) return RAD_E_STATE;
+                (void)lease.release();
+            } else if (reserved != S::Existing && reserved != S::Bypass && reserved != S::Allocation) {
+                return RAD_E_STATE;
+            }
+        } else {
+            if ((int64_t)scratch->size() < w.stored_bytes) scratch->resize((size_t)w.stored_bytes);
+            const int st = relayout_(w, pt, scratch->data(), w.stored_bytes);
+            if (st < 0) return st;
+            const auto rc = mapped_file_cache_.insert(key, scratch->data(), (size_t)w.stored_bytes);
+            if (rc != S::Ok && rc != S::Existing && rc != S::Bypass && rc != S::Allocation) return RAD_E_STATE;
+        }
         if (!source_file_epoch()) return RAD_E_STATE;
         host_plane_inserts_.fetch_add(1, std::memory_order_relaxed);
     }

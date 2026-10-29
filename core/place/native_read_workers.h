@@ -3,8 +3,16 @@
  * Mover remains the sole dispatcher; the call mutex also serializes reset/reconfiguration.
  * Callbacks must not recursively call run/reset on this same object. Destruction requires the
  * ordinary C++ lifetime rule: no concurrent member callers. A reset may race a live run safely.
+ *
+ * post()/join() split a call in two for a caller with other work to do meanwhile: post() starts
+ * the readers and returns at once, holding the call mutex; join() runs the caller's share, waits
+ * and releases it. The same thread calls both; nothing between them may call run, post, reset or
+ * stats on this object (another thread's call waits for the join, as it would for a run). post()
+ * itself never waits: with the readers on another thread's call it posts nothing (that caller then
+ * reads its own way, with no wait ahead of its other work).
  */
 #pragma once
+#include <atomic>
 #include <cstddef>
 #include <condition_variable>
 #include <cstdint>
@@ -23,6 +31,8 @@ public:
     enum class Result { Complete, SerialFallback, Invalid, CallbackFailed };
     struct Stats {
         uint64_t thread_starts, pooled_dispatches, serial_dispatches, fallback_dispatches;
+        uint64_t posted_dispatches = 0;   /* of the pooled ones, through post/join */
+        uint64_t busy_posts = 0;          /* posts that found the readers on another call */
     };
     using Entry = void (*)(void*, int);
     using Launch = std::thread (*)(Entry, void*, int);
@@ -73,6 +83,62 @@ public:
         }
     }
 
+    /* run() without the caller's share up front: readers 1 .. `readers` (at most maximum - 1)
+     * start on `work` now, and the caller returns at once still holding the call mutex. True:
+     * posted, and join() must follow on this thread, with `work` alive until it returns. False:
+     * nothing ran and nothing is held -- arguments out of range, no reader thread (run() would
+     * read on the caller alone), or the readers busy with another thread's call (a run, or a
+     * post not yet joined; counted in busy_posts) -- and the caller reads some other way. It never
+     * waits for the readers: a caller that posts to get on with other work would otherwise wait
+     * here, ahead of that work, for as long as the other call reads. */
+    template <class Work> bool post(int maximum, int readers, Work& work) {
+        if (maximum < 2 || maximum > 8 || readers < 1 || readers >= maximum) return false;
+        std::unique_lock<std::mutex> call(call_mutex_, std::try_to_lock);
+        if (!call.owns_lock()) {
+            busy_posts_.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        if (maximum_ && maximum_ != maximum) stop_locked();
+        if (unavailable_ || (!maximum_ && !start_locked(maximum))) return false;
+        ++pooled_dispatches_;
+        ++posted_dispatches_;
+        {
+            std::lock_guard<std::mutex> state(state_mutex_);
+            context_ = &work;
+            invoke_ = [](void* context, int id) { (*static_cast<Work*>(context))(id); };
+            active_ = readers + 1;   /* ids 1 .. readers; id 0, the caller's, comes in join() */
+            pending_ = readers;
+            callback_failed_ = false;
+            ++generation_;
+        }
+        ready_.notify_all();
+        posted_ = true;
+        call.release();   /* the call mutex stays held until join() */
+        return true;
+    }
+
+    /* After a post() on this thread: work(0) on the caller -- whatever the readers have not
+     * taken yet -- then the wait for them; the call mutex is released. Complete or
+     * CallbackFailed as run(); Invalid when nothing was posted. */
+    Result join() {
+        if (!posted_) return Result::Invalid;
+        posted_ = false;
+        /* This thread wrote context_ and invoke_ in post(); readers only read them. */
+        bool caller_failed = false;
+        try { invoke_(context_, 0); } catch (...) { caller_failed = true; }
+        Result result;
+        {
+            std::unique_lock<std::mutex> state(state_mutex_);
+            done_.wait(state, [&] { return pending_ == 0; });
+            result = callback_failed_ || caller_failed ? Result::CallbackFailed : Result::Complete;
+            context_ = nullptr;
+            invoke_ = nullptr;
+            active_ = 0;
+        }
+        call_mutex_.unlock();
+        return result;
+    }
+
     void reset() noexcept {
         std::lock_guard<std::mutex> dispatch(call_mutex_);
         stop_locked();
@@ -81,7 +147,8 @@ public:
 
     Stats stats() const {
         std::lock_guard<std::mutex> dispatch(call_mutex_);
-        return {thread_starts_, pooled_dispatches_, serial_dispatches_, fallback_dispatches_};
+        return {thread_starts_, pooled_dispatches_, serial_dispatches_, fallback_dispatches_,
+                posted_dispatches_, busy_posts_.load(std::memory_order_relaxed)};
     }
     uint64_t thread_starts() const { return stats().thread_starts; }
 
@@ -160,8 +227,11 @@ private:
     void (*invoke_)(void*, int) = nullptr;
     uint64_t generation_ = 0, thread_starts_ = 0;
     uint64_t pooled_dispatches_ = 0, serial_dispatches_ = 0, fallback_dispatches_ = 0;
+    uint64_t posted_dispatches_ = 0;
+    std::atomic<uint64_t> busy_posts_{ 0 };   /* bumped without the call mutex (post's try_lock) */
     int maximum_ = 0, active_ = 0, pending_ = 0;
     bool stopping_ = false, unavailable_ = false, callback_failed_ = false;
+    bool posted_ = false;   /* a post() awaits its join(); only the posting thread touches it */
 };
 
 }  // namespace rad

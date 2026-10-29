@@ -55,8 +55,15 @@ public:
     bool up_codes(int layer, int expert, Ref* out) const;
     /* The `bytes` bytes of r from `from` on into dst (any alignment), O_DIRECT through this
      * thread's bounce buffer. RAD_OK, or a negative RAD_E_*; a shard whose size or mtime changed
-     * since open fails. */
-    int read(const Ref& r, uint64_t from, uint64_t bytes, uint8_t* dst);
+     * since open fails. copy_ns: the copy out of the bounce buffer, which the read waits for. */
+    int read(const Ref& r, uint64_t from, uint64_t bytes, uint8_t* dst, uint64_t* copy_ns = nullptr);
+    /* A tail of `bytes` cut into at most `pieces` (at most 4) reads for as many readers: whole
+     * 4 KiB pages counted from the tail's start, except that the last piece takes any remainder,
+     * and none under 64 KiB (fewer pieces instead). The pieces' sizes in order into out; returns
+     * how many (0 for no bytes). Mover::read_unit_planes cuts a lone miss's decode tail with it
+     * (RADIANCE_EXPERIMENTAL_DS41_MIRROR_SPLIT): its pieces start on the container's 4 KiB grid,
+     * so a failed piece's fallback read from the container stays aligned. */
+    static int split(int64_t bytes, int pieces, int64_t* out);
     double share() const { return share_; }
     double decode_share() const { return decode_share_; }
     /* Passes of fewer tokens take decode_share(), by default none: a decode miss waits on its
@@ -68,7 +75,7 @@ public:
     bool on() const { return on_.load(std::memory_order_acquire); }
     void turn_off(int rc);
 
-    struct Stats { uint64_t reads = 0, bytes = 0, ns = 0; };
+    struct Stats { uint64_t reads = 0, bytes = 0, ns = 0, copy_ns = 0; };   /* copy_ns: of ns, the copies */
     Stats stats() const;
 
 private:

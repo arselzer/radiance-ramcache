@@ -152,7 +152,22 @@ bool PlaneMirror::unchanged(int shard) const {
            (int64_t)st.st_ctim.tv_sec * 1000000000 + st.st_ctim.tv_nsec == sh.ctime_ns;
 }
 
-int PlaneMirror::read(const Ref& r, uint64_t from, uint64_t bytes, uint8_t* dst) {
+int PlaneMirror::split(int64_t bytes, int pieces, int64_t* out) {
+    constexpr int64_t kMinPiece = 64 << 10;
+    if (bytes <= 0 || !out) return 0;
+    pieces = std::clamp(pieces, 1, 4);
+    while (pieces > 1 && bytes / pieces < kMinPiece) --pieces;
+    const int64_t pages = bytes / kAlign;
+    int n = 0;
+    for (int64_t i = 0, done = 0; i < pieces; ++i) {
+        const int64_t end = i + 1 == pieces ? bytes : pages * (i + 1) / pieces * kAlign;
+        if (end > done) out[n++] = end - done;
+        done = std::max(done, end);
+    }
+    return n;
+}
+
+int PlaneMirror::read(const Ref& r, uint64_t from, uint64_t bytes, uint8_t* dst, uint64_t* copy_ns) {
     if (r.shard < 0 || (size_t)r.shard >= shards_.size() || !dst || from + bytes > r.bytes)
         return RAD_E_INVAL;
     if (!on()) return RAD_E_STATE;
@@ -170,14 +185,21 @@ int PlaneMirror::read(const Ref& r, uint64_t from, uint64_t bytes, uint8_t* dst)
         if (n <= 0) return RAD_E_IO;
         done += n;
     }
+    /* The copy out of the bounce is part of the read's latency (0.13-0.65 ms for a 2.4 MB decode
+     * tail in the engine), hence its own count. */
+    const auto c0 = std::chrono::steady_clock::now();
     std::memcpy(dst, b + (off - lo), (size_t)bytes);
+    const auto c1 = std::chrono::steady_clock::now();
     if (!unchanged(r.shard)) return RAD_E_STATE;
     const uint64_t ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
                             std::chrono::steady_clock::now() - t0).count();
+    const uint64_t cns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(c1 - c0).count();
+    if (copy_ns) *copy_ns = cns;
     std::lock_guard<std::mutex> lk(stats_mu_);
     ++stats_.reads;
     stats_.bytes += bytes;
     stats_.ns += ns;
+    stats_.copy_ns += cns;
     return RAD_OK;
 }
 

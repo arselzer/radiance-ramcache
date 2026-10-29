@@ -2,7 +2,9 @@
  * is indexed from the shards' headers; reads of any extent (unaligned starts and lengths, a tensor
  * ending the shard) return its bytes through the O_DIRECT bounce; an expert in two shards makes the
  * directory unusable; a shard whose times change fails its reads; the fault knob fails exactly one
- * read; turn_off fails every read after it. Skipped where the temporary directory refuses O_DIRECT. */
+ * read; turn_off fails every read after it; split() cuts a tail into whole pages, and a tail read
+ * in its pieces lands the same bytes as one read. Skipped where the temporary directory refuses
+ * O_DIRECT. */
 #include "rad_test.h"
 
 #include "place/plane_mirror.h"
@@ -111,6 +113,62 @@ TEST(plane_mirror_indexes_and_reads_exact_bytes) {
     CHECK(m->read(r, r.bytes - 8, 16, buf.data()) < 0);   /* past the tensor */
     const auto st = m->stats();
     CHECK_EQ(st.reads, (uint64_t)5);
+    PlaneMirrorTest::destroy(m);
+}
+
+/* PlaneMirror::split (RADIANCE_EXPERIMENTAL_DS41_MIRROR_SPLIT): the pieces cover the tail in order,
+ * every boundary on the 4 KiB grid from the tail's start, at most the pieces asked for (4 at most),
+ * none under 64 KiB unless the tail is. */
+TEST(plane_mirror_split_cuts_whole_pages) {
+    int64_t out[4];
+    CHECK_EQ(PlaneMirror::split(0, 3, out), 0);
+    const int64_t decode_tail = 2441216;   /* decode share 0.13 of an 18,800,640 B unit, 4 KiB-aligned */
+    CHECK_EQ(PlaneMirror::split(decode_tail, 3, out), 3);
+    CHECK_EQ(out[0] + out[1] + out[2], decode_tail);
+    for (int i = 0; i < 3; ++i) CHECK_EQ(out[i] % 4096, (int64_t)0);
+    CHECK(out[0] >= 4096 * 198 && out[2] <= 4096 * 199);
+    CHECK_EQ(PlaneMirror::split(decode_tail, 1, out), 1);
+    CHECK_EQ(out[0], decode_tail);
+    CHECK_EQ(PlaneMirror::split(decode_tail, 9, out), 4);   /* at most 4 */
+    CHECK_EQ(PlaneMirror::split(decode_tail, -2, out), 1);
+    CHECK_EQ(PlaneMirror::split(160 << 10, 3, out), 2);     /* 53 KiB pieces would be too small */
+    CHECK_EQ(out[0] + out[1], (int64_t)(160 << 10));
+    CHECK_EQ(PlaneMirror::split(100 << 10, 3, out), 1);
+    CHECK_EQ(PlaneMirror::split(300001, 3, out), 3);        /* not whole pages: the last takes the rest */
+    CHECK_EQ(out[0] + out[1] + out[2], (int64_t)300001);
+    CHECK_EQ(out[0] % 4096, (int64_t)0);
+    CHECK_EQ((out[0] + out[1]) % 4096, (int64_t)0);
+}
+
+/* The tail read as the split's pieces, each its own read as the mover's readers do, lands the same
+ * bytes as one read; copy_ns comes back and the mirror's stats count the copies. */
+TEST(plane_mirror_tail_in_pieces_reads_the_same_bytes) {
+    const std::string dir = subdir("plane_mirror_pieces");
+    if (!direct_ok(dir)) { std::printf("  skip: %s refuses O_DIRECT\n", dir.c_str()); return; }
+    CHECK(write_shard(dir + "/model-00001-of-00001.safetensors", { { 4, 2, 1 << 20 }, { 4, 3, 9000 } }));
+    PlaneMirror* m = PlaneMirrorTest::make(dir);
+    CHECK(m != nullptr);
+    if (!m) return;
+    PlaneMirror::Ref r;
+    REQUIRE(m->up_codes(4, 2, &r));
+    const uint64_t tail = 380 << 10, from = r.bytes - tail;
+    std::vector<uint8_t> one(tail), pieces(tail, 0);
+    uint64_t copy = 0;
+    CHECK_EQ(m->read(r, from, tail, one.data(), &copy), 0);
+    int64_t piece[4];
+    const int np = PlaneMirror::split((int64_t)tail, 3, piece);
+    CHECK_EQ(np, 3);
+    uint64_t at = 0;
+    for (int q = 0; q < np; at += (uint64_t)piece[q], ++q) {
+        uint64_t c = 0;
+        CHECK_EQ(m->read(r, from + at, (uint64_t)piece[q], pieces.data() + at, &c), 0);
+    }
+    CHECK_EQ(at, tail);
+    CHECK(one == pieces);
+    CHECK(same(m, 4, 2, from, tail));
+    const auto st = m->stats();
+    CHECK_EQ(st.reads, (uint64_t)5);
+    CHECK(st.copy_ns <= st.ns);
     PlaneMirrorTest::destroy(m);
 }
 

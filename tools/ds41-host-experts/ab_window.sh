@@ -284,6 +284,27 @@ arm() {   # name, then env assignments for the server; CACHE_MIB the RAM cache (
     log "arm $name: a predictor part, but the server log has no 'router predictor: N routers loaded' line ($(grep -m1 -E 'router predictor' "$OUT/$name.server.log")); not measured"
     stop_server; return 1
   fi
+  # Pi8 / Pi4, PkN, Pw, NsN, Pv: each switch's startup line, and an arm must have exactly what its name
+  # says (a radiance without the switch prints none; a plain arm with one took it from elsewhere).
+  # A row a switch: the part, set when the arm has it, the line's pattern.
+  local sw_bad="" sw_part sw_on sw_pat sw_n
+  while IFS='|' read -r sw_part sw_on sw_pat; do
+    sw_n=$(grep -cE "$sw_pat" "$OUT/$name.server.log")
+    if [[ -n "$sw_on" && "$sw_n" == 0 ]]; then sw_bad+=" $sw_part, but no '$sw_pat' line;"
+    elif [[ -z "$sw_on" && "$sw_n" != 0 ]]; then sw_bad+=" no $sw_part part, but a '$sw_pat' line (the switch set for the window?);"; fi
+  done <<EOF2
+Pi${ARM_PSC:-}|${ARM_PSC:-}|router predictor: [0-9]+ routers loaded \(bf16, [0-9]+ MB\); scored in int${ARM_PSC:-[48]} 
+Pk${ARM_PK:-}|${ARM_PK:-}|router predictor: .*one prediction in [0-9]+ checked against bf16 alone
+Pw|${ARM_PW:-}|rank 0 posts the read-ahead's router input once a layer's CPU work is submitted
+Ns${ARM_NS:-}|${ARM_NS:-}|side store: the planes of up to [0-9]+ units a rank
+Pv|${ARM_PV:-}|router predictor: every posted router input is recorded to
+EOF2
+  if [[ -n "$sw_bad" ]]; then
+    log "arm $name:$sw_bad not measured"
+    stop_server; return 1
+  fi
+  grep -m1 -E 'router predictor: [0-9]+ routers loaded .*scored in int' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
+  grep -m1 -E "side store: the planes of up to|rank 0 posts the read-ahead's router input" "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   # RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED (the Vp part): the engine names the switch at startup and
   # each rank how many static residents it holds packed. A Vp arm without the switch's line or with
   # no rank holding any packed (a radiance without the switch, a dynamic plan, a DSpark bank), or a
@@ -366,6 +387,7 @@ arm() {   # name, then env assignments for the server; CACHE_MIB the RAM cache (
   fi
   grep -E 'host experts|EP scoped|live chain|error|ERR' "$OUT/$name.server.log" | tail -16 | tee -a "$OUT/window.log"
   grep -E 'read-ahead (in pieces|readers)|router predictor \(' "$OUT/$name.server.log" | tail -6 | tee -a "$OUT/window.log"
+  grep -E 'router predictor (scoring|check|record)|side store:|unit inserts refused' "$OUT/$name.server.log" | tail -10 | tee -a "$OUT/window.log"   # Pi/Pk, Pv, Ns
   grep -E 'rank 0: on-die reads' "$OUT/$name.server.log" | tee -a "$OUT/window.log"   # Pa/Pm/Pl/Pe: plan, counts
   grep -E 'post-stop passes: [0-9]' "$OUT/$name.server.log" | tail -1 | tee -a "$OUT/window.log"   # passes after a reply's end (Ss)
   # Every arm's VRAM residents a rank; a Vp arm's packed-form lines (what packed, the scan, the load's checks).
@@ -679,11 +701,30 @@ for a in $ARMS; do
 # with tile form N (1-8, r4d_selftest --perff32's names) for the bf16 GEMV at decode; an Rb arm runs
 # only on the libr4d.so whose gemm_nt_f32bf16 passed SELFTEST_F32BF16's card checks in this window.
 # An arm with a predictor part (Ps, Po, Pt, Pp) is measured only if the router predictor loaded.
+# Pi8 / Pi4 the predictor scores every expert from an int8 / int4 copy of the routers first (one
+# scale an expert, 79 / 39 MB beside the bf16 copy) and its best 12 again in bf16
+# (RADIANCE_EXPERIMENTAL_DS41_PREFETCH_SCORE=int8|int4, ..._PREFETCH_RESCORE pinned to 12; needs a
+# predictor part; only reads ahead change, never a reply); PkN with Pi8 / Pi4 one prediction in N is
+# also scored in bf16 alone after it was handed over and compared (..._PREFETCH_SCORE_CHECK=N; the
+# shutdown's "router predictor check" line: the same set, the same order, where bf16's picks ranked):
+# a precision arm, not a timed one; Pw at an early-issued layer (Ei) rank 0 posts the read-ahead's
+# router input once the layer's CPU work is submitted instead of before its choice
+# (RADIANCE_EXPERIMENTAL_DS41_PREFETCH_POST_LATE=1; needs Ei and PpK); NsN up to N units a rank whose
+# inserts the packed RAM cache refuses (7 experts never fit its raw-round room) keep their planes,
+# and their later misses read nothing (RADIANCE_EXPERIMENTAL_DS41_SIDE_STORE=N, ~18 MiB a unit; needs
+# K). Each is measured only if its startup line is in the server log (Pi: "scored in int8|int4" in
+# the predictor's line; Pk: "checked against bf16 alone" there; Pw: "rank 0 posts the read-ahead's
+# router input once a layer's CPU work is submitted"; Ns: "side store: the planes of up to N units"),
+# and every arm without the part runs with its switch at 0 and must not have the line. Pv records
+# every router input the predictor is posted into pred-<arm>.bin (..._PREFETCH_RECORD; ~10 KB an
+# input, ~190 MB an arm of the held-out prompts; an instrument: router_score_eval scores the file
+# offline in bf16, int8 and int4 against the container's routers); needs a predictor part.
   IFS=- read -r -a parts <<< "$a"
   xt="" bt="" kld="" dk="" db=""
   pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 HOST_POOL_MIB=4096 EXTRA_ARGS="" ARM_HOME="$RHOME" ARM_CONC=
   ARM_PROMPTS= ARM_N= ARM_LQ= rt=
   power="" skip="" ARGS=() f8="" f8x="" rb="" rbf=0 pred="" cs="" kh="" pc="" pcopt=""
+  psc="" pk="" pw="" ns="" pv=""
   unset ARM_NOPC   # --no-prefix-cache unless a Pc part sets it empty
   for p in "${parts[@]:1}"; do
     case $p in
@@ -790,6 +831,13 @@ for a in $ARMS; do
       Lq)      ARM_LQ=1 ;;                 # the quality harness after the timed requests
       Cs)      cs=1 ;;                     # the exact consumer-suffix skip (checked in the server log)
       Kh)      kh=1 ;;                     # KV and logits hashes at each prompt's end
+      Pi8|Pi4) psc=${p#Pi} ;;              # the predictor scores in int8 / int4 first, its best 12 again in bf16
+      Pk[0-9]*) # ...one prediction in N also scored in bf16 alone and compared (a precision arm)
+               if [[ ${p#Pk} =~ ^[0-9]+$ ]]; then pk=$((10#${p#Pk})); else log "arm $a: $p: PkN takes a number; the arm is skipped"; skip=1; fi ;;
+      Pw)      pw=1 ;;                     # Ei: the read-ahead's post after the layer's CPU work is submitted
+      Pv)      pv=1 ;;                     # the predictor's inputs recorded (an instrument)
+      Ns[0-9]*) # side store: up to N units a rank the packed cache refuses keep their planes
+               if [[ ${p#Ns} =~ ^[0-9]+$ ]]; then ns=$((10#${p#Ns})); else log "arm $a: $p: NsN takes a number; the arm is skipped"; skip=1; fi ;;
       *)     log "arm $a: unknown part $p; the arm is skipped (it would run without what its name says)"; skip=1 ;;
     esac
   done
@@ -838,6 +886,25 @@ for a in $ARMS; do
   ARM_RB=$rb ARM_PRED=$pred
   # Ss: the read-back runs in an arm only if its name says so, whatever the window's environment.
   [[ " ${env[*]} " == *" RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP=1 "* ]] || env+=(RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP=0)
+  # Pi8 / Pi4, PkN, Pw, NsN, Pv: each acts only with what it changes (a predictor; Pi; Ei and the
+  # read-ahead in pieces; the packed cache; a predictor); without it the arm would run under a name
+  # it does not do, so it is skipped. Every arm states the five switches (0 or empty is off for
+  # each) and the rescore count, so a window's VAR=val cannot change an arm its name does not cover.
+  if [[ -n "$psc$pv" && -z "$pred" ]]; then log "arm $a: Pi$psc / Pv without a predictor part (PpK, PsK, PoK, PtK); the arm is skipped"; skip=1; fi
+  if [[ -n "$pk" && ( -z "$psc" || "$pk" == 0 ) ]]; then log "arm $a: Pk$pk needs Pi8 or Pi4 and N of 1 or more; the arm is skipped"; skip=1; fi
+  if [[ -n "$pw" ]] && [[ " ${env[*]} " != *" RADIANCE_EXPERIMENTAL_DS41_EARLY_ISSUE=1 "* ||
+                          " ${env[*]} " != *" RADIANCE_EXPERIMENTAL_DS41_PREFETCH=pieces "* ]]; then
+    log "arm $a: Pw needs Ei and PpK (the read-ahead in pieces); the arm is skipped"; skip=1
+  fi
+  if [[ -n "$ns" ]] && [[ "$ns" == 0 || " ${env[*]} " != *" RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE=1 "* ]]; then
+    log "arm $a: Ns$ns needs K (the packed RAM cache) and N of 1 or more; the arm is skipped"; skip=1
+  fi
+  if [[ -n "$psc" ]]; then env+=(RADIANCE_EXPERIMENTAL_DS41_PREFETCH_SCORE=int$psc)
+  else env+=(RADIANCE_EXPERIMENTAL_DS41_PREFETCH_SCORE=0); fi
+  env+=(RADIANCE_EXPERIMENTAL_DS41_PREFETCH_RESCORE=12 RADIANCE_EXPERIMENTAL_DS41_PREFETCH_SCORE_CHECK=${pk:-0}
+        RADIANCE_EXPERIMENTAL_DS41_PREFETCH_POST_LATE=${pw:-0} RADIANCE_EXPERIMENTAL_DS41_SIDE_STORE=${ns:-0}
+        RADIANCE_EXPERIMENTAL_DS41_PREFETCH_RECORD=${pv:+$(cd "$OUT" && pwd)/pred-$a.bin})
+  ARM_PSC=$psc ARM_PK=$pk ARM_PW=$pw ARM_NS=$ns ARM_PV=$pv
   [[ -z "$rt" ]] && env+=(RADIANCE_EXPERIMENTAL_DS41_ROUTE_TRACE=)   # traced only with Rt
   if [[ -n "$cs" ]]; then env+=(RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP=1); else env+=(RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP=0); fi
   ARM_CS=$cs

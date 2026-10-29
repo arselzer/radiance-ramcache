@@ -221,8 +221,9 @@ for a in $ARMS; do
 # drafts a step (Ds0: the bank loaded, drafting off) / with the adaptive window (the bank pins its
 # experts in the host pool: give the arm pN of ~2048); H3 the third run home (RADIANCE_HOME_DIR3); Es
 # engram_kv's rows split over the ranks (needs a deepseek41 plugin that has it); Pa the next layer's
-# attention weights read into the card's on-die cache during the CPU-row wait (same); rN a repeat
-# (ignored).
+# attention weights read into the card's on-die cache during the CPU-row wait (same); K the RAM cache
+# in the CPU-only packed form (RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE; needs all, M16 and B1); rN a
+# repeat (ignored).
   IFS=- read -r -a parts <<< "$a"
   pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 HOST_POOL_MIB=4096 EXTRA_ARGS="" ARM_HOME="$RHOME"
   power="" skip="" ARGS=()
@@ -275,6 +276,7 @@ for a in $ARMS; do
                       --num-speculative-tokens 5 --spec-ngram 0)
                [[ $p == Ds[0-9] ]] && env+=(RADIANCE_EXPERIMENTAL_DS41_DSPARK_VERIFY_CAP=${p#Ds})
                [[ $p == Dsa ]] && ARGS+=(--draft-window adaptive) ;;
+      K)       env+=(RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE=1) ;;     # the RAM cache packed for the CPU only
       *)       log "arm $a: unknown part $p" ;;
     esac
   done

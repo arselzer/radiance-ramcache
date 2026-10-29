@@ -920,11 +920,20 @@ int64_t hx_numel(const RadTensor& t) {
  * down projection's rows as operand 0. */
 /* RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS caps the file buffers (planner.cpp), which then
  * hold only the aliases of units the CPU computes: refuse a configuration in which any routed pass
- * could need the card's copy path. */
+ * could need the card's copy path. The packed RAM cache (Mover::packed_cache) needs that cap: the
+ * card cannot read its slots, so the CPU must compute every unit it holds. */
 int FileStager::hx_init(const Program& prog) {
     RAD_TRY(hx_init_impl(prog));
+    auto packed_ok = [&] {
+        if (!mover_ || !mover_->packed_cache() || hx_capped_) return RAD_OK;
+        RAD_ERR("RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE=1: the RAM cache then holds a form only the CPU "
+                "reads, so the CPU must compute every routed unit: host experts with ..._POLICY=all and "
+                "..._MISSES=%lld, and RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS set",
+                (long long)kEpRouteMaxRows);
+        return RAD_E_INVAL;
+    };
     const char* cap = std::getenv("RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS");
-    if (!cap || std::atoi(cap) <= 0 || layers_.empty()) return RAD_OK;
+    if (!cap || std::atoi(cap) <= 0 || layers_.empty()) return packed_ok();
     bool every = hx_pool_ != nullptr;
     for (size_t li = 0; every && li < layers_.size(); ++li) {
         every = li < ep_layer_eligible_.size() && ep_layer_eligible_[li] && li < hx_ops_.size() &&
@@ -943,7 +952,7 @@ int FileStager::hx_init(const Program& prog) {
     hx_capped_ = true;
     if (plan_->rank == 0)
         RAD_INFO("host experts: file buffers capped at %s units; every routed unit is the CPU's", cap);
-    return RAD_OK;
+    return packed_ok();
 }
 
 int FileStager::hx_init_impl(const Program& prog) {
@@ -1350,8 +1359,14 @@ int FileStager::hx_submit() {
         const Mover::HostUnit& hu = hx_units_[k];
         if (!hu.n) continue;
         HostExpertPool::Job proto;
-        proto.gu = hu.bytes[0] == HostExpertPool::kGuBytes ? hu.host[0] : hu.host[1];
-        proto.dn = hu.bytes[0] == HostExpertPool::kGuBytes ? hu.host[1] : hu.host[0];
+        const int g = hu.bytes[0] == HostExpertPool::kGuBytes ? 0 : 1;
+        proto.gu = hu.host[g];
+        proto.dn = hu.host[1 - g];
+        if (hu.packed) {   /* the packed RAM cache: the slots' own sizes bound their views */
+            proto.packed = true;
+            proto.gu_bytes = hu.slot[g];
+            proto.dn_bytes = hu.slot[1 - g];
+        }
         const int n = hx_jobs_for(plan_->units[(size_t)hu.unit].expert, proto);
         if (n < 0) return n;
         ++hx_stats_.units;
@@ -1623,7 +1638,7 @@ int FileStager::hx_warm() {
     std::stable_sort(units.begin(), units.end(), [&](int32_t a, int32_t b) {
         return plan_->units[(size_t)a].profile_share > plan_->units[(size_t)b].profile_share;
     });
-    const int64_t pair = HostExpertPool::kGuBytes + HostExpertPool::kDnBytes + 6 * 64;
+    const int64_t pair = mover_->mapped_pair_bytes();   /* a gate_up and a down slot, with guards */
     /* The slabs are pinned first (a refused one stops the growth), so the set is what the cache
      * really holds: an estimate that overshot would drop the hottest, inserted last. */
     const int64_t slots = mover_->mapped_cache_pregrow();

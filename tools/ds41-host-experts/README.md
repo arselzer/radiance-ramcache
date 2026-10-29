@@ -73,6 +73,52 @@ the engine or the scripts assumes where the checkpoint is. `ab_window.sh` takes 
 | missed units relaid straight into a reserved cache slot | +1.1% | on by default with `..._NATIVE_CACHE_DIRECT_FILL=1`; `RADIANCE_EXPERIMENTAL_DS41_INSERT_DIRECT=0` relays via scratch and copies, as before |
 | `..._ENGRAM_SPLIT=1` | +3.5%, TTFT −2.6% | in the deepseek41 plugin (build it from this branch; the dev tree's has no switch): each rank holds and computes 6,400 of engram_kv's 25,600 rows and an all_gather rebuilds the row; the replicated 315 MB GEMV (1.4 ms a token on every card) becomes a quarter, and the ~450 MiB a card it frees holds 25 more experts a rank |
 | `..._PREFETCH_ATTN=1` | +2.8% | in the deepseek41 plugin: while the card waits for a layer's CPU rows, lane 1 reads the next layer's q_a, kv, q_b and wo_a (~56 MB a card) into the 64 MB on-die cache (libr4d `prefetch`, read-only); decode passes only, and not ahead of an Engram layer |
+| `RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE=1` | not yet measured on the engine | the RAM cache in a CPU-only packed form: x1.044 the pairs, kernel −8.5% a cached expert (below); refused unless the CPU takes every routed unit (all, M16, B1); arm part `K` |
+
+## The packed RAM cache
+
+With the file buffers capped (`..._FILE_BUFFER_UNITS`) the card never reads the RAM cache: the CPU
+computes every expert in it. So the cache need not hold block_mxfp4 (17 bytes per 32 weights). With
+`RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE=1` each weight keeps the release's codes plane and stores its
+e8m0 scales as 2-bit codes from one base per weight (gate_up, `[w1; w3]`, is one weight): every block
+of a 32-block round (the kernel's unit; down's 8-block row tail is a round of its own) in base .. base
++ 3, or the round is raw and its 32 bytes are kept beside (`ds41_host_experts.h`, the packed form).
+The kernels widen a round's codes into the 32 bytes the scales plane holds there and run the planar
+round code unchanged, so the bits are the planar kernel's, which are the card's.
+
+A full scan of the release's scales (all 40 x 384 experts, 17 GB of e8m0 planes) found 120 (58.7%) and
+121 (41.2%) nearly everywhere: 0.0046% of gate_up rounds and 0.0107% of down rounds are raw, and
+92% of gate_ups and 86% of downs have none. The tail is in layers 37 to 39 (a down with 3331 raw
+rounds of 15360). A slot is fixed per class; the default holds 512 raw rounds a gate_up and 320 a
+down: 11,999,296 + 6,001,984 bytes for a pair of 12,533,760 + 6,266,880, so **x1.0444 the pairs**
+in the same RAM (~1424 instead of 1364 a rank at 24 GiB). Seven experts do not fit (L37 E123, L38
+E250, L39 E007/E087/E188/E313/E382: 0.042% of the decode profile's selections); they are never
+cached and stay misses, computed from their planes. 256/256 would give x1.0451 with 15 left out
+(0.087%), 600/3400 x1.0378 with none. `..._PACKED_CACHE_RAW=<gate_up>,<down>` sets other budgets.
+The scan, budget and profile scripts are in `/home/as/ds41-claude-build/work/packed/run2/`.
+
+Every path that fills the cache writes the packed form: the misses' background inserts and the
+warm-up (both `Mover::insert_unit_planes`, which counts a unit's raw rounds first, then packs each
+weight straight into a reserved slot: its codes plane copied, its scales packed). Before a slot is
+published its scales are widened back as the kernels widen them and compared with the planes byte
+for byte; a weight that fails is never published (counted). The cache carries a layout tag: only
+the CPU path's `borrow_packed`/`reserve_packed` reach a packed slot, and every block_mxfp4 call (the
+card's copy path: `borrow`, `borrow_readonly`, `reserve_fill`, `insert`) is turned away as a miss or
+bypass and counted, so the card's path reads the container instead and never stores block bytes in
+a packed slot. The shutdown report prints the packed cache's outcomes.
+
+Kernel, 40 threads in the engine pool's shape (64-row tiles, 32 experts streamed from DRAM, the
+research sample's real scales; `ds41_host_experts_test pkbench 32 40 24`, medians of seven):
+
+| layout | 40 threads, ms an expert | 24 threads |
+|---|---|---|
+| block_mxfp4 | 0.416 | 0.387 |
+| planes | 0.387 (−6.9%) | 0.354 (−8.6%) |
+| packed | 0.381 (−8.5%) | 0.324 (−16.3%) |
+
+`ds41_host_experts_test packed` holds packed to planar bit for bit: the 27 sampled experts, a raw
+round at every block position (down's tail included), widened rounds on the general path (126 ..
+129, 110 .. 113, the subnormal scales), NaN rows, and the packing API's refusals.
 
 ## Tools
 

@@ -590,12 +590,16 @@ public:
      *                   keeps its bytes in place until release_host_unit, and their host
      *                   addresses in the unit's weight order. False, with nothing held, when a
      *                   weight is not cached or the cache is off. Borrowing touches the entries,
-     *                   as a staged read does. */
+     *                   as a staged read does. `bytes` is each weight's stored (block_mxfp4) size;
+     *                   with the packed cache (packed_cache()) the slots hold the packed form
+     *                   instead, `slot` bytes each (ds41_host_experts.h packed_view). */
     struct HostUnit {
         int32_t        unit = -1;
         int            n = 0;
+        bool           packed = false;
         const uint8_t* host[2] = { nullptr, nullptr };
         int64_t        bytes[2] = { 0, 0 };
+        int64_t        slot[2] = { 0, 0 };
         NativeMappedFileCache::Lease lease[2];
     };
     bool  borrow_host_unit(int32_t u, HostUnit* out);
@@ -631,12 +635,25 @@ public:
     bool  read_weight_file(const WeightInfo& w, void* dst);
     bool  mapped_cache_on() const { return mapped_file_cache_on_; }
     int64_t mapped_cache_bytes() const { return mapped_file_cache_on_ ? cfg_.native_file_cache_bytes : 0; }
+    /* RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE=1 (slabs only): the mapped cache holds the routed
+     * experts in the CPU-only packed form (tools/ds41-host-experts/ds41_host_experts.h), which only
+     * borrow_host_unit's readers can use: the card's copy path neither reads nor fills it. The
+     * file stager refuses it unless the CPU computes every routed unit (..._FILE_BUFFER_UNITS).
+     * ..._PACKED_CACHE_RAW=<gate_up>,<down>: the raw rounds a slot holds (see mover.cpp). */
+    bool  packed_cache() const { return mapped_file_cache_on_ && mapped_file_cache_.packed(); }
+    /* One gate_up and one down slot of the mapped cache's slabs, with their guards. */
+    int64_t mapped_pair_bytes() const;
     /* Pins the mapped cache's slabs (as ..._PREGROW does; again adds nothing) and returns the
      * pairs it can hold: the fewer of its gate_up and down slots. 0 without slabs. */
     int64_t mapped_cache_pregrow();
     /* Whether the mapped RAM cache holds every weight of unit u, without touching it. */
     bool  unit_cached(int32_t u);
     int   insert_unit_planes(const HostPlanes& p, std::vector<uint8_t>* scratch);
+    /* The packed cache's outcomes, all ranks' threads: weights packed and published; units not
+     * cached because a weight had more raw rounds than its slot takes (attempts, and distinct
+     * units); weights whose packed scales failed the round trip (never published). */
+    struct PackedStats { uint64_t inserted = 0, over_budget = 0, over_budget_units = 0, round_trip_failed = 0; };
+    PackedStats packed_stats() const;
     /* retire_file_windows  gives back the RAM-cache leases the read windows keep for their last
      *                      copies, for a caller that knows those copies are done (the file
      *                      stager, past a routing sync the card reached after them). A window
@@ -862,6 +879,12 @@ private:
     /* read_relaid split, summed over the relay threads that run it at once: preads, relayouts. */
     std::atomic<uint64_t> relaid_read_ns_{0}, relaid_pack_ns_{0}, relaid_reads_{0};
     std::atomic<uint64_t> host_plane_read_ns_{0}, host_plane_reads_{0}, host_plane_inserts_{0};
+    /* The packed cache (packed_cache()): each class's raw-round budget, and its outcomes. */
+    int  packed_raw_[2] = { 0, 0 };
+    std::unique_ptr<std::atomic<uint8_t>[]> packed_refused_;   /* by unit: refused once already */
+    std::atomic<uint64_t> packed_inserts_{0}, packed_over_budget_{0}, packed_over_budget_units_{0},
+                          packed_round_trip_failed_{0};
+    int  insert_unit_packed(const HostPlanes& p);
     /* Per unit: the mirror's copy of its gate_up's w3 codes (shard -1: none) and which of the
      * unit's two weights is the gate_up; the tail read from the mirror, 4 KiB-aligned. */
     std::vector<PlaneMirror::Ref> mirror_ref_;

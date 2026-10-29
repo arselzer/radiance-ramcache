@@ -7,6 +7,7 @@
 #include "mover.h"
 #include "format/dspark_rad_banks.h"
 #include "../device/device.h"
+#include "ds41_host_experts.h"
 
 #include <algorithm>
 #include <atomic>
@@ -41,6 +42,38 @@ uint8_t* alloc_plane_buffer(int64_t bytes, int64_t* cap) {
     *cap = n;
     return static_cast<uint8_t*>(p);
 }
+
+namespace {
+
+/* RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE: the two weights of a routed unit, by the mapped cache's
+ * class (0 gate_up [w1; w3], 1 down), as [N, K]; and the raw rounds (32-block rounds with a scale
+ * outside their weight's 2-bit window) each class's slot holds. From a scan of all 15360 routed
+ * experts of the release (tools/ds41-host-experts/README.md, the packed cache): 512 and 320 hold
+ * all but 7 (0.042% of the decode profile's selections; they stay misses, computed from their
+ * planes) for slots x1.0444 smaller than block_mxfp4's. ..._PACKED_CACHE_RAW=<gate_up>,<down> sets
+ * others. */
+constexpr int kPackedShape[2][2] = { { 4608, 5120 }, { 5120, 2304 } };
+constexpr int kPackedRawDefault[2] = { 512, 320 };
+
+int packed_cache_budget(int* raw) {
+    raw[0] = kPackedRawDefault[0];
+    raw[1] = kPackedRawDefault[1];
+    const char* e = std::getenv("RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE_RAW");
+    if (!e || !*e) return RAD_OK;
+    int a = -1, b = -1, used = 0;
+    if (std::sscanf(e, "%d,%d%n", &a, &b, &used) != 2 || e[used] || a < 0 || b < 0 ||
+        !ds41hx::packed_bytes(kPackedShape[0][0], kPackedShape[0][1], a) ||
+        !ds41hx::packed_bytes(kPackedShape[1][0], kPackedShape[1][1], b)) {
+        RAD_ERR("RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE_RAW=%s: <gate_up>,<down>, the raw rounds a slot "
+                "holds (0 .. %d and 0 .. %d)", e, kPackedShape[0][0] * 5, kPackedShape[1][0] * 3);
+        return RAD_E_INVAL;
+    }
+    raw[0] = a;
+    raw[1] = b;
+    return RAD_OK;
+}
+
+}  /* namespace */
 
 /* ------------------------------------------------------------------ the file tier */
 int FileTier::open(const std::string& path) {
@@ -187,6 +220,18 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
     if(want_direct_fill&&(!want_mapped||cfg.native_file_cache_bytes<=0||!slabs_env||std::strcmp(slabs_env,"1")||
         !std::any_of(plan.units.begin(),plan.units.end(),[](const MoveUnit& mu){return mu.tier==Tier::SSD;}))){
         RAD_ERR("mapped direct fill requires mapped COPY-source cache and retained slabs");return RAD_E_UNSUPPORTED;
+    }
+    const char* packed_env=std::getenv("RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE");
+    const bool want_packed=packed_env&&std::strcmp(packed_env,"1")==0;
+    int packed_raw[2]={0,0};
+    if(want_packed){
+        if(!want_mapped||cfg.native_file_cache_bytes<=0||!slabs_env||std::strcmp(slabs_env,"1")||
+           !std::any_of(plan.units.begin(),plan.units.end(),[](const MoveUnit& mu){return mu.tier==Tier::SSD;})){
+            RAD_ERR("RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE=1 needs the mapped RAM cache in retained slabs "
+                    "(RADIANCE_EXPERIMENTAL_NATIVE_CACHE_MAPPED_SOURCE=1, ..._MAPPED_SLABS=1, a RAM cache and a file tier)");
+            return RAD_E_UNSUPPORTED;
+        }
+        RAD_TRY(packed_cache_budget(packed_raw));
     }
     /* Retire all callbacks before cache/RelayIn/window/namespace lifetimes change. */
     relay_workers_.reset();
@@ -358,10 +403,27 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
         if(cfg_.native_file_cache_bytes>0||cfg_.source_banks)RAD_TRY(file_.remember_epoch());
         if (cfg_.native_file_cache_bytes > 0) {
             if (want_mapped) {
+                /* The packed cache's slots: each weight's packed form with room for its raw rounds. */
+                NativeMappedFileCache::SlabCache::Sizes slots = NativeMappedFileCache::SlabCache::block_sizes;
+                for (int c = 0; want_packed && c < 2; ++c) {
+                    packed_raw_[c] = packed_raw[c];
+                    slots[(size_t)c] = ds41hx::packed_bytes(kPackedShape[c][0], kPackedShape[c][1], packed_raw[c]);
+                }
                 RAD_TRY(mapped_file_cache_.configure(size_t(cfg_.native_file_cache_bytes),
                                                      prog.weights.size(),sizeof(mapped_windows_) +
-                                                         sizeof(mapped_copy_hooks_) + 128,cfg_.native_cache_allocation_device)); //fixed flags/stats/alignment reserve
+                                                         sizeof(mapped_copy_hooks_) + 128,cfg_.native_cache_allocation_device,
+                                                     want_packed ? NativeMappedFileCache::Layout::Packed
+                                                                 : NativeMappedFileCache::Layout::Block, slots)); //fixed flags/stats/alignment reserve
                 mapped_file_cache_on_ = true;
+                if (want_packed) {
+                    packed_refused_.reset(new std::atomic<uint8_t>[plan.units.size()]());
+                    RAD_INFO("native mapped cache: packed for the CPU only (RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE): "
+                             "gate_up slots of %s with room for %d raw rounds, down %s with %d (block_mxfp4: %s, %s); "
+                             "the card's copy path neither reads nor fills it",
+                             humanb((int64_t)slots[0]).c_str(), packed_raw[0], humanb((int64_t)slots[1]).c_str(),
+                             packed_raw[1], humanb((int64_t)NativeMappedFileCache::GU).c_str(),
+                             humanb((int64_t)NativeMappedFileCache::DN).c_str());
+                }
                 if(mapped_direct_fill_on_)RAD_INFO("native mapped direct fill: whole-weight unpublished reservation, parallel CPU fill, atomic first lease; unchanged H2D event retirement");
                 if (const char* pg = std::getenv("RADIANCE_EXPERIMENTAL_NATIVE_CACHE_PREGROW");
                     pg && !std::strcmp(pg, "1")) {
@@ -816,22 +878,35 @@ bool Mover::borrow_host_unit(int32_t u, HostUnit* out) {
     if (us.tier != Tier::SSD || us.slab_slot >= 0 || us.klass < 0) return false;
     const MoveUnit& mu = plan_->units[(size_t)u];
     if (mu.weights.empty() || mu.weights.size() > 2 || !source_file_epoch()) return false;
+    /* The packed cache's slots are borrowed by class, and their leases must say packed; a block
+     * cache's must not. */
+    const bool packed = mapped_file_cache_.packed();
+    const auto slots = mapped_file_cache_.slot_bytes();
     for (rad_weight h : mu.weights) {
         const WeightInfo& w = prog_->weights[h];
         NativeMappedFileCache::Lease& l = out->lease[out->n];
+        const size_t key = (size_t)(&w - prog_->weights.data());
+        const int c = w.stored_bytes == (int64_t)NativeMappedFileCache::GU ? 0
+                    : w.stored_bytes == (int64_t)NativeMappedFileCache::DN ? 1 : -1;
+        const size_t want = !packed ? (size_t)w.stored_bytes : c < 0 ? 0 : slots[(size_t)c];
+        auto take = [&] {
+            return !packed ? mapped_file_cache_.borrow(key, (size_t)w.stored_bytes, &l)
+                           : mapped_file_cache_.borrow_packed(key, c, &l);
+        };
         if (w.stored_bytes <= 0 || !mapped_file_eligible(w) ||
-            mapped_file_cache_.borrow((size_t)(&w - prog_->weights.data()), (size_t)w.stored_bytes,
-                                      &l) != NativeMappedFileCache::Status::Hit ||
-            !l.active() || !l.host() || l.bytes() != (size_t)w.stored_bytes) {
+            take() != NativeMappedFileCache::Status::Hit ||
+            !l.active() || !l.host() || l.bytes() != want || l.packed() != packed) {
             (void)l.release();
             release_host_unit(out);
             return false;
         }
         out->host[out->n] = l.host();
         out->bytes[out->n] = w.stored_bytes;
+        out->slot[out->n] = (int64_t)l.bytes();
         ++out->n;
     }
     out->unit = u;
+    out->packed = packed;
     return true;
 }
 
@@ -951,6 +1026,20 @@ bool Mover::read_unit_planes(HostPlanes* const* units, int n, int rows) {
     return source_file_epoch();
 }
 
+int64_t Mover::mapped_pair_bytes() const {
+    const auto b = mapped_file_cache_.slot_bytes();
+    return (int64_t)(b[0] + b[1] + 6 * 64);
+}
+
+Mover::PackedStats Mover::packed_stats() const {
+    PackedStats p;
+    p.inserted = packed_inserts_.load(std::memory_order_relaxed);
+    p.over_budget = packed_over_budget_.load(std::memory_order_relaxed);
+    p.over_budget_units = packed_over_budget_units_.load(std::memory_order_relaxed);
+    p.round_trip_failed = packed_round_trip_failed_.load(std::memory_order_relaxed);
+    return p;
+}
+
 int64_t Mover::mapped_cache_pregrow() {
     if (!mapped_file_cache_on_) return 0;
     size_t slabs = 0;
@@ -1034,8 +1123,68 @@ int Mover::mirror_init() {
     return RAD_OK;
 }
 
+/* The packed cache's insert: both weights' raw rounds counted first, so a unit is cached whole or
+ * not at all (a weight with more raw rounds than its slot holds keeps the unit a miss, computed
+ * from its planes); then each weight packed straight into a reserved slot -- its codes plane
+ * copied, its scales packed -- and checked before it is published: every block's e8m0 as the
+ * kernels widen it from the slot must equal the planes' byte for byte, or the slot goes back
+ * unpublished (the Write's destructor) and the weight stays a miss. */
+int Mover::insert_unit_packed(const HostPlanes& p) {
+    using S = NativeMappedFileCache::Status;
+    if (p.n != 2) return RAD_E_STATE;
+    int klass[2] = { -1, -1 };
+    ds41hx::PackInfo plan[2];
+    for (int k = 0; k < 2; ++k) {
+        const WeightInfo& w = prog_->weights[p.w[k]];
+        const int c = w.stored_bytes == (int64_t)NativeMappedFileCache::GU ? 0
+                    : w.stored_bytes == (int64_t)NativeMappedFileCache::DN ? 1 : -1;
+        if (c < 0 || p.rows[k] != kPackedShape[c][0] || p.cols[k] != kPackedShape[c][1] || !p.codes[k] ||
+            !p.scales[k] || !ds41hx::pack_plan(p.scales[k], kPackedShape[c][0], kPackedShape[c][1], &plan[k]))
+            return RAD_E_STATE;
+        klass[k] = c;
+    }
+    if (klass[0] == klass[1]) return RAD_E_STATE;
+    if (plan[0].n_exc > packed_raw_[klass[0]] || plan[1].n_exc > packed_raw_[klass[1]]) {
+        packed_over_budget_.fetch_add(1, std::memory_order_relaxed);
+        if (packed_refused_ && (size_t)p.unit < unit_.size() && !packed_refused_[(size_t)p.unit].exchange(1))
+            packed_over_budget_units_.fetch_add(1, std::memory_order_relaxed);
+        return RAD_OK;
+    }
+    for (int k = 0; k < 2; ++k) {
+        /* The check-insert-check bracket of read_native_file: never admit another epoch's bytes. */
+        if (!source_file_epoch()) return RAD_E_STATE;
+        const WeightInfo& w = prog_->weights[p.w[k]];
+        const size_t key = (size_t)(&w - prog_->weights.data());
+        const int c = klass[k], N = kPackedShape[c][0], K = kPackedShape[c][1];
+        NativeMappedFileCache::Write write;
+        const auto reserved = mapped_file_cache_.reserve_packed(key, c, &write);
+        if (reserved == S::Ok) {
+            if (!write.packed() || !write.host()) return RAD_E_STATE;
+            ds41hx::Mx view;
+            const int rc = ds41hx::pack_planes(p.codes[k], p.scales[k], N, K, packed_raw_[c], plan[k], write.host(),
+                                               write.bytes());
+            if (rc != ds41hx::kPackOk || !ds41hx::packed_view(write.host(), write.bytes(), N, K, &view) ||
+                !ds41hx::packed_scales_equal(view, p.scales[k])) {
+                packed_round_trip_failed_.fetch_add(1, std::memory_order_relaxed);
+                continue;   /* unpublished: the Write's destructor gives the slot back */
+            }
+            if (!source_file_epoch()) return RAD_E_STATE;
+            NativeMappedFileCache::Lease lease;
+            if (write.publish(&lease) != S::Ok) return RAD_E_STATE;
+            (void)lease.release();
+            packed_inserts_.fetch_add(1, std::memory_order_relaxed);
+        } else if (reserved != S::Existing && reserved != S::Bypass && reserved != S::Allocation) {
+            return RAD_E_STATE;
+        }
+        if (!source_file_epoch()) return RAD_E_STATE;
+        host_plane_inserts_.fetch_add(1, std::memory_order_relaxed);
+    }
+    return RAD_OK;
+}
+
 int Mover::insert_unit_planes(const HostPlanes& p, std::vector<uint8_t>* scratch) {
     if (!scratch || !relayout_ || !mapped_file_cache_on_) return RAD_E_STATE;
+    if (mapped_file_cache_.packed()) return insert_unit_packed(p);
     using S = NativeMappedFileCache::Status;
     for (int k = 0; k < p.n; ++k) {
         /* The check-insert-check bracket of read_native_file: never admit another epoch's bytes. */
@@ -1122,9 +1271,11 @@ void Mover::release_host_unit(HostUnit* hu) {
         (void)hu->lease[i].release();
         hu->host[i] = nullptr;
         hu->bytes[i] = 0;
+        hu->slot[i] = 0;
     }
     hu->n = 0;
     hu->unit = -1;
+    hu->packed = false;
 }
 
 /* The same choice of units as stage_units, without a cap. */
@@ -2545,6 +2696,18 @@ std::string Mover::report() const {
                  (unsigned long long)host_plane_reads_.load(), (double)host_plane_read_ns_.load() * 1e-9,
                  (double)host_plane_read_ns_.load() * 1e-6 / (double)host_plane_reads_.load(),
                  (unsigned long long)host_plane_inserts_.load());
+    if (packed_cache()) {
+        const PackedStats ps = packed_stats();
+        const auto c = mapped_file_cache_.stats();
+        s += fmt("  packed RAM cache: slots %s + %s (raw rounds %d, %d); %llu weights packed and published; "
+                 "%llu unit inserts refused over a raw-round budget (%llu distinct units, never cached); "
+                 "%llu weights failed the scales' round trip (never published); %llu block_mxfp4 calls "
+                 "turned away (the card's copy path)\n",
+                 humanb((int64_t)c.slot_bytes[0]).c_str(), humanb((int64_t)c.slot_bytes[1]).c_str(),
+                 packed_raw_[0], packed_raw_[1], (unsigned long long)ps.inserted,
+                 (unsigned long long)ps.over_budget, (unsigned long long)ps.over_budget_units,
+                 (unsigned long long)ps.round_trip_failed, (unsigned long long)c.layout_refusals);
+    }
     if (mirror_tail_ > 0 && PlaneMirror::get()) {
         const PlaneMirror::Stats ms = PlaneMirror::get()->stats();
         if (ms.reads)

@@ -359,6 +359,7 @@ public:
     struct RtStats {
         uint64_t passes = 0, layers = 0, d_layers = 0, routes = 0, logits = 0, masks = 0;
         uint64_t biases = 0, uncaptured = 0;
+        uint64_t copy_failed = 0;   /* rank 0's router-output copies that could not be queued */
         uint64_t picks[rtrace::kStatusCount] = {};
     };
     const RtStats& rt_stats() const { return rt_stats_; }

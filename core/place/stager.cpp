@@ -777,8 +777,19 @@ int FileStager::start_ep_routed(int32_t li, RadStream s, bool* read) {
     }
     RAD_TRY(rad_event_record(counts_ev_, s));
     /* ..._ROUTE_TRACE: rank 0's copies of the router's outputs, behind the counts' event (the
-     * choice does not wait for them) and under their own, which rt_layer waits for. */
-    if (rt_) RAD_TRY(rt_queue(li, s));
+     * choice does not wait for them) and under their own, which rt_layer waits for. Best-effort:
+     * copies that cannot be queued leave this layer's record without rank 0's router outputs
+     * (counted, warned once); the pass runs on. */
+    if (rt_) {
+        if (const int st = rt_queue(li, s); st < 0) {
+            rt_q_li_ = -1;
+            rt_q_logits_ = false;
+            if (rt_stats_.copy_failed++ == 0)
+                RAD_WARN("route trace: rank 0's copies of routed layer %d's router outputs could not "
+                         "be queued (%d); its record goes without them and the pass runs on (the "
+                         "shutdown line counts such layers)", (int)li, st);
+        }
+    }
     /* ..._EARLY_ISSUE (stager.h): capped, every file-tier unit is the CPU's, so the card's aliases
      * are the same whichever units the router picked. Publish them for the whole layer and return
      * without waiting: the card runs the layer's resident experts, the shared expert and the ffn

@@ -287,7 +287,8 @@ Engine::~Engine() {
                      "%llu on the card, %llu RAM hits, %llu misses, %llu read ahead whole, %llu in "
                      "part, %llu on the copy path, %llu undecided, %llu host-pinned; router outputs "
                      "on %llu layers (logits on %llu), RAM snapshots on %llu, %llu layers whose "
-                     "router operands this pass did not show, %llu bias records",
+                     "router operands this pass did not show, %llu bias records, %llu layers whose "
+                     "copies could not be queued",
                      (unsigned long long)t.passes, (unsigned long long)t.layers,
                      (unsigned long long)t.d_layers, (unsigned long long)p[rtrace::kOnCard],
                      (unsigned long long)p[rtrace::kRamHit], (unsigned long long)p[rtrace::kMiss],
@@ -297,7 +298,8 @@ Engine::~Engine() {
                      (unsigned long long)p[rtrace::kUndecided],
                      (unsigned long long)p[rtrace::kHostPinned], (unsigned long long)t.routes,
                      (unsigned long long)t.logits, (unsigned long long)t.masks,
-                     (unsigned long long)t.uncaptured, (unsigned long long)t.biases);
+                     (unsigned long long)t.uncaptured, (unsigned long long)t.biases,
+                     (unsigned long long)t.copy_failed);
         }
     }
     /* The route trace's files: everything the ranks and the step loop recorded is written before

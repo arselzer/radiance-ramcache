@@ -41,6 +41,25 @@
 # blocks before L5, which then tests nothing; a U part's receipt name holds no "-", which splits
 # parts). Put the same arm without Pc first: it is the cold reference.
 #
+# Harness-grade prefix reuse (each needs Pc or Pc0, or the arm is skipped; every arm without one
+# runs with its switch off, and is not measured if its server says otherwise): Pce end-of-request
+# snapshots (RADIANCE_EXPERIMENTAL_PREFIX_EORS: a decode step completing a position on the resume
+# grid past its prompt snapshots the state there, so a conversation's next turn resumes at most 15
+# tokens before the reply's end; refused, and the arm skipped, with Pcx or speculation); Pcl the
+# snapshot store gives up the least recently used conversation first (..._PREFIX_SESSION_LRU); PcbN
+# the store as a byte budget of N MiB (..._CHECKPOINT_STORE_MIB, auto otherwise; not with PcsN);
+# PcmN --prefix-cache-mib N (the host KV tier: a finished conversation's KV copied to pinned host
+# memory and restored on its next turn); Pcr the compressed and index key caches declared
+# replicated, so a host-tier entry holds one copy rather than one a rank
+# (RADIANCE_EXPERIMENTAL_DS41_KV_REPLICATED; a deepseek41 plugin from claude/ds41-eors, run home
+# home-eors). The harness receipt is Uharness (work/extra-prompts/harness-receipt.json: two
+# interleaved agent sessions, a system prompt of 2-3K tokens and tool outputs of public texts from
+# the repository, 6 and 7 turns, final contexts of about 8K and 10K tokens) at Lm32768, whose pool
+# holds both without a trim; Uharness1 is its first session alone. Each Pc* arm's startup and
+# shutdown lines for these go into window.log, and --ttft at the end reads per-turn TTFT, the
+# tokens the cache supplied and identity against the first arm (the cold one), with Kh arms'
+# prefill hashes compared prompt by prompt.
+#
 # Exact tall passes (RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL): Xt sets the switch (every other arm runs
 # with it 0) and BTN the step, --max-num-batched-tokens N (16 otherwise), e.g. ...-M32-...-Xt-BT32; an
 # Xt arm must log "exact tall passes" at startup and a plain one must not, or it is not measured. Kld
@@ -243,7 +262,25 @@ arm() {   # name, then env assignments for the server; CACHE_MIB the RAM cache (
   log "arm $name: serving after ${t}s"
   # A Pc arm: the prefix cache's startup lines (the snapshot store, the interval, the resume rule).
   [[ -z "${ARM_NOPC---no-prefix-cache}" ]] && \
-    grep -E 'host headroom|chunk geometry|prefix resume|prefix cache|checkpoint slots' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
+    grep -E 'host headroom|chunk geometry|prefix resume|prefix cache|checkpoint slots|end-of-request snapshots|snapshot store|kv tiers' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
+  # The harness parts (Pce, Pcl, PcbN, PcmN, Pcr): each switch's startup line in an arm that names
+  # it, and none in an arm that does not (a switch left set for the window), or the arm is not
+  # measured.
+  local hp_bad=""
+  hp_check() {   # part, set in this arm (1 or empty), the line that says it took effect
+    local n; n=$(grep -cE "$3" "$OUT/$name.server.log")
+    if [[ -n "$2" && "$n" == 0 ]]; then hp_bad+=" $1 asked, but no '$3' line;"; fi
+    if [[ -z "$2" && "$n" != 0 ]]; then hp_bad+=" no $1 part, but a '$3' line;"; fi
+  }
+  hp_check Pce "${ARM_EORS:-}" 'end-of-request snapshots: on'
+  hp_check Pcl "${ARM_SLRU:-}" 'snapshot store: by session'
+  hp_check PcbN "${ARM_STOREMIB:-}" 'checkpoint slots: a byte budget'
+  hp_check PcmN "${ARM_TIER:-}" "kv tiers: a finished conversation's KV is copied"
+  hp_check Pcr "${ARM_KVREP:-}" 'KV_REPLICATED: [0-9]+ paged group'
+  if [[ -n "$hp_bad" ]]; then
+    log "arm $name: not measured:$hp_bad $(grep -m2 -E 'end-of-request snapshots: refused|KV_REPLICATED refused' "$OUT/$name.server.log" | tr '\n' ' ')"
+    stop_server; return 1
+  fi
   # RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8 (the F8 parts): the plugin names the weights it reads from
   # E4M3 codes on each rank, and an arm must have exactly what its name says. An F8 arm whose
   # plugin did not take the knob, or a plain arm that took it from the window's environment, is
@@ -374,6 +411,7 @@ arm() {   # name, then env assignments for the server; CACHE_MIB the RAM cache (
   grep -E 'consumer skip: [0-9]+ (prefill|cut) passes|rank 0: consumer skip' "$OUT/$name.server.log" | tee -a "$OUT/window.log"   # Cs: what the cut ran
   grep -E 'prefill hash: seq [0-9]+, [0-9]+ tokens: all ranks' "$OUT/$name.server.log" | tee -a "$OUT/window.log"   # Kh: a digest a prompt
   grep -E 'DS41_DRAFT_GEMV' "$OUT/$name.server.log" | tail -2 | tee -a "$OUT/window.log"   # Dk/Dkt: calls taken
+  grep -E 'end-of-request snapshots: [0-9]+ reserved' "$OUT/$name.server.log" | tail -1 | tee -a "$OUT/window.log"   # Pce/Pcl: stored, hits, store
 }
 
 if [[ "$("${DOCKER[@]}" inspect "$NAME" --format '{{.State.Status}}' 2>/dev/null)" != running ]]; then
@@ -684,6 +722,7 @@ for a in $ARMS; do
   pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 HOST_POOL_MIB=4096 EXTRA_ARGS="" ARM_HOME="$RHOME" ARM_CONC=
   ARM_PROMPTS= ARM_N= ARM_LQ= rt=
   power="" skip="" ARGS=() f8="" f8x="" rb="" rbf=0 pred="" cs="" kh="" pc="" pcopt=""
+  hpe="" hpl="" hpb="" hpm="" hpr=""
   unset ARM_NOPC   # --no-prefix-cache unless a Pc part sets it empty
   for p in "${parts[@]:1}"; do
     case $p in
@@ -765,6 +804,11 @@ for a in $ARMS; do
       Pci[0-9]*) pcopt+=" $p"; ARGS+=(--checkpoint-interval "${p#Pci}") ;;                    # snapshot interval (2048)
       Pcs[0-9]*) pcopt+=" $p"; ARGS+=(--checkpoint-slots "${p#Pcs}") ;;                       # snapshot store slots (auto)
       Pcx)     pcopt+=" $p"; env+=(RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH=1) ;;           # publish only cold-cut chunks
+      Pce)     pcopt+=" $p"; hpe=1; env+=(RADIANCE_EXPERIMENTAL_PREFIX_EORS=1) ;;              # end-of-request snapshots
+      Pcl)     pcopt+=" $p"; hpl=1; env+=(RADIANCE_EXPERIMENTAL_PREFIX_SESSION_LRU=1) ;;       # snapshot store LRU by session
+      Pcb[0-9]*) pcopt+=" $p"; hpb=1; env+=(RADIANCE_EXPERIMENTAL_CHECKPOINT_STORE_MIB=${p#Pcb}) ;;   # snapshot store as N MiB
+      Pcm[0-9]*) pcopt+=" $p"; hpm=1; ARGS+=(--prefix-cache-mib "${p#Pcm}") ;;                 # host KV tier of N MiB
+      Pcr)     pcopt+=" $p"; hpr=1; env+=(RADIANCE_EXPERIMENTAL_DS41_KV_REPLICATED=1) ;;       # index/compressed caches replicated
       Pf)      env+=(RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE=1) ;;   # a prefill chunk alone in its step; decode rows batched
       N[0-9]*) ARGS+=(--max-num-seqs "${p#N}") ;;                     # this arm's --max-num-seqs (MAX_SEQS for every arm)
       C[0-9]*) ARM_CONC=${p#C} ;;                                     # this arm's requests sent K at a time (AB_CONCURRENCY)
@@ -850,6 +894,23 @@ for a in $ARMS; do
   fi
   [[ " ${env[*]} " == *" RADIANCE_EXPERIMENTAL_CACHE_HEADROOM_BACKED=1 "* ]] || env+=(RADIANCE_EXPERIMENTAL_CACHE_HEADROOM_BACKED=0)
   [[ " ${env[*]} " == *" RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH=1 "* ]] || env+=(RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH=0)
+  # The harness parts: combinations the engine refuses are skipped here, and every arm states each
+  # switch, so a window's VAR=val cannot turn one on for an arm whose name does not say it (arm()
+  # also checks the server's lines both ways).
+  if [[ -n "$hpe" && " ${env[*]} " == *" RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH=1 "* ]]; then
+    log "arm $a: Pce with Pcx (exact publish keeps out the decode-written blocks an end-of-request snapshot stands on; the engine refuses it); the arm is skipped"; skip=1
+  fi
+  if [[ -n "$hpe" && ( " ${ARGS[*]} " == *" --num-speculative-tokens "[1-9]* || " ${env[*]} " == *" RADIANCE_EXPERIMENTAL_DS41_DSPARK_RAD_BANK=1 "* ) ]]; then
+    log "arm $a: Pce with speculation (the engine refuses it); the arm is skipped"; skip=1
+  fi
+  if [[ -n "$hpb" && " ${ARGS[*]} " == *" --checkpoint-slots "* ]]; then
+    log "arm $a: PcbN with PcsN (a count given takes no byte budget); the arm is skipped"; skip=1
+  fi
+  [[ -n "$hpe" ]] || env+=(RADIANCE_EXPERIMENTAL_PREFIX_EORS=0)
+  [[ -n "$hpl" ]] || env+=(RADIANCE_EXPERIMENTAL_PREFIX_SESSION_LRU=0)
+  [[ -n "$hpb" ]] || env+=(RADIANCE_EXPERIMENTAL_CHECKPOINT_STORE_MIB=)
+  [[ -n "$hpr" ]] || env+=(RADIANCE_EXPERIMENTAL_DS41_KV_REPLICATED=0)
+  ARM_EORS=$hpe ARM_SLRU=$hpl ARM_STOREMIB=$hpb ARM_TIER=$hpm ARM_KVREP=$hpr
   # MrN: arms without it take jobs of the default 4 rows, whatever the window's environment (0 is
   # not this switch's off: any value outside 1-32 turns host experts off).
   [[ " ${env[*]} " == *" RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MAX_ROWS="* ]] || env+=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MAX_ROWS=4)

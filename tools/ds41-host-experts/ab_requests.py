@@ -39,6 +39,7 @@ A request is a completion body, with its prompt as text or token ids, or one of:
               an earlier request of the receipt, whose reply in this run is used, as a chat client
               sends the model's own answer back. Every text is tokenized on its own, so each turn's
               prompt starts with the previous turn's, token for token. The prompt ids are saved.
+              `chat_system` beside it: a system prompt, right after BOS (an agent harness's).
 
 The quality harness for the lossy track (RESEARCH-3-LOSSY.md, "Recommended order" 3; ab_window.sh's
 Lq part). Every distribution is the raw one, read from the logits before any sampler stage
@@ -115,14 +116,17 @@ def eos_id(url):
     return _eos[url]
 
 
-def chat_prompt(turns, url, replies, sent_back=None):
+def chat_prompt(turns, url, replies, sent_back=None, system=None):
     """The token ids of a chat_turns conversation (see the module's docstring). `replies`: earlier
     requests' rows by name. For each reply sent back, `sent_back` gets {from, ids, generated}: the
     reply text's own token count against the tokens the server generated for it. Equal counts
     mean the turn most likely repeats the generated ids, so its prompt runs on through the blocks
     the earlier request's decode steps wrote (the prefix cache's chain); fewer or more mean
-    re-tokenization changed them and the chain parts there."""
+    re-tokenization changed them and the chain parts there. `system`: a system prompt (the
+    request's chat_system), right after BOS, where the official encoding puts it."""
     ids = [BOS]
+    if system:
+        ids += tokenize(url, system)
     for i, t in enumerate(turns):
         ids += [USER] + tokenize(url, t["user"]) + [ASSISTANT, END_THINK]
         if "assistant" in t:
@@ -156,6 +160,7 @@ def framed(b, url, prompt_ids=None):
         if prompt_ids is None:
             raise ValueError("a chat_turns request: its prompt needs the earlier replies (one())")
         body.pop("chat_turns")
+        body.pop("chat_system", None)
         body["prompt"] = prompt_ids
     if os.environ.get("AB_MAX_TOKENS"):
         body["max_tokens"] = int(os.environ["AB_MAX_TOKENS"])
@@ -175,7 +180,8 @@ def one(b, url, replies=None):
     sent_back = []
     if "chat_turns" in b["request"]:
         try:
-            prompt_ids = chat_prompt(b["request"]["chat_turns"], url, replies or {}, sent_back)
+            prompt_ids = chat_prompt(b["request"]["chat_turns"], url, replies or {}, sent_back,
+                                     b["request"].get("chat_system"))
         except Exception as e:  # recorded, the next request still runs
             print("%s: ERROR building the prompt: %r" % (b["name"], e), flush=True)
             return {"name": b["name"], "family": family(b), "wall_s": 0.0, "text": None, "timings": {},
@@ -359,6 +365,37 @@ def ttft(d, arms):
             print("%-14s %7s" % (n, p if p is not None else "-") + "".join(cells))
         print("%-14s %7s" % ("sum", "") + "".join(
             "  %9.2f %6d %2d/%-2d" % (tot[a][0], tot[a][1], tot[a][2], tot[a][3]) for a in cols))
+        # Per session (a receipt family: a conversation, e.g. the harness receipt's hxA / hxB):
+        # turns, the prompt tokens sent, and per arm the TTFT summed, the tokens the cache
+        # supplied and the share of the prompt tokens they are, and the turns whose text is the
+        # first arm's. A session's later turns are what a harness pays for.
+        fams = []
+        for n in names:
+            f = next((data[a][n].get("family") for a in cols if n in data[a]), None)
+            if f is not None and f not in fams:
+                fams.append(f)
+        if len(fams) > 1 or any(data[a][n].get("prompt_ids") for a in cols for n in names if n in data[a]):
+            print("%-14s %7s %8s" % ("session", "turns", "prompt") +
+                  "".join("  [%d] ttft_s  cached  share same" % i for i in range(len(cols))))
+            for f in fams:
+                ns = [n for n in names if any(n in data[a] and data[a][n].get("family") == f for a in cols)]
+                prompt = 0
+                cells = []
+                for a in cols:
+                    st, sc, sp, ss, k = 0.0, 0, 0, 0, 0
+                    for n in ns:
+                        r = data[a].get(n)
+                        if not r or r.get("text") is None:
+                            continue
+                        t = r.get("timings") or {}
+                        st += (t.get("ttft_ms") if t.get("ttft_ms") is not None else t.get("prompt_ms") or 0.0) / 1e3
+                        sc += t.get("cache_n") or 0
+                        sp += t.get("prompt_n") or 0
+                        ss += r["text"] == data[ref_arm(data, cols, n)][n].get("text")
+                        k += 1
+                    prompt = max(prompt, sp)
+                    cells.append("  %9.2f %7d %5.1f%% %2d/%-2d" % (st, sc, 100.0 * sc / sp if sp else 0.0, ss, k))
+                print("%-14s %7d %8d" % (f, len(ns), prompt) + "".join(cells))
         for i, a in enumerate(cols):
             rows = [data[a][n] for n in names if n in data[a]]
             seen, reps = {}, []
@@ -384,6 +421,9 @@ def ttft(d, arms):
                       s.get("hit_cut_tokens"), s.get("publish_held_tokens"),
                       s.get("prefix_evictions"), json.dumps(s.get("ckpt_evictions")),
                       s.get("ckpt_refused")))
+            if s.get("eors") is not None or s.get("snapshot_store") is not None:
+                print("[%d] eors %s snapshot_store %s" % (
+                    i, json.dumps(s.get("eors")), json.dumps(s.get("snapshot_store"))))
 
 
 def kld_corpus(out, maxchars, receipts):

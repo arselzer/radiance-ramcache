@@ -165,7 +165,7 @@ int HostExpertPool::submit(const Job* jobs, int n, Ticket* t) {
     }
     /* Counted before any job is visible, so a waiter never sees zero while one is still to come. */
     t->left.fetch_add(n, std::memory_order_relaxed);
-    std::lock_guard<std::mutex> lk(submit_mu_);
+    std::unique_lock<std::mutex> lk(submit_mu_);
     int slot = 0;
     for (int j = 0; j < n; ++j) {
         for (;;) {
@@ -194,6 +194,9 @@ int HostExpertPool::submit(const Job* jobs, int n, Ticket* t) {
         /* Publishes everything above: a worker reads the job only after claiming a tile. */
         s.claim.store((uint64_t)(uint32_t)seq << 32, std::memory_order_release);
     }
+    lk.unlock();
+    /* Outside the lock: waking ~40 sleeping workers takes the waker ~30 us, which another rank's
+     * submit need not wait out. */
     wake();
     return RAD_OK;
 }

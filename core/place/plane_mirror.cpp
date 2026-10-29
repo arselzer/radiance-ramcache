@@ -49,6 +49,8 @@ PlaneMirror* PlaneMirror::get() {
             p->share_ = std::clamp(std::atof(s), 0.0, 0.31);
         if (const char* s = std::getenv("RADIANCE_EXPERIMENTAL_DS41_PLANE_MIRROR_MIN_ROWS"); s && *s)
             p->min_rows_ = std::max(1, std::atoi(s));
+        if (const char* s = std::getenv("RADIANCE_EXPERIMENTAL_DS41_PLANE_MIRROR_FAULT"); s && *s)
+            p->fault_ = std::max(1, std::atoi(s)) - 1;
         if (!p->open(dir)) {
             RAD_WARN("plane mirror: %s gives no usable DeepSeek-V4.1 expert planes; reading the "
                      "container only", dir);
@@ -58,6 +60,16 @@ PlaneMirror* PlaneMirror::get() {
         return p;
     }();
     return m;
+}
+
+PlaneMirror::~PlaneMirror() {
+    for (Shard& sh : shards_)
+        if (sh.fd >= 0) ::close(sh.fd);
+}
+
+void PlaneMirror::turn_off(int rc) {
+    if (on_.exchange(false))
+        RAD_WARN("plane mirror: a read failed (%d); every plane comes from the container from now on", rc);
 }
 
 bool PlaneMirror::open(const std::string& dir) {
@@ -78,22 +90,28 @@ bool PlaneMirror::open(const std::string& dir) {
         sh.fd = ::open(sh.path.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
         struct stat st{};
         uint64_t hlen = 0;
+        const int idx = (int)shards_.size();
+        shards_.push_back(sh);              /* the destructor closes it, whatever happens next */
         if (sh.fd < 0 || ::fstat(sh.fd, &st) != 0 || ::pread(sh.fd, bounce(kAlign), kAlign, 0) != kAlign)
             return false;
         std::memcpy(&hlen, bounce(kAlign), 8);
-        sh.size = st.st_size;
-        sh.mtime_ns = (int64_t)st.st_mtim.tv_sec * 1000000000 + st.st_mtim.tv_nsec;
-        const int idx = (int)shards_.size();
+        shards_.back().size = st.st_size;
+        shards_.back().mtime_ns = (int64_t)st.st_mtim.tv_sec * 1000000000 + st.st_mtim.tv_nsec;
+        shards_.back().ctime_ns = (int64_t)st.st_ctim.tv_sec * 1000000000 + st.st_ctim.tv_nsec;
         for (const StTensor& t : f.tensors()) {
             int layer = -1, expert = -1;
             char tail[32] = {};
             if (std::sscanf(t.name.c_str(), "layers.%d.ffn.experts.%d.%31s", &layer, &expert, tail) != 3 ||
                 std::strcmp(tail, "w3.weight") != 0)
                 continue;
-            index_[std::to_string(layer) + "." + std::to_string(expert)] =
-                Ref{ idx, 8 + hlen + t.offset, t.bytes };
+            /* One copy of each expert: two would leave the choice to the directory's order. */
+            if (!index_.emplace(std::to_string(layer) + "." + std::to_string(expert),
+                                Ref{ idx, 8 + hlen + t.offset, t.bytes }).second) {
+                RAD_WARN("plane mirror: %s holds layer %d expert %d's w3 a second time", sh.path.c_str(),
+                         layer, expert);
+                return false;
+            }
         }
-        shards_.push_back(std::move(sh));
     }
     if (index_.empty()) return false;
     RAD_INFO("plane mirror: %zu shards in %s hold %zu experts' up-projection codes; a missed "
@@ -113,25 +131,26 @@ bool PlaneMirror::unchanged(int shard) const {
     const Shard& sh = shards_[(size_t)shard];
     struct stat st{};
     return ::fstat(sh.fd, &st) == 0 && st.st_size == sh.size &&
-           (int64_t)st.st_mtim.tv_sec * 1000000000 + st.st_mtim.tv_nsec == sh.mtime_ns;
+           (int64_t)st.st_mtim.tv_sec * 1000000000 + st.st_mtim.tv_nsec == sh.mtime_ns &&
+           (int64_t)st.st_ctim.tv_sec * 1000000000 + st.st_ctim.tv_nsec == sh.ctime_ns;
 }
 
 int PlaneMirror::read(const Ref& r, uint64_t from, uint64_t bytes, uint8_t* dst) {
     if (r.shard < 0 || (size_t)r.shard >= shards_.size() || !dst || from + bytes > r.bytes)
         return RAD_E_INVAL;
+    if (!on()) return RAD_E_STATE;
+    if (fault_.load(std::memory_order_relaxed) >= 0 && fault_.fetch_sub(1) == 0) return RAD_E_IO;
     if (!unchanged(r.shard)) return RAD_E_STATE;
     const auto t0 = std::chrono::steady_clock::now();
     const int64_t off = (int64_t)(r.off + from), lo = off / kAlign * kAlign;
     const int64_t len = (off + (int64_t)bytes + kAlign - 1) / kAlign * kAlign - lo;
     uint8_t* b = bounce(len);
     if (!b) return RAD_E_NOMEM;
-    for (int64_t done = 0; done < len;) {
+    /* The rounding may run past the shard's end: stop once what was asked for has arrived, before
+     * a pread at the end of the file (unaligned there) is issued at all. */
+    for (int64_t done = 0; done < len && done < off - lo + (int64_t)bytes;) {
         const ssize_t n = ::pread(shards_[(size_t)r.shard].fd, b + done, (size_t)(len - done), lo + done);
-        if (n <= 0) {
-            /* The rounding may run past the shard's end: what was asked for must have arrived. */
-            if (n == 0 && done >= off - lo + (int64_t)bytes) break;
-            return RAD_E_IO;
-        }
+        if (n <= 0) return RAD_E_IO;
         done += n;
     }
     std::memcpy(dst, b + (off - lo), (size_t)bytes);

@@ -647,6 +647,12 @@ bool FileStager::will_issue(int32_t li) const {
 int FileStager::start(int32_t li) {
     //EVERY full-layer/read-ahead/repeated-slice path acquires the complete buffer here.
     RAD_TRY(head_revoke());
+    if (hx_capped_) {
+        RAD_ERR("host experts: layer %d needs the card's copy path (no live routing witness, or a "
+                "sliced pass), and RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS left it no room; "
+                "run without the cap", layers_[(size_t)li].layer);
+        return RAD_E_STATE;
+    }
     const int b = li & 1;
     if (holds_[b] >= 0) return RAD_E_STATE;     /* released before the next read, by construction */
     const int32_t layer = layers_[(size_t)li].layer;
@@ -732,7 +738,9 @@ int FileStager::start_ep_routed(int32_t li, RadStream s, bool* read) {
     /* The access trace takes want_ before the CPU split; its record is written after the stage
      * below, with the stage's drive reads. */
     if (trace_fp_) trace_units_ = want_;
-    if (defer) {
+    /* Deferred only if every selected unit can go to the CPU: the card gets aliases for all. */
+    if (defer && std::all_of(want_.begin(), want_.end(),
+                             [&](int32_t u) { return mover_->host_planes_eligible(u); })) {
         staged_[b].clear();
         mover_->alias_file_units(skip_, buf_[b], &staged_[b]);
         mover_->alias_file_units(want_, buf_[b], &staged_[b]);
@@ -740,9 +748,8 @@ int FileStager::start_ep_routed(int32_t li, RadStream s, bool* read) {
         pending_[b] = false;
         if (!staged_[b].empty()) holds_[b] = li;
         hx_defer_li_ = want_.empty() ? -1 : li;
-        if (trace_fp_) trace_layer(L.layer, 0);
+        if (trace_fp_ && want_.empty()) trace_layer(L.layer, 0);   /* else hx_deferred writes it */
         ++ep_stats_.reads;
-        ep_stats_.units += want_.size();
         if (!total) ++ep_stats_.zero_local;
         *read = true;
         return RAD_OK;
@@ -807,6 +814,12 @@ int FileStager::start_routed(int32_t li, RadStream s, bool* read) {
     //Generic/global rows cannot authorize the fixed local96/query6 reservation.
     RAD_TRY(head_revoke());
     *read = false;
+    if (hx_capped_) {
+        RAD_ERR("host experts: layer %d's pass of %lld tokens needs the card's copy path, and "
+                "RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS left it no room; run without the cap",
+                layers_[(size_t)li].layer, (long long)pass_tok_);
+        return RAD_E_STATE;
+    }
     const Layer& L = layers_[(size_t)li];
     int64_t ne = 0, top_k = 0;
     const int32_t* row = counts_ ? counts_(L.layer, &ne, &top_k) : nullptr;
@@ -889,9 +902,12 @@ int FileStager::hx_init(const Program& prog) {
     const char* cap = std::getenv("RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS");
     if (!cap || std::atoi(cap) <= 0 || layers_.empty()) return RAD_OK;
     bool every = hx_pool_ != nullptr;
-    for (size_t li = 0; every && li < layers_.size(); ++li)
+    for (size_t li = 0; every && li < layers_.size(); ++li) {
         every = li < ep_layer_eligible_.size() && ep_layer_eligible_[li] && li < hx_ops_.size() &&
                 hx_ops_[li].gu >= 0;
+        for (int32_t u : layers_[li].units)   /* a unit the CPU cannot read would need the card */
+            every = every && mover_->host_planes_eligible(u);
+    }
     if (!every || !hx_defer_ok_ || hx_miss_rows_ < kEpRouteMaxRows || prog.ctx.max_tok > kEpRouteMaxRows) {
         RAD_ERR("RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS=%s: the file buffers then hold no layer's "
                 "units, so the CPU must compute every routed unit of every pass: host experts with "
@@ -900,6 +916,7 @@ int FileStager::hx_init(const Program& prog) {
                 (long long)kEpRouteMaxRows);
         return RAD_E_INVAL;
     }
+    hx_capped_ = true;
     if (plan_->rank == 0)
         RAD_INFO("host experts: file buffers capped at %s units; every routed unit is the CPU's", cap);
     return RAD_OK;
@@ -910,6 +927,7 @@ int FileStager::hx_init_impl(const Program& prog) {
     hx_pool_ = nullptr;
     hx_defer_ok_ = false;
     hx_defer_li_ = -1;
+    hx_capped_ = false;
     hx_ops_.assign(layers_.size(), HxOps{});
     /* The DSpark head tail owns the routed layers' file buffers and their copy budget. */
     if (head_.configured()) {
@@ -1330,7 +1348,7 @@ int FileStager::hx_submit_misses() {
         std::lock_guard<std::mutex> lk(hx_bg_mu_);
         for (auto& p : hx_miss_) hx_bg_q_.push_back(p);
     }
-    hx_bg_cv_.notify_one();
+    hx_bg_cv_.notify_all();
     return RAD_OK;
 }
 
@@ -1469,7 +1487,10 @@ int FileStager::hx_warm() {
         return plan_->units[(size_t)a].profile_share > plan_->units[(size_t)b].profile_share;
     });
     const int64_t pair = HostExpertPool::kGuBytes + HostExpertPool::kDnBytes + 6 * 64;
-    const int64_t fit = mover_->mapped_cache_bytes() / pair;
+    /* The slabs are pinned first (a refused one stops the growth), so the set is what the cache
+     * really holds: an estimate that overshot would drop the hottest, inserted last. */
+    const int64_t slots = mover_->mapped_cache_pregrow();
+    const int64_t fit = slots > 0 ? slots : mover_->mapped_cache_bytes() / pair;
     if ((int64_t)units.size() > fit) units.resize((size_t)std::max<int64_t>(fit, 0));
     std::reverse(units.begin(), units.end());
     size_t done = 0;
@@ -1523,6 +1544,7 @@ int FileStager::hx_deferred(int32_t li, RadStream s) {
                 "has only aliases for them", layers_[(size_t)li].layer, want_.size(), selected);
         return RAD_E_STATE;
     }
+    if (trace_fp_) trace_layer(layers_[(size_t)li].layer, 2 * (uint32_t)hx_miss_.size());
     if (hx_li_ != li) return RAD_OK;
     RAD_TRY(hx_submit());
     RAD_TRY(hx_submit_misses());

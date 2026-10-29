@@ -11,14 +11,18 @@
  * decode miss, bound by its slowest read's latency, does not (decode -4%), so by default only
  * passes of 2+ tokens use it.
  *
- * Reads only. The mirror is trusted no further than checked: its shards' size and modification
- * time are taken at open and compared around every read, and Mover samples units of every rank
- * against the container before it uses the mirror at all.
+ * Reads only. The mirror is trusted no further than checked: its shards' size, modification and
+ * change times are taken at open and compared around every read, every expert must appear once,
+ * and Mover samples units of every rank against the container before it uses the mirror at all.
+ * A read that fails turns the mirror off for the process; the reader takes those bytes from the
+ * container instead.
  *
  * RADIANCE_EXPERIMENTAL_DS41_PLANE_MIRROR=<directory of model-*.safetensors>;
  * RADIANCE_EXPERIMENTAL_DS41_PLANE_MIRROR_SHARE=<fraction of a unit's bytes> (0.18; at most the
- * whole of w3, 0.31); ..._MIN_ROWS=<tokens> (2): the smallest pass that reads the mirror. */
+ * whole of w3, 0.31); ..._MIN_ROWS=<tokens> (2): the smallest pass that reads the mirror;
+ * ..._FAULT=<n>: the n-th read fails, a test of the fallback to the container. */
 #pragma once
+#include <atomic>
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -45,20 +49,26 @@ public:
      * the SATA stripe's reads, alone or queued behind other ranks', come back later than the NVMe
      * drive's larger share (measured: decode -4% at an 18% share, prefill TTFT -10%). */
     int min_rows() const { return min_rows_; }
+    /* False once a read failed: the readers then take every byte from the container. */
+    bool on() const { return on_.load(std::memory_order_acquire); }
+    void turn_off(int rc);
 
     struct Stats { uint64_t reads = 0, bytes = 0, ns = 0; };
     Stats stats() const;
 
 private:
     PlaneMirror() = default;
+    ~PlaneMirror();
     bool open(const std::string& dir);
     bool unchanged(int shard) const;
 
-    struct Shard { std::string path; int fd = -1; int64_t size = 0, mtime_ns = 0; };
+    struct Shard { std::string path; int fd = -1; int64_t size = 0, mtime_ns = 0, ctime_ns = 0; };
     std::vector<Shard> shards_;
     std::unordered_map<std::string, Ref> index_;     /* "L.E" -> w3 codes */
     double share_ = 0.18;
     int    min_rows_ = 2;
+    std::atomic<bool> on_{ true };
+    std::atomic<int64_t> fault_{ -1 };   /* ..._FAULT=N: the N-th read fails (tests the fallback) */
     mutable std::mutex stats_mu_;
     Stats stats_;
 };

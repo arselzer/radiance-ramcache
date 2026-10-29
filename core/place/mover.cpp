@@ -820,11 +820,11 @@ bool Mover::read_unit_planes(HostPlanes* const* units, int n, int rows) {
      * before the reads and after them. */
     if (!source_file_epoch()) return false;
     /* A container extent [off, off+len) into dst (cap bytes there), or with m the mirror's bytes
-     * [from, from+len) of *m. */
+     * [from, from+len) of *m, which are the container's extent if the mirror fails. */
     struct Read { uint32_t file; int64_t off, len; uint8_t* dst; int64_t cap;
                   const PlaneMirror::Ref* m; uint64_t from; };
     std::vector<Read> reads;
-    PlaneMirror* const mirror = mirror_tail_ > 0 && PlaneMirror::get() &&
+    PlaneMirror* const mirror = mirror_tail_ > 0 && PlaneMirror::get() && PlaneMirror::get()->on() &&
         rows >= PlaneMirror::get()->min_rows() ? PlaneMirror::get() : nullptr;
     const int64_t A = DirectFile::alignment();
     int weights = 0;
@@ -874,8 +874,8 @@ bool Mover::read_unit_planes(HostPlanes* const* units, int n, int rows) {
             if (m) {
                 const int64_t codes = (int64_t)w.file_plane_offset[0] - a0;
                 const int64_t end = codes + (int64_t)(2 * m->bytes), cut = end - mirror_tail_;
-                reads.insert(reads.begin(), Read{ 0, 0, mirror_tail_, p->buf[k] + cut, mirror_tail_,
-                                                  m, m->bytes - (uint64_t)mirror_tail_ });
+                reads.insert(reads.begin(), Read{ w.file_id, a0 + cut, mirror_tail_, p->buf[k] + cut,
+                                                  mirror_tail_, m, m->bytes - (uint64_t)mirror_tail_ });
                 reads.push_back(Read{ w.file_id, a0, cut, p->buf[k], cut, nullptr, 0 });
                 reads.push_back(Read{ w.file_id, a0 + end, hi - a0 - end, p->buf[k] + end,
                                       p->cap[k] - end, nullptr, 0 });
@@ -903,11 +903,27 @@ bool Mover::read_unit_planes(HostPlanes* const* units, int n, int rows) {
     }
     reader();
     for (std::thread& t : th) t.join();
+    /* A mirror read that failed: the mirror is off for good, and the container has the bytes. */
+    for (size_t j = 0; j < reads.size(); ++j)
+        if (reads[j].m && rc[j] < 0) {
+            mirror->turn_off(rc[j]);
+            const Read& r = reads[j];
+            rc[j] = read_source_file(r.file, (uint64_t)r.off, r.len, r.dst, r.cap);
+        }
     host_plane_read_ns_.fetch_add((uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
                                       std::chrono::steady_clock::now() - t0).count(), std::memory_order_relaxed);
     host_plane_reads_.fetch_add((uint64_t)weights, std::memory_order_relaxed);
     for (int r : rc) if (r < 0) return false;
     return source_file_epoch();
+}
+
+int64_t Mover::mapped_cache_pregrow() {
+    if (!mapped_file_cache_on_) return 0;
+    size_t slabs = 0;
+    if (mapped_file_cache_.pregrow(&slabs) < 0) return 0;
+    const auto st = mapped_file_cache_.stats();
+    if (!st.slab_policy) return 0;
+    return (int64_t)std::min(st.slabs.classes[0].capacity_slots, st.slabs.classes[1].capacity_slots);
 }
 
 int Mover::mirror_init() {

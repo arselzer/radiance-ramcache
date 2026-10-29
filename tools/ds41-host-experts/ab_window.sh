@@ -34,7 +34,7 @@ R=/home/as/radiance-setup/research/deepseek-v41-1017-20261024
 MODEL=$R/native-models/ds41-native-mxfp4-v3-20261027T121600Z/model.rad
 MIRROR=${MIRROR:-/srv/bulk/source-copies/ds41-native-mxfp4/d8b2e3c20f5f4b6d5044d37f20b8d53f260f83e466f72259572be76d7e756bf3-main}
 PROFILE=$R/ds41-dev-window-profile-calibration-20261028T034300Z/sealed-decode-profile.json
-PROMPTS=$R/ds41-pack-tail-dev-window-tail1-heldout-20261028T085400Z/receipt.json
+PROMPTS=${PROMPTS:-$R/ds41-pack-tail-dev-window-tail1-heldout-20261028T085400Z/receipt.json}
 PORT=18089
 DOCKER=(/usr/bin/sudo -n /usr/bin/docker)
 NAME=radiance-flashnext
@@ -89,7 +89,7 @@ restore() {
 
 arm() {   # name, then env assignments for the server; CACHE_MIB the RAM cache (default 81920)
   local name=$1; shift
-  local n=8; [[ "$name" == verify* ]] && n=$VERIFY_REQUESTS
+  local n=${AB_REQUESTS:-8}; [[ "$name" == verify* ]] && n=$VERIFY_REQUESTS
   log "arm $name: $*"
   env "$@" RADIANCE_EXPERIMENTAL_NATIVE_CACHE_MAPPED_SLABS=1 RADIANCE_EXPERIMENTAL_NATIVE_CACHE_MAPPED_SOURCE=1 \
       RADIANCE_EXPERIMENTAL_DS41_MXFP4_PACK_SSE2=1 \
@@ -173,7 +173,7 @@ for a in $ARMS; do
 # RAM cache's slabs at startup; R / RNN read part of each missed expert from the checkpoint's
 # safetensors on /srv/bulk ($MIRROR; share 0.NN, default 0.18); BN cap the VRAM file buffers at N
 # units (the CPU must take every routed unit: all, M16); W warm the RAM cache from the expert
-# profile before serving.
+# profile before serving; ZN fail the N-th plane mirror read (tests the fallback to the container).
   IFS=- read -r -a parts <<< "$a"
   pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 HOST_POOL_MIB=4096 EXTRA_ARGS="" ARM_HOME="$RHOME"
   for p in "${parts[@]:1}"; do
@@ -193,6 +193,7 @@ for a in $ARMS; do
       G)       env+=(RADIANCE_EXPERIMENTAL_NATIVE_CACHE_PREGROW=1) ;;
       B[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS=${p#B}) ;;
       W)       env+=(RADIANCE_EXPERIMENTAL_DS41_CACHE_WARM=1) ;;
+      Z[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_PLANE_MIRROR_FAULT=${p#Z}) ;;
       R)       env+=(RADIANCE_EXPERIMENTAL_DS41_PLANE_MIRROR=$MIRROR) ;;
       R[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_PLANE_MIRROR=$MIRROR RADIANCE_EXPERIMENTAL_DS41_PLANE_MIRROR_SHARE=0.${p#R}) ;;
       Ps[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_PREFETCH=shadow RADIANCE_EXPERIMENTAL_DS41_PREFETCH_K=${p#Ps}) ;;

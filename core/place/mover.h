@@ -631,6 +631,9 @@ public:
     bool  read_weight_file(const WeightInfo& w, void* dst);
     bool  mapped_cache_on() const { return mapped_file_cache_on_; }
     int64_t mapped_cache_bytes() const { return mapped_file_cache_on_ ? cfg_.native_file_cache_bytes : 0; }
+    /* Pins the mapped cache's slabs (as ..._PREGROW does; again adds nothing) and returns the
+     * pairs it can hold: the fewer of its gate_up and down slots. 0 without slabs. */
+    int64_t mapped_cache_pregrow();
     /* Whether the mapped RAM cache holds every weight of unit u, without touching it. */
     bool  unit_cached(int32_t u);
     int   insert_unit_planes(const HostPlanes& p, std::vector<uint8_t>* scratch);

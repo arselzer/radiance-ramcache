@@ -421,6 +421,8 @@ private:
      * been given aliases for all of them. hx_defer_li_: the layer waiting, or -1. */
     bool    hx_defer_ok_ = false;
     int32_t hx_defer_li_ = -1;
+    /* RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS was accepted: the card's copy path has no room. */
+    bool    hx_capped_ = false;
     std::unique_ptr<Mover::HostUnit[]> hx_units_;
     int  hx_n_ = 0;                               /* slots used; a released one has n == 0 */
     int64_t hx_reserved_ = 0;                     /* pool backlog reserved, not yet submitted */

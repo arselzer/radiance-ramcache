@@ -33,7 +33,7 @@ def run(receipt, url, n, out):
         rows.append({"name": b["name"], "wall_s": wall, "text": text, "timings": t,
                      "error": resp.get("error")})
         print("%s: %.1f s, decode %.2f tok/s, prefill %.0f ms%s" % (
-            b["name"], wall, t.get("predicted_per_second", 0.0), t.get("prompt_ms", 0.0),
+            b["name"], wall, t.get("predicted_per_second") or 0.0, t.get("prompt_ms") or 0.0,
             "" if text is not None else " ERROR %s" % resp.get("error")), flush=True)
     stats = None
     try:
@@ -65,9 +65,9 @@ def compare(d, arms):
                 cells.append("%18s" % "-")
                 continue
             same = r["text"] == data[first][n]["text"] if n in data[first] else False
-            tps = r["timings"].get("predicted_per_second", 0.0)
-            tot[a][0] += r["timings"].get("predicted_ms", 0.0)
-            tot[a][1] += r["timings"].get("predicted_n", 0)
+            tps = r["timings"].get("predicted_per_second") or 0.0
+            tot[a][0] += r["timings"].get("predicted_ms") or 0.0
+            tot[a][1] += r["timings"].get("predicted_n") or 0
             cells.append("%12.2f %5s" % (tps, "same" if same else "DIFF"))
         print("%-12s" % n + "".join(cells))
     print("%-12s" % "decode" + "".join(

@@ -26,13 +26,16 @@
  * The use-order list is the order a decode step issues the ops that read them (deepseek41.cpp
  * step(): the compressor's GEMM goes first, then the query and key chains with the indexer
  * between them, the sparse attention, wo_a's groups, wo_b; then the MoE block's router, the shared
- * expert's gate|up behind the routed one, its down behind the routed down). With the dense
- * linears in FP8 (claude/ds41-fp8-dense: half these bytes) more of the list fits a budget.
+ * expert's gate|up behind the routed one, its down behind the routed down).
  *
  * Sizes a card at TP4, bf16: q_a 12.5 MiB, kv 5, q_b 20, wo_a 2 x 8, wo_b 20 (73.5 in all); the
  * f32 compressor 20 (ratio 2: layers 2, 8, 14) or 5 (bf16, ratio 1: layer 20); the indexer's q_b
  * 10 (index sources 2, 8, 14, 20, 24, 28, 32, 36); the f32 router 7.5; the shared expert's gate|up
- * 15 / 10 and down 7.5 / 5 (rank 0 / ranks 1-3); engram_kv 75 (split over the ranks, 300 whole). */
+ * 15 / 10 and down 7.5 / 5 (rank 0 / ranks 1-3); engram_kv 75 (split over the ranks, 300 whole).
+ * With RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8=1 (+12.7%) every one of these but the compressor and the
+ * router is read from its E4M3 codes, half the bytes: the attention's five 36.75, and 56 MiB then
+ * covers the whole list through the shared expert (rank 0 55.5 MiB a layer) where the four reads
+ * alone are 26.75. */
 #pragma once
 #include <cstdint>
 #include <cstdlib>

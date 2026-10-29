@@ -1163,11 +1163,11 @@ static void pf_layer(RadBuilder* b, Model& m, Layer& L) {
         case pf::kRt:   /* GlmRouter's f32 projection under the sigmoid router, else bf16 */
             put(k, L.moe.w_router, L.moe.c.n_expert_all * D * (L.moe.c.sigmoid_router ? 4 : 2));
             break;
-        /* This rank's slice of the shared expert, bf16. (With the FP8 dense weights a slice
-         * LinearFP8::bf16_alt reads holds its N * K code bytes, as wbytes() says for linear().) */
-        case pf::kSgu: if (sgu.bf16) put(k, sgu.w, sgu.N * sgu.K * 2); break;
+        /* This rank's slice of the shared expert: bf16, or its E4M3 codes where gemm_nt_bf16f8
+         * reads it (LinearFP8::bf16_alt, ..._DENSE_FP8), as wbytes() counts linear()'s. */
+        case pf::kSgu: if (sgu.bf16) put(k, sgu.w, sgu.N * sgu.K * (sgu.bf16_alt ? 1 : 2)); break;
         case pf::kMf: put(k, L.hc_f_fn, mix * c.hc * D * 4); break;
-        case pf::kSdn: if (sdn.bf16) put(k, sdn.w, sdn.N * sdn.K * 2); break;
+        case pf::kSdn: if (sdn.bf16) put(k, sdn.w, sdn.N * sdn.K * (sdn.bf16_alt ? 1 : 2)); break;
         default: break;
         }
     }

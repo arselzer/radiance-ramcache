@@ -33,7 +33,8 @@ const char* const kVars[] = { "RADIANCE_EXPERIMENTAL_DS41_PREFETCH_ATTN",
                               "RADIANCE_EXPERIMENTAL_DS41_PREFETCH_MIB",
                               "RADIANCE_EXPERIMENTAL_DS41_PREFETCH_SET",
                               "RADIANCE_EXPERIMENTAL_DS41_PREFETCH_ENGRAM",
-                              "RADIANCE_EXPERIMENTAL_DS41_ENGRAM_SPLIT" };
+                              "RADIANCE_EXPERIMENTAL_DS41_ENGRAM_SPLIT",
+                              "RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8" };
 /* The variables a case sets, every other one unset, for the case's declares. */
 struct Env {
     Env(std::initializer_list<std::pair<const char*, const char*>> kv) {
@@ -113,11 +114,23 @@ struct Decl {
     deepseek41::Model* m = nullptr;
 };
 /* deepseek41's declare for `rank` of four, decode-sized (16 rows a step), under the current
- * environment; its stderr (the plan line) kept in `err`. */
-std::unique_ptr<Decl> declare(int rank) {
+ * environment; its stderr (the plan line) kept in `err`. `fp8`: the checkpoint states its dense
+ * linears are E4M3 with an E8M0 scale a 32x32 block and stores them as plain bf16, as the release's
+ * container does, so ..._DENSE_FP8=1 takes them (dense_f8_gate, lw8). */
+std::unique_ptr<Decl> declare(int rank, bool fp8 = false) {
     auto d = std::make_unique<Decl>();
     d->b.kv_block_of = block_of;
     MetaKV meta = flash_meta();
+    if (fp8) {
+        meta.set("imported_quantization_config.quant_method", "fp8")
+            .set("imported_quantization_config.scale_fmt", "ue8m0")
+            .set("imported_quantization_config.weight_block_size", "32,32");
+        const RadEncoding plain = rad_enc_plain(RAD_BF16);
+        for (const char* n : { "attn_q_a.weight", "attn_kv.weight", "attn_q_b.weight", "attn_output_a.",
+                               "attn_output_b.weight", "engram_kv.weight", "ffn_gate_up_shexp.weight",
+                               "ffn_down_shexp.weight" })
+            d->b.encs.push_back({ n, plain });
+    }
     RadBuildCtx ctx = build_ctx(rank, kWorld);
     ctx.max_tok = 16;
     d->err = stderr_of([&] { d->rc = deepseek41::declare(&d->b, meta.meta(), &ctx); });
@@ -330,6 +343,57 @@ TEST(ds41_prefetch_engram_layers_read_around_their_gemm) {
         CHECK(L[1].pf.empty() && L[14].pf.empty());
         CHECK(reads_are(L[1].pf_post, pf_kinds{ pk::kQa, pk::kKv, pk::kQb, pk::kOa, pk::kOa }));
         CHECK(reads_are(L[14].pf_post, pf_kinds{ pk::kQa, pk::kKv, pk::kQb, pk::kOa, pk::kOa }));
+    }
+}
+
+/* With the dense linears read from their E4M3 codes (..._DENSE_FP8=1) every read but the f32
+ * compressor's and router's is half the bytes, so the same 56 MiB reach the shared expert's down. */
+TEST(ds41_prefetch_fp8_codes_fit_the_whole_list) {
+    {
+        Env env({ { "RADIANCE_EXPERIMENTAL_DS41_PREFETCH_ATTN", "1" },
+                  { "RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8", "1" } });
+        auto d = declare(0, true);
+        REQUIRE_EQ(d->rc, (int)RAD_OK);
+        REQUIRE(d->m->f8_on);
+        /* The switch alone: the same four reads at their codes' bytes, 26.75 MiB. */
+        const auto& L = d->m->layers;
+        REQUIRE(reads_are(L[3].pf, pf_kinds{ pk::kQa, pk::kKv, pk::kQb, pk::kOa, pk::kOa }));
+        CHECK_EQ(L[3].pf[0].bytes, (int64_t)1280 * 5120);
+        CHECK_EQ(L[3].pf[2].bytes, (int64_t)8192 * 1280);
+        CHECK_EQ(total(L[3].pf), 107 * MiB / 4);
+    }
+    Env env({ { "RADIANCE_EXPERIMENTAL_DS41_PREFETCH_ATTN", "1" },
+              { "RADIANCE_EXPERIMENTAL_DS41_PREFETCH_MIB", "56" },
+              { "RADIANCE_EXPERIMENTAL_DS41_PREFETCH_ENGRAM", "1" },
+              { "RADIANCE_EXPERIMENTAL_DS41_ENGRAM_SPLIT", "1" },
+              { "RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8", "1" } });
+    for (int rank = 0; rank < kWorld; ++rank) {
+        auto d = declare(rank, true);
+        REQUIRE_EQ(d->rc, (int)RAD_OK);
+        REQUIRE(d->m->f8_on);
+        const auto& L = d->m->layers;
+        const int64_t w = rank == 0 ? 768 : 512;
+        const pf_kinds all{ pk::kQa, pk::kKv, pk::kQb, pk::kOa, pk::kOa, pk::kOb, pk::kRt, pk::kSgu, pk::kSdn };
+        /* Layer 3: the five attention weights (36.75 MiB), the f32 router (7.5) and this rank's
+         * shared slice as codes: 55.5 MiB on rank 0, 51.25 on the others, every read whole. */
+        REQUIRE(reads_are(L[3].pf, all));
+        for (const auto& x : L[3].pf) CHECK(!x.cut);
+        CHECK_EQ(L[3].pf[7].bytes, 2 * w * 5120);
+        CHECK_EQ(L[3].pf[8].bytes, 5120 * w);
+        CHECK_EQ(total(L[3].pf), 147 * MiB / 4 + 15 * MiB / 2 + 3 * w * 5120);
+        /* Layer 2 starts with the f32 compressor (20 MiB) and the indexer's q_b, and cuts wo_b. */
+        REQUIRE(reads_are(L[2].pf, pf_kinds{ pk::kComp, pk::kQa, pk::kKv, pk::kIq, pk::kQb, pk::kOa,
+                                             pk::kOa, pk::kOb }));
+        CHECK_EQ(L[2].pf[0].bytes, (int64_t)1024 * 5120 * 4);
+        CHECK(L[2].pf[7].cut);
+        CHECK_EQ(total(L[2].pf), 56 * MiB);
+        /* Layer 1: all 37.5 MiB of its split engram_kv's codes ahead of the GEMM, the whole list
+         * behind it. */
+        REQUIRE(reads_are(L[1].pf, pf_kinds{ pk::kEkv }));
+        CHECK(!L[1].pf[0].cut);
+        CHECK_EQ(L[1].pf[0].bytes, (int64_t)6400 * 6144);
+        CHECK(reads_are(L[1].pf_post, all));
+        for (const auto& x : L) CHECK(reads_declared(d->b, x.pf) && reads_declared(d->b, x.pf_post));
     }
 }
 

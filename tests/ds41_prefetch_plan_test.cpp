@@ -2,7 +2,7 @@
  * RADIANCE_EXPERIMENTAL_DS41_PREFETCH_ATTN alone keeps the four attention reads 16be66c5 measured;
  * a budget reads the use-order list's first bytes, cutting the read that crosses it; ..._SET names
  * the reads and their order; malformed values are named and read as unset. The sizes are a TP4
- * card's of DeepSeek-V4.1-Flash, bf16 and (the dense linears in FP8) half that. */
+ * card's of DeepSeek-V4.1-Flash, bf16 and (..._DENSE_FP8: the linears' E4M3 codes) half that. */
 #include "rad_test.h"
 
 #include "../arch/deepseek41/ds41_prefetch_plan.h"

@@ -135,7 +135,9 @@ int PrefillStager::init(const Program& prog, const Plan& plan, Mover* mover, cha
  * are, and withdrawn if not. */
 bool PrefillStager::begin_pass(const RadBatch* b) {
     if (!b || b->draft_pass != 0) return false;
-    armed_ = want_ != nullptr && enabled() && b->n_tok >= min_rows_;
+    /* A pass the consumer skip cut (RadBatch::consumer_full) runs a prefix of the layers: declined,
+     * its pooled experts read in place, so nothing is copied ahead for a layer it skips. */
+    armed_ = want_ != nullptr && enabled() && b->n_tok >= min_rows_ && b->consumer_full == 0;
     staged_ = armed_;
     if (!armed_) {
         withdraw_early();
@@ -675,6 +677,7 @@ bool FileStager::begin_pass(const RadBatch* b) {
     pass_kind_ = b->draft_pass;
     last_issued_ = -1;
     pass_tok_ = b->n_tok;
+    pass_full_ = b->consumer_full > 0 ? b->consumer_full : INT32_MAX;
     hx_defer_li_ = -1;
     ++trace_pass_;
     if (rt_) rt_pass(b);
@@ -687,6 +690,7 @@ bool FileStager::begin_pass(const RadBatch* b) {
 }
 
 bool FileStager::will_issue(int32_t li) const {
+    if (!moe_runs(layers_[(size_t)li].layer)) return false;   /* a layer the cut skips */
     const auto it = pass_last_.find(pass_kind_);
     return it == pass_last_.end() || layers_[(size_t)li].first_op <= it->second;
 }
@@ -802,7 +806,8 @@ int FileStager::start_ep_routed(int32_t li, RadStream s, bool* read) {
      * cache leases go back now, not when a window next comes round (Mover::retire_file_windows). */
     if (hx) RAD_TRY(mover_->retire_file_windows());
     const auto t_retired = std::chrono::steady_clock::now();
-    if (hx && hx_pred_ && pass_tok_ == 1 && plan_->rank == 0 && !hx_pred_->pieces())
+    if (hx && hx_pred_ && pass_tok_ == 1 && plan_->rank == 0 && !hx_pred_->pieces() &&
+        moe_runs(L.layer + 1))
         hx_pred_->post(trace_pass_, L.layer, hx_x_);
     int64_t total = 0;
     if (!ep_route_counts_valid(v, counts_host_, counts_cap_, &total)) {
@@ -865,7 +870,7 @@ int FileStager::start_ep_routed(int32_t li, RadStream s, bool* read) {
         t_posted = t_submitted;
         /* Pieces mode: the prediction of layer L+2 once this layer's CPU work is out, so the
          * predictor's thread does not compete with the pool's wake-up. */
-        if (hx_ra_ && hx_pred_ && pass_tok_ == 1 && plan_->rank == 0) {
+        if (hx_ra_ && hx_pred_ && pass_tok_ == 1 && plan_->rank == 0 && moe_runs(L.layer + 2)) {
             hx_pred_->post(trace_pass_, L.layer, hx_x_);
             t_posted = std::chrono::steady_clock::now();
         }
@@ -873,7 +878,10 @@ int FileStager::start_ep_routed(int32_t li, RadStream s, bool* read) {
         rt_choice(li, false);   /* the card's copy path takes every selected file-tier unit */
     }
     /* This layer took its read-ahead entries: now the next layer's (predicted from this one). */
-    if (hx && hx_pf_.joinable() && pass_tok_ == 1) hx_pf_target(li + hx_pf_ahead_);
+    if (hx && hx_pf_.joinable() && pass_tok_ == 1 &&
+        (size_t)(li + hx_pf_ahead_) < layers_.size() &&
+        moe_runs(layers_[(size_t)(li + hx_pf_ahead_)].layer))
+        hx_pf_target(li + hx_pf_ahead_);
     const auto t_stage = std::chrono::steady_clock::now();
     ep_stats_.hx_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(t_stage - t_counts).count();
     if (hx && pass_tok_ == 1) {
@@ -1943,7 +1951,8 @@ int FileStager::hx_early_decide() {
     hx_stats_.early_wait_ns += sync_ns;
     RAD_TRY(mover_->retire_file_windows());
     const auto t_retired = std::chrono::steady_clock::now();
-    if (hx_pred_ && pass_tok_ == 1 && plan_->rank == 0)
+    if (hx_pred_ && pass_tok_ == 1 && plan_->rank == 0 &&
+        moe_runs(L.layer + (hx_pred_->pieces() ? 2 : 1)))
         hx_pred_->post(trace_pass_, L.layer, hx_x_);
     int64_t total = 0;
     if (!ep_route_counts_valid(hx_early_v_, counts_host_, counts_cap_, &total)) {
@@ -1980,7 +1989,9 @@ int FileStager::hx_early_decide() {
     if (hx_li_ == li) RAD_TRY(hx_submit());
     const auto t_submitted = std::chrono::steady_clock::now();
     /* This layer took its read-ahead entries: now the next layer's (predicted from this one). */
-    if (hx_pf_.joinable() && pass_tok_ == 1) hx_pf_target(li + hx_pf_ahead_);
+    if (hx_pf_.joinable() && pass_tok_ == 1 && (size_t)(li + hx_pf_ahead_) < layers_.size() &&
+        moe_runs(layers_[(size_t)(li + hx_pf_ahead_)].layer))
+        hx_pf_target(li + hx_pf_ahead_);
     const auto t_stage = std::chrono::steady_clock::now();
     ep_stats_.hx_ns += ns(t_counts, t_stage);
     if (pass_tok_ == 1) {
@@ -3008,7 +3019,8 @@ int FileStager::end_pass(RadStream s) {
     if (lost) RAD_ERR("host experts: layer %d's CPU rows reached no gather before the pass ended",
                       layers_[(size_t)(hx_early_li_ >= 0 ? hx_early_li_ : hx_li_)].layer);
     hx_drain();
-    pass_last_[pass_kind_] = last_issued_;
+    /* A cut pass ends early by design: its last op says nothing of where a whole pass ends. */
+    if (pass_full_ == INT32_MAX) pass_last_[pass_kind_] = last_issued_;
     int rc = lost ? RAD_E_STATE : RAD_OK;
     for (int b = 0; b < 2; ++b)
         if (holds_[b] >= 0) {

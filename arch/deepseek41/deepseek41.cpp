@@ -38,6 +38,10 @@
 #include <string>
 #include <vector>
 
+/* rad_declare_consumer_suffix (abi/rad_builder.h) is an additive export: referenced weakly, it is
+ * null on an engine older than the call, and the consumer skip is then refused (cut_declare). */
+#pragma weak rad_declare_consumer_suffix
+
 namespace deepseek41 {
 using namespace rad::arch;
 
@@ -570,6 +574,14 @@ struct Model {
     struct PfStats {
         uint64_t steps = 0, points = 0, reads = 0, bytes = 0, epoints = 0, ereads = 0, ebytes = 0;
     } pfs;
+    /* The consumer skip (cut_declare): declared, at boundary `cut_b`; and what this rank's cut
+     * passes ran (rad_plugin_close's report): passes cut, layer-passes in full, key ops alone,
+     * skipped. Only this rank's thread writes them. */
+    bool cut_on = false;
+    int  cut_b = -1;
+    struct CutStats {
+        uint64_t passes = 0, full = 0, key = 0, skipped = 0;
+    } cuts;
 };
 static std::unique_ptr<Model> models[MAX_RANKS];
 /* The model whose name map is being declared (declare() on this thread). */
@@ -2233,6 +2245,88 @@ static bool dense_f8_gate(RadBuilder* b, const RadModelMeta* meta, Model& m) {
     return true;
 }
 
+/* ------------------------------------------------------------------ the consumer skip */
+/* RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP=1: the engine runs a prompt's early passes on a prefix of
+ * the layers (core/sched/consumer_skip.h holds the schedule and its proof; rad_builder.h,
+ * rad_declare_consumer_suffix, the contract). This plugin's half is the declaration below, made
+ * only where the graph meets the contract, and step()'s cut.
+ *
+ * Why this graph meets it, layer by layer (layer() and step() above):
+ *   - Compressed and index keys are stored only at the kv sources (`L.src`: l_st, k_st), 2, 8, 14
+ *     and 20 in V4.1-Flash; B, the boundary, is the last. A layer past B reads compressed keys of
+ *     src_of[l], the latest source at or below it of its ratio (read_cfg), so B's: its attention
+ *     reads kv_cache(m.comp[r], src) and its indexer kv_cache(m.index[r], src). The index sources
+ *     past B (24, 28, 32, 36) score their own queries against B's index keys and store none.
+ *   - Every layer's window key (kv_g -> kv_n / kv_f -> kv_st) is computed from that layer's own
+ *     normed input `xn` at the row, and attn_sparse_sink at row p reads the window cache at
+ *     p - window + 1 .. p (libref ref_attn_sparse_sink). The window is W = c.window.
+ *   - The rest is per row, or per pass and rebuilt in it: the candidate layer's keep and an index
+ *     layer's selection are written earlier in the same pass for the same rows (the candidate layer
+ *     is at or below B, and an index layer runs in full whenever a later layer does); Engram rows
+ *     depend on tokens alone, at layers 1 and 14, below B; the compressor's ring (ratio 2) belongs
+ *     to sources below B, which always run.
+ *   - Layer F's key ops in a cut pass are the full layer's own handles in the full layer's order
+ *     with the query, indexer, attention, output and FFN ops left out: its collapse and norm (or
+ *     the previous layer's fused post_f + collapse + norm, pcn_a), kv_g, the norm/rope/round trip
+ *     (kv_f, or kv_n, kv_rope, kv_q), kv_st, and at a source the compressor chain and the index
+ *     and compressed key stores. None of them reads what a left-out op writes (c_tab rewrites
+ *     cs_b with the same angles rope_b_step wrote, a pure function of the position, and keeps its
+ *     order to the reads around it).
+ * Refused (a line on rank 0 says why) for a graph off that shape: a kv source or an Engram layer
+ * past the boundary, a candidate layer past it, a layer past it reading another source's keys,
+ * the DSpark drafter (its context reads every prompt row's taps at its target layers) or any
+ * speculation, and an engine that does not carry the cut (the weak reference is null). */
+static void cut_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
+    const char* v = std::getenv("RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP");
+    if (!v || std::strcmp(v, "1")) return;
+    const auto& c = m.c;
+    int B = -1;
+    for (int64_t s : c.kv_src) B = std::max(B, (int)s);
+    std::string why;
+    if (B < 0 || B >= (int)c.n_layer - 1) {
+        why = "no kv source before the last layer, so no layer to cut";
+    } else if (c.window < 1) {
+        why = "no window";
+    } else if (m.dsp.on || ctx->max_spec > 0) {
+        why = "speculation is on (the DSpark drafter's context reads every prompt row's taps at its "
+              "target layers)";
+    } else if (c.cand > B) {
+        why = "the candidate layer " + std::to_string(c.cand) + " is past the boundary";
+    } else {
+        for (int l = B + 1; l < (int)c.n_layer && why.empty(); ++l) {
+            if (c.is_src(l)) why = "layer " + std::to_string(l) + " stores keys past the boundary";
+            else if (c.ple_index(l) >= 0) why = "layer " + std::to_string(l) + " has an Engram block";
+            else if (c.ratio[(size_t)l] > 0 && c.src_of[(size_t)l] != B)
+                why = "layer " + std::to_string(l) + " reads another source's compressed keys";
+        }
+    }
+    if (why.empty() && !rad_declare_consumer_suffix)
+        why = "this engine does not carry the cut (it is older than rad_declare_consumer_suffix)";
+    if (why.empty()) {
+        RadConsumerSuffix d{};
+        d.struct_size = (uint32_t)sizeof d;
+        d.n_layer = (int32_t)c.n_layer;
+        d.boundary = B;
+        d.window = (int32_t)c.window;
+        const int rc = rad_declare_consumer_suffix(b, &d);
+        if (rc != RAD_OK) why = "the engine refused the declaration (" + std::to_string(rc) + ")";
+    }
+    if (!why.empty()) {
+        if (ctx->rank == 0)
+            fprintf(stderr, "radiance: deepseek41: consumer skip refused: %s\n", why.c_str());
+        rad_note(b, "consumer skip refused: %s", why.c_str());
+        return;
+    }
+    m.cut_on = true;
+    m.cut_b = B;
+    if (ctx->rank == 0)
+        fprintf(stderr, "radiance: deepseek41: consumer suffix declared: layers %d..%lld see earlier "
+                        "rows only through their own %lld-row windows and layer %d's compressed and "
+                        "index keys; a cut pass runs layers [0, F) in full and layer F's key ops alone\n",
+                B + 1, (long long)c.n_layer - 1, (long long)c.window, B);
+    rad_note(b, "consumer suffix declared: boundary %d, window %lld", B, (long long)c.window);
+}
+
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
     if (!b || !meta || !ctx || ctx->is_draft || ctx->rank < 0 || ctx->rank >= MAX_RANKS)
         return RAD_E_INVAL;
@@ -2430,6 +2524,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     /* The drafter after everything the trunk step issues (llama_fp8's rule: declaration order is
      * liveness, and its passes run behind the step). */
     if (m.dsp.on) DS_TRY(dsp_declare(b, m, ctx));
+    cut_declare(b, m, ctx);
     pf_note(m, ctx->rank);
     rad_note(b, "DeepSeek-V4.1: %lld layers, hc %lld, window %lld, %zu kv sources, %zu index "
                 "sources, %lld experts top-%lld, Engram at %zu layers",
@@ -2691,6 +2786,24 @@ static void step(RadCtx* x, const RadBatch* batch) {
                         RAD_NONE);
     }
 
+    /* The consumer skip (cut_declare): a pass the engine cut runs layers [0, F) in full, layer F's
+     * key ops alone and nothing past it; no final norm, no head. Read only once the declaration
+     * was taken: an engine without the call has no such field. */
+    const int32_t cut_full = m.cut_on ? batch->consumer_full : 0;
+    if (cut_full != 0 &&
+        (cut_full < m.cut_b || cut_full >= (int32_t)c.n_layer || batch->n_out != 0 || S != 1 ||
+         batch->n_seq_decode != 0 || batch->n_spec != 0 || batch->n_mm_rows != 0)) {
+        rad_step_fail(x, "deepseek41: a cut pass outside the declared consumer suffix (consumer_full "
+                         "past its bounds, or a pass that samples, mixes decode rows or speculates)");
+        return;
+    }
+    if (cut_full) {
+        ++m.cuts.passes;
+        m.cuts.full += (uint64_t)cut_full;
+        m.cuts.key += 1;
+        m.cuts.skipped += (uint64_t)(c.n_layer - cut_full - 1);
+    }
+
     /* The on-die reads (Layer::pf), at decode heights only: prompt steps keep their reads to
      * themselves (rad_arch.h, kPrefetchRows). */
     const bool pf_live = batch->phase == RAD_PHASE_DECODE && T <= kPrefetchRows;
@@ -2698,6 +2811,9 @@ static void step(RadCtx* x, const RadBatch* batch) {
     for (auto& L : m.layers) {
         const int l = L.l;
         const int64_t r = L.r;
+        /* A cut pass: past layer F nothing; layer F its collapse, norm and key ops (below). */
+        if (cut_full && l > cut_full) break;
+        const bool key_only = cut_full && l == cut_full;
         if (L.e_ids) {
             const int64_t H = c.ple_heads;
             const int pi = c.ple_index(l);
@@ -2734,7 +2850,7 @@ static void step(RadCtx* x, const RadBatch* batch) {
                         bcol(m.ekv, c.hc * D, D, T), RAD_W(L.e_gate), brows(m.h1, T));
             RAD_ISSUE_N(x, L.e_back, T, brows(m.h1, T), brows(m.h0, T));
         }
-        if (L.tap) RAD_ISSUE_N(x, L.tap, T, brows(m.h0, T), bcol(m.dsp.src, L.tap_col * D, D, T));
+        if (L.tap && !key_only) RAD_ISSUE_N(x, L.tap, T, brows(m.h0, T), bcol(m.dsp.src, L.tap_col * D, D, T));
         /* Issue order of the connections' mixes (Ctx::haz_mark: a recorded pass leaves a dispatch
          * unordered when it touches nothing in flight). Each connection's collapse reads the gates
          * the previous connection's mix wrote, never what its own mix writes, and nothing reads a
@@ -2758,9 +2874,10 @@ static void step(RadCtx* x, const RadBatch* batch) {
                 RAD_ISSUE_N(x, L.col_a, T, brows(m.h0, T), brows(m.pre_f, T), brows(m.xcol, T));
         };
         col_a();
-        if (!late) mix_a();
+        if (!late && !key_only) mix_a();
         if (m.zero) {
-            RAD_ISSUE_N(x, L.attn_fill, T, brows(m.attn_out, T));
+            /* An attention-zero rank stores no keys (its caches are zeroed). */
+            if (!key_only) RAD_ISSUE_N(x, L.attn_fill, T, brows(m.attn_out, T));
         } else {
             if (L.norm_a)
                 RAD_ISSUE_N(x, L.norm_a, T, brows(m.xcol, T), RAD_W(L.attn_norm), brows(m.xn, T));
@@ -2934,6 +3051,25 @@ static void step(RadCtx* x, const RadBatch* batch) {
                 }
             };
 
+            if (key_only) {
+                /* The consumer skip's key ops: the order below with the query, the indexer and
+                 * everything after the stores left out, so every store gets the full layer's bytes
+                 * (cut_declare). */
+                c_gemm();
+                kv_g();
+                c_work();
+                kv_n();
+                c_pool();
+                kv_rope();
+                c_tail(); c_norm();
+                kv_q();
+                k_gemm(); c_tab();
+                kv_st();
+                k_norm();
+                l_rope(); k_rope();
+                l_q(); k_q(); l_st(); k_st();
+                break;
+            }
             c_gemm();
             q_a(); kv_g();
             i_w(); c_work();
@@ -2976,6 +3112,7 @@ static void step(RadCtx* x, const RadBatch* batch) {
             if (late) mix_a();
             RAD_ISSUE_N(x, L.o_b, T, brows(m.oa, T), RAD_W(L.wo_b), brows(m.attn_out, T));
         }
+        if (key_only) break;   /* an attention-zero rank's key layer: its collapse alone */
         if (L.ar_attn) RAD_ISSUE_N(x, L.ar_attn, T * D, brows(m.attn_out, T), RAD_NONE);
         if (L.pcn_f)   /* post_a, col_f and norm_f in one */
             RAD_ISSUE_N(x, L.pcn_f, T, brows(m.attn_out, T), brows(m.h0, T), brows(m.post, T),
@@ -3029,6 +3166,7 @@ static void step(RadCtx* x, const RadBatch* batch) {
                         brows(m.comb, T), brows(m.h0, T));
     }
     if (m.pfs.reads != pf_reads0) ++m.pfs.steps;
+    if (cut_full) return;   /* a cut pass samples nothing: no final norm, no head */
     if (m.pcn_fin) {
     } else if (m.cn_fin) {
         RAD_ISSUE_N(x, m.cn_fin, T, brows(m.h0, T), brows(m.pre_f, T), brows(m.xcol, T),
@@ -3077,6 +3215,20 @@ static void pf_report() {
                      (double)s.ebytes / (1024.0 * MiB));
     }
 }
+
+/* The consumer skip's shutdown line, a line a rank (Model::CutStats): what its cut passes issued,
+ * which the engine's own "consumer skip:" line counts from the batches; the two agree. */
+static void cut_report() {
+    for (int r = 0; r < MAX_RANKS; ++r) {
+        const Model* m = models[r].get();
+        if (!m || !m->cut_on) continue;
+        const Model::CutStats& s = m->cuts;
+        std::fprintf(stderr, "radiance: deepseek41: rank %d: consumer skip: %llu cut passes issued "
+                             "%llu layer-passes in full, %llu key ops alone and skipped %llu\n",
+                     r, (unsigned long long)s.passes, (unsigned long long)s.full,
+                     (unsigned long long)s.key, (unsigned long long)s.skipped);
+    }
+}
 }  // namespace deepseek41
 
 #ifndef RAD_ARCH_NO_EXPORTS
@@ -3084,6 +3236,9 @@ RAD_ARCH_PROBE(deepseek41)
 RAD_ARCH_PLUGIN(deepseek41, "deepseek41", "", "0.1.0",
                 "DeepSeek-V4.1: hyper-connection streams, window + sparse compressed latent "
                 "attention, sqrt(softplus) MoE, Engram")
-/* Called once at shutdown (abi/rad_abi.h): the on-die reads' counters. */
-extern "C" void rad_plugin_close(void) { deepseek41::pf_report(); }
+/* Called once at shutdown (abi/rad_abi.h): the on-die reads' and the consumer skip's counters. */
+extern "C" void rad_plugin_close(void) {
+    deepseek41::pf_report();
+    deepseek41::cut_report();
+}
 #endif

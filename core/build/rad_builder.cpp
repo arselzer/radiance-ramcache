@@ -2092,6 +2092,35 @@ int Builder::drafter_short_block(int64_t block) {
     return RAD_OK;
 }
 
+/* An exact consumer suffix (rad_builder.h). Only recorded: the engine decides which steps it cuts
+ * (core/sched/consumer_skip.h), and a step it does not cut runs as before. */
+int Builder::declare_consumer_suffix(const RadConsumerSuffix* d) {
+    if (finished_) {
+        err(RAD_E_STATE, "declare_consumer_suffix after declare finished");
+        return RAD_E_STATE;
+    }
+    if (!d || d->struct_size < sizeof(RadConsumerSuffix)) {
+        err(RAD_E_INVAL, "declare_consumer_suffix: no declaration, or one from a header older than "
+                         "its four fields");
+        return RAD_E_INVAL;
+    }
+    if (prog_.consumer.n_layer > 0) {
+        err(RAD_E_STATE, "declare_consumer_suffix: declared twice");
+        return RAD_E_STATE;
+    }
+    if (d->n_layer < 2 || d->n_layer != prog_.meta.n_layers || d->boundary < 0 ||
+        d->boundary >= d->n_layer - 1 || d->window < 1) {
+        err(RAD_E_INVAL, "declare_consumer_suffix: %d layers (the model has %lld), boundary %d, "
+                         "window %d. The boundary is a layer before the last, the window at least "
+                         "one position.", d->n_layer, (long long)prog_.meta.n_layers, d->boundary,
+            d->window);
+        return RAD_E_INVAL;
+    }
+    prog_.consumer = *d;
+    prog_.consumer.struct_size = sizeof(RadConsumerSuffix);
+    return RAD_OK;
+}
+
 void Builder::note_v(const char* f, va_list ap) {
     char msg[1024];
     vsnprintf(msg, sizeof msg, f ? f : "", ap);
@@ -2634,6 +2663,11 @@ int rad_chain_on(void) { return rad_dev_chain_enabled(); }
 int rad_drafter_short_block(RadBuilder* b, int64_t block) {
     if (!b) return RAD_E_INVAL;
     return B(b)->drafter_short_block(block);
+}
+
+int rad_declare_consumer_suffix(RadBuilder* b, const RadConsumerSuffix* d) {
+    if (!b) return RAD_E_INVAL;
+    return B(b)->declare_consumer_suffix(d);
 }
 
 int rad_declare_encoder(RadBuilder* b, const RadEncoderDecl* d) {

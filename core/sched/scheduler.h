@@ -104,6 +104,11 @@ struct SchedReq {
      * client's tokens into a re-admitted slot. */
     bool     reap_pending = false;
     int64_t  pending_ckpt = -1;  /* absolute position this step's chunk checkpoints at */
+    /* The consumer skip's target for this prefill (consumer_skip.h): the first position whose
+     * state must be exact, its end or the tail checkpoint below it; 0 when its prefill is not
+     * cut. Set at each admission (Scheduler::consumer_target), carried by its prefill entries
+     * (StepEntry::consumer_end); a checkpoint below it is not written. */
+    int64_t  consumer_end = 0;
 
     /* The checkpoint the linear state is seeded from on admission, handed to the sequence's first
      * entry as StepEntry::ckpt_restore. Never held across a step: nothing pins a checkpoint slot,
@@ -459,6 +464,13 @@ public:
 
     /* plan_chunk's tail-checkpoint rule (see the definition). */
     int64_t tail_checkpoint(int64_t target) const;
+    /* The consumer skip (core/sched/consumer_skip.h, RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP):
+     * whether init turned it on, and the target a request's prefill is cut for (0: not cut): its
+     * end, or the tail checkpoint below it when the scheduler writes one there. */
+    bool    consumer_on() const { return cs_on_; }
+    int64_t consumer_target(const SchedReq& s) const;
+    /* What the cut ran (BatchBuilder::ConsumerStats). */
+    const BatchBuilder::ConsumerStats& consumer_stats() const { return builder_.consumer_stats(); }
     /* The least recompute a snapshot at a shared head (CacheHit::branch_at) must save each later
      * request for the chunk split that takes it. */
     static constexpr int64_t kSharedHeadMin = 256;
@@ -758,6 +770,8 @@ private:
      * step, since the step after it must bring them back. */
     int     prefill_alone_ = 0;
     int64_t pf_skipped_ = 0;
+    /* The consumer skip, as init decided it (consumer_on). */
+    bool    cs_on_ = false;
     /* The throughput window (step_finished): each kind's tokens and the wall time the steps
      * covered, both decayed with the same time constant, so their ratio is tokens over time. */
     double  tps_win_prefill_ = 0.0, tps_win_decode_ = 0.0, tps_win_time_ = 0.0;

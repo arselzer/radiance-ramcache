@@ -201,6 +201,14 @@ arm() {   # name, then env assignments for the server; CACHE_MIB the RAM cache (
     log "arm $name: a predictor part, but the server log has no 'router predictor: N routers loaded' line ($(grep -m1 -E 'router predictor' "$OUT/$name.server.log")); not measured"
     stop_server; return 1
   fi
+  # RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP (the Cs part): the scheduler says at startup whether it
+  # took it, and the plugin whether it declared the suffix. An arm whose name says Cs and whose
+  # server did not take it is not measured.
+  if [[ -n "${ARM_CS:-}" ]] && ! grep -q 'consumer skip: on' "$OUT/$name.server.log"; then
+    log "arm $name: Cs, but the server did not take it: $(grep -m2 -E 'consumer skip|consumer suffix' "$OUT/$name.server.log" | tr '\n' ' ')"
+    stop_server; return 1
+  fi
+  [[ -n "${ARM_CS:-}" ]] && grep -m2 -E 'consumer skip: on|consumer suffix declared' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   # The NVMe drive's busy time (io_ticks, ms) and temperature over the requests: read-ahead arms
   # move it from ~45% busy towards saturation.
   local d0 d1 t0 t1 rc temp
@@ -234,6 +242,8 @@ arm() {   # name, then env assignments for the server; CACHE_MIB the RAM cache (
   # Every arm's VRAM residents a rank; a Vp arm's packed-form lines (what packed, the scan, the load's checks).
   grep -E 'planned units VRAM=|VRAM packed' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   grep -E 'route trace' "$OUT/$name.server.log" | tail -6 | tee -a "$OUT/window.log"   # Rt: per rank, and the files
+  grep -E 'consumer skip: [0-9]+ (prefill|cut) passes|rank 0: consumer skip' "$OUT/$name.server.log" | tee -a "$OUT/window.log"   # Cs: what the cut ran
+  grep -E 'prefill hash: seq [0-9]+, [0-9]+ tokens: all ranks' "$OUT/$name.server.log" | tee -a "$OUT/window.log"   # Kh: a digest a prompt
 }
 
 if [[ "$("${DOCKER[@]}" inspect "$NAME" --format '{{.State.Status}}' 2>/dev/null)" != running ]]; then
@@ -459,8 +469,16 @@ for a in $ARMS; do
 # pass's miss reads start on the kept readers as soon as the layer's choice is made, before the
 # pool's wake (RADIANCE_EXPERIMENTAL_DS41_MISS_POST); U<name> the arm sends every request of
 # work/extra-prompts/<name>-receipt.json (chat: 16 chat-framed prompts; long: 64-3500-token
-# prompts) instead of $PROMPTS' first AB_REQUESTS (compare texts only between arms with the same
-# prompts); Rt the routing trace: every EP-routed layer's picks, weights, keys and what the owning
+# prompts; long8k: one ~7K-token document, with LmN of 8448 or more) instead of $PROMPTS' first
+# AB_REQUESTS (compare texts only between arms with the same prompts); Cs the exact consumer-suffix
+# skip (RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP=1: a prompt's early prefill passes run layers 21..39
+# only where their rows reach its last token or its state; needs a radiance and a deepseek41 from
+# claude/ds41-cskip, and the server's "consumer skip: on" line, or the arm is not measured; every
+# other arm runs with it off); Kh at the end of each prompt's prefill every rank hashes its KV groups
+# and the last row's logits (RADIANCE_EXPERIMENTAL_DS41_PREFILL_HASH=1; steps are not issued ahead
+# while it is on, so time a prompt in an arm without it), and the window compares each Kh arm's
+# hashes with those of the first Kh arm with the same prompts (ab_requests.py --hashes); Rt the
+# routing trace: every EP-routed layer's picks, weights, keys and what the owning
 # rank did with them, rank 0's 384 logits on decode passes, each rank's RAM-cache residency, and
 # the requests each pass carried, into rtrace-<arm>/rt.rank<r>.bin and rt.steps.bin
 # (RADIANCE_EXPERIMENTAL_DS41_ROUTE_TRACE; exact; read them with rtrace.py); Lq the quality
@@ -477,7 +495,7 @@ for a in $ARMS; do
   IFS=- read -r -a parts <<< "$a"
   pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 HOST_POOL_MIB=4096 EXTRA_ARGS="" ARM_HOME="$RHOME" ARM_CONC=
   ARM_PROMPTS= ARM_N= ARM_LQ= rt=
-  power="" skip="" ARGS=() f8="" f8x="" rb="" rbf=0 pred=""
+  power="" skip="" ARGS=() f8="" f8x="" rb="" rbf=0 pred="" cs="" kh=""
   for p in "${parts[@]:1}"; do
     case $p in
       Q[gnc]*) power=${p#Q} ;;
@@ -568,6 +586,8 @@ for a in $ARMS; do
       Rt)      mkdir -p "$OUT/rtrace-$a"   # the routing trace, exact (rtrace.py reads it)
                rt=1; env+=(RADIANCE_EXPERIMENTAL_DS41_ROUTE_TRACE=$(cd "$OUT" && pwd)/rtrace-$a/rt) ;;
       Lq)      ARM_LQ=1 ;;                 # the quality harness after the timed requests
+      Cs)      cs=1 ;;                     # the exact consumer-suffix skip (checked in the server log)
+      Kh)      kh=1 ;;                     # KV and logits hashes at each prompt's end
       *)     log "arm $a: unknown part $p; the arm is skipped (it would run without what its name says)"; skip=1 ;;
     esac
   done
@@ -613,6 +633,9 @@ for a in $ARMS; do
   # Ss: the read-back runs in an arm only if its name says so, whatever the window's environment.
   [[ " ${env[*]} " == *" RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP=1 "* ]] || env+=(RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP=0)
   [[ -z "$rt" ]] && env+=(RADIANCE_EXPERIMENTAL_DS41_ROUTE_TRACE=)   # traced only with Rt
+  if [[ -n "$cs" ]]; then env+=(RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP=1); else env+=(RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP=0); fi
+  ARM_CS=$cs
+  if [[ -n "$kh" ]]; then env+=(RADIANCE_EXPERIMENTAL_DS41_PREFILL_HASH=1); else env+=(RADIANCE_EXPERIMENTAL_DS41_PREFILL_HASH=0); fi
   [[ -n "$skip" ]] && continue
   [[ -n "$power" ]] && power_set "$power"
   case $pol in
@@ -627,4 +650,23 @@ done
 [[ -n "$ARMS" ]] && python3 -I "$HERE/ab_requests.py" --compare "$OUT" $ARMS | tee -a "$OUT/window.log"
 # Lq arms: each teacher-forced run against its reference (KL, top-1, by prompt family).
 compgen -G "$OUT/*.lpforce.json" >/dev/null && python3 -I "$HERE/ab_requests.py" --kl-dir "$OUT" | tee -a "$OUT/window.log"
+# Arms by their prompts (the U part; none: the held-out set). Where a window mixes prompt sets, each
+# set's replies against its own first arm, and each set's Kh arms' prefill hashes against its first
+# Kh arm's, prompt by prompt.
+declare -A BY_PROMPTS=() KH_BY_PROMPTS=()
+for a in $ARMS; do
+  u=$(tr '-' '\n' <<< "$a" | grep -m1 -E '^U.+')
+  BY_PROMPTS[${u:-held-out}]+="$a "
+  [[ "-$a-" == *-Kh-* ]] && KH_BY_PROMPTS[${u:-held-out}]+="$a "
+done
+if (( ${#BY_PROMPTS[@]} > 1 )); then
+  for u in "${!BY_PROMPTS[@]}"; do
+    log "replies with prompts $u"
+    python3 -I "$HERE/ab_requests.py" --compare "$OUT" ${BY_PROMPTS[$u]} | tee -a "$OUT/window.log"
+  done
+fi
+for u in "${!KH_BY_PROMPTS[@]}"; do
+  log "prefill hashes with prompts $u"
+  python3 -I "$HERE/ab_requests.py" --hashes "$OUT" ${KH_BY_PROMPTS[$u]} | tee -a "$OUT/window.log"
+done
 log "arms done"

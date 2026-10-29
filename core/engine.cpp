@@ -86,6 +86,8 @@ Engine::~Engine() {
     for (float* p : kld_host_) if (p) rad_dev_free(p, RAD_MEM_HOST_PINNED);
     if (pooled_host_) rad_dev_free(pooled_host_, RAD_MEM_HOST_PINNED);
     for (auto& r : ranks_) if (r->score_host) rad_dev_free(r->score_host, RAD_MEM_HOST_PINNED);
+    for (auto& r : ranks_) if (r->hash_host) rad_dev_free(r->hash_host, RAD_MEM_HOST_PINNED);
+    consumer_skip_report();
     /* The live issue path's overlap and chain trace (runtime/live_chain.h), when
      * RADIANCE_EXPERIMENTAL_DS41_CHAIN_OVERLAP or _TRACE is on: launches checked, how many went
      * unordered (or would, dump only), and why the rest kept the barrier bit. */
@@ -689,6 +691,9 @@ void Engine::rank_loop(int index) {
             if (xstats_ && what != kIssueSampler && b->enc == 0)
                 if (XsTally* xs = xstats_->tally(index)) xs->issued(*b);
             int s = what == kIssueSampler ? RAD_OK : r.ctx.run_step(b);
+            /* RADIANCE_EXPERIMENTAL_DS41_PREFILL_HASH: the state a prompt's last prefill step left,
+             * before its sampler (engine_hash.cpp). */
+            if (s >= 0 && prefill_hash_ && what != kIssueSampler) prefill_hash_rank(r, b);
             if (s < 0) {
                 RAD_ERR("rank %d step %d: %s", index, b->step, r.ctx.step_error());
                 step_status_.store(s, std::memory_order_release);
@@ -820,6 +825,7 @@ int Engine::step_loop() {
     pipelining_ = draft_experiment_.target_pipelining(!cfg_.kld() && !embedding_,
                               serial_drafting(), block_drafting(), cfg_.n_spec);
     early_ids_ = !cfg_.kld() && !embedding_;
+    prefill_hash_init();
     /* RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP (read in serve()): only where steps are issued
      * ahead; without that no pass follows a reply's last token. */
     post_stop_ = post_stop_asked_ && pipelining_;
@@ -1039,6 +1045,7 @@ int Engine::step_loop() {
                 build_status_ = RAD_OK;
             }
             if (const int ps = prepare_release(b); ps < 0) return fail_loop(ps);
+            if (prefill_hash_) prefill_hash_stage(plan, so, b->step);
             /* An embedding program has no sampler to issue behind its pass. */
             issue_what_.store(embedding_ ? kIssueModel : kIssueAll, std::memory_order_release);
             step_batch_.store(b, std::memory_order_release);
@@ -1054,6 +1061,7 @@ int Engine::step_loop() {
                 build_cv_.notify_all();
             }
             barrier_->arrive_and_wait();      /* wait for them */
+            if (prefill_hash_) prefill_hash_print();
         } else {
             /* The forward pass was issued ahead and the previous step has now committed, so the
              * sampler is staged from the correct state and its chain queued behind the running

@@ -123,6 +123,9 @@ struct RadBuilder {
     bool           drafter_shared = false;
     int            drafter_pos = -1;
     int64_t        drafter_short = 0;     /* rad_drafter_short_block */
+    /* The consumer suffix (rad_declare_consumer_suffix), n_layer 0 when none, and the calls. */
+    RadConsumerSuffix consumer{};
+    int               consumer_calls = 0;
 
     /* The buffers named to rad_buf_concurrent: the ones a second lane touches. */
     std::vector<rad_buf> concurrent;
@@ -421,6 +424,13 @@ extern "C" int rad_drafter_short_block(RadBuilder* b, int64_t block) {
     if (!b || b->drafter.kind != RAD_DRAFT_BLOCK) return RAD_E_STATE;
     if (block >= full || block - (full - b->drafter.depth) < 1) return RAD_E_INVAL;
     b->drafter_short = block;
+    return RAD_OK;
+}
+extern "C" int rad_declare_consumer_suffix(RadBuilder* b, const RadConsumerSuffix* d) {
+    if (!b || !d || d->struct_size < sizeof(RadConsumerSuffix)) return RAD_E_INVAL;
+    ++b->consumer_calls;
+    if (b->consumer.n_layer > 0) return RAD_E_STATE;
+    b->consumer = *d;
     return RAD_OK;
 }
 extern "C" int rad_declare_encoder(RadBuilder* b, const RadEncoderDecl* d) {

@@ -7207,3 +7207,199 @@ TEST(prefill_alone_lets_a_second_request_decode_beside_the_first) {
     CHECK_EQ(on.a_out, (size_t)12);
     CHECK_EQ(on.b_out, (size_t)12);
 }
+
+/* ================================================================== the consumer skip */
+/* RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP (core/sched/consumer_skip.h) on the scheduler: a window +
+ * full trunk of 16 layers, the declared suffix past layer 4 with the window's 64 positions, 16-row
+ * chunks on the 16-token quantum, window snapshots at the interval (256) and the tail. */
+namespace {
+
+void consumer_fixture(Fixture& f, int64_t max_tok, int64_t max_seqs = 1) {
+    f.build(4096, 64, max_tok, 4096, /*windowed=*/true);
+    f.prog.kv_groups.erase(f.prog.kv_groups.begin() + 1, f.prog.kv_groups.begin() + 3);
+    f.prog.ops.resize(1);
+    f.prog.buffers.resize(1);
+    f.kv.setup(f.prog.kv_groups, f.cfg.max_ctx, 4096, 64);
+    f.pc.groups = { 0 };
+    f.cfg.max_seqs = max_seqs;
+    f.prog.consumer = RadConsumerSuffix{ (uint32_t)sizeof(RadConsumerSuffix), 16, 4, 64 };
+    f.cfg.consumer_skip = 1;
+}
+
+struct CsRun {
+    int cut = 0, prefill_steps = 0, bad_full = 0, sampled_cut = 0, shared_cut = 0;
+    std::vector<int64_t> ckpts;   /* positions the snapshots were reserved at */
+    int64_t end = -1;             /* the target every prefill entry carried; -2 when they differed */
+};
+
+/* Runs every request the fixture holds to the end, checking each step's cut against the schedule
+ * for `target` (the chunk's last row) and collecting the checkpoints the steps reserve. */
+CsRun consumer_run(Fixture& f, uint64_t id, int64_t target) {
+    CsRun out;
+    const ConsumerShape shape{ 16, 4, 64, f.cfg.max_tok, f.sch.geometry().quantum };
+    const std::vector<int64_t> th = consumer_thresholds(shape, target);
+    for (int k = 0; k < 400; ++k) {
+        const RadBatch* b = f.sch.step();
+        if (!b) break;
+        const StepPlan& p = f.sch.plan();
+        for (const StepEntry& e : p.e) {
+            if (e.seq != id || !e.is_prefill) continue;
+            ++out.prefill_steps;
+            if (out.end == -1) out.end = e.consumer_end;
+            else if (out.end != e.consumer_end) out.end = -2;
+            if (e.ckpt_slot >= 0) out.ckpts.push_back((int64_t)e.ctx_len + e.ckpt_tok + 1);
+            const int32_t F = consumer_full_layers(shape, th, (int64_t)e.ctx_len + e.n_tokens - 1);
+            const int32_t want = p.e.size() == 1 && F < 16 ? F : 0;
+            if (b->consumer_full != want) ++out.bad_full;
+            if (b->consumer_full) {
+                ++out.cut;
+                if (b->consumer_end != target) ++out.bad_full;
+                if (e.produces_token || b->n_out) ++out.sampled_cut;
+                if (p.e.size() != 1) ++out.shared_cut;
+            }
+        }
+        if (b->consumer_full && (p.e.size() != 1 || !p.e[0].is_prefill)) ++out.shared_cut;
+        f.commit_plain();
+    }
+    return out;
+}
+
+}  /* namespace */
+
+/* A lone prompt with the prefix cache on: cut for its tail checkpoint (1072, a block short of
+ * 1100), every pass's F the schedule's, the snapshots at 256 .. 1024 not written (their windows
+ * are incomplete) and the one at the tail written; the prompt's last passes run every layer. */
+TEST(consumer_skip_cuts_a_lone_prefill_for_its_tail_checkpoint) {
+    Fixture f;
+    consumer_fixture(f, 16);
+    REQUIRE_EQ(f.start(), RAD_OK);
+    REQUIRE(f.sch.consumer_on());
+    REQUIRE(f.sch.geometry().window_ckpt);
+    CHECK_EQ(f.sch.geometry().quantum, 16);
+    const int64_t tail = f.sch.tail_checkpoint(1100);
+    CHECK_EQ(tail, 1072);
+    const uint64_t id = f.submit(1100, 1);
+    const CsRun r = consumer_run(f, id, tail);
+    CHECK_EQ(r.end, tail);
+    CHECK_EQ(r.prefill_steps, 69);
+    CHECK(r.cut > 30);
+    CHECK_EQ(r.bad_full, 0);
+    CHECK_EQ(r.sampled_cut, 0);
+    CHECK_EQ(r.shared_cut, 0);
+    CHECK(r.ckpts == std::vector<int64_t>({ tail }));
+    CHECK_EQ(f.pc.reserved, 1);
+    CHECK_EQ(f.sch.metrics().checkpoints_written, 1ll);
+    CHECK_EQ(f.sch.metrics().consumer_ckpt_dropped, 4ll);   /* 256, 512, 768, 1024 */
+    const BatchBuilder::ConsumerStats& cs = f.sch.consumer_stats();
+    CHECK_EQ(cs.cut, (uint64_t)r.cut);
+    CHECK_EQ(cs.passes, (uint64_t)r.prefill_steps);
+    CHECK_EQ(cs.shared, (uint64_t)0);
+    CHECK_EQ(cs.key, (uint64_t)r.cut);
+    CHECK_EQ(cs.full + cs.key + cs.skipped, (uint64_t)r.prefill_steps * 16);
+    CHECK(cs.skipped > 0);
+}
+
+/* Without the prefix cache no snapshot is written and the cut is for the prompt's end; the switch
+ * off, nothing is cut and every snapshot is written. */
+TEST(consumer_skip_targets_the_end_without_checkpoints_and_cuts_nothing_off) {
+    {
+        Fixture f;
+        consumer_fixture(f, 16);
+        f.cfg.prefix_cache = false;
+        REQUIRE_EQ(f.start(), RAD_OK);
+        REQUIRE(f.sch.consumer_on());
+        const uint64_t id = f.submit(700, 1);
+        const CsRun r = consumer_run(f, id, 700);
+        CHECK_EQ(r.end, 700);
+        CHECK(r.cut > 0);
+        CHECK_EQ(r.bad_full, 0);
+        CHECK(r.ckpts.empty());
+        CHECK_EQ(f.sch.metrics().consumer_ckpt_dropped, 0ll);
+    }
+    {
+        Fixture f;
+        consumer_fixture(f, 16);
+        f.cfg.consumer_skip = 0;
+        REQUIRE_EQ(f.start(), RAD_OK);
+        CHECK(!f.sch.consumer_on());
+        const uint64_t id = f.submit(1100, 1);
+        int cut = 0, written = 0;
+        for (int k = 0; k < 200; ++k) {
+            const RadBatch* b = f.sch.step();
+            if (!b) break;
+            cut += b->consumer_full != 0 || b->consumer_end != 0;
+            for (const StepEntry& e : f.sch.plan().e) {
+                CHECK_EQ(e.consumer_end, (int64_t)0);
+                written += e.seq == id && e.ckpt_slot >= 0;
+            }
+            f.commit_plain();
+        }
+        CHECK_EQ(cut, 0);
+        CHECK_EQ(written, 5);   /* 256, 512, 768, 1024 and the tail */
+    }
+}
+
+/* Two requests on a 16-token budget: a chunk the cut shortens holds the whole budget, so no step
+ * that carries a cut also carries anything else, and the second prompt is cut for its own tail. */
+TEST(consumer_skip_never_shares_a_cut_step) {
+    Fixture f;
+    consumer_fixture(f, 16, 4);
+    REQUIRE_EQ(f.start(), RAD_OK);
+    REQUIRE(f.sch.consumer_on());
+    const uint64_t a = f.submit(600, 12);
+    const uint64_t b = f.submit(900, 4);
+    int cut = 0, shared = 0, ends = 0;
+    for (int k = 0; k < 400; ++k) {
+        const RadBatch* rb = f.sch.step();
+        if (!rb) break;
+        const StepPlan& p = f.sch.plan();
+        if (rb->consumer_full) {
+            ++cut;
+            if (p.e.size() != 1 || !p.e[0].is_prefill || rb->n_out) ++shared;
+            ends += rb->consumer_end == f.sch.tail_checkpoint(p.e[0].seq == a ? 600 : 900);
+        }
+        f.commit_plain();
+    }
+    CHECK(cut > 20);
+    CHECK_EQ(shared, 0);
+    CHECK_EQ(ends, cut);
+    CHECK_EQ(f.sch.consumer_stats().shared, (uint64_t)0);
+    (void)b;
+}
+
+/* Refused, with every layer run, where the derivation does not reach. */
+TEST(consumer_skip_is_refused_where_its_derivation_does_not_reach) {
+    {   /* no declaration */
+        Fixture f;
+        consumer_fixture(f, 16);
+        f.prog.consumer = RadConsumerSuffix{};
+        REQUIRE_EQ(f.start(), RAD_OK);
+        CHECK(!f.sch.consumer_on());
+    }
+    {   /* concurrent sequences with chunks wider than the quantum, no prefill-alone steps */
+        Fixture f;
+        consumer_fixture(f, 64, 4);
+        REQUIRE_EQ(f.start(), RAD_OK);
+        CHECK(!f.sch.consumer_on());
+    }
+    {   /* speculation */
+        Fixture f;
+        consumer_fixture(f, 16);
+        f.cfg.n_spec = 2;
+        REQUIRE_EQ(f.start(), RAD_OK);
+        CHECK(!f.sch.consumer_on());
+    }
+    {   /* a declaration outside the derivation: the boundary at the last layer */
+        Fixture f;
+        consumer_fixture(f, 16);
+        f.prog.consumer.boundary = 15;   /* the last layer */
+        REQUIRE_EQ(f.start(), RAD_OK);
+        CHECK(!f.sch.consumer_on());
+    }
+    {   /* one sequence with wide chunks is covered */
+        Fixture f;
+        consumer_fixture(f, 64);
+        REQUIRE_EQ(f.start(), RAD_OK);
+        CHECK(f.sch.consumer_on());
+    }
+}

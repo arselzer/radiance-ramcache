@@ -275,8 +275,10 @@ void Ctx::xp_judge(XpState& x) {
 /* When recording, each of the three calls becomes its own tape step and is re-run at every play:
  * its stream work and rides are issued afresh, not recorded. */
 int Ctx::xp_predict(const RadPrefetchNext* nx, rad_buf h, int64_t r0, int64_t rows, int64_t n_embd) {
-    /* Too wide to predict; keep the tape free of an empty step. */
+    /* Too wide to predict; keep the tape free of an empty step. Nor for a layer a pass the
+     * consumer skip cut does not run (RadBatch::consumer_full; a cut pass's key differs). */
     if (!xp_ || !nx || rows <= 0 || rows > kXpMaxRows) return RAD_OK;
+    if (batch_ && batch_->consumer_full > 0 && nx->layer >= batch_->consumer_full) return RAD_OK;
     if (!rec_) return xp_predict_run(*nx, h, r0, rows, n_embd);
     TapeXp p;
     p.next = *nx;

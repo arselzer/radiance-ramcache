@@ -1008,7 +1008,7 @@ int Ctx::lane_join(int from, int to) {
  * field added to RadBatch changes its size: decide whether the key must read it, then update the
  * size here. `agen_b` and `vgen_b` are set only on generator passes, which are never recorded
  * (below). */
-static_assert(sizeof(void*) != 8 || sizeof(RadBatch) == 360,
+static_assert(sizeof(void*) != 8 || sizeof(RadBatch) == 376,
               "RadBatch changed: check that Ctx::pass_key reads every new field a pass depends on");
 static_assert(sizeof(void*) != 8 || sizeof(RadKVGroupBatch) == 80,
               "RadKVGroupBatch changed: check that Ctx::pass_key reads every new field");
@@ -1041,6 +1041,9 @@ uint64_t Ctx::pass_key(const RadBatch* b) const {
     ptr(b->lora_slot);
     /* Zero issues no projection op (RadBatch::control_vector). */
     mix((uint64_t)b->control_vector);
+    /* A cut prefill step issues a prefix of the layers (RadBatch::consumer_full); consumer_end
+     * changes nothing it issues. */
+    mix((uint64_t)(uint32_t)b->consumer_full);
     for (int g = 0; g < b->n_kv_groups; ++g) {
         const RadKVGroupBatch& k = b->kv[g];
         mix((uint64_t)k.group);  ptr(k.slot_mapping); ptr(k.block_table);

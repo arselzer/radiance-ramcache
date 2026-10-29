@@ -2045,6 +2045,21 @@ int FileStager::hx_init_fetch() {
             RAD_INFO("host experts: early issue: a routed layer's card ops go ahead of its counts sync, "
                      "and its CPU share is chosen at its gather");
     }
+    hx_post_late_ = false;
+    const char* pl = nullptr;
+    if (asked("RADIANCE_EXPERIMENTAL_DS41_PREFETCH_POST_LATE", &pl)) {
+        if (std::strcmp(pl, "1") != 0 || !hx_early_ || !hx_pred_ || !hx_pred_->pieces() || !hx_ra_) {
+            RAD_ERR("RADIANCE_EXPERIMENTAL_DS41_PREFETCH_POST_LATE=%s: 1 posts the read-ahead's prediction "
+                    "after an early-issued layer's CPU work is submitted, which needs "
+                    "RADIANCE_EXPERIMENTAL_DS41_EARLY_ISSUE=1 and the read-ahead in pieces "
+                    "(RADIANCE_EXPERIMENTAL_DS41_PREFETCH=pieces, its readers running)", pl);
+            return RAD_E_INVAL;
+        }
+        hx_post_late_ = true;
+        if (plan_->rank == 0)
+            RAD_INFO("host experts: early issue: rank 0 posts the read-ahead's router input once a layer's "
+                     "CPU work is submitted (RADIANCE_EXPERIMENTAL_DS41_PREFETCH_POST_LATE)");
+    }
     const char* f = nullptr;
     if (asked("RADIANCE_EXPERIMENTAL_DS41_FETCH_LIST", &f)) {
         if (std::strcmp(f, "1") != 0 || !hx_pool_) {
@@ -2116,7 +2131,8 @@ int FileStager::hx_early_decide() {
     hx_stats_.early_wait_ns += sync_ns;
     RAD_TRY(mover_->retire_file_windows());
     const auto t_retired = std::chrono::steady_clock::now();
-    if (hx_pred_ && pass_tok_ == 1 && plan_->rank == 0 &&
+    /* ..._PREFETCH_POST_LATE: after hx_submit below instead. */
+    if (hx_pred_ && pass_tok_ == 1 && plan_->rank == 0 && !hx_post_late_ &&
         moe_runs(L.layer + (hx_pred_->pieces() ? 2 : 1)))
         hx_pred_->post(trace_pass_, L.layer, hx_x_);
     int64_t total = 0;
@@ -2153,6 +2169,13 @@ int FileStager::hx_early_decide() {
     }
     if (hx_li_ == li) RAD_TRY(hx_submit());
     const auto t_submitted = std::chrono::steady_clock::now();
+    auto t_posted = t_submitted;
+    /* ..._PREFETCH_POST_LATE: the prediction of layer L+2 once this layer's CPU work is out, as
+     * start_ep_routed posts it, so the post does not hold back the pool's start. */
+    if (hx_post_late_ && pass_tok_ == 1 && plan_->rank == 0 && moe_runs(L.layer + 2)) {
+        hx_pred_->post(trace_pass_, L.layer, hx_x_);
+        t_posted = std::chrono::steady_clock::now();
+    }
     /* This layer took its read-ahead entries: now the next layer's (predicted from this one). */
     if (hx_pf_.joinable() && pass_tok_ == 1 && (size_t)(li + hx_pf_ahead_) < layers_.size() &&
         moe_runs(layers_[(size_t)(li + hx_pf_ahead_)].layer))
@@ -2164,6 +2187,7 @@ int FileStager::hx_early_decide() {
         ep_stats_.d_choose_ns += ns(t_retired, t_chosen);
         ep_stats_.d_miss_post_ns += ns(t_chosen, t_miss_posted);
         ep_stats_.d_submit_ns += ns(t_miss_posted, t_submitted);
+        ep_stats_.d_post_ns += ns(t_submitted, t_posted);
         ep_stats_.d_decide_ns += ns(t_counts, t_stage);
     }
     /* Nothing is staged (the card reads only aliases); the misses' drive reads count as the

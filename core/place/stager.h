@@ -632,6 +632,13 @@ private:
     bool    hx_early_seen_ = false;     /* its gate_up read the rows its copies fetched */
     EpRouteCounts hx_early_v_;          /* its counts row's witness, checked at the decision */
     int  hx_early_decide();
+    /* RADIANCE_EXPERIMENTAL_DS41_PREFETCH_POST_LATE=1 (with ..._EARLY_ISSUE and ..._PREFETCH=pieces):
+     * hx_early_decide posts rank 0's router input to the predictor once the layer's CPU work is
+     * submitted, as start_ep_routed does, instead of before hx_choose, where the post (its copy
+     * of the input and the predictor's wake, 4-6 us) delays the pool's start (rank 0's choose
+     * 8.1-8.9 us against 3.8-4.4 on ranks 1-3 in every Ei arm). The prediction starts ~25 us later
+     * (the submit) on a lead of ~1.65 ms. Timed apart (d_post_ns), as start_ep_routed's post. */
+    bool    hx_post_late_ = false;
     /* RADIANCE_EXPERIMENTAL_DS41_FETCH_LIST=1: the counts row and the pool's rows in one ranged
      * copy (hx_fetch_list.h) instead of four dispatches. The copy kernel reads its range list when
      * it runs, so each list lives on the card, one a routed layer and pass size (the rows' count

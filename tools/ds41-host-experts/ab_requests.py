@@ -5,7 +5,13 @@
                                           in waves of K at once); save each response
   ab_requests.py --compare DIR ARM...     per request: whether each arm's text equals the first
                                           arm's, and each arm's decode tokens/s
+  ab_requests.py --hashes DIR ARM...      per prompt, in the order the server ended their prefills:
+                                          whether each arm's prefill hashes (RADIANCE_EXPERIMENTAL_DS41_
+                                          PREFILL_HASH, the Kh part) equal the first arm's, every KV
+                                          group of every rank and the last row's logits; on a
+                                          difference, the groups, ranks and window layers that differ
 """
+import re
 import json
 import os
 import sys
@@ -108,8 +114,96 @@ def compare(d, arms):
         "%12.2f tok/s" % (tot[a][1] / tot[a][0] * 1e3 if tot[a][0] else 0.0) for a in data))
 
 
+_ALL = re.compile(r"prefill hash: seq (\d+), (\d+) tokens: all ranks ([0-9a-f]{16})")
+_RANK = re.compile(r"prefill hash: seq (\d+), (\d+) tokens \(([^)]*)\), rank (\d+): (.*)$")
+_LAYERS = re.compile(r"prefill hash: seq (\d+) rank (\d+) (\S+) by layer: (.*)$")
+
+
+def hash_log(path):
+    """One record a prompt, in log order: tokens, the digest over every rank, and per rank its
+    groups' hashes (name -> hex) and the window group's hashes by layer."""
+    out, cur = [], {}
+    for line in open(path, errors="replace"):
+        m = _RANK.search(line)
+        if m:
+            seq, rank = m.group(1), int(m.group(4))
+            groups = dict(g.split("=", 1) for g in m.group(5).split() if "=" in g)
+            cur.setdefault(seq, {"ranks": {}, "layers": {}, "cut": {}})
+            cur[seq]["ranks"][rank] = groups
+            cur[seq]["cut"][rank] = m.group(3)
+            continue
+        m = _LAYERS.search(line)
+        if m:
+            seq, rank = m.group(1), int(m.group(2))
+            cur.setdefault(seq, {"ranks": {}, "layers": {}, "cut": {}})
+            cur[seq]["layers"][rank] = dict(x.split(":", 1) for x in m.group(4).split())
+            continue
+        m = _ALL.search(line)
+        if m:
+            seq = m.group(1)
+            rec = cur.pop(seq, {"ranks": {}, "layers": {}, "cut": {}})
+            rec.update({"seq": seq, "tokens": int(m.group(2)), "all": m.group(3)})
+            out.append(rec)
+    return out
+
+
+def hashes(d, arms):
+    """Each arm's prompts against the first arm's, by position: the same tokens and digest, or what
+    differs. Exit status 1 when anything differs, 2 when an arm has no hashes."""
+    logs = {}
+    for a in arms:
+        try:
+            logs[a] = hash_log("%s/%s.server.log" % (d, a))
+        except OSError:
+            logs[a] = []
+        if not logs[a]:
+            print("arm %s: no prefill hashes (run it with the Kh part)" % a)
+    arms = [a for a in arms if logs[a]]
+    if len(arms) < 2:
+        return 2
+    first = arms[0]
+    ref = logs[first]
+    bad = 0
+    print("prefill hashes against %s: %d prompts" % (first, len(ref)))
+    for a in arms[1:]:
+        got = logs[a]
+        same = 0
+        for i, r in enumerate(ref):
+            if i >= len(got):
+                print("  %s: prompt %d (%d tokens) missing" % (a, i, r["tokens"]))
+                bad += 1
+                continue
+            g = got[i]
+            if g["tokens"] != r["tokens"]:
+                print("  %s: prompt %d is %d tokens, %s's %d: not the same prompts" %
+                      (a, i, g["tokens"], first, r["tokens"]))
+                bad += 1
+                continue
+            if g["all"] == r["all"]:
+                same += 1
+                continue
+            bad += 1
+            diffs = []
+            for rank in sorted(r["ranks"]):
+                for name, h in r["ranks"][rank].items():
+                    if g["ranks"].get(rank, {}).get(name) != h:
+                        diffs.append("rank %d %s" % (rank, name))
+                lr, lg = r["layers"].get(rank, {}), g["layers"].get(rank, {})
+                ls = [l for l in lr if lg.get(l) != lr[l]]
+                if ls:
+                    diffs.append("rank %d window layers %s" % (rank, ",".join(ls)))
+            print("  %s: prompt %d (%d tokens, %s): DIFFERS: %s" %
+                  (a, i, r["tokens"], g["cut"].get(0, "?"), "; ".join(diffs) or "the digest"))
+        cut = sum(1 for g in got if g["cut"].get(0, "").startswith("cut"))
+        print("  %s: %d of %d prompts identical (%d of its prefills cut)" %
+              (a, same, len(ref), cut))
+    return 1 if bad else 0
+
+
 if __name__ == "__main__":
     if sys.argv[1] == "--compare":
         compare(sys.argv[2], sys.argv[3:])
+    elif sys.argv[1] == "--hashes":
+        sys.exit(hashes(sys.argv[2], sys.argv[3:]))
     else:
         run(sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4])

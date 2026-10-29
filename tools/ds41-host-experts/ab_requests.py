@@ -94,8 +94,9 @@ def compare(d, arms):
             print("arm %s: no results" % a)
     if not data:
         return
-    first = arms[0]
-    names = list(data.get(first, next(iter(data.values()))).keys())
+    # The first arm with results (a Kld arm records instead of serving, so it has none).
+    first = next(a for a in arms if a in data)
+    names = list(data[first].keys())
     print("%-12s" % "request" + "".join("%18s" % a for a in data))
     tot = {a: [0.0, 0] for a in data}
     for n in names:

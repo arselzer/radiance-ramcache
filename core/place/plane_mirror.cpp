@@ -6,6 +6,7 @@
 
 #include <dirent.h>
 #include <fcntl.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -22,18 +23,27 @@ namespace {
 
 constexpr int64_t kAlign = 4096;
 
-/* This thread's O_DIRECT bounce buffer, grown as asked. */
+/* This thread's O_DIRECT bounce buffer, grown as asked: in whole 2 MiB, 2 MiB-aligned and on
+ * transparent huge pages where granted, so a request is not cut at 1 MiB by a page-scattered
+ * buffer (RADIANCE_EXPERIMENTAL_DS41_PLANE_HUGEPAGES=0: 4 KiB pages, as before). */
 uint8_t* bounce(int64_t bytes) {
     struct Buf {
         uint8_t* p = nullptr;
         int64_t  cap = 0;
         ~Buf() { std::free(p); }
     };
+    static const bool huge = [] {
+        const char* s = std::getenv("RADIANCE_EXPERIMENTAL_DS41_PLANE_HUGEPAGES");
+        return !s || std::strcmp(s, "0") != 0;
+    }();
     thread_local Buf b;
     if (b.cap < bytes) {
         std::free(b.p);
-        b.p = (uint8_t*)std::aligned_alloc((size_t)kAlign, (size_t)bytes);
-        b.cap = b.p ? bytes : 0;
+        constexpr int64_t kHuge = (int64_t)2 << 20;
+        const int64_t a = huge ? kHuge : kAlign, n = (bytes + a - 1) / a * a;
+        b.p = (uint8_t*)std::aligned_alloc((size_t)a, (size_t)n);
+        if (b.p && huge) (void)::madvise(b.p, (size_t)n, MADV_HUGEPAGE);
+        b.cap = b.p ? n : 0;
     }
     return b.p;
 }

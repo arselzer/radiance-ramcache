@@ -846,6 +846,10 @@ private:
     std::vector<RelayIn> relay_in_;
     int                  relay_threads_ = 1;
     NativeReadWorkers    relay_workers_;
+    /* read_unit_planes' readers: kept, so a miss starts no threads and a mirror read finds its
+     * thread's bounce buffer warm (RADIANCE_EXPERIMENTAL_DS41_READ_POOL=0: a thread a read, as
+     * before). */
+    NativeReadWorkers    plane_workers_;
     bool                 native_file_workers_on_ = false;
     int  read_relaid(const WeightInfo& w, void* dst, int64_t dst_cap, RelayIn* in);
     int  read_native_file(const WeightInfo& w, void* dst, int64_t dst_cap, RelayIn* in,

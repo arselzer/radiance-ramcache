@@ -18,7 +18,29 @@
 #include <thread>
 #include <unordered_map>
 
+#include <sys/mman.h>
+
 namespace rad {
+
+/* A buffer for O_DIRECT reads of a unit's planes (Mover::read_unit_planes): 2 MiB-aligned, a whole
+ * number of 2 MiB, and on transparent huge pages where the kernel grants them. A buffer of
+ * scattered 4 KiB pages limits a drive request to its 256 segments (1 MiB); on huge pages one
+ * request spans the drive's 2 MiB max_sectors (measured: an 18.8 MB miss read 3.03 -> 2.83 ms,
+ * 6.2 -> 6.7 GB/s). *cap gets the size; freed with std::free. */
+uint8_t* alloc_plane_buffer(int64_t bytes, int64_t* cap) {
+    /* RADIANCE_EXPERIMENTAL_DS41_PLANE_HUGEPAGES=0: 4 KiB pages, as before (an A/B switch). */
+    static const bool huge = [] {
+        const char* s = std::getenv("RADIANCE_EXPERIMENTAL_DS41_PLANE_HUGEPAGES");
+        return !s || std::strcmp(s, "0") != 0;
+    }();
+    const int64_t a = huge ? (int64_t)2 << 20 : DirectFile::alignment();
+    const int64_t n = (bytes + a - 1) / a * a;
+    void* p = std::aligned_alloc((size_t)a, (size_t)n);
+    if (!p) { *cap = 0; return nullptr; }
+    if (huge) (void)::madvise(p, (size_t)n, MADV_HUGEPAGE);
+    *cap = n;
+    return static_cast<uint8_t*>(p);
+}
 
 /* ------------------------------------------------------------------ the file tier */
 int FileTier::open(const std::string& path) {
@@ -856,8 +878,7 @@ bool Mover::read_unit_planes(HostPlanes* const* units, int n, int rows) {
             const int64_t a0 = lo / A * A, need = align_up(hi - a0, A);
             if (p->cap[k] < need) {
                 std::free(p->buf[k]);
-                p->buf[k] = (uint8_t*)std::aligned_alloc((size_t)A, (size_t)need);
-                p->cap[k] = p->buf[k] ? need : 0;
+                p->buf[k] = alloc_plane_buffer(need, &p->cap[k]);
                 if (!p->buf[k]) return false;
             }
             p->w[k] = mu.weights[(size_t)k];
@@ -888,23 +909,34 @@ bool Mover::read_unit_planes(HostPlanes* const* units, int n, int rows) {
     }
     const auto t0 = std::chrono::steady_clock::now();
     std::vector<int> rc(reads.size(), RAD_OK);
-    /* At most 16 readers at once, each taking the next read (the mirror's first: they take the
-     * longest); a reader that cannot be started leaves its share to the others and this thread. */
+    /* Readers each take the next read (the mirror's first: they take the longest): up to 8 kept
+     * workers (plane_workers_, this thread one of them), or with ..._READ_POOL=0 up to 16 threads
+     * started for the call; a reader that cannot be started leaves its share to the others. */
+    static const bool pooled = [] {
+        const char* s = std::getenv("RADIANCE_EXPERIMENTAL_DS41_READ_POOL");
+        return !s || std::strcmp(s, "0") != 0;
+    }();
     std::atomic<size_t> next{ 0 };
-    auto reader = [&] {
+    auto reader = [&](int) {
         for (size_t j; (j = next.fetch_add(1)) < reads.size();) {
             const Read& r = reads[j];
             rc[j] = r.m ? mirror->read(*r.m, r.from, (uint64_t)r.len, r.dst)
                         : read_source_file(r.file, (uint64_t)r.off, r.len, r.dst, r.cap);
         }
     };
-    std::vector<std::thread> th;
-    try {
-        for (size_t t = 1; t < std::min<size_t>(reads.size(), 16); ++t) th.emplace_back(reader);
-    } catch (...) {
+    const NativeReadWorkers::Result pr = !pooled || reads.size() < 2
+        ? NativeReadWorkers::Result::Invalid
+        : plane_workers_.run(8, (int)std::min<size_t>(reads.size(), 8), reader);
+    if (pr == NativeReadWorkers::Result::CallbackFailed) return false;   /* reads left undone */
+    if (pr == NativeReadWorkers::Result::Invalid) {
+        std::vector<std::thread> th;
+        try {
+            for (size_t t = 1; t < std::min<size_t>(reads.size(), 16); ++t) th.emplace_back(reader, (int)t);
+        } catch (...) {
+        }
+        reader(0);
+        for (std::thread& t : th) t.join();
     }
-    reader();
-    for (std::thread& t : th) t.join();
     /* A mirror read that failed: the mirror is off for good, and the container has the bytes. */
     for (size_t j = 0; j < reads.size(); ++j)
         if (reads[j].m && rc[j] < 0) {

@@ -214,7 +214,9 @@ for a in $ARMS; do
 # profile before serving; ZN fail the N-th plane mirror read (tests the fallback to the container);
 # A / AN read a layer's missed planes on a worker while the card's ops are issued (passes of N+
 # tokens; A is every pass); Q[gnc] the arm's power settings (see power_set); SgK / SgaK prompt-lookup
-# speculation, K drafts a step (fixed / adaptive window); rN a repeat (ignored).
+# speculation, K drafts a step (fixed / adaptive window); Er the token embedding in host RAM; Xp / Xh
+# miss reads on threads started per call / on 4 KiB pages (the old ways, as A/B switches); rN a
+# repeat (ignored).
   IFS=- read -r -a parts <<< "$a"
   pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 HOST_POOL_MIB=4096 EXTRA_ARGS="" ARM_HOME="$RHOME"
   power="" skip="" ARGS=()
@@ -252,6 +254,8 @@ for a in $ARMS; do
       Po[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_PREFETCH=on RADIANCE_EXPERIMENTAL_DS41_PREFETCH_K=${p#Po}) ;;
       Pt[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_PREFETCH=on RADIANCE_EXPERIMENTAL_DS41_PREFETCH_AHEAD=2 RADIANCE_EXPERIMENTAL_DS41_PREFETCH_K=${p#Pt}) ;;
       Er)      ARGS+=(--embedding-placement ram) ;;   # the token embedding pinned in host RAM, its VRAM to experts
+      Xp)      env+=(RADIANCE_EXPERIMENTAL_DS41_READ_POOL=0) ;;        # miss reads on threads started a call
+      Xh)      env+=(RADIANCE_EXPERIMENTAL_DS41_PLANE_HUGEPAGES=0) ;;  # miss buffers on 4 KiB pages
       *)       log "arm $a: unknown part $p" ;;
     esac
   done

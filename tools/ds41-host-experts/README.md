@@ -6,7 +6,7 @@ host-expert path: the CPU computes every routed expert the cards do not hold, bi
 card's MXFP4 GEMV, so every reply stays byte-identical to the base engine's.
 
 On the loop's eight held-out prompts (64 tokens, greedy, TP4) the path takes decode from 5.03 to
-about 12 tok/s and the time to first token summed over the prompts from 64.0 to about 19.5 s. Every
+about 13.3 tok/s and the time to first token summed over the prompts from 64.0 to about 18.2 s. Every
 step was measured as an A/B window; the log is `/home/as/ds41-decode-review-20261028/NIGHT-LOG.md`.
 
 ## What runs where
@@ -42,7 +42,7 @@ radiance ... --tp 4 --placement expert_tiered --weights-disk-tier \
   --expert-ram-cache-total-mib 98304 --host-pool-mib 256 --embedding-placement ram \
   --max-num-batched-tokens 16 --expert-profile <decode profile> \
   --expert-plane-mirror <dir of the checkpoint's model-*.safetensors> \
-  --expert-plane-mirror-decode-share 0.10                              # the mirror is optional, see below
+  --expert-plane-mirror-decode-share 0.13                              # the mirror is optional, see below
 ```
 
 With the planner's routed-only staging reserve (`bba1fda6`) the pinned pool needs only 256 MiB a rank,
@@ -60,13 +60,14 @@ the engine or the scripts assumes where the checkpoint is. `ab_window.sh` takes 
 | `--embedding-placement ram` | +1.5%, TTFT −2.4% | the engine's default (the A/B script had forced `vram`): the token embedding pinned in host RAM (1.26 GB), its 316 MiB a rank of VRAM to ~17 more resident experts |
 | `--host-pool-mib 256`, cache 96 GiB | +9% (vs the 4 GiB pool) | the pinned pool's RAM is worth more as cache; 256 MiB since the planner fix (was 1900); 96 GiB leaves ~14 GiB free (102 GiB: +4.3% in two runs of three, ~8 GiB free, sensitive to other jobs) |
 | `..._NATIVE_CACHE_PREGROW=1` | request 2 TTFT 13.7 → 5.0 s | slabs pinned at startup (+~30 s startup) |
-| `--expert-plane-mirror DIR` | prefill TTFT −7 to −11% | `--expert-plane-mirror-share` (0.18) in passes of `--expert-plane-mirror-min-rows` (2) tokens or more; `--expert-plane-mirror-decode-share` (0) in decode, where 0.10 measured +3.6% (three runs), 0.14 −1% against 0.10 and 0.18 −4%; turns itself off if a read fails or a shard changes; `RADIANCE_EXPERIMENTAL_DS41_PLANE_MIRROR_FAULT=N` tests that |
+| `--expert-plane-mirror DIR` | prefill TTFT −7 to −11% | `--expert-plane-mirror-share` (0.18) in passes of `--expert-plane-mirror-min-rows` (2) tokens or more; `--expert-plane-mirror-decode-share` (0) in decode, where 0.10 measured +3.6% (three runs), 0.14 −1% against 0.10 and 0.18 −4%; with the kept readers 0.13 +0.6% against 0.10 (two runs); turns itself off if a read fails or a shard changes; `RADIANCE_EXPERIMENTAL_DS41_PLANE_MIRROR_FAULT=N` tests that |
 | `..._FILE_BUFFER_UNITS=1` | +9.5% (176 more VRAM experts a rank) | refused unless the CPU takes every routed unit of every pass (all, MISSES=16, passes ≤ 16 tokens) |
 | `..._CACHE_WARM=1` | first request 7.1 → 11.2 tok/s, TTFT 7.9 → 4.6 s | +~14 s startup; pins the slabs first |
 | `..._ASYNC_MISSES=2` | TTFT −25% | decode passes keep the direct path (no gain there) |
 | `..._HOST_EXPERTS_INSERT_THREADS` (4) | | background relayout+insert threads |
 | `..._PREFETCH=shadow\|on`, `_PREFETCH_K` | read-ahead: top 6 −14%, top 2 ±0 | off; shadow prints precision by prediction rank |
 | `..._ACCESS_TRACE=<dir>` | | per-rank access traces for `cache_sim.py` |
+| miss reads on kept readers, 2 MiB pages | +4.6%, TTFT −3.6% | on by default; `RADIANCE_EXPERIMENTAL_DS41_READ_POOL=0` starts threads a call and `..._PLANE_HUGEPAGES=0` uses 4 KiB pages, as before (A/B switches) |
 
 ## Tools
 

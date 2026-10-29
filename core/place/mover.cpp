@@ -903,6 +903,28 @@ int Mover::insert_unit_planes(const HostPlanes& p, std::vector<uint8_t>* scratch
     return RAD_OK;
 }
 
+bool Mover::read_weight_file(const WeightInfo& w, void* dst) {
+    if (!dst || !file_.ok() || !w.identity || w.stored_bytes <= 0 ||
+        (w.decl.shard != RAD_SHARD_NONE && plan_ && plan_->world_size > 1))
+        return false;
+    const int64_t A = DirectFile::alignment();
+    const int64_t off = (int64_t)w.file_offset, a0 = off / A * A;
+    const int64_t len = off + w.stored_bytes - a0, cap = align_up(len, A);
+    uint8_t* buf = (uint8_t*)std::aligned_alloc((size_t)A, (size_t)cap);
+    if (!buf) return false;
+    const int rc = read_source_file(w.file_id, (uint64_t)a0, len, buf, cap);
+    if (rc >= 0) std::memcpy(dst, buf + (off - a0), (size_t)w.stored_bytes);
+    std::free(buf);
+    return rc >= 0;
+}
+
+bool Mover::unit_cached(int32_t u) {
+    if (!plan_ || !prog_ || !mapped_file_cache_on_ || u < 0 || (size_t)u >= unit_.size()) return false;
+    for (rad_weight h : plan_->units[(size_t)u].weights)
+        if (!mapped_file_cache_.present((size_t)h)) return false;
+    return true;
+}
+
 bool Mover::host_planes_eligible(int32_t u) const {
     if (!plan_ || !prog_ || !mapped_file_cache_on_ || u < 0 || (size_t)u >= unit_.size()) return false;
     const UnitState& us = unit_[(size_t)u];

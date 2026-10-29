@@ -16,7 +16,7 @@
 # Before the arms (DEVICE_CHECKS=1, the default), the device harness checks the served libr4d.so on
 # card 0: swiglu over every (gate, up) pair with mismatches classified, and the host chain.
 #
-# Arms are named POLICY[-tN][-gG][-sS][-nP][-mM][-MR][-f][-x] (see the loop below), e.g. "base greedy-t20-g65 all-t24".
+# Arms are named POLICY[-tN][-gG][-sS][-nP][-mM][-MR][-PsK|-PoK][-f][-x] (see the loop below), e.g. "base greedy-t20-g65 all-t24".
 #
 # Environment: RADIANCE_BIN (the binary), RADIANCE_HOME_DIR (kernels/ and architectures/ for it),
 # SILU_TABLE (the card's silu table), ARMS (default "base verify greedy"), HX_THREADS (16),
@@ -99,7 +99,7 @@ arm() {   # name, then env assignments for the server; CACHE_MIB the RAM cache (
       --vision-tower-placement vram --ngram-placement disk --max-model-len 512 \
       --max-num-batched-tokens 16 --max-num-seqs 1 --kv-cache-dtype bf16 \
       --num-speculative-tokens 0 --spec-ngram 0 --no-prefix-cache --deterministic \
-      --host 127.0.0.1 --port $PORT --expert-profile "$PROFILE" >"$OUT/$name.server.log" 2>&1 &
+      --host 127.0.0.1 --port $PORT --expert-profile "$PROFILE" ${EXTRA_ARGS:-} >"$OUT/$name.server.log" 2>&1 &
   SERVER_PID=$!
   # Memory guard: stops this server (never anything else) if the host runs short.
   ( while kill -0 "$SERVER_PID" 2>/dev/null; do
@@ -158,9 +158,10 @@ for a in $ARMS; do
   # An arm is POLICY[-tN][-gG][-sS][-nP][-mM][-MR][-f][-x]: policy base, verify, greedy or all; N CPU
   # threads; G GB/s the schedule assumes for the CPU; S us the idle pool spins; P the pool's nice
   # value; M MiB of RAM cache (81920); R: passes of at most R tokens compute their missed experts on
-  # the CPU from the container's planes; f the mover's direct cache fill; x an access trace.
+  # the CPU from the container's planes; f the mover's direct cache fill; x an access trace;
+  # PsK / PoK the next-layer predictor in shadow / on mode keeping K experts; o --profile-ops.
   IFS=- read -r -a parts <<< "$a"
-  pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920
+  pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 EXTRA_ARGS=""
   for p in "${parts[@]:1}"; do
     case $p in
       t[0-9]*) threads=${p#t} ;;
@@ -171,6 +172,9 @@ for a in $ARMS; do
       n[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_NICE=${p#n}) ;;
       m[0-9]*) CACHE_MIB=${p#m} ;;
       M[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MISSES=${p#M}) ;;
+      o)       EXTRA_ARGS="--profile-ops" ;;
+      Ps[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_PREFETCH=shadow RADIANCE_EXPERIMENTAL_DS41_PREFETCH_K=${p#Ps}) ;;
+      Po[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_PREFETCH=on RADIANCE_EXPERIMENTAL_DS41_PREFETCH_K=${p#Po}) ;;
       *)       log "arm $a: unknown part $p" ;;
     esac
   done

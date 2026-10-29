@@ -129,6 +129,22 @@ Engine::~Engine() {
                      (unsigned long long)hx.moved, (unsigned long long)hx.probed,
                      (unsigned long long)hx.miss_units, (unsigned long long)hx.miss_rows,
                      (double)hx.miss_read_ns / 1e6);
+        if (hx.pred_layers)
+            RAD_INFO("next-layer predictor: on time for %llu of %llu one-token layers; %llu of %llu "
+                     "misses predicted (%.1f%%); %llu file-tier experts predicted, %llu of them "
+                     "selected (%.1f%%), %llu neither selected nor cached (a read-ahead's waste)",
+                     (unsigned long long)hx.pred_ready, (unsigned long long)hx.pred_layers,
+                     (unsigned long long)hx.pred_hit, (unsigned long long)hx.pred_misses,
+                     hx.pred_misses ? 100.0 * (double)hx.pred_hit / (double)hx.pred_misses : 0.0,
+                     (unsigned long long)hx.pred_file, (unsigned long long)hx.pred_selected,
+                     hx.pred_file ? 100.0 * (double)hx.pred_selected / (double)hx.pred_file : 0.0,
+                     (unsigned long long)hx.pred_wasted);
+        if (hx.pf_read)
+            RAD_INFO("read-ahead: %llu units read ahead, %llu used by a miss (%.1f%%); %llu misses "
+                     "waited for theirs, %.1f ms in all",
+                     (unsigned long long)hx.pf_read, (unsigned long long)hx.pf_used,
+                     100.0 * (double)hx.pf_used / (double)hx.pf_read,
+                     (unsigned long long)hx.pf_waited, (double)hx.pf_wait_ns / 1e6);
     }
     /* Drain the transfer streams before the contexts. Ctx::shutdown drains the compute streams
      * and frees the arena, but the mover's stream also copies into the arena (the prefill

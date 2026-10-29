@@ -243,6 +243,8 @@ public:
         if(rc!=Status::Ok){records_.reset();count_=metadata_=0;first_free_=SIZE_MAX;return RAD_E_NOMEM;}
         slab_policy_=want_slabs;return RAD_OK;
     }
+    // Resident without a lease, an LRU touch or a statistic; slab policy only (false otherwise).
+    bool present(size_t key) noexcept { return slab_policy_&&slab_cache_.present(1,key); }
     Status borrow(size_t key,size_t bytes,Lease* lease) noexcept {
         if(!lease||!lease->empty())return Status::Invalid;
         return slab_policy_?slab_cache_.borrow(1,key,bytes,&lease->slab_):cache_.borrow(1,key,bytes,&lease->regular_);

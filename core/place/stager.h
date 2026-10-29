@@ -89,6 +89,7 @@
 #include "dspark_head_tail.h"
 #include "host_expert_pool.h"
 
+#include <array>
 #include <condition_variable>
 #include <cstdio>
 #include <deque>
@@ -268,6 +269,15 @@ public:
     struct HostStats {
         uint64_t layers = 0, units = 0, rows = 0;
         uint64_t miss_units = 0, miss_rows = 0, miss_read_ns = 0;   /* misses computed from planes */
+        /* The next-layer predictor (router_predictor.h) against one-token layers: predictions on
+         * time, the layers' misses, the misses predicted, the file-tier experts predicted, and of
+         * those the ones the layer selected. */
+        uint64_t pred_layers = 0, pred_ready = 0, pred_misses = 0, pred_hit = 0;
+        uint64_t pred_file = 0, pred_selected = 0;
+        uint64_t pred_wasted = 0;   /* predicted file-tier experts not selected and not cached */
+        /* Read-ahead (..._PREFETCH=on): units read ahead, of them used by a miss, the misses that
+         * found theirs still being read and how long they waited. */
+        uint64_t pf_read = 0, pf_used = 0, pf_waited = 0, pf_wait_ns = 0;
         uint64_t linked = 0;          /* cached experts the schedule left on the copy link */
         uint64_t missed = 0;          /* routed experts the RAM cache did not hold */
         uint64_t wait_ns = 0;         /* the issuing thread waiting at gathers for the CPU */
@@ -430,6 +440,24 @@ private:
      * from the container straight into reused host buffers, computed as urgent jobs, and relaid
      * into the RAM cache by a background thread so later passes hit. */
     int  hx_miss_rows_ = 0;
+    /* By routed layer: each local expert's file-tier unit, or -1 (on the card or pinned). */
+    std::vector<std::array<int32_t, 96>> hx_unit_of_;
+    class RouterPredictor* hx_pred_ = nullptr;
+    /* Read-ahead: a thread a rank reads the next layer's predicted uncached units (hx_pf_loop) for
+     * hx_choose to take instead of reading them. hx_miss_ready_ is parallel to hx_miss_: the
+     * planes are in already (read ahead). */
+    struct PfEntry { int32_t unit = -1; std::shared_ptr<Mover::HostPlanes> p; bool done = false, ok = false; };
+    std::thread hx_pf_;
+    std::mutex hx_pf_mu_;
+    std::condition_variable hx_pf_cv_;
+    uint32_t hx_pf_pass_ = 0;
+    int32_t  hx_pf_li_ = -1;
+    uint64_t hx_pf_seq_ = 0;
+    std::vector<PfEntry> hx_pf_entries_;
+    bool hx_pf_stop_ = false;
+    std::vector<uint8_t> hx_miss_ready_;
+    void hx_pf_loop();
+    void hx_pf_target(int32_t li);
     std::vector<std::shared_ptr<Mover::HostPlanes>> hx_miss_;     /* this layer's */
     std::vector<std::unique_ptr<Mover::HostPlanes>> hx_planes_free_;
     std::mutex hx_planes_mu_;

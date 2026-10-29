@@ -624,7 +624,12 @@ public:
     };
     bool  read_unit_planes(HostPlanes* const* units, int n);
     bool  host_planes_eligible(int32_t u) const;   /* what read_unit_planes accepts */
+    /* read_weight_file  a whole weight the container stores as is (an identity plane, every row
+     *                   on this rank) into dst, for a host reader such as the router predictor. */
+    bool  read_weight_file(const WeightInfo& w, void* dst);
     bool  mapped_cache_on() const { return mapped_file_cache_on_; }
+    /* Whether the mapped RAM cache holds every weight of unit u, without touching it. */
+    bool  unit_cached(int32_t u);
     int   insert_unit_planes(const HostPlanes& p, std::vector<uint8_t>* scratch);
     /* set_file_relayout  the function that makes a file-tier weight's stored form from its
      *                    container planes when the two differ (weight_file_relaid): the kernel's

@@ -269,6 +269,10 @@ public:
     Status borrow(uint64_t ns,size_t key,size_t n,Lease*out){return borrow_policy(ns,key,n,out,true);}
     //Read-only scans still own immutable bytes and account hits, but preserve decode LRU order.
     Status borrow_no_touch(uint64_t ns,size_t key,size_t n,Lease*out){return borrow_policy(ns,key,n,out,false);}
+    // Whether key is resident: no lease, no LRU touch, no statistics (a predictor's question).
+    bool present(uint64_t ns,size_t key){
+        std::lock_guard<std::mutex>o(owner_mutex_);if(!state_)return false;State&s=*state_;std::lock_guard<std::mutex>l(s.mutex);
+        return ns==s.stats.cache.namespace_id&&!s.retiring&&key<s.count&&s.entries[key].present;}
 private:
     Status borrow_policy(uint64_t ns,size_t key,size_t n,Lease*out,bool touch_lru){
         if(!out||!out->empty()||klass_for(n)<0)return Status::Invalid;

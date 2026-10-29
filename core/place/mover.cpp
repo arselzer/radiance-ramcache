@@ -1049,6 +1049,19 @@ int64_t Mover::mapped_cache_pregrow() {
     return (int64_t)std::min(st.slabs.classes[0].capacity_slots, st.slabs.classes[1].capacity_slots);
 }
 
+int Mover::mapped_cache_second_chances(const std::vector<int32_t>& units, int chances) {
+    if (!mapped_file_cache_on_ || !plan_ || !mapped_file_cache_.stats().slab_policy) return 0;
+    int n = 0;
+    for (int32_t u : units) {
+        if (u < 0 || (size_t)u >= plan_->units.size()) continue;
+        bool all = true;
+        for (rad_weight h : plan_->units[(size_t)u].weights)
+            all = mapped_file_cache_.protect((size_t)h) == NativeMappedFileCache::Status::Ok && all;
+        n += all;
+    }
+    return mapped_file_cache_.set_second_chances(chances) == NativeMappedFileCache::Status::Ok ? n : 0;
+}
+
 int Mover::mirror_init() {
     PlaneMirror* m = PlaneMirror::get();
     mirror_tail_ = mirror_tail_decode_ = 0;
@@ -2760,6 +2773,8 @@ std::string Mover::report() const {
             if(mapped_direct_fill_on_)s+=fmt("  mapped direct fill: %llu reservations, %llu committed (%s), %llu cancelled (%s), %zu active; %llu same-key busy bypasses; no fill-duration cache locks; full-weight only\n",
                 (unsigned long long)a.fill_reservations,(unsigned long long)a.fill_commits,humanb(a.fill_bytes).c_str(),
                 (unsigned long long)a.fill_aborts,humanb(a.fill_abort_bytes).c_str(),a.fills_active,(unsigned long long)a.fill_busy_bypasses);
+            if(a.second_chances)s+=fmt("  mapped second chances: %llu protected LRU-end entries moved to the front instead of evicted\n",
+                (unsigned long long)a.second_chances);
             s += fmt("  mapped retained-slab ledger: %zu owners/%zu terminal free-invoked; %s retained backing, %s terminal charge, %s growth reserved; "
                      "%llu growth attempts/%llu failures; %llu device-bind failures; same-class LRU, no per-eviction public free; policy charge is not RSS/unpin proof\n",
                      a.retained_slab_owners,a.terminal_free_invoked_owners,humanb(a.retained_backing_charge).c_str(),

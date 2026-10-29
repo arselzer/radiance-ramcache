@@ -646,6 +646,9 @@ public:
     /* Pins the mapped cache's slabs (as ..._PREGROW does; again adds nothing) and returns the
      * pairs it can hold: the fewer of its gate_up and down slots. 0 without slabs. */
     int64_t mapped_cache_pregrow();
+    /* Marks `units` profile-hot in the mapped cache and gives each such entry `chances` moves to the
+     * front between uses before an insert may evict it (0: plain LRU). The units marked. */
+    int     mapped_cache_second_chances(const std::vector<int32_t>& units, int chances);
     /* Whether the mapped RAM cache holds every weight of unit u, without touching it. */
     bool  unit_cached(int32_t u);
     int   insert_unit_planes(const HostPlanes& p, std::vector<uint8_t>* scratch);

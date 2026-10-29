@@ -312,6 +312,9 @@ public:
         if(packed()){layout_refusals_.fetch_add(1,std::memory_order_relaxed);return Status::Bypass;}
         return slab_policy_?slab_cache_.reserve(1,key,bytes,&out->slab_):Status::Bypass;
     }
+    /* Second chances for profile-hot keys (SlabCache::victim_for); retained slabs only. */
+    Status set_second_chances(int n)noexcept{return slab_policy_?slab_cache_.set_second_chances(n):Status::Bypass;}
+    Status protect(size_t key)noexcept{return slab_policy_?slab_cache_.protect(1,key):Status::Bypass;}
     Status insert(size_t key,const void* source,size_t bytes) noexcept {
         if(packed()){layout_refusals_.fetch_add(1,std::memory_order_relaxed);return Status::Bypass;}
         return slab_policy_?slab_cache_.insert(1,key,source,bytes):cache_.insert(1,key,source,bytes);

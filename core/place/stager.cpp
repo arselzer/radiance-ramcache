@@ -1096,6 +1096,24 @@ int FileStager::hx_init_impl(const Program& prog) {
                 RAD_INFO("host experts: passes of %d+ tokens read their misses on a worker while the "
                          "card's ops are issued", hx_async_rows_);
         }
+        /* RADIANCE_EXPERIMENTAL_DS41_CACHE_SECOND_CHANCE=N: a cached unit the decode profile calls
+         * hot (a share of its layer's selections of at least ..._CACHE_PROTECT_SHARE, default
+         * 6 of the sealed profile's 4326) moves to the front up to N times between uses before
+         * an insert may evict it. Replayed on the chat and held-out prompts' trace: critical
+         * decode misses -7.9% (N=1) and -10.7% (N=2) against plain LRU. */
+        if (const char* sc = std::getenv("RADIANCE_EXPERIMENTAL_DS41_CACHE_SECOND_CHANCE");
+            sc && std::atoi(sc) > 0) {
+            double thr = 6.0 / 4326.0;
+            if (const char* t = std::getenv("RADIANCE_EXPERIMENTAL_DS41_CACHE_PROTECT_SHARE"); t && *t)
+                thr = std::atof(t);
+            std::vector<int32_t> hot;
+            for (const Layer& L : layers_)
+                for (int32_t u : L.units)
+                    if (plan_->units[(size_t)u].profile_share >= thr) hot.push_back(u);
+            const int n = mover_->mapped_cache_second_chances(hot, std::atoi(sc));
+            RAD_INFO("host experts: rank %d protects %d of its file-tier units with %d second "
+                     "chance(s) in the RAM cache", plan_->rank, n, std::atoi(sc));
+        }
         if (const char* w = std::getenv("RADIANCE_EXPERIMENTAL_DS41_CACHE_WARM"); w && !std::strcmp(w, "1"))
             RAD_TRY(hx_warm());
     }

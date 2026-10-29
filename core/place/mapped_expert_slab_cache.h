@@ -9,6 +9,7 @@
  * once any backing was obtained: its charge is never spent again in this instance. */
 #pragma once
 #include "mapped_expert_cache.h"
+#include <algorithm>
 #include <array>
 
 namespace ds41_mapped {
@@ -40,6 +41,7 @@ public:
         size_t retained_backing_charge=0,terminal_backing_charge=0;
         uint64_t growth_attempts=0,growth_failures=0,hit_bytes=0,miss_bytes=0;
         uint64_t fill_reservations=0,fill_commits=0,fill_aborts=0,fill_busy_bypasses=0,fill_bytes=0,fill_abort_bytes=0;
+        uint64_t second_chances=0;   /* protected LRU-end entries moved to the front instead of evicted */
         size_t fills_active=0;
         bool terminal=false;
         size_t charge()const noexcept{return cache.charge();}
@@ -51,6 +53,7 @@ private:
         uint64_t generation=0;
         int klass=-1;
         bool present=false,filling=false;
+        uint8_t protect=0,chances=0;   /* second chances: profile-hot, and moves since its last use */
     };
     struct Slab {
         Allocation allocation{};
@@ -68,6 +71,7 @@ private:
         Sizes bytes=block_sizes;
         size_t count=0,slab_records=0,used_slabs=0,next_pairs=4,minimum_quote=0;
         std::array<size_t,2> first{none,none},last{none,none};
+        uint8_t chance_limit=0;   /* 0: plain LRU */
         bool owner_alive=true,retiring=false;
         void(*test_before_copy)(void*)noexcept=nullptr;
         void*test_copy_context=nullptr;
@@ -111,6 +115,18 @@ private:
         if(e.previous!=none||e.next!=none||s.last[c]==key)unlink(s,key);
         e.next=s.first[c];e.previous=none;
         if(s.first[c]!=none)s.entries[s.first[c]].previous=key;else s.last[c]=key;s.first[c]=key;
+    }
+    /* The entry an insert of `key` in class c evicts: the LRU end, except that a protected entry
+     * there that has moved to the front fewer than chance_limit times since it was last used goes
+     * to the front instead (at most 64 a call, so the walk is bounded). A leased end is returned as
+     * is: the caller turns it away, as before. */
+    static size_t victim_for(State&s,int c,size_t key)noexcept{
+        for(int k=0;k<64&&s.chance_limit;++k){
+            const size_t v=s.last[c];if(v==none||v==key)return v;Entry&e=s.entries[v];
+            if(!e.protect||e.leases||e.chances>=s.chance_limit)return v;
+            ++e.chances;touch(s,v);++s.stats.second_chances;
+        }
+        return s.last[c];
     }
     static void initialize_slot(Slab&s,size_t slot)noexcept{
         auto*h=host(s,slot);const size_t n=bytes_for(s,slot_class(s,slot));
@@ -219,7 +235,7 @@ public:
             Slab&b=s.slabs[e.slab];if(b.keys[e.slot]!=busy||!guards_ok(b,e.slot))return Status::Layout;
             if(s.stats.cache.lease_refs==SIZE_MAX)return Status::Invalid;
             // Publication AND the first immutable consumer pin commit in the SAME state lock.
-            e.filling=false;e.present=true;e.leases=1;b.keys[e.slot]=key_;
+            e.filling=false;e.present=true;e.leases=1;e.chances=0;b.keys[e.slot]=key_;
             --s.stats.fills_active;++s.stats.fill_commits;s.stats.fill_bytes+=bytes_;++s.stats.cache.resident_entries;++s.stats.cache.inserts;
             ++s.stats.cache.lease_refs;++s.stats.cache.leased_entries;s.stats.cache.leased_charge+=stride_for(s.bytes,e.klass);
             s.stats.cache.peak_leased_charge=std::max(s.stats.cache.peak_leased_charge,s.stats.cache.leased_charge);touch(s,key_);
@@ -284,6 +300,15 @@ public:
     Status borrow(uint64_t ns,size_t key,size_t n,Lease*out){return borrow_policy(ns,key,n,out,true);}
     //Read-only scans still own immutable bytes and account hits, but preserve decode LRU order.
     Status borrow_no_touch(uint64_t ns,size_t key,size_t n,Lease*out){return borrow_policy(ns,key,n,out,false);}
+    // Second chances (0 turns them off): a protected entry at the LRU end moves to the front up to
+    // `n` times between uses before an insert may evict it (victim_for). protect marks a key.
+    Status set_second_chances(int n){
+        std::lock_guard<std::mutex>o(owner_mutex_);if(!state_)return Status::Bypass;
+        std::lock_guard<std::mutex>l(state_->mutex);state_->chance_limit=(uint8_t)std::clamp(n,0,8);return Status::Ok;}
+    Status protect(uint64_t ns,size_t key){
+        std::lock_guard<std::mutex>o(owner_mutex_);if(!state_)return Status::Bypass;State&s=*state_;std::lock_guard<std::mutex>l(s.mutex);
+        if(ns!=s.stats.cache.namespace_id||s.retiring)return Status::Namespace;if(key>=s.count)return Status::Invalid;
+        s.entries[key].protect=1;return Status::Ok;}
     // Whether key is resident: no lease, no LRU touch, no statistics (a predictor's question).
     bool present(uint64_t ns,size_t key){
         std::lock_guard<std::mutex>o(owner_mutex_);if(!state_)return false;State&s=*state_;std::lock_guard<std::mutex>l(s.mutex);
@@ -342,7 +367,7 @@ private:
         if(e.leases==SIZE_MAX||s.stats.cache.lease_refs==SIZE_MAX)return Status::Invalid;
         if(!e.leases){++s.stats.cache.leased_entries;s.stats.cache.leased_charge+=stride_for(s.bytes,c);
             s.stats.cache.peak_leased_charge=std::max(s.stats.cache.peak_leased_charge,s.stats.cache.leased_charge);}
-        ++e.leases;++s.stats.cache.lease_refs;++s.stats.cache.hits;++s.stats.classes[c].hits;s.stats.hit_bytes+=n;if(touch_lru)touch(s,key);
+        ++e.leases;++s.stats.cache.lease_refs;++s.stats.cache.hits;++s.stats.classes[c].hits;s.stats.hit_bytes+=n;if(touch_lru){touch(s,key);e.chances=0;}
         const Slab&b=s.slabs[e.slab];out->state_=&s;out->key_=key;out->bytes_=n;out->generation_=e.generation;
         out->host_=host(b,e.slot);out->device_=device(b,e.slot);out->active_=true;return Status::Hit;
     }
@@ -354,7 +379,7 @@ public:
         State&s=*state_;std::unique_lock<std::mutex>l(s.mutex);o.unlock();const int c=klass_for(s.bytes,n);if(c<0)return Status::Invalid;
         if(ns!=s.stats.cache.namespace_id||s.retiring)return Status::Namespace;
         if(key>=s.count)return Status::Invalid;if(s.stats.cache.allocator_contract_broken)return Status::AllocatorContract;
-        Entry&e=s.entries[key];if(e.present){if(e.klass!=c)return Status::Layout;touch(s,key);return Status::Existing;}
+        Entry&e=s.entries[key];if(e.present){if(e.klass!=c)return Status::Layout;touch(s,key);e.chances=0;return Status::Existing;}
         if(e.filling){++s.stats.fill_busy_bypasses;++s.stats.cache.bypasses;++s.stats.classes[c].bypasses;return Status::Bypass;}
         if(e.generation==UINT64_MAX)return Status::Invalid;
         for(size_t i=0;i<s.used_slabs;++i){const Slab&b=s.slabs[i];if(!b.free_invoked&&overlap(src,n,b.allocation.host,b.allocation.bytes))return Status::Invalid;}
@@ -393,7 +418,7 @@ public:
             }
         }
         if(bi==none){
-            const size_t victim=s.last[c];
+            const size_t victim=victim_for(s,c,key);
             if(victim==none||s.entries[victim].leases){++s.stats.cache.bypasses;++s.stats.classes[c].bypasses;
                 if(victim!=none){++s.stats.cache.leased_tail_bypasses;++s.stats.classes[c].leased_tail_bypasses;}return Status::Bypass;}
             Entry&v=s.entries[victim];bi=v.slab;si=v.slot;
@@ -404,7 +429,7 @@ public:
         Slab&b=s.slabs[bi];if(!guards_ok(b,si))return Status::Layout;b.keys[si]=busy;
         const auto hook=s.test_before_copy;void*context=s.test_copy_context;
         l.unlock();initialize_slot(b,si);if(hook)hook(context);std::memcpy(host(b,si),src,n);l.lock();
-        e.slab=bi;e.slot=si;e.klass=c;e.present=true;e.leases=0;++e.generation;b.keys[si]=key;
+        e.slab=bi;e.slot=si;e.klass=c;e.present=true;e.leases=0;e.chances=0;++e.generation;b.keys[si]=key;
         ++s.stats.cache.resident_entries;++s.stats.cache.inserts;touch(s,key);return Status::Ok;
     }
 
@@ -416,7 +441,7 @@ public:
         State&s=*state_;std::unique_lock<std::mutex>l(s.mutex);o.unlock();const int c=klass_for(s.bytes,n);if(c<0)return Status::Invalid;
         if(ns!=s.stats.cache.namespace_id||s.retiring)return Status::Namespace;
         if(key>=s.count)return Status::Invalid;if(s.stats.cache.allocator_contract_broken)return Status::AllocatorContract;
-        Entry&e=s.entries[key];if(e.present){if(e.klass!=c)return Status::Layout;touch(s,key);return Status::Existing;}
+        Entry&e=s.entries[key];if(e.present){if(e.klass!=c)return Status::Layout;touch(s,key);e.chances=0;return Status::Existing;}
         if(e.filling){++s.stats.fill_busy_bypasses;++s.stats.cache.bypasses;++s.stats.classes[c].bypasses;return Status::Bypass;}
         if(e.generation==UINT64_MAX)return Status::Invalid;
         size_t bi=none,si=none;
@@ -453,7 +478,7 @@ public:
             }
         }
         if(bi==none){
-            const size_t victim=s.last[c];
+            const size_t victim=victim_for(s,c,key);
             if(victim==none||s.entries[victim].leases){++s.stats.cache.bypasses;++s.stats.classes[c].bypasses;
                 if(victim!=none){++s.stats.cache.leased_tail_bypasses;++s.stats.classes[c].leased_tail_bypasses;}return Status::Bypass;}
             Entry&v=s.entries[victim];bi=v.slab;si=v.slot;

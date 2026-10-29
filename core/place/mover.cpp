@@ -813,15 +813,21 @@ bool Mover::borrow_host_unit(int32_t u, HostUnit* out) {
     return true;
 }
 
-bool Mover::read_unit_planes(HostPlanes* const* units, int n) {
+bool Mover::read_unit_planes(HostPlanes* const* units, int n, int rows) {
     if (!units || n <= 0 || !plan_ || !prog_ || !relayout_ || !file_.ok() || !mapped_file_cache_on_)
         return false;
     /* As read_native_file: the container must still be the one the Program was loaded from,
      * before the reads and after them. */
     if (!source_file_epoch()) return false;
-    struct Read { HostPlanes* p; int k; uint32_t file; };
+    /* A container extent [off, off+len) into dst (cap bytes there), or with m the mirror's bytes
+     * [from, from+len) of *m. */
+    struct Read { uint32_t file; int64_t off, len; uint8_t* dst; int64_t cap;
+                  const PlaneMirror::Ref* m; uint64_t from; };
     std::vector<Read> reads;
+    PlaneMirror* const mirror = mirror_tail_ > 0 && PlaneMirror::get() &&
+        rows >= PlaneMirror::get()->min_rows() ? PlaneMirror::get() : nullptr;
     const int64_t A = DirectFile::alignment();
+    int weights = 0;
     for (int i = 0; i < n; ++i) {
         HostPlanes* p = units[i];
         const int32_t u = p ? p->unit : -1;
@@ -860,19 +866,34 @@ bool Mover::read_unit_planes(HostPlanes* const* units, int n) {
             p->a0[k] = a0;
             p->len[k] = hi - a0;
             p->n = k + 1;
-            reads.push_back(Read{ p, k, w.file_id });
+            ++weights;
+            /* The gate_up codes' tail from the mirror (mirror_init checked the layout: codes, then
+             * scales, both 4 KiB-aligned): the container reads the head and the scales. */
+            const PlaneMirror::Ref* m = mirror && (size_t)u < mirror_ref_.size() &&
+                mirror_ref_[(size_t)u].shard >= 0 && mirror_k_[(size_t)u] == k ? &mirror_ref_[(size_t)u] : nullptr;
+            if (m) {
+                const int64_t codes = (int64_t)w.file_plane_offset[0] - a0;
+                const int64_t end = codes + (int64_t)(2 * m->bytes), cut = end - mirror_tail_;
+                reads.insert(reads.begin(), Read{ 0, 0, mirror_tail_, p->buf[k] + cut, mirror_tail_,
+                                                  m, m->bytes - (uint64_t)mirror_tail_ });
+                reads.push_back(Read{ w.file_id, a0, cut, p->buf[k], cut, nullptr, 0 });
+                reads.push_back(Read{ w.file_id, a0 + end, hi - a0 - end, p->buf[k] + end,
+                                      p->cap[k] - end, nullptr, 0 });
+                continue;
+            }
+            reads.push_back(Read{ w.file_id, a0, hi - a0, p->buf[k], p->cap[k], nullptr, 0 });
         }
     }
     const auto t0 = std::chrono::steady_clock::now();
     std::vector<int> rc(reads.size(), RAD_OK);
-    /* At most 16 readers at once, each taking the next weight; a reader that cannot be started
-     * leaves its share to the others and this thread. */
+    /* At most 16 readers at once, each taking the next read (the mirror's first: they take the
+     * longest); a reader that cannot be started leaves its share to the others and this thread. */
     std::atomic<size_t> next{ 0 };
     auto reader = [&] {
         for (size_t j; (j = next.fetch_add(1)) < reads.size();) {
             const Read& r = reads[j];
-            rc[j] = read_source_file(r.file, (uint64_t)r.p->a0[r.k], r.p->len[r.k], r.p->buf[r.k],
-                                     r.p->cap[r.k]);
+            rc[j] = r.m ? mirror->read(*r.m, r.from, (uint64_t)r.len, r.dst)
+                        : read_source_file(r.file, (uint64_t)r.off, r.len, r.dst, r.cap);
         }
     };
     std::vector<std::thread> th;
@@ -884,9 +905,78 @@ bool Mover::read_unit_planes(HostPlanes* const* units, int n) {
     for (std::thread& t : th) t.join();
     host_plane_read_ns_.fetch_add((uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
                                       std::chrono::steady_clock::now() - t0).count(), std::memory_order_relaxed);
-    host_plane_reads_.fetch_add(reads.size(), std::memory_order_relaxed);
+    host_plane_reads_.fetch_add((uint64_t)weights, std::memory_order_relaxed);
     for (int r : rc) if (r < 0) return false;
     return source_file_epoch();
+}
+
+int Mover::mirror_init() {
+    PlaneMirror* m = PlaneMirror::get();
+    mirror_tail_ = 0;
+    if (!m || !plan_ || !prog_ || !mapped_file_cache_on_ || !file_.ok()) return RAD_OK;
+    mirror_ref_.assign(unit_.size(), PlaneMirror::Ref{});
+    mirror_k_.assign(unit_.size(), -1);
+    const int64_t A = DirectFile::alignment();
+    int64_t up = 0;
+    std::vector<int32_t> found;
+    for (size_t u = 0; u < unit_.size(); ++u) {
+        if (!host_planes_eligible((int32_t)u)) continue;
+        const MoveUnit& mu = plan_->units[u];
+        for (int k = 0; k < 2; ++k) {
+            const WeightInfo& w = prog_->weights[mu.weights[(size_t)k]];
+            int layer = -1, expert = -1;
+            char tail[16] = {};
+            if (std::sscanf(w.name.c_str(), "blk.%d.ffn_gate_up_exps.%d.%15s", &layer, &expert, tail) != 3 ||
+                std::strcmp(tail, "weight") != 0)
+                continue;
+            RadTensor pt[RAD_ENC_MAX_PLANES];
+            weight_planes(w, pt);
+            const int64_t codes = pt[0].shape[0] * rad_dtype_bytes(pt[0].dtype, pt[0].shape[1]);
+            PlaneMirror::Ref r;
+            /* Codes then scales, each 4 KiB-aligned, w3 the codes' second half. */
+            if (!m->up_codes(layer, expert, &r) || (int64_t)r.bytes * 2 != codes ||
+                w.file_plane_offset[0] % A || (int64_t)w.file_plane_offset[1] != (int64_t)w.file_plane_offset[0] + codes ||
+                codes % A)
+                continue;
+            mirror_ref_[u] = r;
+            mirror_k_[u] = (int8_t)k;
+            up = (int64_t)r.bytes;
+            found.push_back((int32_t)u);
+        }
+    }
+    if (found.empty()) {
+        RAD_WARN("plane mirror: none of rank %d's file-tier experts is in the mirror", plan_->rank);
+        return RAD_OK;
+    }
+    const int64_t unit = plan_->units[(size_t)found[0]].bytes;
+    const int64_t tail = std::min<int64_t>((int64_t)(m->share() * (double)unit) / A * A, up / A * A);
+    if (tail <= 0) return RAD_OK;
+    /* Eight units spread over the rank: the mirror's tail against the container's, byte for byte. */
+    std::vector<uint8_t*> bufs(2, nullptr);
+    for (auto& b : bufs) b = (uint8_t*)std::aligned_alloc((size_t)A, (size_t)tail);
+    bool same = bufs[0] && bufs[1];
+    for (int i = 0; same && i < 8; ++i) {
+        const int32_t u = found[(size_t)i * found.size() / 8];
+        const WeightInfo& w = prog_->weights[plan_->units[(size_t)u].weights[(size_t)mirror_k_[(size_t)u]]];
+        const PlaneMirror::Ref& r = mirror_ref_[(size_t)u];
+        const int64_t end = (int64_t)w.file_plane_offset[0] + 2 * (int64_t)r.bytes;
+        same = read_source_file(w.file_id, (uint64_t)(end - tail), tail, bufs[0], tail) == RAD_OK &&
+               m->read(r, r.bytes - (uint64_t)tail, (uint64_t)tail, bufs[1]) == RAD_OK &&
+               std::memcmp(bufs[0], bufs[1], (size_t)tail) == 0;
+    }
+    for (auto& b : bufs) std::free(b);
+    if (!same) {
+        RAD_WARN("plane mirror: rank %d's sampled experts differ from the container (or could not be "
+                 "read); reading the container only", plan_->rank);
+        mirror_ref_.clear();
+        mirror_k_.clear();
+        return RAD_OK;
+    }
+    mirror_tail_ = tail;
+    RAD_INFO("plane mirror: rank %d reads %s of each missed expert's gate_up from the mirror "
+             "(%zu experts mapped, 8 sampled and identical)", plan_->rank, humanb(tail).c_str(),
+             found.size());
+    return RAD_OK;
 }
 
 int Mover::insert_unit_planes(const HostPlanes& p, std::vector<uint8_t>* scratch) {
@@ -2376,6 +2466,12 @@ std::string Mover::report() const {
                  (unsigned long long)host_plane_reads_.load(), (double)host_plane_read_ns_.load() * 1e-9,
                  (double)host_plane_read_ns_.load() * 1e-6 / (double)host_plane_reads_.load(),
                  (unsigned long long)host_plane_inserts_.load());
+    if (mirror_tail_ > 0 && PlaneMirror::get()) {
+        const PlaneMirror::Stats ms = PlaneMirror::get()->stats();
+        if (ms.reads)
+            s += fmt("  plane mirror (all ranks): %llu reads, %.2f GiB, %.2f ms a read\n",
+                     (unsigned long long)ms.reads, (double)ms.bytes * gib, (double)ms.ns * 1e-6 / (double)ms.reads);
+    }
     if (relaid_reads_.load())
         s += fmt("  file tier relayout split: %llu reads; %.2f s in preads and %.2f s relaying, summed "
                  "over the relay threads (%.2f ms and %.2f ms a weight)\n",

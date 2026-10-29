@@ -1,0 +1,153 @@
+/* plane_mirror.cpp -- see plane_mirror.h. */
+#include "plane_mirror.h"
+
+#include "../format/safetensors.h"
+#include "../rad_internal.h"
+
+#include <dirent.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <memory>
+
+namespace rad {
+
+namespace {
+
+constexpr int64_t kAlign = 4096;
+
+/* This thread's O_DIRECT bounce buffer, grown as asked. */
+uint8_t* bounce(int64_t bytes) {
+    struct Buf {
+        uint8_t* p = nullptr;
+        int64_t  cap = 0;
+        ~Buf() { std::free(p); }
+    };
+    thread_local Buf b;
+    if (b.cap < bytes) {
+        std::free(b.p);
+        b.p = (uint8_t*)std::aligned_alloc((size_t)kAlign, (size_t)bytes);
+        b.cap = b.p ? bytes : 0;
+    }
+    return b.p;
+}
+
+}  /* namespace */
+
+PlaneMirror* PlaneMirror::get() {
+    static PlaneMirror* m = []() -> PlaneMirror* {
+        const char* dir = std::getenv("RADIANCE_EXPERIMENTAL_DS41_PLANE_MIRROR");
+        if (!dir || !*dir) return nullptr;
+        auto* p = new PlaneMirror();
+        if (const char* s = std::getenv("RADIANCE_EXPERIMENTAL_DS41_PLANE_MIRROR_SHARE"); s && *s)
+            p->share_ = std::clamp(std::atof(s), 0.0, 0.31);
+        if (const char* s = std::getenv("RADIANCE_EXPERIMENTAL_DS41_PLANE_MIRROR_MIN_ROWS"); s && *s)
+            p->min_rows_ = std::max(1, std::atoi(s));
+        if (!p->open(dir)) {
+            RAD_WARN("plane mirror: %s gives no usable DeepSeek-V4.1 expert planes; reading the "
+                     "container only", dir);
+            delete p;
+            return nullptr;
+        }
+        return p;
+    }();
+    return m;
+}
+
+bool PlaneMirror::open(const std::string& dir) {
+    std::vector<std::string> names;
+    if (DIR* d = ::opendir(dir.c_str())) {
+        while (const dirent* e = ::readdir(d)) {
+            const std::string n = e->d_name;
+            if (n.size() > 12 && n.compare(n.size() - 12, 12, ".safetensors") == 0) names.push_back(n);
+        }
+        ::closedir(d);
+    }
+    std::sort(names.begin(), names.end());
+    for (const std::string& n : names) {
+        Shard sh;
+        sh.path = dir + "/" + n;
+        SafeTensorsFile f;
+        if (f.open(sh.path) != RAD_OK) return false;
+        sh.fd = ::open(sh.path.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
+        struct stat st{};
+        uint64_t hlen = 0;
+        if (sh.fd < 0 || ::fstat(sh.fd, &st) != 0 || ::pread(sh.fd, bounce(kAlign), kAlign, 0) != kAlign)
+            return false;
+        std::memcpy(&hlen, bounce(kAlign), 8);
+        sh.size = st.st_size;
+        sh.mtime_ns = (int64_t)st.st_mtim.tv_sec * 1000000000 + st.st_mtim.tv_nsec;
+        const int idx = (int)shards_.size();
+        for (const StTensor& t : f.tensors()) {
+            int layer = -1, expert = -1;
+            char tail[32] = {};
+            if (std::sscanf(t.name.c_str(), "layers.%d.ffn.experts.%d.%31s", &layer, &expert, tail) != 3 ||
+                std::strcmp(tail, "w3.weight") != 0)
+                continue;
+            index_[std::to_string(layer) + "." + std::to_string(expert)] =
+                Ref{ idx, 8 + hlen + t.offset, t.bytes };
+        }
+        shards_.push_back(std::move(sh));
+    }
+    if (index_.empty()) return false;
+    RAD_INFO("plane mirror: %zu shards in %s hold %zu experts' up-projection codes; a missed "
+             "expert of a pass of %d+ tokens reads %.0f%% of its bytes from them beside the container",
+             shards_.size(), dir.c_str(), index_.size(), min_rows_, 100.0 * share_);
+    return true;
+}
+
+bool PlaneMirror::up_codes(int layer, int expert, Ref* out) const {
+    const auto it = index_.find(std::to_string(layer) + "." + std::to_string(expert));
+    if (it == index_.end()) return false;
+    *out = it->second;
+    return true;
+}
+
+bool PlaneMirror::unchanged(int shard) const {
+    const Shard& sh = shards_[(size_t)shard];
+    struct stat st{};
+    return ::fstat(sh.fd, &st) == 0 && st.st_size == sh.size &&
+           (int64_t)st.st_mtim.tv_sec * 1000000000 + st.st_mtim.tv_nsec == sh.mtime_ns;
+}
+
+int PlaneMirror::read(const Ref& r, uint64_t from, uint64_t bytes, uint8_t* dst) {
+    if (r.shard < 0 || (size_t)r.shard >= shards_.size() || !dst || from + bytes > r.bytes)
+        return RAD_E_INVAL;
+    if (!unchanged(r.shard)) return RAD_E_STATE;
+    const auto t0 = std::chrono::steady_clock::now();
+    const int64_t off = (int64_t)(r.off + from), lo = off / kAlign * kAlign;
+    const int64_t len = (off + (int64_t)bytes + kAlign - 1) / kAlign * kAlign - lo;
+    uint8_t* b = bounce(len);
+    if (!b) return RAD_E_NOMEM;
+    for (int64_t done = 0; done < len;) {
+        const ssize_t n = ::pread(shards_[(size_t)r.shard].fd, b + done, (size_t)(len - done), lo + done);
+        if (n <= 0) {
+            /* The rounding may run past the shard's end: what was asked for must have arrived. */
+            if (n == 0 && done >= off - lo + (int64_t)bytes) break;
+            return RAD_E_IO;
+        }
+        done += n;
+    }
+    std::memcpy(dst, b + (off - lo), (size_t)bytes);
+    if (!unchanged(r.shard)) return RAD_E_STATE;
+    const uint64_t ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - t0).count();
+    std::lock_guard<std::mutex> lk(stats_mu_);
+    ++stats_.reads;
+    stats_.bytes += bytes;
+    stats_.ns += ns;
+    return RAD_OK;
+}
+
+PlaneMirror::Stats PlaneMirror::stats() const {
+    std::lock_guard<std::mutex> lk(stats_mu_);
+    return stats_;
+}
+
+}  /* namespace rad */

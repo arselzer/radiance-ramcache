@@ -40,6 +40,7 @@
 #include <array>
 #include "native_read_workers.h"
 #include "planner.h"
+#include "plane_mirror.h"
 #include "residency_iface.h"
 
 #include <algorithm>
@@ -622,7 +623,8 @@ public:
         HostPlanes& operator=(const HostPlanes&) = delete;
         ~HostPlanes() { for (uint8_t* b : buf) std::free(b); }
     };
-    bool  read_unit_planes(HostPlanes* const* units, int n);
+    /* `rows`: the pass's tokens, which decide whether the plane mirror takes a share. */
+    bool  read_unit_planes(HostPlanes* const* units, int n, int rows = 1);
     bool  host_planes_eligible(int32_t u) const;   /* what read_unit_planes accepts */
     /* read_weight_file  a whole weight the container stores as is (an identity plane, every row
      *                   on this rank) into dst, for a host reader such as the router predictor. */
@@ -638,6 +640,12 @@ public:
      *                      idle -- the CPU takes the misses -- the held entries drift to their
      *                      class's LRU tail, where each one turns every admission away. */
     int   retire_file_windows();
+    /* mirror_init  once the plan is known: maps every file-tier unit's gate_up codes to the
+     *              plane mirror's copy (place/plane_mirror.h) and samples units against the
+     *              container; from then on read_unit_planes reads each gate_up codes plane's tail
+     *              from the mirror beside the container. Nothing when no mirror is configured, and
+     *              a mismatch turns it off for this rank. */
+    int   mirror_init();
     /* set_file_relayout  the function that makes a file-tier weight's stored form from its
      *                    container planes when the two differ (weight_file_relaid): the kernel's
      *                    relayout, as the loader's relayout pool calls it once for a resident
@@ -846,6 +854,11 @@ private:
     /* read_relaid split, summed over the relay threads that run it at once: preads, relayouts. */
     std::atomic<uint64_t> relaid_read_ns_{0}, relaid_pack_ns_{0}, relaid_reads_{0};
     std::atomic<uint64_t> host_plane_read_ns_{0}, host_plane_reads_{0}, host_plane_inserts_{0};
+    /* Per unit: the mirror's copy of its gate_up's w3 codes (shard -1: none) and which of the
+     * unit's two weights is the gate_up; the tail read from the mirror, 4 KiB-aligned. */
+    std::vector<PlaneMirror::Ref> mirror_ref_;
+    std::vector<int8_t>           mirror_k_;
+    int64_t                       mirror_tail_ = 0;
     int  stage_relaid(const std::vector<Relaid>& rl, NativeFileCacheReadPolicy policy);
     char*    windows_ = nullptr;
     int      n_windows_ = 0;

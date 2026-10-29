@@ -981,6 +981,8 @@ int FileStager::hx_init(const Program& prog) {
             RAD_INFO("host experts: passes of at most %d token(s) compute missed experts on the CPU "
                      "from the container's planes; background threads relay them into the RAM cache",
                      hx_miss_rows_);
+        /* A second copy of the planes on another drive, read beside the container (plane_mirror.h). */
+        RAD_TRY(mover_->mirror_init());
     }
     if (plan_->rank == 0)
         RAD_INFO("host experts: %zu of %zu routed layers give the CPU %s cached experts%s", n_ok,
@@ -1233,7 +1235,7 @@ int FileStager::hx_submit_misses() {
     for (size_t i = 0; i < hx_miss_.size(); ++i)
         if (i >= hx_miss_ready_.size() || !hx_miss_ready_[i]) ptrs.push_back(hx_miss_[i].get());
     const auto t0 = std::chrono::steady_clock::now();
-    if (!ptrs.empty() && !mover_->read_unit_planes(ptrs.data(), (int)ptrs.size())) {
+    if (!ptrs.empty() && !mover_->read_unit_planes(ptrs.data(), (int)ptrs.size(), (int)pass_tok_)) {
         RAD_ERR("host experts: reading layer %d's missed units for the CPU failed",
                 layers_[(size_t)hx_li_].layer);
         return RAD_E_IO;

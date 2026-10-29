@@ -93,6 +93,8 @@ the engine or the scripts assumes where the checkpoint is. `ab_window.sh` takes 
 | `RADIANCE_EXPERIMENTAL_DS41_MIRROR_SPLIT=N` (2-4, designed for 3) | not yet measured on the engine (research landbench2: a lone miss's reads 2629 → 2400 µs, the mirror's copy 216 → 101 µs) | a decode pass that misses one unit reads the plane mirror's decode tail (2.4 MB at 0.13) in N pieces on N readers, so the SATA stripe's preads and the copies out of the bounce buffers overlap; the same bytes (pieces start on the container's 4 KiB grid, so a failed one falls back to the container as a whole tail does). Needs the decode mirror (`R`, `RdNN`); arm part `MsN`. The read-ahead in pieces (`PpK`) reads the container only, so its pieces are not split; the whole-unit read-ahead (`PoK`/`PtK`) reads a unit as a lone decode miss and is split too. Gate: the shutdown report's "one-token miss reads, one unit" line; drop it if the mirror lands last in under 25% of calls and its copy takes under 0.15 ms |
 | `RADIANCE_EXPERIMENTAL_DS41_MISS_POST=1` | not yet measured on the engine (research: 20-40 µs a critical layer, +0.3-0.6%) | a one-token pass's missed planes start on the kept readers as soon as `hx_choose` knows them, instead of after `hx_submit` (its pool wake, 28-32 µs a layer) and the copy path's staging; the issuing thread then waits in `hx_submit_misses_now` (`NativeReadWorkers::post`/`join`, which hold the readers' call mutex from post to join as `run` does). The same reads: the set `hx_submit_misses_now` reads, so with the read-ahead in pieces (`PpK`) never a unit read ahead whole nor one the piece readers are finishing (whose slot `hx_ra_settle` may give fresh planes); the post is a demand read for the piece readers from the post on, and is finished before the urgent units are settled. Also at an early-issued layer's gather (`Ei`). A post that finds the readers on another thread's call (the whole-unit read-ahead's, `PoK`/`PtK`, or the async misses' worker, `A`) does not wait: it posts nothing and the layer reads as before (the mover's "kept plane readers" line counts them). Arm part `Mp`; the "readers" line shows the readers' start and the caller's return, and the EP decision's own `posting the misses' reads` line its time (not in "choose") |
 
+| `RADIANCE_EXPERIMENTAL_DS41_ROUTE_TRACE=<prefix>` | instrument, exact; overhead not yet measured (rank 0: three more ~1.6 KB copies a routed layer behind its counts row; every rank: one cache lock a decode layer) | the routing trace for the lossy track (`core/place/route_trace.h` has the format; below). Arm part `Rt` (files under `rtrace-<arm>/`); shutdown lines `route trace: ...` per rank (picks by status) and for the files (records, bytes, drops) |
+
 The shutdown report counts the miss reads of one-token passes whatever the switches (two lines a
 rank, one for calls of one missed unit and one for more): how many calls had a mirror leg and in how
 many the mirror landed last (and by how much), the legs' mean times from the dispatch and the
@@ -148,6 +150,57 @@ research sample's real scales; `ds41_host_experts_test pkbench 32 40 24`, median
 round at every block position (down's tail included), widened rounds on the general path (126 ..
 129, 110 .. 113, the subnormal scales), NaN rows, and the packing API's refusals.
 
+## The lossy track: routing trace and quality harness
+
+Exact past ~18-19 tok/s means more RAM, a second drive, or giving up exactness on misses
+(`/home/as/ds41-decode-review-20261028/RESEARCH-3-LOSSY.md`). Before any lossy change, two measuring
+tools, both exact (every reply stays the base engine's):
+
+**The routing trace** (`RADIANCE_EXPERIMENTAL_DS41_ROUTE_TRACE=<prefix>`, arm part `Rt`). Per
+EP-routed layer of every pass of up to 16 tokens: the six picks in the router's round order with
+their weights (the card's) and biased keys (score + correction bias, recomputed on the host in f32
+from the logits), rank 0's 384 router logits on a one-token pass, the layer's bias once, and for
+every pick what the rank owning it did: on the card (V), RAM hit (H), miss read while the layer
+waited (M), read ahead whole (A) or in part (P), the card's copy path (C). Every rank also records
+which of its file-tier experts the RAM cache held at the choice (one lock, no lease or LRU touch:
+`Mover::units_cached`) and, once, every local expert's tier; the step loop records which request
+and position each pass carried and where each request ended, so the post-stop pass (issued ahead
+of a request that had just stopped) is flagged. Rank 0 copies its layer's ids, weights and logits
+to pinned memory behind the counts row the file stager already waits for; a background thread
+(nice 10) writes `<prefix>.rank<r>.bin` and `<prefix>.steps.bin`. Rank 0 writes ~1.7 KB a decode
+layer (~66 KB a token), the others ~60 bytes.
+
+`rtrace.py report PREFIX ARM.json` (ARM.json: the arm's `ab_requests.py` output, for the requests'
+names, families and measured decode time) prints the assessment's gates over decode tokens, post-stop
+passes apart: the weight share a miss carries (and the mass drop-all removes a token); the
+weight-threshold drop gate (go if 50% or more of misses carry a share below tau 0.1); the
+cache-aware routing gate (go if 40% or more of misses have a held substitute -- on the card, or in the
+owner's RAM cache at that moment -- with a key within delta 5% of the 6th key, kill below 20%;
+`--delta` sweeps it); the misses' slots (protect-top-2: 60% at slot 2 or below); all by prompt
+family and by layer; and a replay estimate of decode tok/s for drop-all, drop below tau and a cap of
+6 drops a token from the assessment's time model (T = 24.7 + 2.54 x waited misses + 0.133 x CPU hits
+ms a token, and the constrained 31 / 2.28 / 0.108), each also with its fixed part refitted to the
+arm's measured time. `--json OUT` keeps the tables. A miss there is M or P; A counts as a hit.
+
+**The quality harness** (arm part `Lq`; `ab_requests.py --lp / --force / --kl`). After the arm's
+timed requests (unchanged), the window's first `Lq` arm of a prompt set records the reference:
+free-running greedy replies with each position's logprob and top 20 from the raw logits (the
+sampler's `sample_logprobs`, before any stage), into `lpref-<set>.json` (`LQ_REF=<file>` names an
+existing one instead). Every `Lq` arm then decodes teacher-forced along it: each prompt with a GBNF
+grammar of the reference's token ids (`<[id]> <[id]> ...`, so tokenisation cannot drift), so every
+position is a decode pass over the reference's own prefix (KV a lossy arm wrote stays in the cache,
+unlike a re-sync that re-prefills); a reply that stopped on its own is forced up to its stop token,
+which the finished grammar leaves to the model among the end-of-generation ids. Each forced run
+first probes the grammar: one prompt's first position forced to its second-likeliest token, which
+must come back (an exact arm forced along its own reference would match it even unforced). The
+window ends with `ab_requests.py --kl-dir`: per forced file, the positions that followed the
+reference, the bit-identical ones, and KL(ref || arm) over the reference's top 20 plus a tail
+bucket, top-1 agreement and |d logprob| of the reference token, overall, without position 0 (a
+prefill pass's) and by prompt family (the receipt's `domain`, else the name's prefix), and the
+probe's outcome. A grammar disables the step issued ahead (`Scheduler::step_next`), so forced runs
+are slower and have no post-stop pass; logits do not change. The exact arm against itself must give
+every position bit-identical: KL 0, top-1 100%.
+
 ## Tools
 
 - `ab_window.sh OUT`: waits for 30 s of QFN idleness, stops the QFN container, runs each arm of
@@ -163,7 +216,12 @@ round at every block position (down's tail included), widened rounds on the gene
   names the weights read by `gemm_nt_bf16f8`; every other arm runs with the knob off.
   `PROMPTS`, `AB_REQUESTS`, `AB_MAX_TOKENS`, `AB_CONCURRENCY` and `MAX_SEQS` change the workload.
 - `ab_requests.py`: sends a receipt's requests (token ids, `chat_text` framed like the held-out
-  prompts, or `messages`) and compares arms.
+  prompts, or `messages`) and compares arms; `--lp`, `--force`, `--kl`, `--kl-dir`: the quality
+  harness above (`ab_requests_test.py` runs it against a fake server with a toy model: an exact
+  model forced along its own reference is bit-identical, a perturbed one gives KL > 0).
+- `rtrace.py report|dump|synth`: reads the routing trace (above); `rtrace_test.py` checks it on a
+  synthetic trace with known answers, and on the C++ writer's own file when
+  `RTRACE_CPP_PREFIX=<dir>/rt` (made by `RTRACE_DUMP=<dir> route_trace_test`).
 - `cache_sim.py`: replays an access trace against LRU, SLRU, 2Q, aged LFU and Belady.
 - `chain_report.py PREFIX`: reads a `Ct` arm's `PREFIX.ops.csv` and `PREFIX.stamps.csv`: per layer
   kind the dispatches before the routing-counts sync, how many went (or would go) unordered and why

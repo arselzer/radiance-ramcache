@@ -48,7 +48,7 @@ radiance ... --tp 4 --placement expert_tiered --weights-disk-tier \
 |---|---|---|
 | `..._HOST_EXPERTS=N`, `_POLICY=all` | cached experts on the CPU: 5.63 → 5.96 tok/s | `greedy` splits with the copy link (no better); `verify` computes both and compares rows |
 | `..._MISSES=16` | misses on the CPU: 5.96 → 8.89 tok/s | needs the mapped RAM cache |
-| `--host-pool-mib 1900`, cache 96 GiB | +9% | the pinned pool's RAM is worth more as cache; 96 GiB leaves ~8 GiB free (88 GiB: 16.5 GiB free, −6%) |
+| `--host-pool-mib 1900`, cache 96 GiB | +9% | the pinned pool's RAM is worth more as cache; 96 GiB leaves ~8 GiB free (88 GiB: 16.5 GiB free, −4%) |
 | `..._NATIVE_CACHE_PREGROW=1` | request 2 TTFT 13.7 → 5.0 s | slabs pinned at startup (+~30 s startup) |
 | `..._PLANE_MIRROR` | prefill TTFT −11% | prefill passes only (`_MIRROR_MIN_ROWS`, 2); `_MIRROR_SHARE` (0.18); turns itself off if a read fails or a shard changes; `_MIRROR_FAULT=N` tests that |
 | `..._FILE_BUFFER_UNITS=1` | +9.5% (176 more VRAM experts a rank) | refused unless the CPU takes every routed unit of every pass (all, MISSES=16, passes ≤ 16 tokens) |

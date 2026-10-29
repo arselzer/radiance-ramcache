@@ -228,6 +228,24 @@ if [[ "${DEVICE_CHECKS:-1}" == 1 && -x "$HERE/build/ds41_mxfp4_device_check" ]];
   if cmp -s "$OUT/silu_recheck.bin" "$SILU"; then log "silu table recaptured identical"; else log "silu table recapture DIFFERS"; fi
 fi
 
+# VPACK_CHECK=<ds41_vpack_device_check binary>: before the arms, libr4d's gemv_vp row against the plain
+# gemv row on card 0, byte for byte, and both timed (VPACK_LIBR4D, default the run home's libr4d.so).
+if [[ -n "${VPACK_CHECK:-}" ]]; then
+  VPL=${VPACK_LIBR4D:-$RHOME/kernels/libr4d.so}
+  if [[ -x "$VPACK_CHECK" ]]; then
+    log "packed VRAM residents: gemv_vp against the plain row on card 0 with $VPL"
+    ( export HIP_VISIBLE_DEVICES=0
+      timeout 1200 "$VPACK_CHECK" "$VPL" check 48 >"$OUT/vpack_check.log" 2>&1
+      echo "vpack check exit $?" >>"$OUT/vpack_check.log"
+      timeout 900 "$VPACK_CHECK" "$VPL" time >"$OUT/vpack_time.log" 2>&1
+      echo "vpack time exit $?" >>"$OUT/vpack_time.log" )
+    tail -4 "$OUT/vpack_check.log" | tee -a "$OUT/window.log"
+    tail -15 "$OUT/vpack_time.log" | tee -a "$OUT/window.log"
+  else
+    log "VPACK_CHECK=$VPACK_CHECK is not an executable; no packed-form device check"
+  fi
+fi
+
 HX=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=$HX_THREADS RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU=$SILU)
 CANCEL=${CANCEL_FILE:-/home/as/ds41-claude-build/work/cancel_window}
 for a in $ARMS; do
@@ -294,6 +312,10 @@ for a in $ARMS; do
 # (RADIANCE_EXPERIMENTAL_DS41_MIRROR_SPLIT, 2-4, designed for 3; needs R and RdNN); Mp a one-token
 # pass's miss reads start on the kept readers as soon as the layer's choice is made, before the
 # pool's wake (RADIANCE_EXPERIMENTAL_DS41_MISS_POST); rN a repeat (ignored).
+# Vp the cards' static expert residents in the packed-scale form, ~4.4% smaller so ~26 more a rank
+# (RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED; needs a libr4d.so with moe_gemm_ggml_mxfp4_gemv_vp in the arm's
+# run home, --deterministic and passes of at most 16 tokens, which every arm here has); rN a repeat
+# (ignored).
   IFS=- read -r -a parts <<< "$a"
   pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 HOST_POOL_MIB=4096 EXTRA_ARGS="" ARM_HOME="$RHOME" ARM_CONC=
   power="" skip="" ARGS=() f8="" f8x=""
@@ -374,6 +396,7 @@ for a in $ARMS; do
       Fl)      env+=(RADIANCE_EXPERIMENTAL_DS41_FETCH_LIST=1) ;;       # counts + CPU rows in one ranged copy
       Ms[0-9]) env+=(RADIANCE_EXPERIMENTAL_DS41_MIRROR_SPLIT=${p#Ms}) ;;  # a lone decode miss's mirror tail in N pieces
       Mp)      env+=(RADIANCE_EXPERIMENTAL_DS41_MISS_POST=1) ;;       # miss reads start at the choice, before the pool's wake
+      Vp)      env+=(RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED=1) ;;      # VRAM residents in the packed-scale form
       *)       log "arm $a: unknown part $p; the arm is skipped (it would run without what its name says)"; skip=1 ;;
     esac
   done

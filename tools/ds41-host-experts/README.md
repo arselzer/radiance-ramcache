@@ -136,6 +136,16 @@ experts in pinned host memory and in VRAM, then times each mode at a 5-row query
 (`DEVICE_CHECKS=draft` in a window, with `DRAFT_CHECK_BIN` and `DRAFT_CHECK_LIB`). Not yet measured
 on the card.
 
+`RADIANCE_EXPERIMENTAL_DS41_DSPARK_SHORT_BLOCK=N` (2-4; the deepseek41 plugin) declares a short query
+block of N rows, [anchor, noise x (N - 1)], proposing N tokens (`rad_drafter_short_block`), which the
+core runs from `--draft-short-from` decoding sequences on; the verify cap (`DsK`) now also accepts
+`--draft-short-from 1` when the drafter has one. At N = K + 1 the three draft stages route 3 (K + 1)
+slots instead of 15. The block's attention is non-causal, so its proposals are not the full
+block's first ones: the replies stay the target's, acceptance may move (the drafter was trained at
+5, and a short block has never been measured). Its own ops where the block length is a parameter:
+the offsets placing every row at the block's last position, each stage's attention window (`window`
+context keys before the anchor plus the block's), and the walk. Arm part `DbN` (with a `Ds` part);
+off, nothing of it is declared.
 
 ## The packed RAM cache
 

@@ -278,7 +278,10 @@ for a in $ARMS; do
 # live tail and one pass over each expert's weights (RADIANCE_EXPERIMENTAL_DS41_DRAFT_GEMV=1: no
 # slot routed to another rank runs against the rank's last expert, and an expert's rows share one
 # read of its pinned host weights; exact; a libr4d that has it, and a Ds part), Dkt the live tail
-# alone (=2); H3 the third run home (RADIANCE_HOME_DIR3); Es
+# alone (=2); DbN DSpark's query pass as a short block of N rows (2-4), [anchor, noise x (N - 1)],
+# on every decoding step (RADIANCE_EXPERIMENTAL_DS41_DSPARK_SHORT_BLOCK=N, --draft-short-from 1;
+# with DsK, N = K + 1 drafts what the cap verifies; the replies stay the target's, acceptance may
+# move; a deepseek41 plugin that has it, and a Ds part); H3 the third run home (RADIANCE_HOME_DIR3); Es
 # engram_kv's rows split over the ranks (needs a deepseek41 plugin that has it); Pa the next layer's
 # attention weights read into the card's on-die cache during the CPU-row wait (same); PmN those reads
 # from the use-order list up to N MiB an issue point, the read that crosses it cut
@@ -381,6 +384,8 @@ for a in $ARMS; do
                [[ $p == Dsa ]] && ARGS+=(--draft-window adaptive) ;;
       Dk)      env+=(RADIANCE_EXPERIMENTAL_DS41_DRAFT_GEMV=1) ;;   # draft GEMVs: live tail + one weight pass
       Dkt)     env+=(RADIANCE_EXPERIMENTAL_DS41_DRAFT_GEMV=2) ;;   # draft GEMVs: the live tail alone
+      Db[2-4]) env+=(RADIANCE_EXPERIMENTAL_DS41_DSPARK_SHORT_BLOCK=${p#Db})   # DSpark's short query block
+               ARGS+=(--draft-short-from 1) ;;
       K)       env+=(RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE=1) ;;     # the RAM cache packed for the CPU only
       Lm[0-9]*) ARGS+=(--max-model-len "${p#Lm}") ;;   # a longer context (default 512), e.g. for long-prompt TTFT
       Pf)      env+=(RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE=1) ;;   # a prefill chunk alone in its step; decode rows batched
@@ -415,10 +420,11 @@ for a in $ARMS; do
     env+=(RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8=0)
   fi
   ARM_F8=$f8
-  # Dk / Dkt act on the draft bank's GEMVs only: without a Ds part the arm would not test them.
-  if [[ " ${env[*]} " == *" RADIANCE_EXPERIMENTAL_DS41_DRAFT_GEMV="* &&
-        " ${env[*]} " != *" RADIANCE_EXPERIMENTAL_DS41_DSPARK_RAD_BANK=1 "* ]]; then
-    log "arm $a: Dk / Dkt need a Ds part (the DSpark draft bank); the arm is skipped"; skip=1
+  # Dk / Dkt / DbN act on the DSpark drafter only: without a Ds part the arm would not test them.
+  if [[ " ${env[*]} " == *" RADIANCE_EXPERIMENTAL_DS41_DRAFT_GEMV="* ||
+        " ${env[*]} " == *" RADIANCE_EXPERIMENTAL_DS41_DSPARK_SHORT_BLOCK="* ]] &&
+     [[ " ${env[*]} " != *" RADIANCE_EXPERIMENTAL_DS41_DSPARK_RAD_BANK=1 "* ]]; then
+    log "arm $a: Dk / Dkt / DbN need a Ds part (the DSpark draft bank); the arm is skipped"; skip=1
   fi
   [[ -n "$skip" ]] && continue
   [[ -n "$power" ]] && power_set "$power"

@@ -23,6 +23,7 @@
 #include "mem/vram_budget.h"
 #include "place/expert_profile_map.h"
 #include "place/native_decode_profile.h"
+#include "place/plane_mirror.h"
 #include "place/dspark_native_scope.h"
 #include "place/dspark_draft_control_scope.h"
 #include "kvstream/bringup.h"
@@ -1621,6 +1622,10 @@ static int declare_ring_windows(KVManager& kv, const Program& prog) {
 }
 
 int Engine::plan() {
+    /* The plane mirror's options, before any rank's stager asks for the mirror. */
+    PlaneMirror::configure({ cfg_.expert_plane_mirror, cfg_.expert_plane_mirror_share,
+                             (int)cfg_.expert_plane_mirror_min_rows,
+                             cfg_.expert_plane_mirror_decode_share });
     // The external DECODE vector owns its rows until every rank's Planner has consumed them.
     NativeDecodeProfile decode_profile;
     const bool native_profile = meta_.arch_id && !std::strcmp(meta_.arch_id, "deepseek41");

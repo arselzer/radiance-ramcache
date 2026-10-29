@@ -117,6 +117,18 @@ static const Flag g_flags[] = {
     { "--expert-ram-cache-total-mib", "MIB", "native expert RAM cache across all ranks (default 0, off);\n"
     "                                    includes cache metadata, separate from the fixed host pool;\n"
     "                                    requires --weights-disk-tier" },
+    { "--expert-plane-mirror", "DIR",   "DeepSeek-V4.1 with host experts: the checkpoint's\n"
+    "                                    model-*.safetensors on another drive than the container;\n"
+    "                                    part of each missed expert is read from it beside the\n"
+    "                                    container (default: none, the container only); requires\n"
+    "                                    --weights-disk-tier" },
+    { "--expert-plane-mirror-share", "F", "the fraction of a missed expert's bytes read from\n"
+    "                                    --expert-plane-mirror (default 0.18, at most 0.31)" },
+    { "--expert-plane-mirror-min-rows", "N", "the fewest tokens a pass has for the share above\n"
+    "                                    (default 2: prefill chunks)" },
+    { "--expert-plane-mirror-decode-share", "F", "the fraction read from --expert-plane-mirror in\n"
+    "                                    smaller passes, decode (default 0: the container only;\n"
+    "                                    at most 0.31)" },
     { "--row-prefetch",       "MODE",   "on (default) | off -- a host gather from a table read through\n"
     "                                    the container's mapping (--ngram-placement disk) asks for the\n"
     "                                    pages its rows cover before its kernel runs, or beside it when\n"
@@ -639,6 +651,20 @@ int config_parse(int argc, char** argv, Config* c) {
         else if (S("--expert-ram-cache-total-mib")) {
             if (!num(0, INT64_MAX / ((int64_t)1 << 20), &c->expert_ram_cache_total_mib))
                 return RAD_E_INVAL;
+        }
+        else if (S("--expert-plane-mirror"))   { if (!(v = need(i))) return RAD_E_INVAL; c->expert_plane_mirror = v; }
+        else if (S("--expert-plane-mirror-share") || S("--expert-plane-mirror-decode-share")) {
+            double d = 0.0;
+            if (!(v = need(i)) || !parse_num(a.c_str(), v, &d)) return RAD_E_INVAL;
+            if (d < 0.0 || d > 0.31) {
+                RAD_ERR("%s: %s is not a fraction in [0, 0.31]", a.c_str(), v);
+                return RAD_E_INVAL;
+            }
+            (S("--expert-plane-mirror-share") ? c->expert_plane_mirror_share
+                                              : c->expert_plane_mirror_decode_share) = d;
+        }
+        else if (S("--expert-plane-mirror-min-rows")) {
+            if (!num(1, INT32_MAX, &c->expert_plane_mirror_min_rows)) return RAD_E_INVAL;
         }
         else if (S("--row-prefetch")) {
             if (!(v = need(i))) return RAD_E_INVAL;
@@ -1193,6 +1219,10 @@ int config_parse(int argc, char** argv, Config* c) {
         RAD_ERR("--expert-ram-cache-total-mib needs --weights-disk-tier");
         return RAD_E_INVAL;
     }
+    if (!c->expert_plane_mirror.empty() && !c->weights_disk_tier) {
+        RAD_ERR("--expert-plane-mirror needs --weights-disk-tier: only missed experts read it");
+        return RAD_E_INVAL;
+    }
     return RAD_OK;
 }
 
@@ -1274,6 +1304,10 @@ const ShowRow kShow[] = {
     { "--vision-tower-placement", [](const Config& c) { return std::string(table_placement_name(c.tower_placement)); } },
     { "--weights-disk-tier",  [](const Config& c) { return onoff(c.weights_disk_tier); } },
     { "--expert-ram-cache-total-mib", [](const Config& c) { return num(c.expert_ram_cache_total_mib); } },
+    { "--expert-plane-mirror", [](const Config& c) { return or_none(c.expert_plane_mirror, "none"); } },
+    { "--expert-plane-mirror-share", [](const Config& c) { return fmt("%.4g", c.expert_plane_mirror_share); } },
+    { "--expert-plane-mirror-min-rows", [](const Config& c) { return num(c.expert_plane_mirror_min_rows); } },
+    { "--expert-plane-mirror-decode-share", [](const Config& c) { return fmt("%.4g", c.expert_plane_mirror_decode_share); } },
     { "--row-prefetch",       [](const Config& c) { return onoff(c.row_prefetch); } },
     { "--mapped-rewarm",      [](const Config& c) { return onoff(c.mapped_rewarm); } },
     { "--prefix-cache-mib",   [](const Config& c) {

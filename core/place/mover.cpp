@@ -824,8 +824,10 @@ bool Mover::read_unit_planes(HostPlanes* const* units, int n, int rows) {
     struct Read { uint32_t file; int64_t off, len; uint8_t* dst; int64_t cap;
                   const PlaneMirror::Ref* m; uint64_t from; };
     std::vector<Read> reads;
-    PlaneMirror* const mirror = mirror_tail_ > 0 && PlaneMirror::get() && PlaneMirror::get()->on() &&
-        rows >= PlaneMirror::get()->min_rows() ? PlaneMirror::get() : nullptr;
+    /* Passes of min_rows or more take the mirror's share, smaller ones (decode) its decode share. */
+    PlaneMirror* const pm = PlaneMirror::get();
+    const int64_t tail = !pm ? 0 : rows >= pm->min_rows() ? mirror_tail_ : mirror_tail_decode_;
+    PlaneMirror* const mirror = tail > 0 && pm->on() ? pm : nullptr;
     const int64_t A = DirectFile::alignment();
     int weights = 0;
     for (int i = 0; i < n; ++i) {
@@ -873,9 +875,9 @@ bool Mover::read_unit_planes(HostPlanes* const* units, int n, int rows) {
                 mirror_ref_[(size_t)u].shard >= 0 && mirror_k_[(size_t)u] == k ? &mirror_ref_[(size_t)u] : nullptr;
             if (m) {
                 const int64_t codes = (int64_t)w.file_plane_offset[0] - a0;
-                const int64_t end = codes + (int64_t)(2 * m->bytes), cut = end - mirror_tail_;
-                reads.insert(reads.begin(), Read{ w.file_id, a0 + cut, mirror_tail_, p->buf[k] + cut,
-                                                  mirror_tail_, m, m->bytes - (uint64_t)mirror_tail_ });
+                const int64_t end = codes + (int64_t)(2 * m->bytes), cut = end - tail;
+                reads.insert(reads.begin(), Read{ w.file_id, a0 + cut, tail, p->buf[k] + cut,
+                                                  tail, m, m->bytes - (uint64_t)tail });
                 reads.push_back(Read{ w.file_id, a0, cut, p->buf[k], cut, nullptr, 0 });
                 reads.push_back(Read{ w.file_id, a0 + end, hi - a0 - end, p->buf[k] + end,
                                       p->cap[k] - end, nullptr, 0 });
@@ -928,7 +930,7 @@ int64_t Mover::mapped_cache_pregrow() {
 
 int Mover::mirror_init() {
     PlaneMirror* m = PlaneMirror::get();
-    mirror_tail_ = 0;
+    mirror_tail_ = mirror_tail_decode_ = 0;
     if (!m || !plan_ || !prog_ || !mapped_file_cache_on_ || !file_.ok()) return RAD_OK;
     mirror_ref_.assign(unit_.size(), PlaneMirror::Ref{});
     mirror_k_.assign(unit_.size(), -1);
@@ -965,7 +967,10 @@ int Mover::mirror_init() {
         return RAD_OK;
     }
     const int64_t unit = plan_->units[(size_t)found[0]].bytes;
-    const int64_t tail = std::min<int64_t>((int64_t)(m->share() * (double)unit) / A * A, up / A * A);
+    auto tail_of = [&](double share) { return std::min<int64_t>((int64_t)(share * (double)unit) / A * A, up / A * A); };
+    const int64_t prefill_tail = tail_of(m->share()), decode_tail = tail_of(m->decode_share());
+    /* The longer tail is checked; the shorter is its suffix. */
+    const int64_t tail = std::max(prefill_tail, decode_tail);
     if (tail <= 0) return RAD_OK;
     /* Eight units spread over the rank: the mirror's tail against the container's, byte for byte. */
     std::vector<uint8_t*> bufs(2, nullptr);
@@ -988,9 +993,11 @@ int Mover::mirror_init() {
         mirror_k_.clear();
         return RAD_OK;
     }
-    mirror_tail_ = tail;
-    RAD_INFO("plane mirror: rank %d reads %s of each missed expert's gate_up from the mirror "
-             "(%zu experts mapped, 8 sampled and identical)", plan_->rank, humanb(tail).c_str(),
+    mirror_tail_ = prefill_tail;
+    mirror_tail_decode_ = decode_tail;
+    RAD_INFO("plane mirror: rank %d reads %s of each missed expert's gate_up from the mirror in passes "
+             "of %d+ tokens and %s in smaller ones (%zu experts mapped, 8 sampled and identical)",
+             plan_->rank, humanb(prefill_tail).c_str(), m->min_rows(), humanb(decode_tail).c_str(),
              found.size());
     return RAD_OK;
 }

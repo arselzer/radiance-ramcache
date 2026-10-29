@@ -38,22 +38,29 @@ uint8_t* bounce(int64_t bytes) {
     return b.p;
 }
 
+/* configure()'s options, read once by get()'s first call. */
+PlaneMirror::Options& options() {
+    static PlaneMirror::Options o;
+    return o;
+}
+
 }  /* namespace */
+
+void PlaneMirror::configure(const Options& o) { options() = o; }
 
 PlaneMirror* PlaneMirror::get() {
     static PlaneMirror* m = []() -> PlaneMirror* {
-        const char* dir = std::getenv("RADIANCE_EXPERIMENTAL_DS41_PLANE_MIRROR");
-        if (!dir || !*dir) return nullptr;
+        const Options& o = options();
+        if (o.dir.empty()) return nullptr;
         auto* p = new PlaneMirror();
-        if (const char* s = std::getenv("RADIANCE_EXPERIMENTAL_DS41_PLANE_MIRROR_SHARE"); s && *s)
-            p->share_ = std::clamp(std::atof(s), 0.0, 0.31);
-        if (const char* s = std::getenv("RADIANCE_EXPERIMENTAL_DS41_PLANE_MIRROR_MIN_ROWS"); s && *s)
-            p->min_rows_ = std::max(1, std::atoi(s));
+        p->share_ = std::clamp(o.share, 0.0, 0.31);
+        p->min_rows_ = std::max(1, o.min_rows);
+        p->decode_share_ = std::clamp(o.decode_share, 0.0, 0.31);
         if (const char* s = std::getenv("RADIANCE_EXPERIMENTAL_DS41_PLANE_MIRROR_FAULT"); s && *s)
             p->fault_ = std::max(1, std::atoi(s)) - 1;
-        if (!p->open(dir)) {
+        if (!p->open(o.dir)) {
             RAD_WARN("plane mirror: %s gives no usable DeepSeek-V4.1 expert planes; reading the "
-                     "container only", dir);
+                     "container only", o.dir.c_str());
             delete p;
             return nullptr;
         }

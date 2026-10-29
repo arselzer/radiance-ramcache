@@ -17,10 +17,13 @@
  * A read that fails turns the mirror off for the process; the reader takes those bytes from the
  * container instead.
  *
- * RADIANCE_EXPERIMENTAL_DS41_PLANE_MIRROR=<directory of model-*.safetensors>;
- * RADIANCE_EXPERIMENTAL_DS41_PLANE_MIRROR_SHARE=<fraction of a unit's bytes> (0.18; at most the
- * whole of w3, 0.31); ..._MIN_ROWS=<tokens> (2): the smallest pass that reads the mirror;
- * ..._FAULT=<n>: the n-th read fails, a test of the fallback to the container. */
+ * Off unless asked for: --expert-plane-mirror <directory of model-*.safetensors>,
+ * --expert-plane-mirror-share <fraction of a unit's bytes> (0.18; at most the whole of w3, 0.31)
+ * for passes of --expert-plane-mirror-min-rows <tokens> (2) or more, and
+ * --expert-plane-mirror-decode-share (0, off) for smaller passes, reach it through configure()
+ * (Config::expert_plane_mirror*). A test hook stays in the environment:
+ * RADIANCE_EXPERIMENTAL_DS41_PLANE_MIRROR_FAULT=<n> fails the n-th read, to exercise the fallback
+ * to the container. */
 #pragma once
 #include <atomic>
 #include <cstdint>
@@ -34,8 +37,17 @@ namespace rad {
 class PlaneMirror {
     friend struct PlaneMirrorTest;   /* tests/plane_mirror_test.cpp builds instances of its own */
 public:
-    /* The process's mirror, or null when RADIANCE_EXPERIMENTAL_DS41_PLANE_MIRROR is unset or its
-     * directory cannot be read (warned once). */
+    /* The command line's choice (Config::expert_plane_mirror*). Set once at startup, before the
+     * first get(); an empty dir, the default, means no mirror. */
+    struct Options {
+        std::string dir;
+        double      share = 0.18;         /* passes of min_rows+ tokens (prefill chunks) */
+        int         min_rows = 2;
+        double      decode_share = 0.0;   /* smaller passes (decode); 0 reads the container only */
+    };
+    static void configure(const Options& o);
+    /* The process's mirror, or null when no directory was configured or it cannot be read (warned
+     * once). */
     static PlaneMirror* get();
 
     struct Ref { int shard = -1; uint64_t off = 0, bytes = 0; };   /* a tensor's data, absolute */
@@ -46,9 +58,11 @@ public:
      * since open fails. */
     int read(const Ref& r, uint64_t from, uint64_t bytes, uint8_t* dst);
     double share() const { return share_; }
-    /* Passes of fewer tokens read the container only: a decode miss waits on its slowest read, and
-     * the SATA stripe's reads, alone or queued behind other ranks', come back later than the NVMe
-     * drive's larger share (measured: decode -4% at an 18% share, prefill TTFT -10%). */
+    double decode_share() const { return decode_share_; }
+    /* Passes of fewer tokens take decode_share(), by default none: a decode miss waits on its
+     * slowest read, and the SATA stripe's reads, alone or queued behind other ranks', come back
+     * later than the NVMe drive's larger share (measured: decode -4% at an 18% share, +~3% at 10%;
+     * prefill TTFT -7 to -10% at 18%). */
     int min_rows() const { return min_rows_; }
     /* False once a read failed: the readers then take every byte from the container. */
     bool on() const { return on_.load(std::memory_order_acquire); }
@@ -68,6 +82,7 @@ private:
     std::unordered_map<std::string, Ref> index_;     /* "L.E" -> w3 codes */
     double share_ = 0.18;
     int    min_rows_ = 2;
+    double decode_share_ = 0.0;
     std::atomic<bool> on_{ true };
     std::atomic<int64_t> fault_{ -1 };   /* ..._FAULT=N: the N-th read fails (tests the fallback) */
     mutable std::mutex stats_mu_;

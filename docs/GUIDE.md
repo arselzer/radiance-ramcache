@@ -1997,6 +1997,10 @@ by 0.002-0.003 nats.
 | `--ngram-placement WHERE` | auto | `auto`, `vram`, `ram` or `disk`: an n-gram table on the card, as a copy in RAM made at load and read by the card, or read from the container (§4.3) |
 | `--vision-tower-placement WHERE` | vram | `vram` or `ram`: the encoder towers (vision, and audio where a model has one) on the card, or pinned in host memory beside `--host-pool-mib` and read in place once an image (§4.3) |
 | `--weights-disk-tier` | off | read weights that fit neither VRAM nor the host pool from the container (O_DIRECT); routed experts a layer at a time |
+| `--expert-plane-mirror DIR` | none | DeepSeek-V4.1 with host experts: the checkpoint's `model-*.safetensors` on another drive than the container; part of each missed expert is read from it beside the container (needs `--weights-disk-tier`) |
+| `--expert-plane-mirror-share F` | 0.18 | the fraction of a missed expert's bytes read from the mirror, at most 0.31 |
+| `--expert-plane-mirror-min-rows N` | 2 | the fewest tokens a pass has for `--expert-plane-mirror-share`: 2 is prefill chunks |
+| `--expert-plane-mirror-decode-share F` | 0 | the fraction read from the mirror in smaller passes (decode); 0 reads the container only, at most 0.31 |
 | `--row-prefetch MODE` | on | `on` or `off`: a host gather from a table read through the container's mapping (`--ngram-placement disk`) asks for its rows' pages before its kernel, or beside it when they are resident (§4.3); the output is the same either way |
 | `--mapped-rewarm MODE` | on | `on` or `off`: at startup, the pages of such a table an earlier run left in the page cache, and the load's own allocations pushed out, are asked for again (at most half of the available memory), so the first requests after a restart do not read them from the drive |
 

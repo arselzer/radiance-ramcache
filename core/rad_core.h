@@ -888,6 +888,18 @@ struct Config {
     /* Server-wide native RAM cache for file-tier experts, partitioned across ranks. Includes
      * entry metadata; pageable payloads copy through existing pinned windows. Zero disables. */
     int64_t expert_ram_cache_total_mib = 0;
+    /* --expert-plane-mirror DIR: the checkpoint's model-*.safetensors on another drive than the
+     * container. DeepSeek-V4.1's CPU expert path reads part of each missed expert from it beside
+     * the container (place/plane_mirror.h). Empty, the default, reads the container only.
+     * --expert-plane-mirror-share: the fraction of a missed expert's bytes it supplies (0.18, at
+     * most 0.31, the whole of the up projection's codes) in passes of
+     * --expert-plane-mirror-min-rows tokens or more (2: prefill chunks), and
+     * --expert-plane-mirror-decode-share in smaller passes (0, the default: decode reads the
+     * container only). */
+    std::string expert_plane_mirror;
+    double      expert_plane_mirror_share = 0.18;
+    int64_t     expert_plane_mirror_min_rows = 2;
+    double      expert_plane_mirror_decode_share = 0.0;
     /* --row-prefetch on|off: a host gather's rows on the mapped tier (a table on disk, read
      * through the container's mapping) are asked for ahead of its kernel (runtime/rowprefetch.h,
      * CtxDesc::row_prefetch). Output-neutral; on is the default. */

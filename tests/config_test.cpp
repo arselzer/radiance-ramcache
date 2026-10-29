@@ -281,6 +281,36 @@ TEST(the_paths_and_names_reach_their_fields) {
     CHECK_EQ(c.override_chat_template, std::string("/t.jinja"));
 }
 
+/* The plane mirror is off unless a directory is named; its share and minimum pass have stated
+ * defaults and refuse what the reader cannot honour; only the disk tier's misses read it. */
+TEST(the_plane_mirror_is_off_by_default_and_takes_its_directory_share_and_rows) {
+    Config d;
+    CHECK_EQ(parse({}, &d), RAD_OK);
+    CHECK(d.expert_plane_mirror.empty());
+    CHECK_EQ(d.expert_plane_mirror_share, 0.18);
+    CHECK_EQ(d.expert_plane_mirror_min_rows, 2ll);
+    CHECK_EQ(d.expert_plane_mirror_decode_share, 0.0);
+
+    Config c;
+    CHECK_EQ(parse({ "--weights-disk-tier",
+                     "--expert-plane-mirror", "/mirror/ckpt",
+                     "--expert-plane-mirror-share", "0.1",
+                     "--expert-plane-mirror-min-rows", "1",
+                     "--expert-plane-mirror-decode-share", "0.08" }, &c), RAD_OK);
+    CHECK_EQ(c.expert_plane_mirror, std::string("/mirror/ckpt"));
+    CHECK_EQ(c.expert_plane_mirror_share, 0.1);
+    CHECK_EQ(c.expert_plane_mirror_min_rows, 1ll);
+    CHECK_EQ(c.expert_plane_mirror_decode_share, 0.08);
+    CHECK_EQ(parse_fresh({ "--weights-disk-tier", "--expert-plane-mirror-decode-share", "0.5" }), RAD_E_INVAL);
+
+    CHECK_EQ(parse_fresh({ "--expert-plane-mirror", "/mirror/ckpt" }), RAD_E_INVAL);   /* no disk tier */
+    CHECK_EQ(parse_fresh({ "--weights-disk-tier", "--expert-plane-mirror-share", "0.4" }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--weights-disk-tier", "--expert-plane-mirror-share", "-0.1" }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--weights-disk-tier", "--expert-plane-mirror-share", "most" }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--weights-disk-tier", "--expert-plane-mirror-min-rows", "0" }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--weights-disk-tier", "--expert-plane-mirror" }), RAD_E_INVAL);   /* no directory */
+}
+
 /* The reasoning budget is a count or unset (-1); a negative value cannot be given. */
 TEST(thinking_token_budget_takes_a_count_and_defaults_to_none) {
     Config c;
@@ -444,6 +474,9 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--kv-resident", { "65536" } },
         { "--host-pool-mib", { "1024" } }, { "--host-headroom-mib", { "2048" } },
         { "--expert-ram-cache-total-mib", { "64", "--weights-disk-tier" } },
+        { "--expert-plane-mirror", { "/mirror", "--weights-disk-tier" } },
+        { "--expert-plane-mirror-share", { "0.1" } }, { "--expert-plane-mirror-min-rows", { "1" } },
+        { "--expert-plane-mirror-decode-share", { "0.08" } },
         { "--expert-profile", { "decode-profile.json" } },
         { "--embedding-placement", { "vram" } },
         { "--vision-tower-placement", { "ram" } }, { "--ngram-placement", { "disk" } },

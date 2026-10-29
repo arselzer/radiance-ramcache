@@ -862,7 +862,8 @@ private:
      * unit's two weights is the gate_up; the tail read from the mirror, 4 KiB-aligned. */
     std::vector<PlaneMirror::Ref> mirror_ref_;
     std::vector<int8_t>           mirror_k_;
-    int64_t                       mirror_tail_ = 0;
+    int64_t                       mirror_tail_ = 0;          /* passes of min_rows+ tokens */
+    int64_t                       mirror_tail_decode_ = 0;   /* smaller passes */
     int  stage_relaid(const std::vector<Relaid>& rl, NativeFileCacheReadPolicy policy);
     char*    windows_ = nullptr;
     int      n_windows_ = 0;

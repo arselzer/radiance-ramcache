@@ -162,6 +162,12 @@ int HostExpertPool::submit(const Job* jobs, int n, Ticket* t) {
             return RAD_E_INVAL;
         for (int r = 0; r < b.more; ++r)
             if (!b.xs[r] || !b.ys[r]) return RAD_E_INVAL;
+        /* A packed job's slots must describe these weights: tile() reads them through the same view. */
+        ds41hx::Mx v;
+        if (b.packed && (b.gu_scales || b.gu_bytes <= 0 || b.dn_bytes <= 0 ||
+                         !ds41hx::packed_view(b.gu, (size_t)b.gu_bytes, 2 * kFf, kEmbd, &v) ||
+                         !ds41hx::packed_view(b.dn, (size_t)b.dn_bytes, kEmbd, kFf, &v)))
+            return RAD_E_INVAL;
     }
     /* Counted before any job is visible, so a waiter never sees zero while one is still to come. */
     t->left.fetch_add(n, std::memory_order_relaxed);
@@ -251,13 +257,21 @@ bool HostExpertPool::run_one() {
     }
 }
 
+/* A packed slot's view: submit checked it, and the slot is leased and unchanged until the job is done. */
+static void packed_or_die(const uint8_t* p, int64_t bytes, int N, int K, ds41hx::Mx* m) {
+    if (ds41hx::packed_view(p, (size_t)bytes, N, K, m)) return;
+    RAD_ERR("host experts: a packed slot changed under a job (%dx%d); stopping", N, K);
+    std::abort();
+}
+
 void HostExpertPool::tile(Slot& s, uint32_t gen, int k) {
     ds41hx::Mx m;
     const bool planes = s.job.gu_scales != nullptr;
     if (k < kGuTiles) {
         m.N = 2 * kFf;
         m.K = kEmbd;
-        if (planes) { m.codes = s.job.gu; m.scales = s.job.gu_scales; }
+        if (s.job.packed) packed_or_die(s.job.gu, s.job.gu_bytes, 2 * kFf, kEmbd, &m);
+        else if (planes) { m.codes = s.job.gu; m.scales = s.job.gu_scales; }
         else m.blocks = s.job.gu;
         const uint16_t* xs[kMaxRows];
         uint16_t* ys[kMaxRows];
@@ -274,7 +288,8 @@ void HostExpertPool::tile(Slot& s, uint32_t gen, int k) {
     const int d = k - kGuTiles;
     m.N = kEmbd;
     m.K = kFf;
-    if (planes) { m.codes = s.job.dn; m.scales = s.job.dn_scales; }
+    if (s.job.packed) packed_or_die(s.job.dn, s.job.dn_bytes, kEmbd, kFf, &m);
+    else if (planes) { m.codes = s.job.dn; m.scales = s.job.dn_scales; }
     else m.blocks = s.job.dn;
     const uint16_t* xs[kMaxRows];
     uint16_t* ys[kMaxRows];

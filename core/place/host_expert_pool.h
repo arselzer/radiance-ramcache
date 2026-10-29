@@ -37,14 +37,17 @@ public:
 
     /* One expert on one token row. gu and dn are block_mxfp4 rows (the RAM cache's form), or with
      * gu_scales and dn_scales set the release's planes (a fresh read from the container): codes
-     * [N, K/2] and e8m0 scales [N, K/32]. An urgent job (a missed expert, on the critical path)
-     * is claimed before every other. */
+     * [N, K/2] and e8m0 scales [N, K/32], or with `packed` set packed slots of gu_bytes and
+     * dn_bytes (the packed RAM cache: ds41_host_experts.h packed_view, checked at submit). An
+     * urgent job (a missed expert, on the critical path) is claimed before every other. */
     static constexpr int kMaxRows = 4;
     struct Job {
         const uint8_t*  gu = nullptr;   /* [2 * kFf, kEmbd] */
         const uint8_t*  dn = nullptr;   /* [kEmbd, kFf] */
         const uint8_t*  gu_scales = nullptr;
         const uint8_t*  dn_scales = nullptr;
+        bool            packed = false;
+        int64_t         gu_bytes = 0, dn_bytes = 0;   /* packed: the slots' sizes */
         const uint16_t* x = nullptr;    /* kEmbd bf16 */
         uint16_t*       y = nullptr;    /* kEmbd bf16 */
         /* Up to kMaxRows - 1 more token rows of the same expert: each weight tile is read once for

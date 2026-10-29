@@ -226,6 +226,90 @@ TEST(host_expert_pool_multi_row_jobs_match) {
     CHECK_EQ(HostExpertPool::cost_rows(9), 2 * HostExpertPool::job_cost(4) + HostExpertPool::job_cost(1));
 }
 
+/* block_mxfp4 rows with the release's scales: e8m0 120 or 121, now and then 119 or 122, and one
+ * block in `rare` at 112, 117, 124 or 127 (raw rounds in the packed form). */
+static std::vector<uint8_t> release_blocks(int N, int K, uint64_t seed, int rare) {
+    std::vector<uint8_t> b = blocks(N, K, seed);
+    uint64_t s = seed * 0xD1B54A32D192ED03ull + 7;
+    static const uint8_t out[] = { 112, 117, 124, 127 };
+    for (size_t i = 0; i < b.size(); i += 17) {
+        s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+        const int p = (int)((s >> 20) % 100);
+        b[i] = (uint8_t)(p < 2 ? 119 : p < 50 ? 120 : p < 98 ? 121 : 122);
+        if ((s >> 40) % (uint64_t)rare == 0) b[i] = out[(s >> 8) % 4];
+    }
+    return b;
+}
+
+/* The packed RAM cache's slots (RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE, ds41_host_experts.h): one-
+ * and multi-row packed jobs give the reference's rows, beside block and planar jobs of the same
+ * expert; a packed job whose slot does not describe its weight, is cut short, or also names scales
+ * is refused. */
+TEST(host_expert_pool_packed_jobs_match) {
+    HostExpertPool* p = pool();
+    if (!p || !__builtin_cpu_supports("avx2")) { SKIP("no AVX2 or no pool"); return; }
+    Expert e{ release_blocks(2 * kFf, kEmbd, 61, 2000), release_blocks(kEmbd, kFf, 62, 2000) };
+    std::vector<uint8_t> guc, gus, dnc, dns;
+    planes_of(e.gu, 2 * kFf, kEmbd, &guc, &gus);
+    planes_of(e.dn, kEmbd, kFf, &dnc, &dns);
+    /* Slots that hold exactly their weight's raw rounds, as the engine sizes them for its budget. */
+    auto slot = [](const std::vector<uint8_t>& codes, const std::vector<uint8_t>& scales, int N, int K,
+                   ds41hx::PackInfo* plan) {
+        std::vector<uint8_t> out;
+        if (!ds41hx::pack_plan(scales.data(), N, K, plan)) return out;
+        out.assign(ds41hx::packed_bytes(N, K, plan->n_exc), 0xEE);
+        if (ds41hx::pack_planes(codes.data(), scales.data(), N, K, plan->n_exc, *plan, out.data(), out.size()) !=
+            ds41hx::kPackOk)
+            out.clear();
+        return out;
+    };
+    ds41hx::PackInfo gp, dp;
+    const std::vector<uint8_t> gk = slot(guc, gus, 2 * kFf, kEmbd, &gp), dk = slot(dnc, dns, kEmbd, kFf, &dp);
+    REQUIRE(!gk.empty() && !dk.empty());
+    CHECK(gp.n_exc > 0 && dp.n_exc > 0);   /* both widened and raw rounds */
+    std::vector<std::vector<uint16_t>> xs, want, got(5, std::vector<uint16_t>(kEmbd, 0xffff));
+    for (int r = 0; r < 3; ++r) {
+        xs.push_back(row(200 + (uint64_t)r));
+        want.push_back(reference(e, xs.back()));
+    }
+    HostExpertPool::Job j[3];
+    j[0].gu = gk.data(); j[0].dn = dk.data(); j[0].packed = true;
+    j[0].gu_bytes = (int64_t)gk.size(); j[0].dn_bytes = (int64_t)dk.size();
+    j[0].x = xs[0].data(); j[0].y = got[0].data();
+    j[1] = j[0];   /* three rows, urgent */
+    j[1].x = xs[0].data(); j[1].y = got[1].data();
+    j[1].xs[0] = xs[1].data(); j[1].ys[0] = got[2].data();
+    j[1].xs[1] = xs[2].data(); j[1].ys[1] = got[3].data();
+    j[1].more = 2; j[1].urgent = true;
+    j[2].gu = e.gu.data(); j[2].dn = e.dn.data(); j[2].x = xs[2].data(); j[2].y = got[4].data();   /* blocks */
+    HostExpertPool::Ticket t;
+    p->reserve(HostExpertPool::job_cost(1) * 2 + HostExpertPool::job_cost(3));
+    CHECK_EQ(p->submit(j, 3, &t), 0);
+    p->wait(&t);
+    CHECK(got[0] == want[0]);
+    for (int r = 0; r < 3; ++r) CHECK(got[(size_t)r + 1] == want[(size_t)r]);
+    CHECK(got[4] == want[2]);
+    CHECK_EQ(p->backlog(), (int64_t)0);
+    /* Refused: a slot a byte short, the weights' slots swapped (another shape), scales beside a packed
+     * slot, and block bytes called packed. */
+    HostExpertPool::Ticket t2;
+    HostExpertPool::Job bad = j[0];
+    bad.gu_bytes -= 1;
+    CHECK(p->submit(&bad, 1, &t2) < 0);
+    bad = j[0];
+    std::swap(bad.gu, bad.dn);
+    std::swap(bad.gu_bytes, bad.dn_bytes);
+    CHECK(p->submit(&bad, 1, &t2) < 0);
+    bad = j[0];
+    bad.gu_scales = gus.data(); bad.dn_scales = dns.data();
+    CHECK(p->submit(&bad, 1, &t2) < 0);
+    bad = j[2];
+    bad.packed = true; bad.gu_bytes = (int64_t)e.gu.size(); bad.dn_bytes = (int64_t)e.dn.size();
+    CHECK(p->submit(&bad, 1, &t2) < 0);
+    CHECK_EQ(t2.left.load(), 0);
+    CHECK_EQ(p->backlog(), (int64_t)0);
+}
+
 TEST(host_expert_pool_refuses_incomplete_jobs) {
     HostExpertPool* p = pool();
     if (!p) { SKIP("no pool"); return; }

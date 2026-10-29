@@ -328,6 +328,7 @@ for a in $ARMS; do
                [[ $p == Ds[0-9] ]] && env+=(RADIANCE_EXPERIMENTAL_DS41_DSPARK_VERIFY_CAP=${p#Ds})
                [[ $p == Dsa ]] && ARGS+=(--draft-window adaptive) ;;
       K)       env+=(RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE=1) ;;     # the RAM cache packed for the CPU only
+      Lm[0-9]*) ARGS+=(--max-model-len "${p#Lm}") ;;   # a longer context (default 512), e.g. for long-prompt TTFT
       *)       log "arm $a: unknown part $p; the arm is skipped (it would run without what its name says)"; skip=1 ;;
     esac
   done

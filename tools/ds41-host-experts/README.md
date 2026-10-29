@@ -44,6 +44,8 @@ RADIANCE_EXPERIMENTAL_DS41_PREFETCH_ATTN=1                 # next layer's attent
 RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE=1                  # the RAM cache in a CPU-only packed form (x1.044 slots)
 RADIANCE_EXPERIMENTAL_DS41_CACHE_SECOND_CHANCE=2           # profile-hot cached units get two second chances
 RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8=1                     # FP8-sourced dense weights read from E4M3 codes
+RADIANCE_EXPERIMENTAL_DS41_PREFETCH=pieces                 # read-ahead of predicted misses in 512 KB pieces
+RADIANCE_EXPERIMENTAL_DS41_PREFETCH_K=4
 
 radiance ... --tp 4 --placement expert_tiered --weights-disk-tier \
   --expert-ram-cache-total-mib 98304 --host-pool-mib 256 --embedding-placement ram \

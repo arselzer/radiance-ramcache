@@ -321,6 +321,29 @@ arm() {   # name, then env assignments for the server; CACHE_MIB the RAM cache (
     stop_server; return 1
   fi
   [[ -n "${ARM_DB:-}" ]] && grep -m2 -E 'runs its short block|short[0-9] query' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
+  # Pu / Pu2 (RADIANCE_EXPERIMENTAL_DS41_PREFETCH_URGENT=1 / 2): every rank names at startup what a
+  # partly read unit's rest is read from. A Pu arm without such a line with its value (a radiance
+  # without the switch, no read-ahead in pieces to finish, ..._PREFETCH_FINISH=0), a Pu2 arm with a
+  # rank that has no decode mirror (it would read the rest from the container alone), or another
+  # arm with such a line, is not measured. Its shutdown counters are checked after the requests.
+  local pu_any pu_lines pu_cont
+  pu_any=$(grep -c 'reads the rest of a partly read unit its layer needs' "$OUT/$name.server.log")
+  if [[ -n "${ARM_PU:-}" ]]; then
+    pu_lines=$(grep -c "reads the rest of a partly read unit its layer needs .*PREFETCH_URGENT=${ARM_PU})" "$OUT/$name.server.log")
+    pu_cont=$(grep -c "PREFETCH_URGENT=${ARM_PU}), from the container alone: this rank has no decode mirror" "$OUT/$name.server.log")
+    if [[ "$pu_lines" == 0 || "$pu_lines" != "$pu_any" ]]; then
+      log "arm $name: Pu${ARM_PU#1}, but the server log has $pu_lines 'reads the rest of a partly read unit ... PREFETCH_URGENT=${ARM_PU})' lines of $pu_any ($(grep -m1 -E 'a partly read unit its layer needs is' "$OUT/$name.server.log")); not measured"
+      stop_server; return 1
+    fi
+    if [[ "$pu_cont" != 0 ]]; then
+      log "arm $name: Pu2, but $pu_cont rank(s) have no decode mirror and read the rest from the container alone (MIRROR, R and RdNN?); not measured"
+      stop_server; return 1
+    fi
+    grep -E 'reads the rest of a partly read unit its layer needs' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
+  elif [[ "$pu_any" != 0 ]]; then
+    log "arm $name: no Pu part, but the server reads a partly read unit's rest in the layer's own call (the knob set for the window?); not measured"
+    stop_server; return 1
+  fi
   # The NVMe drive's busy time (io_ticks, ms) and temperature over the requests: read-ahead arms
   # move it from ~45% busy towards saturation.
   local d0 d1 t0 t1 rc temp
@@ -364,8 +387,25 @@ arm() {   # name, then env assignments for the server; CACHE_MIB the RAM cache (
     log "arm $name: $dk_bad; not measured (results kept as $name.unmeasured.json)"
     [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
   fi
+  # Pu / Pu2 at shutdown: some rank's layers read a partly read unit's rest in their own call (Pu2:
+  # some of it from the plane mirror), or the switch never acted and the arm is not measured (set
+  # aside as <arm>.unmeasured.json, as a Dk arm's).
+  if [[ -n "${ARM_PU:-}" ]]; then
+    local pu_rest pu_mb pu_bad=""
+    pu_rest=$(grep -oE "PREFETCH_URGENT=${ARM_PU}\): [0-9]+ units' rest" "$OUT/$name.server.log" | grep -oE ': [0-9]+' | tr -d ': ' | awk '{s += $1} END {print s + 0}')
+    pu_mb=$(grep -E "PREFETCH_URGENT=${ARM_PU}\): [0-9]+ units' rest" "$OUT/$name.server.log" | grep -oE '\([0-9]+ MB of it from the plane mirror' | grep -oE '[0-9]+' | awk '{s += $1} END {print s + 0}')
+    [[ "$pu_rest" == 0 ]] && pu_bad="no rank's shutdown line counts a unit's rest read in its layer's own call"
+    [[ -z "$pu_bad" && "$ARM_PU" == 2 && "$pu_mb" == 0 ]] && pu_bad="no rank read any of a rest from the plane mirror"
+    if [[ -n "$pu_bad" ]]; then
+      log "arm $name: Pu${ARM_PU#1}, but $pu_bad; not measured (results kept as $name.unmeasured.json)"
+      [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
+    fi
+  fi
   grep -E 'host experts|EP scoped|live chain|error|ERR' "$OUT/$name.server.log" | tail -16 | tee -a "$OUT/window.log"
-  grep -E 'read-ahead (in pieces|readers)|router predictor \(' "$OUT/$name.server.log" | tail -6 | tee -a "$OUT/window.log"
+  grep -E 'read-ahead (in pieces:|readers)|router predictor \(' "$OUT/$name.server.log" | tail -6 | tee -a "$OUT/window.log"
+  # The per-unit wait for partly read units, every arm with read-ahead in pieces (the Pu parts' gate),
+  # and a Pu arm's rests.
+  grep -E 'read-ahead in pieces, (partly read units|rests on the kept readers)' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   grep -E 'rank 0: on-die reads' "$OUT/$name.server.log" | tee -a "$OUT/window.log"   # Pa/Pm/Pl/Pe: plan, counts
   grep -E 'post-stop passes: [0-9]' "$OUT/$name.server.log" | tail -1 | tee -a "$OUT/window.log"   # passes after a reply's end (Ss)
   # Every arm's VRAM residents a rank; a Vp arm's packed-form lines (what packed, the scan, the load's checks).
@@ -581,7 +621,16 @@ for a in $ARMS; do
   # pieces, 4 in flight over the process, none started while a demand read is in flight, handed to
   # their layer only whole (the rest read at once when the layer needs a partly read one); PqN its
   # readers (pieces in flight, 4), PbN its piece size in KiB (512), and Pf0 a partly read unit its
-  # layer needs read afresh instead of finished, with PpK; o --profile-ops;
+  # layer needs read afresh instead of finished, with PpK; Pu such a unit finished by its layer's
+  # own read instead of urgent pieces: no further piece starts, and the call that reads the layer's
+  # other misses on the kept readers reads the rest of each extent too, one large read an extent's
+  # rest, while the pieces in flight land (RADIANCE_EXPERIMENTAL_DS41_PREFETCH_URGENT=1; the same
+  # bytes at the same offsets), Pu2 the same with the plane mirror's decode share of the rest beside
+  # the container's (=2, so a barely started unit is finished too; needs R and RdNN); both need PpK,
+  # every other arm runs with the switch 0, and a Pu arm is measured only if every rank names it at
+  # startup (Pu2: with its decode mirror) and a shutdown line counts rests read (Pu2: some from the
+  # mirror); the "read-ahead in pieces, partly read units" line has the per-unit wait in every
+  # arm with PpK; o --profile-ops;
   # H the second run home (RADIANCE_HOME_DIR2); iN background insert threads for missed units;
 # pN --host-pool-mib (4096: a rank's pinned expert slots and the file tier's staging); G pin the
 # RAM cache's slabs at startup; R / RNN read part of each missed expert from the checkpoint's
@@ -680,7 +729,7 @@ for a in $ARMS; do
 # only on the libr4d.so whose gemm_nt_f32bf16 passed SELFTEST_F32BF16's card checks in this window.
 # An arm with a predictor part (Ps, Po, Pt, Pp) is measured only if the router predictor loaded.
   IFS=- read -r -a parts <<< "$a"
-  xt="" bt="" kld="" dk="" db=""
+  xt="" bt="" kld="" dk="" db="" pu=""
   pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 HOST_POOL_MIB=4096 EXTRA_ARGS="" ARM_HOME="$RHOME" ARM_CONC=
   ARM_PROMPTS= ARM_N= ARM_LQ= rt=
   power="" skip="" ARGS=() f8="" f8x="" rb="" rbf=0 pred="" cs="" kh="" pc="" pcopt=""
@@ -739,6 +788,8 @@ for a in $ARMS; do
       Pq[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_PREFETCH_QD=${p#Pq}) ;;          # ...its readers (4)
       Pb[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_PREFETCH_PIECE_KB=${p#Pb}) ;;    # ...its piece size in KiB (512)
       Pf[01])   env+=(RADIANCE_EXPERIMENTAL_DS41_PREFETCH_FINISH=${p#Pf}) ;;      # ...0: partly read units read afresh
+      Pu|Pu2)   pu=${p#Pu}; pu=${pu:-1}                                          # ...a partly read unit's rest in its layer's own read
+                env+=(RADIANCE_EXPERIMENTAL_DS41_PREFETCH_URGENT=$pu) ;;          # (1; 2: the plane mirror's share of it too)
       Er)      ARGS+=(--embedding-placement ram) ;;   # the token embedding pinned in host RAM, its VRAM to experts
       Xp)      env+=(RADIANCE_EXPERIMENTAL_DS41_READ_POOL=0) ;;        # miss reads on threads started a call
       Xh)      env+=(RADIANCE_EXPERIMENTAL_DS41_PLANE_HUGEPAGES=0) ;;  # miss buffers on 4 KiB pages
@@ -836,6 +887,16 @@ for a in $ARMS; do
     fi
   fi
   ARM_RB=$rb ARM_PRED=$pred
+  # Pu / Pu2: a partly read unit's rest in its layer's own read only in an arm whose name says so,
+  # whatever the window's environment (0: the urgent pieces, as before); arm() checks the log both
+  # ways. Without a PpK part there is nothing to finish, and the arm would not test it.
+  if [[ -n "$pu" ]]; then
+    if [[ "-$a-" != *-Pp[0-9]* ]]; then log "arm $a: Pu${pu#1} needs a PpK part (read-ahead in pieces); the arm is skipped"; skip=1; fi
+    [[ "$pu" == 2 && "-$a-" != *-Rd[0-9]* ]] && { log "arm $a: Pu2 needs the decode mirror (R and RdNN); the arm is skipped"; skip=1; }
+  else
+    env+=(RADIANCE_EXPERIMENTAL_DS41_PREFETCH_URGENT=0)
+  fi
+  ARM_PU=$pu
   # Ss: the read-back runs in an arm only if its name says so, whatever the window's environment.
   [[ " ${env[*]} " == *" RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP=1 "* ]] || env+=(RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP=0)
   [[ -z "$rt" ]] && env+=(RADIANCE_EXPERIMENTAL_DS41_ROUTE_TRACE=)   # traced only with Rt

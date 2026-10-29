@@ -14,6 +14,7 @@
 #include <array>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -713,16 +714,22 @@ int Planner::assign_expert_tiered(Plan* p) {
         for (int32_t ui : order) {
             MoveUnit& mu = p->units[(size_t)ui];
             if (mu.access != RAD_ACCESS_CONDITIONAL || mu.preplaced()) continue;
-            if (k.residents < cap && k.used + mu.slot_bytes <= room) {
-                k.used += mu.slot_bytes;
-                ++k.residents;
-                mu.tier = Tier::VRAM;
-                mu.site = Site::Device;
-                mu.reason = "resident: ranked by the container's profile";
-                /* Only movable units are touched by heat; under Config::deterministic none are,
-                 * so this resident set holds for the whole run. */
-                mu.movable = p->dynamic;
-                continue;
+            /* A resident costs its slot, or under RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED what the card
+             * holds of it (vram_packed.h). The floor reads nothing, so a unit past the room is never
+             * scanned; without the switch both are the slot, so this is the plain test. */
+            if (k.residents < cap && k.used + vram_floor(mu) <= room) {
+                const int64_t charge = vram_charge(ui, mu, p);
+                if (k.used + charge <= room) {
+                    k.used += charge;
+                    ++k.residents;
+                    mu.tier = Tier::VRAM;
+                    mu.site = Site::Device;
+                    mu.reason = "resident: ranked by the container's profile";
+                    /* Only movable units are touched by heat; under Config::deterministic none are,
+                     * so this resident set holds for the whole run. */
+                    mu.movable = p->dynamic;
+                    continue;
+                }
             }
             if (!fall.place(mu, host_kernel(mu), &mu.reason)) {
                 mu.tier = Tier::SSD;
@@ -812,6 +819,100 @@ int Planner::assign_expert_tiered(Plan* p) {
         }
     }
     return rc;
+}
+
+/* ------------------------------------------------------------------ packed VRAM residents */
+/* RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED (vram_packed.h). Weight by weight at each one's alignment, as
+ * build_units lays a unit out, so a unit with every weight at its stored size comes to `bytes` exactly. */
+template <class F>
+int64_t Planner::unit_layout(const MoveUnit& mu, F size, std::vector<int64_t>* off) const {
+    const Program& prog = *in_.program;
+    int64_t b = 0;
+    if (off) off->clear();
+    for (rad_weight w : mu.weights) {
+        const WeightInfo& wi = prog.weights[w];
+        const int64_t a = wi.align > 0 ? wi.align : RAD_ALIGN_UNIT;
+        const int64_t at = align_up(b, a);
+        if (off) off->push_back(at);
+        b = at + size(w);
+    }
+    return b;
+}
+
+int64_t Planner::vram_floor(const MoveUnit& mu) const {
+    if (!pk_on_ || mu.access != RAD_ACCESS_CONDITIONAL) return mu.slot_bytes;
+    const Program& prog = *in_.program;
+    const int64_t b = unit_layout(mu, [&](rad_weight w) {
+        int32_t cap = -1, raw = -1;
+        const int64_t pk = in_.vram_pack(w, false, &cap, &raw);
+        return pk > 0 ? pk : weight_bytes(prog.weights[w]);
+    }, nullptr);
+    return std::min(mu.slot_bytes, align_up(b, RAD_ALIGN_UNIT));
+}
+
+int64_t Planner::vram_charge(int32_t ui, const MoveUnit& mu, Plan* p) {
+    if (!pk_on_ || mu.access != RAD_ACCESS_CONDITIONAL) return mu.slot_bytes;
+    int64_t& charge = pk_charge_[(size_t)ui];
+    if (charge >= 0) return charge;
+    const Program& prog = *in_.program;
+    for (rad_weight w : mu.weights) {
+        if (pk_bytes_[w] >= 0) continue;
+        int32_t cap = -1, raw = -1;
+        pk_bytes_[w] = 0;
+        if (in_.vram_pack(w, false, &cap, &raw) <= 0) continue;   /* not eligible: nothing to read */
+        const auto t0 = std::chrono::steady_clock::now();
+        pk_bytes_[w] = std::max<int64_t>(in_.vram_pack(w, true, &cap, &raw), 0);
+        p->vram_packed.scan_s +=
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        pk_cap_[w] = cap;
+        pk_raw_[w] = raw;
+        ++p->vram_packed.scanned;
+        if (raw < 0) ++p->vram_packed.scan_failed;
+    }
+    const int64_t b = unit_layout(mu, [&](rad_weight w) {
+        return pk_bytes_[w] > 0 ? pk_bytes_[w] : weight_bytes(prog.weights[w]);
+    }, nullptr);
+    charge = std::min(mu.slot_bytes, align_up(b, RAD_ALIGN_UNIT));
+    return charge;
+}
+
+/* After the fill: every static conditional resident the fill charged gets its packed layout, which the
+ * mover places and publishes (MoveUnit::vram_bytes) and the loader packs (Placement::vram_bytes). A
+ * resident with no packed weight keeps its stored form and its plain layout. */
+void Planner::finish_vram_packed(Plan* p) {
+    for (MoveUnit& mu : p->units) {
+        mu.vram_bytes = 0;
+        mu.vram_offset.clear();
+    }
+    if (!pk_on_) return;
+    const Program& prog = *in_.program;
+    Plan::VramPacked& st = p->vram_packed;
+    for (size_t u = 0; u < p->units.size(); ++u) {
+        MoveUnit& mu = p->units[u];
+        if (mu.tier != Tier::VRAM || mu.movable || mu.slab_slot >= 0 ||
+            mu.access != RAD_ACCESS_CONDITIONAL || pk_charge_[u] < 0)
+            continue;
+        int packed = 0;
+        for (rad_weight w : mu.weights) {
+            if (pk_bytes_[w] > 0) ++packed;
+            else if (pk_cap_[w] >= 0 && pk_raw_[w] > pk_cap_[w]) ++st.over_budget;
+        }
+        if (!packed) continue;
+        mu.vram_bytes = unit_layout(mu, [&](rad_weight w) {
+            return pk_bytes_[w] > 0 ? pk_bytes_[w] : weight_bytes(prog.weights[w]);
+        }, &mu.vram_offset);
+        ++st.units;
+        st.bytes += align_up(mu.vram_bytes, RAD_ALIGN_UNIT);
+        st.block_bytes += mu.slot_bytes;
+        for (rad_weight w : mu.weights) {
+            if (pk_bytes_[w] <= 0) continue;
+            ++st.weights;
+            if (prog.weights[w].decl.group.slot == 0) ++st.gate_up;
+            else ++st.down;
+            st.raw_rounds += pk_raw_[w];
+            st.raw_max = std::max<int64_t>(st.raw_max, pk_raw_[w]);
+        }
+    }
 }
 
 bool Planner::host_kernel(const MoveUnit& mu) const {
@@ -948,6 +1049,8 @@ void Planner::finish(const Program& prog, Plan* p) {
     /* Two crossings a run: to the host at its first layer, back after its last. */
     p->link_crossings = 2 * (int32_t)p->host_runs.size();
 
+    finish_vram_packed(p);
+
     /* Copy each unit's decision onto its weights, which is what the rest of the engine reads. */
     p->weight.assign(prog.weights.size(), Placement{});
     p->totals = Plan::Totals{};
@@ -961,6 +1064,12 @@ void Planner::finish(const Program& prog, Plan* p) {
             pl.unit = i;
             pl.reason = mu.reason;
             pl.bytes = weight_bytes(prog.weights[w]);
+            /* A packed VRAM weight: what the card holds, and so what the tier total counts. */
+            if (mu.vram_bytes > 0 && pk_bytes_[w] > 0) {
+                pl.vram_bytes = pk_bytes_[w];
+                pl.vram_pk_cap = pk_cap_[w];
+                pl.bytes = pl.vram_bytes;
+            }
             p->totals.bytes[(int)mu.tier] += pl.bytes;
             if (mu.host_forced) p->forced_host_used += pl.bytes;
         }
@@ -1252,6 +1361,13 @@ int Planner::plan(Plan* out) {
     /* Before build_classes and assign: mapped units get no class and no budget. */
     pin_mapped(prog, out);
     build_classes(out);
+    /* RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED packs static residents only: a movable one lives in a slot
+     * of its class's stride, and the heat engine copies slots as they are. */
+    pk_on_ = in_.vram_pack != nullptr && !out->dynamic;
+    pk_bytes_.assign(pk_on_ ? prog.weights.size() : 0, -1);
+    pk_cap_.assign(pk_on_ ? prog.weights.size() : 0, -1);
+    pk_raw_.assign(pk_on_ ? prog.weights.size() : 0, -1);
+    pk_charge_.assign(pk_on_ ? out->units.size() : 0, -1);
 
     /* After build_classes: a unit's slot_bytes is its class's stride, and the pins below charge
      * the host pool that. Before it the charge would be zero and the pool would not hold them. */
@@ -1504,6 +1620,11 @@ std::string Plan::report(const Program& prog) const {
     if (slab_overhead)
         s += fmt("  slab overhead %12s  %12s   (shadow slots + the staging ring)\n", "-",
                  humanb(slab_overhead).c_str());
+    if (vram_packed.units)
+        s += fmt("  vram packed   %12s  %12s   (%lld residents in the packed-scale form, block_mxfp4 %s; "
+                 "%lld weights over their raw-round budget stay block)\n", "-",
+                 humanb(vram_packed.bytes).c_str(), (long long)vram_packed.units,
+                 humanb(vram_packed.block_bytes).c_str(), (long long)vram_packed.over_budget);
 
     bool any_slab = false;
     for (const SlabClass& c : classes) if (c.movable || c.n_stage) any_slab = true;

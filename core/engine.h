@@ -34,6 +34,7 @@
 #include "format/radfile.h"
 #include "format/table_copy.h"
 #include "format/dspark_rad_banks.h"
+#include "place/vram_packed.h"
 #include "lora/adapter.h"
 #include "lora/slots.h"
 
@@ -600,6 +601,8 @@ private:
     std::string devnote_;            /* the devices usable_devices left out, and why */
     int         p2p_measured_ = -1;  /* 1 peer to peer, 0 through host memory, -1 not asked */
     std::string p2p_blocked_;
+    /* RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED (place/vram_packed.h), read once in start(). */
+    VramPackConfig vram_pack_cfg_;
     bool        has_ngram_ = false;  /* the model carries an n-gram table */
     std::string prefix_off_why_;     /* why the engine itself turned prefix caching off, or "" */
 

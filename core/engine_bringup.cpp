@@ -2063,11 +2063,44 @@ int Engine::plan() {
         in.container = file_ != nullptr;
         in.host_backend = device_is_host();
         in.file_relayout = true;    /* the mover relays on the read (Mover::set_file_relayout) */
+        /* RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED (place/vram_packed.h): the weights the card can hold in the
+         * packed-scale form, and the scan the expert fill asks for before it charges a resident so: the
+         * weight's scales from the container, one read each. */
+        std::vector<VramPackWeight> vpk;
+        std::vector<uint8_t> vpk_buf;
+        if (vram_pack_cfg_.on) {
+            std::string why;
+            if (!file_ || source_banks_)
+                why = "the experts are not read from one container (a checkpoint, or a DSpark bank)";
+            else
+                vram_pack_eligible(r->program, *file_, vram_pack_cfg_, &vpk, &why);
+            int64_t n_ok = 0;
+            for (const VramPackWeight& v : vpk) n_ok += v.bytes > 0;
+            if (r->index == 0 || !why.empty())
+                RAD_INFO("VRAM packed experts: rank %d: %lld routed weights can be held packed%s%s", r->index,
+                         (long long)n_ok, why.empty() ? "" : "; ", why.c_str());
+            if (n_ok > 0)
+                in.vram_pack = [&](rad_weight w, bool scan, int32_t* cap, int32_t* raw) -> int64_t {
+                    return vram_pack_query(*file_, vpk, w, scan, cap, raw, &vpk_buf);
+                };
+        }
         Planner planner(in);
         s = planner.plan(&r->plan);
         if (cfg_.debug_placement || s < 0)
             fputs(r->plan.report(r->program).c_str(), stderr);
         if (s < 0) return s;
+        if (vram_pack_cfg_.on) {
+            const Plan::VramPacked& vp = r->plan.vram_packed;
+            RAD_INFO("VRAM packed experts: rank %d holds %lld static residents in the packed-scale form (%lld gate_up "
+                     "and %lld down weights): %s where block_mxfp4 takes %s; %lld eligible weights over their "
+                     "raw-round budget stay block_mxfp4; %lld weights' scales read in %.2f s to decide (%lld "
+                     "unreadable, kept block_mxfp4); raw rounds %lld in all, at most %lld in a weight%s",
+                     r->index, (long long)vp.units, (long long)vp.gate_up, (long long)vp.down,
+                     humanb(vp.bytes).c_str(), humanb(vp.block_bytes).c_str(), (long long)vp.over_budget,
+                     (long long)vp.scanned, vp.scan_s, (long long)vp.scan_failed, (long long)vp.raw_rounds,
+                     (long long)vp.raw_max,
+                     r->plan.dynamic ? " (a dynamic plan packs nothing: give --deterministic)" : "");
+        }
         if (!decode_profile.rows.empty()) {
             size_t vram_units = 0, pinned_units = 0, disk_units = 0;
             double vram_mass = 0, pinned_mass = 0, disk_mass = 0;
@@ -2211,6 +2244,10 @@ struct StagedWeight {
     int      device = 0;
     uint8_t* dst = nullptr;     /* where the stored form goes */
     bool     dev = false;       /* ...in device memory */
+    /* RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED: the packed-scale form goes there instead, `pk_bytes` long with
+     * room for `pk_cap` raw rounds (place/vram_packed.h); 0 for the stored form. */
+    int64_t  pk_bytes = 0;
+    int32_t  pk_cap = -1;
     int64_t  in_bytes = 0;
     int64_t  plane_off[RAD_ENC_MAX_PLANES] = {0};
     int64_t  remaining = 0;     /* bytes the sweep has yet to deliver */
@@ -2544,7 +2581,7 @@ private:
         RadTensor pt[RAD_ENC_MAX_PLANES];
         weight_planes(w, pt);
         for (int k = 0; k < w.n_sel; ++k) pt[k].data = s.in + s.plane_off[k];
-        const int64_t n = w.stored_bytes;
+        const int64_t n = s.pk_bytes > 0 ? s.pk_bytes : w.stored_bytes;
         std::unique_ptr<uint8_t[]> tmp;
         uint8_t* out = s.dst;
         /* A weight that fits a slot is laid out in pinned memory the copy reads directly. */
@@ -2561,7 +2598,23 @@ private:
 
         int st = RAD_OK;
         const char* who = "the loader";
-        if (w.widen || w.narrow) {
+        if (s.pk_bytes > 0) {
+            /* A packed VRAM resident (vram_packed.h): its codes and scales planes packed and checked, the
+             * scales' round trip through the kernels' widening and the codes byte for byte. */
+            who = "the packed-scale form (RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED)";
+            int n_exc = -1;
+            st = w.n_sel == 2 && pt[0].dtype == RAD_FP4E2M1 && pt[1].dtype == RAD_E8M0
+                     ? vram_pack_weight((const uint8_t*)pt[0].data, (const uint8_t*)pt[1].data,
+                                        (int)pt[0].shape[0], (int)pt[0].shape[1], s.pk_cap, out, n, &n_exc)
+                     : RAD_E_DTYPE;
+            if (st == RAD_E_FULL)
+                RAD_ERR("load: '%s' needs %d raw rounds and its packed form has room for %d: the plan's scan of "
+                        "the same container found it within; was the container changed under the load?",
+                        w.name.c_str(), n_exc, s.pk_cap);
+            else if (st == RAD_E_STATE)
+                RAD_ERR("load: '%s' packed does not give back its planes (scales' round trip or codes)",
+                        w.name.c_str());
+        } else if (w.widen || w.narrow) {
             /* Exact: every bf16 and f16 value is representable in f32, and f32 rounds to bf16 to
              * nearest even. */
             const int64_t cnt = w.sel_rows[0] * w.sel_cols[0];
@@ -3080,6 +3133,9 @@ int Engine::load_weights() {
             w.tier        = r->plan.weight[i].tier;
             w.site        = r->plan.weight[i].site;
             w.slab_slot   = r->plan.weight[i].slab_slot;
+            /* RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED: a packed VRAM resident (vram_packed.h). */
+            w.vram_bytes  = w.tier == Tier::VRAM ? r->plan.weight[i].vram_bytes : 0;
+            w.vram_pk_cap = w.vram_bytes > 0 ? r->plan.weight[i].vram_pk_cap : -1;
             w.file_offset = e ? source->plane(*e, w.sel[0]).offset : 0;
             for (int k = 0; k < w.n_sel && e; ++k)
                 w.file_plane_offset[k] = source->plane(*e, w.sel[k]).offset;
@@ -3196,7 +3252,14 @@ int Engine::load_weights() {
              * (core/mem/pools.cpp), but an async host-to-host copy on this stack is the same memcpy
              * behind a stream, not a DMA, so streaming it would not overlap it with reads. */
             const bool dev = w.tier == Tier::VRAM;
-            if (dev && !dst_fits(slot->ptr, w.stored_bytes, w.name.c_str())) return RAD_E_STATE;
+            /* A packed VRAM resident takes its packed bytes there, which the mover laid out. */
+            const int64_t dev_bytes = w.vram_bytes > 0 ? w.vram_bytes : w.stored_bytes;
+            if (dev && !dst_fits(slot->ptr, dev_bytes, w.name.c_str())) return RAD_E_STATE;
+            if (w.vram_bytes > 0 && (!e || !dev || w.identity)) {
+                RAD_ERR("rank %d: '%s' was planned packed in VRAM but is %s", r->index, w.name.c_str(),
+                        !e ? "read from a checkpoint" : !dev ? "not in VRAM" : "stored as it is read");
+                return RAD_E_STATE;
+            }
 
             /* This rank's share of the selected planes (format/share.h). */
             PlaneShare sh[RAD_ENC_MAX_PLANES];
@@ -3257,6 +3320,10 @@ int Engine::load_weights() {
                 sw.device = r->device;
                 sw.dst = (uint8_t*)slot->ptr;
                 sw.dev = dev;
+                sw.pk_bytes = w.vram_bytes;
+                sw.pk_cap = w.vram_pk_cap;
+                /* Packed and checked by the relayout pool, or the load fails. */
+                if (w.vram_bytes > 0) ++r->plan.vram_packed.loaded;
                 for (int k = 0; k < w.n_sel; ++k) {
                     sw.plane_off[k] = in_bytes;
                     in_bytes += align_up(sh[k].dense_bytes(), 64);
@@ -3881,6 +3948,23 @@ int Engine::start() {
         const bool forced_off = cfg_.p2p == RAD_P2P_OFF;
         if (forced_off) p2p = 0;
         rad_tools_registry().set_device_fact(RAD_FACT_P2P, p2p);
+        /* RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED (place/vram_packed.h): the machine fact that lets libr4d's
+         * moe_gemm_ggml_mxfp4_gemv_vp row take the routed GEMMs' decode band, set before selection as
+         * device.p2p is. Without it the row never matches and nothing below packs. */
+        RAD_TRY(vram_pack_config(&vram_pack_cfg_));
+        if (vram_pack_cfg_.on) {
+            const char* oracle = std::getenv("RADIANCE_OP_ORACLE");
+            if (oracle && *oracle) {
+                RAD_ERR("RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED=1 with RADIANCE_OP_ORACLE: the oracle reads a "
+                        "weight back through its stored form, block_mxfp4, and a packed VRAM resident is not "
+                        "in it; run the oracle without the switch");
+                return RAD_E_INVAL;
+            }
+            rad_tools_registry().set_device_fact(kVramPackFact, 1);
+            RAD_INFO("VRAM packed experts (RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED): %s selects %s for the routed "
+                     "GEMMs' decode band; static residents with room for %d (gate_up) and %d (down) raw rounds",
+                     kVramPackFact, kVramPackRow, vram_pack_cfg_.raw[0], vram_pack_cfg_.raw[1]);
+        }
         p2p_measured_ = (int)p2p;
         p2p_blocked_ = blocked;
         if (cfg_.tp > 1)

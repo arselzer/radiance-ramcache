@@ -255,6 +255,11 @@ int Ctx::table_refresh(rad_op h, int operand, WeightTable& t) {
                                       "pointer at issue: the load phase never bound it and no "
                                       "residency table claims it",
                                       program_->weights[w].name.c_str(), (long long)e, operand));
+        /* RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED (place/vram_packed.h): a VRAM resident held in the
+         * packed-scale form is marked with bit 0 of its entry, which weights' 64-byte alignment leaves
+         * free; libr4d's moe_gemm_ggml_mxfp4_gemv_vp, the only row such a table reaches, reads the mark.
+         * A static resident's pointer never changes, so the mark is set once, at the first refresh. */
+        if (program_->weights[w].vram_bytes > 0) p = (void*)((uintptr_t)p | (uintptr_t)1);
         *out = p;
         return RAD_OK;
     };

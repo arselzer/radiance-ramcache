@@ -689,6 +689,74 @@ TEST(a_weight_table_issued_against_its_declaration_is_refused) {
     }
 }
 
+/* RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED (core/place/vram_packed.h): a VRAM resident the card holds in the
+ * packed-scale form (WeightInfo::vram_bytes) is marked in its table entry with bit 0, which only libr4d's
+ * moe_gemm_ggml_mxfp4_gemv_vp reads; every other entry is its weight's address as it is. The mark goes on
+ * at the first resolve and holds through the refreshes that patch only the entries that moved. */
+TEST(a_packed_vram_residents_table_entry_carries_bit_0) {
+    alignas(64) static uint16_t expert_bytes[4][32];
+    alignas(64) static uint16_t moved_expert[32];
+    Fixture f;
+    std::vector<rad_weight> w;
+    for (int e = 0; e < 4; ++e)
+        w.push_back(f.add_weight(("blk.0.e" + std::to_string(e)).c_str(), RAD_BF16, 8, 4,
+                                 expert_bytes[e]));
+    /* Experts 1 and 3 are packed residents. */
+    f.P.weights[w[1]].vram_bytes = 48;
+    f.P.weights[w[3]].vram_bytes = 48;
+    rad_buf x = f.add_buffer("x", RAD_BF16, 64, 4, 0);
+    rad_buf y = f.add_buffer("y", RAD_BF16, 64, 8, 1024);
+    rad_op  op = f.add_op("moe_gemm", "M", { 8192 }, { k_pre }, { "prefill" }, &g_moe_schema, w);
+
+    TableResidency res;
+    res.slot.assign(f.P.weights.size(), rad::WeightSlot{});
+    for (int e = 0; e < 4; ++e) res.slot[(size_t)w[(size_t)e]].ptr = expert_bytes[e];
+    CHECK_OK(f.start(&res));
+
+    auto issue = [&](int step_no) {
+        g_rec.clear();
+        CHECK_OK(f.step(4, step_no, [&](Ctx& c) {
+            RadOperand opd[3] = { RAD_B(x), RAD_WTAB(w[0], 4), RAD_B(y) };
+            CHECK_OK(c.issue(op, opd, 3, RAD_N_BATCH));
+        }));
+    };
+    /* What the kernel reads: the device table, copied back through the step's stream. */
+    auto entries = [&]() {
+        std::vector<void*> v(4, nullptr);
+        CHECK_OK(rad_memcpy_async(v.data(), g_rec[0].t[1].data, 4 * sizeof(void*), f.ctx.stream()));
+        CHECK_OK(rad_stream_sync(f.ctx.stream()));
+        return v;
+    };
+    auto marked = [](const void* p) { return (void*)((uintptr_t)p | (uintptr_t)1); };
+
+    issue(0);
+    std::vector<void*> v = entries();
+    CHECK(v[0] == (void*)expert_bytes[0]);
+    CHECK(v[1] == marked(expert_bytes[1]));
+    CHECK(v[2] == (void*)expert_bytes[2]);
+    CHECK(v[3] == marked(expert_bytes[3]));
+    CHECK_EQ(res.lookups, 4);
+
+    /* Nothing moved: no walk, and the marks as they were. */
+    issue(1);
+    CHECK_EQ(res.lookups, 4);
+    v = entries();
+    CHECK(v[1] == marked(expert_bytes[1]));
+    CHECK(v[3] == marked(expert_bytes[3]));
+
+    /* A plain entry moved is patched unmarked; a packed one named as changed is resolved again and keeps
+     * its mark; the untouched ones stay as they were. */
+    res.move(w[2], moved_expert);
+    res.move(w[1], expert_bytes[1]);
+    issue(2);
+    CHECK_EQ(res.lookups, 6);
+    v = entries();
+    CHECK(v[0] == (void*)expert_bytes[0]);
+    CHECK(v[1] == marked(expert_bytes[1]));
+    CHECK(v[2] == (void*)moved_expert);
+    CHECK(v[3] == marked(expert_bytes[3]));
+}
+
 /* Routing never blocks the compute stream: the histogram is copied back asynchronously and the
  * heat engine drains it on a later step (spec §5.5). */
 TEST(route_report_is_asynchronous_and_drains_oldest_first) {

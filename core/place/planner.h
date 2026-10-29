@@ -28,6 +28,7 @@
 #include "../rad_core.h"
 #include "rad_format.h"
 
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -104,6 +105,13 @@ struct MoveUnit {
      * the file tier can stage it with a read (and the relayout). A unit that is neither never
      * goes to the file tier. */
     bool    file_direct = true;
+
+    /* RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED (place/vram_packed.h): a static VRAM resident some of whose
+     * weights the card holds in the packed-scale form (Placement::vram_bytes). `vram_bytes` is the unit as
+     * the card holds it and `vram_offset[i]` where weights[i] sits in it, laid out as `offset` is, at
+     * each weight's alignment; the mover places and publishes these instead. 0 and empty otherwise. */
+    int64_t vram_bytes = 0;
+    std::vector<int64_t> vram_offset;
 };
 
 /* The strongest access class in a group, "read most surely", decides the group's: a group with
@@ -183,6 +191,10 @@ struct Placement {
     int32_t slab_slot = -1;
     int32_t unit = -1;
     int64_t bytes = 0;
+    /* RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED: a VRAM weight held in the packed-scale form, its bytes there
+     * (`bytes` is then the same) and the raw rounds the form has room for; 0 and -1 for the stored form. */
+    int64_t vram_bytes = 0;
+    int32_t vram_pk_cap = -1;
     /* Why this and not VRAM/device, as a fixed string for the report. */
     const char* reason = "";
 };
@@ -238,6 +250,20 @@ public:
     int64_t pinned_units = 0;
     int64_t profile_units = 0;
     float   pin_threshold = 0.0f;
+    /* RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED: the static residents held in the packed-scale form. `units`
+     * and `weights` (gate_up and down) packed, the bytes they take on the card against their stored
+     * form's, the eligible residents' weights left block_mxfp4 over their raw-round budget, the
+     * weights whose scales were read to decide it and the time that took, and the packed weights' raw
+     * rounds in all and at most. `loaded` counts the weights the load packed and checked. */
+    struct VramPacked {
+        int64_t units = 0, weights = 0, gate_up = 0, down = 0;
+        int64_t bytes = 0, block_bytes = 0;
+        int64_t over_budget = 0, scanned = 0, scan_failed = 0;
+        int64_t raw_rounds = 0, raw_max = 0;
+        double  scan_s = 0.0;
+        int64_t loaded = 0;
+    };
+    VramPacked vram_packed;
     /* --ngram-placement ram: RAM for the n-gram tables the load phase copies out of the mapping.
      * Every pool still sees them on the mapped tier. `ngram_copy_card` selects pinned memory a
      * device kernel reads over the link; otherwise locked memory the host gather reads. */
@@ -295,6 +321,14 @@ struct PlannerInput {
      * (weight_file_relaid), so such a unit may go there too, not only one stored as it is read.
      * The engine's mover does; a caller whose mover has no relayout leaves it false. */
     bool                  file_relayout = false;
+    /* RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED (place/vram_packed.h): the bytes weight `w` takes on the card
+     * in the packed-scale form, or 0 when it keeps its stored form there. With `scan` false, from the
+     * declaration alone (what an eligible weight would take); with it true, after reading its scales
+     * (0 too when they need more raw rounds than the form has room for, which `*raw` then reports, -1
+     * when they could not be read). `cap` gets the room. The expert fill asks once a weight, and only
+     * for the conditional units it considers for VRAM in a static plan; null leaves every weight in
+     * its stored form and the plan exactly as without it. */
+    std::function<int64_t(rad_weight w, bool scan, int32_t* cap, int32_t* raw)> vram_pack;
 };
 
 /* Whether a host-only unit stays in the container's mapping. On a card, always: a host kernel
@@ -315,6 +349,23 @@ public:
 
 private:
     const PlannerInput& in_;
+
+    /* RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED: on for a static plan with PlannerInput::vram_pack set. Per
+     * weight the scan's answer (-1 not asked yet) with its room and raw rounds; per unit the resident
+     * charge once its weights are known (-1 not yet). */
+    bool                 pk_on_ = false;
+    std::vector<int64_t> pk_bytes_;
+    std::vector<int32_t> pk_cap_, pk_raw_;
+    std::vector<int64_t> pk_charge_;
+    /* What a resident costs the weights pool: its slot, or as packed weights take it. The floor reads
+     * nothing (every eligible weight packed); the charge reads the unit's scales once. */
+    int64_t vram_floor(const MoveUnit& mu) const;
+    int64_t vram_charge(int32_t ui, const MoveUnit& mu, Plan* p);
+    /* The unit laid out with each weight at size(w) bytes, as build_units lays it out: its bytes, and
+     * each weight's offset in `off` when set. */
+    template <class F> int64_t unit_layout(const MoveUnit& mu, F size, std::vector<int64_t>* off) const;
+    /* After the fill: each static resident's packed layout, weights and counters. */
+    void finish_vram_packed(Plan* p);
 
     /* Per-weight facts derived from declare, indexed by rad_weight. */
     std::vector<uint8_t> host_ok_;     /* every op reading it resolved a RAD_DOMAIN_HOST kernel */

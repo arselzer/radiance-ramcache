@@ -454,8 +454,9 @@ set_tests_properties(isa_tools PROPERTIES TIMEOUT ${RAD_TEST_TIMEOUT})
 # deadlock). Checked against ports of libref's ref_attn_paged and ref_qsa_select, the host
 # arithmetic in ref_host.cpp, for the joins the unfused chain bit for bit, for the LoRA pair libref
 # itself when the test can load it, for KDA libref itself, and for the DSA split the unsplit
-# kernels. The M2XFP4 decode and tiled GEMMs are checked against an f64 decode of the weight, and
-# the bf16 skinny GEMM's bf16f8 twin (gemm_nt_bf16f8) against the bf16 kernel itself, byte for byte.
+# kernels. The M2XFP4 decode and tiled GEMMs are checked against an f64 decode of the weight, the
+# bf16 skinny GEMM's bf16f8 twin (gemm_nt_bf16f8) against the bf16 kernel itself, byte for byte, and
+# DeepSeek-V4.1's MXFP4 gemv_vp row over packed-scale experts against its plain gemv row, the same.
 #
 # Requires clang (ext_vector_type) and x86-64 (SysV fiber switch in inline assembly). With a clang
 # C++ compiler the .hip files build here as C++ (`-x c++`; the property is per directory, so
@@ -472,12 +473,18 @@ set(R4D_EMU_HIP ${R4D_DIR}/r4d_attn_paged_window.hip ${R4D_DIR}/r4d_pair_argmax_
                 ${R4D_DIR}/r4d_moe_mxfp4.hip ${R4D_DIR}/r4d_mla.hip ${R4D_DIR}/r4d_quant_act_fp8.hip
                 ${R4D_DIR}/r4d_kv_resolve.hip ${R4D_DIR}/r4d_dsa.hip
                 ${R4D_DIR}/r4d_gemm_m2xfp4a8_decode.hip ${R4D_DIR}/r4d_gemm_m2xfp4a8_tiled.hip
-                ${R4D_DIR}/r4d_gemm_bf16_nt_m64.hip ${R4D_DIR}/r4d_gemm_bf16f8_nt_m64.hip)
+                ${R4D_DIR}/r4d_gemm_bf16_nt_m64.hip ${R4D_DIR}/r4d_gemm_bf16f8_nt_m64.hip
+                ${R4D_DIR}/r4d_ds41_mxfp4.hip)
 # The M2XFP4 units' plugin entries call two cfg readers that r4d_rows.cpp defines, which is not in
 # this build: cfg_stub.cpp defines them at their axis defaults, in both arms below, and the bf16
 # skinny GEMM's (r4d_cfg_gemm) for it and its bf16f8 twin, whose outputs test_bf16f8 compares.
 set(R4D_EMU_TESTS attn pick norm escale qsa lora f32 mhc fp8f32 kda moemx mla moefuse kvres
-                  dsa m2xfp4 bf16f8)
+                  dsa m2xfp4 bf16f8 ds41vp)
+# ds41vp holds DeepSeek-V4.1's gemv_vp row (RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED) to the plain MXFP4 gemv
+# row over experts packed by tools/ds41-host-experts' own packer, the one the engine loads them with. That
+# file builds as rad_core builds it: AVX2 without FMA contraction.
+set(R4D_EMU_HX_DIR ${CMAKE_SOURCE_DIR}/tools/ds41-host-experts)
+set(R4D_EMU_HX_SRC ${R4D_EMU_HX_DIR}/ds41_host_experts.cpp)
 set(R4D_EMU_BUILT OFF)
 if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
   # No fiber switch for this ISA.
@@ -495,6 +502,10 @@ elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND NOT RAD_ASAN AND NOT RAD_TSAN)
     target_compile_options(r4d_emu_${t} PRIVATE -ffp-contract=off -Wno-psabi)
     set_target_properties(r4d_emu_${t} PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
   endforeach()
+  target_sources(r4d_emu_ds41vp PRIVATE ${R4D_EMU_HX_SRC})
+  target_include_directories(r4d_emu_ds41vp PRIVATE ${R4D_EMU_HX_DIR})
+  set_source_files_properties(${R4D_EMU_HX_SRC} PROPERTIES
+                              COMPILE_OPTIONS "-mavx2;-ffp-contract=off;-fno-fast-math")
   set(R4D_EMU_BUILT ON)
 else()
   if(RAD_HIP_FOUND AND CMAKE_HIP_COMPILER_ID MATCHES "Clang")
@@ -510,7 +521,7 @@ else()
     set(dir ${CMAKE_CURRENT_BINARY_DIR}/r4d_emu)
     file(MAKE_DIRECTORY ${dir})
     set(flags -std=c++20 -O2 -ffp-contract=off -Wno-psabi -I${R4D_EMU}/emu -I${R4D_EMU}
-              -I${CMAKE_SOURCE_DIR}/abi -I${R4D_DIR})
+              -I${CMAKE_SOURCE_DIR}/abi -I${R4D_DIR} -I${R4D_EMU_HX_DIR})
     set(objs "")
     foreach(src ${R4D_EMU_HIP} ${R4D_EMU}/ref_host.cpp ${R4D_EMU}/emu/emu.cpp
                 ${R4D_EMU}/test_attn.cpp ${R4D_EMU}/test_pick.cpp ${R4D_EMU}/test_norm.cpp
@@ -519,6 +530,7 @@ else()
                 ${R4D_EMU}/test_kda.cpp ${R4D_EMU}/test_moemx.cpp ${R4D_EMU}/test_mla.cpp
                 ${R4D_EMU}/test_moefuse.cpp ${R4D_EMU}/test_kvres.cpp
                 ${R4D_EMU}/test_dsa.cpp ${R4D_EMU}/test_m2xfp4.cpp ${R4D_EMU}/test_bf16f8.cpp
+                ${R4D_EMU}/test_ds41vp.cpp
                 ${R4D_EMU}/cfg_stub.cpp)
       get_filename_component(stem ${src} NAME_WE)
       set(lang "")
@@ -536,6 +548,14 @@ else()
         list(APPEND objs ${dir}/${stem}.o)
       endif()
     endforeach()
+    # ds41vp's packer, built as rad_core builds it (AVX2, no FMA contraction), linked into ds41vp alone.
+    add_custom_command(OUTPUT ${dir}/ds41_host_experts.o
+      COMMAND ${R4D_EMU_CXX} ${flags} -mavx2 -fno-fast-math -MD -MF ${dir}/ds41_host_experts.o.d -c
+              ${R4D_EMU_HX_SRC} -o ${dir}/ds41_host_experts.o
+      DEPENDS ${R4D_EMU_HX_SRC}
+      DEPFILE ${dir}/ds41_host_experts.o.d
+      COMMENT "Building r4d_emu ds41_host_experts.o with ${R4D_EMU_CXX}"
+      VERBATIM)
     # test_lora and test_kda open libref with dlopen to hold the emulated kernels to it.
     set(dl "")
     foreach(l ${CMAKE_DL_LIBS})
@@ -544,19 +564,26 @@ else()
     set(exes "")
     foreach(t ${R4D_EMU_TESTS})
       set(exe ${CMAKE_BINARY_DIR}/tests/r4d_emu_${t})
+      set(extra "")
+      if(t STREQUAL "ds41vp")
+        set(extra ${dir}/ds41_host_experts.o)
+      endif()
       add_custom_command(OUTPUT ${exe}
-        COMMAND ${R4D_EMU_CXX} ${dir}/test_${t}.o ${objs} ${dl} -o ${exe}
-        DEPENDS ${dir}/test_${t}.o ${objs}
+        COMMAND ${R4D_EMU_CXX} ${dir}/test_${t}.o ${objs} ${extra} ${dl} -o ${exe}
+        DEPENDS ${dir}/test_${t}.o ${objs} ${extra}
         COMMENT "Linking r4d_emu_${t}"
         VERBATIM)
       list(APPEND exes ${exe})
+      # One test's binary alone (`r4d_emu_<t>`), without the others' links.
+      add_custom_target(r4d_emu_${t}_bin DEPENDS ${exe})
     endforeach()
     add_custom_target(r4d_emu ALL DEPENDS ${exes})
     set(R4D_EMU_BUILT ON)
   endif()
 endif()
 if(R4D_EMU_BUILT)
-  foreach(t pick norm escale qsa lora f32 mhc fp8f32 kda moemx mla moefuse kvres dsa m2xfp4 bf16f8)
+  foreach(t pick norm escale qsa lora f32 mhc fp8f32 kda moemx mla moefuse kvres dsa m2xfp4 bf16f8
+            ds41vp)
     add_test(NAME r4d_emu_${t} COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_${t})
   endforeach()
   # The attention cases take about 11 s, 7 of them in the two long prefills on the WMMA kernel,
@@ -565,9 +592,12 @@ if(R4D_EMU_BUILT)
     add_test(NAME r4d_emu_attn_shard${k}
              COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_attn --shard ${k}/3)
   endforeach()
+  # ds41vp again with the live-tail ranges on (RADIANCE_EXPERIMENTAL_DS41_LIVE_TAIL=1, read once a process):
+  # its cases at the tail's geometry take mx_moe's tail branch, gemv_vp's kernel and then the zeroed tail.
+  add_test(NAME r4d_emu_ds41vp_tail COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_ds41vp tail)
   set_tests_properties(r4d_emu_attn_shard0 r4d_emu_attn_shard1 r4d_emu_attn_shard2 r4d_emu_pick
                        r4d_emu_norm r4d_emu_escale r4d_emu_qsa r4d_emu_lora r4d_emu_mla r4d_emu_moefuse
-                       r4d_emu_dsa r4d_emu_m2xfp4 r4d_emu_bf16f8
+                       r4d_emu_dsa r4d_emu_m2xfp4 r4d_emu_bf16f8 r4d_emu_ds41vp r4d_emu_ds41vp_tail
                        PROPERTIES LABELS "r4d_emu" TIMEOUT ${RAD_TEST_TIMEOUT})
   # The LoRA pair has a libref oracle, and the test holds the emulated kernels to it when it can
   # load one -- expand bit for bit, shrink to its bound. kda_update is held to libref's within

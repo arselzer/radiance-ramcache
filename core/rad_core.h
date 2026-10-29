@@ -212,6 +212,12 @@ struct WeightInfo {
     Tier           tier = Tier::VRAM;
     Site           site = Site::Device;
     int32_t        slab_slot = -1;      /* -1 = not slab-resident */
+    /* RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED (place/vram_packed.h): a VRAM weight the card holds in the
+     * packed-scale form instead of its stored form, `vram_bytes` long with room for `vram_pk_cap` raw
+     * rounds. The load packs it there, and its weight-table entries carry bit 0 (Ctx::table_refresh),
+     * which only libr4d's moe_gemm_ggml_mxfp4_gemv_vp reads. 0 / -1: the stored form, as everywhere else. */
+    int64_t        vram_bytes = 0;
+    int32_t        vram_pk_cap = -1;
 
     /* Filled at load. Under TP this is this rank's shard, not the whole weight. */
     void*          ptr = nullptr;

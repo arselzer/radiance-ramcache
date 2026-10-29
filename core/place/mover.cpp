@@ -1077,6 +1077,17 @@ int Mover::retire_file_window(int window) {
     return RAD_OK;
 }
 
+int Mover::retire_file_windows() {
+    if (!mapped_file_cache_on_) return RAD_OK;
+    for (int w = 0; w < n_windows_; ++w) {
+        const MappedWindow& batch = mapped_windows_[(size_t)w];
+        bool held = win_rec_[(size_t)w] || batch.copy_may_be_queued;
+        for (const auto& l : batch.leases) held = held || l.active();
+        if (held) RAD_TRY(retire_file_window(w));
+    }
+    return RAD_OK;
+}
+
 int Mover::mapped_file_drain() {
     bool pending = false;
     for (const auto& batch : mapped_windows_) pending = pending || batch.copy_may_be_queued;

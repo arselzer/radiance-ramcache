@@ -491,13 +491,14 @@ FileStager::~FileStager() {
         hx_pf_entries_.clear();
     }
     hx_drain();
-    if (hx_bg_.joinable()) {
+    if (!hx_bg_.empty()) {
         {
             std::lock_guard<std::mutex> lk(hx_bg_mu_);
             hx_bg_stop_ = true;
         }
         hx_bg_cv_.notify_all();
-        hx_bg_.join();
+        for (std::thread& t : hx_bg_) t.join();
+        hx_bg_.clear();
     }
     if (trace_fp_) std::fclose(trace_fp_);
     if (hx_out_rec_ && hx_out_ev_) (void)rad_event_sync(hx_out_ev_);
@@ -703,6 +704,9 @@ int FileStager::start_ep_routed(int32_t li, RadStream s, bool* read) {
     const uint64_t sync_ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(t_counts - t_sync).count();
     ep_stats_.sync_ns += sync_ns;
     if (pass_tok_ == 1) { ++ep_stats_.d_reads; ep_stats_.d_sync_ns += sync_ns; }
+    /* Every earlier layer's window copies fed a gather this sync followed on the card: their
+     * cache leases go back now, not when a window next comes round (Mover::retire_file_windows). */
+    if (hx) RAD_TRY(mover_->retire_file_windows());
     if (hx && hx_pred_ && pass_tok_ == 1 && plan_->rank == 0)
         hx_pred_->post(trace_pass_, L.layer, hx_x_);
     int64_t total = 0;
@@ -967,12 +971,15 @@ int FileStager::hx_init(const Program& prog) {
         hx_pf_stop_ = false;
         hx_pf_ = std::thread(&FileStager::hx_pf_loop, this);
     }
-    if (hx_miss_rows_ > 0 && !hx_bg_.joinable()) {
+    if (hx_miss_rows_ > 0 && hx_bg_.empty()) {
         hx_bg_stop_ = false;
-        hx_bg_ = std::thread(&FileStager::hx_bg_loop, this);
+        int n = 4;
+        if (const char* t = std::getenv("RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_INSERT_THREADS"); t && *t)
+            n = std::clamp(std::atoi(t), 1, 16);
+        for (int i = 0; i < n; ++i) hx_bg_.emplace_back(&FileStager::hx_bg_loop, this);
         if (plan_->rank == 0)
             RAD_INFO("host experts: passes of at most %d token(s) compute missed experts on the CPU "
-                     "from the container's planes; a background thread relays them into the RAM cache",
+                     "from the container's planes; background threads relay them into the RAM cache",
                      hx_miss_rows_);
     }
     if (plan_->rank == 0)
@@ -1361,7 +1368,7 @@ void FileStager::hx_bg_loop() {
         if (hx_bg_q_.empty()) return;   /* stopping, nothing left */
         std::shared_ptr<Mover::HostPlanes> p = std::move(hx_bg_q_.front());
         hx_bg_q_.pop_front();
-        hx_bg_busy_ = true;
+        ++hx_bg_busy_;
         lk.unlock();
         const int rc = mover_->insert_unit_planes(*p, &scratch);
         if (rc < 0 && !told) {
@@ -1371,14 +1378,14 @@ void FileStager::hx_bg_loop() {
         }
         p.reset();
         lk.lock();
-        hx_bg_busy_ = false;
+        --hx_bg_busy_;
         hx_bg_cv_.notify_all();
     }
 }
 
 void FileStager::drain_host_inserts() {
     std::unique_lock<std::mutex> lk(hx_bg_mu_);
-    hx_bg_cv_.wait(lk, [&] { return hx_bg_q_.empty() && !hx_bg_busy_; });
+    hx_bg_cv_.wait(lk, [&] { return hx_bg_q_.empty() && hx_bg_busy_ == 0; });
 }
 
 /* A layer's gate_up op, before its launch, on every pass: the addresses of its token rows,

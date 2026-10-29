@@ -463,11 +463,12 @@ private:
     std::mutex hx_planes_mu_;
     std::shared_ptr<Mover::HostPlanes> hx_planes_get(int32_t unit);
     int  hx_submit_misses();
-    std::thread hx_bg_;
+    std::vector<std::thread> hx_bg_;   /* ..._INSERT_THREADS of them (4) */
     std::mutex hx_bg_mu_;
     std::condition_variable hx_bg_cv_;
     std::deque<std::shared_ptr<Mover::HostPlanes>> hx_bg_q_;
-    bool hx_bg_stop_ = false, hx_bg_busy_ = false;
+    bool hx_bg_stop_ = false;
+    int  hx_bg_busy_ = 0;
     void hx_bg_loop();
 public:
     /* Waits for the background relayouts of missed units; before the mover drains its cache. */

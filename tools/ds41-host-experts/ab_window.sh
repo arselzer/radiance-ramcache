@@ -94,7 +94,7 @@ arm() {   # name, then env assignments for the server; CACHE_MIB the RAM cache (
       RADIANCE_EXPERIMENTAL_DS41_MXFP4_PACK_SSE2=1 \
     "$BIN" --radiance-home "${ARM_HOME:-$RHOME}" --kernels libr4d,libref --model "$MODEL" \
       --served-model-name ds41-native-smoke --tp 4 --tp-wire exact --placement expert_tiered \
-      --weights-disk-tier --expert-ram-cache-total-mib ${CACHE_MIB:-81920} --host-pool-mib 4096 \
+      --weights-disk-tier --expert-ram-cache-total-mib ${CACHE_MIB:-81920} --host-pool-mib ${HOST_POOL_MIB:-4096} \
       --host-headroom-mib 8192 --gpu-headroom-mib 256 --embedding-placement vram \
       --vision-tower-placement vram --ngram-placement disk --max-model-len 512 \
       --max-num-batched-tokens 16 --max-num-seqs 1 --kv-cache-dtype bf16 \
@@ -167,9 +167,10 @@ for a in $ARMS; do
   # value; M MiB of RAM cache (81920); R: passes of at most R tokens compute their missed experts on
   # the CPU from the container's planes; f the mover's direct cache fill; x an access trace;
   # PsK / PoK the next-layer predictor in shadow / on mode keeping K experts; o --profile-ops;
-  # H the second run home (RADIANCE_HOME_DIR2).
+  # H the second run home (RADIANCE_HOME_DIR2); iN background insert threads for missed units;
+# pN --host-pool-mib (4096: a rank's pinned expert slots and the file tier's staging).
   IFS=- read -r -a parts <<< "$a"
-  pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 EXTRA_ARGS="" ARM_HOME="$RHOME"
+  pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 HOST_POOL_MIB=4096 EXTRA_ARGS="" ARM_HOME="$RHOME"
   for p in "${parts[@]:1}"; do
     case $p in
       t[0-9]*) threads=${p#t} ;;
@@ -182,6 +183,8 @@ for a in $ARMS; do
       M[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MISSES=${p#M}) ;;
       o)       EXTRA_ARGS="--profile-ops" ;;
       H)       ARM_HOME=${RADIANCE_HOME_DIR2:?H needs RADIANCE_HOME_DIR2} ;;
+      i[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_INSERT_THREADS=${p#i}) ;;
+      p[0-9]*) HOST_POOL_MIB=${p#p} ;;
       Ps[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_PREFETCH=shadow RADIANCE_EXPERIMENTAL_DS41_PREFETCH_K=${p#Ps}) ;;
       Po[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_PREFETCH=on RADIANCE_EXPERIMENTAL_DS41_PREFETCH_K=${p#Po}) ;;
       *)       log "arm $a: unknown part $p" ;;

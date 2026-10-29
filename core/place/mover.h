@@ -631,6 +631,13 @@ public:
     /* Whether the mapped RAM cache holds every weight of unit u, without touching it. */
     bool  unit_cached(int32_t u);
     int   insert_unit_planes(const HostPlanes& p, std::vector<uint8_t>* scratch);
+    /* retire_file_windows  gives back the RAM-cache leases the read windows keep for their last
+     *                      copies, for a caller that knows those copies are done (the file
+     *                      stager, past a routing sync the card reached after them). A window
+     *                      otherwise keeps them until it comes round again; when the windows sit
+     *                      idle -- the CPU takes the misses -- the held entries drift to their
+     *                      class's LRU tail, where each one turns every admission away. */
+    int   retire_file_windows();
     /* set_file_relayout  the function that makes a file-tier weight's stored form from its
      *                    container planes when the two differ (weight_file_relaid): the kernel's
      *                    relayout, as the loader's relayout pool calls it once for a resident

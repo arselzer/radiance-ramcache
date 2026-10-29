@@ -98,7 +98,7 @@ arm() {   # name, then env assignments for the server; CACHE_MIB the RAM cache (
       --weights-disk-tier --expert-ram-cache-total-mib ${CACHE_MIB:-81920} --host-pool-mib ${HOST_POOL_MIB:-4096} \
       --host-headroom-mib 8192 --gpu-headroom-mib 256 --embedding-placement vram \
       --vision-tower-placement vram --ngram-placement disk --max-model-len 512 \
-      --max-num-batched-tokens 16 --max-num-seqs 1 --kv-cache-dtype bf16 \
+      --max-num-batched-tokens 16 --max-num-seqs ${MAX_SEQS:-1} --kv-cache-dtype bf16 \
       --num-speculative-tokens 0 --spec-ngram 0 --no-prefix-cache --deterministic \
       --host 127.0.0.1 --port $PORT --expert-profile "$PROFILE" ${EXTRA_ARGS:-} >"$OUT/$name.server.log" 2>&1 &
   SERVER_PID=$!

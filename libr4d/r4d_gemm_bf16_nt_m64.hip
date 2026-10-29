@@ -28,23 +28,8 @@
 #define R4D_GEMM64_MAX_M 65536
 #define WAVE32 32
 
-// A fragment from a base pointer plus a compile-time k step. With fragGo's 32-bit element offset,
-// LLVM re-derives a 64-bit address per fragment per step (a b64 shift and a carry-in add pair); a
-// constant step instead folds into the 13-bit immediate of global_load_b64 (32 bytes per k step,
-// so eight fit).
-//
-// The pointer is explicitly global: a plain pointer held in an array across iterations becomes
-// generic, so loads become flat_load_b64, which on gfx12 also increments dscnt and makes later LDS
-// waits wait on HBM. The element is a scalar because HIP's vector structs cannot be assigned from
-// an address-space-qualified source.
-typedef __attribute__((address_space(1))) const unsigned long long* r4d_gu2;
-
-__device__ __forceinline__ v8bf fragU(r4d_gu2 p, int u) {
-  union { unsigned long long w[2]; v8bf f; } x;
-  x.w[0] = p[4 * u];
-  x.w[1] = p[4 * u + 2];
-  return x.f;
-}
+// fragU, the fragment from a base pointer plus a compile-time k step, is in
+// r4d_gemm_m64_shared.h.
 
 // MT = row tiles per block, held as MT v8f accumulators (8 VGPRs each); grid.y covers the rest.
 // More amortises each weight fragment, fewer puts more blocks on the machine, so MT is tunable.

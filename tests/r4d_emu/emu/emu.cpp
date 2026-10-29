@@ -150,6 +150,13 @@ int emu_cvt_pk_fp8(float a, float b, int old, bool hi) {
     const unsigned o = (unsigned)old;
     return (int)(hi ? ((o & 0xffffu) | (pk << 16)) : ((o & 0xffff0000u) | pk));
 }
+emu_v2f emu_cvt_pk_f32_fp8(int src, bool hi) {
+    const unsigned u = (unsigned)src >> (hi ? 16 : 0);
+    emu_v2f r;
+    r.x = rad_fp8e4m3_to_f32((uint8_t)(u & 0xffu));
+    r.y = rad_fp8e4m3_to_f32((uint8_t)((u >> 8) & 0xffu));
+    return r;
+}
 /* One 16x16x16 WMMA: each lane posts its A and B elements, then reads the whole tile back. `ga`
  * and `gb` are the exchange slots of one element type, [wave][parity][lane][element]. */
 template <class T, class V, class Cvt>
@@ -171,7 +178,18 @@ static emu_v8f emu_wmma(T (&ga)[64][2][32][8], T (&gb)[64][2][32][8], V a, V b, 
     return d;
 }
 static short g_wa[64][2][32][8], g_wb[64][2][32][8];
+EmuWmmaTap emu_wmma_bf16_tap = nullptr;
 emu_v8f emu_wmma_bf16(emu_v8s a, emu_v8s b, emu_v8f c) {
+    if (emu_wmma_bf16_tap) {
+        unsigned short av[8], bv[8];
+        float cv[8];
+        for (int e = 0; e < 8; ++e) {
+            av[e] = (unsigned short)a[e];
+            bv[e] = (unsigned short)b[e];
+            cv[e] = c[e];
+        }
+        emu_wmma_bf16_tap(S.bid, S.f[S.cur].tid.x, av, bv, cv);
+    }
     return emu_wmma(g_wa, g_wb, a, b, c, [](short v) { return rad_bf16_to_f32((uint16_t)v); });
 }
 static _Float16 g_ha[64][2][32][8], g_hb[64][2][32][8];

@@ -460,6 +460,8 @@ int  r4d_rad_ar_gather_hc_write_4rank(const RadArgs*, RadStream);
 int r4d_rad_gemm_bf16_m16   (const RadArgs*, RadStream);
 int r4d_rad_gemm_bf16_m64   (const RadArgs*, RadStream);
 int r4d_rad_gemm_bf16_tiled (const RadArgs*, RadStream);
+/* gemm_nt_bf16f8 (r4d_gemm_bf16f8_nt_m64.hip): gemm_bf16_nt_m64's bytes from the bf16f8 store. */
+int r4d_rad_gemm_bf16f8_m64 (const RadArgs*, RadStream);
 int r4d_rad_gemm_w4a16_m64  (const RadArgs*, RadStream);
 int r4d_rad_gemm_w5a16_m64  (const RadArgs*, RadStream);
 int r4d_rad_gemm_w4a16asym_m64(const RadArgs*, RadStream);

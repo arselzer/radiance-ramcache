@@ -137,6 +137,13 @@ inline emu_v8f emu_wmma_bf16(emu_v8bf a, emu_v8bf b, emu_v8f c) {
     return emu_wmma_bf16(__builtin_bit_cast(emu_v8s, a), __builtin_bit_cast(emu_v8s, b), c);
 }
 #define __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a, b, c) emu_wmma_bf16((a), (b), (c))
+/* A test's view of the operands of every bf16 WMMA a kernel issues: while set, each lane's call
+ * hands it the block, the thread and the lane's eight A and B elements' bits and its C, in that
+ * thread's program order (tests/r4d_emu/test_bf16f8.cpp holds two kernels' operand streams equal
+ * this way, which an output comparison cannot: a -0 in B vanishes into the sum). */
+typedef void (*EmuWmmaTap)(const EmuIdx& block, unsigned thread, const unsigned short* a,
+                           const unsigned short* b, const float* c);
+extern EmuWmmaTap emu_wmma_bf16_tap;
 typedef _Float16 emu_v8h __attribute__((ext_vector_type(8)));
 emu_v8f emu_wmma_f16(emu_v8h a, emu_v8h b, emu_v8f c);
 #define __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, c) emu_wmma_f16((a), (b), (c))
@@ -160,6 +167,11 @@ emu_v8s emu_load_tr_b128(const void* p);
  * rad_f32_to_fp8e4m3 on inputs a kernel has already clamped to +-448. */
 int emu_cvt_pk_fp8(float a, float b, int old, bool hi);
 #define __builtin_amdgcn_cvt_pk_fp8_f32(a, b, old, hi) emu_cvt_pk_fp8((a), (b), (old), (hi))
+/* v_cvt_pk_f32_fp8 (gfx12, OCP E4M3): bytes 0 and 1 of src (hi false) or 2 and 3 (hi true) as two
+ * f32, lower byte in .x; exact for every non-NaN code, subnormals and signed zeros included. */
+typedef float emu_v2f __attribute__((ext_vector_type(2)));
+emu_v2f emu_cvt_pk_f32_fp8(int src, bool hi);
+#define __builtin_amdgcn_cvt_pk_f32_fp8(s, hi) emu_cvt_pk_f32_fp8((s), (hi))
 extern int emu_last_block;     /* threads a block of the last grid had: which kernel ran */
 
 /* Blocks run one after another on one OS thread, so a fence orders nothing that is not already in

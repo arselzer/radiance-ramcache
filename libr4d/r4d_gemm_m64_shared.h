@@ -8,9 +8,29 @@
 // is unchanged instruction for instruction.
 //
 // They read the kernel's own names: the template parameter MT, the arguments A, C, M, K, N, WV, SK,
-// LDA and LDC, WAVE32, and between them the accumulators `acc` and the A offsets `aoff`.
+// LDA and LDC, WAVE32, and between them the accumulators `acc` and the A offsets `aoff`. The
+// kernels' A fragment, fragU, is here too, so both read the activation with the same loads.
+// Include it after r4d_gdn_wmma.h (v8bf, rowGo).
 #pragma once
 #include "r4d_launch.h"
+
+// A fragment from a base pointer plus a compile-time k step. With fragGo's 32-bit element offset,
+// LLVM re-derives a 64-bit address per fragment per step (a b64 shift and a carry-in add pair); a
+// constant step instead folds into the 13-bit immediate of global_load_b64 (32 bytes per k step,
+// so eight fit).
+//
+// The pointer is explicitly global: a plain pointer held in an array across iterations becomes
+// generic, so loads become flat_load_b64, which on gfx12 also increments dscnt and makes later LDS
+// waits wait on HBM. The element is a scalar because HIP's vector structs cannot be assigned from
+// an address-space-qualified source.
+typedef __attribute__((address_space(1))) const unsigned long long* r4d_gu2;
+
+__device__ __forceinline__ v8bf fragU(r4d_gu2 p, int u) {
+  union { unsigned long long w[2]; v8bf f; } x;
+  x.w[0] = p[4 * u];
+  x.w[1] = p[4 * u + 2];
+  return x.f;
+}
 
 // The block's waves: WV column tiles x SK k-splits, each wave one 16-wide N tile over one
 // contiguous K slice of Ks = K / SK; MT row tiles of accumulators from zero. `red` is the dynamic

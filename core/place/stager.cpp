@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstring>
 #include <cstdlib>
+#include <limits>
 #include <string>
 
 namespace rad {
@@ -532,6 +533,11 @@ FileStager::~FileStager() {
         hx_bg_.clear();
     }
     if (trace_fp_) std::fclose(trace_fp_);
+    /* The route trace's pinned staging, once its last copies have landed. */
+    if (rt_ev_rec_ && rt_ev_) (void)rad_event_sync(rt_ev_);
+    if (rt_ev_) rad_event_destroy(rt_ev_);
+    for (void* p : { (void*)rt_ids_, (void*)rt_w_, (void*)rt_logits_, (void*)rt_bias_ })
+        if (p) rad_dev_free(p, RAD_MEM_HOST_PINNED);
     if (hx_out_rec_ && hx_out_ev_) (void)rad_event_sync(hx_out_ev_);
     if (hx_in_ev_) rad_event_destroy(hx_in_ev_);
     if (hx_out_ev_) rad_event_destroy(hx_out_ev_);
@@ -643,7 +649,8 @@ int FileStager::init(const Program& prog, const Plan& plan, Mover* mover, Counts
         else if (plan.rank == 0) RAD_INFO("access trace: each routed layer's selected units to %s/rank<r>.bin", td);
     }
     RAD_TRY(init_head_cache(prog, plan));
-    return hx_init(prog);
+    RAD_TRY(hx_init(prog));
+    return rt_init(prog);
 }
 
 /* Arms for every pass: a file-tier unit has no other address, so an unarmed pass would reach its
@@ -670,6 +677,7 @@ bool FileStager::begin_pass(const RadBatch* b) {
     pass_tok_ = b->n_tok;
     hx_defer_li_ = -1;
     ++trace_pass_;
+    if (rt_) rt_pass(b);
     routed_ = counts_host_ && b->n_tok > 0 && b->n_tok <= kRoutedRows;
     if (hx_ra_) {   /* predictions for this pass may come; units of earlier ones are stale */
         hx_ra_at_.store((uint64_t)trace_pass_ << 32, std::memory_order_release);
@@ -764,6 +772,9 @@ int FileStager::start_ep_routed(int32_t li, RadStream s, bool* read) {
         if (hx) RAD_TRY(hx_fetch(li, s));
     }
     RAD_TRY(rad_event_record(counts_ev_, s));
+    /* ..._ROUTE_TRACE: rank 0's copies of the router's outputs, behind the counts' event (the
+     * choice does not wait for them) and under their own, which rt_layer waits for. */
+    if (rt_) RAD_TRY(rt_queue(li, s));
     /* ..._EARLY_ISSUE (stager.h): capped, every file-tier unit is the CPU's, so the card's aliases
      * are the same whichever units the router picked. Publish them for the whole layer and return
      * without waiting: the card runs the layer's resident experts, the shared expert and the ffn
@@ -820,6 +831,11 @@ int FileStager::start_ep_routed(int32_t li, RadStream s, bool* read) {
         if (!staged_[b].empty()) holds_[b] = li;
         hx_defer_li_ = want_.empty() ? -1 : li;
         if (trace_fp_ && want_.empty()) trace_layer(L.layer, 0);   /* else hx_deferred writes it */
+        if (rt_ && want_.empty()) {   /* the route trace's too: no file-tier pick to choose for */
+            rt_units_.clear();
+            rt_choice(li, true);
+            rt_layer(li);
+        }
         ++ep_stats_.reads;
         if (!total) ++ep_stats_.zero_local;
         *read = true;
@@ -832,8 +848,10 @@ int FileStager::start_ep_routed(int32_t li, RadStream s, bool* read) {
     /* ..._MISS_POST: misses posted to the readers below are joined on every way out of here;
      * hx_submit_misses_now joins them first on the way that computes them. */
     const HxMissPostJoin miss_post_join{ this };
+    if (rt_) rt_units_ = want_;   /* hx_choose takes the CPU's units out of want_ */
     if (hx) {
         hx_choose(li);
+        if (rt_) rt_choice(li, true);
         t_chosen = std::chrono::steady_clock::now();
         t_miss_posted = t_chosen;
         /* ..._MISS_POST: the misses' reads start now, ahead of the pool's wake in hx_submit and
@@ -851,6 +869,8 @@ int FileStager::start_ep_routed(int32_t li, RadStream s, bool* read) {
             hx_pred_->post(trace_pass_, L.layer, hx_x_);
             t_posted = std::chrono::steady_clock::now();
         }
+    } else if (rt_) {
+        rt_choice(li, false);   /* the card's copy path takes every selected file-tier unit */
     }
     /* This layer took its read-ahead entries: now the next layer's (predicted from this one). */
     if (hx && hx_pf_.joinable() && pass_tok_ == 1) hx_pf_target(li + hx_pf_ahead_);
@@ -904,6 +924,9 @@ int FileStager::start_ep_routed(int32_t li, RadStream s, bool* read) {
     }
     partial_[b] = !skip_.empty() || cpu_aliased;
     if (hx_li_ == li) RAD_TRY(hx_submit_misses());
+    /* The route trace's record, once the misses are in (or on hx_mw_): the pool has the layer's
+     * work, and the next thing this thread does for it is wait at the gather. */
+    if (rt_) rt_layer(li);
     if (!staged_[b].empty()) holds_[b] = li;
     ++ep_stats_.reads;
     ep_stats_.units += want_.size();
@@ -989,7 +1012,305 @@ int64_t hx_numel(const RadTensor& t) {
     for (int i = 0; i < t.rank; ++i) n *= t.shape[i];
     return t.rank > 0 ? n : 0;
 }
+
+uint64_t rt_now_ns() {
+    return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 }  /* namespace */
+
+/* ---- RADIANCE_EXPERIMENTAL_DS41_ROUTE_TRACE (route_trace.h; stager.h's rt_ members) ----------- */
+
+/* The router select op of each routed layer, every layer's local tiers, the file-tier units and
+ * rank 0's pinned staging; then the tiers record. Only for what the trace describes: DeepSeek-V4.1
+ * EP4 layers with the counts witness (start_ep_routed); anything else writes no layer. */
+int FileStager::rt_init(const Program& prog) {
+    rt_ = nullptr;
+    RouteTrace* rt = RouteTrace::get();
+    if (!rt || !plan_ || layers_.empty()) return RAD_OK;
+    const int rank = plan_->rank;
+    bool eligible = false;
+    for (uint8_t e : ep_layer_eligible_) eligible = eligible || e != 0;
+    if (plan_->world_size != rtrace::kWorld || rank < 0 || rank >= rtrace::kWorld || !ep_counts_ ||
+        !counts_host_ || counts_cap_ < rtrace::kLocal || !eligible) {
+        if (rank == 0)
+            RAD_WARN("route trace: it reads DeepSeek-V4.1's EP4 routed layers, and this plan has none "
+                     "the file stager routes; no layer is traced");
+        return RAD_OK;
+    }
+    /* A layer's select op: the router_scored_topk (router_sigmoid_topk has the same operands)
+     * nearest before its first expert op, after the routed layer before it. */
+    rt_li_of_op_.assign(prog.ops.size(), -1);
+    rt_cap_.assign(layers_.size(), RtCap{});
+    size_t found = 0;
+    for (size_t li = 0; li < layers_.size(); ++li) {
+        const int32_t lo = li ? layers_[li - 1].last_op + 1 : 0;
+        for (int32_t h = layers_[li].first_op - 1; h >= lo && h >= 0; --h) {
+            const std::string& n = prog.ops[(size_t)h].op;
+            if (n == "router_scored_topk" || n == "router_sigmoid_topk") {
+                rt_li_of_op_[(size_t)h] = (int32_t)li;
+                ++found;
+                break;
+            }
+        }
+    }
+    rt_tier_.assign((size_t)rtrace::kLayers, {});
+    for (auto& t : rt_tier_) t.fill(255);
+    for (const MoveUnit& mu : plan_->units)
+        if (mu.access == RAD_ACCESS_CONDITIONAL && mu.layer >= 0 && mu.layer < rtrace::kLayers &&
+            mu.expert >= 0 && mu.expert < rtrace::kLocal)
+            rt_tier_[(size_t)mu.layer][(size_t)mu.expert] = (uint8_t)mu.tier;
+    rt_unit_.assign(layers_.size(), {});
+    rt_file_units_.assign(layers_.size(), {});
+    for (size_t li = 0; li < layers_.size(); ++li) {
+        rt_unit_[li].fill(-1);
+        for (int32_t u : layers_[li].units) {
+            const int32_t e = plan_->units[(size_t)u].expert;
+            if (e < 0 || e >= rtrace::kLocal) continue;
+            rt_unit_[li][(size_t)e] = u;
+            rt_file_units_[li].push_back(u);
+        }
+    }
+    if (rank == 0 && !rt_ids_) {
+        const int64_t pick = kEpRouteMaxRows * rtrace::kTopK * 4;
+        rt_ids_ = (int32_t*)rad_dev_alloc(pick, RAD_MEM_HOST_PINNED);
+        rt_w_ = (float*)rad_dev_alloc(pick, RAD_MEM_HOST_PINNED);
+        rt_logits_ = (float*)rad_dev_alloc(rtrace::kExperts * 4, RAD_MEM_HOST_PINNED);
+        rt_bias_ = (float*)rad_dev_alloc((int64_t)layers_.size() * rtrace::kExperts * 4,
+                                         RAD_MEM_HOST_PINNED);
+        if (rad_event_create(&rt_ev_) < 0) rt_ev_ = nullptr;   /* host-waited: not a local event */
+        if (!rt_ids_ || !rt_w_ || !rt_logits_ || !rt_bias_ || !rt_ev_) {
+            RAD_WARN("route trace: pinned staging for the router's outputs failed; rank 0 writes "
+                     "its residency only");
+            for (void* p : { (void*)rt_ids_, (void*)rt_w_, (void*)rt_logits_, (void*)rt_bias_ })
+                if (p) rad_dev_free(p, RAD_MEM_HOST_PINNED);
+            if (rt_ev_) rad_event_destroy(rt_ev_);
+            rt_ids_ = nullptr;
+            rt_w_ = rt_logits_ = rt_bias_ = nullptr;
+            rt_ev_ = nullptr;
+        }
+    }
+    rt_bias_state_.assign(layers_.size(), 0);
+    rt_rec_.reserve(16 << 10);
+    rt_ = rt;
+    rt_rank_ = rank;
+    rt_rec_.clear();
+    rtrace::encode_tiers(rt_rec_, rt_tier_.data());
+    rt_->put(rank, rt_rec_.data(), rt_rec_.size());
+    if (rank == 0)
+        RAD_INFO("route trace: %zu of %zu routed layers' router ops found; rank 0 copies each one's "
+                 "picks and weights (and a one-token pass's 384 logits) behind its counts row, every "
+                 "rank its picks' fate and its RAM cache's residency", found, layers_.size());
+    return RAD_OK;
+}
+
+void FileStager::rt_pass(const RadBatch* b) {
+    rt_step_ = b->step;
+    rt_t0_ns_ = rt_now_ns();
+    rt_q_li_ = -1;
+    rtrace::PassRec p;
+    p.step = b->step;
+    p.pass = trace_pass_;
+    p.phase = (int16_t)b->phase;
+    p.draft_pass = (int16_t)b->draft_pass;
+    p.n_tok = (int32_t)b->n_tok;
+    p.n_seq = (int32_t)b->n_seq;
+    p.n_spec = (int32_t)b->n_spec;
+    p.n_tok_decode = (int32_t)b->n_tok_decode;
+    p.max_ctx_len = (int32_t)b->max_ctx_len;
+    p.t_ns = rt_t0_ns_;
+    rt_rec_.clear();
+    rtrace::encode_pass(rt_rec_, p);
+    rt_->put(rt_rank_, rt_rec_.data(), rt_rec_.size());
+    ++rt_stats_.passes;
+}
+
+/* The select op's operands as this pass issues them (logits, correction bias, ids, weights): where
+ * rt_queue copies from, if the pass is the one routed and all its rows went in one issue. */
+void FileStager::rt_capture(int32_t li, const RadTensor* t, int n_t) {
+    if (n_t < 4 || (size_t)li >= rt_cap_.size()) return;
+    const RadTensor &lg = t[0], &bias = t[1], &ids = t[2], &w = t[3];
+    const int64_t rows = lg.rank == 2 ? lg.shape[0] : 0;
+    auto rows_of = [&](const RadTensor& x, int64_t width, bool f32) {
+        return x.data && x.rank == 2 && x.shape[0] == rows && x.shape[1] == width &&
+               x.stride[1] == 1 && (rows == 1 || x.stride[0] >= width) &&
+               (f32 ? x.dtype == RAD_F32 : (x.dtype == RAD_I32 || x.dtype == RAD_U32));
+    };
+    RtCap c;
+    if (rows < 1 || rows > kEpRouteMaxRows || !rows_of(lg, rtrace::kExperts, true) ||
+        !rows_of(ids, rtrace::kTopK, false) || !rows_of(w, rtrace::kTopK, true) || !bias.data ||
+        bias.dtype != RAD_F32 || hx_numel(bias) != rtrace::kExperts ||
+        bias.stride[bias.rank > 0 ? bias.rank - 1 : 0] != 1) {
+        rt_cap_[(size_t)li] = c;
+        return;
+    }
+    c.pass = trace_pass_;
+    c.rows = rows;
+    c.logits = (const char*)lg.data;
+    c.bias = (const char*)bias.data;
+    c.ids = (const char*)ids.data;
+    c.w = (const char*)w.data;
+    c.logits_ld = rows > 1 ? lg.stride[0] : rtrace::kExperts;
+    c.ids_ld = rows > 1 ? ids.stride[0] : rtrace::kTopK;
+    c.w_ld = rows > 1 ? w.stride[0] : rtrace::kTopK;
+    rt_cap_[(size_t)li] = c;
+}
+
+/* Rank 0: the layer's ids and weights (and on a one-token pass its logits; the first time, its
+ * bias) to pinned memory on s, behind the router that wrote them and the counts' event, then
+ * rt_ev_ behind them (rt_layer waits for it). */
+int FileStager::rt_queue(int32_t li, RadStream s) {
+    rt_q_li_ = -1;
+    rt_q_logits_ = false;
+    if (rt_rank_ != 0 || !rt_ids_ || (size_t)li >= rt_cap_.size()) return RAD_OK;
+    const RtCap& c = rt_cap_[(size_t)li];
+    if (c.pass != trace_pass_ || c.rows != pass_tok_) {
+        ++rt_stats_.uncaptured;
+        return RAD_OK;
+    }
+    auto rows = [&](void* dst, const char* src, int64_t ld, int64_t width) -> int {
+        if (c.rows == 1 || ld == width) return rad_memcpy_async(dst, src, c.rows * width * 4, s);
+        for (int64_t r = 0; r < c.rows; ++r)
+            RAD_TRY(rad_memcpy_async((char*)dst + r * width * 4, src + r * ld * 4, width * 4, s));
+        return RAD_OK;
+    };
+    RAD_TRY(rows(rt_ids_, c.ids, c.ids_ld, rtrace::kTopK));
+    RAD_TRY(rows(rt_w_, c.w, c.w_ld, rtrace::kTopK));
+    if (c.rows == 1) {
+        RAD_TRY(rad_memcpy_async(rt_logits_, c.logits, rtrace::kExperts * 4, s));
+        rt_q_logits_ = true;
+    }
+    if (rt_bias_state_[(size_t)li] == 0) {
+        RAD_TRY(rad_memcpy_async(rt_bias_ + (size_t)li * rtrace::kExperts, c.bias,
+                                 rtrace::kExperts * 4, s));
+        rt_bias_state_[(size_t)li] = 1;
+    }
+    if (rt_ev_) {
+        RAD_TRY(rad_event_record(rt_ev_, s));
+        rt_ev_rec_ = true;
+    }
+    rt_q_li_ = li;
+    return RAD_OK;
+}
+
+/* Right after hx_choose (decided) or in its stead (the card's copy path takes every file-tier
+ * pick): what this rank does with each of the layer's selected file-tier units, from hx_choose's
+ * slots (>= 0 the cache's lease, -2 a miss for the CPU, -1 the copy path) and its misses' read-
+ * ahead state, and on a one-token pass which of the layer's file-tier units the RAM cache holds
+ * now (one lock for all, no lease or LRU touch: Mover::units_cached). */
+void FileStager::rt_choice(int32_t li, bool decided) {
+    rt_decided_ = decided;
+    rt_us_ = (uint32_t)std::min<uint64_t>((rt_now_ns() - rt_t0_ns_) / 1000, UINT32_MAX);
+    rt_status_.assign(rt_units_.size(), (uint8_t)rtrace::kCopyPath);
+    if (decided) {
+        size_t k = 0;   /* the misses in hx_choose's order: hx_miss_, hx_miss_ready_, hx_miss_ra_ */
+        for (size_t i = 0; i < rt_units_.size(); ++i) {
+            const int slot = i < hx_slot_.size() ? hx_slot_[i] : -1;
+            uint8_t st = rtrace::kCopyPath;
+            if (slot >= 0) {
+                st = rtrace::kRamHit;
+            } else if (slot == -2) {
+                const bool whole = k < hx_miss_ready_.size() && hx_miss_ready_[k] != 0;
+                const bool part = k < hx_miss_ra_.size() && hx_miss_ra_[k] != nullptr;
+                st = whole ? rtrace::kAheadWhole : part ? rtrace::kAheadPart : rtrace::kMiss;
+                ++k;
+            }
+            rt_status_[i] = st;
+        }
+    }
+    rt_ram_ok_ = false;
+    std::memset(rt_ram_, 0, sizeof rt_ram_);
+    if (pass_tok_ == 1 && (size_t)li < rt_file_units_.size() && !rt_file_units_[(size_t)li].empty()) {
+        const std::vector<int32_t>& us = rt_file_units_[(size_t)li];
+        rt_hit_.resize(us.size());
+        mover_->units_cached(us.data(), (int)us.size(), rt_hit_.data());
+        for (size_t i = 0; i < us.size(); ++i)
+            if (rt_hit_[i]) {
+                const int32_t e = plan_->units[(size_t)us[i]].expert;
+                rt_ram_[e >> 5] |= 1u << (e & 31);
+            }
+        rt_ram_ok_ = true;
+    }
+}
+
+/* The layer's record (route_trace.h, type 2), and the first time rank 0's copy of the layer's bias
+ * has landed, its bias record. Built from what rt_choice kept and the counts row, which the next
+ * layer's copy has not yet overwritten; rank 0's router outputs landed with the counts. */
+void FileStager::rt_layer(int32_t li) {
+    const int32_t layer = layers_[(size_t)li].layer;
+    if (layer < 0 || layer >= rtrace::kLayers) return;
+    /* Rank 0's copies of this layer's router outputs: queued right behind the counts the choice
+     * waited for, so in practice landed by now and this wait returns at once. */
+    const bool route = rt_rank_ == 0 && rt_q_li_ == li &&
+                       !(rt_ev_rec_ && rt_ev_ && rad_event_sync(rt_ev_) < 0);
+    const bool logits = route && rt_q_logits_;
+    const int64_t rows = pass_tok_;
+    rtrace::Pick picks[rtrace::kLocal];
+    int n = 0;
+    const std::array<uint8_t, 96>& tier = rt_tier_[(size_t)layer];
+    for (int e = 0; e < rtrace::kLocal; ++e) {
+        if (counts_host_[e] <= 0) continue;
+        uint8_t st = rtrace::kUndecided;
+        if (tier[(size_t)e] == (uint8_t)Tier::VRAM) {
+            st = rtrace::kOnCard;
+        } else if (tier[(size_t)e] == (uint8_t)Tier::HostPinned ||
+                   tier[(size_t)e] == (uint8_t)Tier::HostPageable) {
+            st = rtrace::kHostPinned;
+        } else {
+            const int32_t u = rt_unit_[(size_t)li][(size_t)e];
+            for (size_t i = 0; i < rt_units_.size(); ++i)
+                if (rt_units_[i] == u) { st = rt_status_[i]; break; }
+        }
+        picks[n].expert = (uint16_t)(rt_rank_ * rtrace::kLocal + e);
+        picks[n].rows = (uint8_t)std::min<int32_t>(counts_host_[e], 255);
+        picks[n].status = st;
+        ++n;
+        if (rows == 1) ++rt_stats_.picks[st];
+    }
+    /* Rank 0's keys, from the logits that landed with the counts and the bias rt_queue copied
+     * (this pass or an earlier one); NaN without logits. */
+    float keys[kEpRouteMaxRows * rtrace::kTopK];
+    if (route) {
+        const float* bias = rt_bias_ + (size_t)li * rtrace::kExperts;
+        for (int64_t i = 0; i < rows * rtrace::kTopK; ++i) {
+            const int32_t id = rt_ids_[i];
+            keys[i] = logits && id >= 0 && id < rtrace::kExperts
+                          ? rtrace::sqrt_softplus(rt_logits_[id]) + bias[id]
+                          : std::numeric_limits<float>::quiet_NaN();
+        }
+    }
+    rtrace::LayerRec L;
+    L.pass = trace_pass_;
+    L.step = rt_step_;
+    L.layer = (uint16_t)layer;
+    L.rows = (uint16_t)rows;
+    L.flags = (uint8_t)((rt_decided_ ? rtrace::kDecided : 0) | (route ? rtrace::kRoute : 0) |
+                        (logits ? rtrace::kLogits : 0) | (rt_ram_ok_ ? rtrace::kRamMask : 0));
+    L.us = rt_us_;
+    std::memcpy(L.ram, rt_ram_, sizeof L.ram);
+    L.picks = picks;
+    L.n_picks = n;
+    L.ids = rt_ids_;
+    L.weights = rt_w_;
+    L.keys = keys;
+    L.logits = rt_logits_;
+    rt_rec_.clear();
+    rtrace::encode_layer(rt_rec_, L);
+    rt_->put(rt_rank_, rt_rec_.data(), rt_rec_.size());
+    ++rt_stats_.layers;
+    rt_stats_.d_layers += rows == 1;
+    rt_stats_.routes += route;
+    rt_stats_.logits += logits;
+    rt_stats_.masks += rt_ram_ok_;
+    if (route && rt_bias_state_[(size_t)li] == 1) {   /* the layer's bias, the first time it landed */
+        rt_rec_.clear();
+        rtrace::encode_bias(rt_rec_, (uint16_t)layer, rt_bias_ + (size_t)li * rtrace::kExperts);
+        rt_->put(rt_rank_, rt_rec_.data(), rt_rec_.size());
+        rt_bias_state_[(size_t)li] = 2;
+        ++rt_stats_.biases;
+    }
+    rt_q_li_ = -1;
+}
 
 /* Which layers can hand units to the pool: the EP-routed ones whose first expert op is a decode
  * gate_up (moe_gemm_ggml mxfp4 [4608, 5120], token order), whose last is the down projection
@@ -1638,8 +1959,10 @@ int FileStager::hx_early_decide() {
         (selected ? want_ : skip_).push_back(u);
     }
     if (trace_fp_) trace_units_ = want_;
+    if (rt_) rt_units_ = want_;
     const size_t selected = want_.size();
     hx_choose(li);
+    if (rt_) rt_choice(li, true);
     const auto t_chosen = std::chrono::steady_clock::now();
     if (!want_.empty() || (selected && hx_li_ != li)) {
         RAD_ERR("host experts: layer %d left %zu of %zu selected units off the CPU, and its card ops "
@@ -1679,6 +2002,8 @@ int FileStager::hx_early_decide() {
         RAD_TRY(hx_submit_misses());
         hx_confirmed_ = true;   /* hx_capture saw this pass's gate_up read the rows fetched */
     }
+    /* The route trace's record, before this gather waits for the pool (as in start_ep_routed). */
+    if (rt_) rt_layer(li);
     ++ep_stats_.reads;
     if (!total) ++ep_stats_.zero_local;
     return RAD_OK;
@@ -2364,17 +2689,23 @@ int FileStager::hx_deferred(int32_t li, RadStream s) {
     RAD_TRY(rad_event_record(counts_ev_, s));
     RAD_TRY(rad_event_sync(counts_ev_));
     const size_t selected = want_.size();
+    if (rt_) rt_units_ = want_;
     hx_choose(li);
+    if (rt_) rt_choice(li, true);
     if (!want_.empty() || (selected && hx_li_ != li)) {
         RAD_ERR("host experts: layer %d's first pass left %zu of %zu units off the CPU, and the card "
                 "has only aliases for them", layers_[(size_t)li].layer, want_.size(), selected);
         return RAD_E_STATE;
     }
     if (trace_fp_) trace_layer(layers_[(size_t)li].layer, 2 * (uint32_t)hx_miss_.size());
-    if (hx_li_ != li) return RAD_OK;
+    if (hx_li_ != li) {
+        if (rt_) rt_layer(li);
+        return RAD_OK;
+    }
     RAD_TRY(hx_submit());
     RAD_TRY(hx_submit_misses());
     hx_confirmed_ = true;   /* the pool was given exactly the rows this gate_up reads */
+    if (rt_) rt_layer(li);
     return RAD_OK;
 }
 
@@ -2556,6 +2887,9 @@ void FileStager::hx_drain() {
 }
 
 int FileStager::operands(rad_op h, RadStream s, const RadTensor* t, int n_t) {
+    /* ..._ROUTE_TRACE: a routed layer's router select op, before its launch (rt_capture). */
+    if (rt_ && (size_t)h < rt_li_of_op_.size() && rt_li_of_op_[(size_t)h] >= 0)
+        rt_capture(rt_li_of_op_[(size_t)h], t, n_t);
     if (!hx_pool_) return RAD_OK;
     if ((size_t)h < first_of_.size() && first_of_[(size_t)h] >= 0) {
         const int32_t li = first_of_[(size_t)h];

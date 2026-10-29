@@ -1414,6 +1414,36 @@ bool Mover::unit_cached(int32_t u) {
     return true;
 }
 
+void Mover::units_cached(const int32_t* units, int n, uint8_t* out) {
+    if (n <= 0) return;
+    if (!plan_ || !prog_ || !mapped_file_cache_on_) {
+        std::memset(out, 0, (size_t)n);
+        return;
+    }
+    /* Every unit's weights as keys, one lock for all; a unit is cached when all its weights are,
+     * as unit_cached says. The scratch is the calling (rank) thread's, kept between calls. */
+    thread_local std::vector<size_t> keys;
+    thread_local std::vector<int> first;
+    thread_local std::vector<uint8_t> hit;
+    keys.clear();
+    first.assign((size_t)n + 1, 0);
+    for (int i = 0; i < n; ++i) {
+        first[(size_t)i] = (int)keys.size();
+        const int32_t u = units[i];
+        if (u >= 0 && (size_t)u < unit_.size())
+            for (rad_weight h : plan_->units[(size_t)u].weights) keys.push_back((size_t)h);
+    }
+    first[(size_t)n] = (int)keys.size();
+    hit.assign(keys.size(), 0);
+    if (!keys.empty()) mapped_file_cache_.present_many(keys.data(), keys.size(), hit.data());
+    for (int i = 0; i < n; ++i) {
+        const int a = first[(size_t)i], b = first[(size_t)i + 1];
+        bool all = b > a;
+        for (int k = a; k < b; ++k) all = all && hit[(size_t)k];
+        out[i] = all ? 1 : 0;
+    }
+}
+
 bool Mover::host_planes_eligible(int32_t u) const {
     if (!plan_ || !prog_ || !mapped_file_cache_on_ || u < 0 || (size_t)u >= unit_.size()) return false;
     const UnitState& us = unit_[(size_t)u];

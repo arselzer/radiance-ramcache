@@ -90,6 +90,7 @@
 #include "host_expert_pool.h"
 #include "hx_fetch_list.h"
 #include "readahead.h"
+#include "route_trace.h"
 
 #include <array>
 #include <condition_variable>
@@ -351,6 +352,17 @@ public:
     };
     const HostStats& host_stats() const { return hx_stats_; }
     bool host_experts() const { return hx_pool_ != nullptr; }
+    /* RADIANCE_EXPERIMENTAL_DS41_ROUTE_TRACE (route_trace.h): this rank's part. Passes and layer
+     * records written; of the layers, one-token ones; layers with rank 0's router outputs, with
+     * its logits, with a RAM-cache snapshot; bias records; layers whose router op this pass did
+     * not show (no route then); the one-token layers' picks by what this rank did with them. */
+    struct RtStats {
+        uint64_t passes = 0, layers = 0, d_layers = 0, routes = 0, logits = 0, masks = 0;
+        uint64_t biases = 0, uncaptured = 0;
+        uint64_t picks[rtrace::kStatusCount] = {};
+    };
+    const RtStats& rt_stats() const { return rt_stats_; }
+    bool route_trace() const { return rt_ != nullptr; }
 
     /* The routed layers of `plan` that hold a unit on the file tier and the ops that read them,
      * over the mover's two file buffers. Leaves it disabled -- enabled() false -- when the plan
@@ -441,6 +453,59 @@ private:
     uint32_t trace_pass_ = 0;
     std::vector<int32_t> trace_units_;
     void trace_layer(int32_t layer, uint32_t miss_weights);
+
+    /* ---- RADIANCE_EXPERIMENTAL_DS41_ROUTE_TRACE=<prefix> (route_trace.h) --------------------
+     *
+     * Every EP-routed layer's record, built where the CPU path has just chosen (start_ep_routed,
+     * hx_early_decide, hx_deferred): the selected experts this rank owns and what it did with
+     * them (rt_choice, from hx_choose's slots, right after it, with the RAM cache's residency of
+     * the layer's file-tier units on a one-token pass), written once the misses are submitted
+     * (rt_layer), where the issuing thread waits for the pool anyway. Rank 0 adds the router's
+     * outputs: the layer's router select op (router_scored_topk: logits, correction bias, ids,
+     * weights) shows its operands at operands() (rt_capture), and start_ep_routed queues their
+     * copies to pinned memory right behind the counts' event (rt_queue), under an event of their
+     * own (rt_ev_) that rt_layer waits for: the CPU's choice does not wait for them, and by the
+     * time the record is built they have long landed. The router's buffers hold this layer's
+     * outputs until the next layer's router, which the issue order puts after this layer's
+     * decision. No byte the card or the pool computes changes. */
+    struct RtCap {
+        uint32_t pass = 0;       /* the pass the operands were seen in (trace_pass_), 0 never */
+        int64_t rows = 0;
+        const char *logits = nullptr, *bias = nullptr, *ids = nullptr, *w = nullptr;
+        int64_t logits_ld = 0, ids_ld = 0, w_ld = 0;   /* row pitches, in elements */
+    };
+    RouteTrace* rt_ = nullptr;
+    int  rt_rank_ = -1;
+    std::vector<int32_t> rt_li_of_op_;                  /* by op: whose router select op, or -1 */
+    std::vector<RtCap>   rt_cap_;                       /* by routed layer */
+    std::vector<std::array<uint8_t, 96>> rt_tier_;      /* by model layer: each local expert's Tier */
+    std::vector<std::array<int32_t, 96>> rt_unit_;      /* by routed layer: a local expert's file-tier unit, or -1 */
+    std::vector<std::vector<int32_t>> rt_file_units_;   /* by routed layer: its file-tier units */
+    int32_t* rt_ids_ = nullptr;        /* pinned, rank 0: [kEpRouteMaxRows, 6] */
+    float*   rt_w_ = nullptr;          /* [kEpRouteMaxRows, 6] */
+    float*   rt_logits_ = nullptr;     /* [384]: a one-token pass's */
+    float*   rt_bias_ = nullptr;       /* [routed layers, 384], each copied once */
+    RadEvent rt_ev_ = nullptr;         /* behind rank 0's copies (host-waited) */
+    bool     rt_ev_rec_ = false;
+    std::vector<uint8_t> rt_bias_state_;                /* by routed layer: 0, 1 queued, 2 recorded */
+    int32_t  rt_q_li_ = -1;            /* the layer whose router outputs are queued, or -1 */
+    bool     rt_q_logits_ = false;
+    int32_t  rt_step_ = 0;
+    uint64_t rt_t0_ns_ = 0;
+    uint32_t rt_us_ = 0;               /* the choice, from the pass's start */
+    bool     rt_decided_ = false;
+    std::vector<int32_t> rt_units_;    /* the layer's selected file-tier units, as hx_choose had them */
+    std::vector<uint8_t> rt_status_;   /* parallel to rt_units_ (rtrace::Status) */
+    uint32_t rt_ram_[3] = {};
+    bool     rt_ram_ok_ = false;
+    std::vector<uint8_t> rt_hit_, rt_rec_;
+    RtStats  rt_stats_;
+    int  rt_init(const Program& prog);
+    void rt_pass(const RadBatch* b);
+    void rt_capture(int32_t li, const RadTensor* t, int n_t);
+    int  rt_queue(int32_t li, RadStream s);
+    void rt_choice(int32_t li, bool decided);
+    void rt_layer(int32_t li);
 
     /* ---- routed experts computed on the CPU (host_expert_pool.h) ----------------------------
      *

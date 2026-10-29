@@ -10,6 +10,7 @@
 #include "mm/processor.h"
 #include "mm/media.h"
 #include "place/readahead.h"
+#include "place/route_trace.h"
 #include "place/router_predictor.h"
 
 #include "build/startup.h"
@@ -275,6 +276,33 @@ Engine::~Engine() {
                      hx.ra_misses ? 100.0 * (double)used / (double)hx.ra_misses : 0.0,
                      (double)hx.ra_used_bytes / 1e6, (double)hx.ra_dropped_bytes / 1e6);
         }
+        /* RADIANCE_EXPERIMENTAL_DS41_ROUTE_TRACE (place/route_trace.h): this rank's records, and
+         * its one-token layers' picks by what it did with them (the trace's own tally of them). */
+        if (r->fstager.route_trace()) {
+            const auto& t = r->fstager.rt_stats();
+            const auto* p = t.picks;
+            RAD_INFO("route trace: %llu passes, %llu layer records (%llu one-token); one-token picks: "
+                     "%llu on the card, %llu RAM hits, %llu misses, %llu read ahead whole, %llu in "
+                     "part, %llu on the copy path, %llu undecided, %llu host-pinned; router outputs "
+                     "on %llu layers (logits on %llu), RAM snapshots on %llu, %llu layers whose "
+                     "router operands this pass did not show, %llu bias records",
+                     (unsigned long long)t.passes, (unsigned long long)t.layers,
+                     (unsigned long long)t.d_layers, (unsigned long long)p[rtrace::kOnCard],
+                     (unsigned long long)p[rtrace::kRamHit], (unsigned long long)p[rtrace::kMiss],
+                     (unsigned long long)p[rtrace::kAheadWhole],
+                     (unsigned long long)p[rtrace::kAheadPart],
+                     (unsigned long long)p[rtrace::kCopyPath],
+                     (unsigned long long)p[rtrace::kUndecided],
+                     (unsigned long long)p[rtrace::kHostPinned], (unsigned long long)t.routes,
+                     (unsigned long long)t.logits, (unsigned long long)t.masks,
+                     (unsigned long long)t.uncaptured, (unsigned long long)t.biases);
+        }
+    }
+    /* The route trace's files: everything the ranks and the step loop recorded is written before
+     * the line that counts it (the writer joined). */
+    if (RouteTrace* rt = RouteTrace::get()) {
+        rt->close();
+        RAD_INFO("%s", rt->report().c_str());
     }
     /* The read-ahead's readers and the predictor serve every rank: one report for the process. */
     if (PieceReader& pr = PieceReader::process(); pr.started()) {
@@ -786,6 +814,7 @@ int Engine::step_loop() {
     StepOut so;
     int idle = 0;
     std::vector<uint64_t> cancel;
+    std::vector<RtStepEntry> rt_entries;   /* ..._ROUTE_TRACE's step records */
     /* Not in KL mode: its scored rows are copied out of the logits buffer after collection, and a
      * pass issued ahead would overwrite them. */
     pipelining_ = draft_experiment_.target_pipelining(!cfg_.kld() && !embedding_,
@@ -857,6 +886,25 @@ int Engine::step_loop() {
          * produces_token, 1 + n_spec rows each. Row and sequence indices differ (a mid-prompt
          * chunk produces no row). */
         const StepPlan& plan = sched_.plan();
+        /* RADIANCE_EXPERIMENTAL_DS41_ROUTE_TRACE (place/route_trace.h): the requests this step's
+         * rows belong to, which the ranks' routing records join on the step number. A step issued
+         * ahead has run its pass already; its record is written now that it is the open step. */
+        if (RouteTrace* rt = RouteTrace::get()) {
+            rt_entries.clear();
+            for (const StepEntry& e : plan.e) {
+                RtStepEntry x;
+                x.seq = e.seq;
+                x.ctx_len = e.ctx_len;
+                x.n_tokens = e.n_tokens;
+                x.flags = (uint8_t)((e.is_prefill ? rtrace::kPrefill : 0) |
+                                    (e.produces_token ? rtrace::kProduces : 0) |
+                                    (e.dev ? rtrace::kDevRow : 0));
+                x.n_spec = (uint8_t)std::clamp<int32_t>(e.n_spec, 0, 255);
+                rt_entries.push_back(x);
+            }
+            rt->step(b->step, b->phase, b->draft_pass, b->n_tok, issued, rt_entries.data(),
+                     (int)rt_entries.size());
+        }
         /* One entry per request; Sampler::build_step expands each into 1 + n_draft rows itself
          * (giving each position its RNG coordinate), so one push per row would stage (1+n)^2 rows.
          * `first_row` indexes sampled tokens, so it counts rows. */
@@ -1155,6 +1203,15 @@ int Engine::step_loop() {
         st = sched_.commit(res);
         if (t_on) phase_mark(PH_COMMIT);
         if (st < 0) { RAD_ERR("commit: %s", rad_strerror(st)); return fail_loop(st); }
+        /* ..._ROUTE_TRACE: the requests this commit ended, and the step issued ahead of it, which
+         * still carries their rows (its pass's output is discarded: the post-stop pass). */
+        if (RouteTrace* rt = RouteTrace::get())
+            for (const StepEntry& e : plan.e) {
+                uint64_t n_out = 0;
+                bool live = true;
+                if (sched_.committed_seq(e.seq, &n_out, &live) && !live)
+                    rt->end(b->step, ahead ? ahead->step : -1, e.seq, n_out);
+            }
         /* The step has drained, so its counters are readable. A chunk that produced no row did not
          * wait, so its copy is read on a later step; a finished prompt or request always produced
          * a row. */

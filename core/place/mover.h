@@ -694,6 +694,9 @@ public:
     int     mapped_cache_second_chances(const std::vector<int32_t>& units, int chances);
     /* Whether the mapped RAM cache holds every weight of unit u, without touching it. */
     bool  unit_cached(int32_t u);
+    /* unit_cached for n units under one lock of the cache (out[i] 0/1): the routing trace's
+     * residency snapshot (route_trace.h). */
+    void  units_cached(const int32_t* units, int n, uint8_t* out);
     int   insert_unit_planes(const HostPlanes& p, std::vector<uint8_t>* scratch);
     /* The packed cache's outcomes, all ranks' threads: weights packed and published; units not
      * cached because a weight had more raw rounds than its slot takes (attempts, and distinct

@@ -32,7 +32,7 @@ VERIFY_REQUESTS=${VERIFY_REQUESTS:-3}
 HERE=$(cd "$(dirname "$0")" && pwd)
 R=/home/as/radiance-setup/research/deepseek-v41-1017-20261024
 MODEL=$R/native-models/ds41-native-mxfp4-v3-20261027T121600Z/model.rad
-MIRROR=${MIRROR:-/srv/bulk/source-copies/ds41-native-mxfp4/d8b2e3c20f5f4b6d5044d37f20b8d53f260f83e466f72259572be76d7e756bf3-main}
+MIRROR=${MIRROR:-}   # the checkpoint's model-*.safetensors for R arms; no default
 PROFILE=$R/ds41-dev-window-profile-calibration-20261028T034300Z/sealed-decode-profile.json
 PROMPTS=${PROMPTS:-$R/ds41-pack-tail-dev-window-tail1-heldout-20261028T085400Z/receipt.json}
 PORT=18089
@@ -64,6 +64,41 @@ stop_server() {
   SERVER_PID=
 }
 
+# Power settings a Q arm changes for its own run: g the performance CPU governor, n no NVMe power
+# state with an exit latency (pm_qos latency tolerance 0), c the C2 idle state off. Every file's
+# value is read here, before any arm, and written back after each Q arm and on any exit.
+POWER_FILES=(/sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_governor
+             /sys/class/nvme/nvme[0-9]*/power/pm_qos_latency_tolerance_us
+             /sys/devices/system/cpu/cpu[0-9]*/cpuidle/state2/disable)
+POWER_SAVED=$(for f in "${POWER_FILES[@]}"; do [[ -r $f ]] && echo "$f $(cat "$f")"; done)
+POWER_SET=
+power_write() {   # lines "file value" on stdin, written as root
+  /usr/bin/sudo -n /bin/bash -c 'while read -r f v; do echo "$v" > "$f" || echo "power: cannot write $f" >&2; done'
+}
+power_state() {
+  echo "governor $(sort /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_governor | uniq -c | xargs)," \
+       "nvme latency tolerance $(cat /sys/class/nvme/nvme[0-9]*/power/pm_qos_latency_tolerance_us | xargs) us," \
+       "C2 disabled $(sort /sys/devices/system/cpu/cpu[0-9]*/cpuidle/state2/disable | uniq -c | xargs)"
+}
+power_set() {   # the letters of an arm's Q part
+  local f
+  for f in "${POWER_FILES[@]}"; do
+    case $f in
+      */scaling_governor)              [[ $1 == *g* ]] && echo "$f performance" ;;
+      */pm_qos_latency_tolerance_us)   [[ $1 == *n* ]] && echo "$f 0" ;;
+      */state2/disable)                [[ $1 == *c* ]] && echo "$f 1" ;;
+    esac
+  done | power_write 2>>"$OUT/window.log"
+  POWER_SET=1
+  log "power Q$1: $(power_state)"
+}
+power_restore() {
+  [[ -n "$POWER_SET" ]] || return 0
+  echo "$POWER_SAVED" | power_write 2>>"$OUT/window.log"
+  POWER_SET=
+  log "power restored: $(power_state)"
+}
+
 restore() {
   # Runs once, ignores further signals, and retries the start until the container really runs:
   # a start issued while a stop is still in flight is a no-op, and the stop then wins.
@@ -71,6 +106,7 @@ restore() {
   [[ -n "${RESTORED:-}" ]] && return 0
   RESTORED=1
   stop_server
+  power_restore
   log "restoring $NAME"
   local t=0 state
   while :; do
@@ -100,7 +136,7 @@ arm() {   # name, then env assignments for the server; CACHE_MIB the RAM cache (
       --vision-tower-placement vram --ngram-placement disk --max-model-len 512 \
       --max-num-batched-tokens 16 --max-num-seqs ${MAX_SEQS:-1} --kv-cache-dtype bf16 \
       --num-speculative-tokens 0 --spec-ngram 0 --no-prefix-cache --deterministic \
-      --host 127.0.0.1 --port $PORT --expert-profile "$PROFILE" ${EXTRA_ARGS:-} >"$OUT/$name.server.log" 2>&1 &
+      --host 127.0.0.1 --port $PORT --expert-profile "$PROFILE" ${EXTRA_ARGS:-} "${ARGS[@]}" >"$OUT/$name.server.log" 2>&1 &
   SERVER_PID=$!
   # Memory guard: stops this server (never anything else) if the host runs short.
   ( while kill -0 "$SERVER_PID" 2>/dev/null; do
@@ -171,15 +207,21 @@ for a in $ARMS; do
   # H the second run home (RADIANCE_HOME_DIR2); iN background insert threads for missed units;
 # pN --host-pool-mib (4096: a rank's pinned expert slots and the file tier's staging); G pin the
 # RAM cache's slabs at startup; R / RNN read part of each missed expert from the checkpoint's
-# safetensors on /srv/bulk ($MIRROR; share 0.NN, default 0.18); BN cap the VRAM file buffers at N
+# safetensors in $MIRROR (--expert-plane-mirror; share 0.NN, default 0.18) in passes of N+ tokens
+# (RmN, --expert-plane-mirror-min-rows, default 2), RdNN share 0.NN in smaller passes (decode;
+# --expert-plane-mirror-decode-share, default 0); BN cap the VRAM file buffers at N
 # units (the CPU must take every routed unit: all, M16); W warm the RAM cache from the expert
 # profile before serving; ZN fail the N-th plane mirror read (tests the fallback to the container);
 # A / AN read a layer's missed planes on a worker while the card's ops are issued (passes of N+
-# tokens; A is every pass).
+# tokens; A is every pass); Q[gnc] the arm's power settings (see power_set); SgK / SgaK prompt-lookup
+# speculation, K drafts a step (fixed / adaptive window); rN a repeat (ignored).
   IFS=- read -r -a parts <<< "$a"
   pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 HOST_POOL_MIB=4096 EXTRA_ARGS="" ARM_HOME="$RHOME"
+  power="" skip="" ARGS=()
   for p in "${parts[@]:1}"; do
     case $p in
+      Q[gnc]*) power=${p#Q} ;;
+      r[0-9]*) ;;
       t[0-9]*) threads=${p#t} ;;
       g[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_GBPS=${p#g}) ;;
       f)       env+=(RADIANCE_EXPERIMENTAL_NATIVE_CACHE_DIRECT_FILL=1) ;;
@@ -198,13 +240,21 @@ for a in $ARMS; do
       Z[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_PLANE_MIRROR_FAULT=${p#Z}) ;;
       A)       env+=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_ASYNC_MISSES=1) ;;
       A[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_ASYNC_MISSES=${p#A}) ;;
-      R)       env+=(RADIANCE_EXPERIMENTAL_DS41_PLANE_MIRROR=$MIRROR) ;;
-      R[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_PLANE_MIRROR=$MIRROR RADIANCE_EXPERIMENTAL_DS41_PLANE_MIRROR_SHARE=0.${p#R}) ;;
+      Rm[0-9]*) ARGS+=(--expert-plane-mirror-min-rows "${p#Rm}") ;;
+      Rd[0-9]*) ARGS+=(--expert-plane-mirror-decode-share "0.${p#Rd}") ;;
+      Sga[0-9]*) ARGS+=(--num-speculative-tokens "${p#Sga}" --spec-ngram "${p#Sga}" --draft-window adaptive) ;;
+      Sg[0-9]*) ARGS+=(--num-speculative-tokens "${p#Sg}" --spec-ngram "${p#Sg}") ;;
+      R|R[0-9]*)
+               if [[ -z "$MIRROR" ]]; then log "arm $a: $p needs MIRROR=<directory of the checkpoint's model-*.safetensors>"; skip=1; fi
+               ARGS+=(--expert-plane-mirror "$MIRROR")
+               [[ $p != R ]] && ARGS+=(--expert-plane-mirror-share "0.${p#R}") ;;
       Ps[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_PREFETCH=shadow RADIANCE_EXPERIMENTAL_DS41_PREFETCH_K=${p#Ps}) ;;
       Po[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_PREFETCH=on RADIANCE_EXPERIMENTAL_DS41_PREFETCH_K=${p#Po}) ;;
       *)       log "arm $a: unknown part $p" ;;
     esac
   done
+  [[ -n "$skip" ]] && continue
+  [[ -n "$power" ]] && power_set "$power"
   case $pol in
     base) arm "$a" RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=0 "${env[@]}" ;;
     verify|greedy|all)
@@ -212,6 +262,7 @@ for a in $ARMS; do
           RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_POLICY=$pol "${env[@]}" ;;
     *) log "unknown arm $a" ;;
   esac
+  power_restore
 done
 [[ -n "$ARMS" ]] && python3 -I "$HERE/ab_requests.py" --compare "$OUT" $ARMS | tee -a "$OUT/window.log"
 log "arms done"

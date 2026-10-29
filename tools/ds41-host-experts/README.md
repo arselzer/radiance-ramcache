@@ -35,14 +35,18 @@ RADIANCE_EXPERIMENTAL_NATIVE_CACHE_MAPPED_SOURCE=1
 RADIANCE_EXPERIMENTAL_NATIVE_CACHE_DIRECT_FILL=1
 RADIANCE_EXPERIMENTAL_NATIVE_CACHE_PREGROW=1               # pin the cache's slabs at startup
 RADIANCE_EXPERIMENTAL_DS41_MXFP4_PACK_SSE2=1
-RADIANCE_EXPERIMENTAL_DS41_PLANE_MIRROR=<dir of the checkpoint's model-*.safetensors>
 RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS=1             # VRAM file buffers to residents
 RADIANCE_EXPERIMENTAL_DS41_CACHE_WARM=1                    # fill the cache from the profile
 
 radiance ... --tp 4 --placement expert_tiered --weights-disk-tier \
   --expert-ram-cache-total-mib 98304 --host-pool-mib 1900 \
-  --max-num-batched-tokens 16 --expert-profile <decode profile>
+  --max-num-batched-tokens 16 --expert-profile <decode profile> \
+  --expert-plane-mirror <dir of the checkpoint's model-*.safetensors>   # optional, see below
 ```
+
+The plane mirror is optional and off unless `--expert-plane-mirror` names a directory; nothing in
+the engine or the scripts assumes where the checkpoint is. `ab_window.sh` takes it as
+`MIRROR=<dir>` for its `R` arms and refuses those arms without it.
 
 | Setting | Effect measured | Notes |
 |---|---|---|
@@ -50,7 +54,7 @@ radiance ... --tp 4 --placement expert_tiered --weights-disk-tier \
 | `..._MISSES=16` | misses on the CPU: 5.96 → 8.89 tok/s | needs the mapped RAM cache |
 | `--host-pool-mib 1900`, cache 96 GiB | +9% | the pinned pool's RAM is worth more as cache; 96 GiB leaves ~8 GiB free (88 GiB: 16.5 GiB free, −4%) |
 | `..._NATIVE_CACHE_PREGROW=1` | request 2 TTFT 13.7 → 5.0 s | slabs pinned at startup (+~30 s startup) |
-| `..._PLANE_MIRROR` | prefill TTFT −11% | prefill passes only (`_MIRROR_MIN_ROWS`, 2); `_MIRROR_SHARE` (0.18); turns itself off if a read fails or a shard changes; `_MIRROR_FAULT=N` tests that |
+| `--expert-plane-mirror DIR` | prefill TTFT −7 to −11% | `--expert-plane-mirror-share` (0.18) in passes of `--expert-plane-mirror-min-rows` (2) tokens or more; `--expert-plane-mirror-decode-share` (0) in decode, where 0.10 measured ~+3% once and 0.18 −4%; turns itself off if a read fails or a shard changes; `RADIANCE_EXPERIMENTAL_DS41_PLANE_MIRROR_FAULT=N` tests that |
 | `..._FILE_BUFFER_UNITS=1` | +9.5% (176 more VRAM experts a rank) | refused unless the CPU takes every routed unit of every pass (all, MISSES=16, passes ≤ 16 tokens) |
 | `..._CACHE_WARM=1` | first request 7.1 → 11.2 tok/s, TTFT 7.9 → 4.6 s | +~14 s startup; pins the slabs first |
 | `..._ASYNC_MISSES=2` | TTFT −25% | decode passes keep the direct path (no gain there) |

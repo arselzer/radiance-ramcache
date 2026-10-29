@@ -145,6 +145,18 @@ experts in pinned host memory and in VRAM, then times each mode at a 5-row query
 (`DEVICE_CHECKS=draft` in a window, with `DRAFT_CHECK_BIN` and `DRAFT_CHECK_LIB`). Not yet measured
 on the card.
 
+The replies cannot show a wrong draft GEMV (the target verifies every draft), so `ab_window.sh`
+holds a `Dk`/`Dkt` arm to what its name says: it runs only on the `libr4d.so` (sha256) whose draft
+check passed in the same window; it is measured only if libr4d's first-call line is in its log and
+the exit line leaves 0 draft-shaped calls on the old path (otherwise its results are kept as
+`<arm>.unmeasured.json`); every other arm runs with `..._DRAFT_GEMV=0` and
+`..._DSPARK_SHORT_BLOCK=0` and must show neither line; a `DbN` arm needs the engine's "runs its short
+block of N row(s)" startup line, and no other arm may have it. At the window's end each `Dk` arm's
+per-request `draft_n` and `draft_n_accepted` (and texts) must equal those of the same arm without
+`Dk` (`ab_requests.py --draft-stats`): the exact drafter proposes the same tokens. On a table the
+packed VRAM residents' `gemv_vp` row serves (`Vp`), the draft mode does not apply (its kernel has no
+one-pass form) and such calls are counted as left on the old path.
+
 `RADIANCE_EXPERIMENTAL_DS41_DSPARK_SHORT_BLOCK=N` (2-4; the deepseek41 plugin) declares a short query
 block of N rows, [anchor, noise x (N - 1)], proposing N tokens (`rad_drafter_short_block`), which the
 core runs from `--draft-short-from` decoding sequences on; the verify cap (`DsK`) now also accepts
@@ -482,7 +494,8 @@ tokens gives every row the bits it gets in today's 16-token chunking, because ev
 the decode band's arithmetic at every height or is checked to (`ds41_mxfp4_device_check tall` and
 `sweep`, `r4d_emu_ds41tall`), and the server refuses any step whose bands say otherwise. The A/B's
 byte gate: two `Kld` arms of the same configuration (e.g. `...-Lm2048-Kld` and
-`...-M32-...-Lm2048-Xt-BT32-Kld`) record every position of a corpus with `--kld-record` (its f16
+`...-M32-...-Lm2048-Xt-BT32-Kld`; the plain one first: an `Xt` arm is never taken as the reference,
+and `KLD_TIMEOUT`, 900 s, bounds a run) record every position of a corpus with `--kld-record` (its f16
 log-probabilities, its top 16 in f32, and the next token's NLL and the whole row's entropy in f32, so
 one changed logit anywhere in a row shows), and the second must equal the first byte for byte
 (`ab_requests.py --kld-compare`).

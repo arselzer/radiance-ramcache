@@ -22,6 +22,10 @@
                                           a --kld-corpus (JSONL) of the receipts' text prompts
                                           (chat_text, or a string prompt) of at most MAXCHARS
                                           characters, as plain text, every position scored
+  ab_requests.py --draft-stats DIR A B     per request: DSpark's draft_n and draft_n_accepted and the
+                                          text of arm B against arm A (exit 1 on any difference): a
+                                          Dk arm against the same arm without Dk, whose exact draft
+                                          GEMV must propose the same tokens
   ab_requests.py --kld-compare REF DIR    two --kld-record directories byte for byte: every
                                           position's log-probabilities, top entries and row values
                                           (exit 1 when any differ, naming the first positions)
@@ -445,6 +449,35 @@ def kld_compare(ref, cand):
     return 1 if bad else 0
 
 
+def draft_stats(d, a, b):
+    """Arm b's requests against arm a's, by name: the drafter's draft_n and draft_n_accepted and the
+    reply text must be the same (the K1 review's draft_stats_cmp.py). 1 on any difference."""
+    data, _ = load(d, [a, b])
+    if a not in data or b not in data:
+        return 1
+    bad = 0
+    for n, x in data[a].items():
+        y = data[b].get(n)
+        if y is None:
+            print("  %s: not in %s" % (n, b))
+            bad += 1
+            continue
+        tx, ty = x.get("timings") or {}, y.get("timings") or {}
+        sx = (tx.get("draft_n"), tx.get("draft_n_accepted"))
+        sy = (ty.get("draft_n"), ty.get("draft_n_accepted"))
+        same = x.get("text") == y.get("text")
+        ok = same and sx == sy and sx[0] is not None
+        bad += not ok
+        print("  %s: drafts %s/%s against %s/%s, text %s%s" % (n, sy[0], sy[1], sx[0], sx[1],
+              "same" if same else "DIFFERS", "" if ok else "  <-- MISMATCH"))
+    extra = [n for n in data[b] if n not in data[a]]
+    if extra:
+        print("  not in %s: %s" % (a, ", ".join(extra)))
+        bad += 1
+    print("draft stats %s against %s: %s" % (b, a, "PASS" if not bad else "FAIL, %d request(s)" % bad))
+    return 1 if bad else 0
+
+
 # ---- the quality harness -----------------------------------------------------------------------
 
 def lp_rows(choice):
@@ -766,6 +799,8 @@ if __name__ == "__main__":
         sys.exit(hashes(a[1], a[2:]))
     elif a[0] == "--ttft":
         ttft(a[1], a[2:])
+    elif a[0] == "--draft-stats":
+        sys.exit(draft_stats(a[1], a[2], a[3]))
     elif a[0] == "--kld-corpus":
         sys.exit(0 if kld_corpus(a[1], int(a[2]), a[3:]) > 0 else 1)
     elif a[0] == "--kld-compare":

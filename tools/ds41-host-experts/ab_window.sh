@@ -47,8 +47,8 @@
 # runs the arm's server as --kld-record over a corpus instead of serving: every chat_text of the
 # receipts KLD_RECEIPTS names (default "long chat", work/extra-prompts/<name>-receipt.json) up to
 # KLD_MAX_CHARS characters (6000), as plain text, every position scored, at --max-model-len KLD_LEN
-# (2048) unless the arm gives an Lm part. The window's first Kld arm is the reference; every later
-# one's records are compared with it byte for byte (ab_requests.py --kld-compare: every position's
+# (2048) unless the arm gives an Lm part. The window's first Kld arm to finish is the reference (an
+# Xt arm never is: it is then not compared); every later one's records are compared with it byte for byte (ab_requests.py --kld-compare: every position's
 # f16 log-probabilities, its top 16 in f32, and the next token's NLL and the whole row's entropy in
 # f32, so one changed logit anywhere in a row shows).
 #
@@ -180,14 +180,14 @@ xt_check() {   # name
 }
 
 # A Kld arm: its server records the corpus (--kld-record) instead of serving, then exits. The
-# window's first Kld arm that finishes is the reference (KLD_REF); a later one's records must equal
-# it byte for byte.
+# window's first Kld arm that finishes is the reference (KLD_REF), never an Xt arm; a later one's
+# records must equal it byte for byte. KLD_TIMEOUT (900 s) bounds a run.
 KLD_REF=
 kld_finish() {   # name; the run is SERVER_PID
   local name=$1 t=0 rc
   while kill -0 "$SERVER_PID" 2>/dev/null; do
     sleep 5; t=$((t + 5))
-    if (( t > ${KLD_TIMEOUT:-3600} )); then log "arm $name: kld run still going after ${t}s; stopped"; stop_server; return 1; fi
+    if (( t > ${KLD_TIMEOUT:-900} )); then log "arm $name: kld run still going after ${t}s; stopped"; stop_server; return 1; fi
   done
   wait "$SERVER_PID"; rc=$?; SERVER_PID=
   log "arm $name: kld run exit $rc after ${t}s"
@@ -195,6 +195,12 @@ kld_finish() {   # name; the run is SERVER_PID
   (( rc == 0 )) || return 1
   xt_check "$name" || return 1
   if [[ -z "$KLD_REF" ]]; then
+    # The reference must be a 16-token arm's bits: an Xt arm first (the plain one failed or is
+    # missing) would let a later Xt arm be compared with another Xt arm.
+    if [[ -n "${ARM_XT:-}" ]]; then
+      log "arm $name: an Xt arm cannot be the window's kld reference (no plain Kld arm finished before it); not compared"
+      return 1
+    fi
     KLD_REF=$OUT/kld-$name
     log "arm $name: the window's kld reference"
     return 0
@@ -302,6 +308,19 @@ arm() {   # name, then env assignments for the server; CACHE_MIB the RAM cache (
   fi
   [[ -n "${ARM_CS:-}" ]] && grep -m2 -E 'consumer skip: on|consumer suffix declared' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   xt_check "$name" || { stop_server; return 1; }
+  # DbN (RADIANCE_EXPERIMENTAL_DS41_DSPARK_SHORT_BLOCK): the engine says at startup that the drafter
+  # runs its short block. A Db arm without that line (a plugin without the switch: the full block
+  # runs), or another arm with it, is not measured.
+  local db_lines; db_lines=$(grep -c "runs its short block of [0-9]* row" "$OUT/$name.server.log")
+  if [[ -n "${ARM_DB:-}" && "$db_lines" == 0 ]]; then
+    log "arm $name: Db${ARM_DB}, but the server log has no 'runs its short block of N row(s)' line; not measured"
+    stop_server; return 1
+  fi
+  if [[ -z "${ARM_DB:-}" && "$db_lines" != 0 ]]; then
+    log "arm $name: no Db part, but the drafter runs a short block (the knob set for the window?); not measured"
+    stop_server; return 1
+  fi
+  [[ -n "${ARM_DB:-}" ]] && grep -m2 -E 'runs its short block|short[0-9] query' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   # The NVMe drive's busy time (io_ticks, ms) and temperature over the requests: read-ahead arms
   # move it from ~45% busy towards saturation.
   local d0 d1 t0 t1 rc temp
@@ -328,6 +347,23 @@ arm() {   # name, then env assignments for the server; CACHE_MIB the RAM cache (
     log "arm $name: teacher-forced along $lpref: exit $?"
   fi
   stop_server
+  # Dk / Dkt (RADIANCE_EXPERIMENTAL_DS41_DRAFT_GEMV): libr4d names the mode at its first draft call
+  # and counts the calls when the server exits. A Dk arm without the first line, or whose exit line
+  # leaves draft-shaped calls on the old path, or another arm with either line, is not measured:
+  # its results are set aside as <arm>.unmeasured.json (the window's comparisons skip it).
+  local dk_first dk_exit dk_bad=""
+  dk_first=$(grep -c 'libr4d: RADIANCE_EXPERIMENTAL_DS41_DRAFT_GEMV: the DSpark draft bank' "$OUT/$name.server.log")
+  dk_exit=$(grep -E 'libr4d: RADIANCE_EXPERIMENTAL_DS41_DRAFT_GEMV \(' "$OUT/$name.server.log" | tail -1)
+  if [[ -n "${ARM_DK:-}" ]]; then
+    [[ "$dk_first" == 0 ]] && dk_bad="no 'libr4d: RADIANCE_EXPERIMENTAL_DS41_DRAFT_GEMV: the DSpark draft bank' line (a libr4d without the switch, or no draft call)"
+    [[ -n "$dk_exit" && "$dk_exit" != *" 0 draft-shaped calls left on the old path"* ]] && dk_bad="draft-shaped calls left on the old path: $dk_exit"
+  elif [[ "$dk_first" != 0 || -n "$dk_exit" ]]; then
+    dk_bad="no Dk part, but libr4d took RADIANCE_EXPERIMENTAL_DS41_DRAFT_GEMV (the knob set for the window?)"
+  fi
+  if [[ -n "$dk_bad" ]]; then
+    log "arm $name: $dk_bad; not measured (results kept as $name.unmeasured.json)"
+    [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
+  fi
   grep -E 'host experts|EP scoped|live chain|error|ERR' "$OUT/$name.server.log" | tail -16 | tee -a "$OUT/window.log"
   grep -E 'read-ahead (in pieces|readers)|router predictor \(' "$OUT/$name.server.log" | tail -6 | tee -a "$OUT/window.log"
   grep -E 'rank 0: on-die reads' "$OUT/$name.server.log" | tee -a "$OUT/window.log"   # Pa/Pm/Pl/Pe: plan, counts
@@ -387,18 +423,35 @@ if [[ "${DEVICE_CHECKS:-1}" == 1 && -x "$HERE/build/ds41_mxfp4_device_check" ]];
   tail -3 "$OUT/chain_check.log" | tee -a "$OUT/window.log"
   if cmp -s "$OUT/silu_recheck.bin" "$SILU"; then log "silu table recaptured identical"; else log "silu table recapture DIFFERS"; fi
 fi
+# The Dk arms' gate (RADIANCE_EXPERIMENTAL_DS41_DRAFT_GEMV): the target verifies every draft, so a
+# wrong draft GEMV only moves acceptance and speed, never a reply; the card check is its exactness
+# proof. A Dk arm runs only on the libr4d.so (sha256) this check passed on in the window.
+DK_OK="" DK_LIB="" DK_SUM="" DK_WHY="no draft GEMV device check in this window (DEVICE_CHECKS=draft with DRAFT_CHECK_BIN and DRAFT_CHECK_LIB)"
 if [[ "${DEVICE_CHECKS:-1}" == draft ]]; then
   # RADIANCE_EXPERIMENTAL_DS41_DRAFT_GEMV (Dk) on card 0: the draft bank's grouped GEMMs in every
   # mode against the host experts, experts in pinned host memory and in VRAM, then each mode's
   # time a call at a 5-row query pass. DRAFT_CHECK_BIN is a ds41_mxfp4_device_check with the draft
-  # subcommand, DRAFT_CHECK_LIB a libr4d.so with the switch.
-  DCB=${DRAFT_CHECK_BIN:-$HERE/build/ds41_mxfp4_device_check}
-  DCL=${DRAFT_CHECK_LIB:-$RHOME/kernels/libr4d.so}
-  log "draft GEMV device check on card 0 with $DCL"
-  ( export HIP_VISIBLE_DEVICES=0
-    timeout 900 "$DCB" "$DCL" draft ${DRAFT_CHECK_TRIALS:-36} >"$OUT/draft_check.log" 2>&1
-    echo "draft check exit $?" >>"$OUT/draft_check.log" )
-  grep -E 'draft GEMV|PASS|FAIL|gate_up|down|exit' "$OUT/draft_check.log" | tail -20 | tee -a "$OUT/window.log"
+  # subcommand, DRAFT_CHECK_LIB a libr4d.so with the switch (both must be named: the window runs
+  # from a snapshot directory, so no default exists).
+  DCB=${DRAFT_CHECK_BIN:-} DCL=${DRAFT_CHECK_LIB:-}
+  if [[ ! -x "$DCB" || ! -f "$DCL" ]]; then
+    DK_WHY="DRAFT_CHECK_BIN=$DCB is not an executable or DRAFT_CHECK_LIB=$DCL is not a file"
+    log "draft GEMV device check: $DK_WHY; no Dk arm is measured"
+  else
+    log "draft GEMV device check on card 0 with $DCL"
+    ( export HIP_VISIBLE_DEVICES=0
+      timeout 900 "$DCB" "$DCL" draft ${DRAFT_CHECK_TRIALS:-36} >"$OUT/draft_check.log" 2>&1
+      echo "draft check exit $?" >>"$OUT/draft_check.log" )
+    grep -E 'draft GEMV|PASS|FAIL|gate_up|down|exit' "$OUT/draft_check.log" | tail -20 | tee -a "$OUT/window.log"
+    if grep -q '^PASS: every draft GEMV mode is bit-identical' "$OUT/draft_check.log" &&
+       grep -qx 'draft check exit 0' "$OUT/draft_check.log"; then
+      DK_OK=1 DK_LIB=$DCL DK_SUM=$(sha256sum "$DCL" 2>/dev/null | cut -d' ' -f1)
+      log "draft GEMV device check passed on $DCL, sha256 ${DK_SUM:0:16}: Dk arms on it are measured"
+    else
+      DK_WHY="the draft GEMV device check did not pass on $DCL ($(tail -1 "$OUT/draft_check.log" 2>/dev/null))"
+      log "$DK_WHY: no Dk arm is measured"
+    fi
+  fi
 fi
 
 # SELFTEST_F32BF16=<r4d_selftest>: before the arms, on card 0 with the H home's libr4d.so (the Rb
@@ -547,7 +600,11 @@ for a in $ARMS; do
 # live tail and one pass over each expert's weights (RADIANCE_EXPERIMENTAL_DS41_DRAFT_GEMV=1: no
 # slot routed to another rank runs against the rank's last expert, and an expert's rows share one
 # read of its pinned host weights; exact; a libr4d that has it, and a Ds part), Dkt the live tail
-# alone (=2); DbN DSpark's query pass as a short block of N rows (2-4), [anchor, noise x (N - 1)],
+# alone (=2) (a Dk/Dkt arm runs only on the libr4d.so DEVICE_CHECKS=draft's check passed on in the
+# window, and is measured only if libr4d names the mode at its first draft call and leaves no
+# draft-shaped call on the old path; every other arm runs with both switches at 0 and must show
+# neither; at the end each Dk arm's draft_n/draft_n_accepted must equal the same arm's without Dk);
+# DbN DSpark's query pass as a short block of N rows (2-4), [anchor, noise x (N - 1)],
 # on every decoding step (RADIANCE_EXPERIMENTAL_DS41_DSPARK_SHORT_BLOCK=N, --draft-short-from 1;
 # with DsK, N = K + 1 drafts what the cap verifies; the replies stay the target's, acceptance may
 # move; a deepseek41 plugin that has it, and a Ds part); H3 the third run home (RADIANCE_HOME_DIR3); Es
@@ -623,7 +680,7 @@ for a in $ARMS; do
 # only on the libr4d.so whose gemm_nt_f32bf16 passed SELFTEST_F32BF16's card checks in this window.
 # An arm with a predictor part (Ps, Po, Pt, Pp) is measured only if the router predictor loaded.
   IFS=- read -r -a parts <<< "$a"
-  xt="" bt="" kld=""
+  xt="" bt="" kld="" dk="" db=""
   pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 HOST_POOL_MIB=4096 EXTRA_ARGS="" ARM_HOME="$RHOME" ARM_CONC=
   ARM_PROMPTS= ARM_N= ARM_LQ= rt=
   power="" skip="" ARGS=() f8="" f8x="" rb="" rbf=0 pred="" cs="" kh="" pc="" pcopt=""
@@ -695,9 +752,9 @@ for a in $ARMS; do
                       --num-speculative-tokens 5 --spec-ngram 0)
                [[ $p == Ds[0-9] ]] && env+=(RADIANCE_EXPERIMENTAL_DS41_DSPARK_VERIFY_CAP=${p#Ds})
                [[ $p == Dsa ]] && ARGS+=(--draft-window adaptive) ;;
-      Dk)      env+=(RADIANCE_EXPERIMENTAL_DS41_DRAFT_GEMV=1) ;;   # draft GEMVs: live tail + one weight pass
-      Dkt)     env+=(RADIANCE_EXPERIMENTAL_DS41_DRAFT_GEMV=2) ;;   # draft GEMVs: the live tail alone
-      Db[2-4]) env+=(RADIANCE_EXPERIMENTAL_DS41_DSPARK_SHORT_BLOCK=${p#Db})   # DSpark's short query block
+      Dk)      dk=1 ;;                     # draft GEMVs: live tail + one weight pass (DRAFT_GEMV=1)
+      Dkt)     dk=2 ;;                     # draft GEMVs: the live tail alone (DRAFT_GEMV=2)
+      Db[2-4]) db=${p#Db}                  # DSpark's short query block (DSPARK_SHORT_BLOCK=N)
                ARGS+=(--draft-short-from 1) ;;
       K)       env+=(RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE=1) ;;     # the RAM cache packed for the CPU only
       Vp)      env+=(RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED=1) ;;      # VRAM residents in the packed-scale form (vpack_gate)
@@ -797,11 +854,23 @@ for a in $ARMS; do
   # not this switch's off: any value outside 1-32 turns host experts off).
   [[ " ${env[*]} " == *" RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MAX_ROWS="* ]] || env+=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MAX_ROWS=4)
   # Dk / Dkt / DbN act on the DSpark drafter only: without a Ds part the arm would not test them.
-  if [[ " ${env[*]} " == *" RADIANCE_EXPERIMENTAL_DS41_DRAFT_GEMV="* ||
-        " ${env[*]} " == *" RADIANCE_EXPERIMENTAL_DS41_DSPARK_SHORT_BLOCK="* ]] &&
-     [[ " ${env[*]} " != *" RADIANCE_EXPERIMENTAL_DS41_DSPARK_RAD_BANK=1 "* ]]; then
+  if [[ -n "$dk$db" && " ${env[*]} " != *" RADIANCE_EXPERIMENTAL_DS41_DSPARK_RAD_BANK=1 "* ]]; then
     log "arm $a: Dk / Dkt / DbN need a Ds part (the DSpark draft bank); the arm is skipped"; skip=1
   fi
+  # Every arm states both switches (0 is off for both), so a window's VAR=val cannot turn them on;
+  # arm() checks the logs both ways. A Dk arm runs only on the libr4d.so the draft check passed on.
+  env+=(RADIANCE_EXPERIMENTAL_DS41_DRAFT_GEMV=${dk:-0} RADIANCE_EXPERIMENTAL_DS41_DSPARK_SHORT_BLOCK=${db:-0})
+  if [[ -n "$dk" && -z "$skip" ]]; then
+    IFS=: read -r -a homes <<< "$ARM_HOME"
+    lib=""
+    for h in "${homes[@]}"; do [[ -f "$h/kernels/libr4d.so" ]] && { lib=$h/kernels/libr4d.so; break; }; done
+    if [[ -z "$DK_OK" ]]; then
+      log "arm $a: Dk refused: $DK_WHY"; skip=1
+    elif [[ -z "$lib" || "$(sha256sum "$lib" 2>/dev/null | cut -d' ' -f1)" != "$DK_SUM" ]]; then
+      log "arm $a: Dk refused: its libr4d.so (${lib:-none under $ARM_HOME}) is not the one the draft check passed on ($DK_LIB, sha256 ${DK_SUM:0:16})"; skip=1
+    fi
+  fi
+  ARM_DK=$dk ARM_DB=$db
   # RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL: on only in an Xt arm, explicitly off in every other one.
   if [[ -n "$xt" ]]; then env+=(RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=1); else env+=(RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=0); fi
   if [[ -n "$kld" ]]; then
@@ -847,6 +916,16 @@ fi
 for u in "${!KH_BY_PROMPTS[@]}"; do
   log "prefill hashes with prompts $u"
   python3 -I "$HERE/ab_requests.py" --hashes "$OUT" ${KH_BY_PROMPTS[$u]} | tee -a "$OUT/window.log"
+done
+# Dk / Dkt arms: the draft GEMV is exact, so the drafter proposes the same tokens. Each Dk arm's
+# requests must have the draft_n and draft_n_accepted (and the texts) of the same arm without its
+# Dk part, when the window ran it (K1 review finding 3).
+for a in $ARMS; do
+  [[ "-$a-" == *-Dk-* || "-$a-" == *-Dkt-* ]] || continue
+  b=$(sed -E 's/-Dkt?(-|$)/\1/' <<< "$a")
+  if [[ " $ARMS " != *" $b "* ]]; then log "draft stats: no arm $b in this window to hold $a to"; continue; fi
+  log "draft stats: $a against $b"
+  python3 -I "$HERE/ab_requests.py" --draft-stats "$OUT" "$b" "$a" | tee -a "$OUT/window.log"
 done
 [[ " $ARMS" == *-Pc* ]] && python3 -I "$HERE/ab_requests.py" --ttft "$OUT" $ARMS | tee -a "$OUT/window.log"
 log "arms done"

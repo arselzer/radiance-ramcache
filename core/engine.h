@@ -469,6 +469,10 @@ private:
     uint64_t post_stop_issued_ = 0, post_stop_turn_ns_ = 0;
     std::chrono::steady_clock::time_point post_stop_t_{};
     void post_stop_report();
+    /* RADIANCE_EXPERIMENTAL_PREFIX_EORS's shutdown line (Scheduler::eors_on): the end-of-request
+     * snapshots stored and their bytes, the steps not issued ahead for one, the hits that resumed
+     * from one (tokens reused, the deepest), and the snapshot store's occupancy. */
+    void eors_report();
     /* The arena level and the followers' pools, before any release that runs a forward pass. */
     int  prepare_release(const RadBatch* b);
     /* Whether a step may be issued ahead: requires that the drafter, if any, runs on the card (the

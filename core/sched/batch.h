@@ -37,6 +37,9 @@ struct StepEntry {
     int32_t conv_cursor = 0;      /* read offset inside the rolling conv window (§10) */
     int32_t ckpt_tok = -1;        /* token index WITHIN this entry to snapshot at, or -1 */
     int32_t ckpt_slot = -1;
+    /* That snapshot is an end-of-request one (RADIANCE_EXPERIMENTAL_PREFIX_EORS): a decode step's
+     * at a grid position past its prompt, or the prompt's own end on the grid. */
+    bool    ckpt_eors = false;
     /* Snapshot this entry resumes from, or -1. Set only on the first step after a prefix hit; the
      * adopted blocks cover attention only, so this is the sole carrier of the recurrent state. */
     int32_t ckpt_restore = -1;

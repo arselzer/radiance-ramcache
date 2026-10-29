@@ -7927,3 +7927,122 @@ TEST(a_streamed_op_exists_only_for_a_capable_architecture_and_a_ring) {
     CHECK(!kvstream_op_gated(ctx, "kv_store"));
     CHECK(!kvstream_op_gated(ctx, "attn_paged"));
 }
+
+/* ================================================================== end-of-request snapshots
+ *
+ * RADIANCE_EXPERIMENTAL_PREFIX_EORS: the scheduler reserves a decode step's snapshot through
+ * PCBinding::reserve_eors_checkpoint, keyed like any other by the chain over prompt ++ output; the
+ * cache counts it apart, the next turn's lookup reaches it through the reply and says so
+ * (CacheHit::ckpt_eors), and a trim after the publish spares the chain just published. */
+TEST(an_end_of_request_snapshot_is_counted_and_the_next_turn_resumes_there) {
+    Fixture f;
+    REQUIRE_EQ(f.build(/*with_linear=*/true, /*ckpt_slots=*/4), RAD_OK);
+    PCBinding<PrefixCache> b(&f.pc);
+    /* A 300-token prompt and 40 tokens out: decode computed 339, its last grid snapshot is 336. */
+    const Request r = turn(7, tok_run(100, 300), tok_run(9000, 40));
+    CHECK_OK(f.kv.add_sequence(r.id));
+    CHECK_OK(f.kv.ensure(r.id, 339));
+    int32_t ladder = -1, tip = -1;
+    CHECK_OK(b.reserve_checkpoint(r, 288, &ladder));        /* the prompt's tail */
+    b.commit_checkpoint(r, 288);
+    CHECK_OK(b.reserve_eors_checkpoint(r, 336, &tip));      /* the reply's last grid position */
+    b.commit_checkpoint(r, 336);
+    std::vector<std::vector<int32_t>> bt;
+    for (int32_t g : f.pc.cached_groups()) bt.push_back(f.kv.block_table(r.id, g));
+    CHECK_OK(b.insert(r, bt, 339));
+    f.kv.free_sequence(r.id);
+    CHECK_EQ(f.pc.stats().ckpt_eors, 1ll);
+    CHECK_EQ(b.store_counts().eors, 1ll);
+    CHECK_EQ(b.store_counts().held, 2ll);
+    CHECK_EQ(b.store_counts().peak, 2ll);
+
+    /* The next turn: the reply sent back and a new message. */
+    const Request next = turn(8, cat(cat(r.prompt, r.output), tok_run(20000, 50)), {});
+    f.pc.begin_step();
+    const CacheHit h = b.lookup(next, nullptr, nullptr);
+    CHECK_EQ(h.n_attn_tokens, 336);
+    CHECK_EQ(h.n_linear_tokens, 336);
+    CHECK_EQ(h.checkpoint_slot, tip);
+    CHECK(h.ckpt_eors);
+    CHECK_EQ(f.pc.stats().ckpt_eors_hits, 1ll);
+    CHECK_EQ(b.store_counts().eors_hits, 1ll);
+    /* A turn that rewrote the reply resumes at the prompt's tail, which is not one. */
+    const Request edit = turn(9, cat(cat(r.prompt, tok_run(30000, 40)), tok_run(20000, 50)), {});
+    f.pc.begin_step();
+    const CacheHit e = b.lookup(edit, nullptr, nullptr);
+    CHECK_EQ(e.n_linear_tokens, 288);
+    CHECK_EQ(e.checkpoint_slot, ladder);
+    CHECK(!e.ckpt_eors);
+    CHECK_EQ(f.pc.stats().ckpt_eors_hits, 1ll);
+}
+
+/* The trim after a publish spares the conversation just published: a plain trim takes the least
+ * recently used entries, and a chain is touched deepest first, so it reaches that conversation's
+ * end once the older ones are gone; trim_except takes only the others. */
+TEST(trim_except_spares_the_chain_just_published) {
+    for (const bool except : { false, true }) {
+        Fixture f;
+        CHECK_OK(f.build(/*with_linear=*/false));
+        const auto a = tok_run(7600, 336);
+        const auto b = tok_run(9600, 336);
+        publish(f, 1, a, 320);
+        f.kv.free_sequence(1);
+        publish(f, 2, b, 320);
+        f.kv.free_sequence(2);
+        const int64_t took = except ? f.pc.trim_except(b, {}, 320, 25) : f.pc.trim(25);
+        CHECK_EQ(took, except ? 20ll : 25ll);
+        CHECK_EQ(f.pc.lookup(a, {}).n_attn_tokens, 0);
+        /* b's five deepest entries went in the plain trim; none in trim_except. */
+        CHECK_EQ(f.pc.lookup(b, {}).n_attn_tokens, except ? 320 : 240);
+        CHECK_EQ(f.pc.stats().trim_spared, except ? 5ll : 0ll);
+    }
+}
+
+/* RADIANCE_EXPERIMENTAL_PREFIX_SESSION_LRU: once retention has run, a full store gives up the least
+ * recently used session's snapshots, its shallowest first and its tip last, before any snapshot of
+ * a session used since. Without it the least recently used snapshot of any session goes: here the
+ * busy session's anchor, older than the idle session's whole ladder. */
+TEST(a_full_store_by_session_gives_up_the_idle_conversation_first) {
+    for (const bool by_session : { false, true }) {
+        Fixture f;
+        CHECK_OK(f.build(/*with_linear=*/true, /*ckpt_slots=*/4));
+        f.pc.set_policy(std::make_unique<KeepAll>());
+        f.pc.set_session_lru(by_session);
+        const auto a = tok_run(5151, 16 * 9);
+        const auto c = tok_run(7171, 16 * 9);
+        publish(f, 1, a, 16 * 8);
+        publish(f, 2, c, 16 * 8);
+        const std::vector<BlockHash> ha = chain_of(a), hc = chain_of(c);
+        ckpt_at(f, 1, ha, 64);                /* session 1's anchor, the oldest snapshot */
+        ckpt_at(f, 2, hc, 64);                /* session 2's ladder */
+        ckpt_at(f, 2, hc, 128);
+        ckpt_at(f, 1, ha, 128);               /* session 1's tip */
+        f.pc.begin_step();
+        REQUIRE_EQ(f.pc.lookup(a, {}).n_linear_tokens, 128);   /* session 1 is used again */
+        f.pc.begin_step();
+        BlockHash n1 = ha[3]; n1.lo ^= 0x55ull;
+        int32_t s = -1;
+        CHECK_OK(f.pc.reserve_checkpoint(3, 64, n1, &s));
+        if (by_session) {
+            CHECK(f.pc.checkpoints(1) == (std::vector<int64_t>{ 64, 128 }));
+            CHECK(f.pc.checkpoints(2) == (std::vector<int64_t>{ 128 }));   /* shallowest first */
+            CHECK_EQ(f.pc.stats().ckpt_session_lru, 1ll);
+        } else {
+            CHECK(f.pc.checkpoints(1) == (std::vector<int64_t>{ 128 }));
+            CHECK(f.pc.checkpoints(2) == (std::vector<int64_t>{ 64, 128 }));
+            CHECK_EQ(f.pc.stats().ckpt_session_lru, 0ll);
+        }
+        /* One more: by session, session 2's tip goes before anything of session 1. */
+        f.pc.begin_step();
+        BlockHash n2 = ha[3]; n2.lo ^= 0x56ull;
+        CHECK_OK(f.pc.reserve_checkpoint(4, 64, n2, &s));
+        if (by_session) {
+            CHECK(f.pc.checkpoints(1) == (std::vector<int64_t>{ 64, 128 }));
+            CHECK(f.pc.checkpoints(2).empty());
+        } else {
+            CHECK(f.pc.checkpoints(2) == (std::vector<int64_t>{ 128 }));
+        }
+        CHECK_EQ(f.pc.stats().ckpt_lru, 2ll);
+        CHECK_EQ(f.pc.stats().ckpt_peak, 4ll);
+    }
+}

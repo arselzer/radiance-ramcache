@@ -121,6 +121,9 @@ struct SchedReq {
      * fit would inflate the prompt and hit totals. */
     int32_t  hit_attn = 0;
     bool     hit_owed = false;
+    /* That hit resumes from an end-of-request snapshot (CacheHit::ckpt_eors), for the counters
+     * (SchedMetrics::eors_hits). */
+    bool     hit_eors = false;
     /* Why that hit was cut, for the counters (SchedMetrics::hit_cut_*): to nothing, or to a
      * snapshot more than an interval below it. */
     enum class HitCut : uint8_t { None, NoSnapshot, Window, Adopt, ResumedBelow };
@@ -516,6 +519,16 @@ public:
      * one token a step attends as its decode step did. Otherwise `n_target`. */
     int64_t chunk_end(const Request& r, int64_t n_target) const;
 
+    /* RADIANCE_EXPERIMENTAL_PREFIX_EORS (eors_): whether init turned end-of-request snapshots on,
+     * and the position the next snapshot of a sequence decoding at `n_computed` with a
+     * `n_prompt`-token prompt lands on: the state after the row at `n_computed`, when that is on
+     * the resume grid past the prompt (-1 otherwise). */
+    bool    eors_on() const { return eors_; }
+    int64_t eors_position(int64_t n_computed, int64_t n_prompt) const {
+        const int64_t p = n_computed + 1;
+        return eors_ && p > n_prompt && geo_.on_grid(p) ? p : -1;
+    }
+
 private:
     Program*      prog_ = nullptr;
     Config        cfg_{};
@@ -792,6 +805,21 @@ private:
      * those positions. Bit-identical only if every kernel rounds a row the same at every pass
      * height; with this, every published block is a cold chunk's own. */
     bool    exact_publish_ = false;
+    /* RADIANCE_EXPERIMENTAL_PREFIX_EORS=1 (read at init; refused, with the reason, outside
+     * --prefix-resume exact, with speculation or with ..._EXACT_PUBLISH): end-of-request
+     * snapshots. Decode writes none otherwise, so a conversation's next turn resumes at most at the
+     * previous prompt's last chunk start and prefills the reply and everything after it again. With
+     * it, a decode step whose row completes a position on the resume grid (ChunkGeometry::grid)
+     * past its prompt snapshots the state there, a prompt ending on the grid snapshots its end, and
+     * every prompt takes its tail snapshot (the start of its last chunk) however short it is. The
+     * deepest stands when the request ends: at most grid - 1 tokens below its last computed
+     * position, and the next turn resumes there and recomputes the cold run's own chunks from it.
+     * Such a step is never issued ahead (step_next_locked): its key hashes the token the step
+     * before samples. The trim after a publish spares the chain just published. Exact where a row
+     * computed alone (decode) has the bits of the same row in a prefill pass of up to
+     * --max-num-batched-tokens rows: see the exactness argument in scheduler.cpp ("end-of-request
+     * snapshots", at init). */
+    bool    eors_ = false;
     /* The throughput window (step_finished): each kind's tokens and the wall time the steps
      * covered, both decayed with the same time constant, so their ratio is tokens over time. */
     double  tps_win_prefill_ = 0.0, tps_win_decode_ = 0.0, tps_win_time_ = 0.0;
@@ -841,8 +869,9 @@ private:
     /* Both snapshots resolve the same way; the two wrappers exist because the row types differ. */
     const Request* live_req(int32_t slot, uint64_t id) const;
     void preempt_back();
-    /* Give blocks back from the prefix cache until the pool has headroom again. */
-    void trim_prefix_cache();
+    /* Give blocks back from the prefix cache until the pool has headroom again. With `spare`
+     * (end-of-request snapshots on), the first `spare_tokens` of that request's chain stay. */
+    void trim_prefix_cache(const Request* spare = nullptr, int64_t spare_tokens = 0);
     /* RAD_OK, or a negative status when the request cannot be admitted now, nor anything behind
      * it. `reserve`: tokens of the step to leave for the requests queued behind this one
      * (--busy-prefill-chunk; busy_cap); 0 plans the chunk on the whole budget. */

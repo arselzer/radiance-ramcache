@@ -34,6 +34,7 @@
 #include <cstring>
 #include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -48,6 +49,10 @@ static pf::Cfg pf_env() {
                      std::getenv("RADIANCE_EXPERIMENTAL_DS41_PREFETCH_SET"),
                      std::getenv("RADIANCE_EXPERIMENTAL_DS41_PREFETCH_ENGRAM"));
 }
+
+/* RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8=1: the op that reads the FP8-sourced dense linears (see
+ * Model::f8). */
+static constexpr const char* kDenseF8 = "gemm_nt_bf16f8";
 
 /* RAD_ARCH_TRY that names the call that failed: a refused declaration otherwise surfaces only as
  * the plugin's return code. */
@@ -490,6 +495,20 @@ struct Model {
     std::map<int64_t, rad_kvgroup> comp, index, tail;
     /* The GGUF type of each linear weight the model ships in llama.cpp's blocks (lw()). */
     std::map<rad_weight, const char*> wty;
+    /* RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8=1 (dense_f8_gate): DeepSeek's release ships the
+     * trunk's dense linears as E4M3 codes with an E8M0 exponent a 32x32 block, which the container
+     * keeps cast to bf16. Those linear() reads by `gemm_nt_bf16f8`, gemm_nt's bytes from a stored
+     * form of the codes and exponents (libr4d: half the weight bytes; its relayout refuses at load
+     * any weight that is not exactly so). `f8` the weights lw8() marked, `f8_read` those whose op
+     * resolved, `f8_skip` the names (or `*suffix` patterns) ..._DENSE_FP8_EXCLUDE keeps on gemm_nt.
+     * `f8_n` and `f8_codes`: the weights the op reads on this rank and their code bytes, the
+     * shared expert's (MoeFP8::Config::shared_bf16_op) among them; `f8_kept`: those it could have
+     * read that stay on gemm_nt (excluded, ineligible, or declined as a runtime-LoRA target). */
+    bool f8_on = false;
+    std::set<rad_weight> f8, f8_read;
+    std::vector<std::string> f8_skip;
+    int64_t f8_codes = 0;
+    int f8_n = 0, f8_kept = 0;
     int64_t win_bs = 0;
     /* model-wide weights and ops */
     rad_weight token = 0, head = 0, final_gain = 0, tmap = 0, ple_table = 0;
@@ -662,8 +681,14 @@ static rad_weight lw(RadBuilder* b, Model& m, const char* name, int64_t n, int64
     if (ty) m.wty[w] = ty;
     return w;
 }
-/* y = x . w^T over lw()'s weight: gemm_nt_ggml for a GGUF block weight, gemm_nt for bf16. */
-static rad_op linear(RadBuilder* b, const Model& m, int64_t rows, rad_weight w, int64_t n,
+static rad_op fused(RadBuilder* b, const char* name, std::vector<RadParam> ps,
+                    std::vector<rad_weight> ws, std::initializer_list<rad_buf> rd,
+                    std::initializer_list<rad_buf> wr);
+/* y = x . w^T over lw()'s weight: gemm_nt_ggml for a GGUF block weight, gemm_nt for bf16, and
+ * for a weight lw8() marked gemm_nt_bf16f8, the same bytes from the weight's E4M3 + E8M0 stored
+ * form (libr4d). That op resolves wherever a library declares it, but for a runtime-LoRA target,
+ * whose fused GEMM the core declines; gemm_nt then reads the bf16 store, as without the knob. */
+static rad_op linear(RadBuilder* b, Model& m, int64_t rows, rad_weight w, int64_t n,
                      int64_t k, rad_buf x, rad_buf y) {
     const auto t = m.wty.find(w);
     if (t != m.wty.end())
@@ -671,16 +696,65 @@ static rad_op linear(RadBuilder* b, const Model& m, int64_t rows, rad_weight w, 
                   { RAD_RANGE("M", 1, rows), RAD_INT("N", n), RAD_INT("K", k), RAD_STR("type", t->second),
                     RAD_STR("dtype", m.g.dtype) },
                   { w }, { x }, { y });
+    if (m.f8.count(w)) {
+        if (const rad_op h = fused(b, kDenseF8,
+                                   { RAD_RANGE("M", 1, rows), RAD_INT("N", n), RAD_INT("K", k),
+                                     RAD_STR("dtype", m.g.dtype) },
+                                   { w }, { x }, { y })) {
+            if (m.f8_read.insert(w).second) {
+                ++m.f8_n;
+                m.f8_codes += n * k;
+            }
+            return h;
+        }
+        ++m.f8_kept;
+    }
     return op(b, "gemm_nt",
               { RAD_RANGE("M", 1, rows), RAD_INT("N", n), RAD_INT("K", k), RAD_STR("dtype", m.g.dtype) },
               { w }, { x }, { y });
 }
-/* The bytes linear() weight `w` [n, k] holds as stored: lw()'s bf16, two a value. 0 for a weight
- * in llama.cpp's blocks (a GGUF's), which no prefetch reads (pf_layer()). With the FP8 dense
- * weights (claude/ds41-fp8-dense), a weight gemm_nt_bf16f8 reads holds its n * k code bytes: that
- * branch's wbytes() is this one with that case. */
+/* Whether RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8_EXCLUDE names this weight: its declared name, or a
+ * `*suffix` of it (`*_shexp.weight`: every shared expert). */
+static bool f8_skipped(const Model& m, const char* name) {
+    const size_t n = std::strlen(name);
+    for (const std::string& x : m.f8_skip) {
+        if (x.empty()) continue;
+        if (x[0] == '*' ? (n >= x.size() - 1 && !std::strcmp(name + n - (x.size() - 1), x.c_str() + 1))
+                        : x == name)
+            return true;
+    }
+    return false;
+}
+/* lw() for a trunk linear the release ships as E4M3 codes with an E8M0 exponent a 32x32 block
+ * (Model::f8). Marks the weight for gemm_nt_bf16f8 where everything the op's row and layout hook
+ * check holds -- plain bf16 (LinearFP8's test), rows in 16s and K in 32s, a slice on whole 32x32
+ * blocks -- so the op resolves wherever a library declares it, and the hook can refuse only a
+ * weight whose values are not exactly so, at load. The scan ahead of time
+ * (tools/ds41-host-experts/ds41_dense_fp8_scan) names those for ..._EXCLUDE; the release's 570
+ * entries are all exact. */
+static rad_weight lw8(RadBuilder* b, Model& m, const char* name, int64_t n, int64_t k,
+                      RadWeightGroup grp, int shard = RAD_SHARD_NONE, int64_t lo = 0,
+                      int64_t hi = 0, bool mapped = false) {
+    const rad_weight w = lw(b, m, name, n, k, grp, shard, lo, hi, mapped);
+    if (!w || !m.f8_on || m.wty.count(w)) return w;
+    RadEncoding e{};
+    const bool plain = weight_enc(b, name, &e) && rad_enc_is(&e, "plain") && e.n_planes == 1 &&
+                       e.plane[0].dtype == RAD_BF16;
+    const bool split = m.g.world > 1 && shard != RAD_SHARD_NONE;
+    if (f8_skipped(m, name) || !plain || n % 16 || k % 32 || (split && (lo % 32 || hi % 32))) {
+        ++m.f8_kept;
+        return w;
+    }
+    m.f8.insert(w);
+    return w;
+}
+/* The bytes a prefetch of linear() weight `w` [n, k] reads (pf_layer()): its E4M3 codes, a byte
+ * an element, where gemm_nt_bf16f8 reads it (the exponents, one byte a 32x32 block, are left to
+ * the GEMM; libr4d clamps a prefetch to the stored form either way), else the bf16 plane's two; 0
+ * for a weight in llama.cpp's blocks (a GGUF's), which no prefetch reads. */
 static int64_t wbytes(const Model& m, rad_weight w, int64_t n, int64_t k) {
-    return !w || m.wty.count(w) ? 0 : n * k * 2;
+    if (!w || m.wty.count(w)) return 0;
+    return m.f8_read.count(w) ? n * k : n * k * 2;
 }
 static rad_op rmsnorm(RadBuilder* b, const Model& m, int64_t rows, rad_weight w, int64_t n,
                       rad_buf x, rad_buf y) {
@@ -1154,9 +1228,9 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
                          RAD_SHARD_NONE, grp);
         L.e_off = decl_w(b, nm.f("blk.%d.engram_off", l), RAD_I64, { H }, RAD_ACCESS_PER_TOKEN,
                          RAD_SHARD_NONE, grp);
-        L.e_kv = m.esplit ? lw(b, m, nm.f("blk.%d.engram_kv.weight", l), m.esplit, H * c.ple_dim, grp,
-                               RAD_SHARD_ROW, m.ar * m.esplit, (m.ar + 1) * m.esplit)
-                          : lw(b, m, nm.f("blk.%d.engram_kv.weight", l), (c.hc + 1) * D, H * c.ple_dim, grp);
+        L.e_kv = m.esplit ? lw8(b, m, nm.f("blk.%d.engram_kv.weight", l), m.esplit, H * c.ple_dim, grp,
+                                RAD_SHARD_ROW, m.ar * m.esplit, (m.ar + 1) * m.esplit)
+                          : lw8(b, m, nm.f("blk.%d.engram_kv.weight", l), (c.hc + 1) * D, H * c.ple_dim, grp);
         if (m.release || m.ista) {
             /* The release ships the gate as two factors, k_weight and q_weight, that the model only
              * multiplies (model.py Engram): one gain, as llama.cpp's converter folds it. */
@@ -1305,16 +1379,16 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
         if (!L.cn_a && !L.pcn_a) L.norm_a = rmsnorm(b, m, T, L.attn_norm, D, m.xcol, m.xn);
 
         /* ---- attention: the query, the window key */
-        L.wq_a = lw(b, m, nm.f("blk.%d.attn_q_a.weight", l), c.q_lora, D, grp);
+        L.wq_a = lw8(b, m, nm.f("blk.%d.attn_q_a.weight", l), c.q_lora, D, grp);
         L.q_norm = w("blk.%d.attn_q_a_norm.weight", RAD_F32, { c.q_lora });
-        L.wq_b = lw(b, m, nm.f("blk.%d.attn_q_b.weight", l), HD, c.q_lora, grp, RAD_SHARD_ROW,
-                    m.ar * HD, (m.ar + 1) * HD);
+        L.wq_b = lw8(b, m, nm.f("blk.%d.attn_q_b.weight", l), HD, c.q_lora, grp, RAD_SHARD_ROW,
+                     m.ar * HD, (m.ar + 1) * HD);
         L.q_a = linear(b, m, T, L.wq_a, c.q_lora, D, m.xn, m.qr);
         L.q_an = rmsnorm(b, m, T, L.q_norm, c.q_lora, m.qr, m.qrn);
         L.q_b = linear(b, m, T, L.wq_b, HD, c.q_lora, m.qrn, m.q);
         const rad_buf cs = L.r > 0 ? m.cs_b : m.cs_a;
         L.q_rope = rope_rows(b, m, T, g.n_head, hd, 0, m.q, cs);
-        L.wkv = lw(b, m, nm.f("blk.%d.attn_kv.weight", l), hd, D, grp);
+        L.wkv = lw8(b, m, nm.f("blk.%d.attn_kv.weight", l), hd, D, grp);
         L.kv_norm = w("blk.%d.attn_kv_a_norm.weight", RAD_F32, { hd });
         L.kv_g = linear(b, m, T, L.wkv, hd, D, m.xn, m.kv);
         L.kv_f = norm_rope_rt(b, m, T, L.kv_norm, hd, 32, "fp8_e4m3", "ue8m0", m.kv, m.kvn, cs);
@@ -1408,7 +1482,7 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
 
         /* ---- the indexer, at an index source */
         if (L.idx && r > 0) {
-            L.iq_w = lw(b, m, nm.f("blk.%d.indexer.attn_q_b.weight", l), c.ih * c.idim, c.q_lora, grp);
+            L.iq_w = lw8(b, m, nm.f("blk.%d.indexer.attn_q_b.weight", l), c.ih * c.idim, c.q_lora, grp);
             L.iproj = lw(b, m, nm.f("blk.%d.indexer.proj.weight", l), c.ih, D, grp);
             L.i_q = linear(b, m, T, L.iq_w, c.ih * c.idim, c.q_lora, m.qrn, m.iq);
             L.i_f = rope_rt(b, m, T, c.ih, c.idim, 0, 32, "fp4_e2m1", "ue8m0", m.iq, m.cs_b);
@@ -1483,13 +1557,13 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
             else
                 DS_TRY(map_rows(b, n, { { ckpt_name(nm.f("blk.%d.attn_output_a.weight", l)), (int)(gi_ * c.o_rank),
                                                 c.o_rank } }));
-            L.wo_a.push_back(lw(b, m, n, c.o_rank, gd, grp, RAD_SHARD_NONE, 0, 0, true));
+            L.wo_a.push_back(lw8(b, m, n, c.o_rank, gd, grp, RAD_SHARD_NONE, 0, 0, true));
             if (!L.wo_a.back()) return RAD_E_INVAL;
             L.o_a.push_back(linear(b, m, T, L.wo_a.back(), c.o_rank, gd, m.o, m.oa));
         }
         const int64_t ok = m.gr * c.o_rank;
-        L.wo_b = lw(b, m, nm.f("blk.%d.attn_output_b.weight", l), D, ok, grp, RAD_SHARD_COL,
-                    m.ar * ok, (m.ar + 1) * ok);
+        L.wo_b = lw8(b, m, nm.f("blk.%d.attn_output_b.weight", l), D, ok, grp, RAD_SHARD_COL,
+                     m.ar * ok, (m.ar + 1) * ok);
         L.o_b = linear(b, m, T, L.wo_b, D, ok, m.oa, m.attn_out);
     }
     /* The heads' partial outputs (zeros on an attention-zero rank) summed over every rank. */
@@ -1534,8 +1608,22 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
     s.cfg.route_scale = c.route_scale;
     s.cfg.swiglu_limit = c.swiglu_limit;
     s.cfg.shared_ungated = 1;
+    /* The shared expert's two linears (LinearFP8, row parts and an uneven slice of 256-column
+     * blocks) read as the attention's are, unless excluded by name. */
+    const bool sh_f8 = m.f8_on && !f8_skipped(m, nm.f("blk.%d.ffn_gate_up_shexp.weight", l)) &&
+                       !f8_skipped(m, nm.f("blk.%d.ffn_down_shexp.weight", l));
+    s.cfg.shared_bf16_op = sh_f8 ? kDenseF8 : nullptr;
     DS_TRY(MoeFP8::probe(b, nm, l, s, &s.cfg));
     DS_TRY(L.moe.declare(b, nm, g, l, m.mw, s, false, false));
+    if (m.f8_on && g.n_ff > 0)
+        for (const LinearFP8* sl : { &L.moe.sh_gate_up, &L.moe.sh_down }) {
+            if (sl->bf16_alt) {
+                ++m.f8_n;
+                m.f8_codes += sl->N * sl->K;
+            } else {
+                ++m.f8_kept;
+            }
+        }
     L.post_f = op(b, "mhc_post", hcp, {}, { m.act.x, m.h1, m.post, m.comb }, { m.h0 });
     /* After the MoE block, whose router and shared expert the reads can reach. The reads name no
      * buffer, so where they are declared changes no liveness. */
@@ -2043,6 +2131,45 @@ static void pf_note(const Model& m, int rank) {
 }
 
 /* ------------------------------------------------------------------ declare */
+/* RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8=1 (Model::f8), on only where the checkpoint says its dense
+ * linears are E4M3 with an E8M0 exponent a 32x32 block (the release's config.json, which the
+ * container keeps as imported_quantization_config) and a library declares the op. Anything else
+ * is a note, and every linear stays on gemm_nt. RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8_EXCLUDE:
+ * comma-separated declared weight names, or `*suffix` patterns, kept on gemm_nt. */
+static bool dense_f8_gate(RadBuilder* b, const RadModelMeta* meta, Model& m) {
+    const char* on = std::getenv("RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8");
+    if (!on || std::strcmp(on, "1")) return false;
+    const char* qm = rad_meta_gets(meta, "imported_quantization_config.quant_method", nullptr);
+    const char* sf = rad_meta_gets(meta, "imported_quantization_config.scale_fmt", nullptr);
+    const std::vector<int64_t> bs =
+        int_list(rad_meta_gets(meta, "imported_quantization_config.weight_block_size", nullptr));
+    if (!qm || std::strcmp(qm, "fp8") || !sf || std::strcmp(sf, "ue8m0") || bs.size() != 2 ||
+        bs[0] != 32 || bs[1] != 32) {
+        fprintf(stderr, "radiance: deepseek41: RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8 is set, but the "
+                        "checkpoint does not say its dense linears are E4M3 with an E8M0 scale a 32x32 "
+                        "block (imported_quantization_config: quant_method %s, scale_fmt %s, "
+                        "weight_block_size %s); they stay on gemm_nt\n",
+                qm ? qm : "-", sf ? sf : "-",
+                rad_meta_gets(meta, "imported_quantization_config.weight_block_size", "-"));
+        return false;
+    }
+    if (!rad_op_declared(b, kDenseF8)) {
+        fprintf(stderr, "radiance: deepseek41: RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8 is set, but no "
+                        "kernel library loaded declares %s; the dense linears stay on gemm_nt\n",
+                kDenseF8);
+        return false;
+    }
+    m.f8_skip.clear();
+    if (const char* x = std::getenv("RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8_EXCLUDE"))
+        for (const char* p = x; *p;) {
+            const char* e = std::strchr(p, ',');
+            const size_t len = e ? (size_t)(e - p) : std::strlen(p);
+            if (len) m.f8_skip.emplace_back(p, len);
+            p += len + (e ? 1 : 0);
+        }
+    return true;
+}
+
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
     if (!b || !meta || !ctx || ctx->is_draft || ctx->rank < 0 || ctx->rank >= MAX_RANKS)
         return RAD_E_INVAL;
@@ -2064,6 +2191,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.pfc = pf_env();
     naming = &m;
     DS_TRY(geometry(m, ctx));
+    m.f8_on = dense_f8_gate(b, meta, m);
     DS_TRY(dsp_config(b, m, meta, ctx));
     const auto& c = m.c;
     auto& g = m.g;
@@ -2231,6 +2359,20 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                 "sources, %lld experts top-%lld, Engram at %zu layers",
              (long long)c.n_layer, (long long)c.hc, (long long)c.window, c.kv_src.size(),
              c.idx_src.size(), (long long)c.n_expert, (long long)c.top_k, c.ple.size());
+    if (m.f8_on) {
+        /* In the server log, not only the graph dump: the A/B harness requires this line of an
+         * arm that sets the knob (ab_window.sh's F8 part). */
+        char msg[400];
+        std::snprintf(msg, sizeof msg,
+                      "deepseek41: rank %d: %d dense weights read by gemm_nt_bf16f8 "
+                      "(RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8): %.1f MiB of E4M3 codes where bf16 held "
+                      "%.1f MiB; %d left on gemm_nt%s",
+                      ctx->rank, m.f8_n, (double)m.f8_codes / 1048576.0,
+                      2.0 * (double)m.f8_codes / 1048576.0, m.f8_kept,
+                      m.f8_skip.empty() ? "" : " (some by RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8_EXCLUDE)");
+        fprintf(stderr, "radiance: %s\n", msg);
+        rad_note(b, "%s", msg);
+    }
     return RAD_OK;
 }
 

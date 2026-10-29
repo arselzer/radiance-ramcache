@@ -3263,6 +3263,10 @@ static const RadOpSchema kSchemas[] = {
            "logit) pairs and an id lane read as f32 is a denormal."),
     SCHEMA("gemm_nt", pGemmNt, oGemmNt,
            "C[M,N] = A[M,K] @ B[N,K]^T, unquantised."),
+    SCHEMA("gemm_nt_bf16f8", pGemmNt, oGemmNt,
+           "gemm_nt over a bf16 weight every 32x32 block of which is E4M3 codes times one power of "
+           "two: gemm_nt's bytes. The kernel stores the codes and an E8M0 exponent a block, and a "
+           "weight that is not exactly so is refused at load."),
     SCHEMA("gemm_nt_q", pGemmNtQ, oGemmNtQ,
            "C[M,N] = A[M,K] @ dequant(Bq)[N,K]^T. `dtype` names the operand COMBINATION, so one "
            "op covers w4a16 through mxfp4a8 and an architecture plugin that changes quant changes "
@@ -4711,6 +4715,12 @@ static const RadConstraint cGemmNt64[] = {
  * mostly clamped rows; those shapes (the GDN a|b at 48, the shared-expert gate at 1) stay skinny. */
 static const RadConstraint cGemmNtTiled[] = {
     C_GE("M", 65), C_LE("M", 65536), C_GE("N", 128), C_DIV("K", 64), C_IN("dtype", "bf16"),
+};
+/* gemm_nt_bf16f8's one row serves every M (the bf16 tiled row is byte-identical to the skinny
+ * one, so the skinny row's bytes are gemm_nt's at any height). Its stored form is whole 16-row
+ * tiles and 32-K blocks; the split law's K % (SK * 16) holds for every SK it picks. */
+static const RadConstraint cGemmNtBf16F8[] = {
+    C_LE("M", 65536), C_DIV("N", 16), C_DIV("K", 32), C_IN("dtype", "bf16"),
 };
 /* The dense integer kernels take their group from a build constant and read no `group` argument.
  * A declaration at another group gets no kernel rather than a silent 128. */
@@ -7706,6 +7716,21 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   nullptr, nullptr, r4d_rad_gemm_bf16_tiled, nullptr, nullptr, nullptr,
   r4d_shape_gemm_nt },
 
+/* NOTUNE: the split is always gemm_bf16_nt_m64's law at its own arguments (cfg_for at the axis
+ * defaults, which untuned bf16 rows get too), so a tune row or pin for this name cannot move it
+ * away from the bf16 rows'. */
+{ "gemm_bf16f8_nt_m64", "gemm_nt_bf16f8", "gemm",
+  "gemm_bf16_nt_m64 over the weight stored as E4M3 codes and an E8M0 exponent a 32x32 block, "
+  "expanded in registers to the same bf16 operand: half the weight bytes a k step",
+  "any M -- MT row tiles a block and grid.y covers the rest; N a multiple of 16, K of 32; the "
+  "split is gemm_bf16_nt_m64's law",
+  "bf16 A / C, a bf16 weight held as E4M3 x 2^(s-127), fp32 accumulate. BYTE-IDENTICAL to "
+  "gemm_bf16_nt_m64: the same WMMA operands and sequence, split and reduction",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_GEMM_SKINNY,
+  ROW(cGemmNtBf16F8), NOTUNE,
+  nullptr, nullptr, r4d_rad_gemm_bf16f8_m64, nullptr, r4d_rad_layout_bf16f8,
+  r4d_rad_relayout_bf16f8, r4d_shape_gemm_nt, r4d_rad_unrelayout_bf16f8 },
+
 { "gemm_w4a16_nt_m64", "gemm_nt_q", "gemm",
   "skinny GEMM with a 4-bit weight, 16x16x16 WMMA, split-K reduced in LDS",
   "M <= 64; N a multiple of 16; K divisible by SK*128; weight pre-permuted into fragment order",
@@ -10122,6 +10147,8 @@ extern "C" int rad_kernel_chain(int i) {
         "gemm_fp8a8_nt_m16", "gemm_fp8a8_gated_nt_m16",
         "gemm_i8a8_nt_m16", "quant_act_fp8", "rmsnorm_bf16", "add_rmsnorm_bf16",
         "gemm_bf16_nt_m16", "gemm_bf16_nt_m64", "dflash_conv_t2_g16_bf16",
+        /* gemm_nt_bf16f8, the bf16 skinny row's chain over its stored form */
+        "gemm_bf16f8_nt_m64",
         "ar_oneshot_4rank_exact", "ar_twoshot_4rank_exact",
         /* the decode tail: the embedding, the sampled rows' gather, the lm_head's WMMA pass (the
          * matvec below three rows stays plain) and the soft-cap */

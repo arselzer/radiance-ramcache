@@ -278,8 +278,14 @@ void HostExpertPool::tile(Slot& s, uint32_t gen, int k) {
         for (int r = 0; r <= s.job.more; ++r) { xs[r] = r ? s.job.xs[r - 1] : s.job.x; ys[r] = s.gate_up[r]; }
         ds41hx::gemv_avx2_rows(m, xs, ys, 1 + s.job.more, k * kTile, (k + 1) * kTile);
         if (s.gu_left.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            /* The job's down tiles wait for this, so it runs eight values a step (12 -> ~2 us a
+             * row); RADIANCE_EXPERIMENTAL_DS41_SWIGLU_SCALAR=1 keeps the scalar loop (an A/B switch). */
+            static const bool scalar = [] {
+                const char* v = std::getenv("RADIANCE_EXPERIMENTAL_DS41_SWIGLU_SCALAR");
+                return v && !std::strcmp(v, "1");
+            }();
             for (int r = 0; r <= s.job.more; ++r)
-                ds41hx::swiglu(silu_.data(), s.gate_up[r], s.act[r], kFf, limit_);
+                (scalar ? ds41hx::swiglu : ds41hx::swiglu_avx2)(silu_.data(), s.gate_up[r], s.act[r], kFf, limit_);
             s.open.store(gen, std::memory_order_release);
             wake();   /* workers that slept through the gate_up tail take down tiles too */
         }
@@ -298,10 +304,29 @@ void HostExpertPool::tile(Slot& s, uint32_t gen, int k) {
     if (s.dn_left.fetch_sub(1, std::memory_order_acq_rel) != 1) return;
     /* The job's last tile: nothing reads the slot after this. */
     Ticket* t = s.ticket;
-    backlog_.fetch_sub(s.job.cost, std::memory_order_relaxed);
+    drained(backlog_.fetch_sub(s.job.cost, std::memory_order_relaxed) - s.job.cost);
     s.state.store(0, std::memory_order_release);
     t->left.fetch_sub(1, std::memory_order_acq_rel);
     slot_cv_.notify_one();
+}
+
+void HostExpertPool::drained(int64_t left) {
+    if (left > 0) return;
+    std::atomic_thread_fence(std::memory_order_seq_cst);   /* against wait_idle's count, then check */
+    if (quiet_waiters_.load(std::memory_order_relaxed) == 0) return;
+    std::lock_guard<std::mutex> lk(quiet_mu_);
+    quiet_cv_.notify_all();
+}
+
+void HostExpertPool::wait_idle(int64_t max_ns) {
+    if (max_ns <= 0 || backlog_.load(std::memory_order_relaxed) <= 0) return;
+    std::unique_lock<std::mutex> lk(quiet_mu_);
+    quiet_waiters_.fetch_add(1);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    quiet_cv_.wait_for(lk, std::chrono::nanoseconds(max_ns), [&] {
+        return backlog_.load(std::memory_order_relaxed) <= 0 || stop_.load(std::memory_order_relaxed);
+    });
+    quiet_waiters_.fetch_sub(1);
 }
 
 void HostExpertPool::worker(int i, int cpu) {

@@ -786,6 +786,14 @@ struct LinearFP8 {
      * request (an encoder's) says so, which lets placement keep it off the card. Set before
      * declare(). */
     int        access  = RAD_ACCESS_PER_TOKEN;
+    /* Set before declare(): the op the bf16 branch declares in place of `gemm_nt` where a library
+     * serves it, with gemm_nt's schema, parameters and bytes over another stored form of the same
+     * weight (libr4d's `gemm_nt_bf16f8`, for a weight the caller knows is FP8-sourced). Declared
+     * only for a plain bf16 weight whose every cut is whole 32x32 blocks, so the op's own layout
+     * check refuses nothing at declare; unresolved, `gemm_nt` runs as before. Null: `gemm_nt`.
+     * `bf16_alt` says whether it took. */
+    const char* bf16_op = nullptr;
+    bool        bf16_alt = false;
 
     /* Declares the name map and reads the weight's format (reads_x, probed_i8). `base` and `src`
      * are the same as for declare(). */
@@ -1184,6 +1192,26 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
         w = decl_w_n(b, wn, RAD_BF16, { N, K }, access, shard, grp, 0, rp.w, rp.n);
         if (!w) return RAD_E_INVAL;
         if (span_hi > 0) RAD_ARCH_TRY(rad_weight_shard_span(b, w, span_lo, span_hi));
+        /* bf16_op: every 32x32 block of this rank's plane must be one of the container's, so the
+         * rows in 16s and K in 32s, a row split and its parts' seams on 32 rows, a slice's ends
+         * on 32. */
+        bf16_alt = false;
+        if (bf16_op && plain && N % 16 == 0 && K % 32 == 0 && span_lo % 32 == 0 &&
+            span_hi % 32 == 0 && rad_op_declared(b, bf16_op)) {
+            bool whole = shard != RAD_SHARD_ROW || g.world <= 1 || N % 32 == 0;
+            for (int i = 0; i < rp.n; ++i) whole = whole && rp.w[i] % 32 == 0;
+            const rad_op h = whole ? RAD_OP(b, bf16_op,
+                                            RAD_PARAMS(RAD_RANGE("M", 1, max_rows > 0 ? max_rows : g.max_tok),
+                                                       RAD_INT("N", N), RAD_INT("K", K),
+                                                       RAD_STR("dtype", g.dtype)),
+                                            RAD_WEIGHTS(w))
+                                   : RAD_NULL_HANDLE;
+            if (h != RAD_NULL_HANDLE) {
+                op = rw(b, h, { a.x }, { y });
+                bf16_alt = true;
+                return RAD_OK;
+            }
+        }
         op = rw(b, RAD_OP(b, "gemm_nt",
                    RAD_PARAMS(RAD_RANGE("M", 1, max_rows > 0 ? max_rows : g.max_tok),
                               RAD_INT("N", N), RAD_INT("K", K), RAD_STR("dtype", g.dtype)),

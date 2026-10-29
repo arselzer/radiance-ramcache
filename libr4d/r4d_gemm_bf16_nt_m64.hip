@@ -20,6 +20,7 @@
 #include "r4d_gemm_args.h"
 #include "r4d_gdn_wmma.h"
 #include "r4d_chain.h"
+#include "r4d_gemm_m64_shared.h"
 #include <hip/hip_bf16.h>
 #include <cstdint>
 #include <stdexcept>
@@ -27,23 +28,8 @@
 #define R4D_GEMM64_MAX_M 65536
 #define WAVE32 32
 
-// A fragment from a base pointer plus a compile-time k step. With fragGo's 32-bit element offset,
-// LLVM re-derives a 64-bit address per fragment per step (a b64 shift and a carry-in add pair); a
-// constant step instead folds into the 13-bit immediate of global_load_b64 (32 bytes per k step,
-// so eight fit).
-//
-// The pointer is explicitly global: a plain pointer held in an array across iterations becomes
-// generic, so loads become flat_load_b64, which on gfx12 also increments dscnt and makes later LDS
-// waits wait on HBM. The element is a scalar because HIP's vector structs cannot be assigned from
-// an address-space-qualified source.
-typedef __attribute__((address_space(1))) const unsigned long long* r4d_gu2;
-
-__device__ __forceinline__ v8bf fragU(r4d_gu2 p, int u) {
-  union { unsigned long long w[2]; v8bf f; } x;
-  x.w[0] = p[4 * u];
-  x.w[1] = p[4 * u + 2];
-  return x.f;
-}
+// fragU, the fragment from a base pointer plus a compile-time k step, is in
+// r4d_gemm_m64_shared.h.
 
 // MT = row tiles per block, held as MT v8f accumulators (8 VGPRs each); grid.y covers the rest.
 // More amortises each weight fragment, fewer puts more blocks on the machine, so MT is tunable.
@@ -56,25 +42,12 @@ __device__ __forceinline__ void r4d_gemm_bf16_nt_m64_body(
     const unsigned short* __restrict__ A, const unsigned short* __restrict__ W,
     __hip_bfloat16* __restrict__ C, int M, int K, int N, int WV, int SK, int LDA, int LDC) {
   if (CHAIN) r4d_chain_wait();
-  extern __shared__ float red[];              // WV*SK*256 floats: one 16x16 tile per (column, split)
-  const int tid = threadIdx.x, wave = tid / WAVE32, lane = tid % WAVE32;
-  const int col_local = wave / SK, ksplit = wave % SK;
-  const int nt = blockIdx.x * WV + col_local;
-  const int n0 = nt * 16;
-  const int mt0 = blockIdx.y * MT;
-  const int Ks = K / SK, ksteps = Ks / 16, kbase = ksplit * Ks;
-
-  v8f acc[MT];
-#pragma unroll
-  for (int i = 0; i < MT; i++) acc[i] = (v8f)(0.f);
+  R4D_M64_WAVE_SETUP();   // r4d_gemm_m64_shared.h: tid, lane, n0, mt0, Ks, ksteps, kbase, acc, red
 
   // Row offsets as 32-bit element offsets, turned into pointers once below; as pointers, LLVM
   // would not keep the 64-bit stride math and the row clamp out of the loop.
   unsigned woff = rowGo((unsigned)K, n0, N - 1, lane) + (unsigned)kbase;
-  unsigned aoff[MT];
-#pragma unroll
-  for (int i = 0; i < MT; i++)
-    aoff[i] = rowGo((unsigned)LDA, (mt0 + i) * 16, M - 1, lane) + (unsigned)kbase;
+  R4D_M64_A_OFFSETS();    // aoff[MT]
 
   // Unrolled so the k step is a load immediate (the 13-bit field of global_load_b64) and the base
   // pointers advance once per KU steps; rolled, LLVM rebuilds a 64-bit address every step.
@@ -106,28 +79,9 @@ __device__ __forceinline__ void r4d_gemm_bf16_nt_m64_body(
     }
   }
 
-  // Reduce one row tile at a time, so LDS is WV*SK KiB regardless of MT. Every thread in the block
-  // shares the sum (one element per thread at SK=8); the order over splits is fixed.
-  const int slot = (col_local * SK + ksplit) * 256;
-  const int nthreads = WV * SK * WAVE32;
-#pragma unroll
-  for (int i = 0; i < MT; i++) {
-    __syncthreads();
-#pragma unroll
-    for (int e = 0; e < 8; e++) red[slot + e * WAVE32 + lane] = acc[i][e];   // conflict-free
-    __syncthreads();
-    for (int idx = tid; idx < WV * 256; idx += nthreads) {
-      const int col = idx >> 8, off = idx & 255;
-      float v = 0.f;
-      for (int s = 0; s < SK; s++) v += red[(col * SK + s) * 256 + off];
-      const int l = off & 31;
-      const int n = (blockIdx.x * WV + col) * 16 + (l & 15);
-      const int m = (mt0 + i) * 16 + 8 * (l >> 4) + (off >> 5);
-      // The language's float-to-bf16 conversion on purpose; the header's f2bf rounds half away
-      // from zero.
-      if (n < N && m < M) C[(size_t)m * LDC + n] = (__hip_bfloat16)v;
-    }
-  }
+  // Reduce one row tile at a time through LDS, splits summed in split order from 0.f, and store
+  // with the language's float-to-bf16 conversion (r4d_gemm_m64_shared.h).
+  R4D_M64_REDUCE_STORE();
   if (CHAIN) r4d_chain_done();
 }
 

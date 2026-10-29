@@ -732,6 +732,13 @@ private:
      * the hold is spent, or the chunk would wait as long as the decoders keep stepping ahead. */
     int64_t interleave_left_ = 0;
     int64_t held_prefill_ = 0;
+    /* RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE=1 (read at init): a prefill chunk gets a step of
+     * its own when decode rows would otherwise leave it under the chunk quantum, so concurrent
+     * requests decode together instead of one after another (see step()). pf_skipped_: decode
+     * rows the last step() left out for a chunk; step_next_locked issues nothing ahead of such a
+     * step, since the step after it must bring them back. */
+    int     prefill_alone_ = 0;
+    int64_t pf_skipped_ = 0;
     /* The throughput window (step_finished): each kind's tokens and the wall time the steps
      * covered, both decayed with the same time constant, so their ratio is tokens over time. */
     double  tps_win_prefill_ = 0.0, tps_win_decode_ = 0.0, tps_win_time_ = 0.0;

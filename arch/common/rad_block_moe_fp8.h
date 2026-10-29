@@ -192,6 +192,10 @@ struct MoeFP8 {
         int     swiglu_quant = 0;
         /* A shared arm without its sigmoid gate: the gate plane is filled with 1. */
         int     shared_ungated = 0;
+        /* A bf16 shared arm's GEMMs as this op in place of `gemm_nt` where a library serves it
+         * (LinearFP8::bf16_op: the same schema and bytes over another stored form of the
+         * weights). Null: `gemm_nt`. */
+        const char* shared_bf16_op = nullptr;
         /* At TP1 the caller may fill the ungated arm's ones plane once for the whole step,
          * rather than each layer/pass filling the same plane again. */
         int     shared_one_external = 0;
@@ -1468,6 +1472,7 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         sgate_concurrent = true;
         /* gate/up rows and down columns of this rank's slice (even, or Config's uneven split); the
          * gate/up row parts stay, as a property of the stacked checkpoint tensor. */
+        sh_gate_up.bf16_op = sh_down.bf16_op = c.shared_bf16_op;
         RAD_ARCH_TRY(sh_gate_up.declare(b, nm, g, nm.f("blk.%d.ffn_gate_up_shexp", l),
                                         2 * c.n_ff_shared, g.n_embd, RAD_SHARD_ROW, grp_layer(l),
                                         { shared_gate, shared_up },

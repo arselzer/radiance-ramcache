@@ -460,6 +460,8 @@ int  r4d_rad_ar_gather_hc_write_4rank(const RadArgs*, RadStream);
 int r4d_rad_gemm_bf16_m16   (const RadArgs*, RadStream);
 int r4d_rad_gemm_bf16_m64   (const RadArgs*, RadStream);
 int r4d_rad_gemm_bf16_tiled (const RadArgs*, RadStream);
+/* gemm_nt_bf16f8 (r4d_gemm_bf16f8_nt_m64.hip): gemm_bf16_nt_m64's bytes from the bf16f8 store. */
+int r4d_rad_gemm_bf16f8_m64 (const RadArgs*, RadStream);
 int r4d_rad_gemm_w4a16_m64  (const RadArgs*, RadStream);
 int r4d_rad_gemm_w5a16_m64  (const RadArgs*, RadStream);
 int r4d_rad_gemm_w4a16asym_m64(const RadArgs*, RadStream);
@@ -622,6 +624,9 @@ R4D_HOOKS(w4)
 R4D_HOOKS(w2a8)
 R4D_HOOKS(moe_w4)
 R4D_HOOKS(moe_w4_mod4)
+/* gemm_nt_bf16f8's E4M3 codes and E8M0 32x32 exponents from a plain bf16 weight (r4d_layout.cpp,
+ * r4d_bf16f8_layout.h): refused at load unless every element re-encodes exactly. */
+R4D_HOOKS(bf16f8)
 #undef R4D_HOOKS
 int r4d_rad_layout_fp8_rowmajor(const RadParam*, int, int, const RadEncoding*, const int*,
                                 const RadTensor*, int, RadLayout*);

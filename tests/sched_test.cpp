@@ -6907,3 +6907,74 @@ TEST(fixed_verify_cap_zero_is_the_same_runtime_off_and_preserves_declared_depth)
         CHECK(x.target_pipelining(true,false,false,5));
     }
 }
+
+/* RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE. DeepSeek-V4.1 is served with the budget at the chunk
+ * quantum (--max-num-batched-tokens 16 against a 16-token attention block), so a decode row ahead
+ * of a chunk leaves it under the quantum. Without the switch a request arriving while another
+ * decodes waits until that one has finished, however many --max-num-seqs admits; with it, each of
+ * its chunks runs in a step of its own, the decode rows wait for it, and the two then decode
+ * together. Every step is one prefill chunk alone, cut as an idle server cuts it, or decode rows
+ * only; nothing is issued ahead of a step that left a decode row out. */
+namespace {
+struct PfAloneRun {
+    int  together = 0;          /* steps carrying both sequences' decode rows */
+    bool pure = true;           /* every step one chunk alone, or decode rows only */
+    bool ahead_refused = true;  /* step_next refused after every step that left a row out */
+    std::vector<int32_t> b_chunks;
+    size_t a_out = 0, b_out = 0;
+};
+void pf_alone_run(bool on, PfAloneRun& out) {
+    Fixture f;
+    f.build(/*blocks=*/4096, /*states=*/64, /*max_tok=*/16, /*max_ctx=*/512, /*windowed=*/false,
+            /*linear=*/false);
+    f.cfg.max_seqs = 4;
+    f.cfg.prefix_cache = false;
+    if (on) setenv("RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE", "1", 1);
+    else unsetenv("RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE");
+    const int rc = f.start();
+    unsetenv("RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE");
+    CHECK_OK(rc);
+    f.sch.set_stage_rows(16);
+    CHECK_EQ(f.sch.geometry().quantum, 16);
+    const uint64_t a = f.submit(40, 12);
+    for (int k = 0; k < 3; ++k) { REQUIRE(f.sch.step() != nullptr); f.commit_plain(11); }
+    CHECK_EQ(f.sch.find(a)->output.size(), (size_t)1);   /* a decodes from here */
+    const uint64_t b = f.submit(40, 12);
+    for (int k = 0; k < 60; ++k) {
+        if (!f.sch.step()) break;
+        const StepPlan& p = f.sch.plan();
+        int pf = 0, dec = 0;
+        bool a_dec = false, b_dec = false;
+        for (const StepEntry& e : p.e) {
+            if (e.is_prefill) { ++pf; if (e.seq == b) out.b_chunks.push_back(e.n_tokens); }
+            else { ++dec; a_dec |= e.seq == a; b_dec |= e.seq == b; }
+        }
+        if (pf && (pf > 1 || dec)) out.pure = false;
+        if (a_dec && b_dec) ++out.together;
+        Request* ra = f.sch.find(a);
+        Request* rb = f.sch.find(b);
+        if (ra) ra->speculation_fixed = true;
+        if (rb) rb->speculation_fixed = true;
+        const bool left_out = ra && rb && pf == 1 && f.sch.running(a) && !a_dec;
+        if (left_out && f.sch.step_next() != nullptr) out.ahead_refused = false;
+        f.commit_plain(12);
+        if (f.sch.find(a)) out.a_out = f.sch.find(a)->output.size();
+        if (f.sch.find(b)) out.b_out = f.sch.find(b)->output.size();
+    }
+}
+}  /* namespace */
+
+TEST(prefill_alone_lets_a_second_request_decode_beside_the_first) {
+    PfAloneRun off, on;
+    pf_alone_run(false, off);
+    CHECK_EQ(off.together, 0);                       /* one after another */
+    pf_alone_run(true, on);
+    CHECK(on.together >= 8);
+    CHECK(on.pure);
+    CHECK(on.ahead_refused);
+    /* b's prompt is cut as an idle server cuts it: 16, 16, 8 */
+    CHECK(on.b_chunks == std::vector<int32_t>({ 16, 16, 8 }));
+    CHECK(off.b_chunks == std::vector<int32_t>({ 16, 16, 8 }));
+    CHECK_EQ(on.a_out, (size_t)12);
+    CHECK_EQ(on.b_out, (size_t)12);
+}

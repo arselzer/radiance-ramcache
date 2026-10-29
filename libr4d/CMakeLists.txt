@@ -134,6 +134,9 @@ set(R4D_UNITS
   "r4d_gemm_bf16_nt_m16|"
   "r4d_gemm_bf16_nt_m64|"
   "r4d_gemm_bf16_nt_tiled|"
+  # gemm_bf16_nt_m64 over a bf16 weight stored as E4M3 codes and E8M0 32x32 exponents
+  # (gemm_nt_bf16f8): the same bytes from half the weight bytes.
+  "r4d_gemm_bf16f8_nt_m64|"
   "r4d_gemm_w4a16_nt_m64|"
   "r4d_gemm_w5a16_nt_m64|"
   "r4d_gemm_wpa8i8_tiled|"

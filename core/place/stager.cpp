@@ -37,9 +37,13 @@ std::vector<StagedLayer> routed_layers(const Plan& plan, Take take, size_t* clas
     return out;
 }
 
-/* Demand reads of missed units in flight, over every rank's stager (they share the drive): the
- * read-ahead starts no read while any is (FileStager::hx_pf_loop). */
-std::atomic<int> hx_demand_reads{ 0 };
+/* Demand reads of missed units in flight, over every rank's stager (they share the drive), are
+ * PieceReader::process()'s count: the read-ahead starts no read while any is (hx_pf_loop polls it,
+ * the piece readers sleep on it). */
+
+/* ..._PREFETCH=pieces: the stagers a finished prediction goes to, every rank's (hx_ra_ready). */
+std::mutex g_ra_mu;
+std::vector<FileStager*> g_ra_stagers;
 
 }  /* namespace */
 
@@ -503,6 +507,20 @@ FileStager::~FileStager() {
         for (PfBatch& b : hx_pf_batch_) b.entries.clear();
         hx_pf_queue_.clear();
     }
+    if (hx_ra_) {
+        /* No prediction reaches this stager from here on, and no reader touches its units or their
+         * buffers once forget returns; then the units give their buffers back to hx_planes_free_. */
+        {
+            std::lock_guard<std::mutex> lk(g_ra_mu);
+            g_ra_stagers.erase(std::remove(g_ra_stagers.begin(), g_ra_stagers.end(), this),
+                               g_ra_stagers.end());
+        }
+        hx_ra_->forget(this);
+        std::lock_guard<std::mutex> lk(hx_ra_mu_);
+        hx_ra_live_.clear();
+        hx_ra_here_.clear();
+        hx_miss_ra_.clear();
+    }
     hx_drain();
     if (!hx_bg_.empty()) {
         {
@@ -649,6 +667,10 @@ bool FileStager::begin_pass(const RadBatch* b) {
     hx_defer_li_ = -1;
     ++trace_pass_;
     routed_ = counts_host_ && b->n_tok > 0 && b->n_tok <= kRoutedRows;
+    if (hx_ra_) {   /* predictions for this pass may come; units of earlier ones are stale */
+        hx_ra_at_.store((uint64_t)trace_pass_ << 32, std::memory_order_release);
+        hx_ra_drop_stale(trace_pass_, -1);
+    }
     return true;
 }
 
@@ -734,7 +756,7 @@ int FileStager::start_ep_routed(int32_t li, RadStream s, bool* read) {
      * cache leases go back now, not when a window next comes round (Mover::retire_file_windows). */
     if (hx) RAD_TRY(mover_->retire_file_windows());
     const auto t_retired = std::chrono::steady_clock::now();
-    if (hx && hx_pred_ && pass_tok_ == 1 && plan_->rank == 0)
+    if (hx && hx_pred_ && pass_tok_ == 1 && plan_->rank == 0 && !hx_pred_->pieces())
         hx_pred_->post(trace_pass_, L.layer, hx_x_);
     int64_t total = 0;
     if (!ep_route_counts_valid(v, counts_host_, counts_cap_, &total)) {
@@ -770,12 +792,19 @@ int FileStager::start_ep_routed(int32_t li, RadStream s, bool* read) {
     }
     /* The selected units the CPU computes leave want_ and start on the pool before the drive
      * reads below block this thread (host_expert_pool.h). */
-    auto t_chosen = t_retired, t_submitted = t_retired;
+    auto t_chosen = t_retired, t_submitted = t_retired, t_posted = t_retired;
     if (hx) {
         hx_choose(li);
         t_chosen = std::chrono::steady_clock::now();
         if (hx_li_ == li) RAD_TRY(hx_submit());
         t_submitted = std::chrono::steady_clock::now();
+        t_posted = t_submitted;
+        /* Pieces mode: the prediction of layer L+2 once this layer's CPU work is out, so the
+         * predictor's thread does not compete with the pool's wake-up. */
+        if (hx_ra_ && hx_pred_ && pass_tok_ == 1 && plan_->rank == 0) {
+            hx_pred_->post(trace_pass_, L.layer, hx_x_);
+            t_posted = std::chrono::steady_clock::now();
+        }
     }
     /* This layer took its read-ahead entries: now the next layer's (predicted from this one). */
     if (hx && hx_pf_.joinable() && pass_tok_ == 1) hx_pf_target(li + hx_pf_ahead_);
@@ -786,6 +815,7 @@ int FileStager::start_ep_routed(int32_t li, RadStream s, bool* read) {
         ep_stats_.d_retire_ns += ns(t_counts, t_retired);
         ep_stats_.d_choose_ns += ns(t_retired, t_chosen);
         ep_stats_.d_submit_ns += ns(t_chosen, t_submitted);
+        ep_stats_.d_post_ns += ns(t_submitted, t_posted);
         ep_stats_.d_decide_ns += ns(t_counts, t_stage);
     }
     const uint64_t relaid0 = mover_->stats().file_relaid;
@@ -803,8 +833,9 @@ int FileStager::start_ep_routed(int32_t li, RadStream s, bool* read) {
         const uint64_t ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
                                 std::chrono::steady_clock::now() - t_stage).count();
         /* The CPU path's drive reads count too (verify reads them on the card path as well). */
+        /* (Units read ahead whole were read before the layer.) */
         const uint64_t missed = mover_->stats().file_relaid - relaid0 +
-            (hx_li_ == li && hx_policy_ != kHxVerify ? 2 * (uint64_t)hx_miss_.size() : 0);
+            (hx_li_ == li && hx_policy_ != kHxVerify ? 2 * (uint64_t)(hx_miss_.size() - (size_t)hx_ra_handed_) : 0);
         ep_stats_.stage_ns += ns;
         if (missed) { ++ep_stats_.miss_layers; ep_stats_.miss_stage_ns += ns; }
         if (pass_tok_ == 1) {
@@ -1069,10 +1100,53 @@ int FileStager::hx_init_impl(const Program& prog) {
             return mover_->read_weight_file(w, dst);
         }))
         hx_pred_ = nullptr;
-    if (hx_pred_ && !hx_pred_->shadow() && hx_miss_rows_ > 0 && !hx_pf_.joinable()) {
+    if (hx_pred_ && !hx_pred_->shadow() && !hx_pred_->pieces() && hx_miss_rows_ > 0 &&
+        !hx_pf_.joinable()) {
         hx_pf_ahead_ = hx_pred_->ahead();
         hx_pf_stop_ = false;
         hx_pf_ = std::thread(&FileStager::hx_pf_loop, this);
+    }
+    /* Read-ahead in pieces (stager.h, readahead.h): the process's readers, this rank's tables, and
+     * the predictor's callback. */
+    if (hx_pred_ && hx_pred_->pieces() && hx_miss_rows_ > 0 && !hx_ra_) {
+        int qd = 4, live = 8;
+        int64_t piece_kb = 512;
+        if (const char* q = std::getenv("RADIANCE_EXPERIMENTAL_DS41_PREFETCH_QD"); q && *q)
+            qd = std::clamp(std::atoi(q), 1, 8);
+        if (const char* b = std::getenv("RADIANCE_EXPERIMENTAL_DS41_PREFETCH_PIECE_KB"); b && *b)
+            piece_kb = std::clamp<int64_t>(std::atoll(b), 64, 16384) / 4 * 4;
+        if (const char* l = std::getenv("RADIANCE_EXPERIMENTAL_DS41_PREFETCH_LIVE"); l && *l)
+            live = std::clamp(std::atoi(l), 1, 64);
+        const char* fin = std::getenv("RADIANCE_EXPERIMENTAL_DS41_PREFETCH_FINISH");
+        hx_ra_finish_ = !fin || std::strcmp(fin, "0") != 0;
+        PieceReader& r = PieceReader::process();
+        if (!r.start(qd, piece_kb << 10)) {
+            if (plan_->rank == 0)
+                RAD_WARN("read-ahead: the piece readers did not start (%d readers, %lld KiB pieces); "
+                         "no read-ahead", qd, (long long)piece_kb);
+        } else {
+            hx_ra_li_.assign(RouterPredictor::kLayers, -1);
+            for (size_t li = 0; li < layers_.size(); ++li)
+                if (layers_[li].layer >= 0 && layers_[li].layer < RouterPredictor::kLayers)
+                    hx_ra_li_[(size_t)layers_[li].layer] = (int32_t)li;
+            hx_ra_ok_.assign(plan_->units.size(), 0);
+            for (const Layer& L : layers_)
+                for (int32_t u : L.units) hx_ra_ok_[(size_t)u] = mover_->host_planes_eligible(u);
+            hx_ra_cap_ = live;
+            hx_ra_at_.store(0, std::memory_order_release);
+            hx_ra_ = &r;
+            {
+                std::lock_guard<std::mutex> lk(g_ra_mu);
+                g_ra_stagers.push_back(this);
+            }
+            hx_pred_->on_ready(&FileStager::hx_ra_ready, nullptr);
+            if (plan_->rank == 0)
+                RAD_INFO("read-ahead: each rank's uncached units among layer L+2's top %d predicted "
+                         "experts are read at layer L in %lld KiB pieces, %d readers over the process, "
+                         "yielding to demand reads; at most %d live units a rank; a partly read unit "
+                         "its layer needs is %s", hx_pred_->k(), (long long)(r.piece_bytes() >> 10),
+                         r.readers(), live, hx_ra_finish_ ? "finished by the readers" : "read afresh");
+        }
     }
     if (hx_miss_rows_ > 0 && hx_bg_.empty()) {
         hx_bg_stop_ = false;
@@ -1136,7 +1210,11 @@ void FileStager::hx_choose(int32_t li) {
     hx_reserved_ = 0;
     hx_miss_.clear();
     hx_miss_ready_.clear();
+    hx_miss_ra_.clear();
+    hx_ra_handed_ = 0;
     hx_slot_.assign(want_.size(), -1);
+    const bool ra = hx_ra_ && pass_tok_ == 1;   /* read-ahead in pieces: this layer's units */
+    if (ra) hx_ra_begin(li);
     const double cb = hx_pool_->cpu_bytes_per_ns(), lb = hx_pool_->link_bytes_per_ns();
     const bool misses = hx_miss_rows_ > 0 && pass_tok_ <= hx_miss_rows_;
     int64_t link = 0;
@@ -1152,6 +1230,9 @@ void FileStager::hx_choose(int32_t li) {
             }
             if (hu->n == 2 && gu && dn) {
                 hx_slot_[i] = hx_n_++;
+                if (ra)
+                    for (RaEntry& r : hx_ra_here_)
+                        if (r.u && r.unit == u) hx_ra_drop(r, true);
                 continue;
             }
             mover_->release_host_unit(hu);
@@ -1165,6 +1246,8 @@ void FileStager::hx_choose(int32_t li) {
             /* Read ahead for this layer? Take it, waiting while its read is in flight; one whose
              * read has not begun is read below as any miss (the read-ahead then skips it). */
             std::shared_ptr<Mover::HostPlanes> ahead;
+            std::shared_ptr<ReadAheadUnit> urgent;
+            bool ready = false;
             if (hx_pf_.joinable()) {
                 std::unique_lock<std::mutex> lk(hx_pf_mu_);
                 PfBatch& pb = hx_pf_batch_[li & 1];
@@ -1187,9 +1270,13 @@ void FileStager::hx_choose(int32_t li) {
                             pe.p.reset();
                             break;
                         }
+                if (ahead) ++hx_stats_.pf_used;
+                ready = ahead != nullptr;
+            } else if (ra) {
+                ahead = hx_ra_take(u, &ready, &urgent);
             }
-            if (ahead) ++hx_stats_.pf_used;
-            hx_miss_ready_.push_back(ahead ? 1 : 0);
+            hx_miss_ready_.push_back(ready ? 1 : 0);
+            if (hx_ra_) hx_miss_ra_.push_back(std::move(urgent));
             hx_miss_.push_back(ahead ? ahead : hx_planes_get(u));
             const int rows = e >= 0 && e < counts_cap_ ? std::max<int32_t>(counts_host_[e], 1) : 1;
             hx_pool_->reserve(HostExpertPool::cost_rows(rows));
@@ -1198,8 +1285,12 @@ void FileStager::hx_choose(int32_t li) {
         }
         link += plan_->units[(size_t)u].bytes;
     }
+    if (ra) {   /* the layer's units it did not select */
+        for (RaEntry& r : hx_ra_here_) hx_ra_drop(r, false);
+        hx_ra_here_.clear();
+    }
     /* The predictor's guess for this layer, made one layer ago, against what the layer misses. */
-    if (hx_pred_ && pass_tok_ == 1) {
+    if (hx_pred_ && pass_tok_ == 1 && !hx_pred_->pieces()) {
         ++hx_stats_.pred_layers;
         int32_t g[RouterPredictor::kMaxK];
         if (hx_pred_->predicted(trace_pass_, layers_[(size_t)li].layer, g)) {
@@ -1450,19 +1541,31 @@ void FileStager::hx_mw_loop() {
 /* Reads the misses' planes (rows: the pass's tokens) and submits their jobs to the pool. */
 int FileStager::hx_submit_misses_now(int rows) {
     std::vector<Mover::HostPlanes*> ptrs;
-    for (size_t i = 0; i < hx_miss_.size(); ++i)
-        if (i >= hx_miss_ready_.size() || !hx_miss_ready_[i]) ptrs.push_back(hx_miss_[i].get());
+    bool urgent = false;   /* units the piece readers are finishing for this layer */
+    for (size_t i = 0; i < hx_miss_.size(); ++i) {
+        if (i < hx_miss_ra_.size() && hx_miss_ra_[i]) urgent = true;
+        else if (i >= hx_miss_ready_.size() || !hx_miss_ready_[i]) ptrs.push_back(hx_miss_[i].get());
+    }
     const auto t0 = std::chrono::steady_clock::now();
-    if (!ptrs.empty()) {
-        /* A demand read in flight: every rank's read-ahead holds back (hx_pf_loop). */
-        hx_demand_reads.fetch_add(1, std::memory_order_acq_rel);
-        const bool ok = mover_->read_unit_planes(ptrs.data(), (int)ptrs.size(), rows);
-        hx_demand_reads.fetch_sub(1, std::memory_order_acq_rel);
+    if (!ptrs.empty() || urgent) {
+        /* A demand read in flight: every rank's read-ahead holds back (hx_pf_loop, readahead.h).
+         * The urgent units' last pieces are part of it. */
+        PieceReader& demand = PieceReader::process();
+        demand.demand_enter();
+        bool ok = ptrs.empty() || mover_->read_unit_planes(ptrs.data(), (int)ptrs.size(), rows);
+        if (ok && urgent) ok = hx_ra_settle(rows);
+        demand.demand_leave();
         if (!ok) {
             RAD_ERR("host experts: reading layer %d's missed units for the CPU failed",
                     layers_[(size_t)hx_li_].layer);
             return RAD_E_IO;
         }
+    }
+    /* Units read ahead whole: handed over only from the container the program was loaded from. */
+    if (hx_ra_handed_ > 0 && !mover_->source_epochs_current()) {
+        RAD_ERR("host experts: the container changed under layer %d's units read ahead",
+                layers_[(size_t)hx_li_].layer);
+        return RAD_E_IO;
     }
     hx_stats_.miss_read_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
                                   std::chrono::steady_clock::now() - t0).count();
@@ -1582,7 +1685,7 @@ void FileStager::hx_pf_loop() {
             if (b->seq != seq || hx_pf_stop_) break;
             lk.unlock();
             const auto y0 = std::chrono::steady_clock::now();
-            while (hx_demand_reads.load(std::memory_order_acquire) > 0 &&
+            while (PieceReader::process().demand_count() > 0 &&
                    std::chrono::steady_clock::now() - y0 < std::chrono::milliseconds(2))
                 std::this_thread::sleep_for(std::chrono::microseconds(20));
             const uint64_t yield_ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1608,6 +1711,183 @@ void FileStager::hx_pf_loop() {
     }
 }
 
+/* ---- read-ahead in pieces (stager.h, readahead.h) ---------------------------------------------- */
+
+/* On the predictor's thread: layer `layer`'s prediction to every rank's stager. */
+void FileStager::hx_ra_ready(void*, uint32_t pass, int layer, const int32_t* experts, int k) {
+    std::lock_guard<std::mutex> lk(g_ra_mu);
+    for (FileStager* s : g_ra_stagers) s->hx_ra_plan(pass, layer, experts, k);
+}
+
+int FileStager::hx_ra_read(void* ctx, const PlaneExtent& p) {
+    return static_cast<Mover*>(ctx)->read_piece(p.file, p.off, p.len, p.dst, p.cap);
+}
+
+namespace {
+/* hx_ra_at_'s pass and routed layer. */
+inline bool ra_too_late(uint64_t at, uint32_t pass, int32_t li) {
+    const uint32_t at_pass = (uint32_t)(at >> 32);
+    const int32_t at_li = (int32_t)(uint32_t)at - 1;
+    return (int32_t)(pass - at_pass) < 0 || (pass == at_pass && li <= at_li);
+}
+}  /* namespace */
+
+/* On the predictor's thread: this rank's predicted experts of `layer` that are on its file tier,
+ * readable by the CPU path and not in the RAM cache, laid out in planes buffers and queued for the
+ * readers, best prediction first. Only the plan, the program, the cache's own lock and the free
+ * list are touched here, never what the issuing thread writes. */
+void FileStager::hx_ra_plan(uint32_t pass, int layer, const int32_t* g, int k) {
+    if (!hx_ra_ || layer < 0 || layer >= (int)hx_ra_li_.size()) return;
+    const int32_t li = hx_ra_li_[(size_t)layer];
+    if (li < 0 || (size_t)li >= hx_unit_of_.size()) return;
+    const int base = 96 * plan_->rank;
+    for (int pos = 0; pos < k; ++pos) {
+        const int e = g[pos] - base;
+        if (e < 0 || e >= 96) continue;
+        const int32_t u = hx_unit_of_[(size_t)li][(size_t)e];
+        if (u < 0 || (size_t)u >= hx_ra_ok_.size() || !hx_ra_ok_[(size_t)u] || mover_->unit_cached(u))
+            continue;
+        {
+            std::lock_guard<std::mutex> lk(hx_ra_mu_);
+            if (ra_too_late(hx_ra_at_.load(std::memory_order_acquire), pass, li)) {
+                ++hx_stats_.ra_late;
+                return;
+            }
+            if ((int)hx_ra_live_.size() >= hx_ra_cap_) {
+                ++hx_stats_.ra_capped;
+                return;
+            }
+            bool dup = false;
+            for (const RaEntry& r : hx_ra_live_) dup = dup || (r.pass == pass && r.li == li && r.unit == u);
+            if (dup) continue;
+        }
+        std::shared_ptr<Mover::HostPlanes> p = hx_planes_get(u);
+        PlaneExtent ext[2];
+        if (!mover_->lay_out_unit_planes(p.get(), ext) || !mover_->source_epochs_current()) continue;
+        auto ra = std::make_shared<ReadAheadUnit>(
+            this, ((uint64_t)pass << 24) | ((uint64_t)layer << 8) | (uint64_t)pos, ext, 2,
+            hx_ra_->piece_bytes(), &FileStager::hx_ra_read, mover_, p);
+        {
+            std::lock_guard<std::mutex> lk(hx_ra_mu_);
+            /* The rank may have reached the layer while the unit was laid out. */
+            if (ra_too_late(hx_ra_at_.load(std::memory_order_acquire), pass, li)) {
+                ++hx_stats_.ra_late;
+                return;
+            }
+            hx_ra_live_.push_back(RaEntry{ ra, p, pass, li, u });
+            ++hx_stats_.ra_planned;
+        }
+        hx_ra_->submit(std::move(ra));
+    }
+}
+
+void FileStager::hx_ra_drop_stale(uint32_t pass, int32_t li) {
+    std::vector<RaEntry> stale;
+    {
+        std::lock_guard<std::mutex> lk(hx_ra_mu_);
+        for (size_t i = 0; i < hx_ra_live_.size();) {
+            const RaEntry& e = hx_ra_live_[i];
+            if ((int32_t)(e.pass - pass) < 0 || (e.pass == pass && e.li <= li)) {
+                stale.push_back(std::move(hx_ra_live_[i]));
+                if (i + 1 < hx_ra_live_.size()) hx_ra_live_[i] = std::move(hx_ra_live_.back());
+                hx_ra_live_.pop_back();
+                continue;
+            }
+            ++i;
+        }
+    }
+    for (RaEntry& e : stale) {
+        hx_ra_->cancel(*e.u);
+        ++hx_stats_.ra_stale;
+        hx_stats_.ra_dropped_bytes += (uint64_t)e.u->bytes_in();
+    }
+}
+
+void FileStager::hx_ra_begin(int32_t li) {
+    hx_ra_at_.store(((uint64_t)trace_pass_ << 32) | (uint32_t)(li + 1), std::memory_order_release);
+    hx_ra_here_.clear();
+    {
+        std::lock_guard<std::mutex> lk(hx_ra_mu_);
+        for (size_t i = 0; i < hx_ra_live_.size();) {
+            if (hx_ra_live_[i].pass == trace_pass_ && hx_ra_live_[i].li == li) {
+                hx_ra_here_.push_back(std::move(hx_ra_live_[i]));
+                if (i + 1 < hx_ra_live_.size()) hx_ra_live_[i] = std::move(hx_ra_live_.back());
+                hx_ra_live_.pop_back();
+                continue;
+            }
+            ++i;
+        }
+    }
+    hx_ra_drop_stale(trace_pass_, li);   /* layers this rank passed without deciding them */
+}
+
+std::shared_ptr<Mover::HostPlanes> FileStager::hx_ra_take(int32_t u, bool* ready,
+                                                          std::shared_ptr<ReadAheadUnit>* urgent) {
+    *ready = false;
+    ++hx_stats_.ra_misses;
+    RaEntry* e = nullptr;
+    for (RaEntry& r : hx_ra_here_)
+        if (r.u && r.unit == u) { e = &r; break; }
+    if (!e) return nullptr;
+    ++hx_stats_.ra_miss_planned;
+    std::shared_ptr<ReadAheadUnit> ra = std::move(e->u);
+    std::shared_ptr<Mover::HostPlanes> p = std::move(e->p);
+    if (ra->whole()) {   /* every piece in: the epoch is checked before the jobs go out */
+        ++hx_stats_.ra_whole;
+        hx_stats_.ra_used_bytes += (uint64_t)ra->bytes_in();
+        ++hx_ra_handed_;
+        *ready = true;
+        return p;
+    }
+    /* No piece started: the layer reads it as any miss, into the buffers laid out for it. */
+    if (hx_ra_->take_whole(*ra)) {
+        ++hx_stats_.ra_fresh;
+        return p;
+    }
+    /* Barely started: the demand read with the plane mirror's share beats the container alone for
+     * the rest (or ..._PREFETCH_FINISH=0). A fresh buffer, since pieces in flight still land in
+     * this one. */
+    if (!hx_ra_finish_ || (int64_t)ra->started() * hx_ra_->piece_bytes() < mover_->decode_mirror_bytes()) {
+        hx_ra_->cancel(*ra);
+        ++hx_stats_.ra_fresh;
+        hx_stats_.ra_dropped_bytes += (uint64_t)ra->bytes_in();
+        return nullptr;
+    }
+    hx_ra_->make_urgent(*ra);
+    ++hx_stats_.ra_finished;
+    hx_stats_.ra_used_bytes += (uint64_t)ra->bytes_in();
+    *urgent = std::move(ra);
+    return p;
+}
+
+void FileStager::hx_ra_drop(RaEntry& e, bool hit) {
+    if (!e.u) return;
+    hx_ra_->cancel(*e.u);
+    ++(hit ? hx_stats_.ra_cached : hx_stats_.ra_unselected);
+    hx_stats_.ra_dropped_bytes += (uint64_t)e.u->bytes_in();
+    e.u.reset();
+    e.p.reset();
+}
+
+/* Inside the demand read: the urgent units' last pieces, then the units with a failed piece read
+ * again whole into fresh buffers, and the container's epoch. */
+bool FileStager::hx_ra_settle(int rows) {
+    std::vector<Mover::HostPlanes*> again;
+    for (size_t i = 0; i < hx_miss_ra_.size() && i < hx_miss_.size(); ++i) {
+        std::shared_ptr<ReadAheadUnit>& ra = hx_miss_ra_[i];
+        if (!ra) continue;
+        hx_stats_.ra_wait_ns += hx_ra_->wait(*ra);
+        if (!ra->whole()) {
+            ++hx_stats_.ra_refetched;
+            hx_miss_[i] = hx_planes_get(hx_miss_[i]->unit);
+            again.push_back(hx_miss_[i].get());
+        }
+        ra.reset();
+    }
+    if (!again.empty() && !mover_->read_unit_planes(again.data(), (int)again.size(), rows)) return false;
+    return mover_->source_epochs_current();
+}
+
 void FileStager::hx_bg_loop() {
     std::vector<uint8_t> scratch;
     bool told = false;
@@ -1619,6 +1899,13 @@ void FileStager::hx_bg_loop() {
         hx_bg_q_.pop_front();
         ++hx_bg_busy_;
         lk.unlock();
+        /* RADIANCE_EXPERIMENTAL_DS41_INSERT_YIELD_US=N: an insert streams ~37 MB through DRAM, which
+         * the pool's workers are bound by; it waits (asleep) up to N us for the pool to drain. */
+        static const int64_t yield_ns = [] {
+            const char* y = std::getenv("RADIANCE_EXPERIMENTAL_DS41_INSERT_YIELD_US");
+            return y && *y ? (int64_t)std::clamp(std::atoi(y), 0, 100000) * 1000 : (int64_t)0;
+        }();
+        if (yield_ns > 0 && hx_pool_) hx_pool_->wait_idle(yield_ns);
         const int rc = mover_->insert_unit_planes(*p, &scratch);
         if (rc < 0 && !told) {
             RAD_WARN("host experts: relaying a missed unit into the RAM cache failed (%s); it stays "
@@ -1778,6 +2065,7 @@ int FileStager::hx_finish(RadStream s, const RadTensor* t, int n_t) {
     for (int k = 0; k < hx_n_; ++k) mover_->release_host_unit(&hx_units_[k]);
     hx_n_ = 0;
     hx_miss_.clear();
+    hx_miss_ra_.clear();
     const int32_t li = hx_li_;
     const bool confirmed = hx_confirmed_;
     hx_li_ = -1;
@@ -1859,6 +2147,11 @@ void FileStager::hx_drain() {
         for (int k = 0; k < hx_n_; ++k) mover_->release_host_unit(&hx_units_[k]);
     hx_n_ = 0;
     hx_miss_.clear();
+    /* Units a layer given up was waiting for: no further piece (the ones in flight keep their
+     * buffers until they finish). */
+    for (auto& r : hx_miss_ra_)
+        if (r && hx_ra_) hx_ra_->cancel(*r);
+    hx_miss_ra_.clear();
     hx_li_ = -1;
     hx_stage_ = 0;
     hx_confirmed_ = false;

@@ -41,6 +41,7 @@
 #include "native_read_workers.h"
 #include "planner.h"
 #include "plane_mirror.h"
+#include "readahead.h"
 #include "residency_iface.h"
 
 #include <algorithm>
@@ -630,6 +631,19 @@ public:
     /* `rows`: the pass's tokens, which decide whether the plane mirror takes a share. */
     bool  read_unit_planes(HostPlanes* const* units, int n, int rows = 1);
     bool  host_planes_eligible(int32_t u) const;   /* what read_unit_planes accepts */
+    /* lay_out_unit_planes  for a read-ahead (readahead.h): unit p->unit laid out in p exactly as
+     *                      read_unit_planes lays it out before reading, and each weight's container
+     *                      extent in ext[0..1] (the whole extent, from the container: no mirror).
+     *                      Reads nothing and reads only the plan and the program, so a thread
+     *                      beside the issuing one may call it. False when read_unit_planes would
+     *                      refuse the unit's weights.
+     * read_piece           one O_DIRECT read of [off, off + len) of container `file` into dst (cap
+     *                      bytes there), as read_unit_planes reads an extent; thread-safe.
+     * decode_mirror_bytes  the bytes of a missed unit a one-token pass reads from the plane mirror
+     *                      instead of the container (0 with no mirror, or one turned off). */
+    bool  lay_out_unit_planes(HostPlanes* p, PlaneExtent ext[2]);
+    int   read_piece(uint32_t file, int64_t off, int64_t len, void* dst, int64_t cap);
+    int64_t decode_mirror_bytes() const;
     /* read_weight_file  a whole weight the container stores as is (an identity plane, every row
      *                   on this rank) into dst, for a host reader such as the router predictor. */
     bool  read_weight_file(const WeightInfo& w, void* dst);
@@ -888,6 +902,9 @@ private:
     std::atomic<uint64_t> packed_inserts_{0}, packed_over_budget_{0}, packed_over_budget_units_{0},
                           packed_round_trip_failed_{0};
     int  insert_unit_packed(const HostPlanes& p);
+    /* Weight k (handle h) of a unit's planes laid out in p, its buffer grown as needed: where
+     * read_unit_planes reads it. False when it is not a plain pair of MXFP4 planes. */
+    bool lay_out_weight(HostPlanes* p, int k, rad_weight h);
     /* Per unit: the mirror's copy of its gate_up's w3 codes (shard -1: none) and which of the
      * unit's two weights is the gate_up; the tail read from the mirror, 4 KiB-aligned. */
     std::vector<PlaneMirror::Ref> mirror_ref_;

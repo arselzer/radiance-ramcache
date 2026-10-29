@@ -35,6 +35,7 @@
 #include "rad_abi.h"
 #include "rad_plugin.h"
 #include "r4d_args.h"
+#include "r4d_bf16f8_layout.h"
 #include "r4d_ar_shards.h"
 #include "r4d_ar_links.h"
 #include "r4d_hc_fp8.h"
@@ -6537,6 +6538,105 @@ static void bf16_tiled_identity(const Plugin& pl, int64_t M, int64_t N, int64_t 
         d += b;
     }
     ok(nm, all, d);
+}
+
+/* gemm_bf16f8_nt_m64 against gemm_bf16_nt_m64, byte for byte: the same GEMM over the same bf16
+ * values, one row reading them from the plane and the other from E4M3 codes and an E8M0 exponent a
+ * 32x32 block (r4d_bf16f8_layout.h), relaid by the row's own hooks. The weight is FP8-exact by
+ * construction (random codes, an exponent a block from 2^-27 to 2^2, signed zeros and subnormals
+ * mixed in), so the relayout must accept it. Every split the bf16 kernel can take at this K, MB 1
+ * and 2, and both forms (the chained one runs without waiting outside the engine). */
+static void bf16f8_identity(const Plugin& pl, int64_t M, int64_t N, int64_t K) {
+    if (!sel("gemm_bf16f8_nt_m64")) return;
+    char nm[128];
+    std::snprintf(nm, sizeof nm, "gemm_bf16f8_nt_m64 == gemm_bf16_nt_m64  M=%lld N=%lld K=%lld",
+                  (long long)M, (long long)N, (long long)K);
+    const RadKernelInfo* r8 = find(pl, "gemm_bf16f8_nt_m64");
+    const RadKernelInfo* rs = find(pl, "gemm_bf16_nt_m64");
+    if (!r8 || !rs) { ok(nm, false, "row absent"); return; }
+    if (!r8->layout || !r8->relayout) { ok(nm, false, "no layout hooks"); return; }
+
+    std::vector<uint16_t> ha((size_t)(M * K)), hw((size_t)(N * K));
+    for (size_t i = 0; i < ha.size(); ++i)
+        ha[i] = h_to_bf16((float)((int)(st_mix32((uint32_t)i) % 401) - 200) * 0.03f);
+    const int64_t kb = K / 32;
+    for (int64_t n = 0; n < N; ++n)
+        for (int64_t k = 0; k < K; ++k) {
+            const uint32_t s = 100 + st_mix32((uint32_t)((n / 32) * kb + k / 32) ^ 0x51u) % 30;
+            uint32_t c = st_mix32((uint32_t)(n * K + k) ^ 0xb5u) & 0xFFu;
+            if ((c & 0x7Fu) == 0x7Fu) c ^= 0x01u;   /* never the NaN code */
+            hw[(size_t)(n * K + k)] = r4d_bf16f8_expand(c, s);
+        }
+
+    std::vector<RadParam> gp = { PI("M", M), PI("N", N), PI("K", K), PS("dtype", "bf16") };
+    const RadEncoding enc = rad_enc_plain(RAD_BF16);
+    const int psel[1] = { 0 };
+    RadTensor plane = T(hw.data(), RAD_BF16, { N, K });
+    RadLayout L;
+    std::memset(&L, 0, sizeof(L));
+    int rc = r8->layout(gp.data(), (int)gp.size(), 1, &enc, psel, &plane, 1, &L);
+    if (rc != RAD_OK || L.dtype != (uint32_t)R4D_DT_BF16F8 || L.bytes != r4d_bf16f8_bytes(N, K)) {
+        ok(nm, false, "layout hook: rc " + std::to_string(rc));
+        return;
+    }
+    std::vector<uint8_t> blob((size_t)L.bytes);
+    rc = r8->relayout(gp.data(), (int)gp.size(), 1, &enc, psel, &plane, 1, blob.data(), L.bytes);
+    if (rc != RAD_OK) { ok(nm, false, "relayout refused an exact weight: rc " + std::to_string(rc)); return; }
+
+    void* d_a = dalloc(ha.size() * 2);
+    void* d_w = dalloc(hw.size() * 2);
+    void* d_b = dalloc(blob.size());
+    void* d_y = dalloc((size_t)(M * N) * 2);
+    if (!d_a || !d_w || !d_b || !d_y) { ok(nm, false, "hipMalloc failed"); return; }
+    st_memcpy(d_a, ha.data(), ha.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_w, hw.data(), hw.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_b, blob.data(), blob.size(), hipMemcpyHostToDevice);
+    RadTensor tb = T(d_b, R4D_DT_BF16F8, { N, K });
+    std::vector<RadTensor> t16 = { T(d_a, RAD_BF16, { M, K }), T(d_w, RAD_BF16, { N, K }),
+                                   T(d_y, RAD_BF16, { M, N }) };
+    std::vector<RadTensor> t8 = { t16[0], tb, t16[2] };
+
+    auto run = [&](const RadKernelInfo* r, std::vector<RadTensor>& ts, int sk, int mb, int chain,
+                   std::vector<uint16_t>& out) {
+        std::vector<RadParam> ps = { PI("M", M), PI("N", N), PI("K", K), PS("dtype", "bf16"),
+                                     PI("chain", chain) };
+        if (sk > 0) ps.push_back(PI("sk", sk));
+        if (mb > 0) ps.push_back(PI("mb", mb));
+        /* Poisoned before each run, since a stale output would compare equal. */
+        if (st_memset(d_y, 0xA5, (size_t)(M * N) * 2) != hipSuccess) return -1;
+        RadArgs a;
+        std::memset(&a, 0, sizeof(a));
+        a.t = ts.data(); a.n_t = (int)ts.size();
+        a.p = ps.data(); a.n_p = (int)ps.size();
+        a.world_size = 1;
+        const int lrc = r->launch(&a, (RadStream) nullptr);
+        if (lrc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) return lrc != RAD_OK ? lrc : -1;
+        out.assign((size_t)(M * N), 0);
+        st_memcpy(out.data(), d_y, out.size() * 2, hipMemcpyDeviceToHost);
+        return 0;
+    };
+    std::string d;
+    bool all = true;
+    int runs = 0;
+    for (int sk : { 0, 1, 2, 4, 5, 8, 10, 16, 20 }) {
+        if (sk > 0 && K % (sk * 16)) continue;
+        for (int mb : { 0, 1, 2 })
+            for (int chain : { 0, 1 }) {
+                std::vector<uint16_t> ref, got;
+                const int r0 = run(rs, t16, sk, mb, chain, ref);
+                const int r1 = run(r8, t8, sk, mb, chain, got);
+                size_t diff = 0;
+                if (r0 == 0 && r1 == 0)
+                    for (size_t i = 0; i < ref.size(); ++i) diff += ref[i] != got[i];
+                ++runs;
+                if (r0 == 0 && r1 == 0 && diff == 0) continue;
+                all = false;
+                if (d.size() < 200)
+                    d += fmt("%ssk %d mb %d chain %d: %s", d.empty() ? "" : ", ", sk, mb, chain,
+                             r0 || r1 ? "launch failed" : (std::to_string(diff) + " differ").c_str());
+            }
+    }
+    ok(nm, all && runs > 0, d);
 }
 
 /* logit_softcap, against an f64 evaluation of the same formula.
@@ -31352,6 +31452,14 @@ static void device_phase(const Plugin& pl) {
             bf16_one_row_identity(pl, nk.first, nk.second);
             bf16_gemm_numeric(pl, "gemm_bf16_nt_m64", 1, nk.first, nk.second);
         }
+    }
+    if (sel("gemm_bf16f8_nt_m64")) {
+        if (!g_case) std::printf("\ngemm_nt_bf16f8's stored-form GEMM, against the bf16 skinny one\n");
+        bf16f8_identity(pl, 1, 1280, 5120);      /* ds41 attn_q_a's shape, one row */
+        bf16f8_identity(pl, 16, 512, 5120);      /* attn_kv at the decode batch */
+        bf16f8_identity(pl, 5, 48, 96);          /* the peel and the byte-wise exponents */
+        bf16f8_identity(pl, 33, 80, 160);        /* N % 32 == 16, three row tiles */
+        bf16f8_identity(pl, 70, 1024, 4096);     /* past the skinny band, two row tiles of four */
     }
     if (sel("gemm_bf16_nt_tiled")) {
         if (!g_case) std::printf("\nthe tiled bf16 GEMM, against the skinny one\n");

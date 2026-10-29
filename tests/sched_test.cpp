@@ -847,6 +847,72 @@ static void exact_fixture(Fixture& f, int kind) {
     f.cfg.prefix_exact = true;
 }
 
+/* DeepSeek-V4.1 as the ds41 A/Bs serve it (arch/deepseek41, tools/ds41-host-experts): prefill in
+ * 16-token chunks (--max-num-batched-tokens 16, the CPU expert path's row limit), linear state
+ * with no chunked scan (the compressor's f32 tail and the Engram token history: a state chunk of
+ * 1) and the trunk's sliding window carried in the checkpoint slot beside it (KVGroupPlan::
+ * win_snap); the full groups are prefix-cached, the window is not. */
+static void ds41_fixture(Fixture& f, int64_t interval) {
+    f.build(4096, 64, /*max_tok=*/16, 4096, /*windowed=*/true, /*linear=*/true);
+    f.prog.ops.resize(1);          /* no gdn_chunk_scan: nothing sets a state chunk */
+    f.kv.snap = { 3 };             /* the window ("swa") rides in the slot */
+    f.pc.groups = { 0 };           /* the full group is cached; the window is not */
+    f.cfg.checkpoint_interval = interval;
+    f.cfg.prefix_exact = true;
+}
+
+/* In that shape the resume grid is the 16-token chunk, whatever the interval: every snapshot is a
+ * chunk start of the cold run of its prompt and of every longer prompt it begins, a prompt's tail
+ * snapshot is where its last chunk starts (past the first interval only), and a hit at any of them
+ * recomputes the cold run's own chunks. An interval of 16 snapshots every chunk; 256 the interval
+ * boundaries and the tail. */
+TEST(ds41_shape_resumes_on_the_16_token_chunk_grid) {
+    for (const int64_t interval : { 16, 256 }) {
+        Fixture f;
+        ds41_fixture(f, interval);
+        REQUIRE_EQ(f.start(), RAD_OK);
+        const ChunkGeometry& g = f.sch.geometry();
+        CHECK_EQ(g.quantum, 16);
+        CHECK_EQ(g.state_chunk, 1);
+        CHECK(!g.window_ckpt);                /* linear state beside the window */
+        CHECK_EQ(g.checkpoint_interval, interval);
+        CHECK(g.exact);
+        CHECK_EQ(g.grid, 16);
+        CHECK_EQ(g.grid_origin, 0);
+        /* A 1,100-token prompt: 69 chunks, the last [1088, 1100); its tail snapshot at 1088. */
+        const Cut c = cut_from(f.sch, 0, 1100, 16);
+        REQUIRE_EQ(c.ends.size(), (size_t)69);
+        CHECK_EQ(c.ends[67], 1088);
+        CHECK_EQ(c.ends[68], 1100);
+        std::vector<int64_t> want;
+        for (int64_t p = interval; p <= 1088; p += interval) want.push_back(p);
+        if (want.back() != 1088) want.push_back(1088);
+        CHECK(c.ckpts == want);
+        /* A 19-token prompt: only an interval of 16 leaves it a snapshot (at 16; a tail inside
+         * the first interval is not taken). */
+        CHECK((cut_from(f.sch, 0, 19, 16).ckpts ==
+               (interval == 16 ? std::vector<int64_t>{ 16 } : std::vector<int64_t>{})));
+        /* Every snapshot of a cold run is a chunk start of the cold run of the prompt and of any
+         * longer one it begins, and a hit there recomputes that run's own chunks. */
+        int checked = 0;
+        for (int64_t L = 30; L <= 1400; L += 53) {
+            const Cut cold = cut_from(f.sch, 0, L, 16);
+            for (int64_t k : cold.ckpts) {
+                CHECK(g.on_grid(k));
+                if (k >= L) continue;
+                CHECK(cut_from(f.sch, k, L, 16).ends == ends_after(cold, k));
+                for (int64_t L2 : { L + 1, L + 70, L + 600 }) {
+                    const Cut cold2 = cut_from(f.sch, 0, L2, 16);
+                    CHECK(std::find(cold2.ends.begin(), cold2.ends.end(), k) != cold2.ends.end());
+                    CHECK(cut_from(f.sch, k, L2, 16).ends == ends_after(cold2, k));
+                }
+                ++checked;
+            }
+        }
+        CHECK(checked > 20);
+    }
+}
+
 TEST(exact_resume_grid_is_the_chunk_an_idle_prefill_cuts) {
     struct Want { int kind; int64_t interval, grid, origin; };
     for (const Want w : { Want{ 0, 256, 256, 0 }, Want{ 1, 1024, 512, 0 }, Want{ 2, 256, 512, 256 },
@@ -1049,10 +1115,13 @@ namespace {
 struct ExactPub { std::vector<int64_t> published; std::vector<int64_t> computed; int64_t held = 0; };
 /* Runs `prompts` (all submitted at once) to the end, with the switch `on`; `hit` > 0 seeds a
  * snapshot hit there first. What was published, each sequence's computed tokens at its close,
- * and the held-back counter. */
-ExactPub exact_publish_run(bool on, std::vector<int> prompts, int64_t hit = 0, bool exact = true) {
+ * and the held-back counter. `ds41` > 0: DeepSeek-V4.1's shape (ds41_fixture) at that interval
+ * instead of the GDN hybrid. */
+ExactPub exact_publish_run(bool on, std::vector<int> prompts, int64_t hit = 0, bool exact = true,
+                           int64_t ds41 = 0) {
     Fixture f;
-    exact_fixture(f, 0);                      /* the GDN hybrid: interval 256, chunks of 256 */
+    if (ds41 > 0) ds41_fixture(f, ds41);
+    else exact_fixture(f, 0);                 /* the GDN hybrid: interval 256, chunks of 256 */
     f.cfg.prefix_exact = exact;
     if (on) setenv("RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH", "1", 1);
     else unsetenv("RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH");
@@ -1069,7 +1138,7 @@ ExactPub exact_publish_run(bool on, std::vector<int> prompts, int64_t hit = 0, b
     }
     std::vector<uint64_t> ids;
     for (int n : prompts) ids.push_back(f.submit(n, 3));
-    for (int i = 0; i < 64; ++i) {
+    for (int i = 0; i < 512; ++i) {
         if (!f.sch.step()) break;
         f.commit_plain();
     }
@@ -1101,10 +1170,13 @@ TEST(exact_publish_stops_at_the_last_chunk_a_cold_prefill_cuts_alike) {
     REQUIRE_EQ(on.published.size(), (size_t)1);
     CHECK_EQ(on.published[0], 1024ll);
     CHECK_EQ(on.held, on.computed[0] - 1024);
-    /* From a hit at a snapshot: the adopted 512, then its own full chunks to 1024. */
+    /* From a hit at a snapshot: the adopted 512, then its own full chunks [512, 768), [768, 1024)
+     * and [1024, 1280), up to where its short last chunk starts (a cold run of any longer prompt
+     * cuts [1024, 1280) the same). */
     on = exact_publish_run(true, { 1300 }, 512);
     REQUIRE_EQ(on.published.size(), (size_t)1);
-    CHECK_EQ(on.published[0], 1024ll);
+    CHECK_EQ(on.published[0], 1280ll);
+    CHECK_EQ(on.held, on.computed[0] - 1280);
     off = exact_publish_run(false, { 1300 }, 512);
     REQUIRE_EQ(off.published.size(), (size_t)1);
     CHECK_EQ(off.published[0], off.computed[0]);
@@ -1121,6 +1193,38 @@ TEST(exact_publish_stops_at_the_last_chunk_a_cold_prefill_cuts_alike) {
     REQUIRE_EQ(on.published.size(), (size_t)1);
     CHECK_EQ(on.published[0], on.computed[0]);
     CHECK_EQ(on.held, 0ll);
+}
+
+/* The same in DeepSeek-V4.1's shape at 16-token chunks (ds41_fixture): what a turn publishes ends
+ * where its last chunk starts, its tail snapshot, which is where the next turn resumes; the short
+ * last chunk and the decode steps are held back, so the next turn's own 16-token chunk over them
+ * is what a third turn adopts. */
+TEST(ds41_shape_exact_publish_ends_at_the_tail_snapshot) {
+    for (const int64_t interval : { 16, 256 }) {
+        /* Off: all 1,100 prompt tokens and the decode steps but the last. */
+        ExactPub off = exact_publish_run(false, { 1100 }, 0, true, interval);
+        REQUIRE_EQ(off.published.size(), (size_t)1);
+        CHECK_EQ(off.computed[0], 1102ll);
+        CHECK_EQ(off.published[0], 1102ll);
+        CHECK_EQ(off.held, 0ll);
+        /* On: [0, 1088), the 68 full chunks; [1088, 1100) and decode are held back. */
+        ExactPub on = exact_publish_run(true, { 1100 }, 0, true, interval);
+        REQUIRE_EQ(on.published.size(), (size_t)1);
+        CHECK_EQ(on.published[0], 1088ll);
+        CHECK_EQ(on.held, 1102ll - 1088);
+        /* A prompt ending on the grid publishes its last chunk, a full one. */
+        on = exact_publish_run(true, { 1104 }, 0, true, interval);
+        REQUIRE_EQ(on.published.size(), (size_t)1);
+        CHECK_EQ(on.published[0], 1104ll);
+        /* The next turn, from that tail snapshot: its own chunks up to its tail, 1296. */
+        on = exact_publish_run(true, { 1300 }, 1088, true, interval);
+        REQUIRE_EQ(on.published.size(), (size_t)1);
+        CHECK_EQ(on.computed[0], 1302ll);
+        CHECK_EQ(on.published[0], 1296ll);
+        off = exact_publish_run(false, { 1300 }, 1088, true, interval);
+        REQUIRE_EQ(off.published.size(), (size_t)1);
+        CHECK_EQ(off.published[0], 1302ll);
+    }
 }
 
 TEST(a_chunk_ending_on_a_checkpoint_carries_it_into_the_batch) {

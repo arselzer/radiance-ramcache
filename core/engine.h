@@ -268,6 +268,10 @@ private:
     int configure_kv();
     /* Resolves --checkpoint-slots auto for snapshots of `slot` bytes (`what` names their kind). */
     int size_checkpoint_store(int64_t slot, const char* what);
+    /* For a checkpoint store refused for room: when the expert RAM cache's slabs already hold
+     * memory the margin reserves again (RADIANCE_EXPERIMENTAL_CACHE_HEADROOM_BACKED off), a clause
+     * saying so and naming the switch; empty otherwise. Words only: it decides nothing. */
+    std::string cache_margin_hint() const;
     /* Maps the step's logits rows back to the sequences that wanted them. Not the identity: a
      * mid-prompt prefill chunk produces no row, and a speculative verify produces 1 + n_spec. */
     struct StepOut {

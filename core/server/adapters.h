@@ -129,6 +129,7 @@ inline SchedMetrics bridge_metrics(const rad::SchedMetrics& m) {
     o.attn_cached_tokens = m.attn_cached_tokens;
     o.linear_cached_tokens = m.linear_cached_tokens;
     o.checkpoints_written = m.checkpoints_written;
+    o.prefix_publish_held_tokens = m.prefix_publish_held_tokens;
     o.draft_depth_seen = m.draft_depth_seen;
     if (o.draft_depth_seen > SchedMetrics::MAX_DRAFT_POS)
         o.draft_depth_seen = SchedMetrics::MAX_DRAFT_POS;

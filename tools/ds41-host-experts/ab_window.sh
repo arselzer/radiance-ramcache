@@ -181,7 +181,8 @@ arm() {   # name, then env assignments for the server; CACHE_MIB the RAM cache (
   # move it from ~45% busy towards saturation.
   local d0 d1 t0 t1 rc temp
   d0=$(awk '{print $10}' /sys/block/nvme0n1/stat 2>/dev/null); t0=$(date +%s%N)
-  python3 -I "$HERE/ab_requests.py" "$PROMPTS" "http://127.0.0.1:$PORT" "$n" "$OUT/$name.json" >>"$OUT/window.log" 2>&1
+  env AB_CONCURRENCY=${ARM_CONC:-${AB_CONCURRENCY:-1}} \
+    python3 -I "$HERE/ab_requests.py" "$PROMPTS" "http://127.0.0.1:$PORT" "$n" "$OUT/$name.json" >>"$OUT/window.log" 2>&1
   rc=$?
   log "arm $name: requests exit $rc"
   d1=$(awk '{print $10}' /sys/block/nvme0n1/stat 2>/dev/null); t1=$(date +%s%N)
@@ -265,9 +266,12 @@ for a in $ARMS; do
 # (RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8, gemm_nt_bf16f8; a deepseek41 and libr4d that have it), F8n
 # the same with the shared expert left bf16, both with $F8_EXCLUDE as ..._DENSE_FP8_EXCLUDE when set;
 # an F8 arm is refused under RADIANCE_TUNE or a tune cache in its home, every other arm runs with the
-# knob off; rN a repeat (ignored).
+# knob off; Pf a prefill chunk runs in a step of its own and the decode rows of concurrent requests
+# run together (RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE); NK --max-num-seqs K, CK the arm's requests
+# sent K at a time (AB_CONCURRENCY), LK --max-model-len K (the KV pool backs about one sequence of K
+# tokens in all: 512 holds four 110-token requests, 1024 eight, 2048 sixteen); rN a repeat (ignored).
   IFS=- read -r -a parts <<< "$a"
-  pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 HOST_POOL_MIB=4096 EXTRA_ARGS="" ARM_HOME="$RHOME"
+  pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 HOST_POOL_MIB=4096 EXTRA_ARGS="" ARM_HOME="$RHOME" ARM_CONC=
   power="" skip="" ARGS=() f8="" f8x=""
   for p in "${parts[@]:1}"; do
     case $p in
@@ -329,6 +333,10 @@ for a in $ARMS; do
                [[ $p == Dsa ]] && ARGS+=(--draft-window adaptive) ;;
       K)       env+=(RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE=1) ;;     # the RAM cache packed for the CPU only
       Lm[0-9]*) ARGS+=(--max-model-len "${p#Lm}") ;;   # a longer context (default 512), e.g. for long-prompt TTFT
+      Pf)      env+=(RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE=1) ;;   # a prefill chunk alone in its step; decode rows batched
+      N[0-9]*) ARGS+=(--max-num-seqs "${p#N}") ;;                     # this arm's --max-num-seqs (MAX_SEQS for every arm)
+      C[0-9]*) ARM_CONC=${p#C} ;;                                     # this arm's requests sent K at a time (AB_CONCURRENCY)
+      L[0-9]*) ARGS+=(--max-model-len "${p#L}") ;;                    # this arm's --max-model-len (KV for N sequences)
       *)       log "arm $a: unknown part $p; the arm is skipped (it would run without what its name says)"; skip=1 ;;
     esac
   done

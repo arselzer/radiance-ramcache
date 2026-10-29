@@ -66,6 +66,19 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     cfg_ = cfg;
     kv_ = kv;
     pc_ = pc;
+    /* An experimental switch read here rather than a Config field, like the host-expert ones
+     * (RADIANCE_EXPERIMENTAL_DS41_*); unset, the scheduler is exactly as before. */
+    prefill_alone_ = 0;
+    pf_skipped_ = 0;
+    if (const char* pa = std::getenv("RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE");
+        pa && std::atoi(pa) > 0) {
+        prefill_alone_ = 1;
+        if (cfg.max_seqs > 1)
+            RAD_INFO("scheduler: RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE: a prefill chunk runs in a "
+                     "step of its own (decode rows wait for it), and the decode rows of up to %lld "
+                     "sequences run together in the steps between",
+                     (long long)cfg.max_seqs);
+    }
 
     /* The engine resolves the geometry once, because the prefix cache needs its checkpoint
      * interval first; a caller without one (tests) resolves its own from prog and cfg. Both
@@ -1502,6 +1515,13 @@ const RadBatch* Scheduler::step() {
     /* The last step's admissions have read their snapshots: its forward committed before this. */
     if (pc_) pc_->begin_step();
 
+    /* RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE (prefill_alone_): the plan below is made at most
+     * twice. The first try gives one prefill chunk (a running prompt's next chunk, or an
+     * admission's first) a step of its own whenever decode rows would otherwise take the budget
+     * a chunk of the quantum needs; if no chunk could be planned after all (the pool refused the
+     * admission), the step is planned again as it is without the switch. */
+    bool pf_alone_tried = false;
+replan:
     plan_.reset();
     step_prefill_tok_ = 0;
     step_decode_tok_ = 0;
@@ -1603,6 +1623,32 @@ const RadBatch* Scheduler::step() {
         gate_tokens_ = (double)gate_rows_;
     }
 
+    /* Prefill alone (prefill_alone_): with decode rows in the running set and a prefill chunk to
+     * run (a running prompt's, or an admission the queue and the card pool allow), the step
+     * carries that one chunk and nothing else. When the budget is no larger than the chunk
+     * quantum (--max-num-batched-tokens 16 against DeepSeek-V4.1's 16-token attention block), a
+     * decode row ahead of a chunk otherwise leaves it under the quantum, and the chunk waits until
+     * every sequence ahead of it has finished: requests then run one after another however many
+     * --max-num-seqs admits. Every pass stays one prefill chunk alone, cut as an idle server cuts
+     * it, or decode rows only. */
+    bool pf_alone = false;
+    pf_skipped_ = 0;
+    if (prefill_alone_ && !pf_alone_tried && !hold_prefill) {
+        bool pf_running = false, decoding = false;
+        for (int32_t slot : running_) {
+            const SchedReq& g = *reqs_[(size_t)slot];
+            if (!g.req || !g.running) continue;
+            const Request& gr = *g.req;
+            if (gr.n_computed < (int64_t)gr.prompt.size() || gr.n_computed + 1 < g.seq_len())
+                pf_running = true;
+            else
+                decoding = true;
+        }
+        const bool admit_possible = !waiting_.empty() && !free_cards_.empty() &&
+                                    (int64_t)running_.size() < cfg_.max_seqs;
+        pf_alone = decoding && (pf_running || admit_possible);
+    }
+
     /* ---------------------------------------------------------- running requests first */
     /* Continuous batching: requests already holding blocks are served before new ones are
      * admitted, so new work never preempts work half done. */
@@ -1624,6 +1670,12 @@ const RadBatch* Scheduler::step() {
         int64_t ckpt = -1;
         int64_t want;
         if (prefill && hold_prefill) { ++held_prefill_; ++i; continue; }
+        /* Prefill alone: decode rows, and a second prefill chunk, wait for the next step. */
+        if (pf_alone && (!prefill || !plan_.e.empty())) {
+            if (!prefill) ++pf_skipped_;
+            ++i;
+            continue;
+        }
         if (prefill) {
             const int64_t shares = share_step ? behind_pf + (admit_waits ? 1 : 0) : 0;
             const int64_t reserve = share_step ? behind_dec + share_tok * shares : 0;
@@ -1785,6 +1837,8 @@ const RadBatch* Scheduler::step() {
                (int64_t)plan_.e.size() < cfg_.max_seqs && budget > 0) {
             /* A step planned for one prefill holds that one (span_now_ above). */
             if (cfg_.prefill_span > 1 && span_now_ && !plan_.e.empty()) break;
+            /* Prefill alone: an admission's chunk is never beside another chunk or decode rows. */
+            if (prefill_alone_ && !plan_.e.empty()) break;
             int32_t slot = waiting_[at];
             SchedReq& s = *reqs_[(size_t)slot];
             /* A sequence the context cannot hold never runs: its prompt alone reaches the last
@@ -1857,6 +1911,13 @@ const RadBatch* Scheduler::step() {
             }
             waiting_.resize(w);
         }
+    }
+
+    /* Prefill alone found no chunk to run after all (the pool or the queue refused the admission
+     * it was for): plan the step again as without the switch, so the decode rows run. */
+    if (pf_alone && plan_.e.empty()) {
+        pf_alone_tried = true;
+        goto replan;
     }
 
     /* Budget the held-back chunk reserved for others but they did not use goes back to it. The
@@ -2133,6 +2194,11 @@ const RadBatch* Scheduler::step_next_locked() {
     /* Once the hold is spent, the held chunk goes into the next full step rather than waiting
      * behind decode steps issued ahead. */
     if (held_prefill_ > 0 && interleave_left_ == 0) return nullptr;
+    /* Prefill alone: a step that left running sequences out (their decode rows waited for a
+     * chunk) is followed by a full step, which brings them back; issued ahead, the step would
+     * carry only this step's rows, and the rows left out would wait for as long as steps are
+     * issued ahead. */
+    if (prefill_alone_ && (pf_skipped_ > 0 || plan_.e.size() != running_.size())) return nullptr;
     /* Before the loop below, which reserves the next step's KV. */
     if (ends_every_request()) return nullptr;
 

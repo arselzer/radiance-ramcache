@@ -1,0 +1,94 @@
+/* vram_packed.h -- RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED: DeepSeek-V4.1's routed experts held in VRAM in the
+ * packed-scale form instead of block_mxfp4.
+ *
+ * ---- why --------------------------------------------------------------------------------------
+ *
+ * The RAM cache already holds the CPU's experts in tools/ds41-host-experts' packed form
+ * (ds41_host_experts.h, RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE): the release's codes plane unchanged
+ * and each block's e8m0 as a 2-bit code from one base a weight, a round of 32 blocks with a scale
+ * outside the window stored raw beside. 99.975% of the release's scales are 119..121, so with room for
+ * 512 raw rounds a gate_up and 320 a down (all but 7 of the 15360 experts fit) an expert is 18,001,920
+ * bytes a slot against block_mxfp4's 18,800,640: x1.0444. This holds the card's static residents the
+ * same way, so the same weights pool holds ~26 more experts a rank (598/615 -> ~624/642 in the
+ * recommended configuration), each a CPU expert or a drive miss fewer for the tokens that route to it.
+ *
+ * ---- how --------------------------------------------------------------------------------------
+ *
+ *   select  Engine::start sets the machine fact device.ds41_vram_packed (kVramPackFact) before
+ *           declare, which makes libr4d's moe_gemm_ggml_mxfp4_gemv_vp row (kVramPackRow) take the
+ *           routed GEMMs' decode band. That row declares the gemv row's stored form, block_mxfp4, so
+ *           every other tier (the pinned pool, the file tier, the RAM cache and the CPU path, the
+ *           expert profile's checks) keeps it untouched: the packed form is VRAM's alone.
+ *   plan    A weight is eligible (vram_pack_eligible) when it is a trunk routed expert's ggml_mxfp4
+ *           gate_up or down, whole on its rank, read only by moe_gemm_ggml ops every band of which
+ *           resolved the gemv_vp row. The expert fill charges an eligible unit at its packed size,
+ *           after reading its weights' scales from the container (vram_pack_scan): a weight with
+ *           more raw rounds than its budget stays block_mxfp4 in VRAM and is charged so. Only a
+ *           static plan (--deterministic) packs: a movable resident sits in a slot of its class's
+ *           stride and the heat engine copies slots as they are.
+ *   load    The loader packs each such weight from its planes (vram_pack_weight) and checks it
+ *           before the upload: every block's e8m0, as the kernels widen it, equals the planes' byte
+ *           for byte and the codes plane is unchanged. A mismatch refuses the load.
+ *   issue   Ctx marks a packed weight's table entry with bit 0 (weights are 64-byte aligned).
+ *           gemv_vp decodes a marked entry from the packed form and any other as block_mxfp4, by the
+ *           same arithmetic in the same order, so every output is the block row's bit for bit
+ *           (tests/r4d_emu/test_ds41vp.cpp runs both on the host emulator;
+ *           tools/ds41-host-experts/ds41_vpack_device_check.hip on a card).
+ *
+ * With the switch off nothing here runs: no fact, so the row never matches; no callback, so the
+ * planner charges what it did; no packed weight, so no mark and no packing at load.
+ */
+#pragma once
+#include "../rad_core.h"
+
+#include <cstdint>
+#include <string>
+#include <vector>
+
+namespace rad {
+
+class RadFile;
+
+/* libr4d's R4D_FACT_DS41_VRAM_PACKED and the row it selects (r4d_ds41_mxfp4.h, .inc), restated: the
+ * core links no plugin. */
+constexpr const char* kVramPackFact = "device.ds41_vram_packed";
+constexpr const char* kVramPackRow  = "moe_gemm_ggml_mxfp4_gemv_vp";
+
+/* The switch and the raw rounds a packed gate_up (raw[0]) and down (raw[1]) may hold: the RAM cache's
+ * 512 and 320 by default (mover.cpp, kPackedRawDefault), which hold all but 7 of the release's 15360
+ * experts. */
+struct VramPackConfig {
+    bool on = false;
+    int  raw[2] = { 512, 320 };
+};
+/* RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED=1 and ..._VRAM_PACKED_RAW=<gate_up>,<down>. RAD_E_INVAL, logged,
+ * for a value that is neither. */
+int vram_pack_config(VramPackConfig* out);
+
+/* One weight as the packed form would hold it. bytes 0: not eligible. */
+struct VramPackWeight {
+    int64_t  bytes = 0;          /* ds41hx::packed_bytes(N, K, cap) */
+    int32_t  cap = -1;           /* raw rounds the form has room for */
+    int32_t  N = 0, K = 0;
+    uint64_t scales_off = 0;     /* the scales plane in the container */
+    int64_t  scales_bytes = 0;
+};
+
+/* Per weight of `prog` (indexed by rad_weight, 0 the sentinel), what the packed form takes in VRAM, from
+ * the declaration and the container's directory alone. `why`, when set, gets a summary of the routed
+ * ops whose weights are not eligible (empty when all are), for the startup log. */
+void vram_pack_eligible(const Program& prog, const RadFile& file, const VramPackConfig& cfg,
+                        std::vector<VramPackWeight>* out, std::string* why);
+
+/* The raw rounds w's scales need (ds41hx::pack_plan's n_exc), read from the container into `buf` and
+ * dropped from the page cache after; -1 when the read or the plan fails. */
+int vram_pack_scan(const RadFile& file, const VramPackWeight& w, std::vector<uint8_t>* buf);
+
+/* Packs one weight's planes (codes [N, K / 2], scales [N, K / 32]) into dst_bytes (packed_bytes(N, K, cap))
+ * at dst and checks the result: the scales' round trip through the kernels' widening, and the codes
+ * plane byte for byte. RAD_OK; RAD_E_FULL when the scales need more than cap raw rounds; RAD_E_STATE
+ * when the check fails; RAD_E_SHAPE for a shape the form cannot hold. `n_exc` gets the raw rounds. */
+int vram_pack_weight(const uint8_t* codes, const uint8_t* scales, int N, int K, int cap, uint8_t* dst,
+                     int64_t dst_bytes, int* n_exc);
+
+}  /* namespace rad */

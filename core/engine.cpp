@@ -98,7 +98,8 @@ Engine::~Engine() {
      * residency histogram shows whether the global ranking starved a layer, which a hit rate
      * cannot. */
     for (auto& r : ranks_) {
-        if (!r->heat.enabled() && r->plan.file_layer_max <= 0) continue;
+        /* RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED's line is in the mover's report too. */
+        if (!r->heat.enabled() && r->plan.file_layer_max <= 0 && !r->plan.vram_packed.units) continue;
         LogRank lr(r->index);
         if (r->heat.enabled()) {
         RAD_INFO("%s", r->heat.report().c_str());
@@ -2509,9 +2510,11 @@ int Engine::run_server() {
                      * cells default to VRAM. */
                     const int ti = (int)t >= 0 && (int)t < kTierCount ? (int)t : (int)Tier::SSD;
                     s.experts.units[ti]++;
-                    s.experts.bytes[ti] += mu.bytes;
+                    /* A packed VRAM resident (RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED) takes less there. */
+                    const int64_t ub = t == Tier::VRAM && mu.vram_bytes > 0 ? mu.vram_bytes : mu.bytes;
+                    s.experts.bytes[ti] += ub;
                     s.experts.n_units++;
-                    s.experts.total_bytes += mu.bytes;
+                    s.experts.total_bytes += ub;
                     if (mu.movable) s.experts.movable++;
                     s.experts.layer_units[(size_t)mu.layer]++;
                     if (t == Tier::VRAM) s.experts.layer_resident[(size_t)mu.layer]++;

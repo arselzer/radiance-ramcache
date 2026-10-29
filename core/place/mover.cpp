@@ -276,8 +276,12 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
             n_slab[(size_t)mu.slab_class] = std::max(n_slab[(size_t)mu.slab_class],
                                                      (int64_t)mu.slab_slot + 1);
         } else if (mu.tier == Tier::VRAM) {
+            /* RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED: a static resident with packed weights takes what the
+             * card holds of it (MoveUnit::vram_bytes), as the planner charged it. It never moves: only a
+             * static plan packs. */
+            if (mu.vram_bytes > 0) us.bytes = mu.vram_bytes;
             us.static_off = align_up(static_need, RAD_ALIGN_UNIT);
-            static_need = us.static_off + mu.bytes;
+            static_need = us.static_off + us.bytes;
         } else if (mu.tier == Tier::HostPinned) {
             us.pool_slot = n_pool[(size_t)mu.slab_class]++;
             pool_layer_[(size_t)mu.slab_class].push_back(mu.layer);
@@ -600,8 +604,13 @@ void* Mover::unit_base(int32_t unit) const {
 void Mover::republish(int32_t unit) {
     const MoveUnit& mu = plan_->units[(size_t)unit];
     char* base = (char*)unit_base(unit);
+    /* A static resident with packed weights is laid out as the card holds it (vram_packed.h). */
+    const UnitState& us = unit_[(size_t)unit];
+    const bool packed = mu.vram_bytes > 0 && us.tier == Tier::VRAM && us.slab_slot < 0 &&
+                        mu.vram_offset.size() == mu.weights.size();
+    const std::vector<int64_t>& off = packed ? mu.vram_offset : mu.offset;
     for (size_t i = 0; i < mu.weights.size(); ++i)
-        res_.publish(mu.weights[i], base ? base + mu.offset[i] : nullptr);
+        res_.publish(mu.weights[i], base ? base + off[i] : nullptr);
 }
 
 /* Whether a copy into this unit's slot is still in flight. A slot whose staging copy has not
@@ -2867,6 +2876,18 @@ std::string Mover::report() const {
                  packed_raw_[0], packed_raw_[1], (unsigned long long)ps.inserted,
                  (unsigned long long)ps.over_budget, (unsigned long long)ps.over_budget_units,
                  (unsigned long long)ps.round_trip_failed, (unsigned long long)c.layout_refusals);
+    }
+    /* RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED (vram_packed.h): what the card holds packed. */
+    if (plan_ && plan_->vram_packed.units) {
+        const Plan::VramPacked& vp = plan_->vram_packed;
+        s += fmt("  VRAM packed experts: %lld static residents hold %lld weights (%lld gate_up, %lld down) in the "
+                 "packed-scale form, %s where block_mxfp4 takes %s; %lld weights packed and checked at load; "
+                 "%lld eligible weights over their raw-round budget stayed block_mxfp4; %lld weights' scales "
+                 "read in %.2f s to plan it; raw rounds %lld, at most %lld in a weight\n",
+                 (long long)vp.units, (long long)vp.weights, (long long)vp.gate_up, (long long)vp.down,
+                 humanb(vp.bytes).c_str(), humanb(vp.block_bytes).c_str(), (long long)vp.loaded,
+                 (long long)vp.over_budget, (long long)vp.scanned, vp.scan_s, (long long)vp.raw_rounds,
+                 (long long)vp.raw_max);
     }
     if (mirror_tail_ > 0 && PlaneMirror::get()) {
         const PlaneMirror::Stats ms = PlaneMirror::get()->stats();

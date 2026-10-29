@@ -15,12 +15,15 @@
 #include "place/mover.h"
 #include "place/stager.h"
 #include "place/planner.h"
+#include "place/vram_packed.h"
+#include "../tools/ds41-host-experts/ds41_host_experts.h"
 #include "place/expert_profile_map.h"
 #include "place/native_decode_profile.h"
 #include "format/radfile.h"
 #include "dspark_bank_plan_fixture.h"
 #include "format/dspark_rad_banks.h"
 #include <filesystem>
+#include <functional>
 #include <stdexcept>
 #include <fstream>
 #include <fcntl.h>
@@ -5188,6 +5191,349 @@ TEST(dspark_bank_manual_collision_refuses_before_any_direct_plan_or_budget_mutat
         CHECK(out.units.empty());CHECK_EQ(out.notes.size(),size_t(1));CHECK(out.notes[0]=="unchanged");
         CHECK_EQ(cfg.host_pool_mib,int64_t(4096));
     }
+}
+
+/* ================================================================== packed VRAM residents
+ *
+ * RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED (core/place/vram_packed.h): the expert fill charges a static
+ * resident what the card holds of it -- its weights in the packed-scale form where the scan allows -- and
+ * the mover places and publishes that layout. Without the callback, or in a dynamic plan, nothing
+ * changes. */
+namespace {
+
+/* DeepSeek-V4.1's served unit: gate_up and down in block_mxfp4 at the ggml layout's 64-byte alignment,
+ * and their packed forms with room for 512 and 320 raw rounds (ds41hx::packed_bytes). */
+constexpr int64_t kGuBlock = 12533760, kDnBlock = 6266880, kGuPacked = 11999296, kDnPacked = 6001984;
+
+void build_ds41_like(Fixture& f, int layers, int n, int64_t gu, int64_t dn) {
+    build_moe_layers(f, layers, n, gu, dn);
+    for (size_t w = 1; w < f.prog.weights.size(); ++w) {
+        WeightInfo& wi = f.prog.weights[w];
+        wi.align = 64;
+        if (wi.name.find("ffn_down_exps") != std::string::npos) wi.decl.group.slot = 1;
+    }
+}
+
+/* RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS for the scope, as the recommended configuration runs. */
+struct FileBufferUnitsEnv {
+    std::string old;
+    bool had = false;
+    explicit FileBufferUnitsEnv(const char* v) {
+        const char* o = std::getenv("RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS");
+        had = o != nullptr;
+        if (o) old = o;
+        ::setenv("RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS", v, 1);
+    }
+    ~FileBufferUnitsEnv() {
+        if (had) ::setenv("RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS", old.c_str(), 1);
+        else ::unsetenv("RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS");
+    }
+};
+
+/* A stand-in for the engine's callback: every routed weight eligible at `gu` / `dn` bytes packed (slot 0
+ * / 1), its scan within budget unless it is in `over` (then 600 raw rounds against its room). Counts the
+ * scans. */
+struct FakePack {
+    const Program* prog = nullptr;
+    int64_t gu = kGuPacked, dn = kDnPacked;
+    std::vector<rad_weight> over;
+    int scans = 0;
+    std::function<int64_t(rad_weight, bool, int32_t*, int32_t*)> fn() {
+        return [this](rad_weight w, bool scan, int32_t* cap, int32_t* raw) -> int64_t {
+            const WeightInfo& wi = prog->weights[w];
+            if (wi.decl.group.expert < 0) return 0;
+            const bool down = wi.decl.group.slot == 1;
+            if (cap) *cap = down ? 320 : 512;
+            if (!scan) return down ? dn : gu;
+            ++scans;
+            const bool bad = std::find(over.begin(), over.end(), w) != over.end();
+            if (raw) *raw = bad ? 600 : 3;
+            return bad ? 0 : (down ? dn : gu);
+        };
+    }
+};
+
+int vram_residents(const Plan& p) {
+    int n = 0;
+    for (const MoveUnit& mu : p.units)
+        if (mu.expert >= 0 && mu.tier == Tier::VRAM) ++n;
+    return n;
+}
+
+}  /* namespace */
+
+TEST(packed_vram_residents_are_charged_what_the_card_holds) {
+    /* 8 layers of 48 experts at the served sizes, the file tier for the rest and the file buffers capped
+     * at one unit, as the recommended configuration runs. */
+    FileBufferUnitsEnv cap("1");
+    Fixture f;
+    build_ds41_like(f, 8, 48, kGuBlock, kDnBlock);
+    Config c = base_config();
+    c.placement = "expert_tiered";
+    c.vram_weights_mib = 4000;
+    c.host_pool_mib = 210;   /* the file tier's staging and windows, no room for a pooled expert */
+    c.weights_disk_tier = true;
+    c.deterministic = true;
+
+    PlannerInput in0{&f.prog, &c, 0, 1, nullptr, 0};
+    Plan p0;
+    CHECK_OK(Planner(in0).plan(&p0));
+    const int r0 = vram_residents(p0);
+    CHECK(r0 > 100);
+    CHECK_EQ(p0.vram_packed.units, (int64_t)0);
+
+    FakePack fake;
+    fake.prog = &f.prog;
+    PlannerInput in1{&f.prog, &c, 0, 1, nullptr, 0};
+    in1.vram_pack = fake.fn();
+    Plan p1;
+    CHECK_OK(Planner(in1).plan(&p1));
+    CHECK(p1.fits());
+    const int r1 = vram_residents(p1);
+    /* The same room at 18,001,920 bytes a unit instead of 18,800,640: x1.0444 the residents. */
+    const int64_t room = (int64_t)r0 * 18800640;
+    CHECK(r1 >= (int)(room / 18001920) - 1);
+    CHECK(r1 > r0 + r0 * 4 / 100 - 1);
+    CHECK_EQ(p1.vram_packed.units, (int64_t)r1);
+    CHECK_EQ(p1.vram_packed.weights, (int64_t)2 * r1);
+    CHECK_EQ(p1.vram_packed.gate_up, (int64_t)r1);
+    CHECK_EQ(p1.vram_packed.down, (int64_t)r1);
+    CHECK_EQ(p1.vram_packed.bytes, (int64_t)r1 * 18001920);
+    CHECK_EQ(p1.vram_packed.block_bytes, (int64_t)r1 * 18800640);
+    CHECK_EQ(p1.vram_packed.over_budget, (int64_t)0);
+    /* Only the units the fill considered were read: the residents and the few the room turned down. */
+    CHECK(p1.vram_packed.scanned >= 2 * r1 && p1.vram_packed.scanned <= 2 * r1 + 4);
+    CHECK_EQ((int64_t)fake.scans, p1.vram_packed.scanned);
+    for (const MoveUnit& mu : p1.units) {
+        if (mu.expert < 0) continue;
+        if (mu.tier != Tier::VRAM) {
+            CHECK_EQ(mu.vram_bytes, (int64_t)0);
+            for (rad_weight w : mu.weights) CHECK_EQ(p1.weight[w].vram_bytes, (int64_t)0);
+            continue;
+        }
+        CHECK(!mu.movable);
+        CHECK_EQ(mu.vram_bytes, kGuPacked + kDnPacked);
+        REQUIRE(mu.vram_offset.size() == 2);
+        CHECK_EQ(mu.vram_offset[0], (int64_t)0);
+        CHECK_EQ(mu.vram_offset[1], kGuPacked);
+        /* The stored layout is untouched: every other tier and the file tier read it. */
+        CHECK_EQ(mu.bytes, align_up(kGuBlock, 64) + kDnBlock);
+        CHECK_EQ(p1.weight[mu.weights[0]].vram_bytes, kGuPacked);
+        CHECK_EQ(p1.weight[mu.weights[0]].vram_pk_cap, 512);
+        CHECK_EQ(p1.weight[mu.weights[1]].vram_bytes, kDnPacked);
+        CHECK_EQ(p1.weight[mu.weights[1]].vram_pk_cap, 320);
+    }
+    /* Residents, spares and the file buffers still fit the weights pool. */
+    CHECK(p1.totals.bytes[(int)Tier::VRAM] + p1.slab_overhead + p1.file_stage_vram <= p1.vram_budget);
+    CHECK(p1.report(f.prog).find("vram packed") != std::string::npos);
+}
+
+TEST(a_packed_weight_over_its_budget_stays_block_and_is_charged_so) {
+    FileBufferUnitsEnv cap("1");
+    Fixture f;
+    build_ds41_like(f, 4, 32, kGuBlock, kDnBlock);
+    Config c = base_config();
+    c.placement = "expert_tiered";
+    c.vram_weights_mib = 1500;
+    c.host_pool_mib = 210;
+    c.weights_disk_tier = true;
+    c.deterministic = true;
+    /* Every unit ranks alike, so expert 0 of every layer is resident first (rank_units): layer 0
+     * expert 0's down is over budget. */
+    FakePack fake;
+    fake.prog = &f.prog;
+    PlannerInput in{&f.prog, &c, 0, 1, nullptr, 0};
+    Plan probe;
+    CHECK_OK(Planner(in).plan(&probe));
+    int32_t u00 = -1;
+    for (int32_t u = 0; u < (int32_t)probe.units.size(); ++u)
+        if (probe.units[(size_t)u].layer == 0 && probe.units[(size_t)u].expert == 0) u00 = u;
+    REQUIRE(u00 >= 0);
+    REQUIRE(probe.units[(size_t)u00].tier == Tier::VRAM);
+    fake.over.push_back(probe.units[(size_t)u00].weights[1]);
+    in.vram_pack = fake.fn();
+    Plan p;
+    CHECK_OK(Planner(in).plan(&p));
+    const MoveUnit& mu = p.units[(size_t)u00];
+    REQUIRE(mu.tier == Tier::VRAM);
+    /* gate_up packed, down kept block_mxfp4 at its stored size, laid out as the card holds them. */
+    CHECK_EQ(mu.vram_bytes, kGuPacked + kDnBlock);
+    REQUIRE(mu.vram_offset.size() == 2);
+    CHECK_EQ(mu.vram_offset[1], kGuPacked);
+    CHECK_EQ(p.weight[mu.weights[0]].vram_bytes, kGuPacked);
+    CHECK_EQ(p.weight[mu.weights[1]].vram_bytes, (int64_t)0);
+    CHECK_EQ(p.vram_packed.over_budget, (int64_t)1);
+    CHECK_EQ(p.vram_packed.weights, 2 * p.vram_packed.units - 1);
+    CHECK_EQ(p.vram_packed.raw_max, (int64_t)3);
+    CHECK(p.totals.bytes[(int)Tier::VRAM] + p.slab_overhead + p.file_stage_vram <= p.vram_budget);
+}
+
+TEST(without_packing_the_plan_is_the_plain_one) {
+    /* No callback, a callback that finds nothing eligible, and a dynamic plan with the callback: all
+     * three give the plain plan, decision for decision. */
+    FileBufferUnitsEnv cap("1");
+    Fixture f;
+    build_ds41_like(f, 4, 32, kGuBlock, kDnBlock);
+    Config c = base_config();
+    c.placement = "expert_tiered";
+    c.vram_weights_mib = 1500;
+    c.host_pool_mib = 210;
+    c.weights_disk_tier = true;
+    c.deterministic = true;
+    PlannerInput in0{&f.prog, &c, 0, 1, nullptr, 0};
+    Plan p0;
+    CHECK_OK(Planner(in0).plan(&p0));
+
+    int asked = 0;
+    PlannerInput in1{&f.prog, &c, 0, 1, nullptr, 0};
+    in1.vram_pack = [&](rad_weight, bool, int32_t*, int32_t*) -> int64_t { ++asked; return 0; };
+    Plan p1;
+    CHECK_OK(Planner(in1).plan(&p1));
+    CHECK_EQ(digest(f.prog, p0), digest(f.prog, p1));
+    CHECK(asked > 0);
+    CHECK_EQ(p1.vram_packed.units, (int64_t)0);
+    CHECK_EQ(p1.vram_packed.scanned, (int64_t)0);
+    CHECK_EQ(p1.totals.bytes[(int)Tier::VRAM], p0.totals.bytes[(int)Tier::VRAM]);
+
+    c.deterministic = false;
+    PlannerInput in2{&f.prog, &c, 0, 1, nullptr, 0};
+    Plan d0;
+    CHECK_OK(Planner(in2).plan(&d0));
+    FakePack fake;
+    fake.prog = &f.prog;
+    PlannerInput in3{&f.prog, &c, 0, 1, nullptr, 0};
+    in3.vram_pack = fake.fn();
+    Plan d1;
+    CHECK_OK(Planner(in3).plan(&d1));
+    CHECK_EQ(digest(f.prog, d0), digest(f.prog, d1));
+    CHECK_EQ(fake.scans, 0);
+    CHECK_EQ(d1.vram_packed.units, (int64_t)0);
+    for (const MoveUnit& mu : d1.units) CHECK_EQ(mu.vram_bytes, (int64_t)0);
+}
+
+TEST(the_mover_places_and_publishes_packed_residents_as_the_card_holds_them) {
+    /* Small units on the host backend: 12 KiB gate_ups and 6 KiB downs, packed to 11 KiB + 64 and
+     * 5 KiB + 64 (each packed size off a 64-byte boundary, so the down's offset shows the alignment). */
+    Fixture f;
+    build_ds41_like(f, 2, 8, 12 * KiB, 6 * KiB);
+    Config c = base_config();
+    c.placement = "expert_tiered";
+    c.vram_weights_mib = 2;   /* the 1 MiB embedding and every unit */
+    c.host_pool_mib = 64;
+    c.deterministic = true;
+    FakePack fake;
+    fake.prog = &f.prog;
+    fake.gu = 11 * KiB + 40;
+    fake.dn = 5 * KiB + 40;
+    PlannerInput in{&f.prog, &c, 0, 1, nullptr, 0};
+    in.vram_pack = fake.fn();
+    Plan p;
+    CHECK_OK(Planner(in).plan(&p));
+    CHECK(p.vram_packed.units > 0);
+
+    Mover m;
+    MoverConfig mc;
+    CHECK_OK(m.init(f.prog, p, mc));
+    ResidencyTable* rt = m.residency();
+    const int64_t want_dn_off = align_up(fake.gu, 64);
+    int packed_units = 0;
+    std::vector<std::pair<uintptr_t, int64_t>> spans;
+    for (const MoveUnit& mu : p.units) {
+        if (mu.expert < 0 || mu.tier != Tier::VRAM) continue;
+        const WeightSlot* g = rt->lookup(mu.weights[0]);
+        const WeightSlot* d = rt->lookup(mu.weights[1]);
+        REQUIRE(g && d && g->ptr && d->ptr);
+        CHECK_EQ((uintptr_t)g->ptr % 64, (uintptr_t)0);
+        if (mu.vram_bytes > 0) {
+            ++packed_units;
+            CHECK_EQ((int64_t)((const char*)d->ptr - (const char*)g->ptr), want_dn_off);
+            spans.emplace_back((uintptr_t)g->ptr, mu.vram_bytes);
+        } else {
+            CHECK_EQ((int64_t)((const char*)d->ptr - (const char*)g->ptr), mu.offset[1]);
+        }
+    }
+    CHECK_EQ((int64_t)packed_units, p.vram_packed.units);
+    /* Each packed unit starts on its own allocation unit and no two overlap. */
+    std::sort(spans.begin(), spans.end());
+    for (size_t i = 0; i < spans.size(); ++i) {
+        CHECK_EQ(spans[i].first % RAD_ALIGN_UNIT, (uintptr_t)0);
+        if (i) CHECK(spans[i - 1].first + (uintptr_t)spans[i - 1].second <= spans[i].first);
+    }
+}
+
+TEST(the_load_packs_a_weight_and_checks_what_the_card_will_read) {
+    /* vram_pack_weight, the loader's packer: a [64, 2304] weight (down's shape: two full rounds and a partial
+     * one of 8 blocks a row) with scales at 120..121 and a few raw rounds. */
+    const int N = 64, K = 2304, UK = K / 32;
+    std::vector<uint8_t> codes((size_t)N * K / 2), scales((size_t)N * UK);
+    uint64_t z = 7;
+    auto next = [&] { z = z * 6364136223846793005ull + 1442695040888963407ull; return (uint32_t)(z >> 33); };
+    for (auto& c : codes) c = (uint8_t)next();
+    for (auto& v : scales) v = (uint8_t)(120 + (next() & 1));
+    scales[5] = 200;                          /* row 0, round 0: raw */
+    scales[(size_t)3 * UK + 70] = 2;          /* row 3, the partial round: raw */
+    scales[(size_t)40 * UK + 33] = 255;       /* row 40, round 1: raw */
+    const int cap = 4;
+    const size_t bytes = ds41hx::packed_bytes(N, K, cap);
+    REQUIRE(bytes > 0);
+    std::vector<uint8_t> dst(bytes, 0xA5);
+    int n_exc = -1;
+    CHECK_EQ(vram_pack_weight(codes.data(), scales.data(), N, K, cap, dst.data(), (int64_t)bytes, &n_exc), RAD_OK);
+    CHECK_EQ(n_exc, 3);
+    ds41hx::Mx v;
+    REQUIRE(ds41hx::packed_view(dst.data(), bytes, N, K, &v));
+    CHECK(ds41hx::packed_scales_equal(v, scales.data()));
+    CHECK_EQ(std::memcmp(v.codes, codes.data(), codes.size()), 0);
+    /* The same values as the block form, row for row (the host's reference decode of each layout). */
+    std::vector<uint16_t> x(K), y_pk(N), y_pl(N);
+    for (auto& e : x) e = (uint16_t)(0x3c00 + (next() & 0x3ff));
+    ds41hx::Mx pl;
+    pl.N = N; pl.K = K; pl.codes = codes.data(); pl.scales = scales.data();
+    ds41hx::gemv_ref(v, x.data(), y_pk.data(), 0, N);
+    ds41hx::gemv_ref(pl, x.data(), y_pl.data(), 0, N);
+    CHECK(y_pk == y_pl);
+    /* More raw rounds than room: refused, nothing claimed. */
+    std::vector<uint8_t> small(ds41hx::packed_bytes(N, K, 2));
+    CHECK_EQ(vram_pack_weight(codes.data(), scales.data(), N, K, 2, small.data(), (int64_t)small.size(), &n_exc),
+             RAD_E_FULL);
+    CHECK_EQ(n_exc, 3);
+    /* A destination short of the form, and a shape it cannot hold. */
+    CHECK_EQ(vram_pack_weight(codes.data(), scales.data(), N, K, cap, dst.data(), (int64_t)bytes - 1, &n_exc),
+             RAD_E_SHAPE);
+    CHECK_EQ(vram_pack_weight(codes.data(), scales.data(), N, K + 16, cap, dst.data(), (int64_t)bytes, &n_exc),
+             RAD_E_SHAPE);
+}
+
+TEST(the_vram_packed_switch_and_its_budget_parse) {
+    struct Env {
+        const char* k;
+        std::string old;
+        bool had;
+        explicit Env(const char* key) : k(key) { const char* o = std::getenv(k); had = o; if (o) old = o; }
+        ~Env() { if (had) ::setenv(k, old.c_str(), 1); else ::unsetenv(k); }
+    } on("RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED"), raw("RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED_RAW");
+    VramPackConfig c;
+    ::unsetenv("RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED");
+    ::unsetenv("RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED_RAW");
+    CHECK_OK(vram_pack_config(&c));
+    CHECK(!c.on);
+    ::setenv("RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED", "0", 1);
+    CHECK_OK(vram_pack_config(&c));
+    CHECK(!c.on);
+    ::setenv("RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED", "1", 1);
+    CHECK_OK(vram_pack_config(&c));
+    CHECK(c.on);
+    CHECK_EQ(c.raw[0], 512);
+    CHECK_EQ(c.raw[1], 320);
+    ::setenv("RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED_RAW", "600,3400", 1);
+    CHECK_OK(vram_pack_config(&c));
+    CHECK_EQ(c.raw[0], 600);
+    CHECK_EQ(c.raw[1], 3400);
+    ::setenv("RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED_RAW", "600", 1);
+    CHECK_EQ(vram_pack_config(&c), RAD_E_INVAL);
+    ::setenv("RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED_RAW", "512,320", 1);
+    ::setenv("RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED", "yes", 1);
+    CHECK_EQ(vram_pack_config(&c), RAD_E_INVAL);
 }
 
 RAD_TEST_MAIN()

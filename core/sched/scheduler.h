@@ -325,13 +325,32 @@ public:
      *   promote_next   once this step has committed: the next step becomes the open one.
      *
      * While the next step is open, commit() leaves continuing requests' blocks in place, and a
-     * finished request keeps them until that step has run. */
+     * finished request keeps them until that step has run.
+     *
+     * The one thing the host does learn from a step is whether it ended a request. Issued ahead
+     * of that, a step behind the last one of a request that stops at an end-of-generation token
+     * runs a pass for the finished request alone (SchedMetrics::ended_with_step_ahead). With
+     * RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP the engine reads the step's tokens back first
+     * whenever outcome_decides_next says they can decide it, and hands them to step_next as
+     * `known`; a step whose outcome ends every request it carries is then followed by nothing. */
     void            expect_draft(uint64_t id, int n);
-    const RadBatch* step_next();
-    const RadBatch* step_next_locked();
+    const RadBatch* step_next(const StepResult* known = nullptr);
+    const RadBatch* step_next_locked(const StepResult* known = nullptr);
     /* Whether the step just issued likely ends every request it carries; step_next_locked then
      * issues nothing behind it. */
     bool            ends_every_request() const;
+    /* Whether the open step's own tokens could withhold the step that would be issued behind it:
+     * it carries one sequence, which produces a token this step, still runs, and could end on an
+     * end-of-generation token (not ignore_eos), and ends_every_request does not already withhold
+     * it. Steps of two or more sequences are not read back first: they end all at once too
+     * rarely to pay for the wait, and a step issued without some of their rows would batch the
+     * others differently, which on the card can change their bits. */
+    bool            outcome_decides_next() const;
+    /* Whether committing `r` against the open step would end every request it carries, by
+     * commit()'s own end conditions: an end-of-generation token not ignored, max_tokens, or the
+     * context. A step with a row that produces no token, or whose request no longer runs, is not
+     * ended by its outcome. Read under the step lock or on the step thread, as plan(). */
+    bool            outcome_ends_every_request(const StepResult& r) const;
     void            promote_next();
     /* Fold the step's outcome back in: append tokens, roll back rejected speculation, retire
      * finished requests, feed the draft controller, and fill `r`'s report counts

@@ -215,6 +215,7 @@ arm() {   # name, then env assignments for the server; CACHE_MIB the RAM cache (
   grep -E 'host experts|EP scoped|live chain|error|ERR' "$OUT/$name.server.log" | tail -16 | tee -a "$OUT/window.log"
   grep -E 'read-ahead (in pieces|readers)|router predictor \(' "$OUT/$name.server.log" | tail -6 | tee -a "$OUT/window.log"
   grep -E 'rank 0: on-die reads' "$OUT/$name.server.log" | tee -a "$OUT/window.log"   # Pa/Pm/Pl/Pe: plan, counts
+  grep -E 'post-stop passes: [0-9]' "$OUT/$name.server.log" | tail -1 | tee -a "$OUT/window.log"   # passes after a reply's end (Ss)
 }
 
 if [[ "$("${DOCKER[@]}" inspect "$NAME" --format '{{.State.Status}}' 2>/dev/null)" != running ]]; then
@@ -355,6 +356,11 @@ for a in $ARMS; do
 # kernel's card times into chain-<arm>.stamps.csv (RADIANCE_EXPERIMENTAL_DS41_CHAIN_TRACE; read them
 # with chain_report.py; without Ov it is the dump-only arm: what the check would free, nothing
 # changed); rN a repeat (ignored).
+# Ss a step of one sequence that its own token can end has its tokens read back before the next
+# step is planned, and nothing runs behind one that ended its request: no forward pass after a
+# reply's end-of-generation token, which the reply (and the next request) otherwise waits out,
+# ~0.26 s when the cache lacks its experts (RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP; exact: the
+# passes that run are the ones that ran; the shutdown's "post-stop passes" line counts both).
 # the RAM cache's profile-hot units get N second chances before eviction; Ei a routed layer's card
 # ops (gate_up, swiglu, down, shared expert) issued ahead of its counts sync, the CPU's share chosen
 # at its gather (RADIANCE_EXPERIMENTAL_DS41_EARLY_ISSUE; needs all, M16 and B1); Fl the counts and
@@ -454,6 +460,7 @@ for a in $ARMS; do
                env+=(RADIANCE_EXPERIMENTAL_DS41_CHAIN_TRACE=${ct:-16}
                      RADIANCE_EXPERIMENTAL_DS41_CHAIN_TRACE_OUT=$(cd "$OUT" && pwd)/chain-$a) ;;
       Ei)      env+=(RADIANCE_EXPERIMENTAL_DS41_EARLY_ISSUE=1) ;;      # routed card ops ahead of the counts sync
+      Ss)      env+=(RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP=1) ;;   # no pass behind a reply's last token
       Fl)      env+=(RADIANCE_EXPERIMENTAL_DS41_FETCH_LIST=1) ;;       # counts + CPU rows in one ranged copy
       Ms[0-9]) env+=(RADIANCE_EXPERIMENTAL_DS41_MIRROR_SPLIT=${p#Ms}) ;;  # a lone decode miss's mirror tail in N pieces
       Mp)      env+=(RADIANCE_EXPERIMENTAL_DS41_MISS_POST=1) ;;       # miss reads start at the choice, before the pool's wake
@@ -493,6 +500,8 @@ for a in $ARMS; do
     fi
   fi
   ARM_RB=$rb ARM_PRED=$pred
+  # Ss: the read-back runs in an arm only if its name says so, whatever the window's environment.
+  [[ " ${env[*]} " == *" RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP=1 "* ]] || env+=(RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP=0)
   [[ -n "$skip" ]] && continue
   [[ -n "$power" ]] && power_set "$power"
   case $pol in

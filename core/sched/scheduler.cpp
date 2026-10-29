@@ -2144,9 +2144,9 @@ void Scheduler::expect_draft(uint64_t id, int n) {
     s.draft_next = n > 0 ? n : 0;
 }
 
-const RadBatch* Scheduler::step_next() {
+const RadBatch* Scheduler::step_next(const StepResult* known) {
     std::lock_guard<std::mutex> lk(mu_);
-    const RadBatch* b = step_next_locked();
+    const RadBatch* b = step_next_locked(known);
     if (!b)
         for (const StepEntry& e : plan_.e)
             if (e.slot >= 0 && (size_t)e.slot < reqs_.size() && reqs_[(size_t)e.slot])
@@ -2187,7 +2187,63 @@ bool Scheduler::ends_every_request() const {
     return !plan_.e.empty();
 }
 
-const RadBatch* Scheduler::step_next_locked() {
+/* RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP (Engine::issue_ahead): whether the open step's tokens
+ * should be read back before a step is issued behind it. Only a step of one sequence, which its
+ * own token can end: with ignore_eos only max_tokens or the context can, and ends_every_request
+ * already withholds the step whenever they may. Reading back first costs the card the host's
+ * turnaround between the two passes on every such step (the wait's wake-up, the next step's
+ * build and advance, the ranks' release: tens of microseconds against a 57 ms DS41 decode token);
+ * what it saves is the pass after a reply's last token, which on the CPU path runs whole before
+ * the commit that ends the reply (SchedMetrics::ended_with_step_ahead): about a token's time warm,
+ * and ~0.26 s for an end-of-generation token whose experts the RAM cache does not hold (~100
+ * misses in the 29 Oct trace). Two or more sequences end at the same step too rarely to pay for
+ * the wait on every step, and withholding a step that some of them continue in would change how
+ * their rows are batched, which on the card can change their bits. */
+bool Scheduler::outcome_decides_next() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (!step_open_ || next_open_ || plan_.e.size() != 1) return false;
+    const StepEntry& e = plan_.e[0];
+    if (!e.produces_token || e.slot < 0 || (size_t)e.slot >= reqs_.size() || !reqs_[(size_t)e.slot])
+        return false;
+    const SchedReq& s = *reqs_[(size_t)e.slot];
+    if (!s.req || s.req->state != ReqState::Running || s.req->ignore_eos || s.req->embed)
+        return false;
+    return !ends_every_request();
+}
+
+/* commit()'s end conditions, evaluated on an outcome before it is committed: a row ends on an
+ * end-of-generation token unless its request ignores them, or once its emission (its token and
+ * the drafts it accepted, as commit emits them) reaches max_tokens or the context. Each of those
+ * ends the request in commit whatever the order it tests them in, and commit emits a row's tokens
+ * only up to that bound, so `output.size() + 1 + accepted` reaching it is the same test. commit's
+ * other ends (a sink overflow, logprobs that could not be computed, a client that hung up) are
+ * not predicted: a step issued behind one of those runs as it always has. */
+bool Scheduler::outcome_ends_every_request(const StepResult& res) const {
+    if (plan_.e.empty() || res.n_seq != (int)plan_.e.size() || !res.token) return false;
+    for (int i = 0; i < res.n_seq; ++i) {
+        const StepEntry& e = plan_.e[(size_t)i];
+        if (!e.produces_token || e.slot < 0 || (size_t)e.slot >= reqs_.size() ||
+            !reqs_[(size_t)e.slot])
+            return false;
+        const SchedReq& s = *reqs_[(size_t)e.slot];
+        if (!s.req || s.req->state != ReqState::Running || s.req->embed) return false;
+        const Request& r = *s.req;
+        if (res.eos && res.eos[i] && !r.ignore_eos) continue;
+        int64_t n = 1;
+        if (!e.is_prefill) {
+            int32_t a = res.n_accepted ? res.n_accepted[i] : 0;
+            if (a < 0) a = 0;
+            if (a > e.n_spec) a = e.n_spec;
+            n += a;
+        }
+        if (r.max_tokens > 0 && (int64_t)r.output.size() + n >= r.max_tokens) continue;
+        if (ctx_limit_ > 0 && s.seq_len() + n >= ctx_limit_) continue;
+        return false;
+    }
+    return true;
+}
+
+const RadBatch* Scheduler::step_next_locked(const StepResult* known) {
     if (!step_open_ || next_open_ || plan_.e.empty()) return nullptr;
     /* An admission is a decision about the pool and the queue that the full step makes. */
     if (!waiting_.empty()) return nullptr;
@@ -2201,6 +2257,17 @@ const RadBatch* Scheduler::step_next_locked() {
     if (prefill_alone_ && (pf_skipped_ > 0 || plan_.e.size() != running_.size())) return nullptr;
     /* Before the loop below, which reserves the next step's KV. */
     if (ends_every_request()) return nullptr;
+    /* RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP: the step's own tokens, read back before this
+     * (Engine::issue_ahead), end every request it carries. A step issued behind it would run its
+     * forward pass for finished requests, which nothing reads (commit publishes a finished
+     * sequence's prefix up to its last token's position, and that pass would write the position
+     * after), and the reply and the next request would wait behind it. Also before the KV
+     * reservation: nothing is held for the step that is not issued, so the commit frees the
+     * requests' blocks at once instead of deferring them to it. */
+    if (known && outcome_ends_every_request(*known)) {
+        ++m_.steps_ahead_withheld;
+        return nullptr;
+    }
 
     plan_next_.reset();
     for (const StepEntry& e : plan_.e) {
@@ -2511,6 +2578,9 @@ int Scheduler::commit(StepResult& res) {
         } else if (eos) {
             close_request(s, ReqState::Finished, "stop", carried);
         }
+        /* A pass already issued behind the request's last step will run a row for it
+         * (SchedMetrics::ended_with_step_ahead). */
+        if (carried && r.state != ReqState::Running) ++m_.ended_with_step_ahead;
         /* -v: a request ended with a step issued ahead behind it, which ends_every_request did not
          * predict. */
         if (carried && r.state != ReqState::Running && (int)log_level() >= (int)Log::Debug) {

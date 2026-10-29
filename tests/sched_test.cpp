@@ -5015,6 +5015,235 @@ TEST(no_step_is_issued_ahead_behind_one_that_ends_its_requests) {
     CHECK_EQ(nb->n_seq, 2);
 }
 
+namespace {
+/* One sequence's outcome, as Engine::peek_outcome hands it to step_next. */
+struct Outcome {
+    int32_t token = 0, accepted = 0;
+    uint8_t eos = 0;
+    Scheduler::StepResult r() {
+        Scheduler::StepResult x;
+        x.n_seq = 1;
+        x.token = &token;
+        x.n_accepted = &accepted;
+        x.eos = &eos;
+        return x;
+    }
+};
+}  /* namespace */
+
+/* RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP: with each step's own outcome read back before the next
+ * is planned (`known`), nothing is issued behind the step whose token ends the reply. Without it
+ * the step behind runs a pass for the finished request (ended_with_step_ahead) and holds its blocks
+ * to its own commit, and a request arriving after the reply runs only after that step; with it the
+ * reply's commit returns the blocks, nothing was reserved for a next step, and the next request's
+ * prompt is the very next step. The reply, and every step issued before its end, are the same. */
+TEST(a_step_whose_tokens_end_its_request_issues_nothing_behind_it) {
+    constexpr int32_t kEog = 2;
+    std::vector<int32_t> reply[2];
+    for (int skip = 0; skip < 2; ++skip) {
+        Fixture f;
+        f.build();
+        f.cfg.prefix_cache = false;   /* a finished request's blocks are not kept as a prefix */
+        CHECK_OK(f.start());
+        f.sch.set_eog({ kEog });
+        const int64_t free0 = f.kv.free_blocks(0);
+        const uint64_t id = f.submit(8, 64);
+        REQUIRE(f.sch.step() != nullptr);               /* the prompt */
+        Request* r = f.sch.find(id);
+        REQUIRE(r != nullptr);
+        r->speculation_fixed = true;
+        /* The prompt's step and three decode steps go on, each with the next issued behind it
+         * before it commits; the fourth decode step's token ends the reply. */
+        const int32_t toks[5] = { 11, 21, 22, 23, kEog };
+        for (int k = 0; k < 5; ++k) {
+            const bool last = k == 4;
+            Outcome o;
+            o.token = toks[k];
+            o.eos = last ? 1 : 0;
+            const Scheduler::StepResult known = o.r();
+            CHECK(f.sch.outcome_decides_next());
+            CHECK_EQ(f.sch.outcome_ends_every_request(known), last);
+            const int64_t free_before = f.kv.free_blocks(0);
+            const RadBatch* nb = f.sch.step_next(skip ? &known : nullptr);
+            CHECK_EQ(nb != nullptr, !(skip && last));
+            if (!nb) CHECK_EQ(f.kv.free_blocks(0), free_before);   /* nothing reserved */
+            CHECK_OK(f.commit(o.token, o.eos));
+            if (nb) f.sch.promote_next();
+        }
+        CHECK_EQ((int)r->state, (int)ReqState::Finished);
+        CHECK_EQ(r->finish_reason, std::string("stop"));
+        reply[skip] = r->output;
+        /* The next request arrives after the reply. */
+        const uint64_t next = f.submit(8, 64);
+        const SchedMetrics m = f.sch.metrics();
+        if (!skip) {
+            /* The step issued behind the reply's end is open: a pass for the finished request,
+             * which holds the request's blocks until it commits. */
+            CHECK_EQ(m.ended_with_step_ahead, 1);
+            CHECK_EQ(m.steps_ahead_withheld, 0);
+            CHECK_EQ(m.steps_ahead, 5);
+            REQUIRE_EQ(f.sch.plan().e.size(), (size_t)1);
+            CHECK_EQ(f.sch.plan().e[0].seq, id);
+            CHECK(f.kv.has_sequence(id));
+            CHECK_OK(f.commit(7));
+        } else {
+            CHECK_EQ(m.ended_with_step_ahead, 0);
+            CHECK_EQ(m.steps_ahead_withheld, 1);
+            CHECK_EQ(m.steps_ahead, 4);
+        }
+        CHECK(!f.kv.has_sequence(id));
+        CHECK_EQ(f.kv.free_blocks(0), free0);
+        /* Only now can the next request's prompt run: with the switch right after the reply. */
+        REQUIRE(f.sch.step() != nullptr);
+        REQUIRE_EQ(f.sch.plan().e.size(), (size_t)1);
+        CHECK_EQ(f.sch.plan().e[0].seq, next);
+        CHECK(f.sch.plan().e[0].is_prefill);
+    }
+    CHECK(reply[0] == std::vector<int32_t>({ 11, 21, 22, 23, kEog }));
+    CHECK(reply[0] == reply[1]);
+}
+
+/* outcome_ends_every_request is commit()'s end test run before the commit: over random requests
+ * (max_tokens none or 1..8, the context 9..17 tokens or the default, ignore_eos or not) and their
+ * steps (the prompt's, then verifies of up to four drafts), with random outcomes (any number of
+ * drafts accepted, any token, the end flag set or not), it says the request ends exactly when the
+ * commit of that outcome ends it, by its end-of-generation token, max_tokens or the context. */
+TEST(an_outcome_ends_every_request_exactly_when_its_commit_does) {
+    uint32_t rng = 2026;
+    auto pick = [&](uint32_t n) {
+        rng = rng * 1664525u + 1013904223u;
+        return (int32_t)((rng >> 16) % n);
+    };
+    int ends = 0, goes_on = 0, by_eos = 0, by_length = 0;
+    for (int it = 0; it < 300; ++it) {
+        Fixture f;
+        f.build();
+        f.cfg.n_spec = 4;
+        f.cfg.prefix_cache = false;
+        if (pick(3) == 0) f.cfg.max_ctx = 9 + pick(9);   /* 9: the prompt's own token fills it */
+        CHECK_OK(f.start());
+        f.sch.set_eog({ 2, 3 });
+        const int max_tokens = pick(4) == 0 ? 0 : 1 + pick(8);
+        const uint64_t id = f.submit(8, max_tokens, 0, pick(4) == 0);
+        REQUIRE(id != 0);
+        for (int k = 0; k < 40; ++k) {
+            if (k > 0) {
+                int32_t d[4];
+                for (int32_t& x : d) x = pick(4) == 0 ? 2 : 20 + pick(4);
+                CHECK_OK(f.sch.set_draft(id, d, 4));
+            }
+            REQUIRE(f.sch.step() != nullptr);
+            REQUIRE_EQ(f.sch.plan().e.size(), (size_t)1);
+            const StepEntry& e = f.sch.plan().e[0];
+            Outcome o;
+            o.token = pick(3) == 0 ? 3 : 20 + pick(4);
+            o.eos = pick(4) == 0 ? 1 : 0;
+            o.accepted = e.n_spec > 0 ? pick((uint32_t)e.n_spec + 1) : 0;
+            Scheduler::StepResult res = o.r();
+            const bool predicted = f.sch.outcome_ends_every_request(res);
+            CHECK_OK(f.sch.commit(res));
+            const Request* r = f.sch.find(id);
+            REQUIRE(r != nullptr);
+            const bool ended = r->state != ReqState::Running;
+            if (predicted != ended)
+                fprintf(stderr, "    case %d step %d: max_tokens %d, context %lld, ignore_eos %d, "
+                        "n_spec %d, accepted %d, eos %d: predicted %d, committed %d (%s)\n", it, k,
+                        max_tokens, (long long)f.cfg.max_ctx, (int)r->ignore_eos, (int)e.n_spec,
+                        (int)o.accepted, (int)o.eos, (int)predicted, (int)ended,
+                        r->finish_reason.c_str());
+            CHECK_EQ(predicted, ended);
+            if (!ended) { ++goes_on; continue; }
+            ++ends;
+            (r->finish_reason == "stop" ? by_eos : by_length) += 1;
+            break;
+        }
+    }
+    /* Both answers, and both kinds of end, many times over. */
+    CHECK(ends > 100);
+    CHECK(goes_on > 100);
+    CHECK(by_eos > 30);
+    CHECK(by_length > 30);
+}
+
+/* A step of two sequences is not read back first: they end at the same step too rarely to pay for
+ * the wait on every step. An outcome that ends one of them leaves the step issued behind it for
+ * both, as without the outcome, since issued without the ended one's row the other would run in a
+ * step of another shape, whose bits on a card can differ; only one that ends both withholds it. */
+TEST(a_step_of_two_sequences_is_withheld_only_when_both_end) {
+    constexpr int32_t kEog = 2;
+    for (int both = 0; both < 2; ++both) {
+        Fixture f;
+        f.build();
+        f.cfg.prefix_cache = false;
+        CHECK_OK(f.start());
+        f.sch.set_eog({ kEog });
+        const uint64_t a = f.submit(8, 64), b = f.submit(8, 64);
+        REQUIRE(f.sch.step() != nullptr);
+        f.commit_plain(11);
+        REQUIRE(f.sch.step() != nullptr);
+        REQUIRE_EQ(f.sch.plan().e.size(), (size_t)2);
+        f.sch.find(a)->speculation_fixed = true;
+        f.sch.find(b)->speculation_fixed = true;
+        CHECK(!f.sch.outcome_decides_next());
+        int32_t t[2] = { kEog, both ? kEog : 21 }, acc[2] = { 0, 0 };
+        uint8_t eos[2] = { 1, (uint8_t)both };
+        Scheduler::StepResult known;
+        known.n_seq = 2;
+        known.token = t;
+        known.n_accepted = acc;
+        known.eos = eos;
+        CHECK_EQ(f.sch.outcome_ends_every_request(known), both == 1);
+        const RadBatch* nb = f.sch.step_next(&known);
+        CHECK_EQ(nb != nullptr, both == 0);
+        if (nb) CHECK_EQ(nb->n_seq, 2);
+        CHECK_EQ(f.sch.metrics().steps_ahead_withheld, (int64_t)both);
+    }
+}
+
+/* A step is read back first only when its own token can withhold the next: not for a request that
+ * ignores end-of-generation tokens (only max_tokens or the context end it, which
+ * ends_every_request already foresees), not for a step that ends_every_request already withholds
+ * (the reply's max_tokens-th token), and not for a step whose row produces no token (a chunk in
+ * the middle of a prompt). */
+TEST(a_step_is_read_back_first_only_when_its_own_token_can_end_it) {
+    {
+        Fixture f;
+        f.build();
+        CHECK_OK(f.start());
+        f.sch.set_eog({ 2 });
+        const uint64_t id = f.submit(8, 64, 0, /*ignore_eos=*/true);
+        REQUIRE(f.sch.step() != nullptr);
+        CHECK(!f.sch.outcome_decides_next());
+        f.commit_plain();
+        REQUIRE(f.sch.step() != nullptr);
+        f.sch.find(id)->speculation_fixed = true;
+        CHECK(!f.sch.outcome_decides_next());
+    }
+    {
+        Fixture f;
+        f.build();
+        CHECK_OK(f.start());
+        f.sch.set_eog({ 2 });
+        f.submit(8, /*max_tokens=*/2);
+        REQUIRE(f.sch.step() != nullptr);
+        CHECK(f.sch.outcome_decides_next());     /* the prompt's token, the first of two */
+        f.commit_plain();
+        REQUIRE(f.sch.step() != nullptr);        /* the second and last */
+        CHECK(f.sch.ends_every_request());
+        CHECK(!f.sch.outcome_decides_next());
+    }
+    {
+        Fixture f;
+        f.build(4096, 64, /*max_tok=*/64);
+        CHECK_OK(f.start());
+        f.sch.set_eog({ 2 });
+        f.submit(200, 64);
+        REQUIRE(f.sch.step() != nullptr);
+        REQUIRE(!f.sch.plan().e[0].produces_token);
+        CHECK(!f.sch.outcome_decides_next());
+    }
+}
+
 /* The context bounds a sequence whatever max_tokens says, "no limit" included. Positions past the
  * last one the deployment can address have no rotary row or block-table column; a sequence
  * running into them would corrupt memory instead of stopping. */

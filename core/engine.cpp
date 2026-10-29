@@ -709,19 +709,35 @@ int Engine::prepare_release(const RadBatch* b) {
     return RAD_OK;
 }
 
-int Engine::issue_ahead(const RadBatch** out) {
+int Engine::issue_ahead(const RadBatch** out, const StepOut& so) {
     *out = nullptr;
     if (!pipelining_) return RAD_OK;
     for (int i = 0; i < serial_rows_ && serial_done_ > 0; ++i)
         sched_.expect_draft(serial_row_[(size_t)i].seq, serial_done_);
     for (int i = 0; i < block_rows_; ++i)
         sched_.expect_draft(block_row_[(size_t)i].seq, block_steps_);
-    const RadBatch* nb = sched_.step_next();
+    /* RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP: this step's ids first, when they can decide
+     * whether a step follows (Scheduler::outcome_decides_next). Issued ahead regardless, the step
+     * behind a reply's last token runs a pass for a finished request; and where issuing a pass
+     * waits for the card, as the CPU path's routed layers do, the commit that ends the reply comes
+     * only after most of that pass, so the reply and the next request wait it out (the EOS
+     * token's pass misses ~100 experts when the cache has not held them: ~0.26 s). The read-back
+     * moves no commit: the ids are read again by collect_step and committed after this as
+     * before, and a step that is issued is the step that would have been. */
+    Scheduler::StepResult known{};
+    const bool peek = post_stop_ && sched_.outcome_decides_next();
+    if (peek) RAD_TRY(peek_outcome(so, &known));
+    const RadBatch* nb = sched_.step_next(peek ? &known : nullptr);
     if (!nb) return RAD_OK;
     /* Its rows' tokens, positions and slots, advanced on the card behind this step's acceptance
      * and drafts. */
     RAD_TRY(advance_all(ADV_TRUNK, 0, false));
     RAD_TRY(prepare_release(nb));
+    if (peek && known.token) {
+        ++post_stop_issued_;
+        post_stop_turn_ns_ += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                  std::chrono::steady_clock::now() - post_stop_t_).count();
+    }
     issue_what_.store(kIssueModel, std::memory_order_release);
     step_batch_.store(nb, std::memory_order_release);
     barrier_->arrive_and_wait();
@@ -770,6 +786,18 @@ int Engine::step_loop() {
     pipelining_ = draft_experiment_.target_pipelining(!cfg_.kld() && !embedding_,
                               serial_drafting(), block_drafting(), cfg_.n_spec);
     early_ids_ = !cfg_.kld() && !embedding_;
+    /* RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP (read in serve()): only where steps are issued
+     * ahead; without that no pass follows a reply's last token. */
+    post_stop_ = post_stop_asked_ && pipelining_;
+    if (post_stop_)
+        RAD_INFO("post-stop passes: a step of one sequence that its own token can end is read back "
+                 "before the next step is planned, and nothing is issued behind one that ended its "
+                 "request (RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP)");
+    else if (post_stop_asked_)
+        RAD_INFO("post-stop passes: RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP has nothing to "
+                 "do: no step is issued ahead in this configuration (KL mode, an embedding model, "
+                 "or a drafter that reads the committed sequence), so none follows a reply's last "
+                 "token");
     const bool t_on = (int)log_level() >= (int)Log::Debug;
     /* The next step's forward pass when already issued behind the previous step, before its
      * readback (Scheduler::step_next). */
@@ -1063,7 +1091,7 @@ int Engine::step_loop() {
         /* Then the next step's forward pass, before this step is read back. Its rows continue from
          * the card's acceptance and verify the new drafts; its sampler waits for this step's
          * commit. The card runs straight on while the host waits, commits and stages. */
-        st = issue_ahead(&ahead);
+        st = issue_ahead(&ahead, so);
         if (st < 0) return fail_loop(st);
         st = embedding_ ? collect_pooled(b, so) : collect_step(b, so);
         if (t_on) phase_mark(PH_COLLECT);
@@ -1176,6 +1204,7 @@ int Engine::step_loop() {
             }
         }
     }
+    post_stop_report();
     return RAD_OK;
 }
 
@@ -1576,6 +1605,80 @@ int Engine::collect_step(const RadBatch* b, StepOut& so) {
         r->may_speculate = ranks_[0]->sampler.allows_speculation(r->id);
     }
     return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ the pass after a reply */
+/* RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP: the open step's outcome before the next step is
+ * planned (issue_ahead), from the same ids and by the same rules as collect_step: a verify row's
+ * accepted drafts by agreement, cut at the first end-of-generation token, and the token it ends
+ * on. collect_step's effects are left to it (the grammars' advance, logprobs, the rows it keeps,
+ * may_speculate), so the commit that follows is the one there always was. Waits for the ids on
+ * the event collect_step waits on, which it then finds signalled. */
+int Engine::peek_outcome(const StepOut& so, Scheduler::StepResult* out) {
+    const StepPlan& plan = sched_.plan();
+    const size_t n = plan.e.size();
+    peek_tok_.assign(n, 0);
+    peek_acc_.assign(n, 0);
+    peek_eos_.assign(n, 0);
+    *out = Scheduler::StepResult{};
+    if (so.n_rows <= 0 || !so.rb || so.first_row.size() != n) return RAD_OK;
+    const auto t0 = std::chrono::steady_clock::now();
+    RAD_TRY(rad_event_sync(so.early ? tok_end_ : step_end_));
+    post_stop_t_ = std::chrono::steady_clock::now();
+    post_stop_wait_ns_ += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              post_stop_t_ - t0).count();
+    ++post_stop_peeks_;
+    auto eog = [&](int32_t t) { return vocab_ && vocab_->is_eog(t); };
+    for (size_t i = 0; i < n; ++i) {
+        const int32_t f = so.first_row[i];
+        if (f < 0) continue;
+        const StepEntry& e = plan.e[i];
+        if (f + std::max(e.n_spec, 0) >= so.n_rows) continue;
+        const int32_t* y = so.rb + f;
+        if (e.n_spec > 0) {
+            if (!e.req) continue;   /* as collect_step: no token, no end */
+            int32_t o[RAD_SCHED_MAX_SPEC + 1] = { 0 };
+            int32_t acc = 0;
+            RAD_TRY(accept_greedy(e.draft, e.n_spec, y, o, &acc));
+            acc = accept_cut_at_eog(o, acc, eog);
+            peek_acc_[i] = acc;
+            peek_tok_[i] = o[acc];
+        } else {
+            peek_tok_[i] = y[0];
+        }
+        peek_eos_[i] = eog(peek_tok_[i]) ? 1 : 0;
+    }
+    out->n_seq      = (int)n;
+    out->token      = peek_tok_.data();
+    out->n_accepted = peek_acc_.data();
+    out->eos        = peek_eos_.data();
+    return RAD_OK;
+}
+
+/* At the step loop's end: how many requests ended with a pass issued behind their last token
+ * (SchedMetrics::ended_with_step_ahead; with the switch, steps of two or more sequences and
+ * commit's unpredicted ends), and with RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP the steps read
+ * back first, the wait for their ids, the host's turnaround from the ids to the next step's
+ * release (the card's idle time per step, less the ranks' wake-up), and the passes withheld. */
+void Engine::post_stop_report() {
+    if (!pipelining_) return;
+    const SchedMetrics m = sched_.metrics();
+    if (!m.ended_with_step_ahead && !post_stop_) return;
+    RAD_INFO("post-stop passes: %lld request(s) ended with a step issued ahead behind their last "
+             "one (a forward pass after the last token)%s",
+             (long long)m.ended_with_step_ahead,
+             post_stop_
+                 ? fmt("; ..._SKIP_POST_STOP: %llu step(s) read back before the next was planned "
+                       "(%.1f ms waiting for their ids, %.1f us a step), %lld of them ended their "
+                       "request and issued nothing behind it, %llu issued the next step %.1f us "
+                       "after their ids (its build, advance and arena; the card waits through it)",
+                       (unsigned long long)post_stop_peeks_, (double)post_stop_wait_ns_ * 1e-6,
+                       post_stop_peeks_ ? (double)post_stop_wait_ns_ * 1e-3 /
+                                              (double)post_stop_peeks_ : 0.0,
+                       (long long)m.steps_ahead_withheld, (unsigned long long)post_stop_issued_,
+                       post_stop_issued_ ? (double)post_stop_turn_ns_ * 1e-3 /
+                                               (double)post_stop_issued_ : 0.0).c_str()
+                 : "");
 }
 
 /* ------------------------------------------------------------------ the KV loan */
@@ -2126,6 +2229,19 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
     }
 
     for (auto& r : ranks_) r->sampler.attach_vocab(vocab_view_.get());
+
+    /* RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP=1 (issue_ahead): anything but 0 or 1 is refused
+     * here, before the expert stats' thread or any other starts. */
+    if (const char* v = std::getenv("RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP"); v && *v &&
+        std::strcmp(v, "0") != 0) {
+        if (std::strcmp(v, "1") != 0) {
+            RAD_ERR("RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP=%s: 1 reads a step's tokens back "
+                    "before planning the next behind it, so that nothing runs after a reply's last "
+                    "token; 0 or unset leaves the step issued ahead as before", v);
+            return RAD_E_INVAL;
+        }
+        post_stop_asked_ = true;
+    }
 
     if (const int xs = xstats_open(); xs < 0) return xs;
 

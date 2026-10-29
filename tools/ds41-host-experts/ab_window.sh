@@ -278,6 +278,11 @@ for a in $ARMS; do
 # kernel's card times into chain-<arm>.stamps.csv (RADIANCE_EXPERIMENTAL_DS41_CHAIN_TRACE; read them
 # with chain_report.py; without Ov it is the dump-only arm: what the check would free, nothing
 # changed); rN a repeat (ignored).
+# the RAM cache's profile-hot units get N second chances before eviction; Ei a routed layer's card
+# ops (gate_up, swiglu, down, shared expert) issued ahead of its counts sync, the CPU's share chosen
+# at its gather (RADIANCE_EXPERIMENTAL_DS41_EARLY_ISSUE; needs all, M16 and B1); Fl the counts and
+# the CPU's rows fetched in one ranged copy instead of four (RADIANCE_EXPERIMENTAL_DS41_FETCH_LIST;
+# needs host experts); rN a repeat (ignored).
   IFS=- read -r -a parts <<< "$a"
   pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 HOST_POOL_MIB=4096 EXTRA_ARGS="" ARM_HOME="$RHOME" ARM_CONC=
   power="" skip="" ARGS=() f8="" f8x=""
@@ -351,6 +356,8 @@ for a in $ARMS; do
                ct=${p#Ct}
                env+=(RADIANCE_EXPERIMENTAL_DS41_CHAIN_TRACE=${ct:-16}
                      RADIANCE_EXPERIMENTAL_DS41_CHAIN_TRACE_OUT=$(cd "$OUT" && pwd)/chain-$a) ;;
+      Ei)      env+=(RADIANCE_EXPERIMENTAL_DS41_EARLY_ISSUE=1) ;;      # routed card ops ahead of the counts sync
+      Fl)      env+=(RADIANCE_EXPERIMENTAL_DS41_FETCH_LIST=1) ;;       # counts + CPU rows in one ranged copy
       *)       log "arm $a: unknown part $p; the arm is skipped (it would run without what its name says)"; skip=1 ;;
     esac
   done

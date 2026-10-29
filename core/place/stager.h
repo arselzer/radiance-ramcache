@@ -88,6 +88,7 @@
 #include "ep_route_counts.h"
 #include "dspark_head_tail.h"
 #include "host_expert_pool.h"
+#include "hx_fetch_list.h"
 #include "readahead.h"
 
 #include <array>
@@ -316,6 +317,15 @@ public:
         uint64_t moved = 0;           /* a gate_up's operands at new addresses (kept the newest) */
         uint64_t probed = 0;          /* selected units hx_choose borrowed to test for the cache:
                                        * the mapped cache's own hit/miss counts include these */
+        /* ..._EARLY_ISSUE: layers whose card ops went ahead of their counts sync (their CPU share
+         * chosen at the gather), the issuing thread's wait there for the counts, the layers whose
+         * counts had landed before the thread got there (it was behind the card, so issuing the
+         * card ops first delayed the CPU's start), and the layers whose rows were fetched again
+         * because their gate_up read them at new addresses. */
+        uint64_t early = 0, early_wait_ns = 0, early_ready = 0, early_refetch = 0;
+        /* ..._FETCH_LIST: round trips copied in one ranged dispatch, range lists (re)written, and
+         * round trips left as separate copies (addresses the copy kernel cannot take). */
+        uint64_t fl_copies = 0, fl_armed = 0, fl_plain = 0;
     };
     const HostStats& host_stats() const { return hx_stats_; }
     bool host_experts() const { return hx_pool_ != nullptr; }
@@ -422,7 +432,12 @@ private:
      *
      * The rows' addresses are the gate_up's operands, which hx_capture records at every pass's
      * gate_up and checks against what hx_fetch read; a layer gets CPU units from its second pass
-     * on. One layer is in flight at a time; its leases are given back once the pool read them. */
+     * on. One layer is in flight at a time; its leases are given back once the pool read them.
+     *
+     * With ..._EARLY_ISSUE (file buffers capped) the wait, the choice, the submission and the
+     * misses' reads move from the gate_up to the gather, behind the layer's card ops
+     * (hx_early_decide); with ..._FETCH_LIST the counts row and the rows go in one ranged copy
+     * (hx_fetch_list). See the members below. */
     enum { kHxGreedy, kHxAll, kHxVerify };
     /* gather: the ops that may read the layer's down rows first -- its moe_gather, or the
      * reduction that folds it in (ar_gather_hc_write, a form a wire), whichever the pass issues.
@@ -490,9 +505,55 @@ private:
     void hx_choose(int32_t li);
     int  hx_submit();
     int  hx_jobs_for(int e, const HostExpertPool::Job& proto);
-    int  hx_capture(int32_t li, const RadTensor* t, int n_t);
+    int  hx_capture(int32_t li, RadStream s, const RadTensor* t, int n_t);
     int  hx_finish(RadStream s, const RadTensor* t, int n_t);
     void hx_drain();
+    /* RADIANCE_EXPERIMENTAL_DS41_EARLY_ISSUE=1 (with the file buffers capped). Without it a
+     * routed layer's gate_up waits in start_ep_routed for the counts, the CPU's choice and, in a
+     * decode pass, the misses' drive reads, and only then do the layer's card ops (gate_up,
+     * swiglu, down, the shared expert, the ffn mix and the next layer's attention prefetch) reach
+     * the queue: the card idles from the counts' copy until the host is done. Capped, every
+     * file-tier unit is the CPU's, so the card's aliases do not depend on the routing:
+     * start_ep_routed queues the counts' and rows' copies, publishes aliases for all the layer's
+     * file-tier units and returns at once, and the card computes the resident experts and the
+     * shared expert while the host waits. The counts are waited for, the CPU's share chosen and
+     * submitted and the misses read at the layer's first gather (hx_early_decide), which then waits
+     * for the CPU rows as before (hx_finish). The bytes the card and the pool compute are the same,
+     * and the CPU's rows still overwrite the card's stray rows before the gather reads them.
+     * hx_early_li_: the layer waiting for its gather, or -1. */
+    bool    hx_early_ = false;
+    int32_t hx_early_li_ = -1;
+    bool    hx_early_seen_ = false;     /* its gate_up read the rows its copies fetched */
+    EpRouteCounts hx_early_v_;          /* its counts row's witness, checked at the decision */
+    int  hx_early_decide();
+    /* RADIANCE_EXPERIMENTAL_DS41_FETCH_LIST=1: the counts row and the pool's rows in one ranged
+     * copy (hx_fetch_list.h) instead of four dispatches. The copy kernel reads its range list when
+     * it runs, so each list lives on the card, one a routed layer and pass size (the rows' count
+     * sets the ranges), written in stream order from a pinned staging slot when the addresses it
+     * was armed for change: the counts row, or the gate_up operands hx_capture records (an
+     * operand move re-arms it). An earlier copy reading the old list is ahead of that write on the
+     * same stream; the staging slot is rewritten only after hx_fl_ev_ says its last write left. */
+    struct HxFl {
+        const void* row = nullptr;
+        const void* x = nullptr;
+        int64_t     x_ld = 0;
+        const void* sorted = nullptr;
+        const void* off = nullptr;
+        RadStream   s = nullptr;
+        int         n = 0;                /* ranges armed; 0: not armed */
+    };
+    static constexpr int kHxFlRanges = hx_fetch_n_ranges(kEpRouteMaxRows);
+    static constexpr int kHxFlSlot = (kHxFlRanges + 1) & ~1;   /* a list's room: whole 16-byte copies */
+    bool hx_fl_ = false;
+    std::vector<HxFl> hx_fl_key_;         /* by routed layer and pass rows: what its list holds */
+    size_t hx_fl_cap_ = 0;                /* lists allocated */
+    RadCopyRange* hx_fl_dev_ = nullptr;   /* the lists, on the card */
+    RadCopyRange* hx_fl_pin_ = nullptr;   /* their pinned staging */
+    RadEvent hx_fl_ev_ = nullptr;         /* behind the last list write */
+    bool hx_fl_rec_ = false;
+    /* 1: the counts row and rows are queued as one copy; 0: the caller makes the separate copies. */
+    int  hx_fetch_list(int32_t li, const int32_t* row, RadStream s);
+    int  hx_init_fetch();
     /* Misses on the CPU (..._MISSES=N: passes of at most N tokens): a missed unit's planes are read
      * from the container straight into reused host buffers, computed as urgent jobs, and relaid
      * into the RAM cache by a background thread so later passes hit. */

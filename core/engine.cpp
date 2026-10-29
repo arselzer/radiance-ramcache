@@ -158,6 +158,19 @@ Engine::~Engine() {
         if (hx.async_wait_ns)
             RAD_INFO("host experts: %.1f ms waiting at gathers for misses still being read on the worker "
                      "(not in the gather waits above)", (double)hx.async_wait_ns / 1e6);
+        if (hx.early)
+            RAD_INFO("host experts, early issue: %llu layers issued their card ops ahead of their counts "
+                     "sync and waited %.1f ms for the counts at their gathers (%.1f us a layer; also in "
+                     "the router wait above); %llu found their counts already in (the thread was behind "
+                     "the card); %llu fetched their rows again after a gate_up operand move",
+                     (unsigned long long)hx.early, (double)hx.early_wait_ns / 1e6,
+                     (double)hx.early_wait_ns * 1e-3 / (double)hx.early,
+                     (unsigned long long)hx.early_ready, (unsigned long long)hx.early_refetch);
+        if (hx.fl_copies || hx.fl_plain)
+            RAD_INFO("host experts, fetch lists: %llu counts syncs fetched in one ranged copy, %llu range "
+                     "lists written, %llu fetches left as separate copies",
+                     (unsigned long long)hx.fl_copies, (unsigned long long)hx.fl_armed,
+                     (unsigned long long)hx.fl_plain);
         if (hx.pred_layers)
             RAD_INFO("next-layer predictor: on time for %llu of %llu one-token layers; %llu of %llu "
                      "misses predicted (%.1f%%); %llu file-tier experts predicted, %llu of them "

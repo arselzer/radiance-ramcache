@@ -14,18 +14,20 @@
  * With the variable at "1" libr4d keeps the decode band's arithmetic at every height up to
  * kR4dDs41TallRows: the routed GEMM's twin row moe_gemm_ggml_mxfp4_gemv_tall (r4d_rows.cpp), the
  * gemv at any number of tokens, takes the bands between 17 and kR4dDs41TallRows tokens from the
- * tiled row, and the sparse ops keep their scalar forms at every height. The twin's bound on M is
- * the tallest pass at which every libr4d kernel ds41 runs gives a 16-token pass's bits, so the core
- * reads the limit off the bands it resolved (FileStager::tall_init) rather than assuming it: up to
- * 32 tokens the norms keep their 1024 threads without help.
+ * tiled row, the sparse ops keep their scalar forms at every height, and r4d_act_threads gives every
+ * height the 1024 threads rows up to 32 get, so every norm sums a row's squares alike. The twin's
+ * bound on M is the tallest pass at which every libr4d kernel ds41 runs gives a 16-token pass's bits,
+ * so the core reads the limit off the bands it resolved (FileStager::tall_init) rather than assuming
+ * it: 48, the CPU path's limit (core/place/ep_route_counts.h) and the sparse ops' scalar band.
  *
  * Read once, the first time a launcher or the row table asks. Anything but "1" is off here; the core
  * refuses a value other than 0 or 1 (core/place/ep_route_counts.h). */
 #pragma once
 #include <cstdlib>
 
-/* The twin's bound: the tallest pass that keeps a 16-token pass's bits under the switch. */
-constexpr int kR4dDs41TallRows = 32;
+/* The twin's bound: the tallest pass that keeps a 16-token pass's bits under the switch (32 without
+ * the norms' pin). */
+constexpr int kR4dDs41TallRows = 48;
 
 inline bool r4d_ds41_exact_tall() {
     static const bool on = [] {

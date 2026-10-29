@@ -52,6 +52,19 @@
 # f16 log-probabilities, its top 16 in f32, and the next token's NLL and the whole row's entropy in
 # f32, so one changed logit anywhere in a row shows).
 #
+# Large-chunk prefill (RADIANCE_EXPERIMENTAL_DS41_LCP=C): LcN sets it and --max-num-batched-tokens N
+# (N a multiple of 16 in 64..2048), e.g. ...-M1024-...-B1-...-Lc1024-Mr32; it needs MN (..._MISSES at
+# least N), B1 (the CPU takes every routed unit) and an Mr part (Mr32 or Mr64; Mr4 only as a control),
+# cannot go with Xt or BT, and leaves
+# RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL unset (LCP keeps its pins; every other arm runs with LCP=0).
+# AdN the RAM cache admits a chunk's units from the prompt's last N tokens only (..._LCP_ADMIT=N; 0
+# none, the chunks read-only), Ada every unit (as at 16-token passes; 128 without either); LpN
+# ..._LCP_PLANES (missed units read at once a layer, 48); LiN ..._LCP_INSERTQ (admitted misses queued
+# for the cache, 16). An Lc arm must log "large-chunk prefill: passes of up to N tokens" at startup and
+# a plain one must not, or it is not measured; an Lc arm is never the Kld reference. DEVICE_CHECKS=lcp
+# runs ds41_mxfp4_device_check `lcp LCP_CHECK_C` (1024), `sweep` under LCP and `sweep0` on card 0
+# (TALL_LIBR4D, TALL_CHECK as for `tall`).
+#
 # Environment: RADIANCE_BIN (the binary), RADIANCE_HOME_DIR (kernels/ and architectures/ for it),
 # SILU_TABLE (the card's silu table), ARMS (default "base verify greedy"), HX_THREADS (16),
 # VERIFY_REQUESTS (3), DEVICE_CHECKS (1; `tall`: the exact-tall checks, TALL_LIBR4D and TALL_CHECK),
@@ -176,6 +189,28 @@ xt_check() {   # name
   fi
   [[ -n "${ARM_XT:-}" ]] && grep -m1 -E 'exact tall passes: ' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   [[ -n "${ARM_BT:-}" ]] && grep -m1 -E 'chunk geometry: ' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
+  lcp_check "$name"
+}
+
+# RADIANCE_EXPERIMENTAL_DS41_LCP (the LcN part): the file stager says at startup that it took passes of
+# up to N tokens (after checking every op's bands, the CPU path and the switches beside it; it refuses to
+# start otherwise), and the scheduler the chunks and the cache admission. An Lc arm without that line,
+# or a plain arm with it, is not measured.
+lcp_check() {   # name
+  local name=$1 lc_lines
+  lc_lines=$(grep -c 'large-chunk prefill: passes of up to [0-9]* tokens' "$OUT/$name.server.log")
+  if [[ -n "${ARM_LC:-}" ]] && ! grep -q "large-chunk prefill: passes of up to ${ARM_LC} tokens" "$OUT/$name.server.log"; then
+    log "arm $name: Lc${ARM_LC}, but the server log has no 'large-chunk prefill: passes of up to ${ARM_LC} tokens' line ($(grep -m2 -E 'large-chunk prefill' "$OUT/$name.server.log" | tr '\n' ' ')); not measured"
+    return 1
+  fi
+  if [[ -z "${ARM_LC:-}" && "$lc_lines" != 0 ]]; then
+    log "arm $name: no Lc part, but the server runs large-chunk prefill (the knob set for the window?); not measured"
+    return 1
+  fi
+  if [[ -n "${ARM_LC:-}" ]]; then
+    grep -m3 -E 'large-chunk prefill: |chunk geometry: ' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
+    grep -m1 -E 'consumer skip: ' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
+  fi
   return 0
 }
 
@@ -195,10 +230,10 @@ kld_finish() {   # name; the run is SERVER_PID
   (( rc == 0 )) || return 1
   xt_check "$name" || return 1
   if [[ -z "$KLD_REF" ]]; then
-    # The reference must be a 16-token arm's bits: an Xt arm first (the plain one failed or is
-    # missing) would let a later Xt arm be compared with another Xt arm.
-    if [[ -n "${ARM_XT:-}" ]]; then
-      log "arm $name: an Xt arm cannot be the window's kld reference (no plain Kld arm finished before it); not compared"
+    # The reference must be a 16-token arm's bits: an Xt or Lc arm first (the plain one failed or is
+    # missing) would let a later Xt or Lc arm be compared with another one.
+    if [[ -n "${ARM_XT:-}${ARM_LC:-}" ]]; then
+      log "arm $name: an Xt or Lc arm cannot be the window's kld reference (no plain Kld arm finished before it); not compared"
       return 1
     fi
     KLD_REF=$OUT/kld-$name
@@ -395,6 +430,22 @@ if [[ "${DEVICE_CHECKS:-1}" == ptime && -x "$HERE/build/ds41_mxfp4_device_check"
     timeout 900 "$HERE/build/ds41_mxfp4_device_check" "$RHOME/kernels/libr4d.so" ptime ${PTIME_ARGS:-1 2 4 8 16} >"$OUT/ptime.log" 2>&1
     echo "ptime exit $?" >>"$OUT/ptime.log" )
   grep -E 'prefill|exit' "$OUT/ptime.log" | tee -a "$OUT/window.log"
+fi
+if [[ "${DEVICE_CHECKS:-1}" == lcp ]]; then
+  # RADIANCE_EXPERIMENTAL_DS41_LCP on card 0: the twin and the sparse ops at chunk heights up to
+  # LCP_CHECK_C (`lcp`, which also sweeps every other height-dependent op to 2048 rows, gemm_nt by the
+  # row the table resolves and the router's column split among them), the sweep under LCP alone, and
+  # without any switch (`sweep0`), each row against the same row alone and in launches of 16.
+  TL=${TALL_LIBR4D:-$RHOME/kernels/libr4d.so} TC=${TALL_CHECK:-$HERE/build/ds41_mxfp4_device_check}
+  log "large-chunk prefill device checks on card 0 with $TL ($TC)"
+  for m in "lcp ${LCP_CHECK_C:-1024}" sweep sweep0; do
+    f=${m%% *}
+    ( export HIP_VISIBLE_DEVICES=0
+      [[ $f == sweep ]] && export RADIANCE_EXPERIMENTAL_DS41_LCP=${LCP_CHECK_C:-1024}
+      timeout 1800 "$TC" "$TL" $m >"$OUT/devcheck-$f.log" 2>&1
+      echo "$f exit $?" >>"$OUT/devcheck-$f.log" )
+    grep -E '^(PASS|FAIL)|exit|norm rows' "$OUT/devcheck-$f.log" | tail -10 | tee -a "$OUT/window.log"
+  done
 fi
 if [[ "${DEVICE_CHECKS:-1}" == tall ]]; then
   # RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL on card 0: the twin row and the sparse ops at tall heights
@@ -680,7 +731,7 @@ for a in $ARMS; do
 # only on the libr4d.so whose gemm_nt_f32bf16 passed SELFTEST_F32BF16's card checks in this window.
 # An arm with a predictor part (Ps, Po, Pt, Pp) is measured only if the router predictor loaded.
   IFS=- read -r -a parts <<< "$a"
-  xt="" bt="" kld="" dk="" db=""
+  xt="" bt="" kld="" dk="" db="" lc="" ad=""
   pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 HOST_POOL_MIB=4096 EXTRA_ARGS="" ARM_HOME="$RHOME" ARM_CONC=
   ARM_PROMPTS= ARM_N= ARM_LQ= rt=
   power="" skip="" ARGS=() f8="" f8x="" rb="" rbf=0 pred="" cs="" kh="" pc="" pcopt=""
@@ -697,10 +748,10 @@ for a in $ARMS; do
       n[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_NICE=${p#n}) ;;
       m[0-9]*) CACHE_MIB=${p#m} ;;
       M[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MISSES=${p#M}) ;;
-      Mr[0-9]*) # pool jobs of up to N token rows of one expert (1-32, default 4; above 4, jobs of 4+ rows take the many-row kernel)
-               if [[ ${p#Mr} =~ ^[0-9]+$ ]] && (( 10#${p#Mr} >= 1 && 10#${p#Mr} <= 32 )); then
+      Mr[0-9]*) # pool jobs of up to N token rows of one expert (1-64, default 4; above 4, jobs of 4+ rows take the many-row kernel)
+               if [[ ${p#Mr} =~ ^[0-9]+$ ]] && (( 10#${p#Mr} >= 1 && 10#${p#Mr} <= 64 )); then
                  env+=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MAX_ROWS=${p#Mr})
-               else log "arm $a: $p: a job takes 1-32 rows; the arm is skipped"; skip=1; fi ;;
+               else log "arm $a: $p: a job takes 1-64 rows; the arm is skipped"; skip=1; fi ;;
       o)       EXTRA_ARGS="--profile-ops" ;;
       H)       ARM_HOME=${RADIANCE_HOME_DIR2:?H needs RADIANCE_HOME_DIR2} ;;
       H3)      ARM_HOME=${RADIANCE_HOME_DIR3:?H3 needs RADIANCE_HOME_DIR3} ;;
@@ -780,6 +831,14 @@ for a in $ARMS; do
       Xt)      xt=1 ;;                                                 # exact tall passes (RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=1)
       BT[0-9]*) bt=${p#BT}; ARGS+=(--max-num-batched-tokens "$bt") ;;  # this arm's step: prefill chunks of N
       Kld)     kld=1 ;;                                                # --kld-record over the corpus instead of serving
+      Lc[0-9]*) lc=${p#Lc}                                             # large-chunk prefill: chunks of N (RADIANCE_EXPERIMENTAL_DS41_LCP)
+               if [[ $lc =~ ^[0-9]+$ ]] && (( 10#$lc >= 64 && 10#$lc <= 2048 && 10#$lc % 16 == 0 )); then
+                 lc=$((10#$lc)); ARGS+=(--max-num-batched-tokens "$lc"); env+=(RADIANCE_EXPERIMENTAL_DS41_LCP=$lc)
+               else log "arm $a: $p: a chunk is a multiple of 16 in 64..2048; the arm is skipped"; skip=1; fi ;;
+      Ad[0-9]*) ad=${p#Ad}; env+=(RADIANCE_EXPERIMENTAL_DS41_LCP_ADMIT=$((10#$ad))) ;;   # admit the last N tokens' units
+      Ada)     ad=all; env+=(RADIANCE_EXPERIMENTAL_DS41_LCP_ADMIT=all) ;;       # admit every unit (as at 16 rows)
+      Lp[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_LCP_PLANES=${p#Lp}) ;;        # missed units read at once a layer
+      Li[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_LCP_INSERTQ=${p#Li}) ;;       # admitted misses queued for the cache
       Fl)      env+=(RADIANCE_EXPERIMENTAL_DS41_FETCH_LIST=1) ;;       # counts + CPU rows in one ranged copy
       Ms[0-9]) env+=(RADIANCE_EXPERIMENTAL_DS41_MIRROR_SPLIT=${p#Ms}) ;;  # a lone decode miss's mirror tail in N pieces
       Mp)      env+=(RADIANCE_EXPERIMENTAL_DS41_MISS_POST=1) ;;       # miss reads start at the choice, before the pool's wake
@@ -871,8 +930,24 @@ for a in $ARMS; do
     fi
   fi
   ARM_DK=$dk ARM_DB=$db
-  # RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL: on only in an Xt arm, explicitly off in every other one.
-  if [[ -n "$xt" ]]; then env+=(RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=1); else env+=(RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=0); fi
+  # RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL: on only in an Xt arm, explicitly off in every other one but an
+  # Lc arm, where it is unset (LCP keeps its pins; the core refuses EXACT_TALL=0 beside it).
+  # RADIANCE_EXPERIMENTAL_DS41_LCP: an Lc arm's chunk, 0 in every other arm.
+  if [[ -n "$lc" ]]; then
+    [[ -n "$xt$bt" ]] && { log "arm $a: Lc goes with neither Xt nor BT (it sets the step itself); the arm is skipped"; skip=1; }
+    [[ " ${env[*]} " == *" RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS=1 "* ]] ||
+      { log "arm $a: Lc needs B1 (the CPU takes every routed unit); the arm is skipped"; skip=1; }
+    mm=$(grep -oE ' RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MISSES=[0-9]+' <<< " ${env[*]}" | tail -1 | cut -d= -f2)
+    (( ${mm:-0} >= lc )) || { log "arm $a: Lc$lc needs M$lc or more (the CPU computes a chunk's misses); the arm is skipped"; skip=1; }
+    # The pool's job size is not a matter of bits, but 4-row jobs (the default) take a chunk about twice
+    # the CPU time of the many-row kernel's: an Lc arm names it (Mr32 or Mr64; Mr4 for a control).
+    [[ " ${env[*]} " == *" RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MAX_ROWS="* ]] ||
+      { log "arm $a: Lc needs an Mr part (Mr32 or Mr64: a chunk's experts in many-row jobs); the arm is skipped"; skip=1; }
+    env+=(RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=)
+  elif [[ -n "$xt" ]]; then env+=(RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=1 RADIANCE_EXPERIMENTAL_DS41_LCP=0)
+  else env+=(RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=0 RADIANCE_EXPERIMENTAL_DS41_LCP=0); fi
+  if [[ -n "$ad" && -z "$lc" ]]; then log "arm $a: Ad$ad needs Lc (it acts on large chunks only); the arm is skipped"; skip=1; fi
+  [[ -n "$ad" ]] || env+=(RADIANCE_EXPERIMENTAL_DS41_LCP_ADMIT=)
   if [[ -n "$kld" ]]; then
     if [[ ! -s "$OUT/kld-corpus.jsonl" ]] &&
        ! python3 -I "$HERE/ab_requests.py" --kld-corpus "$OUT/kld-corpus.jsonl" "${KLD_MAX_CHARS:-6000}" \
@@ -883,7 +958,7 @@ for a in $ARMS; do
     rm -rf "$OUT/kld-$a"
     ARGS=(--max-model-len "${KLD_LEN:-2048}" "${ARGS[@]}" --kld-record "$OUT/kld-$a" --kld-corpus "$OUT/kld-corpus.jsonl")
   fi
-  ARM_XT=$xt ARM_BT=$bt ARM_KLD=$kld
+  ARM_XT=$xt ARM_BT=$bt ARM_KLD=$kld ARM_LC=$lc
   [[ -n "$skip" ]] && continue
   [[ -n "$power" ]] && power_set "$power"
   case $pol in

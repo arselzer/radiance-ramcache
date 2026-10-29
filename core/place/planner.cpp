@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -769,11 +770,21 @@ int Planner::assign_expert_tiered(Plan* p) {
         /* The file stager's two buffers, each the largest routed layer's file-tier units at the
          * stager's packing, plus a tail pad. */
         std::map<int32_t, int64_t> layer_bytes;
+        int64_t unit_max = 0;
         for (const MoveUnit& mu : p->units)
-            if (mu.tier == Tier::SSD && mu.access == RAD_ACCESS_CONDITIONAL && mu.layer >= 0)
+            if (mu.tier == Tier::SSD && mu.access == RAD_ACCESS_CONDITIONAL && mu.layer >= 0) {
                 layer_bytes[mu.layer] += align_up(mu.bytes, RAD_ALIGN_UNIT);
+                unit_max = std::max(unit_max, align_up(mu.bytes, RAD_ALIGN_UNIT));
+            }
         p->file_layer_max = 0;
         for (const auto& kv : layer_bytes) p->file_layer_max = std::max(p->file_layer_max, kv.second);
+        /* RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS=N: the CPU computes every routed unit
+         * (FileStager::hx_init refuses any configuration where it would not), so the buffers
+         * only back the card's aliases for them; N units keep those valid and the VRAM goes to
+         * residents. */
+        if (const char* c = std::getenv("RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS");
+            c && std::atoi(c) > 0 && unit_max > 0)
+            p->file_layer_max = std::min(p->file_layer_max, (int64_t)std::atoi(c) * unit_max);
         k.file = p->file_layer_max > 0 ? 2 * p->file_layer_max + RAD_ALIGN_UNIT : 0;
         p->file_stage_vram = k.file;
         return k;

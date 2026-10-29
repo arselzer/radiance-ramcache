@@ -416,6 +416,11 @@ private:
     int32_t hx_li_ = -1;                          /* the layer with CPU units, or -1 */
     int  hx_stage_ = 0;                           /* 1: chosen, 2: handed to the pool */
     bool hx_confirmed_ = false;                   /* its gate_up read the rows the pool was given */
+    /* A layer never seen at its gate_up has no addresses for hx_fetch: with the CPU taking every
+     * unit (policy all, misses on) its CPU work waits for the gate_up's operands, the card having
+     * been given aliases for all of them. hx_defer_li_: the layer waiting, or -1. */
+    bool    hx_defer_ok_ = false;
+    int32_t hx_defer_li_ = -1;
     std::unique_ptr<Mover::HostUnit[]> hx_units_;
     int  hx_n_ = 0;                               /* slots used; a released one has n == 0 */
     int64_t hx_reserved_ = 0;                     /* pool backlog reserved, not yet submitted */
@@ -432,6 +437,9 @@ private:
     int       hx_told_ = 0;
     HostStats hx_stats_;
     int  hx_init(const Program& prog);
+    int  hx_init_impl(const Program& prog);
+    /* The first pass's CPU work, at its gate_up's operands (start_ep_routed deferred it). */
+    int  hx_deferred(int32_t li, RadStream s);
     int  hx_fetch(int32_t li, RadStream s);
     void hx_choose(int32_t li);
     int  hx_submit();

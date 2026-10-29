@@ -633,6 +633,7 @@ bool FileStager::begin_pass(const RadBatch* b) {
     pass_kind_ = b->draft_pass;
     last_issued_ = -1;
     pass_tok_ = b->n_tok;
+    hx_defer_li_ = -1;
     ++trace_pass_;
     routed_ = counts_host_ && b->n_tok > 0 && b->n_tok <= kRoutedRows;
     return true;
@@ -670,6 +671,7 @@ int FileStager::start(int32_t li) {
  * reads the whole layer. */
 int FileStager::start_ep_routed(int32_t li, RadStream s, bool* read) {
     *read = false;
+    hx_defer_li_ = -1;   /* a deferral is for the gate_up right after its own layer's start only */
     if (!ep_counts_ || (size_t)li >= ep_layer_eligible_.size() || !ep_layer_eligible_[li])
         return RAD_OK;
     const Layer& L = layers_[(size_t)li];
@@ -693,6 +695,11 @@ int FileStager::start_ep_routed(int32_t li, RadStream s, bool* read) {
     /* With the pool, the pass's token rows and sorted order ride the same wait (hx_fetch). */
     const bool hx = hx_pool_ && !head_.configured() && (size_t)li < hx_ops_.size() &&
                     hx_ops_[(size_t)li].gu >= 0 && hx_ops_[(size_t)li].x;
+    /* Never seen at its gate_up (the first pass): nothing to fetch the rows from yet, so the CPU's
+     * part waits for the gate_up's operands (hx_deferred) and the card gets aliases for all. */
+    const bool defer = !hx && hx_defer_ok_ && hx_pool_ && !head_.configured() &&
+                       (size_t)li < hx_ops_.size() && hx_ops_[(size_t)li].gu >= 0 &&
+                       pass_tok_ <= hx_miss_rows_;
     /* Same actual producer stream; this host-wait event is the completion proof.
      * The Ctx witness means successfully issued, never completed before this wait. */
     RAD_TRY(rad_memcpy_async(counts_host_, v.row, 96 * (int64_t)sizeof(int32_t), s));
@@ -725,6 +732,21 @@ int FileStager::start_ep_routed(int32_t li, RadStream s, bool* read) {
     /* The access trace takes want_ before the CPU split; its record is written after the stage
      * below, with the stage's drive reads. */
     if (trace_fp_) trace_units_ = want_;
+    if (defer) {
+        staged_[b].clear();
+        mover_->alias_file_units(skip_, buf_[b], &staged_[b]);
+        mover_->alias_file_units(want_, buf_[b], &staged_[b]);
+        partial_[b] = true;
+        pending_[b] = false;
+        if (!staged_[b].empty()) holds_[b] = li;
+        hx_defer_li_ = want_.empty() ? -1 : li;
+        if (trace_fp_) trace_layer(L.layer, 0);
+        ++ep_stats_.reads;
+        ep_stats_.units += want_.size();
+        if (!total) ++ep_stats_.zero_local;
+        *read = true;
+        return RAD_OK;
+    }
     /* The selected units the CPU computes leave want_ and start on the pool before the drive
      * reads below block this thread (host_expert_pool.h). */
     if (hx) {
@@ -859,9 +881,35 @@ int64_t hx_numel(const RadTensor& t) {
  * ([5120, 2304], sorted order) with a swiglu_clamped at the pool's limit between, and whose
  * gathers (moe_gather, or ar_gather_hc_write folding it in, up to the next routed layer) read the
  * down projection's rows as operand 0. */
+/* RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS caps the file buffers (planner.cpp), which then
+ * hold only the aliases of units the CPU computes: refuse a configuration in which any routed pass
+ * could need the card's copy path. */
 int FileStager::hx_init(const Program& prog) {
+    RAD_TRY(hx_init_impl(prog));
+    const char* cap = std::getenv("RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS");
+    if (!cap || std::atoi(cap) <= 0 || layers_.empty()) return RAD_OK;
+    bool every = hx_pool_ != nullptr;
+    for (size_t li = 0; every && li < layers_.size(); ++li)
+        every = li < ep_layer_eligible_.size() && ep_layer_eligible_[li] && li < hx_ops_.size() &&
+                hx_ops_[li].gu >= 0;
+    if (!every || !hx_defer_ok_ || hx_miss_rows_ < kEpRouteMaxRows || prog.ctx.max_tok > kEpRouteMaxRows) {
+        RAD_ERR("RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS=%s: the file buffers then hold no layer's "
+                "units, so the CPU must compute every routed unit of every pass: host experts with "
+                "..._POLICY=all and ..._MISSES=%lld on every routed layer, and passes of at most %lld "
+                "tokens (--max-num-batched-tokens)", cap, (long long)kEpRouteMaxRows,
+                (long long)kEpRouteMaxRows);
+        return RAD_E_INVAL;
+    }
+    if (plan_->rank == 0)
+        RAD_INFO("host experts: file buffers capped at %s units; every routed unit is the CPU's", cap);
+    return RAD_OK;
+}
+
+int FileStager::hx_init_impl(const Program& prog) {
     hx_drain();
     hx_pool_ = nullptr;
+    hx_defer_ok_ = false;
+    hx_defer_li_ = -1;
     hx_ops_.assign(layers_.size(), HxOps{});
     /* The DSpark head tail owns the routed layers' file buffers and their copy budget. */
     if (head_.configured()) {
@@ -990,6 +1038,7 @@ int FileStager::hx_init(const Program& prog) {
                  hx_policy_ == kHxVerify ? " and still compute them on the card, comparing the rows"
                  : hx_policy_ == kHxGreedy ? " (whichever of the pool and the copy link frees sooner)"
                                            : "");
+    hx_defer_ok_ = hx_policy_ == kHxAll && hx_miss_rows_ > 0;
     return RAD_OK;
 }
 
@@ -1402,6 +1451,33 @@ void FileStager::drain_host_inserts() {
  * sorted order and expert offsets (moe_gemm_ggml: a, w, sorted_tok, expert_offset, y), which
  * the next pass's hx_fetch reads. With CPU rows in flight they must be the ones hx_fetch read on
  * this pass, or the pool computed from the wrong bytes. */
+/* The first pass's CPU work for layer li, at its gate_up's operands: hx_capture has just taken
+ * the rows' addresses, which the router and scatter wrote before this op on stream s. Every
+ * selected unit was published as an alias, so all of them must go to the CPU. */
+int FileStager::hx_deferred(int32_t li, RadStream s) {
+    hx_defer_li_ = -1;
+    if (!hx_ops_[(size_t)li].x) {
+        RAD_ERR("host experts: layer %d's gate_up operands are not the shape the CPU path reads, "
+                "and its first pass gave the card only aliases", layers_[(size_t)li].layer);
+        return RAD_E_STATE;
+    }
+    RAD_TRY(hx_fetch(li, s));
+    RAD_TRY(rad_event_record(counts_ev_, s));
+    RAD_TRY(rad_event_sync(counts_ev_));
+    const size_t selected = want_.size();
+    hx_choose(li);
+    if (!want_.empty() || (selected && hx_li_ != li)) {
+        RAD_ERR("host experts: layer %d's first pass left %zu of %zu units off the CPU, and the card "
+                "has only aliases for them", layers_[(size_t)li].layer, want_.size(), selected);
+        return RAD_E_STATE;
+    }
+    if (hx_li_ != li) return RAD_OK;
+    RAD_TRY(hx_submit());
+    RAD_TRY(hx_submit_misses());
+    hx_confirmed_ = true;   /* the pool was given exactly the rows this gate_up reads */
+    return RAD_OK;
+}
+
 int FileStager::hx_capture(int32_t li, const RadTensor* t, int n_t) {
     HxOps& o = hx_ops_[(size_t)li];
     if (n_t < 5) return RAD_E_STATE;
@@ -1537,8 +1613,10 @@ int FileStager::operands(rad_op h, RadStream s, const RadTensor* t, int n_t) {
     if (!hx_pool_) return RAD_OK;
     if ((size_t)h < first_of_.size() && first_of_[(size_t)h] >= 0) {
         const int32_t li = first_of_[(size_t)h];
-        if ((size_t)li < hx_ops_.size() && hx_ops_[(size_t)li].gu == (int32_t)h)
-            return hx_capture(li, t, n_t);
+        if ((size_t)li < hx_ops_.size() && hx_ops_[(size_t)li].gu == (int32_t)h) {
+            RAD_TRY(hx_capture(li, t, n_t));
+            return hx_defer_li_ == li ? hx_deferred(li, s) : RAD_OK;
+        }
         return RAD_OK;
     }
     if (hx_li_ < 0 || hx_stage_ != 2) return RAD_OK;

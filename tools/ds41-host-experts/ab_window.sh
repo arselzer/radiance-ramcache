@@ -171,7 +171,8 @@ for a in $ARMS; do
   # H the second run home (RADIANCE_HOME_DIR2); iN background insert threads for missed units;
 # pN --host-pool-mib (4096: a rank's pinned expert slots and the file tier's staging); G pin the
 # RAM cache's slabs at startup; R / RNN read part of each missed expert from the checkpoint's
-# safetensors on /srv/bulk ($MIRROR; share 0.NN, default 0.18).
+# safetensors on /srv/bulk ($MIRROR; share 0.NN, default 0.18); BN cap the VRAM file buffers at N
+# units (the CPU must take every routed unit: all, M16).
   IFS=- read -r -a parts <<< "$a"
   pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 HOST_POOL_MIB=4096 EXTRA_ARGS="" ARM_HOME="$RHOME"
   for p in "${parts[@]:1}"; do
@@ -189,6 +190,7 @@ for a in $ARMS; do
       i[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_INSERT_THREADS=${p#i}) ;;
       p[0-9]*) HOST_POOL_MIB=${p#p} ;;
       G)       env+=(RADIANCE_EXPERIMENTAL_NATIVE_CACHE_PREGROW=1) ;;
+      B[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS=${p#B}) ;;
       R)       env+=(RADIANCE_EXPERIMENTAL_DS41_PLANE_MIRROR=$MIRROR) ;;
       R[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_PLANE_MIRROR=$MIRROR RADIANCE_EXPERIMENTAL_DS41_PLANE_MIRROR_SHARE=0.${p#R}) ;;
       Ps[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_PREFETCH=shadow RADIANCE_EXPERIMENTAL_DS41_PREFETCH_K=${p#Ps}) ;;

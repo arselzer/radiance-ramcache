@@ -51,6 +51,9 @@ RADIANCE_EXPERIMENTAL_DS41_PREFETCH_K=4
 RADIANCE_EXPERIMENTAL_DS41_EARLY_ISSUE=1                    # routed card ops queued before the counts sync
 RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP=1                 # prefill: layers 21-39 only on rows that reach the output
 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MAX_ROWS=16          # prefill: CPU jobs of up to 16 rows of one expert, many-row kernel
+RADIANCE_EXPERIMENTAL_DS41_ROUTER_BF16=1                   # routers and compressor kv|gate held as bf16 halves (needs the libr4d whose f32bf16 card checks passed)
+RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED=1                   # VRAM residents in the packed-scale form, ~31 more a card (needs the libr4d whose gemv_vp card check passed)
+RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP=1                # no pass after a reply's end-of-generation token
 
 radiance ... --tp 4 --placement expert_tiered --weights-disk-tier \
   --expert-ram-cache-total-mib 98304 --host-pool-mib 256 --embedding-placement ram \

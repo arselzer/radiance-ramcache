@@ -43,7 +43,9 @@
 #include "r4d_plugin.h"
 #include "r4d_ds41_live_tail_policy.h"
 
+#include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <type_traits>
@@ -242,6 +244,8 @@ struct MxGemvArgs {
     int n_expert, top_k, a_sorted, AR, x_al;
     int live_off, x_off;                 /* LDS byte offsets of the live list and the rows */
     int live_end;
+    int one_pass;                        /* an expert's rows (up to XM) in one pass over its weights */
+    int probe_passes;                    /* the probe also counts weight passes (probe[5]) */
     unsigned long long* probe;
 };
 
@@ -544,7 +548,7 @@ __global__ __launch_bounds__(kMxThreads) void mx_gemv_kernel(MxGemvArgs A) {
     } else {
         __syncthreads();
     }
-    bool did_work=false;unsigned long long owned_rows=0;
+    bool did_work=false;unsigned long long owned_rows=0,passes=0;
     int cur_e = -1, cur_p = -1;                       /* the rows the LDS buffer holds whole */
     for (int it = (int)blockIdx.x; it < n_items; it += (int)gridDim.x) {
         int e = 0, ri = it, rs = 0, re = A.M;
@@ -572,8 +576,19 @@ __global__ __launch_bounds__(kMxThreads) void mx_gemv_kernel(MxGemvArgs A) {
          * whole passes of XLM rows, re-reading its weights, rather than restaging K chunks for every
          * row group. Each output is still its weight row dotted with its activation row in the same
          * lane and block order, so the bits are unchanged; only rows that cannot fit even one whole
-         * (XLM 0) use the chunked path. */
-        const int step = A.XLM >= 1 && A.XLM < A.XM ? A.XLM : A.XM;
+         * (XLM 0) use the chunked path.
+         *
+         * one_pass (RADIANCE_EXPERIMENTAL_DS41_DRAFT_GEMV): the other way round, for weights the card
+         * reads in place from pinned host memory (the DSpark draft bank). There a re-read is another
+         * trip over the link -- 12.5 MB of gate_up at ~18 GB/s, 0.7 ms -- while restaging a row
+         * group's K chunks reads activations the caches already hold, so all of the expert's rows (up
+         * to XM) take one pass over its weights, in K chunks when they do not fit whole. The chunked
+         * path keeps each lane's blocks and their order (chunks are whole multiples of 32 blocks), so
+         * the bits are again unchanged. In whole passes of one row the draft's gate_up took 6.1-6.7 ms
+         * a call on ranks 0 and 1 and 11.2-11.8 ms on ranks 2 and 3 (whose cards share a root
+         * complex), its down (three rows a pass) 0.5-1.2 ms (ab-20261029T154954Z, Ds1-o). */
+        const int step = !A.one_pass && A.XLM >= 1 && A.XLM < A.XM ? A.XLM : A.XM;
+        if constexpr(PROBE)if(ri==0)passes+=(unsigned long long)((re-rs+step-1)/step);
         for (int p0 = rs; p0 < re; p0 += step) {
             const int mc = min(step, re - p0);
             const bool whole = mc <= A.XLM;            /* block-uniform */
@@ -642,7 +657,8 @@ __global__ __launch_bounds__(kMxThreads) void mx_gemv_kernel(MxGemvArgs A) {
             }
         }
     }
-    if constexpr(PROBE){__syncthreads();if(tid==0){atomicAdd(A.probe+(did_work?1:4),1ull);atomicAdd(A.probe,owned_rows);}}
+    if constexpr(PROBE){__syncthreads();if(tid==0){atomicAdd(A.probe+(did_work?1:4),1ull);atomicAdd(A.probe,owned_rows);
+                        if(A.probe_passes)atomicAdd(A.probe+5,passes);}}
 }
 
 /* ================================================================== tiled (prefill) */
@@ -890,6 +906,40 @@ int mx_launch_tiled(RadStream s, int ty, int bm, bool moe, const MxTiledArgs& A,
 }
 
 bool mx_tail_opt_in(){static const bool on=ds41_live_tail::opt_in(std::getenv("RADIANCE_EXPERIMENTAL_DS41_LIVE_TAIL"));return on;}
+
+/* RADIANCE_EXPERIMENTAL_DS41_DRAFT_GEMV (ds41_live_tail::draft_mode): the DSpark draft bank's
+ * grouped GEMMs (32 experts a rank, top-3) take the live tail -- the slots routed to other ranks no
+ * longer run against the rank's last expert (mx_range gives it [off[31], T)), one more pass over
+ * its weights for every three of them in down and for each in gate_up -- and with "1" one pass over
+ * each live expert's weights. The calls are counted over the process (every rank), with a line at
+ * the first and the counts at exit, so a server log shows the switch reached the draft's GEMMs:
+ * gate_up calls (token order), down calls (sorted order), their query rows, calls on the tiled path
+ * (more than 16 rows), and draft-shaped calls left on the old path (rows not one whole routing). */
+int mx_draft_mode() {
+    static const int m = ds41_live_tail::draft_mode(std::getenv("RADIANCE_EXPERIMENTAL_DS41_DRAFT_GEMV"));
+    return m;
+}
+const char* mx_draft_what(int m) {
+    return (m & ds41_live_tail::kOnePass) ? "the live tail and one pass over each expert's weights" : "the live tail";
+}
+struct MxDraftCounts {
+    enum { kGu, kDn, kRows, kTiled, kKept, kN };
+    std::atomic<unsigned long long> v[kN]{};
+    std::atomic<bool> said{false};
+    void note(int m) {
+        if (said.exchange(true, std::memory_order_relaxed)) return;
+        std::fprintf(stderr, "libr4d: RADIANCE_EXPERIMENTAL_DS41_DRAFT_GEMV: the DSpark draft bank's moe_gemm_ggml "
+                             "(32 experts a rank, top-3) take %s\n", mx_draft_what(m));
+    }
+    ~MxDraftCounts() {
+        if (!said.load(std::memory_order_relaxed)) return;
+        std::fprintf(stderr, "libr4d: RADIANCE_EXPERIMENTAL_DS41_DRAFT_GEMV (%s): %llu draft moe_gemm_ggml calls "
+                             "(%llu gate_up, %llu down; %llu query rows; %llu tiled), %llu draft-shaped calls left "
+                             "on the old path\n", mx_draft_what(mx_draft_mode()), v[kGu].load() + v[kDn].load(),
+                     v[kGu].load(), v[kDn].load(), v[kRows].load(), v[kTiled].load(), v[kKept].load());
+    }
+};
+MxDraftCounts& mx_draft_counts() { static MxDraftCounts c; return c; }
 int mx_tail_zero(RadStream s,uint16_t*y,long long ld,const int32_t*off,int ne,int total,int N,unsigned long long*p){
  MxTailArgs a{y,ld,off,ne,total,N,p};
  return p?R4D_EMIT(s,(mx_zero_tail_kernel<true>),dim3((unsigned)total),dim3(kMxThreads),0,a):R4D_EMIT(s,(mx_zero_tail_kernel<false>),dim3((unsigned)total),dim3(kMxThreads),0,a);
@@ -971,9 +1021,13 @@ int mx_gemm(const RadArgs* a, RadStream s, bool gemv) {
     return mx_launch_tiled(s, ty, bm, false, A, grid, (unsigned)(tb + 32 * (kTP + bm + 4) * 4));
 }
 
-/* moe_gemm_ggml type=mxfp4: y[i] = a[row(i)] . w[e(i)]^T over the expert-sorted rows. `vp`: the gemv_vp row,
- * whose table entries may name packed weights (bit 0); it serves the decode band only. */
-int mx_moe(const RadArgs* a, RadStream s, bool gemv,bool baseline=false,unsigned long long* probe=nullptr,
+/* moe_gemm_ggml type=mxfp4: y[i] = a[row(i)] . w[e(i)]^T over the expert-sorted rows. `baseline`
+ * keeps every switch off; `force` (0..3, ds41_live_tail::kTail | kOnePass) is a checker's mode at
+ * any shape, in place of the switches; `probe` counts the work (r4d_rad_moe_gemm_mxfp4_draft_probe).
+ * `vp`: the gemv_vp row, whose table entries may name packed weights (bit 0); it serves the decode
+ * band only. Its kernel has no one-pass form, so on a table it serves the draft bank's
+ * ..._DRAFT_GEMV mode does not apply and the call is counted as left on the old path. */
+int mx_moe(const RadArgs* a, RadStream s, bool gemv,bool baseline=false,unsigned long long* probe=nullptr,int force=-1,
            bool vp=false) {
     if (!a || a->n_t < 5) return R4D_NO(RAD_E_INVAL);
     const RadTensor *A_ = r4d_opt(a, 0), *W = r4d_opt(a, 1), *so = r4d_opt(a, 2), *of = r4d_opt(a, 3),
@@ -1017,8 +1071,34 @@ int mx_moe(const RadArgs* a, RadStream s, bool gemv,bool baseline=false,unsigned
     const long long x_ld = AR > 1 ? A_->stride[0] : K, y_ld = T > 1 ? Y->stride[0] : N;
     const long long tb = mx_r16(mx_tab_bytes(ty));
     const long long tokens = a_sorted ? (T + top_k - 1) / top_k : AR;
-    const bool tail=!baseline&&ty==MX_FP4&&ds41_live_tail::geometry(tokens,N,K,ne,top_k,T,AR,a_sorted)&&mx_tail_opt_in();
-    if(probe&&!tail)return R4D_NO(RAD_E_UNSUPPORTED); // Refuse before any enqueue.
+    const bool vpk = vp && ty == MX_FP4 && table;   /* the gemv_vp kernel serves this call */
+    /* The live tail (kTail) and the one weight pass (kOnePass): the trunk's shape takes the tail under
+     * ..._LIVE_TAIL, the draft bank's its mode under ..._DRAFT_GEMV, a checker's call its `force`. The
+     * tail needs the rows to be one whole routing, which a forced call is refused without. */
+    int mode = 0;
+    const bool whole = ds41_live_tail::whole(tokens, top_k, T, AR, a_sorted);
+    if (force >= 0) {
+        if (force > 3 || (force && ty != MX_FP4) || ((force & ds41_live_tail::kTail) && !whole))
+            return R4D_NO(RAD_E_UNSUPPORTED);
+        mode = force;
+    } else if (!baseline && ty == MX_FP4) {
+        if (ds41_live_tail::geometry(tokens, N, K, ne, top_k, T, AR, a_sorted) && mx_tail_opt_in()) {
+            mode = ds41_live_tail::kTail;
+        } else if (const int dm = ds41_live_tail::draft_eligible(tokens, N, K, ne, top_k) ? mx_draft_mode() : 0) {
+            MxDraftCounts& c = mx_draft_counts();
+            c.note(dm);
+            if (whole && !vpk) {
+                mode = dm;
+                c.v[a_sorted ? MxDraftCounts::kDn : MxDraftCounts::kGu].fetch_add(1, std::memory_order_relaxed);
+                c.v[MxDraftCounts::kRows].fetch_add((unsigned long long)tokens, std::memory_order_relaxed);
+                if (!(gemv && tokens <= 16)) c.v[MxDraftCounts::kTiled].fetch_add(1, std::memory_order_relaxed);
+            } else {
+                c.v[MxDraftCounts::kKept].fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
+    const bool tail = (mode & ds41_live_tail::kTail) != 0;
+    if (probe && (ty != MX_FP4 || (!tail && force < 0))) return R4D_NO(RAD_E_UNSUPPORTED); // Refuse before any enqueue.
     const long long L = ne < T ? ne : T;       /* experts that can have rows */
     if (gemv && tokens <= 16) {
         MxGemvArgs A{};
@@ -1042,6 +1122,8 @@ int mx_moe(const RadArgs* a, RadStream s, bool gemv,bool baseline=false,unsigned
         A.rgpi = (int)rgpi; A.ipe = (int)ipe;
         A.n_expert = (int)ne; A.top_k = (int)top_k; A.a_sorted = a_sorted ? 1 : 0; A.AR = (int)AR;
         A.live_end=tail?1:0;A.probe=probe;
+        A.one_pass = (mode & ds41_live_tail::kOnePass) ? 1 : 0;
+        A.probe_passes = probe && force >= 0 ? 1 : 0;
         A.x_al = mx_al16(A_->data, x_ld) ? 1 : 0;
         A.live_off = (int)tb;
         A.x_off = (int)(tb + mx_r16(ne * 4));
@@ -1050,12 +1132,11 @@ int mx_moe(const RadArgs* a, RadStream s, bool gemv,bool baseline=false,unsigned
          * turn out live over all of them. */
         const long long items = L * nrg;
         const unsigned grid = (unsigned)(items < 256 ? items : 256);
-        /* gemv_vp over a table of MX_FP4 experts takes the kernel that tells the forms apart; the float logical
-         * form and stacked experts carry no marks, so the plain kernel serves them for it too. */
-        const bool vpk = vp && ty == MX_FP4 && table;
+        /* gemv_vp over a table of MX_FP4 experts takes the kernel that tells the forms apart (vpk, above); the
+         * float logical form and stacked experts carry no marks, so the plain kernel serves them for it too. */
         if (vpk && probe) return R4D_NO(RAD_E_UNSUPPORTED);   /* the probes are the plain row's */
-        if(!tail)return vpk ? mx_launch_gemv_vp(s, rpw, A, grid, (unsigned)lds) : mx_launch_gemv(s,ty,rpw,true,A,grid,(unsigned)lds);
-        const int rc=vpk ? mx_launch_gemv_vp(s, rpw, A, grid, (unsigned)lds) : mx_tail_gemv(s,rpw,A,grid,(unsigned)lds);if(rc!=RAD_OK)return rc;
+        if(!tail&&!probe)return vpk ? mx_launch_gemv_vp(s, rpw, A, grid, (unsigned)lds) : mx_launch_gemv(s,ty,rpw,true,A,grid,(unsigned)lds);
+        const int rc=vpk ? mx_launch_gemv_vp(s, rpw, A, grid, (unsigned)lds) : mx_tail_gemv(s,rpw,A,grid,(unsigned)lds);if(rc!=RAD_OK||!tail)return rc;
         // No fallback or replay after a submitted prefix; existing stream owner retires both.
         return mx_tail_zero(s,A.y,A.y_ld,A.off,A.n_expert,A.M,A.N,probe);
     }
@@ -1077,8 +1158,8 @@ int mx_moe(const RadArgs* a, RadStream s, bool gemv,bool baseline=false,unsigned
     const int bm = T < 64 * L ? 32 : 128;
     const long long gx = (T + bm - 1) / bm + L, gy = (N + kTN - 1) / kTN;
     if (gy > 65535 || gx > 0x7fffffffLL) return R4D_NO(RAD_E_SHAPE);
-    if(!tail)return mx_launch_tiled(s,ty,bm,true,A,dim3((unsigned)gx,(unsigned)gy),(unsigned)(tb+32*(kTP+bm+4)*4));
-    const int rc=mx_tail_tiled(s,bm,A,dim3((unsigned)gx,(unsigned)gy),(unsigned)(tb+32*(kTP+bm+4)*4));if(rc!=RAD_OK)return rc;
+    if(!tail&&!probe)return mx_launch_tiled(s,ty,bm,true,A,dim3((unsigned)gx,(unsigned)gy),(unsigned)(tb+32*(kTP+bm+4)*4));
+    const int rc=mx_tail_tiled(s,bm,A,dim3((unsigned)gx,(unsigned)gy),(unsigned)(tb+32*(kTP+bm+4)*4));if(rc!=RAD_OK||!tail)return rc;
     return mx_tail_zero(s,A.y,A.y_ld,A.off,A.n_expert,A.M,A.N,probe);
 }
 
@@ -1090,11 +1171,24 @@ extern "C" int r4d_rad_moe_gemm_mxfp4_gemv(const RadArgs* a, RadStream s) { retu
 extern "C" int r4d_rad_moe_gemm_mxfp4_tiled(const RadArgs* a, RadStream s) { return mx_moe(a, s, false); }
 /* gemv_vp: the decode band over a table whose marked entries are packed weights (the top of this file). */
 extern "C" int r4d_rad_moe_gemm_mxfp4_gemv_vp(const RadArgs* a, RadStream s) {
-    return mx_moe(a, s, true, false, nullptr, true);
+    return mx_moe(a, s, true, false, nullptr, -1, true);
 }
 
 // Checker-only exports do not alter registered rows/public ABI.
 extern "C" int r4d_rad_moe_gemm_mxfp4_live_tail_baseline(const RadArgs*a,RadStream s,int gemv){return mx_moe(a,s,gemv!=0,true);}
 extern "C" int r4d_rad_moe_gemm_mxfp4_live_tail_probe(const RadArgs*a,RadStream s,int gemv,unsigned long long*p){
  if(!p||((uintptr_t)p&7u))return RAD_E_INVAL;return mx_moe(a,s,gemv!=0,false,p);
+}
+/* Checker-only: the draft bank's modes forced (`mode`: ds41_live_tail::kTail | kOnePass, 0 the old
+ * path) at any shape, bypassing ..._DRAFT_GEMV and the shape list; the tail still needs one whole
+ * routing. With `p`, six counts added up: [0] the rows the live experts own, [1] blocks that
+ * worked, [2] rows the zero-tail kernel wrote, [3] values it wrote, [4] idle blocks, [5] passes over
+ * an expert's weights (gemv only, each live expert counted once). */
+extern "C" int r4d_rad_moe_gemm_mxfp4_draft_probe(const RadArgs*a,RadStream s,int gemv,int mode,unsigned long long*p){
+ if(mode<0||mode>3||(p&&((uintptr_t)p&7u)))return RAD_E_INVAL;return mx_moe(a,s,gemv!=0,false,p,mode);
+}
+/* Checker-only: ..._DRAFT_GEMV's counts so far (gate_up calls, down calls, query rows, tiled calls,
+ * draft-shaped calls left on the old path), so a test sees which path a served call took. */
+extern "C" void r4d_ds41_draft_gemv_counts(unsigned long long* out){
+ MxDraftCounts& c=mx_draft_counts();for(int i=0;i<MxDraftCounts::kN;++i)out[i]=c.v[i].load();
 }

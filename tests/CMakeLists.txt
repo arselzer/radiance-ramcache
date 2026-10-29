@@ -450,8 +450,10 @@ set_tests_properties(isa_tools PROPERTIES TIMEOUT ${RAD_TEST_TIMEOUT})
 # expert_scale, the QSA block selection, the runtime-LoRA pair, the F32 routing projection's tile
 # forms, GLM's mHC read with its chunk split, the F32-scale E4M3 GEMM's forms, GLM's KDA
 # recurrence, the MXFP4 expert GEMM's forms, the MLA matrix row's pairings, GLM's MoE decode
-# fusions and GLM's DSA scoring split by query rows, whose kernels a card-less build otherwise
-# never runs. emu/hip/hip_runtime.h supplies the HIP names, each GPU thread is a fiber, and
+# fusions, GLM's DSA scoring split by query rows and DeepSeek-V4.1's MXFP4 grouped GEMM at the
+# DSpark draft bank's shape (RADIANCE_EXPERIMENTAL_DS41_DRAFT_GEMV's live tail and one weight
+# pass, against a host restatement of the decode GEMV's sequence), whose kernels a card-less build
+# otherwise never runs. emu/hip/hip_runtime.h supplies the HIP names, each GPU thread is a fiber, and
 # __syncthreads and cross-lane ops are barriers (one not reached uniformly is reported as a
 # deadlock). Checked against ports of libref's ref_attn_paged and ref_qsa_select, the host
 # arithmetic in ref_host.cpp, for the joins the unfused chain bit for bit, for the LoRA pair libref
@@ -481,7 +483,7 @@ set(R4D_EMU_HIP ${R4D_DIR}/r4d_attn_paged_window.hip ${R4D_DIR}/r4d_pair_argmax_
 # this build: cfg_stub.cpp defines them at their axis defaults, in both arms below, and the bf16
 # skinny GEMM's (r4d_cfg_gemm) for it and its bf16f8 twin, whose outputs test_bf16f8 compares.
 set(R4D_EMU_TESTS attn pick norm escale qsa lora f32 mhc fp8f32 kda moemx mla moefuse kvres
-                  dsa m2xfp4 bf16f8 ds41vp)
+                  dsa m2xfp4 bf16f8 ds41vp ds41mx)
 # ds41vp holds DeepSeek-V4.1's gemv_vp row (RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED) to the plain MXFP4 gemv
 # row over experts packed by tools/ds41-host-experts' own packer, the one the engine loads them with. That
 # file builds as rad_core builds it: AVX2 without FMA contraction.
@@ -532,7 +534,7 @@ else()
                 ${R4D_EMU}/test_kda.cpp ${R4D_EMU}/test_moemx.cpp ${R4D_EMU}/test_mla.cpp
                 ${R4D_EMU}/test_moefuse.cpp ${R4D_EMU}/test_kvres.cpp
                 ${R4D_EMU}/test_dsa.cpp ${R4D_EMU}/test_m2xfp4.cpp ${R4D_EMU}/test_bf16f8.cpp
-                ${R4D_EMU}/test_ds41vp.cpp
+                ${R4D_EMU}/test_ds41vp.cpp ${R4D_EMU}/test_ds41mx.cpp
                 ${R4D_EMU}/cfg_stub.cpp)
       get_filename_component(stem ${src} NAME_WE)
       set(lang "")
@@ -585,7 +587,7 @@ else()
 endif()
 if(R4D_EMU_BUILT)
   foreach(t pick norm escale qsa lora f32 mhc fp8f32 kda moemx mla moefuse kvres dsa m2xfp4 bf16f8
-            ds41vp)
+            ds41vp ds41mx)
     add_test(NAME r4d_emu_${t} COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_${t})
   endforeach()
   # The attention cases take about 11 s, 7 of them in the two long prefills on the WMMA kernel,
@@ -599,7 +601,7 @@ if(R4D_EMU_BUILT)
   add_test(NAME r4d_emu_ds41vp_tail COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_ds41vp tail)
   set_tests_properties(r4d_emu_attn_shard0 r4d_emu_attn_shard1 r4d_emu_attn_shard2 r4d_emu_pick
                        r4d_emu_norm r4d_emu_escale r4d_emu_qsa r4d_emu_lora r4d_emu_mla r4d_emu_moefuse
-                       r4d_emu_dsa r4d_emu_m2xfp4 r4d_emu_bf16f8 r4d_emu_ds41vp r4d_emu_ds41vp_tail
+                       r4d_emu_dsa r4d_emu_m2xfp4 r4d_emu_bf16f8 r4d_emu_ds41vp r4d_emu_ds41vp_tail r4d_emu_ds41mx
                        PROPERTIES LABELS "r4d_emu" TIMEOUT ${RAD_TEST_TIMEOUT})
   # The LoRA pair has a libref oracle, and the test holds the emulated kernels to it when it can
   # load one -- expand bit for bit, shrink to its bound. kda_update is held to libref's within

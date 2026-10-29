@@ -436,6 +436,9 @@ struct Layer {
     int tap_col = -1;
     /* A DSpark stage's context pass: its window key from the projected trunk rows. */
     rad_op d_kv = 0, d_kvn = 0, d_kvrope = 0, d_kvq = 0, d_kvst = 0;
+    /* A DSpark stage's attention over the drafter's short block (Dsp::block_lo): `attn` at window
+     * `window + block_lo`. 0 without one. */
+    rad_op attn_lo = 0;
 };
 
 /* The DSpark block drafter (the checkpoint's mtp.0 .. mtp.{n-1}; official inference/model.py DSparkBlock,
@@ -482,6 +485,16 @@ struct Dsp {
     rad_op c_tab = 0, c_fc = 0, c_norm = 0, sizing = 0;
     rad_op embed = 0, embed_ar = 0, expand = 0, pre0 = 0, pre1 = 0, q_tab = 0, poff_op = 0, apos_op = 0;
     rad_op contract = 0, fnorm = 0, gather = 0, head = 0, topk = 0, pgather = 0, merge = 0, select = 0;
+    /* RADIANCE_EXPERIMENTAL_DS41_DSPARK_SHORT_BLOCK=N (2 .. block - 1): the query pass may also run
+     * a block of N rows, [anchor, noise x (N - 1)], proposing N tokens (rad_drafter_short_block; the
+     * core runs it from --draft-short-from decoding sequences on). A verify cap of k reads only the
+     * first k proposals, so at k + 1 rows the drafter's three MoE stages route 3 (k + 1) slots instead
+     * of 15. The block is non-causal, so its rows' proposals are not the full block's first ones:
+     * the replies stay the target's, acceptance may move (the drafter was trained at 5). Its own ops
+     * where the block length is a parameter: the rows' offsets to the block's last position, each
+     * stage's attention window, and the walk. 0: none, and nothing of it declared. */
+    int64_t block_lo = 0;
+    rad_op poff_lo = 0, select_lo = 0;
     std::vector<Layer> st;
 };
 
@@ -1783,6 +1796,19 @@ static int dsp_config(RadBuilder* b, Model& m, const RadModelMeta* meta, const R
     d.n_stage = (int)ns;
     d.Q = std::min<int64_t>(g.max_seqs * blk, g.max_tok);
     d.on = d.Q >= blk;
+    /* The short block (Dsp::block_lo): at least two rows (Scheduler::block_begin stages no fewer),
+     * shorter than the drafter's own. */
+    if (const char* e = std::getenv("RADIANCE_EXPERIMENTAL_DS41_DSPARK_SHORT_BLOCK"); e && *e && std::strcmp(e, "0")) {
+        char* end = nullptr;
+        const long long v = std::strtoll(e, &end, 10);
+        if (*end || v < 2 || v >= blk) {
+            fprintf(stderr, "radiance: deepseek41: RADIANCE_EXPERIMENTAL_DS41_DSPARK_SHORT_BLOCK=%s: the DSpark "
+                            "drafter's short block is 2 .. %lld rows (its own is %lld)\n", e, (long long)blk - 1,
+                    (long long)blk);
+            return RAD_E_INVAL;
+        }
+        d.block_lo = v;
+    }
     return RAD_OK;
 }
 
@@ -1874,6 +1900,15 @@ static int dsp_stage_ops(RadBuilder* b, Model& m, Layer& L) {
                       RAD_INT("window", c.window + d.block), RAD_INT("ratio", 0), RAD_INT("topk", 0),
                       RAD_F64("scale", 1.0 / std::sqrt((double)hd)), RAD_STR("dtype", "bf16") },
                     { L.sinks }, { d.q, d.apos }, { d.o });
+        /* The short block's: the same `window` context keys before the anchor plus its own rows. */
+        if (d.block_lo > 0) {
+            L.attn_lo = op(b, "attn_sparse_sink",
+                           { RAD_RANGE("M", 1, Q), RAD_INT("heads", g.n_head), RAD_INT("dim", hd),
+                             RAD_INT("window", c.window + d.block_lo), RAD_INT("ratio", 0), RAD_INT("topk", 0),
+                             RAD_F64("scale", 1.0 / std::sqrt((double)hd)), RAD_STR("dtype", "bf16") },
+                           { L.sinks }, { d.q, d.apos }, { d.o });
+            if (!L.attn_lo) return RAD_E_INVAL;
+        }
         L.o_rope = rope_rows(b, m, Q, g.n_head, hd, 1, d.o, m.cs_a);
         L.o_q = roundtrip(b, Q, HD, 32, "fp8_e4m3", "ue8m0", d.o);
         const int64_t gd = HD / m.gr;
@@ -2067,6 +2102,12 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
     d.poff_op = op(b, "iota", { RAD_RANGE("M", 1, Q), RAD_INT("start", d.block - 1), RAD_INT("step", -1),
                                 RAD_INT("period", d.block) },
                    {}, {}, { d.poff });
+    /* The short block's, declared where it is issued (in poff_op's place) for the buffers' liveness. */
+    if (d.block_lo > 0 &&
+        !(d.poff_lo = op(b, "iota", { RAD_RANGE("M", 1, Q), RAD_INT("start", d.block_lo - 1), RAD_INT("step", -1),
+                                      RAD_INT("period", d.block_lo) },
+                         {}, {}, { d.poff })))
+        return RAD_E_INVAL;
     d.apos_op = op(b, "add", { RAD_RANGE("M", 1, Q), RAD_INT("n", 1), RAD_STR("dtype", "i32") }, {}, { d.poff },
                    { d.apos });
     if (!d.embed || !d.expand || !d.pre0 || !d.pre1 || !d.q_tab || !d.poff_op || !d.apos_op) return RAD_E_INVAL;
@@ -2113,6 +2154,15 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
                     RAD_STR("dtype", "bf16") },
                   { d.mk1, d.mk2 }, { d.cand_, d.unary }, { d.tokens });
     if (!d.contract || !d.fnorm || !d.gather || !d.head || !d.topk || !d.select) return RAD_E_INVAL;
+    /* The short block's walk: its rows' candidates, the anchor every block_lo rows, into the front of
+     * each sequence's proposal row (the pitch stays the drafter's). */
+    if (d.block_lo > 0 &&
+        !(d.select_lo = op(b, "dflash_select",
+                           { RAD_RANGE("M", 1, g.max_seqs), RAD_INT("steps", d.block_lo), RAD_INT("top_k", R),
+                             RAD_INT("rank", d.rank), RAD_INT("n_vocab", c.n_vocab),
+                             RAD_INT("anchor_stride", d.block_lo), RAD_STR("dtype", "bf16") },
+                           { d.mk1, d.mk2 }, { d.cand_, d.unary }, { d.tokens })))
+        return RAD_E_INVAL;
 
     RadDrafterDecl drf{};
     drf.name = "dspark";
@@ -2132,6 +2182,12 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
              d.n_stage, d.base, d.base + d.n_stage - 1, (long long)d.n_expert, (long long)d.top_k, d.taps.size(),
              (long long)d.noise, (long long)(d.block - 1), (long long)d.block, (long long)c.window,
              (long long)d.rank, (long long)R);
+    if (d.block_lo > 0) {
+        DS_TRY(rad_drafter_short_block(b, d.block_lo));
+        rad_note(b, "DSpark drafter: also a short block of %lld rows ([anchor, noise x %lld], %lld tokens; "
+                    "RADIANCE_EXPERIMENTAL_DS41_DSPARK_SHORT_BLOCK), run from --draft-short-from sequences on",
+                 (long long)d.block_lo, (long long)(d.block_lo - 1), (long long)d.block_lo);
+    }
     return RAD_OK;
 }
 
@@ -2581,7 +2637,10 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
     const int64_t T = batch->n_tok, S = batch->n_seq, D = c.n_embd;
     const int64_t HD = g.n_head * c.head_dim, hd = c.head_dim;
     if (T <= 0 || S <= 0) return;
-    if (T != S * d.block || T > d.Q) {
+    /* The drafter's own block, or its short one (Dsp::block_lo), whose rows' offsets, attention
+     * window and walk are ops of their own. */
+    const bool lo = d.block_lo > 0 && T == S * d.block_lo;
+    if ((!lo && T != S * d.block) || T > d.Q) {
         rad_step_fail(x, "deepseek41: a DSpark query pass staged at a block this drafter has no ops for");
         return;
     }
@@ -2599,7 +2658,7 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
     RAD_ISSUE_N(x, d.pre0, T, brows(d.pre_f, T));
     RAD_ISSUE_N(x, d.pre1, T, bcol(d.pre_f, 0, 1, T));
     RAD_ISSUE_N(x, d.q_tab, T, pos, brows(m.cs_a, g.max_ctx));
-    RAD_ISSUE_N(x, d.poff_op, T, brows(d.poff, T));
+    RAD_ISSUE_N(x, lo ? d.poff_lo : d.poff_op, T, brows(d.poff, T));
     RAD_ISSUE_N(x, d.apos_op, T, pos, brows(d.poff, T), brows(d.apos, T));
 
     for (const auto& L : d.st) {
@@ -2621,7 +2680,7 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
             /* The block's keys past the committed end; the next context pass overwrites them. */
             RAD_ISSUE_N(x, L.kv_st, T, bcol(d.kvn, 0, hd / 2, T), bcol(d.kvn, hd / 2, hd / 2, T),
                         praw(kb->slot_mapping, RAD_I32, T), kv_cache(d.kv, L.l));
-            RAD_ISSUE_N(x, L.attn, T, brows(d.q, T), kv_cache(d.kv, L.l),
+            RAD_ISSUE_N(x, lo ? L.attn_lo : L.attn, T, brows(d.q, T), kv_cache(d.kv, L.l),
                         praw2(kb->block_table, RAD_I32, S, kb->block_table_pitch), praw(kb->seqused, RAD_I32, S),
                         RAD_NONE, RAD_NONE, RAD_NONE, brows(d.apos, T), cu, RAD_W(L.sinks), brows(d.o, T));
             RAD_ISSUE_N(x, L.o_rope, T, brows(d.o, T), brows(m.cs_a, g.max_ctx), pos);
@@ -2657,8 +2716,8 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
     } else {
         RAD_ISSUE_N(x, d.topk, N, brows(d.logits, N), brows(d.cand_, N), brows(d.unary, N), RAD_NONE);
     }
-    RAD_ISSUE_N(x, d.select, S, brows(d.cand_, N), brows(d.unary, N), RAD_NONE, praw(batch->token_ids, RAD_I32, T),
-                RAD_W(d.mk1), RAD_W(d.mk2), brows(d.tokens, S));
+    RAD_ISSUE_N(x, lo ? d.select_lo : d.select, S, brows(d.cand_, N), brows(d.unary, N), RAD_NONE,
+                praw(batch->token_ids, RAD_I32, T), RAD_W(d.mk1), RAD_W(d.mk2), brows(d.tokens, S));
 }
 
 /* The ffn connection's mix, issued by the MoE block behind its routed gate_up (MoeFP8::Beside). */

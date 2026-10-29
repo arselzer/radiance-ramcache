@@ -9,6 +9,16 @@
  *   ds41_mxfp4_device_check LIBR4D.so time [LIB2.so]   decode GEMV time per call at 1..3 live
  *                                                      experts; with LIB2, also its outputs vs
  *                                                      LIBR4D's, bit for bit
+ *   ds41_mxfp4_device_check LIBR4D.so draft [trials]   the DSpark draft bank's grouped GEMMs (32
+ *                                                      experts a rank, top-3) in every mode of
+ *                                                      RADIANCE_EXPERIMENTAL_DS41_DRAFT_GEMV (old
+ *                                                      path, live tail, one weight pass, both) on
+ *                                                      EP4 routings, experts in pinned host memory
+ *                                                      and in VRAM, against the host experts bit
+ *                                                      for bit, with the work counted; the served
+ *                                                      entry under the switch; then each mode's
+ *                                                      time a call at a 5-row query pass, experts
+ *                                                      in pinned host memory as the bank's are
  *
  * Needs a free card (HIP device 0 unless HIP_VISIBLE_DEVICES says otherwise). Uses the
  * live-tail ranges as the measured runs do (RADIANCE_EXPERIMENTAL_DS41_LIVE_TAIL=1). */
@@ -39,13 +49,22 @@ constexpr int kEmbd = 5120, kFf = 2304, kNe = 96, kTop = 6;
 constexpr float kLimit = 10.0f;
 typedef int (*Launch)(const RadArgs*, RadStream);
 
+/* The draft switch's checker exports (r4d_ds41_mxfp4.hip): a forced mode with the probe's counts,
+ * and the switch's call counts. */
+typedef int (*DraftProbe)(const RadArgs*, RadStream, int gemv, int mode, unsigned long long* probe);
+typedef void (*DraftCounts)(unsigned long long* out);
+
 struct Lib {
     Launch moe = nullptr, swiglu = nullptr;
+    DraftProbe draft = nullptr;
+    DraftCounts counts = nullptr;
     explicit Lib(const char* path) {
         void* h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
         if (!h) { std::fprintf(stderr, "dlopen %s: %s\n", path, dlerror()); std::exit(2); }
         moe = (Launch)dlsym(h, "r4d_rad_moe_gemm_mxfp4_gemv");
         swiglu = (Launch)dlsym(h, "r4d_rad_swiglu_clamped");
+        draft = (DraftProbe)dlsym(h, "r4d_rad_moe_gemm_mxfp4_draft_probe");
+        counts = (DraftCounts)dlsym(h, "r4d_ds41_draft_gemv_counts");
         if (!moe) { std::fprintf(stderr, "%s lacks r4d_rad_moe_gemm_mxfp4_gemv\n", path); std::exit(2); }
     }
 };
@@ -468,12 +487,304 @@ int timing(const Lib& a, const Lib* b) {
     return mism ? 1 : 0;
 }
 
+/* ---- the DSpark draft bank's grouped GEMMs (RADIANCE_EXPERIMENTAL_DS41_DRAFT_GEMV) ---------------
+ *
+ * Its 128 experts at EP4 are 32 a rank, top-3; a query pass is 5 rows a sequence. The bank's experts
+ * sit in pinned host memory the card reads in place (--draft-bank-expert-placement host), which is
+ * where the switch's one weight pass pays: the old path reads a gate_up expert once per row (one
+ * fits the LDS whole at K 5120) and the rank's last expert once more per slot routed elsewhere. */
+constexpr int kDl = 32, kDt = 3;
+
+/* Pinned host memory as the engine's host pool holds it (fine-grained, mapped, read in place by
+ * the card), or VRAM. */
+struct Buf {
+    void* p = nullptr;
+    void* dev = nullptr;
+    size_t n = 0;
+    bool host = false;
+    Buf(size_t bytes, bool on_host) : n(bytes), host(on_host) {
+        if (host) {
+            HC(hipHostMalloc(&p, bytes, hipHostMallocMapped | hipHostMallocCoherent));
+            HC(hipHostGetDevicePointer(&dev, p, 0));
+        } else {
+            HC(hipMalloc(&p, bytes));
+            dev = p;
+        }
+    }
+    ~Buf() { if (host) (void)hipHostFree(p); else (void)hipFree(p); }
+    Buf(const Buf&) = delete;
+    Buf& operator=(const Buf&) = delete;
+    void put(const void* h) { if (host) std::memcpy(p, h, n); else HC(hipMemcpy(p, h, n, hipMemcpyHostToDevice)); }
+};
+
+/* moe_scatter on rank `rank` at EP4: its slots grouped by local expert in slot order, the rest -1. */
+struct DRoute { int m = 0, T = 0; std::vector<int32_t> sorted, off; };
+DRoute dscatter(const std::vector<int>& ids, int m, int rank) {
+    DRoute R;
+    R.m = m; R.T = m * kDt;
+    R.off.assign(kDl + 1, 0);
+    for (int e = 0; e < kDl; ++e) {
+        R.off[(size_t)e] = (int)R.sorted.size();
+        for (int i = 0; i < R.T; ++i)
+            if (ids[(size_t)i] == rank * kDl + e) R.sorted.push_back(i);
+    }
+    R.off[kDl] = (int)R.sorted.size();
+    R.sorted.resize((size_t)R.T, -1);
+    return R;
+}
+
+/* Each token's top-3, distinct: no local slot; the last expert with rows of its own; the last
+ * expert idle; one expert in every row; a few experts sharing the rows; spread. */
+constexpr int kDPatterns = 6;
+const char* const kDPatternName[kDPatterns] = { "no local slot", "last expert with its own rows", "last expert idle",
+                                                "one expert in every row", "a few experts share the rows", "spread" };
+std::vector<int> droute(int p, int m, int rank, std::mt19937_64& rng) {
+    std::vector<int> ids((size_t)m * kDt, -1);
+    const int base = rank * kDl, other = ((rank + 1) % 4) * kDl;
+    static const int pool[] = { 3, 4, 31, 40, 70, 100 };
+    for (int t = 0; t < m; ++t)
+        for (int s = 0; s < kDt; ++s) {
+            int e = -1;
+            for (int tries = 0; tries < 1000; ++tries) {
+                switch (p) {
+                    case 0: e = (base + kDl + (int)(rng() % 96)) % 128; break;
+                    case 1: e = s == 0 && t % 2 == 0 ? base + kDl - 1 : (int)(rng() % 128); break;
+                    case 2: e = (int)(rng() % 128); if (e == base + kDl - 1) e = base; break;
+                    case 3: e = s == 0 ? base + 7 : other + (int)(rng() % kDl); break;
+                    case 4: e = (pool[rng() % 6] + base) % 128; break;
+                    default: e = (int)(rng() % 128); break;
+                }
+                bool dup = false;
+                for (int j = 0; j < s; ++j) dup |= ids[(size_t)t * kDt + j] == e;
+                if (!dup) break;
+            }
+            ids[(size_t)t * kDt + s] = e;
+        }
+    return ids;
+}
+
+/* One grouped GEMM over a table of `kDl` expert pointers: the served entry (the switch decides) or
+ * the checker's forced `mode` with the probe. */
+int run_draft(const Lib& L, hipStream_t s, bool served, int mode, unsigned long long* probe, void* x, int AR,
+              void* table, int N, int K, void* sorted, void* off, void* y, int T, const char* order) {
+    RadTensor t[5] = { tensor(x, RAD_BF16, { AR, K }), tensor(table, RAD_U8, { kDl, N, K / 32 * 17 }),
+                       tensor(sorted, RAD_I32, { T }), tensor(off, RAD_I32, { kDl + 1 }), tensor(y, RAD_BF16, { T, N }) };
+    t[1].stride[0] = 0;   /* a table of expert pointers */
+    RadParam p[6] = { ps("type", "mxfp4"), pi("N", N), pi("K", K), pi("n_expert", kDl), pi("top_k", kDt),
+                      ps("a_order", order) };
+    RadArgs a{};
+    a.t = t; a.n_t = 5; a.p = p; a.n_p = 6;
+    return served ? L.moe(&a, (RadStream)s) : L.draft(&a, (RadStream)s, 1, mode, probe);
+}
+
+/* The experts mx_range (old) or the live tail give rows, as row counts. */
+std::vector<int> druns(const DRoute& R, bool tail) {
+    std::vector<int> runs;
+    for (int e = 0; e < kDl; ++e) {
+        int a = e == 0 ? 0 : R.off[(size_t)e], b = tail || e < kDl - 1 ? R.off[(size_t)e + 1] : R.T;
+        a = std::min(std::max(a, 0), R.T);
+        b = std::min(std::max(b, a), R.T);
+        if (b > a) runs.push_back(b - a);
+    }
+    return runs;
+}
+
+int draft_check(const Lib& L, int trials) {
+    if (!L.draft || !L.counts) {
+        std::fprintf(stderr, "this libr4d.so has no RADIANCE_EXPERIMENTAL_DS41_DRAFT_GEMV (r4d_rad_moe_gemm_mxfp4_draft_probe)\n");
+        return 2;
+    }
+    hipStream_t s;
+    HC(hipStreamCreate(&s));
+    std::mt19937_64 rng(4141);
+    const size_t gu_b = (size_t)2 * kFf * (kEmbd / 32) * 17, dn_b = (size_t)kEmbd * (kFf / 32) * 17;
+    /* Distinct experts, each in both placements; a trial with more live experts than this shares. */
+    constexpr int kPool = 24;
+    std::vector<std::vector<uint8_t>> hgu, hdn;
+    std::vector<std::unique_ptr<Buf>> pgu[2], pdn[2];   /* [0] pinned host memory, [1] VRAM */
+    for (int i = 0; i < kPool; ++i) {
+        hgu.push_back(make_blocks(2 * kFf, kEmbd, rng, i % 4 == 3));
+        hdn.push_back(make_blocks(kEmbd, kFf, rng, i % 4 == 3));
+        for (int h = 0; h < 2; ++h) {
+            pgu[h].emplace_back(new Buf(gu_b, h == 0));
+            pgu[h].back()->put(hgu.back().data());
+            pdn[h].emplace_back(new Buf(dn_b, h == 0));
+            pdn[h].back()->put(hdn.back().data());
+        }
+    }
+    constexpr int kMaxM = 16, kMaxT = kMaxM * kDt;
+    Dev tab(kDl * sizeof(void*)), d_sorted(kMaxT * 4), d_off((kDl + 1) * 4), d_x((size_t)kMaxM * kEmbd * 2),
+        d_a((size_t)kMaxT * kFf * 2), d_ygu((size_t)kMaxT * 2 * kFf * 2), d_ydn((size_t)kMaxT * kEmbd * 2),
+        d_probe(6 * sizeof(unsigned long long));
+    const int sizes[] = { 1, 2, 5, 6, 8, 16 };
+    size_t bad[2][4] = {}, bad_served = 0, bad_work = 0, outputs = 0;
+    unsigned long long passes[2][4] = {};
+    int served_calls = 0;
+    for (int trial = 0; trial < trials; ++trial) {
+        const int m = sizes[trial % 6], pat = (trial / 6) % kDPatterns, rank = trial % 4;
+        const DRoute R = dscatter(droute(pat, m, rank, rng), m, rank);
+        /* each local expert with rows, and the last expert always, its own matrix */
+        std::vector<int> mat(kDl, 0);
+        int next = 1 + trial;
+        for (int e = 0; e < kDl; ++e)
+            if (R.off[(size_t)e + 1] > R.off[(size_t)e] || e == kDl - 1) mat[(size_t)e] = next++ % kPool;
+        std::vector<uint16_t> x((size_t)m * kEmbd), act((size_t)R.T * kFf);
+        for (int r = 0; r < m; ++r) {
+            const auto row = make_x(kEmbd, rng, trial % 4 == 3);
+            std::copy(row.begin(), row.end(), x.begin() + (size_t)r * kEmbd);
+        }
+        for (auto& v : act) v = f32_to_bf16(0.1f * (float)((int)(rng() % 200) - 100) / 100.f);
+        HC(hipMemcpy(d_x.p, x.data(), x.size() * 2, hipMemcpyHostToDevice));
+        HC(hipMemcpy(d_a.p, act.data(), act.size() * 2, hipMemcpyHostToDevice));
+        HC(hipMemcpy(d_sorted.p, R.sorted.data(), R.sorted.size() * 4, hipMemcpyHostToDevice));
+        HC(hipMemcpy(d_off.p, R.off.data(), R.off.size() * 4, hipMemcpyHostToDevice));
+        for (int q = 0; q < 2; ++q) {
+            const bool gu = q == 0;
+            const int N = gu ? 2 * kFf : kEmbd, K = gu ? kEmbd : kFf;
+            Dev& dy = gu ? d_ygu : d_ydn;
+            /* the host experts' GEMV for every live slot, zeros for a dropped one */
+            std::vector<uint16_t> want((size_t)R.T * N, 0);
+            for (int e = 0; e < kDl; ++e)
+                for (int i = R.off[(size_t)e]; i < R.off[(size_t)e + 1]; ++i) {
+                    if (R.sorted[(size_t)i] < 0) continue;
+                    Mx W; W.N = N; W.K = K; W.blocks = (gu ? hgu : hdn)[(size_t)mat[(size_t)e]].data();
+                    const uint16_t* in = gu ? x.data() + (size_t)(R.sorted[(size_t)i] / kDt) * kEmbd
+                                            : act.data() + (size_t)i * kFf;
+                    gemv_avx2(W, in, want.data() + (size_t)i * N, 0, N);
+                }
+            const int XM = std::min(m, 8), XLM = std::min(9216 / (K + K / 8), XM);
+            std::vector<uint16_t> got((size_t)R.T * N);
+            for (int h = 0; h < 2; ++h) {
+                std::vector<void*> t(kDl);
+                for (int e = 0; e < kDl; ++e) t[(size_t)e] = (gu ? pgu : pdn)[h][(size_t)mat[(size_t)e]]->dev;
+                tab.put(t.data());
+                for (int mode = 0; mode < 5; ++mode) {
+                    /* modes 0..3 forced; 4 the served entry (pinned host memory only) */
+                    const bool served = mode == 4;
+                    if (served && h) continue;
+                    unsigned long long c0[5] = {}, c1[5] = {}, pr[6] = {};
+                    if (served) L.counts(c0);
+                    HC(hipMemset(dy.p, 0x77, dy.n));
+                    HC(hipMemset(d_probe.p, 0, d_probe.n));
+                    if (run_draft(L, s, served, served ? 0 : mode, served ? nullptr : (unsigned long long*)d_probe.p,
+                                  gu ? d_x.p : d_a.p, gu ? m : R.T, tab.p, N, K, d_sorted.p, d_off.p, dy.p, R.T,
+                                  gu ? "token" : "sorted") < 0) {
+                        std::fprintf(stderr, "the draft GEMV refused trial %d mode %d\n", trial, mode);
+                        return 2;
+                    }
+                    HC(hipStreamSynchronize(s));
+                    HC(hipMemcpy(got.data(), dy.p, got.size() * 2, hipMemcpyDeviceToHost));
+                    const size_t d = count_diff(got.data(), want.data(), got.size());
+                    outputs += got.size();
+                    if (served) {
+                        L.counts(c1);
+                        bad_served += d;
+                        ++served_calls;
+                        if (c1[gu ? 0 : 1] != c0[gu ? 0 : 1] + 1) {
+                            ++bad_work;
+                            std::printf("  trial %d: the served %s call was not the switch's\n", trial, gu ? "gate_up" : "down");
+                        }
+                        continue;
+                    }
+                    bad[h][mode] += d;
+                    if (d && bad[h][mode] == d)
+                        std::printf("  %s, %s m %d rank %d (%s), mode %d: %zu values differ\n", h ? "VRAM" : "pinned host",
+                                    gu ? "gate_up" : "down", m, rank, kDPatternName[pat], mode, d);
+                    HC(hipMemcpy(pr, d_probe.p, sizeof pr, hipMemcpyDeviceToHost));
+                    const bool tail = mode & 1, one = mode & 2;
+                    const std::vector<int> runs = druns(R, tail);
+                    const int step = !one && XLM >= 1 && XLM < XM ? XLM : XM;
+                    unsigned long long owned = 0, np = 0;
+                    for (int r : runs) { owned += (unsigned long long)r; np += (unsigned long long)((r + step - 1) / step); }
+                    const unsigned long long zr = tail ? (unsigned long long)(R.T - R.off[kDl]) : 0;
+                    if (pr[0] != owned || pr[2] != zr || pr[3] != zr * (unsigned long long)N || pr[5] != np) {
+                        ++bad_work;
+                        std::printf("  %s m %d rank %d (%s), mode %d: work owned %llu zero rows %llu passes %llu, want %llu %llu %llu\n",
+                                    gu ? "gate_up" : "down", m, rank, kDPatternName[pat], mode, pr[0], pr[2], pr[5], owned, zr, np);
+                    }
+                    if (!h) passes[q][mode] += pr[5];
+                }
+            }
+        }
+    }
+    std::printf("draft GEMV: %d trials, %zu outputs compared; differing values (old, tail, one pass, both): pinned host "
+                "%zu %zu %zu %zu, VRAM %zu %zu %zu %zu; served entry %zu in %d calls; %zu work counts wrong\n",
+                trials, outputs, bad[0][0], bad[0][1], bad[0][2], bad[0][3], bad[1][0], bad[1][1], bad[1][2], bad[1][3],
+                bad_served, served_calls, bad_work);
+    std::printf("draft GEMV weight passes over the trials (old, tail, one pass, both): gate_up %llu %llu %llu %llu, "
+                "down %llu %llu %llu %llu\n", passes[0][0], passes[0][1], passes[0][2], passes[0][3], passes[1][0],
+                passes[1][1], passes[1][2], passes[1][3]);
+    size_t all_bad = bad_served + bad_work;
+    for (auto& b : bad) for (size_t v : b) all_bad += v;
+    std::printf(all_bad ? "FAIL\n" : "PASS: every draft GEMV mode is bit-identical to the host experts and does the work it should\n");
+
+    /* Time a call, a 5-row query pass with `live` local experts (the rest of the 15 slots dropped),
+     * the experts in pinned host memory as the bank's are and rotated over the pool, so no call
+     * finds the last one's weights in the 64 MB cache. */
+    std::printf("draft GEMV time a call, 5 query rows (15 slots), experts in pinned host memory; old / tail / one pass / "
+                "both, and the live experts' weights over the best\n");
+    static const int rows_of[6][5] = { {}, { 4 }, { 2, 2 }, { 2, 1, 1 }, { 1, 1, 1, 1 }, { 1, 1, 1, 1, 1 } };
+    hipEvent_t e0, e1;
+    HC(hipEventCreate(&e0)); HC(hipEventCreate(&e1));
+    for (int live = 1; live <= 5; ++live) {
+        /* Rank 0's experts 2, 9, 15, 22 and 27 take rows of distinct tokens (expert j tokens j,
+         * j + 1, ..., each in its next free slot); every other slot goes to one of rank 1's, each
+         * once, so a token's top-3 stay distinct. */
+        static const int at[5] = { 2, 9, 15, 22, 27 };
+        std::vector<int> ids(15, -1);
+        for (int t = 0; t < 5; ++t)
+            for (int sl = 0; sl < 3; ++sl) ids[(size_t)t * 3 + sl] = 32 + t * 3 + sl;
+        int used[5] = {};
+        for (int j = 0; j < live; ++j)
+            for (int r = 0; r < rows_of[live][j]; ++r) {
+                const int t = (j + r) % 5;
+                ids[(size_t)t * 3 + (size_t)used[t]++] = at[j];
+            }
+        const DRoute R = dscatter(ids, 5, 0);
+        HC(hipMemcpy(d_sorted.p, R.sorted.data(), R.sorted.size() * 4, hipMemcpyHostToDevice));
+        HC(hipMemcpy(d_off.p, R.off.data(), R.off.size() * 4, hipMemcpyHostToDevice));
+        for (int q = 0; q < 2; ++q) {
+            const bool gu = q == 0;
+            const int N = gu ? 2 * kFf : kEmbd, K = gu ? kEmbd : kFf;
+            Dev& dy = gu ? d_ygu : d_ydn;
+            double med[4] = {};
+            for (int mode = 0; mode < 4; ++mode) {
+                std::vector<float> ts;
+                for (int it = 0; it < 35; ++it) {
+                    std::vector<void*> t(kDl);
+                    for (int e = 0; e < kDl; ++e) t[(size_t)e] = (gu ? pgu : pdn)[0][(size_t)((it * 6 + e) % kPool)]->dev;
+                    tab.put(t.data());
+                    HC(hipEventRecord(e0, s));
+                    if (run_draft(L, s, false, mode, nullptr, gu ? d_x.p : d_a.p, gu ? 5 : 15, tab.p, N, K, d_sorted.p,
+                                  d_off.p, dy.p, 15, gu ? "token" : "sorted") < 0)
+                        return 3;
+                    HC(hipEventRecord(e1, s));
+                    HC(hipEventSynchronize(e1));
+                    float ms = 0;
+                    HC(hipEventElapsedTime(&ms, e0, e1));
+                    if (it >= 5) ts.push_back(ms);
+                }
+                std::sort(ts.begin(), ts.end());
+                med[mode] = ts[ts.size() / 2];
+            }
+            const double bytes = (double)live * N * (K / 32) * 17;
+            const double best = std::min(std::min(med[0], med[1]), std::min(med[2], med[3]));
+            std::printf("  %s live %d (%d rows): %8.1f %8.1f %8.1f %8.1f us   %.1f GB/s\n", gu ? "gate_up" : "down   ", live,
+                        R.off[kDl], 1e3 * med[0], 1e3 * med[1], 1e3 * med[2], 1e3 * med[3], bytes / (best * 1e-3) / 1e9);
+        }
+    }
+    return all_bad ? 1 : 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc < 3) { std::fprintf(stderr, "usage: %s LIBR4D.so check [trials] [table] | swiglu TABLE | time [LIB2.so] | ptime [T[:P]...]\n", argv[0]); return 2; }
+    if (argc < 3) { std::fprintf(stderr, "usage: %s LIBR4D.so check [trials] [table] | swiglu TABLE | time [LIB2.so] | ptime [T[:P]...] | draft [trials]\n", argv[0]); return 2; }
     setenv("RADIANCE_EXPERIMENTAL_DS41_LIVE_TAIL", "1", 1);
+    /* The draft check's served entry runs under the switch, read once at the first draft-shaped call. */
+    if (!std::strcmp(argv[2], "draft")) setenv("RADIANCE_EXPERIMENTAL_DS41_DRAFT_GEMV", "1", 1);
     const Lib lib(argv[1]);
+    if (!std::strcmp(argv[2], "draft")) return draft_check(lib, argc > 3 ? std::atoi(argv[3]) : 36);
     if (!std::strcmp(argv[2], "check")) return check(lib, argc > 3 ? std::atoi(argv[3]) : 24, argc > 4 ? argv[4] : "silu_table.bin");
     if (!std::strcmp(argv[2], "swiglu")) return swiglu_proof(lib, argc > 3 ? argv[3] : "silu_table.bin");
     if (!std::strcmp(argv[2], "ptime")) {

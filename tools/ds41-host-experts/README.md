@@ -110,6 +110,51 @@ issuing thread was back (a `done_` wake when a reader, not the caller, finished 
 mirror's line gives its copy time too, and the mover's "kept plane readers" line how many calls were
 posted.
 
+## DSpark's draft GEMVs (`RADIANCE_EXPERIMENTAL_DS41_DRAFT_GEMV`)
+
+DSpark's drafter (`Ds` arms) has three MoE stages (layers 40-42) whose 128 experts are 32 a rank,
+top-3, read in place from pinned host memory (`--draft-bank-expert-placement host`). A query pass
+is 5 rows, 15 slots a stage, about 4 of them a rank's own. The decode GEMV (libr4d
+`r4d_ds41_mxfp4.hip`) did that work twice over:
+
+- `mx_range` gives the rank's last expert every slot routed to another rank (`[off[31], T)`); the
+  rows come out zero, but its weights are read for them, at gate_up once a slot.
+- Since 02439b8f an expert with more rows than the LDS holds whole (one gate_up row at K 5120,
+  three down rows at K 2304) takes them in passes of that many, each a read of its weights: right
+  for VRAM, where a re-read costs less than restaging the activations, wrong over the link.
+
+Measured in the cap-1 profile (ab-20261029T154954Z; the per-op tables of all four ranks): draft
+gate_up 6.1-6.7 ms a call on ranks 0 and 1 and 11.2-11.8 ms on ranks 2 and 3 (whose cards share
+root complex 00), down 0.5-1.2 ms; 22 ms of draft GEMVs a step on ranks 0 and 1, 38 ms on 2 and 3,
+which the first two wait for in the stages' all-reduces (5.0-6.5 ms each). The draft costs about
+45 ms a step in all (Ds0-o 12.53, Ds1-o 10.81 tok/s).
+
+`=1` takes the live tail for the draft's shape (only the trunk's 96 / top-6 had it, under
+`..._LIVE_TAIL`; the dropped rows are zeroed by the tail kernel instead) and gives each live expert
+one pass over its weights, K restaged in chunks a row group where its rows do not fit whole (the
+chunked path, which keeps each lane's blocks and their order). `=2` is the live tail alone. Exact:
+each output is its weight row dotted with its activation row in the same lane and block order, and
+the dropped rows are zero either way. The trunk's GEMMs are not touched. libr4d prints a line at
+the first draft call and its counts at exit (`libr4d: RADIANCE_EXPERIMENTAL_DS41_DRAFT_GEMV ...:
+N draft moe_gemm_ggml calls (gate_up, down; query rows; tiled), M draft-shaped calls left on the old
+path`). Arm parts `Dk` / `Dkt` (with a `Ds` part). `tests/r4d_emu/test_ds41mx.cpp` holds every mode
+to a host restatement of the decode sequence with the work counted; on a card,
+`ds41_mxfp4_device_check LIBR4D.so draft [trials]` holds them to the host experts with the bank's
+experts in pinned host memory and in VRAM, then times each mode at a 5-row query pass
+(`DEVICE_CHECKS=draft` in a window, with `DRAFT_CHECK_BIN` and `DRAFT_CHECK_LIB`). Not yet measured
+on the card.
+
+`RADIANCE_EXPERIMENTAL_DS41_DSPARK_SHORT_BLOCK=N` (2-4; the deepseek41 plugin) declares a short query
+block of N rows, [anchor, noise x (N - 1)], proposing N tokens (`rad_drafter_short_block`), which the
+core runs from `--draft-short-from` decoding sequences on; the verify cap (`DsK`) now also accepts
+`--draft-short-from 1` when the drafter has one. At N = K + 1 the three draft stages route 3 (K + 1)
+slots instead of 15. The block's attention is non-causal, so its proposals are not the full
+block's first ones: the replies stay the target's, acceptance may move (the drafter was trained at
+5, and a short block has never been measured). Its own ops where the block length is a parameter:
+the offsets placing every row at the block's last position, each stage's attention window (`window`
+context keys before the anchor plus the block's), and the walk. Arm part `DbN` (with a `Ds` part);
+off, nothing of it is declared.
+
 ## The packed RAM cache
 
 With the file buffers capped (`..._FILE_BUFFER_UNITS`) the card never reads the RAM cache: the CPU

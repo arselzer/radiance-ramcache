@@ -4050,12 +4050,17 @@ int Engine::start() {
     RAD_TRY(plan());
     if (draft_experiment_.scope_required()) {
         if (ranks_.size() != 4) return RAD_E_UNSUPPORTED;
+        /* The cap measures the full block's query unless the drafter declared a short block
+         * (deepseek41's RADIANCE_EXPERIMENTAL_DS41_DSPARK_SHORT_BLOCK) and --draft-short-from 1
+         * runs it on every decoding step (max_seqs is 1 here): its first k proposals are then the
+         * verified ones. */
+        const bool short_ok = cfg_.draft_short_from == 0 || (cfg_.draft_short_from == 1 && drafter_short_ > 0);
         for (const auto& r : ranks_) {
             if (!dspark_draft_control_scope(r->program, r->plan, cfg_, bool(source_banks_)) ||
-                (draft_experiment_.verify_cap() >= 0 && cfg_.draft_short_from != 0)) {
+                (draft_experiment_.verify_cap() >= 0 && !short_ok)) {
                 RAD_ERR("experimental draft control requires a bound native DSpark EP4 "
                         "fixed-depth5 bank and all96 final immutable host-pinned head pairs (verify cap "
-                        "also requires draft-short-from0)");
+                        "also requires draft-short-from0, or 1 with the drafter's short block)");
                 return RAD_E_UNSUPPORTED;
             }
         }
@@ -4063,6 +4068,10 @@ int Engine::start() {
             RAD_INFO("experimental draft compute OFF: configured depth5, Program, banks and pools "
                      "retained; learned context/query and scheduler fallback disabled; "
                      "ordinary target pipelining restored");
+        else if (cfg_.draft_short_from == 1 && drafter_short_ > 0)
+            RAD_INFO("experimental draft verify cap: k=%d; configured depth5, short%lld query/proposal "
+                     "(--draft-short-from 1), Program, banks and pools retained; only the verified prefix "
+                     "is capped", draft_experiment_.verify_cap(), (long long)drafter_short_);
         else
             RAD_INFO("experimental draft verify cap: k=%d; configured depth5, full5 query/proposal, "
                      "Program, banks and pools retained; only the verified prefix is capped",

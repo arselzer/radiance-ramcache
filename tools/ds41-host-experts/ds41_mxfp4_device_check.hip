@@ -806,6 +806,8 @@ int draft_check(const Lib& L, int trials) {
         }
     }
     return all_bad ? 1 : 0;
+}
+
 /* ================================================================== tall (..._EXACT_TALL)
  *
  * A pass taller than 16 tokens must give a 16-token pass's bits on the three ops whose arithmetic

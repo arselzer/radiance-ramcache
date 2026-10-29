@@ -364,7 +364,7 @@ TEST(tall_init_refuses_a_step_whose_passes_would_change_arithmetic) {
 
 /* The CPU path's jobs for a tall pass: hx_jobs_for reads the sorted order and the offsets where the
  * tables put them at the stager's limit (offsets after 6 sorted slots a token of the step), cuts
- * each expert's rows into jobs of at most HostExpertPool::kMaxRows, points each job row at its
+ * each expert's rows into jobs of at most HostExpertPool::max_rows(), points each job row at its
  * token's row and its sorted slot's output row, and refuses a run that disagrees with the expert's
  * count. */
 TEST(a_tall_pass_cuts_its_jobs_from_the_step_sized_tables) {
@@ -416,7 +416,7 @@ TEST(a_tall_pass_cuts_its_jobs_from_the_step_sized_tables) {
                 CHECK_EQ(got, cnt[e]);
                 int in_jobs = 0;
                 for (const HostExpertPool::Job& j : EpCountsHostProbe::jobs(fs)) {
-                    CHECK(j.more >= 0 && j.more < HostExpertPool::kMaxRows);
+                    CHECK(j.more >= 0 && j.more < HostExpertPool::max_rows());
                     CHECK_EQ(j.cost, HostExpertPool::job_cost(j.more + 1));
                     for (int m = 0; m <= j.more; ++m) {
                         const uint16_t* jx = m ? j.xs[m - 1] : j.x;

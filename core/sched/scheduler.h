@@ -105,7 +105,7 @@ struct SchedReq {
     bool     reap_pending = false;
     int64_t  pending_ckpt = -1;  /* absolute position this step's chunk checkpoints at */
     /* The consumer skip's target for this prefill (consumer_skip.h): the first position whose
-     * state must be exact, its end or the tail checkpoint below it; 0 when its prefill is not
+     * state must be exact, its end or the deepest checkpoint below it; 0 when its prefill is not
      * cut. Set at each admission (Scheduler::consumer_target), carried by its prefill entries
      * (StepEntry::consumer_end); a checkpoint below it is not written. */
     int64_t  consumer_end = 0;
@@ -473,9 +473,13 @@ public:
     int64_t tail_checkpoint(int64_t target) const;
     /* The consumer skip (core/sched/consumer_skip.h, RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP):
      * whether init turned it on, and the target a request's prefill is cut for (0: not cut): its
-     * end, or the tail checkpoint below it when the scheduler writes one there. */
+     * end, or the deepest checkpoint below it its idle prefill writes (idle_prefill_checkpoint)
+     * when the prefix cache is on. */
     bool    consumer_on() const { return cs_on_; }
     int64_t consumer_target(const SchedReq& s) const;
+    /* The deepest checkpoint plan_chunk's chunks write for `r` from its computed tokens to `end`
+     * at the whole step budget, or -1. */
+    int64_t idle_prefill_checkpoint(const Request& r, int64_t end) const;
     /* What the cut ran (BatchBuilder::ConsumerStats). */
     const BatchBuilder::ConsumerStats& consumer_stats() const { return builder_.consumer_stats(); }
     /* The least recompute a snapshot at a shared head (CacheHit::branch_at) must save each later

@@ -1111,14 +1111,17 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
                              (int)(e.ctx_len + e.n_tokens), (long long)cs_.align,
                              (long long)cs_.max_rows);
             }
-            if (alone) {
+            /* A step that writes a checkpoint runs every layer, so its snapshot holds what the
+             * base engine's step leaves whatever the cut (insurance: the scheduler writes none
+             * below a cut prompt's target, and the step that reaches the target is never cut). */
+            if (alone && n_ck == 0) {
                 if (cs_end_ != e.consumer_end) {
                     cs_end_ = consumer_thresholds(cs_, e.consumer_end, cs_f_.data()) ? e.consumer_end
                                                                                     : -1;
                 }
                 if (cs_end_ == e.consumer_end)
                     F = consumer_full_layers(cs_, cs_f_.data(), (int64_t)e.ctx_len + e.n_tokens - 1);
-            } else {
+            } else if (!alone) {
                 ++cs_stats_.shared;
             }
             if (F < cs_.n_layer && e.produces_token) {

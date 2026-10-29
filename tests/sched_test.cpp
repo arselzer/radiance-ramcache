@@ -7588,3 +7588,143 @@ TEST(consumer_skip_is_refused_where_its_derivation_does_not_reach) {
         CHECK(f.sch.consumer_on());
     }
 }
+
+/* The consumer skip in DeepSeek-V4.1's own shape (ds41_fixture: linear state beside the window, a
+ * state chunk of 1, 16-token chunks), with the prefix cache on, in both resume modes: a prompt is
+ * cut for the deepest snapshot its idle prefill writes, and that one is written, so every prompt
+ * that would have a snapshot keeps one. With --prefix-resume nearest the chunk before a prompt's
+ * last ends on the quantum boundary under its end and the last chunk starts there, so no tail
+ * snapshot is taken (plan_chunk only splits a final chunk for one): cutting for tail_checkpoint()
+ * dropped the interval snapshots below it and wrote none. With exact a prompt just past an
+ * interval boundary has no tail, and the boundary's snapshot is the deepest. Every pass's F is the
+ * schedule's for that target, nothing sampled is cut, and the snapshots below it are counted. */
+TEST(consumer_skip_in_ds41s_shape_keeps_the_deepest_snapshot_its_prefill_writes) {
+    int runs = 0, kept = 0, below_tail = 0;
+    for (const bool exact : { false, true }) {
+        for (const int64_t interval : { 16, 256, 2048 }) {
+            for (const int64_t n : { 19, 40, 255, 256, 257, 300, 1100, 2047, 2048, 2050, 2064, 2065,
+                                     3086 }) {
+                Fixture f;
+                ds41_fixture(f, interval);
+                f.cfg.prefix_exact = exact;
+                f.prog.consumer = RadConsumerSuffix{ (uint32_t)sizeof(RadConsumerSuffix), 16, 4, 64 };
+                f.cfg.consumer_skip = 1;
+                f.cfg.max_seqs = 1;
+                REQUIRE_EQ(f.start(), RAD_OK);
+                REQUIRE(f.sch.consumer_on());
+                REQUIRE_EQ(f.sch.geometry().quantum, 16);
+                CHECK(!f.sch.geometry().window_ckpt);
+                /* The snapshots an uncut idle prefill of the prompt writes. */
+                const Cut cold = cut_from(f.sch, 0, n, 16);
+                int64_t deepest = -1;
+                for (int64_t k : cold.ckpts) deepest = std::max(deepest, k);
+                const int64_t target = deepest > 0 ? deepest : n;
+                const uint64_t id = f.submit((int)n, 1);
+                REQUIRE(id != 0);
+                const CsRun r = consumer_run(f, id, target);
+                CHECK_EQ(r.end, target);
+                CHECK_EQ(r.bad_full, 0);
+                CHECK_EQ(r.sampled_cut, 0);
+                CHECK_EQ(r.shared_cut, 0);
+                CHECK(r.ckpts == (deepest > 0 ? std::vector<int64_t>{ deepest } : std::vector<int64_t>{}));
+                int64_t below = 0;
+                for (int64_t k : cold.ckpts) below += k < target;
+                CHECK_EQ(f.sch.metrics().consumer_ckpt_dropped, below);
+                CHECK_EQ(f.sch.metrics().checkpoints_written, deepest > 0 ? 1ll : 0ll);
+                ++runs;
+                kept += deepest > 0;
+                const int64_t tail = f.sch.tail_checkpoint(n);
+                below_tail += deepest > 0 && tail > 0 && deepest < tail;
+            }
+        }
+    }
+    CHECK_EQ(runs, 78);
+    CHECK(kept > 40);
+    CHECK(below_tail > 0);   /* where tail_checkpoint() named a snapshot no chunk writes */
+    /* The case the review found: nearest, interval 2048, 3,086 tokens: the tail rule names 3072,
+     * which the 16-token chunks never snapshot; the deepest written is 2048. */
+    {
+        Fixture f;
+        ds41_fixture(f, 2048);
+        f.cfg.prefix_exact = false;
+        f.prog.consumer = RadConsumerSuffix{ (uint32_t)sizeof(RadConsumerSuffix), 16, 4, 64 };
+        f.cfg.consumer_skip = 1;
+        f.cfg.max_seqs = 1;
+        REQUIRE_EQ(f.start(), RAD_OK);
+        CHECK_EQ(f.sch.tail_checkpoint(3086), 3072);
+        CHECK((cut_from(f.sch, 0, 3086, 16).ckpts == std::vector<int64_t>{ 2048 }));
+        const uint64_t id = f.submit(3086, 1);
+        const CsRun r = consumer_run(f, id, 2048);
+        CHECK_EQ(r.end, 2048);
+        CHECK(r.ckpts == std::vector<int64_t>{ 2048 });
+        CHECK(r.cut > 100);
+    }
+}
+
+/* Without the prefix cache a prompt is cut for its end, and the snapshots a model with linear
+ * state still proposes (the store refuses them all) are not counted as dropped. */
+TEST(consumer_skip_without_the_prefix_cache_counts_no_dropped_snapshot) {
+    for (const bool exact : { false, true }) {
+        Fixture f;
+        ds41_fixture(f, 2048);
+        f.cfg.prefix_exact = exact;
+        f.cfg.prefix_cache = false;
+        f.prog.consumer = RadConsumerSuffix{ (uint32_t)sizeof(RadConsumerSuffix), 16, 4, 64 };
+        f.cfg.consumer_skip = 1;
+        f.cfg.max_seqs = 1;
+        REQUIRE_EQ(f.start(), RAD_OK);
+        REQUIRE(f.sch.consumer_on());
+        CHECK(f.sch.geometry().checkpoints());   /* linear state: proposed without the cache too */
+        const uint64_t id = f.submit(3086, 1);
+        const CsRun r = consumer_run(f, id, 3086);
+        CHECK_EQ(r.end, 3086);
+        CHECK_EQ(r.bad_full, 0);
+        CHECK(r.ckpts.empty());
+        CHECK(r.cut > 150);
+        CHECK_EQ(f.sch.metrics().consumer_ckpt_dropped, 0ll);
+    }
+}
+
+/* Refused where the ranks would not cut alike (a rank whose declaration differs from rank 0's),
+ * and with KV streaming. */
+TEST(consumer_skip_is_refused_for_unlike_ranks_and_kv_streaming) {
+    {   /* rank 1 declared another window */
+        Fixture f;
+        consumer_fixture(f, 16);
+        Program other = f.prog;
+        other.consumer.window = 32;
+        std::vector<BatchBuilder::RankIO> rio;
+        rio.push_back({ 0, nullptr, &f.prog });
+        rio.push_back({ 0, nullptr, &other });
+        REQUIRE_EQ(f.sch.init(f.prog, f.cfg, &f.kv, &f.pc, rio, nullptr, nullptr), RAD_OK);
+        CHECK(!f.sch.consumer_on());
+    }
+    {   /* rank 1 declared none */
+        Fixture f;
+        consumer_fixture(f, 16);
+        Program other = f.prog;
+        other.consumer = RadConsumerSuffix{};
+        std::vector<BatchBuilder::RankIO> rio;
+        rio.push_back({ 0, nullptr, &f.prog });
+        rio.push_back({ 0, nullptr, &other });
+        REQUIRE_EQ(f.sch.init(f.prog, f.cfg, &f.kv, &f.pc, rio, nullptr, nullptr), RAD_OK);
+        CHECK(!f.sch.consumer_on());
+    }
+    {   /* two ranks alike are covered */
+        Fixture f;
+        consumer_fixture(f, 16);
+        Program other = f.prog;
+        std::vector<BatchBuilder::RankIO> rio;
+        rio.push_back({ 0, nullptr, &f.prog });
+        rio.push_back({ 0, nullptr, &other });
+        REQUIRE_EQ(f.sch.init(f.prog, f.cfg, &f.kv, &f.pc, rio, nullptr, nullptr), RAD_OK);
+        CHECK(f.sch.consumer_on());
+    }
+    {   /* --kv-resident */
+        Fixture f;
+        consumer_fixture(f, 16);
+        f.cfg.kv_resident = 1024;
+        REQUIRE_EQ(f.start(), RAD_OK);
+        CHECK(!f.sch.consumer_on());
+    }
+}

@@ -303,7 +303,7 @@ typedef struct RadBatch {
     int32_t consumer_full;
     int32_t consumer_rsv;          /* zero */
     /* Host. The prompt position the cut was derived for: the first position whose state must be
-     * exact (the end of the prompt, or the tail checkpoint just below it); 0 without a cut. For
+     * exact (the end of the prompt, or the deepest checkpoint below it); 0 without a cut. For
      * checks and logs: what a step issues depends on consumer_full alone. */
     int64_t consumer_end;
 } RadBatch;

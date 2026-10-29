@@ -289,9 +289,38 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
             c.max_rows = cfg.max_tok;
             c.align = std::max<int64_t>(geo_.quantum, 1);
             std::string why;
+            /* Every rank cuts on its own declaration (the plugin's cut_on) while the batch's F is
+             * rank 0's, so all must have declared the same suffix: one that did not would skip
+             * layers, and their collectives, that the others run. */
+            int odd = -1;
+            for (size_t i = 0; i < ranks.size() && odd < 0; ++i) {
+                const Program* rp = ranks[i].prog;
+                if (!rp) continue;
+                const RadConsumerSuffix& o = rp->consumer;
+                if (o.n_layer != d.n_layer || o.boundary != d.boundary || o.window != d.window)
+                    odd = (int)i;
+            }
+            /* KV streaming: a streamed group keeps only a ring of its context on the card, which
+             * the derivation (whole windows of stored keys) does not cover. */
+            bool streams = cfg.kv_resident > 0 || cfg.kv_streams;
+            for (size_t i = 0; i < ranks.size() && !streams; ++i) {
+                if (!ranks[i].kv_streams || !ranks[i].prog) continue;
+                for (size_t g = 0; g < ranks[i].prog->kv_groups.size() && !streams; ++g)
+                    streams = ranks[i].kv_streams[g] != nullptr;
+            }
             if (d.n_layer <= 0)
                 why = "the model's plugin declared no consumer suffix (deepseek41 declares one for "
                       "DeepSeek-V4.1-Flash's own topology only; its line above says why not)";
+            else if (odd >= 0)
+                why = fmt("rank %d declared another consumer suffix (%d layers, boundary %d, window "
+                          "%d) than rank 0 (%d, %d, %d): every rank must cut alike, or their "
+                          "collectives part", odd, ranks[(size_t)odd].prog->consumer.n_layer,
+                          ranks[(size_t)odd].prog->consumer.boundary,
+                          ranks[(size_t)odd].prog->consumer.window, d.n_layer, d.boundary,
+                          d.window);
+            else if (streams)
+                why = "KV streaming (--kv-resident) is not covered: a streamed group holds a ring of "
+                      "its context, not the whole windows the derivation reads";
             else if (cfg.n_spec != 0 || prog.drafter.kind != RAD_DRAFT_NONE)
                 why = "speculation is on: a drafter's context reads every prompt row's hidden state, "
                       "and verify steps are not covered";
@@ -324,8 +353,9 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
                          "starting on a %lld-row grid)%s",
                          d.boundary, d.n_layer, d.window, (long long)c.max_rows, (long long)c.align,
                          cfg.prefix_cache && geo_.checkpoints()
-                             ? "; a prompt is cut for its tail checkpoint, and no checkpoint below "
-                               "it is written"
+                             ? "; a prompt is cut for the deepest checkpoint its idle prefill writes "
+                               "(its tail, else the last interval boundary, else a shared head), and "
+                               "none below it is written"
                              : "");
             } else {
                 RAD_WARN("consumer skip: refused -- %s; every layer runs on every row", why.c_str());
@@ -764,9 +794,11 @@ void Scheduler::close_request(SchedReq& s, ReqState st, const char* reason, bool
  * refusal leaves the entry without one. */
 void Scheduler::reserve_ckpt(StepEntry& e, const Request& r, int64_t pos, int32_t tok) {
     /* The consumer skip: a snapshot below the prompt's cut target would hold the last layers'
-     * windows incomplete; the one at the target is whole (consumer_skip.h). */
+     * windows incomplete; the one at the target is whole (consumer_skip.h). Counted only with the
+     * prefix cache on: without it the store refuses every snapshot anyway (a model with linear
+     * state still proposes them). */
     if (e.consumer_end > 0 && !consumer_checkpoint_complete(pos, e.consumer_end)) {
-        ++m_.consumer_ckpt_dropped;
+        if (cfg_.prefix_cache) ++m_.consumer_ckpt_dropped;
         return;
     }
     int32_t cs = -1;
@@ -1594,9 +1626,9 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
 }
 
 /* The consumer skip's target for a request just admitted (consumer_skip.h): the end of what its
- * prefill computes, or, where the scheduler writes a tail checkpoint below it, that checkpoint,
- * whose snapshot must hold every layer's window. 0 for a request whose every row matters: a
- * scored prompt (KL mode) or an embedding input. */
+ * prefill computes, or, where the scheduler writes a checkpoint below it, the deepest one, whose
+ * snapshot must hold every layer's window (every one below it is dropped). 0 for a request whose
+ * every row matters: a scored prompt (KL mode) or an embedding input. */
 int64_t Scheduler::consumer_target(const SchedReq& s) const {
     if (!cs_on_ || !s.req) return 0;
     const Request& r = *s.req;
@@ -1605,10 +1637,29 @@ int64_t Scheduler::consumer_target(const SchedReq& s) const {
     if (target <= (int64_t)r.n_computed) return 0;
     int64_t t = target;
     if (cfg_.prefix_cache && geo_.checkpoints()) {
-        const int64_t tail = tail_checkpoint(chunk_end(r, target));
-        if (tail > (int64_t)r.n_computed && tail < t) t = tail;
+        const int64_t ck = idle_prefill_checkpoint(r, chunk_end(r, target));
+        if (ck > (int64_t)r.n_computed && ck < t) t = ck;
     }
     return t;
+}
+
+/* The deepest checkpoint an idle prefill of `r` writes from its computed tokens to `end`:
+ * plan_chunk's own chunks at the whole step budget, as a cut prompt runs (alone in its steps), so
+ * its tail where plan_chunk takes one, else the last interval boundary, else the request's own
+ * keep point; -1 when they write none. tail_checkpoint() alone is not that: with --prefix-resume
+ * nearest and chunks of one quantum the chunk before the last already ends on the tail and the
+ * last starts there, so no snapshot is taken at it (and in exact mode a prompt just past an
+ * interval boundary has no tail but the boundary's snapshot). */
+int64_t Scheduler::idle_prefill_checkpoint(const Request& r, int64_t end) const {
+    int64_t deepest = -1;
+    for (int64_t pos = (int64_t)r.n_computed; pos < end;) {
+        int64_t ck = -1;
+        const int64_t n = plan_chunk(pos, end, cfg_.max_tok, &ck, r.checkpoint_at);
+        if (n <= 0) break;
+        if (ck > deepest) deepest = ck;
+        pos += n;
+    }
+    return deepest;
 }
 
 void Scheduler::undo_hit(SchedReq& s) {

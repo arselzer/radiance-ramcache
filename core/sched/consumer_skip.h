@@ -18,9 +18,10 @@
  *
  * ---- what must be exact ----------------------------------------------------------------------
  *
- * Let T be the first position whose state must be exact: the prompt's end N, or the tail
- * checkpoint below it when the scheduler writes one (its snapshot holds every layer's keys at
- * T - W .. T - 1). Rows at or after T - 1 run every layer. The decode after the prompt reads the
+ * Let T be the first position whose state must be exact: the prompt's end N, or with the prefix
+ * cache on the deepest checkpoint below it that the prompt's idle prefill writes (its tail, else
+ * the last interval boundary, else a shared head; Scheduler::idle_prefill_checkpoint), whose
+ * snapshot holds every layer's keys at T - W .. T - 1. Rows at or after T - 1 run every layer. The decode after the prompt reads the
  * keys at N - W + 1 .. N - 1 and a checkpoint at T those at T - W .. T - 1, both inside T - W ..
  * N - 1.
  *

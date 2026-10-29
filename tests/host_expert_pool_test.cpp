@@ -185,6 +185,47 @@ TEST(host_expert_pool_planes_and_urgent_jobs_match) {
     CHECK_EQ(p->backlog(), (int64_t)0);
 }
 
+TEST(host_expert_pool_multi_row_jobs_match) {
+    HostExpertPool* p = pool();
+    if (!p || !__builtin_cpu_supports("avx2")) { SKIP("no AVX2 or no pool"); return; }
+    Expert e{ blocks(2 * kFf, kEmbd, 41), blocks(kEmbd, kFf, 42) };
+    std::vector<uint8_t> guc, gus, dnc, dns;
+    planes_of(e.gu, 2 * kFf, kEmbd, &guc, &gus);
+    planes_of(e.dn, kEmbd, kFf, &dnc, &dns);
+    std::vector<std::vector<uint16_t>> xs, want, got(6, std::vector<uint16_t>(kEmbd, 0xffff));
+    for (int r = 0; r < 4; ++r) {
+        xs.push_back(row(100 + (uint64_t)r));
+        want.push_back(reference(e, xs.back()));
+    }
+    /* Four rows in one block-layout job, and rows 1 and 3 again in one planar urgent job. */
+    HostExpertPool::Job j[2];
+    j[0].gu = e.gu.data(); j[0].dn = e.dn.data();
+    j[0].x = xs[0].data(); j[0].y = got[0].data();
+    for (int r = 1; r < 4; ++r) { j[0].xs[r - 1] = xs[(size_t)r].data(); j[0].ys[r - 1] = got[(size_t)r].data(); }
+    j[0].more = 3;
+    j[1].gu = guc.data(); j[1].gu_scales = gus.data(); j[1].dn = dnc.data(); j[1].dn_scales = dns.data();
+    j[1].x = xs[1].data(); j[1].y = got[4].data();
+    j[1].xs[0] = xs[3].data(); j[1].ys[0] = got[5].data();
+    j[1].more = 1; j[1].urgent = true;
+    HostExpertPool::Ticket t;
+    p->reserve(HostExpertPool::job_cost(4) + HostExpertPool::job_cost(2));
+    CHECK_EQ(p->submit(j, 2, &t), 0);
+    p->wait(&t);
+    for (int r = 0; r < 4; ++r) CHECK(got[(size_t)r] == want[(size_t)r]);
+    CHECK(got[4] == want[1]);
+    CHECK(got[5] == want[3]);
+    CHECK_EQ(p->backlog(), (int64_t)0);
+    /* A missing extra row pointer, or too many rows, is refused. */
+    HostExpertPool::Job bad = j[0];
+    bad.xs[2] = nullptr;
+    HostExpertPool::Ticket t2;
+    CHECK(p->submit(&bad, 1, &t2) < 0);
+    bad = j[0];
+    bad.more = HostExpertPool::kMaxRows;
+    CHECK(p->submit(&bad, 1, &t2) < 0);
+    CHECK_EQ(HostExpertPool::cost_rows(9), 2 * HostExpertPool::job_cost(4) + HostExpertPool::job_cost(1));
+}
+
 TEST(host_expert_pool_refuses_incomplete_jobs) {
     HostExpertPool* p = pool();
     if (!p) { SKIP("no pool"); return; }

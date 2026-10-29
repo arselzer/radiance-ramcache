@@ -39,6 +39,7 @@ public:
      * gu_scales and dn_scales set the release's planes (a fresh read from the container): codes
      * [N, K/2] and e8m0 scales [N, K/32]. An urgent job (a missed expert, on the critical path)
      * is claimed before every other. */
+    static constexpr int kMaxRows = 4;
     struct Job {
         const uint8_t*  gu = nullptr;   /* [2 * kFf, kEmbd] */
         const uint8_t*  dn = nullptr;   /* [kEmbd, kFf] */
@@ -46,8 +47,23 @@ public:
         const uint8_t*  dn_scales = nullptr;
         const uint16_t* x = nullptr;    /* kEmbd bf16 */
         uint16_t*       y = nullptr;    /* kEmbd bf16 */
+        /* Up to kMaxRows - 1 more token rows of the same expert: each weight tile is read once for
+         * all of them (it stays in L2), each row's arithmetic unchanged. */
+        const uint16_t* xs[kMaxRows - 1] = {};
+        uint16_t*       ys[kMaxRows - 1] = {};
+        int             more = 0;
         bool            urgent = false;
+        int64_t         cost = 0;       /* backlog bytes it stands for; 0: cost_rows(1 + more) */
     };
+    /* The backlog a job of `rows` rows stands for: the expert's bytes for the first row, half
+     * of them for each more (computed from L2). */
+    static int64_t job_cost(int rows) { return kExpertBytes + (int64_t)(rows - 1) * kExpertBytes / 2; }
+    /* An expert's `rows` rows as jobs of at most kMaxRows. */
+    static int64_t cost_rows(int rows) {
+        int64_t c = 0;
+        for (; rows > 0; rows -= kMaxRows) c += job_cost(rows < kMaxRows ? rows : kMaxRows);
+        return c;
+    }
     /* The jobs one caller waits for: submit adds them, the pool counts them down. */
     struct Ticket {
         std::atomic<int> left{ 0 };
@@ -57,17 +73,17 @@ public:
      * the configuration is unusable (said once). */
     static HostExpertPool* get();
 
-    /* Queues `n` jobs under `t`, each with kExpertBytes the caller reserved. Blocks while every
-     * job slot is taken. */
+    /* Queues `n` jobs under `t`, each with its cost the caller reserved. Blocks while every job
+     * slot is taken. */
     int  submit(const Job* jobs, int n, Ticket* t);
     /* Until every job of `t` has finished: spins briefly, then yields. */
     void wait(const Ticket* t) const;
     bool done(const Ticket* t) const { return t->left.load(std::memory_order_acquire) == 0; }
 
     /* Weight bytes queued and not yet read, over all callers, counting what callers have reserved
-     * for jobs they are about to submit. A caller reserves kExpertBytes a job when it decides,
-     * so ranks deciding at once see each other's choices; submit takes the reservation over (each
-     * finished job gives back kExpertBytes) and unreserve returns what is never submitted. */
+     * for jobs they are about to submit. A caller reserves a job's cost when it decides, so
+     * ranks deciding at once see each other's choices; submit takes the reservation over (each
+     * finished job gives back its cost) and unreserve returns what is never submitted. */
     int64_t backlog() const { return backlog_.load(std::memory_order_relaxed); }
     void    reserve(int64_t bytes) { backlog_.fetch_add(bytes, std::memory_order_relaxed); }
     void    unreserve(int64_t bytes) { backlog_.fetch_sub(bytes, std::memory_order_relaxed); }
@@ -96,8 +112,8 @@ private:
         std::atomic<int>      urgent{ 0 };
         Job      job;
         Ticket*  ticket = nullptr;
-        alignas(64) uint16_t gate_up[2 * kFf];
-        uint16_t act[kFf];
+        alignas(64) uint16_t gate_up[kMaxRows][2 * kFf];
+        uint16_t act[kMaxRows][kFf];
     };
 
     HostExpertPool() = default;

@@ -155,10 +155,14 @@ HostExpertPool::~HostExpertPool() {
 int HostExpertPool::submit(const Job* jobs, int n, Ticket* t) {
     if (!t || n < 0 || (n > 0 && !jobs)) return RAD_E_INVAL;
     if (n == 0) return RAD_OK;
-    for (int j = 0; j < n; ++j)
-        if (!jobs[j].gu || !jobs[j].dn || !jobs[j].x || !jobs[j].y ||
-            (!jobs[j].gu_scales) != (!jobs[j].dn_scales))
+    for (int j = 0; j < n; ++j) {
+        const Job& b = jobs[j];
+        if (!b.gu || !b.dn || !b.x || !b.y || (!b.gu_scales) != (!b.dn_scales) || b.more < 0 ||
+            b.more >= kMaxRows)
             return RAD_E_INVAL;
+        for (int r = 0; r < b.more; ++r)
+            if (!b.xs[r] || !b.ys[r]) return RAD_E_INVAL;
+    }
     /* Counted before any job is visible, so a waiter never sees zero while one is still to come. */
     t->left.fetch_add(n, std::memory_order_relaxed);
     std::lock_guard<std::mutex> lk(submit_mu_);
@@ -181,6 +185,7 @@ int HostExpertPool::submit(const Job* jobs, int n, Ticket* t) {
         const uint64_t seq = ++seq_;
         s.seq.store(seq, std::memory_order_relaxed);
         s.job = jobs[j];
+        if (!s.job.cost) s.job.cost = job_cost(1 + s.job.more);
         s.ticket = t;
         s.gu_left.store(kGuTiles, std::memory_order_relaxed);
         s.dn_left.store(kDnTiles, std::memory_order_relaxed);
@@ -251,9 +256,11 @@ void HostExpertPool::tile(Slot& s, uint32_t gen, int k) {
         m.K = kEmbd;
         if (planes) { m.codes = s.job.gu; m.scales = s.job.gu_scales; }
         else m.blocks = s.job.gu;
-        ds41hx::gemv_avx2(m, s.job.x, s.gate_up, k * kTile, (k + 1) * kTile);
+        for (int r = 0; r <= s.job.more; ++r)
+            ds41hx::gemv_avx2(m, r ? s.job.xs[r - 1] : s.job.x, s.gate_up[r], k * kTile, (k + 1) * kTile);
         if (s.gu_left.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-            ds41hx::swiglu(silu_.data(), s.gate_up, s.act, kFf, limit_);
+            for (int r = 0; r <= s.job.more; ++r)
+                ds41hx::swiglu(silu_.data(), s.gate_up[r], s.act[r], kFf, limit_);
             s.open.store(gen, std::memory_order_release);
             wake();   /* workers that slept through the gate_up tail take down tiles too */
         }
@@ -264,11 +271,12 @@ void HostExpertPool::tile(Slot& s, uint32_t gen, int k) {
     m.K = kFf;
     if (planes) { m.codes = s.job.dn; m.scales = s.job.dn_scales; }
     else m.blocks = s.job.dn;
-    ds41hx::gemv_avx2(m, s.act, s.job.y, d * kTile, (d + 1) * kTile);
+    for (int r = 0; r <= s.job.more; ++r)
+        ds41hx::gemv_avx2(m, s.act[r], r ? s.job.ys[r - 1] : s.job.y, d * kTile, (d + 1) * kTile);
     if (s.dn_left.fetch_sub(1, std::memory_order_acq_rel) != 1) return;
     /* The job's last tile: nothing reads the slot after this. */
     Ticket* t = s.ticket;
-    backlog_.fetch_sub(kExpertBytes, std::memory_order_relaxed);
+    backlog_.fetch_sub(s.job.cost, std::memory_order_relaxed);
     s.state.store(0, std::memory_order_release);
     t->left.fetch_sub(1, std::memory_order_acq_rel);
     slot_cv_.notify_one();

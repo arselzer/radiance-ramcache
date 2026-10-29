@@ -988,9 +988,9 @@ void FileStager::hx_choose(int32_t li) {
         if (misses && (int)hx_miss_.size() < kHxUnits && mover_->host_planes_eligible(u)) {
             hx_slot_[i] = -2;
             hx_miss_.push_back(hx_planes_get(u));
-            const int64_t rows = e >= 0 && e < counts_cap_ ? std::max<int32_t>(counts_host_[e], 1) : 1;
-            hx_pool_->reserve(rows * HostExpertPool::kExpertBytes);
-            hx_reserved_ += rows * HostExpertPool::kExpertBytes;
+            const int rows = e >= 0 && e < counts_cap_ ? std::max<int32_t>(counts_host_[e], 1) : 1;
+            hx_pool_->reserve(HostExpertPool::cost_rows(rows));
+            hx_reserved_ += HostExpertPool::cost_rows(rows);
             continue;
         }
         link += plan_->units[(size_t)u].bytes;
@@ -1000,8 +1000,8 @@ void FileStager::hx_choose(int32_t li) {
         if (hx_slot_[i] < 0) continue;
         Mover::HostUnit& hu = hx_units_[hx_slot_[i]];
         const int32_t e = plan_->units[(size_t)hu.unit].expert;
-        const int64_t rows = e >= 0 && e < counts_cap_ ? std::max<int32_t>(counts_host_[e], 1) : 1;
-        const int64_t cost = rows * HostExpertPool::kExpertBytes, bytes = plan_->units[(size_t)hu.unit].bytes;
+        const int rows = e >= 0 && e < counts_cap_ ? std::max<int32_t>(counts_host_[e], 1) : 1;
+        const int64_t cost = HostExpertPool::cost_rows(rows), bytes = plan_->units[(size_t)hu.unit].bytes;
         const bool cpu = hx_policy_ != kHxGreedy ||
                          (double)(hx_pool_->backlog() + cost) / cb <= (double)(link + bytes) / lb;
         if (cpu) {
@@ -1063,15 +1063,27 @@ int FileStager::hx_jobs_for(int e, const HostExpertPool::Job& proto) {
     lo = std::clamp(lo, 0, (int)T);
     hi = std::clamp(hi, lo, (int)T);
     int32_t n = 0;
+    HostExpertPool::Job j = proto;
+    int in_job = 0;
+    auto flush = [&] {
+        if (!in_job) return;
+        j.more = in_job - 1;
+        j.cost = HostExpertPool::job_cost(in_job);
+        hx_jobs_.push_back(j);
+        j = proto;
+        in_job = 0;
+    };
     for (int i = lo; i < hi; ++i) {
         if (sorted[i] < 0 || sorted[i] / o.top_k >= AR) continue;
-        HostExpertPool::Job j = proto;
-        j.x = hx_x_ + (int64_t)(sorted[i] / o.top_k) * kHxEmbd;
-        j.y = hx_out_ + (int64_t)i * kHxEmbd;
-        hx_jobs_.push_back(j);
+        const uint16_t* x = hx_x_ + (int64_t)(sorted[i] / o.top_k) * kHxEmbd;
+        uint16_t* y = hx_out_ + (int64_t)i * kHxEmbd;
+        if (!in_job) { j.x = x; j.y = y; }
+        else { j.xs[in_job - 1] = x; j.ys[in_job - 1] = y; }
+        if (++in_job == HostExpertPool::kMaxRows) flush();
         hx_rows_.push_back(i);
         ++n;
     }
+    flush();
     /* The scatter's own count for the expert, which chose it: a different number of rows means the
      * sorted order was not read as the card reads it. */
     if (e >= counts_cap_ || n != counts_host_[e]) {
@@ -1106,17 +1118,17 @@ int FileStager::hx_submit() {
     int64_t miss_res = 0;
     for (const auto& p : hx_miss_) {
         const int32_t e = plan_->units[(size_t)p->unit].expert;
-        miss_res += (e >= 0 && e < counts_cap_ ? std::max<int32_t>(counts_host_[e], 1) : 1) *
-                    HostExpertPool::kExpertBytes;
+        miss_res += HostExpertPool::cost_rows(e >= 0 && e < counts_cap_ ? std::max<int32_t>(counts_host_[e], 1) : 1);
     }
-    const int64_t submitted = (int64_t)hx_jobs_.size() * HostExpertPool::kExpertBytes;
+    int64_t submitted = 0;
+    for (const HostExpertPool::Job& j : hx_jobs_) submitted += j.cost;
     if (hx_reserved_ - miss_res != submitted) hx_pool_->unreserve(hx_reserved_ - miss_res - submitted);
     hx_reserved_ = miss_res;
     RAD_TRY(hx_pool_->submit(hx_jobs_.data(), (int)hx_jobs_.size(), &hx_ticket_));
     hx_stage_ = 2;
     hx_confirmed_ = false;
     ++hx_stats_.layers;
-    hx_stats_.rows += hx_jobs_.size();
+    hx_stats_.rows += hx_rows_.size();
     return RAD_OK;
 }
 
@@ -1154,7 +1166,8 @@ int FileStager::hx_submit_misses() {
         hx_stats_.miss_rows += (uint64_t)n;
     }
     const int n = (int)(hx_jobs_.size() - first);
-    const int64_t submitted = (int64_t)n * HostExpertPool::kExpertBytes;
+    int64_t submitted = 0;
+    for (size_t k = first; k < hx_jobs_.size(); ++k) submitted += hx_jobs_[k].cost;
     if (hx_reserved_ != submitted) hx_pool_->unreserve(hx_reserved_ - submitted);
     hx_reserved_ = 0;
     RAD_TRY(hx_pool_->submit(hx_jobs_.data() + first, n, &hx_ticket_));

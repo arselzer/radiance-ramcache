@@ -19,6 +19,8 @@ step was measured as an A/B window; the log is `/home/as/ds41-decode-review-2026
   are copied over the card's before the gather.
 - `core/place/plane_mirror.*`: an optional second copy of the planes on another drive.
 - `core/place/router_predictor.*`: the next-layer predictor (shadow statistics; read-ahead is off).
+- `core/place/readahead.*`: read-ahead in pieces (`..._PREFETCH=pieces`, off): the predicted misses
+  of layer L+2 read at layer L in small pieces that give way to demand reads.
 
 ## Configuration
 
@@ -71,6 +73,7 @@ the engine or the scripts assumes where the checkpoint is. `ab_window.sh` takes 
 | `..._ASYNC_MISSES=2` | TTFT −25% | decode passes keep the direct path (no gain there) |
 | `..._HOST_EXPERTS_INSERT_THREADS` (4) | | background relayout+insert threads |
 | `..._PREFETCH=shadow\|on`, `_PREFETCH_K` | read-ahead: top 6 −14%, top 2 ±0 | off; shadow prints precision by prediction rank |
+| `..._PREFETCH=pieces`, `_PREFETCH_K` (4) | not yet measured | layer L's router input predicts layer L+2 (posted after the CPU work is submitted; the prediction is handed straight to the read-ahead). Each rank's predicted uncached units are read in `_PREFETCH_PIECE_KB` (512) pieces by `_PREFETCH_QD` (4) readers over the process, none started while any rank's demand read is in flight; a unit goes to its layer only whole, a partly read one is finished at once while the layer waits, and the rest are cancelled and never inserted. At most `_PREFETCH_LIVE` (8) units a rank; `_PREFETCH_FINISH=0` reads a partly read unit afresh instead of finishing it. Arm parts `PpK`, `PqN`, `PbN`, `Pf0`; the shutdown report's "read-ahead in pieces", "read-ahead readers" and "router predictor" lines |
 | `..._ACCESS_TRACE=<dir>` | | per-rank access traces for `cache_sim.py` |
 | miss reads on kept readers, 2 MiB pages | +4.6%, TTFT −3.6% | on by default; `RADIANCE_EXPERIMENTAL_DS41_READ_POOL=0` starts threads a call and `..._PLANE_HUGEPAGES=0` uses 4 KiB pages, as before (A/B switches) |
 | missed units relaid straight into a reserved cache slot | +1.1% | on by default with `..._NATIVE_CACHE_DIRECT_FILL=1`; `RADIANCE_EXPERIMENTAL_DS41_INSERT_DIRECT=0` relays via scratch and copies, as before |

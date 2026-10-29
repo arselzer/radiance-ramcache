@@ -925,7 +925,6 @@ bool Mover::read_unit_planes(HostPlanes* const* units, int n, int rows) {
     PlaneMirror* const pm = PlaneMirror::get();
     const int64_t tail = !pm ? 0 : rows >= pm->min_rows() ? mirror_tail_ : mirror_tail_decode_;
     PlaneMirror* const mirror = tail > 0 && pm->on() ? pm : nullptr;
-    const int64_t A = DirectFile::alignment();
     int weights = 0;
     for (int i = 0; i < n; ++i) {
         HostPlanes* p = units[i];
@@ -937,33 +936,9 @@ bool Mover::read_unit_planes(HostPlanes* const* units, int n, int rows) {
         if (mu.weights.size() != 2) return false;
         p->n = 0;
         for (int k = 0; k < 2; ++k) {
+            if (!lay_out_weight(p, k, mu.weights[(size_t)k])) return false;
             const WeightInfo& w = prog_->weights[mu.weights[(size_t)k]];
-            RadTensor pt[RAD_ENC_MAX_PLANES];
-            weight_planes(w, pt);
-            if (!mapped_file_eligible(w) || w.n_sel != 2 || pt[0].dtype != RAD_FP4E2M1 ||
-                pt[1].dtype != RAD_E8M0 || pt[0].shape[0] != pt[1].shape[0] ||
-                pt[0].shape[1] != pt[1].shape[1] * 32)
-                return false;
-            int64_t lo = INT64_MAX, hi = 0;
-            for (int j = 0; j < 2; ++j) {
-                const int64_t bytes = pt[j].shape[0] * rad_dtype_bytes(pt[j].dtype, pt[j].shape[1]);
-                lo = std::min(lo, (int64_t)w.file_plane_offset[j]);
-                hi = std::max(hi, (int64_t)w.file_plane_offset[j] + bytes);
-            }
-            const int64_t a0 = lo / A * A, need = align_up(hi - a0, A);
-            if (p->cap[k] < need) {
-                std::free(p->buf[k]);
-                p->buf[k] = alloc_plane_buffer(need, &p->cap[k]);
-                if (!p->buf[k]) return false;
-            }
-            p->w[k] = mu.weights[(size_t)k];
-            p->rows[k] = pt[0].shape[0];
-            p->cols[k] = pt[0].shape[1];
-            p->codes[k] = p->buf[k] + ((int64_t)w.file_plane_offset[0] - a0);
-            p->scales[k] = p->buf[k] + ((int64_t)w.file_plane_offset[1] - a0);
-            p->a0[k] = a0;
-            p->len[k] = hi - a0;
-            p->n = k + 1;
+            const int64_t a0 = p->a0[k], hi = a0 + p->len[k];
             ++weights;
             /* The gate_up codes' tail from the mirror (mirror_init checked the layout: codes, then
              * scales, both 4 KiB-aligned): the container reads the head and the scales. */
@@ -1024,6 +999,64 @@ bool Mover::read_unit_planes(HostPlanes* const* units, int n, int rows) {
     host_plane_reads_.fetch_add((uint64_t)weights, std::memory_order_relaxed);
     for (int r : rc) if (r < 0) return false;
     return source_file_epoch();
+}
+
+bool Mover::lay_out_weight(HostPlanes* p, int k, rad_weight h) {
+    const WeightInfo& w = prog_->weights[h];
+    RadTensor pt[RAD_ENC_MAX_PLANES];
+    weight_planes(w, pt);
+    if (!mapped_file_eligible(w) || w.n_sel != 2 || pt[0].dtype != RAD_FP4E2M1 ||
+        pt[1].dtype != RAD_E8M0 || pt[0].shape[0] != pt[1].shape[0] ||
+        pt[0].shape[1] != pt[1].shape[1] * 32)
+        return false;
+    const int64_t A = DirectFile::alignment();
+    int64_t lo = INT64_MAX, hi = 0;
+    for (int j = 0; j < 2; ++j) {
+        const int64_t bytes = pt[j].shape[0] * rad_dtype_bytes(pt[j].dtype, pt[j].shape[1]);
+        lo = std::min(lo, (int64_t)w.file_plane_offset[j]);
+        hi = std::max(hi, (int64_t)w.file_plane_offset[j] + bytes);
+    }
+    const int64_t a0 = lo / A * A, need = align_up(hi - a0, A);
+    if (p->cap[k] < need) {
+        std::free(p->buf[k]);
+        p->buf[k] = alloc_plane_buffer(need, &p->cap[k]);
+        if (!p->buf[k]) return false;
+    }
+    p->w[k] = h;
+    p->rows[k] = pt[0].shape[0];
+    p->cols[k] = pt[0].shape[1];
+    p->codes[k] = p->buf[k] + ((int64_t)w.file_plane_offset[0] - a0);
+    p->scales[k] = p->buf[k] + ((int64_t)w.file_plane_offset[1] - a0);
+    p->a0[k] = a0;
+    p->len[k] = hi - a0;
+    p->n = k + 1;
+    return true;
+}
+
+bool Mover::lay_out_unit_planes(HostPlanes* p, PlaneExtent ext[2]) {
+    if (!p || !ext || !plan_ || !prog_ || !relayout_ || !file_.ok() || !mapped_file_cache_on_)
+        return false;
+    const int32_t u = p->unit;
+    if (u < 0 || (size_t)u >= plan_->units.size()) return false;
+    const MoveUnit& mu = plan_->units[(size_t)u];
+    if (mu.tier != Tier::SSD || mu.weights.size() != 2) return false;
+    p->n = 0;
+    for (int k = 0; k < 2; ++k) {
+        if (!lay_out_weight(p, k, mu.weights[(size_t)k])) return false;
+        ext[k] = PlaneExtent{ prog_->weights[mu.weights[(size_t)k]].file_id, p->a0[k], p->len[k],
+                              p->buf[k], p->cap[k] };
+    }
+    return true;
+}
+
+int Mover::read_piece(uint32_t file, int64_t off, int64_t len, void* dst, int64_t cap) {
+    if (off < 0 || len <= 0 || !dst) return RAD_E_INVAL;
+    return read_source_file(file, (uint64_t)off, len, dst, cap);
+}
+
+int64_t Mover::decode_mirror_bytes() const {
+    PlaneMirror* const pm = PlaneMirror::get();
+    return pm && pm->on() && !mirror_ref_.empty() ? mirror_tail_decode_ : 0;
 }
 
 int64_t Mover::mapped_pair_bytes() const {

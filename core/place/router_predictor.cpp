@@ -69,11 +69,14 @@ RouterPredictor* RouterPredictor::get() {
         const char* m = std::getenv("RADIANCE_EXPERIMENTAL_DS41_PREFETCH");
         if (!m || !*m || !std::strcmp(m, "0") || !std::strcmp(m, "off")) return nullptr;
         auto* r = new RouterPredictor();
-        r->shadow_ = std::strcmp(m, "on") != 0;
+        r->pieces_ = std::strcmp(m, "pieces") == 0;
+        r->shadow_ = std::strcmp(m, "on") != 0 && !r->pieces_;
+        if (r->pieces_) r->k_ = 4;
         if (const char* k = std::getenv("RADIANCE_EXPERIMENTAL_DS41_PREFETCH_K"); k && *k)
             r->k_ = std::clamp(std::atoi(k), 1, (int)kMaxK);
         if (const char* a = std::getenv("RADIANCE_EXPERIMENTAL_DS41_PREFETCH_AHEAD"); a && *a)
             r->ahead_ = std::atoi(a) == 2 ? 2 : 1;
+        if (r->pieces_) r->ahead_ = 2;
         r->avx2_ = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
         r->worker_ = std::thread(&RouterPredictor::loop, r);
         return r;
@@ -130,15 +133,25 @@ bool RouterPredictor::load(const Program& prog,
             }
         load_ok_ = true;
         loaded_.store(true, std::memory_order_release);
-        RAD_INFO("router predictor: %d routers loaded (bf16, %.0f MB); layer L's router input "
-                 "predicts layer L+1's top %d (%s)", kLayers, w_.size() * 2 / 1e6, k_,
-                 shadow_ ? "shadow: compared, nothing read" : "predicted misses are read ahead");
+        if (pieces_)
+            RAD_INFO("router predictor: %d routers loaded (bf16, %.0f MB); layer L's router input "
+                     "predicts layer L+2's top %d, read ahead in pieces", kLayers, w_.size() * 2 / 1e6, k_);
+        else
+            RAD_INFO("router predictor: %d routers loaded (bf16, %.0f MB); layer L's router input "
+                     "predicts layer L+1's top %d (%s)", kLayers, w_.size() * 2 / 1e6, k_,
+                     shadow_ ? "shadow: compared, nothing read" : "predicted misses are read ahead");
     });
     return load_ok_;
 }
 
+void RouterPredictor::on_ready(ReadyFn fn, void* ctx) {
+    std::lock_guard<std::mutex> lk(ready_mu_);
+    ready_fn_ = fn;
+    ready_ctx_ = ctx;
+}
+
 void RouterPredictor::post(uint32_t pass, int layer, const uint16_t* x) {
-    if (!loaded() || layer < 0 || layer + 1 >= kLayers || !x) return;
+    if (!loaded() || layer < 0 || layer + (pieces_ ? 2 : 1) >= kLayers || !x) return;
     posted_.fetch_add(1, std::memory_order_relaxed);
     {
         std::lock_guard<std::mutex> lk(q_mu_);
@@ -191,6 +204,26 @@ void RouterPredictor::score(int target, const float* xh, Result* out, uint32_t p
 void RouterPredictor::compute(uint32_t pass, int layer, const uint16_t* x) {
     const auto t0 = std::chrono::steady_clock::now();
     float xh[kEmbd];
+    if (pieces_) {   /* layer + 2 only, handed straight to the read-ahead */
+        if (layer + 2 >= kLayers) return;
+        const float* ratio2 = &ratio2_[(size_t)layer * kEmbd];
+        for (int k = 0; k < kEmbd; ++k) xh[k] = bf16_to_f32(x[k]) * ratio2[k];
+        Result* r = &res2_[layer + 2];
+        score(layer + 2, xh, r, pass);
+        int32_t e[kMaxK];
+        std::memcpy(e, r->e, sizeof(int32_t) * (size_t)k_);   /* score() wrote r; only this thread does */
+        const auto t1 = std::chrono::steady_clock::now();
+        computed_.fetch_add(1, std::memory_order_relaxed);
+        ns_.fetch_add((uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count(),
+                      std::memory_order_relaxed);
+        {
+            std::lock_guard<std::mutex> lk(ready_mu_);
+            if (ready_fn_) ready_fn_(ready_ctx_, pass, layer + 2, e, k_);
+        }
+        ready_ns_.fetch_add((uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - t1).count(), std::memory_order_relaxed);
+        return;
+    }
     const float* ratio = &ratio_[(size_t)layer * kEmbd];
     for (int k = 0; k < kEmbd; ++k) xh[k] = bf16_to_f32(x[k]) * ratio[k];
     score(layer + 1, xh, &res_[layer + 1], pass);
@@ -230,6 +263,7 @@ RouterPredictor::Stats RouterPredictor::stats() const {
     s.computed = computed_.load();
     s.dropped = dropped_.load();
     s.compute_ns = ns_.load();
+    s.ready_ns = ready_ns_.load();
     return s;
 }
 

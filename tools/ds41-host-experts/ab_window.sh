@@ -28,7 +28,8 @@
 # KLD_MAX_CHARS characters (6000), as plain text, every position scored, at --max-model-len KLD_LEN
 # (2048) unless the arm gives an Lm part. The window's first Kld arm is the reference; every later
 # one's records are compared with it byte for byte (ab_requests.py --kld-compare: every position's
-# log-probabilities, top 16 and row values).
+# f16 log-probabilities, its top 16 in f32, and the next token's NLL and the whole row's entropy in
+# f32, so one changed logit anywhere in a row shows).
 #
 # Environment: RADIANCE_BIN (the binary), RADIANCE_HOME_DIR (kernels/ and architectures/ for it),
 # SILU_TABLE (the card's silu table), ARMS (default "base verify greedy"), HX_THREADS (16),
@@ -279,7 +280,7 @@ if [[ "${DEVICE_CHECKS:-1}" == tall ]]; then
     ( export HIP_VISIBLE_DEVICES=0
       timeout 900 "$TC" "$TL" $m >"$OUT/devcheck-$m.log" 2>&1
       echo "$m exit $?" >>"$OUT/devcheck-$m.log" )
-    grep -E '^(PASS|FAIL)|exit' "$OUT/devcheck-$m.log" | tail -8 | tee -a "$OUT/window.log"
+    grep -E '^(PASS|FAIL)|exit|norm rows' "$OUT/devcheck-$m.log" | tail -8 | tee -a "$OUT/window.log"
   done
 fi
 if [[ "${DEVICE_CHECKS:-1}" == 1 && -x "$HERE/build/ds41_mxfp4_device_check" ]]; then

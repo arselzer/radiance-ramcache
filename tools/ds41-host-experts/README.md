@@ -90,6 +90,16 @@ the engine or the scripts assumes where the checkpoint is. `ab_window.sh` takes 
 - `cache_sim.py`: replays an access trace against LRU, SLRU, 2Q, aged LFU and Belady.
 - `ds41_mxfp4_device_check.hip`: the kernels against the card (chain check, exhaustive SwiGLU,
   GEMV timing against two libr4d builds).
+- `ds41_dense_fp8_scan.cpp` (`make scan O=<dir>`, host only): the exactness scan behind
+  `RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8`. It runs libr4d's own bf16f8 layout hooks over every
+  dense weight deepseek41 would store as E4M3 codes (the 570 container entries of q_a, q_b, kv,
+  wo_a's groups, wo_b, the shared expert, the indexer's q_b and engram_kv) in 1024-row bands, checks
+  the inverse gives every band back, cross-checks the conversion's `sources.jsonl` (`--census`) and
+  the tensor-parallel cuts at 2..4 ranks, and prints the `..._DENSE_FP8_EXCLUDE` list of any entry
+  the load would refuse. Read-only, idle I/O priority, and it pauses while `ab_window.sh` runs. On
+  `ds41-native-mxfp4-v3` (2026-10-29): 570 / 570 entries exact, 6,676,480 blocks, 0 refused
+  (970,434 subnormal codes, 35,738 +0, 36,130 -0, block exponents 109..121), 610 E4M3 pieces in
+  the census, 57 cuts all on 32; 13.7 GB in 17 s with 4 threads.
 - `ds41_host_experts_test.cpp`: host tests of the kernels against the scalar reference.
 
 ## Correctness

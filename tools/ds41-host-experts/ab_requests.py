@@ -5,6 +5,13 @@
                                           in waves of K at once); save each response
   ab_requests.py --compare DIR ARM...     per request: whether each arm's text equals the first
                                           arm's, and each arm's decode tokens/s
+  ab_requests.py --kld-corpus OUT MAXCHARS RECEIPT...
+                                          a --kld-corpus (JSONL) of the receipts' text prompts
+                                          (chat_text, or a string prompt) of at most MAXCHARS
+                                          characters, as plain text, every position scored
+  ab_requests.py --kld-compare REF DIR    two --kld-record directories byte for byte: every
+                                          position's log-probabilities, top entries and row values
+                                          (exit 1 when any differ, naming the first positions)
 """
 import json
 import os
@@ -108,8 +115,75 @@ def compare(d, arms):
         "%12.2f tok/s" % (tot[a][1] / tot[a][0] * 1e3 if tot[a][0] else 0.0) for a in data))
 
 
+def kld_corpus(out, maxchars, receipts):
+    """The receipts' text prompts as a --kld-corpus; returns the number of documents."""
+    docs = []
+    for path in receipts:
+        for b in json.load(open(path))["benchmark_requests"]:
+            r = b["request"]
+            text = r.get("chat_text", r.get("prompt"))
+            if isinstance(text, str) and 0 < len(text) <= maxchars:
+                docs.append({"prompt": text, "source": b["name"]})
+    with open(out, "w") as f:
+        for d in docs:
+            f.write(json.dumps(d) + "\n")
+    print("kld corpus: %d documents, %d characters, from %s" % (
+        len(docs), sum(len(d["prompt"]) for d in docs), " ".join(receipts)), flush=True)
+    return len(docs)
+
+
+def kld_compare(ref, cand):
+    """Every file a --kld-record writes but its manifest (which holds times), position by position."""
+    a, b = json.load(open(ref + "/kld.json")), json.load(open(cand + "/kld.json"))
+    key = lambda m: (m["n_vocab"], m["top"], m["rows"], [(d["tokens"], d["score_from"], d["row0"]) for d in m["docs"]])
+    if key(a) != key(b):
+        print("kld DIFFER: %s and %s record different documents or shapes" % (ref, cand))
+        return 1
+    rows, docs = a["rows"], a["docs"]
+
+    def where(r):
+        for i, d in enumerate(docs):
+            n = d["tokens"] - d["score_from"]
+            if d["row0"] <= r < d["row0"] + n:
+                return "doc %d (%s) position %d" % (i, d.get("source", ""), d["score_from"] + r - d["row0"])
+        return "row %d" % r
+
+    bad = 0
+    if open(ref + "/tokens.i32", "rb").read() != open(cand + "/tokens.i32", "rb").read():
+        print("kld DIFFER: tokens.i32 (the corpus tokenised differently)")
+        bad += 1
+    for name, width in (("logp.f16", a["n_vocab"] * 2), ("top.bin", a["top"] * 8), ("rows.f32", 8)):
+        diff, first = 0, []
+        with open(ref + "/" + name, "rb") as fa, open(cand + "/" + name, "rb") as fb:
+            r = 0
+            while r < rows:
+                n = min(256, rows - r)
+                xa, xb = fa.read(n * width), fb.read(n * width)
+                if len(xa) != n * width or len(xb) != n * width:
+                    print("kld DIFFER: %s is short" % name)
+                    return 1
+                if xa != xb:
+                    for k in range(n):
+                        if xa[k * width:(k + 1) * width] != xb[k * width:(k + 1) * width]:
+                            diff += 1
+                            if len(first) < 4:
+                                first.append(where(r + k))
+                r += n
+        if diff:
+            print("kld DIFFER: %s: %d of %d positions, first %s" % (name, diff, rows, "; ".join(first)))
+            bad += 1
+    if not bad:
+        print("kld identical: %d positions over %d documents (logp.f16, top.bin, rows.f32, tokens.i32), %s against %s"
+              % (rows, len(docs), cand, ref))
+    return 1 if bad else 0
+
+
 if __name__ == "__main__":
     if sys.argv[1] == "--compare":
         compare(sys.argv[2], sys.argv[3:])
+    elif sys.argv[1] == "--kld-corpus":
+        sys.exit(0 if kld_corpus(sys.argv[2], int(sys.argv[3]), sys.argv[4:]) > 0 else 1)
+    elif sys.argv[1] == "--kld-compare":
+        sys.exit(kld_compare(sys.argv[2], sys.argv[3]))
     else:
         run(sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4])

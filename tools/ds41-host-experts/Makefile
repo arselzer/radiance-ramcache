@@ -28,7 +28,21 @@ $(O)/ds41_bf16f8_device_check: ds41_bf16f8_device_check.hip $(TREE)/libr4d/r4d_b
 	$(HIPCC) $(HIPFLAGS) -I$(TREE)/abi -I$(TREE)/libr4d -o $@ ds41_bf16f8_device_check.hip -ldl
 device-check: $(O)/ds41_bf16f8_device_check
 
+# The card check of the host experts against libr4d's decode kernels (check, swiglu, time, ptime)
+# and of RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL (`tall`: the routed GEMM's twin row, the sparse
+# attention and the indexer score at passes taller than 16 tokens against the same rows in smaller
+# launches). Run it in a GPU window: HIP_VISIBLE_DEVICES=0 ds41_mxfp4_device_check <libr4d.so> tall.
+# Built as build_hx.sh builds it: the host kernels by $(CXX), the harness by hipcc.
+MXFLAGS ?= -O2 -std=c++17 --offload-arch=gfx1201
+$(O)/ds41_host_experts_dc.o: ds41_host_experts.cpp ds41_host_experts.h
+	$(CXX) -O2 -std=c++17 -mavx2 -ffp-contract=off -fno-fast-math -fPIC -c ds41_host_experts.cpp -o $@
+$(O)/ds41_mxfp4_device_check.o: ds41_mxfp4_device_check.hip ds41_host_experts.h
+	$(HIPCC) $(MXFLAGS) -I. -I$(TREE)/abi -c ds41_mxfp4_device_check.hip -o $@
+$(O)/ds41_mxfp4_device_check: $(O)/ds41_mxfp4_device_check.o $(O)/ds41_host_experts_dc.o
+	$(HIPCC) $(O)/ds41_mxfp4_device_check.o $(O)/ds41_host_experts_dc.o -o $@ -ldl
+mxfp4-check: $(O)/ds41_mxfp4_device_check
+
 clean:
 	rm -f ds41_host_experts_test ds41_dense_fp8_scan ds41_bf16f8_device_check
 
-.PHONY: clean scan device-check
+.PHONY: clean scan device-check mxfp4-check

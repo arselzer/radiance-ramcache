@@ -4,13 +4,15 @@
  * The list hx_fetch_ranges builds must land exactly the bytes of the separate copies the stager
  * makes without the switch (start_ep_routed's counts copy, then hx_fetch's), from sources in two
  * allocations with offsets on both sides of the base, into three pinned destinations, at every pass
- * size and both row pitches. Addresses the card's copy kernel cannot take must be left to the
+ * size and both row pitches, in the stager's tables at its pass limits (16 tokens, and under
+ * RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL the step: 32 and 48 here). Addresses the card's copy kernel cannot take must be left to the
  * separate copies. And a list on the card rewritten by a copy in stream order (the stager's re-arm
  * after an operand move) must not change what a ranged copy queued before the rewrite reads. */
 #include "rad_test.h"
 
 #include "rad_internal.h"
 #include "device/device.h"
+#include "place/ep_route_counts.h"
 #include "place/hx_fetch_list.h"
 
 #include <cstdint>
@@ -23,8 +25,10 @@ using rad::hx_fetch_ranges;
 
 namespace {
 
-constexpr int64_t kEmbd = 5120, kRowsMax = 16, kTopK = 6, kExperts = 96;
-constexpr int64_t kSorted = kRowsMax * kTopK;      /* FileStager::kHxRows */
+/* The card's rows and the host's tables are sized for the tallest pass the stager takes (up to 48
+ * tokens under ..._EXACT_TALL); a Host lays its sorted order out for one limit, as FileStager does. */
+constexpr int64_t kEmbd = 5120, kRowsMax = rad::kEpRouteTallRows, kTopK = 6, kExperts = 96;
+constexpr int64_t kSorted = kRowsMax * kTopK;      /* FileStager::hx_sorted_max() at the tall limit */
 constexpr int kCap = hx_fetch_n_ranges(kRowsMax) + 1;
 
 struct Stream {
@@ -71,12 +75,14 @@ struct Card {
     bool ok() const { return arena.p && own.p; }
 };
 
-/* The host side, laid out as FileStager's: counts_host_ (512 entries), hx_x_ (16 packed rows) and
- * hx_idx_ (sorted order, then the offsets at kHxRows). */
+/* The host side, laid out as FileStager's at pass limit `lim`: counts_host_ (512 entries), hx_x_
+ * (lim packed rows) and hx_idx_ (sorted order, then the offsets at hx_sorted_max() = lim * 6). */
 struct Host {
     Mem counts, x, idx;
-    Host() : counts(512 * 4, RAD_MEM_HOST_PINNED), x(kRowsMax * kEmbd * 2, RAD_MEM_HOST_PINNED),
-             idx((kSorted + 128) * 4, RAD_MEM_HOST_PINNED) {}
+    int64_t lim;
+    explicit Host(int64_t limit = 16)
+        : counts(512 * 4, RAD_MEM_HOST_PINNED), x(kRowsMax * kEmbd * 2, RAD_MEM_HOST_PINNED),
+          idx((kSorted + 128) * 4, RAD_MEM_HOST_PINNED), lim(limit) {}
     bool ok() const { return counts.p && x.p && idx.p; }
     void clear() {
         std::memset(counts.p, 0xEE, 512 * 4);
@@ -104,7 +110,7 @@ HxFetch fetch(const Card& c, const Host& h, int64_t rows) {
     f.sorted_host = (int32_t*)h.idx.p;
     f.n_sorted = rows * kTopK;
     f.off = c.off;
-    f.off_host = (int32_t*)h.idx.p + kSorted;
+    f.off_host = (int32_t*)h.idx.p + h.lim * kTopK;
     f.n_off = kExperts + 1;
     return f;
 }
@@ -135,15 +141,17 @@ int arm(RadCopyRange* dev, RadCopyRange* pin, const RadCopyRange* r, int n, RadS
 TEST(a_fetch_list_lands_what_the_separate_copies_land) {
     Stream st;
     REQUIRE(st.s);
-    Host a, b;
-    REQUIRE(a.ok() && b.ok());
     Mem dev(kCap * (int64_t)sizeof(RadCopyRange), RAD_MEM_DEVICE);
     Mem pin(kCap * (int64_t)sizeof(RadCopyRange), RAD_MEM_HOST_PINNED);
     REQUIRE(dev.p && pin.p);
     uint32_t seed = 11;
+    for (int64_t lim : { (int64_t)16, (int64_t)32, kRowsMax })
     for (bool inside : { false, true })
         for (int64_t ld : { kEmbd, kEmbd + 64 })
-            for (int64_t rows : { 1, 2, 7, 16 }) {
+            for (int64_t rows : { 1, 2, 7, 16, 17, 33, 48 }) {
+                if (rows > lim) continue;
+                Host a(lim), b(lim);
+                REQUIRE(a.ok() && b.ok());
                 Card c(ld, inside, ++seed);
                 REQUIRE(c.ok());
                 a.clear();
@@ -166,7 +174,7 @@ TEST(a_fetch_list_lands_what_the_separate_copies_land) {
                 CHECK_EQ(std::memcmp(a.x.p + (rows - 1) * kEmbd * 2, c.x + (rows - 1) * ld * 2,
                                      kEmbd * 2), 0);
                 CHECK_EQ(std::memcmp(a.idx.p, c.sorted, rows * kTopK * 4), 0);
-                CHECK_EQ(std::memcmp(a.idx.p + kSorted * 4, c.off, (kExperts + 1) * 4), 0);
+                CHECK_EQ(std::memcmp(a.idx.p + lim * kTopK * 4, c.off, (kExperts + 1) * 4), 0);
                 /* The bytes past the pass's rows are not touched. */
                 if (rows < kRowsMax) CHECK_EQ((unsigned char)a.x.p[rows * kEmbd * 2], 0xEEu);
             }
@@ -195,6 +203,10 @@ TEST(a_fetch_list_leaves_what_the_copy_kernel_cannot_take_to_separate_copies) {
     f = fetch(c, h, 16);
     CHECK_EQ(hx_fetch_ranges(f, r, hx_fetch_n_ranges(16) - 1), 0);
     CHECK_EQ(hx_fetch_ranges(f, r, hx_fetch_n_ranges(16)), hx_fetch_n_ranges(16));
+    /* The tall limit's pass: 51 ranges, the stager's slot of 52 whole pairs. */
+    f = fetch(c, h, 48);
+    CHECK_EQ(hx_fetch_ranges(f, r, hx_fetch_n_ranges(48) - 1), 0);
+    CHECK_EQ(hx_fetch_ranges(f, r, hx_fetch_n_ranges(48)), 51);
     f.x_ld = kEmbd - 2;
     CHECK_EQ(hx_fetch_ranges(f, r, kCap), 0);
     f = fetch(c, h, 0);
@@ -240,7 +252,7 @@ TEST(a_fetch_list_rewritten_in_stream_order_leaves_earlier_copies_their_list) {
     CHECK_EQ(std::memcmp(h.counts.p, two.counts, kExperts * 4), 0);
     CHECK_EQ(std::memcmp(h.idx.p, two.sorted, kTopK * 4), 0);
     CHECK_EQ(std::memcmp(h.idx.p + kTopK * 4, one.sorted + kTopK * 4, 2 * kTopK * 4), 0);
-    CHECK_EQ(std::memcmp(h.idx.p + kSorted * 4, two.off, (kExperts + 1) * 4), 0);
+    CHECK_EQ(std::memcmp(h.idx.p + h.lim * kTopK * 4, two.off, (kExperts + 1) * 4), 0);
     rad_event_destroy(ev);
 }
 

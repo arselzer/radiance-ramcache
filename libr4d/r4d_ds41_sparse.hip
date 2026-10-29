@@ -23,9 +23,14 @@
 // libref's bits (kbench tolerance): attn_sparse_sink with an online softmax, v_exp_f32 and P as
 // bf16 hi + lo; index_score with only the dot's summation order changed (every rounding after it
 // is libref's). The decode band keeps the exact kernels, so speculative verify reproduces decode.
+// Under RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=1 (r4d_ds41_tall.h) every height keeps them
+// (attn_sparse_sink on the decode band's kernel), so a pass of any height gives a 16-token pass's
+// bits here: what the routed GEMMs' twin row moe_gemm_ggml_mxfp4_gemv_tall does for the experts
+// (r4d_rows.cpp). Up to 48 rows that is so without the switch.
 #include "r4d.h"
 #include "r4d_args.h"
 #include "r4d_common.h"
+#include "r4d_ds41_tall.h"
 #include "r4d_emit.h"
 #include "r4d_plugin.h"
 
@@ -1515,6 +1520,9 @@ long lin_stride(const RadTensor& t) {
 
 bool aligned(const void* p, unsigned bytes) { return ((uintptr_t)p & (uintptr_t)(bytes - 1)) == 0; }
 
+/* RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=1: the exact forms at every height (see the file's header). */
+bool ds_exact_tall() { return r4d_ds41_exact_tall(); }
+
 constexpr int kDsChunk = 8192;                       /* index_topk's split: positions a chunk */
 constexpr int kDsSplitRows = 16;                     /* ... at up to this many rows */
 constexpr int kDsSplitMinChunks = 4;                 /* ... over at least this many chunks */
@@ -1596,8 +1604,8 @@ int index_score_body(const RadArgs* a, RadStream stream) {
     s.slot = (int)(Dm / ratio);
     s.wscale = wscale;
     /* Prefill heights on WMMA (up to 32 heads, 16-byte q rows); the decode band on the scalar
-     * kernel below (libref's bits). */
-    if (s.M > kWmRows && H <= 32 && s.qr % 8 == 0 && aligned(s.q, 16) &&
+     * kernel below (libref's bits), and every height under ..._EXACT_TALL. */
+    if (s.M > kWmRows && !ds_exact_tall() && H <= 32 && s.qr % 8 == 0 && aligned(s.q, 16) &&
         (s.M + 7) / 8 <= 65535) {
         const dim3 grid((unsigned)((s.C + kIwEB - 1) / kIwEB), (unsigned)((s.M + 7) / 8));
         if (H > 16) return R4D_EMIT(stream, ds41_index_score_wm_kernel<2>, grid, dim3(256), 0u, s);
@@ -1843,11 +1851,11 @@ int attn_body(const RadArgs* a, RadStream stream) {
     s.nkp = (s.nk + 3) / 4 * 4;
     s.scale = scale;
     /* Prefill heights on WMMA (16-byte q and out rows); the decode band on the scalar kernels
-     * below (libref's bits). */
+     * below (libref's bits), and every height under ..._EXACT_TALL. */
     {
         const int nkt = (s.nk + 15) / 16;
         const long lds = ds_wm_sbuf_off(nkt) + kWmSbufBytes;
-        if (s.M > kWmRows && s.qr % 8 == 0 && s.outr % 8 == 0 && aligned(q.data, 16) &&
+        if (s.M > kWmRows && !ds_exact_tall() && s.qr % 8 == 0 && s.outr % 8 == 0 && aligned(q.data, 16) &&
             aligned(out.data, 16) && lds <= 65536 && (H + 15) / 16 <= 65535) {
             const unsigned gy = (unsigned)(s.M < 65535 ? s.M : 65535);
             const dim3 grid((unsigned)((H + 15) / 16), gy);
@@ -1856,9 +1864,10 @@ int attn_body(const RadArgs* a, RadStream stream) {
         }
     }
     /* Head group and d split by how many workgroups the rows give. Every choice sums each output
-     * in the same order, so the bits do not depend on it. */
+     * in the same order, so the bits do not depend on it. A tall pass under ..._EXACT_TALL takes
+     * the decode band's own kernel, as a 16-token pass does. */
     const long rows = s.M;
-    if (rows <= kWmRows) {
+    if (rows <= kWmRows || ds_exact_tall()) {
         const int rc = attn_dec_emit(stream, s);
         if (rc != RAD_E_UNSUPPORTED) return rc;
     }

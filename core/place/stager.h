@@ -342,7 +342,8 @@ public:
      * top_k, a layer with no live row, or a second issue of the layer's first op (a block that
      * slices the pass) falls back to reading the whole layer. */
     /* The optional private EP provider is used only for exact released native-MXFP4 EP4
-     * layers with M<=kEpRouteMaxRows. A missing current witness reads the full layer
+     * layers with M<=kEpRouteMaxRows (M<=kEpRouteTallRows under RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL,
+     * tall_init). A missing current witness reads the full layer
      * directly; an old global report cannot authorize that EP read. Other layers retain CountsRow verbatim. */
     int init(const Program& prog, const Plan& plan, Mover* mover, CountsRow counts = nullptr,
               EpCountsRow ep_counts = nullptr);
@@ -390,6 +391,15 @@ private:
     bool      routed_ = false;                   /* this pass reads routed experts only */
     int64_t   pass_tok_ = 0;
     bool trace_requested_ = false, trace_target_m1_ = false;
+    /* The largest pass the EP counts path takes: 16, or with RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=1
+     * the step (--max-num-batched-tokens, at most kEpRouteTallRows), and so the CPU path's: its
+     * pinned rows, sorted order and output rows and the fetch lists are sized by it. */
+    int64_t ep_rows_ = kEpRouteMaxRows;
+    /* RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL: sets ep_rows_, and refuses a step whose passes would not
+     * give a 16-token pass's bits: one taller than kEpRouteTallRows, a routed MXFP4 GEMM band off the
+     * decode-band kernel (no twin row moe_gemm_ggml_mxfp4_gemv_tall, or a step taller than its
+     * bound), or another op on two kernels other than gemm_nt's m16 / m64; says so at startup. */
+    int  tall_init(const Program& prog);
     /* Batch eligibility only. start() additionally requires this exact native EP layer;
      * selected-routed starts always use Normal. Immutable copy passed per mover call. */
     NativeFileCacheReadPolicy pass_cache_policy_ = NativeFileCacheReadPolicy::Normal;
@@ -452,7 +462,10 @@ private:
         const void* off = nullptr;
     };
     static constexpr int kHxUnits = 96;
-    static constexpr int kHxRows = (int)kEpRouteMaxRows * 6;
+    /* Sorted rows a pass can have: ep_rows_ tokens at top_k 6. */
+    int64_t hx_sorted_max() const { return ep_rows_ * 6; }
+    int64_t hx_alloc_rows_ = 0;                   /* the ep_rows_ the pinned buffers below hold */
+    int64_t hx_need_misses_ = kEpRouteMaxRows;    /* ..._MISSES the cap needs: ep_rows_ (hx_init) */
     HostExpertPool* hx_pool_ = nullptr;
     int  hx_policy_ = kHxGreedy;
     std::vector<HxOps> hx_ops_;                   /* by routed layer; gu < 0: the card only */
@@ -473,10 +486,10 @@ private:
     std::vector<HostExpertPool::Job> hx_jobs_;
     std::vector<int32_t> hx_rows_;                /* the sorted row each job writes */
     HostExpertPool::Ticket hx_ticket_;
-    uint16_t* hx_x_ = nullptr;                    /* pinned [kEpRouteMaxRows, 5120] token rows */
-    int32_t*  hx_idx_ = nullptr;                  /* pinned sorted_tok [kHxRows], expert_offset */
-    uint16_t* hx_out_ = nullptr;                  /* pinned [kHxRows, 5120]: the CPU's rows */
-    uint16_t* hx_chk_ = nullptr;                  /* pinned [kHxRows, 5120]: the card's (verify) */
+    uint16_t* hx_x_ = nullptr;                    /* pinned [ep_rows_, 5120] token rows */
+    int32_t*  hx_idx_ = nullptr;                  /* pinned sorted_tok [hx_sorted_max()], expert_offset */
+    uint16_t* hx_out_ = nullptr;                  /* pinned [hx_sorted_max(), 5120]: the CPU's rows */
+    uint16_t* hx_chk_ = nullptr;                  /* pinned [hx_sorted_max(), 5120]: the card's (verify) */
     RadEvent  hx_in_ev_ = nullptr, hx_out_ev_ = nullptr;
     bool      hx_out_rec_ = false;
     int       hx_told_ = 0;
@@ -542,8 +555,11 @@ private:
         RadStream   s = nullptr;
         int         n = 0;                /* ranges armed; 0: not armed */
     };
-    static constexpr int kHxFlRanges = hx_fetch_n_ranges(kEpRouteMaxRows);
-    static constexpr int kHxFlSlot = (kHxFlRanges + 1) & ~1;   /* a list's room: whole 16-byte copies */
+    /* A list's ranges at the largest pass, and its room in whole 16-byte copies (pairs of ranges):
+     * hx_fl_slot(ep_rows_). The stack holds the most any limit needs. */
+    static constexpr int kHxFlRangesMax = hx_fetch_n_ranges(kEpRouteTallRows);
+    static constexpr int hx_fl_slot(int64_t rows) { return (hx_fetch_n_ranges(rows) + 1) & ~1; }
+    int  hx_fl_slot_ = hx_fl_slot(kEpRouteMaxRows);
     bool hx_fl_ = false;
     std::vector<HxFl> hx_fl_key_;         /* by routed layer and pass rows: what its list holds */
     size_t hx_fl_cap_ = 0;                /* lists allocated */

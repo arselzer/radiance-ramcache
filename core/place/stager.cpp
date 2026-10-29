@@ -642,6 +642,7 @@ int FileStager::init(const Program& prog, const Plan& plan, Mover* mover, Counts
         if (!trace_fp_) RAD_WARN("access trace: cannot open %s", path.c_str());
         else if (plan.rank == 0) RAD_INFO("access trace: each routed layer's selected units to %s/rank<r>.bin", td);
     }
+    RAD_TRY(tall_init(prog));
     RAD_TRY(init_head_cache(prog, plan));
     return hx_init(prog);
 }
@@ -979,6 +980,134 @@ int64_t hx_numel(const RadTensor& t) {
 }
 }  /* namespace */
 
+/* ---- exact tall passes (RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL, ep_route_counts.h) ------------------
+ *
+ * A pass of 17 to 48 tokens may take the EP counts path and the CPU path only if every op gives it a
+ * 16-token pass's bits, row for row, so that every reply is the 16-token chunking's. Four ops change
+ * arithmetic with the pass height: the routed MoE GEMM above 16 tokens (moe_gemm_ggml_mxfp4_gemv's
+ * band ends there; the tiled row sums in another order), the sparse attention and the indexer score
+ * above 48 rows (libr4d's kWmRows), and every norm above 32 rows (r4d_act_threads halves its width,
+ * which regroups the sum of squares). Under the switch libr4d adds the gemv's twin
+ * moe_gemm_ggml_mxfp4_gemv_tall, bounded at the tallest pass its kernels keep the decode band's bits
+ * at (libr4d/r4d_ds41_tall.h: 32 tokens where the norms' width holds by itself, 48 where libr4d pins
+ * it), and keeps the sparse ops scalar at every height. The CPU's rows are the gemv's bits at any
+ * number of rows.
+ *
+ * So the step (--max-num-batched-tokens) must be one every routed MXFP4 GEMM resolved on the gemv or
+ * its twin in every band: a band on the tiled row means a libr4d without the twin, one loaded without
+ * the switch, or a step taller than the twin reaches, and is refused here before a pass could mix the
+ * sums. Every other op must run one kernel at every height it is declared for, or one of the pairs
+ * known to give the same bits (gemm_bf16_nt_m16 forwards to gemm_bf16_nt_m64): a second row on any
+ * other op is refused by name, since nothing here says its sums agree. A step above kEpRouteTallRows
+ * is refused too: its passes would run with other arithmetic. */
+namespace {
+/* The bound a row places on M (RAD_C_LE), or 0. */
+int64_t row_m_bound(const KernelRow* row) {
+    if (!row || !row->info || !row->info->constraints) return 0;
+    for (int i = 0; i < row->info->n_constraints; ++i) {
+        const RadConstraint& c = row->info->constraints[i];
+        if (c.key && !std::strcmp(c.key, "M") && c.op == RAD_C_LE) return c.ival;
+    }
+    return 0;
+}
+const char* row_name(const Band& b) {
+    const KernelRow* r = b.dom[RAD_DOMAIN_DEVICE].row;
+    return r && r->info && r->info->name ? r->info->name : nullptr;
+}
+}  /* namespace */
+
+int FileStager::tall_init(const Program& prog) {
+    ep_rows_ = kEpRouteMaxRows;
+    const int st = ds41_exact_tall_state();
+    if (st < 0) {
+        const char* v = std::getenv(kExactTallEnv);
+        RAD_ERR("%s=%s: 1 runs prefill passes of up to %lld tokens with a 16-token pass's bits (the routed "
+                "GEMMs, the sparse attention, the indexer and the norms on their decode-band arithmetic), 0 or "
+                "unset is off", kExactTallEnv, v ? v : "", (long long)kEpRouteTallRows);
+        return RAD_E_INVAL;
+    }
+    if (st == 0) return RAD_OK;
+    const int64_t T = prog.ctx.max_tok;
+    if (T > kEpRouteTallRows) {
+        RAD_ERR("%s=1 keeps a 16-token pass's bits in passes of up to %lld tokens; --max-num-batched-tokens "
+                "%lld would run taller ones with other arithmetic (the norms' width, the sparse ops' WMMA "
+                "forms): give at most %lld", kExactTallEnv, (long long)kEpRouteTallRows, (long long)T,
+                (long long)kEpRouteTallRows);
+        return RAD_E_INVAL;
+    }
+    int n_moe = 0, n_twin = 0, n_gemm = 0, n_ops = 0;
+    int64_t reach = 0;   /* the twin's bound, as a band resolved to it states it */
+    for (size_t h = 1; h < prog.ops.size(); ++h) {
+        const OpInfo& op = prog.ops[h];
+        if (op.bands.empty()) continue;
+        ++n_ops;
+        const char* ty = op.base.get_s("type");
+        if (op.op == "moe_gemm_ggml" && ty && !std::strcmp(ty, "mxfp4")) {
+            ++n_moe;
+            int64_t lo = op.range_lo > 0 ? op.range_lo - 1 : 0;   /* the band's exclusive lower bound */
+            int64_t ok_to = lo;   /* the gemv rows serve every band up to here */
+            for (const Band& b : op.bands) {
+                const char* name = row_name(b);
+                const bool gemv = name && !std::strcmp(name, "moe_gemm_ggml_mxfp4_gemv");
+                const bool twin = name && !std::strcmp(name, "moe_gemm_ggml_mxfp4_gemv_tall");
+                if (!gemv && !twin) {
+                    long long N = 0, K = 0;
+                    (void)op.base.get_i("N", &N);
+                    (void)op.base.get_i("K", &K);
+                    RAD_ERR("%s=1: op %zu (moe_gemm_ggml, N %lld K %lld) resolves %s to %s, not to the decode "
+                            "band's kernel (moe_gemm_ggml_mxfp4_gemv, or its twin moe_gemm_ggml_mxfp4_gemv_tall "
+                            "above 16 tokens), so a %lld-token pass would not give a 16-token pass's bits. %s",
+                            kExactTallEnv, h, N, K, b.span.empty() ? "a band" : b.span.c_str(),
+                            name ? name : "nothing", (long long)b.hi,
+                            ok_to > kEpRouteMaxRows
+                                ? fmt("This libr4d keeps them in passes of up to %lld tokens: give "
+                                      "--max-num-batched-tokens %lld or less", (long long)ok_to,
+                                      (long long)ok_to).c_str()
+                                : "Load a libr4d.so with the twin, with the switch in its environment");
+                    return RAD_E_INVAL;
+                }
+                if (twin) {
+                    ++n_twin;
+                    reach = std::max(reach, row_m_bound(b.dom[RAD_DOMAIN_DEVICE].row));
+                }
+                ok_to = lo = b.hi;
+            }
+            continue;
+        }
+        const char* first = nullptr;
+        bool m16 = false;
+        for (const Band& b : op.bands) {
+            const char* name = row_name(b);
+            if (!name) continue;
+            if (!first) { first = name; continue; }
+            if (!std::strcmp(name, first)) continue;
+            const bool pair = op.op == "gemm_nt" &&
+                              ((!std::strcmp(first, "gemm_bf16_nt_m16") && !std::strcmp(name, "gemm_bf16_nt_m64")) ||
+                               (!std::strcmp(first, "gemm_bf16_nt_m64") && !std::strcmp(name, "gemm_bf16_nt_m16")));
+            if (pair) { m16 = true; continue; }
+            RAD_ERR("%s=1: op %zu (%s) runs %s in one band and %s in %s: nothing here says the two give a "
+                    "row the same bits, so a pass of another height could change it. Refused; the step "
+                    "(--max-num-batched-tokens %lld) keeps it on one kernel at 16 or fewer tokens",
+                    kExactTallEnv, h, op.op.c_str(), first, name, b.span.empty() ? "another" : b.span.c_str(),
+                    (long long)T);
+            return RAD_E_INVAL;
+        }
+        n_gemm += m16;
+    }
+    ep_rows_ = std::max<int64_t>(T, kEpRouteMaxRows);
+    if (plan_ && plan_->rank == 0)
+        RAD_INFO("exact tall passes: passes of up to %lld tokens (%s=1, --max-num-batched-tokens %lld): %d routed "
+                 "MXFP4 GEMMs on moe_gemm_ggml_mxfp4_gemv to 16 tokens%s, %d gemm_nt on gemm_bf16_nt_m16 / _m64 "
+                 "(one split law), the other %d of %d ops on one kernel at every height; libr4d keeps the sparse "
+                 "attention, the indexer and the norms on their decode-band arithmetic; the routing counts and the "
+                 "CPU path take passes of up to %lld tokens",
+                 (long long)ep_rows_, kExactTallEnv, (long long)T, n_moe,
+                 n_twin ? fmt(" and its twin moe_gemm_ggml_mxfp4_gemv_tall above (%d bands; this libr4d's "
+                              "twin reaches %lld)", n_twin, (long long)reach).c_str() : "",
+                 n_gemm, n_ops - n_moe - n_gemm, n_ops, (long long)ep_rows_);
+    return RAD_OK;
+}
+
 /* Which layers can hand units to the pool: the EP-routed ones whose first expert op is a decode
  * gate_up (moe_gemm_ggml mxfp4 [4608, 5120], token order), whose last is the down projection
  * ([5120, 2304], sorted order) with a swiglu_clamped at the pool's limit between, and whose
@@ -987,15 +1116,22 @@ int64_t hx_numel(const RadTensor& t) {
 /* RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS caps the file buffers (planner.cpp), which then
  * hold only the aliases of units the CPU computes: refuse a configuration in which any routed pass
  * could need the card's copy path. The packed RAM cache (Mover::packed_cache) needs that cap: the
- * card cannot read its slots, so the CPU must compute every unit it holds. */
+ * card cannot read its slots, so the CPU must compute every unit it holds. With
+ * RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL the passes may be up to ep_rows_ tokens (the step, up to
+ * 48), and the misses must be the CPU's in all of them. */
 int FileStager::hx_init(const Program& prog) {
     RAD_TRY(hx_init_impl(prog));
+    /* The misses the CPU must take: every pass's. Without the switch that is 16 tokens whatever
+     * --max-num-batched-tokens says (as before); with it the step's (tall_init: ep_rows_ is the
+     * step, at least 16). */
+    const int64_t need = ep_rows_;
+    hx_need_misses_ = need;
     auto packed_ok = [&]() -> int {
         if (!mover_ || !mover_->packed_cache() || hx_capped_) return hx_init_fetch();
         RAD_ERR("RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE=1: the RAM cache then holds a form only the CPU "
                 "reads, so the CPU must compute every routed unit: host experts with ..._POLICY=all and "
                 "..._MISSES=%lld, and RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS set",
-                (long long)kEpRouteMaxRows);
+                (long long)need);
         return RAD_E_INVAL;
     };
     const char* cap = std::getenv("RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS");
@@ -1007,12 +1143,14 @@ int FileStager::hx_init(const Program& prog) {
         for (int32_t u : layers_[li].units)   /* a unit the CPU cannot read would need the card */
             every = every && mover_->host_planes_eligible(u);
     }
-    if (!every || !hx_defer_ok_ || hx_miss_rows_ < kEpRouteMaxRows || prog.ctx.max_tok > kEpRouteMaxRows) {
+    if (!every || !hx_defer_ok_ || hx_miss_rows_ < need || prog.ctx.max_tok > ep_rows_) {
         RAD_ERR("RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS=%s: the file buffers then hold no layer's "
                 "units, so the CPU must compute every routed unit of every pass: host experts with "
                 "..._POLICY=all and ..._MISSES=%lld on every routed layer, and passes of at most %lld "
-                "tokens (--max-num-batched-tokens)", cap, (long long)kEpRouteMaxRows,
-                (long long)kEpRouteMaxRows);
+                "tokens (--max-num-batched-tokens%s)", cap, (long long)need, (long long)ep_rows_,
+                ds41_exact_tall_state() == 1
+                    ? "" : "; taller with RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=1, as far as libr4d keeps a "
+                           "16-token pass's bits");
         return RAD_E_INVAL;
     }
     hx_capped_ = true;
@@ -1099,9 +1237,23 @@ int FileStager::hx_init_impl(const Program& prog) {
                      "computes; every expert stays on the card");
         return RAD_OK;
     }
-    const int64_t rows = (int64_t)kHxRows * kHxEmbd * (int64_t)sizeof(uint16_t);
-    if (!hx_x_) hx_x_ = (uint16_t*)rad_dev_alloc(kEpRouteMaxRows * kHxEmbd * 2, RAD_MEM_HOST_PINNED);
-    if (!hx_idx_) hx_idx_ = (int32_t*)rad_dev_alloc((kHxRows + 128) * 4, RAD_MEM_HOST_PINNED);
+    const int64_t rows = hx_sorted_max() * kHxEmbd * (int64_t)sizeof(uint16_t);
+    /* Sized for passes of ep_rows_ tokens; made again if an earlier init sized them otherwise. */
+    if (hx_alloc_rows_ != ep_rows_) {
+        if (hx_out_rec_ && hx_out_ev_) (void)rad_event_sync(hx_out_ev_);
+        hx_out_rec_ = false;
+        if (hx_x_) rad_dev_free(hx_x_, RAD_MEM_HOST_PINNED);
+        if (hx_idx_) rad_dev_free(hx_idx_, RAD_MEM_HOST_PINNED);
+        if (hx_out_) rad_dev_free(hx_out_, RAD_MEM_HOST_PINNED);
+        if (hx_chk_) rad_dev_free(hx_chk_, RAD_MEM_HOST_PINNED);
+        hx_x_ = nullptr;
+        hx_idx_ = nullptr;
+        hx_out_ = nullptr;
+        hx_chk_ = nullptr;
+        hx_alloc_rows_ = ep_rows_;
+    }
+    if (!hx_x_) hx_x_ = (uint16_t*)rad_dev_alloc(ep_rows_ * kHxEmbd * 2, RAD_MEM_HOST_PINNED);
+    if (!hx_idx_) hx_idx_ = (int32_t*)rad_dev_alloc((hx_sorted_max() + 128) * 4, RAD_MEM_HOST_PINNED);
     if (!hx_out_) hx_out_ = (uint16_t*)rad_dev_alloc(rows, RAD_MEM_HOST_PINNED);
     if (!hx_chk_ && hx_policy_ == kHxVerify)
         hx_chk_ = (uint16_t*)rad_dev_alloc(rows, RAD_MEM_HOST_PINNED);
@@ -1115,7 +1267,7 @@ int FileStager::hx_init_impl(const Program& prog) {
     }
     hx_pool_ = pool;
     if (const char* m = std::getenv("RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MISSES"); m && *m)
-        hx_miss_rows_ = std::clamp(std::atoi(m), 0, (int)kEpRouteMaxRows);
+        hx_miss_rows_ = std::clamp(std::atoi(m), 0, (int)ep_rows_);
     if (hx_miss_rows_ > 0 && !mover_->mapped_cache_on()) {
         if (plan_->rank == 0)
             RAD_WARN("host experts: ..._MISSES needs the mapped RAM cache "
@@ -1430,7 +1582,7 @@ void FileStager::hx_choose(int32_t li) {
  * hx_capture checks again on this one. */
 int FileStager::hx_fetch(int32_t li, RadStream s) {
     const HxOps& o = hx_ops_[(size_t)li];
-    if (pass_tok_ < 1 || pass_tok_ > kEpRouteMaxRows) return RAD_E_STATE;
+    if (pass_tok_ < 1 || pass_tok_ > ep_rows_ || ep_rows_ > hx_alloc_rows_) return RAD_E_STATE;
     if (o.x_ld == kHxEmbd) {
         RAD_TRY(rad_memcpy_async(hx_x_, o.x, pass_tok_ * kHxEmbd * 2, s));
     } else {
@@ -1439,7 +1591,7 @@ int FileStager::hx_fetch(int32_t li, RadStream s) {
                                      kHxEmbd * 2, s));
     }
     RAD_TRY(rad_memcpy_async(hx_idx_, o.sorted, pass_tok_ * o.top_k * 4, s));
-    RAD_TRY(rad_memcpy_async(hx_idx_ + kHxRows, o.off, (o.n_expert + 1) * 4, s));
+    RAD_TRY(rad_memcpy_async(hx_idx_ + hx_sorted_max(), o.off, (o.n_expert + 1) * 4, s));
     return RAD_OK;
 }
 
@@ -1454,13 +1606,13 @@ int FileStager::hx_fetch(int32_t li, RadStream s) {
 int FileStager::hx_fetch_list(int32_t li, const int32_t* row, RadStream s) {
     const HxOps& o = hx_ops_[(size_t)li];
     const int64_t T = pass_tok_;
-    const size_t at = (size_t)li * (size_t)kEpRouteMaxRows + (size_t)(T - 1);
-    if (T < 1 || T > kEpRouteMaxRows || at >= hx_fl_key_.size() || at >= hx_fl_cap_) {
+    const size_t at = (size_t)li * (size_t)ep_rows_ + (size_t)(T - 1);
+    if (T < 1 || T > ep_rows_ || at >= hx_fl_key_.size() || at >= hx_fl_cap_) {
         ++hx_stats_.fl_plain;
         return 0;
     }
     HxFl& k = hx_fl_key_[at];
-    RadCopyRange* const dev = hx_fl_dev_ + at * (size_t)kHxFlSlot;
+    RadCopyRange* const dev = hx_fl_dev_ + at * (size_t)hx_fl_slot_;
     if (k.n <= 0 || k.row != row || k.x != o.x || k.x_ld != o.x_ld || k.sorted != o.sorted ||
         k.off != o.off || k.s != s) {
         HxFetch f;
@@ -1476,10 +1628,10 @@ int FileStager::hx_fetch_list(int32_t li, const int32_t* row, RadStream s) {
         f.sorted_host = hx_idx_;
         f.n_sorted = T * o.top_k;
         f.off = o.off;
-        f.off_host = hx_idx_ + kHxRows;
+        f.off_host = hx_idx_ + hx_sorted_max();
         f.n_off = o.n_expert + 1;
-        RadCopyRange r[kHxFlSlot] = {};
-        const int n = hx_fetch_ranges(f, r, kHxFlRanges);
+        RadCopyRange r[hx_fl_slot(kEpRouteTallRows)] = {};
+        const int n = hx_fetch_ranges(f, r, std::min(hx_fetch_n_ranges(ep_rows_), kHxFlRangesMax));
         k = HxFl{};
         if (n <= 0) {
             ++hx_stats_.fl_plain;
@@ -1493,7 +1645,7 @@ int FileStager::hx_fetch_list(int32_t li, const int32_t* row, RadStream s) {
         }
         /* Whole pairs of ranges (48 bytes), so the write is a 16-byte copy. */
         const int64_t bytes = (int64_t)((n + 1) & ~1) * (int64_t)sizeof(RadCopyRange);
-        RadCopyRange* const pin = hx_fl_pin_ + at * (size_t)kHxFlSlot;
+        RadCopyRange* const pin = hx_fl_pin_ + at * (size_t)hx_fl_slot_;
         std::memcpy(pin, r, (size_t)bytes);
         RAD_TRY(rad_memcpy_async(dev, pin, bytes, s));
         RAD_TRY(rad_event_record(hx_fl_ev_, s));
@@ -1522,7 +1674,7 @@ int FileStager::hx_init_fetch() {
             RAD_ERR("RADIANCE_EXPERIMENTAL_DS41_EARLY_ISSUE=%s: 1 issues a routed layer's card ops ahead "
                     "of its counts sync, which needs every file-tier unit to be the CPU's: host experts "
                     "with ..._POLICY=all and ..._MISSES=%lld, and RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS "
-                    "set", e, (long long)kEpRouteMaxRows);
+                    "set", e, (long long)hx_need_misses_);
             return RAD_E_INVAL;
         }
         hx_early_ = true;
@@ -1537,9 +1689,10 @@ int FileStager::hx_init_fetch() {
                     "CPU's rows to the host in one ranged copy, which needs host experts", f);
             return RAD_E_INVAL;
         }
-        const size_t n = layers_.size() * (size_t)kEpRouteMaxRows;
-        const int64_t bytes = (int64_t)n * kHxFlSlot * (int64_t)sizeof(RadCopyRange);
-        if (n != hx_fl_cap_) {
+        const size_t n = layers_.size() * (size_t)ep_rows_;
+        const int slot = hx_fl_slot(ep_rows_);
+        const int64_t bytes = (int64_t)n * slot * (int64_t)sizeof(RadCopyRange);
+        if (n != hx_fl_cap_ || slot != hx_fl_slot_) {
             if (hx_fl_rec_ && hx_fl_ev_) (void)rad_event_sync(hx_fl_ev_);
             hx_fl_rec_ = false;
             if (hx_fl_dev_) rad_dev_free(hx_fl_dev_, RAD_MEM_DEVICE);
@@ -1547,6 +1700,7 @@ int FileStager::hx_init_fetch() {
             hx_fl_dev_ = (RadCopyRange*)rad_dev_alloc(bytes, RAD_MEM_DEVICE);
             hx_fl_pin_ = (RadCopyRange*)rad_dev_alloc(bytes, RAD_MEM_HOST_PINNED);
             hx_fl_cap_ = hx_fl_dev_ && hx_fl_pin_ ? n : 0;
+            hx_fl_slot_ = slot;
             if (hx_fl_pin_) std::memset(hx_fl_pin_, 0, (size_t)bytes);
         }
         if (!hx_fl_ev_ && rad_event_create(&hx_fl_ev_) < 0) hx_fl_ev_ = nullptr;
@@ -1660,7 +1814,7 @@ int FileStager::hx_jobs_for(int e, const HostExpertPool::Job& proto) {
     const HxOps& o = hx_ops_[(size_t)hx_li_];
     const int64_t AR = pass_tok_, T = pass_tok_ * o.top_k;
     const int32_t* const sorted = hx_idx_;
-    const int32_t* const off = hx_idx_ + kHxRows;
+    const int32_t* const off = hx_idx_ + hx_sorted_max();
     const int ne = (int)o.n_expert;
     if (e < 0 || e >= ne) return RAD_E_STATE;
     int lo = e == 0 ? 0 : off[e], hi = e == ne - 1 ? (int)T : off[e + 1];
@@ -2303,7 +2457,7 @@ int FileStager::hx_capture(int32_t li, RadStream s, const RadTensor* t, int n_t)
     }
     /* Only the addresses of a routed pass that reads all its rows at once (no slice, so from row
      * 0) are kept: what hx_fetch reads from on such a pass. */
-    if (shape && routed_ && AR == pass_tok_ && AR >= 1 && AR <= kEpRouteMaxRows &&
+    if (shape && routed_ && AR == pass_tok_ && AR >= 1 && AR <= ep_rows_ &&
         T == AR * o.top_k && hx_numel(so) >= T) {
         if (o.x && (A.data != o.x || x_ld != o.x_ld || so.data != o.sorted || of.data != o.off))
             ++hx_stats_.moved;
@@ -2521,7 +2675,7 @@ int FileStager::before_op(rad_op h, RadStream s, bool* resync) {
      * layer of a routed-only pass, is read here rather than issued without addresses. */
     if (holds_[li & 1] != li) {
         bool read = false;
-        const bool ep = ep_counts_ && pass_tok_ > 0 && pass_tok_ <= kEpRouteMaxRows &&
+        const bool ep = ep_counts_ && pass_tok_ > 0 && pass_tok_ <= ep_rows_ &&
                         (size_t)li < ep_layer_eligible_.size() &&
                         ep_layer_eligible_[(size_t)li];
         if (routed_ && ep) RAD_TRY(start_ep_routed(li, s, &read));

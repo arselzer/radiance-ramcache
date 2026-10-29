@@ -12,6 +12,9 @@ int r4d_rad_gemm_nt_mxfp4_gemv(const RadArgs*, RadStream);
 int r4d_rad_gemm_nt_mxfp4_tiled(const RadArgs*, RadStream);
 int r4d_rad_moe_gemm_mxfp4_gemv(const RadArgs*, RadStream);
 int r4d_rad_moe_gemm_mxfp4_tiled(const RadArgs*, RadStream);
+/* The `_gemv` kernel at any number of tokens: the launch of moe_gemm_ggml_mxfp4_gemv_tall, the twin r4d_rows.cpp
+ * adds under RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=1. */
+int r4d_rad_moe_gemm_mxfp4_gemv_tall(const RadArgs*, RadStream);
 
 /* -- operand descriptions (r4d_ds41_mxfp4_shapes.inc), libref's for type=mxfp4: the weight in its float
  * logical form. */

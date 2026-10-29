@@ -188,7 +188,14 @@ def load(prefix, arm_json=None):
                          timings=(a or {}).get("timings") or {},
                          extra=bool(arm) and a is None)   # past ARM.json's list: an Lq pass's
     post = {(e["ahead_step"], e["seq"]) for e in ends if e["ahead_step"] >= 0}
-    problems = []
+    problems, notes = [], []
+    # The k-th request the trace saw is the k-th the arm sent: their prompts should agree (the
+    # server's prompt_n is what it prefilled; a note, since a prefix-cache hit would explain it).
+    for r in reqs.values():
+        pn = r["timings"].get("prompt_n")
+        if pn is not None and pn != r["prompt"]:
+            notes.append("request %d (%s): a %d-token prompt in the trace, %d in ARM.json" % (
+                r["index"], r["name"], r["prompt"], pn))
     tokens = []
     r0 = ranks[0]
     for p in sorted(r0.passes):
@@ -241,7 +248,8 @@ def load(prefix, arm_json=None):
     for t0, t1 in zip(tokens, tokens[1:]):
         if t1["seq"] == t0["seq"] and t1["token"] == t0["token"] + 1:
             t0["ms"] = (t1["t_ns"] - t0["t_ns"]) / 1e6
-    return dict(ranks=ranks, steps=steps, ends=ends, reqs=reqs, tokens=tokens, problems=problems)
+    return dict(ranks=ranks, steps=steps, ends=ends, reqs=reqs, tokens=tokens, problems=problems,
+                notes=notes)
 
 
 def held(ranks, rec, layer, e):
@@ -465,6 +473,8 @@ def report(prefix, arm_json=None, tau=0.1, delta=0.05, cap=6, insert_ms=0.15, ou
         prefix, len(toks), sum(1 for t in d["tokens"] if t["post_stop"]), len(d["reqs"])))
     if g["extra"]:
         print("  %d decode tokens of requests past ARM.json's list (an Lq pass's) left out" % g["extra"])
+    if d["notes"]:
+        print("  NOTE (%d): %s -- is the request order the arm's?" % (len(d["notes"]), "; ".join(d["notes"][:3])))
     if d["problems"]:
         print("  JOIN PROBLEMS (%d), first: %s" % (len(d["problems"]), "; ".join(d["problems"][:5])))
     tot = sum(g["status"].values())

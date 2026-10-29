@@ -120,6 +120,19 @@ class SynthTrace(unittest.TestCase):
         self.assertIsNone(rtrace.fit_tokens(self.g["per_token"], least=1))
         self.assertEqual([t["ms"] for t in self.d["tokens"] if t["name"] == "beta-01"], [50.0, 50.0, 50.0, None])
 
+    def test_a_request_out_of_step_with_the_arms_list_is_reported(self):
+        shifted = os.path.join(self.dir, "shifted.json")
+        with open(self.arm) as f:
+            arm = json.load(f)
+        arm["requests"][0]["timings"]["prompt_n"] = 5     # agrees
+        arm["requests"][1]["timings"]["prompt_n"] = 37    # does not
+        with open(shifted, "w") as f:
+            json.dump(arm, f)
+        d = rtrace.load(self.prefix, shifted)
+        self.assertEqual(d["problems"], [])
+        self.assertEqual(len(d["notes"]), 1)
+        self.assertIn("a 5-token prompt in the trace, 37 in ARM.json", d["notes"][0])
+
     def test_requests_past_the_arms_list_are_left_out(self):
         one = os.path.join(self.dir, "one.json")
         with open(self.arm) as f:

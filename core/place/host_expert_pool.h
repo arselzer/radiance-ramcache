@@ -16,7 +16,8 @@
  * the card computes it (f32, 256 KiB). The host's expf differs from the card's in the last bit, so
  * the table is captured on the card (ds41_mxfp4_device_check swiglu) rather than computed here.
  * Optional: ..._CPUS=<list> pins the workers ("4-23" or "4,5,6"), ..._GBPS and ..._LINK_GBPS set
- * the scheduling estimates (40 and 20). */
+ * the scheduling estimates (4.2 GB/s a thread up to 78, and 20), ..._SPIN_US how long an idle
+ * worker spins before it sleeps (200), ..._NICE the workers' nice value (0). */
 #pragma once
 #include <atomic>
 #include <condition_variable>
@@ -34,12 +35,18 @@ public:
     static constexpr int64_t kGuBytes = 12533760, kDnBytes = 6266880;
     static constexpr int64_t kExpertBytes = kGuBytes + kDnBytes;
 
-    /* One expert on one token row. */
+    /* One expert on one token row. gu and dn are block_mxfp4 rows (the RAM cache's form), or with
+     * gu_scales and dn_scales set the release's planes (a fresh read from the container): codes
+     * [N, K/2] and e8m0 scales [N, K/32]. An urgent job (a missed expert, on the critical path)
+     * is claimed before every other. */
     struct Job {
-        const uint8_t*  gu = nullptr;   /* [2 * kFf, kEmbd] block_mxfp4 */
-        const uint8_t*  dn = nullptr;   /* [kEmbd, kFf] block_mxfp4 */
+        const uint8_t*  gu = nullptr;   /* [2 * kFf, kEmbd] */
+        const uint8_t*  dn = nullptr;   /* [kEmbd, kFf] */
+        const uint8_t*  gu_scales = nullptr;
+        const uint8_t*  dn_scales = nullptr;
         const uint16_t* x = nullptr;    /* kEmbd bf16 */
         uint16_t*       y = nullptr;    /* kEmbd bf16 */
+        bool            urgent = false;
     };
     /* The jobs one caller waits for: submit adds them, the pool counts them down. */
     struct Ticket {
@@ -86,6 +93,7 @@ private:
         std::atomic<uint64_t> seq{ 0 };
         std::atomic<int>      gu_left{ 0 }, dn_left{ 0 };
         std::atomic<uint32_t> open{ 0 };    /* the sequence whose down tiles may start */
+        std::atomic<int>      urgent{ 0 };
         Job      job;
         Ticket*  ticket = nullptr;
         alignas(64) uint16_t gate_up[2 * kFf];
@@ -102,7 +110,7 @@ private:
     std::unique_ptr<Slot[]> slots_;
     std::vector<float>      silu_;
     float  limit_ = 10.0f;
-    double cpu_bpns_ = 40.0, link_bpns_ = 20.0;
+    double cpu_bpns_ = 67.0, link_bpns_ = 20.0;
 
     std::vector<std::thread> workers_;
     std::atomic<bool>     stop_{ false };

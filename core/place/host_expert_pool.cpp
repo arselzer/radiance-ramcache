@@ -7,7 +7,11 @@
 #include <immintrin.h>
 #include <pthread.h>
 #include <sched.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -24,6 +28,7 @@ constexpr const char* kEnvCpus    = "RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_CPU
 constexpr const char* kEnvGbps    = "RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_GBPS";
 constexpr const char* kEnvLink    = "RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_LINK_GBPS";
 constexpr const char* kEnvSpin    = "RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SPIN_US";
+constexpr const char* kEnvNice    = "RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_NICE";
 
 /* "4-23" or "4,5,6" or "0-5,12-17"; empty on a malformed list. */
 std::vector<int> parse_cpus(const char* s) {
@@ -57,6 +62,7 @@ double env_f(const char* k, double dflt) {
 }
 
 int64_t g_spin_ns = 200000;
+int     g_nice = 0;     /* workers' nice value: positive yields the cores to the drive readers */
 
 }  /* namespace */
 
@@ -92,9 +98,12 @@ HostExpertPool* HostExpertPool::get() {
             delete p;
             return nullptr;
         }
-        p->cpu_bpns_ = env_f(kEnvGbps, 40.0);
+        /* The kernel streams ~4.2 GB/s a thread up to ~78 GB/s of DRAM at 24 threads (EPYC 7443,
+         * DDR4-2133 x8); an override replaces the estimate. */
+        p->cpu_bpns_ = env_f(kEnvGbps, std::min(4.2 * threads, 78.0));
         p->link_bpns_ = env_f(kEnvLink, 20.0);
         g_spin_ns = (int64_t)(env_f(kEnvSpin, 200.0) * 1000.0);
+        if (const char* n = std::getenv(kEnvNice); n && *n) g_nice = std::clamp(std::atoi(n), 0, 19);
         const char* cl = std::getenv(kEnvCpus);
         const std::vector<int> cpus = parse_cpus(cl);
         if (cl && *cl && cpus.empty())
@@ -147,7 +156,9 @@ int HostExpertPool::submit(const Job* jobs, int n, Ticket* t) {
     if (!t || n < 0 || (n > 0 && !jobs)) return RAD_E_INVAL;
     if (n == 0) return RAD_OK;
     for (int j = 0; j < n; ++j)
-        if (!jobs[j].gu || !jobs[j].dn || !jobs[j].x || !jobs[j].y) return RAD_E_INVAL;
+        if (!jobs[j].gu || !jobs[j].dn || !jobs[j].x || !jobs[j].y ||
+            (!jobs[j].gu_scales) != (!jobs[j].dn_scales))
+            return RAD_E_INVAL;
     /* Counted before any job is visible, so a waiter never sees zero while one is still to come. */
     t->left.fetch_add(n, std::memory_order_relaxed);
     std::lock_guard<std::mutex> lk(submit_mu_);
@@ -174,6 +185,7 @@ int HostExpertPool::submit(const Job* jobs, int n, Ticket* t) {
         s.gu_left.store(kGuTiles, std::memory_order_relaxed);
         s.dn_left.store(kDnTiles, std::memory_order_relaxed);
         s.open.store(0, std::memory_order_relaxed);
+        s.urgent.store(jobs[j].urgent ? 1 : 0, std::memory_order_relaxed);
         /* Publishes everything above: a worker reads the job only after claiming a tile. */
         s.claim.store((uint64_t)(uint32_t)seq << 32, std::memory_order_release);
     }
@@ -205,8 +217,10 @@ void HostExpertPool::wait(const Ticket* t) const {
  * was reused cannot claim a tile of the new job by accident. */
 bool HostExpertPool::run_one() {
     for (;;) {
+        /* Urgent jobs first, then the oldest: the key is the sequence with the top bit clear for
+         * urgent ones. */
         Slot* best = nullptr;
-        uint64_t best_claim = 0, best_seq = UINT64_MAX;
+        uint64_t best_claim = 0, best_key = UINT64_MAX;
         for (int i = 0; i < kSlots; ++i) {
             Slot& s = slots_[i];
             const uint64_t c = s.claim.load(std::memory_order_acquire);
@@ -214,11 +228,12 @@ bool HostExpertPool::run_one() {
             if (k >= (uint32_t)(kGuTiles + kDnTiles)) continue;
             if (k >= (uint32_t)kGuTiles &&
                 s.open.load(std::memory_order_acquire) != (uint32_t)(c >> 32)) continue;
-            const uint64_t seq = s.seq.load(std::memory_order_relaxed);
-            if (seq >= best_seq) continue;
+            const uint64_t key = s.seq.load(std::memory_order_relaxed) |
+                                 (s.urgent.load(std::memory_order_relaxed) ? 0 : (uint64_t)1 << 63);
+            if (key >= best_key) continue;
             best = &s;
             best_claim = c;
-            best_seq = seq;
+            best_key = key;
         }
         if (!best) return false;
         if (!best->claim.compare_exchange_strong(best_claim, best_claim + 1,
@@ -230,10 +245,12 @@ bool HostExpertPool::run_one() {
 
 void HostExpertPool::tile(Slot& s, uint32_t gen, int k) {
     ds41hx::Mx m;
+    const bool planes = s.job.gu_scales != nullptr;
     if (k < kGuTiles) {
         m.N = 2 * kFf;
         m.K = kEmbd;
-        m.blocks = s.job.gu;
+        if (planes) { m.codes = s.job.gu; m.scales = s.job.gu_scales; }
+        else m.blocks = s.job.gu;
         ds41hx::gemv_avx2(m, s.job.x, s.gate_up, k * kTile, (k + 1) * kTile);
         if (s.gu_left.fetch_sub(1, std::memory_order_acq_rel) == 1) {
             ds41hx::swiglu(silu_.data(), s.gate_up, s.act, kFf, limit_);
@@ -245,7 +262,8 @@ void HostExpertPool::tile(Slot& s, uint32_t gen, int k) {
     const int d = k - kGuTiles;
     m.N = kEmbd;
     m.K = kFf;
-    m.blocks = s.job.dn;
+    if (planes) { m.codes = s.job.dn; m.scales = s.job.dn_scales; }
+    else m.blocks = s.job.dn;
     ds41hx::gemv_avx2(m, s.act, s.job.y, d * kTile, (d + 1) * kTile);
     if (s.dn_left.fetch_sub(1, std::memory_order_acq_rel) != 1) return;
     /* The job's last tile: nothing reads the slot after this. */
@@ -267,6 +285,9 @@ void HostExpertPool::worker(int i, int cpu) {
     char name[16];
     std::snprintf(name, sizeof name, "rad-hx-%d", i);
     pthread_setname_np(pthread_self(), name);
+    /* Linux nice is per thread: below the issuing and relay threads, which serve the misses. */
+    if (g_nice > 0 && setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), g_nice) != 0 && i == 0)
+        RAD_WARN("host experts: could not lower the workers' priority to nice %d", g_nice);
     while (!stop_.load(std::memory_order_relaxed)) {
         const uint64_t seen = work_gen_.load();
         if (run_one()) continue;

@@ -20,7 +20,7 @@ def run(receipt, url, n, out):
         req = urllib.request.Request(url + "/v1/completions", data=json.dumps(body).encode(),
                                      headers={"Content-Type": "application/json"})
         try:
-            with urllib.request.urlopen(req, timeout=900) as r:
+            with urllib.request.urlopen(req, timeout=300) as r:
                 resp = json.load(r)
         except Exception as e:  # recorded, the next request still runs
             resp = {"error": repr(e)}

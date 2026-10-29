@@ -804,6 +804,118 @@ bool Mover::borrow_host_unit(int32_t u, HostUnit* out) {
     return true;
 }
 
+bool Mover::read_unit_planes(HostPlanes* const* units, int n) {
+    if (!units || n <= 0 || !plan_ || !prog_ || !relayout_ || !file_.ok() || !mapped_file_cache_on_)
+        return false;
+    /* As read_native_file: the container must still be the one the Program was loaded from,
+     * before the reads and after them. */
+    if (!source_file_epoch()) return false;
+    struct Read { HostPlanes* p; int k; uint32_t file; };
+    std::vector<Read> reads;
+    const int64_t A = DirectFile::alignment();
+    for (int i = 0; i < n; ++i) {
+        HostPlanes* p = units[i];
+        const int32_t u = p ? p->unit : -1;
+        if (u < 0 || (size_t)u >= unit_.size()) return false;
+        const UnitState& us = unit_[(size_t)u];
+        if (us.tier != Tier::SSD || us.slab_slot >= 0 || us.klass < 0) return false;
+        const MoveUnit& mu = plan_->units[(size_t)u];
+        if (mu.weights.size() != 2) return false;
+        p->n = 0;
+        for (int k = 0; k < 2; ++k) {
+            const WeightInfo& w = prog_->weights[mu.weights[(size_t)k]];
+            RadTensor pt[RAD_ENC_MAX_PLANES];
+            weight_planes(w, pt);
+            if (!mapped_file_eligible(w) || w.n_sel != 2 || pt[0].dtype != RAD_FP4E2M1 ||
+                pt[1].dtype != RAD_E8M0 || pt[0].shape[0] != pt[1].shape[0] ||
+                pt[0].shape[1] != pt[1].shape[1] * 32)
+                return false;
+            int64_t lo = INT64_MAX, hi = 0;
+            for (int j = 0; j < 2; ++j) {
+                const int64_t bytes = pt[j].shape[0] * rad_dtype_bytes(pt[j].dtype, pt[j].shape[1]);
+                lo = std::min(lo, (int64_t)w.file_plane_offset[j]);
+                hi = std::max(hi, (int64_t)w.file_plane_offset[j] + bytes);
+            }
+            const int64_t a0 = lo / A * A, need = align_up(hi - a0, A);
+            if (p->cap[k] < need) {
+                std::free(p->buf[k]);
+                p->buf[k] = (uint8_t*)std::aligned_alloc((size_t)A, (size_t)need);
+                p->cap[k] = p->buf[k] ? need : 0;
+                if (!p->buf[k]) return false;
+            }
+            p->w[k] = mu.weights[(size_t)k];
+            p->rows[k] = pt[0].shape[0];
+            p->cols[k] = pt[0].shape[1];
+            p->codes[k] = p->buf[k] + ((int64_t)w.file_plane_offset[0] - a0);
+            p->scales[k] = p->buf[k] + ((int64_t)w.file_plane_offset[1] - a0);
+            p->a0[k] = a0;
+            p->len[k] = hi - a0;
+            p->n = k + 1;
+            reads.push_back(Read{ p, k, w.file_id });
+        }
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    std::vector<int> rc(reads.size(), RAD_OK);
+    /* At most 16 readers at once, each taking the next weight; a reader that cannot be started
+     * leaves its share to the others and this thread. */
+    std::atomic<size_t> next{ 0 };
+    auto reader = [&] {
+        for (size_t j; (j = next.fetch_add(1)) < reads.size();) {
+            const Read& r = reads[j];
+            rc[j] = read_source_file(r.file, (uint64_t)r.p->a0[r.k], r.p->len[r.k], r.p->buf[r.k],
+                                     r.p->cap[r.k]);
+        }
+    };
+    std::vector<std::thread> th;
+    try {
+        for (size_t t = 1; t < std::min<size_t>(reads.size(), 16); ++t) th.emplace_back(reader);
+    } catch (...) {
+    }
+    reader();
+    for (std::thread& t : th) t.join();
+    host_plane_read_ns_.fetch_add((uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                      std::chrono::steady_clock::now() - t0).count(), std::memory_order_relaxed);
+    host_plane_reads_.fetch_add(reads.size(), std::memory_order_relaxed);
+    for (int r : rc) if (r < 0) return false;
+    return source_file_epoch();
+}
+
+int Mover::insert_unit_planes(const HostPlanes& p, std::vector<uint8_t>* scratch) {
+    if (!scratch || !relayout_ || !mapped_file_cache_on_) return RAD_E_STATE;
+    for (int k = 0; k < p.n; ++k) {
+        /* The check-insert-check bracket of read_native_file: never admit another epoch's bytes. */
+        if (!source_file_epoch()) return RAD_E_STATE;
+        const WeightInfo& w = prog_->weights[p.w[k]];
+        RadTensor pt[RAD_ENC_MAX_PLANES];
+        weight_planes(w, pt);
+        pt[0].data = const_cast<uint8_t*>(p.codes[k]);
+        pt[1].data = const_cast<uint8_t*>(p.scales[k]);
+        if ((int64_t)scratch->size() < w.stored_bytes) scratch->resize((size_t)w.stored_bytes);
+        const int st = relayout_(w, pt, scratch->data(), w.stored_bytes);
+        if (st < 0) return st;
+        using S = NativeMappedFileCache::Status;
+        const auto rc = mapped_file_cache_.insert((size_t)(&w - prog_->weights.data()), scratch->data(),
+                                                  (size_t)w.stored_bytes);
+        if (rc != S::Ok && rc != S::Existing && rc != S::Bypass && rc != S::Allocation) return RAD_E_STATE;
+        if (!source_file_epoch()) return RAD_E_STATE;
+        host_plane_inserts_.fetch_add(1, std::memory_order_relaxed);
+    }
+    return RAD_OK;
+}
+
+bool Mover::host_planes_eligible(int32_t u) const {
+    if (!plan_ || !prog_ || !mapped_file_cache_on_ || u < 0 || (size_t)u >= unit_.size()) return false;
+    const UnitState& us = unit_[(size_t)u];
+    if (us.tier != Tier::SSD || us.slab_slot >= 0 || us.klass < 0) return false;
+    const MoveUnit& mu = plan_->units[(size_t)u];
+    if (mu.weights.size() != 2) return false;
+    for (rad_weight h : mu.weights) {
+        const WeightInfo& w = prog_->weights[h];
+        if (!mapped_file_eligible(w) || w.n_sel != 2) return false;
+    }
+    return true;
+}
+
 void Mover::release_host_unit(HostUnit* hu) {
     if (!hu) return;
     for (int i = 0; i < hu->n; ++i) {
@@ -874,9 +986,16 @@ int Mover::read_relaid(const WeightInfo& w, void* dst, int64_t dst_cap, RelayIn*
         in->cap = in->p ? n : 0;
         if (!in->p) return RAD_E_NOMEM;
     }
+    const auto t0 = std::chrono::steady_clock::now();
     RAD_TRY(read_source_file(w.file_id,(uint64_t)a0, hi - a0, in->p, in->cap));   /* reads n, needs hi - a0 */
+    const auto t1 = std::chrono::steady_clock::now();
     for (int k = 0; k < w.n_sel; ++k) pt[k].data = in->p + ((int64_t)w.file_plane_offset[k] - a0);
     const int st = relayout_(w, pt, dst, w.stored_bytes);
+    relaid_read_ns_.fetch_add((uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count(),
+                              std::memory_order_relaxed);
+    relaid_pack_ns_.fetch_add((uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                  std::chrono::steady_clock::now() - t1).count(), std::memory_order_relaxed);
+    relaid_reads_.fetch_add(1, std::memory_order_relaxed);
     if (st < 0)
         RAD_ERR("file tier: relaying '%s' (%s) on the read failed: %s", w.name.c_str(),
                 w.layout_tag.c_str(), rad_strerror(st));
@@ -2209,6 +2328,19 @@ std::string Mover::report() const {
                  "issuing thread in the file stager's read+relayout\n",
                  (unsigned long long)stats_.file_relaid, (double)stats_.file_relaid_bytes * gib,
                  (double)stats_.file_relayout_ns * 1e-9);
+    if (host_plane_reads_.load())
+        s += fmt("  host experts' plane reads: %llu weights read for the CPU in %.2f s of issuing-thread "
+                 "time (%.2f ms a batch weight), %llu relaid into the RAM cache beside it\n",
+                 (unsigned long long)host_plane_reads_.load(), (double)host_plane_read_ns_.load() * 1e-9,
+                 (double)host_plane_read_ns_.load() * 1e-6 / (double)host_plane_reads_.load(),
+                 (unsigned long long)host_plane_inserts_.load());
+    if (relaid_reads_.load())
+        s += fmt("  file tier relayout split: %llu reads; %.2f s in preads and %.2f s relaying, summed "
+                 "over the relay threads (%.2f ms and %.2f ms a weight)\n",
+                 (unsigned long long)relaid_reads_.load(), (double)relaid_read_ns_.load() * 1e-9,
+                 (double)relaid_pack_ns_.load() * 1e-9,
+                 (double)relaid_read_ns_.load() * 1e-6 / (double)relaid_reads_.load(),
+                 (double)relaid_pack_ns_.load() * 1e-6 / (double)relaid_reads_.load());
     if (native_file_cache_on_) {
         const NativeFileCache::Stats c = native_file_cache_.stats();
         s += fmt("  native file RAM cache: %llu hits (%.2f GiB), %llu misses (%.2f GiB), "

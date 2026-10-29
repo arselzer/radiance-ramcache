@@ -139,6 +139,52 @@ TEST(host_expert_pool_more_jobs_than_slots) {
     CHECK_EQ(p->backlog(), (int64_t)0);
 }
 
+/* The release's planes of block_mxfp4 rows: codes [N, K/2] (element 2i in the low nibble) and e8m0
+ * scales [N, K/32]. In a block, value j < 16 is the low nibble of code byte j, j + 16 its high one. */
+static void planes_of(const std::vector<uint8_t>& b, int N, int K, std::vector<uint8_t>* codes,
+                      std::vector<uint8_t>* scales) {
+    const int nb = K / 32;
+    codes->assign((size_t)N * K / 2, 0);
+    scales->assign((size_t)N * nb, 0);
+    for (int n = 0; n < N; ++n)
+        for (int u = 0; u < nb; ++u) {
+            const uint8_t* blk = &b[((size_t)n * nb + u) * 17];
+            (*scales)[(size_t)n * nb + u] = blk[0];
+            auto val = [&](int v) { return v < 16 ? blk[1 + v] & 15 : blk[1 + v - 16] >> 4; };
+            for (int q = 0; q < 16; ++q)
+                (*codes)[(size_t)n * (K / 2) + (size_t)u * 16 + q] =
+                    (uint8_t)(val(2 * q) | (val(2 * q + 1) << 4));
+        }
+}
+
+TEST(host_expert_pool_planes_and_urgent_jobs_match) {
+    HostExpertPool* p = pool();
+    if (!p || !__builtin_cpu_supports("avx2")) { SKIP("no AVX2 or no pool"); return; }
+    Expert e{ blocks(2 * kFf, kEmbd, 31), blocks(kEmbd, kFf, 32) };
+    std::vector<uint8_t> guc, gus, dnc, dns;
+    planes_of(e.gu, 2 * kFf, kEmbd, &guc, &gus);
+    planes_of(e.dn, kEmbd, kFf, &dnc, &dns);
+    const auto x = row(17);
+    const auto want = reference(e, x);
+    std::vector<uint16_t> a(kEmbd), b(kEmbd, 0xffff);
+    HostExpertPool::Job j[2];
+    j[0].gu = e.gu.data(); j[0].dn = e.dn.data(); j[0].x = x.data(); j[0].y = a.data();
+    j[1].gu = guc.data(); j[1].gu_scales = gus.data(); j[1].dn = dnc.data(); j[1].dn_scales = dns.data();
+    j[1].x = x.data(); j[1].y = b.data(); j[1].urgent = true;
+    HostExpertPool::Ticket t;
+    p->reserve(2 * HostExpertPool::kExpertBytes);
+    CHECK_EQ(p->submit(j, 2, &t), 0);
+    p->wait(&t);
+    CHECK(a == want);
+    CHECK(b == want);
+    /* One plane pointer without the other is refused. */
+    HostExpertPool::Job bad = j[1];
+    bad.dn_scales = nullptr;
+    HostExpertPool::Ticket t2;
+    CHECK(p->submit(&bad, 1, &t2) < 0);
+    CHECK_EQ(p->backlog(), (int64_t)0);
+}
+
 TEST(host_expert_pool_refuses_incomplete_jobs) {
     HostExpertPool* p = pool();
     if (!p) { SKIP("no pool"); return; }

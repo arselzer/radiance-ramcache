@@ -599,6 +599,33 @@ public:
     };
     bool  borrow_host_unit(int32_t u, HostUnit* out);
     void  release_host_unit(HostUnit* hu);
+    /* read_unit_planes  for a host reader of units the RAM cache misses: reads each unit's
+     *                   weights from the container as the release stores them (codes and scales
+     *                   planes, no relayout, no cache) into buffers the HostPlanes owns, every
+     *                   weight of every unit on its own thread at once. False when a unit is not
+     *                   a plain file-tier ggml_mxfp4 pair or a read fails.
+     * insert_unit_planes relays one unit's planes into the stored form and admits it into the
+     *                   mapped RAM cache, so a later pass hits; thread-safe (relayouts are pure,
+     *                   the cache locks), for a thread beside the issuing one. */
+    struct HostPlanes {
+        int32_t        unit = -1;
+        int            n = 0;
+        rad_weight     w[2] = { 0, 0 };
+        int64_t        rows[2] = { 0, 0 }, cols[2] = { 0, 0 };   /* elements */
+        const uint8_t* codes[2] = { nullptr, nullptr };
+        const uint8_t* scales[2] = { nullptr, nullptr };
+        uint8_t*       buf[2] = { nullptr, nullptr };
+        int64_t        cap[2] = { 0, 0 };
+        int64_t        a0[2] = { 0, 0 }, len[2] = { 0, 0 };     /* file range read */
+        HostPlanes() = default;
+        HostPlanes(const HostPlanes&) = delete;
+        HostPlanes& operator=(const HostPlanes&) = delete;
+        ~HostPlanes() { for (uint8_t* b : buf) std::free(b); }
+    };
+    bool  read_unit_planes(HostPlanes* const* units, int n);
+    bool  host_planes_eligible(int32_t u) const;   /* what read_unit_planes accepts */
+    bool  mapped_cache_on() const { return mapped_file_cache_on_; }
+    int   insert_unit_planes(const HostPlanes& p, std::vector<uint8_t>* scratch);
     /* set_file_relayout  the function that makes a file-tier weight's stored form from its
      *                    container planes when the two differ (weight_file_relaid): the kernel's
      *                    relayout, as the loader's relayout pool calls it once for a resident
@@ -804,6 +831,9 @@ private:
                           bool* cache_hit, NativeFileCacheReadPolicy policy, NativeMappedFileCache::Lease* mapped_lease);
     bool prefetch_trace_slot(const M1PrefetchTrace& trace);
     std::atomic<uint64_t> prefetch_trace_lines_{0};
+    /* read_relaid split, summed over the relay threads that run it at once: preads, relayouts. */
+    std::atomic<uint64_t> relaid_read_ns_{0}, relaid_pack_ns_{0}, relaid_reads_{0};
+    std::atomic<uint64_t> host_plane_read_ns_{0}, host_plane_reads_{0}, host_plane_inserts_{0};
     int  stage_relaid(const std::vector<Relaid>& rl, NativeFileCacheReadPolicy policy);
     char*    windows_ = nullptr;
     int      n_windows_ = 0;

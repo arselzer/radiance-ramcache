@@ -89,10 +89,14 @@
 #include "dspark_head_tail.h"
 #include "host_expert_pool.h"
 
+#include <condition_variable>
+#include <cstdio>
 #include <deque>
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
+#include <thread>
 #include <vector>
 
 namespace rad {
@@ -249,11 +253,21 @@ public:
     using CountsRow = std::function<const int32_t*(int32_t layer, int64_t* n_expert,
                                                    int64_t* top_k)>;
     using EpCountsRow = std::function<bool(int32_t layer, EpRouteCounts* out)>;
-    struct EpStats { uint64_t reads = 0, zero_local = 0, units = 0, corrupt = 0; };
+    /* sync: the issuing thread waiting for the card to reach a layer's router (the counts row);
+     * stage: its routed units' reads and copies queued (drive reads block it); miss_layers and
+     * miss_stage: the layers whose stage read from the drive, and their stage time; hx: the CPU
+     * share chosen and handed to the pool. */
+    struct EpStats {
+        uint64_t reads = 0, zero_local = 0, units = 0, corrupt = 0;
+        uint64_t sync_ns = 0, stage_ns = 0, miss_layers = 0, miss_stage_ns = 0, hx_ns = 0;
+        /* The same split for one-token passes (decode) alone. */
+        uint64_t d_reads = 0, d_sync_ns = 0, d_stage_ns = 0, d_miss_layers = 0, d_miss_stage_ns = 0;
+    };
     const EpStats& ep_stats() const { return ep_stats_; }
     /* Routed experts the CPU computed (HostExpertPool) instead of a copy to the card. */
     struct HostStats {
         uint64_t layers = 0, units = 0, rows = 0;
+        uint64_t miss_units = 0, miss_rows = 0, miss_read_ns = 0;   /* misses computed from planes */
         uint64_t linked = 0;          /* cached experts the schedule left on the copy link */
         uint64_t missed = 0;          /* routed experts the RAM cache did not hold */
         uint64_t wait_ns = 0;         /* the issuing thread waiting at gathers for the CPU */
@@ -347,6 +361,13 @@ private:
     const Program* ep_program_ = nullptr;
     std::vector<uint8_t> ep_layer_eligible_;
     EpStats ep_stats_;
+    /* RADIANCE_EXPERIMENTAL_DS41_ACCESS_TRACE=<dir>: every EP-routed layer's selected file-tier
+     * units, one record each in <dir>/rank<r>.bin (see trace_layer), for replaying cache policies
+     * offline. */
+    FILE*    trace_fp_ = nullptr;
+    uint32_t trace_pass_ = 0;
+    std::vector<int32_t> trace_units_;
+    void trace_layer(int32_t layer, uint32_t miss_weights);
 
     /* ---- routed experts computed on the CPU (host_expert_pool.h) ----------------------------
      *
@@ -401,9 +422,29 @@ private:
     int  hx_fetch(int32_t li, RadStream s);
     void hx_choose(int32_t li);
     int  hx_submit();
+    int  hx_jobs_for(int e, const HostExpertPool::Job& proto);
     int  hx_capture(int32_t li, const RadTensor* t, int n_t);
     int  hx_finish(RadStream s, const RadTensor* t, int n_t);
     void hx_drain();
+    /* Misses on the CPU (..._MISSES=N: passes of at most N tokens): a missed unit's planes are read
+     * from the container straight into reused host buffers, computed as urgent jobs, and relaid
+     * into the RAM cache by a background thread so later passes hit. */
+    int  hx_miss_rows_ = 0;
+    std::vector<std::shared_ptr<Mover::HostPlanes>> hx_miss_;     /* this layer's */
+    std::vector<std::unique_ptr<Mover::HostPlanes>> hx_planes_free_;
+    std::mutex hx_planes_mu_;
+    std::shared_ptr<Mover::HostPlanes> hx_planes_get(int32_t unit);
+    int  hx_submit_misses();
+    std::thread hx_bg_;
+    std::mutex hx_bg_mu_;
+    std::condition_variable hx_bg_cv_;
+    std::deque<std::shared_ptr<Mover::HostPlanes>> hx_bg_q_;
+    bool hx_bg_stop_ = false, hx_bg_busy_ = false;
+    void hx_bg_loop();
+public:
+    /* Waits for the background relayouts of missed units; before the mover drains its cache. */
+    void drain_host_inserts();
+private:
     int  finish(int32_t b, RadStream s);
     struct HeadOps;
     DsparkHeadTailOwner head_;

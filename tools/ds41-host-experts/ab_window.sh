@@ -16,6 +16,8 @@
 # Before the arms (DEVICE_CHECKS=1, the default), the device harness checks the served libr4d.so on
 # card 0: swiglu over every (gate, up) pair with mismatches classified, and the host chain.
 #
+# Arms are named POLICY[-tN][-gG][-sS][-nP][-mM][-MR][-f][-x] (see the loop below), e.g. "base greedy-t20-g65 all-t24".
+#
 # Environment: RADIANCE_BIN (the binary), RADIANCE_HOME_DIR (kernels/ and architectures/ for it),
 # SILU_TABLE (the card's silu table), ARMS (default "base verify greedy"), HX_THREADS (16),
 # VERIFY_REQUESTS (3), DEVICE_CHECKS (1).
@@ -62,35 +64,53 @@ stop_server() {
 }
 
 restore() {
+  # Runs once, ignores further signals, and retries the start until the container really runs:
+  # a start issued while a stop is still in flight is a no-op, and the stop then wins.
+  trap '' INT TERM HUP
+  [[ -n "${RESTORED:-}" ]] && return 0
+  RESTORED=1
   stop_server
   log "restoring $NAME"
-  "${DOCKER[@]}" start "$NAME" >>"$OUT/window.log" 2>&1
-  local t=0
-  until curl -s -m 3 "$URL/stats" >/dev/null 2>&1; do
+  local t=0 state
+  while :; do
+    state=$("${DOCKER[@]}" inspect "$NAME" --format '{{.State.Status}}' 2>/dev/null)
+    [[ "$state" == running ]] && curl -s -m 3 "$URL/stats" >/dev/null 2>&1 && break
+    [[ "$state" != running ]] && "${DOCKER[@]}" start "$NAME" >>"$OUT/window.log" 2>&1
     sleep 5; t=$((t + 5))
-    if (( t > 1200 )); then log "QFN did not come back within 20 min"; return 1; fi
+    if (( t > 1200 )); then log "QFN did not come back within 20 min (state $state)"; return 1; fi
   done
   local r; r=$(curl -s -m 120 "$URL/v1/completions" -H 'Content-Type: application/json' \
       -d '{"model":"qwen-vllm","prompt":"The capital of France is","max_tokens":4,"temperature":0}')
   log "QFN up after ${t}s; completion: $(echo "$r" | head -c 300)"
+  rm -f /home/as/ds41-claude-build/work/qfn_stopped_by
   "${DOCKER[@]}" inspect "$NAME" --format '{{.Id}} {{.State.Status}} {{.State.StartedAt}} {{.Config.Image}}' >>"$OUT/window.log" 2>&1
 }
 
-arm() {   # name, then env assignments for the server
+arm() {   # name, then env assignments for the server; CACHE_MIB the RAM cache (default 81920)
   local name=$1; shift
-  local n=8; [[ "$name" == verify ]] && n=$VERIFY_REQUESTS
+  local n=8; [[ "$name" == verify* ]] && n=$VERIFY_REQUESTS
   log "arm $name: $*"
   env "$@" RADIANCE_EXPERIMENTAL_NATIVE_CACHE_MAPPED_SLABS=1 RADIANCE_EXPERIMENTAL_NATIVE_CACHE_MAPPED_SOURCE=1 \
       RADIANCE_EXPERIMENTAL_DS41_MXFP4_PACK_SSE2=1 \
     "$BIN" --radiance-home "$RHOME" --kernels libr4d,libref --model "$MODEL" \
       --served-model-name ds41-native-smoke --tp 4 --tp-wire exact --placement expert_tiered \
-      --weights-disk-tier --expert-ram-cache-total-mib 81920 --host-pool-mib 4096 \
+      --weights-disk-tier --expert-ram-cache-total-mib ${CACHE_MIB:-81920} --host-pool-mib 4096 \
       --host-headroom-mib 8192 --gpu-headroom-mib 256 --embedding-placement vram \
       --vision-tower-placement vram --ngram-placement disk --max-model-len 512 \
       --max-num-batched-tokens 16 --max-num-seqs 1 --kv-cache-dtype bf16 \
       --num-speculative-tokens 0 --spec-ngram 0 --no-prefix-cache --deterministic \
       --host 127.0.0.1 --port $PORT --expert-profile "$PROFILE" >"$OUT/$name.server.log" 2>&1 &
   SERVER_PID=$!
+  # Memory guard: stops this server (never anything else) if the host runs short.
+  ( while kill -0 "$SERVER_PID" 2>/dev/null; do
+      avail=$(awk '/MemAvailable/ {print int($2/1024)}' /proc/meminfo)
+      if (( avail < ${MEMGUARD_MIB:-3072} )); then
+        echo "[$(date -u +%FT%TZ)] arm $name: MemAvailable ${avail} MiB below the guard; stopping the server" >> "$OUT/window.log"
+        kill -INT "$SERVER_PID"; break
+      fi
+      echo "$(date -u +%T) $avail" >> "$OUT/$name.mem"
+      sleep 5
+    done ) &
   local t=0
   until curl -s -m 3 "http://127.0.0.1:$PORT/stats" >/dev/null 2>&1; do
     if ! kill -0 "$SERVER_PID" 2>/dev/null; then log "arm $name: server exited during startup"; SERVER_PID=; return 1; fi
@@ -104,10 +124,15 @@ arm() {   # name, then env assignments for the server
   grep -E 'host experts|EP scoped|error|ERR' "$OUT/$name.server.log" | tail -12 | tee -a "$OUT/window.log"
 }
 
+if [[ "$("${DOCKER[@]}" inspect "$NAME" --format '{{.State.Status}}' 2>/dev/null)" != running ]]; then
+  log "QFN ($NAME) is not running before the window; not starting one"; exit 4
+fi
 log "waiting for 30 s of QFN idleness"
 if ! idle_for 30 600; then log "QFN not idle within 10 min; no window"; exit 3; fi
 "${DOCKER[@]}" inspect "$NAME" --format 'before: {{.Id}} {{.State.Status}} {{.State.StartedAt}} {{.Config.Image}}' >>"$OUT/window.log" 2>&1
 trap restore EXIT
+trap 'exit 130' INT TERM HUP
+echo $$ > /home/as/ds41-claude-build/work/qfn_stopped_by   # the QFN watchdog leaves a live owner's stop alone
 log "stopping $NAME"
 "${DOCKER[@]}" stop -t 60 "$NAME" >>"$OUT/window.log" 2>&1
 sleep 5
@@ -127,13 +152,34 @@ if [[ "${DEVICE_CHECKS:-1}" == 1 && -x "$HERE/build/ds41_mxfp4_device_check" ]];
 fi
 
 HX=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=$HX_THREADS RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU=$SILU)
+CANCEL=${CANCEL_FILE:-/home/as/ds41-claude-build/work/cancel_window}
 for a in $ARMS; do
-  case $a in
-    base)   arm base RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=0 ;;
-    verify) arm verify "${HX[@]}" RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_POLICY=verify ;;
-    greedy) arm greedy "${HX[@]}" RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_POLICY=greedy ;;
-    all)    arm all "${HX[@]}" RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_POLICY=all ;;
-    *)      log "unknown arm $a" ;;
+  if [[ -e "$CANCEL" ]]; then log "cancel file $CANCEL present; skipping the remaining arms"; break; fi
+  # An arm is POLICY[-tN][-gG][-sS][-nP][-mM][-MR][-f][-x]: policy base, verify, greedy or all; N CPU
+  # threads; G GB/s the schedule assumes for the CPU; S us the idle pool spins; P the pool's nice
+  # value; M MiB of RAM cache (81920); R: passes of at most R tokens compute their missed experts on
+  # the CPU from the container's planes; f the mover's direct cache fill; x an access trace.
+  IFS=- read -r -a parts <<< "$a"
+  pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920
+  for p in "${parts[@]:1}"; do
+    case $p in
+      t[0-9]*) threads=${p#t} ;;
+      g[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_GBPS=${p#g}) ;;
+      f)       env+=(RADIANCE_EXPERIMENTAL_NATIVE_CACHE_DIRECT_FILL=1) ;;
+      x)       mkdir -p "$OUT/trace-$a"; env+=(RADIANCE_EXPERIMENTAL_DS41_ACCESS_TRACE=$OUT/trace-$a) ;;
+      s[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SPIN_US=${p#s}) ;;
+      n[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_NICE=${p#n}) ;;
+      m[0-9]*) CACHE_MIB=${p#m} ;;
+      M[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MISSES=${p#M}) ;;
+      *)       log "arm $a: unknown part $p" ;;
+    esac
+  done
+  case $pol in
+    base) arm "$a" RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=0 "${env[@]}" ;;
+    verify|greedy|all)
+      arm "$a" RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=$threads RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU=$SILU \
+          RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_POLICY=$pol "${env[@]}" ;;
+    *) log "unknown arm $a" ;;
   esac
 done
 python3 -I "$HERE/ab_requests.py" --compare "$OUT" $ARMS | tee -a "$OUT/window.log"

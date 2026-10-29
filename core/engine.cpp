@@ -98,23 +98,37 @@ Engine::~Engine() {
         }
         RAD_INFO("%s", r->mover.report().c_str());
         const auto& ep = r->fstager.ep_stats();
-        if (ep.reads || ep.corrupt)
+        if (ep.reads || ep.corrupt) {
             RAD_INFO("EP scoped file staging: %llu count rows completed, %llu local-zero, "
                      "%llu SSD units submitted, %llu corrupt rows refused",
                      (unsigned long long)ep.reads, (unsigned long long)ep.zero_local,
                      (unsigned long long)ep.units, (unsigned long long)ep.corrupt);
+            RAD_INFO("EP staging time: %.2f s waiting for the card at the routers, %.2f s staging "
+                     "(%llu of %llu layers read the drive, %.2f s of it), %.2f s choosing CPU units",
+                     (double)ep.sync_ns * 1e-9, (double)ep.stage_ns * 1e-9,
+                     (unsigned long long)ep.miss_layers, (unsigned long long)ep.reads,
+                     (double)ep.miss_stage_ns * 1e-9, (double)ep.hx_ns * 1e-9);
+            RAD_INFO("EP staging time, one-token passes: %llu layers; %.2f s waiting for the card, "
+                     "%.2f s staging (%llu layers read the drive, %.2f s of it)",
+                     (unsigned long long)ep.d_reads, (double)ep.d_sync_ns * 1e-9,
+                     (double)ep.d_stage_ns * 1e-9, (unsigned long long)ep.d_miss_layers,
+                     (double)ep.d_miss_stage_ns * 1e-9);
+        }
         const auto& hx = r->fstager.host_stats();
         if (r->fstager.host_experts())
             RAD_INFO("host experts: %llu layers handed %llu experts (%llu rows) to the CPU; "
                      "%llu cached experts went over the copy link, %llu routed experts were not "
                      "cached; %.1f ms waiting at gathers; verify: %llu rows compared, %llu differ; "
                      "%llu gate_up operand moves; %llu units probed (the mapped cache's hit "
-                     "and miss counts above include these probes)",
+                     "and miss counts above include these probes); misses on the CPU: %llu units, "
+                     "%llu rows, %.1f ms reading their planes",
                      (unsigned long long)hx.layers, (unsigned long long)hx.units,
                      (unsigned long long)hx.rows, (unsigned long long)hx.linked,
                      (unsigned long long)hx.missed, (double)hx.wait_ns / 1e6,
                      (unsigned long long)hx.verified, (unsigned long long)hx.differ,
-                     (unsigned long long)hx.moved, (unsigned long long)hx.probed);
+                     (unsigned long long)hx.moved, (unsigned long long)hx.probed,
+                     (unsigned long long)hx.miss_units, (unsigned long long)hx.miss_rows,
+                     (double)hx.miss_read_ns / 1e6);
     }
     /* Drain the transfer streams before the contexts. Ctx::shutdown drains the compute streams
      * and frees the arena, but the mover's stream also copies into the arena (the prefill
@@ -125,6 +139,7 @@ Engine::~Engine() {
             RAD_ERR("DSpark head tail: completion unknown; retaining process owners");
             std::_Exit(88);
         }
+        r->fstager.drain_host_inserts();   /* the CPU path's background relayouts into the cache */
         //Mapped-source leases must retire before any context arena or stager event disappears.
         //A failed completion proof cannot be followed by ordinary member destruction.
         if (r->mover.mapped_file_drain() != RAD_OK) {

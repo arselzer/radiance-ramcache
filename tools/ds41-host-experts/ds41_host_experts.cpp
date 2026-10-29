@@ -321,28 +321,34 @@ inline void x_lanes(const uint16_t* x, int UK, float* xt) {
         }
 }
 
+/* Whether a round's e8m0 bytes (e_pair of groups 0 and 1, and of 2 and 3) all lie in the fast
+ * path's window. */
+HX_INLINE bool fast_round(__m256i e01, __m256i e23) {
+    auto in_range = [](__m256i e) __attribute__((always_inline)) {
+        return _mm256_and_si256(_mm256_cmpeq_epi8(_mm256_max_epu8(e, _mm256_set1_epi8((char)kFastLo)), e),
+                                _mm256_cmpeq_epi8(_mm256_min_epu8(e, _mm256_set1_epi8((char)kFastHi)), e));
+    };
+    return _mm256_movemask_epi8(_mm256_and_si256(in_range(e01), in_range(e23))) == -1;
+}
+/* 4s = 4 (e - 127) = 4e - 508: 4 (e + 1) mod 256 as a signed byte */
+HX_INLINE __m256i s8_of(__m256i e) {
+    const __m256i t = _mm256_add_epi8(e, _mm256_set1_epi8(1)), t2 = _mm256_add_epi8(t, t);
+    return _mm256_add_epi8(t2, t2);
+}
+
 /* One round: groups at gc[g] (code bytes of block 0) and gs[g] (its e8m0 byte or scale), ng of
  * them with blocks (groups past ng repeat group 0 and are never added). */
 template <bool kGgml>
 __attribute__((noinline)) void add_any_round(__m256 (&acc)[4], const uint8_t* const (&gc)[4], const uint8_t* const (&gs)[4],
                                              int ng, const float* xr) {
     const __m256i e01 = e_pair<kGgml>(gs[0], gs[1]), e23 = ng > 2 ? e_pair<kGgml>(gs[2], gs[3]) : e01;
-    auto in_range = [](__m256i e) __attribute__((always_inline)) {
-        return _mm256_and_si256(_mm256_cmpeq_epi8(_mm256_max_epu8(e, _mm256_set1_epi8((char)kFastLo)), e),
-                                _mm256_cmpeq_epi8(_mm256_min_epu8(e, _mm256_set1_epi8((char)kFastHi)), e));
-    };
-    if (_mm256_movemask_epi8(_mm256_and_si256(in_range(e01), in_range(e23))) != -1) {
+    if (!fast_round(e01, e23)) {
         general_round<kGgml>(acc, gc, gs, ng, xr);
         return;
     }
-    /* 4s = 4 (e - 127) = 4e - 508: 4 (e + 1) mod 256 as a signed byte */
-    auto s8 = [](__m256i e) __attribute__((always_inline)) {
-        const __m256i t = _mm256_add_epi8(e, _mm256_set1_epi8(1)), t2 = _mm256_add_epi8(t, t);
-        return _mm256_add_epi8(t2, t2);
-    };
     alignas(32) uint16_t w16[1024];
-    kv_pair16<kGgml>(gc[0], gc[1], s8(e01), w16);
-    if (ng > 2) kv_pair16<kGgml>(gc[2], gc[3], s8(e23), w16 + 512);
+    kv_pair16<kGgml>(gc[0], gc[1], s8_of(e01), w16);
+    if (ng > 2) kv_pair16<kGgml>(gc[2], gc[3], s8_of(e23), w16 + 512);
     switch (ng) {
         case 1: add_round16<1>(acc, w16, xr); break;
         case 2: add_round16<2>(acc, w16, xr); break;
@@ -422,6 +428,60 @@ void gemv_avx2_t(const Mx& w, const uint16_t* x, uint16_t* y, int n0, int n1) {
     }
 }
 
+/* ---- several token rows of one matrix ---- */
+
+/* A full round for `rows` rows: on the fast path its codes are decoded once (kv_pair16) and added
+ * to each row's sums as add_any_round adds them, so every row's sums see the same operations in the
+ * same order. The general path decodes again for each row; its rounds are rare. */
+template <bool kGgml>
+__attribute__((noinline)) void add_round_rows(__m256 (*acc)[4], const uint8_t* const (&gc)[4], const uint8_t* const (&gs)[4],
+                                              const float* const* xr, int rows) {
+    const __m256i e01 = e_pair<kGgml>(gs[0], gs[1]), e23 = e_pair<kGgml>(gs[2], gs[3]);
+    if (!fast_round(e01, e23)) {
+        for (int i = 0; i < rows; ++i) general_round<kGgml>(acc[i], gc, gs, 4, xr[i]);
+        return;
+    }
+    alignas(32) uint16_t w16[1024];
+    kv_pair16<kGgml>(gc[0], gc[1], s8_of(e01), w16);
+    kv_pair16<kGgml>(gc[2], gc[3], s8_of(e23), w16 + 512);
+    for (int i = 0; i < rows; ++i) add_round16<4>(acc[i], w16, xr[i]);
+}
+
+/* gemv_avx2_t for 2 .. kGemvRows rows: x transposed once a row, the full rounds through
+ * add_round_rows, each row's last, partial round (down's eight blocks) on its own. */
+template <bool kGgml>
+void gemv_avx2_rows_t(const Mx& w, const uint16_t* const* x, uint16_t* const* y, int rows, int n0, int n1) {
+    constexpr size_t BS = kGgml ? 17 : 16, SS = kGgml ? 17 : 1;
+    const int UK = w.K / 32, R = (UK + 31) / 32, RF = UK / 32;
+    struct alignas(32) X8 { float f[8]; };
+    thread_local std::vector<X8> xbuf;
+    xbuf.resize((size_t)kGemvRows * R * 128);
+    float* xt[kGemvRows];
+    for (int i = 0; i < rows; ++i) {
+        xt[i] = xbuf.data()->f + (size_t)i * R * 1024;
+        x_lanes(x[i], UK, xt[i]);
+    }
+    for (int n = n0; n < n1; ++n) {
+        const uint8_t* const codes = kGgml ? w.blocks + (size_t)n * UK * 17 + 1 : w.codes + (size_t)n * (size_t)(w.K / 2);
+        const uint8_t* const scl = kGgml ? codes - 1 : w.scales + (size_t)n * UK;
+        __m256 acc[kGemvRows][4];
+        for (int i = 0; i < rows; ++i)
+            for (int g = 0; g < 4; ++g) acc[i][g] = _mm256_setzero_ps();
+        for (int r = 0; r < RF; ++r) {
+            const size_t u0 = (size_t)r * 32;
+            const uint8_t* const gc[4] = { codes + u0 * BS, codes + (u0 + 8) * BS, codes + (u0 + 16) * BS, codes + (u0 + 24) * BS };
+            const uint8_t* const gs[4] = { scl + u0 * SS, scl + (u0 + 8) * SS, scl + (u0 + 16) * SS, scl + (u0 + 24) * SS };
+            const float* xr[kGemvRows];
+            for (int i = 0; i < rows; ++i) xr[i] = xt[i] + (size_t)r * 1024;
+            add_round_rows<kGgml>(acc, gc, gs, xr, rows);
+        }
+        for (int i = 0; i < rows; ++i) {
+            if (RF < R) add_tail<kGgml>(acc[i], codes, scl, 32 * RF, UK, xt[i] + (size_t)RF * 1024);
+            y[i][n] = bf16_rne_nan(wave_sum4(acc[i]));
+        }
+    }
+}
+
 #undef HX_INLINE
 #if defined(__clang__)
 #pragma clang attribute pop
@@ -468,6 +528,15 @@ void gemv_ref(const Mx& w, const uint16_t* x, uint16_t* y, int n0, int n1) {
 void gemv_avx2(const Mx& w, const uint16_t* x, uint16_t* y, int n0, int n1) {
     if (w.blocks) gemv_avx2_t<true>(w, x, y, n0, n1);
     else gemv_avx2_t<false>(w, x, y, n0, n1);
+}
+
+void gemv_avx2_rows(const Mx& w, const uint16_t* const* x, uint16_t* const* y, int rows, int n0, int n1) {
+    for (int i = 0; i < rows; i += kGemvRows) {
+        const int m = rows - i < kGemvRows ? rows - i : kGemvRows;
+        if (m == 1) gemv_avx2(w, x[i], y[i], n0, n1);
+        else if (w.blocks) gemv_avx2_rows_t<true>(w, x + i, y + i, m, n0, n1);
+        else gemv_avx2_rows_t<false>(w, x + i, y + i, m, n0, n1);
+    }
 }
 
 void swiglu(const float* silu, const uint16_t* gu, uint16_t* y, int n, float limit) {

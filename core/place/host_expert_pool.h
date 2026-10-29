@@ -48,7 +48,8 @@ public:
         const uint16_t* x = nullptr;    /* kEmbd bf16 */
         uint16_t*       y = nullptr;    /* kEmbd bf16 */
         /* Up to kMaxRows - 1 more token rows of the same expert: each weight tile is read once for
-         * all of them (it stays in L2), each row's arithmetic unchanged. */
+         * all of them (it stays in L2) and each round of its codes decoded once
+         * (ds41hx::gemv_avx2_rows), each row's arithmetic unchanged. */
         const uint16_t* xs[kMaxRows - 1] = {};
         uint16_t*       ys[kMaxRows - 1] = {};
         int             more = 0;

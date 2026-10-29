@@ -137,6 +137,29 @@ int check() {
         std::printf("%-26s ref planes %zu, avx2 blocks %zu, avx2 planes %zu differing rows of %d  (%zu NaN, %zu Inf)\n",
                     c.name, d1, d2, d3, c.N, nan, inf);
         failures += d1 || d2 || d3;
+        /* gemv_avx2_rows on 2 .. 5 token rows (5: a call of four and one of one), the case's x and
+         * more of its kind: each row as gemv_avx2 gives it, in either layout. */
+        std::vector<std::vector<uint16_t>> xr(5);
+        for (int i = 0; i < 5; ++i)
+            xr[(size_t)i] = i ? make_x(c.K, 31u * (uint64_t)i + (uint64_t)c.K + 3u * (uint64_t)c.act, c.act) : x;
+        size_t dr = 0;
+        for (int rows = 2; rows <= 5; ++rows)
+            for (int lay = 0; lay < 2; ++lay) {
+                const Mx mx = lay ? m.planes() : m.ggml();
+                std::vector<std::vector<uint16_t>> one((size_t)rows, std::vector<uint16_t>((size_t)c.N)),
+                                                   many((size_t)rows, std::vector<uint16_t>((size_t)c.N, 0xffff));
+                const uint16_t* xs[5];
+                uint16_t* ys[5];
+                for (int i = 0; i < rows; ++i) {
+                    gemv_avx2(mx, xr[(size_t)i].data(), one[(size_t)i].data(), 0, c.N);
+                    xs[i] = xr[(size_t)i].data();
+                    ys[i] = many[(size_t)i].data();
+                }
+                gemv_avx2_rows(mx, xs, ys, rows, 0, c.N);
+                for (int i = 0; i < rows; ++i) dr += diff(one[(size_t)i], many[(size_t)i]);
+            }
+        std::printf("%-26s avx2 rows 2..5, both layouts: %zu differing values\n", c.name, dr);
+        failures += dr != 0;
     }
     /* A whole expert: gate_up, swiglu_clamped and down, scalar vs AVX2 at four threads. */
     const Mat gu = make_mat(2 * kFf, kEmbd, 7u, kReal), dn = make_mat(kEmbd, kFf, 8u, kReal);

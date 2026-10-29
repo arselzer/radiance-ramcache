@@ -256,8 +256,10 @@ void HostExpertPool::tile(Slot& s, uint32_t gen, int k) {
         m.K = kEmbd;
         if (planes) { m.codes = s.job.gu; m.scales = s.job.gu_scales; }
         else m.blocks = s.job.gu;
-        for (int r = 0; r <= s.job.more; ++r)
-            ds41hx::gemv_avx2(m, r ? s.job.xs[r - 1] : s.job.x, s.gate_up[r], k * kTile, (k + 1) * kTile);
+        const uint16_t* xs[kMaxRows];
+        uint16_t* ys[kMaxRows];
+        for (int r = 0; r <= s.job.more; ++r) { xs[r] = r ? s.job.xs[r - 1] : s.job.x; ys[r] = s.gate_up[r]; }
+        ds41hx::gemv_avx2_rows(m, xs, ys, 1 + s.job.more, k * kTile, (k + 1) * kTile);
         if (s.gu_left.fetch_sub(1, std::memory_order_acq_rel) == 1) {
             for (int r = 0; r <= s.job.more; ++r)
                 ds41hx::swiglu(silu_.data(), s.gate_up[r], s.act[r], kFf, limit_);
@@ -271,8 +273,10 @@ void HostExpertPool::tile(Slot& s, uint32_t gen, int k) {
     m.K = kFf;
     if (planes) { m.codes = s.job.dn; m.scales = s.job.dn_scales; }
     else m.blocks = s.job.dn;
-    for (int r = 0; r <= s.job.more; ++r)
-        ds41hx::gemv_avx2(m, s.act[r], r ? s.job.ys[r - 1] : s.job.y, d * kTile, (d + 1) * kTile);
+    const uint16_t* xs[kMaxRows];
+    uint16_t* ys[kMaxRows];
+    for (int r = 0; r <= s.job.more; ++r) { xs[r] = s.act[r]; ys[r] = r ? s.job.ys[r - 1] : s.job.y; }
+    ds41hx::gemv_avx2_rows(m, xs, ys, 1 + s.job.more, d * kTile, (d + 1) * kTile);
     if (s.dn_left.fetch_sub(1, std::memory_order_acq_rel) != 1) return;
     /* The job's last tile: nothing reads the slot after this. */
     Ticket* t = s.ticket;

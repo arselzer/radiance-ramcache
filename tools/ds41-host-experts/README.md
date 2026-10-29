@@ -79,7 +79,10 @@ radiance ... --tp 4 --placement expert_tiered --weights-disk-tier \
 ## Correctness
 
 Each row the CPU computes uses the card's arithmetic: the same lane and block order, butterfly,
-BF16 rounding and no fused multiply-add. `POLICY=verify` compared 31,670 rows with the card's (and
+BF16 rounding and no fused multiply-add. A job of several token rows decodes each round of codes
+once for all of them (`gemv_avx2_rows`). Each row's sums still see the same operations in the same
+order, so the bits do not change, and an extra row costs 0.37–0.46 of a row instead of 0.52–0.62
+(40 threads, experts streamed from DRAM). `POLICY=verify` compared 31,670 rows with the card's (and
 28,413 with the plane mirror's bytes) with no difference. Every A/B arm's replies are compared with
 the base engine's; the final configuration also matched it on 16 chat-framed prompts, on the eight
 prompts three times on one server, and on 256-token replies.

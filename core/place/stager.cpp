@@ -1087,6 +1087,14 @@ void FileStager::hx_choose(int32_t li) {
             for (int e = 0; e < 96; ++e)
                 if (pred[e] && !sel[e] && !mover_->unit_cached(hx_unit_of_[(size_t)li][(size_t)e]))
                     ++hx_stats_.pred_wasted;
+            for (int k = 0; k < hx_pred_->k() && k < 16; ++k) {
+                const int e = g[k] - base;
+                if (e < 0 || e >= 96 || hx_unit_of_[(size_t)li][(size_t)e] < 0 ||
+                    mover_->unit_cached(hx_unit_of_[(size_t)li][(size_t)e]))
+                    continue;
+                ++hx_stats_.pred_pos_unc[k];
+                hx_stats_.pred_pos_hit[k] += sel[e];
+            }
         }
     }
     int n_cpu = 0;

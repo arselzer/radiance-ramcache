@@ -275,6 +275,9 @@ public:
         uint64_t pred_layers = 0, pred_ready = 0, pred_misses = 0, pred_hit = 0;
         uint64_t pred_file = 0, pred_selected = 0;
         uint64_t pred_wasted = 0;   /* predicted file-tier experts not selected and not cached */
+        /* By the prediction's rank (best first): uncached file-tier experts predicted, and of them
+         * the ones the layer selected -- a read-ahead's precision at each rank. */
+        uint64_t pred_pos_unc[16] = {}, pred_pos_hit[16] = {};
         /* Read-ahead (..._PREFETCH=on): units read ahead, of them used by a miss, the misses that
          * found theirs still being read and how long they waited. */
         uint64_t pf_read = 0, pf_used = 0, pf_waited = 0, pf_wait_ns = 0;

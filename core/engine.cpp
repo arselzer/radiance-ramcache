@@ -139,6 +139,15 @@ Engine::~Engine() {
                      (unsigned long long)hx.pred_file, (unsigned long long)hx.pred_selected,
                      hx.pred_file ? 100.0 * (double)hx.pred_selected / (double)hx.pred_file : 0.0,
                      (unsigned long long)hx.pred_wasted);
+        if (hx.pred_layers) {
+            std::string pos;
+            for (int k = 0; k < 16 && hx.pred_pos_unc[k]; ++k)
+                pos += fmt(" %d:%llu/%llu", k + 1, (unsigned long long)hx.pred_pos_hit[k],
+                           (unsigned long long)hx.pred_pos_unc[k]);
+            if (!pos.empty())
+                RAD_INFO("next-layer predictor, uncached predictions by rank (selected/predicted):%s",
+                         pos.c_str());
+        }
         if (hx.pf_read)
             RAD_INFO("read-ahead: %llu units read ahead, %llu used by a miss (%.1f%%); %llu misses "
                      "waited for theirs, %.1f ms in all",

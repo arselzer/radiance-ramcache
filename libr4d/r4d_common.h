@@ -279,10 +279,11 @@ __device__ __forceinline__ uint2 swap16_u2p(uint2 v) {
 // below are those crossovers.
 //
 // The width also decides which columns a thread folds into a norm's sum of squares, so a row's bits
-// change with it. Under RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=1 (r4d_ds41_tall.h) every height takes
-// the width rows up to 32 get, so a norm gives a row the same bits in a pass of any height; it costs
-// the residency cliff above 32 rows, a few microseconds a norm at the 48 rows that switch serves.
-// Every caller is a host launcher, which is where the switch is read.
+// change with it. Under RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=1 or RADIANCE_EXPERIMENTAL_DS41_LCP
+// (r4d_ds41_tall.h) every height takes the width rows up to 32 get, so a norm gives a row the same
+// bits in a pass of any height; it costs the residency cliff above 32 rows, a few microseconds a norm
+// at the 48 rows EXACT_TALL serves, a few milliseconds a 1024-row chunk under LCP. Every caller is a
+// host launcher, which is where the switch is read.
 __host__ __device__ __forceinline__ int r4d_act_threads(int M, int K) {
 #if !defined(__HIP_DEVICE_COMPILE__)
     if (r4d_ds41_exact_tall()) return 1024;

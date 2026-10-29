@@ -28,6 +28,19 @@
  *                                                      17..100 rows against the same rows one at a
  *                                                      time and in launches of 16. Every value equal
  *                                                      or FAIL.
+ *   ds41_mxfp4_device_check LIBR4D.so lcp [C] [trials] RADIANCE_EXPERIMENTAL_DS41_LCP=C (default 1024,
+ *                                                      set here; EXACT_TALL unset): `tall` at chunk
+ *                                                      heights up to C (the twin's reach must cover
+ *                                                      C), the sparse ops also as the suffix launches
+ *                                                      a per-row consumer cut issues, then `sweep` at
+ *                                                      heights up to 2048 with gemm_nt by the row the
+ *                                                      table resolves at each height (m16 / m64 /
+ *                                                      tiled) and gemm_nt_f32 over the router's 384
+ *                                                      columns and its 96-column slices.
+ *   ds41_mxfp4_device_check LIBR4D.so sweep [trials]   the height sweep under EXACT_TALL, or under
+ *                                                      RADIANCE_EXPERIMENTAL_DS41_LCP when that is in
+ *                                                      the environment (its heights); sweep0 without
+ *                                                      either switch.
  *
  * Needs a free card (HIP device 0 unless HIP_VISIBLE_DEVICES says otherwise). Uses the
  * live-tail ranges as the measured runs do (RADIANCE_EXPERIMENTAL_DS41_LIVE_TAIL=1), except `tall`,
@@ -57,6 +70,8 @@ using namespace ds41hx;
 namespace {
 
 constexpr int kEmbd = 5120, kFf = 2304, kNe = 96, kTop = 6;
+/* `lcp`, or `sweep` with RADIANCE_EXPERIMENTAL_DS41_LCP in the environment: the chunk C (0 otherwise). */
+int g_lcp = 0;
 constexpr float kLimit = 10.0f;
 typedef int (*Launch)(const RadArgs*, RadStream);
 
@@ -75,6 +90,8 @@ struct Lib {
     /* For `sweep`: the other ops whose launcher reads the pass height. */
     Launch rmsnorm = nullptr, collapse_norm = nullptr, post_collapse_norm = nullptr, norm_rope = nullptr,
            mix = nullptr, gemm64 = nullptr, logits = nullptr;
+    /* For `lcp`: gemm_nt's other rows and the f32 projection (the router and the compressor). */
+    Launch gemm16 = nullptr, gemm_tiled = nullptr, gemm_f32 = nullptr;
     int (*count)(void) = nullptr;
     const RadKernelInfo* (*at)(int) = nullptr;
     explicit Lib(const char* path) {
@@ -95,6 +112,9 @@ struct Lib {
         mix = (Launch)dlsym(h, "r4d_rad_mhc_mix");
         gemm64 = (Launch)dlsym(h, "r4d_rad_gemm_bf16_m64");
         logits = (Launch)dlsym(h, "r4d_rad_logits_gemm");
+        gemm16 = (Launch)dlsym(h, "r4d_rad_gemm_bf16_m16");
+        gemm_tiled = (Launch)dlsym(h, "r4d_rad_gemm_bf16_tiled");
+        gemm_f32 = (Launch)dlsym(h, "r4d_rad_gemm_nt_f32");
         count = (int (*)(void))dlsym(h, "rad_kernel_count");
         at = (const RadKernelInfo* (*)(int))dlsym(h, "rad_kernel_at");
         if (!moe) { std::fprintf(stderr, "%s lacks r4d_rad_moe_gemm_mxfp4_gemv\n", path); std::exit(2); }
@@ -846,9 +866,10 @@ int tall_row_table(const Lib& L, long long* reach) {
         }
     const bool ok = tall->launch == L.moe_tall && m_le == 1 && *reach > 16 && tall->priority == gemv->priority - 1 &&
                     tall->n_constraints == gemv->n_constraints && tall->layout == gemv->layout &&
-                    tall->relayout == gemv->relayout;
-    std::printf("%s: row table: %s, priority %d (the gemv's %d), %d constraints, M up to %lld\n",
-                ok ? "PASS" : "FAIL", tall->name, tall->priority, gemv->priority, tall->n_constraints, *reach);
+                    tall->relayout == gemv->relayout && (!g_lcp || *reach >= g_lcp);
+    std::printf("%s: row table: %s, priority %d (the gemv's %d), %d constraints, M up to %lld%s\n",
+                ok ? "PASS" : "FAIL", tall->name, tall->priority, gemv->priority, tall->n_constraints, *reach,
+                g_lcp ? (" (LCP: at least " + std::to_string(g_lcp) + ")").c_str() : "");
     return ok ? 0 : 1;
 }
 
@@ -1136,6 +1157,20 @@ size_t tall_sparse(const Lib& L, hipStream_t s, int M, int H, size_t* rows_check
     std::vector<float> sc;
     if (sparse_launch(L, s, f, 0, M, &out, &sc) < 0) { std::printf("FAIL: a sparse launch refused M=%d\n", M); return (size_t)1 << 40; }
     size_t differ = 0;
+    /* The suffixes a per-row consumer cut launches: rows [r0, M) for r0 on the 16-row grid. */
+    for (int r0 : { 16, M / 2 / 16 * 16, (M - 1) / 16 * 16 }) {
+        if (r0 <= 0 || r0 >= M) continue;
+        std::vector<uint16_t> o2;
+        std::vector<float> s2;
+        if (sparse_launch(L, s, f, r0, M, &o2, &s2) < 0) { std::printf("FAIL: a sparse launch refused\n"); return (size_t)1 << 40; }
+        const size_t da = count_diff(&out[(size_t)r0 * f.H * f.D], o2.data(), o2.size());
+        size_t ds = 0;
+        for (size_t i = 0; i < s2.size(); ++i) ds += std::memcmp(&sc[(size_t)r0 * f.C + i], &s2[i], 4) != 0;
+        if ((da || ds) && differ < 4)
+            std::printf("  M=%d H=%d suffix %d..%d: attention %zu, index score %zu differing values\n", M, H, r0,
+                        M - 1, da, ds);
+        differ += da + ds;
+    }
     for (int cut : { 1, 16 })
         for (int r0 = 0; r0 < M; r0 += cut) {
             const int r1 = std::min(M, r0 + cut);
@@ -1180,8 +1215,12 @@ int tall_check(const Lib& L, const std::vector<int>& Ts) {
         return 1;
     }
     size_t sp_bad = 0, sp_rows = 0;
+    std::vector<int> sp_heights = { 17, 24, 33, 40, 47, 48, 64, 100 };
+    if (g_lcp)
+        for (int M : { 49, 65, 128, 171, 256, 512, 1000, 1024 })
+            if (M <= g_lcp) sp_heights.push_back(M);
     for (int H : { 16, 32 })
-        for (int M : { 17, 24, 33, 40, 47, 48, 64, 100 }) {
+        for (int M : sp_heights) {
             size_t rows = 0;
             const size_t d = tall_sparse(L, s, M, H, &rows);
             std::printf("attn_sparse_sink (%d heads) + index_score M=%3d: %zu rows against single rows and launches "
@@ -1189,8 +1228,8 @@ int tall_check(const Lib& L, const std::vector<int>& Ts) {
             sp_bad += d;
             sp_rows += rows;
         }
-    std::printf("%s: sparse attention and index score at 17..100 rows equal their rows launched alone and 16 at a "
-                "time (%zu rows)\n", sp_bad ? "FAIL" : "PASS", sp_rows);
+    std::printf("%s: sparse attention and index score at 17..%d rows equal their rows launched alone, 16 at a "
+                "time and as suffixes (%zu rows)\n", sp_bad ? "FAIL" : "PASS", sp_heights.back(), sp_rows);
     rc |= sp_bad ? 1 : 0;
     std::printf(rc ? "FAIL\n" : "PASS: tall passes give 16-token passes' bits on all three ops\n");
     return rc;
@@ -1223,7 +1262,8 @@ struct SweepOp {
     }
 };
 
-constexpr int kSweepRows = 48;
+/* The rows a sweep case holds: 48, or 2048 under LCP (sweep_check). */
+int kSweepRows = 48;
 
 void fill_bf16(Dev* d, std::mt19937_64& rng, float sd, float mean = 0.f) {
     std::normal_distribution<float> nd(mean, sd);
@@ -1381,7 +1421,9 @@ std::unique_ptr<SweepOp> sweep_mix(Launch f, bool scratch, std::mt19937_64& rng)
     Dev* pre = o->buf((size_t)kSweepRows * hc * 4);
     Dev* post = o->buf((size_t)kSweepRows * hc * 4);
     Dev* comb = o->buf((size_t)kSweepRows * hc * hc * 4);
-    Dev* scr = o->buf(4u << 20);
+    /* The split form's partials for every row of the case (libr4d's r4d_rad_mhc_mix_scratch: rows x
+     * chunks of 1024 columns x (mix + 1) floats), as the engine sizes them at the band's top. */
+    Dev* scr = o->buf(std::max<size_t>(4u << 20, (size_t)kSweepRows * ((W + 1023) / 1024) * (mix + 1) * 4));
     fill_bf16(h, rng, 1.0f);
     fill_f32(fn, rng, 0.01f);
     { const float v[3] = { 0.7f, 0.9f, 1.1f }; sc->put(v); }
@@ -1424,6 +1466,64 @@ std::unique_ptr<SweepOp> sweep_gemm(Launch f, int N, int K, std::mt19937_64& rng
     return o;
 }
 
+/* gemm_nt at the row the table resolves at each height (LCP): gemm_bf16_nt_m16 up to 16 rows, the
+ * tiled row above 64 where it serves (N >= 128, K a multiple of 64), gemm_bf16_nt_m64 elsewhere.
+ * ds41's index projection (64 x 5120), its index key (128 x 512) and layer 20's compressor (512 x
+ * 5120). */
+std::unique_ptr<SweepOp> sweep_gemm_rows(const Lib& L, int N, int K, std::mt19937_64& rng) {
+    auto o = std::make_unique<SweepOp>();
+    o->name = "gemm_nt (m16/m64/tiled) N=" + std::to_string(N) + " K=" + std::to_string(K);
+    Dev* A = o->buf((size_t)kSweepRows * K * 2);
+    Dev* Wt = o->buf((size_t)N * K * 2);
+    Dev* C = o->buf((size_t)kSweepRows * N * 2);
+    fill_bf16(A, rng, 1.0f);
+    fill_bf16(Wt, rng, 0.02f);
+    o->outs = { { C, (size_t)N * 2 } };
+    const Launch m16 = L.gemm16, m64 = L.gemm64, tiled = L.gemm_tiled;
+    o->launch = [=](int r0, int m, hipStream_t s) {
+        const Launch f = m <= 16 && m16 ? m16 : (m > 64 && N >= 128 && K % 64 == 0 && tiled ? tiled : m64);
+        RadTensor t[3] = { rows_of(A, RAD_BF16, K, r0, m), tensor(Wt->p, RAD_BF16, { N, K }),
+                           rows_of(C, RAD_BF16, N, r0, m) };
+        RadParam p[4] = { pi("M", m), pi("N", N), pi("K", K), ps("dtype", "bf16") };
+        RadArgs a{};
+        a.t = t; a.n_t = 3; a.p = p; a.n_p = 4;
+        return f(&a, (RadStream)s);
+    };
+    return o;
+}
+
+/* gemm_nt_f32 (bf16 x, f32 weight, f32 out): the router (384 x 5120), and with `parts` 4 the same
+ * outputs as the four 96-column slices the ranks compute once the plugin splits it by columns
+ * (rad_glm_tp.h SplitF32Proj, from 256 rows), each launch into its own columns; the compressor's
+ * kv|gate projection (1024 x 5120). */
+std::unique_ptr<SweepOp> sweep_f32(Launch f, int N, int K, int parts, std::mt19937_64& rng) {
+    auto o = std::make_unique<SweepOp>();
+    o->name = "gemm_nt_f32 N=" + std::to_string(N) + " K=" + std::to_string(K) +
+              (parts > 1 ? " in " + std::to_string(parts) + " column slices" : "");
+    Dev* x = o->buf((size_t)kSweepRows * K * 2);
+    Dev* w = o->buf((size_t)N * K * 4);
+    Dev* y = o->buf((size_t)kSweepRows * N * 4);
+    fill_bf16(x, rng, 1.0f);
+    fill_f32(w, rng, 0.05f);
+    o->outs = { { y, (size_t)N * 4 } };
+    o->launch = [=](int r0, int m, hipStream_t s) {
+        const int cols = N / parts;
+        for (int c = 0; c < parts; ++c) {
+            RadTensor t[3] = { rows_of(x, RAD_BF16, K, r0, m),
+                               tensor((char*)w->p + (size_t)c * cols * K * 4, RAD_F32, { cols, K }),
+                               tensor((char*)y->p + ((size_t)r0 * N + (size_t)c * cols) * 4, RAD_F32, { m, cols }) };
+            t[2].stride[0] = N;
+            RadParam p[4] = { pi("M", m), pi("N", cols), pi("K", K), ps("dtype", "bf16") };
+            RadArgs a{};
+            a.t = t; a.n_t = 3; a.p = p; a.n_p = 4;
+            const int rc = f(&a, (RadStream)s);
+            if (rc < 0) return rc;
+        }
+        return 0;
+    };
+    return o;
+}
+
 /* The lm_head over 1024 vocabulary columns (each rank holds 32320; a column's sum is its own). */
 std::unique_ptr<SweepOp> sweep_logits(Launch f, std::mt19937_64& rng) {
     const int K = kEmbd, V = 1024;
@@ -1450,14 +1550,17 @@ std::unique_ptr<SweepOp> sweep_logits(Launch f, std::mt19937_64& rng) {
  * refused launch. */
 std::vector<std::vector<uint8_t>> sweep_run(SweepOp& o, hipStream_t s, const std::vector<std::pair<int, int>>& runs) {
     for (const SweepOut& q : o.outs) HC(hipMemset(q.d->p, 0xA5, q.d->n));
-    for (const auto& r : runs)
+    int top = 0;   /* the rows the runs cover: only those are read back */
+    for (const auto& r : runs) {
         if (o.launch(r.first, r.second, s) < 0) return {};
+        top = std::max(top, r.first + r.second);
+    }
     HC(hipStreamSynchronize(s));
-    std::vector<std::vector<uint8_t>> rows((size_t)kSweepRows);
+    std::vector<std::vector<uint8_t>> rows((size_t)top);
     for (const SweepOut& q : o.outs) {
-        std::vector<uint8_t> h(q.d->n);
-        q.d->get(h.data());
-        for (int m = 0; m < kSweepRows; ++m)
+        std::vector<uint8_t> h((size_t)top * q.row_bytes);
+        HC(hipMemcpy(h.data(), q.d->p, h.size(), hipMemcpyDeviceToHost));
+        for (int m = 0; m < top; ++m)
             rows[(size_t)m].insert(rows[(size_t)m].end(), h.begin() + (size_t)m * q.row_bytes,
                                    h.begin() + (size_t)(m + 1) * q.row_bytes);
     }
@@ -1471,9 +1574,15 @@ int sweep_check(const Lib& L, bool on, int trials) {
         if (tall_row_table(L, &r) != 0) return 1;
         reach = r;
     }
-    const std::vector<int> heights = { 1, 16, 17, 24, 25, 32, 33, 40, 48 };
-    std::printf("sweep: RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL %s; heights up to %lld must give every row its "
-                "bytes launched alone and in launches of 16; %d trials\n", on ? "1" : "unset", reach, trials);
+    std::vector<int> heights = { 1, 16, 17, 24, 25, 32, 33, 40, 48 };
+    if (on && g_lcp) {
+        heights = { 1, 16, 17, 32, 33, 48, 49, 64, 65, 100, 128, 170, 171, 255, 256, 257, 512, 1000, 1024, 2048 };
+        kSweepRows = 2048;
+    }
+    std::printf("sweep: %s; heights up to %lld must give every row its bytes launched alone and in launches of 16; "
+                "%d trials\n", !on ? "RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL unset"
+                : g_lcp ? ("RADIANCE_EXPERIMENTAL_DS41_LCP=" + std::to_string(g_lcp)).c_str()
+                        : "RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL 1", reach, trials);
     hipStream_t s;
     HC(hipStreamCreate(&s));
     int rc = 0;
@@ -1497,7 +1606,25 @@ int sweep_check(const Lib& L, bool on, int trials) {
             ops.push_back(sweep_gemm(L.gemm64, 512, 5120, rng));
         }
         if (L.logits) ops.push_back(sweep_logits(L.logits, rng));
-        if (trial == 0 && ops.size() < 13) {
+        size_t want = 13;
+        if (on && g_lcp) {
+            if (L.gemm16 && L.gemm64 && L.gemm_tiled) {
+                ops.push_back(sweep_gemm_rows(L, 64, 5120, rng));
+                ops.push_back(sweep_gemm_rows(L, 128, 512, rng));
+                ops.push_back(sweep_gemm_rows(L, 512, 5120, rng));
+            }
+            if (L.gemm_f32) {
+                ops.push_back(sweep_f32(L.gemm_f32, 384, 5120, 1, rng));
+                ops.push_back(sweep_f32(L.gemm_f32, 384, 5120, 4, rng));
+                if (trial == 0) ops.push_back(sweep_f32(L.gemm_f32, 1024, 5120, 1, rng));
+            }
+            want += trial == 0 ? 6 : 5;
+            if (trial == 0 && (!L.gemm16 || !L.gemm_tiled || !L.gemm_f32)) {
+                std::printf("FAIL: the plugin lacks some of r4d_rad_gemm_bf16_m16, _gemm_bf16_tiled, _gemm_nt_f32\n");
+                rc = 1;
+            }
+        }
+        if (trial == 0 && ops.size() < want) {
             std::printf("FAIL: the plugin lacks some of r4d_rad_rmsnorm, _mhc_collapse_rmsnorm, "
                         "_mhc_post_collapse_rmsnorm, _rmsnorm_rope_roundtrip, _mhc_mix, _gemm_bf16_m64, _logits_gemm\n");
             rc = 1;
@@ -1554,13 +1681,28 @@ int sweep_check(const Lib& L, bool on, int trials) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc < 3) { std::fprintf(stderr, "usage: %s LIBR4D.so check [trials] [table] | swiglu TABLE | time [LIB2.so] | ptime [T[:P]...] | draft [trials] | tall [T...] | sweep [trials] | sweep0 [trials]\n", argv[0]); return 2; }
+    if (argc < 3) { std::fprintf(stderr, "usage: %s LIBR4D.so check [trials] [table] | swiglu TABLE | time [LIB2.so] | ptime [T[:P]...] | draft [trials] | tall [T...] | lcp [C] [trials] | sweep [trials] | sweep0 [trials]\n", argv[0]); return 2; }
     /* `tall`: the switch before the plugin's row table and its sparse launchers first read it, and
      * the routed GEMM as the A/B's servers run it (no live tail); the other modes as the loop's
      * measured runs ran it. */
-    if (!std::strcmp(argv[2], "tall") || !std::strcmp(argv[2], "sweep"))
+    /* `lcp [C]`: RADIANCE_EXPERIMENTAL_DS41_LCP=C and EXACT_TALL unset, as an Lc arm's server has them;
+     * `sweep` keeps an LCP already in the environment (its heights) instead of setting EXACT_TALL. */
+    if (!std::strcmp(argv[2], "lcp")) {
+        const int c = argc > 3 ? std::atoi(argv[3]) : 1024;
+        if (c < 64 || c > 2048 || c % 16) { std::fprintf(stderr, "lcp C: a multiple of 16 in 64 .. 2048\n"); return 2; }
+        setenv("RADIANCE_EXPERIMENTAL_DS41_LCP", std::to_string(c).c_str(), 1);
+        unsetenv("RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL");
+        g_lcp = c;
+    } else if (!std::strcmp(argv[2], "sweep") && std::getenv("RADIANCE_EXPERIMENTAL_DS41_LCP") &&
+               std::atoi(std::getenv("RADIANCE_EXPERIMENTAL_DS41_LCP")) >= 64) {
+        g_lcp = std::atoi(std::getenv("RADIANCE_EXPERIMENTAL_DS41_LCP"));
+        unsetenv("RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL");
+    } else if (!std::strcmp(argv[2], "tall") || !std::strcmp(argv[2], "sweep"))
         setenv("RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL", "1", 1);
-    else if (!std::strcmp(argv[2], "sweep0")) unsetenv("RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL");
+    else if (!std::strcmp(argv[2], "sweep0")) {
+        unsetenv("RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL");
+        unsetenv("RADIANCE_EXPERIMENTAL_DS41_LCP");
+    }
     else setenv("RADIANCE_EXPERIMENTAL_DS41_LIVE_TAIL", "1", 1);
     /* The draft check's served entry runs under the switch, read once at the first draft-shaped call. */
     if (!std::strcmp(argv[2], "draft")) setenv("RADIANCE_EXPERIMENTAL_DS41_DRAFT_GEMV", "1", 1);
@@ -1585,6 +1727,16 @@ int main(int argc, char** argv) {
     if (!std::strcmp(argv[2], "time")) {
         if (argc > 3) { const Lib b(argv[3]); return timing(lib, &b); }
         return timing(lib, nullptr);
+    }
+    if (!std::strcmp(argv[2], "lcp")) {
+        std::vector<int> Ts = { 17, 48, 64, 100, 171, 256 };
+        for (int T : { 512, 1024 })
+            if (T <= g_lcp) Ts.push_back(T);
+        int rc = tall_check(lib, Ts);
+        rc |= sweep_check(lib, true, argc > 4 ? std::max(1, std::atoi(argv[4])) : 2);
+        std::printf(rc ? "FAIL: lcp %d\n" : "PASS: lcp %d: tall passes and the height sweep keep 16-token passes' bits\n",
+                    g_lcp);
+        return rc;
     }
     if (!std::strcmp(argv[2], "tall")) {
         std::vector<int> Ts;

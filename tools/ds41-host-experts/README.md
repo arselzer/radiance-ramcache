@@ -39,10 +39,15 @@ RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS=1             # VRAM file buffers t
 RADIANCE_EXPERIMENTAL_DS41_CACHE_WARM=1                    # fill the cache from the profile
 
 radiance ... --tp 4 --placement expert_tiered --weights-disk-tier \
-  --expert-ram-cache-total-mib 98304 --host-pool-mib 1900 \
+  --expert-ram-cache-total-mib 98304 --host-pool-mib 256 \
   --max-num-batched-tokens 16 --expert-profile <decode profile> \
-  --expert-plane-mirror <dir of the checkpoint's model-*.safetensors>   # optional, see below
+  --expert-plane-mirror <dir of the checkpoint's model-*.safetensors> \
+  --expert-plane-mirror-decode-share 0.10                              # the mirror is optional, see below
 ```
+
+With the planner's routed-only staging reserve (`bba1fda6`) the pinned pool needs only 256 MiB a rank,
+which frees ~6.4 GB. Given to the cache instead (`--expert-ram-cache-total-mib 104448`, the RAM the
+earlier 96 GiB + 1900 MiB configuration used): decode +4.3% and TTFT −6% in two runs of three, misses −9%, but with ~8 GB free the third lost 15% when the box ran short of memory (other jobs, the n-gram table's page cache).
 
 The plane mirror is optional and off unless `--expert-plane-mirror` names a directory; nothing in
 the engine or the scripts assumes where the checkpoint is. `ab_window.sh` takes it as
@@ -52,9 +57,9 @@ the engine or the scripts assumes where the checkpoint is. `ab_window.sh` takes 
 |---|---|---|
 | `..._HOST_EXPERTS=N`, `_POLICY=all` | cached experts on the CPU: 5.63 → 5.96 tok/s | `greedy` splits with the copy link (no better); `verify` computes both and compares rows |
 | `..._MISSES=16` | misses on the CPU: 5.96 → 8.89 tok/s | needs the mapped RAM cache |
-| `--host-pool-mib 1900`, cache 96 GiB | +9% | the pinned pool's RAM is worth more as cache; 96 GiB leaves ~8 GiB free (88 GiB: 16.5 GiB free, −4%) |
+| `--host-pool-mib 256`, cache 96 GiB | +9% (vs the 4 GiB pool) | the pinned pool's RAM is worth more as cache; 256 MiB since the planner fix (was 1900); 96 GiB leaves ~14 GiB free (102 GiB: +4.3% in two runs of three, ~8 GiB free, sensitive to other jobs) |
 | `..._NATIVE_CACHE_PREGROW=1` | request 2 TTFT 13.7 → 5.0 s | slabs pinned at startup (+~30 s startup) |
-| `--expert-plane-mirror DIR` | prefill TTFT −7 to −11% | `--expert-plane-mirror-share` (0.18) in passes of `--expert-plane-mirror-min-rows` (2) tokens or more; `--expert-plane-mirror-decode-share` (0) in decode, where 0.10 measured ~+3% once and 0.18 −4%; turns itself off if a read fails or a shard changes; `RADIANCE_EXPERIMENTAL_DS41_PLANE_MIRROR_FAULT=N` tests that |
+| `--expert-plane-mirror DIR` | prefill TTFT −7 to −11% | `--expert-plane-mirror-share` (0.18) in passes of `--expert-plane-mirror-min-rows` (2) tokens or more; `--expert-plane-mirror-decode-share` (0) in decode, where 0.10 measured +3.6% (three runs), 0.14 −1% against 0.10 and 0.18 −4%; turns itself off if a read fails or a shard changes; `RADIANCE_EXPERIMENTAL_DS41_PLANE_MIRROR_FAULT=N` tests that |
 | `..._FILE_BUFFER_UNITS=1` | +9.5% (176 more VRAM experts a rank) | refused unless the CPU takes every routed unit of every pass (all, MISSES=16, passes ≤ 16 tokens) |
 | `..._CACHE_WARM=1` | first request 7.1 → 11.2 tok/s, TTFT 7.9 → 4.6 s | +~14 s startup; pins the slabs first |
 | `..._ASYNC_MISSES=2` | TTFT −25% | decode passes keep the direct path (no gain there) |

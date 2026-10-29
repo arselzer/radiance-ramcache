@@ -359,9 +359,10 @@ __attribute__((noinline)) void add_any_round(__m256 (&acc)[4], const uint8_t* co
 
 /* The last, partial round of a row: blocks u0 .. UK - 1. A group the row ends inside is copied with
  * zero codes and e = 127 after the row's last block: those lanes add 0 * w = 0 (x is 0 there), which
- * leaves a sum as it is (a sum is never -0). */
+ * leaves a sum as it is (a sum is never -0). Inlined: with two callers GCC would call it out of
+ * line, which costs a one-row down projection ~0.5% when compute-bound. */
 template <bool kGgml>
-void add_tail(__m256 (&acc)[4], const uint8_t* codes, const uint8_t* scl, int u0, int UK, const float* xr) {
+HX_INLINE void add_tail(__m256 (&acc)[4], const uint8_t* codes, const uint8_t* scl, int u0, int UK, const float* xr) {
     constexpr size_t BS = kGgml ? 17 : 16, SS = kGgml ? 17 : 1;
     const int nb = UK - u0, ng = (nb + 7) / 8;
     alignas(32) uint8_t pad[8 * 17 + 32];   /* ggml: 8 blocks and room for e_pair's loads */

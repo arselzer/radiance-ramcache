@@ -28,8 +28,9 @@
 # --checkpoint-slots N (auto otherwise); Pcx a finished sequence publishes only the prefill chunks an
 # idle cold prefill cuts alike (RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH: no KV of a short last
 # chunk or a decode step under a later hit). The window prints a Pc arm's prefix-cache startup
-# lines, and at the end each request's TTFT and cached prompt tokens (ab_requests.py --ttft), for a
-# receipt like work/extra-prompts/prefix-chat-receipt.json.
+# lines, and at the end each request's TTFT and cached prompt tokens (ab_requests.py --ttft), for
+# the receipts work/extra-prompts/prefix-chat-receipt.json and pfxlong-receipt.json (U parts
+# Uprefix-chat, Upfxlong; with Lm4096). Put the same arm without Pc first: it is the cold reference.
 #
 # Environment: RADIANCE_BIN (the binary), RADIANCE_HOME_DIR (kernels/ and architectures/ for it),
 # SILU_TABLE (the card's silu table), ARMS (default "base verify greedy"), HX_THREADS (16),

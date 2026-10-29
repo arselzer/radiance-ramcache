@@ -1287,6 +1287,42 @@ TEST(a_slot_pool_regrows_every_slot_a_shrink_dropped) {
     }
 }
 
+/* Expert-tiered placement keeps every dense unit on the card when they fit, so the file tier's
+ * staging is sized for the routed experts alone: a dense layer far wider than an expert no longer
+ * sets it, and a pool too small for that dense layer's slots is accepted. When the dense units do
+ * not fit the card they may spill, the full reserve applies, and the same pool is refused. */
+TEST(planner_sizes_file_staging_for_routed_experts_when_dense_units_stay_on_the_card) {
+    Fixture f;
+    build_moe_layers(f, 2, 8, 1 * MiB, MiB / 2);
+    for (int l = 0; l < 2; ++l)
+        f.op("gemm", { f.weight("blk." + std::to_string(l) + ".attn.weight", 8 * MiB,
+                                RAD_ACCESS_PER_TOKEN, l, -1) }, false);
+
+    Config c = base_config();
+    c.placement = "expert_tiered";
+    c.vram_weights_mib = 40;   /* the embedding, both dense layers and some experts */
+    const int64_t routed = 4 * (MiB + MiB / 2) + RAD_PLACE_FILE_WINDOWS * RAD_PLACE_FILE_WINDOW_BYTES;
+    c.host_pool_mib = (routed + 3 * MiB) / MiB + 1;   /* below 4 x 8 MiB + the windows */
+    c.weights_disk_tier = true;
+    PlannerInput in{&f.prog, &c, 0, 1, nullptr, 0};
+    Plan p;
+    CHECK_OK(Planner(in).plan(&p));
+    CHECK(p.fits());
+    CHECK_EQ(p.file_stage_reserve, routed);
+    int dense = 0, ssd = 0;
+    for (const MoveUnit& mu : p.units) {
+        if (mu.expert < 0 && mu.layer >= 0) { ++dense; CHECK(mu.tier == Tier::VRAM); }
+        if (mu.tier == Tier::SSD) { ++ssd; CHECK(mu.expert >= 0); }
+    }
+    CHECK_EQ(dense, 2);
+    CHECK(ssd > 0);
+
+    c.vram_weights_mib = 12;   /* the dense layers alone do not fit */
+    PlannerInput in2{&f.prog, &c, 0, 1, nullptr, 0};
+    Plan q;
+    CHECK_EQ(Planner(in2).plan(&q), RAD_E_NOMEM);
+}
+
 TEST(file_tier_alignment_is_the_container_alignment) {
     /* O_DIRECT needs aligned offsets, lengths and buffers, and every RadFileEntry offset is
      * RAD_ALIGN_UNIT-aligned, so the fast path needs no head adjustment. */

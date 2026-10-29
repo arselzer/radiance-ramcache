@@ -1264,15 +1264,27 @@ int Planner::plan(Plan* out) {
      * in the host pool, or the fill could exhaust it and the mover refuse the plan. Sized from the
      * widest class carrying a layer unit, the only kind either offload strategy spills; this
      * upper-bounds what the mover computes. A model with routed units also reserves the read
-     * windows, since which units reach the file tier is decided only by the fill below. */
+     * windows, since which units reach the file tier is decided only by the fill below.
+     *
+     * Expert-tiered keeps every non-routed unit on the card when they fit the weight budget
+     * (assign_expert_tiered), so then only routed units can reach the file tier and the slots are
+     * sized from them: a dense layer's unit, hundreds of MiB, never arrives, and pinning room for it
+     * (1.84 GiB a rank on DeepSeek-V4.1) only took RAM from the expert cache. Checked after the fill. */
+    bool routed_only = false;
     if (ssd_) {
-        int64_t widest = 0;
+        int64_t widest = 0, widest_routed = 0, fixed = 0;
         bool routed = false;
         for (const MoveUnit& mu : out->units) {
             if (mu.access == RAD_ACCESS_CONDITIONAL && mu.layer >= 0) routed = true;
+            if (!mu.preplaced() && mu.access != RAD_ACCESS_CONDITIONAL) fixed += mu.slot_bytes;
             if (mu.layer < 0 || mu.slab_class < 0) continue;
-            widest = std::max(widest, out->classes[(size_t)mu.slab_class].stride);
+            const int64_t s = out->classes[(size_t)mu.slab_class].stride;
+            widest = std::max(widest, s);
+            if (mu.access == RAD_ACCESS_CONDITIONAL) widest_routed = std::max(widest_routed, s);
         }
+        routed_only = routed && out->strategy == Strategy::ExpertTiered && out->vram_budget > 0 &&
+                      fixed <= out->vram_budget;
+        if (routed_only) widest = widest_routed;
         const int64_t windows = routed ? (int64_t)RAD_PLACE_FILE_WINDOWS *
                                          RAD_PLACE_FILE_WINDOW_BYTES : 0;
         const int64_t need = file_stage_reserve(widest, routed);
@@ -1298,6 +1310,17 @@ int Planner::plan(Plan* out) {
     // Custom bank mode uses only the remaining explicitly budgeted host pool.
     if (hrc >= 0) hrc = pin_draft_bank_experts(prog, cfg, out);
     int rc = assign(out);
+    /* The staging was sized for routed units only: a fill that still put another unit on the file
+     * tier needs the full reserve, so refuse as the reserve above would have. */
+    if (routed_only && rc >= 0)
+        for (const MoveUnit& mu : out->units)
+            if (mu.tier == Tier::SSD && mu.access != RAD_ACCESS_CONDITIONAL) {
+                RAD_ERR("placement: a non-routed unit of layer %d (%s) reached the file tier, but "
+                        "its staging was sized for routed experts only; raise --host-pool-mib",
+                        (int)mu.layer, humanb(mu.bytes).c_str());
+                rc = RAD_E_NOMEM;
+                break;
+            }
     enforce_op_site_agreement(prog, out);
     schedule_prefetch(out);
     /* After the strategy: it has put the hot set in VRAM, and pinning marks those resident. */

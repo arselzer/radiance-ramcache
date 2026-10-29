@@ -966,6 +966,60 @@ TEST(mapped_packed_actual_mover_inserts_lends_and_keeps_the_card_out){
     CHECK(has(t.mover->report(),"packed RAM cache"));
 }
 
+/* Read-ahead in pieces (place/readahead.h) through the actual HOST Mover: lay_out_unit_planes lays
+ * a unit out exactly as read_unit_planes does, its pieces read through read_piece (the container,
+ * O_DIRECT, 64 KiB pieces, three readers, a demand read holding them back midway) leave the same
+ * codes and scales planes as the demand read, and those planes insert into the RAM cache as the
+ * demand read's would -- packed or not. */
+namespace {
+void read_ahead_case(bool packed){
+    Environment mapped("1","1");std::unique_ptr<PackedEnvironment> pk;if(packed)pk=std::make_unique<PackedEnvironment>();
+    Fixture f;f.experts();f.info.relayout=mx_relayout;Image image(lay_out_mxfp4(f));write_scales(f,image);
+    Config cfg=plan_config(false);Plan plan=planned(f,cfg,true);const auto units=two_ssd_experts(plan);
+    std::atomic<uint64_t> calls{0};Access::Driver driver;Transport t;t.open(f,plan,image,80*MiB,calls);Access::attach(*t.mover,driver);
+    REQUIRE_EQ(t.mover->packed_cache(),packed);
+    auto read=[](void* m,const PlaneExtent& p){return static_cast<Mover*>(m)->read_piece(p.file,p.off,p.len,p.dst,p.cap);};
+    PieceReader r;REQUIRE(r.start(3,64*KiB));
+    for(int32_t u:units){
+        REQUIRE(t.mover->host_planes_eligible(u));
+        Mover::HostPlanes demand,ahead;demand.unit=ahead.unit=u;Mover::HostPlanes* pd=&demand;
+        REQUIRE(t.mover->read_unit_planes(&pd,1,1));
+        PlaneExtent ext[2];REQUIRE(t.mover->lay_out_unit_planes(&ahead,ext));
+        REQUIRE_EQ(ahead.n,2);
+        for(int k=0;k<2;++k){
+            CHECK_EQ(ahead.w[k],demand.w[k]);CHECK_EQ(ahead.rows[k],demand.rows[k]);CHECK_EQ(ahead.cols[k],demand.cols[k]);
+            CHECK_EQ(ahead.a0[k],demand.a0[k]);CHECK_EQ(ahead.len[k],demand.len[k]);
+            CHECK_EQ(ext[k].off,ahead.a0[k]);CHECK_EQ(ext[k].len,ahead.len[k]);CHECK(ext[k].dst==ahead.buf[k]);CHECK_EQ(ext[k].cap,ahead.cap[k]);
+            CHECK(ahead.codes[k]-ahead.buf[k]==demand.codes[k]-demand.buf[k]);
+            CHECK(ahead.scales[k]-ahead.buf[k]==demand.scales[k]-demand.buf[k]);
+        }
+        auto ra=std::make_shared<ReadAheadUnit>(&t,1,ext,2,64*KiB,+read,t.mover.get(),nullptr);
+        r.demand_enter();r.submit(ra);
+        CHECK_EQ(ra->started(),0);           /* held while the demand read is in flight */
+        r.demand_leave();r.wait(*ra);
+        REQUIRE(ra->whole());CHECK_EQ(ra->in(0),ra->pieces(0));CHECK_EQ(ra->in(1),ra->pieces(1));
+        CHECK(t.mover->source_epochs_current());
+        for(int k=0;k<2;++k){
+            const auto& w=f.prog.weights[ahead.w[k]];const size_t codes=size_t(ahead.rows[k]*ahead.cols[k]/2),scales=size_t(ahead.rows[k]*ahead.cols[k]/32);
+            CHECK(std::memcmp(ahead.codes[k],demand.codes[k],codes)==0);CHECK(std::memcmp(ahead.scales[k],demand.scales[k],scales)==0);
+            CHECK(std::memcmp(ahead.codes[k],image.bytes.data()+w.file_plane_offset[0],codes)==0);
+            CHECK(std::memcmp(ahead.scales[k],image.bytes.data()+w.file_plane_offset[1],scales)==0);
+        }
+        std::vector<uint8_t> scratch;
+        CHECK_EQ(t.mover->insert_unit_planes(ahead,&scratch),RAD_OK);
+        const bool over=packed&&plan.units[size_t(u)].expert==1;   /* write_scales: over the down budget */
+        CHECK_EQ(t.mover->unit_cached(u),!over);
+        Mover::HostUnit hu;const bool lent=t.mover->borrow_host_unit(u,&hu);CHECK_EQ(lent,!over);
+        if(lent)t.mover->release_host_unit(&hu);
+    }
+    CHECK_EQ(r.stats().failed,uint64_t(0));
+    CHECK_EQ(t.mover->read_piece(0,0,0,image.bytes.data(),4096),RAD_E_INVAL);
+    t.drain();
+}
+} //namespace
+TEST(mapped_read_ahead_pieces_read_and_insert_as_the_demand_read){read_ahead_case(false);}
+TEST(mapped_packed_read_ahead_pieces_read_and_insert_as_the_demand_read){read_ahead_case(true);}
+
 int main(int argc,char** argv){
 #ifdef RAD_HAVE_HIP
     std::fprintf(stderr,"HOST-only matching fresh Core required; refusing GPU binary.\n");return 2;

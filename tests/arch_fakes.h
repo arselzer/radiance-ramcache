@@ -433,6 +433,10 @@ extern "C" int rad_declare_consumer_suffix(RadBuilder* b, const RadConsumerSuffi
     b->consumer = *d;
     return RAD_OK;
 }
+/* The grain the engine takes (rad_builder.h): the declared one, as the core records it. */
+extern "C" int rad_consumer_row_grain(RadBuilder* b) {
+    return b && b->consumer.n_layer > 0 ? b->consumer.row_grain : 0;
+}
 extern "C" int rad_declare_encoder(RadBuilder* b, const RadEncoderDecl* d) {
     if (!b || !d || !d->name || !d->modalities) return RAD_E_INVAL;
     if (d->modalities == RAD_MM_AUDIO) {

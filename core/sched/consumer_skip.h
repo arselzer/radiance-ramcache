@@ -84,6 +84,7 @@
  * row-by-row dependency simulation over random grids. */
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <vector>
 
@@ -147,5 +148,54 @@ inline int32_t consumer_full_layers(const ConsumerShape& c, const std::vector<in
 /* Whether a checkpoint at `pos` of a prompt cut for `target` holds every layer's window: at or
  * past the target only (see above). */
 inline bool consumer_checkpoint_complete(int64_t pos, int64_t target) { return pos >= target; }
+
+/* ---- the per-row cut (large-chunk prefill) ----------------------------------------------------
+ *
+ * Under RADIANCE_EXPERIMENTAL_DS41_LCP a pass holds up to C = 1024 rows, and the schedule above
+ * derived at M = C cuts almost nothing: lo() steps each layer's threshold back by a whole pass, about
+ * 1,150 rows a layer, so a 3,086-token prompt keeps 3% of its layer-rows cut against the 30% of
+ * 16-row passes. A plugin that can run a layer on a suffix of a pass's rows (RadConsumerSuffix
+ * row_grain = A16, the 16-row grid) gets the 16-row schedule instead, applied to each 16-row group
+ * of the tall pass as if the group were a pass of its own:
+ *
+ *   f = consumer_thresholds({n, B, W, A16, A16}, target)   (the schedule at 16-row passes)
+ *   a group [g, g + A16) of the pass [s, e) (g a multiple of A16, the last group cut at e) runs layer
+ *   L in full when its last row min(g + A16, e) - 1 >= f(L), and layer L's key ops when that row is
+ *   >= f(L - 1) (layer B's on every group), exactly as a 16-row pass [g, min(g + A16, e)) would.
+ *
+ * Those groups are a suffix of the pass for each layer (f does not depend on the group, and a later
+ * group's last row is later), so layer L runs in full on the pass's rows [row0(L), e - s) and its key
+ * ops on [row0(L - 1), e - s) (from 0 at L = B), row0 non-decreasing in L: consumer_row_starts. A
+ * layer with row0 = e - s runs on no row (row0(L) = e - s exactly when e - 1 < f(L), so the first such
+ * layer is consumer_full_layers' F at the pass's last row).
+ *
+ * Why it is exact: each group is a virtual pass on the A16 grid (a real pass starts on the chunk
+ * quantum, which is A16, and ends on it but for the prompt's last, so every group but the prompt's
+ * last is A16 rows and starts on a multiple of A16): the rules the derivation above assumes at M = A =
+ * A16. Every claim of the derivation is about what a row reads and when it was written: (a) a row's
+ * arithmetic does not depend on which other rows share its launch (rows are independent at every
+ * height under LCP's pins), (b) within one tall pass each layer issues its key stores for all of its
+ * key rows before its attention for any row (the plugin's issue order), so a key written by an earlier
+ * group of the same pass is in place, as one written by an earlier pass is, and (c) every per-row
+ * buffer keeps the pass's row index (index selections, keep masks, the angle table). So the (layer,
+ * row) set computed and the keys stored are those of the 16-row schedule, row for row: every computed
+ * row is the base engine's, no row reads an unwritten key, and the windows the next step and a
+ * checkpoint at the target read are complete. tests/consumer_skip_test.cpp checks it against the
+ * row-level simulation, and that the set equals the 16-row passes' own. */
+inline bool consumer_row_starts(const ConsumerShape& c16, const int64_t* f, int64_t s, int64_t e,
+                                int32_t* row0) {
+    if (!c16.valid() || !f || !row0 || e <= s || s < 0) return false;
+    const int64_t A = c16.align, n = e - s;
+    for (int32_t L = 0; L < c16.n_layer; ++L) {
+        if (L < c16.boundary || f[L] < 0) {
+            row0[L] = 0;
+            continue;
+        }
+        const int64_t g = f[L] / A * A;                        /* the group holding row f(L) */
+        const int64_t a = std::min(g + A, e) - 1 >= f[L] ? g : g + A;
+        row0[L] = (int32_t)(a <= s ? 0 : a >= e ? n : a - s);
+    }
+    return true;
+}
 
 }  /* namespace rad */

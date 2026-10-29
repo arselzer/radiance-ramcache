@@ -7884,3 +7884,93 @@ TEST(lcp_is_refused_where_chunks_would_not_be_c_or_share_a_step) {
         CHECK_EQ(rc, (int)RAD_E_INVAL);
     }
 }
+
+/* A lone 3,086-token prompt (and a 6,817-token one) at C = 1,024 with the consumer skip declared at the
+ * 16-row grain: every chunk past the first rows carries the per-row cut of the 16-row schedule for its
+ * target (consumer_row_starts at M = A = 16), the last chunk none that cuts its sampled row, and every
+ * chunk of more than 16 tokens its admission row (the prompt's last 128 tokens); a decode step carries
+ * neither. Without the declared grain the cut is the whole-pass one at M = C. */
+TEST(lcp_steps_carry_the_row_cut_and_the_admission_row) {
+    for (const int64_t n : { 3086, 6817 }) {
+        LcpOn on(1024, 1);
+        Fixture f;
+        lcp_fixture(f, 1024, 2048);
+        f.prog.consumer = RadConsumerSuffix{ (uint32_t)sizeof(RadConsumerSuffix), 16, 4, 64, 16 };
+        f.cfg.consumer_skip = 1;
+        REQUIRE_EQ(f.start(), RAD_OK);
+        REQUIRE(f.sch.consumer_on());
+        REQUIRE_EQ(f.sch.lcp_rows(), (int64_t)1024);
+        const uint64_t id = f.submit((int)n, 2);
+        REQUIRE(id != 0);
+        const ConsumerShape c16{ 16, 4, 64, 16, 16 };
+        int chunks = 0, cut = 0, bad_row0 = 0, bad_admit = 0, decode_marked = 0;
+        int64_t target = -1;
+        for (int k = 0; k < 40; ++k) {
+            const RadBatch* b = f.sch.step();
+            if (!b) break;
+            const StepPlan& p = f.sch.plan();
+            REQUIRE_EQ(p.e.size(), (size_t)1);
+            const StepEntry& e = p.e[0];
+            if (!e.is_prefill) {
+                decode_marked += b->consumer_row0 != nullptr || b->lcp_admit_row != 0 || b->consumer_full != 0;
+                f.commit_plain();
+                continue;
+            }
+            ++chunks;
+            if (target < 0) target = e.consumer_end;
+            CHECK_EQ(e.consumer_end, target);
+            /* The admission row: the chunk's rows inside the prompt's last 128 tokens. */
+            const int32_t want_admit = e.n_tokens > 16
+                ? (int32_t)std::clamp<int64_t>(n - 128 - e.ctx_len, 0, e.n_tokens) : 0;
+            bad_admit += b->lcp_admit_row != want_admit;
+            /* The row cut. */
+            const std::vector<int64_t> th = consumer_thresholds(c16, target);
+            std::vector<int32_t> want(16);
+            REQUIRE(consumer_row_starts(c16, th.data(), e.ctx_len, (int64_t)e.ctx_len + e.n_tokens, want.data()));
+            bool any = false;
+            for (int32_t v : want) any = any || v > 0;
+            int32_t F = 4;
+            while (F < 16 && want[(size_t)F] < e.n_tokens) ++F;
+            any = any || F < 16;
+            if (!any) {
+                bad_row0 += b->consumer_row0 != nullptr;
+            } else {
+                ++cut;
+                if (!b->consumer_row0) { ++bad_row0; }
+                else
+                    for (int L = 0; L < 16; ++L) bad_row0 += b->consumer_row0[L] != want[(size_t)L];
+                bad_row0 += b->consumer_full != (F < 16 ? F : 0);
+                if (e.produces_token) bad_row0 += want[15] > e.n_tokens - 1;
+            }
+            f.commit_plain();
+        }
+        CHECK(chunks >= (int)((n + 1023) / 1024));
+        CHECK(cut >= 2);
+        CHECK_EQ(bad_row0, 0);
+        CHECK_EQ(bad_admit, 0);
+        CHECK_EQ(decode_marked, 0);
+        const BatchBuilder::ConsumerStats& cs = f.sch.consumer_stats();
+        CHECK(cs.rows_skipped > 0);
+        CHECK_EQ(cs.rows_full + cs.rows_key + cs.rows_skipped, (uint64_t)(16 * n));
+    }
+    /* No grain declared: the whole-pass cut (M = C), no row0. */
+    {
+        LcpOn on(1024, 1);
+        Fixture f;
+        lcp_fixture(f, 1024, 2048);
+        f.prog.consumer = RadConsumerSuffix{ (uint32_t)sizeof(RadConsumerSuffix), 16, 4, 64, 0 };
+        f.cfg.consumer_skip = 1;
+        REQUIRE_EQ(f.start(), RAD_OK);
+        REQUIRE(f.sch.consumer_on());
+        const uint64_t id = f.submit(3086, 2);
+        REQUIRE(id != 0);
+        int rows_marked = 0;
+        for (int k = 0; k < 10; ++k) {
+            const RadBatch* b = f.sch.step();
+            if (!b) break;
+            rows_marked += b->consumer_row0 != nullptr;
+            f.commit_plain();
+        }
+        CHECK_EQ(rows_marked, 0);
+    }
+}

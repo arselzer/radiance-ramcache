@@ -369,6 +369,12 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
             c.window = d.window;
             c.max_rows = cfg.max_tok;
             c.align = std::max<int64_t>(geo_.quantum, 1);
+            /* Large-chunk prefill: the cut at M = C keeps almost nothing (consumer_skip.h, the per-row
+             * cut). A plugin that runs a layer on a suffix of a step's rows at the quantum's grain gets
+             * the 16-row schedule in every chunk instead: M = A, each layer on its own rows
+             * (RadBatch::consumer_row0). */
+            const bool rows = lcp_ > 0 && d.row_grain > 0 && d.row_grain == c.align;
+            if (rows) c.max_rows = c.align;
             std::string why;
             /* Every rank cuts on its own declaration (the plugin's cut_on) while the batch's F is
              * rank 0's, so all must have declared the same suffix: one that did not would skip
@@ -378,7 +384,8 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
                 const Program* rp = ranks[i].prog;
                 if (!rp) continue;
                 const RadConsumerSuffix& o = rp->consumer;
-                if (o.n_layer != d.n_layer || o.boundary != d.boundary || o.window != d.window)
+                if (o.n_layer != d.n_layer || o.boundary != d.boundary || o.window != d.window ||
+                    o.row_grain != d.row_grain)
                     odd = (int)i;
             }
             /* KV streaming: a streamed group keeps only a ring of its context on the card, which
@@ -426,18 +433,35 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
                           d.boundary, d.window, (long long)c.max_rows, (long long)c.align);
             if (why.empty()) {
                 cs_on_ = true;
-                builder_.set_consumer(c);
-                RAD_INFO("consumer skip: on (RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP) -- a prompt's "
-                         "pure prefill passes run layers [0, F) in full and layer F's key ops alone, "
-                         "F >= %d of %d, and skip the rest: the rows that reach neither the prompt's "
-                         "last token nor the state after it (window %d, passes of at most %lld rows "
-                         "starting on a %lld-row grid)%s",
-                         d.boundary, d.n_layer, d.window, (long long)c.max_rows, (long long)c.align,
-                         cfg.prefix_cache && geo_.checkpoints()
-                             ? "; a prompt is cut for the deepest checkpoint its idle prefill writes "
-                               "(its tail, else the last interval boundary, else a shared head), and "
-                               "none below it is written"
-                             : "");
+                builder_.set_consumer(c, rows);
+                if (rows)
+                    RAD_INFO("consumer skip: on (RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP), per row -- in a "
+                             "prompt's pure prefill chunks (large-chunk prefill, chunks of %lld) each layer "
+                             "L >= %d of %d runs in full on the chunk's rows from consumer_row0[L] and stores "
+                             "its keys from the layer below's: the %lld-row schedule in every %lld-row group "
+                             "of the chunk (window %d), the rows that reach neither the prompt's last token "
+                             "nor the state after it skipped%s",
+                             (long long)lcp_, d.boundary, d.n_layer, (long long)c.align, (long long)c.align,
+                             d.window,
+                             cfg.prefix_cache && geo_.checkpoints()
+                                 ? "; a prompt is cut for the deepest checkpoint its idle prefill writes, and "
+                                   "none below it is written"
+                                 : "");
+                else
+                    RAD_INFO("consumer skip: on (RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP) -- a prompt's "
+                             "pure prefill passes run layers [0, F) in full and layer F's key ops alone, "
+                             "F >= %d of %d, and skip the rest: the rows that reach neither the prompt's "
+                             "last token nor the state after it (window %d, passes of at most %lld rows "
+                             "starting on a %lld-row grid)%s%s",
+                             d.boundary, d.n_layer, d.window, (long long)c.max_rows, (long long)c.align,
+                             cfg.prefix_cache && geo_.checkpoints()
+                                 ? "; a prompt is cut for the deepest checkpoint its idle prefill writes "
+                                   "(its tail, else the last interval boundary, else a shared head), and "
+                                   "none below it is written"
+                                 : "",
+                             lcp_ > 0 ? "; under large-chunk prefill a whole chunk is cut or not, which keeps "
+                                        "few layer-rows cut (the plugin did not declare the per-row grain)"
+                                      : "");
             } else {
                 RAD_WARN("consumer skip: refused -- %s; every layer runs on every row", why.c_str());
             }

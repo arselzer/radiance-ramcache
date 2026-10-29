@@ -315,6 +315,12 @@ typedef struct RadBatch {
      * borrow read-only and insert nothing. 0 on every other step: everything admitted, as before. */
     int32_t lcp_admit_row;
     int32_t lcp_rsv;               /* zero */
+    /* Host, [n_layer], or null on every step without a per-row cut: under a consumer suffix whose
+     * row_grain the engine took (RadConsumerSuffix, rad_consumer_row_grain), layer L of this step runs
+     * in full on rows [consumer_row0[L], n_tok) only (layers below the boundary always from 0; the
+     * plugin issues layer L's key ops from consumer_row0[L-1]). Every row a layer runs is the base
+     * engine's row. */
+    const int32_t* consumer_row0;
 } RadBatch;
 
 /* What a generator pass carries beside the step batch's own fields, which keep their meanings:

@@ -681,7 +681,8 @@ bool FileStager::begin_pass(const RadBatch* b) {
     pass_tok_ = b->n_tok;
     pass_full_ = b->consumer_full > 0 ? b->consumer_full : INT32_MAX;
     lcp_admit_row_ = lcp_ ? std::max<int32_t>(b->lcp_admit_row, 0) : 0;
-    pass_row0_.clear();
+    if (b->consumer_row0 && n_model_layers_ > 0) pass_row0_.assign(b->consumer_row0, b->consumer_row0 + n_model_layers_);
+    else pass_row0_.clear();
     hx_defer_li_ = -1;
     ++trace_pass_;
     if (rt_) rt_pass(b);

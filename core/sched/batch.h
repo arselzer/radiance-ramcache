@@ -153,13 +153,17 @@ public:
     /* The consumer skip (consumer_skip.h), as the scheduler enabled it: a step whose only entry is
      * a prefill chunk carrying StepEntry::consumer_end gets RadBatch::consumer_full from the
      * declared shape, the chunk's last row and that target. An invalid shape turns it off. */
-    void set_consumer(const ConsumerShape& c);
+    /* `rows`: the per-row cut (consumer_row_starts; the shape is then the 16-row grid's, M = A): a
+     * step carries RadBatch::consumer_row0, each layer's first row. */
+    void set_consumer(const ConsumerShape& c, bool rows = false);
     /* What the cut ran, over the trunk prefill passes of prompts it cut: those passes, the ones
      * cut, the ones that shared their step (run in full), and their layer-passes run in full,
      * key ops alone and skipped. */
     struct ConsumerStats {
         uint64_t passes = 0, cut = 0, shared = 0;
         uint64_t full = 0, key = 0, skipped = 0;
+        /* The per-row cut, over the same passes: layer-rows run in full, key ops alone, skipped. */
+        uint64_t rows_full = 0, rows_key = 0, rows_skipped = 0;
         /* Passes of a cut prompt off the grid the derivation assumes (a start off the quantum, or
          * more rows than the budget): the scheduler makes none, so this stays 0 (a warning names
          * the first). */
@@ -293,6 +297,7 @@ private:
         /* Per rank and group, the RadKVStream a batch names: each rank's own copy, outside the slab. */
         std::vector<std::vector<RadKVStream>>     stream;
         std::vector<RadBatch>                     batch;
+        std::vector<int32_t>                      row0;   /* RadBatch::consumer_row0 (per-row cut) */
     };
 
     struct Derived {
@@ -318,7 +323,7 @@ private:
     /* The consumer skip: the shape, the target `cs_f_` holds the thresholds for (-1: none), and
      * the counters. */
     ConsumerShape cs_{};
-    bool          cs_on_ = false;
+    bool          cs_on_ = false, cs_rows_ = false;
     int64_t       lcp_ = 0, lcp_admit_ = 128;   /* set_lcp */
     int64_t       cs_end_ = -1;
     std::vector<int64_t> cs_f_;

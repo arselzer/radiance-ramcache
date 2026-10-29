@@ -18,7 +18,7 @@
 #
 # Arms are named POLICY[-tN][-gG][-sS][-nP][-mM][-MR][-PsK|-PoK|-PpK][-f][-x] (see the loop below), e.g. "base greedy-t20-g65 all-t24".
 # An arm with an unknown part is skipped, not run without it; F8 (the FP8-stored dense weights) is
-# also checked in the server log.
+# also checked in the server log, and a Vp arm runs only on a libr4d.so VPACK_CHECK passed (below).
 #
 # Environment: RADIANCE_BIN (the binary), RADIANCE_HOME_DIR (kernels/ and architectures/ for it),
 # SILU_TABLE (the card's silu table), ARMS (default "base verify greedy"), HX_THREADS (16),
@@ -192,6 +192,8 @@ arm() {   # name, then env assignments for the server; CACHE_MIB the RAM cache (
   grep -E 'host experts|EP scoped|live chain|error|ERR' "$OUT/$name.server.log" | tail -16 | tee -a "$OUT/window.log"
   grep -E 'read-ahead (in pieces|readers)|router predictor \(' "$OUT/$name.server.log" | tail -6 | tee -a "$OUT/window.log"
   grep -E 'rank 0: on-die reads' "$OUT/$name.server.log" | tee -a "$OUT/window.log"   # Pa/Pm/Pl/Pe: plan, counts
+  # Every arm's VRAM residents a rank; a Vp arm's packed-form lines (what packed, the scan, the load's checks).
+  grep -E 'planned units VRAM=|VRAM packed' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
 }
 
 if [[ "$("${DOCKER[@]}" inspect "$NAME" --format '{{.State.Status}}' 2>/dev/null)" != running ]]; then
@@ -228,22 +230,69 @@ if [[ "${DEVICE_CHECKS:-1}" == 1 && -x "$HERE/build/ds41_mxfp4_device_check" ]];
   if cmp -s "$OUT/silu_recheck.bin" "$SILU"; then log "silu table recaptured identical"; else log "silu table recapture DIFFERS"; fi
 fi
 
-# VPACK_CHECK=<ds41_vpack_device_check binary>: before the arms, libr4d's gemv_vp row against the plain
-# gemv row on card 0, byte for byte, and both timed (VPACK_LIBR4D, default the run home's libr4d.so).
-if [[ -n "${VPACK_CHECK:-}" ]]; then
-  VPL=${VPACK_LIBR4D:-$RHOME/kernels/libr4d.so}
-  if [[ -x "$VPACK_CHECK" ]]; then
-    log "packed VRAM residents: gemv_vp against the plain row on card 0 with $VPL"
+# The Vp arms' gate (RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED). VPACK_CHECK=<ds41_vpack_device_check binary>
+# runs, once for each libr4d.so a Vp arm serves (the first of the arm's run homes holding one, the one its
+# server loads), libr4d's gemv_vp row against the plain gemv row on card 0, byte for byte (`check 48`), and
+# both timed with their outputs compared (`time`). A Vp arm runs only on a libr4d.so (by md5) whose check
+# printed PASS and exited 0, and whose timed outputs matched; without VPACK_CHECK, or after a failure, it is
+# skipped. With RADIANCE_EXPERIMENTAL_DS41_LIVE_TAIL=1 in the window's environment (every server inherits it)
+# the check runs again with the live-tail ranges on (`check 48 tail`), and must pass that way too.
+declare -A VPACK_PASSED=()   # md5 of a checked libr4d.so: 1 passed, 0 failed
+vpack_pass() {   # a check's log: its PASS line and its exit 0
+  grep -q "^PASS: $2" "$1" && grep -qx "vpack $3 exit 0" "$1"
+}
+vpack_check() {   # a libr4d.so: its device check, run once a library; 0 when it passed
+  local lib=$1 md5 tag ok=1
+  md5=$(md5sum < "$lib" | cut -d' ' -f1)
+  if [[ -z "${VPACK_PASSED[$md5]:-}" ]]; then
+    tag=vpack-${md5:0:8}
+    log "packed VRAM residents: gemv_vp against the plain row on card 0 with $lib (md5 $md5)"
     ( export HIP_VISIBLE_DEVICES=0
-      timeout 1200 "$VPACK_CHECK" "$VPL" check 48 >"$OUT/vpack_check.log" 2>&1
-      echo "vpack check exit $?" >>"$OUT/vpack_check.log"
-      timeout 900 "$VPACK_CHECK" "$VPL" time >"$OUT/vpack_time.log" 2>&1
-      echo "vpack time exit $?" >>"$OUT/vpack_time.log" )
-    tail -4 "$OUT/vpack_check.log" | tee -a "$OUT/window.log"
-    tail -15 "$OUT/vpack_time.log" | tee -a "$OUT/window.log"
-  else
-    log "VPACK_CHECK=$VPACK_CHECK is not an executable; no packed-form device check"
+      timeout 1200 "$VPACK_CHECK" "$lib" check 48 >"$OUT/$tag.check.log" 2>&1
+      echo "vpack check exit $?" >>"$OUT/$tag.check.log"
+      if [[ "${RADIANCE_EXPERIMENTAL_DS41_LIVE_TAIL:-}" == 1 ]]; then
+        timeout 1200 "$VPACK_CHECK" "$lib" check 48 tail >"$OUT/$tag.tail.log" 2>&1
+        echo "vpack check exit $?" >>"$OUT/$tag.tail.log"
+      fi
+      timeout 900 "$VPACK_CHECK" "$lib" time >"$OUT/$tag.time.log" 2>&1
+      echo "vpack time exit $?" >>"$OUT/$tag.time.log" )
+    tail -5 "$OUT/$tag.check.log" | tee -a "$OUT/window.log"
+    vpack_pass "$OUT/$tag.check.log" "gemv_vp over packed experts is bit-identical" check || ok=0
+    if [[ "${RADIANCE_EXPERIMENTAL_DS41_LIVE_TAIL:-}" == 1 ]]; then
+      tail -5 "$OUT/$tag.tail.log" | tee -a "$OUT/window.log"
+      vpack_pass "$OUT/$tag.tail.log" "gemv_vp over packed experts is bit-identical" check || ok=0
+    fi
+    tail -22 "$OUT/$tag.time.log" | tee -a "$OUT/window.log"
+    vpack_pass "$OUT/$tag.time.log" "the timed calls' outputs are bit-identical" time || ok=0
+    VPACK_PASSED[$md5]=$ok
+    if (( ok )); then log "packed VRAM residents: device check PASS on $lib; its Vp arms run"
+    else log "packed VRAM residents: the device check did not pass on $lib (see $tag.*.log); its Vp arms are skipped"; fi
   fi
+  [[ "${VPACK_PASSED[$md5]}" == 1 ]]
+}
+vpack_gate() {   # arm name, the libr4d.so it serves; 0 when the arm may run
+  local a=$1 lib=$2
+  if [[ -z "${VPACK_CHECK:-}" || ! -x "${VPACK_CHECK:-}" ]]; then
+    log "arm $a: Vp, but VPACK_CHECK=${VPACK_CHECK:-} is not the packed form's device check; the arm is skipped"
+    return 1
+  fi
+  if [[ ! -f "$lib" ]]; then log "arm $a: Vp, but its run home has no kernels/libr4d.so; the arm is skipped"; return 1; fi
+  vpack_check "$lib" && return 0
+  log "arm $a: Vp, but the device check did not pass on $lib; the arm is skipped"
+  return 1
+}
+# Up front, before any arm runs: each Vp arm's library (its H / H3 part's home, as the loop below picks it,
+# else the run home), so the checks run on idle cards and a failure shows before the window spends its time.
+# The loop's gate then finds each library checked (and checks one this missed).
+if [[ -n "${VPACK_CHECK:-}" && -x "${VPACK_CHECK:-}" ]]; then
+  for a in $ARMS; do
+    [[ "-$a-" == *-Vp-* ]] || continue
+    h=$RHOME
+    [[ "-$a-" == *-H-* ]] && h=${RADIANCE_HOME_DIR2:-$RHOME}
+    [[ "-$a-" == *-H3-* ]] && h=${RADIANCE_HOME_DIR3:-$RHOME}
+    IFS=: read -r -a homes <<< "$h"
+    for hh in "${homes[@]}"; do [[ -f "$hh/kernels/libr4d.so" ]] && { vpack_check "$hh/kernels/libr4d.so"; break; }; done
+  done
 fi
 
 HX=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=$HX_THREADS RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU=$SILU)
@@ -307,15 +356,15 @@ for a in $ARMS; do
 # at its gather (RADIANCE_EXPERIMENTAL_DS41_EARLY_ISSUE; needs all, M16 and B1); Fl the counts and
 # the CPU's rows fetched in one ranged copy instead of four (RADIANCE_EXPERIMENTAL_DS41_FETCH_LIST;
 # needs host experts); rN a repeat (ignored).
+# Vp the cards' static expert residents in the packed-scale form, 4.4% smaller, so ~31 more a rank with F8
+# (RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED; needs a libr4d.so with moe_gemm_ggml_mxfp4_gemv_vp in the arm's
+# run home, --deterministic and passes of at most 16 tokens, which every arm here has); runs only on a
+# libr4d.so VPACK_CHECK's device check passed (vpack_gate above), skipped otherwise.
 # the RAM cache's profile-hot units get N second chances before eviction; MsN a decode pass that
 # misses one unit reads the plane mirror's tail in N pieces on N readers
 # (RADIANCE_EXPERIMENTAL_DS41_MIRROR_SPLIT, 2-4, designed for 3; needs R and RdNN); Mp a one-token
 # pass's miss reads start on the kept readers as soon as the layer's choice is made, before the
 # pool's wake (RADIANCE_EXPERIMENTAL_DS41_MISS_POST); rN a repeat (ignored).
-# Vp the cards' static expert residents in the packed-scale form, ~4.4% smaller so ~26 more a rank
-# (RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED; needs a libr4d.so with moe_gemm_ggml_mxfp4_gemv_vp in the arm's
-# run home, --deterministic and passes of at most 16 tokens, which every arm here has); rN a repeat
-# (ignored).
   IFS=- read -r -a parts <<< "$a"
   pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 HOST_POOL_MIB=4096 EXTRA_ARGS="" ARM_HOME="$RHOME" ARM_CONC=
   power="" skip="" ARGS=() f8="" f8x=""
@@ -381,6 +430,7 @@ for a in $ARMS; do
                [[ $p == Ds[0-9] ]] && env+=(RADIANCE_EXPERIMENTAL_DS41_DSPARK_VERIFY_CAP=${p#Ds})
                [[ $p == Dsa ]] && ARGS+=(--draft-window adaptive) ;;
       K)       env+=(RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE=1) ;;     # the RAM cache packed for the CPU only
+      Vp)      env+=(RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED=1) ;;      # VRAM residents in the packed-scale form (vpack_gate)
       Lm[0-9]*) ARGS+=(--max-model-len "${p#Lm}") ;;   # a longer context (default 512), e.g. for long-prompt TTFT
       Pf)      env+=(RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE=1) ;;   # a prefill chunk alone in its step; decode rows batched
       N[0-9]*) ARGS+=(--max-num-seqs "${p#N}") ;;                     # this arm's --max-num-seqs (MAX_SEQS for every arm)
@@ -396,7 +446,6 @@ for a in $ARMS; do
       Fl)      env+=(RADIANCE_EXPERIMENTAL_DS41_FETCH_LIST=1) ;;       # counts + CPU rows in one ranged copy
       Ms[0-9]) env+=(RADIANCE_EXPERIMENTAL_DS41_MIRROR_SPLIT=${p#Ms}) ;;  # a lone decode miss's mirror tail in N pieces
       Mp)      env+=(RADIANCE_EXPERIMENTAL_DS41_MISS_POST=1) ;;       # miss reads start at the choice, before the pool's wake
-      Vp)      env+=(RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED=1) ;;      # VRAM residents in the packed-scale form
       *)       log "arm $a: unknown part $p; the arm is skipped (it would run without what its name says)"; skip=1 ;;
     esac
   done
@@ -413,6 +462,14 @@ for a in $ARMS; do
     env+=(RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8=1 "RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8_EXCLUDE=$ex")
   else
     env+=(RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8=0)
+  fi
+  # Vp: only on a libr4d.so the packed form's device check passed (vpack_gate), checked here before the
+  # arm's first launch on it; the server loads the first of its homes' kernels/libr4d.so.
+  if [[ -z "$skip" && " ${env[*]} " == *" RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED=1 "* ]]; then
+    vlib=""
+    IFS=: read -r -a homes <<< "$ARM_HOME"
+    for h in "${homes[@]}"; do [[ -f "$h/kernels/libr4d.so" ]] && { vlib=$h/kernels/libr4d.so; break; }; done
+    vpack_gate "$a" "${vlib:-${homes[0]}/kernels/libr4d.so}" || skip=1
   fi
   ARM_F8=$f8
   [[ -n "$skip" ]] && continue

@@ -144,6 +144,18 @@ int vram_pack_scan(const RadFile& file, const VramPackWeight& w, std::vector<uin
     return plan.n_exc;
 }
 
+int64_t vram_pack_query(const RadFile& file, const std::vector<VramPackWeight>& table, rad_weight w, bool scan,
+                        int32_t* cap, int32_t* raw, std::vector<uint8_t>* buf) {
+    if ((size_t)w >= table.size() || table[(size_t)w].bytes <= 0) return 0;
+    const VramPackWeight& v = table[(size_t)w];
+    if (cap) *cap = v.cap;
+    if (!scan) return v.bytes;
+    const int n = vram_pack_scan(file, v, buf);
+    if (raw) *raw = n;
+    /* Unreadable scales (-1) or more raw rounds than the form has room for: the weight stays block_mxfp4. */
+    return n >= 0 && n <= v.cap ? v.bytes : 0;
+}
+
 int vram_pack_weight(const uint8_t* codes, const uint8_t* scales, int N, int K, int cap, uint8_t* dst,
                      int64_t dst_bytes, int* n_exc) {
     if (n_exc) *n_exc = -1;

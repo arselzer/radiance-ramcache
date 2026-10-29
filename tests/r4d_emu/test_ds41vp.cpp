@@ -14,10 +14,16 @@
  * partial one, none at all and nearly all, a form with room to spare (its sections moved); e8m0 edges (0,
  * 1, 2, 127, 254, 255) and NaN, inf and subnormal activations; the release's own scales at the served
  * shapes (the research sample, when its directory is there: DS41_HX_SAMPLE or the default). A marked
- * entry whose header is damaged must give NaN rows and leave every other expert's rows as they were. */
+ * entry whose header is damaged must give NaN rows and leave every other expert's rows as they were.
+ *
+ * `r4d_emu_ds41vp tail` runs every case with the live-tail ranges on (RADIANCE_EXPERIMENTAL_DS41_LIVE_TAIL=1,
+ * which libr4d reads once a process): the cases at their geometry (r4d_ds41_live_tail_policy.h: 96 experts
+ * a rank, top-6, a served or a small checked shape) then take mx_moe's tail branch, gemv_vp's kernel over the
+ * routed rows and mx_tail_zero's over the rows past them, and those rows must be zeros in every output. */
 #include "rad_abi.h"
 #include "rad_plugin.h"
 #include "r4d_plugin.h"
+#include "r4d_ds41_live_tail_policy.h"
 #include "ds41_host_experts.h"
 
 #include <algorithm>
@@ -32,8 +38,13 @@
 #include <vector>
 
 extern const char* emu_last_kernel;
+extern int emu_grids;
 
 namespace {
+
+/* `tail`: the live-tail ranges are on for the whole run; the cases whose launches took the tail branch. */
+bool g_tail = false;
+int g_tail_cases = 0;
 
 uint8_t* aligned_bytes(size_t n) {
     const size_t a = (n + 63) / 64 * 64;
@@ -234,20 +245,45 @@ void check(const Case& c, std::mt19937_64& rng, const std::vector<Expert*>& ex) 
             if (rng() % 97 == 0) v = sp[rng() % (sizeof sp / 2)];
     }
     const char* order = c.sorted ? "sorted" : "token";
+    /* mx_moe's own test of the live-tail geometry, on the arguments `call` passes (tokens is a pass's token
+     * rows in either order); with the ranges on, these launches take the tail branch. */
+    const bool tail = g_tail && ds41_live_tail::geometry(c.tokens, c.N, c.K, ne, c.top_k, r.T, AR, c.sorted);
     std::vector<uint16_t> y_plain, y_vp, y_vp_block;
+    int g0 = emu_grids;
     const int rc1 = call(r4d_rad_moe_gemm_mxfp4_gemv, xin, AR, c.K, plain, c.N, c.top_k, r, order, &y_plain);
+    const int n1 = emu_grids - g0;
     const std::string k1 = emu_last_kernel ? emu_last_kernel : "?";
+    g0 = emu_grids;
     const int rc2 = call(r4d_rad_moe_gemm_mxfp4_gemv_vp, xin, AR, c.K, vp, c.N, c.top_k, r, order, &y_vp);
+    const int n2 = emu_grids - g0;
     const std::string k2 = emu_last_kernel ? emu_last_kernel : "?";
+    g0 = emu_grids;
     const int rc3 = call(r4d_rad_moe_gemm_mxfp4_gemv_vp, xin, AR, c.K, plain, c.N, c.top_k, r, order, &y_vp_block);
+    const int n3 = emu_grids - g0;
+    const std::string k3 = emu_last_kernel ? emu_last_kernel : "?";
     if (rc1 != RAD_OK || rc2 != RAD_OK || rc3 != RAD_OK) {
         std::printf("FAIL %s: the launches returned %d, %d, %d\n", c.name, rc1, rc2, rc3);
         ++fails;
         return;
     }
-    /* gemv_vp's marked-table kernel, and the plain row's own. */
-    if (k2.find("false, true>") == std::string::npos || k1.find("false, true>") != std::string::npos) {
-        std::printf("FAIL %s: the rows ran %s and %s\n", c.name, k1.c_str(), k2.c_str());
+    if (tail) {
+        /* The tail branch: the gemv, then mx_tail_zero's kernel last, in each of the three calls. Which gemv
+         * kernel ran is in the values: the plain kernel would read a marked entry's packed bytes as
+         * block_mxfp4 and give other bits, and a damaged header NaN rows only through gemv_vp's. */
+        const char* z = "mx_zero_tail_kernel";
+        if (n1 != 2 || n2 != 2 || n3 != 2 || k1.find(z) == std::string::npos || k2.find(z) == std::string::npos ||
+            k3.find(z) == std::string::npos) {
+            std::printf("FAIL %s: the live-tail calls launched %d, %d, %d kernels, the last %s, %s, %s\n", c.name,
+                        n1, n2, n3, k1.c_str(), k2.c_str(), k3.c_str());
+            ++fails;
+            return;
+        }
+        ++g_tail_cases;
+    } else if (n1 != 1 || n2 != 1 || n3 != 1 || k2.find("false, true>") == std::string::npos ||
+               k3.find("false, true>") == std::string::npos || k1.find("false, true>") != std::string::npos) {
+        /* One launch each: gemv_vp's marked-table kernel for both of its tables, and the plain row's own. */
+        std::printf("FAIL %s: the rows ran %s (%d launches), %s (%d) and %s (%d)\n", c.name, k1.c_str(), n1,
+                    k2.c_str(), n2, k3.c_str(), n3);
         ++fails;
         return;
     }
@@ -255,12 +291,17 @@ void check(const Case& c, std::mt19937_64& rng, const std::vector<Expert*>& ex) 
     if (damaged_expert >= 0)
         for (int i = r.off[(size_t)damaged_expert]; i < r.off[(size_t)damaged_expert + 1]; ++i)
             damaged_row[(size_t)i] = 1;
-    size_t diff = 0, diff_block = 0, nan_rows = 0, nan_bad = 0, live = 0;
+    size_t diff = 0, diff_block = 0, nan_rows = 0, nan_bad = 0, live = 0, dead = 0, dead_bad = 0;
     for (int i = 0; i < r.T; ++i)
         for (int n = 0; n < c.N; ++n) {
             const size_t at = (size_t)i * c.N + n;
             const uint16_t a = y_plain[at], b = y_vp[at], d = y_vp_block[at];
             if (a != d && !(nan16(a) && nan16(d))) ++diff_block;
+            /* A dropped slot (another rank's expert): past the routed rows, so the tail zeroes it. */
+            if (r.sorted[(size_t)i] < 0) {
+                ++dead;
+                if (tail && (a | b | d)) ++dead_bad;
+            }
             if (damaged_row[(size_t)i]) {
                 if (nan16(b)) ++nan_rows;
                 else ++nan_bad;
@@ -272,14 +313,22 @@ void check(const Case& c, std::mt19937_64& rng, const std::vector<Expert*>& ex) 
                 ++diff;
             }
         }
-    const bool ok = !diff && !diff_block && !nan_bad && (damaged_expert < 0 || nan_rows > 0) && live > 0;
+    const bool ok = !diff && !diff_block && !nan_bad && !dead_bad && (damaged_expert < 0 || nan_rows > 0) &&
+                    live > 0;
+    char what[160];
+    if (tail)
+        std::snprintf(what, sizeof what, "the live-tail branch (its gemv, then %zu dropped slots' values zeroed)",
+                      dead);
+    else
+        std::snprintf(what, sizeof what, "the plain row's kernel %s", k1.c_str());
     std::printf("%s %s: N %d K %d, %d token(s) in %s order, %d of %d entries packed (%d raw rounds), %zu live "
-                "values%s, the plain row's kernel %s\n",
+                "values%s, %s\n",
                 ok ? "pass" : "FAIL", c.name, c.N, c.K, c.tokens, order, packed, ne, raw_rounds, live,
-                damaged_expert >= 0 ? " and the damaged entry's rows NaN" : "", k1.c_str());
+                damaged_expert >= 0 ? " and the damaged entry's rows NaN" : "", what);
     if (!ok) {
         std::printf("  %zu values differ from the plain row, %zu over the block table, %zu of the damaged entry's "
-                    "not NaN (%zu NaN), %zu live\n", diff, diff_block, nan_bad, nan_rows, live);
+                    "not NaN (%zu NaN), %zu live, %zu of the %zu dropped slots' values not zero\n", diff,
+                    diff_block, nan_bad, nan_rows, live, dead_bad, dead);
         ++fails;
     }
 }
@@ -412,14 +461,30 @@ int real_sample(std::mt19937_64& rng) {
     const Case cd2 = { "release scales, down, two tokens, one entry block", kEmbd, kFf, (int)d3.size(), 2, 4, 2,
                        true, 0, 0, 2, 0, false, false };
     check(cd2, rng, d3);
+    /* A rank's whole table, 96 entries (the three experts behind every third), top-6 over all 384: the served
+     * decode calls at the live-tail geometry, so under `tail` the tail branch at the served shapes. */
+    std::vector<Expert*> g96, d96;
+    for (int e = 0; e < 96; ++e) {
+        g96.push_back(g3[(size_t)e % g3.size()]);
+        d96.push_back(d3[(size_t)e % d3.size()]);
+    }
+    const Case cg96 = { "release scales, gate_up, a rank's 96 entries", 2 * kFf, kEmbd, 96, 288, 6, 1, false, 0, 0, 1,
+                        0, false, false };
+    check(cg96, rng, g96);
+    const Case cd96 = { "release scales, down, a rank's 96 entries, every other one block", kEmbd, kFf, 96, 288, 6,
+                        2, true, 0, 0, 2, 0, false, false };
+    check(cd96, rng, d96);
     return (int)g3.size();
 }
 
 }  /* namespace */
 
-int main() {
-    /* The plain row as the A/B serves it: the live-tail ranges off (they are their own switch). */
-    unsetenv("RADIANCE_EXPERIMENTAL_DS41_LIVE_TAIL");
+int main(int argc, char** argv) {
+    /* The rows as the A/B serves them, the live-tail ranges off (their own switch); `tail`, on. libr4d reads
+     * the switch once a process, so each is its own run (ctest: r4d_emu_ds41vp, r4d_emu_ds41vp_tail). */
+    g_tail = argc > 1 && !std::strcmp(argv[1], "tail");
+    if (g_tail) setenv("RADIANCE_EXPERIMENTAL_DS41_LIVE_TAIL", "1", 1);
+    else unsetenv("RADIANCE_EXPERIMENTAL_DS41_LIVE_TAIL");
     /* name, N, K, experts, others', top_k, tokens, sorted, raw, edge, pack every, extra room, damage, special x */
     const Case all[] = {
         { "one full round, decode", 64, 1024, 4, 4, 4, 1, false, 0.05, 0, 1, 0, false, false },
@@ -443,12 +508,26 @@ int main() {
           false },
         { "every third entry block, dropped slots", 56, 1088, 6, 6, 4, 2, false, 0.3, 0, 3, 0, false, false },
         { "a damaged header gives NaN rows", 32, 1024, 4, 0, 4, 2, false, 0.2, 0, 1, 0, true, false },
+        /* The live-tail geometry's small shapes: a rank's 96 experts, top-6 over the 384. */
+        { "live-tail geometry [64, 256], decode", 64, 256, 96, 288, 6, 1, false, 0.3, 0, 1, 0, false, false },
+        { "live-tail geometry [128, 512], four sorted rows, every other entry block", 128, 512, 96, 288, 6, 4,
+          true, 0.2, 0, 2, 0, false, false },
+        { "live-tail geometry, sixteen tokens and a damaged header", 64, 256, 96, 288, 6, 16, false, 0.2, 0, 1, 0,
+          true, false },
     };
     uint64_t seed = 2026;
     for (const Case& c : all) synthetic(c, seed++);
     std::mt19937_64 rng(77);
     const int sampled = real_sample(rng);
-    std::printf("%d case(s), %d failed%s\n", cases, fails,
+    /* Under `tail` the branch must have run: the three small cases, and the two at the served shapes. */
+    const int want_tail = 3 + (sampled ? 2 : 0);
+    if (g_tail && g_tail_cases != want_tail) {
+        std::printf("FAIL the live-tail branch ran in %d case(s), not %d\n", g_tail_cases, want_tail);
+        ++fails;
+    }
+    char tl[96] = "";
+    if (g_tail) std::snprintf(tl, sizeof tl, ", the live-tail ranges on: %d took the tail branch", g_tail_cases);
+    std::printf("%d case(s), %d failed%s%s\n", cases, fails, tl,
                 sampled ? "" : " (the release-scale cases did not run: no sample)");
     return fails ? 1 : 0;
 }

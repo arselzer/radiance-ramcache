@@ -589,9 +589,12 @@ if(R4D_EMU_BUILT)
     add_test(NAME r4d_emu_attn_shard${k}
              COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_attn --shard ${k}/3)
   endforeach()
+  # ds41vp again with the live-tail ranges on (RADIANCE_EXPERIMENTAL_DS41_LIVE_TAIL=1, read once a process):
+  # its cases at the tail's geometry take mx_moe's tail branch, gemv_vp's kernel and then the zeroed tail.
+  add_test(NAME r4d_emu_ds41vp_tail COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_ds41vp tail)
   set_tests_properties(r4d_emu_attn_shard0 r4d_emu_attn_shard1 r4d_emu_attn_shard2 r4d_emu_pick
                        r4d_emu_norm r4d_emu_escale r4d_emu_qsa r4d_emu_lora r4d_emu_mla r4d_emu_moefuse
-                       r4d_emu_dsa r4d_emu_m2xfp4 r4d_emu_bf16f8 r4d_emu_ds41vp
+                       r4d_emu_dsa r4d_emu_m2xfp4 r4d_emu_bf16f8 r4d_emu_ds41vp r4d_emu_ds41vp_tail
                        PROPERTIES LABELS "r4d_emu" TIMEOUT ${RAD_TEST_TIMEOUT})
   # The LoRA pair has a libref oracle, and the test holds the emulated kernels to it when it can
   # load one -- expand bit for bit, shrink to its bound. kda_update is held to libref's within

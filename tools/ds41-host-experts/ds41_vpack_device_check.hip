@@ -3,7 +3,8 @@
  * byte for byte, from a built libr4d.so (core/place/vram_packed.h; the host emulator's twin is
  * tests/r4d_emu/test_ds41vp.cpp).
  *
- *   ds41_vpack_device_check LIBR4D.so check [trials]   the decode chain's two GEMVs at the served shapes,
+ *   ds41_vpack_device_check LIBR4D.so check [trials] [tail]
+ *                                                      the decode chain's two GEMVs at the served shapes,
  *                                                      gate_up [4608, 5120] over token rows and down
  *                                                      [5120, 2304] over sorted rows, 1..3 live experts and
  *                                                      1, 2, 4, 16 tokens; each expert packed exactly as the
@@ -14,11 +15,17 @@
  *                                                      research sample's real scales when its directory is
  *                                                      there (DS41_HX_SAMPLE or the default). Every value of
  *                                                      every row must be the plain row's bits; a damaged
- *                                                      header must give NaN rows. Exit 0 on PASS.
- *   ds41_vpack_device_check LIBR4D.so time              decode GEMV time a call, plain over block_mxfp4 and
- *                                                      gemv_vp over packed, 1..3 live experts, 24 copies
- *                                                      (past the 64 MB on-die cache); the outputs compared
- *                                                      too.
+ *                                                      header must give NaN rows. Exit 0 on PASS. `tail`:
+ *                                                      both rows with the live-tail ranges on
+ *                                                      (RADIANCE_EXPERIMENTAL_DS41_LIVE_TAIL=1, otherwise
+ *                                                      off, as the A/B runs), every call at their geometry,
+ *                                                      and the dropped slots' rows must be zeros in both.
+ *   ds41_vpack_device_check LIBR4D.so time              decode GEMV time a call, plain over block_mxfp4,
+ *                                                      gemv_vp over packed and gemv_vp over block_mxfp4 (a
+ *                                                      table of unmarked entries: what the new kernel costs
+ *                                                      the experts it does not pack), 1..3 live experts, 24
+ *                                                      copies (past the 64 MB on-die cache); the outputs
+ *                                                      compared too.
  *
  * Needs a free card (HIP device 0 unless HIP_VISIBLE_DEVICES says otherwise): run it in a GPU window, as
  * ab_window.sh runs ds41_mxfp4_device_check. Build (as build_hx.sh builds the other harness):
@@ -265,7 +272,8 @@ Route route(std::mt19937_64& rng, int tokens, const std::vector<int>& pool) {
     return r;
 }
 
-int check(const Lib& lib, int trials) {
+/* `tail`: the live-tail ranges are on (main set the switch before the library's first call). */
+int check(const Lib& lib, int trials, bool tail) {
     hipStream_t s;
     HC(hipStreamCreate(&s));
     std::mt19937_64 rng(4141);
@@ -303,7 +311,7 @@ int check(const Lib& lib, int trials) {
         stray.put(junk.data());
     }
     Dev tab_plain(kNe * sizeof(void*)), tab_vp(kNe * sizeof(void*));
-    size_t values = 0, differ = 0, nan_ok = 0, nan_bad = 0, calls = 0;
+    size_t values = 0, differ = 0, nan_ok = 0, nan_bad = 0, calls = 0, dropped = 0, dropped_bad = 0;
     const int token_counts[] = { 1, 2, 4, 16 };
     std::vector<int> pool;
     for (int e = 0; e < kNe; ++e) pool.push_back(e);
@@ -347,6 +355,9 @@ int check(const Lib& lib, int trials) {
             d_x.put(x.data());
             d_sorted.put(r.sorted.data());
             d_off.put(r.off.data());
+            /* Rows no kernel writes stay 0xffff: under `tail` the dropped slots' zeros are the tail kernel's. */
+            HC(hipMemsetAsync(y1.p, 0xff, y1.n, s));
+            HC(hipMemsetAsync(y2.p, 0xff, y2.n, s));
             const char* order = gu ? "token" : "sorted";
             if (run_moe(lib.plain, s, d_x.p, AR, tab_plain.p, N, K, d_sorted.p, d_off.p, y1.p, order, r.T) < 0 ||
                 run_moe(lib.vp, s, d_x.p, AR, tab_vp.p, N, K, d_sorted.p, d_off.p, y2.p, order, r.T) < 0) {
@@ -359,7 +370,16 @@ int check(const Lib& lib, int trials) {
             y1.get(a.data());
             y2.get(b.data());
             for (int i = 0; i < r.T; ++i) {
-                if (r.sorted[(size_t)i] < 0) continue;   /* a dropped slot: zeros in both, not compared */
+                if (r.sorted[(size_t)i] < 0) {
+                    /* A dropped slot (another rank's expert): written by neither row without the live-tail
+                     * ranges, so not compared; with them, zeroed by both (mx_tail_zero). */
+                    if (tail)
+                        for (int n = 0; n < N; ++n) {
+                            ++dropped;
+                            dropped_bad += a[(size_t)i * N + n] != 0 || b[(size_t)i * N + n] != 0;
+                        }
+                    continue;
+                }
                 const bool dmg = damaged_e >= 0 && i >= r.off[(size_t)damaged_e] && i < r.off[(size_t)damaged_e + 1];
                 for (int n = 0; n < N; ++n) {
                     const uint16_t p = a[(size_t)i * N + n], q = b[(size_t)i * N + n];
@@ -378,9 +398,15 @@ int check(const Lib& lib, int trials) {
     }
     std::printf("%zu calls, %zu values compared: %zu differ; damaged headers: %zu values NaN, %zu not\n", calls,
                 values, differ, nan_ok, nan_bad);
-    const bool ok = !differ && !nan_bad && values > 0;
-    std::printf(ok ? "PASS: gemv_vp over packed experts is bit-identical to the plain row over block_mxfp4\n"
-                   : "FAIL\n");
+    if (tail)
+        std::printf("live-tail ranges on: %zu dropped slots' values, %zu not zero in both rows\n", dropped,
+                    dropped_bad);
+    const bool ok = !differ && !nan_bad && values > 0 && !dropped_bad && (!tail || dropped > 0);
+    if (ok)
+        std::printf("PASS: gemv_vp over packed experts is bit-identical to the plain row over block_mxfp4%s\n",
+                    tail ? " (live-tail ranges on)" : "");
+    else
+        std::printf("FAIL\n");
     return ok ? 0 : 1;
 }
 
@@ -416,7 +442,10 @@ int timing(const Lib& lib) {
         for (int which = 0; which < 2; ++which) {
             const bool gu = which == 0;
             const int N = gu ? 2 * kFf : kEmbd, K = gu ? kEmbd : kFf;
-            auto one = [&](bool vp, int it, void* y) {
+            /* mode 0 the plain row over block_mxfp4, 1 gemv_vp over packed entries, 2 gemv_vp over the same
+             * block_mxfp4 entries unmarked (the experts it does not pack: staged, aliased, over budget). */
+            auto one = [&](int mode, int it, void* y) {
+                const bool vp = mode != 0, pk = mode == 1;
                 std::mt19937_64 rr(1000 + it);
                 std::vector<int> pool;
                 for (int e = 0; e < kNe; ++e) pool.push_back(e);
@@ -433,7 +462,7 @@ int timing(const Lib& lib) {
                 std::vector<void*> t(kNe, (gu ? gus : dns)[0]->d_block->p);
                 for (int i = 0; i < live; ++i) {
                     Weight& w = *(gu ? gus : dns)[(size_t)((it * 3 + i) % kCopies)];
-                    t[(size_t)ex[(size_t)i]] = vp ? (void*)((uintptr_t)w.d_packed->p | 1u) : w.d_block->p;
+                    t[(size_t)ex[(size_t)i]] = pk ? (void*)((uintptr_t)w.d_packed->p | 1u) : w.d_block->p;
                 }
                 tab.put(t.data());
                 d_sorted.put(sorted.data());
@@ -448,26 +477,28 @@ int timing(const Lib& lib) {
                 HC(hipEventElapsedTime(&ms, e0, e1));
                 return ms;
             };
-            for (int vp = 0; vp < 2; ++vp) {
-                for (int it = 0; it < 5; ++it) (void)one(vp != 0, it, y1.p);
+            static const char* const kMode[3] = { "plain/block   ", "gemv_vp/packed", "gemv_vp/block " };
+            for (int mode = 0; mode < 3; ++mode) {
+                for (int it = 0; it < 5; ++it) (void)one(mode, it, y1.p);
                 std::vector<float> t;
-                for (int it = 0; it < 60; ++it) t.push_back(one(vp != 0, it, y1.p));
+                for (int it = 0; it < 60; ++it) t.push_back(one(mode, it, y1.p));
                 std::sort(t.begin(), t.end());
                 const double med = t[t.size() / 2];
-                const double bytes = (double)live * (vp ? (double)(gu ? gus : dns)[0]->packed.size()
-                                                        : (double)N * K / 32 * 17);
-                std::printf("%s %s live=%d: median %.1f us, %.0f GB/s of weights\n", vp ? "gemv_vp/packed" : "plain/block   ",
+                const double bytes = (double)live * (mode == 1 ? (double)(gu ? gus : dns)[0]->packed.size()
+                                                               : (double)N * K / 32 * 17);
+                std::printf("%s %s live=%d: median %.1f us, %.0f GB/s of weights\n", kMode[mode],
                             gu ? "gate_up" : "down   ", live, 1e3 * med, bytes / (med * 1e-3) / 1e9);
             }
-            for (int it = 0; it < 20; ++it) {
-                (void)one(false, it, y1.p);
-                (void)one(true, it, y2.p);
-                std::vector<uint16_t> a((size_t)kTop * N), b((size_t)kTop * N);
-                HC(hipMemcpy(a.data(), y1.p, a.size() * 2, hipMemcpyDeviceToHost));
-                HC(hipMemcpy(b.data(), y2.p, b.size() * 2, hipMemcpyDeviceToHost));
-                for (int i = 0; i < live; ++i)
-                    for (int n = 0; n < N; ++n) differ += a[(size_t)i * N + n] != b[(size_t)i * N + n];
-            }
+            for (int it = 0; it < 20; ++it)
+                for (int mode = 1; mode < 3; ++mode) {
+                    (void)one(0, it, y1.p);
+                    (void)one(mode, it, y2.p);
+                    std::vector<uint16_t> a((size_t)kTop * N), b((size_t)kTop * N);
+                    HC(hipMemcpy(a.data(), y1.p, a.size() * 2, hipMemcpyDeviceToHost));
+                    HC(hipMemcpy(b.data(), y2.p, b.size() * 2, hipMemcpyDeviceToHost));
+                    for (int i = 0; i < live; ++i)
+                        for (int n = 0; n < N; ++n) differ += a[(size_t)i * N + n] != b[(size_t)i * N + n];
+                }
         }
     std::printf(differ ? "FAIL: gemv_vp differs from the plain row in %zu values\n"
                        : "PASS: the timed calls' outputs are bit-identical\n", differ);
@@ -478,13 +509,16 @@ int timing(const Lib& lib) {
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        std::fprintf(stderr, "usage: %s LIBR4D.so check [trials] | time\n", argv[0]);
+        std::fprintf(stderr, "usage: %s LIBR4D.so check [trials] [tail] | time\n", argv[0]);
         return 2;
     }
-    /* The rows as the A/B serves them: the live-tail ranges are their own switch, off there. */
-    unsetenv("RADIANCE_EXPERIMENTAL_DS41_LIVE_TAIL");
+    /* The rows as the A/B serves them, the live-tail ranges off (their own switch); `check N tail`, on. libr4d
+     * reads the switch once a process, at its first call, so it is set here, before any. */
+    const bool tail = !std::strcmp(argv[2], "check") && argc > 4 && !std::strcmp(argv[4], "tail");
+    if (tail) setenv("RADIANCE_EXPERIMENTAL_DS41_LIVE_TAIL", "1", 1);
+    else unsetenv("RADIANCE_EXPERIMENTAL_DS41_LIVE_TAIL");
     const Lib lib(argv[1]);
-    if (!std::strcmp(argv[2], "check")) return check(lib, argc > 3 ? std::atoi(argv[3]) : 48);
+    if (!std::strcmp(argv[2], "check")) return check(lib, argc > 3 ? std::atoi(argv[3]) : 48, tail);
     if (!std::strcmp(argv[2], "time")) return timing(lib);
     std::fprintf(stderr, "unknown mode %s\n", argv[2]);
     return 2;

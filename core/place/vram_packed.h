@@ -9,8 +9,9 @@
  * outside the window stored raw beside. 99.975% of the release's scales are 119..121, so with room for
  * 512 raw rounds a gate_up and 320 a down (all but 7 of the 15360 experts fit) an expert is 18,001,920
  * bytes a slot against block_mxfp4's 18,800,640: x1.0444. This holds the card's static residents the
- * same way, so the same weights pool holds ~26 more experts a rank (598/615 -> ~624/642 in the
- * recommended configuration), each a CPU expert or a drive miss fewer for the tokens that route to it.
+ * same way, so the same weights pool holds ~31 more experts a rank (712/720 -> ~743/752 in the
+ * recommended configuration with the FP8 dense weights; 598/615 -> ~624/642 without), each a CPU expert
+ * or a drive miss fewer for the tokens that route to it.
  *
  * ---- how --------------------------------------------------------------------------------------
  *
@@ -31,9 +32,11 @@
  *           for byte and the codes plane is unchanged. A mismatch refuses the load.
  *   issue   Ctx marks a packed weight's table entry with bit 0 (weights are 64-byte aligned).
  *           gemv_vp decodes a marked entry from the packed form and any other as block_mxfp4, by the
- *           same arithmetic in the same order, so every output is the block row's bit for bit
- *           (tests/r4d_emu/test_ds41vp.cpp runs both on the host emulator;
- *           tools/ds41-host-experts/ds41_vpack_device_check.hip on a card).
+ *           same arithmetic in the same order, so every output is the block row's bit for bit, with
+ *           the live-tail ranges (RADIANCE_EXPERIMENTAL_DS41_LIVE_TAIL) off or on
+ *           (tests/r4d_emu/test_ds41vp.cpp runs both on the host emulator, `tail` the second way;
+ *           tools/ds41-host-experts/ds41_vpack_device_check.hip on a card, where ab_window.sh's Vp
+ *           arms run only on a libr4d.so it passed).
  *
  * With the switch off nothing here runs: no fact, so the row never matches; no callback, so the
  * planner charges what it did; no packed weight, so no mark and no packing at load.
@@ -83,6 +86,13 @@ void vram_pack_eligible(const Program& prog, const RadFile& file, const VramPack
 /* The raw rounds w's scales need (ds41hx::pack_plan's n_exc), read from the container into `buf` and
  * dropped from the page cache after; -1 when the read or the plan fails. */
 int vram_pack_scan(const RadFile& file, const VramPackWeight& w, std::vector<uint8_t>* buf);
+
+/* The planner's question (PlannerInput::vram_pack) answered from vram_pack_eligible's table: the bytes
+ * weight `w` takes on the card packed, 0 when it keeps its stored form. Without `scan`, from the table
+ * alone; with it, after vram_pack_scan, so 0 also when its scales need more raw rounds than its room
+ * (`*raw` says how many, -1 when they could not be read). `cap` gets the room. */
+int64_t vram_pack_query(const RadFile& file, const std::vector<VramPackWeight>& table, rad_weight w, bool scan,
+                        int32_t* cap, int32_t* raw, std::vector<uint8_t>* buf);
 
 /* Packs one weight's planes (codes [N, K / 2], scales [N, K / 32]) into dst_bytes (packed_bytes(N, K, cap))
  * at dst and checks the result: the scales' round trip through the kernels' widening, and the codes

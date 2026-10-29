@@ -5536,4 +5536,312 @@ TEST(the_vram_packed_switch_and_its_budget_parse) {
     CHECK_EQ(vram_pack_config(&c), RAD_E_INVAL);
 }
 
+/* ================================================================== which weights may be packed
+ *
+ * vram_pack_eligible decides from the declaration and the container's directory alone, before any scale
+ * is read, and it alone keeps every other reader away from a packed weight's bytes: only a trunk routed
+ * expert's ggml_mxfp4 gate_up or down, read by moe_gemm_ggml tables and nothing else, every band of each
+ * such op resolved to gemv_vp on the card, whole in the container and smaller packed. vram_pack_scan reads
+ * one weight's scales and vram_pack_query is the engine's answer to the planner from both. A container
+ * written by RadWriter, and a Program declared as deepseek41's routed layers are once the layout pass has
+ * chosen libr4d's block_mxfp4: gate_up [64, 1024] (one full round of 32 blocks a row) and down [32, 512]
+ * (a partial round of 16). */
+namespace {
+
+const RadKernelInfo g_vp_info = { kVramPackRow, "moe_gemm_ggml", "moe", "", "", "",
+                                  RAD_DOMAIN_DEVICE, 59, nullptr, 0, nullptr, 0,
+                                  nullptr, nullptr, nullptr, nullptr, nullptr, nullptr };
+const RadKernelInfo g_mx_gemv_info = { "moe_gemm_ggml_mxfp4_gemv", "moe_gemm_ggml", "moe", "", "", "",
+                                       RAD_DOMAIN_DEVICE, 58, nullptr, 0, nullptr, 0,
+                                       nullptr, nullptr, nullptr, nullptr, nullptr, nullptr };
+const RadKernelInfo g_mx_tiled_info = { "moe_gemm_ggml_mxfp4_tiled", "moe_gemm_ggml", "moe", "", "", "",
+                                        RAD_DOMAIN_DEVICE, 57, nullptr, 0, nullptr, 0,
+                                        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr };
+KernelRow g_vp_row, g_mx_gemv_row, g_mx_tiled_row;
+
+constexpr int kVpN[2] = { 64, 32 }, kVpK[2] = { 1024, 512 };   /* gate_up, down */
+
+/* `layers` routed layers of `experts` experts, a gate_up and a down each, written in movement-unit order;
+ * layers at or past `trunk` (meta.n_layers) are a draft head's. Every scale is 120 or 121 but three blocks
+ * of layer 0 expert 0's gate_up, rows 0, 5 and 40: three raw rounds. */
+struct VpModel {
+    Fixture f;
+    RadFile file;
+    std::vector<std::vector<uint8_t>> scales;   /* per weight handle, the e8m0 plane written */
+    std::vector<std::vector<rad_weight>> w;     /* [layer][2 * expert + slot] */
+    bool ok = false;
+
+    VpModel(int layers, int experts, int trunk, const char* name) {
+        g_vp_row.info = &g_vp_info;
+        g_mx_gemv_row.info = &g_mx_gemv_info;
+        g_mx_tiled_row.info = &g_mx_tiled_info;
+        f.prog.meta.n_layers = trunk;
+        RadEncoding enc{};
+        rad_enc_copy_str(enc.scheme, "affine");
+        rad_enc_add_plane(&enc, "codes", RAD_FP4E2M1, 1, 1);
+        rad_enc_add_plane(&enc, "scale", RAD_E8M0, 1, 32);
+        const std::string path = radtest::tmp_path(name);
+        RadWriter writer;
+        if (writer.begin(path.c_str()) != RAD_OK) return;
+        writer.set_arch("deepseek41");
+        writer.meta_i("n_layers", trunk);
+        uint64_t z = 11;
+        auto next = [&] { z = z * 6364136223846793005ull + 1442695040888963407ull; return (uint32_t)(z >> 33); };
+        w.assign((size_t)layers, {});
+        for (int l = 0; l < layers; ++l)
+            for (int e = 0; e < experts; ++e)
+                for (int s = 0; s < 2; ++s) {
+                    const int N = kVpN[s], K = kVpK[s];
+                    const std::string nm = fmt("blk.%d.ffn_%s_exps.%d.weight", l, s ? "down" : "gate_up", e);
+                    const rad_weight h = f.weight(nm, (int64_t)N * (K / 32) * 17, RAD_ACCESS_CONDITIONAL, l, e);
+                    WeightInfo& wi = f.prog.weights[h];
+                    wi.decl.group.slot = s;
+                    wi.source = nm;
+                    wi.enc = enc;
+                    wi.enc_known = true;
+                    wi.n_sel = 2;
+                    wi.sel[0] = 0;
+                    wi.sel[1] = 1;
+                    wi.sel_rows[0] = wi.sel_rows[1] = N;
+                    wi.sel_cols[0] = K;
+                    wi.sel_cols[1] = K / 32;
+                    wi.layout_tag = "ggml_mxfp4";
+                    wi.identity = false;   /* the loader relayouts it to block_mxfp4 */
+                    wi.stored_bytes = (int64_t)N * (K / 32) * 17;
+                    wi.align = 64;
+                    std::vector<uint8_t> codes((size_t)N * K / 2), sc((size_t)N * (K / 32));
+                    for (auto& c : codes) c = (uint8_t)next();
+                    for (auto& v : sc) v = (uint8_t)(120 + (next() & 1));
+                    if (l == 0 && e == 0 && s == 0) {
+                        sc[5] = 200;
+                        sc[(size_t)5 * 32 + 7] = 2;
+                        sc[(size_t)40 * 32 + 31] = 255;
+                    }
+                    RadWriter::Weight rw;
+                    rw.name = nm;
+                    rw.enc = enc;
+                    rw.rank = 2;
+                    rw.shape[0] = N;
+                    rw.shape[1] = K;
+                    rw.layer = l;
+                    rw.expert = e;
+                    rw.slot = s;
+                    const void* planes[2] = { codes.data(), sc.data() };
+                    if (writer.add_weight(rw, planes) < 0) return;
+                    if (scales.size() <= (size_t)h) scales.resize((size_t)h + 1);
+                    scales[(size_t)h] = std::move(sc);
+                    w[(size_t)l].push_back(h);
+                }
+        if (writer.finish() != RAD_OK) return;
+        ok = file.open(path.c_str()) == RAD_OK;
+    }
+    rad_weight at(int l, int e, int s) const { return w[(size_t)l][(size_t)(2 * e + s)]; }
+    /* A moe_gemm_ggml op whose weight table (operand 1) is layer l's gate_ups (s 0) or downs (s 1), a band
+     * a row: up to 16 tokens, then past them; a null row is a band the card has no kernel for. */
+    void op(int l, int s, const std::vector<const KernelRow*>& rows) {
+        OpInfo o;
+        o.op = "moe_gemm_ggml";
+        o.index = (int32_t)f.prog.ops.size();
+        for (size_t k = (size_t)s; k < w[(size_t)l].size(); k += 2) o.weights.push_back(w[(size_t)l][k]);
+        o.weight_opd.assign(o.weights.size(), 1);
+        int64_t hi = 16;
+        for (const KernelRow* r : rows) {
+            Band b;
+            b.hi = hi;
+            b.span = hi == 16 ? "M <= 16" : "M in (16, 1048576]";
+            if (r) b.dom[RAD_DOMAIN_DEVICE].row = r;
+            else b.miss[RAD_DOMAIN_DEVICE] = "no device kernel";
+            o.bands.push_back(b);
+            hi = 1 << 20;
+        }
+        f.prog.ops.push_back(o);
+    }
+};
+
+bool listed(const std::vector<rad_weight>& v, rad_weight w) { return std::find(v.begin(), v.end(), w) != v.end(); }
+
+}  /* namespace */
+
+TEST(vram_pack_eligible_packs_only_what_gemv_vp_tables_alone_read) {
+    VpModel m(3, 4, 2, "vp_eligible.rad");
+    REQUIRE(m.ok);
+    /* Layer 0: both ops gemv_vp. Layer 1: the gate_up op has a band past 16 tokens the tiled row took, so
+     * that band reads its table as block_mxfp4; the down op is gemv_vp, but expert 3's down is also a
+     * dense op's operand. Layer 2: a draft head's experts, though gemv_vp tables read them. */
+    m.op(0, 0, { &g_vp_row });
+    m.op(0, 1, { &g_vp_row });
+    m.op(1, 0, { &g_vp_row, &g_mx_tiled_row });
+    m.op(1, 1, { &g_vp_row });
+    m.f.op("gemm", { m.at(1, 3, 1) }, false);
+    m.op(2, 0, { &g_vp_row });
+    m.op(2, 1, { &g_vp_row });
+    /* Two the gemv_vp tables alone read that the form cannot take: one stored as the container holds it
+     * (the file tier would read it in place), and one this rank holds half of. */
+    m.f.prog.weights[m.at(0, 2, 0)].identity = true;
+    WeightInfo& half = m.f.prog.weights[m.at(0, 3, 1)];
+    half.sel_rows[0] = half.sel_rows[1] = kVpN[1] / 2;
+    half.stored_bytes /= 2;
+
+    VramPackConfig cfg;
+    cfg.on = true;
+    cfg.raw[0] = 16;
+    cfg.raw[1] = 4;
+    std::vector<VramPackWeight> t;
+    std::string why;
+    vram_pack_eligible(m.f.prog, m.file, cfg, &t, &why);
+    REQUIRE(t.size() == m.f.prog.weights.size());
+    const std::vector<rad_weight> want = { m.at(0, 0, 0), m.at(0, 1, 0), m.at(0, 3, 0), m.at(0, 0, 1),
+                                           m.at(0, 1, 1), m.at(0, 2, 1), m.at(1, 0, 1), m.at(1, 1, 1),
+                                           m.at(1, 2, 1) };
+    int packed = 0;
+    for (rad_weight h = 1; (size_t)h < t.size(); ++h) {
+        const VramPackWeight& v = t[(size_t)h];
+        const WeightInfo& wi = m.f.prog.weights[h];
+        if (!listed(want, h)) {
+            if (v.bytes != 0) std::printf("  %s is eligible and should not be\n", wi.name.c_str());
+            CHECK_EQ(v.bytes, (int64_t)0);
+            continue;
+        }
+        ++packed;
+        const int s = wi.decl.group.slot;
+        CHECK_EQ(v.bytes, (int64_t)ds41hx::packed_bytes(kVpN[s], kVpK[s], cfg.raw[s]));
+        CHECK(v.bytes > 0 && v.bytes < wi.stored_bytes);
+        CHECK_EQ(v.cap, cfg.raw[s]);
+        CHECK_EQ(v.N, kVpN[s]);
+        CHECK_EQ(v.K, kVpK[s]);
+        const RadFileEntry* e = m.file.find(wi.source);
+        REQUIRE(e != nullptr);
+        CHECK_EQ(v.scales_off, m.file.plane(*e, 1).offset);
+        CHECK_EQ(v.scales_bytes, (int64_t)kVpN[s] * (kVpK[s] / 32));
+    }
+    CHECK_EQ(packed, 9);
+    /* The startup log says why the rest stay block_mxfp4. */
+    CHECK(why.find("1 routed moe_gemm_ggml op(s) have a band moe_gemm_ggml_mxfp4_gemv_vp does not serve") !=
+          std::string::npos);
+    CHECK(why.find("M in (16, 1048576]: moe_gemm_ggml_mxfp4_tiled") != std::string::npos);
+    CHECK(why.find("10 of the 19 weights the gemv_vp tables read stay block_mxfp4: 8 not a trunk expert's "
+                   "gate_up or down, 1 not ggml_mxfp4 over fp4 codes and e8m0 planes, 1 not whole in the "
+                   "container, 0 no smaller packed") != std::string::npos);
+    if (why.find("10 of the 19") == std::string::npos) std::printf("  why: %s\n", why.c_str());
+
+    /* Room for so many raw rounds that the form is no smaller than block_mxfp4: nothing packs. */
+    cfg.raw[0] = cfg.raw[1] = 64;
+    vram_pack_eligible(m.f.prog, m.file, cfg, &t, &why);
+    for (const VramPackWeight& v : t) CHECK_EQ(v.bytes, (int64_t)0);
+    CHECK(why.find("19 of the 19 weights") != std::string::npos);
+    CHECK(why.find("9 no smaller packed") != std::string::npos);
+
+    /* Off: nothing, and nothing to say. */
+    cfg.on = false;
+    vram_pack_eligible(m.f.prog, m.file, cfg, &t, &why);
+    REQUIRE(t.size() == m.f.prog.weights.size());
+    for (const VramPackWeight& v : t) CHECK_EQ(v.bytes, (int64_t)0);
+    CHECK(why.empty());
+}
+
+TEST(vram_pack_eligible_refuses_a_table_any_other_row_or_position_reads) {
+    VpModel m(2, 2, 2, "vp_readers.rad");
+    REQUIRE(m.ok);
+    /* The plain gemv row (the fact unset), a band past 16 tokens the card has no kernel for (the host's),
+     * and a table position other than the weight table (operand 2) beside gemv_vp tables. */
+    m.op(0, 0, { &g_mx_gemv_row });
+    m.op(0, 1, { &g_vp_row, nullptr });
+    m.op(1, 0, { &g_vp_row });
+    m.f.prog.ops.back().weight_opd[1] = 2;
+    m.op(1, 1, { &g_vp_row });
+    VramPackConfig cfg;
+    cfg.on = true;
+    cfg.raw[0] = 16;
+    cfg.raw[1] = 4;
+    std::vector<VramPackWeight> t;
+    std::string why;
+    vram_pack_eligible(m.f.prog, m.file, cfg, &t, &why);
+    REQUIRE(t.size() == m.f.prog.weights.size());
+    const std::vector<rad_weight> want = { m.at(1, 0, 0), m.at(1, 0, 1), m.at(1, 1, 1) };
+    for (rad_weight h = 1; (size_t)h < t.size(); ++h) {
+        if ((t[(size_t)h].bytes > 0) != listed(want, h))
+            std::printf("  %s: %lld bytes packed\n", m.f.prog.weights[h].name.c_str(),
+                        (long long)t[(size_t)h].bytes);
+        CHECK_EQ(t[(size_t)h].bytes > 0, listed(want, h));
+    }
+    CHECK(why.find("2 routed moe_gemm_ggml op(s) have a band") != std::string::npos);
+    CHECK(why.find("the first: op 0 (M <= 16: moe_gemm_ggml_mxfp4_gemv)") != std::string::npos);
+
+    /* No op reads a weight table: nothing, and the log says so. */
+    Fixture empty;
+    vram_pack_eligible(empty.prog, m.file, cfg, &t, &why);
+    CHECK_EQ(t.size(), (size_t)1);
+    CHECK(why.find("no moe_gemm_ggml op reads a weight table") != std::string::npos);
+}
+
+TEST(the_scan_reads_a_weights_scales_and_the_query_keeps_one_over_its_room_block) {
+    VpModel m(1, 2, 1, "vp_scan.rad");
+    REQUIRE(m.ok);
+    m.op(0, 0, { &g_vp_row });
+    m.op(0, 1, { &g_vp_row });
+    VramPackConfig cfg;
+    cfg.on = true;
+    cfg.raw[0] = 16;
+    cfg.raw[1] = 4;
+    std::vector<VramPackWeight> t;
+    std::string why;
+    vram_pack_eligible(m.f.prog, m.file, cfg, &t, &why);
+    CHECK(why.empty());
+    const rad_weight raw3 = m.at(0, 0, 0), plain = m.at(0, 1, 0), down = m.at(0, 1, 1);
+    REQUIRE(t[raw3].bytes > 0 && t[plain].bytes > 0 && t[down].bytes > 0);
+
+    /* The scan: the raw rounds ds41hx::pack_plan finds in the container's scales, left in buf. */
+    std::vector<uint8_t> buf;
+    CHECK_EQ(vram_pack_scan(m.file, t[raw3], &buf), 3);
+    CHECK(buf == m.scales[raw3]);
+    CHECK_EQ(vram_pack_scan(m.file, t[plain], &buf), 0);
+    CHECK(buf == m.scales[plain]);
+    CHECK_EQ(vram_pack_scan(m.file, t[down], &buf), 0);
+    CHECK(buf == m.scales[down]);
+
+    /* The planner's question: unscanned, the table's answer and nothing read; scanned, the same within
+     * the room. */
+    int32_t cap = -9, raw = -9;
+    CHECK_EQ(vram_pack_query(m.file, t, raw3, false, &cap, &raw, &buf), t[raw3].bytes);
+    CHECK_EQ(cap, 16);
+    CHECK_EQ(raw, -9);
+    CHECK_EQ(vram_pack_query(m.file, t, raw3, true, &cap, &raw, &buf), t[raw3].bytes);
+    CHECK_EQ(raw, 3);
+    CHECK_EQ(vram_pack_query(m.file, t, down, true, &cap, &raw, &buf), t[down].bytes);
+    CHECK_EQ(cap, 4);
+    CHECK_EQ(raw, 0);
+
+    /* Room for two raw rounds: eligible from the declaration, but the scan finds three, so the weight
+     * stays block_mxfp4 (0) and says how many it needs; its neighbour packs. */
+    cfg.raw[0] = 2;
+    std::vector<VramPackWeight> t2;
+    vram_pack_eligible(m.f.prog, m.file, cfg, &t2, &why);
+    REQUIRE(t2[raw3].bytes > 0);
+    CHECK_EQ(vram_pack_query(m.file, t2, raw3, false, &cap, &raw, &buf), t2[raw3].bytes);
+    CHECK_EQ(vram_pack_query(m.file, t2, raw3, true, &cap, &raw, &buf), (int64_t)0);
+    CHECK_EQ(cap, 2);
+    CHECK_EQ(raw, 3);
+    CHECK_EQ(vram_pack_query(m.file, t2, plain, true, &cap, &raw, &buf), t2[plain].bytes);
+    CHECK_EQ(raw, 0);
+
+    /* Not eligible, or past the table: 0, nothing set. */
+    cap = raw = -9;
+    const std::vector<VramPackWeight> none(t.size());
+    CHECK_EQ(vram_pack_query(m.file, none, raw3, true, &cap, &raw, &buf), (int64_t)0);
+    CHECK_EQ(vram_pack_query(m.file, t, (rad_weight)t.size(), true, &cap, &raw, &buf), (int64_t)0);
+    CHECK_EQ(cap, -9);
+    CHECK_EQ(raw, -9);
+
+    /* Unreadable scales (past the container's end) or a plane of the wrong size: -1, and the query keeps
+     * the weight block_mxfp4. */
+    std::vector<VramPackWeight> bad = t;
+    bad[raw3].scales_off = (uint64_t)m.file.size();
+    CHECK_EQ(vram_pack_scan(m.file, bad[raw3], &buf), -1);
+    CHECK_EQ(vram_pack_query(m.file, bad, raw3, true, &cap, &raw, &buf), (int64_t)0);
+    CHECK_EQ(raw, -1);
+    bad[raw3] = t[raw3];
+    bad[raw3].scales_bytes -= 1;
+    CHECK_EQ(vram_pack_scan(m.file, bad[raw3], &buf), -1);
+}
+
 RAD_TEST_MAIN()

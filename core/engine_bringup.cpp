@@ -2081,13 +2081,7 @@ int Engine::plan() {
                          (long long)n_ok, why.empty() ? "" : "; ", why.c_str());
             if (n_ok > 0)
                 in.vram_pack = [&](rad_weight w, bool scan, int32_t* cap, int32_t* raw) -> int64_t {
-                    if ((size_t)w >= vpk.size() || vpk[(size_t)w].bytes <= 0) return 0;
-                    const VramPackWeight& v = vpk[(size_t)w];
-                    if (cap) *cap = v.cap;
-                    if (!scan) return v.bytes;
-                    const int n = vram_pack_scan(*file_, v, &vpk_buf);
-                    if (raw) *raw = n;
-                    return n >= 0 && n <= v.cap ? v.bytes : 0;
+                    return vram_pack_query(*file_, vpk, w, scan, cap, raw, &vpk_buf);
                 };
         }
         Planner planner(in);

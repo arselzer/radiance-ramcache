@@ -84,6 +84,7 @@ the engine or the scripts assumes where the checkpoint is. `ab_window.sh` takes 
 | `..._PREFETCH_ATTN=1` | +2.8% | in the deepseek41 plugin: while the card waits for a layer's CPU rows, lane 1 reads the next layer's q_a, kv, q_b and wo_a (~56 MB a card) into the 64 MB on-die cache (libr4d `prefetch`, read-only); decode passes only, and not ahead of an Engram layer. That stays its behaviour unless one of the three modifiers below is set |
 | `..._PREFETCH_MIB=N`, `..._PREFETCH_SET=k1,k2,..`, `..._PREFETCH_ENGRAM=1` | not yet measured | modifiers of `..._PREFETCH_ATTN=1` (deepseek41 plugin, `arch/deepseek41/ds41_prefetch_plan.h`). `MIB`: a budget of N MiB an issue point, filled in use order (`ekv` engram_kv, `comp` the compressor, `qa`, `kv`, `iq` the indexer's q_b, `qb`, `oa` wo_a's groups, `ob` wo_b, `rt` the f32 router, `sgu`/`sdn` the shared expert's gate\|up and down), the read that crosses it cut to what is left: at bf16 56 MiB is the four reads above plus 2.5 MiB of wo_b; with `..._DENSE_FP8=1`, whose E4M3 codes halve the reads (the four alone are then 26.75 MiB), the whole list through the shared expert (rank 0 55.5 MiB). `SET`: the reads named, in that order (also `iw`, `ik`: the indexer's small projections; `ma`, `mf`: the connections' mixes), whole unless a budget is set. `ENGRAM`: an Engram layer (1, 14) is read too, its engram_kv by the layer before when `ekv` is listed, the rest right behind its Engram GEMM. Each rank prints its plan at startup and its counts at shutdown (`rank R: on-die reads`). Arm parts `PmN`, `Pl<k1+k2+..>`, `Pe` |
 | `..._CACHE_SECOND_CHANCE=N` | N=1 +3.9%, N=2 +5.1% (TTFT −1.5% / +1.2%) | a cached unit the decode profile calls hot (`..._CACHE_PROTECT_SHARE`, default 6 of the sealed profile's 4326 selections a layer: ~1150 units a rank) moves to the front up to N times between uses before an insert may evict it. The held-out prompts share task families with the profile; replayed on the 16 chat prompts too, critical decode misses fell 7.9% (N=1) |
+| `RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED=1` | not yet measured on the engine | the cards' static expert residents in the same packed form (below): 18,001,920 instead of 18,800,640 bytes a unit, so x1.0444 the residents (with F8, 712 / 720 a rank should become ~743 / 752); needs a `libr4d.so` with the row `moe_gemm_ggml_mxfp4_gemv_vp` in the run home, `--deterministic` and passes of at most 16 tokens; `..._VRAM_PACKED_RAW=<gate_up>,<down>` (512,320) sets the raw rounds of room; arm part `Vp`, which runs only on a `libr4d.so` the device check passed (`VPACK_CHECK`, below) |
 | `..._PACKED_CACHE=1` | +3.2% alone, TTFT −5.5%; with `..._CACHE_SECOND_CHANCE=2` 15.52 / 15.48 tok/s (+8.2%) | the RAM cache holds each expert's codes plane plus its e8m0 scales packed to 2 bits from one base a weight (raw rounds beside, budget 512 / 320, `..._PACKED_CACHE_RAW`): x1.0444 slots and 4.4% fewer bytes a CPU hit; 7 of 15,360 experts never fit and stay misses. Refused unless the CPU takes every routed unit (all, M16, B1); the card's copy path never reads or fills it |
 | `RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE=1` | not yet measured on the engine | the RAM cache in a CPU-only packed form: x1.044 the pairs, kernel −8.5% a cached expert (below); refused unless the CPU takes every routed unit (all, M16, B1); arm part `K` |
 | `RADIANCE_EXPERIMENTAL_DS41_CHAIN_OVERLAP=1` (`=2`) | not yet measured on the engine (estimate +1.2 to +3.5%) | in decode passes (in every pass issued live), a device launch whose first dispatch reads nothing the dispatches in flight on its queue write, and writes nothing they read or write, goes without the AQL barrier bit (`core/runtime/live_chain.h`): what `haz_mark` does for recorded passes, which a staged pass never is. Exact: only start order changes. Anything on the queue the issue path did not write (events, waits, copies, table patches) orders the next launch; collectives, kernels without `rad_kernel_concurrent` and host-visible launches never go unordered. Shutdown line `live chain: ...`; arm parts `Ov` / `Ov2` |
@@ -92,7 +93,6 @@ the engine or the scripts assumes where the checkpoint is. `ab_window.sh` takes 
 | `RADIANCE_EXPERIMENTAL_DS41_FETCH_LIST=1` | not yet measured | the counts row and the pool's token rows, sorted order and offsets reach the host in one ranged copy instead of four dispatches (each behind the last, each with a system-scope release), from a range list kept on the card per routed layer and pass size and rewritten in stream order when an address changes; needs host experts; arm part `Fl`; shutdown line `host experts, fetch lists` |
 | `RADIANCE_EXPERIMENTAL_DS41_MIRROR_SPLIT=N` (2-4, designed for 3) | not yet measured on the engine (research landbench2: a lone miss's reads 2629 → 2400 µs, the mirror's copy 216 → 101 µs) | a decode pass that misses one unit reads the plane mirror's decode tail (2.4 MB at 0.13) in N pieces on N readers, so the SATA stripe's preads and the copies out of the bounce buffers overlap; the same bytes (pieces start on the container's 4 KiB grid, so a failed one falls back to the container as a whole tail does). Needs the decode mirror (`R`, `RdNN`); arm part `MsN`. The read-ahead in pieces (`PpK`) reads the container only, so its pieces are not split; the whole-unit read-ahead (`PoK`/`PtK`) reads a unit as a lone decode miss and is split too. Gate: the shutdown report's "one-token miss reads, one unit" line; drop it if the mirror lands last in under 25% of calls and its copy takes under 0.15 ms |
 | `RADIANCE_EXPERIMENTAL_DS41_MISS_POST=1` | not yet measured on the engine (research: 20-40 µs a critical layer, +0.3-0.6%) | a one-token pass's missed planes start on the kept readers as soon as `hx_choose` knows them, instead of after `hx_submit` (its pool wake, 28-32 µs a layer) and the copy path's staging; the issuing thread then waits in `hx_submit_misses_now` (`NativeReadWorkers::post`/`join`, which hold the readers' call mutex from post to join as `run` does). The same reads: the set `hx_submit_misses_now` reads, so with the read-ahead in pieces (`PpK`) never a unit read ahead whole nor one the piece readers are finishing (whose slot `hx_ra_settle` may give fresh planes); the post is a demand read for the piece readers from the post on, and is finished before the urgent units are settled. Also at an early-issued layer's gather (`Ei`). A post that finds the readers on another thread's call (the whole-unit read-ahead's, `PoK`/`PtK`, or the async misses' worker, `A`) does not wait: it posts nothing and the layer reads as before (the mover's "kept plane readers" line counts them). Arm part `Mp`; the "readers" line shows the readers' start and the caller's return, and the EP decision's own `posting the misses' reads` line its time (not in "choose") |
-| `RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED=1` | not yet measured on the engine | the cards' static expert residents in the same packed form (below): 18,001,920 instead of 18,800,640 bytes a unit, so ~26 more residents a rank; needs this branch's `libr4d.so` (row `moe_gemm_ggml_mxfp4_gemv_vp`) and radiance, `--deterministic` and passes of at most 16 tokens; `..._VRAM_PACKED_RAW=<gate_up>,<down>` (512,320) sets the raw rounds of room; arm part `Vp` |
 
 The shutdown report counts the miss reads of one-token passes whatever the switches (two lines a
 rank, one for calls of one missed unit and one for more): how many calls had a mirror leg and in how
@@ -151,11 +151,14 @@ round at every block position (down's tail included), widened rounds on the gene
 
 ## Packed VRAM residents
 
-The cards hold ~600 static expert residents a rank in block_mxfp4. With
-`RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED=1` they take the packed form the RAM cache uses (the codes plane
-and 2-bit e8m0 codes from one base a weight, raw rounds beside, room for 512 / 320 raw rounds): 18,001,920
-bytes a unit instead of 18,800,640, so the same weights pool holds x1.0444 the residents, ~26 more a rank
-(`core/place/vram_packed.h` has the whole design).
+The cards hold 712 / 720 static expert residents a rank in block_mxfp4 in the recommended configuration
+(with F8; 598 / 615 without). With `RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED=1` they take the packed form the
+RAM cache uses (the codes plane and 2-bit e8m0 codes from one base a weight, raw rounds beside, room for
+512 / 320 raw rounds): 18,001,920 bytes a unit instead of 18,800,640, so the same weights pool holds
+x1.0444 the residents. From the room each rank left (712 units and 3.90 MiB free on rank 0, 720 and
+10.62 MiB on the others) that is 743 / 752, 31 / 32 more a rank, one fewer for each ~10-15 MB that
+weights over their raw-round budget (charged block_mxfp4) take back (`core/place/vram_packed.h` has the
+whole design).
 
 - **Selection.** The engine sets the machine fact `device.ds41_vram_packed` before declare, which lets
   libr4d's `moe_gemm_ggml_mxfp4_gemv_vp` row take the routed GEMMs' decode band (priority 59 over the gemv
@@ -166,7 +169,7 @@ bytes a unit instead of 18,800,640, so the same weights pool holds x1.0444 the r
   whole on its rank, read only by `moe_gemm_ggml` ops every band of which resolved the gemv_vp row (so
   `--max-num-batched-tokens` at most 16). The expert fill charges a unit at its packed size after reading
   its weights' scales from the container (only the units it considers for VRAM: 1.1 MB a unit, about
-  0.7 GB a rank); a weight over its raw-round budget stays block_mxfp4 in VRAM and is charged so.
+  0.8 GB a rank with F8); a weight over its raw-round budget stays block_mxfp4 in VRAM and is charged so.
   Only a static plan (`--deterministic`) packs. The startup log prints per rank what was packed and how
   long the scan took; the planner report (`--debug-placement`) has a `vram packed` line.
 - **Loading.** The loader packs each such weight from its planes and checks it before the upload: every
@@ -181,11 +184,21 @@ bytes a unit instead of 18,800,640, so the same weights pool holds x1.0444 the r
 - **Checks.** `tests/r4d_emu/test_ds41vp.cpp` runs both rows on the host SIMT emulator over the kernel's
   every path (whole K and chunks, one and two rows a wave, 1 to 16 tokens, partial rounds of 1, 8, 9 and
   31 blocks, raw rounds anywhere, edge scales and activations, the research sample's real scales at the
-  served shapes) and compares every value. `ds41_vpack_device_check.hip` does the same on a card, and
-  times both rows: build it like the other harness, and run it in a window with
-  `VPACK_CHECK=<binary> VPACK_LIBR4D=<libr4d.so>` (ab_window.sh runs `check 48` and `time` before the
-  arms) or by hand on a free card: `ds41_vpack_device_check LIBR4D.so check 48` (PASS on exit 0) and
-  `... time`.
+  served shapes, a rank's 96-entry table) and compares every value; `r4d_emu_ds41vp_tail` runs it again
+  with the live-tail ranges on (`RADIANCE_EXPERIMENTAL_DS41_LIVE_TAIL=1`), where the cases at their
+  geometry take the tail branch (gemv_vp's kernel, then the dropped slots zeroed). `place_test` holds
+  `vram_pack_eligible` to what it may pack (a tiled or kernel-less band, another op or operand position,
+  a draft head, a weight stored as read, half a weight, a form no smaller: none) and the scan and the
+  planner's query to the container's scales (raw rounds, over the room, unreadable); `runtime_test` holds
+  the table mark (bit 0 on packed residents' entries only, kept through patches).
+  `ds41_vpack_device_check.hip` compares both rows on a card (`check 48`; `check 48 tail` with the
+  live-tail ranges on, the dropped slots' zeros compared too) and times them (`time`: plain over block,
+  gemv_vp over packed, and gemv_vp over unmarked block entries, what the new kernel costs the experts it
+  does not pack). Build it like the other harness and give the window `VPACK_CHECK=<binary>`: before the
+  arms, once for each `libr4d.so` a Vp arm serves (by md5), ab_window.sh runs `check 48` and `time` on
+  card 0 (and `check 48 tail` when the window's environment has the live-tail ranges on), and a Vp arm
+  runs only when each printed PASS and exited 0 on its library; otherwise it is skipped. By hand on a free
+  card: `ds41_vpack_device_check LIBR4D.so check 48` (PASS on exit 0) and `... time`.
 - **Shutdown report.** The mover's report has a `VRAM packed experts` line: residents and weights
   packed, their bytes against block_mxfp4's, weights packed and checked at load, weights over budget
   kept block, the scan.

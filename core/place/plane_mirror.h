@@ -32,6 +32,7 @@
 namespace rad {
 
 class PlaneMirror {
+    friend struct PlaneMirrorTest;   /* tests/plane_mirror_test.cpp builds instances of its own */
 public:
     /* The process's mirror, or null when RADIANCE_EXPERIMENTAL_DS41_PLANE_MIRROR is unset or its
      * directory cannot be read (warned once). */

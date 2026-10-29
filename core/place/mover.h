@@ -671,8 +671,10 @@ public:
     bool  lay_out_unit_planes(HostPlanes* p, PlaneExtent ext[2]);
     int   read_piece(uint32_t file, int64_t off, int64_t len, void* dst, int64_t cap);
     int64_t decode_mirror_bytes() const;
-    /* read_weight_file  a whole weight the container stores as is (an identity plane, every row
-     *                   on this rank) into dst, for a host reader such as the router predictor. */
+    /* read_weight_file  a whole weight as the container holds it (every row on this rank) into
+     *                   dst, weight_file_bytes(w) long (rad_core.h), for a host reader such as
+     *                   the router predictor: a weight stored as is, or the one plane a kernel's
+     *                   relayout read (an f32 router gemm_nt_f32bf16 keeps as its bf16 halves). */
     bool  read_weight_file(const WeightInfo& w, void* dst);
     bool  mapped_cache_on() const { return mapped_file_cache_on_; }
     int64_t mapped_cache_bytes() const { return mapped_file_cache_on_ ? cfg_.native_file_cache_bytes : 0; }

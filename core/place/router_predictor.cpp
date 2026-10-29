@@ -111,8 +111,11 @@ bool RouterPredictor::load(const Program& prog,
             const WeightInfo* wr = find(b + "glm_router.weight");
             const WeightInfo* wc = find(b + "glm_router.correction");
             const WeightInfo* wg = find(b + "ffn_norm.weight");
-            if (!wr || !wc || !wg || wr->stored_bytes != (int64_t)kExperts * kEmbd * 4 ||
-                wc->stored_bytes != kExperts * 4 || wg->stored_bytes != kEmbd * 4 ||
+            /* As the container holds them (weight_file_bytes): a router kept on the card as its
+             * bf16 halves (RADIANCE_EXPERIMENTAL_DS41_ROUTER_BF16) is read as its f32 plane, which
+             * rounds to the same bf16 here. */
+            if (!wr || !wc || !wg || weight_file_bytes(*wr) != (int64_t)kExperts * kEmbd * 4 ||
+                weight_file_bytes(*wc) != kExperts * 4 || weight_file_bytes(*wg) != kEmbd * 4 ||
                 !read(*wr, wf.data()) || !read(*wc, &corr_[(size_t)l * kExperts]) ||
                 !read(*wg, &gain[(size_t)l * kEmbd])) {
                 RAD_WARN("router predictor: layer %d's router or ffn_norm is not f32 [384, 5120] / "

@@ -54,6 +54,24 @@ static pf::Cfg pf_env() {
  * Model::f8). */
 static constexpr const char* kDenseF8 = "gemm_nt_bf16f8";
 
+/* RADIANCE_EXPERIMENTAL_DS41_ROUTER_BF16=1: the trunk's f32 projections that ship bf16 -- every
+ * layer's router ([384, 5120], 7.86 MB a layer replicated on every card, 300 MiB) and the kv|gate
+ * projection of the three compressors with a ratio above 1 (layers 2, 8 and 14 of the release,
+ * [1024, 5120], 21 MB each as f32) -- are read through gemm_nt_f32bf16, which keeps them as bf16
+ * and widens each element back by a shift, multiplying the same operand bits in the same order.
+ * The container holds the routers widened to f32 (all 40 checked: 0 of 78.6M low halves nonzero),
+ * which the kernel's layout stores as their bf16 halves, refusing the load at any nonzero low half
+ * (r4d_layout.cpp) rather than rounding it; it holds the compressors as the release's bf16, which
+ * the loader widened for gemm_nt_f32 and which are now declared bf16 and read as they are. Every
+ * logit and compressor score is bit-identical, from half the bytes: 180 MiB a card more for the
+ * experts (150 of it the routers'), and a decode router GEMV reading 3.9 MB instead of 7.9 (19.7
+ * us as f32, latency-bound at 399 GB/s). The drafter's routers stay f32. Read once a declare
+ * (Model::router_bf16). */
+static bool router_bf16_on() {
+    const char* s = std::getenv("RADIANCE_EXPERIMENTAL_DS41_ROUTER_BF16");
+    return s && !std::strcmp(s, "1");
+}
+
 /* RAD_ARCH_TRY that names the call that failed: a refused declaration otherwise surfaces only as
  * the plugin's return code. */
 #define DS_TRY(e)                                                                                \
@@ -487,6 +505,11 @@ struct Model {
     rad_buf ctok = 0, emb = 0, embd = 0, ekv = 0, ekv_part = 0;
     /* engram_kv's rows a rank computes when they are split over the ranks (0: replicated). */
     int64_t esplit = 0;
+    /* RADIANCE_EXPERIMENTAL_DS41_ROUTER_BF16 (router_bf16_on): the routers and compressor
+     * projections declared over gemm_nt_f32bf16, counted with the bytes their bf16 halves save. */
+    bool router_bf16 = false;
+    int n_router_bf16 = 0, n_comp_bf16 = 0;
+    int64_t bf16_saved = 0;
     rad_buf final_hidden = 0, logit_input = 0, logits = 0;
     ActFP8 act{};
     MoeFP8::Wire mw{};
@@ -1417,12 +1440,25 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
                 const char* cn = nm.f("blk.%d.attn_compressor_kvg.weight", l);
                 DS_TRY(map_concat(b, cn, { ckpt_name(nm.f("blk.%d.attn_compressor_kv.weight", l)),
                                            ckpt_name(nm.f("blk.%d.attn_compressor_gate.weight", l)) }));
-                L.comp_w = decl_w(b, cn, RAD_F32, { 2 * hd, D }, RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE,
+                /* f32 in gemm_nt_f32 (the container's bf16, widened at load); with ROUTER_BF16
+                 * (router_bf16_on) declared at the source's dtype, as GlmRouter declares a
+                 * router's: bf16 here, read as it is. */
+                const char* cg = m.router_bf16 ? "gemm_nt_f32bf16" : "gemm_nt_f32";
+                uint32_t cdt = RAD_F32;
+                RadEncoding ce{};
+                if (m.router_bf16 && weight_enc(b, cn, &ce) && ce.n_planes == 1 &&
+                    ce.plane[0].dtype == RAD_BF16)
+                    cdt = RAD_BF16;
+                L.comp_w = decl_w(b, cn, cdt, { 2 * hd, D }, RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE,
                                   grp);
-                L.c_gemm = op(b, "gemm_nt_f32",
+                L.c_gemm = op(b, cg,
                               { RAD_RANGE("M", 1, T), RAD_INT("N", 2 * hd), RAD_INT("K", D),
                                 RAD_STR("dtype", "bf16") },
                               { L.comp_w }, { m.xn }, { m.kvs });
+                if (m.router_bf16) {
+                    ++m.n_comp_bf16;
+                    m.bf16_saved += 2 * hd * D * 2;
+                }
                 if (!m.tail.count(r) && !(m.tail[r] = tail_group(b, m, r))) return RAD_E_INVAL;
                 DS_TRY(rad_bind_layer_kv(b, l, m.tail[r]));
                 L.c_work = op(b, "qsa_work",
@@ -1605,6 +1641,7 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
     s.cfg.norm_topk = c.norm_topk;
     s.cfg.sigmoid_router = 1;
     s.cfg.router_score = "sqrtsoftplus";
+    s.cfg.router_bf16 = m.router_bf16 ? 1 : 0;
     s.cfg.route_scale = c.route_scale;
     s.cfg.swiglu_limit = c.swiglu_limit;
     s.cfg.shared_ungated = 1;
@@ -1624,6 +1661,10 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
                 ++m.f8_kept;
             }
         }
+    if (m.router_bf16) {
+        ++m.n_router_bf16;
+        m.bf16_saved += c.n_expert * D * 2;
+    }
     L.post_f = op(b, "mhc_post", hcp, {}, { m.act.x, m.h1, m.post, m.comb }, { m.h0 });
     /* After the MoE block, whose router and shared expert the reads can reach. The reads name no
      * buffer, so where they are declared changes no liveness. */
@@ -2193,6 +2234,13 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     DS_TRY(geometry(m, ctx));
     m.f8_on = dense_f8_gate(b, meta, m);
     DS_TRY(dsp_config(b, m, meta, ctx));
+    m.router_bf16 = router_bf16_on();
+    if (m.router_bf16 && !rad_op_declared(b, "gemm_nt_f32bf16")) {
+        fprintf(stderr, "radiance: deepseek41: RADIANCE_EXPERIMENTAL_DS41_ROUTER_BF16=1 needs "
+                        "gemm_nt_f32bf16, which no loaded kernel library declares (a libr4d built "
+                        "with it)\n");
+        return RAD_E_UNSUPPORTED;
+    }
     const auto& c = m.c;
     auto& g = m.g;
     int64_t rmin = 0;
@@ -2327,6 +2375,12 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     }
     m.layers.resize((size_t)c.n_layer);
     for (int l = 0; l < c.n_layer; ++l) DS_TRY(layer(b, m, m.layers[(size_t)l], l));
+    if (m.router_bf16 && g.rank == 0)
+        fprintf(stderr, "radiance: deepseek41: RADIANCE_EXPERIMENTAL_DS41_ROUTER_BF16: %d routers "
+                        "and %d compressor kv|gate projections read as bf16 (gemm_nt_f32bf16), "
+                        "%.1f MiB less a card; the load refuses any f32 one with a nonzero low "
+                        "half\n",
+                m.n_router_bf16, m.n_comp_bf16, (double)m.bf16_saved / (1 << 20));
     m.pcn_fin = post_collapse_norm(b, m, T, m.final_gain, m.act.x, m.h1, m.h0, m.pre_f, m.xcol,
                                    m.final_hidden);
     if (!m.pcn_fin)

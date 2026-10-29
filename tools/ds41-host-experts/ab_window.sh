@@ -17,12 +17,13 @@
 # card 0: swiglu over every (gate, up) pair with mismatches classified, and the host chain.
 #
 # Arms are named POLICY[-tN][-gG][-sS][-nP][-mM][-MR][-PsK|-PoK|-PpK][-f][-x] (see the loop below), e.g. "base greedy-t20-g65 all-t24".
-# An arm with an unknown part is skipped, not run without it; F8 (the FP8-stored dense weights) is
-# also checked in the server log.
+# An arm with an unknown part is skipped, not run without it; F8 (the FP8-stored dense weights) and
+# Rb (the routers read as bf16) are also checked in the server log.
 #
 # Environment: RADIANCE_BIN (the binary), RADIANCE_HOME_DIR (kernels/ and architectures/ for it),
 # SILU_TABLE (the card's silu table), ARMS (default "base verify greedy"), HX_THREADS (16),
-# VERIFY_REQUESTS (3), DEVICE_CHECKS (1).
+# VERIFY_REQUESTS (3), DEVICE_CHECKS (1), SELFTEST_F32BF16 (an r4d_selftest: gemm_nt_f32bf16's
+# checks and timings on card 0 before the arms; unset, none).
 set -u
 OUT=${1:?output directory}
 BIN=${RADIANCE_BIN:?path to the radiance binary}
@@ -177,6 +178,19 @@ arm() {   # name, then env assignments for the server; CACHE_MIB the RAM cache (
     stop_server; return 1
   fi
   [[ -n "${ARM_F8:-}" ]] && grep -E 'dense weights read by gemm_nt_bf16f8' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
+  # RADIANCE_EXPERIMENTAL_DS41_ROUTER_BF16 (the Rb parts): rank 0's plugin names the routers it
+  # reads as bf16, and an arm must have exactly what its name says. An Rb arm whose plugin did not
+  # take the knob, or a plain arm that took it from the window's environment, is not measured.
+  local rb_lines; rb_lines=$(grep -cE 'ROUTER_BF16: [1-9][0-9]* routers' "$OUT/$name.server.log")
+  if [[ -n "${ARM_RB:-}" && "$rb_lines" == 0 ]]; then
+    log "arm $name: Rb, but the server log has no 'ROUTER_BF16: N routers' line (a plugin without the knob?); not measured"
+    stop_server; return 1
+  fi
+  if [[ -z "${ARM_RB:-}" && "$rb_lines" != 0 ]]; then
+    log "arm $name: no Rb part, but the server read its routers as bf16 (the knob set for the window?); not measured"
+    stop_server; return 1
+  fi
+  [[ -n "${ARM_RB:-}" ]] && grep -E 'ROUTER_BF16: ' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   # The NVMe drive's busy time (io_ticks, ms) and temperature over the requests: read-ahead arms
   # move it from ~45% busy towards saturation.
   local d0 d1 t0 t1 rc temp
@@ -226,6 +240,25 @@ if [[ "${DEVICE_CHECKS:-1}" == 1 && -x "$HERE/build/ds41_mxfp4_device_check" ]];
   tail -3 "$OUT/swiglu_proof.log" | tee -a "$OUT/window.log"
   tail -3 "$OUT/chain_check.log" | tee -a "$OUT/window.log"
   if cmp -s "$OUT/silu_recheck.bin" "$SILU"; then log "silu table recaptured identical"; else log "silu table recapture DIFFERS"; fi
+fi
+
+# SELFTEST_F32BF16=<r4d_selftest>: before the arms, on card 0 with the H home's libr4d.so (the Rb
+# arms'), gemm_nt_f32bf16 byte-compared with gemm_nt_f32 and the host arithmetic (router and
+# compressor shapes), then the decode router (384 x 5120) and compressor (1024 x 5120) GEMVs timed
+# cold for both weights at every tile form (the gate: the halves' rule at or under 14 us at 384).
+if [[ -n "${SELFTEST_F32BF16:-}" && -x "${SELFTEST_F32BF16}" ]]; then
+  L4=${RADIANCE_HOME_DIR2:-$RHOME}/kernels/libr4d.so
+  log "gemm_nt_f32bf16 checks on card 0 with $L4"
+  ( export HIP_VISIBLE_DEVICES=0
+    timeout 900 "$SELFTEST_F32BF16" "$L4" --case gemm_nt_f32bf16_bf16 >"$OUT/f32bf16_check.log" 2>&1
+    echo "check exit $?" >>"$OUT/f32bf16_check.log"
+    for n in 384 1024; do
+      timeout 900 "$SELFTEST_F32BF16" "$L4" --cold 256 --perff32 $n 5120 1 200 >>"$OUT/f32bf16_perf.log" 2>&1
+      echo "perff32 $n exit $?" >>"$OUT/f32bf16_perf.log"
+    done )
+  grep -cE "FAIL" "$OUT/f32bf16_check.log" | sed 's/^/f32bf16 check FAIL lines: /' | tee -a "$OUT/window.log"
+  tail -1 "$OUT/f32bf16_check.log" | tee -a "$OUT/window.log"
+  grep -E "^gemm_nt|^  (rule|4x1|2x2|8x1|8x4|1x2|1x4)|FAIL|exit" "$OUT/f32bf16_perf.log" | tee -a "$OUT/window.log"
 fi
 
 HX=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=$HX_THREADS RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU=$SILU)
@@ -297,10 +330,14 @@ for a in $ARMS; do
 # work/extra-prompts/<name>-receipt.json (chat: 16 chat-framed prompts; long: 64-3500-token
 # prompts) instead of $PROMPTS' first AB_REQUESTS (compare texts only between arms with the same
 # prompts); rN a repeat (ignored).
+# Rb the routers and the compressors' kv|gate projections read as bf16
+# (RADIANCE_EXPERIMENTAL_DS41_ROUTER_BF16, bit-identical; needs the deepseek41 plugin and libr4d
+# built with it; checked in the server log, every other arm runs with the knob at 0), RbN the same
+# with tile form N (1-8, r4d_selftest --perff32's names) for the bf16 GEMV at decode.
   IFS=- read -r -a parts <<< "$a"
   pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 HOST_POOL_MIB=4096 EXTRA_ARGS="" ARM_HOME="$RHOME" ARM_CONC=
   ARM_PROMPTS= ARM_N=
-  power="" skip="" ARGS=() f8="" f8x=""
+  power="" skip="" ARGS=() f8="" f8x="" rb="" rbf=0
   for p in "${parts[@]:1}"; do
     case $p in
       Q[gnc]*) power=${p#Q} ;;
@@ -321,6 +358,8 @@ for a in $ARMS; do
       Pm[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_PREFETCH_ATTN=1 RADIANCE_EXPERIMENTAL_DS41_PREFETCH_MIB=${p#Pm}) ;;   # on-die reads: a budget, use order
       Pl?*)    env+=(RADIANCE_EXPERIMENTAL_DS41_PREFETCH_ATTN=1 RADIANCE_EXPERIMENTAL_DS41_PREFETCH_SET=${p#Pl}) ;;   # on-die reads: these, in order
       Pe)      env+=(RADIANCE_EXPERIMENTAL_DS41_PREFETCH_ATTN=1 RADIANCE_EXPERIMENTAL_DS41_PREFETCH_ENGRAM=1) ;;   # on-die reads at Engram layers
+      Rb)      rb=1 ;;                     # routers / compressor kv|gate read as bf16 (gemm_nt_f32bf16)
+      Rb[1-8]) rb=1 rbf=${p#Rb} ;;         # the same, the bf16 GEMV at decode in tile form N
       Sc[0-9]) env+=(RADIANCE_EXPERIMENTAL_DS41_CACHE_SECOND_CHANCE=${p#Sc}) ;;   # profile-hot cached units get N second chances
       Iy[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_INSERT_YIELD_US=${p#Iy}) ;;     # background inserts wait up to N us for an idle pool
       Xs)      env+=(RADIANCE_EXPERIMENTAL_DS41_SWIGLU_SCALAR=1) ;;   # the pool's swiglu as the scalar loop (old way)
@@ -398,6 +437,9 @@ for a in $ARMS; do
     env+=(RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8=0)
   fi
   ARM_F8=$f8
+  # Every arm states the knob, so a window's VAR=val cannot turn it on for the others.
+  env+=(RADIANCE_EXPERIMENTAL_DS41_ROUTER_BF16=${rb:-0} RADIANCE_EXPERIMENTAL_DS41_ROUTER_BF16_FORM=$rbf)
+  ARM_RB=$rb
   [[ -n "$skip" ]] && continue
   [[ -n "$power" ]] && power_set "$power"
   case $pol in

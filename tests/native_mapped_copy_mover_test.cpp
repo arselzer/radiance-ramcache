@@ -8,6 +8,7 @@
 #include "place/mover.h"
 #include "place/planner.h"
 #include "tiny_model.h"
+#include "../tools/ds41-host-experts/ds41_host_experts.h"
 #ifdef RAD_NATIVE_CACHE_ENGINE_CASE
 #include "engine.h"
 #endif
@@ -844,6 +845,125 @@ TEST(mapped_slab_ReadOnly_changed_file_epoch_refuses_before_borrow_IO_copy_or_pu
     CHECK_EQ(after.cache.hits,before.cache.hits);CHECK_EQ(after.cache.misses,before.cache.misses);
     CHECK_EQ(after.cache.lease_refs,size_t(0));CHECK_EQ(c.transport.mover->stats().h2d_bytes,h2d);
     for(auto h:c.plan.units[size_t(a[0])].weights)CHECK(c.transport.mover->residency()->lookup(h)->ptr==nullptr);
+}
+
+namespace {
+/* The packed RAM cache through the actual HOST Mover: weights laid out as the release's MXFP4 planes
+ * (codes [N, K/2], then e8m0 scales [N, K/32]), relaid on a read into block_mxfp4 as the kernel
+ * does. Scales in the release's mix, except expert 1's down: one block in 500 outside the window,
+ * more raw rounds than the default down budget (320). */
+struct PackedEnvironment {
+    bool had=false;std::string old;
+    PackedEnvironment(){const auto*p=std::getenv("RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE");had=p;old=p?p:"";::setenv("RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE","1",1);}
+    ~PackedEnvironment(){if(had)::setenv("RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE",old.c_str(),1);else::unsetenv("RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE");}
+};
+int64_t mx_rows(const WeightInfo& w){return w.stored_bytes==int64_t(NativeMappedFileCache::GU)?4608:5120;}
+int64_t mx_cols(const WeightInfo& w){return w.stored_bytes==int64_t(NativeMappedFileCache::GU)?5120:2304;}
+/* block_mxfp4 from planes: block u of row n is its e8m0, then value j < 16 in the low nibble of byte
+ * j and j + 16 in its high one; a planes byte p holds values 2p (low) and 2p + 1 (high). */
+void mx_blocks(const uint8_t* codes,const uint8_t* scales,int64_t N,int64_t K,uint8_t* out){
+    const int64_t UK=K/32;
+    for(int64_t n=0;n<N;++n)for(int64_t u=0;u<UK;++u){
+        const uint8_t* c=codes+n*(K/2)+u*16;uint8_t* b=out+(n*UK+u)*17;b[0]=scales[n*UK+u];
+        auto v=[&](int j){return j&1?c[j>>1]>>4:c[j>>1]&15;};
+        for(int j=0;j<16;++j)b[1+j]=uint8_t(v(j)|(v(j+16)<<4));
+    }
+}
+int mx_relayout(const RadParam*,int,int,const RadEncoding*,const int*,const RadTensor* p,int n,void* dst,int64_t cap){
+    if(n!=2||!p||!dst||!p[0].data||!p[1].data)return RAD_E_INVAL;
+    const int64_t N=p[0].shape[0],K=p[0].shape[1];
+    if(K%32||p[1].shape[0]!=N||p[1].shape[1]!=K/32||cap!=N*(K/32)*17)return RAD_E_SHAPE;
+    mx_blocks(static_cast<const uint8_t*>(p[0].data),static_cast<const uint8_t*>(p[1].data),N,K,static_cast<uint8_t*>(dst));
+    return RAD_OK;
+}
+int64_t lay_out_mxfp4(Fixture& f){
+    int64_t off=4*int64_t(RAD_ALIGN_UNIT);
+    for(size_t h=1;h<f.prog.weights.size();++h){auto& w=f.prog.weights[h];w.file_offset=uint64_t(off);
+        if(w.decl.group.expert<0){off=align_up(off+w.stored_bytes,RAD_ALIGN_UNIT);continue;}
+        const int64_t N=mx_rows(w),K=mx_cols(w);
+        w.identity=false;w.layout_tag="ggml_mxfp4";w.lay_op=w.first_use_op;
+        w.lay_band=0;w.lay_dom=RAD_DOMAIN_DEVICE;w.lay_operand=0;
+        w.enc.n_planes=2;w.enc.plane[0].dtype=RAD_FP4E2M1;w.enc.plane[1].dtype=RAD_E8M0;
+        w.n_sel=2;w.sel[0]=0;w.sel[1]=1;w.sel_rows[0]=w.sel_rows[1]=N;w.sel_cols[0]=K;w.sel_cols[1]=K/32;
+        w.file_plane_offset[0]=uint64_t(off);w.file_plane_offset[1]=uint64_t(off+N*K/2);
+        off=align_up(off+N*K/2+N*(K/32),RAD_ALIGN_UNIT);
+    }
+    return off+RAD_ALIGN_UNIT;
+}
+/* Writes the scale planes' bytes into the image (and its file): the release's mix, one block in
+ * `rare` outside the window. */
+void write_scales(const Fixture& f,Image& image){
+    for(size_t h=1;h<f.prog.weights.size();++h){const auto& w=f.prog.weights[h];if(w.decl.group.expert<0)continue;
+        const int64_t n=mx_rows(w)*(mx_cols(w)/32);
+        const bool over=w.decl.group.expert==1&&w.stored_bytes==int64_t(NativeMappedFileCache::DN);
+        uint64_t s=0x9e3779b97f4a7c15ull*h+1;uint8_t* sc=image.bytes.data()+w.file_plane_offset[1];
+        for(int64_t i=0;i<n;++i){s^=s<<13;s^=s>>7;s^=s<<17;const int p=int(s%100);
+            sc[i]=uint8_t(p<2?119:p<50?120:p<98?121:122);
+            if((s>>32)%(over?500u:5000u)==0)sc[i]=uint8_t((s>>8)&1?112:126);}
+        if(::pwrite(image.fd,sc,size_t(n),off_t(w.file_plane_offset[1]))!=ssize_t(n))throw std::runtime_error("scale plane write");
+    }
+    if(::fsync(image.fd))throw std::runtime_error("fsync scale planes");
+}
+std::vector<uint8_t> image_blocks(const WeightInfo& w,const Image& image){
+    std::vector<uint8_t> out(size_t(w.stored_bytes));
+    mx_blocks(image.bytes.data()+w.file_plane_offset[0],image.bytes.data()+w.file_plane_offset[1],mx_rows(w),mx_cols(w),out.data());
+    return out;
+}
+} //namespace
+/* insert_unit_planes packs a missed unit into the packed cache, and borrow_host_unit lends packed
+ * slots whose scales widen back to the container's and whose codes are its codes plane; a unit with
+ * a weight over its raw-round budget stays out whole (counted once a unit); the card's copy path
+ * reads the container, publishes the block_mxfp4 bytes, and neither reads nor fills the cache. */
+TEST(mapped_packed_actual_mover_inserts_lends_and_keeps_the_card_out){
+    Environment mapped("1","1");PackedEnvironment packed;
+    Fixture f;f.experts();f.info.relayout=mx_relayout;Image image(lay_out_mxfp4(f));write_scales(f,image);
+    Config cfg=plan_config(false);Plan plan=planned(f,cfg,true);const auto units=two_ssd_experts(plan);
+    std::atomic<uint64_t> calls{0};Access::Driver driver;Transport t;t.open(f,plan,image,80*MiB,calls);Access::attach(*t.mover,driver);
+    REQUIRE(t.mover->packed_cache());
+    for(int32_t u:units)REQUIRE(t.mover->host_planes_eligible(u));
+    Mover::HostPlanes p0,p1;p0.unit=units[0];p1.unit=units[1];
+    Mover::HostPlanes* ps[2]={&p0,&p1};
+    REQUIRE(t.mover->read_unit_planes(ps,2,1));
+    std::vector<uint8_t> scratch;
+    for(Mover::HostPlanes* p:ps){
+        const bool over=plan.units[size_t(p->unit)].expert==1;
+        CHECK_EQ(t.mover->insert_unit_planes(*p,&scratch),RAD_OK);
+        CHECK_EQ(t.mover->unit_cached(p->unit),!over);
+        Mover::HostUnit hu;const bool lent=t.mover->borrow_host_unit(p->unit,&hu);CHECK_EQ(lent,!over);
+        if(!lent)continue;
+        CHECK(hu.packed);REQUIRE_EQ(hu.n,2);
+        for(int k=0;k<2;++k){
+            const auto& w=f.prog.weights[p->w[k]];const int N=int(mx_rows(w)),K=int(mx_cols(w));
+            CHECK_EQ(hu.bytes[k],w.stored_bytes);CHECK(hu.slot[k]<w.stored_bytes);
+            ds41hx::Mx v;REQUIRE(ds41hx::packed_view(hu.host[k],size_t(hu.slot[k]),N,K,&v));
+            CHECK(v.n_exc>0);CHECK(ds41hx::packed_scales_equal(v,image.bytes.data()+w.file_plane_offset[1]));
+            CHECK(std::memcmp(v.codes,image.bytes.data()+w.file_plane_offset[0],size_t(N)*size_t(K/2))==0);
+        }
+        t.mover->release_host_unit(&hu);
+    }
+    CHECK_EQ(t.mover->insert_unit_planes(plan.units[size_t(units[0])].expert==1?p0:p1,&scratch),RAD_OK);
+    const auto st=t.mover->packed_stats();
+    CHECK_EQ(st.inserted,uint64_t(2));CHECK_EQ(st.over_budget,uint64_t(2));CHECK_EQ(st.over_budget_units,uint64_t(1));
+    CHECK_EQ(st.round_trip_failed,uint64_t(0));
+    /* The card's path for the cached unit: the container's bytes relaid, the cache untouched. */
+    const int32_t cached=plan.units[size_t(units[0])].expert==1?units[1]:units[0];
+    const auto before=Access::stats(*t.mover);std::vector<int32_t> staged;
+    need(t.mover->stage_file_units({cached},t.mover->file_buffer(0),t.mover->file_buffer_bytes(),nullptr,t.done,&staged),"card path over a packed cache");
+    REQUIRE(staged==std::vector<int32_t>{cached});
+    need(Access::drain(*t.mover),"the card's copies complete");
+    for(auto h:plan.units[size_t(cached)].weights){
+        const auto* s=t.mover->residency()->lookup(h);REQUIRE(s&&s->ptr);
+        if(s->ready)need(rad_event_wait(t.compute,s->ready),"compute follows the ready event");
+        const auto want=image_blocks(f.prog.weights[h],image);std::vector<uint8_t> got(want.size());
+        need(rad_memcpy_async(got.data(),s->ptr,int64_t(got.size()),t.compute),"readback");need(rad_stream_sync(t.compute),"readback done");
+        CHECK(got==want);
+    }
+    t.drain();t.mover->unstage_units(staged);
+    const auto after=Access::stats(*t.mover);
+    CHECK_EQ(after.layout_refusals-before.layout_refusals,uint64_t(4));   //a borrow and an insert a weight
+    CHECK_EQ(after.cache.inserts,before.cache.inserts);CHECK_EQ(after.cache.hits,before.cache.hits);
+    CHECK_EQ(after.cache.lease_refs,size_t(0));CHECK_EQ(t.mover->stats().mapped_source_copies,uint64_t(0));
+    CHECK(has(t.mover->report(),"packed RAM cache"));
 }
 
 int main(int argc,char** argv){

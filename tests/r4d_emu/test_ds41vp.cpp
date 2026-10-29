@@ -5,7 +5,10 @@
  * over the same experts: the plain row over block_mxfp4 entries, gemv_vp over a table that mixes
  * block_mxfp4 entries with entries marked by bit 0 that name the packed-scale form, packed by
  * tools/ds41-host-experts' pack_planes -- the code the engine packs its VRAM residents with. Every output
- * must be the same bf16 bits, and gemv_vp over the block table alone must be the plain row too.
+ * must be the same bf16 bits, and gemv_vp over the block table alone must be the plain row too. Every kernel the
+ * row can run is held to it: the default, and each of r4d_rad_moe_gemm_mxfp4_gemv_vp_variant's (the first form,
+ * mx_gemv_kernel's packed path, and mx_vp2_kernel at two and four weight rows a wave, each also with its
+ * activation staging hoisted under the first row group's loads).
  *
  * The cases reach every way the kernel walks a row: whole K and K in chunks (rows past the LDS), one and
  * two weight rows a wave (N >= 1024), one to sixteen token rows (one pass, whole sub-passes), token and
@@ -39,6 +42,8 @@
 
 extern const char* emu_last_kernel;
 extern int emu_grids;
+/* Checker-only (r4d_ds41_mxfp4.hip): gemv_vp with one of its kernels for this call. */
+extern "C" int r4d_rad_moe_gemm_mxfp4_gemv_vp_variant(const RadArgs*, RadStream, int);
 
 namespace {
 
@@ -198,6 +203,29 @@ int call(Launch f, const std::vector<uint16_t>& x, int AR, int K, std::vector<co
     return f(&a, nullptr);
 }
 
+/* The gemv_vp kernels, each a row of its own here: the default (the served row) and every variant. A launch's
+ * kernel is told by its name: the first form is mx_gemv_kernel<MX_FP4, R, true, false, true>, the second
+ * mx_vp2_kernel. */
+int vp_old(const RadArgs* a, RadStream s) { return r4d_rad_moe_gemm_mxfp4_gemv_vp_variant(a, s, 1); }
+int vp_r2(const RadArgs* a, RadStream s) { return r4d_rad_moe_gemm_mxfp4_gemv_vp_variant(a, s, 2); }
+int vp_r4(const RadArgs* a, RadStream s) { return r4d_rad_moe_gemm_mxfp4_gemv_vp_variant(a, s, 3); }
+int vp_r2h(const RadArgs* a, RadStream s) { return r4d_rad_moe_gemm_mxfp4_gemv_vp_variant(a, s, 4); }
+int vp_r4h(const RadArgs* a, RadStream s) { return r4d_rad_moe_gemm_mxfp4_gemv_vp_variant(a, s, 5); }
+struct VpRow {
+    const char* name;
+    Launch f;
+    const char* kernel;   /* a substring of the kernel's name, or null: either gemv_vp kernel */
+};
+const VpRow kVp[] = { { "gemv_vp", r4d_rad_moe_gemm_mxfp4_gemv_vp, nullptr },
+                      { "first form", vp_old, "false, true>" },
+                      { "vp2 two rows a wave", vp_r2, "mx_vp2_kernel" },
+                      { "vp2 four rows a wave", vp_r4, "mx_vp2_kernel" },
+                      { "vp2 two rows a wave, staging hoisted", vp_r2h, "mx_vp2_kernel" },
+                      { "vp2 four rows a wave, staging hoisted", vp_r4h, "mx_vp2_kernel" } };
+bool vp_kernel(const std::string& k) {
+    return k.find("false, true>") != std::string::npos || k.find("mx_vp2_kernel") != std::string::npos;
+}
+
 struct Case {
     const char* name;
     int N, K, ne, other, top_k, tokens;
@@ -248,42 +276,13 @@ void check(const Case& c, std::mt19937_64& rng, const std::vector<Expert*>& ex) 
     /* mx_moe's own test of the live-tail geometry, on the arguments `call` passes (tokens is a pass's token
      * rows in either order); with the ranges on, these launches take the tail branch. */
     const bool tail = g_tail && ds41_live_tail::geometry(c.tokens, c.N, c.K, ne, c.top_k, r.T, AR, c.sorted);
-    std::vector<uint16_t> y_plain, y_vp, y_vp_block;
+    std::vector<uint16_t> y_plain;
     int g0 = emu_grids;
     const int rc1 = call(r4d_rad_moe_gemm_mxfp4_gemv, xin, AR, c.K, plain, c.N, c.top_k, r, order, &y_plain);
     const int n1 = emu_grids - g0;
     const std::string k1 = emu_last_kernel ? emu_last_kernel : "?";
-    g0 = emu_grids;
-    const int rc2 = call(r4d_rad_moe_gemm_mxfp4_gemv_vp, xin, AR, c.K, vp, c.N, c.top_k, r, order, &y_vp);
-    const int n2 = emu_grids - g0;
-    const std::string k2 = emu_last_kernel ? emu_last_kernel : "?";
-    g0 = emu_grids;
-    const int rc3 = call(r4d_rad_moe_gemm_mxfp4_gemv_vp, xin, AR, c.K, plain, c.N, c.top_k, r, order, &y_vp_block);
-    const int n3 = emu_grids - g0;
-    const std::string k3 = emu_last_kernel ? emu_last_kernel : "?";
-    if (rc1 != RAD_OK || rc2 != RAD_OK || rc3 != RAD_OK) {
-        std::printf("FAIL %s: the launches returned %d, %d, %d\n", c.name, rc1, rc2, rc3);
-        ++fails;
-        return;
-    }
-    if (tail) {
-        /* The tail branch: the gemv, then mx_tail_zero's kernel last, in each of the three calls. Which gemv
-         * kernel ran is in the values: the plain kernel would read a marked entry's packed bytes as
-         * block_mxfp4 and give other bits, and a damaged header NaN rows only through gemv_vp's. */
-        const char* z = "mx_zero_tail_kernel";
-        if (n1 != 2 || n2 != 2 || n3 != 2 || k1.find(z) == std::string::npos || k2.find(z) == std::string::npos ||
-            k3.find(z) == std::string::npos) {
-            std::printf("FAIL %s: the live-tail calls launched %d, %d, %d kernels, the last %s, %s, %s\n", c.name,
-                        n1, n2, n3, k1.c_str(), k2.c_str(), k3.c_str());
-            ++fails;
-            return;
-        }
-        ++g_tail_cases;
-    } else if (n1 != 1 || n2 != 1 || n3 != 1 || k2.find("false, true>") == std::string::npos ||
-               k3.find("false, true>") == std::string::npos || k1.find("false, true>") != std::string::npos) {
-        /* One launch each: gemv_vp's marked-table kernel for both of its tables, and the plain row's own. */
-        std::printf("FAIL %s: the rows ran %s (%d launches), %s (%d) and %s (%d)\n", c.name, k1.c_str(), n1,
-                    k2.c_str(), n2, k3.c_str(), n3);
+    if (rc1 != RAD_OK || (!tail && (n1 != 1 || vp_kernel(k1)))) {
+        std::printf("FAIL %s: the plain row returned %d and ran %s (%d launches)\n", c.name, rc1, k1.c_str(), n1);
         ++fails;
         return;
     }
@@ -291,46 +290,90 @@ void check(const Case& c, std::mt19937_64& rng, const std::vector<Expert*>& ex) 
     if (damaged_expert >= 0)
         for (int i = r.off[(size_t)damaged_expert]; i < r.off[(size_t)damaged_expert + 1]; ++i)
             damaged_row[(size_t)i] = 1;
-    size_t diff = 0, diff_block = 0, nan_rows = 0, nan_bad = 0, live = 0, dead = 0, dead_bad = 0;
-    for (int i = 0; i < r.T; ++i)
-        for (int n = 0; n < c.N; ++n) {
-            const size_t at = (size_t)i * c.N + n;
-            const uint16_t a = y_plain[at], b = y_vp[at], d = y_vp_block[at];
-            if (a != d && !(nan16(a) && nan16(d))) ++diff_block;
-            /* A dropped slot (another rank's expert): past the routed rows, so the tail zeroes it. */
-            if (r.sorted[(size_t)i] < 0) {
-                ++dead;
-                if (tail && (a | b | d)) ++dead_bad;
-            }
-            if (damaged_row[(size_t)i]) {
-                if (nan16(b)) ++nan_rows;
-                else ++nan_bad;
-                continue;
-            }
-            live += r.sorted[(size_t)i] >= 0;
-            if (a != b && !(nan16(a) && nan16(b))) {
-                if (diff < 4) std::printf("  %s: row %d col %d plain %04x gemv_vp %04x\n", c.name, i, n, a, b);
-                ++diff;
-            }
+    bool ok = true;
+    size_t live_all = 0, dead_all = 0;
+    for (const VpRow& vr : kVp) {
+        std::vector<uint16_t> y_vp, y_vp_block;
+        g0 = emu_grids;
+        const int rc2 = call(vr.f, xin, AR, c.K, vp, c.N, c.top_k, r, order, &y_vp);
+        const int n2 = emu_grids - g0;
+        const std::string k2 = emu_last_kernel ? emu_last_kernel : "?";
+        g0 = emu_grids;
+        const int rc3 = call(vr.f, xin, AR, c.K, plain, c.N, c.top_k, r, order, &y_vp_block);
+        const int n3 = emu_grids - g0;
+        const std::string k3 = emu_last_kernel ? emu_last_kernel : "?";
+        if (rc2 != RAD_OK || rc3 != RAD_OK) {
+            std::printf("FAIL %s: %s returned %d, %d\n", c.name, vr.name, rc2, rc3);
+            ++fails;
+            return;
         }
-    const bool ok = !diff && !diff_block && !nan_bad && !dead_bad && (damaged_expert < 0 || nan_rows > 0) &&
-                    live > 0;
+        if (tail) {
+            /* The tail branch: the gemv, then mx_tail_zero's kernel last, in each call. Which gemv kernel ran is
+             * in the values: the plain kernel would read a marked entry's packed bytes as block_mxfp4 and give
+             * other bits, and a damaged header NaN rows only through a gemv_vp kernel. */
+            const char* z = "mx_zero_tail_kernel";
+            if (n1 != 2 || n2 != 2 || n3 != 2 || k1.find(z) == std::string::npos ||
+                k2.find(z) == std::string::npos || k3.find(z) == std::string::npos) {
+                std::printf("FAIL %s: the live-tail calls (%s) launched %d, %d, %d kernels, the last %s, %s, %s\n",
+                            c.name, vr.name, n1, n2, n3, k1.c_str(), k2.c_str(), k3.c_str());
+                ++fails;
+                return;
+            }
+        } else if (n2 != 1 || n3 != 1 || !vp_kernel(k2) || !vp_kernel(k3) ||
+                   (vr.kernel && (k2.find(vr.kernel) == std::string::npos ||
+                                  k3.find(vr.kernel) == std::string::npos))) {
+            /* One launch each, of the kernel this row names (the default: either gemv_vp kernel). */
+            std::printf("FAIL %s: %s ran %s (%d launches) and %s (%d)\n", c.name, vr.name, k2.c_str(), n2,
+                        k3.c_str(), n3);
+            ++fails;
+            return;
+        }
+        size_t diff = 0, diff_block = 0, nan_rows = 0, nan_bad = 0, live = 0, dead = 0, dead_bad = 0;
+        for (int i = 0; i < r.T; ++i)
+            for (int n = 0; n < c.N; ++n) {
+                const size_t at = (size_t)i * c.N + n;
+                const uint16_t a = y_plain[at], b = y_vp[at], d = y_vp_block[at];
+                if (a != d && !(nan16(a) && nan16(d))) ++diff_block;
+                /* A dropped slot (another rank's expert): past the routed rows, so the tail zeroes it. */
+                if (r.sorted[(size_t)i] < 0) {
+                    ++dead;
+                    if (tail && (a | b | d)) ++dead_bad;
+                }
+                if (damaged_row[(size_t)i]) {
+                    if (nan16(b)) ++nan_rows;
+                    else ++nan_bad;
+                    continue;
+                }
+                live += r.sorted[(size_t)i] >= 0;
+                if (a != b && !(nan16(a) && nan16(b))) {
+                    if (diff < 4)
+                        std::printf("  %s, %s: row %d col %d plain %04x gemv_vp %04x\n", c.name, vr.name, i, n, a, b);
+                    ++diff;
+                }
+            }
+        const bool vok = !diff && !diff_block && !nan_bad && !dead_bad && (damaged_expert < 0 || nan_rows > 0) &&
+                         live > 0;
+        if (!vok) {
+            std::printf("  %s, %s: %zu values differ from the plain row, %zu over the block table, %zu of the "
+                        "damaged entry's not NaN (%zu NaN), %zu live, %zu of the %zu dropped slots' values not zero\n",
+                        c.name, vr.name, diff, diff_block, nan_bad, nan_rows, live, dead_bad, dead);
+            ok = false;
+        }
+        live_all = live;
+        dead_all = dead;
+    }
+    if (tail) ++g_tail_cases;
     char what[160];
     if (tail)
         std::snprintf(what, sizeof what, "the live-tail branch (its gemv, then %zu dropped slots' values zeroed)",
-                      dead);
+                      dead_all);
     else
         std::snprintf(what, sizeof what, "the plain row's kernel %s", k1.c_str());
     std::printf("%s %s: N %d K %d, %d token(s) in %s order, %d of %d entries packed (%d raw rounds), %zu live "
-                "values%s, %s\n",
-                ok ? "pass" : "FAIL", c.name, c.N, c.K, c.tokens, order, packed, ne, raw_rounds, live,
-                damaged_expert >= 0 ? " and the damaged entry's rows NaN" : "", what);
-    if (!ok) {
-        std::printf("  %zu values differ from the plain row, %zu over the block table, %zu of the damaged entry's "
-                    "not NaN (%zu NaN), %zu live, %zu of the %zu dropped slots' values not zero\n", diff,
-                    diff_block, nan_bad, nan_rows, live, dead_bad, dead);
-        ++fails;
-    }
+                "values%s, %s; %zu gemv_vp kernels\n",
+                ok ? "pass" : "FAIL", c.name, c.N, c.K, c.tokens, order, packed, ne, raw_rounds, live_all,
+                damaged_expert >= 0 ? " and the damaged entry's rows NaN" : "", what, sizeof kVp / sizeof kVp[0]);
+    if (!ok) ++fails;
 }
 
 void synthetic(const Case& c, uint64_t seed) {

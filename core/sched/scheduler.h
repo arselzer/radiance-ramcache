@@ -127,6 +127,13 @@ struct SchedReq {
      * admission happens). */
     bool     restore_cut = false;
 
+    /* RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH: the end of the run of prefill chunks this
+     * sequence computed exactly as an idle cold prefill of any prompt it prefixes cuts them, from
+     * its hit (each alone in its step, from one grid position to the next). What lies past it was
+     * computed in another step shape (the prompt's last chunk, a decode step, a shared step), and
+     * close_request publishes no further. Set at admission, advanced by commit(). */
+    int64_t  grid_upto = 0;
+
     /* The whole sequence is prompt ++ output; n_computed indexes into it. */
     int64_t  seq_len() const {
         return (int64_t)req->prompt.size() + (int64_t)req->output.size();
@@ -739,6 +746,15 @@ private:
      * step, since the step after it must bring them back. */
     int     prefill_alone_ = 0;
     int64_t pf_skipped_ = 0;
+    /* RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH=1 (read at init; acts under --prefix-resume
+     * exact): a finished sequence publishes only up to SchedReq::grid_upto. An exact hit resumes
+     * where a cold prefill starts a chunk and recomputes the cold chunks from there, but it also
+     * adopts every block below its snapshot, and insert() keeps the bytes an entry was first
+     * published with: a block of a previous turn's short last chunk, or one a decode step wrote,
+     * then stands under a snapshot the next turn computed from its own full-chunk recompute of
+     * those positions. Bit-identical only if every kernel rounds a row the same at every pass
+     * height; with this, every published block is a cold chunk's own. */
+    bool    exact_publish_ = false;
     /* The throughput window (step_finished): each kind's tokens and the wall time the steps
      * covered, both decayed with the same time constant, so their ratio is tokens over time. */
     double  tps_win_prefill_ = 0.0, tps_win_decode_ = 0.0, tps_win_time_ = 0.0;

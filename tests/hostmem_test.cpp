@@ -126,4 +126,30 @@ TEST(the_cgroup_walk_visits_every_limited_level_up_to_the_root) {
     CHECK_EQ(seen[0].first, t.root);
 }
 
+/* The margin beside the expert RAM cache (Engine::host_headroom_bytes): the flag plus the cache's
+ * budget, less what its slabs already back. With nothing backed it is the margin startup always
+ * kept; a pregrown cache (every slab pinned at load) leaves the flag and the unbacked rest, which
+ * is what the checkpoint store sized after the load can still have. */
+TEST(the_host_margin_reserves_only_the_cache_its_slabs_have_not_backed) {
+    constexpr int64_t MiB = (int64_t)1 << 20;
+    /* No cache: the flag alone, whatever is said to be backed. */
+    CHECK_EQ(host_headroom_total(8192, 0, 0), 8 * GiB);
+    CHECK_EQ(host_headroom_total(8192, 0, 5 * GiB), 8 * GiB);
+    /* Nothing backed (before the load, or the switch off): the flag and the whole budget. */
+    CHECK_EQ(host_headroom_total(8192, 98304, 0), 104 * GiB);
+    /* Today's best arm after its pregrow: four ranks of 47 slabs each, a little under the 24 GiB
+     * a rank, leave the flag and that remainder. */
+    const int64_t backed = 4 * (24 * GiB - 300 * MiB);
+    CHECK_EQ(host_headroom_total(8192, 98304, backed), 8 * GiB + 4 * 300 * MiB);
+    /* Backed past the budget (a ledger charge rounding up) never goes under the flag. */
+    CHECK_EQ(host_headroom_total(8192, 98304, 97 * GiB), 8 * GiB);
+    CHECK_EQ(host_headroom_total(0, 1024, 2 * GiB), (int64_t)0);
+    /* Negative figures and sums past int64 refuse everything, as before. */
+    CHECK_EQ(host_headroom_total(-1, 1024, 0), INT64_MAX);
+    CHECK_EQ(host_headroom_total(1024, -1, 0), INT64_MAX);
+    CHECK_EQ(host_headroom_total(1024, 1024, -1), INT64_MAX);
+    CHECK_EQ(host_headroom_total(INT64_MAX / MiB, 1, 0), INT64_MAX);
+    CHECK_EQ(host_headroom_total(1, INT64_MAX / MiB, 0), INT64_MAX);
+}
+
 RAD_TEST_MAIN()

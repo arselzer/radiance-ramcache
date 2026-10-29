@@ -309,6 +309,9 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
         o["linear_hit_rate"] = m.linear_hit_rate;
         o["linear_cached_tokens"] = (double)m.linear_cached_tokens;
         o["checkpoints_written"] = (double)m.checkpoints_written;
+        /* RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH: computed tokens left unpublished, past the
+         * chunks an idle cold prefill cuts alike. 0 without the switch. */
+        o["publish_held_tokens"] = (double)m.prefix_publish_held_tokens;
         /* Why snapshots went and why hits reused nothing: on a hybrid model these say why a
          * long prompt was prefilled again. `hit_cut_tokens` is the checkpoint shortfall,
          * prompt tokens the attention cache held and admission computed again. */

@@ -3450,6 +3450,24 @@ int Engine::size_checkpoint_store(int64_t slot, const char* what) {
 }
 
 int Engine::configure_kv() {
+    /* RADIANCE_EXPERIMENTAL_CACHE_HEADROOM_BACKED=1: the RAM cache's slabs are allocated by now
+     * (all of them under ..._PREGROW, pinned at the weights' load), so the host checks below (the
+     * checkpoint store, KV mirrors) stop reserving those bytes on top of MemAvailable, which no
+     * longer has them. Without it a 96 GiB pregrown cache counts twice and leaves the checkpoint
+     * store no room: every prefix hit on a model with snapshots then prefills from the start. */
+    cache_backed_bytes_ = 0;
+    if (const char* hb = std::getenv("RADIANCE_EXPERIMENTAL_CACHE_HEADROOM_BACKED");
+        hb && !std::strcmp(hb, "1") && cfg_.expert_ram_cache_total_mib > 0) {
+        for (auto& r : ranks_) cache_backed_bytes_ += r->mover.mapped_cache_backed_bytes();
+        const int64_t MiB = (int64_t)1 << 20;
+        RAD_INFO("host headroom: RADIANCE_EXPERIMENTAL_CACHE_HEADROOM_BACKED: the RAM cache's slabs "
+                 "already hold %s of its %s budget, so the checks from here on keep %s free "
+                 "(--host-headroom-mib %lld and the %s it has yet to grow) beside what they "
+                 "allocate", humanb(cache_backed_bytes_).c_str(),
+                 humanb(cfg_.expert_ram_cache_total_mib * MiB).c_str(),
+                 humanb(host_headroom_bytes()).c_str(), (long long)cfg_.host_headroom_mib,
+                 humanb(host_headroom_bytes() - cfg_.host_headroom_mib * MiB).c_str());
+    }
     /* Resolved once, for the cache below and Scheduler::init later (see Engine::geo_). */
     RAD_TRY(chunk_geometry_resolve(ranks_[0]->program, cfg_, &geo_));
     if (geo_.checkpoint_interval != cfg_.checkpoint_interval)

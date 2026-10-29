@@ -1042,6 +1042,87 @@ TEST(an_exact_cold_prefill_keeps_its_last_chunk_whole) {
     CHECK((ckpts == std::vector<int64_t>{ 256, 512, 768 }));
 }
 
+/* RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH: a finished sequence publishes only the chunks an idle
+ * cold prefill cuts alike, so no later hit adopts a block a short last chunk or a decode step
+ * wrote beneath a snapshot computed from another turn's full-chunk recompute of it. */
+namespace {
+struct ExactPub { std::vector<int64_t> published; std::vector<int64_t> computed; int64_t held = 0; };
+/* Runs `prompts` (all submitted at once) to the end, with the switch `on`; `hit` > 0 seeds a
+ * snapshot hit there first. What was published, each sequence's computed tokens at its close,
+ * and the held-back counter. */
+ExactPub exact_publish_run(bool on, std::vector<int> prompts, int64_t hit = 0, bool exact = true) {
+    Fixture f;
+    exact_fixture(f, 0);                      /* the GDN hybrid: interval 256, chunks of 256 */
+    f.cfg.prefix_exact = exact;
+    if (on) setenv("RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH", "1", 1);
+    else unsetenv("RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH");
+    log_set_level(Log::Error);
+    const int rc = f.start();
+    unsetenv("RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH");
+    ExactPub out;
+    CHECK_OK(rc);
+    if (rc < 0) return out;
+    if (hit > 0) {
+        f.pc.seed(1600);
+        f.pc.lin = (int32_t)hit;              /* a snapshot on the 256 grid */
+        f.pc.src = 3;
+    }
+    std::vector<uint64_t> ids;
+    for (int n : prompts) ids.push_back(f.submit(n, 3));
+    for (int i = 0; i < 64; ++i) {
+        if (!f.sch.step()) break;
+        f.commit_plain();
+    }
+    for (const auto& p : f.pc.published) out.published.push_back(p.n_tokens);
+    for (uint64_t id : ids) {
+        const Request* r = f.sch.find(id);
+        out.computed.push_back(r ? r->n_computed : -1);
+        CHECK(r && r->state == ReqState::Finished);
+    }
+    out.held = f.sch.metrics().prefix_publish_held_tokens;
+    return out;
+}
+}  /* namespace */
+
+TEST(exact_publish_stops_at_the_last_chunk_a_cold_prefill_cuts_alike) {
+    /* Off: everything computed, the 232-token last chunk and the decode steps included. */
+    ExactPub off = exact_publish_run(false, { 1000 });
+    REQUIRE_EQ(off.published.size(), (size_t)1);
+    CHECK(off.computed[0] > 1000);
+    CHECK_EQ(off.published[0], off.computed[0]);
+    CHECK_EQ(off.held, 0ll);
+    /* On: [0, 768), the three full chunks; the last chunk and decode are held back. */
+    ExactPub on = exact_publish_run(true, { 1000 });
+    REQUIRE_EQ(on.published.size(), (size_t)1);
+    CHECK_EQ(on.published[0], 768ll);
+    CHECK_EQ(on.held, on.computed[0] - 768);
+    /* A prompt ending on the grid: its last chunk is a full one, published; decode is not. */
+    on = exact_publish_run(true, { 1024 });
+    REQUIRE_EQ(on.published.size(), (size_t)1);
+    CHECK_EQ(on.published[0], 1024ll);
+    CHECK_EQ(on.held, on.computed[0] - 1024);
+    /* From a hit at a snapshot: the adopted 512, then its own full chunks to 1024. */
+    on = exact_publish_run(true, { 1300 }, 512);
+    REQUIRE_EQ(on.published.size(), (size_t)1);
+    CHECK_EQ(on.published[0], 1024ll);
+    off = exact_publish_run(false, { 1300 }, 512);
+    REQUIRE_EQ(off.published.size(), (size_t)1);
+    CHECK_EQ(off.published[0], off.computed[0]);
+    /* Two prompts sharing their steps: no chunk was alone in its step, so nothing is published
+     * (an idle cold prefill would have cut each step's rows apart); off, both are. */
+    on = exact_publish_run(true, { 300, 300 });
+    CHECK(on.published.empty());
+    CHECK_EQ(on.held, on.computed[0] + on.computed[1]);
+    off = exact_publish_run(false, { 300, 300 });
+    CHECK_EQ(off.published.size(), (size_t)2);
+    /* --prefix-resume nearest has no grid to say what a cold prefill cuts: the switch does
+     * nothing there. */
+    on = exact_publish_run(true, { 1000 }, 0, /*exact=*/false);
+    REQUIRE_EQ(on.published.size(), (size_t)1);
+    CHECK_EQ(on.published[0], on.computed[0]);
+    CHECK_EQ(on.held, 0ll);
+}
+
 TEST(a_chunk_ending_on_a_checkpoint_carries_it_into_the_batch) {
     Fixture f;
     f.build();

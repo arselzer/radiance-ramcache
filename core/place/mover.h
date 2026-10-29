@@ -649,6 +649,11 @@ public:
     bool  read_weight_file(const WeightInfo& w, void* dst);
     bool  mapped_cache_on() const { return mapped_file_cache_on_; }
     int64_t mapped_cache_bytes() const { return mapped_file_cache_on_ ? cfg_.native_file_cache_bytes : 0; }
+    /* The host memory the mapped cache holds now, against its mapped_cache_bytes() budget: its
+     * slabs' backing (every slab once ..._PREGROW pinned them at init, the grown ones otherwise),
+     * or the entries' payload without slabs. 0 with the cache off. Engine::host_headroom_bytes
+     * stops reserving it twice (RADIANCE_EXPERIMENTAL_CACHE_HEADROOM_BACKED). */
+    int64_t mapped_cache_backed_bytes() const;
     /* RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE=1 (slabs only): the mapped cache holds the routed
      * experts in the CPU-only packed form (tools/ds41-host-experts/ds41_host_experts.h), which only
      * borrow_host_unit's readers can use: the card's copy path neither reads nor fills it. The

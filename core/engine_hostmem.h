@@ -27,4 +27,14 @@ void cgroup_levels(const std::string& root, std::string path, bool v2,
  * not count. An unreadable limit is ignored, never guessed. */
 bool lockable_room(int64_t need, int64_t still, int64_t margin, bool mlocks, std::string* why);
 
+/* The margin a startup check keeps free (Engine::host_headroom_bytes): --host-headroom-mib plus
+ * the part of the expert RAM cache's budget (--expert-ram-cache-total-mib) its slabs have not
+ * backed yet, which a cache growing on demand takes later. `backed_bytes` is what the slabs
+ * already hold: that memory is already gone from MemAvailable, so reserving it again counts it
+ * twice. With every slab pinned at load (RADIANCE_EXPERIMENTAL_NATIVE_CACHE_PREGROW) the whole
+ * budget is counted twice, and a 96 GiB cache on a 123 GiB host leaves the checkpoint store no
+ * room at all. `backed_bytes` 0 is the whole budget, as the margin always was. INT64_MAX for a
+ * negative figure or a sum past int64. */
+int64_t host_headroom_total(int64_t headroom_mib, int64_t cache_mib, int64_t backed_bytes);
+
 }  /* namespace rad */

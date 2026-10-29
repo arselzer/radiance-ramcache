@@ -10,9 +10,15 @@
  * stats on this object (another thread's call waits for the join, as it would for a run). post()
  * itself never waits: with the readers on another thread's call it posts nothing (that caller then
  * reads its own way, with no wait ahead of its other work).
+ *
+ * run() and join() take an optional WaitHook: a call made once on the caller's thread while it
+ * waits for the readers, at a set time if they are not done by then (the CPU pool's pre-wake before
+ * a miss read's jobs, RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_PREWAKE). Without one the wait is as
+ * before.
  */
 #pragma once
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <condition_variable>
 #include <cstdint>
@@ -36,6 +42,14 @@ public:
     };
     using Entry = void (*)(void*, int);
     using Launch = std::thread (*)(Entry, void*, int);
+    /* fn(ctx) once, on the caller's thread and without the readers' state lock, when the caller
+     * (its own share done) still waits for readers at `at_ns` (steady clock): at once if that has
+     * passed by then; never when every reader is done first. */
+    struct WaitHook {
+        void (*fn)(void*) = nullptr;
+        void*   ctx = nullptr;
+        int64_t at_ns = 0;
+    };
 
     /* Launch injection lets the HOST checker exercise partial startup failure. The production
      * default is exactly std::thread; failed startup never publishes a read callback. */
@@ -44,7 +58,7 @@ public:
     NativeReadWorkers& operator=(const NativeReadWorkers&) = delete;
     ~NativeReadWorkers() { reset(); }
 
-    template <class Work> Result run(int maximum, int active, Work& work) {
+    template <class Work> Result run(int maximum, int active, Work& work, const WaitHook* hook = nullptr) {
         std::lock_guard<std::mutex> dispatch(call_mutex_);
         if (maximum < 1 || maximum > 8 || active < 1 || active > maximum)
             return Result::Invalid;
@@ -73,7 +87,7 @@ public:
         try { work(0); } catch (...) { caller_failed = true; }
         {
             std::unique_lock<std::mutex> state(state_mutex_);
-            done_.wait(state, [&] { return pending_ == 0; });
+            wait_done(state, hook);
             const bool failed = callback_failed_ || caller_failed;
             /* All active readers have left the callback before its stack captures disappear. */
             context_ = nullptr;
@@ -120,7 +134,7 @@ public:
     /* After a post() on this thread: work(0) on the caller -- whatever the readers have not
      * taken yet -- then the wait for them; the call mutex is released. Complete or
      * CallbackFailed as run(); Invalid when nothing was posted. */
-    Result join() {
+    Result join(const WaitHook* hook = nullptr) {
         if (!posted_) return Result::Invalid;
         posted_ = false;
         /* This thread wrote context_ and invoke_ in post(); readers only read them. */
@@ -129,7 +143,7 @@ public:
         Result result;
         {
             std::unique_lock<std::mutex> state(state_mutex_);
-            done_.wait(state, [&] { return pending_ == 0; });
+            wait_done(state, hook);
             result = callback_failed_ || caller_failed ? Result::CallbackFailed : Result::Complete;
             context_ = nullptr;
             invoke_ = nullptr;
@@ -155,6 +169,18 @@ public:
 private:
     static std::thread launch_thread(Entry entry, void* context, int id) {
         return std::thread(entry, context, id);
+    }
+    /* The caller's wait for readers 1 .. active - 1, with the hook's call at its time. */
+    void wait_done(std::unique_lock<std::mutex>& state, const WaitHook* hook) {
+        if (hook && hook->fn && pending_ != 0) {
+            const std::chrono::steady_clock::time_point at{ std::chrono::nanoseconds(hook->at_ns) };
+            if (!done_.wait_until(state, at, [&] { return pending_ == 0; })) {
+                state.unlock();
+                hook->fn(hook->ctx);
+                state.lock();
+            }
+        }
+        done_.wait(state, [&] { return pending_ == 0; });
     }
     template <class Work> static Result invoke_serial(Work& work, bool fallback) {
         try { work(0); } catch (...) { return Result::CallbackFailed; }

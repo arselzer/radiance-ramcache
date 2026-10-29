@@ -643,9 +643,15 @@ public:
         int64_t copy_sum_ns = 0;    /* the mirror copies, summed */
         int64_t join_ns = 0;        /* posted: the caller came to wait (finish_unit_planes) */
         int64_t return_ns = 0;      /* the caller back, every read landed */
+        int64_t t0_ns = 0;          /* the dispatch itself (steady clock ns) */
     };
-    /* `rows`: the pass's tokens, which decide whether the plane mirror takes a share. */
-    bool  read_unit_planes(HostPlanes* const* units, int n, int rows = 1, PlaneReadTiming* timing = nullptr);
+    /* `rows`: the pass's tokens, which decide whether the plane mirror takes a share. `hook`: a call
+     * on the issuing thread while it waits for the kept readers, its at_ns counted from the call's
+     * dispatch (NativeReadWorkers::WaitHook; the CPU pool's pre-wake, stager.h hx_wake_*); none on
+     * the threads-a-call fallback. */
+    using ReadWaitHook = NativeReadWorkers::WaitHook;
+    bool  read_unit_planes(HostPlanes* const* units, int n, int rows = 1, PlaneReadTiming* timing = nullptr,
+                           const ReadWaitHook* hook = nullptr);
     /* read_unit_planes in two halves, for the issuing thread (RADIANCE_EXPERIMENTAL_DS41_MISS_POST):
      * start_unit_planes hands the reads to the kept readers and returns at once, so they run while
      * the caller goes on (the pool's jobs for the cached units); finish_unit_planes reads whatever
@@ -655,7 +661,7 @@ public:
      * read as before. One call in flight a Mover; the same thread calls both, and calls nothing
      * else that reads planes between them; the units' buffers stay put until the finish. */
     bool  start_unit_planes(HostPlanes* const* units, int n, int rows);
-    bool  finish_unit_planes(PlaneReadTiming* timing = nullptr);
+    bool  finish_unit_planes(PlaneReadTiming* timing = nullptr, const ReadWaitHook* hook = nullptr);
     bool  unit_planes_started() const { return plane_posted_; }
     bool  host_planes_eligible(int32_t u) const;   /* what read_unit_planes accepts */
     /* lay_out_unit_planes  for a read-ahead (readahead.h): unit p->unit laid out in p exactly as

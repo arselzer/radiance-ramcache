@@ -4,7 +4,9 @@
  * post nothing and hold nothing; a reader's exception comes back from the join; a run() on another
  * thread waits for the join (one call at a time), while a post() never waits for another thread's
  * call (it posts nothing); post and run share the threads (no restart); a failed thread start posts
- * nothing. Host threads only, at most 8. */
+ * nothing. A wait hook (the CPU pool's pre-wake in a miss read) runs once on the caller at its time
+ * while readers are still out, at once when its time has passed, and never when they finish first.
+ * Host threads only, at most 8. */
 #include "rad_test.h"
 
 #include "place/native_read_workers.h"
@@ -224,6 +226,105 @@ TEST(native_read_workers_a_post_never_waits_for_another_threads_call) {
     const auto st = w.stats();
     CHECK_EQ(st.busy_posts, (uint64_t)2);
     CHECK_EQ(st.posted_dispatches, (uint64_t)2);
+}
+
+namespace {
+
+/* The caller's share is short (id 0), the readers' long: the caller waits for them. */
+struct Uneven {
+    int caller_ms = 1, reader_ms = 100;
+    std::atomic<int> done{ 0 };
+    void operator()(int id) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(id == 0 ? caller_ms : reader_ms));
+        done.fetch_add(1);
+    }
+};
+
+/* A hook that notes its calls, when, and how many readers were done then. */
+struct HookProbe {
+    std::atomic<int> calls{ 0 }, done_then{ -1 };
+    std::atomic<int64_t> at_ns{ 0 };
+    std::atomic<int>* done = nullptr;
+    std::thread::id thread;
+    static void fn(void* self) {
+        auto* h = static_cast<HookProbe*>(self);
+        h->calls.fetch_add(1);
+        h->done_then.store(h->done ? h->done->load() : -1);
+        h->at_ns.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           std::chrono::steady_clock::now().time_since_epoch()).count());
+        h->thread = std::this_thread::get_id();
+    }
+};
+
+int64_t now_plus_ns(int64_t ns) {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch()).count() + ns;
+}
+
+}  // namespace
+
+TEST(native_read_workers_a_wait_hook_runs_once_at_its_time_while_readers_read) {
+    NativeReadWorkers w;
+    Uneven u;
+    HookProbe h;
+    h.done = &u.done;
+    NativeReadWorkers::WaitHook hook{ &HookProbe::fn, &h, now_plus_ns(15'000'000) };
+    const int64_t t0 = now_plus_ns(0);
+    CHECK_EQ(w.run(8, 3, u, &hook), NativeReadWorkers::Result::Complete);
+    CHECK_EQ(h.calls.load(), 1);
+    CHECK_EQ(u.done.load(), 3);
+    CHECK_EQ(h.done_then.load(), 1);   /* the caller's share only: both readers still out */
+    CHECK(h.thread == std::this_thread::get_id());
+    CHECK(h.at_ns.load() >= hook.at_ns);   /* not before its time ... */
+    CHECK(h.at_ns.load() - t0 < 90'000'000);   /* ... and before the readers' 100 ms */
+}
+
+TEST(native_read_workers_a_wait_hook_past_its_time_runs_as_the_caller_comes_to_wait) {
+    NativeReadWorkers w;
+    Uneven u;
+    HookProbe h;
+    h.done = &u.done;
+    NativeReadWorkers::WaitHook hook{ &HookProbe::fn, &h, now_plus_ns(-1'000'000'000) };
+    CHECK_EQ(w.run(8, 4, u, &hook), NativeReadWorkers::Result::Complete);
+    CHECK_EQ(h.calls.load(), 1);
+    CHECK_EQ(h.done_then.load(), 1);
+    /* The same through post and join. */
+    Uneven v;
+    HookProbe g;
+    g.done = &v.done;
+    REQUIRE(w.post(8, 2, v));
+    NativeReadWorkers::WaitHook later{ &HookProbe::fn, &g, now_plus_ns(10'000'000) };
+    CHECK_EQ(w.join(&later), NativeReadWorkers::Result::Complete);
+    CHECK_EQ(g.calls.load(), 1);
+    CHECK_EQ(v.done.load(), 3);
+    CHECK(g.done_then.load() <= 1);   /* at most the caller's share in by then */
+}
+
+TEST(native_read_workers_a_wait_hook_never_runs_when_the_readers_finish_first) {
+    NativeReadWorkers w;
+    /* Readers as quick as the caller, the hook's time far off: the wait ends without it, and
+     * without waiting for its time. */
+    Uneven u;
+    u.reader_ms = 1;
+    HookProbe h;
+    NativeReadWorkers::WaitHook hook{ &HookProbe::fn, &h, now_plus_ns(5'000'000'000) };
+    const auto t0 = std::chrono::steady_clock::now();
+    CHECK_EQ(w.run(8, 3, u, &hook), NativeReadWorkers::Result::Complete);
+    CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(2));
+    CHECK_EQ(h.calls.load(), 0);
+    /* Readers done while the caller's own share runs: no hook, though its time has passed. */
+    Uneven v;
+    v.caller_ms = 300;
+    v.reader_ms = 1;
+    HookProbe g;
+    NativeReadWorkers::WaitHook past{ &HookProbe::fn, &g, now_plus_ns(-1'000'000'000) };
+    CHECK_EQ(w.run(8, 3, v, &past), NativeReadWorkers::Result::Complete);
+    CHECK_EQ(g.calls.load(), 0);
+    /* A null hook, or one without a function, is the plain wait. */
+    Uneven x;
+    NativeReadWorkers::WaitHook none{};
+    CHECK_EQ(w.run(8, 3, x, &none), NativeReadWorkers::Result::Complete);
+    CHECK_EQ(w.run(8, 3, x, nullptr), NativeReadWorkers::Result::Complete);
 }
 
 TEST(native_read_workers_a_failed_start_posts_nothing) {

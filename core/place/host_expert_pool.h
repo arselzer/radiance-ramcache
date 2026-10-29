@@ -18,13 +18,29 @@
  * Optional: ..._CPUS=<list> pins the workers ("4-23" or "4,5,6"), ..._GBPS and ..._LINK_GBPS set
  * the scheduling estimates (4.2 GB/s a thread up to 78, and 20), ..._SPIN_US how long an idle
  * worker spins before it sleeps (200), ..._NICE the workers' nice value (0), ..._MAX_ROWS the most
- * token rows of one expert a job carries (4; up to 32, see max_rows). */
+ * token rows of one expert a job carries (4; up to 32, see max_rows).
+ *
+ * The wake-up, two experimental switches (off by default; off, the pool runs as without them):
+ *  - ..._FUTEX=1: idle workers sleep on a futex word (the work generation) instead of idle_mu_ and
+ *    a condition variable, and a submit wakes them with one FUTEX_WAKE and no lock. Through the
+ *    condition variable the waker holds idle_mu_ across the broadcast (23-27 us of a 28-36 us
+ *    decode decision), and every woken worker takes it again in turn, as do the other ranks'
+ *    submits meanwhile.
+ *  - ..._PREWAKE=N: prewake() wakes up to N sleeping workers ahead of jobs the caller expects
+ *    within ..._PREWAKE_SPIN_US (100): they spin that long for work and sleep again if none came.
+ *    The file stager calls it before a one-token layer's CPU work (stager.h, hx_wake_*): at the
+ *    layer's router event, and in a miss read ..._PREWAKE_LEAD_US (60) before its predicted end.
+ *    Workers kept runnable between bursts cost decode 7-8% (spin 2.5 ms, MWAITX 1.5 ms: the rank,
+ *    reader and insert threads need the CPUs), hence a subset, a short window and one call a
+ *    window (the ranks' calls for one layer come together).
+ * stats() counts both, and the wake-up itself, with either switch or neither. */
 #pragma once
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -115,6 +131,41 @@ public:
     float   limit() const { return limit_; }
     int     threads() const { return (int)workers_.size(); }
 
+    /* ..._PREWAKE (above): the workers a pre-wake wakes (0: off), and how long before a miss read's
+     * predicted end the file stager calls it (0: not in miss reads). */
+    int     prewake_n() const { return prewake_n_; }
+    int64_t prewake_lead_ns() const { return prewake_lead_ns_; }
+    bool    futex() const { return futex_; }
+    /* Who called prewake: a layer's router event, or a miss read's predicted end. */
+    enum { kWakeRouter = 0, kWakeMiss = 1, kWakeTriggers = 2 };
+    /* Wakes up to prewake_n() sleeping workers, which spin ..._PREWAKE_SPIN_US for work and then
+     * sleep again. Wakes nobody while the last call's workers are still in their window, or when
+     * prewake_n() workers are awake already. Returns the workers it woke (0 when off). */
+    int     prewake(int trigger);
+
+    /* The wake-up's counters, over the process (stats(), report()): submits and those whose wake
+     * found sleeping workers, and the time those wakes took the submitting thread; a submit's first
+     * job from its publication to its first tile claimed and to its kRampTiles-th (for every submit,
+     * and for those that found every worker asleep: `cold`); pre-wakes by trigger (calls that woke
+     * workers, calls that woke nobody, workers woken, those that took a tile in their window and
+     * those that slept again, and their spin) and the callers' time in prewake(); every idle spin
+     * (after a burst or a pre-wake) and the sleeps that ended them. */
+    static constexpr int kRampTiles = 24;
+    struct Stats {
+        uint64_t submits = 0, submit_woke = 0, wake_ns = 0;
+        uint64_t first_n = 0, first_ns = 0, ramp_n = 0, ramp_ns = 0;
+        uint64_t cold_first_n = 0, cold_first_ns = 0, cold_ramp_n = 0, cold_ramp_ns = 0;
+        uint64_t pre_calls[kWakeTriggers] = {}, pre_skipped[kWakeTriggers] = {};
+        uint64_t pre_woken[kWakeTriggers] = {}, pre_used[kWakeTriggers] = {};
+        uint64_t pre_slept[kWakeTriggers] = {}, pre_spin_ns[kWakeTriggers] = {};
+        uint64_t pre_call_ns = 0;
+        uint64_t spin_ns = 0, sleeps = 0;
+    };
+    Stats       stats() const;
+    std::string report() const;
+    /* The process's pool if get() started one, else null; never starts one (the shutdown report). */
+    static HostExpertPool* running();
+
     ~HostExpertPool();
 
 private:
@@ -139,36 +190,78 @@ private:
         Ticket*  ticket = nullptr;
         uint16_t* gate_up = nullptr;   /* max_rows() rows of 2 * kFf, in rows_ */
         uint16_t* act = nullptr;       /* max_rows() rows of kFf */
+        /* The wake-up's counters: the first job of a submit (`head`, `cold` when its wake found
+         * every worker asleep) and its publication (steady clock ns). */
+        bool     head = false, cold = false;
+        int64_t  pub_ns = 0;
+    };
+    /* A worker's own counters (Stats), on its own line: written by it alone, summed by stats(). */
+    struct alignas(64) WorkerStats {
+        std::atomic<uint64_t> spin_ns{ 0 }, sleeps{ 0 };
+        std::atomic<uint64_t> pre_used[kWakeTriggers] = {}, pre_slept[kWakeTriggers] = {};
+        std::atomic<uint64_t> pre_spin_ns[kWakeTriggers] = {};
     };
 
     HostExpertPool() = default;
     int  start(int threads, const std::vector<int>& cpus);
     void worker(int i, int cpu);
-    void wake();                     /* new jobs published: wake sleeping workers */
+    bool wake();                     /* new jobs published: wake sleeping workers (true: some slept) */
+    /* An idle worker's sleep until a wake (work_gen_ past `seen`) or stop; a pre-wake ends it too.
+     * Returns the pre-wake's trigger when one woke it, else -1. */
+    int  sleep(uint32_t seen, WorkerStats& ws);
+    /* A worker that slept through a pre-wake takes one of its tokens (as many as it woke, while its
+     * window is recent): true when it counts as pre-woken, whether its work had come by then or not. */
+    bool take_prewake();
+    void stop_workers();             /* stop_ set and every sleeper woken (destructor, failed start) */
     bool run_one();                  /* one tile of the oldest job with work; false when none */
     void tile(Slot& s, uint32_t gen, int k);
     void drained(int64_t left);      /* backlog_ now `left`: wake wait_idle at 0 */
+    void claimed(const Slot& s, int k);   /* a head job's tile k claimed: the ramp counters */
 
     std::unique_ptr<Slot[]> slots_;
     std::unique_ptr<uint16_t, void (*)(void*)> rows_{ nullptr, nullptr };   /* the slots' row buffers */
     std::vector<float>      silu_;
     float  limit_ = 10.0f;
     double cpu_bpns_ = 67.0, link_bpns_ = 20.0;
+    bool    futex_ = false;              /* ..._FUTEX */
+    int     prewake_n_ = 0;              /* ..._PREWAKE */
+    int64_t prewake_spin_ns_ = 100000;   /* ..._PREWAKE_SPIN_US */
+    int64_t prewake_lead_ns_ = 60000;    /* ..._PREWAKE_LEAD_US */
 
     std::vector<std::thread> workers_;
+    std::unique_ptr<WorkerStats[]> wstats_;
     std::atomic<bool>     stop_{ false };
     std::atomic<int64_t>  backlog_{ 0 };
-    std::atomic<uint64_t> work_gen_{ 0 };
+    /* The work generation: wake() moves it on, a worker sleeps while it is what the worker saw
+     * before looking for work. 32 bits: with ..._FUTEX it is the futex word itself. */
+    std::atomic<uint32_t> work_gen_{ 0 };
     std::mutex              submit_mu_;
     uint64_t                seq_ = 0;
     std::mutex              idle_mu_;
     std::condition_variable idle_cv_;
     std::atomic<int>        sleepers_{ 0 };
+    /* ..._PREWAKE: moved on by each pre-wake that wakes workers (a woken sleeper sees it moved),
+     * the trigger of the last one, its workers not yet counted (take_prewake), and the end of its
+     * workers' window (steady clock ns). */
+    std::atomic<uint32_t> prewake_gen_{ 0 };
+    std::atomic<int>      prewake_trigger_{ 0 };
+    std::atomic<int>      prewake_tokens_{ 0 };
+    std::atomic<int64_t>  prewake_until_ns_{ 0 };
     std::mutex              slot_mu_;    /* submit waits on slot_cv_ while every slot is taken */
     std::condition_variable slot_cv_;
     std::mutex              quiet_mu_;   /* wait_idle */
     std::condition_variable quiet_cv_;
     std::atomic<int>        quiet_waiters_{ 0 };
+    /* Stats that are not a worker's own (submits, claims, pre-wake calls). */
+    struct alignas(64) PoolStats {
+        std::atomic<uint64_t> submits{ 0 }, submit_woke{ 0 }, wake_ns{ 0 };
+        std::atomic<uint64_t> first_n{ 0 }, first_ns{ 0 }, ramp_n{ 0 }, ramp_ns{ 0 };
+        std::atomic<uint64_t> cold_first_n{ 0 }, cold_first_ns{ 0 }, cold_ramp_n{ 0 }, cold_ramp_ns{ 0 };
+        std::atomic<uint64_t> pre_calls[kWakeTriggers] = {}, pre_skipped[kWakeTriggers] = {};
+        std::atomic<uint64_t> pre_woken[kWakeTriggers] = {};
+        std::atomic<uint64_t> pre_call_ns{ 0 };
+    };
+    PoolStats pstats_;
 };
 
 }  /* namespace rad */

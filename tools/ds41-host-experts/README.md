@@ -151,7 +151,10 @@ round at every block position (down's tail included), widened rounds on the gene
   names the weights read by `gemm_nt_bf16f8`; every other arm runs with the knob off.
   `PROMPTS`, `AB_REQUESTS`, `AB_MAX_TOKENS`, `AB_CONCURRENCY` and `MAX_SEQS` change the workload.
 - `ab_requests.py`: sends a receipt's requests (token ids, `chat_text` framed like the held-out
-  prompts, or `messages`) and compares arms.
+  prompts, `chat_turns` conversations in the same framing, or `messages`) and compares arms;
+  `--ttft DIR ARM...` prints each request's time to first token and cached prompt tokens.
+- `make_prefix_receipt.py OUT MPL-2.0 core/mem/prefix.cpp`: the prefix-cache receipt
+  (`/home/as/ds41-claude-build/work/extra-prompts/prefix-chat-receipt.json`; see Prefix caching).
 - `cache_sim.py`: replays an access trace against LRU, SLRU, 2Q, aged LFU and Belady.
 - `chain_report.py PREFIX`: reads a `Ct` arm's `PREFIX.ops.csv` and `PREFIX.stamps.csv`: per layer
   kind the dispatches before the routing-counts sync, how many went (or would go) unordered and why
@@ -177,6 +180,47 @@ round at every block position (down's tail included), widened rounds on the gene
   (970,434 subnormal codes, 35,738 +0, 36,130 -0, block exponents 109..121), 610 E4M3 pieces in
   the census, 57 cuts all on 32; 13.7 GB in 17 s with 4 threads.
 - `ds41_host_experts_test.cpp`: host tests of the kernels against the scalar reference.
+
+## Prefix caching
+
+The A/Bs run with `--no-prefix-cache`. The engine's prefix cache serves DeepSeek-V4.1 as it is:
+the compressed and index groups (blocks of 2 and 1 tokens) are cached in 2-token entries; the
+window (`kv_window`, 9 blocks behind a position), the compressor's f32 tail (`kv_comp_tail_r2`)
+and the Engram token history (`kv_engram_tokens`) are state, so a hit resumes only at a snapshot
+(`--checkpoint-interval`, and a prompt's tail where its last chunk starts), restored on every rank
+before the step. Under `--prefix-resume exact` (the default) a snapshot sits where a cold prefill
+starts a chunk, which at `--max-num-batched-tokens 16` is any multiple of 16, so the tokens a hit
+recomputes are cut as a cold run cuts them. The CPU path, the file-buffer cap and the RAM cache see
+nothing of it; the indexer's score plane is per-step scratch.
+
+A snapshot costs no VRAM: 5.65 MiB a rank of pinned host memory (24 KiB of compressor tail, 24 B of
+Engram history, 9 window pages of 640 KiB), 22.6 MiB a slot for the four ranks, copied out after
+the chunk that ends there (~0.3 ms) and back before a hit's first step. `--checkpoint-slots auto`
+gives a sequence the geometric-backoff ladder at `--max-model-len` plus one: at 4096 tokens 11
+slots at an interval of 16, 8 at 128, 3 at 2048. KV is ~3.1 KiB a token a card, so the pool a
+`--max-model-len` buys holds that many tokens of finished conversations too.
+
+What blocked it in the measured configuration: `--expert-ram-cache-total-mib 98304` with
+`..._NATIVE_CACHE_PREGROW=1`. Startup keeps `--host-headroom-mib` plus the whole cache budget free
+in every host check, and after the load the pregrown slabs are already gone from MemAvailable
+(~12 GiB left), so the checkpoint store gets no room: `--checkpoint-slots auto` resolves to 0 and
+every hit prefills from the start (an explicit count is refused). And the default interval of 2048
+leaves a prompt of fewer than 2,048 tokens without any snapshot. The switches:
+
+| Setting | Effect | Arm part |
+|---|---|---|
+| `--no-prefix-cache` dropped | the cache on | `Pc` (also sets the next row) |
+| `RADIANCE_EXPERIMENTAL_CACHE_HEADROOM_BACKED=1` | the host checks after the load stop reserving what the cache's slabs already hold (`host headroom:` startup line); unchanged before the load | `Pc` (`Pc0`: the cache on without it, the control) |
+| `--checkpoint-interval N` | snapshots every N tokens (a multiple of 16); a prompt needs more than N tokens for its tail snapshot | `PciN` |
+| `--checkpoint-slots N` | the store's size (auto otherwise) | `PcsN` |
+| `RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH=1` | a finished sequence publishes only the prefill chunks it computed as an idle cold prefill cuts them (alone in their step, from one 16-token grid position to the next); without it a hit can adopt blocks the turn before last wrote in its short last chunk or in decode, under a snapshot computed from a full-chunk recompute of those positions, which is bit-identical only if every kernel rounds a row alike at every pass height up to 16 (a decode step's 1, a short chunk's, a full chunk's 16). `/stats` `publish_held_tokens` | `Pcx` |
+
+The test: `prefix-chat-receipt.json` (15 requests: a short prompt and its repeat; a 1,100-token
+license text with four questions and a repeat of the first; a four-turn conversation about a C++
+function with fixed replies, plus its third turn with another question; a story whose turns send the
+model's own replies back). Every reply of a `Pc` arm must equal the same configuration's without
+`Pc` (`ab_requests.py --compare`, `--ttft`); the `--ttft` table gives each request's TTFT and the
+prompt tokens it took from the cache.
 
 ## Correctness
 

@@ -19309,6 +19309,139 @@ static void f32_forms(const Plugin& pl, int64_t M, int64_t N, int64_t K, int ite
     }
 }
 
+/* gemm_nt_f32bf16 (an f32 weight stored as its bf16 halves, r4d_layout.cpp) against gemm_nt_f32 on
+ * the same bf16-valued weight widened to f32: byte for byte, and both against the host arithmetic
+ * f32_forms writes out. Timed (--perff32), every tile form (`form` 1-8: the rule's four, and four
+ * candidates for the halves' decode GEMV, whose loads carry half the bytes) for both weights, with
+ * GB/s on weight + input + output; weights rotate over copies past the last-level cache. The gate
+ * for RADIANCE_EXPERIMENTAL_DS41_ROUTER_BF16 is the halves' rule at N=384 K=5120 M=1 at or under
+ * 14 us (the f32 router: 19.7 us in the engine). */
+static void f32bf16_forms(const Plugin& pl, int64_t M, int64_t N, int64_t K, int iters,
+                          bool timed) {
+    const RadKernelInfo* rf = find(pl, "gemm_nt_f32_bf16");
+    const RadKernelInfo* rh = find(pl, "gemm_nt_f32bf16_bf16");
+    if (!rf || !rh) { ok("gemm_nt_f32bf16 forms", false, "row absent"); return; }
+    const int64_t xp = K + 5, yp = N + 3;
+    const size_t w32b = (size_t)N * (size_t)K * 4, w16b = (size_t)N * (size_t)K * 2,
+                 ybytes = (size_t)M * (size_t)yp * 4;
+    int copies = 1;
+    if (timed) {
+        copies = (int)(((size_t)256 << 20) / w16b) + 1;
+        if (copies > 64) copies = 64;
+    }
+    void* d_x = dalloc((size_t)M * (size_t)xp * 2);
+    void* d_w32 = dalloc(w32b * (size_t)copies);
+    void* d_w16 = dalloc(w16b * (size_t)copies);
+    void* d_y = dalloc(ybytes);
+    if (!d_x || !d_w32 || !d_w16 || !d_y) {
+        ok("gemm_nt_f32bf16 forms", false, "allocation failed");
+        return;
+    }
+    std::vector<uint16_t> x((size_t)M * (size_t)xp), w16((size_t)N * (size_t)K);
+    std::vector<float> w32(w16.size());
+    for (size_t i = 0; i < x.size(); ++i)
+        x[i] = h_to_bf16((float)((int)(st_mix32((uint32_t)i) % 2001) - 1000) / 1000);
+    for (size_t i = 0; i < w16.size(); ++i) {
+        w16[i] = h_to_bf16((float)((int)(st_mix32((uint32_t)i + 0x51ed27u) % 2001) - 1000) / 8000);
+        w32[i] = h_bf16(w16[i]);
+    }
+    st_memcpy(d_x, x.data(), x.size() * 2, hipMemcpyHostToDevice);
+    for (int c = 0; c < copies; ++c) {
+        st_memcpy((uint8_t*)d_w32 + (size_t)c * w32b, w32.data(), w32b, hipMemcpyHostToDevice);
+        st_memcpy((uint8_t*)d_w16 + (size_t)c * w16b, w16.data(), w16b, hipMemcpyHostToDevice);
+    }
+    std::vector<RadTensor> t32 = {
+        T(d_x, RAD_BF16, { M, K }), T(d_w32, RAD_F32, { N, K }), T(d_y, RAD_F32, { M, N }),
+    };
+    std::vector<RadTensor> t16 = {
+        T(d_x, RAD_BF16, { M, K }), T(d_w16, RAD_BF16, { N, K }), T(d_y, RAD_F32, { M, N }),
+    };
+    t32[0].stride[0] = t16[0].stride[0] = xp;
+    t32[2].stride[0] = t16[2].stride[0] = yp;
+    std::vector<RadParam> ps = { PI("M", M), PI("N", N), PI("K", K), PS("dtype", "bf16"),
+                                 PI("form", 0) };
+    RadArgs a32, a16;
+    std::memset(&a32, 0, sizeof(a32));
+    a32.t = t32.data(); a32.n_t = 3; a32.p = ps.data(); a32.n_p = 4; a32.world_size = 1;
+    a16 = a32;
+    a16.t = t16.data();
+
+    /* The arithmetic on the host, into a copy of the filled output (f32_forms'). */
+    std::vector<uint8_t> fill(ybytes, 0xa5), want = fill;
+    for (int64_t row = 0; row < M; ++row)
+        for (int64_t c = 0; c < N; ++c) {
+            float lane[32];
+            for (int l = 0; l < 32; ++l) {
+                float sum = 0;
+                for (int64_t j = l; j < K; j += 32)
+                    sum = std::fmaf(h_bf16(x[(size_t)(row * xp + j)]), w32[(size_t)(c * K + j)],
+                                    sum);
+                lane[l] = sum;
+            }
+            for (int mask = 16; mask; mask >>= 1) {
+                float next[32];
+                for (int l = 0; l < 32; ++l) next[l] = lane[l] + lane[l ^ mask];
+                std::memcpy(lane, next, sizeof lane);
+            }
+            std::memcpy(&want[(size_t)(row * yp + c) * 4], &lane[0], 4);
+        }
+    auto run = [&](const RadKernelInfo* r, RadArgs* a, std::vector<uint8_t>* got) {
+        st_memcpy(d_y, fill.data(), ybytes, hipMemcpyHostToDevice);
+        int rc = r->launch(a, nullptr);
+        if (rc == RAD_OK && st_stream_sync(nullptr) != hipSuccess) rc = RAD_E_DEVICE;
+        got->assign(ybytes, 0);
+        if (rc == RAD_OK) st_memcpy(got->data(), d_y, ybytes, hipMemcpyDeviceToHost);
+        return rc;
+    };
+    std::vector<uint8_t> g32, g16;
+    const int rc32 = run(rf, &a32, &g32), rc16 = run(rh, &a16, &g16);
+    const bool same = rc32 == RAD_OK && rc16 == RAD_OK && g32 == want && g16 == want;
+    std::string why;
+    if (rc32 != RAD_OK || rc16 != RAD_OK) why = fmt("rc %d / %d", rc32, rc16);
+    else if (!same) {
+        size_t f = 0;
+        const std::vector<uint8_t>& g = g16 != want ? g16 : g32;
+        while (f < g.size() && g[f] == want[f]) ++f;
+        why = fmt("%s differs from the host arithmetic at byte %zu",
+                  g16 != want ? "the bf16 halves" : "the f32 weight", f);
+    }
+    ok(fmt("gemm_nt_f32bf16 at M=%lld N=%lld K=%lld: byte-identical to gemm_nt_f32 and the host "
+           "arithmetic", (long long)M, (long long)N, (long long)K).c_str(),
+       same, why);
+    if (!timed || !same) return;
+    const double io = (double)M * K * 2 + (double)M * N * 4;
+    std::printf("\ngemm_nt_f32 / gemm_nt_f32bf16  N=%lld K=%lld M=%lld  %.2f / %.2f MiB weight, %d "
+                "copies, %d iters\n", (long long)N, (long long)K, (long long)M,
+                (double)w32b / (1 << 20), (double)w16b / (1 << 20), copies, iters);
+    static const char* const kForm[] = { "rule",   "4x1",    "2x2x16", "8x1x8", "8x4",
+                                         "1x2x16", "1x2x32", "2x2x32", "1x4x16" };
+    for (int form = 0; form <= 8; ++form) {
+        ps[4].ival = form;
+        a32.n_p = a16.n_p = form ? 5 : 4;
+        /* Each form byte-compared before it is timed: a form the rule does not take yet. */
+        std::vector<uint8_t> f32o, f16o;
+        const bool fsame = run(rf, &a32, &f32o) == RAD_OK && run(rh, &a16, &f16o) == RAD_OK &&
+                           f32o == want && f16o == want;
+        if (form) ok(fmt("gemm_nt_f32bf16 form %s at M=%lld N=%lld K=%lld: byte-identical",
+                         kForm[form], (long long)M, (long long)N, (long long)K).c_str(), fsame);
+        const double us32 = st_time_us([&](int i) {
+            t32[1].data = (uint8_t*)d_w32 + (size_t)(i % copies) * w32b;
+            rf->launch(&a32, nullptr);
+        }, iters, nullptr);
+        const double us16 = st_time_us([&](int i) {
+            t16[1].data = (uint8_t*)d_w16 + (size_t)(i % copies) * w16b;
+            rh->launch(&a16, nullptr);
+        }, iters, nullptr);
+        t32[1].data = d_w32;
+        t16[1].data = d_w16;
+        std::printf("  %-8s f32 %8.1f us %7.1f GB/s   bf16 halves %8.1f us %7.1f GB/s\n",
+                    kForm[form], us32, ((double)w32b + io) / (us32 * 1e3), us16,
+                    ((double)w16b + io) / (us16 * 1e3));
+    }
+    ps[4].ival = 0;
+    a32.n_p = a16.n_p = 4;
+}
+
 /* gemm_fp8a8_f32scale's dense form at the shape (a decode form or a row tile, by the rule)
  * compared byte for byte with the legacy 16x64 tile, which an activation pitch off 16 bytes takes;
  * the output keeps a filled pitch, so an overrun or a missed row shows. Timed, it also prints its
@@ -31013,6 +31146,16 @@ static void device_phase(const Plugin& pl) {
         f32_forms(pl, 7, 31, 129, 0, false);
         f32_forms(pl, 70, 13, 130, 0, false);
     }
+    if (sel("gemm_nt_f32bf16_bf16")) {
+        /* DeepSeek-V4.1's router (384 x 5120) and compressor kv|gate (1024 x 5120) at decode and
+         * prefill heights, and the tails. */
+        for (int64_t rows : { 1, 2, 16, 33, 64, 130 })
+            f32bf16_forms(pl, rows, 384, 5120, 0, false);
+        for (int64_t rows : { 1, 16, 70 }) f32bf16_forms(pl, rows, 1024, 5120, 0, false);
+        for (int64_t cols : { 4, 36, 96 }) f32bf16_forms(pl, 3, cols, 4096, 0, false);
+        f32bf16_forms(pl, 7, 31, 129, 0, false);
+        f32bf16_forms(pl, 70, 13, 130, 0, false);
+    }
     if (sel("dsa_score_fp8")) {
         dsa_score_check(pl, 1, 17);
         dsa_score_check(pl, 7, 257);
@@ -31658,7 +31801,9 @@ static void usage(void) {
                 "             one shape, with the weight bandwidth each reaches.\n"
                 "  --perfbf16 N K M [iters]:  the bf16 skinny GEMM at every variant it has.\n"
                 "  --perff32 N K M [iters]:  gemm_nt_f32 at the tile form its rule picks, compared\n"
-                "             byte for byte with the host arithmetic, with GB/s and TFLOP/s.\n"
+                "             byte for byte with the host arithmetic, with GB/s and TFLOP/s; then\n"
+                "             gemm_nt_f32bf16 (the weight as its bf16 halves) against it at every\n"
+                "             tile form, each byte-compared and timed for both weights.\n"
                 "  --perfq N K M [iters]:  the block-quantised trunk rows GLM resolves to: E4M3 with\n"
                 "             F32 block scales and the three OCP-MXFP4 rows, GB/s on weight + scales.\n"
                 "  --perfw4 N K M [iters]:  a tuning sweep of the asymmetric W4 x F16 GEMM;\n"
@@ -32302,6 +32447,7 @@ int main(int argc, char** argv) {
         if (!load(&pl, path)) return 1;
 #ifdef RAD_HAVE_HIP
         if (perf_f32)     f32_forms(pl, perf_m, perf_n, perf_k, perf_it, true);
+        if (perf_f32)     f32bf16_forms(pl, perf_m, perf_n, perf_k, perf_it, true);
         else if (perf_q)  q_perf(pl, perf_n, perf_k, perf_m, perf_it);
         else if (perf_wpa) wpa_perf(pl, perf_n, perf_k, perf_m, perf_it, perf_pb1);
         else if (perf_mx) mx_perf(pl, perf_n, perf_k, perf_m, perf_it);

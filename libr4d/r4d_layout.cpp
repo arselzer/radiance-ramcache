@@ -1980,3 +1980,99 @@ extern "C" int r4d_rad_unrelayout_convt_phase_f32(const RadParam* p, int n_p, in
                 }
     return RAD_OK;
 }
+
+/* ---- gemm_nt_f32bf16: an f32 weight kept as its bf16 halves.
+ *
+ * gemm_nt_f32 keeps routing and gating projections in f32. Some ship as bf16 and reach the
+ * container widened to f32 because the op declares f32 (DeepSeek-V4.1's routers, 7.86 MB a layer
+ * replicated on every card, and its compressors' kv|gate projections): every element's low 16 bits
+ * are zero. Stored as the high halves, row-major bf16 [rows, cols], the kernel (r4d_glm.hip) widens
+ * each back by a shift, so it reads half the bytes and multiplies the same operand bits in the same
+ * order: every output bit is gemm_nt_f32's.
+ *
+ * The relayout checks every element and refuses the weight at a nonzero low half, a value bf16
+ * cannot hold. Dropping it would choose new numbers, which is the quantiser's decision and never a
+ * layout's (rad_abi.h), so a weight that is not exactly bf16 fails the load instead of serving a
+ * slightly different model. A bf16 plane (a checkpoint read directly) is stored as it is, and an
+ * f16 one is left to the loader's exact widening to f32, which the kernel also reads. Operand 1 of
+ * gemm_nt_f32bf16 (oGemmNt's `b`). The op's N may be a column slice of the weight (the split
+ * router, rad_glm_tp.h); the layout covers the whole plane. */
+namespace {
+constexpr int F32BF16_W_OPERAND = 1;
+
+int f32bf16_layout(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
+                   const RadTensor* pl, int n, RadLayout* out) {
+    if (!out) return RAD_E_INVAL;
+    if (operand != F32BF16_W_OPERAND) return RAD_E_UNSUPPORTED;
+    if (enc && (!rad_enc_is(enc, "plain") || enc->n_planes != 1 || enc->transform[0]))
+        return RAD_E_DTYPE;
+    if (n != 1 || !pl || pl[0].rank != 2 || pl[0].shape[0] < 1 || pl[0].shape[1] < 1)
+        return RAD_E_SHAPE;
+    const long long N = r4d_pgeti_or(p, n_p, "N", 0), K = r4d_pgeti_or(p, n_p, "K", 0);
+    if (N < 1 || K < 1 || pl[0].shape[1] != K || pl[0].shape[0] < N) return RAD_E_SHAPE;
+    if (pl[0].dtype == RAD_BF16 || pl[0].dtype == RAD_F16) return RAD_E_UNSUPPORTED;
+    if (pl[0].dtype != RAD_F32) return RAD_E_DTYPE;
+    const long long rows = pl[0].shape[0], cols = pl[0].shape[1];
+    fill(out, "r4d.f32bf16.rowmajor", RAD_BF16, rows, cols, rows * cols * 2);
+    return RAD_OK;
+}
+}  /* namespace */
+
+extern "C" int r4d_rad_layout_f32bf16(const RadParam* p, int n_p, int operand,
+                                      const RadEncoding* enc, const int* sel, const RadTensor* pl,
+                                      int n, RadLayout* out) {
+    (void)sel;
+    return f32bf16_layout(p, n_p, operand, enc, pl, n, out);
+}
+
+extern "C" int r4d_rad_relayout_f32bf16(const RadParam* p, int n_p, int operand,
+                                        const RadEncoding* enc, const int* sel, const RadTensor* pl,
+                                        int n, void* dst, int64_t dst_bytes) {
+    (void)sel;
+    RadLayout L;
+    const int rc = f32bf16_layout(p, n_p, operand, enc, pl, n, &L);
+    if (rc != RAD_OK) return rc;
+    if (dst_bytes != L.bytes || !pl[0].data || !dst) return RAD_E_SHAPE;
+    const long long rows = pl[0].shape[0], cols = pl[0].shape[1], count = rows * cols;
+    const uint8_t* s = (const uint8_t*)pl[0].data;
+    uint16_t* d = (uint16_t*)dst;
+    long long bad = 0, first = -1;
+    uint32_t first_bits = 0;
+    for (long long i = 0; i < count; ++i) {
+        uint32_t u;
+        std::memcpy(&u, s + 4 * i, 4);
+        if (u & 0xFFFFu) {
+            if (first < 0) { first = i; first_bits = u; }
+            ++bad;
+        }
+        d[i] = (uint16_t)(u >> 16);
+    }
+    if (bad) {
+        std::fprintf(stderr,
+                     "[r4d] f32bf16: %lld of the %lld x %lld weight's elements have a nonzero low "
+                     "half, so it is not a bf16 weight (the first at row %lld, column %lld: "
+                     "0x%08x); refused rather than rounded\n",
+                     bad, rows, cols, first / cols, first % cols, (unsigned)first_bits);
+        return RAD_E_DTYPE;
+    }
+    return RAD_OK;
+}
+
+extern "C" int r4d_rad_unrelayout_f32bf16(const RadParam* p, int n_p, int operand,
+                                          const RadEncoding* enc, const int* sel,
+                                          const void* src, int64_t src_bytes, const RadTensor* pl,
+                                          int n) {
+    (void)sel;
+    RadLayout L;
+    const int rc = f32bf16_layout(p, n_p, operand, enc, pl, n, &L);
+    if (rc != RAD_OK) return rc;
+    if (src_bytes != L.bytes || !pl[0].data || !src) return RAD_E_SHAPE;
+    const long long count = pl[0].shape[0] * pl[0].shape[1];
+    const uint16_t* s = (const uint16_t*)src;
+    uint8_t* d = (uint8_t*)pl[0].data;
+    for (long long i = 0; i < count; ++i) {
+        const uint32_t u = (uint32_t)s[i] << 16;
+        std::memcpy(d + 4 * i, &u, 4);
+    }
+    return RAD_OK;
+}

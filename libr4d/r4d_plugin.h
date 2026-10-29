@@ -627,6 +627,9 @@ R4D_HOOKS(moe_w4_mod4)
 /* gemm_nt_bf16f8's E4M3 codes and E8M0 32x32 exponents from a plain bf16 weight (r4d_layout.cpp,
  * r4d_bf16f8_layout.h): refused at load unless every element re-encodes exactly. */
 R4D_HOOKS(bf16f8)
+/* gemm_nt_f32bf16: an f32 weight stored as its bf16 halves, every low half checked zero at load
+ * (r4d_layout.cpp). */
+R4D_HOOKS(f32bf16)
 #undef R4D_HOOKS
 int r4d_rad_layout_fp8_rowmajor(const RadParam*, int, int, const RadEncoding*, const int*,
                                 const RadTensor*, int, RadLayout*);
@@ -773,6 +776,8 @@ int r4d_layout_fp8_f32scale(const RadParam*, int, int, const RadEncoding*, const
 int r4d_shape_dsa_query(const RadParam*, int, int, RadOpdDesc*);
 int r4d_rad_gemm_nt_f32(const RadArgs*, RadStream);
 int r4d_shape_gemm_nt_f32(const RadParam*, int, int, RadOpdDesc*);
+int r4d_rad_gemm_nt_f32bf16(const RadArgs*, RadStream);
+int r4d_shape_gemm_nt_f32bf16(const RadParam*, int, int, RadOpdDesc*);
 int r4d_rad_mla_project(const RadArgs*, RadStream);
 int r4d_shape_mla_project(const RadParam*, int, int, RadOpdDesc*);
 int r4d_rad_dsa_score(const RadArgs*, RadStream);

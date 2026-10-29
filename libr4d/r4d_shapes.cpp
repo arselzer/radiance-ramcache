@@ -1329,6 +1329,14 @@ extern "C" int r4d_shape_gemm_nt_f32(const RadParam* p, int n_p, int operand, Ra
                              opd((uint32_t)RAD_F32, M, N) };
     R4D_PICK(l);
 }
+/* gemm_nt_f32bf16's weight as the kernel is handed it: the stored bf16 halves, [N, K]. */
+extern "C" int r4d_shape_gemm_nt_f32bf16(const RadParam* p, int n_p, int operand,
+                                         RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), N = pi(p, n_p, "N"), K = pi(p, n_p, "K");
+    const RadOpdDesc l[] = { opd((uint32_t)RAD_BF16, M, K), opd((uint32_t)RAD_BF16, N, K),
+                             opd((uint32_t)RAD_F32, M, N) };
+    R4D_PICK(l);
+}
 extern "C" int r4d_shape_gemm_nt(const RadParam* p, int n_p, int operand,
                                  RadOpdDesc* out) {
 

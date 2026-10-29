@@ -1669,10 +1669,15 @@ int FileStager::hx_jobs_for(int e, const HostExpertPool::Job& proto) {
     int32_t n = 0;
     HostExpertPool::Job j = proto;
     int in_job = 0;
+    const int per_job = HostExpertPool::max_rows();   /* 4, or up to 32 (..._HOST_EXPERTS_MAX_ROWS) */
     auto flush = [&] {
         if (!in_job) return;
         j.more = in_job - 1;
         j.cost = HostExpertPool::job_cost(in_job);
+        if (in_job > HostExpertPool::kMaxRowsDefault) {
+            ++hx_stats_.many_jobs;
+            hx_stats_.many_rows += (uint64_t)in_job;
+        }
         hx_jobs_.push_back(j);
         j = proto;
         in_job = 0;
@@ -1683,7 +1688,7 @@ int FileStager::hx_jobs_for(int e, const HostExpertPool::Job& proto) {
         uint16_t* y = hx_out_ + (int64_t)i * kHxEmbd;
         if (!in_job) { j.x = x; j.y = y; }
         else { j.xs[in_job - 1] = x; j.ys[in_job - 1] = y; }
-        if (++in_job == HostExpertPool::kMaxRows) flush();
+        if (++in_job == per_job) flush();
         hx_rows_.push_back(i);
         ++n;
     }

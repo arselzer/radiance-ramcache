@@ -90,7 +90,10 @@ public:
      * finished job gives back its cost) and unreserve returns what is never submitted. */
     int64_t backlog() const { return backlog_.load(std::memory_order_relaxed); }
     void    reserve(int64_t bytes) { backlog_.fetch_add(bytes, std::memory_order_relaxed); }
-    void    unreserve(int64_t bytes) { backlog_.fetch_sub(bytes, std::memory_order_relaxed); }
+    void    unreserve(int64_t bytes) { drained(backlog_.fetch_sub(bytes, std::memory_order_relaxed) - bytes); }
+    /* Sleeps until the pool has nothing queued or reserved, or `max_ns` has passed: for work that
+     * should not share DRAM with the pool's streaming (the RAM cache's background inserts). */
+    void    wait_idle(int64_t max_ns);
     double  cpu_bytes_per_ns() const { return cpu_bpns_; }
     double  link_bytes_per_ns() const { return link_bpns_; }
     float   limit() const { return limit_; }
@@ -126,6 +129,7 @@ private:
     void wake();                     /* new jobs published: wake sleeping workers */
     bool run_one();                  /* one tile of the oldest job with work; false when none */
     void tile(Slot& s, uint32_t gen, int k);
+    void drained(int64_t left);      /* backlog_ now `left`: wake wait_idle at 0 */
 
     std::unique_ptr<Slot[]> slots_;
     std::vector<float>      silu_;
@@ -143,6 +147,9 @@ private:
     std::atomic<int>        sleepers_{ 0 };
     std::mutex              slot_mu_;    /* submit waits on slot_cv_ while every slot is taken */
     std::condition_variable slot_cv_;
+    std::mutex              quiet_mu_;   /* wait_idle */
+    std::condition_variable quiet_cv_;
+    std::atomic<int>        quiet_waiters_{ 0 };
 };
 
 }  /* namespace rad */

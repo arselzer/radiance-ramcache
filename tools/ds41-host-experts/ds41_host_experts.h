@@ -108,6 +108,11 @@ void gemv_avx2_rows(const Mx& w, const uint16_t* const* x, uint16_t* const* y, i
 
 /* swiglu_clamped over one row: gu is [gate n | up n], y is n. `silu` has 65536 entries. */
 void swiglu(const float* silu, const uint16_t* gu, uint16_t* y, int n, float limit);
+/* The same, eight values a step (the pool's form: one job's swiglu sits between its gate_up and its
+ * down tiles). The same multiply and rounding; the clamp is maxps/minps, which return the limit
+ * where fmax/fmin do for a quiet NaN `up`. Identical except for a signalling-NaN `up`, which the
+ * gate_up GEMV never writes (its NaNs are quiet). */
+void swiglu_avx2(const float* silu, const uint16_t* gu, uint16_t* y, int n, float limit);
 
 /* The table from the host's expf. For tests of everything else only: the served table must be
  * captured from the device (ds41_mxfp4_device_check.hip). */

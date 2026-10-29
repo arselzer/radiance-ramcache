@@ -271,6 +271,35 @@ int check() {
     const size_t de = diff(g1, g2) + diff(a1, a2) + diff(d1, d2);
     std::printf("%-26s scalar vs AVX2 x4 threads: %zu differing values\n", "expert forward", de);
     failures += de != 0;
+    /* swiglu_avx2 against swiglu: every gate pattern with every 61st up pattern and the special
+     * ones (zeros, the limits, infinities, quiet NaNs, subnormals). A signalling-NaN up, which
+     * the gate_up GEMV never writes, is the only input on which they may differ. */
+    {
+        std::vector<uint32_t> ups;
+        for (uint32_t u = 0; u < 65536; u += 61) ups.push_back(u);
+        for (uint32_t u : { 0x0000u, 0x8000u, 0x4120u, 0xc120u, 0x7f80u, 0xff80u, 0x7fc0u, 0xffc0u,
+                            0x0001u, 0x8001u, 0x007fu, 0x4121u, 0xc121u, 0x411fu })
+            ups.push_back(u);
+        std::vector<uint16_t> row(2 * kFf), s1(kFf), s2(kFf);
+        size_t dsw = 0, pairs = 0;
+        for (uint32_t u : ups) {
+            const bool snan = (u & 0x7f80u) == 0x7f80u && (u & 0x7fu) && !(u & 0x40u);
+            if (snan) continue;
+            for (uint32_t g0 = 0; g0 < 65536; g0 += kFf) {
+                for (int i = 0; i < kFf; ++i) {
+                    row[(size_t)i] = (uint16_t)((g0 + (uint32_t)i) & 0xffffu);
+                    row[(size_t)(kFf + i)] = (uint16_t)u;
+                }
+                swiglu(silu.data(), row.data(), s1.data(), kFf, kLimit);
+                swiglu_avx2(silu.data(), row.data(), s2.data(), kFf, kLimit);
+                dsw += diff(s1, s2);
+                pairs += kFf;
+            }
+        }
+        std::printf("%-26s swiglu_avx2 vs swiglu over %zu gate/up pairs: %zu differing values\n", "swiglu",
+                    pairs, dsw);
+        failures += dsw != 0;
+    }
     /* The same chain on packed weights with the release's scale mix: AVX2 at four threads and the
      * scalar reference on the packed form, against the scalar reference on the planes. */
     auto mix = [](int, int, uint64_t r) { return release_like(r, 119, 3000); };

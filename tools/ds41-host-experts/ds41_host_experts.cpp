@@ -747,6 +747,29 @@ bool pk_check(const Mx& w, const uint8_t* scales) {
     return ex.i == ex.n;   /* each raw round used once, in order: the list is ascending */
 }
 
+void swiglu8(const float* silu, const uint16_t* gu, uint16_t* y, int n, float limit) {
+    const __m256 lo = _mm256_set1_ps(-limit), hi = _mm256_set1_ps(limit);
+    const __m256i r7fff = _mm256_set1_epi32(0x7fff), one = _mm256_set1_epi32(1);
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m256i g = _mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i*)(gu + i)));
+        const __m256i ub =
+            _mm256_slli_epi32(_mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i*)(gu + n + i))), 16);
+        const __m256 s = _mm256_i32gather_ps(silu, g, 4);
+        const __m256 u = _mm256_min_ps(_mm256_max_ps(_mm256_castsi256_ps(ub), lo), hi);
+        const __m256i p = _mm256_castps_si256(_mm256_mul_ps(s, u));
+        const __m256i r = _mm256_srli_epi32(
+            _mm256_add_epi32(_mm256_add_epi32(p, r7fff), _mm256_and_si256(_mm256_srli_epi32(p, 16), one)), 16);
+        _mm_storeu_si128((__m128i*)(y + i),
+                         _mm_packus_epi32(_mm256_castsi256_si128(r), _mm256_extracti128_si256(r, 1)));
+    }
+    for (; i < n; ++i) {
+        const __m128 u = _mm_min_ss(_mm_max_ss(_mm_set_ss(bf16_to_f32(gu[n + i])), _mm_set_ss(-limit)),
+                                    _mm_set_ss(limit));
+        y[i] = f32_to_bf16(silu[gu[i]] * _mm_cvtss_f32(u));
+    }
+}
+
 #undef HX_INLINE
 #if defined(__clang__)
 #pragma clang attribute pop
@@ -788,6 +811,10 @@ void gemv_ref(const Mx& w, const uint16_t* x, uint16_t* y, int n0, int n1) {
         }
         y[n] = bf16_rne_nan(wave_sum(lane));
     }
+}
+
+void swiglu_avx2(const float* silu, const uint16_t* gu, uint16_t* y, int n, float limit) {
+    swiglu8(silu, gu, y, n, limit);
 }
 
 void gemv_avx2(const Mx& w, const uint16_t* x, uint16_t* y, int n0, int n1) {

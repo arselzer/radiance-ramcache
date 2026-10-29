@@ -1619,6 +1619,13 @@ void FileStager::hx_bg_loop() {
         hx_bg_q_.pop_front();
         ++hx_bg_busy_;
         lk.unlock();
+        /* RADIANCE_EXPERIMENTAL_DS41_INSERT_YIELD_US=N: an insert streams ~37 MB through DRAM, which
+         * the pool's workers are bound by; it waits (asleep) up to N us for the pool to drain. */
+        static const int64_t yield_ns = [] {
+            const char* y = std::getenv("RADIANCE_EXPERIMENTAL_DS41_INSERT_YIELD_US");
+            return y && *y ? (int64_t)std::clamp(std::atoi(y), 0, 100000) * 1000 : (int64_t)0;
+        }();
+        if (yield_ns > 0 && hx_pool_) hx_pool_->wait_idle(yield_ns);
         const int rc = mover_->insert_unit_planes(*p, &scratch);
         if (rc < 0 && !told) {
             RAD_WARN("host experts: relaying a missed unit into the RAM cache failed (%s); it stays "

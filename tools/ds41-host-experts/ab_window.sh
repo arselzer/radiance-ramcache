@@ -217,6 +217,21 @@ arm() {   # name, then env assignments for the server; CACHE_MIB the RAM cache (
     log "arm $name: a predictor part, but the server log has no 'router predictor: N routers loaded' line ($(grep -m1 -E 'router predictor' "$OUT/$name.server.log")); not measured"
     stop_server; return 1
   fi
+  # RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED (the Vp part): the engine names the switch at startup and
+  # each rank how many static residents it holds packed. A Vp arm without the switch's line or with
+  # no rank holding any packed (a radiance without the switch, a dynamic plan, a DSpark bank), or a
+  # plain arm with either line (the switch taken from the window's environment), is not measured.
+  local vp_on vp_held
+  vp_on=$(grep -c 'VRAM packed experts (RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED)' "$OUT/$name.server.log")
+  vp_held=$(grep -cE 'holds [1-9][0-9]* static residents' "$OUT/$name.server.log")
+  if [[ -n "${ARM_VP:-}" ]] && [[ "$vp_on" == 0 || "$vp_held" == 0 ]]; then
+    log "arm $name: Vp, but the server log has $vp_on 'VRAM packed experts (RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED)' and $vp_held 'holds N static residents' lines with N above 0 ($(grep -m2 -E 'VRAM packed experts' "$OUT/$name.server.log" | tr '\n' ' ')); not measured"
+    stop_server; return 1
+  fi
+  if [[ -z "${ARM_VP:-}" ]] && [[ "$vp_on" != 0 || "$vp_held" != 0 ]]; then
+    log "arm $name: no Vp part, but the server held experts packed (the switch set for the window?); not measured"
+    stop_server; return 1
+  fi
   # RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP (the Cs part): the scheduler says at startup whether it
   # took it, and the plugin whether it declared the suffix. An arm whose name says Cs and whose
   # server did not take it is not measured.
@@ -478,7 +493,9 @@ for a in $ARMS; do
 # Vp the cards' static expert residents in the packed-scale form, 4.4% smaller, so ~31 more a rank with F8
 # (RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED; needs a libr4d.so with moe_gemm_ggml_mxfp4_gemv_vp in the arm's
 # run home, --deterministic and passes of at most 16 tokens, which every arm here has); runs only on a
-# libr4d.so VPACK_CHECK's device check passed (vpack_gate above), skipped otherwise.
+# libr4d.so VPACK_CHECK's device check passed (vpack_gate above), skipped otherwise, and is measured
+# only if its server log names the switch and a rank holding N > 0 residents packed; every other arm
+# runs with the switch at 0 and must have neither line.
 # the RAM cache's profile-hot units get N second chances before eviction; MsN a decode pass that
 # misses one unit reads the plane mirror's tail in N pieces on N readers
 # (RADIANCE_EXPERIMENTAL_DS41_MIRROR_SPLIT, 2-4, designed for 3; needs R and RdNN); Mp a one-token
@@ -636,6 +653,10 @@ for a in $ARMS; do
     for h in "${homes[@]}"; do [[ -f "$h/kernels/libr4d.so" ]] && { vlib=$h/kernels/libr4d.so; break; }; done
     vpack_gate "$a" "${vlib:-${homes[0]}/kernels/libr4d.so}" || skip=1
   fi
+  # Every other arm states the switch off, so a window's VAR=val cannot pack its experts (arm() checks
+  # the server log both ways).
+  if [[ " ${env[*]} " == *" RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED=1 "* ]]; then ARM_VP=1
+  else ARM_VP=; env+=(RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED=0); fi
   ARM_F8=$f8
   # Every arm states the router knob, so a window's VAR=val cannot turn it on for the others. An Rb
   # arm runs only on the libr4d.so whose gemm_nt_f32bf16 passed the card checks before the arms

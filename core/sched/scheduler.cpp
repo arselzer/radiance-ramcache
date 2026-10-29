@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <numeric>
 
@@ -251,6 +252,69 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     draft_est_.reserve((size_t)cfg.max_seqs);
 
     RAD_TRY(builder_.init(prog, cfg, geo_, kvgeom_, ranks));
+    /* The consumer skip (consumer_skip.h): off unless asked for, and refused, with the reason,
+     * wherever its derivation does not cover the deployment. Read here, beside the other
+     * scheduler switch, so a test sets Config::consumer_skip instead of the environment. */
+    cs_on_ = false;
+    builder_.set_consumer(ConsumerShape{});
+    {
+        int want = cfg.consumer_skip;
+        if (want < 0) {
+            const char* v = std::getenv("RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP");
+            want = v && !std::strcmp(v, "1") ? 1 : 0;
+        }
+        if (want > 0) {
+            const RadConsumerSuffix& d = prog.consumer;
+            ConsumerShape c;
+            c.n_layer = d.n_layer;
+            c.boundary = d.boundary;
+            c.window = d.window;
+            c.max_rows = cfg.max_tok;
+            c.align = std::max<int64_t>(geo_.quantum, 1);
+            std::string why;
+            if (d.n_layer <= 0)
+                why = "the model's plugin declared no consumer suffix (deepseek41 declares one for "
+                      "DeepSeek-V4.1-Flash's own topology only; its line above says why not)";
+            else if (cfg.n_spec != 0 || prog.drafter.kind != RAD_DRAFT_NONE)
+                why = "speculation is on: a drafter's context reads every prompt row's hidden state, "
+                      "and verify steps are not covered";
+            else if (cfg.kld())
+                why = "--kld-record / --kld-ref score every prompt row";
+            else if (prog.pooled_buf)
+                why = "an embedding program pools every row";
+            else if (prog.encoder.modalities || prog.audio_encoder.modalities)
+                why = "media rows (an encoder is declared) are not covered";
+            else if (!rswa_windows_.empty())
+                why = "a runtime window (R-SWA) is not covered";
+            else if (cfg.max_seqs > 1 && !prefill_alone_ && cfg.max_tok > c.align)
+                why = fmt("--max-num-seqs %lld with chunks of up to %lld tokens on a %lld-token "
+                          "quantum: a prompt's chunk could share its step with decode rows or "
+                          "another chunk, which need every layer; run --max-num-seqs 1, "
+                          "--max-num-batched-tokens %lld, or RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE=1",
+                          (long long)cfg.max_seqs, (long long)cfg.max_tok, (long long)c.align,
+                          (long long)c.align);
+            else if (!c.valid())
+                why = fmt("the declared suffix (%d layers, boundary %d, window %d) at passes of %lld "
+                          "rows on a %lld-row grid is outside the derivation", d.n_layer,
+                          d.boundary, d.window, (long long)c.max_rows, (long long)c.align);
+            if (why.empty()) {
+                cs_on_ = true;
+                builder_.set_consumer(c);
+                RAD_INFO("consumer skip: on (RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP) -- a prompt's "
+                         "pure prefill passes run layers [0, F) in full and layer F's key ops alone, "
+                         "F >= %d of %d, and skip the rest: the rows that reach neither the prompt's "
+                         "last token nor the state after it (window %d, passes of at most %lld rows "
+                         "starting on a %lld-row grid)%s",
+                         d.boundary, d.n_layer, d.window, (long long)c.max_rows, (long long)c.align,
+                         cfg.prefix_cache && geo_.checkpoints()
+                             ? "; a prompt is cut for its tail checkpoint, and no checkpoint below "
+                               "it is written"
+                             : "");
+            } else {
+                RAD_WARN("consumer skip: refused -- %s; every layer runs on every row", why.c_str());
+            }
+        }
+    }
     /* The builder's bound, not a second derivation: the block tables were sized for it. */
     ctx_limit_ = builder_.max_ctx();
     /* The pool's own bound on one sequence, searched once (can_ever_fit is monotonic in the
@@ -670,6 +734,12 @@ void Scheduler::close_request(SchedReq& s, ReqState st, const char* reason, bool
 /* Reserve a checkpoint slot for the state at `pos`, written after the entry's row `tok`. A
  * refusal leaves the entry without one. */
 void Scheduler::reserve_ckpt(StepEntry& e, const Request& r, int64_t pos, int32_t tok) {
+    /* The consumer skip: a snapshot below the prompt's cut target would hold the last layers'
+     * windows incomplete; the one at the target is whole (consumer_skip.h). */
+    if (e.consumer_end > 0 && !consumer_checkpoint_complete(pos, e.consumer_end)) {
+        ++m_.consumer_ckpt_dropped;
+        return;
+    }
     int32_t cs = -1;
     /* R-SWA: a sequence with a runtime window is never checkpointed. The window is runtime data
      * (the prompt's own length), so a slot would describe a window the sequence does not have, and
@@ -1486,8 +1556,27 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
     server::sink_prompt_progress(r.sink, r.n_computed, (int32_t)r.prompt.size(), r.n_cached);
     s.sched_tokens = (int32_t)want;
     s.pending_ckpt = ckpt;
+    s.consumer_end = consumer_target(s);
     ++m_.admitted;
     return RAD_OK;
+}
+
+/* The consumer skip's target for a request just admitted (consumer_skip.h): the end of what its
+ * prefill computes, or, where the scheduler writes a tail checkpoint below it, that checkpoint,
+ * whose snapshot must hold every layer's window. 0 for a request whose every row matters: a
+ * scored prompt (KL mode) or an embedding input. */
+int64_t Scheduler::consumer_target(const SchedReq& s) const {
+    if (!cs_on_ || !s.req) return 0;
+    const Request& r = *s.req;
+    if (r.score || r.embed) return 0;
+    const int64_t target = s.seq_len();
+    if (target <= (int64_t)r.n_computed) return 0;
+    int64_t t = target;
+    if (cfg_.prefix_cache && geo_.checkpoints()) {
+        const int64_t tail = tail_checkpoint(chunk_end(r, target));
+        if (tail > (int64_t)r.n_computed && tail < t) t = tail;
+    }
+    return t;
 }
 
 void Scheduler::undo_hit(SchedReq& s) {
@@ -1805,6 +1894,7 @@ replan:
         e.draft = s.draft;
         e.n_draft = s.n_draft;
         e.is_prefill = prefill;
+        e.consumer_end = prefill ? s.consumer_end : 0;
         e.ngram = !prefill && s.draft_ngram && s.n_draft > 0;
         e.produces_token = (r.n_computed + want >= target);
         /* The snapshot a hit resumes from, consumed once: the state is in the slot for the whole
@@ -1889,6 +1979,7 @@ replan:
             e.draft = s.draft;
             e.n_draft = 0;
             e.is_prefill = true;
+            e.consumer_end = s.consumer_end;
             e.produces_token = (r.n_computed + s.sched_tokens >= s.seq_len());
             /* admit_one just set ckpt_src, and this is the entry it applies to. Consumed once:
              * restoring again on a later chunk would rewind the recurrence to the hit. */

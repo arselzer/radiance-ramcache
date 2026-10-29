@@ -290,6 +290,22 @@ typedef struct RadBatch {
      * position tables per grid) reads them here; they live as long as the pass. */
     const int32_t* enc_seg_h;
     const int32_t* enc_seg_w;
+
+    /* ---- appended (private; RAD_ABI_VERSION does not move): the exact consumer-suffix skip
+     * (rad_declare_consumer_suffix in rad_builder.h, core/sched/consumer_skip.h). Trailing and
+     * zero on every step a plugin that never declared a suffix can see, so an older plugin reads
+     * the same batch as before; only a plugin whose rad_declare_consumer_suffix returned RAD_OK
+     * reads them. */
+    /* Host. 0: the step runs every layer (every step but the ones below). Otherwise a pure
+     * prefill step of one sequence the engine cut: the number F of leading layers it runs in
+     * full, the declared boundary <= F < the model's layer count. Layer F runs its key ops alone
+     * and the layers after it nothing; the step samples nothing (n_out 0). */
+    int32_t consumer_full;
+    int32_t consumer_rsv;          /* zero */
+    /* Host. The prompt position the cut was derived for: the first position whose state must be
+     * exact (the end of the prompt, or the tail checkpoint just below it); 0 without a cut. For
+     * checks and logs: what a step issues depends on consumer_full alone. */
+    int64_t consumer_end;
 } RadBatch;
 
 /* What a generator pass carries beside the step batch's own fields, which keep their meanings:

@@ -412,6 +412,10 @@ public:
     /* A block drafter's shorter block (rad_drafter_short_block), 0 when it serves only its own. */
     int64_t        drafter_short_block = 0;
 
+    /* The exact consumer suffix the plugin declared (rad_declare_consumer_suffix), n_layer 0 when
+     * it declared none. What the engine does with it: core/sched/consumer_skip.h. */
+    RadConsumerSuffix consumer{};
+
     /* The declared media encoder (rad_declare_encoder). `modalities == 0` when none: every
      * text-only program, and every deployment with RadBuildCtx::max_enc_patches 0.
      * `encoder_name` is a copy, as `drafter_name` is. */
@@ -951,6 +955,9 @@ struct Config {
      * inside a span are not written; those at its end and at a prompt's tail are, where a span of
      * 1 writes them. */
     int64_t prefill_span = 1;
+    /* RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP (core/sched/consumer_skip.h): -1 reads the variable
+     * at the scheduler's start ("1" turns it on), 0 off, 1 on. A field so a test can set it. */
+    int     consumer_skip = -1;
     /* Cap on linear-state (or sliding-window) snapshots held at once, for the whole server. The
      * slots are pinned host memory, all allocated at startup and never on the card (spec §7.3).
      * A slot is a sizeable fraction of a gigabyte on a linear-attention model, so raising the cap

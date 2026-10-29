@@ -803,6 +803,38 @@ int rad_chain_on(void);
 /* ---- appended in ABI 27 (a block drafter's short block) */
 int rad_drafter_short_block(RadBuilder* b, int64_t block);
 
+/* ================================================================== an exact consumer suffix */
+/* The plugin's statement that the trunk's last layers need only a bounded suffix of a prompt's
+ * rows, which lets the engine run them on those rows alone (RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP;
+ * the schedule and its proof are core/sched/consumer_skip.h). With B = `boundary` and W = `window`,
+ * the plugin guarantees, for every layer L >= B of its `n_layer`:
+ *
+ *   - a row's result at layer L depends on other rows only through keys stored per row: layer L's
+ *     own keys, of which an attention at position p reads the W positions p - W + 1 .. p, each
+ *     computed from layer L's input at that position alone; and keys of layers at or below B,
+ *     every one of which layer B's key ops write (from layer B's input, every row);
+ *   - every op computes a row from that row's operands alone, in any step it runs in;
+ *   - "layer L's key ops" are the ops of layer L that compute and store those keys, issued as the
+ *     full layer issues them (the same ops on the same rows, in the same order), so the stored
+ *     bytes are the full layer's; they read nothing the layer's other ops write.
+ *
+ * In a step whose RadBatch::consumer_full is F (B <= F < n_layer), the plugin then runs layers
+ * [0, F) in full, layer F's key ops alone, nothing of the layers after F, and neither the final
+ * norm nor the head. Every other step runs as if the call had never been made.
+ *
+ * Called at most once, during declare, by a plugin whose graph meets the contract. The struct only
+ * grows at its end (`struct_size` is sizeof(RadConsumerSuffix) as the plugin was compiled).
+ * Additive export; RAD_ABI_VERSION does not move: a plugin reaches it through a weak reference,
+ * which is null on an engine older than the call, and reads RadBatch::consumer_full only once the
+ * call returned RAD_OK. */
+typedef struct RadConsumerSuffix {
+    uint32_t struct_size;
+    int32_t  n_layer;     /* the trunk's layers: RadModelMeta::n_layers */
+    int32_t  boundary;    /* B: layers below it are never cut; it always runs at least its key ops */
+    int32_t  window;      /* W: an attention at position p reads its layer's keys p - W + 1 .. p */
+} RadConsumerSuffix;
+int rad_declare_consumer_suffix(RadBuilder* b, const RadConsumerSuffix* d);
+
 /* ================================================================== the encoder */
 /* A media encoder the plugin runs on an encoder pass (RadBatch::enc). The core drives the pass and
  * reads its result, so the plugin declares it. A plugin that declares none serves text only, and

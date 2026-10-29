@@ -86,6 +86,12 @@ struct Engine::Rank {
      * memory ahead of the sampler. Grown to the most rows a step has scored. */
     float*    score_host = nullptr;
     int64_t   score_rows_cap = 0;
+    /* RADIANCE_EXPERIMENTAL_DS41_PREFILL_HASH (engine_hash.cpp): this rank's lines for the step and
+     * each prompt's digest, and a pinned buffer one KV layer's pool is copied into. */
+    std::vector<std::string> hash_lines;
+    std::vector<uint64_t>    hash_digest;
+    uint8_t*  hash_host = nullptr;
+    int64_t   hash_cap = 0;
     rad_buf   tok_buf = 0;      /* where the chain writes the sampled ids */
     /* The card's step state (sched/advance.h): one StepSlot per scheduler slot, and the sorted
      * end-of-generation ids acceptance stops at. Every rank keeps its own and computes the same
@@ -93,6 +99,30 @@ struct Engine::Rank {
     StepSlot* step_slots = nullptr;
     int32_t*  eog = nullptr;
     int32_t   n_eog = 0;
+};
+
+/* RADIANCE_EXPERIMENTAL_DS41_PREFILL_HASH (engine_hash.cpp): the prompts whose prefill the step
+ * ends, and for each what its KV groups hold for it on rank 0's manager (every rank's tables are
+ * rank 0's block ids), staged with the ranks parked. */
+struct Engine::PrefillHashJob {
+    struct Group {
+        int32_t              g = 0;           /* handle */
+        int                  kind = 0;        /* RAD_KV_* */
+        int64_t              block = 0;       /* block_size */
+        int64_t              window = 0;      /* a WINDOW group's positions */
+        int64_t              first = 0;       /* the position the table starts at */
+        int32_t              state = -1;      /* a stateful group's slot */
+        std::vector<int32_t> table;
+    };
+    struct Seq {
+        uint64_t           seq = 0;
+        int64_t            n = 0;             /* positions the prompt wrote */
+        int32_t            row = -1;          /* its logits row */
+        int64_t            cut = 0;           /* StepEntry::consumer_end */
+        std::vector<Group> groups;
+    };
+    int              step = -1;
+    std::vector<Seq> seqs;
 };
 
 /* The tiers' work in flight (Engine::tier_tick): one copy batch per rank's transfer stream at a

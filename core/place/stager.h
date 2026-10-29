@@ -408,6 +408,11 @@ private:
     RadEvent  counts_ev_ = nullptr;
     bool      routed_ = false;                   /* this pass reads routed experts only */
     int64_t   pass_tok_ = 0;
+    /* The layers whose MoE this pass runs: RadBatch::consumer_full on a pass the consumer skip
+     * cut (core/sched/consumer_skip.h), every layer otherwise. Nothing is read, staged, predicted
+     * or read ahead for a layer at or past it. */
+    int32_t   pass_full_ = INT32_MAX;
+    bool      moe_runs(int32_t layer) const { return layer < pass_full_; }
     bool trace_requested_ = false, trace_target_m1_ = false;
     /* Batch eligibility only. start() additionally requires this exact native EP layer;
      * selected-routed starts always use Normal. Immutable copy passed per mover call. */

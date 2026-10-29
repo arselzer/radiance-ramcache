@@ -590,6 +590,15 @@ void BatchBuilder::fini() {
     derived_.clear();
 }
 
+void BatchBuilder::set_consumer(const ConsumerShape& c) {
+    cs_ = c;
+    cs_on_ = c.valid();
+    cs_end_ = -1;
+    /* Sized once here: build() fills it in place, and the step path allocates nothing. */
+    cs_f_.assign(cs_on_ ? (size_t)c.n_layer : 0, -1);
+    cs_stats_ = ConsumerStats{};
+}
+
 /* ------------------------------------------------------------------ derivations */
 int BatchBuilder::run_derivations(const StepPlan& plan, Set& s) {
     if (derived_.empty()) return RAD_OK;
@@ -1072,6 +1081,65 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
         }
     }
 
+    /* The consumer skip (consumer_skip.h). A step whose only entry is a prefill chunk of a prompt
+     * the scheduler cut runs layers [0, F) in full and layer F's key ops alone; F is the declared
+     * shape's for the chunk's last row and the prompt's target. A chunk of such a prompt in a step
+     * with anything else beside it (decode rows, another chunk, encoder or scored rows) runs every
+     * layer, which is the base engine's step; the scheduler's startup refuses the deployments
+     * where that can happen (Scheduler::init), so `shared` stays 0. The prompt's last chunk holds
+     * its target's row and is never cut. */
+    int32_t cs_full = 0;
+    int64_t cs_end = 0;
+    if (cs_on_ && plan.draft_pass == 0 && plan.tok_shift == 0) {
+        bool any = false;
+        for (const StepEntry& e : plan.e) any = any || (e.is_prefill && e.consumer_end > 0);
+        if (any) {
+            ++cs_stats_.passes;
+            const StepEntry& e = plan.e[0];
+            const bool alone = n_seq == 1 && plan.n_seq_decode == 0 && plan.n_spec == 0 &&
+                               e.is_prefill && e.consumer_end > 0 && e.hidden_row < 0 &&
+                               n_mm == 0 && n_dout == 0 && n_out == (e.produces_token ? 1 : 0);
+            int32_t F = cs_.n_layer;
+            if (e.is_prefill && e.consumer_end > 0 &&
+                (e.ctx_len % cs_.align != 0 || e.n_tokens > cs_.max_rows)) {
+                /* Off the grid consumer_skip.h assumes: the prompt's last token and its state stay
+                 * exact (the thresholds sit inside the dependency cone), but rows before the cut
+                 * may read window keys this prompt never wrote. */
+                if (cs_stats_.off_grid++ == 0)
+                    RAD_WARN("consumer skip: a chunk at %d..%d is off the %lld-row grid of at most "
+                             "%lld rows the cut assumes", (int)e.ctx_len,
+                             (int)(e.ctx_len + e.n_tokens), (long long)cs_.align,
+                             (long long)cs_.max_rows);
+            }
+            if (alone) {
+                if (cs_end_ != e.consumer_end) {
+                    cs_end_ = consumer_thresholds(cs_, e.consumer_end, cs_f_.data()) ? e.consumer_end
+                                                                                    : -1;
+                }
+                if (cs_end_ == e.consumer_end)
+                    F = consumer_full_layers(cs_, cs_f_.data(), (int64_t)e.ctx_len + e.n_tokens - 1);
+            } else {
+                ++cs_stats_.shared;
+            }
+            if (F < cs_.n_layer && e.produces_token) {
+                RAD_ERR("consumer skip: the chunk at %d..%d samples, yet the cut for %lld runs %d of "
+                        "%d layers; every layer runs", (int)e.ctx_len, (int)(e.ctx_len + e.n_tokens),
+                        (long long)e.consumer_end, (int)F, (int)cs_.n_layer);
+                F = cs_.n_layer;
+            }
+            if (F < cs_.n_layer) {
+                cs_full = F;
+                cs_end = e.consumer_end;
+                ++cs_stats_.cut;
+                cs_stats_.full += (uint64_t)F;
+                cs_stats_.key += 1;
+                cs_stats_.skipped += (uint64_t)(cs_.n_layer - F - 1);
+            } else {
+                cs_stats_.full += (uint64_t)cs_.n_layer;
+            }
+        }
+    }
+
     /* build_groups consumes the manager's change marks, so any failure before every rank's
      * upload is issued must forget_tables(). */
     if (int st = build_groups(plan, kv, s, o); st < 0) {
@@ -1189,6 +1257,9 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
         B.checkpoint_tok = n_ck ? on_rank(base, b0, s.d_cktok) : nullptr;
         B.checkpoint_slot = n_ck ? on_rank(base, b0, s.d_ckslot) : nullptr;
         B.n_ahead = n_ahead;
+        B.consumer_full = cs_full;
+        B.consumer_rsv = 0;
+        B.consumer_end = cs_end;
     }
     /* Record the flight behind everything reading this span: the upload and the derivation
      * copies. */

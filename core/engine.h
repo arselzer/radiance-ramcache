@@ -444,6 +444,20 @@ private:
     /* Whether a step may be issued ahead: requires that the drafter, if any, runs on the card (the
      * prompt-lookup drafter reads the committed sequence). */
     bool pipelining_ = false;
+    /* RADIANCE_EXPERIMENTAL_DS41_PREFILL_HASH=1 (engine_hash.cpp): at the end of each prompt's
+     * prefill, every rank hashes every KV group the prompt wrote (each layer apart) and the last
+     * row's logits, so two runs' prefill state can be compared byte for byte. Steps are then not
+     * issued ahead: the hash reads the state the prompt's last step left, before the next step
+     * runs. Staged by the scheduler thread with the ranks parked, read by them during the step. */
+    struct PrefillHashJob;
+    bool prefill_hash_ = false;
+    std::unique_ptr<PrefillHashJob> hash_job_;
+    void prefill_hash_init();
+    void prefill_hash_stage(const StepPlan& plan, const StepOut& so, int step);
+    void prefill_hash_rank(Rank& r, const RadBatch* b);
+    void prefill_hash_print();
+    /* The consumer skip's shutdown line (core/sched/consumer_skip.h): what the cut ran. */
+    void consumer_skip_report();
     int  finish_serial_drafter(const StepOut& so);
     /* Handed from issue_serial_drafter to finish_serial_drafter: the drafting rows, the rounds
      * asked for, and the rounds that ran. */

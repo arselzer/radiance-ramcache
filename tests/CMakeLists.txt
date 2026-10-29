@@ -16,9 +16,11 @@
 # rad_builder.cpp.o and collide on every rad_decl_* symbol; without it the error is a single
 # undefined reference. ds41_prefetch_arch_test is deepseek41's on-die reads on that fake (its own
 # binary: arch_test does not carry deepseek41), and ds41_prefetch_plan_test their plan
-# (arch/deepseek41/ds41_prefetch_plan.h), pure host logic with no ABI.
+# (arch/deepseek41/ds41_prefetch_plan.h), pure host logic with no ABI. ds41_consumer_skip_arch_test
+# is deepseek41's half of the consumer skip on that fake, consumer_skip_test the schedule itself
+# (core/sched/consumer_skip.h, header-only) against a dependency simulation.
 set(RAD_TESTS_NO_CORE arch_test glm5next_test mapped_slab_pregrow_test ds41_prefetch_arch_test
-                      ds41_prefetch_plan_test)
+                      ds41_prefetch_plan_test ds41_consumer_skip_arch_test consumer_skip_test)
 
 # fixture_test tests tools/kfixture.cpp and tools/opshapes.cpp (the seeded draw, the reduction and
 # the on-disk recording) directly, kbench_test tools/kbench_core.cpp (rad-kbench's rules), and

@@ -9,6 +9,7 @@
  */
 #pragma once
 #include "advance.h"
+#include "consumer_skip.h"
 #include "device/device.h"
 #include "geometry.h"
 #include "mem_iface.h"
@@ -67,6 +68,10 @@ struct StepEntry {
     int32_t dev_tok = 0;
     int32_t dev_out = -1;
     int32_t dev_aux = 0;
+    /* A prefill entry of a prompt the consumer skip cuts (SchedReq::consumer_end): the target the
+     * builder derives the step's RadBatch::consumer_full from when the entry is the step's only
+     * one; 0 otherwise. */
+    int64_t consumer_end = 0;
 };
 
 struct StepPlan {
@@ -139,6 +144,23 @@ public:
     /* Longest sequence a batch can describe, in tokens, as sized into the block-table rows at
      * init. A position at or past it cannot be addressed. */
     int64_t max_ctx() const { return max_ctx_; }
+
+    /* The consumer skip (consumer_skip.h), as the scheduler enabled it: a step whose only entry is
+     * a prefill chunk carrying StepEntry::consumer_end gets RadBatch::consumer_full from the
+     * declared shape, the chunk's last row and that target. An invalid shape turns it off. */
+    void set_consumer(const ConsumerShape& c);
+    /* What the cut ran, over the trunk prefill passes of prompts it cut: those passes, the ones
+     * cut, the ones that shared their step (run in full), and their layer-passes run in full,
+     * key ops alone and skipped. */
+    struct ConsumerStats {
+        uint64_t passes = 0, cut = 0, shared = 0;
+        uint64_t full = 0, key = 0, skipped = 0;
+        /* Passes of a cut prompt off the grid the derivation assumes (a start off the quantum, or
+         * more rows than the budget): the scheduler makes none, so this stays 0 (a warning names
+         * the first). */
+        uint64_t off_grid = 0;
+    };
+    const ConsumerStats& consumer_stats() const { return cs_stats_; }
 
     /* An encoder pass (RadBatch::enc): patches of whole segments of one or more media items,
      * staged into every rank's encoder input, since each rank runs the tower itself. Returns rank
@@ -274,6 +296,13 @@ private:
     std::vector<RankIO> ranks_;
 
     int64_t max_tok_ = 0, max_seqs_ = 0, max_ctx_ = 0;
+    /* The consumer skip: the shape, the target `cs_f_` holds the thresholds for (-1: none), and
+     * the counters. */
+    ConsumerShape cs_{};
+    bool          cs_on_ = false;
+    int64_t       cs_end_ = -1;
+    std::vector<int64_t> cs_f_;
+    ConsumerStats cs_stats_;
     /* Per KV group, 0 for a non-conv group. This and `h_convslot` only feed DeriveInput for the
      * `conv_state_index` derivation, which no plugin calls at present; conv kernels read
      * RadKVGroupBatch::state_index instead. Kept per group so the derivation is correct with more

@@ -6,6 +6,7 @@
                                           arm's, and each arm's decode tokens/s
 """
 import json
+import os
 import sys
 import time
 import urllib.request
@@ -16,6 +17,8 @@ def run(receipt, url, n, out):
     rows = []
     for b in reqs:
         body = dict(b["request"])
+        if os.environ.get("AB_MAX_TOKENS"):
+            body["max_tokens"] = int(os.environ["AB_MAX_TOKENS"])
         t0 = time.time()
         req = urllib.request.Request(url + "/v1/completions", data=json.dumps(body).encode(),
                                      headers={"Content-Type": "application/json"})

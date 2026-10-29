@@ -26,7 +26,7 @@ OUT=${1:?output directory}
 BIN=${RADIANCE_BIN:?path to the radiance binary}
 RHOME=${RADIANCE_HOME_DIR:?radiance home with kernels/ and architectures/}
 SILU=${SILU_TABLE:?the card silu table}
-ARMS=${ARMS:-"base verify greedy"}
+ARMS=${ARMS-"base verify greedy"}
 HX_THREADS=${HX_THREADS:-16}
 VERIFY_REQUESTS=${VERIFY_REQUESTS:-3}
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -92,7 +92,7 @@ arm() {   # name, then env assignments for the server; CACHE_MIB the RAM cache (
   log "arm $name: $*"
   env "$@" RADIANCE_EXPERIMENTAL_NATIVE_CACHE_MAPPED_SLABS=1 RADIANCE_EXPERIMENTAL_NATIVE_CACHE_MAPPED_SOURCE=1 \
       RADIANCE_EXPERIMENTAL_DS41_MXFP4_PACK_SSE2=1 \
-    "$BIN" --radiance-home "$RHOME" --kernels libr4d,libref --model "$MODEL" \
+    "$BIN" --radiance-home "${ARM_HOME:-$RHOME}" --kernels libr4d,libref --model "$MODEL" \
       --served-model-name ds41-native-smoke --tp 4 --tp-wire exact --placement expert_tiered \
       --weights-disk-tier --expert-ram-cache-total-mib ${CACHE_MIB:-81920} --host-pool-mib 4096 \
       --host-headroom-mib 8192 --gpu-headroom-mib 256 --embedding-placement vram \
@@ -137,6 +137,13 @@ log "stopping $NAME"
 "${DOCKER[@]}" stop -t 60 "$NAME" >>"$OUT/window.log" 2>&1
 sleep 5
 
+if [[ "${DEVICE_CHECKS:-1}" == ptime && -x "$HERE/build/ds41_mxfp4_device_check" ]]; then
+  log "prefill-shaped moe_gemm_ggml timing on card 0 with $RHOME/kernels/libr4d.so"
+  ( export HIP_VISIBLE_DEVICES=0
+    timeout 900 "$HERE/build/ds41_mxfp4_device_check" "$RHOME/kernels/libr4d.so" ptime ${PTIME_ARGS:-1 2 4 8 16} >"$OUT/ptime.log" 2>&1
+    echo "ptime exit $?" >>"$OUT/ptime.log" )
+  grep -E 'prefill|exit' "$OUT/ptime.log" | tee -a "$OUT/window.log"
+fi
 if [[ "${DEVICE_CHECKS:-1}" == 1 && -x "$HERE/build/ds41_mxfp4_device_check" ]]; then
   # The served plugin's swiglu over every (gate, up) pair, mismatches classified, and the
   # whole host chain against its decode kernels; the table recaptured and compared.
@@ -159,9 +166,10 @@ for a in $ARMS; do
   # threads; G GB/s the schedule assumes for the CPU; S us the idle pool spins; P the pool's nice
   # value; M MiB of RAM cache (81920); R: passes of at most R tokens compute their missed experts on
   # the CPU from the container's planes; f the mover's direct cache fill; x an access trace;
-  # PsK / PoK the next-layer predictor in shadow / on mode keeping K experts; o --profile-ops.
+  # PsK / PoK the next-layer predictor in shadow / on mode keeping K experts; o --profile-ops;
+  # H the second run home (RADIANCE_HOME_DIR2).
   IFS=- read -r -a parts <<< "$a"
-  pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 EXTRA_ARGS=""
+  pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 EXTRA_ARGS="" ARM_HOME="$RHOME"
   for p in "${parts[@]:1}"; do
     case $p in
       t[0-9]*) threads=${p#t} ;;
@@ -173,6 +181,7 @@ for a in $ARMS; do
       m[0-9]*) CACHE_MIB=${p#m} ;;
       M[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MISSES=${p#M}) ;;
       o)       EXTRA_ARGS="--profile-ops" ;;
+      H)       ARM_HOME=${RADIANCE_HOME_DIR2:?H needs RADIANCE_HOME_DIR2} ;;
       Ps[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_PREFETCH=shadow RADIANCE_EXPERIMENTAL_DS41_PREFETCH_K=${p#Ps}) ;;
       Po[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_PREFETCH=on RADIANCE_EXPERIMENTAL_DS41_PREFETCH_K=${p#Po}) ;;
       *)       log "arm $a: unknown part $p" ;;
@@ -186,5 +195,5 @@ for a in $ARMS; do
     *) log "unknown arm $a" ;;
   esac
 done
-python3 -I "$HERE/ab_requests.py" --compare "$OUT" $ARMS | tee -a "$OUT/window.log"
+[[ -n "$ARMS" ]] && python3 -I "$HERE/ab_requests.py" --compare "$OUT" $ARMS | tee -a "$OUT/window.log"
 log "arms done"

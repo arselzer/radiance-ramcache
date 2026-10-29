@@ -373,8 +373,14 @@ __global__ __launch_bounds__(kMxThreads) void mx_gemv_kernel(MxGemvArgs A) {
         }
         did_work=true;if constexpr(PROBE)if(ri==0)owned_rows+=(unsigned long long)(re-rs);
         const int rg0 = ri * rgpi, rg1 = min(rg0 + rgpi, nrg);
-        for (int p0 = rs; p0 < re; p0 += A.XM) {
-            const int mc = min(A.XM, re - p0);
+        /* An expert with more rows than the LDS holds whole (one gate_up row at K 5120) takes them in
+         * whole passes of XLM rows, re-reading its weights, rather than restaging K chunks for every
+         * row group. Each output is still its weight row dotted with its activation row in the same
+         * lane and block order, so the bits are unchanged; only rows that cannot fit even one whole
+         * (XLM 0) use the chunked path. */
+        const int step = A.XLM >= 1 && A.XLM < A.XM ? A.XLM : A.XM;
+        for (int p0 = rs; p0 < re; p0 += step) {
+            const int mc = min(step, re - p0);
             const bool whole = mc <= A.XLM;            /* block-uniform */
             if (whole && (cur_e != e || cur_p != p0)) {
                 lds_barrier();

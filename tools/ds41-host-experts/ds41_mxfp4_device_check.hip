@@ -16,6 +16,7 @@
 #include <dlfcn.h>
 
 #include <algorithm>
+#include <memory>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -121,13 +122,14 @@ struct Dev {
     void get(void* h) const { HC(hipMemcpy(h, p, n, hipMemcpyDeviceToHost)); }
 };
 
-/* moe_gemm_ggml type=mxfp4, gemv path, over a table of per-expert device pointers. */
+/* moe_gemm_ggml type=mxfp4, gemv path, over a table of per-expert device pointers; T sorted rows
+ * (one token's top_k by default). */
 int run_moe(Launch f, hipStream_t s, void* x, int AR, void* table, int N, int K, void* sorted,
-            void* off, void* y, const char* order) {
+            void* off, void* y, const char* order, int T = kTop) {
     RadTensor t[5] = { tensor(x, RAD_BF16, { AR, K }),
                        tensor(table, RAD_U8, { kNe, N, K / 32 * 17 }),
-                       tensor(sorted, RAD_I32, { kTop }), tensor(off, RAD_I32, { kNe + 1 }),
-                       tensor(y, RAD_BF16, { kTop, N }) };
+                       tensor(sorted, RAD_I32, { T }), tensor(off, RAD_I32, { kNe + 1 }),
+                       tensor(y, RAD_BF16, { T, N }) };
     t[1].stride[0] = 0;   /* a table of expert pointers */
     RadParam p[6] = { ps("type", "mxfp4"), pi("N", N), pi("K", K), pi("n_expert", kNe),
                       pi("top_k", kTop), ps("a_order", order) };
@@ -299,6 +301,105 @@ int swiglu_proof(const Lib& lib, const char* table_path) {
     return bad_other ? 1 : 0;
 }
 
+/* Prefill-shaped calls at EP4: T tokens, each routed to top_k distinct experts of 4 x 96, this
+ * rank's (0..95) slots grouped by expert, the rest dropped; gate_up over the tokens' rows (token
+ * order), down over the sorted rows. Every live expert's weights in their own buffers. */
+/* Tokens pick from a pool of P of the 384 experts (P 384: uniform routing; smaller: the skew of real
+ * prompts, where popular experts get several of a chunk's tokens). With L2, the same calls run on a
+ * second plugin too, and their outputs are compared value for value. */
+int ptime(const Lib& L, const Lib* L2, int T, int P) {
+    hipStream_t s;
+    HC(hipStreamCreate(&s));
+    std::mt19937_64 rng(4242 + (uint64_t)P);
+    const size_t gu_b = (size_t)2 * kFf * (kEmbd / 32) * 17, dn_b = (size_t)kEmbd * (kFf / 32) * 17;
+    std::vector<int> pool;
+    while ((int)pool.size() < std::min(P, 4 * kNe)) {
+        const int e = (int)(rng() % (4 * kNe));
+        if (std::find(pool.begin(), pool.end(), e) == pool.end()) pool.push_back(e);
+    }
+    std::vector<std::vector<int32_t>> rows(kNe);
+    for (int t = 0; t < T; ++t) {
+        std::vector<int> pick;
+        while ((int)pick.size() < std::min(kTop, (int)pool.size())) {
+            const int e = pool[(size_t)(rng() % pool.size())];
+            if (std::find(pick.begin(), pick.end(), e) == pick.end()) pick.push_back(e);
+        }
+        for (int k = 0; k < kTop; ++k)
+            if (pick[(size_t)k] < kNe) rows[(size_t)pick[(size_t)k]].push_back(t * kTop + k);
+    }
+    std::vector<int32_t> sorted, off(kNe + 1, 0);
+    int live = 0;
+    for (int e = 0; e < kNe; ++e) {
+        off[(size_t)e + 1] = off[(size_t)e] + (int)rows[(size_t)e].size();
+        for (int32_t f : rows[(size_t)e]) sorted.push_back(f);
+        live += !rows[(size_t)e].empty();
+    }
+    const int local = (int)sorted.size();
+    sorted.resize((size_t)T * kTop, -1);
+    std::vector<Dev*> gus, dns;
+    std::vector<void*> tgu(kNe), tdn(kNe);
+    for (int e = 0; e < kNe; ++e) {
+        if (rows[(size_t)e].empty()) continue;
+        const auto hg = make_blocks(2 * kFf, kEmbd, rng, false), hd = make_blocks(kEmbd, kFf, rng, false);
+        gus.push_back(new Dev(gu_b)); gus.back()->put(hg.data());
+        dns.push_back(new Dev(dn_b)); dns.back()->put(hd.data());
+        tgu[(size_t)e] = gus.back()->p;
+        tdn[(size_t)e] = dns.back()->p;
+    }
+    for (int e = 0; e < kNe; ++e) {
+        if (!tgu[(size_t)e]) tgu[(size_t)e] = gus[0]->p;
+        if (!tdn[(size_t)e]) tdn[(size_t)e] = dns[0]->p;
+    }
+    Dev tab_gu(kNe * sizeof(void*)), tab_dn(kNe * sizeof(void*)), d_sorted(sorted.size() * 4), d_off(off.size() * 4);
+    tab_gu.put(tgu.data()); tab_dn.put(tdn.data()); d_sorted.put(sorted.data()); d_off.put(off.data());
+    const int R = T * kTop;
+    Dev d_x((size_t)T * kEmbd * 2), d_a((size_t)R * kFf * 2), d_ygu((size_t)R * 2 * kFf * 2), d_ydn((size_t)R * kEmbd * 2);
+    std::vector<uint16_t> x((size_t)T * kEmbd), act((size_t)R * kFf);
+    for (auto& v : x) v = f32_to_bf16(0.5f * (float)((int)(rng() % 200) - 100) / 100.f);
+    for (auto& v : act) v = f32_to_bf16(0.1f * (float)((int)(rng() % 200) - 100) / 100.f);
+    d_x.put(x.data()); d_a.put(act.data());
+    hipEvent_t e0, e1;
+    HC(hipEventCreate(&e0)); HC(hipEventCreate(&e1));
+    int most = 0;
+    for (const auto& r : rows) most = std::max(most, (int)r.size());
+    size_t differ = 0;
+    for (int which = 0; which < 2; ++which) {
+        const bool gu = which == 0;
+        const int N = gu ? 2 * kFf : kEmbd, K = gu ? kEmbd : kFf;
+        Dev* y = gu ? &d_ygu : &d_ydn;
+        std::vector<uint16_t> first((size_t)R * N), second((size_t)R * N);
+        for (int lib = 0; lib < (L2 ? 2 : 1); ++lib) {
+            const Lib& LL = lib ? *L2 : L;
+            std::vector<float> ts;
+            for (int it = 0; it < 25; ++it) {
+                HC(hipMemset(y->p, 0, y->n));
+                HC(hipEventRecord(e0, s));
+                if (run_moe(LL.moe, s, gu ? d_x.p : d_a.p, gu ? T : R, gu ? tab_gu.p : tab_dn.p, N, K, d_sorted.p,
+                            d_off.p, y->p, gu ? "token" : "sorted", R) < 0) {
+                    std::fprintf(stderr, "moe_gemm_ggml refused the prefill shape\n");
+                    return 3;
+                }
+                HC(hipEventRecord(e1, s));
+                HC(hipEventSynchronize(e1));
+                float ms = 0;
+                HC(hipEventElapsedTime(&ms, e0, e1));
+                if (it >= 5) ts.push_back(ms);
+            }
+            y->get((lib ? second : first).data());
+            std::sort(ts.begin(), ts.end());
+            const double med = ts[ts.size() / 2], bytes = (double)live * N * K / 32 * 17;
+            std::printf("prefill T=%d pool %d: %s %s, %d live experts, %d local rows (most %d): median %.1f us, %.1f GB/s\n",
+                        T, P, lib ? "lib2" : "lib1", gu ? "gate_up" : "down   ", live, local, most, 1e3 * med,
+                        bytes / (med * 1e-3) / 1e9);
+        }
+        if (L2) differ += count_diff(first.data(), second.data(), first.size());
+    }
+    if (L2) std::printf("prefill T=%d pool %d: lib1 and lib2 outputs: %zu differing values\n", T, P, differ);
+    for (auto* p : gus) delete p;
+    for (auto* p : dns) delete p;
+    return 0;
+}
+
 int timing(const Lib& a, const Lib* b) {
     hipStream_t s;
     HC(hipStreamCreate(&s));
@@ -370,11 +471,25 @@ int timing(const Lib& a, const Lib* b) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc < 3) { std::fprintf(stderr, "usage: %s LIBR4D.so check [trials] [table] | swiglu TABLE | time [LIB2.so]\n", argv[0]); return 2; }
+    if (argc < 3) { std::fprintf(stderr, "usage: %s LIBR4D.so check [trials] [table] | swiglu TABLE | time [LIB2.so] | ptime [T[:P]...]\n", argv[0]); return 2; }
     setenv("RADIANCE_EXPERIMENTAL_DS41_LIVE_TAIL", "1", 1);
     const Lib lib(argv[1]);
     if (!std::strcmp(argv[2], "check")) return check(lib, argc > 3 ? std::atoi(argv[3]) : 24, argc > 4 ? argv[4] : "silu_table.bin");
     if (!std::strcmp(argv[2], "swiglu")) return swiglu_proof(lib, argc > 3 ? argv[3] : "silu_table.bin");
+    if (!std::strcmp(argv[2], "ptime")) {
+        /* ptime T[:P] ...; PTIME_LIB2=<libr4d.so> also runs and compares a second plugin */
+        const char* l2 = std::getenv("PTIME_LIB2");
+        std::unique_ptr<Lib> b;
+        if (l2 && *l2) b.reset(new Lib(l2));
+        int rc = 0;
+        for (int i = 3; i < argc; ++i) {
+            int T = 16, P = 4 * kNe;
+            if (std::sscanf(argv[i], "%d:%d", &T, &P) < 1) continue;
+            rc |= ptime(lib, b.get(), T, P);
+        }
+        if (argc <= 3) rc = ptime(lib, b.get(), 16, 4 * kNe);
+        return rc;
+    }
     if (!std::strcmp(argv[2], "time")) {
         if (argc > 3) { const Lib b(argv[3]); return timing(lib, &b); }
         return timing(lib, nullptr);

@@ -69,6 +69,7 @@ the engine or the scripts assumes where the checkpoint is. `ab_window.sh` takes 
 |---|---|---|
 | `..._HOST_EXPERTS=N`, `_POLICY=all` | cached experts on the CPU: 5.63 → 5.96 tok/s | `greedy` splits with the copy link (no better); `verify` computes both and compares rows |
 | `..._MISSES=16` | misses on the CPU: 5.96 → 8.89 tok/s | needs the mapped RAM cache |
+| `RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=1` with `--max-num-batched-tokens 32` (or 48) | not yet measured (estimate: TTFT −4 to −8% on the held-out prompts and −10 to −20% on long documents at 32, −6 to −12% and −12 to −25% at 48; decode unchanged) | prefill passes of up to 32 (48) tokens, every reply, logit and KV entry the 16-token chunking's. Four kinds of op change arithmetic with the pass height: the routed MoE GEMM above 16 tokens (the gemv row's band ends there; the tiled row sums in another order), the sparse attention and the indexer score above 48 rows (WMMA forms), and every norm above 32 rows (`r4d_act_threads` halves the width, which regroups the sum of squares). Under the switch libr4d adds `moe_gemm_ggml_mxfp4_gemv_tall`, the gemv one priority below the gemv row with its bound on M raised to the tallest pass libr4d keeps exact (`libr4d/r4d_ds41_tall.h`), and keeps the sparse ops on their scalar forms at every height; the core raises the counts contract to 48 tokens and the CPU path to the step (its pinned rows, sorted order, output rows and fetch lists), and lets the file-buffer cap take passes of the step with the misses on the CPU in all of them (`..._MISSES` at least the step). At startup `FileStager::tall_init` refuses a step whose passes would change bits: above 48 tokens, a routed MXFP4 GEMM band off the gemv rows (a libr4d without the twin, or a step past its bound), or any other op on two kernels other than gemm_nt's m16 / m64; rank 0 then logs `exact tall passes: passes of up to N tokens ...`. Arm parts `Xt` and `BTN` (e.g. `...-M32-...-Xt-BT32`); the byte gate is a pair of `Kld` arms (below, Tools). Tests: `ds41_tall_test`, `hx_fetch_list_test` (16 / 32 / 48-row tables), `r4d_emu_ds41tall` and `r4d_emu_ds41tall_on` (the twin's rows = the gemv's in passes of 16; the fused norms at heights 1..48), `ds41_mxfp4_device_check LIBR4D tall` and `sweep` / `sweep0` on a card |
 | `--embedding-placement ram` | +1.5%, TTFT −2.4% | the engine's default (the A/B script had forced `vram`): the token embedding pinned in host RAM (1.26 GB), its 316 MiB a rank of VRAM to ~17 more resident experts |
 | `--host-pool-mib 256`, cache 96 GiB | +9% (vs the 4 GiB pool) | the pinned pool's RAM is worth more as cache; 256 MiB since the planner fix (was 1900); 96 GiB leaves ~14 GiB free (102 GiB: +4.3% in two runs of three, ~8 GiB free, sensitive to other jobs) |
 | `..._NATIVE_CACHE_PREGROW=1` | request 2 TTFT 13.7 → 5.0 s | slabs pinned at startup (+~30 s startup) |
@@ -342,8 +343,17 @@ every position bit-identical: KL 0, top-1 100%.
   kind the dispatches before the routing-counts sync, how many went (or would go) unordered and why
   the rest waited, the card's busy time and gaps, the critical chain, and the fusion candidates
   (dependent pairs whose second launch is short and reads only the first's output).
-- `ds41_mxfp4_device_check.hip`: the kernels against the card (chain check, exhaustive SwiGLU,
-  GEMV timing against two libr4d builds).
+- `ds41_mxfp4_device_check.hip` (`make mxfp4-check O=<dir>`): the kernels against the card (chain
+  check, exhaustive SwiGLU, GEMV timing against two libr4d builds). `tall [T...]` checks
+  `RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL`: the twin row in the plugin's table and its bound, its
+  gate_up and down at 17..96 tokens against the gemv over the same tokens in passes of 16 and the
+  host kernels, and the sparse attention and index score at 17..100 rows against the same rows
+  alone and 16 at a time. `sweep [trials]` (with the switch) and `sweep0` (without) launch every
+  other op whose launcher reads the pass height (rmsnorm at 5120 / 1280 / 512 / 128, the fused
+  collapse, post-collapse and norm-rope-roundtrip norms, mhc_mix split and fused, the skinny bf16
+  GEMM, the lm_head) at heights 1..48 and hold each row to the same row launched alone and in
+  launches of 16: up to the reach (the twin's bound with the switch, 32 without) every row must keep
+  its bytes; above it only a norm may differ, and the count is printed. Exit 0 when nothing failed.
 - `ds41_bf16f8_device_check.hip` (`make device-check O=<dir>`): `gemm_nt_bf16f8` on the card
   against `gemm_nt`, from a built libr4d.so: the weight fragments the kernel expands for all 254
   E4M3 codes at all 237 exponents (`frag`, which sees the sign of a zero), one-hot GEMMs over
@@ -466,6 +476,16 @@ order, so the bits do not change, and an extra row costs 0.37–0.46 of a row in
 28,413 with the plane mirror's bytes) with no difference. Every A/B arm's replies are compared with
 the base engine's; the final configuration also matched it on 16 chat-framed prompts, on the eight
 prompts three times on one server, and on 256-token replies.
+
+Exact tall passes (`RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=1`) keep this: a pass of up to 32 (48)
+tokens gives every row the bits it gets in today's 16-token chunking, because every op either runs
+the decode band's arithmetic at every height or is checked to (`ds41_mxfp4_device_check tall` and
+`sweep`, `r4d_emu_ds41tall`), and the server refuses any step whose bands say otherwise. The A/B's
+byte gate: two `Kld` arms of the same configuration (e.g. `...-Lm2048-Kld` and
+`...-M32-...-Lm2048-Xt-BT32-Kld`) record every position of a corpus with `--kld-record` (its f16
+log-probabilities, its top 16 in f32, and the next token's NLL and the whole row's entropy in f32, so
+one changed logit anywhere in a row shows), and the second must equal the first byte for byte
+(`ab_requests.py --kld-compare`).
 
 ## Many token rows of one expert
 

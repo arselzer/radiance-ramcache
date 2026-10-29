@@ -41,10 +41,22 @@
 # blocks before L5, which then tests nothing; a U part's receipt name holds no "-", which splits
 # parts). Put the same arm without Pc first: it is the cold reference.
 #
+# Exact tall passes (RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL): Xt sets the switch (every other arm runs
+# with it 0) and BTN the step, --max-num-batched-tokens N (16 otherwise), e.g. ...-M32-...-Xt-BT32; an
+# Xt arm must log "exact tall passes" at startup and a plain one must not, or it is not measured. Kld
+# runs the arm's server as --kld-record over a corpus instead of serving: every chat_text of the
+# receipts KLD_RECEIPTS names (default "long chat", work/extra-prompts/<name>-receipt.json) up to
+# KLD_MAX_CHARS characters (6000), as plain text, every position scored, at --max-model-len KLD_LEN
+# (2048) unless the arm gives an Lm part. The window's first Kld arm is the reference; every later
+# one's records are compared with it byte for byte (ab_requests.py --kld-compare: every position's
+# f16 log-probabilities, its top 16 in f32, and the next token's NLL and the whole row's entropy in
+# f32, so one changed logit anywhere in a row shows).
+#
 # Environment: RADIANCE_BIN (the binary), RADIANCE_HOME_DIR (kernels/ and architectures/ for it),
 # SILU_TABLE (the card's silu table), ARMS (default "base verify greedy"), HX_THREADS (16),
-# VERIFY_REQUESTS (3), DEVICE_CHECKS (1), SELFTEST_F32BF16 (an r4d_selftest: gemm_nt_f32bf16's
-# checks and timings on card 0 before the arms; unset, none, and no Rb arm runs).
+# VERIFY_REQUESTS (3), DEVICE_CHECKS (1; `tall`: the exact-tall checks, TALL_LIBR4D and TALL_CHECK),
+# SELFTEST_F32BF16 (an r4d_selftest: gemm_nt_f32bf16's checks and timings on card 0 before the
+# arms; unset, none, and no Rb arm runs).
 set -u
 OUT=${1:?output directory}
 BIN=${RADIANCE_BIN:?path to the radiance binary}
@@ -148,6 +160,48 @@ restore() {
   "${DOCKER[@]}" inspect "$NAME" --format '{{.Id}} {{.State.Status}} {{.State.StartedAt}} {{.Config.Image}}' >>"$OUT/window.log" 2>&1
 }
 
+# RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL (the Xt part): the file stager says at startup which passes
+# it takes, after checking every op keeps a 16-token pass's bits in them (it refuses to start
+# otherwise). An Xt arm without that line, or a plain arm with it, is not measured.
+xt_check() {   # name
+  local name=$1 xt_lines
+  xt_lines=$(grep -c 'exact tall passes: passes of up to [0-9]* tokens' "$OUT/$name.server.log")
+  if [[ -n "${ARM_XT:-}" && "$xt_lines" == 0 ]]; then
+    log "arm $name: Xt, but the server log has no 'exact tall passes' line (a radiance without the switch?); not measured"
+    return 1
+  fi
+  if [[ -z "${ARM_XT:-}" && "$xt_lines" != 0 ]]; then
+    log "arm $name: no Xt part, but the server runs exact tall passes (the knob set for the window?); not measured"
+    return 1
+  fi
+  [[ -n "${ARM_XT:-}" ]] && grep -m1 -E 'exact tall passes: ' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
+  [[ -n "${ARM_BT:-}" ]] && grep -m1 -E 'chunk geometry: ' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
+  return 0
+}
+
+# A Kld arm: its server records the corpus (--kld-record) instead of serving, then exits. The
+# window's first Kld arm that finishes is the reference (KLD_REF); a later one's records must equal
+# it byte for byte.
+KLD_REF=
+kld_finish() {   # name; the run is SERVER_PID
+  local name=$1 t=0 rc
+  while kill -0 "$SERVER_PID" 2>/dev/null; do
+    sleep 5; t=$((t + 5))
+    if (( t > ${KLD_TIMEOUT:-3600} )); then log "arm $name: kld run still going after ${t}s; stopped"; stop_server; return 1; fi
+  done
+  wait "$SERVER_PID"; rc=$?; SERVER_PID=
+  log "arm $name: kld run exit $rc after ${t}s"
+  grep -E 'kld:|error|ERR' "$OUT/$name.server.log" | tail -6 | tee -a "$OUT/window.log"
+  (( rc == 0 )) || return 1
+  xt_check "$name" || return 1
+  if [[ -z "$KLD_REF" ]]; then
+    KLD_REF=$OUT/kld-$name
+    log "arm $name: the window's kld reference"
+    return 0
+  fi
+  python3 -I "$HERE/ab_requests.py" --kld-compare "$KLD_REF" "$OUT/kld-$name" 2>&1 | tee -a "$OUT/window.log"
+}
+
 arm() {   # name, then env assignments for the server; CACHE_MIB the RAM cache (default 81920)
   local name=$1; shift
   local n=${ARM_N:-${AB_REQUESTS:-8}}; [[ "$name" == verify* ]] && n=$VERIFY_REQUESTS
@@ -173,6 +227,7 @@ arm() {   # name, then env assignments for the server; CACHE_MIB the RAM cache (
       echo "$(date -u +%T) $avail" >> "$OUT/$name.mem"
       sleep 5
     done ) &
+  if [[ -n "${ARM_KLD:-}" ]]; then kld_finish "$name"; return; fi
   local t=0
   until curl -s -m 3 "http://127.0.0.1:$PORT/stats" >/dev/null 2>&1; do
     if ! kill -0 "$SERVER_PID" 2>/dev/null; then log "arm $name: server exited during startup"; SERVER_PID=; return 1; fi
@@ -246,6 +301,7 @@ arm() {   # name, then env assignments for the server; CACHE_MIB the RAM cache (
     stop_server; return 1
   fi
   [[ -n "${ARM_CS:-}" ]] && grep -m2 -E 'consumer skip: on|consumer suffix declared' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
+  xt_check "$name" || { stop_server; return 1; }
   # The NVMe drive's busy time (io_ticks, ms) and temperature over the requests: read-ahead arms
   # move it from ~45% busy towards saturation.
   local d0 d1 t0 t1 rc temp
@@ -303,6 +359,20 @@ if [[ "${DEVICE_CHECKS:-1}" == ptime && -x "$HERE/build/ds41_mxfp4_device_check"
     timeout 900 "$HERE/build/ds41_mxfp4_device_check" "$RHOME/kernels/libr4d.so" ptime ${PTIME_ARGS:-1 2 4 8 16} >"$OUT/ptime.log" 2>&1
     echo "ptime exit $?" >>"$OUT/ptime.log" )
   grep -E 'prefill|exit' "$OUT/ptime.log" | tee -a "$OUT/window.log"
+fi
+if [[ "${DEVICE_CHECKS:-1}" == tall ]]; then
+  # RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL on card 0: the twin row and the sparse ops at tall heights
+  # (`tall`), and every other height-dependent op with the switch (`sweep`) and without (`sweep0`),
+  # each row against the same row alone and in launches of 16. TALL_LIBR4D: the plugin the Xt arms
+  # load (default the run home's); TALL_CHECK: a harness built with these modes.
+  TL=${TALL_LIBR4D:-$RHOME/kernels/libr4d.so} TC=${TALL_CHECK:-$HERE/build/ds41_mxfp4_device_check}
+  log "exact-tall device checks on card 0 with $TL ($TC)"
+  for m in tall sweep sweep0; do
+    ( export HIP_VISIBLE_DEVICES=0
+      timeout 900 "$TC" "$TL" $m >"$OUT/devcheck-$m.log" 2>&1
+      echo "$m exit $?" >>"$OUT/devcheck-$m.log" )
+    grep -E '^(PASS|FAIL)|exit|norm rows' "$OUT/devcheck-$m.log" | tail -8 | tee -a "$OUT/window.log"
+  done
 fi
 if [[ "${DEVICE_CHECKS:-1}" == 1 && -x "$HERE/build/ds41_mxfp4_device_check" ]]; then
   # The served plugin's swiglu over every (gate, up) pair, mismatches classified, and the
@@ -553,6 +623,7 @@ for a in $ARMS; do
 # only on the libr4d.so whose gemm_nt_f32bf16 passed SELFTEST_F32BF16's card checks in this window.
 # An arm with a predictor part (Ps, Po, Pt, Pp) is measured only if the router predictor loaded.
   IFS=- read -r -a parts <<< "$a"
+  xt="" bt="" kld=""
   pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 HOST_POOL_MIB=4096 EXTRA_ARGS="" ARM_HOME="$RHOME" ARM_CONC=
   ARM_PROMPTS= ARM_N= ARM_LQ= rt=
   power="" skip="" ARGS=() f8="" f8x="" rb="" rbf=0 pred="" cs="" kh="" pc="" pcopt=""
@@ -649,6 +720,9 @@ for a in $ARMS; do
                      RADIANCE_EXPERIMENTAL_DS41_CHAIN_TRACE_OUT=$(cd "$OUT" && pwd)/chain-$a) ;;
       Ei)      env+=(RADIANCE_EXPERIMENTAL_DS41_EARLY_ISSUE=1) ;;      # routed card ops ahead of the counts sync
       Ss)      env+=(RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP=1) ;;   # no pass behind a reply's last token
+      Xt)      xt=1 ;;                                                 # exact tall passes (RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=1)
+      BT[0-9]*) bt=${p#BT}; ARGS+=(--max-num-batched-tokens "$bt") ;;  # this arm's step: prefill chunks of N
+      Kld)     kld=1 ;;                                                # --kld-record over the corpus instead of serving
       Fl)      env+=(RADIANCE_EXPERIMENTAL_DS41_FETCH_LIST=1) ;;       # counts + CPU rows in one ranged copy
       Ms[0-9]) env+=(RADIANCE_EXPERIMENTAL_DS41_MIRROR_SPLIT=${p#Ms}) ;;  # a lone decode miss's mirror tail in N pieces
       Mp)      env+=(RADIANCE_EXPERIMENTAL_DS41_MISS_POST=1) ;;       # miss reads start at the choice, before the pool's wake
@@ -728,6 +802,19 @@ for a in $ARMS; do
      [[ " ${env[*]} " != *" RADIANCE_EXPERIMENTAL_DS41_DSPARK_RAD_BANK=1 "* ]]; then
     log "arm $a: Dk / Dkt / DbN need a Ds part (the DSpark draft bank); the arm is skipped"; skip=1
   fi
+  # RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL: on only in an Xt arm, explicitly off in every other one.
+  if [[ -n "$xt" ]]; then env+=(RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=1); else env+=(RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=0); fi
+  if [[ -n "$kld" ]]; then
+    if [[ ! -s "$OUT/kld-corpus.jsonl" ]] &&
+       ! python3 -I "$HERE/ab_requests.py" --kld-corpus "$OUT/kld-corpus.jsonl" "${KLD_MAX_CHARS:-6000}" \
+           $(for r in ${KLD_RECEIPTS:-long chat}; do echo /home/as/ds41-claude-build/work/extra-prompts/$r-receipt.json; done) \
+           >>"$OUT/window.log" 2>&1; then
+      log "arm $a: no kld corpus; the arm is skipped"; skip=1
+    fi
+    rm -rf "$OUT/kld-$a"
+    ARGS=(--max-model-len "${KLD_LEN:-2048}" "${ARGS[@]}" --kld-record "$OUT/kld-$a" --kld-corpus "$OUT/kld-corpus.jsonl")
+  fi
+  ARM_XT=$xt ARM_BT=$bt ARM_KLD=$kld
   [[ -n "$skip" ]] && continue
   [[ -n "$power" ]] && power_set "$power"
   case $pol in

@@ -23,6 +23,7 @@
  */
 
 #include "r4d_plugin.h"
+#include "r4d_ds41_tall.h"
 
 #include <cstdlib>
 #include <cstring>
@@ -10091,14 +10092,84 @@ const std::vector<HostTwin>& host_twins() {
 
 }  /* namespace */
 
+/* ================================================================================ exact tall passes
+ *
+ * RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=1 (r4d_ds41_tall.h; read when the rows are first counted, at load):
+ * DeepSeek-V4.1's routed GEMMs keep their decode-band kernel in passes taller than 16 tokens, so such a pass gives a
+ * 16-token pass's bits. moe_gemm_ggml_mxfp4_gemv serves M <= 16 tokens and moe_gemm_ggml_mxfp4_tiled anything
+ * above, summing each output in another order. The twin `moe_gemm_ggml_mxfp4_gemv_tall` is the gemv row with its
+ * bound on M raised from 16 to kR4dDs41TallRows, one priority below it: it takes the bands from 17 to that bound from
+ * the tiled row and none from the gemv. The gemv gives each output its weight row dotted with its activation row in
+ * the same lane and block order at any height (r4d_ds41_mxfp4.hip, mx_row), so the twin's rows are the gemv's bit
+ * for bit. The bound is the tallest pass at which every kernel ds41 runs keeps the decode band's bits under the
+ * switch (r4d_ds41_tall.h: the sparse attention and the indexer score stay on their scalar forms, and the norms
+ * keep 1024 threads up to 32 rows), so the core reads the limit off the bands it resolved (FileStager::tall_init):
+ * a pass the twin does not reach resolves to the tiled row, and the core refuses a step that size. A libr4d without
+ * the twin is refused the same way rather than served with mixed arithmetic. Without the switch nothing is added:
+ * the row set and every index are as before. */
+namespace {
+
+struct TallTwin {
+    RadKernelInfo              info;
+    std::string                name, computes, shape;
+    std::vector<RadConstraint> c;
+};
+
+const std::vector<TallTwin>& tall_twins() {
+    static const std::vector<TallTwin> v = [] {
+        std::vector<TallTwin> t;
+        if (!r4d_ds41_exact_tall()) return t;
+        for (const RadKernelInfo& k : kKernels) {
+            if (std::strcmp(k.name, "moe_gemm_ggml_mxfp4_gemv") != 0) continue;
+            TallTwin h;
+            int bound = 0;
+            for (int i = 0; i < k.n_constraints; ++i) {
+                RadConstraint c = k.constraints[i];
+                if (!std::strcmp(c.key, "M") && c.op == RAD_C_LE) {
+                    ++bound;
+                    c.ival = kR4dDs41TallRows;   /* the gemv's 16, raised */
+                }
+                h.c.push_back(c);
+            }
+            if (bound != 1) continue;   /* not the row this was written for: no twin */
+            h.info = k;
+            h.info.priority = k.priority - 1;
+            h.info.launch = r4d_rad_moe_gemm_mxfp4_gemv_tall;
+            h.name = std::string(k.name) + "_tall";
+            h.computes = std::string(k.computes) +
+                         "; in passes of up to " + std::to_string(kR4dDs41TallRows) +
+                         " tokens (RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL), each output the decode band's bits";
+            h.shape = "M 17.." + std::to_string(kR4dDs41TallRows) +
+                      " tokens (the passes the gemv row leaves to the tiled one), any N, K a multiple of 32, up to "
+                      "1024 experts";
+            t.push_back(std::move(h));
+        }
+        /* The strings are pointed into only once the vector has stopped growing. */
+        for (TallTwin& h : t) {
+            h.info.name          = h.name.c_str();
+            h.info.computes      = h.computes.c_str();
+            h.info.shape         = h.shape.c_str();
+            h.info.constraints   = h.c.data();
+            h.info.n_constraints = (int)h.c.size();
+        }
+        return t;
+    }();
+    return v;
+}
+
+}  /* namespace */
+
 extern "C" int rad_kernel_count(void) {
-    return (int)(sizeof(kKernels) / sizeof(kKernels[0])) + (int)host_twins().size();
+    return (int)(sizeof(kKernels) / sizeof(kKernels[0])) + (int)host_twins().size() +
+           (int)tall_twins().size();
 }
 extern "C" const RadKernelInfo* rad_kernel_at(int i) {
     const int base = (int)(sizeof(kKernels) / sizeof(kKernels[0]));
+    const int twins = (int)host_twins().size();
     if (i < 0 || i >= rad_kernel_count()) return nullptr;
     if (i < base) return &kKernels[i];
-    return &host_twins()[(size_t)(i - base)].info;
+    if (i < base + twins) return &host_twins()[(size_t)(i - base)].info;
+    return &tall_twins()[(size_t)(i - base - twins)].info;
 }
 
 /* Which rows touch nothing but their operands and scratch (rad_abi.h). The exceptions keep state

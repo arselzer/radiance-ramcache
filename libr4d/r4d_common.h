@@ -4,6 +4,8 @@
 #include <hip/hip_runtime.h>
 #include <cstdint>
 
+#include "r4d_ds41_tall.h"
+
 // The W4A8 scale group lives here, not in either GEMM, because both read the same packed weight and
 // a disagreement would be silently wrong, not a link error. r4d_gemm_args.h restates it and checks
 // it against the layout constant.
@@ -275,7 +277,16 @@ __device__ __forceinline__ uint2 swap16_u2p(uint2 v) {
 // workgroups a CU holds. At K=8704 only one fits at either width, so wider wins out to large M; at
 // K=3072 five fit, the grid fills the part, and past M~72 the narrow width is even. The thresholds
 // below are those crossovers.
+//
+// The width also decides which columns a thread folds into a norm's sum of squares, so a row's bits
+// change with it. Under RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=1 (r4d_ds41_tall.h) every height takes
+// the width rows up to 32 get, so a norm gives a row the same bits in a pass of any height; it costs
+// the residency cliff above 32 rows, a few microseconds a norm at the 48 rows that switch serves.
+// Every caller is a host launcher, which is where the switch is read.
 __host__ __device__ __forceinline__ int r4d_act_threads(int M, int K) {
+#if !defined(__HIP_DEVICE_COMPILE__)
+    if (r4d_ds41_exact_tall()) return 1024;
+#endif
     if (M <= 32) return 1024;
     const int lim = K >= 8192 ? (1 << 24) : (K >= 4096 ? 120 : 72);
     return M <= lim ? 512 : 256;

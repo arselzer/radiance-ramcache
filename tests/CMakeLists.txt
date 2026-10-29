@@ -461,6 +461,11 @@ set_tests_properties(isa_tools PROPERTIES TIMEOUT ${RAD_TEST_TIMEOUT})
 # kernels. The M2XFP4 decode and tiled GEMMs are checked against an f64 decode of the weight, the
 # bf16 skinny GEMM's bf16f8 twin (gemm_nt_bf16f8) against the bf16 kernel itself, byte for byte, and
 # DeepSeek-V4.1's MXFP4 gemv_vp row over packed-scale experts against its plain gemv row, the same.
+# DeepSeek-V4.1's routed MXFP4 GEMM (r4d_ds41_mxfp4.hip) at passes taller than 16 tokens on the
+# twin row of RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL is held to the decode band's kernel over the
+# same tokens in passes of 16, byte for byte, and its fused norms (r4d_ds41_elem.hip) at pass
+# heights 1 to 48 to the same rows alone and in launches of 16 up to libr4d's reach (test_ds41tall;
+# r4d_emu_ds41tall_on runs it with the switch set).
 #
 # Requires clang (ext_vector_type) and x86-64 (SysV fiber switch in inline assembly). With a clang
 # C++ compiler the .hip files build here as C++ (`-x c++`; the property is per directory, so
@@ -478,12 +483,12 @@ set(R4D_EMU_HIP ${R4D_DIR}/r4d_attn_paged_window.hip ${R4D_DIR}/r4d_pair_argmax_
                 ${R4D_DIR}/r4d_kv_resolve.hip ${R4D_DIR}/r4d_dsa.hip
                 ${R4D_DIR}/r4d_gemm_m2xfp4a8_decode.hip ${R4D_DIR}/r4d_gemm_m2xfp4a8_tiled.hip
                 ${R4D_DIR}/r4d_gemm_bf16_nt_m64.hip ${R4D_DIR}/r4d_gemm_bf16f8_nt_m64.hip
-                ${R4D_DIR}/r4d_ds41_mxfp4.hip)
+                ${R4D_DIR}/r4d_ds41_mxfp4.hip ${R4D_DIR}/r4d_ds41_elem.hip)
 # The M2XFP4 units' plugin entries call two cfg readers that r4d_rows.cpp defines, which is not in
 # this build: cfg_stub.cpp defines them at their axis defaults, in both arms below, and the bf16
 # skinny GEMM's (r4d_cfg_gemm) for it and its bf16f8 twin, whose outputs test_bf16f8 compares.
 set(R4D_EMU_TESTS attn pick norm escale qsa lora f32 mhc fp8f32 kda moemx mla moefuse kvres
-                  dsa m2xfp4 bf16f8 ds41vp ds41mx)
+                  dsa m2xfp4 bf16f8 ds41vp ds41mx ds41tall)
 # ds41vp holds DeepSeek-V4.1's gemv_vp row (RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED) to the plain MXFP4 gemv
 # row over experts packed by tools/ds41-host-experts' own packer, the one the engine loads them with. That
 # file builds as rad_core builds it: AVX2 without FMA contraction.
@@ -534,7 +539,7 @@ else()
                 ${R4D_EMU}/test_kda.cpp ${R4D_EMU}/test_moemx.cpp ${R4D_EMU}/test_mla.cpp
                 ${R4D_EMU}/test_moefuse.cpp ${R4D_EMU}/test_kvres.cpp
                 ${R4D_EMU}/test_dsa.cpp ${R4D_EMU}/test_m2xfp4.cpp ${R4D_EMU}/test_bf16f8.cpp
-                ${R4D_EMU}/test_ds41vp.cpp ${R4D_EMU}/test_ds41mx.cpp
+                ${R4D_EMU}/test_ds41vp.cpp ${R4D_EMU}/test_ds41mx.cpp ${R4D_EMU}/test_ds41tall.cpp
                 ${R4D_EMU}/cfg_stub.cpp)
       get_filename_component(stem ${src} NAME_WE)
       set(lang "")
@@ -587,9 +592,12 @@ else()
 endif()
 if(R4D_EMU_BUILT)
   foreach(t pick norm escale qsa lora f32 mhc fp8f32 kda moemx mla moefuse kvres dsa m2xfp4 bf16f8
-            ds41vp ds41mx)
+            ds41vp ds41mx ds41tall)
     add_test(NAME r4d_emu_${t} COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_${t})
   endforeach()
+  add_test(NAME r4d_emu_ds41tall_on COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_ds41tall)
+  set_tests_properties(r4d_emu_ds41tall_on PROPERTIES ENVIRONMENT "RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=1"
+                       LABELS "r4d_emu" TIMEOUT ${RAD_TEST_TIMEOUT})
   # The attention cases take about 11 s, 7 of them in the two long prefills on the WMMA kernel,
   # which three shards put in different entries.
   foreach(k 0 1 2)
@@ -602,6 +610,7 @@ if(R4D_EMU_BUILT)
   set_tests_properties(r4d_emu_attn_shard0 r4d_emu_attn_shard1 r4d_emu_attn_shard2 r4d_emu_pick
                        r4d_emu_norm r4d_emu_escale r4d_emu_qsa r4d_emu_lora r4d_emu_mla r4d_emu_moefuse
                        r4d_emu_dsa r4d_emu_m2xfp4 r4d_emu_bf16f8 r4d_emu_ds41vp r4d_emu_ds41vp_tail r4d_emu_ds41mx
+                       r4d_emu_ds41tall
                        PROPERTIES LABELS "r4d_emu" TIMEOUT ${RAD_TEST_TIMEOUT})
   # The LoRA pair has a libref oracle, and the test holds the emulated kernels to it when it can
   # load one -- expand bit for bit, shrink to its bound. kda_update is held to libref's within

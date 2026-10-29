@@ -20,7 +20,9 @@
  *   gemv  (M <= 16 rows, or tokens for the grouped GEMM): the weight streamed once. A wave owns 1 or 2 weight rows,
  *         its lanes walk the row's blocks (lane = block mod 32, four blocks a lane in flight), each decoded into
  *         registers and dotted with every activation row, the activation chunk staged once a block in LDS as f32.
- *         A wave butterfly closes each sum. Up to 8 activation rows a pass, 16 in two.
+ *         A wave butterfly closes each sum. Up to 8 activation rows a pass, 16 in two. Under
+ *         RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=1 the grouped GEMM's twin row moe_gemm_ggml_mxfp4_gemv_tall runs this
+ *         path at any number of tokens (r4d_rows.cpp), so a tall pass keeps a 16-token pass's bits.
  *   tiled (any M): 128 x 128 output tiles, the weight tile dequantised into LDS once a block-wide slab and reused
  *         by the tile's activation rows, the next slab's raw words prefetched; f32 8 x 8 (or 4 x 4) register tiles.
  *         For the grouped GEMM a tile is 32 or 128 rows of one expert's run.
@@ -1026,9 +1028,11 @@ int mx_gemm(const RadArgs* a, RadStream s, bool gemv) {
  * any shape, in place of the switches; `probe` counts the work (r4d_rad_moe_gemm_mxfp4_draft_probe).
  * `vp`: the gemv_vp row, whose table entries may name packed weights (bit 0); it serves the decode
  * band only. Its kernel has no one-pass form, so on a table it serves the draft bank's
- * ..._DRAFT_GEMV mode does not apply and the call is counted as left on the old path. */
+ * ..._DRAFT_GEMV mode does not apply and the call is counted as left on the old path. `tall`: the
+ * gemv at any number of tokens (moe_gemm_ggml_mxfp4_gemv_tall, RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL),
+ * not only up to 16. */
 int mx_moe(const RadArgs* a, RadStream s, bool gemv,bool baseline=false,unsigned long long* probe=nullptr,int force=-1,
-           bool vp=false) {
+           bool vp=false, bool tall=false) {
     if (!a || a->n_t < 5) return R4D_NO(RAD_E_INVAL);
     const RadTensor *A_ = r4d_opt(a, 0), *W = r4d_opt(a, 1), *so = r4d_opt(a, 2), *of = r4d_opt(a, 3),
                     *Y = r4d_opt(a, 4);
@@ -1100,7 +1104,10 @@ int mx_moe(const RadArgs* a, RadStream s, bool gemv,bool baseline=false,unsigned
     const bool tail = (mode & ds41_live_tail::kTail) != 0;
     if (probe && (ty != MX_FP4 || (!tail && force < 0))) return R4D_NO(RAD_E_UNSUPPORTED); // Refuse before any enqueue.
     const long long L = ne < T ? ne : T;       /* experts that can have rows */
-    if (gemv && tokens <= 16) {
+    /* Above 16 tokens the gemv is still exact: each output is its weight row dotted with its activation row in the
+     * same lane and block order at any height (mx_row; an expert's rows go in whole passes of XLM), so a tall pass
+     * gives a 16-token pass's bits. The tiled path below sums in another order. */
+    if (gemv && (tokens <= 16 || tall)) {
         MxGemvArgs A{};
         A.x = (const uint16_t*)A_->data; A.x_ld = x_ld;
         A.w = table ? nullptr : (const uint8_t*)W->data;
@@ -1172,6 +1179,11 @@ extern "C" int r4d_rad_moe_gemm_mxfp4_tiled(const RadArgs* a, RadStream s) { ret
 /* gemv_vp: the decode band over a table whose marked entries are packed weights (the top of this file). */
 extern "C" int r4d_rad_moe_gemm_mxfp4_gemv_vp(const RadArgs* a, RadStream s) {
     return mx_moe(a, s, true, false, nullptr, -1, true);
+}
+/* The row moe_gemm_ggml_mxfp4_gemv_tall (r4d_rows.cpp, exported only under RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=1):
+ * the decode band's kernel at every pass height. */
+extern "C" int r4d_rad_moe_gemm_mxfp4_gemv_tall(const RadArgs* a, RadStream s) {
+    return mx_moe(a, s, true, false, nullptr, -1, false, true);
 }
 
 // Checker-only exports do not alter registered rows/public ABI.

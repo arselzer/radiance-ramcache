@@ -21,6 +21,9 @@ int r4d_rad_moe_gemm_mxfp4_gemv_vp(const RadArgs*, RadStream);
  * under RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED, before any selection; absent, the row never matches and nothing
  * changes. Restated as core/place/vram_packed.h's kVramPackFact. */
 #define R4D_FACT_DS41_VRAM_PACKED "device.ds41_vram_packed"
+/* The `_gemv` kernel at any number of tokens: the launch of moe_gemm_ggml_mxfp4_gemv_tall, the twin r4d_rows.cpp
+ * adds under RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=1. */
+int r4d_rad_moe_gemm_mxfp4_gemv_tall(const RadArgs*, RadStream);
 
 /* -- operand descriptions (r4d_ds41_mxfp4_shapes.inc), libref's for type=mxfp4: the weight in its float
  * logical form. */

@@ -20,6 +20,7 @@
 #include "r4d_args.h"
 #include "r4d_common.h"
 #include "r4d_emit.h"
+#include "r4d_launch.h"
 #include "r4d_plugin.h"
 
 #include <climits>
@@ -1588,7 +1589,7 @@ __global__ __launch_bounds__(THR) void norm_rope_rt_kernel(
     const uint16_t* __restrict__ x, uint32_t x_ld, const void* __restrict__ w,
     uint16_t* __restrict__ y, uint32_t y_ld, uint32_t n, float eps, float wadd, float mult,
     uint32_t M, FzRope r, int block, int fmt, int sc) {
-    extern __shared__ uint16_t fz_row[];
+    R4D_DYN_LDS(uint16_t, fz_row);   /* extern __shared__ on the card (r4d_launch.h) */
     __shared__ float lds[THR / kFzWave];
     const uint32_t m = blockIdx.x;
     if (m >= M) return;   // a row the launch added past the full-card cliff (r4d_cliff_rows)

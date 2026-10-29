@@ -29,11 +29,14 @@
 # (default 2048: a prompt under 2,048 tokens gets no snapshot to resume from); PcsN
 # --checkpoint-slots N (auto otherwise); Pcx a finished sequence publishes only the prefill chunks an
 # idle cold prefill cuts alike (RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH: no KV of a short last
-# chunk or a decode step under a later hit). The window prints a Pc arm's prefix-cache startup
-# lines, and at the end each request's TTFT and cached prompt tokens (ab_requests.py --ttft), for
-# the receipts work/extra-prompts/pfxchat-receipt.json and pfxlong-receipt.json (U parts Upfxchat
-# and Upfxlong, with Lm4096; a U part's receipt name holds no "-", which splits parts). Put the
-# same arm without Pc first: it is the cold reference.
+# chunk or a decode step under a later hit). PciN, PcsN and Pcx need Pc or Pc0 (an arm with one and
+# neither is skipped); every arm without Pc runs with ..._CACHE_HEADROOM_BACKED=0, and without Pcx
+# with ..._PREFIX_EXACT_PUBLISH=0. The window prints a Pc arm's prefix-cache startup lines, and at
+# the end each request's TTFT and cached prompt tokens (ab_requests.py --ttft), for the receipts
+# work/extra-prompts/pfxchat-receipt.json and pfxlong-receipt.json (U parts Upfxchat with Lm4096,
+# and Upfxlong with Lm8192: at Lm4096 the pool's trim evicts L1's short last chunk and decode
+# blocks before L5, which then tests nothing; a U part's receipt name holds no "-", which splits
+# parts). Put the same arm without Pc first: it is the cold reference.
 #
 # Environment: RADIANCE_BIN (the binary), RADIANCE_HOME_DIR (kernels/ and architectures/ for it),
 # SILU_TABLE (the card's silu table), ARMS (default "base verify greedy"), HX_THREADS (16),
@@ -528,7 +531,7 @@ for a in $ARMS; do
   IFS=- read -r -a parts <<< "$a"
   pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 HOST_POOL_MIB=4096 EXTRA_ARGS="" ARM_HOME="$RHOME" ARM_CONC=
   ARM_PROMPTS= ARM_N= ARM_LQ= rt=
-  power="" skip="" ARGS=() f8="" f8x="" rb="" rbf=0 pred="" cs="" kh=""
+  power="" skip="" ARGS=() f8="" f8x="" rb="" rbf=0 pred="" cs="" kh="" pc="" pcopt=""
   unset ARM_NOPC   # --no-prefix-cache unless a Pc part sets it empty
   for p in "${parts[@]:1}"; do
     case $p in
@@ -600,12 +603,12 @@ for a in $ARMS; do
       K)       env+=(RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE=1) ;;     # the RAM cache packed for the CPU only
       Vp)      env+=(RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED=1) ;;      # VRAM residents in the packed-scale form (vpack_gate)
       Lm[0-9]*) ARGS+=(--max-model-len "${p#Lm}") ;;   # a longer context (default 512), e.g. for long-prompt TTFT
-      Pc)      ARM_NOPC= ; ARGS+=(--prefix-resume exact)                            # prefix cache on (exact resume, the default, named)
+      Pc)      pc=1 ARM_NOPC= ; ARGS+=(--prefix-resume exact)                          # prefix cache on (exact resume, the default, named)
                env+=(RADIANCE_EXPERIMENTAL_CACHE_HEADROOM_BACKED=1) ;;              # ... and pinned slabs not reserved twice
-      Pc0)     ARM_NOPC= ; ARGS+=(--prefix-resume exact) ;;                         # prefix cache on, the margin as before (the control)
-      Pci[0-9]*) ARGS+=(--checkpoint-interval "${p#Pci}") ;;                      # snapshot interval (2048)
-      Pcs[0-9]*) ARGS+=(--checkpoint-slots "${p#Pcs}") ;;                         # snapshot store slots (auto)
-      Pcx)     env+=(RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH=1) ;;             # publish only cold-cut chunks
+      Pc0)     pc=1 ARM_NOPC= ; ARGS+=(--prefix-resume exact) ;;                      # prefix cache on, the margin as before (the control)
+      Pci[0-9]*) pcopt+=" $p"; ARGS+=(--checkpoint-interval "${p#Pci}") ;;                    # snapshot interval (2048)
+      Pcs[0-9]*) pcopt+=" $p"; ARGS+=(--checkpoint-slots "${p#Pcs}") ;;                       # snapshot store slots (auto)
+      Pcx)     pcopt+=" $p"; env+=(RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH=1) ;;           # publish only cold-cut chunks
       Pf)      env+=(RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE=1) ;;   # a prefill chunk alone in its step; decode rows batched
       N[0-9]*) ARGS+=(--max-num-seqs "${p#N}") ;;                     # this arm's --max-num-seqs (MAX_SEQS for every arm)
       C[0-9]*) ARM_CONC=${p#C} ;;                                     # this arm's requests sent K at a time (AB_CONCURRENCY)
@@ -680,6 +683,14 @@ for a in $ARMS; do
   if [[ -n "$cs" ]]; then env+=(RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP=1); else env+=(RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP=0); fi
   ARM_CS=$cs
   if [[ -n "$kh" ]]; then env+=(RADIANCE_EXPERIMENTAL_DS41_PREFILL_HASH=1); else env+=(RADIANCE_EXPERIMENTAL_DS41_PREFILL_HASH=0); fi
+  # The prefix cache's parts: PciN, PcsN and Pcx act only with the cache on (Pc or Pc0); without it
+  # the arm would run cold under their names. Every arm states both prefix switches, so a window's
+  # VAR=val cannot turn a cold arm or the Pc0 control into something its name does not say.
+  if [[ -n "$pcopt" && -z "$pc" ]]; then
+    log "arm $a:$pcopt without Pc or Pc0 (the prefix cache stays off); the arm is skipped"; skip=1
+  fi
+  [[ " ${env[*]} " == *" RADIANCE_EXPERIMENTAL_CACHE_HEADROOM_BACKED=1 "* ]] || env+=(RADIANCE_EXPERIMENTAL_CACHE_HEADROOM_BACKED=0)
+  [[ " ${env[*]} " == *" RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH=1 "* ]] || env+=(RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH=0)
   [[ -n "$skip" ]] && continue
   [[ -n "$power" ]] && power_set "$power"
   case $pol in

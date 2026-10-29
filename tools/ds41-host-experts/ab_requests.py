@@ -3,10 +3,11 @@
   ab_requests.py RECEIPT URL N OUT.json   send the first N held-out requests of RECEIPT (the loop's
                                           receipt.json) to URL, one at a time (AB_CONCURRENCY=K:
                                           in waves of K at once); save each response
-  ab_requests.py --compare DIR ARM...     per request: whether each arm's text equals the first
-                                          arm's, and each arm's decode tokens/s (arms that sent
-                                          other requests, a U part's receipt, are compared apart,
-                                          against the first of their own)
+  ab_requests.py --compare DIR ARM...     per request: whether each arm's text equals that of the
+                                          first arm that sent the request (by name), and each arm's
+                                          decode tokens/s (arms with no request in common, a U
+                                          part's receipt beside the held-out prompts, are compared
+                                          apart)
   ab_requests.py --ttft DIR ARM...        per request: each arm's time to first token, the prompt
                                           tokens the prefix cache supplied, and whether its text
                                           equals the first arm's (prefix-cache A/Bs; grouped the
@@ -242,36 +243,60 @@ def load(d, arms):
 
 
 def by_receipt(data):
-    """Arms grouped by the requests they sent (a U part's receipt, or the held-out prompts), in the
-    order given; texts are compared within a group, against its first arm."""
-    groups = []
+    """Arms grouped by the requests they sent, in the order given: arms whose request names overlap,
+    directly or through another arm, are one group (a verify arm that sent the first three
+    held-out prompts goes with the arms that sent all eight); only arms with no name in common are
+    apart (a U part's receipt beside the held-out prompts). A group's names come in the order its
+    arms first sent them. An arm with no requests is left out."""
+    groups = []   # [names, their set, arms]
     for a, rows in data.items():
-        for g in groups:
-            if g[0] == tuple(rows):
-                g[1].append(a)
-                break
+        if not rows:
+            print("arm %s: no requests" % a)
+            continue
+        mine = set(rows)
+        hit = [g for g in groups if g[1] & mine]
+        if hit:
+            g = hit[0]
+            for h in hit[1:]:   # this arm's names join groups that were apart
+                g[0] += [n for n in h[0] if n not in g[1]]
+                g[1] |= h[1]
+                g[2] += h[2]
+                groups.remove(h)
         else:
-            groups.append((tuple(rows), [a]))
-    return groups
+            g = [[], set(), []]
+            groups.append(g)
+        g[0] += [n for n in rows if n not in g[1]]
+        g[1] |= mine
+        g[2].append(a)
+    order = {a: i for i, a in enumerate(data)}
+    return [(tuple(g[0]), sorted(g[2], key=order.get)) for g in groups]
+
+
+def ref_arm(data, cols, n):
+    """The arm request n is compared against: the first of `cols` that sent it."""
+    return next(a for a in cols if n in data[a])
 
 
 def compare(d, arms):
+    """Per request, each arm's text against the first arm that sent that request (by name), and
+    each arm's decode tokens/s; arms with no request name in common are compared apart."""
     data, _ = load(d, arms)
-    for names, cols in by_receipt(data):
-        first = cols[0]
-        if len(data) > len(cols):
-            print("arms sending %s .. %s (%d requests), against %s:" % (names[0], names[-1],
-                                                                        len(names), first))
+    groups = by_receipt(data)
+    for names, cols in groups:
+        if len(groups) > 1:
+            print("arms sending %s .. %s (%d requests), each against the first arm that sent it (%s):" % (
+                names[0], names[-1], len(names), cols[0]))
         print("%-12s" % "request" + "".join("%18s" % a for a in cols))
         tot = {a: [0.0, 0] for a in cols}
         for n in names:
+            ref = data[ref_arm(data, cols, n)][n]
             cells = []
             for a in cols:
                 r = data[a].get(n)
                 if not r or r["text"] is None:
                     cells.append("%18s" % "-")
                     continue
-                same = r["text"] == data[first][n]["text"]
+                same = r["text"] == ref["text"]
                 tps = r["timings"].get("predicted_per_second") or 0.0
                 tot[a][0] += r["timings"].get("predicted_ms") or 0.0
                 tot[a][1] += r["timings"].get("predicted_n") or 0
@@ -282,10 +307,10 @@ def compare(d, arms):
 
 
 def ttft(d, arms):
-    """Prefix-cache A/Bs, per group of arms that sent the same requests (by_receipt), against the
-    group's first arm (put the arm without Pc first: every request cold). Per request and arm: the
-    time to first token, the prompt tokens the cache supplied (cache_n), and the text: 'same' or
-    'DIFF' against the first arm, 'pdif' where a chat_turns prompt differs from the first arm's (an
+    """Prefix-cache A/Bs, per group of arms that sent the same requests (by_receipt), each request
+    against the group's first arm that sent it (put the arm without Pc first: every request cold).
+    Per request and arm: the time to first token, the prompt tokens the cache supplied (cache_n),
+    and the text: 'same' or 'DIFF' against that arm, 'pdif' where a chat_turns prompt differs from its (an
     earlier reply that differed was sent back, so the texts are not comparable; the first DIFF
     above it is the one to read). Then per arm: the sums; repeats (requests with the same prompt
     ids in one arm, e.g. a cold request and its hit) whose texts differ, want none; replies sent
@@ -293,8 +318,8 @@ def ttft(d, arms):
     next turn adopts fewer of the decode steps' blocks); and the /stats prefix counters."""
     data, stats = load(d, arms)
     for names, cols in by_receipt(data):
-        first = cols[0]
-        print("%d requests (%s .. %s), against [0]:" % (len(names), names[0], names[-1]))
+        print("%d requests (%s .. %s), each against the first arm that sent it ([0] when it did):" % (
+            len(names), names[0], names[-1]))
         for i, a in enumerate(cols):
             print("[%d] %s" % (i, a))
         print("%-14s %7s" % ("request", "prompt") +
@@ -303,7 +328,7 @@ def ttft(d, arms):
         for n in names:
             p = None
             cells = []
-            ref = data[first][n]
+            ref = data[ref_arm(data, cols, n)][n]
             for a in cols:
                 r = data[a].get(n)
                 if not r or r.get("text") is None:

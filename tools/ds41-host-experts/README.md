@@ -279,8 +279,9 @@ every position bit-identical: KL 0, top-1 100%.
   names the weights read by `gemm_nt_bf16f8`; every other arm runs with the knob off.
   `PROMPTS`, `AB_REQUESTS`, `AB_MAX_TOKENS`, `AB_CONCURRENCY` and `MAX_SEQS` change the workload.
 - `ab_requests.py`: sends a receipt's requests (token ids, `chat_text` framed like the held-out
-  prompts, `chat_turns` conversations in the same framing, or `messages`) and compares arms
-  (arms that sent another receipt are compared among themselves); `--ttft DIR ARM...` prints each
+  prompts, `chat_turns` conversations in the same framing, or `messages`) and compares arms (each
+  request by name against the first arm that sent it; only arms with no request in common, such as
+  a U part's receipt beside the held-out prompts, are compared apart); `--ttft DIR ARM...` prints each
   request's time to first token and cached prompt tokens (see Prefix caching); `--lp`, `--force`,
   `--kl`, `--kl-dir`: the quality harness above (`ab_requests_test.py` runs it against a fake
   server with a toy model: an exact model forced along its own reference is bit-identical, a
@@ -393,6 +394,15 @@ model of the scheduler's exact rule, the retention ladder and the slot store:
 | B2 / B3 / D1 / B4 | 640 / 752 / 832 / 848 | 640 / 752 / 768 / 848 | B3, D1, B4: 10-18 tokens of a short last chunk |
 | C2 / C3 | 336 / 400 | 336 / 400 | C3: 2 tokens of C1's short last chunk, 46 of its decode steps |
 | L2 / L3 / L4 / L5 | 3,072 / 2,560 / 3,072 / 3,152 | same | L5: 14 of L1's short last chunk, 30-46 of its decode steps |
+
+Run `Upfxlong` at `Lm8192` (`Upfxchat` at `Lm4096`). At `Lm4096` the KV pool holds 4,284 tokens, and
+the trim that keeps a quarter of it free (counting the closing request's own blocks) evicts exactly
+L1's short last chunk and decode blocks at L3's close: L4 recomputes them and L5 adopts L4's full
+chunks, so the arms with and without `Pcx` test the same thing. At `Lm8192` (~8,568 tokens) nothing
+in the receipt is trimmed (`/stats` `prefix_evictions` 0) and the values above hold; the auto
+snapshot slots are 12 at `Pci16` and 8 at `Pci256`. `PciN`, `PcsN` and `Pcx` need `Pc` or `Pc0` (an
+arm with one and neither is skipped), and every arm without `Pc` / `Pcx` runs with
+`..._CACHE_HEADROOM_BACKED=0` / `..._PREFIX_EXACT_PUBLISH=0`.
 
 Every reply of a `Pc` arm must equal the same arm's without `Pc` on the same receipt (put that arm
 first): `ab_requests.py --compare` and `--ttft` (texts `same`; `pdif` marks a prompt that differs

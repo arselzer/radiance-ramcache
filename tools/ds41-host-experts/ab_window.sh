@@ -156,7 +156,8 @@ arm() {   # name, then env assignments for the server; CACHE_MIB the RAM cache (
     if (( t > 600 )); then log "arm $name: no server after 600 s"; stop_server; return 1; fi
   done
   log "arm $name: serving after ${t}s"
-  python3 -I "$HERE/ab_requests.py" "$PROMPTS" "http://127.0.0.1:$PORT" "$n" "$OUT/$name.json" >>"$OUT/window.log" 2>&1
+  env AB_CONCURRENCY=${ARM_CONC:-${AB_CONCURRENCY:-1}} \
+    python3 -I "$HERE/ab_requests.py" "$PROMPTS" "http://127.0.0.1:$PORT" "$n" "$OUT/$name.json" >>"$OUT/window.log" 2>&1
   log "arm $name: requests exit $?"
   stop_server
   grep -E 'host experts|EP scoped|error|ERR' "$OUT/$name.server.log" | tail -12 | tee -a "$OUT/window.log"
@@ -223,9 +224,13 @@ for a in $ARMS; do
 # engram_kv's rows split over the ranks (needs a deepseek41 plugin that has it); Pa the next layer's
 # attention weights read into the card's on-die cache during the CPU-row wait (same); K the RAM cache
 # in the CPU-only packed form (RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE; needs all, M16 and B1); ScN
-# the RAM cache's profile-hot units get N second chances before eviction; rN a repeat (ignored).
+# the RAM cache's profile-hot units get N second chances before eviction; rN a repeat (ignored);
+# Pf a prefill chunk runs in a step of its own and the decode rows of concurrent requests run
+# together (RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE); NK --max-num-seqs K, CK the arm's requests
+# sent K at a time (AB_CONCURRENCY), LK --max-model-len K (the KV pool backs about one sequence of
+# K tokens in all: 512 holds four 110-token requests, 1024 eight, 2048 sixteen).
   IFS=- read -r -a parts <<< "$a"
-  pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 HOST_POOL_MIB=4096 EXTRA_ARGS="" ARM_HOME="$RHOME"
+  pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 HOST_POOL_MIB=4096 EXTRA_ARGS="" ARM_HOME="$RHOME" ARM_CONC=
   power="" skip="" ARGS=()
   for p in "${parts[@]:1}"; do
     case $p in
@@ -278,6 +283,10 @@ for a in $ARMS; do
                [[ $p == Ds[0-9] ]] && env+=(RADIANCE_EXPERIMENTAL_DS41_DSPARK_VERIFY_CAP=${p#Ds})
                [[ $p == Dsa ]] && ARGS+=(--draft-window adaptive) ;;
       K)       env+=(RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE=1) ;;     # the RAM cache packed for the CPU only
+      Pf)      env+=(RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE=1) ;;   # a prefill chunk alone in its step; decode rows batched
+      N[0-9]*) ARGS+=(--max-num-seqs "${p#N}") ;;                     # this arm's --max-num-seqs (MAX_SEQS for every arm)
+      C[0-9]*) ARM_CONC=${p#C} ;;                                     # this arm's requests sent K at a time (AB_CONCURRENCY)
+      L[0-9]*) ARGS+=(--max-model-len "${p#L}") ;;                    # this arm's --max-model-len (KV for N sequences)
       *)       log "arm $a: unknown part $p" ;;
     esac
   done

@@ -15,10 +15,11 @@
  * carried and which passes ran after their request had already stopped (the post-stop pass).
  *
  * Nothing it does changes a byte the card or the CPU computes: rank 0 copies the router's outputs
- * to pinned memory behind the counts row the file stager already waits for (three more copies a
- * layer on the compute stream, ~1.6 KB), each rank reads the RAM cache's residency without a lease,
- * an LRU touch or a statistic (Mover::units_cached), and a background thread writes the files. The
- * issuing threads only append to a buffer.
+ * to pinned memory right behind the counts row the file stager already copies (three more copies a
+ * layer on the compute stream, ~1.6 KB, under an event of their own, so the CPU's choice does not
+ * wait for them), each rank reads the RAM cache's residency without a lease, an LRU touch or a
+ * statistic (Mover::units_cached), and a background thread writes the files. The issuing threads
+ * only append to a buffer.
  *
  * ---- files ------------------------------------------------------------------------------------
  *

@@ -460,9 +460,11 @@ private:
      * (rt_layer), where the issuing thread waits for the pool anyway. Rank 0 adds the router's
      * outputs: the layer's router select op (router_scored_topk: logits, correction bias, ids,
      * weights) shows its operands at operands() (rt_capture), and start_ep_routed queues their
-     * copies to pinned memory behind the counts row's (rt_queue), so the counts' wait covers them.
-     * The router's buffers hold this layer's outputs until the next layer's router, which the
-     * issue order puts after this layer's decision. No byte the card or the pool computes changes. */
+     * copies to pinned memory right behind the counts' event (rt_queue), under an event of their
+     * own (rt_ev_) that rt_layer waits for: the CPU's choice does not wait for them, and by the
+     * time the record is built they have long landed. The router's buffers hold this layer's
+     * outputs until the next layer's router, which the issue order puts after this layer's
+     * decision. No byte the card or the pool computes changes. */
     struct RtCap {
         uint32_t pass = 0;       /* the pass the operands were seen in (trace_pass_), 0 never */
         int64_t rows = 0;
@@ -480,6 +482,8 @@ private:
     float*   rt_w_ = nullptr;          /* [kEpRouteMaxRows, 6] */
     float*   rt_logits_ = nullptr;     /* [384]: a one-token pass's */
     float*   rt_bias_ = nullptr;       /* [routed layers, 384], each copied once */
+    RadEvent rt_ev_ = nullptr;         /* behind rank 0's copies (host-waited) */
+    bool     rt_ev_rec_ = false;
     std::vector<uint8_t> rt_bias_state_;                /* by routed layer: 0, 1 queued, 2 recorded */
     int32_t  rt_q_li_ = -1;            /* the layer whose router outputs are queued, or -1 */
     bool     rt_q_logits_ = false;

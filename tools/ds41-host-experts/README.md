@@ -93,7 +93,7 @@ the engine or the scripts assumes where the checkpoint is. `ab_window.sh` takes 
 | `RADIANCE_EXPERIMENTAL_DS41_MIRROR_SPLIT=N` (2-4, designed for 3) | not yet measured on the engine (research landbench2: a lone miss's reads 2629 → 2400 µs, the mirror's copy 216 → 101 µs) | a decode pass that misses one unit reads the plane mirror's decode tail (2.4 MB at 0.13) in N pieces on N readers, so the SATA stripe's preads and the copies out of the bounce buffers overlap; the same bytes (pieces start on the container's 4 KiB grid, so a failed one falls back to the container as a whole tail does). Needs the decode mirror (`R`, `RdNN`); arm part `MsN`. The read-ahead in pieces (`PpK`) reads the container only, so its pieces are not split; the whole-unit read-ahead (`PoK`/`PtK`) reads a unit as a lone decode miss and is split too. Gate: the shutdown report's "one-token miss reads, one unit" line; drop it if the mirror lands last in under 25% of calls and its copy takes under 0.15 ms |
 | `RADIANCE_EXPERIMENTAL_DS41_MISS_POST=1` | not yet measured on the engine (research: 20-40 µs a critical layer, +0.3-0.6%) | a one-token pass's missed planes start on the kept readers as soon as `hx_choose` knows them, instead of after `hx_submit` (its pool wake, 28-32 µs a layer) and the copy path's staging; the issuing thread then waits in `hx_submit_misses_now` (`NativeReadWorkers::post`/`join`, which hold the readers' call mutex from post to join as `run` does). The same reads: the set `hx_submit_misses_now` reads, so with the read-ahead in pieces (`PpK`) never a unit read ahead whole nor one the piece readers are finishing (whose slot `hx_ra_settle` may give fresh planes); the post is a demand read for the piece readers from the post on, and is finished before the urgent units are settled. Also at an early-issued layer's gather (`Ei`). A post that finds the readers on another thread's call (the whole-unit read-ahead's, `PoK`/`PtK`, or the async misses' worker, `A`) does not wait: it posts nothing and the layer reads as before (the mover's "kept plane readers" line counts them). Arm part `Mp`; the "readers" line shows the readers' start and the caller's return, and the EP decision's own `posting the misses' reads` line its time (not in "choose") |
 
-| `RADIANCE_EXPERIMENTAL_DS41_ROUTE_TRACE=<prefix>` | instrument, exact; overhead not yet measured (rank 0: three more ~1.6 KB copies a routed layer behind its counts row; every rank: one cache lock a decode layer) | the routing trace for the lossy track (`core/place/route_trace.h` has the format; below). Arm part `Rt` (files under `rtrace-<arm>/`); shutdown lines `route trace: ...` per rank (picks by status) and for the files (records, bytes, drops) |
+| `RADIANCE_EXPERIMENTAL_DS41_ROUTE_TRACE=<prefix>` | instrument, exact; overhead not yet measured (rank 0: three more copies, ~1.6 KB, a routed layer behind its counts row's, which the CPU's choice does not wait for; every rank: one cache lock a decode layer) | the routing trace for the lossy track (`core/place/route_trace.h` has the format; below). Arm part `Rt` (files under `rtrace-<arm>/`); shutdown lines `route trace: ...` per rank (picks by status) and for the files (records, bytes, drops) |
 
 The shutdown report counts the miss reads of one-token passes whatever the switches (two lines a
 rank, one for calls of one missed unit and one for more): how many calls had a mirror leg and in how
@@ -166,21 +166,24 @@ which of its file-tier experts the RAM cache held at the choice (one lock, no le
 `Mover::units_cached`) and, once, every local expert's tier; the step loop records which request
 and position each pass carried and where each request ended, so the post-stop pass (issued ahead
 of a request that had just stopped) is flagged. Rank 0 copies its layer's ids, weights and logits
-to pinned memory behind the counts row the file stager already waits for; a background thread
+to pinned memory right behind the counts row's copy, under an event of its own that the CPU's
+choice does not wait for; a background thread
 (nice 10) writes `<prefix>.rank<r>.bin` and `<prefix>.steps.bin`. Rank 0 writes ~1.7 KB a decode
 layer (~66 KB a token), the others ~60 bytes.
 
 `rtrace.py report PREFIX ARM.json` (ARM.json: the arm's `ab_requests.py` output, for the requests'
-names, families and measured decode time) prints the assessment's gates over decode tokens, post-stop
-passes apart: the weight share a miss carries (and the mass drop-all removes a token); the
+names, families and measured decode time) prints the assessment's gates over decode tokens,
+post-stop passes apart: the weight share a miss carries (and the mass drop-all removes a token); the
 weight-threshold drop gate (go if 50% or more of misses carry a share below tau 0.1); the
-cache-aware routing gate (go if 40% or more of misses have a held substitute -- on the card, or in the
-owner's RAM cache at that moment -- with a key within delta 5% of the 6th key, kill below 20%;
+cache-aware routing gate (go if 40% or more of misses have a held substitute -- on the card, or in
+the owner's RAM cache at that moment -- with a key within delta 5% of the 6th key, kill below 20%;
 `--delta` sweeps it); the misses' slots (protect-top-2: 60% at slot 2 or below); all by prompt
-family and by layer; and a replay estimate of decode tok/s for drop-all, drop below tau and a cap of
-6 drops a token from the assessment's time model (T = 24.7 + 2.54 x waited misses + 0.133 x CPU hits
-ms a token, and the constrained 31 / 2.28 / 0.108), each also with its fixed part refitted to the
-arm's measured time. `--json OUT` keeps the tables. A miss there is M or P; A counts as a hit.
+family and by layer; and a replay estimate of decode tok/s for drop-all, drop below tau, a cap of 6
+drops a token and the protect-top-k arms (drop only misses at slot 2 or below, 4 or below) from the
+assessment's time model (T = 24.7 + 2.54 x waited misses + 0.133 x CPU hits ms a token, and the
+constrained 31 / 2.28 / 0.108), each also with its fixed part refitted to the arm's measured time,
+and a third model fitted on the trace's own token times (rank 0's pass starts). `--json OUT` keeps
+the tables. A miss there is M or P; A counts as a hit. Single-sequence decode passes only (C1 arms).
 
 **The quality harness** (arm part `Lq`; `ab_requests.py --lp / --force / --kl`). After the arm's
 timed requests (unchanged), the window's first `Lq` arm of a prompt set records the reference:

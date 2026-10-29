@@ -533,8 +533,9 @@ FileStager::~FileStager() {
         hx_bg_.clear();
     }
     if (trace_fp_) std::fclose(trace_fp_);
-    /* The route trace's pinned staging: its last copies were behind a counts row this thread
-     * waited for, so nothing still writes it. */
+    /* The route trace's pinned staging, once its last copies have landed. */
+    if (rt_ev_rec_ && rt_ev_) (void)rad_event_sync(rt_ev_);
+    if (rt_ev_) rad_event_destroy(rt_ev_);
     for (void* p : { (void*)rt_ids_, (void*)rt_w_, (void*)rt_logits_, (void*)rt_bias_ })
         if (p) rad_dev_free(p, RAD_MEM_HOST_PINNED);
     if (hx_out_rec_ && hx_out_ev_) (void)rad_event_sync(hx_out_ev_);
@@ -770,9 +771,10 @@ int FileStager::start_ep_routed(int32_t li, RadStream s, bool* read) {
         RAD_TRY(rad_memcpy_async(counts_host_, v.row, 96 * (int64_t)sizeof(int32_t), s));
         if (hx) RAD_TRY(hx_fetch(li, s));
     }
-    /* ..._ROUTE_TRACE: rank 0's copies of the router's outputs ride the counts' wait. */
-    if (rt_) RAD_TRY(rt_queue(li, s));
     RAD_TRY(rad_event_record(counts_ev_, s));
+    /* ..._ROUTE_TRACE: rank 0's copies of the router's outputs, behind the counts' event (the
+     * choice does not wait for them) and under their own, which rt_layer waits for. */
+    if (rt_) RAD_TRY(rt_queue(li, s));
     /* ..._EARLY_ISSUE (stager.h): capped, every file-tier unit is the CPU's, so the card's aliases
      * are the same whichever units the router picked. Publish them for the whole layer and return
      * without waiting: the card runs the layer's resident experts, the shared expert and the ffn
@@ -1076,13 +1078,16 @@ int FileStager::rt_init(const Program& prog) {
         rt_logits_ = (float*)rad_dev_alloc(rtrace::kExperts * 4, RAD_MEM_HOST_PINNED);
         rt_bias_ = (float*)rad_dev_alloc((int64_t)layers_.size() * rtrace::kExperts * 4,
                                          RAD_MEM_HOST_PINNED);
-        if (!rt_ids_ || !rt_w_ || !rt_logits_ || !rt_bias_) {
+        if (rad_event_create(&rt_ev_) < 0) rt_ev_ = nullptr;   /* host-waited: not a local event */
+        if (!rt_ids_ || !rt_w_ || !rt_logits_ || !rt_bias_ || !rt_ev_) {
             RAD_WARN("route trace: pinned staging for the router's outputs failed; rank 0 writes "
                      "its residency only");
             for (void* p : { (void*)rt_ids_, (void*)rt_w_, (void*)rt_logits_, (void*)rt_bias_ })
                 if (p) rad_dev_free(p, RAD_MEM_HOST_PINNED);
+            if (rt_ev_) rad_event_destroy(rt_ev_);
             rt_ids_ = nullptr;
             rt_w_ = rt_logits_ = rt_bias_ = nullptr;
+            rt_ev_ = nullptr;
         }
     }
     rt_bias_state_.assign(layers_.size(), 0);
@@ -1152,8 +1157,8 @@ void FileStager::rt_capture(int32_t li, const RadTensor* t, int n_t) {
 }
 
 /* Rank 0: the layer's ids and weights (and on a one-token pass its logits; the first time, its
- * bias) to pinned memory on s, behind the router that wrote them; the caller records the counts'
- * event after these, so its wait covers them. */
+ * bias) to pinned memory on s, behind the router that wrote them and the counts' event, then
+ * rt_ev_ behind them (rt_layer waits for it). */
 int FileStager::rt_queue(int32_t li, RadStream s) {
     rt_q_li_ = -1;
     rt_q_logits_ = false;
@@ -1179,6 +1184,10 @@ int FileStager::rt_queue(int32_t li, RadStream s) {
         RAD_TRY(rad_memcpy_async(rt_bias_ + (size_t)li * rtrace::kExperts, c.bias,
                                  rtrace::kExperts * 4, s));
         rt_bias_state_[(size_t)li] = 1;
+    }
+    if (rt_ev_) {
+        RAD_TRY(rad_event_record(rt_ev_, s));
+        rt_ev_rec_ = true;
     }
     rt_q_li_ = li;
     return RAD_OK;
@@ -1230,7 +1239,10 @@ void FileStager::rt_choice(int32_t li, bool decided) {
 void FileStager::rt_layer(int32_t li) {
     const int32_t layer = layers_[(size_t)li].layer;
     if (layer < 0 || layer >= rtrace::kLayers) return;
-    const bool route = rt_rank_ == 0 && rt_q_li_ == li;
+    /* Rank 0's copies of this layer's router outputs: queued right behind the counts the choice
+     * waited for, so in practice landed by now and this wait returns at once. */
+    const bool route = rt_rank_ == 0 && rt_q_li_ == li &&
+                       !(rt_ev_rec_ && rt_ev_ && rad_event_sync(rt_ev_) < 0);
     const bool logits = route && rt_q_logits_;
     const int64_t rows = pass_tok_;
     rtrace::Pick picks[rtrace::kLocal];

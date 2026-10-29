@@ -1117,6 +1117,8 @@ int FileStager::hx_init_impl(const Program& prog) {
             piece_kb = std::clamp<int64_t>(std::atoll(b), 64, 16384) / 4 * 4;
         if (const char* l = std::getenv("RADIANCE_EXPERIMENTAL_DS41_PREFETCH_LIVE"); l && *l)
             live = std::clamp(std::atoi(l), 1, 64);
+        const char* fin = std::getenv("RADIANCE_EXPERIMENTAL_DS41_PREFETCH_FINISH");
+        hx_ra_finish_ = !fin || std::strcmp(fin, "0") != 0;
         PieceReader& r = PieceReader::process();
         if (!r.start(qd, piece_kb << 10)) {
             if (plan_->rank == 0)
@@ -1141,8 +1143,9 @@ int FileStager::hx_init_impl(const Program& prog) {
             if (plan_->rank == 0)
                 RAD_INFO("read-ahead: each rank's uncached units among layer L+2's top %d predicted "
                          "experts are read at layer L in %lld KiB pieces, %d readers over the process, "
-                         "yielding to demand reads; at most %d live units a rank", hx_pred_->k(),
-                         (long long)(r.piece_bytes() >> 10), r.readers(), live);
+                         "yielding to demand reads; at most %d live units a rank; a partly read unit "
+                         "its layer needs is %s", hx_pred_->k(), (long long)(r.piece_bytes() >> 10),
+                         r.readers(), live, hx_ra_finish_ ? "finished by the readers" : "read afresh");
         }
     }
     if (hx_miss_rows_ > 0 && hx_bg_.empty()) {
@@ -1842,8 +1845,9 @@ std::shared_ptr<Mover::HostPlanes> FileStager::hx_ra_take(int32_t u, bool* ready
         return p;
     }
     /* Barely started: the demand read with the plane mirror's share beats the container alone for
-     * the rest. A fresh buffer, since pieces in flight still land in this one. */
-    if ((int64_t)ra->started() * hx_ra_->piece_bytes() < mover_->decode_mirror_bytes()) {
+     * the rest (or ..._PREFETCH_FINISH=0). A fresh buffer, since pieces in flight still land in
+     * this one. */
+    if (!hx_ra_finish_ || (int64_t)ra->started() * hx_ra_->piece_bytes() < mover_->decode_mirror_bytes()) {
         hx_ra_->cancel(*ra);
         ++hx_stats_.ra_fresh;
         hx_stats_.ra_dropped_bytes += (uint64_t)ra->bytes_in();

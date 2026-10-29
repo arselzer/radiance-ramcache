@@ -527,7 +527,7 @@ private:
      * them on the process's PieceReader. hx_choose decides each of a layer's units once its
      * routing is known (hx_ra_take; the rest are cancelled), and hx_submit_misses_now waits for
      * the urgent ones inside its demand read. ..._PREFETCH_QD readers (4) read pieces of
-     * ..._PREFETCH_PIECE_KB (512); at most ..._PREFETCH_LIVE units a rank are live (12). */
+     * ..._PREFETCH_PIECE_KB (512); at most ..._PREFETCH_LIVE units a rank are live (8). */
     struct RaEntry {
         std::shared_ptr<ReadAheadUnit>     u;
         std::shared_ptr<Mover::HostPlanes> p;
@@ -544,7 +544,9 @@ private:
      * a layer at or before it is too late to read ahead. */
     std::atomic<uint64_t> hx_ra_at_{ 0 };
     int     hx_ra_cap_ = 12;
-    int64_t hx_ra_fresh_below_ = 0;          /* bytes started under which a miss reads afresh */
+    /* ..._PREFETCH_FINISH (1): a partly read unit its layer selects is finished by the readers
+     * (urgent); 0 cancels it and the layer reads it afresh, as a unit barely started always is. */
+    bool    hx_ra_finish_ = true;
     int     hx_ra_handed_ = 0;               /* whole units handed to this layer: no drive read at
                                               * the layer; the epoch is checked before their jobs */
     /* Parallel to hx_miss_: the unit the readers are finishing for this layer, or null. */

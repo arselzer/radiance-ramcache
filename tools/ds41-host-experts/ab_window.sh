@@ -218,7 +218,8 @@ for a in $ARMS; do
   # at layer L each rank's uncached units among layer L+2's top K predicted experts, read in 512 KiB
   # pieces, 4 in flight over the process, none started while a demand read is in flight, handed to
   # their layer only whole (the rest read at once when the layer needs a partly read one); PqN its
-  # readers (pieces in flight, 4) and PbN its piece size in KiB (512), with PpK; o --profile-ops;
+  # readers (pieces in flight, 4), PbN its piece size in KiB (512), and Pf0 a partly read unit its
+  # layer needs read afresh instead of finished, with PpK; o --profile-ops;
   # H the second run home (RADIANCE_HOME_DIR2); iN background insert threads for missed units;
 # pN --host-pool-mib (4096: a rank's pinned expert slots and the file tier's staging); G pin the
 # RAM cache's slabs at startup; R / RNN read part of each missed expert from the checkpoint's
@@ -281,6 +282,7 @@ for a in $ARMS; do
       Pp[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_PREFETCH=pieces RADIANCE_EXPERIMENTAL_DS41_PREFETCH_K=${p#Pp}) ;;   # read-ahead in pieces, top K
       Pq[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_PREFETCH_QD=${p#Pq}) ;;          # ...its readers (4)
       Pb[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_PREFETCH_PIECE_KB=${p#Pb}) ;;    # ...its piece size in KiB (512)
+      Pf[01])   env+=(RADIANCE_EXPERIMENTAL_DS41_PREFETCH_FINISH=${p#Pf}) ;;      # ...0: partly read units read afresh
       Er)      ARGS+=(--embedding-placement ram) ;;   # the token embedding pinned in host RAM, its VRAM to experts
       Xp)      env+=(RADIANCE_EXPERIMENTAL_DS41_READ_POOL=0) ;;        # miss reads on threads started a call
       Xh)      env+=(RADIANCE_EXPERIMENTAL_DS41_PLANE_HUGEPAGES=0) ;;  # miss buffers on 4 KiB pages

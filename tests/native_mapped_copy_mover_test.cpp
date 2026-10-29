@@ -668,7 +668,7 @@ struct SlabCacheHostTest {
     static std::pair<uint8_t*,size_t> copying(SlabCache& c){
         std::lock_guard<std::mutex>o(c.owner_mutex_);if(!c.state_)return{};std::lock_guard<std::mutex>l(c.state_->mutex);
         for(size_t i=0;i<c.state_->used_slabs;++i){auto&b=c.state_->slabs[i];if(!b.ready)continue;
-            for(size_t j=0;j<2*b.pairs;++j)if(b.keys[j]==SlabCache::busy)return{SlabCache::host(b,j),SlabCache::bytes_for(SlabCache::slot_class(b,j))};}
+            for(size_t j=0;j<2*b.pairs;++j)if(b.keys[j]==SlabCache::busy)return{SlabCache::host(b,j),SlabCache::bytes_for(b,SlabCache::slot_class(b,j))};}
         return{};
     }
 };

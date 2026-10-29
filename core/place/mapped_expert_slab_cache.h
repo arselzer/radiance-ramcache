@@ -1,4 +1,6 @@
 /* Two fixed-size mapped expert classes in paired retained slabs. Private HOST helper.
+ * The class sizes are block_mxfp4's GU and DN unless configure is given others (a CPU-only
+ * packed layout); every slab of one configuration has the same sizes.
  * Allocator callbacks/context must outlive Cache AND every Lease/cleanup handle.
  * Callbacks are noexcept/non-reentrant; quote is deterministic, nondecreasing
  * with requested bytes, and conservative before allocate.
@@ -18,6 +20,14 @@ public:
     using Allocation=Cache::Allocation;
     using Allocator=Cache::Allocator;
     static constexpr size_t GU=12533760,DN=6266880,guard=64,max_pairs=32;
+    using Sizes=std::array<size_t,2>;
+    static constexpr Sizes block_sizes{GU,DN};
+    //Class sizes configure accepts: two distinct nonzero 64-byte multiples (slots stay 64-byte
+    //aligned), small enough that max_pairs pairs fit a size_t.
+    static bool sizes_valid(const Sizes&b)noexcept{
+        constexpr size_t most=SIZE_MAX/(4*max_pairs);
+        return b[0]&&b[1]&&b[0]!=b[1]&&b[0]%64==0&&b[1]%64==0&&b[0]<=most&&b[1]<=most;
+    }
     struct ClassStats {
         size_t capacity_slots=0,resident_slots=0,idle_slots=0,busy_slots=0,leased_slots=0;
         size_t capacity_logical_bytes=0,resident_logical_bytes=0,idle_logical_bytes=0,leased_logical_bytes=0;
@@ -45,6 +55,7 @@ private:
     struct Slab {
         Allocation allocation{};
         std::array<size_t,2*max_pairs> keys{};
+        Sizes bytes=block_sizes;
         size_t pairs=0,request=0,ledger_charge=0;
         bool present=false,ready=false,free_safe=true,free_invoked=false;
     };
@@ -54,6 +65,7 @@ private:
         std::unique_ptr<Slab[]> slabs;
         Allocator allocator{};
         Stats stats{};
+        Sizes bytes=block_sizes;
         size_t count=0,slab_records=0,used_slabs=0,next_pairs=4,minimum_quote=0;
         std::array<size_t,2> first{none,none},last{none,none};
         bool owner_alive=true,retiring=false;
@@ -63,12 +75,12 @@ private:
     std::mutex writer_mutex_;
     mutable std::mutex owner_mutex_;
     State*state_=nullptr;
-    static size_t bytes_for(int c)noexcept{return c==0?GU:DN;}
-    static int klass_for(size_t n)noexcept{return n==GU?0:n==DN?1:-1;}
-    static size_t stride_for(int c)noexcept{return bytes_for(c)+3*guard;}
-    static size_t request_for(size_t p)noexcept{return p&&p<=max_pairs?p*(GU+DN+6*guard):0;}
+    static size_t bytes_for(const Slab&s,int c)noexcept{return s.bytes[size_t(c)];}
+    static int klass_for(const Sizes&b,size_t n)noexcept{return n==b[0]?0:n==b[1]?1:-1;}
+    static size_t stride_for(const Sizes&b,int c)noexcept{return b[size_t(c)]+3*guard;}
+    static size_t request_for(const Sizes&b,size_t p)noexcept{return p&&p<=max_pairs?p*(b[0]+b[1]+6*guard):0;}
     static size_t offset_for(const Slab&s,size_t slot)noexcept{
-        return slot<s.pairs?slot*stride_for(0):s.pairs*stride_for(0)+(slot-s.pairs)*stride_for(1);
+        return slot<s.pairs?slot*stride_for(s.bytes,0):s.pairs*stride_for(s.bytes,0)+(slot-s.pairs)*stride_for(s.bytes,1);
     }
     static int slot_class(const Slab&s,size_t slot)noexcept{return slot<s.pairs?0:1;}
     static uint8_t*host(const Slab&s,size_t slot)noexcept{return s.allocation.host+offset_for(s,slot)+guard;}
@@ -101,11 +113,11 @@ private:
         if(s.first[c]!=none)s.entries[s.first[c]].previous=key;else s.last[c]=key;s.first[c]=key;
     }
     static void initialize_slot(Slab&s,size_t slot)noexcept{
-        auto*h=host(s,slot);const size_t n=bytes_for(slot_class(s,slot));
+        auto*h=host(s,slot);const size_t n=bytes_for(s,slot_class(s,slot));
         std::memset(h-guard,0xbd,guard);std::memset(h+n,0,guard);std::memset(h+n+guard,0xbd,guard);
     }
     static bool guards_ok(const Slab&s,size_t slot)noexcept{
-        const auto*h=host(s,slot);const size_t n=bytes_for(slot_class(s,slot));
+        const auto*h=host(s,slot);const size_t n=bytes_for(s,slot_class(s,slot));
         for(size_t j=0;j<guard;++j)if(h[-ptrdiff_t(guard)+ptrdiff_t(j)]!=0xbd||h[n+j]!=0||h[n+guard+j]!=0xbd)return false;
         return true;
     }
@@ -114,7 +126,7 @@ private:
         for(auto&c:out.classes){c.capacity_slots=c.resident_slots=c.idle_slots=c.busy_slots=c.leased_slots=0;
             c.capacity_logical_bytes=c.resident_logical_bytes=c.idle_logical_bytes=c.leased_logical_bytes=0;}
         for(size_t i=0;i<s.used_slabs;++i){const Slab&b=s.slabs[i];if(!b.ready||b.free_invoked)continue;
-            for(size_t j=0;j<2*b.pairs;++j){auto&c=out.classes[slot_class(b,j)];const size_t n=bytes_for(slot_class(b,j));
+            for(size_t j=0;j<2*b.pairs;++j){auto&c=out.classes[slot_class(b,j)];const size_t n=bytes_for(b,slot_class(b,j));
                 ++c.capacity_slots;c.capacity_logical_bytes+=n;
                 if(b.keys[j]==none){++c.idle_slots;c.idle_logical_bytes+=n;}
                 else if(b.keys[j]==busy)++c.busy_slots;
@@ -123,7 +135,7 @@ private:
             }
         }
         out.cache.idle_charge=0;
-        for(int c=0;c<2;++c)out.cache.idle_charge+=out.classes[c].idle_slots*stride_for(c);
+        for(int c=0;c<2;++c)out.cache.idle_charge+=out.classes[c].idle_slots*stride_for(s.bytes,c);
         return out;
     }
     static Status retire(State&s,std::unique_lock<std::mutex>&lock)noexcept{
@@ -177,7 +189,7 @@ public:
             if(!state_)return Status::Empty;State*s=state_;std::unique_lock<std::mutex>l(s->mutex);
             if(active_){Entry&e=s->entries[key_];if(!e.present||e.generation!=generation_||!e.leases||!s->stats.cache.lease_refs)return Status::Invalid;
                 --e.leases;--s->stats.cache.lease_refs;
-                if(!e.leases){--s->stats.cache.leased_entries;s->stats.cache.leased_charge-=stride_for(e.klass);}
+                if(!e.leases){--s->stats.cache.leased_entries;s->stats.cache.leased_charge-=stride_for(s->bytes,e.klass);}
                 active_=false;host_=nullptr;device_=nullptr;bytes_=0;}
             if(s->owner_alive||s->stats.cache.lease_refs||s->stats.fills_active){state_=nullptr;return Status::Ok;}
             const auto rc=retire(*s,l);if(rc!=Status::Ok)return rc;
@@ -209,7 +221,7 @@ public:
             // Publication AND the first immutable consumer pin commit in the SAME state lock.
             e.filling=false;e.present=true;e.leases=1;b.keys[e.slot]=key_;
             --s.stats.fills_active;++s.stats.fill_commits;s.stats.fill_bytes+=bytes_;++s.stats.cache.resident_entries;++s.stats.cache.inserts;
-            ++s.stats.cache.lease_refs;++s.stats.cache.leased_entries;s.stats.cache.leased_charge+=stride_for(e.klass);
+            ++s.stats.cache.lease_refs;++s.stats.cache.leased_entries;s.stats.cache.leased_charge+=stride_for(s.bytes,e.klass);
             s.stats.cache.peak_leased_charge=std::max(s.stats.cache.peak_leased_charge,s.stats.cache.leased_charge);touch(s,key_);
             out->state_=&s;out->key_=key_;out->bytes_=bytes_;out->generation_=generation_;
             out->host_=SlabCache::host(b,e.slot);out->device_=SlabCache::device(b,e.slot);out->active_=true;
@@ -235,9 +247,9 @@ public:
         if(s->stats.cache.lease_refs||s->stats.fills_active)return;
         const auto rc=retire(*s,l);l.unlock();if(rc==Status::Ok)delete s;else warn_retained();
     }
-    static size_t maximum_slab_records(size_t count,size_t budget,Allocator a)noexcept{
-        if(!count||!a.quote)return 0;const size_t q=a.quote(a.context,request_for(1));
-        return q>=request_for(1)?std::min(count,budget/q):0;
+    static size_t maximum_slab_records(size_t count,size_t budget,Allocator a,const Sizes&b=block_sizes)noexcept{
+        if(!count||!a.quote||!sizes_valid(b))return 0;const size_t q=a.quote(a.context,request_for(b,1));
+        return q>=request_for(b,1)?std::min(count,budget/q):0;
     }
     static size_t metadata_charge(size_t count,size_t slabs)noexcept{
         constexpr size_t fixed=sizeof(SlabCache)+sizeof(State)+192;
@@ -245,9 +257,10 @@ public:
         const size_t x=fixed+slabs*sizeof(Slab);
         return count<=(SIZE_MAX-x)/sizeof(Entry)?x+count*sizeof(Entry):0;
     }
-    Status configure(uint64_t ns,size_t budget,size_t count,Allocator a){
-        if(!ns||!a.quote||!a.allocate||!a.free)return Status::Invalid;
-        const size_t slabs=maximum_slab_records(count,budget,a),m=metadata_charge(count,slabs);
+    //sizes: the two classes' payload bytes (block_mxfp4's GU and DN unless a caller packs them).
+    Status configure(uint64_t ns,size_t budget,size_t count,Allocator a,const Sizes&sizes=block_sizes){
+        if(!ns||!a.quote||!a.allocate||!a.free||!sizes_valid(sizes))return Status::Invalid;
+        const size_t slabs=maximum_slab_records(count,budget,a,sizes),m=metadata_charge(count,slabs);
         if(!m||m>=budget)return Status::Metadata;
         std::lock_guard<std::mutex>w(writer_mutex_);std::lock_guard<std::mutex>o(owner_mutex_);
         if(state_){std::unique_lock<std::mutex>l(state_->mutex);
@@ -257,7 +270,7 @@ public:
         auto*s=new(std::nothrow)State;if(!s)return Status::Metadata;
         s->entries.reset(new(std::nothrow)Entry[count]);s->slabs.reset(new(std::nothrow)Slab[slabs]);
         if(!s->entries||!s->slabs){delete s;return Status::Metadata;}
-        s->allocator=a;s->count=count;s->slab_records=slabs;s->minimum_quote=a.quote(a.context,request_for(1));s->stats.cache.namespace_id=ns;
+        s->allocator=a;s->bytes=sizes;s->count=count;s->slab_records=slabs;s->minimum_quote=a.quote(a.context,request_for(sizes,1));s->stats.cache.namespace_id=ns;
         if(!s->minimum_quote){delete s;return Status::Invalid;}
         s->stats.cache.budget=budget;s->stats.cache.metadata=m;s->stats.cache.peak_charge=m;state_=s;return Status::Ok;
     }
@@ -266,6 +279,8 @@ public:
         std::unique_lock<std::mutex>l(state_->mutex);return retire(*state_,l);
     }
     Stats stats()const{std::lock_guard<std::mutex>o(owner_mutex_);if(!state_)return{};std::lock_guard<std::mutex>l(state_->mutex);return snapshot(*state_);}
+    // The configured classes' payload bytes (block_sizes before any configure).
+    Sizes class_bytes()const{std::lock_guard<std::mutex>o(owner_mutex_);if(!state_)return block_sizes;std::lock_guard<std::mutex>l(state_->mutex);return state_->bytes;}
     Status borrow(uint64_t ns,size_t key,size_t n,Lease*out){return borrow_policy(ns,key,n,out,true);}
     //Read-only scans still own immutable bytes and account hits, but preserve decode LRU order.
     Status borrow_no_touch(uint64_t ns,size_t key,size_t n,Lease*out){return borrow_policy(ns,key,n,out,false);}
@@ -287,16 +302,16 @@ public:
             if(s.stats.cache.allocator_contract_broken)return Status::AllocatorContract;
             if(s.used_slabs>=s.slab_records)return Status::Ok;
             const size_t room=s.stats.cache.budget-s.stats.cache.charge();size_t p=std::min(s.next_pairs,max_pairs),quote=0;
-            for(;p;--p){quote=s.allocator.quote(s.allocator.context,request_for(p));
-                if(quote&&(quote<s.minimum_quote||quote<request_for(p))){s.stats.cache.allocator_contract_broken=true;++s.stats.cache.contract_refusals;return Status::AllocatorContract;}
+            for(;p;--p){quote=s.allocator.quote(s.allocator.context,request_for(s.bytes,p));
+                if(quote&&(quote<s.minimum_quote||quote<request_for(s.bytes,p))){s.stats.cache.allocator_contract_broken=true;++s.stats.cache.contract_refusals;return Status::AllocatorContract;}
                 if(quote&&quote<=room)break;}
             if(!p)return Status::Ok;
-            const size_t request=request_for(p);s.stats.cache.reserved_charge=quote;++s.stats.growth_attempts;peak(s);
+            const size_t request=request_for(s.bytes,p);s.stats.cache.reserved_charge=quote;++s.stats.growth_attempts;peak(s);
             Allocation a{};l.unlock();const bool got=s.allocator.allocate(s.allocator.context,request,quote,&a);l.lock();
             s.stats.cache.reserved_charge=0;
             const bool empty=!a.token&&!a.host&&!a.device&&!a.bytes&&!a.charged_bytes;
             if(!got&&empty){++s.stats.cache.allocation_failures;++s.stats.growth_failures;return Status::Allocation;}
-            const size_t bi=s.used_slabs++;Slab&b=s.slabs[bi];b.present=true;b.pairs=p;b.request=request;b.allocation=a;b.keys.fill(none);b.free_safe=a.token!=nullptr;
+            const size_t bi=s.used_slabs++;Slab&b=s.slabs[bi];b.present=true;b.pairs=p;b.bytes=s.bytes;b.request=request;b.allocation=a;b.keys.fill(none);b.free_safe=a.token!=nullptr;
             b.ledger_charge=a.charged_bytes&&a.charged_bytes>=a.bytes?
                 std::max(a.bytes,a.charged_bytes):std::max(quote,a.bytes);
             s.stats.cache.payload_charge=sat_add(s.stats.cache.payload_charge,b.ledger_charge);
@@ -316,15 +331,16 @@ public:
     }
 private:
     Status borrow_policy(uint64_t ns,size_t key,size_t n,Lease*out,bool touch_lru){
-        if(!out||!out->empty()||klass_for(n)<0)return Status::Invalid;
-        std::lock_guard<std::mutex>o(owner_mutex_);if(!state_)return Status::Miss;State&s=*state_;std::lock_guard<std::mutex>l(s.mutex);
+        if(!out||!out->empty())return Status::Invalid;
+        std::lock_guard<std::mutex>o(owner_mutex_);if(!state_)return klass_for(block_sizes,n)<0?Status::Invalid:Status::Miss;
+        State&s=*state_;std::lock_guard<std::mutex>l(s.mutex);const int c=klass_for(s.bytes,n);if(c<0)return Status::Invalid;
         if(ns!=s.stats.cache.namespace_id||s.retiring)return Status::Namespace;
         if(key>=s.count)return Status::Invalid;if(s.stats.cache.allocator_contract_broken)return Status::AllocatorContract;
-        Entry&e=s.entries[key];const int c=klass_for(n);
+        Entry&e=s.entries[key];
         if(!e.present){++s.stats.cache.misses;++s.stats.classes[c].misses;s.stats.miss_bytes+=n;return Status::Miss;}
         if(e.klass!=c)return Status::Layout;
         if(e.leases==SIZE_MAX||s.stats.cache.lease_refs==SIZE_MAX)return Status::Invalid;
-        if(!e.leases){++s.stats.cache.leased_entries;s.stats.cache.leased_charge+=stride_for(c);
+        if(!e.leases){++s.stats.cache.leased_entries;s.stats.cache.leased_charge+=stride_for(s.bytes,c);
             s.stats.cache.peak_leased_charge=std::max(s.stats.cache.peak_leased_charge,s.stats.cache.leased_charge);}
         ++e.leases;++s.stats.cache.lease_refs;++s.stats.cache.hits;++s.stats.classes[c].hits;s.stats.hit_bytes+=n;if(touch_lru)touch(s,key);
         const Slab&b=s.slabs[e.slab];out->state_=&s;out->key_=key;out->bytes_=n;out->generation_=e.generation;
@@ -332,9 +348,10 @@ private:
     }
 public:
     Status insert(uint64_t ns,size_t key,const void*src,size_t n){
-        const int c=klass_for(n);uintptr_t end=0;if(c<0||!span(src,n,&end))return Status::Invalid;
-        std::lock_guard<std::mutex>w(writer_mutex_);std::unique_lock<std::mutex>o(owner_mutex_);if(!state_)return Status::Bypass;
-        State&s=*state_;std::unique_lock<std::mutex>l(s.mutex);o.unlock();
+        uintptr_t end=0;if(!span(src,n,&end))return Status::Invalid;
+        std::lock_guard<std::mutex>w(writer_mutex_);std::unique_lock<std::mutex>o(owner_mutex_);
+        if(!state_)return klass_for(block_sizes,n)<0?Status::Invalid:Status::Bypass;
+        State&s=*state_;std::unique_lock<std::mutex>l(s.mutex);o.unlock();const int c=klass_for(s.bytes,n);if(c<0)return Status::Invalid;
         if(ns!=s.stats.cache.namespace_id||s.retiring)return Status::Namespace;
         if(key>=s.count)return Status::Invalid;if(s.stats.cache.allocator_contract_broken)return Status::AllocatorContract;
         Entry&e=s.entries[key];if(e.present){if(e.klass!=c)return Status::Layout;touch(s,key);return Status::Existing;}
@@ -346,16 +363,16 @@ public:
             for(size_t j=size_t(c)*b.pairs;j<size_t(c+1)*b.pairs;++j)if(b.keys[j]==none){bi=i;si=j;break;}}
         if(bi==none&&s.used_slabs<s.slab_records){
             const size_t room=s.stats.cache.budget-s.stats.cache.charge();size_t p=std::min(s.next_pairs,max_pairs),quote=0;
-            for(;p;--p){quote=s.allocator.quote(s.allocator.context,request_for(p));
-                if(quote&&(quote<s.minimum_quote||quote<request_for(p))){s.stats.cache.allocator_contract_broken=true;++s.stats.cache.contract_refusals;return Status::AllocatorContract;}
+            for(;p;--p){quote=s.allocator.quote(s.allocator.context,request_for(s.bytes,p));
+                if(quote&&(quote<s.minimum_quote||quote<request_for(s.bytes,p))){s.stats.cache.allocator_contract_broken=true;++s.stats.cache.contract_refusals;return Status::AllocatorContract;}
                 if(quote&&quote<=room)break;}
             if(p){
-                const size_t request=request_for(p);s.stats.cache.reserved_charge=quote;++s.stats.growth_attempts;peak(s);
+                const size_t request=request_for(s.bytes,p);s.stats.cache.reserved_charge=quote;++s.stats.growth_attempts;peak(s);
                 Allocation a{};l.unlock();const bool got=s.allocator.allocate(s.allocator.context,request,quote,&a);l.lock();
                 s.stats.cache.reserved_charge=0;
                 const bool empty=!a.token&&!a.host&&!a.device&&!a.bytes&&!a.charged_bytes;
                 if(!got&&empty){++s.stats.cache.allocation_failures;++s.stats.growth_failures;return Status::Allocation;}
-                bi=s.used_slabs++;Slab&b=s.slabs[bi];b.present=true;b.pairs=p;b.request=request;b.allocation=a;b.keys.fill(none);b.free_safe=a.token!=nullptr;
+                bi=s.used_slabs++;Slab&b=s.slabs[bi];b.present=true;b.pairs=p;b.bytes=s.bytes;b.request=request;b.allocation=a;b.keys.fill(none);b.free_safe=a.token!=nullptr;
                 //Only a credible actual charge can refund a conservative quote.
                 //An undercharge/missing charge keeps the reservation as a lower bound.
                 b.ledger_charge=a.charged_bytes&&a.charged_bytes>=a.bytes?
@@ -393,9 +410,10 @@ public:
 
     // Same paired geometry, gross charge, held-tail and namespace checks as insert.
     Status reserve(uint64_t ns,size_t key,size_t n,Write*out){
-        const int c=klass_for(n);if(c<0||!out||!out->empty())return Status::Invalid;
-        std::lock_guard<std::mutex>w(writer_mutex_);std::unique_lock<std::mutex>o(owner_mutex_);if(!state_)return Status::Bypass;
-        State&s=*state_;std::unique_lock<std::mutex>l(s.mutex);o.unlock();
+        if(!out||!out->empty())return Status::Invalid;
+        std::lock_guard<std::mutex>w(writer_mutex_);std::unique_lock<std::mutex>o(owner_mutex_);
+        if(!state_)return klass_for(block_sizes,n)<0?Status::Invalid:Status::Bypass;
+        State&s=*state_;std::unique_lock<std::mutex>l(s.mutex);o.unlock();const int c=klass_for(s.bytes,n);if(c<0)return Status::Invalid;
         if(ns!=s.stats.cache.namespace_id||s.retiring)return Status::Namespace;
         if(key>=s.count)return Status::Invalid;if(s.stats.cache.allocator_contract_broken)return Status::AllocatorContract;
         Entry&e=s.entries[key];if(e.present){if(e.klass!=c)return Status::Layout;touch(s,key);return Status::Existing;}
@@ -406,16 +424,16 @@ public:
             for(size_t j=size_t(c)*b.pairs;j<size_t(c+1)*b.pairs;++j)if(b.keys[j]==none){bi=i;si=j;break;}}
         if(bi==none&&s.used_slabs<s.slab_records){
             const size_t room=s.stats.cache.budget-s.stats.cache.charge();size_t p=std::min(s.next_pairs,max_pairs),quote=0;
-            for(;p;--p){quote=s.allocator.quote(s.allocator.context,request_for(p));
-                if(quote&&(quote<s.minimum_quote||quote<request_for(p))){s.stats.cache.allocator_contract_broken=true;++s.stats.cache.contract_refusals;return Status::AllocatorContract;}
+            for(;p;--p){quote=s.allocator.quote(s.allocator.context,request_for(s.bytes,p));
+                if(quote&&(quote<s.minimum_quote||quote<request_for(s.bytes,p))){s.stats.cache.allocator_contract_broken=true;++s.stats.cache.contract_refusals;return Status::AllocatorContract;}
                 if(quote&&quote<=room)break;}
             if(p){
-                const size_t request=request_for(p);s.stats.cache.reserved_charge=quote;++s.stats.growth_attempts;peak(s);
+                const size_t request=request_for(s.bytes,p);s.stats.cache.reserved_charge=quote;++s.stats.growth_attempts;peak(s);
                 Allocation a{};l.unlock();const bool got=s.allocator.allocate(s.allocator.context,request,quote,&a);l.lock();
                 s.stats.cache.reserved_charge=0;
                 const bool empty=!a.token&&!a.host&&!a.device&&!a.bytes&&!a.charged_bytes;
                 if(!got&&empty){++s.stats.cache.allocation_failures;++s.stats.growth_failures;return Status::Allocation;}
-                bi=s.used_slabs++;Slab&b=s.slabs[bi];b.present=true;b.pairs=p;b.request=request;b.allocation=a;b.keys.fill(none);b.free_safe=a.token!=nullptr;
+                bi=s.used_slabs++;Slab&b=s.slabs[bi];b.present=true;b.pairs=p;b.bytes=s.bytes;b.request=request;b.allocation=a;b.keys.fill(none);b.free_safe=a.token!=nullptr;
                 //Only a credible actual charge can refund a conservative quote.
                 //An undercharge/missing charge keeps the reservation as a lower bound.
                 b.ledger_charge=a.charged_bytes&&a.charged_bytes>=a.bytes?

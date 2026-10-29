@@ -6,6 +6,7 @@
 
 #include "place/mapped_expert_slab_cache.h"
 
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
@@ -85,6 +86,87 @@ TEST(mapped_slab_pregrow_keeps_what_a_refusing_host_pinned) {
     CHECK_EQ(st.classes[0].capacity_slots, st.classes[1].capacity_slots);
     std::vector<uint8_t> gu(SlabCache::GU, 3);
     CHECK(c.insert(1, 0, gu.data(), gu.size()) == S::Ok);   /* the pinned slots still admit */
+}
+
+/* Other class sizes (the packed RAM cache's slots, RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE): the
+ * slabs are laid out with them -- more pairs in the same budget, every slot 64-byte aligned behind
+ * intact guards -- the cache admits, reserves and lends exactly those sizes and refuses block_mxfp4's,
+ * and it evicts in the same LRU order as a block cache. Sizes that are equal, zero or not 64-byte
+ * multiples are refused. */
+TEST(mapped_slab_runtime_class_sizes) {
+    const SlabCache::Sizes packed{ 11999296, 6001984 };   /* the engine's default packed slots */
+    CHECK(SlabCache::sizes_valid(packed));
+    CHECK(SlabCache::sizes_valid(SlabCache::block_sizes));
+    Host hb, hp;
+    SlabCache blk, pk;
+    CHECK(blk.configure(1, kBudget, kKeys, { &hb, quote, allocate, release }) == S::Ok);
+    CHECK(pk.configure(1, kBudget, kKeys, { &hp, quote, allocate, release }, packed) == S::Ok);
+    CHECK(blk.class_bytes() == SlabCache::block_sizes);
+    CHECK(pk.class_bytes() == packed);
+    size_t a = 0, b = 0;
+    CHECK(blk.pregrow(1, &a) == S::Ok);
+    CHECK(pk.pregrow(1, &b) == S::Ok);
+    const auto sb = blk.stats(), sp = pk.stats();
+    for (int c = 0; c < 2; ++c) {
+        CHECK_EQ(sp.classes[c].capacity_slots, sp.classes[0].capacity_slots);
+        CHECK_EQ(sp.classes[c].capacity_logical_bytes, sp.classes[c].capacity_slots * packed[(size_t)c]);
+        CHECK_EQ(sb.classes[c].capacity_logical_bytes, sb.classes[c].capacity_slots * SlabCache::block_sizes[(size_t)c]);
+    }
+    /* The same budget holds more pairs, as many as the pair sizes' ratio allows (each slab's quote
+     * here is its request plus 4 KiB). */
+    CHECK(sp.classes[0].capacity_slots > sb.classes[0].capacity_slots);
+    CHECK(sp.charge() <= kBudget);
+    /* Block sizes are not this cache's: refused before any admission. */
+    std::vector<uint8_t> G(SlabCache::GU, 7), D(SlabCache::DN, 8);
+    CHECK(pk.insert(1, 0, G.data(), G.size()) == S::Invalid);
+    SlabCache::Lease none;
+    CHECK(pk.borrow(1, 0, D.size(), &none) == S::Invalid);
+    SlabCache::Write nw;
+    CHECK(pk.reserve(1, 0, G.size(), &nw) == S::Invalid);
+    std::vector<uint8_t> pg(packed[0], 0), pd(packed[1], 0);
+    CHECK(blk.insert(1, 0, pg.data(), pg.size()) == S::Invalid);
+    /* Pairs past the capacity in both caches: the same admissions and evictions, slot by slot. */
+    const size_t pairs = sp.classes[0].capacity_slots + 20;
+    for (size_t k = 0; k < pairs; ++k) {
+        std::memset(pg.data(), (int)(k & 255), 4096);
+        std::memset(pd.data(), (int)((k + 1) & 255), 4096);
+        pg[pg.size() - 1] = (uint8_t)k;
+        SlabCache::Write w;
+        CHECK(pk.reserve(1, 2 * k, pg.size(), &w) == S::Ok);   /* a reserved slot, as the engine fills it */
+        REQUIRE(w.host() != nullptr);
+        CHECK_EQ(w.bytes(), packed[0]);
+        CHECK_EQ(reinterpret_cast<uintptr_t>(w.host()) % 64, (uintptr_t)0);
+        std::memcpy(w.host(), pg.data(), pg.size());
+        SlabCache::Lease l;
+        CHECK(w.publish(&l) == S::Ok);
+        CHECK(l.release() == S::Ok);
+        CHECK(pk.insert(1, 2 * k + 1, pd.data(), pd.size()) == S::Ok);
+    }
+    const auto after = pk.stats();
+    CHECK_EQ(after.cache.evictions, (uint64_t)40);   /* 20 pairs past the capacity, two classes */
+    CHECK_EQ(after.cache.resident_entries, 2 * sp.classes[0].capacity_slots);
+    CHECK_EQ(after.growth_attempts, sp.growth_attempts);   /* nothing grew past the pregrow */
+    for (size_t k = pairs - 3; k < pairs; ++k) {   /* the newest are resident with their bytes */
+        SlabCache::Lease lg, ld;
+        CHECK(pk.borrow(1, 2 * k, packed[0], &lg) == S::Hit);
+        CHECK(pk.borrow(1, 2 * k + 1, packed[1], &ld) == S::Hit);
+        CHECK_EQ(lg.bytes(), packed[0]);
+        CHECK_EQ(ld.bytes(), packed[1]);
+        if (lg.host()) { CHECK_EQ(lg.host()[packed[0] - 1], (uint8_t)k); CHECK_EQ(lg.host()[0], (uint8_t)(k & 255)); }
+        if (ld.host()) CHECK_EQ(ld.host()[0], (uint8_t)((k + 1) & 255));
+        CHECK(lg.release() == S::Ok);
+        CHECK(ld.release() == S::Ok);
+    }
+    SlabCache::Lease oldest;
+    CHECK(pk.borrow(1, 0, packed[0], &oldest) == S::Miss);   /* the first pair went first */
+    CHECK(pk.clear() == S::Ok);   /* every slot's guards intact, or clear reports Layout */
+    /* Refused sizes. */
+    Host hx;
+    SlabCache x;
+    for (const SlabCache::Sizes& bad : { SlabCache::Sizes{ packed[0], packed[0] }, SlabCache::Sizes{ 0, packed[1] },
+                                         SlabCache::Sizes{ packed[0] + 1, packed[1] }, SlabCache::Sizes{ packed[0], packed[1] + 32 } })
+        CHECK(x.configure(1, kBudget, kKeys, { &hx, quote, allocate, release }, bad) == S::Invalid);
+    CHECK_EQ(hx.granted, 0);
 }
 
 RAD_TEST_MAIN()

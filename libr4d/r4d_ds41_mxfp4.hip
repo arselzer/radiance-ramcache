@@ -26,6 +26,13 @@
  *         For the grouped GEMM a tile is 32 or 128 rows of one expert's run.
  * A unit's four groups of 8 consecutive values: groups 0, 1 the low nibbles of qs[0..15], 2, 3 the high ones.
  *
+ * moe_gemm_ggml_mxfp4_gemv_vp (RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED, core/place/vram_packed.h) is the gemv
+ * path over a table some of whose entries name the packed-scale form instead of block_mxfp4 (see "the
+ * packed-scale form" below): the engine holds those VRAM residents 4.4% smaller and marks their entries with
+ * bit 0. Each packed block is widened back to its e8m0 byte and decoded by the block path's arithmetic, value
+ * for value in the same order, so its outputs are the block row's bit for bit; an unmarked entry is read as
+ * block_mxfp4 exactly as the plain row reads it.
+ *
  * Design after r4d_ds41_ggml.hip's qk32 rows (this unit is MXFP4's own so the two can change apart).
  */
 #include "r4d.h"
@@ -48,8 +55,11 @@ __constant__ __attribute__((aligned(16))) float kMxValues[16] = { 0.0f, 1.0f, 2.
                                                                    0.0f, -1.0f, -2.0f, -3.0f, -4.0f, -6.0f, -8.0f, -12.0f };
 
 /* ================================================================== loads and conversions */
-enum : int { MX_FP4 = 0, MX_F32 = 1 };
+/* MX_PK: a block of the packed-scale form (the gemv_vp row's marked entries); it has no load() of its own, the
+ * packed row walker (mx_row_pk) fills its raw words. */
+enum : int { MX_FP4 = 0, MX_F32 = 1, MX_PK = 2 };
 
+typedef __attribute__((address_space(1))) const uint8_t* mx_gu8;
 typedef __attribute__((address_space(1))) const uint32_t* mx_gu32;
 typedef __attribute__((address_space(1))) const r4d_u32x4* mx_gu128;
 
@@ -129,6 +139,22 @@ template <> struct Mx<MX_F32> {
     __device__ static __forceinline__ void dec(const uint32_t* r, const void*, float* w) {
 #pragma unroll
         for (int t = 0; t < 8; ++t) w[t] = __uint_as_float(r[8 * G + t]);
+    }
+};
+
+/* A block of the packed-scale form: raw[0] = its e8m0 (widened from its 2-bit code, or its raw round's byte),
+ * raw[1..4] = its 16 bytes of the codes plane, where value 2i is the low nibble of byte i. So group G (values
+ * 8G..8G+7) is code dword G, value 8G + t in its bits 4t..4t+3, and y = kv[nibble] * 2^(e - 128) as in
+ * Mx<MX_FP4>::dec: the same eight f32 values of the same block, from the same table and the same scale. */
+template <> struct Mx<MX_PK> {
+    static constexpr int QK = 32, NR = 5;   /* the table is MX_FP4's, loaded by the kernel's T */
+    __device__ static __forceinline__ int goff(int g) { return 8 * g; }
+    template <int G>
+    __device__ static __forceinline__ void dec(const uint32_t* r, const void* tab, float* w) {
+        const float* kv = (const float*)tab;
+        const float d = mx_e8m0_half(r[0]);
+#pragma unroll
+        for (int t = 0; t < 8; ++t) w[t] = kv[(r[1 + G] >> (4 * t)) & 0xFu] * d;
     }
 };
 
@@ -317,7 +343,165 @@ __device__ __forceinline__ void mx_row(const MxGemvArgs& A, const uint8_t* wb, c
     }
 }
 
-template <int T, int RPW, bool MOE, bool PROBE=false>
+/* ================================================================== the packed-scale form
+ *
+ * tools/ds41-host-experts/ds41_host_experts.h's packed form (pk_layout there; the core packs with that code and
+ * checks every weight's round trip before it marks the entry), restated because a plugin links nothing of
+ * another. A weight [N, K] of UK = K / 32 blocks a row, R = ceil(UK / 32) rounds of 32 blocks a row (the last
+ * holding the t = UK % 32 left over), its sections at 64-byte boundaries:
+ *
+ *   header   u32 magic "HXP2", u32 version 1, i32 N, K, cap, n_exc, u32 e0, u32 0, u64 total, 24 bytes 0
+ *   codes    [N, K / 2]: the release's codes plane, value 2i in the low nibble of byte i
+ *   pk       [N, PB], PB = 8 * (UK / 32) + (t + 3) / 4: a round of b blocks takes tb = (b + 3) / 4 bytes, its
+ *            block j's 2-bit code in bits 2 (j / tb) .. +1 of byte j % tb (a full round: byte j % 8, bits
+ *            2 (j / 8)); the block's e8m0 is e0 + code
+ *   exc_idx  cap u32: the n_exc raw rounds' indices n * R + r, ascending (a raw round has a block outside
+ *            e0..e0+3; its codes in pk are 0)
+ *   exc_raw  cap x 32 bytes: the raw rounds' e8m0 bytes, in block order
+ *
+ * The decode reads a block's 16 code bytes as one aligned 128-bit load and its scale from its round (two bits,
+ * or the raw byte), then runs the block path's arithmetic (Mx<MX_PK>::dec, mx_unit), so a packed weight's
+ * outputs are its block_mxfp4 weight's bit for bit. Lane L's blocks are L, L + 32, ...: every lane of a wave
+ * is in the same round at the same time, and a row's rounds come in increasing order, so the raw rounds are a
+ * cursor that walks the ascending index, not a search per block. */
+constexpr uint32_t kPkMagic = 0x32505848u;   /* "HXP2", ds41_host_experts.cpp kPkMagic */
+constexpr uint32_t kPkVersion = 1;
+
+__device__ __forceinline__ long long mx_up64(long long v) { return (v + 63) & ~63LL; }
+
+/* One packed weight's sections. `ok` false: the header does not describe exactly a [N, K] weight laid out as
+ * pk_layout lays it, and nothing past the header is read (its rows come out NaN, loudly). */
+struct MxPk {
+    const uint8_t*  codes;
+    const uint8_t*  pk;
+    const uint8_t*  idx;     /* u32 entries */
+    const uint8_t*  raw;
+    int      n_exc, R, RF, PB, tbl;
+    uint32_t e0;
+    bool     ok;
+};
+__device__ __forceinline__ MxPk mx_pk_open(const uint8_t* p, int N, int K) {
+    uint32_t h[12];
+#pragma unroll
+    for (int i = 0; i < 3; ++i) {
+        const r4d_u32x4 q = *(mx_gu128)(const void*)(p + 16 * i);
+        h[4 * i] = q[0]; h[4 * i + 1] = q[1]; h[4 * i + 2] = q[2]; h[4 * i + 3] = q[3];
+    }
+    MxPk v;
+    const int UK = K / 32;
+    v.R = (UK + 31) / 32;
+    v.RF = UK / 32;
+    v.tbl = (UK % 32 + 3) / 4;
+    v.PB = 8 * v.RF + v.tbl;
+    const int cap = (int)h[4], ne = (int)h[5];
+    const long long o_pk = mx_up64(64 + (long long)N * (K / 2)), o_idx = mx_up64(o_pk + (long long)N * v.PB);
+    const long long o_raw = mx_up64(o_idx + 4LL * cap), total = mx_up64(o_raw + 32LL * cap);
+    v.ok = h[0] == kPkMagic && h[1] == kPkVersion && (int)h[2] == N && (int)h[3] == K && cap >= 0 &&
+           (long long)cap <= (long long)N * v.R && ne >= 0 && ne <= cap && h[6] <= 252u &&
+           (((unsigned long long)h[9] << 32) | h[8]) == (unsigned long long)total;
+    v.codes = p + 64;
+    v.pk = p + o_pk;
+    v.idx = p + o_idx;
+    v.raw = p + o_raw;
+    v.n_exc = v.ok ? ne : 0;
+    v.e0 = h[6];
+    return v;
+}
+/* The first raw round at or after round index g, found by the whole wave (every lane active, as at the start
+ * of a row): each step the 32 lanes test the last entry of 32 even buckets of [lo, hi) at once and the ballot
+ * of "below g" (a prefix: the index ascends) names the bucket it is in, so up to 1024 raw rounds take two
+ * loads a lane and a last one, not a binary search's ten dependent loads a row. */
+__device__ __forceinline__ int mx_pk_lower(const MxPk& v, uint32_t g, int lane) {
+    int lo = 0, hi = v.n_exc;
+    while (hi - lo > 32) {
+        const long long span = hi - lo;
+        const int last = lo + (int)(((long long)(lane + 1) * span) / 32) - 1;
+        const int nb = __builtin_popcount(__builtin_amdgcn_ballot_w32(mx_d32(v.idx + 4 * last) < g));
+        const int nlo = lo + (int)(((long long)nb * span) / 32);
+        hi = nb < 32 ? lo + (int)(((long long)(nb + 1) * span) / 32) : hi;
+        lo = nlo;
+    }
+    const int i = lo + lane;
+    return lo + __builtin_popcount(__builtin_amdgcn_ballot_w32(i < hi && mx_d32(v.idx + 4 * i) < g));
+}
+
+/* mx_row over a packed weight: blocks [U0, U1) of rows n0.. into the sums, lane = block mod 32 (U0 a multiple
+ * of 32), UF blocks a lane in flight. The same blocks, groups and order as mx_row, so the same bits. */
+template <int RPW>
+__device__ __forceinline__ void mx_row_pk(const MxGemvArgs& A, const MxPk& v, const float* xs, int xr, int kb,
+                                          int U0, int U1, int n0, int mc, int lane, const void* tab,
+                                          float (&acc)[RPW][kMxXM]) {
+    constexpr int UF = 4;
+    const long long CB = A.K / 2;                       /* code bytes a row */
+    /* This lane's block j = lane of every round: its code's byte and shift in a full round and in the last. */
+    const int fb = lane & 7, fs = 2 * (lane >> 3);
+    const int pb = v.tbl ? lane % v.tbl : 0, ps = v.tbl ? 2 * (lane / v.tbl) : 0;
+    bool ok[RPW];
+    const uint8_t* cr[RPW];
+    const uint8_t* pr[RPW];
+    uint32_t g[RPW];                                    /* the row's first round index, n * R */
+    int cur[RPW];                                       /* its next raw round */
+#pragma unroll
+    for (int r = 0; r < RPW; ++r) {
+        ok[r] = n0 + r < A.N;
+        const long long n = ok[r] ? n0 + r : 0;
+        cr[r] = v.codes + n * CB;
+        pr[r] = v.pk + n * v.PB;
+        g[r] = (uint32_t)n * (uint32_t)v.R;
+        cur[r] = v.n_exc ? mx_pk_lower(v, g[r] + (uint32_t)(U0 >> 5), lane) : 0;
+    }
+    for (int U = U0 + lane; U < U1; U += 32 * UF) {
+        uint32_t raw[UF][RPW][Mx<MX_PK>::NR];
+        mx_for<UF>([&](auto fi) {
+            constexpr int F = decltype(fi)::value;
+            const int V = U + 32 * F;
+            if (V < U1) {
+                const int rr = V >> 5;
+#pragma unroll
+                for (int r = 0; r < RPW; ++r)
+                    if (ok[r]) {
+                        const r4d_u32x4 q = *(mx_gu128)(const void*)(cr[r] + (long long)V * 16);
+                        raw[F][r][1] = q[0]; raw[F][r][2] = q[1]; raw[F][r][3] = q[2]; raw[F][r][4] = q[3];
+                        uint32_t e;
+                        if (cur[r] < v.n_exc && mx_d32(v.idx + 4 * cur[r]) == g[r] + (uint32_t)rr) {
+                            e = *(mx_gu8)(const void*)(v.raw + 32LL * cur[r] + lane);
+                            ++cur[r];
+                        } else {
+                            const bool full = rr < v.RF;
+                            const uint32_t by = *(mx_gu8)(const void*)(pr[r] + 8 * rr + (full ? fb : pb));
+                            e = v.e0 + ((by >> (full ? fs : ps)) & 3u);
+                        }
+                        raw[F][r][0] = e;
+                    }
+            }
+        });
+        mx_for<UF>([&](auto fi) {
+            constexpr int F = decltype(fi)::value;
+            const int V = U + 32 * F;
+            if (V < U1) mx_unit<MX_PK, RPW>(raw[F], V, xs, xr, kb, mc, tab, ok, acc);
+        });
+    }
+}
+/* A marked entry: its packed rows, or NaN sums when its header is not a packed [N, K] weight's -- an engine
+ * that marked a weight it did not pack gets NaN rows and a reply that differs, never quiet wrong bits. */
+template <int RPW>
+__device__ __forceinline__ void mx_row_vp(const MxGemvArgs& A, const MxPk& v, const float* xs, int xr, int kb,
+                                          int U0, int U1, int n0, int mc, int lane, const void* tab,
+                                          float (&acc)[RPW][kMxXM]) {
+    if (v.ok) {
+        mx_row_pk<RPW>(A, v, xs, xr, kb, U0, U1, n0, mc, lane, tab, acc);
+        return;
+    }
+#pragma unroll
+    for (int r = 0; r < RPW; ++r)
+#pragma unroll
+        for (int m = 0; m < kMxXM; ++m) acc[r][m] = __uint_as_float(0x7fc00000u);
+}
+
+/* VP: the gemv_vp row's kernel. A table entry with bit 0 set is a packed weight (mx_row_pk), any other is
+ * block_mxfp4 (mx_row), so the same kernel serves the engine's packed VRAM residents and every other expert
+ * (pinned-pool, staged, aliased) beside them. Only MX_FP4 over a table is instantiated with it. */
+template <int T, int RPW, bool MOE, bool PROBE=false, bool VP=false>
 __global__ __launch_bounds__(kMxThreads) void mx_gemv_kernel(MxGemvArgs A) {
     using Q = Mx<T>;
     R4D_DYN_LDS(r4d_u32x4, mx_lds);
@@ -371,6 +555,17 @@ __global__ __launch_bounds__(kMxThreads) void mx_gemv_kernel(MxGemvArgs A) {
             if(A.live_end)ds41_live_tail::range(A.off,e,A.M,&rs,&re);else mx_range(A.off, e, A.n_expert, A.M, &rs, &re);
             wb = A.wtab ? A.wtab[e] : A.w + (long long)e * A.w_es;
         }
+        /* gemv_vp: bit 0 of a table entry marks a packed weight (block-uniform: one expert an item). Weights are
+         * 64-byte aligned, so an unmarked entry is the address as it is. */
+        [[maybe_unused]] bool pk = false;
+        [[maybe_unused]] MxPk pv{};
+        if constexpr (VP) {
+            if (A.wtab) {
+                pk = ((uintptr_t)wb & 1u) != 0;
+                wb = (const uint8_t*)((uintptr_t)wb & ~(uintptr_t)1);
+            }
+            if (pk) pv = mx_pk_open(wb, A.N, A.K);
+        }
         did_work=true;if constexpr(PROBE)if(ri==0)owned_rows+=(unsigned long long)(re-rs);
         const int rg0 = ri * rgpi, rg1 = min(rg0 + rgpi, nrg);
         /* An expert with more rows than the LDS holds whole (one gate_up row at K 5120) takes them in
@@ -405,7 +600,14 @@ __global__ __launch_bounds__(kMxThreads) void mx_gemv_kernel(MxGemvArgs A) {
 #pragma unroll
                     for (int m = 0; m < kMxXM; ++m) acc[r][m] = 0.0f;
                 if (whole) {
-                    if (active) mx_row<T, RPW>(A, wb, xs, A.XR, 0, 0, UK, n0, mc, lane, tab, acc);
+                    if (active) {
+                        if constexpr (VP) {
+                            if (pk) mx_row_vp<RPW>(A, pv, xs, A.XR, 0, 0, UK, n0, mc, lane, tab, acc);
+                            else mx_row<T, RPW>(A, wb, xs, A.XR, 0, 0, UK, n0, mc, lane, tab, acc);
+                        } else {
+                            mx_row<T, RPW>(A, wb, xs, A.XR, 0, 0, UK, n0, mc, lane, tab, acc);
+                        }
+                    }
                 } else {
                     /* The pass's rows do not fit whole: K in chunks, restaged a row group (every wave takes
                      * part in the barriers). */
@@ -414,7 +616,14 @@ __global__ __launch_bounds__(kMxThreads) void mx_gemv_kernel(MxGemvArgs A) {
                         lds_barrier();
                         mx_stage<MOE>(A, xs, p0, mc, k0, k1, XRC);
                         lds_barrier();
-                        if (active) mx_row<T, RPW>(A, wb, xs, XRC, k0, k0 / Q::QK, k1 / Q::QK, n0, mc, lane, tab, acc);
+                        if (active) {
+                            if constexpr (VP) {
+                                if (pk) mx_row_vp<RPW>(A, pv, xs, XRC, k0, k0 / Q::QK, k1 / Q::QK, n0, mc, lane, tab, acc);
+                                else mx_row<T, RPW>(A, wb, xs, XRC, k0, k0 / Q::QK, k1 / Q::QK, n0, mc, lane, tab, acc);
+                            } else {
+                                mx_row<T, RPW>(A, wb, xs, XRC, k0, k0 / Q::QK, k1 / Q::QK, n0, mc, lane, tab, acc);
+                            }
+                        }
                     }
                     cur_e = -1;
                 }
@@ -668,6 +877,13 @@ int mx_launch_gemv(RadStream s, int ty, int rpw, bool moe, const MxGemvArgs& A, 
                         : mx_launch_gemv_t<MX_F32>(s, rpw, moe, A, grid, lds);
 }
 
+/* gemv_vp's kernel: MX_FP4 experts over a table whose marked entries are packed weights. */
+int mx_launch_gemv_vp(RadStream s, int rpw, const MxGemvArgs& A, unsigned grid, unsigned lds) {
+    if (rpw == 2)
+        return R4D_EMIT(s, (mx_gemv_kernel<MX_FP4, 2, true, false, true>), dim3(grid), dim3(kMxThreads), lds, A);
+    return R4D_EMIT(s, (mx_gemv_kernel<MX_FP4, 1, true, false, true>), dim3(grid), dim3(kMxThreads), lds, A);
+}
+
 int mx_launch_tiled(RadStream s, int ty, int bm, bool moe, const MxTiledArgs& A, dim3 grid, unsigned lds) {
     return ty == MX_FP4 ? mx_launch_tiled_t<MX_FP4>(s, bm, moe, A, grid, lds)
                         : mx_launch_tiled_t<MX_F32>(s, bm, moe, A, grid, lds);
@@ -755,8 +971,10 @@ int mx_gemm(const RadArgs* a, RadStream s, bool gemv) {
     return mx_launch_tiled(s, ty, bm, false, A, grid, (unsigned)(tb + 32 * (kTP + bm + 4) * 4));
 }
 
-/* moe_gemm_ggml type=mxfp4: y[i] = a[row(i)] . w[e(i)]^T over the expert-sorted rows. */
-int mx_moe(const RadArgs* a, RadStream s, bool gemv,bool baseline=false,unsigned long long* probe=nullptr) {
+/* moe_gemm_ggml type=mxfp4: y[i] = a[row(i)] . w[e(i)]^T over the expert-sorted rows. `vp`: the gemv_vp row,
+ * whose table entries may name packed weights (bit 0); it serves the decode band only. */
+int mx_moe(const RadArgs* a, RadStream s, bool gemv,bool baseline=false,unsigned long long* probe=nullptr,
+           bool vp=false) {
     if (!a || a->n_t < 5) return R4D_NO(RAD_E_INVAL);
     const RadTensor *A_ = r4d_opt(a, 0), *W = r4d_opt(a, 1), *so = r4d_opt(a, 2), *of = r4d_opt(a, 3),
                     *Y = r4d_opt(a, 4);
@@ -832,11 +1050,17 @@ int mx_moe(const RadArgs* a, RadStream s, bool gemv,bool baseline=false,unsigned
          * turn out live over all of them. */
         const long long items = L * nrg;
         const unsigned grid = (unsigned)(items < 256 ? items : 256);
-        if(!tail)return mx_launch_gemv(s,ty,rpw,true,A,grid,(unsigned)lds);
-        const int rc=mx_tail_gemv(s,rpw,A,grid,(unsigned)lds);if(rc!=RAD_OK)return rc;
+        /* gemv_vp over a table of MX_FP4 experts takes the kernel that tells the forms apart; the float logical
+         * form and stacked experts carry no marks, so the plain kernel serves them for it too. */
+        const bool vpk = vp && ty == MX_FP4 && table;
+        if (vpk && probe) return R4D_NO(RAD_E_UNSUPPORTED);   /* the probes are the plain row's */
+        if(!tail)return vpk ? mx_launch_gemv_vp(s, rpw, A, grid, (unsigned)lds) : mx_launch_gemv(s,ty,rpw,true,A,grid,(unsigned)lds);
+        const int rc=vpk ? mx_launch_gemv_vp(s, rpw, A, grid, (unsigned)lds) : mx_tail_gemv(s,rpw,A,grid,(unsigned)lds);if(rc!=RAD_OK)return rc;
         // No fallback or replay after a submitted prefix; existing stream owner retires both.
         return mx_tail_zero(s,A.y,A.y_ld,A.off,A.n_expert,A.M,A.N,probe);
     }
+    /* The tiled kernel reads every entry as block_mxfp4: a marked table is the decode band's alone. */
+    if (vp) return R4D_NO(RAD_E_UNSUPPORTED);
     MxTiledArgs A{};
     A.x = (const uint16_t*)A_->data; A.x_ld = x_ld;
     A.w = table ? nullptr : (const uint8_t*)W->data;
@@ -864,6 +1088,10 @@ extern "C" int r4d_rad_gemm_nt_mxfp4_gemv(const RadArgs* a, RadStream s) { retur
 extern "C" int r4d_rad_gemm_nt_mxfp4_tiled(const RadArgs* a, RadStream s) { return mx_gemm(a, s, false); }
 extern "C" int r4d_rad_moe_gemm_mxfp4_gemv(const RadArgs* a, RadStream s) { return mx_moe(a, s, true); }
 extern "C" int r4d_rad_moe_gemm_mxfp4_tiled(const RadArgs* a, RadStream s) { return mx_moe(a, s, false); }
+/* gemv_vp: the decode band over a table whose marked entries are packed weights (the top of this file). */
+extern "C" int r4d_rad_moe_gemm_mxfp4_gemv_vp(const RadArgs* a, RadStream s) {
+    return mx_moe(a, s, true, false, nullptr, true);
+}
 
 // Checker-only exports do not alter registered rows/public ABI.
 extern "C" int r4d_rad_moe_gemm_mxfp4_live_tail_baseline(const RadArgs*a,RadStream s,int gemv){return mx_moe(a,s,gemv!=0,true);}

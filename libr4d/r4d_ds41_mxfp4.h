@@ -12,6 +12,15 @@ int r4d_rad_gemm_nt_mxfp4_gemv(const RadArgs*, RadStream);
 int r4d_rad_gemm_nt_mxfp4_tiled(const RadArgs*, RadStream);
 int r4d_rad_moe_gemm_mxfp4_gemv(const RadArgs*, RadStream);
 int r4d_rad_moe_gemm_mxfp4_tiled(const RadArgs*, RadStream);
+/* `_gemv_vp`: the decode band over a table some of whose entries (bit 0 set) name a weight in the packed-scale
+ * form instead of block_mxfp4 (r4d_ds41_mxfp4.hip, "the packed-scale form"); the engine's VRAM residents under
+ * RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED (core/place/vram_packed.h). Same bits as `_gemv`. */
+int r4d_rad_moe_gemm_mxfp4_gemv_vp(const RadArgs*, RadStream);
+
+/* The machine fact (rad_types.h, RAD_DEVICE_FACT_PREFIX) the gemv_vp row is selected on: the engine sets it to 1
+ * under RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED, before any selection; absent, the row never matches and nothing
+ * changes. Restated as core/place/vram_packed.h's kVramPackFact. */
+#define R4D_FACT_DS41_VRAM_PACKED "device.ds41_vram_packed"
 
 /* -- operand descriptions (r4d_ds41_mxfp4_shapes.inc), libref's for type=mxfp4: the weight in its float
  * logical form. */

@@ -24,6 +24,13 @@ static const RadConstraint cDs41MxMoeGemv[] = {
     C_GE("n_expert", 1), C_LE("n_expert", 1024), C_GE("top_k", 1), C_IN("a_order", "token sorted"),
     C_IN("type", "mxfp4"), C_IN("dtype", "bf16"),
 };
+/* gemv_vp: cDs41MxMoeGemv's band, only where the engine opted in (r4d_ds41_mxfp4.h, R4D_FACT_DS41_VRAM_PACKED). */
+static const RadConstraint cDs41MxMoeGemvVp[] = {
+    C_EQ(R4D_FACT_DS41_VRAM_PACKED, 1),
+    C_GE("M", 1), C_LE("M", 16), C_GE("N", 1), C_GE("K", 32), C_DIV("K", 32),
+    C_GE("n_expert", 1), C_LE("n_expert", 1024), C_GE("top_k", 1), C_IN("a_order", "token sorted"),
+    C_IN("type", "mxfp4"), C_IN("dtype", "bf16"),
+};
 static const RadConstraint cDs41MxMoeTiled[] = {
     C_GE("M", 1), C_GE("N", 1), C_GE("K", 32), C_DIV("K", 32),
     C_GE("n_expert", 1), C_LE("n_expert", 1024), C_GE("top_k", 1), C_IN("a_order", "token sorted"),
@@ -62,6 +69,20 @@ static const RadConstraint cDs41MxMoeTiled[] = {
   "stacked, or the f32 logical form), i32 routing",
   RAD_DOMAIN_DEVICE, 58, ROW(cDs41MxMoeGemv), NOTUNE,
   nullptr, nullptr, r4d_rad_moe_gemm_mxfp4_gemv, nullptr, R4D_DS41_MX_HOOKS(r4d_shape_moe_gemm_mxfp4) },
+/* Above the gemv row only where RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED set the machine fact: the same band and
+ * bits, over a table whose marked entries are the engine's packed VRAM residents. The stored form it declares is
+ * the gemv row's (block_mxfp4, the same hooks), so every other tier keeps it; the packed form is the engine's own,
+ * VRAM only (core/place/vram_packed.h). */
+{ "moe_gemm_ggml_mxfp4_gemv_vp", "moe_gemm_ggml", "moe",
+  "moe_gemm_ggml_mxfp4_gemv over a table whose entries with bit 0 set name a weight in the packed-scale form "
+  "(the codes plane, a 2-bit e8m0 code a block from one base a weight, raw rounds beside): each such block is "
+  "widened back to its e8m0 byte and decoded by the block path's arithmetic in its order, so the outputs are the "
+  "gemv row's bit for bit; an unmarked entry is read as block_mxfp4",
+  "M 1..16 tokens, any N, K a multiple of 32, up to 1024 experts; only with device.ds41_vram_packed",
+  "bf16 a and y; mxfp4 experts (table entries block_mxfp4 or packed, stacked, or the f32 logical form), i32 "
+  "routing",
+  RAD_DOMAIN_DEVICE, 59, ROW(cDs41MxMoeGemvVp), NOTUNE,
+  nullptr, nullptr, r4d_rad_moe_gemm_mxfp4_gemv_vp, nullptr, R4D_DS41_MX_HOOKS(r4d_shape_moe_gemm_mxfp4) },
 { "moe_gemm_ggml_mxfp4_tiled", "moe_gemm_ggml", "moe",
   "the grouped GEMM over GGUF MXFP4 experts in 128-row (or 32-row) x 128-column tiles of one expert's run (a "
   "block finds its expert by scanning the offsets), gemm_nt_ggml_mxfp4_tiled's slab loop",

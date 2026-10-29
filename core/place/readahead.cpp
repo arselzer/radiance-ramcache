@@ -44,6 +44,13 @@ int ReadAheadUnit::started() const {
     return stopped >= 0 ? stopped : std::min(next_.load(std::memory_order_acquire), n_all_);
 }
 
+int64_t ReadAheadUnit::front(int w) const {
+    if ((w != 0 && w != 1) || w >= n_ext_) return 0;
+    const int s = started();
+    const int k = w == 0 ? std::min(s, n_[0]) : std::max(s - n_[0], 0);
+    return std::min((int64_t)k * piece_, ext_[w].len);
+}
+
 int64_t ReadAheadUnit::bytes_in() const { return bytes_in_.load(std::memory_order_acquire); }
 
 bool ReadAheadUnit::whole() const {
@@ -160,6 +167,19 @@ void PieceReader::make_urgent(ReadAheadUnit& u) {
     if (u.urgent_.exchange(true, std::memory_order_acq_rel)) return;
     std::lock_guard<std::mutex> lk(mu_);
     if (asleep_) cv_.notify_all();
+}
+
+/* As cancel_locked, but the unit is not cancelled: a reader that picked it finds nothing left to
+ * start (its next_ is past the last piece) and pick() prunes it; wait() waits for the pieces
+ * started by then. Under mu_, so no reader is between its pick and its piece's claim. */
+int PieceReader::stop(ReadAheadUnit& u) {
+    std::lock_guard<std::mutex> lk(mu_);
+    const int was = u.next_.exchange(u.n_all_, std::memory_order_acq_rel);
+    if (u.stopped_at_.load(std::memory_order_acquire) < 0) {
+        u.stopped_at_.store(std::min(was, u.n_all_), std::memory_order_release);
+        ++st_.stopped;
+    }
+    return u.stopped_at_.load(std::memory_order_acquire);
 }
 
 uint64_t PieceReader::wait(ReadAheadUnit& u) {

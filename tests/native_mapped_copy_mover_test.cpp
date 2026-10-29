@@ -16,6 +16,7 @@
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <climits>
 #include <cstdio>
 #include <cstdlib>
@@ -26,6 +27,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 #include <utility>
 #include <fcntl.h>
@@ -1052,9 +1054,113 @@ TEST(mapped_actual_mover_unit_planes_read_whole_or_posted_land_the_same_bytes){
         CHECK(!t.mover->unit_planes_started());
         CHECK(same(b0));CHECK(same(b1));
         CHECK(tb.posted);CHECK_EQ(tb.units,2);CHECK_EQ(tb.reads,4);CHECK(tb.return_ns>=tb.join_ns);
+        CHECK_EQ(ta.rest,0);CHECK_EQ(tb.rest,0);CHECK_EQ(ta.rest_bytes,int64_t(0));
         CHECK(!t.mover->finish_unit_planes(&tb));   //none in flight
     }
     CHECK(has(t.mover->report(),"kept plane readers"));
+}
+
+/* RADIANCE_EXPERIMENTAL_DS41_PREFETCH_URGENT through the actual HOST Mover: a unit laid out for the
+ * read-ahead, its pieces read by the piece readers up to a stop (the last two held in flight), and
+ * the rest of each extent read by read_unit_planes -- or posted, start_unit_planes and
+ * finish_unit_planes -- with PlanesIn, beside a fresh unit in the same call, while the held pieces
+ * land after it: the container's planes byte for byte, the unit never laid out again (its buffers
+ * stay put), and only the rest read, counted in the call's timing. A unit not laid out, or bytes in
+ * off the alignment, past their extent or negative, is refused before any read; a unit with every
+ * byte in reads nothing. */
+namespace {
+struct HeldPieces {
+    Mover* mover=nullptr;std::atomic<int> n{0};int hold=0;std::atomic<bool> go{false};
+    static int read(void* c,const PlaneExtent& p){auto* h=static_cast<HeldPieces*>(c);
+        if(h->n.fetch_add(1)>=h->hold)while(!h->go.load())std::this_thread::sleep_for(std::chrono::microseconds(50));
+        return h->mover->read_piece(p.file,p.off,p.len,p.dst,p.cap);}
+};
+} //namespace
+TEST(mapped_actual_mover_reads_a_read_ahead_units_rest_in_place){
+    Environment mapped("1","1");
+    Fixture f;f.experts();f.info.relayout=mx_relayout;Image image(lay_out_mxfp4(f));write_scales(f,image);
+    Config cfg=plan_config(false);Plan plan=planned(f,cfg,true);const auto units=two_ssd_experts(plan);
+    std::atomic<uint64_t> calls{0};Access::Driver driver;Transport t;t.open(f,plan,image,80*MiB,calls);Access::attach(*t.mover,driver);
+    for(int32_t u:units)REQUIRE(t.mover->host_planes_eligible(u));
+    auto same=[&](const Mover::HostPlanes& p){
+        if(p.n!=2)return false;
+        for(int k=0;k<2;++k){const auto& w=f.prog.weights[p.w[k]];const size_t N=size_t(mx_rows(w)),K=size_t(mx_cols(w));
+            if(std::memcmp(p.codes[k],image.bytes.data()+w.file_plane_offset[0],N*K/2)||
+               std::memcmp(p.scales[k],image.bytes.data()+w.file_plane_offset[1],N*(K/32)))return false;}
+        return true;};
+    for(int posted=0;posted<2;++posted){
+        PieceReader r;REQUIRE(r.start(2,64*KiB));
+        HeldPieces held;held.mover=t.mover.get();held.hold=5;   //pieces 5 and 6 wait in flight
+        Mover::HostPlanes ahead;ahead.unit=units[0];PlaneExtent ext[2];REQUIRE(t.mover->lay_out_unit_planes(&ahead,ext));
+        uint8_t* const bufs[2]={ahead.buf[0],ahead.buf[1]};
+        auto ra=std::make_shared<ReadAheadUnit>(&t,1,ext,2,64*KiB,&HeldPieces::read,&held,nullptr);
+        //However the case ends, no reader is left in `held` or the planes once they go.
+        struct Settle{PieceReader& r;HeldPieces& h;std::shared_ptr<ReadAheadUnit>& u;
+            ~Settle(){h.go=true;if(u){r.cancel(*u);r.wait(*u);}}} settle{r,held,ra};
+        r.submit(ra);
+        for(int i=0;i<50000&&!(held.n.load()==7&&ra->in()==5);++i)std::this_thread::sleep_for(std::chrono::microseconds(100));
+        REQUIRE_EQ(ra->in(),5);REQUIRE_EQ(held.n.load(),7);
+        REQUIRE_EQ(r.stop(*ra),7);
+        Mover::PlanesIn in[2];in[0].bytes[0]=ra->front(0);in[0].bytes[1]=ra->front(1);
+        CHECK_EQ(in[0].bytes[0],7*64*KiB);CHECK_EQ(in[0].bytes[1],int64_t(0));
+        Mover::HostPlanes fresh;fresh.unit=units[1];Mover::HostPlanes* ps[2]={&ahead,&fresh};
+        Mover::PlaneReadTiming tm;
+        if(posted){REQUIRE(t.mover->start_unit_planes(ps,2,1,in));REQUIRE(t.mover->finish_unit_planes(&tm));CHECK(tm.posted);}
+        else REQUIRE(t.mover->read_unit_planes(ps,2,1,&tm,in));
+        CHECK(ahead.buf[0]==bufs[0]);CHECK(ahead.buf[1]==bufs[1]);
+        CHECK_EQ(tm.units,2);CHECK_EQ(tm.reads,4);CHECK_EQ(tm.mirror_reads,0);CHECK_EQ(tm.rest,1);
+        CHECK_EQ(tm.rest_bytes,ahead.len[0]+ahead.len[1]-in[0].bytes[0]);CHECK_EQ(tm.rest_mirror_bytes,int64_t(0));
+        CHECK(!ra->whole());CHECK_EQ(ra->in(),5);   //the two held pieces land after the call
+        held.go=true;r.wait(*ra);
+        CHECK_EQ(ra->in(),7);CHECK(!ra->failed());
+        CHECK(same(ahead));CHECK(same(fresh));
+        CHECK(t.mover->source_epochs_current());
+    }
+    Mover::HostPlanes lay;lay.unit=units[0];PlaneExtent ext[2];REQUIRE(t.mover->lay_out_unit_planes(&lay,ext));
+    Mover::HostPlanes* pl[1]={&lay};Mover::PlanesIn bad;
+    bad.bytes[0]=64*KiB+100;CHECK(!t.mover->read_unit_planes(pl,1,1,nullptr,&bad));            //off the alignment
+    bad.bytes[0]=0;bad.bytes[1]=lay.len[1]+4096;CHECK(!t.mover->read_unit_planes(pl,1,1,nullptr,&bad));   //past the extent
+    bad.bytes[1]=-4096;CHECK(!t.mover->read_unit_planes(pl,1,1,nullptr,&bad));
+    Mover::HostPlanes never;never.unit=units[0];Mover::HostPlanes* pn[1]={&never};Mover::PlanesIn some;some.bytes[0]=64*KiB;
+    CHECK(!t.mover->read_unit_planes(pn,1,1,nullptr,&some));CHECK(never.buf[0]==nullptr);   //not laid out: never laid out here
+    CHECK(!t.mover->start_unit_planes(pn,1,1,&some));CHECK(!t.mover->unit_planes_started());
+    Mover::PlanesIn all;all.bytes[0]=lay.len[0];all.bytes[1]=lay.len[1];Mover::PlaneReadTiming tz;
+    CHECK(t.mover->read_unit_planes(pl,1,1,&tz,&all));CHECK_EQ(tz.reads,0);CHECK_EQ(tz.rest,1);CHECK_EQ(tz.rest_bytes,int64_t(0));
+    CHECK(!t.mover->start_unit_planes(pl,1,1,&all));   //nothing to post
+}
+
+/* Mover::plane_spans and Mover::rest_mirror_tail (RADIANCE_EXPERIMENTAL_DS41_PREFETCH_URGENT): with
+ * nothing in, the reads read_unit_planes has always made of an extent (the container's head, the
+ * mirror's tail, the scales; one read without a mirror); with bytes in, reads that tile the rest once
+ * in order, the mirror's part whole, past the bytes in and ending the codes plane, or none; a rest's
+ * mirror share scales with what is left of its unit, at most the w3 codes past the bytes in, on the
+ * alignment. Shapes of a DeepSeek-V4.1 gate_up: codes [4608, 2560] (w3 the second half), scales
+ * [4608, 160]. */
+TEST(mover_plane_spans_tile_a_rest_and_keep_the_mirror_in_w3){
+    constexpr int64_t A=4096,P=512*KiB;
+    const int64_t end=4608ll*2560,len=end+4608ll*160,w3=end/2,tail=596*A,total=len+5120ll*1152+5120ll*72;
+    Mover::PlaneSpan s[3];
+    REQUIRE_EQ(Mover::plane_spans(len,0,end,tail,s),3);
+    CHECK(s[0].off==0&&s[0].len==end-tail&&!s[0].mirror);
+    CHECK(s[1].off==end-tail&&s[1].len==tail&&s[1].mirror);
+    CHECK(s[2].off==end&&s[2].len==len-end&&!s[2].mirror);
+    REQUIRE_EQ(Mover::plane_spans(len,0,0,0,s),1);CHECK(s[0].off==0&&s[0].len==len&&!s[0].mirror);
+    CHECK_EQ(Mover::plane_spans(len,len,end,tail,s),0);CHECK_EQ(Mover::plane_spans(0,0,0,0,s),0);
+    for(int64_t in=0;in<len;in+=P)for(int64_t t:{int64_t(0),A,int64_t(MiB),tail,w3,w3+A}){
+        const int n=Mover::plane_spans(len,in,end,t,s);int64_t at=in;bool mirror=false;
+        for(int j=0;j<n;++j){CHECK_EQ(s[j].off,at);CHECK(s[j].len>0);at+=s[j].len;
+            if(s[j].mirror){mirror=true;CHECK(s[j].off>=in);CHECK_EQ(s[j].off+s[j].len,end);CHECK_EQ(s[j].len,t);}}
+        CHECK_EQ(at,len);
+        CHECK_EQ(mirror,t>0&&t<=end-in);
+    }
+    CHECK_EQ(Mover::rest_mirror_tail(tail,total,total,0,end,w3,A),tail);   //a whole unit: the whole tail
+    const int64_t in7=7*P,left=total-in7,t7=Mover::rest_mirror_tail(tail,left,total,in7,end,w3,A);
+    CHECK_EQ(t7%A,int64_t(0));CHECK(t7<=tail*left/total);CHECK(t7>=tail*left/total-A);
+    CHECK_EQ(Mover::rest_mirror_tail(tail,total-end,total,end,end,w3,A),int64_t(0));     //the codes all in
+    CHECK_EQ(Mover::rest_mirror_tail(tail,total/2,total,end-3*A,end,w3,A),3*A);         //no further than the bytes in
+    CHECK_EQ(Mover::rest_mirror_tail(4*w3,total,total,0,end,w3,A),w3);                  //no more than w3
+    CHECK_EQ(Mover::rest_mirror_tail(0,total,total,0,end,w3,A),int64_t(0));
+    CHECK_EQ(Mover::rest_mirror_tail(tail,0,total,0,end,w3,A),int64_t(0));
 }
 
 int main(int argc,char** argv){

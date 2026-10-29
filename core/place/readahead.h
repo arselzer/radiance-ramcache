@@ -23,12 +23,17 @@
  *                whole        handed to the layer as read
  *                not started  the layer reads it as any miss (take_whole)
  *                partly read  urgent: the readers read the rest at once, demand reads or not, and
- *                             the layer waits for its last piece (wait)
+ *                             the layer waits for its last piece (wait); or, with
+ *                             RADIANCE_EXPERIMENTAL_DS41_PREFETCH_URGENT, stopped: no further piece
+ *                             starts, the layer reads the rest of each extent (past front()) in its
+ *                             own demand read, large reads on the mover's kept readers, while the
+ *                             pieces in flight land, and then waits for those (wait)
  *
  * A unit is handed over only when every piece of each of its weights is in (per-weight counters)
- * and none failed; the stager also checks the container's epoch then. One with a failed piece is
- * read again whole by its layer. The bytes are the container's either way: the outputs are the same
- * as without read-ahead.
+ * and none failed -- a stopped one when its pieces started are in, none failed, and its layer's
+ * read of the rest succeeded; the stager also checks the container's epoch then. One with a failed
+ * piece is read again whole by its layer. The bytes are the container's either way: the outputs are
+ * the same as without read-ahead.
  *
  * The demand count (demand_enter / demand_leave) is the process's: every rank's missed-unit reads
  * share the drive. A reader starts a non-urgent piece only at a count of zero, and the count is
@@ -72,6 +77,12 @@ public:
     int         pieces(int w) const { return w == 0 || w == 1 ? n_[w] : 0; }
     /* Piece k: its extent's file, offset, length, destination and capacity from there. */
     PlaneExtent piece(int k) const;
+    /* Extent w as given (an empty one past the unit's extents). */
+    PlaneExtent extent(int w) const { return (w == 0 || w == 1) && w < n_ext_ ? ext_[w] : PlaneExtent{}; }
+    /* The bytes at the front of extent w that the pieces started cover: the readers' part of it,
+     * the rest (front(w) .. its length) no reader starts once the unit is stopped, cancelled or
+     * taken whole. */
+    int64_t front(int w) const;
 
     /* Pieces the readers have started (for a unit cancelled or taken whole: by then), and pieces
      * in. */
@@ -139,9 +150,13 @@ public:
     /* The unit's layer needs it now: its remaining pieces go before any other unit's, and start
      * whether demand reads are in flight or not. */
     void make_urgent(ReadAheadUnit& u);
-    /* Blocks until the unit's pieces are all in, or, for a unit cancelled or taken whole, the
-     * pieces started by then; a unit still queued is made urgent first. Returns the nanoseconds
-     * waited, at once when the readers have stopped. */
+    /* The unit's layer reads the rest itself (..._PREFETCH_URGENT): no further piece starts, the
+     * ones in flight finish, and wait() waits for them; each extent's front(w) is then final.
+     * Returns the pieces started. Not a cancel: the unit stays its layer's. */
+    int  stop(ReadAheadUnit& u);
+    /* Blocks until the unit's pieces are all in, or, for a unit cancelled, stopped or taken
+     * whole, the pieces started by then; a unit still queued is made urgent first. Returns the
+     * nanoseconds waited, at once when the readers have stopped. */
     uint64_t wait(ReadAheadUnit& u);
     /* Cancels every unit of `owner` and waits for their pieces in flight: afterwards no reader
      * touches them or their buffers. */
@@ -154,6 +169,7 @@ public:
         uint64_t demand_met = 0;       /* demand reads that started with pieces in flight */
         uint64_t demand_wait_ns = 0;   /* ...summed from their start to the last such piece's end */
         uint64_t max_in_flight = 0;
+        uint64_t stopped = 0;          /* units whose layer read the rest itself (stop) */
     };
     Stats stats() const;
 

@@ -2,9 +2,10 @@
  * cover each extent once and land where read_unit_planes would put the bytes (through O_DIRECT
  * too); no non-urgent piece starts while a demand read is in flight, and at most the readers' count
  * is ever in flight; urgent units finish behind demand reads; a cancelled unit starts no piece and
- * keeps its buffer until the pieces in flight are in; a unit is whole only with every piece in and
- * none failed; take_whole only before any piece; earlier orders first; forget waits for an owner's
- * pieces; demand reads that meet pieces are counted. */
+ * keeps its buffer until the pieces in flight are in; a stopped unit starts no piece and leaves the
+ * rest past front() to its layer; a unit is whole only with every piece in and none failed;
+ * take_whole only before any piece; earlier orders first; forget waits for an owner's pieces; demand
+ * reads that meet pieces are counted. */
 #include "rad_test.h"
 
 #include "place/readahead.h"
@@ -305,6 +306,89 @@ TEST(readahead_wait_on_a_cancelled_unit_returns_once_its_started_pieces_are_in) 
     CHECK_EQ(x.u->in(), x.u->started());
     CHECK(!x.u->whole());
     CHECK(x.u->bytes_in() > 0);
+}
+
+/* RADIANCE_EXPERIMENTAL_DS41_PREFETCH_URGENT: a stopped unit starts no further piece, its pieces in
+ * flight finish and wait() waits for them; front(w) covers exactly the pieces started, so the layer
+ * reading [front(w), len) of each extent itself -- the same bytes at the same offsets, here while a
+ * piece is still in flight -- leaves the unit as the readers would have. Not a cancel; stopped once,
+ * and a later stop or cancel changes nothing. */
+TEST(readahead_stop_leaves_the_rest_to_the_layer) {
+    Source src(16 << 20);
+    src.delay_us = 1500;
+    Ctx ctx{ &src, 1 };
+    PieceReader r;
+    REQUIRE(r.start(4, kPiece));
+    /* Extent 0 of 21 pieces (its last one short), extent 1 of 9. */
+    Unit x = make_unit(&ctx, 1, &ctx, 3 * kA, 20 * kPiece + 12345, 8 << 20, 9 * kPiece - 777);
+    r.submit(x.u);
+    CHECK(eventually([&] { return x.u->in() >= 5 && src.in_flight.load() > 0; }));
+    const int started = r.stop(*x.u);
+    CHECK_EQ(started, x.u->started());
+    CHECK(started >= 5);
+    REQUIRE(started < x.u->pieces(0));
+    CHECK(!x.u->cancelled());
+    CHECK(!x.u->urgent());
+    CHECK_EQ(r.stop(*x.u), started);
+    CHECK_EQ(r.stats().stopped, (uint64_t)1);
+    const int64_t f0 = x.u->front(0), f1 = x.u->front(1);
+    CHECK_EQ(f0, (int64_t)started * kPiece);
+    CHECK_EQ(f1, (int64_t)0);
+    CHECK_EQ(x.u->extent(0).len, x.ext[0].len);
+    CHECK_EQ(x.u->extent(2).len, (int64_t)0);
+    /* The layer's own read of the rest, with the unit's pieces in flight beside it. */
+    std::memcpy(x.dest->a.data() + f0, src.bytes.data() + x.ext[0].off + f0, (size_t)(x.ext[0].len - f0));
+    std::memcpy(x.dest->b.data() + f1, src.bytes.data() + x.ext[1].off + f1, (size_t)(x.ext[1].len - f1));
+    r.wait(*x.u);
+    CHECK_EQ(x.u->in(), started);
+    CHECK(!x.u->whole());   /* the rest was not the readers' */
+    CHECK(!x.u->failed());
+    CHECK(same(x, src));
+    sleep_us(5000);
+    CHECK_EQ(src.reads.load(), started);   /* nothing started after the stop */
+    {
+        /* Every byte the readers read lies in front of the stop. */
+        std::lock_guard<std::mutex> lk(src.mu);
+        for (const auto& [off, len] : src.log) {
+            const bool e0 = off >= x.ext[0].off && off + len <= x.ext[0].off + f0;
+            const bool e1 = off >= x.ext[1].off && off + len <= x.ext[1].off + f1;
+            CHECK(e0 || e1);
+        }
+    }
+    r.cancel(*x.u);
+    CHECK_EQ(x.u->started(), started);
+    CHECK_EQ(x.u->front(0), f0);
+    CHECK_EQ(r.stats().stopped, (uint64_t)1);
+    CHECK_EQ(src.bad.load(), 0);
+}
+
+/* front() of a unit stopped before any piece (nothing the readers': the layer reads it all) and
+ * after its every piece (the extents' whole lengths: nothing left to read but the wait). */
+TEST(readahead_front_before_any_piece_and_after_every_piece) {
+    Source src(16 << 20);
+    Ctx ctx{ &src, 1 };
+    PieceReader r;
+    REQUIRE(r.start(2, kPiece));
+    r.demand_enter();   /* nothing starts */
+    Unit a = make_unit(&ctx, 1, &ctx, 0, 3 * kPiece, 4 << 20, kPiece + 5);
+    r.submit(a.u);
+    sleep_us(3000);
+    CHECK_EQ(r.stop(*a.u), 0);
+    CHECK_EQ(a.u->front(0), (int64_t)0);
+    CHECK_EQ(a.u->front(1), (int64_t)0);
+    CHECK_EQ(r.wait(*a.u), (uint64_t)0);
+    r.demand_leave();
+    sleep_us(3000);
+    CHECK_EQ(src.reads.load(), 0);
+    Unit b = make_unit(&ctx, 2, &ctx, 8 << 20, 3 * kPiece, 12 << 20, kPiece + 5);
+    r.submit(b.u);
+    r.wait(*b.u);
+    REQUIRE(b.u->whole());
+    CHECK_EQ(r.stop(*b.u), b.u->pieces());
+    CHECK_EQ(b.u->front(0), b.ext[0].len);
+    CHECK_EQ(b.u->front(1), b.ext[1].len);
+    CHECK(same(b, src));
+    CHECK_EQ(r.stats().stopped, (uint64_t)2);
 }
 
 TEST(readahead_take_whole_only_before_any_piece) {

@@ -2561,7 +2561,8 @@ const RadBatch* Scheduler::step_next_locked(const StepResult* known) {
         for (const StepEntry& e : plan_.e) {
             if (e.slot < 0 || (size_t)e.slot >= reqs_.size() || !reqs_[(size_t)e.slot]) continue;
             const SchedReq& s = *reqs_[(size_t)e.slot];
-            if (!s.req) continue;
+            /* Only a step the loop below would issue counts as withheld for a snapshot. */
+            if (!s.req || !e.produces_token || !s.req->speculation_fixed) continue;
             if (eors_position((int64_t)s.req->n_computed + e.n_tokens,
                               (int64_t)s.req->prompt.size()) > 0) {
                 ++m_.eors_ahead_withheld;

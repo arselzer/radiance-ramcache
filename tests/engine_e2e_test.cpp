@@ -1926,6 +1926,89 @@ TEST(a_prompt_resumed_from_the_prefix_cache_returns_what_a_cold_run_does) {
     CHECK_EQ(s.stop(), 0);
 }
 
+/* RADIANCE_EXPERIMENTAL_PREFIX_EORS: a conversation's next turn resumes at the snapshot its previous
+ * turn's decode wrote at the last position on the resume grid (64 tokens here, the
+ * --max-num-batched-tokens chunk), not at the previous prompt's last chunk, and returns what a cold
+ * run of the same prompt returns, token for token and probability for probability. LFM2 keeps a
+ * short convolution's state, which only a snapshot carries, and decodes a row with the bits
+ * prefilling it gives on libref (a_decoded_token_has_the_probabilities_prefilling_it_gives), the
+ * property the exactness rests on; without the switch its next turn finds no snapshot past the
+ * previous prompt's tail and prefills it all again. Gemma 4 here keeps no state a snapshot holds (its
+ * sliding layers are a full group), so the switch is refused and a hit adopts the decode-written
+ * blocks as they are, with or without it: the same property on attention alone. The gated delta
+ * net's recurrence decodes otherwise than its chunked prefill rounds, so qwen35 is no case for it. */
+TEST(a_turn_resumed_at_an_end_of_request_snapshot_returns_what_a_cold_run_does) {
+    REQUIRE(world().ok);
+    const std::vector<std::string> warm = { "--num-speculative-tokens", "0",
+                                            "--max-num-batched-tokens", "64", "--prefix-resume",
+                                            "exact" };
+    const std::vector<std::string> cold = { "--num-speculative-tokens", "0",
+                                            "--max-num-batched-tokens", "64", "--no-prefix-cache" };
+    struct Run { const char* name; std::string World::*model; bool state; };
+    const Run kRuns[] = { { "lfm2", &World::lfm2, true }, { "gemma4", &World::gemma4, false } };
+    for (const Run& run : kRuns) {
+        const std::vector<int32_t> p1 = prompt_ids(41, 150);
+        const int64_t n1 = (int64_t)p1.size();
+        std::vector<int32_t> out1, p2;
+        json with, without;
+        int64_t cached_with = -1, cached_without = -1;
+        for (const bool eors : { true, false }) {
+            Server s;
+            REQUIRE(s.start(world().*run.model, warm,
+                            eors ? std::vector<std::string>{ "RADIANCE_EXPERIMENTAL_PREFIX_EORS=1" }
+                                 : std::vector<std::string>{}));
+            const json t1 = post(s.port, "/completion", completion(p1, 100, 0.0, 0, 2));
+            const std::vector<int32_t> o = tokens_of(t1);
+            REQUIRE_EQ(o.size(), (size_t)100);
+            if (eors) {
+                out1 = o;
+                p2 = p1;
+                p2.insert(p2.end(), o.begin(), o.end());
+                const std::vector<int32_t> more = prompt_ids(42, 30);
+                p2.insert(p2.end(), more.begin(), more.end());
+            } else {
+                CHECK(o == out1);
+            }
+            const json t2 = post(s.port, "/completion", completion(p2, 24, 0.0, 0, 2));
+            (eors ? with : without) = t2;
+            (eors ? cached_with : cached_without) = timing(t2, "cache_n");
+            CHECK_EQ(s.stop(), 0);
+            const std::string log = s.output();
+            const bool on = has(log, "end-of-request snapshots: on");
+            const bool refused = has(log, "end-of-request snapshots: refused -- this model keeps no "
+                                          "state a snapshot would hold");
+            const bool hit = has(log, "1 admission(s) resumed from one");
+            const bool want_on = eors && run.state;
+            if (on != want_on || hit != want_on || refused != (eors && !run.state))
+                fprintf(stderr, "    %s eors=%d:\n%s\n", run.name, (int)eors, tail(log, 30).c_str());
+            CHECK(on == want_on);
+            CHECK(hit == want_on);
+            CHECK(refused == (eors && !run.state));
+        }
+        Server c;
+        REQUIRE(c.start(world().*run.model, cold));
+        const json ref = post(c.port, "/completion", completion(p2, 24, 0.0, 0, 2));
+        CHECK_EQ(c.stop(), 0);
+        /* Turn 1 computed its prompt and 99 of its tokens; the next turn resumes at the deepest grid
+         * position at or below them, past the prompt: at a snapshot (LFM2, with the switch), or at
+         * a block (Gemma 4, either way). */
+        const int64_t want = (n1 + 99) / 64 * 64;
+        const int64_t want_without = run.state ? 0 : want;
+        if (cached_with != want || cached_without != want_without)
+            fprintf(stderr, "    %s: prompt %lld, cached with %lld (want %lld), without %lld "
+                            "(want %lld)\n", run.name, (long long)n1, (long long)cached_with,
+                    (long long)want, (long long)cached_without, (long long)want_without);
+        CHECK(want > n1);
+        CHECK_EQ(cached_with, want);
+        CHECK_EQ(cached_without, want_without);
+        REQUIRE(ref.contains("completion_probabilities"));
+        for (const json* r : { &with, &without }) {
+            CHECK(tokens_of(*r) == tokens_of(ref));
+            CHECK((*r)["completion_probabilities"] == ref["completion_probabilities"]);
+        }
+    }
+}
+
 /* The row a running server's /diagnostics reports for `option`, or null. */
 json config_row(int port, const std::string& option) {
     Call c;

@@ -41,6 +41,8 @@
 /* rad_declare_consumer_suffix (abi/rad_builder.h) is an additive export: referenced weakly, it is
  * null on an engine older than the call, and the consumer skip is then refused (cut_declare). */
 #pragma weak rad_declare_consumer_suffix
+/* The same for rad_kv_group_replicated (RADIANCE_EXPERIMENTAL_DS41_KV_REPLICATED, kv_replicate). */
+#pragma weak rad_kv_group_replicated
 
 namespace deepseek41 {
 using namespace rad::arch;
@@ -2383,6 +2385,44 @@ static void cut_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
     rad_note(b, "consumer suffix declared: boundary %d, window %lld", B, (long long)c.window);
 }
 
+/* RADIANCE_EXPERIMENTAL_DS41_KV_REPLICATED=1: the compressed and index key caches declared
+ * replicated (rad_kv_group_replicated), so the prefix cache's host tier (--prefix-cache-mib) keeps
+ * one copy of an entry instead of every rank's: 6,400 B a 2-token entry instead of 25,600 at TP4,
+ * four times the conversations in the same bytes. Every attention rank computes them whole from the
+ * replicated residual stream with replicated weights (one latent KV head), so the four ranks hold
+ * the same bytes: the Kh arms' per-rank hashes of kv_index_r* and kv_compressed_r* agree in every
+ * prompt of the 29 Oct prefill window, and RADIANCE_DEBUG_TIER_VERIFY checks it at each restore.
+ * Only with every rank attending (no attention-zero rank, whose groups are zeroed) and more than
+ * one; it changes nothing but the tier's slot layout. */
+static int kv_replicate(RadBuilder* b, Model& m) {
+    const char* v = std::getenv("RADIANCE_EXPERIMENTAL_DS41_KV_REPLICATED");
+    if (!v || std::strcmp(v, "1") != 0) return RAD_OK;
+    const char* why = nullptr;
+    if (!rad_kv_group_replicated) why = "this engine has no rad_kv_group_replicated";
+    else if (m.g.world <= 1) why = "one rank holds every byte already";
+    else if (m.zero || m.aw != m.g.world) why = "a rank keeps no attention cache (attention-zero)";
+    if (why) {
+        if (m.g.rank == 0)
+            fprintf(stderr, "radiance: deepseek41: RADIANCE_EXPERIMENTAL_DS41_KV_REPLICATED refused: "
+                            "%s\n", why);
+        return RAD_OK;
+    }
+    int n = 0;
+    std::string names;
+    for (const auto* groups : { &m.index, &m.comp })
+        for (const auto& kv : *groups) {
+            DS_TRY(rad_kv_group_replicated(b, kv.second));
+            ++n;
+        }
+    for (const auto& kv : m.index) names += (names.empty() ? "" : ",") + std::string("kv_index_r") + std::to_string(kv.first);
+    for (const auto& kv : m.comp) names += (names.empty() ? "" : ",") + std::string("kv_compressed_r") + std::to_string(kv.first);
+    if (m.g.rank == 0)
+        fprintf(stderr, "radiance: deepseek41: RADIANCE_EXPERIMENTAL_DS41_KV_REPLICATED: %d paged "
+                        "group(s) declared replicated (%s): a host-tier slot holds them once, not "
+                        "once a rank\n", n, names.c_str());
+    return RAD_OK;
+}
+
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
     if (!b || !meta || !ctx || ctx->is_draft || ctx->rank < 0 || ctx->rank >= MAX_RANKS)
         return RAD_E_INVAL;
@@ -2547,6 +2587,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     }
     m.layers.resize((size_t)c.n_layer);
     for (int l = 0; l < c.n_layer; ++l) DS_TRY(layer(b, m, m.layers[(size_t)l], l));
+    DS_TRY(kv_replicate(b, m));
     if (m.router_bf16 && g.rank == 0)
         fprintf(stderr, "radiance: deepseek41: RADIANCE_EXPERIMENTAL_DS41_ROUTER_BF16: %d routers "
                         "and %d compressor kv|gate projections read as bf16 (gemm_nt_f32bf16), "

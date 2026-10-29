@@ -1674,7 +1674,7 @@ int FileStager::hx_jobs_for(int e, const HostExpertPool::Job& proto) {
         if (!in_job) return;
         j.more = in_job - 1;
         j.cost = HostExpertPool::job_cost(in_job);
-        if (in_job > HostExpertPool::kMaxRowsDefault) {
+        if (in_job >= HostExpertPool::many_from()) {
             ++hx_stats_.many_jobs;
             hx_stats_.many_rows += (uint64_t)in_job;
         }

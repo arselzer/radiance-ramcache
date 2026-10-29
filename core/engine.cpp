@@ -159,7 +159,7 @@ Engine::~Engine() {
             RAD_INFO("host experts: %.1f ms waiting at gathers for misses still being read on the worker "
                      "(not in the gather waits above)", (double)hx.async_wait_ns / 1e6);
         if (hx.many_jobs)
-            RAD_INFO("host experts: %llu jobs of more than four rows of one expert (%llu rows) went "
+            RAD_INFO("host experts: %llu jobs of four or more rows of one expert (%llu rows) went "
                      "through the many-row kernel", (unsigned long long)hx.many_jobs,
                      (unsigned long long)hx.many_rows);
         if (hx.early)

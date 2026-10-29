@@ -45,9 +45,13 @@ public:
     static constexpr int kMaxRowsDefault = 4;  /* ds41hx::kFewRows */
     /* The most token rows a job carries: RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MAX_ROWS, 1 ..
      * kMaxRowsCap (default 4), read once; an unusable value turns the pool off (get() says so) and
-     * reads as the default here. A job of more than four rows runs the many-row kernel
-     * (ds41hx::gemv_avx2_many), for prefill passes whose rows meet in one expert. */
+     * reads as the default here. With more than four allowed, a job of four or more rows runs the
+     * many-row kernel (ds41hx::gemv_avx2_many), for prefill passes whose rows meet in one expert;
+     * every other job runs ds41hx::gemv_avx2_few, as with the default. */
     static int max_rows();
+    /* The fewest rows of a job that runs the many-row kernel: 4 when max_rows() > 4 (rbench, 40
+     * threads: 10-18% under gemv_avx2_few at four rows, about even at three), else none. */
+    static int many_from() { return max_rows() > kMaxRowsDefault ? kMaxRowsDefault : kMaxRowsCap + 1; }
     struct Job {
         const uint8_t*  gu = nullptr;   /* [2 * kFf, kEmbd] */
         const uint8_t*  dn = nullptr;   /* [kEmbd, kFf] */
@@ -58,8 +62,8 @@ public:
         const uint16_t* x = nullptr;    /* kEmbd bf16 */
         uint16_t*       y = nullptr;    /* kEmbd bf16 */
         /* Up to max_rows() - 1 more token rows of the same expert: each weight tile is read once for
-         * all of them and each round of its codes decoded once (ds41hx::gemv_avx2_rows), each row's
-         * arithmetic unchanged. */
+         * all of them and each round of its codes decoded once (gemv_avx2_few, or gemv_avx2_many from
+         * many_from() rows), each row's arithmetic unchanged. */
         const uint16_t* xs[kMaxRowsCap - 1] = {};
         uint16_t*       ys[kMaxRowsCap - 1] = {};
         int             more = 0;
@@ -67,10 +71,11 @@ public:
         int64_t         cost = 0;       /* backlog bytes it stands for; 0: cost_rows(1 + more) */
     };
     /* The backlog a job of `rows` rows stands for: the expert's bytes for the first row and for
-     * each more half of them in a job of up to four rows (computed from L2), a fifth in a larger
-     * one (the many-row kernel; ds41_host_experts_test rbench). */
+     * each more half of them in a job of up to four rows (computed from L2), an eighth in a larger
+     * one (the many-row kernel: ~0.05 ms a further row against ~0.38 ms for an expert's first, 40
+     * threads; ds41_host_experts_test rbench). */
     static int64_t job_cost(int rows) {
-        return kExpertBytes + (int64_t)(rows - 1) * (rows <= kMaxRowsDefault ? kExpertBytes / 2 : kExpertBytes / 5);
+        return kExpertBytes + (int64_t)(rows - 1) * (rows <= kMaxRowsDefault ? kExpertBytes / 2 : kExpertBytes / 8);
     }
     /* An expert's `rows` rows as jobs of at most max_rows(). */
     static int64_t cost_rows(int rows) {

@@ -21,7 +21,7 @@
 namespace rad {
 
 static_assert(HostExpertPool::kMaxRowsCap == ds41hx::kGemvRows, "a job's rows are one many-row kernel call");
-static_assert(HostExpertPool::kMaxRowsDefault == ds41hx::kFewRows, "jobs of up to four rows keep the few-row kernel");
+static_assert(HostExpertPool::kMaxRowsDefault == ds41hx::kFewRows, "jobs of up to four rows can take the few-row kernel");
 
 namespace {
 
@@ -144,7 +144,7 @@ HostExpertPool* HostExpertPool::get() {
                  p->cpu_bpns_, p->link_bpns_);
         if (max_rows() != kMaxRowsDefault)
             RAD_INFO("host experts: jobs of up to %d token rows of one expert (%s)%s", max_rows(), kEnvMaxRows,
-                     max_rows() > kMaxRowsDefault ? "; more than four through the many-row kernel" : "");
+                     max_rows() > kMaxRowsDefault ? "; four or more through the many-row kernel" : "");
         return p;
     }();
     return pool;
@@ -315,7 +315,8 @@ void HostExpertPool::tile(Slot& s, uint32_t gen, int k) {
         const uint16_t* xs[kMaxRowsCap];
         uint16_t* ys[kMaxRowsCap];
         for (int r = 0; r <= s.job.more; ++r) { xs[r] = r ? s.job.xs[r - 1] : s.job.x; ys[r] = s.gate_up + (size_t)r * 2 * kFf; }
-        ds41hx::gemv_avx2_rows(m, xs, ys, 1 + s.job.more, k * kTile, (k + 1) * kTile);
+        (1 + s.job.more >= many_from() ? ds41hx::gemv_avx2_many : ds41hx::gemv_avx2_few)(m, xs, ys, 1 + s.job.more, k * kTile,
+                                                                                         (k + 1) * kTile);
         if (s.gu_left.fetch_sub(1, std::memory_order_acq_rel) == 1) {
             /* The job's down tiles wait for this, so it runs eight values a step (12 -> ~2 us a
              * row); RADIANCE_EXPERIMENTAL_DS41_SWIGLU_SCALAR=1 keeps the scalar loop (an A/B switch). */
@@ -340,7 +341,8 @@ void HostExpertPool::tile(Slot& s, uint32_t gen, int k) {
     const uint16_t* xs[kMaxRowsCap];
     uint16_t* ys[kMaxRowsCap];
     for (int r = 0; r <= s.job.more; ++r) { xs[r] = s.act + (size_t)r * kFf; ys[r] = r ? s.job.ys[r - 1] : s.job.y; }
-    ds41hx::gemv_avx2_rows(m, xs, ys, 1 + s.job.more, d * kTile, (d + 1) * kTile);
+    (1 + s.job.more >= many_from() ? ds41hx::gemv_avx2_many : ds41hx::gemv_avx2_few)(m, xs, ys, 1 + s.job.more, d * kTile,
+                                                                                     (d + 1) * kTile);
     if (s.dn_left.fetch_sub(1, std::memory_order_acq_rel) != 1) return;
     /* The job's last tile: nothing reads the slot after this. */
     Ticket* t = s.ticket;

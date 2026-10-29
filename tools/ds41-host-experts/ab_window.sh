@@ -298,7 +298,7 @@ for a in $ARMS; do
       n[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_NICE=${p#n}) ;;
       m[0-9]*) CACHE_MIB=${p#m} ;;
       M[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MISSES=${p#M}) ;;
-      Mr[0-9]*) # pool jobs of up to N token rows of one expert (1-32, default 4; above 4 the many-row kernel)
+      Mr[0-9]*) # pool jobs of up to N token rows of one expert (1-32, default 4; above 4, jobs of 4+ rows take the many-row kernel)
                if [[ ${p#Mr} =~ ^[0-9]+$ ]] && (( 10#${p#Mr} >= 1 && 10#${p#Mr} <= 32 )); then
                  env+=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MAX_ROWS=${p#Mr})
                else log "arm $a: $p: a job takes 1-32 rows; the arm is skipped"; skip=1; fi ;;

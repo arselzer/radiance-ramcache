@@ -172,6 +172,16 @@ Engine::~Engine() {
             RAD_INFO("host experts: %llu jobs of four or more rows of one expert (%llu rows) went "
                      "through the many-row kernel", (unsigned long long)hx.many_jobs,
                      (unsigned long long)hx.many_rows);
+        /* RADIANCE_EXPERIMENTAL_DS41_SIDE_STORE (place/hx_side_store.h): the units the packed RAM
+         * cache refuses, held, and the misses that read nothing for them. */
+        if (r->fstager.side_store()) {
+            const HxSideStore::Stats ss = r->fstager.side_store_stats();
+            RAD_INFO("host experts' side store: %d of at most %d units held (%s) whose inserts the "
+                     "packed RAM cache refuses; %llu misses handed their planes without a read (%llu "
+                     "in one-token passes); %llu refused units turned away for want of room",
+                     ss.units, ss.cap, humanb(ss.bytes).c_str(), (unsigned long long)hx.side_hits,
+                     (unsigned long long)hx.side_d_hits, (unsigned long long)ss.full);
+        }
         if (hx.early)
             RAD_INFO("host experts, early issue: %llu layers issued their card ops ahead of their counts "
                      "sync and waited %.1f ms for the counts at their gathers (%.1f us a layer; also in "

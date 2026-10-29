@@ -89,6 +89,7 @@
 #include "dspark_head_tail.h"
 #include "host_expert_pool.h"
 #include "hx_fetch_list.h"
+#include "hx_side_store.h"
 #include "readahead.h"
 #include "route_trace.h"
 
@@ -316,6 +317,9 @@ public:
         uint64_t ra_unselected = 0, ra_cached = 0, ra_stale = 0;
         uint64_t ra_misses = 0, ra_miss_planned = 0;
         uint64_t ra_used_bytes = 0, ra_dropped_bytes = 0, ra_wait_ns = 0;
+        /* ..._SIDE_STORE (hx_side_store.h): misses handed the planes the store holds (no drive
+         * read), and of them in one-token passes. */
+        uint64_t side_hits = 0, side_d_hits = 0;
         uint64_t linked = 0;          /* cached experts the schedule left on the copy link */
         uint64_t missed = 0;          /* routed experts the RAM cache did not hold */
         uint64_t wait_ns = 0;         /* the issuing thread waiting at gathers for the CPU */
@@ -352,6 +356,9 @@ public:
     };
     const HostStats& host_stats() const { return hx_stats_; }
     bool host_experts() const { return hx_pool_ != nullptr; }
+    /* ..._SIDE_STORE: what the store holds now (the insert threads fill it). */
+    bool side_store() const { return hx_side_.on(); }
+    HxSideStore::Stats side_store_stats() const { return hx_side_.stats(); }
     /* RADIANCE_EXPERIMENTAL_DS41_ROUTE_TRACE (route_trace.h): this rank's part. Passes and layer
      * records written; of the layers, one-token ones; layers with rank 0's router outputs, with
      * its logits, with a RAM-cache snapshot; bias records; layers whose router op this pass did
@@ -683,7 +690,7 @@ private:
      * queued (0), being read (1), read (2), or taken by its layer before its read began (3): the
      * layer then reads it as any miss. The thread starts no read while a demand read of any rank
      * is in flight (PieceReader::process()'s count, up to 2 ms). hx_miss_ready_ is parallel to hx_miss_: the
-     * planes are in already (read ahead). */
+     * planes are in already (1: read ahead; 2: the side store's, hx_side_store.h). */
     struct PfEntry { int32_t unit = -1; std::shared_ptr<Mover::HostPlanes> p; int state = 0; bool ok = false; };
     struct PfBatch { uint32_t pass = 0; int32_t li = -1; uint64_t seq = 0; std::vector<PfEntry> entries; };
     std::thread hx_pf_;
@@ -748,6 +755,16 @@ private:
     std::vector<std::unique_ptr<Mover::HostPlanes>> hx_planes_free_;
     std::mutex hx_planes_mu_;
     std::shared_ptr<Mover::HostPlanes> hx_planes_get(int32_t unit);
+    /* RADIANCE_EXPERIMENTAL_DS41_SIDE_STORE=N (hx_side_store.h): the planes of up to N units the
+     * packed RAM cache refused, kept by the insert threads (hx_bg_loop) and handed to their later
+     * misses as read (hx_choose: hx_miss_ready_ 2); hx_side_handed_ such misses this layer, which
+     * read nothing (the epoch is checked before their jobs, as for units read ahead whole). Its
+     * planes go back to hx_planes_free_ when it lets them go (the destructor, before the list). */
+    HxSideStore hx_side_;
+    int hx_side_handed_ = 0;
+    /* hx_init_impl, before the insert threads see a refusal: the switch, refused unless the packed
+     * cache and misses on the CPU are on. */
+    int hx_side_init();
     int  hx_submit_misses();
     /* The misses hx_submit_misses_now reads, into *out: the layer's not read ahead whole and not
      * being finished by the piece readers. True when some are (urgent: hx_ra_settle waits for

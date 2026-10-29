@@ -2053,6 +2053,50 @@ TEST(a_requests_last_step_issues_no_step_ahead) {
     CHECK_EQ(plain.stop(), 0);
 }
 
+/* RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP: a reply that ends on its end-of-generation token runs
+ * no forward pass after it. A grammar of two letters makes that token the third: the prompt's step
+ * samples the first letter, two decode steps the second and the end. Issued ahead regardless, a
+ * third decode step follows the end and runs for the finished request, which the shutdown report
+ * counts; with the switch each step's tokens are read back before the next is planned, and
+ * nothing follows the end. The replies are the same. The counts are the report's, taken at the
+ * requests' commits, not /metrics', which the step behind a reply reaches only after it. */
+TEST(a_reply_that_ends_on_its_end_token_runs_no_pass_after_it) {
+    REQUIRE(world().ok);
+    auto ask = [](int port, uint64_t seed) {
+        const json b = { { "prompt", prompt_ids(seed, 40) }, { "n_predict", 16 },
+                         { "temperature", 0.0 }, { "grammar", "root ::= \"ab\"" },
+                         { "return_tokens", true } };
+        return post(port, "/completion", b);
+    };
+    auto field = [](const json& j, const char* k) {
+        return j.is_object() ? j.value(k, std::string()) : std::string();
+    };
+    Server plain, skip;
+    REQUIRE(plain.start(world().lfm2, kPlain));
+    REQUIRE(skip.start(world().lfm2, kPlain, { "RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP=1" }));
+    for (uint64_t seed : { 8, 9 }) {
+        const json a = ask(plain.port, seed), b = ask(skip.port, seed);
+        const std::string ea = field(a, "stop_type"), eb = field(b, "stop_type");
+        if (ea != "eos" || eb != "eos" || tokens_of(a) != tokens_of(b))
+            fprintf(stderr, "    seed %llu:\n    %s\n    %s\n", (unsigned long long)seed,
+                    a.dump().c_str(), b.dump().c_str());
+        CHECK_EQ(ea, std::string("eos"));
+        CHECK_EQ(eb, std::string("eos"));
+        CHECK(tokens_of(a) == tokens_of(b));
+        CHECK_EQ(field(a, "content"), std::string("ab"));
+        CHECK_EQ(field(b, "content"), std::string("ab"));
+    }
+    CHECK_EQ(plain.stop(), 0);
+    CHECK_EQ(skip.stop(), 0);
+    const std::string lp = plain.output(), ls = skip.output();
+    const bool ok = has(lp, "post-stop passes: 2 request(s) ended with a step issued ahead") &&
+                    has(ls, "post-stop passes: 0 request(s) ended with a step issued ahead") &&
+                    has(ls, "2 of them ended their request and issued nothing behind it");
+    if (!ok) fprintf(stderr, "    plain:\n%s\n    skip:\n%s\n", tail(lp, 6).c_str(),
+                     tail(ls, 6).c_str());
+    CHECK(ok);
+}
+
 /* Decoding a token runs the recurrent kernels over one row; prefilling it runs the chunked ones
  * over the whole prompt. Each decoded position's probabilities must be what a cold prefill of the
  * prompt and the tokens before it gives: exactly where both paths compute each row the same way

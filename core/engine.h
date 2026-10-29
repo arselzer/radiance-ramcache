@@ -437,8 +437,29 @@ private:
     int  advance_all(int mode, int round, bool from_proposal, int rows = -1);
     int  issue_serial_drafter(int step, StepOut& so);
     /* The next step's forward pass, issued before this one is read back; null when the scheduler
-     * wants this step committed first. See Scheduler::step_next. */
-    int  issue_ahead(const RadBatch** out);
+     * wants this step committed first. See Scheduler::step_next. `so` is this step's, for
+     * RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP's read-back. */
+    int  issue_ahead(const RadBatch** out, const StepOut& so);
+    /* RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP=1: before a step is planned behind one of a single
+     * sequence that its own token can end (Scheduler::outcome_decides_next), that step's ids are
+     * read back and its outcome handed to Scheduler::step_next, which issues nothing behind a
+     * step that ended its request. Off: the pass after a reply's end-of-generation token runs as
+     * before. Read in serve(), applied in step_loop() once pipelining_ is known. */
+    bool post_stop_asked_ = false;
+    bool post_stop_ = false;
+    /* The outcome as collect_step will find it, without its effects (grammar, logprobs, the kept
+     * rows): each row's last emitted token, its accepted drafts, whether the token ends
+     * generation. Waits for the ids. */
+    int  peek_outcome(const StepOut& so, Scheduler::StepResult* out);
+    std::vector<int32_t> peek_tok_, peek_acc_;
+    std::vector<uint8_t> peek_eos_;
+    /* For the shutdown report's "post-stop passes" line: the steps read back first and the wait
+     * for their ids; of the steps then issued, the host's time from the ids to the ranks'
+     * release (the next step's build, advance and arena), through which the card idles. */
+    uint64_t post_stop_peeks_ = 0, post_stop_wait_ns_ = 0;
+    uint64_t post_stop_issued_ = 0, post_stop_turn_ns_ = 0;
+    std::chrono::steady_clock::time_point post_stop_t_{};
+    void post_stop_report();
     /* The arena level and the followers' pools, before any release that runs a forward pass. */
     int  prepare_release(const RadBatch* b);
     /* Whether a step may be issued ahead: requires that the drafter, if any, runs on the card (the

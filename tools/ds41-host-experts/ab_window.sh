@@ -15,6 +15,9 @@
 #
 # Before the arms (DEVICE_CHECKS=1, the default), the device harness checks the served libr4d.so on
 # card 0: swiglu over every (gate, up) pair with mismatches classified, and the host chain.
+# DEVICE_CHECKS=draft checks the DSpark draft bank's GEMVs instead (every mode of
+# RADIANCE_EXPERIMENTAL_DS41_DRAFT_GEMV against the host experts, then their times a call), with the
+# harness DRAFT_CHECK_BIN and the plugin DRAFT_CHECK_LIB (DRAFT_CHECK_TRIALS, 36).
 #
 # Arms are named POLICY[-tN][-gG][-sS][-nP][-mM][-MR][-PsK|-PoK|-PpK][-f][-x] (see the loop below), e.g. "base greedy-t20-g65 all-t24".
 # An arm with an unknown part is skipped, not run without it; F8 (the FP8-stored dense weights) is
@@ -192,6 +195,7 @@ arm() {   # name, then env assignments for the server; CACHE_MIB the RAM cache (
   grep -E 'host experts|EP scoped|live chain|error|ERR' "$OUT/$name.server.log" | tail -16 | tee -a "$OUT/window.log"
   grep -E 'read-ahead (in pieces|readers)|router predictor \(' "$OUT/$name.server.log" | tail -6 | tee -a "$OUT/window.log"
   grep -E 'rank 0: on-die reads' "$OUT/$name.server.log" | tee -a "$OUT/window.log"   # Pa/Pm/Pl/Pe: plan, counts
+  grep -E 'DS41_DRAFT_GEMV' "$OUT/$name.server.log" | tail -2 | tee -a "$OUT/window.log"   # Dk/Dkt: calls taken
 }
 
 if [[ "$("${DOCKER[@]}" inspect "$NAME" --format '{{.State.Status}}' 2>/dev/null)" != running ]]; then
@@ -227,6 +231,19 @@ if [[ "${DEVICE_CHECKS:-1}" == 1 && -x "$HERE/build/ds41_mxfp4_device_check" ]];
   tail -3 "$OUT/chain_check.log" | tee -a "$OUT/window.log"
   if cmp -s "$OUT/silu_recheck.bin" "$SILU"; then log "silu table recaptured identical"; else log "silu table recapture DIFFERS"; fi
 fi
+if [[ "${DEVICE_CHECKS:-1}" == draft ]]; then
+  # RADIANCE_EXPERIMENTAL_DS41_DRAFT_GEMV (Dk) on card 0: the draft bank's grouped GEMMs in every
+  # mode against the host experts, experts in pinned host memory and in VRAM, then each mode's
+  # time a call at a 5-row query pass. DRAFT_CHECK_BIN is a ds41_mxfp4_device_check with the draft
+  # subcommand, DRAFT_CHECK_LIB a libr4d.so with the switch.
+  DCB=${DRAFT_CHECK_BIN:-$HERE/build/ds41_mxfp4_device_check}
+  DCL=${DRAFT_CHECK_LIB:-$RHOME/kernels/libr4d.so}
+  log "draft GEMV device check on card 0 with $DCL"
+  ( export HIP_VISIBLE_DEVICES=0
+    timeout 900 "$DCB" "$DCL" draft ${DRAFT_CHECK_TRIALS:-36} >"$OUT/draft_check.log" 2>&1
+    echo "draft check exit $?" >>"$OUT/draft_check.log" )
+  grep -E 'draft GEMV|PASS|FAIL|gate_up|down|exit' "$OUT/draft_check.log" | tail -20 | tee -a "$OUT/window.log"
+fi
 
 HX=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=$HX_THREADS RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU=$SILU)
 CANCEL=${CANCEL_FILE:-/home/as/ds41-claude-build/work/cancel_window}
@@ -257,7 +274,11 @@ for a in $ARMS; do
 # / Xi miss reads on threads started per call / on 4 KiB pages / relaid via scratch (the old ways,
 # as A/B switches); Ds / DsN / Dsa DSpark speculation from $DRAFT_BANK at depth 5 / capped at N
 # drafts a step (Ds0: the bank loaded, drafting off) / with the adaptive window (the bank pins its
-# experts in the host pool: give the arm pN of ~2048); H3 the third run home (RADIANCE_HOME_DIR3); Es
+# experts in the host pool: give the arm pN of ~2048); Dk the draft bank's grouped GEMMs take the
+# live tail and one pass over each expert's weights (RADIANCE_EXPERIMENTAL_DS41_DRAFT_GEMV=1: no
+# slot routed to another rank runs against the rank's last expert, and an expert's rows share one
+# read of its pinned host weights; exact; a libr4d that has it, and a Ds part), Dkt the live tail
+# alone (=2); H3 the third run home (RADIANCE_HOME_DIR3); Es
 # engram_kv's rows split over the ranks (needs a deepseek41 plugin that has it); Pa the next layer's
 # attention weights read into the card's on-die cache during the CPU-row wait (same); PmN those reads
 # from the use-order list up to N MiB an issue point, the read that crosses it cut
@@ -358,6 +379,8 @@ for a in $ARMS; do
                       --num-speculative-tokens 5 --spec-ngram 0)
                [[ $p == Ds[0-9] ]] && env+=(RADIANCE_EXPERIMENTAL_DS41_DSPARK_VERIFY_CAP=${p#Ds})
                [[ $p == Dsa ]] && ARGS+=(--draft-window adaptive) ;;
+      Dk)      env+=(RADIANCE_EXPERIMENTAL_DS41_DRAFT_GEMV=1) ;;   # draft GEMVs: live tail + one weight pass
+      Dkt)     env+=(RADIANCE_EXPERIMENTAL_DS41_DRAFT_GEMV=2) ;;   # draft GEMVs: the live tail alone
       K)       env+=(RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE=1) ;;     # the RAM cache packed for the CPU only
       Lm[0-9]*) ARGS+=(--max-model-len "${p#Lm}") ;;   # a longer context (default 512), e.g. for long-prompt TTFT
       Pf)      env+=(RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE=1) ;;   # a prefill chunk alone in its step; decode rows batched
@@ -392,6 +415,11 @@ for a in $ARMS; do
     env+=(RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8=0)
   fi
   ARM_F8=$f8
+  # Dk / Dkt act on the draft bank's GEMVs only: without a Ds part the arm would not test them.
+  if [[ " ${env[*]} " == *" RADIANCE_EXPERIMENTAL_DS41_DRAFT_GEMV="* &&
+        " ${env[*]} " != *" RADIANCE_EXPERIMENTAL_DS41_DSPARK_RAD_BANK=1 "* ]]; then
+    log "arm $a: Dk / Dkt need a Ds part (the DSpark draft bank); the arm is skipped"; skip=1
+  fi
   [[ -n "$skip" ]] && continue
   [[ -n "$power" ]] && power_set "$power"
   case $pol in

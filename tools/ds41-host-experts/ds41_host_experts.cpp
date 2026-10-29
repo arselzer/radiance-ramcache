@@ -659,13 +659,17 @@ void gemv_avx2_rows_pk(const Mx& w, const uint16_t* const* x, uint16_t* const* y
  * token rows, value), so one group of a round for four token rows is 4 KiB in a row and stays in L1
  * while the block's 16 output rows pass over it; their weights lie by (group, output row, value), so
  * a group's are 16 KiB in a row (in L1 too, no two rows on the same sets). The sums of each (group,
- * output row, token row) wait in a buffer between rounds. */
+ * output row, token row) wait in a buffer between rounds: round 0 starts them at +0 (as the one-row
+ * kernel's accumulators start), and each later call fetches the next call's sums ahead.
+ *
+ * Measured (ds41_host_experts_test rhot, one thread, 32 rows): 0.100 cycles a row-weight, where Zen 3's
+ * pipes allow 0.0625 for a separate multiply and add (a loop of 8 vmulps and 8 vaddps runs in 4.1
+ * cycles on the EPYC 7443, with the block's six loads too); the rest is the calls' entry and exit, the
+ * decode (~0.3 cycles a weight, once for all rows) and x's transpose. Blocks of 8 or 32 rows, register
+ * blocks of 1 x 8 and 1 x 12 (x folded into the multiplies), other unrolls and all of a block's
+ * rounds decoded first (the sums kept in registers across rounds) measured no better or worse. */
 
-#ifndef HX_MANY_MB
-#define HX_MANY_MB 16   /* output rows a block (a benchmark knob: 8, 16 or 32) */
-#endif
-constexpr int kMb = HX_MANY_MB;
-static_assert(kMb % 8 == 0, "blocks of whole groups of eight output rows");
+constexpr int kMb = 16;   /* output rows a block */
 
 /* Round u0 / 32 of a row of UK blocks (`codes` / `scl` the row's code bytes and e8m0 bytes): its groups,
  * a partial one padded as add_tail pads it (into `pad`, 8 * 17 + 32 bytes, and `pad_sc`, 8), groups past
@@ -751,20 +755,24 @@ HX_INLINE void decode_round(const uint8_t* const (&gc)[4], const uint8_t* const 
 
 /* One group of one round: a[n][i] += x_i * w_n over its 32 values, for NN output rows (w: a value 8
  * floats on, the next row 256) and NI <= 4 token rows (x: the next row 8 floats on, a value 32). The
- * sums come from and return to `acc` (the next token row 8 floats on, the next output row `as`). */
-#ifndef HX_MAC_UNROLL
-#define HX_MAC_UNROLL 1   /* the value loop's unroll (a benchmark knob) */
-#endif
-#define HX_PRAGMA_(x) _Pragma(#x)
-#define HX_PRAGMA(x) HX_PRAGMA_(x)
-template <int NN, int NI>
-HX_INLINE void mac_rows(float* acc, size_t as, const float* w, const float* x) {
+ * sums start at +0 in the first round (kFirst) and otherwise come from `acc` (the next token row 8
+ * floats on, the next output row `as`); they return there. `pf`: the next call's sums, fetched into
+ * L1 while this call runs (they were last stored a round ago). */
+template <int NN, int NI, bool kFirst>
+HX_INLINE void mac_rows(float* acc, size_t as, const float* w, const float* x, const float* pf) {
     __m256 a[NN][NI];
+    if (!kFirst && pf)
+#pragma GCC unroll 8
+        for (int n = 0; n < NN; ++n) {
+            _mm_prefetch(reinterpret_cast<const char*>(pf + (size_t)n * as), _MM_HINT_T0);
+            _mm_prefetch(reinterpret_cast<const char*>(pf + (size_t)n * as + 16), _MM_HINT_T0);
+        }
 #pragma GCC unroll 8
     for (int n = 0; n < NN; ++n)
 #pragma GCC unroll 8
-        for (int i = 0; i < NI; ++i) a[n][i] = _mm256_load_ps(acc + (size_t)n * as + (size_t)i * 8);
-HX_PRAGMA(GCC unroll HX_MAC_UNROLL)
+        for (int i = 0; i < NI; ++i)
+            a[n][i] = kFirst ? _mm256_setzero_ps() : _mm256_load_ps(acc + (size_t)n * as + (size_t)i * 8);
+#pragma GCC unroll 4
     for (int v = 0; v < 32; ++v, w += 8, x += 32) {
         __m256 wv[NN];
 #pragma GCC unroll 8
@@ -785,21 +793,29 @@ HX_PRAGMA(GCC unroll HX_MAC_UNROLL)
 /* A group of a round for every token row and the block's mb output rows: four token rows at a time
  * against two output rows, the last one to three against two or four. ag: the group's sums (output
  * row k, token row i at (k * rows + i) * 8); wg: its weights (row k at k * 256); xg: its x (token rows
- * 4b .. 4b + 3 at b * 1024). */
+ * 4b .. 4b + 3 at b * 1024). kFirst: the round that starts the sums. */
+template <bool kFirst>
 HX_INLINE void mac_group(float* ag, const float* wg, const float* xg, int rows, int mb) {
     const size_t as = (size_t)rows * 8;
     int i = 0;
     for (; i + 4 <= rows; i += 4)
-        for (int k = 0; k < mb; k += 2) mac_rows<2, 4>(ag + (size_t)k * as + (size_t)i * 8, as, wg + (size_t)k * 256, xg + (size_t)i * 256);
+        for (int k = 0; k < mb; k += 2) {
+            float* const a = ag + (size_t)k * as + (size_t)i * 8;
+            const float* const next = k + 2 < mb ? a + 2 * as : ag + (size_t)(i + 4) * 8;
+            mac_rows<2, 4, kFirst>(a, as, wg + (size_t)k * 256, xg + (size_t)i * 256, next);
+        }
     switch (rows - i) {
         case 3:
-            for (int k = 0; k < mb; k += 2) mac_rows<2, 3>(ag + (size_t)k * as + (size_t)i * 8, as, wg + (size_t)k * 256, xg + (size_t)i * 256);
+            for (int k = 0; k < mb; k += 2)
+                mac_rows<2, 3, kFirst>(ag + (size_t)k * as + (size_t)i * 8, as, wg + (size_t)k * 256, xg + (size_t)i * 256, nullptr);
             break;
         case 2:
-            for (int k = 0; k < mb; k += 4) mac_rows<4, 2>(ag + (size_t)k * as + (size_t)i * 8, as, wg + (size_t)k * 256, xg + (size_t)i * 256);
+            for (int k = 0; k < mb; k += 4)
+                mac_rows<4, 2, kFirst>(ag + (size_t)k * as + (size_t)i * 8, as, wg + (size_t)k * 256, xg + (size_t)i * 256, nullptr);
             break;
         case 1:
-            for (int k = 0; k < mb; k += 4) mac_rows<4, 1>(ag + (size_t)k * as + (size_t)i * 8, as, wg + (size_t)k * 256, xg + (size_t)i * 256);
+            for (int k = 0; k < mb; k += 4)
+                mac_rows<4, 1, kFirst>(ag + (size_t)k * as + (size_t)i * 8, as, wg + (size_t)k * 256, xg + (size_t)i * 256, nullptr);
             break;
         default: break;
     }
@@ -837,16 +853,16 @@ void gemv_avx2_many_t(const Mx& w, const uint16_t* const* x, uint16_t* const* y,
     PkRounds cur[kMb];
     for (int nb = n0; nb < n1; nb += kMb) {
         const int mb = n1 - nb < kMb ? n1 - nb : kMb;   /* a multiple of 8 */
-        /* ab[((g * mb + k) * rows + i) * 8 + j]: the sums of group g, output row nb + k, token row i */
-        std::memset(ab, 0, (size_t)4 * mb * rows * 32);
+        /* ab[((g * mb + k) * rows + i) * 8 + j]: the sums of group g, output row nb + k, token row i; round 0
+         * starts them, so only groups past a single partial round's are zeroed */
         if (L == 2)
             for (int k = 0; k < mb; ++k) cur[k] = pk_rounds_from(w, (uint32_t)(nb + k) * (uint32_t)R);
         for (int r = 0; r < R; ++r) {
             int ng = 4;
             for (int k = 0; k < mb; ++k) {
                 const int n = nb + k;
-                const uint8_t* gc[4];
-                const uint8_t* gs[4];
+                const uint8_t* gc[4] = {};   /* round_groups sets all four (a round has a block) */
+                const uint8_t* gs[4] = {};
                 if (L == 0) {
                     const uint8_t* const codes = w.blocks + (size_t)n * UK * 17 + 1;
                     ng = round_groups<true>(codes, codes - 1, 32 * r, UK, gc, gs, pad, pad_sc);
@@ -862,120 +878,12 @@ void gemv_avx2_many_t(const Mx& w, const uint16_t* const* x, uint16_t* const* y,
                 }
                 decode_round<kGgml>(gc, gs, ng, wb + (size_t)k * 256, (size_t)kMb * 256);
             }
-            for (int g = 0; g < ng; ++g)
-                mac_group(ab + (size_t)g * mb * rows * 8, wb + (size_t)g * kMb * 256, xt + (size_t)(r * 4 + g) * gx, rows, mb);
-        }
-        for (int k = 0; k < mb; ++k)
-            for (int i = 0; i < rows; ++i) {
-                __m256 a[4];
-                for (int g = 0; g < 4; ++g) a[g] = _mm256_load_ps(ab + (((size_t)g * mb + k) * rows + i) * 8);
-                y[i][nb + k] = bf16_rne_nan(wave_sum4(a));
+            for (int g = 0; g < ng; ++g) {
+                float* const ag = ab + (size_t)g * mb * rows * 8;
+                if (r == 0) mac_group<true>(ag, wb + (size_t)g * kMb * 256, xt + (size_t)g * gx, rows, mb);
+                else mac_group<false>(ag, wb + (size_t)g * kMb * 256, xt + (size_t)(r * 4 + g) * gx, rows, mb);
             }
-    }
-}
-
-#ifndef HX_MANY_RI
-#define HX_MANY_RI 0   /* 1: a block's rounds all decoded first, each call sums a group over every round (a benchmark knob) */
-#endif
-
-/* One group over rounds 0 .. nr - 1 for NN output rows and NI <= 4 token rows: the sums start at +0
- * and take the rounds in order (w and x a round further on at wr and xr floats), each round's 32
- * values in order, as mac_rows does round by round; then they are stored to acc. */
-template <int NN, int NI>
-HX_INLINE void mac_rounds(float* acc, size_t as, const float* w, size_t wr, const float* x, size_t xr, int nr) {
-    __m256 a[NN][NI];
-#pragma GCC unroll 8
-    for (int n = 0; n < NN; ++n)
-#pragma GCC unroll 8
-        for (int i = 0; i < NI; ++i) a[n][i] = _mm256_setzero_ps();
-    for (int r = 0; r < nr; ++r, w += wr, x += xr) {
-        const float* wp = w;
-        const float* xp = x;
-HX_PRAGMA(GCC unroll HX_MAC_UNROLL)
-        for (int v = 0; v < 32; ++v, wp += 8, xp += 32) {
-            __m256 wv[NN];
-#pragma GCC unroll 8
-            for (int n = 0; n < NN; ++n) wv[n] = _mm256_load_ps(wp + (size_t)n * 256);
-#pragma GCC unroll 8
-            for (int i = 0; i < NI; ++i) {
-                const __m256 xv = _mm256_load_ps(xp + (size_t)i * 8);
-#pragma GCC unroll 8
-                for (int n = 0; n < NN; ++n) a[n][i] = _mm256_add_ps(a[n][i], _mm256_mul_ps(xv, wv[n]));
-            }
-        }
-    }
-#pragma GCC unroll 8
-    for (int n = 0; n < NN; ++n)
-#pragma GCC unroll 8
-        for (int i = 0; i < NI; ++i) _mm256_store_ps(acc + (size_t)n * as + (size_t)i * 8, a[n][i]);
-}
-
-/* gemv_avx2_many_t with a block's rounds decoded first: wb[((r * 4 + g) * kMb + k) * 256 + v * 8 + j],
- * and each call sums one group of two output rows and four token rows over all its rounds. */
-template <int L>
-void gemv_avx2_many_ri_t(const Mx& w, const uint16_t* const* x, uint16_t* const* y, int rows, int n0, int n1) {
-    constexpr bool kGgml = L == 0;
-    const int UK = w.K / 32, R = (UK + 31) / 32, RF = UK / 32, t = UK % 32;
-    const int ng_tail = RF < R ? (t + 7) / 8 : 4;   /* the last round's groups */
-    const size_t PB = (size_t)(8 * RF + (t + 3) / 4);
-    const size_t gx = (size_t)(rows + 3) / 4 * 1024;
-    ManyBufs& bufs = many_bufs();
-    float* const xt = at_least(bufs.x, (size_t)R * 4 * gx / 8);
-    float* const wb = at_least(bufs.w, (size_t)R * 4 * kMb * 32);
-    float* const ab = at_least(bufs.a, (size_t)4 * kMb * (size_t)rows);
-    for (int i = 0; i < rows; ++i) x_lanes_t<false>(x[i], UK, xt + (size_t)(i / 4) * 1024 + (size_t)(i % 4) * 8, 32, gx, 4 * gx);
-    alignas(32) uint8_t pad[8 * 17 + 32], pad_sc[8], sb[32];
-    const size_t as = (size_t)rows * 8, wr = (size_t)4 * kMb * 256, xr = 4 * gx;
-    for (int nb = n0; nb < n1; nb += kMb) {
-        const int mb = n1 - nb < kMb ? n1 - nb : kMb;
-        for (int k = 0; k < mb; ++k) {
-            const int n = nb + k;
-            PkRounds cur{};
-            if (L == 2) cur = pk_rounds_from(w, (uint32_t)n * (uint32_t)R);
-            for (int r = 0; r < R; ++r) {
-                const uint8_t* gc[4];
-                const uint8_t* gs[4];
-                int ng;
-                if (L == 0) {
-                    const uint8_t* const codes = w.blocks + (size_t)n * UK * 17 + 1;
-                    ng = round_groups<true>(codes, codes - 1, 32 * r, UK, gc, gs, pad, pad_sc);
-                } else if (L == 1) {
-                    ng = round_groups<false>(w.codes + (size_t)n * (size_t)(w.K / 2), w.scales + (size_t)n * UK, 32 * r, UK,
-                                             gc, gs, pad, pad_sc);
-                } else {
-                    const int tb = r < RF ? 32 : t;
-                    const uint8_t* const s = pk_round(cur, (uint32_t)n * (uint32_t)R + (uint32_t)r,
-                                                      w.pk + (size_t)n * PB + (size_t)8 * r, tb, w.e0, sb);
-                    ng = round_groups<false>(w.codes + (size_t)n * (size_t)(w.K / 2) + (size_t)r * 32 * 16, s, 0, tb,
-                                             gc, gs, pad, pad_sc);
-                }
-                decode_round<kGgml>(gc, gs, ng, wb + ((size_t)r * 4 * kMb + (size_t)k) * 256, (size_t)kMb * 256);
-            }
-        }
-        for (int g = 0; g < 4; ++g) {
-            const int nr = g < ng_tail ? R : RF;
-            float* const ag = ab + (size_t)g * mb * rows * 8;
-            const float* const wg = wb + (size_t)g * kMb * 256;
-            const float* const xg = xt + (size_t)g * gx;
-            int i = 0;
-            for (; i + 4 <= rows; i += 4)
-                for (int k = 0; k < mb; k += 2)
-                    mac_rounds<2, 4>(ag + (size_t)k * as + (size_t)i * 8, as, wg + (size_t)k * 256, wr, xg + (size_t)i * 256, xr, nr);
-            switch (rows - i) {
-                case 3:
-                    for (int k = 0; k < mb; k += 2)
-                        mac_rounds<2, 3>(ag + (size_t)k * as + (size_t)i * 8, as, wg + (size_t)k * 256, wr, xg + (size_t)i * 256, xr, nr);
-                    break;
-                case 2:
-                    for (int k = 0; k < mb; k += 4)
-                        mac_rounds<4, 2>(ag + (size_t)k * as + (size_t)i * 8, as, wg + (size_t)k * 256, wr, xg + (size_t)i * 256, xr, nr);
-                    break;
-                case 1:
-                    for (int k = 0; k < mb; k += 4)
-                        mac_rounds<4, 1>(ag + (size_t)k * as + (size_t)i * 8, as, wg + (size_t)k * 256, wr, xg + (size_t)i * 256, xr, nr);
-                    break;
-                default: break;
-            }
+            if (r == 0 && ng < 4) std::memset(ab + (size_t)ng * mb * rows * 8, 0, (size_t)(4 - ng) * mb * rows * 32);
         }
         for (int k = 0; k < mb; ++k)
             for (int i = 0; i < rows; ++i) {
@@ -1187,15 +1095,9 @@ void gemv_avx2_few(const Mx& w, const uint16_t* const* x, uint16_t* const* y, in
 void gemv_avx2_many(const Mx& w, const uint16_t* const* x, uint16_t* const* y, int rows, int n0, int n1) {
     for (int i = 0; i < rows; i += kGemvRows) {
         const int m = rows - i < kGemvRows ? rows - i : kGemvRows;
-#if HX_MANY_RI
-        if (w.blocks) gemv_avx2_many_ri_t<0>(w, x + i, y + i, m, n0, n1);
-        else if (w.pk) gemv_avx2_many_ri_t<2>(w, x + i, y + i, m, n0, n1);
-        else gemv_avx2_many_ri_t<1>(w, x + i, y + i, m, n0, n1);
-#else
         if (w.blocks) gemv_avx2_many_t<0>(w, x + i, y + i, m, n0, n1);
         else if (w.pk) gemv_avx2_many_t<2>(w, x + i, y + i, m, n0, n1);
         else gemv_avx2_many_t<1>(w, x + i, y + i, m, n0, n1);
-#endif
     }
 }
 

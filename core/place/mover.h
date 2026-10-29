@@ -630,6 +630,7 @@ public:
      *                   on this rank) into dst, for a host reader such as the router predictor. */
     bool  read_weight_file(const WeightInfo& w, void* dst);
     bool  mapped_cache_on() const { return mapped_file_cache_on_; }
+    int64_t mapped_cache_bytes() const { return mapped_file_cache_on_ ? cfg_.native_file_cache_bytes : 0; }
     /* Whether the mapped RAM cache holds every weight of unit u, without touching it. */
     bool  unit_cached(int32_t u);
     int   insert_unit_planes(const HostPlanes& p, std::vector<uint8_t>* scratch);

@@ -1031,6 +1031,8 @@ int FileStager::hx_init_impl(const Program& prog) {
                      hx_miss_rows_);
         /* A second copy of the planes on another drive, read beside the container (plane_mirror.h). */
         RAD_TRY(mover_->mirror_init());
+        if (const char* w = std::getenv("RADIANCE_EXPERIMENTAL_DS41_CACHE_WARM"); w && !std::strcmp(w, "1"))
+            RAD_TRY(hx_warm());
     }
     if (plan_->rank == 0)
         RAD_INFO("host experts: %zu of %zu routed layers give the CPU %s cached experts%s", n_ok,
@@ -1451,6 +1453,56 @@ void FileStager::drain_host_inserts() {
  * sorted order and expert offsets (moe_gemm_ggml: a, w, sorted_tok, expert_offset, y), which
  * the next pass's hx_fetch reads. With CPU rows in flight they must be the ones hx_fetch read on
  * this pass, or the pool computed from the wrong bytes. */
+/* RADIANCE_EXPERIMENTAL_DS41_CACHE_WARM=1: before the first request the RAM cache takes this
+ * rank's file-tier experts in the expert profile's order, as many as fit, the hottest inserted
+ * last so LRU keeps them longest: planes read as the CPU path reads a miss (the plane mirror
+ * included), relaid by the background insert threads. A fresh server's first requests otherwise
+ * miss on nearly every expert the card does not hold. */
+int FileStager::hx_warm() {
+    const auto t0 = std::chrono::steady_clock::now();
+    std::vector<int32_t> units;
+    for (const Layer& L : layers_)
+        for (int32_t u : L.units)
+            if (plan_->units[(size_t)u].profile_share > 0.0f && mover_->host_planes_eligible(u))
+                units.push_back(u);
+    std::stable_sort(units.begin(), units.end(), [&](int32_t a, int32_t b) {
+        return plan_->units[(size_t)a].profile_share > plan_->units[(size_t)b].profile_share;
+    });
+    const int64_t pair = HostExpertPool::kGuBytes + HostExpertPool::kDnBytes + 6 * 64;
+    const int64_t fit = mover_->mapped_cache_bytes() / pair;
+    if ((int64_t)units.size() > fit) units.resize((size_t)std::max<int64_t>(fit, 0));
+    std::reverse(units.begin(), units.end());
+    size_t done = 0;
+    for (size_t i = 0; i < units.size(); i += 8) {
+        {   /* at most a few batches' planes wait for the insert threads */
+            std::unique_lock<std::mutex> lk(hx_bg_mu_);
+            hx_bg_cv_.wait(lk, [&] { return hx_bg_q_.size() < 24; });
+        }
+        std::vector<std::shared_ptr<Mover::HostPlanes>> batch;
+        std::vector<Mover::HostPlanes*> ptrs;
+        for (size_t k = i; k < std::min(units.size(), i + 8); ++k) {
+            batch.push_back(hx_planes_get(units[k]));
+            ptrs.push_back(batch.back().get());
+        }
+        if (!mover_->read_unit_planes(ptrs.data(), (int)ptrs.size(), (int)kEpRouteMaxRows)) {
+            RAD_WARN("host experts: warming rank %d's RAM cache stopped after %zu units: a read failed",
+                     plan_->rank, done);
+            break;
+        }
+        {
+            std::lock_guard<std::mutex> lk(hx_bg_mu_);
+            for (auto& p : batch) hx_bg_q_.push_back(p);
+        }
+        hx_bg_cv_.notify_all();
+        done += batch.size();
+    }
+    drain_host_inserts();
+    RAD_INFO("host experts: rank %d's RAM cache warmed with the profile's %zu hottest file-tier "
+             "experts (%s) in %.1f s", plan_->rank, done, humanb((int64_t)done * pair).c_str(),
+             std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    return RAD_OK;
+}
+
 /* The first pass's CPU work for layer li, at its gate_up's operands: hx_capture has just taken
  * the rows' addresses, which the router and scatter wrote before this op on stream s. Every
  * selected unit was published as an alias, so all of them must go to the CPU. */

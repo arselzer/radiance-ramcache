@@ -440,6 +440,7 @@ private:
     int  hx_init_impl(const Program& prog);
     /* The first pass's CPU work, at its gate_up's operands (start_ep_routed deferred it). */
     int  hx_deferred(int32_t li, RadStream s);
+    int  hx_warm();
     int  hx_fetch(int32_t li, RadStream s);
     void hx_choose(int32_t li);
     int  hx_submit();

@@ -519,10 +519,16 @@ rank. (A) is what the exact-tall device sweep checks op by op (each row against 
 and in launches of 16, up to the reach), and what the `Kh` arms below check end to end: the prefill
 hashes of every KV group and the last row's logits at the end of each prompt of the resumed turns
 must equal the cold arm's. On libref the e2e test
-`a_turn_resumed_at_an_end_of_request_snapshot_returns_what_a_cold_run_does` holds it for LFM2 and
-Gemma 4 (qwen35's gated delta net decodes by another recurrence than its chunked prefill, so (A)
-fails there, as it would on any such model). Under the consumer skip (`Cs`) the snapshots are at or
-past each prompt's cut target and decode rows run every layer; under `Xt` (A) is the tall checks.
+`a_turn_resumed_at_an_end_of_request_snapshot_returns_what_a_cold_run_does` holds it for LFM2 (a
+convolution's state: with the switch the next turn resumes at the reply's last grid position, 192,
+without it at nothing) and Gemma 4 (no state to snapshot: the switch is refused and the hit adopts
+the decode-written blocks at 192 either way); every reply and probability is a cold server's.
+qwen35's gated delta net decodes by another recurrence than its chunked prefill, so (A) fails
+there, as it would on any such model. On the cards the first evidence came from today's cache:
+in window ab-20261029T232708Z `Pc-Pci256` on `Upfxchat` answered 15/15 as the cold arm, C3 among
+them, which adopts 46 of C1's decode-step blocks beneath C2's recompute snapshot (token level; the
+`Kh` arms are the byte level). Under the consumer skip (`Cs`) the snapshots are at or past each
+prompt's cut target and decode rows run every layer; under `Xt` (A) is the tall checks.
 
 **The snapshot store for harness sessions.** `--checkpoint-slots auto` sizes the store for the
 running sequences (7 slots of 22.6 MiB at `Lm32768`, interval 2048, one sequence: one session's

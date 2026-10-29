@@ -90,6 +90,13 @@ the engine or the scripts assumes where the checkpoint is. `ab_window.sh` takes 
 - `cache_sim.py`: replays an access trace against LRU, SLRU, 2Q, aged LFU and Belady.
 - `ds41_mxfp4_device_check.hip`: the kernels against the card (chain check, exhaustive SwiGLU,
   GEMV timing against two libr4d builds).
+- `ds41_bf16f8_device_check.hip` (`make device-check O=<dir>`): `gemm_nt_bf16f8` on the card
+  against `gemm_nt`, from a built libr4d.so: the weight fragments the kernel expands for all 254
+  E4M3 codes at all 237 exponents (`frag`, which sees the sign of a zero), one-hot GEMMs over
+  every (code, exponent) pair, signed zeros and cancelling pairs through the slices that start
+  mid-block (`zeros`), ds41's per-rank shapes at every split and row count, container tensors and a
+  timing table. Exit 0 when every output bit is equal. Run it in a GPU window under both locks:
+  `HIP_VISIBLE_DEVICES=0 ds41_bf16f8_device_check <libr4d.so> all <model.rad>`.
 - `ds41_dense_fp8_scan.cpp` (`make scan O=<dir>`, host only): the exactness scan behind
   `RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8`. It runs libr4d's own bf16f8 layout hooks over every
   dense weight deepseek41 would store as E4M3 codes (the 570 container entries of q_a, q_b, kv,

@@ -18,7 +18,17 @@ $(O)/ds41_dense_fp8_scan: $(SCAN_SRC) $(TREE)/libr4d/r4d_bf16f8_layout.h
 	  -I$(TREE)/libr4d -I$(TREE)/vendor -o $@ $(SCAN_SRC)
 scan: $(O)/ds41_dense_fp8_scan
 
-clean:
-	rm -f ds41_host_experts_test ds41_dense_fp8_scan
+# The card check of gemm_nt_bf16f8 against gemm_nt (run it in a GPU window; see its header). The
+# fragment probe includes the kernel's own expansion (libr4d/r4d_bf16f8_frag.h), compiled as
+# libr4d's plugin flags compile it: no FMA contraction, no fast math.
+HIPCC ?= hipcc
+HIPFLAGS ?= -O2 -std=c++17 --offload-arch=gfx1201 -ffp-contract=off -fno-fast-math
+$(O)/ds41_bf16f8_device_check: ds41_bf16f8_device_check.hip $(TREE)/libr4d/r4d_bf16f8_layout.h \
+                               $(TREE)/libr4d/r4d_bf16f8_frag.h
+	$(HIPCC) $(HIPFLAGS) -I$(TREE)/abi -I$(TREE)/libr4d -o $@ ds41_bf16f8_device_check.hip -ldl
+device-check: $(O)/ds41_bf16f8_device_check
 
-.PHONY: clean scan
+clean:
+	rm -f ds41_host_experts_test ds41_dense_fp8_scan ds41_bf16f8_device_check
+
+.PHONY: clean scan device-check

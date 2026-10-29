@@ -24,6 +24,7 @@
 #include <map>
 #include <set>
 #include "build/startup.h"
+#include "engine_hostmem.h"
 #include "diag/diag.h"
 #include "mem/hostarena.h"
 #include "sched/mem_iface.h"
@@ -227,14 +228,17 @@ private:
     int64_t host_headroom_bytes() const {
         /* All callers are startup allocation checks. Reserve the lazy native cache before a
          * whole table or prefix pool can consume its future capacity. The cache's small entry
-         * metadata may already exist at the later checks; counting it again is conservative. */
-        const int64_t cache = cfg_.expert_ram_cache_total_mib;
-        if (!cache) return cfg_.host_headroom_mib * ((int64_t)1 << 20);
-        const int64_t limit = INT64_MAX / ((int64_t)1 << 20);
-        if (cache < 0 || cfg_.host_headroom_mib < 0 || cache > limit ||
-            cfg_.host_headroom_mib > limit - cache) return INT64_MAX;
-        return (cfg_.host_headroom_mib + cache) * ((int64_t)1 << 20);
+         * metadata may already exist at the later checks; counting it again is conservative.
+         * Less what its slabs already back, under RADIANCE_EXPERIMENTAL_CACHE_HEADROOM_BACKED
+         * (cache_backed_bytes_; 0 otherwise, which is the whole budget as before). */
+        return host_headroom_total(cfg_.host_headroom_mib, cfg_.expert_ram_cache_total_mib,
+                                   cache_backed_bytes_);
     }
+    /* RADIANCE_EXPERIMENTAL_CACHE_HEADROOM_BACKED=1: the bytes every rank's RAM cache slabs held
+     * when configure_kv began (Mover::mapped_cache_backed_bytes), which host_headroom_bytes()
+     * stops reserving a second time. Set once the weights are loaded, so the checks that size
+     * the tables before the load are unchanged; 0 without the switch. */
+    int64_t cache_backed_bytes_ = 0;
     /* Resolves --embedding-placement, --vision-tower-placement and --ngram-placement into Config
      * before the card is split (engine_bringup.cpp describes how auto chooses). `wfs` is every
      * rank's footprint, read for its towers. `host_late` is the pinned host memory startup
@@ -265,6 +269,10 @@ private:
     int configure_kv();
     /* Resolves --checkpoint-slots auto for snapshots of `slot` bytes (`what` names their kind). */
     int size_checkpoint_store(int64_t slot, const char* what);
+    /* For a checkpoint store refused for room: when the expert RAM cache's slabs already hold
+     * memory the margin reserves again (RADIANCE_EXPERIMENTAL_CACHE_HEADROOM_BACKED off), a clause
+     * saying so and naming the switch; empty otherwise. Words only: it decides nothing. */
+    std::string cache_margin_hint() const;
     /* Maps the step's logits rows back to the sequences that wanted them. Not the identity: a
      * mid-prompt prefill chunk produces no row, and a speculative verify produces 1 + n_spec. */
     struct StepOut {

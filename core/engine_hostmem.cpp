@@ -51,4 +51,16 @@ void cgroup_levels(const std::string& root, std::string path, bool v2,
     }
 }
 
+int64_t host_headroom_total(int64_t headroom_mib, int64_t cache_mib, int64_t backed_bytes) {
+    const int64_t MiB = (int64_t)1 << 20;
+    /* No cache: the flag alone, exactly as before. */
+    if (!cache_mib) return headroom_mib * MiB;
+    const int64_t limit = INT64_MAX / MiB;
+    if (cache_mib < 0 || headroom_mib < 0 || backed_bytes < 0 || cache_mib > limit ||
+        headroom_mib > limit - cache_mib)
+        return INT64_MAX;
+    const int64_t cache = cache_mib * MiB;
+    return headroom_mib * MiB + (cache - (backed_bytes < cache ? backed_bytes : cache));
+}
+
 }  /* namespace rad */

@@ -1197,6 +1197,13 @@ int64_t Mover::mapped_cache_pregrow() {
     return (int64_t)std::min(st.slabs.classes[0].capacity_slots, st.slabs.classes[1].capacity_slots);
 }
 
+int64_t Mover::mapped_cache_backed_bytes() const {
+    if (!mapped_file_cache_on_) return 0;
+    const auto st = mapped_file_cache_.stats();
+    const size_t b = st.slab_policy ? st.slabs.retained_backing_charge : st.cache.payload_charge;
+    return b > (size_t)INT64_MAX ? INT64_MAX : (int64_t)b;
+}
+
 int Mover::mapped_cache_second_chances(const std::vector<int32_t>& units, int chances) {
     if (!mapped_file_cache_on_ || !plan_ || !mapped_file_cache_.stats().slab_policy) return 0;
     int n = 0;

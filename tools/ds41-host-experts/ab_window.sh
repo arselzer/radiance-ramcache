@@ -22,6 +22,19 @@
 # router predictor. An Rb arm runs only after SELFTEST_F32BF16's card checks passed in the window,
 # and a Vp arm only on a libr4d.so VPACK_CHECK passed (below).
 #
+# Prefix caching (every other arm runs with --no-prefix-cache): Pc the prefix cache on, with
+# RADIANCE_EXPERIMENTAL_CACHE_HEADROOM_BACKED=1 (startup's checks after the load stop reserving the
+# RAM cache's pinned slabs a second time; without it a G arm has no room for a checkpoint store and
+# no ds41 hit can resume); Pc0 the cache on without it (the control); PciN --checkpoint-interval N
+# (default 2048: a prompt under 2,048 tokens gets no snapshot to resume from); PcsN
+# --checkpoint-slots N (auto otherwise); Pcx a finished sequence publishes only the prefill chunks an
+# idle cold prefill cuts alike (RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH: no KV of a short last
+# chunk or a decode step under a later hit). The window prints a Pc arm's prefix-cache startup
+# lines, and at the end each request's TTFT and cached prompt tokens (ab_requests.py --ttft), for
+# the receipts work/extra-prompts/pfxchat-receipt.json and pfxlong-receipt.json (U parts Upfxchat
+# and Upfxlong, with Lm4096; a U part's receipt name holds no "-", which splits parts). Put the
+# same arm without Pc first: it is the cold reference.
+#
 # Environment: RADIANCE_BIN (the binary), RADIANCE_HOME_DIR (kernels/ and architectures/ for it),
 # SILU_TABLE (the card's silu table), ARMS (default "base verify greedy"), HX_THREADS (16),
 # VERIFY_REQUESTS (3), DEVICE_CHECKS (1), SELFTEST_F32BF16 (an r4d_selftest: gemm_nt_f32bf16's
@@ -141,7 +154,7 @@ arm() {   # name, then env assignments for the server; CACHE_MIB the RAM cache (
       --host-headroom-mib 8192 --gpu-headroom-mib 256 --embedding-placement vram \
       --vision-tower-placement vram --ngram-placement disk --max-model-len 512 \
       --max-num-batched-tokens 16 --max-num-seqs ${MAX_SEQS:-1} --kv-cache-dtype bf16 \
-      --num-speculative-tokens 0 --spec-ngram 0 --no-prefix-cache --deterministic \
+      --num-speculative-tokens 0 --spec-ngram 0 ${ARM_NOPC---no-prefix-cache} --deterministic \
       --host 127.0.0.1 --port $PORT --expert-profile "$PROFILE" ${EXTRA_ARGS:-} "${ARGS[@]}" >"$OUT/$name.server.log" 2>&1 &
   SERVER_PID=$!
   # Memory guard: stops this server (never anything else) if the host runs short.
@@ -161,6 +174,9 @@ arm() {   # name, then env assignments for the server; CACHE_MIB the RAM cache (
     if (( t > 600 )); then log "arm $name: no server after 600 s"; stop_server; return 1; fi
   done
   log "arm $name: serving after ${t}s"
+  # A Pc arm: the prefix cache's startup lines (the snapshot store, the interval, the resume rule).
+  [[ -z "${ARM_NOPC---no-prefix-cache}" ]] && \
+    grep -E 'host headroom|chunk geometry|prefix resume|prefix cache|checkpoint slots' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   # RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8 (the F8 parts): the plugin names the weights it reads from
   # E4M3 codes on each rank, and an arm must have exactly what its name says. An F8 arm whose
   # plugin did not take the knob, or a plain arm that took it from the window's environment, is
@@ -496,6 +512,7 @@ for a in $ARMS; do
   pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 HOST_POOL_MIB=4096 EXTRA_ARGS="" ARM_HOME="$RHOME" ARM_CONC=
   ARM_PROMPTS= ARM_N= ARM_LQ= rt=
   power="" skip="" ARGS=() f8="" f8x="" rb="" rbf=0 pred="" cs="" kh=""
+  unset ARM_NOPC   # --no-prefix-cache unless a Pc part sets it empty
   for p in "${parts[@]:1}"; do
     case $p in
       Q[gnc]*) power=${p#Q} ;;
@@ -566,6 +583,12 @@ for a in $ARMS; do
       K)       env+=(RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE=1) ;;     # the RAM cache packed for the CPU only
       Vp)      env+=(RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED=1) ;;      # VRAM residents in the packed-scale form (vpack_gate)
       Lm[0-9]*) ARGS+=(--max-model-len "${p#Lm}") ;;   # a longer context (default 512), e.g. for long-prompt TTFT
+      Pc)      ARM_NOPC= ; ARGS+=(--prefix-resume exact)                            # prefix cache on (exact resume, the default, named)
+               env+=(RADIANCE_EXPERIMENTAL_CACHE_HEADROOM_BACKED=1) ;;              # ... and pinned slabs not reserved twice
+      Pc0)     ARM_NOPC= ; ARGS+=(--prefix-resume exact) ;;                         # prefix cache on, the margin as before (the control)
+      Pci[0-9]*) ARGS+=(--checkpoint-interval "${p#Pci}") ;;                      # snapshot interval (2048)
+      Pcs[0-9]*) ARGS+=(--checkpoint-slots "${p#Pcs}") ;;                         # snapshot store slots (auto)
+      Pcx)     env+=(RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH=1) ;;             # publish only cold-cut chunks
       Pf)      env+=(RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE=1) ;;   # a prefill chunk alone in its step; decode rows batched
       N[0-9]*) ARGS+=(--max-num-seqs "${p#N}") ;;                     # this arm's --max-num-seqs (MAX_SEQS for every arm)
       C[0-9]*) ARM_CONC=${p#C} ;;                                     # this arm's requests sent K at a time (AB_CONCURRENCY)
@@ -669,4 +692,5 @@ for u in "${!KH_BY_PROMPTS[@]}"; do
   log "prefill hashes with prompts $u"
   python3 -I "$HERE/ab_requests.py" --hashes "$OUT" ${KH_BY_PROMPTS[$u]} | tee -a "$OUT/window.log"
 done
+[[ " $ARMS" == *-Pc* ]] && python3 -I "$HERE/ab_requests.py" --ttft "$OUT" $ARMS | tee -a "$OUT/window.log"
 log "arms done"

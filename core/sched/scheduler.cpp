@@ -87,6 +87,23 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     if (geo) geo_ = *geo;
     else RAD_TRY(chunk_geometry_resolve(prog, cfg, &geo_));
 
+    /* RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH=1: see exact_publish_. Only an exact resume
+     * grid says which chunks a cold prefill cuts, so it acts under --prefix-resume exact alone. */
+    exact_publish_ = false;
+    if (const char* ep = std::getenv("RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH");
+        ep && !std::strcmp(ep, "1") && cfg.prefix_cache) {
+        exact_publish_ = geo_.exact && geo_.grid > 0;
+        if (exact_publish_)
+            RAD_INFO("prefix cache: RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH: a finished "
+                     "sequence publishes only the prefill chunks it computed as an idle cold "
+                     "prefill cuts them (from its hit, alone in their step, %lld-token grid), so "
+                     "no later hit adopts a block a short last chunk or a decode step wrote",
+                     (long long)geo_.grid);
+        else
+            RAD_WARN("prefix cache: RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH needs --prefix-resume "
+                     "exact; everything computed is published as before");
+    }
+
     kvgeom_ = KVGeom::of(prog.kv_groups);
     for (size_t i = 0; i < kvgeom_.g.size(); ++i) {
         const int64_t w = kv->state_index_width((int32_t)i);
@@ -676,8 +693,20 @@ void Scheduler::close_request(SchedReq& s, ReqState st, const char* reason, bool
             if (kv_->first_block_pos(s.req->id, cg[i]) != 0) { ok = false; break; }
             pub_blocks_[i] = kv_->block_table(s.req->id, cg[i]);
         }
-        if (ok) {
-            const int rc = pc_->insert(*s.req, pub_blocks_, s.req->n_computed);
+        /* RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH: no further than the cold-cut chunks
+         * (exact_publish_); the tokens held back are recomputed by whichever turn reaches them,
+         * in its own chunks, and published by it if those are cold-cut. */
+        int64_t n_pub = s.req->n_computed;
+        if (ok && exact_publish_) {
+            const int64_t upto = std::max<int64_t>(0, std::min<int64_t>(n_pub, s.grid_upto));
+            m_.prefix_publish_held_tokens += n_pub - upto;
+            RAD_DEBUG("prefix cache: request %llu publishes %lld of its %lld computed tokens, the "
+                      "chunks an idle cold prefill cuts alike", (unsigned long long)s.req->id,
+                      (long long)upto, (long long)n_pub);
+            n_pub = upto;
+        }
+        if (ok && n_pub > 0) {
+            const int rc = pc_->insert(*s.req, pub_blocks_, n_pub);
             if (rc < 0)
                 RAD_DEBUG("prefix cache: request %llu not published: %s",
                           (unsigned long long)s.req->id, rad_strerror(rc));
@@ -1478,6 +1507,9 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
 
         r.n_computed = reuse;
         r.n_cached = reuse;
+        /* The adopted blocks are published ones, cold-cut under the switch; the run of this
+         * sequence's own starts at the hit, on the grid (exact_publish_). */
+        s.grid_upto = reuse;
         s.ckpt_src = (reuse > 0 && reuse == h.n_linear_tokens &&
                       (has_linear_state_ || win_hit)) ? h.checkpoint_slot : -1;
         s.hit_attn = h.n_attn_tokens;
@@ -2519,6 +2551,14 @@ int Scheduler::commit(StepResult& res) {
             pc_->commit_checkpoint(r, (int64_t)e.ctx_len + e.ckpt_tok + 1);
 
         if (e.is_prefill) {
+            /* RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH: a chunk alone in its step, from the end
+             * of the run, from one grid position to the next, is the chunk an idle cold prefill
+             * of any prompt it prefixes cuts there (ChunkGeometry::grid); the run goes on. Any
+             * other chunk ends it: the prompt's last (short) chunk, one sharing its step. */
+            if (exact_publish_ && res.n_seq == 1 && (int64_t)e.ctx_len == s.grid_upto &&
+                geo_.on_grid(e.ctx_len) && geo_.on_grid((int64_t)e.ctx_len + e.n_tokens) &&
+                geo_.grid_floor((int64_t)e.ctx_len + e.n_tokens - 1) == e.ctx_len)
+                s.grid_upto = (int64_t)e.ctx_len + e.n_tokens;
             r.n_computed += e.n_tokens;
             /* The chunk is committed: a window group returns its blocks below the window now,
              * not at this sequence's next ensure(), which may be steps away. */

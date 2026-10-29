@@ -3449,6 +3449,17 @@ int Engine::load_weights() {
  * mapped tables read through and to the host's other work. It is pinned before the host
  * activation arenas and the prefix cache's host tier, so their bytes count as still to come;
  * on a card the amdgpu pin cap bounds it too. */
+std::string Engine::cache_margin_hint() const {
+    if (cfg_.expert_ram_cache_total_mib <= 0 || cache_backed_bytes_ > 0) return std::string();
+    int64_t backed = 0;
+    for (const auto& r : ranks_) backed += r->mover.mapped_cache_backed_bytes();
+    if (backed <= 0) return std::string();
+    return fmt(". The expert RAM cache's slabs already hold %s, gone from the memory available, "
+               "and the margin reserves its whole --expert-ram-cache-total-mib again: "
+               "RADIANCE_EXPERIMENTAL_CACHE_HEADROOM_BACKED=1 keeps only what it has yet to grow",
+               humanb(backed).c_str());
+}
+
 int Engine::size_checkpoint_store(int64_t slot, const char* what) {
     if (slot <= 0 || !cfg_.prefix_cache) {
         cfg_.checkpoint_slots = 0;
@@ -3503,8 +3514,8 @@ int Engine::size_checkpoint_store(int64_t slot, const char* what) {
     if (c.slots == 0) {
         RAD_WARN("checkpoint slots: auto finds no room for one %s snapshot of %s (%s), so every "
                  "prefix hit on this model prefills from the start. Free host memory, or lower "
-                 "--host-pool-mib or --prefix-cache-mib", what, humanb(slot).c_str(),
-                 limit.c_str());
+                 "--host-pool-mib or --prefix-cache-mib%s", what, humanb(slot).c_str(),
+                 limit.c_str(), cache_margin_hint().c_str());
         return RAD_OK;
     }
     const std::string line =
@@ -3517,6 +3528,24 @@ int Engine::size_checkpoint_store(int64_t slot, const char* what) {
 }
 
 int Engine::configure_kv() {
+    /* RADIANCE_EXPERIMENTAL_CACHE_HEADROOM_BACKED=1: the RAM cache's slabs are allocated by now
+     * (all of them under ..._PREGROW, pinned at the weights' load), so the host checks below (the
+     * checkpoint store, KV mirrors) stop reserving those bytes on top of MemAvailable, which no
+     * longer has them. Without it a 96 GiB pregrown cache counts twice and leaves the checkpoint
+     * store no room: every prefix hit on a model with snapshots then prefills from the start. */
+    cache_backed_bytes_ = 0;
+    if (const char* hb = std::getenv("RADIANCE_EXPERIMENTAL_CACHE_HEADROOM_BACKED");
+        hb && !std::strcmp(hb, "1") && cfg_.expert_ram_cache_total_mib > 0) {
+        for (auto& r : ranks_) cache_backed_bytes_ += r->mover.mapped_cache_backed_bytes();
+        const int64_t MiB = (int64_t)1 << 20;
+        RAD_INFO("host headroom: RADIANCE_EXPERIMENTAL_CACHE_HEADROOM_BACKED: the RAM cache's slabs "
+                 "already hold %s of its %s budget, so the checks from here on keep %s free "
+                 "(--host-headroom-mib %lld and the %s it has yet to grow) beside what they "
+                 "allocate", humanb(cache_backed_bytes_).c_str(),
+                 humanb(cfg_.expert_ram_cache_total_mib * MiB).c_str(),
+                 humanb(host_headroom_bytes()).c_str(), (long long)cfg_.host_headroom_mib,
+                 humanb(host_headroom_bytes() - cfg_.host_headroom_mib * MiB).c_str());
+    }
     /* Resolved once, for the cache below and Scheduler::init later (see Engine::geo_). */
     RAD_TRY(chunk_geometry_resolve(ranks_[0]->program, cfg_, &geo_));
     if (geo_.checkpoint_interval != cfg_.checkpoint_interval)
@@ -3643,7 +3672,7 @@ int Engine::configure_kv() {
             if (!sized) return refuse("no host has");
             std::string why;
             if (!lockable_room(slot * n, 0, host_headroom_bytes(), false, &why))
-                return refuse("does not fit: " + why);
+                return refuse("does not fit: " + why + cache_margin_hint());
             if (ck_store_.open(slot, slot * n) != RAD_OK)
                 return refuse(std::string("the host did not pin: ") + rad_dev_last_error());
             if (!sized_auto)

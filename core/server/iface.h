@@ -92,6 +92,9 @@ struct SchedMetrics {
     int64_t attn_cached_tokens = 0;
     int64_t linear_cached_tokens = 0;
     int64_t checkpoints_written = 0;
+    /* RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH: computed tokens left unpublished (the
+     * scheduler's SchedMetrics::prefix_publish_held_tokens). 0 without the switch. */
+    int64_t prefix_publish_held_tokens = 0;
     double  prefill_tps = 0.0;
     double  decode_tps = 0.0;
     /* Exact cumulative counts behind the EWMA rates above, for comparing runs.

@@ -279,12 +279,18 @@ every position bit-identical: KL 0, top-1 100%.
   names the weights read by `gemm_nt_bf16f8`; every other arm runs with the knob off.
   `PROMPTS`, `AB_REQUESTS`, `AB_MAX_TOKENS`, `AB_CONCURRENCY` and `MAX_SEQS` change the workload.
 - `ab_requests.py`: sends a receipt's requests (token ids, `chat_text` framed like the held-out
-  prompts, or `messages`) and compares arms; `--lp`, `--force`, `--kl`, `--kl-dir`: the quality
-  harness above (`ab_requests_test.py` runs it against a fake server with a toy model: an exact
-  model forced along its own reference is bit-identical, a perturbed one gives KL > 0).
+  prompts, `chat_turns` conversations in the same framing, or `messages`) and compares arms
+  (arms that sent another receipt are compared among themselves); `--ttft DIR ARM...` prints each
+  request's time to first token and cached prompt tokens (see Prefix caching); `--lp`, `--force`,
+  `--kl`, `--kl-dir`: the quality harness above (`ab_requests_test.py` runs it against a fake
+  server with a toy model: an exact model forced along its own reference is bit-identical, a
+  perturbed one gives KL > 0).
 - `rtrace.py report|dump|synth`: reads the routing trace (above); `rtrace_test.py` checks it on a
   synthetic trace with known answers, and on the C++ writer's own file when
   `RTRACE_CPP_PREFIX=<dir>/rt` (made by `RTRACE_DUMP=<dir> route_trace_test`).
+- `make_prefix_receipt.py OUT MPL-2.0 core/mem/prefix.cpp` and `make_prefix_receipt.py --long OUT
+  long-receipt.json`: the prefix-cache receipts in `/home/as/ds41-claude-build/work/extra-prompts/`
+  (`pfxchat-receipt.json`, part `Upfxchat`; `pfxlong-receipt.json`, part `Upfxlong`).
 - `cache_sim.py`: replays an access trace against LRU, SLRU, 2Q, aged LFU and Belady.
 - `chain_report.py PREFIX`: reads a `Ct` arm's `PREFIX.ops.csv` and `PREFIX.stamps.csv`: per layer
   kind the dispatches before the routing-counts sync, how many went (or would go) unordered and why
@@ -315,6 +321,85 @@ every position bit-identical: KL 0, top-1 100%.
 - `scan_low_halves.py model.rad`: whether a container's f32 routers (and compressor kv|gate
   projections) are bf16-valued, every low half zero, as `RADIANCE_EXPERIMENTAL_DS41_ROUTER_BF16`
   requires (its load refuses the weight otherwise). ~300 MiB of reads; outside a window.
+
+## Prefix caching
+
+The A/Bs run with `--no-prefix-cache`. The engine's prefix cache serves DeepSeek-V4.1 as it is
+(read from the code; not yet run on the cards):
+- The full groups (`kv_compressed_r2`/`kv_index_r2`, 2-token blocks, layers 2-19; `..._r1`, 1-token
+  blocks, layers 20-39) are cached, in 2-token entries; a hit adopts their blocks on every rank (one
+  block table serves all four).
+- Everything else a position carries is state, so a hit resumes only at a snapshot: the window
+  (`kv_window`, 128 tokens: 9 pages behind the position), the compressor's f32 tail
+  (`kv_comp_tail_r2`) and the Engram token history (`kv_engram_tokens`), copied out after the chunk
+  that ends there and restored on every rank before the hit's first step. The indexer's score
+  plane and candidate list are rebuilt each step from the cached index keys.
+- Under `--prefix-resume exact` (the default) snapshots sit where a cold prefill starts a chunk: at
+  `--max-num-batched-tokens 16` the grid is every 16 tokens, whatever `--checkpoint-interval`, so a
+  hit recomputes the cold run's own 16-token chunks. Snapshots are taken at every interval boundary
+  and where a prompt's last chunk starts (its tail; past the first interval only).
+- The CPU expert path, the file-buffer cap (`B1`) and the RAM cache see passes only: a hit's first
+  chunk is an ordinary 16-token pass at a later position.
+
+A snapshot costs no VRAM: 5.65 MiB a rank of pinned host memory (24 KiB of compressor tail, 24 B of
+Engram history, 9 window pages of 640 KiB), 22.6 MiB a slot for the four ranks, one D2H copy per
+rank after the chunk that ends there (~0.3 ms) and one H2D copy before a hit's first step.
+`--checkpoint-slots auto` gives a sequence the geometric-backoff ladder at `--max-model-len` plus
+one: at 4096 tokens 11 slots at an interval of 16 (249 MiB), 7 at 256 (158 MiB), 3 at 2048. The
+cached blocks live in the KV pool the VRAM split already sizes for one `--max-model-len` sequence
+(~3.1 KiB a token a card: 13 MiB at 4096), which holds finished conversations between requests at
+no further cost; nothing moves from the experts.
+
+What blocked it in the measured configuration: `--expert-ram-cache-total-mib 98304` with
+`..._NATIVE_CACHE_PREGROW=1` (part G). Startup keeps `--host-headroom-mib` plus the whole cache
+budget free in every host check, and after the load the pregrown slabs are already gone from
+MemAvailable (12.3-14 GiB left in the 14:54 window), so the checkpoint store gets no room:
+`--checkpoint-slots auto` resolves to 0 ("checkpoint slots: auto finds no room ...", which now also
+names the switch) and every hit prefills from the start (an explicit count is refused). And the
+default interval of 2048 leaves a prompt of fewer than 2,049 tokens without any snapshot. The
+switches:
+
+| Setting | Effect | Arm part |
+|---|---|---|
+| `--no-prefix-cache` dropped, `--prefix-resume exact` (the default) named | the cache on | `Pc` (also sets the next row) |
+| `RADIANCE_EXPERIMENTAL_CACHE_HEADROOM_BACKED=1` | the host checks after the load stop reserving what the cache's slabs already hold (`host headroom:` startup line); unchanged before the load | `Pc` (`Pc0`: the cache on without it, the control) |
+| `--checkpoint-interval N` | snapshots every N tokens (a multiple of 16); a prompt needs more than N tokens for its tail snapshot | `PciN` |
+| `--checkpoint-slots N` | the store's size (auto otherwise) | `PcsN` |
+| `RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH=1` | a finished sequence publishes only the prefill chunks it computed as an idle cold prefill cuts them (alone in their step, from one 16-token grid position to the next); without it a hit can adopt blocks the turn before last wrote in its short last chunk or in decode, under a snapshot computed from a full-chunk recompute of those positions, which is bit-identical only if every kernel rounds a row alike at every pass height up to 16 (a decode step's 1, a short chunk's, a full chunk's 16). `/stats` `publish_held_tokens` | `Pcx` |
+
+The exactness hazard `Pcx` removes: an exact hit recomputes the cold run's chunks from its snapshot
+but adopts every cached block below it, and `insert()` keeps the bytes an entry was first published
+with. A third turn therefore adopts blocks the first turn wrote in its short last chunk (and, when
+the client sends the model's reply back, in its 1-row decode steps) beneath a snapshot the second
+turn computed from its own 16-row recompute of those positions. That is bit-identical to a cold run
+only if every op rounds a row alike at 1 to 16 rows (the prefill design's audit says so; no window
+has tested it). `Pc` without `Pcx` is that test.
+
+The test receipts (`make_prefix_receipt.py`; token counts from the official tokenizer, which gives
+the long receipt's measured 82/272/933/1,890/3,086 exactly), each request capped at 48 tokens:
+
+| Receipt (part) | Requests | Prompt tokens, cold | With the cache (modelled) |
+|---|---|---|---|
+| `pfxchat` (`Upfxchat`) | F1-F2 (19 tokens, repeat), A1-A5 (1,207-1,221: one license text, four questions, A1 again), B1-B4 (651-991: a four-turn chat with fixed replies), D1 (B3 edited), C1-C3 (338-470: a story whose turns send the model's replies back) | 11,447 | 2,855 at `Pci16`, 3,415 at `Pci256` |
+| `pfxlong` (`Upfxlong`) | L1 (= `long-3500`, 3,086), L2 (repeat), L3 (cut to 2,655), L4-L5 (3,163-3,232: L1, its reply, more questions) | 15,222 | 3,366 |
+
+What each request should take from the cache (`cache_n` in the `--ttft` table), from an offline
+model of the scheduler's exact rule, the retention ladder and the slot store:
+
+| Request | `Pci16` | `Pci256` | Adopts (without `Pcx`) |
+|---|---|---|---|
+| F2 | 16 | 0 | - |
+| A2, A3, A4 / A5 | 1,184 / 1,216 | 1,024 / 1,216 | - |
+| B2 / B3 / D1 / B4 | 640 / 752 / 832 / 848 | 640 / 752 / 768 / 848 | B3, D1, B4: 10-18 tokens of a short last chunk |
+| C2 / C3 | 336 / 400 | 336 / 400 | C3: 2 tokens of C1's short last chunk, 46 of its decode steps |
+| L2 / L3 / L4 / L5 | 3,072 / 2,560 / 3,072 / 3,152 | same | L5: 14 of L1's short last chunk, 30-46 of its decode steps |
+
+Every reply of a `Pc` arm must equal the same arm's without `Pc` on the same receipt (put that arm
+first): `ab_requests.py --compare` and `--ttft` (texts `same`; `pdif` marks a prompt that differs
+because an earlier reply differed and was sent back, the earlier `DIFF` is the one to read). The
+`--ttft` table also lists repeats within an arm (F2 = F1, A5 = A1, L2 = L1: want `same`), replies
+sent back with their own token count against the generated count (equal means the next turn's
+chain runs through the decode steps' blocks), and the `/stats` prefix counters.
 
 ## Correctness
 

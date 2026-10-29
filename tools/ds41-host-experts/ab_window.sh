@@ -160,6 +160,7 @@ arm() {   # name, then env assignments for the server; CACHE_MIB the RAM cache (
   log "arm $name: requests exit $?"
   stop_server
   grep -E 'host experts|EP scoped|error|ERR' "$OUT/$name.server.log" | tail -12 | tee -a "$OUT/window.log"
+  grep -E 'rank 0: on-die reads' "$OUT/$name.server.log" | tee -a "$OUT/window.log"   # Pa/Pm/Pl/Pe: plan, counts
 }
 
 if [[ "$("${DOCKER[@]}" inspect "$NAME" --format '{{.State.Status}}' 2>/dev/null)" != running ]]; then
@@ -221,7 +222,12 @@ for a in $ARMS; do
 # drafts a step (Ds0: the bank loaded, drafting off) / with the adaptive window (the bank pins its
 # experts in the host pool: give the arm pN of ~2048); H3 the third run home (RADIANCE_HOME_DIR3); Es
 # engram_kv's rows split over the ranks (needs a deepseek41 plugin that has it); Pa the next layer's
-# attention weights read into the card's on-die cache during the CPU-row wait (same); K the RAM cache
+# attention weights read into the card's on-die cache during the CPU-row wait (same); PmN those reads
+# from the use-order list up to N MiB an issue point, the read that crosses it cut
+# (RADIANCE_EXPERIMENTAL_DS41_PREFETCH_MIB), Pl<k1+k2+...> the reads named, in that order (..._SET;
+# ekv comp qa kv iw iq qb ik oa ma ob rt sgu mf sdn), Pe an Engram layer's too: its engram_kv by the
+# layer before when listed, the rest behind its GEMM (..._ENGRAM); each implies Pa and needs a
+# deepseek41 plugin from claude/ds41-pfx; K the RAM cache
 # in the CPU-only packed form (RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE; needs all, M16 and B1); ScN
 # the RAM cache's profile-hot units get N second chances before eviction; rN a repeat (ignored).
   IFS=- read -r -a parts <<< "$a"
@@ -244,6 +250,9 @@ for a in $ARMS; do
       H3)      ARM_HOME=${RADIANCE_HOME_DIR3:?H3 needs RADIANCE_HOME_DIR3} ;;
       Es)      env+=(RADIANCE_EXPERIMENTAL_DS41_ENGRAM_SPLIT=1) ;;   # engram_kv rows split over the ranks
       Pa)      env+=(RADIANCE_EXPERIMENTAL_DS41_PREFETCH_ATTN=1) ;;   # next layer's attention weights into the on-die cache
+      Pm[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_PREFETCH_ATTN=1 RADIANCE_EXPERIMENTAL_DS41_PREFETCH_MIB=${p#Pm}) ;;   # on-die reads: a budget, use order
+      Pl?*)    env+=(RADIANCE_EXPERIMENTAL_DS41_PREFETCH_ATTN=1 RADIANCE_EXPERIMENTAL_DS41_PREFETCH_SET=${p#Pl}) ;;   # on-die reads: these, in order
+      Pe)      env+=(RADIANCE_EXPERIMENTAL_DS41_PREFETCH_ATTN=1 RADIANCE_EXPERIMENTAL_DS41_PREFETCH_ENGRAM=1) ;;   # on-die reads at Engram layers
       Sc[0-9]) env+=(RADIANCE_EXPERIMENTAL_DS41_CACHE_SECOND_CHANCE=${p#Sc}) ;;   # profile-hot cached units get N second chances
       i[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_INSERT_THREADS=${p#i}) ;;
       p[0-9]*) HOST_POOL_MIB=${p#p} ;;

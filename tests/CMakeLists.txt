@@ -14,8 +14,9 @@
 # declare-phase C ABI (arch_fakes.h), so plugins are tested without depending on core/build/'s
 # builder. With the archive linked, a new ABI call missing from the fake would pull in
 # rad_builder.cpp.o and collide on every rad_decl_* symbol; without it the error is a single
-# undefined reference.
-set(RAD_TESTS_NO_CORE arch_test glm5next_test mapped_slab_pregrow_test)
+# undefined reference. ds41_prefetch_plan_test checks deepseek41's on-die read plan
+# (arch/deepseek41/ds41_prefetch_plan.h), pure host logic with no ABI.
+set(RAD_TESTS_NO_CORE arch_test glm5next_test mapped_slab_pregrow_test ds41_prefetch_plan_test)
 
 # fixture_test tests tools/kfixture.cpp and tools/opshapes.cpp (the seeded draw, the reduction and
 # the on-disk recording) directly, kbench_test tools/kbench_core.cpp (rad-kbench's rules), and

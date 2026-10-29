@@ -24,6 +24,7 @@
  * The checkpoint's DSpark drafter (mtp.0 .. mtp.{n-1}, when the container carries its stages as
  * blk.{n_layer}.. with `nextn_predict_layers`) runs on the block-drafter protocol: see struct Dsp. */
 #include <arch/rad_block_moe_fp8.h>
+#include "ds41_prefetch_plan.h"
 #include "ista_dialect.h"
 
 #include <algorithm>
@@ -39,13 +40,13 @@
 namespace deepseek41 {
 using namespace rad::arch;
 
-/* RADIANCE_EXPERIMENTAL_DS41_PREFETCH_ATTN=1: see Layer::pf_qa. */
-static bool prefetch_attn_on() {
-    static const bool on = [] {
-        const char* s = std::getenv("RADIANCE_EXPERIMENTAL_DS41_PREFETCH_ATTN");
-        return s && !std::strcmp(s, "1");
-    }();
-    return on;
+/* RADIANCE_EXPERIMENTAL_DS41_PREFETCH_ATTN=1 and its modifiers ..._PREFETCH_MIB, ..._SET and
+ * ..._ENGRAM, as declare() reads them into Model::pfc (ds41_prefetch_plan.h; see Layer::pf). */
+static pf::Cfg pf_env() {
+    return pf::parse(std::getenv("RADIANCE_EXPERIMENTAL_DS41_PREFETCH_ATTN"),
+                     std::getenv("RADIANCE_EXPERIMENTAL_DS41_PREFETCH_MIB"),
+                     std::getenv("RADIANCE_EXPERIMENTAL_DS41_PREFETCH_SET"),
+                     std::getenv("RADIANCE_EXPERIMENTAL_DS41_PREFETCH_ENGRAM"));
 }
 
 /* RAD_ARCH_TRY that names the call that failed: a refused declaration otherwise surfaces only as
@@ -343,6 +344,17 @@ static int read_cfg(Cfg& c, const RadModelMeta* m) {
 }
 
 /* ------------------------------------------------------------------ the model */
+/* One read into the card's on-die cache: `op`, libr4d's `prefetch` of weight `w`'s leading
+ * `bytes` (rad_arch.h decl_prefetch); `kind` a pf::Kind, `cut` when `bytes` is less than `w`
+ * holds (the read that crossed the budget). */
+struct PfRead {
+    rad_op op = 0;
+    rad_weight w = 0;
+    int64_t bytes = 0;
+    int kind = 0;
+    bool cut = false;
+};
+
 struct Layer {
     int l = 0;
     int64_t r = 0;            /* compress ratio, 0 for window only */
@@ -355,10 +367,12 @@ struct Layer {
     std::vector<rad_weight> wo_a;
     rad_weight comp_w = 0, comp_norm = 0, ik_w = 0, ik_norm = 0, iq_w = 0, iproj = 0;
     rad_weight e_mult = 0, e_vsz = 0, e_off = 0, e_kv = 0, e_gate = 0;
-    /* Reads of this layer's q_a, kv, q_b and wo_a into the card's on-die cache, issued by the layer
-     * before it (pf_attn_tail); 0 unless RADIANCE_EXPERIMENTAL_DS41_PREFETCH_ATTN=1. */
-    rad_op pf_qa = 0, pf_kv = 0, pf_qb = 0;
-    std::vector<rad_op> pf_oa;
+    /* Reads of this layer's weights into the card's on-die cache (pf_layer(), ds41_prefetch_plan.h;
+     * empty unless RADIANCE_EXPERIMENTAL_DS41_PREFETCH_ATTN=1), in read order: `pf` issued by the
+     * layer before while it waits for its CPU rows (pf_tail), `pf_post` by an Engram layer itself
+     * behind its Engram GEMM, which would evict anything read before it but its own weight. By
+     * default q_a, kv, q_b and wo_a whole, and nothing for an Engram layer. */
+    std::vector<PfRead> pf, pf_post;
     /* ops, in issue order */
     rad_op e_ids = 0, e_emb = 0, e_copy = 0, e_gemm = 0, e_gather = 0, e_gate_op = 0, e_back = 0;
     /* This Engram layer's row ids [T, heads]: one buffer a layer, since step() writes every
@@ -500,6 +514,16 @@ struct Model {
     bool ista = false;
     bool local_engram = false;
     int n_stage = 0;
+    /* The on-die reads' configuration (pf_env(), read at declare like ..._ENGRAM_SPLIT). */
+    pf::Cfg pfc{};
+    /* The on-die reads (Layer::pf) step() issued live, for the shutdown report (rad_plugin_close):
+     * decode steps that issued any, issue points, reads and their bytes, and of those the reads
+     * behind an Engram GEMM. Only this rank's thread writes them. A pass played back from a
+     * recording (core/runtime/ctx.h) is not counted; a pass the host-expert stager arms never is
+     * one (core/runtime/stager.h). */
+    struct PfStats {
+        uint64_t steps = 0, points = 0, reads = 0, bytes = 0, epoints = 0, ereads = 0, ebytes = 0;
+    } pfs;
 };
 static std::unique_ptr<Model> models[MAX_RANKS];
 /* The model whose name map is being declared (declare() on this thread). */
@@ -650,6 +674,13 @@ static rad_op linear(RadBuilder* b, const Model& m, int64_t rows, rad_weight w, 
     return op(b, "gemm_nt",
               { RAD_RANGE("M", 1, rows), RAD_INT("N", n), RAD_INT("K", k), RAD_STR("dtype", m.g.dtype) },
               { w }, { x }, { y });
+}
+/* The bytes linear() weight `w` [n, k] holds as stored: lw()'s bf16, two a value. 0 for a weight
+ * in llama.cpp's blocks (a GGUF's), which no prefetch reads (pf_layer()). With the FP8 dense
+ * weights (claude/ds41-fp8-dense), a weight gemm_nt_bf16f8 reads holds its n * k code bytes: that
+ * branch's wbytes() is this one with that case. */
+static int64_t wbytes(const Model& m, rad_weight w, int64_t n, int64_t k) {
+    return !w || m.wty.count(w) ? 0 : n * k * 2;
 }
 static rad_op rmsnorm(RadBuilder* b, const Model& m, int64_t rows, rad_weight w, int64_t n,
                       rad_buf x, rad_buf y) {
@@ -1001,6 +1032,77 @@ static void moe_names(Model& m, int l, MoeFP8::Src* s) {
     s->experts_gate = nm.f("blk.%d.ffn_gate_exps.weight", l);
     s->experts_up = nm.f("blk.%d.ffn_up_exps.weight", l);
     s->experts_down = nm.f("blk.%d.ffn_down_exps.weight", l);
+}
+
+/* Layer `L`'s reads into the card's on-die cache (Layer::pf, ds41_prefetch_plan.h), declared once
+ * its MoE block is: each listed kind's weights on this rank in the configured order, at the bytes
+ * their stored form holds, the reads of each issue point cut to the budget. A weight the layer
+ * does not have (no compressor away from a kv source, none of the attention on an attention-zero
+ * rank) is no read, and the next kind goes in its place. An Engram layer is read only with
+ * ..._PREFETCH_ENGRAM=1: its engram_kv by the layer before (pf: its GEMM is the layer's first
+ * read), everything else behind that GEMM (pf_post), which streams 79 MB a card (split over the
+ * ranks; 315 MB whole) and would evict what was read before it. Layer 0's `pf` would have no
+ * layer before it to issue it, so it gets none. */
+static void pf_layer(RadBuilder* b, Model& m, Layer& L) {
+    const pf::Cfg& pc = m.pfc;
+    if (!pc.on) return;
+    /* A GGUF trunk (llama.cpp's blocks), as before: no reads. */
+    if (L.wq_a && m.wty.count(L.wq_a)) return;
+    const bool eng = L.e_gemm != 0;
+    if (eng && !pc.engram) return;
+    const auto& c = m.c;
+    const auto& g = m.g;
+    const int64_t D = c.n_embd, hd = c.head_dim, HD = g.n_head * c.head_dim;
+    const int64_t mix = c.hc * (c.hc + 2);
+    /* [0] issued by the layer before at its MoE tail, [1] behind this layer's Engram GEMM. */
+    std::vector<pf::Cand> ca[2];
+    std::vector<rad_weight> cw[2];
+    const auto put = [&](int k, rad_weight w, int64_t bytes) {
+        if (!w || bytes <= 0) return;
+        const int at = eng && k != pf::kEkv ? 1 : 0;
+        ca[at].push_back({ k, bytes });
+        cw[at].push_back(w);
+    };
+    const LinearFP8& sgu = L.moe.sh_gate_up;
+    const LinearFP8& sdn = L.moe.sh_down;
+    for (const int k : pc.order) {
+        switch (k) {
+        case pf::kEkv:
+            if (eng)
+                put(k, L.e_kv,
+                    wbytes(m, L.e_kv, m.esplit ? m.esplit : (c.hc + 1) * D, c.ple_heads * c.ple_dim));
+            break;
+        case pf::kComp:   /* f32 [2 hd, D] (kv|gate) at a ratio above 1, else lw()'s [hd, D] */
+            put(k, L.comp_w, L.r > 1 ? 2 * hd * D * 4 : wbytes(m, L.comp_w, hd, D));
+            break;
+        case pf::kQa: put(k, L.wq_a, wbytes(m, L.wq_a, c.q_lora, D)); break;
+        case pf::kKv: put(k, L.wkv, wbytes(m, L.wkv, hd, D)); break;
+        case pf::kIw: put(k, L.iproj, wbytes(m, L.iproj, c.ih, D)); break;
+        case pf::kIq: put(k, L.iq_w, wbytes(m, L.iq_w, c.ih * c.idim, c.q_lora)); break;
+        case pf::kQb: put(k, L.wq_b, wbytes(m, L.wq_b, HD, c.q_lora)); break;
+        case pf::kIk: put(k, L.ik_w, wbytes(m, L.ik_w, c.idim, hd)); break;
+        case pf::kOa:
+            for (const rad_weight wa : L.wo_a) put(k, wa, wbytes(m, wa, c.o_rank, HD / m.gr));
+            break;
+        case pf::kMa: put(k, L.hc_a_fn, mix * c.hc * D * 4); break;   /* f32 [mix, hc D] */
+        case pf::kOb: put(k, L.wo_b, wbytes(m, L.wo_b, D, m.gr * c.o_rank)); break;
+        case pf::kRt:   /* GlmRouter's f32 projection under the sigmoid router, else bf16 */
+            put(k, L.moe.w_router, L.moe.c.n_expert_all * D * (L.moe.c.sigmoid_router ? 4 : 2));
+            break;
+        /* This rank's slice of the shared expert, bf16. (With the FP8 dense weights a slice
+         * LinearFP8::bf16_alt reads holds its N * K code bytes, as wbytes() says for linear().) */
+        case pf::kSgu: if (sgu.bf16) put(k, sgu.w, sgu.N * sgu.K * 2); break;
+        case pf::kMf: put(k, L.hc_f_fn, mix * c.hc * D * 4); break;
+        case pf::kSdn: if (sdn.bf16) put(k, sdn.w, sdn.N * sdn.K * 2); break;
+        default: break;
+        }
+    }
+    for (int at = (L.l == 0 ? 1 : 0); at < 2; ++at)
+        for (const pf::Read& r : pf::fit(ca[at], pc.budget)) {
+            const rad_weight w = cw[at][r.cand];
+            if (const rad_op h = decl_prefetch(b, w, r.bytes))
+                (at ? L.pf_post : L.pf).push_back({ h, w, r.bytes, ca[at][r.cand].kind, r.cut });
+        }
 }
 
 /* ------------------------------------------------------------------ one layer */
@@ -1389,12 +1491,6 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
         L.wo_b = lw(b, m, nm.f("blk.%d.attn_output_b.weight", l), D, ok, grp, RAD_SHARD_COL,
                     m.ar * ok, (m.ar + 1) * ok);
         L.o_b = linear(b, m, T, L.wo_b, D, ok, m.oa, m.attn_out);
-        if (prefetch_attn_on() && !m.wty.count(L.wq_a)) {
-            L.pf_qa = decl_prefetch(b, L.wq_a, c.q_lora * D * 2);
-            L.pf_kv = decl_prefetch(b, L.wkv, hd * D * 2);
-            L.pf_qb = decl_prefetch(b, L.wq_b, HD * c.q_lora * 2);
-            for (rad_weight wa : L.wo_a) L.pf_oa.push_back(decl_prefetch(b, wa, c.o_rank * gd * 2));
-        }
     }
     /* The heads' partial outputs (zeros on an attention-zero rank) summed over every rank. */
     if (g.world > 1)
@@ -1441,6 +1537,9 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
     DS_TRY(MoeFP8::probe(b, nm, l, s, &s.cfg));
     DS_TRY(L.moe.declare(b, nm, g, l, m.mw, s, false, false));
     L.post_f = op(b, "mhc_post", hcp, {}, { m.act.x, m.h1, m.post, m.comb }, { m.h0 });
+    /* After the MoE block, whose router and shared expert the reads can reach. The reads name no
+     * buffer, so where they are declared changes no liveness. */
+    pf_layer(b, m, L);
     return RAD_OK;
 }
 
@@ -1873,6 +1972,76 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
     return RAD_OK;
 }
 
+/* The startup line of RADIANCE_EXPERIMENTAL_DS41_PREFETCH_ATTN, one a rank (the shared expert's
+ * slice differs by rank): the list and budget, what the layers read ahead of them (the reads each
+ * layer's predecessor issues, Engram layers apart), the reads by kind (cut: crossed the budget),
+ * and each Engram layer's MiB read ahead of its GEMM + behind it. So an A/B arm's server log
+ * states the plan it ran. */
+static void pf_note(const Model& m, int rank) {
+    const pf::Cfg& pc = m.pfc;
+    if (!pc.on) return;
+    constexpr double MiB = 1048576.0;
+    char t[192];
+    std::string order, kinds, eng;
+    for (const int k : pc.order) order += (order.empty() ? "" : ",") + std::string(pf::name(k));
+    int whole[pf::kKinds] = {}, cut[pf::kKinds] = {};
+    int n = 0, rmin = 0, rmax = 0;
+    int64_t bsum = 0, bmin = 0, bmax = 0;
+    for (const Layer& L : m.layers) {
+        for (const std::vector<PfRead>* v : { &L.pf, &L.pf_post })
+            for (const PfRead& r : *v)
+                if (r.kind >= 0 && r.kind < pf::kKinds) ++(r.cut ? cut : whole)[r.kind];
+        if (L.e_gemm) {
+            int64_t a = 0, p = 0;
+            for (const PfRead& r : L.pf) a += r.bytes;
+            for (const PfRead& r : L.pf_post) p += r.bytes;
+            std::snprintf(t, sizeof t, "%s%d %.1f + %.1f", eng.empty() ? "" : ", ", L.l, a / MiB, p / MiB);
+            eng += t;
+            continue;
+        }
+        if (L.pf.empty()) continue;
+        int64_t s = 0;
+        for (const PfRead& r : L.pf) s += r.bytes;
+        const int cnt = (int)L.pf.size();
+        rmin = n ? std::min(rmin, cnt) : cnt;
+        rmax = n ? std::max(rmax, cnt) : cnt;
+        bmin = n ? std::min(bmin, s) : s;
+        bmax = n ? std::max(bmax, s) : s;
+        bsum += s;
+        ++n;
+    }
+    for (int k = 0; k < pf::kKinds; ++k) {
+        if (!whole[k] && !cut[k]) continue;
+        if (cut[k])
+            std::snprintf(t, sizeof t, "%s%s %d (%d cut)", kinds.empty() ? "" : ", ", pf::name(k),
+                          whole[k] + cut[k], cut[k]);
+        else
+            std::snprintf(t, sizeof t, "%s%s %d", kinds.empty() ? "" : ", ", pf::name(k), whole[k]);
+        kinds += t;
+    }
+    std::string how;
+    if (pc.budget > 0) {
+        std::snprintf(t, sizeof t, "a budget of %.1f MiB an issue point over ", pc.budget / MiB);
+        how = t + order;
+    } else {
+        how = order + (pc.listed ? " whole" : " whole (the default)");
+    }
+    if (!pc.note.empty()) how += "; ignored:" + pc.note;
+    if (!n && eng.empty()) {
+        std::fprintf(stderr, "radiance: deepseek41: rank %d: on-die reads (RADIANCE_EXPERIMENTAL_DS41_"
+                             "PREFETCH_ATTN): %s; none declared (no kernel library serves `prefetch`, "
+                             "or the trunk is llama.cpp's blocks)\n", rank, how.c_str());
+        return;
+    }
+    const std::string engs = pc.engram ? "(MiB ahead of the GEMM + behind it) " + eng
+                                       : std::string("not read (..._PREFETCH_ENGRAM unset)");
+    std::fprintf(stderr, "radiance: deepseek41: rank %d: on-die reads (RADIANCE_EXPERIMENTAL_DS41_"
+                         "PREFETCH_ATTN): %s; %d layers read ahead, %d-%d reads, %.1f MiB a layer "
+                         "(%.1f-%.1f); by kind %s; Engram layers %s\n",
+                 rank, how.c_str(), n, rmin, rmax, n ? bsum / MiB / n : 0.0, bmin / MiB, bmax / MiB,
+                 kinds.c_str(), engs.c_str());
+}
+
 /* ------------------------------------------------------------------ declare */
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
     if (!b || !meta || !ctx || ctx->is_draft || ctx->rank < 0 || ctx->rank >= MAX_RANKS)
@@ -1892,6 +2061,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.ista = is_ista(meta);
     m.local_engram = local_ista_engram(meta);
     m.n_stage = (int)gi(meta, "nextn_predict_layers", 0);
+    m.pfc = pf_env();
     naming = &m;
     DS_TRY(geometry(m, ctx));
     DS_TRY(dsp_config(b, m, meta, ctx));
@@ -2056,6 +2226,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     /* The drafter after everything the trunk step issues (llama_fp8's rule: declaration order is
      * liveness, and its passes run behind the step). */
     if (m.dsp.on) DS_TRY(dsp_declare(b, m, ctx));
+    pf_note(m, ctx->rank);
     rad_note(b, "DeepSeek-V4.1: %lld layers, hc %lld, window %lld, %zu kv sources, %zu index "
                 "sources, %lld experts top-%lld, Engram at %zu layers",
              (long long)c.n_layer, (long long)c.hc, (long long)c.window, c.kv_src.size(),
@@ -2182,25 +2353,43 @@ struct MixBeside {
     const Layer* L;
     const Model* m;
     int64_t T;
-    const Layer* next = nullptr;   /* whose attention weights pf_attn_tail reads; null: none */
+    /* The reads pf_tail issues (the next layer's Layer::pf) and their counters; null: none. */
+    const std::vector<PfRead>* pf = nullptr;
+    Model::PfStats* pfs = nullptr;
 };
-/* The next layer's q_a, kv, q_b and wo_a read into the on-die cache while the card waits for this
- * layer's CPU rows (MoeFP8::Beside::tail), on lane 1 behind a join, as prefetch_beside does
- * (rad_arch.h). They only read, so no value changes. */
-static void pf_attn_tail(RadCtx* x, void* a) {
-    const Layer* nx = ((const MixBeside*)a)->next;
-    if (!nx || !nx->pf_qa) return;
+/* Reads `rd` into the on-die cache, in order, on lane 1 behind a join from lane 0 (so they start
+ * once everything issued so far is done, and lane 0 goes on), or on lane 0 itself where launches
+ * chain, as prefetch_beside does (rad_arch.h). They only read, so no value changes. `engram`: the
+ * reads behind an Engram GEMM (Layer::pf_post), counted apart. */
+static void pf_issue(RadCtx* x, const std::vector<PfRead>& rd, Model::PfStats& st, bool engram) {
+    if (rd.empty()) return;
     const bool l0 = prefetch_lane0();
     if (!l0 && (rad_lane_join(x, 0, 1) != RAD_OK || rad_lane(x, 1) != RAD_OK)) {
         rad_lane(x, 0);
         return;
     }
-    RAD_ISSUE(x, nx->pf_qa, RAD_W(nx->wq_a));
-    if (nx->pf_kv) RAD_ISSUE(x, nx->pf_kv, RAD_W(nx->wkv));
-    if (nx->pf_qb) RAD_ISSUE(x, nx->pf_qb, RAD_W(nx->wq_b));
-    for (size_t j = 0; j < nx->pf_oa.size() && j < nx->wo_a.size(); ++j)
-        if (nx->pf_oa[j]) RAD_ISSUE(x, nx->pf_oa[j], RAD_W(nx->wo_a[j]));
+    uint64_t n = 0, bytes = 0;
+    for (const PfRead& r : rd)
+        if (RAD_ISSUE(x, r.op, RAD_W(r.w)) == RAD_OK) {
+            ++n;
+            bytes += (uint64_t)r.bytes;
+        }
     if (!l0) rad_lane(x, 0);
+    if (!n) return;
+    ++st.points;
+    st.reads += n;
+    st.bytes += bytes;
+    if (engram) {
+        ++st.epoints;
+        st.ereads += n;
+        st.ebytes += bytes;
+    }
+}
+/* The next layer's reads, while the card waits for this layer's CPU rows (MoeFP8::Beside::tail,
+ * called once the block's card work before the gather is issued). */
+static void pf_tail(RadCtx* x, void* a) {
+    const MixBeside& p = *(const MixBeside*)a;
+    if (p.pf && p.pfs) pf_issue(x, *p.pf, *p.pfs, false);
 }
 
 static void mix_f_beside(RadCtx* x, void* a) {
@@ -2284,6 +2473,10 @@ static void step(RadCtx* x, const RadBatch* batch) {
                         RAD_NONE);
     }
 
+    /* The on-die reads (Layer::pf), at decode heights only: prompt steps keep their reads to
+     * themselves (rad_arch.h, kPrefetchRows). */
+    const bool pf_live = batch->phase == RAD_PHASE_DECODE && T <= kPrefetchRows;
+    const uint64_t pf_reads0 = m.pfs.reads;
     for (auto& L : m.layers) {
         const int l = L.l;
         const int64_t r = L.r;
@@ -2308,11 +2501,16 @@ static void step(RadCtx* x, const RadBatch* batch) {
             else
                 RAD_ISSUE_N(x, L.e_emb, T * H, brows(L.ids, T), RAD_W(eplain), brows(m.emb, T));
             RAD_ISSUE_N(x, L.e_copy, T, brows(m.emb, T), brows(m.embd, T));
+            /* This layer's own reads go right behind its Engram GEMM, which would have evicted
+             * them (..._PREFETCH_ENGRAM=1): beside the all_gather of the split rows, the gate and
+             * the attention connection, until the attention's GEMVs reach them. */
             if (L.e_gather) {
                 RAD_ISSUE_N(x, L.e_gemm, T, brows(m.embd, T), RAD_W(L.e_kv), brows(m.ekv_part, T));
+                if (pf_live) pf_issue(x, L.pf_post, m.pfs, true);
                 RAD_ISSUE_N(x, L.e_gather, T * m.esplit, brows(m.ekv_part, T), brows(m.ekv, T));
             } else {
                 RAD_ISSUE_N(x, L.e_gemm, T, brows(m.embd, T), RAD_W(L.e_kv), brows(m.ekv, T));
+                if (pf_live) pf_issue(x, L.pf_post, m.pfs, true);
             }
             RAD_ISSUE_N(x, L.e_gate_op, T, brows(m.h0, T), bcol(m.ekv, 0, c.hc * D, T),
                         bcol(m.ekv, c.hc * D, D, T), RAD_W(L.e_gate), brows(m.h1, T));
@@ -2585,15 +2783,18 @@ static void step(RadCtx* x, const RadBatch* batch) {
         };
         col_f();
         MixBeside mb{ &L, &m, T };
-        /* Decode passes only (prompt steps keep their reads to themselves, rad_arch.h), and not
-         * ahead of an Engram layer, whose 79 MB GEMM would evict the reads before attention. */
+        /* The next layer's reads (decode passes only). Ahead of an Engram layer that is at most
+         * its engram_kv, since its 79 MB GEMM would evict anything else before the attention
+         * (pf_layer()); by default nothing. */
         const Layer* nl = L.l + 1 < c.n_layer ? &m.layers[(size_t)L.l + 1] : nullptr;
-        if (nl && nl->pf_qa && !nl->e_gemm && batch->phase == RAD_PHASE_DECODE && T <= kPrefetchRows)
-            mb.next = nl;
+        if (nl && pf_live && !nl->pf.empty()) {
+            mb.pf = &nl->pf;
+            mb.pfs = &m.pfs;
+        }
         MoeFP8::Beside bs;
         bs.fn = mix_f_beside;
         bs.arg = &mb;
-        bs.tail = pf_attn_tail;
+        bs.tail = pf_tail;
         L.moe.step(x, batch, bs);
         /* post_f, or post_f with the next collapse + norm (the next layer's pcn_a, or pcn_fin). */
         const Layer* nx = L.l + 1 < c.n_layer ? &m.layers[(size_t)L.l + 1] : nullptr;
@@ -2609,6 +2810,7 @@ static void step(RadCtx* x, const RadBatch* batch) {
             RAD_ISSUE_N(x, L.post_f, T, brows(m.act.x, T), brows(m.h1, T), brows(m.post, T),
                         brows(m.comb, T), brows(m.h0, T));
     }
+    if (m.pfs.reads != pf_reads0) ++m.pfs.steps;
     if (m.pcn_fin) {
     } else if (m.cn_fin) {
         RAD_ISSUE_N(x, m.cn_fin, T, brows(m.h0, T), brows(m.pre_f, T), brows(m.xcol, T),
@@ -2635,6 +2837,28 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
     }
     return RAD_OK;
 }
+
+/* RADIANCE_EXPERIMENTAL_DS41_PREFETCH_ATTN's shutdown report, a line a rank (Model::PfStats),
+ * from rad_plugin_close: the loader calls it once at shutdown, after the engine's own report and
+ * once the rank threads are gone. */
+static void pf_report() {
+    constexpr double MiB = 1048576.0;
+    for (int r = 0; r < MAX_RANKS; ++r) {
+        const Model* m = models[r].get();
+        if (!m || !m->pfc.on) continue;
+        const Model::PfStats& s = m->pfs;
+        const uint64_t tails = s.points - s.epoints, treads = s.reads - s.ereads;
+        std::fprintf(stderr, "radiance: deepseek41: rank %d: on-die reads issued live in %llu decode "
+                             "steps: %llu reads at %llu layer tails, %.2f GiB (%.1f MiB a step, %.1f "
+                             "a tail); behind the Engram GEMMs %llu reads at %llu layers, %.2f GiB\n",
+                     r, (unsigned long long)s.steps, (unsigned long long)treads,
+                     (unsigned long long)tails, (double)(s.bytes - s.ebytes) / (1024.0 * MiB),
+                     s.steps ? (double)s.bytes / MiB / (double)s.steps : 0.0,
+                     tails ? (double)(s.bytes - s.ebytes) / MiB / (double)tails : 0.0,
+                     (unsigned long long)s.ereads, (unsigned long long)s.epoints,
+                     (double)s.ebytes / (1024.0 * MiB));
+    }
+}
 }  // namespace deepseek41
 
 #ifndef RAD_ARCH_NO_EXPORTS
@@ -2642,4 +2866,6 @@ RAD_ARCH_PROBE(deepseek41)
 RAD_ARCH_PLUGIN(deepseek41, "deepseek41", "", "0.1.0",
                 "DeepSeek-V4.1: hyper-connection streams, window + sparse compressed latent "
                 "attention, sqrt(softplus) MoE, Engram")
+/* Called once at shutdown (abi/rad_abi.h): the on-die reads' counters. */
+extern "C" void rad_plugin_close(void) { deepseek41::pf_report(); }
 #endif

@@ -6,7 +6,7 @@ host-expert path: the CPU computes every routed expert the cards do not hold, bi
 card's MXFP4 GEMV, so every reply stays byte-identical to the base engine's.
 
 On the loop's eight held-out prompts (64 tokens, greedy, TP4) the path takes decode from 5.03 to
-about 14.4 tok/s and the time to first token summed over the prompts from 64.0 to about 17.6 s. Every
+about 15.5 tok/s and the time to first token summed over the prompts from 64.0 to about 16.7 s. Every
 step was measured as an A/B window; the log is `/home/as/ds41-decode-review-20261028/NIGHT-LOG.md`.
 
 ## What runs where
@@ -39,6 +39,8 @@ RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS=1             # VRAM file buffers t
 RADIANCE_EXPERIMENTAL_DS41_CACHE_WARM=1                    # fill the cache from the profile
 RADIANCE_EXPERIMENTAL_DS41_ENGRAM_SPLIT=1                  # engram_kv's rows split over the ranks
 RADIANCE_EXPERIMENTAL_DS41_PREFETCH_ATTN=1                 # next layer's attention weights into the on-die cache
+RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE=1                  # the RAM cache in a CPU-only packed form (x1.044 slots)
+RADIANCE_EXPERIMENTAL_DS41_CACHE_SECOND_CHANCE=2           # profile-hot cached units get two second chances
 
 radiance ... --tp 4 --placement expert_tiered --weights-disk-tier \
   --expert-ram-cache-total-mib 98304 --host-pool-mib 256 --embedding-placement ram \
@@ -74,6 +76,7 @@ the engine or the scripts assumes where the checkpoint is. `ab_window.sh` takes 
 | `..._ENGRAM_SPLIT=1` | +3.5%, TTFT −2.6% | in the deepseek41 plugin (build it from this branch; the dev tree's has no switch): each rank holds and computes 6,400 of engram_kv's 25,600 rows and an all_gather rebuilds the row; the replicated 315 MB GEMV (1.4 ms a token on every card) becomes a quarter, and the ~450 MiB a card it frees holds 25 more experts a rank |
 | `..._PREFETCH_ATTN=1` | +2.8% | in the deepseek41 plugin: while the card waits for a layer's CPU rows, lane 1 reads the next layer's q_a, kv, q_b and wo_a (~56 MB a card) into the 64 MB on-die cache (libr4d `prefetch`, read-only); decode passes only, and not ahead of an Engram layer |
 | `..._CACHE_SECOND_CHANCE=N` | N=1 +3.9%, N=2 +5.1% (TTFT −1.5% / +1.2%) | a cached unit the decode profile calls hot (`..._CACHE_PROTECT_SHARE`, default 6 of the sealed profile's 4326 selections a layer: ~1150 units a rank) moves to the front up to N times between uses before an insert may evict it. The held-out prompts share task families with the profile; replayed on the 16 chat prompts too, critical decode misses fell 7.9% (N=1) |
+| `..._PACKED_CACHE=1` | +3.2% alone, TTFT −5.5%; with `..._CACHE_SECOND_CHANCE=2` 15.52 / 15.48 tok/s (+8.2%) | the RAM cache holds each expert's codes plane plus its e8m0 scales packed to 2 bits from one base a weight (raw rounds beside, budget 512 / 320, `..._PACKED_CACHE_RAW`): x1.0444 slots and 4.4% fewer bytes a CPU hit; 7 of 15,360 experts never fit and stay misses. Refused unless the CPU takes every routed unit (all, M16, B1); the card's copy path never reads or fills it |
 | `RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE=1` | not yet measured on the engine | the RAM cache in a CPU-only packed form: x1.044 the pairs, kernel −8.5% a cached expert (below); refused unless the CPU takes every routed unit (all, M16, B1); arm part `K` |
 
 ## The packed RAM cache

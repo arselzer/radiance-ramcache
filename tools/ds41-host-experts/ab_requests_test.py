@@ -206,6 +206,17 @@ class Harness(unittest.TestCase):
         for p in (self.same, self.other):
             shutil.copy(p, out)
         ab_requests.kl_dir(out)   # prints both against the one reference; must not raise
+        # moved with its reference (the window's relative path no longer resolves): found beside
+        moved = os.path.join(self.dir, "moved")
+        os.makedirs(moved, exist_ok=True)
+        for p in (self.same, self.ref):
+            shutil.copy(p, moved)
+        with open(os.path.join(moved, os.path.basename(self.same))) as f:
+            js = json.load(f)
+        js["forced_along"] = "build/ab-nowhere/" + os.path.basename(self.ref)
+        with open(os.path.join(moved, os.path.basename(self.same)), "w") as f:
+            json.dump(js, f)
+        ab_requests.kl_dir(moved)
 
 
 if __name__ == "__main__":

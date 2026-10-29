@@ -354,12 +354,16 @@ def kl_compare(ref_path, forced_paths):
 
 
 def kl_dir(d):
-    """Every forced file in d, grouped by the reference each was forced along."""
+    """Every forced file in d, grouped by the reference each was forced along (a path as the window
+    wrote it, relative to the tools directory; else the reference beside the forced file)."""
     by_ref = {}
     for fp in sorted(glob.glob(os.path.join(d, "*.lpforce.json"))):
         try:
             with open(fp) as f:
-                by_ref.setdefault(json.load(f)["forced_along"], []).append(fp)
+                ref = json.load(f)["forced_along"]
+            if not os.path.exists(ref):
+                ref = os.path.join(d, os.path.basename(ref))
+            by_ref.setdefault(ref, []).append(fp)
         except (OSError, ValueError, KeyError) as e:
             print("%s: %r" % (fp, e))
     for ref, fps in by_ref.items():

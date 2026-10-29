@@ -14,7 +14,8 @@ the gates of RESEARCH-3-LOSSY.md ("Recommended order" 2) for decode tokens:
     kill below 20% (`assignable`: each held near-tie replaces one miss of its layer);
   - the misses' slots (the researcher's protect-top-2 gate: 60% or more at slot 2 or below);
   - all of it per prompt family and per layer, plus a replay estimate of decode tok/s under
-    drop-all, drop below tau and a drop cap of 6 a token, from the assessment's time model
+    drop-all, drop below tau, a drop cap of 6 a token and the researcher's protect-top-k arms
+    (drop only misses at slot 2 or below / 4 or below), from the assessment's time model
     T = a + b x waited misses + c x CPU hits a token (both summed over the ranks): (24.7, 2.54,
     0.133) and the constrained fit (31, 2.28, 0.108), each also with `a` refitted so the model
     meets the arm's measured decode time; a dropped miss is still read and inserted in the
@@ -355,7 +356,7 @@ def gates(d, tau=0.1, delta=0.05):
                 if not t["post_stop"]:
                     fam.add(sh, p["slot"], assignable, anysub)
                     lays.setdefault(layer, Tally()).add(sh, p["slot"], assignable, anysub)
-                    misses.append((layer, sh))
+                    misses.append((layer, sh, p["slot"]))
         if not t["post_stop"]:
             per_token.append(dict(req=t["req"], name=t["name"], misses=misses, hits=hits, ms=t["ms"]))
     return dict(all=allt, families=fams, layers=lays, post=post, status=status, per_token=per_token,
@@ -411,9 +412,11 @@ def replay(g, d, cap=6, tau=0.1, insert_ms=0.15):
             elif policy == "drop-all":
                 drop = w
             elif policy == "drop<tau":
-                drop = sum(1 for _l, sh in t["misses"] if sh < tau)
+                drop = sum(1 for _l, sh, _s in t["misses"] if sh < tau)
             elif policy == "cap":   # online: every miss in layer order until `cap` were dropped
                 drop = min(w, cap)
+            elif policy.startswith("slot>="):   # the researcher's protect-top-k arms
+                drop = sum(1 for _l, _sh, sl in t["misses"] if sl >= int(policy[6:]))
             out.append((w - drop, t["hits"], drop))
         return out
     measured = None
@@ -422,7 +425,7 @@ def replay(g, d, cap=6, tau=0.1, insert_ms=0.15):
     if ms and n:
         measured = ms / n
     res = {"measured_ms": measured, "tokens": len(toks)}
-    policies = ["exact", "drop-all", "drop<tau", "cap"]
+    policies = ["exact", "drop-all", "drop<tau", "cap", "slot>=2", "slot>=4"]
     models = dict(MODELS)
     fit = fit_tokens(toks)
     if fit:
@@ -475,7 +478,7 @@ def report(prefix, arm_json=None, tau=0.1, delta=0.05, cap=6, insert_ms=0.15, ou
                                          pct(shares, .5), pct(shares, .75), pct(shares, .9)))
     pt = g["per_token"]
     if pt:
-        mass = [sum(sh for _l, sh in t["misses"]) for t in pt]
+        mass = [sum(sh for _l, sh, _s in t["misses"]) for t in pt]
         nm = [len(t["misses"]) for t in pt]
         print("  a token: %.2f misses (max %d; %.1f%% of tokens with 20 or more); drop-all removes %.3f "
               "of routing weight a token (its misses' shares summed over its layers)" % (
@@ -512,19 +515,21 @@ def report(prefix, arm_json=None, tau=0.1, delta=0.05, cap=6, insert_ms=0.15, ou
     for i in range(0, len(line), 5):
         print("    " + "  ".join(line[i:i + 5]))
     if rp:
-        print("  replay (decode ms a token -> tok/s; drops a token), %d tokens%s, insert %.2f ms a drop:" % (
-            rp["tokens"], ", measured %.1f ms (%.2f tok/s)" % (rp["measured_ms"], 1000 / rp["measured_ms"])
-            if rp["measured_ms"] else "", insert_ms))
+        print("  replay: decode tok/s (ms a token) under each drop policy, %d tokens%s, %.2f ms of "
+              "background insert a drop:" % (rp["tokens"], ", measured %.1f ms (%.2f tok/s)" % (
+                  rp["measured_ms"], 1000 / rp["measured_ms"]) if rp["measured_ms"] else "", insert_ms))
         if rp.get("trace_fit"):
             f = rp["trace_fit"]
             print("    the trace's own token times (%d tokens, mean %.1f ms): T = %.1f + %.3f x misses + "
                   "%.4f x CPU hits ms, R^2 %.3f (misses up to %d a token: drop-all extrapolates)" % (
                       f["n"], f["mean_ms"], f["a"], f["b"], f["c"], f["r2"], f["max_misses"]))
-        for k, v in rp.items():
-            if not isinstance(v, dict) or k == "trace_fit":
-                continue
-            print("    %-28s " % k + "  ".join("%s %.1f -> %.2f (%.1f)" % (
-                p, x["ms"], x["tok_s"], x["drops"]) for p, x in v.items()))
+        rows = [(k, v) for k, v in rp.items() if isinstance(v, dict) and k != "trace_fit"]
+        if rows:
+            pols = list(rows[0][1])
+            print("    %-30s" % "model" + "".join("%15s" % (p_ if p_ != "cap" else "cap %d" % cap) for p_ in pols))
+            for k, v in rows:
+                print("    %-30s" % k + "".join("%15s" % ("%.2f (%.1f)" % (v[p_]["tok_s"], v[p_]["ms"])) for p_ in pols))
+            print("    %-30s" % "drops a token" + "".join("%15.2f" % rows[0][1][p_]["drops"] for p_ in pols))
     if out_json:
         js = dict(prefix=prefix, tokens=len(toks), problems=d["problems"][:100],
                   status=g["status"], all=a,

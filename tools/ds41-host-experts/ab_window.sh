@@ -192,12 +192,12 @@ arm() {   # name, then env assignments for the server; CACHE_MIB the RAM cache (
   # them). The window's first Lq arm of a prompt set records the reference (free-running, logprobs)
   # unless LQ_REF names one; every Lq arm then decodes teacher-forced along it (ab_requests.py).
   if [[ -n "${ARM_LQ:-}" ]]; then
-    local set lpref
-    set=$(basename "${ARM_PROMPTS:-$PROMPTS}" .json)
-    lpref=${LQ_REF:-$OUT/lpref-$set.json}
+    local pset lpref
+    pset=$(basename "${ARM_PROMPTS:-$PROMPTS}" .json)
+    lpref=${LQ_REF:-$OUT/lpref-$pset.json}
     if [[ ! -f "$lpref" ]]; then
       python3 -I "$HERE/ab_requests.py" --lp "${ARM_PROMPTS:-$PROMPTS}" "http://127.0.0.1:$PORT" "$n" "$lpref" >>"$OUT/window.log" 2>&1
-      log "arm $name: the logprob reference for $set ($lpref): exit $?"
+      log "arm $name: the logprob reference for $pset ($lpref): exit $?"
     fi
     python3 -I "$HERE/ab_requests.py" --force "$lpref" "http://127.0.0.1:$PORT" "$OUT/$name.lpforce.json" >>"$OUT/window.log" 2>&1
     log "arm $name: teacher-forced along $lpref: exit $?"

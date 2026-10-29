@@ -99,13 +99,16 @@ class SynthTrace(unittest.TestCase):
         self.assertEqual(len(cal), 1)
         self.assertAlmostEqual(rp[cal[0]]["exact"]["ms"], 60.0)
         self.assertAlmostEqual(rp[cal[0]]["drop-all"]["ms"], 60.0 - 2 * b + 0.3)
+        # protect-top-k: slot >= 2 and slot >= 4 drop layer 3's slot-5 miss, not layer 17's slot 1
+        self.assertAlmostEqual(fit["slot>=2"]["ms"], a + b + c * h + 0.15)
+        self.assertAlmostEqual(fit["slot>=4"]["drops"], 1.0)
         # a cap of 1 drops the first miss in layer order (layer 3's), not the lighter one
         rp1 = rtrace.replay(self.g, self.d, cap=1, tau=0.1, insert_ms=0.0)
         self.assertAlmostEqual(rp1["fit"]["cap"]["ms"], a + b + c * h)
 
     def test_the_fit_on_token_times(self):
         # T = 20 + 2.5 x misses + 0.1 x hits, exactly: the fit gives it back with R^2 1.
-        toks = [dict(misses=[(0, 0.1)] * w, hits=h, ms=20 + 2.5 * w + 0.1 * h)
+        toks = [dict(misses=[(0, 0.1, 3)] * w, hits=h, ms=20 + 2.5 * w + 0.1 * h)
                 for w in range(0, 12) for h in (80, 95, 110)]
         f = rtrace.fit_tokens(toks)
         self.assertAlmostEqual(f["a"], 20.0, places=6)

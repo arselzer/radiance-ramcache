@@ -12,7 +12,10 @@
  *     GEMM;
  *   - a decode step issues each layer's reads on lane 1 behind a join, after the shared expert's
  *     down and before the gather (or on lane 0 where launches chain), an Engram layer's between
- *     its GEMM and the all_gather; a prompt step issues none.
+ *     its GEMM and the all_gather; a prompt step issues none;
+ *   - with ..._ROUTER_BF16 the router and the ratio-2 compressors' kv|gate go through
+ *     gemm_nt_f32bf16 at their planes' dtypes, are counted on rank 0's startup line, and are read
+ *     at their bf16 bytes; refused where no library declares the op.
  * The pure plan (parse, fit) is ds41_prefetch_plan_test's. */
 #define RAD_ARCH_NO_EXPORTS 1
 
@@ -21,6 +24,7 @@
 #include "../arch/deepseek41/deepseek41.cpp"
 
 #include <cstdlib>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -34,7 +38,8 @@ const char* const kVars[] = { "RADIANCE_EXPERIMENTAL_DS41_PREFETCH_ATTN",
                               "RADIANCE_EXPERIMENTAL_DS41_PREFETCH_SET",
                               "RADIANCE_EXPERIMENTAL_DS41_PREFETCH_ENGRAM",
                               "RADIANCE_EXPERIMENTAL_DS41_ENGRAM_SPLIT",
-                              "RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8" };
+                              "RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8",
+                              "RADIANCE_EXPERIMENTAL_DS41_ROUTER_BF16" };
 /* The variables a case sets, every other one unset, for the case's declares. */
 struct Env {
     Env(std::initializer_list<std::pair<const char*, const char*>> kv) {
@@ -116,8 +121,10 @@ struct Decl {
 /* deepseek41's declare for `rank` of four, decode-sized (16 rows a step), under the current
  * environment; its stderr (the plan line) kept in `err`. `fp8`: the checkpoint states its dense
  * linears are E4M3 with an E8M0 scale a 32x32 block and stores them as plain bf16, as the release's
- * container does, so ..._DENSE_FP8=1 takes them (dense_f8_gate, lw8). */
-std::unique_ptr<Decl> declare(int rank, bool fp8 = false) {
+ * container does, so ..._DENSE_FP8=1 takes them (dense_f8_gate, lw8). `setup`: anything else the
+ * builder should say (more plane encodings, ops no library declares), before the declare. */
+std::unique_ptr<Decl> declare(int rank, bool fp8 = false,
+                              const std::function<void(RadBuilder&)>& setup = {}) {
     auto d = std::make_unique<Decl>();
     d->b.kv_block_of = block_of;
     MetaKV meta = flash_meta();
@@ -131,6 +138,7 @@ std::unique_ptr<Decl> declare(int rank, bool fp8 = false) {
                                "ffn_down_shexp.weight" })
             d->b.encs.push_back({ n, plain });
     }
+    if (setup) setup(d->b);
     RadBuildCtx ctx = build_ctx(rank, kWorld);
     ctx.max_tok = 16;
     d->err = stderr_of([&] { d->rc = deepseek41::declare(&d->b, meta.meta(), &ctx); });
@@ -508,6 +516,139 @@ TEST(ds41_prefetch_reads_stay_on_lane0_where_launches_chain) {
         CHECK_EQ(c.issues[i].lane, 0);
         for (const auto& j : c.joins) CHECK(j.at != i);
     }
+}
+
+/* RADIANCE_EXPERIMENTAL_DS41_ROUTER_BF16=1 over the planes the release's container holds: every
+ * router f32 (its low halves zero, which gemm_nt_f32bf16's layout keeps as the bf16 halves) and the
+ * ratio-2 compressors' kv|gate bf16 (read as they are). */
+namespace {
+void release_planes(RadBuilder& b) {
+    b.encs.push_back({ "glm_router.weight", rad_enc_plain(RAD_F32) });
+    b.encs.push_back({ "attn_compressor_kvg.weight", rad_enc_plain(RAD_BF16) });
+}
+uint32_t decl_dtype(const RadBuilder& b, const std::string& name) {
+    for (const auto& w : b.weights)
+        if (w.name == name) return w.d.dtype;
+    return RAD_DT_INVALID;
+}
+}  // namespace
+
+/* Off, the routers (op and split part, 40 layers) and the three ratio-2 compressors are 83
+ * gemm_nt_f32 over f32, read ahead at four bytes an element. On, the same 83 go through
+ * gemm_nt_f32bf16 -- the router still declared f32, the compressor bf16 -- rank 0 counts them
+ * (150 + 30 MiB), and the reads take their bf16 bytes. A decode step issues the bf16 form only. */
+TEST(ds41_router_bf16_declares_counts_and_reads_half) {
+    {
+        Env env({ { "RADIANCE_EXPERIMENTAL_DS41_PREFETCH_ATTN", "1" },
+                  { "RADIANCE_EXPERIMENTAL_DS41_PREFETCH_SET", "comp,rt" } });
+        auto d = declare(0, false, release_planes);
+        REQUIRE_EQ(d->rc, (int)RAD_OK);
+        CHECK_EQ(count_op(d->b, "gemm_nt_f32"), 83);
+        CHECK_EQ(count_op(d->b, "gemm_nt_f32bf16"), 0);
+        CHECK_EQ(decl_dtype(d->b, "blk.3.glm_router.weight"), (uint32_t)RAD_F32);
+        CHECK_EQ(decl_dtype(d->b, "blk.2.attn_compressor_kvg.weight"), (uint32_t)RAD_F32);
+        const auto& L = d->m->layers;
+        for (const auto& x : L) CHECK(!x.rt_bf16 && !x.comp_bf16);
+        REQUIRE(reads_are(L[2].pf, pf_kinds{ pk::kComp, pk::kRt }));
+        CHECK_EQ(L[2].pf[0].bytes, (int64_t)1024 * 5120 * 4);
+        CHECK_EQ(L[2].pf[1].bytes, (int64_t)384 * 5120 * 4);
+        CHECK(d->err.find("ROUTER_BF16") == std::string::npos);
+    }
+    Env env({ { "RADIANCE_EXPERIMENTAL_DS41_PREFETCH_ATTN", "1" },
+              { "RADIANCE_EXPERIMENTAL_DS41_PREFETCH_SET", "comp,rt" },
+              { "RADIANCE_EXPERIMENTAL_DS41_ROUTER_BF16", "1" } });
+    for (int rank = 0; rank < kWorld; ++rank) {
+        auto d = declare(rank, false, release_planes);
+        REQUIRE_EQ(d->rc, (int)RAD_OK);
+        CHECK_EQ(count_op(d->b, "gemm_nt_f32bf16"), 83);
+        CHECK_EQ(count_op(d->b, "gemm_nt_f32"), 0);
+        CHECK_EQ(decl_dtype(d->b, "blk.3.glm_router.weight"), (uint32_t)RAD_F32);
+        CHECK_EQ(decl_dtype(d->b, "blk.2.attn_compressor_kvg.weight"), (uint32_t)RAD_BF16);
+        const auto& L = d->m->layers;
+        REQUIRE_EQ(L.size(), (size_t)40);
+        for (const auto& x : L) {
+            CHECK(x.rt_bf16);
+            CHECK_EQ(x.comp_bf16, x.l == 2 || x.l == 8 || x.l == 14);
+        }
+        /* Layer 2: the kv|gate [1024, 5120] and the router [384, 5120] at two bytes; layer 20's
+         * ratio-1 compressor is lw()'s bf16 [512, 5120] either way; layer 3 has the router only. */
+        REQUIRE(reads_are(L[2].pf, pf_kinds{ pk::kComp, pk::kRt }));
+        CHECK_EQ(L[2].pf[0].bytes, (int64_t)1024 * 5120 * 2);
+        CHECK_EQ(L[2].pf[1].bytes, (int64_t)384 * 5120 * 2);
+        REQUIRE(reads_are(L[20].pf, pf_kinds{ pk::kComp, pk::kRt }));
+        CHECK_EQ(L[20].pf[0].bytes, (int64_t)512 * 5120 * 2);
+        REQUIRE(reads_are(L[3].pf, pf_kinds{ pk::kRt }));
+        CHECK_EQ(L[3].pf[0].bytes, (int64_t)384 * 5120 * 2);
+        CHECK_EQ(wname(d->b, L[3].pf[0].w), std::string("blk.3.glm_router.weight"));
+        for (const auto& x : L) CHECK(reads_declared(d->b, x.pf));
+        CHECK_EQ(d->m->n_router_bf16, 40);
+        CHECK_EQ(d->m->n_comp_bf16, 3);
+        const std::string want = "RADIANCE_EXPERIMENTAL_DS41_ROUTER_BF16: 40 routers and 3 "
+                                 "compressor kv|gate projections read as bf16 (gemm_nt_f32bf16), "
+                                 "180.0 MiB less a card";
+        const bool line = d->err.find(want) != std::string::npos;
+        CHECK_EQ(line, rank == 0);
+        if (rank) continue;
+        auto k = kit(d->b, { 1 }, {});
+        auto run = run_passes(d->b, deepseek41::step, { k.get() }, 0, kWorld);
+        REQUIRE(steps_ok(run));
+        const std::vector<std::string> ops = issued_ops(d->b, *run[0]);
+        CHECK(count_issued(ops, "gemm_nt_f32bf16") >= 40);
+        CHECK_EQ(count_issued(ops, "gemm_nt_f32"), 0);
+    }
+}
+
+/* With the dense linears as E4M3 codes and a 56 MiB budget, the halved compressor and router let
+ * layer 2 read wo_b whole and its router (55.5 MiB; f32 they cut wo_b), and layer 3 read its whole
+ * list in 3.75 MiB less. */
+TEST(ds41_router_bf16_with_fp8_codes_reaches_further) {
+    Env env({ { "RADIANCE_EXPERIMENTAL_DS41_PREFETCH_ATTN", "1" },
+              { "RADIANCE_EXPERIMENTAL_DS41_PREFETCH_MIB", "56" },
+              { "RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8", "1" },
+              { "RADIANCE_EXPERIMENTAL_DS41_ROUTER_BF16", "1" } });
+    for (int rank = 0; rank < kWorld; ++rank) {
+        auto d = declare(rank, true, release_planes);
+        REQUIRE_EQ(d->rc, (int)RAD_OK);
+        REQUIRE(d->m->f8_on);
+        const auto& L = d->m->layers;
+        const int64_t w = rank == 0 ? 768 : 512;
+        REQUIRE(reads_are(L[2].pf, pf_kinds{ pk::kComp, pk::kQa, pk::kKv, pk::kIq, pk::kQb, pk::kOa,
+                                             pk::kOa, pk::kOb, pk::kRt }));
+        for (const auto& x : L[2].pf) CHECK(!x.cut);
+        CHECK_EQ(L[2].pf[0].bytes, (int64_t)1024 * 5120 * 2);
+        CHECK_EQ(L[2].pf[8].bytes, (int64_t)384 * 5120 * 2);
+        CHECK_EQ(total(L[2].pf), 111 * MiB / 2);
+        REQUIRE(reads_are(L[3].pf, pf_kinds{ pk::kQa, pk::kKv, pk::kQb, pk::kOa, pk::kOa, pk::kOb,
+                                             pk::kRt, pk::kSgu, pk::kSdn }));
+        CHECK_EQ(total(L[3].pf), 147 * MiB / 4 + 15 * MiB / 4 + 3 * w * 5120);
+        for (const auto& x : L) CHECK(reads_declared(d->b, x.pf));
+    }
+}
+
+/* A plane whose encoding the builder does not know is still read through the op, but not counted
+ * and read ahead at four bytes; no library declaring the op refuses the declare rather than serve
+ * the routers as f32. */
+TEST(ds41_router_bf16_unknown_planes_and_refusal) {
+    {
+        Env env({ { "RADIANCE_EXPERIMENTAL_DS41_PREFETCH_ATTN", "1" },
+                  { "RADIANCE_EXPERIMENTAL_DS41_PREFETCH_SET", "rt" },
+                  { "RADIANCE_EXPERIMENTAL_DS41_ROUTER_BF16", "1" } });
+        auto d = declare(0);
+        REQUIRE_EQ(d->rc, (int)RAD_OK);
+        CHECK_EQ(count_op(d->b, "gemm_nt_f32bf16"), 83);
+        CHECK(!d->m->layers[3].rt_bf16);
+        REQUIRE(reads_are(d->m->layers[3].pf, pf_kinds{ pk::kRt }));
+        CHECK_EQ(d->m->layers[3].pf[0].bytes, (int64_t)384 * 5120 * 4);
+        CHECK(d->err.find("ROUTER_BF16: 0 routers and 0 compressor") != std::string::npos);
+    }
+    Env env({ { "RADIANCE_EXPERIMENTAL_DS41_ROUTER_BF16", "1" } });
+    auto d = declare(0, false, [](RadBuilder& b) {
+        release_planes(b);
+        b.undeclared.insert("gemm_nt_f32bf16");
+    });
+    CHECK_EQ(d->rc, (int)RAD_E_UNSUPPORTED);
+    CHECK(d->err.find("ROUTER_BF16=1 needs gemm_nt_f32bf16") != std::string::npos);
+    CHECK_EQ(count_op(d->b, "gemm_nt_f32bf16"), 0);
 }
 
 RAD_TEST_MAIN()

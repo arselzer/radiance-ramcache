@@ -18,12 +18,13 @@
 #
 # Arms are named POLICY[-tN][-gG][-sS][-nP][-mM][-MR][-PsK|-PoK|-PpK][-f][-x] (see the loop below), e.g. "base greedy-t20-g65 all-t24".
 # An arm with an unknown part is skipped, not run without it; F8 (the FP8-stored dense weights) and
-# Rb (the routers read as bf16) are also checked in the server log.
+# Rb (the routers read as bf16) are also checked in the server log, and so is a predictor part's
+# router predictor. An Rb arm runs only after SELFTEST_F32BF16's card checks passed in the window.
 #
 # Environment: RADIANCE_BIN (the binary), RADIANCE_HOME_DIR (kernels/ and architectures/ for it),
 # SILU_TABLE (the card's silu table), ARMS (default "base verify greedy"), HX_THREADS (16),
 # VERIFY_REQUESTS (3), DEVICE_CHECKS (1), SELFTEST_F32BF16 (an r4d_selftest: gemm_nt_f32bf16's
-# checks and timings on card 0 before the arms; unset, none).
+# checks and timings on card 0 before the arms; unset, none, and no Rb arm runs).
 set -u
 OUT=${1:?output directory}
 BIN=${RADIANCE_BIN:?path to the radiance binary}
@@ -183,7 +184,7 @@ arm() {   # name, then env assignments for the server; CACHE_MIB the RAM cache (
   # take the knob, or a plain arm that took it from the window's environment, is not measured.
   local rb_lines; rb_lines=$(grep -cE 'ROUTER_BF16: [1-9][0-9]* routers' "$OUT/$name.server.log")
   if [[ -n "${ARM_RB:-}" && "$rb_lines" == 0 ]]; then
-    log "arm $name: Rb, but the server log has no 'ROUTER_BF16: N routers' line (a plugin without the knob?); not measured"
+    log "arm $name: Rb, but the server log has no 'ROUTER_BF16: N routers' line with N above 0 (a plugin without the knob, or no router held as bf16?); not measured"
     stop_server; return 1
   fi
   if [[ -z "${ARM_RB:-}" && "$rb_lines" != 0 ]]; then
@@ -191,6 +192,14 @@ arm() {   # name, then env assignments for the server; CACHE_MIB the RAM cache (
     stop_server; return 1
   fi
   [[ -n "${ARM_RB:-}" ]] && grep -E 'ROUTER_BF16: ' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
+  # A predictor part (Ps, Po, Pt, Pp) needs the router predictor: it reads every layer's router from
+  # the container (an Rb arm's from the f32 plane its card copy was relaid from, weight_file_bytes),
+  # and where it cannot, the read-ahead is off with nothing in the arm's name to say so. Not
+  # measured then.
+  if [[ -n "${ARM_PRED:-}" ]] && ! grep -qE 'router predictor: [0-9]+ routers loaded' "$OUT/$name.server.log"; then
+    log "arm $name: a predictor part, but the server log has no 'router predictor: N routers loaded' line ($(grep -m1 -E 'router predictor' "$OUT/$name.server.log")); not measured"
+    stop_server; return 1
+  fi
   # The NVMe drive's busy time (io_ticks, ms) and temperature over the requests: read-ahead arms
   # move it from ~45% busy towards saturation.
   local d0 d1 t0 t1 rc temp
@@ -244,21 +253,47 @@ fi
 
 # SELFTEST_F32BF16=<r4d_selftest>: before the arms, on card 0 with the H home's libr4d.so (the Rb
 # arms'), gemm_nt_f32bf16 byte-compared with gemm_nt_f32 and the host arithmetic (router and
-# compressor shapes), then the decode router (384 x 5120) and compressor (1024 x 5120) GEMVs timed
-# cold for both weights at every tile form (the gate: the halves' rule at or under 14 us at 384).
+# compressor shapes), then the router (384 x 5120) and compressor (1024 x 5120) GEMVs at one row
+# (decode) and 16 (a prefill chunk) timed cold for both weights at every tile form, each form
+# byte-compared first (the gate: the halves' rule at or under 14 us at 384, one row). RbN takes
+# form N at passes of up to 16 rows, so its form is card-checked at both ends of that range.
+# RB_OK is set only when everything compared equal: the check case exits 0 with no FAIL, and the
+# sweep compared the rule and forms 1-8 at both shapes and both heights (36 lines) with no FAIL and
+# all four runs exit 0. RB_SUM is the checked file's sha256, which an Rb arm's own libr4d.so must have.
+RB_OK="" RB_LIB="" RB_SUM="" RB_WHY="no SELFTEST_F32BF16 (an r4d_selftest) given"
 if [[ -n "${SELFTEST_F32BF16:-}" && -x "${SELFTEST_F32BF16}" ]]; then
   L4=${RADIANCE_HOME_DIR2:-$RHOME}/kernels/libr4d.so
   log "gemm_nt_f32bf16 checks on card 0 with $L4"
+  RB_SUM=$(sha256sum "$L4" 2>/dev/null | cut -d' ' -f1)
   ( export HIP_VISIBLE_DEVICES=0
     timeout 900 "$SELFTEST_F32BF16" "$L4" --case gemm_nt_f32bf16_bf16 >"$OUT/f32bf16_check.log" 2>&1
     echo "check exit $?" >>"$OUT/f32bf16_check.log"
+    : >"$OUT/f32bf16_perf.log"
     for n in 384 1024; do
-      timeout 900 "$SELFTEST_F32BF16" "$L4" --cold 256 --perff32 $n 5120 1 200 >>"$OUT/f32bf16_perf.log" 2>&1
-      echo "perff32 $n exit $?" >>"$OUT/f32bf16_perf.log"
+      for m in 1 16; do
+        timeout 900 "$SELFTEST_F32BF16" "$L4" --cold 256 --perff32 $n 5120 $m 200 >>"$OUT/f32bf16_perf.log" 2>&1
+        echo "perff32 $n $m exit $?" >>"$OUT/f32bf16_perf.log"
+      done
     done )
   grep -cE "FAIL" "$OUT/f32bf16_check.log" | sed 's/^/f32bf16 check FAIL lines: /' | tee -a "$OUT/window.log"
   tail -1 "$OUT/f32bf16_check.log" | tee -a "$OUT/window.log"
   grep -E "^gemm_nt|^  (rule|4x1|2x2|8x1|8x4|1x2|1x4)|FAIL|exit" "$OUT/f32bf16_perf.log" | tee -a "$OUT/window.log"
+  nfail=$(cat "$OUT/f32bf16_check.log" "$OUT/f32bf16_perf.log" 2>/dev/null | grep -c 'FAIL')
+  ncheck=$(grep -cE '^  ok    gemm_nt_f32bf16 at M=' "$OUT/f32bf16_check.log" 2>/dev/null)
+  nsweep=$(grep -cE '^  ok    gemm_nt_f32bf16 (at|form) ' "$OUT/f32bf16_perf.log" 2>/dev/null)
+  nruns=$(grep -cxE 'perff32 (384|1024) (1|16) exit 0' "$OUT/f32bf16_perf.log" 2>/dev/null)
+  nfail=${nfail:-0} ncheck=${ncheck:-0} nsweep=${nsweep:-0} nruns=${nruns:-0}
+  if [[ "$nfail" == 0 && "$ncheck" -gt 0 && "$nsweep" == 36 && "$nruns" == 4 && -n "$RB_SUM" ]] &&
+     grep -qx 'check exit 0' "$OUT/f32bf16_check.log"; then
+    RB_OK=1 RB_LIB=$L4
+    log "gemm_nt_f32bf16 card checks passed ($ncheck comparisons, $nsweep in the form sweep) on $L4, sha256 ${RB_SUM:0:16}: Rb arms on it are measured"
+  else
+    RB_WHY="FAIL lines $nfail, comparisons ok $ncheck, sweep comparisons ok $nsweep of 36, sweep runs exiting 0 $nruns of 4; $(tail -1 "$OUT/f32bf16_check.log" 2>/dev/null)"
+    log "gemm_nt_f32bf16 card checks did not pass ($RB_WHY): no Rb arm is measured"
+  fi
+elif [[ -n "${SELFTEST_F32BF16:-}" ]]; then
+  RB_WHY="SELFTEST_F32BF16=$SELFTEST_F32BF16 is not an executable"
+  log "$RB_WHY: no Rb arm is measured"
 fi
 
 HX=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=$HX_THREADS RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU=$SILU)
@@ -333,11 +368,13 @@ for a in $ARMS; do
 # Rb the routers and the compressors' kv|gate projections read as bf16
 # (RADIANCE_EXPERIMENTAL_DS41_ROUTER_BF16, bit-identical; needs the deepseek41 plugin and libr4d
 # built with it; checked in the server log, every other arm runs with the knob at 0), RbN the same
-# with tile form N (1-8, r4d_selftest --perff32's names) for the bf16 GEMV at decode.
+# with tile form N (1-8, r4d_selftest --perff32's names) for the bf16 GEMV at decode; an Rb arm runs
+# only on the libr4d.so whose gemm_nt_f32bf16 passed SELFTEST_F32BF16's card checks in this window.
+# An arm with a predictor part (Ps, Po, Pt, Pp) is measured only if the router predictor loaded.
   IFS=- read -r -a parts <<< "$a"
   pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 HOST_POOL_MIB=4096 EXTRA_ARGS="" ARM_HOME="$RHOME" ARM_CONC=
   ARM_PROMPTS= ARM_N=
-  power="" skip="" ARGS=() f8="" f8x="" rb="" rbf=0
+  power="" skip="" ARGS=() f8="" f8x="" rb="" rbf=0 pred=""
   for p in "${parts[@]:1}"; do
     case $p in
       Q[gnc]*) power=${p#Q} ;;
@@ -381,10 +418,10 @@ for a in $ARMS; do
                if [[ -z "$MIRROR" ]]; then log "arm $a: $p needs MIRROR=<directory of the checkpoint's model-*.safetensors>"; skip=1; fi
                ARGS+=(--expert-plane-mirror "$MIRROR")
                [[ $p != R ]] && ARGS+=(--expert-plane-mirror-share "0.${p#R}") ;;
-      Ps[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_PREFETCH=shadow RADIANCE_EXPERIMENTAL_DS41_PREFETCH_K=${p#Ps}) ;;
-      Po[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_PREFETCH=on RADIANCE_EXPERIMENTAL_DS41_PREFETCH_K=${p#Po}) ;;
-      Pt[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_PREFETCH=on RADIANCE_EXPERIMENTAL_DS41_PREFETCH_AHEAD=2 RADIANCE_EXPERIMENTAL_DS41_PREFETCH_K=${p#Pt}) ;;
-      Pp[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_PREFETCH=pieces RADIANCE_EXPERIMENTAL_DS41_PREFETCH_K=${p#Pp}) ;;   # read-ahead in pieces, top K
+      Ps[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_PREFETCH=shadow RADIANCE_EXPERIMENTAL_DS41_PREFETCH_K=${p#Ps}) pred=1 ;;
+      Po[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_PREFETCH=on RADIANCE_EXPERIMENTAL_DS41_PREFETCH_K=${p#Po}) pred=1 ;;
+      Pt[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_PREFETCH=on RADIANCE_EXPERIMENTAL_DS41_PREFETCH_AHEAD=2 RADIANCE_EXPERIMENTAL_DS41_PREFETCH_K=${p#Pt}) pred=1 ;;
+      Pp[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_PREFETCH=pieces RADIANCE_EXPERIMENTAL_DS41_PREFETCH_K=${p#Pp}) pred=1 ;;   # read-ahead in pieces, top K
       Pq[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_PREFETCH_QD=${p#Pq}) ;;          # ...its readers (4)
       Pb[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_PREFETCH_PIECE_KB=${p#Pb}) ;;    # ...its piece size in KiB (512)
       Pf[01])   env+=(RADIANCE_EXPERIMENTAL_DS41_PREFETCH_FINISH=${p#Pf}) ;;      # ...0: partly read units read afresh
@@ -437,9 +474,22 @@ for a in $ARMS; do
     env+=(RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8=0)
   fi
   ARM_F8=$f8
-  # Every arm states the knob, so a window's VAR=val cannot turn it on for the others.
+  # Every arm states the router knob, so a window's VAR=val cannot turn it on for the others. An Rb
+  # arm runs only on the libr4d.so whose gemm_nt_f32bf16 passed the card checks before the arms
+  # (SELFTEST_F32BF16): they are its exactness proof, which eight identical greedy replies are not
+  # (a 1-ulp logit difference seldom changes a token).
   env+=(RADIANCE_EXPERIMENTAL_DS41_ROUTER_BF16=${rb:-0} RADIANCE_EXPERIMENTAL_DS41_ROUTER_BF16_FORM=$rbf)
-  ARM_RB=$rb
+  if [[ -n "$rb" ]]; then
+    IFS=: read -r -a homes <<< "$ARM_HOME"
+    lib=""
+    for h in "${homes[@]}"; do [[ -f "$h/kernels/libr4d.so" ]] && { lib=$h/kernels/libr4d.so; break; }; done
+    if [[ -z "$RB_OK" ]]; then
+      log "arm $a: Rb refused: gemm_nt_f32bf16's card checks did not pass in this window ($RB_WHY)"; skip=1
+    elif [[ -z "$lib" || "$(sha256sum "$lib" 2>/dev/null | cut -d' ' -f1)" != "$RB_SUM" ]]; then
+      log "arm $a: Rb refused: its libr4d.so (${lib:-none under $ARM_HOME}) is not the one the card checks passed on ($RB_LIB, sha256 ${RB_SUM:0:16})"; skip=1
+    fi
+  fi
+  ARM_RB=$rb ARM_PRED=$pred
   [[ -n "$skip" ]] && continue
   [[ -n "$power" ]] && power_set "$power"
   case $pol in

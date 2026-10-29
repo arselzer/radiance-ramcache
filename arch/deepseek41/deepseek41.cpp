@@ -390,6 +390,9 @@ struct Layer {
     std::vector<rad_weight> wo_a;
     rad_weight comp_w = 0, comp_norm = 0, ik_w = 0, ik_norm = 0, iq_w = 0, iproj = 0;
     rad_weight e_mult = 0, e_vsz = 0, e_off = 0, e_kv = 0, e_gate = 0;
+    /* RADIANCE_EXPERIMENTAL_DS41_ROUTER_BF16: the compressor's kv|gate (comp_w at a ratio above 1)
+     * and the router held at two bytes an element (bf16_held()), not four. */
+    bool comp_bf16 = false, rt_bf16 = false;
     /* Reads of this layer's weights into the card's on-die cache (pf_layer(), ds41_prefetch_plan.h;
      * empty unless RADIANCE_EXPERIMENTAL_DS41_PREFETCH_ATTN=1), in read order: `pf` issued by the
      * layer before while it waits for its CPU rows (pf_tail), `pf_post` by an Engram layer itself
@@ -506,7 +509,8 @@ struct Model {
     /* engram_kv's rows a rank computes when they are split over the ranks (0: replicated). */
     int64_t esplit = 0;
     /* RADIANCE_EXPERIMENTAL_DS41_ROUTER_BF16 (router_bf16_on): the routers and compressor
-     * projections declared over gemm_nt_f32bf16, counted with the bytes their bf16 halves save. */
+     * projections declared over gemm_nt_f32bf16; those held at two bytes an element (bf16_held())
+     * counted, with the bytes that saves. */
     bool router_bf16 = false;
     int n_router_bf16 = 0, n_comp_bf16 = 0;
     int64_t bf16_saved = 0;
@@ -778,6 +782,17 @@ static rad_weight lw8(RadBuilder* b, Model& m, const char* name, int64_t n, int6
 static int64_t wbytes(const Model& m, rad_weight w, int64_t n, int64_t k) {
     if (!w || m.wty.count(w)) return 0;
     return m.f8_read.count(w) ? n * k : n * k * 2;
+}
+/* With ROUTER_BF16 (Model::router_bf16): whether gemm_nt_f32bf16 holds the weight declared as
+ * `name` at two bytes an element -- an f32 plane its layout keeps as the bf16 halves, or a bf16
+ * plane read as it is. An f16 plane is widened to f32 by the loader and read at four, and a plane
+ * whose encoding is unknown is taken to be so too (r4d_layout.cpp, f32bf16). It decides what the
+ * startup line counts and the bytes the on-die reads of the router and the compressor's kv|gate
+ * take (pf_layer). */
+static bool bf16_held(RadBuilder* b, const Model& m, const char* name) {
+    RadEncoding e{};
+    return m.router_bf16 && weight_enc(b, name, &e) && rad_enc_is(&e, "plain") && e.n_planes == 1 &&
+           (e.plane[0].dtype == RAD_F32 || e.plane[0].dtype == RAD_BF16);
 }
 static rad_op rmsnorm(RadBuilder* b, const Model& m, int64_t rows, rad_weight w, int64_t n,
                       rad_buf x, rad_buf y) {
@@ -1169,8 +1184,10 @@ static void pf_layer(RadBuilder* b, Model& m, Layer& L) {
                 put(k, L.e_kv,
                     wbytes(m, L.e_kv, m.esplit ? m.esplit : (c.hc + 1) * D, c.ple_heads * c.ple_dim));
             break;
-        case pf::kComp:   /* f32 [2 hd, D] (kv|gate) at a ratio above 1, else lw()'s [hd, D] */
-            put(k, L.comp_w, L.r > 1 ? 2 * hd * D * 4 : wbytes(m, L.comp_w, hd, D));
+        case pf::kComp:   /* f32 [2 hd, D] (kv|gate) at a ratio above 1, half that where ROUTER_BF16
+                           * holds it as bf16 (Layer::comp_bf16), else lw()'s [hd, D] */
+            put(k, L.comp_w,
+                L.r > 1 ? 2 * hd * D * (L.comp_bf16 ? 2 : 4) : wbytes(m, L.comp_w, hd, D));
             break;
         case pf::kQa: put(k, L.wq_a, wbytes(m, L.wq_a, c.q_lora, D)); break;
         case pf::kKv: put(k, L.wkv, wbytes(m, L.wkv, hd, D)); break;
@@ -1183,8 +1200,10 @@ static void pf_layer(RadBuilder* b, Model& m, Layer& L) {
             break;
         case pf::kMa: put(k, L.hc_a_fn, mix * c.hc * D * 4); break;   /* f32 [mix, hc D] */
         case pf::kOb: put(k, L.wo_b, wbytes(m, L.wo_b, D, m.gr * c.o_rank)); break;
-        case pf::kRt:   /* GlmRouter's f32 projection under the sigmoid router, else bf16 */
-            put(k, L.moe.w_router, L.moe.c.n_expert_all * D * (L.moe.c.sigmoid_router ? 4 : 2));
+        case pf::kRt:   /* GlmRouter's f32 projection under the sigmoid router (bf16 where
+                         * ROUTER_BF16 holds it so, Layer::rt_bf16), else bf16 */
+            put(k, L.moe.w_router,
+                L.moe.c.n_expert_all * D * (L.moe.c.sigmoid_router && !L.rt_bf16 ? 4 : 2));
             break;
         /* This rank's slice of the shared expert: bf16, or its E4M3 codes where gemm_nt_bf16f8
          * reads it (LinearFP8::bf16_alt, ..._DENSE_FP8), as wbytes() counts linear()'s. */
@@ -1455,7 +1474,8 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
                               { RAD_RANGE("M", 1, T), RAD_INT("N", 2 * hd), RAD_INT("K", D),
                                 RAD_STR("dtype", "bf16") },
                               { L.comp_w }, { m.xn }, { m.kvs });
-                if (m.router_bf16) {
+                L.comp_bf16 = bf16_held(b, m, cn);
+                if (L.comp_bf16) {
                     ++m.n_comp_bf16;
                     m.bf16_saved += 2 * hd * D * 2;
                 }
@@ -1661,7 +1681,9 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
                 ++m.f8_kept;
             }
         }
-    if (m.router_bf16) {
+    /* GlmRouter declared it as blk.L.glm_router.weight. */
+    L.rt_bf16 = bf16_held(b, m, nm.f("blk.%d.glm_router.weight", l));
+    if (L.rt_bf16) {
         ++m.n_router_bf16;
         m.bf16_saved += c.n_expert * D * 2;
     }

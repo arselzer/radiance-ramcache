@@ -35,7 +35,8 @@
  * With RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8=1 (+12.7%) every one of these but the compressor and the
  * router is read from its E4M3 codes, half the bytes: the attention's five 36.75, and 56 MiB then
  * covers the whole list through the shared expert (rank 0 55.5 MiB a layer) where the four reads
- * alone are 26.75. */
+ * alone are 26.75. With RADIANCE_EXPERIMENTAL_DS41_ROUTER_BF16=1 the ratio-2 compressor and the
+ * router are held as bf16 (gemm_nt_f32bf16), half theirs: 10 and 3.75. */
 #pragma once
 #include <cstdint>
 #include <cstdlib>
@@ -49,7 +50,8 @@ namespace pf {
 /* A layer's weights by the op that reads them, in use order. */
 enum Kind : int {
     kEkv,   /* ekv:  the Engram GEMM's engram_kv (an Engram layer's first read) */
-    kComp,  /* comp: the compressor's kv|gate (f32) or kv (bf16) projection, at a kv source */
+    kComp,  /* comp: the compressor's kv|gate (f32; bf16 under ..._ROUTER_BF16) or kv (bf16)
+             *       projection, at a kv source */
     kQa,    /* qa:   attn_q_a */
     kKv,    /* kv:   attn_kv */
     kIw,    /* iw:   the indexer's weights_proj (320 KiB), at an index source */
@@ -59,7 +61,7 @@ enum Kind : int {
     kOa,    /* oa:   attn_output_a, one read a group this rank holds */
     kMa,    /* ma:   the attention connection's mix (hc_attn_fn, f32, 1.9 MiB) */
     kOb,    /* ob:   attn_output_b, this rank's columns */
-    kRt,    /* rt:   the router (f32) */
+    kRt,    /* rt:   the router (f32; bf16 under ..._ROUTER_BF16) */
     kSgu,   /* sgu:  the shared expert's gate|up, this rank's slice */
     kMf,    /* mf:   the ffn connection's mix (hc_ffn_fn, f32, 1.9 MiB) */
     kSdn,   /* sdn:  the shared expert's down, this rank's slice */

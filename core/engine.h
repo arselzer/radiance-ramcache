@@ -29,6 +29,7 @@
 #include "mem/hostarena.h"
 #include "sched/mem_iface.h"
 #include "sched/scheduler.h"
+#include "sched/draft_conf_head.h"
 #include "sample/vocab_view.h"
 #include "runtime/rank_barrier.h"
 #include "text/tokenizer.h"
@@ -576,6 +577,18 @@ private:
     /* The proposals a row of the query pass took (block_shape), for finish_block_drafter and
      * issue_ahead's expect_draft. */
     int  block_steps_ = 0;
+    /* RADIANCE_EXPERIMENTAL_DS41_DSPARK_CONF (engine_dconf.cpp, sched/draft_conf.h): the confidence
+     * head, the plugin's persistent collapsed rows ([dconf_rows_, dim] bf16 on rank 0), their pinned
+     * host copy, and the query pass whose rows it holds (dconf_n_ drafting rows of dconf_block_). */
+    int  dconf_init();
+    void dconf_fini();
+    int  dconf_issue(int n, int block);
+    void dconf_finish();
+    DconfHead dconf_head_;
+    rad_buf   dconf_x_ = 0;
+    int64_t   dconf_rows_ = 0;
+    uint16_t* dconf_host_ = nullptr;
+    int       dconf_n_ = 0, dconf_block_ = 0;
     /* Encoder driver (spec §11, core/engine_mm.cpp): encodes every media item the scheduler waits
      * on, in passes of whole segments, and reads it back into the item. Runs between steps, never
      * inside one. */

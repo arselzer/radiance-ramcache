@@ -121,6 +121,9 @@ int Engine::step_state_init() {
                      drafter_.depth);
     }
 
+    /* RADIANCE_EXPERIMENTAL_DS41_DSPARK_CONF: the confidence head (engine_dconf.cpp). */
+    RAD_TRY(dconf_init());
+
     RAD_TRY(rad_event_create_as(&step_end_, RAD_EVENT_LOCAL | RAD_EVENT_HOST_WAIT));
     RAD_TRY(rad_event_create_as(&tok_end_, RAD_EVENT_LOCAL | RAD_EVENT_HOST_WAIT));
     return RAD_OK;
@@ -138,6 +141,7 @@ void Engine::step_state_fini() {
     slots_host_ = nullptr;
     if (couple_draw_stage_) rad_dev_free(couple_draw_stage_, RAD_MEM_HOST_PINNED);
     if (couple_readback_) rad_dev_free(couple_readback_, RAD_MEM_HOST_PINNED);
+    dconf_fini();
     couple_draw_stage_ = nullptr;
     couple_readback_ = nullptr;
     if (step_end_) rad_event_destroy(step_end_);
@@ -548,6 +552,8 @@ int Engine::issue_block_drafter(int step, StepOut& so) {
     RAD_TRY(advance_all(ADV_BLOCK, 0, false));
     RAD_TRY(block_pass(qb, "query", step));
     RAD_TRY(advance_all(ADV_BTAKE, steps, true, n));
+    /* The confidence head's input rows, behind the pass (engine_dconf.cpp). */
+    RAD_TRY(dconf_issue(n, block));
     Rank& r0 = *ranks_[0];
     if (mtp_couple_) {
         /* Positions 1..steps of the drafting rows, on the stream of the slots below. */
@@ -605,6 +611,8 @@ int Engine::finish_block_drafter(const StepOut& so) {
         if (mtp_couple_)
             RAD_TRY(bind_couple(seq, i, steps, rc == RAD_OK, block_row_[(size_t)i].card));
     }
+    /* The confidence head's p for each drafting row (engine_dconf.cpp). */
+    dconf_finish();
     return RAD_OK;
 }
 

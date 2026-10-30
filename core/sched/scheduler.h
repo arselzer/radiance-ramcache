@@ -73,6 +73,7 @@ struct SchedReq {
         draft_lo     = 0;
         draft_hi     = 0;
         dgate_held   = false;
+        ctx_hole     = false;
     }
 
     /* The adaptive draft window's estimate (--draft-window adaptive, draft.h). Not reset by
@@ -85,6 +86,13 @@ struct SchedReq {
      * step verifies nothing for it: the prompt-lookup fallback, which fills an empty proposal in
      * step(), does not stand in. Consumed by the next step's planning. */
     bool       dgate_held = false;
+    /* RADIANCE_EXPERIMENTAL_DS41_DSPARK_CONF (draft_conf.h): the confidence controller's estimate and
+     * counters. Kept through preemption; a new request starts it over. */
+    DraftConfSeq dconf;
+    /* RADIANCE_EXPERIMENTAL_DS41_DSPARK_CTX_DEFER: context rows of this sequence were dropped (a
+     * deferral that could not be caught up), so its drafter cache restarts at the next row a context
+     * pass writes (block_end), and it drafts again only once its window lies past that. */
+    bool       ctx_hole = false;
     /* The proposal the step being planned carries came from prompt lookup (StepEntry::ngram). */
     bool       draft_ngram = false;
     /* Prompt lookup's index over prompt ++ output (ngram.h), built at the sequence's first lookup
@@ -478,6 +486,18 @@ public:
     void draft_gate_report() const;
     const DraftGateCfg&  draft_gate() const { return dgate_cfg_; }
 
+    /* draft_conf.h. The engine's estimate for a sequence's newest draft (p0 its first proposal's, p1
+     * its second's, -1 for none), after finish_block_drafter has read the query pass back; ignored
+     * while the controller is off. The shutdown report: totals, the calibration tables, the context
+     * passes, and a line for each of the last kConfRecs finished sequences; nothing while all three
+     * are off. */
+    void draft_conf_scored(uint64_t id, float p0, float p1);
+    void draft_conf_report() const;
+    const DraftConfCfg&  draft_conf() const { return dconf_cfg_; }
+    int                  draft_load_from() const { return dload_from_; }
+    bool                 ctx_deferred() const { return dctx_.on; }
+    int64_t              ctx_defer_cap() const { return dctx_.cap; }
+
     const StepPlan&      plan() const { return plan_; }
     const ChunkGeometry& geometry() const { return geo_; }
     DraftController&     draft() { return draft_; }
@@ -643,6 +663,18 @@ private:
     std::vector<GateRec> dgate_recs_;
     int64_t              dgate_recs_n_ = 0;
     int32_t              dgate_step_drafts_ = 0;
+    /* draft_conf.h, from draft_experiment_ at init: the controller, load-aware drafting from
+     * `dload_from_` decoding sequences (0 off), the deferred context pass, their totals, and the last
+     * kConfRecs finished sequences' controller records (reserved at init, as the gate's). */
+    static constexpr int kConfRecs = 256;
+    struct ConfRec { uint64_t id = 0; int64_t out = 0; DraftConfSeq g; };
+    DraftConfCfg         dconf_cfg_{};
+    int                  dload_from_ = 0;
+    DraftCtxDefer        dctx_{};
+    DraftConfStats       dconf_tot_{};
+    std::vector<ConfRec> dconf_recs_;
+    int64_t              dconf_recs_n_ = 0;
+    bool                 dconf_any_ = false;   /* any of the three on */
 
     /* Where this sequence's block-drafter cache begins; block_begin's guard reads it and
      * block_end records it. */
@@ -813,6 +845,11 @@ private:
          * nothing, but keeps its row so later rows stay aligned with the trunk's. The pass stores
          * nothing for it (a negative slot is padding). */
         bool           mirror = false;
+        /* The positions the context pass writes for it, [ctx_from, ctx_from + ctx_n): its own rows,
+         * those and the rows a deferral held back (a catch-up), or none (skipped). block_end moves the
+         * filled range over exactly these. */
+        int64_t        ctx_from = 0;
+        int32_t        ctx_n = 0;
         /* No Request* here: block_ is read by later passes with the lock released in between,
          * and a disconnect could free the Request. Rows hold `slot` plus `seq`, resolved through
          * block_req(). */
@@ -929,6 +966,9 @@ private:
     const Request* serial_req(const SerialSeq& m) const;
     /* Both snapshots resolve the same way; the two wrappers exist because the row types differ. */
     const Request* live_req(int32_t slot, uint64_t id) const;
+    /* RADIANCE_EXPERIMENTAL_DS41_DSPARK_CTX_DEFER: sequence `id`'s deferred context rows were
+     * dropped (SchedReq::ctx_hole); nothing for a sequence no longer queued or running. */
+    void ctx_hole_locked(uint64_t id);
     void preempt_back();
     /* Give blocks back from the prefix cache until the pool has headroom again. With `spare`
      * (end-of-request snapshots on; before its sequence is freed), the first `spare_tokens` of that

@@ -20,9 +20,11 @@
 # is deepseek41's half of the consumer skip on that fake, consumer_skip_test the schedule itself
 # (core/sched/consumer_skip.h, header-only) against a dependency simulation. ds41_dspark_fp8_arch_test
 # is the DSpark drafter's dense linears from E4M3 codes (RADIANCE_EXPERIMENTAL_DS41_DSPARK_FP8) on it.
+# ds41_tbo_arch_test is deepseek41's two-batch overlap (RADIANCE_EXPERIMENTAL_SCHED_TBO, core/sched/tbo.h)
+# on it: each micro-batch against a lone step of its rows, and no read of the other's writes.
 set(RAD_TESTS_NO_CORE arch_test glm5next_test mapped_slab_pregrow_test ds41_prefetch_arch_test
                       ds41_prefetch_plan_test ds41_consumer_skip_arch_test consumer_skip_test
-                      ds41_dspark_fp8_arch_test)
+                      ds41_dspark_fp8_arch_test ds41_tbo_arch_test)
 
 # fixture_test tests tools/kfixture.cpp and tools/opshapes.cpp (the seeded draw, the reduction and
 # the on-disk recording) directly, kbench_test tools/kbench_core.cpp (rad-kbench's rules), and
@@ -465,6 +467,11 @@ set_tests_properties(isa_tools PROPERTIES TIMEOUT ${RAD_TEST_TIMEOUT})
 add_test(NAME ab_window_vp_test COMMAND bash ${CMAKE_SOURCE_DIR}/tools/ds41-host-experts/ab_window_vp_test.sh)
 set_tests_properties(ab_window_vp_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT}
                      ENVIRONMENT "ROCR_VISIBLE_DEVICES=99")
+# ab_window.sh's P1 parts (P1, QmN, QlK, QhMS): the server-log gate on synthetic logs and the arm loop with
+# every action stubbed. No card, no server, no model.
+add_test(NAME ab_window_p1_test COMMAND bash ${CMAKE_SOURCE_DIR}/tools/ds41-host-experts/ab_window_p1_test.sh)
+set_tests_properties(ab_window_p1_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT}
+                     ENVIRONMENT "ROCR_VISIBLE_DEVICES=99")
 
 # ================================================================== libr4d's kernels, on the host
 #
@@ -828,5 +835,54 @@ foreach(cost IN ITEMS kbench_ref:500 r4d_selftest:350 r4d_emu_attn_sweep:80 kben
   list(GET cost 1 c)
   if(TEST ${t})
     set_tests_properties(${t} PROPERTIES COST ${c})
+  endif()
+endforeach()
+
+# ---- P1 (K)
+# Prefill Phase 1's twin moe_gemm_ggml_mxfp4_gemv_tall_p1 (RADIANCE_EXPERIMENTAL_DS41_P1, r4d_ds41_mxfp4.hip, the
+# contract in tools/ds41-host-experts/ds41_p1.h) on the emulator: at 17 to 1024 tokens over tables mixing
+# block_mxfp4, packed and skipped entries against the plain gemv in passes of 16, skipped rows untouched, the slots
+# past the live end zeros, other work splits the same bytes, and the stager's wave composition (a main launch with
+# a subset skipped, then waves over it, the clamped SwiGLU relaunched) equal to one launch. Built like ds41vp (the
+# engine's packer linked in), in whichever arm built the emulator above.
+if(R4D_EMU_BUILT)
+  if(TARGET r4d_emu_kernels)
+    add_executable(r4d_emu_ds41p1 ${R4D_EMU}/test_ds41p1.cpp ${R4D_EMU_HX_SRC})
+    target_link_libraries(r4d_emu_ds41p1 PRIVATE r4d_emu_kernels ${CMAKE_DL_LIBS})
+    target_include_directories(r4d_emu_ds41p1 PRIVATE ${R4D_EMU_HX_DIR})
+    target_compile_options(r4d_emu_ds41p1 PRIVATE -ffp-contract=off -Wno-psabi)
+    set_target_properties(r4d_emu_ds41p1 PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+  else()
+    add_custom_command(OUTPUT ${dir}/test_ds41p1.o
+      COMMAND ${R4D_EMU_CXX} ${flags} -MD -MF ${dir}/test_ds41p1.o.d -c ${R4D_EMU}/test_ds41p1.cpp
+              -o ${dir}/test_ds41p1.o
+      DEPENDS ${R4D_EMU}/test_ds41p1.cpp
+      DEPFILE ${dir}/test_ds41p1.o.d
+      COMMENT "Building r4d_emu test_ds41p1.o with ${R4D_EMU_CXX}"
+      VERBATIM)
+    add_custom_command(OUTPUT ${CMAKE_BINARY_DIR}/tests/r4d_emu_ds41p1
+      COMMAND ${R4D_EMU_CXX} ${dir}/test_ds41p1.o ${objs} ${dir}/ds41_host_experts.o ${dl}
+              -o ${CMAKE_BINARY_DIR}/tests/r4d_emu_ds41p1
+      DEPENDS ${dir}/test_ds41p1.o ${objs} ${dir}/ds41_host_experts.o
+      COMMENT "Linking r4d_emu_ds41p1"
+      VERBATIM)
+    add_custom_target(r4d_emu_ds41p1_bin ALL DEPENDS ${CMAKE_BINARY_DIR}/tests/r4d_emu_ds41p1)
+  endif()
+  add_test(NAME r4d_emu_ds41p1 COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_ds41p1)
+  set_tests_properties(r4d_emu_ds41p1 PROPERTIES LABELS "r4d_emu;slow" TIMEOUT 3600)
+  # The same at the small heights, in the fast tier.
+  add_test(NAME r4d_emu_ds41p1_quick COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_ds41p1 quick)
+  set_tests_properties(r4d_emu_ds41p1_quick PROPERTIES LABELS "r4d_emu;fast" TIMEOUT ${RAD_TEST_TIMEOUT})
+endif()
+
+# ---- P1 (S)
+# Prefill Phase 1's stager and end-aligned chunks (core/place/card_expert_stager.h, core/sched/p1_chunk.h):
+# p1_stager_test (the scheduling on a simulated card, the ring stress, the tunables, the admission) and
+# p1_chunk_test (Scheduler::plan_chunk's end alignment on the scheduler fakes), registered by the glob
+# above. Host only: the cards hidden, in the fast tier.
+foreach(t p1_stager_test p1_chunk_test)
+  if(TEST ${t})
+    set_property(TEST ${t} APPEND PROPERTY ENVIRONMENT "ROCR_VISIBLE_DEVICES=99")
+    set_property(TEST ${t} APPEND PROPERTY LABELS fast)
   endif()
 endforeach()

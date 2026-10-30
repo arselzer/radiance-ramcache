@@ -487,6 +487,13 @@ int FileStager::shutdown_head_cache() {
 }
 
 FileStager::~FileStager() {
+    /* The card path's threads use this stager's planes and insert queue: they stop first. */
+    p1_.reset();
+    if (p1_end_) rad_event_destroy(p1_end_);
+    if (p1_lend_ev_) rad_event_destroy(p1_lend_ev_);
+    if (p1_vev_) rad_event_destroy(p1_vev_);
+    for (void* p : { (void*)p1_vidx_, (void*)p1_vx_, (void*)p1_vy_, (void*)p1_vh_ })
+        if (p) rad_dev_free(p, RAD_MEM_HOST_PINNED);
     if (hx_mw_.joinable()) {
         {
             std::lock_guard<std::mutex> lk(hx_mw_mu_);
@@ -661,6 +668,7 @@ int FileStager::init(const Program& prog, const Plan& plan, Mover* mover, Counts
     RAD_TRY(tall_init(prog));
     RAD_TRY(init_head_cache(prog, plan));
     RAD_TRY(hx_init(prog));
+    RAD_TRY(p1_init(prog));
     return rt_init(prog);
 }
 
@@ -693,6 +701,30 @@ bool FileStager::begin_pass(const RadBatch* b) {
     else pass_row0_.clear();
     hx_defer_li_ = -1;
     hx_wake_li_ = -1;
+    /* Prefill Phase 1: a pure prefill pass of the threshold's rows or more runs every routed expert row
+     * of its layers of that many rows on the cards (p1_layer_on). Its first copy waits on the last
+     * readers of the file buffers before it. */
+    p1_armed_ = false;
+    p1_li_ = -1;
+    const bool p1_arms = p1_on() && lcp_ && p1_pass_arms(*b, p1_min_rows_, ep_rows_);
+    /* The lent ring (card_expert_stager.h): a pass that arms the card path takes the residents' slots
+     * back, and its first ring copy waits on their last reader too; any other pass, once the grace has
+     * run out, reloads them and publishes those whose copies have passed. Here only, before the run
+     * phase brings the weight tables up to date. */
+    if (p1_on() && p1_->lending()) (void)p1_->lender().begin_pass(p1_arms, p1_now_ms());
+    if (p1_arms) {
+        const RadEvent hand[3] = { free_rec_[0] ? free_[0] : nullptr, free_rec_[1] ? free_[1] : nullptr,
+                                   p1_lend_rec_ ? p1_lend_ev_ : nullptr };
+        if (p1_->begin_pass(b->n_tok, hand, 3) < 0) {
+            RAD_ERR("ds41 p1: an armed pass could not begin; this pass goes to the CPU path");
+        } else {
+            p1_armed_ = true;
+            p1_pass_rows_ = b->n_tok;
+            p1_t0_ = std::chrono::steady_clock::now();
+            p1_layers_ = 0;
+            p1_cpu_layers_ = 0;
+        }
+    }
     ++trace_pass_;
     if (rt_) rt_pass(b);
     /* Under LCP every routed unit is the CPU's (hx_capped_), so a chunk of up to C tokens reads only
@@ -701,6 +733,12 @@ bool FileStager::begin_pass(const RadBatch* b) {
               (b->n_tok <= kRoutedRows || (lcp_ && hx_capped_ && b->n_tok <= ep_rows_));
     /* A one-token pass, or with ..._PREFETCH_MULTIROW a trunk decode pass of 2..N rows. */
     hx_ra_pass_ = ra_pass_reads_ahead(b->phase == RAD_PHASE_DECODE, b->draft_pass, b->n_tok, hx_ra_rows_);
+    /* Two-batch overlap (stager.h, tbo_): the architecture declared it (rad_declare_two_batch) and
+     * issues this pass as two micro-batches, so each routed layer arrives as slice A, then slice B. */
+    tbo_ = ep_program_ && ep_program_->two_batch && tbo::step_splits(b);
+    tbo_tok_ = b->n_tok;
+    tbo_slice_ = 0;
+    if (tbo_) tbo_enter(0);
     if (hx_ra_) {   /* predictions for this pass may come; units of earlier ones are stale */
         hx_ra_at_.store((uint64_t)trace_pass_ << 32, std::memory_order_release);
         hx_ra_drop_stale(trace_pass_, -1);
@@ -777,14 +815,19 @@ int FileStager::start_ep_routed(int32_t li, RadStream s, bool* read) {
             return RAD_E_STATE;
         }
     }
+    /* Prefill Phase 1 decides a layer at a time: in an armed pass a layer below the threshold (the
+     * per-row cut's deep layers of a prompt's last chunk; at 16 rows or fewer the gemv rows, which
+     * honour no skip mark) takes the CPU path below as a pass of its height does (p1_layer_on). */
+    const bool p1 = p1_layer_on(li);
+    if (p1_armed_ && !p1) ++p1_cpu_layers_;
     /* With the pool, the pass's token rows and sorted order ride the same wait (hx_fetch). */
-    const bool hx = hx_pool_ && !head_.configured() && (size_t)li < hx_ops_.size() &&
+    const bool hx = !p1 && hx_pool_ && !head_.configured() && (size_t)li < hx_ops_.size() &&
                     hx_ops_[(size_t)li].gu >= 0 && hx_ops_[(size_t)li].x;
     /* Never seen at its gate_up (the first pass): nothing to fetch the rows from yet, so the CPU's
      * part waits for the gate_up's operands (hx_deferred) and the card gets aliases for all. */
-    const bool defer = !hx && hx_defer_ok_ && hx_pool_ && !head_.configured() &&
+    const bool defer = !p1 && !hx && hx_defer_ok_ && hx_pool_ && !head_.configured() &&
                        (size_t)li < hx_ops_.size() && hx_ops_[(size_t)li].gu >= 0 &&
-                       pass_tok_ <= hx_miss_rows_;
+                       hx_miss_need(li) <= hx_miss_rows_;
     /* Same actual producer stream; this host-wait event is the completion proof.
      * The Ctx witness means successfully issued, never completed before this wait.
      * With ..._FETCH_LIST the counts row and the pool's rows go as one ranged copy. */
@@ -793,6 +836,20 @@ int FileStager::start_ep_routed(int32_t li, RadStream s, bool* read) {
     if (!listed) {
         RAD_TRY(rad_memcpy_async(counts_host_, v.row, 96 * (int64_t)sizeof(int32_t), s));
         if (hx) RAD_TRY(hx_fetch(li, s));
+    }
+    /* Prefill Phase 1's admission: in a pass whose rows reach the admission row, the sorted order and
+     * the offsets ride the counts' wait (from the addresses the layer's gate_up last read, as hx_fetch
+     * takes them; hx_capture counts it if this pass's gate_up reads others). */
+    p1_order_ = false;
+    if (p1 && lcp_admit_row_ > 0 && lcp_admit_row_ < pass_tok_ && hx_idx_ && (size_t)li < hx_ops_.size() &&
+        hx_ops_[(size_t)li].sorted && hx_ops_[(size_t)li].off) {
+        const HxOps& o = hx_ops_[(size_t)li];
+        const int64_t T = layer_rows(li) * o.top_k;
+        if (T > 0 && T <= hx_sorted_max()) {
+            RAD_TRY(rad_memcpy_async(hx_idx_, o.sorted, T * (int64_t)sizeof(int32_t), s));
+            RAD_TRY(rad_memcpy_async(hx_idx_ + hx_sorted_max(), o.off, (o.n_expert + 1) * (int64_t)sizeof(int32_t), s));
+            p1_order_ = true;
+        }
     }
     RAD_TRY(rad_event_record(counts_ev_, s));
     /* ..._ROUTE_TRACE: rank 0's copies of the router's outputs, behind the counts' event (the
@@ -854,6 +911,7 @@ int FileStager::start_ep_routed(int32_t li, RadStream s, bool* read) {
     }
     want_.clear(); skip_.clear();
     for (int32_t u : L.units) {
+        if (mover_->ring_resident(u)) continue;   /* a lent-ring resident: the card's, as a VRAM one */
         bool selected = false;
         if (!ep_route_unit_selected(counts_host_, plan_->units[(size_t)u].expert, &selected))
             return RAD_E_STATE;
@@ -862,6 +920,16 @@ int FileStager::start_ep_routed(int32_t li, RadStream s, bool* read) {
     /* The access trace takes want_ before the CPU split; its record is written after the stage
      * below, with the stage's drive reads. */
     if (trace_fp_) trace_units_ = want_;
+    /* Prefill Phase 1: every selected unit goes to the cards' ring (p1_layer). */
+    if (p1) {
+        RAD_TRY(p1_layer(li, s));
+        if (trace_fp_) trace_layer(L.layer, 0);
+        ++ep_stats_.reads;
+        ep_stats_.units += want_.size();
+        if (!total) ++ep_stats_.zero_local;
+        *read = true;
+        return RAD_OK;
+    }
     /* Deferred only if every selected unit can go to the CPU: the card gets aliases for all. */
     if (defer && std::all_of(want_.begin(), want_.end(),
                              [&](int32_t u) { return mover_->host_planes_eligible(u); })) {
@@ -938,6 +1006,12 @@ int FileStager::start_ep_routed(int32_t li, RadStream s, bool* read) {
     const int64_t available = head_.pending() ? head_.budget().serving_bytes : cap_;
     const auto trace = m1_trace_scope(trace_requested_,trace_target_m1_,v);
     mover_->prefetch_trace_route(trace,counts_host_,want_.size());
+    /* The lent ring's slots are the file buffers' idle ones (p1_lend_init), so with it nothing may take
+     * the card's copy path (hx_init sends every miss to the CPU): staging would overwrite residents. */
+    if (p1_ && p1_->lending() && !want_.empty()) {
+        RAD_ERR("ds41 p1: lent ring: %zu routed units of layer %d reached the card's copy path", want_.size(), (int)li);
+        return RAD_E_STATE;
+    }
     const int stage_status = mover_->stage_file_units(want_, buf_[b], available,
         free_rec_[b] ? free_[b] : nullptr, done_[b], &staged_[b], NativeFileCacheReadPolicy::Normal,trace);
     mover_->prefetch_trace_stage_done(trace,stage_status);
@@ -1021,6 +1095,12 @@ int FileStager::start_routed(int32_t li, RadStream s, bool* read) {
         const int32_t e = plan_->units[(size_t)u].expert;
         if (e < 0 || e >= ne || counts_host_[e] != 0) want_.push_back(u);
         else skip_.push_back(u);
+    }
+    /* The lent ring's slots are the file buffers' idle ones (p1_lend_init), so with it nothing may take
+     * the card's copy path (hx_init sends every miss to the CPU): staging would overwrite residents. */
+    if (p1_ && p1_->lending() && !want_.empty()) {
+        RAD_ERR("ds41 p1: lent ring: %zu routed units of layer %d reached the card's copy path", want_.size(), (int)li);
+        return RAD_E_STATE;
     }
     RAD_TRY(mover_->stage_file_units(want_, buf_[b], cap_, free_rec_[b] ? free_[b] : nullptr,
                                      done_[b], &staged_[b]));
@@ -1442,6 +1522,19 @@ int FileStager::lcp_init(const Program& prog, int64_t C) {
     const char* xt = std::getenv(kExactTallEnv);
     std::string why;
     const int64_t T = prog.ctx.max_tok;
+    /* RADIANCE_EXPERIMENTAL_DS41_P1 (card_expert_stager.h): the twin above 16 rows is the P1 row, and
+     * the packed residents' gemv_vp may serve 16 or fewer (the P1 row decodes the packed form). */
+    p1_state_ = ds41p1::env_state(std::getenv(ds41p1::kEnv));
+    const bool p1 = p1_state_ == 1;
+    /* The threshold, for hx_init's CPU bound (p1_cpu_rows); a value out of range is p1_init's refusal. */
+    p1_min_rows_ = ds41p1::kDefMinRows;
+    if (p1) {
+        p1::Tunables t;
+        if (p1::parse_tunables([](const char* k) { return std::getenv(k); }, &t, nullptr)) {
+            p1_min_rows_ = t.min_rows;
+            p1_lend_asked_ = t.lend > 0;
+        }
+    }
     if (xt && *xt && std::strcmp(xt, "1") != 0)
         why = fmt("%s=%s beside it: large-chunk prefill keeps EXACT_TALL's pins at every height; leave it unset "
                   "(or empty) or 1", kExactTallEnv, xt);
@@ -1454,7 +1547,7 @@ int FileStager::lcp_init(const Program& prog, int64_t C) {
                   prog.ctx.max_spec);
     else if (const char* fl = std::getenv("RADIANCE_EXPERIMENTAL_DS41_FETCH_LIST"); fl && !std::strcmp(fl, "1"))
         why = "RADIANCE_EXPERIMENTAL_DS41_FETCH_LIST=1: its range lists are sized for passes of up to 48 tokens";
-    else if (const char* vp = std::getenv("RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED"); vp && !std::strcmp(vp, "1"))
+    else if (const char* vp = std::getenv("RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED"); !p1 && vp && !std::strcmp(vp, "1"))
         why = "RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED=1: the packed residents' gemv_vp serves passes of up to 16 "
               "tokens";
     if (!why.empty()) {
@@ -1481,6 +1574,30 @@ int FileStager::lcp_init(const Program& prog, int64_t C) {
             ++n_moe;
             for (const Band& b : op.bands) {
                 const char* name = row_name(b);
+                if (p1) {
+                    /* Under P1: the gemv (or gemv_vp) to 16 rows, the P1 twin above. */
+                    const bool low = name && b.hi <= kEpRouteMaxRows &&
+                                     (!std::strcmp(name, ds41p1::kGemvRow) || !std::strcmp(name, ds41p1::kGemvVpRow));
+                    const bool high = name && !std::strcmp(name, ds41p1::kTwinRow);
+                    if (!low && !high) {
+                        RAD_ERR("%s=1 beside %s=%lld refused: op %zu (moe_gemm_ggml, N %lld K %lld) resolves %s to %s: "
+                                "the card path needs %s (or %s) to 16 tokens and %s above, where every expert row is "
+                                "computed on the card with the skip and packed marks. %s",
+                                ds41p1::kEnv, kLcpEnv, (long long)C, h, N, K, b.span.empty() ? "a band" : b.span.c_str(),
+                                name ? name : "nothing", ds41p1::kGemvRow, ds41p1::kGemvVpRow, ds41p1::kTwinRow,
+                                name && !std::strcmp(name, ds41p1::kLcpTwinRow)
+                                    ? "This libr4d.so has LCP's twin, not the P1 row: load one built with the P1 row, "
+                                      "with RADIANCE_EXPERIMENTAL_DS41_P1=1 in its environment"
+                                    : "Load a libr4d.so with the P1 row");
+                        return RAD_E_INVAL;
+                    }
+                    if (high) {
+                        ++n_twin;
+                        const int64_t r = row_m_bound(b.dom[RAD_DOMAIN_DEVICE].row);
+                        reach = reach ? std::min(reach, r) : r;
+                    }
+                    continue;
+                }
                 const bool gemv = name && !std::strcmp(name, "moe_gemm_ggml_mxfp4_gemv");
                 const bool twin = name && !std::strcmp(name, "moe_gemm_ggml_mxfp4_gemv_tall");
                 if (!gemv && !twin) {
@@ -1537,8 +1654,10 @@ int FileStager::lcp_init(const Program& prog, int64_t C) {
         RAD_ERR("%s=%lld (large-chunk prefill) refused: %s", kLcpEnv, (long long)C,
                 n_moe == 0 ? "the program has no routed MXFP4 GEMM (not DeepSeek-V4.1's EP graph)"
                 : n_twin == 0
-                    ? "no band resolved to moe_gemm_ggml_mxfp4_gemv_tall: load a libr4d.so with the twin, with the "
-                      "switch in its environment"
+                    ? (p1 ? "no band resolved to the P1 row moe_gemm_ggml_mxfp4_gemv_tall_p1: load a libr4d.so with "
+                            "it, with RADIANCE_EXPERIMENTAL_DS41_P1=1 and the LCP switch in its environment"
+                          : "no band resolved to moe_gemm_ggml_mxfp4_gemv_tall: load a libr4d.so with the twin, with the "
+                            "switch in its environment")
                     : fmt("this libr4d's twin moe_gemm_ggml_mxfp4_gemv_tall reaches %lld tokens, short of the "
                           "chunk: a libr4d that knows %s declares it to %lld", (long long)reach, kLcpEnv,
                           (long long)kEpRouteLcpMax).c_str());
@@ -1727,7 +1846,12 @@ int FileStager::hx_init(const Program& prog) {
     /* The misses the CPU must take: every pass's. Without the switch that is 16 tokens whatever
      * --max-num-batched-tokens says (as before); with it the step's (tall_init: ep_rows_ is the
      * step, at least 16). */
-    const int64_t need = ep_rows_;
+    /* Under P1 every layer pass of the threshold's rows or more is the card path's (p1_init), so the
+     * CPU takes the layer passes below it only (p1_cpu_rows: 16 at the threshold 17), whatever the
+     * chunk. With the lent ring (..._P1_LEND) the CPU takes every other pass's misses too (hx_need_rows):
+     * a pass that does not arm P1 (a decode step of more rows than the bound, a mixed step) would
+     * otherwise stage them in the file buffers, whose idle slots then hold published residents. */
+    const int64_t need = hx_need_rows();
     hx_need_misses_ = need;
     auto packed_ok = [&]() -> int {
         if (!mover_ || !mover_->packed_cache() || hx_capped_) return hx_init_fetch();
@@ -1739,6 +1863,14 @@ int FileStager::hx_init(const Program& prog) {
     };
     const char* cap = std::getenv("RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS");
     if (!cap || std::atoi(cap) <= 0 || layers_.empty()) {
+        if (lcp_ && p1_state_ == 1) {
+            RAD_ERR("%s=1 beside %s=%lld refused: the card path's ring is the file buffers, sized by "
+                    "RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS (2 or more; the window measures 6), and the CPU path "
+                    "takes the layer passes below %s=%lld (host experts with ..._POLICY=all and ..._MISSES=%lld or "
+                    "more)", ds41p1::kEnv, kLcpEnv, (long long)lcp_, ds41p1::kMinRowsEnv, (long long)p1_min_rows_,
+                    (long long)need);
+            return RAD_E_INVAL;
+        }
         if (lcp_) {
             RAD_ERR("%s=%lld (large-chunk prefill) refused: the CPU must compute every routed unit of every "
                     "chunk (the card's copy path has no room for a chunk's experts): host experts with "
@@ -1781,6 +1913,22 @@ int FileStager::hx_init(const Program& prog) {
 /* The startup line of an admitted LCP (rank 0): ab_window.sh measures an Lc arm only with it, and a
  * plain arm only without it. */
 void FileStager::lcp_report() const {
+    if (p1_state_ == 1) {
+        RAD_INFO("large-chunk prefill: passes of up to %lld tokens (%s=%lld): %d routed MXFP4 GEMMs on "
+                 "%s (or %s) to 16 tokens and the P1 row %s above (%d bands; this libr4d's row reaches %lld); "
+                 "multi-kernel ops admitted: %s; the other %d of %d ops on one kernel at every height; the "
+                 "plugin's own height switches: the router split by columns (%d ops)%s, the indexer in %d extra "
+                 "runs; libr4d keeps the sparse attention, the indexer and the norms on their decode-band "
+                 "arithmetic; every routed expert row of a layer pass of %lld rows or more is computed on the cards "
+                 "(%s=1, %s=%lld), the CPU path takes every routed unit of the layer passes below it, up to %lld "
+                 "rows, in jobs of up to %d rows over %d pool slots",
+                 (long long)lcp_, kLcpEnv, (long long)lcp_, lcp_moe_, ds41p1::kGemvRow, ds41p1::kGemvVpRow,
+                 ds41p1::kTwinRow, lcp_twin_, (long long)lcp_reach_, lcp_pairs_.empty() ? "none" : lcp_pairs_.c_str(),
+                 lcp_ops_ - lcp_moe_ - lcp_pair_ops_, lcp_ops_, lcp_split_, lcp_split_ ? " from 256 rows" : "",
+                 lcp_runs_, (long long)p1_min_rows_, ds41p1::kEnv, ds41p1::kMinRowsEnv, (long long)p1_min_rows_,
+                 (long long)p1_cpu_rows(), HostExpertPool::max_rows(), HostExpertPool::slots());
+        return;
+    }
     RAD_INFO("large-chunk prefill: passes of up to %lld tokens (%s=%lld): %d routed MXFP4 GEMMs on "
              "moe_gemm_ggml_mxfp4_gemv to 16 tokens and its twin moe_gemm_ggml_mxfp4_gemv_tall above (%d bands; "
              "this libr4d's twin reaches %lld); multi-kernel ops admitted: %s; the other %d of %d ops on one "
@@ -2107,7 +2255,7 @@ void FileStager::hx_choose(int32_t li) {
         hx_ra_chose_ns_ = rt_now_ns();
     }
     const double cb = hx_pool_->cpu_bytes_per_ns(), lb = hx_pool_->link_bytes_per_ns();
-    const bool misses = hx_miss_rows_ > 0 && pass_tok_ <= hx_miss_rows_;
+    const bool misses = hx_miss_rows_ > 0 && hx_miss_need(li) <= hx_miss_rows_;
     int64_t link = 0;
     for (size_t i = 0; i < want_.size(); ++i) {
         const int32_t u = want_[i];
@@ -2189,7 +2337,7 @@ void FileStager::hx_choose(int32_t li) {
         }
         link += plan_->units[(size_t)u].bytes;
     }
-    if (ra) {   /* the layer's units it did not select */
+    if (ra && !tbo_keeps_ra()) {   /* the layer's units it did not select */
         for (RaEntry& r : hx_ra_here_) hx_ra_drop(r, false);
         hx_ra_here_.clear();
     }
@@ -2326,6 +2474,11 @@ int FileStager::hx_fetch(int32_t li, RadStream s) {
 int FileStager::hx_fetch_list(int32_t li, const int32_t* row, RadStream s) {
     const HxOps& o = hx_ops_[(size_t)li];
     const int64_t T = pass_tok_;
+    /* A split pass's slice B starts past row 0, which the list's copies do not: separate copies. */
+    if (tbo_ && layer_r0(li) != 0) {
+        ++hx_stats_.fl_plain;
+        return 0;
+    }
     const size_t at = (size_t)li * (size_t)ep_rows_ + (size_t)(T - 1);
     if (T < 1 || T > ep_rows_ || at >= hx_fl_key_.size() || at >= hx_fl_cap_) {
         ++hx_stats_.fl_plain;
@@ -2509,6 +2662,7 @@ int FileStager::hx_early_decide() {
     want_.clear();
     skip_.clear();
     for (int32_t u : L.units) {
+        if (mover_->ring_resident(u)) continue;   /* a lent-ring resident: the card's, as a VRAM one */
         bool selected = false;
         if (!ep_route_unit_selected(counts_host_, plan_->units[(size_t)u].expert, &selected))
             return RAD_E_STATE;
@@ -3561,7 +3715,8 @@ void FileStager::hx_ra_drop_stale(uint32_t pass, int32_t li) {
 
 void FileStager::hx_ra_begin(int32_t li) {
     hx_ra_at_.store(((uint64_t)trace_pass_ << 32) | (uint32_t)(li + 1), std::memory_order_release);
-    hx_ra_here_.clear();
+    /* A split pass's slice B keeps what slice A left of this layer (tbo_keeps_ra). */
+    if (!(tbo_ && tbo_slice_ == 1)) hx_ra_here_.clear();
     {
         std::lock_guard<std::mutex> lk(hx_ra_mu_);
         for (size_t i = 0; i < hx_ra_live_.size();) {
@@ -4161,6 +4316,11 @@ int FileStager::operands(rad_op h, RadStream s, const RadTensor* t, int n_t) {
     if ((size_t)h < first_of_.size() && first_of_[(size_t)h] >= 0) {
         const int32_t li = first_of_[(size_t)h];
         if ((size_t)li < hx_ops_.size() && hx_ops_[(size_t)li].gu == (int32_t)h) {
+            /* Prefill Phase 1's admission read the order from the addresses an earlier pass's gate_up
+             * read: counted when this one reads others (the bits never depend on it). */
+            if (p1_armed_ && p1_order_ && p1_li_ == li && n_t >= 4 &&
+                (t[2].data != hx_ops_[(size_t)li].sorted || t[3].data != hx_ops_[(size_t)li].off))
+                ++p1_order_moved_;
             RAD_TRY(hx_capture(li, s, t, n_t));
             return hx_defer_li_ == li ? hx_deferred(li, s) : RAD_OK;
         }
@@ -4227,6 +4387,13 @@ int FileStager::before_op(rad_op h, RadStream s, bool* resync) {
     if ((size_t)h >= first_of_.size()) return RAD_OK;
     const int32_t li = first_of_[(size_t)h];
     if (li < 0) return RAD_OK;
+    if (li == cur_ && tbo_) {
+        /* A split pass: micro-batch B's slice of the layer, behind A's gather. */
+        RAD_TRY(tbo_second(li, s));
+        *resync = true;
+        return RAD_OK;
+    }
+    if (li != cur_ && tbo_) tbo_enter(0);   /* a split pass enters a layer with micro-batch A */
     if (li == cur_) {
         /* The layer's first op again: a block that slices the pass routes each slice afresh, so
          * an expert aliased for the slice before may be wanted now. Read the whole layer behind
@@ -4274,14 +4441,98 @@ int FileStager::before_op(rad_op h, RadStream s, bool* resync) {
     return RAD_OK;
 }
 
+/* RADIANCE_EXPERIMENTAL_SCHED_TBO (stager.h, tbo_): slice `slice` of the step's rows runs. */
+void FileStager::tbo_enter(int slice) {
+    tbo_slice_ = slice;
+    pass_tok_ = tbo::rows_of(tbo_tok_, slice);
+    hx_ra_pass_ = ra_pass_reads_ahead(true, 0, pass_tok_, hx_ra_rows_);
+}
+
+bool FileStager::tbo_keeps_ra() const {
+    return tbo_ && tbo_slice_ == 0 &&
+           ra_pass_reads_ahead(true, 0, tbo::rows_of(tbo_tok_, 1), hx_ra_rows_);
+}
+
+/* Layer li's second gate_up in a split pass: slice A has had its gather (its CPU rows were copied
+ * there, or it had none), so its holds go and slice B's reads start as a layer's first op's do. */
+int FileStager::tbo_second(int32_t li, RadStream s) {
+    if (tbo_slice_ != 0) {
+        RAD_ERR("two-batch overlap: layer %d's gate_up issued a third time in one pass",
+                layers_[(size_t)li].layer);
+        return RAD_E_STATE;
+    }
+    if ((hx_li_ == li && hx_stage_ == 2) || hx_early_li_ == li) {
+        RAD_ERR("two-batch overlap: layer %d's slice B issued before slice A's gather",
+                layers_[(size_t)li].layer);
+        return RAD_E_STATE;
+    }
+    hx_drain();
+    tbo_enter(1);
+    const int b = li & 1;
+    if (holds_[b] == li) RAD_TRY(finish(b, s));
+    bool read = false;
+    const bool ep = ep_counts_ && pass_tok_ > 0 && pass_tok_ <= ep_rows_ &&
+                    (size_t)li < ep_layer_eligible_.size() && ep_layer_eligible_[(size_t)li];
+    if (routed_ && ep) RAD_TRY(start_ep_routed(li, s, &read));
+    if (routed_ && !ep) RAD_TRY(start_routed(li, s, &read));
+    if (!read) RAD_TRY(start(li));
+    if (holds_[b] == li && pending_[b]) RAD_TRY(rad_event_wait(s, done_[b]));
+    ++tbo_slices_;
+    return RAD_OK;
+}
+
 int FileStager::end_pass(RadStream s) {
     if (!armed_) return RAD_OK;
     armed_ = false;
+    /* Prefill Phase 1: every copy seen and every source let go before the buffers are released; the
+     * mover's stream then waits behind this pass's last reader of the ring. */
+    int p1_rc = RAD_OK;
+    /* The lent ring: the grace runs from the card path's last pass, and the residents' last reader so
+     * far is behind this pass, which a later armed pass's first ring copy waits on. */
+    if (p1_ && p1_->lending()) {
+        if (p1_armed_) p1_->lender().end_p1(p1_now_ms());
+        if (p1_->lender().residents() > 0) {
+            const int r = s ? rad_event_record(p1_lend_ev_, s) : RAD_E_STATE;
+            if (r >= 0) p1_lend_rec_ = true;
+            else p1_rc = r;
+        }
+    }
+    if (p1_armed_) {
+        p1_armed_ = false;
+        if (p1_li_ >= 0)
+            RAD_ERR("ds41 p1: routed layer %d's down projection was never issued this pass",
+                    layers_[(size_t)p1_li_].layer);
+        const int er = p1_->end_pass(s, p1_end_);
+        if (p1_rc >= 0) p1_rc = er;
+        if (p1_li_ >= 0 && p1_rc >= 0) p1_rc = RAD_E_STATE;
+        p1_li_ = -1;
+        if (plan_->rank == 0) {
+            const double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - p1_t0_).count();
+            const auto& c = p1_->counts();
+            static uint64_t units0 = 0, bytes0 = 0;
+            const uint64_t du = c.drive_units - units0, db = c.drive_bytes - bytes0;
+            units0 = c.drive_units;
+            bytes0 = c.drive_bytes;
+            long long avail_kb = -1;
+            if (FILE* f = std::fopen("/proc/meminfo", "r")) {
+                char line[256];
+                while (std::fgets(line, sizeof line, f))
+                    if (std::sscanf(line, "MemAvailable: %lld kB", &avail_kb) == 1) break;
+                std::fclose(f);
+            }
+            RAD_INFO("%s rows %lld, layers %llu (and %llu cut below %lld rows, on the CPU path), wall %.3f s "
+                     "(issue), rank 0 drive units %llu, %.2f GB/s, MemAvailable %lld MiB", ds41p1::kLogChunk,
+                     (long long)p1_pass_rows_, (unsigned long long)p1_layers_, (unsigned long long)p1_cpu_layers_,
+                     (long long)p1_min_rows_, wall, (unsigned long long)du,
+                     wall > 0 ? (double)db * 1e-9 / wall : 0.0, avail_kb >= 0 ? avail_kb / 1024 : -1);
+        }
+    }
     /* An early-issued layer whose gather never came is lost too: its card ops ran on aliases. */
     const bool lost = (hx_li_ >= 0 && hx_stage_ == 2) || hx_early_li_ >= 0;
     if (lost) RAD_ERR("host experts: layer %d's CPU rows reached no gather before the pass ended",
                       layers_[(size_t)(hx_early_li_ >= 0 ? hx_early_li_ : hx_li_)].layer);
     hx_drain();
+    tbo_ = false;
     /* A cut pass ends early by design: its last op says nothing of where a whole pass ends. */
     if (pass_full_ == INT32_MAX) pass_last_[pass_kind_] = last_issued_;
     int rc = lost ? RAD_E_STATE : RAD_OK;
@@ -4291,7 +4542,484 @@ int FileStager::end_pass(RadStream s) {
             if (r < 0 && rc >= 0) rc = r;
         }
     cur_ = -1;
+    if (rc >= 0 && p1_rc < 0) rc = p1_rc;
     return rc<0 ? rc : head_status_;
+}
+
+/* ---- prefill Phase 1 (card_expert_stager.h) ---------------------------------------------------------- */
+
+/* RADIANCE_EXPERIMENTAL_DS41_P1: the switch's checks beyond lcp_init's bands and hx_init's CPU path, and
+ * the path's start. Off (unset, empty, 0): nothing. Refused, with the reason: an invalid value; P1
+ * without an admitted LCP chunk or beyond 2048; the tunables out of range; FETCH_LIST; the route trace;
+ * the DSpark head tail; a routed layer the counts path or the CPU path does not take, or whose gate_up,
+ * SwiGLU and down cannot be named; a routed unit off the card neither in the container nor pinned in
+ * the host pool of a static plan (a pooled unit is copied to the ring from its pool slot, p1_pool_; a
+ * plan that moves units may relocate it between steps); a ring of fewer than kMinRingSlots slots. */
+int FileStager::p1_init(const Program& prog) {
+    p1_.reset();
+    p1_armed_ = false;
+    const char* v = std::getenv(ds41p1::kEnv);
+    const int st = ds41p1::env_state(v);
+    p1_state_ = st;
+    if (st == 0) return RAD_OK;
+    auto refuse = [&](const std::string& why) {
+        RAD_ERR("%s=%s (prefill Phase 1, card experts) refused: %s", ds41p1::kEnv, v ? v : "", why.c_str());
+        return RAD_E_INVAL;
+    };
+    if (st < 0) return refuse("1 is on, 0 / unset / empty off");
+    if (!enabled() || !mover_ || !plan_) return refuse("no routed layer is read from the container on this rank");
+    if (!lcp_) return refuse(fmt("it needs large-chunk prefill (%s=<C>, the chunk the cards take)", kLcpEnv));
+    if (lcp_ > ds41p1::kTwinMaxRows || lcp_ > 2048)
+        return refuse(fmt("%s=%lld: the first milestone takes chunks of up to 2048", kLcpEnv, (long long)lcp_));
+    p1::Tunables t;
+    std::string why;
+    if (!p1::parse_tunables([](const char* k) { return std::getenv(k); }, &t, &why)) return refuse(why);
+    if (const char* fl = std::getenv("RADIANCE_EXPERIMENTAL_DS41_FETCH_LIST"); fl && !std::strcmp(fl, "1"))
+        return refuse("RADIANCE_EXPERIMENTAL_DS41_FETCH_LIST=1 is not covered");
+    if (prog.ctx.max_spec > 0) return refuse("speculation is on");
+    /* Set but empty is off (ab_window.sh states the switch on every arm without Rt). */
+    if (const char* rte = std::getenv("RADIANCE_EXPERIMENTAL_DS41_ROUTE_TRACE"); rt_ || (rte && *rte))
+        return refuse("RADIANCE_EXPERIMENTAL_DS41_ROUTE_TRACE is on: its records follow the CPU path's choice");
+    if (head_.configured()) return refuse("the DSpark head tail holds the routed layers' file buffers");
+    if (!hx_pool_ || !hx_capped_)
+        return refuse("the CPU path must take the passes of up to 16 tokens with the file buffers capped "
+                      "(host experts, ..._POLICY=all, ..._MISSES, ..._FILE_BUFFER_UNITS)");
+    /* Every routed layer: on the counts path, with its gate_up (hx_ops_), one SwiGLU and its down. */
+    p1_ops_.assign(layers_.size(), P1Ops{});
+    for (size_t li = 0; li < layers_.size(); ++li) {
+        const Layer& L = layers_[li];
+        if (li >= ep_layer_eligible_.size() || !ep_layer_eligible_[li] || li >= hx_ops_.size() ||
+            hx_ops_[li].gu != L.first_op)
+            return refuse(fmt("routed layer %d is not on the EP counts path with its gate_up found", L.layer));
+        int32_t sw = -1;
+        std::string others;
+        for (int32_t h = L.first_op + 1; h < L.last_op; ++h) {
+            const OpInfo& op = prog.ops[(size_t)h];
+            if (op.op == "swiglu_clamped" && sw < 0) sw = h;
+            else others += (others.empty() ? "" : ", ") + op.op;
+        }
+        const OpInfo& dn = prog.ops[(size_t)L.last_op];
+        const char* ord = dn.base.get_s("a_order");
+        if (sw < 0 || !others.empty() || dn.op != "moe_gemm_ggml" || !ord || std::strcmp(ord, "sorted"))
+            return refuse(fmt("routed layer %d's expert ops are not gate_up, one swiglu_clamped and down (ops %d..%d%s%s)",
+                              L.layer, L.first_op, L.last_op, others.empty() ? "" : "; also ", others.c_str()));
+        p1_ops_[li].sw = sw;
+        p1_ops_[li].dn = L.last_op;
+    }
+    /* The routed units of these layers off the card: file-tier units (the ring takes them from the RAM
+     * cache or the drive) and, in a static plan, units pinned in the host pool, which the ring takes
+     * from their pool slots (p1_pool_) instead of the card reading them across the link once a row
+     * pass. Anything else is refused. */
+    {
+        std::vector<int32_t> li_of((size_t)std::max<int32_t>(n_model_layers_, 1) + 64, -1);
+        for (size_t li = 0; li < layers_.size(); ++li)
+            if (layers_[li].layer >= 0 && (size_t)layers_[li].layer < li_of.size())
+                li_of[(size_t)layers_[li].layer] = (int32_t)li;
+        p1_pool_.assign(layers_.size(), {});
+        p1_pool_units_ = 0;
+        int other = 0, first = -1;
+        const char* first_why = "";
+        for (size_t u = 0; u < plan_->units.size(); ++u) {
+            const MoveUnit& mu = plan_->units[u];
+            if (mu.layer < 0 || (size_t)mu.layer >= li_of.size() || li_of[(size_t)mu.layer] < 0 ||
+                mu.access != RAD_ACCESS_CONDITIONAL || mu.tier == Tier::VRAM || mu.tier == Tier::SSD)
+                continue;
+            std::vector<int32_t>& v = p1_pool_[(size_t)li_of[(size_t)mu.layer]];
+            bool dup = false;
+            for (int32_t w : v) dup = dup || plan_->units[(size_t)w].expert == mu.expert;
+            p1::Source src;
+            const char* no = mu.tier != Tier::HostPinned ? "neither in VRAM, the container nor the host pool"
+                           : plan_->dynamic ? "pinned in the host pool of a plan that moves units between steps"
+                           : mu.expert < 0 || mu.expert >= 96 || dup ? "not one unit of a local expert"
+                           : !p1_pool_source((int32_t)u, &src) ? "pinned, but not a block_mxfp4 gate_up and down pair "
+                                                                 "with a pool address"
+                                                               : nullptr;
+            if (!no) {
+                v.push_back((int32_t)u);
+                ++p1_pool_units_;
+                continue;
+            }
+            if (!other++) {
+                first = (int)u;
+                first_why = no;
+            }
+        }
+        if (other)
+            return refuse(fmt("%d routed units of these layers are off the card in a form the card path cannot copy (the "
+                              "first: unit %d, layer %d, %s); it takes file-tier units, and units pinned in the host "
+                              "pool of a static plan", other, first, plan_->units[(size_t)first].layer, first_why));
+    }
+    if (!p1_end_ && rad_event_create_local(&p1_end_) < 0) return refuse("could not create its events");
+    if (t.verify > 0) {
+        const int64_t n = t.verify;
+        if (!p1_vidx_) p1_vidx_ = (int32_t*)rad_dev_alloc((6 * lcp_ + 128) * 4, RAD_MEM_HOST_PINNED);
+        if (!p1_vx_) p1_vx_ = (uint16_t*)rad_dev_alloc(n * kHxEmbd * 2, RAD_MEM_HOST_PINNED);
+        if (!p1_vy_) p1_vy_ = (uint16_t*)rad_dev_alloc(n * kHxEmbd * 2, RAD_MEM_HOST_PINNED);
+        if (!p1_vh_) p1_vh_ = (uint16_t*)rad_dev_alloc(n * kHxEmbd * 2, RAD_MEM_HOST_PINNED);
+        if (!p1_vev_ && rad_event_create(&p1_vev_) < 0) p1_vev_ = nullptr;
+        if (!p1_vidx_ || !p1_vx_ || !p1_vy_ || !p1_vh_ || !p1_vev_)
+            return refuse("no pinned memory or event for the host verify (..._P1_VERIFY)");
+    }
+    auto path = std::make_unique<p1::CardExpertPath>();
+    const int rc = path->init(
+        mover_, t, plan_->rank, [this](int32_t u) { return hx_planes_get(u); },
+        [this](std::shared_ptr<Mover::HostPlanes> p, int rows) {
+            /* An admitted miss to the insert threads, at most ..._LCP_INSERTQ queued at once. */
+            {
+                std::lock_guard<std::mutex> lk(hx_bg_mu_);
+                if (hx_bg_.empty() || (int64_t)hx_bg_q_.size() + hx_bg_busy_ >= hx_lcp_insertq_) {
+                    ++hx_stats_.lcp_miss_dropped;
+                    return;
+                }
+                ++hx_stats_.lcp_miss_admit;
+                hx_bg_q_.push_back(HxInsert{ std::move(p), rows });
+            }
+            hx_bg_cv_.notify_all();
+        },
+        &why);
+    if (rc < 0) return refuse(why);
+    p1_ = std::move(path);
+    p1_min_rows_ = t.min_rows;
+    if (t.lend > 0 && p1_lend_init(t, &why) < 0) {
+        p1_.reset();
+        return refuse(why);
+    }
+    if (plan_->rank == 0)
+        RAD_INFO("%s: every routed expert row of a pure prefill pass's layer of %lld to %lld rows on the cards "
+                 "(%s=%lld; a shorter layer pass takes the CPU path, up to %lld rows); ring %d slots of %lld bytes "
+                 "(%.0f MiB a card), waves of %d units, %d drive units in flight, %d pinned ready slots, %d units "
+                 "read ahead, verify %d expert-rows a layer, chunks aligned to the %s; %d routed units pinned in the "
+                 "host pool copied to the ring from their pool slots; the RAM cache read-only but for the units the "
+                 "prompt's last rows select (..._LCP_ADMIT)",
+                 ds41p1::kLogOn, (long long)p1_min_rows_, (long long)lcp_, ds41p1::kMinRowsEnv, (long long)p1_min_rows_,
+                 (long long)p1_cpu_rows(), p1_->ring_slots(), (long long)ds41p1::kSlotBytes,
+                 (double)p1_->ring_slots() * (double)ds41p1::kSlotBytes / 1048576.0, t.wave, t.inflight, t.ready,
+                 t.ahead, t.verify, t.align_end ? "prompt's end" : "chunk grid (start)", p1_pool_units_);
+    return RAD_OK;
+}
+
+bool FileStager::p1_pool_source(int32_t u, p1::Source* out) const {
+    if (!mover_ || !plan_ || !ep_program_ || u < 0 || (size_t)u >= plan_->units.size() || !out) return false;
+    const MoveUnit& mu = plan_->units[(size_t)u];
+    const char* const base = (const char*)mover_->unit_base(u);
+    if (mu.tier != Tier::HostPinned || !base || mover_->file_unit_in_slab(u) || mu.weights.size() != 2 ||
+        mu.offset.size() != 2)
+        return false;
+    p1::Source src;
+    for (size_t k = 0; k < 2; ++k) {
+        const WeightInfo& w = ep_program_->weights[mu.weights[k]];
+        const bool gu = w.stored_bytes == ds41p1::kGuBlockBytes;
+        if ((!gu && w.stored_bytes != ds41p1::kDnBlockBytes) || w.layout_tag != "ggml_mxfp4" ||
+            w.decl.shard != RAD_SHARD_NONE)
+            return false;
+        (gu ? src.gu : src.dn) = base + mu.offset[k];
+        (gu ? src.gu_bytes : src.dn_bytes) = w.stored_bytes;
+    }
+    if (!src.gu || !src.dn) return false;
+    *out = src;
+    return true;
+}
+
+/* The lent ring (card_expert_stager.h): the ring's slots that neither file buffer's alias base names,
+ * each lent to one of this rank's hottest file-tier units by the profile (a trunk layer's, one the CPU
+ * path can read), at most ..._P1_LEND of them; the reloads begin at once, and every pass from the next
+ * publishes what has landed. Refused when no slot or no unit can be lent. */
+int FileStager::p1_lend_init(const p1::Tunables& t, std::string* why) {
+    const char* const ring = p1_->ring_base();
+    const int n_slots = p1_->ring_slots();
+    std::vector<int> slots;
+    for (int r = 0; r < n_slots; ++r) {
+        const char* at = ring + (int64_t)r * ds41p1::kSlotBytes;
+        bool alias = false;
+        for (int b = 0; b < 2; ++b)
+            alias = alias || (buf_[b] && at < buf_[b] + ds41p1::kSlotBytes && buf_[b] < at + ds41p1::kSlotBytes);
+        if (!alias) slots.push_back(r);
+    }
+    std::vector<int32_t> cand;
+    for (size_t li = 0; li < layers_.size(); ++li) {
+        if (layers_[li].layer < 0 || layers_[li].layer >= n_model_layers_ || li >= ep_layer_eligible_.size() ||
+            !ep_layer_eligible_[li])
+            continue;
+        for (int32_t u : layers_[li].units) {
+            const MoveUnit& mu = plan_->units[(size_t)u];
+            if (mu.bytes == ds41p1::kSlotBytes && mu.weights.size() == 2 && mu.offset.size() == 2 &&
+                !mover_->file_unit_in_slab(u) && mover_->host_planes_eligible(u))
+                cand.push_back(u);
+        }
+    }
+    std::stable_sort(cand.begin(), cand.end(), [&](int32_t a, int32_t c) {
+        return plan_->units[(size_t)a].profile_share > plan_->units[(size_t)c].profile_share;
+    });
+    const int alias_slots = n_slots - (int)slots.size();
+    const int k = std::min<int>(t.lend, (int)std::min(slots.size(), cand.size()));
+    if (k <= 0) {
+        if (why)
+            *why = fmt("%s=%d: no ring slot (%d slots, %zu past the file buffers' alias bases) or file-tier unit "
+                       "(%zu) to lend", ds41p1::kLendEnv, t.lend, n_slots, slots.size(), cand.size());
+        return RAD_E_INVAL;
+    }
+    std::vector<p1::CardExpertPath::LendUnit> units((size_t)k);
+    for (int i = 0; i < k; ++i) {
+        const MoveUnit& mu = plan_->units[(size_t)cand[(size_t)i]];
+        p1::CardExpertPath::LendUnit& lu = units[(size_t)i];
+        lu.unit = cand[(size_t)i];
+        for (int w = 0; w < 2; ++w) {
+            lu.off[w] = mu.offset[(size_t)w];
+            lu.bytes[w] = ep_program_->weights[mu.weights[(size_t)w]].stored_bytes;
+        }
+    }
+    slots.resize((size_t)k);
+    if (!p1_lend_ev_ && rad_event_create_local(&p1_lend_ev_) < 0) {
+        p1_lend_ev_ = nullptr;
+        if (why) *why = "could not create the lent ring's event";
+        return RAD_E_DEVICE;
+    }
+    p1_lend_rec_ = false;
+    RAD_TRY(p1_->lend_init(units, slots, t.grace_ms, why));
+    (void)p1_->lender().begin_pass(false, p1_now_ms());   /* the first reloads begin now */
+    if (plan_->rank == 0) {
+        double share = 0.0;
+        for (int i = 0; i < k; ++i) share += plan_->units[(size_t)cand[(size_t)i]].profile_share;
+        RAD_INFO("%s: %d of the ring's %d slots (%d of them past the file buffers' alias bases; %s=%d) hold "
+                 "rank 0's %d hottest file-tier units (profile share %.4f) as decode residents outside the card "
+                 "path's passes; a pass that arms it takes them back, and %d ms after its last pass (%s) they are "
+                 "reloaded in the background (from the RAM cache where it holds the card's block form, else read "
+                 "from the drive and relaid into two pinned buffers of %.0f MiB) and published again; a unit not "
+                 "yet reloaded, or whose reload failed, takes the CPU path",
+                 ds41p1::kLogLend, k, n_slots, n_slots - alias_slots, ds41p1::kLendEnv, t.lend, k, share, t.grace_ms,
+                 ds41p1::kGraceEnv,
+                 (double)ds41p1::kSlotBytes / 1048576.0);
+    }
+    return RAD_OK;
+}
+
+/* Layer li of an armed pass, its counts in counts_host_ and its selected file-tier units in want_
+ * (the rest in skip_): the slab's residents stay where they are; every other selected unit goes to
+ * the ring (a RAM-cache hit borrowed, a miss read), published with kMarkSkip; the rest aliased as
+ * always. The layer's next one's likely misses are read after this one's. */
+int FileStager::p1_layer(int32_t li, RadStream s) {
+    (void)s;
+    const Layer& L = layers_[(size_t)li];
+    const int b = li & 1;
+    if (p1_li_ >= 0) {
+        RAD_ERR("ds41 p1: routed layer %d began while layer %d's waves had not run",
+                L.layer, layers_[(size_t)p1_li_].layer);
+        return RAD_E_STATE;
+    }
+    for (int e = 0; e < 96 && e < counts_cap_; ++e) p1_touched_ += counts_host_[e] > 0;
+    RAD_TRY(p1_->begin_layer(li, b));
+    /* The admission: none in a pass whose rows stop short of the admission row; every unit when the row
+     * is 0 (a prompt within the last N tokens, or ..._LCP_ADMIT=all); else by the sorted order
+     * fetched with the counts (none without it). */
+    p1_nonres_.clear();
+    p1_ram_.clear();
+    p1_units_ = 0;
+    for (int32_t u : want_) {
+        if (mover_->file_unit_in_slab(u)) { ++p1_slab_; continue; }
+        const int32_t e = plan_->units[(size_t)u].expert;
+        const int rows = e >= 0 && e < counts_cap_ ? counts_host_[e] : 0;
+        const bool admit = p1_admits(li, e);
+        bool hit = false;
+        RAD_TRY(p1_->add_ram(e, u, rows, admit, &hit));
+        if (!hit) {
+            if (!mover_->host_planes_eligible(u)) {
+                RAD_ERR("ds41 p1: routed layer %d's unit %d cannot be read as planes", L.layer, u);
+                return RAD_E_STATE;
+            }
+            RAD_TRY(p1_->add_drive(e, u, rows, admit));
+        }
+        p1_nonres_.push_back(u);
+        p1_ram_.push_back(hit ? 1 : 0);
+        ++p1_units_;
+    }
+    /* The layer's selected units pinned in the host pool: copied from their pool slots as a RAM-cache
+     * unit is, and published skipped like the others until the layer is released. */
+    p1_pool_sel_.clear();
+    if ((size_t)li < p1_pool_.size())
+        for (int32_t u : p1_pool_[(size_t)li]) {
+            const int32_t e = plan_->units[(size_t)u].expert;
+            const int rows = e >= 0 && e < counts_cap_ ? counts_host_[e] : 0;
+            if (rows <= 0) continue;
+            p1::Source src;
+            if (!p1_pool_source(u, &src)) {
+                RAD_ERR("ds41 p1: routed layer %d's unit %d has no pool slot to copy from", L.layer, u);
+                return RAD_E_STATE;
+            }
+            RAD_TRY(p1_->add_pool(e, u, rows, src));
+            p1_pool_sel_.push_back(u);
+            ++p1_units_;
+        }
+    staged_[b].clear();
+    mover_->alias_file_units(skip_, buf_[b], &staged_[b]);
+    mover_->alias_file_units(p1_nonres_, (char*)p1_->alias_base(), &staged_[b], ds41p1::kMarkSkip);
+    mover_->alias_pool_units(p1_pool_sel_, (char*)p1_->alias_base(), &staged_[b], ds41p1::kMarkSkip);
+    partial_[b] = true;
+    pending_[b] = false;
+    if (!staged_[b].empty()) holds_[b] = li;
+    RAD_TRY(p1_->start());
+    /* The next routed layer's likely misses: its file-tier units neither in the slab nor in the RAM
+     * cache, by the sealed profile's share (best first). */
+    const int32_t nx = li + 1;
+    if (p1_->tunables().ahead > 0 && (size_t)nx < layers_.size() && will_issue(nx) && p1_layer_on(nx)) {
+        p1_ahead_.clear();
+        for (int32_t u : layers_[(size_t)nx].units)
+            if (!mover_->file_unit_in_slab(u) && mover_->host_planes_eligible(u) && !mover_->unit_cached(u))
+                p1_ahead_.push_back(u);
+        std::stable_sort(p1_ahead_.begin(), p1_ahead_.end(), [&](int32_t a, int32_t c) {
+            return plan_->units[(size_t)a].profile_share > plan_->units[(size_t)c].profile_share;
+        });
+        RAD_TRY(p1_->read_ahead(nx, p1_ahead_));
+    }
+    p1_li_ = li;
+    ++p1_layers_;
+    return RAD_OK;
+}
+
+/* The admission: none in a pass whose rows stop short of the admission row; every unit when the row is
+ * 0 (a prompt within the last N tokens, ..._LCP_ADMIT=all, or a step that is not a lone chunk); else
+ * by the sorted order fetched with the counts (hx_admits), and none without it. */
+bool FileStager::p1_admits(int32_t li, int32_t e) const {
+    if (lcp_admit_row_ <= 0) return true;
+    if (lcp_admit_row_ >= pass_tok_ || !p1_order_ || !hx_idx_ || li < 0 || (size_t)li >= hx_ops_.size()) return false;
+    const HxOps& o = hx_ops_[(size_t)li];
+    if (e < 0 || e >= (int32_t)o.n_expert || o.top_k <= 0) return false;
+    /* Expert e's slots are [off[e], off[e + 1]) (the n_expert + 1 offsets fetched with the counts; the
+     * slots past off[n_expert] are other ranks'), each a token of the layer's rows times top_k. */
+    const int64_t rows = layer_rows(li), T = rows * o.top_k, from = lcp_admit_row_ - layer_r0(li);
+    const int32_t* const sorted = hx_idx_;
+    const int32_t* const off = hx_idx_ + hx_sorted_max();
+    const int64_t lo = std::clamp<int64_t>(off[e], 0, T), hi = std::clamp<int64_t>(off[e + 1], lo, T);
+    for (int64_t i = lo; i < hi; ++i)
+        if (sorted[i] >= 0 && sorted[i] / o.top_k >= from && sorted[i] / o.top_k < rows) return true;
+    return false;
+}
+
+int FileStager::launched(rad_op h, RadStream, const RadArgs* a, int (*launch)(const RadArgs*, RadStream)) {
+    if (!p1_armed_ || p1_li_ < 0) return RAD_OK;
+    const size_t li = (size_t)p1_li_;
+    const int32_t op = (int32_t)h;
+    const int which = op == hx_ops_[li].gu ? 0 : op == p1_ops_[li].sw ? 1 : op == p1_ops_[li].dn ? 2 : -1;
+    if (which < 0) return RAD_OK;
+    return p1_->capture(which, a, launch);
+}
+
+int FileStager::after_op(rad_op h, RadStream s) {
+    if (!p1_armed_ || p1_li_ < 0 || (int32_t)h != p1_ops_[(size_t)p1_li_].dn) return RAD_OK;
+    const int32_t li = p1_li_;
+    p1_li_ = -1;
+    /* Behind the down projection, before any later op: the waves (card_expert_stager.h). */
+    const int rc = p1_->run(s);
+    if (rc < 0) return rc;
+    if (p1_->tunables().verify > 0) return p1_verify(li, s);
+    return RAD_OK;
+}
+
+int FileStager::p1_verify(int32_t li, RadStream s) {
+    auto& c = p1_->counts_mut();
+    const int N = p1_->tunables().verify;
+    int na = 0, nd = 0;
+    const RadTensor* ga = p1_->captured_operands(0, &na);
+    const RadTensor* da = p1_->captured_operands(2, &nd);
+    const HxOps& o = hx_ops_[(size_t)li];
+    if (!ga || !da || na < 5 || nd < 5 || !hx_pool_ || o.top_k <= 0) return RAD_E_STATE;
+    const RadTensor &A = ga[0], &so = ga[2], &of = ga[3], &Y = da[4];
+    const int64_t rows = A.rank == 2 ? A.shape[0] : 0, T = rows * o.top_k;
+    const int64_t x_ld = rows > 1 ? A.stride[0] : kHxEmbd, y_ld = Y.rank == 2 && Y.shape[0] > 1 ? Y.stride[0] : kHxEmbd;
+    if (rows <= 0 || T > 6 * lcp_ || A.dtype != RAD_BF16 || Y.dtype != RAD_BF16 || !so.data || !of.data) return RAD_E_STATE;
+    /* The order and the offsets, as the card's gate_up read them. */
+    int32_t* const sorted = p1_vidx_;
+    int32_t* const off = p1_vidx_ + 6 * lcp_;
+    RAD_TRY(rad_memcpy_async(sorted, so.data, T * 4, s));
+    RAD_TRY(rad_memcpy_async(off, of.data, (o.n_expert + 1) * 4, s));
+    RAD_TRY(rad_event_record(p1_vev_, s));
+    RAD_TRY(rad_event_sync(p1_vev_));
+    /* The samples: expert-rows of the layer's RAM-cache units, evenly over them. */
+    std::vector<std::pair<int32_t, int32_t>> cand;   /* (index in p1_nonres_, sorted slot) */
+    for (size_t k = 0; k < p1_nonres_.size(); ++k) {
+        if (!p1_ram_[k]) continue;
+        const int32_t e = plan_->units[(size_t)p1_nonres_[k]].expert;
+        if (e < 0 || e >= (int32_t)o.n_expert) continue;
+        const int64_t lo = std::clamp<int64_t>(off[e], 0, T), hi = std::clamp<int64_t>(off[e + 1], lo, T);
+        for (int64_t i = lo; i < hi; ++i)
+            if (sorted[i] >= 0 && sorted[i] / o.top_k < rows) cand.push_back({ (int32_t)k, (int32_t)i });
+    }
+    if (cand.empty()) return RAD_OK;
+    const size_t step = std::max<size_t>(1, cand.size() / (size_t)N);
+    std::vector<std::pair<int32_t, int32_t>> pick;
+    for (size_t i = 0; i < cand.size() && (int)pick.size() < N; i += step) pick.push_back(cand[i]);
+    for (size_t k = 0; k < pick.size(); ++k) {
+        const int64_t i = pick[k].second, t = sorted[i] / o.top_k;
+        RAD_TRY(rad_memcpy_async(p1_vx_ + k * kHxEmbd, (const char*)A.data + t * x_ld * 2, kHxEmbd * 2, s));
+        RAD_TRY(rad_memcpy_async(p1_vy_ + k * kHxEmbd, (const char*)Y.data + i * y_ld * 2, kHxEmbd * 2, s));
+    }
+    RAD_TRY(rad_event_record(p1_vev_, s));
+    RAD_TRY(rad_event_sync(p1_vev_));
+    /* The same rows on the CPU from the cache's bytes, borrowed again (read-only). */
+    std::vector<Mover::HostUnit> held(pick.size());
+    std::vector<HostExpertPool::Job> jobs;
+    std::vector<size_t> job_of;
+    int64_t cost = 0;
+    for (size_t k = 0; k < pick.size(); ++k) {
+        Mover::HostUnit& hu = held[k];
+        if (!mover_->borrow_host_unit(p1_nonres_[(size_t)pick[k].first], &hu, false) || hu.n != 2) {
+            mover_->release_host_unit(&hu);
+            ++c.verify_skipped;   /* evicted since its copy */
+            continue;
+        }
+        HostExpertPool::Job j;
+        const int g = hu.bytes[0] == HostExpertPool::kGuBytes ? 0 : 1;
+        j.gu = hu.host[g];
+        j.dn = hu.host[1 - g];
+        if (hu.packed) {
+            j.packed = true;
+            j.gu_bytes = hu.slot[g];
+            j.dn_bytes = hu.slot[1 - g];
+        }
+        j.x = p1_vx_ + k * kHxEmbd;
+        j.y = p1_vh_ + k * kHxEmbd;
+        j.cost = HostExpertPool::job_cost(1);
+        cost += j.cost;
+        jobs.push_back(j);
+        job_of.push_back(k);
+    }
+    if (!jobs.empty()) {
+        HostExpertPool::Ticket tk;
+        hx_pool_->reserve(cost);
+        const int rc = hx_pool_->submit(jobs.data(), (int)jobs.size(), &tk);
+        if (rc < 0) {
+            hx_pool_->unreserve(cost);
+            for (Mover::HostUnit& hu : held) mover_->release_host_unit(&hu);
+            return rc;
+        }
+        hx_pool_->wait(&tk);
+    }
+    for (Mover::HostUnit& hu : held) mover_->release_host_unit(&hu);
+    for (size_t k : job_of) {
+        const uint16_t* a = p1_vh_ + k * kHxEmbd;
+        const uint16_t* b = p1_vy_ + k * kHxEmbd;
+        int bad = 0, first = -1;
+        for (int i = 0; i < kHxEmbd; ++i)
+            if (a[i] != b[i]) { ++bad; if (first < 0) first = i; }
+        ++c.verified;
+        if (!bad) continue;
+        if (++c.differ <= 8)
+            RAD_WARN("ds41 p1 verify: layer %d sorted row %d (unit %d): %d of %d values differ from the CPU's "
+                     "(first at %d: 0x%04x on the CPU, 0x%04x on the card)", layers_[(size_t)li].layer,
+                     pick[k].second, p1_nonres_[(size_t)pick[k].first], bad, (int)kHxEmbd, first, a[first], b[first]);
+    }
+    return RAD_OK;
+}
+
+std::string FileStager::p1_stats_line() const {
+    if (!p1_) return std::string();
+    std::string line = p1_->stats_line(plan_ ? plan_->rank : 0);
+    const auto& sc = p1_->sched();
+    const uint64_t ring = sc.ram + sc.drive + sc.pool;
+    line += fmt("; touched experts %llu: VRAM residents %llu, slab %llu, ring %llu; admission orders moved %llu",
+                (unsigned long long)p1_touched_,
+                (unsigned long long)(p1_touched_ >= ring + p1_slab_ ? p1_touched_ - ring - p1_slab_ : 0),
+                (unsigned long long)p1_slab_, (unsigned long long)ring, (unsigned long long)p1_order_moved_);
+    return line;
 }
 
 }  /* namespace rad */

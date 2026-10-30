@@ -21,6 +21,7 @@
 #include <chrono>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <unordered_map>
 
 namespace rad {
@@ -852,6 +853,20 @@ private:
     int64_t cs_band_ = 0;
     /* Large-chunk prefill, as lcp_init decided it (lcp_rows). */
     int64_t lcp_ = 0;
+    /* Prefill Phase 1's end-aligned chunks (RADIANCE_EXPERIMENTAL_DS41_P1=1 with ..._P1_ALIGN end, the
+     * default; sched/p1_chunk.h): a lone prompt's chunks at the whole step are cut so its last chunk
+     * is full; off under --prefix-resume exact (its resume grid is the start-aligned chunks') and
+     * with ..._P1_ALIGN=start. p1_grid_: where a non-final chunk ends (16 and the quantum). */
+    bool    p1_end_ = false;
+    int64_t p1_grid_ = 16;
+public:
+    /* Tests: end alignment on or off at chunk C (plan_chunk), as lcp_init would set it. */
+    void set_p1_end_align(bool on, int64_t C) { p1_end_ = on; lcp_ = on ? C : lcp_; p1_grid_ = p1_grid(); }
+    int64_t p1_grid() const {
+        const int64_t q = geo_.quantum > 0 ? geo_.quantum : 1;
+        return std::lcm<int64_t>(16, q);
+    }
+private:
     int     lcp_init(const Program& prog, const Config& cfg, const std::vector<BatchBuilder::RankIO>& ranks);
     /* RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH=1 (read at init; acts under --prefix-resume
      * exact): a finished sequence publishes only up to SchedReq::grid_upto. An exact hit resumes

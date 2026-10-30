@@ -24,6 +24,16 @@ int r4d_rad_moe_gemm_mxfp4_gemv_vp(const RadArgs*, RadStream);
 /* The `_gemv` kernel at any number of tokens: the launch of moe_gemm_ggml_mxfp4_gemv_tall, the twin r4d_rows.cpp
  * adds under RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=1. */
 int r4d_rad_moe_gemm_mxfp4_gemv_tall(const RadArgs*, RadStream);
+/* The twin under RADIANCE_EXPERIMENTAL_DS41_P1 (r4d_ds41_tall.h; the row moe_gemm_ggml_mxfp4_gemv_tall_p1, contract
+ * T1-T6 in tools/ds41-host-experts/ds41_p1.h): over a weight table, gemv_vp's kernel at any number of tokens, entries
+ * with bit 0 packed-scale weights, entries with bit 1 skipped (no row written, no byte read), the live-tail ranges
+ * with the slots past off[n_expert] written as zeros, the work spread by row passes. A stacked weight is served as
+ * r4d_rad_moe_gemm_mxfp4_gemv_tall serves it. */
+int r4d_rad_moe_gemm_mxfp4_gemv_tall_p1(const RadArgs*, RadStream);
+/* Checker-only: the same with its work split forced for the call (0 or less: the launcher's own choice): `grid`
+ * blocks, at most `item_kib` KiB of weight rows a work item, `fill` work items a block on average, `lds_kib` KiB
+ * of staged activation rows (by default 36, or two whole rows where 36 holds one: gate_up; at most 56). Same bits. */
+int r4d_rad_moe_gemm_mxfp4_gemv_tall_p1_opts(const RadArgs*, RadStream, int grid, int item_kib, int fill, int lds_kib);
 /* Checker-only: the gemv row (`tall` 0) or the twin (1) with RADIANCE_EXPERIMENTAL_DS41_MOE_BALANCE forced off
  * (`bal` 0) or on (1) for the call: work items by row passes, dropped passes without weight reads, same bits. */
 int r4d_rad_moe_gemm_mxfp4_gemv_bal(const RadArgs*, RadStream, int tall, int bal);

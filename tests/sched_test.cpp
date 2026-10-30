@@ -9,6 +9,7 @@
 #include "sched/scheduler.h"
 #include "sched/advance_impl.h"
 #include "sched/derive.h"
+#include "sched/tbo.h"
 #include "server/sink.h"
 
 #include <algorithm>
@@ -7695,6 +7696,9 @@ struct PfAloneRun {
     bool ahead_refused = true;  /* step_next refused after every step that left a row out */
     std::vector<int32_t> b_chunks;
     size_t a_out = 0, b_out = 0;
+    /* The two-batch overlap's split (core/sched/tbo.h) on these steps: those split, and those
+     * whose split disagrees with "decode rows of two or more sequences and nothing else". */
+    int split = 0, split_wrong = 0;
 };
 void pf_alone_run(bool on, PfAloneRun& out) {
     Fixture f;
@@ -7714,7 +7718,8 @@ void pf_alone_run(bool on, PfAloneRun& out) {
     CHECK_EQ(f.sch.find(a)->output.size(), (size_t)1);   /* a decodes from here */
     const uint64_t b = f.submit(40, 12);
     for (int k = 0; k < 60; ++k) {
-        if (!f.sch.step()) break;
+        const RadBatch* sb = f.sch.step();
+        if (!sb) break;
         const StepPlan& p = f.sch.plan();
         int pf = 0, dec = 0;
         bool a_dec = false, b_dec = false;
@@ -7724,6 +7729,9 @@ void pf_alone_run(bool on, PfAloneRun& out) {
         }
         if (pf && (pf > 1 || dec)) out.pure = false;
         if (a_dec && b_dec) ++out.together;
+        const bool splits = tbo::step_splits(sb);
+        out.split += splits;
+        out.split_wrong += splits != (pf == 0 && dec >= 2);
         Request* ra = f.sch.find(a);
         Request* rb = f.sch.find(b);
         if (ra) ra->speculation_fixed = true;
@@ -7750,6 +7758,20 @@ TEST(prefill_alone_lets_a_second_request_decode_beside_the_first) {
     CHECK(off.b_chunks == std::vector<int32_t>({ 16, 16, 8 }));
     CHECK_EQ(on.a_out, (size_t)12);
     CHECK_EQ(on.b_out, (size_t)12);
+}
+
+/* The two-batch overlap (core/sched/tbo.h) on the scheduler's own steps under the switch above:
+ * exactly the steps carrying both sequences' decode rows split, never a prompt chunk; without it
+ * (one after another) no step does. */
+TEST(two_batch_splits_exactly_the_steps_that_decode_together) {
+    PfAloneRun off, on;
+    pf_alone_run(false, off);
+    CHECK_EQ(off.split, 0);
+    CHECK_EQ(off.split_wrong, 0);
+    pf_alone_run(true, on);
+    CHECK_EQ(on.split, on.together);
+    CHECK(on.split >= 8);
+    CHECK_EQ(on.split_wrong, 0);
 }
 
 /* ================================================================== the consumer skip */

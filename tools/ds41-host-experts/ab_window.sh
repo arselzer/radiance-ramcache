@@ -99,6 +99,31 @@
 # an Mb arm runs only on the libr4d.so (sha256) that passed it. Lf: RADIANCE_EXPERIMENTAL_DS41_LCP_PROFILE=1,
 # the file stager's per-pass-size time lines at exit (an instrument; no change to what runs).
 #
+# P1 (prefill Phase 1, RADIANCE_EXPERIMENTAL_DS41_P1=1; core/place/card_expert_stager.h): with an LcN part,
+# every routed expert row of a pure prefill pass's routed layer of at least the threshold's rows on the
+# cards (residents in place, RAM-cache units, units pinned in the host pool and drive misses through a VRAM
+# ring of the file buffers, waves of a few units); a shorter layer pass takes the CPU path exactly as an Lc
+# arm without P1 does. Needs BN with N >= 2 (the ring: B6, 12 slots, is the measured one) and an M part of
+# min(N_Lc, threshold - 1) or more (the CPU path takes the layer passes below the threshold: M319 at the
+# default, M16 at Qm17); the arm's Mr part serves those passes. QmN the threshold (..._P1_MIN_ROWS, 17-4096,
+# 320; Qm17 is the card path for every pass above 16 tokens, as before the threshold), QwN units a wave
+# (..._P1_WAVE, 2), QiN drive units in flight a rank (..._P1_INFLIGHT, 16), QrN pinned ready slots a rank
+# (..._P1_READY, 6), QaN units read ahead (..._P1_AHEAD, 8; Qa0 off), QvN expert-rows a layer recomputed on
+# the host (..._P1_VERIFY, 0), Qs chunks aligned to the start (..._P1_ALIGN=start; end by default), QlK the
+# lent ring: K of the ring's slots (at most 2N - 2: all but the two the file buffers' alias bases name, B1's
+# share) hold the rank's hottest file-tier units as decode residents between the card path's passes, taken
+# back by a pass that arms it and reloaded in the background QhMS ms after its last one (..._P1_LEND, 0 off;
+# ..._P1_GRACE_MS, 1000; Qh needs Ql; Q[gnc] stays the power settings), so B6-Ql10 gives decode B1's
+# residents; each needs P1. Every other arm states RADIANCE_EXPERIMENTAL_DS41_P1=0 and the Q knobs empty
+# (..._P1_LEND 0). A P1 arm is measured only if the server logs "ds41 p1: card experts on" at startup with
+# its threshold and chunk ("a pure prefill pass's layer of N to C rows") (and a plain arm only without it),
+# a Ql arm "ds41 p1: lent ring: K of the ring's" (and any other none), and runs only on the libr4d.so
+# (sha256) on which `p1` in DEVICE_CHECKS passed (ds41_mxfp4_device_check TALL_LIBR4D p1 P1_CHECK_M
+# P1_ROUTES on card 0, "p1: PASS" its last line; P1_CHECK_M 4096 by default, P1_ROUTES a p0_tables.py routes
+# file, none by default); an Lc2048 arm needs LCP_CHECK_C=2048 as before. The window log takes each P1 arm's
+# "ds41 p1 stats, rank" and "ds41 p1 chunk:" lines; a P1 arm whose stats lines count a lease held at a pass
+# end, or (Qv) a host-verified expert-row that differs from the card's, is not measured.
+#
 # Environment: RADIANCE_BIN (the binary), RADIANCE_HOME_DIR (kernels/ and architectures/ for it),
 # SILU_TABLE (the card's silu table), ARMS (default "base verify greedy"), HX_THREADS (16),
 # VERIFY_REQUESTS (3), DEVICE_CHECKS (1; a list: `tall` the exact-tall checks, `lcp` the large-chunk
@@ -246,7 +271,7 @@ xt_check() {   # name
 # start otherwise), and the scheduler the chunks and the cache admission. An Lc arm without that line,
 # or a plain arm with it, is not measured.
 lcp_check() {   # name
-  local name=$1 lc_lines
+  local name=$1 lc_lines p1_lines
   lc_lines=$(grep -c 'large-chunk prefill: passes of up to [0-9]* tokens' "$OUT/$name.server.log")
   if [[ -n "${ARM_LC:-}" ]] && ! grep -q "large-chunk prefill: passes of up to ${ARM_LC} tokens" "$OUT/$name.server.log"; then
     log "arm $name: Lc${ARM_LC}, but the server log has no 'large-chunk prefill: passes of up to ${ARM_LC} tokens' line ($(grep -m2 -E 'large-chunk prefill' "$OUT/$name.server.log" | tr '\n' ' ')); not measured"
@@ -260,6 +285,35 @@ lcp_check() {   # name
     grep -m3 -E 'large-chunk prefill: |chunk geometry: ' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
     grep -m1 -E 'consumer skip: ' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   fi
+  # P1 (RADIANCE_EXPERIMENTAL_DS41_P1): rank 0's "ds41 p1: card experts on" line at startup, in a P1 arm
+  # only.
+  p1_lines=$(grep -c 'ds41 p1: card experts on' "$OUT/$name.server.log")
+  if [[ -n "${ARM_P1:-}" && "$p1_lines" == 0 ]]; then
+    log "arm $name: P1, but the server log has no 'ds41 p1: card experts on' line ($(grep -m2 -E 'ds41 p1|P1' "$OUT/$name.server.log" | tr '\n' ' ')); not measured"
+    return 1
+  fi
+  if [[ -z "${ARM_P1:-}" && "$p1_lines" != 0 ]]; then
+    log "arm $name: no P1 part, but the server runs the card path (the knob set for the window?); not measured"
+    return 1
+  fi
+  # ...and the line states the arm's threshold (QmN, 320 without one) and chunk.
+  if [[ -n "${ARM_P1:-}" ]] &&
+     ! grep -q "ds41 p1: card experts on: every routed expert row of a pure prefill pass's layer of ${ARM_QM:-320} to ${ARM_LC} rows" "$OUT/$name.server.log"; then
+    log "arm $name: P1, but the card path's line does not state layer passes of ${ARM_QM:-320} to ${ARM_LC} rows ($(grep -m1 'ds41 p1: card experts on' "$OUT/$name.server.log")); not measured"
+    return 1
+  fi
+  # QlK: rank 0's "ds41 p1: lent ring: K of the ring's" line at startup, in a Ql arm only.
+  local lend_lines
+  lend_lines=$(grep -c 'ds41 p1: lent ring: ' "$OUT/$name.server.log")
+  if [[ -n "${ARM_QL:-}" ]] && ! grep -q "ds41 p1: lent ring: ${ARM_QL} of the ring's" "$OUT/$name.server.log"; then
+    log "arm $name: Ql${ARM_QL}, but the server log has no 'ds41 p1: lent ring: ${ARM_QL} of the ring's' line ($(grep -m1 'ds41 p1: lent ring' "$OUT/$name.server.log")); not measured"
+    return 1
+  fi
+  if [[ -z "${ARM_QL:-}" && "$lend_lines" != 0 ]]; then
+    log "arm $name: no Ql part, but the server lends the ring (the knob set for the window?); not measured"
+    return 1
+  fi
+  [[ -n "${ARM_P1:-}" ]] && grep -m2 -E 'ds41 p1: ' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   return 0
 }
 
@@ -431,6 +485,7 @@ Pk${ARM_PK:-}|${ARM_PK:-}|router predictor: .*one prediction in [0-9]+ checked a
 Pw|${ARM_PW:-}|rank 0 posts the read-ahead's router input once a layer's CPU work is submitted
 Ns${ARM_NS:-}|${ARM_NS:-}|side store: the planes of up to [0-9]+ units a rank
 Pv|${ARM_PV:-}|router predictor: every posted router input is recorded to
+Tb|${ARM_TB:-}|two-batch overlap \(RADIANCE_EXPERIMENTAL_SCHED_TBO=1\): a decode step
 EOF2
   if [[ -n "$sw_bad" ]]; then
     log "arm $name:$sw_bad not measured"
@@ -672,6 +727,27 @@ EOF2
     log "arm $name: $dk_bad; not measured (results kept as $name.unmeasured.json)"
     [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
   fi
+  # P1 at exit: each rank's "ds41 p1 stats, rank" line counts the leases its passes still held at their
+  # end (released there: a source not let go in order) and, with a Qv part, the expert-rows the host
+  # recomputed and how many differ from the card's. A P1 arm with a lease at a pass end or a differing
+  # row on any rank is not measured (results kept as <arm>.unmeasured.json), with the reason.
+  if [[ -n "${ARM_P1:-}" ]]; then
+    local p1_bad="" p1_ranks=0 p1_leases=0 p1_vrows=0 p1_differ=0 p1l pl pv pd
+    while IFS= read -r p1l; do
+      pl=$(sed -nE 's/.*leases at pass end ([0-9]+).*/\1/p' <<< "$p1l")
+      pv=$(sed -nE 's/.*verify rows ([0-9]+), differ ([0-9]+).*/\1/p' <<< "$p1l")
+      pd=$(sed -nE 's/.*verify rows ([0-9]+), differ ([0-9]+).*/\2/p' <<< "$p1l")
+      p1_ranks=$((p1_ranks + 1)); p1_leases=$((p1_leases + ${pl:-0}))
+      p1_vrows=$((p1_vrows + ${pv:-0})); p1_differ=$((p1_differ + ${pd:-0}))
+      [[ -z "$pl" || -z "$pd" ]] && p1_bad="a 'ds41 p1 stats, rank' line without its leases or verify counts ($p1l)"
+    done < <(grep -E 'ds41 p1 stats, rank [0-9]+: ' "$OUT/$name.server.log")
+    (( p1_leases > 0 )) && p1_bad="${p1_bad:+$p1_bad; }$p1_leases leases still held at a pass end over $p1_ranks ranks"
+    (( p1_differ > 0 )) && p1_bad="${p1_bad:+$p1_bad; }the host verify: $p1_differ of $p1_vrows expert-rows differ from the card's over $p1_ranks ranks"
+    if [[ -n "$p1_bad" ]]; then
+      log "arm $name: P1, but $p1_bad; not measured (results kept as $name.unmeasured.json)"
+      [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
+    fi
+  fi
   # Pmr with a drafting Ds part (DSpark's 2+ row verify passes) at shutdown: the predictor's
   # multi-row line, and some rank's "by pass size" line with a "2 rows:" entry that planned units;
   # otherwise the switch never acted on a verify pass and the arm is set aside (mrra review B3).
@@ -781,6 +857,16 @@ EOF2
   grep -E 'planned units VRAM=|VRAM packed' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   grep -E 'route trace' "$OUT/$name.server.log" | tail -6 | tee -a "$OUT/window.log"   # Rt: per rank, and the files
   grep -E 'consumer skip: [0-9]+ (prefill|cut) passes|rank 0: consumer skip' "$OUT/$name.server.log" | tee -a "$OUT/window.log"   # Cs: what the cut ran
+  grep -E 'ds41 p1 stats, rank|ds41 p1 chunk:' "$OUT/$name.server.log" | tail -24 | tee -a "$OUT/window.log"   # P1: each rank's totals, rank 0's chunks
+  # Tb: the steps each rank issued as two micro-batches and the routed layers rank stagers ran as two
+  # slices. A Tb arm that sent requests together (CK, K > 1) and split no step did not do what its
+  # name says: its results are set aside as <arm>.unmeasured.json.
+  grep -E 'two-batch overlap: [0-9]+ (decode steps|routed layers)' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
+  if [[ -n "${ARM_TB:-}" && "${ARM_CONC:-${AB_CONCURRENCY:-1}}" -gt 1 ]] &&
+     ! grep -qE 'rank 0: two-batch overlap: [1-9][0-9]* decode steps' "$OUT/$name.server.log"; then
+    log "arm $name: Tb, but rank 0 split no decode step; not measured (results kept as $name.unmeasured.json)"
+    [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
+  fi
   grep -E 'prefill hash: seq [0-9]+, [0-9]+ tokens: all ranks' "$OUT/$name.server.log" | tee -a "$OUT/window.log"   # Kh: a digest a prompt
   grep -E '^libr4d: RADIANCE_EXPERIMENTAL_DS41_DRAFT_GEMV' "$OUT/$name.server.log" | tail -2 | tee -a "$OUT/window.log"   # Dk/Dkt: calls taken
   grep -E 'host expert pool: |host experts, pre-wake: |host experts, one-token passes: ' "$OUT/$name.server.log" | tee -a "$OUT/window.log"   # Fw/WpN: the wake-up, decode's gather waits
@@ -885,6 +971,41 @@ if [[ " ${DEVICE_CHECKS:-1} " == *" bal "* ]]; then
     else
       BAL_WHY="the balanced gemv device check did not pass on $TL (devcheck-bal.log)"
       log "$BAL_WHY; no Mb arm is measured"
+      fi
+    fi
+fi
+# The P1 arms' gate (RADIANCE_EXPERIMENTAL_DS41_P1), like Lc's: a P1 arm runs only on the libr4d.so
+# (sha256) on which ds41_mxfp4_device_check `p1` passed in this window (the P1 row against the gemv in
+# passes of 16, the marks, the live tail and the wave composition; the check sets LCP=2048 and P1=1 itself).
+P1_OK="" P1_LIB="" P1_SUM=""
+P1_WHY="no prefill Phase 1 device check in this window (DEVICE_CHECKS=p1 with TALL_CHECK and TALL_LIBR4D)"
+if [[ " ${DEVICE_CHECKS:-1} " == *" p1 "* ]]; then
+  TL=${TALL_LIBR4D:-} TC=${TALL_CHECK:-} PM=${P1_CHECK_M:-4096} PR=${P1_ROUTES:-}
+  if [[ ! -x "$TC" || ! -f "$TL" ]]; then
+    P1_WHY="TALL_CHECK=$TC is not an executable or TALL_LIBR4D=$TL is not a file"
+    log "prefill Phase 1 device check: $P1_WHY; no P1 arm is measured"
+  elif ! [[ $PM =~ ^[0-9]+$ ]] || (( 10#$PM < 17 || 10#$PM > 4096 )); then
+    P1_WHY="P1_CHECK_M=$PM is not in 17..4096"
+    log "prefill Phase 1 device check: $P1_WHY; no P1 arm is measured"
+  elif [[ -n "$PR" && ! -f "$PR" ]]; then
+    P1_WHY="P1_ROUTES=$PR is not a file"
+    log "prefill Phase 1 device check: $P1_WHY; no P1 arm is measured"
+  else
+    log "prefill Phase 1 device check on card 0 with $TL ($TC), M up to $PM${PR:+, routes $PR}"
+    ( export HIP_VISIBLE_DEVICES=0
+      unset RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL RADIANCE_EXPERIMENTAL_DS41_LCP RADIANCE_EXPERIMENTAL_DS41_P1
+      timeout 1800 "$TC" "$TL" p1 $((10#$PM)) $PR >"$OUT/devcheck-p1.log" 2>&1
+      echo "p1 exit $?" >>"$OUT/devcheck-p1.log" )
+    grep -E '^p1( time)?:|exit' "$OUT/devcheck-p1.log" | tail -14 | tee -a "$OUT/window.log"
+    p1_bad=""
+    grep -qx "p1 exit 0" "$OUT/devcheck-p1.log" || p1_bad+=" p1 exited non-zero;"
+    [[ "$(grep -E '^p1: (PASS|FAIL)' "$OUT/devcheck-p1.log" | tail -1)" == "p1: PASS"* ]] || p1_bad+=" its last p1 line is not PASS;"
+    if [[ -z "$p1_bad" ]]; then
+      P1_OK=1 P1_LIB=$TL P1_SUM=$(sha256sum "$TL" 2>/dev/null | cut -d' ' -f1)
+      log "prefill Phase 1 device check passed on $TL, sha256 ${P1_SUM:0:16}: P1 arms on it are measured"
+    else
+      P1_WHY="the prefill Phase 1 device check did not pass on $TL:$p1_bad"
+      log "$P1_WHY no P1 arm is measured"
     fi
   fi
 fi
@@ -1173,7 +1294,9 @@ for a in $ARMS; do
 # knob off; Pf a prefill chunk runs in a step of its own and the decode rows of concurrent requests
 # run together (RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE); NK --max-num-seqs K, CK the arm's requests
 # sent K at a time (AB_CONCURRENCY), LK --max-model-len K (the KV pool backs about one sequence of K
-# tokens in all: 512 holds four 110-token requests, 1024 eight, 2048 sixteen); rN a repeat (ignored).
+# tokens in all: 512 holds four 110-token requests, 1024 eight, 2048 sixteen); Tb a decode step of two or
+# more sequences issued as two micro-batches, each layer's MoE gather of one behind the other's card
+# work (RADIANCE_EXPERIMENTAL_SCHED_TBO; a radiance and deepseek41 from claude/ds41-tbo); rN a repeat (ignored).
 # the RAM cache's profile-hot units get N second chances before eviction; Ov / Ov2 a launch whose
 # first dispatch depends on nothing in flight on its queue goes without the barrier bit, in decode
 # passes / in every pass issued live (RADIANCE_EXPERIMENTAL_DS41_CHAIN_OVERLAP=1 / 2; exact, only
@@ -1280,8 +1403,9 @@ for a in $ARMS; do
 # input, ~190 MB an arm of the held-out prompts; an instrument: router_score_eval scores the file
 # offline in bf16, int8 and int4 against the container's routers); needs a predictor part.
   IFS=- read -r -a parts <<< "$a"
-  xt="" bt="" kld="" dk="" db="" pu="" ins_nt="" ins_kib="" ins_wait="" lean="" lc="" ad="" dv="" xd="" hs="" dg="" df="" pmr=""
+  xt="" bt="" kld="" dk="" db="" pu="" ins_nt="" ins_kib="" ins_wait="" lean="" lc="" ad="" dv="" xd="" hs="" dg="" df="" pmr="" tb=""
   mb="" lf=""
+  p1="" q1=() qm="" ql="" qg=""
   pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 HOST_POOL_MIB=4096 EXTRA_ARGS="" ARM_HOME="$RHOME" ARM_CONC=
   ARM_PROMPTS= ARM_N= ARM_LQ= rt=
   power="" skip="" ARGS=() f8="" f8x="" rb="" rbf=0 pred="" cs="" ck="" kh="" pc="" pcopt="" fw="" wp="" wl=""
@@ -1391,6 +1515,7 @@ for a in $ARMS; do
       Pcm[0-9]*) pcopt+=" $p"; hpm=1; ARGS+=(--prefix-cache-mib "${p#Pcm}") ;;                 # host KV tier of N MiB
       Pcr)     pcopt+=" $p"; hpr=1; env+=(RADIANCE_EXPERIMENTAL_DS41_KV_REPLICATED=1) ;;       # index/compressed caches replicated
       Pf)      env+=(RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE=1) ;;   # a prefill chunk alone in its step; decode rows batched
+      Tb)      tb=1 ;;                                                 # two-batch overlap of concurrent decode steps
       N[0-9]*) ARGS+=(--max-num-seqs "${p#N}") ;;                     # this arm's --max-num-seqs (MAX_SEQS for every arm)
       C[0-9]*) ARM_CONC=${p#C} ;;                                     # this arm's requests sent K at a time (AB_CONCURRENCY)
       L[0-9]*) ARGS+=(--max-model-len "${p#L}") ;;                    # this arm's --max-model-len (KV for N sequences)
@@ -1409,6 +1534,21 @@ for a in $ARMS; do
                if [[ $lc =~ ^[0-9]+$ ]] && (( 10#$lc >= 64 && 10#$lc <= 2048 && 10#$lc % 16 == 0 )); then
                  lc=$((10#$lc)); ARGS+=(--max-num-batched-tokens "$lc"); env+=(RADIANCE_EXPERIMENTAL_DS41_LCP=$lc)
                else log "arm $a: $p: a chunk is a multiple of 16 in 64..2048; the arm is skipped"; skip=1; fi ;;
+      P1)      p1=1 ;;                                                  # prefill Phase 1: card experts in large chunks (needs Lc)
+      Qw[0-9]*|Qi[0-9]*|Qr[0-9]*|Qa[0-9]*|Qv[0-9]*|Qm[0-9]*|Ql[0-9]*|Qh[0-9]*)   # ...wave / in flight / ready / read-ahead / verify / threshold / lent slots / its hold
+               qn=${p:2}
+               case ${p:0:2} in
+                 Qw) qk=WAVE qlo=1 qhi=16 ;; Qi) qk=INFLIGHT qlo=1 qhi=64 ;; Qr) qk=READY qlo=1 qhi=32 ;;
+                 Qa) qk=AHEAD qlo=0 qhi=64 ;; Qm) qk=MIN_ROWS qlo=17 qhi=4096 ;; Ql) qk=LEND qlo=1 qhi=64 ;;
+                 Qh) qk=GRACE_MS qlo=0 qhi=60000 ;; *) qk=VERIFY qlo=0 qhi=4096 ;;
+               esac
+               if [[ $qn =~ ^[0-9]+$ ]] && (( 10#$qn >= qlo && 10#$qn <= qhi )); then
+                 q1+=(RADIANCE_EXPERIMENTAL_DS41_P1_$qk=$((10#$qn)))
+                 [[ $qk == MIN_ROWS ]] && qm=$((10#$qn))
+                 [[ $qk == LEND ]] && ql=$((10#$qn))
+                 [[ $qk == GRACE_MS ]] && qg=$((10#$qn))
+               else log "arm $a: $p: ${p:0:2} takes $qlo-$qhi; the arm is skipped"; skip=1; fi ;;
+      Qs)      q1+=(RADIANCE_EXPERIMENTAL_DS41_P1_ALIGN=start) ;;       # ...chunks aligned to the start
       Ad[0-9]*) ad=${p#Ad}; env+=(RADIANCE_EXPERIMENTAL_DS41_LCP_ADMIT=$((10#$ad))) ;;   # admit the last N tokens' units
       Ada)     ad=all; env+=(RADIANCE_EXPERIMENTAL_DS41_LCP_ADMIT=all) ;;       # admit every unit (as at 16 rows)
       Lp[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_LCP_PLANES=${p#Lp}) ;;        # missed units read at once a layer
@@ -1524,6 +1664,10 @@ for a in $ARMS; do
   fi
   env+=(RADIANCE_EXPERIMENTAL_DS41_PREFETCH_MULTIROW=${pmr:-0})
   ARM_PMR=$pmr
+  # Tb: stated by every arm (0 off), so a window's VAR=val cannot split another arm's steps; arm()
+  # checks deepseek41's startup line both ways.
+  env+=(RADIANCE_EXPERIMENTAL_SCHED_TBO=${tb:-0})
+  ARM_TB=$tb
   # Ss: the read-back runs in an arm only if its name says so, whatever the window's environment.
   [[ " ${env[*]} " == *" RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP=1 "* ]] || env+=(RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP=0)
   # Pi8 / Pi4, PkN, Pw, NsN, Pv: each acts only with what it changes (a predictor; Pi; Ei and the
@@ -1674,18 +1818,56 @@ for a in $ARMS; do
   # RADIANCE_EXPERIMENTAL_DS41_LCP: an Lc arm's chunk, 0 in every other arm.
   if [[ -n "$lc" ]]; then
     [[ -n "$xt$bt" ]] && { log "arm $a: Lc goes with neither Xt nor BT (it sets the step itself); the arm is skipped"; skip=1; }
-    [[ " ${env[*]} " == *" RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS=1 "* ]] ||
-      { log "arm $a: Lc needs B1 (the CPU takes every routed unit); the arm is skipped"; skip=1; }
     mm=$(grep -oE ' RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MISSES=[0-9]+' <<< " ${env[*]}" | tail -1 | cut -d= -f2)
-    (( ${mm:-0} >= lc )) || { log "arm $a: Lc$lc needs M$lc or more (the CPU computes a chunk's misses); the arm is skipped"; skip=1; }
-    # The pool's job size is not a matter of bits, but 4-row jobs (the default) take a chunk about twice
-    # the CPU time of the many-row kernel's: an Lc arm names it (Mr32 or Mr64; Mr4 for a control).
-    [[ " ${env[*]} " == *" RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MAX_ROWS="* ]] ||
-      { log "arm $a: Lc needs an Mr part (Mr32 or Mr64: a chunk's experts in many-row jobs); the arm is skipped"; skip=1; }
+    bn=$(grep -oE ' RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS=[0-9]+' <<< " ${env[*]}" | tail -1 | cut -d= -f2)
+    if [[ -n "$p1" ]]; then
+      # P1: the ring is the file buffers (B2 or more); the CPU path takes every layer pass below the threshold
+      # (QmN, 320 without one): its misses up to min(C, N - 1) rows (M16 at Qm17, M319 at the default).
+      qmin=${qm:-320}
+      qcpu=$(( qmin - 1 < lc ? qmin - 1 : lc ))
+      (( ${bn:-0} >= 2 )) || { log "arm $a: P1 needs B2 or more (the ring: 2N slots; B6 is the measured one); the arm is skipped"; skip=1; }
+      (( ${mm:-0} >= qcpu )) || { log "arm $a: P1 at the threshold $qmin needs M$qcpu or more (the CPU path takes the layer passes below it, up to $qcpu rows); the arm is skipped"; skip=1; }
+      # QlK lends K of the ring's 2N slots to decode residents: at most the 2N - 2 past the file buffers' alias bases.
+      [[ -n "$ql" ]] && (( ql > 2 * ${bn:-0} - 2 )) && { log "arm $a: Ql$ql lends more than the $(( 2 * ${bn:-0} - 2 )) slots B${bn:-0}'s ring has past the file buffers' alias bases; the arm is skipped"; skip=1; }
+    else
+      [[ " ${env[*]} " == *" RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS=1 "* ]] ||
+        { log "arm $a: Lc needs B1 (the CPU takes every routed unit); the arm is skipped"; skip=1; }
+      (( ${mm:-0} >= lc )) || { log "arm $a: Lc$lc needs M$lc or more (the CPU computes a chunk's misses); the arm is skipped"; skip=1; }
+      # The pool's job size is not a matter of bits, but 4-row jobs (the default) take a chunk about twice
+      # the CPU time of the many-row kernel's: an Lc arm names it (Mr32 or Mr64; Mr4 for a control).
+      [[ " ${env[*]} " == *" RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MAX_ROWS="* ]] ||
+        { log "arm $a: Lc needs an Mr part (Mr32 or Mr64: a chunk's experts in many-row jobs); the arm is skipped"; skip=1; }
+    fi
     env+=(RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=)
   elif [[ -n "$xt" ]]; then env+=(RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=1 RADIANCE_EXPERIMENTAL_DS41_LCP=0)
   else env+=(RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=0 RADIANCE_EXPERIMENTAL_DS41_LCP=0); fi
   if [[ -n "$ad" && -z "$lc" ]]; then log "arm $a: Ad$ad needs Lc (it acts on large chunks only); the arm is skipped"; skip=1; fi
+  # P1 (RADIANCE_EXPERIMENTAL_DS41_P1): with Lc, on the libr4d.so the `p1` device check passed on; every
+  # other arm states the switch 0 and the Q knobs empty, so a window's VAR=val cannot turn them on.
+  if [[ -n "$p1" ]]; then
+    [[ -n "$lc" ]] || { log "arm $a: P1 needs an Lc part (the chunk the cards take); the arm is skipped"; skip=1; }
+    if [[ -z "$skip" ]]; then
+      IFS=: read -r -a homes <<< "$ARM_HOME"
+      lib=""
+      for h in "${homes[@]}"; do [[ -f "$h/kernels/libr4d.so" ]] && { lib=$h/kernels/libr4d.so; break; }; done
+      if [[ -z "$P1_OK" ]]; then
+        log "arm $a: P1 refused: $P1_WHY"; skip=1
+      elif [[ -z "$lib" || "$(sha256sum "$lib" 2>/dev/null | cut -d' ' -f1)" != "$P1_SUM" ]]; then
+        log "arm $a: P1 refused: its libr4d.so (${lib:-none under $ARM_HOME}) is not the one the p1 check passed on ($P1_LIB, sha256 ${P1_SUM:0:16})"; skip=1
+      fi
+    fi
+    env+=(RADIANCE_EXPERIMENTAL_DS41_P1=1 RADIANCE_EXPERIMENTAL_DS41_P1_WAVE= RADIANCE_EXPERIMENTAL_DS41_P1_INFLIGHT=
+          RADIANCE_EXPERIMENTAL_DS41_P1_READY= RADIANCE_EXPERIMENTAL_DS41_P1_AHEAD= RADIANCE_EXPERIMENTAL_DS41_P1_VERIFY=
+          RADIANCE_EXPERIMENTAL_DS41_P1_ALIGN= RADIANCE_EXPERIMENTAL_DS41_P1_MIN_ROWS= RADIANCE_EXPERIMENTAL_DS41_P1_LEND=0
+          RADIANCE_EXPERIMENTAL_DS41_P1_GRACE_MS= "${q1[@]}")
+    [[ -n "$qg" && -z "$ql" ]] && { log "arm $a: Qh$qg sets the lent ring's grace, which needs a QlK part; the arm is skipped"; skip=1; }
+  else
+    (( ${#q1[@]} )) && { log "arm $a: the Q parts (${q1[*]}) need P1; the arm is skipped"; skip=1; }
+    env+=(RADIANCE_EXPERIMENTAL_DS41_P1=0 RADIANCE_EXPERIMENTAL_DS41_P1_WAVE= RADIANCE_EXPERIMENTAL_DS41_P1_INFLIGHT=
+          RADIANCE_EXPERIMENTAL_DS41_P1_READY= RADIANCE_EXPERIMENTAL_DS41_P1_AHEAD= RADIANCE_EXPERIMENTAL_DS41_P1_VERIFY=
+          RADIANCE_EXPERIMENTAL_DS41_P1_ALIGN= RADIANCE_EXPERIMENTAL_DS41_P1_MIN_ROWS= RADIANCE_EXPERIMENTAL_DS41_P1_LEND=0
+          RADIANCE_EXPERIMENTAL_DS41_P1_GRACE_MS=)
+  fi
   [[ -n "$ad" ]] || env+=(RADIANCE_EXPERIMENTAL_DS41_LCP_ADMIT=)
   # Fw / WpN (the CPU pool's wake-up): every arm states both switches, 0 off, so a window's VAR=val
   # cannot turn them on for an arm whose name does not say so; arm() checks the server log both ways.
@@ -1724,7 +1906,7 @@ for a in $ARMS; do
     rm -rf "$OUT/kld-$a"
     ARGS=(--max-model-len "${KLD_LEN:-2048}" "${ARGS[@]}" --kld-record "$OUT/kld-$a" --kld-corpus "$OUT/kld-corpus.jsonl")
   fi
-  ARM_XT=$xt ARM_BT=$bt ARM_KLD=$kld ARM_LC=$lc
+  ARM_XT=$xt ARM_BT=$bt ARM_KLD=$kld ARM_LC=$lc ARM_P1=$p1 ARM_QM=${qm:-320} ARM_QL=$ql
   [[ -n "$skip" ]] && continue
   [[ -n "$power" ]] && power_set "$power"
   case $pol in

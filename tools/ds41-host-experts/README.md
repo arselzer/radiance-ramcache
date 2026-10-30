@@ -950,3 +950,140 @@ A further row costs 0.050–0.053 ms with the many-row kernel (from 4 to 32 rows
 can stay on the CPU, whose floor becomes about 8 ms a token (158 non-resident rows a token × 0.052
 ms). One thread with the matrix in L3 (`rhot`): 0.100 cycles a row-weight at 32 rows against 0.189
 for `gemv_avx2_few`, where Zen 3's two multiply and two add pipes allow 0.0625.
+
+## Card experts in large chunks (P1)
+
+Prefill Phase 1 (`RADIANCE_EXPERIMENTAL_DS41_P1=1` beside `RADIANCE_EXPERIMENTAL_DS41_LCP=<C>`; the
+contract with libr4d is `ds41_p1.h`, the plan `PHASE1-PLAN.md` in the review directory, the engine side
+`core/place/card_expert_stager.h`). A routed layer of a pure prefill pass that runs on at least the
+threshold's rows (`..._P1_MIN_ROWS`, 320; under the consumer skip a deep layer can run on fewer than its
+pass) gives no routed expert to the CPU; a shorter layer pass takes the CPU path exactly as the adopted
+large-chunk path does (a P1 layer streams nearly every routed expert of the layer to the cards whatever
+its rows, which does not pay below ~300 rows):
+
+- **VRAM residents** run in the plugin's own expert ops (gate_up, the clamped SwiGLU, down).
+- **Every other touched expert** is published to those ops with the skip mark (`kMarkSkip`, bit 1), so
+  the P1 twin row (`moe_gemm_ggml_mxfp4_gemv_tall_p1`) leaves its rows alone.
+- **The ring.** Each such expert is copied, on the card's DMA lane, into a slot of a VRAM ring: the file
+  stager's two buffers seen as whole 18,800,640-byte slots (`FILE_BUFFER_UNITS=N` gives 2N slots; B6 is
+  12 slots, 215 MiB a card). A RAM-cache unit is copied from its pinned slab slot (borrowed read-only,
+  packed or block form); a unit the plan pinned in the host pool (a static plan's, `--host-pool-mib`
+  256 leaves three a rank) from its pool slot, published skipped for its layer like the others instead of
+  being read across the link once a row pass; a drive miss is read into host planes by the kept readers (with the plane
+  mirror's prefill share), packed by a packer thread a rank into a pinned ready slot in the packed RAM
+  cache's form (or block form where the packer refuses it, or without the packed cache), and copied from
+  there.
+- **Waves.** Right after the layer's down projection is issued, the stager launches the same three ops
+  again in waves of `..._P1_WAVE` ring units (`OpStager::launched` captured their arguments), each with
+  its own expert table: the wave's units name their ring slots (`kMarkPacked` where packed), every other
+  entry carries `kMarkSkip`. The same kernels and arguments, so the decode band's bits. The SwiGLU
+  relaunch covers all of the layer's slots each wave, which is idempotent. The waves run right behind
+  the down projection, before any later op is issued, and under the switch the builder stretches the
+  lives of every buffer the gate_up and SwiGLU touch (the MoE input rows, the gate_up rows, the sorted
+  order) to the down projection, so the arena never gives their bytes to the down projection's output
+  or to anything that starts there (`Builder::finish_buffer_liveness`; a packing change only, which
+  costs the arena some bytes; off, nothing changes).
+- **Order and safety.** Units take slots in the order their copies are queued, and waves launch the
+  oldest queued units first; a copy waits on its slot's free event (recorded behind the down projection
+  of the wave that read the slot's previous unit), a wave on its units' copy events, and a lease or ready
+  slot is let go only after the host saw its copy's event pass.
+- **Read-ahead.** After a layer's demand reads, the next layer's likely misses (file-tier units neither in
+  the slab nor in the RAM cache, by the sealed profile's share) are read, `..._P1_AHEAD` a rank; the next
+  layer takes the ones it selects, the rest are dropped.
+- **Admission.** The RAM cache stays read-only during a prompt, except the units the prompt's last rows
+  select (`..._LCP_ADMIT`, 128): those hits get the LRU touch, those misses go to the insert threads after
+  packing. The sorted order comes with the counts from the addresses the layer's gate_up last read; a
+  layer never seen before admits nothing.
+- **Chunks** are aligned to the prompt's end (`..._P1_ALIGN=end`): the first is cut so the last is full,
+  every chunk ending on the 16-token grid (and the quantum's): 3,086 tokens at C 2048 are 1,040 + 2,046,
+  6,817 are 688 + 2,048 + 2,048 + 2,033. The interval's snapshots are written where a chunk ends on the
+  interval, and the prompt's tail snapshot as before. Start-aligned under `--prefix-resume exact` and with
+  `..._P1_ALIGN=start`, with a startup line saying so.
+- **The lent ring** (`..._P1_LEND=K`). Outside the card path's passes the ring's slots past the two the
+  file buffers' alias bases name (B1's share) hold the rank's K hottest file-tier units (by the profile)
+  as decode residents, published at their slots and computed by the plugin's own ops, never aliased or
+  handed to the CPU; B6 with K 10 gives decode B1's residents. A pass that arms the card path takes them
+  back first (published as file-tier units again, which the card path or the CPU path takes like any
+  other), and its first ring copy waits on their last reader (an event recorded at the end of every pass
+  that had residents). `..._P1_GRACE_MS` after the card path's last pass they are reloaded in the
+  background, from the RAM cache where it holds the card's block form, else read from the drive and relaid
+  into one of two pinned buffers by a reload thread (`Mover::relay_unit_block`), copied into their slots on
+  the DMA lane behind the card path's last ring reader, and published at a later pass's start once the host
+  has seen the copy pass; until then, or after a failed reload, they take the CPU path. Residency changes
+  only at a pass's start, before the weight tables are brought up to date, and a copy a card-path pass
+  overtakes is never published. Off by default.
+- **Unchanged.** Decode, every pass of up to 16 tokens and every layer pass below the threshold run the
+  CPU path as before.
+
+Switches (each a whole number; anything else refuses to start): `..._P1_WAVE` (2; 1-16),
+`..._P1_INFLIGHT` (drive units read at once a rank, 16), `..._P1_READY` (pinned ready slots a rank, 6,
+18.8 MB each), `..._P1_AHEAD` (8; 0 off), `..._P1_VERIFY` (0: after each layer's waves, up to N
+expert-rows of its RAM-cache units are recomputed by the CPU pool from the cache's bytes, borrowed again
+read-only, and compared with the card's down rows; the pass waits for the readback, so it is for exactness
+arms only; drive units are not sampled, their pinned slot being reused by then; the stats line counts rows
+compared and differing, and samples skipped because the unit was evicted since its copy),
+`..._P1_ALIGN` (`end` or `start`), `..._P1_MIN_ROWS` (the threshold, 320; 17-4096: 17 is the card path
+for every pass above 16 tokens, as before the threshold), `..._P1_LEND` (lent ring slots, 0 off; up to
+64, at most the ring's slots less two), `..._P1_GRACE_MS` (1000; 0-60000).
+
+Refused at startup, with the reason: an invalid switch value; P1 without an admitted LCP chunk, or above
+2048; a routed band of 17 rows or more not on the P1 row (a libr4d with LCP's twin is named as such); a
+band of up to 16 rows not on the gemv or gemv_vp; `FILE_BUFFER_UNITS` unset or below 2 (fewer than 4 ring
+slots); the CPU path not taking the layer passes below the threshold (host experts with `..._POLICY=all`,
+`..._MISSES` of min(C, threshold - 1) or more: 319 at the default, 16 at 17); speculation (so no DSpark
+bank serves beside P1 or its lent ring); `..._FETCH_LIST`; the route trace; the DSpark head tail; a routed
+layer whose gate_up, single `swiglu_clamped` and down cannot be named; a routed unit off the card neither on
+the file tier nor pinned in the host pool of a static plan (`--deterministic`) as a block_mxfp4 gate_up and
+down pair; `..._P1_LEND` with no slot or unit to lend; a checkpoint interval below C. Under P1, LCP admits
+`..._VRAM_PACKED=1` (the P1 row decodes the packed form; gemv_vp serves 16 rows or fewer).
+
+Log lines: rank 0's `ds41 p1: card experts on: every routed expert row of a pure prefill pass's layer of
+N to C rows ...` at startup (the threshold, the CPU path's bound, ring, tunables, pooled units), with a
+lent ring `ds41 p1: lent ring: K of the ring's S slots ...`; the scheduler's
+`ds41 p1: a lone prompt's chunks are aligned to ...`; rank 0's `ds41 p1 chunk: rows R, layers L, wall S s
+(issue), rank 0 drive units D, G GB/s, MemAvailable M MiB` after each card-path chunk; each rank's
+`ds41 p1 stats, rank R: ...` at shutdown (chunks, layers, units RAM / drive, read-ahead posted / used /
+dropped, waves, ring copies and DMA GB, drive units, GB and busy % of the chunks' wall time, the issuing
+thread's waits, the packer's ms a unit, admitted units, leases at pass end (must be 0), with a lent ring
+its residents, bursts that took them back, returns, reloads by source, failures and overtaken reloads,
+touched experts split into VRAM residents / slab / ring); the large-chunk line names the threshold and the
+CPU path's bound, and each chunk line the layers left below the threshold.
+
+Window parts (`ab_window.sh`): `P1` (needs `LcN`, `B2`..`B8` and an `M` part of min(N, threshold - 1)
+or more; the arm's `Mr` part serves the CPU path's passes), `QwN`, `QiN`, `QrN`, `QaN`, `QvN`, `Qs`,
+`QmN` (the threshold), `QlK` (the lent ring, K at most 2B - 2), `QhMS` (its grace, the hold; needs `Ql`); a P1 arm
+is measured only if the startup line states its threshold and chunk, a `Ql` arm only with its lent-ring
+line; `DEVICE_CHECKS` gains `p1` (`P1_CHECK_M`, 4096, and `P1_ROUTES`),
+and a P1 arm runs only on the libr4d.so its `p1: PASS` was on; `LCP_CHECK_C=2048` for Lc2048 arms. The
+prompt receipts `Up1len` (five documents of ~1K, ~2K, ~5K, ~8K and ~16K tokens, `max_tokens` 16, from
+license texts the long receipts do not use) and `Up1reply` (the ~2K and ~5K ones at 256 tokens) are made
+by `p1_receipts.py`; their token counts are estimates (4.9 characters a token) until the window's first
+arm logs them.
+
+Host tests (cards hidden): `p1_stager_test` runs the ring's scheduling on a simulated card (two streams
+in random order, events with record generations, slots that a copy in flight leaves garbage): every
+unit in exactly one wave, RAM units first by rows, table parity by layer, sources let go only after
+their copies, and the ring stress (2 to 12 slots, waves of 1 to 3, 440 random runs of 12 layers), also
+with pooled units beside RAM and drive ones (never let go, block form only); the host-pool source (a pooled
+unit's two weights at its pool slot whatever their order; skip marks on and off around a layer); the
+threshold over the end-aligned chunks of every length to 6,000 under the consumer cut (a pass arms only
+from the threshold, a layer is the card path's exactly at its own rows, every other layer within the CPU
+path's bound, decode, mixed, draft and speculative passes never); the lent ring's state machine on a
+simulated host (lend, return after the grace, back-to-back prompts, failed loads and copies left on the
+CPU path, loads and copies a card-path pass overtakes never published, decode between chunks, 200 random
+runs) and the mover's ring residents (published at their slots, never aliased or borrowed, file-tier
+again once taken back); the tunables; the end-aligned chunks for every length to 20,000; the admission
+against the sorted order.
+`p1_chunk_test` runs `Scheduler::plan_chunk`'s end alignment on the scheduler fakes, with and without a
+checkpoint interval.
+
+P1 twin (package K). Under `RADIANCE_EXPERIMENTAL_DS41_P1=1` beside `LCP`, libr4d registers
+`moe_gemm_ggml_mxfp4_gemv_tall_p1` (M ≤ 4096) in place of `_gemv_tall`. It runs gemv_vp's vp2 kernel at
+every height over a weight table. Bit 0 marks a packed-scale entry; bit 1 (skip) means no rows written and
+no bytes read. Experts own the live-tail ranges, every call zero-fills `[off[96], T)`, and work is cut into
+items by row passes, so one expert with 2,000 rows does not serialise a launch. gate_up stages two
+activation rows a pass and down three, on 512 blocks. Each output is one wave's sum in the gemv's lane and
+block order, so the bytes equal 16-token passes. Gate: `ds41_mxfp4_device_check LIB p1 4096 ROUTES` prints
+`p1: PASS` (rows, host rows, skip, tail, splits, waves of 1-3). On a 9070 XT with real routing at M
+1024-2048 it costs about 16.4 µs an expert-row in block form and 18.8 packed, against 2,238 for the served
+LCP twin and 30 for lcpfast's balanced twin.

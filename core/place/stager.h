@@ -88,10 +88,12 @@
 #include "ep_route_counts.h"
 #include "dspark_head_tail.h"
 #include "host_expert_pool.h"
+#include "card_expert_stager.h"
 #include "hx_fetch_list.h"
 #include "hx_side_store.h"
 #include "readahead.h"
 #include "route_trace.h"
+#include "../sched/tbo.h"
 
 #include <algorithm>
 #include <array>
@@ -316,6 +318,8 @@ public:
     static constexpr int kProfBuckets = 4;
     bool profile_on() const { return prof_on_; }
     const PassProfile& profile(int b) const { return prof_[b]; }
+    /* RADIANCE_EXPERIMENTAL_SCHED_TBO: routed layers' slices B begun (a split pass, stager.h tbo_). */
+    uint64_t tbo_slices() const { return tbo_slices_; }
     /* Routed experts the CPU computed (HostExpertPool) instead of a copy to the card. */
     struct HostStats {
         uint64_t layers = 0, units = 0, rows = 0;
@@ -514,7 +518,21 @@ public:
     bool begin_pass(const RadBatch* b) override;
     int  before_op(rad_op h, RadStream s, bool* resync) override;
     int  operands(rad_op h, RadStream s, const RadTensor* t, int n_t) override;
+    int  launched(rad_op h, RadStream s, const RadArgs* a, int (*launch)(const RadArgs*, RadStream)) override;
+    int  after_op(rad_op h, RadStream s) override;
     int  end_pass(RadStream s) override;
+    /* ---- prefill Phase 1 (card_expert_stager.h): RADIANCE_EXPERIMENTAL_DS41_P1=1 beside LCP ----------
+     * p1_on: this rank took it (p1_init); p1_stats_line: kLogStats's line for the shutdown. */
+    bool p1_on() const { return p1_ && p1_->on(); }
+    std::string p1_stats_line() const;
+    /* Whether pass `b` is armed for the card path at the threshold `min_rows` (..._P1_MIN_ROWS): a pure
+     * prefill pass (no decode row, no draft or speculation) of at least min_rows and at most
+     * `max_rows` (the chunk) tokens. Its routed layers then each take the card path or the CPU path by
+     * their own rows (ds41p1::card_layer); any other pass runs as without the switch. */
+    static bool p1_pass_arms(const RadBatch& b, int64_t min_rows, int64_t max_rows) {
+        return b.phase == RAD_PHASE_PREFILL && b.n_tok_decode == 0 && b.draft_pass == 0 && b.n_spec == 0 &&
+               b.n_tok >= ds41p1::kMinArmRows && b.n_tok >= min_rows && b.n_tok <= max_rows;
+    }
     //Must run before Ctx::shutdown and before Mover/bank/buffer owners disappear.
     int shutdown_head_cache();
 
@@ -560,11 +578,27 @@ private:
      * jobs over layer_rows); 0 and the pass on every pass without it. */
     std::vector<int32_t> pass_row0_;   /* by model layer; empty: no cut by row */
     int64_t layer_r0(int32_t li) const {
+        if (tbo_) return tbo::first_row(tbo_tok_, tbo_slice_);
         if (pass_row0_.empty() || li < 0 || (size_t)li >= layers_.size()) return 0;
         const int32_t l = layers_[(size_t)li].layer;
         return l >= 0 && (size_t)l < pass_row0_.size() ? std::clamp<int64_t>(pass_row0_[(size_t)l], 0, pass_tok_) : 0;
     }
-    int64_t layer_rows(int32_t li) const { return pass_tok_ - layer_r0(li); }
+    int64_t layer_rows(int32_t li) const { return tbo_ ? pass_tok_ : pass_tok_ - layer_r0(li); }
+    /* RADIANCE_EXPERIMENTAL_SCHED_TBO (core/sched/tbo.h): a split pass issues each routed layer as
+     * two slices one after the other, micro-batch A's rows [0, Sa) and then B's [Sa, n_tok), each
+     * from its gate_up to its gather (the architecture's other card work between them names no
+     * file-tier weight). While a slice runs, pass_tok_ is its rows and layer_r0 its first row, so
+     * its counts witness, its rows' copies, the CPU's choice and jobs, its misses and the
+     * read-ahead take it as a pass of its own rows. A layer's second gate_up starts slice B
+     * (tbo_second); entering a layer starts slice A. */
+    bool    tbo_ = false;
+    int     tbo_slice_ = 0;
+    int64_t tbo_tok_ = 0;     /* the step's tokens */
+    void tbo_enter(int slice);
+    int  tbo_second(int32_t li, RadStream s);
+    /* Whether slice A's read-ahead entries it did not select stay for slice B (which reads ahead). */
+    bool tbo_keeps_ra() const;
+    uint64_t tbo_slices_ = 0;   /* slices B started (the shutdown report) */
     int32_t n_model_layers_ = 0;
     /* The layers whose MoE this pass runs: RadBatch::consumer_full on a pass the consumer skip
      * cut (core/sched/consumer_skip.h), every layer otherwise. Nothing is read, staged, predicted
@@ -590,6 +624,79 @@ private:
      * requires the CPU to take every routed unit, and says what was admitted (lcp_report). */
     int  lcp_init(const Program& prog, int64_t C);
     void lcp_report() const;
+    /* ---- prefill Phase 1 (card_expert_stager.h) -------------------------------------------------
+     *
+     * Under RADIANCE_EXPERIMENTAL_DS41_P1=1 (p1_state_ 1, read at lcp_init with the threshold
+     * p1_min_rows_), lcp_init admits the P1 twin above 16 rows (ds41p1::kTwinRow, refusing LCP's own
+     * twin) and the packed residents' gemv_vp at 16 or fewer; hx_init needs the CPU to take every layer
+     * pass below the threshold (p1_cpu_rows); p1_init then checks the rest (every routed layer's three
+     * expert ops found, the routed units off the card in the container or the host pool, the ring, the
+     * tunables) and starts the path. An armed pass (p1_armed_, p1_pass_arms) hands each routed layer
+     * of at least the threshold's rows to the path at start_ep_routed (p1_layer), captures the layer's
+     * three launches (launched) and runs its waves behind its down projection (after_op). */
+    int  p1_state_ = 0;
+    int64_t p1_min_rows_ = ds41p1::kDefMinRows;   /* ..._P1_MIN_ROWS as lcp_init read it */
+    bool    p1_lend_asked_ = false;               /* ..._P1_LEND > 0 as lcp_init read it */
+    /* The rows the CPU path takes under P1: every layer pass below the threshold (ds41p1::cpu_rows). */
+    int64_t p1_cpu_rows() const { return ds41p1::cpu_rows(ep_rows_, p1_min_rows_); }
+    /* hx_init's ..._MISSES bound: every pass's rows (ep_rows_), but under P1 without the lent ring only the
+     * layer passes below the threshold (p1_cpu_rows); with it a pass that does not arm P1 would stage its
+     * misses in the file buffers, whose idle slots then hold published residents. */
+    int64_t hx_need_rows() const { return lcp_ && p1_state_ == 1 && !p1_lend_asked_ ? p1_cpu_rows() : ep_rows_; }
+    std::unique_ptr<p1::CardExpertPath> p1_;
+    bool p1_armed_ = false;
+    int32_t p1_li_ = -1;                 /* the layer the path holds this pass, or -1 */
+    int  p1_units_ = 0;                  /* its units on the ring */
+    struct P1Ops { int32_t sw = -1, dn = -1; };
+    std::vector<P1Ops> p1_ops_;          /* by routed layer */
+    RadEvent p1_end_ = nullptr;          /* behind an armed pass's last reader of the ring */
+    /* The lent ring (card_expert_stager.h, RingLender; ..._P1_LEND): behind the last pass that read a
+     * ring resident, recorded at its end; an armed pass's first ring copy waits on it. */
+    RadEvent p1_lend_ev_ = nullptr;
+    bool     p1_lend_rec_ = false;
+    int  p1_lend_init(const p1::Tunables& t, std::string* why);
+    static int64_t p1_now_ms() {
+        return (int64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+    std::vector<int32_t> p1_nonres_, p1_ahead_;
+    /* By routed layer: its routed units the plan pinned in the host pool, which the card would read
+     * across the link once a row pass; an armed layer copies the selected ones to the ring as it does
+     * a RAM-cache unit (p1_layer). p1_pool_sel_: this layer's selected ones, published skipped. */
+    std::vector<std::vector<int32_t>> p1_pool_;
+    std::vector<int32_t> p1_pool_sel_;
+    int  p1_pool_units_ = 0;
+    /* A pooled unit's two weights where the card's DMA reads them (its pool slot), block form; false
+     * when it has no pool address or is not a gate_up and down pair. */
+    bool p1_pool_source(int32_t u, p1::Source* out) const;
+    bool p1_order_ = false;              /* this layer's sorted order fetched for the admission */
+    int64_t p1_pass_rows_ = 0;
+    std::chrono::steady_clock::time_point p1_t0_{};
+    uint64_t p1_touched_ = 0, p1_slab_ = 0, p1_order_moved_ = 0, p1_layers_ = 0;
+    int  p1_init(const Program& prog);
+    /* Whether routed layer li of this pass is the card path's: an armed pass, and the layer's own rows
+     * (layer_rows: under the per-row cut a deep layer can run on fewer) at least the threshold and
+     * never 16 or fewer (ds41p1::card_layer). Any other layer of an armed pass takes the CPU path for
+     * its non-resident experts as a pass of its height does: plain aliases, no mark, no wave. */
+    bool p1_layer_on(int32_t li) const { return p1_armed_ && ds41p1::card_layer(layer_rows(li), p1_min_rows_); }
+    /* The rows the CPU path's miss bound (..._MISSES, hx_miss_rows_) is held to: the pass's, or in an
+     * armed pass the layer's own (a layer the card path does not take, below the threshold, beside
+     * ..._MISSES of at least p1_cpu_rows). */
+    int64_t hx_miss_need(int32_t li) const { return p1_armed_ ? layer_rows(li) : pass_tok_; }
+    uint64_t p1_cpu_layers_ = 0;         /* this armed pass's routed layers on the CPU path (below the threshold) */
+    int  p1_layer(int32_t li, RadStream s);
+    bool p1_admits(int32_t li, int32_t e) const;
+    /* ..._P1_VERIFY=N: after a layer's waves, N of its RAM-cache units' expert-rows recomputed by the
+     * CPU pool from the cache's bytes (borrowed again, read-only) and compared with the card's down
+     * rows; the pass waits for the readback. Drive units are not sampled (their pinned slot is reused
+     * by then). */
+    int  p1_verify(int32_t li, RadStream s);
+    std::vector<uint8_t> p1_ram_;        /* parallel to p1_nonres_: a RAM-cache hit */
+    int32_t*  p1_vidx_ = nullptr;        /* pinned: the sorted order and the offsets */
+    uint16_t* p1_vx_ = nullptr;          /* pinned: the sampled token rows */
+    uint16_t* p1_vy_ = nullptr;          /* pinned: the card's down rows */
+    uint16_t* p1_vh_ = nullptr;          /* the host's */
+    RadEvent  p1_vev_ = nullptr;
     int64_t lcp_ = 0;                  /* C once lcp_init admitted it, else 0 */
     int64_t lcp_reach_ = 0;            /* the twin's bound, as its bands state it */
     int     lcp_moe_ = 0, lcp_twin_ = 0, lcp_split_ = 0, lcp_runs_ = 0, lcp_ops_ = 0, lcp_pair_ops_ = 0;

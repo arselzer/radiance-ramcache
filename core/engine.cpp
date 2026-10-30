@@ -115,6 +115,9 @@ Engine::~Engine() {
         }
         RAD_INFO("%s", r->mover.report().c_str());
         const auto& ep = r->fstager.ep_stats();
+        if (r->fstager.tbo_slices())
+            RAD_INFO("two-batch overlap: %llu routed layers ran as two slices (micro-batch B's behind "
+                     "A's gather)", (unsigned long long)r->fstager.tbo_slices());
         if (ep.reads || ep.corrupt) {
             RAD_INFO("EP scoped file staging: %llu count rows completed, %llu local-zero, "
                      "%llu SSD units submitted, %llu corrupt rows refused",
@@ -152,6 +155,8 @@ Engine::~Engine() {
                          "kept readers (..._MISS_POST; between choose and submit, in neither)",
                          (double)ep.d_miss_post_ns * 1e-3 / (double)ep.d_reads);
         }
+        /* Prefill Phase 1 (place/card_expert_stager.h): each rank's line (ds41p1::kLogStats). */
+        if (r->fstager.p1_on()) RAD_INFO("%s", r->fstager.p1_stats_line().c_str());
         const auto& hx = r->fstager.host_stats();
         if (r->fstager.host_experts())
             RAD_INFO("host experts: %llu layers handed %llu experts (%llu rows) to the CPU; "

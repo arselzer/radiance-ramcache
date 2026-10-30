@@ -26,6 +26,7 @@
 #include <arch/rad_block_moe_fp8.h>
 #include "ds41_prefetch_plan.h"
 #include "ista_dialect.h"
+#include "../../core/sched/tbo.h"
 
 #include <algorithm>
 #include <cmath>
@@ -46,6 +47,9 @@
 #pragma weak rad_consumer_row_grain
 /* The same for rad_kv_group_replicated (RADIANCE_EXPERIMENTAL_DS41_KV_REPLICATED, kv_replicate). */
 #pragma weak rad_kv_group_replicated
+/* And rad_declare_two_batch (RADIANCE_EXPERIMENTAL_SCHED_TBO, core/sched/tbo.h): null on an engine
+ * older than the split, which then never splits a step. */
+#pragma weak rad_declare_two_batch
 
 namespace deepseek41 {
 using namespace rad::arch;
@@ -601,6 +605,10 @@ struct Model {
     struct PfStats {
         uint64_t steps = 0, points = 0, reads = 0, bytes = 0, epoints = 0, ereads = 0, ebytes = 0;
     } pfs;
+    /* RADIANCE_EXPERIMENTAL_SCHED_TBO=1 (core/sched/tbo.h), read at declare; and the steps this
+     * rank issued split (rad_plugin_close's report). */
+    bool tbo = false;
+    uint64_t tbo_steps = 0;
     /* The consumer skip (cut_declare): declared, at boundary `cut_b`; and what this rank's cut
      * passes ran (rad_plugin_close's report): passes cut, layer-passes in full, key ops alone,
      * skipped. Only this rank's thread writes them. */
@@ -2519,6 +2527,14 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.f8_on = dense_f8_gate(b, meta, m);
     DS_TRY(dsp_config(b, m, meta, ctx));
     m.dsp_f8 = dsp_f8_gate(m);
+    m.tbo = ::rad::tbo::env_on() && rad_declare_two_batch && rad_declare_two_batch(b) == RAD_OK;
+    if (::rad::tbo::env_on() && !m.tbo && ctx->rank == 0)
+        fprintf(stderr, "radiance: deepseek41: RADIANCE_EXPERIMENTAL_SCHED_TBO=1, but this engine does not "
+                        "carry rad_declare_two_batch (or refused it): no step is split\n");
+    if (m.tbo && ctx->rank == 0)
+        fprintf(stderr, "radiance: deepseek41: two-batch overlap (RADIANCE_EXPERIMENTAL_SCHED_TBO=1): a "
+                        "decode step of two or more sequences is issued as two micro-batches, each "
+                        "layer's MoE gather of one behind the other's card work\n");
     m.router_bf16 = router_bf16_on();
     if (m.router_bf16 && !rad_op_declared(b, "gemm_nt_f32bf16")) {
         fprintf(stderr, "radiance: deepseek41: RADIANCE_EXPERIMENTAL_DS41_ROUTER_BF16=1 needs "
@@ -3024,23 +3040,53 @@ static void step(RadCtx* x, const RadBatch* batch) {
      * themselves (rad_arch.h, kPrefetchRows). */
     const bool pf_live = batch->phase == RAD_PHASE_DECODE && T <= kPrefetchRows;
     const uint64_t pf_reads0 = m.pfs.reads;
-    for (auto& L : m.layers) {
+    /* RADIANCE_EXPERIMENTAL_SCHED_TBO (core/sched/tbo.h): a split step issues each layer as three
+     * segments of two micro-batches, each on its own rows (a View). The whole step is the view
+     * `full`, with every operand exactly as before. In a micro-batch's view the step's row-indexed
+     * buffers are taken at its rows [rb, te), the per-sequence arrays at its sequences [sb, sb + sv)
+     * and cu_seqlens as its first sv + 1 entries (a split step is one row a sequence, so they are
+     * 0 .. sv); the attention's own scratch (the compressor's rows, the index scores) starts at row
+     * 0, as in a step of its rows alone, since each micro-batch's attention runs whole between the
+     * other's segments. */
+    struct View {
+        bool full = true;
+        int64_t rb = 0, te = 0, sb = 0, sv = 0;
+        int k = 0;   /* 0: micro-batch A (or the whole step), 1: B */
+    };
+    enum { kSeg1 = 1, kSeg2 = 2, kSeg3 = 4, kSegAll = 7 };
+    /* One layer's segments `seg` on V's rows. 0: go on; 1: no further layer (a cut); -1: the step
+     * failed (rad_step_fail was called). */
+    const auto run_layer = [&](Layer& L, const View& V, int seg) -> int {
         const int l = L.l;
         const int64_t r = L.r;
+        const int64_t TE = V.te, nv = V.te - V.rb, SV = V.sv;
+        /* V's rows of a [T, w] buffer (its column slice), its positions, cu_seqlens and a
+         * per-sequence [S, pitch] array; the step's own operands in the full view. */
+        const auto VR = [&](rad_buf h, int64_t w) { return V.full ? brows(h, T) : brow_slice(h, V.rb, nv, w); };
+        const auto VC = [&](rad_buf h, int64_t w, int64_t c0, int64_t cw) {
+            return V.full ? bcol(h, c0, cw, T) : bcol_at(h, V.rb, w, c0, cw, nv);
+        };
+        const RadOperand vpos = V.full ? pos : praw(batch->positions + V.rb, RAD_I32, nv);
+        const RadOperand vcu = V.full ? cu : praw(batch->cu_seqlens, RAD_I32, SV + 1);
+        const auto VS = [&](const int32_t* p, int64_t pitch) {
+            return V.full ? praw2(p, RAD_I32, S, pitch) : praw2(p + V.sb * pitch, RAD_I32, SV, pitch);
+        };
+        const RadOperand vwbt = V.full ? wbt : VS(wb->block_table, wb->block_table_pitch);
+        const RadOperand vwused = V.full ? wused : praw(wb->seqused + V.sb, RAD_I32, SV);
         /* A cut pass: past layer F nothing; layer F its collapse, norm and key ops (below). */
-        if (cut_full && l > cut_full) break;
+        if (cut_full && l > cut_full) return 1;
         /* The rows this layer runs (the per-row cut; the whole step otherwise): its key ops -- the
          * collapse and norm that feed them, the window key, at a source the compressor and the index
          * keys -- on [rk, T), everything else on [rf, T). A source is at or below the boundary, so its
          * key rows are all of the step's. */
-        const int64_t rk = row0 && l > m.cut_b ? row0[l - 1] : 0;
-        const int64_t rf = row0 ? row0[l] : 0;
-        if (row0 && rk >= T) break;
-        const bool key_only = (cut_full && l == cut_full) || (row0 && rf >= T);
-        const int64_t nk = T - rk, nf = T - rf;
-        if (L.src && rk != 0) {
+        const int64_t rk = row0 && l > m.cut_b ? row0[l - 1] : V.rb;
+        const int64_t rf = row0 ? row0[l] : V.rb;
+        if (row0 && rk >= TE) return 1;
+        const bool key_only = (cut_full && l == cut_full) || (row0 && rf >= TE);
+        const int64_t nk = TE - rk, nf = TE - rf;
+        if (row0 && L.src && rk != 0) {
             rad_step_fail(x, "deepseek41: a per-row cut that leaves a key source's rows out");
-            return;
+            return -1;
         }
         const int64_t HN = c.hc * D, hc = c.hc;
         /* Rows [rk, T) / [rf, T) of a [T, w] buffer; a column slice of them; the rows' positions. */
@@ -3049,12 +3095,13 @@ static void step(RadCtx* x, const RadBatch* batch) {
         const auto FC = [&](rad_buf h, int64_t w, int64_t c0, int64_t cw) { return bcol_at(h, rf, w, c0, cw, nf); };
         const RadOperand kpos = praw(batch->positions + rk, RAD_I32, nk);
         const RadOperand fpos = praw(batch->positions + rf, RAD_I32, nf);
+        if (seg & kSeg1) {
         if (L.e_ids) {
             const int64_t H = c.ple_heads;
             const int pi = c.ple_index(l);
             if (m.local_engram && (pi < 0 || pi >= int(sizeof(m.ista_tables) / sizeof(m.ista_tables[0])))) {
                 rad_step_fail(x, "deepseek41: local Engram layer has no declared table");
-                return;
+                return -1;
             }
             const auto* et = m.local_engram ? &m.ista_tables[pi] : nullptr;
             const int64_t egroup = et ? et->group : m.ple_group;
@@ -3065,27 +3112,29 @@ static void step(RadCtx* x, const RadBatch* batch) {
             /* T rows of operands; the gather's band is T * H, one table row per head per token,
              * read through the ids and rows as flat (rad_block_ple.h does the same). */
             if (egroup > 0)
-                RAD_ISSUE_N(x, L.e_emb, T * H, brows(L.ids, T), RAD_W(ecodes), RAD_W(escale),
-                            etab ? RAD_W(etab) : RAD_NONE, brows(m.emb, T));
+                RAD_ISSUE_N(x, L.e_emb, nv * H, VR(L.ids, H), RAD_W(ecodes), RAD_W(escale),
+                            etab ? RAD_W(etab) : RAD_NONE, VR(m.emb, H * c.ple_dim));
             else
-                RAD_ISSUE_N(x, L.e_emb, T * H, brows(L.ids, T), RAD_W(eplain), brows(m.emb, T));
-            RAD_ISSUE_N(x, L.e_copy, T, brows(m.emb, T), brows(m.embd, T));
+                RAD_ISSUE_N(x, L.e_emb, nv * H, VR(L.ids, H), RAD_W(eplain), VR(m.emb, H * c.ple_dim));
+            RAD_ISSUE_N(x, L.e_copy, nv, VR(m.emb, H * c.ple_dim), VR(m.embd, H * c.ple_dim));
             /* This layer's own reads go right behind its Engram GEMM, which would have evicted
              * them (..._PREFETCH_ENGRAM=1): beside the all_gather of the split rows, the gate and
              * the attention connection, until the attention's GEMVs reach them. */
             if (L.e_gather) {
-                RAD_ISSUE_N(x, L.e_gemm, T, brows(m.embd, T), RAD_W(L.e_kv), brows(m.ekv_part, T));
+                RAD_ISSUE_N(x, L.e_gemm, nv, VR(m.embd, H * c.ple_dim), RAD_W(L.e_kv), VR(m.ekv_part, m.esplit));
                 if (pf_live) pf_issue(x, L.pf_post, m.pfs, true);
-                RAD_ISSUE_N(x, L.e_gather, T * m.esplit, brows(m.ekv_part, T), brows(m.ekv, T));
+                RAD_ISSUE_N(x, L.e_gather, nv * m.esplit, VR(m.ekv_part, m.esplit), VR(m.ekv, (c.hc + 1) * D));
             } else {
-                RAD_ISSUE_N(x, L.e_gemm, T, brows(m.embd, T), RAD_W(L.e_kv), brows(m.ekv, T));
+                RAD_ISSUE_N(x, L.e_gemm, nv, VR(m.embd, H * c.ple_dim), RAD_W(L.e_kv), VR(m.ekv, (c.hc + 1) * D));
                 if (pf_live) pf_issue(x, L.pf_post, m.pfs, true);
             }
-            RAD_ISSUE_N(x, L.e_gate_op, T, brows(m.h0, T), bcol(m.ekv, 0, c.hc * D, T),
-                        bcol(m.ekv, c.hc * D, D, T), RAD_W(L.e_gate), brows(m.h1, T));
-            RAD_ISSUE_N(x, L.e_back, T, brows(m.h1, T), brows(m.h0, T));
+            RAD_ISSUE_N(x, L.e_gate_op, nv, VR(m.h0, c.hc * D), VC(m.ekv, (c.hc + 1) * D, 0, c.hc * D),
+                        VC(m.ekv, (c.hc + 1) * D, c.hc * D, D), RAD_W(L.e_gate), VR(m.h1, c.hc * D));
+            RAD_ISSUE_N(x, L.e_back, nv, VR(m.h1, c.hc * D), VR(m.h0, c.hc * D));
         }
-        if (L.tap && !key_only) RAD_ISSUE_N(x, L.tap, T, brows(m.h0, T), bcol(m.dsp.src, L.tap_col * D, D, T));
+        if (L.tap && !key_only)
+            RAD_ISSUE_N(x, L.tap, nv, VR(m.h0, c.hc * D),
+                        VC(m.dsp.src, (int64_t)m.dsp.taps.size() * D, L.tap_col * D, D));
         /* Issue order of the connections' mixes (Ctx::haz_mark: a recorded pass leaves a dispatch
          * unordered when it touches nothing in flight). Each connection's collapse reads the gates
          * the previous connection's mix wrote, never what its own mix writes, and nothing reads a
@@ -3125,21 +3174,21 @@ static void step(RadCtx* x, const RadBatch* batch) {
              * three or four chains instead of running the compressor and the indexer alone after
              * the window key. Same kernels on the same operands. */
             const bool ctail = L.src && r > 1;
-            int64_t rows = T, tpitch = 1;
-            RadOperand page = RAD_NONE, bpos = pos;
+            int64_t rows = nv, tpitch = 1;
+            RadOperand page = RAD_NONE, bpos = vpos;
             const auto* cb = L.src ? kv_batch(batch, m.comp[r]) : nullptr;
             const auto* tb = ctail ? kv_batch(batch, m.tail[r]) : nullptr;
             if (L.src) {
                 const auto* ib = kv_batch(batch, m.index[r]);
                 if (!cb || !ib || !cb->block_table || !ib->block_table) {
                     rad_step_fail(x, "deepseek41: a compressed group has no block table");
-                    return;
+                    return -1;
                 }
-                page = praw(cb->slot_mapping, RAD_I32, T);
+                page = praw(cb->slot_mapping + V.rb, RAD_I32, nv);
                 if (ctail) {
                     if (!tb || !tb->state_index) {
                         rad_step_fail(x, "deepseek41: the compressor tail has no state slots");
-                        return;
+                        return -1;
                     }
                     tpitch = tb->state_index_pitch > 0 ? tb->state_index_pitch : 1;
                     rows = m.work;
@@ -3179,16 +3228,15 @@ static void step(RadCtx* x, const RadBatch* batch) {
             };
             const auto c_gemm = [&] {
                 if (L.src)
-                    RAD_ISSUE_N(x, L.c_gemm, T, brows(m.xn, T), RAD_W(L.comp_w),
-                                brows(ctail ? m.kvs : m.pooled, T));
+                    RAD_ISSUE_N(x, L.c_gemm, nv, VR(m.xn, D), RAD_W(L.comp_w),
+                                brows(ctail ? m.kvs : m.pooled, nv));
             };
             const auto c_work = [&] {
                 if (ctail)
-                    RAD_ISSUE_N(x, L.c_work, T, brows(m.kvs, T), pos, cu, kv_cache(m.tail[r], l),
-                                praw2(tb->state_index, RAD_I32, S, tpitch),
-                                praw2(cb->block_table, RAD_I32, S, cb->block_table_pitch), RAD_NONE,
-                                brows(m.stage, rows * r), brows(m.page, rows), brows(m.bpos, rows),
-                                brows(m.nc, S));
+                    RAD_ISSUE_N(x, L.c_work, nv, brows(m.kvs, nv), vpos, vcu, kv_cache(m.tail[r], l),
+                                VS(tb->state_index, tpitch), VS(cb->block_table, cb->block_table_pitch),
+                                RAD_NONE, brows(m.stage, rows * r), brows(m.page, rows), brows(m.bpos, rows),
+                                brows(m.nc, SV));
             };
             const auto c_pool = [&] {
                 if (ctail)
@@ -3241,8 +3289,8 @@ static void step(RadCtx* x, const RadBatch* batch) {
             };
             const auto c_tail = [&] {
                 if (ctail && L.c_tail)
-                    RAD_ISSUE_N(x, L.c_tail, T, brows(m.kvs, T), pos, cu, kv_cache(m.tail[r], l),
-                                praw2(tb->state_index, RAD_I32, S, tpitch));
+                    RAD_ISSUE_N(x, L.c_tail, nv, brows(m.kvs, nv), vpos, vcu, kv_cache(m.tail[r], l),
+                                VS(tb->state_index, tpitch));
             };
             const int64_t iqw = c.ih * c.idim;
             const auto i_q = [&] {
@@ -3281,7 +3329,7 @@ static void step(RadCtx* x, const RadBatch* batch) {
                     const RadOperand prow = praw(batch->positions + at, RAD_I32, rows);
                     RAD_ISSUE_N(x, L.i_runs[(size_t)p], R, FR(m.iq, iqw), FR(m.iw, c.ih),
                                 kv_cache(m.index[r], src),
-                                praw2(ib->block_table, RAD_I32, S, ib->block_table_pitch), fpos, cu,
+                                VS(ib->block_table, ib->block_table_pitch), fpos, vcu,
                                 bcol(m.score, 0, live, R));
                     if (L.i_cand)
                         RAD_ISSUE_N(x, L.i_cand, rows, bcol(m.score, 0, live, rows), prow,
@@ -3309,7 +3357,7 @@ static void step(RadCtx* x, const RadBatch* batch) {
                 k_norm();
                 l_rope(); k_rope();
                 l_q(); k_q(); l_st(); k_st();
-                break;
+                return 1;
             }
             c_gemm();
             q_a(); kv_g();
@@ -3334,13 +3382,13 @@ static void step(RadCtx* x, const RadBatch* batch) {
             if (r > 0) {
                 const int src = c.src_of[(size_t)l];
                 const auto* cb = kv_batch(batch, m.comp[r]);
-                RAD_ISSUE_N(x, L.attn, nf, FR(m.q, HD), kv_cache(m.win, l), wbt, wused,
+                RAD_ISSUE_N(x, L.attn, nf, FR(m.q, HD), kv_cache(m.win, l), vwbt, vwused,
                             kv_cache(m.comp[r], src),
-                            praw2(cb->block_table, RAD_I32, S, cb->block_table_pitch), FR(m.sel, c.itopk),
-                            fpos, cu, RAD_W(L.sinks), FR(m.o, HD));
+                            VS(cb->block_table, cb->block_table_pitch), FR(m.sel, c.itopk),
+                            fpos, vcu, RAD_W(L.sinks), FR(m.o, HD));
             } else {
-                RAD_ISSUE_N(x, L.attn, nf, FR(m.q, HD), kv_cache(m.win, l), wbt, wused, RAD_NONE,
-                            RAD_NONE, RAD_NONE, fpos, cu, RAD_W(L.sinks), FR(m.o, HD));
+                RAD_ISSUE_N(x, L.attn, nf, FR(m.q, HD), kv_cache(m.win, l), vwbt, vwused, RAD_NONE,
+                            RAD_NONE, RAD_NONE, fpos, vcu, RAD_W(L.sinks), FR(m.o, HD));
             }
             if (L.o_f) {
                 RAD_ISSUE_N(x, L.o_f, nf, FR(m.o, HD), brows(cs, g.max_ctx), fpos);
@@ -3355,7 +3403,7 @@ static void step(RadCtx* x, const RadBatch* batch) {
             if (late) mix_a();
             RAD_ISSUE_N(x, L.o_b, nf, FR(m.oa, ow), RAD_W(L.wo_b), FR(m.attn_out, D));
         }
-        if (key_only) break;   /* an attention-zero rank's key layer: its collapse alone */
+        if (key_only) return 1;   /* an attention-zero rank's key layer: its collapse alone */
         if (L.ar_attn) RAD_ISSUE_N(x, L.ar_attn, nf * D, FR(m.attn_out, D), RAD_NONE);
         if (L.pcn_f)   /* post_a, col_f and norm_f in one */
             RAD_ISSUE_N(x, L.pcn_f, nf, FR(m.attn_out, D), FR(m.h0, HN), FR(m.post, hc),
@@ -3380,13 +3428,16 @@ static void step(RadCtx* x, const RadBatch* batch) {
             }
         };
         col_f();
-        MixBeside mb{ &L, &m, T };
+        }   /* kSeg1 */
+        if (seg & kSeg2) {
+        MixBeside mb{ &L, &m, TE };
         mb.r0 = rf;
         /* The next layer's reads (decode passes only). Ahead of an Engram layer that is at most
          * its engram_kv, since its 79 MB GEMM would evict anything else before the attention
          * (pf_layer()); by default nothing. */
         const Layer* nl = L.l + 1 < c.n_layer ? &m.layers[(size_t)L.l + 1] : nullptr;
-        if (nl && pf_live && !nl->pf.empty()) {
+        /* Split, the next attention after A's MoE is B's of this layer: B's MoE reads ahead. */
+        if (nl && pf_live && !nl->pf.empty() && (V.full || V.k == 1)) {
             mb.pf = &nl->pf;
             mb.pfs = &m.pfs;
         }
@@ -3394,13 +3445,26 @@ static void step(RadCtx* x, const RadBatch* batch) {
         bs.fn = mix_f_beside;
         bs.arg = &mb;
         bs.tail = pf_tail;
-        if (row0) {
+        if (!V.full) {
+            /* A micro-batch: its rows as one pass of the step (MoeFP8::pass_head), the gather in
+             * its segment 3. */
+            bs.first_row = rf;
+            L.moe.pass_head(x, T, rf, nf, &bs);
+        } else if (row0) {
             /* The layer's rows alone, one pass (a chunk is at most the block's pass height). */
             bs.first_row = rf;
             L.moe.pass(x, T, rf, nf, true, &bs);
             L.moe.route_report(x);
         } else {
             L.moe.step(x, batch, bs);
+        }
+        }   /* kSeg2 */
+        if (!(seg & kSeg3)) return 0;
+        if (!V.full) {
+            L.moe.pass_tail(x, T, rf, nf, true);
+            /* The heat engine's handoff once a layer (MoeFP8::route_report: the last pass's routing,
+             * a sample as with any step of several passes): behind micro-batch B's. */
+            if (V.k == 1) L.moe.route_report(x);
         }
         /* post_f, or post_f with the next collapse + norm (the next layer's pcn_a, or pcn_fin). Under the
          * per-row cut the next layer's key rows are this layer's rows. */
@@ -3416,6 +3480,37 @@ static void step(RadCtx* x, const RadBatch* batch) {
         else
             RAD_ISSUE_N(x, L.post_f, nf, FR(m.act.x, D), FR(m.h1, HN), FR(m.post, hc),
                         FR(m.comb, hc * hc), FR(m.h0, HN));
+        return 0;
+    };
+    /* The split (core/sched/tbo.h): A's first layer to its gather, then for each layer
+     * 1B 3A 2B 1A' 3B 2A' (A' the next layer), so the wait for one micro-batch's CPU rows in its
+     * segment 3 overlaps the other's card work issued just before. */
+    if (m.tbo && ::rad::tbo::step_splits(batch) && !row0 && !cut_full) {
+        const int64_t Sa = ::rad::tbo::split_a(S);
+        View A, B;
+        A.full = B.full = false;
+        A.rb = 0; A.te = Sa; A.sb = 0; A.sv = Sa; A.k = 0;
+        B.rb = Sa; B.te = T; B.sb = Sa; B.sv = S - Sa; B.k = 1;
+        const size_t nl = m.layers.size();
+        ++m.tbo_steps;
+        if (nl && run_layer(m.layers[0], A, kSeg1 | kSeg2) != 0) return;
+        for (size_t i = 0; i < nl; ++i) {
+            Layer& L = m.layers[i];
+            Layer* N = i + 1 < nl ? &m.layers[i + 1] : nullptr;
+            if (run_layer(L, B, kSeg1) != 0 || run_layer(L, A, kSeg3) != 0 ||
+                run_layer(L, B, kSeg2) != 0 || (N && run_layer(*N, A, kSeg1) != 0) ||
+                run_layer(L, B, kSeg3) != 0 || (N && run_layer(*N, A, kSeg2) != 0))
+                return;
+        }
+    } else {
+        View W;
+        W.te = T;
+        W.sv = S;
+        for (auto& L : m.layers) {
+            const int rc = run_layer(L, W, kSegAll);
+            if (rc < 0) return;
+            if (rc > 0) break;
+        }
     }
     if (m.pfs.reads != pf_reads0) ++m.pfs.steps;
     if (cut_full) return;   /* a cut pass samples nothing: no final norm, no head */
@@ -3477,6 +3572,16 @@ static void pf_report() {
 
 /* The consumer skip's shutdown line, a line a rank (Model::CutStats): what its cut passes issued,
  * which the engine's own "consumer skip:" line counts from the batches; the two agree. */
+/* The two-batch overlap's shutdown line, a line a rank: the steps step() issued split. */
+static void tbo_report() {
+    for (int r = 0; r < MAX_RANKS; ++r) {
+        const Model* m = models[r].get();
+        if (!m || !m->tbo) continue;
+        std::fprintf(stderr, "radiance: deepseek41: rank %d: two-batch overlap: %llu decode steps issued "
+                             "as two micro-batches\n", r, (unsigned long long)m->tbo_steps);
+    }
+}
+
 static void cut_report() {
     for (int r = 0; r < MAX_RANKS; ++r) {
         const Model* m = models[r].get();
@@ -3504,5 +3609,6 @@ RAD_ARCH_PLUGIN(deepseek41, "deepseek41", "", "0.1.0",
 extern "C" void rad_plugin_close(void) {
     deepseek41::pf_report();
     deepseek41::cut_report();
+    deepseek41::tbo_report();
 }
 #endif

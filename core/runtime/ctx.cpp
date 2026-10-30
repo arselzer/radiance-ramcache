@@ -7,6 +7,7 @@
 #include "kvstream/stage.h"
 #include "xp_state.h"
 #include "../device/device.h"
+#include "../sched/tbo.h"
 
 #include <algorithm>
 #include <cstring>
@@ -639,6 +640,15 @@ static int64_t ep_layer_rows(const RadBatch* b, const Program* p, int64_t layer)
     return r0 >= 0 && r0 <= b->n_tok ? b->n_tok - r0 : 0;
 }
 
+/* Whether a router issued over `rows` routes this step's layer: ep_layer_rows, or in a step the
+ * plugin splits (rad_declare_two_batch, core/sched/tbo.h) either micro-batch's rows (the file
+ * stager checks the slice it expects against the witness's rows, ep_route_current). */
+static bool ep_rows_ok(const RadBatch* b, const Program* p, int64_t layer, int64_t rows) {
+    if (p && p->two_batch && tbo::step_splits(b))
+        return rows == tbo::rows_of(b->n_tok, 0) || rows == tbo::rows_of(b->n_tok, 1);
+    return rows == ep_layer_rows(b, p, layer);
+}
+
 void Ctx::note_ep_route_producer(const OpInfo& op, const RadTensor* t, int n_t,
                                  int64_t rows, RadStream issued_stream) {
     if (ep_route_.empty() || !batch_ || !staging_ || step_status_ < 0 || !route_dev_ ||
@@ -658,7 +668,7 @@ void Ctx::note_ep_route_producer(const OpInfo& op, const RadTensor* t, int n_t,
             (op.op != "moe_scatter" && op.op != "moe_scatter_inv" &&
              op.op != "router_topk_scatter" && op.op != "router_gemm_topk_scatter")) continue;
         if (lane_ != 0 || issued_stream != stream_ || rows <= 0 || rows > ep_route_max_rows() ||
-            rows != ep_layer_rows(batch_, program_, (int64_t)layer) || t[i].dtype != RAD_I32 ||
+            !ep_rows_ok(batch_, program_, (int64_t)layer, rows) || t[i].dtype != RAD_I32 ||
             !((t[i].rank == 1 && t[i].shape[0] == 96 && t[i].stride[0] == 1) ||
               (t[i].rank == 2 && t[i].shape[0] == 96 && t[i].shape[1] == 1 &&
                t[i].stride[0] == 1 && t[i].stride[1] == 1))) continue;
@@ -684,7 +694,7 @@ bool Ctx::ep_route_counts_live(int layer, EpRouteCounts* out) const {
         (size_t)layer >= ep_route_.size()) return false;
     const EpRouteCounts& v = ep_route_[(size_t)layer];
     if (!ep_route_current(v, program_, stream_, ep_route_generation_, layer,
-                          ep_layer_rows(batch_, program_, layer)))
+                          ep_rows_ok(batch_, program_, layer, v.rows) ? v.rows : -1))
         return false;
     *out = v;
     return true;

@@ -436,20 +436,24 @@ TEST(ds41_row_cut_declares_its_grain) {
     CHECK(d->m->cut_rows);
 }
 
-/* Every row0 at 0 is the plain step, op for op and operand for operand. */
+/* Every row0 at 0 is the plain step, op for op and operand for operand. One kit runs both steps, so
+ * the raw operands (pointers into its batch fields) are comparable, without and then with the row
+ * starts; operands compare field by field (a RadOperand has padding a memcmp would read). */
+bool same_operand(const RadOperand& a, const RadOperand& b) {
+    return a.kind == b.kind && a.dtype == b.dtype && a.handle == b.handle && a.raw == b.raw &&
+           a.offset == b.offset && a.rows == b.rows && a.cols == b.cols;
+}
 TEST(ds41_row_cut_at_row_zero_is_the_plain_step) {
     Env env({ { "RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP", "1" } });
     for (int rank : { 0, 3 }) {
         auto d = declare(rank, flash_meta(), 0, kWorld, 1024);
         REQUIRE_EQ(d->rc, (int)RAD_OK);
         std::vector<int32_t> z;
-        auto plain = kit(d->b, {}, { 1024 }, 0);
-        plain->out.clear();
-        plain->b.n_out = 0;
-        plain->b.out_ids = nullptr;
-        auto zero = row_chunk(d->b, 0, 1024, &z, false);
-        auto rp = run_passes(d->b, deepseek41::step, { plain.get() }, rank, kWorld);
-        auto rz = run_passes(d->b, deepseek41::step, { zero.get() }, rank, kWorld);
+        auto k = row_chunk(d->b, 0, 1024, &z, false);
+        k->b.consumer_row0 = nullptr;
+        auto rp = run_passes(d->b, deepseek41::step, { k.get() }, rank, kWorld);
+        k->b.consumer_row0 = z.data();
+        auto rz = run_passes(d->b, deepseek41::step, { k.get() }, rank, kWorld);
         REQUIRE(steps_ok(rp));
         REQUIRE(steps_ok(rz));
         REQUIRE_EQ(rp[0]->issues.size(), rz[0]->issues.size());
@@ -457,11 +461,11 @@ TEST(ds41_row_cut_at_row_zero_is_the_plain_step) {
         for (size_t i = 0; i < rp[0]->issues.size(); ++i) {
             const RecIssue &a = rp[0]->issues[i], &b = rz[0]->issues[i];
             bool same = a.op == b.op && a.n == b.n && a.opd.size() == b.opd.size();
-            for (size_t j = 0; same && j < a.opd.size(); ++j)
-                same = std::memcmp(&a.opd[j], &b.opd[j], sizeof(RadOperand)) == 0;
-            differ += !same;
+            for (size_t j = 0; same && j < a.opd.size(); ++j) same = same_operand(a.opd[j], b.opd[j]);
+            if (!same && differ++ < 4) fprintf(stderr, "    issue %zu (%s) differs\n", i, op_name(d->b, a.op).c_str());
         }
         CHECK_EQ(differ, 0);
+        CHECK_EQ(d->m->cuts.row_passes, (uint64_t)1);   /* the second step took the row path */
     }
 }
 
@@ -494,6 +498,7 @@ TEST(ds41_row_cut_issues_each_layer_on_its_rows) {
                 const RecIssue& is = c.issues[i];
                 if (!own.count(is.op) || is.op == L.pcn_a) continue;
                 if (rk >= T) { ++bad_rows; continue; }   /* a layer with no rows issues nothing */
+                if (is.op == L.kv_st) kv_st_at = (int64_t)i;   /* a source's too (its keys are on every row) */
                 if (L.src && keys.count(is.op)) continue;   /* the compressor's own row counts */
                 const bool key = keys.count(is.op) != 0;
                 const int64_t want = is.op == L.ar_attn ? (T - rf) * 5120 : key ? T - rk : T - rf;
@@ -506,7 +511,6 @@ TEST(ds41_row_cut_issues_each_layer_on_its_rows) {
                     ++bad_rows;
                 }
                 if (is.op == L.kv_st) {
-                    kv_st_at = (int64_t)i;
                     /* the window key's halves from row rk, the slot mapping from rk */
                     if (is.opd[0].offset != rk * 512 || is.opd[2].raw != (const void*)(k->slot.data() + rk)) ++bad_off;
                 }
@@ -519,15 +523,41 @@ TEST(ds41_row_cut_issues_each_layer_on_its_rows) {
             }
             if (rk < T && attn_at >= 0) CHECK(kv_st_at >= 0 && kv_st_at < attn_at);   /* keys before attention */
         }
-        /* The MoE's grouped GEMMs: on each layer's rows, the gate_up's tokens from row0. */
-        for (const RecIssue& is : c.issues) {
-            if (op_name(d->b, is.op) != "moe_gemm_ggml") continue;
-            ++moe;
+        /* Each layer's MoE (MoeFP8's own handles): layers 0..22 run it once, its router, scatter and
+         * grouped GEMMs on the layer's rows [rf, T) (the gate_up's token rows from rf), the ffn mix beside
+         * it; layers 23.. run none of it. */
+        int bad_moe = 0;
+        for (int l = 0; l < 40; ++l) {
+            const deepseek41::Layer& L = m.layers[(size_t)l];
+            const int64_t rf = row0[(size_t)l];
+            const rad_op route[] = { L.moe.op_router, L.moe.op_router_fused, L.moe.op_topk, L.moe.op_scatter,
+                                     L.moe.op_topk_scatter, L.moe.op_sigmoid_scatter };
+            int gu = 0, dn = 0;
+            for (const RecIssue& is : c.issues) {
+                if (is.op == L.moe.op_gu) {
+                    ++gu;
+                    ++moe;
+                    if (is.n != T - rf || is.opd.empty() || is.opd[0].offset != rf * 5120 || is.opd[0].rows != T - rf)
+                        ++bad_moe;
+                } else if (is.op == L.moe.op_dn) {
+                    ++dn;
+                    ++moe;
+                    if (is.n != T - rf) ++bad_moe;
+                } else {
+                    for (rad_op h : route)
+                        if (h && is.op == h && is.n != T - rf) ++bad_moe;
+                }
+            }
+            if (l < 23 ? gu != 1 || dn != 1 : gu + dn != 0) {
+                if (bad_moe < 4) fprintf(stderr, "    layer %d: %d gate_up and %d down issues\n", l, gu, dn);
+                ++bad_moe;
+            }
         }
         CHECK_EQ(bad_rows, 0);
         CHECK_EQ(bad_off, 0);
+        CHECK_EQ(bad_moe, 0);
         CHECK_EQ(mixf, 3);     /* the ffn mix beside every cut layer that runs its MoE (20..22) */
-        CHECK(moe >= 23 * 2);
+        CHECK_EQ(moe, 23 * 2);
         const std::vector<std::string> names = issued_ops(d->b, c);
         CHECK_EQ(count_issued(names, "logits_gemm") + count_issued(names, "gather_rows"), 0);
         CHECK_EQ(m.cuts.row_passes, (uint64_t)1);

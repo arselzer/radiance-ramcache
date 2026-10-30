@@ -429,8 +429,9 @@ TEST(host_expert_pool_cuts_an_experts_rows_evenly) {
 }
 
 /* Jobs of up to 64 rows (two many-row calls a tile), from four submitters at once, more jobs in flight
- * than the pool has slots, in one order and in the reverse: every row as the one-row kernel gives it,
- * whatever the order and the cut, no submitter stuck, the backlog drained. */
+ * than the pool has slots, two submitters in one order and two in the reverse: every row as the
+ * one-row kernel gives it, whatever the order and the cut, no submitter stuck, the backlog drained.
+ * Mostly one-row jobs (each still reads a whole expert), so the slots fill at a test's CPU cost. */
 TEST(host_expert_pool_64_row_jobs_from_four_submitters) {
     HostExpertPool* p = pool();
     if (!p || !__builtin_cpu_supports("avx2")) { SKIP("no AVX2 or no pool"); return; }
@@ -442,52 +443,54 @@ TEST(host_expert_pool_64_row_jobs_from_four_submitters) {
         xs.push_back(row(400 + (uint64_t)r));
         want.push_back(reference_avx2(e, xs.back()));
     }
-    /* Each submitter: jobs of 64, 33, 17, 5 and 1 rows (rows r0.. of the 64), cycled; 80 jobs each, 320
-     * in all, past the pool's slots. */
-    const int sizes[5] = { 64, 33, 17, 5, 1 };
-    constexpr int kSub = 4, kJobs = 80;
-    for (int order = 0; order < 2; ++order) {
-        std::vector<std::vector<std::vector<uint16_t>>> got(kSub * kJobs);
-        std::vector<std::vector<HostExpertPool::Job>> jobs(kSub);
-        int64_t cost = 0;
-        for (int s2 = 0; s2 < kSub; ++s2)
-            for (int q = 0; q < kJobs; ++q) {
-                const int idx = s2 * kJobs + q, rows = sizes[(q + s2) % 5], r0 = (q * 7 + s2) % (kRows - rows + 1);
-                got[(size_t)idx].assign((size_t)rows, std::vector<uint16_t>(kEmbd, 0xffff));
-                HostExpertPool::Job j;
-                j.gu = e.gu.data();
-                j.dn = e.dn.data();
-                j.x = xs[(size_t)r0].data();
-                j.y = got[(size_t)idx][0].data();
-                for (int i = 1; i < rows; ++i) {
-                    j.xs[i - 1] = xs[(size_t)(r0 + i)].data();
-                    j.ys[i - 1] = got[(size_t)idx][(size_t)i].data();
-                }
-                j.more = rows - 1;
-                j.urgent = (q % 9) == 0;
-                cost += HostExpertPool::job_cost(rows);
-                jobs[(size_t)s2].push_back(j);
+    /* Each submitter: 66 jobs (264 in all, past the pool's 256 slots); every 22nd one of 64, 33, 17 or 5
+     * rows (cycled, so each size is a job of each submitter's or another's), the rest one row; rows r0..
+     * of the 64. */
+    const int sizes[4] = { 64, 33, 17, 5 };
+    constexpr int kSub = 4, kJobs = 66;
+    static_assert(kSub * kJobs > 256, "more jobs than the pool's slots");
+    auto rows_of = [&](int s2, int q) { return q % 22 == 0 ? sizes[(q / 22 + s2) % 4] : 1; };
+    auto r0_of = [&](int s2, int q) { return (q * 7 + s2) % (kRows - rows_of(s2, q) + 1); };
+    std::vector<std::vector<std::vector<uint16_t>>> got(kSub * kJobs);
+    std::vector<std::vector<HostExpertPool::Job>> jobs(kSub);
+    int64_t cost = 0;
+    for (int s2 = 0; s2 < kSub; ++s2)
+        for (int q = 0; q < kJobs; ++q) {
+            const int idx = s2 * kJobs + q, rows = rows_of(s2, q), r0 = r0_of(s2, q);
+            got[(size_t)idx].assign((size_t)rows, std::vector<uint16_t>(kEmbd, 0xffff));
+            HostExpertPool::Job j;
+            j.gu = e.gu.data();
+            j.dn = e.dn.data();
+            j.x = xs[(size_t)r0].data();
+            j.y = got[(size_t)idx][0].data();
+            for (int i = 1; i < rows; ++i) {
+                j.xs[i - 1] = xs[(size_t)(r0 + i)].data();
+                j.ys[i - 1] = got[(size_t)idx][(size_t)i].data();
             }
-        if (order) for (auto& v : jobs) std::reverse(v.begin(), v.end());
-        p->reserve(cost);
-        std::vector<std::thread> th;
-        for (int s2 = 0; s2 < kSub; ++s2)
-            th.emplace_back([&, s2] {
-                HostExpertPool::Ticket t;
-                /* In bursts of 20, as a layer's units come. */
-                for (int q = 0; q < kJobs; q += 20) CHECK_EQ(p->submit(jobs[(size_t)s2].data() + q, 20, &t), 0);
-                p->wait(&t);
-            });
-        for (auto& t : th) t.join();
-        int bad = 0;
-        for (int s2 = 0; s2 < kSub; ++s2)
-            for (int q = 0; q < kJobs; ++q) {
-                const int idx = s2 * kJobs + q, rows = sizes[(q + s2) % 5], r0 = (q * 7 + s2) % (kRows - rows + 1);
-                for (int i = 0; i < rows; ++i) bad += got[(size_t)idx][(size_t)i] != want[(size_t)(r0 + i)];
-            }
-        CHECK_EQ(bad, 0);
-        CHECK_EQ(p->backlog(), (int64_t)0);
-    }
+            j.more = rows - 1;
+            j.urgent = (q % 9) == 0;
+            cost += HostExpertPool::job_cost(rows);
+            jobs[(size_t)s2].push_back(j);
+        }
+    for (int s2 = 1; s2 < kSub; s2 += 2) std::reverse(jobs[(size_t)s2].begin(), jobs[(size_t)s2].end());
+    p->reserve(cost);
+    std::vector<std::thread> th;
+    for (int s2 = 0; s2 < kSub; ++s2)
+        th.emplace_back([&, s2] {
+            HostExpertPool::Ticket t;
+            /* In bursts of 22, as a layer's units come. */
+            for (int q = 0; q < kJobs; q += 22) CHECK_EQ(p->submit(jobs[(size_t)s2].data() + q, 22, &t), 0);
+            p->wait(&t);
+        });
+    for (auto& t : th) t.join();
+    int bad = 0;
+    for (int s2 = 0; s2 < kSub; ++s2)
+        for (int q = 0; q < kJobs; ++q) {
+            const int idx = s2 * kJobs + q, rows = rows_of(s2, q), r0 = r0_of(s2, q);
+            for (int i = 0; i < rows; ++i) bad += got[(size_t)idx][(size_t)i] != want[(size_t)(r0 + i)];
+        }
+    CHECK_EQ(bad, 0);
+    CHECK_EQ(p->backlog(), (int64_t)0);
     fprintf(stderr, "    submit waited for a slot %llu times so far (%.1f ms)\n",
             (unsigned long long)p->submit_waits(), (double)p->submit_wait_ns() / 1e6);
 }

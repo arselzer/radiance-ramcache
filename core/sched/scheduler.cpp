@@ -346,17 +346,74 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
             if (why.empty()) {
                 cs_on_ = true;
                 builder_.set_consumer(c);
+                /* Which checkpoints below a cut prompt's target are made whole (consumer_skip.h,
+                 * "complete checkpoints"): every one its idle prefill writes unless the
+                 * sub-switch says otherwise. Without the prefix cache none is written anyway. */
+                cs_band_ = 0;
+                const bool ckpts = cfg.prefix_cache && geo_.checkpoints();
+                if (ckpts) {
+                    int64_t band = cfg.consumer_skip_ckpt;
+                    if (band < -1) {
+                        band = -1;
+                        const char* v = std::getenv("RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP_CKPT");
+                        if (v && *v && std::strcmp(v, "all") != 0) {
+                            char* stop = nullptr;
+                            const long long n = std::strtoll(v, &stop, 10);
+                            if (stop && stop != v && *stop == '\0' && n >= 0) band = (int64_t)n;
+                            else RAD_WARN("consumer skip: RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP_CKPT="
+                                          "%s is neither \"all\" nor a token count; every checkpoint "
+                                          "below a prompt's target is made whole", v);
+                        }
+                    }
+                    cs_band_ = band;
+                }
+                std::string tail;
+                if (ckpts && cs_band_ == 0)
+                    tail = "; a prompt is cut for the deepest checkpoint its idle prefill writes (its "
+                           "tail, else the last interval boundary, else a shared head), and none "
+                           "below it is written (RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP_CKPT=0)";
+                else if (ckpts)
+                    tail = "; a prompt is cut for the deepest checkpoint its idle prefill writes (its "
+                           "tail, else the last interval boundary, else a shared head), and the "
+                           "checkpoints below it are made whole (next line)";
                 RAD_INFO("consumer skip: on (RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP) -- a prompt's "
                          "pure prefill passes run layers [0, F) in full and layer F's key ops alone, "
                          "F >= %d of %d, and skip the rest: the rows that reach neither the prompt's "
                          "last token nor the state after it (window %d, passes of at most %lld rows "
                          "starting on a %lld-row grid)%s",
                          d.boundary, d.n_layer, d.window, (long long)c.max_rows, (long long)c.align,
-                         cfg.prefix_cache && geo_.checkpoints()
-                             ? "; a prompt is cut for the deepest checkpoint its idle prefill writes "
-                               "(its tail, else the last interval boundary, else a shared head), and "
-                               "none below it is written"
-                             : "");
+                         tail.c_str());
+                if (ckpts && cs_band_ != 0) {
+                    /* What one whole checkpoint costs at this shape, on an idle grid: the
+                     * layer-passes its cone runs in full (layers B .. n-2) on the passes before
+                     * it, for a checkpoint far from both the prompt's start and its target. */
+                    const int64_t q = std::max<int64_t>(c.max_rows / c.align * c.align, c.align);
+                    const int64_t P = q * ((64 * (int64_t)d.window + q - 1) / q);
+                    std::vector<int64_t> g = consumer_ckpt_thresholds(c, P);
+                    int64_t cone = 0;
+                    for (int32_t L = d.boundary; L + 1 < d.n_layer && !g.empty(); ++L)
+                        cone += g[(size_t)L] < 0 ? P / q : P / q - (g[(size_t)L] + 1 + q - 1) / q + 1;
+                    RAD_INFO("consumer skip: complete checkpoints (RADIANCE_EXPERIMENTAL_DS41_CONSUMER_"
+                             "SKIP_CKPT=%s) -- %s holds the base engine's bytes: the passes before it "
+                             "run its own dependency cone, layer L < %d in full on about %d (%d - L) "
+                             "rows behind it and layer %d's key ops on the last %d (keys alone are not "
+                             "enough: a layer's key at a row needs the layer below it run in full "
+                             "there); a lone one adds up to %lld layer-passes in full, and checkpoints "
+                             "every I tokens overlap their cones for every layer L with %d (%d - L) "
+                             ">= I, which then runs in full throughout (I = 16 or 256: every layer but "
+                             "the last one or two). ..._CKPT=N keeps those within N tokens below the "
+                             "target and a shared head, 0 none",
+                             cs_band_ < 0 ? "all" : fmt("%lld", (long long)cs_band_).c_str(),
+                             cs_band_ < 0
+                                 ? "every checkpoint a cut prompt's idle prefill writes below its "
+                                   "target is made whole, and each"
+                                 : fmt("a cut prompt's checkpoints within %lld tokens below its "
+                                       "target and its shared head (the request's keep point) are "
+                                       "made whole, the rest are not written, and each",
+                                       (long long)cs_band_).c_str(),
+                             d.n_layer - 1, d.window, d.n_layer - 1, d.n_layer - 1, d.window,
+                             (long long)cone, d.window, d.n_layer - 1);
+                }
             } else {
                 RAD_WARN("consumer skip: refused -- %s; every layer runs on every row", why.c_str());
             }
@@ -507,6 +564,15 @@ int Scheduler::add_locked(std::unique_ptr<Request> r) {
     const int64_t ctx_room = ctx_limit_ - (int64_t)s.req->prompt.size();
     if (ctx_limit_ > 0 && out_cap > ctx_room) out_cap = ctx_room > 1 ? ctx_room : 1;
     s.req->output.reserve((size_t)out_cap + (size_t)RAD_SCHED_MAX_SPEC);
+    /* The checkpoints the consumer skip makes whole are listed at each admission, on the step
+     * path (consumer_target): their room is made here too, one an interval of everything the
+     * request can prefill and a few more (its tail, its keep point). The slot keeps it. */
+    s.consumer_ckpts.clear();
+    if (cs_on_ && cs_band_ != 0 && geo_.checkpoints()) {
+        const int64_t I = std::max<int64_t>(geo_.checkpoint_interval, 1);
+        const size_t room = (size_t)(((int64_t)s.req->prompt.size() + out_cap) / I + 4);
+        if (s.consumer_ckpts.capacity() < room) s.consumer_ckpts.reserve(room);
+    }
 
     by_id_[s.req->id] = slot;
     /* Enough headroom that a step preempting every running request does not grow the queue under
@@ -793,11 +859,14 @@ void Scheduler::close_request(SchedReq& s, ReqState st, const char* reason, bool
 /* Reserve a checkpoint slot for the state at `pos`, written after the entry's row `tok`. A
  * refusal leaves the entry without one. */
 void Scheduler::reserve_ckpt(StepEntry& e, const Request& r, int64_t pos, int32_t tok) {
-    /* The consumer skip: a snapshot below the prompt's cut target would hold the last layers'
-     * windows incomplete; the one at the target is whole (consumer_skip.h). Counted only with the
-     * prefix cache on: without it the store refuses every snapshot anyway (a model with linear
-     * state still proposes them). */
-    if (e.consumer_end > 0 && !consumer_checkpoint_complete(pos, e.consumer_end)) {
+    /* The consumer skip: a snapshot below the prompt's cut target holds the last layers' windows
+     * incomplete unless it is the checkpoint the entry's passes were planned to make whole (its
+     * StepEntry::consumer_ckpt, at the chunk's end); the one at the target is whole
+     * (consumer_skip.h). Counted only with the prefix cache on: without it the store refuses every
+     * snapshot anyway (a model with linear state still proposes them). */
+    const bool below = e.consumer_end > 0 && !consumer_checkpoint_complete(pos, e.consumer_end);
+    if (below && !(e.consumer_ckpt > 0 && pos == e.consumer_ckpt &&
+                   pos == (int64_t)e.ctx_len + tok + 1)) {
         if (cfg_.prefix_cache) ++m_.consumer_ckpt_dropped;
         return;
     }
@@ -811,6 +880,8 @@ void Scheduler::reserve_ckpt(StepEntry& e, const Request& r, int64_t pos, int32_
     e.ckpt_tok = tok;
     e.ckpt_slot = cs;
     ++m_.checkpoints_written;
+    /* One below the target that the cut makes whole (StepEntry::consumer_ckpt). */
+    if (below) ++m_.consumer_ckpt_whole;
 }
 
 int Scheduler::fail_prefilling(const char* why) {
@@ -1620,16 +1691,25 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
     server::sink_prompt_progress(r.sink, r.n_computed, (int32_t)r.prompt.size(), r.n_cached);
     s.sched_tokens = (int32_t)want;
     s.pending_ckpt = ckpt;
-    s.consumer_end = consumer_target(s);
+    s.consumer_end = consumer_target(s, &s.consumer_ckpts);
     ++m_.admitted;
     return RAD_OK;
 }
 
 /* The consumer skip's target for a request just admitted (consumer_skip.h): the end of what its
  * prefill computes, or, where the scheduler writes a checkpoint below it, the deepest one, whose
- * snapshot must hold every layer's window (every one below it is dropped). 0 for a request whose
- * every row matters: a scored prompt (KL mode) or an embedding input. */
-int64_t Scheduler::consumer_target(const SchedReq& s) const {
+ * snapshot must hold every layer's window. 0 for a request whose every row matters: a scored
+ * prompt (KL mode) or an embedding input.
+ *
+ * With `ckpts`, the checkpoints below the target its cut makes whole ("complete checkpoints" in
+ * consumer_skip.h, which proves the schedule for any such set), ascending: of those its idle
+ * prefill writes, past its computed tokens, every one (cs_band_ -1, the default with the prefix
+ * cache), none (0: they are not written, as before), or those within cs_band_ tokens below the
+ * target and its own keep point (Request::checkpoint_at, a shared head other requests resume at),
+ * which plan_chunk snapshots on its quantum. A checkpoint the run writes outside the set is not
+ * reserved (reserve_ckpt). */
+int64_t Scheduler::consumer_target(const SchedReq& s, std::vector<int64_t>* ckpts) const {
+    if (ckpts) ckpts->clear();
     if (!cs_on_ || !s.req) return 0;
     const Request& r = *s.req;
     if (r.score || r.embed) return 0;
@@ -1637,10 +1717,28 @@ int64_t Scheduler::consumer_target(const SchedReq& s) const {
     if (target <= (int64_t)r.n_computed) return 0;
     int64_t t = target;
     if (cfg_.prefix_cache && geo_.checkpoints()) {
-        const int64_t ck = idle_prefill_checkpoint(r, chunk_end(r, target));
+        const int64_t ck = idle_prefill_checkpoint(r, chunk_end(r, target),
+                                                   cs_band_ != 0 ? ckpts : nullptr);
         if (ck > (int64_t)r.n_computed && ck < t) t = ck;
+        if (ckpts && cs_band_ != 0) {
+            const int64_t q = std::max<int64_t>(geo_.quantum, 1);
+            const int64_t keep = r.checkpoint_at / q * q;
+            size_t w = 0;
+            for (const int64_t p : *ckpts) {
+                if (p <= (int64_t)r.n_computed || p >= t) continue;
+                if (cs_band_ < 0 || p >= t - cs_band_ || (keep > 0 && p == keep))
+                    (*ckpts)[w++] = p;
+            }
+            ckpts->resize(w);
+        }
     }
     return t;
+}
+
+int64_t Scheduler::consumer_next_ckpt(const SchedReq& s, int64_t end) {
+    const std::vector<int64_t>& v = s.consumer_ckpts;
+    const auto it = std::lower_bound(v.begin(), v.end(), end);
+    return it == v.end() ? 0 : *it;
 }
 
 /* The deepest checkpoint an idle prefill of `r` writes from its computed tokens to `end`:
@@ -1650,13 +1748,16 @@ int64_t Scheduler::consumer_target(const SchedReq& s) const {
  * nearest and chunks of one quantum the chunk before the last already ends on the tail and the
  * last starts there, so no snapshot is taken at it (and in exact mode a prompt just past an
  * interval boundary has no tail but the boundary's snapshot). */
-int64_t Scheduler::idle_prefill_checkpoint(const Request& r, int64_t end) const {
+int64_t Scheduler::idle_prefill_checkpoint(const Request& r, int64_t end,
+                                           std::vector<int64_t>* all) const {
+    if (all) all->clear();
     int64_t deepest = -1;
     for (int64_t pos = (int64_t)r.n_computed; pos < end;) {
         int64_t ck = -1;
         const int64_t n = plan_chunk(pos, end, cfg_.max_tok, &ck, r.checkpoint_at);
         if (n <= 0) break;
         if (ck > deepest) deepest = ck;
+        if (all && ck > 0) all->push_back(ck);
         pos += n;
     }
     return deepest;
@@ -1978,6 +2079,7 @@ replan:
         e.n_draft = s.n_draft;
         e.is_prefill = prefill;
         e.consumer_end = prefill ? s.consumer_end : 0;
+        e.consumer_ckpt = e.consumer_end > 0 ? consumer_next_ckpt(s, (int64_t)r.n_computed + want) : 0;
         e.ngram = !prefill && s.draft_ngram && s.n_draft > 0;
         e.produces_token = (r.n_computed + want >= target);
         /* The snapshot a hit resumes from, consumed once: the state is in the slot for the whole
@@ -2063,6 +2165,8 @@ replan:
             e.n_draft = 0;
             e.is_prefill = true;
             e.consumer_end = s.consumer_end;
+            e.consumer_ckpt = e.consumer_end > 0
+                ? consumer_next_ckpt(s, (int64_t)r.n_computed + s.sched_tokens) : 0;
             e.produces_token = (r.n_computed + s.sched_tokens >= s.seq_len());
             /* admit_one just set ckpt_src, and this is the entry it applies to. Consumed once:
              * restoring again on a later chunk would rewind the recurrence to the hit. */
@@ -2115,6 +2219,7 @@ replan:
         if (grown > had && kv_->ensure_from(r.id, r.n_computed + grown, r.n_computed) >= 0) {
             e.n_tokens = (int32_t)grown;
             e.produces_token = (r.n_computed + grown >= s.seq_len());
+            if (e.consumer_end > 0) e.consumer_ckpt = consumer_next_ckpt(s, (int64_t)r.n_computed + grown);
             if (ckpt > 0) reserve_ckpt(e, r, ckpt, (int32_t)(grown - 1));
             s.sched_tokens = (int32_t)grown;
             plan_.n_tok += grown - had;

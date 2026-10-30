@@ -594,8 +594,10 @@ void BatchBuilder::set_consumer(const ConsumerShape& c) {
     cs_ = c;
     cs_on_ = c.valid();
     cs_end_ = -1;
-    /* Sized once here: build() fills it in place, and the step path allocates nothing. */
+    cs_ck_ = -1;
+    /* Sized once here: build() fills them in place, and the step path allocates nothing. */
     cs_f_.assign(cs_on_ ? (size_t)c.n_layer : 0, -1);
+    cs_g_.assign(cs_on_ ? (size_t)c.n_layer : 0, -1);
     cs_stats_ = ConsumerStats{};
 }
 
@@ -1083,7 +1085,9 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
 
     /* The consumer skip (consumer_skip.h). A step whose only entry is a prefill chunk of a prompt
      * the scheduler cut runs layers [0, F) in full and layer F's key ops alone; F is the declared
-     * shape's for the chunk's last row and the prompt's target. A chunk of such a prompt in a step
+     * shape's for the chunk's last row and the prompt's target, raised to the cone of the first
+     * checkpoint below the target that the scheduler makes whole at or after the chunk's end
+     * (StepEntry::consumer_ckpt; "complete checkpoints"). A chunk of such a prompt in a step
      * with anything else beside it (decode rows, another chunk, encoder or scored rows) runs every
      * layer, which is the base engine's step; the scheduler's startup refuses the deployments
      * where that can happen (Scheduler::init), so `shared` stays 0. The prompt's last chunk holds
@@ -1111,17 +1115,49 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
                              (int)(e.ctx_len + e.n_tokens), (long long)cs_.align,
                              (long long)cs_.max_rows);
             }
-            /* A step that writes a checkpoint runs every layer, so its snapshot holds what the
-             * base engine's step leaves whatever the cut (insurance: the scheduler writes none
-             * below a cut prompt's target, and the step that reaches the target is never cut). */
-            if (alone && n_ck == 0) {
+            if (alone) {
+                const int64_t last = (int64_t)e.ctx_len + e.n_tokens - 1;
                 if (cs_end_ != e.consumer_end) {
                     cs_end_ = consumer_thresholds(cs_, e.consumer_end, cs_f_.data()) ? e.consumer_end
                                                                                     : -1;
                 }
-                if (cs_end_ == e.consumer_end)
-                    F = consumer_full_layers(cs_, cs_f_.data(), (int64_t)e.ctx_len + e.n_tokens - 1);
-            } else if (!alone) {
+                if (cs_end_ == e.consumer_end) {
+                    F = consumer_full_layers(cs_, cs_f_.data(), last);
+                    /* The checkpoint ahead that the scheduler makes whole: its cone. */
+                    const int64_t ck = e.consumer_ckpt;
+                    if (F < cs_.n_layer && ck > last && ck < e.consumer_end) {
+                        if (cs_ck_ != ck)
+                            cs_ck_ = consumer_ckpt_thresholds(cs_, ck, cs_g_.data()) ? ck : -1;
+                        if (cs_ck_ == ck) {
+                            const int32_t G = consumer_full_layers(cs_, cs_g_.data(), last);
+                            if (G > F) {
+                                ++cs_stats_.ckpt_raised;
+                                cs_stats_.ckpt_full += (uint64_t)(G - F);
+                                F = G;
+                            }
+                        }
+                    }
+                    /* A step that writes a snapshot below the target is cut only where the
+                     * snapshot is the one it was planned to make whole and it stores every layer's
+                     * keys (consumer_ckpt_covered); otherwise it runs every layer, which leaves what
+                     * the base engine's step does (insurance: the scheduler writes no other). */
+                    if (n_ck > 0 && F < cs_.n_layer) {
+                        const int64_t pos = (int64_t)e.ctx_len + e.ckpt_tok + 1;
+                        if (e.ckpt_slot >= 0 && e.ckpt_tok >= 0 &&
+                            consumer_ckpt_covered(cs_, pos, last, e.consumer_end, e.consumer_ckpt, F)) {
+                            ++cs_stats_.ckpt_cut;
+                        } else {
+                            if (cs_stats_.ckpt_insured++ == 0)
+                                RAD_WARN("consumer skip: the chunk at %d..%d writes a snapshot at %lld "
+                                         "that its cut for %lld was not planned to make whole (next "
+                                         "%lld); every layer runs", (int)e.ctx_len,
+                                         (int)(e.ctx_len + e.n_tokens), (long long)pos,
+                                         (long long)e.consumer_end, (long long)e.consumer_ckpt);
+                            F = cs_.n_layer;
+                        }
+                    }
+                }
+            } else {
                 ++cs_stats_.shared;
             }
             if (F < cs_.n_layer && e.produces_token) {

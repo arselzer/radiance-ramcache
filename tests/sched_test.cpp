@@ -57,6 +57,7 @@ void  operator delete(void* p, size_t) noexcept { std::free(p); }
 void  operator delete[](void* p, size_t) noexcept { std::free(p); }
 
 #include "sched_fakes.h"
+#include "consumer_sim.h"
 
 using namespace sched_fake;
 
@@ -7415,15 +7416,24 @@ struct CsRun {
     int cut = 0, prefill_steps = 0, bad_full = 0, sampled_cut = 0, shared_cut = 0;
     std::vector<int64_t> ckpts;   /* positions the snapshots were reserved at */
     int64_t end = -1;             /* the target every prefill entry carried; -2 when they differed */
+    /* The request's prefill passes and each one's F (the layer count when it was not cut), for
+     * the dependency simulation (consumer_sim.h). */
+    std::vector<csim::Pass> passes;
+    std::vector<int32_t> F;
 };
 
 /* Runs every request the fixture holds to the end, checking each step's cut against the schedule
- * for `target` (the chunk's last row) and collecting the checkpoints the steps reserve. */
-CsRun consumer_run(Fixture& f, uint64_t id, int64_t target) {
+ * for `target` (the chunk's last row) and the checkpoints below it made whole (`whole`, ascending:
+ * the first at or after the chunk's end raises F to its cone; consumer_skip.h), and collecting
+ * the checkpoints the steps reserve. The shape is the program's declared suffix. */
+CsRun consumer_run(Fixture& f, uint64_t id, int64_t target,
+                   const std::vector<int64_t>& whole = {}) {
     CsRun out;
-    const ConsumerShape shape{ 16, 4, 64, f.cfg.max_tok, f.sch.geometry().quantum };
+    const RadConsumerSuffix& d = f.prog.consumer;
+    const ConsumerShape shape{ d.n_layer, d.boundary, d.window, f.cfg.max_tok,
+                               f.sch.geometry().quantum };
     const std::vector<int64_t> th = consumer_thresholds(shape, target);
-    for (int k = 0; k < 400; ++k) {
+    for (int k = 0; k < 4000; ++k) {
         const RadBatch* b = f.sch.step();
         if (!b) break;
         const StepPlan& p = f.sch.plan();
@@ -7433,15 +7443,22 @@ CsRun consumer_run(Fixture& f, uint64_t id, int64_t target) {
             if (out.end == -1) out.end = e.consumer_end;
             else if (out.end != e.consumer_end) out.end = -2;
             if (e.ckpt_slot >= 0) out.ckpts.push_back((int64_t)e.ctx_len + e.ckpt_tok + 1);
-            const int32_t F = consumer_full_layers(shape, th, (int64_t)e.ctx_len + e.n_tokens - 1);
-            const int32_t want = p.e.size() == 1 && F < 16 ? F : 0;
+            const int64_t end = (int64_t)e.ctx_len + e.n_tokens;
+            const auto it = std::lower_bound(whole.begin(), whole.end(), end);
+            const int32_t F = it == whole.end()
+                ? consumer_full_layers(shape, th, end - 1)
+                : consumer_pass_layers(shape, th, consumer_ckpt_thresholds(shape, *it), end - 1);
+            const int32_t want = p.e.size() == 1 && F < d.n_layer ? F : 0;
             if (b->consumer_full != want) ++out.bad_full;
+            if (e.consumer_ckpt != (it == whole.end() ? 0 : *it)) ++out.bad_full;
             if (b->consumer_full) {
                 ++out.cut;
                 if (b->consumer_end != target) ++out.bad_full;
                 if (e.produces_token || b->n_out) ++out.sampled_cut;
                 if (p.e.size() != 1) ++out.shared_cut;
             }
+            out.passes.push_back({ (int64_t)e.ctx_len, end });
+            out.F.push_back(b->consumer_full ? b->consumer_full : d.n_layer);
         }
         if (b->consumer_full && (p.e.size() != 1 || !p.e[0].is_prefill)) ++out.shared_cut;
         f.commit_plain();
@@ -7451,13 +7468,16 @@ CsRun consumer_run(Fixture& f, uint64_t id, int64_t target) {
 
 }  /* namespace */
 
-/* A lone prompt with the prefix cache on: cut for its tail checkpoint (1072, a block short of
- * 1100), every pass's F the schedule's, the snapshots at 256 .. 1024 not written (their windows
- * are incomplete) and the one at the tail written; the prompt's last passes run every layer. */
+/* A lone prompt with the prefix cache on and ..._CKPT=0: cut for its tail checkpoint (1072, a
+ * block short of 1100), every pass's F the schedule's, the snapshots at 256 .. 1024 not written
+ * (their windows are incomplete) and the one at the tail written; the prompt's last passes run
+ * every layer. */
 TEST(consumer_skip_cuts_a_lone_prefill_for_its_tail_checkpoint) {
     Fixture f;
     consumer_fixture(f, 16);
+    f.cfg.consumer_skip_ckpt = 0;   /* none below the target made whole: they are not written */
     REQUIRE_EQ(f.start(), RAD_OK);
+    CHECK_EQ(f.sch.consumer_ckpt_policy(), (int64_t)0);
     REQUIRE(f.sch.consumer_on());
     REQUIRE(f.sch.geometry().window_ckpt);
     CHECK_EQ(f.sch.geometry().quantum, 16);
@@ -7590,9 +7610,9 @@ TEST(consumer_skip_is_refused_where_its_derivation_does_not_reach) {
 }
 
 /* The consumer skip in DeepSeek-V4.1's own shape (ds41_fixture: linear state beside the window, a
- * state chunk of 1, 16-token chunks), with the prefix cache on, in both resume modes: a prompt is
- * cut for the deepest snapshot its idle prefill writes, and that one is written, so every prompt
- * that would have a snapshot keeps one. With --prefix-resume nearest the chunk before a prompt's
+ * state chunk of 1, 16-token chunks), with the prefix cache on and ..._CKPT=0, in both resume
+ * modes: a prompt is cut for the deepest snapshot its idle prefill writes, and that one is
+ * written, so every prompt that would have a snapshot keeps one. With --prefix-resume nearest the chunk before a prompt's
  * last ends on the quantum boundary under its end and the last chunk starts there, so no tail
  * snapshot is taken (plan_chunk only splits a final chunk for one): cutting for tail_checkpoint()
  * dropped the interval snapshots below it and wrote none. With exact a prompt just past an
@@ -7609,6 +7629,7 @@ TEST(consumer_skip_in_ds41s_shape_keeps_the_deepest_snapshot_its_prefill_writes)
                 f.cfg.prefix_exact = exact;
                 f.prog.consumer = RadConsumerSuffix{ (uint32_t)sizeof(RadConsumerSuffix), 16, 4, 64 };
                 f.cfg.consumer_skip = 1;
+                f.cfg.consumer_skip_ckpt = 0;
                 f.cfg.max_seqs = 1;
                 REQUIRE_EQ(f.start(), RAD_OK);
                 REQUIRE(f.sch.consumer_on());
@@ -7649,6 +7670,7 @@ TEST(consumer_skip_in_ds41s_shape_keeps_the_deepest_snapshot_its_prefill_writes)
         f.cfg.prefix_exact = false;
         f.prog.consumer = RadConsumerSuffix{ (uint32_t)sizeof(RadConsumerSuffix), 16, 4, 64 };
         f.cfg.consumer_skip = 1;
+        f.cfg.consumer_skip_ckpt = 0;
         f.cfg.max_seqs = 1;
         REQUIRE_EQ(f.start(), RAD_OK);
         CHECK_EQ(f.sch.tail_checkpoint(3086), 3072);
@@ -7726,5 +7748,252 @@ TEST(consumer_skip_is_refused_for_unlike_ranks_and_kv_streaming) {
         f.cfg.kv_resident = 1024;
         REQUIRE_EQ(f.start(), RAD_OK);
         CHECK(!f.sch.consumer_on());
+    }
+}
+
+/* ================================================================== complete checkpoints */
+/* RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP_CKPT (consumer_skip.h, "complete checkpoints") on the
+ * scheduler, in DeepSeek-V4.1's own shape and suffix: ds41_fixture's 16-token chunks with linear
+ * state beside the window, and the declared suffix of 40 layers past boundary 20 with the
+ * 128-position window. Each run's passes and F go through the dependency simulation
+ * (consumer_sim.h), which holds every snapshot to the base engine's window and state bytes. */
+namespace {
+
+void ds41_cs_fixture(Fixture& f, int64_t interval, bool exact, int64_t policy) {
+    ds41_fixture(f, interval);
+    f.cfg.prefix_exact = exact;
+    f.prog.consumer = RadConsumerSuffix{ (uint32_t)sizeof(RadConsumerSuffix), 40, 20, 128 };
+    f.cfg.consumer_skip = 1;
+    f.cfg.consumer_skip_ckpt = policy;
+    f.cfg.max_seqs = 1;
+}
+
+const ConsumerShape kDs41Shape{ 40, 20, 128, 16, 16 };
+
+/* The snapshots an uncut idle prefill from `from` to `n` writes with keep point `keep`. */
+std::vector<int64_t> idle_ckpts(const Scheduler& s, int64_t from, int64_t n, int64_t keep = 0) {
+    std::vector<int64_t> v;
+    for (int64_t pos = from; pos < n;) {
+        int64_t ck = -1;
+        const int64_t k = s.plan_chunk(pos, n, 16, &ck, keep);
+        if (k <= 0) break;
+        pos += k;
+        if (ck > 0) v.push_back(ck);
+    }
+    return v;
+}
+
+}  /* namespace */
+
+/* With every checkpoint made whole (..._CKPT=all, the default with the prefix cache), a cut prompt
+ * writes every snapshot its uncut idle prefill writes, each with the base engine's bytes: in both
+ * resume modes at intervals 16, 256 and 2048, over prompt lengths around the interval and tail
+ * boundaries, cold and resumed at one of its own snapshots (a prefix hit), the real scheduler's
+ * snapshots are the uncut run's (and csim::ds41_idle_snapshots, the lists consumer_skip_test
+ * simulates), every pass's F is the schedule's for the target and the first checkpoint ahead,
+ * each pass that writes one below the target is cut at layer 39's keys, nothing sampled is cut,
+ * and the simulation of the passes the scheduler ran finds every snapshot whole and every computed
+ * row exact. */
+TEST(consumer_skip_in_ds41s_shape_writes_every_snapshot_whole) {
+    int runs = 0, with = 0, resumed = 0;
+    for (const bool exact : { false, true }) {
+        for (const int64_t interval : { 16, 256, 2048 }) {
+            for (const int64_t n : { 19, 40, 255, 256, 257, 300, 1100, 1221, 2047, 2048, 2050, 2064,
+                                     2065, 2655, 3086 }) {
+                const std::vector<int64_t> model = csim::ds41_idle_snapshots(0, n, interval, exact);
+                /* Cold, then resumed at the first snapshot below the end, if any. */
+                std::vector<int64_t> starts{ 0 };
+                for (int64_t k : model) if (k < n && k <= 1024) { starts.push_back(k); break; }
+                for (const int64_t p0 : starts) {
+                    Fixture f;
+                    ds41_cs_fixture(f, interval, exact, -1);
+                    REQUIRE_EQ(f.start(), RAD_OK);
+                    REQUIRE(f.sch.consumer_on());
+                    CHECK_EQ(f.sch.consumer_ckpt_policy(), (int64_t)-1);
+                    if (p0 > 0) {
+                        f.pc.seed((int32_t)p0);
+                        f.pc.lin = (int32_t)p0;   /* a snapshot of its own, on the grid */
+                        f.pc.src = 3;
+                    }
+                    const std::vector<int64_t> cold = idle_ckpts(f.sch, p0, n);
+                    if (p0 == 0) CHECK(cold == model);
+                    CHECK(cold == csim::ds41_idle_snapshots(p0, n, interval, exact));
+                    const int64_t deepest = cold.empty() ? -1 : cold.back();
+                    const int64_t target = deepest > p0 && deepest < n ? deepest : n;
+                    std::vector<int64_t> whole;
+                    for (int64_t k : cold) if (k < target) whole.push_back(k);
+                    const uint64_t id = f.submit((int)n, 1);
+                    REQUIRE(id != 0);
+                    const CsRun r = consumer_run(f, id, target, whole);
+                    REQUIRE(!r.passes.empty());
+                    CHECK_EQ(r.passes.front().first, p0);
+                    CHECK_EQ(r.end, target);
+                    CHECK_EQ(r.bad_full, 0);
+                    CHECK_EQ(r.sampled_cut, 0);
+                    CHECK_EQ(r.shared_cut, 0);
+                    CHECK(r.ckpts == cold);
+                    CHECK_EQ(f.sch.metrics().consumer_ckpt_whole, (int64_t)whole.size());
+                    CHECK_EQ(f.sch.metrics().consumer_ckpt_dropped, (int64_t)0);
+                    CHECK_EQ(f.sch.metrics().checkpoints_written, (int64_t)cold.size());
+                    const BatchBuilder::ConsumerStats& cs = f.sch.consumer_stats();
+                    CHECK_EQ(cs.ckpt_insured, (uint64_t)0);
+                    CHECK_EQ(cs.ckpt_cut, (uint64_t)whole.size());
+                    CHECK_EQ(cs.full + cs.key + cs.skipped, (uint64_t)r.prefill_steps * 40);
+                    const csim::Sim sim = csim::simulate_passes(kDs41Shape, n, p0, r.passes, r.F,
+                                                                r.ckpts);
+                    CHECK(sim.ok);
+                    if (!sim.ok)
+                        fprintf(stderr, "    %s I %lld n %lld p0 %lld: %s\n",
+                                exact ? "exact" : "nearest", (long long)interval, (long long)n,
+                                (long long)p0, sim.why.c_str());
+                    ++runs;
+                    with += !whole.empty();
+                    resumed += p0 > 0;
+                }
+            }
+        }
+    }
+    CHECK(runs >= 90);
+    CHECK(resumed > 20);
+    CHECK(with > 40);
+}
+
+/* ..._CKPT=N: of the snapshots below the target, those within N tokens of it are made whole and
+ * written, the rest not (counted as dropped); the target's is written. In both modes at intervals
+ * 16, 256 and 2048, for N = 32 and 512: the written list is the uncut run's from target - N on,
+ * every pass's F the schedule's for that set, and every written snapshot whole in the simulation;
+ * the band costs less than every checkpoint and more than none. */
+TEST(consumer_skip_band_writes_the_snapshots_near_the_target_whole) {
+    int runs = 0, dropped_some = 0;
+    for (const bool exact : { false, true }) {
+        for (const int64_t interval : { 16, 256, 2048 }) {
+            for (const int64_t band : { 32, 512 }) {
+                for (const int64_t n : { 300, 1221, 2655, 3086 }) {
+                    int64_t full[3] = { 0, 0, 0 };   /* policies 0, band, all */
+                    for (int k = 0; k < 3; ++k) {
+                        const int64_t policy = k == 0 ? 0 : k == 1 ? band : -1;
+                        Fixture f;
+                        ds41_cs_fixture(f, interval, exact, policy);
+                        REQUIRE_EQ(f.start(), RAD_OK);
+                        CHECK_EQ(f.sch.consumer_ckpt_policy(), policy);
+                        const std::vector<int64_t> cold = idle_ckpts(f.sch, 0, n);
+                        const int64_t deepest = cold.empty() ? -1 : cold.back();
+                        const int64_t target = deepest > 0 && deepest < n ? deepest : n;
+                        std::vector<int64_t> whole, written;
+                        for (int64_t c : cold) {
+                            const bool kept = c >= target || policy < 0 ||
+                                              (policy > 0 && c >= target - policy);
+                            if (kept) written.push_back(c);
+                            if (kept && c < target) whole.push_back(c);
+                        }
+                        const uint64_t id = f.submit((int)n, 1);
+                        REQUIRE(id != 0);
+                        const CsRun r = consumer_run(f, id, target, whole);
+                        CHECK_EQ(r.bad_full, 0);
+                        CHECK(r.ckpts == written);
+                        CHECK_EQ(f.sch.metrics().consumer_ckpt_whole, (int64_t)whole.size());
+                        CHECK_EQ(f.sch.metrics().consumer_ckpt_dropped,
+                                 (int64_t)(cold.size() - written.size()));
+                        const csim::Sim sim = csim::simulate_passes(kDs41Shape, n, 0, r.passes,
+                                                                    r.F, r.ckpts);
+                        CHECK(sim.ok);
+                        if (!sim.ok)
+                            fprintf(stderr, "    %s I %lld N %lld n %lld: %s\n",
+                                    exact ? "exact" : "nearest", (long long)interval,
+                                    (long long)policy, (long long)n, sim.why.c_str());
+                        full[k] = csim::full_layer_passes(r.F);
+                        dropped_some += k == 1 && written.size() < cold.size();
+                        ++runs;
+                    }
+                    CHECK(full[0] <= full[1]);
+                    CHECK(full[1] <= full[2]);
+                }
+            }
+        }
+    }
+    CHECK_EQ(runs, 2 * 3 * 2 * 4 * 3);
+    CHECK(dropped_some > 10);
+}
+
+/* A request's keep point (Request::checkpoint_at, a head other requests resume at; set here from
+ * the cache's CacheHit::branch_at) is made whole under ..._CKPT=N wherever it falls: a 3,086-token
+ * prompt at interval 2048 (exact) with a shared head ending at 1,000 writes the head's snapshot at
+ * 992 (plan_chunk's quantum), its tail at 3072, and not 2048, which is outside a band of 256; with
+ * every checkpoint 2048 too; with none only the tail. */
+TEST(consumer_skip_band_keeps_a_shared_head_whole) {
+    struct Want { int64_t policy; std::vector<int64_t> written; int64_t whole, dropped; };
+    for (const Want& w : { Want{ 256, { 992, 3072 }, 1, 1 }, Want{ -1, { 992, 2048, 3072 }, 2, 0 },
+                           Want{ 0, { 3072 }, 0, 2 } }) {
+        Fixture f;
+        ds41_cs_fixture(f, 2048, true, w.policy);
+        REQUIRE_EQ(f.start(), RAD_OK);
+        f.pc.branch_at = 1000;
+        CHECK((idle_ckpts(f.sch, 0, 3086, 1000) == std::vector<int64_t>{ 992, 2048, 3072 }));
+        const uint64_t id = f.submit(3086, 1);
+        REQUIRE(id != 0);
+        std::vector<int64_t> whole;
+        for (int64_t c : w.written) if (c < 3072) whole.push_back(c);
+        const CsRun r = consumer_run(f, id, 3072, whole);
+        CHECK_EQ(r.bad_full, 0);
+        CHECK(r.ckpts == w.written);
+        CHECK_EQ(f.sch.metrics().consumer_ckpt_whole, w.whole);
+        CHECK_EQ(f.sch.metrics().consumer_ckpt_dropped, w.dropped);
+        const csim::Sim sim = csim::simulate_passes(kDs41Shape, 3086, 0, r.passes, r.F, r.ckpts);
+        CHECK(sim.ok);
+        if (!sim.ok) fprintf(stderr, "    policy %lld: %s\n", (long long)w.policy, sim.why.c_str());
+    }
+}
+
+/* The policy from RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP_CKPT: unset or "all" every checkpoint,
+ * a token count that band, 0 none, anything else every checkpoint (with a warning); and 0 without
+ * the prefix cache, which writes no snapshot. */
+TEST(consumer_skip_ckpt_policy_from_the_environment) {
+    struct Want { const char* v; int64_t policy; };
+    const Log was = log_level();
+    for (const Want w : { Want{ nullptr, -1 }, Want{ "all", -1 }, Want{ "0", 0 }, Want{ "512", 512 },
+                          Want{ "junk", -1 }, Want{ "-4", -1 }, Want{ "12x", -1 } }) {
+        Fixture f;
+        ds41_cs_fixture(f, 256, true, -2);
+        if (w.v) setenv("RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP_CKPT", w.v, 1);
+        else unsetenv("RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP_CKPT");
+        log_set_level(Log::Error);
+        const int rc = f.start();
+        log_set_level(was);
+        unsetenv("RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP_CKPT");
+        REQUIRE_EQ(rc, RAD_OK);
+        REQUIRE(f.sch.consumer_on());
+        CHECK_EQ(f.sch.consumer_ckpt_policy(), w.policy);
+    }
+    {
+        Fixture f;
+        ds41_cs_fixture(f, 256, true, -1);
+        f.cfg.prefix_cache = false;
+        REQUIRE_EQ(f.start(), RAD_OK);
+        REQUIRE(f.sch.consumer_on());
+        CHECK_EQ(f.sch.consumer_ckpt_policy(), (int64_t)0);
+    }
+}
+
+/* The startup lines say which policy runs, as ab_window.sh checks them: `all` and a band name the
+ * variable's value in a "complete checkpoints" line with the cost of a lone whole checkpoint at the
+ * deployed shape (1,520 layer-passes for DeepSeek-V4.1's suffix at 16-row passes); 0 says so in
+ * the "on" line and has no such line; without the prefix cache neither appears. */
+TEST(consumer_skip_ckpt_policy_is_named_at_startup) {
+    struct Want { int64_t policy; bool cache; const char* has; const char* lacks; };
+    for (const Want& w : {
+             Want{ -1, true, "consumer skip: complete checkpoints (RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP_CKPT=all) -- every checkpoint", nullptr },
+             Want{ 512, true, "consumer skip: complete checkpoints (RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP_CKPT=512) -- a cut prompt's checkpoints within 512 tokens", nullptr },
+             Want{ 0, true, "none below it is written (RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP_CKPT=0)", "complete checkpoints" },
+             Want{ -1, false, "consumer skip: on", "CONSUMER_SKIP_CKPT" } }) {
+        Fixture f;
+        ds41_cs_fixture(f, 256, true, w.policy);
+        f.cfg.prefix_cache = w.cache;
+        int rc = RAD_E_STATE;
+        const std::string text = info_of([&] { rc = f.start(); });
+        REQUIRE_EQ(rc, RAD_OK);
+        CHECK(text.find(w.has) != std::string::npos);
+        if (w.lacks) CHECK(text.find(w.lacks) == std::string::npos);
+        if (w.policy != 0 && w.cache)
+            CHECK(text.find("a lone one adds up to 1520 layer-passes in full") != std::string::npos);
     }
 }

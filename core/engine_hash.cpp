@@ -235,14 +235,19 @@ void Engine::consumer_skip_report() {
     if (!sched_.consumer_on()) return;
     const BatchBuilder::ConsumerStats& c = sched_.consumer_stats();
     const uint64_t lp = c.full + c.key + c.skipped;
+    const SchedMetrics m = sched_.metrics();
     RAD_INFO("consumer skip: %llu prefill passes of cut prompts, %llu of them cut (%llu shared a "
              "step and ran every layer, %llu off the grid): %llu layer-passes run in full, %llu key "
-             "ops alone, %llu skipped (%.1f%% of those passes' layer-passes in full); %lld "
-             "checkpoints below a prompt's target not written",
+             "ops alone, %llu skipped (%.1f%% of those passes' layer-passes in full); checkpoints "
+             "below a prompt's target: %lld written whole, %lld not written; their cones raised "
+             "%llu passes by %llu layer-passes in full (the key ops alone stay one a cut pass), %llu "
+             "snapshot passes cut at the last layer's keys, %llu run in full off the plan",
              (unsigned long long)c.passes, (unsigned long long)c.cut, (unsigned long long)c.shared,
              (unsigned long long)c.off_grid, (unsigned long long)c.full, (unsigned long long)c.key,
              (unsigned long long)c.skipped, lp ? 100.0 * (double)c.full / (double)lp : 100.0,
-             (long long)sched_.metrics().consumer_ckpt_dropped);
+             (long long)m.consumer_ckpt_whole, (long long)m.consumer_ckpt_dropped,
+             (unsigned long long)c.ckpt_raised, (unsigned long long)c.ckpt_full,
+             (unsigned long long)c.ckpt_cut, (unsigned long long)c.ckpt_insured);
 }
 
 }  /* namespace rad */

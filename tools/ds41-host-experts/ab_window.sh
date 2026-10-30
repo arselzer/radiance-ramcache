@@ -45,7 +45,9 @@
 # runs with its switch off, and is not measured if its server says otherwise): Pce end-of-request
 # snapshots (RADIANCE_EXPERIMENTAL_PREFIX_EORS: a decode step completing a position on the resume
 # grid past its prompt snapshots the state there, so a conversation's next turn resumes at most 15
-# tokens before the reply's end; refused, and the arm skipped, with Pcx or speculation); Pcl the
+# tokens before the reply's end; refused, and the arm skipped, with Pcx or speculation; skipped
+# with Xt, which no Kh run has yet covered end to end, unless the window sets PCE_XT=1 for that
+# Kh run); Pcl the
 # snapshot store gives up the least recently used conversation first (..._PREFIX_SESSION_LRU); PcbN
 # the store as a byte budget of N MiB (..._CHECKPOINT_STORE_MIB, auto otherwise; not with PcsN);
 # PcmN --prefix-cache-mib N (the host KV tier: a finished conversation's KV copied to pinned host
@@ -923,6 +925,12 @@ for a in $ARMS; do
   fi
   if [[ -n "$hpe" && ( " ${ARGS[*]} " == *" --num-speculative-tokens "[1-9]* || " ${env[*]} " == *" RADIANCE_EXPERIMENTAL_DS41_DSPARK_RAD_BANK=1 "* ) ]]; then
     log "arm $a: Pce with speculation (the engine refuses it); the arm is skipped"; skip=1
+  fi
+  # Pce with exact tall passes: the engine takes it (the tall checks are (A) up to their reach), but
+  # no window has yet shown it end to end (a Kh arm's prefill hashes of resumed turns against a
+  # cold arm's at Xt-BT32), so it is not measured; PCE_XT=1 runs it, for that evidence alone.
+  if [[ -n "$hpe" && -n "$xt" && "${PCE_XT:-}" != 1 ]]; then
+    log "arm $a: Pce with Xt (no end-to-end evidence yet that a turn resumed from a tall-pass run's decode snapshot is a cold run's; PCE_XT=1 runs it for a Kh check); the arm is skipped"; skip=1
   fi
   if [[ -n "$hpb" && " ${ARGS[*]} " == *" --checkpoint-slots "* ]]; then
     log "arm $a: PcbN with PcsN (a count given takes no byte budget); the arm is skipped"; skip=1

@@ -535,7 +535,10 @@ nowhere and answers as a cold server. On the cards the first evidence came from 
 in window ab-20261029T232708Z `Pc-Pci256` on `Upfxchat` answered 15/15 as the cold arm, C3 among
 them, which adopts 46 of C1's decode-step blocks beneath C2's recompute snapshot (token level; the
 `Kh` arms are the byte level). Under the consumer skip (`Cs`) the snapshots are at or past each
-prompt's cut target and decode rows run every layer; under `Xt` (A) is the tall checks.
+prompt's cut target and decode rows run every layer; under `Xt` (A) is the tall checks, but no
+window has yet shown `Pce` with `Xt` end to end, so `ab_window.sh` skips an arm with both; the
+window variable `PCE_XT=1` runs them for that evidence (a `Kh` pair at `Xt-BT32`, cold and `Pce`,
+whose `--hashes` must agree).
 
 **The snapshot store for harness sessions.** `--checkpoint-slots auto` sizes the store for the
 running sequences (7 slots of 22.6 MiB at `Lm32768`, interval 2048, one sequence: one session's

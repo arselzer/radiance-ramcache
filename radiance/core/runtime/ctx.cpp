@@ -1,312 +1,19 @@
-#include "../build/glm_main_profile_limits.h"
 /* ctx.cpp -- the run phase outside the hot path: arena and plan bring-up, the step driver, the
  * routing handoff and opt-in per-op timing. The hot path is issue.cpp.
  */
 #include <vector>
 #include "ctx.h"
+#include "kvstream/bind.h"
+#include "kvstream/stage.h"
 #include "xp_state.h"
-#include "cache_prepare4_session.h"
-#include "../build/tiny_component_quotes.h"
-#include "../build/glm_main_quote.h"
-#include "../build/tiny_startup.h"
 #include "../device/device.h"
 
 #include <algorithm>
 #include <cstring>
-#include <cstdio>
 #include <cstdlib>
 #include <string>
 
 namespace rad {
-
-// Pure requested-storage quote for the closed synthetic startup, including first-use
-// WTAB mirrors. Container/allocator overhead is a separate conservative allowance.
-int Ctx::tiny_startup_quote(const CtxDesc& d,bool handoff,TinyCtxQuote* out) noexcept {
-    if(!out||!d.program)return RAD_E_INVAL;
-    if(d.cache_prepare4)return RAD_E_UNSUPPORTED;
-    const Program& p=*d.program;
-    if(d.tiny_retirement&&(!d.stream||d.device))return RAD_E_UNSUPPORTED;
-    if(tiny_quote::program_profile(p)<0||d.rank||d.world_size!=1||d.profile_ops||d.record_passes||d.kv.size()>1||(!handoff&&d.expert_prepare_owner))return RAD_E_UNSUPPORTED;
-    // Builder reserves handle0 even when the graph has no cache. KVManager's
-    // real carve may give that inert zero-byte plan a pool base; bind_kv_pools
-    // faithfully carries it. Admit only that exact sentinel, never a real KV
-    // group or an opaque nonzero-size binding. No pointer is dereferenced here.
-    if(p.kv_groups.size()!=1)return RAD_E_UNSUPPORTED;
-    const auto& sentinel=p.kv_groups[0];const auto& kd=sentinel.decl;
-    if(!sentinel.name.empty()||kd.kind||kd.dtype||kd.window||kd.n_head_kv||kd.head_dim||
-       kd.state_dim[0]||kd.state_dim[1]||kd.conv_width||sentinel.block_size||
-       sentinel.bytes_per_block||sentinel.bytes_per_state||!sentinel.layers.empty()||
-       sentinel.zero||sentinel.replicated||sentinel.drafter)return RAD_E_UNSUPPORTED;
-    for(const auto& k:d.kv){
-        if(k.layer_stride||k.bytes||k.rank||k.dtype!=RAD_DT_INVALID||!k.layer_slot.empty())return RAD_E_UNSUPPORTED;
-        for(const auto extent:k.shape)if(extent)return RAD_E_UNSUPPORTED;
-    }
-    for(const char* key:{"RADIANCE_OP_ORACLE","RADIANCE_OP_REPEAT"}){const auto* value=std::getenv(key);if(value&&*value)return RAD_E_UNSUPPORTED;}
-    TinyCtxQuote q;auto& s=q.storage;
-    q.sizeof_ctx=sizeof(Ctx);q.sizeof_tensor=sizeof(RadTensor);q.sizeof_op_plan=sizeof(OpPlan);q.sizeof_issue_plan=sizeof(IssuePlan);
-    q.sizeof_weight_table=sizeof(WeightTable);q.sizeof_weight_member=sizeof(WMemb);q.sizeof_route_slot=sizeof(RouteSlot);
-    q.sizeof_expert_state=sizeof(ExpertPrepareState);q.sizeof_expert_map=sizeof(ExpertRouteMap);q.sizeof_expert_entry=sizeof(RadExpertRouteEntry);
-    q.buffers=p.buffers.size();q.weights=p.weights.size();q.ops=p.ops.size();
-    // Validate every summand before invoking the actual arena layout helpers, which
-    // intentionally assume a well-formed Builder plan and do unchecked arithmetic.
-    for(size_t i=1;i<p.buffers.size();++i){const auto& b=p.buffers[i];
-        if(b.arena_offset<0||b.bytes<=0||uint64_t(b.arena_offset)>tiny_quote::arena_cap||uint64_t(b.bytes)>tiny_quote::arena_cap-uint64_t(b.arena_offset)||!b.decl.rank||b.decl.rank>RAD_MAX_RANK||(b.decl.domain!=RAD_DOMAIN_DEVICE&&b.decl.domain!=RAD_DOMAIN_HOST))return RAD_E_SHAPE;
-        uint64_t count=1;for(uint32_t axis=0;axis<b.decl.rank;++axis)if(b.decl.shape[axis]<=0||!tiny_quote::mul(count,uint64_t(b.decl.shape[axis]),&count)||count>tiny_quote::arena_cap*8)return RAD_E_SHAPE;
-        const int bits=rad_dtype_bits(b.decl.dtype);uint64_t bit_count=0;
-        if(bits<=0||bits>64||!tiny_quote::mul(count,uint64_t(bits),&bit_count)||(bit_count+7)/8>uint64_t(b.bytes))return RAD_E_DTYPE;
-    }
-    for(size_t i=1;i<p.weights.size();++i){const auto& w=p.weights[i];
-        if(!w.decl.rank||w.decl.rank>RAD_MAX_RANK||w.stored_bytes<=0||uint64_t(w.stored_bytes)>tiny_quote::arena_cap)return RAD_E_SHAPE;
-        uint64_t count=1;for(uint32_t axis=0;axis<w.decl.rank;++axis)if(w.decl.shape[axis]<=0||!tiny_quote::mul(count,uint64_t(w.decl.shape[axis]),&count)||count>tiny_quote::arena_cap*8)return RAD_E_SHAPE;
-    }
-    int64_t dev=0,total=0;arena_plan_bytes(p,&dev,&total);const int64_t host=arena_host_bytes(p);
-    if(dev<0||total<=0||host<0||uint64_t(total)>tiny_quote::arena_cap||uint64_t(host)>tiny_quote::arena_cap||uint64_t(host)>tiny_quote::arena_cap-uint64_t(total))return RAD_E_SCRATCH;
-    q.arena_device=uint64_t(total);q.arena_host=host?((uint64_t(host)+4095)/4096*4096):0;
-    if(q.arena_host>tiny_quote::arena_cap-q.arena_device||!tiny_quote::device(s,q.arena_device)||(q.arena_host&&!tiny_quote::mapped(s,q.arena_host)))return RAD_E_SCRATCH;
-    s.embedded_object_bytes=sizeof(Ctx);s.stream_count=d.stream?0:1;
-    // bind_buffers, its level0 deep copy, and bind_weights (including two wait lanes).
-    if(!tiny_quote::heap(s,q.buffers,2*sizeof(RadTensor)+sizeof(int32_t)+sizeof(uint8_t))||!tiny_quote::heap(s,1,sizeof(std::vector<RadTensor>))||
-       !tiny_quote::heap(s,q.weights,sizeof(RadTensor)+sizeof(int32_t)+2*sizeof(uint32_t)+sizeof(uint8_t))||
-       !tiny_quote::heap(s,q.ops,sizeof(OpPlan)+sizeof(uint32_t)+sizeof(std::atomic<uint8_t>))||
-       !tiny_quote::heap(s,q.ops,3*sizeof(double)+sizeof(int64_t)+sizeof(uint8_t))||!tiny_quote::heap(s,d.kv.size(),sizeof(KVPoolBinding)))return RAD_E_SHAPE;
-    // Five profiling arrays are allocated even with profiling OFF: ms/join/wait
-    // doubles, int64 calls and a byte (33B/op on the actual build).
-    uint64_t gate_params=0,gate_vectors=0;
-    for(size_t oi=0;oi<p.ops.size();++oi){const auto& op=p.ops[oi];
-        if(op.bands.size()>tiny_quote::max_bands-q.bands)return RAD_E_SHAPE;
-        q.bands+=op.bands.size();
-        if(oi&&(!op.schema||op.schema->n_operands<0||op.schema->n_operands>MAX_OPERANDS||(op.schema->n_operands&&!op.schema->operands)||op.weights.size()!=op.weight_opd.size()||op.weights.size()>tiny_quote::max_weights))return RAD_E_UNSUPPORTED;
-        for(const auto& b:op.bands){bool resolved=false;
-            for(int domain=0;domain<RAD_N_DOMAINS;++domain){const auto& r=b.dom[domain];
-                if(r.scratch_bytes<0||r.scratch_bytes>p.scratch_bytes)return RAD_E_SCRATCH;
-                if(r.instance||(r.row&&(!r.row->info||r.row->info->init||r.row->deferred_status||r.row->collective)))return RAD_E_UNSUPPORTED;
-                resolved|=r.row&&r.row->info&&r.row->info->launch;
-                if(r.row&&r.row->releases_link){
-                    const auto count=r.geom.n_params();
-                    if(count<0||count>256||!tiny_quote::add(gate_params,uint64_t(count)+1))return RAD_E_SHAPE;
-                    ++gate_vectors;
-                }
-            }
-            if(oi&&!resolved)return RAD_E_UNSUPPORTED;
-        }
-        if(!oi)continue;
-        for(int operand=0;operand<op.schema->n_operands;++operand){
-            if(op.schema->operands[operand].role!=RAD_OPD_WTAB)continue;
-            rad_weight lo=0,hi=0;uint64_t count=0;
-            for(size_t k=0;k<op.weights.size();++k){if(op.weight_opd[k]!=operand)continue;const auto w=op.weights[k];if(!w||w>=p.weights.size())return RAD_E_INVAL;if(!count)lo=hi=w;else{lo=std::min(lo,w);hi=std::max(hi,w);}++count;}
-            if(!count)continue;
-            if(uint64_t(hi-lo)+1!=count||q.tables>=tiny_quote::max_ops||!tiny_quote::add(q.table_entries,count))return RAD_E_INVAL;
-            ++q.tables;
-            if(!tiny_quote::pinned(s,count*sizeof(void*))||!tiny_quote::device(s,count*sizeof(void*)))return RAD_E_SHAPE;
-        }
-    }
-    if(!tiny_quote::heap(s,q.bands,sizeof(int64_t)+RAD_N_DOMAINS*sizeof(IssuePlan))||!tiny_quote::heap(s,gate_params,sizeof(RadParam)))return RAD_E_SHAPE;
-    if(q.tables){
-        if(!tiny_quote::heap(s,q.weights,sizeof(int32_t))||!tiny_quote::heap(s,q.tables,sizeof(WeightTable))||!tiny_quote::heap(s,q.table_entries,sizeof(WMemb)+sizeof(int32_t)+sizeof(void*)))return RAD_E_SHAPE;
-        q.first_use_heap_reservation=q.table_entries*sizeof(void*); // t.cur.assign at first refresh
-        uint64_t growing=q.tables*sizeof(WeightTable)+q.table_entries*(sizeof(WMemb)+sizeof(int32_t)+sizeof(void*));
-        if(!tiny_quote::mul(growing,2,&s.heap_growth_allowance))return RAD_E_SHAPE;
-    }
-    uint64_t gate_growth=0;if(!tiny_quote::mul(gate_params,2*sizeof(RadParam),&gate_growth)||!tiny_quote::add(s.heap_growth_allowance,gate_growth))return RAD_E_SHAPE;
-    int64_t layers=p.meta.n_layers;for(const auto& w:p.weights)if(w.decl.group.expert>=0){if(w.decl.group.layer<0||w.decl.group.layer>=8)return RAD_E_UNSUPPORTED;layers=std::max(layers,int64_t(w.decl.group.layer)+1);}
-    if(layers!=8||p.meta.n_expert!=4)return RAD_E_UNSUPPORTED;
-    q.route_bank=uint64_t(layers)*kRouteBanks*uint64_t(p.meta.n_expert)*sizeof(int32_t);q.route_device=uint64_t(layers)*uint64_t(p.meta.n_expert)*sizeof(int32_t);
-    if(!tiny_quote::heap(s,uint64_t(layers),sizeof(RouteSlot))||!tiny_quote::pinned(s,q.route_bank)||!tiny_quote::device(s,q.route_device))return RAD_E_SHAPE;
-    s.event_count=kRouteBanks;
-    if(handoff){const auto& l=d.expert_prepare_limits;
-        if(l.max_rows<=0||l.max_rows>65536||l.max_experts<=0||l.max_experts>4096||l.max_top_k<=0||l.max_top_k>512||!l.max_maps||l.max_maps>256||!l.max_entries||l.max_entries>65536||!l.max_readback_bytes||l.max_readback_bytes>(16u<<20)||!l.max_metadata_bytes||l.max_metadata_bytes>(32u<<20)||p.expert_route_maps.size()!=8||p.expert_route_maps.size()>l.max_maps)return RAD_E_UNSUPPORTED;
-        uint64_t unique_peak=0;q.prepare_maps=p.expert_route_maps.size();
-        uint16_t layer_mask=0;
-        for(const auto& map:p.expert_route_maps){const auto& m=map.decl;
-            if(m.layer<0||m.layer>=8||(layer_mask&(1u<<m.layer))||m.expert_base||m.canonical_experts!=4||m.local_experts!=4||m.local_experts>l.max_experts||m.max_rows!=2||m.max_rows>l.max_rows||m.top_k!=2||m.top_k>l.max_top_k||map.entries.size()!=size_t(m.local_experts)||m.n_entries!=m.local_experts||m.regular_experts!=4||(m.classes!=1&&m.classes!=2)||!m.gu||m.gu>=p.ops.size())return RAD_E_UNSUPPORTED;
-            layer_mask=uint16_t(layer_mask|(1u<<m.layer));uint8_t canonical_mask=0;
-            for(size_t i=0;i<map.entries.size();++i){const auto& e=map.entries[i];
-                if(e.slot!=int32_t(i)||e.canonical<0||e.canonical>=4||(canonical_mask&(1u<<e.canonical))||e.protected_expert||e.class_index<-1||e.class_index>=m.classes||(e.class_index>=0&&e.class_index!=int32_t(i%size_t(m.classes)))||!e.members[0]||!e.members[2]||bool(e.members[1])!=bool(e.members[3]))return RAD_E_INVAL;
-                canonical_mask=uint8_t(canonical_mask|(1u<<e.canonical));
-                for(size_t member=0;member<4;++member){const auto w=e.members[member];if(!w)continue;if(w>=p.weights.size()||p.weights[w].decl.group.layer!=m.layer||p.weights[w].decl.group.expert!=e.slot||p.weights[w].decl.group.slot!=int(member/2))return RAD_E_INVAL;}
-            }
-            for(const auto b:{m.counts,m.offsets,m.sorted,m.ids})if(!b||b>=p.buffers.size()||p.buffers[b].decl.dtype!=RAD_I32)return RAD_E_DTYPE;
-            if(!tiny_quote::add(q.prepare_entries,map.entries.size())||q.prepare_entries>l.max_entries)return RAD_E_SHAPE;
-            const uint64_t bank=uint64_t(2*m.local_experts+1+2*m.max_rows*m.top_k)*sizeof(int32_t);q.prepare_bank=std::max(q.prepare_bank,bank);unique_peak=std::max(unique_peak,uint64_t(m.local_experts));
-        }
-        if(!tiny_quote::mul(uint64_t(l.max_rows),uint64_t(l.max_top_k),&q.prepare_seen)||q.prepare_bank>l.max_readback_bytes)return RAD_E_SCRATCH;
-        const uint64_t metadata=q.prepare_entries*sizeof(RadExpertRouteEntry)+q.prepare_seen+q.prepare_maps*sizeof(ExpertRouteMap);if(metadata>l.max_metadata_bytes)return RAD_E_SCRATCH;
-        if(!tiny_quote::heap(s,1,sizeof(ExpertPrepareState))||!tiny_quote::heap(s,q.prepare_maps,sizeof(ExpertRouteMap))||!tiny_quote::heap(s,q.prepare_entries,sizeof(RadExpertRouteEntry))||!tiny_quote::heap(s,q.prepare_seen,sizeof(uint8_t))||!tiny_quote::add(s.heap_growth_allowance,unique_peak)||!tiny_quote::mapped(s,q.prepare_bank))return RAD_E_SHAPE;
-        ++s.event_count;
-    }
-    // Hash nodes/buckets, empty deque backing and library-dependent allocator metadata:
-    // explicit planning allowance, never reported as an actual measured sizeof.
-    s.control_allowance=4096+q.tables*(sizeof(decltype(wtab_of_)::value_type)+128)+gate_vectors*128;
-    if(!tiny_quote::finish(s))return RAD_E_SCRATCH;
-    *out=q;return RAD_OK;
-}
-
-int Ctx::glm_main_startup_quote(const CtxDesc& d,TinyCtxQuote* out) noexcept {
-    if(!out||!d.program)return RAD_E_INVAL;
-    const auto& p=*d.program;
-    constexpr uint64_t arena_cap=uint64_t(2)<<30;
-    constexpr uint64_t max_weights=100000,max_buffers=100000,max_ops=50000,max_bands=100000,max_entries=1000000;
-    if(glm_main_tp4_cache_program_profile(p)<0||!glm_main_rows_supported(p.ctx.max_tok)||p.ctx.max_ctx<=0||p.ctx.max_ctx>2048||
-       d.rank!=p.ctx.rank||d.world_size!=4||d.device<0||d.profile_ops||d.record_passes||d.tiny_retirement||
-       p.weights.empty()||p.weights.size()>max_weights||p.buffers.empty()||p.buffers.size()>max_buffers||
-       p.ops.empty()||p.ops.size()>max_ops||p.kv_groups.empty()||p.kv_groups.size()>128||
-       (p.scratch_regions!=1&&p.scratch_regions!=2)||p.arena_stage_bytes||p.arena_bytes<0||uint64_t(p.arena_bytes)>arena_cap||
-       p.scratch_bytes<0||uint64_t(p.scratch_bytes)>arena_cap||
-       (!d.kv.empty()&&d.kv.size()!=p.kv_groups.size()))return RAD_E_UNSUPPORTED;
-    for(const char* key:{"RADIANCE_OP_ORACLE","RADIANCE_OP_REPEAT","RADIANCE_DEBUG_ROUTING"}){
-        const auto* value=std::getenv(key);if(value&&*value)return RAD_E_UNSUPPORTED;
-    }
-    TinyCtxQuote q;auto& s=q.storage;
-    q.sizeof_ctx=sizeof(Ctx);q.sizeof_tensor=sizeof(RadTensor);q.sizeof_op_plan=sizeof(OpPlan);q.sizeof_issue_plan=sizeof(IssuePlan);
-    q.sizeof_weight_table=sizeof(WeightTable);q.sizeof_weight_member=sizeof(WMemb);q.sizeof_route_slot=sizeof(RouteSlot);
-    q.sizeof_expert_state=sizeof(ExpertPrepareState);q.sizeof_expert_map=sizeof(ExpertRouteMap);q.sizeof_expert_entry=sizeof(RadExpertRouteEntry);
-    q.buffers=p.buffers.size();q.weights=p.weights.size();q.ops=p.ops.size();
-    for(size_t i=1;i<p.buffers.size();++i){const auto& b=p.buffers[i];
-        if(b.arena_offset<0||b.bytes<=0||uint64_t(b.arena_offset)>arena_cap||uint64_t(b.bytes)>arena_cap-uint64_t(b.arena_offset)||
-           !b.decl.rank||b.decl.rank>RAD_MAX_RANK||(b.decl.domain!=RAD_DOMAIN_DEVICE&&b.decl.domain!=RAD_DOMAIN_HOST))return RAD_E_SHAPE;
-        uint64_t count=1;
-        for(uint32_t axis=0;axis<b.decl.rank;++axis)
-            if(b.decl.shape[axis]<=0||!tiny_quote::mul(count,uint64_t(b.decl.shape[axis]),&count)||count>arena_cap*8)return RAD_E_SHAPE;
-        const int bits=rad_dtype_bits(b.decl.dtype);uint64_t bit_count=0;
-        if(bits<=0||bits>64||!tiny_quote::mul(count,uint64_t(bits),&bit_count)||(bit_count+7)/8>uint64_t(b.bytes))return RAD_E_DTYPE;
-    }
-    for(size_t i=1;i<p.weights.size();++i){const auto& w=p.weights[i];
-        if(w.decl.rank>RAD_MAX_RANK||w.stored_bytes<=0||uint64_t(w.stored_bytes)>arena_cap)return RAD_E_SHAPE;
-        uint64_t count=1;
-        for(uint32_t axis=0;axis<w.decl.rank;++axis)
-            if(w.decl.shape[axis]<=0||!tiny_quote::mul(count,uint64_t(w.decl.shape[axis]),&count)||count>arena_cap*8)return RAD_E_SHAPE;
-    }
-    // Shared MoeFP8 buffers are marked concurrent even though its shared arm
-    // interleaves on the same queue. Builder therefore declares two scratch
-    // regions without a lane1 window. The profile above still forbids an active
-    // lane1, and the existing arena planner charges the actual second region.
-    int64_t dev=0,total=0;arena_plan_bytes(p,&dev,&total);const auto host=arena_host_bytes(p);
-    if(dev<0||total<=0||host<0||uint64_t(total)>arena_cap||uint64_t(host)>arena_cap-uint64_t(total))return RAD_E_SCRATCH;
-    q.arena_device=uint64_t(total);q.arena_host=host?((uint64_t(host)+4095)/4096*4096):0;
-    if(q.arena_host>arena_cap-q.arena_device||!tiny_quote::device(s,q.arena_device)||
-       (q.arena_host&&!tiny_quote::mapped(s,q.arena_host)))return RAD_E_SCRATCH;
-    s.embedded_object_bytes=sizeof(Ctx);s.stream_count=d.stream?0:1;
-    if(!tiny_quote::heap(s,q.buffers,2*sizeof(RadTensor)+sizeof(int32_t)+sizeof(uint8_t))||
-       !tiny_quote::heap(s,1,sizeof(std::vector<RadTensor>))||
-       !tiny_quote::heap(s,q.weights,sizeof(RadTensor)+sizeof(int32_t)+2*sizeof(uint32_t)+sizeof(uint8_t))||
-       !tiny_quote::heap(s,q.ops,sizeof(OpPlan)+sizeof(uint32_t)+sizeof(std::atomic<uint8_t>))||
-       !tiny_quote::heap(s,q.ops,3*sizeof(double)+sizeof(int64_t)+sizeof(uint8_t))||
-       !tiny_quote::heap(s,p.kv_groups.size(),sizeof(KVPoolBinding)))return RAD_E_SHAPE;
-    // Exact bind_kv_pools layer-slot lengths, independent of not-yet-carved base
-    // addresses. No KV tensor payload is allocated/charged by Ctx itself.
-    for(size_t g=0;g<p.kv_groups.size();++g){const auto& group=p.kv_groups[g];
-        if(group.layers.size()>45||group.drafter)return RAD_E_UNSUPPORTED;
-        const auto& decl=group.decl;
-        if(!g){
-            if(!group.name.empty()||decl.kind||decl.dtype||decl.window||decl.n_head_kv||decl.head_dim||
-               decl.state_dim[0]||decl.state_dim[1]||decl.conv_width||group.block_size||group.bytes_per_block||
-               group.bytes_per_state||!group.layers.empty()||group.zero||group.replicated)return RAD_E_UNSUPPORTED;
-        }else{
-            if(decl.kind!=RAD_KV_FULL&&decl.kind!=RAD_KV_WINDOW&&decl.kind!=RAD_KV_LINEAR&&decl.kind!=RAD_KV_CONV)
-                return RAD_E_UNSUPPORTED;
-            // The actual TP4 GLM KDA convolution has 3*(64/4)*128=6144
-            // channels. Preserve its declared geometry; all other kinds keep
-            // the original 4096 head bound and only this exact tuple extends it.
-            const bool glm_conv6144=decl.kind==RAD_KV_CONV&&decl.head_dim==6144&&
-                decl.dtype==RAD_BF16&&decl.n_head_kv==1&&decl.conv_width==4&&
-                decl.window==0&&decl.state_dim[0]==0&&decl.state_dim[1]==0;
-            if(decl.window<0||decl.n_head_kv<0||decl.n_head_kv>4096||decl.head_dim<0||
-               (decl.head_dim>4096&&!glm_conv6144)||
-               decl.state_dim[0]<0||decl.state_dim[0]>4096||decl.state_dim[1]<0||decl.state_dim[1]>4096||
-               decl.conv_width<0||decl.conv_width>4096||group.block_size<0||group.bytes_per_block<0||group.bytes_per_state<0)
-                return RAD_E_SHAPE;
-            if(!group.zero){
-                if(group.layers.empty()||decl.n_head_kv<=0||rad_dtype_bits(decl.dtype)<=0)return RAD_E_SHAPE;
-                if((decl.kind==RAD_KV_FULL||decl.kind==RAD_KV_WINDOW)&&
-                   (decl.head_dim<=0||group.block_size<=0||group.bytes_per_block<=0))return RAD_E_SHAPE;
-                if(decl.kind==RAD_KV_LINEAR&&(decl.state_dim[0]<=0||decl.state_dim[1]<=0||group.bytes_per_state<=0))return RAD_E_SHAPE;
-                if(decl.kind==RAD_KV_CONV&&(decl.head_dim<=0||decl.conv_width<=0||group.bytes_per_state<=0))return RAD_E_SHAPE;
-            }
-        }
-        int high=-1;
-        for(size_t i=0;i<group.layers.size();++i){const int layer=group.layers[i];
-            if(layer<0||layer>=45)return RAD_E_SHAPE;
-            for(size_t j=0;j<i;++j)if(group.layers[j]==layer)return RAD_E_SHAPE;
-            high=std::max(high,layer);
-        }
-        if(!tiny_quote::heap(s,uint64_t(high+1),sizeof(int32_t)))return RAD_E_SHAPE;
-        if(!d.kv.empty()){const auto& binding=d.kv[g];
-            if(binding.rank>RAD_MAX_RANK||binding.bytes<0||binding.layer_stride<0||binding.layer_slot.size()!=size_t(high+1)||
-               binding.dtype!=group.decl.dtype)return RAD_E_SHAPE;
-            for(const auto dim:binding.shape)if(dim<0)return RAD_E_SHAPE;
-            for(size_t layer=0;layer<binding.layer_slot.size();++layer){int expected=-1;
-                for(size_t slot=0;slot<group.layers.size();++slot)if(group.layers[slot]==int(layer))expected=int(slot);
-                if(binding.layer_slot[layer]!=expected)return RAD_E_SHAPE;
-            }
-        }
-    }
-    uint64_t gate_params=0,gate_vectors=0;
-    for(size_t oi=0;oi<p.ops.size();++oi){const auto& op=p.ops[oi];
-        if(op.bands.size()>max_bands-q.bands)return RAD_E_SHAPE;
-        q.bands+=op.bands.size();
-        if(oi&&(!op.schema||op.schema->n_operands<0||op.schema->n_operands>MAX_OPERANDS||
-           (op.schema->n_operands&&!op.schema->operands)||op.weights.size()!=op.weight_opd.size()||op.weights.size()>max_weights))return RAD_E_UNSUPPORTED;
-        for(const auto& band:op.bands)for(const auto& r:band.dom){
-            if(r.scratch_bytes<0||r.scratch_bytes>p.scratch_bytes)return RAD_E_SCRATCH;
-            // Actual collective/init rows are metadata here, not initialized by
-            // this quote; unlike the tiny profile they are deliberately allowed.
-            if(r.row&&(!r.row->info||r.row->deferred_status))return RAD_E_UNSUPPORTED;
-            if(r.row&&r.row->releases_link){const auto count=r.geom.n_params();
-                if(count<0||count>256||!tiny_quote::add(gate_params,uint64_t(count)+1))return RAD_E_SHAPE;
-                ++gate_vectors;
-            }
-        }
-        if(!oi)continue;
-        for(int operand=0;operand<op.schema->n_operands;++operand){
-            if(op.schema->operands[operand].role!=RAD_OPD_WTAB)continue;
-            rad_weight low=0,high=0;uint64_t count=0;
-            for(size_t k=0;k<op.weights.size();++k){if(op.weight_opd[k]!=operand)continue;const auto w=op.weights[k];
-                if(!w||w>=p.weights.size())return RAD_E_INVAL;
-                if(!count)low=high=w;else{low=std::min(low,w);high=std::max(high,w);}++count;
-            }
-            if(!count)continue;
-            if(uint64_t(high-low)+1!=count||q.tables>=max_ops||count>max_entries-q.table_entries)return RAD_E_INVAL;
-            ++q.tables;q.table_entries+=count;
-            if(!tiny_quote::pinned(s,count*sizeof(void*))||!tiny_quote::device(s,count*sizeof(void*)))return RAD_E_SHAPE;
-        }
-    }
-    if(!tiny_quote::heap(s,q.bands,sizeof(int64_t)+RAD_N_DOMAINS*sizeof(IssuePlan))||
-       !tiny_quote::heap(s,gate_params,sizeof(RadParam)))return RAD_E_SHAPE;
-    if(q.tables){
-        if(!tiny_quote::heap(s,q.weights,sizeof(int32_t))||!tiny_quote::heap(s,q.tables,sizeof(WeightTable))||
-           !tiny_quote::heap(s,q.table_entries,sizeof(WMemb)+sizeof(int32_t)+sizeof(void*)))return RAD_E_SHAPE;
-        q.first_use_heap_reservation=q.table_entries*sizeof(void*);
-        uint64_t growing=q.tables*sizeof(WeightTable)+q.table_entries*(sizeof(WMemb)+sizeof(int32_t)+sizeof(void*));
-        if(!tiny_quote::mul(growing,2,&s.heap_growth_allowance))return RAD_E_SHAPE;
-    }
-    uint64_t growth=0;if(!tiny_quote::mul(gate_params,2*sizeof(RadParam),&growth)||!tiny_quote::add(s.heap_growth_allowance,growth))return RAD_E_SHAPE;
-    q.route_bank=uint64_t(45)*kRouteBanks*288*sizeof(int32_t);q.route_device=uint64_t(45)*288*sizeof(int32_t);
-    if(!tiny_quote::heap(s,45,sizeof(RouteSlot))||!tiny_quote::pinned(s,q.route_bank)||!tiny_quote::device(s,q.route_device))return RAD_E_SHAPE;
-    s.event_count=kRouteBanks;
-    const auto& limits=d.expert_prepare_limits;
-    if(limits.max_rows!=p.ctx.max_tok||limits.max_experts!=288||limits.max_top_k!=8||limits.max_maps<42||limits.max_maps>256||
-       limits.max_entries<12096||limits.max_entries>65536||!limits.max_readback_bytes||limits.max_readback_bytes>(16u<<20)||
-       !limits.max_metadata_bytes||limits.max_metadata_bytes>(32u<<20))return RAD_E_UNSUPPORTED;
-    q.prepare_maps=p.expert_route_maps.size();
-    for(const auto& map:p.expert_route_maps){
-        if(!tiny_quote::add(q.prepare_entries,map.entries.size())||q.prepare_entries>limits.max_entries)return RAD_E_SHAPE;
-        const auto& decl=map.decl;
-        q.prepare_bank=std::max(q.prepare_bank,uint64_t(2*decl.local_experts+1+2*decl.max_rows*decl.top_k)*sizeof(int32_t));
-    }
-    q.prepare_seen=uint64_t(p.ctx.max_tok)*8;
-    const uint64_t prepare_metadata=q.prepare_entries*sizeof(RadExpertRouteEntry)+q.prepare_seen+q.prepare_maps*sizeof(ExpertRouteMap);
-    if(q.prepare_bank>limits.max_readback_bytes||prepare_metadata>limits.max_metadata_bytes)return RAD_E_SCRATCH;
-    if(!tiny_quote::heap(s,1,sizeof(ExpertPrepareState))||!tiny_quote::heap(s,q.prepare_maps,sizeof(ExpertRouteMap))||
-       !tiny_quote::heap(s,q.prepare_entries,sizeof(RadExpertRouteEntry))||!tiny_quote::heap(s,q.prepare_seen,sizeof(uint8_t))||
-       !tiny_quote::add(s.heap_growth_allowance,288)||!tiny_quote::mapped(s,q.prepare_bank))return RAD_E_SHAPE;
-    ++s.event_count;
-    // Two possible lazy HOST-scope touch events are a separately stated upper;
-    // lane1/recorded passes/XP remain excluded by the actual profile.
-    s.event_count+=2;
-    s.control_allowance=65536+q.tables*(sizeof(decltype(wtab_of_)::value_type)+128)+gate_vectors*128;
-    if(!glm_main_quote_finish(s))return RAD_E_SCRATCH;
-    *out=q;return RAD_OK;
-}
 
 /* ================================================================== lifecycle */
 
@@ -314,26 +21,7 @@ Ctx::Ctx() = default;
 Ctx::~Ctx() { shutdown(); }
 
 int Ctx::init(const CtxDesc& d) {
-    if (const int failed = terminal_status(); failed < 0) return failed;
     if (!d.program) return RAD_E_INVAL;
-    if(cache_prepare4_)return RAD_E_STATE; // one-shot binding; no legacy downgrade/reinit after shutdown
-    if(d.program->requires_glm_main_tp4_cache_fail_stop()) {
-        if(!d.cache_prepare4||!d.cache_prepare4->runtime_admitted()||d.cache_prepare4->rank()!=d.rank||
-           d.world_size!=4||d.program->ctx.rank!=d.rank||d.record_passes||d.profile_ops||d.tiny_retirement||
-           glm_main_tp4_cache_program_profile(*d.program)<0||device_is_host()||std::strcmp(device_backend_name(),"aql"))return RAD_E_UNSUPPORTED;
-        cache_prepare4_=d.cache_prepare4;
-    }else if(d.cache_prepare4)return RAD_E_UNSUPPORTED;
-    if(d.tiny_retirement&&(!d.stream||d.device||d.rank||d.world_size!=1))return RAD_E_UNSUPPORTED;
-    if(tiny_retirement_&&(program_||stream_))return RAD_E_STATE;
-    if(tiny_retirement_&&!d.tiny_retirement)return RAD_E_UNSUPPORTED;
-    // Snapshot the policy and borrowed stream before any fallible vector copies
-    // or prepare()/owner-open call can lead to this object's internal shutdown.
-    if(d.tiny_retirement){
-        tiny_retirement_=true;device_=d.device;stream_=d.stream;own_stream_=false;
-    }
-    if (d.program->requires_permanent_model_failure() && d.world_size != 1)
-        return RAD_E_UNSUPPORTED;
-    permanent_model_failure_ = d.program->requires_permanent_model_failure();
     program_   = d.program;
     rank_      = d.rank;
     world_size_= d.world_size < 1 ? 1 : d.world_size;
@@ -344,6 +32,11 @@ int Ctx::init(const CtxDesc& d) {
     kv_        = d.kv;
     arch_step_ = d.arch_step;
     profiling_ = d.profile_ops;
+    tape_dump_ = d.tape_dump;
+    /* A host gather's rows on the mapped tier are read ahead unless --row-prefetch off
+     * (runtime/rowprefetch.h). The scratch is sized once, off the step path. */
+    row_prefetch_on_ = d.row_prefetch;
+    rowpf_.reserve(4096);
 
     /* The rank owns one device. Set it here so allocation lands on the right card, and again from
      * the rank thread in bind_thread() because the backend's current device is thread-local. */
@@ -362,38 +55,21 @@ int Ctx::init(const CtxDesc& d) {
     /* The second lane is created lazily; see lane_init(). */
 
     int s = prepare();
-    if (s < 0) { cache_prepare4_fail_if_bound(s);shutdown(); return s; }
-    s = expert_prepare_open(d.expert_prepare_owner,d.expert_prepare_limits);
-    if (s < 0) { cache_prepare4_fail_if_bound(s);shutdown(); return s; }
+    if (s < 0) { shutdown(); return s; }
+    /* RADIANCE_EXPERIMENTAL_DS41_CHAIN_OVERLAP / _TRACE (runtime/live_chain.h); inert when off. */
+    live_.init(rank_, program_);
     return RAD_OK;
 }
 
 void Ctx::shutdown() {
-    if(cache_prepare4_&&cache_prepare4_->runtime_admitted()){
-        if(cache_prepare4_->active())cache_prepare4_->fail_stop(RAD_E_STATE);
-        const int bound=rad_dev_set(device_);if(bound<0)cache_prepare4_->fail_stop(bound);
-        if(stream_){const int drained=rad_stream_sync(stream_);if(drained<0)cache_prepare4_->fail_stop(drained);}
-        if(lane1_){const int drained=rad_stream_sync(lane1_);if(drained<0)cache_prepare4_->fail_stop(drained);}
-    } // BEFORE oracle/xp/end-owner/free on the experimental profile
-    if(tiny_retirement_){
-        if(stream_)tiny_drain_or_fail(stream_,device_);
-        if(lane1_)tiny_drain_or_fail(lane1_,device_);
-    }
     oracle_close();
     xp_close();
+    row_prefetch_done();
+    rowpf_worker_.reset();   /* joins the read-ahead helper, if one started */
     /* Teardown sync, before freeing memory the streams may still use: the routing staging is the
      * destination of unwaited copies (spec §5.5) and the arena holds every kernel's operands. */
-    const int stream_drained = stream_ ?
-        (tiny_retirement_?(tiny_drain_or_fail(stream_,device_),RAD_OK):rad_stream_sync(stream_)):RAD_OK;
-    const int lane1_drained = lane1_ ?
-        (tiny_retirement_?(tiny_drain_or_fail(lane1_,device_),RAD_OK):rad_stream_sync(lane1_)):RAD_OK;
-    if (stream_drained < 0 || lane1_drained < 0)
-        remember_model_failure(stream_drained < 0 ? stream_drained : lane1_drained,
-                               "model retirement could not drain its streams");
-    expert_prepare_close(stream_drained >= 0 && lane1_drained >= 0);
-    if (stream_drained >= 0 && lane1_drained >= 0) deferred_status_.shutdown();
-    else deferred_status_.quarantine_after_failed_drain();
-    deferred_launches_.clear();
+    if (stream_) rad_stream_sync(stream_);
+    if (lane1_) rad_stream_sync(lane1_);
 
     for (PassTape& t : tapes_) tape_drop(t);
     tapes_.clear();
@@ -407,6 +83,8 @@ void Ctx::shutdown() {
     for (RadEvent& e : route_done_)
         if (e) { rad_event_destroy(e); e = nullptr; }
     route_.clear();
+    ep_route_.clear();
+    ep_route_generation_ = ep_route_serial_ = 0;
 
     if (route_pool_) { rad_dev_free(route_pool_, RAD_MEM_HOST_PINNED); route_pool_ = nullptr; }
     if (route_dev_)  { rad_dev_free(route_dev_, RAD_MEM_DEVICE);        route_dev_  = nullptr; }
@@ -444,7 +122,6 @@ int Ctx::prepare() {
     RAD_TRY(bind_buffers());
     RAD_TRY(bind_weights());
     RAD_TRY(bind_weight_tables());
-    RAD_TRY(bind_deferred_status());
     RAD_TRY(bind_ops());
     RAD_TRY(bind_routing());
     RAD_TRY(bind_profiling());
@@ -455,84 +132,10 @@ int Ctx::prepare() {
      * hold more rows than their header says and be written late. */
     const bool taps = std::any_of(program_->ops.begin(), program_->ops.end(),
                                   [](const OpInfo& o) { return o.op == "gram_accum"; });
-    tape_on_ = record_passes_ && tape_supported() && !profiling_ && !oracle_ && !taps &&
-               !checks_device_status() && !requires_permanent_model_failure();
+    tape_on_ = record_passes_ && tape_supported() && !profiling_ && !oracle_ && !taps;
     if (taps && record_passes_ && tape_supported() && rank_ == 0)
         RAD_INFO("recorded passes: off, the program accumulates calibration Grams (gram_accum)");
-    if (checks_device_status() && rank_ == 0)
-        RAD_INFO("deferred device validation: enabled; recorded passes, speculation and issue-ahead are unsupported");
     return RAD_OK;
-}
-
-int Ctx::bind_deferred_status() {
-    for (const auto& op : program_->ops)
-        for (const auto& band : op.bands)
-            for (const auto& resolved : band.dom)
-                if (resolved.row && resolved.row->deferred_status) return deferred_status_.init();
-    return RAD_OK;
-}
-
-void Ctx::cache_prepare4_fail_if_bound(int status)const noexcept {
-    if(status<0&&cache_prepare4_&&cache_prepare4_->runtime_admitted())cache_prepare4_->fail_stop(status);
-}
-int Ctx::remember_model_failure(int status, const char* fallback) {
-    cache_prepare4_fail_if_bound(status);
-    if (!permanent_model_failure_) return status;
-    if (const int first = terminal_status(); first < 0) return first;
-    if (status >= 0) return status;
-    if (step_status_ >= 0) step_status_ = status;
-    const char* message = !step_fail_.empty() ? step_fail_.c_str() : fallback ? fallback :
-        "the model pass failed; its mutated state cannot be reused";
-    std::snprintf(terminal_error_, sizeof terminal_error_, "%s", message);
-    // The rank thread is the sole writer; publish the bounded owned diagnostic/code.
-    terminal_status_.store(step_status_, std::memory_order_release);
-    return step_status_;
-}
-
-void Ctx::record_device_status_error(int status, const char* boundary) {
-    // Preserve the first failure/attribution; later refused issues and final
-    // drain must not replace a useful semantic error with a lifecycle error.
-    if (status >= 0 || step_status_ < 0) return;
-    const auto failure = deferred_status_.last();
-    const bool attributed = failure.code == status && failure.op > 0 &&
-                            failure.op < program_->ops.size();
-    const char* op = attributed ? program_->ops[failure.op].op.c_str() : "?";
-    step_fail_ = fmt("deferred device validation %s failed on rank %d, op %u (%s): %s",
-                     boundary, rank_, attributed ? failure.op : 0u, op, rad_strerror(status));
-    step_status_ = status;
-}
-
-int Ctx::await_device_status() {
-    if (!checks_device_status()) return terminal_status() < 0 ? terminal_status() : RAD_OK;
-    // A terminal error never skips an outstanding resource retirement. Repeated
-    // calls after completed retirement return the first error, not a new event.
-    if (terminal_status() < 0 && !deferred_status_.pending()) return terminal_status();
-    const int status = deferred_status_.await((uint32_t)program_->ops.size());
-    record_device_status_error(status, "final readback");
-    return remember_model_failure(status);
-}
-
-int Ctx::checkpoint_device_status() {
-    if (const int first = terminal_status(); first < 0) return first;
-    if (!checks_device_status()) return RAD_E_UNSUPPORTED;
-    // Outside a current unsealed frame, refuse without poisoning a future pass.
-    if (!deferred_status_.collecting()) return RAD_E_STATE;
-    if (step_status_ < 0) {
-        deferred_status_.reject_checkpoint(step_status_);
-        return remember_model_failure(step_status_);
-    }
-    // This first seam is intentionally narrower than ordinary deferred status.
-    // A created lane1 is refused even if joined: no silent partial-lane proof.
-    if (!batch_ || world_size_ != 1 || lane_ != 0 || lane1_ || lane1_pending_ ||
-        tape_on_ || rec_ || staging_ || batch_->n_spec != 0 || batch_->draft_pass != 0) {
-        const int status = deferred_status_.reject_checkpoint(RAD_E_UNSUPPORTED);
-        step_fail_ = "deferred device-validation checkpoint requires eager lane0 TP1, no lane1/staging/tape/speculation";
-        step_status_ = status;
-        return remember_model_failure(status);
-    }
-    const int status = deferred_status_.checkpoint((uint32_t)program_->ops.size());
-    record_device_status_error(status, "checkpoint");
-    return remember_model_failure(status);
 }
 
 int Ctx::bind_arena() {
@@ -675,7 +278,6 @@ int Ctx::add_level(int64_t rows, const std::vector<int64_t>& offset,
 }
 
 int Ctx::set_level(int level) {
-    if (const int first = terminal_status(); first < 0) return first;
     if (level < 0 || level >= (int)level_tmpl_.size()) return RAD_E_INVAL;
     if (level == level_) return RAD_OK;
     buf_tmpl_ = level_tmpl_[(size_t)level];
@@ -729,7 +331,6 @@ int Ctx::bind_ops() {
     for (auto& o : P.ops) n_bands_total += (int64_t)o.bands.size();
     band_table_.reserve((size_t)n_bands_total);
     issue_table_.reserve((size_t)(n_bands_total * RAD_N_DOMAINS));
-    if (checks_device_status()) deferred_launches_.resize((size_t)(n_bands_total * RAD_N_DOMAINS));
 
     for (size_t i = 1; i < P.ops.size(); ++i) {
         OpInfo& oi = P.ops[i];
@@ -739,8 +340,17 @@ int Ctx::bind_ops() {
         p.n_bands  = (int32_t)oi.bands.size();
         p.plan_off = (int32_t)issue_table_.size();
         p.n_opd_schema = oi.schema ? (int32_t)oi.schema->n_operands : -1;
+        p.n_opd_required = -1;
+        if (oi.schema) {
+            /* One past the last required operand: an issue may leave out the optional ones after
+             * it. */
+            for (int o = 0; o < oi.schema->n_operands; ++o)
+                if (!oi.schema->operands[o].optional) p.n_opd_required = o + 1;
+            if (p.n_opd_required < 0) p.n_opd_required = 0;
+        }
         /* Matched by name once here, not on the issue path; see OpPlan::billed. */
         p.billed     = (oi.op == "all_reduce");
+        p.row_gather = row_gather_op(oi.op);
         p.collective = p.billed;
         p.lora_site  = oi.lora_site;
         p.order      = oi.anchor > 0 && (size_t)oi.anchor < P.ops.size() ? P.ops[(size_t)oi.anchor].index
@@ -769,13 +379,6 @@ int Ctx::bind_ops() {
                     ip.args.instance      = r.instance;
                     ip.args.rank          = rank_;
                     ip.args.world_size    = world_size_;
-                    if (r.row->deferred_status) {
-                        auto& wrapper = deferred_launches_[issue_table_.size()];
-                        wrapper = {ip.launch, r.row->deferred_status, r.instance,
-                                   deferred_status_.device(), (uint32_t)i, &deferred_status_};
-                        ip.launch = DeferredStatusLaunch::launch;
-                        ip.args.instance = &wrapper;
-                    }
                     /* A launch that ends its own link hold gets the hold word as an extra
                      * `link_gate` parameter after the geometry's. */
                     if (r.row->releases_link)
@@ -934,7 +537,6 @@ int Ctx::check_domain(rad_op h, int domain) const {
 
 
 int Ctx::set_op_domain(rad_op h, int domain) {
-    if (const int first = terminal_status(); first < 0) return first;
     int s = check_domain(h, domain);
     if (s < 0) return s;
     if (op_domain_[h].exchange((uint8_t)domain, std::memory_order_relaxed) != (uint8_t)domain)
@@ -964,6 +566,10 @@ int Ctx::bind_routing() {
 
     route_n_expert_ = n_expert;
     route_.assign((size_t)n_layer, RouteSlot{});
+    if (P.meta.arch_id && std::strcmp(P.meta.arch_id, "deepseek41") == 0 &&
+        P.meta.n_layers == 40 && P.meta.n_embd == 5120 && P.meta.n_expert == 384 &&
+        P.meta.n_expert_used == 6 && world_size_ == 4)
+        ep_route_.assign((size_t)n_layer, EpRouteCounts{});
 
     /* One pinned host block for all banks, and one row per layer on the card. Pinned so the copy
      * is a true async DMA; a pageable destination can make the driver synchronise, and routing
@@ -1016,8 +622,65 @@ int Ctx::route_flush() {
     return RAD_OK;
 }
 
+int Ctx::begin_ep_route_generation() {
+    if (ep_route_.empty()) return RAD_OK;
+    if (ep_route_generation_ == UINT64_MAX) return RAD_E_STATE;
+    ++ep_route_generation_;
+    for (EpRouteCounts& v : ep_route_) v = {};
+    return RAD_OK;
+}
+
+void Ctx::note_ep_route_producer(const OpInfo& op, const RadTensor* t, int n_t,
+                                 int64_t rows, RadStream issued_stream) {
+    if (ep_route_.empty() || !batch_ || !staging_ || step_status_ < 0 || !route_dev_ ||
+        !op.schema || n_t != op.schema->n_operands) return;
+    for (int i = 0; i < n_t; ++i) {
+        const RadOperandSpec& spec = op.schema->operands[i];
+        if (spec.role != RAD_OPD_OUT && spec.role != RAD_OPD_INOUT) continue;
+        const uintptr_t lo = (uintptr_t)route_dev_, at = (uintptr_t)t[i].data;
+        const uint64_t stride = (uint64_t)route_n_expert_ * sizeof(int32_t);
+        if (!at || at < lo || !stride) continue;
+        const uint64_t layer = (at - lo) / stride;
+        if (layer >= ep_route_.size()) continue;
+        EpRouteCounts& v = ep_route_[(size_t)layer];
+        v = {}; // Any observed writer invalidates previous eligibility first.
+        if ((at - lo) % stride != 0 || spec.role != RAD_OPD_OUT || !spec.name ||
+            std::strcmp(spec.name, "expert_count") != 0 ||
+            (op.op != "moe_scatter" && op.op != "moe_scatter_inv" &&
+             op.op != "router_topk_scatter" && op.op != "router_gemm_topk_scatter")) continue;
+        if (lane_ != 0 || issued_stream != stream_ || rows <= 0 || rows > ep_route_max_rows() ||
+            rows != batch_->n_tok || t[i].dtype != RAD_I32 ||
+            !((t[i].rank == 1 && t[i].shape[0] == 96 && t[i].stride[0] == 1) ||
+              (t[i].rank == 2 && t[i].shape[0] == 96 && t[i].shape[1] == 1 &&
+               t[i].stride[0] == 1 && t[i].stride[1] == 1))) continue;
+        long long ne = 0, local = 0, base = -1, topk = 0;
+        if (!op.base.get_i("n_expert", &ne) || !op.base.get_i("expert_base", &base) ||
+            !op.base.get_i("top_k", &topk)) continue;
+        const bool separate = op.op == "moe_scatter" || op.op == "moe_scatter_inv";
+        if (separate) local = ne;
+        else if (!op.base.get_i("n_local", &local)) continue;
+        const char* protect = op.base.get_s("protect");
+        if ((protect && *protect) || local != 96 || topk != 6 || base != rank_ * 96 ||
+            (separate ? ne != 96 : ne != 384) || ep_route_serial_ == UINT64_MAX) continue;
+        v.program = program_; v.row = (const int32_t*)t[i].data; v.stream = issued_stream;
+        v.generation = ep_route_generation_; v.producer_serial = ++ep_route_serial_;
+        v.layer = (int64_t)layer; v.rank = rank_; v.world = world_size_;
+        v.global_experts = 384; v.local_experts = 96; v.expert_base = base;
+        v.top_k = topk; v.rows = rows; v.successfully_issued = true;
+    }
+}
+
+bool Ctx::ep_route_counts_live(int layer, EpRouteCounts* out) const {
+    if (!out || !batch_ || !staging_ || step_status_ < 0 || layer < 0 ||
+        (size_t)layer >= ep_route_.size()) return false;
+    const EpRouteCounts& v = ep_route_[(size_t)layer];
+    if (!ep_route_current(v, program_, stream_, ep_route_generation_, layer, batch_->n_tok))
+        return false;
+    *out = v;
+    return true;
+}
+
 int Ctx::route_report(int layer, const RadRouting* r) {
-    if (const int first = terminal_status(); first < 0) return first;
     if (rec_ && r) {
         tape_cut();
         TapeStep st;
@@ -1289,6 +952,11 @@ void Ctx::dump_profile() const {
         waited += wait;
     }
     fprintf(stderr, "  %10s %12.3f   (waited %.3f ms besides)\n\n", "total", total, waited);
+    if (rowpf_calls_)
+        fprintf(stderr, "  row read-ahead: %lld host gather(s) from the mapped tier asked for %lld "
+                        "page(s) ahead of their kernel, %lld of them beside it "
+                        "(runtime/rowprefetch.h; --row-prefetch off turns it off)\n\n",
+                (long long)rowpf_calls_, (long long)rowpf_pages_, (long long)rowpf_beside_calls_);
 }
 
 /* ================================================================== the step driver */
@@ -1296,7 +964,6 @@ void Ctx::dump_profile() const {
 /* Lazy, so an architecture that never asks for a second lane runs exactly the single-lane code
  * path. */
 int Ctx::lane_init() {
-    if (const int first = terminal_status(); first < 0) return first;
     if (lane1_) return RAD_OK;
     RAD_TRY(rad_dev_set(device_));
     RAD_TRY(rad_stream_create(&lane1_, 0));
@@ -1313,8 +980,6 @@ int Ctx::lane_init() {
 }
 
 int Ctx::set_lane(int lane) {
-    if (const int first = terminal_status(); first < 0) return first;
-    if (expert_prepare_ && lane != 0) return expert_prepare_fail(RAD_E_UNSUPPORTED,"current expert prepare forbids lane1");
     if (lane != 0 && lane != 1) return RAD_E_INVAL;
     if (lane == 0 && !lane1_) { lane_ = 0; return RAD_OK; }   /* lane 0 needs nothing built */
     RAD_TRY(lane_init());
@@ -1343,9 +1008,9 @@ int Ctx::lane_join(int from, int to) {
  * field added to RadBatch changes its size: decide whether the key must read it, then update the
  * size here. `agen_b` and `vgen_b` are set only on generator passes, which are never recorded
  * (below). */
-static_assert(sizeof(void*) != 8 || sizeof(RadBatch) == 360,
+static_assert(sizeof(void*) != 8 || sizeof(RadBatch) == 376,
               "RadBatch changed: check that Ctx::pass_key reads every new field a pass depends on");
-static_assert(sizeof(void*) != 8 || sizeof(RadKVGroupBatch) == 72,
+static_assert(sizeof(void*) != 8 || sizeof(RadKVGroupBatch) == 80,
               "RadKVGroupBatch changed: check that Ctx::pass_key reads every new field");
 
 uint64_t Ctx::pass_key(const RadBatch* b) const {
@@ -1376,11 +1041,16 @@ uint64_t Ctx::pass_key(const RadBatch* b) const {
     ptr(b->lora_slot);
     /* Zero issues no projection op (RadBatch::control_vector). */
     mix((uint64_t)b->control_vector);
+    /* A cut prefill step issues a prefix of the layers (RadBatch::consumer_full); consumer_end
+     * changes nothing it issues. */
+    mix((uint64_t)(uint32_t)b->consumer_full);
     for (int g = 0; g < b->n_kv_groups; ++g) {
         const RadKVGroupBatch& k = b->kv[g];
         mix((uint64_t)k.group);  ptr(k.slot_mapping); ptr(k.block_table);
         mix((uint64_t)k.block_table_pitch); ptr(k.seqused); ptr(k.state_index);
         mix((uint64_t)k.state_index_pitch); mix((uint64_t)k.block_size); mix((uint64_t)k.max_blocks);
+        /* A streamed group's view by the memory it names, never its address (kvstream_view_key). */
+        mix(kvstream_view_key(k.stream));
     }
     mix((uint64_t)level_);
     mix(dense_epoch_);
@@ -1445,7 +1115,18 @@ int Ctx::record_pass(const RadBatch* b, uint64_t key, PassTape* out) {
     out->touch_pending[1] = host_touch_pending_[1];
     out->scratch_open[0] = scratch_open_[0];
     out->scratch_open[1] = scratch_open_[1];
-    if (haz_mark(*out) < 0) {
+    {
+        /* --debug-tape-dump: the first recording of each draft pass kind lists its dispatches
+         * (TAPEDUMP lines on stderr, every rank): a diagnostic for issue-order work. */
+        const int db = b->draft_pass + 8;
+        haz_dump_ = tape_dump_ && db >= 0 && db < 64 && !(tape_told_ & (1ull << db));
+        if (haz_dump_)
+            fprintf(stderr, "TAPEDUMP r%d begin draft %d tok %lld\n", rank_, b->draft_pass,
+                    (long long)b->n_tok);
+    }
+    const int hm = haz_mark(*out);
+    haz_dump_ = false;
+    if (hm < 0) {
         tape_destroy(t);
         out->dev = nullptr;
         return 0;
@@ -1512,18 +1193,50 @@ int Ctx::haz_mark(PassTape& t) {
         if (!q) { qs.push_back(Q{}); q = &qs.back(); q->id = qid; }
         /* An event packet: the next dispatch is ordered, since nothing after a wait may start
          * before its event completes. */
-        if (kind != 0) { q->infl.clear(); q->opaque = true; q->run = 0; continue; }
+        if (kind != 0) {
+            if (haz_dump_) fprintf(stderr, "TAPEDUMP r%d %d q%u event\n", rank_, i, qid);
+            q->infl.clear(); q->opaque = true; q->run = 0; continue;
+        }
         ++t.dispatches;
 
         const int32_t op = first_of[(size_t)i];
         bool ok = op >= 0 && !q->opaque && !haz_ops_[(size_t)op].opaque && q->run < kTapeOverlapRun;
+        int32_t clash = -1;
         if (ok) {
             const HazOp& h = haz_ops_[(size_t)op];
             for (int32_t x : q->infl) {
                 const HazOp& f = haz_ops_[(size_t)x];
                 if (overlaps(h.rd, h.n_rd, f.wr, f.n_wr) || overlaps(h.wr, h.n_wr, f.rd, f.n_rd) ||
-                    overlaps(h.wr, h.n_wr, f.wr, f.n_wr)) { ok = false; break; }
+                    overlaps(h.wr, h.n_wr, f.wr, f.n_wr)) { ok = false; clash = x; break; }
             }
+        }
+        if (haz_dump_) {
+            const int32_t own = part_of[(size_t)i];
+            const HazOp* h = own >= 0 ? &haz_ops_[(size_t)own] : nullptr;
+            const OpPlan* pl = h ? &plans_[h->op] : nullptr;
+            const char* why = ok                                 ? "U"
+                              : own < 0                          ? "O noop"
+                              : op < 0                           ? "O cont"
+                              : h->opaque                        ? "O opaque"
+                              : q->opaque                        ? "O after-opaque"
+                              : q->run >= kTapeOverlapRun        ? "O run-cap"
+                                                                 : "O clash";
+            std::string rr;
+            if (h && op >= 0 && !h->opaque) {
+                rr = " rd";
+                for (uint32_t k = 0; k < h->n_rd; ++k)
+                    rr += fmt(" %llx+%llx", (unsigned long long)haz_rng_[h->rd + k].first,
+                              (unsigned long long)(haz_rng_[h->rd + k].second - haz_rng_[h->rd + k].first));
+                rr += " wr";
+                for (uint32_t k = 0; k < h->n_wr; ++k)
+                    rr += fmt(" %llx+%llx", (unsigned long long)haz_rng_[h->wr + k].first,
+                              (unsigned long long)(haz_rng_[h->wr + k].second - haz_rng_[h->wr + k].first));
+            }
+            fprintf(stderr, "TAPEDUMP r%d %d q%u hop%d op%d decl%d %s %s %s%s%s\n", rank_, i, qid, own,
+                    h ? (int)h->op : -1, pl && pl->info ? pl->info->index : -1,
+                    pl && pl->info ? pl->info->op.c_str() : "-",
+                    h && h->row && h->row->info && h->row->info->name ? h->row->info->name : "-", why,
+                    clash >= 0 ? fmt(" with hop%d", clash).c_str() : "", rr.c_str());
         }
         if (ok) {
             const int sc = tape_set_overlap(t.dev, i, true);
@@ -1567,10 +1280,7 @@ bool Ctx::tapes_agree(const PassTape& a, const PassTape& b, std::string* why) {
         const TapeHost& x = a.host[i];
         const TapeHost& y = b.host[i];
         bool same = x.h == y.h && x.launch == y.launch && x.n == y.n && x.drain == y.drain &&
-                    x.args.n_t == y.args.n_t && x.args.scratch == y.args.scratch &&
-                    x.n_direct_weights == y.n_direct_weights;
-        for (int k = 0; same && k < x.n_direct_weights; ++k)
-            same = x.direct_weights[k] == y.direct_weights[k];
+                    x.args.n_t == y.args.n_t && x.args.scratch == y.args.scratch;
         for (int k = 0; same && k < x.args.n_t; ++k)
             same = std::memcmp(&x.t[k], &y.t[k], sizeof(RadTensor)) == 0;
         if (!same) { *why = fmt("host op %zu (op %u) differs", i, (unsigned)x.h); return false; }
@@ -1624,11 +1334,15 @@ int Ctx::play_pass(PassTape& t) {
         case kTapeHost: {
             TapeHost& th = t.host[(size_t)st.a];
             lane_ = st.lane;
-            rc = host_join_wait(th.drain ||
-                                host_weights_pending(th.direct_weights, th.n_direct_weights));
+            /* What the recorded join waited on (TapeHost::touch): the stretches played before this
+             * step re-recorded those events. */
+            for (int l = 0; l < 2; ++l) host_touch_pending_[l] = host_touch_pending_[l] || th.touch[l];
+            rc = host_join_wait(th.drain);
             if (rc >= 0) {
                 th.args.t = th.t;
+                if (th.rp.n) row_prefetch_run(th.rp, th.t, th.n);
                 rc = th.launch(&th.args, cur_stream());
+                row_prefetch_done();
                 rad_dev_host_wrote();
             }
             lane_ = l0;
@@ -1657,6 +1371,12 @@ int Ctx::play_pass(PassTape& t) {
             rc = xp_ ? xp_step_run(st.a) : RAD_OK;
             lane_ = l0;
             break;
+        case kTapeKvStage:
+        case kTapeKvStageAfter:
+            lane_ = st.lane;
+            rc = kvstage_run(this, st.a, st.b, st.kind == kTapeKvStageAfter);
+            lane_ = l0;
+            break;
         }
         if (rc < 0) {
             if (step_status_ >= 0) step_status_ = rc;
@@ -1679,13 +1399,14 @@ int Ctx::play_pass(PassTape& t) {
 int Ctx::run_pass(const RadBatch* b) {
     const auto bump = [](std::atomic<int64_t>& c) { c.fetch_add(1, std::memory_order_relaxed); };
     scratch_cur_[0] = scratch_cur_[1] = 0;
-    /* A pass the stager armed for is issued live: see runtime/stager.h. */
-    if (!tape_on_ || staging_) { bump(pc_unkeyed_); arch_step_(this, b); return RAD_OK; }
+    /* A pass the stager armed for is issued live: see runtime/stager.h. Every pass issued live
+     * goes through live_step, where the live chain (runtime/live_chain.h) marks its ends. */
+    if (!tape_on_ || staging_) { bump(pc_unkeyed_); live_step(b); return RAD_OK; }
     const uint64_t key = pass_key(b);
-    if (key == 0) { bump(pc_unkeyed_); arch_step_(this, b); return RAD_OK; }
+    if (key == 0) { bump(pc_unkeyed_); live_step(b); return RAD_OK; }
     if (std::find(tape_refused_.begin(), tape_refused_.end(), key) != tape_refused_.end()) {
         bump(pc_refused_);
-        arch_step_(this, b);
+        live_step(b);
         return RAD_OK;
     }
     PassTape* t = nullptr;
@@ -1728,7 +1449,7 @@ int Ctx::run_pass(const RadBatch* b) {
      * bound crosses its bucket, so they are recorded on first sight. */
     if (b->phase != RAD_PHASE_DECODE && !tape_seen(key)) {
         bump(pc_first_);
-        arch_step_(this, b);
+        live_step(b);
         return RAD_OK;
     }
 
@@ -1748,49 +1469,13 @@ int Ctx::run_pass(const RadBatch* b) {
 }
 
 int Ctx::run_step(const RadBatch* b) {
-    if(cache_prepare4_){
-        const int admitted=b?cache_prepare4_->check_batch(*b):RAD_E_INVAL;
-        if(admitted<0)cache_prepare4_fail_if_bound(admitted);
-        if(admitted<0)return admitted;
-    }
-    if (const int first = terminal_status(); first < 0) {cache_prepare4_fail_if_bound(first);return first;}
     if (!b) return RAD_E_INVAL;
     if (!arch_step_) {
-        cache_prepare4_fail_if_bound(RAD_E_STATE);
         RAD_WARN("Ctx::run_step: no architecture step function was installed");
         return RAD_E_STATE;
     }
-    if (requires_permanent_model_failure() && (b->n_spec != 0 || b->draft_pass != 0)) {
-        step_fail_ = "permanent model failure policy requires non-speculative eager passes";
-        return remember_model_failure(RAD_E_UNSUPPORTED);
-    }
-    if (checks_device_status()) {
-        // Only the NEW checkpoint path is permanently fatal. Legacy deferred
-        // readback callers keep their existing per-pass reset behavior.
-        if (deferred_status_.checkpoint_failed())
-            return remember_model_failure(step_status_ < 0 ? step_status_ : RAD_E_STATE);
-        if (b->n_spec != 0 || b->draft_pass != 0) {
-            step_fail_ = "deferred device validation does not yet support speculative/draft passes";
-            return RAD_E_UNSUPPORTED;
-        }
-    }
-    // Pure Native admission must precede collector reset/enqueue: a known owner
-    // fatal/profile refusal cannot strand an opened deferred frame. No owner
-    // callback or active-pass mutation occurs on successful admission.
-    const int prepare_profile = expert_prepare_admit(b);
-    if (prepare_profile < 0) return remember_model_failure(prepare_profile);
-    if (checks_device_status()) {
-        const int status = deferred_status_.begin(stream_, lane1_);
-        if (status < 0) {
-            step_fail_ = "cannot begin deferred device-validation pass";
-            return remember_model_failure(status);
-        }
-    }
 
-    // Nonfallible activation only after BOTH admissions succeeded; every
-    // active pass below reaches expert_prepare_end, including issue failure.
-    expert_prepare_begin();
-
+    RAD_TRY(begin_ep_route_generation());
     /* Before the residency sync, which carries any weights a declining stager gave back into the
      * tables (runtime/stager.h). */
     staging_ = stager_ != nullptr && stager_->begin_pass(b);
@@ -1801,11 +1486,9 @@ int Ctx::run_step(const RadBatch* b) {
     step_status_ = RAD_OK;
     step_fail_.clear();
     prof_n_      = 0;
+    kvstream_enter(this, b);
     {
-        int rc=RAD_E_STATE;
-        if(cache_prepare4_){try{rc=run_pass(b);}catch(...){cache_prepare4_fail_if_bound(RAD_E_STATE);throw;}}
-        else rc=run_pass(b);
-        cache_prepare4_fail_if_bound(rc);cache_prepare4_fail_if_bound(step_status_);
+        const int rc = run_pass(b);
         if (rc < 0 && step_status_ >= 0) step_status_ = rc;
     }
 
@@ -1815,13 +1498,8 @@ int Ctx::run_step(const RadBatch* b) {
     lane_ = 0;
     {
         const int lj = lane_join(1, 0);   /* no-op when lane 1 is unbuilt */
-        cache_prepare4_fail_if_bound(lj);
         if (lj < 0 && step_status_ >= 0) step_status_ = lj;
     }
-    cache_prepare4_fail_if_bound(step_status_); // BEFORE owner/end drains on any known failure
-    const int prepared_end = expert_prepare_end();
-    cache_prepare4_fail_if_bound(prepared_end);
-    if (prepared_end < 0 && step_status_ >= 0) step_status_ = prepared_end;
     /* After the join, so the compute stream is behind every reader of staged weights; regardless
      * of status, because a staged weight must never outlive its pass. */
     if (staging_) {
@@ -1835,14 +1513,8 @@ int Ctx::run_step(const RadBatch* b) {
     }
 
     if (profiling_) profile_collect();
-    if (checks_device_status()) {
-        const int status = deferred_status_.seal();
-        if (status < 0 && step_status_ >= 0) step_status_ = status;
-    }
     flush_issued();
-    /* Includes failures in route_flush/deferred finalization AFTER owner end_pass. */
-    if (expert_prepare_ && step_status_ < 0 && expert_prepare_->fatal >= 0) expert_prepare_->fatal = step_status_;
-    return remember_model_failure(step_status_);
+    return step_status_;
 }
 
 /* Copies OpPlan::issued into the Program for the graph dump. Walks only ops not yet seen issued

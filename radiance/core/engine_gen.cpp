@@ -34,7 +34,6 @@ static const char* pass_name(int gen) {
 }
 
 int Engine::gen_loop() {
-    if (const int s = model_policy_admission(); s < 0) return fail_loop(s);
     if (rad_dev_set(ranks_[0]->device) < 0)
         RAD_ERR("generator loop: could not bind rank 0's device");
     int step = 0, idle = 0;

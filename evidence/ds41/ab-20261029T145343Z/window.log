@@ -1,0 +1,47 @@
+[2026-10-29T14:54:28Z] waiting for 30 s of QFN idleness
+before: 608764c1d1989c714d8aad7b8a79f8057c3e73473b9f9d55b49d02e82defd2b8 running 2026-10-29T14:51:55.253872644Z sha256:e82764045e46ebae07e33961f17dedba981c0d07336dfcddd67e4b3b042b8600
+[2026-10-29T14:54:56Z] stopping radiance-flashnext
+radiance-flashnext
+[2026-10-29T14:55:05Z] arm all-t40-f-M16-H-p256-m98304-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Lm4096: RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=40 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU=/home/as/radiance-ds41-claude/tools/ds41-host-experts/build/window-20261028T203510Z/silu_table_gfx1201.bin RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_POLICY=all RADIANCE_EXPERIMENTAL_NATIVE_CACHE_DIRECT_FILL=1 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MISSES=16 RADIANCE_EXPERIMENTAL_NATIVE_CACHE_PREGROW=1 RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS=1 RADIANCE_EXPERIMENTAL_DS41_CACHE_WARM=1 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_ASYNC_MISSES=2 RADIANCE_EXPERIMENTAL_DS41_ENGRAM_SPLIT=1 RADIANCE_EXPERIMENTAL_DS41_PREFETCH_ATTN=1 RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE=1 RADIANCE_EXPERIMENTAL_DS41_CACHE_SECOND_CHANCE=2 RADIANCE_EXPERIMENTAL_DS41_PREFETCH=pieces RADIANCE_EXPERIMENTAL_DS41_PREFETCH_K=4 RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8=1 RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8_EXCLUDE=
+[2026-10-29T14:55:57Z] arm all-t40-f-M16-H-p256-m98304-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Lm4096: serving after 52s
+radiance: deepseek41: rank 0: 330 dense weights read by gemm_nt_bf16f8 (RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8): 2035.0 MiB of E4M3 codes where bf16 held 4070.0 MiB; 0 left on gemm_nt
+radiance: deepseek41: rank 3: 330 dense weights read by gemm_nt_bf16f8 (RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8): 1885.0 MiB of E4M3 codes where bf16 held 3770.0 MiB; 0 left on gemm_nt
+radiance: deepseek41: rank 1: 330 dense weights read by gemm_nt_bf16f8 (RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8): 1885.0 MiB of E4M3 codes where bf16 held 3770.0 MiB; 0 left on gemm_nt
+radiance: deepseek41: rank 2: 330 dense weights read by gemm_nt_bf16f8 (RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8): 1885.0 MiB of E4M3 codes where bf16 held 3770.0 MiB; 0 left on gemm_nt
+long-0064: 6.8 s, decode 14.95 tok/s, prefill 5752 ms
+long-0256: 12.1 s, decode 16.16 tok/s, prefill 11181 ms
+long-1024: 33.5 s, decode 13.56 tok/s, prefill 32429 ms
+long-2048: 71.5 s, decode 16.04 tok/s, prefill 70583 ms
+long-3500: 101.3 s, decode 17.27 tok/s, prefill 100458 ms
+[2026-10-29T14:59:43Z] arm all-t40-f-M16-H-p256-m98304-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Lm4096: requests exit 0
+[2026-10-29T14:59:43Z] arm all-t40-f-M16-H-p256-m98304-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Lm4096: NVMe busy 47% of the requests' 225331 ms, drive at 56 C
+  host experts' plane reads: 28462 weights read for the CPU in 85.98 s of issuing-thread time (3.02 ms a batch weight), 28476 relaid into the RAM cache beside it
+I[1] EP scoped file staging: 18760 count rows completed, 456 local-zero, 0 SSD units submitted, 0 corrupt rows refused
+I[1] host experts: 17511 layers handed 109914 experts (254940 rows) to the CPU; 0 cached experts went over the copy link, 12874 routed experts were not cached; 54425.1 ms waiting at gathers; verify: 0 rows compared, 0 differ; 0 gate_up operand moves; 122788 units probed (the mapped cache's hit and miss counts above include these probes); misses on the CPU: 12874 units, 16324 rows, 82445.0 ms reading their planes
+I[1] host experts: 84814.1 ms waiting at gathers for misses still being read on the worker (not in the gather waits above)
+  host experts' plane reads: 29226 weights read for the CPU in 79.95 s of issuing-thread time (2.74 ms a batch weight), 29200 relaid into the RAM cache beside it
+I[2] EP scoped file staging: 18760 count rows completed, 493 local-zero, 0 SSD units submitted, 0 corrupt rows refused
+I[2] host experts: 17417 layers handed 118560 experts (277678 rows) to the CPU; 0 cached experts went over the copy link, 13253 routed experts were not cached; 64895.5 ms waiting at gathers; verify: 0 rows compared, 0 differ; 0 gate_up operand moves; 131813 units probed (the mapped cache's hit and miss counts above include these probes); misses on the CPU: 13253 units, 16887 rows, 75756.2 ms reading their planes
+I[2] host experts: 78511.1 ms waiting at gathers for misses still being read on the worker (not in the gather waits above)
+  host experts' plane reads: 29246 weights read for the CPU in 78.03 s of issuing-thread time (2.67 ms a batch weight), 29242 relaid into the RAM cache beside it
+I[3] EP scoped file staging: 18760 count rows completed, 530 local-zero, 0 SSD units submitted, 0 corrupt rows refused
+I[3] host experts: 17366 layers handed 113837 experts (239360 rows) to the CPU; 0 cached experts went over the copy link, 13268 routed experts were not cached; 59446.1 ms waiting at gathers; verify: 0 rows compared, 0 differ; 0 gate_up operand moves; 127105 units probed (the mapped cache's hit and miss counts above include these probes); misses on the CPU: 13268 units, 16865 rows, 73615.5 ms reading their planes
+I[3] host experts: 76419.2 ms waiting at gathers for misses still being read on the worker (not in the gather waits above)
+I[0] read-ahead in pieces: 208 units planned (0 more too late, 0 over the live cap); at their layer 77 used (0 whole, 77 finished while the layer waited 188.5 ms in all, 2.448 ms each), 4 read as any miss, 0 re-read after a failed piece; 127 dropped (127 not selected, 0 cache hits, 0 stale); 81 of 230 one-token misses planned (35.2%), 77 used (33.5%); read ahead 500 MB for units used, 760 MB for units dropped
+I[1] read-ahead in pieces: 201 units planned (0 more too late, 0 over the live cap); at their layer 67 used (0 whole, 67 finished while the layer waited 153.7 ms in all, 2.294 ms each), 6 read as any miss, 0 re-read after a failed piece; 128 dropped (128 not selected, 0 cache hits, 0 stale); 73 of 207 one-token misses planned (35.3%), 67 used (32.4%); read ahead 458 MB for units used, 808 MB for units dropped
+I[2] read-ahead in pieces: 190 units planned (0 more too late, 0 over the live cap); at their layer 64 used (0 whole, 64 finished while the layer waited 165.3 ms in all, 2.583 ms each), 5 read as any miss, 0 re-read after a failed piece; 121 dropped (121 not selected, 0 cache hits, 0 stale); 69 of 212 one-token misses planned (32.5%), 64 used (30.2%); read ahead 428 MB for units used, 679 MB for units dropped
+I[3] read-ahead in pieces: 181 units planned (0 more too late, 0 over the live cap); at their layer 69 used (0 whole, 69 finished while the layer waited 183.8 ms in all, 2.663 ms each), 0 read as any miss, 0 re-read after a failed piece; 112 dropped (112 not selected, 0 cache hits, 0 stale); 69 of 221 one-token misses planned (31.2%), 69 used (31.2%); read ahead 438 MB for units used, 656 MB for units dropped
+I read-ahead readers: 4 readers, 512 KiB pieces; 17116 pieces read (5388 urgent, 0 failed), 8951 MB in 6606.7 ms of reads (0.386 ms a piece), at most 4 in flight; 2147.9 ms of reader time held back by demand reads; 34193 demand reads, 537 of them started with read-ahead pieces in flight, 242.7 ms in all until those pieces were in (0.452 ms each)
+I router predictor (two ahead, top 4): 2850 inputs posted, 2850 predictions, 0 dropped behind a full queue; 1900.9 ms scoring (667.0 us a prediction), 19.6 ms planning the read-ahead (6.9 us a prediction)
+request     all-t40-f-M16-H-p256-m98304-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Lm4096
+long-0064          14.95  same
+long-0256          16.16  same
+long-1024          13.56  same
+long-2048          16.04  same
+long-3500          17.27  same
+decode             16.53 tok/s
+[2026-10-29T14:59:46Z] arms done
+[2026-10-29T14:59:46Z] restoring radiance-flashnext
+radiance-flashnext
+[2026-10-29T15:00:42Z] QFN up after 55s; completion: {"id":"cmpl-8802a5c412c3c862da12f17f","object":"text_completion","created":1793286041,"model":"qwen-vllm","system_fingerprint":"radiance-1.12.0","choices":[{"text":" Paris. The capital","index":0,"logprobs":null,"finish_reason":"length"}],"usage":{"prompt_tokens":5,"completion_tokens":4,"total_token
+608764c1d1989c714d8aad7b8a79f8057c3e73473b9f9d55b49d02e82defd2b8 running 2026-10-29T14:59:46.301486459Z sha256:e82764045e46ebae07e33961f17dedba981c0d07336dfcddd67e4b3b042b8600

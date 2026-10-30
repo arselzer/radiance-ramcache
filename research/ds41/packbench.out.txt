@@ -1,0 +1,8 @@
+# packbench output, 2026-10-28, run once on this machine (AMD EPYC 7443, one thread, nice -n 19)
+# build: g++ -O2 -msse2 -o packbench packbench.cpp
+# run:   ./packbench <scratch file on the 990 Pro, the model disk>
+# Warm caches; the scratch file had just been written, so the O_DIRECT read was likely
+# served from the drive's own cache. Cold data makes all three numbers slower.
+GU 12.53 MB: sse2 pack 0.74 ms (16.9 GB/s out), memcpy 0.65 ms (19.3 GB/s)
+DN 6.27 MB: sse2 pack 0.29 ms (21.9 GB/s out), memcpy 0.17 ms (36.6 GB/s)
+O_DIRECT pread 12.54 MB: best 1.22 ms (10.3 GB/s)

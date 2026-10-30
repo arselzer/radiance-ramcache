@@ -9,6 +9,7 @@
  */
 #pragma once
 #include "advance.h"
+#include "consumer_skip.h"
 #include "device/device.h"
 #include "geometry.h"
 #include "mem_iface.h"
@@ -67,6 +68,10 @@ struct StepEntry {
     int32_t dev_tok = 0;
     int32_t dev_out = -1;
     int32_t dev_aux = 0;
+    /* A prefill entry of a prompt the consumer skip cuts (SchedReq::consumer_end): the target the
+     * builder derives the step's RadBatch::consumer_full from when the entry is the step's only
+     * one; 0 otherwise. */
+    int64_t consumer_end = 0;
 };
 
 struct StepPlan {
@@ -105,6 +110,13 @@ public:
         int       device = 0;
         RadStream stream = nullptr;
         Program*  prog   = nullptr;
+        /* This rank's KV pool base, for rebasing rank 0's map pointers when no per-rank views are
+         * given (kvstream_step_view). */
+        void*     kv_base = nullptr;
+        /* Per group, this rank's stream view or null, owned by the engine. Each rank's view names its
+         * own maps and its own mirror. Pointers rather than the manager, so a test that drives the
+         * builder without a device does not link the manager. */
+        const RadKVStream* const* kv_streams = nullptr;
     };
 
     /* `prog` is non-const because derived buffers are written into its arena, whose pointer lands
@@ -116,10 +128,6 @@ public:
     /* Bytes init() allocates on each rank's card (the step slab and, with an encoder, the media
      * regions), computed without allocating, for the VRAM budget. -1 if init() would refuse. */
     static int64_t device_bytes(Program& prog, const Config& cfg, const KVGeom& kvg);
-    // Closed manual GLM profile: actual shared pinned-ring and event requests.
-    // Metadata sizing only; outputs commit together, no backend/payload work.
-    static int glm_main_staging_quote(Program&,const Config&,const KVGeom&,
-        uint64_t* device,uint64_t* pinned,uint64_t* events);
 
     /* Build the batch for this step. The returned pointer stays valid for the next kOut - 1
      * calls and is shared by pointer across rank threads (spec §1). Null on a device failure,
@@ -136,6 +144,23 @@ public:
     /* Longest sequence a batch can describe, in tokens, as sized into the block-table rows at
      * init. A position at or past it cannot be addressed. */
     int64_t max_ctx() const { return max_ctx_; }
+
+    /* The consumer skip (consumer_skip.h), as the scheduler enabled it: a step whose only entry is
+     * a prefill chunk carrying StepEntry::consumer_end gets RadBatch::consumer_full from the
+     * declared shape, the chunk's last row and that target. An invalid shape turns it off. */
+    void set_consumer(const ConsumerShape& c);
+    /* What the cut ran, over the trunk prefill passes of prompts it cut: those passes, the ones
+     * cut, the ones that shared their step (run in full), and their layer-passes run in full,
+     * key ops alone and skipped. */
+    struct ConsumerStats {
+        uint64_t passes = 0, cut = 0, shared = 0;
+        uint64_t full = 0, key = 0, skipped = 0;
+        /* Passes of a cut prompt off the grid the derivation assumes (a start off the quantum, or
+         * more rows than the budget): the scheduler makes none, so this stays 0 (a warning names
+         * the first). */
+        uint64_t off_grid = 0;
+    };
+    const ConsumerStats& consumer_stats() const { return cs_stats_; }
 
     /* An encoder pass (RadBatch::enc): patches of whole segments of one or more media items,
      * staged into every rank's encoder input, since each rank runs the tower itself. Returns rank
@@ -246,6 +271,8 @@ private:
     static constexpr int kOut = RAD_SCHED_MAX_SPEC + 4;
     struct Out {
         std::vector<std::vector<RadKVGroupBatch>> kv;
+        /* Per rank and group, the RadKVStream a batch names: each rank's own copy, outside the slab. */
+        std::vector<std::vector<RadKVStream>>     stream;
         std::vector<RadBatch>                     batch;
     };
 
@@ -269,6 +296,13 @@ private:
     std::vector<RankIO> ranks_;
 
     int64_t max_tok_ = 0, max_seqs_ = 0, max_ctx_ = 0;
+    /* The consumer skip: the shape, the target `cs_f_` holds the thresholds for (-1: none), and
+     * the counters. */
+    ConsumerShape cs_{};
+    bool          cs_on_ = false;
+    int64_t       cs_end_ = -1;
+    std::vector<int64_t> cs_f_;
+    ConsumerStats cs_stats_;
     /* Per KV group, 0 for a non-conv group. This and `h_convslot` only feed DeriveInput for the
      * `conv_state_index` derivation, which no plugin calls at present; conv kernels read
      * RadKVGroupBatch::state_index instead. Kept per group so the derivation is correct with more

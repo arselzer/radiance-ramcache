@@ -12,8 +12,6 @@
 #include "gen/video_driver.h"
 
 #include "build/startup.h"
-#include "build/tiny_loader.h"
-#include "build/tiny_native_source/source_factory.h"
 #include "build/rad_build.h"
 #include "device/device.h"
 #include "device/directio.h"
@@ -23,6 +21,13 @@
 #include "format/table_copy.h"
 #include "rad_plugin.h"
 #include "mem/vram_budget.h"
+#include "place/expert_profile_map.h"
+#include "place/native_decode_profile.h"
+#include "place/plane_mirror.h"
+#include "place/dspark_native_scope.h"
+#include "place/dspark_draft_control_scope.h"
+#include "kvstream/bringup.h"
+#include "kvstream/plan.h"
 #include "runtime/arena.h"
 #include "runtime/kvbind.h"
 #include "runtime/xprefetch.h"
@@ -37,6 +42,7 @@
 
 #include <cstring>
 #include <fstream>
+#include <numeric>
 #include <sstream>
 #include <cstdint>
 #include <cstdlib>
@@ -53,8 +59,7 @@
 #include <memory>
 #include <mutex>
 #include <chrono>
-#include <new>
-#include <system_error>
+#include <cstdio>
 
 namespace rad {
 
@@ -333,14 +338,13 @@ static void memory_cgroups(const std::function<bool(const std::string&, int64_t)
     }
 }
 
-/* Whether `need` more bytes fit in host memory after `still` more this process will allocate
- * first and `margin` (--host-headroom-mib) stays free, or why not. Checks MemAvailable; every
- * memory cgroup from the process's own up to the visible root (Docker's --memory, enforced by
- * the OOM killer); and, for an mlock()ed copy (`mlocks`), RLIMIT_MEMLOCK unless the process has
- * CAP_IPC_LOCK. Pinned memory a card reads is a driver userptr mapping, which RLIMIT_MEMLOCK
- * does not count. An unreadable limit is ignored, never guessed. */
-static bool lockable_room(int64_t need, int64_t still, int64_t margin, bool mlocks,
-                          std::string* why) {
+/* See engine_hostmem.h. */
+bool lockable_room(int64_t need, int64_t still, int64_t margin, bool mlocks,
+                   std::string* why) {
+    if (need < 0 || still < 0 || margin < 0) {
+        *why = "negative host allocation or reserve";
+        return false;
+    }
     long long locked_kb = 0;
     unsigned long long caps = 0;
     {
@@ -353,14 +357,14 @@ static bool lockable_room(int64_t need, int64_t still, int64_t margin, bool mloc
     }
     struct rlimit rl {};
     if (mlocks && !((caps >> 14) & 1) && ::getrlimit(RLIMIT_MEMLOCK, &rl) == 0 &&
-        rl.rlim_cur != RLIM_INFINITY && (int64_t)rl.rlim_cur < locked_kb * 1024 + need) {
+        rl.rlim_cur != RLIM_INFINITY && (__int128)rl.rlim_cur < (__int128)locked_kb * 1024 + need) {
         *why = fmt("RLIMIT_MEMLOCK allows %s locked and the copy locks %s (Docker: --ulimit "
                    "memlock=-1; systemd: LimitMEMLOCK=infinity)", humanb((int64_t)rl.rlim_cur).c_str(),
                    humanb(need).c_str());
         return false;
     }
     if (const int64_t avail = meminfo_bytes("MemAvailable");
-        avail >= 0 && avail - still - margin < need) {
+        avail >= 0 && (__int128)avail - still - margin < need) {
         *why = fmt("%s of memory is available, %s more is still to be allocated (the pinned host "
                    "pools, the prefix cache's host tier, the checkpoint slots and the host "
                    "activation arenas), and this wants %s with %s to spare "
@@ -371,7 +375,7 @@ static bool lockable_room(int64_t need, int64_t still, int64_t margin, bool mloc
     }
     bool fits = true;
     memory_cgroups([&](const std::string& dir, int64_t room) {
-        if (room - still - margin >= need) return true;
+        if ((__int128)room - still - margin >= need) return true;
         *why = fmt("the memory cgroup at %s leaves %s, %s more is still to be allocated, "
                    "and this wants %s with %s to spare (--host-headroom-mib)", dir.c_str(),
                    humanb(room).c_str(), humanb(still).c_str(), humanb(need).c_str(),
@@ -385,16 +389,21 @@ static bool lockable_room(int64_t need, int64_t still, int64_t margin, bool mloc
 /* The most lockable_room(need, still, margin, false) admits, and in `limit` the bound that
  * decides it. INT64_MAX when no limit can be read. */
 static int64_t lockable_bytes(int64_t still, int64_t margin, std::string* limit) {
+    if (still < 0 || margin < 0) { *limit = "negative host allocation or reserve"; return 0; }
+    auto remaining = [&](int64_t room) {
+        const __int128 left = (__int128)room - still - margin;
+        return left <= 0 ? int64_t{0} : left >= INT64_MAX ? int64_t{INT64_MAX} : (int64_t)left;
+    };
     int64_t most = INT64_MAX;
     *limit = "no readable memory limit";
     if (const int64_t avail = meminfo_bytes("MemAvailable"); avail >= 0) {
-        most = avail - still - margin;
+        most = remaining(avail);
         *limit = fmt("%s of memory available, less %s still to be allocated and %s to spare",
                      humanb(avail).c_str(), humanb(still).c_str(), humanb(margin).c_str());
     }
     memory_cgroups([&](const std::string& dir, int64_t room) {
-        if (room - still - margin < most) {
-            most = room - still - margin;
+        if (remaining(room) < most) {
+            most = remaining(room);
             *limit = fmt("the memory cgroup at %s, which leaves %s, less %s still to be allocated "
                          "and %s to spare", dir.c_str(), humanb(room).c_str(),
                          humanb(still).c_str(), humanb(margin).c_str());
@@ -407,8 +416,9 @@ static int64_t lockable_bytes(int64_t still, int64_t margin, std::string* limit)
 /* The copy is table_copy_make's (core/format/table_copy.h), or for a card, table_copy_fill into
  * pinned memory every card maps (rad_dev_alloc RAD_MEM_HOST_MAPPED, locked in pieces). One copy
  * per container address, shared by every rank; freed in ~Engine. */
-int Engine::copy_table(const uint8_t* src, int64_t n, int64_t foff, bool card, void** out,
+int Engine::copy_table(const RadFile& owner,const uint8_t* src, int64_t n, int64_t foff, bool card, void** out,
                        std::string* why) {
+    if(source_banks_&&!source_banks_->same_epoch())return RAD_E_STATE;
     for (const auto& c : table_copy_of_)
         if (c.first == src) { *out = c.second; return RAD_OK; }
     const auto t0 = std::chrono::steady_clock::now();
@@ -419,7 +429,7 @@ int Engine::copy_table(const uint8_t* src, int64_t n, int64_t foff, bool card, v
             *why = fmt("pinning %s: %s", humanb(n).c_str(), rad_dev_last_error());
             return RAD_E_NOMEM;
         }
-        const int rc = table_copy_fill(*file_, src, n, foff, static_cast<uint8_t*>(base), why);
+        const int rc = table_copy_fill(owner, src, n, foff, static_cast<uint8_t*>(base), why);
         if (rc != RAD_OK) {
             rad_dev_free(base, RAD_MEM_HOST_MAPPED);
             return rc;
@@ -427,7 +437,7 @@ int Engine::copy_table(const uint8_t* src, int64_t n, int64_t foff, bool card, v
         card_copies_.push_back(base);
     } else {
         TableCopy tc;
-        const int rc = table_copy_make(*file_, src, n, foff, &tc, why);
+        const int rc = table_copy_make(owner, src, n, foff, &tc, why);
         if (rc != RAD_OK) return rc;
         table_copies_.push_back(tc);
         base = tc.base;
@@ -435,6 +445,7 @@ int Engine::copy_table(const uint8_t* src, int64_t n, int64_t foff, bool card, v
     RAD_INFO("placement: n-gram table copied into %s, %s in %.1f s",
              card ? "pinned memory the cards read" : "locked memory", humanb(n).c_str(),
              std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    if(source_banks_&&!source_banks_->same_epoch())return RAD_E_STATE;
     table_copy_of_.push_back({ src, base });
     *out = base;
     return RAD_OK;
@@ -716,28 +727,39 @@ bool is_container(const std::string& path) {
 
 }  /* namespace */
 
-Checkpoint* Engine::checkpoint_view() const {
-    return tiny_&&tiny_->binding?&tiny_->binding->checkpoint():ckpt_.get();
-}
-const CkptWeight* Engine::checkpoint_find(const std::string& name) const {
-    return tiny_&&tiny_->binding?tiny_->binding->find(name):(ckpt_src_?ckpt_src_->find(name):nullptr);
-}
-std::string Engine::checkpoint_missing(const std::string& name) const {
-    return tiny_&&tiny_->binding?tiny_->binding->missing(name):(ckpt_src_?ckpt_src_->missing(name):std::string());
-}
-std::vector<std::string> Engine::checkpoint_refused() const {
-    return tiny_&&tiny_->binding?tiny_->binding->refused():(ckpt_src_?ckpt_src_->refused():std::vector<std::string>());
+const RadFileEntry* Engine::source_entry(const std::string& name) const {
+    if(source_banks_){DsparkRadBanks::Entry ref;return source_banks_->find(name,&ref)==RAD_OK?ref.entry:nullptr;}
+    return file_?file_->find(name):nullptr;
 }
 WeightSourceFn Engine::sources() const {
-    if(tiny_&&tiny_->binding)return tiny_->binding->source_fn();
+    if (source_banks_) return source_banks_->sources();
     if (file_) return rad_container_sources(*file_);
     return ckpt_src_ ? ckpt_src_->fn() : WeightSourceFn{};
 }
 
 int Engine::read_metadata() {
-    if (!is_container(cfg_.model)) return read_checkpoint_metadata();
+    if(cfg_.draft_bank_expert_placement=="host"&&cfg_.draft_bank.empty()){
+        RAD_ERR("--draft-bank-expert-placement host requires --draft-bank");return RAD_E_INVAL;
+    }
+    if (!is_container(cfg_.model)) {
+        if(!cfg_.draft_bank.empty()){RAD_ERR("--draft-bank requires an ordinary canonical .rad");return RAD_E_INVAL;}
+        return read_checkpoint_metadata();
+    }
     file_ = std::make_unique<RadFile>();
     RAD_TRY(file_->open(cfg_.model.c_str()));
+    if(!cfg_.draft_bank.empty()){
+        const char* opt=std::getenv("RADIANCE_EXPERIMENTAL_DS41_DSPARK_RAD_BANK");
+        if(!opt||std::strcmp(opt,"1")||cfg_.tp!=4||cfg_.max_seqs!=1||cfg_.max_tok<5||cfg_.n_spec!=5||cfg_.spec_ngram!=0||cfg_.kv_cache_dtype!="bf16"){
+            RAD_ERR("--draft-bank first scope requires opt-in, EP4, one sequence, batch>=5, depth5, lookup0 and BF16 KV");return RAD_E_INVAL;}
+        draft_file_=std::make_unique<RadFile>();RAD_TRY(draft_file_->open(cfg_.draft_bank.c_str()));
+        source_banks_=std::make_unique<DsparkRadBanks>();std::string why;
+        const int st=source_banks_->bind(*file_,draft_file_.get(),&why);
+        if(st<0){RAD_ERR("--draft-bank binding refused: %s",why.c_str());return st;}
+    }
+
+    /* What an earlier run left cached of the container, recorded before anything here allocates,
+     * for the mapped tier's rewarm after the load (RadFile::rewarm). */
+    if (cfg_.mapped_rewarm) {file_->snapshot_resident();if(draft_file_)draft_file_->snapshot_resident();}
 
     const RadFileHeader& h = file_->header();
     meta_ = RadModelMeta{};
@@ -809,17 +831,13 @@ int Engine::read_metadata() {
  * as rad-convert reads it, and its tensors are the weights. Only encodings served as stored are
  * answered (CheckpointSources); weights needing quantisation are refused after declare. */
 int Engine::read_checkpoint_metadata() {
-    if(!tiny_) {
-        ckpt_ = std::make_unique<Checkpoint>();
-        RAD_TRY(ckpt_->open(cfg_.model));
-        ckpt_src_ = std::make_unique<CheckpointSources>(*ckpt_);
-    }
-    Checkpoint* active=checkpoint_view();if(!active)return RAD_E_STATE;
-    const MetaOwn& mo = active->meta();
+    ckpt_ = std::make_unique<Checkpoint>();
+    RAD_TRY(ckpt_->open(cfg_.model));
+    ckpt_src_ = std::make_unique<CheckpointSources>(*ckpt_);
+    const MetaOwn& mo = ckpt_->meta();
     meta_ = mo.m;
     if (!meta_.name || !*meta_.name) meta_.name = meta_.arch_id;
-    const bool tiny_zero=tiny_&&tiny_->binding&&tiny_->binding->permits_zero_head(meta_,build_ctx(0,cfg_.max_tok));
-    if (meta_.n_layers <= 0 || meta_.n_embd <= 0 || (!tiny_zero&&meta_.n_head <= 0) || meta_.n_vocab <= 0) {
+    if (meta_.n_layers <= 0 || meta_.n_embd <= 0 || meta_.n_head <= 0 || meta_.n_vocab <= 0) {
         RAD_ERR("%s: the checkpoint's configuration states no model dimensions (n_layers=%lld "
                 "n_embd=%lld n_head=%lld n_vocab=%lld)", cfg_.model.c_str(),
                 (long long)meta_.n_layers, (long long)meta_.n_embd, (long long)meta_.n_head,
@@ -838,7 +856,7 @@ int Engine::read_checkpoint_metadata() {
     RAD_INFO("model: %s  arch=%s  quant=%s  %lld layers  %lld ctx  (checkpoint, %zu tensors, "
              "served as it stands)", meta_.name, meta_.arch_id,
              meta_.quant && *meta_.quant ? meta_.quant : "bf16", (long long)meta_.n_layers,
-             (long long)meta_.n_ctx_train, active->tensors().size());
+             (long long)meta_.n_ctx_train, ckpt_->tensors().size());
     return RAD_OK;
 }
 
@@ -895,13 +913,13 @@ int Engine::apply_rope_scaling() {
 int Engine::load_plugins() {
     int s = rad_tools_load_plugins(cfg_.radiance_home, cfg_.kernel_hierarchy,
                                    meta_.arch_id, meta_.quant ? meta_.quant : "", &plugins_,
-                                   checkpoint_view() && checkpoint_view()->imports() != Checkpoint::Import::None);
+                                   ckpt_ && ckpt_->imports() != Checkpoint::Import::None);
     if (s < 0) {
         /* rad_tools_load_plugins already logged why. A checkpoint whose quantisation the import
          * refused keeps the tool's descriptor, which no plugin claims; the refusal is the reason. */
-        if (checkpoint_view() && !checkpoint_view()->import_refusal().empty() && plugins_.arch_plugin.empty())
+        if (ckpt_ && !ckpt_->import_refusal().empty() && plugins_.arch_plugin.empty())
             RAD_ERR("quantisation '%s' cannot be imported: %s", meta_.quant ? meta_.quant : "",
-                    checkpoint_view()->import_refusal().c_str());
+                    ckpt_->import_refusal().c_str());
         RAD_ERR("the plugins under %s did not load (above)", cfg_.radiance_home.c_str());
         return s;
     }
@@ -927,8 +945,10 @@ RadBuildCtx Engine::build_ctx(int rank, int64_t max_tok) const {
                 : cfg_.kv_cache_dtype == "k6_v4"  ? RAD_KVQ_K6V4 : RAD_KVQ_NONE;
     bc.attn_prefill_fp8 = cfg_.attn_prefill_fp8;
     bc.tp_attn_rows = cfg_.tp_attn_rows;
+    bc.weight_prefetch_off = cfg_.weight_prefetch ? 0 : 1;
     bc.state_dtype = cfg_.state_cache_dtype == "f16" ? RAD_F16 : 0;
     bc.draft_coupling = cfg_.draft_coupling ? 1 : 0;
+    bc.draft_head_off = cfg_.spec_ngram > 0 ? 1 : 0;
     bc.tp_wire_min_bytes = cfg_.tp_wire_min_kb * 1024;
     bc.scope      = "";
     bc.max_enc_patches = cfg_.mm_max_patches > 0 ? cfg_.mm_max_patches : 0;
@@ -939,35 +959,33 @@ RadBuildCtx Engine::build_ctx(int rank, int64_t max_tok) const {
     /* Under --prefill-span every step but a lone prefill is planned at the shared budget
      * (Scheduler::step), so a wider step is one sequence; 0 without a span. */
     bc.max_mixed_tok = cfg_.prefill_span > 1 ? std::min(max_tok, prefill_shared_tok(cfg_)) : 0;
+    /* --kv-resident in tokens, raised to kStreamFloorTokens as kvstream_ring_shape raises it: the
+     * arch declares kv_resolve's ring depth from this, and the kernel refuses a carve deeper than
+     * the declared table. */
+    bc.kv_resident_blocks = cfg_.kv_resident > 0 && cfg_.kv_resident < kStreamFloorTokens
+                                ? kStreamFloorTokens
+                                : cfg_.kv_resident;
+    /* A streamed-only op is declared only when the architecture streams and the flag asks
+     * (kvstream_op_gated). */
+    bc.kv_stream_ok = arch_probe_.kv_stream_ok;
     /* The control vector, when one is loaded: this rank's view, or null. A plugin reads it at
      * declare only (the direction table never changes); the per-request switch rides the derived
      * mask, not this struct. */
     if (cvec_.loaded() && rank >= 0 && rank < (int) cvec_views_.size() &&
         cvec_views_[(size_t) rank].dir)
         bc.cvec = &cvec_views_[(size_t) rank];
-    if(tiny_) {bc.kv_dtype=0;bc.kv_quant=0;bc.tp_wire_min_bytes=0;}
     return bc;
 }
 
 int Engine::declare() {
-    if(glm_main_)return glm_main_declare();
-    if(tiny_) {
-        if(ranks_.size()!=1||ranks_[0]->index||ranks_[0]->device)return RAD_E_UNSUPPORTED;
-        TinyTicket auxiliary;RAD_TRY(tiny_->budget.take_aux_thread(&auxiliary));
-        int status=RAD_E_STATE;
-        std::thread worker;
-        struct Join {std::thread& worker;~Join(){if(worker.joinable())try{worker.join();}catch(...){tiny_unretired_fail_stop();}}} join{worker};
-        worker=std::thread([&]{try{
-            const int bound=rad_dev_set(0);if(bound<0){status=bound;return;}
-            auto& r=*ranks_[0];const auto context=build_ctx(0,cfg_.max_tok);
-            status=rad_tools_declare(plugins_,meta_,context,&r.program,
-                [this](RadBuilder* b,int64_t width){return declare_sampler(0,b,width);},
-                nullptr,sources(),false,nullptr);
-        }catch(const std::bad_alloc&){status=RAD_E_NOMEM;}catch(...){status=RAD_E_STATE;}});
-        worker.join();
-        if(status<0)return status;
-        if(!checkpoint_refused().empty())return RAD_E_UNSUPPORTED;
-        return RAD_OK;
+    /* An architecture that declares no streamed ops cannot stream, so with --kv-resident set on one
+     * the flag is turned off here, with the decision named, before anything is planned for it. */
+    (void)rad_tools_probe(plugins_, meta_, &arch_probe_);
+    if (cfg_.kv_resident > 0 && arch_probe_.kv_stream_ok == 0) {
+        cfg_.kv_resident = 0;
+        decide("--kv-resident", "0",
+               std::string("architecture '") + (meta_.arch_id ? meta_.arch_id : "?") +
+                   "' has no streamed KV path");
     }
     RAD_TRY(lora_targets());
     /* KL mode measures the trunk (core/kld.h): a drafter writes no scored rows and a prefix hit
@@ -1031,7 +1049,14 @@ int Engine::declare() {
                 decide("--max-model-len", std::to_string(cfg_.max_ctx),
                        "a video generator: a step's rows");
             }
-            if (cfg_.mm_max_patches < 0) cfg_.mm_max_patches = 0;
+            /* A video generator with a vision tower takes a pass of its patches, the size its
+             * plugin states. */
+            if (cfg_.mm_max_patches < 0 && pb.gen_patches > 0) {
+                cfg_.mm_max_patches = pb.gen_patches;
+                decide("--mm-max-patches", std::to_string(cfg_.mm_max_patches),
+                       "a video generator: every reference media patch of one conditioning, "
+                       "the pass size the plugin states");
+            }
             if (cfg_.n_spec < 0) cfg_.n_spec = 0;
             cfg_.prefix_cache = false;
         } else if (pb.gen_rows > 0) {
@@ -1357,8 +1382,8 @@ int Engine::declare() {
     }
     /* Checkpoint weights that cannot be served as stored cannot be loaded; name them all with the
      * remedy. */
-    if (checkpoint_view()) {
-        const std::vector<std::string> no = checkpoint_refused();
+    if (ckpt_src_) {
+        const std::vector<std::string> no = ckpt_src_->refused();
         if (!no.empty()) {
             RAD_ERR("%zu weight(s) of %s are not in a form the engine serves as it stands -- "
                     "nothing is quantised at load. Convert the checkpoint to a container with a "
@@ -1370,6 +1395,16 @@ int Engine::declare() {
         }
     }
     for (size_t i = 0; i < st.size(); ++i) if (st[i] < 0) return st[i];
+    if(source_banks_){
+        std::set<int64_t> consumed;
+        for(auto&r:ranks_){
+            if(!dspark_native_program_scope(r->program)){RAD_ERR("--draft-bank requires the exact native DSpark three-stage declaration");return RAD_E_UNSUPPORTED;}
+            RAD_TRY(source_banks_->bind_weights(r->program.weights,&consumed));
+        }
+        RAD_TRY(source_banks_->finish_coverage(consumed));
+        RAD_INFO("DSpark draft bank: canonical metadata unchanged; %zu donor entries bound across %zu rank declarations",consumed.size(),ranks_.size());
+    }
+
     RAD_INFO("declare: %zu ops, %zu weights, %zu buffers, %zu KV groups",
              ranks_[0]->program.ops.size() - 1, ranks_[0]->program.weights.size() - 1,
              ranks_[0]->program.buffers.size() - 1, ranks_[0]->program.kv_groups.size());
@@ -1380,6 +1415,41 @@ int Engine::declare() {
     drafter_       = p0.drafter;
     drafter_name_  = p0.drafter_name;
     drafter_.name  = drafter_name_.c_str();
+    /* Every rank declared its own drafter, and the engine drives one from rank 0's: they must
+     * agree in everything but the proposal's handle, which indexes each rank's own program (a
+     * plugin may declare different buffers per rank) and is resolved per rank (advance_all). */
+    for (size_t i = 1; i < ranks_.size(); ++i) {
+        const Program& pr = ranks_[i]->program;
+        const RadDrafterDecl& d = pr.drafter;
+        bool same = d.kind == drafter_.kind && d.depth == drafter_.depth && d.block == drafter_.block &&
+                    d.proposal_pitch == drafter_.proposal_pitch && d.mask_token == drafter_.mask_token &&
+                    d.window == drafter_.window && !d.proposal == !drafter_.proposal;
+        if (same && d.proposal) {
+            const RadBufDecl& a = p0.buffers[(size_t)drafter_.proposal].decl;
+            const RadBufDecl& b = pr.buffers[(size_t)d.proposal].decl;
+            same = a.dtype == b.dtype && a.rank == b.rank &&
+                   std::equal(a.shape, a.shape + a.rank, b.shape);
+        }
+        if (!same) {
+            RAD_ERR("rank %zu declared drafter '%s' (kind %d, depth %d, block %lld, proposal %s) unlike "
+                    "rank 0's '%s' (kind %d, depth %d, block %lld, proposal %s); every rank runs the "
+                    "same passes", i, pr.drafter_name.c_str(), d.kind, d.depth, (long long)d.block,
+                    d.proposal ? pr.buffers[(size_t)d.proposal].name.c_str() : "none",
+                    drafter_name_.c_str(), drafter_.kind, drafter_.depth, (long long)drafter_.block,
+                    drafter_.proposal ? p0.buffers[(size_t)drafter_.proposal].name.c_str() : "none");
+            return RAD_E_STATE;
+        }
+    }
+    /* --spec-ngram asked the plugin to leave its head out (RadBuildCtx::draft_head_off). One that
+     * declared it anyway would hold its weights and passes for nothing, so startup stops. */
+    if (cfg_.spec_ngram > 0 && drafter_.kind != RAD_DRAFT_NONE) {
+        RAD_ERR("--spec-ngram %d: the '%s' plugin declared its draft head '%s' although the "
+                "deployment drafts by prompt lookup alone (it does not read "
+                "RadBuildCtx::draft_head_off). Use --num-speculative-tokens N instead: the head "
+                "drafts and prompt lookup fills in for any sequence it declines",
+                cfg_.spec_ngram, plugins_.arch_plugin.c_str(), drafter_name_.c_str());
+        return RAD_E_UNSUPPORTED;
+    }
     if (cfg_.n_spec <= 0) drafter_ = RadDrafterDecl{};
     drafter_short_ = drafter_.kind == RAD_DRAFT_BLOCK && cfg_.draft_short_from > 0
                    ? p0.drafter_short_block : 0;
@@ -1411,8 +1481,18 @@ int Engine::declare() {
                  : fmt("'%s' drafts %d token(s) a step in %d serial pass(es); prompt lookup fills "
                        "in for any sequence it declines",
                        drafter_.name, drafter_.depth, drafter_.depth).c_str());
+    } else if (cfg_.spec_ngram > 0) {
+        RAD_INFO("speculation: prompt lookup only (--spec-ngram %d) -- up to %d draft(s) a step "
+                 "from the latest earlier occurrence of the sequence's last %d..%d tokens; no "
+                 "draft head is declared", cfg_.spec_ngram, cfg_.n_spec, cfg_.spec_ngram_max,
+                 cfg_.spec_ngram_min);
+        decide("--spec-ngram", std::to_string(cfg_.spec_ngram),
+               fmt("prompt lookup alone, patterns of %d..%d tokens, longest first; the "
+                   "container's draft head (if any) is not declared",
+                   cfg_.spec_ngram_max, cfg_.spec_ngram_min));
     } else if (cfg_.n_spec > 0) {
-        RAD_INFO("speculation: prompt lookup only -- this container declares no draft head");
+        RAD_INFO("speculation: prompt lookup only -- this container declares no draft head "
+                 "(patterns of %d..%d tokens)", cfg_.spec_ngram_max, cfg_.spec_ngram_min);
     }
     probe_arena_levels();
     return RAD_OK;
@@ -1542,6 +1622,42 @@ static int declare_ring_windows(KVManager& kv, const Program& prog) {
 }
 
 int Engine::plan() {
+    /* The plane mirror's options, before any rank's stager asks for the mirror. */
+    PlaneMirror::configure({ cfg_.expert_plane_mirror, cfg_.expert_plane_mirror_share,
+                             (int)cfg_.expert_plane_mirror_min_rows,
+                             cfg_.expert_plane_mirror_decode_share });
+    // The external DECODE vector owns its rows until every rank's Planner has consumed them.
+    NativeDecodeProfile decode_profile;
+    const bool native_profile = meta_.arch_id && !std::strcmp(meta_.arch_id, "deepseek41");
+    if (!cfg_.expert_profile.empty() && native_profile) {
+        if (!file_ || cfg_.tp != 4 || ranks_.size() != 4 || !meta_.arch_id ||
+            std::strcmp(meta_.arch_id, "deepseek41") || meta_.n_layers != 40 ||
+            meta_.n_embd != 5120 || meta_.n_expert != 384 || meta_.n_expert_used != 6) {
+            RAD_ERR("--expert-profile initially supports only native DeepSeek4.1 Flash EP4");
+            return RAD_E_UNSUPPORTED;
+        }
+        for (const auto& rank : ranks_)
+            if (rank->program.ctx.world_size != 4 || !native_decode_profile_geometry(rank->program.weights)) {
+                RAD_ERR("--expert-profile: unsupported native GU/DN layout or local EP geometry");
+                return RAD_E_UNSUPPORTED;
+            }
+        NativeProfileIdentity identity;
+        RAD_TRY(native_profile_identity(*file_, &identity));
+        std::string reason;
+        const int profile_status = read_native_decode_profile(cfg_.expert_profile, identity, &decode_profile, &reason);
+        if (profile_status < 0) {
+            RAD_ERR("--expert-profile '%s' refused: %s", cfg_.expert_profile.c_str(), reason.c_str());
+            return profile_status;
+        }
+        RAD_INFO("expert profile: phase=decode, %llu tokens, %zu global rows (%llu nonzero); "
+                 "source metadata %s; placement ranking only, no weight/precision change",
+                 (unsigned long long)decode_profile.decode_tokens, decode_profile.rows.size(),
+                 (unsigned long long)decode_profile.nonzero_rows, identity.metadata_sha256.c_str());
+    }
+    if (!cfg_.expert_profile.empty() && !native_profile) {
+        int32_t trunk = -1;
+        RAD_TRY(xs_profile_load(cfg_.expert_profile, &expert_profile_, &trunk));
+    }
     /* The budget is resolved once, for every rank, before any rank allocates. vram_budget_resolve
      * folds the smallest capacity with the largest program so one split fits every card, and
      * writes it into Config; per-rank resolution would let rank 1 measure a card rank 0 already
@@ -1630,6 +1746,18 @@ int Engine::plan() {
             if (declare_ring_windows(probe, r->program) == RAD_OK &&
                 probe.plan_groups(r->program.kv_groups, cfg_) == RAD_OK) {
                 ck_slot += probe.checkpoint_bytes();
+                /* The budget must see the streamed plan before it sizes the pool: a streamed group's
+                 * ceiling is max(ring, one layer of its context), not its whole cache
+                 * (docs/KV-STREAMING.md §4.1). */
+                RAD_TRY(kvstream_cap_probe(probe, cfg_, r->program, ctx));
+                /* No prefix-cache entry holding a streamed group can be demoted (its mirror is its only
+                 * cold copy), so the host tier would be pinned and never used: turned off before
+                 * the tables and the checkpoint store are sized. */
+                if (const int64_t off = kvstream_prefix_host_off(cfg_)) {
+                    RAD_INFO("a streamed KV group has no host cache: --prefix-cache-mib %lld is off, "
+                             "since no entry holding the group could be demoted",
+                             (long long)off);
+                }
                 f.kv_ceiling = probe.ceiling(ctx);
                 f.kv_fixed   = probe.fixed_bytes();
                 /* One --max-model-len sequence's pool, as the inverse of the real plan: its
@@ -1658,16 +1786,21 @@ int Engine::plan() {
             int64_t lazy = r->program.scratch_regions > 1 ? f.queue_bytes : 0;
             /* The KV tiers' copy staging, built by TierExec::device_init on the first copy out.
              * The cached groups are settled later, so every paged group is counted (an upper
-             * bound). */
+             * bound), each with the blocks an entry at the lcm of their block sizes holds
+             * (PrefixCache::entry_groups). */
             if (cfg_.prefix_cache_mib > 0) {
                 int64_t entry = 0, bs = 0;
                 int ng = 0;
                 for (size_t g = 0; g < r->program.kv_groups.size(); ++g) {
                     const KVGroupPlan* p = probe.plan((int32_t)g);
-                    if (!p || !p->paged() || p->bytes_per_block <= 0) continue;
-                    entry += p->bytes_per_block;
-                    bs = bs > 0 ? std::min<int64_t>(bs, p->block_size) : p->block_size;
-                    ++ng;
+                    if (!p || !p->paged() || p->bytes_per_block <= 0 || p->block_size <= 0) continue;
+                    bs = bs > 0 ? std::lcm<int64_t>(bs, p->block_size) : p->block_size;
+                }
+                for (size_t g = 0; g < r->program.kv_groups.size() && bs > 0; ++g) {
+                    const KVGroupPlan* p = probe.plan((int32_t)g);
+                    if (!p || !p->paged() || p->bytes_per_block <= 0 || p->block_size <= 0) continue;
+                    entry += p->bytes_per_block * (bs / p->block_size);
+                    ng += (int)(bs / p->block_size);
                 }
                 const int64_t tier = TierExec::device_bytes(entry, ng, TierExec::sizes(entry, ctx, bs));
                 f.staging += tier;
@@ -1701,6 +1834,58 @@ int Engine::plan() {
         for (VramFacts& f : facts) f.held_out = cvec_bytes;
         RAD_TRY(resolve_table_placement(facts, emb_bytes, wfs, kv_floor, ngram_bytes,
                                         ngram_device, ngram_host, ck_store + host_arenas));
+        /* --draft-expert-placement host: the drafter's experts are pinned in the host pool before
+         * the strategy runs, so they are not part of the elastic plane the card must hold and the
+         * pool must have room for them on top of the trunk's spill. Growing the pool here, before
+         * the split, is what lets a drafter fit beside a trunk that already fills the card. */
+        if (cfg_.draft_expert_placement == "host") {
+            const int64_t MiB = (int64_t)1 << 20;
+            int64_t draft_max = 0;
+            for (const WeightFootprint& wf : wfs) draft_max = std::max(draft_max, wf.draft_experts);
+            if (draft_max == 0 && cfg_.draft_expert_placement_given) {
+                RAD_ERR("--draft-expert-placement host: this model declares no draft head with "
+                        "routed experts");
+                return RAD_E_INVAL;
+            }
+            if (draft_max > 0) {
+                /* The pool must hold the drafter on top of the trunk's own spill, so it grows by
+                 * the drafter's bytes and the floor is recomputed against that larger room with
+                 * the drafter taken out of the plane the card places. */
+                const int64_t add = (align_up(draft_max, MiB) + MiB - 1) / MiB;
+                cfg_.host_pool_mib += add;
+                for (size_t i = 0; i < facts.size(); ++i) {
+                    int64_t room = cfg_.host_pool_mib * MiB;
+                    if (cfg_.weights_disk_tier)
+                        room -= file_stage_reserve(wfs[i].layer_unit_max, wfs[i].routed);
+                    facts[i].expert_floor = expert_vram_floor_draft_hosted(
+                        wfs[i], std::max<int64_t>(room - align_up(wfs[i].draft_experts, MiB), 0));
+                    facts[i].experts = std::max<int64_t>(wfs[i].experts - wfs[i].draft_experts, 0);
+                }
+                RAD_INFO("placement: --draft-expert-placement host pins %s of drafter experts a "
+                         "rank in the host pool; --host-pool-mib grows by %lld to hold them, and "
+                         "the card places only the trunk's experts",
+                         humanb(draft_max).c_str(), (long long)add);
+            }
+        }
+        if (cfg_.expert_ram_cache_total_mib > 0) {
+            /* Always check the joint future HOST allocation, even with all optional RAM tables
+             * and checkpoint storage off. Conditional table checks alone can skip every memory
+             * probe. host_headroom_bytes reserves both the configured cache and system margin. */
+            const int64_t MiB = (int64_t)1 << 20;
+            const __int128 pool_mib = (__int128)cfg_.host_pool_mib +
+                                       cfg_.embedding_host_mib + cfg_.tower_host_mib;
+            __int128 pending = pool_mib * cfg_.tp * MiB +
+                               (__int128)cfg_.prefix_cache_mib * MiB + ck_store + host_arenas;
+            if (cfg_.ngram_resolved == TablePlacement::Ram) pending += ngram_bytes;
+            if (cfg_.tp <= 0 || pending < 0 || pending > INT64_MAX) return RAD_E_INVAL;
+            std::string cache_room_why;
+            if (!lockable_room((int64_t)pending, 0, host_headroom_bytes(), false,
+                               &cache_room_why)) {
+                RAD_ERR("native expert RAM cache: cache, remaining host allocations and "
+                        "--host-headroom-mib do not fit: %s", cache_room_why.c_str());
+                return RAD_E_NOMEM;
+            }
+        }
         /* The n-gram table was counted off the card; on it, every rank holds the whole table. */
         if (cfg_.ngram_resolved == TablePlacement::Vram)
             for (VramFacts& f : facts) f.statics += ngram_bytes;
@@ -1845,17 +2030,142 @@ int Engine::plan() {
         in.config     = &rc;
         in.rank       = r->index;
         in.world_size = cfg_.tp;
-        if (file_ && file_->header().prof_count) {
-            in.profile   = file_->profile();
+        std::vector<RadFileProfile> rank_profile;
+        if (!decode_profile.rows.empty()) {
+            in.profile = decode_profile.rows.data();
+            in.n_profile = (int64_t)decode_profile.rows.size();
+        } else if (file_ && file_->header().prof_count) {
+            in.profile = file_->profile();
             in.n_profile = (int64_t)file_->header().prof_count;
+        }
+        if (!expert_profile_.empty()) {
+            in.profile = expert_profile_.data();
+            in.n_profile = (int64_t)expert_profile_.size();
+        }
+        // DeepSeek EP movement groups are local; container/profile expert keys are global.
+        // The tested adapter resolves every GU/DN contributor through WeightInfo.source.
+        if (in.n_profile && file_ && meta_.arch_id && !std::strcmp(meta_.arch_id, "deepseek41")) {
+            const auto mapped = local_expert_profile(r->program.weights,
+                [&](const std::string& source) { return source_entry(source); },
+                in.profile, in.n_profile, meta_.n_layers, meta_.n_expert, &rank_profile);
+            if (mapped != ExpertProfileMapStatus::Complete ||
+                (!decode_profile.rows.empty() && rank_profile.size() != 40 * 96)) {
+                RAD_ERR("rank %d: expert profile source-key mapping refused: %s (%zu rows)",
+                        r->index, expert_profile_map_status(mapped), rank_profile.size());
+                return mapped == ExpertProfileMapStatus::NoMemory ? RAD_E_NOMEM : RAD_E_FORMAT;
+            }
+            in.profile = rank_profile.empty() ? nullptr : rank_profile.data();
+            in.n_profile = (int64_t)rank_profile.size();
+            if (!decode_profile.rows.empty())
+                RAD_INFO("expert profile: rank %d source-mapped %zu/3840 rows, phase=decode; "
+                         "per-rank shares are not renormalized", r->index, rank_profile.size());
         }
         in.container = file_ != nullptr;
         in.host_backend = device_is_host();
+        in.file_relayout = true;    /* the mover relays on the read (Mover::set_file_relayout) */
+        /* RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED (place/vram_packed.h): the weights the card can hold in the
+         * packed-scale form, and the scan the expert fill asks for before it charges a resident so: the
+         * weight's scales from the container, one read each. */
+        std::vector<VramPackWeight> vpk;
+        std::vector<uint8_t> vpk_buf;
+        if (vram_pack_cfg_.on) {
+            std::string why;
+            if (!file_ || source_banks_)
+                why = "the experts are not read from one container (a checkpoint, or a DSpark bank)";
+            else
+                vram_pack_eligible(r->program, *file_, vram_pack_cfg_, &vpk, &why);
+            int64_t n_ok = 0;
+            for (const VramPackWeight& v : vpk) n_ok += v.bytes > 0;
+            if (r->index == 0 || !why.empty())
+                RAD_INFO("VRAM packed experts: rank %d: %lld routed weights can be held packed%s%s", r->index,
+                         (long long)n_ok, why.empty() ? "" : "; ", why.c_str());
+            if (n_ok > 0)
+                in.vram_pack = [&](rad_weight w, bool scan, int32_t* cap, int32_t* raw) -> int64_t {
+                    return vram_pack_query(*file_, vpk, w, scan, cap, raw, &vpk_buf);
+                };
+        }
         Planner planner(in);
         s = planner.plan(&r->plan);
         if (cfg_.debug_placement || s < 0)
             fputs(r->plan.report(r->program).c_str(), stderr);
         if (s < 0) return s;
+        if (vram_pack_cfg_.on) {
+            const Plan::VramPacked& vp = r->plan.vram_packed;
+            RAD_INFO("VRAM packed experts: rank %d holds %lld static residents in the packed-scale form (%lld gate_up "
+                     "and %lld down weights): %s where block_mxfp4 takes %s; %lld eligible weights over their "
+                     "raw-round budget stay block_mxfp4; %lld weights' scales read in %.2f s to decide (%lld "
+                     "unreadable, kept block_mxfp4); raw rounds %lld in all, at most %lld in a weight%s",
+                     r->index, (long long)vp.units, (long long)vp.gate_up, (long long)vp.down,
+                     humanb(vp.bytes).c_str(), humanb(vp.block_bytes).c_str(), (long long)vp.over_budget,
+                     (long long)vp.scanned, vp.scan_s, (long long)vp.scan_failed, (long long)vp.raw_rounds,
+                     (long long)vp.raw_max,
+                     r->plan.dynamic ? " (a dynamic plan packs nothing: give --deterministic)" : "");
+        }
+        if (!decode_profile.rows.empty()) {
+            size_t vram_units = 0, pinned_units = 0, disk_units = 0;
+            double vram_mass = 0, pinned_mass = 0, disk_mass = 0;
+            for (const auto& unit : r->plan.units) {
+                if (unit.expert < 0 || unit.layer < 0 || unit.layer >= 40) continue;
+                if (unit.tier == Tier::VRAM) { ++vram_units; vram_mass += unit.profile_share; }
+                else if (unit.tier == Tier::HostPinned || unit.tier == Tier::HostPageable) {
+                    ++pinned_units; pinned_mass += unit.profile_share;
+                } else if (unit.tier == Tier::SSD) { ++disk_units; disk_mass += unit.profile_share; }
+            }
+            RAD_INFO("expert profile: rank %d planned units VRAM=%zu pinned=%zu SSD=%zu; "
+                     "decode calibration mass %.6f/%.6f/%.6f; two file buffers %s; "
+                     "calibration coverage is not held-out performance",
+                     r->index, vram_units, pinned_units, disk_units, vram_mass, pinned_mass,
+                     disk_mass, humanb(r->plan.file_stage_vram).c_str());
+        }
+        // Diagnostic only: the global-id counts can be joined to this INITIAL placement.
+        // No table, pointer, placement decision or GPU operation is changed here.
+        if (!cfg_.expert_stats.empty() && file_ && cfg_.tp == 4 && ranks_.size() == 4 &&
+            meta_.arch_id && !std::strcmp(meta_.arch_id, "deepseek41") && meta_.n_layers == 40 &&
+            meta_.n_expert == 384 && meta_.n_expert_used == 6 &&
+            native_decode_profile_geometry(r->program.weights)) {
+            struct PlacementIds { std::vector<int> vram, pinned, disk; };
+            std::array<PlacementIds, 40> ids;
+            std::array<std::array<bool, 96>, 40> local_seen{};
+            std::array<std::array<bool, 384>, 40> global_seen{};
+            bool valid = true;
+            for (const auto& unit : r->plan.units) {
+                if (unit.expert < 0 || unit.layer < 0 || unit.layer >= 40) continue;
+                if (unit.expert >= 96 || local_seen[(size_t)unit.layer][(size_t)unit.expert]) { valid = false; break; }
+                int global = -1;
+                for (const auto weight : unit.weights) {
+                    if (weight <= 0 || (size_t)weight >= r->program.weights.size()) { valid = false; break; }
+                    const auto& wi = r->program.weights[(size_t)weight];
+                    const auto* entry = source_entry(wi.source);
+                    if (!entry || entry->layer != unit.layer || entry->expert < 0 || entry->expert >= 384 ||
+                        (global >= 0 && global != entry->expert)) { valid = false; break; }
+                    global = entry->expert;
+                }
+                if (!valid || global < 0 || global_seen[(size_t)unit.layer][(size_t)global]) { valid = false; break; }
+                local_seen[(size_t)unit.layer][(size_t)unit.expert] = true;
+                global_seen[(size_t)unit.layer][(size_t)global] = true;
+                auto& row = ids[(size_t)unit.layer];
+                if (unit.tier == Tier::VRAM) row.vram.push_back(global);
+                else if (unit.tier == Tier::HostPinned || unit.tier == Tier::HostPageable) row.pinned.push_back(global);
+                else if (unit.tier == Tier::SSD) row.disk.push_back(global);
+                else { valid = false; break; }
+            }
+            for (const auto& layer : local_seen) for (bool present : layer) valid = valid && present;
+            if (valid) {
+                const auto render = [](std::vector<int>& values) {
+                    std::sort(values.begin(), values.end()); std::string result = "[";
+                    for (size_t i = 0; i < values.size(); ++i) {
+                        if (i) result += ','; result += std::to_string(values[i]);
+                    }
+                    return result + ']';
+                };
+                for (size_t layer = 0; layer < ids.size(); ++layer) {
+                    auto& row = ids[layer];
+                    RAD_INFO("EXPERT_PLACEMENT v=1 rank=%d layer=%zu static=%d ids=source-global "
+                             "vram=%s pinned=%s ssd=%s", r->index, layer, r->plan.dynamic ? 0 : 1,
+                             render(row.vram).c_str(), render(row.pinned).c_str(), render(row.disk).c_str());
+                }
+            } else RAD_WARN("expert placement ids unavailable for rank %d: inconsistent source/local units", r->index);
+        }
         /* The planner's slab must match the weights pool the mover fills. */
         RAD_TRY(plan_check_weights_pool(r->plan, r->pools.weights().bytes()));
         if (r->index == 0) {
@@ -1870,7 +2180,8 @@ int Engine::plan() {
                        humanb(r->plan.totals.bytes[(int)Tier::Mapped]).c_str()),
                    r->plan.forced_host_used > 0
                        ? fmt("the host pool holds the %s the placement flags put there (the token "
-                             "embedding, the encoder towers) beside the weights placed in it",
+                             "embedding, the encoder towers, the drafter's experts) beside the "
+                             "weights placed in it",
                              humanb(r->plan.forced_host_used).c_str())
                        : std::string());
         }
@@ -1914,10 +2225,10 @@ struct LoadRun {
 /* ================================================================== the relayout pool
  *
  * Weights the loader must rearrange (spec §4.3): the resolved kernel stores something other than
- * the canonical planes (a fragment order, a per-row scale tail), or the declaration widens bf16 to
- * f32. The sweep copies the weight's planes into a host input; once all bytes arrive, a worker
- * produces the stored form, directly into its host pool slot or, for VRAM, through the worker's
- * pinned bounce buffers.
+ * the canonical planes (a fragment order, a per-row scale tail), or the declaration converts bf16
+ * to f32, or f32 to bf16. The sweep copies the weight's planes into a host input; once all bytes
+ * arrive, a worker produces the stored form, directly into its host pool slot or, for VRAM,
+ * through the worker's pinned bounce buffers.
  *
  * It must keep pace with the disk (Qwen3.8-27B-FP8 rearranges 24 GiB of 29 per load; one thread
  * runs at a fraction of 7 GB/s), so it is a thread pool and the sweep only reads. The copies out
@@ -1933,6 +2244,10 @@ struct StagedWeight {
     int      device = 0;
     uint8_t* dst = nullptr;     /* where the stored form goes */
     bool     dev = false;       /* ...in device memory */
+    /* RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED: the packed-scale form goes there instead, `pk_bytes` long with
+     * room for `pk_cap` raw rounds (place/vram_packed.h); 0 for the stored form. */
+    int64_t  pk_bytes = 0;
+    int32_t  pk_cap = -1;
     int64_t  in_bytes = 0;
     int64_t  plane_off[RAD_ENC_MAX_PLANES] = {0};
     int64_t  remaining = 0;     /* bytes the sweep has yet to deliver */
@@ -1942,14 +2257,12 @@ struct StagedWeight {
     /* A checkpoint weight has no sweep: the worker fills its input from the mapped tensors
      * itself, so reads run on all workers in parallel. */
     std::function<int(uint8_t* in)> fill;
-    int (*tiny_fill)(void*,uint8_t*,int64_t) = nullptr;
-    void* tiny_context = nullptr;
 };
 
 class RelayoutPool {
 public:
-    explicit RelayoutPool(std::vector<StagedWeight>& items,bool tiny=false)
-        : items_(items), once_(tiny?nullptr:new std::once_flag[items.size()]) {}
+    explicit RelayoutPool(std::vector<StagedWeight>& items)
+        : items_(items), once_(new std::once_flag[items.size()]) {}
     ~RelayoutPool() {
         finish();
         for (StagedWeight& s : items_) if (s.own) delete[] s.in;
@@ -1974,53 +2287,6 @@ public:
         n_uplinks_ = devs;
         for (int t = 0; t < threads; ++t) threads_.emplace_back([this] { worker(); });
     }
-
-    /* Tiny mode is reachable only through the bounded manual seam below. Its
-     * worker states are owned by this Pool, not by worker stacks. */
-    int start_tiny(TinyBudget& budget, const TinyLoaderQuote& quote,
-                   TinyLoaderFault fault, TinyLoaderReceipt* receipt) {
-        tiny_=true; tiny_budget_=&budget; tiny_receipt_=receipt; tiny_fault_=fault;
-        budget_=1048576;
-        int st=RAD_OK;
-        try {
-            uplinks_.reset(new Uplink[1]);n_uplinks_=1;
-            region_=(uint8_t*)::mmap(nullptr,(size_t)budget_,PROT_READ|PROT_WRITE,
-                                     MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
-            if(region_==MAP_FAILED){region_=nullptr;return latch(RAD_E_NOMEM);}
-            int64_t off=0;
-            for(auto& item:items_) {
-                item.in=region_+off;item.reserved=true;
-                off+=align_up(item.in_bytes,kHole);
-            }
-            tiny_receipt_->input_pages=(uint64_t)off;
-            tiny_receipt_->category_bytes=quote.page_upper;
-            // Allocate both Bounce owners before even the first worker starts.
-            for(int t=0;t<2;++t) {
-                tiny_workers_[t].reset(new Bounce(uplinks_.get(),this));
-                st=tiny_workers_[t]->prepare_tiny();if(st<0)return latch(st);
-            }
-            threads_.reserve(2);
-            for(int t=0;t<2;++t) {
-                st=budget.take_aux_thread(&tiny_thread_tickets_[t]);if(st<0)return latch(st);
-                if(t==1 && fault_once(TinyLoaderFault::BeforeSecondWorker))return latch(RAD_E_STATE);
-                threads_.emplace_back([this,t]{worker_body(*tiny_workers_[t],true);});
-                ++tiny_receipt_->workers_started;
-            }
-            return RAD_OK;
-        } catch(const std::bad_alloc&) {return latch(RAD_E_NOMEM);}
-          catch(const std::system_error&) {return latch(RAD_E_STATE);}
-    }
-    void queue_tiny() {
-        std::lock_guard<std::mutex> lk(mu_);
-        if(failed_)return;
-        // Fixed ring: no deque allocation from any tiny worker or producer.
-        for(size_t i=0;i<items_.size();++i) {
-            tiny_queue_[tiny_tail_++]=(int)i;held_+=items_[i].in_bytes;pending_+=items_[i].in_bytes;
-        }
-        peak_=held_;
-        work_.notify_all();
-    }
-    static int quote_tiny(const TinyLoadJob* jobs,size_t count,TinyLoaderQuote* out);
 
     /* Sweep thread: reserve budget for a staged weight's input when a run first reaches it. Only
      * the accounting happens here; input() allocates on a worker, because an mmap this size
@@ -2075,35 +2341,14 @@ public:
             done_ = true;
         }
         work_.notify_all();
-        for (std::thread& t : threads_) {
-            if(t.joinable()) {t.join();if(tiny_)++tiny_receipt_->workers_joined;}
-        }
+        for (std::thread& t : threads_) t.join();
         threads_.clear();
-        if(tiny_)stop_submissions();
-        if(tiny_ && !tiny_retired_) {
-            // Even a failed copy or event record may have enqueued work. Both
-            // complete Bounce owners remain alive through this REAL drain.
-            tiny_receipt_->live_bounces_at_final_drain=
-                (tiny_workers_[0]?1:0)+(tiny_workers_[1]?1:0);
-            for(int d=0;d<n_uplinks_;++d)if(uplinks_[(size_t)d].st) {
-                tiny_drain_or_fail(uplinks_[(size_t)d].st,d);
-                ++tiny_receipt_->real_uplink_drains;
-            }
-            for(auto& b:tiny_workers_)if(b)b->retired_tiny();
-            tiny_retired_=true;tiny_receipt_->all_retired=true;
-        }
         for (int d = 0; d < n_uplinks_; ++d)
             if (uplinks_[(size_t)d].st) {
                 rad_dev_set(d);
                 rad_stream_destroy(uplinks_[(size_t)d].st);
                 uplinks_[(size_t)d].st = nullptr;
             }
-        if(tiny_) {
-            for(auto& b:tiny_workers_)b.reset();
-            for(auto& t:tiny_thread_tickets_)t.reset();
-            for(auto& u:tiny_stream_tickets_)u.reset();
-            for(auto& u:tiny_control_tickets_)u.reset();
-        }
         /* Every staged weight must have been delivered; otherwise its slot holds whatever memory
          * held before (often zeros, so the bug can go unnoticed). */
         if (status_ == RAD_OK && !audited_) {
@@ -2130,32 +2375,12 @@ public:
     int64_t peak() const { return peak_; }
 
 private:
-    int latch(int st) {
-        if(st>=0)return st;
-        std::lock_guard<std::mutex>lk(mu_);
-        if(!failed_){status_=st;failed_=true;}
-        work_.notify_all();return st;
-    }
-    bool fault_once(TinyLoaderFault f) {
-        if(tiny_fault_!=f)return false;
-        bool expected=false;
-        if(!tiny_fault_seen_.compare_exchange_strong(expected,true))return false;
-        ++tiny_receipt_->faults_triggered;return true;
-    }
-    void stop_submissions() {
-        for(int d=0;d<n_uplinks_;++d) {
-            std::lock_guard<std::mutex>lk(uplinks_[(size_t)d].mu);
-            uplinks_[(size_t)d].stop=true;
-        }
-        if(tiny_receipt_)tiny_receipt_->submissions_stopped=true;
-    }
     /* One stream per card shared by all workers. Each stream is a hardware queue on this backend,
      * and a stream per worker per card means ~20 time-sliced queues per card (workers spent three
      * quarters of a Flash-Next load waiting). One copy already saturates the link. */
     struct Uplink {
         std::mutex mu;
         RadStream  st = nullptr;
-        bool stop = false; // tiny-only sticky submission barrier
     };
 
     /* A worker's path to a card: a ring of pinned slots. A weight that fits is laid out directly
@@ -2164,21 +2389,7 @@ private:
     struct Bounce {
         static constexpr int     kSlots = 8;
         static constexpr int64_t kSlot  = 4ll << 20;
-        explicit Bounce(Uplink* up,RelayoutPool* tiny=nullptr) : up_(up),tiny_(tiny) {}
-        RelayoutPool* tiny_=nullptr;
-        bool retired_=false;
-        int slots() const {return tiny_?2:kSlots;}
-        int64_t slot_bytes() const {return tiny_?131072:kSlot;}
-        int64_t keep_bytes() const {return tiny_?131072:kKeep;}
-        int prepare_tiny() {
-            for(int i=0;i<2;++i)slot[i].ev.resize(1,nullptr);
-            if(tiny_->fault_once(TinyLoaderFault::BeforePinnedAllocation))return RAD_E_NOMEM;
-            buf=rad_dev_alloc(2*131072,RAD_MEM_HOST_PINNED);
-            if(!buf)return RAD_E_NOMEM;
-            ++tiny_->tiny_receipt_->pinned_allocations;
-            return RAD_OK;
-        }
-        void retired_tiny() {retired_=true;for(auto& s:slot){s.live=-1;s.recorded=false;}}
+        explicit Bounce(Uplink* up) : up_(up) {}
         Uplink* up_;
         void* buf = nullptr;
         /* Relayout output for weights larger than a slot, reused across weights up to kKeep to
@@ -2188,76 +2399,50 @@ private:
         int64_t out_cap = 0;
         /* One event per device (an event belongs to its device); `live` is the device of the
          * slot's last copy. */
-        struct Slot { std::vector<RadEvent> ev; int live = -1; bool recorded = false; };
+        struct Slot { std::vector<RadEvent> ev; int live = -1; };
         Slot slot[kSlots];
         int  next = 0;
         ~Bounce() {
-            if(tiny_ && !retired_ && buf)tiny_unretired_fail_stop();
-            if(!tiny_)(void)flush();
+            (void)flush();
             for (Slot& s : slot)
                 for (size_t d = 0; d < s.ev.size(); ++d)
                     if (s.ev[d]) { rad_dev_set((int)d); rad_event_destroy(s.ev[d]); }
-            if (buf) {
-                rad_dev_free(buf, RAD_MEM_HOST_PINNED);
-                if(tiny_)++tiny_->tiny_receipt_->pinned_releases;
-            }
+            if (buf) rad_dev_free(buf, RAD_MEM_HOST_PINNED);
         }
         /* The next slot, once the copy made out of it last time round has run. */
         int acquire(uint8_t** p) {
             if (!buf) {
-                buf = rad_dev_alloc(slots() * slot_bytes(), RAD_MEM_HOST_PINNED);
+                buf = rad_dev_alloc(kSlots * kSlot, RAD_MEM_HOST_PINNED);
                 if (!buf) return RAD_E_NOMEM;
             }
             Slot& s = slot[next];
             if (s.live >= 0) {
-                if(tiny_ && (!s.recorded || tiny_->fault_once(TinyLoaderFault::BeforeSlotWait))) {
-                    tiny_->stop_submissions();return RAD_E_STATE;
-                }
-                const int wait=rad_event_sync(s.ev[(size_t)s.live]);
-                if(tiny_){std::lock_guard<std::mutex>lk(tiny_->tiny_receipt_mu_);++tiny_->tiny_receipt_->slot_waits;}
-                if(wait<0){if(tiny_)tiny_->stop_submissions();return wait;}
-                s.live = -1;s.recorded=false;
+                RAD_TRY(rad_event_sync(s.ev[(size_t)s.live]));
+                s.live = -1;
             }
-            *p = (uint8_t*)buf + next * slot_bytes();
+            *p = (uint8_t*)buf + next * kSlot;
             return RAD_OK;
         }
         /* The first `n` bytes of the slot acquire() handed out, up to `dst` on `device`. */
         int send(uint8_t* dst, int64_t n, int device) {
-            Slot& s=slot[next];
-            if(tiny_ && (device!=0 || n<0 || n>slot_bytes()))return RAD_E_INVAL;
+            Slot& s = slot[next];
             RAD_TRY(rad_dev_set(device));
-            if(s.ev.size()<=(size_t)device)s.ev.resize((size_t)device+1,nullptr);
-            if(!s.ev[(size_t)device])RAD_TRY(rad_event_create(&s.ev[(size_t)device]));
-            Uplink& u=up_[device];
-            int st=RAD_OK;
+            if (s.ev.size() <= (size_t)device) s.ev.resize((size_t)device + 1, nullptr);
+            if (!s.ev[(size_t)device]) RAD_TRY(rad_event_create(&s.ev[(size_t)device]));
+            Uplink& u = up_[device];
             {
-                std::lock_guard<std::mutex>lk(u.mu);
-                if(tiny_ && (u.stop || tiny_->failed_))return RAD_E_STATE;
-                if(!u.st) {
-                    if(tiny_) {
-                        st=tiny_->tiny_budget_->take_stream(&tiny_->tiny_stream_tickets_[device],
-                                                           &tiny_->tiny_control_tickets_[device]);
-                        if(st<0){u.stop=true;return st;}
-                    }
-                    st=tiny_?tiny_backend_stream_create(&u.st):rad_stream_create(&u.st,0);if(st<0){if(tiny_)u.stop=true;return st;}
-                }
-                // Busy BEFORE the copy. A failed backend call may have enqueued.
-                if(tiny_){s.live=device;s.recorded=false;}
-                st=rad_memcpy_async(dst,(uint8_t*)buf+next*slot_bytes(),n,u.st);
-                if(st>=0 && tiny_)++tiny_->tiny_receipt_->copies_enqueued;
-                if(st>=0 && tiny_ && tiny_->fault_once(TinyLoaderFault::AfterCopyBeforeRecord))st=RAD_E_STATE;
-                if(st>=0) {
-                    st=rad_event_record(s.ev[(size_t)device],u.st);
-                    if(st>=0){s.recorded=true;if(tiny_)++tiny_->tiny_receipt_->records_enqueued;}
-                }
-                if(st>=0 && tiny_ && tiny_->fault_once(TinyLoaderFault::AfterRecord))st=RAD_E_STATE;
-                if(st<0){if(tiny_)u.stop=true;return st;}
+                std::lock_guard<std::mutex> lk(u.mu);
+                if (!u.st) RAD_TRY(rad_stream_create(&u.st, 0));
+                RAD_TRY(rad_memcpy_async(dst, (uint8_t*)buf + next * kSlot, n, u.st));
+                RAD_TRY(rad_event_record(s.ev[(size_t)device], u.st));
             }
-            s.live=device;next=(next+1)%slots();return RAD_OK;
+            s.live = device;
+            next = (next + 1) % kSlots;
+            return RAD_OK;
         }
         int upload(uint8_t* dst, const uint8_t* src, int64_t n, int device) {
             for (int64_t off = 0; off < n;) {
-                const int64_t c = n - off < slot_bytes() ? n - off : slot_bytes();
+                const int64_t c = n - off < kSlot ? n - off : kSlot;
                 uint8_t* p = nullptr;
                 RAD_TRY(acquire(&p));
                 std::memcpy(p, src + off, (size_t)c);
@@ -2281,19 +2466,14 @@ private:
 
     void worker() {
         Bounce b(uplinks_.get());
-        worker_body(b,false);
-    }
-    void worker_body(Bounce& b,bool tiny) {
         for (;;) {
             int i = -1;
             Copy c{};
             bool cp = false;
             {
                 std::unique_lock<std::mutex> lk(mu_);
-                work_.wait(lk, [&] { return (tiny?tiny_head_<tiny_tail_:(!copies_.empty() || !queue_.empty())) || done_; });
-                if(tiny && tiny_head_<tiny_tail_) {
-                    i=tiny_queue_[tiny_head_++];
-                } else if (!copies_.empty()) {
+                work_.wait(lk, [&] { return !copies_.empty() || !queue_.empty() || done_; });
+                if (!copies_.empty()) {
                     c = copies_.front();
                     copies_.pop_front();
                     cp = true;
@@ -2313,24 +2493,17 @@ private:
             }
             StagedWeight& s = items_[(size_t)i];
             if (!failed_) input(i);
-            int st=RAD_E_STATE;
-            if(tiny) {
-                try {st=failed_?RAD_E_STATE:run(s,b);}
-                catch(const std::bad_alloc&) {st=RAD_E_NOMEM;}
-                catch(...) {st=RAD_E_STATE;}
-            } else st=failed_?RAD_E_STATE:run(s,b);
+            const int st = failed_ ? RAD_E_STATE : run(s, b);
             if (s.own) { delete[] s.in; s.in = nullptr; s.own = false; }
             std::lock_guard<std::mutex> lk(mu_);
-            if (s.in && !tiny) give_back(s.in - region_, align_up(s.in_bytes, kHole));
+            if (s.in) give_back(s.in - region_, align_up(s.in_bytes, kHole));
             s.in = nullptr;
-            if(tiny && st>=0)s.remaining=0;
             held_    -= s.in_bytes;
             pending_ -= s.in_bytes;
             if (st < 0 && !failed_) { failed_ = true; status_ = st; }
             room_.notify_all();
         }
         /* Wait for this worker's copies still in flight. */
-        if(tiny)return; // Pool owns retirement and backing lifetime.
         const int fs = b.flush();
         std::lock_guard<std::mutex> lk(mu_);
         if (fs < 0 && !failed_) { failed_ = true; status_ = fs; }
@@ -2340,7 +2513,6 @@ private:
      * hole that fits. */
     uint8_t* input(int i) {
         StagedWeight& s = items_[(size_t)i];
-        if(tiny_)return s.in; // fixed, fully admitted offsets; no fallback
         std::call_once(once_[(size_t)i], [&] {
             const int64_t n = align_up(s.in_bytes, kHole);
             {
@@ -2393,16 +2565,12 @@ private:
 
     int run(StagedWeight& s, Bounce& b) {
         const WeightInfo& w = s.prog->weights[s.wi];
-        if(s.tiny_fill) {
-            const int fs=s.tiny_fill(s.tiny_context,s.in,s.in_bytes);
-            if(fs<0)return fs;
-        }
         if (s.fill) {
             const int fs = s.fill(s.in);
             if (fs < 0) return fs;
         }
-        /* Stored as read (only reached by a weight with no sweep). */
-        if (w.identity && !w.widen) {
+        /* Stored as read (only reached by a weight with no sweep, no dtype conversion). */
+        if (w.identity && !w.widen && !w.narrow) {
             const int64_t n = w.stored_bytes;
             if (!s.dev) { std::memcpy(s.dst, s.in, (size_t)n); return RAD_OK; }
             const int us = b.upload(s.dst, s.in, n, s.device);
@@ -2413,14 +2581,14 @@ private:
         RadTensor pt[RAD_ENC_MAX_PLANES];
         weight_planes(w, pt);
         for (int k = 0; k < w.n_sel; ++k) pt[k].data = s.in + s.plane_off[k];
-        const int64_t n = w.stored_bytes;
+        const int64_t n = s.pk_bytes > 0 ? s.pk_bytes : w.stored_bytes;
         std::unique_ptr<uint8_t[]> tmp;
         uint8_t* out = s.dst;
         /* A weight that fits a slot is laid out in pinned memory the copy reads directly. */
-        const bool in_slot = s.dev && n <= b.slot_bytes();
+        const bool in_slot = s.dev && n <= Bounce::kSlot;
         if (in_slot) {
             RAD_TRY(b.acquire(&out));
-        } else if (s.dev && n > b.keep_bytes()) {
+        } else if (s.dev && n > Bounce::kKeep) {
             tmp.reset(new uint8_t[(size_t)n]);
             out = tmp.get();
         } else if (s.dev) {
@@ -2430,11 +2598,31 @@ private:
 
         int st = RAD_OK;
         const char* who = "the loader";
-        if (w.widen) {
-            /* Exact: every bf16 and f16 value is representable in f32. */
+        if (s.pk_bytes > 0) {
+            /* A packed VRAM resident (vram_packed.h): its codes and scales planes packed and checked, the
+             * scales' round trip through the kernels' widening and the codes byte for byte. */
+            who = "the packed-scale form (RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED)";
+            int n_exc = -1;
+            st = w.n_sel == 2 && pt[0].dtype == RAD_FP4E2M1 && pt[1].dtype == RAD_E8M0
+                     ? vram_pack_weight((const uint8_t*)pt[0].data, (const uint8_t*)pt[1].data,
+                                        (int)pt[0].shape[0], (int)pt[0].shape[1], s.pk_cap, out, n, &n_exc)
+                     : RAD_E_DTYPE;
+            if (st == RAD_E_FULL)
+                RAD_ERR("load: '%s' needs %d raw rounds and its packed form has room for %d: the plan's scan of "
+                        "the same container found it within; was the container changed under the load?",
+                        w.name.c_str(), n_exc, s.pk_cap);
+            else if (st == RAD_E_STATE)
+                RAD_ERR("load: '%s' packed does not give back its planes (scales' round trip or codes)",
+                        w.name.c_str());
+        } else if (w.widen || w.narrow) {
+            /* Exact: every bf16 and f16 value is representable in f32, and f32 rounds to bf16 to
+             * nearest even. */
             const int64_t cnt = w.sel_rows[0] * w.sel_cols[0];
-            if (cnt * 4 != n) st = RAD_E_SHAPE;
-            else for (int64_t e = 0; e < cnt; ++e) ((float*)out)[e] = rad_load_f32(pt[0].data, pt[0].dtype, e);
+            const int64_t esz = (int64_t)rad_dtype_bytes(w.stored_dtype, 1);
+            if (cnt * esz != n) st = RAD_E_SHAPE;
+            else for (int64_t e = 0; e < cnt; ++e)
+                rad_store_f32(out, w.stored_dtype, e,
+                              rad_load_f32(pt[0].data, pt[0].dtype, e));
         } else {
             const Resolved& r = s.prog->ops[(size_t)w.lay_op].bands[(size_t)w.lay_band].dom[w.lay_dom];
             const RadKernelInfo* ki = r.row->info;
@@ -2476,105 +2664,7 @@ private:
     bool audited_ = false;   /* finish() runs its delivery audit once; the destructor calls it again */
     std::atomic<bool> failed_{false};
     int status_ = RAD_OK;
-    std::mutex tiny_receipt_mu_;
-    bool tiny_=false, tiny_retired_=false;
-    TinyBudget* tiny_budget_=nullptr;
-    TinyLoaderReceipt* tiny_receipt_=nullptr;
-    TinyLoaderFault tiny_fault_=TinyLoaderFault::None;
-    std::atomic<bool> tiny_fault_seen_{false};
-    TinyTicket tiny_thread_tickets_[2],tiny_stream_tickets_[1],tiny_control_tickets_[1];
-    std::unique_ptr<Bounce> tiny_workers_[2];
-    int tiny_queue_[59]={};size_t tiny_head_=0,tiny_tail_=0;
 };
-
-int RelayoutPool::quote_tiny(const TinyLoadJob* jobs,size_t count,TinyLoaderQuote* out) {
-    if(!out || !jobs || !count || count>59)return RAD_E_INVAL;
-    TinyLoaderQuote q{};q.jobs=count;
-    for(size_t i=0;i<count;++i) {
-        const auto& j=jobs[i];
-        if(!j.program || j.program->weights.size()>512 || !j.weight || j.weight>=j.program->weights.size() ||
-           !j.destination || !j.fill || j.device!=0 || j.input_bytes<=0 || j.input_bytes>131072)
-            return RAD_E_INVAL;
-        const auto& w=j.program->weights[j.weight];
-        if(w.stored_bytes<=0 || w.stored_bytes>131072 || w.n_sel<1 || w.n_sel>RAD_ENC_MAX_PLANES)
-            return RAD_E_INVAL;
-        if(w.widen && (w.n_sel!=1 || w.sel_rows[0]>131072 || w.sel_cols[0]>131072 ||
-            w.sel_rows[0]<=0 || w.sel_cols[0]<=0 ||
-            w.sel_rows[0]>w.stored_bytes/(4*w.sel_cols[0]) ||
-            w.sel_rows[0]*w.sel_cols[0]*4!=w.stored_bytes))return RAD_E_INVAL;
-        if(!w.identity && !w.widen && (w.lay_op<0 || (size_t)w.lay_op>=j.program->ops.size() ||
-            w.lay_band<0 || (size_t)w.lay_band>=j.program->ops[(size_t)w.lay_op].bands.size() ||
-            w.lay_dom<0 || w.lay_dom>=RAD_N_DOMAINS))return RAD_E_INVAL;
-        if(!w.identity && !w.widen) {
-            const auto& r=j.program->ops[(size_t)w.lay_op].bands[(size_t)w.lay_band].dom[w.lay_dom];
-            if(!r.row || !r.row->info || !r.row->info->relayout)return RAD_E_UNSUPPORTED;
-        }
-        if(w.identity && !w.widen && j.input_bytes<w.stored_bytes)return RAD_E_INVAL;
-        for(int k=0;k<w.n_sel;++k) {
-            if(w.sel[k]<0 || w.sel[k]>=w.enc.n_planes || w.enc.n_planes>RAD_ENC_MAX_PLANES ||
-               j.plane_offset[k]<0 || j.plane_offset[k]>=j.input_bytes ||
-               w.sel_rows[k]<=0 || w.sel_cols[k]<=0 || w.sel_rows[k]>131072 || w.sel_cols[k]>1048576)
-                return RAD_E_INVAL;
-            const int64_t row=rad_enc_row_bytes(w.enc.plane[w.sel[k]].dtype,w.sel_cols[k]);
-            if(row<=0 || row>131072 || w.sel_rows[k]>(j.input_bytes-j.plane_offset[k])/row)
-                return RAD_E_INVAL;
-        }
-        const uint64_t n=(uint64_t)align_up(j.input_bytes,kHole);
-        if(n>1048576-q.input_pages)return RAD_E_NOMEM;
-        q.input_pages+=n;
-        const uintptr_t lo=(uintptr_t)j.destination;
-        if((uint64_t)w.stored_bytes>UINTPTR_MAX-lo)return RAD_E_INVAL;
-        const uintptr_t hi=lo+(uintptr_t)w.stored_bytes;
-        for(size_t k=0;k<i;++k) {
-            const auto& old=jobs[k];
-            const uintptr_t old_lo=(uintptr_t)old.destination;
-            const uintptr_t old_hi=old_lo+(uintptr_t)old.program->weights[old.weight].stored_bytes;
-            if((lo<old_hi && old_lo<hi) || (j.program==old.program && j.weight==old.weight))return RAD_E_INVAL;
-        }
-    }
-    TinyBackendQuote b{};const int st=tiny_backend_quote(&b);if(st<0)return st;
-    q.staged_size=sizeof(StagedWeight);q.pool_size=sizeof(RelayoutPool);
-    q.bounce_size=sizeof(Bounce);q.uplink_size=sizeof(Uplink);q.slot_size=sizeof(Bounce::Slot);
-    q.event_size=b.event_size;
-    // Actual known payload/control terms plus explicit library-control allowance.
-    // No invented deque-node/std::thread-private sizeof is called an actual quote.
-    q.requested_bytes=q.input_arena+q.pinned_slots+count*sizeof(StagedWeight)+sizeof(RelayoutPool)+
-        2*sizeof(Bounce)+sizeof(Uplink)+2*sizeof(std::thread)+4*sizeof(RadEvent)+4*b.event_size+q.control_allowance;
-    q.page_upper=(q.requested_bytes+4095)&~uint64_t(4095);
-    if(q.page_upper>2097152)return RAD_E_NOMEM;
-    *out=q;return RAD_OK;
-}
-int tiny_loader_quote(const TinyLoadJob* jobs,size_t count,TinyLoaderQuote* out) {
-    return RelayoutPool::quote_tiny(jobs,count,out);
-}
-int tiny_loader_run(const TinyLoadJob* jobs,size_t count,TinyBudget& budget,TinyLoaderFault fault,
-                    TinyLoaderReceipt* diagnostic) {
-    if(!diagnostic || !budget.admitted() || (uint32_t)fault>(uint32_t)TinyLoaderFault::BeforeSlotWait)
-        return RAD_E_INVAL;
-    TinyLoaderQuote q{};int st=tiny_loader_quote(jobs,count,&q);if(st<0)return st;
-    TinyTicket storage;
-    st=budget.take(TinyCategory::Loader,q.page_upper,&storage);if(st<0)return st;
-    TinyLoaderReceipt receipt{};
-    // The ticket precedes and outlives every fallible vector/Pool allocation.
-    try {
-        std::vector<StagedWeight> items;items.reserve(count);
-        for(size_t i=0;i<count;++i) {
-            const auto& j=jobs[i];StagedWeight w{};
-            w.prog=j.program;w.wi=j.weight;w.device=j.device;w.dst=j.destination;
-            w.dev=j.device_destination;w.in_bytes=j.input_bytes;w.remaining=j.input_bytes;
-            std::copy(std::begin(j.plane_offset),std::end(j.plane_offset),std::begin(w.plane_off));
-            w.tiny_fill=j.fill;w.tiny_context=j.fill_context;items.push_back(std::move(w));
-        }
-        {
-            RelayoutPool pool(items,true);
-            st=pool.start_tiny(budget,q,fault,&receipt);
-            if(st>=0)pool.queue_tiny();
-            const int finish=pool.finish();if(st>=0)st=finish;
-        }
-    } catch(const std::bad_alloc&) {st=RAD_E_NOMEM;}
-      catch(...) {st=RAD_E_STATE;}
-    *diagnostic=receipt;return st;
-}
 
 /* One pass over the container, serving every rank. The runs (declaration order, grouped by rank)
  * are sorted by file offset into one front-to-back sweep: read a window, hand it to every rank
@@ -2593,8 +2683,11 @@ int tiny_loader_run(const TinyLoadJob* jobs,size_t count,TinyBudget& budget,Tiny
  * card. */
 static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
                            const std::vector<int>& devices, RelayoutPool* pool,
-                           int64_t* read_out) {
+                           int64_t* read_out,
+                           const std::vector<std::pair<int64_t, int64_t>>& keep_cached,
+                           const DsparkRadBanks* banks=nullptr,uint32_t bank=0,int64_t* rewarm_remaining=nullptr) {
     *read_out = 0;
+    if(banks&&!banks->same_epoch())return RAD_E_STATE;
     if (runs.empty()) return RAD_OK;
 
     /* Sort by file offset into a reading order; the span tie-break makes the order total, so the
@@ -2657,6 +2750,7 @@ static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
          * runs do, so a window is read from the block below the chunk to the block above it (two
          * blocks wider). A filesystem that refuses O_DIRECT is read buffered. */
         RAD_TRY(dio.open(file->path(), RAD_DIO_READ | RAD_DIO_ALLOW_BUFFERED));
+        if(banks)RAD_TRY(banks->direct_owner_matches(bank,dio.fd()));
         for (int b = 0; b < kWin; ++b) {
             buf[b] = rad_dev_alloc(window + 2 * kBlk, RAD_MEM_HOST_PINNED);
             if (!buf[b]) {
@@ -2825,15 +2919,36 @@ static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
         return RAD_OK;
     }();
 
-    /* Release the page cache of weights never read from the file again, leaving it to the mapped
-     * tier (e.g. a mapped n-gram table, read from its mapping for the process lifetime). */
-    file->drop_blob_cache();
+    /* Release the page cache of weights never read from the file again, leaving the mapped tier's
+     * (e.g. a mapped n-gram table, read from its mapping for the process lifetime): what an earlier
+     * run brought in stays, so its gathers do not start cold after a restart. */
+    file->drop_blob_cache(keep_cached);
+    /* ... and what the load's allocations reclaimed of it comes back (RadFile::rewarm), at most half
+     * of what the kernel calls available, so the re-read cannot itself push the host into reclaim. */
+    if (!keep_cached.empty()) {
+        int64_t avail = 0;
+        if (FILE* mi = std::fopen("/proc/meminfo", "r")) {
+            char line[256];
+            while (std::fgets(line, sizeof line, mi))
+                if (std::sscanf(line, "MemAvailable: %lld kB", (long long*)&avail) == 1) { avail *= 1024; break; }
+            std::fclose(mi);
+        }
+        const auto w0 = std::chrono::steady_clock::now();
+        const int64_t limit=rewarm_remaining?std::min(avail/2,*rewarm_remaining):avail/2;
+        const int64_t asked = file->rewarm(keep_cached,limit);
+        if(rewarm_remaining)*rewarm_remaining=std::max<int64_t>(0,*rewarm_remaining-asked);
+        if (asked > 0)
+            RAD_INFO("mapped tier: asked the page cache again for %s an earlier run had cached (%.0f ms; "
+                     "--mapped-rewarm off turns it off)", humanb(asked).c_str(),
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count());
+    }
     /* Drain before freeing: a sweep that failed part-way may have copies outstanding. */
     for (int b = 0; b < kWin; ++b) pool->drain(b);
     for (int b = 0; b < kWin; ++b) if (buf[b]) rad_dev_free(buf[b], RAD_MEM_HOST_PINNED);
     for (size_t k = 0; k < ev.size(); ++k) if (ev[k]) rad_event_destroy(ev[k]);
     for (size_t k = 0; k < nr; ++k) if (st[k]) rad_stream_destroy(st[k]);
     *read_out = read_bytes;
+    if(banks&&!banks->same_epoch())return RAD_E_STATE;
     return rc;
 }
 
@@ -2886,37 +3001,18 @@ static int fill_from_checkpoint(const CkptWeight& cw, const std::vector<PlaneSha
     return RAD_OK;
 }
 
-struct TinyCheckpointContext {
-    const CkptWeight* source=nullptr;
-    const std::string* name=nullptr;
-    std::vector<PlaneShare> shares;
-    std::vector<int> selected;
-    std::vector<int64_t> offsets;
-};
-static int tiny_checkpoint_fill(void* context,uint8_t* input,int64_t) {
-    const auto& c=*static_cast<TinyCheckpointContext*>(context);
-    return fill_from_checkpoint(*c.source,c.shares,c.selected,c.offsets,*c.name,input);
-}
-
 int Engine::load_weights() {
-    TinyTicket tiny_loader_credit;
-    if(tiny_) {
-        RAD_TRY(tiny_->budget.take(TinyCategory::Loader,2u<<20,&tiny_loader_credit));
-        if(file_||!tiny_->records||tiny_->records->audit()<0||!tiny_->binding||tiny_->binding->audit()<0)return RAD_E_STATE;
-    }
-    std::vector<TinyCheckpointContext> tiny_contexts;
-    if(tiny_)tiny_contexts.reserve(59);
     int64_t total = 0, n_loaded = 0, n_missing = 0;
     /* Counted apart from `n_loaded`: mapped weights are published in place, not loaded. */
     int64_t n_mapped = 0, mapped_bytes = 0;
+    std::array<std::vector<std::pair<int64_t, int64_t>>,2> mapped_ranges;   /* kept cached by the sweep's drop */
 
     /* Two phases. The walk decides which rank wants which bytes, where they land, and what is
      * refused, without touching the disk; sweep_container then reads the container once in file
      * order (reading per rank in declaration order would run far below the sequential rate and
      * read replicated weights once per rank). */
-    std::vector<LoadRun> runs;
+    std::array<std::vector<LoadRun>,2> bank_runs;
     std::vector<StagedWeight> staged;
-    if(tiny_)staged.reserve(59);
     int64_t n_out = 0;      /* destination overruns reported, capped */
 
     /* ============================================================== the walk */
@@ -2929,13 +3025,31 @@ int Engine::load_weights() {
          * mover needs its path. It reads the container with O_DIRECT: weights are RAD_ALIGN_UNIT-
          * aligned (rad_format.h), DirectFile's alignment, so stages take the no-bounce path. */
         MoverConfig mc{};
+        mc.native_cache_allocation_device = r->device;
         mc.container_path = file_ ? cfg_.model : std::string();
-        if(tiny_)mc.tiny_budget=&tiny_->budget;
-        RAD_TRY(r->mover.init(r->program, r->plan, mc, &r->pools));
-        if(tiny_) {
-            RAD_TRY(r->mover.bind_compute_stream(r->tiny_compute.get()));
-            RAD_TRY(tiny_phase(uint32_t(TinyEnginePhase::MoverReady)));
+        mc.source_banks = source_banks_.get();
+        if (cfg_.expert_ram_cache_total_mib > 0) {
+            const int64_t MiB = (int64_t)1 << 20;
+            if (cfg_.tp <= 0 || cfg_.expert_ram_cache_total_mib > INT64_MAX / MiB)
+                return RAD_E_INVAL;
+            const int64_t total = cfg_.expert_ram_cache_total_mib * MiB;
+            mc.native_file_cache_bytes = total / cfg_.tp / RAD_ALIGN_UNIT * RAD_ALIGN_UNIT;
         }
+        /* A file-tier weight the kernel relayouts is relaid on every read, by the kernel's own
+         * relayout, as the relayout pool does once for a resident one. */
+        {
+            const Program* prog = &r->program;
+            r->mover.set_file_relayout([prog](const WeightInfo& w, const RadTensor* planes,
+                                              void* dst, int64_t dst_bytes) {
+                const RadKernelInfo* ki = weight_layout_kernel(*prog, w);
+                if (!ki || !ki->relayout) return (int)RAD_E_STATE;
+                const Resolved& rs =
+                    prog->ops[(size_t)w.lay_op].bands[(size_t)w.lay_band].dom[w.lay_dom];
+                return ki->relayout(rs.geom.params(), rs.geom.n_params(), w.lay_operand, &w.enc,
+                                    w.sel, planes, w.n_sel, dst, dst_bytes);
+            });
+        }
+        RAD_TRY(r->mover.init(r->program, r->plan, mc, &r->pools));
         /* What the mover took, before the first copy. Its slabs are allocated in init, so the pool
          * is as full as it will get; a load stopping with zero free is a placement failure, not
          * a loader one. */
@@ -2969,17 +3083,22 @@ int Engine::load_weights() {
         /* And every source range must lie inside its plane. Offsets depend on the rank index
          * (rank 0 always starts at the plane's start, so it never exercises the arithmetic), and
          * an overrun would read the wrong weight. */
-        const int64_t file_bytes = file_ ? file_->size() : 0;
 
         for (size_t i = 1; i < r->program.weights.size(); ++i) {
             WeightInfo& w = r->program.weights[i];
             /* The planes' source: a container entry or the checkpoint tensors declare resolved,
              * giving the encoding and logical shape the share is cut in. */
-            const RadFileEntry* e = file_ ? file_->find(w.source) : nullptr;
-            const CkptWeight* cw = checkpoint_find(w.source);
+            const RadFile* source=file_.get();
+            const RadFileEntry* e=nullptr;
+            if(source_banks_){
+                if(w.decl.optional&&w.source_entry_index<0)continue;
+                DsparkRadBanks::Entry ref;RAD_TRY(source_banks_->bound(w,&ref));source=ref.file;e=ref.entry;
+            }else e=source?source->find(w.source):nullptr;
+            const int64_t file_bytes=source?source->size():0;
+            const CkptWeight* cw = ckpt_src_ ? ckpt_src_->find(w.source) : nullptr;
             if (!e && !cw) {
                 if (w.decl.optional) continue;
-                const std::string why = checkpoint_missing(w.source);
+                const std::string why = ckpt_src_ ? ckpt_src_->missing(w.source) : std::string();
                 if (!why.empty())
                     RAD_ERR("rank %d: '%s' was declared over '%s', and %s", r->index,
                             w.name.c_str(), w.source.c_str(), why.c_str());
@@ -2989,7 +3108,7 @@ int Engine::load_weights() {
                 ++n_missing;
                 continue;
             }
-            const RadEncoding& src_enc = e ? file_->encoding(*e) : cw->enc;
+            const RadEncoding& src_enc = e ? source->encoding(*e) : cw->enc;
             const uint32_t src_rank = e ? e->rank : cw->rank;
             const int64_t* src_shape = e ? e->shape : cw->shape;
 
@@ -3005,21 +3124,6 @@ int Engine::load_weights() {
                 return RAD_E_FORMAT;
             }
 
-            PlaneShare tiny_share[RAD_ENC_MAX_PLANES];
-            if(tiny_) {
-                // Real source and weight_share precede typed omission and EVERY
-                // destination lookup/publication/staging reservation for owned views.
-                std::string why;
-                if(!cw||e||weight_share(w,src_enc,src_rank,src_shape,cfg_.tp,r->index,tiny_share,&why)<0)return RAD_E_SHAPE;
-                const auto unit=tiny_->inventory->unit_for_weight(rad_weight(i));
-                if(tiny_->inventory->find(unit)) {
-                    RAD_TRY(tiny_->inventory->validate_unit(r->program,r->plan,unit));
-                    w.tier=r->plan.weight[i].tier;w.site=r->plan.weight[i].site;w.slab_slot=r->plan.weight[i].slab_slot;
-                    ++tiny_->result.omitted_views;
-                    for(int k=0;k<w.n_sel;++k)tiny_->result.omitted_source_bytes+=tiny_share[k].dense_bytes();
-                    continue;
-                }
-            }
             /* Copy the planner's decision (Plan::weight[], a parallel array) onto WeightInfo.
              * Ctx::bind_weights picks RAD_DOMAIN_HOST only when every weight operand has
              * Site::Host, so without this host-site execution is unreachable. file_offset (the
@@ -3029,14 +3133,37 @@ int Engine::load_weights() {
             w.tier        = r->plan.weight[i].tier;
             w.site        = r->plan.weight[i].site;
             w.slab_slot   = r->plan.weight[i].slab_slot;
-            w.file_offset = e ? file_->plane(*e, w.sel[0]).offset : 0;
+            /* RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED: a packed VRAM resident (vram_packed.h). */
+            w.vram_bytes  = w.tier == Tier::VRAM ? r->plan.weight[i].vram_bytes : 0;
+            w.vram_pk_cap = w.vram_bytes > 0 ? r->plan.weight[i].vram_pk_cap : -1;
+            w.file_offset = e ? source->plane(*e, w.sel[0]).offset : 0;
+            for (int k = 0; k < w.n_sel && e; ++k)
+                w.file_plane_offset[k] = source->plane(*e, w.sel[k]).offset;
             const bool direct = weight_file_direct(w, cfg_.tp);
-            if ((w.tier == Tier::Mapped || w.tier == Tier::SSD) && (!direct || !e)) {
+            /* The file tier also serves a weight it relays on every read (weight_file_relaid):
+             * each selected plane whole in the container, as many bytes as the plane holds. */
+            const bool relaid = w.tier == Tier::SSD && e && weight_file_relaid(r->program, w, cfg_.tp);
+            if (relaid)
+                for (int k = 0; k < w.n_sel; ++k) {
+                    const RadFilePlane& pk = source->plane(*e, w.sel[k]);
+                    const int64_t want = w.sel_rows[k] *
+                        rad_dtype_bytes(source->encoding(*e).plane[w.sel[k]].dtype, w.sel_cols[k]);
+                    if ((int64_t)pk.bytes != want) {
+                        RAD_ERR("rank %d: '%s' is relaid from the file tier, and its '%s' plane "
+                                "holds %lld bytes where the whole plane is %lld", r->index,
+                                w.name.c_str(), source->encoding(*e).plane[w.sel[k]].role,
+                                (long long)pk.bytes, (long long)want);
+                        return RAD_E_FORMAT;
+                    }
+                }
+            if ((w.tier == Tier::Mapped || w.tier == Tier::SSD) && (!direct || !e) && !relaid) {
                 RAD_ERR("rank %d: '%s' was placed on the %s tier, which reads the container where "
                         "it lies, and its stored form is not the container's (%s)", r->index,
                         w.name.c_str(), tier_name(w.tier),
-                        w.widen ? "widened at load" : w.identity ? "a shard of it"
-                                                                 : w.layout_tag.c_str());
+                        w.widen ? "widened at load"
+                                : w.narrow ? "narrowed at load"
+                                           : w.identity ? "a shard of it"
+                                                        : w.layout_tag.c_str());
                 return RAD_E_STATE;
             }
 
@@ -3045,15 +3172,15 @@ int Engine::load_weights() {
              * Publish through the residency table too, not only WeightInfo::ptr, because
              * Ctx::resolve_weight reads the table whenever a mover exists. */
             if (w.tier == Tier::Mapped) {
-                const RadFilePlane& p0 = file_->plane(*e, w.sel[0]);
+                const RadFilePlane& p0 = source->plane(*e, w.sel[0]);
                 const int64_t n = (int64_t)p0.bytes;
                 if (n != w.stored_bytes) {
                     RAD_ERR("'%s': the container's '%s' plane has %lld bytes, the declaration "
-                            "wants %lld", w.name.c_str(), file_->encoding(*e).plane[w.sel[0]].role,
+                            "wants %lld", w.name.c_str(), source->encoding(*e).plane[w.sel[0]].role,
                             (long long)n, (long long)w.stored_bytes);
                     return RAD_E_FORMAT;
                 }
-                w.ptr = (void*)file_->data(p0);
+                w.ptr = (void*)source->data(p0);
                 w.host_ptr = w.ptr;
                 /* --ngram-placement ram: the gather reads a copy instead of the mapping: pinned
                  * memory for a device kernel on the zero-copy site, or locked memory for the host
@@ -3064,7 +3191,7 @@ int Engine::load_weights() {
                     const bool card = w.site == Site::DeviceZeroCopy;
                     void* copy = nullptr;
                     std::string why;
-                    const int cs = copy_table((const uint8_t*)w.ptr, n, (int64_t)p0.offset, card,
+                    const int cs = copy_table(*source,(const uint8_t*)w.ptr, n, (int64_t)p0.offset, card,
                                               &copy, &why);
                     if (cs == RAD_OK) {
                         void* on_card = card ? rad_dev_device_ptr(copy) : nullptr;
@@ -3101,6 +3228,7 @@ int Engine::load_weights() {
                  * container keeps sequential readahead. The effect shows only with a cold cache. */
                 posix_madvise(w.ptr, (size_t)n, POSIX_MADV_RANDOM);
                 r->mover.publish_mapped((rad_weight)i, w.ptr);
+                mapped_ranges[w.file_id].emplace_back((int64_t)((const uint8_t*)w.ptr - source->base()), n);
                 ++n_mapped;
                 mapped_bytes += n;
                 continue;
@@ -3124,13 +3252,19 @@ int Engine::load_weights() {
              * (core/mem/pools.cpp), but an async host-to-host copy on this stack is the same memcpy
              * behind a stream, not a DMA, so streaming it would not overlap it with reads. */
             const bool dev = w.tier == Tier::VRAM;
-            if (dev && !dst_fits(slot->ptr, w.stored_bytes, w.name.c_str())) return RAD_E_STATE;
+            /* A packed VRAM resident takes its packed bytes there, which the mover laid out. */
+            const int64_t dev_bytes = w.vram_bytes > 0 ? w.vram_bytes : w.stored_bytes;
+            if (dev && !dst_fits(slot->ptr, dev_bytes, w.name.c_str())) return RAD_E_STATE;
+            if (w.vram_bytes > 0 && (!e || !dev || w.identity)) {
+                RAD_ERR("rank %d: '%s' was planned packed in VRAM but is %s", r->index, w.name.c_str(),
+                        !e ? "read from a checkpoint" : !dev ? "not in VRAM" : "stored as it is read");
+                return RAD_E_STATE;
+            }
 
             /* This rank's share of the selected planes (format/share.h). */
             PlaneShare sh[RAD_ENC_MAX_PLANES];
             std::string why;
-            if(tiny_)for(int k=0;k<w.n_sel;++k)sh[k]=std::move(tiny_share[k]);
-            if (!tiny_ && weight_share(w, src_enc, src_rank, src_shape, cfg_.tp, r->index, sh, &why) !=
+            if (weight_share(w, src_enc, src_rank, src_shape, cfg_.tp, r->index, sh, &why) !=
                 RAD_OK) {
                 RAD_ERR("rank %d: '%s' at --tp %d: %s", r->index, w.name.c_str(), cfg_.tp,
                         why.c_str());
@@ -3154,23 +3288,12 @@ int Engine::load_weights() {
                     total += sh[k].dense_bytes();
                 }
                 sw.in_bytes = in_bytes;
-                if (w.identity && !w.widen && sh[0].dense_bytes() != w.stored_bytes) {
+                if (w.identity && !w.widen && !w.narrow &&
+                    sh[0].dense_bytes() != w.stored_bytes) {
                     RAD_ERR("rank %d: '%s': this rank's share is %lld bytes and the slot %lld",
                             r->index, w.name.c_str(), (long long)sh[0].dense_bytes(),
                             (long long)w.stored_bytes);
                     return RAD_E_FORMAT;
-                }
-                if(tiny_) {
-                    if(staged.size()>=59||tiny_contexts.size()>=59)return RAD_E_SHAPE;
-                    TinyCheckpointContext context;context.source=cw;context.name=&w.name;
-                    for(int k=0;k<w.n_sel;++k) {
-                        // Closed TP1 complete planes only: the generic partial-
-                        // column path's64MiB temporary is outside this tiny profile.
-                        for(const auto& rect:sh[k].rects)if(rect.byte0||rect.bytes!=sh[k].row_bytes)return RAD_E_UNSUPPORTED;
-                        context.shares.push_back(std::move(sh[k]));context.selected.push_back(w.sel[k]);context.offsets.push_back(sw.plane_off[k]);
-                    }
-                    tiny_contexts.push_back(std::move(context));sw.tiny_context=&tiny_contexts.back();sw.tiny_fill=tiny_checkpoint_fill;
-                    staged.push_back(std::move(sw));++n_loaded;continue;
                 }
                 std::vector<PlaneShare> shares(sh, sh + w.n_sel);
                 std::vector<int> sel(w.sel, w.sel + w.n_sel);
@@ -3188,7 +3311,7 @@ int Engine::load_weights() {
              * by plane for the relayout pool, which writes the slot. */
             int32_t stage = -1;
             int64_t in_bytes = 0;
-            if (!w.identity || w.widen) {
+            if (!w.identity || w.widen || w.narrow) {
                 stage = (int32_t)staged.size();
                 staged.emplace_back();
                 StagedWeight& sw = staged.back();
@@ -3197,6 +3320,10 @@ int Engine::load_weights() {
                 sw.device = r->device;
                 sw.dst = (uint8_t*)slot->ptr;
                 sw.dev = dev;
+                sw.pk_bytes = w.vram_bytes;
+                sw.pk_cap = w.vram_pk_cap;
+                /* Packed and checked by the relayout pool, or the load fails. */
+                if (w.vram_bytes > 0) ++r->plan.vram_packed.loaded;
                 for (int k = 0; k < w.n_sel; ++k) {
                     sw.plane_off[k] = in_bytes;
                     in_bytes += align_up(sh[k].dense_bytes(), 64);
@@ -3211,7 +3338,7 @@ int Engine::load_weights() {
                 return RAD_E_FORMAT;
             }
             for (int k = 0; k < w.n_sel; ++k) {
-                const RadFilePlane& pk = file_->plane(*e, w.sel[k]);
+                const RadFilePlane& pk = source->plane(*e, w.sel[k]);
                 int64_t doff = stage >= 0 ? staged[(size_t)stage].plane_off[k] : 0;
                 for (const PlaneShare::Rect& q : sh[k].rects) {
                     const int64_t foff = (int64_t)pk.offset + q.row0 * sh[k].row_bytes + q.byte0;
@@ -3221,7 +3348,7 @@ int Engine::load_weights() {
                         foff + len > (int64_t)(pk.offset + pk.bytes)) {
                         RAD_ERR("rank %d: '%s' would read [%lld, %lld), outside its '%s' plane "
                                 "[%llu, %llu)", r->index, w.name.c_str(), (long long)foff,
-                                (long long)(foff + len), file_->encoding(*e).plane[w.sel[k]].role,
+                                (long long)(foff + len), source->encoding(*e).plane[w.sel[k]].role,
                                 (unsigned long long)pk.offset,
                                 (unsigned long long)(pk.offset + pk.bytes));
                         return RAD_E_FORMAT;
@@ -3229,11 +3356,11 @@ int Engine::load_weights() {
                     uint8_t* dst = stage >= 0 ? (uint8_t*)(intptr_t)doff : (uint8_t*)slot->ptr + doff;
                     const bool dense = q.byte0 == 0 && q.bytes == sh[k].row_bytes;
                     if (dense)
-                        runs.push_back(LoadRun{ foff, q.rows * q.bytes, dst, q.rows * q.bytes,
+                        bank_runs[w.file_id].push_back(LoadRun{ foff, q.rows * q.bytes, dst, q.rows * q.bytes,
                                                 q.rows * q.bytes, 1, r->index,
                                                 stage >= 0 ? 0 : (dev ? 1 : 0), stage });
                     else
-                        runs.push_back(LoadRun{ foff, len, dst, q.bytes, sh[k].row_bytes, q.rows,
+                        bank_runs[w.file_id].push_back(LoadRun{ foff, len, dst, q.bytes, sh[k].row_bytes, q.rows,
                                                 r->index, stage >= 0 ? 0 : (dev ? 1 : 0), stage });
                     total += q.rows * q.bytes;
                     doff += q.rows * q.bytes;
@@ -3249,62 +3376,6 @@ int Engine::load_weights() {
         return RAD_E_NOTFOUND;
     }
 
-    if(tiny_) {
-        auto& state=*tiny_;
-        if(staged.size()!=59||state.result.omitted_views!=96||state.result.omitted_source_bytes!=626688||total!=393856)return RAD_E_SHAPE;
-        std::array<TinyLoadJob,59> jobs{};
-        uint64_t context_bytes=tiny_contexts.capacity()*sizeof(TinyCheckpointContext)+131072; // independent verification scratch peak
-        for(size_t k=0;k<staged.size();++k) {
-            const auto& item=staged[k];auto& job=jobs[k];
-            job.program=item.prog;job.weight=item.wi;job.destination=item.dst;job.device=item.device;job.device_destination=item.dev;
-            job.input_bytes=item.in_bytes;std::copy(std::begin(item.plane_off),std::end(item.plane_off),std::begin(job.plane_offset));
-            job.fill=item.tiny_fill;job.fill_context=item.tiny_context;
-            const auto& c=tiny_contexts[k];context_bytes+=c.shares.capacity()*sizeof(PlaneShare)+c.selected.capacity()*sizeof(int)+c.offsets.capacity()*sizeof(int64_t);
-            for(const auto& share:c.shares)context_bytes+=share.rects.capacity()*sizeof(PlaneShare::Rect);
-        }
-        TinyLoaderQuote quote{};RAD_TRY(tiny_loader_quote(jobs.data(),jobs.size(),&quote));
-        if(context_bytes>2097152-quote.requested_bytes)return RAD_E_NOMEM;
-        quote.requested_bytes+=context_bytes;quote.page_upper=(quote.requested_bytes+4095)&~uint64_t(4095);
-        if(quote.page_upper>2097152)return RAD_E_NOMEM;
-        state.result.loader_context_bytes=context_bytes;
-        {
-            // Existing actual Pool/run/relayout; no second loader or payload cache.
-            RelayoutPool pool(staged,true);
-            const int start=pool.start_tiny(state.budget,quote,TinyLoaderFault::None,&state.result.loader);
-            if(start>=0)pool.queue_tiny();const int finished=pool.finish();
-            if(start<0)return start;if(finished<0)return finished;
-        }
-        state.result.ordinary_views=n_loaded;state.result.ordinary_source_bytes=total;
-        auto& r=*ranks_[0];std::vector<std::byte> scratch(131072);
-        // Independent full-plane read comparison; never call the loader fill function.
-        for(size_t i=1;i<r.program.weights.size();++i) {
-            const auto& w=r.program.weights[i];const auto unit=state.inventory->unit_for_weight(rad_weight(i));
-            if(state.inventory->find(unit))continue;
-            const auto* cw=checkpoint_find(w.source);const auto* slot=r.mover.residency()->lookup(rad_weight(i));
-            if(!cw||!slot||!slot->ptr||slot->ready||w.ptr!=slot->ptr||!w.identity||w.widen||w.n_sel!=1)return RAD_E_STATE;
-            int64_t rows=0,cols=0;const auto& plane=cw->enc.plane[w.sel[0]];rad_enc_plane_dims(&plane,cw->rows,cw->cols,&rows,&cols);
-            const int64_t bytes=rows*rad_enc_row_bytes(plane.dtype,cols);
-            if(bytes!=w.stored_bytes||bytes<=0||size_t(bytes)>scratch.size())return RAD_E_SHAPE;
-            RAD_TRY(ckpt_plane_rows(*cw,w.sel[0],0,rows,scratch.data(),nullptr));
-            if(std::memcmp(slot->ptr,scratch.data(),size_t(bytes)))return RAD_E_STATE;
-            ++state.result.ordinary_checked;
-        }
-        for(const auto unit_id:state.records->resident_units()) {
-            if(unit_id<0||size_t(unit_id)>=state.metadata_plan.units.size())return RAD_E_STATE;
-            const auto& unit=state.metadata_plan.units[size_t(unit_id)];
-            if(unit.weights.size()!=4||unit.offset.size()!=4||unit.bytes<=0||size_t(unit.bytes)>scratch.size())return RAD_E_SHAPE;
-            std::fill(scratch.begin(),scratch.end(),std::byte{0xcd});
-            RAD_TRY(state.records->bootstrap(unit_id,std::span<std::byte>(scratch.data(),size_t(unit.bytes))));
-            for(size_t m=0;m<4;++m) {
-                const auto h=unit.weights[m];const auto& w=r.program.weights[h];const auto* slot=r.mover.residency()->lookup(h);
-                if(!slot||!slot->ptr||slot->ready||w.ptr!=slot->ptr||unit.offset[m]<0||w.stored_bytes<=0||unit.offset[m]+w.stored_bytes>unit.bytes||
-                    std::memcmp(slot->ptr,scratch.data()+unit.offset[m],size_t(w.stored_bytes)))return RAD_E_STATE;
-                ++state.result.resident_members_checked;
-            }
-        }
-        if(state.result.ordinary_checked!=59||state.result.resident_members_checked!=32)return RAD_E_STATE;
-        RAD_TRY(state.records->audit());RAD_TRY(state.binding->audit());return RAD_OK;
-    }
     /* ============================================================== the sweep */
     std::vector<int> devices;
     devices.reserve(ranks_.size());
@@ -3320,7 +3391,13 @@ int Engine::load_weights() {
     const auto rt0 = std::chrono::steady_clock::now();
     int sw_st = RAD_OK;
     if (file_) {
-        sw_st = sweep_container(file_.get(), runs, devices, &pool, &read_bytes);
+        if(source_banks_){
+            int64_t rewarm_remaining=std::max<int64_t>(0,meminfo_bytes("MemAvailable")/2);
+            for(uint32_t bank=0;bank<2&&sw_st==RAD_OK;++bank){
+                int64_t n=0;sw_st=sweep_container(const_cast<RadFile*>(source_banks_->file(bank)),bank_runs[bank],devices,&pool,&n,mapped_ranges[bank],source_banks_.get(),bank,&rewarm_remaining);
+                read_bytes+=n;
+            }
+        }else sw_st=sweep_container(file_.get(),bank_runs[0],devices,&pool,&read_bytes,mapped_ranges[0]);
     } else {
         /* Every weight to the workers in declaration order, as the budget allows. */
         for (size_t k = 0; k < staged.size() && !pool.failed(); ++k) {
@@ -3333,6 +3410,7 @@ int Engine::load_weights() {
     const int pool_st = pool.finish();
     RAD_TRY(sw_st);
     RAD_TRY(pool_st);
+    if(source_banks_&&!source_banks_->same_epoch())return RAD_E_STATE;
     if (!staged.empty() && file_)
         RAD_INFO("load: %zu weight(s), %s of planes, rearranged for their kernels by %d worker(s) "
                  "behind the read, %s held at most; done %.1f s after the read began",
@@ -3371,6 +3449,17 @@ int Engine::load_weights() {
  * mapped tables read through and to the host's other work. It is pinned before the host
  * activation arenas and the prefix cache's host tier, so their bytes count as still to come;
  * on a card the amdgpu pin cap bounds it too. */
+std::string Engine::cache_margin_hint() const {
+    if (cfg_.expert_ram_cache_total_mib <= 0 || cache_backed_bytes_ > 0) return std::string();
+    int64_t backed = 0;
+    for (const auto& r : ranks_) backed += r->mover.mapped_cache_backed_bytes();
+    if (backed <= 0) return std::string();
+    return fmt(". The expert RAM cache's slabs already hold %s, gone from the memory available, "
+               "and the margin reserves its whole --expert-ram-cache-total-mib again: "
+               "RADIANCE_EXPERIMENTAL_CACHE_HEADROOM_BACKED=1 keeps only what it has yet to grow",
+               humanb(backed).c_str());
+}
+
 int Engine::size_checkpoint_store(int64_t slot, const char* what) {
     if (slot <= 0 || !cfg_.prefix_cache) {
         cfg_.checkpoint_slots = 0;
@@ -3425,8 +3514,8 @@ int Engine::size_checkpoint_store(int64_t slot, const char* what) {
     if (c.slots == 0) {
         RAD_WARN("checkpoint slots: auto finds no room for one %s snapshot of %s (%s), so every "
                  "prefix hit on this model prefills from the start. Free host memory, or lower "
-                 "--host-pool-mib or --prefix-cache-mib", what, humanb(slot).c_str(),
-                 limit.c_str());
+                 "--host-pool-mib or --prefix-cache-mib%s", what, humanb(slot).c_str(),
+                 limit.c_str(), cache_margin_hint().c_str());
         return RAD_OK;
     }
     const std::string line =
@@ -3439,11 +3528,26 @@ int Engine::size_checkpoint_store(int64_t slot, const char* what) {
 }
 
 int Engine::configure_kv() {
+    /* RADIANCE_EXPERIMENTAL_CACHE_HEADROOM_BACKED=1: the RAM cache's slabs are allocated by now
+     * (all of them under ..._PREGROW, pinned at the weights' load), so the host checks below (the
+     * checkpoint store, KV mirrors) stop reserving those bytes on top of MemAvailable, which no
+     * longer has them. Without it a 96 GiB pregrown cache counts twice and leaves the checkpoint
+     * store no room: every prefix hit on a model with snapshots then prefills from the start. */
+    cache_backed_bytes_ = 0;
+    if (const char* hb = std::getenv("RADIANCE_EXPERIMENTAL_CACHE_HEADROOM_BACKED");
+        hb && !std::strcmp(hb, "1") && cfg_.expert_ram_cache_total_mib > 0) {
+        for (auto& r : ranks_) cache_backed_bytes_ += r->mover.mapped_cache_backed_bytes();
+        const int64_t MiB = (int64_t)1 << 20;
+        RAD_INFO("host headroom: RADIANCE_EXPERIMENTAL_CACHE_HEADROOM_BACKED: the RAM cache's slabs "
+                 "already hold %s of its %s budget, so the checks from here on keep %s free "
+                 "(--host-headroom-mib %lld and the %s it has yet to grow) beside what they "
+                 "allocate", humanb(cache_backed_bytes_).c_str(),
+                 humanb(cfg_.expert_ram_cache_total_mib * MiB).c_str(),
+                 humanb(host_headroom_bytes()).c_str(), (long long)cfg_.host_headroom_mib,
+                 humanb(host_headroom_bytes() - cfg_.host_headroom_mib * MiB).c_str());
+    }
     /* Resolved once, for the cache below and Scheduler::init later (see Engine::geo_). */
-    if(glm_main_){
-        if(!cache_prepare4_||!cache_prepare4_->runtime_admitted()||glm_main_->geometry[0].shared_tok!=1)return RAD_E_STATE;
-        geo_=glm_main_->geometry[0]; // actual checked pre-Pools geometry, including true Q
-    }else RAD_TRY(chunk_geometry_resolve(ranks_[0]->program, cfg_, &geo_));
+    RAD_TRY(chunk_geometry_resolve(ranks_[0]->program, cfg_, &geo_));
     if (geo_.checkpoint_interval != cfg_.checkpoint_interval)
         decide("--checkpoint-interval",
                geo_.checkpoint_interval ? std::to_string(geo_.checkpoint_interval) : "0 (none)",
@@ -3452,6 +3556,14 @@ int Engine::configure_kv() {
                          "block and the linear-state chunk), so a checkpoint is a legal chunk split",
                          (long long)geo_.quantum)
                    : std::string("the model keeps no linear state to checkpoint"));
+    /* KV streaming's policy, refusals and ring (kvstream/bringup.h), decided once from rank 0's
+     * declarations: a streamed group must be the same group on every rank. */
+    KVStreamSetup stream;
+    if (!ranks_.empty())
+        RAD_TRY(kvstream_configure(cfg_, cfg_.max_ctx ? cfg_.max_ctx : meta_.n_ctx_train,
+                                   ranks_[0]->program.kv_groups, ranks_[0]->program, &stream));
+    if (stream.group >= 0)
+        for (auto& r : ranks_) r->kv.cap_resident_tokens(stream.group, stream.ring_tokens);
     /* One block table serves every rank (serve() checks it), so every rank carves the same number
      * of paged blocks. Under an uneven split the pools differ (more delta-net heads, or zero
      * attention weights), so each rank is planned first and all are capped at the least before
@@ -3475,6 +3587,22 @@ int Engine::configure_kv() {
         if (t == KVManager::kUnboundedTokens) continue;   /* holds no cache; limits nobody */
         if (least < 0 || t < least) least = t;
     }
+    /* The mirrors are checked once, before any rank pins one, against the host tiers still to be
+     * pinned after them: the prefix cache's, the activation arenas and, when sized already, the
+     * checkpoint store. */
+    KVStreamHostUse stream_host;
+    for (auto& r : ranks_) kvstream_host_add(&stream_host, r->kv);
+    if (stream_host.sum.host_bytes > 0) {
+        const int64_t MiB = (int64_t)1 << 20;
+        int64_t still = cfg_.prefix_cache_mib * MiB;
+        for (auto& r : ranks_) still += arena_host_bytes(r->program);
+        if (cfg_.checkpoint_slots > 0) {
+            int64_t slot = 0;
+            for (auto& r : ranks_) slot += r->kv.checkpoint_bytes();
+            still += slot * cfg_.checkpoint_slots;
+        }
+        RAD_TRY(kvstream_host_gate(stream_host, (int)ranks_.size(), still, host_headroom_bytes()));
+    }
     for (auto& r : ranks_) {
         LogRank lr(r->index);
         RAD_TRY(rad_dev_set(r->device));   /* allocates on the current device; see plan() */
@@ -3486,7 +3614,13 @@ int Engine::configure_kv() {
                          (long long)least);
             r->kv.cap_paged_tokens(least);
         }
+        /* Before the carve, which refuses a streamed plan with no mirror and maps. The maps come out
+         * of this rank's KV pool, so the paged split sees them taken. */
+        const KVManager::StreamCost sc = r->kv.stream_cost();
+        if (sc.groups > 0)
+            RAD_TRY(r->kv.alloc_stream(rad_device_allocator(), r->pools.kv()));
         RAD_TRY(r->kv.carve(r->pools.kv()));
+        if (sc.groups > 0) RAD_TRY(kvstream_fill(r->kv));   /* the maps, after the elastic pool */
         /* Without virtual memory management the cache cannot lend: everything still works, but
          * the expert slab never grows, which no counter shows, so log it once. */
         if (r->index == 0 && !r->pools.kv().elastic())
@@ -3510,8 +3644,11 @@ int Engine::configure_kv() {
             shard_off[i] = slot;
             slot += ranks_[i]->kv.checkpoint_bytes();
         }
-        /* A slot holds linear state or a trunk's window, never both (KVGroupPlan::win_snap). */
-        const char* what = ranks_[0]->kv.has_window_snapshot() ? "sliding-window" : "linear-state";
+        /* A slot holds linear state, a trunk's window (KVGroupPlan::win_snap), or both. */
+        bool linear = false;
+        for (const KVGroupPlan& p : ranks_[0]->kv.plans()) linear = linear || p.stateful();
+        const char* what = !ranks_[0]->kv.has_window_snapshot() ? "linear-state"
+                           : linear ? "linear-state + sliding-window" : "sliding-window";
         const bool sized_auto = cfg_.checkpoint_slots < 0;
         if (sized_auto) RAD_TRY(size_checkpoint_store(slot, what));
         const int64_t n = cfg_.checkpoint_slots > 0 ? cfg_.checkpoint_slots : 0;
@@ -3535,7 +3672,7 @@ int Engine::configure_kv() {
             if (!sized) return refuse("no host has");
             std::string why;
             if (!lockable_room(slot * n, 0, host_headroom_bytes(), false, &why))
-                return refuse("does not fit: " + why);
+                return refuse("does not fit: " + why + cache_margin_hint());
             if (ck_store_.open(slot, slot * n) != RAD_OK)
                 return refuse(std::string("the host did not pin: ") + rad_dev_last_error());
             if (!sized_auto)
@@ -3561,7 +3698,9 @@ int Engine::configure_kv() {
      * sessions view reads. The flags gate only the mover, below. */
     {
         const bool tier_asked = cfg_.prefix_cache_mib > 0;
-        const std::vector<int32_t>& cg = ranks_[0]->prefix.cached_groups();
+        /* An entry's blocks, one group per block: a cached group whose blocks are shorter than
+         * the entry appears once for each of its blocks (PrefixCache::entry_groups). */
+        const std::vector<int32_t>& cg = ranks_[0]->prefix.entry_groups();
         /* One slot holds the whole engine's entry: the groups every rank holds alike
          * (rad_kv_group_replicated) once, at the front, then every rank's own shard in its own
          * window. Shards can differ or be empty (uneven heads, rad_kv_group_zero). The layout is
@@ -3687,6 +3826,7 @@ int Engine::configure_kv() {
     }
 
     RAD_INFO("kv: %s", ranks_[0]->kv.report().c_str());
+    kvstream_report(stream, stream_host, (int)ranks_.size());
     /* The prefix cache's report: on or off, groups covered and skipped. It names the two things
      * that silently disable caching on a hybrid model: a windowed group cannot be served a prefix,
      * and a linear model with no checkpoint interval replays from zero. */
@@ -3744,9 +3884,16 @@ int Engine::configure_kv() {
 
 /* ================================================================== start */
 int Engine::start() {
-    if(tiny_)return start_tiny_transport();
-    if(glm_main_)return start_glm_main();
+    // Before device discovery, model open or generic draft-host automatic pool growth.
+    if (draft_placement_modes_conflict(cfg_)) {
+        RAD_ERR("draft placement: experimental bank and generic manual modes cannot be combined");
+        return RAD_E_INVAL;
+    }
     startup_begin_ns_ = rad_mono_ns();
+    if (!draft_experiment_.valid()) {
+        RAD_ERR("experimental draft control: stats/OFF must be absent or0|1, verify cap absent or0..5, with no positive-cap/OFF conflict");
+        return RAD_E_INVAL;
+    }
     std::vector<int> devs;
     std::string inventory;
     std::string devnote;
@@ -3776,7 +3923,6 @@ int Engine::start() {
     rad_tools_registry().set_code_device(devs[0]);
     rad_tools_registry().set_no_device_code(device_is_host());
     RAD_TRY(load_plugins());
-    RAD_TRY(glm_main_tp4_cold_source_gate()); // absent complete-store factory: BEFORE declare/init/Plan/Pools
     {
         /* The loaded libraries in selection order: as --kernels named them, or every library in
          * the home. */
@@ -3831,6 +3977,23 @@ int Engine::start() {
         const bool forced_off = cfg_.p2p == RAD_P2P_OFF;
         if (forced_off) p2p = 0;
         rad_tools_registry().set_device_fact(RAD_FACT_P2P, p2p);
+        /* RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED (place/vram_packed.h): the machine fact that lets libr4d's
+         * moe_gemm_ggml_mxfp4_gemv_vp row take the routed GEMMs' decode band, set before selection as
+         * device.p2p is. Without it the row never matches and nothing below packs. */
+        RAD_TRY(vram_pack_config(&vram_pack_cfg_));
+        if (vram_pack_cfg_.on) {
+            const char* oracle = std::getenv("RADIANCE_OP_ORACLE");
+            if (oracle && *oracle) {
+                RAD_ERR("RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED=1 with RADIANCE_OP_ORACLE: the oracle reads a "
+                        "weight back through its stored form, block_mxfp4, and a packed VRAM resident is not "
+                        "in it; run the oracle without the switch");
+                return RAD_E_INVAL;
+            }
+            rad_tools_registry().set_device_fact(kVramPackFact, 1);
+            RAD_INFO("VRAM packed experts (RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED): %s selects %s for the routed "
+                     "GEMMs' decode band; static residents with room for %d (gate_up) and %d (down) raw rounds",
+                     kVramPackFact, kVramPackRow, vram_pack_cfg_.raw[0], vram_pack_cfg_.raw[1]);
+        }
         p2p_measured_ = (int)p2p;
         p2p_blocked_ = blocked;
         if (cfg_.tp > 1)
@@ -3885,6 +4048,35 @@ int Engine::start() {
     }
 
     RAD_TRY(plan());
+    if (draft_experiment_.scope_required()) {
+        if (ranks_.size() != 4) return RAD_E_UNSUPPORTED;
+        /* The cap measures the full block's query unless the drafter declared a short block
+         * (deepseek41's RADIANCE_EXPERIMENTAL_DS41_DSPARK_SHORT_BLOCK) and --draft-short-from 1
+         * runs it on every decoding step (max_seqs is 1 here): its first k proposals are then the
+         * verified ones. */
+        const bool short_ok = cfg_.draft_short_from == 0 || (cfg_.draft_short_from == 1 && drafter_short_ > 0);
+        for (const auto& r : ranks_) {
+            if (!dspark_draft_control_scope(r->program, r->plan, cfg_, bool(source_banks_)) ||
+                (draft_experiment_.verify_cap() >= 0 && !short_ok)) {
+                RAD_ERR("experimental draft control requires a bound native DSpark EP4 "
+                        "fixed-depth5 bank and all96 final immutable host-pinned head pairs (verify cap "
+                        "also requires draft-short-from0, or 1 with the drafter's short block)");
+                return RAD_E_UNSUPPORTED;
+            }
+        }
+        if (draft_experiment_.compute_off())
+            RAD_INFO("experimental draft compute OFF: configured depth5, Program, banks and pools "
+                     "retained; learned context/query and scheduler fallback disabled; "
+                     "ordinary target pipelining restored");
+        else if (cfg_.draft_short_from == 1 && drafter_short_ > 0)
+            RAD_INFO("experimental draft verify cap: k=%d; configured depth5, short%lld query/proposal "
+                     "(--draft-short-from 1), Program, banks and pools retained; only the verified prefix "
+                     "is capped", draft_experiment_.verify_cap(), (long long)drafter_short_);
+        else
+            RAD_INFO("experimental draft verify cap: k=%d; configured depth5, full5 query/proposal, "
+                     "Program, banks and pools retained; only the verified prefix is capped",
+                     draft_experiment_.verify_cap());
+    }
     RAD_TRY(load_weights());
     RAD_TRY(configure_kv());
 
@@ -3900,6 +4092,8 @@ int Engine::start() {
         d.residency   = r->plan.strategy == Strategy::AllVram ? nullptr : r->mover.residency();
         d.arch_step   = arch_step_;
         d.profile_ops = cfg_.profile_ops;
+        d.row_prefetch = cfg_.row_prefetch;
+        d.tape_dump   = cfg_.debug_tape_dump;
         bind_kv_pools(r->program, [&](int32_t g) { return r->kv.plan(g); }, &d.kv);
         d.registry    = &rad_tools_registry();
         RAD_TRY(r->ctx.init(d));
@@ -3936,13 +4130,24 @@ int Engine::start() {
                          r->stager.n_layers(), (int)PrefillStager::lead());
         }
         /* The file stager, wherever a routed expert is on the file tier (static or dynamic plan;
-         * such a unit has no other address). */
-        RAD_TRY(r->fstager.init(r->program, r->plan, &r->mover));
+         * such a unit has no other address). A small pass reads only the experts its router
+         * picked, from the core's counts row (Ctx::route_counts_live). */
+        Ctx* const rctx = &r->ctx;
+        RAD_TRY(r->fstager.init(r->program, r->plan, &r->mover,
+                                [rctx](int32_t layer, int64_t* ne, int64_t* top_k) {
+                                    return rctx->route_counts_live(layer, ne, top_k);
+                                },
+                                [rctx](int32_t layer, EpRouteCounts* out) {
+                                    return rctx->ep_route_counts_live(layer, out);
+                                }));
         if (r->fstager.enabled() && r->index == 0)
             RAD_INFO("file stager: %zu routed layers hold experts read from the container; each "
                      "pass reads a layer's (up to %s) into one of two VRAM buffers before its "
-                     "first expert op, so every step is paced by the drive",
-                     r->fstager.n_layers(), humanb(r->plan.file_layer_max).c_str());
+                     "first expert op, so every step is paced by the drive%s",
+                     r->fstager.n_layers(), humanb(r->plan.file_layer_max).c_str(),
+                     r->fstager.routed_reads() ? "; a pass of at most 64 tokens reads only the "
+                                                 "experts it routes to"
+                                               : "");
         if (r->stager.enabled() && r->fstager.enabled()) {
             r->stagers.set(&r->stager, &r->fstager);
             r->ctx.set_stager(&r->stagers);
@@ -3972,8 +4177,8 @@ int Engine::start() {
             const int64_t lbpb = p.layer_bytes_per_block(), stripe = p.layer_stride();
             for (int64_t L = 0; L < p.n_layers; ++L) {
                 LoanStrip st;
-                st.top = (char*)p.base + L * stripe + p.n_blocks * lbpb;
-                st.bytes = p.n_blocks * lbpb;
+                st.top = (char*)p.base + L * stripe + p.pool_blocks() * lbpb;
+                st.bytes = p.pool_blocks() * lbpb;
                 st.unit_bytes = lbpb;
                 st.unit_tokens = p.block_size;
                 strips.push_back(st);
@@ -4234,17 +4439,17 @@ int Engine::load_vocab() {
             return RAD_E_FORMAT;
         }
         RAD_TRY(vocab_deserialize(file_->base(), (uint64_t)file_->size(), vs.h, vb));
-    } else if (checkpoint_view()->is_gguf()) {
+    } else if (ckpt_->is_gguf()) {
         /* GGUF names its pre-tokeniser; the chain is reconstructed from the name or refused (a
          * container converted with --tokenizer bakes in the declared one). */
-        RAD_TRY(vocab_from_gguf(checkpoint_view()->gguf(), vb));
+        RAD_TRY(vocab_from_gguf(ckpt_->gguf(), vb));
     } else {
         /* With tokenizer_config.json and chat_template.jinja: beside config.json in a model
          * repository, in a diffusers pipeline's processor/ or tokenizer/ folder. */
-        const std::string tj = checkpoint_view()->tok_dir() + "/tokenizer.json";
+        const std::string tj = ckpt_->tok_dir() + "/tokenizer.json";
         if (parse_tokenizer_json(tj.c_str(), vb) < 0) {
             RAD_ERR("%s: no readable tokenizer.json in %s", cfg_.model.c_str(),
-                    checkpoint_view()->tok_dir().c_str());
+                    ckpt_->tok_dir().c_str());
             return RAD_E_FORMAT;
         }
     }
@@ -4315,10 +4520,6 @@ int Engine::load_vocab() {
     if (gs < 0) {
         RAD_ERR("gbnf: the vocabulary index could not be built: %s", rad_strerror(gs));
         return gs;
-    }
-    if(tiny_) {
-        tiny_->result.vocab_index_bytes=gi.bytes;
-        if(gi.bytes>(1u<<20))return RAD_E_UNSUPPORTED;
     }
     RAD_INFO("gbnf: vocabulary index built in %.0f ms, %s", gi.build_ms,
              humanb((int64_t)gi.bytes).c_str());

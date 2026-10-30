@@ -1,0 +1,12 @@
+Warning: Resource leak detected by SharedSignalPool, 575 Signals leaked.
+prefill T=1: gate_up, 1 live experts, 1 local rows: median 67.8 us, 184.8 GB/s of weights
+prefill T=1: down   , 1 live experts, 1 local rows: median 50.4 us, 124.3 GB/s of weights
+prefill T=2: gate_up, 1 live experts, 1 local rows: median 104.0 us, 120.5 GB/s of weights
+prefill T=2: down   , 1 live experts, 1 local rows: median 69.8 us, 89.7 GB/s of weights
+prefill T=4: gate_up, 4 live experts, 4 local rows: median 204.0 us, 245.7 GB/s of weights
+prefill T=4: down   , 4 live experts, 4 local rows: median 138.7 us, 180.8 GB/s of weights
+prefill T=8: gate_up, 10 live experts, 10 local rows: median 418.1 us, 299.8 GB/s of weights
+prefill T=8: down   , 10 live experts, 10 local rows: median 262.2 us, 239.0 GB/s of weights
+prefill T=16: gate_up, 23 live experts, 26 local rows: median 1233.7 us, 233.7 GB/s of weights
+prefill T=16: down   , 23 live experts, 26 local rows: median 534.6 us, 269.6 GB/s of weights
+ptime exit 0

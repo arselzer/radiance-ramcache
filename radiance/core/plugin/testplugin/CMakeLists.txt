@@ -75,25 +75,6 @@ rad_add_plugin(radtest_rows testrows SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/tierrow
 # path to check that its weights decode through the core's decoder.
 rad_add_plugin(radtest_quant testquant SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/testquant.cc)
 
-rad_add_plugin(radtest_importarch testarch/import SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/importarch.cc)
-rad_add_plugin(radtest_importkernel testkernels/import SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/importkernel.cc)
-# Native GGUF layout metadata only; deliberately outside the serving kernel scan.
-rad_add_plugin(radtest_repackkernel testkernels/repack SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/repackkernel.cc)
-rad_add_plugin(radtest_ds41meta testkernels/ds41meta
-  SOURCES ${CMAKE_SOURCE_DIR}/libds41/ds41_packed_rows.cpp ${CMAKE_CURRENT_SOURCE_DIR}/ds41meta.cc)
-target_compile_definitions(radtest_ds41meta PRIVATE DS41_METADATA_ONLY=1)
-target_compile_options(radtest_ds41meta PRIVATE -ffp-contract=off)
-foreach(variant RANGE 0 6)
-  rad_add_plugin(radtest_status_${variant} teststatus
-    SOURCES ${CMAKE_SOURCE_DIR}/tests/deferred_status_plugin.cpp)
-  target_compile_definitions(radtest_status_${variant} PRIVATE DS_STATUS_VARIANT=${variant})
-  set_target_properties(radtest_status_${variant} PROPERTIES OUTPUT_NAME status${variant})
-endforeach()
-foreach(case RANGE 1 5)
-  rad_add_plugin(radtest_importbad_${case} testquant/import SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/importplugin.cc)
-  target_compile_definitions(radtest_importbad_${case} PRIVATE IMPORT_CASE=${case})
-endforeach()
-
 # Deliberately defective kernel libraries, one per defect, for tests/kbench_mutant_test.cpp: a
 # replay must fail each of them (or, for kbm_ok, pass it). One source, as above; KBM_MUTANT picks
 # the defect. Under testkernels/kbmut, loaded only by name.
@@ -109,13 +90,3 @@ endforeach()
 # An architecture that declares a norm, a projection and an add from a synthetic container, so
 # tests/kbench_mutant_test.cpp can record a fixture on the host with libref alone.
 rad_add_plugin(radtest_kbarch testarch/kbench SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/kbarch.cc)
-
-# Targeted host regression builds need every loader/movement fixture, just as a
-# full build does. Keep these test-only modules outside the serving scan.
-get_property(RAD_TEST_PLUGIN_TARGETS DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
-add_custom_target(radtest_plugin_fixtures DEPENDS ${RAD_TEST_PLUGIN_TARGETS})
-
-# Architecture policy fixture: never installed in serving architecture scan.
-rad_add_plugin(radtest_model_policy testpolicy
-  SOURCES ${CMAKE_SOURCE_DIR}/tests/model_failure_policy_plugin.cpp)
-set_target_properties(radtest_model_policy PROPERTIES OUTPUT_NAME policy)

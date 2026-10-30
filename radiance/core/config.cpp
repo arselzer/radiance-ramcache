@@ -39,7 +39,7 @@ static const std::string g_draft_window_help =
     std::string("fixed | adaptive: how many drafts each sequence carries. fixed drafts\n"
                 "                                    --num-speculative-tokens every step; adaptive makes that\n"
                 "                                    the ceiling and follows each sequence's acceptance and the\n"
-                "                                    measured step cost (a serial draft head only). Default ") +
+                "                                    measured step cost (a draft head, or prompt lookup alone). Default ") +
     draft_window_name(kDraftWindowDefault);
 
 static const Flag g_flags[] = {
@@ -60,6 +60,9 @@ static const Flag g_flags[] = {
                                         "attention splits over the ranks: rows gives each rank all\n"
                                         "heads of its rows, a faster prefill for the projections at\n"
                                         "full width on every card; not bit-identical to heads" },
+    { "--weight-prefetch",    "MODE",   "on (default) | off -- read a GEMM's weight into the cache\n"
+                                        "beside the collective before it; off for an engine that\n"
+                                        "shares its cards with another server" },
     { "--p2p",                "MODE",   "how the collectives reach the other cards: auto (default)\n"
                                         "asks the driver, on requires peer access and stops without\n"
                                         "it, off exchanges through pinned host memory" },
@@ -85,6 +88,11 @@ static const Flag g_flags[] = {
     { "--attn-prefill-fp8",   "MODE",   "off (default) | qk | pv | both -- the prefill attention's\n"
                                         "Q.K^T, P.V or both as e4m3 WMMA over an fp8, fp8_v4 or\n"
                                         "k6_v4 cache: faster at long context, and lossy" },
+    { "--kv-resident",        "N",      "stream the sparse attention group's KV from host memory,\n"
+    "                                    keeping N tokens of it in a VRAM ring (0, the default, is\n"
+    "                                    off). Raised to 32768 and to what one decode step selects;\n"
+    "                                    a ring that covers the context (sequences x\n"
+    "                                    --max-model-len) streams nothing" },
     { "--host-pool-mib",      "N",      "pinned host tier" },
     { "--host-headroom-mib",  "N",      "host RAM to leave free for the system when radiance\n"
     "                                    pins its host memory at startup (default 4096)" },
@@ -106,10 +114,36 @@ static const Flag g_flags[] = {
     { "--weights-disk-tier",  nullptr,  "read weights that fit neither VRAM nor the host pool from the\n"
     "                                    container on disk (O_DIRECT); a routed expert is read a layer\n"
     "                                    at a time, so a step is paced by the drive" },
+    { "--expert-ram-cache-total-mib", "MIB", "native expert RAM cache across all ranks (default 0, off);\n"
+    "                                    includes cache metadata, separate from the fixed host pool;\n"
+    "                                    requires --weights-disk-tier" },
+    { "--expert-plane-mirror", "DIR",   "DeepSeek-V4.1 with host experts: the checkpoint's\n"
+    "                                    model-*.safetensors on another drive than the container;\n"
+    "                                    part of each missed expert is read from it beside the\n"
+    "                                    container (default: none, the container only); requires\n"
+    "                                    --weights-disk-tier" },
+    { "--expert-plane-mirror-share", "F", "the fraction of a missed expert's bytes read from\n"
+    "                                    --expert-plane-mirror (default 0.18, at most 0.31)" },
+    { "--expert-plane-mirror-min-rows", "N", "the fewest tokens a pass has for the share above\n"
+    "                                    (default 2: prefill chunks)" },
+    { "--expert-plane-mirror-decode-share", "F", "the fraction read from --expert-plane-mirror in\n"
+    "                                    smaller passes, decode (default 0: the container only;\n"
+    "                                    at most 0.31)" },
+    { "--row-prefetch",       "MODE",   "on (default) | off -- a host gather from a table read through\n"
+    "                                    the container's mapping (--ngram-placement disk) asks for the\n"
+    "                                    pages its rows cover before its kernel runs, or beside it when\n"
+    "                                    they are already resident; off leaves every row to the\n"
+    "                                    kernel's own page faults. The output is the same either way" },
+    { "--mapped-rewarm",      "MODE",   "on (default) | off -- at startup, ask the page cache again for\n"
+    "                                    the pages of a table read through the container's mapping\n"
+    "                                    that an earlier run left cached and the load's own\n"
+    "                                    allocations pushed out, at most half of the available memory,\n"
+    "                                    so the first requests do not read them from the drive" },
     { "--prefix-cache-mib",   "N",      "copy finished conversations' KV to host memory, up to N MiB,\n"
     "                                    so their VRAM can go to experts and a return restores\n"
     "                                    instead of re-prefilling. A full tier drops its least\n"
-    "                                    recently used entries. 0 is off" },
+    "                                    recently used entries. 0 is off. Off while a KV group\n"
+    "                                    streams (--kv-resident)" },
     { "--prefix-cache-ttl",   "S",      "seconds a cached conversation no request uses is kept, in VRAM\n"
     "                                    or host memory (default 3600). 0 keeps it until the memory\n"
     "                                    is wanted" },
@@ -158,21 +192,38 @@ static const Flag g_flags[] = {
     "                                    one, for each of --max-num-seqs, within an eighth of host\n"
     "                                    memory. N fixes the total; 0 keeps none" },
     { "--no-prefix-cache",    nullptr,  "disable prefix caching" },
+    { "--prefix-resume",      "MODE",   "where a prefix hit resumes: exact (default) only where\n"
+    "                                    an idle server's cold prefill of the prompt starts a\n"
+    "                                    chunk, so the hit answers bit-identically to a cold run;\n"
+    "                                    nearest at the deepest snapshot, up to a chunk less to\n"
+    "                                    re-prefill" },
     { "--checkpoint-policy",  "NAME",   "which snapshots a session retains: geometric-backoff "
                                         "(default), tip-only, keep-all" },
 
     { "--num-speculative-tokens", "N",  "speculative window; 0 disables. Default `auto`: the drafter's\n"
     "                                    own operating point, which the plugin states. A container\n"
     "                                    with no draft head is unaffected -- auto resolves to 0." },
+    { "--spec-ngram",         "K",      "speculate by prompt lookup alone: up to K drafts a step\n"
+    "                                    copied from what followed the latest earlier occurrence of\n"
+    "                                    the sequence's last n tokens (no weights, no draft pass).\n"
+    "                                    Sets the window to K; a draft head the container carries is\n"
+    "                                    not loaded. A proposal is verified only when its record\n"
+    "                                    says it pays at the measured step cost. 0 (default) off" },
+    { "--spec-ngram-min",     "N",      "shortest pattern prompt lookup matches (default 2)" },
+    { "--spec-ngram-max",     "N",      "longest pattern prompt lookup matches, tried first\n"
+                                        "(default 4, at most 15)" },
     { "--draft-window",       "MODE",   g_draft_window_help.c_str() },
     { "--draft-short-from",   "N",      "a block drafter that also serves a shorter block runs it\n"
                                         "from N decoding sequences on (0 never, the default): the\n"
                                         "long block pays at one sequence, the short one at many" },
-    { "--draft-coupling",     "MODE",   "off (default) | on -- a linear MTP drafter samples each proposal\n"
-    "                                    from its own shortlist and the sampler couples the target's draw\n"
-    "                                    to it: more accepted drafts on sampled requests, the same output\n"
-    "                                    law, other tokens than off for a fixed seed" },
+    { "--draft-coupling",     "MODE",   "off (default) | on -- a linear MTP drafter or DFlash2's walk\n"
+    "                                    samples each proposal from its own shortlist and the sampler\n"
+    "                                    couples the target's draw to it: more accepted drafts on sampled\n"
+    "                                    requests, the same output law, other tokens than off for a fixed\n"
+    "                                    seed" },
     { "--draft-model",        "PATH",   "NOT IMPLEMENTED -- merge the drafter at convert time" },
+    { "--draft-bank",         "FILE",   "experimental missing-only DSpark RAD; requires RADIANCE_EXPERIMENTAL_DS41_DSPARK_RAD_BANK=1" },
+    { "--draft-bank-expert-placement", "auto|host", "experimental DSpark expert placement; host charges the existing pinned pool" },
 
     { "--host",               "ADDR",   "listen address" },
     { "--port",               "N",      "listen port" },
@@ -279,11 +330,36 @@ static const Flag g_flags[] = {
     { "--debug-graph",        nullptr,  "print the entire declared graph and exit-quality detail" },
     { "--debug-selection",    nullptr,  "print the selection table" },
     { "--debug-placement",    nullptr,  "print the placement plan" },
+    { "--debug-tape-dump",    nullptr,  "list the dispatches of the first recorded pass of each kind\n"
+    "                                    on stderr (TAPEDUMP lines, every rank) and which of them\n"
+    "                                    start unordered behind the one before" },
+    { "--debug-draft-oracle", "FILE",   "a verify-path test, not a drafter: with --spec-ngram, prompt\n"
+    "                                    lookup proposes from the token ids in FILE (a plain greedy\n"
+    "                                    run's continuation of the one prompt the test sends), 30% of\n"
+    "                                    the drafts corrupted; the text must stay the plain run's" },
     { "--debug-accept-reference-kernels", nullptr,
       "serve even when ops resolve only to a reference library. NOT a production configuration: the reference\n"
       "                              implementation is an oracle and a last resort, and falling back\n"
       "                              to it is orders of magnitude of speed with nothing to say so." },
     { "--profile-ops",        nullptr,  "per-op device timing (see the caveat it prints)" },
+    { "--expert-stats",       "FILE",   "count the routed experts every layer selects, apart for prefill, decode,\n"
+    "                                    mixed steps and draft-head passes, and write the counts to FILE as\n"
+    "                                    JSON every 30 s and at shutdown. From the routing histograms the core\n"
+    "                                    already copies back: no device work, no synchronisation" },
+    { "--expert-profile",     "FILE",   "rank the expert plane by this radiance-expert-stats JSON's `decode`\n"
+    "                                    counts instead of the container's activation profile, which is\n"
+    "                                    prefill-heavy: decode-hot experts differ. The planner keeps the\n"
+    "                                    hottest resident; --expert-pin-top makes a chosen slice unmovable.\n"
+    "                                    Native DeepSeek4.1 EP4 ranking retains its sealed DECODE profile\n"
+    "                                    and source-identity checks; model weights are unchanged" },
+    { "--expert-pin-top",     "F",      "pin the hottest fraction F of the routed experts (0 < F <= 1) by\n"
+    "                                    --expert-profile's share: heat never demotes them, so the decode-hot\n"
+    "                                    set stays resident while the rest streams. 0 is off" },
+    { "--draft-expert-placement", "PLACEMENT", "where a draft head's (MTP/DSpark) routed experts live.\n"
+    "                                    `host` pins them in the host pool before any strategy runs, read in\n"
+    "                                    place like a pooled expert: the drafter's experts fit beside a trunk\n"
+    "                                    that already fills the card, instead of the strategy having to make\n"
+    "                                    room on the card. `auto` (the default) leaves them to the strategy" },
     { "--live",               nullptr,  "the live view: cards, throughput, draft acceptance, the expert plane.\n"
     "                                    Redirected it prints one greppable key=value line instead" },
     { "-v",                   nullptr,  "verbose" },
@@ -461,6 +537,12 @@ int config_parse(int argc, char** argv, Config* c) {
             else if (!std::strcmp(v, "rows"))  c->tp_attn_rows = 1;
             else { RAD_ERR("--tp-attn-split takes heads or rows, not '%s'", v); return RAD_E_INVAL; }
         }
+        else if (S("--weight-prefetch")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if      (!std::strcmp(v, "on"))  c->weight_prefetch = true;
+            else if (!std::strcmp(v, "off")) c->weight_prefetch = false;
+            else { RAD_ERR("--weight-prefetch takes on or off, not '%s'", v); return RAD_E_INVAL; }
+        }
         else if (S("--p2p")) {
             if (!(v = need(i))) return RAD_E_INVAL;
             if      (!std::strcmp(v, "auto")) c->p2p = RAD_P2P_AUTO;
@@ -531,6 +613,7 @@ int config_parse(int argc, char** argv, Config* c) {
                 return RAD_E_INVAL;
             }
         }
+        else if (S("--kv-resident"))           { if (!num(0, INT64_MAX, &c->kv_resident)) return RAD_E_INVAL; }
         else if (S("--host-pool-mib"))         { if (!num(0, INT64_MAX, &c->host_pool_mib)) return RAD_E_INVAL; }
         else if (S("--embedding-placement") || S("--ngram-placement")) {
             const bool emb = S("--embedding-placement");
@@ -565,6 +648,42 @@ int config_parse(int argc, char** argv, Config* c) {
             c->tower_placement = p;
         }
         else if (S("--weights-disk-tier"))     { c->weights_disk_tier = true; }
+        else if (S("--expert-ram-cache-total-mib")) {
+            if (!num(0, INT64_MAX / ((int64_t)1 << 20), &c->expert_ram_cache_total_mib))
+                return RAD_E_INVAL;
+        }
+        else if (S("--expert-plane-mirror"))   { if (!(v = need(i))) return RAD_E_INVAL; c->expert_plane_mirror = v; }
+        else if (S("--expert-plane-mirror-share") || S("--expert-plane-mirror-decode-share")) {
+            double d = 0.0;
+            if (!(v = need(i)) || !parse_num(a.c_str(), v, &d)) return RAD_E_INVAL;
+            if (d < 0.0 || d > 0.31) {
+                RAD_ERR("%s: %s is not a fraction in [0, 0.31]", a.c_str(), v);
+                return RAD_E_INVAL;
+            }
+            (S("--expert-plane-mirror-share") ? c->expert_plane_mirror_share
+                                              : c->expert_plane_mirror_decode_share) = d;
+        }
+        else if (S("--expert-plane-mirror-min-rows")) {
+            if (!num(1, INT32_MAX, &c->expert_plane_mirror_min_rows)) return RAD_E_INVAL;
+        }
+        else if (S("--row-prefetch")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if      (!std::strcmp(v, "on"))  c->row_prefetch = true;
+            else if (!std::strcmp(v, "off")) c->row_prefetch = false;
+            else {
+                RAD_ERR("--row-prefetch takes on or off, not '%s'", v);
+                return RAD_E_INVAL;
+            }
+        }
+        else if (S("--mapped-rewarm")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if      (!std::strcmp(v, "on"))  c->mapped_rewarm = true;
+            else if (!std::strcmp(v, "off")) c->mapped_rewarm = false;
+            else {
+                RAD_ERR("--mapped-rewarm takes on or off, not '%s'", v);
+                return RAD_E_INVAL;
+            }
+        }
         else if (S("--prefix-cache-mib"))      { if (!num(0, INT32_MAX, &c->prefix_cache_mib)) return RAD_E_INVAL; }
         else if (S("--prefix-cache-ttl"))      { if (!num(0, INT32_MAX, &c->prefix_cache_ttl)) return RAD_E_INVAL; }
         else if (S("--lora")) {
@@ -649,6 +768,15 @@ int config_parse(int argc, char** argv, Config* c) {
             }
         }
         else if (S("--no-prefix-cache"))       c->prefix_cache = false;
+        else if (S("--prefix-resume")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if (!std::strcmp(v, "exact"))        c->prefix_exact = true;
+            else if (!std::strcmp(v, "nearest")) c->prefix_exact = false;
+            else {
+                RAD_ERR("--prefix-resume '%s' is not one of exact, nearest", v);
+                return RAD_E_INVAL;
+            }
+        }
         else if (S("--checkpoint-policy")) {
             if (!(v = need(i))) return RAD_E_INVAL;
             /* Validated, so an unknown name does not silently fall back to the default. */
@@ -671,6 +799,9 @@ int config_parse(int argc, char** argv, Config* c) {
                 return RAD_E_INVAL;
             c->n_spec = (int)n;
         }
+        else if (S("--spec-ngram"))            { if (!num(0, 64, &c->spec_ngram)) return RAD_E_INVAL; }
+        else if (S("--spec-ngram-min"))        { if (!num(1, 15, &c->spec_ngram_min)) return RAD_E_INVAL; }
+        else if (S("--spec-ngram-max"))        { if (!num(1, 15, &c->spec_ngram_max)) return RAD_E_INVAL; }
         else if (S("--draft-window")) {
             if (!(v = need(i))) return RAD_E_INVAL;
             if      (!std::strcmp(v, "fixed"))    c->draft_window = DraftWindow::Fixed;
@@ -689,6 +820,25 @@ int config_parse(int argc, char** argv, Config* c) {
                 RAD_ERR("--draft-coupling takes off or on, not '%s'", v);
                 return RAD_E_INVAL;
             }
+        }
+        else if (S("--draft-bank")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            const char* enabled = std::getenv("RADIANCE_EXPERIMENTAL_DS41_DSPARK_RAD_BANK");
+            if (!enabled || std::strcmp(enabled,"1")) {
+                RAD_ERR("--draft-bank requires experimental DS4.1 DSpark two-bank opt-in");
+                return RAD_E_INVAL;
+            }
+            c->draft_bank = v;
+        }
+        else if (S("--draft-bank-expert-placement")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            const char* enabled = std::getenv("RADIANCE_EXPERIMENTAL_DS41_DSPARK_RAD_BANK");
+            if (!enabled || std::strcmp(enabled,"1") ||
+                (std::strcmp(v,"auto") && std::strcmp(v,"host"))) {
+                RAD_ERR("--draft-bank-expert-placement takes auto or host under the exact bank opt-in");
+                return RAD_E_INVAL;
+            }
+            c->draft_bank_expert_placement = v;
         }
         else if (S("--draft-model")) {
             /* Refused, not ignored: separate draft models are not supported (spec §10), and the
@@ -890,8 +1040,32 @@ int config_parse(int argc, char** argv, Config* c) {
         else if (S("--debug-graph"))           { c->debug_graph = true; c->debug_selection = true; }
         else if (S("--debug-selection"))       c->debug_selection = true;
         else if (S("--debug-placement"))       c->debug_placement = true;
+        else if (S("--debug-tape-dump"))       c->debug_tape_dump = true;
+        else if (S("--debug-draft-oracle"))    { if (!(v = need(i))) return RAD_E_INVAL; c->debug_draft_oracle = v; }
         else if (S("--debug-accept-reference-kernels")) c->accept_reference_kernels = true;
         else if (S("--profile-ops"))           c->profile_ops = true;
+        else if (S("--expert-stats"))          { if (!(v = need(i))) return RAD_E_INVAL; c->expert_stats = v; }
+        else if (S("--expert-profile"))        { if (!(v = need(i))) return RAD_E_INVAL; c->expert_profile = v; c->expert_profile_given = true; }
+        else if (S("--expert-pin-top"))        {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            char* e = nullptr;
+            const double d = strtod(v, &e);
+            if (e == v || *e != '\0' || !std::isfinite(d) || d < 0.0 || d > 1.0) {
+                RAD_ERR("--expert-pin-top: '%s' is not a fraction in [0, 1]", v);
+                return RAD_E_INVAL;
+            }
+            c->expert_pin_top = (float)d;
+            c->expert_pin_top_given = true;
+        }
+        else if (S("--draft-expert-placement")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if (std::strcmp(v, "auto") != 0 && std::strcmp(v, "host") != 0) {
+                RAD_ERR("--draft-expert-placement: '%s' is not auto or host", v);
+                return RAD_E_INVAL;
+            }
+            c->draft_expert_placement = v;
+            c->draft_expert_placement_given = true;
+        }
         else if (S("--live"))                  c->live_view = true;
         else {
             RAD_ERR("unknown option '%s'", a.c_str());
@@ -922,9 +1096,30 @@ int config_parse(int argc, char** argv, Config* c) {
      * rank the installed one behind the reference implementation. An empty hierarchy loads every
      * library found, ordered with the reference last (core/plugin/loader.cpp). A list loads only
      * the named libraries, in its order. */
+    if (draft_placement_modes_conflict(*c)) {
+        RAD_ERR("--draft-bank-expert-placement and --draft-expert-placement are separate manual "
+                "placement modes; give only one");
+        return RAD_E_INVAL;
+    }
     if (c->model.empty()) {
         RAD_ERR("--model is required");
         return RAD_E_INVAL;
+    }
+
+    /* Prompt lookup alone: the window is its K, stated once. */
+    if (c->spec_ngram_min > c->spec_ngram_max) {
+        RAD_ERR("--spec-ngram-min %d is longer than --spec-ngram-max %d", c->spec_ngram_min,
+                c->spec_ngram_max);
+        return RAD_E_INVAL;
+    }
+    if (c->spec_ngram > 0) {
+        if (c->given.count("--num-speculative-tokens") && c->n_spec != c->spec_ngram) {
+            RAD_ERR("--spec-ngram %d sets the speculative window to %d, and "
+                    "--num-speculative-tokens asks for %s; give one", c->spec_ngram,
+                    c->spec_ngram, c->n_spec < 0 ? "auto" : std::to_string(c->n_spec).c_str());
+            return RAD_E_INVAL;
+        }
+        c->n_spec = c->spec_ngram;
     }
 
     /* KL mode: exactly one direction, each with the inputs it reads. */
@@ -1020,6 +1215,14 @@ int config_parse(int argc, char** argv, Config* c) {
     if (c->video_min_frames && c->video_max_frames && *c->video_min_frames > *c->video_max_frames) {
         RAD_ERR("--video-min-frames is above --video-max-frames"); return RAD_E_INVAL; }
 
+    if (c->expert_ram_cache_total_mib > 0 && !c->weights_disk_tier) {
+        RAD_ERR("--expert-ram-cache-total-mib needs --weights-disk-tier");
+        return RAD_E_INVAL;
+    }
+    if (!c->expert_plane_mirror.empty() && !c->weights_disk_tier) {
+        RAD_ERR("--expert-plane-mirror needs --weights-disk-tier: only missed experts read it");
+        return RAD_E_INVAL;
+    }
     return RAD_OK;
 }
 
@@ -1073,6 +1276,7 @@ const ShowRow kShow[] = {
     { "--tp",                 [](const Config& c) { return num(c.tp); } },
     { "--tp-wire",            [](const Config& c) { return std::string(c.tp_wire_exact ? "exact" : "wht6"); } },
     { "--tp-attn-split",      [](const Config& c) { return std::string(c.tp_attn_rows ? "rows" : "heads"); } },
+    { "--weight-prefetch",    [](const Config& c) { return onoff(c.weight_prefetch); } },
     { "--tp-wire-min-kb",     [](const Config& c) { return num(c.tp_wire_min_kb); } },
     { "--p2p",                [](const Config& c) {
           return std::string(c.p2p == RAD_P2P_ON ? "on" : c.p2p == RAD_P2P_OFF ? "off" : "auto"); } },
@@ -1091,12 +1295,21 @@ const ShowRow kShow[] = {
     { "--state-cache-dtype",  [](const Config& c) { return c.state_cache_dtype; } },
     { "--attn-prefill-fp8",   [](const Config& c) {
           return std::string(attn_prefill_fp8_name(c.attn_prefill_fp8)); } },
+    { "--kv-resident",        [](const Config& c) {
+          return c.kv_resident > 0 ? num(c.kv_resident) : std::string("0 (off)"); } },
     { "--host-pool-mib",      [](const Config& c) { return num(c.host_pool_mib); } },
     { "--host-headroom-mib",  [](const Config& c) { return num(c.host_headroom_mib); } },
     { "--embedding-placement", [](const Config& c) { return std::string(table_placement_name(c.embedding_placement)); } },
     { "--ngram-placement",    [](const Config& c) { return std::string(table_placement_name(c.ngram_placement)); } },
     { "--vision-tower-placement", [](const Config& c) { return std::string(table_placement_name(c.tower_placement)); } },
     { "--weights-disk-tier",  [](const Config& c) { return onoff(c.weights_disk_tier); } },
+    { "--expert-ram-cache-total-mib", [](const Config& c) { return num(c.expert_ram_cache_total_mib); } },
+    { "--expert-plane-mirror", [](const Config& c) { return or_none(c.expert_plane_mirror, "none"); } },
+    { "--expert-plane-mirror-share", [](const Config& c) { return fmt("%.4g", c.expert_plane_mirror_share); } },
+    { "--expert-plane-mirror-min-rows", [](const Config& c) { return num(c.expert_plane_mirror_min_rows); } },
+    { "--expert-plane-mirror-decode-share", [](const Config& c) { return fmt("%.4g", c.expert_plane_mirror_decode_share); } },
+    { "--row-prefetch",       [](const Config& c) { return onoff(c.row_prefetch); } },
+    { "--mapped-rewarm",      [](const Config& c) { return onoff(c.mapped_rewarm); } },
     { "--prefix-cache-mib",   [](const Config& c) {
           return c.prefix_cache_mib ? num(c.prefix_cache_mib) : std::string("0 (off)"); } },
     { "--prefix-cache-ttl",   [](const Config& c) {
@@ -1124,13 +1337,21 @@ const ShowRow kShow[] = {
           return c.checkpoint_slots < 0 ? std::string("auto") : num(c.checkpoint_slots); } },
     { "--no-prefix-cache",    [](const Config& c) {
           return std::string(c.prefix_cache ? "not given: prefix caching on" : "prefix caching off"); } },
+    { "--prefix-resume",      [](const Config& c) {
+          return std::string(c.prefix_exact ? "exact" : "nearest"); } },
     { "--checkpoint-policy",  [](const Config& c) { return c.checkpoint_policy; } },
     { "--num-speculative-tokens", [](const Config& c) { return c.n_spec < 0 ? std::string("auto") : num(c.n_spec); } },
+    { "--spec-ngram",         [](const Config& c) {
+          return c.spec_ngram > 0 ? num(c.spec_ngram) : std::string("0 (off)"); } },
+    { "--spec-ngram-min",     [](const Config& c) { return num(c.spec_ngram_min); } },
+    { "--spec-ngram-max",     [](const Config& c) { return num(c.spec_ngram_max); } },
     { "--draft-window",       [](const Config& c) { return std::string(draft_window_name(c.draft_window)); } },
     { "--draft-short-from",   [](const Config& c) {
           return c.draft_short_from > 0 ? num(c.draft_short_from) : std::string("0 (never)"); } },
     { "--draft-coupling",     [](const Config& c) { return onoff(c.draft_coupling); } },
     { "--draft-model",        [](const Config&) { return std::string("not implemented (the container's own drafter)"); } },
+    { "--draft-bank",         [](const Config& c) { return or_none(c.draft_bank,"off"); } },
+    { "--draft-bank-expert-placement", [](const Config& c) { return c.draft_bank_expert_placement; } },
     { "--host",               [](const Config& c) { return c.host; } },
     { "--port",               [](const Config& c) { return num(c.port); } },
     /* Never print the secret, only whether it is set. */
@@ -1207,8 +1428,14 @@ const ShowRow kShow[] = {
     { "--debug-graph",        [](const Config& c) { return onoff(c.debug_graph); } },
     { "--debug-selection",    [](const Config& c) { return onoff(c.debug_selection); } },
     { "--debug-placement",    [](const Config& c) { return onoff(c.debug_placement); } },
+    { "--debug-tape-dump",    [](const Config& c) { return onoff(c.debug_tape_dump); } },
+    { "--debug-draft-oracle", [](const Config& c) { return or_none(c.debug_draft_oracle, "none"); } },
     { "--debug-accept-reference-kernels", [](const Config& c) { return onoff(c.accept_reference_kernels); } },
     { "--profile-ops",        [](const Config& c) { return onoff(c.profile_ops); } },
+    { "--expert-stats",       [](const Config& c) { return or_none(c.expert_stats, "off"); } },
+    { "--expert-profile",     [](const Config& c) { return or_none(c.expert_profile, "off"); } },
+    { "--expert-pin-top",     [](const Config& c) { return fmt("%.4g", c.expert_pin_top); } },
+    { "--draft-expert-placement", [](const Config& c) { return c.draft_expert_placement; } },
     { "--live",               [](const Config& c) { return onoff(c.live_view); } },
     { "-v",                   [](const Config& c) { return onoff(c.given.count("-v") > 0); } },
     { "-vv",                  [](const Config& c) { return onoff(c.given.count("-vv") > 0); } },

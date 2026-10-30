@@ -1,3 +1,0 @@
-I device: AQL backend, 1 device(s) [0:gfx1201]
-I quantisation 'quark' is imported weight by weight; 'glm5next' serves it as (unquantised)
-WROTE full stockGLM TP4 planning report /home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-real-main-metadata-262k-20261025T163229Z/plan.json selection=1 trackedAllocUnchanged=1

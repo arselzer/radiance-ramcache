@@ -26,7 +26,6 @@
 #include "safetensors.h"
 #include "torch_zip.h"
 #include "../text/gguf.h"
-#include "rad_import.h"
 
 #include <deque>
 #include <memory>
@@ -39,7 +38,6 @@
 namespace rad {
 
 class Program;
-class Registry;
 
 /* ================================================================== tensors */
 /* Shapes are row-major, shape[0] slowest. GGUF stores ne[] fastest-first, so Checkpoint::open
@@ -51,6 +49,11 @@ struct SrcTensor {
     std::vector<int64_t> shape;                        /* row-major */
     const void*          data = nullptr;
     int64_t              bytes = 0;
+    /* Only explicit ISTA Engram supplements use this provenance. Copies/slices
+     * retain the actual owner and original directory row; global Fp8Mx import
+     * must never reinterpret these GGUF pieces. */
+    const GgufFile*      supplemental_gguf = nullptr;
+    std::string          supplemental_tensor;
     /* GPTQ-packed (auto_gptq's layout, shared by AutoRound's `auto_round:auto_gptq` export):
      * `data` is the qweight's int32 words [K * bits / 32, N], each packing 32 / bits codes along K
      * from the low bits up, unsigned with zero point 2^(bits-1). The tensor described is the
@@ -76,21 +79,9 @@ struct SrcTensor {
     const SrcTensor*     aux[3] = { nullptr, nullptr, nullptr };
 
     int64_t numel() const {
-        /* Empty shapes retain their existing zero count. Scan all dimensions first: a later
-         * zero can make the tensor empty even when an earlier partial product would overflow,
-         * while a negative dimension is malformed even if another dimension is zero. */
-        bool zero = shape.empty();
-        for (int64_t d : shape) {
-            if (d < 0) return -1;
-            zero = zero || d == 0;
-        }
-        if (zero) return 0;
         int64_t n = 1;
-        for (int64_t d : shape) {
-            if (n > INT64_MAX / d) return -1;
-            n *= d;
-        }
-        return n; // -1 above denotes a nonzero shape whose count cannot be represented.
+        for (int64_t d : shape) n *= d;
+        return shape.empty() ? 0 : n;
     }
 };
 
@@ -135,13 +126,35 @@ public:
      * borrows the target's embedding and head, so it goes into the target's container with its
      * tensors and config.json keys under `draft.`. */
     int add_draft(const std::string& dir, const std::string& prefix);
-    /* Merge a safetensors file, or an unsplit GGUF sidecar into a GGUF checkpoint.
-     * Tensor names are kept and duplicates refused. A sidecar never replaces model metadata. */
+    /* Merge one more safetensors file, its tensor names kept: a release that ships its networks
+     * as separate single files (ComfyUI's split_files: a diffusion model, a text encoder and a
+     * VAE). A name already present is refused. */
     int add_file(const std::string& path);
+    /* Opt-in before supplements, never a metadata/import-mode replacement.
+     * GGUF additions expose only the six fixed ISTA control/table roles. */
+    void enable_ista_engram_source(bool enabled) { ista_engram_source_ = enabled; }
+    bool ista_engram_source_complete() const;
     /* Before open(): read config.json, generation_config.json and the tokenizer from `dir` rather
      * than from beside the checkpoint, for a single-file checkpoint that ships none of them (the
      * text encoder's repository describes such a release). */
     void set_meta_dir(const std::string& dir) { meta_dir_ = dir; }
+
+    /* Merge PEFT adapters into the tensors they name: `path` is a .safetensors file or a
+     * directory of them, of `<module>.lora_A.weight` [r, K] and `<module>.lora_B.weight` [N, r]
+     * pairs (or ComfyUI's `.lora_down` / `.lora_up`) and an optional `<module>.alpha`. The target
+     * is `<module>.weight`, or that with a wrapper prefix ("diffusion_model.", "transformer.",
+     * "unet.") stripped; a module the checkpoint does not have is refused by name. In f32,
+     * W += strength (alpha / r, or 1 without alpha) B A, stored in the target's dtype, a plain
+     * bf16, f16 or f32 matrix. Call right after open(): a merged tensor's bytes move, and views
+     * taken before read the old ones. `merged` receives the targets' names.
+     *
+     * `map_json` names a file of rules for adapters trained on other module names (a fused qkv,
+     * renamed blocks): `{"strip": ["prefix."], "modules": {"<pattern>": ["<target>", ...]}}`,
+     * a `*` in a pattern matching one run (the block index) that fills each target's `*`. With
+     * several targets the module is their concatenation, B's rows split along them in order. A
+     * rule's target the checkpoint lacks is refused. */
+    int add_lora(const std::string& path, double strength, std::vector<std::string>* merged,
+                 const std::string* map_json = nullptr);
 
     const SrcTensor* find(const std::string& n) const;
     const std::vector<SrcTensor>& tensors() const { return tensors_; }
@@ -154,9 +167,6 @@ public:
     const std::string& tok_dir() const { return tok_dir_.empty() ? dir_ : tok_dir_; }
     MetaOwn&           meta() { return meta_; }
     const MetaOwn&     meta() const { return meta_; }
-    /* Conversion only. The registry and its plugins must outlive every resolved weight. */
-    void set_importers(const Registry* registry) { importers_ = registry; }
-    const Registry* importers() const { return importers_; }
 
     /* Sub-tensor `index` along dim 0 of a stacked (rank >= 2) tensor, as a view owned here and
      * valid for the checkpoint's life. Null, with the reason logged, if there is no such slice. */
@@ -173,18 +183,26 @@ public:
      * quantization_config at open. Gptq: AutoRound's `auto_round:auto_gptq` export and GPTQ v1
      * (zero point stored less one). QuarkMx: Quark's MXFP4 (fp4 weights, per_group 32, e8m0
      * scales, no per-layer overrides). ParoMx: ParoQuant's `paroquant_mxfp4` (Quark's codes and
-     * exponents in a rotated basis, rotations beside them). CtInt4, Nvfp4, CtFp8:
+     * exponents in a rotated basis, rotations beside them). ParoM2: ParoQuant's
+     * `paroquant_m2xfp4` (the same plus the m2xfp4 metadata byte a group). CtInt4, Nvfp4, CtFp8:
      * compressed-tensors' pack-quantized int4 (symmetric, or asymmetric with a zero point), a
      * release with an nvfp4-pack-quantized group, and one whose groups are all float-quantized FP8
      * (detect_import). ModelOpt: NVIDIA ModelOpt's NVFP4, FP8, or both per layer
      * (MIXED_PRECISION). In an Nvfp4, CtFp8 or ModelOpt release every weight without the NVFP4
      * tensors reads stock, so FP8 and bf16 linears beside the NVFP4 ones read by their own form.
+     * Gguf: a GGUF holding llama.cpp block types (K-, I- and legacy quants): every such tensor is
+     * imported block for block as the affine planes libquant's `ggml` quantiser writes for the
+     * same blocks (libquant/lq_ggml_planes.h); its float tensors read as they are.
+     * Fp8Mx: DeepSeek-V4's release form (quant_method fp8, scale_fmt ue8m0, expert_dtype fp4):
+     * block-FP8 linears with an e8m0 scale per weight_block_size block, read stock beside their
+     * `X.scale` (DeepSeek's spelling of the scale plane), and routed experts as `X.weight` I8
+     * [N, K/2] (two e2m1 codes a byte, element 2j in the low nibble) with `X.scale` e8m0
+     * [N, K/32]: `fp4_e2m1*e8m0[1x32]` byte for byte, as Quark's MXFP4.
      * An unreadable form of these stays None, with the reason in import_refusal(). The
      * quantization_config keys are then renamed `imported_quantization_config.*`, since they
-     * describe the tool, not a served format. GgufBlocks preserves standard GGML block types
-     * through optional quantiser-plugin importers, enabled only by rad-convert. */
-    enum class Import { None, Gptq, QuarkMx, CtInt4, ParoMx, ParoI5, ParoI4, Nvfp4, CtFp8,
-                        ModelOpt, GgufBlocks };
+     * describe the tool, not a served format. */
+    enum class Import { None, Gptq, QuarkMx, CtInt4, ParoMx, ParoM2, ParoI5, ParoI4, Nvfp4, CtFp8,
+                        ModelOpt, Gguf, Fp8Mx };
     Import imports() const { return import_; }
     const std::string& import_refusal() const { return import_why_; }
 
@@ -195,6 +213,10 @@ public:
      * tensor or absent; another error, with `why`, for an unreadable imported form. */
     int import_piece(const std::string& name, const SrcTensor** codes, const SrcTensor** scale,
                      std::string* why);
+
+    /* The metadata plane an imported `name` carries, when its form has one (ParoM2): [N, K/32] u8,
+     * one byte a group, as `weight_meta` ships it. Null for every other form. */
+    const SrcTensor* import_meta(const std::string& name) const;
 
 private:
     /* `owner` is the index's weight_map, if any: a tensor it places in another shard is skipped
@@ -207,14 +229,18 @@ private:
     int add_companions();
     int add_torch_files();
     int open_gguf(const std::string& path);
-    int merge_gguf(GgufFile& file);
+    int add_ista_engram_gguf(const std::string& path);
     void detect_import();
 
     enum Kind { None, Gguf, SafeT } kind_ = None;
     std::string path_, dir_, tok_dir_, meta_dir_;
     GgufFile    gguf_;
-    std::vector<std::unique_ptr<GgufFile>> gguf_parts_;
-    const Registry* importers_ = nullptr;
+    /* A split GGUF's shards after the first (llama.cpp's gguf-split): tensors only. */
+    std::vector<std::unique_ptr<GgufFile>> gguf_more_;
+    std::vector<std::unique_ptr<GgufFile>> ista_gguf_;
+    bool ista_engram_source_ = false;
+    /* Long integer metadata arrays as tensor bytes (open_gguf); a deque, so data never moves. */
+    std::deque<std::vector<uint8_t>> gguf_arrays_;
     MetaOwn     meta_;
     std::vector<std::unique_ptr<SafeTensorsFile>> shards_;
     std::vector<std::unique_ptr<TorchZipFile>>    torch_;
@@ -232,6 +258,8 @@ private:
     bool        ct_asym_  = false;   /* CtInt4: the config states asymmetric weights */
     /* import_piece's answers by name, so a weight resolved twice reuses its views. */
     std::unordered_map<std::string, std::pair<const SrcTensor*, const SrcTensor*>> imported_;
+    /* The metadata plane of an imported form that has one (ParoM2), by name. */
+    std::unordered_map<std::string, const SrcTensor*> imported_meta_;
 };
 
 /* ================================================================== logical weights */
@@ -270,13 +298,17 @@ struct CkptWeight {
      * still reads piece by piece (a row join ending inside a scale block); one that cannot be
      * read leaves `enc` unstated, and ckpt_rows_f32 refuses it with `why`. */
     bool        imported = false;
-    const RadCheckpointImporterInfo* block_importer = nullptr;
     /* ParoQuant MXFP4 (Import::ParoMx), also `imported`: written plane by plane through
      * ckpt_plane_rows. Planes 0 and 1 are Quark's codes and exponents byte for byte; the rest are
      * the "givens" transform's tables, built from `pq_pairs`/`pq_theta`/`pq_scale`, one set per
-     * piece (a row part: gate and up, or q, k and v, each rotated separately). */
+     * piece (a row part: gate and up, or q, k and v, each rotated separately). Import::ParoM2 is
+     * the same with a third plane before the tables, the m2xfp4 scheme's metadata byte a group,
+     * from `pq_meta`. */
     bool        paro = false;
-    std::vector<const SrcTensor*> pq_pairs, pq_theta, pq_scale;
+    std::vector<const SrcTensor*> pq_pairs, pq_theta, pq_scale, pq_meta;
+    /* GGUF Q8_0, Q4_K or Q6_K blocks (also `imported`): ckpt_plane_rows splits each row's blocks
+     * into the planes of `enc` (ggml_planes.h), and ckpt_rows_f32 dequantises them. */
+    bool        ggml_blocks = false;
     /* A weight-normalised tensor (RAD_MAP_WNORM): `pieces` is its direction v alone, and every
      * element of v with first index i reads times wnorm_scale[i] = g_i / ||v_i||. Not trivial
      * (the values change), so a recipe rule stores it. */
@@ -342,11 +374,5 @@ int ckpt_rows_f32(const CkptWeight& w, int64_t r0, int64_t nr, float* out, std::
  * into `dst`: the bytes a container entry holds. */
 int ckpt_plane_rows(const CkptWeight& w, int k, int64_t r0, int64_t nr, void* dst,
                     std::string* why);
-
-/* Import every canonical plane for one band in one pass over the packed source. Shared planes
- * are complete; row planes start at logical row r0. This is the converter's lossless GGUF path,
- * avoiding one full reread of a large checkpoint for each output plane. nr=0 reads no payload. */
-int ckpt_import_band(const CkptWeight& w, int64_t r0, int64_t nr,
-                      std::vector<std::vector<uint8_t>>* planes, std::string* why);
 
 }  /* namespace rad */

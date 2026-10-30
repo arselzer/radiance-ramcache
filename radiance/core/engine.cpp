@@ -9,14 +9,18 @@
 #include "kld.h"
 #include "mm/processor.h"
 #include "mm/media.h"
+#include "place/host_expert_pool.h"
+#include "place/readahead.h"
+#include "place/route_trace.h"
+#include "place/router_predictor.h"
 
 #include "build/startup.h"
 #include "build/rad_build.h"
 #include "device/device.h"
 #include "format/radfile.h"
 #include "gen_config.h"
+#include "kvstream/stage.h"
 #include "sample/accept.h"
-#include "runtime/model_failure_policy.h"
 #include "sched/scheduler.h"
 #include "server/adapters.h"
 #include "server/server.h"
@@ -31,8 +35,10 @@
 #include <cstring>
 #include <cstdint>
 #include <cstdlib>
+#include <climits>
 #include <cmath>
 #include <algorithm>
+#include <map>
 #include <fstream>
 #include <functional>
 #include <utility>
@@ -44,7 +50,10 @@ namespace rad {
 
 /* The operator's RADIANCE_* names, captured at construction for the diagnostics report. */
 Engine::Engine(Config cfg)
-    : cfg_(std::move(cfg)), env_set_(diag::env_names(environ, "RADIANCE_")) {}
+    : cfg_(std::move(cfg)),
+      draft_experiment_(DraftExperiment::capture(std::getenv(kDraftOriginEnv),
+                                                  std::getenv(kDraftComputeOffEnv),
+                                                  std::getenv(kDraftVerifyCapEnv))), env_set_(diag::env_names(environ, "RADIANCE_")) {}
 
 int32_t* Engine::Readback::reserve(int64_t count) {
     if (count <= n) return p;
@@ -59,9 +68,6 @@ Engine::Readback::~Readback() {
 }
 
 Engine::~Engine() {
-    if(cache_prepare4_)cache_prepare4_->stop_admission(); // before any diagnostic/resource teardown
-    if(tiny_) {tiny_shutdown();rad_tools_registry().close();return;}
-    if(glm_main_) {glm_main_shutdown();return;}
     /* The control vector's per-rank direction copies. Uploaded at declare, outside any arena, so
      * nothing else frees them; each rank's copy is freed with that rank's device bound, since the
      * allocator is per device. */
@@ -77,32 +83,416 @@ Engine::~Engine() {
     /* --profile-ops prints its final table here, the last point where the program still holds
      * the op table the rows name. */
     if (cfg_.profile_ops) for (auto& r : ranks_) r->ctx.dump_profile();
+    if (stream_ctl_p_) rad_dev_free(stream_ctl_p_, RAD_MEM_HOST_PINNED);
     for (float* p : kld_host_) if (p) rad_dev_free(p, RAD_MEM_HOST_PINNED);
     if (pooled_host_) rad_dev_free(pooled_host_, RAD_MEM_HOST_PINNED);
     for (auto& r : ranks_) if (r->score_host) rad_dev_free(r->score_host, RAD_MEM_HOST_PINNED);
+    for (auto& r : ranks_) if (r->hash_host) rad_dev_free(r->hash_host, RAD_MEM_HOST_PINNED);
+    consumer_skip_report();
+    /* The live issue path's overlap and chain trace (runtime/live_chain.h), when
+     * RADIANCE_EXPERIMENTAL_DS41_CHAIN_OVERLAP or _TRACE is on: launches checked, how many went
+     * unordered (or would, dump only), and why the rest kept the barrier bit. */
+    for (auto& r : ranks_) {
+        const std::string line = r->ctx.live_report();
+        if (line.empty()) continue;
+        LogRank lr(r->index);
+        RAD_INFO("%s", line.c_str());
+    }
     /* The tiering summary, here for the same reason, and only for a dynamic plan. Its per-layer
      * residency histogram shows whether the global ranking starved a layer, which a hit rate
      * cannot. */
     for (auto& r : ranks_) {
-        if (!r->heat.enabled()) continue;
+        /* RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED's line is in the mover's report too. */
+        if (!r->heat.enabled() && r->plan.file_layer_max <= 0 && !r->plan.vram_packed.units) continue;
         LogRank lr(r->index);
+        if (r->heat.enabled()) {
         RAD_INFO("%s", r->heat.report().c_str());
         RAD_INFO("  routing evidence: %llu layer-histograms credited, %llu layer-sweeps found "
                  "nothing new, %llu dropped by a ring shallower than the run-ahead",
                  (unsigned long long)r->heat_credited, (unsigned long long)r->heat_idle,
                  (unsigned long long)r->ctx.route_dropped());
+        }
         RAD_INFO("%s", r->mover.report().c_str());
+        const auto& ep = r->fstager.ep_stats();
+        if (ep.reads || ep.corrupt) {
+            RAD_INFO("EP scoped file staging: %llu count rows completed, %llu local-zero, "
+                     "%llu SSD units submitted, %llu corrupt rows refused",
+                     (unsigned long long)ep.reads, (unsigned long long)ep.zero_local,
+                     (unsigned long long)ep.units, (unsigned long long)ep.corrupt);
+            RAD_INFO("EP staging time: %.2f s waiting for the card at the routers, %.2f s staging "
+                     "(%llu of %llu layers read the drive, %.2f s of it), %.2f s choosing CPU units",
+                     (double)ep.sync_ns * 1e-9, (double)ep.stage_ns * 1e-9,
+                     (unsigned long long)ep.miss_layers, (unsigned long long)ep.reads,
+                     (double)ep.miss_stage_ns * 1e-9, (double)ep.hx_ns * 1e-9);
+            RAD_INFO("EP staging time, one-token passes: %llu layers; %.2f s waiting for the card, "
+                     "%.2f s staging (%llu layers read the drive, %.2f s of it)",
+                     (unsigned long long)ep.d_reads, (double)ep.d_sync_ns * 1e-9,
+                     (double)ep.d_stage_ns * 1e-9, (unsigned long long)ep.d_miss_layers,
+                     (double)ep.d_miss_stage_ns * 1e-9);
+            if (ep.d_reads && ep.d_decide_ns && !ep.d_post_ns)
+                RAD_INFO("EP decision, one-token passes: %.1f us a layer from the counts to the CPU's "
+                         "work submitted (read windows %.1f, choose %.1f, submit %.1f)",
+                         (double)ep.d_decide_ns * 1e-3 / (double)ep.d_reads,
+                         (double)ep.d_retire_ns * 1e-3 / (double)ep.d_reads,
+                         (double)ep.d_choose_ns * 1e-3 / (double)ep.d_reads,
+                         (double)ep.d_submit_ns * 1e-3 / (double)ep.d_reads);
+            if (ep.d_reads && ep.d_decide_ns && ep.d_post_ns)
+                RAD_INFO("EP decision, one-token passes: %.1f us a layer from the counts to the CPU's "
+                         "work submitted (read windows %.1f, choose %.1f, submit %.1f, predictor post %.1f)",
+                         (double)ep.d_decide_ns * 1e-3 / (double)ep.d_reads,
+                         (double)ep.d_retire_ns * 1e-3 / (double)ep.d_reads,
+                         (double)ep.d_choose_ns * 1e-3 / (double)ep.d_reads,
+                         (double)ep.d_submit_ns * 1e-3 / (double)ep.d_reads,
+                         (double)ep.d_post_ns * 1e-3 / (double)ep.d_reads);
+            /* ..._MISS_POST: the misses' reads handed to the readers, between choose and submit
+             * (in the decision above, not in its parts). */
+            if (ep.d_reads && ep.d_miss_post_ns)
+                RAD_INFO("EP decision, one-token passes: %.1f us a layer posting the misses' reads to the "
+                         "kept readers (..._MISS_POST; between choose and submit, in neither)",
+                         (double)ep.d_miss_post_ns * 1e-3 / (double)ep.d_reads);
+        }
+        const auto& hx = r->fstager.host_stats();
+        if (r->fstager.host_experts())
+            RAD_INFO("host experts: %llu layers handed %llu experts (%llu rows) to the CPU; "
+                     "%llu cached experts went over the copy link, %llu routed experts were not "
+                     "cached; %.1f ms waiting at gathers; verify: %llu rows compared, %llu differ; "
+                     "%llu gate_up operand moves; %llu units probed (the mapped cache's hit "
+                     "and miss counts above include these probes); misses on the CPU: %llu units, "
+                     "%llu rows, %.1f ms reading their planes",
+                     (unsigned long long)hx.layers, (unsigned long long)hx.units,
+                     (unsigned long long)hx.rows, (unsigned long long)hx.linked,
+                     (unsigned long long)hx.missed, (double)hx.wait_ns / 1e6,
+                     (unsigned long long)hx.verified, (unsigned long long)hx.differ,
+                     (unsigned long long)hx.moved, (unsigned long long)hx.probed,
+                     (unsigned long long)hx.miss_units, (unsigned long long)hx.miss_rows,
+                     (double)hx.miss_read_ns / 1e6);
+        if (hx.d_waits[0] || hx.d_waits[1])
+            RAD_INFO("host experts, one-token passes: %llu gathers without a miss waited %.1f ms for the "
+                     "CPU's rows (%.1f us each), %llu with one %.1f ms (%.1f us each)",
+                     (unsigned long long)hx.d_waits[0], (double)hx.d_wait_ns[0] / 1e6,
+                     hx.d_waits[0] ? (double)hx.d_wait_ns[0] * 1e-3 / (double)hx.d_waits[0] : 0.0,
+                     (unsigned long long)hx.d_waits[1], (double)hx.d_wait_ns[1] / 1e6,
+                     hx.d_waits[1] ? (double)hx.d_wait_ns[1] * 1e-3 / (double)hx.d_waits[1] : 0.0);
+        if (hx.async_wait_ns)
+            RAD_INFO("host experts: %.1f ms waiting at gathers for misses still being read on the worker "
+                     "(not in the gather waits above)", (double)hx.async_wait_ns / 1e6);
+        /* The background inserts of missed units (FileStager::InsertStats); the non-temporal and
+         * piece counts are RADIANCE_EXPERIMENTAL_DS41_INSERT_NT's / ..._INSERT_SLICE_KIB's, 0
+         * without them (ab_window.sh holds an In / Is arm to them). */
+        if (const FileStager::InsertStats is = r->fstager.insert_stats(); is.units)
+            RAD_INFO("host experts' background inserts: %llu units relaid from passes, %.3f ms a unit from "
+                     "the queue to published (%llu from one-token passes, %.3f ms a unit); non-temporal: "
+                     "%llu pieces, %.0f MB of codes; waited before %llu pieces, %.1f ms asleep, %llu inserts "
+                     "out of their wait; %.0f MB in %.1f ms copied while the pool had submitted jobs unfinished, "
+                     "%llu pieces begun while it held only reservations",
+                     (unsigned long long)is.units, (double)is.ns * 1e-6 / (double)is.units,
+                     (unsigned long long)is.d_units,
+                     is.d_units ? (double)is.d_ns * 1e-6 / (double)is.d_units : 0.0,
+                     (unsigned long long)is.pieces, (double)is.nt_bytes / 1e6,
+                     (unsigned long long)is.waited, (double)is.wait_ns / 1e6,
+                     (unsigned long long)is.capped, (double)is.busy_bytes / 1e6, (double)is.busy_ns / 1e6,
+                     (unsigned long long)is.reserved);
+        if (hx.many_jobs)
+            RAD_INFO("host experts: %llu jobs of four or more rows of one expert (%llu rows) went "
+                     "through the many-row kernel", (unsigned long long)hx.many_jobs,
+                     (unsigned long long)hx.many_rows);
+        /* RADIANCE_EXPERIMENTAL_DS41_SIDE_STORE (place/hx_side_store.h): the units the packed RAM
+         * cache refuses, held, and the misses that read nothing for them. */
+        if (r->fstager.side_store()) {
+            const HxSideStore::Stats ss = r->fstager.side_store_stats();
+            RAD_INFO("host experts' side store: %d of at most %d units held (%s) whose inserts the "
+                     "packed RAM cache refuses; %llu misses handed their planes without a read (%llu "
+                     "in one-token passes); %llu refused units turned away for want of room",
+                     ss.units, ss.cap, humanb(ss.bytes).c_str(), (unsigned long long)hx.side_hits,
+                     (unsigned long long)hx.side_d_hits, (unsigned long long)ss.full);
+        }
+        if (hx.early)
+            RAD_INFO("host experts, early issue: %llu layers issued their card ops ahead of their counts "
+                     "sync and waited %.1f ms for the counts at their gathers (%.1f us a layer; also in "
+                     "the router wait above); %llu found their counts already in (the thread was behind "
+                     "the card); %llu fetched their rows again after a gate_up operand move",
+                     (unsigned long long)hx.early, (double)hx.early_wait_ns / 1e6,
+                     (double)hx.early_wait_ns * 1e-3 / (double)hx.early,
+                     (unsigned long long)hx.early_ready, (unsigned long long)hx.early_refetch);
+        /* RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_PREWAKE (place/stager.h, hx_wake_*): the triggers as
+         * this rank saw them; the pool's line below counts what the pre-wakes woke. */
+        if (hx.wk_rt || hx.wk_rt_ready || hx.wk_rd_armed) {
+            const uint64_t early = hx.wk_rd_armed - hx.wk_rd_fired;
+            RAD_INFO("host experts, pre-wake: %llu one-token layers waited for their router's event and "
+                     "then called the pool's pre-wake (%.1f us a call), their counts %.1f us after the "
+                     "event, %llu of them with the counts in when the call returned (the call held them "
+                     "back); %llu had their counts in first (no pre-wake); one-token miss reads: %llu with "
+                     "a pre-wake armed, %llu fired it (the last read landed %.1f us after it), %llu landed "
+                     "first (%.1f us before its time)",
+                     (unsigned long long)hx.wk_rt,
+                     hx.wk_rt ? (double)hx.wk_rt_call_ns * 1e-3 / (double)hx.wk_rt : 0.0,
+                     hx.wk_rt ? (double)hx.wk_rt_gap_ns * 1e-3 / (double)hx.wk_rt : 0.0,
+                     (unsigned long long)hx.wk_rt_late,
+                     (unsigned long long)hx.wk_rt_ready, (unsigned long long)hx.wk_rd_armed,
+                     (unsigned long long)hx.wk_rd_fired,
+                     hx.wk_rd_fired ? (double)hx.wk_rd_lead_ns * 1e-3 / (double)hx.wk_rd_fired : 0.0,
+                     (unsigned long long)early, early ? (double)hx.wk_rd_early_ns * 1e-3 / (double)early : 0.0);
+        }
+        if (hx.fl_copies || hx.fl_plain)
+            RAD_INFO("host experts, fetch lists: %llu counts syncs fetched in one ranged copy, %llu range "
+                     "lists written, %llu fetches left as separate copies",
+                     (unsigned long long)hx.fl_copies, (unsigned long long)hx.fl_armed,
+                     (unsigned long long)hx.fl_plain);
+        /* The miss reads' legs and handoffs (FileStager::HostStats::MissReads): the gates of
+         * ..._MIRROR_SPLIT (how often the mirror's leg lands last, its copy) and ..._MISS_POST (the
+         * readers' start, the caller's return), and ..._PREFETCH_URGENT's calls with a read-ahead
+         * unit's rest apart. Means a call, or a call with a mirror leg. */
+        static const char* const kMrWhat[3] = { "one unit", "two or more units",
+                                                "with a read-ahead unit's rest" };
+        for (int k = 0; k < 3; ++k) {
+            const auto& m = hx.mr[k];
+            if (!m.calls) continue;
+            const double c = (double)m.calls, mc = (double)(m.mirror_calls ? m.mirror_calls : 1);
+            const uint64_t cl = m.mirror_calls - m.mirror_last;
+            RAD_INFO("host experts' one-token miss reads, %s: %llu calls, %llu posted at the choice, "
+                     "%llu with the mirror's tail in pieces; of %llu with a mirror leg the mirror landed "
+                     "last in %llu (%.1f%%, %.3f ms after the container) and the container in %llu "
+                     "(%.3f ms after the mirror); from the dispatch: mirror leg %.3f ms (its copy %.3f ms, "
+                     "all its copies %.3f), container leg %.3f ms, the caller back %.3f ms",
+                     kMrWhat[k], (unsigned long long)m.calls,
+                     (unsigned long long)m.posted, (unsigned long long)m.split,
+                     (unsigned long long)m.mirror_calls, (unsigned long long)m.mirror_last,
+                     100.0 * (double)m.mirror_last / mc,
+                     m.mirror_last ? (double)m.mirror_by_ns * 1e-6 / (double)m.mirror_last : 0.0,
+                     (unsigned long long)cl, cl ? (double)m.container_by_ns * 1e-6 / (double)cl : 0.0,
+                     (double)m.mirror_ns * 1e-6 / mc, (double)m.copy_ns * 1e-6 / mc,
+                     (double)m.copy_sum_ns * 1e-6 / mc, (double)m.container_ns * 1e-6 / c,
+                     (double)m.total_ns * 1e-6 / c);
+            RAD_INFO("host experts' one-token miss reads, %s, readers: the first read begun %.1f us "
+                     "after the dispatch, the first container read %.1f us, the last read %.1f us; the "
+                     "caller back %.1f us after the last read landed%s",
+                     kMrWhat[k], (double)m.first_ns * 1e-3 / c,
+                     (double)m.first_container_ns * 1e-3 / c, (double)m.last_start_ns * 1e-3 / c,
+                     (double)m.back_ns * 1e-3 / c,
+                     m.posted ? fmt("; posted calls: the caller came to wait %.1f us after the dispatch",
+                                    (double)m.join_ns * 1e-3 / (double)m.posted).c_str() : "");
+        }
+        if (hx.pred_layers)
+            RAD_INFO("next-layer predictor: on time for %llu of %llu one-token layers; %llu of %llu "
+                     "misses predicted (%.1f%%); %llu file-tier experts predicted, %llu of them "
+                     "selected (%.1f%%), %llu neither selected nor cached (a read-ahead's waste)",
+                     (unsigned long long)hx.pred_ready, (unsigned long long)hx.pred_layers,
+                     (unsigned long long)hx.pred_hit, (unsigned long long)hx.pred_misses,
+                     hx.pred_misses ? 100.0 * (double)hx.pred_hit / (double)hx.pred_misses : 0.0,
+                     (unsigned long long)hx.pred_file, (unsigned long long)hx.pred_selected,
+                     hx.pred_file ? 100.0 * (double)hx.pred_selected / (double)hx.pred_file : 0.0,
+                     (unsigned long long)hx.pred_wasted);
+        if (hx.pred_layers) {
+            std::string pos;
+            for (int k = 0; k < 16 && hx.pred_pos_unc[k]; ++k)
+                pos += fmt(" %d:%llu/%llu", k + 1, (unsigned long long)hx.pred_pos_hit[k],
+                           (unsigned long long)hx.pred_pos_unc[k]);
+            if (!pos.empty())
+                RAD_INFO("next-layer predictor, uncached predictions by rank (selected/predicted):%s",
+                         pos.c_str());
+        }
+        if (hx.pred2_ready) {
+            std::string pos;
+            for (int k = 0; k < 16 && hx.pred2_pos_unc[k]; ++k)
+                pos += fmt(" %d:%llu/%llu", k + 1, (unsigned long long)hx.pred2_pos_hit[k],
+                           (unsigned long long)hx.pred2_pos_unc[k]);
+            RAD_INFO("two-ahead predictor: on time for %llu one-token layers; %llu of %llu misses "
+                     "predicted (%.1f%%); uncached predictions by rank (selected/predicted):%s",
+                     (unsigned long long)hx.pred2_ready, (unsigned long long)hx.pred2_hit,
+                     (unsigned long long)hx.pred2_misses,
+                     hx.pred2_misses ? 100.0 * (double)hx.pred2_hit / (double)hx.pred2_misses : 0.0,
+                     pos.c_str());
+        }
+        if (hx.pf_read)
+            RAD_INFO("read-ahead: %llu units read ahead, %llu used by a miss (%.1f%%); %llu misses "
+                     "waited for theirs, %.1f ms in all; %llu taken by their layer before their read "
+                     "began; %.1f ms holding back for demand reads",
+                     (unsigned long long)hx.pf_read, (unsigned long long)hx.pf_used,
+                     100.0 * (double)hx.pf_used / (double)hx.pf_read,
+                     (unsigned long long)hx.pf_waited, (double)hx.pf_wait_ns / 1e6,
+                     (unsigned long long)hx.pf_taken, (double)hx.pf_yield_ns / 1e6);
+        if (hx.ra_planned || hx.ra_misses) {
+            const uint64_t used = hx.ra_whole + hx.ra_finished;
+            /* ..._PREFETCH_URGENT: the finished units' rest was the layer's own read, and the wait
+             * here is only for their pieces in flight after it (the line below has the layers'). */
+            const int rest = r->fstager.prefetch_urgent();
+            RAD_INFO("read-ahead in pieces: %llu units planned (%llu more too late, %llu over the "
+                     "live cap); at their layer %llu used (%llu whole, %llu %s %.1f ms in all, %.3f ms "
+                     "each), %llu read as any miss, %llu re-read after a "
+                     "failed piece; %llu dropped (%llu not selected, %llu cache hits, %llu stale); "
+                     "%llu of %llu one-token misses planned (%.1f%%), %llu used (%.1f%%); read ahead "
+                     "%.0f MB for units used, %.0f MB for units dropped",
+                     (unsigned long long)hx.ra_planned, (unsigned long long)hx.ra_late,
+                     (unsigned long long)hx.ra_capped, (unsigned long long)used,
+                     (unsigned long long)hx.ra_whole, (unsigned long long)hx.ra_finished,
+                     rest ? "finished by the layer's own read, their pieces in flight waited for"
+                          : "finished while the layer waited",
+                     (double)hx.ra_wait_ns / 1e6,
+                     hx.ra_finished ? (double)hx.ra_wait_ns / 1e6 / (double)hx.ra_finished : 0.0,
+                     (unsigned long long)hx.ra_fresh, (unsigned long long)hx.ra_refetched,
+                     (unsigned long long)(hx.ra_unselected + hx.ra_cached + hx.ra_stale),
+                     (unsigned long long)hx.ra_unselected, (unsigned long long)hx.ra_cached,
+                     (unsigned long long)hx.ra_stale, (unsigned long long)hx.ra_miss_planned,
+                     (unsigned long long)hx.ra_misses,
+                     hx.ra_misses ? 100.0 * (double)hx.ra_miss_planned / (double)hx.ra_misses : 0.0,
+                     (unsigned long long)used,
+                     hx.ra_misses ? 100.0 * (double)used / (double)hx.ra_misses : 0.0,
+                     (double)hx.ra_used_bytes / 1e6, (double)hx.ra_dropped_bytes / 1e6);
+            /* The per-unit wait, the same measure with and without ..._PREFETCH_URGENT: from the
+             * layer's choice until its partly read units were whole. */
+            if (hx.ra_fin_layers)
+                RAD_INFO("read-ahead in pieces, partly read units at their layer: %llu layers waited "
+                         "for them, %.3f ms each from the layer's choice until every such unit was "
+                         "whole; %llu of those layers read nothing else, %.3f ms each (one unit's own "
+                         "wait); %llu of them with the unit started at least the plane mirror's decode share, "
+                         "%.3f ms each (the per-unit wait on the units every arm finishes)",
+                         (unsigned long long)hx.ra_fin_layers,
+                         (double)hx.ra_fin_ns * 1e-6 / (double)hx.ra_fin_layers,
+                         (unsigned long long)hx.ra_alone,
+                         hx.ra_alone ? (double)hx.ra_alone_ns * 1e-6 / (double)hx.ra_alone : 0.0,
+                         (unsigned long long)hx.ra_alone_b,
+                         hx.ra_alone_b ? (double)hx.ra_alone_b_ns * 1e-6 / (double)hx.ra_alone_b : 0.0);
+            if (rest)
+                RAD_INFO("read-ahead in pieces, rests on the kept readers "
+                         "(RADIANCE_EXPERIMENTAL_DS41_PREFETCH_URGENT=%d): %llu units' rest read in their "
+                         "layer's own call, %.0f MB (%.1f MB of it from the plane mirror, %llu units' rests with "
+                         "a part from it; %.2f MB a unit); %.1f ms waiting after the call for their pieces in "
+                         "flight", rest,
+                         (unsigned long long)hx.ra_rest, (double)hx.ra_rest_bytes / 1e6,
+                         (double)hx.ra_rest_mirror_bytes / 1e6, (unsigned long long)hx.ra_rest_mirror,
+                         hx.ra_rest ? (double)hx.ra_rest_bytes / 1e6 / (double)hx.ra_rest : 0.0,
+                         (double)hx.ra_wait_ns / 1e6);
+        }
+        /* RADIANCE_EXPERIMENTAL_DS41_ROUTE_TRACE (place/route_trace.h): this rank's records, and
+         * its one-token layers' picks by what it did with them (the trace's own tally of them). */
+        if (r->fstager.route_trace()) {
+            const auto& t = r->fstager.rt_stats();
+            const auto* p = t.picks;
+            RAD_INFO("route trace: %llu passes, %llu layer records (%llu one-token); one-token picks: "
+                     "%llu on the card, %llu RAM hits, %llu misses, %llu read ahead whole, %llu in "
+                     "part, %llu on the copy path, %llu undecided, %llu host-pinned; router outputs "
+                     "on %llu layers (logits on %llu), RAM snapshots on %llu, %llu layers whose "
+                     "router operands this pass did not show, %llu bias records, %llu layers whose "
+                     "copies could not be queued",
+                     (unsigned long long)t.passes, (unsigned long long)t.layers,
+                     (unsigned long long)t.d_layers, (unsigned long long)p[rtrace::kOnCard],
+                     (unsigned long long)p[rtrace::kRamHit], (unsigned long long)p[rtrace::kMiss],
+                     (unsigned long long)p[rtrace::kAheadWhole],
+                     (unsigned long long)p[rtrace::kAheadPart],
+                     (unsigned long long)p[rtrace::kCopyPath],
+                     (unsigned long long)p[rtrace::kUndecided],
+                     (unsigned long long)p[rtrace::kHostPinned], (unsigned long long)t.routes,
+                     (unsigned long long)t.logits, (unsigned long long)t.masks,
+                     (unsigned long long)t.uncaptured, (unsigned long long)t.biases,
+                     (unsigned long long)t.copy_failed);
+        }
+    }
+    /* The route trace's files: everything the ranks and the step loop recorded is written before
+     * the line that counts it (the writer joined). */
+    if (RouteTrace* rt = RouteTrace::get()) {
+        rt->close();
+        RAD_INFO("%s", rt->report().c_str());
+    }
+    /* The CPU pool serves every rank: its wake-up and pre-wakes, once for the process. */
+    if (const HostExpertPool* hp = HostExpertPool::running()) RAD_INFO("%s", hp->report().c_str());
+    /* The CPU pool serves every rank: RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_LEAN_TILES's counts,
+     * once for the process (ab_window.sh holds a Ph arm to them). */
+    bool hx_any = false;
+    for (auto& r : ranks_) hx_any = hx_any || r->fstager.host_experts();
+    if (HostExpertPool* hp = hx_any ? HostExpertPool::get() : nullptr; hp && hp->lean()) {
+        const HostExpertPool::LeanStats ls = hp->lean_stats();
+        RAD_INFO("host expert pool, lean tiles: %llu tiles claimed, %.2f slots looked at a claim (all %d "
+                 "without the switch); x lanes laid out for %llu tiles, reused on %llu (%.1f%%)",
+                 (unsigned long long)ls.claims,
+                 ls.claims ? (double)ls.scanned / (double)ls.claims : 0.0, 128,
+                 (unsigned long long)ls.lanes_built, (unsigned long long)ls.lanes_reused,
+                 ls.lanes_built + ls.lanes_reused
+                     ? 100.0 * (double)ls.lanes_reused / (double)(ls.lanes_built + ls.lanes_reused) : 0.0);
+    }
+    /* The read-ahead's readers and the predictor serve every rank: one report for the process. */
+    if (PieceReader& pr = PieceReader::process(); pr.started()) {
+        const PieceReader::Stats s = pr.stats();
+        RAD_INFO("read-ahead readers: %d readers, %llu KiB pieces; %llu pieces read (%llu urgent, %llu "
+                 "failed), %.0f MB in %.1f ms of reads (%.3f ms a piece), at most %llu in flight; "
+                 "%.1f ms of reader time held back by demand reads; %llu demand reads, %llu of them "
+                 "started with read-ahead pieces in flight, %.1f ms in all until those pieces were in "
+                 "(%.3f ms each)%s", pr.readers(), (unsigned long long)(pr.piece_bytes() >> 10),
+                 (unsigned long long)s.pieces, (unsigned long long)s.urgent_pieces,
+                 (unsigned long long)s.failed, (double)s.bytes / 1e6, (double)s.read_ns / 1e6,
+                 s.pieces ? (double)s.read_ns / 1e6 / (double)s.pieces : 0.0,
+                 (unsigned long long)s.max_in_flight, (double)s.held_ns / 1e6,
+                 (unsigned long long)s.demand_reads, (unsigned long long)s.demand_met,
+                 (double)s.demand_wait_ns / 1e6,
+                 s.demand_met ? (double)s.demand_wait_ns / 1e6 / (double)s.demand_met : 0.0,
+                 s.stopped ? fmt("; %llu units stopped for their layer to read the rest "
+                                 "(..._PREFETCH_URGENT)", (unsigned long long)s.stopped).c_str() : "");
+    }
+    if (RouterPredictor* rp = RouterPredictor::get(); rp && rp->pieces()) {
+        const RouterPredictor::Stats s = rp->stats();
+        RAD_INFO("router predictor (two ahead, top %d): %llu inputs posted, %llu predictions, %llu "
+                 "dropped behind a full queue; %.1f ms scoring (%.1f us a prediction), %.1f ms "
+                 "planning the read-ahead (%.1f us a prediction)", rp->k(),
+                 (unsigned long long)s.posted, (unsigned long long)s.computed,
+                 (unsigned long long)s.dropped, (double)s.compute_ns / 1e6,
+                 s.computed ? (double)s.compute_ns / 1e3 / (double)s.computed : 0.0,
+                 (double)s.ready_ns / 1e6,
+                 s.computed ? (double)s.ready_ns / 1e3 / (double)s.computed : 0.0);
+    }
+    /* ..._PREFETCH_RECORD: the inputs written for offline scoring (router_predictor.h). */
+    if (RouterPredictor* rp = RouterPredictor::get(); rp && !rp->record_path().empty()) {
+        rp->flush_record();
+        RAD_INFO("router predictor record: %llu router inputs written to %s",
+                 (unsigned long long)rp->stats().recorded, rp->record_path().c_str());
+    }
+    /* ..._PREFETCH_SCORE=int8|int4: the scoring's parts, and with ..._SCORE_CHECK the predictions
+     * against bf16 alone (router_predictor.h). */
+    if (RouterPredictor* rp = RouterPredictor::get(); rp && rp->score_mode() != RouterPredictor::kScoreBf16) {
+        const RouterPredictor::Stats s = rp->stats();
+        const char* q = rp->score_mode() == RouterPredictor::kScoreInt8 ? "int8" : "int4";
+        const double n = s.computed ? (double)s.computed : 1.0;
+        RAD_INFO("router predictor scoring: %s (%.0f MB, one scale an expert), the best %d scored again "
+                 "in bf16: %llu predictions, %.1f us a prediction in the %s pass and %.1f us rescoring",
+                 q, (double)rp->quant_bytes() / 1e6, rp->rescore(), (unsigned long long)s.computed,
+                 (double)s.quant_ns / 1e3 / n, q, (double)s.rescore_ns / 1e3 / n);
+        if (s.checked) {
+            std::string ranks;
+            for (int b = 0; b < RouterPredictor::kRankBuckets; ++b)
+                ranks += b < RouterPredictor::kRankBuckets - 1
+                    ? fmt(" under %d %llu,", RouterPredictor::kRankEdge[b], (unsigned long long)s.check_rank[b])
+                    : fmt(" %d or more %llu", RouterPredictor::kRankEdge[b - 1], (unsigned long long)s.check_rank[b]);
+            const double c = (double)s.checked;
+            RAD_INFO("router predictor check against bf16 alone: %llu predictions checked (one in %d); "
+                     "bf16's top %d the same set in %llu (%.2f%%) and in the same order in %llu (%.2f%%); "
+                     "bf16's picks by their rank in the %s scores:%s; %llu at or past the %d rescored; "
+                     "%.1f ms checking", (unsigned long long)s.checked, rp->check_every(),
+                     rp->k(), (unsigned long long)s.check_set,
+                     100.0 * (double)s.check_set / c, (unsigned long long)s.check_order,
+                     100.0 * (double)s.check_order / c, q, ranks.c_str(),
+                     (unsigned long long)s.check_outside, rp->rescore(), (double)s.check_ns / 1e6);
+        }
     }
     /* Drain the transfer streams before the contexts. Ctx::shutdown drains the compute streams
      * and frees the arena, but the mover's stream also copies into the arena (the prefill
      * stager's ring, lent slab slots) and would otherwise drain only later, with the mover. A fill
      * landing in a freed arena is a GPU memory fault. */
-    for (auto& r : ranks_)
-        if (RadStream s = r->mover.transfer_stream()) (void)rad_stream_sync(s);
     for (auto& r : ranks_) {
-        if (r->record_owner) (void)r->record_owner->quiesce();
-        r->ctx.shutdown();
+        if (r->fstager.shutdown_head_cache() != RAD_OK) {
+            RAD_ERR("DSpark head tail: completion unknown; retaining process owners");
+            std::_Exit(88);
+        }
+        r->fstager.drain_host_inserts();   /* the CPU path's background relayouts into the cache */
+        //Mapped-source leases must retire before any context arena or stager event disappears.
+        //A failed completion proof cannot be followed by ordinary member destruction.
+        if (r->mover.mapped_file_drain() != RAD_OK) {
+            RAD_ERR("mapped file cache: Engine transfer completion unknown; retaining process owners");
+            std::_Exit(88);
+        }
+        if (RadStream s = r->mover.transfer_stream()) (void)rad_stream_sync(s);
     }
+    for (auto& r : ranks_) r->ctx.shutdown();
+    /* The streamed groups' host mirrors are pinned outside every pool; freed after the contexts,
+     * since a pass reads them. Safe after a failed bring-up. */
+    for (auto& r : ranks_) r->kv.free_stream(rad_device_allocator());
     step_state_fini();
     ranks_.clear();
     for (TableCopy& c : table_copies_) table_copy_free(&c);
@@ -133,11 +523,6 @@ int Engine::declare_sampler(int rank, RadBuilder* b, int64_t logits_width, bool 
 
     SamplerConfig sc{};
     sc.n_vocab       = meta_.n_vocab;
-    if(glm_main_){
-        if(glm_main_->result.vocabulary.model_rows!=meta_.n_vocab||
-           glm_main_->result.vocabulary.valid_tokens!=154856)return RAD_E_STATE;
-        sc.valid_token_count=glm_main_->result.vocabulary.valid_tokens;
-    }
     /* This rank's vocabulary width, from the declared logits buffer (see rad_tools_declare).
      * meta_.n_vocab is the whole model's on every rank. */
     sc.n_vocab_local = logits_width > 0 ? logits_width : meta_.n_vocab;
@@ -169,13 +554,6 @@ int Engine::declare_sampler(int rank, RadBuilder* b, int64_t logits_width, bool 
     sc.rank          = rank;
     sc.world_size    = cfg_.tp;
     sc.draft_coupling = cfg_.draft_coupling;
-    if(glm_main_&&!sizing){
-        TinySamplerQuote quote;RAD_TRY(Sampler::glm_main_startup_quote(sc,&quote));
-        const auto total=glm_main_->result.sampler_requested+quote.storage.page_and_heap_total;
-        if(total<glm_main_->result.sampler_requested||total>(8u<<20))return RAD_E_NOMEM;
-        glm_main_->sampler_quotes[size_t(rank)]=quote;
-        glm_main_->result.sampler_requested=total;
-    }
     RAD_TRY(smp.declare(b, sc));
 
     /* Where the chain writes the sampled ids. The engine declares it because rad-kbench drives the
@@ -217,11 +595,9 @@ int Engine::declare_sampler(int rank, RadBuilder* b, int64_t logits_width, bool 
  * `heat_seen` prevents crediting a bank twice: a bank keeps its counts until the next report, so a
  * step where a layer did not route (a drafter pass) would re-credit the stale plane.
  */
-void Engine::tiering_dispatch(Rank& r, int step) {
-    if (!r.heat.enabled()) return;
-
-    r.mover.begin_dispatch(step, &r.heat);
-
+/* Every landed histogram of a step before `before_step`, oldest first per layer, into
+ * `r.heat_rows`; nothing is credited yet. */
+void Engine::find_histograms(Rank& r, int before_step) {
     const int n_layer = r.ctx.n_route_layers();
     if ((int)r.heat_seen.size() != n_layer) r.heat_seen.assign((size_t)n_layer, -1);
     /* Find all histograms first, then credit them in order. Each is a card-written row in host
@@ -238,7 +614,7 @@ void Engine::tiering_dispatch(Rank& r, int step) {
         int seen = r.heat_seen[(size_t)l];
         bool any = false;
         for (;;) {
-            const int bank = r.ctx.next_histogram(l, seen, step, landed);
+            const int bank = r.ctx.next_histogram(l, seen, before_step, landed);
             if (bank < 0) break;
             const int32_t* h = r.ctx.last_histogram(l, bank);
             if (!h) break;
@@ -248,8 +624,46 @@ void Engine::tiering_dispatch(Rank& r, int step) {
         }
         if (!any) ++r.heat_idle;
     }
+}
+
+/* --expert-stats: one found histogram into the rank's tally (place/xstats.h), from the same row
+ * the heat engine reads. The caller holds the tally. */
+static void xstats_credit(XsTally* xs, Ctx& ctx, int layer, int bank, const int32_t* h) {
+    const RadRouting* rt = ctx.last_routing(layer);
+    const int64_t n = rt ? std::min<int64_t>(rt->n_expert, ctx.route_n_expert()) : 0;
+    xs->credit(layer, ctx.last_histogram_step(layer, bank), h, n,
+               ctx.last_histogram_reports(layer, bank), rt ? rt->top_k : 0);
+}
+
+/* The drain alone, for the tally, where the heat engine is off or the engine is stopping
+ * (`before_step` INT_MAX once the streams are drained). */
+void Engine::xstats_drain(Rank& r, XsTally* xs, int before_step) {
+    find_histograms(r, before_step);
+    std::lock_guard<std::mutex> lk(xs->mutex());
+    for (const Rank::HeatRow& hr : r.heat_rows) {
+        xstats_credit(xs, r.ctx, hr.layer, hr.bank, hr.h);
+        r.heat_seen[(size_t)hr.layer] = r.ctx.last_histogram_step(hr.layer, hr.bank);
+        r.ctx.mark_credited(hr.layer, hr.bank);
+        ++r.heat_credited;
+    }
+    xs->note_dropped(r.ctx.route_dropped());
+}
+
+void Engine::tiering_dispatch(Rank& r, int step) {
+    XsTally* const xs = xstats_ ? xstats_->tally(r.index) : nullptr;
+    if (!r.heat.enabled()) {
+        if (xs) xstats_drain(r, xs, step);
+        return;
+    }
+
+    r.mover.begin_dispatch(step, &r.heat);
+
+    find_histograms(r, step);
+    std::vector<Rank::HeatRow>& rows = r.heat_rows;
     const int32_t n_ex = (int32_t)r.ctx.route_n_expert();
     constexpr size_t kAhead = 2;
+    std::unique_lock<std::mutex> xl;
+    if (xs) xl = std::unique_lock<std::mutex>(xs->mutex());
     for (size_t i = 0; i < rows.size() && i < kAhead; ++i) r.heat.prefetch(rows[i].h, n_ex);
     for (size_t i = 0; i < rows.size(); ++i) {
         if (i + kAhead < rows.size()) r.heat.prefetch(rows[i + kAhead].h, n_ex);
@@ -258,9 +672,15 @@ void Engine::tiering_dispatch(Rank& r, int step) {
          * weight it by the report count, or the layer's experts are underpriced and drained. */
         const int reps = r.ctx.last_histogram_reports(hr.layer, hr.bank);
         r.heat.observe(hr.layer, hr.h, n_ex, reps > 1 ? (float)reps : 1.0f);
+        /* The row is in cache now. */
+        if (xs) xstats_credit(xs, r.ctx, hr.layer, hr.bank, hr.h);
         r.heat_seen[(size_t)hr.layer] = r.ctx.last_histogram_step(hr.layer, hr.bank);
         r.ctx.mark_credited(hr.layer, hr.bank);
         ++r.heat_credited;
+    }
+    if (xs) {
+        xs->note_dropped(r.ctx.route_dropped());
+        xl.unlock();
     }
 
     /* No swaps behind a pass the stager armed: that step is bound by its own copies on the same
@@ -292,54 +712,130 @@ void Engine::tiering_dispatch(Rank& r, int step) {
     r.mover.hold_turnover(hold);
     (void)r.mover.balance(&r.heat, !hold);
 }
+
+/* ------------------------------------------------------------------ --expert-stats
+ *
+ * Which model-wide expert each index of each rank's histogram is (place/xstats.h, XsMap): index e
+ * is the rank's unit with group expert e, and the container's directory entry for that unit's
+ * weight names the expert in the model's numbering. A checkpoint served directly has no such entry
+ * and the map falls back to rank order. */
+int Engine::xstats_open() {
+    if (cfg_.expert_stats.empty()) return RAD_OK;
+    const int n_layer = ranks_[0]->ctx.n_route_layers();
+    if (n_layer <= 0) {
+        RAD_WARN("--expert-stats: '%s' routes no experts; there is nothing to count and %s is not "
+                 "written", meta_.name ? meta_.name : "the model", cfg_.expert_stats.c_str());
+        return RAD_OK;
+    }
+    constexpr int32_t kUnset = INT32_MIN, kClash = -3;
+    std::vector<std::vector<std::vector<int32_t>>> ids(ranks_.size());
+    for (size_t ri = 0; ri < ranks_.size(); ++ri) {
+        const Program& P = ranks_[ri]->program;
+        auto& layers = ids[ri];
+        layers.assign((size_t)n_layer, {});
+        for (size_t w = 1; w < P.weights.size(); ++w) {
+            const WeightInfo& wi = P.weights[w];
+            const int32_t l = wi.decl.group.layer, e = wi.decl.group.expert;
+            if (l < 0 || l >= n_layer || e < 0) continue;
+            std::vector<int32_t>& row = layers[(size_t)l];
+            if ((size_t)e >= row.size()) row.resize((size_t)e + 1, kUnset);
+            const RadFileEntry* fe = source_entry(wi.source);
+            const int32_t g = fe && fe->layer == l && fe->expert >= 0 ? fe->expert : -1;
+            int32_t& at = row[(size_t)e];
+            /* Every weight of one unit must name the same expert. */
+            at = at == kUnset ? g : at == g ? at : kClash;
+        }
+        for (auto& row : layers)
+            for (int32_t& v : row) if (v == kUnset || v < 0) v = -1;
+    }
+    std::vector<int32_t> n_model((size_t)n_layer, 0);
+    for (int l = 0; l < n_layer && l < meta_.n_layers; ++l) n_model[(size_t)l] = (int32_t)meta_.n_expert;
+    XsMap map;
+    RAD_TRY(xs_map_build(ids, n_model, (int32_t)meta_.n_layers, &map));
+
+    XsSnapshot info;
+    info.model = meta_.name ? meta_.name : "";
+    info.arch = meta_.arch_id ? meta_.arch_id : "";
+    info.container = cfg_.model;
+    xstats_ = std::make_unique<ExpertStats>();
+    if (const int st = xstats_->init(cfg_.expert_stats, map, std::move(info)); st < 0) {
+        RAD_ERR("--expert-stats: cannot write %s", cfg_.expert_stats.c_str());
+        xstats_.reset();
+        return st;
+    }
+    std::map<std::string, int> how;
+    int32_t mx = 0;
+    for (int l = 0; l < n_layer; ++l) {
+        if (map.n_expert[(size_t)l] <= 0) continue;
+        ++how[map.how[(size_t)l]];
+        mx = std::max(mx, map.n_expert[(size_t)l]);
+    }
+    std::string hs;
+    for (const auto& [k, v] : how) hs += fmt("%s%d by %s", hs.empty() ? "" : ", ", v, k.c_str());
+    int counting = 0;
+    for (size_t ri = 0; ri < ranks_.size(); ++ri) counting += xstats_->tally((int)ri) != nullptr;
+    RAD_INFO("expert stats: %d routed layers (up to %d experts; ids %s), counted on %d of %d "
+             "rank%s, written to %s every 30 s and at shutdown",
+             n_layer, (int)mx, hs.c_str(), counting, cfg_.tp, cfg_.tp == 1 ? "" : "s",
+             cfg_.expert_stats.c_str());
+    xstats_->start();
+    return RAD_OK;
+}
+
+void Engine::xstats_close() {
+    if (!xstats_) return;
+    xstats_->stop();
+    /* The banks of the last steps are still in the ring: drain each counting rank's stream, then
+     * credit them. Not after a step-loop error, where a stream may never drain. */
+    if (loop_status_.load(std::memory_order_acquire) >= 0) {
+        for (auto& r : ranks_) {
+            XsTally* xs = xstats_->tally(r->index);
+            if (!xs) continue;
+            if (rad_dev_set(r->device) < 0 || rad_stream_sync(r->ctx.stream()) < 0) continue;
+            xstats_drain(*r, xs, INT_MAX);
+        }
+        if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
+    }
+    (void)xstats_->write(true);
+}
+
 /* ------------------------------------------------------------------ the rank thread */
 void Engine::rank_loop(int index) {
     Rank& r = *ranks_[(size_t)index];
-    auto* cache_binding=cache_prepare4_?cache_prepare4_->binding(index):nullptr;
     if (r.ctx.bind_thread() < 0) {
-        if(cache_binding)cache_binding->fail_stop(RAD_E_DEVICE);
         RAD_ERR("rank %d: could not bind its device", index);
         step_status_.store(RAD_E_DEVICE, std::memory_order_release);
     }
 
     for (;;) {
         barrier_->arrive_and_wait();                    /* released against this step's batch */
-        if (stopping_.load(std::memory_order_acquire)) {if(cache_prepare4_)cache_prepare4_->stop_if_active();break;}
+        if (stopping_.load(std::memory_order_acquire)) break;
 
-        try {
         const RadBatch* b = step_batch_.load(std::memory_order_acquire);
         if (b) {
-            const int cache_what=issue_what_.load(std::memory_order_acquire);
-            struct CacheRankGuard {
-                CachePrepare4RankBinding* binding;bool model,finished=false;
-                ~CacheRankGuard(){if(binding&&model&&!finished)binding->fail_stop(RAD_E_STATE);}
-            } cache_guard{cache_binding,cache_what==kIssueModel};
-            if(cache_binding&&(cache_what!=kIssueModel&&cache_what!=kIssueSampler))cache_binding->fail_stop(RAD_E_UNSUPPORTED);
             /* This rank's view of the step, pointing at this card's staging. Its upload was issued
              * on this rank's stream, so no cross-rank fence is needed. */
             const RadBatch* mine = gen_ ? gen_->batch_for(index) : sched_.batch_for(index);
             if (!mine) {
-                if(cache_binding)cache_binding->fail_stop(RAD_E_STATE);
                 RAD_ERR("rank %d: the builder has no batch for this rank", index);
                 step_status_.store(RAD_E_STATE, std::memory_order_release);
                 barrier_->arrive_and_wait();
                 continue;
             }
             b = mine;
-            if(cache_binding){const int same=cache_binding->check_batch(*b);if(same<0)cache_binding->fail_stop(same);}
             const int what = issue_what_.load(std::memory_order_acquire);
-            const bool sampler_phase = what == kIssueAll || what == kIssueSampler;
-            int s = what == kIssueStatus
-                        ? r.ctx.await_device_status()
-                        : what == kIssueSampler ? RAD_OK : r.ctx.run_step(b);
-            if (s >= 0 && what == kIssueAll && r.ctx.checks_device_status())
-                s = r.ctx.await_device_status();
-            if(cache_binding&&cache_guard.model){const int ended=cache_binding->finish(*b,s);if(ended<0)cache_binding->fail_stop(ended);cache_guard.finished=true;}
+            /* --expert-stats files each pass's step kind for the drain, which reads it a step or
+             * more later. An encoder pass is not a step of the token stream. */
+            if (xstats_ && what != kIssueSampler && b->enc == 0)
+                if (XsTally* xs = xstats_->tally(index)) xs->issued(*b);
+            int s = what == kIssueSampler ? RAD_OK : r.ctx.run_step(b);
+            /* RADIANCE_EXPERIMENTAL_DS41_PREFILL_HASH: the state a prompt's last prefill step left,
+             * before its sampler (engine_hash.cpp). */
+            if (s >= 0 && prefill_hash_ && what != kIssueSampler) prefill_hash_rank(r, b);
             if (s < 0) {
-                if(cache_binding)cache_binding->fail_stop(s);
                 RAD_ERR("rank %d step %d: %s", index, b->step, r.ctx.step_error());
                 step_status_.store(s, std::memory_order_release);
-            } else if (b->n_out > 0 && sampler_phase) {
+            } else if (b->n_out > 0 && what != kIssueModel) {
                 /* Wait for the scheduler's sampler staging, which runs while the device executes
                  * the forward pass enqueued above, so the wait is hidden behind device work. */
                 int bst = RAD_OK;
@@ -348,7 +844,6 @@ void Engine::rank_loop(int index) {
                     build_cv_.wait(lk, [this] { return build_ready_; });
                     bst = build_status_;
                 }
-                if(bst<0&&cache_binding)cache_binding->fail_stop(bst);
                 /* The sampler chain goes on the same stream behind the model with no host sync
                  * (spec §13). */
                 if (bst >= 0) {
@@ -356,24 +851,21 @@ void Engine::rank_loop(int index) {
                     if (b->draft_pass == 0 && !score_rows_.empty()) s = issue_scored_rows(r);
                     if (s >= 0) s = r.sampler.run(&r.ctx, r.program.logits_buf, r.tok_buf);
                     if (s < 0) {
-                        if(cache_binding)cache_binding->fail_stop(s);
                         RAD_ERR("rank %d step %d: sampler: %s", index, b->step, rad_strerror(s));
                         step_status_.store(s, std::memory_order_release);
                     }
                 }
             }
             /* Behind the pass, once a step: see tiering_dispatch. */
-            if (s >= 0 && b->draft_pass == 0 && sampler_phase) tiering_dispatch(r, b->step);
+            if (s >= 0 && b->draft_pass == 0 && what != kIssueModel) tiering_dispatch(r, b->step);
 
-        }else if(cache_binding&&cache_binding->active())cache_binding->fail_stop(RAD_E_STATE);
-        }catch(...){if(cache_binding)cache_binding->fail_stop(RAD_E_STATE);throw;}
+        }
         barrier_->arrive_and_wait();                    /* joined; the scheduler may read */
     }
 }
 
 /* ------------------------------------------------------------------ the scheduler thread */
 int Engine::prepare_release(const RadBatch* b) {
-    if (const int s = model_policy_admission(); s < 0) return s;
     /* The arena level, recalling lent arena memory if this step needs it. Every rank thread is
      * parked, so the level can change and a recall can drain both streams. */
     if (const int as = arena_step(b); as < 0) return as;
@@ -387,23 +879,41 @@ int Engine::prepare_release(const RadBatch* b) {
             step_status_.store(RAD_E_NOMEM, std::memory_order_release);
     }
     if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
+    /* The stage bound for every rank (kvstream/stage.h, "Volume"). Rank 0's allocator hands out the
+     * block ids every rank uses, and the ranks are parked, so no allocation races the read. */
+    for (auto& rk : ranks_) kvstream_bound_live(&rk->ctx, ranks_[0]->kv);
     return RAD_OK;
 }
 
-int Engine::issue_ahead(const RadBatch** out) {
+int Engine::issue_ahead(const RadBatch** out, const StepOut& so) {
     *out = nullptr;
-    if(cache_prepare4_)return RAD_OK; // preserve truthful Batch.n_ahead; disable ONLY actual issue-ahead
     if (!pipelining_) return RAD_OK;
     for (int i = 0; i < serial_rows_ && serial_done_ > 0; ++i)
         sched_.expect_draft(serial_row_[(size_t)i].seq, serial_done_);
     for (int i = 0; i < block_rows_; ++i)
         sched_.expect_draft(block_row_[(size_t)i].seq, block_steps_);
-    const RadBatch* nb = sched_.step_next();
+    /* RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP: this step's ids first, when they can decide
+     * whether a step follows (Scheduler::outcome_decides_next). Issued ahead regardless, the step
+     * behind a reply's last token runs a pass for a finished request; and where issuing a pass
+     * waits for the card, as the CPU path's routed layers do, the commit that ends the reply comes
+     * only after most of that pass, so the reply and the next request wait it out (the EOS
+     * token's pass misses ~100 experts when the cache has not held them: ~0.26 s). The read-back
+     * moves no commit: the ids are read again by collect_step and committed after this as
+     * before, and a step that is issued is the step that would have been. */
+    Scheduler::StepResult known{};
+    const bool peek = post_stop_ && sched_.outcome_decides_next();
+    if (peek) RAD_TRY(peek_outcome(so, &known));
+    const RadBatch* nb = sched_.step_next(peek ? &known : nullptr);
     if (!nb) return RAD_OK;
     /* Its rows' tokens, positions and slots, advanced on the card behind this step's acceptance
      * and drafts. */
     RAD_TRY(advance_all(ADV_TRUNK, 0, false));
     RAD_TRY(prepare_release(nb));
+    if (peek && known.token) {
+        ++post_stop_issued_;
+        post_stop_turn_ns_ += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                  std::chrono::steady_clock::now() - post_stop_t_).count();
+    }
     issue_what_.store(kIssueModel, std::memory_order_release);
     step_batch_.store(nb, std::memory_order_release);
     barrier_->arrive_and_wait();
@@ -431,50 +941,7 @@ void Engine::phase_mark(int p) {
  *     refuses new submissions;
  *   - sets `loop_status_`, which run_server watches to stop HTTP, so the process exits with the
  *     error instead of queueing requests nothing will drain (spec §17). */
-bool Engine::requires_checked_model_profile() const {
-    return std::any_of(ranks_.begin(), ranks_.end(), [](const auto& r) {
-        return checked_model_profile(r->program, r->ctx.checks_device_status());
-    });
-}
-
-int Engine::glm_main_tp4_cold_source_gate()const {
-    if(plugins_.arch_plugin!="glm5next_cache")return glm_main_?RAD_E_UNSUPPORTED:RAD_OK;
-    if(glm_main_&&glm_main_->attempted&&!glm_main_->result.retired)return RAD_OK;
-    // The real packed-one-expert proof is NOT complete source coverage. No
-    // factory is installed in this slice; do not create a Session or allocate
-    // model payload/opaque instances from an asserted boolean or scalar hash.
-    RAD_ERR("experimental GLM TP4 cache is closed: complete verified four-rank source/placement factory is not implemented");
-    return RAD_E_UNSUPPORTED;
-}
-int Engine::model_policy_admission() const {
-    if (ranks_.empty()) return RAD_E_STATE;
-    const bool required = ranks_[0]->program.requires_permanent_model_failure();
-    const bool cache_required=ranks_[0]->program.requires_glm_main_tp4_cache_fail_stop();
-    if(cache_required){
-        if(!cache_prepare4_||!cache_prepare4_->runtime_admitted()||ranks_.size()!=4||cfg_.tp!=4||cfg_.n_spec||cfg_.max_seqs!=1||cfg_.max_tok<1||cfg_.max_tok>128||
-           cfg_.kld()||cfg_.profile_ops||cfg_.mm_max_patches||cfg_.prefix_cache||cfg_.checkpoint_slots||cfg_.checkpoint_interval)return RAD_E_UNSUPPORTED;
-        for(size_t index=0;index<ranks_.size();++index){const auto& r=*ranks_[index];
-            if(glm_main_tp4_cache_program_profile(r.program)<0||r.ctx.checks_device_status()||!r.native_owner||!r.plan.native_inventory||
-               r.plan.native_inventory->limits().backend_profile!=NativeBackendProfile::GlmMainTp4AqlFailStopV1||
-               r.plan.native_inventory->source_generation()!=cache_prepare4_->source_generation()||
-               r.ctx.cache_prepare4_binding()!=cache_prepare4_->binding(int(index)))return RAD_E_UNSUPPORTED;
-        }
-        return RAD_OK;
-    }
-    if(cache_prepare4_)return RAD_E_UNSUPPORTED;
-    for (const auto& r : ranks_) {
-        if (const int first = r->ctx.terminal_status(); first < 0) return first;
-        if (r->program.requires_permanent_model_failure() != required) return RAD_E_STATE;
-        if(r->program.requires_glm_main_tp4_cache_fail_stop())return RAD_E_STATE;
-        const int s = model_profile_admission(r->program, r->ctx.checks_device_status(),
-                                              (int)ranks_.size(), cfg_.n_spec);
-        if (s < 0) return s;
-    }
-    return RAD_OK;
-}
-
 int Engine::fail_loop(int st) {
-    if(cache_prepare4_&&cache_prepare4_->runtime_admitted()&&!cache_prepare4_->admission_closed())cache_prepare4_->fail_stop(-1,st);
     stopping_.store(true, std::memory_order_release);
     if (barrier_) barrier_->abort();
     sched_.shutdown("the engine stopped on an error and is not serving", st < 0 ? st : RAD_E_STATE);
@@ -483,40 +950,41 @@ int Engine::fail_loop(int st) {
 }
 
 int Engine::step_loop() {
-    if (const int s = model_policy_admission(); s < 0) return fail_loop(s);
     /* The batch is built on rank 0's stream into rank 0's memory, so this thread binds rank 0's
      * device; the backend's current device is thread-local and starts at device 0. */
-    if (const int bound=rad_dev_set(ranks_[0]->device);bound<0){
-        if(cache_prepare4_&&cache_prepare4_->runtime_admitted())cache_prepare4_->fail_stop(0,bound);
+    if (rad_dev_set(ranks_[0]->device) < 0)
         RAD_ERR("step loop: could not bind rank 0's device");
-    }
     StepOut so;
     int idle = 0;
     std::vector<uint64_t> cancel;
-    deferred_status_profile_ = requires_checked_model_profile();
-    if (deferred_status_profile_ && ranks_.size() > 1) {
-        /* A synchronous refusal can leave a peer's collective unmatched. The
-         * device API has no cancel-and-quiesce operation, so neither a joined
-         * host enqueue gate nor ordinary teardown proves a bounded drain. Keep
-         * this NEW experimental profile closed to multi-rank serving until
-         * that failure protocol is implemented; legacy TP is unchanged. */
-        RAD_ERR("deferred device validation currently requires TP1: multi-rank collective cancellation is not implemented");
-        return fail_loop(RAD_E_UNSUPPORTED);
-    }
-    if (deferred_status_profile_ && cfg_.n_spec > 0) {
-        RAD_ERR("deferred device validation requires --num-speculative-tokens 0");
-        return fail_loop(RAD_E_UNSUPPORTED);
-    }
+    std::vector<RtStepEntry> rt_entries;   /* ..._ROUTE_TRACE's step records */
     /* Not in KL mode: its scored rows are copied out of the logits buffer after collection, and a
      * pass issued ahead would overwrite them. */
-    pipelining_ = !cache_prepare4_ && !deferred_status_profile_ && !cfg_.kld() && !embedding_ &&
-                  (serial_drafting() || block_drafting() || cfg_.n_spec <= 0);
+    pipelining_ = draft_experiment_.target_pipelining(!cfg_.kld() && !embedding_,
+                              serial_drafting(), block_drafting(), cfg_.n_spec);
+    early_ids_ = !cfg_.kld() && !embedding_;
+    prefill_hash_init();
+    /* RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP (read in serve()): only where steps are issued
+     * ahead; without that no pass follows a reply's last token. */
+    post_stop_ = post_stop_asked_ && pipelining_;
+    if (post_stop_)
+        RAD_INFO("post-stop passes: a step of one sequence that its own token can end is read back "
+                 "before the next step is planned, and nothing is issued behind one that ended its "
+                 "request (RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP)");
+    else if (post_stop_asked_)
+        RAD_INFO("post-stop passes: RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP has nothing to "
+                 "do: no step is issued ahead in this configuration (KL mode, an embedding model, "
+                 "or a drafter that reads the committed sequence), so none follows a reply's last "
+                 "token");
     const bool t_on = (int)log_level() >= (int)Log::Debug;
     /* The next step's forward pass when already issued behind the previous step, before its
      * readback (Scheduler::step_next). */
     const RadBatch* ahead = nullptr;
+    /* A step that runs for 20 s reports where the step loop waits: its syscall and its stack.
+     * Every iteration, idle or not, marks progress, so only a stuck step is reported. */
+    rad::StallWatch step_watch("step", 20000);
     while (!stopping_.load(std::memory_order_acquire)) {
-        if (const int s = model_policy_admission(); s < 0) return fail_loop(s);
+        step_watch.progress();
         lora_epoch_.fetch_add(1, std::memory_order_acq_rel);
         phase_t_ = std::chrono::steady_clock::now();
         /* Encode media for waiting requests while nothing is in flight. The scheduler issues no
@@ -562,6 +1030,25 @@ int Engine::step_loop() {
          * produces_token, 1 + n_spec rows each. Row and sequence indices differ (a mid-prompt
          * chunk produces no row). */
         const StepPlan& plan = sched_.plan();
+        /* RADIANCE_EXPERIMENTAL_DS41_ROUTE_TRACE (place/route_trace.h): the requests this step's
+         * rows belong to, which the ranks' routing records join on the step number. A step issued
+         * ahead has run its pass already; its record is written now that it is the open step. */
+        if (RouteTrace* rt = RouteTrace::get()) {
+            rt_entries.clear();
+            for (const StepEntry& e : plan.e) {
+                RtStepEntry x;
+                x.seq = e.seq;
+                x.ctx_len = e.ctx_len;
+                x.n_tokens = e.n_tokens;
+                x.flags = (uint8_t)((e.is_prefill ? rtrace::kPrefill : 0) |
+                                    (e.produces_token ? rtrace::kProduces : 0) |
+                                    (e.dev ? rtrace::kDevRow : 0));
+                x.n_spec = (uint8_t)std::clamp<int32_t>(e.n_spec, 0, 255);
+                rt_entries.push_back(x);
+            }
+            rt->step(b->step, b->phase, b->draft_pass, b->n_tok, issued, rt_entries.data(),
+                     (int)rt_entries.size());
+        }
         /* One entry per request; Sampler::build_step expands each into 1 + n_draft rows itself
          * (giving each position its RNG coordinate), so one push per row would stage (1+n)^2 rows.
          * `first_row` indexes sampled tokens, so it counts rows. */
@@ -689,69 +1176,30 @@ int Engine::step_loop() {
         if (t_on) phase_mark(PH_PRE);
 
         if (!issued) {
-            const auto model_phase = [&]() -> int {
-                /* Reset the gate while every rank is parked, so none sees a stale ready flag. */
+            /* Reset the gate while every rank is parked, so none sees a stale ready flag. */
+            {
+                std::lock_guard<std::mutex> lk(build_mu_);
+                build_ready_  = false;
+                build_status_ = RAD_OK;
+            }
+            if (const int ps = prepare_release(b); ps < 0) return fail_loop(ps);
+            if (prefill_hash_) prefill_hash_stage(plan, so, b->step);
+            /* An embedding program has no sampler to issue behind its pass. */
+            issue_what_.store(embedding_ ? kIssueModel : kIssueAll, std::memory_order_release);
+            step_batch_.store(b, std::memory_order_release);
+            barrier_->arrive_and_wait();      /* release the ranks */
+            {
+                /* Stage the sampler while the ranks enqueue and the device runs the pass. */
+                bst = stage_sampler();
                 {
                     std::lock_guard<std::mutex> lk(build_mu_);
-                    build_ready_  = false;
-                    build_status_ = RAD_OK;
+                    build_ready_  = true;
+                    build_status_ = bst;
                 }
-                if (const int ps = prepare_release(b); ps < 0) return ps;
-                if(cache_prepare4_){const int begun=cache_prepare4_->begin(*b);
-                    if(begun<0){if(cache_prepare4_->admission_closed())return RAD_OK;cache_prepare4_->fail_stop(-1,begun);}
-                    if(glm_main_){const int witnessed=glm_main_step_begin(plan,*b);if(witnessed<0)cache_prepare4_->fail_stop(-1,witnessed);}}
-                /* An embedding program has no sampler to issue behind its pass. */
-                issue_what_.store(embedding_ || deferred_status_profile_ || cache_prepare4_ ? kIssueModel : kIssueAll,
-                                  std::memory_order_release);
-                step_batch_.store(b, std::memory_order_release);
-                barrier_->arrive_and_wait();      /* release the ranks */
-                {
-                    /* Stage the sampler while the ranks enqueue and the device runs the pass. */
-                    bst = stage_sampler();
-                    if(bst<0&&cache_prepare4_)cache_prepare4_->fail_stop(-1,bst);
-                    {
-                        std::lock_guard<std::mutex> lk(build_mu_);
-                        build_ready_  = true;
-                        build_status_ = bst;
-                    }
-                    build_cv_.notify_all();
-                }
-                barrier_->arrive_and_wait();      /* wait for them */
-                return (deferred_status_profile_||cache_prepare4_)
-                    ? (bst < 0 ? bst : step_status_.load(std::memory_order_acquire)) : RAD_OK;
-            };
-            int phase_status = RAD_OK;
-            if (deferred_status_profile_) {
-                // First join synchronous enqueue results; only a successful
-                // enqueue phase may enter device waits. Then join completed
-                // validation results before any sampler/state publication.
-                phase_status = status_checked_model_sampler(model_phase, [&]() -> int {
-                    issue_what_.store(kIssueStatus, std::memory_order_release);
-                    step_batch_.store(b, std::memory_order_release);
-                    barrier_->arrive_and_wait();
-                    barrier_->arrive_and_wait();
-                    return step_status_.load(std::memory_order_acquire);
-                }, [&]() -> int {
-                    if (embedding_) return RAD_OK;
-                    issue_what_.store(kIssueSampler, std::memory_order_release);
-                    step_batch_.store(b, std::memory_order_release);
-                    barrier_->arrive_and_wait();
-                    barrier_->arrive_and_wait();
-                    return step_status_.load(std::memory_order_acquire);
-                });
-            } else if(cache_prepare4_){
-                phase_status=model_phase();
-                if(cache_prepare4_->admission_closed())return RAD_OK; // idle stop won begin admission; release NO workers
-                if(phase_status<0)cache_prepare4_->fail_stop(-1,phase_status);
-                // Every rank completed all42 MODEL gates before sampler release.
-                issue_what_.store(kIssueSampler,std::memory_order_release);step_batch_.store(b,std::memory_order_release);
-                barrier_->arrive_and_wait();barrier_->arrive_and_wait();
-                phase_status=step_status_.load(std::memory_order_acquire);
-                if(phase_status<0)cache_prepare4_->fail_stop(-1,phase_status);
-            } else {
-                phase_status = model_phase();
+                build_cv_.notify_all();
             }
-            if (phase_status < 0) return fail_loop(phase_status);
+            barrier_->arrive_and_wait();      /* wait for them */
+            if (prefill_hash_) prefill_hash_print();
         } else {
             /* The forward pass was issued ahead and the previous step has now committed, so the
              * sampler is staged from the correct state and its chain queued behind the running
@@ -778,7 +1226,6 @@ int Engine::step_loop() {
         if (bst < 0) return fail_loop(bst);
 
         int st = step_status_.load(std::memory_order_acquire);
-        if (st >= 0) st = model_policy_admission();
         if (st < 0) {
             /* A device fault is not recoverable in-process (spec §17). */
             RAD_ERR("step %d failed: %s -- the engine cannot continue", b->step, rad_strerror(st));
@@ -835,19 +1282,19 @@ int Engine::step_loop() {
         st = block_drafting() ? issue_block_drafter(b->step, so)
                               : issue_serial_drafter(b->step, so);
         if (st < 0) return fail_loop(st);
+        /* Behind the step's last resolve and before its end event, so collect_step's wait covers it. */
+        st = stream_probe_issue(b);
+        if (st < 0) return fail_loop(st);
         st = mark_step_end(b, so);
         if (st < 0) return fail_loop(st);
         /* Then the next step's forward pass, before this step is read back. Its rows continue from
          * the card's acceptance and verify the new drafts; its sampler waits for this step's
          * commit. The card runs straight on while the host waits, commits and stages. */
-        st = issue_ahead(&ahead);
+        st = issue_ahead(&ahead, so);
         if (st < 0) return fail_loop(st);
         st = embedding_ ? collect_pooled(b, so) : collect_step(b, so);
         if (t_on) phase_mark(PH_COLLECT);
         if (st < 0) return fail_loop(st);
-        if(cache_prepare4_){const int completed=cache_prepare4_->complete_frame(*b);if(completed<0)cache_prepare4_->fail_stop(-1,completed);
-            if(glm_main_){if((b->n_out!=0&&b->n_out!=1)||(b->n_out&&so.token.size()!=1)||(!b->n_out&&so.n_rows))cache_prepare4_->fail_stop(-1,RAD_E_STATE);
-                const int witnessed=glm_main_step_complete(*b,b->n_out?so.token[0]:-1);if(witnessed<0)cache_prepare4_->fail_stop(-1,witnessed);}}
         /* The step's sampler chain, verify op included, has returned: one line at the first
          * coupled verify that actually completed. */
         couple_verify_evidence(b->step);
@@ -899,10 +1346,35 @@ int Engine::step_loop() {
             res.lp        = so.lp.data();
             res.first_row = so.first_row.data();
         }
-        if (const int ps = model_policy_admission(); ps < 0) return fail_loop(ps);
         st = sched_.commit(res);
         if (t_on) phase_mark(PH_COMMIT);
         if (st < 0) { RAD_ERR("commit: %s", rad_strerror(st)); return fail_loop(st); }
+        /* ..._ROUTE_TRACE: the requests this commit ended, and the step issued ahead of it, which
+         * still carries their rows (its pass's output is discarded: the post-stop pass). */
+        if (RouteTrace* rt = RouteTrace::get())
+            for (const StepEntry& e : plan.e) {
+                uint64_t n_out = 0;
+                bool live = true;
+                if (sched_.committed_seq(e.seq, &n_out, &live) && !live)
+                    rt->end(b->step, ahead ? ahead->step : -1, e.seq, n_out);
+            }
+        /* The step has drained, so its counters are readable. A chunk that produced no row did not
+         * wait, so its copy is read on a later step; a finished prompt or request always produced
+         * a row. */
+        if (so.n_rows > 0) {
+            st = stream_probe_take(b, res.n_prefill_done > 0, res.n_finished > 0);
+            if (st < 0) return fail_loop(st);
+        }
+
+        /* With the ids read ahead of the drafter's passes, the commit streamed the tokens while
+         * the card ran them. Wait for the passes now, before the slots below are read and before
+         * anything reuses what the commit released. */
+        if (so.early) {
+            st = rad_event_sync(step_end_);
+            if (st < 0) { RAD_ERR("step %d: waiting for its draft passes: %s", b->step,
+                                  rad_strerror(st)); return fail_loop(st); }
+            so.early = false;
+        }
 
         /* The drafter for the next step already ran on the card; what remains is to check its
          * acceptance against the host's and publish its proposals. Each driver returns
@@ -940,15 +1412,21 @@ int Engine::step_loop() {
             }
         }
     }
+    post_stop_report();
     return RAD_OK;
 }
 
 /* Issue the copy of the sampled ids into pinned memory behind the sampler, without waiting.
- * Issued by the serial drafter before its passes (a head sampling through the sampler's buffer
- * overwrites the ids), otherwise just before the wait. */
-int Engine::collect_issue(StepOut& so) {
+ * Issued by a drafter before its passes (a head sampling through the sampler's buffer overwrites
+ * the ids), otherwise just before the wait.
+ *
+ * With `fence` (a drafter queueing its passes behind the step) the copy records tok_end_, so
+ * collect_step waits for the ids alone (StepOut::early). Not at -vv, whose logits row is a
+ * pageable copy read in collect_step. */
+int Engine::collect_issue(StepOut& so, bool fence) {
     so.rb = nullptr;
     so.lg.clear();
+    so.early = false;
     if (so.n_rows <= 0) return RAD_OK;
     Rank& r0 = *ranks_[0];
     void* src = r0.ctx.buf_ptr(r0.tok_buf);
@@ -969,8 +1447,126 @@ int Engine::collect_issue(StepOut& so) {
             so.lg.resize((size_t)nv);
             rad_memcpy_async(so.lg.data(), lp, nv * 4, r0.ctx.stream());
         }
+        return RAD_OK;
+    }
+    if (fence && early_ids_) {
+        RAD_TRY(rad_event_record(tok_end_, r0.ctx.stream()));
+        so.early = true;
     }
     return RAD_OK;
+}
+
+/* ================================================================== KV streaming's counters
+ *
+ * Each streamed group's device control block holds the resolve's cumulative counters, the largest
+ * union, misses and claims of one launch, and the overflow latch (libref/ref_kvstream.cpp, "The
+ * control block"). They show at run time whether the ring's depth holds; a launch that overflowed
+ * is failed, not served (docs/KV-STREAMING.md §3.4).
+ *
+ * The step path never waits on the card: the 64-byte copy per group is enqueued on rank 0's compute
+ * stream behind the step's last resolve and before its end event, and the commit that already
+ * waits for that event reads it. One rank's counters stand for all, since every rank resolves the
+ * same block ids through identically built maps. The counters are cumulative, so the metrics are
+ * charged the deltas. */
+int Engine::stream_probe_issue(const RadBatch* b) {
+    if (!b || b->n_kv_groups <= 0 || ranks_.empty()) return RAD_OK;
+    const size_t n = (size_t)b->n_kv_groups;
+    if (stream_ctl_n_ < n) {
+        if (stream_ctl_p_) rad_dev_free(stream_ctl_p_, RAD_MEM_HOST_PINNED);
+        stream_ctl_p_ = static_cast<int32_t*>(
+            rad_dev_alloc((int64_t)n * 16 * (int64_t)sizeof(int32_t), RAD_MEM_HOST_PINNED));
+        stream_ctl_n_ = stream_ctl_p_ ? n : 0;
+        if (!stream_ctl_p_) {
+            RAD_ERR("kv streaming: no pinned host memory for the resolve's counters");
+            return RAD_E_NOMEM;
+        }
+        /* Zeroed, so a group whose first copy has not landed reads as no calls yet. */
+        std::memset(stream_ctl_p_, 0, n * 16 * sizeof(int32_t));
+    }
+    RadStream st = ranks_[0]->ctx.stream();
+    for (size_t i = 0; i < n; ++i) {
+        const RadKVStream* sv = b->kv[i].stream;
+        if (!sv || !sv->ctl) continue;
+        if (rad_memcpy_async(stream_ctl_p_ + i * 16, sv->ctl, 16 * 4, st) < 0) {
+            RAD_ERR("kv streaming: the resolve's counters could not be copied to the host: %s",
+                    rad_dev_last_error());
+            return RAD_E_STATE;
+        }
+    }
+    return RAD_OK;
+}
+
+/* Read what stream_probe_issue() enqueued, charge the metrics and, at a prompt's or request's
+ * end, log the group's line. A newly latched overflow fails every request prefilling in the step
+ * just committed and clears the latch on the card, so the next request is measured on its own;
+ * the map stays consistent, because the resolve reverts a claim it could not place. */
+int Engine::stream_probe_take(const RadBatch* b, bool prefill_done, bool request_end) {
+    if (!b || !stream_ctl_p_ || b->n_kv_groups <= 0) return RAD_OK;
+    const size_t n = (size_t)b->n_kv_groups;
+    if (stream_prev_.size() < n) stream_prev_.assign(n, StreamRead{});
+    RadStream st = ranks_[0]->ctx.stream();
+    bool       overflowed = false;
+    std::string overflow_why;
+    for (size_t i = 0; i < n; ++i) {
+        const RadKVStream* sv = b->kv[i].stream;
+        if (!sv) continue;
+        const int32_t* c = stream_ctl_p_ + i * 16;
+        /* The counters are three u64s from ctl[4], hence the 8-byte alignment. */
+        const uint64_t* ctr = (const uint64_t*)(c + 4);
+        StreamRead r;
+        r.group       = (int32_t)b->kv[i].group;
+        r.misses      = (int64_t)ctr[0];
+        r.lookups     = (int64_t)ctr[1];
+        r.resolves    = (int64_t)ctr[2];
+        r.overflow    = c[3] != 0;
+        r.max_union   = c[10];
+        r.max_misses  = c[11];
+        r.max_claims  = c[12];
+        r.slots       = sv->slots;
+        r.block_bytes = sv->block_bytes;
+        const StreamRead& p = stream_prev_[i];
+        const int64_t dm = r.misses - p.misses;
+        ranks_[0]->kv.note_stream_traffic(dm, dm * r.block_bytes);
+        if (request_end || prefill_done) stream_report(request_end ? "request end" : "prefill complete", r, p);
+        if (r.overflow && !p.overflow && !overflowed) {
+            overflowed = true;
+            const KVGroupPlan* gp = ranks_[0]->kv.plan(r.group);
+            const int64_t bs = gp && gp->block_size > 0 ? gp->block_size : 1;
+            /* The largest union since bring-up, which for the failing request is the launch that
+             * overflowed. */
+            overflow_why = fmt(
+                "kv streaming overflow: group '%s' ring holds %lld blocks (%lld tokens) and one "
+                "resolve launch selected %lld distinct blocks, %lld of them not resident, so the "
+                "request is failed; raise --kv-resident above %lld tokens",
+                gp ? gp->name.c_str() : "?", (long long)r.slots, (long long)(r.slots * bs),
+                (long long)r.max_union, (long long)r.max_misses,
+                (long long)(r.max_union * bs));
+            RAD_ERR("%s", overflow_why.c_str());
+        }
+        stream_prev_[i] = r;
+    }
+    if (overflowed) {
+        (void)sched_.fail_prefilling(overflow_why.c_str());
+        for (size_t i = 0; i < n; ++i) {
+            const RadKVStream* sv = b->kv[i].stream;
+            if (sv && sv->ctl) (void)rad_memset_async(sv->ctl + 3, 0, 4, st);
+        }
+    }
+    return RAD_OK;
+}
+
+/* One line per group: the cumulative counters, the misses since the previous report and the three
+ * largest-launch figures a ring and a claim list are sized from. A launch claims at most
+ * `max_seqs * sel_pitch` blocks; a larger `largest launch claims` means that derivation is wrong. */
+void Engine::stream_report(const char* when, const StreamRead& r, const StreamRead& prev) {
+    const KVGroupPlan* gp = ranks_.empty() ? nullptr : ranks_[0]->kv.plan(r.group);
+    RAD_INFO("kv streaming: group '%s' %s: %lld resolves, %lld lookups, %lld misses (+%lld this "
+             "interval); ring %lld blocks, largest launch union %lld distinct blocks, largest "
+             "launch misses %lld, largest launch claims %lld, overflow %s",
+             gp ? gp->name.c_str() : "?", when, (long long)r.resolves, (long long)r.lookups,
+             (long long)r.misses, (long long)(r.misses - prev.misses), (long long)r.slots,
+             (long long)r.max_union, (long long)r.max_misses, (long long)r.max_claims,
+             r.overflow ? "LATCHED" : "no");
 }
 
 int Engine::mark_step_end(const RadBatch* b, StepOut& so) {
@@ -1067,7 +1663,7 @@ int Engine::issue_scored_rows(Rank& r) {
 
 int Engine::collect_scored_rows() {
     if (score_rows_.empty()) return RAD_OK;
-    /* step_end_ fences rank 0's stream; every other rank's copies are fenced here. */
+    /* collect_step's wait fences rank 0's stream; every other rank's copies are fenced here. */
     for (size_t i = 1; i < ranks_.size(); ++i) {
         RAD_TRY(rad_dev_set(ranks_[i]->device));
         RAD_TRY(rad_stream_sync(ranks_[i]->ctx.stream()));
@@ -1113,8 +1709,9 @@ int Engine::collect_step(const RadBatch* b, StepOut& so) {
     if (so.n_rows <= 0) return RAD_OK;
 
     so.rows.resize((size_t)so.n_rows);
-    /* Wait on the step-end event, not the stream: a step issued ahead is queued behind it. */
-    RAD_TRY(rad_event_sync(step_end_));
+    /* Wait on an event, not the stream: a step issued ahead is queued behind it. With early ids
+     * that is the ids' own copy; the step loop waits for the rest after the commit. */
+    RAD_TRY(rad_event_sync(so.early ? tok_end_ : step_end_));
     std::memcpy(so.rows.data(), so.rb, (size_t)so.n_rows * sizeof(int32_t));
     so.rb = nullptr;
     RAD_TRY(collect_scored_rows());
@@ -1216,6 +1813,80 @@ int Engine::collect_step(const RadBatch* b, StepOut& so) {
         r->may_speculate = ranks_[0]->sampler.allows_speculation(r->id);
     }
     return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ the pass after a reply */
+/* RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP: the open step's outcome before the next step is
+ * planned (issue_ahead), from the same ids and by the same rules as collect_step: a verify row's
+ * accepted drafts by agreement, cut at the first end-of-generation token, and the token it ends
+ * on. collect_step's effects are left to it (the grammars' advance, logprobs, the rows it keeps,
+ * may_speculate), so the commit that follows is the one there always was. Waits for the ids on
+ * the event collect_step waits on, which it then finds signalled. */
+int Engine::peek_outcome(const StepOut& so, Scheduler::StepResult* out) {
+    const StepPlan& plan = sched_.plan();
+    const size_t n = plan.e.size();
+    peek_tok_.assign(n, 0);
+    peek_acc_.assign(n, 0);
+    peek_eos_.assign(n, 0);
+    *out = Scheduler::StepResult{};
+    if (so.n_rows <= 0 || !so.rb || so.first_row.size() != n) return RAD_OK;
+    const auto t0 = std::chrono::steady_clock::now();
+    RAD_TRY(rad_event_sync(so.early ? tok_end_ : step_end_));
+    post_stop_t_ = std::chrono::steady_clock::now();
+    post_stop_wait_ns_ += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              post_stop_t_ - t0).count();
+    ++post_stop_peeks_;
+    auto eog = [&](int32_t t) { return vocab_ && vocab_->is_eog(t); };
+    for (size_t i = 0; i < n; ++i) {
+        const int32_t f = so.first_row[i];
+        if (f < 0) continue;
+        const StepEntry& e = plan.e[i];
+        if (f + std::max(e.n_spec, 0) >= so.n_rows) continue;
+        const int32_t* y = so.rb + f;
+        if (e.n_spec > 0) {
+            if (!e.req) continue;   /* as collect_step: no token, no end */
+            int32_t o[RAD_SCHED_MAX_SPEC + 1] = { 0 };
+            int32_t acc = 0;
+            RAD_TRY(accept_greedy(e.draft, e.n_spec, y, o, &acc));
+            acc = accept_cut_at_eog(o, acc, eog);
+            peek_acc_[i] = acc;
+            peek_tok_[i] = o[acc];
+        } else {
+            peek_tok_[i] = y[0];
+        }
+        peek_eos_[i] = eog(peek_tok_[i]) ? 1 : 0;
+    }
+    out->n_seq      = (int)n;
+    out->token      = peek_tok_.data();
+    out->n_accepted = peek_acc_.data();
+    out->eos        = peek_eos_.data();
+    return RAD_OK;
+}
+
+/* At the step loop's end: how many requests ended with a pass issued behind their last token
+ * (SchedMetrics::ended_with_step_ahead; with the switch, steps of two or more sequences and
+ * commit's unpredicted ends), and with RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP the steps read
+ * back first, the wait for their ids, the host's turnaround from the ids to the next step's
+ * release (the card's idle time per step, less the ranks' wake-up), and the passes withheld. */
+void Engine::post_stop_report() {
+    if (!pipelining_) return;
+    const SchedMetrics m = sched_.metrics();
+    if (!m.ended_with_step_ahead && !post_stop_) return;
+    RAD_INFO("post-stop passes: %lld request(s) ended with a step issued ahead behind their last "
+             "one (a forward pass after the last token)%s",
+             (long long)m.ended_with_step_ahead,
+             post_stop_
+                 ? fmt("; ..._SKIP_POST_STOP: %llu step(s) read back before the next was planned "
+                       "(%.1f ms waiting for their ids, %.1f us a step), %lld of them ended their "
+                       "request and issued nothing behind it, %llu issued the next step %.1f us "
+                       "after their ids (its build, advance and arena; the card waits through it)",
+                       (unsigned long long)post_stop_peeks_, (double)post_stop_wait_ns_ * 1e-6,
+                       post_stop_peeks_ ? (double)post_stop_wait_ns_ * 1e-3 /
+                                              (double)post_stop_peeks_ : 0.0,
+                       (long long)m.steps_ahead_withheld, (unsigned long long)post_stop_issued_,
+                       post_stop_issued_ ? (double)post_stop_turn_ns_ * 1e-3 /
+                                               (double)post_stop_issued_ : 0.0).c_str()
+                 : "");
 }
 
 /* ------------------------------------------------------------------ the KV loan */
@@ -1508,7 +2179,6 @@ void Engine::drain_completed() {
  * size depends on the heads this rank holds, which can differ per rank (rad_arch.h
  * remainder_place). */
 void Engine::clear_fresh_states() {
-    if (model_policy_admission() < 0) return;
     for (const StateClear& c : ranks_[0]->kv.state_clears()) {
         for (auto& rk : ranks_) {
             const KVGroupPlan* gp = rk->kv.plan(c.group);
@@ -1523,11 +2193,6 @@ void Engine::clear_fresh_states() {
 }
 
 int Engine::serve(std::unique_ptr<StallWatch> watch) {
-    if(glm_main_&&!glm_main_->manual_requested)return RAD_E_UNSUPPORTED; // no research HTTP serving
-    if(tiny_)return RAD_E_UNSUPPORTED; // transport-only: never serve/step
-    // Before scheduler creation, request admission, state resets or stream work.
-    // In particular serve() must not clear a failed Ctx by resetting loop atomics.
-    if (const int s = model_policy_admission(); s < 0) return s;
     startup_watch_ = std::move(watch);
     if (ranks_.empty() || !ranks_[0]->ctx.program()) {
         RAD_ERR("serve: start() has not run, or stopped at --debug-graph");
@@ -1681,8 +2346,8 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
             if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
             ranks_[0]->tierx.report_pass(jobs, ok, rad_mono_ns());
             /* Rebind every entry that came back, not only the leading run: the tiers already
-             * marked each resident at its new blocks. */
-            const std::vector<int32_t>& cg = pc.cached_groups();
+             * marked each resident at its new blocks. A job's blocks are one per entry slot. */
+            const std::vector<int32_t>& cg = pc.entry_groups();
             for (size_t i = 0; i < jobs.size(); ++i) {
                 TierJob& j = jobs[i];
                 if (!ok[i]) { res = RestoreResult::Cut; continue; }
@@ -1709,14 +2374,25 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
      * PCIe read and unordered against the copies that fill it (see Set in batch.h). */
     std::vector<BatchBuilder::RankIO> rio;
     rio.reserve(ranks_.size());
-    for (auto& rk : ranks_)
-        rio.push_back({ rk->device, rk->ctx.stream(), &rk->program });
+    rank_stream_views_.assign(ranks_.size(), {});
+    for (size_t r = 0; r < ranks_.size(); ++r) {
+        const size_t ng = ranks_[r]->program.kv_groups.size();
+        rank_stream_views_[r].resize(ng, nullptr);
+        for (size_t g = 0; g < ng; ++g)
+            rank_stream_views_[r][g] = ranks_[r]->kv.stream_view((int32_t)g);
+    }
+    for (size_t r = 0; r < ranks_.size(); ++r) {
+        auto& rk = ranks_[r];
+        rio.push_back({ rk->device, rk->ctx.stream(), &rk->program, rk->pools.kv().base(),
+                        rank_stream_views_[r].data() });
+    }
     if (video_gen) {
         /* As for the image generator below; the plugin lays out each request's rows. */
         std::vector<gen::VideoDriver::RankIO> gio;
         for (auto& rk : ranks_) gio.push_back({ rk->device, rk->ctx.stream() });
         auto d = std::make_unique<gen::VideoDriver>();
-        RAD_TRY(d->init(ranks_[0]->program, rad_tools_video_positions(plugins_), gio));
+        RAD_TRY(d->init(ranks_[0]->program, rad_tools_video_positions(plugins_), gio,
+                        rad_tools_video_pack(plugins_), rad_tools_encode_geom(plugins_)));
         vid_gen_ = d.get();
         gen_ = std::move(d);
         RAD_TRY(rad_dev_set(ranks_[0]->device));
@@ -1740,7 +2416,7 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
         gen_ = std::move(d);
         RAD_TRY(rad_dev_set(ranks_[0]->device));
     } else
-    RAD_TRY(sched_.init(ranks_[0]->program, cfg_, kv_iface_.get(), pc_iface_.get(), rio, &geo_));
+    RAD_TRY(sched_.init(ranks_[0]->program, cfg_, kv_iface_.get(), pc_iface_.get(), rio, &geo_, &draft_experiment_));
     /* The smallest step the prefill stager overlaps. A chunk held back for other work
      * (--busy-prefill-chunk) stays at or above it; below it every routed layer reads its pooled
      * experts synchronously, which costs far more than sharing the step saves. The maximum over
@@ -1762,6 +2438,21 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
 
     for (auto& r : ranks_) r->sampler.attach_vocab(vocab_view_.get());
 
+    /* RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP=1 (issue_ahead): anything but 0 or 1 is refused
+     * here, before the expert stats' thread or any other starts. */
+    if (const char* v = std::getenv("RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP"); v && *v &&
+        std::strcmp(v, "0") != 0) {
+        if (std::strcmp(v, "1") != 0) {
+            RAD_ERR("RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP=%s: 1 reads a step's tokens back "
+                    "before planning the next behind it, so that nothing runs after a reply's last "
+                    "token; 0 or unset leaves the step issued ahead as before", v);
+            return RAD_E_INVAL;
+        }
+        post_stop_asked_ = true;
+    }
+
+    if (const int xs = xstats_open(); xs < 0) return xs;
+
     barrier_ = std::make_unique<RankBarrier>(cfg_.tp + 1);
     stopping_.store(false, std::memory_order_release);
     step_status_.store(RAD_OK, std::memory_order_release);
@@ -1776,17 +2467,17 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
         print_startup_report(RAD_OK);
         startup_watch_.reset();
     }
-    int s = glm_main_ ? glm_main_run_request() : cfg_.kld() ? run_kld() : run_server();
+    int s = cfg_.kld() ? run_kld() : run_server();
     startup_watch_.reset();
 
     /* Stop the step loop before the server's storage is destroyed: Request::sink points into it,
      * and an unfinished request still writes there (server.h). */
-    if(cache_prepare4_)cache_prepare4_->stop_admission(); // serialize against begin BEFORE Engine barrier/worker joins
     stopping_.store(true, std::memory_order_release);
     barrier_->abort();
     if (stepper.joinable()) stepper.join();
     for (auto& t : rank_threads_) if (t.joinable()) t.join();
     rank_threads_.clear();
+    xstats_close();
     /* A step-loop error takes precedence over the transport's status. */
     const int ls = loop_status_.load(std::memory_order_acquire);
     return ls < 0 ? ls : s;
@@ -1852,6 +2543,7 @@ std::string Engine::engine_info() const {
     e["tp_wire_min_kb"]         = cfg_.tp_wire_exact ? 0 : cfg_.tp_wire_min_kb;
     e["attn_prefill_fp8"]       = attn_prefill_fp8_name(cfg_.attn_prefill_fp8);
     e["tp_attn_split"]          = cfg_.tp_attn_rows ? "rows" : "heads";
+    e["weight_prefetch"]        = cfg_.weight_prefetch;
     e["max_num_batched_tokens"] = cfg_.max_tok;
     e["placement"]              = cfg_.placement;
     /* Each lookup table's requested and resolved placement. */
@@ -1919,6 +2611,8 @@ std::string Engine::engine_info() const {
         sp["depth"]   = drafter_.depth;
     }
     e["speculation"] = std::move(sp);
+    /* --expert-stats: where the counts are, for a client that reads them. */
+    if (xstats_) e["expert_stats"] = { { "file", xstats_->path() }, { "interval_s", 30 } };
     return e.dump();
 }
 
@@ -2139,9 +2833,11 @@ int Engine::run_server() {
                      * cells default to VRAM. */
                     const int ti = (int)t >= 0 && (int)t < kTierCount ? (int)t : (int)Tier::SSD;
                     s.experts.units[ti]++;
-                    s.experts.bytes[ti] += mu.bytes;
+                    /* A packed VRAM resident (RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED) takes less there. */
+                    const int64_t ub = t == Tier::VRAM && mu.vram_bytes > 0 ? mu.vram_bytes : mu.bytes;
+                    s.experts.bytes[ti] += ub;
                     s.experts.n_units++;
-                    s.experts.total_bytes += mu.bytes;
+                    s.experts.total_bytes += ub;
                     if (mu.movable) s.experts.movable++;
                     s.experts.layer_units[(size_t)mu.layer]++;
                     if (t == Tier::VRAM) s.experts.layer_resident[(size_t)mu.layer]++;
@@ -2824,6 +3520,8 @@ int Engine::run_server() {
         in.default_steps = vd.default_steps;
         in.max_steps = vd.max_steps;
         in.fixed_steps = vd.n_rungs > 0;
+        in.shift_video = vd.shift_video;
+        in.shift_audio = vd.shift_audio;
         in.upscale_max = vd.upscale_max;
         in.upscale_refine = vd.upscale_refine;
         in.step_evals = vd.sched_kind == 1;
@@ -2840,6 +3538,13 @@ int Engine::run_server() {
                      "needs libx264; this build's libavcodec has none, so input_reference is "
                      "refused", in.name.c_str(), (int)in.image_crf);
         in.max_lanes = vd.max_lanes;
+        in.max_ref_images = vd.max_ref_images;
+        in.max_ref_videos = vd.max_ref_videos;
+        in.max_ref_audios = vd.max_ref_audios;
+        in.max_enc_frames = vd.max_enc_frames;
+        in.max_enc_side = vd.max_enc_side;
+        in.max_enc_samples = vd.max_enc_samples;
+        in.enc_ratio = vd.enc_ratio;
         video_bridge.drv = vid_gen_;
         d.videos = &video_bridge;
         if (cfg_.served_model_name.empty() && !in.name.empty()) {

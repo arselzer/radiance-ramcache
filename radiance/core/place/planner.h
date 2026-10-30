@@ -28,17 +28,14 @@
 #include "../rad_core.h"
 #include "rad_format.h"
 
+#include <functional>
 #include <string>
-#include <memory>
-#include <set>
-#include <utility>
 #include <vector>
 
 namespace rad {
-class NativeInventory;
 
 /* ------------------------------------------------------------------ strategy */
-enum class Strategy { AllVram = 0, LayerOffload = 1, ExpertTiered = 2, Auto = 3, NativeBacked = 4 };
+enum class Strategy { AllVram = 0, LayerOffload = 1, ExpertTiered = 2, Auto = 3 };
 
 const char* strategy_name(Strategy s);
 /* RAD_E_INVAL and *out untouched if the string is not one of the four. */
@@ -64,11 +61,10 @@ struct Budgets {
  * ranking are all per unit, and a weight's placement is its unit's placement.
  *
  * Under tensor parallel a unit is this rank's shard: dimensions are declared already divided
- * (spec §9), so `bytes` is per rank. Canonical expert IDs and shard ownership must agree with the
- * graph, but class/slot indices and memory tiers are rank-local: each rank binds its own valid
- * expert pointers. Equal rankings can produce different residency when shard costs differ.
- * Collective shapes/order remain graph requirements. Ranking uses the profile and identity,
- * with no free-VRAM query, timing or device enumeration; a common initial mask is optional.
+ * (spec §9), so `bytes` is per rank. Invariant: the resident set must be identical on every rank,
+ * or a slab slot holds different experts on different cards. The ranking therefore uses only the
+ * container's profile and the unit's identity -- no free-VRAM query, no timing, no device
+ * enumeration.
  */
 struct MoveUnit {
     int32_t layer = -1;          /* RadWeightGroup::layer; -1 for a model-level weight */
@@ -84,8 +80,9 @@ struct MoveUnit {
     Site    site = Site::Device;
     int32_t slab_slot = -1;
     bool    movable = false;     /* may the heat engine relocate it after load */
-    bool    host_forced = false; /* a placement flag put it in the pinned pool: the embedding's
-                                  * or the encoder tower's */
+    bool    pinned = false;      /* a decode-hot resident --expert-pin-top kept: heat never demotes it */
+    bool    host_forced = false; /* a placement flag put it in the pinned pool: the embedding's,
+                                  * the encoder tower's or the draft head's experts' */
 
     /* Placed before any strategy runs, so every assignment pass skips it and no VRAM total counts
      * it: the mapped tier, --embedding-placement ram and --vision-tower-placement ram. */
@@ -103,9 +100,18 @@ struct MoveUnit {
      * report still attributes `bytes`, since padding is not weight. */
     int64_t slot_bytes = 0;
 
-    /* Every weight lies in the container exactly as its kernel reads it (weight_file_direct), so
-     * the file tier can stage it with a read. A unit that is not never goes to the file tier. */
+    /* Every weight lies in the container exactly as its kernel reads it (weight_file_direct), or
+     * the file tier relayouts it on each read (weight_file_relaid, PlannerInput::file_relayout), so
+     * the file tier can stage it with a read (and the relayout). A unit that is neither never
+     * goes to the file tier. */
     bool    file_direct = true;
+
+    /* RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED (place/vram_packed.h): a static VRAM resident some of whose
+     * weights the card holds in the packed-scale form (Placement::vram_bytes). `vram_bytes` is the unit as
+     * the card holds it and `vram_offset[i]` where weights[i] sits in it, laid out as `offset` is, at
+     * each weight's alignment; the mover places and publishes these instead. 0 and empty otherwise. */
+    int64_t vram_bytes = 0;
+    std::vector<int64_t> vram_offset;
 };
 
 /* The strongest access class in a group, "read most surely", decides the group's: a group with
@@ -185,6 +191,10 @@ struct Placement {
     int32_t slab_slot = -1;
     int32_t unit = -1;
     int64_t bytes = 0;
+    /* RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED: a VRAM weight held in the packed-scale form, its bytes there
+     * (`bytes` is then the same) and the raw rounds the form has room for; 0 and -1 for the stored form. */
+    int64_t vram_bytes = 0;
+    int32_t vram_pk_cap = -1;
     /* Why this and not VRAM/device, as a fixed string for the report. */
     const char* reason = "";
 };
@@ -194,13 +204,12 @@ class Plan {
 public:
     int      rank = 0, world_size = 1;
     Strategy strategy = Strategy::Auto;
-    std::shared_ptr<const NativeInventory> native_inventory; // typed opt-in only; no CLI
     /* Why `strategy` is the one it is, when `auto` chose it; empty when it was asked for. */
     std::string strategy_why;
 
-    /* False under Config::deterministic: weight addresses stay fixed and the heat engine stays
-     * off, with no shadow slots. Numerical reproducibility also depends on kernel/collective
-     * contracts; matching resident masks alone does not establish it. */
+    /* False under Config::deterministic: residency sets the summation order, so dynamic placement
+     * breaks bitwise reproducibility (spec §17). The heat engine stays off and the mover allocates
+     * no shadow slots when it is false. */
     bool     dynamic = true;
 
     std::vector<Placement> weight;         /* by rad_weight; index 0 is the sentinel */
@@ -233,7 +242,28 @@ public:
      * both flags' weight bytes, as the tier totals count them; the pooled figures exclude it. */
     int64_t embedding_host_bytes = 0;
     int64_t tower_host_bytes = 0;
+    int64_t draft_host_bytes = 0;
     int64_t forced_host_used = 0;
+    /* --expert-profile and --expert-pin-top: the profile's units the planner pinned resident and the
+     * share threshold it derived from the fraction. Reported so the window can see what the decode
+     * set costs the card. */
+    int64_t pinned_units = 0;
+    int64_t profile_units = 0;
+    float   pin_threshold = 0.0f;
+    /* RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED: the static residents held in the packed-scale form. `units`
+     * and `weights` (gate_up and down) packed, the bytes they take on the card against their stored
+     * form's, the eligible residents' weights left block_mxfp4 over their raw-round budget, the
+     * weights whose scales were read to decide it and the time that took, and the packed weights' raw
+     * rounds in all and at most. `loaded` counts the weights the load packed and checked. */
+    struct VramPacked {
+        int64_t units = 0, weights = 0, gate_up = 0, down = 0;
+        int64_t bytes = 0, block_bytes = 0;
+        int64_t over_budget = 0, scanned = 0, scan_failed = 0;
+        int64_t raw_rounds = 0, raw_max = 0;
+        double  scan_s = 0.0;
+        int64_t loaded = 0;
+    };
+    VramPacked vram_packed;
     /* --ngram-placement ram: RAM for the n-gram tables the load phase copies out of the mapping.
      * Every pool still sees them on the mapped tier. `ngram_copy_card` selects pinned memory a
      * device kernel reads over the link; otherwise locked memory the host gather reads. */
@@ -269,10 +299,6 @@ public:
     std::string report(const Program& p) const;
 };
 
-/* Canonical expert identities, independent of rank-local class/slot numbering. */
-using ExpertKey = std::pair<int32_t,int32_t>;  /* (layer, expert) */
-using ExpertEligibility = std::set<ExpertKey>;
-
 /* ------------------------------------------------------------------ the planner */
 struct PlannerInput {
     const Program* program = nullptr;
@@ -291,12 +317,18 @@ struct PlannerInput {
     /* No card is visible and the device backend is host memory (device_is_host()), so a host
      * kernel can read the weights pool as well as the mapping. See mapped_unit(). */
     bool                  host_backend = false;
-    /* Optional initial-placement restriction, only for expert_tiered. A conditional expert
-     * outside this set takes the existing off-device path, with its actual cost and refusal
-     * rules. Null preserves existing behavior; an empty set permits no resident experts.
-     * Borrowed for plan() only and never modified. This does NOT restrict later heat/loans. */
-    const ExpertEligibility* resident_eligibility = nullptr;
-    std::shared_ptr<const NativeInventory> native_inventory;
+    /* The file tier relayouts a weight on every read when its kernel has a relayout
+     * (weight_file_relaid), so such a unit may go there too, not only one stored as it is read.
+     * The engine's mover does; a caller whose mover has no relayout leaves it false. */
+    bool                  file_relayout = false;
+    /* RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED (place/vram_packed.h): the bytes weight `w` takes on the card
+     * in the packed-scale form, or 0 when it keeps its stored form there. With `scan` false, from the
+     * declaration alone (what an eligible weight would take); with it true, after reading its scales
+     * (0 too when they need more raw rounds than the form has room for, which `*raw` then reports, -1
+     * when they could not be read). `cap` gets the room. The expert fill asks once a weight, and only
+     * for the conditional units it considers for VRAM in a static plan; null leaves every weight in
+     * its stored form and the plan exactly as without it. */
+    std::function<int64_t(rad_weight w, bool scan, int32_t* cap, int32_t* raw)> vram_pack;
 };
 
 /* Whether a host-only unit stays in the container's mapping. On a card, always: a host kernel
@@ -318,6 +350,23 @@ public:
 private:
     const PlannerInput& in_;
 
+    /* RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED: on for a static plan with PlannerInput::vram_pack set. Per
+     * weight the scan's answer (-1 not asked yet) with its room and raw rounds; per unit the resident
+     * charge once its weights are known (-1 not yet). */
+    bool                 pk_on_ = false;
+    std::vector<int64_t> pk_bytes_;
+    std::vector<int32_t> pk_cap_, pk_raw_;
+    std::vector<int64_t> pk_charge_;
+    /* What a resident costs the weights pool: its slot, or as packed weights take it. The floor reads
+     * nothing (every eligible weight packed); the charge reads the unit's scales once. */
+    int64_t vram_floor(const MoveUnit& mu) const;
+    int64_t vram_charge(int32_t ui, const MoveUnit& mu, Plan* p);
+    /* The unit laid out with each weight at size(w) bytes, as build_units lays it out: its bytes, and
+     * each weight's offset in `off` when set. */
+    template <class F> int64_t unit_layout(const MoveUnit& mu, F size, std::vector<int64_t>* off) const;
+    /* After the fill: each static resident's packed layout, weights and counters. */
+    void finish_vram_packed(Plan* p);
+
     /* Per-weight facts derived from declare, indexed by rad_weight. */
     std::vector<uint8_t> host_ok_;     /* every op reading it resolved a RAD_DOMAIN_HOST kernel */
     std::vector<uint8_t> device_ok_;   /* ...and a RAD_DOMAIN_DEVICE one. Cleared means the weight
@@ -330,6 +379,9 @@ private:
     void pin_mapped(const Program& prog, Plan* p);
     int  pin_embedding(const Program& prog, const Config& cfg, Plan* p) const;
     int  pin_towers(const Config& cfg, Plan* p) const;
+    int  pin_draft_experts(const Program& prog, const Config& cfg, Plan* p) const;
+    int  pin_draft_bank_experts(const Program& prog, const Config& cfg, Plan* p) const;
+    void pin_hot(const Config& cfg, Plan* p) const;
     void build_classes(Plan* p);
     void rank_units(Plan* p, std::vector<int32_t>* order) const;
     int  assign(Plan* p);
@@ -365,6 +417,11 @@ struct WeightFootprint {
     int64_t experts = 0;   /* the elastic plane: what streams from host when it does not fit */
     int64_t expert_layer_max = 0;   /* the most expert bytes any one routed layer holds */
     int64_t expert_unit_max  = 0;   /* the largest expert unit's slot */
+    /* A draft head's routed experts (layers at meta.n_layers and above, when the program has a
+     * drafter): the part of `experts` a host-pinned --draft-expert-placement takes out of the host
+     * pool's room for the trunk, and the largest such unit. */
+    int64_t draft_experts    = 0;
+    int64_t draft_unit_max   = 0;
     /* Upper bound on an expert-tiered plan's spare slab: per expert slab class, the shadow slots,
      * staging ring and tail pad (Planner::assign_expert_tiered). Same weight budget as residents. */
     int64_t expert_spare     = 0;
@@ -416,6 +473,11 @@ int64_t file_stage_reserve(int64_t widest, bool routed);
  * the host pool. */
 int64_t expert_vram_floor(const WeightFootprint& wf, int64_t host_room);
 
+/* The same floor once --draft-expert-placement host has taken the drafter's experts out of the
+ * plane the strategy places: the trunk's floor against the whole host room. The drafter's units
+ * share the trunk's slab classes, so no spare is added. With no drafter it is expert_vram_floor. */
+int64_t expert_vram_floor_draft_hosted(const WeightFootprint& wf, int64_t host_room);
+
 /* Checks that the plan and this rank's weights pool used the same split: Plan::vram_budget must
  * equal the pool Pools::configure allocated, or the slab and the pool disagree silently. Returns
  * RAD_E_STATE, logging the rank and both sizes, when they differ. */
@@ -423,15 +485,16 @@ int plan_check_weights_pool(const Plan& p, int64_t pool_bytes);
 
 /* The tables the placement flags move, identified by their readers rather than by name: a
  * model-level weight read by at least one op, and only by `embed_lookup`, is a token embedding;
- * only by `embed_lookup_q`, an n-gram table. A lookup reads M rows a step, so a tier below the
- * card is usable; a weight a GEMM also reads (an output head tied to the embedding) would stream
- * whole every step and is neither. Shared by the budget resolver and the planner. */
+ * only by `embed_lookup_q`, or only by `embed_lookup_planes` (a table's planes read in place, each
+ * plane its own view), an n-gram table. A lookup reads M rows a step, so a tier below the card is
+ * usable; a weight a GEMM also reads (an output head tied to the embedding) would stream whole
+ * every step and is neither. Shared by the budget resolver and the planner. */
 bool read_only_by(const Program& prog, rad_weight w, const char* op);
 inline bool is_embedding_table(const Program& prog, rad_weight w) {
     return read_only_by(prog, w, "embed_lookup");
 }
 inline bool is_ngram_table(const Program& prog, rad_weight w) {
-    return read_only_by(prog, w, "embed_lookup_q");
+    return read_only_by(prog, w, "embed_lookup_q") || read_only_by(prog, w, "embed_lookup_planes");
 }
 
 /* "blk.12.ffn_gate_exps.3.weight" -> "blk.*.ffn_gate_exps.*.weight": the report's per-class

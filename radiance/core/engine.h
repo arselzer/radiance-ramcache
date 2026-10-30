@@ -24,6 +24,7 @@
 #include <map>
 #include <set>
 #include "build/startup.h"
+#include "engine_hostmem.h"
 #include "diag/diag.h"
 #include "mem/hostarena.h"
 #include "sched/mem_iface.h"
@@ -33,6 +34,8 @@
 #include "text/tokenizer.h"
 #include "format/radfile.h"
 #include "format/table_copy.h"
+#include "format/dspark_rad_banks.h"
+#include "place/vram_packed.h"
 #include "lora/adapter.h"
 #include "lora/slots.h"
 
@@ -46,17 +49,13 @@
 namespace rad {
 
 class Kld;
-struct EngineTinyState;
-class TinyNativeHarness;
-struct EngineGlmMainState;
-class GlmMainEngineHarness;
-class GlmMainTp4VerifiedSourceFactory;
-class CachePrepare4Session;
 class StallWatch;
 namespace gen { class Driver; class AudioDriver; class VideoDriver; struct IPassDriver; }
 struct TierPump;
 struct TierJob;
 struct StepSlot;
+class ExpertStats;   /* place/xstats.h */
+class XsTally;
 
 struct VramFacts;   /* mem/vram_budget.h */
 struct WeightFootprint;   /* place/planner.h */
@@ -115,36 +114,14 @@ public:
     uint64_t cvec_salt_for(bool on) const { return on ? cvec_salt_ : 0; }
 
 private:
-    friend class TinyNativeHarness;
-    friend class GlmMainEngineHarness;
-    friend class GlmMainTp4VerifiedSourceFactory;
-    std::unique_ptr<EngineGlmMainState> glm_main_; // outlives Session/ranks/source leases
-    int start_glm_main();
-    int glm_main_body();
-    int glm_main_metadata_prepare();
-    int glm_main_declare();
-    int glm_main_vocabulary_admit();
-    int glm_main_run_request();
-    int glm_main_step_begin(const StepPlan&,const RadBatch&);
-    int glm_main_step_complete(const RadBatch&,int32_t sampled);
-    void glm_main_shutdown() noexcept;
-    std::unique_ptr<EngineTinyState> tiny_; // declared before ranks: last owner to retire
-    std::unique_ptr<CachePrepare4Session> cache_prepare4_; // full-source owner, outlives all rank joins/resources
-    int glm_main_tp4_cold_source_gate()const;
-    int start_tiny_transport();
-    int tiny_transport_body();
-    int tiny_phase(uint32_t);
-    void tiny_shutdown() noexcept;
-    Checkpoint* checkpoint_view() const;
-    const CkptWeight* checkpoint_find(const std::string&) const;
-    std::string checkpoint_missing(const std::string&) const;
-    std::vector<std::string> checkpoint_refused() const;
-    friend struct ModelFailurePolicyTestAccess; // actual HOST Engine admission fixture
     /* One thread per tensor-parallel rank, each owning one device. Ranks share the address
      * space, so there is no IPC or serialisation and the step batch is shared by pointer rather
      * than broadcast (spec §1). */
     struct Rank;
     std::vector<std::unique_ptr<Rank>> ranks_;
+    /* Per rank and KV group, that rank's stream view or null; the batch builder takes these, since it
+     * cannot reach each rank's manager. */
+    std::vector<std::vector<const RadKVStream*>> rank_stream_views_;
     /* The tiers' work in flight: the host-memory copies the transfer streams are running. */
     std::unique_ptr<TierPump> pump_;
     /* serve()'s startup stall watch, released when the server listens (run_server) or the KL
@@ -156,6 +133,7 @@ private:
     std::vector<std::thread>           rank_threads_;
 
     Config cfg_;
+    const DraftExperiment draft_experiment_; // one construction-time environment snapshot
     /* The VRAM split each rank actually takes, filled by Engine::plan. Equal to cfg_ on every
      * rank whose cache costs as much per token as the dearest rank's. A cheaper rank (an
      * attention-zero rank) gets a KV pool sized for the common token count and the difference in
@@ -168,10 +146,17 @@ private:
      * the mapped and file tiers read it in place (spec §4.3). A checkpoint served directly also
      * stays mapped and is read once, at load (spec §4.3). */
     std::unique_ptr<RadFile> file_;
+    /* Both borrowed owners outlive every rank, queued copy and cached source reference. */
+    std::unique_ptr<RadFile> draft_file_;
+    std::unique_ptr<DsparkRadBanks> source_banks_;
+    const RadFileEntry* source_entry(const std::string& name) const;
     std::unique_ptr<Checkpoint> ckpt_;
     std::unique_ptr<CheckpointSources> ckpt_src_;
     /* The source rad_weight_encoding answers from: container entries or checkpoint tensors. */
     WeightSourceFn sources() const;
+
+    /* --expert-stats FILE (place/xstats.h); null without the flag. */
+    std::unique_ptr<ExpertStats> xstats_;
 
     RadModelMeta   meta_{};
     LoadedPlugins  plugins_;
@@ -240,7 +225,20 @@ private:
     /* --host-headroom-mib in bytes: the host RAM startup leaves free for the system when it
      * pins host memory (engine_bringup.cpp). 4 GiB suits a busy server; a small host wants to
      * leave less to make room for its tiers, which is why it is a flag and not a constant. */
-    int64_t host_headroom_bytes() const { return cfg_.host_headroom_mib * ((int64_t)1 << 20); }
+    int64_t host_headroom_bytes() const {
+        /* All callers are startup allocation checks. Reserve the lazy native cache before a
+         * whole table or prefix pool can consume its future capacity. The cache's small entry
+         * metadata may already exist at the later checks; counting it again is conservative.
+         * Less what its slabs already back, under RADIANCE_EXPERIMENTAL_CACHE_HEADROOM_BACKED
+         * (cache_backed_bytes_; 0 otherwise, which is the whole budget as before). */
+        return host_headroom_total(cfg_.host_headroom_mib, cfg_.expert_ram_cache_total_mib,
+                                   cache_backed_bytes_);
+    }
+    /* RADIANCE_EXPERIMENTAL_CACHE_HEADROOM_BACKED=1: the bytes every rank's RAM cache slabs held
+     * when configure_kv began (Mover::mapped_cache_backed_bytes), which host_headroom_bytes()
+     * stops reserving a second time. Set once the weights are loaded, so the checks that size
+     * the tables before the load are unchanged; 0 without the switch. */
+    int64_t cache_backed_bytes_ = 0;
     /* Resolves --embedding-placement, --vision-tower-placement and --ngram-placement into Config
      * before the card is split (engine_bringup.cpp describes how auto chooses). `wfs` is every
      * rank's footprint, read for its towers. `host_late` is the pinned host memory startup
@@ -254,7 +252,7 @@ private:
     /* --ngram-placement ram: one copy of the container's [src, src + n) at file offset `foff`,
      * shared by every rank. Locked for the host gather, or pinned for a device kernel to read
      * over the link (`card`). */
-    int copy_table(const uint8_t* src, int64_t n, int64_t foff, bool card, void** out,
+    int copy_table(const RadFile& owner, const uint8_t* src, int64_t n, int64_t foff, bool card, void** out,
                    std::string* why);
     /* An auto-chosen pinned copy failed: move every rank's n-gram gather to the host. */
     bool ngram_gather_to_host();
@@ -264,10 +262,17 @@ private:
     std::vector<TableCopy> table_copies_;
     std::vector<void*> card_copies_;
     std::vector<std::pair<const void*, void*>> table_copy_of_;
+    /* --expert-profile: the decode ranking loaded once, before any rank plans, and handed to every
+     * rank's planner in place of the container's activation profile. */
+    std::vector<RadFileProfile> expert_profile_;
     int load_weights();
     int configure_kv();
     /* Resolves --checkpoint-slots auto for snapshots of `slot` bytes (`what` names their kind). */
     int size_checkpoint_store(int64_t slot, const char* what);
+    /* For a checkpoint store refused for room: when the expert RAM cache's slabs already hold
+     * memory the margin reserves again (RADIANCE_EXPERIMENTAL_CACHE_HEADROOM_BACKED off), a clause
+     * saying so and naming the switch; empty otherwise. Words only: it decides nothing. */
+    std::string cache_margin_hint() const;
     /* Maps the step's logits rows back to the sequences that wanted them. Not the identity: a
      * mid-prompt prefill chunk produces no row, and a speculative verify produces 1 + n_spec. */
     struct StepOut {
@@ -285,6 +290,9 @@ private:
         /* [n_rows] each sampled row's logprobs, for the rows of requests that asked for them;
          * empty on a step with none. */
         std::vector<TokenLogprobs> lp;
+        /* The ids' copy recorded tok_end_ ahead of the drafter's passes: collect_step waits for
+         * it alone, and the step loop for step_end_ after the commit. */
+        bool                  early = false;
     };
 
     /* The text frontend, loaded from the container. The sampler's grammars walk `vocab_view_`,
@@ -312,17 +320,14 @@ private:
      * forward pass alone (kIssueModel: the next step's, issued before this one is read back), or
      * that pass's sampler alone (kIssueSampler, once the host has committed its inputs). Every
      * release must set it; a stale value would make a draft pass issue only its sampler. */
-    enum { kIssueAll = 0, kIssueModel = 1, kIssueSampler = 2, kIssueStatus = 3 };
+    enum { kIssueAll = 0, kIssueModel = 1, kIssueSampler = 2 };
     std::atomic<int>              issue_what_{kIssueAll};
     std::atomic<int>              step_status_{RAD_OK};
-    bool                         deferred_status_profile_ = false;
     std::atomic<bool>             stopping_{false};
     /* The error the step loop ended on; RAD_OK while running or after a clean stop. Written once
      * by fail_loop(); read by the server watcher to stop HTTP and by serve() to return it. */
     std::atomic<int>              loop_status_{RAD_OK};
     int  fail_loop(int st);
-    int  model_policy_admission() const;
-    bool requires_checked_model_profile() const;
 
     /* This step's scored rows (Request::token_scores): a logits row and the result it fills.
      * Written by the scheduler thread while the ranks are parked, read by them during the step,
@@ -357,16 +362,38 @@ private:
     void probe_arena_levels();
     int  step_loop();
     /* Issue the copy of the step's sampled ids to the host, then wait for and interpret them.
-     * Split so the copy is issued before draft passes overwrite the ids, and the wait comes after
-     * them. */
-    int  collect_issue(StepOut& so);
+     * Split so the copy is issued before draft passes overwrite the ids. With `fence` the copy
+     * records tok_end_, so the wait for the ids skips the passes (StepOut::early). */
+    int  collect_issue(StepOut& so, bool fence = false);
     int  collect_step(const RadBatch* b, StepOut& so);
     int  row_logprobs(StepOut& so, int32_t row, int32_t token);
     /* The step's end on the card: after its last draft pass and the host readbacks, before the
-     * step issued ahead. collect_step waits on this event, not the stream, so the card runs the
+     * step issued ahead. The engine waits on this event, not the stream, so the card runs the
      * next step while the host commits this one. */
     int  mark_step_end(const RadBatch* b, StepOut& so);
     RadEvent step_end_ = nullptr;
+    /* The sampled ids' copy, ahead of the drafter's passes (collect_issue's `fence`). */
+    RadEvent tok_end_ = nullptr;
+    /* Whether the ids may be read before the drafter's passes end: not in KL mode, whose scored
+     * rows are read from the logits after collection, nor for an embedding program. */
+    bool     early_ids_ = false;
+
+    /* ---- KV streaming's counters (engine.cpp, "KV streaming's counters"). Pinned, because a
+     * device-to-host copy into pageable memory blocks the stream. */
+    struct StreamRead {
+        int64_t  resolves = 0, lookups = 0, misses = 0;
+        int64_t  max_union = 0, max_misses = 0, max_claims = 0;
+        int64_t  slots = 0, block_bytes = 0;
+        bool     overflow = false;
+        int32_t  group = -1;
+    };
+    std::vector<StreamRead> stream_prev_;   /* what metrics have already been charged */
+    /* Pinned landing area for the copies: [n_kv_groups][16] i32, grown on first use. */
+    int32_t*                stream_ctl_p_ = nullptr;
+    size_t                  stream_ctl_n_ = 0;
+    int  stream_probe_issue(const RadBatch* b);
+    int  stream_probe_take(const RadBatch* b, bool prefill_done, bool request_end);
+    void stream_report(const char* when, const StreamRead& r, const StreamRead& prev);
 
     /* The draft head as declared (rad_declare_drafter), zeroed when no speculative window was
      * asked for. `kind` selects which of the two drivers below runs. `drafter_name_` owns the
@@ -419,13 +446,48 @@ private:
     int  advance_all(int mode, int round, bool from_proposal, int rows = -1);
     int  issue_serial_drafter(int step, StepOut& so);
     /* The next step's forward pass, issued before this one is read back; null when the scheduler
-     * wants this step committed first. See Scheduler::step_next. */
-    int  issue_ahead(const RadBatch** out);
+     * wants this step committed first. See Scheduler::step_next. `so` is this step's, for
+     * RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP's read-back. */
+    int  issue_ahead(const RadBatch** out, const StepOut& so);
+    /* RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP=1: before a step is planned behind one of a single
+     * sequence that its own token can end (Scheduler::outcome_decides_next), that step's ids are
+     * read back and its outcome handed to Scheduler::step_next, which issues nothing behind a
+     * step that ended its request. Off: the pass after a reply's end-of-generation token runs as
+     * before. Read in serve(), applied in step_loop() once pipelining_ is known. */
+    bool post_stop_asked_ = false;
+    bool post_stop_ = false;
+    /* The outcome as collect_step will find it, without its effects (grammar, logprobs, the kept
+     * rows): each row's last emitted token, its accepted drafts, whether the token ends
+     * generation. Waits for the ids. */
+    int  peek_outcome(const StepOut& so, Scheduler::StepResult* out);
+    std::vector<int32_t> peek_tok_, peek_acc_;
+    std::vector<uint8_t> peek_eos_;
+    /* For the shutdown report's "post-stop passes" line: the steps read back first and the wait
+     * for their ids; of the steps then issued, the host's time from the ids to the ranks'
+     * release (the next step's build, advance and arena), through which the card idles. */
+    uint64_t post_stop_peeks_ = 0, post_stop_wait_ns_ = 0;
+    uint64_t post_stop_issued_ = 0, post_stop_turn_ns_ = 0;
+    std::chrono::steady_clock::time_point post_stop_t_{};
+    void post_stop_report();
     /* The arena level and the followers' pools, before any release that runs a forward pass. */
     int  prepare_release(const RadBatch* b);
     /* Whether a step may be issued ahead: requires that the drafter, if any, runs on the card (the
      * prompt-lookup drafter reads the committed sequence). */
     bool pipelining_ = false;
+    /* RADIANCE_EXPERIMENTAL_DS41_PREFILL_HASH=1 (engine_hash.cpp): at the end of each prompt's
+     * prefill, every rank hashes every KV group the prompt wrote (each layer apart) and the last
+     * row's logits, so two runs' prefill state can be compared byte for byte. Steps are then not
+     * issued ahead: the hash reads the state the prompt's last step left, before the next step
+     * runs. Staged by the scheduler thread with the ranks parked, read by them during the step. */
+    struct PrefillHashJob;
+    bool prefill_hash_ = false;
+    std::unique_ptr<PrefillHashJob> hash_job_;
+    void prefill_hash_init();
+    void prefill_hash_stage(const StepPlan& plan, const StepOut& so, int step);
+    void prefill_hash_rank(Rank& r, const RadBatch* b);
+    void prefill_hash_print();
+    /* The consumer skip's shutdown line (core/sched/consumer_skip.h): what the cut ran. */
+    void consumer_skip_report();
     int  finish_serial_drafter(const StepOut& so);
     /* Handed from issue_serial_drafter to finish_serial_drafter: the drafting rows, the rounds
      * asked for, and the rounds that ran. */
@@ -441,7 +503,8 @@ private:
      * `mtp_couple_state`; the engine stages one draw per drafting row before the serial passes and
      * reads the states back once, then binds each to the verify row it will be coupled at. */
     bool     mtp_couple_ = false;
-    rad_buf  couple_draws_buf_ = 0, couple_state_buf_ = 0;
+    rad_buf  couple_draws_buf_ = 0, couple_state_buf_ = 0;   /* rank 0's handles */
+    std::vector<rad_buf> couple_draws_rank_;           /* the draws plane, by rank */
     int64_t  couple_rows_ = 0;                       /* the state plane's rows per round */
     RadMtpCoupleDraw*  couple_draw_stage_ = nullptr;   /* pinned [max_seqs] */
     RadMtpCoupleState* couple_readback_  = nullptr;    /* pinned [rounds, couple_rows_] */
@@ -450,7 +513,9 @@ private:
     bool couple_evidence_ = false;   /* the completed-verify line was written (once a process) */
     bool couple_host_note_ = false;  /* the host-domain counterpart was written (once) */
     bool couple_malformed_note_ = false;   /* a status -1 round was reported (once) */
-    int  stage_couple_draws(int n);
+    /* `rows` are serial_row_ or block_row_ (Scheduler::SerialRow / BlockRow). */
+    template <class Row> int stage_couple_draws(const Row* rows, int n);
+    int  bind_couple(uint64_t seq, int i, int done, bool drafted, int32_t card);
     /* One INFO line at the first coupled verify that completed: the step, the live requests whose
      * rows carried a bound state, the kernel and its domain. Read from the sampler's build
      * snapshot after collect_step's wait, so it reports a finished verify, not an enqueue. */
@@ -552,9 +617,14 @@ private:
     void decide(const std::string& key, const std::string& value, const std::string& why) {
         diag::decide(&decisions_, key, value, why);
     }
+    /* The architecture's RadArchProbe, asked once in declare(): a property of the model, so every
+     * RadBuildCtx carries the same answer (RadBuildCtx::kv_stream_ok). */
+    RadArchProbe arch_probe_{};
     std::string devnote_;            /* the devices usable_devices left out, and why */
     int         p2p_measured_ = -1;  /* 1 peer to peer, 0 through host memory, -1 not asked */
     std::string p2p_blocked_;
+    /* RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED (place/vram_packed.h), read once in start(). */
+    VramPackConfig vram_pack_cfg_;
     bool        has_ngram_ = false;  /* the model carries an n-gram table */
     std::string prefix_off_why_;     /* why the engine itself turned prefix caching off, or "" */
 
@@ -602,6 +672,14 @@ private:
      * what the heat engine proposes. A member because Rank is private; a no-op on a static plan.
      * The definition explains why a step is the unit. */
     void tiering_dispatch(Rank& r, int step);
+    /* The routing histograms landed since the last drain (tiering_dispatch), and the drain alone
+     * for --expert-stats where the heat engine is off. */
+    void find_histograms(Rank& r, int before_step);
+    void xstats_drain(Rank& r, XsTally* xs, int before_step);
+    /* --expert-stats: the map and the file, opened before the rank threads start; closed after they
+     * stop, crediting what the ring still holds once the streams are drained. */
+    int  xstats_open();
+    void xstats_close();
     void rank_loop(int rank);
 };
 

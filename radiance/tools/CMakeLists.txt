@@ -39,20 +39,6 @@ endfunction()
 
 rad_add_tool(rad-info     rad_info.cpp)
 
-# Offline inventory/Planner probe. Its never-launch fixture exists only in test builds.
-if(RAD_BUILD_TESTS)
-  add_executable(gguf-weight-probe gguf_weight_probe.cpp)
-  target_link_libraries(gguf-weight-probe PRIVATE stdc++ rad_core)
-  target_include_directories(gguf-weight-probe PRIVATE ${CMAKE_SOURCE_DIR}/core ${CMAKE_SOURCE_DIR}/abi)
-  add_dependencies(gguf-weight-probe libquant radtest_repackkernel)
-  set_target_properties(gguf-weight-probe PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
-  # Config-derived GLM expert records only; no payload, actual kernel or full graph claim.
-  add_executable(glm53-weight-probe glm53_weight_probe.cpp)
-  target_link_libraries(glm53-weight-probe PRIVATE stdc++ rad_core)
-  target_include_directories(glm53-weight-probe PRIVATE ${CMAKE_SOURCE_DIR}/core ${CMAKE_SOURCE_DIR}/abi)
-  set_target_properties(glm53-weight-probe PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
-endif()
-
 # The tokeniser's independent reference encoder (tokref.h), which core/text's pre-tokeniser is
 # checked against. A library because tests/tokenizer_test uses it too; core/ does not link it.
 add_library(rad_tokref STATIC ${CMAKE_CURRENT_SOURCE_DIR}/tokref.cpp)
@@ -102,9 +88,18 @@ install(TARGETS rad-info rad-convert rad-kbench rad-tune rad-schemas rad-tokchec
 # template, compared with the legacy parser in tests/legacy/. It shares that parser and the
 # differential harness with tests/chatparse_test, so it is built only with the tests.
 if(RAD_BUILD_TESTS)
-  add_executable(rad-chatparse rad_chatparse.cpp ${CMAKE_CURRENT_SOURCE_DIR}/iface.cpp)
-  target_link_libraries(rad-chatparse PRIVATE rad_legacy_toolparse)
+  # Its --request mode loads the architecture plugin for the model's declared reply format, so it
+  # is a plugin host like rad_add_tool's tools: the whole of rad_core, with its symbols exported.
+  # The legacy parser's sources are compiled in rather than linked as rad_legacy_toolparse, which
+  # links rad_core without that feature.
+  add_executable(rad-chatparse rad_chatparse.cpp chatparse_serve.cpp
+                               ${CMAKE_CURRENT_SOURCE_DIR}/iface.cpp
+                               ${CMAKE_SOURCE_DIR}/tests/legacy/toolparse_legacy.cpp
+                               ${CMAKE_SOURCE_DIR}/tests/legacy/chatdiff.cpp)
+  target_link_libraries(rad-chatparse PRIVATE "$<LINK_LIBRARY:WHOLE_ARCHIVE,rad_core>")
   target_include_directories(rad-chatparse PRIVATE ${CMAKE_SOURCE_DIR}/core ${CMAKE_SOURCE_DIR}/abi
-                                                   ${CMAKE_CURRENT_SOURCE_DIR})
-  set_target_properties(rad-chatparse PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+                                                   ${CMAKE_CURRENT_SOURCE_DIR}
+                                                   ${CMAKE_SOURCE_DIR}/tests/legacy)
+  set_target_properties(rad-chatparse PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+                                                 ENABLE_EXPORTS ON)
 endif()

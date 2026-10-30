@@ -1,0 +1,57 @@
+[2026-10-29T10:27:40Z] waiting for 30 s of QFN idleness
+before: 608764c1d1989c714d8aad7b8a79f8057c3e73473b9f9d55b49d02e82defd2b8 running 2026-10-29T10:25:41.01972629Z sha256:e82764045e46ebae07e33961f17dedba981c0d07336dfcddd67e4b3b042b8600
+[2026-10-29T10:28:09Z] stopping radiance-flashnext
+radiance-flashnext
+[2026-10-29T10:28:18Z] arm all-t40-f-M16-H-p256-m92160-G-R-B1-W-A2-Rd13-Er: RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=40 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU=/home/as/radiance-ds41-claude/tools/ds41-host-experts/build/window-20261028T203510Z/silu_table_gfx1201.bin RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_POLICY=all RADIANCE_EXPERIMENTAL_NATIVE_CACHE_DIRECT_FILL=1 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MISSES=16 RADIANCE_EXPERIMENTAL_NATIVE_CACHE_PREGROW=1 RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS=1 RADIANCE_EXPERIMENTAL_DS41_CACHE_WARM=1 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_ASYNC_MISSES=2
+[2026-10-29T10:29:02Z] arm all-t40-f-M16-H-p256-m92160-G-R-B1-W-A2-Rd13-Er: serving after 44s
+heldout-01: 8.4 s, decode 12.40 tok/s, prefill 3348 ms
+heldout-02: 8.2 s, decode 11.82 tok/s, prefill 2899 ms
+heldout-03: 7.3 s, decode 13.55 tok/s, prefill 2644 ms
+heldout-04: 8.0 s, decode 12.02 tok/s, prefill 2757 ms
+heldout-05: 4.5 s, decode 14.17 tok/s, prefill 1716 ms
+heldout-06: 7.3 s, decode 11.99 tok/s, prefill 2056 ms
+heldout-07: 7.0 s, decode 12.79 tok/s, prefill 2084 ms
+heldout-08: 6.3 s, decode 14.17 tok/s, prefill 1852 ms
+[2026-10-29T10:29:59Z] arm all-t40-f-M16-H-p256-m92160-G-R-B1-W-A2-Rd13-Er: requests exit 0
+  host experts' plane reads: 9264 weights read for the CPU in 20.11 s of issuing-thread time (2.17 ms a batch weight), 9264 relaid into the RAM cache beside it
+I[1] EP scoped file staging: 20160 count rows completed, 3488 local-zero, 0 SSD units submitted, 0 corrupt rows refused
+I[1] host experts: 10521 layers handed 15519 experts (18388 rows) to the CPU; 0 cached experts went over the copy link, 3353 routed experts were not cached; 6247.5 ms waiting at gathers; verify: 0 rows compared, 0 differ; 0 gate_up operand moves; 18872 units probed (the mapped cache's hit and miss counts above include these probes); misses on the CPU: 3353 units, 4280 rows, 16423.6 ms reading their planes
+I[1] host experts: 11541.3 ms waiting at gathers for misses still being read on the worker (not in the gather waits above)
+  host experts' plane reads: 9256 weights read for the CPU in 20.38 s of issuing-thread time (2.20 ms a batch weight), 9256 relaid into the RAM cache beside it
+I[2] EP scoped file staging: 20160 count rows completed, 3186 local-zero, 0 SSD units submitted, 0 corrupt rows refused
+I[2] host experts: 10983 layers handed 16280 experts (19650 rows) to the CPU; 0 cached experts went over the copy link, 3349 routed experts were not cached; 6390.5 ms waiting at gathers; verify: 0 rows compared, 0 differ; 0 gate_up operand moves; 19629 units probed (the mapped cache's hit and miss counts above include these probes); misses on the CPU: 3349 units, 4180 rows, 16464.4 ms reading their planes
+I[2] host experts: 11432.5 ms waiting at gathers for misses still being read on the worker (not in the gather waits above)
+  host experts' plane reads: 9310 weights read for the CPU in 19.48 s of issuing-thread time (2.09 ms a batch weight), 9310 relaid into the RAM cache beside it
+I[3] EP scoped file staging: 20160 count rows completed, 3385 local-zero, 0 SSD units submitted, 0 corrupt rows refused
+I[3] host experts: 10735 layers handed 15571 experts (18594 rows) to the CPU; 0 cached experts went over the copy link, 3376 routed experts were not cached; 5571.6 ms waiting at gathers; verify: 0 rows compared, 0 differ; 0 gate_up operand moves; 18947 units probed (the mapped cache's hit and miss counts above include these probes); misses on the CPU: 3376 units, 4198 rows, 15527.2 ms reading their planes
+I[3] host experts: 10519.4 ms waiting at gathers for misses still being read on the worker (not in the gather waits above)
+[2026-10-29T10:30:01Z] arm all-t40-f-M16-H-p2048-m92160-G-R-B1-W-A2-Rd13-Er-Rm7-Ds0: RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=40 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU=/home/as/radiance-ds41-claude/tools/ds41-host-experts/build/window-20261028T203510Z/silu_table_gfx1201.bin RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_POLICY=all RADIANCE_EXPERIMENTAL_NATIVE_CACHE_DIRECT_FILL=1 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MISSES=16 RADIANCE_EXPERIMENTAL_NATIVE_CACHE_PREGROW=1 RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS=1 RADIANCE_EXPERIMENTAL_DS41_CACHE_WARM=1 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_ASYNC_MISSES=2 RADIANCE_EXPERIMENTAL_DS41_DSPARK_RAD_BANK=1 RADIANCE_EXPERIMENTAL_DS41_DSPARK_VERIFY_CAP=0
+[2026-10-29T10:30:11Z] arm all-t40-f-M16-H-p2048-m92160-G-R-B1-W-A2-Rd13-Er-Rm7-Ds0: server exited during startup
+[2026-10-29T10:30:11Z] arm all-t40-f-M16-H-p2048-m92160-G-R-B1-W-A2-Rd13-Er-Rm7-Ds1: RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=40 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU=/home/as/radiance-ds41-claude/tools/ds41-host-experts/build/window-20261028T203510Z/silu_table_gfx1201.bin RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_POLICY=all RADIANCE_EXPERIMENTAL_NATIVE_CACHE_DIRECT_FILL=1 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MISSES=16 RADIANCE_EXPERIMENTAL_NATIVE_CACHE_PREGROW=1 RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS=1 RADIANCE_EXPERIMENTAL_DS41_CACHE_WARM=1 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_ASYNC_MISSES=2 RADIANCE_EXPERIMENTAL_DS41_DSPARK_RAD_BANK=1 RADIANCE_EXPERIMENTAL_DS41_DSPARK_VERIFY_CAP=1
+[2026-10-29T10:30:21Z] arm all-t40-f-M16-H-p2048-m92160-G-R-B1-W-A2-Rd13-Er-Rm7-Ds1: server exited during startup
+[2026-10-29T10:30:21Z] arm all-t40-f-M16-H-p2048-m92160-G-R-B1-W-A2-Rd13-Er-Rm7-Ds2: RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=40 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU=/home/as/radiance-ds41-claude/tools/ds41-host-experts/build/window-20261028T203510Z/silu_table_gfx1201.bin RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_POLICY=all RADIANCE_EXPERIMENTAL_NATIVE_CACHE_DIRECT_FILL=1 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MISSES=16 RADIANCE_EXPERIMENTAL_NATIVE_CACHE_PREGROW=1 RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS=1 RADIANCE_EXPERIMENTAL_DS41_CACHE_WARM=1 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_ASYNC_MISSES=2 RADIANCE_EXPERIMENTAL_DS41_DSPARK_RAD_BANK=1 RADIANCE_EXPERIMENTAL_DS41_DSPARK_VERIFY_CAP=2
+[2026-10-29T10:30:32Z] arm all-t40-f-M16-H-p2048-m92160-G-R-B1-W-A2-Rd13-Er-Rm7-Ds2: server exited during startup
+[2026-10-29T10:30:32Z] arm all-t40-f-M16-H-p2048-m92160-G-R-B1-W-A2-Rd13-Er-Rm7-Ds3: RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=40 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU=/home/as/radiance-ds41-claude/tools/ds41-host-experts/build/window-20261028T203510Z/silu_table_gfx1201.bin RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_POLICY=all RADIANCE_EXPERIMENTAL_NATIVE_CACHE_DIRECT_FILL=1 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MISSES=16 RADIANCE_EXPERIMENTAL_NATIVE_CACHE_PREGROW=1 RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS=1 RADIANCE_EXPERIMENTAL_DS41_CACHE_WARM=1 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_ASYNC_MISSES=2 RADIANCE_EXPERIMENTAL_DS41_DSPARK_RAD_BANK=1 RADIANCE_EXPERIMENTAL_DS41_DSPARK_VERIFY_CAP=3
+[2026-10-29T10:30:42Z] arm all-t40-f-M16-H-p2048-m92160-G-R-B1-W-A2-Rd13-Er-Rm7-Ds3: server exited during startup
+[2026-10-29T10:30:42Z] arm all-t40-f-M16-H-p2048-m92160-G-R-B1-W-A2-Rd13-Er-Rm7-Dsa: RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=40 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU=/home/as/radiance-ds41-claude/tools/ds41-host-experts/build/window-20261028T203510Z/silu_table_gfx1201.bin RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_POLICY=all RADIANCE_EXPERIMENTAL_NATIVE_CACHE_DIRECT_FILL=1 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MISSES=16 RADIANCE_EXPERIMENTAL_NATIVE_CACHE_PREGROW=1 RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS=1 RADIANCE_EXPERIMENTAL_DS41_CACHE_WARM=1 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_ASYNC_MISSES=2 RADIANCE_EXPERIMENTAL_DS41_DSPARK_RAD_BANK=1
+[2026-10-29T10:31:22Z] arm all-t40-f-M16-H-p2048-m92160-G-R-B1-W-A2-Rd13-Er-Rm7-Dsa: server exited during startup
+arm all-t40-f-M16-H-p2048-m92160-G-R-B1-W-A2-Rd13-Er-Rm7-Ds0: no results
+arm all-t40-f-M16-H-p2048-m92160-G-R-B1-W-A2-Rd13-Er-Rm7-Ds1: no results
+arm all-t40-f-M16-H-p2048-m92160-G-R-B1-W-A2-Rd13-Er-Rm7-Ds2: no results
+arm all-t40-f-M16-H-p2048-m92160-G-R-B1-W-A2-Rd13-Er-Rm7-Ds3: no results
+arm all-t40-f-M16-H-p2048-m92160-G-R-B1-W-A2-Rd13-Er-Rm7-Dsa: no results
+request     all-t40-f-M16-H-p256-m92160-G-R-B1-W-A2-Rd13-Er
+heldout-01         12.40  same
+heldout-02         11.82  same
+heldout-03         13.55  same
+heldout-04         12.02  same
+heldout-05         14.17  same
+heldout-06         11.99  same
+heldout-07         12.79  same
+heldout-08         14.17  same
+decode             12.95 tok/s
+[2026-10-29T10:31:22Z] arms done
+[2026-10-29T10:31:22Z] restoring radiance-flashnext
+radiance-flashnext
+[2026-10-29T10:32:18Z] QFN up after 55s; completion: {"id":"cmpl-ff0f7016ceae218d00da4491","object":"text_completion","created":1793269937,"model":"qwen-vllm","system_fingerprint":"radiance-1.12.0","choices":[{"text":" Paris. The capital","index":0,"logprobs":null,"finish_reason":"length"}],"usage":{"prompt_tokens":5,"completion_tokens":4,"total_token
+608764c1d1989c714d8aad7b8a79f8057c3e73473b9f9d55b49d02e82defd2b8 running 2026-10-29T10:31:22.4638834Z sha256:e82764045e46ebae07e33961f17dedba981c0d07336dfcddd67e4b3b042b8600

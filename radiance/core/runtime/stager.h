@@ -28,6 +28,10 @@ public:
      * so the run phase brings the op's weight tables up to date before resolving them. */
     virtual int before_op(rad_op h, RadStream s, bool* resync) = 0;
 
+    /* Op `h` with its operands resolved, before its launch on `s`: what the stager queues on `s`
+     * here runs right before the op. `t` holds one tensor a schema operand. */
+    virtual int operands(rad_op, RadStream, const RadTensor*, int) { return RAD_OK; }
+
     /* After op `h` was issued on stream `s`: the point a staged weight's last reader is behind. */
     virtual int after_op(rad_op, RadStream) { return RAD_OK; }
 
@@ -61,6 +65,11 @@ public:
             if (rc < 0) return rc;
             *resync = *resync || r;
         }
+        return RAD_OK;
+    }
+    int operands(rad_op h, RadStream s, const RadTensor* t, int n_t) override {
+        for (int i = 0; i < 2; ++i)
+            if (on_[i]) { const int rc = s_[i]->operands(h, s, t, n_t); if (rc < 0) return rc; }
         return RAD_OK;
     }
     int after_op(rad_op h, RadStream s) override {

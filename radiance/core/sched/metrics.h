@@ -5,6 +5,7 @@
  */
 #pragma once
 #include "rad_core.h"
+#include "draft_experiment.h"
 
 namespace rad {
 
@@ -40,6 +41,17 @@ struct SchedMetrics {
      * (Scheduler::step_next). Every other step leaves the card idle during the host's commit and
      * staging. */
     int64_t steps_ahead = 0;
+    /* Requests that ended with a step issued ahead behind their last one. That step's forward
+     * pass ran a row for a finished request (its last token, which nothing reads after), and
+     * when the row was the step's only one the whole pass was spent on it while the reply waited:
+     * the issuing of a pass that waits for the card, as the CPU path's routed layers do, returns
+     * only once most of the pass has run, and the commit that finishes the request comes after.
+     * ends_every_request predicts max_tokens ends, so these are mostly end-of-generation stops. */
+    int64_t ended_with_step_ahead = 0;
+    /* RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP: steps whose sampled tokens, read back before the
+     * next step was planned, ended every request they carried, so none was issued behind them
+     * (Scheduler::step_next's `known`): passes of the kind above that did not run. */
+    int64_t steps_ahead_withheld = 0;
     /* Prefill chunks capped to leave room for decode rows or a waiting admission in the same
      * step (--busy-prefill-chunk). Zero under `off`. */
     int64_t prefill_chunks_capped = 0;
@@ -77,6 +89,11 @@ struct SchedMetrics {
          * difference is the VRAM the elastic pool released behind unheld blocks. */
         int64_t bytes_carved = 0;
     } kv[RAD_SCHED_MAX_KV_GROUPS];
+    /* KV streaming: the rings' depth over every streamed group, and the resolve's cumulative misses
+     * and bytes copied in from the host mirrors. Zero when nothing streams. */
+    int64_t kv_resident_blocks = 0;
+    int64_t kv_stream_misses = 0;
+    int64_t kv_stream_bytes_in = 0;
 
     /* Prefix caching (§7.3). Attention and linear are reported separately because they hit at
      * different granularities. */
@@ -113,6 +130,13 @@ struct SchedMetrics {
     int64_t prefix_held_tokens = 0;
     float   linear_hit_rate = 0.0f;
     int64_t checkpoints_written = 0;
+    /* Checkpoints the consumer skip did not write: below their prompt's target, where its cut
+     * leaves the last layers' windows incomplete (core/sched/consumer_skip.h). */
+    int64_t consumer_ckpt_dropped = 0;
+    /* RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH: finished sequences' computed tokens left
+     * unpublished, past the last chunk an idle cold prefill would have cut the same way (the
+     * prompt's last chunk, decode, a shared step). Cumulative; 0 without the switch. */
+    int64_t prefix_publish_held_tokens = 0;
 
     /* Throughput: tokens over wall time in a 1-second decaying window (Scheduler::step_finished);
      * the counters beside them are exact. */
@@ -122,6 +146,7 @@ struct SchedMetrics {
     float   decode_tps = 0.0f;
 
     /* Speculation (§10). */
+    DraftOriginStats draft_origin; // private additive opt-in snapshot, no SDK change
     int64_t draft_tokens = 0;
     int64_t draft_accepted = 0;
     /* Prefix hits ended early so a windowed block drafter has context (Scheduler::draft_refill_),
@@ -143,6 +168,14 @@ struct SchedMetrics {
     bool    draft_adaptive = false;
     float   draft_depth_adaptive = 0.0f;
     int64_t draft_verify_depth[RAD_METRICS_MAX_SPEC + 1] = {};
+    /* Prompt lookup's verify gate (sched/lookup.h), when lookup is the only drafter: proposals
+     * made, proposals held back unverified and their drafts, and of the held proposals scored
+     * against the text that followed, the drafts that came true (what a verify would have
+     * accepted). */
+    int64_t lookup_proposals = 0;
+    int64_t lookup_held = 0;
+    int64_t lookup_held_drafts = 0;
+    int64_t lookup_held_hits = 0;
 };
 
 

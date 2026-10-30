@@ -1,0 +1,158 @@
+{
+ "requests": [
+  {
+   "name": "heldout-01",
+   "wall_s": 8.8180832862854,
+   "text": "# PostgreSQL Query: Active Accounts on 1 Oct 2026 with No September 2026 Invoices\n\n```sql\nSELECT DISTINCT s.account_id\nFROM subscriptions s\nWHERE s.started_at <= DATE '2026-10-01'\n  AND (s.ended_at IS NULL OR s.ended",
+   "timings": {
+    "cache_n": 0,
+    "prompt_n": 46,
+    "prompt_ms": 3281.605831,
+    "prompt_per_token_ms": 71.33925719565217,
+    "prompt_per_second": 14.017527506032764,
+    "predicted_n": 64,
+    "predicted_ms": 5525.480923,
+    "predicted_per_token_ms": 87.7060463968254,
+    "predicted_per_second": 11.40172247048404,
+    "ttft_ms": 3283.67598,
+    "total_ms": 8809.156903
+   },
+   "error": null
+  },
+  {
+   "name": "heldout-02",
+   "wall_s": 8.47376275062561,
+   "text": "# Merging Overlapping Half-Open Intervals\n\n## Implementation\n\n```python\ndef merge_intervals(intervals):\n    \"\"\"\n    Merge overlapping half-open intervals [start, end).\n    \n    Touching intervals like [1,3) and [3,5) are NOT merged,\n    because they share no",
+   "timings": {
+    "cache_n": 0,
+    "prompt_n": 40,
+    "prompt_ms": 2780.3195499999997,
+    "prompt_per_token_ms": 69.50798875,
+    "prompt_per_second": 14.386835498818833,
+    "predicted_n": 64,
+    "predicted_ms": 5692.256405,
+    "predicted_per_token_ms": 90.35327626984127,
+    "predicted_per_second": 11.067667286502003,
+    "ttft_ms": 2780.5366289999997,
+    "total_ms": 8472.793034
+   },
+   "error": null
+  },
+  {
+   "name": "heldout-03",
+   "wall_s": 7.678541660308838,
+   "text": "Let's go through it step by step.\n\n**Step 1: Find the number of rejected items initially.**  \n5% of 240 items are rejected:  \n\\( 240 \\times 0.05 = 12 \\) items rejected.\n\n**Step 2: Determine how many are recovered by rework.**  \n",
+   "timings": {
+    "cache_n": 0,
+    "prompt_n": 39,
+    "prompt_ms": 2685.462894,
+    "prompt_per_token_ms": 68.85802292307692,
+    "prompt_per_second": 14.522635962364559,
+    "predicted_n": 64,
+    "predicted_ms": 4991.941599,
+    "predicted_per_token_ms": 79.23716823809524,
+    "predicted_per_second": 12.620339952017936,
+    "ttft_ms": 2685.714813,
+    "total_ms": 7677.656411999999
+   },
+   "error": null
+  },
+  {
+   "name": "heldout-04",
+   "wall_s": 9.288709163665771,
+   "text": "```json\n{\n  \"action_items\": [\n    {\n      \"action\": \"Send the draft\",\n      \"owner\": \"Priya\",\n      \"deadline\": \"Friday\"\n    },\n    {\n      \"action\": \"Testing\",\n      \"owner\": \"Jonas\",\n      \"deadline\": null\n   ",
+   "timings": {
+    "cache_n": 0,
+    "prompt_n": 44,
+    "prompt_ms": 2847.950198,
+    "prompt_per_token_ms": 64.72614086363636,
+    "prompt_per_second": 15.449708366002824,
+    "predicted_n": 64,
+    "predicted_ms": 6438.816288,
+    "predicted_per_token_ms": 102.20343314285714,
+    "predicted_per_second": 9.784407130455467,
+    "ttft_ms": 2848.0998769999997,
+    "total_ms": 9286.916164999999
+   },
+   "error": null
+  },
+  {
+   "name": "heldout-05",
+   "wall_s": 4.737446069717407,
+   "text": "Project update: The schema migration is complete. Load testing is pending, and the release date depends on the test results. Next milestone: complete load testing and review results to confirm the release date.",
+   "timings": {
+    "cache_n": 0,
+    "prompt_n": 35,
+    "prompt_ms": 1735.01425,
+    "prompt_per_token_ms": 49.57183571428571,
+    "prompt_per_second": 20.172744978895707,
+    "predicted_n": 40,
+    "predicted_ms": 3001.24732,
+    "predicted_per_token_ms": 76.95505948717948,
+    "predicted_per_second": 12.994597193009739,
+    "ttft_ms": 1735.240849,
+    "total_ms": 4736.488169
+   },
+   "error": null
+  },
+  {
+   "name": "heldout-06",
+   "wall_s": 2.9185822010040283,
+   "text": null,
+   "timings": {},
+   "error": "<HTTPError 429: 'Too Many Requests'>"
+  },
+  {
+   "name": "heldout-07",
+   "wall_s": 0.0006363391876220703,
+   "text": null,
+   "timings": {},
+   "error": "URLError(ConnectionRefusedError(111, 'Connection refused'))"
+  },
+  {
+   "name": "heldout-08",
+   "wall_s": 0.00020933151245117188,
+   "text": null,
+   "timings": {},
+   "error": "URLError(ConnectionRefusedError(111, 'Connection refused'))"
+  }
+ ],
+ "waves": [
+  {
+   "wall_s": 8.81812310218811,
+   "tokens": 64
+  },
+  {
+   "wall_s": 8.473820686340332,
+   "tokens": 64
+  },
+  {
+   "wall_s": 7.678593158721924,
+   "tokens": 64
+  },
+  {
+   "wall_s": 9.288756370544434,
+   "tokens": 64
+  },
+  {
+   "wall_s": 4.737508058547974,
+   "tokens": 40
+  },
+  {
+   "wall_s": 2.918714761734009,
+   "tokens": 0
+  },
+  {
+   "wall_s": 0.0007002353668212891,
+   "tokens": 0
+  },
+  {
+   "wall_s": 0.00023436546325683594,
+   "tokens": 0
+  }
+ ],
+ "concurrency": 1,
+ "stats": {
+  "error": "URLError(ConnectionRefusedError(111, 'Connection refused'))"
+ }
+}

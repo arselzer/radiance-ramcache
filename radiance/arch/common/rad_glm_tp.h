@@ -99,14 +99,17 @@ struct GlmTp {
  * A replicated [n, k] F32 projection computed column-split: rank r runs the same gemm_nt_f32 on
  * rows [r*n/world, (r+1)*n/world) of the weight and a row-interleaved all_gather lays the slices
  * out as the full [M, n]. The kernel computes every output column independently of n and the
- * gather moves bytes, so each value is bit-identical to the replicated projection's. */
+ * gather moves bytes, so each value is bit-identical to the replicated projection's. `gemm` is the
+ * replicated projection's op: gemm_nt_f32, or gemm_nt_f32bf16 over a weight stored as its bf16
+ * halves (GlmRouter::Config::bf16_halves), whose rows slice the same way. */
 struct SplitF32Proj {
     rad_buf part = 0;
     rad_op op_part = 0, op_gather = 0;
     int64_t cols = 0, k = 0, min_rows = 0, first_col = 0;
 
     int declare(RadBuilder* b, Names& nm, const Geom& g, const char* name, int64_t rows, int64_t n,
-                int64_t width, rad_weight weight, rad_buf input, rad_buf output) {
+                int64_t width, rad_weight weight, rad_buf input, rad_buf output,
+                const char* gemm = "gemm_nt_f32") {
         min_rows = GlmTp::kSplitRows;
         if (g.world < 2 || n % g.world || (n / g.world * 4) % 16) {
             min_rows = 0;
@@ -117,7 +120,7 @@ struct SplitF32Proj {
         first_col = g.rank * cols;
         part = decl_b(b, nm.f("%s.part", name), RAD_F32, { rows, cols });
         op_part = rw(b,
-                     RAD_OP(b, "gemm_nt_f32",
+                     RAD_OP(b, gemm,
                             RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("N", cols), RAD_INT("K", k),
                                        RAD_STR("dtype", "bf16")),
                             RAD_WEIGHTS(weight)),

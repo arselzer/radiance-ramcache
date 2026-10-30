@@ -30,6 +30,7 @@
 #include "ref_ops.h"
 
 #include <algorithm>
+#include <cstring>
 
 using namespace ref;
 
@@ -565,6 +566,102 @@ int ref_kv_store(const RadArgs* a, RadStream) {
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------------ kv_store_streamed */
+/* The store of a streamed group (docs/OPS.md "kv_store_streamed"): `kv_store` into both of the
+ * group's copies. host[b], the authoritative mirror, is written always; kv_cache[res[b]] only when
+ * the block is resident. The writer must test residency: at decode the block a step writes is
+ * usually the one the previous step made resident, so a mirror-only writer would leave the ring's
+ * copy missing this step's tokens, and the resolve, seeing it resident, would not copy it. The
+ * caller's order is store, resolve, attention. The planes are the same paged layout at the same
+ * pitch, so one conversion writes both. `res` is read, never written; an entry outside
+ * [-1, slots) for a touched block, or a slot past the id space, is refused before any write. */
+int ref_kv_store_streamed(const RadArgs* a, RadStream) {
+    if (!have(a, 6)) return RAD_E_INVAL;
+    const RadTensor *k = &a->t[0], *v = &a->t[1], *sm = &a->t[2], *kv = &a->t[3];
+    const RadTensor *res = &a->t[4], *host = &a->t[5];
+
+    const int64_t head_dim   = p_int(a, "head_dim", k->rank >= 3 ? k->shape[k->rank - 1] : 0);
+    const int64_t block_size = p_int(a, "block_size", 0);
+    const int64_t kv_heads   = p_int(a, "n_head_kv", 0);
+    if (head_dim <= 0 || block_size <= 0 || kv_heads <= 0) return RAD_E_SHAPE;
+    if (k->dtype != RAD_BF16 || v->dtype != RAD_BF16) return RAD_E_DTYPE;
+    if (sm->dtype != RAD_I32 || res->dtype != RAD_I32) return RAD_E_DTYPE;
+    if (host->dtype != RAD_U8) return RAD_E_DTYPE;
+    /* E4M3 or bf16: a bf16 group doubles every offset and stores the value itself, as
+     * kv_store_bf16 does. A packed fp8_v4/k6_v4 group has no streamed row. */
+    const bool fp8 = kv->dtype == RAD_F8E4M3;
+    if (!fp8 && kv->dtype != RAD_BF16) return RAD_E_UNSUPPORTED;
+    if (kv->rank != 4) return RAD_E_SHAPE;
+    if (kv->shape[1] != kv_heads || kv->shape[2] != block_size ||
+        kv->shape[3] != 2 * head_dim) return RAD_E_SHAPE;
+    if (host->rank != 2) return RAD_E_SHAPE;
+
+    /* Both planes are dense rows of one block of one layer: a padded mirror row would copy over its
+     * neighbour, and the two copies must share offsets. */
+    const int64_t EB = fp8 ? 1 : 2;
+    const int64_t row = kv_heads * block_size * 2 * head_dim * EB;
+    const int64_t slots = kv->shape[0], blocks = host->shape[0];
+    if (host->shape[1] != row || host->stride[0] * rad_dtype_bytes(host->dtype, 1) != row)
+        return RAD_E_STRIDE;
+    if (kv->stride[0] * rad_dtype_bytes(kv->dtype, 1) != row) return RAD_E_STRIDE;
+    if (slots <= 0 || blocks <= 0) return RAD_E_SHAPE;
+    if (numel(res) < blocks || res->stride[0] != 1) return RAD_E_SHAPE;
+
+    const int64_t M = numel(sm);
+    if (M <= 0 || numel(k) < M * kv_heads * head_dim || numel(v) < M * kv_heads * head_dim)
+        return RAD_E_SHAPE;
+
+    const int64_t k_ds = k->rank >= 2 ? k->stride[k->rank - 1] : 1;
+    const int64_t k_hs = k->rank >= 3 ? k->stride[k->rank - 2] : head_dim * k_ds;
+    const int64_t k_rs = row_stride(k, kv_heads * head_dim);
+    const int64_t v_ds = v->rank >= 2 ? v->stride[v->rank - 1] : 1;
+    const int64_t v_hs = v->rank >= 3 ? v->stride[v->rank - 2] : head_dim * v_ds;
+    const int64_t v_rs = row_stride(v, kv_heads * head_dim);
+    /* kv_store_bf16 stores the value itself; only the E4M3 row divides by the reader's descales. */
+    const float ks = fp8 ? 1.0f / p_f32(a, "k_scale", 1.0f) : 1.0f;
+    const float vs = fp8 ? 1.0f / p_f32(a, "v_scale", 1.0f) : 1.0f;
+
+    /* Everything that can refuse is checked before the first write: a half-written mirror would
+     * make later copies plausible and wrong. */
+    const int32_t* const R = (int32_t*)res->data;
+    for (int64_t t = 0; t < M; ++t) {
+        const int64_t s = ld_int(sm->dtype, sm->data, offlin(sm, t));
+        if (s < 0) continue;                      /* padded row, no cache slot */
+        const int64_t blk = s / block_size;
+        if (blk >= blocks) return RAD_E_SHAPE;
+        if (R[blk] < -1 || R[blk] >= slots) return RAD_E_INVAL;
+    }
+
+    /* The mirror seen as the plane it holds, so both copies round the same. */
+    RadTensor hkv = *host;
+    hkv.dtype = kv->dtype;
+    const KVView kvv = kv_view(kv, head_dim, block_size, kv_heads);
+    const KVView hv  = kv_view(&hkv, head_dim, block_size, kv_heads);
+
+    REF_PAR_FOR(M * kv_heads * head_dim * 2)
+    for (int64_t t = 0; t < M; ++t) {
+        const int64_t s = ld_int(sm->dtype, sm->data, offlin(sm, t));
+        if (s < 0) continue;
+        const int64_t blk = s / block_size, off = s % block_size;
+        const int64_t hb = blk * hv.sb + off * hv.so;
+        /* A non-resident block is written to the mirror alone; the resolve copies it in whole. */
+        const int64_t cb = R[blk] >= 0 ? R[blk] * kvv.sb + off * kvv.so : -1;
+        for (int64_t h = 0; h < kv_heads; ++h) {
+            for (int64_t d = 0; d < head_dim; ++d) {
+                const float xk = ldt(k, t * k_rs + h * k_hs + d * k_ds) * ks;
+                const float xv = ldt(v, t * v_rs + h * v_hs + d * v_ds) * vs;
+                stt(&hkv, hb + h * hv.sh + d * hv.sd, xk);
+                stt(&hkv, hb + h * hv.sh + (head_dim + d) * hv.sd, xv);
+                if (cb >= 0) {
+                    stt(kv, cb + h * kvv.sh + d * kvv.sd, xk);
+                    stt(kv, cb + h * kvv.sh + (head_dim + d) * kvv.sd, xv);
+                }
+            }
+        }
+    }
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------------ rope */
 namespace {
 
@@ -1017,6 +1114,50 @@ int ref_rope_table(const RadArgs* a, RadStream) {
             stt(cs, offlin(cs, pp * rot + i),        ref_cos(ang) * yarn.magnitude);
             stt(cs, offlin(cs, pp * rot + half + i), ref_sin(ang) * yarn.magnitude);
         }
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ rope_rows */
+/* Rotary embedding from a rope_table plane over a window of each head: columns [off, off+rot) of
+ * every head_dim-wide head of x [M, n_head*head_dim], in place. "gptj" pairs adjacent columns,
+ * "neox" pairs i with i + rot/2. The pair (a, b) times (c + i s) is (a c - b s, a s + b c) in f32,
+ * rounded once to x's dtype; `inverse` 1 conjugates (s -> -s), which undoes the rotation. A row
+ * whose position is negative or past the table is left as it is. DeepSeek-V4 rotates the last 64
+ * of each 512-wide head and un-rotates the attention output the same way. */
+int ref_rope_rows(const RadArgs* a, RadStream) {
+    if (!have(a, 3)) return RAD_E_INVAL;
+    const RadTensor &x = a->t[0], &cs = a->t[1], &pos = a->t[2];
+    const int64_t nh = p_int(a, "n_head", 0), hd = p_int(a, "head_dim", 0);
+    const int64_t rot = p_int(a, "rot", 0), off = p_int(a, "off", -1);
+    const int64_t inv = p_int(a, "inverse", -1);
+    const char* mode = p_str(a, "mode", "");
+    const bool gptj = !std::strcmp(mode, "gptj");
+    if (!gptj && std::strcmp(mode, "neox")) return RAD_E_UNSUPPORTED;
+    if (nh < 1 || hd < 2 || rot < 2 || (rot & 1) || off < 0 || off + rot > hd ||
+        (inv != 0 && inv != 1))
+        return RAD_E_SHAPE;
+    if (!x.data || !cs.data || !pos.data || x.rank != 2 || x.shape[0] < 1 || x.shape[1] != nh * hd ||
+        cs.rank != 2 ||
+        cs.shape[1] != rot || numel(&pos) != x.shape[0])
+        return RAD_E_SHAPE;
+    const int64_t M = x.shape[0], rows = cs.shape[0], half = rot / 2;
+    const float sign = inv ? -1.0f : 1.0f;
+#pragma omp parallel for schedule(static)
+    for (int64_t m = 0; m < M; ++m) {
+        const int64_t p = ld_int(pos.dtype, pos.data, offlin(&pos, m));
+        if (p < 0 || p >= rows) continue;
+        const int64_t cb = rowoff(&cs, p, rot), css = laststride(&cs);
+        const int64_t xb = rowoff(&x, m, nh * hd), xs = laststride(&x);
+        for (int64_t h = 0; h < nh; ++h)
+            for (int64_t i = 0; i < half; ++i) {
+                const int64_t ia = h * hd + off + (gptj ? 2 * i : i);
+                const int64_t ib = gptj ? ia + 1 : ia + half;
+                const float c = ldt(&cs, cb + i * css), s = sign * ldt(&cs, cb + (half + i) * css);
+                const float va = ldt(&x, xb + ia * xs), vb = ldt(&x, xb + ib * xs);
+                stt(&x, xb + ia * xs, va * c - vb * s);
+                stt(&x, xb + ib * xs, va * s + vb * c);
+            }
     }
     return RAD_OK;
 }

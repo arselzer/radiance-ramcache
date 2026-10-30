@@ -1,0 +1,60 @@
+[2026-10-29T08:27:38Z] waiting for 30 s of QFN idleness
+before: 608764c1d1989c714d8aad7b8a79f8057c3e73473b9f9d55b49d02e82defd2b8 running 2026-10-29T08:23:08.398090364Z sha256:e82764045e46ebae07e33961f17dedba981c0d07336dfcddd67e4b3b042b8600
+[2026-10-29T08:29:26Z] stopping radiance-flashnext
+radiance-flashnext
+[2026-10-29T08:29:51Z] arm all-t40-f-M16-H-p1900-m98304-G-R-B1-W-A2: RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=40 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU=/home/as/radiance-ds41-claude/tools/ds41-host-experts/build/window-20261028T203510Z/silu_table_gfx1201.bin RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_POLICY=all RADIANCE_EXPERIMENTAL_NATIVE_CACHE_DIRECT_FILL=1 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MISSES=16 RADIANCE_EXPERIMENTAL_NATIVE_CACHE_PREGROW=1 RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS=1 RADIANCE_EXPERIMENTAL_DS41_CACHE_WARM=1 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_ASYNC_MISSES=2
+[2026-10-29T08:30:59Z] arm all-t40-f-M16-H-p1900-m98304-G-R-B1-W-A2: serving after 68s
+heldout-01: 8.8 s, decode 11.40 tok/s, prefill 3282 ms
+heldout-02: 8.5 s, decode 11.07 tok/s, prefill 2780 ms
+heldout-03: 7.7 s, decode 12.62 tok/s, prefill 2685 ms
+heldout-04: 9.3 s, decode 9.78 tok/s, prefill 2848 ms
+heldout-05: 4.7 s, decode 12.99 tok/s, prefill 1735 ms
+[2026-10-29T08:31:41Z] arm all-t40-f-M16-H-p1900-m98304-G-R-B1-W-A2: MemAvailable 2683 MiB below the guard; stopping the server
+heldout-06: 2.9 s, decode 0.00 tok/s, prefill 0 ms ERROR <HTTPError 429: 'Too Many Requests'>
+heldout-07: 0.0 s, decode 0.00 tok/s, prefill 0 ms ERROR URLError(ConnectionRefusedError(111, 'Connection refused'))
+heldout-08: 0.0 s, decode 0.00 tok/s, prefill 0 ms ERROR URLError(ConnectionRefusedError(111, 'Connection refused'))
+[2026-10-29T08:31:41Z] arm all-t40-f-M16-H-p1900-m98304-G-R-B1-W-A2: requests exit 0
+I[0] host experts: 40 CPU threads compute RAM-resident DeepSeek-V4.1 experts (silu table /home/as/radiance-ds41-claude/tools/ds41-host-experts/build/window-20261028T203510Z/silu_table_gfx1201.bin; scheduling at 78 GB/s against 20 GB/s a copy link)
+I[0] host experts: passes of at most 16 token(s) compute missed experts on the CPU from the container's planes; background threads relay them into the RAM cache
+I[0] host experts: passes of 2+ tokens read their misses on a worker while the card's ops are issued
+I[0] host experts: rank 0's RAM cache warmed with the profile's 1364 hottest file-tier experts (23.88 GiB) in 3.4 s
+I[0] host experts: 40 of 40 routed layers give the CPU every one of their cached experts
+I[0] host experts: file buffers capped at 1 units; every routed unit is the CPU's
+I[1] host experts: rank 1's RAM cache warmed with the profile's 1364 hottest file-tier experts (23.88 GiB) in 3.4 s
+I[2] host experts: rank 2's RAM cache warmed with the profile's 1364 hottest file-tier experts (23.88 GiB) in 3.4 s
+I[3] host experts: rank 3's RAM cache warmed with the profile's 1364 hottest file-tier experts (23.88 GiB) in 3.4 s
+I host experts: layer 0's first CPU rows (14) copied over the card's before its gather
+I req refused from 127.0.0.1:34046 -> 429 rate_limit_error: the server is shutting down
+[2026-10-29T08:31:42Z] arm all-t40-f-M16-H-p1900-m98304-G-R-B1-W-A2-Rd10: RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=40 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU=/home/as/radiance-ds41-claude/tools/ds41-host-experts/build/window-20261028T203510Z/silu_table_gfx1201.bin RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_POLICY=all RADIANCE_EXPERIMENTAL_NATIVE_CACHE_DIRECT_FILL=1 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MISSES=16 RADIANCE_EXPERIMENTAL_NATIVE_CACHE_PREGROW=1 RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS=1 RADIANCE_EXPERIMENTAL_DS41_CACHE_WARM=1 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_ASYNC_MISSES=2
+[2026-10-29T08:31:50Z] arm all-t40-f-M16-H-p1900-m98304-G-R-B1-W-A2-Rd10: server exited during startup
+[2026-10-29T08:31:50Z] arm all-t40-f-M16-H-p1900-m98304-G-R-B1-W-A2-Sg3: RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=40 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU=/home/as/radiance-ds41-claude/tools/ds41-host-experts/build/window-20261028T203510Z/silu_table_gfx1201.bin RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_POLICY=all RADIANCE_EXPERIMENTAL_NATIVE_CACHE_DIRECT_FILL=1 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MISSES=16 RADIANCE_EXPERIMENTAL_NATIVE_CACHE_PREGROW=1 RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS=1 RADIANCE_EXPERIMENTAL_DS41_CACHE_WARM=1 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_ASYNC_MISSES=2
+[2026-10-29T08:31:58Z] arm all-t40-f-M16-H-p1900-m98304-G-R-B1-W-A2-Sg3: server exited during startup
+[2026-10-29T08:31:58Z] arm all-t40-f-M16-H-p1900-m98304-G-R-B1-W-A2-s0: RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=40 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU=/home/as/radiance-ds41-claude/tools/ds41-host-experts/build/window-20261028T203510Z/silu_table_gfx1201.bin RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_POLICY=all RADIANCE_EXPERIMENTAL_NATIVE_CACHE_DIRECT_FILL=1 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MISSES=16 RADIANCE_EXPERIMENTAL_NATIVE_CACHE_PREGROW=1 RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS=1 RADIANCE_EXPERIMENTAL_DS41_CACHE_WARM=1 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_ASYNC_MISSES=2 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SPIN_US=0
+[2026-10-29T08:32:06Z] arm all-t40-f-M16-H-p1900-m98304-G-R-B1-W-A2-s0: server exited during startup
+[2026-10-29T08:32:06Z] arm all-t40-f-M16-H-p1900-m98304-G-R-B1-W-A2-r2: RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=40 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU=/home/as/radiance-ds41-claude/tools/ds41-host-experts/build/window-20261028T203510Z/silu_table_gfx1201.bin RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_POLICY=all RADIANCE_EXPERIMENTAL_NATIVE_CACHE_DIRECT_FILL=1 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MISSES=16 RADIANCE_EXPERIMENTAL_NATIVE_CACHE_PREGROW=1 RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS=1 RADIANCE_EXPERIMENTAL_DS41_CACHE_WARM=1 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_ASYNC_MISSES=2
+[2026-10-29T08:32:12Z] arm all-t40-f-M16-H-p1900-m98304-G-R-B1-W-A2-r2: server exited during startup
+[2026-10-29T08:32:12Z] arm all-t40-f-M16-H-p1900-m98304-G-R-B1-W-A2-Rd10-r2: RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=40 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU=/home/as/radiance-ds41-claude/tools/ds41-host-experts/build/window-20261028T203510Z/silu_table_gfx1201.bin RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_POLICY=all RADIANCE_EXPERIMENTAL_NATIVE_CACHE_DIRECT_FILL=1 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MISSES=16 RADIANCE_EXPERIMENTAL_NATIVE_CACHE_PREGROW=1 RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS=1 RADIANCE_EXPERIMENTAL_DS41_CACHE_WARM=1 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_ASYNC_MISSES=2
+[2026-10-29T08:32:18Z] arm all-t40-f-M16-H-p1900-m98304-G-R-B1-W-A2-Rd10-r2: server exited during startup
+[2026-10-29T08:32:18Z] arm all-t40-f-M16-H-p1900-m98304-G-R-B1-W-A2-Sga3: RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=40 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU=/home/as/radiance-ds41-claude/tools/ds41-host-experts/build/window-20261028T203510Z/silu_table_gfx1201.bin RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_POLICY=all RADIANCE_EXPERIMENTAL_NATIVE_CACHE_DIRECT_FILL=1 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MISSES=16 RADIANCE_EXPERIMENTAL_NATIVE_CACHE_PREGROW=1 RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS=1 RADIANCE_EXPERIMENTAL_DS41_CACHE_WARM=1 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_ASYNC_MISSES=2
+[2026-10-29T08:32:26Z] arm all-t40-f-M16-H-p1900-m98304-G-R-B1-W-A2-Sga3: server exited during startup
+arm all-t40-f-M16-H-p1900-m98304-G-R-B1-W-A2-Rd10: no results
+arm all-t40-f-M16-H-p1900-m98304-G-R-B1-W-A2-Sg3: no results
+arm all-t40-f-M16-H-p1900-m98304-G-R-B1-W-A2-s0: no results
+arm all-t40-f-M16-H-p1900-m98304-G-R-B1-W-A2-r2: no results
+arm all-t40-f-M16-H-p1900-m98304-G-R-B1-W-A2-Rd10-r2: no results
+arm all-t40-f-M16-H-p1900-m98304-G-R-B1-W-A2-Sga3: no results
+request     all-t40-f-M16-H-p1900-m98304-G-R-B1-W-A2
+heldout-01         11.40  same
+heldout-02         11.07  same
+heldout-03         12.62  same
+heldout-04          9.78  same
+heldout-05         12.99  same
+heldout-06                   -
+heldout-07                   -
+heldout-08                   -
+decode             11.54 tok/s
+[2026-10-29T08:32:26Z] arms done
+[2026-10-29T08:32:26Z] restoring radiance-flashnext
+radiance-flashnext
+[2026-10-29T08:33:22Z] QFN up after 55s; completion: {"id":"cmpl-34e95b488f5ffb56d2c3d670","object":"text_completion","created":1793262802,"model":"qwen-vllm","system_fingerprint":"radiance-1.12.0","choices":[{"text":" Paris. The capital","index":0,"logprobs":null,"finish_reason":"length"}],"usage":{"prompt_tokens":5,"completion_tokens":4,"total_token
+608764c1d1989c714d8aad7b8a79f8057c3e73473b9f9d55b49d02e82defd2b8 running 2026-10-29T08:32:26.971770524Z sha256:e82764045e46ebae07e33961f17dedba981c0d07336dfcddd67e4b3b042b8600

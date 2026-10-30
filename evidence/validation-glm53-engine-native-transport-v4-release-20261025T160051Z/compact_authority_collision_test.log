@@ -1,4 +1,0 @@
-RAM_ADMISSION MemAvailable=9618878464
-DIFFERENTIAL guarded=663 ignored=14 sizeofWeightInfo=1368
-ALLOCATION W=129 G=5 names=193 nameSourceBytes=1802 tagBytes=36 immutable=18486 scratch=28672 upper=47158 observedRequestedPeak=39174 observedRetained=14598 calls=9
-PASS compact authority mode=forced-hash-collisions groups=6 checks=2938 differential=677 OOMrefusals=9; pure metadata, no Core archive/device/model payload

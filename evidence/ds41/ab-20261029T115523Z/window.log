@@ -1,0 +1,106 @@
+[2026-10-29T11:55:23Z] waiting for 30 s of QFN idleness
+before: 608764c1d1989c714d8aad7b8a79f8057c3e73473b9f9d55b49d02e82defd2b8 running 2026-10-29T11:44:00.073317179Z sha256:e82764045e46ebae07e33961f17dedba981c0d07336dfcddd67e4b3b042b8600
+[2026-10-29T11:55:52Z] stopping radiance-flashnext
+radiance-flashnext
+[2026-10-29T11:56:00Z] arm all-t40-f-M16-H-p256-m98304-G-R-B1-W-A2-Rd13-Er-Es-Pa-x: RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=40 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU=/home/as/radiance-ds41-claude/tools/ds41-host-experts/build/window-20261028T203510Z/silu_table_gfx1201.bin RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_POLICY=all RADIANCE_EXPERIMENTAL_NATIVE_CACHE_DIRECT_FILL=1 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MISSES=16 RADIANCE_EXPERIMENTAL_NATIVE_CACHE_PREGROW=1 RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS=1 RADIANCE_EXPERIMENTAL_DS41_CACHE_WARM=1 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_ASYNC_MISSES=2 RADIANCE_EXPERIMENTAL_DS41_ENGRAM_SPLIT=1 RADIANCE_EXPERIMENTAL_DS41_PREFETCH_ATTN=1 RADIANCE_EXPERIMENTAL_DS41_ACCESS_TRACE=build/ab-20261029T115523Z/trace-all-t40-f-M16-H-p256-m98304-G-R-B1-W-A2-Rd13-Er-Es-Pa-x
+[2026-10-29T11:56:47Z] arm all-t40-f-M16-H-p256-m98304-G-R-B1-W-A2-Rd13-Er-Es-Pa-x: serving after 46s
+chat-01: 6.7 s, decode 14.60 tok/s, prefill 2333 ms
+chat-02: 6.2 s, decode 11.95 tok/s, prefill 904 ms
+chat-03: 3.5 s, decode 12.83 tok/s, prefill 1592 ms
+chat-04: 6.4 s, decode 12.01 tok/s, prefill 1161 ms
+chat-05: 2.6 s, decode 10.90 tok/s, prefill 825 ms
+chat-06: 6.1 s, decode 12.91 tok/s, prefill 1212 ms
+chat-07: 6.3 s, decode 13.40 tok/s, prefill 1570 ms
+chat-08: 7.1 s, decode 10.25 tok/s, prefill 930 ms
+chat-09: 6.9 s, decode 11.40 tok/s, prefill 1323 ms
+chat-10: 6.4 s, decode 11.65 tok/s, prefill 1004 ms
+chat-11: 6.5 s, decode 11.30 tok/s, prefill 951 ms
+chat-12: 6.7 s, decode 12.35 tok/s, prefill 1613 ms
+chat-13: 6.6 s, decode 12.01 tok/s, prefill 1325 ms
+chat-14: 6.5 s, decode 11.99 tok/s, prefill 1227 ms
+chat-15: 5.4 s, decode 14.24 tok/s, prefill 1005 ms
+chat-16: 5.9 s, decode 13.00 tok/s, prefill 1014 ms
+heldout-01-r1: 8.1 s, decode 12.43 tok/s, prefill 3010 ms
+heldout-02-r1: 7.5 s, decode 13.18 tok/s, prefill 2705 ms
+heldout-03-r1: 6.8 s, decode 14.71 tok/s, prefill 2524 ms
+heldout-04-r1: 7.6 s, decode 12.88 tok/s, prefill 2714 ms
+heldout-05-r1: 4.2 s, decode 14.98 tok/s, prefill 1602 ms
+heldout-06-r1: 6.7 s, decode 13.03 tok/s, prefill 1824 ms
+heldout-07-r1: 6.3 s, decode 14.42 tok/s, prefill 1883 ms
+heldout-08-r1: 5.6 s, decode 16.11 tok/s, prefill 1668 ms
+heldout-01-r2: 8.2 s, decode 11.75 tok/s, prefill 2872 ms
+heldout-02-r2: 7.3 s, decode 13.39 tok/s, prefill 2637 ms
+heldout-03-r2: 6.7 s, decode 14.93 tok/s, prefill 2467 ms
+heldout-04-r2: 7.4 s, decode 13.06 tok/s, prefill 2613 ms
+heldout-05-r2: 4.1 s, decode 15.16 tok/s, prefill 1571 ms
+heldout-06-r2: 6.7 s, decode 12.93 tok/s, prefill 1814 ms
+heldout-07-r2: 6.3 s, decode 14.43 tok/s, prefill 1883 ms
+heldout-08-r2: 5.6 s, decode 16.07 tok/s, prefill 1654 ms
+heldout-01-r3: 8.2 s, decode 11.76 tok/s, prefill 2815 ms
+heldout-02-r3: 7.3 s, decode 13.42 tok/s, prefill 2612 ms
+heldout-03-r3: 6.7 s, decode 14.94 tok/s, prefill 2455 ms
+heldout-04-r3: 7.4 s, decode 13.11 tok/s, prefill 2603 ms
+heldout-05-r3: 4.2 s, decode 15.17 tok/s, prefill 1593 ms
+heldout-06-r3: 6.6 s, decode 12.95 tok/s, prefill 1772 ms
+heldout-07-r3: 6.3 s, decode 14.37 tok/s, prefill 1889 ms
+heldout-08-r3: 5.6 s, decode 16.09 tok/s, prefill 1658 ms
+[2026-10-29T12:01:00Z] arm all-t40-f-M16-H-p256-m98304-G-R-B1-W-A2-Rd13-Er-Es-Pa-x: requests exit 0
+  host experts' plane reads: 31316 weights read for the CPU in 71.23 s of issuing-thread time (2.27 ms a batch weight), 31316 relaid into the RAM cache beside it
+I[1] EP scoped file staging: 98680 count rows completed, 17206 local-zero, 0 SSD units submitted, 0 corrupt rows refused
+I[1] host experts: 54215 layers handed 80402 experts (92478 rows) to the CPU; 0 cached experts went over the copy link, 14294 routed experts were not cached; 31932.8 ms waiting at gathers; verify: 0 rows compared, 0 differ; 0 gate_up operand moves; 94696 units probed (the mapped cache's hit and miss counts above include these probes); misses on the CPU: 14294 units, 18038 rows, 67208.8 ms reading their planes
+I[1] host experts: 43049.1 ms waiting at gathers for misses still being read on the worker (not in the gather waits above)
+  host experts' plane reads: 31332 weights read for the CPU in 69.36 s of issuing-thread time (2.21 ms a batch weight), 31332 relaid into the RAM cache beside it
+I[2] EP scoped file staging: 98680 count rows completed, 16383 local-zero, 0 SSD units submitted, 0 corrupt rows refused
+I[2] host experts: 55497 layers handed 82287 experts (96030 rows) to the CPU; 0 cached experts went over the copy link, 14302 routed experts were not cached; 31618.5 ms waiting at gathers; verify: 0 rows compared, 0 differ; 0 gate_up operand moves; 96589 units probed (the mapped cache's hit and miss counts above include these probes); misses on the CPU: 14302 units, 17792 rows, 65258.3 ms reading their planes
+I[2] host experts: 40702.2 ms waiting at gathers for misses still being read on the worker (not in the gather waits above)
+  host experts' plane reads: 31622 weights read for the CPU in 63.95 s of issuing-thread time (2.02 ms a batch weight), 31622 relaid into the RAM cache beside it
+I[3] EP scoped file staging: 98680 count rows completed, 16385 local-zero, 0 SSD units submitted, 0 corrupt rows refused
+I[3] host experts: 54953 layers handed 80161 experts (92948 rows) to the CPU; 0 cached experts went over the copy link, 14447 routed experts were not cached; 27314.6 ms waiting at gathers; verify: 0 rows compared, 0 differ; 0 gate_up operand moves; 94608 units probed (the mapped cache's hit and miss counts above include these probes); misses on the CPU: 14447 units, 17968 rows, 59871.9 ms reading their planes
+I[3] host experts: 35118.3 ms waiting at gathers for misses still being read on the worker (not in the gather waits above)
+request     all-t40-f-M16-H-p256-m98304-G-R-B1-W-A2-Rd13-Er-Es-Pa-x
+chat-01            14.60  same
+chat-02            11.95  same
+chat-03            12.83  same
+chat-04            12.01  same
+chat-05            10.90  same
+chat-06            12.91  same
+chat-07            13.40  same
+chat-08            10.25  same
+chat-09            11.40  same
+chat-10            11.65  same
+chat-11            11.30  same
+chat-12            12.35  same
+chat-13            12.01  same
+chat-14            11.99  same
+chat-15            14.24  same
+chat-16            13.00  same
+heldout-01-r1       12.43  same
+heldout-02-r1       13.18  same
+heldout-03-r1       14.71  same
+heldout-04-r1       12.88  same
+heldout-05-r1       14.98  same
+heldout-06-r1       13.03  same
+heldout-07-r1       14.42  same
+heldout-08-r1       16.11  same
+heldout-01-r2       11.75  same
+heldout-02-r2       13.39  same
+heldout-03-r2       14.93  same
+heldout-04-r2       13.06  same
+heldout-05-r2       15.16  same
+heldout-06-r2       12.93  same
+heldout-07-r2       14.43  same
+heldout-08-r2       16.07  same
+heldout-01-r3       11.76  same
+heldout-02-r3       13.42  same
+heldout-03-r3       14.94  same
+heldout-04-r3       13.11  same
+heldout-05-r3       15.17  same
+heldout-06-r3       12.95  same
+heldout-07-r3       14.37  same
+heldout-08-r3       16.09  same
+decode             13.36 tok/s
+[2026-10-29T12:01:03Z] arms done
+[2026-10-29T12:01:03Z] restoring radiance-flashnext
+radiance-flashnext
+[2026-10-29T12:01:55Z] QFN up after 50s; completion: {"id":"cmpl-603ba01d9a13d8ce568e0746","object":"text_completion","created":1793275313,"model":"qwen-vllm","system_fingerprint":"radiance-1.12.0","choices":[{"text":" Paris. The capital","index":0,"logprobs":null,"finish_reason":"length"}],"usage":{"prompt_tokens":5,"completion_tokens":4,"total_token
+608764c1d1989c714d8aad7b8a79f8057c3e73473b9f9d55b49d02e82defd2b8 running 2026-10-29T12:01:03.434529574Z sha256:e82764045e46ebae07e33961f17dedba981c0d07336dfcddd67e4b3b042b8600

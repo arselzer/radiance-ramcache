@@ -99,11 +99,6 @@ using WeightSourceFn = std::function<int(const std::string& name, const Program&
                                          WeightSource* out)>;
 
 /* ------------------------------------------------------------------ the builder */
-// Shared actual instance pass, also used after closed metadata-only Engine admission.
-int initialize_program_instances(Registry&,Program&,
-    const std::function<void(int,const std::string&)>& report = {},
-    Registry::InitFailureHook early_failure=nullptr,void* failure_context=nullptr);
-
 class Builder : public RadBuilder {
 public:
     /* The Registry must outlive the Builder and its Program (see the file header). */
@@ -120,6 +115,7 @@ public:
     rad_buf     decl_buffer  (const char* name, const RadBufDecl* d);
     rad_kvgroup decl_kv_group(const char* name, const RadKVGroupDecl* d);
     int64_t     kv_block_size(rad_kvgroup g);
+    int64_t     kv_layer_bytes(rad_kvgroup g);
     int         bind_layer_kv(int layer, rad_kvgroup g);
     rad_op      decl_op      (const char* op, const RadParam* p, int n_p,
                               const rad_weight* w, int n_w);
@@ -134,6 +130,7 @@ public:
     int         lora_alias(const char* native, const char* from, const char* to, int64_t from_lo,
                            int64_t from_hi, int64_t to_lo);
     int         drafter_short_block(int64_t block);
+    int         declare_consumer_suffix(const RadConsumerSuffix* d);
     int         declare_encoder(const RadEncoderDecl* d);
     int         declare_generator(const RadGeneratorDecl* d);
     int         declare_audio_generator(const RadAudioGenDecl* d);
@@ -151,6 +148,7 @@ public:
     int weight_shard_span_parts(rad_weight w, const int64_t* lo, const int64_t* hi,
                                 const int64_t* total, int n);
     int kv_group_zero(rad_kvgroup g);
+    int kv_group_dense_read(rad_kvgroup g);
     int kv_group_replicated(rad_kvgroup g);
 
     /* Finalise: weight first/last use, KV group geometry, buffer liveness and packing. Returns
@@ -158,8 +156,6 @@ public:
      * unresolved op returns a null handle and the plugin should offer a fallback (spec §2.3); it
      * becomes an error only if the run phase issues it. */
     int finish();
-    int require_permanent_model_failure();
-    int require_glm_main_tp4_cache_fail_stop();
 
     /* A sizing declare (RadBuildCtx::shape_probe): each op takes the bands `ref` resolved at the
      * same position, and finish() initialises nothing. The plugin sees the real declare's answers
@@ -184,8 +180,6 @@ public:
     const std::vector<rad_buf>& op_read_set (rad_op h) const { return op_bufs_[h].reads; }
     const std::vector<rad_buf>& op_write_set(rad_op h) const { return op_bufs_[h].writes; }
 
-    int decl_expert_route_map(const RadExpertRouteDecl*);
-
     Program&       program()       { return prog_; }
     const Program& program() const { return prog_; }
 
@@ -206,6 +200,7 @@ private:
     /* init() for every surviving instance, after the whole graph has resolved, so a failing init
      * cannot abort declare before the miss report is assembled. */
     void finish_instances();
+    void fill_tune_instances();
     int32_t find_kv_consumer(rad_kvgroup g);
     void finish_layouts();
     void finish_kv_groups();
@@ -247,6 +242,9 @@ private:
     /* Declared weight name -> handle, for the same reason (Flash-Next declares about 100K weights
      * per rank). */
     std::unordered_map<std::string, rad_weight> weight_by_name_;
+
+    /* tune_key() -> index in prog_.tune_requests: one request per kernel instantiation. */
+    std::unordered_map<std::string, size_t> tune_index_;
 
     /* The model's answers, cached per source: a routed model declares each expert's codes and
      * scales as two weights over one source, and a checkpoint lookup walks the name map. */

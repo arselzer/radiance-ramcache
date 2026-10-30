@@ -1,4 +1,3 @@
-#include "../build/glm_main_profile_limits.h"
 /* mover.cpp -- the mover's mechanics; mover.h has the design.
  *
  * Everything here runs on the dispatch thread. Transfers run asynchronously on the mover's
@@ -6,19 +5,75 @@
  * applied by this thread at a layer boundary (see Mover::Move).
  */
 #include "mover.h"
-#include "native_inventory.h"
-#include "runtime/cache_prepare4_session.h"
-#include "build/glm_main_quote.h"
+#include "format/dspark_rad_banks.h"
 #include "../device/device.h"
+#include "ds41_host_experts.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <map>
 #include <queue>
+#include <thread>
 #include <unordered_map>
 
+#include <sys/mman.h>
+
 namespace rad {
+
+/* A buffer for O_DIRECT reads of a unit's planes (Mover::read_unit_planes): 2 MiB-aligned, a whole
+ * number of 2 MiB, and on transparent huge pages where the kernel grants them. A buffer of
+ * scattered 4 KiB pages limits a drive request to its 256 segments (1 MiB); on huge pages one
+ * request spans the drive's 2 MiB max_sectors (measured: an 18.8 MB miss read 3.03 -> 2.83 ms,
+ * 6.2 -> 6.7 GB/s). *cap gets the size; freed with std::free. */
+uint8_t* alloc_plane_buffer(int64_t bytes, int64_t* cap) {
+    /* RADIANCE_EXPERIMENTAL_DS41_PLANE_HUGEPAGES=0: 4 KiB pages, as before (an A/B switch). */
+    static const bool huge = [] {
+        const char* s = std::getenv("RADIANCE_EXPERIMENTAL_DS41_PLANE_HUGEPAGES");
+        return !s || std::strcmp(s, "0") != 0;
+    }();
+    const int64_t a = huge ? (int64_t)2 << 20 : DirectFile::alignment();
+    const int64_t n = (bytes + a - 1) / a * a;
+    void* p = std::aligned_alloc((size_t)a, (size_t)n);
+    if (!p) { *cap = 0; return nullptr; }
+    if (huge) (void)::madvise(p, (size_t)n, MADV_HUGEPAGE);
+    *cap = n;
+    return static_cast<uint8_t*>(p);
+}
+
+namespace {
+
+/* RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE: the two weights of a routed unit, by the mapped cache's
+ * class (0 gate_up [w1; w3], 1 down), as [N, K]; and the raw rounds (32-block rounds with a scale
+ * outside their weight's 2-bit window) each class's slot holds. From a scan of all 15360 routed
+ * experts of the release (tools/ds41-host-experts/README.md, the packed cache): 512 and 320 hold
+ * all but 7 (0.042% of the decode profile's selections; they stay misses, computed from their
+ * planes) for slots x1.0444 smaller than block_mxfp4's. ..._PACKED_CACHE_RAW=<gate_up>,<down> sets
+ * others. */
+constexpr int kPackedShape[2][2] = { { 4608, 5120 }, { 5120, 2304 } };
+constexpr int kPackedRawDefault[2] = { 512, 320 };
+
+int packed_cache_budget(int* raw) {
+    raw[0] = kPackedRawDefault[0];
+    raw[1] = kPackedRawDefault[1];
+    const char* e = std::getenv("RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE_RAW");
+    if (!e || !*e) return RAD_OK;
+    int a = -1, b = -1, used = 0;
+    if (std::sscanf(e, "%d,%d%n", &a, &b, &used) != 2 || e[used] || a < 0 || b < 0 ||
+        !ds41hx::packed_bytes(kPackedShape[0][0], kPackedShape[0][1], a) ||
+        !ds41hx::packed_bytes(kPackedShape[1][0], kPackedShape[1][1], b)) {
+        RAD_ERR("RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE_RAW=%s: <gate_up>,<down>, the raw rounds a slot "
+                "holds (0 .. %d and 0 .. %d)", e, kPackedShape[0][0] * 5, kPackedShape[1][0] * 3);
+        return RAD_E_INVAL;
+    }
+    raw[0] = a;
+    raw[1] = b;
+    return RAD_OK;
+}
+
+}  /* namespace */
 
 /* ------------------------------------------------------------------ the file tier */
 int FileTier::open(const std::string& path) {
@@ -36,15 +91,34 @@ int FileTier::read(uint64_t offset, int64_t bytes, void* dst, int64_t dst_cap) {
     if (!f_.is_open()) return RAD_E_STATE;
     if (!dst || bytes <= 0) return RAD_E_INVAL;
     /* The extent rounded up to the alignment: the unit stride already covers it, and reading
-     * one extra block is cheaper than a branch on the step path. */
+     * one extra block is cheaper than a branch on the step path. The rounding may pass end of
+     * file when the extent is the container's last; only `bytes` must arrive. */
     const int64_t want = direct_align(bytes);
     if (want > dst_cap) {
         RAD_ERR("file tier: a %s read needs a %s aligned buffer, the staging slot is %s",
                 humanb(bytes).c_str(), humanb(want).c_str(), humanb(dst_cap).c_str());
         return RAD_E_SCRATCH;
     }
-    RAD_TRY(f_.read_at(dst, (int64_t)offset, want));
+    RAD_TRY(f_.read_covering(dst, (int64_t)offset, want, bytes));
     return RAD_OK;
+}
+
+int FileTier::remember_epoch() {
+    epoch_ready_ = false;
+    if (!f_.is_open() || ::fstat(f_.fd(), &epoch_) || !S_ISREG(epoch_.st_mode))
+        return RAD_E_IO;
+    epoch_ready_ = true;
+    return RAD_OK;
+}
+
+bool FileTier::same_epoch() const {
+    struct stat current{};
+    return epoch_ready_ && f_.is_open() && !::fstat(f_.fd(), &current) &&
+        current.st_dev == epoch_.st_dev && current.st_ino == epoch_.st_ino &&
+        current.st_size == epoch_.st_size && current.st_mtim.tv_sec == epoch_.st_mtim.tv_sec &&
+        current.st_mtim.tv_nsec == epoch_.st_mtim.tv_nsec &&
+        current.st_ctim.tv_sec == epoch_.st_ctim.tv_sec &&
+        current.st_ctim.tv_nsec == epoch_.st_ctim.tv_nsec;
 }
 
 /* ------------------------------------------------------------------ residency */
@@ -69,142 +143,21 @@ void Residency::begin_transfer(rad_weight w, void* ptr, RadEvent ready) {
 }
 
 /* ------------------------------------------------------------------ the mover */
-int Mover::tiny_startup_quote(const Program& p,const Plan& plan,const MoverConfig& cfg,
-                              TinyStorageQuote* out) noexcept {
-    if(!out)return RAD_E_INVAL;
-    if(tiny_quote::program_profile(p)<0||!cfg.tiny_budget||!plan.native_inventory||
-       plan.strategy!=Strategy::NativeBacked||plan.dynamic||!cfg.container_path.empty()||
-       cfg.max_lead_dispatches!=2||plan.units.empty()||plan.units.size()>512||
-       plan.classes.size()>512||plan.file_stage_vram||plan.file_windows||
-       plan.native_inventory->validate(p,plan)<0)return RAD_E_UNSUPPORTED;
-    const auto& inventory=*plan.native_inventory;
-    const auto& f=inventory.footprint();
-    if(!f.regions||f.regions>512||f.consumer_slots>512||inventory.owned().size()>128)
-        return RAD_E_UNSUPPORTED;
-    TinyStorageQuote s;s.embedded_object_bytes=sizeof(Mover);s.stream_count=1;
-    const uint64_t units=plan.units.size(),classes=plan.classes.size(),weights=p.weights.size();
-    uint64_t slab_slots=0;
-    for(size_t c=0;c<plan.classes.size();++c){
-        const auto& sc=plan.classes[c];
-        if(sc.n_shadow||sc.n_stage)return RAD_E_UNSUPPORTED;
-        uint64_t live=0;
-        for(const auto& u:plan.units){
-            if(u.slab_class < -1||u.slab_class>=int32_t(classes)||u.layer < -1||u.layer>=p.meta.n_layers||
-               (u.tier!=Tier::VRAM&&u.tier!=Tier::NativeStore))return RAD_E_UNSUPPORTED;
-            if(u.tier==Tier::VRAM&&u.slab_class==int32_t(c)&&u.slab_slot>=0){
-                if(uint64_t(u.slab_slot)>=units)return RAD_E_SHAPE;
-                live=std::max(live,uint64_t(u.slab_slot)+1);
-            }
-        }
-        if(!tiny_quote::add(slab_slots,live))return RAD_E_SHAPE;
-    }
-    // Init vectors, including its simultaneous temporary n_slab/n_pool arrays.
-    // There are no native-profile pageable/pinned/static expert duplicates,
-    // loans, stage picks, file windows or dynamic swap workspaces here.
-    if(!tiny_quote::heap(s,units,sizeof(UnitState)+sizeof(uint16_t))||
-       !tiny_quote::heap(s,classes,sizeof(ClassPools)+sizeof(DonorRank)+sizeof(std::vector<int32_t>)+2*sizeof(int64_t))||
-       !tiny_quote::heap(s,classes,2*SlotPool::tiny_segment_bytes())||
-       !tiny_quote::heap(s,slab_slots,sizeof(uint8_t))||
-       !tiny_quote::heap(s,4,sizeof(Move))||!tiny_quote::heap(s,3,sizeof(RadEvent))||
-       !tiny_quote::heap(s,weights,sizeof(WeightSlot)+sizeof(uint8_t)+sizeof(rad_weight)))return RAD_E_SHAPE;
-    // Native bootstrap's actual bounded arrays and the first session's staging
-    // copy. Reserve-before-publication belongs to Mover, not NativeOwner's quote.
-    if(!tiny_quote::heap(s,f.regions,2*sizeof(RecordRegion)+4*sizeof(char*)+sizeof(int32_t)+sizeof(uint8_t))||
-       !tiny_quote::heap(s,inventory.owned().size(),4*sizeof(rad_weight)+sizeof(RecordClaim))||
-       !tiny_quote::heap(s,f.consumer_slots,sizeof(RecordPublication)))return RAD_E_SHAPE;
-    s.event_count=1+3+4+f.consumer_slots; // gate, lead, four Move events, non-sentinel ready events
-    s.heap_growth_allowance=s.heap_payload_bytes;
-    s.control_allowance=4096+s.event_count*128;
-    if(!tiny_quote::finish(s))return RAD_E_SCRATCH;
-    *out=s;return RAD_OK;
-}
-
-int Mover::glm_main_startup_quote(const Program& p,const Plan& plan,
-                              TinyStorageQuote* out) noexcept {
-    if(!out)return RAD_E_INVAL;
-    if(glm_main_tp4_cache_program_profile(p)<0||!glm_main_rows_supported(p.ctx.max_tok)||!plan.native_inventory||
-       plan.strategy!=Strategy::NativeBacked||plan.dynamic||plan.units.empty()||plan.units.size()>65536||
-       plan.classes.size()>65536||plan.file_stage_vram||plan.file_windows||
-       plan.native_inventory->validate(p,plan)<0)return RAD_E_UNSUPPORTED;
-    const auto& inventory=*plan.native_inventory;
-    const auto& f=inventory.footprint();
-    if(!f.regions||f.regions>512||f.consumer_slots>512||inventory.owned().size()!=12096)
-        return RAD_E_UNSUPPORTED;
-    TinyStorageQuote s;s.embedded_object_bytes=sizeof(Mover);s.stream_count=1;
-    const uint64_t units=plan.units.size(),classes=plan.classes.size(),weights=p.weights.size();
-    uint64_t slab_slots=0;
-    for(size_t c=0;c<plan.classes.size();++c){
-        const auto& sc=plan.classes[c];
-        if(sc.n_shadow||sc.n_stage)return RAD_E_UNSUPPORTED;
-        uint64_t live=0;
-        for(const auto& u:plan.units){
-            if(u.slab_class < -1||u.slab_class>=int32_t(classes)||u.layer < -1||u.layer>=p.meta.n_layers||
-               (u.tier!=Tier::VRAM&&u.tier!=Tier::NativeStore))return RAD_E_UNSUPPORTED;
-            if(u.tier==Tier::VRAM&&u.slab_class==int32_t(c)&&u.slab_slot>=0){
-                if(uint64_t(u.slab_slot)>=units)return RAD_E_SHAPE;
-                live=std::max(live,uint64_t(u.slab_slot)+1);
-            }
-        }
-        if(!tiny_quote::add(slab_slots,live))return RAD_E_SHAPE;
-    }
-    // Init vectors, including its simultaneous temporary n_slab/n_pool arrays.
-    // There are no native-profile pageable/pinned/static expert duplicates,
-    // loans, stage picks, file windows or dynamic swap workspaces here.
-    if(!tiny_quote::heap(s,units,sizeof(UnitState)+sizeof(uint16_t))||
-       !tiny_quote::heap(s,classes,sizeof(ClassPools)+sizeof(DonorRank)+sizeof(std::vector<int32_t>)+2*sizeof(int64_t))||
-       !tiny_quote::heap(s,classes,2*SlotPool::tiny_segment_bytes())||
-       !tiny_quote::heap(s,slab_slots,sizeof(uint8_t))||
-       !tiny_quote::heap(s,4,sizeof(Move))||!tiny_quote::heap(s,3,sizeof(RadEvent))||
-       !tiny_quote::heap(s,weights,sizeof(WeightSlot)+sizeof(uint8_t)+sizeof(rad_weight)))return RAD_E_SHAPE;
-    // Native bootstrap's actual bounded arrays and the first session's staging
-    // copy. Reserve-before-publication belongs to Mover, not NativeOwner's quote.
-    if(!tiny_quote::heap(s,f.regions,2*sizeof(RecordRegion)+4*sizeof(char*)+sizeof(int32_t)+sizeof(uint8_t))||
-       !tiny_quote::heap(s,inventory.owned().size(),4*sizeof(rad_weight)+sizeof(RecordClaim))||
-       !tiny_quote::heap(s,f.consumer_slots,sizeof(RecordPublication)))return RAD_E_SHAPE;
-    s.event_count=1+3+4+f.consumer_slots; // gate, lead, four Move events, non-sentinel ready events
-    s.heap_growth_allowance=s.heap_payload_bytes;
-    s.control_allowance=4096+s.event_count*128;
-    if(!glm_main_quote_finish(s))return RAD_E_SCRATCH;
-    *out=s;return RAD_OK;
-}
-
-void Mover::tiny_retire_or_fail() noexcept {
-    if(!cfg_.tiny_budget)return;
-    try {
-        // A copy API can enqueue and then return a negative status. Always retire
-        // both actual streams before any retained landing/event/storage release.
-        if(mover_)(void)flush_moves();
-        if(compute_)tiny_drain_or_fail(compute_,0);
-        if(mover_)tiny_drain_or_fail(mover_,0);
-    } catch(...) { tiny_unretired_fail_stop(); }
-}
-
-void Mover::glm_main_retire_or_fail() noexcept {
-    auto* binding=cfg_.glm_main_binding;if(!binding)return;
-    try{
-        if(rad_dev_set(cfg_.glm_main_device)<0)binding->fail_stop(RAD_E_DEVICE);
-        // No diagnostics/unwind before either actual stream has retired.
-        if(compute_){const int st=rad_stream_sync(compute_);if(st<0)binding->fail_stop(st);}
-        if(mover_){const int st=rad_stream_sync(mover_);if(st<0)binding->fail_stop(st);}
-    }catch(...){binding->fail_stop(RAD_E_STATE);}
-}
 Mover::~Mover() {
+    /* No CPU reader may retain RelayIn/window/cache references through teardown. */
+    relay_workers_.reset();
+    //No error path may destroy a mapped owner while an uncertain queued copy can read it.
+    if (mapped_file_drain() != RAD_OK) {
+        RAD_ERR("mapped file cache: transfer completion unknown at teardown; retaining process owners");
+        std::_Exit(88);
+    }
     /* Drain the stream first: its queued gate waits, event records and copies refer to the
      * events and memory freed below. */
-    if(cfg_.glm_main_binding){
-        glm_main_retire_or_fail();
-        if(mover_)rad_stream_destroy(mover_);
-        mover_=nullptr;
-    } else if(cfg_.tiny_budget){
-        tiny_retire_or_fail();
-        tiny_stream_.close(); // sole owner; never raw-destroy this borrowed handle
-        mover_=nullptr;
-    } else if (mover_) {
+    if (mover_) {
         (void)flush_moves();
         rad_stream_sync(mover_);
         rad_stream_destroy(mover_);
     }
-    for (const auto& r : native_regions_) if (r.ready) rad_event_destroy(r.ready);
     for (Move& m : moves_) if (m.ev) rad_event_destroy(m.ev);
     for (RadEvent e : lead_) if (e) rad_event_destroy(e);
     for (RadEvent e : win_ev_) if (e) rad_event_destroy(e);
@@ -238,31 +191,62 @@ void* Mover::reserve(const char* what, int64_t bytes, int kind) {
     return rad_dev_alloc(bytes, kind);
 }
 
+bool Mover::source_file_epoch() const {
+    if(!cfg_.source_banks)return file_.same_epoch();
+    return cfg_.source_banks->same_epoch()&&(!file_.ok()||file_.same_epoch())&&
+        (!draft_file_.ok()||draft_file_.same_epoch());
+}
+int Mover::read_source_file(uint32_t bank,uint64_t offset,int64_t bytes,void*dst,int64_t cap) {
+    if(bank>1||(bank&&!cfg_.source_banks))return RAD_E_STATE;
+    if(cfg_.source_banks&&!source_file_epoch())return RAD_E_STATE;
+    const int st=(bank?draft_file_:file_).read(offset,bytes,dst,cap);if(st<0)return st;
+    return cfg_.source_banks&&!source_file_epoch()?RAD_E_STATE:RAD_OK;
+}
 int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, Pools* budget) {
-    if(tiny_stream_.get()||cfg_.tiny_budget||cfg_.glm_main_binding)return RAD_E_STATE;
-    if(cfg.glm_main_binding){
-        if(cfg.tiny_budget||!cfg.glm_main_binding->runtime_admitted()||cfg.glm_main_device<0||
-           cfg.glm_main_binding->rank()!=prog.ctx.rank||!plan.native_inventory||
-           plan.native_inventory->limits().backend_profile!=NativeBackendProfile::GlmMainTp4AqlFailStopV1||
-           plan.native_inventory->source_generation()!=cfg.glm_main_binding->source_generation())return RAD_E_UNSUPPORTED;
-    }else if(plan.native_inventory&&plan.native_inventory->limits().backend_profile==NativeBackendProfile::GlmMainTp4AqlFailStopV1)return RAD_E_UNSUPPORTED;
-    if(cfg.tiny_budget){
-        TinyStorageQuote checked;
-        const int status=tiny_startup_quote(prog,plan,cfg,&checked);
-        if(status<0)return status;
-        if(!cfg.tiny_budget->admitted()||!budget)return RAD_E_UNSUPPORTED;
+    if (cfg.native_file_cache_bytes < 0) return RAD_E_INVAL;
+    if(cfg.source_banks){
+        if(!cfg.source_banks->dual()||!cfg.source_banks->same_epoch())return RAD_E_STATE;
+        for(size_t i=1;i<prog.weights.size();++i){const auto&w=prog.weights[i];
+            if(w.decl.optional&&w.source_entry_index<0)continue;
+            DsparkRadBanks::Entry owner;RAD_TRY(cfg.source_banks->bound(w,&owner));}
+    }else for(const auto&w:prog.weights)if(w.file_id||w.source_bank_generation)return RAD_E_STATE;
+    const bool want_native_file_workers = native_read_workers_opt_in(
+        std::getenv("RADIANCE_EXPERIMENTAL_NATIVE_FILE_WORKERS"));
+    const char* mapped_env = std::getenv("RADIANCE_EXPERIMENTAL_NATIVE_CACHE_MAPPED_SOURCE");
+    const bool want_mapped = mapped_env && std::strcmp(mapped_env,"1") == 0;
+    const char* fill_env=std::getenv("RADIANCE_EXPERIMENTAL_NATIVE_CACHE_DIRECT_FILL");
+    const bool want_direct_fill=fill_env&&std::strcmp(fill_env,"1")==0;
+    const char* slabs_env=std::getenv("RADIANCE_EXPERIMENTAL_NATIVE_CACHE_MAPPED_SLABS");
+    if(want_direct_fill&&(!want_mapped||cfg.native_file_cache_bytes<=0||!slabs_env||std::strcmp(slabs_env,"1")||
+        !std::any_of(plan.units.begin(),plan.units.end(),[](const MoveUnit& mu){return mu.tier==Tier::SSD;}))){
+        RAD_ERR("mapped direct fill requires mapped COPY-source cache and retained slabs");return RAD_E_UNSUPPORTED;
     }
-    if (!plan.native_inventory &&
-        std::any_of(plan.units.begin(),plan.units.end(),[](const auto& u){return u.tier==Tier::NativeStore;}))
-        return RAD_E_INVAL;
-    if (plan.native_inventory) {
-        if (!budget || budget->native_inventory()!=plan.native_inventory.get() ||
-            plan.strategy!=Strategy::NativeBacked || plan.dynamic ||
-            plan.native_inventory->validate(prog,plan)<0 || !cfg.container_path.empty()) return RAD_E_INVAL;
+    const char* packed_env=std::getenv("RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE");
+    const bool want_packed=packed_env&&std::strcmp(packed_env,"1")==0;
+    int packed_raw[2]={0,0};
+    if(want_packed){
+        if(!want_mapped||cfg.native_file_cache_bytes<=0||!slabs_env||std::strcmp(slabs_env,"1")||
+           !std::any_of(plan.units.begin(),plan.units.end(),[](const MoveUnit& mu){return mu.tier==Tier::SSD;})){
+            RAD_ERR("RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE=1 needs the mapped RAM cache in retained slabs "
+                    "(RADIANCE_EXPERIMENTAL_NATIVE_CACHE_MAPPED_SOURCE=1, ..._MAPPED_SLABS=1, a RAM cache and a file tier)");
+            return RAD_E_UNSUPPORTED;
+        }
+        RAD_TRY(packed_cache_budget(packed_raw));
     }
+    /* Retire all callbacks before cache/RelayIn/window/namespace lifetimes change. */
+    relay_workers_.reset();
+    RAD_TRY(mapped_file_drain());
+    RAD_TRY(mapped_file_cache_.clear());
+    mapped_file_cache_on_ = false;
+    mapped_direct_fill_on_ = want_direct_fill;
+    native_file_cache_on_ = false;
+    RAD_TRY(native_file_cache_.clear());
+    /* A refused cache clear must retain the previous namespace and worker policy. */
+    native_file_workers_on_ = want_native_file_workers;
     prog_ = &prog;
     plan_ = &plan;
     cfg_ = cfg;
+    draft_file_.close(); //old copies/cache users are proven retired before owner replacement
     budget_ = budget;
     stats_ = MoverStats{};
     if (!budget_)
@@ -287,14 +271,17 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
         us.site = mu.site;
         us.klass = mu.slab_class;
         us.bytes = mu.bytes;
-        if (mu.tier == Tier::NativeStore) continue;
         if (mu.slab_class < 0) continue;
         if (mu.tier == Tier::VRAM && mu.slab_slot >= 0) {
             n_slab[(size_t)mu.slab_class] = std::max(n_slab[(size_t)mu.slab_class],
                                                      (int64_t)mu.slab_slot + 1);
         } else if (mu.tier == Tier::VRAM) {
+            /* RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED: a static resident with packed weights takes what the
+             * card holds of it (MoveUnit::vram_bytes), as the planner charged it. It never moves: only a
+             * static plan packs. */
+            if (mu.vram_bytes > 0) us.bytes = mu.vram_bytes;
             us.static_off = align_up(static_need, RAD_ALIGN_UNIT);
-            static_need = us.static_off + mu.bytes;
+            static_need = us.static_off + us.bytes;
         } else if (mu.tier == Tier::HostPinned) {
             us.pool_slot = n_pool[(size_t)mu.slab_class]++;
             pool_layer_[(size_t)mu.slab_class].push_back(mu.layer);
@@ -408,6 +395,86 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
             return RAD_E_INVAL;
         }
         RAD_TRY(file_.open(cfg_.container_path));
+        if(cfg_.source_banks){
+            RAD_TRY(cfg_.source_banks->direct_owner_matches(0,file_.borrowed_fd_for_owner_identity()));
+            bool want_draft=false;
+            for(const auto&mu:plan.units)if(mu.tier==Tier::SSD)for(const auto h:mu.weights)
+                if(prog.weights[h].file_id==1)want_draft=true;
+            if(want_draft){RAD_TRY(draft_file_.open(cfg_.source_banks->file(1)->path()));
+                RAD_TRY(cfg_.source_banks->direct_owner_matches(1,draft_file_.borrowed_fd_for_owner_identity()));
+                RAD_TRY(draft_file_.remember_epoch());}
+        }
+        if(cfg_.native_file_cache_bytes>0||cfg_.source_banks)RAD_TRY(file_.remember_epoch());
+        if (cfg_.native_file_cache_bytes > 0) {
+            if (want_mapped) {
+                /* The packed cache's slots: each weight's packed form with room for its raw rounds. */
+                NativeMappedFileCache::SlabCache::Sizes slots = NativeMappedFileCache::SlabCache::block_sizes;
+                for (int c = 0; want_packed && c < 2; ++c) {
+                    packed_raw_[c] = packed_raw[c];
+                    slots[(size_t)c] = ds41hx::packed_bytes(kPackedShape[c][0], kPackedShape[c][1], packed_raw[c]);
+                }
+                RAD_TRY(mapped_file_cache_.configure(size_t(cfg_.native_file_cache_bytes),
+                                                     prog.weights.size(),sizeof(mapped_windows_) +
+                                                         sizeof(mapped_copy_hooks_) + 128,cfg_.native_cache_allocation_device,
+                                                     want_packed ? NativeMappedFileCache::Layout::Packed
+                                                                 : NativeMappedFileCache::Layout::Block, slots)); //fixed flags/stats/alignment reserve
+                mapped_file_cache_on_ = true;
+                if (want_packed) {
+                    packed_refused_.reset(new std::atomic<uint8_t>[plan.units.size()]());
+                    RAD_INFO("native mapped cache: packed for the CPU only (RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE): "
+                             "gate_up slots of %s with room for %d raw rounds, down %s with %d (block_mxfp4: %s, %s); "
+                             "the card's copy path neither reads nor fills it",
+                             humanb((int64_t)slots[0]).c_str(), packed_raw[0], humanb((int64_t)slots[1]).c_str(),
+                             packed_raw[1], humanb((int64_t)NativeMappedFileCache::GU).c_str(),
+                             humanb((int64_t)NativeMappedFileCache::DN).c_str());
+                }
+                if(mapped_direct_fill_on_)RAD_INFO("native mapped direct fill: whole-weight unpublished reservation, parallel CPU fill, atomic first lease; unchanged H2D event retirement");
+                if (const char* pg = std::getenv("RADIANCE_EXPERIMENTAL_NATIVE_CACHE_PREGROW");
+                    pg && !std::strcmp(pg, "1")) {
+                    const auto t0 = std::chrono::steady_clock::now();
+                    size_t slabs = 0;
+                    RAD_TRY(mapped_file_cache_.pregrow(&slabs));
+                    RAD_INFO("native mapped cache: %zu slabs pinned at startup in %.2f s, so no "
+                             "request pays for growing them", slabs,
+                             std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+                }
+                RAD_INFO("native mapped COPY-source cache: %s policy cap/rank; conservative no-SVM "
+                         "retained backing + metadata (not physical RSS); legacy cache disabled",
+                         humanb(cfg_.native_file_cache_bytes).c_str());
+            } else {
+                RAD_TRY(native_file_cache_.configure(cfg_.native_file_cache_bytes, prog.weights.size()));
+                native_file_cache_on_ = true;
+                RAD_INFO("native file RAM cache: %s for this rank, including %s of entry metadata",
+                         humanb(cfg_.native_file_cache_bytes).c_str(),
+                         humanb(native_file_cache_.stats().metadata_bytes).c_str());
+            }
+        }
+        /* A weight the file tier relays on each read needs the relayout (set_file_relayout). */
+        int64_t relaid = 0;
+        for (const MoveUnit& mu : plan.units) {
+            if (mu.tier != Tier::SSD) continue;
+            for (rad_weight w : mu.weights) {
+                const WeightInfo& wi = prog.weights[w];
+                if (wi.widen) {
+                    RAD_ERR("mover: '%s' is on the file tier and widened at load, which a file "
+                            "read does not do", wi.name.c_str());
+                    return RAD_E_STATE;
+                }
+                if (!wi.identity) ++relaid;
+            }
+        }
+        if (relaid && !relayout_) {
+            RAD_ERR("mover: the plan puts %lld weight(s) whose stored form is a relayout on the "
+                    "file tier, and the mover was given no relayout to make it on a read",
+                    (long long)relaid);
+            return RAD_E_STATE;
+        }
+        if (relaid) {
+            const unsigned hw = std::thread::hardware_concurrency();
+            relay_threads_ = (int)std::max(1u, std::min(8u, hw / 2));
+            relay_in_.clear();
+            relay_in_.resize((size_t)relay_threads_);
+        }
         /* Staging slots are sized by the widest unit actually on the file tier, not the widest
          * class. The widest class is usually the embedding table (gigabytes, and never on the
          * file tier), and sizing on it would reserve pinned memory for a weight that never
@@ -470,12 +537,7 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
     }
 
     /* ---- streams, events, move records ------------------------------------------------------ */
-    if(cfg_.tiny_budget){
-        RAD_TRY(tiny_stream_.open(*cfg_.tiny_budget,0));
-        mover_=tiny_stream_.get();
-    } else {
-        RAD_TRY(rad_stream_create(&mover_, /*high_priority=*/0));
-    }
+    RAD_TRY(rad_stream_create(&mover_, /*high_priority=*/0));
     /* Every event here is local: they order the mover's queue against this card's compute queue
      * and tell the host when a slot is free, and the host never reads the ordered bytes through
      * them. A copy out to host memory carries system scope on its own packets. */
@@ -497,10 +559,7 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
     for (Move& m : moves_) RAD_TRY(rad_event_create_local(&m.ev));
 
     /* ---- publish the initial addresses ------------------------------------------------------ */
-    RAD_TRY(native_record_init());
     res_.init(prog);
-    res_.set_native_inventory(plan.native_inventory.get());
-    if (plan.native_inventory) RAD_TRY(res_.reserve_record_changes());
     for (int32_t u = 0; u < (int32_t)plan.units.size(); ++u) {
         unit_[(size_t)u].slab_slot = plan.units[(size_t)u].slab_slot;
         republish(u);
@@ -519,7 +578,6 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
 }
 
 int Mover::bind_compute_stream(RadStream s) {
-    if (record_session_.token || (plan_ && plan_->native_inventory && compute_)) return RAD_E_UNSUPPORTED;
     if (!s) return RAD_E_INVAL;
     compute_ = s;
     return RAD_OK;
@@ -545,9 +603,14 @@ void* Mover::unit_base(int32_t unit) const {
 
 void Mover::republish(int32_t unit) {
     const MoveUnit& mu = plan_->units[(size_t)unit];
-    char* base = mu.tier==Tier::NativeStore ? (char*)native_sentinel(unit) : (char*)unit_base(unit);
+    char* base = (char*)unit_base(unit);
+    /* A static resident with packed weights is laid out as the card holds it (vram_packed.h). */
+    const UnitState& us = unit_[(size_t)unit];
+    const bool packed = mu.vram_bytes > 0 && us.tier == Tier::VRAM && us.slab_slot < 0 &&
+                        mu.vram_offset.size() == mu.weights.size();
+    const std::vector<int64_t>& off = packed ? mu.vram_offset : mu.offset;
     for (size_t i = 0; i < mu.weights.size(); ++i)
-        res_.publish(mu.weights[i], base ? base + mu.offset[i] : nullptr);
+        res_.publish(mu.weights[i], base ? base + off[i] : nullptr);
 }
 
 /* Whether a copy into this unit's slot is still in flight. A slot whose staging copy has not
@@ -589,7 +652,6 @@ int Mover::record_gate() {
 }
 
 int Mover::begin_dispatch(int dispatch, HeatEngine* heat) {
-    if (record_session_.token || (plan_ && plan_->native_inventory)) return RAD_E_UNSUPPORTED;
     dispatch_ = dispatch;
     ++stats_.dispatches;
     RAD_TRY(retire(heat));
@@ -614,7 +676,6 @@ int Mover::begin_dispatch(int dispatch, HeatEngine* heat) {
  * first would turn the prefetch into a cache.
  */
 int Mover::prefetch_to_op(int32_t op_index) {
-    if (record_session_.token || (plan_ && plan_->native_inventory)) return RAD_E_UNSUPPORTED;
     if (!plan_) return RAD_E_STATE;
 
     /* A backwards op index means the next step started; the schedule is per step, so the cursor
@@ -679,7 +740,18 @@ int Mover::start_stage(int32_t unit, int64_t slab_slot) {
         const MoveUnit& mu = plan_->units[(size_t)unit];
         for (size_t k = 0; k < mu.weights.size(); ++k) {
             const WeightInfo& w = prog_->weights[mu.weights[k]];
-            RAD_TRY(file_.read(w.file_offset, w.stored_bytes, stage + mu.offset[k],
+            if (!w.identity || ((native_file_cache_on_ || (mapped_file_cache_on_ && mapped_file_eligible(w))) && w.stored_bytes <= RAD_PLACE_FILE_WINDOW_BYTES)) {
+                if (relay_in_.empty()) relay_in_.resize(1);
+                bool cached = false;
+                RAD_TRY(read_native_file(w, stage + mu.offset[k], stage_stride_ - mu.offset[k],
+                                        &relay_in_[0], &cached));
+                if (!w.identity && !cached) {
+                    ++stats_.file_relaid;
+                    stats_.file_relaid_bytes += (uint64_t)w.stored_bytes;
+                }
+                continue;
+            }
+            RAD_TRY(read_source_file(w.file_id,w.file_offset, w.stored_bytes, stage + mu.offset[k],
                                stage_stride_ - mu.offset[k]));
         }
         ++stats_.ssd_reads;
@@ -719,14 +791,12 @@ int Mover::start_stage(int32_t unit, int64_t slab_slot) {
 /* ---- staging within a pass (see mover.h) ---------------------------------------------------- */
 int Mover::stage_units(const std::vector<int32_t>& units, char* dst, int64_t cap, RadEvent after,
                        RadEvent done, std::vector<int32_t>* staged) {
-    if (record_session_.token || (plan_ && plan_->native_inventory)) return RAD_E_UNSUPPORTED;
     const StageSpan one{dst, cap};
     return stage_units(units, &one, 1, after, done, staged);
 }
 
 int Mover::stage_units(const std::vector<int32_t>& units, const StageSpan* spans, int n_spans,
                        RadEvent after, RadEvent done, std::vector<int32_t>* staged) {
-    if (record_session_.token || (plan_ && plan_->native_inventory)) return RAD_E_UNSUPPORTED;
     if (!plan_ || !spans || n_spans < 1 || n_spans > 2 || !staged || !done) return RAD_E_INVAL;
     for (int k = 0; k < n_spans; ++k)
         if (!spans[k].dst) return RAD_E_INVAL;
@@ -792,8 +862,702 @@ int Mover::stage_units(const std::vector<int32_t>& units, const StageSpan* spans
 }
 
 void Mover::unstage_units(const std::vector<int32_t>& staged) {
-    if (record_session_.token || (plan_ && plan_->native_inventory)) return;
     for (int32_t u : staged) republish(u);
+}
+
+void Mover::alias_file_units(const std::vector<int32_t>& units, char* base,
+                             std::vector<int32_t>* staged) {
+    if (!plan_ || !base || !staged) return;
+    for (int32_t u : units) {
+        if (u < 0 || (size_t)u >= unit_.size()) continue;
+        const UnitState& us = unit_[(size_t)u];
+        if (us.tier != Tier::SSD || us.slab_slot >= 0 || us.klass < 0) continue;
+        const MoveUnit& mu = plan_->units[(size_t)u];
+        for (rad_weight w : mu.weights) res_.publish(w, base);
+        staged->push_back(u);
+        ++stats_.file_aliased;
+    }
+}
+
+bool Mover::borrow_host_unit(int32_t u, HostUnit* out) {
+    if (!out || out->n != 0 || !plan_ || !prog_ || !mapped_file_cache_on_ || u < 0 ||
+        (size_t)u >= unit_.size())
+        return false;
+    const UnitState& us = unit_[(size_t)u];
+    if (us.tier != Tier::SSD || us.slab_slot >= 0 || us.klass < 0) return false;
+    const MoveUnit& mu = plan_->units[(size_t)u];
+    if (mu.weights.empty() || mu.weights.size() > 2 || !source_file_epoch()) return false;
+    /* The packed cache's slots are borrowed by class, and their leases must say packed; a block
+     * cache's must not. */
+    const bool packed = mapped_file_cache_.packed();
+    const auto slots = mapped_file_cache_.slot_bytes();
+    for (rad_weight h : mu.weights) {
+        const WeightInfo& w = prog_->weights[h];
+        NativeMappedFileCache::Lease& l = out->lease[out->n];
+        const size_t key = (size_t)(&w - prog_->weights.data());
+        const int c = w.stored_bytes == (int64_t)NativeMappedFileCache::GU ? 0
+                    : w.stored_bytes == (int64_t)NativeMappedFileCache::DN ? 1 : -1;
+        const size_t want = !packed ? (size_t)w.stored_bytes : c < 0 ? 0 : slots[(size_t)c];
+        auto take = [&] {
+            return !packed ? mapped_file_cache_.borrow(key, (size_t)w.stored_bytes, &l)
+                           : mapped_file_cache_.borrow_packed(key, c, &l);
+        };
+        if (w.stored_bytes <= 0 || !mapped_file_eligible(w) ||
+            take() != NativeMappedFileCache::Status::Hit ||
+            !l.active() || !l.host() || l.bytes() != want || l.packed() != packed) {
+            (void)l.release();
+            release_host_unit(out);
+            return false;
+        }
+        out->host[out->n] = l.host();
+        out->bytes[out->n] = w.stored_bytes;
+        out->slot[out->n] = (int64_t)l.bytes();
+        ++out->n;
+    }
+    out->unit = u;
+    out->packed = packed;
+    return true;
+}
+
+namespace {
+
+int64_t steady_ns() {
+    return (int64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+/* Miss reads on the kept readers (plane_workers_), unless RADIANCE_EXPERIMENTAL_DS41_READ_POOL=0:
+ * threads started a call, as before. */
+bool plane_read_pool() {
+    static const bool pooled = [] {
+        const char* s = std::getenv("RADIANCE_EXPERIMENTAL_DS41_READ_POOL");
+        return !s || std::strcmp(s, "0") != 0;
+    }();
+    return pooled;
+}
+
+/* RADIANCE_EXPERIMENTAL_DS41_MIRROR_SPLIT=N (2 to 4; designed for 3, one a drive of the SATA
+ * stripe): a pass of fewer than the mirror's min_rows tokens (decode) that misses one unit reads
+ * the mirror's tail of its gate_up in N pieces (PlaneMirror::split), each on its own reader, beside
+ * the container's three reads. The tail leg is one pread into a bounce buffer and then a copy out
+ * of it, 2.4 MB at decode share 0.13, and a lone miss waits for its slowest leg: in pieces the
+ * preads overlap and so do the copies. Measured on the drives (research mrp/landbench2, warm
+ * bounces, medians of 4 rounds a rank): the call 2629 -> 2400 us, the mirror leg 2246 -> 2150 us,
+ * its copy 216 -> 101 us. The same bytes land in the same places; a piece that fails is read from
+ * the container like a whole tail (its start is on the container's 4 KiB grid). 0 or 1: one read. */
+int mirror_split() {
+    static const int n = [] {
+        const char* s = std::getenv("RADIANCE_EXPERIMENTAL_DS41_MIRROR_SPLIT");
+        return s && *s ? std::clamp(std::atoi(s), 1, 4) : 1;
+    }();
+    return n;
+}
+
+}  /* namespace */
+
+/* A reader: takes the next read until none is left, and notes when it began and landed. */
+void Mover::PlaneCall::operator()(int) {
+    for (size_t j; (j = next.fetch_add(1)) < reads.size();) {
+        Read& r = reads[j];
+        r.start_ns = steady_ns() - t0;
+        uint64_t copy = 0;
+        r.rc = r.m ? mirror->read(*r.m, r.from, (uint64_t)r.len, r.dst, &copy)
+                   : mover->read_source_file(r.file, (uint64_t)r.off, r.len, r.dst, r.cap);
+        r.copy_ns = (int64_t)copy;
+        r.end_ns = steady_ns() - t0;
+    }
+}
+
+int Mover::plane_spans(int64_t len, int64_t in, int64_t end, int64_t tail, PlaneSpan out[3]) {
+    in = std::max<int64_t>(in, 0);
+    if (len <= 0 || in >= len) return 0;
+    int n = 0;
+    /* The mirror's part only where it lies whole in what is left of the codes plane. */
+    if (tail > 0 && end <= len && end - tail >= in) {
+        const int64_t cut = end - tail;
+        if (cut > in) out[n++] = PlaneSpan{ in, cut - in, false };
+        out[n++] = PlaneSpan{ cut, tail, true };
+        if (len > end) out[n++] = PlaneSpan{ end, len - end, false };
+        return n;
+    }
+    out[n++] = PlaneSpan{ in, len - in, false };
+    return n;
+}
+
+int64_t Mover::rest_mirror_tail(int64_t tail, int64_t left, int64_t total, int64_t in, int64_t end,
+                                int64_t w3, int64_t align) {
+    if (tail <= 0 || left <= 0 || total <= 0 || align <= 0 || in >= end) return 0;
+    int64_t t = left >= total ? tail : (int64_t)((double)tail * ((double)left / (double)total));
+    t = std::min({ t, end - std::max<int64_t>(in, 0), w3 });
+    return t > 0 ? t / align * align : 0;
+}
+
+/* The call's reads: each unit's buffers sized and its planes' pointers set, a read an extent (or,
+ * for a unit with bytes in already, a read of what is left of each extent: PlanesIn). */
+bool Mover::plane_reads(HostPlanes* const* units, int n, int rows, PlaneCall* c, const PlanesIn* in,
+                        bool rest_mirror) {
+    if (!units || n <= 0 || !plan_ || !prog_ || !relayout_ || !file_.ok() || !mapped_file_cache_on_)
+        return false;
+    /* As read_native_file: the container must still be the one the Program was loaded from,
+     * before the reads and after them. */
+    if (!source_file_epoch()) return false;
+    using Read = PlaneCall::Read;
+    std::vector<Read>& reads = c->reads;
+    reads.clear();
+    c->mover = this;
+    c->next.store(0);
+    c->weights = 0;
+    c->units = n;
+    c->rest = c->rest_mirror = 0;
+    c->rest_bytes = c->rest_mirror_bytes = 0;
+    c->posted = false;
+    c->join_ns = 0;
+    /* Passes of min_rows or more take the mirror's share, smaller ones (decode) its decode share. */
+    PlaneMirror* const pm = PlaneMirror::get();
+    const int64_t tail = !pm ? 0 : rows >= pm->min_rows() ? mirror_tail_ : mirror_tail_decode_;
+    PlaneMirror* const mirror = tail > 0 && pm->on() ? pm : nullptr;
+    c->mirror = mirror;
+    /* A lone decode miss's tail in pieces (mirror_split; the default 1 is one read, as before). */
+    const int pieces = mirror && n == 1 && rows < pm->min_rows() ? mirror_split() : 1;
+    const int64_t A = DirectFile::alignment();
+    for (int i = 0; i < n; ++i) {
+        HostPlanes* p = units[i];
+        const int32_t u = p ? p->unit : -1;
+        if (u < 0 || (size_t)u >= unit_.size()) return false;
+        const UnitState& us = unit_[(size_t)u];
+        if (us.tier != Tier::SSD || us.slab_slot >= 0 || us.klass < 0) return false;
+        const MoveUnit& mu = plan_->units[(size_t)u];
+        if (mu.weights.size() != 2) return false;
+        const PlanesIn got = in ? in[i] : PlanesIn{};
+        const bool part = got.bytes[0] != 0 || got.bytes[1] != 0;
+        if (part) {
+            /* Laid out for this unit already (lay_out_unit_planes), its first bytes in or landing:
+             * kept as it is, since a new layout could move the buffers under them. */
+            if (p->n != 2) return false;
+            for (int k = 0; k < 2; ++k) {
+                const int64_t b = got.bytes[k];
+                if (p->w[k] != mu.weights[(size_t)k] || !p->buf[k] || b < 0 || b > p->len[k] ||
+                    (b < p->len[k] && b % A))
+                    return false;
+            }
+            ++c->rest;
+        } else {
+            p->n = 0;
+            for (int k = 0; k < 2; ++k)
+                if (!lay_out_weight(p, k, mu.weights[(size_t)k])) return false;
+        }
+        const int64_t total = p->len[0] + p->len[1];
+        const int64_t left = total - got.bytes[0] - got.bytes[1];
+        for (int k = 0; k < 2; ++k) {
+            const WeightInfo& w = prog_->weights[mu.weights[(size_t)k]];
+            const int64_t a0 = p->a0[k], b = got.bytes[k];
+            /* The gate_up codes' tail from the mirror (mirror_init checked the layout: codes, then
+             * scales, both 4 KiB-aligned): the container reads the head and the scales. A unit's
+             * rest takes the mirror's share of what is left (..._PREFETCH_URGENT=2), or none. */
+            const PlaneMirror::Ref* m = mirror && (size_t)u < mirror_ref_.size() &&
+                mirror_ref_[(size_t)u].shard >= 0 && mirror_k_[(size_t)u] == k ? &mirror_ref_[(size_t)u] : nullptr;
+            int64_t end = 0, t = 0;
+            if (m) {
+                end = (int64_t)w.file_plane_offset[0] - a0 + (int64_t)(2 * m->bytes);
+                t = !part ? tail
+                    : rest_mirror ? rest_mirror_tail(tail, left, total, b, end, (int64_t)m->bytes, A) : 0;
+            }
+            PlaneSpan sp[3];
+            const int ns = plane_spans(p->len[k], b, end, t, sp);
+            if (!ns) continue;
+            ++c->weights;
+            int q = 0;   /* the mirror's reads go to the front, in order */
+            for (int j = 0; j < ns; ++j) {
+                const PlaneSpan& s = sp[j];
+                if (part) {
+                    c->rest_bytes += s.len;
+                    if (s.mirror) {   /* one weight of a unit has a mirror part, in one span */
+                        c->rest_mirror_bytes += s.len;
+                        ++c->rest_mirror;
+                    }
+                }
+                if (!s.mirror) {
+                    /* A read to the extent's end may round up into the buffer's slack. */
+                    const int64_t cap = s.off + s.len == p->len[k] ? p->cap[k] - s.off : s.len;
+                    reads.push_back(Read{ w.file_id, a0 + s.off, s.len, p->buf[k] + s.off, cap, nullptr, 0 });
+                    continue;
+                }
+                /* One piece (no split) as the unit's one mirror read. */
+                int64_t piece[4];
+                const int np = PlaneMirror::split(s.len, pieces, piece);
+                int64_t at = 0;
+                for (int r = 0; r < np; at += piece[r], ++r, ++q)
+                    reads.insert(reads.begin() + q, Read{ w.file_id, a0 + s.off + at, piece[r],
+                                                          p->buf[k] + s.off + at, piece[r], m,
+                                                          m->bytes - (uint64_t)(s.len - at) });
+            }
+        }
+    }
+    return true;
+}
+
+/* After the readers: a failed mirror read again from the container, the counters, the result. */
+bool Mover::plane_reads_done(PlaneCall* c, bool readers_failed, PlaneReadTiming* timing) {
+    if (readers_failed) return false;   /* reads left undone */
+    /* A mirror read that failed: the mirror is off for good, and the container has the bytes. */
+    for (PlaneCall::Read& r : c->reads)
+        if (r.m && r.rc < 0) {
+            c->mirror->turn_off(r.rc);
+            r.rc = read_source_file(r.file, (uint64_t)r.off, r.len, r.dst, r.cap);
+        }
+    const int64_t back = steady_ns() - c->t0;
+    /* The issuing thread's time in the reads: a posted call's from the finish on. */
+    host_plane_read_ns_.fetch_add((uint64_t)std::max<int64_t>(back - c->join_ns, 0), std::memory_order_relaxed);
+    host_plane_reads_.fetch_add((uint64_t)c->weights, std::memory_order_relaxed);
+    if (timing) {
+        PlaneReadTiming t;
+        t.units = c->units;
+        t.reads = (int)c->reads.size();
+        t.posted = c->posted;
+        t.first_ns = t.first_container_ns = INT64_MAX;
+        for (const PlaneCall::Read& r : c->reads) {
+            t.first_ns = std::min(t.first_ns, r.start_ns);
+            t.last_start_ns = std::max(t.last_start_ns, r.start_ns);
+            if (r.m) {
+                ++t.mirror_reads;
+                t.mirror_ns = std::max(t.mirror_ns, r.end_ns);
+                t.copy_ns = std::max(t.copy_ns, r.copy_ns);
+                t.copy_sum_ns += r.copy_ns;
+            } else {
+                t.first_container_ns = std::min(t.first_container_ns, r.start_ns);
+                t.container_ns = std::max(t.container_ns, r.end_ns);
+            }
+        }
+        if (t.first_ns == INT64_MAX) t.first_ns = 0;
+        if (t.first_container_ns == INT64_MAX) t.first_container_ns = 0;
+        t.join_ns = c->join_ns;
+        t.return_ns = back;
+        t.t0_ns = c->t0;
+        t.rest = c->rest;
+        t.rest_mirror = c->rest_mirror;
+        t.rest_bytes = c->rest_bytes;
+        t.rest_mirror_bytes = c->rest_mirror_bytes;
+        *timing = t;
+    }
+    for (const PlaneCall::Read& r : c->reads) if (r.rc < 0) return false;
+    return source_file_epoch();
+}
+
+bool Mover::read_unit_planes(HostPlanes* const* units, int n, int rows, PlaneReadTiming* timing,
+                             const PlanesIn* in, bool rest_mirror, const ReadWaitHook* hook) {
+    PlaneCall c;
+    if (!plane_reads(units, n, rows, &c, in, rest_mirror)) return false;
+    c.t0 = steady_ns();
+    ReadWaitHook at;
+    if (hook && hook->fn) {
+        at = *hook;
+        at.at_ns = c.t0 + hook->at_ns;
+    }
+    /* Readers each take the next read (the mirror's first: they take the longest): up to 8 kept
+     * workers (plane_workers_, this thread one of them), or with ..._READ_POOL=0 up to 16 threads
+     * started for the call; a reader that cannot be started leaves its share to the others. */
+    const NativeReadWorkers::Result pr = !plane_read_pool() || c.reads.size() < 2
+        ? NativeReadWorkers::Result::Invalid
+        : plane_workers_.run(8, (int)std::min<size_t>(c.reads.size(), 8), c, at.fn ? &at : nullptr);
+    if (pr == NativeReadWorkers::Result::Invalid) {
+        std::vector<std::thread> th;
+        try {
+            for (size_t t = 1; t < std::min<size_t>(c.reads.size(), 16); ++t) th.emplace_back(std::ref(c), (int)t);
+        } catch (...) {
+        }
+        c(0);
+        for (std::thread& t : th) t.join();
+    }
+    return plane_reads_done(&c, pr == NativeReadWorkers::Result::CallbackFailed, timing);
+}
+
+bool Mover::start_unit_planes(HostPlanes* const* units, int n, int rows, const PlanesIn* in,
+                              bool rest_mirror) {
+    if (plane_posted_ || !plane_read_pool()) return false;
+    PlaneCall& c = plane_call_;
+    if (!plane_reads(units, n, rows, &c, in, rest_mirror) || c.reads.empty()) return false;
+    c.posted = true;
+    c.t0 = steady_ns();
+    /* A reader a read, seven at most (the eighth worker is the caller, in finish_unit_planes). */
+    if (!plane_workers_.post(8, (int)std::min<size_t>(c.reads.size(), 7), c)) return false;
+    plane_posted_ = true;
+    return true;
+}
+
+bool Mover::finish_unit_planes(PlaneReadTiming* timing, const ReadWaitHook* hook) {
+    if (!plane_posted_) return false;
+    plane_posted_ = false;
+    PlaneCall& c = plane_call_;
+    c.join_ns = steady_ns() - c.t0;
+    ReadWaitHook at;
+    if (hook && hook->fn) {
+        at = *hook;
+        at.at_ns = c.t0 + hook->at_ns;
+    }
+    const NativeReadWorkers::Result pr = plane_workers_.join(at.fn ? &at : nullptr);
+    return plane_reads_done(&c, pr != NativeReadWorkers::Result::Complete, timing);
+}
+
+bool Mover::lay_out_weight(HostPlanes* p, int k, rad_weight h) {
+    const WeightInfo& w = prog_->weights[h];
+    RadTensor pt[RAD_ENC_MAX_PLANES];
+    weight_planes(w, pt);
+    if (!mapped_file_eligible(w) || w.n_sel != 2 || pt[0].dtype != RAD_FP4E2M1 ||
+        pt[1].dtype != RAD_E8M0 || pt[0].shape[0] != pt[1].shape[0] ||
+        pt[0].shape[1] != pt[1].shape[1] * 32)
+        return false;
+    const int64_t A = DirectFile::alignment();
+    int64_t lo = INT64_MAX, hi = 0;
+    for (int j = 0; j < 2; ++j) {
+        const int64_t bytes = pt[j].shape[0] * rad_dtype_bytes(pt[j].dtype, pt[j].shape[1]);
+        lo = std::min(lo, (int64_t)w.file_plane_offset[j]);
+        hi = std::max(hi, (int64_t)w.file_plane_offset[j] + bytes);
+    }
+    const int64_t a0 = lo / A * A, need = align_up(hi - a0, A);
+    if (p->cap[k] < need) {
+        std::free(p->buf[k]);
+        p->buf[k] = alloc_plane_buffer(need, &p->cap[k]);
+        if (!p->buf[k]) return false;
+    }
+    p->w[k] = h;
+    p->rows[k] = pt[0].shape[0];
+    p->cols[k] = pt[0].shape[1];
+    p->codes[k] = p->buf[k] + ((int64_t)w.file_plane_offset[0] - a0);
+    p->scales[k] = p->buf[k] + ((int64_t)w.file_plane_offset[1] - a0);
+    p->a0[k] = a0;
+    p->len[k] = hi - a0;
+    p->n = k + 1;
+    return true;
+}
+
+bool Mover::lay_out_unit_planes(HostPlanes* p, PlaneExtent ext[2]) {
+    if (!p || !ext || !plan_ || !prog_ || !relayout_ || !file_.ok() || !mapped_file_cache_on_)
+        return false;
+    const int32_t u = p->unit;
+    if (u < 0 || (size_t)u >= plan_->units.size()) return false;
+    const MoveUnit& mu = plan_->units[(size_t)u];
+    if (mu.tier != Tier::SSD || mu.weights.size() != 2) return false;
+    p->n = 0;
+    for (int k = 0; k < 2; ++k) {
+        if (!lay_out_weight(p, k, mu.weights[(size_t)k])) return false;
+        ext[k] = PlaneExtent{ prog_->weights[mu.weights[(size_t)k]].file_id, p->a0[k], p->len[k],
+                              p->buf[k], p->cap[k] };
+    }
+    return true;
+}
+
+int Mover::read_piece(uint32_t file, int64_t off, int64_t len, void* dst, int64_t cap) {
+    if (off < 0 || len <= 0 || !dst) return RAD_E_INVAL;
+    return read_source_file(file, (uint64_t)off, len, dst, cap);
+}
+
+int64_t Mover::decode_mirror_bytes() const {
+    PlaneMirror* const pm = PlaneMirror::get();
+    return pm && pm->on() && !mirror_ref_.empty() ? mirror_tail_decode_ : 0;
+}
+
+int64_t Mover::mapped_pair_bytes() const {
+    const auto b = mapped_file_cache_.slot_bytes();
+    return (int64_t)(b[0] + b[1] + 6 * 64);
+}
+
+Mover::PackedStats Mover::packed_stats() const {
+    PackedStats p;
+    p.inserted = packed_inserts_.load(std::memory_order_relaxed);
+    p.over_budget = packed_over_budget_.load(std::memory_order_relaxed);
+    p.over_budget_units = packed_over_budget_units_.load(std::memory_order_relaxed);
+    p.round_trip_failed = packed_round_trip_failed_.load(std::memory_order_relaxed);
+    return p;
+}
+
+int64_t Mover::mapped_cache_pregrow() {
+    if (!mapped_file_cache_on_) return 0;
+    size_t slabs = 0;
+    if (mapped_file_cache_.pregrow(&slabs) < 0) return 0;
+    const auto st = mapped_file_cache_.stats();
+    if (!st.slab_policy) return 0;
+    return (int64_t)std::min(st.slabs.classes[0].capacity_slots, st.slabs.classes[1].capacity_slots);
+}
+
+int64_t Mover::mapped_cache_backed_bytes() const {
+    if (!mapped_file_cache_on_) return 0;
+    const auto st = mapped_file_cache_.stats();
+    const size_t b = st.slab_policy ? st.slabs.retained_backing_charge : st.cache.payload_charge;
+    return b > (size_t)INT64_MAX ? INT64_MAX : (int64_t)b;
+}
+
+int Mover::mapped_cache_second_chances(const std::vector<int32_t>& units, int chances) {
+    if (!mapped_file_cache_on_ || !plan_ || !mapped_file_cache_.stats().slab_policy) return 0;
+    int n = 0;
+    for (int32_t u : units) {
+        if (u < 0 || (size_t)u >= plan_->units.size()) continue;
+        bool all = true;
+        for (rad_weight h : plan_->units[(size_t)u].weights)
+            all = mapped_file_cache_.protect((size_t)h) == NativeMappedFileCache::Status::Ok && all;
+        n += all;
+    }
+    return mapped_file_cache_.set_second_chances(chances) == NativeMappedFileCache::Status::Ok ? n : 0;
+}
+
+int Mover::mirror_init() {
+    PlaneMirror* m = PlaneMirror::get();
+    mirror_tail_ = mirror_tail_decode_ = 0;
+    if (!m || !plan_ || !prog_ || !mapped_file_cache_on_ || !file_.ok()) return RAD_OK;
+    mirror_ref_.assign(unit_.size(), PlaneMirror::Ref{});
+    mirror_k_.assign(unit_.size(), -1);
+    const int64_t A = DirectFile::alignment();
+    int64_t up = 0;
+    std::vector<int32_t> found;
+    for (size_t u = 0; u < unit_.size(); ++u) {
+        if (!host_planes_eligible((int32_t)u)) continue;
+        const MoveUnit& mu = plan_->units[u];
+        for (int k = 0; k < 2; ++k) {
+            const WeightInfo& w = prog_->weights[mu.weights[(size_t)k]];
+            int layer = -1, expert = -1;
+            char tail[16] = {};
+            if (std::sscanf(w.name.c_str(), "blk.%d.ffn_gate_up_exps.%d.%15s", &layer, &expert, tail) != 3 ||
+                std::strcmp(tail, "weight") != 0)
+                continue;
+            RadTensor pt[RAD_ENC_MAX_PLANES];
+            weight_planes(w, pt);
+            const int64_t codes = pt[0].shape[0] * rad_dtype_bytes(pt[0].dtype, pt[0].shape[1]);
+            PlaneMirror::Ref r;
+            /* Codes then scales, each 4 KiB-aligned, w3 the codes' second half. */
+            if (!m->up_codes(layer, expert, &r) || (int64_t)r.bytes * 2 != codes ||
+                w.file_plane_offset[0] % A || (int64_t)w.file_plane_offset[1] != (int64_t)w.file_plane_offset[0] + codes ||
+                codes % A)
+                continue;
+            mirror_ref_[u] = r;
+            mirror_k_[u] = (int8_t)k;
+            up = (int64_t)r.bytes;
+            found.push_back((int32_t)u);
+        }
+    }
+    if (found.empty()) {
+        RAD_WARN("plane mirror: none of rank %d's file-tier experts is in the mirror", plan_->rank);
+        return RAD_OK;
+    }
+    const int64_t unit = plan_->units[(size_t)found[0]].bytes;
+    auto tail_of = [&](double share) { return std::min<int64_t>((int64_t)(share * (double)unit) / A * A, up / A * A); };
+    const int64_t prefill_tail = tail_of(m->share()), decode_tail = tail_of(m->decode_share());
+    /* The longer tail is checked; the shorter is its suffix. */
+    const int64_t tail = std::max(prefill_tail, decode_tail);
+    if (tail <= 0) return RAD_OK;
+    /* Eight units spread over the rank: the mirror's tail against the container's, byte for byte. */
+    std::vector<uint8_t*> bufs(2, nullptr);
+    for (auto& b : bufs) b = (uint8_t*)std::aligned_alloc((size_t)A, (size_t)tail);
+    bool same = bufs[0] && bufs[1];
+    for (int i = 0; same && i < 8; ++i) {
+        const int32_t u = found[(size_t)i * found.size() / 8];
+        const WeightInfo& w = prog_->weights[plan_->units[(size_t)u].weights[(size_t)mirror_k_[(size_t)u]]];
+        const PlaneMirror::Ref& r = mirror_ref_[(size_t)u];
+        const int64_t end = (int64_t)w.file_plane_offset[0] + 2 * (int64_t)r.bytes;
+        same = read_source_file(w.file_id, (uint64_t)(end - tail), tail, bufs[0], tail) == RAD_OK &&
+               m->read(r, r.bytes - (uint64_t)tail, (uint64_t)tail, bufs[1]) == RAD_OK &&
+               std::memcmp(bufs[0], bufs[1], (size_t)tail) == 0;
+    }
+    for (auto& b : bufs) std::free(b);
+    if (!same) {
+        RAD_WARN("plane mirror: rank %d's sampled experts differ from the container (or could not be "
+                 "read); reading the container only", plan_->rank);
+        mirror_ref_.clear();
+        mirror_k_.clear();
+        return RAD_OK;
+    }
+    mirror_tail_ = prefill_tail;
+    mirror_tail_decode_ = decode_tail;
+    RAD_INFO("plane mirror: rank %d reads %s of each missed expert's gate_up from the mirror in passes "
+             "of %d+ tokens and %s in smaller ones (%zu experts mapped, 8 sampled and identical)",
+             plan_->rank, humanb(prefill_tail).c_str(), m->min_rows(), humanb(decode_tail).c_str(),
+             found.size());
+    return RAD_OK;
+}
+
+/* The packed cache's insert: both weights' raw rounds counted first, so a unit is cached whole or
+ * not at all (a weight with more raw rounds than its slot holds keeps the unit a miss, computed
+ * from its planes); then each weight packed straight into a reserved slot -- its codes plane
+ * copied (as `copy` says: by non-temporal stores, in pieces, each piece's sfence before the
+ * publication; null, one memcpy), its scales packed -- and checked before it is published: every
+ * block's e8m0 as the kernels widen it from the slot must equal the planes' byte for byte, or the
+ * slot goes back unpublished (the Write's destructor) and the weight stays a miss. */
+int Mover::insert_unit_packed(const HostPlanes& p, const ds41hx::PackCopy* copy) {
+    using S = NativeMappedFileCache::Status;
+    if (p.n != 2) return RAD_E_STATE;
+    int klass[2] = { -1, -1 };
+    ds41hx::PackInfo plan[2];
+    for (int k = 0; k < 2; ++k) {
+        const WeightInfo& w = prog_->weights[p.w[k]];
+        const int c = w.stored_bytes == (int64_t)NativeMappedFileCache::GU ? 0
+                    : w.stored_bytes == (int64_t)NativeMappedFileCache::DN ? 1 : -1;
+        if (c < 0 || p.rows[k] != kPackedShape[c][0] || p.cols[k] != kPackedShape[c][1] || !p.codes[k] ||
+            !p.scales[k] || !ds41hx::pack_plan(p.scales[k], kPackedShape[c][0], kPackedShape[c][1], &plan[k]))
+            return RAD_E_STATE;
+        klass[k] = c;
+    }
+    if (klass[0] == klass[1]) return RAD_E_STATE;
+    if (plan[0].n_exc > packed_raw_[klass[0]] || plan[1].n_exc > packed_raw_[klass[1]]) {
+        packed_over_budget_.fetch_add(1, std::memory_order_relaxed);
+        if (packed_refused_ && (size_t)p.unit < unit_.size() && !packed_refused_[(size_t)p.unit].exchange(1))
+            packed_over_budget_units_.fetch_add(1, std::memory_order_relaxed);
+        return RAD_OK;
+    }
+    for (int k = 0; k < 2; ++k) {
+        /* The check-insert-check bracket of read_native_file: never admit another epoch's bytes. */
+        if (!source_file_epoch()) return RAD_E_STATE;
+        const WeightInfo& w = prog_->weights[p.w[k]];
+        const size_t key = (size_t)(&w - prog_->weights.data());
+        const int c = klass[k], N = kPackedShape[c][0], K = kPackedShape[c][1];
+        NativeMappedFileCache::Write write;
+        const auto reserved = mapped_file_cache_.reserve_packed(key, c, &write);
+        if (reserved == S::Ok) {
+            if (!write.packed() || !write.host()) return RAD_E_STATE;
+            ds41hx::Mx view;
+            const int rc = ds41hx::pack_planes(p.codes[k], p.scales[k], N, K, packed_raw_[c], plan[k], write.host(),
+                                               write.bytes(), copy);
+            if (rc != ds41hx::kPackOk || !ds41hx::packed_view(write.host(), write.bytes(), N, K, &view) ||
+                !ds41hx::packed_scales_equal(view, p.scales[k])) {
+                packed_round_trip_failed_.fetch_add(1, std::memory_order_relaxed);
+                continue;   /* unpublished: the Write's destructor gives the slot back */
+            }
+            if (!source_file_epoch()) return RAD_E_STATE;
+            NativeMappedFileCache::Lease lease;
+            if (write.publish(&lease) != S::Ok) return RAD_E_STATE;
+            (void)lease.release();
+            packed_inserts_.fetch_add(1, std::memory_order_relaxed);
+        } else if (reserved != S::Existing && reserved != S::Bypass && reserved != S::Allocation) {
+            return RAD_E_STATE;
+        }
+        if (!source_file_epoch()) return RAD_E_STATE;
+        host_plane_inserts_.fetch_add(1, std::memory_order_relaxed);
+    }
+    return RAD_OK;
+}
+
+int Mover::insert_unit_planes(const HostPlanes& p, std::vector<uint8_t>* scratch, const ds41hx::PackCopy* copy) {
+    if (!scratch || !relayout_ || !mapped_file_cache_on_) return RAD_E_STATE;
+    if (mapped_file_cache_.packed()) return insert_unit_packed(p, copy);
+    using S = NativeMappedFileCache::Status;
+    for (int k = 0; k < p.n; ++k) {
+        /* The check-insert-check bracket of read_native_file: never admit another epoch's bytes. */
+        if (!source_file_epoch()) return RAD_E_STATE;
+        const WeightInfo& w = prog_->weights[p.w[k]];
+        const size_t key = (size_t)(&w - prog_->weights.data());
+        RadTensor pt[RAD_ENC_MAX_PLANES];
+        weight_planes(w, pt);
+        pt[0].data = const_cast<uint8_t*>(p.codes[k]);
+        pt[1].data = const_cast<uint8_t*>(p.scales[k]);
+        /* With direct fill the weight is relaid straight into a reserved slot: one pass over its
+         * stored bytes instead of one into scratch and a second copying scratch into the cache
+         * (under the cache's writer lock). A reservation the cache turns away (busy key, held
+         * tail, no room) is the same refusal insert would give, so there is no second try.
+         * RADIANCE_EXPERIMENTAL_DS41_INSERT_DIRECT=0: through scratch, as before (an A/B switch). */
+        static const bool direct = [] {
+            const char* s = std::getenv("RADIANCE_EXPERIMENTAL_DS41_INSERT_DIRECT");
+            return !s || std::strcmp(s, "0") != 0;
+        }();
+        if (mapped_direct_fill_on_ && direct) {
+            NativeMappedFileCache::Write write;
+            const auto reserved = mapped_file_cache_.reserve_fill(key, (size_t)w.stored_bytes, &write);
+            if (reserved == S::Ok) {
+                const int st = relayout_(w, pt, write.host(), w.stored_bytes);
+                if (st < 0) return st;   /* the Write's destructor gives the slot back */
+                if (!source_file_epoch()) return RAD_E_STATE;
+                NativeMappedFileCache::Lease lease;
+                if (write.publish(&lease) != S::Ok) return RAD_E_STATE;
+                (void)lease.release();
+            } else if (reserved != S::Existing && reserved != S::Bypass && reserved != S::Allocation) {
+                return RAD_E_STATE;
+            }
+        } else {
+            if ((int64_t)scratch->size() < w.stored_bytes) scratch->resize((size_t)w.stored_bytes);
+            const int st = relayout_(w, pt, scratch->data(), w.stored_bytes);
+            if (st < 0) return st;
+            const auto rc = mapped_file_cache_.insert(key, scratch->data(), (size_t)w.stored_bytes);
+            if (rc != S::Ok && rc != S::Existing && rc != S::Bypass && rc != S::Allocation) return RAD_E_STATE;
+        }
+        if (!source_file_epoch()) return RAD_E_STATE;
+        host_plane_inserts_.fetch_add(1, std::memory_order_relaxed);
+    }
+    return RAD_OK;
+}
+
+bool Mover::read_weight_file(const WeightInfo& w, void* dst) {
+    const int64_t bytes = weight_file_bytes(w);
+    if (!dst || !file_.ok() || bytes <= 0 ||
+        (w.decl.shard != RAD_SHARD_NONE && plan_ && plan_->world_size > 1))
+        return false;
+    const int64_t A = DirectFile::alignment();
+    const int64_t off = (int64_t)w.file_offset, a0 = off / A * A;
+    const int64_t len = off + bytes - a0, cap = align_up(len, A);
+    uint8_t* buf = (uint8_t*)std::aligned_alloc((size_t)A, (size_t)cap);
+    if (!buf) return false;
+    const int rc = read_source_file(w.file_id, (uint64_t)a0, len, buf, cap);
+    if (rc >= 0) std::memcpy(dst, buf + (off - a0), (size_t)bytes);
+    std::free(buf);
+    return rc >= 0;
+}
+
+bool Mover::unit_cached(int32_t u) {
+    if (!plan_ || !prog_ || !mapped_file_cache_on_ || u < 0 || (size_t)u >= unit_.size()) return false;
+    for (rad_weight h : plan_->units[(size_t)u].weights)
+        if (!mapped_file_cache_.present((size_t)h)) return false;
+    return true;
+}
+
+void Mover::units_cached(const int32_t* units, int n, uint8_t* out) {
+    if (n <= 0) return;
+    if (!plan_ || !prog_ || !mapped_file_cache_on_) {
+        std::memset(out, 0, (size_t)n);
+        return;
+    }
+    /* Every unit's weights as keys, one lock for all; a unit is cached when all its weights are,
+     * as unit_cached says. The scratch is the calling (rank) thread's, kept between calls. */
+    thread_local std::vector<size_t> keys;
+    thread_local std::vector<int> first;
+    thread_local std::vector<uint8_t> hit;
+    keys.clear();
+    first.assign((size_t)n + 1, 0);
+    for (int i = 0; i < n; ++i) {
+        first[(size_t)i] = (int)keys.size();
+        const int32_t u = units[i];
+        if (u >= 0 && (size_t)u < unit_.size())
+            for (rad_weight h : plan_->units[(size_t)u].weights) keys.push_back((size_t)h);
+    }
+    first[(size_t)n] = (int)keys.size();
+    hit.assign(keys.size(), 0);
+    if (!keys.empty()) mapped_file_cache_.present_many(keys.data(), keys.size(), hit.data());
+    for (int i = 0; i < n; ++i) {
+        const int a = first[(size_t)i], b = first[(size_t)i + 1];
+        bool all = b > a;
+        for (int k = a; k < b; ++k) all = all && hit[(size_t)k];
+        out[i] = all ? 1 : 0;
+    }
+}
+
+bool Mover::host_planes_eligible(int32_t u) const {
+    if (!plan_ || !prog_ || !mapped_file_cache_on_ || u < 0 || (size_t)u >= unit_.size()) return false;
+    const UnitState& us = unit_[(size_t)u];
+    if (us.tier != Tier::SSD || us.slab_slot >= 0 || us.klass < 0) return false;
+    const MoveUnit& mu = plan_->units[(size_t)u];
+    if (mu.weights.size() != 2) return false;
+    for (rad_weight h : mu.weights) {
+        const WeightInfo& w = prog_->weights[h];
+        if (!mapped_file_eligible(w) || w.n_sel != 2) return false;
+    }
+    return true;
+}
+
+void Mover::release_host_unit(HostUnit* hu) {
+    if (!hu) return;
+    for (int i = 0; i < hu->n; ++i) {
+        (void)hu->lease[i].release();
+        hu->host[i] = nullptr;
+        hu->bytes[i] = 0;
+        hu->slot[i] = 0;
+    }
+    hu->n = 0;
+    hu->unit = -1;
+    hu->packed = false;
 }
 
 /* The same choice of units as stage_units, without a cap. */
@@ -814,6 +1578,7 @@ namespace {
 
 /* One weight's bytes: where they are in the container and where they go. */
 struct FileExt {
+    uint32_t bank = 0;
     int64_t foff = 0, bytes = 0;
     char*   dst = nullptr;
 };
@@ -827,15 +1592,418 @@ constexpr int64_t kReadThrough = (int64_t)256 << 10;
 
 }  /* namespace */
 
+/* One weight relaid on the read: its selected planes' span, aligned out to the O_DIRECT block,
+ * read into this thread's host input in one pread (the aligned path, which touches no shared
+ * bounce, so threads read at once), then the relayout writes the stored form to `dst`. Each plane
+ * is whole (weight_file_relaid), so it is one range of the container. */
+int Mover::read_relaid(const WeightInfo& w, void* dst, int64_t dst_cap, RelayIn* in) {
+    if (!relayout_ || !in || w.n_sel <= 0) return RAD_E_STATE;
+    if (w.stored_bytes > dst_cap) {
+        RAD_ERR("file tier: '%s' relays to %s and the pinned space for it is %s", w.name.c_str(),
+                humanb(w.stored_bytes).c_str(), humanb(dst_cap).c_str());
+        return RAD_E_SCRATCH;
+    }
+    RadTensor pt[RAD_ENC_MAX_PLANES];
+    weight_planes(w, pt);
+    int64_t lo = INT64_MAX, hi = 0;
+    for (int k = 0; k < w.n_sel; ++k) {
+        const int64_t len = pt[k].shape[0] * rad_dtype_bytes(pt[k].dtype, pt[k].shape[1]);
+        lo = std::min(lo, (int64_t)w.file_plane_offset[k]);
+        hi = std::max(hi, (int64_t)w.file_plane_offset[k] + len);
+    }
+    const int64_t A = DirectFile::alignment();
+    const int64_t a0 = lo / A * A, n = align_up(hi - a0, A);
+    if (in->cap < n) {
+        std::free(in->p);
+        in->p = (uint8_t*)std::aligned_alloc((size_t)A, (size_t)n);
+        in->cap = in->p ? n : 0;
+        if (!in->p) return RAD_E_NOMEM;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    RAD_TRY(read_source_file(w.file_id,(uint64_t)a0, hi - a0, in->p, in->cap));   /* reads n, needs hi - a0 */
+    const auto t1 = std::chrono::steady_clock::now();
+    for (int k = 0; k < w.n_sel; ++k) pt[k].data = in->p + ((int64_t)w.file_plane_offset[k] - a0);
+    const int st = relayout_(w, pt, dst, w.stored_bytes);
+    relaid_read_ns_.fetch_add((uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count(),
+                              std::memory_order_relaxed);
+    relaid_pack_ns_.fetch_add((uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                  std::chrono::steady_clock::now() - t1).count(), std::memory_order_relaxed);
+    relaid_reads_.fetch_add(1, std::memory_order_relaxed);
+    if (st < 0)
+        RAD_ERR("file tier: relaying '%s' (%s) on the read failed: %s", w.name.c_str(),
+                w.layout_tag.c_str(), rad_strerror(st));
+    return st;
+}
+
+bool Mover::mapped_file_eligible(const WeightInfo& w) {
+    //Only byte transport changes. The Program/file epoch/key still select exact original bytes.
+    //Keep this first experiment inside the native DS4.1 trunk expert representation.
+    return w.decl.access == RAD_ACCESS_CONDITIONAL && w.decl.shard == RAD_SHARD_NONE &&
+        w.decl.group.layer >= 0 && w.decl.group.layer < 40 &&
+        w.decl.group.expert >= 0 && w.decl.group.expert < 96 &&
+        !w.widen && !w.narrow && w.layout_tag == "ggml_mxfp4" &&
+        (w.stored_bytes == int64_t(NativeMappedFileCache::GU) ||
+         w.stored_bytes == int64_t(NativeMappedFileCache::DN));
+}
+
+int Mover::file_copy_event_record(RadEvent event) {
+    if (mapped_file_cache_on_ && mapped_copy_hooks_.record)
+        return mapped_copy_hooks_.record(mapped_copy_hooks_.context,event,mover_);
+    return rad_event_record(event,mover_);
+}
+int Mover::file_copy_event_sync(RadEvent event) {
+    if (mapped_file_cache_on_ && mapped_copy_hooks_.sync)
+        return mapped_copy_hooks_.sync(mapped_copy_hooks_.context,event);
+    return rad_event_sync(event);
+}
+int Mover::file_copy_stream_sync() {
+    if (mapped_file_cache_on_ && mapped_copy_hooks_.drain)
+        return mapped_copy_hooks_.drain(mapped_copy_hooks_.context,mover_);
+    return mover_ ? rad_stream_sync(mover_) : RAD_E_STATE;
+}
+int Mover::mapped_copy_to_vram(void* dst,const void* src,int64_t bytes) {
+    if (mapped_file_cache_on_ && mapped_copy_hooks_.copy)
+        return mapped_copy_hooks_.copy(mapped_copy_hooks_.context,dst,src,bytes,mover_);
+    return rad_memcpy_async(dst,src,bytes,mover_);
+}
+
+int Mover::retire_file_window(int window) {
+    if (window < 0 || window >= n_windows_) return RAD_E_INVAL;
+    auto& batch = mapped_windows_[(size_t)window];
+    if (win_rec_[(size_t)window]) {
+        //This exact event generation follows every copy consuming these leases.
+        RAD_TRY(file_copy_event_sync(win_ev_[(size_t)window]));
+    } else if (batch.copy_may_be_queued) {
+        //An enqueue or event-record failure may have left a prefix of copies queued.
+        RAD_TRY(file_copy_stream_sync());
+    }
+    //No copy was issued, or its event/drain is proven complete. A failure above retains all.
+    for (auto& lease : batch.leases) {
+        const auto rc = lease.release();
+        if (rc != NativeMappedFileCache::Status::Ok && rc != NativeMappedFileCache::Status::Empty)
+            return RAD_E_STATE;
+    }
+    batch.copy_may_be_queued = false;
+    win_rec_[(size_t)window] = 0;
+    return RAD_OK;
+}
+
+int Mover::retire_file_windows() {
+    if (!mapped_file_cache_on_) return RAD_OK;
+    for (int w = 0; w < n_windows_; ++w) {
+        const MappedWindow& batch = mapped_windows_[(size_t)w];
+        bool held = win_rec_[(size_t)w] || batch.copy_may_be_queued;
+        for (const auto& l : batch.leases) held = held || l.active();
+        if (held) RAD_TRY(retire_file_window(w));
+    }
+    return RAD_OK;
+}
+
+int Mover::mapped_file_drain() {
+    bool pending = false;
+    for (const auto& batch : mapped_windows_) pending = pending || batch.copy_may_be_queued;
+    //On init/error/destruction, a single successful stream drain closes all generations.
+    if (pending) RAD_TRY(file_copy_stream_sync());
+    for (auto& batch : mapped_windows_) {
+        for (auto& lease : batch.leases) {
+            const auto rc = lease.release();
+            if (rc != NativeMappedFileCache::Status::Ok && rc != NativeMappedFileCache::Status::Empty)
+                return RAD_E_STATE;
+        }
+        batch.copy_may_be_queued = false;
+    }
+    if (pending) std::fill(win_rec_.begin(),win_rec_.end(),0);
+    return RAD_OK;
+}
+
+/* The cache stores the final native bytes, not their container encoding. Its lock covers only
+ * CPU copies; GPU copies still use the existing pinned windows and their existing drain events.
+ * The one-Mover Program and held file epoch define the namespace, so a hit requires no payload
+ * hash or relayout. Direct-layout weights use each worker's aligned input, avoiding a shared
+ * O_DIRECT bounce buffer when several workers fill differently aligned window offsets. */
+bool Mover::prefetch_trace_slot(const M1PrefetchTrace& t) {
+    if(!m1_trace_tag_valid(t))return false;
+    const uint64_t n=prefetch_trace_lines_.fetch_add(1,std::memory_order_relaxed);
+    if(n==kM1PrefetchTraceMaxLines)
+        RAD_INFO("DS41M1TRACE v=1 kind=truncated rank=%lld limit=%llu; incomplete trace, no recall estimate",
+            (long long)t.rank,(unsigned long long)kM1PrefetchTraceMaxLines);
+    return n<kM1PrefetchTraceMaxLines;
+}
+
+void Mover::prefetch_trace_route(const M1PrefetchTrace& t,const int32_t* counts,size_t SSD_units) {
+    if(!m1_trace_tag_valid(t) || !counts || SSD_units>6)return;
+    char ids[128]{};size_t at=0;int sum=0;
+    for(int e=0;e<96;++e){
+        if(counts[e]<0 || counts[e]>1)return;
+        sum+=counts[e];if(sum>6)return;
+        if(counts[e]){
+            const int n=std::snprintf(ids+at,sizeof(ids)-at,"%s%d",at?",":"",e);
+            if(n<0 || size_t(n)>=sizeof(ids)-at)return;
+            at+=size_t(n);
+        }
+    }
+    if(prefetch_trace_slot(t))
+        RAD_INFO("DS41M1TRACE v=1 kind=route rank=%lld gen=%llu producer=%llu layer=%lld ready_ns=%llu base=%lld local=[%s] ssd_units=%zu",
+            (long long)t.rank,(unsigned long long)t.generation,(unsigned long long)t.producer,(long long)t.layer,
+            (unsigned long long)t.ready_ns,(long long)t.expert_base,ids,SSD_units);
+}
+
+void Mover::prefetch_trace_stage_done(const M1PrefetchTrace& t,int status) {
+    if(prefetch_trace_slot(t))
+        RAD_INFO("DS41M1TRACE v=1 kind=stage_return rank=%lld gen=%llu producer=%llu layer=%lld cpu_return_ns=%llu rc=%d; not GPU completion",
+            (long long)t.rank,(unsigned long long)t.generation,(unsigned long long)t.producer,
+            (long long)t.layer,(unsigned long long)m1_trace_now_ns(),status);
+}
+
+int Mover::read_native_file(const WeightInfo& w,void* dst,int64_t dst_cap,RelayIn* in,
+                            bool* cache_hit,NativeFileCacheReadPolicy policy,
+                            NativeMappedFileCache::Lease* mapped_lease,M1PrefetchTrace trace) {
+    if(!m1_trace_weight(trace,w.decl.group.layer,w.decl.group.expert,w.decl.group.slot,w.stored_bytes) ||
+        w.layout_tag!="ggml_mxfp4" || policy!=NativeFileCacheReadPolicy::Normal)
+        return read_native_file_impl(w,dst,dst_cap,in,cache_hit,policy,mapped_lease);
+    const uint64_t began=m1_trace_now_ns();
+    const bool eligible=native_file_cache_on_ || (mapped_file_cache_on_ && mapped_file_eligible(w));
+    const int rc=read_native_file_impl(w,dst,dst_cap,in,cache_hit,policy,mapped_lease);
+    const uint64_t ended=m1_trace_now_ns();
+    // Eligibility is not an entered-probe claim on error. Known0+eligible means
+    // the existing cache API was consulted; hit is its actual returned outcome.
+    if(prefetch_trace_slot(trace))
+        RAD_INFO("DS41M1TRACE v=1 kind=read rank=%lld gen=%llu producer=%llu layer=%lld expert=%lld slot=%lld key=%zu bank=%u bank_generation=%llu entry=%lld bytes=%lld begin_ns=%llu end_ns=%llu rc=%d cache_eligible=%d hit=%d identity=%d",
+            (long long)trace.rank,(unsigned long long)trace.generation,(unsigned long long)trace.producer,
+            (long long)trace.layer,(long long)w.decl.group.expert,(long long)w.decl.group.slot,
+            size_t(&w-prog_->weights.data()),unsigned(w.file_id),(unsigned long long)w.source_bank_generation,
+            (long long)w.source_entry_index,(long long)w.stored_bytes,(unsigned long long)began,
+            (unsigned long long)ended,rc,int(eligible),rc==RAD_OK && cache_hit?int(*cache_hit):-1,int(w.identity));
+    return rc;
+}
+
+int Mover::read_native_file_impl(const WeightInfo& w, void* dst, int64_t dst_cap, RelayIn* in,
+                            bool* cache_hit, NativeFileCacheReadPolicy policy,
+                            NativeMappedFileCache::Lease* mapped_lease) {
+    if (!in || !dst || !cache_hit || w.stored_bytes <= 0 || dst_cap < w.stored_bytes ||
+        !native_file_cache_policy_valid(policy))
+        return RAD_E_INVAL;
+    *cache_hit = false;
+    const size_t key = (size_t)(&w - prog_->weights.data());
+    const bool mapped_scope = mapped_file_cache_on_ && mapped_file_eligible(w);
+    if (mapped_scope && !source_file_epoch()) return RAD_E_STATE;
+    //Slab ReadOnly borrows preserve decode LRU order. Per-entry ReadOnly still bypasses.
+    const bool mapped = mapped_scope && (policy == NativeFileCacheReadPolicy::Normal ||
+                                        mapped_file_cache_.supports_readonly_borrow());
+    if (mapped) {
+        if (!source_file_epoch()) return RAD_E_STATE;
+        NativeMappedFileCache::Lease local;
+        auto* lease = mapped_lease ? mapped_lease : &local;
+        const auto rc = policy == NativeFileCacheReadPolicy::ReadOnly ?
+            mapped_file_cache_.borrow_readonly(key,size_t(w.stored_bytes),lease) :
+            mapped_file_cache_.borrow(key,size_t(w.stored_bytes),lease);
+        if (rc == NativeMappedFileCache::Status::Hit) {
+            *cache_hit = true;
+            //Demand promotion still uses its pinned stage; routed copies keep this lease.
+            if (!mapped_lease) std::memcpy(dst,lease->host(),size_t(w.stored_bytes));
+            return source_file_epoch() ? RAD_OK : RAD_E_STATE;
+        }
+        if (rc != NativeMappedFileCache::Status::Miss) return RAD_E_STATE;
+    }
+    bool skip_mapped_insert=false;
+    if(mapped&&mapped_direct_fill_on_&&mapped_lease&&policy==NativeFileCacheReadPolicy::Normal){
+        NativeMappedFileCache::Write write;
+        const auto reserved=mapped_file_cache_.reserve_fill(key,size_t(w.stored_bytes),&write);
+        using S=NativeMappedFileCache::Status;
+        if(reserved==S::Ok){
+            // The charged unpublished slot is owned exclusively by this retired-before-return reader.
+            // No owner/state/writer cache lock spans disk input or whole-weight native relayout.
+            int rc=RAD_OK;
+            if(!w.identity)rc=read_relaid(w,write.host(),int64_t(write.bytes()),in);
+            else{
+                const int64_t A=DirectFile::alignment();
+                if(w.file_offset>uint64_t(INT64_MAX))return RAD_E_INVAL;
+                const int64_t offset=int64_t(w.file_offset),lo=offset/A*A,delta=offset-lo;
+                if(w.stored_bytes>INT64_MAX-delta-A)return RAD_E_INVAL;
+                const int64_t need=delta+w.stored_bytes,allocation=align_up(need,A);
+                if(in->cap<allocation){std::free(in->p);in->p=(uint8_t*)std::aligned_alloc(size_t(A),size_t(allocation));in->cap=in->p?allocation:0;}
+                if(!in->p)return RAD_E_NOMEM;
+                rc=read_source_file(w.file_id,uint64_t(lo),need,in->p,in->cap);
+                if(rc>=0)std::memcpy(write.host(),in->p+delta,size_t(w.stored_bytes));
+            }
+            if(rc<0)return rc; // Write destructor cancels; a partial payload is never published
+            if(!source_file_epoch())return RAD_E_STATE;
+            const auto published=write.publish(mapped_lease); // atomic publication + consumer pin
+            if(published!=S::Ok)return RAD_E_STATE;
+            return source_file_epoch()?RAD_OK:RAD_E_STATE;
+        }
+        if(reserved==S::Existing){
+            const auto hit=mapped_file_cache_.borrow(key,size_t(w.stored_bytes),mapped_lease);
+            if(hit==S::Hit){*cache_hit=true;return source_file_epoch()?RAD_OK:RAD_E_STATE;}
+            if(hit!=S::Miss)return RAD_E_STATE;
+        }else if(reserved!=S::Bypass&&reserved!=S::Allocation)return RAD_E_STATE;
+        // Gross cap/class/held-tail/allocation pressure keeps the original window path, without
+        // repeating a failed reservation or copying that fallback into the cache a second time.
+        skip_mapped_insert=true;
+    }
+    if (native_file_cache_on_) {
+        if (!source_file_epoch()) return RAD_E_STATE;
+        RAD_TRY(native_file_cache_.copy(key, w.stored_bytes, dst, dst_cap, cache_hit, policy));
+        if (*cache_hit) return source_file_epoch() ? RAD_OK : RAD_E_STATE;
+    }
+    if (!w.identity) {
+        RAD_TRY(read_relaid(w, dst, dst_cap, in));
+    } else {
+        const int64_t A = DirectFile::alignment();
+        if (w.file_offset > (uint64_t)INT64_MAX) return RAD_E_INVAL;
+        const int64_t offset = (int64_t)w.file_offset, lo = offset / A * A, delta = offset - lo;
+        if (w.stored_bytes > INT64_MAX - delta - A) return RAD_E_INVAL;
+        const int64_t need = delta + w.stored_bytes, allocation = align_up(need, A);
+        if (in->cap < allocation) {
+            std::free(in->p);
+            in->p = (uint8_t*)std::aligned_alloc((size_t)A, (size_t)allocation);
+            in->cap = in->p ? allocation : 0;
+            if (!in->p) return RAD_E_NOMEM;
+        }
+        RAD_TRY(read_source_file(w.file_id,(uint64_t)lo, need, in->p, in->cap));
+        std::memcpy(dst, in->p + delta, (size_t)w.stored_bytes);
+    }
+    if (mapped_scope && !source_file_epoch()) return RAD_E_STATE;
+    if (mapped && !skip_mapped_insert && policy == NativeFileCacheReadPolicy::Normal) {
+        if (!source_file_epoch()) return RAD_E_STATE;
+        const auto rc = mapped_file_cache_.insert(key,dst,size_t(w.stored_bytes));
+        //Admission pressure and a failed new allocation preserve the original window fallback.
+        using S = NativeMappedFileCache::Status;
+        if (rc != S::Ok && rc != S::Existing && rc != S::Bypass && rc != S::Allocation)
+            return RAD_E_STATE;
+        if (!source_file_epoch()) return RAD_E_STATE;
+    }
+    if (native_file_cache_on_) {
+        if (!source_file_epoch()) return RAD_E_STATE;
+        if (policy == NativeFileCacheReadPolicy::Normal)
+            RAD_TRY(native_file_cache_.insert(key, dst, w.stored_bytes));
+        if (!source_file_epoch()) return RAD_E_STATE;
+    }
+    return RAD_OK;
+}
+
+/* The file stager's relaid weights (stage_file_units): packed into the read windows, each
+ * window's weights read and relaid on up to relay_threads_ threads at once, then copied to the
+ * layer buffer on the mover's stream like the direct runs, the window's event recorded behind
+ * them. A window comes round again only after its copies drained, as for the direct runs. */
+int Mover::stage_relaid(const std::vector<Relaid>& rl, NativeFileCacheReadPolicy policy) {
+    const int64_t W = RAD_PLACE_FILE_WINDOW_BYTES;
+    if (!windows_ || n_windows_ <= 0) return RAD_E_STATE;
+    if ((int)relay_in_.size() < relay_threads_) relay_in_.resize((size_t)relay_threads_);
+    const auto t_all = std::chrono::steady_clock::now();
+    struct Job { size_t r; int64_t wo; int mapped_slot; };
+    std::vector<Job> jobs;
+    size_t i = 0;
+    while (i < rl.size()) {
+        const int w = win_next_;
+        win_next_ = (win_next_ + 1) % n_windows_;
+        char* win = windows_ + (int64_t)w * W;
+        if (win_rec_[(size_t)w] || mapped_file_cache_on_) {
+            const auto t0 = std::chrono::steady_clock::now();
+            RAD_TRY(retire_file_window(w));
+            stats_.file_wait_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                       std::chrono::steady_clock::now() - t0).count();
+            win_rec_[(size_t)w] = 0;
+        }
+        jobs.clear();
+        int64_t used = 0;
+        size_t mapped_slots = 0;
+        while (i < rl.size()) {
+            const WeightInfo& wi = *rl[i].w;
+            const int64_t a = std::max<int64_t>(wi.align > 0 ? wi.align : RAD_ALIGN_UNIT, 256);
+            const int64_t wo = align_up(used, a);
+            if (wo + wi.stored_bytes > W) break;
+            const bool eligible = mapped_file_cache_on_ && mapped_file_eligible(wi) &&
+                (policy == NativeFileCacheReadPolicy::Normal || mapped_file_cache_.supports_readonly_borrow());
+            if (eligible && mapped_slots >= kMappedPerWindow) return RAD_E_STATE;
+            jobs.push_back(Job{ i, wo, eligible ? int(mapped_slots++) : -1 });
+            used = wo + wi.stored_bytes;
+            ++i;
+        }
+        if (jobs.empty()) {
+            RAD_ERR("file tier: '%s' relays to %s, more than a %s read window", rl[i].w->name.c_str(),
+                    humanb(rl[i].w->stored_bytes).c_str(), humanb(W).c_str());
+            return RAD_E_SCRATCH;
+        }
+        std::vector<int> rc(jobs.size(), RAD_OK);
+        std::vector<uint8_t> cache_hits(jobs.size(), 0);
+        std::atomic<size_t> next{ 0 };
+        auto work = [&, policy](int t) {
+            for (size_t j; (j = next.fetch_add(1)) < jobs.size();) {
+                const Job& jb = jobs[j];
+                bool cached = false;
+                rc[j] = read_native_file(*rl[jb.r].w, win + jb.wo, W - jb.wo,
+                                         &relay_in_[(size_t)t], &cached, policy,
+                                         jb.mapped_slot < 0 ? nullptr :
+                                             &mapped_windows_[(size_t)w].leases[(size_t)jb.mapped_slot],rl[jb.r].trace);
+                cache_hits[j] = cached;
+            }
+        };
+        const int nt = (int)std::min<size_t>((size_t)relay_threads_, jobs.size());
+        if (native_file_workers_on_) {
+            const auto result = relay_workers_.run(relay_threads_, nt, work);
+            if (result == NativeReadWorkers::Result::Invalid ||
+                result == NativeReadWorkers::Result::CallbackFailed)
+                return RAD_E_STATE;  /* run() has already retired every CPU reader */
+        } else {
+            std::vector<std::thread> th;
+            for (int t = 1; t < nt; ++t) th.emplace_back(work, t);
+            work(0);
+            for (std::thread& x : th) x.join();
+        }
+        for (size_t j = 0; j < jobs.size(); ++j) RAD_TRY(rc[j]);
+        if (policy == NativeFileCacheReadPolicy::ReadOnly) {
+            for (size_t j = 0; j < jobs.size(); ++j) {
+                const uint64_t bytes = uint64_t(rl[jobs[j].r].w->stored_bytes);
+                if (cache_hits[j]) { ++stats_.file_prefill_ro_hits; stats_.file_prefill_ro_hit_bytes += bytes; }
+                else { ++stats_.file_prefill_ro_misses; stats_.file_prefill_ro_miss_bytes += bytes; }
+            }
+        }
+        if (mapped_file_cache_on_) {
+            //All CPU readers/packers retired. Publish CPU writes before DEVICE reads.
+            rad_dev_host_wrote();
+            //Also retain ordinary fallback windows on partial enqueue/record failure.
+            mapped_windows_[(size_t)w].copy_may_be_queued = true;
+        }
+        for (size_t j = 0; j < jobs.size(); ++j) {
+            const Job& jb = jobs[j];
+            const WeightInfo& wi = *rl[jb.r].w;
+            const auto* lease = jb.mapped_slot < 0 ? nullptr :
+                &mapped_windows_[(size_t)w].leases[(size_t)jb.mapped_slot];
+            if (lease && lease->active()) {
+                //Ownership was already transferred into this persistent window before enqueue.
+                RAD_TRY(mapped_copy_to_vram(rl[jb.r].dst,lease->device(),wi.stored_bytes));
+                ++stats_.mapped_source_copies;
+                stats_.mapped_source_bytes += uint64_t(wi.stored_bytes);
+            } else {
+                RAD_TRY(mapped_copy_to_vram(rl[jb.r].dst, win + jb.wo, wi.stored_bytes));
+            }
+            if (!wi.identity && !cache_hits[j]) {
+                ++stats_.file_relaid;
+                stats_.file_relaid_bytes += (uint64_t)wi.stored_bytes;
+            }
+        }
+        RAD_TRY(file_copy_event_record(win_ev_[(size_t)w]));
+        win_rec_[(size_t)w] = 1;
+    }
+    stats_.file_relayout_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   std::chrono::steady_clock::now() - t_all).count();
+    return RAD_OK;
+}
+
 int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_t cap,
-                            RadEvent after, RadEvent done, std::vector<int32_t>* staged) {
-    if (record_session_.token || (plan_ && plan_->native_inventory)) return RAD_E_UNSUPPORTED;
-    if (!plan_ || !dst || !staged || !done) return RAD_E_INVAL;
+                            RadEvent after, RadEvent done, std::vector<int32_t>* staged,
+                            NativeFileCacheReadPolicy policy, M1PrefetchTrace trace) {
+    if (!plan_ || !dst || !staged || !done || !native_file_cache_policy_valid(policy)) return RAD_E_INVAL;
+    const auto cache_policy = (native_file_cache_on_ || mapped_file_cache_on_) ? policy : NativeFileCacheReadPolicy::Normal;
     staged->clear();
     if (!file_.ok() || !windows_ || n_windows_ <= 0) return RAD_E_STATE;
+    if(cfg_.source_banks&&!source_file_epoch())return RAD_E_STATE;
 
-    /* The layout in `dst`, unit by unit in the order given, and every weight's extent. */
+    /* The layout in `dst`, unit by unit in the order given, and every weight's extent; a weight
+     * the read relays goes through stage_relaid instead of the windows' direct copies. */
     std::vector<FileExt> ext;
+    std::vector<Relaid>  relaid;
     std::vector<int64_t> at;
     int64_t off = 0;
     for (int32_t u : units) {
@@ -852,7 +2020,11 @@ int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_
         for (size_t k = 0; k < mu.weights.size(); ++k) {
             const WeightInfo& w = prog_->weights[mu.weights[k]];
             if (w.stored_bytes <= 0) continue;          /* nothing to read, and nothing to place */
-            ext.push_back(FileExt{ (int64_t)w.file_offset, w.stored_bytes, dst + off + mu.offset[k] });
+            if (!w.identity || ((native_file_cache_on_ || (mapped_file_cache_on_ && mapped_file_eligible(w))) && w.stored_bytes <= RAD_PLACE_FILE_WINDOW_BYTES)) {
+                relaid.push_back(Relaid{ &w, dst + off + mu.offset[k], trace });
+                continue;
+            }
+            ext.push_back(FileExt{ w.file_id,(int64_t)w.file_offset, w.stored_bytes, dst + off + mu.offset[k] });
         }
         staged->push_back(u);
         at.push_back(off);
@@ -861,13 +2033,13 @@ int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_
     if (staged->empty()) return RAD_OK;
     /* Container order, so a window is one long run of the drive rather than a seek per weight. */
     std::stable_sort(ext.begin(), ext.end(),
-                     [](const FileExt& a, const FileExt& b) { return a.foff < b.foff; });
+                     [](const FileExt& a, const FileExt& b) { return a.bank!=b.bank?a.bank<b.bank:a.foff<b.foff; });
 
     if (after) RAD_TRY(rad_event_wait(mover_, after));
 
     const int64_t A = DirectFile::alignment();
     const int64_t W = RAD_PLACE_FILE_WINDOW_BYTES;
-    struct Seg { int64_t fs = 0, fe = 0, ws = 0; };     /* file [fs, fe) read to window offset ws */
+    struct Seg { uint32_t bank=0; int64_t fs = 0, fe = 0, ws = 0; };     /* file [fs, fe) read to window offset ws */
     struct Cp  { int64_t wo = 0, bytes = 0; char* dst = nullptr; };
     std::vector<Seg> segs;
     std::vector<Cp>  cps;
@@ -877,10 +2049,10 @@ int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_
         const int w = win_next_;
         win_next_ = (win_next_ + 1) % n_windows_;
         char* win = windows_ + (int64_t)w * W;
-        if (win_rec_[(size_t)w]) {
+        if (win_rec_[(size_t)w] || mapped_file_cache_on_) {
             /* The window's copies from the round before must have left it. */
             const auto t0 = std::chrono::steady_clock::now();
-            RAD_TRY(rad_event_sync(win_ev_[(size_t)w]));
+            RAD_TRY(retire_file_window(w));
             stats_.file_wait_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
                                        std::chrono::steady_clock::now() - t0).count();
             win_rec_[(size_t)w] = 0;
@@ -895,7 +2067,7 @@ int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_
             const FileExt& e = ext[i];
             const int64_t fo = e.foff + piece, left = e.bytes - piece;
             int64_t wo;
-            if (!segs.empty() && fo >= segs.back().fs && fo <= segs.back().fe + kReadThrough) {
+            if (!segs.empty() && e.bank==segs.back().bank && fo >= segs.back().fs && fo <= segs.back().fe + kReadThrough) {
                 wo = segs.back().ws + (fo - segs.back().fs);
             } else {
                 const int64_t ws = segs.empty()
@@ -903,7 +2075,7 @@ int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_
                 const int64_t fs = fo / A * A;
                 wo = ws + (fo - fs);
                 if (wo >= W) break;
-                segs.push_back(Seg{ fs, fs, ws });
+                segs.push_back(Seg{ e.bank,fs,fs,ws });
             }
             const int64_t take = std::min(left, W - wo);
             if (take <= 0) break;
@@ -918,15 +2090,17 @@ int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_
 
         const auto t0 = std::chrono::steady_clock::now();
         for (const Seg& s : segs) {
-            RAD_TRY(file_.read((uint64_t)s.fs, s.fe - s.fs, win + s.ws, W - s.ws));
+            RAD_TRY(read_source_file(s.bank,(uint64_t)s.fs, s.fe - s.fs, win + s.ws, W - s.ws));
             ++stats_.file_preads;
         }
         stats_.file_read_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
                                    std::chrono::steady_clock::now() - t0).count();
-        for (const Cp& c : cps) RAD_TRY(rad_memcpy_async(c.dst, win + c.wo, c.bytes, mover_));
-        RAD_TRY(rad_event_record(win_ev_[(size_t)w], mover_));
+        if (mapped_file_cache_on_) mapped_windows_[(size_t)w].copy_may_be_queued = true;
+        for (const Cp& c : cps) RAD_TRY(mapped_copy_to_vram(c.dst, win + c.wo, c.bytes));
+        RAD_TRY(file_copy_event_record(win_ev_[(size_t)w]));
         win_rec_[(size_t)w] = 1;
     }
+    if (!relaid.empty()) RAD_TRY(stage_relaid(relaid,cache_policy));
     RAD_TRY(rad_event_record(done, mover_));
 
     for (size_t k = 0; k < staged->size(); ++k) {
@@ -957,7 +2131,6 @@ void Mover::release_slot(int32_t unit) {
 }
 
 int Mover::issue(const Swap& s, HeatEngine* heat) {
-    if (record_session_.token || (plan_ && plan_->native_inventory)) return RAD_E_UNSUPPORTED;
     if (!plan_ || !plan_->dynamic) return RAD_OK;
 
     auto one = [&](int32_t unit, bool promote) -> bool {
@@ -1026,7 +2199,6 @@ static char* align_down_ptr(char* p) {
 }
 
 int Mover::lend_from(int lender, const std::vector<LoanStrip>& strips) {
-    if (record_session_.token || (plan_ && plan_->native_inventory)) return RAD_E_UNSUPPORTED;
     if (!plan_ || !plan_->dynamic) return RAD_OK;      /* a static plan never moves a unit */
     if (lender < 0 || lender >= kLenders) return RAD_E_INVAL;
     for (const ClassPools& cp : pools_)
@@ -1126,7 +2298,6 @@ int Mover::lend_from(int lender, const std::vector<LoanStrip>& strips) {
 }
 
 int Mover::set_loan(int lender, int64_t amount) {
-    if (record_session_.token || (plan_ && plan_->native_inventory)) return RAD_E_UNSUPPORTED;
     if (lender < 0 || lender >= kLenders) return RAD_E_INVAL;
     loan_[lender] = amount > 0 ? amount : 0;
     for (ClassPools& cp : pools_)
@@ -1400,7 +2571,6 @@ int Mover::fill(size_t klass, int64_t room, HeatEngine* heat) {
 }
 
 int Mover::balance(HeatEngine* heat, bool turnover) {
-    if (record_session_.token || (plan_ && plan_->native_inventory)) return RAD_E_UNSUPPORTED;
     if (!plan_ || !plan_->dynamic) return RAD_OK;
 
     for (size_t c = 0; c < pools_.size(); ++c) {
@@ -1517,14 +2687,12 @@ int Mover::balance(HeatEngine* heat, bool turnover) {
 }
 
 int Mover::idle_tick(HeatEngine* heat) {
-    if (record_session_.token || (plan_ && plan_->native_inventory)) return RAD_E_UNSUPPORTED;
     if (!plan_ || !plan_->dynamic) return RAD_OK;
     RAD_TRY(retire(heat));
     return balance(heat, !hold_turnover_);
 }
 
 int Mover::reclaim(int lender, int64_t amount, HeatEngine* heat) {
-    if (record_session_.token || (plan_ && plan_->native_inventory)) return RAD_E_UNSUPPORTED;
     RAD_TRY(set_loan(lender, amount));
     if (loan_held(lender) <= loan_[lender]) return RAD_OK;
     if (!compute_ || !mover_) {
@@ -1787,12 +2955,148 @@ std::string Mover::report() const {
      * window whose copies had not drained when it came round again. */
     if (stats_.file_layers) {
         const double rs = (double)stats_.file_read_ns * 1e-9;
-        s += fmt("  file stager: %llu routed layers read, %llu units, %.2f GiB in %llu preads; "
+        if (native_file_cache_on_ || mapped_file_cache_on_)
+            s += fmt("  file stager: %llu routed layers, %llu units, %.2f GiB native bytes staged "
+                     "from RAM or disk; %.2f s waiting on windows\n",
+                     (unsigned long long)stats_.file_layers, (unsigned long long)stats_.file_units,
+                     (double)stats_.file_bytes * gib, (double)stats_.file_wait_ns * 1e-9);
+        else s += fmt("  file stager: %llu routed layers read, %llu units, %.2f GiB in %llu preads; "
                  "%.2f s reading (%.2f GB/s), %.2f s waiting on windows\n",
                  (unsigned long long)stats_.file_layers, (unsigned long long)stats_.file_units,
                  (double)stats_.file_bytes * gib, (unsigned long long)stats_.file_preads, rs,
                  rs > 0 ? (double)stats_.file_bytes / rs * 1e-9 : 0.0,
                  (double)stats_.file_wait_ns * 1e-9);
+    }
+    if (stats_.file_relaid)
+        s += fmt("  file tier relayout: %llu weights relaid on the read (%.2f GiB), %.2f s of the "
+                 "issuing thread in the file stager's read+relayout\n",
+                 (unsigned long long)stats_.file_relaid, (double)stats_.file_relaid_bytes * gib,
+                 (double)stats_.file_relayout_ns * 1e-9);
+    if (host_plane_reads_.load()) {
+        s += fmt("  host experts' plane reads: %llu weights read for the CPU in %.2f s of issuing-thread "
+                 "time (%.2f ms a batch weight), %llu relaid into the RAM cache beside it\n",
+                 (unsigned long long)host_plane_reads_.load(), (double)host_plane_read_ns_.load() * 1e-9,
+                 (double)host_plane_read_ns_.load() * 1e-6 / (double)host_plane_reads_.load(),
+                 (unsigned long long)host_plane_inserts_.load());
+        const NativeReadWorkers::Stats k = plane_workers_.stats();
+        s += fmt("  host experts' kept plane readers: %llu calls on them (%llu posted ahead of the "
+                 "pool's jobs, ..._MISS_POST; %llu posts read the normal way, the readers on another "
+                 "thread's call), %llu that could not start them; %llu threads started\n",
+                 (unsigned long long)k.pooled_dispatches, (unsigned long long)k.posted_dispatches,
+                 (unsigned long long)k.busy_posts, (unsigned long long)k.fallback_dispatches,
+                 (unsigned long long)k.thread_starts);
+    }
+    if (packed_cache()) {
+        const PackedStats ps = packed_stats();
+        const auto c = mapped_file_cache_.stats();
+        s += fmt("  packed RAM cache: slots %s + %s (raw rounds %d, %d); %llu weights packed and published; "
+                 "%llu unit inserts refused over a raw-round budget (%llu distinct units, never cached); "
+                 "%llu weights failed the scales' round trip (never published); %llu block_mxfp4 calls "
+                 "turned away (the card's copy path)\n",
+                 humanb((int64_t)c.slot_bytes[0]).c_str(), humanb((int64_t)c.slot_bytes[1]).c_str(),
+                 packed_raw_[0], packed_raw_[1], (unsigned long long)ps.inserted,
+                 (unsigned long long)ps.over_budget, (unsigned long long)ps.over_budget_units,
+                 (unsigned long long)ps.round_trip_failed, (unsigned long long)c.layout_refusals);
+    }
+    /* RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED (vram_packed.h): what the card holds packed. */
+    if (plan_ && plan_->vram_packed.units) {
+        const Plan::VramPacked& vp = plan_->vram_packed;
+        s += fmt("  VRAM packed experts: %lld static residents hold %lld weights (%lld gate_up, %lld down) in the "
+                 "packed-scale form, %s where block_mxfp4 takes %s; %lld weights packed and checked at load; "
+                 "%lld eligible weights over their raw-round budget stayed block_mxfp4; %lld weights' scales "
+                 "read in %.2f s to plan it; raw rounds %lld, at most %lld in a weight\n",
+                 (long long)vp.units, (long long)vp.weights, (long long)vp.gate_up, (long long)vp.down,
+                 humanb(vp.bytes).c_str(), humanb(vp.block_bytes).c_str(), (long long)vp.loaded,
+                 (long long)vp.over_budget, (long long)vp.scanned, vp.scan_s, (long long)vp.raw_rounds,
+                 (long long)vp.raw_max);
+    }
+    if (mirror_tail_ > 0 && PlaneMirror::get()) {
+        const PlaneMirror::Stats ms = PlaneMirror::get()->stats();
+        if (ms.reads)
+            s += fmt("  plane mirror (all ranks): %llu reads, %.2f GiB, %.2f ms a read, %.3f ms of it "
+                     "copying out of the bounce buffer\n",
+                     (unsigned long long)ms.reads, (double)ms.bytes * gib, (double)ms.ns * 1e-6 / (double)ms.reads,
+                     (double)ms.copy_ns * 1e-6 / (double)ms.reads);
+    }
+    if (relaid_reads_.load())
+        s += fmt("  file tier relayout split: %llu reads; %.2f s in preads and %.2f s relaying, summed "
+                 "over the relay threads (%.2f ms and %.2f ms a weight)\n",
+                 (unsigned long long)relaid_reads_.load(), (double)relaid_read_ns_.load() * 1e-9,
+                 (double)relaid_pack_ns_.load() * 1e-9,
+                 (double)relaid_read_ns_.load() * 1e-6 / (double)relaid_reads_.load(),
+                 (double)relaid_pack_ns_.load() * 1e-6 / (double)relaid_reads_.load());
+    if (native_file_cache_on_) {
+        const NativeFileCache::Stats c = native_file_cache_.stats();
+        s += fmt("  native file RAM cache: %llu hits (%.2f GiB), %llu misses (%.2f GiB), "
+                 "%llu evictions, %llu bypasses; %s charged of %s\n",
+                 (unsigned long long)c.hits, (double)c.hit_bytes * gib,
+                 (unsigned long long)c.misses, (double)c.miss_bytes * gib,
+                 (unsigned long long)c.evictions, (unsigned long long)c.bypasses,
+                 humanb(c.metadata_bytes + c.payload_charge).c_str(), humanb(c.budget_bytes).c_str());
+    }
+    if (stats_.file_prefill_ro_hits || stats_.file_prefill_ro_misses) {
+        s += fmt("  native prefill read-only: %llu cached weights (%.2f GiB), "
+                 "%llu read/relayout weights (%.2f GiB) not admitted; completed CPU windows, no LRU touch\n",
+                 (unsigned long long)stats_.file_prefill_ro_hits, (double)stats_.file_prefill_ro_hit_bytes * gib,
+                 (unsigned long long)stats_.file_prefill_ro_misses, (double)stats_.file_prefill_ro_miss_bytes * gib);
+    }
+    if (mapped_file_cache_on_) {
+        const auto c = mapped_file_cache_.stats();
+        s += c.slab_policy ?
+            "  mapped cache ReadOnly policy: retained-slab hit lease without LRU touch; miss read/pack windows without admission\n" :
+            "  mapped cache ReadOnly policy: bypass to original read/pack windows; no lease/LRU touch/admission\n";
+        s += fmt(c.slab_policy ?
+                 "  mapped retained-slab COPY-source cache: %llu hits, %llu misses, %llu evictions, %llu bypasses; "
+                 "%s owned logical payload (resident/idle), %s conservative mapped backing, %s metadata, %s policy cap; "
+                 "%llu copies/%.2f GiB without CPU bounce; %llu mapped allocations/%llu public free calls\n" :
+                 "  mapped COPY-source cache: %llu hits, %llu misses, %llu evictions, %llu bypasses; "
+                 "%s owned logical payload (resident/idle), %s conservative mapped backing, %s metadata, %s policy cap; "
+                 "%llu copies/%.2f GiB without CPU bounce; %llu mapped allocations/%llu public free calls\n",
+                 (unsigned long long)c.cache.hits,(unsigned long long)c.cache.misses,
+                 (unsigned long long)c.cache.evictions,(unsigned long long)c.cache.bypasses,
+                 humanb(c.logical_payload).c_str(),humanb(c.mapped_policy_charge).c_str(),
+                 humanb(c.external_metadata+c.cache.metadata).c_str(),
+                 humanb(c.external_metadata+c.cache.budget).c_str(),
+                 (unsigned long long)stats_.mapped_source_copies,double(stats_.mapped_source_bytes)*gib,
+                 (unsigned long long)c.allocations,(unsigned long long)c.public_free_invocations);
+        if(c.slab_policy){
+            const auto& a=c.slabs;
+            if(mapped_direct_fill_on_)s+=fmt("  mapped direct fill: %llu reservations, %llu committed (%s), %llu cancelled (%s), %zu active; %llu same-key busy bypasses; no fill-duration cache locks; full-weight only\n",
+                (unsigned long long)a.fill_reservations,(unsigned long long)a.fill_commits,humanb(a.fill_bytes).c_str(),
+                (unsigned long long)a.fill_aborts,humanb(a.fill_abort_bytes).c_str(),a.fills_active,(unsigned long long)a.fill_busy_bypasses);
+            if(a.second_chances)s+=fmt("  mapped second chances: %llu protected LRU-end entries moved to the front instead of evicted\n",
+                (unsigned long long)a.second_chances);
+            s += fmt("  mapped retained-slab ledger: %zu owners/%zu terminal free-invoked; %s retained backing, %s terminal charge, %s growth reserved; "
+                     "%llu growth attempts/%llu failures; %llu device-bind failures; same-class LRU, no per-eviction public free; policy charge is not RSS/unpin proof\n",
+                     a.retained_slab_owners,a.terminal_free_invoked_owners,humanb(a.retained_backing_charge).c_str(),
+                     humanb(a.terminal_backing_charge).c_str(),humanb(a.cache.reserved_charge).c_str(),
+                     (unsigned long long)a.growth_attempts,(unsigned long long)a.growth_failures,(unsigned long long)c.api.device_bind_failures);
+            for(int k=0;k<2;++k){const auto& cl=a.classes[k];
+                s += fmt("  mapped retained-slab class %s: %zu capacity/%zu resident/%zu idle/%zu busy/%zu leased slots; "
+                         "%s logical capacity/%s resident/%s idle/%s leased bytes; %llu class bypasses/%llu leased-tail bypasses\n",
+                         k==0?"GU":"DN",cl.capacity_slots,cl.resident_slots,cl.idle_slots,cl.busy_slots,cl.leased_slots,
+                         humanb(cl.capacity_logical_bytes).c_str(),humanb(cl.resident_logical_bytes).c_str(),
+                         humanb(cl.idle_logical_bytes).c_str(),humanb(cl.leased_logical_bytes).c_str(),
+                         (unsigned long long)cl.bypasses,(unsigned long long)cl.leased_tail_bypasses);
+            }
+        }
+        s += fmt("  mapped cache API timing (aggregate before final clear): %llu alloc attempts, "
+                 "%llu null returns, %llu alias rejections; alloc %llu ns total/%llu ns max; "
+                 "%llu free invocations, %llu ns total/%llu ns max; monotonic HOST elapsed, "
+                 "not per-request/pure pin time/confirmed unpin\n",
+                 (unsigned long long)c.api.allocate_attempts,(unsigned long long)c.api.allocate_null_returns,
+                 (unsigned long long)c.api.alias_rejections,(unsigned long long)c.api.allocate_ns,
+                 (unsigned long long)c.api.allocate_max_ns,(unsigned long long)c.api.free_invocations,
+                 (unsigned long long)c.api.free_ns,(unsigned long long)c.api.free_max_ns);
+    }
+    if (native_file_workers_on_) {
+        const auto readers = relay_workers_.stats();
+        s += fmt("  native read workers: %llu pooled windows, %llu serial windows, "
+                 "%llu startup-fallback windows, %llu threads started\n",
+                 (unsigned long long)readers.pooled_dispatches,
+                 (unsigned long long)readers.serial_dispatches,
+                 (unsigned long long)readers.fallback_dispatches,
+                 (unsigned long long)readers.thread_starts);
     }
     return s;
 }

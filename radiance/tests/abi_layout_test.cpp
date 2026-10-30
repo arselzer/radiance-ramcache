@@ -8,7 +8,7 @@
  *
  * Checked: a C translation unit (abi_c_test.c, strict C11) lays every struct out as C++ does; every
  * struct's listed fields account for its size, so the list in abi_layout_rows.h is complete; and
- * the layout agrees with the table below, taken at RAD_ABI_VERSION 27 and RAD_FORMAT_VER 2. Under
+ * the layout agrees with the table below, taken at RAD_ABI_VERSION 32 and RAD_FORMAT_VER 2. Under
  * those versions a listed field may not move or change size, an ABI struct may only grow by fields
  * past its old end, and an on-disk struct may not change at all. The table is a snapshot of the
  * headers: nothing else states the layout. When it disagrees the test prints the live table.
@@ -18,14 +18,12 @@
 #include "rad_abi.h"
 #include "rad_builder.h"
 #include "rad_device.h"
-#include "rad_deferred_status.h"
 #include "rad_encoding.h"
 #include "rad_format.h"
 #include "rad_philox.h"
 #include "rad_planes.h"
 #include "rad_plugin.h"
 #include "rad_quant.h"
-#include "rad_import.h"
 #include "rad_runtime.h"
 #include "rad_sample.h"
 #include "rad_spechub.h"
@@ -40,17 +38,6 @@
 #include <set>
 #include <string>
 #include <vector>
-
-extern "C" size_t abi_c_deferred_status_alignment(void);
-
-TEST(optional_deferred_status_word_has_fixed_c_and_cpp_layout) {
-    CHECK_EQ(sizeof(RadDeviceStatus), size_t(8));
-    CHECK_EQ(offsetof(RadDeviceStatus, code), size_t(0));
-    CHECK_EQ(offsetof(RadDeviceStatus, op), size_t(4));
-    CHECK_EQ(alignof(RadDeviceStatus), size_t(4));
-    CHECK_EQ(abi_c_deferred_status_alignment(), alignof(RadDeviceStatus));
-    CHECK_EQ(RAD_DEFERRED_STATUS_VERSION, 1u);
-}
 
 namespace {
 
@@ -71,8 +58,8 @@ std::vector<Row> cpp_rows() {
     };
 }
 
-/* The layout at RAD_ABI_VERSION 27 / RAD_FORMAT_VER 2 (see the file header). */
-constexpr uint32_t kTableAbi = 27, kTableFormat = 2;
+/* The layout at RAD_ABI_VERSION 32 / RAD_FORMAT_VER 2 (see the file header). */
+constexpr uint32_t kTableAbi = 32, kTableFormat = 2;
 const AbiRow kTable[] = {
 #include "abi_layout_table.h"
 };

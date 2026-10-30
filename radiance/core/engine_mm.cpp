@@ -26,9 +26,6 @@
 namespace rad {
 
 int Engine::run_encodes() {
-    if (const int s = model_policy_admission(); s < 0) return s;
-    if (!ranks_.empty() && ranks_[0]->program.requires_permanent_model_failure())
-        return RAD_E_UNSUPPORTED; // No verified multi-pass encoder protocol in V1.
     std::vector<std::shared_ptr<mm::Item>> items;
     sched_.take_encodes(&items);
     if (items.empty()) return RAD_OK;

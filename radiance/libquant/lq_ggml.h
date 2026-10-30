@@ -4,14 +4,11 @@
  */
 #pragma once
 #include "rad_quant.h"
-#include "rad_import.h"
 
 namespace lq {
 
 /* The quantiser's table row, for lq_registry.cpp. Its initialiser is a constant expression, so it
  * is in place before any table that copies it is built. */
 extern const RadQuantizerInfo ggml_quantizer;
-int ggml_import_count();
-const RadCheckpointImporterInfo* ggml_import_at(int i);
 
 }  /* namespace lq */

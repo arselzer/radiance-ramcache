@@ -17,13 +17,14 @@
  */
 #pragma once
 #include "../rad_core.h"
+#include "../place/ep_route_counts.h"
 #include "arena.h"
+#include "live_chain.h"
 #include "rank_barrier.h"
 #include "residency.h"
+#include "rowprefetch.h"
 #include "stager.h"
 #include "device/device.h"
-#include "deferred_status.h"
-#include "expert_prepare.h"
 
 #include <atomic>
 #include <memory>
@@ -37,10 +38,8 @@
 struct RadCtx { };
 
 namespace rad {
-class CachePrepare4RankBinding;
 
 class Registry;
-struct TinyCtxQuote;
 struct XpState;
 struct XpLayer;
 
@@ -79,9 +78,11 @@ struct OpPlan {
     int32_t       band_off = 0;      /* into Ctx::band_table_ */
     int32_t       n_bands  = 0;
     int32_t       plan_off = 0;      /* into Ctx::issue_table_, band * RAD_N_DOMAINS + domain */
-    /* The schema's operand count, cached so the arity check avoids a cold OpInfo. -1 when the op
-     * has no schema. */
-    int32_t       n_opd_schema = -1;
+    /* The schema's operand count, cached so the arity check avoids a cold OpInfo, -1 when the op
+     * has no schema; and the count without its trailing optional operands, which an issue may
+     * leave out. */
+    int32_t       n_opd_schema   = -1;
+    int32_t       n_opd_required = -1;
     bool          issued   = false;  /* did the run phase ever issue it (spec §16's graph dump) */
     /* Whether issuing it puts bytes on the interconnect. Set at bind from the resolved rows
      * (rad_kernel_collective) and the conventional all_reduce. The weight stager's copies share
@@ -95,6 +96,9 @@ struct OpPlan {
     /* Its position in the declared order, or its anchor's for a core-appended op: what the second
      * lane's window (Program::lane1_w0..lane1_w1) is checked against. */
     int32_t       order = 0;
+    /* A row gather (runtime/rowprefetch.h): on the host, its rows on the mapped tier are read
+     * ahead before the kernel runs. Matched by name once here, like `billed`. */
+    bool          row_gather = false;
 };
 
 /* ------------------------------------------------------------------ routing handoff */
@@ -145,6 +149,16 @@ struct RouteSlot {
  *     LINEAR         [n_states, n_head_kv, state_dim[0], state_dim[1]]
  *     CONV           [n_states, n_head_kv * head_dim, conv_slots]      channel-major, then time
  */
+/* One of a streamed group's two views of its allocation (kvstream/bind.h). `depth` is the stripe
+ * count it presents: 0 for the ring's `n_layers`, 1 for the stage, where every layer aliases
+ * offset 0. */
+struct KVViewState {
+    int64_t layer_stride = 0;
+    int64_t bytes = 0;
+    int64_t depth = 0;             /* 0: n_layers; 1: every layer at offset 0 */
+    int64_t shape0 = 0;            /* the operand's [blocks] extent for this view */
+};
+
 struct KVPoolBinding {
     void*    base = nullptr;
     int64_t  layer_stride = 0;      /* bytes between one layer's cache and the next */
@@ -156,7 +170,20 @@ struct KVPoolBinding {
     std::vector<int32_t> layer_slot;
     uint32_t rank = 0;              /* 0 when the group has no plan: the operand stays a flat span */
     int64_t  shape[RAD_MAX_RANK] = {0};
+    /* The active view's stripe count, as KVViewState::depth. */
+    int64_t  depth = 0;
+    /* Both views of a streamed group's allocation; the stage only when the plan's depth is 1. The
+     * active fields above are set from one of them before each pass (kvstream_enter). */
+    KVViewState ring;
+    KVViewState stage;
+    bool        has_stage = false;
+    /* Bytes of a layer's mirror row a staged pass copies, from the held bound (kvstream/stage.h,
+     * "Volume"), set each step. 0 copies the whole row. */
+    int64_t     stage_live_bytes = 0;
 };
+
+/* The KV stage's driver (kvstream/stage.cpp), declared here for Ctx::tape_kv_stage. */
+int kvstage_run(Ctx* c, int group, int layer, bool after);
 
 struct CtxDesc {
     Program*        program     = nullptr;
@@ -167,6 +194,12 @@ struct CtxDesc {
     ResidencyTable* residency   = nullptr;  /* null in the all-in-VRAM case */
     ArchStepFn      arch_step   = nullptr;  /* the architecture plugin's rad_arch_step */
     bool            profile_ops = false;    /* spec §16, and it changes what you measure */
+    /* --row-prefetch: a host gather's rows on the mapped tier are read ahead of (or beside) its
+     * kernel (runtime/rowprefetch.h). */
+    bool            row_prefetch = true;
+    /* --debug-tape-dump: the first recording of each draft pass kind lists its dispatches on
+     * stderr (TAPEDUMP lines) and which of them start unordered behind the one before. */
+    bool            tape_dump = false;
     /* Whether a repeated pass may be recorded and played back. False for a caller whose pass
      * issues work the batch does not describe (e.g. a test driving another component through
      * run_step), since a recording keyed on the batch would replay the wrong pass. */
@@ -180,21 +213,11 @@ struct CtxDesc {
      * reference library's host rows. Null: the oracle checks a band only where the reference
      * library won its host row. */
     Registry*       registry    = nullptr;
-    ExpertPrepareOwner* expert_prepare_owner = nullptr; // lifetime through Ctx shutdown
-    ExpertPrepareLimits expert_prepare_limits{};
-    // Internal sealed transport only: borrow a precharged compute stream and
-    // fail stop on unproven retirement BEFORE any internal shutdown releases.
-    bool tiny_retirement = false;
-    CachePrepare4RankBinding* cache_prepare4 = nullptr; // experimental sealed-source TP4 binding, borrowed through shutdown
 };
 
 /* ------------------------------------------------------------------ Ctx */
 class Ctx : public RadCtx {
 public:
-    static int tiny_startup_quote(const CtxDesc&,bool current_route_handoff,TinyCtxQuote*) noexcept;
-    // Metadata-only actual GLM TP4/seq1/maxTok1/no-spec quote. Real KV pool
-    // payload is charged by Pools/KV; this quotes the Context's binding copies.
-    static int glm_main_startup_quote(const CtxDesc&,TinyCtxQuote*) noexcept;
     Ctx();   /* out of line, beside ~Ctx: xp_ points to a type this header only names */
     ~Ctx();
     Ctx(const Ctx&) = delete;
@@ -204,10 +227,6 @@ public:
     void shutdown();
 
     /* ---------------------------------------------------------- the hot path */
-    int expert_prepare(const RadExpertPrepare*);
-    uint64_t expert_prepare_copies() const { return expert_prepare_ ? expert_prepare_->copies : 0; }
-    uint64_t expert_prepare_bytes() const { return expert_prepare_ ? expert_prepare_->copied_bytes : 0; }
-
     int issue(rad_op h, const RadOperand* opd, int n_opd, int64_t n);
     /* A weight stager for the passes it arms for (runtime/stager.h); null for none. */
     void set_stager(OpStager* s) { stager_ = s; }
@@ -222,7 +241,6 @@ public:
     /* Call once on the rank thread before its first run_step: the backend's current device is
      * thread-local, and init may have run on another thread. */
     int bind_thread();
-    CachePrepare4RankBinding* cache_prepare4_binding()const noexcept{return cache_prepare4_;}
     /* The runtime LoRA slot every row of the generator passes that follow runs with, -1 for none
      * (Ctx::issue_lora). Set by the pass loop before it releases the rank for a pass. */
     void set_gen_lora_slot(int32_t s) { gen_lora_slot_ = s; }
@@ -232,20 +250,19 @@ public:
     int             rank()       const { return rank_; }
     /* Whether repeated passes are recorded and played back (prepare() says when they are not). */
     bool            records_passes() const { return tape_on_; }
-    bool            checks_device_status() const { return deferred_status_.enabled(); }
-    bool            requires_permanent_model_failure() const { return permanent_model_failure_; }
-    // Atomic code only is safe for Engine admission while workers are parked.
-    // step_error's owned string is still rank-thread/barrier protected.
-    int             terminal_status() const { return permanent_model_failure_ ? terminal_status_.load(std::memory_order_acquire) : RAD_OK; }
-    /* Completes this pass's owned validation readback. Used by the rank model
-     * phase before any rank is released to sample or publish state. */
-    int             await_device_status();
-    /* Opt-in synchronous checkpoint on the owning rank thread, during an eager
-     * lane0 TP1 pass only. Success observes prior collectors without resetting
-     * the sticky latch or sealing the pass. A failed in-pass checkpoint makes
-     * this Ctx fatal until recreation; final seal/await is still required for
-     * ownership retirement. No negative return proves device quiescence. */
-    int             checkpoint_device_status();
+    /* Whether the pass being issued is being recorded. */
+    bool            recording()  const { return rec_ != nullptr; }
+    /* A KV stage call while recording: a host step that re-runs at every play, because its DMA
+     * list is not a queue packet (kvstream/stage.cpp; xprefetch.cpp does the same). */
+    int tape_kv_stage(bool after, int group, int layer) {
+        TapeStep st;
+        st.kind = (uint8_t)(after ? kTapeKvStageAfter : kTapeKvStage);
+        st.a = group;
+        st.b = layer;
+        return tape_host(st, [&] { return kvstage_run(this, group, layer, after); });
+    }
+    /* This rank's device ordinal, for the calls that name a card rather than a stream. */
+    int             device()     const { return device_; }
     int             world_size() const { return world_size_; }
     RadStream       stream()     const { return stream_; }
     Program*        program()    const { return program_; }
@@ -263,6 +280,16 @@ public:
 
     void* weight_ptr(rad_weight w);
     void* buf_ptr(rad_buf b);
+    /* The group-local position of model layer `layer` in the binding's layer_slot, or -1: the
+     * index of its host mirror row (rad_kv_layer_index). */
+    int64_t kv_layer_index(rad_kvgroup g, int layer) const;
+    /* The group's pool binding, for the view switch and the stage. */
+    const KVPoolBinding* kv_binding(rad_kvgroup g) const {
+        return g < kv_.size() ? &kv_[(size_t)g] : nullptr;
+    }
+    KVPoolBinding* kv_binding(rad_kvgroup g) {
+        return g < kv_.size() ? &kv_[(size_t)g] : nullptr;
+    }
 
     /* ---------------------------------------------------------- routing (spec §5.5) */
     int route_report(int layer, const RadRouting* r);
@@ -277,6 +304,24 @@ public:
     /* How many layers report routing (the heat engine's sweep). Zero on a dense model. */
     int               n_route_layers() const { return (int)route_.size(); }
     int64_t           route_n_expert() const { return route_n_expert_; }
+    /* Layer `layer`'s card-side counts row when the layer's last report named that row, i.e. its
+     * router writes this pass's counts there in stream order (rad_route_counts); null otherwise,
+     * including before the layer's first report. `n_expert` and `top_k` are that report's. The
+     * file stager reads it to fetch only the experts a small pass routes to. */
+    const int32_t* route_counts_live(int layer, int64_t* n_expert, int64_t* top_k) const {
+        if (!route_dev_ || layer < 0 || (size_t)layer >= route_.size()) return nullptr;
+        const int32_t* row = route_dev_ + (int64_t)layer * route_n_expert_;
+        const RadRouting& r = route_[(size_t)layer].routing;
+        if (r.expert_count != row || r.n_expert <= 0 || r.n_expert > route_n_expert_ ||
+            r.top_k <= 0)
+            return nullptr;
+        if (n_expert) *n_expert = r.n_expert;
+        if (top_k) *top_k = r.top_k;
+        return row;
+    }
+    /* Private EP view: queued by THIS pass's actual successful count producer, not by
+     * a previous RadRouting report. The file stager supplies the completion event. */
+    bool ep_route_counts_live(int layer, EpRouteCounts* out) const;
 
     /* ---------------------------------------------------- the next-layer expert prefetch
      * (xprefetch.h). xp_open at bringup, after placement has made its pinned pools, with their
@@ -322,15 +367,23 @@ public:
      * every step, or the graph dump reports every op as never issued. */
     void        flush_issued();
     void        dump_profile() const;      /* spec §16, opt-in, with its caveat printed */
-    const char* step_error() const {
-        return terminal_status() < 0 ? terminal_error_ : step_fail_.c_str();
-    }
+    const char* step_error() const { return step_fail_.c_str(); }
     int64_t     stream_waits() const { return n_stream_waits_; }
     /* Lane 1 has work lane 0 has not joined (lane1_pending_). */
     bool        lane1_pending() const { return lane1_pending_; }
     /* Host synchronisations on the step path. Always zero unless per-op timing is on (spec §16);
      * tests read it. Teardown's drain is not counted. */
     int64_t     host_syncs()   const { return n_host_syncs_; }
+    /* Of those, the host-op joins that drained the stream because an operand is untracked by the
+     * host arena (host_join_drains); tests read it. */
+    int64_t     host_drains()  const { return n_host_drains_; }
+    /* Host gathers whose rows were read ahead from the mapped tier, and the pages they advised
+     * (runtime/rowprefetch.h); tests read them. */
+    int64_t     row_prefetch_calls() const { return rowpf_calls_; }
+    int64_t     row_prefetch_pages() const { return rowpf_pages_; }
+    /* Of the calls, those whose read-ahead ran beside the kernel (runtime/rowprefetch.h). */
+    int64_t     row_prefetch_beside_calls() const { return rowpf_beside_calls_; }
+    bool        row_prefetch_busy() const { return rowpf_worker_ && rowpf_worker_->busy(); }
     /* This rank's all-reduce traffic. The inter-card link carries both the tensor-parallel
      * all-reduce and the expert mover's transfers; the mover counts its own (MoverStats), so the
      * two can be told apart.
@@ -364,6 +417,11 @@ public:
         c.unordered      = pc_unordered_.load(std::memory_order_relaxed);
         return c;
     }
+    /* The live issue path's overlap and trace (runtime/live_chain.h): the shutdown line, empty
+     * when RADIANCE_EXPERIMENTAL_DS41_CHAIN_OVERLAP and _TRACE are both off. Read after the rank's
+     * thread stopped issuing. */
+    std::string live_report() const { return live_.report(); }
+    const LiveStats& live_stats() const { return live_.stats(); }
     void*       arena_base()   const { return arena_.base(); }
     void*       scratch()      const { return arena_.scratch(); }
 
@@ -387,14 +445,12 @@ public:
     uint64_t    pass_key(const RadBatch* b) const;
 
 private:
+    friend struct EpCountsHostProbe;
     int  prepare();
     int  bind_arena();
     int  bind_buffers();
     int  bind_weights();
     int  bind_ops();
-    int  bind_deferred_status();
-    void record_device_status_error(int status, const char* boundary);
-    int remember_model_failure(int status, const char* fallback = nullptr);
     int  issue_lora(rad_op h, const RadOperand* opd, int n_opd, int64_t n);
     int32_t gen_lora_slot_ = -1;
     int  bind_routing();
@@ -473,7 +529,8 @@ private:
      * issue. A difference means the key misses a dependency; the step fails, naming the first
      * differing dispatch. */
     enum TapeKind : uint8_t { kTapePlay = 0, kTapeTable = 1, kTapeHost = 2, kTapeRoute = 3,
-                              kTapeXp = 4, kTapeXpMark = 5, kTapeXpStep = 6 };
+                              kTapeXp = 4, kTapeXpMark = 5, kTapeXpStep = 6,
+                              kTapeKvStage = 7, kTapeKvStageAfter = 8 };
     /* A prefetch call (Ctx::xp_predict), run again where the pass made it. */
     struct TapeXp {
         RadPrefetchNext next{};
@@ -493,8 +550,11 @@ private:
         RadTensor        t[MAX_OPERANDS] = {};
         int64_t          n = 0;
         bool             drain = false;    /* an operand the arena does not track: drain instead */
-        rad_weight       direct_weights[MAX_OPERANDS] = {};
-        int              n_direct_weights = 0; /* stable dependencies, not captured ready state */
+        /* The lanes whose last host-arena toucher its join waited on when recorded. A play
+         * re-records those events in the played stretches, but only the issue path raises
+         * host_touch_pending_, so a pass with two host ops would run the second unjoined. */
+        bool             touch[2] = { false, false };
+        RowPrefetch      rp{};             /* its rows read ahead at every play (rowprefetch.h) */
     };
     struct PassTape {
         uint64_t key = 0;
@@ -524,6 +584,7 @@ private:
         int32_t  rec0 = 0, rec1 = 0;      /* its dispatches in the tape */
         uint32_t op = 0;
         bool     opaque = false;
+        const KernelRow* row = nullptr;   /* for --debug-tape-dump only */
         uint32_t rd = 0, n_rd = 0, wr = 0, n_wr = 0;   /* into haz_rng_ */
     };
     std::vector<HazOp> haz_ops_;
@@ -531,6 +592,22 @@ private:
     void haz_note(const OpPlan& p, const IssuePlan& ip, const RadTensor* t, int n_opd, int rec0,
                   int rec1);
     int  haz_mark(PassTape& t);
+    /* The live issue path's counterpart of haz_note / haz_mark, per launch (runtime/live_chain.h):
+     * live_before checks the launch against what is in flight on its queue and opens the backend's
+     * window, live_after closes it and books what the launch wrote. Only for device launches of a
+     * pass issued live (not while a tape records). */
+    LiveChain live_;
+    void live_before(const OpPlan& p, const IssuePlan& ip, const RadTensor* t,
+                     const RadOperand* opd, int n_opd, bool touches_host, LiveCall* c);
+    void live_after(LiveCall* c);
+    /* An architecture step issued live, between the trace's and the counters' pass marks. */
+    void live_step(const RadBatch* b) {
+        live_.pass_begin(b);
+        arch_step_(this, b);
+        live_.pass_end();
+    }
+    bool tape_dump_ = false;  /* --debug-tape-dump (CtxDesc::tape_dump) */
+    bool haz_dump_ = false;   /* haz_mark lists this recording's dispatches (tape_dump_) */
 
     static constexpr size_t  kTapes      = 24;     /* recorded passes kept, least recently used out */
     static constexpr int64_t kAuditPlays = 1024;
@@ -630,19 +707,10 @@ private:
     Registry*       registry_  = nullptr;   /* CtxDesc::registry */
     std::vector<KVPoolBinding> kv_;   /* by rad_kvgroup; RAD_OPK_KV resolves through it */
     ResidencyTable* residency_ = nullptr;
-    std::unique_ptr<ExpertPrepareState> expert_prepare_;
-    int expert_prepare_open(ExpertPrepareOwner*,const ExpertPrepareLimits&);
-    void expert_prepare_close(bool drained);
-    int expert_prepare_admit(const RadBatch*); // pure readiness/profile admission; never opens a pass
-    void expert_prepare_begin();              // nonfallible activation AFTER deferred begin
-    int expert_prepare_end();
-    int expert_prepare_fail(int,const char*);
     OpStager*       stager_ = nullptr;
     bool            staging_ = false;     /* the stager armed for the pass being issued */
     int issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n);
     ArchStepFn      arch_step_ = nullptr;
-    DeferredStatus deferred_status_;
-    std::vector<DeferredStatusLaunch> deferred_launches_;
 
     /* The expert prefetch's state (xp_state.h), null while it is off. */
     std::unique_ptr<XpState> xp_;
@@ -659,7 +727,6 @@ private:
     int       device_     = 0;
     RadStream stream_     = nullptr;
     bool      own_stream_ = false;
-    bool      tiny_retirement_ = false;
 
     /* ---- The second lane: overlaps the tensor-parallel all-reduce with compute at prefill
      * (order of 15% prefill throughput). Any use must respect these constraints:
@@ -711,8 +778,21 @@ private:
     bool      host_touch_pending_[2] = { false, false };
     int       host_join(const RadOperand* opd, int n_opd);
     bool      host_join_drains(const RadOperand* opd, int n_opd) const;
-    bool      host_weights_pending(const rad_weight* weights, int n_weights) const;
     int       host_join_wait(bool drain);
+    /* Read ahead a host gather's rows on the mapped tier (runtime/rowprefetch.h): which tables
+     * this issue reads there, then the madvise over the rows `t[0]` names -- in front of the
+     * kernel, or beside it on rowpf_worker_ when longer than kRowAheadInline and its sampled rows
+     * are resident; row_prefetch_done() after the kernel returns stops and joins that. Off with
+     * --row-prefetch off (CtxDesc::row_prefetch). */
+    bool      row_prefetch_on_ = true;
+    RowPrefetchScratch rowpf_;
+    int64_t   rowpf_calls_ = 0, rowpf_pages_ = 0, rowpf_beside_calls_ = 0;
+    std::unique_ptr<RowPrefetchWorker> rowpf_worker_;
+    bool      rowpf_beside_ = false;   /* a read-ahead runs beside the kernel being launched */
+    void      row_prefetch_plan(const RadArgs& a, const RadOperand* opd, int n_opd,
+                                const RadTensor* t, RowPrefetch* out) const;
+    void      row_prefetch_run(const RowPrefetch& rp, const RadTensor* t, int64_t n);
+    void      row_prefetch_done();
     /* A lane issued a scratch user and the other lane has not been joined behind it since. Keeps
      * two lanes off the shared region at once; lane_join clears its `from` side. See the scratch
      * block in Ctx::issue. */
@@ -765,6 +845,11 @@ private:
     std::vector<std::atomic<uint8_t>>   op_domain_;   /* sized once, never resized */
 
     std::vector<RouteSlot> route_;
+    std::vector<EpRouteCounts> ep_route_;
+    uint64_t ep_route_generation_ = 0, ep_route_serial_ = 0;
+    int begin_ep_route_generation();
+    void note_ep_route_producer(const OpInfo& op, const RadTensor* t, int n_t,
+                                int64_t rows, RadStream issued_stream);
     int64_t                route_n_expert_ = 0;
     /* A bank is one step's histograms for every layer: [kRouteBanks][n_layer][n_expert] in pinned
      * host memory. A report copies a layer's counts into its row of the card-side
@@ -798,18 +883,13 @@ private:
      * for wall time the ops' own times do not cover. */
     std::vector<double>   prof_wait_ms_;
 
-    bool        permanent_model_failure_ = false;
-    CachePrepare4RankBinding* cache_prepare4_ = nullptr;
-    void cache_prepare4_fail_if_bound(int status)const noexcept;
-    // Deliberately not reset by shutdown/init; a failed object cannot be reused.
-    std::atomic<int> terminal_status_{RAD_OK};
-    char terminal_error_[2048] = {}; // owned bounded fallback, no failure-path allocation
     int         step_status_ = RAD_OK;
     std::string step_fail_;
 
     int64_t n_issues_ = 0;
     int64_t n_stream_waits_ = 0;
     int64_t n_host_syncs_ = 0;
+    int64_t n_host_drains_ = 0;
     std::atomic<int64_t> ar_calls_{0}, ar_bytes_{0};
     std::atomic<int64_t> pc_played_{0}, pc_recorded_{0}, pc_audited_{0};
     std::atomic<int64_t> pc_unkeyed_{0}, pc_refused_{0}, pc_first_{0};

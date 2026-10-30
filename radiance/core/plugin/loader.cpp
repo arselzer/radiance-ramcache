@@ -4,8 +4,6 @@
 #include "registry.h"
 #include "../device/device.h"
 #include "../format/encoding.h"
-#include "rad_deferred_status_capability.h"
-#include "rad_model_failure_policy.h"
 
 #include <dlfcn.h>
 #include <dirent.h>
@@ -16,18 +14,6 @@
 #include <cerrno>
 #include <cstdarg>
 #include <cstring>
-
-/* Kept in the loader object: every tool reaching rad_plugin_open necessarily
- * links this capability, even when it never instantiates a runtime Ctx. */
-extern "C" uint32_t rad_core_deferred_status_version(void) {
-    return RAD_DEFERRED_STATUS_VERSION;
-}
-
-// Version1 includes both Ctx and Engine guards in this overlay, not only a
-// local wrapper. Never publish1 in a partial Core-only implementation.
-extern "C" uint32_t rad_core_model_failure_policy_version(void) {
-    return RAD_MODEL_FAILURE_POLICY_VERSION;
-}
 
 namespace rad {
 
@@ -199,7 +185,6 @@ int Registry::commit_(Staged& s, int order) {
     std::vector<const RadOpSchema*> staged_schemas;
     std::vector<std::pair<const RadKernelInfo*, int>> staged_rows;   /* the row and its index */
     std::vector<const RadQuantizerInfo*> staged_quants;
-    std::vector<const RadCheckpointImporterInfo*> staged_imports;
     int n_declared_schemas = 0;
 
     if (p.kind == RAD_PLUGIN_ARCH) {
@@ -243,6 +228,12 @@ int Registry::commit_(Staged& s, int order) {
         /* A video generator's rotary positions; the driver refuses to start without it. */
         p.arch_video_positions = dl_fn<int64_t (*)(int, const RadVideoGeom*, float*, int64_t)>(
             s.handle, "rad_arch_video_positions");
+        /* Its reference conditioning, which the video driver refuses to serve without. */
+        p.arch_video_pack = dl_fn<int64_t (*)(const RadVideoGeom*, const int32_t*, int32_t*,
+                                              int32_t*, int32_t*, int32_t*, float*, int64_t)>(
+            s.handle, "rad_arch_video_pack");
+        p.arch_encode_geom = dl_fn<int64_t (*)(int32_t, const int64_t*, int32_t*, int64_t)>(
+            s.handle, "rad_arch_encode_geom");
 
         /* The (architecture id, quantisation) pair selects the plugin, so no two plugins may claim
          * the same pair (§2.4). Sharing an id at different quantisations is normal (qwen35_bf16
@@ -419,86 +410,11 @@ int Registry::commit_(Staged& s, int order) {
                 }
             staged_quants.push_back(q);
         }
-        auto i_n = dl_fn<int (*)(void)>(s.handle, "rad_checkpoint_import_count");
-        auto i_at = dl_fn<const RadCheckpointImporterInfo* (*)(int)>(
-                        s.handle, "rad_checkpoint_import_at");
-        if (!!i_n != !!i_at) {
-            err_("quantiser plugin '%s' has an incomplete checkpoint importer interface", p.name.c_str());
-            unstage_(s);
-            return RAD_E_INVAL;
-        }
-        const int ni = i_n ? i_n() : 0;
-        if (ni < 0 || ni > 65536) {
-            err_("quantiser plugin '%s' has an invalid checkpoint importer count", p.name.c_str());
-            unstage_(s);
-            return RAD_E_INVAL;
-        }
-        for (int i = 0; i < ni; ++i) {
-            const auto* q = i_at(i);
-            if (!q || !q->source_format || !*q->source_format || !q->source_type ||
-                !*q->source_type || q->block_values <= 0 || q->block_bytes <= 0 ||
-                !q->encoding || !q->import_rows) {
-                err_("quantiser plugin '%s' declares an invalid checkpoint importer at %d", p.name.c_str(), i);
-                unstage_(s);
-                return RAD_E_INVAL;
-            }
-            auto clash = [&](const RadCheckpointImporterInfo* other) {
-                return !std::strcmp(q->source_format, other->source_format) &&
-                       !std::strcmp(q->source_type, other->source_type);
-            };
-            bool duplicate = false;
-            for (const auto& row : importers_) duplicate = duplicate || clash(row.info);
-            for (const auto* other : staged_imports) duplicate = duplicate || clash(other);
-            if (duplicate) {
-                err_("checkpoint importer '%s/%s' is offered twice; refusing '%s'",
-                     q->source_format, q->source_type, p.name.c_str());
-                unstage_(s);
-                return RAD_E_DUPLICATE;
-            }
-            staged_imports.push_back(q);
-        }
     } else {
         err_("plugin '%s' declares kind %u, which is not a kernel, architecture or quantiser "
              "plugin", p.name.c_str(), p.kind);
         unstage_(s);
         return RAD_E_INVAL;
-    }
-
-    /* Optional interface is validated before anything is registered. A malformed
-     * pair must not silently drop device validation or partially register rows. */
-    const auto status_version = dl_fn<RadPluginDeferredStatusVersionFn>(
-        s.handle, "rad_plugin_deferred_status_version");
-    const auto status_query = dl_fn<RadKernelDeferredStatusFn>(s.handle, "rad_kernel_deferred_status");
-    const auto collective = dl_fn<RadKernelCollectiveFn>(s.handle, "rad_kernel_collective");
-    if (!!status_version != !!status_query ||
-        (status_version && (p.kind != RAD_PLUGIN_KERNEL || status_version() != RAD_DEFERRED_STATUS_VERSION))) {
-        err_("plugin '%s' has an incomplete or unsupported deferred-status interface", p.name.c_str());
-        unstage_(s);
-        return RAD_E_ABI;
-    }
-    std::vector<RadDeferredStatusLaunchFn> status_collectors;
-    std::vector<int> status_collectives;
-    if (status_query) {
-        status_collectors.reserve(staged_rows.size());
-        status_collectives.reserve(staged_rows.size());
-        for (const auto& sr : staged_rows) {
-            const auto collect = status_query(sr.second);
-            const int collective_kind = collective ? collective(sr.second) : 0;
-            if (collect && sr.first->domain != RAD_DOMAIN_DEVICE) {
-                err_("kernel '%s' in plugin '%s' requests device-status collection from a host row",
-                     sr.first->name, p.name.c_str());
-                unstage_(s);
-                return RAD_E_ABI;
-            }
-            if (collect && collective_kind == 2) {
-                err_("kernel '%s' in plugin '%s' combines deferred status with a self-releasing link hold; contract v1 refuses it",
-                     sr.first->name, p.name.c_str());
-                unstage_(s);
-                return RAD_E_ABI;
-            }
-            status_collectors.push_back(collect);
-            status_collectives.push_back(collective_kind);
-        }
     }
 
     /* Called once after load, before any selection (rad_abi.h). A plugin that cannot open is
@@ -529,13 +445,13 @@ int Registry::commit_(Staged& s, int order) {
         /* Register its decoder so every weight reader can decode its schemes. */
         if (q->decode) enc_add_decoder(q->decode);
     }
-    for (const auto* q : staged_imports) importers_.push_back(ImportRow{q, p.name});
     const auto concurrent = dl_fn<RadKernelConcurrentFn>(s.handle, "rad_kernel_concurrent");
+    const auto collective = dl_fn<RadKernelCollectiveFn>(s.handle, "rad_kernel_collective");
     const auto chainable  = dl_fn<RadKernelChainFn>(s.handle, "rad_kernel_chain");
+    const auto fetches    = dl_fn<RadKernelFetchesRowsFn>(s.handle, "rad_kernel_fetches_rows");
     /* Per row when exported, else the library's own answer: a plugin that ships a device row and
      * its host oracle in one library must not have the oracle's status leak onto the device row. */
     const auto kern_ref = dl_fn<RadKernelReferenceFn>(s.handle, "rad_kernel_reference");
-    size_t status_row = 0;
     for (const auto& sr : staged_rows) {
         KernelRow row;
         row.info         = sr.first;
@@ -543,17 +459,12 @@ int Registry::commit_(Staged& s, int order) {
         row.plugin_order = order;
         row.index        = sr.second;
         row.concurrent   = concurrent && concurrent(sr.second) != 0;
-        const int coll   = status_query ? status_collectives[status_row]
-                                       : (collective ? collective(sr.second) : 0);
+        const int coll   = collective ? collective(sr.second) : 0;
         row.collective   = coll != 0;
         row.releases_link = coll == 2;
         row.reference    = kern_ref ? kern_ref(sr.second) != 0 : p.reference;
         row.chain        = chainable && chainable(sr.second) != 0;
-        row.deferred_status = status_query ? status_collectors[status_row] : nullptr;
-        ++status_row;
-        /* The collector writes an extra persistent latch outside the op schema.
-         * Version 1 always issues these rows live and conservatively ordered. */
-        if (row.deferred_status) { row.concurrent = false; row.chain = false; }
+        row.fetches_rows = fetches && fetches(sr.second) != 0;
         rows_.push_back(row);
     }
 
@@ -780,13 +691,6 @@ const Registry::QuantRow* Registry::quantizer(std::string_view name) const {
     return nullptr;
 }
 
-const Registry::ImportRow* Registry::checkpoint_importer(std::string_view format,
-                                                         std::string_view type) const {
-    for (const auto& row : importers_)
-        if (format == row.info->source_format && type == row.info->source_type) return &row;
-    return nullptr;
-}
-
 const std::vector<const KernelRow*>* Registry::rows_for(std::string_view op) const {
     auto it = by_op_.find(std::string(op));
     return it == by_op_.end() ? nullptr : &it->second;
@@ -804,7 +708,6 @@ void Registry::close() {
     plugins_.clear();
     rows_.clear();
     quants_.clear();
-    importers_.clear();
     by_op_.clear();
     schemas_.clear();
     load_errors_.clear();

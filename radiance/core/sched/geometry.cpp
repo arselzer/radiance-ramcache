@@ -2,7 +2,6 @@
  * See geometry.h.
  */
 #include "geometry.h"
-#include "runtime/cache_prepare4_session.h"
 
 #include <algorithm>
 #include <cstring>
@@ -39,7 +38,7 @@ int64_t prefill_shared_tok(const Config& cfg) {
     return std::max(std::min(cfg.max_tok, I), cfg.max_tok - (cfg.prefill_span - 1) * I);
 }
 
-static int resolve_geometry(const Program& prog,const Config& cfg,ChunkGeometry* out,bool final_single_token) {
+int chunk_geometry_resolve(const Program& prog, const Config& cfg, ChunkGeometry* out) {
     if (!out) return RAD_E_INVAL;
     ChunkGeometry g;
 
@@ -144,14 +143,48 @@ static int resolve_geometry(const Program& prog,const Config& cfg,ChunkGeometry*
      * checkpoints land wherever a step ends (§7.3). */
     g.min_max_tok = g.quantum;
 
-    *out = g;
-
-    if (cfg.max_tok < g.min_max_tok && !final_single_token) {
+    if (cfg.max_tok < g.min_max_tok) {
+        *out = g;
         RAD_ERR("--max-num-batched-tokens is %lld but this model's chunk geometry needs at least "
                 "%lld, so a chunk can end on a linear-state boundary: %s",
                 (long long)cfg.max_tok, (long long)g.min_max_tok, g.why.c_str());
         return RAD_E_INVAL;
     }
+
+    /* The resume grid (--prefix-resume exact): where an idle server's prefill chunks start. A
+     * prefill alone in its step takes the budget, rounded down to the quantum, and stops at every
+     * interval boundary it reaches where chunks split at the interval (linear state, or periodic
+     * window snapshots); a span carries h intervals from the second one on. An interval past the
+     * budget must then be a multiple of the budget's chunk, or the chunk after a checkpoint would
+     * start off the grid every cold run cuts: rounded up, as the quantum rounds it, since a longer
+     * interval costs only retention. */
+    const int64_t I0 = g.checkpoint_interval;
+    const bool splits = I0 > 0 && (!g.window_ckpt || g.window_periodic);
+    const int64_t budget_chunk = cfg.max_tok / g.quantum * g.quantum;
+    g.exact = cfg.prefix_exact && cfg.prefix_cache;
+    if (g.exact && splits && I0 > budget_chunk && I0 % budget_chunk != 0) {
+        g.checkpoint_interval = align_up(I0, budget_chunk);
+        RAD_WARN("--checkpoint-interval %lld resolves to %lld: --prefix-resume exact needs it a "
+                 "multiple of the %lld-token prefill chunk (--max-num-batched-tokens %lld) so "
+                 "every checkpoint is where a cold prefill's chunk ends; give a multiple of %lld, "
+                 "or --prefix-resume nearest to keep %lld", (long long)cfg.checkpoint_interval,
+                 (long long)g.checkpoint_interval, (long long)budget_chunk, (long long)cfg.max_tok,
+                 (long long)budget_chunk, (long long)I0);
+    }
+    if (g.exact) {
+        const int64_t I = g.checkpoint_interval;
+        if (splits && I <= budget_chunk) {
+            const int64_t h = g.span > 1 ? std::max<int64_t>(1, std::min(g.span, cfg.max_tok / I))
+                                         : 1;
+            g.grid = h * I;
+            g.grid_origin = h > 1 ? I : 0;
+        } else {
+            g.grid = budget_chunk;
+            g.grid_origin = 0;
+        }
+    }
+
+    *out = g;
 
     /* Log the effective chunk length. `plan_chunk` splits at the checkpoint interval first, so
      * when the interval is below --max-num-batched-tokens, raising the budget does not change the
@@ -168,6 +201,13 @@ static int resolve_geometry(const Program& prog,const Config& cfg,ChunkGeometry*
              eff >= cfg.max_tok ? ""
              : g.span > 1 ? " (the checkpoint interval times the span, not the budget)"
                           : " (the checkpoint interval, not the budget)");
+    if (g.exact)
+        RAD_INFO("prefix resume: exact -- a hit resumes only where an idle server's cold prefill "
+                 "of the same prompt starts a chunk (every %lld tokens%s) and a prompt's tail "
+                 "snapshot is taken where its last chunk starts, so the hit recomputes the cold "
+                 "run's own chunks and answers bit-identically; a turn re-prefills up to one chunk "
+                 "more than --prefix-resume nearest", (long long)g.grid,
+                 g.grid_origin > 0 ? fmt(" from %lld", (long long)g.grid_origin).c_str() : "");
     if (cfg.prefill_span > 1) {
         /* What the span does here, said once: the intervals the budget holds can be fewer than
          * the flag asks for, and a model without an interval grid spans nothing. */
@@ -194,41 +234,6 @@ static int resolve_geometry(const Program& prog,const Config& cfg,ChunkGeometry*
                      (long long)g.shared_tok);
     }
     return RAD_OK;
-}
-
-int chunk_geometry_resolve(const Program& p,const Config& c,ChunkGeometry* out) {
-    return resolve_geometry(p,c,out,false); // original minimum and all old behavior
-}
-int glm_main_final_token_geometry_resolve(const Program& p,const Config& c,ChunkGeometry* out) {
-    if(!out)return RAD_E_INVAL;
-    if(glm_main_tp4_cache_program_profile(p)<0||p.ctx.max_tok!=1||c.tp!=4||c.max_tok!=1||
-       c.max_seqs!=1||c.n_spec||c.prefix_cache||c.prefix_cache_mib||c.checkpoint_slots||
-       c.checkpoint_interval||c.prefill_span!=1||!c.deterministic||!c.tp_wire_exact||
-       c.max_ctx!=p.ctx.max_ctx)return RAD_E_UNSUPPORTED;
-    ChunkGeometry actual;
-    const int status=resolve_geometry(p,c,&actual,true);
-    if(status<0)return status;
-    // Every actual block/state/kernel contradiction is retained. Only the
-    // scheduler's final-partial-one-row admission is enabled, never a nonfinal
-    // sub-quantum chunk. Engine enforces exactly one token before add().
-    if(actual.checkpoint_interval||actual.span!=1||actual.shared_tok!=1)return RAD_E_UNSUPPORTED;
-    *out=std::move(actual);return RAD_OK;
-}
-
-int glm_main_prefill4_geometry_resolve(const Program& p,const Config& c,ChunkGeometry* out) {
-    if(!out)return RAD_E_INVAL;
-    if(glm_main_tp4_cache_program_profile(p)<0||p.ctx.max_tok!=4||c.tp!=4||c.max_tok!=4||
-       c.max_seqs!=1||c.n_spec||c.max_ctx!=512||p.ctx.max_ctx!=512||c.prefix_cache||
-       c.prefix_cache_mib||c.checkpoint_slots||c.checkpoint_interval||c.prefill_span!=1||
-       !c.deterministic||!c.tp_wire_exact)return RAD_E_UNSUPPORTED;
-    ChunkGeometry actual;
-    const int status=resolve_geometry(p,c,&actual,false);
-    if(status<0)return status;
-    // Closed to the actual parent-observed grid; a newly selected kernel with a
-    // different legal geometry is a new profile review, never guessed padding.
-    if(actual.quantum!=4||actual.attn_block!=4||actual.state_chunk!=1||
-       actual.checkpoint_interval||actual.span!=1||actual.shared_tok!=4)return RAD_E_UNSUPPORTED;
-    *out=std::move(actual);return RAD_OK;
 }
 
 }  /* namespace rad */

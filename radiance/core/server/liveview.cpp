@@ -35,33 +35,29 @@ void snapshot_from(const SchedMetrics& m, LiveSnapshot* out) {
 
 namespace {
 
-/* Tier -> colour in rad::Tier order. NativeStore is distinct durable native backing,
- * not the original-container SSD tier and not a statement about a current HOT hit. */
+/* Tier -> colour, in rad::Tier order: VRAM, HostPinned, HostPageable, SSD, Mapped. Green is
+ * resident, red is on disk, so the plane shows at a glance where the model lives. */
 const char* tier_colour(uint8_t t) {
     switch (t) {
         case 0: return "\033[32m";   /* VRAM */
         case 1: return "\033[33m";   /* host, pinned */
         case 2: return "\033[35m";   /* host, pageable */
         case 4: return "\033[36m";   /* the container's mapping */
-        case 5: return "\033[94m";   /* verified native-store backing */
         default: return "\033[31m";  /* SSD */
     }
 }
 /* Tier names, in rad::Tier order. */
-const char* const kTierNames[] = {"vram", "pinned", "host", "ssd", "mapped", "native-store"};
-static_assert(sizeof(kTierNames)/sizeof(kTierNames[0]) == kLiveTiers, "tier names incomplete");
+const char* const kTierNames[kLiveTiers] = {"vram", "pinned", "host", "ssd", "mapped"};
 
-/* Display precedence for a compressed column, not measured read latency. NativeStore
- * remains visible as its own backing class; it may supply a HOT hit or require record I/O. */
-const uint8_t kTierRank[] = {0, 1, 2, 4, 3, 5};
-static_assert(sizeof(kTierRank)/sizeof(kTierRank[0]) == kLiveTiers, "tier ranks incomplete");
+/* How slow a tier is to read, in rad::Tier order, for a column's worst tier: SSD is the slowest,
+ * so it outranks the mapping though it comes first in the enum. */
+const uint8_t kTierRank[kLiveTiers] = {0, 1, 2, 4, 3};
 
 char tier_glyph(uint8_t t) {
     switch (t) {
         case 0: return '#';
         case 1: return '+';
         case 2: return '-';
-        case 5: return 'N';
         default: return '.';
     }
 }

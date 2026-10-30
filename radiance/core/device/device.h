@@ -113,13 +113,24 @@ extern "C" void* rad_link_gate(RadStream s);
  * counts lists handed over and not yet finished. The prefetch ring is uncached device memory
  * (rad_dev_alloc_uncached): the engine writes it and kernels read it, so no cache may hold a
  * slot's previous contents. */
+/* An event a DMA list completes instead of a dispatch. `*word` is its completion word, for
+ * rad_xp_list to write 0 to as the list's `done`; the caller arms it with a 1 in stream order (the
+ * weight table's patch dispatch). `rad_event_wait(s, ev)` then holds `s` on the device until the
+ * copy has landed. The caller waits for the previous copy before arming the next, so an older 0
+ * cannot release a later wait. RAD_E_STATE while a tape records: the caller re-runs it with the
+ * tape paused (core/kvstream/stage.cpp). */
+extern "C" int     rad_event_dma(RadEvent ev, RadStream s, uint32_t** word);
 extern "C" int     rad_xp_supported(int device);
 extern "C" int     rad_xp_stream_create(RadStream* out);
 extern "C" int     rad_ride(RadStream s, void** token);
 extern "C" int     rad_ride_wait(RadStream s, void* token);
 extern "C" void    rad_ride_release(void* token, RadStream after, int64_t packets);
+/* `flags` RAD_XP_NO_YIELD: the list does not yield the link to a hold by a stream of this card. A
+ * copy the compute stream waits on must set it, since the hold's release is behind that wait. */
+#define RAD_XP_NO_YIELD 1u
 extern "C" int     rad_xp_list(int device, void* mark, int n, const uint64_t* src, const uint64_t* dst,
-                               const uint64_t* bytes, uint32_t* done, uint32_t done_val);
+                               const uint64_t* bytes, uint32_t* done, uint32_t done_val,
+                               unsigned flags);
 extern "C" int64_t rad_xp_behind(int device);
 extern "C" void*   rad_dev_alloc_uncached(int64_t bytes);
 extern "C" void    rad_dev_free_uncached(void* p);
@@ -175,7 +186,6 @@ const char* device_backend_name();      /* "host" or "aql" */
 
 /* ------------------------------------------------------------------ the backend vtable */
 /* One entry per call in rad_device.h. `name` is what device_backend_name() returns. */
-struct TinyBackendQuote;
 struct DeviceBackend {
     const char* name;
 
@@ -317,7 +327,7 @@ struct DeviceBackend {
     int     (*ride_wait)(RadStream s, void* token);
     void    (*ride_release)(void* token, RadStream after, int64_t packets);
     int     (*xp_list)(int device, void* mark, int n, const uint64_t* src, const uint64_t* dst,
-                       const uint64_t* bytes, uint32_t* done, uint32_t done_val);
+                       const uint64_t* bytes, uint32_t* done, uint32_t done_val, unsigned flags);
     int64_t (*xp_behind)(int device);
     void*   (*alloc_uncached)(int64_t bytes);
     void    (*free_uncached)(void* p);
@@ -327,9 +337,35 @@ struct DeviceBackend {
     int     (*gate_open)(void* gate);
     int64_t (*gate_room)(RadStream s);
 
-    /* Research-only cold admission. Older backends leave the appended hook null. */
-    int (*tiny_startup_quote)(TinyBackendQuote* out) = nullptr;
-    int (*tiny_stream_create)(RadStream* out) = nullptr;
+    /* ---- rad_event_dma; null on a backend with no DMA queue. */
+    int     (*event_dma)(RadEvent e, RadStream s, uint32_t** word);
+
+    /* ---- the live issue path's overlap and timestamps (Ctx::issue_body, runtime/live_chain.h).
+     * A recorded pass leaves independent dispatches unordered (tape_set_overlap); a pass issued
+     * live, which is every pass a stager arms, keeps the barrier bit on every packet. These let
+     * the issue path do per launch what haz_mark does per tape. Null on a backend whose queues
+     * run work as issued; last in the table, so the positional backends leave them null.
+     *
+     * `live_pos`: where `s` stands: its queue's id, the index its next packet goes to, and the
+     * tag of the launch that wrote the packet before that one (0: a packet written outside a
+     * tagged launch -- a copy, an event, a wait, another thread's -- or none).
+     * `live_open`: until live_close, this thread's packets on `s` carry `tag`, and the first may
+     * go without the barrier bit when `permit` is set, it is written at index `at`, and the
+     * backend's own conditions hold: a kernel dispatch with no ride or record on it, no
+     * system-scope fence, not chained and not behind a chained kernel, not inside a tape capture,
+     * and fewer than kTapeOverlapRun packets without the bit at the queue's tail (whoever wrote
+     * them), so reserve()'s margin holds for live packets as for played ones.
+     * `live_close`: what the window wrote on its stream: the first packet's index, how many, and
+     * flags (LIVE_FIRST_UNORDERED: the first went without the barrier bit; LIVE_BARRIER: one of
+     * them was a barrier packet).
+     * `live_stamp`: while on, every kernel this thread writes on card 0 gets a completion signal
+     * the packet processor writes its start and end into, read later without waiting and written
+     * to `path` (the first call's) as one line per dispatch under pass `pass`. Ordering is
+     * unchanged: a stamp's signal never sets or clears a barrier bit. */
+    int     (*live_pos)(RadStream s, uint32_t* queue, uint64_t* wr, uint64_t* last_tag);
+    void    (*live_open)(RadStream s, uint64_t tag, uint64_t at, int permit);
+    void    (*live_close)(uint64_t* first, int32_t* packets, int* flags);
+    void    (*live_stamp)(int on, uint64_t pass, const char* path);
 };
 
 
@@ -347,6 +383,16 @@ int     tape_diff(RadTape a, RadTape b, std::string* why);
 void    tape_destroy(RadTape t);
 int     tape_record(RadTape t, int i, int* kind, uint32_t* queue);
 int     tape_set_overlap(RadTape t, int i, bool on);
+
+/* The current backend's live entries (DeviceBackend::live_pos ...); live_supported() is false and
+ * the calls are inert on a backend without them. LIVE_FIRST_UNORDERED and LIVE_BARRIER are
+ * live_close's flags. */
+enum : int { LIVE_FIRST_UNORDERED = 1, LIVE_BARRIER = 2 };
+bool    live_supported();
+int     live_pos(RadStream s, uint32_t* queue, uint64_t* wr, uint64_t* last_tag);
+void    live_open(RadStream s, uint64_t tag, uint64_t at, bool permit);
+void    live_close(uint64_t* first, int32_t* packets, int* flags);
+void    live_stamp(bool on, uint64_t pass, const char* path);
 
 /* The current backend's DeviceBackend::peer_access. */
 int     dev_peer_access(int self, int peer);

@@ -38,7 +38,7 @@ struct CardStat {
 /* rad::kTierCount, restated so this header need not include the program description (a tier
  * arrives here as a byte). liveview.cpp static_asserts that the two agree, since the per-tier
  * arrays below are indexed by tier. */
-enum { kLiveTiers = 6 };
+enum { kLiveTiers = 5 };
 
 /* The expert plane and the placement engine's activity on it.
  *

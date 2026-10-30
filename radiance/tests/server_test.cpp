@@ -621,6 +621,94 @@ TEST(a_complete_tool_call_is_reported_as_tool_calls) {
     CHECK(c["message"]["content"].is_null());
 }
 
+TEST(hyv3_native_markup_flows_through_openai_tools_api) {
+    const json tools = json::parse(R"([{
+      "type":"function","function":{"name":"lookup_weather","parameters":{"type":"object",
+      "properties":{"city":{"type":"string"}},"required":["city"]}}},
+      {"type":"function","function":{"name":"add","parameters":{"type":"object",
+      "properties":{"a":{"type":"integer"},"b":{"type":"integer"}},"required":["a","b"]}}}])");
+    const json messages = json::array({
+        {{"role", "user"}, {"content", "Check Toronto weather and add 20 and 22."}},
+        {{"role", "assistant"}, {"content", nullptr},
+         {"tool_calls", json::array({
+             {{"id", "call-weather"}, {"type", "function"},
+              {"function", {{"name", "lookup_weather"},
+                             {"arguments", "{\"city\":\"Toronto\"}"}}}},
+             {{"id", "call-add"}, {"type", "function"},
+              {"function", {{"name", "add"}, {"arguments", "{\"a\":20,\"b\":22}"}}}}
+         })}},
+        {{"role", "tool"}, {"tool_call_id", "call-weather"}, {"content", "Cloudy, 12 C."}},
+        {{"role", "tool"}, {"tool_call_id", "call-add"}, {"content", "42"}},
+        {{"role", "user"}, {"content", "Summarize the results."}}
+    });
+    const std::string reply =
+        "The weather is cloudy, and the sum is 42.\n<tool_calls>\n"
+        "<tool_call>lookup_weather<tool_sep>\n"
+        "<arg_key>city</arg_key>\n<arg_value>Toronto</arg_value>\n</tool_call>\n"
+        "<tool_call>add<tool_sep>\n"
+        "<arg_key>a</arg_key>\n<arg_value>20</arg_value>\n"
+        "<arg_key>b</arg_key>\n<arg_value>22</arg_value>\n</tool_call>\n</tool_calls>";
+    Fixture f;
+    f.tmpl.real_parser = hyv3_reply_parser(tools);
+    REQUIRE(f.tmpl.real_parser != nullptr);
+    f.sched.reply = reply;
+    const std::string body = json({{"messages", messages}, {"tools", tools},
+                                   {"parallel_tool_calls", true}, {"max_tokens", 512}}).dump();
+
+    HttpResponse buffered = f.post("/v1/chat/completions", body);
+    CHECK_EQ(buffered.status, 200);
+    const json c = json::parse(buffered.body)["choices"][0];
+    CHECK_EQ(c["finish_reason"].get<std::string>(), std::string("tool_calls"));
+    CHECK_EQ(c["message"]["content"].get<std::string>(),
+             std::string("The weather is cloudy, and the sum is 42."));
+    REQUIRE(c["message"]["tool_calls"].size() == 2);
+    CHECK_EQ(c["message"]["tool_calls"][0]["function"]["name"].get<std::string>(),
+             std::string("lookup_weather"));
+    CHECK_EQ(c["message"]["tool_calls"][0]["function"]["arguments"].get<std::string>(),
+             std::string("{\"city\":\"Toronto\"}"));
+    CHECK_EQ(c["message"]["tool_calls"][1]["function"]["name"].get<std::string>(),
+             std::string("add"));
+    CHECK_EQ(c["message"]["tool_calls"][1]["function"]["arguments"].get<std::string>(),
+             std::string("{\"a\":20,\"b\":22}"));
+    CHECK_EQ(f.tmpl.last_tool_msgs, 2);
+    CHECK(has(f.tmpl.last_prompt, "Summarize the results."));
+
+    HttpResponse streamed = f.post("/v1/chat/completions",
+                                   json({{"messages", messages}, {"tools", tools},
+                                         {"stream", true}, {"max_tokens", 512}}).dump());
+    CHECK_EQ(streamed.status, 200);
+    int bad = 0;
+    std::string finish, content;
+    std::vector<std::string> names, arguments;
+    for (const std::string& payload : sse_payloads(drain(streamed), &bad)) {
+        if (payload == "[DONE]") continue;
+        const json event = json::parse(payload);
+        if (event["choices"].empty()) continue;
+        const json& choice = event["choices"][0];
+        if (!choice["finish_reason"].is_null())
+            finish = choice["finish_reason"].get<std::string>();
+        const json& delta = choice["delta"];
+        if (delta.contains("content")) content += delta["content"].get<std::string>();
+        if (!delta.contains("tool_calls")) continue;
+        for (const json& call : delta["tool_calls"]) {
+            const size_t i = call["index"].get<size_t>();
+            if (i >= names.size()) { names.resize(i + 1); arguments.resize(i + 1); }
+            if (call.contains("function") && call["function"].contains("name"))
+                names[i] = call["function"]["name"].get<std::string>();
+            if (call.contains("function") && call["function"].contains("arguments"))
+                arguments[i] += call["function"]["arguments"].get<std::string>();
+        }
+    }
+    CHECK_EQ(bad, 0);
+    CHECK_EQ(finish, std::string("tool_calls"));
+    CHECK_EQ(content, std::string("The weather is cloudy, and the sum is 42."));
+    REQUIRE(names.size() == 2);
+    CHECK_EQ(names[0], std::string("lookup_weather"));
+    CHECK_EQ(arguments[0], std::string("{\"city\":\"Toronto\"}"));
+    CHECK_EQ(names[1], std::string("add"));
+    CHECK_EQ(arguments[1], std::string("{\"a\":20,\"b\":22}"));
+}
+
 /* The three spellings of "do not think" must all reach the template, and the kwarg must reach
  * both places: the lift overwrites the context key `enable_thinking` with its own field
  * (chat-auto-parser-helpers.cpp), so a kwarg not also lifted into the field would be discarded
@@ -2271,6 +2359,11 @@ TEST(metrics_is_valid_prometheus_text_with_vllm_names) {
     CHECK_EQ(d.type["radiance:draft_acceptance_ratio"], std::string("gauge"));
     CHECK_EQ(d.type["radiance:decode_tokens_per_second"], std::string("gauge"));
     CHECK_EQ(d.type["radiance:http_admission_rejected_total"], std::string("counter"));
+    /* KV streaming (docs/KV-STREAMING.md §4.2), present even when no group streams so a dashboard
+     * can query the names before the feature is turned on. The bytes counter carries `dir`. */
+    CHECK_EQ(d.type["radiance:kv_resident_blocks"], std::string("gauge"));
+    CHECK_EQ(d.type["radiance:kv_stream_misses_total"], std::string("counter"));
+    CHECK_EQ(d.type["radiance:kv_stream_bytes_total"], std::string("counter"));
 
     /* The scheduler's numbers reached the gauges. */
     auto find_one = [&](const std::string& prefix) -> double {
@@ -2283,6 +2376,10 @@ TEST(metrics_is_valid_prometheus_text_with_vllm_names) {
     CHECK_NEAR(find_one("vllm:gpu_cache_usage_perc{"), 0.42, 1e-9);
     CHECK_NEAR(find_one("radiance:draft_acceptance_ratio{"), 0.61, 1e-9);
     CHECK_NEAR(find_one("vllm:generation_tokens_total{"), 5.0, 1e-9);
+    /* This server streams nothing, so every streaming number is zero. */
+    CHECK_NEAR(find_one("radiance:kv_resident_blocks{"), 0.0, 1e-9);
+    CHECK_NEAR(find_one("radiance:kv_stream_misses_total{"), 0.0, 1e-9);
+    CHECK_NEAR(find_one("radiance:kv_stream_bytes_total{"), 0.0, 1e-9);
 
     /* An unmeasured decode floor is absent, not 0, which a scrape would plot as the fastest step
      * ever. This fixture completes no single-stream window, so neither series appears. */
@@ -5143,8 +5240,8 @@ TEST(embeddings_are_truncated_then_normalised_and_failures_named) {
     }
     {
         f.sched.embedding = std::vector<float>(8, 0.0f);
-        for (const json& x : vectors(R"({"input":"a"})")["data"][0]["embedding"])
-            CHECK_EQ(x.get<float>(), 0.0f);
+        const json embedding = vectors(R"({"input":"a"})")["data"][0]["embedding"];
+        for (const json& x : embedding) CHECK_EQ(x.get<float>(), 0.0f);
     }
     f.sched.embedding = { 3, 4, 0, 12, 0, 0, 0, 0 };
     {
@@ -6042,3 +6139,50 @@ TEST(a_fault_in_a_realtime_session_ends_the_session_not_the_server) {
 }
 
 RAD_TEST_MAIN()
+
+TEST(draft_origin_metrics_are_absent_when_observation_is_off) {
+    Metrics metrics("origin-test",1024); server::SchedMetrics s;
+    s.draft_tokens=7; s.draft_accepted=3; metrics.sample(s);
+    const auto raw=metrics.render();
+    CHECK(raw.find("radiance:experimental_draft_")==std::string::npos);
+    CHECK(raw.find("radiance:draft_tokens_total")!=std::string::npos);
+}
+TEST(draft_origin_metrics_export_only_exact_owner_counters) {
+    Metrics metrics("origin-test",1024); server::SchedMetrics s;
+    s.draft_origin.enabled=true; s.draft_origin.compute_off=true;s.draft_origin.verify_cap=0;
+    s.draft_origin.learned_publications=2; s.draft_origin.learned_published_tokens=8;
+    s.draft_origin.learned_verified_tokens=4; s.draft_origin.learned_accepted_tokens=2;
+    s.draft_origin.fallback_offers=3; s.draft_origin.fallback_offered_tokens=10;
+    s.draft_origin.fallback_publications=2; s.draft_origin.fallback_published_tokens=5;
+    s.draft_origin.fallback_verified_tokens=5; s.draft_origin.fallback_accepted_tokens=1;
+    s.draft_origin.block_context_issues=7; s.draft_origin.block_context_rows=100;
+    s.draft_origin.block_query_issues=6; s.draft_origin.block_query_rows=30;
+    metrics.sample(s); const auto raw=metrics.render();
+    CHECK(raw.find("radiance:experimental_draft_compute_off")!=std::string::npos);
+    CHECK(raw.find("radiance:experimental_draft_learned_publications_total")!=std::string::npos);
+    CHECK(raw.find("radiance:experimental_draft_learned_verified_tokens_total")!=std::string::npos);
+    CHECK(raw.find("radiance:experimental_draft_fallback_accepted_tokens_total")!=std::string::npos);
+    CHECK(raw.find("radiance:experimental_draft_block_context_rows_total")!=std::string::npos);
+    CHECK(raw.find("per_depth_origin")==std::string::npos);
+    const PromDoc d=parse_prom(raw); CHECK_EQ(d.errors.size(),size_t(0));
+    auto value=[&](const std::string& name){
+        for(const auto& v:d.samples)if(v.first.rfind(name+"{",0)==0)return v.second;
+        return -1.0;
+    };
+    CHECK_EQ(value("radiance:experimental_draft_compute_off"),1.0);
+    CHECK_EQ(value("radiance:experimental_draft_verify_cap"),0.0);
+    CHECK_EQ(value("radiance:experimental_draft_learned_publications_total"),2.0);
+    CHECK_EQ(value("radiance:experimental_draft_learned_published_tokens_total"),8.0);
+    CHECK_EQ(value("radiance:experimental_draft_fallback_offers_total"),3.0);
+    CHECK_EQ(value("radiance:experimental_draft_fallback_offered_tokens_total"),10.0);
+    CHECK_EQ(value("radiance:experimental_draft_fallback_publications_total"),2.0);
+    CHECK_EQ(value("radiance:experimental_draft_fallback_published_tokens_total"),5.0);
+    CHECK_EQ(value("radiance:experimental_draft_learned_verified_tokens_total"),4.0);
+    CHECK_EQ(value("radiance:experimental_draft_learned_accepted_tokens_total"),2.0);
+    CHECK_EQ(value("radiance:experimental_draft_fallback_verified_tokens_total"),5.0);
+    CHECK_EQ(value("radiance:experimental_draft_fallback_accepted_tokens_total"),1.0);
+    CHECK_EQ(value("radiance:experimental_draft_block_context_issues_total"),7.0);
+    CHECK_EQ(value("radiance:experimental_draft_block_context_rows_total"),100.0);
+    CHECK_EQ(value("radiance:experimental_draft_block_query_issues_total"),6.0);
+    CHECK_EQ(value("radiance:experimental_draft_block_query_rows_total"),30.0);
+}

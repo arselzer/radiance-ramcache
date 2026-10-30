@@ -1,0 +1,5 @@
+Warning: Resource leak detected by SharedSignalPool, 77 Signals leaked.
+9 experts (6 with the research sample's scales); at most 368 raw rounds in a gate_up, 189 in a down
+96 calls, 6087680 values compared: 0 differ; damaged headers: 72704 values NaN, 0 not
+PASS: gemv_vp over packed experts is bit-identical to the plain row over block_mxfp4
+vpack check exit 0

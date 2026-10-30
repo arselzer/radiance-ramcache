@@ -244,6 +244,7 @@ const std::vector<const RadQuantizerInfo*>& table() {
         v.push_back(&autoround_info());
         v.push_back(&paroquant_info());
         v.push_back(&ggml_quantizer);
+        v.push_back(&m2xfp_info());
         return v;
     }();
     return t;
@@ -267,8 +268,4 @@ extern "C" const RadPluginInfo* rad_plugin_info(void) { return &kInfo; }
 extern "C" int rad_quant_count(void) { return (int)table().size(); }
 extern "C" const RadQuantizerInfo* rad_quant_at(int i) {
     return (i >= 0 && i < rad_quant_count()) ? table()[(size_t)i] : nullptr;
-}
-extern "C" int rad_checkpoint_import_count(void) { return lq::ggml_import_count(); }
-extern "C" const RadCheckpointImporterInfo* rad_checkpoint_import_at(int i) {
-    return lq::ggml_import_at(i);
 }

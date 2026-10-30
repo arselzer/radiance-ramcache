@@ -1,3 +1,0 @@
-I device: AQL backend, 1 device(s) [0:gfx1201]
-I quantisation 'quark' is imported weight by weight; 'glm5next' serves it as (unquantised)
-PASS complete actual main DATA reader/source; no Engine/Session/GPU inference

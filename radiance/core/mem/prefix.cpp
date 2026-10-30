@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <numeric>
 #include <unordered_set>
 
 namespace rad {
@@ -144,6 +145,8 @@ int PrefixCache::configure(const Config& cfg, KVManager* kv, int64_t checkpoint_
     block_size_ = 0;
     interval_ = 0;
     groups_.clear();
+    per_.clear();
+    entry_groups_.clear();
     map_.clear(); lru_.clear();
     ck_by_prefix_.clear(); ck_by_session_.clear();
     /* set_policy() may override this afterwards. */
@@ -156,12 +159,17 @@ int PrefixCache::configure(const Config& cfg, KVManager* kv, int64_t checkpoint_
         return RAD_OK;
     }
 
-    /* Granularity is the first full-attention group's block size, since that is what a hit
-     * reuses. Paged groups with another block size are not cached and are named in the report. */
+    /* Every paged group but a windowed one is cached. An entry covers the lcm of their block
+     * sizes, and holds that over a group's block size of the group's blocks: a hit then ends on
+     * a block of every group, which adopt() needs. The chunk quantum is a multiple of every paged
+     * group's block (core/sched/geometry.cpp), so the lcm divides every checkpoint position. */
     for (const auto& p : kv->plans()) {
-        if (p.kind == RAD_KV_FULL && block_size_ == 0) block_size_ = p.block_size;
         if (p.stateful()) has_linear_ = true;
+        if (p.paged() && p.kind != RAD_KV_WINDOW && p.block_size > 0)
+            block_size_ = block_size_ > 0 ? std::lcm(block_size_, p.block_size) : p.block_size;
     }
+    /* With only windowed groups, nothing is indexed and a hit is a window snapshot alone, keyed
+     * on the chain at the first group's block. */
     if (block_size_ == 0) {
         for (const auto& p : kv->plans()) if (p.paged()) { block_size_ = p.block_size; break; }
     }
@@ -170,20 +178,34 @@ int PrefixCache::configure(const Config& cfg, KVManager* kv, int64_t checkpoint_
         RAD_WARN("%s", report_.c_str());
         return RAD_OK;
     }
-    std::string skipped;
+    std::string skipped, split;
     for (const auto& p : kv->plans()) {
         if (!p.paged()) continue;
         /* A window group is not prefix-cached. Its blocks below the window are recycled, adopt()
          * would overfill a table capped at window_blocks, and a hit does not set first_block_pos.
-         * A drafter or windowed layer's cache then starts where the hit ended. */
+         * A checkpoint slot can carry a trunk's window instead (KVManager::has_window_snapshot);
+         * a drafter or a windowed layer without one starts its cache where the hit ended. */
         if (p.kind == RAD_KV_WINDOW) {
-            skipped += fmt("  group '%s' is windowed (%lld blocks): not cached\n",
-                           p.name.c_str(), (long long)p.window_blocks);
+            skipped += fmt("  group '%s' is windowed (%lld blocks): not cached%s\n",
+                           p.name.c_str(), (long long)p.window_blocks,
+                           p.win_snap ? "; a checkpoint slot carries its window" : "");
             continue;
         }
-        if (p.block_size == block_size_) groups_.push_back(p.index);
-        else skipped += fmt("  group '%s' block %lld != cache granularity %lld: not cached\n",
-                            p.name.c_str(), (long long)p.block_size, (long long)block_size_);
+        groups_.push_back(p.index);
+        per_.push_back((int32_t)(block_size_ / p.block_size));
+        for (int64_t k = 0; k < block_size_ / p.block_size; ++k) entry_groups_.push_back(p.index);
+        if (p.block_size != block_size_)
+            split += fmt("  group '%s' block %lld: %lld blocks an entry\n", p.name.c_str(),
+                         (long long)p.block_size, (long long)(block_size_ / p.block_size));
+    }
+
+    /* An entry can be demoted only when the host tier can hold every group in it. A streamed
+     * group's rows are its pinned mirror, addressed by the block id the sequence used, so an entry
+     * holding one stays in VRAM and is evicted whole (docs/KV-STREAMING.md §4.1). */
+    demotable_ = true;
+    for (int32_t g : groups_) {
+        const KVGroupPlan* p = kv->plan(g);
+        if (p && p->streamed()) demotable_ = false;
     }
 
     interval_ = checkpoint_interval;
@@ -200,8 +222,8 @@ int PrefixCache::configure(const Config& cfg, KVManager* kv, int64_t checkpoint_
             /* A checkpoint is found by the chained hash at its position, which exists only on
              * block boundaries, so an interval off the block grid would never hit. */
             RAD_ERR("the checkpoint interval resolves to %lld (from --checkpoint-interval %lld, "
-                    "rounded up to the chunk quantum), which is not a multiple of the attention "
-                    "block size %lld, so no checkpoint would ever hit (spec §7.3)",
+                    "rounded up to the chunk quantum), which is not a multiple of the cache's "
+                    "%lld-token entry, so no checkpoint would ever hit (spec §7.3)",
                     (long long)interval_, (long long)cfg.checkpoint_interval,
                     (long long)block_size_);
             return RAD_E_INVAL;
@@ -209,14 +231,20 @@ int PrefixCache::configure(const Config& cfg, KVManager* kv, int64_t checkpoint_
     }
 
     enabled_ = true;
-    report_ = fmt("prefix cache: %zu paged group(s) at %lld-token blocks; linear checkpoints "
+    report_ = fmt("prefix cache: %zu paged group(s) in %lld-token entries; checkpoints "
                   "every %lld tokens (%lld slots of %s a rank, pinned host memory), retention "
                   "'%s'\n",
                   groups_.size(), (long long)block_size_,
                   (long long)(has_linear_ ? interval_ : 0),
                   (long long)kv->checkpoint_slots(), humanb(kv->checkpoint_bytes()).c_str(),
                   policy_->name());
+    report_ += split;
     report_ += skipped;
+    if (!demotable_) {
+        /* Stated whether or not a host tier is configured. */
+        report_ += "  a streamed group is cached, so no entry can be demoted to the host tier: a "
+                   "streamed group's rows are its pinned mirror, addressed by block id\n";
+    }
     return RAD_OK;
 }
 
@@ -278,9 +306,10 @@ CacheHit PrefixCache::lookup(const std::vector<int32_t>& tokens,
     std::vector<BlockHash> hs = chain_all(tokens, mm, n_full);
 
     int64_t matched = 0;
+    bool departed = false;              /* the prompt goes on where nothing is cached */
     for (; matched < n_full; ++matched) {
         auto it = map_.find(hs[(size_t)matched]);
-        if (it == map_.end()) break;
+        if (it == map_.end()) { departed = true; break; }
         /* An off-device entry is not a hit: demotion released its blocks and its recorded ids now
          * belong to other sequences. The prefix stops here (also while a promotion is in flight);
          * the caller may promote and look up again (restorable_from). */
@@ -288,7 +317,10 @@ CacheHit PrefixCache::lookup(const std::vector<int32_t>& tokens,
         if (!same_tokens(it->second, tokens.data() + matched * block_size_)) break;
     }
 
-    /* Back a full hit off by one block so one token remains to compute a logit from. */
+    if (departed && matched > 0 && map_.find(hs[(size_t)matched - 1])->second.n_children >= 2)
+        hit.branch_at = (int32_t)(matched * block_size_);
+
+    /* Back a full hit off by one entry so one token remains to compute a logit from. */
     if (matched * block_size_ >= (int64_t)tokens.size() && matched > 0) --matched;
 
     auto deepest = [&](int64_t limit) { return deepest_ckpt(hs, limit); };
@@ -318,8 +350,9 @@ CacheHit PrefixCache::lookup(const std::vector<int32_t>& tokens,
     if (blocks_out)
         for (int64_t b = 0; b < matched; ++b) {
             const Entry& e = map_.find(hs[(size_t)b])->second;
-            for (size_t g = 0; g < groups_.size(); ++g)
-                (*blocks_out)[g].push_back(e.blocks[g]);
+            for (size_t k = 0, g = 0; g < groups_.size(); ++g)
+                for (int32_t j = 0; j < per_[g]; ++j, ++k)
+                    (*blocks_out)[g].push_back(e.blocks[k]);
         }
     /* A hit is a use for the tiers' idle clock too; otherwise a prefix hit every turn, or one just
      * promoted for this lookup, would look idle since its publish. */
@@ -350,6 +383,23 @@ CacheHit PrefixCache::lookup(const std::vector<int32_t>& tokens,
     return hit;
 }
 
+bool PrefixCache::retain_entry(const std::vector<std::vector<int32_t>>& bt, int64_t b,
+                               std::vector<int32_t>* out) {
+    out->assign(entry_groups_.size(), -1);
+    size_t k = 0;
+    for (size_t g = 0; g < groups_.size(); ++g)
+        for (int32_t j = 0; j < per_[g]; ++j, ++k) {
+            const int32_t blk = bt[g][(size_t)(b * per_[g] + j)];
+            if (kv_->retain_block(groups_[g], blk) >= 0) { (*out)[k] = blk; continue; }
+            /* Unwind exactly what was retained: anything else leaks a block or frees one under a
+             * live sequence. */
+            for (size_t i = 0; i < k; ++i) kv_->release_block(entry_groups_[i], (*out)[i]);
+            out->clear();
+            return false;
+        }
+    return true;
+}
+
 int PrefixCache::insert(uint64_t session,
                         const std::vector<int32_t>& tokens,
                         const std::vector<MMContentKey>& mm,
@@ -361,7 +411,8 @@ int PrefixCache::insert(uint64_t session,
 
     const int64_t n_full = n_tokens / block_size_;
     if (n_full <= 0) return RAD_OK;
-    for (const auto& bt : blocks) if ((int64_t)bt.size() < n_full) return RAD_E_INVAL;
+    for (size_t g = 0; g < blocks.size(); ++g)
+        if ((int64_t)blocks[g].size() < n_full * per_[g]) return RAD_E_INVAL;
 
     std::vector<BlockHash> hs = chain_all(tokens, mm, n_full);
     const uint64_t now = rad_mono_ns();
@@ -379,17 +430,8 @@ int PrefixCache::insert(uint64_t session,
              * tier copy goes (IdleTiers::rebound). An entry with a promotion in flight is left
              * alone. */
             if (!tiers_ || !tiers_->resident_off_device(h)) continue;
-            std::vector<int32_t> mine(groups_.size(), -1);
-            size_t held = 0;
-            for (; held < groups_.size(); ++held) {
-                const int32_t blk = blocks[held][(size_t)b];
-                if (kv_->retain_block(groups_[held], blk) < 0) break;
-                mine[held] = blk;
-            }
-            if (held != groups_.size()) {
-                for (size_t g = 0; g < held; ++g) kv_->release_block(groups_[g], mine[g]);
-                return RAD_E_STATE;
-            }
+            std::vector<int32_t> mine;
+            if (!retain_entry(blocks, b, &mine)) return RAD_E_STATE;
             Entry& e = it->second;
             e.blocks = std::move(mine);
             e.used_ns = now;
@@ -401,19 +443,7 @@ int PrefixCache::insert(uint64_t session,
         }
 
         Entry e;
-        e.blocks.assign(groups_.size(), -1);
-        size_t held = 0;
-        for (; held < groups_.size(); ++held) {
-            int32_t blk = blocks[held][(size_t)b];
-            if (kv_->retain_block(groups_[held], blk) < 0) break;
-            e.blocks[held] = blk;
-        }
-        if (held != groups_.size()) {
-            /* Unwind exactly what was retained: anything else leaks a block or frees one under a
-             * live sequence. */
-            for (size_t g = 0; g < held; ++g) kv_->release_block(groups_[g], e.blocks[g]);
-            return RAD_E_STATE;
-        }
+        if (!retain_entry(blocks, b, &e.blocks)) return RAD_E_STATE;
         e.tokens.assign(tokens.begin() + b * block_size_,
                         tokens.begin() + (b + 1) * block_size_);
         e.used_ns = now;
@@ -421,6 +451,10 @@ int PrefixCache::insert(uint64_t session,
         e.lru = std::prev(lru_.end());
         e.in_lru = true;
         map_.emplace(h, std::move(e));
+        if (b > 0) {
+            auto p = map_.find(hs[(size_t)b - 1]);
+            if (p != map_.end() && p->second.n_children < 255) ++p->second.n_children;
+        }
     }
     /* Deepest first, as in lookup: the first block ends most recent. */
     for (int64_t b = n_full - 1; b >= 0; --b) touch(hs[(size_t)b], now);
@@ -431,14 +465,15 @@ int PrefixCache::insert(uint64_t session,
      * The ids come from the map, not from `blocks`. For an entry that already existed the loop
      * above kept the cache's blocks, and `blocks` belongs to a sequence about to be freed; the
      * tiers would copy from blocks reassigned to another sequence. */
-    if (tiers_) {
+    if (tiers_ && demotable_) {
         for (int64_t b = 0; b < n_full; ++b) {
             auto it = map_.find(hs[(size_t)b]);
             if (it == map_.end()) continue;
             tiers_->note_used(hs[(size_t)b], it->second.blocks, now, b);
         }
-        tiers_->note_session(session, hs, n_tokens, now, label);
     }
+    /* The session index names no blocks, so it is kept with or without a host copy. */
+    if (tiers_) tiers_->note_session(session, hs, n_tokens, now, label);
 
     take_over(session, hs, n_full * block_size_);
     return RAD_OK;
@@ -511,18 +546,20 @@ std::vector<BlockHash> PrefixCache::restorable_from(const std::vector<int32_t>& 
 int64_t PrefixCache::restore_room() const {
     if (!kv_ || groups_.empty()) return 0;
     int64_t room = INT64_MAX;
-    for (int32_t g : groups_) room = std::min(room, kv_->total_blocks(g) - kv_->held_blocks(g));
+    for (size_t i = 0; i < groups_.size(); ++i)
+        room = std::min(room, (kv_->total_blocks(groups_[i]) - kv_->held_blocks(groups_[i])) /
+                                  std::max<int32_t>(per_[i], 1));
     return std::max<int64_t>(0, room);
 }
 
 int64_t PrefixCache::trim_for(const std::vector<int32_t>& tokens,
-                              const std::vector<MMContentKey>& mm, int64_t n_blocks) {
+                              const std::vector<MMContentKey>& mm, int64_t n_entries) {
     /* Without a host tier a trim erases, and making room for a restore must lose nothing. */
-    if (!enabled_ || n_blocks <= 0 || !tiers_ || !tiers_->host_on()) return 0;
+    if (!enabled_ || n_entries <= 0 || !tiers_ || !tiers_->host_on()) return 0;
     const std::vector<BlockHash> hs = chain_all(tokens, mm, (int64_t)tokens.size() / block_size_);
     std::unordered_set<BlockHash, BlockHashHash> spare(hs.begin(), hs.end());
     for (const auto& h : held_) spare.insert(h.first);
-    return trim_sparing(n_blocks, &spare);
+    return trim_sparing(n_entries, &spare);
 }
 
 void PrefixCache::drop_offdevice(const BlockHash& key) {
@@ -540,14 +577,15 @@ void PrefixCache::drop_offdevice(const BlockHash& key) {
 int PrefixCache::rebind(const BlockHash& key, const std::vector<int32_t>& blocks) {
     auto it = map_.find(key);
     if (it == map_.end()) return RAD_E_NOTFOUND;
-    if (blocks.size() != groups_.size()) return RAD_E_SHAPE;
+    if (blocks.size() != entry_groups_.size()) return RAD_E_SHAPE;
     for (int32_t b : blocks) if (b < 0) return RAD_E_INVAL;
     /* The reservation's reference becomes the cache's: KVManager::reserve_block left each block at
      * refcount one with no sequence attached, and the cache's release path frees it from now on.
      * No extra retain. */
     Entry& e = it->second;
     e.blocks = blocks;
-    for (size_t g = 0; g < groups_.size(); ++g) kv_->cache_reserved_block(groups_[g], blocks[g]);
+    for (size_t k = 0; k < entry_groups_.size(); ++k)
+        kv_->cache_reserved_block(entry_groups_[k], blocks[k]);
     if (!e.in_lru) {
         /* A restore is a use: a request is about to hit it. */
         e.used_ns = rad_mono_ns();
@@ -559,8 +597,8 @@ int PrefixCache::rebind(const BlockHash& key, const std::vector<int32_t>& blocks
 }
 
 bool PrefixCache::shared_with_live(const Entry& e) const {
-    for (size_t g = 0; g < groups_.size(); ++g)
-        if (kv_->block_refcount(groups_[g], e.blocks[g]) > 1) return true;
+    for (size_t k = 0; k < entry_groups_.size() && k < e.blocks.size(); ++k)
+        if (kv_->block_refcount(entry_groups_[k], e.blocks[k]) > 1) return true;
     return false;
 }
 
@@ -572,7 +610,8 @@ bool PrefixCache::same_tokens(const Entry& e, const int32_t* src) const {
 }
 
 void PrefixCache::release_blocks(const Entry& e) {
-    for (size_t g = 0; g < groups_.size(); ++g) kv_->release_block(groups_[g], e.blocks[g]);
+    for (size_t k = 0; k < entry_groups_.size() && k < e.blocks.size(); ++k)
+        kv_->release_block(entry_groups_[k], e.blocks[k]);
 }
 
 int64_t PrefixCache::evict_lru(int64_t n) {
@@ -611,16 +650,16 @@ int64_t PrefixCache::evict_lru(int64_t n) {
     return done;
 }
 
-int64_t PrefixCache::trim(int64_t n_blocks) { return trim_sparing(n_blocks, nullptr); }
+int64_t PrefixCache::trim(int64_t n_entries) { return trim_sparing(n_entries, nullptr); }
 
-int64_t PrefixCache::trim_sparing(int64_t n_blocks,
+int64_t PrefixCache::trim_sparing(int64_t n_entries,
                                   const std::unordered_set<BlockHash, BlockHashHash>* spare) {
     /* Tiers attached but off count as no tiers: no copy will ever land, so do not wait for one. */
     const bool keep = tiers_ && tiers_->host_on();
     const uint64_t now = rad_mono_ns();
     int64_t done = 0;
     auto it = lru_.begin();
-    for (int64_t seen = (int64_t)lru_.size(); it != lru_.end() && done < n_blocks && seen > 0;
+    for (int64_t seen = (int64_t)lru_.size(); it != lru_.end() && done < n_entries && seen > 0;
          --seen) {
         const BlockHash h = *it;
         auto m = map_.find(h);
@@ -635,11 +674,12 @@ int64_t PrefixCache::trim_sparing(int64_t n_blocks,
             it = next;
             continue;
         }
-        if (keep && !tiers_->droppable(h)) { ++it; continue; }
+        /* Skip an entry whose copy is still in flight; one the tier cannot hold never gets a copy. */
+        if (keep && demotable_ && !tiers_->droppable(h)) { ++it; continue; }
         it = lru_.erase(it);
         e.in_lru = false;
         release_blocks(e);
-        if (keep) {
+        if (keep && demotable_) {
             tiers_->drop_commit(h);
             ++stats_.drops;
         } else {
@@ -690,11 +730,11 @@ int64_t PrefixCache::drop_clean() {
 }
 
 /* The KV manager tracks how many cache-held blocks are at refcount one. One group only: the paged
- * groups share a token axis and an entry is one block in each, so summing groups would multiply
- * the answer. Off-device entries hold no blocks and count for nothing. */
+ * groups share a token axis and an entry is blocks_per_entry() blocks in each, so summing groups
+ * would multiply the answer. Off-device entries hold no blocks and count for nothing. */
 int64_t PrefixCache::unshared_tokens() const {
-    if (!kv_ || groups_.empty() || block_size_ <= 0) return 0;
-    return kv_->cache_only_blocks(groups_[0]) * block_size_;
+    if (!kv_ || groups_.empty() || block_size_ <= 0 || per_.empty() || per_[0] <= 0) return 0;
+    return kv_->cache_only_blocks(groups_[0]) * (block_size_ / per_[0]);
 }
 
 void PrefixCache::clear() {
@@ -1011,7 +1051,7 @@ int PrefixCache::release_session(const std::string& label, uint64_t id, int64_t 
     /* A kept token keeps its whole block: the block holding it is what the next turn hits. */
     const int64_t keep_blocks = (keep_tokens + block_size_ - 1) / block_size_;
     int64_t entry_bytes = 0;
-    for (int32_t g : groups_) {
+    for (int32_t g : entry_groups_) {
         const KVGroupPlan* p = kv_->plan(g);
         if (p) entry_bytes += p->bytes_per_block;
     }

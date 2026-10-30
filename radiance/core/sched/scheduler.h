@@ -14,7 +14,9 @@
 #pragma once
 #include "batch.h"
 #include "draft.h"
+#include "lookup.h"
 #include "metrics.h"
+#include "ngram.h"
 
 #include <chrono>
 #include <memory>
@@ -77,6 +79,13 @@ struct SchedReq {
     DraftAdapt adapt;
     /* The proposal the step being planned carries came from prompt lookup (StepEntry::ngram). */
     bool       draft_ngram = false;
+    /* Prompt lookup's index over prompt ++ output (ngram.h), built at the sequence's first lookup
+     * and extended by each later one. It depends on the tokens alone, so preemption keeps it; it
+     * is keyed by request id, so a recycled slot starts over, and a closed request frees it. */
+    NgramIndex ngram_ix;
+    /* Prompt lookup's record on this text for the verify gate (lookup.h): it describes the text,
+     * so preemption keeps it; a new request starts it over. */
+    LookupSeq  look;
 
     int32_t  sched_tokens = 0;   /* tokens given to this request in the current step */
     int32_t  entry = -1;         /* its index in the current StepPlan, or -1 */
@@ -95,6 +104,11 @@ struct SchedReq {
      * client's tokens into a re-admitted slot. */
     bool     reap_pending = false;
     int64_t  pending_ckpt = -1;  /* absolute position this step's chunk checkpoints at */
+    /* The consumer skip's target for this prefill (consumer_skip.h): the first position whose
+     * state must be exact, its end or the deepest checkpoint below it; 0 when its prefill is not
+     * cut. Set at each admission (Scheduler::consumer_target), carried by its prefill entries
+     * (StepEntry::consumer_end); a checkpoint below it is not written. */
+    int64_t  consumer_end = 0;
 
     /* The checkpoint the linear state is seeded from on admission, handed to the sequence's first
      * entry as StepEntry::ckpt_restore. Never held across a step: nothing pins a checkpoint slot,
@@ -118,6 +132,13 @@ struct SchedReq {
      * admission happens). */
     bool     restore_cut = false;
 
+    /* RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH: the end of the run of prefill chunks this
+     * sequence computed exactly as an idle cold prefill of any prompt it prefixes cuts them, from
+     * its hit (each alone in its step, from one grid position to the next). What lies past it was
+     * computed in another step shape (the prompt's last chunk, a decode step, a shared step), and
+     * close_request publishes no further. Set at admission, advanced by commit(). */
+    int64_t  grid_upto = 0;
+
     /* The whole sequence is prompt ++ output; n_computed indexes into it. */
     int64_t  seq_len() const {
         return (int64_t)req->prompt.size() + (int64_t)req->output.size();
@@ -127,12 +148,15 @@ struct SchedReq {
 class Scheduler {
 public:
     /* What the sampler hands back after a step: per sequence, how many drafts survived, the token
-     * sampled at the accepted position, and whether the sequence ended. No logits. */
+     * sampled at the accepted position, and whether the sequence ended. No logits. commit() fills
+     * in the two counts. */
     struct StepResult {
         int             n_seq = 0;
         const int32_t*  n_accepted = nullptr;  /* [n_seq] drafted tokens accepted, 0..n_spec */
         const int32_t*  token = nullptr;       /* [n_seq] token sampled at the accepted position */
         const uint8_t*  eos = nullptr;         /* [n_seq] 1 when the sequence ended */
+        int             n_prefill_done = 0;   /* prompts this step fully placed */
+        int             n_finished = 0;       /* requests that ended during this step */
         /* Logprobs, null on a step where no request asked: entry i's j-th emitted token (its
          * accepted drafts first, then the sampled token) is lp[first_row[i] + j]. */
         const TokenLogprobs* lp = nullptr;
@@ -153,7 +177,8 @@ public:
      * resolve one here. */
     int  init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCache* pc,
               const std::vector<BatchBuilder::RankIO>& ranks,
-              const ChunkGeometry* geo = nullptr);
+              const ChunkGeometry* geo = nullptr,
+              const DraftExperiment* experiment = nullptr);
 
     /* The batch the last build produced for one rank; see BatchBuilder::batch_for. */
     const RadBatch* batch_for(int rank) const { return builder_.batch_for(rank); }
@@ -176,6 +201,10 @@ public:
      * under exactly the load that cancels. */
     int      cancel(uint64_t id);
     Request* find(uint64_t id);
+    /* Fail every request prefilling in the step just committed, with `why` for the client: a streamed
+     * group's resolve latched overflow, so their selection tables no longer address the pool
+     * (docs/KV-STREAMING.md §3.4). */
+    int      fail_prefilling(const char* why);
     /* Whether the request is still admitted and Running, read under the lock. */
     bool     running(uint64_t id) const;
     /* What the step just committed left for `seq`, copied by commit under the lock. False when
@@ -256,6 +285,8 @@ public:
     /* The drafter's proposal for a request's next step. n is clamped to the sequence's window
      * (draft_cap): the controller's depth, or what the adaptive policy gives the sequence. */
     int      set_draft(uint64_t id, const int32_t* tokens, int n);
+    // Engine calls only after a block pass has returned known0 on all ranks.
+    void     note_block_issue(int draft_pass, int64_t rows);
 
     /* ---------------------------------------------------------- media the encoder owes
      * A request carrying media is admitted only once every item is encoded; until then it keeps
@@ -274,6 +305,9 @@ public:
      * cache. Takes the step lock because the step path inserts into the map (live sequences hold
      * their own block references). See IScheduler::reset_prefix_cache. */
     int64_t  reset_prefix_cache();
+    /* The end-of-generation ids the card's acceptance reads, for ends_every_request. Set once at
+     * start; without them only max_tokens ends are predicted. */
+    void     set_eog(std::vector<int32_t> ids);
     /* Forget one stored conversation, by label or engine id, keeping its first `keep_tokens`
      * (IPrefixCache::release_session). Refused with RAD_E_STATE while a request of that
      * conversation is queued or running: its blocks would be skipped as live and its close
@@ -303,14 +337,37 @@ public:
      *   promote_next   once this step has committed: the next step becomes the open one.
      *
      * While the next step is open, commit() leaves continuing requests' blocks in place, and a
-     * finished request keeps them until that step has run. */
+     * finished request keeps them until that step has run.
+     *
+     * The one thing the host does learn from a step is whether it ended a request. Issued ahead
+     * of that, a step behind the last one of a request that stops at an end-of-generation token
+     * runs a pass for the finished request alone (SchedMetrics::ended_with_step_ahead). With
+     * RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP the engine reads the step's tokens back first
+     * whenever outcome_decides_next says they can decide it, and hands them to step_next as
+     * `known`; a step whose outcome ends every request it carries is then followed by nothing. */
     void            expect_draft(uint64_t id, int n);
-    const RadBatch* step_next();
-    const RadBatch* step_next_locked();
+    const RadBatch* step_next(const StepResult* known = nullptr);
+    const RadBatch* step_next_locked(const StepResult* known = nullptr);
+    /* Whether the step just issued likely ends every request it carries; step_next_locked then
+     * issues nothing behind it. */
+    bool            ends_every_request() const;
+    /* Whether the open step's own tokens could withhold the step that would be issued behind it:
+     * it carries one sequence, which produces a token this step, still runs, and could end on an
+     * end-of-generation token (not ignore_eos), and ends_every_request does not already withhold
+     * it. Steps of two or more sequences are not read back first: they end all at once too
+     * rarely to pay for the wait, and a step issued without some of their rows would batch the
+     * others differently, which on the card can change their bits. */
+    bool            outcome_decides_next() const;
+    /* Whether committing `r` against the open step would end every request it carries, by
+     * commit()'s own end conditions: an end-of-generation token not ignored, max_tokens, or the
+     * context. A step with a row that produces no token, or whose request no longer runs, is not
+     * ended by its outcome. Read under the step lock or on the step thread, as plan(). */
+    bool            outcome_ends_every_request(const StepResult& r) const;
     void            promote_next();
     /* Fold the step's outcome back in: append tokens, roll back rejected speculation, retire
-     * finished requests, feed the draft controller. */
-    int             commit(const StepResult& r);
+     * finished requests, feed the draft controller, and fill `r`'s report counts
+     * (n_prefill_done, n_finished). */
+    int             commit(StepResult& r);
     /* Ends the step for timing; call once per loop iteration that ran a step, after the drafter,
      * so the draft rounds are charged to the step (see the definition). Without it the counters
      * stay correct but there is no timing. */
@@ -400,6 +457,7 @@ public:
     const StepPlan&      plan() const { return plan_; }
     const ChunkGeometry& geometry() const { return geo_; }
     DraftController&     draft() { return draft_; }
+    LookupGate&          lookup_gate() { return lookup_; }
     SchedMetrics         metrics() const;
 
     /* The observers' copy. Dashboards, scrapers and admin calls read what the engine thread last
@@ -413,6 +471,20 @@ public:
 
     /* plan_chunk's tail-checkpoint rule (see the definition). */
     int64_t tail_checkpoint(int64_t target) const;
+    /* The consumer skip (core/sched/consumer_skip.h, RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP):
+     * whether init turned it on, and the target a request's prefill is cut for (0: not cut): its
+     * end, or the deepest checkpoint below it its idle prefill writes (idle_prefill_checkpoint)
+     * when the prefix cache is on. */
+    bool    consumer_on() const { return cs_on_; }
+    int64_t consumer_target(const SchedReq& s) const;
+    /* The deepest checkpoint plan_chunk's chunks write for `r` from its computed tokens to `end`
+     * at the whole step budget, or -1. */
+    int64_t idle_prefill_checkpoint(const Request& r, int64_t end) const;
+    /* What the cut ran (BatchBuilder::ConsumerStats). */
+    const BatchBuilder::ConsumerStats& consumer_stats() const { return builder_.consumer_stats(); }
+    /* The least recompute a snapshot at a shared head (CacheHit::branch_at) must save each later
+     * request for the chunk split that takes it. */
+    static constexpr int64_t kSharedHeadMin = 256;
     /* Visible for tests: the chunk the scheduler would give a request at `n_computed` under a
      * token budget, and the checkpoint position it will land on (-1 for none). `keep_at` is the
      * request's own checkpoint (Request::checkpoint_at), 0 for none. */
@@ -465,16 +537,25 @@ private:
     IPrefixCache* pc_ = nullptr;
 
     /* Does a prefix-cache hit leave a hole in a block drafter's own KV? Only if some paged group
-     * is not prefix-cached. prefix.cpp skips windowed groups, so a windowed drafter has K and V
-     * only from the hit position and must wait for its window to slide past it. A full-attention
-     * drafter's group is cached like the trunk's and its floor is 0; treating it as windowed
-     * would stop drafting for good, since it has no window to slide. Read off
-     * IPrefixCache::cached_groups() so prefix.cpp's rule lives in one place. */
+     * is neither prefix-cached nor restored from the window snapshot. prefix.cpp skips windowed
+     * groups, so a windowed drafter the snapshot does not carry has K and V only from the hit
+     * position and must wait for its window to slide past it. A full-attention drafter's group is
+     * cached like the trunk's and its floor is 0; treating it as windowed would stop drafting for
+     * good, since it has no window to slide. Read off IPrefixCache::cached_groups() and
+     * IKVManager::window_snapshot() so prefix.cpp's and the KV manager's rules live in one
+     * place. */
     bool          hit_holes_draft_ = true;
     /* Does a hit leave a hole in the trunk: a paged group with a trunk layer (bound below
-     * meta.n_layers; drafter layers bind from `base_layer` up) that the cache does not index?
-     * Unlike a drafter hole, recomputing the tail cannot repair it; see admit_one. */
+     * meta.n_layers; drafter layers bind from `base_layer` up) that the cache does not index and
+     * no checkpoint slot carries? Unlike a drafter hole, recomputing the tail cannot repair it;
+     * every hit is refused (admit_one). */
     bool          hit_holes_trunk_ = false;
+    /* The end-of-generation ids, sorted and unique (set_eog), and a lookup in them. */
+    std::vector<int32_t> eog_;
+    bool          is_eog(int32_t id) const;
+    /* A windowed trunk group, which the cache does not index: a hit stands only where it resumes
+     * at a window snapshot (IKVManager::has_window_snapshot), which restores the window. */
+    bool          hit_needs_window_ = false;
     /* R-SWA: the groups whose KV manager carries per-sequence runtime windows, with the W a
      * sequence is armed with (IKVManager::runtime_window_tokens). Empty for every model that does
      * not declare one, in which case admission and commit are exactly as before. A sequence with
@@ -496,6 +577,7 @@ private:
     int32_t       serial_rot_shift_ = 0;
     BatchBuilder  builder_;
     DraftController draft_;
+    DraftExperiment draft_experiment_; // Engine validates OFF scope before load/serve
 
     /* Where this sequence's block-drafter cache begins; block_begin's guard reads it and
      * block_end records it. */
@@ -509,7 +591,9 @@ private:
      * Every site that caps a proposal applies it: step(), set_draft(), expect_draft() and the
      * rounds in serial_begin(). With the policy off it is next_depth(). */
     int draft_cap(SchedReq& s) const {
-        return draft_.adaptive() ? draft_.window_for(s.adapt) : draft_.next_depth();
+        if (draft_experiment_.compute_off()) return 0;
+        return draft_experiment_.runtime_depth(
+            draft_.adaptive() ? draft_.window_for(s.adapt) : draft_.next_depth());
     }
 
     /* The step's head depth D is chosen once per cycle by draft_cycle(), the first thing step()
@@ -523,11 +607,30 @@ private:
     std::vector<DraftAdapt*> draft_est_;
     void    draft_cycle();
 
-    /* The built-in prompt-lookup drafter (scheduler.cpp). Fills s.draft and returns how many
-     * tokens it proposed; 0 when the sequence has no repeated pattern to extend. The pattern
-     * lengths it tries, longest first. */
-    int draft_ngram(SchedReq& s, int depth) const;
-    enum { kNgramMin = 2, kNgramMax = 4 };
+    /* The built-in prompt-lookup drafter (scheduler.cpp, ngram.h). Fills s.draft and returns how
+     * many tokens it proposed; 0 when the sequence has no repeated pattern to extend. It tries
+     * --spec-ngram-max down to --spec-ngram-min tokens, longest first. `match`, if given, gets how
+     * far the match behind the proposal runs back (NgramIndex::propose), -1 when the proposal did
+     * not come from the index (--debug-draft-oracle). */
+    int draft_ngram(SchedReq& s, int depth, int* match = nullptr) const;
+    /* Prompt lookup is the deployment's only drafter and --draft-window adaptive is on: its
+     * proposals feed each sequence's estimate and are capped by its window, as a head's are. */
+    bool lookup_adapt_ = false;
+    /* Prompt lookup is the deployment's only drafter: each proposal is verified only when its
+     * sequence's record says it pays for its verify rows at the measured step cost (lookup.h).
+     * Beside a draft head the lookup only fills in for a sequence the head declines, and is
+     * left to the head's window. */
+    bool       lookup_gate_on_ = false;
+    LookupGate lookup_;
+    /* Decode rows and expected tokens of the step being planned, for the gate: a decode row
+     * counts once up front, and each verified proposal adds its drafts and expected yield. */
+    int64_t    gate_rows_ = 0;
+    double     gate_tokens_ = 0.0;
+    /* --debug-draft-oracle (draft_ngram): a fixed continuation the lookup proposes from instead,
+     * with kDebugMiss of the drafts corrupted, so a verify accepts and rejects at every depth on
+     * any model. A test harness; empty when not given. */
+    std::vector<int32_t>    debug_oracle_;
+    static constexpr double kDebugMiss = 0.3;
 
     mutable std::mutex mu_;
 
@@ -553,6 +656,10 @@ private:
     std::vector<int32_t> running_;
     std::vector<int32_t> waiting_;
     std::vector<uint64_t> completed_;
+    /* StepResult's counts for the step being committed: the ids whose prompt it completed, and the
+     * requests it ended. Reset at every commit. */
+    std::vector<uint64_t> last_prefill_ids_;
+    int                   step_finished_ = 0;
 
     /* Requests whose release waits on something that still refers to them (a deferred reap or a
      * deferred free). A count, so the sweeps cost nothing on the steps where there are none. */
@@ -577,6 +684,8 @@ private:
      * lives here). See add_locked. */
     int64_t     pool_tokens_ = -1;
     std::string pool_refusal_;
+    /* fail_prefilling()'s message; a sink keeps the pointer until the HTTP thread writes it. */
+    std::string stream_why_;
 
     /* Scratch for a prefix-cache hit's block ids, one row per cached group. Reserved at init so
      * an admission does not reach the allocator. */
@@ -665,6 +774,24 @@ private:
      * the hold is spent, or the chunk would wait as long as the decoders keep stepping ahead. */
     int64_t interleave_left_ = 0;
     int64_t held_prefill_ = 0;
+    /* RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE=1 (read at init): a prefill chunk gets a step of
+     * its own when decode rows would otherwise leave it under the chunk quantum, so concurrent
+     * requests decode together instead of one after another (see step()). pf_skipped_: decode
+     * rows the last step() left out for a chunk; step_next_locked issues nothing ahead of such a
+     * step, since the step after it must bring them back. */
+    int     prefill_alone_ = 0;
+    int64_t pf_skipped_ = 0;
+    /* The consumer skip, as init decided it (consumer_on). */
+    bool    cs_on_ = false;
+    /* RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH=1 (read at init; acts under --prefix-resume
+     * exact): a finished sequence publishes only up to SchedReq::grid_upto. An exact hit resumes
+     * where a cold prefill starts a chunk and recomputes the cold chunks from there, but it also
+     * adopts every block below its snapshot, and insert() keeps the bytes an entry was first
+     * published with: a block of a previous turn's short last chunk, or one a decode step wrote,
+     * then stands under a snapshot the next turn computed from its own full-chunk recompute of
+     * those positions. Bit-identical only if every kernel rounds a row the same at every pass
+     * height; with this, every published block is a cold chunk's own. */
+    bool    exact_publish_ = false;
     /* The throughput window (step_finished): each kind's tokens and the wall time the steps
      * covered, both decayed with the same time constant, so their ratio is tokens over time. */
     double  tps_win_prefill_ = 0.0, tps_win_decode_ = 0.0, tps_win_time_ = 0.0;

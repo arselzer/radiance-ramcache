@@ -1,0 +1,40 @@
+{
+ "requests": [
+  {
+   "name": "heldout-01",
+   "wall_s": 37.01657271385193,
+   "text": "# PostgreSQL Query: Active Accounts on 1 Oct 2026 with No September 2026 Invoices\n\n```sql\nSELECT DISTINCT s.account_id\nFROM subscriptions s\nWHERE s.started_at <= DATE '2026-10-01'\n  AND (s.ended_at IS NULL OR s.ended",
+   "timings": {
+    "cache_n": 0,
+    "prompt_n": 46,
+    "prompt_ms": 17574.613699999998,
+    "prompt_per_token_ms": 382.0568195652173,
+    "prompt_per_second": 2.617411727234722,
+    "predicted_n": 64,
+    "predicted_ms": 19434.038866,
+    "predicted_per_token_ms": 308.4768073968254,
+    "predicted_per_second": 3.2417347950363005,
+    "ttft_ms": 17575.221767,
+    "total_ms": 37009.260633
+   },
+   "error": null
+  },
+  {
+   "name": "heldout-02",
+   "wall_s": 16.453680276870728,
+   "text": null,
+   "timings": {},
+   "error": "<HTTPError 429: 'Too Many Requests'>"
+  },
+  {
+   "name": "heldout-03",
+   "wall_s": 0.00031495094299316406,
+   "text": null,
+   "timings": {},
+   "error": "URLError(ConnectionRefusedError(111, 'Connection refused'))"
+  }
+ ],
+ "stats": {
+  "error": "URLError(ConnectionRefusedError(111, 'Connection refused'))"
+ }
+}

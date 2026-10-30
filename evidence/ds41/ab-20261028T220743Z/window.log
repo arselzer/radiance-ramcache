@@ -1,0 +1,5 @@
+[2026-10-28T22:07:43Z] waiting for 30 s of QFN idleness
+before: 608764c1d1989c714d8aad7b8a79f8057c3e73473b9f9d55b49d02e82defd2b8 running 2026-10-28T22:05:51.830213834Z sha256:e82764045e46ebae07e33961f17dedba981c0d07336dfcddd67e4b3b042b8600
+[2026-10-28T22:08:12Z] stopping radiance-flashnext
+[2026-10-28T22:08:13Z] restoring radiance-flashnext
+radiance-flashnext

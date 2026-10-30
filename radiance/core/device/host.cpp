@@ -13,7 +13,6 @@
  * std::function, which would heap-allocate inside rad_memcpy_async.
  */
 #include "device.h"
-#include "../build/tiny_startup.h"
 #include "../rad_internal.h"
 
 #include <atomic>
@@ -22,9 +21,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
-#include <memory>
-#include <new>
-#include <system_error>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -411,19 +407,16 @@ void* h_host_ptr(void* p) {
 void* h_device_ptr(void* p) { return h_host_ptr(p); }
 
 int h_stream_create(RadStream* out, int high_priority) {
-    (void)high_priority;
     if (!out) return RAD_E_INVAL;
-    /* Publish last: resize and thread construction may throw. The local owner
-     * frees the ring/control on either refusal; no worker exists after a failed
-     * std::thread constructor. No fallible operation follows successful launch. */
-    try {
-        auto s = std::make_unique<HostStream>();
-        s->ring.resize(kQueueDepth);
-        s->worker = std::thread(stream_run, s.get());
-        *out = (RadStream)s.release();
-        return RAD_OK;
-    } catch (const std::bad_alloc&) { return RAD_E_NOMEM; }
-      catch (const std::system_error&) { return RAD_E_STATE; }
+    /* Priority is ignored: raising a thread's scheduling class needs privileges and buys nothing
+     * on a one-thread queue. */
+    (void)high_priority;
+    auto* s = new (std::nothrow) HostStream();
+    if (!s) { device_set_error("rad_stream_create: out of memory"); return RAD_E_NOMEM; }
+    s->ring.resize(kQueueDepth);
+    s->worker = std::thread(stream_run, s);
+    *out = (RadStream)s;
+    return RAD_OK;
 }
 
 void h_stream_destroy(RadStream st) {
@@ -797,27 +790,6 @@ int h_vram_used(int device, int64_t* out) {
     return RAD_OK;
 }
 
-int h_tiny_stream_create(RadStream* out) {
-    uint64_t s=0,g=0;const int st=tiny_thread_defaults(&s,&g);
-    if(st<0)return st;
-    return h_stream_create(out,0);
-}
-int h_tiny_startup_quote(TinyBackendQuote* out) {
-    if (!out) return RAD_E_INVAL;
-    TinyBackendQuote q{};
-    q.host=1; q.stream_size=sizeof(HostStream); q.event_size=sizeof(HostEvent);
-    q.task_size=sizeof(Task); q.queue_depth=kQueueDepth;
-    q.stream_heap_bytes=sizeof(Task)*kQueueDepth;
-    /* This explicit bounded allowance is NOT a claim about the private
-     * std::thread implementation, malloc arenas, or process RSS. */
-    q.stream_control_allowance=16384;
-    q.backend_threads_per_stream=1;
-    const int st=tiny_thread_defaults(&q.stack_bytes,&q.guard_bytes);
-    if(st<0)return st;
-    if(q.stream_heap_bytes+q.stream_size+q.stream_control_allowance>131072) return RAD_E_UNSUPPORTED;
-    *out=q;return RAD_OK;
-}
-
 const DeviceBackend g_host = {
     "host",
     h_count, h_set, h_props, h_enable_peer,
@@ -844,7 +816,7 @@ const DeviceBackend g_host = {
     nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
 
     h_stream_gate, h_gate_open, h_gate_room,
-    h_tiny_startup_quote, h_tiny_stream_create,
+    nullptr,                     /* event_dma: no DMA queue */
 };
 
 }  /* namespace */

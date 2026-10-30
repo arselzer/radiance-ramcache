@@ -1,0 +1,21 @@
+Warning: Resource leak detected by SharedSignalPool, 684 Signals leaked.
+plain/block    gate_up live=1: median 187.8 us, 67 GB/s of weights
+gemv_vp/packed gate_up live=1: median 237.4 us, 51 GB/s of weights
+gemv_vp/block  gate_up live=1: median 220.7 us, 57 GB/s of weights
+plain/block    down    live=1: median 112.2 us, 56 GB/s of weights
+gemv_vp/packed down    live=1: median 170.0 us, 35 GB/s of weights
+gemv_vp/block  down    live=1: median 155.2 us, 40 GB/s of weights
+plain/block    gate_up live=2: median 180.4 us, 139 GB/s of weights
+gemv_vp/packed gate_up live=2: median 275.1 us, 87 GB/s of weights
+gemv_vp/block  gate_up live=2: median 251.4 us, 100 GB/s of weights
+plain/block    down    live=2: median 116.1 us, 108 GB/s of weights
+gemv_vp/packed down    live=2: median 185.1 us, 65 GB/s of weights
+gemv_vp/block  down    live=2: median 164.6 us, 76 GB/s of weights
+plain/block    gate_up live=3: median 188.4 us, 200 GB/s of weights
+gemv_vp/packed gate_up live=3: median 250.2 us, 144 GB/s of weights
+gemv_vp/block  gate_up live=3: median 215.9 us, 174 GB/s of weights
+plain/block    down    live=3: median 109.5 us, 172 GB/s of weights
+gemv_vp/packed down    live=3: median 164.0 us, 110 GB/s of weights
+gemv_vp/block  down    live=3: median 139.6 us, 135 GB/s of weights
+PASS: the timed calls' outputs are bit-identical
+vpack time exit 0

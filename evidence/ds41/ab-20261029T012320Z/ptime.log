@@ -1,0 +1,32 @@
+Warning: Resource leak detected by SharedSignalPool, 690 Signals leaked.
+prefill T=1 pool 384: lib1 gate_up, 1 live experts, 1 local rows (most 1): median 84.0 us, 149.3 GB/s
+prefill T=1 pool 384: lib2 gate_up, 1 live experts, 1 local rows (most 1): median 68.4 us, 183.2 GB/s
+prefill T=1 pool 384: lib1 down   , 1 live experts, 1 local rows (most 1): median 67.4 us, 93.0 GB/s
+prefill T=1 pool 384: lib2 down   , 1 live experts, 1 local rows (most 1): median 54.5 us, 114.9 GB/s
+prefill T=1 pool 384: lib1 and lib2 outputs: 0 differing values
+prefill T=16 pool 384: lib1 gate_up, 21 live experts, 23 local rows (most 2): median 1145.0 us, 229.9 GB/s
+prefill T=16 pool 384: lib2 gate_up, 21 live experts, 23 local rows (most 2): median 667.1 us, 394.5 GB/s
+prefill T=16 pool 384: lib1 down   , 21 live experts, 23 local rows (most 2): median 602.8 us, 218.3 GB/s
+prefill T=16 pool 384: lib2 down   , 21 live experts, 23 local rows (most 2): median 360.1 us, 365.4 GB/s
+prefill T=16 pool 384: lib1 and lib2 outputs: 0 differing values
+prefill T=16 pool 96: lib1 gate_up, 15 live experts, 19 local rows (most 2): median 1301.6 us, 144.4 GB/s
+prefill T=16 pool 96: lib2 gate_up, 15 live experts, 19 local rows (most 2): median 584.4 us, 321.7 GB/s
+prefill T=16 pool 96: lib1 down   , 15 live experts, 19 local rows (most 2): median 601.0 us, 156.4 GB/s
+prefill T=16 pool 96: lib2 down   , 15 live experts, 19 local rows (most 2): median 313.0 us, 300.3 GB/s
+prefill T=16 pool 96: lib1 and lib2 outputs: 0 differing values
+prefill T=16 pool 48: lib1 gate_up, 14 live experts, 32 local rows (most 4): median 1660.5 us, 105.7 GB/s
+prefill T=16 pool 48: lib2 gate_up, 14 live experts, 32 local rows (most 4): median 843.1 us, 208.1 GB/s
+prefill T=16 pool 48: lib1 down   , 14 live experts, 32 local rows (most 4): median 953.8 us, 92.0 GB/s
+prefill T=16 pool 48: lib2 down   , 14 live experts, 32 local rows (most 4): median 352.6 us, 248.8 GB/s
+prefill T=16 pool 48: lib1 and lib2 outputs: 0 differing values
+prefill T=16 pool 24: lib1 gate_up, 5 live experts, 15 local rows (most 4): median 1589.3 us, 39.4 GB/s
+prefill T=16 pool 24: lib2 gate_up, 5 live experts, 15 local rows (most 4): median 343.7 us, 182.3 GB/s
+prefill T=16 pool 24: lib1 down   , 5 live experts, 15 local rows (most 4): median 881.3 us, 35.6 GB/s
+prefill T=16 pool 24: lib2 down   , 5 live experts, 15 local rows (most 4): median 168.6 us, 185.9 GB/s
+prefill T=16 pool 24: lib1 and lib2 outputs: 0 differing values
+prefill T=8 pool 24: lib1 gate_up, 5 live experts, 7 local rows (most 2): median 592.5 us, 105.8 GB/s
+prefill T=8 pool 24: lib2 gate_up, 5 live experts, 7 local rows (most 2): median 215.4 us, 290.9 GB/s
+prefill T=8 pool 24: lib1 down   , 5 live experts, 7 local rows (most 2): median 335.8 us, 93.3 GB/s
+prefill T=8 pool 24: lib2 down   , 5 live experts, 7 local rows (most 2): median 120.3 us, 260.4 GB/s
+prefill T=8 pool 24: lib1 and lib2 outputs: 0 differing values
+ptime exit 0

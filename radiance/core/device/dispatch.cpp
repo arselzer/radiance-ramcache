@@ -7,7 +7,6 @@
  * with ROCm headers and no /dev/kfd); the chosen backend is logged at Info.
  */
 #include "device.h"
-#include "../build/tiny_startup.h"
 #include "../rad_internal.h"
 
 #include <algorithm>
@@ -466,15 +465,6 @@ int  rad_stream_sync(RadStream s) {
 
 namespace rad {
 
-int tiny_backend_stream_create(RadStream* out) {
-    if(!out)return RAD_E_INVAL;
-    return dev()->tiny_stream_create?dev()->tiny_stream_create(out):RAD_E_UNSUPPORTED;
-}
-int tiny_backend_quote(TinyBackendQuote* out) {
-    if (!out) return RAD_E_INVAL;
-    return dev()->tiny_startup_quote && dev()->tiny_stream_create ? dev()->tiny_startup_quote(out) : RAD_E_UNSUPPORTED;
-}
-
 bool    tape_supported()       { return dev()->tape_begin != nullptr; }
 int     dev_vram_used(int device, int64_t* out) {
     return dev()->vram_used ? dev()->vram_used(device, out) : RAD_E_UNSUPPORTED;
@@ -501,6 +491,22 @@ int     tape_record(RadTape t, int i, int* kind, uint32_t* queue) {
 }
 int     tape_set_overlap(RadTape t, int i, bool on) {
     return dev()->tape_set_overlap ? dev()->tape_set_overlap(t, i, on ? 1 : 0) : RAD_E_UNSUPPORTED;
+}
+bool    live_supported() { return dev()->live_pos && dev()->live_open && dev()->live_close; }
+int     live_pos(RadStream s, uint32_t* queue, uint64_t* wr, uint64_t* last_tag) {
+    return dev()->live_pos ? dev()->live_pos(s, queue, wr, last_tag) : RAD_E_UNSUPPORTED;
+}
+void    live_open(RadStream s, uint64_t tag, uint64_t at, bool permit) {
+    if (dev()->live_open) dev()->live_open(s, tag, at, permit ? 1 : 0);
+}
+void    live_close(uint64_t* first, int32_t* packets, int* flags) {
+    if (dev()->live_close) { dev()->live_close(first, packets, flags); return; }
+    *first = 0;
+    *packets = 0;
+    *flags = 0;
+}
+void    live_stamp(bool on, uint64_t pass, const char* path) {
+    if (dev()->live_stamp) dev()->live_stamp(on ? 1 : 0, pass, path);
 }
 bool    dev_integrated(int device) { return dev()->integrated && dev()->integrated(device) > 0; }
 /* These getters answer "" on failure and restore the error slot, so the next
@@ -545,6 +551,7 @@ int     dev_code_runs(size_t from, size_t to, int device, std::string* why) {
 
 extern "C" {
 
+int  rad_dev_peer_access(int self, int peer)      { return rad::dev_peer_access(self, peer); }
 
 int  rad_event_create_as(RadEvent* out, unsigned flags) {
     const int s = dev()->event_create(out, flags);
@@ -559,6 +566,11 @@ void rad_event_destroy(RadEvent e) {
     dev()->event_destroy(e);
 }
 int  rad_event_record(RadEvent e, RadStream s)    { return dev()->event_record(e, s); }
+int  rad_event_dma(RadEvent e, RadStream s, uint32_t** w) {
+    if (const auto f = dev()->event_dma) return f(e, s, w);
+    rad::device_set_error("rad_event_dma: the device backend has no DMA queue to complete an event");
+    return RAD_E_UNSUPPORTED;
+}
 int  rad_event_wait(RadStream s, RadEvent e)      { return dev()->event_wait(s, e); }
 int  rad_event_query(RadEvent e)                  { return dev()->event_query(e); }
 int  rad_event_sync(RadEvent e) {
@@ -640,8 +652,8 @@ void rad_ride_release(void* token, RadStream after, int64_t packets) {
     if (const auto f = dev()->ride_release) f(token, after, packets);
 }
 int rad_xp_list(int device, void* mark, int n, const uint64_t* src, const uint64_t* dst, const uint64_t* bytes,
-                uint32_t* done, uint32_t done_val) {
-    if (const auto f = dev()->xp_list) return f(device, mark, n, src, dst, bytes, done, done_val);
+                uint32_t* done, uint32_t done_val, unsigned flags) {
+    if (const auto f = dev()->xp_list) return f(device, mark, n, src, dst, bytes, done, done_val, flags);
     return RAD_E_UNSUPPORTED;
 }
 int64_t rad_xp_behind(int device) {

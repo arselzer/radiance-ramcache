@@ -4,7 +4,7 @@
 # Sources are globbed per subdirectory with CONFIGURE_DEPENDS. Re-run cmake if a new file does not
 # appear.
 set(RAD_CORE_DIRS util device plugin build runtime mem sched place sample text server format mm diag gen
-                  lora)
+                  lora kvstream)
 
 set(RAD_CORE_SRC "")
 foreach(d ${RAD_CORE_DIRS})
@@ -13,31 +13,35 @@ foreach(d ${RAD_CORE_DIRS})
        ${CMAKE_CURRENT_SOURCE_DIR}/${d}/*.c)
   list(APPEND RAD_CORE_SRC ${_s})
 endforeach()
-# Private complete-main Reader textually includes this producer implementation.
-# It is not a second translation unit (the same rule as its frozen A/B parent).
-list(REMOVE_ITEM RAD_CORE_SRC ${CMAKE_CURRENT_SOURCE_DIR}/build/glm_main_source_data/producer/main_records.cpp)
-
 # The top level minus main.cpp, which belongs to the `radiance` executable. Every architecture plugin
 # host links the archive whole (tools/CMakeLists.txt), so a main() inside it would collide with each
 # tool's own.
 file(GLOB _top CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/*.cpp)
 list(REMOVE_ITEM _top ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp)
 list(APPEND RAD_CORE_SRC ${_top})
+# llama.cpp's block layouts as affine planes, shared with libquant's `ggml` quantiser, so a GGUF's
+# blocks import as the same planes that quantiser writes (format/checkpoint.cpp). Compiled from
+# libquant's own sources: the plugin stays buildable out of tree, and both read one definition.
+list(APPEND RAD_CORE_SRC ${CMAKE_SOURCE_DIR}/libquant/lq_ggml_planes.cpp
+                         ${CMAKE_SOURCE_DIR}/libquant/lq_ggml_dequant.cpp
+                         ${CMAKE_SOURCE_DIR}/libquant/lq_ggml_tables.cpp)
+# DeepSeek-V4.1 experts computed on the host (place/host_expert_pool.h), from the kernels
+# tools/ds41-host-experts proves bit-identical to the card's. AVX2 without FMA contraction, so each
+# product and sum stays a separate rounded operation as on the card.
+set(RAD_DS41_HX_SRC ${CMAKE_SOURCE_DIR}/tools/ds41-host-experts/ds41_host_experts.cpp)
+list(APPEND RAD_CORE_SRC ${RAD_DS41_HX_SRC})
+set_source_files_properties(${RAD_DS41_HX_SRC} PROPERTIES
+                            COMPILE_OPTIONS "-mavx2;-ffp-contract=off;-fno-fast-math")
 
 add_library(rad_core STATIC ${RAD_CORE_SRC})
 target_link_libraries(rad_core PUBLIC rad_abi ${CMAKE_DL_LIBS} Threads::Threads)
 target_compile_definitions(rad_core PUBLIC RAD_VERSION="${PROJECT_VERSION}")
 target_include_directories(rad_core PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}
-  ${CMAKE_SOURCE_DIR} # private bounded tiny-source helper includes tests/tiny_model.h
   ${CMAKE_SOURCE_DIR}/abi
   ${CMAKE_SOURCE_DIR}/vendor)
-
-# Match the frozen A/B textual producer include contract. Only Core translation
-# units include producer/main_records.h; public Engine headers resolve their
-# own relative includes and do not require this private search root.
-target_include_directories(rad_core PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/build/glm_main_source_data)
+target_include_directories(rad_core PRIVATE ${CMAKE_SOURCE_DIR}/libquant
+                                            ${CMAKE_SOURCE_DIR}/tools/ds41-host-experts)
 
 if(TARGET rad_vendor)
   target_link_libraries(rad_core PUBLIC rad_vendor)

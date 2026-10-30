@@ -1,0 +1,34 @@
+{
+  "commit": "d243fba88646da9ab2343965675318466919ce43",
+  "tree": "54ef641e4312a4ab8a67cf8e22ae596f8fbd8c68",
+  "branch": "claude/ds41-decode-impl",
+  "subject": "README: the futex wake in the recommended configuration",
+  "committed_utc": "2026-10-30T09:24:27Z",
+  "files": 1428,
+  "bytes": 56050835,
+  "executable_files": 57,
+  "pins": "docs/ds41/provenance/ENGINE_SOURCE_PINS.json",
+  "pins_sha256": "91571b5bcdcc0bbc2b97a562aef0301f2469112a2662ca6232565d3761d60a4a",
+  "export": "git archive --format=tar d243fba88646da9ab2343965675318466919ce43 (tracked files only, modes kept)",
+  "upstream": {
+    "repository": "https://codeberg.org/StillDeadcode/radiance",
+    "note": "Radiance upstream plus the deepseek41 architecture work of its pull request 266; the commits after them are this work (ds41 RAM cache and CPU experts)",
+    "commits": {
+      "upstream main as fetched (origin/main)": {
+        "commit": "6c33ee4e1267fc0a016fc0a4a333b0221326a1be",
+        "contained": true,
+        "commits_after": 285
+      },
+      "newest upstream commit contained (review-upstream/main)": {
+        "commit": "4374bea1c4bca1c00c59890d10b799a274d5e8b4",
+        "contained": true,
+        "commits_after": 252
+      },
+      "pull request 266, deepseek41 (origin/pr-266)": {
+        "commit": "bd65d4e58f7c4233de09ad5245a82c9510eb8962",
+        "contained": true,
+        "commits_after": 371
+      }
+    }
+  }
+}

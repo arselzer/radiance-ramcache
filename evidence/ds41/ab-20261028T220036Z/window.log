@@ -1,0 +1,36 @@
+[2026-10-28T22:00:36Z] waiting for 30 s of QFN idleness
+before: 608764c1d1989c714d8aad7b8a79f8057c3e73473b9f9d55b49d02e82defd2b8 running 2026-10-28T21:35:43.028044677Z sha256:e82764045e46ebae07e33961f17dedba981c0d07336dfcddd67e4b3b042b8600
+[2026-10-28T22:01:04Z] stopping radiance-flashnext
+radiance-flashnext
+[2026-10-28T22:01:13Z] device checks on card 0 with /home/as/ds41-claude-build/home/kernels/libr4d.so
+swiglu_clamped: 2202009600 (gate, up) pairs, 8257410 differing: 8257410 with a signaling-NaN up (of 8257536 such pairs), 0 others; table written to /home/as/radiance-ds41-claude/tools/ds41-host-experts/build/ab-20261028T220036Z/silu_recheck.bin
+PASS: host swiglu with the captured table equals libr4d's for every bf16 input but a signaling-NaN up, which a gate_up row never holds
+swiglu exit 0
+24 trials, 48 expert rows: differing values gate_up 0, swiglu 0, down 0, whole host chain 0
+PASS: host experts are bit-identical to libr4d's decode chain
+chain exit 0
+[2026-10-28T22:01:35Z] silu table recaptured identical
+[2026-10-28T22:01:35Z] arm base: RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=0
+[2026-10-28T22:01:53Z] arm base: serving after 18s
+heldout-01: 36.0 s, decode 3.44 tok/s, prefill 17668 ms
+heldout-02: 21.4 s, decode 4.84 tok/s, prefill 8393 ms
+heldout-03: 19.1 s, decode 5.49 tok/s, prefill 7635 ms
+heldout-04: 20.2 s, decode 5.00 tok/s, prefill 7598 ms
+heldout-05: 12.0 s, decode 5.81 tok/s, prefill 5239 ms
+heldout-06: 17.9 s, decode 5.11 tok/s, prefill 5558 ms
+heldout-07: 18.6 s, decode 5.27 tok/s, prefill 6655 ms
+heldout-08: 16.3 s, decode 5.87 tok/s, prefill 5571 ms
+[2026-10-28T22:04:35Z] arm base: requests exit 0
+I[0] EP scoped file staging: 20160 count rows completed, 3674 local-zero, 20834 SSD units submitted, 0 corrupt rows refused
+I[1] EP scoped file staging: 20160 count rows completed, 3488 local-zero, 20213 SSD units submitted, 0 corrupt rows refused
+I[2] EP scoped file staging: 20160 count rows completed, 3186 local-zero, 20819 SSD units submitted, 0 corrupt rows refused
+I[3] EP scoped file staging: 20160 count rows completed, 3385 local-zero, 20327 SSD units submitted, 0 corrupt rows refused
+[2026-10-28T22:04:38Z] arm verify: RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=16 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU=/home/as/radiance-ds41-claude/tools/ds41-host-experts/build/window-20261028T203510Z/silu_table_gfx1201.bin RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_POLICY=verify
+[2026-10-28T22:04:56Z] arm verify: serving after 18s
+heldout-01: 37.0 s, decode 3.24 tok/s, prefill 17575 ms
+heldout-02: 16.5 s, decode 0.00 tok/s, prefill 0 ms ERROR <HTTPError 429: 'Too Many Requests'>
+heldout-03: 0.0 s, decode 0.00 tok/s, prefill 0 ms ERROR URLError(ConnectionRefusedError(111, 'Connection refused'))
+[2026-10-28T22:05:51Z] restoring radiance-flashnext
+radiance-flashnext
+[2026-10-28T22:06:52Z] QFN up after 60s; completion: {"id":"cmpl-036029b5114254970210af60","object":"text_completion","created":1793225212,"model":"qwen-vllm","system_fingerprint":"radiance-1.12.0","choices":[{"text":" Paris. The capital","index":0,"logprobs":null,"finish_reason":"length"}],"usage":{"prompt_tokens":5,"completion_tokens":4,"total_token
+608764c1d1989c714d8aad7b8a79f8057c3e73473b9f9d55b49d02e82defd2b8 running 2026-10-28T22:05:51.830213834Z sha256:e82764045e46ebae07e33961f17dedba981c0d07336dfcddd67e4b3b042b8600

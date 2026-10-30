@@ -1,6 +1,5 @@
 /* pools.cpp -- see pools.h. */
 #include "mem/pools.h"
-#include "place/native_inventory.h"
 
 #include <cstdlib>
 #include <cstring>
@@ -161,35 +160,8 @@ std::string Pool::report() const {
 
 /* ------------------------------------------------------------------ Pools */
 
-int Pools::configure(const Config& cfg,int64_t capacity,MemAllocator* device,MemAllocator* host) {
-    native_inventory_=nullptr;
-    return configure_impl(cfg,capacity,0,device,host);
-}
-int Pools::configure_native(const Config& cfg,int64_t capacity,const Plan& plan,
-                            MemAllocator* device,MemAllocator* host) {
-    if (!plan.native_inventory || plan.strategy!=Strategy::NativeBacked || plan.dynamic ||
-        cfg.host_pool_mib || cfg.weights_disk_tier || !cfg.deterministic ||
-        cfg.vram_weights_mib<=0 || cfg.vram_weights_mib>INT64_MAX/(1<<20) ||
-        cfg.vram_kv_mib<=0 || cfg.vram_kv_mib>INT64_MAX/(1<<20) ||
-        cfg.vram_kv_mib>INT64_MAX/(1<<20)-cfg.vram_weights_mib ||
-        cfg.embedding_host_mib<0 || cfg.tower_host_mib<0 ||
-        uint64_t(cfg.tower_host_mib)>uint64_t(INT64_MAX)/(1<<20) ||
-        uint64_t(cfg.embedding_host_mib)>uint64_t(INT64_MAX)/(1<<20)-uint64_t(cfg.tower_host_mib) ||
-        plan.vram_budget!=cfg.vram_weights_mib*(int64_t(1)<<20)) return RAD_E_INVAL;
-    const auto& authority=*plan.native_inventory;
-    RAD_TRY(authority.validate(*authority.program(),plan));
-    const auto& f=authority.footprint();
-    if (uint64_t(plan.vram_budget)<f.weights_minimum() ||
-        f.landing_bytes>uint64_t(INT64_MAX) || cfg.host_pool_total_mib()<0 ||
-        uint64_t(cfg.host_pool_total_mib())>(uint64_t(INT64_MAX)-f.landing_bytes)/(1<<20))
-        return RAD_E_SHAPE;
-    native_inventory_=nullptr;
-    const int status=configure_impl(cfg,capacity,int64_t(f.landing_bytes),device,host);
-    if (status>=0) native_inventory_=plan.native_inventory;
-    return status;
-}
-int Pools::configure_impl(const Config& cfg,int64_t vram_capacity,int64_t extra_pinned,
-                         MemAllocator* device,MemAllocator* host) {
+int Pools::configure(const Config& cfg, int64_t vram_capacity,
+                     MemAllocator* device, MemAllocator* host) {
     configured_ = false;
     fit_report_.clear();
 
@@ -199,7 +171,7 @@ int Pools::configure_impl(const Config& cfg,int64_t vram_capacity,int64_t extra_
     const int64_t MiB = 1024 * 1024;
     const int64_t w  = cfg.vram_weights_mib  * MiB;
     const int64_t kv = cfg.vram_kv_mib       * MiB;
-    const int64_t hp = cfg.host_pool_total_mib() * MiB + extra_pinned;
+    const int64_t hp = cfg.host_pool_total_mib() * MiB;
 
     /* The budgets were resolved by core/mem/vram_budget.cpp (from the card, the measured driver
      * residency and the computed arena); this refuses rather than re-deciding them (spec §6). A

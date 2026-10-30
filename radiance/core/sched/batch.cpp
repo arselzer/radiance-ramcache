@@ -1,11 +1,10 @@
-#include "../build/glm_main_profile_limits.h"
 /* batch.cpp -- builds the step batch once per step. See batch.h.
  */
 #include "batch.h"
-#include "runtime/cache_prepare4_session.h"
 #include "mm/processor.h"
 #include "derive.h"
 #include "device/device.h"
+#include "kvstream/bind.h"
 
 #include <algorithm>
 #include <cassert>
@@ -13,6 +12,11 @@
 #include <cstdlib>
 
 namespace rad {
+
+/* Steps of the following prompt a prefill batch carries for the PLE read-ahead queue
+ * (RadBatch::n_ahead), whose rows the arch's reader thread prefetches off the step path. Keep in
+ * step with rad_block_ple.h's kAheadChunks, which clamps to the buffer it declared. */
+static constexpr int64_t k_ahead_chunks = 8;
 
 /* Alignment of each staging array carved from a set's slab. One slab per set means a couple of
  * allocations at init instead of two dozen, with every array sharing one mapping. */
@@ -99,9 +103,8 @@ void BatchBuilder::carve(Set& s, char* h) {
         *ph = ::rad::carve<int32_t>(h, oh, n);
         *pd = ::rad::carve<int32_t>(d, od, n);
     };
-    /* Twice the step: its own tokens, then up to a step of the following prompt
-     * (RadBatch::n_ahead). */
-    pair(&s.h_tok,    &s.d_tok,    2 * T);
+    /* The step's tokens, then k_ahead_chunks steps of the following prompt (RadBatch::n_ahead). */
+    pair(&s.h_tok,    &s.d_tok,    (1 + k_ahead_chunks) * T);
     pair(&s.h_pos,    &s.d_pos,    T);
     pair(&s.h_parent, &s.d_parent, T);
     pair(&s.h_cu,     &s.d_cu,     S + 1);
@@ -235,6 +238,7 @@ int BatchBuilder::alloc_set(Set& s, const std::vector<KVGroupInfo>& groups) {
 
     for (Out& o : out_) {
         o.kv.assign(ranks_.size(), std::vector<RadKVGroupBatch>(s.groups.size()));
+        o.stream.assign(ranks_.size(), std::vector<RadKVStream>(s.groups.size()));
         o.batch.assign(ranks_.size(), RadBatch{});
     }
     pitch_.assign(s.groups.size(), 1);
@@ -255,21 +259,18 @@ void BatchBuilder::forget_tables() {
 }
 
 void BatchBuilder::free_set(Set& s) {
-    const auto bind=[this](int device){const int status=rad_dev_set(device);
-        if(status<0&&prog_&&prog_->requires_glm_main_tp4_cache_fail_stop())glm53::cache_prepare4::process_fail_stop();
-    };
     for (size_t f = 0; f < ev_.size(); ++f)
         for (size_t r = 0; r < ev_[f].size(); ++r) {
-            if (r < ranks_.size()) bind(ranks_[r].device);
+            if (r < ranks_.size()) rad_dev_set(ranks_[r].device);
             if (ev_[f][r]) rad_event_destroy(ev_[f][r]);
         }
     ev_.clear();
     ev_free_.clear();
     for (size_t r = 0; r < s.dev.size(); ++r) {
-        if (r < ranks_.size()) bind(ranks_[r].device);
+        if (r < ranks_.size()) rad_dev_set(ranks_[r].device);
         if (s.dev[r]) rad_dev_free(s.dev[r], RAD_MEM_DEVICE);
     }
-    if (!ranks_.empty()) bind(ranks_[0].device);
+    if (!ranks_.empty()) rad_dev_set(ranks_[0].device);
     s.dev.clear();
     if (ring_.host) { rad_dev_free(ring_.host, RAD_MEM_HOST_PINNED); ring_.host = nullptr; }
     ring_.first = 0;
@@ -361,23 +362,6 @@ int64_t BatchBuilder::device_bytes(Program& prog, const Config& cfg, const KVGeo
     b.size_set(b.set_, prog.kv_groups);
     const MediaBytes m = b.mm_on_ ? b.media_bytes() : MediaBytes{};
     return b.set_.dev_bytes + m.mm + m.pix + m.crd + m.cu;
-}
-
-int BatchBuilder::glm_main_staging_quote(Program& p,const Config& c,const KVGeom& kg,
-                                         uint64_t* device,uint64_t* pinned,uint64_t* events){
-    if(!device||!pinned||!events)return RAD_E_INVAL;
-    if(glm_main_tp4_cache_program_profile(p)<0||c.tp!=4||!glm_main_rows_supported(c.max_tok)||c.max_tok!=p.ctx.max_tok||c.max_seqs!=1||c.n_spec||
-       c.max_ctx<1||c.max_ctx>512||p.encoder.modalities||p.audio_encoder.modalities)return RAD_E_UNSUPPORTED;
-    BatchBuilder b;b.prog_=&p;b.cfg_=c;b.kvgeom_=kg;
-    RAD_TRY(b.layout(p,c));b.size_set(b.set_,p.kv_groups);
-    if(b.mm_on_||b.set_.dev_bytes<=0||b.set_.host_bytes<=0)return RAD_E_UNSUPPORTED;
-    uint64_t pay=0;
-    for(const auto& g:b.set_.groups){if(g.max_blocks<0||uint64_t(g.max_blocks)>(UINT64_MAX-pay)/4)return RAD_E_SHAPE;pay+=uint64_t(g.max_blocks)*4;}
-    const uint64_t ranges=pay/uint64_t(k_range_max)+b.set_.groups.size()+1;
-    if(ranges>(UINT64_MAX-uint64_t(b.set_.host_bytes)-uint64_t(k_carve_align))/sizeof(RadCopyRange))return RAD_E_SHAPE;
-    const uint64_t one=uint64_t(b.set_.host_bytes)+ranges*sizeof(RadCopyRange)+uint64_t(k_carve_align);
-    if(one>UINT64_MAX/3)return RAD_E_SHAPE;
-    *device=uint64_t(b.set_.dev_bytes);*pinned=3*one;*events=uint64_t(kFlights)*4;return RAD_OK;
 }
 
 int BatchBuilder::layout(Program& prog, const Config& cfg) {
@@ -604,6 +588,15 @@ void BatchBuilder::fini() {
     free_media();
     free_set(set_);
     derived_.clear();
+}
+
+void BatchBuilder::set_consumer(const ConsumerShape& c) {
+    cs_ = c;
+    cs_on_ = c.valid();
+    cs_end_ = -1;
+    /* Sized once here: build() fills it in place, and the step path allocates nothing. */
+    cs_f_.assign(cs_on_ ? (size_t)c.n_layer : 0, -1);
+    cs_stats_ = ConsumerStats{};
 }
 
 /* ------------------------------------------------------------------ derivations */
@@ -843,6 +836,8 @@ int BatchBuilder::build_groups(const StepPlan& plan, const IKVManager& kv, Set& 
             a.tlen_off    = (const char*)s.d_tlen - d0;
         }
 
+        /* Each rank's own view of the group's ring and mirror (kvstream_step_view). */
+        const RadKVStream* sv = kv.stream_view((int32_t)gi);
         for (size_t r = 0; r < ranks_.size(); ++r) {
             void* base = s.dev[r];
             RadKVGroupBatch& b = o.kv[r][gi];
@@ -855,6 +850,10 @@ int BatchBuilder::build_groups(const StepPlan& plan, const IKVManager& kv, Set& 
             b.state_index_pitch = g.sidx_pitch;
             b.block_size = L.block_size;
             b.max_blocks = pitch;
+            b.stream = kvstream_step_view(&o.stream[r][gi],
+                                          ranks_[r].kv_streams ? ranks_[r].kv_streams[gi] : sv,
+                                          ranks_[r].kv_streams != nullptr,
+                                          ranks_[0].kv_base, ranks_[r].kv_base);
 
             /* The group's arrays are uploaded with the rest of the slab in build(). */
         }
@@ -1066,18 +1065,81 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
         }
     }
 
-    /* Up to a step of the last sequence's following tokens, after this step's own
-     * (RadBatch::n_ahead). Only on a trunk pass whose last entry is a prefill chunk, bounded by
-     * the tokens the request has; like token_at, a re-prefill after preemption continues into its
-     * own output. */
+    /* Up to k_ahead_chunks steps of the last sequence's following tokens, after this step's own
+     * (RadBatch::n_ahead). Only on a trunk pass whose last entry is a prefill chunk, bounded by the
+     * tokens the request has; like token_at, a re-prefill after preemption continues into its own
+     * output. The arch clamps to the rows it declared. */
     int64_t n_ahead = 0;
     if (n_seq > 0 && plan.draft_pass == 0 && plan.tok_shift == 0) {
         const StepEntry& e = plan.e[(size_t)(n_seq - 1)];
         if (e.req && e.is_prefill) {
             const int64_t next = (int64_t)e.ctx_len + e.n_tokens;
             const int64_t have = (int64_t)e.req->prompt.size() + (int64_t)e.req->output.size();
-            n_ahead = std::min<int64_t>(std::max<int64_t>(have - next, 0), max_tok_);
+            n_ahead = std::min<int64_t>(std::max<int64_t>(have - next, 0),
+                                        k_ahead_chunks * max_tok_);
             for (int64_t j = 0; j < n_ahead; ++j) s.h_tok[n_tok + j] = token_at(e, next + j);
+        }
+    }
+
+    /* The consumer skip (consumer_skip.h). A step whose only entry is a prefill chunk of a prompt
+     * the scheduler cut runs layers [0, F) in full and layer F's key ops alone; F is the declared
+     * shape's for the chunk's last row and the prompt's target. A chunk of such a prompt in a step
+     * with anything else beside it (decode rows, another chunk, encoder or scored rows) runs every
+     * layer, which is the base engine's step; the scheduler's startup refuses the deployments
+     * where that can happen (Scheduler::init), so `shared` stays 0. The prompt's last chunk holds
+     * its target's row and is never cut. */
+    int32_t cs_full = 0;
+    int64_t cs_end = 0;
+    if (cs_on_ && plan.draft_pass == 0 && plan.tok_shift == 0) {
+        bool any = false;
+        for (const StepEntry& e : plan.e) any = any || (e.is_prefill && e.consumer_end > 0);
+        if (any) {
+            ++cs_stats_.passes;
+            const StepEntry& e = plan.e[0];
+            const bool alone = n_seq == 1 && plan.n_seq_decode == 0 && plan.n_spec == 0 &&
+                               e.is_prefill && e.consumer_end > 0 && e.hidden_row < 0 &&
+                               n_mm == 0 && n_dout == 0 && n_out == (e.produces_token ? 1 : 0);
+            int32_t F = cs_.n_layer;
+            if (e.is_prefill && e.consumer_end > 0 &&
+                (e.ctx_len % cs_.align != 0 || e.n_tokens > cs_.max_rows)) {
+                /* Off the grid consumer_skip.h assumes: the prompt's last token and its state stay
+                 * exact (the thresholds sit inside the dependency cone), but rows before the cut
+                 * may read window keys this prompt never wrote. */
+                if (cs_stats_.off_grid++ == 0)
+                    RAD_WARN("consumer skip: a chunk at %d..%d is off the %lld-row grid of at most "
+                             "%lld rows the cut assumes", (int)e.ctx_len,
+                             (int)(e.ctx_len + e.n_tokens), (long long)cs_.align,
+                             (long long)cs_.max_rows);
+            }
+            /* A step that writes a checkpoint runs every layer, so its snapshot holds what the
+             * base engine's step leaves whatever the cut (insurance: the scheduler writes none
+             * below a cut prompt's target, and the step that reaches the target is never cut). */
+            if (alone && n_ck == 0) {
+                if (cs_end_ != e.consumer_end) {
+                    cs_end_ = consumer_thresholds(cs_, e.consumer_end, cs_f_.data()) ? e.consumer_end
+                                                                                    : -1;
+                }
+                if (cs_end_ == e.consumer_end)
+                    F = consumer_full_layers(cs_, cs_f_.data(), (int64_t)e.ctx_len + e.n_tokens - 1);
+            } else if (!alone) {
+                ++cs_stats_.shared;
+            }
+            if (F < cs_.n_layer && e.produces_token) {
+                RAD_ERR("consumer skip: the chunk at %d..%d samples, yet the cut for %lld runs %d of "
+                        "%d layers; every layer runs", (int)e.ctx_len, (int)(e.ctx_len + e.n_tokens),
+                        (long long)e.consumer_end, (int)F, (int)cs_.n_layer);
+                F = cs_.n_layer;
+            }
+            if (F < cs_.n_layer) {
+                cs_full = F;
+                cs_end = e.consumer_end;
+                ++cs_stats_.cut;
+                cs_stats_.full += (uint64_t)F;
+                cs_stats_.key += 1;
+                cs_stats_.skipped += (uint64_t)(cs_.n_layer - F - 1);
+            } else {
+                cs_stats_.full += (uint64_t)cs_.n_layer;
+            }
         }
     }
 
@@ -1198,6 +1260,9 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
         B.checkpoint_tok = n_ck ? on_rank(base, b0, s.d_cktok) : nullptr;
         B.checkpoint_slot = n_ck ? on_rank(base, b0, s.d_ckslot) : nullptr;
         B.n_ahead = n_ahead;
+        B.consumer_full = cs_full;
+        B.consumer_rsv = 0;
+        B.consumer_end = cs_end;
     }
     /* Record the flight behind everything reading this span: the upload and the derivation
      * copies. */

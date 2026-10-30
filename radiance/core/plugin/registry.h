@@ -37,7 +37,6 @@
 #pragma once
 #include "rad_core.h"
 #include "rad_quant.h"
-#include "rad_import.h"
 #include "../format/tunecache.h"
 
 #include <deque>
@@ -98,6 +97,10 @@ struct Plugin {
     /* Optional (rad_builder.h, rad_arch_serves_imports); absent is true. False keeps the plugin
      * out of the pick for an imported checkpoint (startup.h). */
     bool arch_serves_imports = true;
+    /* A video generator's reference conditioning (rad_builder.h); null for one without. */
+    int64_t (*arch_video_pack)(const RadVideoGeom*, const int32_t*, int32_t*, int32_t*, int32_t*,
+                               int32_t*, float*, int64_t) = nullptr;
+    int64_t (*arch_encode_geom)(int32_t, const int64_t*, int32_t*, int64_t) = nullptr;
 
     RadPluginCloseFn close = nullptr;
 };
@@ -202,13 +205,6 @@ public:
     const std::deque<QuantRow>& quantizers() const { return quants_; }
     const QuantRow*             quantizer(std::string_view name) const;
 
-    struct ImportRow {
-        const RadCheckpointImporterInfo* info = nullptr;
-        std::string plugin;
-    };
-    const ImportRow* checkpoint_importer(std::string_view format, std::string_view type) const;
-    const std::deque<ImportRow>& checkpoint_importers() const { return importers_; }
-
     /* Every kernel row, in (hierarchy order, declaration order). rad-info prints this. */
     const std::deque<KernelRow>&    rows() const { return rows_; }
     /* The rows implementing one op, in the order select() considers them. Empty if none. */
@@ -294,12 +290,7 @@ public:
     /* Calls init() once per resolved instance (one op, band and domain) with the frozen geometry,
      * rank and world size, off the hot path: e.g. libr4d's all-reduce sets up peer signal buffers
      * and IPC handles here. A negative return aborts startup; the caller names the kernel. */
-    using InitFailureHook=void(*)(void*,int) noexcept;
-    // Internal opt-in startup: reserve actual tracking slots BEFORE any peer
-    // init may rendezvous. Null hook retains the original default path.
-    int reserve_instance_tracking(size_t additional) noexcept;
-    int init_instance(Resolved& r,int rank,int world_size,
-                      InitFailureHook early_failure=nullptr,void* failure_context=nullptr);
+    int  init_instance(Resolved& r, int rank, int world_size);
     void fini_instances();
     size_t n_instances() const;
 
@@ -351,7 +342,6 @@ private:
     std::vector<Plugin>      plugins_;
     std::deque<KernelRow>    rows_;          /* deque: KernelRow* handed out must stay valid */
     std::deque<QuantRow>     quants_;
-    std::deque<ImportRow>    importers_;
     std::unordered_map<std::string, std::vector<const KernelRow*>> by_op_;
     std::unordered_map<std::string, SchemaEntry> schemas_;
     std::vector<std::string> load_errors_;
@@ -360,7 +350,6 @@ private:
     std::vector<SelectionRecord> log_;
     std::unordered_map<std::string, size_t> log_at_;   /* SelectionRecord::key -> index in log_ */
     std::vector<std::pair<const RadKernelInfo*, void*>> instances_;
-    size_t instance_tracking_credits_=0; // only the explicit opt-in path
 };
 
 /* The value a kernel's own constraints place on one key, e.g. the paged block size the resolved

@@ -1,0 +1,21 @@
+[2026-10-29T01:09:05Z] waiting for 30 s of QFN idleness
+before: 608764c1d1989c714d8aad7b8a79f8057c3e73473b9f9d55b49d02e82defd2b8 running 2026-10-29T01:04:38.539013009Z sha256:e82764045e46ebae07e33961f17dedba981c0d07336dfcddd67e4b3b042b8600
+[2026-10-29T01:09:33Z] stopping radiance-flashnext
+radiance-flashnext
+[2026-10-29T01:09:42Z] prefill-shaped moe_gemm_ggml timing on card 0 with /home/as/ds41-claude-build/home/kernels/libr4d.so
+prefill T=1: gate_up, 1 live experts, 1 local rows: median 67.8 us, 184.8 GB/s of weights
+prefill T=1: down   , 1 live experts, 1 local rows: median 50.4 us, 124.3 GB/s of weights
+prefill T=2: gate_up, 1 live experts, 1 local rows: median 104.0 us, 120.5 GB/s of weights
+prefill T=2: down   , 1 live experts, 1 local rows: median 69.8 us, 89.7 GB/s of weights
+prefill T=4: gate_up, 4 live experts, 4 local rows: median 204.0 us, 245.7 GB/s of weights
+prefill T=4: down   , 4 live experts, 4 local rows: median 138.7 us, 180.8 GB/s of weights
+prefill T=8: gate_up, 10 live experts, 10 local rows: median 418.1 us, 299.8 GB/s of weights
+prefill T=8: down   , 10 live experts, 10 local rows: median 262.2 us, 239.0 GB/s of weights
+prefill T=16: gate_up, 23 live experts, 26 local rows: median 1233.7 us, 233.7 GB/s of weights
+prefill T=16: down   , 23 live experts, 26 local rows: median 534.6 us, 269.6 GB/s of weights
+ptime exit 0
+[2026-10-29T01:09:43Z] arms done
+[2026-10-29T01:09:43Z] restoring radiance-flashnext
+radiance-flashnext
+[2026-10-29T01:10:44Z] QFN up after 60s; completion: {"id":"cmpl-8e41a9d7e96d2bff5787635e","object":"text_completion","created":1793236244,"model":"qwen-vllm","system_fingerprint":"radiance-1.12.0","choices":[{"text":" Paris. The capital","index":0,"logprobs":null,"finish_reason":"length"}],"usage":{"prompt_tokens":5,"completion_tokens":4,"total_token
+608764c1d1989c714d8aad7b8a79f8057c3e73473b9f9d55b49d02e82defd2b8 running 2026-10-29T01:09:43.614765703Z sha256:e82764045e46ebae07e33961f17dedba981c0d07336dfcddd67e4b3b042b8600

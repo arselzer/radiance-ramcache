@@ -1,3 +1,0 @@
-I device: AQL backend, 1 device(s) [0:gfx1201]
-I quantisation 'quark' is imported weight by weight; 'glm5next' serves it as (unquantised)
-PASS GLM main store data records=8 nativeBytes=26738688 checks=82173 faults=4 runtimeReady=false

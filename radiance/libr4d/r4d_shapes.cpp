@@ -754,6 +754,32 @@ extern "C" int r4d_shape_kv_store(const RadParam* p, int n_p, int operand,
     R4D_PICK(l);
 }
 
+/* The streamed store: kv_store's geometry plus the mirror and the residency map. One block, one ring
+ * slot, every token on its own position (libref/ref_shapes.cpp says why); the partly resident map
+ * and the mirror-only step are built by hand. */
+extern "C" int r4d_shape_kv_store_streamed(const RadParam* p, int n_p, int operand,
+                                           RadOpdDesc* out) {
+    const int64_t M   = pi(p, n_p, "M");
+    const int64_t hd  = pi(p, n_p, "head_dim");
+    const int64_t kvh = pi(p, n_p, "n_head_kv");
+    const int64_t bs  = pi(p, n_p, "block_size");
+    const uint32_t KV = dt_act(p, n_p, "kv_dtype");
+    if (M <= 0 || hd <= 0 || kvh <= 0 || bs <= 0 || M > bs) return RAD_E_UNSUPPORTED;
+    /* E4M3 or bf16: the mirror and the ring are byte planes of the same paged layout, and the
+     * mirror's row pitch doubles for a two-byte element. */
+    if (KV != (uint32_t)RAD_F8E4M3 && KV != (uint32_t)RAD_BF16) return RAD_E_UNSUPPORTED;
+    const int64_t row = kvh * bs * 2 * hd * (KV == (uint32_t)RAD_BF16 ? 2 : 1);
+    const RadOpdDesc l[] = {
+        opd((uint32_t)RAD_BF16, M, kvh, hd),
+        opd((uint32_t)RAD_BF16, M, kvh, hd),
+        opd_idx(M, 0, bs, -1, RAD_OPD_F_IDX_UNIQUE),   /* slot_mapping, one block */
+        opd(KV, 1, kvh, bs, 2 * hd),              /* kv_cache -- the ring */
+        opd_idx(1, 0, 1, 0),                      /* res -- the block, resident in slot 0 */
+        opd((uint32_t)RAD_U8, 1, row),            /* host -- the layer's mirror */
+    };
+    R4D_PICK(l);
+}
+
 /* logits_gemm at bf16. The fp8 row is not described; see the file header. */
 extern "C" int r4d_shape_logits_gemm(const RadParam* p, int n_p, int operand,
                                      RadOpdDesc* out) {
@@ -1133,6 +1159,32 @@ extern "C" int r4d_shape_qkv_norm_rope_kv_store(const RadParam* p, int n_p, int 
     R4D_PICK(l);
 }
 
+/* qk_norm_rope_gate_kv_store_streamed: the prologue's operands, then the streamed store's (`v`,
+ * `slot_mapping`, the ring, the map and the mirror), on one block as kv_store_streamed's shape is.
+ * A bf16 mirror row is twice the fp8 one. */
+extern "C" int r4d_shape_qk_norm_rope_gate_kv_store_streamed(const RadParam* p, int n_p,
+                                                             int operand, RadOpdDesc* out) {
+    if (operand < 9) return r4d_shape_qk_norm_rope_gate(p, n_p, operand, out);
+    const int64_t M   = pi(p, n_p, "M");
+    const int64_t hd  = pi(p, n_p, "head_dim");
+    const int64_t kvh = pi(p, n_p, "n_head_kv");
+    const int64_t bs  = pi(p, n_p, "block_size");
+    const uint32_t KV = dt_act(p, n_p, "kv_dtype");
+    if (M <= 0 || hd <= 0 || kvh <= 0 || bs <= 0 || M > bs) return RAD_E_UNSUPPORTED;
+    if (KV != (uint32_t)RAD_F8E4M3 && KV != (uint32_t)RAD_BF16) return RAD_E_UNSUPPORTED;
+    const int64_t row = kvh * bs * 2 * hd * (KV == (uint32_t)RAD_BF16 ? 2 : 1);
+    const RadOpdDesc l[] = {
+        opd_none(), opd_none(), opd_none(), opd_none(), opd_none(), opd_none(), opd_none(),
+        opd_none(), opd_none(),
+        opd((uint32_t)RAD_BF16, M, kvh, hd),
+        opd_idx(M, 0, bs, -1, RAD_OPD_F_IDX_UNIQUE),   /* slot_mapping, one block */
+        opd(KV, 1, kvh, bs, 2 * hd),                   /* kv_cache -- the ring */
+        opd_idx(1, 0, 1, 0),                           /* res -- the block, resident in slot 0 */
+        opd((uint32_t)RAD_U8, 1, row),                 /* host -- the layer's mirror */
+    };
+    R4D_PICK(l);
+}
+
 /* rope_table -- the cos/sin plane the fused prologue reads (shim in r4d_qk_norm_rope_gate.hip). */
 extern "C" int r4d_shape_rope_table(const RadParam* p, int n_p, int operand,
                                     RadOpdDesc* out) {
@@ -1274,6 +1326,14 @@ extern "C" int r4d_shape_ar_rmsnorm_had_quant_i8g(const RadParam* p, int n_p, in
 extern "C" int r4d_shape_gemm_nt_f32(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = pi(p, n_p, "M"), N = pi(p, n_p, "N"), K = pi(p, n_p, "K");
     const RadOpdDesc l[] = { opd((uint32_t)RAD_BF16, M, K), opd((uint32_t)RAD_F32, N, K),
+                             opd((uint32_t)RAD_F32, M, N) };
+    R4D_PICK(l);
+}
+/* gemm_nt_f32bf16's weight as the kernel is handed it: the stored bf16 halves, [N, K]. */
+extern "C" int r4d_shape_gemm_nt_f32bf16(const RadParam* p, int n_p, int operand,
+                                         RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), N = pi(p, n_p, "N"), K = pi(p, n_p, "K");
+    const RadOpdDesc l[] = { opd((uint32_t)RAD_BF16, M, K), opd((uint32_t)RAD_BF16, N, K),
                              opd((uint32_t)RAD_F32, M, N) };
     R4D_PICK(l);
 }
@@ -1869,6 +1929,29 @@ extern "C" int r4d_shape_qsa_select(const RadParam* p, int n_p, int operand, Rad
     R4D_PICK(l);
 }
 
+/* The residency map and the two byte planes: `sel` is block ids, -1 past `nsel`. A described map
+ * is all-resident (no draw expresses -1), so a cold call never misses; the service-shaped cases
+ * are built by hand in tests/ref_test.cpp and this plugin's selftest. */
+extern "C" int r4d_shape_kv_resolve(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+
+    const int64_t M = pi(p, n_p, "M"), blocks = pi(p, n_p, "blocks");
+    const int64_t slots = pi(p, n_p, "slots"), pitch = pi(p, n_p, "sel_pitch");
+    const int64_t bbytes = pi(p, n_p, "block_bytes");
+    if (M <= 0 || blocks <= 0 || slots <= 0 || pitch <= 0 || bbytes <= 0)
+        return RAD_E_UNSUPPORTED;
+    const RadOpdDesc l[] = {
+        opd_idx(M, pitch, blocks),              /* sel -- one block id an entry */
+        opd_idx(M, 0, pitch + 1),               /* nsel -- 0 .. sel_pitch */
+        opd_idx(blocks, 0, slots, 0),           /* res -- an all-resident map, no -2 */
+        opd_idx(slots, 0, blocks, 0),           /* slot_block -- the reverse map */
+        opd_idx(slots, 2, 2, 0),                /* slot_state -- cold: epoch 0, no reference */
+        opd_idx(16, 0, 2, 0),                   /* ctl -- cold: epoch 0, hand 0 */
+        opd((uint32_t)RAD_U8, blocks, bbytes),  /* host -- the layer's mirror, a block a row */
+        opd((uint32_t)RAD_U8, slots, bbytes),   /* kv_cache -- the layer's ring, a block a row */
+    };
+    R4D_PICK(l);
+}
+
 /* The QSA block score. The block-key store's height is the KV pool's page count, which the
  * runtime decides, so `blocks` gives the widest a table entry can address: a bound, not the plan.
  * Table entries are page ids. */
@@ -2096,3 +2179,9 @@ extern "C" int r4d_shape_dflash_select(const RadParam* p, int n_p, int operand,
     };
     R4D_PICK(l);
 }
+
+/* DeepSeek-V4.1's ops, in this unit for the helpers above. */
+#include "r4d_ds41_elem_shapes.inc"
+#include "r4d_ds41_sparse_shapes.inc"
+#include "r4d_ds41_ggml_shapes.inc"
+#include "r4d_ds41_mxfp4_shapes.inc"

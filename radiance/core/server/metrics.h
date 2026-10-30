@@ -111,7 +111,9 @@ private:
     std::string labels_;        /* {model_name="...",engine="0"} */
 
     Gauge   g_running_, g_waiting_, g_kv_util_, g_prefix_hit_;
-    Gauge   g_kv_max_tokens_, g_kv_max_bytes_;
+    Gauge   g_kv_max_tokens_, g_kv_max_bytes_, g_kv_resident_blocks_;
+    /* KV streaming: blocks and bytes copied into the rings, cumulative. */
+    Counter c_kv_stream_misses_, c_kv_stream_bytes_;
     Gauge   g_prefill_tps_, g_decode_tps_, g_draft_accept_, g_preempted_;
     /* The decode floor in seconds: the fastest and the most recent single-sequence window. 0
      * until a window completes, and render() omits a 0. */
@@ -147,7 +149,24 @@ private:
     Counter c_step_secs_, c_step_secs_decode_;
     /* Exact totals behind the rate gauges; see render(). */
     Counter c_prefill_tokens_, c_decode_tokens_, c_draft_tokens_, c_draft_accepted_;
+    std::atomic<bool> draft_origin_on_{false};
+    Gauge g_draft_compute_off_, g_draft_verify_cap_;
+    Counter c_origin_learned_publications;
+    Counter c_origin_learned_published_tokens;
+    Counter c_origin_fallback_offers;
+    Counter c_origin_fallback_offered_tokens;
+    Counter c_origin_fallback_publications;
+    Counter c_origin_fallback_published_tokens;
+    Counter c_origin_learned_verified_tokens;
+    Counter c_origin_learned_accepted_tokens;
+    Counter c_origin_fallback_verified_tokens;
+    Counter c_origin_fallback_accepted_tokens;
+    Counter c_origin_block_context_issues;
+    Counter c_origin_block_context_rows;
+    Counter c_origin_block_query_issues;
+    Counter c_origin_block_query_rows;
     Counter c_draft_refills_, c_draft_refill_tokens_;
+    Counter c_lookup_proposals_, c_lookup_held_, c_lookup_held_drafts_, c_lookup_held_hits_;
     Counter c_attn_cached_, c_linear_cached_, c_checkpoints_;
     Counter c_prefix_evict_, c_prefix_ckpt_evict_;
     Counter c_prefix_expired_, c_prefix_ckpt_expired_;

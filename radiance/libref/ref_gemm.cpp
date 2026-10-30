@@ -286,8 +286,8 @@ static int gemm_nt_impl(const RadArgs* a, bool bias_operand, const char* nkey, c
  *                acc += (sub * a_scale[m]) * scale
  *   ZP_I8_GROUP  sub = sum(a * (code - zero))                  exact
  *                acc += (sub * a_scale[m][g]) * scale
- *   ZP_F16       sub = sum over ascending k of a * (code - zero), each product exact in f32
- *                acc += sub * scale
+ *   ZP_F16       BF16 inputs are first narrowed to F16 (as by the graph's former cast); sub is
+ *                the sum over ascending k of a * (code - zero), then acc += sub * scale
  *
  * `a` is already in column order (the caller undoes the step order). `a_sum` is quant_act_i8's,
  * group-major [K/group][Mpad], Mpad = ceil(M/16)*16; the grid's zero is removed through it, as
@@ -319,7 +319,29 @@ static int gemm_zp(const ZpGrid& zg, const RadTensor* A, const RadTensor* as_,
     const int64_t acols = parts * K;
     if (numel(A) < M * acols) return RAD_E_SHAPE;
     if (A->rank >= 2 && A->shape[A->rank - 1] != acols) return RAD_E_SHAPE;
-    const int64_t ars = row_stride(A, acols), acs = laststride(A);
+    int64_t ars = row_stride(A, acols), acs = laststride(A);
+
+    /* The W4 decode graph supplies BF16 directly so HIP can narrow on load. Preserve the former
+     * explicit BF16->F16 cast semantics on host backends before evaluating the F16 activation grid. */
+    std::vector<uint16_t> narrowed;
+    RadTensor a_f16{};
+    if (zg.act == ZP_F16 && A->dtype == RAD_BF16) {
+        narrowed.resize((size_t)(M * acols));
+        for (int64_t m = 0; m < M; ++m)
+            for (int64_t k = 0; k < acols; ++k)
+                narrowed[(size_t)(m * acols + k)] = f32_to_f16(ldt(A, m * ars + k * acs));
+        a_f16 = *A;
+        a_f16.data = narrowed.data();
+        a_f16.dtype = RAD_F16;
+        a_f16.rank = 2;
+        a_f16.shape[0] = M;
+        a_f16.shape[1] = acols;
+        a_f16.stride[0] = acols;
+        a_f16.stride[1] = 1;
+        A = &a_f16;
+        ars = acols;
+        acs = 1;
+    }
 
     const bool i8 = zg.act != ZP_F16;
     if (i8 && A->dtype != RAD_I8) return RAD_E_DTYPE;
@@ -550,6 +572,63 @@ static int embed_gather(const RadArgs* a, const RadTensor* tok, const RadTensor*
 int ref_embed_lookup(const RadArgs* a, RadStream) {
     if (!have(a, 3)) return RAD_E_INVAL;
     return embed_gather(a, &a->t[0], &a->t[1], &a->t[2], p_f32(a, "mult", 1.0f));
+}
+
+/* A gather from a table stored as single-level affine planes, read in place: no relayout, so a
+ * table too large to copy (an n-gram embedding of hundreds of GiB) is gathered from the
+ * container's own bytes on whatever tier holds them.
+ *
+ *   x[m, i] = v * scale[id, i / group] * mult,  v = table[code] with a table, else the code.
+ *
+ * Codes are i8 or u8, or 4-bit (u4 an unsigned index, i4 signed) elements of a bit stream along the
+ * row, lowest bits first (rad_encoding.h). This is how llama.cpp's Q8_0, Q4_0 and IQ4_NL blocks
+ * decode once imported as planes (libquant/lq_ggml_planes.h), product for product. Padding, bounds
+ * and `vocab_offset` behave as embed_lookup's. */
+int ref_embed_lookup_planes(const RadArgs* a, RadStream) {
+    if (a->n_t < 5 || !rad_arg_in(a, 0) || !rad_arg_in(a, 1) || !rad_arg_in(a, 2) || !rad_arg_in(a, 4))
+        return RAD_E_INVAL;
+    const RadTensor &tok = a->t[0], &cd = a->t[1], &sc = a->t[2], &tb = a->t[3], &x = a->t[4];
+    const bool tab = tb.data != nullptr;
+    const int64_t E = p_int(a, "n_embd", 0), V = p_int(a, "n_vocab", 0), G = p_int(a, "group", 0);
+    const int64_t voff = p_int(a, "vocab_offset", 0);
+    const float mult = p_f32(a, "mult", 1.0f);
+    if (E <= 0 || V <= 0 || G <= 0 || E % G || voff < 0 || cd.rank != 2 || cd.shape[0] < V ||
+        cd.shape[1] != E || sc.rank != 2 || sc.shape[0] < V || sc.shape[1] != E / G)
+        return RAD_E_SHAPE;
+    const uint32_t cdt = cd.dtype;
+    const int bits = (cdt == RAD_U4 || cdt == RAD_I4) ? 4 : (cdt == RAD_U8 || cdt == RAD_I8) ? 8 : 0;
+    if (!bits) return RAD_E_DTYPE;
+    /* A table is indexed by an unsigned code and must hold every one of them. */
+    if (tab && (cdt == RAD_I4 || cdt == RAD_I8 || numel(&tb) < (int64_t)1 << bits)) return RAD_E_DTYPE;
+    const int64_t rb = rad_dtype_bytes(cdt, E);
+    const int64_t M = numel(&x) / E;
+    if (rb <= 0 || M <= 0 || numel(&tok) < M) return RAD_E_SHAPE;
+    if (voff == 0 && a->world_size <= 1)
+        for (int64_t m = 0; m < M; ++m)
+            if (ld_int(tok.dtype, tok.data, offlin(&tok, m)) >= V) return RAD_E_INVAL;
+    REF_PAR_FOR(M * E)
+    for (int64_t m = 0; m < M; ++m) {
+        const int64_t id = ld_int(tok.dtype, tok.data, offlin(&tok, m)) - voff;
+        const int64_t xb = rowoff(&x, m, E), xs = laststride(&x);
+        if (id < 0 || id >= V) {
+            for (int64_t i = 0; i < E; ++i) stt(&x, xb + i * xs, 0.0f);
+            continue;
+        }
+        const uint8_t* row = (const uint8_t*)cd.data + id * rb;
+        const int64_t sb = rowoff(&sc, id, E / G), ss = laststride(&sc);
+        for (int64_t i = 0; i < E; ++i) {
+            int code;
+            if (bits == 8) {
+                code = cdt == RAD_I8 ? (int)(int8_t)row[i] : (int)row[i];
+            } else {
+                const int u = (row[i >> 1] >> ((i & 1) * 4)) & 15;
+                code = cdt == RAD_I4 ? (u ^ 8) - 8 : u;
+            }
+            const float v = tab ? ld_dt(tb.dtype, tb.data, code) : (float)code;
+            stt(&x, xb + i * xs, v * ldt(&sc, sb + (i / G) * ss) * mult);
+        }
+    }
+    return RAD_OK;
 }
 
 /* A gather from a quantised table with one scale for the whole table.

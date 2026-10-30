@@ -5,18 +5,14 @@
  * C compiler gives them, and rad_yarn.h's C definitions, are handed to abi_layout_test.cpp, which
  * compares them with its own. */
 #include "rad_abi.h"
-#include "rad_model_failure_policy.h"
 #include "rad_builder.h"
 #include "rad_device.h"
-#include "rad_deferred_status.h"
-#include "rad_deferred_status_capability.h"
 #include "rad_encoding.h"
 #include "rad_format.h"
 #include "rad_philox.h"
 #include "rad_planes.h"
 #include "rad_plugin.h"
 #include "rad_quant.h"
-#include "rad_import.h"
 #include "rad_runtime.h"
 #include "rad_sample.h"
 #include "rad_spechub.h"
@@ -24,8 +20,6 @@
 #include "rad_yarn.h"
 
 #include "abi_layout.h"
-
-size_t abi_c_deferred_status_alignment(void) { return _Alignof(RadDeviceStatus); }
 
 const AbiRow abi_c_rows[] = {
 #define ABI_STRUCT(T)   { #T, "", 0, sizeof(T) },

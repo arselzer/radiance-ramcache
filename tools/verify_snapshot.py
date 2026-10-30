@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
-"""Verify the portable source snapshot; no build, model, device or network use."""
+"""Verify the ds41 source snapshot; no build, model, device or network use.
+
+Every file in the tree must be listed in SNAPSHOT_MANIFEST.json with its SHA256, and nothing
+else may be there. radiance/ must be exactly the engine commit the manifest names: the same
+files, byte for byte, as docs/ds41/provenance/ENGINE_SOURCE_PINS.json, whose own SHA256 the
+manifest records. With --engine-repo PATH the pins are also checked against that commit's git
+tree (blob ids and executable bits); that needs a local copy of the engine repository.
+
+Adapted from main's tools/verify_snapshot.py. Main's frozen Core12/Fixture17 identity and its
+HOST build-profile checks belong to the GLM checkpoint and do not apply to this branch.
+"""
 
 import argparse
 import hashlib
@@ -7,16 +17,15 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import stat
+import subprocess
 import sys
 
 
 MANIFEST = "SNAPSHOT_MANIFEST.json"
-CORE_ARCHIVE_PINS_SHA256 = "c5c474c9ab5e8e96bd939069ee646937f99b9237d6cc1933bd5b8b69316eaf2a"
-FIXTURE_ARCHIVE_RECEIPT_SHA256 = "82665d51cccdb3bd55e16b4fa62282414737a2ae11dcd7db0f2024592f6c48b2"
-CORE_CACHE_EXCLUSIONS = frozenset({
-    "tests/__pycache__/gen_deepseek41_reference.cpython-314.pyc",
-    "tests/data/golden/__pycache__/deepseek41-engram-generate.cpython-314.pyc",
-})
+ENGINE_DIR = "radiance"
+ENGINE_PINS = "docs/ds41/provenance/ENGINE_SOURCE_PINS.json"
+ENGINE_SOURCE = "docs/ds41/provenance/ENGINE_SOURCE.json"
+HEX = frozenset("0123456789abcdef")
 
 
 class Refusal(RuntimeError):
@@ -31,12 +40,21 @@ def digest(path):
     return h.hexdigest()
 
 
-def relative_name(value):
-    if not isinstance(value, str) or not value or "\\" in value:
-        raise Refusal("invalid manifest path")
+def is_hex(value, length):
+    return isinstance(value, str) and len(value) == length and all(c in HEX for c in value)
+
+
+def canonical(value):
+    if not isinstance(value, str) or not value or "\\" in value or "\0" in value:
+        raise Refusal("invalid path: " + repr(value))
     p = PurePosixPath(value)
     if p.is_absolute() or str(p) != value or any(x in ("", ".", "..") for x in p.parts):
-        raise Refusal("noncanonical manifest path: " + value)
+        raise Refusal("noncanonical path: " + value)
+    return p
+
+
+def relative_name(value):
+    p = canonical(value)
     if p.parts[0] in (".git", "build") or value == MANIFEST:
         raise Refusal("manifest contains excluded/generated path: " + value)
     return value
@@ -56,19 +74,24 @@ def regular_path(root, name):
     return path
 
 
-def load_manifest(root):
-    path = regular_path(root, MANIFEST)
-    if path.stat().st_size > 16 * 1024 * 1024:
-        raise Refusal("manifest exceeds 16 MiB cap")
+def strict_json(path, cap):
+    if path.stat().st_size > cap:
+        raise Refusal(str(path) + " exceeds its size cap")
+
     # Duplicate JSON members must not shadow a path/digest.
     def object_pairs(pairs):
         obj = {}
         for key, value in pairs:
             if key in obj:
-                raise Refusal("duplicate manifest member: " + key)
+                raise Refusal("duplicate JSON member in " + str(path) + ": " + key)
             obj[key] = value
         return obj
-    data = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=object_pairs)
+
+    return json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=object_pairs)
+
+
+def load_manifest(root):
+    data = strict_json(regular_path(root, MANIFEST), 16 * 1024 * 1024)
     if not isinstance(data, dict):
         raise Refusal("manifest root must be an object")
     files = data.get("files_sha256")
@@ -76,9 +99,9 @@ def load_manifest(root):
         raise Refusal("manifest files_sha256 must contain 1..100000 file hashes")
     for name, h in files.items():
         relative_name(name)
-        if not isinstance(h, str) or len(h) != 64 or any(c not in "0123456789abcdef" for c in h):
+        if not is_hex(h, 64):
             raise Refusal("invalid SHA256 for " + name)
-    return files
+    return data, files
 
 
 def source_files(root):
@@ -102,7 +125,7 @@ def source_files(root):
 
 def verify_snapshot(root):
     root = root.resolve(strict=True)
-    files = load_manifest(root)
+    data, files = load_manifest(root)
     found = source_files(root)
     missing = set(files) - found
     extra = found - set(files)
@@ -112,166 +135,96 @@ def verify_snapshot(root):
     for name, expected in sorted(files.items()):
         if digest(regular_path(root, name)) != expected:
             raise Refusal("source SHA256 mismatch: " + name)
-    core_files = {name.removeprefix("radiance/"): h
-                  for name, h in files.items() if name.startswith("radiance/")}
-    archived_pins = regular_path(root, "research/glm53-main-verified-source-engine-v17-prototype/CORE_SOURCE_PINS.json")
-    archived_receipt = regular_path(root, "research/glm53-main-verified-source-engine-v17-prototype/SOURCE_RECEIPT.json")
-    if digest(archived_pins) != CORE_ARCHIVE_PINS_SHA256 or digest(archived_receipt) != FIXTURE_ARCHIVE_RECEIPT_SHA256:
-        raise Refusal("expected exact frozen Core12 / Fixture17 archived source identity")
-    original = json.loads(archived_pins.read_text(encoding="utf-8"))
-    # Core12's original1536-file map already excludes both historical generated
-    # caches. Compare it directly; preserve all older archived maps unchanged.
-    if not isinstance(original, dict) or len(original) != 1536 or CORE_CACHE_EXCLUSIONS & set(original):
-        raise Refusal("unexpected frozen1536-file Core12 pin inventory")
-    if core_files != original:
-        raise Refusal("exported Core differs from the exact frozen1536-file Core12 inventory")
-    if any(name in core_files for name in CORE_CACHE_EXCLUSIONS):
-        raise Refusal("portable source snapshot must exclude the two recorded Python caches")
-    return files
+    return data, files
 
 
-def cache_values(path):
-    if path.stat().st_size > 4 * 1024 * 1024:
-        raise Refusal("CMakeCache exceeds 4 MiB cap")
-    values = {}
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if not line or line.startswith(("#", "//")) or "=" not in line or ":" not in line.split("=", 1)[0]:
+def verify_engine(root, data, files):
+    """radiance/ must be exactly the pinned engine tree the manifest names."""
+    engine = data.get("engine")
+    if not isinstance(engine, dict):
+        raise Refusal("manifest has no engine record")
+    commit, pins_sha256, count = engine.get("commit"), engine.get("pins_sha256"), engine.get("files")
+    if not is_hex(commit, 40) or not is_hex(pins_sha256, 64) or not isinstance(count, int) or count < 1:
+        raise Refusal("manifest engine record needs commit (40 hex), pins_sha256 and files")
+    # verify_snapshot already held the pin file to the manifest's digest.
+    if files.get(ENGINE_PINS) != pins_sha256:
+        raise Refusal("engine pin file is not the one the manifest's engine record names")
+    pins = strict_json(regular_path(root, ENGINE_PINS), 16 * 1024 * 1024)
+    if not isinstance(pins, dict) or len(pins) != count:
+        raise Refusal("engine pin file must map exactly " + str(count) + " files")
+    for name, h in pins.items():
+        canonical(name)
+        if not is_hex(h, 64):
+            raise Refusal("invalid engine pin for " + name)
+    source = strict_json(regular_path(root, ENGINE_SOURCE), 1024 * 1024)
+    if not isinstance(source, dict) or source.get("commit") != commit \
+            or source.get("pins_sha256") != pins_sha256 or source.get("files") != count:
+        raise Refusal("ENGINE_SOURCE.json disagrees with the manifest's engine record")
+    prefix = ENGINE_DIR + "/"
+    exported = {name[len(prefix):]: h for name, h in files.items() if name.startswith(prefix)}
+    if exported != pins:
+        missing = sorted(set(pins) - set(exported))
+        extra = sorted(set(exported) - set(pins))
+        changed = sorted(n for n in set(pins) & set(exported) if pins[n] != exported[n])
+        raise Refusal("radiance/ differs from the pinned engine tree; missing=" + repr(missing[:8])
+                      + " extra=" + repr(extra[:8]) + " changed=" + repr(changed[:8]))
+    return commit, pins
+
+
+def verify_engine_repo(root, repo, commit, pins):
+    """Optional: the pins against the engine commit's own tree in a local git repository."""
+    def git(*args):
+        return subprocess.run(["git", "-C", str(repo), *args], check=True,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout
+    try:
+        git("cat-file", "-e", commit + "^{commit}")
+        object_format = git("rev-parse", "--show-object-format").decode().strip() or "sha1"
+        listing = git("ls-tree", "-r", "-z", "--full-tree", commit)
+    except (OSError, subprocess.CalledProcessError) as e:
+        raise Refusal("engine repository does not have commit " + commit) from e
+    if object_format not in ("sha1", "sha256"):
+        raise Refusal("unsupported git object format: " + object_format)
+    entries = {}
+    for record in listing.split(b"\0"):
+        if not record:
             continue
-        left, value = line.split("=", 1)
-        key, _kind = left.split(":", 1)
-        if key in values:
-            raise Refusal("duplicate CMakeCache entry: " + key)
-        values[key] = value
-    return values
+        meta, path = record.split(b"\t", 1)
+        mode, kind, blob = meta.split()
+        if kind != b"blob" or mode not in (b"100644", b"100755"):
+            raise Refusal("engine tree entry is not a regular file: " + path.decode(errors="replace"))
+        entries[path.decode()] = (mode == b"100755", blob.decode())
+    if set(entries) != set(pins):
+        raise Refusal("pins and the engine commit's tree name different files")
+    base = root / ENGINE_DIR
+    for name, (executable, blob) in sorted(entries.items()):
+        path = regular_path(base, name)
+        content = path.read_bytes()
+        h = hashlib.new(object_format)
+        h.update(b"blob %d\0" % len(content))
+        h.update(content)
+        if h.hexdigest() != blob:
+            raise Refusal("radiance/" + name + " differs from the engine commit's blob")
+        if bool(path.stat().st_mode & 0o111) != executable:
+            raise Refusal("radiance/" + name + " executable bit differs from the engine commit")
+    return len(entries)
 
-
-def verify_compiler_profile(cache, languages=("CXX", "C"), allow_exact_ccache=False):
-    # Closed research profile: source identity alone cannot establish matching
-    # private STL/ABI layouts when e.g. -D_GLIBCXX_DEBUG or -fpack-struct differs.
-    # Sanitizer flags are supplied only by the reviewed RAD_ASAN/RAD_TSAN CMake
-    # branches, not arbitrary cache flags. Do not inherit an unbounded flag set.
-    profiles = {"": (), "_DEBUG": ("-g",), "_RELEASE": ("-O3", "-DNDEBUG"),
-                "_MINSIZEREL": ("-Os", "-DNDEBUG"),
-                "_RELWITHDEBINFO": ("-O2", "-g", "-DNDEBUG")}
-    permitted = {language + suffix: flags
-                 for language in ("CMAKE_" + name + "_FLAGS" for name in languages)
-                 for suffix, flags in profiles.items()}
-    for key, flags in permitted.items():
-        if key not in cache or tuple(cache[key].split()) != flags:
-            raise Refusal("unsupported compiler/ABI profile: " + key + "=" + repr(cache.get(key)))
-    for key, value in cache.items():
-        if key.endswith("-ADVANCED"):
-            continue
-        if key.startswith(("CMAKE_CXX_FLAGS", "CMAKE_C_FLAGS")) and key not in permitted:
-            raise Refusal("unsupported extra compiler profile: " + key)
-        if any(key.startswith("CMAKE_" + kind + "_LINKER_FLAGS")
-               for kind in ("EXE", "MODULE", "SHARED", "STATIC")) and value.strip():
-            raise Refusal("unsupported linker flags: " + key)
-        if key.startswith("CMAKE_INTERPROCEDURAL_OPTIMIZATION") and value not in ("", "OFF", "FALSE", "0"):
-            raise Refusal("unsupported interprocedural optimization profile")
-    for key in ("CMAKE_CXX_COMPILER_LAUNCHER", "CMAKE_C_COMPILER_LAUNCHER"):
-        value = cache.get(key, "")
-        if not value:
-            continue
-        # Existing reviewed v4 HOST archives used this ONE system compiler-cache
-        # front end. Admit no argument/list/alternate launcher, and do not pass
-        # it on to the fixture build. Compiler/flags/private source checks still
-        # apply. System tool trust is not prebuilt-binary authentication.
-        launcher = Path("/usr/bin/ccache")
-        if (not allow_exact_ccache or value != "/usr/bin/ccache"
-                or launcher.is_symlink() or not launcher.is_file()
-                or not os.access(launcher, os.X_OK)):
-            raise Refusal("unsupported compiler/toolchain injection: " + key)
-    for key in ("CMAKE_CXX_COMPILER_ARG1", "CMAKE_C_COMPILER_ARG1",
-                "CMAKE_TOOLCHAIN_FILE", "CMAKE_SYSROOT", "CMAKE_CXX_COMPILER_TARGET",
-                "CMAKE_CXX_COMPILER_EXTERNAL_TOOLCHAIN", "CMAKE_PROJECT_TOP_LEVEL_INCLUDES"):
-        if cache.get(key, "").strip():
-            raise Refusal("unsupported compiler/toolchain injection: " + key)
-
-
-def verify_core_build(root, build, mode, files=None, require_archives=True):
-    if not build.is_absolute():
-        raise Refusal("existing Core build path must be absolute")
-    build = build.resolve(strict=True)
-    cache = cache_values(regular_path(build, "CMakeCache.txt"))
-    expected_type = "Release" if mode == "release" else "Debug"
-    expected = {"RAD_WITH_HIP": "OFF", "RAD_WITH_FFMPEG": "OFF",
-                "RAD_ASAN": "ON" if mode == "asan" else "OFF",
-                "RAD_TSAN": "ON" if mode == "tsan" else "OFF",
-                "CMAKE_BUILD_TYPE": expected_type}
-    for key, value in expected.items():
-        if cache.get(key) != value:
-            raise Refusal("Core build profile mismatch: " + key + " expected " + value
-                          + " observed " + repr(cache.get(key)))
-    verify_compiler_profile(cache, allow_exact_ccache=True)
-    if cache.get("RAD_BUILD_DS41_EXPERIMENTAL") not in ("ON", "OFF"):
-        raise Refusal("Core must explicitly record its experimental-DS41 build option")
-    if cache.get("RAD_BUILD_GLM_TP4_CACHE_EXPERIMENTAL") not in ("ON", "OFF"):
-        raise Refusal("Core must explicitly record its experimental GLM TP4 module build option")
-    home_value = cache.get("CMAKE_HOME_DIRECTORY", "")
-    if not home_value or not Path(home_value).is_absolute():
-        raise Refusal("Core build has no absolute CMAKE_HOME_DIRECTORY")
-    home = Path(home_value).resolve(strict=True)
-    if files is None:
-        files = verify_snapshot(root)
-    wanted = {name.removeprefix("radiance/"): h for name, h in files.items()
-              if name.startswith("radiance/")}
-    actual = set()
-    for base, dirs, names in os.walk(home, followlinks=False):
-        directory = Path(base)
-        for name in dirs:
-            if (directory / name).is_symlink():
-                raise Refusal("Core source-home directory symlink is unsupported")
-        for name in names:
-            relative = (directory / name).relative_to(home).as_posix()
-            regular_path(home, relative)
-            actual.add(relative)
-    missing = set(wanted) - actual
-    extra = actual - set(wanted) - CORE_CACHE_EXCLUSIONS
-    if missing or extra:
-        raise Refusal("Core source-home file-set mismatch; missing=" + repr(sorted(missing)[:8])
-                      + " extra=" + repr(sorted(extra)[:8]))
-    for name, expected_hash in sorted(wanted.items()):
-        if digest(regular_path(home, name)) != expected_hash:
-            raise Refusal("built Core source-home differs from snapshot: " + name)
-    if require_archives:
-        for name in ("core/librad_core.a", "vendor/librad_vendor_llama.a",
-                     "vendor/librad_vendor_httplib.a"):
-            regular_path(build, name)
-    compiler = cache.get("CMAKE_CXX_COMPILER", "")
-    if not compiler or not Path(compiler).is_absolute():
-        raise Refusal("Core must record an absolute C++ compiler")
-    return cache
-
-
-
-def verify_fixture_build(root, build, mode, core_build, core_cache):
-    cache = cache_values(regular_path(build, "CMakeCache.txt"))
-    verify_compiler_profile(cache, languages=("CXX",))
-    expected_type = "Release" if mode == "release" else "Debug"
-    if cache.get("CMAKE_BUILD_TYPE") != expected_type or cache.get("PORTABLE_MODE") != mode:
-        raise Refusal("portable fixture mode/build-type mismatch")
-    for key, target in (("CMAKE_HOME_DIRECTORY", root / "research/portable"),
-                        ("RADIANCE_SOURCE", root / "radiance"),
-                        ("RADIANCE_HOST_BUILD", core_build)):
-        value = cache.get(key, "")
-        if not value or not Path(value).is_absolute() or Path(value).resolve(strict=True) != target.resolve(strict=True):
-            raise Refusal("portable fixture source/Core path mismatch: " + key)
-    if cache.get("CMAKE_CXX_COMPILER") != core_cache.get("CMAKE_CXX_COMPILER"):
-        raise Refusal("portable fixture compiler differs from verified Core")
-    return cache
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--repo-root", type=Path,
                         default=Path(__file__).resolve().parents[1])
-    parser.add_argument("--existing-core-build", type=Path)
-    parser.add_argument("--mode", choices=("release", "asan", "tsan"), default="release")
+    parser.add_argument("--engine-repo", type=Path,
+                        help="local engine git repository holding the pinned commit (optional)")
     args = parser.parse_args()
-    files = verify_snapshot(args.repo_root)
-    if args.existing_core_build is not None:
-        verify_core_build(args.repo_root, args.existing_core_build, args.mode, files)
-    print("PASS source-only snapshot SHA256 verification:", len(files), "files; no runtime/device execution")
+    data, files = verify_snapshot(args.repo_root)
+    commit, pins = verify_engine(args.repo_root.resolve(), data, files)
+    note = ""
+    if args.engine_repo is not None:
+        checked = verify_engine_repo(args.repo_root.resolve(), args.engine_repo, commit, pins)
+        note = "; " + str(checked) + " blobs and modes match the engine repository"
+    print("PASS source-only snapshot SHA256 verification:", len(files), "files; radiance/ is engine",
+          commit[:12], "(" + str(len(pins)) + " files" + note + "); no runtime/device execution")
 
 
 if __name__ == "__main__":

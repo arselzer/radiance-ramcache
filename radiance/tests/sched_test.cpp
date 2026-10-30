@@ -11,6 +11,7 @@
 #include "server/sink.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <new>
@@ -88,7 +89,7 @@ struct Fixture {
     ~Fixture() { sch.fini(); for (void* p : owned) std::free(p); }
 
     void build(int64_t blocks = 4096, int64_t states = 64, int64_t max_tok = 512,
-               int64_t max_ctx = 4096, bool windowed = false) {
+               int64_t max_ctx = 4096, bool windowed = false, bool linear = true) {
         g_gdn_ki = RadKernelInfo{};
         g_gdn_ki.name = "gdn_fake";
         g_gdn_ki.op = "gdn_chunked";
@@ -109,17 +110,21 @@ struct Fixture {
         attn.block_size = 16;
         prog.kv_groups.push_back(attn);
 
-        KVGroupInfo lin;
-        lin.name = "gdn";
-        lin.decl.kind = RAD_KV_LINEAR;
-        lin.decl.state_dim[0] = 128; lin.decl.state_dim[1] = 128;
-        prog.kv_groups.push_back(lin);
+        /* `linear` false: a full-attention trunk, as Gemma 4's (with `windowed`, its sliding
+         * layers), and no GDN op or state buffers below. */
+        if (linear) {
+            KVGroupInfo lin;
+            lin.name = "gdn";
+            lin.decl.kind = RAD_KV_LINEAR;
+            lin.decl.state_dim[0] = 128; lin.decl.state_dim[1] = 128;
+            prog.kv_groups.push_back(lin);
 
-        KVGroupInfo conv;
-        conv.name = "conv";
-        conv.decl.kind = RAD_KV_CONV;
-        conv.decl.conv_width = 4;
-        prog.kv_groups.push_back(conv);
+            KVGroupInfo conv;
+            conv.name = "conv";
+            conv.decl.kind = RAD_KV_CONV;
+            conv.decl.conv_width = 4;
+            prog.kv_groups.push_back(conv);
+        }
 
         /* A windowed paged group, as sliding-window checkpoints pair with a full group. Not
          * prefix-cached: prefix.cpp indexes only groups whose blocks below the window stay put.
@@ -138,28 +143,34 @@ struct Fixture {
                                         * stays unbound, and unbound is not trunk-owned */
         }
 
-        OpInfo op;
-        op.op = "gdn_chunk_scan";
-        op.schema = &g_gdn_schema;
-        Band b;
-        b.hi = 4096;
-        b.dom[RAD_DOMAIN_DEVICE].row = &g_gdn_row;
-        /* The architecture plugin's declared geometry, in arch/common/rad_block_gdn.h's spelling,
-         * the key its schema marks RAD_PROLE_SEQ_CHUNK. Both this and the kernel's constraint
-         * contribute. */
-        b.dom[RAD_DOMAIN_DEVICE].geom.set_i("chunk", 64);
-        op.bands.push_back(b);
-        prog.ops.push_back(op);
+        if (linear) {
+            OpInfo op;
+            op.op = "gdn_chunk_scan";
+            op.schema = &g_gdn_schema;
+            Band b;
+            b.hi = 4096;
+            b.dom[RAD_DOMAIN_DEVICE].row = &g_gdn_row;
+            /* The architecture plugin's declared geometry, in arch/common/rad_block_gdn.h's
+             * spelling, the key its schema marks RAD_PROLE_SEQ_CHUNK. Both this and the kernel's
+             * constraint contribute. */
+            b.dom[RAD_DOMAIN_DEVICE].geom.set_i("chunk", 64);
+            op.bands.push_back(b);
+            prog.ops.push_back(op);
 
-        add_derived("seq_start", "seq_start_index", 257);
-        add_derived("chunk_bounds", "state_chunk_bounds", 4097);
-        add_derived("conv_idx", "conv_state_index", 256);
+            add_derived("seq_start", "seq_start_index", 257);
+            add_derived("chunk_bounds", "state_chunk_bounds", 4097);
+            add_derived("conv_idx", "conv_state_index", 256);
+        }
 
         cfg.max_tok = max_tok;
         cfg.max_seqs = 32;
         cfg.max_ctx = max_ctx;
         cfg.checkpoint_interval = 256;
         cfg.prefix_cache = true;
+        /* The tests below were written for the nearest resume rule (a tail snapshot at the last
+         * quantum boundary, a hit at any snapshot or block); the exact rule's own tests set
+         * prefix_exact (--prefix-resume exact, the default). */
+        cfg.prefix_exact = false;
         /* Config::n_spec defaults to -1 (`auto`), which engine_bringup resolves; this fixture
          * skips that, and DraftController::configure refuses a negative depth. Speculation tests
          * set their own depth. */
@@ -188,10 +199,10 @@ struct Fixture {
         prog.buffers.push_back(b);
     }
 
-    int start() {
+    int start(const DraftExperiment* experiment = nullptr) {
         std::vector<BatchBuilder::RankIO> rio;
         rio.push_back({ 0, nullptr, &prog });
-        return sch.init(prog, cfg, &kv, &pc, rio);
+        return sch.init(prog, cfg, &kv, &pc, rio, nullptr, experiment);
     }
 
     const int32_t* derived(const char* name) const {
@@ -426,6 +437,47 @@ TEST(tip_only_window_prefill_writes_only_the_tail_snapshot) {
     for (int i = 0; i < 8 && f.sch.step(); ++i) f.commit_plain();
     CHECK_EQ(f.pc.reserved, 1);
     CHECK_EQ(f.sch.metrics().checkpoints_written, 1ll);
+}
+
+/* A hit that ends at a head other prompts share (CacheHit::branch_at) and resumes nothing there:
+ * the request takes a snapshot at that point (Request::checkpoint_at), so the requests after it
+ * skip the head. TranslateGemma's chunks: the same instructions, then a different text each. Not
+ * when a snapshot already resumes within Scheduler::kSharedHeadMin of it, nor for an ordinary hit. */
+TEST(a_hit_at_a_shared_head_takes_a_snapshot_there) {
+    {   /* a window model, tip-only: the head's snapshot comes in addition to the tail's */
+        Fixture f;
+        f.build(4096, 64, 512, 4096, /*windowed=*/true);
+        f.prog.kv_groups.erase(f.prog.kv_groups.begin() + 1, f.prog.kv_groups.begin() + 3);
+        f.prog.ops.resize(1);
+        f.prog.buffers.resize(1);
+        f.kv.setup(f.prog.kv_groups, f.cfg.max_ctx, 4096, 64);
+        f.pc.groups = { 0 };
+        f.cfg.checkpoint_policy = "tip-only";
+        REQUIRE_EQ(f.start(), RAD_OK);
+        f.pc.seed(640);
+        f.pc.branch_at = 640;
+        const uint64_t a = f.submit(1100, 1);
+        CHECK(f.sch.step() != nullptr);
+        CHECK_EQ(f.sch.find(a)->n_computed, (int64_t)0);
+        CHECK_EQ(f.sch.find(a)->checkpoint_at, (int64_t)640);
+        f.commit_plain();
+        for (int i = 0; i < 8 && f.sch.step(); ++i) f.commit_plain();
+        CHECK_EQ(f.sch.metrics().checkpoints_written, 2ll);
+        const std::vector<int64_t> want = { 640, 1072 };
+        CHECK(f.pc.committed == want);
+    }
+    for (int c = 0; c < 3; ++c) {   /* a hybrid model, interval 256, quantum 64 */
+        Fixture f;
+        f.build();
+        CHECK_OK(f.start());
+        f.pc.seed(640);
+        if (c == 1) { f.pc.lin = 512; f.pc.src = 3; }   /* resumes 128 short: not worth a split */
+        f.pc.branch_at = c == 2 ? 0 : 640;              /* an ordinary hit: no branch */
+        const uint64_t a = f.submit(1100, 1);
+        CHECK(f.sch.step() != nullptr);
+        CHECK_EQ(f.sch.find(a)->n_computed, (int64_t)(c == 1 ? 512 : 0));
+        CHECK_EQ(f.sch.find(a)->checkpoint_at, (int64_t)(c == 0 ? 640 : 0));
+    }
 }
 
 TEST(tip_only_does_not_disable_recurrent_interval_checkpoints) {
@@ -748,6 +800,433 @@ TEST(a_span_needs_an_interval_grid) {
     CHECK_EQ((int64_t)f.sch.plan().e.size(), 2ll);
 }
 
+/* ================================================================== exact resume */
+/* --prefix-resume exact (the default): a hit resumes only where an idle server's cold prefill of
+ * the same prompt starts a chunk, and a prompt's tail snapshot is where its last chunk starts. A
+ * kernel may round a row differently at another chunk length (spec §17: the split-K count is
+ * chosen from M), so a hit is bit-identical to a cold run only when it recomputes the cold run's
+ * own chunks. */
+
+/* The chunk ends and checkpoints an idle server plans for an `L`-token prompt from `from`. */
+struct Cut { std::vector<int64_t> ends, ckpts; };
+static Cut cut_from(const Scheduler& s, int64_t from, int64_t L, int64_t budget) {
+    Cut c;
+    for (int64_t pos = from; pos < L;) {
+        int64_t ck = -1;
+        const int64_t n = s.plan_chunk(pos, L, budget, &ck);
+        if (n <= 0) break;
+        pos += n;
+        c.ends.push_back(pos);
+        if (ck > 0) c.ckpts.push_back(ck);
+    }
+    return c;
+}
+static std::vector<int64_t> ends_after(const Cut& c, int64_t from) {
+    std::vector<int64_t> v;
+    for (int64_t e : c.ends) if (e > from) v.push_back(e);
+    return v;
+}
+
+/* Which geometry: 0 the GDN hybrid at interval 256 / budget 512 (chunks split at the interval);
+ * 1 interval 1024 past a 512 budget; 2 a span of 2; 3 a sliding-window model with periodic
+ * snapshots; 4 the same, tip-only (no interval split); 5 full attention alone (no snapshots). */
+static void exact_fixture(Fixture& f, int kind) {
+    const bool window = kind == 3 || kind == 4, attn_only = kind == 5;
+    f.build(4096, 64, 512, 8192, window, !attn_only);
+    if (window) {
+        /* As the window tests above: drop the GDN hybrid's linear and conv groups and its scan. */
+        f.prog.kv_groups.erase(f.prog.kv_groups.begin() + 1, f.prog.kv_groups.begin() + 3);
+        f.prog.ops.resize(1);
+        f.prog.buffers.resize(1);
+        f.kv.setup(f.prog.kv_groups, f.cfg.max_ctx, 4096, 64);
+        f.pc.groups = { 0 };
+        if (kind == 4) f.cfg.checkpoint_policy = "tip-only";
+    }
+    if (kind == 1) f.cfg.checkpoint_interval = 1024;
+    if (kind == 2) f.cfg.prefill_span = 2;
+    f.cfg.prefix_exact = true;
+}
+
+/* DeepSeek-V4.1 as the ds41 A/Bs serve it (arch/deepseek41, tools/ds41-host-experts): prefill in
+ * 16-token chunks (--max-num-batched-tokens 16, the CPU expert path's row limit), linear state
+ * with no chunked scan (the compressor's f32 tail and the Engram token history: a state chunk of
+ * 1) and the trunk's sliding window carried in the checkpoint slot beside it (KVGroupPlan::
+ * win_snap); the full groups are prefix-cached, the window is not. */
+static void ds41_fixture(Fixture& f, int64_t interval) {
+    f.build(4096, 64, /*max_tok=*/16, 4096, /*windowed=*/true, /*linear=*/true);
+    f.prog.ops.resize(1);          /* no gdn_chunk_scan: nothing sets a state chunk */
+    f.kv.snap = { 3 };             /* the window ("swa") rides in the slot */
+    f.pc.groups = { 0 };           /* the full group is cached; the window is not */
+    f.cfg.checkpoint_interval = interval;
+    f.cfg.prefix_exact = true;
+}
+
+/* In that shape the resume grid is the 16-token chunk, whatever the interval: every snapshot is a
+ * chunk start of the cold run of its prompt and of every longer prompt it begins, a prompt's tail
+ * snapshot is where its last chunk starts (past the first interval only), and a hit at any of them
+ * recomputes the cold run's own chunks. An interval of 16 snapshots every chunk; 256 the interval
+ * boundaries and the tail. */
+TEST(ds41_shape_resumes_on_the_16_token_chunk_grid) {
+    for (const int64_t interval : { 16, 256 }) {
+        Fixture f;
+        ds41_fixture(f, interval);
+        REQUIRE_EQ(f.start(), RAD_OK);
+        const ChunkGeometry& g = f.sch.geometry();
+        CHECK_EQ(g.quantum, 16);
+        CHECK_EQ(g.state_chunk, 1);
+        CHECK(!g.window_ckpt);                /* linear state beside the window */
+        CHECK_EQ(g.checkpoint_interval, interval);
+        CHECK(g.exact);
+        CHECK_EQ(g.grid, 16);
+        CHECK_EQ(g.grid_origin, 0);
+        /* A 1,100-token prompt: 69 chunks, the last [1088, 1100); its tail snapshot at 1088. */
+        const Cut c = cut_from(f.sch, 0, 1100, 16);
+        REQUIRE_EQ(c.ends.size(), (size_t)69);
+        CHECK_EQ(c.ends[67], 1088);
+        CHECK_EQ(c.ends[68], 1100);
+        std::vector<int64_t> want;
+        for (int64_t p = interval; p <= 1088; p += interval) want.push_back(p);
+        if (want.back() != 1088) want.push_back(1088);
+        CHECK(c.ckpts == want);
+        /* A 19-token prompt: only an interval of 16 leaves it a snapshot (at 16; a tail inside
+         * the first interval is not taken). */
+        CHECK((cut_from(f.sch, 0, 19, 16).ckpts ==
+               (interval == 16 ? std::vector<int64_t>{ 16 } : std::vector<int64_t>{})));
+        /* Every snapshot of a cold run is a chunk start of the cold run of the prompt and of any
+         * longer one it begins, and a hit there recomputes that run's own chunks. */
+        int checked = 0;
+        for (int64_t L = 30; L <= 1400; L += 53) {
+            const Cut cold = cut_from(f.sch, 0, L, 16);
+            for (int64_t k : cold.ckpts) {
+                CHECK(g.on_grid(k));
+                if (k >= L) continue;
+                CHECK(cut_from(f.sch, k, L, 16).ends == ends_after(cold, k));
+                for (int64_t L2 : { L + 1, L + 70, L + 600 }) {
+                    const Cut cold2 = cut_from(f.sch, 0, L2, 16);
+                    CHECK(std::find(cold2.ends.begin(), cold2.ends.end(), k) != cold2.ends.end());
+                    CHECK(cut_from(f.sch, k, L2, 16).ends == ends_after(cold2, k));
+                }
+                ++checked;
+            }
+        }
+        CHECK(checked > 20);
+    }
+}
+
+TEST(exact_resume_grid_is_the_chunk_an_idle_prefill_cuts) {
+    struct Want { int kind; int64_t interval, grid, origin; };
+    for (const Want w : { Want{ 0, 256, 256, 0 }, Want{ 1, 1024, 512, 0 }, Want{ 2, 256, 512, 256 },
+                          Want{ 3, 256, 256, 0 }, Want{ 4, 256, 512, 0 }, Want{ 5, 0, 512, 0 } }) {
+        Fixture f;
+        exact_fixture(f, w.kind);
+        REQUIRE_EQ(f.start(), RAD_OK);
+        const ChunkGeometry& g = f.sch.geometry();
+        CHECK(g.exact);
+        CHECK_EQ(g.checkpoint_interval, w.interval);
+        CHECK_EQ(g.grid, w.grid);
+        CHECK_EQ(g.grid_origin, w.origin);
+    }
+    /* Nearest, or no prefix cache: no grid, every position its own floor. */
+    for (int off = 0; off < 2; ++off) {
+        Fixture f;
+        exact_fixture(f, 0);
+        if (off) f.cfg.prefix_cache = false; else f.cfg.prefix_exact = false;
+        REQUIRE_EQ(f.start(), RAD_OK);
+        CHECK(!f.sch.geometry().exact);
+        CHECK_EQ(f.sch.geometry().grid_floor(300), 300);
+    }
+    Fixture f;
+    exact_fixture(f, 2);
+    REQUIRE_EQ(f.start(), RAD_OK);
+    const ChunkGeometry& g = f.sch.geometry();   /* 0, 256, 768, 1280, ... */
+    CHECK_EQ(g.grid_floor(255), 0);
+    CHECK_EQ(g.grid_floor(256), 256);
+    CHECK_EQ(g.grid_floor(767), 256);
+    CHECK_EQ(g.grid_floor(1000), 768);
+    CHECK(!g.on_grid(512));
+}
+
+/* An interval past the budget that is not a multiple of the budget's chunk would put the chunk
+ * after every checkpoint off the cold run's grid: exact rounds it up, with a warning that names
+ * both ways out; nearest keeps it. */
+TEST(exact_rounds_an_interval_off_the_chunk_up_to_a_multiple_of_it) {
+    for (int exact = 0; exact < 2; ++exact) {
+        Fixture f;
+        f.build();                            /* quantum 64 */
+        f.cfg.checkpoint_interval = 768;      /* past the 512 budget, not a multiple of it */
+        f.cfg.prefix_exact = exact != 0;
+        log_set_level(Log::Error);
+        REQUIRE_EQ(f.start(), RAD_OK);
+        CHECK_EQ(f.sch.geometry().checkpoint_interval, exact ? 1024 : 768);
+        if (exact) CHECK_EQ(f.sch.geometry().grid, 512);
+    }
+    /* A budget off the quantum chunks at the quantum below it: 500 -> 448, and the interval goes
+     * to the next multiple of 448. */
+    Fixture f;
+    f.build(4096, 64, /*max_tok=*/500);
+    f.cfg.checkpoint_interval = 1024;
+    f.cfg.prefix_exact = true;
+    log_set_level(Log::Error);
+    REQUIRE_EQ(f.start(), RAD_OK);
+    CHECK_EQ(f.sch.geometry().checkpoint_interval, 1344);
+    CHECK_EQ(f.sch.geometry().grid, 448);
+    int64_t ck = -1;
+    CHECK_EQ(f.sch.plan_chunk(0, 5000, 500, &ck), 448);
+    CHECK_EQ(f.sch.plan_chunk(896, 5000, 500, &ck), 448);
+    CHECK_EQ(ck, 1344);
+}
+
+/* The tail snapshot is where the prompt's last chunk starts, a boundary an idle chunk already
+ * ends on: no extra step, and an exact repeat re-prefills that last chunk whole. */
+TEST(an_exact_tail_snapshot_is_where_the_last_chunk_starts) {
+    Fixture f;
+    exact_fixture(f, 1);                      /* interval 1024, chunks of 512 */
+    REQUIRE_EQ(f.start(), RAD_OK);
+    Cut c = cut_from(f.sch, 0, 1800, 512);
+    CHECK((c.ends == std::vector<int64_t>{ 512, 1024, 1536, 1800 }));
+    CHECK((c.ckpts == std::vector<int64_t>{ 1024, 1536 }));
+    /* Its last chunk starting on the interval: that checkpoint is the tail's. */
+    c = cut_from(f.sch, 0, 1100, 512);
+    CHECK((c.ends == std::vector<int64_t>{ 512, 1024, 1100 }));
+    CHECK((c.ckpts == std::vector<int64_t>{ 1024 }));
+    /* One ending on the grid: the last chunk is [1536, 2048), and its end is an interval. */
+    c = cut_from(f.sch, 0, 2048, 512);
+    CHECK((c.ckpts == std::vector<int64_t>{ 1024, 1536, 2048 }));
+    /* Inside the first interval nothing (as before, cheap to prefill again). */
+    c = cut_from(f.sch, 0, 900, 512);
+    CHECK(c.ckpts.empty());
+    /* A step sharing its budget may straddle the tail: split there, the snapshot written. */
+    int64_t ck = -1;
+    CHECK_EQ(f.sch.plan_chunk(1400, 1800, 512, &ck), 136);
+    CHECK_EQ(ck, 1536);
+    /* A budget short of a quantum boundary past it leaves it for the next chunk. */
+    CHECK_EQ(f.sch.plan_chunk(1024, 1800, 100, &ck), 64);
+    CHECK_EQ(ck, -1);
+
+    /* Nearest cuts the same prompt's last chunk at its last quantum boundary instead. */
+    Fixture n;
+    n.build();
+    n.cfg.checkpoint_interval = 1024;
+    REQUIRE_EQ(n.start(), RAD_OK);
+    c = cut_from(n.sch, 0, 1800, 512);
+    CHECK((c.ends == std::vector<int64_t>{ 512, 1024, 1536, 1792, 1800 }));
+    CHECK((c.ckpts == std::vector<int64_t>{ 1024, 1792 }));
+}
+
+/* The property itself, over every geometry and many prompt lengths: every checkpoint is on the
+ * grid and is a chunk start of the cold run of the prompt that wrote it and of any longer prompt
+ * it prefixes (an agent's next turn), and from it the hit cuts exactly the cold run's chunks. */
+TEST(an_exact_hit_from_any_checkpoint_recomputes_the_cold_runs_own_chunks) {
+    for (int kind = 0; kind < 6; ++kind) {
+        Fixture f;
+        exact_fixture(f, kind);
+        REQUIRE_EQ(f.start(), RAD_OK);
+        const ChunkGeometry& g = f.sch.geometry();
+        int checked = 0;
+        for (int64_t L = 100; L <= 3000; L += 37) {
+            const Cut cold = cut_from(f.sch, 0, L, 512);
+            for (int64_t c : cold.ckpts) {
+                CHECK(g.on_grid(c));
+                if (c >= L) continue;
+                CHECK(std::find(cold.ends.begin(), cold.ends.end(), c) != cold.ends.end());
+                CHECK(cut_from(f.sch, c, L, 512).ends == ends_after(cold, c));
+                for (int64_t L2 : { L + 1, L + 300, L + 1500 }) {
+                    const Cut cold2 = cut_from(f.sch, 0, L2, 512);
+                    CHECK(std::find(cold2.ends.begin(), cold2.ends.end(), c) != cold2.ends.end());
+                    CHECK(cut_from(f.sch, c, L2, 512).ends == ends_after(cold2, c));
+                }
+                ++checked;
+            }
+        }
+        CHECK(kind == 5 ? checked == 0 : checked > 20);
+    }
+    /* What nearest gives up: its tail snapshot at a 1000-token prompt's last quantum boundary
+     * (960) is no chunk start of the 1500-token turn after it, which a cold run cuts at 768 and
+     * 1024, so a hit there recomputes [960, 1024) as a chunk of its own. */
+    Fixture n;
+    n.build();
+    REQUIRE_EQ(n.start(), RAD_OK);
+    const Cut c1000 = cut_from(n.sch, 0, 1000, 512);
+    CHECK(std::find(c1000.ckpts.begin(), c1000.ckpts.end(), 960) != c1000.ckpts.end());
+    const Cut c1500 = cut_from(n.sch, 0, 1500, 512);
+    CHECK(std::find(c1500.ends.begin(), c1500.ends.end(), 960) == c1500.ends.end());
+    CHECK(std::find(c1500.ends.begin(), c1500.ends.end(), 768) != c1500.ends.end());
+    CHECK_EQ(cut_from(n.sch, 960, 1500, 512).ends.front(), 1024);
+}
+
+/* At admission: a hit at a snapshot resumes there (plan_chunk put it on the grid); a hit with no
+ * snapshot to resume from (full attention alone) steps back to the grid, the blocks above it
+ * left to the cache and recomputed in the cold run's chunk. */
+TEST(an_exact_hit_steps_back_to_the_grid_and_prefills_the_cold_chunks) {
+    for (int exact = 0; exact < 2; ++exact) {
+        Fixture f;
+        exact_fixture(f, 5);                  /* chunks of 512, no snapshots */
+        f.cfg.prefix_exact = exact != 0;
+        REQUIRE_EQ(f.start(), RAD_OK);
+        f.pc.seed(784);                       /* 49 blocks */
+        const uint64_t a = f.submit(1300, 8);
+        const RadBatch* b = f.sch.step();
+        REQUIRE(b != nullptr);
+        CHECK_EQ(f.sch.find(a)->n_computed, exact ? 512 : 784);
+        CHECK_EQ(b->ctx_lens[0], exact ? 512 : 784);
+        CHECK_EQ(b->n_tok, 512);              /* [512, 1024) as the cold run, or [784, 1296) */
+        CHECK_EQ((int)f.kv.block_table(a, 0).size(), exact ? 64 : 81);
+        CHECK_EQ(f.sch.metrics().hit_cut_tokens, exact ? 272 : 0);
+    }
+    /* With snapshots the hit is at one: kept as is, restored from its slot. */
+    Fixture f;
+    exact_fixture(f, 1);
+    REQUIRE_EQ(f.start(), RAD_OK);
+    f.pc.seed(1600);
+    f.pc.lin = 1536;                          /* a tail snapshot, on the 512 grid */
+    f.pc.src = 3;
+    const uint64_t a = f.submit(1800, 8);
+    const RadBatch* b = f.sch.step();
+    REQUIRE(b != nullptr);
+    CHECK_EQ(f.sch.find(a)->n_computed, 1536);
+    CHECK_EQ(b->n_tok, 264);                  /* the cold run's last chunk, whole */
+    CHECK_EQ(f.sch.plan().e[0].ckpt_restore, 3);
+}
+
+/* A cold prompt at the scheduler: the last chunk is not split at the end, and an exact repeat's
+ * hit at the tail snapshot is that chunk. */
+TEST(an_exact_cold_prefill_keeps_its_last_chunk_whole) {
+    Fixture f;
+    exact_fixture(f, 0);                      /* interval 256, chunks of 256 */
+    REQUIRE_EQ(f.start(), RAD_OK);
+    f.submit(1000, 1);
+    std::vector<int64_t> toks, ckpts;
+    for (int i = 0; i < 8; ++i) {
+        const RadBatch* b = f.sch.step();
+        if (!b) break;
+        toks.push_back(b->n_tok);
+        for (int k = 0; k < b->n_checkpoints; ++k)
+            ckpts.push_back(b->ctx_lens[0] + b->checkpoint_tok[k] + 1);
+        f.commit_plain();
+    }
+    CHECK((toks == std::vector<int64_t>{ 256, 256, 256, 232 }));
+    CHECK((ckpts == std::vector<int64_t>{ 256, 512, 768 }));
+}
+
+/* RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH: a finished sequence publishes only the chunks an idle
+ * cold prefill cuts alike, so no later hit adopts a block a short last chunk or a decode step
+ * wrote beneath a snapshot computed from another turn's full-chunk recompute of it. */
+namespace {
+struct ExactPub { std::vector<int64_t> published; std::vector<int64_t> computed; int64_t held = 0; };
+/* Runs `prompts` (all submitted at once) to the end, with the switch `on`; `hit` > 0 seeds a
+ * snapshot hit there first. What was published, each sequence's computed tokens at its close,
+ * and the held-back counter. `ds41` > 0: DeepSeek-V4.1's shape (ds41_fixture) at that interval
+ * instead of the GDN hybrid. */
+ExactPub exact_publish_run(bool on, std::vector<int> prompts, int64_t hit = 0, bool exact = true,
+                           int64_t ds41 = 0) {
+    Fixture f;
+    if (ds41 > 0) ds41_fixture(f, ds41);
+    else exact_fixture(f, 0);                 /* the GDN hybrid: interval 256, chunks of 256 */
+    f.cfg.prefix_exact = exact;
+    if (on) setenv("RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH", "1", 1);
+    else unsetenv("RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH");
+    log_set_level(Log::Error);
+    const int rc = f.start();
+    unsetenv("RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH");
+    ExactPub out;
+    CHECK_OK(rc);
+    if (rc < 0) return out;
+    if (hit > 0) {
+        f.pc.seed(1600);
+        f.pc.lin = (int32_t)hit;              /* a snapshot on the 256 grid */
+        f.pc.src = 3;
+    }
+    std::vector<uint64_t> ids;
+    for (int n : prompts) ids.push_back(f.submit(n, 3));
+    for (int i = 0; i < 512; ++i) {
+        if (!f.sch.step()) break;
+        f.commit_plain();
+    }
+    for (const auto& p : f.pc.published) out.published.push_back(p.n_tokens);
+    for (uint64_t id : ids) {
+        const Request* r = f.sch.find(id);
+        out.computed.push_back(r ? r->n_computed : -1);
+        CHECK(r && r->state == ReqState::Finished);
+    }
+    out.held = f.sch.metrics().prefix_publish_held_tokens;
+    return out;
+}
+}  /* namespace */
+
+TEST(exact_publish_stops_at_the_last_chunk_a_cold_prefill_cuts_alike) {
+    /* Off: everything computed, the 232-token last chunk and the decode steps included. */
+    ExactPub off = exact_publish_run(false, { 1000 });
+    REQUIRE_EQ(off.published.size(), (size_t)1);
+    CHECK(off.computed[0] > 1000);
+    CHECK_EQ(off.published[0], off.computed[0]);
+    CHECK_EQ(off.held, 0ll);
+    /* On: [0, 768), the three full chunks; the last chunk and decode are held back. */
+    ExactPub on = exact_publish_run(true, { 1000 });
+    REQUIRE_EQ(on.published.size(), (size_t)1);
+    CHECK_EQ(on.published[0], 768ll);
+    CHECK_EQ(on.held, on.computed[0] - 768);
+    /* A prompt ending on the grid: its last chunk is a full one, published; decode is not. */
+    on = exact_publish_run(true, { 1024 });
+    REQUIRE_EQ(on.published.size(), (size_t)1);
+    CHECK_EQ(on.published[0], 1024ll);
+    CHECK_EQ(on.held, on.computed[0] - 1024);
+    /* From a hit at a snapshot: the adopted 512, then its own full chunks [512, 768), [768, 1024)
+     * and [1024, 1280), up to where its short last chunk starts (a cold run of any longer prompt
+     * cuts [1024, 1280) the same). */
+    on = exact_publish_run(true, { 1300 }, 512);
+    REQUIRE_EQ(on.published.size(), (size_t)1);
+    CHECK_EQ(on.published[0], 1280ll);
+    CHECK_EQ(on.held, on.computed[0] - 1280);
+    off = exact_publish_run(false, { 1300 }, 512);
+    REQUIRE_EQ(off.published.size(), (size_t)1);
+    CHECK_EQ(off.published[0], off.computed[0]);
+    /* Two prompts sharing their steps: no chunk was alone in its step, so nothing is published
+     * (an idle cold prefill would have cut each step's rows apart); off, both are. */
+    on = exact_publish_run(true, { 300, 300 });
+    CHECK(on.published.empty());
+    CHECK_EQ(on.held, on.computed[0] + on.computed[1]);
+    off = exact_publish_run(false, { 300, 300 });
+    CHECK_EQ(off.published.size(), (size_t)2);
+    /* --prefix-resume nearest has no grid to say what a cold prefill cuts: the switch does
+     * nothing there. */
+    on = exact_publish_run(true, { 1000 }, 0, /*exact=*/false);
+    REQUIRE_EQ(on.published.size(), (size_t)1);
+    CHECK_EQ(on.published[0], on.computed[0]);
+    CHECK_EQ(on.held, 0ll);
+}
+
+/* The same in DeepSeek-V4.1's shape at 16-token chunks (ds41_fixture): what a turn publishes ends
+ * where its last chunk starts, its tail snapshot, which is where the next turn resumes; the short
+ * last chunk and the decode steps are held back, so the next turn's own 16-token chunk over them
+ * is what a third turn adopts. */
+TEST(ds41_shape_exact_publish_ends_at_the_tail_snapshot) {
+    for (const int64_t interval : { 16, 256 }) {
+        /* Off: all 1,100 prompt tokens and the decode steps but the last. */
+        ExactPub off = exact_publish_run(false, { 1100 }, 0, true, interval);
+        REQUIRE_EQ(off.published.size(), (size_t)1);
+        CHECK_EQ(off.computed[0], 1102ll);
+        CHECK_EQ(off.published[0], 1102ll);
+        CHECK_EQ(off.held, 0ll);
+        /* On: [0, 1088), the 68 full chunks; [1088, 1100) and decode are held back. */
+        ExactPub on = exact_publish_run(true, { 1100 }, 0, true, interval);
+        REQUIRE_EQ(on.published.size(), (size_t)1);
+        CHECK_EQ(on.published[0], 1088ll);
+        CHECK_EQ(on.held, 1102ll - 1088);
+        /* A prompt ending on the grid publishes its last chunk, a full one. */
+        on = exact_publish_run(true, { 1104 }, 0, true, interval);
+        REQUIRE_EQ(on.published.size(), (size_t)1);
+        CHECK_EQ(on.published[0], 1104ll);
+        /* The next turn, from that tail snapshot: its own chunks up to its tail, 1296. */
+        on = exact_publish_run(true, { 1300 }, 1088, true, interval);
+        REQUIRE_EQ(on.published.size(), (size_t)1);
+        CHECK_EQ(on.computed[0], 1302ll);
+        CHECK_EQ(on.published[0], 1296ll);
+        off = exact_publish_run(false, { 1300 }, 1088, true, interval);
+        REQUIRE_EQ(off.published.size(), (size_t)1);
+        CHECK_EQ(off.published[0], 1302ll);
+    }
+}
+
 TEST(a_chunk_ending_on_a_checkpoint_carries_it_into_the_batch) {
     Fixture f;
     f.build();
@@ -1068,6 +1547,123 @@ TEST(a_hit_on_a_model_with_a_windowed_group_reuses_nothing) {
     SchedMetrics m = f.sch.metrics();
     CHECK_EQ(m.attn_cached_tokens, 304);
     CHECK_EQ(m.linear_cached_tokens, 0);
+}
+
+/* The same model with the trunk's window in the checkpoint slot (KVGroupPlan::win_snap beside
+ * linear state, as DeepSeek-V4.1's sliding layers beside its compressor state): the hit resumes at
+ * the snapshot, which restores the linear state and the window together, and the cached group's
+ * blocks are adopted. Before, a model with linear state never put its window in the slot, so this
+ * clamp refused every hit on it. */
+TEST(a_hit_on_a_hybrid_whose_slot_carries_the_window_resumes_at_the_snapshot) {
+    Fixture f;
+    f.build(4096, 64, 512, 4096, /*windowed=*/true);
+    const int32_t swa = 3;
+    f.kv.snap = { swa };
+    f.pc.groups = { 0 };
+    CHECK_OK(f.start());
+    f.pc.seed(304);
+    f.pc.lin = 256;
+    f.pc.src = 3;
+
+    const uint64_t a = f.submit(300, 8);
+    const RadBatch* b = f.sch.step();
+    REQUIRE(b != nullptr);
+    CHECK_EQ(f.sch.find(a)->n_computed, 256);
+    CHECK_EQ(b->ctx_lens[0], 256);
+    CHECK_EQ(f.sch.plan().e[0].ckpt_restore, 3);
+    CHECK_EQ(f.kv.block_table(a, 0)[0], f.pc.seeded[0][0]);
+    const SchedMetrics m = f.sch.metrics();
+    CHECK_EQ(m.linear_cached_tokens, 256);
+    CHECK_EQ(m.hit_cut_window, 0);
+
+    /* A hit with no snapshot under it still reuses nothing: the window has nowhere to come from. */
+    Fixture g;
+    g.build(4096, 64, 512, 4096, /*windowed=*/true);
+    g.kv.snap = { swa };
+    g.pc.groups = { 0 };
+    CHECK_OK(g.start());
+    g.pc.seed(304);
+    g.pc.lin = 0;
+    g.pc.src = -1;
+    const uint64_t c = g.submit(300, 8);
+    REQUIRE(g.sch.step() != nullptr);
+    CHECK_EQ(g.sch.find(c)->n_computed, 0);
+}
+
+/* A trunk group the cache does not index and no slot carries is a hole no snapshot fills: a full
+ * group left out (as a group at another block size was before the cache took every block size)
+ * refuses the hit even where the window is in the slot. */
+TEST(a_trunk_group_neither_cached_nor_in_the_slot_refuses_the_hit) {
+    Fixture f;
+    f.build(4096, 64, 512, 4096, /*windowed=*/true);
+    KVGroupInfo k;
+    k.name = "fine";
+    k.decl.kind = RAD_KV_FULL;
+    k.block_size = 16;
+    k.layers = { 3 };
+    f.prog.kv_groups.push_back(k);
+    f.kv.setup(f.prog.kv_groups, f.cfg.max_ctx, 4096, 64);
+    f.kv.snap = { 3 };
+    f.pc.groups = { 0 };
+    CHECK_OK(f.start());
+    f.pc.seed(304);
+    f.pc.lin = 256;
+    f.pc.src = 3;
+    const uint64_t a = f.submit(300, 8);
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.find(a)->n_computed, 0);
+    CHECK_EQ(f.sch.metrics().hit_cut_window, 1);
+}
+
+/* Groups at two block sizes: a hit adopts each group's own blocks (the 8-token group twice as
+ * many), and the cache's reserve is asked for in entries, from the group furthest short. */
+TEST(a_hit_over_mixed_block_sizes_adopts_each_groups_own_blocks) {
+    Fixture f;
+    f.build(4096, 64);
+    KVGroupInfo k;
+    k.name = "fine";
+    k.decl.kind = RAD_KV_FULL;
+    k.block_size = 8;
+    f.prog.kv_groups.push_back(k);
+    const int32_t fine = 3;
+    f.kv.setup(f.prog.kv_groups, f.cfg.max_ctx, 4096, 64);
+    f.pc.groups = { 0, fine };
+    CHECK_OK(f.start());
+    CHECK_EQ(f.sch.geometry().quantum % 16, 0ll);
+    f.pc.seed(304);                                   /* 19 blocks of 16, 38 of 8 */
+    f.pc.lin = 256;
+    f.pc.src = 3;
+    const uint64_t a = f.submit(1000, 8);
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.find(a)->n_computed, 256);
+    const std::vector<int32_t> t0 = f.kv.block_table(a, 0), t1 = f.kv.block_table(a, fine);
+    CHECK_EQ((int)t0.size(), 32);                     /* 16 adopted + 16 for the 256-token chunk */
+    CHECK_EQ((int)t1.size(), 64);                     /* 32 adopted + 32 */
+    for (int i = 0; i < 16; ++i) CHECK_EQ(t0[(size_t)i], f.pc.seeded[0][(size_t)i]);
+    for (int i = 0; i < 32; ++i) CHECK_EQ(t1[(size_t)i], f.pc.seeded[1][(size_t)i]);
+}
+
+TEST(the_cache_trim_over_mixed_block_sizes_asks_for_entries) {
+    Fixture f;
+    f.build(/*blocks=*/64, /*states=*/64);
+    KVGroupInfo k;
+    k.name = "fine";
+    k.decl.kind = RAD_KV_FULL;
+    k.block_size = 8;
+    f.prog.kv_groups.push_back(k);
+    f.kv.setup(f.prog.kv_groups, f.cfg.max_ctx, 64, 64);
+    f.pc.groups = { 0, 3 };
+    CHECK_OK(f.start());
+    f.pc.evict_grant = 1 << 20;
+    f.submit(160, /*max_tokens=*/1);                 /* 10 + 20 blocks, finishes on the first commit */
+    f.submit(176, /*max_tokens=*/64);                /* 11 + 22 each, still running after it */
+    f.submit(176, /*max_tokens=*/64);
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(f.kv.held_blocks(0), 32ll);             /* 32 free against a reserve of 16 */
+    CHECK_EQ(f.kv.held_blocks(3), 64ll);             /* none free against 16: 8 entries of 2 */
+    f.commit_plain();
+    REQUIRE(f.pc.trims.size() == 1u);
+    CHECK_EQ(f.pc.trims[0], 8ll);
 }
 
 /* A request whose media is not encoded yet waits, and only it does: it is not admitted without
@@ -1573,6 +2169,49 @@ TEST(a_prefix_hit_with_no_checkpoint_near_the_cap_is_kept_whole) {
     CHECK_EQ(r.m.draft_refills, (int64_t)0);
     CHECK_EQ(r.m.linear_cached_tokens, (int64_t)2048);
     CHECK_EQ(r.rows, 0);
+}
+
+/* z-lab's DFlash on the Gemma 4 31B: a full-attention block drafter (no window), whose own group the
+ * prefix cache indexes like the trunk's full layers. A hit resumes the trunk's window from the
+ * window snapshot, so no paged group is left with a hole and the drafter drafts from the first
+ * decode. Counting the trunk's window as a hole would put the drafter's floor at the hit, and a
+ * drafter with no window to slide would not draft again that turn. */
+TEST(a_full_attention_drafter_drafts_at_once_after_a_hit_the_window_snapshot_resumes) {
+    for (int counted = 0; counted < 2; ++counted) {
+        Fixture f;
+        f.build(/*blocks=*/4096, /*states=*/64, /*max_tok=*/512, /*max_ctx=*/8192,
+                /*windowed=*/true, /*linear=*/false);
+        f.cfg.n_spec = 7;
+        f.prog.drafter.kind = RAD_DRAFT_BLOCK;
+        f.prog.drafter.window = 0;
+        KVGroupInfo d;
+        d.name = "draft";
+        d.decl.kind = RAD_KV_FULL;
+        d.block_size = 16;
+        f.prog.kv_groups.push_back(d);
+        f.kv.setup(f.prog.kv_groups, f.cfg.max_ctx, 4096, 64);
+        const int32_t swa = 1, draft = 2;
+        f.kv.snap = { swa };
+        f.kv.snap_reported = counted != 0;
+        f.pc.groups = { 0, draft };
+        f.pc.ckpt_lo = 2048;
+        CHECK_OK(f.start());
+        CHECK(f.sch.geometry().window_ckpt);
+        f.pc.seed(2048); f.pc.lin = 2048; f.pc.src = 3;
+        const uint64_t a = f.submit(2200, 64);
+        Scheduler::BlockRow rows[4];
+        int n_rows = -1;
+        for (int st = 0; st < 40; ++st) {
+            CHECK(f.sch.step() != nullptr);
+            if (st == 0) CHECK_EQ(f.sch.find(a)->n_computed, (int64_t)2048);
+            f.commit_plain(11);
+            const int n = f.sch.block_begin(8, 7, 0, 99, rows, 4);
+            f.sch.block_end();
+            if (!f.sch.find(a)->output.empty()) { n_rows = n; break; }
+        }
+        CHECK_EQ(f.sch.metrics().draft_refills, (int64_t)0);
+        CHECK_EQ(n_rows, counted ? 1 : 0);
+    }
 }
 
 TEST(no_prefix_hit_gives_nothing_back) {
@@ -2618,9 +3257,9 @@ TEST(the_adaptive_window_chooses_the_head_depth_over_the_whole_batch) {
     CHECK_EQ(h.plan_step(hone, 0, 3), 2);
 }
 
-/* The flag, for a drafting head (serial or block). --draft-window adaptive with prompt lookup
- * alone, or with no speculation, keeps the configured depth and says so at startup; the proposal
- * then reaches the step uncut. The default is the fixed window. */
+/* The flag, for a drafting head (serial or block) or prompt lookup alone. --draft-window adaptive
+ * with no speculation keeps the configured depth and says so at startup. The default is the fixed
+ * window. */
 TEST(the_adaptive_window_is_a_flag_for_a_drafting_head_and_said_when_there_is_none) {
     {
         Fixture f;
@@ -2673,6 +3312,8 @@ TEST(the_adaptive_window_is_a_flag_for_a_drafting_head_and_said_when_there_is_no
         CHECK(f.sch.metrics().draft_verify_depth[4] > 0);
         CHECK(f.sch.metrics().draft_verify_depth[1] > 0);
     }
+    /* Prompt lookup as the only drafter takes the policy as a block drafter does: each of its
+     * drafts is a verify row (prompt_lookup_alone_follows_its_own_acceptance). */
     {
         Fixture f;
         adaptive_fixture(f, 4);
@@ -2681,9 +3322,9 @@ TEST(the_adaptive_window_is_a_flag_for_a_drafting_head_and_said_when_there_is_no
         int st = RAD_E_STATE;
         const std::string log = info_of([&] { st = f.start(); });
         CHECK_OK(st);
-        CHECK(!f.sch.draft().adaptive());
-        CHECK(log.find("--draft-window adaptive: the window is fixed at 4") != std::string::npos);
-        CHECK(log.find("prompt lookup only") != std::string::npos);
+        CHECK(f.sch.draft().adaptive());
+        CHECK(log.find("--draft-window adaptive with prompt lookup only") != std::string::npos);
+        CHECK(log.find("the window is fixed") == std::string::npos);
 
         const uint64_t a = f.submit(160, 64);
         CHECK(f.sch.step() != nullptr);
@@ -2691,7 +3332,7 @@ TEST(the_adaptive_window_is_a_flag_for_a_drafting_head_and_said_when_there_is_no
         int32_t draft[4] = { 21, 22, 23, 24 };
         CHECK_OK(f.sch.set_draft(a, draft, 4));
         CHECK_EQ(f.sch.find(a)->n_draft, 4);
-        CHECK(!f.sch.metrics().draft_adaptive);
+        CHECK(f.sch.metrics().draft_adaptive);
     }
     {
         Fixture f;
@@ -2889,6 +3530,423 @@ TEST(the_adaptive_window_is_not_fed_by_prompt_lookup) {
         f.commit_plain(100 + (t + 1) % 8);
     }
     CHECK_NEAR(f.sch.metrics().draft_depth_adaptive, 1.0, 1e-6);
+}
+
+/* With prompt lookup the only drafter, its drafts are what the adaptive window measures: refused
+ * lookups bring each sequence's window, and the lookup's proposals, down to one draft. */
+TEST(prompt_lookup_alone_follows_its_own_acceptance) {
+    Fixture f;
+    adaptive_fixture(f, 4);
+    f.prog.drafter.kind = RAD_DRAFT_NONE;
+    f.prog.drafter.depth = 0;
+    CHECK_OK(f.start());
+    REQUIRE(f.sch.draft().adaptive());
+
+    auto r = std::make_unique<Request>();
+    r->id = f.next_id++;
+    r->max_tokens = 2000;
+    r->prompt.resize(160);
+    for (int i = 0; i < 160; ++i) r->prompt[(size_t)i] = 100 + i % 8;
+    CHECK_OK(f.sch.add(std::move(r)));
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(100);
+
+    int first = 0, last = 0, lookups = 0;
+    for (int t = 0; t < 6 * DraftController::kHold; ++t) {
+        REQUIRE(f.sch.step() != nullptr);
+        const StepEntry& e = f.sch.plan().e[0];
+        if (e.n_spec > 0) {
+            CHECK(e.ngram);
+            /* What the pattern says comes next, the period continued. */
+            CHECK_EQ(e.draft[0], 100 + (t + 1) % 8);
+            if (!first) first = e.n_spec;
+            last = e.n_spec;
+            ++lookups;
+        }
+        f.commit_plain(100 + (t + 1) % 8);             /* every lookup refused */
+    }
+    CHECK_EQ(lookups, 6 * DraftController::kHold);
+    CHECK_EQ(first, 4);
+    CHECK_EQ(last, 1);
+    CHECK_NEAR(f.sch.metrics().draft_depth_adaptive, 1.0, 1e-6);
+}
+
+/* ------------------------------------------------------------------ prompt lookup's verify gate */
+/* A held proposal is scored against the text that follows, as a verify would have scored it: its
+ * accepted count is the common prefix. One proposal at a time; the next is taken once it ends. */
+TEST(the_lookup_gate_scores_a_held_proposal_against_the_text_that_follows) {
+    LookupGate g;
+    g.configure(4);
+    LookupSeq q;
+    /* The priors: a short match waits, a long one drafts. */
+    CHECK_NEAR(g.expect(q, 0, 4), 4 * LookupGate::kPriorShort, 1e-6);
+    CHECK_NEAR(g.expect(q, 1, 4), 4 * LookupGate::kPriorLong, 1e-6);
+    CHECK_EQ(LookupGate::class_of(LookupGate::kLongMatch - 1), 0);
+    CHECK_EQ(LookupGate::class_of(LookupGate::kLongMatch), 1);
+
+    std::vector<int32_t> text(10, 1);                  /* the sequence so far: 10 tokens */
+    TokenSeq ts;
+    auto view = [&]() {
+        ts.a = text.data();
+        ts.na = (int64_t)text.size();
+    };
+    const int32_t prop[4] = { 5, 6, 7, 8 };
+    g.offer(q, 10, prop, 4, 2);
+    g.held(q, 4);
+    const int32_t other[4] = { 40, 41, 42, 43 };
+    g.offer(q, 10, other, 4, 9);                       /* pending already: counted, not taken */
+    CHECK_EQ(q.proposed, (int64_t)2);
+    CHECK_EQ(q.pend_cls, 0);
+
+    text.push_back(5);                                 /* the first came true; no verdict yet */
+    view();
+    g.advance(q, ts);
+    CHECK(q.pend_pos >= 0);
+    CHECK_NEAR(q.s[0][0], 0.0, 1e-6);
+    text.push_back(6);
+    text.push_back(9);                                 /* two came true, the third did not */
+    view();
+    g.advance(q, ts);
+    CHECK(q.pend_pos < 0);
+    /* The prior weighs two proposals: the first evaluated moves each position a third. */
+    const double w = 1.0 / (LookupGate::kPriorWeight + 1.0);
+    CHECK_NEAR(q.s[0][0], w, 1e-6);
+    CHECK_NEAR(q.s[0][1], w, 1e-6);
+    CHECK_NEAR(q.s[0][2], 0.0, 1e-6);
+    CHECK_NEAR(q.s[0][3], 0.0, 1e-6);
+    CHECK_NEAR(q.s[1][0], LookupGate::kPriorLong, 1e-6);   /* the other class untouched */
+    CHECK_EQ(q.held_hits, (int64_t)2);
+    CHECK_EQ(g.held_hits(), (int64_t)2);
+    CHECK_EQ(g.held_count(), (int64_t)1);
+    CHECK_EQ(g.held_drafts(), (int64_t)4);
+
+    /* A proposal that comes true whole ends at its last token; a verified one counts no held
+     * hits but feeds the estimate the same way. */
+    const int64_t at = (int64_t)text.size();
+    const int32_t whole[4] = { 11, 12, 13, 14 };
+    g.offer(q, at, whole, 4, 3);
+    for (int32_t t : whole) text.push_back(t);
+    view();
+    g.advance(q, ts);
+    CHECK(q.pend_pos < 0);
+    CHECK(q.s[0][3] > 0.0f);
+    CHECK_EQ(q.held_hits, (int64_t)2);
+
+    /* Evidence is what moves a short match into drafting: a run of proposals that come true. */
+    LookupGate g2;
+    g2.configure(4);
+    LookupSeq r;
+    CHECK(!g2.pays(g2.expect(r, 0, 4), 4, 1, 1.0));
+    std::vector<int32_t> s2(4, 1);
+    for (int i = 0; i < 6; ++i) {
+        const int32_t p2[4] = { 2, 3, 4, 5 };
+        g2.offer(r, (int64_t)s2.size(), p2, 4, 2);
+        for (int32_t t : p2) s2.push_back(t);
+        TokenSeq t2;
+        t2.a = s2.data();
+        t2.na = (int64_t)s2.size();
+        g2.advance(r, t2);
+    }
+    CHECK(g2.expect(r, 0, 4) > 2.9);   /* 6 / (6 + 2) a position */
+    CHECK(g2.pays(g2.expect(r, 0, 4), 4, 1, 1.0));
+}
+
+/* What a verify costs: the measured step time at the step's rows with the drafts against without
+ * them; between timed row counts a line, outside them the nearest scaled by the prior's shape. */
+TEST(the_lookup_gate_prices_a_verify_by_measured_step_times) {
+    LookupGate g;
+    g.configure(4);
+    /* Untimed: the prior shape, 6% a row, so a whole window pays at a quarter of a token. */
+    CHECK_NEAR(g.step_cost(5) / g.step_cost(1), 1.0 + 4 * LookupGate::kRowCost, 1e-9);
+    CHECK(g.pays(0.3, 4, 1, 1.0));
+    CHECK(!g.pays(0.2, 4, 1, 1.0));
+    CHECK(!g.pays(0.0, 4, 1, 1.0));
+
+    /* One row timed: a verify is priced off it on the prior's shape. */
+    for (int i = 0; i < 8; ++i) g.step_time(1, 10.0);
+    CHECK_EQ(g.cost_samples(1), (int64_t)8);
+    CHECK_NEAR(g.step_cost(5), 10.0 * (1.0 + 4 * LookupGate::kRowCost), 1e-9);
+
+    /* Both timed: 2.5x for four drafts (a MoE reading each row's experts). 1 + E must beat it. */
+    for (int i = 0; i < 8; ++i) g.step_time(5, 25.0);
+    CHECK_NEAR(g.step_cost(5), 25.0, 1e-9);
+    CHECK_NEAR(g.step_cost(3), 17.5, 1e-9);            /* between: the line */
+    CHECK(!g.pays(1.4, 4, 1, 1.0));
+    CHECK(g.pays(1.6, 4, 1, 1.0));
+    /* Past the last timed count: the prior's shape from there. */
+    CHECK_NEAR(g.step_cost(9), 25.0 * (1.0 + 8 * LookupGate::kRowCost) /
+                                   (1.0 + 4 * LookupGate::kRowCost), 1e-9);
+    /* In a step of eight rows already expecting eight tokens, the same drafts weigh against the
+     * whole step: marginal cost over the step's rate. */
+    for (int i = 0; i < 8; ++i) g.step_time(8, 30.0);
+    for (int i = 0; i < 8; ++i) g.step_time(12, 36.0);
+    CHECK(!g.pays(1.5, 4, 8, 8.0));                    /* 1.5 / 8 < 36 / 30 - 1 */
+    CHECK(g.pays(1.7, 4, 8, 8.0));
+
+    /* A step that waited on something else counts as at most four times the mean. */
+    g.step_time(1, 1000.0);
+    CHECK(g.step_cost(1) < 10.0 + 40.0 / 8.0);
+    /* Junk is ignored. */
+    g.step_time(0, 5.0);
+    g.step_time(2, -1.0);
+    CHECK_EQ(g.cost_samples(2), (int64_t)0);
+    /* Wide steps share keys in bands of 32 rows past 128. */
+    g.step_time(200, 80.0);
+    g.step_time(210, 90.0);
+    CHECK_EQ(g.cost_samples(205), (int64_t)2);
+}
+
+/* The index says how far the match behind a proposal runs back, up to the cap. */
+TEST(prompt_lookup_reports_how_far_its_match_runs_back) {
+    NgramIndex ix;
+    /* 1 2 3 4 5 6 7 8 9 | 30 31 | 5 6 7 8 9: the last four match 5 6 7 8 9 at its first place,
+     * which runs five back; 30 31 then follows. */
+    std::vector<int32_t> s = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 30, 31, 5, 6, 7, 8, 9 };
+    TokenSeq ts;
+    ts.a = s.data();
+    ts.na = (int64_t)s.size();
+    int32_t out[4];
+    int m = -1;
+    CHECK_EQ(ix.propose(ts, 2, 4, 4, out, &m, 8), 4);
+    CHECK_EQ(out[0], 30);
+    CHECK_EQ(m, 5);
+    /* A copy that runs back further is cut at the cap. */
+    std::vector<int32_t> c;
+    for (int i = 0; i < 20; ++i) c.push_back(100 + i);
+    for (int i = 0; i < 12; ++i) c.push_back(100 + i);
+    TokenSeq tc;
+    tc.a = c.data();
+    tc.na = (int64_t)c.size();
+    NgramIndex ic;
+    CHECK_EQ(ic.propose(tc, 2, 4, 4, out, &m, 8), 4);
+    CHECK_EQ(out[0], 112);
+    CHECK_EQ(m, 8);
+    /* Without the out-parameter nothing changes. */
+    NgramIndex id;
+    CHECK_EQ(id.propose(tc, 2, 4, 4, out), 4);
+}
+
+namespace {
+/* A lookup-only deployment (no draft head) at window `depth`, the fixed window (the default). */
+void lookup_fixture(Fixture& f, int depth) {
+    f.build(/*blocks=*/4096, /*states=*/64);
+    f.cfg.n_spec = depth;
+    f.prog.drafter.kind = RAD_DRAFT_NONE;
+    f.prog.drafter.depth = 0;
+}
+}  /* namespace */
+
+/* Prompt lookup alone, the gate on by default. Text that copies a stretch it has seen drafts at
+ * once and keeps drafting while its drafts come true; text that only repeats bigrams it has seen,
+ * whose proposals do not come true, is never verified, yet every proposal is still scored; and a
+ * reply that turns from the second kind into the first drafts as soon as it does. The text is
+ * the same either way: the emitted token is the fixture's, whatever was verified. */
+TEST(prompt_lookup_alone_holds_back_proposals_that_do_not_pay) {
+    Fixture f;
+    lookup_fixture(f, 4);
+    std::string log = info_of([&]() { CHECK_OK(f.start()); });
+    CHECK(log.find("prompt lookup: a proposal is verified when") != std::string::npos);
+    CHECK(!f.sch.draft().adaptive());
+
+    /* A copy: an 8-token period, 160 tokens of it; the reply goes on with it. */
+    auto r = std::make_unique<Request>();
+    r->id = f.next_id++;
+    r->max_tokens = 2000;
+    r->prompt.resize(160);
+    for (int i = 0; i < 160; ++i) r->prompt[(size_t)i] = 100 + i % 8;
+    CHECK_OK(f.sch.add(std::move(r)));
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(100);
+    f.sch.step_finished();                               /* a prefill step: not a sample */
+    for (int64_t rows = 1; rows <= 5; ++rows)
+        CHECK_EQ(f.sch.lookup_gate().cost_samples(rows), (int64_t)0);
+    int64_t pos = 161;                                   /* the next token's place in the period */
+    auto truth = [&](int64_t p) { return (int32_t)(100 + p % 8); };
+    int verified = 0;
+    for (int t = 0; t < 24; ++t) {
+        REQUIRE(f.sch.step() != nullptr);
+        const StepEntry& e = f.sch.plan().e[0];
+        int32_t a = 0;
+        if (e.n_spec > 0) {
+            CHECK(e.ngram);
+            ++verified;
+            while (a < e.n_spec && e.draft[a] == truth(pos + a)) ++a;
+        }
+        CHECK_OK(f.commit(truth(pos + a), 0, [a](const StepEntry&) { return a; }));
+        f.sch.step_finished();                           /* a decode step of 1 + 4 rows, timed */
+        pos += a + 1;
+    }
+    CHECK_EQ(verified, 24);
+    CHECK_EQ(f.sch.lookup_gate().cost_samples(5), (int64_t)24);
+    SchedMetrics m = f.sch.metrics();
+    CHECK_EQ(m.lookup_held, (int64_t)0);
+    CHECK_EQ(m.lookup_proposals, (int64_t)24);
+    CHECK_EQ(m.draft_accepted, m.draft_tokens);
+
+    /* Recurring bigrams: the prompt holds every pair of the reply 200, 201, 202, ... followed by
+     * a 50, so after each token the lookup proposes 50 on a two-token match, and it never comes
+     * true. */
+    Fixture g;
+    lookup_fixture(g, 4);
+    CHECK_OK(g.start());
+    auto q = std::make_unique<Request>();
+    q->id = g.next_id++;
+    q->max_tokens = 2000;
+    for (int i = 0; i < 60; ++i) {
+        q->prompt.push_back(200 + i);
+        q->prompt.push_back(201 + i);
+        q->prompt.push_back(50);
+    }
+    q->prompt.push_back(199);
+    CHECK_OK(g.sch.add(std::move(q)));
+    REQUIRE(g.sch.step() != nullptr);
+    g.commit_plain(200);
+    int proposals = 0;
+    for (int t = 0; t < 40; ++t) {
+        REQUIRE(g.sch.step() != nullptr);
+        CHECK_EQ(g.sch.plan().e[0].n_spec, 0);           /* held, every one */
+        g.commit_plain(201 + t);
+        ++proposals;
+    }
+    m = g.sch.metrics();
+    CHECK_EQ(m.draft_tokens, (int64_t)0);
+    CHECK(m.lookup_proposals >= proposals - 1);
+    CHECK_EQ(m.lookup_held, m.lookup_proposals);
+    CHECK_EQ(m.lookup_held_drafts, 4 * m.lookup_held);
+    CHECK_EQ(m.lookup_held_hits, (int64_t)0);
+
+    /* The reply now copies its own stretch 201.. from the start: a long match, drafted at once. */
+    std::vector<int32_t> copy;
+    for (int i = 0; i < 40; ++i) copy.push_back(200 + i);
+    size_t k = 0;
+    int drafted_steps = 0, steps = 0;
+    while (k < copy.size() && steps < 40) {
+        REQUIRE(g.sch.step() != nullptr);
+        const StepEntry& e = g.sch.plan().e[0];
+        int32_t a = 0;
+        if (e.n_spec > 0) {
+            ++drafted_steps;
+            while (a < e.n_spec && k + (size_t)a < copy.size() &&
+                   e.draft[a] == copy[k + (size_t)a])
+                ++a;
+        }
+        CHECK_OK(g.commit(copy[std::min(k + (size_t)a, copy.size() - 1)], 0,
+                          [a](const StepEntry&) { return a; }));
+        k += (size_t)a + 1;
+        ++steps;
+    }
+    CHECK(drafted_steps > 0);
+    CHECK(g.sch.metrics().draft_accepted > 0);
+}
+
+namespace {
+/* Prompt lookup by scanning: the longest pattern first, its latest earlier occurrence, the
+ * proposal continued past the end with its own tokens. The index must answer exactly this. */
+int scan_propose(const std::vector<int32_t>& s, int nmin, int nmax, int depth, int32_t* out) {
+    const int64_t L = (int64_t)s.size();
+    if (L < 2) return 0;
+    for (int n = (int)std::min<int64_t>(nmax, L - 1); n >= nmin; --n)
+        for (int64_t e = L - 2; e >= n - 1; --e) {
+            bool ok = true;
+            for (int k = 0; k < n && ok; ++k) ok = s[(size_t)(e - k)] == s[(size_t)(L - 1 - k)];
+            if (!ok) continue;
+            for (int d = 0; d < depth; ++d) {
+                const int64_t i = e + 1 + d;
+                out[d] = i < L ? s[(size_t)i] : out[i - L];
+            }
+            return depth;
+        }
+    return 0;
+}
+}  /* namespace */
+
+/* The index against the scan, over sequences grown a few tokens at a time across the prompt /
+ * output seam, on alphabets small enough to repeat often and large enough to miss, at several
+ * pattern ranges; then a change of range and a shorter sequence, which rebuild it. */
+TEST(prompt_lookup_index_answers_what_a_scan_answers) {
+    uint32_t rng = 12345;
+    auto next = [&](uint32_t mod) { rng = rng * 1664525u + 1013904223u; return (rng >> 8) % mod; };
+    const int kRanges[][2] = { { 1, 1 }, { 1, 4 }, { 2, 4 }, { 3, 7 }, { 15, 15 } };
+    int64_t hits = 0, misses = 0;
+    for (const uint32_t alphabet : { 2u, 5u, 40u, 3000u }) {
+        for (const auto& rg : kRanges) {
+            std::vector<int32_t> seq;
+            const int64_t np = 50 + next(200);
+            NgramIndex ix;
+            ix.reset(7);
+            while (seq.size() < 1500) {
+                const int add = 1 + (int)next(6);
+                for (int k = 0; k < add; ++k) {
+                    /* Runs and copies as well as noise, so long patterns recur. */
+                    if (seq.size() > 20 && next(4) == 0) {
+                        const size_t from = next((uint32_t)seq.size() - 10);
+                        for (int c = 0; c < 6; ++c) seq.push_back(seq[from + (size_t)c]);
+                    } else {
+                        seq.push_back((int32_t)next(alphabet));
+                    }
+                }
+                TokenSeq ts;
+                ts.a = seq.data();
+                ts.na = std::min<int64_t>(np, (int64_t)seq.size());
+                ts.b = seq.data() + ts.na;
+                ts.nb = (int64_t)seq.size() - ts.na;
+                int32_t want[8] = {}, got[8] = {};
+                const int depth = 1 + (int)next(8);
+                const int w = scan_propose(seq, rg[0], rg[1], depth, want);
+                const int g = ix.propose(ts, rg[0], rg[1], depth, got);
+                CHECK_EQ(g, w);
+                if (g == w) CHECK(std::memcmp(got, want, sizeof(int32_t) * (size_t)w) == 0);
+                (w ? hits : misses) += 1;
+            }
+            CHECK_EQ(ix.indexed(), (int64_t)seq.size() - 1);
+            CHECK(ix.bytes() <= (size_t)(16 * (rg[1] - rg[0] + 1)) * seq.size() + 8192);
+        }
+    }
+    CHECK(hits > 100);
+    CHECK(misses > 100);
+
+    /* Another range, then a shorter sequence (another request in the slot): both rebuild. */
+    std::vector<int32_t> a = { 1, 2, 3, 9, 1, 2, 3 };
+    TokenSeq ta{ a.data(), (int64_t)a.size(), nullptr, 0 };
+    NgramIndex ix;
+    int32_t out[4] = {};
+    CHECK_EQ(ix.propose(ta, 2, 4, 2, out), 2);
+    CHECK_EQ(out[0], 9);
+    CHECK_EQ(out[1], 1);
+    CHECK_EQ(ix.propose(ta, 4, 4, 2, out), 0);         /* no 4-gram recurs */
+    std::vector<int32_t> b = { 5, 6, 5 };
+    TokenSeq tb{ b.data(), (int64_t)b.size(), nullptr, 0 };
+    CHECK_EQ(ix.propose(tb, 1, 4, 3, out), 3);         /* period 2, continued: 6 5 6 */
+    CHECK_EQ(out[0], 6);
+    CHECK_EQ(out[1], 5);
+    CHECK_EQ(out[2], 6);
+}
+
+/* A lookup costs the n-grams the last commit added, not a pass over the context: over a 400k-token
+ * prompt that never repeats a 2-gram, the first lookup indexes it once and the next thousand
+ * lookups, a token apart, together take a small fraction of that. */
+TEST(prompt_lookup_does_not_scan_the_context) {
+    std::vector<int32_t> seq;
+    seq.reserve(401000);
+    for (int i = 0; i < 400000; ++i) seq.push_back(i);   /* every token distinct: always a miss */
+    NgramIndex ix;
+    int32_t out[8];
+    TokenSeq ts{ seq.data(), (int64_t)seq.size(), nullptr, 0 };
+    const auto t0 = std::chrono::steady_clock::now();
+    CHECK_EQ(ix.propose(ts, 2, 4, 8, out), 0);
+    const auto t1 = std::chrono::steady_clock::now();
+    for (int i = 0; i < 1000; ++i) {
+        seq.push_back(1000000 + i);
+        TokenSeq t2{ seq.data(), (int64_t)seq.size(), nullptr, 0 };
+        CHECK_EQ(ix.propose(t2, 2, 4, 8, out), 0);
+    }
+    const auto t2 = std::chrono::steady_clock::now();
+    const double build = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    const double steps = std::chrono::duration<double, std::milli>(t2 - t1).count();
+    fprintf(stderr, "    index 400k tokens: %.1f ms; 1000 lookups after: %.3f ms (%.1f MiB)\n", build,
+            steps, (double)ix.bytes() / 1048576.0);
+    CHECK(steps < build);
+    CHECK_EQ(ix.indexed(), (int64_t)seq.size() - 1);
 }
 
 /* The scheduler's half of the cost: a decode step that verified drafts is timed at its deepest
@@ -3334,6 +4392,78 @@ TEST(the_cards_block_tables_match_the_manager_after_every_build) {
     }
     /* The run reached steady decode with rows to compare, not an empty loop. */
     CHECK(checked > 100);
+}
+
+/* A streamed group's residency map and ring bookkeeping live in each rank's KV pool,
+ * but the manager the builder is given is rank 0's, so its pointers are rank 0's addresses. A
+ * two-rank batch must name rank r's own copies or device r resolves through device 0's memory
+ * (a page-not-present fault at --tp 2). The host mirror is the exception: RAD_MEM_HOST_MAPPED's
+ * device view is its host address on every card, so it is the same pointer on both ranks.
+ *
+ * The bases are fake and no map is dereferenced: what is under test is the rebasing arithmetic,
+ * not two cards. Both ranks use device 0 so the test runs on the host backend. */
+TEST(a_two_rank_batch_rebases_stream_maps_into_each_ranks_pool_and_shares_the_mirror) {
+    Fixture f;
+    f.build();
+    ChunkGeometry geo;
+    CHECK_OK(chunk_geometry_resolve(f.prog, f.cfg, &geo));
+    KVGeom kvg = KVGeom::of(f.prog.kv_groups);
+    for (size_t i = 0; i < kvg.g.size(); ++i) {
+        const int64_t w = f.kv.state_index_width((int32_t)i);
+        if (w > 0) kvg.g[i].sidx_width = w;
+    }
+
+    /* Two pools' worth of address space, only ever differenced, never dereferenced. */
+    alignas(16) char pool0[0x200], pool1[0x200];
+    char* const base[2] = { pool0, pool1 };
+    const int64_t res_off = 0x40, sblk_off = 0x80, sst_off = 0xc0, ctl_off = 0x100;
+    alignas(16) uint8_t mirror[0x100];
+    f.kv.streams = true;
+    f.kv.stream.host        = mirror;
+    f.kv.stream.res         = (int32_t*)(base[0] + res_off);
+    f.kv.stream.slot_block  = (int32_t*)(base[0] + sblk_off);
+    f.kv.stream.slot_state  = (int32_t*)(base[0] + sst_off);
+    f.kv.stream.ctl         = (int32_t*)(base[0] + ctl_off);
+    f.kv.stream.block_bytes = 64;
+    f.kv.stream.slots       = 8;
+
+    BatchBuilder bb;
+    std::vector<BatchBuilder::RankIO> rio;
+    rio.push_back({ 0, nullptr, &f.prog, base[0] });
+    rio.push_back({ 0, nullptr, &f.prog, base[1] });
+    CHECK_OK(bb.init(f.prog, f.cfg, geo, kvg, rio));
+
+    CHECK_OK(f.kv.add_sequence(1));
+    CHECK_OK(f.kv.ensure(1, 80));
+    StepPlan p;
+    p.reset();
+    StepEntry e;
+    e.seq = 1;
+    e.card = 0;
+    e.n_tokens = 1;
+    e.ctx_len = 79;
+    p.e.push_back(e);
+    p.n_tok = 1;
+    REQUIRE(bb.build(p, f.kv, 0) != nullptr);
+
+    for (int r = 0; r < 2; ++r) {
+        const RadBatch* b = bb.batch_for(r);
+        REQUIRE(b != nullptr);
+        const RadKVStream* s = b->kv[0].stream;
+        REQUIRE(s != nullptr);
+        CHECK_EQ((void*)s->res,        (void*)(base[r] + res_off));
+        CHECK_EQ((void*)s->slot_block, (void*)(base[r] + sblk_off));
+        CHECK_EQ((void*)s->slot_state, (void*)(base[r] + sst_off));
+        CHECK_EQ((void*)s->ctl,        (void*)(base[r] + ctl_off));
+        /* Same mirror address, and the geometry is rank-independent. */
+        CHECK_EQ((void*)s->host, (void*)mirror);
+        CHECK_EQ(s->block_bytes, (int64_t)64);
+        CHECK_EQ(s->slots, (int64_t)8);
+        /* Groups that do not stream keep a null view. */
+        for (int gi = 1; gi < b->n_kv_groups; ++gi)
+            CHECK(b->kv[gi].stream == nullptr);
+    }
+    bb.fini();
 }
 
 /* A sequence that leaves a row and returns to it is restaged whole. Its change marks are taken
@@ -4010,6 +5140,293 @@ TEST(a_step_is_issued_ahead_only_once_the_requests_speculation_is_fixed) {
     r->sp.grammar = "root ::= \"a\"";
     r->speculation_fixed = true;                    /* a grammar whose backend rewinds */
     CHECK(f.sch.step_next() != nullptr);
+}
+
+/* No step is issued ahead behind one that ends every request it carries: its rows would
+ * belong to finished requests, and a request arriving after the last token would wait out its
+ * forward pass. The verify ends a request most likely when its drafts hold an end-of-generation
+ * id, certainly when its first token is the request's last (max_tokens), and possibly when that
+ * token and its accepted drafts reach max_tokens. An ignore_eos request's drafted end ends
+ * nothing, nor do drafts without one, and a request that even every draft accepted leaves short
+ * of max_tokens goes on. The refusal reserves nothing for the step it does not issue. */
+TEST(no_step_is_issued_ahead_behind_one_that_ends_its_requests) {
+    constexpr int32_t kEog = 2;
+    int32_t ends[4] = { 21, kEog, 23, 24 }, goes_on[4] = { 21, 22, 23, 24 };
+    /* One request: its prompt's token committed, then the verify of `draft`. */
+    auto ahead = [&](const int32_t* draft, int max_tokens, bool ignore_eos) -> bool {
+        Fixture f;
+        f.build();
+        f.cfg.n_spec = 4;
+        CHECK_OK(f.start());
+        f.sch.set_eog({ kEog, 3 });
+        const uint64_t id = f.submit(160, max_tokens, 0, ignore_eos);
+        CHECK(f.sch.step() != nullptr);
+        f.commit_plain(11);
+        CHECK_OK(f.sch.set_draft(id, draft, 4));
+        const bool verify = f.sch.step() != nullptr;
+        CHECK(verify);
+        if (!verify) return false;
+        CHECK_EQ(f.sch.plan().e[0].n_spec, 4);
+        f.sch.find(id)->speculation_fixed = true;
+        f.sch.expect_draft(id, 4);
+        const int64_t free_before = f.kv.free_blocks(0);
+        const bool issued = f.sch.step_next() != nullptr;
+        if (!issued) CHECK_EQ(f.kv.free_blocks(0), free_before);
+        return issued;
+    };
+    CHECK(ahead(goes_on, 64, false));
+    CHECK(!ahead(ends, 64, false));               /* a drafted end */
+    CHECK(ahead(ends, 64, true));                 /* ignore_eos: an end-of-text like any token */
+    CHECK(!ahead(goes_on, 2, false));             /* one token committed, its next the last */
+    CHECK(!ahead(goes_on, 6, false));             /* 1 + its token + 4 accepted drafts reach it */
+    CHECK(ahead(goes_on, 7, false));              /* all four accepted leave it a token short */
+
+    /* Two requests: one ends, the other goes on, so the step is issued ahead for both. */
+    Fixture f;
+    f.build();
+    f.cfg.n_spec = 4;
+    CHECK_OK(f.start());
+    f.sch.set_eog({ kEog });
+    const uint64_t a = f.submit(160, 64), b = f.submit(160, 64);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    CHECK_OK(f.sch.set_draft(a, ends, 4));
+    CHECK_OK(f.sch.set_draft(b, goes_on, 4));
+    REQUIRE(f.sch.step() != nullptr);
+    f.sch.find(a)->speculation_fixed = true;
+    f.sch.find(b)->speculation_fixed = true;
+    const RadBatch* nb = f.sch.step_next();
+    REQUIRE(nb != nullptr);
+    CHECK_EQ(nb->n_seq, 2);
+}
+
+namespace {
+/* One sequence's outcome, as Engine::peek_outcome hands it to step_next. */
+struct Outcome {
+    int32_t token = 0, accepted = 0;
+    uint8_t eos = 0;
+    Scheduler::StepResult r() {
+        Scheduler::StepResult x;
+        x.n_seq = 1;
+        x.token = &token;
+        x.n_accepted = &accepted;
+        x.eos = &eos;
+        return x;
+    }
+};
+}  /* namespace */
+
+/* RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP: with each step's own outcome read back before the next
+ * is planned (`known`), nothing is issued behind the step whose token ends the reply. Without it
+ * the step behind runs a pass for the finished request (ended_with_step_ahead) and holds its blocks
+ * to its own commit, and a request arriving after the reply runs only after that step; with it the
+ * reply's commit returns the blocks, nothing was reserved for a next step, and the next request's
+ * prompt is the very next step. The reply, and every step issued before its end, are the same. */
+TEST(a_step_whose_tokens_end_its_request_issues_nothing_behind_it) {
+    constexpr int32_t kEog = 2;
+    std::vector<int32_t> reply[2];
+    for (int skip = 0; skip < 2; ++skip) {
+        Fixture f;
+        f.build();
+        f.cfg.prefix_cache = false;   /* a finished request's blocks are not kept as a prefix */
+        CHECK_OK(f.start());
+        f.sch.set_eog({ kEog });
+        const int64_t free0 = f.kv.free_blocks(0);
+        const uint64_t id = f.submit(8, 64);
+        REQUIRE(f.sch.step() != nullptr);               /* the prompt */
+        Request* r = f.sch.find(id);
+        REQUIRE(r != nullptr);
+        r->speculation_fixed = true;
+        /* The prompt's step and three decode steps go on, each with the next issued behind it
+         * before it commits; the fourth decode step's token ends the reply. */
+        const int32_t toks[5] = { 11, 21, 22, 23, kEog };
+        for (int k = 0; k < 5; ++k) {
+            const bool last = k == 4;
+            Outcome o;
+            o.token = toks[k];
+            o.eos = last ? 1 : 0;
+            const Scheduler::StepResult known = o.r();
+            CHECK(f.sch.outcome_decides_next());
+            CHECK_EQ(f.sch.outcome_ends_every_request(known), last);
+            const int64_t free_before = f.kv.free_blocks(0);
+            const RadBatch* nb = f.sch.step_next(skip ? &known : nullptr);
+            CHECK_EQ(nb != nullptr, !(skip && last));
+            if (!nb) CHECK_EQ(f.kv.free_blocks(0), free_before);   /* nothing reserved */
+            CHECK_OK(f.commit(o.token, o.eos));
+            if (nb) f.sch.promote_next();
+        }
+        CHECK_EQ((int)r->state, (int)ReqState::Finished);
+        CHECK_EQ(r->finish_reason, std::string("stop"));
+        reply[skip] = r->output;
+        /* The next request arrives after the reply. */
+        const uint64_t next = f.submit(8, 64);
+        const SchedMetrics m = f.sch.metrics();
+        if (!skip) {
+            /* The step issued behind the reply's end is open: a pass for the finished request,
+             * which holds the request's blocks until it commits. */
+            CHECK_EQ(m.ended_with_step_ahead, 1);
+            CHECK_EQ(m.steps_ahead_withheld, 0);
+            CHECK_EQ(m.steps_ahead, 5);
+            REQUIRE_EQ(f.sch.plan().e.size(), (size_t)1);
+            CHECK_EQ(f.sch.plan().e[0].seq, id);
+            CHECK(f.kv.has_sequence(id));
+            CHECK_OK(f.commit(7));
+        } else {
+            CHECK_EQ(m.ended_with_step_ahead, 0);
+            CHECK_EQ(m.steps_ahead_withheld, 1);
+            CHECK_EQ(m.steps_ahead, 4);
+        }
+        CHECK(!f.kv.has_sequence(id));
+        CHECK_EQ(f.kv.free_blocks(0), free0);
+        /* Only now can the next request's prompt run: with the switch right after the reply. */
+        REQUIRE(f.sch.step() != nullptr);
+        REQUIRE_EQ(f.sch.plan().e.size(), (size_t)1);
+        CHECK_EQ(f.sch.plan().e[0].seq, next);
+        CHECK(f.sch.plan().e[0].is_prefill);
+    }
+    CHECK(reply[0] == std::vector<int32_t>({ 11, 21, 22, 23, kEog }));
+    CHECK(reply[0] == reply[1]);
+}
+
+/* outcome_ends_every_request is commit()'s end test run before the commit: over random requests
+ * (max_tokens none or 1..8, the context 9..17 tokens or the default, ignore_eos or not) and their
+ * steps (the prompt's, then verifies of up to four drafts), with random outcomes (any number of
+ * drafts accepted, any token, the end flag set or not), it says the request ends exactly when the
+ * commit of that outcome ends it, by its end-of-generation token, max_tokens or the context. */
+TEST(an_outcome_ends_every_request_exactly_when_its_commit_does) {
+    uint32_t rng = 2026;
+    auto pick = [&](uint32_t n) {
+        rng = rng * 1664525u + 1013904223u;
+        return (int32_t)((rng >> 16) % n);
+    };
+    int ends = 0, goes_on = 0, by_eos = 0, by_length = 0;
+    for (int it = 0; it < 300; ++it) {
+        Fixture f;
+        f.build();
+        f.cfg.n_spec = 4;
+        f.cfg.prefix_cache = false;
+        if (pick(3) == 0) f.cfg.max_ctx = 9 + pick(9);   /* 9: the prompt's own token fills it */
+        CHECK_OK(f.start());
+        f.sch.set_eog({ 2, 3 });
+        const int max_tokens = pick(4) == 0 ? 0 : 1 + pick(8);
+        const uint64_t id = f.submit(8, max_tokens, 0, pick(4) == 0);
+        REQUIRE(id != 0);
+        for (int k = 0; k < 40; ++k) {
+            if (k > 0) {
+                int32_t d[4];
+                for (int32_t& x : d) x = pick(4) == 0 ? 2 : 20 + pick(4);
+                CHECK_OK(f.sch.set_draft(id, d, 4));
+            }
+            REQUIRE(f.sch.step() != nullptr);
+            REQUIRE_EQ(f.sch.plan().e.size(), (size_t)1);
+            const StepEntry& e = f.sch.plan().e[0];
+            Outcome o;
+            o.token = pick(3) == 0 ? 3 : 20 + pick(4);
+            o.eos = pick(4) == 0 ? 1 : 0;
+            o.accepted = e.n_spec > 0 ? pick((uint32_t)e.n_spec + 1) : 0;
+            Scheduler::StepResult res = o.r();
+            const bool predicted = f.sch.outcome_ends_every_request(res);
+            CHECK_OK(f.sch.commit(res));
+            const Request* r = f.sch.find(id);
+            REQUIRE(r != nullptr);
+            const bool ended = r->state != ReqState::Running;
+            if (predicted != ended)
+                fprintf(stderr, "    case %d step %d: max_tokens %d, context %lld, ignore_eos %d, "
+                        "n_spec %d, accepted %d, eos %d: predicted %d, committed %d (%s)\n", it, k,
+                        max_tokens, (long long)f.cfg.max_ctx, (int)r->ignore_eos, (int)e.n_spec,
+                        (int)o.accepted, (int)o.eos, (int)predicted, (int)ended,
+                        r->finish_reason.c_str());
+            CHECK_EQ(predicted, ended);
+            if (!ended) { ++goes_on; continue; }
+            ++ends;
+            (r->finish_reason == "stop" ? by_eos : by_length) += 1;
+            break;
+        }
+    }
+    /* Both answers, and both kinds of end, many times over. */
+    CHECK(ends > 100);
+    CHECK(goes_on > 100);
+    CHECK(by_eos > 30);
+    CHECK(by_length > 30);
+}
+
+/* A step of two sequences is not read back first: they end at the same step too rarely to pay for
+ * the wait on every step. An outcome that ends one of them leaves the step issued behind it for
+ * both, as without the outcome, since issued without the ended one's row the other would run in a
+ * step of another shape, whose bits on a card can differ; only one that ends both withholds it. */
+TEST(a_step_of_two_sequences_is_withheld_only_when_both_end) {
+    constexpr int32_t kEog = 2;
+    for (int both = 0; both < 2; ++both) {
+        Fixture f;
+        f.build();
+        f.cfg.prefix_cache = false;
+        CHECK_OK(f.start());
+        f.sch.set_eog({ kEog });
+        const uint64_t a = f.submit(8, 64), b = f.submit(8, 64);
+        REQUIRE(f.sch.step() != nullptr);
+        f.commit_plain(11);
+        REQUIRE(f.sch.step() != nullptr);
+        REQUIRE_EQ(f.sch.plan().e.size(), (size_t)2);
+        f.sch.find(a)->speculation_fixed = true;
+        f.sch.find(b)->speculation_fixed = true;
+        CHECK(!f.sch.outcome_decides_next());
+        int32_t t[2] = { kEog, both ? kEog : 21 }, acc[2] = { 0, 0 };
+        uint8_t eos[2] = { 1, (uint8_t)both };
+        Scheduler::StepResult known;
+        known.n_seq = 2;
+        known.token = t;
+        known.n_accepted = acc;
+        known.eos = eos;
+        CHECK_EQ(f.sch.outcome_ends_every_request(known), both == 1);
+        const RadBatch* nb = f.sch.step_next(&known);
+        CHECK_EQ(nb != nullptr, both == 0);
+        if (nb) CHECK_EQ(nb->n_seq, 2);
+        CHECK_EQ(f.sch.metrics().steps_ahead_withheld, (int64_t)both);
+    }
+}
+
+/* A step is read back first only when its own token can withhold the next: not for a request that
+ * ignores end-of-generation tokens (only max_tokens or the context end it, which
+ * ends_every_request already foresees), not for a step that ends_every_request already withholds
+ * (the reply's max_tokens-th token), and not for a step whose row produces no token (a chunk in
+ * the middle of a prompt). */
+TEST(a_step_is_read_back_first_only_when_its_own_token_can_end_it) {
+    {
+        Fixture f;
+        f.build();
+        CHECK_OK(f.start());
+        f.sch.set_eog({ 2 });
+        const uint64_t id = f.submit(8, 64, 0, /*ignore_eos=*/true);
+        REQUIRE(f.sch.step() != nullptr);
+        CHECK(!f.sch.outcome_decides_next());
+        f.commit_plain();
+        REQUIRE(f.sch.step() != nullptr);
+        f.sch.find(id)->speculation_fixed = true;
+        CHECK(!f.sch.outcome_decides_next());
+    }
+    {
+        Fixture f;
+        f.build();
+        CHECK_OK(f.start());
+        f.sch.set_eog({ 2 });
+        f.submit(8, /*max_tokens=*/2);
+        REQUIRE(f.sch.step() != nullptr);
+        CHECK(f.sch.outcome_decides_next());     /* the prompt's token, the first of two */
+        f.commit_plain();
+        REQUIRE(f.sch.step() != nullptr);        /* the second and last */
+        CHECK(f.sch.ends_every_request());
+        CHECK(!f.sch.outcome_decides_next());
+    }
+    {
+        Fixture f;
+        f.build(4096, 64, /*max_tok=*/64);
+        CHECK_OK(f.start());
+        f.sch.set_eog({ 2 });
+        f.submit(200, 64);
+        REQUIRE(f.sch.step() != nullptr);
+        REQUIRE(!f.sch.plan().e[0].produces_token);
+        CHECK(!f.sch.outcome_decides_next());
+    }
 }
 
 /* The context bounds a sequence whatever max_tokens says, "no limit" included. Positions past the
@@ -4966,13 +6383,15 @@ TEST(a_cancel_while_a_step_runs_ahead_keeps_the_request_until_that_step_commits)
 }
 
 /* A request that finishes at the commit of a step whose successor is already issued keeps its
- * blocks for that successor, which writes them, and returns them at its commit. */
+ * blocks for that successor, which writes them, and returns them at its commit. The end is one
+ * the scheduler could not see coming (an end-of-text it did not draft): a step known to end the
+ * request issues nothing ahead (no_step_is_issued_ahead_behind_one_that_ends_its_requests). */
 TEST(a_request_finishing_under_a_step_issued_ahead_keeps_its_blocks_for_that_step) {
     Fixture f;
     f.build(/*blocks=*/20, /*states=*/64);
     CHECK_OK(f.start());
     const int64_t before = f.kv.free_blocks(0);
-    auto r = f.request(40, /*max_tokens=*/2);
+    auto r = f.request(40, /*max_tokens=*/64);
     r->speculation_fixed = true;
     const uint64_t a = f.add(std::move(r));
     REQUIRE(f.sch.step() != nullptr);
@@ -4980,7 +6399,7 @@ TEST(a_request_finishing_under_a_step_issued_ahead_keeps_its_blocks_for_that_ste
     REQUIRE(f.sch.step() != nullptr);
     REQUIRE(f.sch.step_next() != nullptr);
     const int64_t held = f.kv.free_blocks(0);
-    f.commit_plain();                              /* the second token: finished */
+    CHECK_OK(f.commit(7, /*eos=*/1));              /* the second token, an end of text: finished */
     CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Finished);
     CHECK_EQ(f.kv.free_blocks(0), held);
     f.sch.promote_next();
@@ -5661,8 +7080,8 @@ uint64_t scripted_steps(int64_t max_tok, int64_t interval, int64_t busy, int* n_
 TEST(without_a_span_the_scheduler_plans_and_stages_the_pinned_steps) {
     struct Case { int64_t max_tok, interval, busy; uint64_t want; };
     const Case cases[] = {
-        { 256, 256, -1, 0x17b8231a20db9d46ull }, { 512, 256, -1, 0xe155e72b6a4cc94full }, { 1024, 256, -1, 0x54ba52dac3f4f61cull },
-        { 1024, 256, 0, 0x54ba52dac3f4f61cull }, { 1024, 256, 128, 0x3d9cbbf533e3c4b5ull }, { 2048, 512, -1, 0x400205b7b9afcf12ull },
+        { 256, 256, -1, 0x9b2fe92b1919355cull }, { 512, 256, -1, 0xdae73489249b5339ull }, { 1024, 256, -1, 0x44975a352e78619aull },
+        { 1024, 256, 0, 0x44975a352e78619aull }, { 1024, 256, 128, 0x3c0b9b1a1f864e4aull }, { 2048, 512, -1, 0xd6c184d0563159eeull },
     };
     for (const Case& c : cases) {
         int n = 0;
@@ -5672,5 +7091,640 @@ TEST(without_a_span_the_scheduler_plans_and_stages_the_pinned_steps) {
                 (unsigned long long)h);
         CHECK(n > 20);
         CHECK_EQ(h, c.want);
+    }
+}
+
+/* ===== source-authored origin/OFF component controls; no Engine/GPU/bank proof ===== */
+TEST(draft_origin_default_off_preserves_aggregate_counting) {
+    Fixture f; f.build(); f.cfg.n_spec = 4; CHECK_OK(f.start());
+    const auto id = f.submit(160); REQUIRE(f.sch.step()); f.commit_plain(11);
+    const int32_t draft[] = {21,22,23,24}; CHECK_OK(f.sch.set_draft(id,draft,4));
+    REQUIRE(f.sch.step()); CHECK_OK(f.commit(99,0,[](const StepEntry&){return 2;}));
+    const auto m = f.sch.metrics(); CHECK_EQ(m.draft_tokens,4); CHECK_EQ(m.draft_accepted,2);
+    CHECK(!m.draft_origin.enabled); CHECK_EQ(m.draft_origin.learned_verified_tokens,0);
+}
+TEST(draft_origin_publication_counts_actual_caps_and_refusals) {
+    Fixture f; f.build(); f.cfg.n_spec = 4;
+    const auto x = DraftExperiment::capture("1","0"); CHECK_OK(f.start(&x));
+    const auto id = f.submit(160); REQUIRE(f.sch.step()); f.commit_plain(11);
+    const int32_t draft[] = {21,22,23,24,25,26,27,28};
+    CHECK_EQ(f.sch.set_draft(id,draft,-1),RAD_E_INVAL);
+    CHECK_EQ(f.sch.set_draft(id+1000,draft,4),RAD_E_NOTFOUND);
+    CHECK_OK(f.sch.set_draft(id,draft,8)); // installed cap4, not requested8
+    auto o = f.sch.metrics().draft_origin;
+    CHECK_EQ(o.learned_publications,1); CHECK_EQ(o.learned_published_tokens,4);
+    f.sch.find(id)->may_speculate = false; CHECK_OK(f.sch.set_draft(id,draft,4));
+    o=f.sch.metrics().draft_origin; CHECK_EQ(o.learned_publications,1);
+    CHECK_EQ(f.sch.find(id)->n_draft,0);
+}
+TEST(draft_origin_committed_learned_matches_existing_aggregate) {
+    Fixture f; f.build(); f.cfg.n_spec = 4;
+    const auto x = DraftExperiment::capture("1","0"); CHECK_OK(f.start(&x));
+    const auto id=f.submit(160); REQUIRE(f.sch.step()); f.commit_plain(11);
+    const int32_t draft[]={21,22,23,24}; CHECK_OK(f.sch.set_draft(id,draft,4));
+    REQUIRE(f.sch.step()); CHECK(!f.sch.plan().e[0].ngram);
+    CHECK_OK(f.commit(99,0,[](const StepEntry&){return 2;}));
+    const auto m=f.sch.metrics(); const auto& o=m.draft_origin;
+    CHECK_EQ(o.learned_verified_tokens,4); CHECK_EQ(o.learned_accepted_tokens,2);
+    CHECK_EQ(o.fallback_verified_tokens,0);
+    CHECK_EQ(o.learned_verified_tokens+o.fallback_verified_tokens,m.draft_tokens);
+    CHECK_EQ(o.learned_accepted_tokens+o.fallback_accepted_tokens,m.draft_accepted);
+}
+TEST(draft_origin_overwrite_and_cancellation_do_not_invent_consumption) {
+    Fixture f; f.build(); f.cfg.n_spec=4;
+    const auto x=DraftExperiment::capture("1","0"); CHECK_OK(f.start(&x));
+    const auto id=f.submit(160); REQUIRE(f.sch.step()); f.commit_plain(11);
+    const int32_t d[]={21,22,23,24}; CHECK_OK(f.sch.set_draft(id,d,4));
+    CHECK_OK(f.sch.set_draft(id,d,4)); CHECK_OK(f.sch.cancel(id));
+    const auto o=f.sch.metrics().draft_origin;
+    CHECK_EQ(o.learned_publications,2); CHECK_EQ(o.learned_published_tokens,8);
+    CHECK_EQ(o.learned_verified_tokens,0); CHECK_EQ(o.learned_accepted_tokens,0);
+}
+TEST(draft_origin_empty_head_uses_separately_tagged_lookup) {
+    Fixture f; f.build(); f.cfg.n_spec=4;
+    f.prog.drafter.kind=RAD_DRAFT_BLOCK; f.prog.drafter.depth=4; // fallback beside a head
+    const auto x=DraftExperiment::capture("1","0"); CHECK_OK(f.start(&x));
+    auto r=f.request(160,2000); for(int i=0;i<160;++i)r->prompt[size_t(i)]=100+i%8;
+    const auto id=f.add(std::move(r)); REQUIRE(id); REQUIRE(f.sch.step()); f.commit_plain(100);
+    CHECK_OK(f.sch.set_draft(id,nullptr,0)); REQUIRE(f.sch.step());
+    REQUIRE(f.sch.plan().e[0].ngram); const int n=f.sch.plan().e[0].n_spec; REQUIRE(n>0);
+    CHECK_OK(f.commit(101,0,[](const StepEntry& e){return e.n_spec>1?1:0;}));
+    const auto m=f.sch.metrics(); const auto& o=m.draft_origin;
+    CHECK_EQ(o.learned_publications,0); CHECK_EQ(o.learned_verified_tokens,0);
+    CHECK_EQ(o.fallback_offers,1); CHECK(o.fallback_offered_tokens>=n);
+    CHECK_EQ(o.fallback_publications,1); CHECK_EQ(o.fallback_published_tokens,n);
+    CHECK_EQ(o.fallback_verified_tokens,n); CHECK_EQ(o.fallback_accepted_tokens,m.draft_accepted);
+    CHECK_EQ(o.fallback_verified_tokens,m.draft_tokens);
+}
+TEST(draft_origin_ahead_publication_counts_only_matching_installs) {
+    Fixture f; f.build(); f.cfg.n_spec=4;
+    const auto x=DraftExperiment::capture("1","0"); CHECK_OK(f.start(&x));
+    const auto id=f.submit(160); REQUIRE(f.sch.step()); f.commit_plain(11);
+    REQUIRE(f.sch.step()); f.sch.find(id)->speculation_fixed=true;
+    f.sch.expect_draft(id,4); REQUIRE(f.sch.step_next());
+    const int32_t d[]={21,22,23,24};
+    CHECK_EQ(f.sch.set_draft(id,d,3),RAD_E_STATE);
+    CHECK_EQ(f.sch.metrics().draft_origin.learned_publications,0);
+    CHECK_OK(f.sch.set_draft(id,d,4));
+    CHECK_EQ(f.sch.metrics().draft_origin.learned_publications,1);
+    CHECK_EQ(f.sch.metrics().draft_origin.learned_published_tokens,4);
+    CHECK_OK(f.commit(12)); f.sch.promote_next();
+    CHECK_OK(f.commit(99,0,[](const StepEntry&){return 2;}));
+    CHECK_EQ(f.sch.metrics().draft_origin.learned_verified_tokens,4);
+}
+TEST(draft_compute_off_keeps_configured_depth_but_suppresses_all_scheduler_sources) {
+    Fixture f; f.build(); f.cfg.n_spec=5;
+    f.prog.drafter.kind=RAD_DRAFT_BLOCK; f.prog.drafter.depth=5;
+    f.prog.drafter.window=129;
+    // Private component injection only. Engine separately requires full EP4 bank/final-Plan scope.
+    const auto x=DraftExperiment::capture("0","1"); CHECK_OK(f.start(&x));
+    CHECK_EQ(f.cfg.n_spec,5); CHECK_EQ(f.sch.draft().next_depth(),5);
+    auto r=f.request(160,2000); for(int i=0;i<160;++i)r->prompt[size_t(i)]=100+i%8;
+    const auto id=f.add(std::move(r)); REQUIRE(f.sch.step()); f.commit_plain(100);
+    const int32_t d[]={101,102,103,104,105};
+    CHECK_EQ(f.sch.set_draft(id,d,5),RAD_E_UNSUPPORTED);
+    int rounds=5; Scheduler::SerialRow serial[1];
+    CHECK_EQ(f.sch.serial_begin(&rounds,serial,1),0); CHECK_EQ(rounds,0);
+    Scheduler::BlockRow block[1]; CHECK_EQ(f.sch.block_begin(5,5,129,128799,block,1),0);
+    CHECK(f.sch.block_context(1)==nullptr); CHECK(f.sch.block_query(1)==nullptr);
+    REQUIRE(f.sch.step()); CHECK_EQ(f.sch.plan().n_spec,0); CHECK_EQ(f.sch.plan().n_tok,1);
+    f.sch.find(id)->speculation_fixed=true; f.sch.expect_draft(id,5);
+    const RadBatch* ahead=f.sch.step_next(); REQUIRE(ahead); CHECK_EQ(ahead->n_spec,0);
+    CHECK_EQ(ahead->n_tok,1); CHECK_OK(f.commit(101)); f.sch.promote_next();
+    CHECK_OK(f.commit(102));
+    const auto m=f.sch.metrics(); const auto& o=m.draft_origin;
+    CHECK(o.enabled); CHECK(o.compute_off); CHECK_EQ(m.draft_depth,0);
+    CHECK_EQ(m.draft_tokens,0); CHECK_EQ(m.draft_refills,0);
+    CHECK_EQ(o.learned_publications,0); CHECK_EQ(o.fallback_offers,0);
+    CHECK_EQ(o.learned_verified_tokens+o.fallback_verified_tokens,0);
+}
+TEST(draft_origin_issue_evidence_remains_visible_even_in_off_control) {
+    Fixture f; f.build(); f.cfg.n_spec=5;
+    const auto x=DraftExperiment::capture("0","1"); CHECK_OK(f.start(&x));
+    // Defensive observation: OFF must not hide unexpected actual Engine issues.
+    f.sch.note_block_issue(-1,160); f.sch.note_block_issue(1,5);
+    f.sch.note_block_issue(0,8); f.sch.note_block_issue(1,0);
+    const auto o=f.sch.metrics().draft_origin;
+    CHECK_EQ(o.block_context_issues,1); CHECK_EQ(o.block_context_rows,160);
+    CHECK_EQ(o.block_query_issues,1); CHECK_EQ(o.block_query_rows,5);
+}
+
+TEST(draft_origin_held_lookup_offer_is_not_a_publication_or_consume) {
+    Fixture f; f.build(); f.cfg.n_spec=4;
+    const auto x=DraftExperiment::capture("1","0"); CHECK_OK(f.start(&x));
+    auto r=f.request(160,2000); for(int i=0;i<160;++i)r->prompt[size_t(i)]=100+i%8;
+    REQUIRE(f.add(std::move(r))); REQUIRE(f.sch.step()); f.commit_plain(100);
+    // Make a five-row verify far more costly than any four-token offer can repay.
+    for(int i=0;i<8;++i){f.sch.lookup_gate().step_time(1,10.0);f.sch.lookup_gate().step_time(5,1000.0);}
+    REQUIRE(f.sch.step()); CHECK_EQ(f.sch.plan().n_spec,0);
+    const auto o=f.sch.metrics().draft_origin;
+    CHECK_EQ(o.fallback_offers,1); CHECK(o.fallback_offered_tokens>0);
+    CHECK_EQ(o.fallback_publications,0);CHECK_EQ(o.fallback_published_tokens,0);
+    CHECK_EQ(o.fallback_verified_tokens,0);
+}
+
+/* ===== fixed verify-prefix successor controls: full5 generation, capped consumption ===== */
+TEST(fixed_verify_cap_installs_only_prefix_and_caps_lookup_at_every_positive_depth) {
+    for(int cap:{1,2,3,4,5}){
+        const char text[2]={char('0'+cap),0};const auto x=DraftExperiment::capture("0","0",text);
+        Fixture f;f.build();f.cfg.n_spec=5;f.prog.drafter.kind=RAD_DRAFT_BLOCK;f.prog.drafter.depth=5;
+        CHECK_OK(f.start(&x));auto r=f.request(160,2000);
+        for(int i=0;i<160;++i)r->prompt[size_t(i)]=100+i%8;
+        const auto id=f.add(std::move(r));REQUIRE(f.sch.step());f.commit_plain(100);
+        const int32_t generated[5]={201,202,203,204,205};
+        CHECK_EQ(f.sch.set_draft(id,generated,6),RAD_E_STATE); // refuses before reading six words
+        CHECK_OK(f.sch.set_draft(id,generated,5));
+        REQUIRE(f.sch.step());CHECK_EQ(f.sch.plan().n_spec,cap);CHECK_EQ(f.sch.plan().n_tok,1+cap);
+        CHECK_EQ(f.sch.find(id)->n_draft,cap);
+        CHECK_OK(f.commit(101,0,[](const StepEntry&){return 0;}));
+        const auto m=f.sch.metrics();CHECK_EQ(m.draft_tokens,cap);CHECK_EQ(m.draft_origin.learned_published_tokens,cap);
+        CHECK_EQ(m.draft_origin.verify_cap,cap);CHECK_EQ(f.cfg.n_spec,5);CHECK_EQ(f.sch.draft().next_depth(),5);
+        // Resume the original repeated pattern; no head publication means a lookup fallback.
+        REQUIRE(f.sch.step());CHECK(f.sch.plan().n_spec<=cap);
+        if(f.sch.plan().e[0].ngram)CHECK(f.sch.plan().e[0].n_spec<=cap);
+    }
+}
+TEST(fixed_verify_cap_preserves_full5_query_and_exact_ahead_prefix_transport) {
+    for(int cap:{1,2,3,4,5}){
+        const char text[2]={char('0'+cap),0};const auto x=DraftExperiment::capture("0","0",text);
+        Fixture f;f.build();f.cfg.n_spec=5;f.cfg.max_seqs=1;
+        f.prog.drafter.kind=RAD_DRAFT_BLOCK;f.prog.drafter.depth=5;
+        CHECK_OK(f.start(&x));auto r=f.request(40,0);r->speculation_fixed=true;
+        const auto id=f.add(std::move(r));const RadBatch* b=f.sch.step();REQUIRE(b);
+        std::vector<StepSlot> slots(size_t(f.cfg.max_seqs));std::vector<int32_t> expected;
+        for(int t=0;t<12;++t){
+            const StepEntry entry=f.sch.plan().e[0];
+            CHECK_EQ(entry.n_spec,t?cap:0);
+            const int accepted=ahead_acc(id,t,entry.n_spec);
+            std::vector<int32_t> sampled(size_t(b->n_out)+1,-1);
+            for(int j=0;j<=entry.n_spec;++j)sampled[size_t(entry.dev_out+j)]=
+                j<accepted?ahead_draft(id,t,j):ahead_tok(id,t);
+            AdvanceArgs accept=f.sch.advance_args(0);accept.mode=ADV_ACCEPT;
+            accept.st=slots.data();accept.src=sampled.data();adv_row(accept,0);
+            CHECK_EQ(slots[size_t(entry.card)].acc,accepted);
+            CHECK_EQ(slots[size_t(entry.card)].tok[0],ahead_tok(id,t));
+            Scheduler::BlockRow row[1];CHECK_EQ(f.sch.block_begin(5,5,129,128799,row,1,true),1);
+            const RadBatch* context=f.sch.block_context(t+1);REQUIRE(context);
+            CHECK_EQ(context->n_tok,entry.n_tokens);
+            const RadBatch* query=f.sch.block_query(t+1);REQUIRE(query);
+            CHECK_EQ(query->draft_pass,1);CHECK_EQ(query->n_tok,5);CHECK_EQ(query->n_spec,0);
+            AdvanceArgs q=f.sch.advance_args(0);q.mode=ADV_BLOCK;q.st=slots.data();adv_row(q,0);
+            int32_t generated[5];for(int j=0;j<5;++j)generated[j]=ahead_draft(id,t+1,j);
+            AdvanceArgs take=f.sch.advance_args(0);take.mode=ADV_BTAKE;take.round=5;
+            take.src=generated;take.src_pitch=5;take.st=slots.data();adv_row(take,0);
+            for(int j=0;j<5;++j)CHECK_EQ(slots[size_t(entry.card)].tok[1+j],generated[j]);
+            f.sch.expect_draft(id,5);const RadBatch* next=f.sch.step_next();REQUIRE(next);
+            CHECK_EQ(next->n_spec,cap);CHECK_EQ(next->n_tok,1+cap);
+            AdvanceArgs tr=f.sch.advance_args(0);tr.mode=ADV_TRUNK;tr.st=slots.data();adv_row(tr,0);
+            CHECK_EQ(next->token_ids[0],ahead_tok(id,t));
+            for(int j=0;j<cap;++j)CHECK_EQ(next->token_ids[1+j],generated[j]);
+            for(int j=0;j<accepted;++j)expected.push_back(ahead_draft(id,t,j));
+            expected.push_back(ahead_tok(id,t));
+            CHECK_OK(f.commit(ahead_tok(id,t),0,[accepted](const StepEntry&){return accepted;}));
+            f.sch.block_end();
+            // Fixed-ahead installation must accept generated5 ONLY as its exact planned prefix.
+            CHECK_EQ(f.sch.set_draft(id,generated,cap-1),RAD_E_STATE);
+            CHECK_OK(f.sch.set_draft(id,generated,5));f.sch.promote_next();b=next;
+            CHECK(f.sch.find(id)->output==expected);
+        }
+        const auto m=f.sch.metrics();CHECK_EQ(m.draft_tokens,11*cap);
+        CHECK_EQ(m.draft_origin.learned_verified_tokens,m.draft_tokens);
+        CHECK_EQ(m.draft_origin.learned_published_tokens,12*cap);
+        CHECK_EQ(f.cfg.n_spec,5);CHECK_EQ(f.sch.draft().next_depth(),5);
+    }
+}
+TEST(fixed_verify_cap_partial_rejection_rolls_back_only_committed_prefix) {
+    for(int cap:{1,2,3,4,5}){
+        const char text[2]={char('0'+cap),0};const auto x=DraftExperiment::capture("0","0",text);
+        Fixture f;f.build();f.cfg.n_spec=5;CHECK_OK(f.start(&x));
+        const auto id=f.submit(160,2000);REQUIRE(f.sch.step());f.commit_plain(11);
+        const int32_t generated[5]={21,22,23,24,25};CHECK_OK(f.sch.set_draft(id,generated,5));
+        REQUIRE(f.sch.step());const auto e=f.sch.plan().e[0];const int a=cap-1;
+        CHECK_OK(f.commit(99,0,[a](const StepEntry&){return a;}));
+        CHECK_EQ(f.sch.find(id)->n_computed,int64_t(e.ctx_len+1+a));
+        CHECK_EQ(f.kv.seqs.at(id).n,int64_t(e.ctx_len+1+a));
+        const auto& out=f.sch.find(id)->output;CHECK_EQ(out.size(),size_t(2+a));
+        for(int j=0;j<a;++j){CHECK_EQ(out[size_t(1+j)],generated[j]);}
+        CHECK_EQ(out.back(),99);
+        for(size_t j=1;j<out.size();++j)CHECK(out[j]!=25); // unused tail never emitted (target99)
+    }
+}
+TEST(fixed_verify_cap_zero_is_the_same_runtime_off_and_preserves_declared_depth) {
+    const auto a=DraftExperiment::capture("0","0","0"),b=DraftExperiment::capture("0","1");
+    CHECK(a.compute_off()&&b.compute_off());CHECK(a.observe()&&b.observe());
+    for(int mode=0;mode<2;++mode){
+        const auto& x=mode?a:b;Fixture f;f.build();f.cfg.n_spec=5;CHECK_OK(f.start(&x));
+        const auto id=f.submit(40);REQUIRE(f.sch.step());f.commit_plain(11);
+        const int32_t d[5]={21,22,23,24,25};CHECK_EQ(f.sch.set_draft(id,d,5),RAD_E_UNSUPPORTED);
+        REQUIRE(f.sch.step());CHECK_EQ(f.sch.plan().n_spec,0);CHECK_EQ(f.sch.plan().n_tok,1);
+        CHECK_EQ(f.cfg.n_spec,5);CHECK_EQ(f.sch.draft().next_depth(),5);
+        CHECK(x.target_pipelining(true,false,false,5));
+    }
+}
+
+/* RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE. DeepSeek-V4.1 is served with the budget at the chunk
+ * quantum (--max-num-batched-tokens 16 against a 16-token attention block), so a decode row ahead
+ * of a chunk leaves it under the quantum. Without the switch a request arriving while another
+ * decodes waits until that one has finished, however many --max-num-seqs admits; with it, each of
+ * its chunks runs in a step of its own, the decode rows wait for it, and the two then decode
+ * together. Every step is one prefill chunk alone, cut as an idle server cuts it, or decode rows
+ * only; nothing is issued ahead of a step that left a decode row out. */
+namespace {
+struct PfAloneRun {
+    int  together = 0;          /* steps carrying both sequences' decode rows */
+    bool pure = true;           /* every step one chunk alone, or decode rows only */
+    bool ahead_refused = true;  /* step_next refused after every step that left a row out */
+    std::vector<int32_t> b_chunks;
+    size_t a_out = 0, b_out = 0;
+};
+void pf_alone_run(bool on, PfAloneRun& out) {
+    Fixture f;
+    f.build(/*blocks=*/4096, /*states=*/64, /*max_tok=*/16, /*max_ctx=*/512, /*windowed=*/false,
+            /*linear=*/false);
+    f.cfg.max_seqs = 4;
+    f.cfg.prefix_cache = false;
+    if (on) setenv("RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE", "1", 1);
+    else unsetenv("RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE");
+    const int rc = f.start();
+    unsetenv("RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE");
+    CHECK_OK(rc);
+    f.sch.set_stage_rows(16);
+    CHECK_EQ(f.sch.geometry().quantum, 16);
+    const uint64_t a = f.submit(40, 12);
+    for (int k = 0; k < 3; ++k) { REQUIRE(f.sch.step() != nullptr); f.commit_plain(11); }
+    CHECK_EQ(f.sch.find(a)->output.size(), (size_t)1);   /* a decodes from here */
+    const uint64_t b = f.submit(40, 12);
+    for (int k = 0; k < 60; ++k) {
+        if (!f.sch.step()) break;
+        const StepPlan& p = f.sch.plan();
+        int pf = 0, dec = 0;
+        bool a_dec = false, b_dec = false;
+        for (const StepEntry& e : p.e) {
+            if (e.is_prefill) { ++pf; if (e.seq == b) out.b_chunks.push_back(e.n_tokens); }
+            else { ++dec; a_dec |= e.seq == a; b_dec |= e.seq == b; }
+        }
+        if (pf && (pf > 1 || dec)) out.pure = false;
+        if (a_dec && b_dec) ++out.together;
+        Request* ra = f.sch.find(a);
+        Request* rb = f.sch.find(b);
+        if (ra) ra->speculation_fixed = true;
+        if (rb) rb->speculation_fixed = true;
+        const bool left_out = ra && rb && pf == 1 && f.sch.running(a) && !a_dec;
+        if (left_out && f.sch.step_next() != nullptr) out.ahead_refused = false;
+        f.commit_plain(12);
+        if (f.sch.find(a)) out.a_out = f.sch.find(a)->output.size();
+        if (f.sch.find(b)) out.b_out = f.sch.find(b)->output.size();
+    }
+}
+}  /* namespace */
+
+TEST(prefill_alone_lets_a_second_request_decode_beside_the_first) {
+    PfAloneRun off, on;
+    pf_alone_run(false, off);
+    CHECK_EQ(off.together, 0);                       /* one after another */
+    pf_alone_run(true, on);
+    CHECK(on.together >= 8);
+    CHECK(on.pure);
+    CHECK(on.ahead_refused);
+    /* b's prompt is cut as an idle server cuts it: 16, 16, 8 */
+    CHECK(on.b_chunks == std::vector<int32_t>({ 16, 16, 8 }));
+    CHECK(off.b_chunks == std::vector<int32_t>({ 16, 16, 8 }));
+    CHECK_EQ(on.a_out, (size_t)12);
+    CHECK_EQ(on.b_out, (size_t)12);
+}
+
+/* ================================================================== the consumer skip */
+/* RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP (core/sched/consumer_skip.h) on the scheduler: a window +
+ * full trunk of 16 layers, the declared suffix past layer 4 with the window's 64 positions, 16-row
+ * chunks on the 16-token quantum, window snapshots at the interval (256) and the tail. */
+namespace {
+
+void consumer_fixture(Fixture& f, int64_t max_tok, int64_t max_seqs = 1) {
+    f.build(4096, 64, max_tok, 4096, /*windowed=*/true);
+    f.prog.kv_groups.erase(f.prog.kv_groups.begin() + 1, f.prog.kv_groups.begin() + 3);
+    f.prog.ops.resize(1);
+    f.prog.buffers.resize(1);
+    f.kv.setup(f.prog.kv_groups, f.cfg.max_ctx, 4096, 64);
+    f.pc.groups = { 0 };
+    f.cfg.max_seqs = max_seqs;
+    f.prog.consumer = RadConsumerSuffix{ (uint32_t)sizeof(RadConsumerSuffix), 16, 4, 64 };
+    f.cfg.consumer_skip = 1;
+}
+
+struct CsRun {
+    int cut = 0, prefill_steps = 0, bad_full = 0, sampled_cut = 0, shared_cut = 0;
+    std::vector<int64_t> ckpts;   /* positions the snapshots were reserved at */
+    int64_t end = -1;             /* the target every prefill entry carried; -2 when they differed */
+};
+
+/* Runs every request the fixture holds to the end, checking each step's cut against the schedule
+ * for `target` (the chunk's last row) and collecting the checkpoints the steps reserve. */
+CsRun consumer_run(Fixture& f, uint64_t id, int64_t target) {
+    CsRun out;
+    const ConsumerShape shape{ 16, 4, 64, f.cfg.max_tok, f.sch.geometry().quantum };
+    const std::vector<int64_t> th = consumer_thresholds(shape, target);
+    for (int k = 0; k < 400; ++k) {
+        const RadBatch* b = f.sch.step();
+        if (!b) break;
+        const StepPlan& p = f.sch.plan();
+        for (const StepEntry& e : p.e) {
+            if (e.seq != id || !e.is_prefill) continue;
+            ++out.prefill_steps;
+            if (out.end == -1) out.end = e.consumer_end;
+            else if (out.end != e.consumer_end) out.end = -2;
+            if (e.ckpt_slot >= 0) out.ckpts.push_back((int64_t)e.ctx_len + e.ckpt_tok + 1);
+            const int32_t F = consumer_full_layers(shape, th, (int64_t)e.ctx_len + e.n_tokens - 1);
+            const int32_t want = p.e.size() == 1 && F < 16 ? F : 0;
+            if (b->consumer_full != want) ++out.bad_full;
+            if (b->consumer_full) {
+                ++out.cut;
+                if (b->consumer_end != target) ++out.bad_full;
+                if (e.produces_token || b->n_out) ++out.sampled_cut;
+                if (p.e.size() != 1) ++out.shared_cut;
+            }
+        }
+        if (b->consumer_full && (p.e.size() != 1 || !p.e[0].is_prefill)) ++out.shared_cut;
+        f.commit_plain();
+    }
+    return out;
+}
+
+}  /* namespace */
+
+/* A lone prompt with the prefix cache on: cut for its tail checkpoint (1072, a block short of
+ * 1100), every pass's F the schedule's, the snapshots at 256 .. 1024 not written (their windows
+ * are incomplete) and the one at the tail written; the prompt's last passes run every layer. */
+TEST(consumer_skip_cuts_a_lone_prefill_for_its_tail_checkpoint) {
+    Fixture f;
+    consumer_fixture(f, 16);
+    REQUIRE_EQ(f.start(), RAD_OK);
+    REQUIRE(f.sch.consumer_on());
+    REQUIRE(f.sch.geometry().window_ckpt);
+    CHECK_EQ(f.sch.geometry().quantum, 16);
+    const int64_t tail = f.sch.tail_checkpoint(1100);
+    CHECK_EQ(tail, 1072);
+    const uint64_t id = f.submit(1100, 1);
+    const CsRun r = consumer_run(f, id, tail);
+    CHECK_EQ(r.end, tail);
+    CHECK_EQ(r.prefill_steps, 69);
+    CHECK(r.cut > 30);
+    CHECK_EQ(r.bad_full, 0);
+    CHECK_EQ(r.sampled_cut, 0);
+    CHECK_EQ(r.shared_cut, 0);
+    CHECK(r.ckpts == std::vector<int64_t>({ tail }));
+    CHECK_EQ(f.pc.reserved, 1);
+    CHECK_EQ(f.sch.metrics().checkpoints_written, 1ll);
+    CHECK_EQ(f.sch.metrics().consumer_ckpt_dropped, 4ll);   /* 256, 512, 768, 1024 */
+    const BatchBuilder::ConsumerStats& cs = f.sch.consumer_stats();
+    CHECK_EQ(cs.cut, (uint64_t)r.cut);
+    CHECK_EQ(cs.passes, (uint64_t)r.prefill_steps);
+    CHECK_EQ(cs.shared, (uint64_t)0);
+    CHECK_EQ(cs.key, (uint64_t)r.cut);
+    CHECK_EQ(cs.full + cs.key + cs.skipped, (uint64_t)r.prefill_steps * 16);
+    CHECK(cs.skipped > 0);
+}
+
+/* Without the prefix cache no snapshot is written and the cut is for the prompt's end; the switch
+ * off, nothing is cut and every snapshot is written. */
+TEST(consumer_skip_targets_the_end_without_checkpoints_and_cuts_nothing_off) {
+    {
+        Fixture f;
+        consumer_fixture(f, 16);
+        f.cfg.prefix_cache = false;
+        REQUIRE_EQ(f.start(), RAD_OK);
+        REQUIRE(f.sch.consumer_on());
+        const uint64_t id = f.submit(700, 1);
+        const CsRun r = consumer_run(f, id, 700);
+        CHECK_EQ(r.end, 700);
+        CHECK(r.cut > 0);
+        CHECK_EQ(r.bad_full, 0);
+        CHECK(r.ckpts.empty());
+        CHECK_EQ(f.sch.metrics().consumer_ckpt_dropped, 0ll);
+    }
+    {
+        Fixture f;
+        consumer_fixture(f, 16);
+        f.cfg.consumer_skip = 0;
+        REQUIRE_EQ(f.start(), RAD_OK);
+        CHECK(!f.sch.consumer_on());
+        const uint64_t id = f.submit(1100, 1);
+        int cut = 0, written = 0;
+        for (int k = 0; k < 200; ++k) {
+            const RadBatch* b = f.sch.step();
+            if (!b) break;
+            cut += b->consumer_full != 0 || b->consumer_end != 0;
+            for (const StepEntry& e : f.sch.plan().e) {
+                CHECK_EQ(e.consumer_end, (int64_t)0);
+                written += e.seq == id && e.ckpt_slot >= 0;
+            }
+            f.commit_plain();
+        }
+        CHECK_EQ(cut, 0);
+        CHECK_EQ(written, 5);   /* 256, 512, 768, 1024 and the tail */
+    }
+}
+
+/* Two requests on a 16-token budget: a chunk the cut shortens holds the whole budget, so no step
+ * that carries a cut also carries anything else, and the second prompt is cut for its own tail. */
+TEST(consumer_skip_never_shares_a_cut_step) {
+    Fixture f;
+    consumer_fixture(f, 16, 4);
+    REQUIRE_EQ(f.start(), RAD_OK);
+    REQUIRE(f.sch.consumer_on());
+    const uint64_t a = f.submit(600, 12);
+    const uint64_t b = f.submit(900, 4);
+    int cut = 0, shared = 0, ends = 0;
+    for (int k = 0; k < 400; ++k) {
+        const RadBatch* rb = f.sch.step();
+        if (!rb) break;
+        const StepPlan& p = f.sch.plan();
+        if (rb->consumer_full) {
+            ++cut;
+            if (p.e.size() != 1 || !p.e[0].is_prefill || rb->n_out) ++shared;
+            ends += rb->consumer_end == f.sch.tail_checkpoint(p.e[0].seq == a ? 600 : 900);
+        }
+        f.commit_plain();
+    }
+    CHECK(cut > 20);
+    CHECK_EQ(shared, 0);
+    CHECK_EQ(ends, cut);
+    CHECK_EQ(f.sch.consumer_stats().shared, (uint64_t)0);
+    (void)b;
+}
+
+/* Refused, with every layer run, where the derivation does not reach. */
+TEST(consumer_skip_is_refused_where_its_derivation_does_not_reach) {
+    {   /* no declaration */
+        Fixture f;
+        consumer_fixture(f, 16);
+        f.prog.consumer = RadConsumerSuffix{};
+        REQUIRE_EQ(f.start(), RAD_OK);
+        CHECK(!f.sch.consumer_on());
+    }
+    {   /* concurrent sequences with chunks wider than the quantum, no prefill-alone steps */
+        Fixture f;
+        consumer_fixture(f, 64, 4);
+        REQUIRE_EQ(f.start(), RAD_OK);
+        CHECK(!f.sch.consumer_on());
+    }
+    {   /* speculation */
+        Fixture f;
+        consumer_fixture(f, 16);
+        f.cfg.n_spec = 2;
+        REQUIRE_EQ(f.start(), RAD_OK);
+        CHECK(!f.sch.consumer_on());
+    }
+    {   /* a declaration outside the derivation: the boundary at the last layer */
+        Fixture f;
+        consumer_fixture(f, 16);
+        f.prog.consumer.boundary = 15;   /* the last layer */
+        REQUIRE_EQ(f.start(), RAD_OK);
+        CHECK(!f.sch.consumer_on());
+    }
+    {   /* one sequence with wide chunks is covered */
+        Fixture f;
+        consumer_fixture(f, 64);
+        REQUIRE_EQ(f.start(), RAD_OK);
+        CHECK(f.sch.consumer_on());
+    }
+}
+
+/* The consumer skip in DeepSeek-V4.1's own shape (ds41_fixture: linear state beside the window, a
+ * state chunk of 1, 16-token chunks), with the prefix cache on, in both resume modes: a prompt is
+ * cut for the deepest snapshot its idle prefill writes, and that one is written, so every prompt
+ * that would have a snapshot keeps one. With --prefix-resume nearest the chunk before a prompt's
+ * last ends on the quantum boundary under its end and the last chunk starts there, so no tail
+ * snapshot is taken (plan_chunk only splits a final chunk for one): cutting for tail_checkpoint()
+ * dropped the interval snapshots below it and wrote none. With exact a prompt just past an
+ * interval boundary has no tail, and the boundary's snapshot is the deepest. Every pass's F is the
+ * schedule's for that target, nothing sampled is cut, and the snapshots below it are counted. */
+TEST(consumer_skip_in_ds41s_shape_keeps_the_deepest_snapshot_its_prefill_writes) {
+    int runs = 0, kept = 0, below_tail = 0;
+    for (const bool exact : { false, true }) {
+        for (const int64_t interval : { 16, 256, 2048 }) {
+            for (const int64_t n : { 19, 40, 255, 256, 257, 300, 1100, 2047, 2048, 2050, 2064, 2065,
+                                     3086 }) {
+                Fixture f;
+                ds41_fixture(f, interval);
+                f.cfg.prefix_exact = exact;
+                f.prog.consumer = RadConsumerSuffix{ (uint32_t)sizeof(RadConsumerSuffix), 16, 4, 64 };
+                f.cfg.consumer_skip = 1;
+                f.cfg.max_seqs = 1;
+                REQUIRE_EQ(f.start(), RAD_OK);
+                REQUIRE(f.sch.consumer_on());
+                REQUIRE_EQ(f.sch.geometry().quantum, 16);
+                CHECK(!f.sch.geometry().window_ckpt);
+                /* The snapshots an uncut idle prefill of the prompt writes. */
+                const Cut cold = cut_from(f.sch, 0, n, 16);
+                int64_t deepest = -1;
+                for (int64_t k : cold.ckpts) deepest = std::max(deepest, k);
+                const int64_t target = deepest > 0 ? deepest : n;
+                const uint64_t id = f.submit((int)n, 1);
+                REQUIRE(id != 0);
+                const CsRun r = consumer_run(f, id, target);
+                CHECK_EQ(r.end, target);
+                CHECK_EQ(r.bad_full, 0);
+                CHECK_EQ(r.sampled_cut, 0);
+                CHECK_EQ(r.shared_cut, 0);
+                CHECK(r.ckpts == (deepest > 0 ? std::vector<int64_t>{ deepest } : std::vector<int64_t>{}));
+                int64_t below = 0;
+                for (int64_t k : cold.ckpts) below += k < target;
+                CHECK_EQ(f.sch.metrics().consumer_ckpt_dropped, below);
+                CHECK_EQ(f.sch.metrics().checkpoints_written, deepest > 0 ? 1ll : 0ll);
+                ++runs;
+                kept += deepest > 0;
+                const int64_t tail = f.sch.tail_checkpoint(n);
+                below_tail += deepest > 0 && tail > 0 && deepest < tail;
+            }
+        }
+    }
+    CHECK_EQ(runs, 78);
+    CHECK(kept > 40);
+    CHECK(below_tail > 0);   /* where tail_checkpoint() named a snapshot no chunk writes */
+    /* The case the review found: nearest, interval 2048, 3,086 tokens: the tail rule names 3072,
+     * which the 16-token chunks never snapshot; the deepest written is 2048. */
+    {
+        Fixture f;
+        ds41_fixture(f, 2048);
+        f.cfg.prefix_exact = false;
+        f.prog.consumer = RadConsumerSuffix{ (uint32_t)sizeof(RadConsumerSuffix), 16, 4, 64 };
+        f.cfg.consumer_skip = 1;
+        f.cfg.max_seqs = 1;
+        REQUIRE_EQ(f.start(), RAD_OK);
+        CHECK_EQ(f.sch.tail_checkpoint(3086), 3072);
+        CHECK((cut_from(f.sch, 0, 3086, 16).ckpts == std::vector<int64_t>{ 2048 }));
+        const uint64_t id = f.submit(3086, 1);
+        const CsRun r = consumer_run(f, id, 2048);
+        CHECK_EQ(r.end, 2048);
+        CHECK(r.ckpts == std::vector<int64_t>{ 2048 });
+        CHECK(r.cut > 100);
+    }
+}
+
+/* Without the prefix cache a prompt is cut for its end, and the snapshots a model with linear
+ * state still proposes (the store refuses them all) are not counted as dropped. */
+TEST(consumer_skip_without_the_prefix_cache_counts_no_dropped_snapshot) {
+    for (const bool exact : { false, true }) {
+        Fixture f;
+        ds41_fixture(f, 2048);
+        f.cfg.prefix_exact = exact;
+        f.cfg.prefix_cache = false;
+        f.prog.consumer = RadConsumerSuffix{ (uint32_t)sizeof(RadConsumerSuffix), 16, 4, 64 };
+        f.cfg.consumer_skip = 1;
+        f.cfg.max_seqs = 1;
+        REQUIRE_EQ(f.start(), RAD_OK);
+        REQUIRE(f.sch.consumer_on());
+        CHECK(f.sch.geometry().checkpoints());   /* linear state: proposed without the cache too */
+        const uint64_t id = f.submit(3086, 1);
+        const CsRun r = consumer_run(f, id, 3086);
+        CHECK_EQ(r.end, 3086);
+        CHECK_EQ(r.bad_full, 0);
+        CHECK(r.ckpts.empty());
+        CHECK(r.cut > 150);
+        CHECK_EQ(f.sch.metrics().consumer_ckpt_dropped, 0ll);
+    }
+}
+
+/* Refused where the ranks would not cut alike (a rank whose declaration differs from rank 0's),
+ * and with KV streaming. */
+TEST(consumer_skip_is_refused_for_unlike_ranks_and_kv_streaming) {
+    {   /* rank 1 declared another window */
+        Fixture f;
+        consumer_fixture(f, 16);
+        Program other = f.prog;
+        other.consumer.window = 32;
+        std::vector<BatchBuilder::RankIO> rio;
+        rio.push_back({ 0, nullptr, &f.prog });
+        rio.push_back({ 0, nullptr, &other });
+        REQUIRE_EQ(f.sch.init(f.prog, f.cfg, &f.kv, &f.pc, rio, nullptr, nullptr), RAD_OK);
+        CHECK(!f.sch.consumer_on());
+    }
+    {   /* rank 1 declared none */
+        Fixture f;
+        consumer_fixture(f, 16);
+        Program other = f.prog;
+        other.consumer = RadConsumerSuffix{};
+        std::vector<BatchBuilder::RankIO> rio;
+        rio.push_back({ 0, nullptr, &f.prog });
+        rio.push_back({ 0, nullptr, &other });
+        REQUIRE_EQ(f.sch.init(f.prog, f.cfg, &f.kv, &f.pc, rio, nullptr, nullptr), RAD_OK);
+        CHECK(!f.sch.consumer_on());
+    }
+    {   /* two ranks alike are covered */
+        Fixture f;
+        consumer_fixture(f, 16);
+        Program other = f.prog;
+        std::vector<BatchBuilder::RankIO> rio;
+        rio.push_back({ 0, nullptr, &f.prog });
+        rio.push_back({ 0, nullptr, &other });
+        REQUIRE_EQ(f.sch.init(f.prog, f.cfg, &f.kv, &f.pc, rio, nullptr, nullptr), RAD_OK);
+        CHECK(f.sch.consumer_on());
+    }
+    {   /* --kv-resident */
+        Fixture f;
+        consumer_fixture(f, 16);
+        f.cfg.kv_resident = 1024;
+        REQUIRE_EQ(f.start(), RAD_OK);
+        CHECK(!f.sch.consumer_on());
     }
 }

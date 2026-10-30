@@ -1,7 +1,0 @@
-RAM_ADMISSION MemAvailable=12378710016
-I device: host backend, 1 device(s) [0:host]
-I chunk geometry: quantum 4 (attn block 4, state chunk 1), checkpoint interval 0, max_tok 4 -> prefill chunks of at most 4
-E --max-num-batched-tokens is 4 but this model's chunk geometry needs at least 8, so a chunk can end on a linear-state boundary: attn_block=8 from synthetic metadata4-page
-I draft floor: 1 paged group(s), 0 prefix-cached -> a hit leaves a hole in a drafter's own KV
-I step batch: 27.96 KiB pinned staging ring + 9.00 KiB device slab a rank (3.00 KiB of it block tables), 2 KV group(s), 0 derived buffer(s)
-PASS normal4 HOST metadata/Scheduler/protocol: 3 groups 2036 checks 24 refusals; no actual source/model/GPU proof

@@ -30,24 +30,32 @@
  * launch that could name the slot has retired.
  */
 #pragma once
+#include "prefetch_trace.h"
 #include "../device/device.h"
 #include "../device/directio.h"
 #include "../mem/pools.h"
 #include "heat.h"
+#include "native_file_cache.h"
+#include "native_mapped_file_cache.h"
+#include <array>
+#include "native_read_workers.h"
 #include "planner.h"
+#include "plane_mirror.h"
+#include "readahead.h"
 #include "residency_iface.h"
-#include "record_session.h"
-#include "../build/tiny_component_quotes.h"
-#include "../build/tiny_startup.h"
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <functional>
 #include <string>
 #include <vector>
+#include <sys/stat.h>
+
+namespace ds41hx { struct PackCopy; }
 
 namespace rad {
-class CachePrepare4RankBinding;
+class DsparkRadBanks; //borrowed immutable two-bank directory/epoch owner
 
 /* ------------------------------------------------------------------ slot bookkeeping */
 /* Free-list bookkeeping for the VRAM slab and the pinned host pool. Pure host state, testable
@@ -68,8 +76,6 @@ class CachePrepare4RankBinding;
  */
 class SlotPool {
 public:
-    // Actual private bookkeeping size for the pure sealed-startup quote.
-    static constexpr size_t tiny_segment_bytes() noexcept { return sizeof(Seg); }
     /* Segment 0 starts with `n_live` slots, all held (the plan's resident set) until add_free()
      * releases them. `n_cap` is how far segment 0 may grow into address space the caller has
      * reserved and backs on demand; the default is no growth. */
@@ -237,7 +243,10 @@ public:
      * whose latency cannot be budgeted. */
     int  open(const std::string& path);
     bool ok() const { return f_.is_open(); }
-    void close() { f_.close(); }
+    int borrowed_fd_for_owner_identity() const { return f_.fd(); }
+    void close() { f_.close(); epoch_ready_ = false; }
+    int remember_epoch();
+    bool same_epoch() const;
 
     /* One expert-sized read into a pinned buffer. Blocking and counted: a dispatch that meets a
      * file-tier unit stalls until the read returns. This is the cost the plan accepted by putting
@@ -250,14 +259,14 @@ public:
 
 private:
     DirectFile f_;
+    struct stat epoch_{};
+    bool epoch_ready_ = false;
 };
 
 /* ------------------------------------------------------------------ residency */
 class Residency final : public ResidencyTable {
 public:
     void init(const Program& prog);
-    const NativeInventory* native_inventory()const override{return native_authority_;}
-    void set_native_inventory(const NativeInventory* p){native_authority_=p;}
 
     const WeightSlot* lookup(rad_weight w) const override {
         return (size_t)w < slot_.size() ? &slot_[w] : nullptr;
@@ -275,8 +284,6 @@ public:
      * skipped (residency_iface.h). */
     void publish(rad_weight w, void* ptr) { begin_transfer(w, ptr, nullptr); }
     void begin_transfer(rad_weight w, void* ptr, RadEvent ready);
-    int reserve_record_changes();
-    bool record_batch_ready(std::span<const rad_weight>,bool known_unique=false) const;
     void settle(rad_weight w) {
         if ((size_t)w >= slot_.size()) return;
         slot_[w].ready = nullptr;
@@ -290,7 +297,6 @@ private:
         changed_.push_back(w);
     }
 
-    const NativeInventory* native_authority_=nullptr;
     std::vector<WeightSlot> slot_;
     uint64_t                epoch_ = 1;
     std::vector<rad_weight> changed_;
@@ -318,14 +324,16 @@ struct MoverConfig {
     /* The container, for the file tier. Empty means no file tier; a unit planned there is then
      * an error. */
     std::string container_path;
+    /* Optional immutable source owner. Must outlive Mover and every checked copy/lease drain.
+     * Empty preserves the single-container path. Committed only after old cache retirement. */
+    const DsparkRadBanks* source_banks = nullptr;
     /* Pinned staging buffers for file-tier reads, one class stride each; the count the planner
      * charged to --host-pool-mib. */
     int stage_slots = RAD_PLACE_FILE_STAGE_SLOTS;
-    // Internal sealed transport only. The admission and its tickets outlive this
-    // Mover. Null preserves ordinary stream creation/retirement behavior.
-    TinyBudget* tiny_budget = nullptr;
-    CachePrepare4RankBinding* glm_main_binding=nullptr;
-    int glm_main_device=-1; // actual device, never inferred from logical rank
+    /* Native RAM cache capacity for THIS rank, including its entry metadata. Zero disables it.
+     * Engine divides the configured server-wide capacity; it is separate from the fixed pool. */
+    int64_t native_file_cache_bytes = 0;
+    int native_cache_allocation_device = 0; //Engine actual device, never EP rank ordinal
 };
 
 /* ------------------------------------------------------------------ the loan */
@@ -363,17 +371,23 @@ struct MoverStats {
      * for a window's copies to drain. */
     uint64_t file_layers = 0, file_units = 0, file_bytes = 0, file_preads = 0;
     uint64_t file_read_ns = 0, file_wait_ns = 0;
+    /* Units a routed-only read left unread (alias_file_units): the pass did not route to them. */
+    uint64_t file_aliased = 0;
+    /* File-tier weights relaid on the read (Mover::set_file_relayout), and the issuing thread's
+     * time in those reads and relayouts, which run on several threads at once. */
+    uint64_t file_relaid = 0, file_relaid_bytes = 0, file_relayout_ns = 0;
+    uint64_t mapped_source_copies = 0, mapped_source_bytes = 0;
+    /* Existing read-only prefill accounting, aggregated after reader retirement. */
+    uint64_t file_prefill_ro_hits = 0, file_prefill_ro_hit_bytes = 0;
+    uint64_t file_prefill_ro_misses = 0, file_prefill_ro_miss_bytes = 0;
 };
 
 /* ------------------------------------------------------------------ the mover */
+struct NativeMappedMoverHostTest;
 class Mover {
+    friend struct NativeMappedMoverHostTest; //private HOST-only fixture seam
+    friend class Engine; //drain mapped source consumers before Engine tears down arenas/events
 public:
-    // Actual bounded private bookkeeping/event quote; pool backings and the
-    // backend TinyStream reservation are charged separately. No allocation/I/O.
-    static int tiny_startup_quote(const Program&,const Plan&,const MoverConfig&,
-                                  TinyStorageQuote*) noexcept;
-    static int glm_main_startup_quote(const Program&,const Plan&,TinyStorageQuote*) noexcept;
-    void glm_main_retire_or_fail() noexcept;
     ~Mover();
     Mover() = default;
     Mover(const Mover&) = delete;
@@ -390,10 +404,6 @@ public:
     /* The compute stream this rank issues on. Transfers are ordered against it and the
      * quarantine barrier is recorded on it; without one the mover refuses to move. */
     int bind_compute_stream(RadStream s);
-    // Internal tiny teardown barrier, before owner/Ctx/storage retirement. This
-    // proves real stream retirement, not success of a prior operation. Ordinary
-    // Mover users retain their existing behavior when tiny_budget is null.
-    void tiny_retire_or_fail() noexcept;
 
     /* The mover's stream, to be shared by any subsystem moving bytes off the critical path. Each
      * HIP stream costs a hardware queue, and on RDNA4 a fourth one is expensive: on two R9700s
@@ -405,12 +415,14 @@ public:
      * The run phase issues here too, so a sharer's large copy delays transfers the compute stream
      * waits on; gate the two rather than add a queue. */
     RadStream transfer_stream() const { return mover_; }
+    //Private fixed-head tail owner validates BOTH immutable source banks on warm reuse too.
+    bool source_epochs_current() const { return source_file_epoch(); }
 
     ResidencyTable* residency() { return &res_; }
     /* For Tier::Mapped weights, which live in the container mapping the load phase holds: the
      * one address the mover does not own, recorded so the residency table stays the only record
      * of weight addresses. A mapped unit has no slab class, so nothing republishes over it. */
-    void publish_mapped(rad_weight w, void* p) { if (!record_session_.token && !(plan_ && plan_->native_inventory)) res_.publish(w, p); }
+    void publish_mapped(rad_weight w, void* p) { res_.publish(w, p); }
 
     /* ---- the run phase, in the order a layer dispatch calls it -----------------------------
      *
@@ -563,48 +575,222 @@ public:
      *                   thread.
      * file_buffer       buffer 0 or 1 of the plan's two, or null when the plan has none. */
     int   stage_file_units(const std::vector<int32_t>& units, char* dst, int64_t cap,
-                           RadEvent after, RadEvent done, std::vector<int32_t>* staged);
+                           RadEvent after, RadEvent done, std::vector<int32_t>* staged,
+                           NativeFileCacheReadPolicy policy = NativeFileCacheReadPolicy::Normal,
+                           M1PrefetchTrace trace = {});
+    void prefetch_trace_route(const M1PrefetchTrace& trace, const int32_t* counts, size_t SSD_units);
+    void prefetch_trace_stage_done(const M1PrefetchTrace& trace, int status);
+    /* alias_file_units  publishes every file-tier weight of `units` at `base` without reading
+     *                   it, for experts a pass does not route to: the grouped GEMM is handed
+     *                   every expert's pointer and reads none of a zero-row expert's bytes, so
+     *                   the pointer only has to name memory the card owns (the file buffer, at
+     *                   least one unit long). Appends them to `staged`; unstage_units takes them
+     *                   back like read ones. */
+    void  alias_file_units(const std::vector<int32_t>& units, char* base,
+                           std::vector<int32_t>* staged);
+    /* borrow_host_unit  for a reader on the host (place/host_expert_pool.h): when the mapped RAM
+     *                   cache holds every weight of file-tier unit `u`, a lease on each, which
+     *                   keeps its bytes in place until release_host_unit, and their host
+     *                   addresses in the unit's weight order. False, with nothing held, when a
+     *                   weight is not cached or the cache is off. Borrowing touches the entries,
+     *                   as a staged read does. `bytes` is each weight's stored (block_mxfp4) size;
+     *                   with the packed cache (packed_cache()) the slots hold the packed form
+     *                   instead, `slot` bytes each (ds41_host_experts.h packed_view). */
+    struct HostUnit {
+        int32_t        unit = -1;
+        int            n = 0;
+        bool           packed = false;
+        const uint8_t* host[2] = { nullptr, nullptr };
+        int64_t        bytes[2] = { 0, 0 };
+        int64_t        slot[2] = { 0, 0 };
+        NativeMappedFileCache::Lease lease[2];
+    };
+    bool  borrow_host_unit(int32_t u, HostUnit* out);
+    void  release_host_unit(HostUnit* hu);
+    /* read_unit_planes  for a host reader of units the RAM cache misses: reads each unit's
+     *                   weights from the container as the release stores them (codes and scales
+     *                   planes, no relayout, no cache) into buffers the HostPlanes owns, every
+     *                   weight of every unit on its own thread at once. False when a unit is not
+     *                   a plain file-tier ggml_mxfp4 pair or a read fails.
+     * insert_unit_planes relays one unit's planes into the stored form and admits it into the
+     *                   mapped RAM cache, so a later pass hits; thread-safe (relayouts are pure,
+     *                   the cache locks), for a thread beside the issuing one. */
+    struct HostPlanes {
+        int32_t        unit = -1;
+        int            n = 0;
+        rad_weight     w[2] = { 0, 0 };
+        int64_t        rows[2] = { 0, 0 }, cols[2] = { 0, 0 };   /* elements */
+        const uint8_t* codes[2] = { nullptr, nullptr };
+        const uint8_t* scales[2] = { nullptr, nullptr };
+        uint8_t*       buf[2] = { nullptr, nullptr };
+        int64_t        cap[2] = { 0, 0 };
+        int64_t        a0[2] = { 0, 0 }, len[2] = { 0, 0 };     /* file range read */
+        HostPlanes() = default;
+        HostPlanes(const HostPlanes&) = delete;
+        HostPlanes& operator=(const HostPlanes&) = delete;
+        ~HostPlanes() { for (uint8_t* b : buf) std::free(b); }
+    };
+    /* One read_unit_planes call's timing, in ns from its dispatch (the readers handed the reads),
+     * for the CPU path's counters: which leg lands last, the mirror's copy out of its bounce
+     * buffer, the readers' start and the caller's return (RESEARCH-2-RANKED-PLAN #7's gates). */
+    struct PlaneReadTiming {
+        int     units = 0, reads = 0;
+        int     mirror_reads = 0;   /* the mirror's tail reads (pieces, with ..._MIRROR_SPLIT) */
+        bool    posted = false;     /* start_unit_planes .. finish_unit_planes */
+        int64_t first_ns = 0;       /* the first read begun */
+        int64_t first_container_ns = 0, last_start_ns = 0;   /* the first container read, the last of all, begun */
+        int64_t container_ns = 0;   /* the last container read landed (0: none) */
+        int64_t mirror_ns = 0;      /* the last mirror read landed, its copy included (0: none) */
+        int64_t copy_ns = 0;        /* the longest mirror copy (pieces copy at once) */
+        int64_t copy_sum_ns = 0;    /* the mirror copies, summed */
+        int64_t join_ns = 0;        /* posted: the caller came to wait (finish_unit_planes) */
+        int64_t return_ns = 0;      /* the caller back, every read landed */
+        int64_t t0_ns = 0;          /* the dispatch itself (steady clock ns) */
+        /* Units read past bytes they had in already (PlanesIn: a read-ahead's rest), of them those
+         * whose rest the plane mirror read part of, and the bytes read for them, of those the plane
+         * mirror's. */
+        int     rest = 0, rest_mirror = 0;
+        int64_t rest_bytes = 0, rest_mirror_bytes = 0;
+    };
+    /* A unit whose planes are partly in already (a read-ahead's pieces, readahead.h): the first
+     * bytes[k] of weight k's extent -- [a0, a0 + len) as lay_out_unit_planes laid it out -- are
+     * read, or being read, by someone else, and a call reads only the rest of each extent, into
+     * the same places; each is 0, a multiple of the O_DIRECT alignment, or the whole extent. All
+     * zero: the whole unit, as without. */
+    struct PlanesIn { int64_t bytes[2] = { 0, 0 }; };
+    /* `rows`: the pass's tokens, which decide whether the plane mirror takes a share. `in` (one a
+     * unit, or null for none): what each unit has in already; `rest_mirror`: the plane mirror
+     * takes its decode share of such a unit's rest (rest_mirror_tail), else the rest is read from
+     * the container alone (RADIANCE_EXPERIMENTAL_DS41_PREFETCH_URGENT=2 / 1). A unit with bytes
+     * in must be laid out where they are (its buffers big enough already): it is never moved.
+     * `hook`: a call on the issuing thread while it waits for the kept readers, its at_ns counted
+     * from the call's dispatch (NativeReadWorkers::WaitHook; the CPU pool's pre-wake, stager.h
+     * hx_wake_*); none on the threads-a-call fallback. */
+    using ReadWaitHook = NativeReadWorkers::WaitHook;
+    bool  read_unit_planes(HostPlanes* const* units, int n, int rows = 1, PlaneReadTiming* timing = nullptr,
+                           const PlanesIn* in = nullptr, bool rest_mirror = false,
+                           const ReadWaitHook* hook = nullptr);
+    /* read_unit_planes in two halves, for the issuing thread (RADIANCE_EXPERIMENTAL_DS41_MISS_POST):
+     * start_unit_planes hands the reads to the kept readers and returns at once, so they run while
+     * the caller goes on (the pool's jobs for the cached units); finish_unit_planes reads whatever
+     * no reader has begun, waits for the rest and returns what read_unit_planes would have. False
+     * from start: nothing started (one already in flight, no kept readers, the readers busy with
+     * another thread's read_unit_planes -- start never waits for them -- or a unit not eligible),
+     * read as before. One call in flight a Mover; the same thread calls both, and calls nothing
+     * else that reads planes between them; the units' buffers stay put until the finish. */
+    bool  start_unit_planes(HostPlanes* const* units, int n, int rows, const PlanesIn* in = nullptr,
+                            bool rest_mirror = false);
+    bool  finish_unit_planes(PlaneReadTiming* timing = nullptr, const ReadWaitHook* hook = nullptr);
+    /* One read of a weight's extent, in bytes from its a0: the container's, or the plane mirror's
+     * copy of the same bytes (mirror). */
+    struct PlaneSpan { int64_t off = 0, len = 0; bool mirror = false; };
+    /* The reads of an extent of `len` bytes whose first `in` are in already, the plane mirror
+     * taking [end - tail, end) (end: its codes plane's end; tail 0: no mirror): the container's
+     * head up to the mirror's part, the mirror's part, the container's tail past `end`, each only
+     * where bytes are left, into out in that order. Returns how many (0: nothing left). With
+     * nothing in, the reads read_unit_planes has always made of a whole extent. */
+    static int plane_spans(int64_t len, int64_t in, int64_t end, int64_t tail, PlaneSpan out[3]);
+    /* The mirror's part of a unit's rest (RADIANCE_EXPERIMENTAL_DS41_PREFETCH_URGENT=2): the decode
+     * tail `tail` scaled by the share of the unit's `total` bytes still to read (`left`), at most
+     * the mirrored w3 codes (`w3` bytes ending at `end`) past `in`, rounded down to `align`. */
+    static int64_t rest_mirror_tail(int64_t tail, int64_t left, int64_t total, int64_t in,
+                                    int64_t end, int64_t w3, int64_t align);
+    bool  unit_planes_started() const { return plane_posted_; }
+    bool  host_planes_eligible(int32_t u) const;   /* what read_unit_planes accepts */
+    /* lay_out_unit_planes  for a read-ahead (readahead.h): unit p->unit laid out in p exactly as
+     *                      read_unit_planes lays it out before reading, and each weight's container
+     *                      extent in ext[0..1] (the whole extent, from the container: no mirror).
+     *                      Reads nothing and reads only the plan and the program, so a thread
+     *                      beside the issuing one may call it. False when read_unit_planes would
+     *                      refuse the unit's weights.
+     * read_piece           one O_DIRECT read of [off, off + len) of container `file` into dst (cap
+     *                      bytes there), as read_unit_planes reads an extent; thread-safe.
+     * decode_mirror_bytes  the bytes of a missed unit a one-token pass reads from the plane mirror
+     *                      instead of the container (0 with no mirror, or one turned off). */
+    bool  lay_out_unit_planes(HostPlanes* p, PlaneExtent ext[2]);
+    int   read_piece(uint32_t file, int64_t off, int64_t len, void* dst, int64_t cap);
+    int64_t decode_mirror_bytes() const;
+    /* read_weight_file  a whole weight as the container holds it (every row on this rank) into
+     *                   dst, weight_file_bytes(w) long (rad_core.h), for a host reader such as
+     *                   the router predictor: a weight stored as is, or the one plane a kernel's
+     *                   relayout read (an f32 router gemm_nt_f32bf16 keeps as its bf16 halves). */
+    bool  read_weight_file(const WeightInfo& w, void* dst);
+    bool  mapped_cache_on() const { return mapped_file_cache_on_; }
+    int64_t mapped_cache_bytes() const { return mapped_file_cache_on_ ? cfg_.native_file_cache_bytes : 0; }
+    /* The host memory the mapped cache holds now, against its mapped_cache_bytes() budget: its
+     * slabs' backing (every slab once ..._PREGROW pinned them at init, the grown ones otherwise),
+     * or the entries' payload without slabs. 0 with the cache off. Engine::host_headroom_bytes
+     * stops reserving it twice (RADIANCE_EXPERIMENTAL_CACHE_HEADROOM_BACKED). */
+    int64_t mapped_cache_backed_bytes() const;
+    /* RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE=1 (slabs only): the mapped cache holds the routed
+     * experts in the CPU-only packed form (tools/ds41-host-experts/ds41_host_experts.h), which only
+     * borrow_host_unit's readers can use: the card's copy path neither reads nor fills it. The
+     * file stager refuses it unless the CPU computes every routed unit (..._FILE_BUFFER_UNITS).
+     * ..._PACKED_CACHE_RAW=<gate_up>,<down>: the raw rounds a slot holds (see mover.cpp). */
+    bool  packed_cache() const { return mapped_file_cache_on_ && mapped_file_cache_.packed(); }
+    /* One gate_up and one down slot of the mapped cache's slabs, with their guards. */
+    int64_t mapped_pair_bytes() const;
+    /* Pins the mapped cache's slabs (as ..._PREGROW does; again adds nothing) and returns the
+     * pairs it can hold: the fewer of its gate_up and down slots. 0 without slabs. */
+    int64_t mapped_cache_pregrow();
+    /* Marks `units` profile-hot in the mapped cache and gives each such entry `chances` moves to the
+     * front between uses before an insert may evict it (0: plain LRU). The units marked. */
+    int     mapped_cache_second_chances(const std::vector<int32_t>& units, int chances);
+    /* Whether the mapped RAM cache holds every weight of unit u, without touching it. */
+    bool  unit_cached(int32_t u);
+    /* unit_cached for n units under one lock of the cache (out[i] 0/1): the routing trace's
+     * residency snapshot (route_trace.h). */
+    void  units_cached(const int32_t* units, int n, uint8_t* out);
+    /* `copy`: how the packed cache's insert writes each weight's codes plane (ds41hx::PackCopy:
+     * non-temporal stores, pieces, a hook before each; the background inserts' ..._INSERT_NT and
+     * ..._INSERT_SLICE_KIB). The slot's bytes are the same; a block_mxfp4 cache ignores it. */
+    int   insert_unit_planes(const HostPlanes& p, std::vector<uint8_t>* scratch,
+                             const ds41hx::PackCopy* copy = nullptr);
+    /* The packed cache's outcomes, all ranks' threads: weights packed and published; units not
+     * cached because a weight had more raw rounds than its slot takes (attempts, and distinct
+     * units); weights whose packed scales failed the round trip (never published). */
+    struct PackedStats { uint64_t inserted = 0, over_budget = 0, over_budget_units = 0, round_trip_failed = 0; };
+    PackedStats packed_stats() const;
+    /* The packed cache refused unit u over its raw-round budget (at least once: a refusal is the
+     * unit's for good, its scales decide it). */
+    bool packed_refused(int32_t u) const {
+        return packed_refused_ && u >= 0 && (size_t)u < unit_.size() &&
+               packed_refused_[(size_t)u].load(std::memory_order_relaxed) != 0;
+    }
+    /* retire_file_windows  gives back the RAM-cache leases the read windows keep for their last
+     *                      copies, for a caller that knows those copies are done (the file
+     *                      stager, past a routing sync the card reached after them). A window
+     *                      otherwise keeps them until it comes round again; when the windows sit
+     *                      idle -- the CPU takes the misses -- the held entries drift to their
+     *                      class's LRU tail, where each one turns every admission away. */
+    int   retire_file_windows();
+    /* mirror_init  once the plan is known: maps every file-tier unit's gate_up codes to the
+     *              plane mirror's copy (place/plane_mirror.h) and samples units against the
+     *              container; from then on read_unit_planes reads each gate_up codes plane's tail
+     *              from the mirror beside the container. Nothing when no mirror is configured, and
+     *              a mismatch turns it off for this rank. */
+    int   mirror_init();
+    /* set_file_relayout  the function that makes a file-tier weight's stored form from its
+     *                    container planes when the two differ (weight_file_relaid): the kernel's
+     *                    relayout, as the loader's relayout pool calls it once for a resident
+     *                    weight. Every read of such a weight -- a staging slot (stage) or the
+     *                    file stager -- reads its planes into a host input, relays them into the
+     *                    pinned memory the copy to the card reads (the staging slot, or a read
+     *                    window), and copies as usual. Must be pure and thread-safe: the file
+     *                    stager relays a window's weights on several threads. Set before init;
+     *                    without it a plan with such a weight on the file tier is refused. */
+    using FileRelayout = std::function<int(const WeightInfo& w, const RadTensor* planes,
+                                           void* dst, int64_t dst_bytes)>;
+    void  set_file_relayout(FileRelayout fn) { relayout_ = std::move(fn); }
     char* file_buffer(int i) const {
         return (file_vram_ && (i == 0 || i == 1)) ? file_vram_ + i * file_buf_bytes_ : nullptr;
     }
     int64_t file_buffer_bytes() const { return file_vram_ ? file_buf_bytes_ : 0; }
 
-    // Experimental static bounded record-owner capability, not a native-store loader tier.
-    // Original unit allocations remain charged. Close only AFTER Ctx/WTAB shutdown.
-    bool record_plan_matches(const Program& p,const Plan& plan) const { return prog_ == &p && plan_ == &plan; }
-    int record_session_open(std::span<const RecordClaim>,std::span<const RecordRegion>,uint64_t* token);
-    int record_publish(uint64_t,std::span<const RecordPublication>);
-    int record_restore(uint64_t); // both stream drains before whole-batch sentinel restore
-    int record_session_close(uint64_t);
-    uint64_t record_base_allocation_bytes() const;
-    // Native-only B2 capability: regions are carved/charged by Mover from typed Pools.
-    int native_record_session_open(uint64_t* token);
-    int native_record_upload(uint64_t,int32_t unit,int32_t region,std::span<const std::byte>);
-    // Explicit READY fence for a sealed native session: validate the exact current
-    // publication/generations, finish the REAL transfer stream, then revalidate.
-    // No compute drain, unpublish, lease release, or region reuse is authorized.
-    int native_record_wait_prepared(uint64_t,std::span<const RecordPublication>);
-    int native_record_guards_host() const;
-    // Test-only TinyAqlV1: bounded caller-owned mapped readback, both streams drained.
-    int native_record_guards_aql(void* host,void* device,int64_t bytes,RadStream) const;
-    RadStream native_record_compute_stream() const { return compute_; }
-    std::span<const RecordRegion> native_record_regions() const { return native_regions_; }
-
-
     const MoverStats& stats() const { return stats_; }
     std::string report() const;
 
 private:
-    int native_record_init();
-    void* native_sentinel(int32_t unit) const;
-    bool native_closed_=false;
-    std::vector<RecordRegion> native_regions_;
-    std::vector<char*> native_landing_,native_landing_device_,native_device_allocation_,native_host_allocation_;
-    std::vector<rad_weight> native_weights_;
-    std::vector<int32_t> native_uploaded_unit_;
-    std::vector<uint8_t> native_region_busy_;
-    RecordSession record_session_;
-    uint64_t record_next_token_ = 0;
     /* One in-flight relocation: Free -> Copying -> Published -> Quarantine -> Free. Transfers
      * are asynchronous; every transition is made by the dispatch thread at a layer boundary. No
      * mutex on the read side (it is on every layer's critical path) and no background thread,
@@ -688,8 +874,7 @@ private:
      * reservation belongs to the Pool; freeing it here would be a double free. */
     bool           owns_memory_ = false;
 
-    TinyStream tiny_stream_; // owns ONLY the sealed tiny transfer stream
-    RadStream mover_ = nullptr; // borrowed from tiny_stream_ in that profile
+    RadStream mover_ = nullptr;
     RadStream compute_ = nullptr;
     RadEvent  gate_ = nullptr;          /* recorded on compute, waited on by the mover stream */
     std::vector<RadCopySeg> stage_segs_;   /* stage_units' list, kept so a layer allocates nothing */
@@ -729,6 +914,9 @@ private:
     int64_t pageable_bytes_ = 0;
 
     FileTier file_;
+    FileTier draft_file_;
+    bool source_file_epoch() const;
+    int read_source_file(uint32_t bank,uint64_t offset,int64_t bytes,void*dst,int64_t cap);
     void*    stage_ = nullptr;          /* pinned staging ring for file-tier reads */
     int64_t  stage_stride_ = 0;
     int      stage_next_ = 0;
@@ -737,6 +925,107 @@ private:
      * through, each with the event behind the copies out of it. */
     char*    file_vram_ = nullptr;
     int64_t  file_buf_bytes_ = 0;
+    /* The file tier's relayout (set_file_relayout): a host input per thread, which holds the
+     * planes' aligned span as read. */
+    struct RelayIn {
+        uint8_t* p = nullptr;
+        int64_t  cap = 0;
+        RelayIn() = default;
+        RelayIn(RelayIn&& o) noexcept : p(o.p), cap(o.cap) { o.p = nullptr; o.cap = 0; }
+        RelayIn(const RelayIn&) = delete;
+        ~RelayIn() { std::free(p); }
+    };
+    struct Relaid { const WeightInfo* w; char* dst; M1PrefetchTrace trace{}; };
+    FileRelayout         relayout_;
+    NativeFileCache      native_file_cache_;
+    //Allocator context must outlive every window lease. Destruction drains explicitly first.
+    NativeMappedFileCache mapped_file_cache_;
+    bool mapped_file_cache_on_ = false;
+    bool mapped_direct_fill_on_ = false; // captured at init; only slab/Normal/routed leases
+    static constexpr size_t kMappedPerWindow = size_t(RAD_PLACE_FILE_WINDOW_BYTES) / NativeMappedFileCache::DN;
+    struct MappedWindow {
+        std::array<NativeMappedFileCache::Lease,kMappedPerWindow> leases;
+        bool copy_may_be_queued = false;
+    };
+    std::array<MappedWindow,RAD_PLACE_FILE_WINDOWS> mapped_windows_;
+    struct MappedCopyHooks {
+        void* context = nullptr;
+        int (*copy)(void*,void*,const void*,int64_t,RadStream) = nullptr;
+        int (*record)(void*,RadEvent,RadStream) = nullptr;
+        int (*sync)(void*,RadEvent) = nullptr;
+        int (*drain)(void*,RadStream) = nullptr;
+    } mapped_copy_hooks_; //only the friend fixture can change these; default real device API
+    static bool mapped_file_eligible(const WeightInfo& w);
+    int mapped_file_drain();
+    int retire_file_window(int window);
+    int file_copy_event_record(RadEvent event);
+    int file_copy_event_sync(RadEvent event);
+    int file_copy_stream_sync();
+    int mapped_copy_to_vram(void* dst,const void* src,int64_t bytes);
+    bool                 native_file_cache_on_ = false;
+    std::vector<RelayIn> relay_in_;
+    int                  relay_threads_ = 1;
+    NativeReadWorkers    relay_workers_;
+    /* read_unit_planes' readers: kept, so a miss starts no threads and a mirror read finds its
+     * thread's bounce buffer warm (RADIANCE_EXPERIMENTAL_DS41_READ_POOL=0: a thread a read, as
+     * before). */
+    NativeReadWorkers    plane_workers_;
+    /* One read_unit_planes call: its reads, which the readers take in order (the mirror's first:
+     * they take the longest), each read's outcome and when it began and landed (ns from t0, the
+     * dispatch). The reader is operator(); a posted call (start_unit_planes) lives in plane_call_
+     * until its finish. */
+    struct PlaneCall {
+        struct Read {
+            uint32_t file = 0; int64_t off = 0, len = 0; uint8_t* dst = nullptr; int64_t cap = 0;
+            const PlaneMirror::Ref* m = nullptr; uint64_t from = 0;   /* m: the mirror's bytes [from, from+len) */
+            int rc = 0;
+            int64_t start_ns = 0, end_ns = 0, copy_ns = 0;
+        };
+        Mover* mover = nullptr;
+        PlaneMirror* mirror = nullptr;
+        std::vector<Read> reads;
+        std::atomic<size_t> next{ 0 };
+        int weights = 0, units = 0;
+        int rest = 0, rest_mirror = 0;                   /* PlaneReadTiming::rest, rest_mirror */
+        int64_t rest_bytes = 0, rest_mirror_bytes = 0;   /* ...and its bytes */
+        bool posted = false;
+        int64_t t0 = 0;        /* steady_clock ns: the dispatch */
+        int64_t join_ns = 0;   /* posted: the caller came to wait, from t0 */
+        void operator()(int);
+    };
+    PlaneCall plane_call_;
+    bool      plane_posted_ = false;
+    bool plane_reads(HostPlanes* const* units, int n, int rows, PlaneCall* c,
+                     const PlanesIn* in = nullptr, bool rest_mirror = false);
+    bool plane_reads_done(PlaneCall* c, bool readers_failed, PlaneReadTiming* timing);
+    bool                 native_file_workers_on_ = false;
+    int  read_relaid(const WeightInfo& w, void* dst, int64_t dst_cap, RelayIn* in);
+    int  read_native_file(const WeightInfo& w, void* dst, int64_t dst_cap, RelayIn* in,
+                          bool* cache_hit, NativeFileCacheReadPolicy policy = NativeFileCacheReadPolicy::Normal,
+                          NativeMappedFileCache::Lease* mapped_lease = nullptr, M1PrefetchTrace trace = {});
+    int  read_native_file_impl(const WeightInfo& w, void* dst, int64_t dst_cap, RelayIn* in,
+                          bool* cache_hit, NativeFileCacheReadPolicy policy, NativeMappedFileCache::Lease* mapped_lease);
+    bool prefetch_trace_slot(const M1PrefetchTrace& trace);
+    std::atomic<uint64_t> prefetch_trace_lines_{0};
+    /* read_relaid split, summed over the relay threads that run it at once: preads, relayouts. */
+    std::atomic<uint64_t> relaid_read_ns_{0}, relaid_pack_ns_{0}, relaid_reads_{0};
+    std::atomic<uint64_t> host_plane_read_ns_{0}, host_plane_reads_{0}, host_plane_inserts_{0};
+    /* The packed cache (packed_cache()): each class's raw-round budget, and its outcomes. */
+    int  packed_raw_[2] = { 0, 0 };
+    std::unique_ptr<std::atomic<uint8_t>[]> packed_refused_;   /* by unit: refused once already */
+    std::atomic<uint64_t> packed_inserts_{0}, packed_over_budget_{0}, packed_over_budget_units_{0},
+                          packed_round_trip_failed_{0};
+    int  insert_unit_packed(const HostPlanes& p, const ds41hx::PackCopy* copy);
+    /* Weight k (handle h) of a unit's planes laid out in p, its buffer grown as needed: where
+     * read_unit_planes reads it. False when it is not a plain pair of MXFP4 planes. */
+    bool lay_out_weight(HostPlanes* p, int k, rad_weight h);
+    /* Per unit: the mirror's copy of its gate_up's w3 codes (shard -1: none) and which of the
+     * unit's two weights is the gate_up; the tail read from the mirror, 4 KiB-aligned. */
+    std::vector<PlaneMirror::Ref> mirror_ref_;
+    std::vector<int8_t>           mirror_k_;
+    int64_t                       mirror_tail_ = 0;          /* passes of min_rows+ tokens */
+    int64_t                       mirror_tail_decode_ = 0;   /* smaller passes */
+    int  stage_relaid(const std::vector<Relaid>& rl, NativeFileCacheReadPolicy policy);
     char*    windows_ = nullptr;
     int      n_windows_ = 0;
     int      win_next_ = 0;

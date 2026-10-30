@@ -214,6 +214,8 @@ static int indexer_buffers(RadBuilder* b, Model& m) {
     c.selected = m.aw.core.selected;
     c.length = m.aw.core.length;
     c.nsel = decl_b(b, nm.f("selected_count"), RAD_I32, { T });
+    /* The MLA block's resolve count: qsa_select's second output, never `length`. */
+    m.aw.core.nsel = c.nsel;
     if (g.world > 1) {
         c.cu_part = decl_b(b, nm.f("index_part_bounds"), RAD_I32, { g.max_seqs + 1 });
         c.sel_part = decl_b(b, nm.f("selected_part"), RAD_I32, { part, 513 });
@@ -357,10 +359,6 @@ static int layer(RadBuilder* b, Model& m, Layer& lay, Names& nm, int l, bool dra
         s.shared = nm.ckpt("%s.mlp.shared_experts", pre);
         s.cfg.n_expert = s.cfg.n_expert_all = 288;
         s.cfg.top_k = 8;
-#if defined(RAD_GLM_MAIN_TP4_CACHE_EXPERIMENTAL)
-        // Explicit separate module only. No dense/MTP/vision route hook.
-        if(!draft&&l>=3&&l<=44)s.cfg.route_prepare=1;
-#endif
         s.cfg.n_ff_exp = s.cfg.n_ff_shared = GlmTp::expert_width(g.world);
         s.cfg.rows = g.max_tok;
         s.cfg.sigmoid_router = 1;
@@ -400,6 +398,9 @@ static int geometry(Geom& g, const RadModelMeta* meta, const RadBuildCtx* ctx, i
     g.max_ctx = ctx->max_ctx;
     g.max_seqs = ctx->max_seqs;
     g.max_spec = ctx->max_spec;
+    /* Filled by hand here, not by geom_from: without it kv_resolve would declare the whole context as
+     * the ring. */
+    g.kv_resident = ctx->kv_resident_blocks;
     g.max_logit_rows = std::min<int64_t>(g.max_tok, g.max_seqs * (g.max_spec + 1));
     if (ctx->max_out_rows > g.max_logit_rows) g.max_logit_rows = ctx->max_out_rows;
     g.eps = meta->rms_eps;
@@ -411,13 +412,6 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     if (!b || !meta || !ctx || ctx->is_draft || ctx->rank < 0 || ctx->rank >= MAX_RANKS)
         return RAD_E_INVAL;
     const int world = ctx->world_size ? ctx->world_size : 1;
-#if defined(RAD_GLM_MAIN_TP4_CACHE_EXPERIMENTAL)
-    if(world!=4||ctx->max_tok<1||ctx->max_tok>128||ctx->max_seqs!=1||ctx->max_spec||ctx->max_enc_patches||ctx->is_draft)
-        return RAD_E_UNSUPPORTED;
-    if(!rad_core_glm_main_tp4_cache_profile_version||!rad_require_glm_main_tp4_cache_fail_stop||
-       rad_core_glm_main_tp4_cache_profile_version()<RAD_GLM_MAIN_TP4_CACHE_PROFILE_VERSION)return RAD_E_ABI;
-    RAD_ARCH_TRY(rad_require_glm_main_tp4_cache_fail_stop(b));
-#endif
     if (!GlmTp::world_ok(world)) {
         fprintf(stderr, "radiance: glm5next: --tp %d; the head, KDA channel and expert splits of "
                         "this plugin are built for 1, 2, 4 or 8 ranks\n", world);
@@ -518,7 +512,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                              RAD_INT("n_embd", 4096), RAD_STR("dtype", "bf16")),
                   RAD_WEIGHTS(m.head)),
            { m.logit_input }, { m.logits });
-    if (g.max_spec > 0) {
+    if (rad_ctx_draft_head(ctx)) {
         GlmMtp::Wire tw{ m.final_hidden, m.logits, m.token, m.head };
         RAD_ARCH_TRY(m.mtp.declare_inputs(b, g, tw, m.media));
         RAD_ARCH_TRY(layer(b, m, m.draft, m.mtp.nm, 45, true));
@@ -604,6 +598,8 @@ static void step(RadCtx* c, const RadBatch* batch) {
 }
 static int probe(const RadModelMeta* meta, RadArchProbe* out) {
     if (!meta || !out) return RAD_E_INVAL;
+    /* The MLA block declares the streamed store and the resolve (rad_block_glm_mla.h). */
+    out->kv_stream_ok = 1;
     if (cfg(meta, "num_nextn_predict_layers", 0) == 1) out->draft_depth = GlmMtp::kDepth;
     // The tower's merged block, so a pass size the core picks itself is whole output rows.
     if (GlmVision::present(meta)) {

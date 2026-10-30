@@ -9,8 +9,7 @@
  * which makes fusion a selection rather than a compiler pass (spec §2.3).
  */
 #include "rad_build.h"
-#include "rad_model_failure_policy.h"
-#include "rad_glm_main_tp4_cache.h"
+#include "kvstream/bringup.h"
 #include "lora/lora.h"
 #include "../device/device.h"
 
@@ -207,21 +206,24 @@ rad_weight Builder::decl_weight(const char* name, const RadWeightDecl* d) {
 
     /* Check the declaration against the planes. One plane is declared at its own dtype and extents
      * (this rank's share under a shard); several at the codes' dtype and the logical extents. A
-     * different dtype must be an exact widening the loader performs; a quantisation belongs to
+     * different dtype must be an exact conversion the loader performs; a quantisation belongs to
      * rad-convert and is refused. */
     const RadEncPlane& p0 = w.enc.plane[w.sel[0]];
     if (p0.dtype != d->dtype) {
         const bool widen = w.n_sel == 1 && d->dtype == RAD_F32 &&
                            (p0.dtype == RAD_BF16 || p0.dtype == RAD_F16);
+        /* A bf16 readout head over an f32 checkpoint tensor: the loader rounds it to bf16. */
+        const bool narrow = w.n_sel == 1 && d->dtype == RAD_BF16 && p0.dtype == RAD_F32;
         char e[256];
         rad_enc_format(&w.enc, e, sizeof e);
-        if (!widen)
+        if (!widen && !narrow)
             return err(RAD_E_DTYPE, "weight '%s' is declared %s, and '%s' holds %s as %s: only an "
-                                    "exact widening is done at load -- anything else is a "
-                                    "quantisation, which a recipe does before the container is "
-                                    "written (spec §4.4)", n.c_str(), rad_dtype_name(d->dtype),
+                                    "exact widening or narrowing is done at load; anything else "
+                                    "is a quantisation, which a recipe does before the container "
+                                    "is written (spec §4.4)", n.c_str(), rad_dtype_name(d->dtype),
                        w.source.c_str(), p0.role, e);
-        w.widen = true;
+        w.widen = widen;
+        w.narrow = narrow;
     }
     int64_t sr = 0, sc = 0;            /* the source's logical [rows, cols] */
     if (w.enc_known) rad_enc_view(ws.rank, ws.shape, &sr, &sc);
@@ -258,9 +260,10 @@ rad_weight Builder::decl_weight(const char* name, const RadWeightDecl* d) {
      * the resolved kernel's layout hook asks for another (spec §4.3); no hook, or
      * RAD_E_UNSUPPORTED, keeps this. */
     w.identity     = true;
-    w.stored_dtype = w.widen ? d->dtype : p0.dtype;
-    w.stored_bytes = w.widen ? rad_dtype_bytes(d->dtype, vr * vc)
-                             : vr * rad_enc_row_bytes(p0.dtype, vc);
+    const bool converted = w.widen || w.narrow;
+    w.stored_dtype = converted ? d->dtype : p0.dtype;
+    w.stored_bytes = converted ? rad_dtype_bytes(d->dtype, vr * vc)
+                               : vr * rad_enc_row_bytes(p0.dtype, vc);
     w.stored_rank  = d->rank;
     for (uint32_t i = 0; i < RAD_MAX_RANK; ++i)
         w.stored_shape[i] = i < d->rank ? d->shape[i] : 0;
@@ -468,20 +471,31 @@ int64_t Builder::kv_block_size(rad_kvgroup g) {
     return 0;
 }
 
+/* One layer's bytes of a paged group's block: what a kernel addressing one layer sees, and the
+ * pitch of a streamed group's host mirror rows. */
+int64_t Builder::kv_layer_bytes(rad_kvgroup g) {
+    if (g == 0 || g >= prog_.kv_groups.size()) return 0;
+    KVGroupInfo& gi = prog_.kv_groups[g];
+    if (gi.decl.kind != RAD_KV_FULL && gi.decl.kind != RAD_KV_WINDOW) return 0;
+    const int64_t bs = kv_block_size(g);
+    if (bs <= 0) return 0;
+    const int64_t nh = gi.decl.n_head_kv > 0 ? gi.decl.n_head_kv : 1;
+    return rad_dtype_bytes(gi.decl.dtype, 2 * bs * nh * gi.decl.head_dim);
+}
+
 /* ================================================================== ops */
+/* A kernel instantiation: (kernel, plugin, resolved input params). Keyed on geom_key, not
+ * geom.str(), so tuner and selector key identically: geom_key is tunecache.h's canonical sorted
+ * spelling without the tuned axes, while geom.str() keeps declaration order and includes them. */
+static std::string tune_key(const Resolved& r) {
+    return r.row->info->name + std::string("\x1f") + r.row->plugin + std::string("\x1f") +
+           r.geom_key;
+}
+
 void Builder::record_tune_request(const Resolved& r) {
     if (!r.row || !r.row->info || r.row->info->n_tunables <= 0) return;
-    /* One request per kernel instantiation: (kernel, plugin, resolved input params). The same
-     * shape requested by many layers is one benchmark (spec §15).
-     *
-     * Keyed on geom_key, not geom.str(), so tuner and selector key identically: geom_key is
-     * tunecache.h's canonical sorted spelling without the tuned axes, while geom.str() keeps
-     * declaration order and includes the axes. */
-    const std::string key = r.row->info->name + std::string("\x1f") + r.row->plugin +
-                            std::string("\x1f") + r.geom_key;
-    for (auto& t : prog_.tune_requests)
-        if (t.kernel + std::string("\x1f") + t.plugin + std::string("\x1f") + t.geom_key == key)
-            return;
+    /* The same shape requested by many layers is one benchmark (spec §15). */
+    if (!tune_index_.emplace(tune_key(r), prog_.tune_requests.size()).second) return;
 
     Program::TuneRequest req;
     req.kernel     = r.row->info->name;
@@ -489,6 +503,7 @@ void Builder::record_tune_request(const Resolved& r) {
     req.geom       = r.geom;
     req.geom_key   = r.geom_key;
     req.info       = r.row->info;
+    req.instance   = r.instance;
     prog_.tune_requests.push_back(std::move(req));
 }
 
@@ -578,36 +593,41 @@ void Builder::resolve_bands(OpInfo& oi) {
 /* init() once per resolved instance (op, band, domain), after the whole graph has resolved
  * (spec §2.1; see rad_build.h). A negative init means the kernel refused an instance it matched:
  * the band becomes a miss reported here rather than at the first launch. */
-int initialize_program_instances(Registry& registry,Program& program,
-    const std::function<void(int,const std::string&)>& report,
-    Registry::InitFailureHook early_failure,void* failure_context) {
-    int first=RAD_OK;
-    for (size_t i = 1; i < program.ops.size(); ++i) {
-        OpInfo& oi = program.ops[i];
+void Builder::finish_instances() {
+    for (size_t i = 1; i < prog_.ops.size(); ++i) {
+        OpInfo& oi = prog_.ops[i];
         for (Band& b : oi.bands) {
             for (int d = 0; d < RAD_N_DOMAINS; ++d) {
                 Resolved& r = b.dom[d];
                 if (!r) continue;
-                const int s = registry.init_instance(r,program.ctx.rank,program.ctx.world_size,early_failure,failure_context);
+                const int s = reg_.init_instance(r, prog_.ctx.rank, prog_.ctx.world_size);
                 if (s >= 0) continue;
 
-                if(first>=0)first=s;
-                const auto message=fmt("%s: kernel %s matched %s and then its init() refused the instance: %s",
-                    oi.op.c_str(),r.row->info?r.row->info->name:"?",r.geom.str().c_str(),rad_strerror(s));
-                if(report)report(s,message);
+                err(s, "%s: kernel %s matched %s and then its init() refused the instance: %s",
+                    oi.op.c_str(), r.row->info ? r.row->info->name : "?",
+                    r.geom.str().c_str(), rad_strerror(s));
                 b.miss[d] = fmt("init() refused the instance: %s", rad_strerror(s));
-                program.misses.push_back({ oi.op, display_geometry(oi, b).str(), b.span,
+                prog_.misses.push_back({ oi.op, display_geometry(oi, b).str(), b.span,
                                          b.miss[d], d, oi.index });
                 r = Resolved{};
             }
         }
     }
-    return first;
 }
-void Builder::finish_instances() {
-    (void)initialize_program_instances(reg_,prog_,[this](int status,const std::string& message){
-        err(status,"%s",message.c_str());
-    });
+
+/* Hand each tune request the instance finish_instances() made for its kernel: a collective's
+ * launch reaches its peer bundle (scratch, flags, sequence counters) only through the instance, so
+ * the tuner forms its launches from this. */
+void Builder::fill_tune_instances() {
+    if (prog_.tune_requests.empty()) return;
+    for (size_t i = 1; i < prog_.ops.size(); ++i)
+        for (const Band& b : prog_.ops[i].bands)
+            for (int d = 0; d < RAD_N_DOMAINS; ++d) {
+                const Resolved& r = b.dom[d];
+                if (!r || !r.row || !r.row->info || r.row->info->n_tunables <= 0) continue;
+                const auto it = tune_index_.find(tune_key(r));
+                if (it != tune_index_.end()) prog_.tune_requests[it->second].instance = r.instance;
+            }
 }
 
 rad_op Builder::decl_op(const char* opname, const RadParam* p, int n_p,
@@ -806,6 +826,18 @@ rad_op Builder::decl_op(const char* opname, const RadParam* p, int n_p,
     for (const Band& b : oi.bands)
         if (!b.dom[RAD_DOMAIN_DEVICE] && !b.dom[RAD_DOMAIN_HOST]) resolved = false;
 
+    /* An op that resolved nowhere owns no weight either, as a declined one does (above): no handle
+     * reaches the plugin, so it never runs, and the plugin declares its fallback over the same
+     * weights. Kept, its weights would steer what reads them although nothing it serves will: the
+     * planner reads every op's weights to decide where a weight may be read (a band with no device
+     * kernel moves the weight's whole unit off the card), and the layout pass would let its resolved
+     * bands' kernels claim a stored form the fallback does not read. It stays in the list by name,
+     * with its bands and misses. */
+    if (!resolved) {
+        oi.weights.clear();
+        oi.weight_opd.clear();
+    }
+
     prog_.ops.push_back(std::move(oi));
     op_bufs_.emplace_back();
 
@@ -816,6 +848,7 @@ rad_op Builder::decl_op(const char* opname, const RadParam* p, int n_p,
 }
 
 int Builder::op_declared(const char* op) const {
+    if (kvstream_op_gated(prog_.ctx, op)) return 0; /* kvstream_op_gated */
     return op && reg_.schema(op) ? 1 : 0;
 }
 
@@ -971,6 +1004,21 @@ int Builder::kv_group_zero(rad_kvgroup h) {
     return RAD_OK;
 }
 
+int Builder::kv_group_dense_read(rad_kvgroup h) {
+    if (finished_) { err(RAD_E_STATE, "kv_group_dense_read after declare finished"); return RAD_E_STATE; }
+    if (h == 0 || h >= prog_.kv_groups.size()) return RAD_E_INVAL;
+    /* Full groups only: a state slot is already per sequence, and a window bounds its own
+     * history. */
+    const KVGroupInfo& gi = prog_.kv_groups[h];
+    if (gi.decl.kind != RAD_KV_FULL) {
+        err(RAD_E_INVAL, "kv group '%s': dense_read on a group that is not a full attention group",
+            gi.name.c_str());
+        return RAD_E_INVAL;
+    }
+    prog_.kv_groups[h].dense_read = true;
+    return RAD_OK;
+}
+
 int Builder::kv_group_replicated(rad_kvgroup h) {
     if (finished_) {
         err(RAD_E_STATE, "kv_group_replicated after declare finished");
@@ -1007,7 +1055,7 @@ int Builder::decl_name_map(const RadNameMap* m) {
     }
     if (m->mode != RAD_MAP_COPY && m->mode != RAD_MAP_CONCAT && m->mode != RAD_MAP_WNORM &&
         m->mode != RAD_MAP_ROWS && m->mode != RAD_MAP_TRANSPOSE && m->mode != RAD_MAP_EMA &&
-        m->mode != RAD_MAP_TAP && m->mode != RAD_MAP_COLS) {
+        m->mode != RAD_MAP_TAP && m->mode != RAD_MAP_COLS && m->mode != RAD_MAP_MUL) {
         err(RAD_E_INVAL, "name map for '%s': unknown mode %d", m->declared, m->mode);
         return RAD_E_INVAL;
     }
@@ -1016,6 +1064,11 @@ int Builder::decl_name_map(const RadNameMap* m) {
             m->declared, m->mode == RAD_MAP_EMA ? "codebook" : "weight-norm",
             m->mode == RAD_MAP_EMA ? "the embedding sums and the cluster usage"
                                    : "the magnitude and the direction", m->n_src);
+        return RAD_E_INVAL;
+    }
+    if (m->mode == RAD_MAP_MUL && m->n_src != 2) {
+        err(RAD_E_INVAL, "name map for '%s': a product map names its two factors, not %d",
+            m->declared, m->n_src);
         return RAD_E_INVAL;
     }
     if ((m->mode == RAD_MAP_TRANSPOSE || m->mode == RAD_MAP_TAP || m->mode == RAD_MAP_COLS) &&
@@ -2039,6 +2092,35 @@ int Builder::drafter_short_block(int64_t block) {
     return RAD_OK;
 }
 
+/* An exact consumer suffix (rad_builder.h). Only recorded: the engine decides which steps it cuts
+ * (core/sched/consumer_skip.h), and a step it does not cut runs as before. */
+int Builder::declare_consumer_suffix(const RadConsumerSuffix* d) {
+    if (finished_) {
+        err(RAD_E_STATE, "declare_consumer_suffix after declare finished");
+        return RAD_E_STATE;
+    }
+    if (!d || d->struct_size < sizeof(RadConsumerSuffix)) {
+        err(RAD_E_INVAL, "declare_consumer_suffix: no declaration, or one from a header older than "
+                         "its four fields");
+        return RAD_E_INVAL;
+    }
+    if (prog_.consumer.n_layer > 0) {
+        err(RAD_E_STATE, "declare_consumer_suffix: declared twice");
+        return RAD_E_STATE;
+    }
+    if (d->n_layer < 2 || d->n_layer != prog_.meta.n_layers || d->boundary < 0 ||
+        d->boundary >= d->n_layer - 1 || d->window < 1) {
+        err(RAD_E_INVAL, "declare_consumer_suffix: %d layers (the model has %lld), boundary %d, "
+                         "window %d. The boundary is a layer before the last, the window at least "
+                         "one position.", d->n_layer, (long long)prog_.meta.n_layers, d->boundary,
+            d->window);
+        return RAD_E_INVAL;
+    }
+    prog_.consumer = *d;
+    prog_.consumer.struct_size = sizeof(RadConsumerSuffix);
+    return RAD_OK;
+}
+
 void Builder::note_v(const char* f, va_list ap) {
     char msg[1024];
     vsnprintf(msg, sizeof msg, f ? f : "", ap);
@@ -2178,12 +2260,13 @@ void Builder::finish_layouts() {
                                 w.source.c_str());
                         continue;   /* the stored defaults decl_weight set stand */
                     }
-                    if (w.widen) {
+                    if (w.widen || w.narrow) {
                         err(RAD_E_DTYPE, "'%s' is declared %s over a %s plane and kernel %s "
-                                         "relayouts it; a widening and a relayout are not both "
+                                         "relayouts it; a %s and a relayout are not both "
                                          "done at load", w.name.c_str(),
                             rad_dtype_name(w.decl.dtype),
-                            rad_dtype_name(w.enc.plane[w.sel[0]].dtype), ki->name);
+                            rad_dtype_name(w.enc.plane[w.sel[0]].dtype), ki->name,
+                            w.widen ? "widening" : "narrowing");
                         continue;
                     }
                     w.layout_tag   = tag;
@@ -2367,26 +2450,6 @@ void Builder::finish_buffer_liveness() {
     if (prog_.scratch_bytes_lane1 > prog_.scratch_bytes) prog_.scratch_bytes_lane1 = prog_.scratch_bytes;
 }
 
-int Builder::require_permanent_model_failure() {
-    if (finished_) {
-        err(RAD_E_STATE, "permanent model failure policy after declare finished");
-        return RAD_E_STATE;
-    }
-    if(prog_.requires_glm_main_tp4_cache_fail_stop()) {
-        err(RAD_E_UNSUPPORTED,"PermanentV1 and GLM TP4 cache fail-stop are separate profiles");return RAD_E_UNSUPPORTED;
-    }
-    prog_.permanent_model_failure_ = true;
-    return RAD_OK;
-}
-int Builder::require_glm_main_tp4_cache_fail_stop(){
-    // The experimental Engine must first metadata-declare and verify its full
-    // source capability. An opaque init cannot precede that cold admission.
-    if(finished_){err(RAD_E_STATE,"GLM TP4 cache profile after declare finished");return RAD_E_STATE;}
-    if(instances_){err(RAD_E_UNSUPPORTED,"GLM TP4 cache requires metadata-first verified source admission");return RAD_E_UNSUPPORTED;}
-    if(prog_.requires_permanent_model_failure()){err(RAD_E_UNSUPPORTED,"GLM TP4 cache profile cannot replace PermanentV1");return RAD_E_UNSUPPORTED;}
-    prog_.glm_main_tp4_cache_fail_stop_=true;return RAD_OK;
-}
-
 int Builder::finish() {
     if (finished_) return status_;
     finished_ = true;
@@ -2394,10 +2457,6 @@ int Builder::finish() {
     /* A sizing declare needs only buffers and liveness; its kernels are the real declare's and its
      * weights and KV groups are unused. */
     if (ref_) {
-        if (ref_->requires_permanent_model_failure() != prog_.requires_permanent_model_failure())
-            err(RAD_E_STATE, "sizing declaration changes permanent model failure policy");
-        if(ref_->requires_glm_main_tp4_cache_fail_stop()!=prog_.requires_glm_main_tp4_cache_fail_stop())
-            err(RAD_E_STATE,"sizing declaration changes GLM TP4 cache profile");
         finish_buffer_liveness();
         return status_;
     }
@@ -2417,6 +2476,7 @@ int Builder::finish() {
         }
 
     if (instances_) finish_instances();
+    fill_tune_instances();
     finish_weight_uses();
     finish_layouts();
     finish_kv_groups();
@@ -2459,12 +2519,6 @@ extern "C" {
 
 static rad::Builder* B(RadBuilder* b) { return static_cast<rad::Builder*>(b); }
 
-int rad_require_permanent_model_failure(RadBuilder* b) {
-    return b ? B(b)->require_permanent_model_failure() : RAD_E_INVAL;
-}
-uint32_t rad_core_glm_main_tp4_cache_profile_version(void){return RAD_GLM_MAIN_TP4_CACHE_PROFILE_VERSION;}
-int rad_require_glm_main_tp4_cache_fail_stop(RadBuilder* b){return b?B(b)->require_glm_main_tp4_cache_fail_stop():RAD_E_INVAL;}
-
 rad_weight rad_decl_weight(RadBuilder* b, const char* name, const RadWeightDecl* d) {
     if (!b) return RAD_NULL_HANDLE;
     return B(b)->decl_weight(name, d);
@@ -2489,6 +2543,11 @@ rad_kvgroup rad_decl_kv_group(RadBuilder* b, const char* name, const RadKVGroupD
 int64_t rad_kv_block_size(RadBuilder* b, rad_kvgroup g) {
     if (!b) return 0;
     return B(b)->kv_block_size(g);
+}
+
+int64_t rad_kv_layer_bytes(RadBuilder* b, rad_kvgroup g) {
+    if (!b) return 0;
+    return B(b)->kv_layer_bytes(g);
 }
 
 int rad_bind_layer_kv(RadBuilder* b, int layer, rad_kvgroup g) {
@@ -2553,6 +2612,11 @@ int rad_kv_group_zero(RadBuilder* b, rad_kvgroup g) {
     return B(b)->kv_group_zero(g);
 }
 
+int rad_kv_group_dense_read(RadBuilder* b, rad_kvgroup g) {
+    if (!b) return RAD_E_INVAL;
+    return B(b)->kv_group_dense_read(g);
+}
+
 int rad_kv_group_replicated(RadBuilder* b, rad_kvgroup g) {
     if (!b) return RAD_E_INVAL;
     return B(b)->kv_group_replicated(g);
@@ -2599,6 +2663,11 @@ int rad_chain_on(void) { return rad_dev_chain_enabled(); }
 int rad_drafter_short_block(RadBuilder* b, int64_t block) {
     if (!b) return RAD_E_INVAL;
     return B(b)->drafter_short_block(block);
+}
+
+int rad_declare_consumer_suffix(RadBuilder* b, const RadConsumerSuffix* d) {
+    if (!b) return RAD_E_INVAL;
+    return B(b)->declare_consumer_suffix(d);
 }
 
 int rad_declare_encoder(RadBuilder* b, const RadEncoderDecl* d) {

@@ -1,0 +1,124 @@
+[2026-10-29T00:07:06Z] waiting for 30 s of QFN idleness
+before: 608764c1d1989c714d8aad7b8a79f8057c3e73473b9f9d55b49d02e82defd2b8 running 2026-10-28T23:46:00.047817266Z sha256:e82764045e46ebae07e33961f17dedba981c0d07336dfcddd67e4b3b042b8600
+[2026-10-29T00:07:35Z] stopping radiance-flashnext
+radiance-flashnext
+[2026-10-29T00:07:43Z] arm verify-f-M1: RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=16 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU=/home/as/radiance-ds41-claude/tools/ds41-host-experts/build/window-20261028T203510Z/silu_table_gfx1201.bin RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_POLICY=verify RADIANCE_EXPERIMENTAL_NATIVE_CACHE_DIRECT_FILL=1 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MISSES=1
+[2026-10-29T00:08:01Z] arm verify-f-M1: serving after 18s
+heldout-01: 38.0 s, decode 2.97 tok/s, prefill 16785 ms
+heldout-02: 22.6 s, decode 4.30 tok/s, prefill 7960 ms
+heldout-03: 20.2 s, decode 4.89 tok/s, prefill 7296 ms
+[2026-10-29T00:09:22Z] arm verify-f-M1: requests exit 0
+  host experts' plane reads: 2000 weights read for the CPU in 3.45 s of issuing-thread time (1.72 ms a batch weight), 2000 relaid into the RAM cache beside it
+I[0] EP scoped file staging: 7920 count rows completed, 1449 local-zero, 8296 SSD units submitted, 0 corrupt rows refused
+I[0] host experts: 4468 layers handed 6083 experts (7086 rows) to the CPU; 0 cached experts went over the copy link, 1926 routed experts were not cached; 4227.5 ms waiting at gathers; verify: 8086 rows compared, 0 differ; 0 gate_up operand moves; 8009 units probed (the mapped cache's hit and miss counts above include these probes); misses on the CPU: 1000 units, 1000 rows, 3453.2 ms reading their planes
+  host experts' plane reads: 2004 weights read for the CPU in 3.40 s of issuing-thread time (1.70 ms a batch weight), 2004 relaid into the RAM cache beside it
+I[1] EP scoped file staging: 7920 count rows completed, 1334 local-zero, 8259 SSD units submitted, 0 corrupt rows refused
+I[1] host experts: 4344 layers handed 5871 experts (6721 rows) to the CPU; 0 cached experts went over the copy link, 2046 routed experts were not cached; 4175.6 ms waiting at gathers; verify: 7723 rows compared, 0 differ; 0 gate_up operand moves; 7917 units probed (the mapped cache's hit and miss counts above include these probes); misses on the CPU: 1002 units, 1002 rows, 3407.9 ms reading their planes
+  host experts' plane reads: 2124 weights read for the CPU in 3.67 s of issuing-thread time (1.73 ms a batch weight), 2124 relaid into the RAM cache beside it
+I[2] EP scoped file staging: 7920 count rows completed, 1366 local-zero, 8261 SSD units submitted, 0 corrupt rows refused
+I[2] host experts: 4322 layers handed 5837 experts (6880 rows) to the CPU; 0 cached experts went over the copy link, 2085 routed experts were not cached; 4039.6 ms waiting at gathers; verify: 7942 rows compared, 0 differ; 0 gate_up operand moves; 7922 units probed (the mapped cache's hit and miss counts above include these probes); misses on the CPU: 1062 units, 1062 rows, 3675.2 ms reading their planes
+  host experts' plane reads: 2026 weights read for the CPU in 3.41 s of issuing-thread time (1.68 ms a batch weight), 2026 relaid into the RAM cache beside it
+I[3] EP scoped file staging: 7920 count rows completed, 1386 local-zero, 8201 SSD units submitted, 0 corrupt rows refused
+I[3] host experts: 4411 layers handed 5889 experts (6905 rows) to the CPU; 0 cached experts went over the copy link, 1995 routed experts were not cached; 3116.8 ms waiting at gathers; verify: 7918 rows compared, 0 differ; 0 gate_up operand moves; 7884 units probed (the mapped cache's hit and miss counts above include these probes); misses on the CPU: 1013 units, 1013 rows, 3413.3 ms reading their planes
+[2026-10-29T00:09:25Z] arm all-f-M1: RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=16 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU=/home/as/radiance-ds41-claude/tools/ds41-host-experts/build/window-20261028T203510Z/silu_table_gfx1201.bin RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_POLICY=all RADIANCE_EXPERIMENTAL_NATIVE_CACHE_DIRECT_FILL=1 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MISSES=1
+[2026-10-29T00:09:43Z] arm all-f-M1: serving after 18s
+heldout-01: 26.1 s, decode 6.74 tok/s, prefill 16780 ms
+heldout-02: 15.0 s, decode 8.78 tok/s, prefill 7841 ms
+heldout-03: 13.7 s, decode 9.59 tok/s, prefill 7084 ms
+heldout-04: 14.5 s, decode 8.54 tok/s, prefill 7164 ms
+heldout-05: 9.1 s, decode 9.57 tok/s, prefill 5001 ms
+heldout-06: 12.4 s, decode 8.91 tok/s, prefill 5336 ms
+heldout-07: 13.6 s, decode 8.64 tok/s, prefill 6281 ms
+heldout-08: 11.6 s, decode 9.92 tok/s, prefill 5262 ms
+[2026-10-29T00:11:40Z] arm all-f-M1: requests exit 0
+  host experts' plane reads: 4678 weights read for the CPU in 9.16 s of issuing-thread time (1.96 ms a batch weight), 4678 relaid into the RAM cache beside it
+I[0] EP scoped file staging: 20160 count rows completed, 3674 local-zero, 2208 SSD units submitted, 0 corrupt rows refused
+I[0] host experts: 11497 layers handed 16287 experts (19153 rows) to the CPU; 0 cached experts went over the copy link, 4260 routed experts were not cached; 9009.1 ms waiting at gathers; verify: 0 rows compared, 0 differ; 0 gate_up operand moves; 20547 units probed (the mapped cache's hit and miss counts above include these probes); misses on the CPU: 2339 units, 2339 rows, 9313.1 ms reading their planes
+  host experts' plane reads: 4604 weights read for the CPU in 9.14 s of issuing-thread time (1.99 ms a batch weight), 4604 relaid into the RAM cache beside it
+I[1] EP scoped file staging: 20160 count rows completed, 3488 local-zero, 2404 SSD units submitted, 0 corrupt rows refused
+I[1] host experts: 11007 layers handed 15507 experts (18162 rows) to the CPU; 0 cached experts went over the copy link, 4364 routed experts were not cached; 8949.4 ms waiting at gathers; verify: 0 rows compared, 0 differ; 0 gate_up operand moves; 19871 units probed (the mapped cache's hit and miss counts above include these probes); misses on the CPU: 2302 units, 2302 rows, 9322.1 ms reading their planes
+  host experts' plane reads: 4690 weights read for the CPU in 9.33 s of issuing-thread time (1.99 ms a batch weight), 4690 relaid into the RAM cache beside it
+I[2] EP scoped file staging: 20160 count rows completed, 3186 local-zero, 2350 SSD units submitted, 0 corrupt rows refused
+I[2] host experts: 11388 layers handed 16124 experts (19150 rows) to the CPU; 0 cached experts went over the copy link, 4356 routed experts were not cached; 8940.8 ms waiting at gathers; verify: 0 rows compared, 0 differ; 0 gate_up operand moves; 20480 units probed (the mapped cache's hit and miss counts above include these probes); misses on the CPU: 2345 units, 2345 rows, 9521.1 ms reading their planes
+  host experts' plane reads: 4616 weights read for the CPU in 9.27 s of issuing-thread time (2.01 ms a batch weight), 4616 relaid into the RAM cache beside it
+I[3] EP scoped file staging: 20160 count rows completed, 3385 local-zero, 2383 SSD units submitted, 0 corrupt rows refused
+I[3] host experts: 11238 layers handed 15636 experts (18660 rows) to the CPU; 0 cached experts went over the copy link, 4374 routed experts were not cached; 8572.2 ms waiting at gathers; verify: 0 rows compared, 0 differ; 0 gate_up operand moves; 20010 units probed (the mapped cache's hit and miss counts above include these probes); misses on the CPU: 2308 units, 2308 rows, 9426.0 ms reading their planes
+[2026-10-29T00:11:42Z] arm all-f-M16: RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=16 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU=/home/as/radiance-ds41-claude/tools/ds41-host-experts/build/window-20261028T203510Z/silu_table_gfx1201.bin RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_POLICY=all RADIANCE_EXPERIMENTAL_NATIVE_CACHE_DIRECT_FILL=1 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MISSES=16
+[2026-10-29T00:12:00Z] arm all-f-M16: serving after 18s
+heldout-01: 24.6 s, decode 6.90 tok/s, prefill 15437 ms
+heldout-02: 15.3 s, decode 8.05 tok/s, prefill 7487 ms
+heldout-03: 15.7 s, decode 6.88 tok/s, prefill 6576 ms
+heldout-04: 18.8 s, decode 5.84 tok/s, prefill 7978 ms
+heldout-05: 11.3 s, decode 6.50 tok/s, prefill 5285 ms
+heldout-06: 18.3 s, decode 4.98 tok/s, prefill 5624 ms
+heldout-07: 16.6 s, decode 5.97 tok/s, prefill 6007 ms
+heldout-08: 16.9 s, decode 5.57 tok/s, prefill 5610 ms
+[2026-10-29T00:14:17Z] arm all-f-M16: requests exit 0
+  host experts' plane reads: 11496 weights read for the CPU in 38.50 s of issuing-thread time (3.35 ms a batch weight), 11496 relaid into the RAM cache beside it
+I[0] EP scoped file staging: 20160 count rows completed, 3674 local-zero, 287 SSD units submitted, 0 corrupt rows refused
+I[0] host experts: 11513 layers handed 14799 experts (17499 rows) to the CPU; 0 cached experts went over the copy link, 5748 routed experts were not cached; 11716.3 ms waiting at gathers; verify: 0 rows compared, 0 differ; 0 gate_up operand moves; 20547 units probed (the mapped cache's hit and miss counts above include these probes); misses on the CPU: 5748 units, 7042 rows, 38579.6 ms reading their planes
+  host experts' plane reads: 12212 weights read for the CPU in 39.43 s of issuing-thread time (3.23 ms a batch weight), 12212 relaid into the RAM cache beside it
+I[1] EP scoped file staging: 20160 count rows completed, 3488 local-zero, 342 SSD units submitted, 0 corrupt rows refused
+I[1] host experts: 11017 layers handed 13765 experts (16116 rows) to the CPU; 0 cached experts went over the copy link, 6106 routed experts were not cached; 11407.3 ms waiting at gathers; verify: 0 rows compared, 0 differ; 0 gate_up operand moves; 19871 units probed (the mapped cache's hit and miss counts above include these probes); misses on the CPU: 6106 units, 7531 rows, 39465.9 ms reading their planes
+  host experts' plane reads: 15812 weights read for the CPU in 46.37 s of issuing-thread time (2.93 ms a batch weight), 15812 relaid into the RAM cache beside it
+I[2] EP scoped file staging: 20160 count rows completed, 3186 local-zero, 339 SSD units submitted, 0 corrupt rows refused
+I[2] host experts: 11406 layers handed 12574 experts (15315 rows) to the CPU; 0 cached experts went over the copy link, 7906 routed experts were not cached; 11260.3 ms waiting at gathers; verify: 0 rows compared, 0 differ; 0 gate_up operand moves; 20480 units probed (the mapped cache's hit and miss counts above include these probes); misses on the CPU: 7906 units, 9267 rows, 46522.7 ms reading their planes
+  host experts' plane reads: 12146 weights read for the CPU in 39.88 s of issuing-thread time (3.28 ms a batch weight), 12146 relaid into the RAM cache beside it
+I[3] EP scoped file staging: 20160 count rows completed, 3385 local-zero, 317 SSD units submitted, 0 corrupt rows refused
+I[3] host experts: 11256 layers handed 13937 experts (16714 rows) to the CPU; 0 cached experts went over the copy link, 6073 routed experts were not cached; 11456.7 ms waiting at gathers; verify: 0 rows compared, 0 differ; 0 gate_up operand moves; 20010 units probed (the mapped cache's hit and miss counts above include these probes); misses on the CPU: 6073 units, 7383 rows, 40146.4 ms reading their planes
+[2026-10-29T00:14:20Z] arm all-f-M1-t20: RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=20 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU=/home/as/radiance-ds41-claude/tools/ds41-host-experts/build/window-20261028T203510Z/silu_table_gfx1201.bin RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_POLICY=all RADIANCE_EXPERIMENTAL_NATIVE_CACHE_DIRECT_FILL=1 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MISSES=1
+[2026-10-29T00:14:38Z] arm all-f-M1-t20: serving after 18s
+heldout-01: 26.5 s, decode 6.47 tok/s, prefill 16748 ms
+heldout-02: 15.4 s, decode 8.46 tok/s, prefill 7921 ms
+heldout-03: 13.7 s, decode 9.64 tok/s, prefill 7173 ms
+heldout-04: 14.4 s, decode 8.56 tok/s, prefill 7025 ms
+heldout-05: 9.1 s, decode 9.46 tok/s, prefill 5017 ms
+heldout-06: 12.3 s, decode 9.15 tok/s, prefill 5404 ms
+heldout-07: 13.5 s, decode 8.85 tok/s, prefill 6384 ms
+heldout-08: 11.6 s, decode 10.14 tok/s, prefill 5355 ms
+[2026-10-29T00:16:35Z] arm all-f-M1-t20: requests exit 0
+  host experts' plane reads: 4678 weights read for the CPU in 9.25 s of issuing-thread time (1.98 ms a batch weight), 4678 relaid into the RAM cache beside it
+I[0] EP scoped file staging: 20160 count rows completed, 3674 local-zero, 2208 SSD units submitted, 0 corrupt rows refused
+I[0] host experts: 11497 layers handed 16287 experts (19153 rows) to the CPU; 0 cached experts went over the copy link, 4260 routed experts were not cached; 8331.8 ms waiting at gathers; verify: 0 rows compared, 0 differ; 0 gate_up operand moves; 20547 units probed (the mapped cache's hit and miss counts above include these probes); misses on the CPU: 2339 units, 2339 rows, 9391.5 ms reading their planes
+  host experts' plane reads: 4604 weights read for the CPU in 9.14 s of issuing-thread time (1.99 ms a batch weight), 4604 relaid into the RAM cache beside it
+I[1] EP scoped file staging: 20160 count rows completed, 3488 local-zero, 2404 SSD units submitted, 0 corrupt rows refused
+I[1] host experts: 11007 layers handed 15507 experts (18162 rows) to the CPU; 0 cached experts went over the copy link, 4364 routed experts were not cached; 8231.8 ms waiting at gathers; verify: 0 rows compared, 0 differ; 0 gate_up operand moves; 19871 units probed (the mapped cache's hit and miss counts above include these probes); misses on the CPU: 2302 units, 2302 rows, 9350.2 ms reading their planes
+  host experts' plane reads: 4690 weights read for the CPU in 9.38 s of issuing-thread time (2.00 ms a batch weight), 4690 relaid into the RAM cache beside it
+I[2] EP scoped file staging: 20160 count rows completed, 3186 local-zero, 2350 SSD units submitted, 0 corrupt rows refused
+I[2] host experts: 11388 layers handed 16124 experts (19150 rows) to the CPU; 0 cached experts went over the copy link, 4356 routed experts were not cached; 8395.2 ms waiting at gathers; verify: 0 rows compared, 0 differ; 0 gate_up operand moves; 20480 units probed (the mapped cache's hit and miss counts above include these probes); misses on the CPU: 2345 units, 2345 rows, 9601.2 ms reading their planes
+  host experts' plane reads: 4616 weights read for the CPU in 9.39 s of issuing-thread time (2.03 ms a batch weight), 4616 relaid into the RAM cache beside it
+I[3] EP scoped file staging: 20160 count rows completed, 3385 local-zero, 2383 SSD units submitted, 0 corrupt rows refused
+I[3] host experts: 11238 layers handed 15636 experts (18660 rows) to the CPU; 0 cached experts went over the copy link, 4374 routed experts were not cached; 8016.1 ms waiting at gathers; verify: 0 rows compared, 0 differ; 0 gate_up operand moves; 20010 units probed (the mapped cache's hit and miss counts above include these probes); misses on the CPU: 2308 units, 2308 rows, 9597.5 ms reading their planes
+[2026-10-29T00:16:38Z] arm all-f-M1-t24: RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=24 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU=/home/as/radiance-ds41-claude/tools/ds41-host-experts/build/window-20261028T203510Z/silu_table_gfx1201.bin RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_POLICY=all RADIANCE_EXPERIMENTAL_NATIVE_CACHE_DIRECT_FILL=1 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MISSES=1
+[2026-10-29T00:16:56Z] arm all-f-M1-t24: serving after 18s
+heldout-01: 26.5 s, decode 6.51 tok/s, prefill 16782 ms
+heldout-02: 15.4 s, decode 8.44 tok/s, prefill 7919 ms
+heldout-03: 13.8 s, decode 9.47 tok/s, prefill 7166 ms
+heldout-04: 14.3 s, decode 8.76 tok/s, prefill 7118 ms
+heldout-05: 9.0 s, decode 9.86 tok/s, prefill 5014 ms
+heldout-06: 12.3 s, decode 9.11 tok/s, prefill 5357 ms
+heldout-07: 13.2 s, decode 9.06 tok/s, prefill 6291 ms
+heldout-08: 11.3 s, decode 10.29 tok/s, prefill 5212 ms
+[2026-10-29T00:18:52Z] arm all-f-M1-t24: requests exit 0
+  host experts' plane reads: 4678 weights read for the CPU in 9.26 s of issuing-thread time (1.98 ms a batch weight), 4678 relaid into the RAM cache beside it
+I[0] EP scoped file staging: 20160 count rows completed, 3674 local-zero, 2208 SSD units submitted, 0 corrupt rows refused
+I[0] host experts: 11497 layers handed 16287 experts (19153 rows) to the CPU; 0 cached experts went over the copy link, 4260 routed experts were not cached; 8345.5 ms waiting at gathers; verify: 0 rows compared, 0 differ; 0 gate_up operand moves; 20547 units probed (the mapped cache's hit and miss counts above include these probes); misses on the CPU: 2339 units, 2339 rows, 9440.4 ms reading their planes
+  host experts' plane reads: 4604 weights read for the CPU in 9.10 s of issuing-thread time (1.98 ms a batch weight), 4604 relaid into the RAM cache beside it
+I[1] EP scoped file staging: 20160 count rows completed, 3488 local-zero, 2404 SSD units submitted, 0 corrupt rows refused
+I[1] host experts: 11007 layers handed 15507 experts (18162 rows) to the CPU; 0 cached experts went over the copy link, 4364 routed experts were not cached; 7988.4 ms waiting at gathers; verify: 0 rows compared, 0 differ; 0 gate_up operand moves; 19871 units probed (the mapped cache's hit and miss counts above include these probes); misses on the CPU: 2302 units, 2302 rows, 9289.7 ms reading their planes
+  host experts' plane reads: 4690 weights read for the CPU in 9.32 s of issuing-thread time (1.99 ms a batch weight), 4690 relaid into the RAM cache beside it
+I[2] EP scoped file staging: 20160 count rows completed, 3186 local-zero, 2350 SSD units submitted, 0 corrupt rows refused
+I[2] host experts: 11388 layers handed 16124 experts (19150 rows) to the CPU; 0 cached experts went over the copy link, 4356 routed experts were not cached; 8075.5 ms waiting at gathers; verify: 0 rows compared, 0 differ; 0 gate_up operand moves; 20480 units probed (the mapped cache's hit and miss counts above include these probes); misses on the CPU: 2345 units, 2345 rows, 9489.7 ms reading their planes
+  host experts' plane reads: 4616 weights read for the CPU in 9.38 s of issuing-thread time (2.03 ms a batch weight), 4616 relaid into the RAM cache beside it
+I[3] EP scoped file staging: 20160 count rows completed, 3385 local-zero, 2383 SSD units submitted, 0 corrupt rows refused
+I[3] host experts: 11238 layers handed 15636 experts (18660 rows) to the CPU; 0 cached experts went over the copy link, 4374 routed experts were not cached; 7615.5 ms waiting at gathers; verify: 0 rows compared, 0 differ; 0 gate_up operand moves; 20010 units probed (the mapped cache's hit and miss counts above include these probes); misses on the CPU: 2308 units, 2308 rows, 9518.4 ms reading their planes
+request            verify-f-M1          all-f-M1         all-f-M16      all-f-M1-t20      all-f-M1-t24
+heldout-01          2.97  same        6.74  same        6.90  same        6.47  same        6.51  same
+heldout-02          4.30  same        8.78  same        8.05  same        8.46  same        8.44  same
+heldout-03          4.89  same        9.59  same        6.88  same        9.64  same        9.47  same
+decode              3.94 tok/s        8.31 tok/s        7.35 tok/s        8.10 tok/s        8.07 tok/s
+[2026-10-29T00:18:55Z] arms done
+[2026-10-29T00:18:55Z] restoring radiance-flashnext
+radiance-flashnext
+[2026-10-29T00:20:01Z] QFN up after 65s; completion: {"id":"cmpl-1c8141e2a53e03a037718041","object":"text_completion","created":1793233201,"model":"qwen-vllm","system_fingerprint":"radiance-1.12.0","choices":[{"text":" Paris. The capital","index":0,"logprobs":null,"finish_reason":"length"}],"usage":{"prompt_tokens":5,"completion_tokens":4,"total_token
+608764c1d1989c714d8aad7b8a79f8057c3e73473b9f9d55b49d02e82defd2b8 running 2026-10-29T00:18:55.571539656Z sha256:e82764045e46ebae07e33961f17dedba981c0d07336dfcddd67e4b3b042b8600

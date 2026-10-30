@@ -15,6 +15,7 @@
 // word cost ~8% of a DFlash2 step on 4x R9700, for a reason not pinned down.
 #include "r4d.h"
 #include "r4d_args.h"
+#include "r4d_bf16f8_layout.h"
 #include "r4d_chain.h"
 #include "r4d_emit.h"
 #include <cstdint>
@@ -68,6 +69,11 @@ extern "C" int r4d_rad_prefetch(const RadArgs* a, RadStream stream) {
         long long n = 1;
         for (uint32_t i = 0; i < w->rank; ++i) n *= w->shape[i];
         const long long have = n * bits / 8;
+        if (have > 0 && bytes > have) bytes = have;
+    } else if (w->dtype == R4D_DT_BF16F8 && w->rank == 2) {
+        // gemm_nt_bf16f8's stored form: a plugin dtype has no width, but its size follows from
+        // the declared [N, K] (r4d_bf16f8_layout.h), codes and exponents together.
+        const long long have = r4d_bf16f8_bytes(w->shape[0], w->shape[1]);
         if (have > 0 && bytes > have) bytes = have;
     }
     if ((uintptr_t)w->data % 16) return R4D_NO(RAD_E_ALIGN);

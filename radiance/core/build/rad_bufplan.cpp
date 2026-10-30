@@ -154,8 +154,6 @@ int plan_level(const Program& full, const Program& probe, int64_t rows, ArenaLev
         if (why) *why = w;
         return RAD_E_STATE;
     };
-    if (probe.requires_permanent_model_failure() != full.requires_permanent_model_failure())
-        return refuse("sizing declaration changes permanent model failure policy");
     if (probe.buffers.size() != full.buffers.size())
         return refuse(fmt("the sizing declare named %zu buffers and the real one %zu",
                           probe.buffers.size() - 1, full.buffers.size() - 1));

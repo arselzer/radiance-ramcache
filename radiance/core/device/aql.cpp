@@ -28,7 +28,6 @@
  *     that implement events and synchronisation.
  */
 #include "device.h"
-#include "../build/tiny_startup.h"
 
 #if defined(RAD_HAVE_HIP) && RAD_HAVE_HIP
 
@@ -60,7 +59,6 @@
 #include <map>
 #include <mutex>
 #include <new>
-#include <system_error>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -78,6 +76,16 @@
 namespace rad {
 
 int aql_vmem_device_of(const void* addr, int* dev);
+
+namespace {
+void stamp_hold(hsa_signal_t h, bool on);
+/* The live stamps (live_stamp), kept beside the play stamps ("dispatch timestamps"): a signal for
+ * one dispatch, one taken and not used, and the row of one stamped dispatch. */
+hsa_signal_t lstamp_take();
+void lstamp_give(hsa_signal_t h);
+void lstamp_row(hsa_signal_t h, bool own, bool ordered, bool chained, uint32_t queue, uint64_t idx,
+                uint64_t kernel);
+}
 
 namespace aql {
 namespace {
@@ -612,6 +620,14 @@ struct Stream {
      * launched since the last packet whose barrier bit held it behind everything before. A chained
      * kernel's wait covers only chained blocks, so while this is set the next one keeps its bit. */
     bool            plain_inflight = false;
+    /* The live issue path (live_open; runtime/live_chain.h). `unord_run`: packets at the queue's
+     * tail written without the barrier bit, by any writer; a live permit is refused once it
+     * reaches kTapeOverlapRun. `last_tag`: the tag of the launch that wrote the last packet, 0 for
+     * one written outside a tagged launch, so the issue path can tell whether anything it did not
+     * account for sits between two of its launches. Bookkeeping only: nothing reads them unless a
+     * live window is opened. */
+    int             unord_run = 0;
+    uint64_t        last_tag = 0;
 
     void lock() {
         while (busy.exchange(true, std::memory_order_acquire))
@@ -1052,6 +1068,69 @@ inline uint64_t blocks_of(const hsa_kernel_dispatch_packet_t* p) {
 static_assert(RAD_CHAIN_KARG_OFF >= kKargMax && RAD_CHAIN_KARG_OFF + RAD_CHAIN_REC_BYTES <= kKargSlot,
               "the chain record sits in an argument slot's tail, past every kernel's arguments");
 
+/* ------------------------------------------------------------------ the live window
+ *
+ * A pass a stager arms is issued live, never recorded, so haz_mark never runs on it and every
+ * dispatch keeps the barrier bit: the packet processor waits for each kernel to end before it
+ * launches the next, ~2.5-4 us of idle card a dependent pair plus the whole of any kernel that
+ * could have run beside its predecessor. On DS41 decode that is ~19 serial dispatches before each
+ * layer's routing-counts sync (RESEARCH-2-RANKED-PLAN.md #6).
+ *
+ * Ctx::issue_body brackets one launch with live_open / live_close (runtime/live_chain.h): the Ctx
+ * proves from the op's operands that its first dispatch touches nothing the packets still in
+ * flight on the queue write (nor writes what they read), and the backend adds what only it sees at
+ * the packet. Every packet carries the launch's tag in Stream::last_tag, so the next launch can
+ * tell whether anything it did not account for (a copy, an event, a wait, a table patch, another
+ * thread's packet) went onto the queue in between; such a packet makes the Ctx order the next
+ * launch. */
+struct LiveWin {
+    Stream*  s = nullptr;       /* the stream the window is open on */
+    uint64_t tag = 0;
+    uint64_t at = 0;            /* the index the permit names */
+    bool     permit = false;
+    uint64_t first = 0;         /* what the window wrote on `s` */
+    int32_t  packets = 0;
+    bool     unordered = false;
+    bool     barrier = false;
+};
+thread_local LiveWin t_live;
+/* This thread stamps the kernels it writes on card 0 (live_stamp; "dispatch timestamps"). */
+thread_local bool t_lstamp_on = false;
+
+/* Whether the kernel about to be written at `idx` may go without the barrier bit under this
+ * thread's live permit. With s->lock() held. Every condition here is one the Ctx cannot see:
+ * - only the window's first packet, at the index the Ctx checked: anything else (another thread's
+ *   packet, a fill the launch wrote first) was not in the Ctx's proof;
+ * - no completion signal (a ride or a record): its completion must cover everything before it;
+ * - no system-scope fence: a copy touching host or peer memory stays ordered;
+ * - not chained, and not behind a chained kernel, whose waits count chained blocks only;
+ * - not while a tape captures: the recording's own analysis (haz_mark) decides there;
+ * - fewer than kTapeOverlapRun packets without the bit at the tail, so that of any
+ *   kTapeOverlapRun + 1 consecutive packets one has it and reserve()'s margin still proves an
+ *   argument slot free. */
+inline bool live_permits(const Stream* s, uint64_t idx, const KernelRec* k, uint8_t fence,
+                         const hsa_kernel_dispatch_packet_t* p, bool capture) {
+    return t_live.s == s && t_live.permit && t_live.packets == 0 && idx == t_live.at &&
+           !p->completion_signal.handle && !fence && !k->chained && !s->prev_chained && !capture &&
+           s->unord_run < kTapeOverlapRun;
+}
+
+/* The bookkeeping after a packet was written at `idx`, with s->lock() held: the run of packets
+ * without the bit, the queue's last tag, and what this thread's window wrote. */
+inline void live_note(Stream* s, uint64_t idx, bool ordered, bool barrier_pkt) {
+    s->unord_run = ordered ? 0 : s->unord_run + 1;
+    if (t_live.s != s) {
+        s->last_tag = 0;
+        return;
+    }
+    if (t_live.packets++ == 0) {
+        t_live.first = idx;
+        t_live.unordered = !ordered;
+    }
+    t_live.barrier = t_live.barrier || barrier_pkt;
+    s->last_tag = t_live.tag;
+}
+
 int barrier(Stream* s, hsa_signal_t dep, hsa_signal_t done, int acq, int rel,
             uint64_t* out_idx = nullptr) {
     s->lock();
@@ -1060,6 +1139,7 @@ int barrier(Stream* s, hsa_signal_t dep, hsa_signal_t done, int acq, int rel,
     if (rc < 0) { s->unlock(); return rc; }
     s->prev_chained = false;
     s->plain_inflight = false;
+    live_note(s, idx, true, true);
     if (out_idx) *out_idx = idx;
     auto* p = reinterpret_cast<hsa_barrier_and_packet_t*>(
         static_cast<hsa_kernel_dispatch_packet_t*>(s->q->base_address) + (idx & s->mask));
@@ -1098,10 +1178,18 @@ int dispatch(Stream* s, const KernelRec* k, dim3 g, dim3 b, void** args, size_t 
     put(Hidden::GridDims, 3);
     put(Hidden::DynamicLds, shm);
 
+    /* A live stamp's signal, taken before the queue lock (the pool has its own). */
+    hsa_signal_t stamp{0};
+    if (t_lstamp_on && s->ord == 0) stamp = lstamp_take();
+
     s->lock();
     uint64_t idx = 0;
     const int rc = reserve(s, &idx);
-    if (rc < 0) { s->unlock(); return rc; }
+    if (rc < 0) {
+        s->unlock();
+        if (stamp.handle) lstamp_give(stamp);
+        return rc;
+    }
     char* slot = s->karg + (size_t)(idx & s->mask) * kKargSlot;
     std::memcpy(slot, ka, n);
     auto* p = static_cast<hsa_kernel_dispatch_packet_t*>(s->q->base_address) + (idx & s->mask);
@@ -1134,12 +1222,32 @@ int dispatch(Stream* s, const KernelRec* k, dim3 g, dim3 b, void** args, size_t 
     const int rel = (fence & kFenceReleaseSystem) ? HSA_FENCE_SCOPE_SYSTEM : HSA_FENCE_SCOPE_AGENT;
     /* Behind another chained kernel a chained one waits in its prologue; a completion signal keeps
      * the bit, since its completion must cover everything before it. */
-    const bool keep = !(chain && s->prev_chained && !s->plain_inflight && !p->completion_signal.handle);
+    bool keep = !(chain && s->prev_chained && !s->plain_inflight && !p->completion_signal.handle);
+    /* The live issue path's permit (see "the live window"); never without an open window. */
+    if (keep && t_live.s == s && live_permits(s, idx, k, fence, p, capturing())) keep = false;
+    /* A live stamp, after the bit is decided so it cannot change it: on the ride's signal where
+     * one rides here (held out of the pool until read, as a play does), else on its own. */
+    hsa_signal_t stamped{0};
+    bool stamp_own = false;
+    if (stamp.handle) {
+        if (p->completion_signal.handle) {
+            stamp_hold(p->completion_signal, true);
+            stamped = p->completion_signal;
+        } else {
+            p->completion_signal = stamp;
+            stamped = stamp;
+            stamp_own = true;
+        }
+    }
     publish(s, idx, header(HSA_PACKET_TYPE_KERNEL_DISPATCH, acq, rel, keep), setup);
     if (chain) s->chain_issued += blocks_of(p);
     s->prev_chained = chain;
     s->plain_inflight = keep ? !chain : s->plain_inflight || !chain;
+    live_note(s, idx, keep, false);
+    const uint32_t qid = s->id;
     s->unlock();
+    if (stamp.handle && !stamp_own) lstamp_give(stamp);
+    if (stamped.handle) lstamp_row(stamped, stamp_own, keep, chain, qid, idx, k->object);
     return RAD_OK;
 }
 
@@ -1158,6 +1266,15 @@ constexpr int kPlayRing = 64;
 struct PlayLeft { uint32_t q = UINT32_MAX; uint64_t wr = 0; };
 constexpr int kPlayLeft = 8;
 thread_local PlayLeft t_left[kPlayLeft];
+
+/* A dispatch played under RADIANCE_AQL_STAMP (see "dispatch timestamps"). `sig` goes in as the
+ * stamp's own signal and comes out as the packet's completion signal, which is a record's or a
+ * ride's where one rides on the dispatch. */
+struct PlayStamp {
+    hsa_signal_t sig{};
+    bool         ordered = false;
+    bool         chained = false;
+};
 
 struct PlayRun {
     const Tape* tape = nullptr;   /* the tape played, for a chained record's argument bytes */
@@ -1193,7 +1310,7 @@ struct PlayRun {
     /* `done`, when set, is the packet's completion signal and `rel_min` its minimum release
      * scope, for a record riding on this dispatch (see a_tape_play). */
     int put(const TapeRec& r, uint64_t* out_idx, hsa_signal_t done = hsa_signal_t{0},
-            int rel_min = HSA_FENCE_SCOPE_NONE) {
+            int rel_min = HSA_FENCE_SCOPE_NONE, PlayStamp* stamp = nullptr) {
         if (s != r.s) {
             end();
             s = r.s;
@@ -1218,6 +1335,12 @@ struct PlayRun {
             s->ride.handle = 0;
         }
         if (done.handle) p->completion_signal = done;
+        if (stamp) {
+            /* Before the header: once the packet completes, the signal may return to the pool. */
+            if (done.handle) stamp_hold(done, true);
+            else p->completion_signal = stamp->sig;
+            stamp->sig = p->completion_signal;
+        }
         /* A chained record plays from this queue's own argument slot, where its chain record goes:
          * the tape's copy is shared by every play, and the next step's play may be written while
          * this one runs. */
@@ -1243,6 +1366,10 @@ struct PlayRun {
          * kernel that reads its output and sits behind a chained one (a cache read beside a
          * collective, say) would wait for the chained blocks only. */
         if (chain && s->prev_chained && !s->plain_inflight && !foreign && !done.handle) ordered = false;
+        if (stamp) {
+            stamp->ordered = ordered;
+            stamp->chained = chain;
+        }
         const uint16_t h = header(HSA_PACKET_TYPE_KERNEL_DISPATCH, acq, rel, ordered);
         __atomic_store_n(reinterpret_cast<uint32_t*>(p), (uint32_t)h | ((uint32_t)r.pkt.setup << 16),
                          __ATOMIC_RELEASE);
@@ -1250,6 +1377,7 @@ struct PlayRun {
         if (chain) s->chain_issued += blocks_of(p);
         s->prev_chained = chain;
         s->plain_inflight = ordered ? !chain : s->plain_inflight || !chain;
+        live_note(s, idx, ordered, false);   /* a played packet: never in a live window */
         s->wr = idx + 1;
         next = idx + 1;
         *out_idx = idx;
@@ -1474,69 +1602,68 @@ namespace {
 
 using namespace aql;
 
-thread_local bool t_tiny_stream_creation=false;
 int a_stream_create(RadStream* out, int high_priority) {
     if (!out) return RAD_E_INVAL;
-    int ord=0;
-    if(hipGetDevice(&ord)!=hipSuccess || ord<0 || ord>=(int)G().dev.size()) {
-        device_set_error("rad_stream_create: no current device");return RAD_E_DEVICE;
+    int ord = 0;
+    if (hipGetDevice(&ord) != hipSuccess || ord < 0 || ord >= (int)G().dev.size()) {
+        device_set_error("rad_stream_create: no current device");
+        return RAD_E_DEVICE;
     }
-    try {
-        const Dev& d=G().dev[(size_t)ord];
-        auto s=std::make_unique<Stream>();s->ord=ord;s->agent=d.agent;
-        // Every successfully returned handle is owned before the next fallible
-        // operation, including allow_access and streams-vector growth. No queue
-        // submissions have occurred, so partial construction needs no drain.
-        struct Partial {
-            Stream* s;bool karg_noted=false,bounce_noted=false,committed=false;
-            ~Partial(){if(committed)return;
-                // Diagnostic history growth may itself be out of memory. It
-                // must not prevent actual partial-resource release.
-                if(s->bounce){if(bounce_noted){try{note_free(s->bounce);}catch(...){}}hsa_amd_memory_pool_free(s->bounce);}
-                if(s->karg){if(karg_noted){try{note_free(s->karg);}catch(...){}}hsa_amd_memory_pool_free(s->karg);}
-                if(s->q)hsa_queue_destroy(s->q);
-            }
-        } partial{s.get()};
-        if(hsa_queue_create(d.agent,kQueuePackets,HSA_QUEUE_TYPE_SINGLE,on_queue_error,s.get(),
-                            UINT32_MAX,UINT32_MAX,&s->q)!=HSA_STATUS_SUCCESS) {
-            device_set_error("rad_stream_create: hsa_queue_create failed on device %d",ord);return RAD_E_DEVICE;
-        }
-        if(t_tiny_stream_creation && s->q->size!=kQueuePackets)return RAD_E_UNSUPPORTED;
-        s->mask=s->q->size-1;
-        hsa_amd_profiling_set_profiler_enabled(s->q,1);
-        if(high_priority)hsa_amd_queue_set_priority(s->q,HSA_AMD_QUEUE_PRIORITY_HIGH);
-        void* ka=nullptr;
-        const auto kpool=d.host_kargs?G().host_fine:d.vram;
-        const auto kpeer=d.host_kargs?d.agent:G().cpu;
-        const auto alloc_k=hsa_amd_memory_pool_allocate(kpool,(size_t)(s->mask+2)*kKargSlot,0,&ka);
-        s->karg=static_cast<char*>(ka);
-        if(alloc_k!=HSA_STATUS_SUCCESS || hsa_amd_agents_allow_access(1,&kpeer,nullptr,ka)!=HSA_STATUS_SUCCESS) {
-            device_set_error("rad_stream_create: the kernel argument ring could not be placed in %s",
-                             d.host_kargs?"pinned host memory":"VRAM the host can write");return RAD_E_DEVICE;
-        }
-        s->chain_ctr=reinterpret_cast<uint64_t*>(s->karg+(size_t)(s->mask+1)*kKargSlot);
-        *reinterpret_cast<volatile uint64_t*>(s->chain_ctr)=0;_mm_sfence();
-        void* bb=nullptr;
-        const auto alloc_b=hsa_amd_memory_pool_allocate(G().host_fine,kBounceBytes,0,&bb);
-        s->bounce=static_cast<char*>(bb);
-        if(alloc_b!=HSA_STATUS_SUCCESS || hsa_amd_agents_allow_access(1,&d.agent,nullptr,bb)!=HSA_STATUS_SUCCESS) {
-            device_set_error("rad_stream_create: no pinned bounce buffer");return RAD_E_NOMEM;
-        }
-        note_alloc(ka,(int64_t)(s->mask+2)*kKargSlot,-1);partial.karg_noted=true;
-        note_alloc(bb,kBounceBytes,-1);partial.bounce_noted=true;
-        s->id=g_next_queue_id.fetch_add(1,std::memory_order_relaxed);
-        if(s->id>=kMaxQueues) {
-            device_set_error("rad_stream_create: more than %u streams in one process",kMaxQueues);return RAD_E_NOMEM;
-        }
-        {
-            std::lock_guard<std::mutex>lk(G().streams_mu);
-            G().streams.push_back(s.get());
-        }
-        // No fallible operation after visibility/publication.
-        g_queue_by_id[s->id].store(s->q,std::memory_order_release);
-        partial.committed=true;*out=(RadStream)s.release();return RAD_OK;
-    } catch(const std::bad_alloc&) {return RAD_E_NOMEM;}
-      catch(const std::system_error&) {return RAD_E_STATE;}
+    const Dev& d = G().dev[(size_t)ord];
+    auto s = std::make_unique<Stream>();
+    s->ord = ord;
+    s->agent = d.agent;
+    if (hsa_queue_create(d.agent, kQueuePackets, HSA_QUEUE_TYPE_SINGLE, on_queue_error, s.get(),
+                         UINT32_MAX, UINT32_MAX, &s->q) != HSA_STATUS_SUCCESS) {
+        device_set_error("rad_stream_create: hsa_queue_create failed on device %d", ord);
+        return RAD_E_DEVICE;
+    }
+    s->mask = s->q->size - 1;
+    hsa_amd_profiling_set_profiler_enabled(s->q, 1);
+    if (high_priority) hsa_amd_queue_set_priority(s->q, HSA_AMD_QUEUE_PRIORITY_HIGH);
+    void* ka = nullptr;
+    hsa_amd_memory_pool_t kpool = d.host_kargs ? G().host_fine : d.vram;
+    hsa_agent_t kpeer = d.host_kargs ? d.agent : G().cpu;
+    if (hsa_amd_memory_pool_allocate(kpool, (size_t)(s->mask + 2) * kKargSlot, 0, &ka) !=
+            HSA_STATUS_SUCCESS ||
+        hsa_amd_agents_allow_access(1, &kpeer, nullptr, ka) != HSA_STATUS_SUCCESS) {
+        hsa_queue_destroy(s->q);
+        device_set_error("rad_stream_create: the kernel argument ring could not be placed in %s",
+                         d.host_kargs ? "pinned host memory" : "VRAM the host can write");
+        return RAD_E_DEVICE;
+    }
+    s->karg = static_cast<char*>(ka);
+    s->chain_ctr = reinterpret_cast<uint64_t*>(s->karg + (size_t)(s->mask + 1) * kKargSlot);
+    *reinterpret_cast<volatile uint64_t*>(s->chain_ctr) = 0;
+    _mm_sfence();
+    void* bb = nullptr;
+    if (hsa_amd_memory_pool_allocate(G().host_fine, kBounceBytes, 0, &bb) != HSA_STATUS_SUCCESS ||
+        hsa_amd_agents_allow_access(1, &d.agent, nullptr, bb) != HSA_STATUS_SUCCESS) {
+        hsa_amd_memory_pool_free(ka);
+        hsa_queue_destroy(s->q);
+        device_set_error("rad_stream_create: no pinned bounce buffer");
+        return RAD_E_NOMEM;
+    }
+    s->bounce = static_cast<char*>(bb);
+    note_alloc(ka, (int64_t)(s->mask + 2) * kKargSlot, -1);
+    note_alloc(bb, kBounceBytes, -1);
+    s->id = g_next_queue_id.fetch_add(1, std::memory_order_relaxed);
+    if (s->id >= kMaxQueues) {
+        note_free(bb);
+        note_free(ka);
+        hsa_amd_memory_pool_free(bb);
+        hsa_amd_memory_pool_free(ka);
+        hsa_queue_destroy(s->q);
+        device_set_error("rad_stream_create: more than %u streams in one process", kMaxQueues);
+        return RAD_E_NOMEM;
+    }
+    g_queue_by_id[s->id].store(s->q, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lk(G().streams_mu);
+        G().streams.push_back(s.get());
+    }
+    *out = (RadStream)s.release();
+    return RAD_OK;
 }
 
 void a_stream_destroy(RadStream rs) {
@@ -1586,12 +1713,14 @@ struct Sig {
     bool         irq = false;                              /* an interrupt signal */
     hsa_agent_t  agent{};                                  /* where it was recorded */
     std::vector<std::pair<uint32_t, uint64_t>> waiters;    /* queue id, packet index */
+    bool         stamped = false;                          /* its times not read yet (stamp_hold) */
 };
 
 struct SigPool {
     std::mutex        mu;
     std::vector<Sig*> free[2];                             /* by irq */
     std::deque<Sig*>  retiring;                            /* in the order they were retired */
+    std::unordered_map<uint64_t, Sig*> by_handle;
 };
 
 SigPool& pool() {
@@ -1600,7 +1729,7 @@ SigPool& pool() {
 }
 
 bool reusable(const Sig* g) {
-    if (hsa_signal_load_relaxed(g->h) != 0) return false;
+    if (g->stamped || hsa_signal_load_relaxed(g->h) != 0) return false;
     for (const auto& w : g->waiters) {
         hsa_queue_t* q = g_queue_by_id[w.first].load(std::memory_order_acquire);
         if (q && hsa_queue_load_read_index_relaxed(q) <= w.second) return false;
@@ -1649,7 +1778,17 @@ Sig* sig_get(bool irq) {
     const hsa_status_t st = irq ? hsa_signal_create(0, 0, nullptr, &g->h)
                                 : hsa_amd_signal_create(0, 0, nullptr, HSA_AMD_SIGNAL_AMD_GPU_ONLY, &g->h);
     if (st != HSA_STATUS_SUCCESS || (irq && !interrupts(g->h))) return nullptr;
+    p.by_handle[g->h.handle] = g.get();
     return g.release();
+}
+
+/* A stamp's times live in the signal until a reuse overwrites them, so a record's or a ride's
+ * signal a stamp shares stays out of the free list until they are read. */
+void stamp_hold(hsa_signal_t h, bool on) {
+    SigPool& p = pool();
+    std::lock_guard<std::mutex> lk(p.mu);
+    auto it = p.by_handle.find(h.handle);
+    if (it != p.by_handle.end()) it->second->stamped = on;
 }
 
 void sig_retire(Sig* g) {
@@ -1925,6 +2064,383 @@ int a_tape_set_overlap(RadTape rt, int i, int on) {
     return RAD_OK;
 }
 
+/* ---- dispatch timestamps (RADIANCE_AQL_STAMP)
+ *
+ * RADIANCE_AQL_STAMP=N gives every dispatch of every Nth pass played on card 0 a completion signal,
+ * into which the packet processor writes the dispatch's start and end (profiling is on on every
+ * queue). Nothing else changes: PlayRun::put decides the barrier bit and the chain as without the
+ * signal, so the queues run the pass as unstamped. A pass is the plays of one tape from its record
+ * 0 on: Ctx::play_pass plays a pass in stretches between its host ops, and counting plays would
+ * time stretches rather than passes. A dispatch a record or a ride already rides on is stamped
+ * from that signal, held out of the pool until its times are read (stamp_hold).
+ *
+ * Nothing waits for the card: a later play on card 0 reads the signals that reached 0, in issue
+ * order, and appends a line per dispatch to RADIANCE_AQL_STAMP_OUT (default
+ * /tmp/radiance-stamps-<pid>.csv); exit waits briefly for the rest. */
+constexpr size_t kStampSignals = 8192;
+
+struct StampRow {
+    hsa_signal_t h{};
+    bool     own = false;           /* the stamp's signal, not a record's or a ride's */
+    bool     ordered = false;
+    bool     chained = false;
+    uint32_t queue = 0;
+    int      seq = 0;               /* its record in the tape */
+    uint32_t play = 0;              /* the play of the pass that issued it */
+    uint32_t records = 0;           /* the tape's length, which tells kinds of pass apart */
+    uint64_t pass = 0;
+    uint64_t kernel = 0;
+    bool     live = false;          /* a live dispatch (live_stamp): `idx` is its packet's index */
+    uint64_t idx = 0;
+};
+
+struct Stamps {
+    std::mutex   mu;
+    int          every = 0;
+    std::string  path;
+    FILE*        out = nullptr;
+    bool         out_failed = false;
+    bool         full_told = false;
+    uint64_t     passes = 0;         /* begun on card 0 */
+    const Tape*  tape = nullptr;     /* the pass being stamped, if one is */
+    uint32_t     play = 0;
+    std::vector<hsa_signal_t> free;
+    size_t       made = 0;
+    std::deque<StampRow> rows;       /* issued, times not read yet */
+    std::unordered_map<uint64_t, std::string> names;
+    /* The live stamps' own file (live_stamp's first path), and whether exit reads what is left. */
+    std::string  live_path;
+    FILE*        live_out = nullptr;
+    bool         live_failed = false;
+    bool         exit_hooked = false;
+};
+
+void stamps_at_exit();
+
+Stamps& stamps() {
+    static Stamps* st = [] {
+        Stamps* x = new Stamps();
+        const char* n = std::getenv("RADIANCE_AQL_STAMP");
+        x->every = n ? std::max(0, std::atoi(n)) : 0;
+        const char* o = std::getenv("RADIANCE_AQL_STAMP_OUT");
+        x->path = o && *o ? std::string(o) : fmt("/tmp/radiance-stamps-%d.csv", (int)getpid());
+        if (x->every) {
+            RAD_WARN("device: RADIANCE_AQL_STAMP times every dispatch of one pass in %d on card 0, "
+                     "into %s", x->every, x->path.c_str());
+            std::atexit(stamps_at_exit);
+            x->exit_hooked = true;
+        }
+        return x;
+    }();
+    return *st;
+}
+
+/* With st.mu held: the live stamps' file, opened on first use; null once it failed. */
+FILE* stamps_live_file(Stamps& st) {
+    if (st.live_out || st.live_failed) return st.live_out;
+    if (st.live_path.empty()) {
+        st.live_failed = true;
+        return nullptr;
+    }
+    st.live_out = std::fopen(st.live_path.c_str(), "a");
+    if (!st.live_out) {
+        st.live_failed = true;
+        RAD_WARN("device: live stamps: %s cannot be opened (%s); the times are dropped",
+                 st.live_path.c_str(), std::strerror(errno));
+        return nullptr;
+    }
+    std::fseek(st.live_out, 0, SEEK_END);
+    if (std::ftell(st.live_out) == 0)
+        std::fputs("pass,queue,idx,kernel,ordered,chained,start_ns,end_ns\n", st.live_out);
+    return st.live_out;
+}
+
+bool stamps_file(Stamps& st) {
+    if (st.out) return true;
+    if (st.out_failed) return false;
+    st.out = std::fopen(st.path.c_str(), "a");
+    if (!st.out) {
+        st.out_failed = true;
+        RAD_WARN("device: RADIANCE_AQL_STAMP: %s cannot be opened (%s); the times are dropped",
+                 st.path.c_str(), std::strerror(errno));
+        return false;
+    }
+    std::fseek(st.out, 0, SEEK_END);
+    if (std::ftell(st.out) == 0)
+        std::fputs("pass,seq,queue,kernel,ordered,chained,start_ns,end_ns,play,records\n", st.out);
+    return true;
+}
+
+const std::string& stamps_kernel(Stamps& st, uint64_t obj) {
+    auto it = st.names.find(obj);
+    if (it != st.names.end()) return it->second;
+    std::string n;
+    {
+        std::lock_guard<std::mutex> nl(g_names_mu);
+        auto k = g_names.find(obj);
+        n = k != g_names.end() ? k->second : fmt("%#" PRIx64, obj);
+    }
+    if (n.find_first_of(",\"") != std::string::npos) {
+        std::string q = "\"";
+        for (char c : n) {
+            if (c == '"') q += '"';
+            q += c;
+        }
+        n = q + "\"";
+    }
+    return st.names.emplace(obj, std::move(n)).first->second;
+}
+
+uint64_t stamps_ns(uint64_t t) {
+    return (uint64_t)((unsigned __int128)t * 1000000000u / G().ts_freq);
+}
+
+/* With st.mu held. Rows are read in issue order, so one still running holds back the rows after
+ * it, which a later call reads. */
+void stamps_read(Stamps& st, bool wait) {
+    bool wrote = false, wrote_live = false;
+    while (!st.rows.empty()) {
+        const StampRow w = st.rows.front();
+        if (hsa_signal_load_scacquire(w.h) != 0 &&
+            (!wait || G().faulted.load(std::memory_order_acquire) ||
+             hsa_signal_wait_scacquire(w.h, HSA_SIGNAL_CONDITION_EQ, 0, G().ts_freq / 10,
+                                       HSA_WAIT_STATE_ACTIVE) != 0))
+            break;
+        hsa_amd_profiling_dispatch_time_t t{};
+        const bool timed = hsa_amd_profiling_get_dispatch_time(G().dev[0].agent, w.h, &t) ==
+                           HSA_STATUS_SUCCESS;
+        if (w.own) st.free.push_back(w.h);
+        else stamp_hold(w.h, false);
+        st.rows.pop_front();
+        if (w.live) {
+            /* Keyed by (pass, queue, packet index), which the issue path's trace names per op. */
+            FILE* f = stamps_live_file(st);
+            if (!f) continue;
+            std::fprintf(f, "%" PRIu64 ",%u,%" PRIu64 ",%s,%d,%d,", w.pass, w.queue, w.idx,
+                         stamps_kernel(st, w.kernel).c_str(), (int)w.ordered, (int)w.chained);
+            if (timed) std::fprintf(f, "%" PRIu64 ",%" PRIu64 "\n", stamps_ns(t.start), stamps_ns(t.end));
+            else std::fputs(",\n", f);
+            wrote_live = true;
+            continue;
+        }
+        if (!stamps_file(st)) continue;
+        std::fprintf(st.out, "%" PRIu64 ",%d,%u,%s,%d,%d,", w.pass, w.seq, w.queue,
+                     stamps_kernel(st, w.kernel).c_str(), (int)w.ordered, (int)w.chained);
+        if (timed) std::fprintf(st.out, "%" PRIu64 ",%" PRIu64, stamps_ns(t.start), stamps_ns(t.end));
+        else std::fputc(',', st.out);
+        std::fprintf(st.out, ",%u,%u\n", w.play, w.records);
+        wrote = true;
+    }
+    if (wrote) std::fflush(st.out);
+    if (wrote_live) std::fflush(st.live_out);
+}
+
+void stamps_at_exit() {
+    Stamps& st = stamps();
+    std::lock_guard<std::mutex> lk(st.mu);
+    stamps_read(st, true);
+    if (st.out) std::fclose(st.out);
+    st.out = nullptr;
+    st.out_failed = true;
+    if (st.live_out) std::fclose(st.live_out);
+    st.live_out = nullptr;
+    st.live_failed = true;
+}
+
+/* ---- the live stamps (live_stamp): the issue path's timestamps, for the passes no tape plays.
+ *
+ * The Ctx turns them on around the passes its chain trace records (runtime/live_chain.h); every
+ * kernel the thread writes on card 0 meanwhile gets a signal from the play stamps' pool, taken 64
+ * at a time so a dispatch rarely touches the lock. Rows wait in the thread until the pass ends,
+ * then join the play stamps' queue, read in issue order without waiting at the next pass's start
+ * and at exit. */
+struct LiveStampTl {
+    uint64_t pass = 0;
+    std::vector<hsa_signal_t> sig;    /* taken from the pool, armed when used */
+    std::vector<StampRow> rows;       /* stamped this pass */
+};
+thread_local LiveStampTl t_lst;
+
+hsa_signal_t lstamp_take() {
+    if (t_lst.sig.empty()) {
+        Stamps& st = stamps();
+        std::lock_guard<std::mutex> lk(st.mu);
+        while (t_lst.sig.size() < 64) {
+            hsa_signal_t h{};
+            if (!st.free.empty()) {
+                h = st.free.back();
+                st.free.pop_back();
+            } else if (st.made < kStampSignals &&
+                       hsa_amd_signal_create(1, 0, nullptr, HSA_AMD_SIGNAL_AMD_GPU_ONLY, &h) ==
+                           HSA_STATUS_SUCCESS) {
+                ++st.made;
+            } else {
+                break;
+            }
+            t_lst.sig.push_back(h);
+        }
+        if (t_lst.sig.empty()) {
+            if (!st.full_told) {
+                st.full_told = true;
+                RAD_WARN("device: live stamps: %zu signals are in flight; dispatches are stamped "
+                         "in part until they are read", st.made);
+            }
+            return hsa_signal_t{0};
+        }
+    }
+    const hsa_signal_t h = t_lst.sig.back();
+    t_lst.sig.pop_back();
+    hsa_signal_silent_store_relaxed(h, 1);
+    return h;
+}
+
+void lstamp_give(hsa_signal_t h) { t_lst.sig.push_back(h); }
+
+void lstamp_row(hsa_signal_t h, bool own, bool ordered, bool chained, uint32_t queue, uint64_t idx,
+                uint64_t kernel) {
+    StampRow w;
+    w.h = h;
+    w.own = own;
+    w.ordered = ordered;
+    w.chained = chained;
+    w.queue = queue;
+    w.pass = t_lst.pass;
+    w.kernel = kernel;
+    w.live = true;
+    w.idx = idx;
+    t_lst.rows.push_back(w);
+}
+
+int a_live_pos(RadStream rs, uint32_t* queue, uint64_t* wr, uint64_t* last_tag) {
+    Stream* s = ours(rs);
+    if (!s) return RAD_E_INVAL;
+    s->lock();
+    if (queue) *queue = s->id;
+    if (wr) *wr = s->wr;
+    if (last_tag) *last_tag = s->last_tag;
+    s->unlock();
+    return RAD_OK;
+}
+
+void a_live_open(RadStream rs, uint64_t tag, uint64_t at, int permit) {
+    t_live = LiveWin{};
+    t_live.s = ours(rs);
+    t_live.tag = tag;
+    t_live.at = at;
+    t_live.permit = permit != 0 && t_live.s != nullptr;
+}
+
+void a_live_close(uint64_t* first, int32_t* packets, int* flags) {
+    if (first) *first = t_live.first;
+    if (packets) *packets = t_live.packets;
+    if (flags)
+        *flags = (t_live.unordered ? LIVE_FIRST_UNORDERED : 0) | (t_live.barrier ? LIVE_BARRIER : 0);
+    t_live = LiveWin{};
+}
+
+void a_live_stamp(int on, uint64_t pass, const char* path) {
+    Stamps& st = stamps();
+    std::lock_guard<std::mutex> lk(st.mu);
+    if (on) {
+        if (st.live_path.empty() && path && *path) st.live_path = path;
+        if (!st.exit_hooked) {
+            st.exit_hooked = true;
+            std::atexit(stamps_at_exit);
+        }
+        stamps_read(st, false);
+        t_lst.pass = pass;
+        t_lstamp_on = true;
+        return;
+    }
+    t_lstamp_on = false;
+    st.free.insert(st.free.end(), t_lst.sig.begin(), t_lst.sig.end());
+    t_lst.sig.clear();
+    st.rows.insert(st.rows.end(), t_lst.rows.begin(), t_lst.rows.end());
+    t_lst.rows.clear();
+}
+
+/* The stamping of one play: a signal for each of its dispatches, taken up front so the play
+ * takes the lock twice rather than once a dispatch. */
+struct StampRun {
+    bool     on = false;
+    uint64_t pass = 0;
+    uint32_t play = 0;
+    uint32_t records = 0;
+    std::vector<hsa_signal_t> sig;
+    size_t   used = 0;
+    std::vector<StampRow> rows;
+
+    void begin(const Tape* t, int from, int to) {
+        Stamps& st = stamps();
+        if (!st.every || from >= to || t->rec[(size_t)from].s->ord != 0) return;
+        std::lock_guard<std::mutex> lk(st.mu);
+        stamps_read(st, false);
+        if (from == 0) {
+            st.tape = ++st.passes % (uint64_t)st.every == 0 ? t : nullptr;
+            st.play = 0;
+        }
+        if (!st.tape || st.tape != t) return;
+        size_t n = 0;
+        for (int i = from; i < to; ++i) n += t->rec[(size_t)i].kind == kTapeDispatch;
+        while (sig.size() < n) {
+            hsa_signal_t h{};
+            if (!st.free.empty()) {
+                h = st.free.back();
+                st.free.pop_back();
+            } else if (st.made < kStampSignals &&
+                       hsa_amd_signal_create(1, 0, nullptr, HSA_AMD_SIGNAL_AMD_GPU_ONLY, &h) ==
+                           HSA_STATUS_SUCCESS) {
+                ++st.made;
+            } else {
+                break;
+            }
+            hsa_signal_silent_store_relaxed(h, 1);
+            sig.push_back(h);
+        }
+        if (sig.size() < n) {
+            st.tape = nullptr;
+            if (!st.full_told) {
+                st.full_told = true;
+                RAD_WARN("device: RADIANCE_AQL_STAMP: %zu signals are in flight, pass %" PRIu64
+                         " and any pass that finds them so are stamped in part", st.made, st.passes);
+            }
+        }
+        on = true;
+        pass = st.passes;
+        play = st.play++;
+        records = (uint32_t)t->rec.size();
+    }
+    PlayStamp* take(PlayStamp& ps) {
+        if (!on || used == sig.size()) return nullptr;
+        ps = PlayStamp{};
+        ps.sig = sig[used++];
+        return &ps;
+    }
+    void drop() { --used; }
+    void note(const TapeRec& r, int seq, const PlayStamp& ps) {
+        StampRow w;
+        w.h = ps.sig;
+        w.own = ps.sig.handle == sig[used - 1].handle;
+        if (!w.own) --used;
+        w.ordered = ps.ordered;
+        w.chained = ps.chained;
+        w.queue = r.s->id;
+        w.seq = seq;
+        w.play = play;
+        w.records = records;
+        w.pass = pass;
+        w.kernel = r.pkt.kernel_object;
+        rows.push_back(w);
+    }
+    void end() {
+        if (sig.empty()) return;
+        Stamps& st = stamps();
+        std::lock_guard<std::mutex> lk(st.mu);
+        st.free.insert(st.free.end(), sig.begin() + (std::ptrdiff_t)used, sig.end());
+        st.rows.insert(st.rows.end(), rows.begin(), rows.end());
+    }
+};
+
 int a_tape_play(RadTape rt, int from, int to) {
     Tape* t = tape_of(rt);
     if (!t || from < 0 || to > (int)t->rec.size() || from > to) {
@@ -1935,6 +2451,8 @@ int a_tape_play(RadTape rt, int from, int to) {
     int rc = RAD_OK;
     PlayRun run;
     run.tape = t;
+    StampRun stamp;
+    stamp.begin(t, from, to);
     for (int i = from; i < to && rc >= 0; ++i) {
         const TapeRec& r = t->rec[(size_t)i];
         if (r.kind == kTapeDispatch) {
@@ -1953,8 +2471,14 @@ int a_tape_play(RadTape rt, int from, int to) {
                 break;
             }
             uint64_t idx = 0;
-            rc = run.put(r, &idx, g ? g->h : hsa_signal_t{0}, rel);
-            if (rc < 0) break;
+            PlayStamp ps;
+            PlayStamp* sp = stamp.take(ps);
+            rc = run.put(r, &idx, g ? g->h : hsa_signal_t{0}, rel, sp);
+            if (rc < 0) {
+                if (sp) stamp.drop();
+                break;
+            }
+            if (sp) stamp.note(r, i, ps);
             bool found = false;
             for (auto& l : t->last)
                 if (l.first == r.s->id) { l.second = idx; found = true; break; }
@@ -1975,6 +2499,7 @@ int a_tape_play(RadTape rt, int from, int to) {
                                    : a_event_wait((RadStream)r.s, r.ev);
     }
     run.end();
+    stamp.end();
     --t_tape_pause;
     return rc;
 }
@@ -2671,9 +3196,9 @@ int64_t a_gate_room(RadStream rs) {
 
 /* Waits for the mark, then for the card's link gate if a collective has ever held it (under TP
  * the all-reduce shares the link and the step waits on it, not on these copies), copies, writes
- * `done`, then the list's number. */
+ * `done`, then the list's number. RAD_XP_NO_YIELD skips the gate (rad_xp_list). */
 int a_xp_list(int ord, void* mark, int n, const uint64_t* src, const uint64_t* dst, const uint64_t* bytes,
-              uint32_t* done, uint32_t done_val) {
+              uint32_t* done, uint32_t done_val, unsigned flags) {
     DmaQueue* dq = xp_queue(ord);
     if (!dq) return RAD_E_UNSUPPORTED;
     Sig* in = (Sig*)mark;
@@ -2687,7 +3212,8 @@ int a_xp_list(int ord, void* mark, int n, const uint64_t* src, const uint64_t* d
                                    10u /* interval */ | (0xfffu << 16) /* retry forever */ };
         rc = dma_put(dq, poll, 6);
     }
-    if (rc == RAD_OK && n > 0 && lane && lane->ever_held && lane->gate.handle) {
+    if (rc == RAD_OK && n > 0 && lane && lane->ever_held && lane->gate.handle &&
+        !(flags & RAD_XP_NO_YIELD)) {
         const uint64_t ga = (uint64_t)lane->gate.handle + offsetof(amd_signal_t, value);
         const uint32_t gate[6] = { kSdmaPoll | (3u << 28) /* equal */ | (1u << 31) /* memory */,
                                    (uint32_t)ga, (uint32_t)(ga >> 32), 0u, 1u /* the low bit */,
@@ -2720,6 +3246,29 @@ int a_xp_list(int ord, void* mark, int n, const uint64_t* src, const uint64_t* d
     }
     dma_kick(dq);
     return rc;
+}
+
+/* rad_event_dma: a fresh signal for the event, at 0. The caller arms it with a 1 written in stream
+ * order: a host store could land ahead of a wait still queued for the previous copy, and an event
+ * record completes by reaching 0, the value the wait looks for. A fresh signal each time keeps two
+ * uses from sharing one word. */
+int a_event_dma(RadEvent re, RadStream rs, uint32_t** word) {
+    if (!word) { device_set_error("rad_event_dma: null word"); return RAD_E_INVAL; }
+    if (capturing()) {
+        device_set_error("rad_event_dma: a tape cannot record a DMA list; the caller must re-run "
+                         "this call with the tape paused");
+        return RAD_E_STATE;
+    }
+    Event* e = ev_of(re);
+    Stream* s = ours(rs);
+    if (!e || !s) { device_set_error("rad_event_dma: null or foreign argument"); return RAD_E_INVAL; }
+    Sig* g = sig_get(e->host);
+    if (!g) { device_set_error("rad_event_dma: no signal could be made"); return RAD_E_DEVICE; }
+    hsa_signal_silent_store_relaxed(g->h, 0);
+    g->agent = s->agent;
+    record_adopt(e, g);
+    *word = (uint32_t*)(uintptr_t)sig_value_addr(g);
+    return RAD_OK;
 }
 
 int64_t a_xp_behind(int ord) {
@@ -3523,29 +4072,6 @@ int a_code_runs(size_t from, size_t to, int device, char* why, int cap) {
     return 1;
 }
 
-int a_tiny_stream_create(RadStream* out) {
-    struct Guard {Guard(){t_tiny_stream_creation=true;}~Guard(){t_tiny_stream_creation=false;}} guard;
-    return a_stream_create(out,0);
-}
-int a_tiny_startup_quote(TinyBackendQuote* out) {
-    if(!out)return RAD_E_INVAL;
-    int ord=-1;
-    if(hipGetDevice(&ord)!=hipSuccess || ord<0 || ord>=(int)G().dev.size()) return RAD_E_DEVICE;
-    TinyBackendQuote q{};
-    q.stream_size=sizeof(Stream);q.event_size=sizeof(Event);
-    q.signal_size=sizeof(Sig);q.signal_pool_size=sizeof(SigPool);
-    q.allocation_record_size=sizeof(AllocRec);q.allocation_history_limit=kFreedKept;
-    q.host_wait_tls_element_size=sizeof(uint64_t);q.stream_registry_element_size=sizeof(Stream*);
-    q.queue_depth=kQueuePackets;
-    q.stream_packet_bytes=(uint64_t)kQueuePackets*sizeof(hsa_kernel_dispatch_packet_t);
-    q.stream_karg_bytes=(uint64_t)(kQueuePackets+1)*kKargSlot;
-    q.stream_bounce_bytes=kBounceBytes;
-    q.karg_host=G().dev[(size_t)ord].host_kargs?1:0;
-    // Signals, driver internals and vendor-global state remain explicitly opaque.
-    q.stream_control_allowance=16384;
-    *out=q;return RAD_OK;
-}
-
 DeviceBackend g_aql;
 
 }  // namespace
@@ -3573,8 +4099,6 @@ const DeviceBackend* aql_backend_if_present(void) {
         G().ok = true;
         g_aql = *hip;
         g_aql.name = "aql";
-        g_aql.tiny_startup_quote = a_tiny_startup_quote;
-        g_aql.tiny_stream_create = a_tiny_stream_create;
         g_hip_alloc = hip->alloc;
         g_hip_free = hip->free;
         g_hip_host_ptr = hip->host_ptr;
@@ -3632,6 +4156,11 @@ const DeviceBackend* aql_backend_if_present(void) {
         g_aql.stream_gate = a_stream_gate;
         g_aql.gate_open = a_gate_open;
         g_aql.gate_room = a_gate_room;
+        g_aql.event_dma = a_event_dma;
+        g_aql.live_pos = a_live_pos;
+        g_aql.live_open = a_live_open;
+        g_aql.live_close = a_live_close;
+        g_aql.live_stamp = a_live_stamp;
         return &g_aql;
     }();
     return b;

@@ -23,8 +23,6 @@
 #include <vector>
 
 namespace rad {
-class NativeInventory;
-class Plan;
 
 /* ------------------------------------------------------------------ the allocator seam */
 /* Pools allocate through this interface rather than rad_dev_alloc so they run without ROCm: the
@@ -149,11 +147,6 @@ public:
     int configure(const Config& cfg, int64_t vram_capacity,
                   MemAllocator* device = nullptr, MemAllocator* host = nullptr);
 
-    // Typed native profile adds only inventory landing bytes; old expert host pool must be 0.
-    int configure_native(const Config&,int64_t,const Plan&,
-                         MemAllocator* device=nullptr,MemAllocator* host=nullptr);
-    const NativeInventory* native_inventory()const{return native_inventory_.get();}
-
     Pool& weights()     { return weights_; }
     Pool& kv()          { return kv_; }
     Pool& host_pinned() { return host_; }
@@ -171,8 +164,6 @@ public:
     std::vector<Shortfall> shortfalls() const;
 
 private:
-    int configure_impl(const Config&,int64_t,int64_t extra_pinned,MemAllocator*,MemAllocator*);
-    std::shared_ptr<const NativeInventory> native_inventory_;
     Pool weights_, kv_, host_;
     std::string fit_report_;
     bool configured_ = false;

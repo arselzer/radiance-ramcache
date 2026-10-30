@@ -1170,6 +1170,89 @@ TEST(gemma4_chunking_and_batching_change_no_logit) {
                             { "--max-num-batched-tokens", "512", "--max-num-seqs", "4" });
 }
 
+/* GPTQ for the Gemma 4 31B's w4a8 container, end to end on the tiny Gemma 4 (shaped like the 31B):
+ * arch/gemma4's calibration tap records the trunk's Hessians from the bf16 checkpoint at --tp 2,
+ * where o_proj's and down's inputs are split and each rank writes its block; rad-convert makes the
+ * container with the two shipped recipes, round to nearest and GPTQ; and on documents the Hessians
+ * never saw, the GPTQ one is more than three times closer to the bf16 model (5.8 times here). A
+ * Hessian under another name or of another width is refused, and the weight rounds to nearest,
+ * said on stderr. With the ranks' blocks swapped, the codes fit the wrong inputs and GPTQ is only
+ * 2.2 times closer. */
+TEST(gemma4_s_calibration_tap_gives_gptq_a_container_closer_to_bf16_than_rounding) {
+    REQUIRE(world().ok);
+    World& w = world();
+    const tiny::Gemma4 s;
+    tiny::TempDir d("e2e_g4calib");
+    const std::string grams = d / "grams";
+    REQUIRE(::mkdir(grams.c_str(), 0755) == 0);
+    const Ran tap = radiance(w.gemma4, { "--tp", "2", "--kld-record", d / "tap", "--kld-corpus",
+                                         w.corpus, "--max-num-batched-tokens", "512",
+                                         "--max-num-seqs", "1" },
+                             { "RADIANCE_HOST_DEVICES=2", "RADIANCE_CALIB_DIR=" + grams,
+                               "RADIANCE_CALIB_TOKENS=1000" });
+    if (tap.status != 0) fprintf(stderr, "    the tap exited %d:\n%s\n", tap.status, tail(tap.log).c_str());
+    REQUIRE_EQ(tap.status, 0);
+    /* Rank 0 writes q|k|v's and gate|up's inputs whole; each rank its half of o_proj's (the heads)
+     * and of down's (the FFN). A global layer's heads are wider. */
+    auto expect = [&](int rank, const std::string& what, int64_t k) {
+        const std::string f = grams + "/gram.r" + std::to_string(rank) + "." + what + ".bin";
+        std::error_code ec;
+        const auto n = std::filesystem::file_size(f, ec);
+        if (ec || (int64_t)n != 32 + k * k * 4)
+            fprintf(stderr, "    %s: %s, expected %lld bytes\n", f.c_str(),
+                    ec ? "missing" : std::to_string(n).c_str(), (long long)(32 + k * k * 4));
+        CHECK(!ec && (int64_t)n == 32 + k * k * 4);
+    };
+    for (int64_t l = 0; l < s.layers; ++l) {
+        const std::string b = "blk." + std::to_string(l) + ".";
+        const int64_t hd = (l + 1) % s.interval == 0 ? s.global_head_dim : s.head_dim;
+        expect(0, b + "attn_qkv", s.hidden);
+        expect(0, b + "ffn_gate_up", s.hidden);
+        for (int rank : { 0, 1 }) {
+            expect(rank, b + "attn_o.part", s.heads * hd / 2);
+            expect(rank, b + "ffn_down.part", s.ffn / 2);
+        }
+    }
+
+    auto convert = [&](const char* recipe, const std::string& out, std::string* log) {
+        const int st = tiny::run({ RAD_E2E_CONVERT, w.gemma4, "-o", out, "--recipe",
+                                   std::string(RAD_E2E_RECIPES "/") + recipe, "--set",
+                                   "quantization_config.quant_method=compressed-tensors",
+                                   "--kernels", "libref" },
+                                 engine_env({ "CALIB=" + grams }), log);
+        if (st != 0) fprintf(stderr, "    rad-convert exited %d:\n%s\n", st, tail(*log).c_str());
+        return st;
+    };
+    std::string rlog, glog;
+    REQUIRE_EQ(convert("gemma4-31b-dense-bf16-w4a8-df2.recipe", d / "rtn.rad", &rlog), 0);
+    REQUIRE_EQ(convert("gemma4-31b-dense-bf16-w4a8g-df2.recipe", d / "gptq.rad", &glog), 0);
+    /* Every trunk linear of every layer fitted to its Hessian, none rounded to nearest. */
+    size_t fitted = 0;
+    for (size_t at = glog.find("GPTQ quantises"); at != std::string::npos;
+         at = glog.find("GPTQ quantises", at + 1))
+        ++fitted;
+    CHECK_EQ(fitted, (size_t)(4 * s.layers));
+    CHECK(glog.find("rounding it to nearest") == std::string::npos);
+
+    std::string ref_log;
+    const std::string ref = w.reference(w.gemma4, w.corpus_short, &ref_log);
+    REQUIRE(!ref.empty());
+    auto kl = [&](const std::string& rad) {
+        tiny::TempDir o("e2e_g4calib_kld");
+        const Ran r = radiance(rad, { "--kld-ref", ref, "--kld-out", o / "kld.json",
+                                      "--max-num-batched-tokens", "512", "--max-num-seqs", "1" });
+        if (r.status != 0) fprintf(stderr, "    child exited %d:\n%s\n", r.status, tail(r.log).c_str());
+        const json rep = json::parse(tiny::read_text(o / "kld.json"), nullptr, false);
+        return rep.is_object() && rep.contains("all") ? rep["all"]["kld"]["mean"].get<double>()
+                                                      : -1.0;
+    };
+    const double rtn = kl(d / "rtn.rad"), gptq = kl(d / "gptq.rad");
+    fprintf(stderr, "    mean KL against the bf16 model: round to nearest %.4g, GPTQ %.4g\n", rtn,
+            gptq);
+    REQUIRE(rtn > 0.0 && gptq > 0.0);
+    CHECK(gptq * 3.0 < rtn);
+}
+
 /* A container rad-convert made block fp8 (llama_dense_fp8): the fp8 activation quantisers and
  * GEMMs are per row too, so the invariants hold through them. */
 TEST(llama_fp8_container_chunking_and_batching_change_no_logit) {
@@ -1620,11 +1703,145 @@ TEST(seeded_sampling_repeats_and_is_unchanged_by_speculation) {
         CHECK(a == b);
         CHECK(a != other);
         CHECK(a != greedy);
-        const int64_t drafted = timing(sb, "draft_n");
-        if (drafted <= 0) fprintf(stderr, "    %s: nothing drafted\n", f.name);
-        CHECK(drafted > 0);
+        /* Prompt lookup verifies a proposal only when it pays at the measured step cost
+         * (sched/lookup.h), and this sampled reply hardly repeats, so whether `spec` verified
+         * anything depends on the host's timings. The verify path at this temperature is held to
+         * the plain draw through the harness instead, which is always verified: it proposes the
+         * plain run's own reply with 30% of the drafts corrupted, so verifies accept and reject. */
+        const std::string oracle =
+            radtest::tmp_path(std::string("oracle-sampled-") + f.name + ".txt");
+        {
+            std::string ids;
+            for (int32_t t : a) ids += std::to_string(t) + " ";
+            FILE* fp = std::fopen(oracle.c_str(), "w");
+            REQUIRE(fp != nullptr);
+            std::fputs(ids.c_str(), fp);
+            std::fclose(fp);
+        }
+        Server orc;
+        REQUIRE(orc.start(world().*f.model, { "--spec-ngram", "4", "--no-prefix-cache",
+                                              "--debug-draft-oracle", oracle }));
+        const json ob = post(orc.port, "/completion", req);
+        CHECK_EQ(orc.stop(), 0);
+        if (a != tokens_of(ob)) fprintf(stderr, "    %s plain %s\n    %s oracle %s\n", f.name,
+                                        show(a).c_str(), f.name, show(tokens_of(ob)).c_str());
+        CHECK(a == tokens_of(ob));
+        const int64_t drafted = timing(ob, "draft_n"), accepted = timing(ob, "draft_n_accepted");
+        fprintf(stderr, "    %s: harness drafted %lld, accepted %lld (lookup drafted %lld)\n", f.name,
+                (long long)drafted, (long long)accepted,
+                (long long)std::max<int64_t>(0, timing(sb, "draft_n")));
+        CHECK(drafted > accepted);
+        CHECK(accepted > 0);
         CHECK_EQ(plain.stop(), 0);
         CHECK_EQ(spec.stop(), 0);
+    }
+}
+
+/* --spec-ngram K: prompt lookup alone at window K, here with single-token patterns allowed and,
+ * in the second arm, the adaptive window cutting each sequence's lookups to its own acceptance.
+ * Greedy text must equal one-token-a-step decoding token for token, a seeded draw must repeat
+ * its plain run's draw (a lookup draft is a point mass, for which accepting on agreement with the
+ * target's draw is the speculative-sampling rule: accept with probability p(x), else a draw from
+ * p without x), and the timings must show lookups made, some taken and some not. The code-edit
+ * prompt asks for a copy with a rename, the case prompt lookup is for. */
+TEST(spec_ngram_alone_returns_the_tokens_plain_decoding_returns) {
+    REQUIRE(world().ok);
+    const std::vector<int32_t> edit = tiny::byte_ids(
+        "Rename total to acc in this function and keep the rest as it is.\n"
+        "def add_all(xs):\n    total = 0\n    for x in xs:\n        total = total + x\n"
+        "    return total\n\ndef add_all(xs):\n    acc = 0\n    for x in xs:\n");
+    const std::vector<std::string> kArms[] = {
+        { "--spec-ngram", "4", "--spec-ngram-min", "1", "--no-prefix-cache" },
+        { "--spec-ngram", "4", "--draft-window", "adaptive", "--no-prefix-cache" } };
+    for (const Family& f : kSpecFamilies) {
+        Server plain;
+        REQUIRE(plain.start(world().*f.model, kPlain));
+        for (const std::vector<std::string>& arm : kArms) {
+            Server ng;
+            REQUIRE(ng.start(world().*f.model, arm));
+            CHECK(has(ng.output(), "speculation: prompt lookup only (--spec-ngram 4)"));
+            int64_t drafted = 0, accepted = 0;
+            for (const std::vector<int32_t>* p : { &repetitive_prompt(), &edit }) {
+                const json a = post(plain.port, "/completion", completion(*p, 48));
+                int status = 0;
+                const json b = post(ng.port, "/completion", completion(*p, 48), &status);
+                CHECK_EQ(status, 200);
+                const std::vector<int32_t> ta = tokens_of(a), tb = tokens_of(b);
+                CHECK_EQ(ta.size(), (size_t)48);
+                if (ta != tb)
+                    fprintf(stderr, "    %s %s plain %s\n    ngram %s\n", f.name, arm[3].c_str(),
+                            show(ta).c_str(), show(tb).c_str());
+                CHECK(ta == tb);
+                drafted += std::max<int64_t>(timing(b, "draft_n"), 0);
+                accepted += std::max<int64_t>(timing(b, "draft_n_accepted"), 0);
+            }
+            fprintf(stderr, "    %s %s %s: drafted %lld, accepted %lld\n", f.name, arm[2].c_str(),
+                    arm[3].c_str(), (long long)drafted, (long long)accepted);
+            CHECK(drafted > accepted);
+            CHECK(accepted > 0);
+
+            const json req = completion(repetitive_prompt(), 64, 0.7, 4321);
+            const std::vector<int32_t> sa = tokens_of(post(plain.port, "/completion", req));
+            const json sb = post(ng.port, "/completion", req);
+            if (sa != tokens_of(sb))
+                fprintf(stderr, "    %s seeded plain %s\n    ngram %s\n", f.name, show(sa).c_str(),
+                        show(tokens_of(sb)).c_str());
+            CHECK(sa == tokens_of(sb));
+            CHECK_EQ(ng.stop(), 0);
+        }
+        CHECK_EQ(plain.stop(), 0);
+    }
+}
+
+/* The verify path with rejections at every depth, on text that never repeats: the harness
+ * (--debug-draft-oracle) proposes from the plain run's own continuation with 30% of the
+ * drafts corrupted, so a verify accepts 0..4 drafts and rolls back the rest, on each family's
+ * recurrent state, conv window and sliding window. Text and logprobs must be the plain run's. */
+TEST(verifies_that_reject_at_every_depth_return_the_plain_tokens) {
+    REQUIRE(world().ok);
+    for (const Family& f : kSpecFamilies) {
+        Server plain;
+        REQUIRE(plain.start(world().*f.model, kPlain));
+        const std::vector<int32_t> p = prompt_ids(77, 50);
+        const json a = post(plain.port, "/completion", completion(p, 40, 0.0, 0, 2));
+        CHECK_EQ(plain.stop(), 0);
+        const std::vector<int32_t> ta = tokens_of(a);
+        REQUIRE(ta.size() == 40);
+        const std::string oracle = radtest::tmp_path(std::string("oracle-") + f.name + ".txt");
+        {
+            std::string ids;
+            for (int32_t t : ta) ids += std::to_string(t) + " ";
+            FILE* fp = std::fopen(oracle.c_str(), "w");
+            REQUIRE(fp != nullptr);
+            std::fputs(ids.c_str(), fp);
+            std::fclose(fp);
+        }
+        Server ng;
+        REQUIRE(ng.start(world().*f.model, { "--spec-ngram", "4", "--no-prefix-cache",
+                                             "--debug-draft-oracle", oracle }));
+        const json b = post(ng.port, "/completion", completion(p, 40, 0.0, 0, 2));
+        CHECK_EQ(ng.stop(), 0);
+        const std::vector<int32_t> tb = tokens_of(b);
+        if (ta != tb)
+            fprintf(stderr, "    %s plain %s\n    oracle %s\n", f.name, show(ta).c_str(),
+                    show(tb).c_str());
+        CHECK(ta == tb);
+        const int64_t drafted = timing(b, "draft_n"), accepted = timing(b, "draft_n_accepted");
+        fprintf(stderr, "    %s: drafted %lld, accepted %lld\n", f.name, (long long)drafted,
+                (long long)accepted);
+        CHECK(drafted > 2 * accepted);
+        CHECK(accepted > 4);
+        /* Every emitted token's logprobs are its own row's, verify row or decode row alike. */
+        double worst = 0;
+        const json& pa = a["completion_probabilities"];
+        const json& pb = b["completion_probabilities"];
+        REQUIRE(pa.size() == pb.size());
+        for (size_t i = 0; i < pa.size(); ++i)
+            worst = std::max(worst,
+                             std::fabs(pa[i]["top_logprobs"][0]["logprob"].get<double>() -
+                                       pb[i]["top_logprobs"][0]["logprob"].get<double>()));
+        fprintf(stderr, "    %s: worst |dlogprob| %.3g\n", f.name, worst);
+        CHECK(worst < 0.1);
     }
 }
 
@@ -1811,6 +2028,73 @@ TEST(decoding_without_a_drafter_issues_steps_ahead) {
     CHECK_EQ(metric(spec.port, "radiance:engine_steps_ahead_total"), 0.0);
     CHECK_EQ(plain.stop(), 0);
     CHECK_EQ(spec.stop(), 0);
+}
+
+/* The step that emits a request's last token issues nothing behind it: a step issued ahead for a
+ * request the commit then finishes verifies nothing, and the next request would wait out its
+ * forward pass. A reply of 32 tokens is the prefill's token and 31 decode steps, each
+ * issued ahead of the one before it, and no 32nd. Twice, so the second request starts behind the
+ * first's last step. */
+TEST(a_requests_last_step_issues_no_step_ahead) {
+    REQUIRE(world().ok);
+    Server plain;
+    REQUIRE(plain.start(world().lfm2, kPlain));
+    for (uint64_t seed : { 6, 7 }) {
+        const std::vector<int32_t> t =
+            tokens_of(post(plain.port, "/completion", completion(prompt_ids(seed, 80), 32)));
+        CHECK_EQ(t.size(), (size_t)32);
+    }
+    const double decode = metric(plain.port, "radiance:engine_steps_decode_total");
+    const double ahead = metric(plain.port, "radiance:engine_steps_ahead_total");
+    if (decode != 62.0 || ahead != 62.0)
+        fprintf(stderr, "    decode steps %g, issued ahead %g\n", decode, ahead);
+    CHECK_EQ(decode, 62.0);
+    CHECK_EQ(ahead, 62.0);
+    CHECK_EQ(plain.stop(), 0);
+}
+
+/* RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP: a reply that ends on its end-of-generation token runs
+ * no forward pass after it. A grammar of two letters makes that token the third: the prompt's step
+ * samples the first letter, two decode steps the second and the end. Issued ahead regardless, a
+ * third decode step follows the end and runs for the finished request, which the shutdown report
+ * counts; with the switch each step's tokens are read back before the next is planned, and
+ * nothing follows the end. The replies are the same. The counts are the report's, taken at the
+ * requests' commits, not /metrics', which the step behind a reply reaches only after it. */
+TEST(a_reply_that_ends_on_its_end_token_runs_no_pass_after_it) {
+    REQUIRE(world().ok);
+    auto ask = [](int port, uint64_t seed) {
+        const json b = { { "prompt", prompt_ids(seed, 40) }, { "n_predict", 16 },
+                         { "temperature", 0.0 }, { "grammar", "root ::= \"ab\"" },
+                         { "return_tokens", true } };
+        return post(port, "/completion", b);
+    };
+    auto field = [](const json& j, const char* k) {
+        return j.is_object() ? j.value(k, std::string()) : std::string();
+    };
+    Server plain, skip;
+    REQUIRE(plain.start(world().lfm2, kPlain));
+    REQUIRE(skip.start(world().lfm2, kPlain, { "RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP=1" }));
+    for (uint64_t seed : { 8, 9 }) {
+        const json a = ask(plain.port, seed), b = ask(skip.port, seed);
+        const std::string ea = field(a, "stop_type"), eb = field(b, "stop_type");
+        if (ea != "eos" || eb != "eos" || tokens_of(a) != tokens_of(b))
+            fprintf(stderr, "    seed %llu:\n    %s\n    %s\n", (unsigned long long)seed,
+                    a.dump().c_str(), b.dump().c_str());
+        CHECK_EQ(ea, std::string("eos"));
+        CHECK_EQ(eb, std::string("eos"));
+        CHECK(tokens_of(a) == tokens_of(b));
+        CHECK_EQ(field(a, "content"), std::string("ab"));
+        CHECK_EQ(field(b, "content"), std::string("ab"));
+    }
+    CHECK_EQ(plain.stop(), 0);
+    CHECK_EQ(skip.stop(), 0);
+    const std::string lp = plain.output(), ls = skip.output();
+    const bool ok = has(lp, "post-stop passes: 2 request(s) ended with a step issued ahead") &&
+                    has(ls, "post-stop passes: 0 request(s) ended with a step issued ahead") &&
+                    has(ls, "2 of them ended their request and issued nothing behind it");
+    if (!ok) fprintf(stderr, "    plain:\n%s\n    skip:\n%s\n", tail(lp, 6).c_str(),
+                     tail(ls, 6).c_str());
+    CHECK(ok);
 }
 
 /* Decoding a token runs the recurrent kernels over one row; prefilling it runs the chunked ones

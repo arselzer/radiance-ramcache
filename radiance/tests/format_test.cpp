@@ -1620,6 +1620,8 @@ TEST(safetensors_refuses_a_shape_that_is_not_its_span) {
         "{\"t\":{\"dtype\":\"F32\",\"shape\":[-1,-1],\"data_offsets\":[0,4]}}",
         /* fewer elements than the span */
         "{\"t\":{\"dtype\":\"BF16\",\"shape\":[1],\"data_offsets\":[0,4]}}",
+        /* an E8M0 scale is one byte: nine of them are not four bytes */
+        "{\"t\":{\"dtype\":\"F8_E8M0\",\"shape\":[9],\"data_offsets\":[0,4]}}",
     };
     for (const char* h : bad) {
         const std::string path = st_write(h);
@@ -1633,8 +1635,9 @@ TEST(safetensors_refuses_a_shape_that_is_not_its_span) {
         "{\"t\":{\"dtype\":\"F32\",\"shape\":[],\"data_offsets\":[0,4]}}",        /* a scalar */
         "{\"t\":{\"dtype\":\"BF16\",\"shape\":[2,1],\"data_offsets\":[0,4]}}",
         "{\"t\":{\"dtype\":\"F32\",\"shape\":[0,7],\"data_offsets\":[4,4]}}",     /* empty */
+        "{\"t\":{\"dtype\":\"F8_E8M0\",\"shape\":[4],\"data_offsets\":[0,4]}}",   /* four 1-byte scales */
         /* an unsized dtype is left to consumers, which refuse it by name */
-        "{\"t\":{\"dtype\":\"F8_E8M0\",\"shape\":[9],\"data_offsets\":[0,4]}}",
+        "{\"t\":{\"dtype\":\"F64\",\"shape\":[9],\"data_offsets\":[0,4]}}",
     };
     for (const char* h : good) {
         const std::string path = st_write(h);
@@ -2013,6 +2016,30 @@ TEST(a_converter_weight_name_finds_its_imatrix_row) {
     CHECK(!im.importance_for("blk.5.ffn_down_exps.-1.weight", 4, &w));
     CHECK(!im.importance_for("blk.5.ffn_down_exps.x.weight", 4, &w));
     CHECK(!im.importance_for("blk.0.attn_k.weight", 4, &w));
+}
+
+/* llama.cpp's imatrix (tools/imatrix, "%s.in_sum2" of the tensor's name) keeps `.weight` in every
+ * entry's name; a converter weight finds that spelling too, dense or an expert of a stack. */
+TEST(a_converter_weight_name_finds_llama_cpps_spelling) {
+    const std::string path = write_tmp("names-llama.imatrix", gguf_bytes(
+        {
+            { "blk.0.attn_q.weight.in_sum2", { 4 }, { 1.0f, 2.0f, 3.0f, 6.0f } },
+            { "blk.5.ffn_down_exps.weight.in_sum2", { 4, 2 },
+              { 1.0f, 1.0f, 1.0f, 1.0f,  8.0f, 4.0f, 2.0f, 2.0f } },
+            { "blk.5.ffn_down_exps.weight.counts", { 1, 2 }, { 10.0f, 3.0f } },
+        },
+        {}));
+    ImatrixFile im;
+    REQUIRE(im.open(path) == RAD_OK);
+    std::vector<float> w;
+    REQUIRE(im.importance_for("blk.0.attn_q.weight", 4, &w));
+    CHECK_NEAR(w[0], 1.0 / 3.0, 1e-6);
+    CHECK_NEAR(w[3], 2.0, 1e-6);
+    REQUIRE(im.importance_for("blk.5.ffn_down_exps.1.weight", 4, &w));
+    CHECK_NEAR(w[0], 2.0, 1e-6);                   /* expert 1's own row, mean 4 */
+    CHECK_NEAR(w[2], 0.5, 1e-6);
+    CHECK(!im.importance_for("blk.5.ffn_down_exps.2.weight", 4, &w)); /* no expert 2 */
+    CHECK(!im.importance_for("blk.0.attn_q.weight", 5, &w));
 }
 
 /* With general.alignment 1 every float of a payload may sit at an odd address; the importance is

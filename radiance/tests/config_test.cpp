@@ -16,6 +16,7 @@
 #include "diag/diag.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <map>
 #include <regex>
@@ -52,6 +53,15 @@ struct LogGuard {
 };
 
 }  /* namespace */
+
+namespace {
+struct DraftBankEnv {
+    const char*key="RADIANCE_EXPERIMENTAL_DS41_DSPARK_RAD_BANK";
+    bool present;std::string value;
+    DraftBankEnv():present(std::getenv(key)!=nullptr),value(present?std::getenv(key):""){}
+    ~DraftBankEnv(){if(present)::setenv(key,value.c_str(),1);else ::unsetenv(key);}
+};
+}
 
 /* ================================================================== the shape of the call */
 
@@ -271,6 +281,36 @@ TEST(the_paths_and_names_reach_their_fields) {
     CHECK_EQ(c.override_chat_template, std::string("/t.jinja"));
 }
 
+/* The plane mirror is off unless a directory is named; its share and minimum pass have stated
+ * defaults and refuse what the reader cannot honour; only the disk tier's misses read it. */
+TEST(the_plane_mirror_is_off_by_default_and_takes_its_directory_share_and_rows) {
+    Config d;
+    CHECK_EQ(parse({}, &d), RAD_OK);
+    CHECK(d.expert_plane_mirror.empty());
+    CHECK_EQ(d.expert_plane_mirror_share, 0.18);
+    CHECK_EQ(d.expert_plane_mirror_min_rows, 2ll);
+    CHECK_EQ(d.expert_plane_mirror_decode_share, 0.0);
+
+    Config c;
+    CHECK_EQ(parse({ "--weights-disk-tier",
+                     "--expert-plane-mirror", "/mirror/ckpt",
+                     "--expert-plane-mirror-share", "0.1",
+                     "--expert-plane-mirror-min-rows", "1",
+                     "--expert-plane-mirror-decode-share", "0.08" }, &c), RAD_OK);
+    CHECK_EQ(c.expert_plane_mirror, std::string("/mirror/ckpt"));
+    CHECK_EQ(c.expert_plane_mirror_share, 0.1);
+    CHECK_EQ(c.expert_plane_mirror_min_rows, 1ll);
+    CHECK_EQ(c.expert_plane_mirror_decode_share, 0.08);
+    CHECK_EQ(parse_fresh({ "--weights-disk-tier", "--expert-plane-mirror-decode-share", "0.5" }), RAD_E_INVAL);
+
+    CHECK_EQ(parse_fresh({ "--expert-plane-mirror", "/mirror/ckpt" }), RAD_E_INVAL);   /* no disk tier */
+    CHECK_EQ(parse_fresh({ "--weights-disk-tier", "--expert-plane-mirror-share", "0.4" }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--weights-disk-tier", "--expert-plane-mirror-share", "-0.1" }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--weights-disk-tier", "--expert-plane-mirror-share", "most" }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--weights-disk-tier", "--expert-plane-mirror-min-rows", "0" }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--weights-disk-tier", "--expert-plane-mirror" }), RAD_E_INVAL);   /* no directory */
+}
+
 /* The reasoning budget is a count or unset (-1); a negative value cannot be given. */
 TEST(thinking_token_budget_takes_a_count_and_defaults_to_none) {
     Config c;
@@ -407,10 +447,12 @@ std::vector<std::pair<std::string, std::string>> usage_options() {
         std::string name, arg;
         in >> name >> arg;
         /* The help starts after the padded column; a metavariable is upper case. */
+        // This one experimental help row prints its closed enum, not an uppercase metavariable.
+        const bool bank_enum = name == "--draft-bank-expert-placement" && arg == "auto|host";
         const bool is_arg = !arg.empty() && line.find(name + " " + arg) == 2 &&
-                            std::all_of(arg.begin(), arg.end(), [](char ch) {
+                            (bank_enum || std::all_of(arg.begin(), arg.end(), [](char ch) {
                                 return (ch >= 'A' && ch <= 'Z') || ch == '_';
-                            });
+                            }));
         out.emplace_back(name, is_arg ? arg : "");
     }
     return out;
@@ -422,22 +464,35 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--model", { "/m/y.rad" } }, { "--download-dir", { "/d" } },
         { "--radiance-home", { "/h1:/h2" } }, { "--kernels", { "libref" } },
         { "--tp", { "2" } }, { "--tp-wire", { "wht6" } }, { "--tp-wire-min-kb", { "64" } },
-        { "--tp-attn-split", { "rows" } },
+        { "--tp-attn-split", { "rows" } }, { "--weight-prefetch", { "off" } },
         { "--p2p", { "off" } }, { "--max-num-batched-tokens", { "512" } },
         { "--busy-prefill-chunk", { "256" } }, { "--prefill-interleave", { "2" } },
         { "--max-num-seqs", { "4" } },
         { "--max-model-len", { "4096" } }, { "--rope-scaling", { "yarn:4" } },
         { "--gpu-headroom-mib", { "128" } }, { "--kv-cache-dtype", { "fp8" } },
         { "--state-cache-dtype", { "f16" } }, { "--attn-prefill-fp8", { "both" } },
+        { "--kv-resident", { "65536" } },
         { "--host-pool-mib", { "1024" } }, { "--host-headroom-mib", { "2048" } },
+        { "--expert-ram-cache-total-mib", { "64", "--weights-disk-tier" } },
+        { "--expert-plane-mirror", { "/mirror", "--weights-disk-tier" } },
+        { "--expert-plane-mirror-share", { "0.1" } }, { "--expert-plane-mirror-min-rows", { "1" } },
+        { "--expert-plane-mirror-decode-share", { "0.08" } },
+        { "--expert-profile", { "decode-profile.json" } },
         { "--embedding-placement", { "vram" } },
         { "--vision-tower-placement", { "ram" } }, { "--ngram-placement", { "disk" } },
+        { "--row-prefetch", { "off" } }, { "--mapped-rewarm", { "off" } },
+        { "--debug-draft-oracle", { "/o.txt", "--spec-ngram", "4" } },
         { "--prefix-cache-mib", { "256" } }, { "--prefix-cache-ttl", { "60" } },
         { "--placement", { "all_vram" } }, { "--checkpoint-interval", { "256" } },
         { "--prefill-span", { "2" } },
         { "--checkpoint-slots", { "4" } }, { "--checkpoint-policy", { "tip-only" } },
-        { "--num-speculative-tokens", { "2" } }, { "--draft-window", { "fixed" } }, { "--draft-short-from", { "4" } },
+        { "--prefix-resume", { "nearest" } },
+        { "--num-speculative-tokens", { "2" } }, { "--spec-ngram", { "4" } },
+        { "--spec-ngram-min", { "1" } }, { "--spec-ngram-max", { "6" } },
+        { "--draft-window", { "fixed" } }, { "--draft-short-from", { "4" } },
         { "--draft-coupling", { "on" } },
+        { "--draft-bank", { "/d/head.rad" } },
+        { "--draft-bank-expert-placement", { "host", "--draft-bank", "/d/head.rad" } },
         { "--host", { "127.0.0.1" } }, { "--port", { "8001" } }, { "--api-key", { "k" } },
         { "--served-model-name", { "m" } }, { "--mm-max-patches", { "1024" } },
         { "--control-vector", { "off" } },
@@ -464,6 +519,9 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--video-min-frames", { "2" } }, { "--video-max-frames", { "8" } },
         { "--video-max-frame-tokens", { "70" } }, { "--image-tokens", { "280" } },
         { "--max-source-pixels", { "1000000" } },
+        { "--expert-stats", { "/s/experts.json" } },
+        { "--expert-pin-top", { "0.2" } },
+        { "--draft-expert-placement", { "host" } },
         { "--kld-record", { "/r", "--kld-corpus", "/c.jsonl" } }, { "--kld-ref", { "/r" } },
         { "--kld-corpus", { "/c.jsonl", "--kld-record", "/r" } },
         { "--kld-out", { "/o.json", "--kld-ref", "/r" } },
@@ -486,6 +544,8 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
  * setting. */
 TEST(every_listed_option_parses_and_is_reported_as_given) {
     LogGuard lg;
+    DraftBankEnv bank_opt;
+    REQUIRE(::setenv(bank_opt.key,"1",1)==0); // scoped only to legal-example parsing; negative cases retain their own gates
     const auto opts = usage_options();
     CHECK(opts.size() > 90);
     const std::vector<std::string> names = diag::config_option_names();
@@ -656,6 +716,19 @@ TEST(the_attention_split_is_one_of_two_names) {
     CHECK_EQ(parse({ "--tp-attn-split", "ROWS" }, &c), RAD_E_INVAL);
 }
 
+/* The weight reads beside the collectives are on unless a deployment turns them off; anything but
+ * the two names stops the server. */
+TEST(weight_prefetch_is_on_or_off) {
+    Config c;
+    CHECK(c.weight_prefetch);
+    CHECK_EQ(parse({ "--weight-prefetch", "off" }, &c), RAD_OK);
+    CHECK(!c.weight_prefetch);
+    CHECK_EQ(parse({ "--weight-prefetch", "on" }, &c), RAD_OK);
+    CHECK(c.weight_prefetch);
+    CHECK_EQ(parse({ "--weight-prefetch", "0" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--weight-prefetch", "" }, &c), RAD_E_INVAL);
+}
+
 /* The prefill attention's e4m3 legs are lossy, so the default is off and anything but the four
  * names stops the server. */
 TEST(the_attention_fp8_mode_is_one_of_four_names) {
@@ -724,6 +797,22 @@ TEST(the_kv_cache_dtype_is_one_of_four_names) {
     Config d;
     CHECK_EQ(parse({}, &d), RAD_OK);
     CHECK_EQ(d.kv_cache_dtype, std::string("bf16"));
+}
+
+/* --kv-resident is the whole switch: absent or 0 and nothing streams, and it is whole tokens
+ * rounded up to the group's page at startup. The mode flag is gone, and a launch line that still
+ * passes it is refused by name rather than silently served without streaming. */
+TEST(kv_resident_is_the_whole_switch_and_its_ring_is_whole_tokens) {
+    Config d;
+    CHECK_EQ(parse({}, &d), RAD_OK);
+    CHECK_EQ(d.kv_resident, 0ll);              /* nothing streams */
+    CHECK(!d.kv_streams);                      /* derived: no group streams either */
+    Config c;
+    CHECK_EQ(parse({ "--kv-resident", "262144" }, &c), RAD_OK);
+    CHECK_EQ(c.kv_resident, 262144ll);
+    CHECK_EQ(parse({ "--kv-resident", "0" }, &c), RAD_OK);
+    CHECK_EQ(c.kv_resident, 0ll);
+    CHECK_EQ(parse({ "--kv-resident", "-1" }, &c), RAD_E_INVAL);
 }
 
 /* The embedding takes ram (default) or vram; the n-gram table takes auto (default), vram, ram or
@@ -810,6 +899,40 @@ TEST(the_checkpoint_policy_is_one_of_the_three_that_exist) {
     Config d;
     CHECK_EQ(parse({}, &d), RAD_OK);
     CHECK_EQ(d.checkpoint_policy, std::string("geometric-backoff"));
+}
+
+/* --expert-stats is off until it names a file, and needs one. */
+TEST(expert_stats_is_off_until_it_names_a_file) {
+    LogGuard lg;
+    auto row = [](const Config& c) {
+        for (const diag::ConfigRow& r : diag::config_rows(c))
+            if (r.flag == "--expert-stats") return r;
+        return diag::ConfigRow{};
+    };
+    Config d;
+    CHECK_EQ(parse({}, &d), RAD_OK);
+    CHECK(d.expert_stats.empty());
+    CHECK_EQ(row(d).value, std::string("off"));
+    Config c;
+    CHECK_EQ(parse({ "--expert-stats", "/s/experts.json" }, &c), RAD_OK);
+    CHECK_EQ(c.expert_stats, std::string("/s/experts.json"));
+    CHECK_EQ(row(c).value, std::string("/s/experts.json"));
+    CHECK_EQ(row(c).source, std::string("command line"));
+    CHECK(parse_fresh({ "--expert-stats" }) < 0);
+}
+
+/* A prefix hit resumes on the cold run's chunk grid unless the operator trades that for a shorter
+ * re-prefill; any other word is refused. */
+TEST(prefix_resume_is_exact_unless_nearest_is_asked_for) {
+    Config d;
+    CHECK_EQ(parse({}, &d), RAD_OK);
+    CHECK(d.prefix_exact);
+    Config c;
+    CHECK_EQ(parse({ "--prefix-resume", "nearest" }, &c), RAD_OK);
+    CHECK(!c.prefix_exact);
+    CHECK_EQ(parse({ "--prefix-resume", "exact" }, &c), RAD_OK);
+    CHECK(c.prefix_exact);
+    CHECK_EQ(parse({ "--prefix-resume", "deepest" }, &c), RAD_E_INVAL);
 }
 
 /* --checkpoint-slots is auto by default, resolved by the engine once a snapshot's size is known;
@@ -1161,6 +1284,39 @@ TEST(auto_speculation_is_negative_one_and_not_zero) {
     CHECK_EQ(d.n_spec, -1);                /* auto is also the default */
 }
 
+/* --spec-ngram K is prompt lookup alone at window K: it sets the window, agrees with a matching
+ * --num-speculative-tokens and refuses another; the pattern range must be a range. Off by
+ * default, at the lengths 2..4. */
+TEST(spec_ngram_sets_the_window_and_refuses_another) {
+    Config d;
+    CHECK_EQ(parse({}, &d), RAD_OK);
+    CHECK_EQ(d.spec_ngram, 0);
+    CHECK_EQ(d.spec_ngram_min, 2);
+    CHECK_EQ(d.spec_ngram_max, 4);
+    Config c;
+    CHECK_EQ(parse({ "--spec-ngram", "5" }, &c), RAD_OK);
+    CHECK_EQ(c.spec_ngram, 5);
+    CHECK_EQ(c.n_spec, 5);
+    Config e;
+    CHECK_EQ(parse({ "--spec-ngram", "5", "--num-speculative-tokens", "5" }, &e), RAD_OK);
+    CHECK_EQ(e.n_spec, 5);
+    Config f;
+    {
+        LogGuard lg;
+        CHECK_EQ(parse({ "--spec-ngram", "5", "--num-speculative-tokens", "3" }, &f), RAD_E_INVAL);
+        CHECK_EQ(parse({ "--spec-ngram", "5", "--num-speculative-tokens", "auto" }, &f),
+                 RAD_E_INVAL);
+        CHECK_EQ(parse({ "--spec-ngram-min", "5", "--spec-ngram-max", "3" }, &f), RAD_E_INVAL);
+        CHECK_EQ(parse({ "--spec-ngram-max", "16" }, &f), RAD_E_INVAL);
+        CHECK_EQ(parse({ "--spec-ngram", "65" }, &f), RAD_E_INVAL);
+    }
+    Config g;
+    CHECK_EQ(parse({ "--spec-ngram-min", "1", "--spec-ngram-max", "8" }, &g), RAD_OK);
+    CHECK_EQ(g.spec_ngram_min, 1);
+    CHECK_EQ(g.spec_ngram_max, 8);
+    CHECK_EQ(g.n_spec, -1);              /* the range alone changes no window */
+}
+
 /* --gpu-headroom is an alias for --gpu-headroom-mib; both set the same field. */
 TEST(gpu_headroom_parses_under_both_spellings) {
     Config a, b, d;
@@ -1324,6 +1480,82 @@ TEST(rope_scaling_takes_yarn_with_a_factor_above_one_or_none) {
     Config d;
     CHECK_EQ(parse({}, &d), RAD_OK);
     CHECK(d.rope_scaling.empty());
+}
+
+TEST(external_expert_profile_is_off_until_an_explicit_input_is_given) {
+    Config c;
+    CHECK(c.expert_profile.empty());
+    CHECK(!c.expert_profile_given);
+    CHECK_OK(parse({ "--expert-profile", "decode-profile.json" }, &c));
+    CHECK(c.expert_profile == "decode-profile.json");
+    CHECK(c.expert_profile_given);
+    CHECK(c.expert_stats.empty());
+    CHECK_EQ(parse_fresh({ "--expert-profile" }), RAD_E_INVAL);
+}
+
+TEST(expert_pin_top_requires_a_finite_fraction) {
+    Config defaults;
+    CHECK_OK(parse({}, &defaults));
+    CHECK_EQ(defaults.expert_pin_top, 0.0f);
+    CHECK(!defaults.expert_pin_top_given);
+    CHECK_EQ(defaults.draft_expert_placement, std::string("auto"));
+    CHECK(!defaults.draft_expert_placement_given);
+    for (const char* value : {"0", "0.25", "1"}) {
+        Config c;
+        CHECK_OK(parse({"--expert-pin-top", value}, &c));
+        CHECK(c.expert_pin_top_given);
+        CHECK(std::isfinite(c.expert_pin_top));
+        CHECK(c.expert_pin_top >= 0.0f && c.expert_pin_top <= 1.0f);
+    }
+    for (const char* value : {"nan", "NaN", "nan(payload)", "inf", "+inf", "-inf",
+                              "1e309", "-0.1", "1.1", "0.25x"}) {
+        Config c;
+        CHECK_EQ(parse({"--expert-pin-top", value}, &c), RAD_E_INVAL);
+        CHECK(!c.expert_pin_top_given);
+        CHECK_EQ(c.expert_pin_top, 0.0f);
+    }
+}
+
+TEST(dspark_rad_bank_requires_exact_explicit_opt_in) {
+    DraftBankEnv old;
+    for(const char*v:{static_cast<const char*>(nullptr),"0","true","1junk",""}){
+        if(v)::setenv(old.key,v,1);else ::unsetenv(old.key);
+        CHECK_EQ(parse_fresh({"--draft-bank","head.rad"}),RAD_E_INVAL);
+    }
+    REQUIRE(::setenv(old.key,"1",1)==0);
+    Config c;CHECK_OK(parse({"--draft-bank","head.rad"},&c));CHECK(c.draft_bank=="head.rad");
+    CHECK_EQ(parse_fresh({"--draft-bank"}),RAD_E_INVAL);
+}
+TEST(dspark_bank_keeps_single_file_defaults_and_generic_draft_model_refused) {
+    DraftBankEnv old;REQUIRE(::setenv(old.key,"1",1)==0);
+    Config c;CHECK_OK(parse({},&c));CHECK(c.draft_bank.empty());
+    CHECK_EQ(parse_fresh({"--draft-model","head.rad"}),RAD_E_INVAL);
+    CHECK(c.n_spec==-1);CHECK_EQ(c.spec_ngram,0);
+}
+
+TEST(dspark_bank_expert_placement_is_explicit_and_keeps_automatic_budgeting_off) {
+    DraftBankEnv old; ::unsetenv(old.key);
+    CHECK_EQ(parse_fresh({"--draft-bank-expert-placement","host"}), RAD_E_INVAL);
+    REQUIRE(::setenv(old.key,"1",1)==0);
+    for (const char* mode : {"auto","host"}) {
+        Config c; CHECK_OK(parse({"--draft-bank-expert-placement",mode},&c));
+        CHECK(c.draft_bank_expert_placement == mode); CHECK(c.draft_bank.empty());
+    }
+    CHECK_EQ(parse_fresh({"--draft-bank-expert-placement","all"}),RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({"--draft-bank-expert-placement"}),RAD_E_INVAL);
+    Config d; CHECK(d.draft_bank_expert_placement == "auto");
+}
+
+TEST(dspark_bank_and_generic_manual_placement_modes_refuse_both_orders) {
+    DraftBankEnv env; REQUIRE(::setenv(env.key,"1",1)==0);
+    for(const char* bank : {"auto","host"})for(const char* generic : {"auto","host"}) {
+        CHECK_EQ(parse_fresh({"--draft-bank-expert-placement",bank,"--draft-expert-placement",generic}),RAD_E_INVAL);
+        CHECK_EQ(parse_fresh({"--draft-expert-placement",generic,"--draft-bank-expert-placement",bank}),RAD_E_INVAL);
+    }
+    Config bank;CHECK_OK(parse({"--draft-bank-expert-placement","host"},&bank));
+    CHECK_EQ(bank.host_pool_mib,Config{}.host_pool_mib);CHECK(bank.draft_expert_placement=="auto");
+    Config standard;CHECK_OK(parse({"--draft-expert-placement","host"},&standard));
+    CHECK(standard.draft_bank_expert_placement=="auto");
 }
 
 RAD_TEST_MAIN()

@@ -1,7 +1,0 @@
-{
-  "utc": "2026-10-26T05:54:41.846674+00:00",
-  "source": "/home/as/radiance-ramcache-glm-v12-flight/build/core-main-verified-v12-host-release",
-  "preserved": "/home/as/radiance-ramcache-glm-v12-flight/build/core-main-verified-v12-host-release-interrupted-for-QFN-recovery-20261026T0553",
-  "reason": "Incomplete unvalidated compilation cancelled to prioritizeQFN recovery; preserveallpartialobjects and beginfreshnextCore directory",
-  "published_source_manifest_unchanged": true
-}

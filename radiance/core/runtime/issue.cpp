@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include "ctx.h"
 #include "device/device.h"
+#include "kvstream/bind.h"
 #include "wtab.h"
 
 #include <cstring>
@@ -74,7 +75,6 @@ static inline bool byte_delta(int bits, int64_t elems, int64_t* out) {
 }
 
 void* Ctx::resolve_weight(rad_weight w) {
-    if (step_status_ < 0) return nullptr;
     /* The template carries WeightInfo::ptr, refreshed between steps after a move. In the
      * all-in-VRAM case that is the answer. */
     void* p = w_tmpl_[w].data;
@@ -91,16 +91,8 @@ void* Ctx::resolve_weight(rad_weight w) {
             /* Kept out of a recording: it orders every later play too, and moving a weight a
              * pass names directly re-keys the pass. */
             if (rec_) tape_pause(true);
-            const int wait_status = rad_event_wait(cur_stream(), s->ready);
+            rad_event_wait(cur_stream(), s->ready);         /* the stream waits, not the host */
             if (rec_) tape_pause(false);
-            if (wait_status < 0) {
-                /* An unsuccessful enqueue provides no ordering. Do not publish a pointer or
-                 * remember this generation; later callers must preserve the first failure. */
-                abort_step_msg(RAD_NULL_HANDLE, wait_status,
-                               fmt("readiness wait for weight '%s' failed: %s",
-                                   program_->weights[w].name.c_str(), rad_strerror(wait_status)));
-                return nullptr;
-            }
             waited[w] = s->generation;
             ++n_stream_waits_;
         }
@@ -257,13 +249,17 @@ int Ctx::table_refresh(rad_op h, int operand, WeightTable& t) {
     auto resolve = [&](int64_t e, void** out) -> int {
         const rad_weight w = (rad_weight)(t.first + e);
         void* p = resolve_weight(w);
-        if (step_status_ < 0) return step_status_;
         if (!p)
             return abort_step_msg(h, RAD_E_STATE,
                                   fmt("weight '%s' (entry %lld of operand %d's table) has no "
                                       "pointer at issue: the load phase never bound it and no "
                                       "residency table claims it",
                                       program_->weights[w].name.c_str(), (long long)e, operand));
+        /* RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED (place/vram_packed.h): a VRAM resident held in the
+         * packed-scale form is marked with bit 0 of its entry, which weights' 64-byte alignment leaves
+         * free; libr4d's moe_gemm_ggml_mxfp4_gemv_vp, the only row such a table reaches, reads the mark.
+         * A static resident's pointer never changes, so the mark is set once, at the first refresh. */
+        if (program_->weights[w].vram_bytes > 0) p = (void*)((uintptr_t)p | (uintptr_t)1);
         *out = p;
         return RAD_OK;
     };
@@ -375,12 +371,7 @@ int Ctx::weight_table_tensor(rad_op h, int operand, const WeightTable& t, const 
     out->rank      = e0.rank + 1;
     out->shape[0]  = t.n;
     out->stride[0] = 0;
-    /* A synchronous HOST row cannot walk a device-only pointer array. `cur` is
-     * the stable CPU mirror, refreshed before this descriptor is assembled;
-     * `host` is the immutable source of the first asynchronous device upload.
-     * Keep the latter immutable while a copy may still be queued. */
-    out->data      = op_domain_[h].load(std::memory_order_relaxed) == RAD_DOMAIN_HOST
-                         ? const_cast<void**>(t.cur.data()) : t.dev;
+    out->data      = t.dev;
     return RAD_OK;
 }
 
@@ -412,7 +403,6 @@ static long   g_iss_n   = 0;
  * after_op runs on the op's stream, where "every reader of this weight is behind us" can be
  * recorded. */
 int Ctx::issue(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
-    if (const int first = terminal_status(); first < 0) return first;
     if (!staging_) {
         const int rc = issue_body(h, opd, n_opd, n);
         if (rc < 0 || (size_t)h >= plans_.size() || plans_[h].lora_site < 0) return rc;
@@ -610,8 +600,12 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
                               : "has no device kernel for this band");
     /* The second lane's window (rad_lane1_window_begin): its concurrent buffers are live only across
      * it, so lane 1 runs nothing outside it, and lane 0 joins lane 1 before it runs an op outside
-     * it, on either side: a transient of such an op may share bytes with a concurrent buffer. */
-    if (program_ && program_->lane1_w1 >= 0) {
+     * it, on either side: a transient of such an op may share bytes with a concurrent buffer. An op
+     * that names no buffer (prefetch_beside's weight read) touches nothing the window keeps live,
+     * so it may run on lane 1 anywhere. */
+    bool names_buf = false;
+    for (int i = 0; i < n_opd && !names_buf; ++i) names_buf = opd[i].kind == RAD_OPK_BUF;
+    if (program_ && program_->lane1_w1 >= 0 && names_buf) {
         const bool outside = p.order < program_->lane1_w0 || p.order > program_->lane1_w1;
         if (lane_ == 1 && outside)
             return abort_step_msg(h, RAD_E_STATE,
@@ -625,7 +619,7 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
                 return abort_step_msg(h, js, "joining the second lane outside its window failed");
         }
     }
-    if (lane_ == 1) lane1_pending_ = true;
+    if (lane_ == 1 && names_buf) lane1_pending_ = true;
 
     /* The row's DIV on the ranged parameter held at the band's upper bound, maybe not here. */
     if (ip.ranged_div > 1 && n % ip.ranged_div != 0)
@@ -638,13 +632,23 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
         return abort_step_msg(h, RAD_E_INVAL,
                               fmt("issued with %d operands; the runtime carries at most %d",
                                   n_opd, MAX_OPERANDS));
-    if (p.n_opd_schema >= 0 && n_opd != p.n_opd_schema)
+    /* A count below the schema is legal only when every dropped slot is a *trailing optional*
+     * operand (rad_abi.h: "an absent optional operand is a null RadTensor.data" -- the shims
+     * branch on exactly that: r4d_opt(), rad_args_have(), libref's finish()). A count below the
+     * required floor shifts positions or drops a required operand, and operands are positional,
+     * so a miscount is silent numerical garbage. */
+    if (p.n_opd_schema >= 0 && (n_opd > p.n_opd_schema || n_opd < p.n_opd_required))
         return abort_step_msg(h, RAD_E_SCHEMA,
-                              fmt("issued with %d operands; the op's schema declares %d. Operands "
-                                  "are positional, so a miscount is silent numerical garbage",
-                                  n_opd, (int)p.n_opd_schema));
+                              fmt("issued with %d operands; the op's schema declares %d "
+                                  "(%d required, only trailing optional operands may be omitted). "
+                                  "Operands are positional, so a miscount is silent numerical "
+                                  "garbage",
+                                  n_opd, (int)p.n_opd_schema, (int)p.n_opd_required));
 
     RadTensor* t = tbuf_;
+    /* The schema slots the issue stopped short of: absent operands, null tensors rather than
+     * stale ones, since args.n_t covers every schema slot (rad_plugin.h). */
+    for (int i = n_opd; i < p.n_opd_schema; ++i) t[i] = RadTensor{};
     bool touches_host = false;   /* a host-domain buffer among the operands; see host_touch_ev_ */
 
     for (int i = 0; i < n_opd; ++i) {
@@ -720,7 +724,6 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
                                           "returned", i, wh));
             tt      = w_tmpl_[wh];
             tt.data = resolve_weight(wh);
-            if (step_status_ < 0) return step_status_;
             w_direct_[wh] = 1;
             if (!tt.data)
                 return abort_step_msg(h, RAD_E_STATE,
@@ -819,7 +822,7 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
             const int64_t layer = (o.offset >= 0 && (size_t)o.offset < b.layer_slot.size())
                                       ? b.layer_slot[(size_t)o.offset]
                                       : -1;
-            const int64_t off   = layer * b.layer_stride;
+            const int64_t off   = kv_binding_offset(b, layer);
             if (layer < 0 || (b.bytes && off + b.layer_stride > b.bytes))
                 return abort_step_msg(h, RAD_E_INVAL,
                                       fmt("operand %d asks KV group %u for layer %lld, which is "
@@ -853,10 +856,19 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
         }
     }
 
-    /* The rest of RadArgs was filled in at prepare; args.t already points at tbuf_. */
-    ip.args.n_t = n_opd;
+    /* The rest of RadArgs was filled in at prepare; args.t already points at tbuf_. There is one
+     * entry per schema operand, the trailing optional ones the issue left out null. */
+    ip.args.n_t = std::max(n_opd, (int)p.n_opd_schema);
     p.issued    = true;
     ++n_issues_;
+
+    /* The stager sees the resolved operands before the launch; what it queues on the stream runs
+     * right before the op (OpStager::operands). */
+    if (staging_ && stager_ && dom == RAD_DOMAIN_DEVICE) {
+        const int so = stager_->operands(h, cur_stream(), t, ip.args.n_t);
+        if (so < 0)
+            return abort_step_msg(h, so, "the weight stager could not prepare this op's operands");
+    }
 
     /* All-reduce link accounting: `n` is the collective's numel (its ranged parameter) and operand
      * 0's dtype is the wire element type. The op's `dtype` key ("w4a8") is not an element
@@ -869,7 +881,7 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
 
     /* The oracle snapshots every operand before the launch, so the host kernel sees the same
      * input bytes even for an in-place op. */
-    const IssuePlan* horacle = oracle_ ? oracle_before(h, b, n_opd) : nullptr;
+    const IssuePlan* horacle = oracle_ ? oracle_before(h, b, ip.args.n_t) : nullptr;
 
     /* ============================== a host launch is a join ==============================
      *
@@ -886,6 +898,7 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
      *
      * The device caches host-arena memory, so rad_dev_host_wrote after the launch makes the
      * host's writes visible to later kernels. */
+    const bool touch0 = host_touch_pending_[0], touch1 = host_touch_pending_[1];
     if (dom == RAD_DOMAIN_HOST) {
         /* Timed apart from the op: it is the cost of stopping the pipeline. */
         if (profiling_) {
@@ -897,6 +910,26 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
         } else {
             const int js = host_join(opd, n_opd);
             if (js < 0) return abort_step(h, b, dom, ip, n, js);
+        }
+    }
+
+    /* A host gather from the mapped tier: every page its rows cover is asked for now, so the
+     * kernel's faults wait on reads already in flight rather than issuing them one at a time
+     * (runtime/rowprefetch.h). After the join, since the ids may be a device op's output. Timed
+     * with the op when profiling: it is the op's own read. */
+    RowPrefetch rowpf{};
+    if (dom == RAD_DOMAIN_HOST && p.row_gather && row_prefetch_on_ &&
+        !(ip.row && ip.row->fetches_rows)) {
+        row_prefetch_plan(ip.args, opd, n_opd, t, &rowpf);
+        if (rowpf.n) {
+            if (profiling_) {
+                const auto r0 = std::chrono::steady_clock::now();
+                row_prefetch_run(rowpf, t, n);
+                prof_ms_[(size_t)h] += std::chrono::duration<double, std::milli>(
+                                           std::chrono::steady_clock::now() - r0).count();
+            } else {
+                row_prefetch_run(rowpf, t, n);
+            }
         }
     }
 
@@ -956,11 +989,10 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
         th.args = ip.args;
         th.n = n;
         th.drain = host_join_drains(opd, n_opd);
-        for (int i = 0; i < n_opd; ++i) {
-            th.t[i] = t[i];
-            if (opd[i].kind == RAD_OPK_WEIGHT)
-                th.direct_weights[th.n_direct_weights++] = opd[i].handle;
-        }
+        th.touch[0] = touch0;
+        th.touch[1] = touch1;
+        th.rp = rowpf;
+        for (int i = 0; i < n_opd; ++i) th.t[i] = t[i];
         TapeStep st;
         st.kind = kTapeHost;
         st.lane = (uint8_t)lane_;
@@ -988,6 +1020,12 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
             la = &gate_args;
         }
     }
+
+    /* The live issue path's overlap and trace (runtime/live_chain.h), last before the launch so
+     * that whatever the steps above put on the stream counts as in front of it. */
+    LiveCall lc;
+    if (live_.checking() && dom == RAD_DOMAIN_DEVICE && !rec_)
+        live_before(p, ip, t, opd, n_opd, touches_host, &lc);
 
     int s;
     if (profiling_ && dom == RAD_DOMAIN_HOST) {
@@ -1067,6 +1105,10 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
     } else {
         s = ip.launch(la, cur_stream());
     }
+    /* Closed whatever the launch returned: the link hold's release below is not the op's. */
+    if (lc.on) live_after(&lc);
+    /* A read-ahead beside a host gather stops with its kernel (runtime/rowprefetch.h). */
+    if (rowpf_beside_) row_prefetch_done();
     if (hold) {
         /* Always released, by a barrier unless the launch ended the hold itself
          * (RAD_LINK_ENDED); otherwise a list waiting on the hold never ends. */
@@ -1090,7 +1132,8 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
         if (er < 0) return abort_step(h, b, dom, ip, n, er);
         host_touch_pending_[l] = true;
     }
-    if (horacle) oracle_after(h, *horacle, ip, n_opd);
+    if (horacle) oracle_after(h, *horacle, ip, ip.args.n_t);
+    if (!ep_route_.empty()) note_ep_route_producer(*p.info, t, ip.args.n_t, n, cur_stream());
     return RAD_OK;
 }
 
@@ -1112,6 +1155,7 @@ void Ctx::haz_note(const OpPlan& p, const IssuePlan& ip, const RadTensor* t, int
     o.rec0 = rec0;
     o.rec1 = rec1;
     o.op = (uint32_t)(&p - plans_.data());
+    o.row = ip.row;
     const RadOpSchema* sc = p.info ? p.info->schema : nullptr;
     o.opaque = p.collective || !sc || sc->n_operands != n_opd || !ip.row || !ip.row->concurrent;
     std::pair<uintptr_t, uintptr_t> rd[MAX_OPERANDS + 1], wr[MAX_OPERANDS + 1];
@@ -1156,38 +1200,210 @@ void Ctx::haz_note(const OpPlan& p, const IssuePlan& ip, const RadTensor* t, int
     haz_ops_.push_back(o);
 }
 
-/* See "a host launch is a join" in Ctx::issue_body. */
-int Ctx::host_join(const RadOperand* opd, int n_opd) {
-    rad_weight weights[MAX_OPERANDS];
-    int n_weights = 0;
-    for (int i = 0; i < n_opd; ++i)
-        if (opd[i].kind == RAD_OPK_WEIGHT) weights[n_weights++] = opd[i].handle;
-    return host_join_wait(host_join_drains(opd, n_opd) ||
-                          host_weights_pending(weights, n_weights));
+/* ---------------------------------------------------------------- the live issue path
+ *
+ * What one device launch of a pass issued live reads and writes (runtime/live_chain.h), by
+ * haz_note's rules with three differences, each on the safe side or neutral:
+ *   - fewer operands than the schema are fine: the issue path nulls the trailing ones, and a null
+ *     operand touches nothing;
+ *   - a buffer, raw pointer or cache passed in a weight's slot is read like any input, since only
+ *     a declared weight is known never to be written in a pass; an unknown role is opaque;
+ *   - a write through a raw pointer (memory the core cannot place, possibly the host's) or any
+ *     host-arena operand makes the launch host-visible: it keeps its bit and orders the next. */
+static void live_ranges(const OpPlan& p, const IssuePlan& ip, const RadTensor* t,
+                        const RadOperand* opd, int n_opd, bool touches_host, LiveOp* o) {
+    const RadOpSchema* sc = p.info ? p.info->schema : nullptr;
+    o->host = touches_host;
+    o->opaque = p.collective || !sc || n_opd > (int)sc->n_operands || !ip.row || !ip.row->concurrent;
+    for (int i = 0; i < n_opd && !o->opaque; ++i) {
+        const RadTensor& tt = t[i];
+        if (!tt.data) continue;
+        const int role = sc->operands[i].role;
+        if (role == RAD_OPD_WEIGHT && opd[i].kind == RAD_OPK_WEIGHT) continue;
+        const uintptr_t lo = (uintptr_t)tt.data;
+        if (role == RAD_OPD_WTAB) {
+            /* The pointer array itself; the experts it names are weights. */
+            if (tt.rank < 1 || tt.shape[0] <= 0) { o->opaque = true; break; }
+            o->read(lo, lo + (uintptr_t)tt.shape[0] * sizeof(void*));
+            continue;
+        }
+        if (role != RAD_OPD_IN && role != RAD_OPD_OUT && role != RAD_OPD_INOUT &&
+            role != RAD_OPD_WEIGHT) {
+            o->opaque = true;
+            break;
+        }
+        const int bits = rad_dtype_bits(tt.dtype);
+        if (tt.rank == 0 || bits <= 0) { o->opaque = true; break; }
+        int64_t span = 1;
+        bool empty = false;
+        for (uint32_t d = 0; d < tt.rank; ++d) {
+            if (tt.shape[d] <= 0) { empty = true; break; }
+            if (tt.stride[d] < 0) { o->opaque = true; break; }
+            span += (tt.shape[d] - 1) * tt.stride[d];
+        }
+        if (o->opaque) break;
+        if (empty) continue;
+        const uintptr_t hi = lo + (uintptr_t)((span * bits + 7) / 8);
+        const bool writes = role == RAD_OPD_OUT || role == RAD_OPD_INOUT;
+        if (writes && opd[i].kind == RAD_OPK_RAW) o->host = true;
+        if (role != RAD_OPD_OUT) o->read(lo, hi);
+        if (writes) o->write(lo, hi);
+    }
+    if (!o->opaque && ip.args.scratch_bytes > 0 && ip.args.scratch) {
+        const uintptr_t lo = (uintptr_t)ip.args.scratch;
+        o->read(lo, lo + (uintptr_t)ip.args.scratch_bytes);
+        o->write(lo, lo + (uintptr_t)ip.args.scratch_bytes);
+    }
 }
 
-/* resolve_weight orders a transfer on the compute stream; a synchronous HOST launch is not
- * submitted to that stream. Even if an earlier device op already waited on this generation,
- * the CPU must join before reading its bytes. Query readiness anew on replay: settle() may
- * clear ready without changing the generation or the tape's stable dependencies. */
-bool Ctx::host_weights_pending(const rad_weight* weights, int n_weights) const {
-    if (!residency_) return false;
-    for (int i = 0; i < n_weights; ++i) {
-        const WeightSlot* slot = residency_->lookup(weights[i]);
-        if (slot && slot->ready) return true;
+/* Checks the launch against what is in flight on its queue and opens the backend's window: the
+ * first packet goes unordered only with the overlap on, the check clear, and the backend agreeing
+ * (DeviceBackend::live_open). With the overlap off the check still runs and is counted, which is
+ * the dump-only arm. */
+void Ctx::live_before(const OpPlan& p, const IssuePlan& ip, const RadTensor* t,
+                      const RadOperand* opd, int n_opd, bool touches_host, LiveCall* c) {
+    c->on = false;
+    c->s = cur_stream();
+    if (live_pos(c->s, &c->before.queue, &c->before.wr, &c->before.last_tag) < 0) return;
+    LiveQueues& q = live_.queues();
+    c->slot = q.claim();
+    LiveOp& o = q.op(c->slot);
+    o.reset(live_.next_tag(), (uint32_t)(&p - plans_.data()));
+    live_ranges(p, ip, t, opd, n_opd, touches_host, &o);
+    c->why = q.check(c->slot, c->before, &c->clash, &c->foreign);
+    c->permit = live_.overlap() && c->why == kLiveFree;
+    c->row = nullptr;
+    if (live_.tracing()) {
+        LiveTraceRow& r = live_.trace_row();
+        r.op = (uint32_t)(&p - plans_.data());
+        r.info = p.info;
+        r.row = ip.row;
+        r.lane = (uint8_t)lane_;
+        r.scratch = ip.args.scratch_bytes > 0 && ip.args.scratch;
+        const RadOpSchema* sc = p.info ? p.info->schema : nullptr;
+        r.n_opd = std::min(n_opd, (int)(sizeof r.opd / sizeof r.opd[0]));
+        for (int i = 0; i < r.n_opd; ++i) {
+            r.opd[i].kind = (uint8_t)opd[i].kind;
+            r.opd[i].role = sc && i < (int)sc->n_operands ? (uint8_t)sc->operands[i].role : 255;
+            r.opd[i].handle = opd[i].handle;
+            r.opd[i].offset = opd[i].offset;
+        }
+        c->row = &r;
     }
-    return false;
+    c->on = true;
+    live_open(c->s, o.tag, c->before.wr, c->permit);
+}
+
+/* Closes the window and books what the launch wrote: the queue's in-flight set, the counters, the
+ * trace's row. */
+void Ctx::live_after(LiveCall* c) {
+    LiveQueues::Win w;
+    live_close(&w.first, &w.packets, &w.flags);
+    LiveQueues::Pos after;
+    if (live_pos(c->s, &after.queue, &after.wr, &after.last_tag) < 0) after = LiveQueues::Pos{};
+    LiveQueues& q = live_.queues();
+    q.commit(c->slot, c->before, w, after);
+    LiveStats& st = live_.stats();
+    const bool decode = batch_ && batch_->phase == RAD_PHASE_DECODE;
+    const bool unord = (w.flags & LIVE_FIRST_UNORDERED) != 0;
+    ++st.launches;
+    if (decode) ++st.decode_launches;
+    if (c->why == kLiveFree) {
+        ++st.free;
+        if (decode) ++st.decode_free;
+    } else {
+        ++st.why[c->why];
+    }
+    if (unord) {
+        ++st.unordered;
+        if (decode) ++st.decode_unordered;
+    } else if (c->permit && w.packets > 0) {
+        ++st.refused;
+    }
+    if (w.packets > 1) ++st.multi;
+    if (w.packets == 0) ++st.silent;
+    if (LiveTraceRow* r = c->row) {
+        r->queue = c->before.queue;
+        r->first = w.first;
+        r->packets = w.packets;
+        r->unordered = unord;
+        r->would = c->why == kLiveFree;
+        r->why = (uint8_t)c->why;
+        r->foreign = c->foreign;
+        const uint64_t t0 = live_.pass_first_tag();
+        r->clash = c->why == kLiveClash && c->clash >= t0 ? (int64_t)(c->clash - t0) : -1;
+        r->ranges = q.op(c->slot);
+    }
+    c->on = false;
+}
+
+/* See "a host launch is a join" in Ctx::issue_body. */
+int Ctx::host_join(const RadOperand* opd, int n_opd) {
+    return host_join_wait(host_join_drains(opd, n_opd));
+}
+
+/* The tables a row gather's issue reads from the mapped tier (runtime/rowprefetch.h):
+ * every weight operand, taken whole, that holds at least n_vocab rows -- the gathers' own shape
+ * rule, which leaves out a codebook or a scalar scale -- at its stored row pitch. Nothing when
+ * the ids (operand 0) are not a buffer or raw pointer, or no table is mapped. */
+void Ctx::row_prefetch_plan(const RadArgs& a, const RadOperand* opd, int n_opd, const RadTensor* t,
+                            RowPrefetch* out) const {
+    out->n = 0;
+    if (n_opd < 2 || (opd[0].kind != RAD_OPK_BUF && opd[0].kind != RAD_OPK_RAW) || !t[0].data)
+        return;
+    long long vocab = 0, voff = 0;
+    if (!rad_args_geti(&a, "n_vocab", &vocab) || vocab <= 0) return;
+    rad_args_geti(&a, "vocab_offset", &voff);
+    for (int i = 1; i < n_opd && out->n < kRowTablesMax; ++i) {
+        const RadOperand& o = opd[i];
+        if (o.kind != RAD_OPK_WEIGHT || o.offset || o.rows > 0 || o.cols > 0) continue;
+        if (o.handle == RAD_NULL_HANDLE || (size_t)o.handle >= program_->weights.size()) continue;
+        const WeightInfo& w = program_->weights[o.handle];
+        if (w.tier != Tier::Mapped || !t[i].data) continue;
+        const int64_t rows = w.stored_rank ? w.stored_shape[0] : (w.decl.rank ? w.decl.shape[0] : 0);
+        const int64_t bytes = w.stored_bytes > 0 ? w.stored_bytes : w.logical_bytes;
+        if (rows < vocab || rows <= 0 || bytes <= 0 || bytes % rows) continue;
+        out->opd[out->n] = (int8_t)i;
+        out->row_bytes[out->n] = bytes / rows;
+        ++out->n;
+    }
+    out->rows = vocab;
+    out->voff = voff;
+}
+
+void Ctx::row_prefetch_run(const RowPrefetch& rp, const RadTensor* t, int64_t n) {
+    const int64_t have = rad_tensor_numel(&t[0]);
+    const int64_t m = have > 0 && have < n ? have : n;
+    if (m > 0 && rp.n > 0 && m * rp.n > kRowAheadInline && t[0].data &&
+        row_pages_resident(rp, t[0], m, t)) {
+        /* Long and its sampled rows resident: beside the kernel (rowprefetch.h);
+         * row_prefetch_done() after its launch. */
+        if (!rowpf_worker_) rowpf_worker_ = std::make_unique<RowPrefetchWorker>();
+        rowpf_worker_->start(rp, t[0], m, t);
+        rowpf_beside_ = true;
+        ++rowpf_calls_;
+        ++rowpf_beside_calls_;
+        return;
+    }
+    const int64_t pages = row_prefetch(rp, t[0], m, t, &rowpf_);
+    if (pages < 0) return;
+    ++rowpf_calls_;
+    rowpf_pages_ += pages;
+}
+
+/* The kernel a read-ahead ran beside has returned (or never launched): stop the helper and wait
+ * until it no longer reads the ids, before anything may write them. */
+void Ctx::row_prefetch_done() {
+    if (!rowpf_beside_) return;
+    rowpf_beside_ = false;
+    rowpf_pages_ += rowpf_worker_->finish();
 }
 
 /* Whether any operand is untracked by the host arena, so the join must drain the stream. */
 bool Ctx::host_join_drains(const RadOperand* opd, int n_opd) const {
     for (int i = 0; i < n_opd; ++i) {
         const RadOperand& o = opd[i];
-        /* A table refresh may just have queued readiness waits/uploads. A host
-         * consumer is synchronous and must not outrun that ordered work, even
-         * when all activation buffers live in the tracked host arena. */
-        if (o.kind == RAD_OPK_WTAB) return true;
-        if (o.kind == RAD_OPK_WEIGHT || o.kind == RAD_OPK_NONE) continue;
+        if (o.kind == RAD_OPK_WEIGHT || o.kind == RAD_OPK_WTAB || o.kind == RAD_OPK_NONE) continue;
         if (o.kind == RAD_OPK_BUF && buf_host_[o.handle]) continue;
         return true;
     }
@@ -1196,21 +1412,22 @@ bool Ctx::host_join_drains(const RadOperand* opd, int n_opd) const {
 
 int Ctx::host_join_wait(bool drain) {
     ++n_host_syncs_;
-    /* A current-stream drain does not join host-arena producers on the other lane. Keep both
-     * arena event joins even when a direct weight or an untracked operand needs the drain. */
+    if (drain) {
+        ++n_host_drains_;
+        return rad_stream_sync(cur_stream());
+    }
     for (int l = 0; l < 2; ++l) {
         if (!host_touch_pending_[l]) continue;
         RAD_TRY(rad_event_sync(host_touch_ev_[l]));
         host_touch_pending_[l] = false;
     }
-    return drain ? rad_stream_sync(cur_stream()) : RAD_OK;
+    return RAD_OK;
 }
 
 /* ================================================================== the cold paths */
 
 int Ctx::abort_step(rad_op h, int band, int dom, const IssuePlan& ip, int64_t n, int status) {
-    cache_prepare4_fail_if_bound(status);
-    if (const int first = terminal_status(); first < 0) return first;
+    row_prefetch_done();   /* no helper outlives the op that started it */
     const OpInfo&   o     = *plans_[h].info;
     const char*     kname = ip.row && ip.row->info ? ip.row->info->name : "<unnamed>";
     const char*     pname = ip.row ? ip.row->plugin.c_str() : "<unknown plugin>";
@@ -1232,31 +1449,26 @@ int Ctx::abort_step(rad_op h, int band, int dom, const IssuePlan& ip, int64_t n,
             step_fail_.c_str());
 
     step_status_ = status;
-    return remember_model_failure(status);
+    return status;
 }
 
 int Ctx::step_fail(const char* what) {
-    cache_prepare4_fail_if_bound(RAD_E_SHAPE);
-    if (const int first = terminal_status(); first < 0) return first;
     step_fail_ = what ? what : "the architecture block refused this batch";
     RAD_ERR("%s", step_fail_.c_str());
     step_status_ = RAD_E_SHAPE;
-    return remember_model_failure(RAD_E_SHAPE);
+    return RAD_E_SHAPE;
 }
 
 int Ctx::abort_step_msg(rad_op h, int status, std::string what) {
-    cache_prepare4_fail_if_bound(status);
-    if (const int first = terminal_status(); first < 0) return first;
     const OpInfo* o = (h != RAD_NULL_HANDLE && (size_t)h < plans_.size()) ? plans_[h].info : nullptr;
     step_fail_ = o ? fmt("op '%s' {%s}: %s", o->op.c_str(), o->base.str().c_str(), what.c_str())
                    : fmt("op handle %u: %s", h, what.c_str());
     RAD_ERR("%s", step_fail_.c_str());
     step_status_ = status;
-    return remember_model_failure(status);
+    return status;
 }
 
 void Ctx::fatal_issue(rad_op h, int64_t n, const char* why) const {
-    cache_prepare4_fail_if_bound(RAD_E_STATE);
     if (h == RAD_NULL_HANDLE || (size_t)h >= plans_.size() || !plans_[h].info)
         fatal("rad_issue: op handle %u at n=%lld %s", (unsigned)h, (long long)n, why);
     const OpInfo& o = *plans_[h].info;
@@ -1268,8 +1480,6 @@ void Ctx::fatal_issue(rad_op h, int64_t n, const char* why) const {
 /* ================================================================== pointer queries */
 
 void* Ctx::weight_ptr(rad_weight w) {
-    if (terminal_status() < 0) return nullptr; // resolve_weight can enqueue readiness waits
-    if (step_status_ < 0) return nullptr;
     if (w == RAD_NULL_HANDLE || (size_t)w >= w_tmpl_.size()) {
         RAD_WARN("rad_weight_ptr: handle %u was never declared", (unsigned)w);
         return nullptr;
@@ -1304,6 +1514,17 @@ int rad_step_fail(RadCtx* c, const char* what) {
 }
 
 const RadBatch* rad_batch(RadCtx* c)      { return c ? static_cast<rad::Ctx*>(c)->batch() : nullptr; }
+
+int64_t rad::Ctx::kv_layer_index(rad_kvgroup g, int layer) const {
+    if (g >= kv_.size() || !kv_[g].base || layer < 0) return -1;
+    const std::vector<int32_t>& ls = kv_[g].layer_slot;
+    if ((size_t)layer >= ls.size()) return -1;
+    return ls[(size_t)layer];
+}
+
+int rad_kv_layer_index(RadCtx* c, rad_kvgroup group, int layer) {
+    return c ? (int)static_cast<rad::Ctx*>(c)->kv_layer_index(group, layer) : -1;
+}
 int             rad_rank(RadCtx* c)       { return c ? static_cast<rad::Ctx*>(c)->rank() : 0; }
 int             rad_world_size(RadCtx* c) { return c ? static_cast<rad::Ctx*>(c)->world_size() : 1; }
 RadStream       rad_stream(RadCtx* c)     { return c ? static_cast<rad::Ctx*>(c)->stream() : nullptr; }

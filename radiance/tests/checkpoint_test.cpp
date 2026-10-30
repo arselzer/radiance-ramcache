@@ -7,8 +7,11 @@
  * back.
  */
 #include "rad_test.h"
+#include "gguf_writer.h"
 #include "format/checkpoint.h"
 #include "format/encoding.h"
+#include "../libquant/lq_ggml_planes.h"
+#include "../libquant/lq_ggml_dequant.h"
 #include "rad_plugin.h"
 
 #include <cmath>
@@ -60,7 +63,8 @@ void write_shard(const std::string& path, const std::vector<T>& ts) {
     const uint64_t n = hdr.size();
     std::fwrite(&n, 8, 1, f);
     std::fwrite(hdr.data(), 1, hdr.size(), f);
-    for (const T& t : ts) std::fwrite(t.bytes.data(), 1, t.bytes.size(), f);
+    for (const T& t : ts)
+        if (!t.bytes.empty()) std::fwrite(t.bytes.data(), 1, t.bytes.size(), f);
     std::fclose(f);
 }
 
@@ -85,6 +89,12 @@ T bf16(const std::string& name, std::vector<int64_t> shape, float tag) {
     for (int64_t s : shape) n *= s;
     t.bytes.resize((size_t)n * 2);
     for (int64_t i = 0; i < n; ++i) rad_store_f32(t.bytes.data(), RAD_BF16, i, tag + (float)(i % 64));
+    return t;
+}
+
+T cache_scale_f32(const std::string& name, float value) {
+    T t{ name, "F32", {1}, std::vector<uint8_t>(4) };
+    std::memcpy(t.bytes.data(), &value, sizeof value);
     return t;
 }
 
@@ -156,6 +166,47 @@ TEST(the_descriptor_is_quant_method_and_fmt_whoever_set_them) {
     CHECK_EQ(quant_descriptor(m), std::string("fp8"));
     m.set("quantization_config.fmt", "e4m3");
     CHECK_EQ(quant_descriptor(m), std::string("fp8_e4m3"));
+}
+
+/* Google's bf16 E2B needs no `--set quantization_config.quant_method`: its per-layer embeddings
+ * name the E form, which arch/gemma4 refuses and arch/gemma4_bf16 serves. */
+TEST(a_gemma4_e2b_checkpoint_selects_the_bf16_plugin_on_its_own) {
+    const std::string dir = write_checkpoint({ bf16("x", { 2, 2 }, 0) },
+        "{\"model_type\":\"gemma4\",\"text_config\":{\"hidden_size\":1536,"
+        "\"intermediate_size\":6144,\"hidden_size_per_layer_input\":256,"
+        "\"num_kv_shared_layers\":20,\"use_double_wide_mlp\":true}}");
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(dir), RAD_OK);
+    CHECK_EQ(ck.meta().arch, std::string("gemma4"));
+    CHECK_EQ(ck.meta().quant, std::string("compressed-tensors"));
+}
+
+/* E4B states shared KV layers without per-layer embeddings; either key selects the same plugin. */
+TEST(a_gemma4_e4b_checkpoint_selects_the_bf16_plugin_on_its_own) {
+    const std::string dir = write_checkpoint({ bf16("x", { 2, 2 }, 0) },
+        "{\"model_type\":\"gemma4\",\"text_config\":{\"hidden_size\":2560,"
+        "\"intermediate_size\":10240,\"num_kv_shared_layers\":6,"
+        "\"use_double_wide_mlp\":false}}");
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(dir), RAD_OK);
+    CHECK_EQ(ck.meta().quant, std::string("compressed-tensors"));
+    /* The rule is gemma4's: another architecture with the same key keeps its own descriptor. */
+    const std::string other = write_checkpoint({ bf16("x", { 2, 2 }, 0) },
+        "{\"model_type\":\"ltx2\",\"text_config\":{\"num_kv_shared_layers\":6}}");
+    Checkpoint ok;
+    REQUIRE_EQ(ok.open(other), RAD_OK);
+    CHECK_EQ(ok.meta().quant, std::string());
+}
+
+/* The 26B-A4B/31B shape declares neither key and keeps the bare descriptor arch/gemma4 owns. */
+TEST(a_gemma4_31b_checkpoint_keeps_the_bare_descriptor) {
+    const std::string dir = write_checkpoint({ bf16("x", { 2, 2 }, 0) },
+        "{\"model_type\":\"gemma4\",\"text_config\":{\"hidden_size\":5376,"
+        "\"intermediate_size\":21504,\"num_hidden_layers\":62}}");
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(dir), RAD_OK);
+    CHECK_EQ(ck.meta().arch, std::string("gemma4"));
+    CHECK_EQ(ck.meta().quant, std::string());
 }
 
 TEST(a_plain_tensor_is_its_own_encoding_and_reads_back_as_itself) {
@@ -1469,6 +1520,115 @@ TEST(a_paroquant_mxfp4_weight_carries_its_rotations_as_parts) {
     }
 }
 
+/* ParoQuant M2XFP4 is the MXFP4 form plus one metadata byte a group (`weight_meta`, [N, K/32] u8):
+ * the three planes of the `m2xfp4` scheme byte for byte, joined row by row, with the rotations
+ * beside them as for ParoMx. A piece without its metadata plane is refused, and so is a grid the
+ * import does not read. */
+TEST(a_paroquant_m2xfp4_weight_carries_its_meta_plane_and_rotations) {
+    const int64_t K = 128, S = 2, N = 16;
+    uint32_t rng = 777;
+    auto next = [&]() { rng = rng * 1664525u + 1013904223u; return rng >> 8; };
+    auto u8s = [&](const std::string& n, int64_t cols, uint32_t lo, uint32_t span) {
+        T t{ n, "U8", { N, cols }, {} };
+        for (int64_t i = 0; i < N * cols; ++i) t.bytes.push_back((uint8_t)(lo + next() % span));
+        return t;
+    };
+    auto pairs = [&](const std::string& n) {
+        T t{ n, "I16", { S, K }, {} };
+        for (int64_t st = 0; st < S; ++st) {
+            std::vector<int16_t> perm((size_t)K);
+            for (int64_t i = 0; i < K; ++i) perm[(size_t)i] = (int16_t)i;
+            for (int64_t i = K - 1; i > 0; --i) std::swap(perm[(size_t)i], perm[next() % (i + 1)]);
+            for (int64_t i = 0; i < K; ++i) {
+                t.bytes.push_back((uint8_t)(perm[(size_t)i] & 0xff));
+                t.bytes.push_back((uint8_t)(perm[(size_t)i] >> 8));
+            }
+        }
+        return t;
+    };
+    auto f16s = [&](const std::string& n, std::vector<int64_t> shape, float lo, float hi) {
+        T t{ n, "F16", shape, {} };
+        int64_t cnt = 1;
+        for (int64_t d : shape) cnt *= d;
+        for (int64_t i = 0; i < cnt; ++i) {
+            const uint16_t h = rad_f32_to_f16(lo + (hi - lo) * (float)(next() % 1000) / 1000.0f);
+            t.bytes.push_back((uint8_t)(h & 0xff));
+            t.bytes.push_back((uint8_t)(h >> 8));
+        }
+        return t;
+    };
+    std::vector<T> ts;
+    for (const char* b : { "g", "u" }) {
+        const std::string n = b;
+        ts.push_back(u8s(n + ".weight", K / 2, 0, 256));
+        ts.push_back(u8s(n + ".weight_scale", K / 32, 122, 5));
+        ts.push_back(u8s(n + ".weight_meta", K / 32, 0, 256));
+        ts.push_back(pairs(n + ".pairs"));
+        ts.push_back(f16s(n + ".theta", { S, K / 2 }, -3.0f, 3.0f));
+        ts.push_back(f16s(n + ".channel_scales", { 1, K }, 0.5f, 2.0f));
+    }
+    const std::string cfg = "{\"model_type\":\"qwen3_5\",\"quantization_config\":{\"quant_method\":"
+                            "\"paroquant_m2xfp4\",\"format\":\"m2xfp4\",\"bits\":4,\"group_size\":128,"
+                            "\"mx_block\":32,\"subgroup\":8,\"krot\":2}}";
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(write_checkpoint(ts, cfg)), RAD_OK);
+    CHECK(ck.imports() == Checkpoint::Import::ParoM2);
+    Program prog;
+    prog.name_map.push_back(map("gu", RAD_MAP_CONCAT, { "g.weight", "u.weight" }));
+    CkptWeight w;
+    std::string why;
+    REQUIRE_EQ(ckpt_resolve(ck, prog, "gu", false, &w, &why), RAD_OK);
+    REQUIRE(w.paro);
+    CHECK(w.imported && !w.trivial);
+    REQUIRE(rad_enc_valid(&w.enc));
+    CHECK(rad_enc_is(&w.enc, "m2xfp4"));
+    CHECK_EQ(std::string(w.enc.transform), std::string("givens"));
+    CHECK_EQ(rad_enc_givens_parts(&w.enc), (int64_t)2);
+    CHECK_EQ(w.rows, (int64_t)2 * N);
+    REQUIRE_EQ(w.enc.n_planes, 8);
+    CHECK_EQ(std::string(w.enc.plane[2].role), std::string("meta"));
+    CHECK_EQ(w.enc.plane[2].dtype, (uint32_t)RAD_U8);
+    CHECK_EQ(w.enc.plane[2].block[1], (int64_t)32);
+    CHECK(ckpt_reads_any(w, { "u.weight_meta" }));
+
+    // codes, exponents and metadata are the checkpoint's bytes, gate's rows then up's
+    const std::vector<std::vector<uint8_t>> pl = read_planes(w);
+    REQUIRE(!pl.empty());
+    for (int k = 0; k < 3; ++k) {
+        const T& g = ts[(size_t)k];
+        const T& u = ts[(size_t)(6 + k)];
+        CHECK_EQ(std::memcmp(pl[(size_t)k].data(), g.bytes.data(), g.bytes.size()), 0);
+        CHECK_EQ(std::memcmp(pl[(size_t)k].data() + g.bytes.size(), u.bytes.data(), u.bytes.size()), 0);
+    }
+    // the rotation tables follow, as ParoMx's: part 1's stage 0 pairs in whole-row columns
+    REQUIRE_EQ(std::string(w.enc.plane[3].role), std::string("t.pairs"));
+    const int32_t* tp = (const int32_t*)pl[3].data();
+    for (int64_t c = 0; c < K; ++c)
+        CHECK_EQ(tp[S * K + c], (int32_t)(*(const int16_t*)(ts[9].bytes.data() + 2 * c)));
+
+    // a piece without its metadata plane is refused by name
+    {
+        std::vector<T> no_meta;
+        for (const T& t : ts)
+            if (t.name != "u.weight_meta") no_meta.push_back(t);
+        Checkpoint c2;
+        REQUIRE_EQ(c2.open(write_checkpoint(no_meta, cfg)), RAD_OK);
+        CkptWeight w2;
+        why.clear();
+        CHECK(ckpt_resolve(c2, prog, "gu", false, &w2, &why) != RAD_OK);
+        CHECK(why.find("u.weight_meta") != std::string::npos);
+    }
+    // another subgroup width is not the grid this reads
+    {
+        std::string other = cfg;
+        other.replace(other.find("\"subgroup\":8"), 12, "\"subgroup\":4");
+        Checkpoint c3;
+        REQUIRE_EQ(c3.open(write_checkpoint(ts, other)), RAD_OK);
+        CHECK(c3.imports() == Checkpoint::Import::None);
+        CHECK(c3.import_refusal().find("M2XFP4") != std::string::npos);
+    }
+}
+
 /* ParoQuant int5-bitplane: low nibbles AWQ-packed along N (qweight [K, N/8], eight columns per
  * word in the order 0,2,4,6,1,3,5,7), a fifth-bit plane (qweight_hi [K, N/32], bit n % 32), and the
  * same two packings for the zero points. The logical [N, K] weight becomes u5 codes (a bit stream
@@ -1684,6 +1844,53 @@ struct ConfigCase {
 
 }  /* namespace */
 
+TEST(hyv3_static_kv_cache_scales_are_carried_into_model_metadata) {
+    const std::string dir = fresh_dir();
+    write_file(dir + "/config.json", R"({"model_type":"hy_v3","num_hidden_layers":1})");
+    write_shard(dir + "/kv_cache_scales.safetensors", {
+        cache_scale_f32("model.layers.0.self_attn.k_cache.scale", 0.0376674123f),
+        cache_scale_f32("model.layers.0.self_attn.v_cache.scale", 0.0004359654f),
+    });
+    write_file(dir + "/model.safetensors.index.json",
+               R"({"weight_map":{"model.layers.0.self_attn.k_cache.scale":"kv_cache_scales.safetensors","model.layers.0.self_attn.v_cache.scale":"kv_cache_scales.safetensors"}})");
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(dir), RAD_OK);
+    const char* k = ck.meta().get("hyv3.kv_cache.0.k_scale");
+    const char* v = ck.meta().get("hyv3.kv_cache.0.v_scale");
+    REQUIRE(k && v);
+    CHECK(std::fabs(std::strtod(k, nullptr) - 0.0376674123) < 1e-9);
+    CHECK(std::fabs(std::strtod(v, nullptr) - 0.0004359654) < 1e-10);
+    std::filesystem::remove_all(dir);
+}
+
+TEST(hyv3_static_kv_cache_scales_reject_invalid_values_and_shapes) {
+    const char* name = "model.layers.0.self_attn.k_cache.scale";
+    std::vector<T> invalid;
+    for (float value : {0.0f, -1.0f, NAN, INFINITY})
+        invalid.push_back(cache_scale_f32(name, value));
+    invalid.push_back(bf16(name, {1}, 1.0f));
+    T nonscalar = cache_scale_f32(name, 1.0f);
+    nonscalar.shape = {2};
+    nonscalar.bytes.resize(8);
+    invalid.push_back(std::move(nonscalar));
+    for (const T& t : invalid) {
+        const std::string dir = write_checkpoint({t},
+            R"({"model_type":"hy_v3","num_hidden_layers":1})");
+        Checkpoint ck;
+        CHECK_EQ(ck.open(dir), RAD_E_FORMAT);
+    }
+    /* A true rank-zero scalar and a one-element vector both satisfy the checkpoint contract. */
+    T scalar = cache_scale_f32(name, 0.5f);
+    scalar.shape.clear();
+    const std::string dir = write_checkpoint({scalar},
+        R"({"model_type":"hy_v3","num_hidden_layers":1})");
+    Checkpoint ck;
+    CHECK_OK(ck.open(dir));
+    const char* scale = ck.meta().get("hyv3.kv_cache.0.k_scale");
+    REQUIRE(scale != nullptr);
+    CHECK_EQ(std::strtod(scale, nullptr), 0.5);
+}
+
 TEST(config_json_fills_the_model_meta_as_each_family_spells_it) {
     const ConfigCase cases[] = {
         { "a multimodal MoE: text_config first, head_dim read rather than derived, the expert "
@@ -1768,6 +1975,38 @@ TEST(config_json_fills_the_model_meta_as_each_family_spells_it) {
     }
 }
 
+/* Nomic BERT names its dimensions n_layer, n_embd, n_head, n_inner and n_positions, its expert
+ * count num_experts and its top-k moe_top_k, and its norm epsilon layer_norm_epsilon. Without the
+ * fallbacks the engine refuses the checkpoint at startup and rad-convert sizes nothing. */
+TEST(a_nomic_config_fills_the_meta_from_its_own_spellings) {
+    const char* cfg =
+        R"({"model_type":"nomic_bert","n_layer":12,"n_embd":768,"n_head":12,
+            "n_inner":3072,"n_positions":2048,"vocab_size":250048,
+            "layer_norm_epsilon":1e-05,"num_experts":8,"moe_top_k":2,
+            "moe_every_n_layers":2,"rotary_emb_base":10000,"prenorm":false})";
+    const std::string dir = write_checkpoint({ bf16("x", { 2, 2 }, 0) }, cfg);
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(dir), RAD_OK);
+    const MetaOwn& m = ck.meta();
+    CHECK_EQ(m.arch, std::string("nomicbert"));
+    CHECK_EQ(m.m.n_layers, (int64_t)12);
+    CHECK_EQ(m.m.n_embd, (int64_t)768);
+    CHECK_EQ(m.m.n_head, (int64_t)12);
+    CHECK_EQ(m.m.n_head_kv, (int64_t)12);
+    CHECK_EQ(m.m.head_dim, (int64_t)64);
+    CHECK_EQ(m.m.n_ff, (int64_t)3072);
+    CHECK_EQ(m.m.n_vocab, (int64_t)250048);
+    CHECK_EQ(m.m.n_ctx_train, (int64_t)2048);
+    CHECK_EQ(m.m.n_expert, (int64_t)8);
+    CHECK_EQ(m.m.n_expert_used, (int64_t)2);
+    CHECK_EQ(m.m.rms_eps, 1e-5f);
+    CHECK_EQ(m.m.rope_theta, 1e4f);
+    CHECK_EQ(m.get("moe_every_n_layers"), std::string("2"));
+    CHECK_EQ(m.get("num_experts"), std::string("8"));
+    CHECK_EQ(m.get("rotary_emb_base"), std::string("10000"));
+    CHECK_EQ(m.get("prenorm"), std::string("0"));
+}
+
 /* ================================================================== a table declared in pieces
  *
  * A table shipped as many shards is declared as several CONCAT maps under one name (each map holds
@@ -1815,64 +2054,12 @@ TEST(a_concat_declared_in_pieces_joins_every_piece_in_order) {
 /* ================================================================== GGUF as a source
  *
  * A GGUF tensor's dimensions are stored fastest first and are reversed once into the row-major
- * shape everything else uses; the legacy block types decode by their definitions; a K-quant is
- * refused with its name, not decoded as something else. */
+ * shape everything else uses; the legacy and Q4_K/Q6_K block types decode by their definitions. */
 namespace {
 
-struct GKv {
-    std::string key;
-    uint32_t type;                     /* 4 u32, 6 f32, 8 string, 9 array of strings */
-    double num = 0;
-    std::vector<std::string> strs;
-};
-struct GTensor { std::string name; uint32_t type; std::vector<uint64_t> ne; std::vector<uint8_t> bytes; };
-
-void put_bytes(std::string* b, const void* p, size_t n) { b->append((const char*)p, n); }
-void put_str(std::string* b, const std::string& s) {
-    const uint64_t n = s.size();
-    put_bytes(b, &n, 8);
-    b->append(s);
-}
-
-/* A GGUF v3 file of `kvs` and `ts`, every tensor at a 32-byte aligned offset. */
-void write_gguf(const std::string& path, const std::vector<GKv>& kvs, const std::vector<GTensor>& ts) {
-    std::string b = "GGUF";
-    const uint32_t ver = 3;
-    const uint64_t nt = ts.size(), nk = kvs.size();
-    put_bytes(&b, &ver, 4);
-    put_bytes(&b, &nt, 8);
-    put_bytes(&b, &nk, 8);
-    for (const GKv& kv : kvs) {
-        put_str(&b, kv.key);
-        put_bytes(&b, &kv.type, 4);
-        if (kv.type == 4) { const uint32_t v = (uint32_t)kv.num; put_bytes(&b, &v, 4); }
-        else if (kv.type == 6) { const float v = (float)kv.num; put_bytes(&b, &v, 4); }
-        else if (kv.type == 8) put_str(&b, kv.strs.at(0));
-        else {
-            const uint32_t et = 8;
-            const uint64_t n = kv.strs.size();
-            put_bytes(&b, &et, 4);
-            put_bytes(&b, &n, 8);
-            for (const std::string& s : kv.strs) put_str(&b, s);
-        }
-    }
-    uint64_t off = 0;
-    for (const GTensor& t : ts) {
-        put_str(&b, t.name);
-        const uint32_t nd = (uint32_t)t.ne.size();
-        put_bytes(&b, &nd, 4);
-        for (uint64_t d : t.ne) put_bytes(&b, &d, 8);
-        put_bytes(&b, &t.type, 4);
-        put_bytes(&b, &off, 8);
-        off += (t.bytes.size() + 31) / 32 * 32;
-    }
-    while (b.size() % 32) b.push_back('\0');
-    for (const GTensor& t : ts) {
-        b.append((const char*)t.bytes.data(), t.bytes.size());
-        while (b.size() % 32) b.push_back('\0');
-    }
-    write_file(path, b);
-}
+using ggufw::GKv;
+using ggufw::GTensor;
+using ggufw::write_gguf;
 
 uint16_t h16(float v) { return rad_f32_to_f16(v); }
 
@@ -1947,21 +2134,98 @@ std::vector<GKv> llama_kvs(int64_t file_type) {
 
 }  /* namespace */
 
+/* Integer metadata arrays: up to 1024 values spelled out in full in the metadata (a plugin reads
+ * them at declare), and every one readable as a tensor under its key, I64 for 64-bit elements,
+ * I32 otherwise. */
+TEST(gguf_integer_arrays_are_spelled_out_or_read_as_tensors) {
+    const std::string dir = fresh_dir();
+    const std::string path = dir + "/m.gguf";
+    std::vector<GKv> kvs = llama_kvs(1);
+    std::vector<int64_t> ratios(43), map(2000), big(1100);
+    for (size_t i = 0; i < ratios.size(); ++i) ratios[i] = i < 2 ? 0 : (i < 20 ? 2 : 1);
+    for (size_t i = 0; i < map.size(); ++i) map[i] = (int64_t)(i * 7 % 1999);
+    for (size_t i = 0; i < big.size(); ++i) big[i] = (int64_t)i * 4000000000LL;
+    kvs.push_back({ "llama.compress_ratios", 9, 0, {}, ratios });
+    kvs.push_back({ "llama.token_map", 9, 0, {}, map });
+    kvs.push_back({ "llama.wide_table", 9, 0, {}, big, true });
+    std::vector<float> w8;
+    write_gguf(path, kvs, { legacy_blocks("t.q8_0", 8, &w8) });
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(path), RAD_OK);
+    const char* r = ck.meta().get("llama.compress_ratios");
+    REQUIRE(r != nullptr);
+    std::string want;
+    for (size_t i = 0; i < ratios.size(); ++i) want += (i ? "," : "") + std::to_string(ratios[i]);
+    CHECK_EQ(std::string(r), want);
+    const SrcTensor* tm = nullptr;
+    const SrcTensor* wt = nullptr;
+    for (const SrcTensor& s : ck.tensors()) {
+        if (s.name == "llama.token_map") tm = &s;
+        if (s.name == "llama.wide_table") wt = &s;
+        if (s.name == "llama.compress_ratios") {
+            CHECK_EQ(s.rad_dtype, (uint32_t)RAD_I32);
+            CHECK_EQ(s.shape.at(0), (int64_t)43);
+        }
+    }
+    REQUIRE(tm != nullptr);
+    CHECK_EQ(tm->rad_dtype, (uint32_t)RAD_I32);
+    REQUIRE_EQ(tm->shape.size(), (size_t)1);
+    CHECK_EQ(tm->shape[0], (int64_t)2000);
+    int bad = 0;
+    for (size_t i = 0; i < map.size(); ++i) {
+        int32_t v;
+        std::memcpy(&v, (const uint8_t*)tm->data + 4 * i, 4);
+        bad += v != (int32_t)map[i];
+    }
+    CHECK_EQ(bad, 0);
+    REQUIRE(wt != nullptr);
+    CHECK_EQ(wt->rad_dtype, (uint32_t)RAD_I64);
+    int64_t last;
+    std::memcpy(&last, (const uint8_t*)wt->data + 8 * 1099, 8);
+    CHECK_EQ(last, big[1099]);
+}
+
 TEST(a_gguf_tensor_is_row_major_and_its_legacy_blocks_decode_by_definition) {
     const std::string dir = fresh_dir();
     const std::string path = dir + "/m.gguf";
     std::vector<float> w8, w40, w41, w50, w51;
-    GTensor k4{ "t.q4_k", 12, { 256, 2 }, std::vector<uint8_t>(2 * 144, 0) };
+    /* Row 1 of the q4_K tensor is all zero (a row read at an offset of an imported weight). */
+    std::vector<uint8_t> q4k(2 * 144, 0);
+    const uint16_t q4d = h16(0.5f), q4min = h16(0.25f);
+    std::memcpy(q4k.data(), &q4d, 2);
+    std::memcpy(q4k.data() + 2, &q4min, 2);
+    const uint8_t q4scales[12] = {0x41, 0x42, 0x43, 0x44, 0x45, 0x46,
+                                   0x47, 0x48, 0x21, 0x32, 0x43, 0x54};
+    std::memcpy(q4k.data() + 4, q4scales, sizeof q4scales);
+    q4k[16] = 0x21;       /* low/high nibbles of values 0 and 32 */
+    q4k[16 + 64] = 0x32;  /* values 128 and 160, including packed high scale bits */
+    GTensor k4{ "t.q4_k", 12, { 256, 2 }, q4k };
+    std::vector<uint8_t> q6k(210, 0);
+    const uint16_t q6d = h16(0.5f);
+    std::memcpy(q6k.data() + 208, &q6d, 2);
+    q6k[0] = 0x21; q6k[32] = 0x43; q6k[128] = 0xD3;
+    q6k[192] = 2; q6k[194] = 3; q6k[196] = 4; q6k[198] = 5;
+    GTensor k6{ "t.q6_k", 14, { 256, 1 }, q6k };
     GTensor f16{ "t.f16", 1, { 64, 4, 2 }, {} };
     for (int i = 0; i < 64 * 4 * 2; ++i) {
         const uint16_t v = h16((float)i * 0.5f);
         f16.bytes.push_back((uint8_t)v);
         f16.bytes.push_back((uint8_t)(v >> 8));
     }
+    /* An MXFP4 tensor [2, 64] (GGUF type 39: e, qs[16] a block of 32). Row 0, block 0: e = 127,
+     * qs[j] = j | (15 - j) << 4, so value j is e2m1(j) and value 16 + j e2m1(15 - j) at scale 1;
+     * block 1: e = 130 (x 8), every nibble 8 (OCP's -0) but qs[0] = 0x71 (values 0.5 x 8 and 6 x 8
+     * at 0 and 16). Row 1 all zero bytes: e = 0, every value 0. */
+    GTensor mx{ "t.mxfp4", 39, { 64, 2 }, std::vector<uint8_t>(2 * 2 * 17, 0) };
+    mx.bytes[0] = 127;
+    for (int j = 0; j < 16; ++j) mx.bytes[1 + j] = (uint8_t)(j | (15 - j) << 4);
+    mx.bytes[17] = 130;
+    for (int j = 0; j < 16; ++j) mx.bytes[18 + j] = 0x88;
+    mx.bytes[18] = 0x71;
     write_gguf(path, llama_kvs(7),
                { legacy_blocks("t.q8_0", 8, &w8), legacy_blocks("t.q4_0", 2, &w40),
                  legacy_blocks("t.q4_1", 3, &w41), legacy_blocks("t.q5_0", 6, &w50),
-                 legacy_blocks("t.q5_1", 7, &w51), k4, f16 });
+                 legacy_blocks("t.q5_1", 7, &w51), k4, k6, f16, mx });
     Checkpoint ck;
     REQUIRE_EQ(ck.open(path), RAD_OK);
     CHECK(ck.is_gguf());
@@ -1973,7 +2237,9 @@ TEST(a_gguf_tensor_is_row_major_and_its_legacy_blocks_decode_by_definition) {
         { "t.q5_1", &w51 } };
     for (const auto& l : legacy) prog.name_map.push_back(map(l.name, RAD_MAP_COPY, { l.name }));
     prog.name_map.push_back(map("t.q4_k", RAD_MAP_COPY, { "t.q4_k" }));
+    prog.name_map.push_back(map("t.q6_k", RAD_MAP_COPY, { "t.q6_k" }));
     prog.name_map.push_back(map("t.f16", RAD_MAP_COPY, { "t.f16" }));
+    prog.name_map.push_back(map("t.mxfp4", RAD_MAP_COPY, { "t.mxfp4" }));
     std::string why;
     for (const auto& l : legacy) {
         CkptWeight w;
@@ -1994,13 +2260,72 @@ TEST(a_gguf_tensor_is_row_major_and_its_legacy_blocks_decode_by_definition) {
         CHECK_EQ(row[63], (*l.want)[3 * 64 + 63]);
     }
     {
+        /* A K-quant imports block for block, as the planes libquant's `ggml` quantiser writes, and
+         * decodes as dequantize_row_q4_K does: d * sc * q - dmin * m. */
         CkptWeight w;
         REQUIRE_EQ(ckpt_resolve(ck, prog, "t.q4_k", false, &w, &why), RAD_OK);
+        CHECK(w.imported);
+        CHECK(!w.trivial);
+        CHECK(has(w.why, "q4_K"));
         CHECK_EQ(w.shape[0], (int64_t)2);
         CHECK_EQ(w.shape[1], (int64_t)256);
         std::vector<float> f(256);
-        CHECK_EQ(ckpt_rows_f32(w, 0, 1, f.data(), &why), (int)RAD_E_UNSUPPORTED);
-        CHECK(has(why, "q4_K"));
+        REQUIRE_EQ(ckpt_rows_f32(w, 0, 1, f.data(), &why), RAD_OK);
+        CHECK_EQ(f[0], -0.75f);
+        CHECK_EQ(f[32], 0.5f);
+        CHECK_EQ(f[128], 12.5f);
+        CHECK_EQ(f[160], 22.25f);
+        std::vector<float> one(256);                        /* row 1 alone */
+        REQUIRE_EQ(ckpt_rows_f32(w, 1, 1, one.data(), &why), RAD_OK);
+        int bad = 0;
+        for (float v : one) bad += v != 0.0f;
+        CHECK_EQ(bad, 0);
+    }
+    {
+        CkptWeight w;
+        REQUIRE_EQ(ckpt_resolve(ck, prog, "t.q6_k", false, &w, &why), RAD_OK);
+        CHECK(w.imported);
+        std::vector<float> f(256);
+        REQUIRE_EQ(ckpt_rows_f32(w, 0, 1, f.data(), &why), RAD_OK);
+        CHECK_EQ(f[0], 17.0f);
+        CHECK_EQ(f[32], -43.5f);
+        CHECK_EQ(f[64], -28.0f);
+        CHECK_EQ(f[96], 50.0f);
+    }
+    {
+        /* MXFP4 imports block for block as OCP MXFP4's own planes (ggml's nibble is the e2m1 bit
+         * pattern, kvalues_mxfp4 [q] * 2^(e - 128) = e2m1(q) * 2^(e - 127)): `fp4_e2m1*e8m0[1x32]`,
+         * the encoding a safetensors MXFP4 imports as, and it decodes as dequantize_row_mxfp4. */
+        CkptWeight w;
+        REQUIRE_EQ(ckpt_resolve(ck, prog, "t.mxfp4", false, &w, &why), RAD_OK);
+        CHECK(w.imported);
+        CHECK(!w.trivial);
+        CHECK(has(w.why, "mxfp4"));
+        char en[128];
+        rad_enc_format(&w.enc, en, sizeof en);
+        CHECK_EQ(std::string(en), std::string("fp4_e2m1*e8m0[1x32]"));
+        CHECK_EQ(w.shape[0], (int64_t)2);
+        CHECK_EQ(w.shape[1], (int64_t)64);
+        static const float kE2m1[16] = { 0, .5f, 1, 1.5f, 2, 3, 4, 6, 0, -.5f, -1, -1.5f, -2, -3, -4, -6 };
+        std::vector<float> f(2 * 64);
+        REQUIRE_EQ(ckpt_rows_f32(w, 0, 2, f.data(), &why), RAD_OK);
+        int bad = 0;
+        for (int v = 0; v < 128; ++v) {
+            float want = 0.0f;
+            if (v < 16) want = kE2m1[v];
+            else if (v < 32) want = kE2m1[15 - (v - 16)];
+            else if (v == 32) want = 4.0f;
+            else if (v == 48) want = 48.0f;
+            bad += f[(size_t)v] != want;
+        }
+        CHECK_EQ(bad, 0);
+        std::vector<float> dq(128);
+        const lq::ggml::DequantFn dqf = lq::ggml::dequant_of(39);
+        REQUIRE(dqf != nullptr);
+        dqf(mx.bytes.data(), dq.data(), 64);
+        dqf(mx.bytes.data() + 34, dq.data() + 64, 64);
+        for (int v = 0; v < 128; ++v) bad += dq[(size_t)v] != f[(size_t)v];
+        CHECK_EQ(bad, 0);
     }
     {
         /* A plain f16 tensor of rank 3 is trivial and reversed in every dimension. */
@@ -2042,6 +2367,275 @@ TEST(a_gguf_tensor_is_row_major_and_its_legacy_blocks_decode_by_definition) {
         REQUIRE_EQ(c2.open(p2), RAD_OK);
         CHECK_EQ(c2.meta().quant, std::string());
     }
+}
+
+namespace {
+
+/* `rows` x `cols` blocks of Q4_K (type 12) or Q6_K (type 14) with arbitrary quants and scales and
+ * finite f16 super-scales: random bits there would make NaNs, which equal nothing. */
+GTensor k_blocks(const char* name, uint32_t type, int64_t rows, int64_t cols, uint32_t seed) {
+    GTensor t{ name, type, { (uint64_t)cols, (uint64_t)rows }, {} };
+    uint32_t x = seed;
+    auto fill = [&](int n) {
+        for (int i = 0; i < n; ++i) {
+            x = x * 1664525u + 1013904223u;
+            t.bytes.push_back((uint8_t)(x >> 24));
+        }
+    };
+    auto push16 = [&](float v) {
+        const uint16_t h = h16(v);
+        t.bytes.push_back((uint8_t)h);
+        t.bytes.push_back((uint8_t)(h >> 8));
+    };
+    for (int64_t b = 0; b < rows * cols / 256; ++b) {
+        const float d = 0.0625f * (float)(1 + (b + seed) % 7);
+        if (type == 12) {
+            push16(d);
+            push16(d / 2);
+            fill(12 + 128);
+        } else {
+            fill(128 + 64 + 16);
+            push16(d);
+        }
+    }
+    return t;
+}
+
+/* Every plane of `w` through ckpt_plane_rows, and the weight those planes decode to. */
+void read_planes(const CkptWeight& w, std::vector<std::vector<uint8_t>>* planes,
+                 std::vector<float>* values) {
+    std::string why;
+    planes->assign((size_t)w.enc.n_planes, {});
+    const void* data[RAD_ENC_MAX_PLANES] = { nullptr };
+    for (int k = 0; k < w.enc.n_planes; ++k) {
+        int64_t pr = 0, pc = 0;
+        rad_enc_plane_dims(&w.enc.plane[k], w.rows, w.cols, &pr, &pc);
+        (*planes)[(size_t)k].resize((size_t)(pr * rad_enc_row_bytes(w.enc.plane[k].dtype, pc)));
+        CHECK_EQ(ckpt_plane_rows(w, k, 0, pr, (*planes)[(size_t)k].data(), &why), (int)RAD_OK);
+        data[k] = (*planes)[(size_t)k].data();
+    }
+    EncodedView v;
+    enc_view(w.enc, w.rows, w.cols, data, &v);
+    values->assign((size_t)(w.rows * w.cols), 0.0f);
+    CHECK_EQ(enc_decode_rows(v, 0, w.rows, values->data(), &why), (int)RAD_OK);
+}
+
+/* The planes of `w` decode to exactly what the block definition gives (ckpt_rows_f32). */
+void check_planes_decode_by_definition(const CkptWeight& w) {
+    std::vector<std::vector<uint8_t>> planes;
+    std::vector<float> got, want((size_t)(w.rows * w.cols));
+    std::string why;
+    read_planes(w, &planes, &got);
+    REQUIRE_EQ(ckpt_rows_f32(w, 0, w.rows, want.data(), &why), (int)RAD_OK);
+    int bad = 0, nonzero = 0;
+    for (size_t i = 0; i < want.size(); ++i) {
+        bad += !(got[i] == want[i]);
+        nonzero += want[i] != 0.0f;
+    }
+    if (bad) std::fprintf(stderr, "    %d of %zu value(s) differ\n", bad, want.size());
+    CHECK_EQ(bad, 0);
+    CHECK(nonzero > (int)want.size() / 2);
+}
+
+}  /* namespace */
+
+TEST(a_gguf_q8_0_q4_k_or_q6_k_tensor_is_imported_as_its_planes) {
+    const std::string path = fresh_dir() + "/m.gguf";
+    std::vector<float> w8;
+    const GTensor q8 = legacy_blocks("t.q8_0", 8, &w8);
+    const GTensor g = k_blocks("g", 12, 2, 512, 1), u = k_blocks("u", 12, 3, 512, 2);
+    const GTensor s = k_blocks("s", 12, 2, 256, 3), k6 = k_blocks("k6", 14, 2, 256, 4);
+    const GTensor q5{ "t.q5_k", 13, { 256, 1 }, std::vector<uint8_t>(176, 0) };
+    write_gguf(path, llama_kvs(15), { q8, g, u, s, k6, q5 });
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(path), RAD_OK);
+    Program prog;
+    prog.name_map.push_back(map("t.q8_0", RAD_MAP_COPY, { "t.q8_0" }));
+    prog.name_map.push_back(map("gu", RAD_MAP_CONCAT, { "g", "u" }));
+    prog.name_map.push_back(map("s", RAD_MAP_COPY, { "s" }));
+    prog.name_map.push_back(map("k6", RAD_MAP_COPY, { "k6" }));
+    prog.name_map.push_back(map("mix", RAD_MAP_CONCAT, { "s", "k6" }));
+    prog.name_map.push_back(map("across", RAD_MAP_CONCAT, { "g", "s" }, {}, 1));
+    prog.name_map.push_back(map("t.q5_k", RAD_MAP_COPY, { "t.q5_k" }));
+    std::string why;
+
+    /* Q8_0: the codes plane is each block's quants and the scale plane its d, byte for byte. */
+    {
+        CkptWeight w;
+        REQUIRE_EQ(ckpt_resolve(ck, prog, "t.q8_0", false, &w, &why), RAD_OK);
+        CHECK(w.imported && w.ggml_blocks);
+        CHECK(!w.trivial);
+        CHECK(has(w.why, "GGUF"));
+        REQUIRE(rad_enc_valid(&w.enc));
+        REQUIRE_EQ(w.enc.n_planes, 2);
+        std::vector<std::vector<uint8_t>> planes;
+        std::vector<float> f;
+        read_planes(w, &planes, &f);
+        REQUIRE_EQ(planes[0].size(), (size_t)(8 * 32));
+        REQUIRE_EQ(planes[1].size(), (size_t)(8 * 2));
+        int bad = 0;
+        for (int b = 0; b < 8; ++b) {
+            bad += std::memcmp(planes[0].data() + 32 * b, q8.bytes.data() + 34 * b + 2, 32) != 0;
+            bad += std::memcmp(planes[1].data() + 2 * b, q8.bytes.data() + 34 * b, 2) != 0;
+        }
+        CHECK_EQ(bad, 0);
+        int differ = 0;
+        for (size_t i = 0; i < w8.size(); ++i) differ += f[i] != w8[i];
+        CHECK_EQ(differ, 0);
+    }
+
+    /* Q4_K, gate and up joined along rows: the planes decode to the block definition, and a
+     * range that starts in the first piece and ends in the second is the same bytes. */
+    {
+        CkptWeight w;
+        REQUIRE_EQ(ckpt_resolve(ck, prog, "gu", false, &w, &why), RAD_OK);
+        CHECK(w.imported && w.ggml_blocks);
+        CHECK(!w.trivial);
+        CHECK_EQ(w.rows, (int64_t)5);
+        CHECK_EQ(w.cols, (int64_t)512);
+        REQUIRE(rad_enc_valid(&w.enc));
+        REQUIRE_EQ(w.enc.n_planes, 5);
+        check_planes_decode_by_definition(w);
+        std::vector<std::vector<uint8_t>> planes;
+        std::vector<float> f;
+        read_planes(w, &planes, &f);
+        for (int k = 0; k < w.enc.n_planes; ++k) {
+            int64_t pr = 0, pc = 0;
+            rad_enc_plane_dims(&w.enc.plane[k], w.rows, w.cols, &pr, &pc);
+            const int64_t rb = rad_enc_row_bytes(w.enc.plane[k].dtype, pc);
+            std::vector<uint8_t> part((size_t)(3 * rb));
+            REQUIRE_EQ(ckpt_plane_rows(w, k, 1, 3, part.data(), &why), RAD_OK);
+            CHECK_EQ(std::memcmp(part.data(), planes[(size_t)k].data() + rb, part.size()), 0);
+        }
+    }
+
+    /* A row of one block ends its 6-bit planes mid-word. */
+    {
+        CkptWeight w;
+        REQUIRE_EQ(ckpt_resolve(ck, prog, "s", false, &w, &why), RAD_OK);
+        CHECK(w.imported && w.ggml_blocks);
+        check_planes_decode_by_definition(w);
+    }
+
+    /* Q6_K. */
+    {
+        CkptWeight w;
+        REQUIRE_EQ(ckpt_resolve(ck, prog, "k6", false, &w, &why), RAD_OK);
+        CHECK(w.imported && w.ggml_blocks);
+        CHECK(!w.trivial);
+        REQUIRE(rad_enc_valid(&w.enc));
+        REQUIRE_EQ(w.enc.n_planes, 3);
+        check_planes_decode_by_definition(w);
+    }
+
+    /* What it does not import keeps the GGUF reason. */
+    {
+        CkptWeight w;
+        REQUIRE_EQ(ckpt_resolve(ck, prog, "mix", false, &w, &why), RAD_OK);
+        CHECK(!w.imported && !w.ggml_blocks && !w.trivial);
+        CHECK(has(w.why, "different block types"));
+        REQUIRE_EQ(ckpt_resolve(ck, prog, "across", false, &w, &why), RAD_OK);
+        CHECK(!w.imported && !w.ggml_blocks && !w.trivial);
+        CHECK(has(w.why, "joined along a column"));
+    }
+    /* The mature GGML importer also supports Q5_K. This all-zero block is exact. */
+    {
+        CkptWeight w;
+        REQUIRE_EQ(ckpt_resolve(ck, prog, "t.q5_k", false, &w, &why), RAD_OK);
+        CHECK(w.imported && w.ggml_blocks && !w.trivial);
+        REQUIRE(rad_enc_valid(&w.enc));
+        std::vector<std::vector<uint8_t>> planes;
+        std::vector<float> decoded;
+        read_planes(w, &planes, &decoded);
+        REQUIRE_EQ(decoded.size(), (size_t)256);
+        for (float value : decoded) CHECK_EQ(value, 0.0f);
+    }
+}
+
+/* llama.cpp stacks an MoE's experts in one rank-3 tensor of blocks, and an expert's gate|up is two
+ * dim-0 slices joined along rows: their planes are those of the same blocks stored on their own. */
+TEST(a_slice_of_a_stacked_gguf_block_tensor_is_imported_as_its_planes) {
+    const std::string path = fresh_dir() + "/m.gguf";
+    const int64_t E = 4, N = 3, K = 512;
+    GTensor gate = k_blocks("gate_exps", 12, E * N, K, 5);
+    GTensor up = k_blocks("up_exps", 12, E * N, K, 6);
+    gate.ne = up.ne = { (uint64_t)K, (uint64_t)N, (uint64_t)E };
+    const size_t eb = gate.bytes.size() / E;
+    GTensor own{ "gu2", 12, { (uint64_t)K, (uint64_t)(2 * N) }, {} };
+    own.bytes.assign(gate.bytes.begin() + 2 * eb, gate.bytes.begin() + 3 * eb);
+    own.bytes.insert(own.bytes.end(), up.bytes.begin() + 2 * eb, up.bytes.begin() + 3 * eb);
+    write_gguf(path, llama_kvs(15), { gate, up, own });
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(path), RAD_OK);
+    Program prog;
+    prog.name_map.push_back(map("gu", RAD_MAP_CONCAT, { "gate_exps", "up_exps" }, { 2, 2 }));
+    prog.name_map.push_back(map("gu2", RAD_MAP_COPY, { "gu2" }));
+    std::string why;
+    CkptWeight w, o;
+    REQUIRE_EQ(ckpt_resolve(ck, prog, "gu", false, &w, &why), RAD_OK);
+    REQUIRE_EQ(ckpt_resolve(ck, prog, "gu2", false, &o, &why), RAD_OK);
+    CHECK(w.imported && w.ggml_blocks);
+    CHECK_EQ(w.rows, 2 * N);
+    CHECK_EQ(w.cols, K);
+    REQUIRE(rad_enc_equal(&w.enc, &o.enc));
+    std::vector<std::vector<uint8_t>> got, want;
+    std::vector<float> fg, fo;
+    read_planes(w, &got, &fg);
+    read_planes(o, &want, &fo);
+    for (int k = 0; k < w.enc.n_planes; ++k) CHECK(got[(size_t)k] == want[(size_t)k]);
+}
+
+TEST(hyv3_gguf_metadata_normalizes_architecture_and_config_fields) {
+    const std::string path = fresh_dir() + "/hyv3.gguf";
+    const std::vector<GKv> kvs = {
+        { "general.architecture", 8, 0, { "hy_v3" } },
+        { "hy_v3.block_count", 4, 2, {} },
+        { "hy_v3.embedding_length", 4, 4, {} },
+        { "hy_v3.attention.head_count", 4, 2, {} },
+        { "hy_v3.attention.head_count_kv", 4, 1, {} },
+        { "hy_v3.attention.key_length", 4, 2, {} },
+        { "hy_v3.feed_forward_length", 4, 8, {} },
+        { "hy_v3.context_length", 4, 1024, {} },
+        { "hy_v3.expert_count", 4, 4, {} },
+        { "hy_v3.expert_used_count", 4, 2, {} },
+        { "hy_v3.expert_feed_forward_length", 4, 2, {} },
+        { "hy_v3.expert_shared_feed_forward_length", 4, 2, {} },
+        { "hy_v3.expert_weights_norm", 4, 1, {} },
+        { "hy_v3.expert_weights_scale", 6, 2.826, {} },
+        { "hy_v3.expert_gating_func", 4, 2, {} },
+        { "hy_v3.attention.layer_norm_rms_epsilon", 6, 1e-5, {} },
+        { "hy_v3.rope.freq_base", 6, 11158840.0, {} },
+        { "tokenizer.ggml.tokens", 9, 0, { "a", "b" } },
+        { "general.file_type", 4, 15, {} },
+    };
+    auto f32 = [](const char* name, std::vector<uint64_t> ne) {
+        size_t count = 1;
+        for (uint64_t d : ne) count *= (size_t)d;
+        return GTensor{ name, 0, std::move(ne), std::vector<uint8_t>(count * sizeof(float), 0) };
+    };
+    write_gguf(path, kvs, { f32("token_embd.weight", {4, 4}),
+                             f32("blk.0.attn_q_norm.weight", {2}),
+                             f32("blk.0.attn_k_norm.weight", {2}),
+                             f32("blk.0.ffn_gate.weight", {4, 4}),
+                             f32("blk.1.ffn_gate_inp.weight", {4, 4}),
+                             f32("blk.1.exp_probs_b", {4}) });
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(path), RAD_OK);
+    CHECK_EQ(ck.meta().arch, std::string("hyv3"));
+    CHECK_EQ(ck.meta().quant, std::string("gguf_ftype_15"));
+    CHECK_EQ(ck.meta().m.n_vocab, (int64_t)4);  /* matrix rows exceed tokenizer strings */
+    CHECK_EQ(std::string(ck.meta().get("qk_norm")), std::string("1"));
+    CHECK_EQ(std::string(ck.meta().get("moe_router_use_sigmoid")), std::string("1"));
+    CHECK_EQ(std::string(ck.meta().get("moe_router_enable_expert_bias")), std::string("1"));
+    CHECK_EQ(std::string(ck.meta().get("enable_moe_fp32_combine")), std::string("1"));
+    CHECK_EQ(std::string(ck.meta().get("route_norm")), std::string("1"));
+    CHECK_EQ(std::string(ck.meta().get("first_k_dense_replace")), std::string("1"));
+    CHECK_EQ(std::string(ck.meta().get("num_shared_experts")), std::string("1"));
+    CHECK_EQ(std::string(ck.meta().get("expert_hidden_dim")), std::string("2"));
+    CHECK_EQ(std::string(ck.meta().get("moe_intermediate_size")), std::string("4"));
+    CHECK_EQ(std::string(ck.meta().get("num_experts")), std::string("4"));
+    CHECK_EQ(std::string(ck.meta().get("num_experts_per_tok")), std::string("2"));
+    CHECK_EQ(ck.meta().get("router_scaling_factor") != nullptr, true);
 }
 
 /* ================================================================== a diffusers pipeline
@@ -2754,6 +3348,92 @@ TEST(a_transposed_weight_swaps_its_last_two_dimensions_in_each_slice) {
                 CHECK_EQ(f[(size_t)(s * 12 + j * 3 + i)], (float)(s * 12 + i * 4 + j));
 }
 
+/* An expert's w2 is a dim-0 sub-tensor of a stacked [n_expert, in, out] tensor, transposed into
+ * the [out, in] table a grouped GEMM reads. Ignoring src_index would give every expert the whole
+ * stack, and transposing before slicing would mix experts. */
+TEST(a_transposed_expert_slice_takes_its_dim0_sub_tensor_then_transposes) {
+    std::vector<float> v(8 * 4 * 3);
+    for (size_t i = 0; i < v.size(); ++i) v[i] = (float)i;
+    const std::string dir = write_checkpoint({ f32("w2", { 8, 4, 3 }, v) }, kConfig);
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(dir), RAD_OK);
+    Program prog;
+    std::vector<std::string> names;
+    names.reserve(8);
+    for (int e = 0; e < 8; ++e) names.push_back("w2." + std::to_string(e));
+    for (int e = 0; e < 8; ++e)
+        prog.name_map.push_back(map(names[(size_t)e].c_str(), RAD_MAP_TRANSPOSE, { "w2" }, { e }));
+    prog.name_map.push_back(map("w2.bad", RAD_MAP_TRANSPOSE, { "w2" }, { 8 }));
+    CkptWeight w;
+    std::string why;
+    for (int e = 0; e < 8; ++e) {
+        const std::string& name = names[(size_t)e];
+        REQUIRE_EQ(ckpt_resolve(ck, prog, name, false, &w, &why), RAD_OK);
+        CHECK(!w.trivial);
+        REQUIRE_EQ(w.rank, (uint32_t)2);
+        CHECK_EQ(w.shape[0], (int64_t)3);
+        CHECK_EQ(w.shape[1], (int64_t)4);
+        std::vector<float> f(3 * 4);
+        REQUIRE_EQ(ckpt_rows_f32(w, 0, 3, f.data(), &why), RAD_OK);
+        /* Element (j, i) is the source's (e, i, j). */
+        for (int j = 0; j < 3; ++j)
+            for (int i = 0; i < 4; ++i)
+                CHECK_EQ(f[(size_t)(j * 4 + i)], (float)(e * 12 + i * 3 + j));
+    }
+    CHECK(ckpt_resolve(ck, prog, "w2.bad", false, &w, &why) < 0);
+}
+
+/* A stack flattened over the rows of a rank-2 tensor (Nomic's experts.mlp.w1 and w2 are
+ * [n_expert * n_ff, n_embd]) takes src_rows as one expert's row count. w1 is a copy of the block,
+ * w2 the same block transposed. */
+TEST(a_flat_expert_stack_is_one_blocks_rows_before_transposing) {
+    std::vector<float> v(8 * 4 * 3);
+    for (size_t i = 0; i < v.size(); ++i) v[i] = (float)i;
+    const std::string dir = write_checkpoint({ f32("w", { 8 * 4, 3 }, v) }, kConfig);
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(dir), RAD_OK);
+    Program prog;
+    std::vector<std::string> names;
+    names.reserve(16);
+    for (int e = 0; e < 8; ++e) names.push_back("w1." + std::to_string(e));
+    for (int e = 0; e < 8; ++e) names.push_back("w2." + std::to_string(e));
+    for (int e = 0; e < 8; ++e) {
+        RadNameMap a = map(names[(size_t)e].c_str(), RAD_MAP_COPY, { "w" }, { e });
+        a.src_rows[0] = 4;
+        prog.name_map.push_back(a);
+        RadNameMap t = map(names[(size_t)(8 + e)].c_str(), RAD_MAP_TRANSPOSE, { "w" }, { e });
+        t.src_rows[0] = 4;
+        prog.name_map.push_back(t);
+    }
+    CkptWeight w1, w2;
+    std::string why;
+    for (int e = 0; e < 8; ++e) {
+        REQUIRE_EQ(ckpt_resolve(ck, prog, names[(size_t)e], false, &w1, &why), RAD_OK);
+        REQUIRE_EQ(w1.rank, (uint32_t)2);
+        CHECK_EQ(w1.shape[0], (int64_t)4);
+        CHECK_EQ(w1.shape[1], (int64_t)3);
+        std::vector<float> f1(4 * 3);
+        REQUIRE_EQ(ckpt_rows_f32(w1, 0, 4, f1.data(), &why), RAD_OK);
+        for (int i = 0; i < 4; ++i)
+            for (int j = 0; j < 3; ++j)
+                CHECK_EQ(f1[(size_t)(i * 3 + j)], (float)(e * 12 + i * 3 + j));
+
+        REQUIRE_EQ(ckpt_resolve(ck, prog, names[(size_t)(8 + e)], false, &w2, &why), RAD_OK);
+        REQUIRE_EQ(w2.rank, (uint32_t)2);
+        CHECK_EQ(w2.shape[0], (int64_t)3);
+        CHECK_EQ(w2.shape[1], (int64_t)4);
+        std::vector<float> f2(3 * 4);
+        REQUIRE_EQ(ckpt_rows_f32(w2, 0, 3, f2.data(), &why), RAD_OK);
+        for (int j = 0; j < 3; ++j)
+            for (int i = 0; i < 4; ++i)
+                CHECK_EQ(f2[(size_t)(j * 4 + i)], (float)(e * 12 + i * 3 + j));
+    }
+    RadNameMap bad = map("w1.bad", RAD_MAP_COPY, { "w" }, { 8 });
+    bad.src_rows[0] = 4;
+    prog.name_map.push_back(bad);
+    CHECK(ckpt_resolve(ck, prog, "w1.bad", false, &w1, &why) < 0);
+}
+
 /* An EMA codebook is its sums over max(usage, 1e-5), row by row; codebooks declared in pieces
  * stack along dim 0. */
 TEST(an_ema_codebook_divides_its_sums_by_their_usage_and_stacks) {
@@ -2886,3 +3566,382 @@ TEST(single_files_merge_by_name_and_read_their_metadata_elsewhere) {
 }
 
 RAD_TEST_MAIN()
+
+/* pack_of inverts unpack for the native-layout types: any bytes as blocks, unpacked into their
+ * planes and packed again, come back unchanged (every bit pattern is a valid block of these
+ * types: codes, scales and signs are copied, never interpreted). */
+TEST(ggml_pack_inverts_unpack_for_every_block) {
+    const uint32_t types[] = { 8 /* q8_0 */, 13 /* q5_K */, 14 /* q6_K */, 20 /* iq4_nl */,
+                               16 /* iq2_xxs */, 19 /* iq1_s */, 39 /* mxfp4 */ };
+    uint64_t seed = 0x9E3779B97F4A7C15ull;
+    for (uint32_t ty : types) {
+        const lq::ggml::PlaneKind* k = lq::ggml::plane_kind(ty);
+        REQUIRE(k != nullptr);
+        const lq::ggml::PackFn pack = lq::ggml::pack_of(ty);
+        REQUIRE(pack != nullptr);
+        const RadEncoding e = lq::ggml::encoding_of(k->type);
+        for (int64_t nb : { (int64_t)1, (int64_t)3, (int64_t)7 }) {
+            std::vector<uint8_t> blocks((size_t)(nb * (int64_t)k->block_bytes)), back(blocks.size(), 0xA5);
+            for (uint8_t& b : blocks) {
+                seed = seed * 6364136223846793005ull + 1442695040888963407ull;
+                b = (uint8_t)(seed >> 56);
+            }
+            const int64_t cols = nb * k->block;
+            std::vector<std::vector<uint8_t>> planes((size_t)e.n_planes);
+            std::vector<uint8_t*> row((size_t)e.n_planes, nullptr);
+            for (int i = 0; i < e.n_planes; ++i) {
+                const RadEncPlane& pl = e.plane[i];
+                if (pl.kind == RAD_PLANE_TABLE || (pl.block[0] == 0 && pl.block[1] == 0)) continue;
+                int64_t pr = 0, pc = 0;
+                rad_enc_plane_dims(&pl, 1, cols, &pr, &pc);
+                planes[(size_t)i].assign((size_t)(rad_enc_row_bytes(pl.dtype, pc) + 8), 0);
+                row[(size_t)i] = planes[(size_t)i].data();
+            }
+            k->unpack(blocks.data(), nb, row.data());
+            pack((const uint8_t* const*)row.data(), nb, back.data());
+            CHECK(blocks == back);
+            if (blocks != back) {
+                size_t at = 0;
+                while (at < blocks.size() && blocks[at] == back[at]) ++at;
+                fprintf(stderr, "  %s nb=%lld: first byte differing at %zu of %zu (%02x vs %02x)\n",
+                        k->name, (long long)nb, at, blocks.size(), blocks[at], back[at]);
+            }
+        }
+    }
+}
+
+/* Each GGUF type's encoding is its own (arch/common/rad_ggml.h names a weight's type by its encoding,
+ * so two types with one encoding would be read as whichever comes first). Every pair of types the
+ * import reads differs. */
+TEST(ggml_encodings_are_distinct) {
+    std::vector<const lq::ggml::PlaneKind*> kinds;
+    for (uint32_t t = 0; t < 64; ++t)
+        if (const lq::ggml::PlaneKind* k = lq::ggml::plane_kind(t)) kinds.push_back(k);
+    CHECK(kinds.size() >= 6);
+    for (size_t i = 0; i < kinds.size(); ++i)
+        for (size_t j = i + 1; j < kinds.size(); ++j) {
+            const RadEncoding a = lq::ggml::encoding_of(kinds[i]->type);
+            const RadEncoding b = lq::ggml::encoding_of(kinds[j]->type);
+            if (rad_enc_equal(&a, &b))
+                fprintf(stderr, "  %s and %s share an encoding\n", kinds[i]->name, kinds[j]->name);
+            CHECK(!rad_enc_equal(&a, &b));
+        }
+}
+
+/* dequant_of (llama.cpp's dequantize_row_<type>) over native blocks equals the core's decode of the
+ * same blocks' planes, bit for bit: the native reader's values are the container's. Random blocks
+ * with each f16 super-scale set to a finite value (a NaN scale compares unequal to itself), and
+ * MXFP4's e8m0 exponent kept off 255 (ggml's 2^127, OCP's NaN: the one value the two read apart). */
+TEST(ggml_native_dequant_equals_the_plane_decode) {
+    struct T { uint32_t type; std::vector<size_t> f16_at; std::vector<size_t> e8_at = {}; };
+    const T types[] = {
+        { 8,  { offsetof(lq::ggml::block_q8_0, d) } },
+        { 13, { offsetof(lq::ggml::block_q5_K, d), offsetof(lq::ggml::block_q5_K, dmin) } },
+        { 14, { offsetof(lq::ggml::block_q6_K, d) } },
+        { 20, { offsetof(lq::ggml::block_iq4_nl, d) } },
+        { 16, { offsetof(lq::ggml::block_iq2_xxs, d) } },
+        { 19, { offsetof(lq::ggml::block_iq1_s, d) } },
+        { 39, {}, { offsetof(lq::ggml::block_mxfp4, e) } },
+    };
+    uint64_t seed = 0xD1B54A32D192ED03ull;
+    auto rnd = [&]() { seed = seed * 6364136223846793005ull + 1442695040888963407ull; return seed >> 33; };
+    for (const T& ty : types) {
+        const lq::ggml::PlaneKind* k = lq::ggml::plane_kind(ty.type);
+        REQUIRE(k != nullptr);
+        const lq::ggml::DequantFn dq = lq::ggml::dequant_of(ty.type);
+        REQUIRE(dq != nullptr);
+        const RadEncoding e = lq::ggml::encoding_of(k->type);
+        const int64_t nb = 5, cols = nb * k->block;
+        std::vector<uint8_t> blocks((size_t)(nb * (int64_t)k->block_bytes));
+        for (uint8_t& b : blocks) b = (uint8_t)rnd();
+        for (int64_t i = 0; i < nb; ++i)
+            for (size_t off : ty.f16_at) {
+                /* sign, exponent 1..30 (normal), any mantissa; small exponents keep the
+                 * products away from overflow */
+                const uint16_t h = (uint16_t)((rnd() & 0x8000u) | ((5u + rnd() % 14u) << 10) | (rnd() & 0x3FFu));
+                std::memcpy(blocks.data() + i * (int64_t)k->block_bytes + off, &h, 2);
+            }
+        /* e8m0 exponents over the subnormal two and the whole normal range short of 255 */
+        for (int64_t i = 0; i < nb; ++i)
+            for (size_t off : ty.e8_at) blocks[(size_t)(i * (int64_t)k->block_bytes + off)] = (uint8_t)(i < 2 ? i : rnd() % 255u);
+        std::vector<std::vector<uint8_t>> planes((size_t)e.n_planes);
+        std::vector<uint8_t*> row((size_t)e.n_planes, nullptr);
+        std::vector<void*> all((size_t)e.n_planes, nullptr);
+        for (int i = 0; i < e.n_planes; ++i) {
+            const RadEncPlane& pl = e.plane[i];
+            int64_t pr = 0, pc = 0;
+            rad_enc_plane_dims(&pl, 1, cols, &pr, &pc);
+            planes[(size_t)i].assign((size_t)(pr * rad_enc_row_bytes(pl.dtype, pc) + 8), 0);
+            all[(size_t)i] = planes[(size_t)i].data();
+            if (pl.kind != RAD_PLANE_TABLE && !(pl.block[0] == 0 && pl.block[1] == 0))
+                row[(size_t)i] = planes[(size_t)i].data();
+        }
+        k->unpack(blocks.data(), nb, row.data());
+        lq::ggml::write_shared(k->type, e, all.data());
+        EncodedView v;
+        enc_view(e, 1, cols, (const void* const*)all.data(), &v);
+        std::vector<float> a((size_t)cols), b((size_t)cols);
+        std::string why;
+        REQUIRE_EQ(enc_decode_rows(v, 0, 1, a.data(), &why), RAD_OK);
+        dq(blocks.data(), b.data(), cols);
+        int64_t bad = 0, first = -1;
+        for (int64_t j = 0; j < cols; ++j) {
+            uint32_t x, y;
+            std::memcpy(&x, &a[(size_t)j], 4);
+            std::memcpy(&y, &b[(size_t)j], 4);
+            /* MXFP4's nibble 8 is OCP's -0 (the core decodes -0.0) and ggml's kvalues 0 (+0.0):
+             * the same number, apart only in the sign of a zero */
+            if (ty.type == 39 && a[(size_t)j] == 0.0f && b[(size_t)j] == 0.0f) continue;
+            if (x != y) { ++bad; if (first < 0) first = j; }
+        }
+        CHECK_EQ(bad, (int64_t)0);
+        if (bad) fprintf(stderr, "  %s: %lld of %lld differ, first at %lld (%.9g vs %.9g)\n", k->name,
+                         (long long)bad, (long long)cols, (long long)first, a[(size_t)first], b[(size_t)first]);
+    }
+}
+
+/* ---------------------------------------------------------------- DeepSeek-V4's release form
+ *
+ * quant_method fp8 with scale_fmt ue8m0 and expert_dtype fp4: `X.weight` F8_E4M3 beside an
+ * `X.scale` F8_E8M0 per 32x32 block, the routed experts `X.weight` I8 [N, K/2] (two e2m1 codes a
+ * byte, element 2j low) beside `X.scale` F8_E8M0 [N, K/32], and the Engram tables e4m3 rows with
+ * an e8m0 per 32 of a row. Every value is exact in f32: code times 2^(e - 127). */
+namespace {
+
+const char* kDsConfig =
+    "{\"architectures\":[\"DeepseekV41ForCausalLM\"],\"model_type\":\"deepseek_v41\","
+    "\"quantization_config\":{\"quant_method\":\"fp8\",\"activation_scheme\":\"dynamic\","
+    "\"weight_block_size\":[32,32],\"scale_fmt\":\"ue8m0\",\"expert_dtype\":\"fp4\"},"
+    "\"text_config\":{\"hidden_size\":64,\"num_hidden_layers\":1}}";
+
+/* e8m0 exponents around 127 and both ends that stay finite in f32 (0 is 2^-127, a subnormal). */
+T e8m0(const std::string& name, std::vector<int64_t> shape, int seed) {
+    T t{ name, "F8_E8M0", shape, {} };
+    int64_t n = 1;
+    for (int64_t s : shape) n *= s;
+    static const uint8_t pick[] = { 127, 120, 131, 0, 254, 111, 126, 128, 1 };
+    for (int64_t i = 0; i < n; ++i) t.bytes.push_back(pick[(size_t)((i + seed) % 9)]);
+    return t;
+}
+/* Every e4m3 code but the two NaNs (0x7f, 0xff), in turn. */
+T e4m3_codes(const std::string& name, std::vector<int64_t> shape, int seed) {
+    T t{ name, "F8_E4M3", shape, {} };
+    int64_t n = 1;
+    for (int64_t s : shape) n *= s;
+    for (int64_t i = 0; i < n; ++i) {
+        uint8_t b = (uint8_t)((i * 29 + seed) & 0xff);
+        if ((b & 0x7f) == 0x7f) b ^= 1;
+        t.bytes.push_back(b);
+    }
+    return t;
+}
+T i8_nibbles(const std::string& name, int64_t N, int64_t K, int seed) {
+    T t{ name, "I8", { N, K / 2 }, {} };
+    for (int64_t i = 0; i < N * K / 2; ++i) t.bytes.push_back((uint8_t)((i * 53 + seed) & 0xff));
+    return t;
+}
+float e4m3_at(const T& t, int64_t i) { return rad_fp8e4m3_to_f32(t.bytes[(size_t)i]); }
+float e8m0_at(const T& t, int64_t i) { return std::ldexp(1.0f, (int)t.bytes[(size_t)i] - 127); }
+
+}  /* namespace */
+
+TEST(a_deepseek_v4_release_is_imported_as_fp8_blocks_and_mxfp4_experts) {
+    const int64_t N = 64, K = 96, E = 3, KE = 64;
+    const T wq = e4m3_codes("l.wq.weight", { N, K }, 3), wqs = e8m0("l.wq.scale", { 2, 3 }, 1);
+    const T w1 = i8_nibbles("l.experts.0.w1.weight", E, KE, 1), w1s = e8m0("l.experts.0.w1.scale", { E, 2 }, 2);
+    const T w3 = i8_nibbles("l.experts.0.w3.weight", E, KE, 7), w3s = e8m0("l.experts.0.w3.scale", { E, 2 }, 5);
+    const T em = e4m3_codes("l.engram.embed.weight", { 5, 64 }, 11), ems = e8m0("l.engram.embed.scale", { 5, 2 }, 4);
+    const std::string dir = write_checkpoint({ wq, wqs, w1, w1s, w3, w3s, em, ems,
+                                               bf16("l.norm.weight", { 4 }, 1.0f) }, kDsConfig);
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(dir), RAD_OK);
+    CHECK(ck.imports() == Checkpoint::Import::Fp8Mx);
+    CHECK(ck.import_refusal().empty());
+    CHECK_EQ(ck.meta().arch, std::string("deepseek41"));
+    CHECK_EQ(ck.fp8_block_rows(), (int64_t)32);
+    CHECK_EQ(ck.fp8_block_cols(), (int64_t)32);
+    /* the release's quantization_config is provenance: no plugin claims "fp8" for it */
+    CHECK(ck.meta().get("quantization_config.quant_method") == nullptr);
+    CHECK(ck.meta().get("imported_quantization_config.expert_dtype") != nullptr);
+    const SrcTensor* st = ck.find("l.wq.scale");
+    REQUIRE(st != nullptr);
+    CHECK_EQ(st->rad_dtype, (uint32_t)RAD_E8M0);
+
+    Program prog;
+    prog.name_map.push_back(map("wq", RAD_MAP_COPY, { "l.wq.weight" }));
+    prog.name_map.push_back(map("gu", RAD_MAP_CONCAT, { "l.experts.0.w1.weight", "l.experts.0.w3.weight" }));
+    prog.name_map.push_back(map("em", RAD_MAP_COPY, { "l.engram.embed.weight" }));
+    prog.name_map.push_back(map("n", RAD_MAP_COPY, { "l.norm.weight" }));
+    CkptWeight w;
+    std::string why;
+
+    /* block FP8: fp8_e4m3*e8m0[32x32], every element exact */
+    REQUIRE_EQ(ckpt_resolve(ck, prog, "wq", false, &w, &why), RAD_OK);
+    REQUIRE(w.trivial);
+    REQUIRE_EQ(w.enc.n_planes, 2);
+    CHECK_EQ(w.enc.plane[0].dtype, (uint32_t)RAD_F8E4M3);
+    CHECK_EQ(w.enc.plane[1].dtype, (uint32_t)RAD_E8M0);
+    CHECK_EQ(w.enc.plane[1].block[0], (int64_t)32);
+    CHECK_EQ(w.enc.plane[1].block[1], (int64_t)32);
+    CHECK(rad_enc_valid(&w.enc));
+    std::unordered_set<std::string> hit;
+    CHECK(ckpt_reads_any(w, { "l.wq.scale" }, &hit));
+    std::vector<float> f((size_t)(N * K));
+    REQUIRE_EQ(ckpt_rows_f32(w, 0, N, f.data(), &why), RAD_OK);
+    int64_t bad = 0;
+    for (int64_t r = 0; r < N; ++r)
+        for (int64_t c = 0; c < K; ++c)
+            if (f[(size_t)(r * K + c)] != e4m3_at(wq, r * K + c) * e8m0_at(wqs, (r / 32) * 3 + c / 32)) ++bad;
+    CHECK_EQ(bad, (int64_t)0);
+
+    /* fp4 experts: gate and up joined, fp4_e2m1*e8m0[1x32], the codes the shipped bytes */
+    REQUIRE_EQ(ckpt_resolve(ck, prog, "gu", false, &w, &why), RAD_OK);
+    REQUIRE(w.trivial);
+    CHECK_EQ(w.rows, 2 * E);
+    CHECK_EQ(w.cols, KE);
+    REQUIRE_EQ(w.enc.n_planes, 2);
+    CHECK_EQ(w.enc.plane[0].dtype, (uint32_t)RAD_FP4E2M1);
+    CHECK_EQ(w.enc.plane[1].dtype, (uint32_t)RAD_E8M0);
+    CHECK_EQ(w.enc.plane[1].block[0], (int64_t)1);
+    CHECK_EQ(w.enc.plane[1].block[1], (int64_t)32);
+    std::vector<uint8_t> cp((size_t)(2 * E * KE / 2)), sp((size_t)(2 * E * KE / 32));
+    REQUIRE_EQ(ckpt_plane_rows(w, 0, 0, 2 * E, cp.data(), &why), RAD_OK);
+    REQUIRE_EQ(ckpt_plane_rows(w, 1, 0, 2 * E, sp.data(), &why), RAD_OK);
+    CHECK_EQ(std::memcmp(cp.data(), w1.bytes.data(), w1.bytes.size()), 0);
+    CHECK_EQ(std::memcmp(cp.data() + w1.bytes.size(), w3.bytes.data(), w3.bytes.size()), 0);
+    CHECK_EQ(std::memcmp(sp.data(), w1s.bytes.data(), w1s.bytes.size()), 0);
+    CHECK_EQ(std::memcmp(sp.data() + w1s.bytes.size(), w3s.bytes.data(), w3s.bytes.size()), 0);
+    std::vector<float> g((size_t)(2 * E * KE));
+    REQUIRE_EQ(ckpt_rows_f32(w, 0, 2 * E, g.data(), &why), RAD_OK);
+    bad = 0;
+    for (int64_t r = 0; r < 2 * E; ++r) {
+        const T& c = r < E ? w1 : w3;
+        const T& s = r < E ? w1s : w3s;
+        const int64_t rr = r % E;
+        for (int64_t k = 0; k < KE; ++k) {
+            const uint8_t b = c.bytes[(size_t)(rr * KE / 2 + k / 2)];
+            const float code = rad_fp4e2m1_to_f32((uint8_t)(k % 2 ? b >> 4 : b & 15));
+            if (g[(size_t)(r * KE + k)] != code * e8m0_at(s, rr * 2 + k / 32)) ++bad;
+        }
+    }
+    CHECK_EQ(bad, (int64_t)0);
+
+    /* e4m3 rows with an e8m0 per 32 of each row: fp8_e4m3*e8m0[1x32] */
+    REQUIRE_EQ(ckpt_resolve(ck, prog, "em", false, &w, &why), RAD_OK);
+    REQUIRE(w.trivial);
+    REQUIRE_EQ(w.enc.n_planes, 2);
+    CHECK_EQ(w.enc.plane[1].block[0], (int64_t)1);
+    CHECK_EQ(w.enc.plane[1].block[1], (int64_t)32);
+    std::vector<float> h((size_t)(5 * 64));
+    REQUIRE_EQ(ckpt_rows_f32(w, 0, 5, h.data(), &why), RAD_OK);
+    bad = 0;
+    for (int64_t i = 0; i < 5 * 64; ++i)
+        if (h[(size_t)i] != e4m3_at(em, i) * e8m0_at(ems, (i / 64) * 2 + (i % 64) / 32)) ++bad;
+    CHECK_EQ(bad, (int64_t)0);
+
+    REQUIRE_EQ(ckpt_resolve(ck, prog, "n", false, &w, &why), RAD_OK);
+    CHECK(w.trivial && rad_enc_is(&w.enc, "plain"));
+}
+
+/* A row range of a block-scaled FP8 tensor (DeepSeek-V4.1's grouped output projection read one
+ * group at a time) takes its scale plane's rows with it when it starts and ends on a block; one
+ * that cuts a block is refused, since its first rows would take another block's scales. */
+TEST(row_pieces_of_block_fp8_take_their_scale_rows) {
+    const int64_t N = 96, K = 64;
+    const T wo = e4m3_codes("l.wo.weight", { N, K }, 9), wos = e8m0("l.wo.scale", { 3, 2 }, 6);
+    const T em = e4m3_codes("l.t.weight", { 6, 64 }, 2), ems = e8m0("l.t.scale", { 6, 2 }, 3);
+    const std::string dir = write_checkpoint({ wo, wos, em, ems }, kDsConfig);
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(dir), RAD_OK);
+    Program prog;
+    prog.name_map.push_back(ranged("g1", RAD_MAP_ROWS, { "l.wo.weight" }, { 32 }, { 32 }));
+    prog.name_map.push_back(ranged("g12", RAD_MAP_ROWS, { "l.wo.weight" }, { 32 }, { 64 }));
+    prog.name_map.push_back(ranged("cut", RAD_MAP_ROWS, { "l.wo.weight" }, { 16 }, { 32 }));
+    prog.name_map.push_back(ranged("t", RAD_MAP_ROWS, { "l.t.weight" }, { 3 }, { 2 }));
+    CkptWeight w;
+    std::string why;
+    for (const char* name : { "g1", "g12" }) {
+        REQUIRE_EQ(ckpt_resolve(ck, prog, name, false, &w, &why), RAD_OK);
+        REQUIRE(w.trivial);
+        CHECK_EQ(w.enc.plane[1].block[0], (int64_t)32);
+        std::vector<float> f((size_t)(w.rows * K));
+        REQUIRE_EQ(ckpt_rows_f32(w, 0, w.rows, f.data(), &why), RAD_OK);
+        int64_t bad = 0;
+        for (int64_t r = 0; r < w.rows; ++r)
+            for (int64_t c = 0; c < K; ++c) {
+                const int64_t R = 32 + r;
+                if (f[(size_t)(r * K + c)] != e4m3_at(wo, R * K + c) * e8m0_at(wos, (R / 32) * 2 + c / 32))
+                    ++bad;
+            }
+        CHECK_EQ(bad, (int64_t)0);
+        std::vector<uint8_t> sp((size_t)(w.rows / 32 * 2));
+        REQUIRE_EQ(ckpt_plane_rows(w, 1, 0, w.rows / 32, sp.data(), &why), RAD_OK);
+        CHECK_EQ(std::memcmp(sp.data(), wos.bytes.data() + 2, sp.size()), 0);
+    }
+    CHECK(ckpt_resolve(ck, prog, "cut", false, &w, &why) < 0);
+    CHECK(why.find("scale blocks") != std::string::npos);
+    /* a plane of a scale per group of a row cuts anywhere */
+    REQUIRE_EQ(ckpt_resolve(ck, prog, "t", false, &w, &why), RAD_OK);
+    REQUIRE(w.trivial);
+    std::vector<float> f((size_t)(2 * 64));
+    REQUIRE_EQ(ckpt_rows_f32(w, 0, 2, f.data(), &why), RAD_OK);
+    int64_t bad = 0;
+    for (int64_t i = 0; i < 2 * 64; ++i)
+        if (f[(size_t)i] != e4m3_at(em, 3 * 64 + i) * e8m0_at(ems, 6 + (i / 64) * 2 + (i % 64) / 32)) ++bad;
+    CHECK_EQ(bad, (int64_t)0);
+}
+
+/* Another expert dtype or scale format is not read as DeepSeek-V4's: refused by name, and an I8
+ * expert whose exponent plane does not fit is refused at the weight. */
+TEST(a_deepseek_release_in_another_form_is_refused) {
+    {
+        const std::string dir = write_checkpoint({ bf16("x", { 2, 2 }, 0) },
+            "{\"model_type\":\"deepseek_v41\",\"quantization_config\":{\"quant_method\":\"fp8\","
+            "\"weight_block_size\":[32,32],\"scale_fmt\":\"ue8m0\",\"expert_dtype\":\"fp6\"}}");
+        Checkpoint ck;
+        REQUIRE_EQ(ck.open(dir), RAD_OK);
+        CHECK(ck.imports() == Checkpoint::Import::None);
+        CHECK(ck.import_refusal().find("expert_dtype") != std::string::npos);
+    }
+    const T w1 = i8_nibbles("e.w1.weight", 3, 64, 1), bad = e8m0("e.w1.scale", { 3, 4 }, 0);
+    const std::string dir = write_checkpoint({ w1, bad }, kDsConfig);
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(dir), RAD_OK);
+    Program prog;
+    prog.name_map.push_back(map("e", RAD_MAP_COPY, { "e.w1.weight" }));
+    CkptWeight w;
+    std::string why;
+    CHECK(ckpt_resolve(ck, prog, "e", false, &w, &why) < 0);
+    CHECK(why.find("exponent plane") != std::string::npos);
+}
+
+/* A gain shipped as two factors (DeepSeek-V4.1's Engram q_weight and k_weight) is their product,
+ * element by element, in f32: exact for two bf16s. Factors of two shapes are refused. */
+TEST(a_product_map_multiplies_its_two_factors) {
+    T q = bf16("e.q_weight", { 2, 6 }, 0.0f), k = bf16("e.k_weight", { 2, 6 }, 0.0f);
+    for (int i = 0; i < 12; ++i) {
+        rad_store_f32(q.bytes.data(), RAD_BF16, i, 0.75f + 0.125f * (float)i);
+        rad_store_f32(k.bytes.data(), RAD_BF16, i, -1.5f + 0.0625f * (float)(i * i));
+    }
+    const std::string dir = write_checkpoint({ q, k, bf16("odd", { 3, 4 }, 1.0f) }, kConfig);
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(dir), RAD_OK);
+    Program prog;
+    prog.name_map.push_back(map("g", RAD_MAP_MUL, { "e.q_weight", "e.k_weight" }));
+    prog.name_map.push_back(map("bad", RAD_MAP_MUL, { "e.q_weight", "odd" }));
+    CkptWeight w;
+    std::string why;
+    REQUIRE_EQ(ckpt_resolve(ck, prog, "g", false, &w, &why), RAD_OK);
+    CHECK(!w.trivial);
+    CHECK_EQ(w.rows, (int64_t)2);
+    CHECK_EQ(w.cols, (int64_t)6);
+    std::unordered_set<std::string> hit;
+    CHECK(ckpt_reads_any(w, { "e.k_weight" }, &hit));
+    std::vector<float> f(12);
+    REQUIRE_EQ(ckpt_rows_f32(w, 0, 2, f.data(), &why), RAD_OK);
+    for (int i = 0; i < 12; ++i)
+        CHECK_EQ(f[(size_t)i], rad_load_f32(q.bytes.data(), RAD_BF16, i) *
+                               rad_load_f32(k.bytes.data(), RAD_BF16, i));
+    CHECK(ckpt_resolve(ck, prog, "bad", false, &w, &why) < 0);
+    CHECK(why.find("not one shape") != std::string::npos);
+}

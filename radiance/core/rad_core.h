@@ -7,8 +7,6 @@
 #pragma once
 #include "rad_internal.h"
 #include "lora/config.h"
-#include "rad_deferred_status.h"
-#include "rad_expert_prepare.h"
 
 #include <map>
 #include <memory>
@@ -61,9 +59,9 @@ struct KernelRow {
     bool                 reference = false;
     /* rad_kernel_chain: its launches can wait in the kernel instead of behind the barrier bit. */
     bool                 chain = false;
-    /* Optional versioned deferred-status collector, loaded separately from the
-     * frozen RadKernelInfo. Only an opted row gets a wrapped launch. */
-    RadDeferredStatusLaunchFn deferred_status = nullptr;
+    /* rad_kernel_fetches_rows: it reads a mapped table's rows itself, so the engine does not read
+     * them ahead through the page cache (runtime/rowprefetch.h). */
+    bool                 fetches_rows = false;
 };
 
 /* A kernel bound to one geometry, one domain and one variant, with init() already run. */
@@ -119,7 +117,7 @@ struct Band {
  * off the card (embed_lookup_q, libavx/avx_ngram.cpp). Under `ram` the load phase publishes a
  * copy instead: locked memory for the host gather, or pinned memory a device kernel reads over
  * the link (the zero-copy site). */
-enum class Tier { VRAM = 0, HostPinned = 1, HostPageable = 2, SSD = 3, Mapped = 4, NativeStore = 5 };
+enum class Tier { VRAM = 0, HostPinned = 1, HostPageable = 2, SSD = 3, Mapped = 4 };
 
 /* Where a lookup table lives: the token embedding (--embedding-placement) or an n-gram embedding
  * (--ngram-placement). Only a row lookup reads them, so a step touches M rows, never the whole
@@ -161,7 +159,7 @@ enum class Site { Device = 0, DeviceStaged = 1, DeviceZeroCopy = 2, Host = 3 };
 
 /* Size of every Tier-indexed array (report, live view, planner totals). Use it rather than a
  * literal, so a new tier cannot silently write out of bounds. */
-constexpr int kTierCount = 6;
+constexpr int kTierCount = 5;
 
 const char* tier_name(Tier t);
 const char* site_name(Site s);
@@ -194,11 +192,13 @@ struct WeightInfo {
     /* Filled by the layout pass: what the resolved kernel stores. `identity` is the selected
      * plane's bytes unchanged, the only form the file and mapped tiers can serve since they read
      * the container in place; `widen` is identity plus an exact widening (a bf16 norm read as
-     * f32) done by the loader. Otherwise the kernel at (lay_op, lay_band, lay_dom) relayouts it at
+     * f32) done by the loader, and `narrow` an exact narrowing (an f32 readout head served as
+     * bf16). Otherwise the kernel at (lay_op, lay_band, lay_dom) relayouts it at
      * load, as operand `lay_operand`. */
     std::string    layout_tag;
     bool           identity = true;
     bool           widen = false;
+    bool           narrow = false;
     int32_t        lay_op = -1, lay_band = -1, lay_dom = -1, lay_operand = -1;
     uint32_t       stored_dtype = RAD_DT_INVALID;
     uint32_t       stored_rank = 0;
@@ -212,16 +212,30 @@ struct WeightInfo {
     Tier           tier = Tier::VRAM;
     Site           site = Site::Device;
     int32_t        slab_slot = -1;      /* -1 = not slab-resident */
+    /* RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED (place/vram_packed.h): a VRAM weight the card holds in the
+     * packed-scale form instead of its stored form, `vram_bytes` long with room for `vram_pk_cap` raw
+     * rounds. The load packs it there, and its weight-table entries carry bit 0 (Ctx::table_refresh),
+     * which only libr4d's moe_gemm_ggml_mxfp4_gemv_vp reads. 0 / -1: the stored form, as everywhere else. */
+    int64_t        vram_bytes = 0;
+    int32_t        vram_pk_cap = -1;
 
     /* Filled at load. Under TP this is this rank's shard, not the whole weight. */
     void*          ptr = nullptr;
     void*          host_ptr = nullptr;
     uint64_t       file_offset = 0;
+    /* Each selected plane's offset in the container (file_offset is plane_offset[0]), for a
+     * file-tier weight the loader relayouts on every read (weight_file_relaid). */
+    uint64_t       file_plane_offset[RAD_ENC_MAX_PLANES] = {0};
 
     /* First and last op index that read the weight. Prefetch runs off these, so layer offload is
      * scheduling rather than prediction (spec §5). */
     int32_t        first_use_op = -1;
     int32_t        last_use_op  = -1;
+    /* Private immutable source owner;0 is canonical/legacy,1 is an admitted DSpark bank.
+     * These are not public ABI fields and never encode a bank in a payload offset. */
+    uint32_t       file_id = 0;
+    uint64_t       source_bank_generation = 0;
+    int64_t        source_entry_index = -1;
 };
 
 /* This rank's selected planes as a layout hook sees them: dense rank-2 geometry, `data` null
@@ -243,7 +257,19 @@ inline void weight_planes(const WeightInfo& w, RadTensor* t) {
  * the mapped tier's pointer): only when they are the selected plane unchanged and this rank holds
  * all of it. A relayout is not in the file, and a column shard is not one contiguous range. */
 inline bool weight_file_direct(const WeightInfo& w, int world_size) {
-    return w.identity && !w.widen && (w.decl.shard == RAD_SHARD_NONE || world_size <= 1);
+    return w.identity && !w.widen && !w.narrow &&
+           (w.decl.shard == RAD_SHARD_NONE || world_size <= 1);
+}
+
+/* A weight's bytes as the container holds them, for a host reader of the file (the router
+ * predictor, Mover::read_weight_file): the stored bytes of a weight stored as is, or the one plane
+ * a kernel's relayout reads (gemm_nt_f32bf16 keeps an f32 router as its bf16 halves under
+ * RADIANCE_EXPERIMENTAL_DS41_ROUTER_BF16). 0 for anything else, a weight the loader widens or
+ * narrows among them: its stored bytes are not the file's. */
+inline int64_t weight_file_bytes(const WeightInfo& w) {
+    if (w.identity) return !w.widen && !w.narrow && w.stored_bytes > 0 ? w.stored_bytes : 0;
+    if (w.n_sel != 1 || !w.enc_known) return 0;
+    return w.sel_rows[0] * rad_enc_row_bytes(w.enc.plane[w.sel[0]].dtype, w.sel_cols[0]);
 }
 
 struct BufferInfo {
@@ -294,6 +320,9 @@ struct KVGroupInfo {
     int64_t         bytes_per_state = 0;   /* linear/conv: per sequence */
     std::vector<int> layers;
     bool            zero = false;       /* rad_kv_group_zero: declared for position, nothing carved */
+    /* rad_kv_group_dense_read: read over the whole history every step (an indexer's block keys), so
+     * it cannot stream and must hold every sequence's context while a sibling streams. */
+    bool            dense_read = false;
     bool            replicated = false; /* rad_kv_group_replicated: the same bytes on every rank */
     /* Bound only at meta.n_layers and above: the drafter's own cache, which no trunk layer reads.
      * Set at declare (Builder::finish_kv_groups). */
@@ -349,22 +378,13 @@ struct LoraAlias {
     int64_t     from_lo = 0, from_hi = 0, to_lo = 0;
 };
 
-struct ExpertRouteMap { RadExpertRouteDecl decl{}; std::vector<RadExpertRouteEntry> entries; };
-
 /* Everything declare produced. The core owns it; the plugin only ever sees handles into it. */
 class Program {
-    friend class Builder;
-    // Fixed by declaration, with no public downgrade setter.
-    bool permanent_model_failure_ = false;
-    bool glm_main_tp4_cache_fail_stop_ = false; // separate additive profile; never clears PermanentV1
 public:
-    bool requires_permanent_model_failure() const { return permanent_model_failure_; }
-    bool requires_glm_main_tp4_cache_fail_stop() const { return glm_main_tp4_cache_fail_stop_; }
     std::vector<WeightInfo>  weights;    /* index 0 is a sentinel: handles are 1-based */
     std::vector<BufferInfo>  buffers;
     std::vector<OpInfo>      ops;
     std::vector<KVGroupInfo> kv_groups;
-    std::vector<ExpertRouteMap> expert_route_maps; // opt-in, owned immutable routing metadata
     std::vector<RadNameMap>  name_map;
     std::vector<std::string> notes;
 
@@ -408,6 +428,10 @@ public:
     int32_t        drafter_pos_offset = 0;
     /* A block drafter's shorter block (rad_drafter_short_block), 0 when it serves only its own. */
     int64_t        drafter_short_block = 0;
+
+    /* The exact consumer suffix the plugin declared (rad_declare_consumer_suffix), n_layer 0 when
+     * it declared none. What the engine does with it: core/sched/consumer_skip.h. */
+    RadConsumerSuffix consumer{};
 
     /* The declared media encoder (rad_declare_encoder). `modalities == 0` when none: every
      * text-only program, and every deployment with RadBuildCtx::max_enc_patches 0.
@@ -518,6 +542,11 @@ public:
         Geometry             geom;
         std::string          geom_key;
         const RadKernelInfo* info = nullptr;
+        /* The instance init() made for this instantiation, null for a kernel with no init. A
+         * collective's launch reaches its peer bundle (scratch, flags, sequence counters) only
+         * through it. It belongs to the rank this Program was declared for, and the Registry that
+         * made it must outlive the launch (spec §1, §15). */
+        void*                instance = nullptr;
     };
     std::vector<TuneRequest> tune_requests;
 
@@ -526,6 +555,30 @@ public:
     OpInfo*     op(rad_op h)         { return h && h < ops.size()     ? &ops[h] : nullptr; }
 
 };
+
+/* The kernel whose layout hook settled `w`'s stored form, or null when it is stored as is or
+ * widened. */
+inline const RadKernelInfo* weight_layout_kernel(const Program& prog, const WeightInfo& w) {
+    if (w.identity || w.widen || w.lay_op < 0 || (size_t)w.lay_op >= prog.ops.size()) return nullptr;
+    const OpInfo& op = prog.ops[(size_t)w.lay_op];
+    if (w.lay_band < 0 || (size_t)w.lay_band >= op.bands.size() || w.lay_dom < 0 ||
+        w.lay_dom >= RAD_N_DOMAINS)
+        return nullptr;
+    const KernelRow* row = op.bands[(size_t)w.lay_band].dom[w.lay_dom].row;
+    return row ? row->info : nullptr;
+}
+
+/* Whether the file tier can serve `w` by relayouting it on every read, as the loader does once
+ * for a resident weight: whole planes (no shard at a world above one, so each plane is one range
+ * of the container), not widened, and a kernel that relayouts. The selected planes are read from
+ * the container and the kernel's relayout writes the stored form into the pinned stage the copy
+ * to the card reads. The mapped tier cannot do this: it hands kernels the container's bytes. */
+inline bool weight_file_relaid(const Program& prog, const WeightInfo& w, int world_size) {
+    if (w.identity || w.widen) return false;
+    if (w.decl.shard != RAD_SHARD_NONE && world_size > 1) return false;
+    const RadKernelInfo* ki = weight_layout_kernel(prog, w);
+    return ki && ki->relayout;
+}
 
 /* ================================================================== requests */
 
@@ -768,6 +821,8 @@ enum { RAD_P2P_AUTO = 0, RAD_P2P_ON = 1, RAD_P2P_OFF = 2 };
 
 struct Config {
     std::string model;                 /* path to the .rad, or a Hugging Face repo id (hf_model.h) */
+    std::string draft_bank;            /* experimental missing-only ordinary DSpark RAD */
+    std::string draft_bank_expert_placement = "auto"; /* existing pinned pool; no automatic growth */
     LoraConfig  lora;                  /* --lora, --max-loras, --max-lora-rank, --lora-target-modules */
     std::string download_dir;          /* where a repo id is fetched to; empty = the XDG cache */
     std::string radiance_home;
@@ -782,6 +837,10 @@ struct Config {
     /* --tp-attn-split heads|rows: 1 runs a prefill-sized step's attention by rows over the ranks
      * (RadBuildCtx::tp_attn_rows). Not bit-identical to the head split, so heads is the default. */
     int   tp_attn_rows = 0;
+    /* --weight-prefetch on|off: off declares none of the plugin's weight reads beside the
+     * collectives (RadBuildCtx::weight_prefetch_off), for an engine that shares its cards with
+     * another server, where the second lane's read costs a queue switch every decode step. */
+    bool  weight_prefetch = true;
     /* Smallest all-reduce message, in KiB, that the lossy wire compresses; smaller ones are sent
      * exact. Compression pays only when the transfer is bandwidth-bound: a decode step's handful
      * of residual rows costs more to rotate than it saves, while a prefill chunk is far larger.
@@ -833,6 +892,13 @@ struct Config {
      * accepted in e4m3 (RadBuildCtx::attn_prefill_fp8). Lossy, so off is the default.
      * attn_prefill_fp8_name() spells it as the flag does. */
     int attn_prefill_fp8 = 0;
+    /* --kv-resident N: tokens of the sparse attention group's context its VRAM ring holds
+     * (docs/KV-STREAMING.md). 0 is off; a ring that covers `max_seqs x max_ctx` streams nothing; a
+     * ring below kStreamFloorTokens or one decode step's selection is raised to it. */
+    int64_t kv_resident = 0;
+    /* Derived: whether a group streams, set by kvstream_cap_probe before the pool is sized (a
+     * streamed group's ceiling is its ring and stage, not its cache); the KV MiB rounding reads it. */
+    bool kv_streams = false;
     int64_t host_pool_mib = 0;
     int64_t host_headroom_mib = 4096; /* --host-headroom-mib: RAM left free for the system at startup */
     /* File tier for weights: what fits in neither the VRAM slab nor the pinned host pool is read
@@ -840,6 +906,29 @@ struct Config {
      * exact prefetch, a routed expert a routed layer at a time). Off by default because disk
      * paces the step, so an accidental spill makes the server orders of magnitude slower. */
     bool    weights_disk_tier = false;
+    /* Server-wide native RAM cache for file-tier experts, partitioned across ranks. Includes
+     * entry metadata; pageable payloads copy through existing pinned windows. Zero disables. */
+    int64_t expert_ram_cache_total_mib = 0;
+    /* --expert-plane-mirror DIR: the checkpoint's model-*.safetensors on another drive than the
+     * container. DeepSeek-V4.1's CPU expert path reads part of each missed expert from it beside
+     * the container (place/plane_mirror.h). Empty, the default, reads the container only.
+     * --expert-plane-mirror-share: the fraction of a missed expert's bytes it supplies (0.18, at
+     * most 0.31, the whole of the up projection's codes) in passes of
+     * --expert-plane-mirror-min-rows tokens or more (2: prefill chunks), and
+     * --expert-plane-mirror-decode-share in smaller passes (0, the default: decode reads the
+     * container only). */
+    std::string expert_plane_mirror;
+    double      expert_plane_mirror_share = 0.18;
+    int64_t     expert_plane_mirror_min_rows = 2;
+    double      expert_plane_mirror_decode_share = 0.0;
+    /* --row-prefetch on|off: a host gather's rows on the mapped tier (a table on disk, read
+     * through the container's mapping) are asked for ahead of its kernel (runtime/rowprefetch.h,
+     * CtxDesc::row_prefetch). Output-neutral; on is the default. */
+    bool    row_prefetch = true;
+    /* --mapped-rewarm on|off: at startup, the mapped tier's pages an earlier run left in the page
+     * cache and the load's allocations reclaimed are asked for again, at most half of
+     * MemAvailable (RadFile::rewarm). Output-neutral; on is the default. */
+    bool    mapped_rewarm = true;
 
     std::string placement = "auto";    /* all_vram | layer_offload | expert_tiered | auto */
     /* --embedding-placement and --ngram-placement as given (see TablePlacement), and their
@@ -883,6 +972,9 @@ struct Config {
      * inside a span are not written; those at its end and at a prompt's tail are, where a span of
      * 1 writes them. */
     int64_t prefill_span = 1;
+    /* RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP (core/sched/consumer_skip.h): -1 reads the variable
+     * at the scheduler's start ("1" turns it on), 0 off, 1 on. A field so a test can set it. */
+    int     consumer_skip = -1;
     /* Cap on linear-state (or sliding-window) snapshots held at once, for the whole server. The
      * slots are pinned host memory, all allocated at startup and never on the card (spec §7.3).
      * A slot is a sizeable fraction of a gigabyte on a linear-attention model, so raising the cap
@@ -890,6 +982,14 @@ struct Config {
      * store is opened (checkpoint_slots_auto in core/mem/prefix.h). */
     int64_t checkpoint_slots = -1;
     bool    prefix_cache = true;
+    /* --prefix-resume exact|nearest. Exact (the default) resumes a prefix hit only on the grid an
+     * idle server's cold prefill chunks the same prompt on (ChunkGeometry::grid), and takes a
+     * prompt's tail snapshot where its last chunk starts: the hit recomputes the cold run's own
+     * chunks, so its output is the cold run's bit for bit, where a kernel rounds a row differently
+     * at another chunk length. Nearest resumes at the deepest snapshot or block, a prompt's tail
+     * snapshot at its last quantum boundary: up to a chunk less re-prefilled a turn, and a hit that
+     * can differ from a cold run in the last bits (a near-tie in greedy text). */
+    bool    prefix_exact = true;
     /* geometric-backoff | tip-only | keep-all. §19.1 records the default as unmeasured;
      * core/mem/prefix.h ships the two extremes so they can be compared. */
     std::string checkpoint_policy = "geometric-backoff";
@@ -926,13 +1026,26 @@ struct Config {
      * and rad-tune read the same operating point; defaulting to off would pay for the head in
      * VRAM and still decode one token a step. */
     int     n_spec = -1;                /* --num-speculative-tokens; -1 = auto, 0 = off */
+    /* --spec-ngram K: speculate by prompt lookup alone, K drafts a step (core/sched/ngram.h), each
+     * proposal verified only when it pays for its verify rows (core/sched/lookup.h).
+     * Sets the window to K and tells the plugin to declare no draft head
+     * (RadBuildCtx::draft_head_off), so a head the container carries costs no memory. 0 (the
+     * default) is off: a deployment that speculates still uses prompt lookup for any sequence its
+     * head declines, and a container without a head speculates by prompt lookup at
+     * --num-speculative-tokens N. */
+    int     spec_ngram = 0;
+    /* The pattern lengths prompt lookup tries, longest first (--spec-ngram-min/--spec-ngram-max),
+     * wherever it runs. */
+    int     spec_ngram_min = 2;
+    int     spec_ngram_max = 4;
     DraftWindow draft_window = kDraftWindowDefault;   /* --draft-window */
     /* A block drafter's short block (rad_drafter_short_block) from this many decoding sequences in
      * the step just run; 0 never. Ignored without a drafter that declares one. */
     int64_t draft_short_from = 0;       /* --draft-short-from */
 
-    /* --draft-coupling off|on: a linear serial drafter samples its proposals and the sampler
-     * applies the maximal coupling at the verify (RadBuildCtx::draft_coupling, abi/rad_spechub.h).
+    /* --draft-coupling off|on: a linear serial drafter (or DFlash2's block walk) samples its
+     * proposals and the sampler applies the maximal coupling at the verify
+     * (RadBuildCtx::draft_coupling, abi/rad_spechub.h).
      * Off by default; on changes which tokens a fixed seed yields, not their law. */
     bool        draft_coupling = false;
 
@@ -1057,7 +1170,32 @@ struct Config {
     bool    debug_graph = false;
     bool    debug_selection = false;
     bool    debug_placement = false;
+    /* --debug-tape-dump: each rank lists the dispatches of the first recorded pass of each kind
+     * (CtxDesc::tape_dump). */
+    bool    debug_tape_dump = false;
+    /* --debug-draft-oracle FILE: prompt lookup proposes from these token ids, 30% of its drafts
+     * corrupted -- the verify path's test harness (Scheduler::draft_ngram). Empty is off. */
+    std::string debug_draft_oracle;
     bool    profile_ops = false;
+    /* --expert-stats FILE: count the routed experts every layer selects, by step kind, and write
+     * the counts to FILE as JSON every 30 s and at shutdown (place/xstats.h). Empty is off. */
+    std::string expert_stats;
+    /* --expert-profile FILE: a radiance-expert-stats JSON (place/xstats.h) whose `decode` counts
+     * rank the expert plane, instead of the container's activation profile. Empty serves the
+     * container's profile. The native DS4.1 EP4 path additionally checks its sealed DECODE
+     * profile against the immutable source identity before localizing the ranking. */
+    std::string expert_profile;
+    bool    expert_profile_given = false;
+    /* --expert-pin-top F: pin the hottest F of the routed experts (0 < F <= 1) by the profile's
+     * share, keeping them resident: heat never demotes them. 0 is off. */
+    float   expert_pin_top = 0.0f;
+    bool    expert_pin_top_given = false;
+    /* --draft-expert-placement auto|host: a draft head's (MTP/DSpark) routed experts are pinned in
+     * the host pool before any strategy runs, streamed in place like a pooled expert. `auto` (the
+     * default) leaves them to the strategy. `host` is what lets a drafter's experts fit beside a
+     * trunk that already fills the card. */
+    std::string draft_expert_placement = "auto";
+    bool    draft_expert_placement_given = false;
     /* --live: the live view (spec §16). Off by default like everything else in that section. */
     bool    live_view = false;
 
@@ -1071,6 +1209,17 @@ struct Config {
      * the startup report (core/diag/diag.h) prints this beside every value. */
     std::map<std::string, std::string> given;
 };
+
+/* Two distinct manual host-placement contracts must never charge the same draft units.
+ * The generic mode grows a host pool; the experimental bank mode never grows it.
+ * Value checks also protect directly constructed Configs, whose `given` map is empty. */
+inline bool draft_placement_modes_conflict(const Config& cfg) {
+    const bool bank_manual = cfg.draft_bank_expert_placement == "host" ||
+                            cfg.given.count("--draft-bank-expert-placement") != 0;
+    const bool standard_manual = cfg.draft_expert_placement == "host" ||
+                                 cfg.draft_expert_placement_given;
+    return bank_manual && standard_manual;
+}
 
 }  /* namespace rad */
 

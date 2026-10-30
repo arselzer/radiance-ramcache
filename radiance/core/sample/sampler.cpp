@@ -3,8 +3,6 @@
  */
 #include "sampler.h"
 #include "gbnf.h"
-#include "../build/tiny_component_quotes.h"
-#include "../build/glm_main_quote.h"
 
 #include <algorithm>
 #include <chrono>
@@ -12,58 +10,6 @@
 #include <cstring>
 
 namespace rad {
-
-// No staging allocation, declaration or backend access; caller output commits last.
-int Sampler::tiny_startup_quote(const SamplerConfig& c,TinySamplerQuote* out) noexcept {
-    if(!out)return RAD_E_INVAL;
-    if(c.n_vocab!=320||(c.n_vocab_local!=0&&c.n_vocab_local!=320)||c.max_seqs!=1||c.max_hist!=2048||c.max_spec||c.rank||c.world_size!=1||c.vocab_off||c.max_candidates!=1024||c.draft_coupling)return RAD_E_UNSUPPORTED;
-    TinySamplerQuote q;q.sizeof_sampler=sizeof(Sampler);q.sizeof_sample_params=sizeof(DeviceSampleParams);q.sizeof_couple_entry=sizeof(decltype(CoupleBuild::seqs)::value_type);
-    q.rows=1;q.history=c.max_hist;q.candidates=c.max_candidates;q.mask_words=grammar_mask_words(c.n_vocab);q.logprob_width=lp_width();
-    const uint64_t bytes[]{sizeof(DeviceSampleParams),sizeof(DeviceSampleParams),sizeof(DeviceSampleParams),uint64_t(c.max_hist)*sizeof(int32_t),uint64_t(c.max_hist),2*sizeof(int32_t),q.mask_words*sizeof(uint32_t),q.mask_words*sizeof(uint32_t),q.logprob_width*sizeof(float),uint64_t(c.max_candidates)*sizeof(int32_t),uint64_t(c.max_candidates)*sizeof(float)};
-    for(size_t i=0;i<11;++i){q.pinned_request_bytes[i]=bytes[i];if(!tiny_quote::pinned(q.storage,bytes[i]))return RAD_E_SHAPE;}
-    if(!tiny_quote::heap(q.storage,q.mask_words,sizeof(uint32_t))||!tiny_quote::heap(q.storage,1,q.sizeof_couple_entry))return RAD_E_SHAPE;
-    q.storage.embedded_object_bytes=sizeof(Sampler);q.storage.control_allowance=512;
-    if(!tiny_quote::finish(q.storage))return RAD_E_SCRATCH;
-    *out=q;return RAD_OK;
-}
-
-int Sampler::glm_main_startup_quote(const SamplerConfig& c,TinySamplerQuote* out) noexcept {
-    if(!out)return RAD_E_INVAL;
-    if(c.n_vocab!=154880||c.world_size!=4||c.rank<0||c.rank>=4||c.max_seqs!=1||c.max_spec||
-       c.max_hist!=2048||c.draft_coupling||c.max_candidates<=0||c.max_candidates>kSampleMergeCandidates||
-       (c.valid_token_count && c.valid_token_count!=154856))
-        return RAD_E_UNSUPPORTED;
-    const int64_t local=c.n_vocab_local>0?c.n_vocab_local:c.n_vocab/c.world_size;
-    if(local!=c.n_vocab/4||c.vocab_off!=int64_t(c.rank)*local)return RAD_E_UNSUPPORTED;
-    TinySamplerQuote q;
-    q.sizeof_sampler=sizeof(Sampler);q.sizeof_sample_params=sizeof(DeviceSampleParams);
-    q.sizeof_couple_entry=sizeof(decltype(CoupleBuild::seqs)::value_type);
-    q.rows=1;q.history=c.max_hist;
-    // EXACT Sampler::declare clamp, including a caller's larger requested width.
-    q.candidates=uint64_t(std::min<int64_t>(c.max_candidates,kSampleMergeCandidates/c.world_size));
-    q.mask_words=grammar_mask_words(local);q.logprob_width=uint64_t(lp_width())*4;
-    const uint64_t bytes[]{sizeof(DeviceSampleParams),sizeof(DeviceSampleParams),sizeof(DeviceSampleParams),
-        uint64_t(c.max_hist)*sizeof(int32_t),uint64_t(c.max_hist),2*sizeof(int32_t),
-        q.mask_words*sizeof(uint32_t),q.mask_words*sizeof(uint32_t),
-        c.rank==0?q.logprob_width*sizeof(float):0,
-        c.rank==0?q.candidates*sizeof(int32_t):0,c.rank==0?q.candidates*sizeof(float):0};
-    for(size_t i=0;i<11;++i){q.pinned_request_bytes[i]=bytes[i];if(bytes[i]&&!tiny_quote::pinned(q.storage,bytes[i]))return RAD_E_SHAPE;}
-    // Actual whole-vocab mask + stage_alloc's unconditional CoupleBuild reserve.
-    if(!tiny_quote::heap(q.storage,grammar_mask_words(c.n_vocab),sizeof(uint32_t))||
-       !tiny_quote::heap(q.storage,1,q.sizeof_couple_entry))return RAD_E_SHAPE;
-    // Conservative one-request baseline uses ACTUAL private node/row sizes. It
-    // does not price arbitrary grammar/DRY programs or unbounded request queues.
-    if(!tiny_quote::heap(q.storage,1,sizeof(decltype(seqs_)::value_type)+128)||
-       !tiny_quote::heap(q.storage,1,sizeof(LpRow)+sizeof(uint64_t))||
-       !tiny_quote::heap(q.storage,uint64_t(c.max_hist),sizeof(int32_t)))return RAD_E_SHAPE;
-    q.storage.embedded_object_bytes=sizeof(Sampler);q.storage.control_allowance=1024;
-    if(!glm_main_quote_finish(q.storage))return RAD_E_SCRATCH;
-    *out=q;return RAD_OK;
-}
-int Sampler::glm_main_startup_quote(TinySamplerQuote* out)const noexcept {
-    if(!declared_)return RAD_E_STATE;
-    return glm_main_startup_quote(cfg_,out);
-}
 
 /* ================================================================== grammar triggers
  *
@@ -176,34 +122,6 @@ static int64_t rows_for(const SamplerConfig& c) {
     return c.max_seqs * (int64_t)(c.max_spec + 1);
 }
 
-/* Zero leaves all legacy behavior unchanged. This first use is intentionally
- * closed to the actual GLM TP4 manual profile, not a generic vocabulary API. */
-static bool valid_token_profile(const SamplerConfig& c) {
-    if (!c.valid_token_count) return true;
-    const int64_t local = c.n_vocab_local > 0 ? c.n_vocab_local : c.n_vocab / 4;
-    return c.valid_token_count == 154856 && c.n_vocab == 154880 &&
-        c.world_size == 4 && c.rank >= 0 && c.rank < 4 && local == 38720 &&
-        c.vocab_off == int64_t(c.rank) * 38720 && c.max_seqs == 1 &&
-        c.max_spec == 0 && !c.draft_coupling;
-}
-
-/* AND the source-token prefix into an existing grammar/reasoning mask. A fresh
- * greedy build replaces stale mask staging, including the greedy_ready_ path.
- * No allocation, new operand, geometry change or kernel is introduced. */
-static void valid_token_mask(const SamplerConfig& c, DeviceSampleParams& p,
-                             uint32_t* dst, int64_t words, int64_t row, bool fresh) {
-    if (!c.valid_token_count) return;
-    const bool combine = !fresh && (p.flags & RAD_SP_MASK);
-    const int64_t legal = std::clamp<int64_t>(c.valid_token_count - c.vocab_off, 0, c.n_vocab_local);
-    for (int64_t w = 0; w < words; ++w) {
-        const int64_t bits = std::clamp<int64_t>(legal - 32*w, 0, 32);
-        const uint32_t allowed = bits == 32 ? UINT32_MAX : bits == 0 ? 0u : (uint32_t(1) << bits) - 1u;
-        dst[w] = combine ? dst[w] & allowed : allowed;
-    }
-    p.mask_row = int32_t(row);
-    p.flags |= RAD_SP_MASK;
-}
-
 /* ================================================================== declare */
 
 int Sampler::declare(RadBuilder* b, const SamplerConfig& cfg) {
@@ -214,7 +132,6 @@ int Sampler::declare(RadBuilder* b, const SamplerConfig& cfg) {
         return RAD_E_INVAL;
     }
 
-    if (!valid_token_profile(cfg)) return RAD_E_UNSUPPORTED;
     cfg_ = cfg;
     couple_ = cfg.draft_coupling;
     if (cfg_.n_vocab_local <= 0) cfg_.n_vocab_local = cfg_.n_vocab / cfg_.world_size;
@@ -410,8 +327,6 @@ int Sampler::declare(RadBuilder* b, const SamplerConfig& cfg) {
         if (!op_lp_gather_) op_logprobs_ = RAD_NULL_HANDLE;
     }
 
-    // Tail exclusion is mandatory for this opt-in, even without a grammar.
-    if (cfg_.valid_token_count && !op_mask_) return RAD_E_NOKERNEL;
     RAD_TRY(stage_alloc());
     declared_ = true;
 
@@ -602,7 +517,7 @@ int Sampler::check_request(const SamplingParams& sp, std::string* why) const {
                                  "sample_temp (over the candidates, for temperature last)");
     if (!missing) missing = need(dry_on(sp), op_dry_, "sample_dry");
     if (!missing) missing = need(ngram_ban_on(sp), op_ngram_ban_, "sample_ngram_ban");
-    if (!missing) missing = need(cfg_.valid_token_count || !sp.grammar.empty() || sp.thinking_budget >= 0, op_mask_,
+    if (!missing) missing = need(!sp.grammar.empty() || sp.thinking_budget >= 0, op_mask_,
                                  "sample_mask");
     if (!missing) missing = need(penalties_on(sp), op_penalties_, "sample_penalties");
     if (missing) {
@@ -1028,8 +943,6 @@ int Sampler::build_step(const std::vector<Request*>& reqs, int64_t step) {
             if (budget && think.inside() && think.body >= sp.thinking_budget)
                 force_close(p, row, sp.reasoning.close);
 
-            valid_token_mask(cfg_, p, mask_stage_ + row * mask_words_, mask_words_, row, false);
-
             if (want_lp) {
                 /* Temperature the candidate value carries: early and late, each counted only
                  * where its kernel applies it (temp > 0 and not 1). */
@@ -1110,21 +1023,17 @@ int Sampler::build_greedy(int64_t n) {
      * by the build that staged the pair (build_step), and rows below a zeroed pair are skipped
      * by the op before they read a word. */
     std::memset(ngram_stage_, 0, (size_t)cap * 2 * sizeof(int32_t));
-    if (!greedy_ready_) {
-        for (int64_t i = 0; i < cap; ++i) {
-            DeviceSampleParams& p = greedy_stage_[i];
-            std::memset(&p, 0, sizeof p);
-            p.top_k    = 1;
-            p.mask_row = -1;
-            /* Over a split vocabulary a greedy row is an unflagged top-1 chain row (see
-             * build_step). */
-            p.flags    = vocab_parallel() ? 0 : RAD_SP_GREEDY;
-        }
-        greedy_ready_ = true;
+    if (greedy_ready_) return RAD_OK;
+    for (int64_t i = 0; i < cap; ++i) {
+        DeviceSampleParams& p = greedy_stage_[i];
+        std::memset(&p, 0, sizeof p);
+        p.top_k    = 1;
+        p.mask_row = -1;
+        /* Over a split vocabulary a greedy row is an unflagged top-1 chain row (see
+         * build_step). */
+        p.flags    = vocab_parallel() ? 0 : RAD_SP_GREEDY;
     }
-    if (cfg_.valid_token_count)
-        for (int64_t i = 0; i < n; ++i)
-            valid_token_mask(cfg_, greedy_stage_[i], mask_stage_ + i * mask_words_, mask_words_, i, true);
+    greedy_ready_ = true;
     return RAD_OK;
 }
 

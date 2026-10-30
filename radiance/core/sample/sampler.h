@@ -121,23 +121,12 @@ struct SamplerConfig {
     /* --draft-coupling: declare the coupled verify (`mtp_couple_verify`) behind the pick and the
      * per-row state plane it reads. */
     bool    draft_coupling = false;
-    /* Internal opt-in for the closed GLM manual profile only. Zero preserves
-     * every legacy sampler path. Append to retain old aggregate member order.
-     * Model/logit widths stay padded; the existing sample_mask row admits only
-     * real tokenizer IDs. No public ABI struct or kernel schema changes. */
-    int64_t valid_token_count = 0;
 };
 
 /* ================================================================== the driver */
 
-struct TinySamplerQuote;
 class Sampler {
 public:
-    static int tiny_startup_quote(const SamplerConfig&,TinySamplerQuote*) noexcept;
-    // Actual pinned GLM TP4/seq1/spec0 staging quote, BEFORE declare's stage_alloc.
-    // Pure metadata; existing Tiny/default admission is unchanged.
-    static int glm_main_startup_quote(const SamplerConfig&,TinySamplerQuote*) noexcept;
-    int glm_main_startup_quote(TinySamplerQuote*)const noexcept;
     Sampler() = default;
     ~Sampler();
 

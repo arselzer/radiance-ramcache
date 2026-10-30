@@ -1,0 +1,62 @@
+[2026-10-29T03:45:34Z] waiting for 30 s of QFN idleness
+before: 608764c1d1989c714d8aad7b8a79f8057c3e73473b9f9d55b49d02e82defd2b8 running 2026-10-29T03:29:56.626053655Z sha256:e82764045e46ebae07e33961f17dedba981c0d07336dfcddd67e4b3b042b8600
+[2026-10-29T03:46:03Z] stopping radiance-flashnext
+radiance-flashnext
+[2026-10-29T03:46:11Z] arm base: RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=0
+[2026-10-29T03:46:30Z] arm base: serving after 18s
+extra-01: 31.1 s, decode 3.05 tok/s, prefill 10436 ms
+extra-02: 18.8 s, decode 4.20 tok/s, prefill 3831 ms
+extra-03: 13.2 s, decode 5.13 tok/s, prefill 4413 ms
+extra-04: 16.3 s, decode 4.94 tok/s, prefill 3561 ms
+extra-05: 2.5 s, decode 3.09 tok/s, prefill 2180 ms
+Traceback (most recent call last):
+  File "/home/as/ds41-claude-build/work/run-20261029T034534Z/ab_requests.py", line 81, in <module>
+    run(sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4])
+    ~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/as/ds41-claude-build/work/run-20261029T034534Z/ab_requests.py", line 35, in run
+    print("%s: %.1f s, decode %.2f tok/s, prefill %.0f ms%s" % (
+          ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~
+        b["name"], wall, t.get("predicted_per_second", 0.0), t.get("prompt_ms", 0.0),
+        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        "" if text is not None else " ERROR %s" % resp.get("error")), flush=True)
+        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+TypeError: must be real number, not NoneType
+[2026-10-29T03:47:55Z] arm base: requests exit 1
+I[0] EP scoped file staging: 9840 count rows completed, 1680 local-zero, 11218 SSD units submitted, 0 corrupt rows refused
+I[1] EP scoped file staging: 9840 count rows completed, 1881 local-zero, 10741 SSD units submitted, 0 corrupt rows refused
+I[2] EP scoped file staging: 9840 count rows completed, 1530 local-zero, 11344 SSD units submitted, 0 corrupt rows refused
+I[3] EP scoped file staging: 9840 count rows completed, 1565 local-zero, 11167 SSD units submitted, 0 corrupt rows refused
+[2026-10-29T03:47:58Z] arm all-t24-f-M16-H-p1900-m98304-G-R-B1-W: RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=24 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU=/home/as/radiance-ds41-claude/tools/ds41-host-experts/build/window-20261028T203510Z/silu_table_gfx1201.bin RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_POLICY=all RADIANCE_EXPERIMENTAL_NATIVE_CACHE_DIRECT_FILL=1 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MISSES=16 RADIANCE_EXPERIMENTAL_NATIVE_CACHE_PREGROW=1 RADIANCE_EXPERIMENTAL_DS41_PLANE_MIRROR=/srv/bulk/source-copies/ds41-native-mxfp4/d8b2e3c20f5f4b6d5044d37f20b8d53f260f83e466f72259572be76d7e756bf3-main RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS=1 RADIANCE_EXPERIMENTAL_DS41_CACHE_WARM=1
+[2026-10-29T03:48:52Z] arm all-t24-f-M16-H-p1900-m98304-G-R-B1-W: serving after 54s
+Traceback (most recent call last):
+  File "/home/as/ds41-claude-build/work/run-20261029T034534Z/ab_requests.py", line 81, in <module>
+    run(sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4])
+    ~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/as/ds41-claude-build/work/run-20261029T034534Z/ab_requests.py", line 35, in run
+    print("%s: %.1f s, decode %.2f tok/s, prefill %.0f ms%s" % (
+          ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~
+        b["name"], wall, t.get("predicted_per_second", 0.0), t.get("prompt_ms", 0.0),
+        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        "" if text is not None else " ERROR %s" % resp.get("error")), flush=True)
+        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+TypeError: must be real number, not NoneType
+[2026-10-29T03:48:55Z] arm all-t24-f-M16-H-p1900-m98304-G-R-B1-W: requests exit 1
+  host experts' plane reads: 3058 weights read for the CPU in 4.72 s of issuing-thread time (1.54 ms a batch weight), 3058 relaid into the RAM cache beside it
+I[0] EP scoped file staging: 120 count rows completed, 6 local-zero, 268 SSD units submitted, 0 corrupt rows refused
+I[0] host experts: 113 layers handed 334 experts (654 rows) to the CPU; 0 cached experts went over the copy link, 159 routed experts were not cached; 185.3 ms waiting at gathers; verify: 0 rows compared, 0 differ; 0 gate_up operand moves; 493 units probed (the mapped cache's hit and miss counts above include these probes); misses on the CPU: 159 units, 345 rows, 1302.4 ms reading their planes
+  host experts' plane reads: 3100 weights read for the CPU in 4.86 s of issuing-thread time (1.57 ms a batch weight), 3100 relaid into the RAM cache beside it
+I[1] EP scoped file staging: 120 count rows completed, 10 local-zero, 290 SSD units submitted, 0 corrupt rows refused
+I[1] host experts: 107 layers handed 305 experts (562 rows) to the CPU; 0 cached experts went over the copy link, 180 routed experts were not cached; 143.2 ms waiting at gathers; verify: 0 rows compared, 0 differ; 0 gate_up operand moves; 485 units probed (the mapped cache's hit and miss counts above include these probes); misses on the CPU: 180 units, 326 rows, 1436.4 ms reading their planes
+  host experts' plane reads: 3166 weights read for the CPU in 4.85 s of issuing-thread time (1.53 ms a batch weight), 3166 relaid into the RAM cache beside it
+I[2] EP scoped file staging: 120 count rows completed, 6 local-zero, 314 SSD units submitted, 0 corrupt rows refused
+I[2] host experts: 110 layers handed 294 experts (594 rows) to the CPU; 0 cached experts went over the copy link, 213 routed experts were not cached; 148.8 ms waiting at gathers; verify: 0 rows compared, 0 differ; 0 gate_up operand moves; 507 units probed (the mapped cache's hit and miss counts above include these probes); misses on the CPU: 213 units, 398 rows, 1444.7 ms reading their planes
+  host experts' plane reads: 3106 weights read for the CPU in 4.98 s of issuing-thread time (1.60 ms a batch weight), 3106 relaid into the RAM cache beside it
+I[3] EP scoped file staging: 120 count rows completed, 7 local-zero, 282 SSD units submitted, 0 corrupt rows refused
+I[3] host experts: 111 layers handed 296 experts (526 rows) to the CPU; 0 cached experts went over the copy link, 183 routed experts were not cached; 160.3 ms waiting at gathers; verify: 0 rows compared, 0 differ; 0 gate_up operand moves; 479 units probed (the mapped cache's hit and miss counts above include these probes); misses on the CPU: 183 units, 347 rows, 1387.5 ms reading their planes
+arm base: no results
+arm all-t24-f-M16-H-p1900-m98304-G-R-B1-W: no results
+[2026-10-29T03:48:57Z] arms done
+[2026-10-29T03:48:57Z] restoring radiance-flashnext
+radiance-flashnext
+[2026-10-29T03:49:53Z] QFN up after 55s; completion: {"id":"cmpl-1d51bfc71b0651749d13e739","object":"text_completion","created":1793245793,"model":"qwen-vllm","system_fingerprint":"radiance-1.12.0","choices":[{"text":" Paris. The capital","index":0,"logprobs":null,"finish_reason":"length"}],"usage":{"prompt_tokens":5,"completion_tokens":4,"total_token
+608764c1d1989c714d8aad7b8a79f8057c3e73473b9f9d55b49d02e82defd2b8 running 2026-10-29T03:48:57.67584913Z sha256:e82764045e46ebae07e33961f17dedba981c0d07336dfcddd67e4b3b042b8600

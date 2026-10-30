@@ -844,6 +844,23 @@ TEST(directfile_write_then_read_roundtrip) {
     CHECK(f.read_at(t2, body, tail + 1) < 0);
     CHECK(f.read_at(r, body + tail + A, A) < 0);
 
+    /* An extent rounded out to the alignment past end of file (the container's last weight):
+     * succeeds when what was needed arrived, fails when the needed bytes run past the end. */
+    {
+        DevBuf<uint8_t> big(body + A, RAD_MEM_HOST_PINNED);
+        CHECK(big);
+        if (big) {
+            std::memset(big, 0, (size_t)(body + A));
+            CHECK_OK(f.read_covering(big, 0, body + A, body + tail));
+            CHECK_EQ(std::memcmp(big, w, (size_t)body), 0);
+            CHECK_EQ(std::memcmp(big + body, t, (size_t)tail), 0);
+            CHECK(f.read_covering(big, 0, body + A, body + tail + 1) < 0);
+            CHECK(f.read_covering(big, A, body, body) < 0);          /* needed past the end */
+            CHECK_OK(f.read_covering(big, A, body, body - A + tail));
+            CHECK(f.read_covering(big, 0, A, A + 1) < 0);            /* need > bytes: refused */
+        }
+    }
+
     /* Reopen without O_TRUNC: the bytes are on disk, not in this handle. */
     f.close();
     CHECK_OK(f.open(path.c_str(), RAD_DIO_READ | RAD_DIO_ALLOW_BUFFERED));

@@ -13,7 +13,6 @@
 #include <vector>
 
 namespace rad {
-class NativeInventory;
 
 /* Where a weight's bytes are now, and whether they have arrived.
  *
@@ -35,7 +34,6 @@ struct WeightSlot {
 class ResidencyTable {
 public:
     virtual ~ResidencyTable() = default;
-    virtual const NativeInventory* native_inventory() const { return nullptr; }
 
     /* Never blocks: called once per weight operand per issue, and a lock would serialise the
      * mover against compute. Null means no entry; the run phase falls back to WeightInfo::ptr. */

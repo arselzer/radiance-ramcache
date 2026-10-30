@@ -1,7 +1,0 @@
-[ 50%] Building CXX object CMakeFiles/tp4_cache_prepare_check.dir/checker.cpp.o
-/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-tp4-cache-prepare-coordinator-prototype/checker.cpp: In destructor ‘{anonymous}::fatal_child(int)::Marker::~Marker()’:
-/home/as/radiance-setup/research/deepseek-v41-1017-20261024/glm53-tp4-cache-prepare-coordinator-prototype/checker.cpp:136:91: warning: ignoring return value of ‘ssize_t write(int, const void*, size_t)’ declared with attribute ‘warn_unused_result’ [-Wunused-result]
-  136 | int fatal_child(int marker){struct Marker {int fd;~Marker(){const char x='D';(void)::write(fd,&x,1);}} destruction{marker};
-      |                                                                                    ~~~~~~~^~~~~~~~~
-[100%] Linking CXX executable tp4_cache_prepare_check
-[100%] Built target tp4_cache_prepare_check

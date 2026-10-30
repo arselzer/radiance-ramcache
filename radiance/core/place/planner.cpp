@@ -2,8 +2,7 @@
  *
  * The planner is pure: it reads the Program, the Config and the container's profile and writes a
  * Plan. It queries no device, clock or environment, which is what makes Config::deterministic
- * possible (spec §17) and keeps the initial ranking reproducible. Unequal per-rank shard costs
- * can still yield different local resident sets (planner.h, MoveUnit).
+ * possible (spec §17) and keeps the resident set identical on every TP rank (planner.h, MoveUnit).
  *
  * Do not add a device query. Budgets come from Config (spec §6). rad_dev_count() also enumerates
  * integrated GPUs, which report tens of GiB of "VRAM" that is system RAM, so summing capacity
@@ -11,10 +10,15 @@
  * RadDeviceProps::arch, never on index or capacity.
  */
 #include "planner.h"
-#include "native_inventory.h"
+#include "dspark_native_scope.h"
+#include <array>
 
 #include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <set>
 
@@ -31,7 +35,6 @@ const char* tier_name(Tier t) {
         case Tier::HostPageable: return "pageable";
         case Tier::SSD:          return "ssd";
         case Tier::Mapped:       return "mapped";
-        case Tier::NativeStore:  return "native-store";
     }
     return "?";
 }
@@ -62,7 +65,6 @@ const char* strategy_name(Strategy s) {
         case Strategy::LayerOffload: return "layer_offload";
         case Strategy::ExpertTiered: return "expert_tiered";
         case Strategy::Auto:         return "auto";
-        case Strategy::NativeBacked: return "native-backed (internal)";
     }
     return "?";
 }
@@ -105,6 +107,21 @@ int64_t expert_vram_floor(const WeightFootprint& wf, int64_t host_room) {
     if (wf.experts <= 0) return 0;
     const int64_t all = wf.experts + wf.expert_spare;
     return std::min(all, std::max<int64_t>(all + 2 * wf.expert_unit_max - host_room, 0));
+}
+
+/* A draft head's routed experts, pinned in the host pool before any strategy runs, leave the trunk
+ * the whole of `host_room`. The card then holds only the trunk's floor against that room. The
+ * drafter's units share the trunk's slab classes, so the spare the trunk's floor already reserves
+ * covers them; with no trunk experts the drafter is the whole plane and pinning it leaves the card
+ * nothing to hold. */
+int64_t expert_vram_floor_draft_hosted(const WeightFootprint& wf, int64_t host_room) {
+    if (wf.draft_experts <= 0) return expert_vram_floor(wf, host_room);
+    const int64_t trunk = wf.experts - wf.draft_experts;
+    if (trunk <= 0) return 0;
+    WeightFootprint t = wf;
+    t.experts = trunk;
+    t.draft_experts = 0;
+    return expert_vram_floor(t, host_room);
 }
 
 int plan_check_weights_pool(const Plan& p, int64_t pool_bytes) {
@@ -230,6 +247,14 @@ void weight_footprint(const Program& prog, WeightFootprint* out, TablePlacement 
             layer_experts[mu.layer] += b;
             out->expert_unit_max = std::max(out->expert_unit_max, b);
             expert_strides.insert(b);
+            /* A draft head's routed experts: layers at meta.n_layers and above, and only when the
+             * program declares a drafter. The trunk's own layers stay in the elastic plane a
+             * strategy places; --draft-expert-placement host takes this part out of it. */
+            if (prog.drafter.kind != RAD_DRAFT_NONE && prog.meta.n_layers > 0 &&
+                mu.layer >= (int32_t)prog.meta.n_layers) {
+                out->draft_experts += b;
+                out->draft_unit_max = std::max(out->draft_unit_max, b);
+            }
         }
         else                     out->statics += b;
         if (mu.layer >= 0 && !mu.mapped) out->layer_unit_max = std::max(out->layer_unit_max, b);
@@ -317,7 +342,7 @@ void Planner::pin_mapped(const Program& prog, Plan* p) {
                               "directly has none; convert it to a container");
         else if (!stored)
             note_unfit(p, mu, "it must be read from the container's mapping, and its stored form "
-                              "is not the container's (a relayout, a widening or a shard)");
+                              "is not the container's (a relayout, a dtype conversion or a shard)");
         if (host_only)
             for (rad_weight w : mu.weights)
                 if (w < device_ok_.size() && device_ok_[w])
@@ -378,7 +403,11 @@ void Planner::build_units(const Program& prog, Plan* p) {
         mu.weights.push_back(w);
         mu.offset.push_back(at);
         mu.bytes = at + weight_bytes(wi);
-        if (!in_.container || !weight_file_direct(wi, prog.ctx.world_size)) mu.file_direct = false;
+        if (!in_.container ||
+            !(weight_file_direct(wi, prog.ctx.world_size) ||
+              (in_.file_relayout && weight_file_relaid(prog, wi, prog.ctx.world_size) &&
+               weight_bytes(wi) <= RAD_PLACE_FILE_WINDOW_BYTES)))
+            mu.file_direct = false;
         if (wi.first_use_op >= 0 && (mu.first_use_op < 0 || wi.first_use_op < mu.first_use_op))
             mu.first_use_op = wi.first_use_op;
         if (wi.last_use_op > mu.last_use_op) mu.last_use_op = wi.last_use_op;
@@ -502,7 +531,8 @@ struct HostFall {
             }
             return true;
         }
-        /* The file tier, for a unit stored in the container as its kernel reads it. A Tier::SSD
+        /* The file tier, for a unit stored in the container as its kernel reads it or relaid on
+         * each read (MoveUnit::file_direct). A Tier::SSD
          * unit has no address until staged. A scheduled unit is staged by Plan::prefetch. A routed
          * one cannot be scheduled, since a grouped MoE GEMM needs every expert's pointer at issue,
          * so the file stager reads all of a routed layer's file-tier experts into a VRAM buffer
@@ -671,7 +701,7 @@ int Planner::assign_expert_tiered(Plan* p) {
         Cost k;
         for (int32_t ui : order) {
             MoveUnit& mu = p->units[(size_t)ui];
-            if (mu.access != RAD_ACCESS_CONDITIONAL) continue;
+            if (mu.access != RAD_ACCESS_CONDITIONAL || mu.preplaced()) continue;
             mu.tier = Tier::VRAM;
             mu.site = Site::Device;
             mu.reason = "fits in vram";
@@ -683,19 +713,23 @@ int Planner::assign_expert_tiered(Plan* p) {
 
         for (int32_t ui : order) {
             MoveUnit& mu = p->units[(size_t)ui];
-            if (mu.access != RAD_ACCESS_CONDITIONAL) continue;
-            const bool eligible = !in_.resident_eligibility || mu.expert < 0 ||
-                in_.resident_eligibility->count(ExpertKey{mu.layer,mu.expert}) != 0;
-            if (eligible && k.residents < cap && k.used + mu.slot_bytes <= room) {
-                k.used += mu.slot_bytes;
-                ++k.residents;
-                mu.tier = Tier::VRAM;
-                mu.site = Site::Device;
-                mu.reason = "resident: ranked by the container's profile";
-                /* Only movable units are touched by heat; under Config::deterministic none are,
-                 * so this resident set holds for the whole run. */
-                mu.movable = p->dynamic;
-                continue;
+            if (mu.access != RAD_ACCESS_CONDITIONAL || mu.preplaced()) continue;
+            /* A resident costs its slot, or under RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED what the card
+             * holds of it (vram_packed.h). The floor reads nothing, so a unit past the room is never
+             * scanned; without the switch both are the slot, so this is the plain test. */
+            if (k.residents < cap && k.used + vram_floor(mu) <= room) {
+                const int64_t charge = vram_charge(ui, mu, p);
+                if (k.used + charge <= room) {
+                    k.used += charge;
+                    ++k.residents;
+                    mu.tier = Tier::VRAM;
+                    mu.site = Site::Device;
+                    mu.reason = "resident: ranked by the container's profile";
+                    /* Only movable units are touched by heat; under Config::deterministic none are,
+                     * so this resident set holds for the whole run. */
+                    mu.movable = p->dynamic;
+                    continue;
+                }
             }
             if (!fall.place(mu, host_kernel(mu), &mu.reason)) {
                 mu.tier = Tier::SSD;
@@ -703,9 +737,10 @@ int Planner::assign_expert_tiered(Plan* p) {
                 mu.reason = "fits in no tier";
                 /* With the file tier on, only a non-file-direct unit gets here (HostFall::place). */
                 note_unfit(p, mu, ssd_ ? "neither VRAM nor the host pool has room, and its "
-                                         "stored form is not the container's (a relayout, a "
-                                         "widening or a shard), so the file tier cannot read it "
-                                         "in place"
+                                         "stored form is not the container's in a way a file "
+                                         "read cannot make (a widening, a shard, or a relayout "
+                                         "whose kernel has no relayout function), so the file "
+                                         "tier cannot serve it"
                                        : "the host pool is full and no --weights-disk-tier was "
                                          "given");
                 rc = RAD_E_NOMEM;
@@ -742,11 +777,21 @@ int Planner::assign_expert_tiered(Plan* p) {
         /* The file stager's two buffers, each the largest routed layer's file-tier units at the
          * stager's packing, plus a tail pad. */
         std::map<int32_t, int64_t> layer_bytes;
+        int64_t unit_max = 0;
         for (const MoveUnit& mu : p->units)
-            if (mu.tier == Tier::SSD && mu.access == RAD_ACCESS_CONDITIONAL && mu.layer >= 0)
+            if (mu.tier == Tier::SSD && mu.access == RAD_ACCESS_CONDITIONAL && mu.layer >= 0) {
                 layer_bytes[mu.layer] += align_up(mu.bytes, RAD_ALIGN_UNIT);
+                unit_max = std::max(unit_max, align_up(mu.bytes, RAD_ALIGN_UNIT));
+            }
         p->file_layer_max = 0;
         for (const auto& kv : layer_bytes) p->file_layer_max = std::max(p->file_layer_max, kv.second);
+        /* RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS=N: the CPU computes every routed unit
+         * (FileStager::hx_init refuses any configuration where it would not), so the buffers
+         * only back the card's aliases for them; N units keep those valid and the VRAM goes to
+         * residents. */
+        if (const char* c = std::getenv("RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS");
+            c && std::atoi(c) > 0 && unit_max > 0)
+            p->file_layer_max = std::min(p->file_layer_max, (int64_t)std::atoi(c) * unit_max);
         k.file = p->file_layer_max > 0 ? 2 * p->file_layer_max + RAD_ALIGN_UNIT : 0;
         p->file_stage_vram = k.file;
         return k;
@@ -774,6 +819,100 @@ int Planner::assign_expert_tiered(Plan* p) {
         }
     }
     return rc;
+}
+
+/* ------------------------------------------------------------------ packed VRAM residents */
+/* RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED (vram_packed.h). Weight by weight at each one's alignment, as
+ * build_units lays a unit out, so a unit with every weight at its stored size comes to `bytes` exactly. */
+template <class F>
+int64_t Planner::unit_layout(const MoveUnit& mu, F size, std::vector<int64_t>* off) const {
+    const Program& prog = *in_.program;
+    int64_t b = 0;
+    if (off) off->clear();
+    for (rad_weight w : mu.weights) {
+        const WeightInfo& wi = prog.weights[w];
+        const int64_t a = wi.align > 0 ? wi.align : RAD_ALIGN_UNIT;
+        const int64_t at = align_up(b, a);
+        if (off) off->push_back(at);
+        b = at + size(w);
+    }
+    return b;
+}
+
+int64_t Planner::vram_floor(const MoveUnit& mu) const {
+    if (!pk_on_ || mu.access != RAD_ACCESS_CONDITIONAL) return mu.slot_bytes;
+    const Program& prog = *in_.program;
+    const int64_t b = unit_layout(mu, [&](rad_weight w) {
+        int32_t cap = -1, raw = -1;
+        const int64_t pk = in_.vram_pack(w, false, &cap, &raw);
+        return pk > 0 ? pk : weight_bytes(prog.weights[w]);
+    }, nullptr);
+    return std::min(mu.slot_bytes, align_up(b, RAD_ALIGN_UNIT));
+}
+
+int64_t Planner::vram_charge(int32_t ui, const MoveUnit& mu, Plan* p) {
+    if (!pk_on_ || mu.access != RAD_ACCESS_CONDITIONAL) return mu.slot_bytes;
+    int64_t& charge = pk_charge_[(size_t)ui];
+    if (charge >= 0) return charge;
+    const Program& prog = *in_.program;
+    for (rad_weight w : mu.weights) {
+        if (pk_bytes_[w] >= 0) continue;
+        int32_t cap = -1, raw = -1;
+        pk_bytes_[w] = 0;
+        if (in_.vram_pack(w, false, &cap, &raw) <= 0) continue;   /* not eligible: nothing to read */
+        const auto t0 = std::chrono::steady_clock::now();
+        pk_bytes_[w] = std::max<int64_t>(in_.vram_pack(w, true, &cap, &raw), 0);
+        p->vram_packed.scan_s +=
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        pk_cap_[w] = cap;
+        pk_raw_[w] = raw;
+        ++p->vram_packed.scanned;
+        if (raw < 0) ++p->vram_packed.scan_failed;
+    }
+    const int64_t b = unit_layout(mu, [&](rad_weight w) {
+        return pk_bytes_[w] > 0 ? pk_bytes_[w] : weight_bytes(prog.weights[w]);
+    }, nullptr);
+    charge = std::min(mu.slot_bytes, align_up(b, RAD_ALIGN_UNIT));
+    return charge;
+}
+
+/* After the fill: every static conditional resident the fill charged gets its packed layout, which the
+ * mover places and publishes (MoveUnit::vram_bytes) and the loader packs (Placement::vram_bytes). A
+ * resident with no packed weight keeps its stored form and its plain layout. */
+void Planner::finish_vram_packed(Plan* p) {
+    for (MoveUnit& mu : p->units) {
+        mu.vram_bytes = 0;
+        mu.vram_offset.clear();
+    }
+    if (!pk_on_) return;
+    const Program& prog = *in_.program;
+    Plan::VramPacked& st = p->vram_packed;
+    for (size_t u = 0; u < p->units.size(); ++u) {
+        MoveUnit& mu = p->units[u];
+        if (mu.tier != Tier::VRAM || mu.movable || mu.slab_slot >= 0 ||
+            mu.access != RAD_ACCESS_CONDITIONAL || pk_charge_[u] < 0)
+            continue;
+        int packed = 0;
+        for (rad_weight w : mu.weights) {
+            if (pk_bytes_[w] > 0) ++packed;
+            else if (pk_cap_[w] >= 0 && pk_raw_[w] > pk_cap_[w]) ++st.over_budget;
+        }
+        if (!packed) continue;
+        mu.vram_bytes = unit_layout(mu, [&](rad_weight w) {
+            return pk_bytes_[w] > 0 ? pk_bytes_[w] : weight_bytes(prog.weights[w]);
+        }, &mu.vram_offset);
+        ++st.units;
+        st.bytes += align_up(mu.vram_bytes, RAD_ALIGN_UNIT);
+        st.block_bytes += mu.slot_bytes;
+        for (rad_weight w : mu.weights) {
+            if (pk_bytes_[w] <= 0) continue;
+            ++st.weights;
+            if (prog.weights[w].decl.group.slot == 0) ++st.gate_up;
+            else ++st.down;
+            st.raw_rounds += pk_raw_[w];
+            st.raw_max = std::max<int64_t>(st.raw_max, pk_raw_[w]);
+        }
+    }
 }
 
 bool Planner::host_kernel(const MoveUnit& mu) const {
@@ -910,6 +1049,8 @@ void Planner::finish(const Program& prog, Plan* p) {
     /* Two crossings a run: to the host at its first layer, back after its last. */
     p->link_crossings = 2 * (int32_t)p->host_runs.size();
 
+    finish_vram_packed(p);
+
     /* Copy each unit's decision onto its weights, which is what the rest of the engine reads. */
     p->weight.assign(prog.weights.size(), Placement{});
     p->totals = Plan::Totals{};
@@ -923,6 +1064,12 @@ void Planner::finish(const Program& prog, Plan* p) {
             pl.unit = i;
             pl.reason = mu.reason;
             pl.bytes = weight_bytes(prog.weights[w]);
+            /* A packed VRAM weight: what the card holds, and so what the tier total counts. */
+            if (mu.vram_bytes > 0 && pk_bytes_[w] > 0) {
+                pl.vram_bytes = pk_bytes_[w];
+                pl.vram_pk_cap = pk_cap_[w];
+                pl.bytes = pl.vram_bytes;
+            }
             p->totals.bytes[(int)mu.tier] += pl.bytes;
             if (mu.host_forced) p->forced_host_used += pl.bytes;
         }
@@ -1033,11 +1180,165 @@ int Planner::pin_towers(const Config& cfg, Plan* p) const {
     return RAD_OK;
 }
 
+/* --draft-expert-placement host: a draft head's routed experts (layers at meta.n_layers and above,
+ * and only when the program declares a drafter) go to the pinned host pool before any strategy
+ * runs. The card reads them in place at the DeviceZeroCopy site, the same way it reads a pooled
+ * expert, so a drafter's experts fit beside a trunk that already fills the card instead of the
+ * strategy having to make room for them on it. They are not movable: heat never promotes a draft
+ * expert onto the card and into the trunk's slab. */
+int Planner::pin_draft_experts(const Program& prog, const Config& cfg, Plan* p) const {
+    if (cfg.draft_expert_placement != "host") return RAD_OK;
+    if (prog.drafter.kind == RAD_DRAFT_NONE || prog.meta.n_layers == 0) {
+        if (cfg.draft_expert_placement_given) {
+            RAD_ERR("placement: --draft-expert-placement host: this model declares no draft head");
+            p->notes.push_back("--draft-expert-placement host: no draft head to place");
+            return RAD_E_INVAL;
+        }
+        return RAD_OK;
+    }
+    const int32_t trunk = (int32_t)prog.meta.n_layers;
+    auto draft = [&](const MoveUnit& mu) {
+        return mu.expert >= 0 && mu.layer >= trunk && mu.tier != Tier::Mapped && !mu.host_forced;
+    };
+    int64_t need = 0, n = 0, widest = 0;
+    for (const MoveUnit& mu : p->units)
+        if (draft(mu)) { need += mu.slot_bytes; widest = std::max(widest, mu.slot_bytes); ++n; }
+    if (!n) {
+        RAD_ERR("placement: --draft-expert-placement host: the draft head declares no routed "
+                "experts");
+        p->notes.push_back("--draft-expert-placement host: no drafter experts to place");
+        return RAD_E_STATE;
+    }
+    if (need > p->host_budget) {
+        RAD_ERR("placement: --draft-expert-placement host: the drafter's experts need %s of the "
+                "pinned host pool and %s of it is left%s", humanb(need).c_str(),
+                humanb(p->host_budget).c_str(),
+                p->file_stage_reserve ? " after the file tier's staging" : "");
+        p->notes.push_back(fmt("--draft-expert-placement host: the drafter's experts (%s) do not "
+                               "fit the host pool", humanb(need).c_str()));
+        return RAD_E_NOMEM;
+    }
+    for (MoveUnit& mu : p->units) {
+        if (!draft(mu)) continue;
+        p->host_budget -= mu.slot_bytes;
+        p->draft_host_bytes += mu.slot_bytes;
+        mu.tier = Tier::HostPinned;
+        mu.site = Site::DeviceZeroCopy;
+        mu.movable = false;
+        mu.host_forced = true;
+        mu.reason = "--draft-expert-placement host; read over the link in place";
+    }
+    RAD_INFO("placement: the drafter's experts, %lld units (%s, widest %s), in the pinned host "
+             "pool, read in place (--draft-expert-placement host)", (long long)n,
+             humanb(need).c_str(), humanb(widest).c_str());
+    return RAD_OK;
+}
+
+/* --expert-pin-top F: the hottest fraction of the routed experts, ranked by the profile the planner
+ * was given (the container's, or --expert-profile's decode counts), stay resident. They are marked
+ * unmovable, so the heat engine never demotes them and the decode-hot set stops paying the host
+ * pool's PCIe read. The cut keeps the hottest ceil(F * n), and a tie at the cut stays movable: the
+ * threshold is the share just below the hot set, and only a share strictly above it pins. Runs
+ * after the strategy, which has already put the hot set in VRAM; a hot unit the strategy had to
+ * leave on the host is left there and counted, since pinning it would need VRAM the card does not
+ * have. */
+void Planner::pin_hot(const Config& cfg, Plan* p) const {
+    if (cfg.expert_pin_top <= 0.0f) return;
+    std::vector<float> shares;
+    for (const MoveUnit& mu : p->units)
+        if (mu.expert >= 0 && mu.tier != Tier::Mapped) shares.push_back(mu.profile_share);
+    if (shares.empty()) return;
+    std::sort(shares.begin(), shares.end());
+    /* The cut sits after the coldest (1 - F) of the plane, so the hottest F are pinned. A tie at
+     * the cut stays movable: the threshold is the share just below the hot set, and only a share
+     * strictly above it pins. If rounding requests the whole plane (including F == 1), every
+     * resident qualifies, even one with a zero share. */
+    const double keep = (double)cfg.expert_pin_top * (double)shares.size();
+    const size_t hot = keep <= 0.0 ? 0 : std::min(shares.size(), (size_t)std::ceil(keep));
+    const float threshold = hot == 0 ? std::numeric_limits<float>::infinity()
+                          : hot == shares.size() ? -std::numeric_limits<float>::infinity()
+                          : shares[shares.size() - hot - 1];
+    p->pin_threshold = threshold;
+    p->profile_units = (int64_t)shares.size();
+    int64_t pinned = 0, left = 0;
+    for (MoveUnit& mu : p->units) {
+        if (mu.expert < 0 || mu.tier == Tier::Mapped || mu.host_forced) continue;
+        if (mu.profile_share <= threshold) continue;
+        if (mu.tier != Tier::VRAM) { ++left; continue; }
+        mu.pinned = true;
+        mu.movable = false;
+        ++pinned;
+    }
+    p->pinned_units = pinned;
+    RAD_INFO("placement: --expert-pin-top %.4g pins %lld of %lld routed experts resident (share "
+             "above %.4g); %lld of the hot set had no VRAM slot and stay where the strategy put "
+             "them", (double)cfg.expert_pin_top, (long long)pinned, (long long)shares.size(),
+             (double)threshold, (long long)left);
+}
+
+/* Experimental first learned-MTP path: all exact native DSpark expert pairs live in
+ * the already budgeted pinned pool and the DEVICE kernel reads them in place. This
+ * does not grow a pool or change trunk placement. The ordinary default is byte-for-byte
+ * unchanged. A whole pair stays immutable, so draft file staging is unnecessary. */
+int Planner::pin_draft_bank_experts(const Program& prog, const Config& cfg, Plan* p) const {
+    if (cfg.draft_bank_expert_placement == "auto") return RAD_OK;
+    if (cfg.draft_bank_expert_placement != "host" || cfg.draft_bank.empty() ||
+        in_.host_backend || in_.world_size != 4 || in_.rank != prog.ctx.rank ||
+        !dspark_native_program_scope(prog)) {
+        RAD_ERR("draft-bank host experts require the exact native DSpark EP4 DEVICE declaration");
+        return RAD_E_UNSUPPORTED;
+    }
+    int64_t need = 0, count = 0;
+    for (const MoveUnit& mu : p->units) {
+        if (mu.layer < 40 || mu.expert < 0) continue;
+        if (mu.layer >= 43 || mu.expert >= 32 || mu.weights.size() != 2 ||
+            mu.tier == Tier::Mapped || mu.host_forced || mu.slot_bytes <= 0 ||
+            need > std::numeric_limits<int64_t>::max() - mu.slot_bytes)
+            return RAD_E_UNSUPPORTED;
+        unsigned slots = 0;
+        for (rad_weight h : mu.weights) {
+            if (!h || size_t(h) >= prog.weights.size() || h >= device_ok_.size() ||
+                !device_ok_[h] || !dspark_native_weight_scope(prog.weights[h]))
+                return RAD_E_UNSUPPORTED;
+            const auto& g = prog.weights[h].decl.group;
+            if (g.layer != mu.layer || g.expert != mu.expert || (slots & (1u << g.slot)))
+                return RAD_E_UNSUPPORTED;
+            slots |= 1u << g.slot;
+        }
+        if (slots != 3) return RAD_E_UNSUPPORTED;
+        need += mu.slot_bytes;
+        ++count;
+    }
+    if (count != 96) return RAD_E_UNSUPPORTED;
+    if (need > p->host_budget) {
+        RAD_ERR("draft-bank host experts need %s of the remaining pinned pool, only %s available; "
+                "adjust the explicit cache/pool budgets", humanb(need).c_str(),
+                humanb(p->host_budget).c_str());
+        p->notes.push_back("draft-bank experts do not fit the explicit pinned pool");
+        return RAD_E_NOMEM;
+    }
+    for (MoveUnit& mu : p->units) {
+        if (mu.layer < 40 || mu.expert < 0) continue;
+        p->host_budget -= mu.slot_bytes;
+        mu.tier = Tier::HostPinned;
+        mu.site = Site::DeviceZeroCopy;
+        mu.movable = false;
+        mu.host_forced = true;
+        mu.reason = "--draft-bank-expert-placement host; read in place";
+    }
+    RAD_INFO("draft-bank experts: %lld rank-local pairs (%s) in the existing pinned pool; "
+             "DEVICE zero-copy, immutable; no automatic budget growth", (long long)count,
+             humanb(need).c_str());
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------------ plan */
 int Planner::plan(Plan* out) {
     if (!out || !in_.program || !in_.config) return RAD_E_INVAL;
     const Program& prog = *in_.program;
     const Config& cfg = *in_.config;
+    // Direct Config callers receive the same refusal before any Plan/budget mutation.
+    if (draft_placement_modes_conflict(cfg)) return RAD_E_INVAL;
 
     *out = Plan{};
     out->rank = in_.rank;
@@ -1054,64 +1355,52 @@ int Planner::plan(Plan* out) {
                 "expert_tiered or auto", cfg.placement.c_str());
         return RAD_E_INVAL;
     }
-    if (in_.resident_eligibility && out->strategy != Strategy::ExpertTiered) {
-        out->notes.push_back("resident eligibility restricts initial expert_tiered placement only");
-        return RAD_E_INVAL;
-    }
 
     resolve_sites(prog, &host_ok_, &device_ok_);
     build_units(prog, out);
-    if (in_.native_inventory) {
-        const auto profile=in_.native_inventory->limits().backend_profile;
-        const bool host_profile=profile==NativeBackendProfile::HostOnly&&in_.host_backend;
-        // NativeInventory::bind sealed the actual AQL/backend/topology checks.
-        // Planner remains pure: it consumes that capability and never queries a device.
-        const bool tiny_aql_profile=profile==NativeBackendProfile::TinyAqlV1&&!in_.host_backend;
-        const bool glm_aql_profile=profile==NativeBackendProfile::GlmMainTp4AqlFailStopV1&&
-            !in_.host_backend&&in_.world_size==4&&in_.rank>=0&&in_.rank<4&&
-            prog.requires_glm_main_tp4_cache_fail_stop()&&!prog.requires_permanent_model_failure()&&
-            cfg.tp==4&&cfg.n_spec==0&&cfg.max_seqs==1&&cfg.max_tok==prog.ctx.max_tok;
-        const bool rank_profile=((host_profile||tiny_aql_profile)&&in_.rank==0&&in_.world_size==1)||glm_aql_profile;
-        if (!cfg.deterministic || cfg.placement != "all_vram" || cfg.host_pool_mib ||
-            cfg.weights_disk_tier || in_.container || !rank_profile || in_.resident_eligibility)
-            return RAD_E_UNSUPPORTED;
-        // Explicit profile capability: exact native classes precede legacy pin_mapped.
-        build_classes(out);
-        RAD_TRY(in_.native_inventory->validate(prog,*out));
-        const auto& f=in_.native_inventory->footprint();
-        if (out->vram_budget <= 0 || uint64_t(out->vram_budget) < f.weights_minimum())
-            return RAD_E_NOMEM;
-        out->native_inventory=in_.native_inventory;
-        out->strategy=Strategy::NativeBacked;
-        out->strategy_why="verified native backing; fixed residents plus bounded reusable consumers";
-        out->dynamic=false;
-        for (size_t u=0;u<out->units.size();++u) {
-            auto& mu=out->units[u];
-            mu.tier=in_.native_inventory->find(int32_t(u))?Tier::NativeStore:Tier::VRAM;
-            mu.site=Site::Device;mu.movable=false;
-            mu.reason=mu.tier==Tier::NativeStore?"verified native record, no permanent payload":
-                                                   "explicit immutable original resident";
-        }
-        finish(prog,out);
-        return RAD_OK;
-    }
     /* Before build_classes and assign: mapped units get no class and no budget. */
     pin_mapped(prog, out);
     build_classes(out);
+    /* RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED packs static residents only: a movable one lives in a slot
+     * of its class's stride, and the heat engine copies slots as they are. */
+    pk_on_ = in_.vram_pack != nullptr && !out->dynamic;
+    pk_bytes_.assign(pk_on_ ? prog.weights.size() : 0, -1);
+    pk_cap_.assign(pk_on_ ? prog.weights.size() : 0, -1);
+    pk_raw_.assign(pk_on_ ? prog.weights.size() : 0, -1);
+    pk_charge_.assign(pk_on_ ? out->units.size() : 0, -1);
+
+    /* After build_classes: a unit's slot_bytes is its class's stride, and the pins below charge
+     * the host pool that. Before it the charge would be zero and the pool would not hold them. */
+    int hrc = pin_embedding(prog, cfg, out);
+    const int trc = pin_towers(cfg, out);
+    if (hrc >= 0) hrc = trc;
+    if (hrc >= 0) hrc = pin_draft_experts(prog, cfg, out);
 
     /* Charge the file tier's staging pool (RAD_PLACE_FILE_STAGE_SLOTS) before anything is placed
      * in the host pool, or the fill could exhaust it and the mover refuse the plan. Sized from the
      * widest class carrying a layer unit, the only kind either offload strategy spills; this
      * upper-bounds what the mover computes. A model with routed units also reserves the read
-     * windows, since which units reach the file tier is decided only by the fill below. */
+     * windows, since which units reach the file tier is decided only by the fill below.
+     *
+     * Expert-tiered keeps every non-routed unit on the card when they fit the weight budget
+     * (assign_expert_tiered), so then only routed units can reach the file tier and the slots are
+     * sized from them: a dense layer's unit, hundreds of MiB, never arrives, and pinning room for it
+     * (1.84 GiB a rank on DeepSeek-V4.1) only took RAM from the expert cache. Checked after the fill. */
+    bool routed_only = false;
     if (ssd_) {
-        int64_t widest = 0;
+        int64_t widest = 0, widest_routed = 0, fixed = 0;
         bool routed = false;
         for (const MoveUnit& mu : out->units) {
             if (mu.access == RAD_ACCESS_CONDITIONAL && mu.layer >= 0) routed = true;
+            if (!mu.preplaced() && mu.access != RAD_ACCESS_CONDITIONAL) fixed += mu.slot_bytes;
             if (mu.layer < 0 || mu.slab_class < 0) continue;
-            widest = std::max(widest, out->classes[(size_t)mu.slab_class].stride);
+            const int64_t s = out->classes[(size_t)mu.slab_class].stride;
+            widest = std::max(widest, s);
+            if (mu.access == RAD_ACCESS_CONDITIONAL) widest_routed = std::max(widest_routed, s);
         }
+        routed_only = routed && out->strategy == Strategy::ExpertTiered && out->vram_budget > 0 &&
+                      fixed <= out->vram_budget;
+        if (routed_only) widest = widest_routed;
         const int64_t windows = routed ? (int64_t)RAD_PLACE_FILE_WINDOWS *
                                          RAD_PLACE_FILE_WINDOW_BYTES : 0;
         const int64_t need = file_stage_reserve(widest, routed);
@@ -1131,14 +1420,59 @@ int Planner::plan(Plan* out) {
         }
     }
 
-    /* Not RAD_TRY: a refusal still leaves `out` filled in far enough to print. */
-    int hrc = pin_embedding(prog, cfg, out);
-    const int trc = pin_towers(cfg, out);
-    if (hrc >= 0) hrc = trc;
+    /* Not RAD_TRY: a refusal still leaves `out` filled in far enough to print. The pins ran above,
+     * once slot_bytes was known. */
 
+    // Custom bank mode uses only the remaining explicitly budgeted host pool.
+    if (hrc >= 0) hrc = pin_draft_bank_experts(prog, cfg, out);
     int rc = assign(out);
+    /* The staging was sized for routed units only: a fill that still put another unit on the file
+     * tier needs the full reserve, so refuse as the reserve above would have. */
+    if (routed_only && rc >= 0)
+        for (const MoveUnit& mu : out->units)
+            if (mu.tier == Tier::SSD && mu.access != RAD_ACCESS_CONDITIONAL) {
+                RAD_ERR("placement: a non-routed unit of layer %d (%s) reached the file tier, but "
+                        "its staging was sized for routed experts only; raise --host-pool-mib",
+                        (int)mu.layer, humanb(mu.bytes).c_str());
+                rc = RAD_E_NOMEM;
+                break;
+            }
     enforce_op_site_agreement(prog, out);
     schedule_prefetch(out);
+    /* After the strategy: it has put the hot set in VRAM, and pinning marks those resident. */
+    pin_hot(cfg, out);
+    //The preassignment pin log is an intent, not final-residency evidence. Refuse
+    //a successful strategy that has moved any already-charged native bank head.
+    //Keep the original error class when pinning or the strategy itself refused.
+    if (hrc >= 0 && rc >= 0 && cfg.draft_bank_expert_placement == "host") {
+        constexpr int64_t pair_bytes = 18800640;
+        int64_t heads = 0, bytes = 0;
+        bool valid = true;
+        std::array<std::array<bool,32>,3> seen{};
+        for (const MoveUnit& mu : out->units) {
+            if (mu.layer < 40 || mu.expert < 0) continue;
+            ++heads;
+            if (mu.layer >= 43 || mu.expert >= 32 || mu.weights.size() != 2 ||
+                mu.slot_bytes != pair_bytes || mu.tier != Tier::HostPinned ||
+                mu.site != Site::DeviceZeroCopy || !mu.host_forced || mu.movable) {
+                valid = false;
+                continue;
+            }
+            auto& present = seen[size_t(mu.layer-40)][size_t(mu.expert)];
+            if (present) valid = false;
+            present = true;
+            bytes += mu.slot_bytes;
+        }
+        for (const auto& layer : seen) for (bool present : layer) valid = valid && present;
+        if (!valid || heads != 96 || bytes != 96*pair_bytes) {
+            RAD_ERR("draft-bank final placement: rank=%d refused after assignment; expected96 "
+                    "immutable HostPinned/DeviceZeroCopy pairs", out->rank);
+            return RAD_E_STATE;
+        }
+        RAD_INFO("draft-bank final placement: rank=%d strategy=%s heads=%lld bytes=%lld "
+                 "HostPinned/DeviceZeroCopy; host_forced=1 movable=0; checked after assignment",
+                 out->rank, strategy_name(out->strategy), (long long)heads, (long long)bytes);
+    }
     finish(prog, out);
     return hrc < 0 ? hrc : rc;
 }
@@ -1266,6 +1600,13 @@ std::string Plan::report(const Program& prog) const {
     if (tower_host_bytes)
         s += fmt("  encoder tower %12s  %12s   (--vision-tower-placement ram, pinned, read in place)\n",
                  "-", humanb(tower_host_bytes).c_str());
+    if (draft_host_bytes)
+        s += fmt("  drafter       %12s  %12s   (--draft-expert-placement host, pinned, read in place)\n",
+                 "-", humanb(draft_host_bytes).c_str());
+    if (pinned_units)
+        s += fmt("  pinned hot    %12s  %12lld   (--expert-pin-top: resident, heat never demotes them, "
+                 "share above %.4g of %lld)\n", "-", (long long)pinned_units, (double)pin_threshold,
+                 (long long)profile_units);
     if (ngram_copy_bytes)
         s += fmt("  n-gram copy   %12s  %12s   (--ngram-placement ram, %s, filled at load)\n",
                  "-", humanb(ngram_copy_bytes).c_str(),
@@ -1276,22 +1617,14 @@ std::string Plan::report(const Program& prog) const {
                  "the container)\n", "-", humanb(file_stage_vram).c_str(),
                  humanb(file_layer_max).c_str());
 
-    if (native_inventory) {
-        const auto& n=native_inventory->footprint();
-        s += fmt("  native payload %12s  %12s   (durable bytes; not a RAM/VRAM pool)\n",
-                 "-",humanb(n.native_payload_bytes).c_str());
-        s += fmt("  native consumers %10s  %12s   (slots, sentinels, tail and guards)\n",
-                 "-",humanb(n.native_device_bytes).c_str());
-        s += fmt("  native landing %12s  %12s   (separate pinned reservation)\n",
-                 "-",humanb(n.landing_bytes).c_str());
-        s += fmt("  native HOT/COLD %12s / %s   (rank-global source ledger, not preallocated here)\n",
-                 humanb(n.hot_bytes).c_str(),humanb(n.cold_bytes).c_str());
-        s += fmt("  native metadata %11s   (conservative bounded reservation)\n",
-                 humanb(n.metadata_reservation).c_str());
-    }
     if (slab_overhead)
         s += fmt("  slab overhead %12s  %12s   (shadow slots + the staging ring)\n", "-",
                  humanb(slab_overhead).c_str());
+    if (vram_packed.units)
+        s += fmt("  vram packed   %12s  %12s   (%lld residents in the packed-scale form, block_mxfp4 %s; "
+                 "%lld weights over their raw-round budget stay block)\n", "-",
+                 humanb(vram_packed.bytes).c_str(), (long long)vram_packed.units,
+                 humanb(vram_packed.block_bytes).c_str(), (long long)vram_packed.over_budget);
 
     bool any_slab = false;
     for (const SlabClass& c : classes) if (c.movable || c.n_stage) any_slab = true;

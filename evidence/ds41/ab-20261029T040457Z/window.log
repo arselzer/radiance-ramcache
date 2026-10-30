@@ -1,0 +1,89 @@
+[2026-10-29T04:04:57Z] waiting for 30 s of QFN idleness
+before: 608764c1d1989c714d8aad7b8a79f8057c3e73473b9f9d55b49d02e82defd2b8 running 2026-10-29T04:03:31.958509975Z sha256:e82764045e46ebae07e33961f17dedba981c0d07336dfcddd67e4b3b042b8600
+[2026-10-29T04:05:25Z] stopping radiance-flashnext
+radiance-flashnext
+[2026-10-29T04:05:33Z] arm base: RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=0
+[2026-10-29T04:05:52Z] arm base: serving after 18s
+chat-01: 0.0 s, decode 0.00 tok/s, prefill 0 ms ERROR <HTTPError 501: 'Not Implemented'>
+chat-02: 0.0 s, decode 0.00 tok/s, prefill 0 ms ERROR <HTTPError 501: 'Not Implemented'>
+chat-03: 0.0 s, decode 0.00 tok/s, prefill 0 ms ERROR <HTTPError 501: 'Not Implemented'>
+chat-04: 0.0 s, decode 0.00 tok/s, prefill 0 ms ERROR <HTTPError 501: 'Not Implemented'>
+chat-05: 0.0 s, decode 0.00 tok/s, prefill 0 ms ERROR <HTTPError 501: 'Not Implemented'>
+chat-06: 0.0 s, decode 0.00 tok/s, prefill 0 ms ERROR <HTTPError 501: 'Not Implemented'>
+chat-07: 0.0 s, decode 0.00 tok/s, prefill 0 ms ERROR <HTTPError 501: 'Not Implemented'>
+chat-08: 0.0 s, decode 0.00 tok/s, prefill 0 ms ERROR <HTTPError 501: 'Not Implemented'>
+chat-09: 0.0 s, decode 0.00 tok/s, prefill 0 ms ERROR <HTTPError 501: 'Not Implemented'>
+chat-10: 0.0 s, decode 0.00 tok/s, prefill 0 ms ERROR <HTTPError 501: 'Not Implemented'>
+chat-11: 0.0 s, decode 0.00 tok/s, prefill 0 ms ERROR <HTTPError 501: 'Not Implemented'>
+chat-12: 0.0 s, decode 0.00 tok/s, prefill 0 ms ERROR <HTTPError 501: 'Not Implemented'>
+chat-13: 0.0 s, decode 0.00 tok/s, prefill 0 ms ERROR <HTTPError 501: 'Not Implemented'>
+chat-14: 0.0 s, decode 0.00 tok/s, prefill 0 ms ERROR <HTTPError 501: 'Not Implemented'>
+chat-15: 0.0 s, decode 0.00 tok/s, prefill 0 ms ERROR <HTTPError 501: 'Not Implemented'>
+chat-16: 0.0 s, decode 0.00 tok/s, prefill 0 ms ERROR <HTTPError 501: 'Not Implemented'>
+[2026-10-29T04:05:52Z] arm base: requests exit 0
+W req refused from 127.0.0.1:35970 -> 501 not_implemented_error: /v1/chat/completions requires a chat template; this model was loaded without one. Use /v1/completions
+W req refused from 127.0.0.1:35972 -> 501 not_implemented_error: /v1/chat/completions requires a chat template; this model was loaded without one. Use /v1/completions
+W req refused from 127.0.0.1:35982 -> 501 not_implemented_error: /v1/chat/completions requires a chat template; this model was loaded without one. Use /v1/completions
+W req refused from 127.0.0.1:35998 -> 501 not_implemented_error: /v1/chat/completions requires a chat template; this model was loaded without one. Use /v1/completions
+W req refused from 127.0.0.1:36004 -> 501 not_implemented_error: /v1/chat/completions requires a chat template; this model was loaded without one. Use /v1/completions
+W req refused from 127.0.0.1:36014 -> 501 not_implemented_error: /v1/chat/completions requires a chat template; this model was loaded without one. Use /v1/completions
+W req refused from 127.0.0.1:36016 -> 501 not_implemented_error: /v1/chat/completions requires a chat template; this model was loaded without one. Use /v1/completions
+W req refused from 127.0.0.1:36020 -> 501 not_implemented_error: /v1/chat/completions requires a chat template; this model was loaded without one. Use /v1/completions
+W req refused from 127.0.0.1:36024 -> 501 not_implemented_error: /v1/chat/completions requires a chat template; this model was loaded without one. Use /v1/completions
+W req refused from 127.0.0.1:36036 -> 501 not_implemented_error: /v1/chat/completions requires a chat template; this model was loaded without one. Use /v1/completions
+W req refused from 127.0.0.1:36046 -> 501 not_implemented_error: /v1/chat/completions requires a chat template; this model was loaded without one. Use /v1/completions
+W req refused from 127.0.0.1:36050 -> 501 not_implemented_error: /v1/chat/completions requires a chat template; this model was loaded without one. Use /v1/completions
+[2026-10-29T04:05:53Z] arm all-t24-f-M16-H-p1900-m98304-G-R-B1-W: RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=24 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU=/home/as/radiance-ds41-claude/tools/ds41-host-experts/build/window-20261028T203510Z/silu_table_gfx1201.bin RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_POLICY=all RADIANCE_EXPERIMENTAL_NATIVE_CACHE_DIRECT_FILL=1 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MISSES=16 RADIANCE_EXPERIMENTAL_NATIVE_CACHE_PREGROW=1 RADIANCE_EXPERIMENTAL_DS41_PLANE_MIRROR=/srv/bulk/source-copies/ds41-native-mxfp4/d8b2e3c20f5f4b6d5044d37f20b8d53f260f83e466f72259572be76d7e756bf3-main RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS=1 RADIANCE_EXPERIMENTAL_DS41_CACHE_WARM=1
+[2026-10-29T04:06:43Z] arm all-t24-f-M16-H-p1900-m98304-G-R-B1-W: serving after 50s
+chat-01: 0.0 s, decode 0.00 tok/s, prefill 0 ms ERROR <HTTPError 501: 'Not Implemented'>
+chat-02: 0.0 s, decode 0.00 tok/s, prefill 0 ms ERROR <HTTPError 501: 'Not Implemented'>
+chat-03: 0.0 s, decode 0.00 tok/s, prefill 0 ms ERROR <HTTPError 501: 'Not Implemented'>
+chat-04: 0.0 s, decode 0.00 tok/s, prefill 0 ms ERROR <HTTPError 501: 'Not Implemented'>
+chat-05: 0.0 s, decode 0.00 tok/s, prefill 0 ms ERROR <HTTPError 501: 'Not Implemented'>
+chat-06: 0.0 s, decode 0.00 tok/s, prefill 0 ms ERROR <HTTPError 501: 'Not Implemented'>
+chat-07: 0.0 s, decode 0.00 tok/s, prefill 0 ms ERROR <HTTPError 501: 'Not Implemented'>
+chat-08: 0.0 s, decode 0.00 tok/s, prefill 0 ms ERROR <HTTPError 501: 'Not Implemented'>
+chat-09: 0.0 s, decode 0.00 tok/s, prefill 0 ms ERROR <HTTPError 501: 'Not Implemented'>
+chat-10: 0.0 s, decode 0.00 tok/s, prefill 0 ms ERROR <HTTPError 501: 'Not Implemented'>
+chat-11: 0.0 s, decode 0.00 tok/s, prefill 0 ms ERROR <HTTPError 501: 'Not Implemented'>
+chat-12: 0.0 s, decode 0.00 tok/s, prefill 0 ms ERROR <HTTPError 501: 'Not Implemented'>
+chat-13: 0.0 s, decode 0.00 tok/s, prefill 0 ms ERROR <HTTPError 501: 'Not Implemented'>
+chat-14: 0.0 s, decode 0.00 tok/s, prefill 0 ms ERROR <HTTPError 501: 'Not Implemented'>
+chat-15: 0.0 s, decode 0.00 tok/s, prefill 0 ms ERROR <HTTPError 501: 'Not Implemented'>
+chat-16: 0.0 s, decode 0.00 tok/s, prefill 0 ms ERROR <HTTPError 501: 'Not Implemented'>
+[2026-10-29T04:06:43Z] arm all-t24-f-M16-H-p1900-m98304-G-R-B1-W: requests exit 0
+W req refused from 127.0.0.1:41288 -> 501 not_implemented_error: /v1/chat/completions requires a chat template; this model was loaded without one. Use /v1/completions
+W req refused from 127.0.0.1:41294 -> 501 not_implemented_error: /v1/chat/completions requires a chat template; this model was loaded without one. Use /v1/completions
+W req refused from 127.0.0.1:41306 -> 501 not_implemented_error: /v1/chat/completions requires a chat template; this model was loaded without one. Use /v1/completions
+W req refused from 127.0.0.1:41308 -> 501 not_implemented_error: /v1/chat/completions requires a chat template; this model was loaded without one. Use /v1/completions
+  host experts' plane reads: 2728 weights read for the CPU in 3.41 s of issuing-thread time (1.25 ms a batch weight), 2728 relaid into the RAM cache beside it
+I[0] host experts: 0 layers handed 0 experts (0 rows) to the CPU; 0 cached experts went over the copy link, 0 routed experts were not cached; 0.0 ms waiting at gathers; verify: 0 rows compared, 0 differ; 0 gate_up operand moves; 0 units probed (the mapped cache's hit and miss counts above include these probes); misses on the CPU: 0 units, 0 rows, 0.0 ms reading their planes
+  host experts' plane reads: 2728 weights read for the CPU in 3.40 s of issuing-thread time (1.25 ms a batch weight), 2728 relaid into the RAM cache beside it
+I[1] host experts: 0 layers handed 0 experts (0 rows) to the CPU; 0 cached experts went over the copy link, 0 routed experts were not cached; 0.0 ms waiting at gathers; verify: 0 rows compared, 0 differ; 0 gate_up operand moves; 0 units probed (the mapped cache's hit and miss counts above include these probes); misses on the CPU: 0 units, 0 rows, 0.0 ms reading their planes
+  host experts' plane reads: 2728 weights read for the CPU in 3.39 s of issuing-thread time (1.24 ms a batch weight), 2728 relaid into the RAM cache beside it
+I[2] host experts: 0 layers handed 0 experts (0 rows) to the CPU; 0 cached experts went over the copy link, 0 routed experts were not cached; 0.0 ms waiting at gathers; verify: 0 rows compared, 0 differ; 0 gate_up operand moves; 0 units probed (the mapped cache's hit and miss counts above include these probes); misses on the CPU: 0 units, 0 rows, 0.0 ms reading their planes
+  host experts' plane reads: 2728 weights read for the CPU in 3.39 s of issuing-thread time (1.24 ms a batch weight), 2728 relaid into the RAM cache beside it
+I[3] host experts: 0 layers handed 0 experts (0 rows) to the CPU; 0 cached experts went over the copy link, 0 routed experts were not cached; 0.0 ms waiting at gathers; verify: 0 rows compared, 0 differ; 0 gate_up operand moves; 0 units probed (the mapped cache's hit and miss counts above include these probes); misses on the CPU: 0 units, 0 rows, 0.0 ms reading their planes
+request                   baseall-t24-f-M16-H-p1900-m98304-G-R-B1-W
+chat-01                      -                 -
+chat-02                      -                 -
+chat-03                      -                 -
+chat-04                      -                 -
+chat-05                      -                 -
+chat-06                      -                 -
+chat-07                      -                 -
+chat-08                      -                 -
+chat-09                      -                 -
+chat-10                      -                 -
+chat-11                      -                 -
+chat-12                      -                 -
+chat-13                      -                 -
+chat-14                      -                 -
+chat-15                      -                 -
+chat-16                      -                 -
+decode              0.00 tok/s        0.00 tok/s
+[2026-10-29T04:06:46Z] arms done
+[2026-10-29T04:06:46Z] restoring radiance-flashnext
+radiance-flashnext
+[2026-10-29T04:07:42Z] QFN up after 55s; completion: {"id":"cmpl-f745423b7e135729b5408beb","object":"text_completion","created":1793246862,"model":"qwen-vllm","system_fingerprint":"radiance-1.12.0","choices":[{"text":" Paris. The capital","index":0,"logprobs":null,"finish_reason":"length"}],"usage":{"prompt_tokens":5,"completion_tokens":4,"total_token
+608764c1d1989c714d8aad7b8a79f8057c3e73473b9f9d55b49d02e82defd2b8 running 2026-10-29T04:06:46.668055055Z sha256:e82764045e46ebae07e33961f17dedba981c0d07336dfcddd67e4b3b042b8600

@@ -1,0 +1,7 @@
+ 1 threads:   23.7 GB/s
+ 4 threads:   55.9 GB/s
+ 8 threads:   50.3 GB/s
+12 threads:   58.8 GB/s
+16 threads:   67.9 GB/s
+20 threads:   83.3 GB/s
+24 threads:   78.9 GB/s

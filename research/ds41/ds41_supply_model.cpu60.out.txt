@@ -1,0 +1,5 @@
+#1 CPU off the miss path (0.3 ms left)                           136.6    +26%    +11%
+host experts computed on the CPU                                 112.1    +54%    +23%
+host experts on CPU or copy link, whichever is free              105.9    +63%    +27%
+CPU experts + #3 (50%)                                            78.7   +119%    +50%
+hybrid + #3 (50%)                                                 68.7   +151%    +64%

@@ -15,6 +15,19 @@
 #include "place/mover.h"
 #include "place/stager.h"
 #include "place/planner.h"
+#include "place/vram_packed.h"
+#include "../tools/ds41-host-experts/ds41_host_experts.h"
+#include "place/expert_profile_map.h"
+#include "place/native_decode_profile.h"
+#include "format/radfile.h"
+#include "dspark_bank_plan_fixture.h"
+#include "format/dspark_rad_banks.h"
+#include <filesystem>
+#include <functional>
+#include <stdexcept>
+#include <fstream>
+#include <fcntl.h>
+#include <sys/stat.h>
 
 #include <dirent.h>
 #include <unistd.h>
@@ -27,6 +40,7 @@
 #include <cstring>
 #include <string>
 #include <thread>
+#include <atomic>
 #include <vector>
 
 using namespace rad;
@@ -1276,6 +1290,42 @@ TEST(a_slot_pool_regrows_every_slot_a_shrink_dropped) {
     }
 }
 
+/* Expert-tiered placement keeps every dense unit on the card when they fit, so the file tier's
+ * staging is sized for the routed experts alone: a dense layer far wider than an expert no longer
+ * sets it, and a pool too small for that dense layer's slots is accepted. When the dense units do
+ * not fit the card they may spill, the full reserve applies, and the same pool is refused. */
+TEST(planner_sizes_file_staging_for_routed_experts_when_dense_units_stay_on_the_card) {
+    Fixture f;
+    build_moe_layers(f, 2, 8, 1 * MiB, MiB / 2);
+    for (int l = 0; l < 2; ++l)
+        f.op("gemm", { f.weight("blk." + std::to_string(l) + ".attn.weight", 8 * MiB,
+                                RAD_ACCESS_PER_TOKEN, l, -1) }, false);
+
+    Config c = base_config();
+    c.placement = "expert_tiered";
+    c.vram_weights_mib = 40;   /* the embedding, both dense layers and some experts */
+    const int64_t routed = 4 * (MiB + MiB / 2) + RAD_PLACE_FILE_WINDOWS * RAD_PLACE_FILE_WINDOW_BYTES;
+    c.host_pool_mib = (routed + 3 * MiB) / MiB + 1;   /* below 4 x 8 MiB + the windows */
+    c.weights_disk_tier = true;
+    PlannerInput in{&f.prog, &c, 0, 1, nullptr, 0};
+    Plan p;
+    CHECK_OK(Planner(in).plan(&p));
+    CHECK(p.fits());
+    CHECK_EQ(p.file_stage_reserve, routed);
+    int dense = 0, ssd = 0;
+    for (const MoveUnit& mu : p.units) {
+        if (mu.expert < 0 && mu.layer >= 0) { ++dense; CHECK(mu.tier == Tier::VRAM); }
+        if (mu.tier == Tier::SSD) { ++ssd; CHECK(mu.expert >= 0); }
+    }
+    CHECK_EQ(dense, 2);
+    CHECK(ssd > 0);
+
+    c.vram_weights_mib = 12;   /* the dense layers alone do not fit */
+    PlannerInput in2{&f.prog, &c, 0, 1, nullptr, 0};
+    Plan q;
+    CHECK_EQ(Planner(in2).plan(&q), RAD_E_NOMEM);
+}
+
 TEST(file_tier_alignment_is_the_container_alignment) {
     /* O_DIRECT needs aligned offsets, lengths and buffers, and every RadFileEntry offset is
      * RAD_ALIGN_UNIT-aligned, so the fast path needs no head adjustment. */
@@ -1451,6 +1501,343 @@ TEST(the_file_stager_reads_each_routed_layer_from_the_container) {
     CHECK_EQ(m.stats().file_layers, (uint64_t)(2 * L));
     CHECK_EQ(m.stats().file_units, (uint64_t)(2 * L * 2));
     CHECK(m.stats().file_preads >= (uint64_t)(2 * L * 2));
+    rad_stream_sync(m.transfer_stream());
+    rad_stream_destroy(s);
+    std::remove(path.c_str());
+}
+
+namespace {
+/* A relayout a test can predict, standing in for a kernel's (RadRelayoutFn): the first plane's
+ * bytes reversed and xored, then the second plane as it is. Refuses a size that is not the two
+ * planes', so a weight handed the wrong geometry fails loudly. */
+int reversing_relayout(const RadParam*, int, int, const RadEncoding*, const int*,
+                       const RadTensor* planes, int n_planes, void* dst, int64_t dst_bytes) {
+    if (n_planes != 2) return RAD_E_SHAPE;
+    const int64_t n0 = planes[0].shape[0] * planes[0].shape[1];
+    const int64_t n1 = planes[1].shape[0] * planes[1].shape[1];
+    if (n0 + n1 != dst_bytes || !planes[0].data || !planes[1].data) return RAD_E_SHAPE;
+    const uint8_t* a = (const uint8_t*)planes[0].data;
+    uint8_t* d = (uint8_t*)dst;
+    for (int64_t i = 0; i < n0; ++i) d[i] = (uint8_t)(a[n0 - 1 - i] ^ 0x5a);
+    std::memcpy(d + n0, planes[1].data, (size_t)n1);
+    return RAD_OK;
+}
+}  /* namespace */
+
+/* A weight whose kernel stores a relayout of the container's planes goes to the file tier too
+ * (weight_file_relaid, PlannerInput::file_relayout) and is relaid on every read, by the kernel's
+ * own relayout, into the read windows the copy to the card reads. Three routed layers of four
+ * experts, two planes per weight: the second starts 256 bytes past the first's end, so not on an
+ * O_DIRECT block, and a layer's relaid bytes span two read windows. Experts 0 and 2 stay resident.
+ * Refused without the planner's flag, and by a mover with no relayout. */
+TEST(the_file_tier_relays_a_weight_its_kernel_relayouts_on_every_read) {
+    Fixture f;
+    const int64_t tail = 600;                         /* the second plane */
+    const int64_t gu = 20 * MiB + 1000 + tail, dn = 1 * MiB + 24 + tail;
+    const int L = 3;    /* with two, the two layer buffers cost what the file-tier experts would */
+    build_moe_layers(f, L, 4, gu, dn);
+    RadKernelInfo info = g_dev_info;
+    info.relayout = reversing_relayout;
+    KernelRow row;
+    row.info = &info;
+    for (OpInfo& o : f.prog.ops)
+        if (o.op == "moe_gemm") o.bands[0].dom[RAD_DOMAIN_DEVICE].row = &row;
+
+    int64_t off = 4 * (int64_t)RAD_ALIGN_UNIT;
+    std::vector<rad_weight> relaid;
+    for (rad_weight w = 1; (size_t)w < f.prog.weights.size(); ++w) {
+        WeightInfo& wi = f.prog.weights[w];
+        wi.stored_bytes = wi.logical_bytes;
+        wi.file_offset = (uint64_t)off;
+        if (wi.decl.group.expert < 0) {
+            off = align_up(off + wi.stored_bytes, RAD_ALIGN_UNIT);
+            continue;
+        }
+        const int64_t n0 = wi.logical_bytes - tail;
+        wi.identity = false;
+        wi.layout_tag = "test.reversed";
+        wi.lay_op = wi.first_use_op;
+        wi.lay_band = 0;
+        wi.lay_dom = RAD_DOMAIN_DEVICE;
+        wi.lay_operand = 0;
+        wi.enc.n_planes = 2;
+        wi.enc.plane[0].dtype = RAD_U8;
+        wi.enc.plane[1].dtype = RAD_U8;
+        wi.n_sel = 2;
+        wi.sel[0] = 0;
+        wi.sel[1] = 1;
+        wi.sel_rows[0] = 1; wi.sel_cols[0] = n0;
+        wi.sel_rows[1] = 1; wi.sel_cols[1] = tail;
+        wi.file_plane_offset[0] = (uint64_t)off;
+        wi.file_plane_offset[1] = (uint64_t)align_up(off + n0, 256);
+        off = align_up((int64_t)wi.file_plane_offset[1] + tail, RAD_ALIGN_UNIT);
+        relaid.push_back(w);
+    }
+    std::vector<uint8_t> img((size_t)off);
+    for (int64_t i = 0; i < off; ++i) img[(size_t)i] = container_byte(i);
+    const std::string path = "place_test_file_relay.rad";
+    {
+        FILE* fp = std::fopen(path.c_str(), "wb");
+        CHECK(fp != nullptr);
+        if (!fp) return;
+        CHECK_EQ(std::fwrite(img.data(), 1, img.size(), fp), img.size());
+        std::fclose(fp);
+    }
+    {
+        DirectFile probe;
+        if (probe.open(path.c_str(), RAD_DIO_READ) < 0) {
+            std::printf("  SKIP the working directory has no O_DIRECT\n");
+            std::remove(path.c_str());
+            return;
+        }
+    }
+    /* What the relayout makes of weight w's planes. */
+    auto expect = [&](rad_weight w) {
+        const WeightInfo& wi = f.prog.weights[w];
+        const int64_t n0 = wi.sel_cols[0];
+        std::vector<uint8_t> e((size_t)wi.stored_bytes);
+        for (int64_t i = 0; i < n0; ++i)
+            e[(size_t)i] = (uint8_t)(img[(size_t)(wi.file_plane_offset[0] + n0 - 1 - i)] ^ 0x5a);
+        std::memcpy(e.data() + n0, img.data() + wi.file_plane_offset[1], (size_t)tail);
+        return e;
+    };
+
+    std::vector<RadFileProfile> prof;
+    for (int l = 0; l < L; ++l)
+        for (int e = 0; e < 4; ++e)
+            prof.push_back(RadFileProfile{l, e, e == 0 ? 0.5f : e == 2 ? 0.4f : 0.01f, 0.0f});
+    Config c = base_config();
+    c.placement = "expert_tiered";
+    c.deterministic = true;
+    c.vram_weights_mib = 222;
+    c.host_pool_mib = (4 * 22 * MiB + RAD_PLACE_FILE_WINDOWS * RAD_PLACE_FILE_WINDOW_BYTES) / MiB + 1;
+    c.weights_disk_tier = true;
+    PlannerInput in{&f.prog, &c, 0, 1, prof.data(), (int64_t)prof.size()};
+    {
+        /* Without the flag a relaid unit fits in no tier, as before. */
+        Plan refused;
+        CHECK(Planner(in).plan(&refused) < 0);
+    }
+    in.file_relayout = true;
+    Plan p;
+    CHECK_OK(Planner(in).plan(&p));
+    std::vector<std::vector<rad_weight>> file_w((size_t)L);
+    for (const MoveUnit& mu : p.units) {
+        if (mu.expert < 0) continue;
+        CHECK(mu.tier == ((mu.expert & 1) ? Tier::SSD : Tier::VRAM));
+        if (mu.tier == Tier::SSD)
+            for (rad_weight w : mu.weights) file_w[(size_t)mu.layer].push_back(w);
+    }
+
+    MoverConfig mc;
+    mc.container_path = path;
+    {
+        /* A mover with no relayout refuses the plan rather than copy the planes as they lie. */
+        Mover bare;
+        CHECK(bare.init(f.prog, p, mc) < 0);
+    }
+    Mover m;
+    std::atomic<int> calls{ 0 };
+    m.set_file_relayout([&](const WeightInfo& w, const RadTensor* planes, void* dst, int64_t n) {
+        ++calls;
+        const RadKernelInfo* ki = weight_layout_kernel(f.prog, w);
+        if (!ki || !ki->relayout) return (int)RAD_E_STATE;
+        return ki->relayout(nullptr, 0, w.lay_operand, &w.enc, w.sel, planes, w.n_sel, dst, n);
+    });
+    CHECK_OK(m.init(f.prog, p, mc));
+    RadStream s = nullptr;
+    CHECK_OK(rad_stream_create(&s, 0));
+    CHECK_OK(m.bind_compute_stream(s));
+    FileStager fs;
+    CHECK_OK(fs.init(f.prog, p, &m));
+    CHECK(fs.enabled());
+
+    /* Every file-tier weight of layer l is published holding its relayout. */
+    auto relaid_ok = [&](int l) {
+        int ok = 0;
+        for (rad_weight w : file_w[(size_t)l]) {
+            const WeightSlot* slot = m.residency()->lookup(w);
+            if (!slot || !slot->ptr) continue;
+            const WeightInfo& wi = f.prog.weights[w];
+            std::vector<uint8_t> got((size_t)wi.stored_bytes);
+            rad_stream_sync(m.transfer_stream());
+            if (rad_memcpy_async(got.data(), slot->ptr, wi.stored_bytes, s) < 0) continue;
+            rad_stream_sync(s);
+            if (got == expect(w)) ++ok;
+        }
+        return ok == (int)file_w[(size_t)l].size() && ok > 0;
+    };
+    for (int pass = 0; pass < 2; ++pass) {
+        RadBatch b{};
+        CHECK(fs.begin_pass(&b));
+        bool resync = false;
+        CHECK_OK(fs.before_op(0, s, &resync));          /* layer 0 */
+        CHECK(relaid_ok(0));
+        CHECK_OK(fs.before_op(1, s, &resync));          /* layer 1 read ahead */
+        CHECK(relaid_ok(1));
+        CHECK_OK(fs.before_op(2, s, &resync));
+        CHECK_OK(fs.before_op(3, s, &resync));          /* layer 2 read ahead */
+        CHECK(relaid_ok(1) && relaid_ok(2));
+        CHECK_OK(fs.before_op(4, s, &resync));
+        CHECK_OK(fs.before_op(5, s, &resync));
+        CHECK(relaid_ok(2));
+        CHECK_OK(fs.before_op(6, s, &resync));
+        CHECK_OK(fs.end_pass(s));
+    }
+    /* Two passes over three layers of two file-tier experts of two weights, every one relaid. */
+    CHECK_EQ(m.stats().file_relaid, (uint64_t)(2 * L * 2 * 2));
+    CHECK_EQ((uint64_t)calls.load(), m.stats().file_relaid);
+    CHECK_EQ(m.stats().file_units, (uint64_t)(2 * L * 2));
+    rad_stream_sync(m.transfer_stream());
+    rad_stream_destroy(s);
+    std::remove(path.c_str());
+}
+
+TEST(the_file_stager_reads_only_the_experts_a_small_pass_routes_to) {
+    /* The fixture above: three routed layers of four experts, 1 and 3 of each on the file tier.
+     * A one-token pass at top_k 2 routes, per layer, to the counts below. Layer 0 routes to
+     * expert 1 and is then sliced (its first op issued again), so the whole layer is read
+     * behind it; layer 1 routes to 3; layer 2's counts do not add up to the pass, so it is read
+     * whole. */
+    Fixture f;
+    const int64_t gu = 14 * MiB + 1000, dn = 6 * MiB + 24;
+    const int L = 3;
+    build_moe_layers(f, L, 4, gu, dn);
+
+    int64_t off = 4 * (int64_t)RAD_ALIGN_UNIT;
+    int32_t prev = -1;
+    for (rad_weight w = 1; (size_t)w < f.prog.weights.size(); ++w) {
+        WeightInfo& wi = f.prog.weights[w];
+        if (prev >= 0 && wi.decl.group.layer != prev) off += 2 * MiB;
+        prev = wi.decl.group.layer;
+        wi.stored_bytes = wi.logical_bytes;
+        wi.file_offset = (uint64_t)off;
+        off = align_up(off + wi.stored_bytes, RAD_ALIGN_UNIT);
+    }
+    std::vector<uint8_t> img((size_t)off);
+    for (int64_t i = 0; i < off; ++i) img[(size_t)i] = container_byte(i);
+    const std::string path = "place_test_file_routed.rad";
+    {
+        FILE* fp = std::fopen(path.c_str(), "wb");
+        CHECK(fp != nullptr);
+        if (!fp) return;
+        CHECK_EQ(std::fwrite(img.data(), 1, img.size(), fp), img.size());
+        std::fclose(fp);
+    }
+    {
+        DirectFile probe;
+        if (probe.open(path.c_str(), RAD_DIO_READ) < 0) {
+            std::printf("  SKIP the working directory has no O_DIRECT\n");
+            std::remove(path.c_str());
+            return;
+        }
+    }
+
+    std::vector<RadFileProfile> prof;
+    for (int l = 0; l < L; ++l)
+        for (int e = 0; e < 4; ++e)
+            prof.push_back(RadFileProfile{l, e, e == 0 ? 0.5f : e == 2 ? 0.4f : 0.01f, 0.0f});
+    Config c = base_config();
+    c.placement = "expert_tiered";
+    c.deterministic = true;
+    c.vram_weights_mib = 210;
+    c.host_pool_mib = (4 * 21 * MiB + RAD_PLACE_FILE_WINDOWS * RAD_PLACE_FILE_WINDOW_BYTES) / MiB + 1;
+    c.weights_disk_tier = true;
+    PlannerInput in{&f.prog, &c, 0, 1, prof.data(), (int64_t)prof.size()};
+    Plan p;
+    CHECK_OK(Planner(in).plan(&p));
+    /* file_w[l][e]: the file-tier weights of expert e of layer l. */
+    std::vector<std::vector<std::vector<rad_weight>>> file_w(
+        (size_t)L, std::vector<std::vector<rad_weight>>(4));
+    for (const MoveUnit& mu : p.units)
+        if (mu.expert >= 0 && mu.tier == Tier::SSD)
+            for (rad_weight w : mu.weights) file_w[(size_t)mu.layer][(size_t)mu.expert].push_back(w);
+
+    Mover m;
+    MoverConfig mc;
+    mc.container_path = path;
+    CHECK_OK(m.init(f.prog, p, mc));
+    RadStream s = nullptr;
+    CHECK_OK(rad_stream_create(&s, 0));
+    CHECK_OK(m.bind_compute_stream(s));
+
+    int32_t counts[L][4] = { { 1, 1, 0, 0 }, { 0, 0, 1, 1 }, { 1, 0, 0, 0 } };
+    FileStager fs;
+    CHECK_OK(fs.init(f.prog, p, &m, [&](int32_t layer, int64_t* ne, int64_t* top_k) {
+        *ne = 4;
+        *top_k = 2;
+        return (layer >= 0 && layer < L) ? (const int32_t*)counts[layer] : nullptr;
+    }));
+    CHECK(fs.enabled());
+    CHECK(fs.routed_reads());
+
+    /* 0: no address; 1: its container bytes; 2: an alias into the layer's file buffer. */
+    auto state = [&](int l, int e) {
+        int got = -1;
+        for (rad_weight w : file_w[(size_t)l][(size_t)e]) {
+            const WeightSlot* slot = m.residency()->lookup(w);
+            int st = 0;
+            if (slot && slot->ptr) {
+                if (published_matches(m, f.prog, w, img, s)) st = 1;
+                else if (slot->ptr == m.file_buffer(l & 1)) st = 2;
+                else st = 3;
+            }
+            if (got >= 0 && st != got) return 4;          /* the unit's weights disagree */
+            got = st;
+        }
+        return got;
+    };
+
+    RadBatch b{};
+    b.n_tok = 1;
+    CHECK(fs.begin_pass(&b));
+    bool resync = false;
+    CHECK_OK(fs.before_op(0, s, &resync));     /* no read before layer 0's router has run */
+    CHECK(!resync);
+    CHECK_EQ(state(0, 1), 0);
+    CHECK_OK(fs.before_op(1, s, &resync));     /* layer 0: expert 1 read, 3 aliased, no read-ahead */
+    CHECK(resync);
+    CHECK_EQ(state(0, 1), 1);
+    CHECK_EQ(state(0, 3), 2);
+    CHECK_EQ(state(1, 1), 0);
+    CHECK_OK(fs.after_op(1, s));
+    CHECK_OK(fs.before_op(1, s, &resync));     /* a second slice: the whole layer */
+    CHECK(resync);
+    CHECK_EQ(state(0, 1), 1);
+    CHECK_EQ(state(0, 3), 1);
+    CHECK_OK(fs.before_op(2, s, &resync));
+    CHECK_OK(fs.before_op(3, s, &resync));     /* layer 1: 0 released, expert 3 read, 1 aliased */
+    CHECK_EQ(state(0, 1), 0);
+    CHECK_EQ(state(0, 3), 0);
+    CHECK_EQ(state(1, 3), 1);
+    CHECK_EQ(state(1, 1), 2);
+    CHECK_OK(fs.before_op(4, s, &resync));
+    CHECK_OK(fs.before_op(5, s, &resync));     /* layer 2: counts sum to 1, not 2: read whole */
+    CHECK_EQ(state(1, 1), 0);
+    CHECK_EQ(state(2, 1), 1);
+    CHECK_EQ(state(2, 3), 1);
+    CHECK_OK(fs.before_op(6, s, &resync));
+    CHECK_OK(fs.end_pass(s));
+    for (int l = 0; l < L; ++l) {
+        CHECK_EQ(state(l, 1), 0);
+        CHECK_EQ(state(l, 3), 0);
+    }
+    /* Units read: 1 + 2 (layer 0, routed then whole) + 1 + 2; aliased: one each in layers 0, 1. */
+    CHECK_EQ(m.stats().file_units, (uint64_t)6);
+    CHECK_EQ(m.stats().file_aliased, (uint64_t)2);
+
+    /* A prefill-sized pass keeps the whole-layer read and its read-ahead. */
+    RadBatch big{};
+    big.n_tok = FileStager::kRoutedRows + 1;
+    CHECK(fs.begin_pass(&big));
+    CHECK_OK(fs.before_op(0, s, &resync));
+    CHECK(resync);
+    CHECK_EQ(state(0, 1), 1);
+    CHECK_EQ(state(0, 3), 1);
+    CHECK_OK(fs.before_op(1, s, &resync));
+    CHECK_EQ(state(1, 1), 1);
+    CHECK_OK(fs.end_pass(s));
+
     rad_stream_sync(m.transfer_stream());
     rad_stream_destroy(s);
     std::remove(path.c_str());
@@ -2840,6 +3227,41 @@ TEST(weight_bytes_prefers_the_stored_layout_then_the_logical_then_the_shape) {
     CHECK_EQ(weight_bytes(z), 0ll);
 }
 
+/* What a host reader of the container (the router predictor, through Mover::read_weight_file)
+ * reads of a weight: the stored bytes of one stored as it is, or the selected plane a kernel's
+ * relayout reads. DeepSeek-V4.1's router under RADIANCE_EXPERIMENTAL_DS41_ROUTER_BF16 is the second
+ * kind: gemm_nt_f32bf16 keeps its bf16 halves on the card (half the bytes), and the predictor still
+ * reads the container's f32 plane, [384, 5120], so read-ahead (..._PREFETCH) keeps working with the
+ * switch on. Nothing for a weight the loader widens or narrows, whose stored bytes are not the
+ * file's, nor for one joining several planes or of unknown encoding. */
+TEST(weight_file_bytes_is_the_container_plane_not_the_stored_form) {
+    WeightInfo w;
+    w.stored_bytes = 384ll * 5120 * 4;
+    CHECK_EQ(weight_file_bytes(w), 384ll * 5120 * 4);   /* identity, as without the switch */
+    w.widen = true;
+    CHECK_EQ(weight_file_bytes(w), 0ll);
+    w.widen = false;
+    w.narrow = true;
+    CHECK_EQ(weight_file_bytes(w), 0ll);
+
+    WeightInfo r;   /* relaid: the f32 plane held on the card as its bf16 halves */
+    r.identity = false;
+    r.stored_bytes = 384ll * 5120 * 2;
+    r.enc = rad_enc_plain(RAD_F32);
+    r.enc_known = true;
+    r.n_sel = 1;
+    r.sel_rows[0] = 384;
+    r.sel_cols[0] = 5120;
+    CHECK_EQ(weight_file_bytes(r), 384ll * 5120 * 4);
+    r.enc = rad_enc_plain(RAD_BF16);   /* a bf16 plane: two bytes an element in the file */
+    CHECK_EQ(weight_file_bytes(r), 384ll * 5120 * 2);
+    r.enc_known = false;
+    CHECK_EQ(weight_file_bytes(r), 0ll);
+    r.enc_known = true;
+    r.n_sel = 2;
+    CHECK_EQ(weight_file_bytes(r), 0ll);
+}
+
 /* The footprint must agree with the planner: the VRAM budget resolver calls it before a Planner
  * exists and gives the planner a budget computed from it. It must reproduce the unit grouping, the
  * per-unit alignment and the mapped-tier pin. */
@@ -3906,6 +4328,1555 @@ TEST(a_mover_gives_back_every_event_and_device_byte) {
     run();
     CHECK_OK(settled_vram(&vram1));
     CHECK(vram1 - vram0 <= 2 * MiB + 4096);
+}
+
+TEST(source_localized_decode_profile_ranks_whole_GU_DN_units_without_budget_changes) {
+    Fixture f;
+    build_moe_layers(f, 1, 8, 2 * MiB, 1 * MiB);
+    f.prog.ctx.rank = 1;
+    f.prog.ctx.world_size = 4;
+    std::map<std::string, RadFileEntry> directory;
+    for (size_t i = 1; i < f.prog.weights.size(); ++i) {
+        auto& w = f.prog.weights[i];
+        if (w.decl.group.expert < 0) continue;
+        const int local = w.decl.group.expert;
+        const int slot = w.logical_bytes == 2 * MiB ? 0 : 1;
+        w.decl.group.slot = slot;
+        w.source = "source." + std::to_string(96 + local) + "." + std::to_string(slot);
+        RadFileEntry entry{};
+        entry.layer = 0; entry.expert = 96 + local; entry.slot = slot;
+        directory[w.source] = entry;
+    }
+    Config c = base_config();
+    c.placement = "expert_tiered"; c.deterministic = true;
+    c.vram_weights_mib = 10; c.host_pool_mib = 64;
+    PlannerInput input{};
+    input.program = &f.prog; input.config = &c; input.rank = 1; input.world_size = 4;
+    Plan baseline;
+    CHECK_OK(Planner(input).plan(&baseline));
+    for (const auto& u : baseline.units) if (u.expert >= 0)
+        CHECK((u.expert < 3) == (u.tier == Tier::VRAM));
+
+    std::vector<RadFileProfile> global;
+    for (int e = 0; e < 384; ++e)
+        global.push_back({0, e, e >= 100 && e <= 102 ? float(103-e)/10.0f : 0.0f, 0.0f});
+    std::vector<RadFileProfile> local;
+    const auto find = [&](const std::string& source) -> const RadFileEntry* {
+        const auto at = directory.find(source); return at == directory.end() ? nullptr : &at->second;
+    };
+    CHECK(local_expert_profile(f.prog.weights, find, global.data(), (int64_t)global.size(),
+                              40, 384, &local) == ExpertProfileMapStatus::Complete);
+    CHECK_EQ(local.size(), size_t(8));
+    input.profile = local.data(); input.n_profile = (int64_t)local.size();
+    Plan ranked, repeated;
+    CHECK_OK(Planner(input).plan(&ranked));
+    CHECK_OK(Planner(input).plan(&repeated));
+    CHECK(digest(f.prog, ranked) == digest(f.prog, repeated));
+    for (const auto& u : ranked.units) if (u.expert >= 0) {
+        CHECK_EQ(u.weights.size(), size_t(2));
+        CHECK((u.expert >= 4 && u.expert <= 6) == (u.tier == Tier::VRAM));
+        CHECK_EQ(u.bytes, int64_t(3 * MiB));
+    }
+    CHECK_EQ(ranked.totals.bytes[(int)Tier::VRAM], baseline.totals.bytes[(int)Tier::VRAM]);
+    CHECK_EQ(ranked.totals.bytes[(int)Tier::HostPinned], baseline.totals.bytes[(int)Tier::HostPinned]);
+    CHECK(!ranked.dynamic);
+    // One conflicting GU source must refuse localization transactionally, not rank it silently.
+    for (auto& [name, entry] : directory) if (entry.expert == 100 && entry.slot == 0) entry.expert = 200;
+    auto preserved = local;
+    CHECK(local_expert_profile(f.prog.weights, find, global.data(), (int64_t)global.size(),
+                              40, 384, &local) == ExpertProfileMapStatus::ConflictingGroup);
+    CHECK_EQ(local.size(), preserved.size());
+    for (size_t i = 0; i < local.size(); ++i) {
+        CHECK_EQ(local[i].expert, preserved[i].expert);
+        CHECK_EQ(local[i].share, preserved[i].share);
+    }
+}
+
+/* A real sidecar fd and RadFile directory feed the actual parser, tested key mapper,
+ * and actual Planner for all four EP ranks. Only tiny synthetic 1x32 expert blocks
+ * are written: planned real native GU/DN dimensions are metadata, never allocated
+ * as model payload or executed. No Engine, GPU, serving process or real model. */
+TEST(decode_profile_file_to_four_rank_planner_checks_local_identity_and_source_generation) {
+    struct Files {
+        std::string directory, model, profile, link, backup;
+        Files() {
+            std::string name = radtest::tmpdir() + "/decode_profile.XXXXXX";
+            if (::mkdtemp(name.data())) {
+                directory = name; model = name + "/metadata.rad";
+                profile = name + "/profile.json"; link = name + "/profile-link";
+                backup = name + "/metadata-old.rad";
+            }
+        }
+        ~Files() {
+            for (const auto* path : {&link, &profile, &model, &backup})
+                if (!path->empty()) ::unlink(path->c_str());
+            if (!directory.empty()) ::rmdir(directory.c_str());
+        }
+    } files;
+    REQUIRE(!files.directory.empty());
+    const auto source_name = [](int layer, int global, int slot) {
+        return "blk." + std::to_string(layer) + (slot ? ".ffn_down_exps." : ".ffn_gate_up_exps.") +
+               std::to_string(global) + ".weight";
+    };
+    RadEncoding encoding{};
+    rad_enc_copy_str(encoding.scheme, "affine");
+    rad_enc_add_plane(&encoding, "codes", RAD_FP4E2M1, 1, 1);
+    rad_enc_add_plane(&encoding, "scale", RAD_E8M0, 1, 32);
+    {
+        RadWriter writer;
+        REQUIRE(writer.begin(files.model.c_str()) == RAD_OK);
+        writer.set_arch("deepseek41"); writer.set_model_name("profile-pipeline-fixture");
+        writer.set_quant("synthetic-native-MXFP4-metadata");
+        writer.meta_i("n_layers", 40); writer.meta_i("n_embd", 5120);
+        writer.meta_i("n_expert", 384); writer.meta_i("n_expert_used", 6);
+        const uint8_t codes[16] = {}; const uint8_t scale = 127;
+        const void* planes[2] = {codes, &scale};
+        for (int layer = 0; layer < 40; ++layer)
+            for (int global = 0; global < 384; ++global)
+                for (int slot = 0; slot < 2; ++slot) {
+                    RadWriter::Weight w;
+                    w.name = source_name(layer, global, slot); w.enc = encoding;
+                    w.rank = 2; w.shape[0] = 1; w.shape[1] = 32;
+                    w.layer = layer; w.expert = global; w.slot = slot;
+                    REQUIRE(writer.add_weight(w, planes) >= 0);
+                }
+        REQUIRE(writer.finish() == RAD_OK);
+    }
+    RadFile source;
+    REQUIRE(source.open(files.model.c_str()) == RAD_OK);
+    REQUIRE(source.entry_count() == 40 * 384 * 2);
+    NativeProfileIdentity identity;
+    REQUIRE(native_profile_identity(source, &identity) == RAD_OK);
+    using Json = nlohmann::json;
+    Json doc = {{"format", "radiance-expert-stats/1"}, {"final", true},
+        {"model", identity.model}, {"container", identity.container}, {"arch", "deepseek41"},
+        {"tp", 4}, {"n_layers", 40}, {"n_trunk_layers", 40}, {"n_experts", 384},
+        {"source_identity", {{"format", "rad-metadata-prefix-sha256/1"},
+            {"file_bytes", identity.file_bytes}, {"metadata_bytes", identity.metadata_bytes},
+            {"device", identity.device}, {"inode", identity.inode},
+            {"mtime_ns", identity.mtime_ns}, {"ctime_ns", identity.ctime_ns},
+            {"sha256", identity.metadata_sha256}}},
+        {"tokens", {{"decode", 1}}}, {"steps", {{"decode", 1}}}};
+    doc["layer_experts"] = std::vector<int>(40, 384);
+    doc["top_k"] = std::vector<int>(40, 6);
+    doc["map"] = std::vector<std::string>(40, "container");
+    for (const char* key : {"observed_tokens", "histograms", "passes"})
+        doc[key]["decode"] = std::vector<int>(40, 1);
+    doc["selections"]["decode"] = std::vector<int>(40, 6);
+    doc["counts"]["decode"] = std::vector<std::vector<int>>(40, std::vector<int>(384));
+    // Deliberately different local hot id on every rank: 1,4,8,12. None is local0.
+    for (int layer = 0; layer < 40; ++layer)
+        for (int expert : {1, 2, 3, 100, 200, 300}) doc["counts"]["decode"][layer][expert] = 1;
+    for (const char* key : {"credited", "unmapped", "unclassified", "dropped"})
+        doc["ranks"][key] = std::vector<int>(4, std::strcmp(key, "credited") == 0 ? 40 : 0);
+    {
+        std::ofstream output(files.profile, std::ios::binary | std::ios::trunc);
+        REQUIRE(bool(output)); output << doc.dump(); output.close(); REQUIRE(bool(output));
+    }
+    NativeDecodeProfile full;
+    std::string reason;
+    REQUIRE(read_native_decode_profile(files.profile, identity, &full, &reason) == RAD_OK);
+    REQUIRE(full.rows.size() == 40 * 384);
+    const std::array<int, 4> hot_local{1, 4, 8, 12};
+    for (int rank = 0; rank < 4; ++rank) {
+        Fixture f;
+        build_moe_layers(f, 40, 96, 12533760, 6266880);
+        f.prog.ctx.rank = rank; f.prog.ctx.world_size = 4;
+        for (size_t i = 1; i < f.prog.weights.size(); ++i) {
+            auto& w = f.prog.weights[i];
+            if (w.decl.group.expert < 0) continue;
+            const int layer = w.decl.group.layer, local = w.decl.group.expert;
+            const int slot = w.logical_bytes == 12533760 ? 0 : 1;
+            w.decl.group.slot = slot;
+            w.source = source_name(layer, rank * 96 + local, slot);
+            const auto* entry = source.find(w.source);
+            REQUIRE(entry != nullptr);
+            w.enc = source.encoding(*entry); w.enc_known = true;
+            w.n_sel = 2; w.sel[0] = 0; w.sel[1] = 1;
+            w.decl.dtype = RAD_FP4E2M1; w.decl.rank = 2;
+            w.decl.shape[0] = slot ? 5120 : 4608; w.decl.shape[1] = slot ? 2304 : 5120;
+            w.stored_bytes = slot ? 6266880 : 12533760;
+            w.layout_tag = "ggml_mxfp4";
+        }
+        REQUIRE(native_decode_profile_geometry(f.prog.weights));
+        std::vector<RadFileProfile> local;
+        REQUIRE(local_expert_profile(f.prog.weights,
+            [&](const std::string& name) { return source.find(name); }, full.rows.data(),
+            (int64_t)full.rows.size(), 40, 384, &local) == ExpertProfileMapStatus::Complete);
+        REQUIRE(local.size() == 40 * 96);
+        Config c = base_config(); c.placement = "expert_tiered"; c.deterministic = true; c.tp = 4;
+        c.vram_weights_mib = 32;
+        // Planner-only virtual budget. No host pool, tensor payload or device is allocated.
+        c.host_pool_mib = 128 * 1024;
+        PlannerInput input{};
+        input.program = &f.prog; input.config = &c; input.rank = rank; input.world_size = 4;
+        Plan baseline, ranked;
+        REQUIRE(Planner(input).plan(&baseline) == RAD_OK);
+        input.profile = local.data(); input.n_profile = (int64_t)local.size();
+        REQUIRE(Planner(input).plan(&ranked) == RAD_OK);
+        size_t baseline_residents = 0, profile_residents = 0;
+        for (const auto& u : baseline.units) if (u.expert >= 0 && u.tier == Tier::VRAM) {
+            ++baseline_residents; CHECK_EQ(u.layer, 0); CHECK_EQ(u.expert, 0);
+        }
+        for (const auto& u : ranked.units) if (u.expert >= 0 && u.tier == Tier::VRAM) {
+            ++profile_residents; CHECK_EQ(u.layer, 0); CHECK_EQ(u.expert, hot_local[size_t(rank)]);
+            CHECK_EQ(u.weights.size(), size_t(2)); CHECK_EQ(u.bytes, int64_t(18800640));
+        }
+        CHECK_EQ(baseline_residents, size_t(1)); CHECK_EQ(profile_residents, size_t(1));
+        CHECK_EQ(ranked.rank, rank); CHECK(!ranked.dynamic);
+        CHECK_EQ(ranked.totals.bytes[(int)Tier::VRAM], baseline.totals.bytes[(int)Tier::VRAM]);
+    }
+    NativeDecodeProfile unchanged;
+    unchanged.decode_tokens = 777; unchanged.rows.push_back({7, 13, 0.25f, 0.0f});
+    REQUIRE(::symlink(files.profile.c_str(), files.link.c_str()) == 0);
+    CHECK(read_native_decode_profile(files.link, identity, &unchanged, &reason) < 0);
+    CHECK_EQ(unchanged.decode_tokens, uint64_t(777)); CHECK_EQ(unchanged.rows.size(), size_t(1));
+    NativeProfileIdentity wrong = identity; ++wrong.inode;
+    CHECK(read_native_decode_profile(files.profile, wrong, &unchanged, &reason) == RAD_E_FORMAT);
+    CHECK_EQ(unchanged.rows[0].expert, 13);
+    struct stat before{};
+    REQUIRE(::fstat(source.fd_for_metadata_identity(), &before) == 0);
+    const timespec times[2] = {{0, UTIME_OMIT}, {before.st_mtim.tv_sec - 1, before.st_mtim.tv_nsec}};
+    REQUIRE(::utimensat(AT_FDCWD, files.model.c_str(), times, 0) == 0);
+    NativeProfileIdentity changed;
+    REQUIRE(native_profile_identity(source, &changed) == RAD_OK);
+    CHECK(changed.mtime_ns != identity.mtime_ns);
+    CHECK(read_native_decode_profile(files.profile, changed, &unchanged, &reason) == RAD_E_FORMAT);
+    CHECK_EQ(unchanged.decode_tokens, uint64_t(777));
+    // Same path with a different inode must not be mistaken for the held RadFile.
+    REQUIRE(::rename(files.model.c_str(), files.backup.c_str()) == 0);
+    const int replacement = ::open(files.model.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    REQUIRE(replacement >= 0); REQUIRE(::close(replacement) == 0);
+    CHECK(native_profile_identity(source, &changed) == RAD_E_FORMAT);
+}
+
+/* ================================================================== the two placement flags
+ *
+ * --draft-expert-placement host pins a draft head's routed experts in the host pool before any
+ * strategy runs, so they fit beside a trunk that already fills the card. --expert-pin-top keeps
+ * the hottest fraction of the routed experts resident, so heat never demotes them. */
+
+/* A trunk of `trunk` routed layers and a draft head of `head` layers past it, `n` experts each. */
+void build_drafted(Fixture& f, int trunk, int head, int n, int64_t each) {
+    f.prog.meta.n_layers = (uint32_t)trunk;
+    f.prog.drafter.kind = RAD_DRAFT_BLOCK;
+    f.prog.drafter.depth = 5;
+    build_moe_layers(f, trunk + head, n, each, 0);
+}
+
+TEST(draft_experts_pin_to_the_host_pool) {
+    Fixture f;
+    build_drafted(f, 2, 1, 4, 1 * MiB);
+
+    Config c = base_config();
+    c.placement = "expert_tiered";
+    c.vram_weights_mib = 1024;
+    c.host_pool_mib = 64;
+    c.draft_expert_placement = "host";
+    c.draft_expert_placement_given = true;
+
+    PlannerInput in{&f.prog, &c, 0, 1, nullptr, 0};
+    Plan p;
+    CHECK_OK(Planner(in).plan(&p));
+
+    int pinned = 0, trunk_vram = 0;
+    for (const MoveUnit& mu : p.units) {
+        if (mu.expert < 0) continue;
+        if (mu.layer >= 2) {
+            CHECK(mu.host_forced);
+            CHECK(mu.tier == Tier::HostPinned);
+            CHECK(mu.site == Site::DeviceZeroCopy);
+            CHECK(!mu.movable);
+            ++pinned;
+        } else if (mu.tier == Tier::VRAM) {
+            ++trunk_vram;
+        }
+    }
+    /* The head's four experts, and only those, are forced into the pool. */
+    CHECK_EQ(pinned, 4);
+    CHECK(trunk_vram > 0);
+    CHECK(p.draft_host_bytes >= 4 * MiB);
+    CHECK(p.report(f.prog).find("drafter") != std::string::npos);
+
+    /* The footprint agrees: the head is the part of the plane the flag takes out. */
+    WeightFootprint wf;
+    weight_footprint(f.prog, &wf, TablePlacement::Vram, TablePlacement::Disk, false, false);
+    CHECK(wf.draft_experts >= 4 * MiB);
+    CHECK(wf.draft_experts < wf.experts);
+}
+
+TEST(draft_placement_auto_leaves_the_head_to_the_strategy) {
+    Fixture f;
+    build_drafted(f, 2, 1, 4, 1 * MiB);
+
+    Config c = base_config();
+    c.placement = "all_vram";
+    c.vram_weights_mib = 1024;
+
+    PlannerInput in{&f.prog, &c, 0, 1, nullptr, 0};
+    Plan p;
+    CHECK_OK(Planner(in).plan(&p));
+    for (const MoveUnit& mu : p.units)
+        if (mu.expert >= 0 && mu.layer >= 2) CHECK(!mu.host_forced);
+    CHECK_EQ(p.draft_host_bytes, (int64_t)0);
+}
+
+TEST(draft_placement_host_refuses_a_model_with_no_drafter) {
+    Fixture f;
+    build_moe_layers(f, 2, 4, 1 * MiB, 0);
+
+    Config c = base_config();
+    c.placement = "all_vram";
+    c.vram_weights_mib = 1024;
+    c.host_pool_mib = 64;
+    c.draft_expert_placement = "host";
+    c.draft_expert_placement_given = true;
+
+    PlannerInput in{&f.prog, &c, 0, 1, nullptr, 0};
+    Plan p;
+    CHECK_EQ(Planner(in).plan(&p), RAD_E_INVAL);
+}
+
+TEST(draft_placement_host_refuses_when_the_pool_is_short) {
+    Fixture f;
+    build_drafted(f, 1, 1, 8, 4 * MiB);
+
+    Config c = base_config();
+    c.placement = "expert_tiered";
+    c.vram_weights_mib = 1024;
+    c.host_pool_mib = 1;
+    c.draft_expert_placement = "host";
+
+    PlannerInput in{&f.prog, &c, 0, 1, nullptr, 0};
+    Plan p;
+    CHECK_EQ(Planner(in).plan(&p), RAD_E_NOMEM);
+    CHECK(p.report(f.prog).find("DID NOT FIT") != std::string::npos);
+}
+
+TEST(expert_pin_top_keeps_the_hottest_resident) {
+    Fixture f;
+    build_moe_layers(f, 2, 8, 1 * MiB, 0);
+
+    /* Expert e of each layer takes share e + 1, so the hottest are the high indices. */
+    std::vector<RadFileProfile> prof;
+    for (int l = 0; l < 2; ++l)
+        for (int e = 0; e < 8; ++e) {
+            RadFileProfile r{};
+            r.layer = l;
+            r.expert = e;
+            r.share = (float)(e + 1);
+            prof.push_back(r);
+        }
+
+    Config c = base_config();
+    c.placement = "expert_tiered";
+    c.vram_weights_mib = 1024;
+    c.host_pool_mib = 1024;
+    c.expert_pin_top = 0.25f;
+
+    PlannerInput in{&f.prog, &c, 0, 1, prof.data(), (int64_t)prof.size()};
+    Plan p;
+    CHECK_OK(Planner(in).plan(&p));
+
+    int pinned = 0, hot_pinned = 0;
+    for (const MoveUnit& mu : p.units) {
+        if (mu.expert < 0) continue;
+        if (mu.pinned) {
+            CHECK(mu.tier == Tier::VRAM);
+            CHECK(!mu.movable);
+            ++pinned;
+            if (mu.expert >= 6) ++hot_pinned;
+        }
+    }
+    /* The top quarter of 16 experts: the two hottest of each layer. */
+    CHECK_EQ(pinned, 4);
+    CHECK_EQ(hot_pinned, 4);
+    CHECK(p.report(f.prog).find("pinned hot") != std::string::npos);
+}
+
+TEST(expert_pin_top_zero_pins_nothing) {
+    Fixture f;
+    build_moe_layers(f, 1, 4, 1 * MiB, 0);
+
+    Config c = base_config();
+    c.placement = "all_vram";
+    c.vram_weights_mib = 1024;
+    c.expert_pin_top = 0.0f;
+
+    PlannerInput in{&f.prog, &c, 0, 1, nullptr, 0};
+    Plan p;
+    CHECK_OK(Planner(in).plan(&p));
+    for (const MoveUnit& mu : p.units) CHECK(!mu.pinned);
+    CHECK_EQ(p.pinned_units, (int64_t)0);
+}
+
+TEST(expert_pin_top_normalized_shares_keep_the_same_set_after_rescaling) {
+    const std::vector<float> shares{0.01f, 0.02f, 0.04f, 0.08f, 0.12f, 0.18f, 0.25f, 0.30f};
+    for (float scale : {1.0f, 257.0f}) {
+        Fixture f;
+        build_moe_layers(f, 1, (int)shares.size(), 1 * MiB, 0);
+        std::vector<RadFileProfile> prof;
+        for (size_t e = 0; e < shares.size(); ++e) {
+            RadFileProfile r{};
+            r.layer = 0; r.expert = (int)e; r.share = shares[e] * scale;
+            prof.push_back(r);
+        }
+        Config c = base_config();
+        c.placement = "expert_tiered";
+        c.vram_weights_mib = 1024;
+        c.host_pool_mib = 1024;
+        c.expert_pin_top = 0.25f;
+        PlannerInput in{&f.prog, &c, 0, 1, prof.data(), (int64_t)prof.size()};
+        Plan p;
+        CHECK_OK(Planner(in).plan(&p));
+        CHECK_EQ(p.pinned_units, int64_t(2));
+        for (const MoveUnit& mu : p.units) {
+            if (mu.expert < 0) continue;
+            CHECK_EQ(mu.pinned, mu.expert >= 6);
+            if (mu.pinned) CHECK(!mu.movable);
+        }
+    }
+}
+
+TEST(expert_pin_top_leaves_boundary_ties_and_an_unobserved_profile_unpinned) {
+    for (bool zero : {false, true}) {
+        Fixture f;
+        build_moe_layers(f, 1, 8, 1 * MiB, 0);
+        const float shares[] = {0.02f, 0.04f, 0.06f, 0.08f, 0.10f, 0.20f, 0.20f, 0.30f};
+        std::vector<RadFileProfile> prof;
+        for (int e = 0; e < 8; ++e) {
+            RadFileProfile r{};
+            r.layer = 0; r.expert = e; r.share = zero ? 0.0f : shares[e];
+            prof.push_back(r);
+        }
+        Config c = base_config();
+        c.placement = "expert_tiered";
+        c.vram_weights_mib = 1024;
+        c.host_pool_mib = 1024;
+        c.expert_pin_top = 0.25f;
+        PlannerInput in{&f.prog, &c, 0, 1, prof.data(), (int64_t)prof.size()};
+        Plan p;
+        CHECK_OK(Planner(in).plan(&p));
+        CHECK_EQ(p.pinned_units, zero ? int64_t(0) : int64_t(1));
+        for (const MoveUnit& mu : p.units)
+            if (mu.expert >= 0) CHECK_EQ(mu.pinned, !zero && mu.expert == 7);
+    }
+}
+
+TEST(expert_pin_top_all_requested_pins_every_resident_including_zero_share) {
+    for (float fraction : {1.0f, 0.99f}) {
+        Fixture f;
+        build_moe_layers(f, 1, 4, 1 * MiB, 0);
+        Config c = base_config();
+        c.placement = "expert_tiered";
+        c.vram_weights_mib = 1024;
+        c.host_pool_mib = 1024;
+        c.expert_pin_top = fraction;
+        /* No profile: every share is zero. ceil(F * 4) still requests all four. */
+        PlannerInput in{&f.prog, &c, 0, 1, nullptr, 0};
+        Plan p;
+        CHECK_OK(Planner(in).plan(&p));
+        CHECK_EQ(p.pinned_units, int64_t(4));
+        CHECK(std::isinf(p.pin_threshold) && p.pin_threshold < 0.0f);
+        for (const MoveUnit& mu : p.units)
+            if (mu.expert >= 0) CHECK(mu.pinned && !mu.movable && mu.tier == Tier::VRAM);
+    }
+}
+
+TEST(a_pinned_resident_is_never_demoted) {
+    Fixture f;
+    build_moe_layers(f, 1, 4, 1 * MiB, 0);
+
+    std::vector<RadFileProfile> prof;
+    for (int e = 0; e < 4; ++e) {
+        RadFileProfile r{};
+        r.layer = 0;
+        r.expert = e;
+        r.share = (float)(e + 1);
+        prof.push_back(r);
+    }
+    Config c = base_config();
+    c.placement = "expert_tiered";
+    c.vram_weights_mib = 1024;
+    c.host_pool_mib = 1024;
+    c.expert_pin_top = 0.5f;
+
+    PlannerInput in{&f.prog, &c, 0, 1, prof.data(), (int64_t)prof.size()};
+    Plan p;
+    CHECK_OK(Planner(in).plan(&p));
+
+    /* Force one pinned unit and one cold unit onto the host, so the engine has a swap to make,
+     * and heat the cold one far above the pinned one. */
+    int32_t pinned_u = -1, cold_u = -1;
+    for (size_t u = 0; u < p.units.size(); ++u) {
+        if (p.units[u].pinned && pinned_u < 0) pinned_u = (int32_t)u;
+        if (p.units[u].expert == 0) cold_u = (int32_t)u;
+    }
+    CHECK(pinned_u >= 0 && cold_u >= 0);
+    p.units[(size_t)cold_u].tier = Tier::HostPinned;
+    p.units[(size_t)cold_u].movable = true;
+
+    HeatEngine h;
+    HeatParams hp;
+    hp.warmup_dispatches = 0;
+    CHECK_OK(h.init(p, hp));
+    const int32_t ids[] = {0};
+    const int32_t counts[] = {1000};
+    for (int i = 0; i < 8; ++i) h.observe_ids(0, ids, counts, 1);
+    Swap sw{};
+    if (h.pick(&sw)) CHECK(sw.demote != pinned_u);
+}
+
+TEST(the_draft_floor_charges_only_the_trunk) {
+    WeightFootprint wf;
+    wf.experts = 100;
+    wf.draft_experts = 30;
+    wf.expert_unit_max = 5;
+    wf.expert_spare = 10;
+    /* With the drafter hosted, the pool's room serves the trunk alone. */
+    const int64_t hosted = expert_vram_floor_draft_hosted(wf, 80);
+    const int64_t plain = expert_vram_floor(wf, 80);
+    CHECK(hosted < plain);
+    CHECK(hosted <= wf.experts - wf.draft_experts + wf.expert_spare);
+    /* No drafter: the two floors agree. */
+    wf.draft_experts = 0;
+    CHECK_EQ(expert_vram_floor_draft_hosted(wf, 80), expert_vram_floor(wf, 80));
+}
+
+namespace {
+Program bank_placement_program(int rank) {
+    Program p = dspark_scope_fixture::make(rank);
+    g_dev_row.info = &g_dev_info;
+    for (auto& op : p.ops) {
+        Band b; b.hi = 1 << 20; b.dom[RAD_DOMAIN_DEVICE].row = &g_dev_row;
+        op.bands.push_back(b);
+        for (auto w : op.weights) {
+            p.weights[w].align = RAD_ALIGN_UNIT;
+            p.weights[w].first_use_op = p.weights[w].last_use_op = op.index;
+        }
+    }
+    WeightInfo trunk;
+    trunk.name = trunk.source = "bank_test.trunk";
+    trunk.decl.dtype = RAD_U8; trunk.decl.rank = 1; trunk.decl.shape[0] = 4096;
+    trunk.decl.access = RAD_ACCESS_PER_TOKEN;
+    trunk.decl.group.layer = 0; trunk.decl.group.expert = -1;
+    trunk.stored_bytes = 4096; trunk.align = RAD_ALIGN_UNIT;
+    trunk.first_use_op = trunk.last_use_op = int(p.ops.size());
+    OpInfo op; op.index = int(p.ops.size()); op.op = "gemm";
+    op.weights.push_back(rad_weight(p.weights.size())); p.weights.push_back(std::move(trunk));
+    Band b; b.hi = 1 << 20; b.dom[RAD_DOMAIN_DEVICE].row = &g_dev_row;
+    op.bands.push_back(b); p.ops.push_back(std::move(op));
+    return p;
+}
+Config bank_placement_config() {
+    Config c; c.deterministic = true; c.placement = "all_vram";
+    c.vram_weights_mib = 8192; c.host_pool_mib = 4096;
+    c.draft_bank = "synthetic-head.rad";
+    c.tp=4;c.max_seqs=1;c.max_tok=16;c.n_spec=5;c.kv_cache_dtype="bf16";
+    return c;
+}
+}
+TEST(dspark_bank_host_placement_charges_existing_pool_and_preserves_trunk_on_all_ranks) {
+    for (int rank = 0; rank < 4; ++rank) {
+        Program prog = bank_placement_program(rank);
+        Config cfg = bank_placement_config();
+        cfg.draft_bank_expert_placement = "host";
+        PlannerInput in{&prog, &cfg, rank, 4, nullptr, 0};
+        Plan p; REQUIRE(Planner(in).plan(&p) == RAD_OK);
+        int64_t charged = 0; int pairs = 0;
+        for (const auto& mu : p.units) {
+            if (mu.layer >= 40 && mu.expert >= 0) {
+                CHECK(mu.tier == Tier::HostPinned); CHECK(mu.site == Site::DeviceZeroCopy);
+                CHECK(mu.host_forced); CHECK(!mu.movable); CHECK_EQ(mu.slab_slot, -1);
+                CHECK_EQ(mu.weights.size(), size_t(2)); charged += mu.slot_bytes; ++pairs;
+                for (auto w : mu.weights) {
+                    CHECK(p.weight[w].tier == Tier::HostPinned);
+                    CHECK(p.weight[w].site == Site::DeviceZeroCopy);
+                }
+            } else {
+                CHECK(mu.tier == Tier::VRAM); CHECK(!mu.host_forced);
+            }
+        }
+        CHECK_EQ(pairs, 96); CHECK(charged >= int64_t(1804861440));
+        CHECK_EQ(p.host_budget, int64_t(4096) * MiB - charged);
+        CHECK_EQ(cfg.host_pool_mib, int64_t(4096));
+    }
+}
+TEST(dspark_bank_default_does_not_force_or_charge_host_experts) {
+    Program prog = bank_placement_program(0); Config cfg = bank_placement_config();
+    CHECK(cfg.draft_bank_expert_placement == "auto");
+    PlannerInput in{&prog, &cfg, 0, 4, nullptr, 0}; Plan p;
+    REQUIRE(Planner(in).plan(&p) == RAD_OK);
+    CHECK_EQ(p.host_budget, int64_t(4096) * MiB);
+    for (const auto& mu : p.units) { CHECK(mu.tier == Tier::VRAM); CHECK(!mu.host_forced); }
+}
+TEST(dspark_bank_host_refuses_insufficient_budget_without_partial_pinning_or_growth) {
+    Program prog = bank_placement_program(0); Config cfg = bank_placement_config();
+    cfg.draft_bank_expert_placement = "host"; cfg.host_pool_mib = 128;
+    PlannerInput in{&prog, &cfg, 0, 4, nullptr, 0}; Plan p;
+    CHECK_EQ(Planner(in).plan(&p), RAD_E_NOMEM);
+    CHECK_EQ(cfg.host_pool_mib, int64_t(128)); CHECK_EQ(p.host_budget, int64_t(128) * MiB);
+    for (const auto& mu : p.units) CHECK(!mu.host_forced);
+}
+TEST(dspark_bank_host_refuses_wrong_declaration_and_missing_bank) {
+    for (int bad = 0; bad < 4; ++bad) {
+        Program prog = bank_placement_program(0); Config cfg = bank_placement_config();
+        cfg.draft_bank_expert_placement = "host";
+        if (bad == 0) cfg.draft_bank.clear();
+        if (bad == 1) prog.ctx.max_spec = 4;
+        if (bad == 2) prog.weights[1].layout_tag = "other";
+        if (bad == 3) prog.ops.front().bands.clear();
+        PlannerInput in{&prog, &cfg, 0, 4, nullptr, 0}; Plan p;
+        CHECK_EQ(Planner(in).plan(&p), RAD_E_UNSUPPORTED);
+        for (const auto& mu : p.units) CHECK(!mu.host_forced);
+    }
+}
+
+namespace {
+/* Real ordinary files + actual HOST Mover transport; synthetic group attributes deliberately
+ * differ from native DSpark. This proves only source ownership/IO/cache publication, not a full
+ * donor, learned MTP, native math or a TP4 model. No finish_coverage bypass exists in Engine. */
+struct BankIoTemp {
+    std::string dir;
+    BankIoTemp() {
+        std::string pattern = radtest::tmpdir() + "/bank-mover-XXXXXX";
+        char* got = ::mkdtemp(pattern.data());
+        if (!got) throw std::runtime_error("bank Mover mkdtemp");
+        dir = got;
+    }
+    ~BankIoTemp() { std::error_code ec; std::filesystem::remove_all(dir, ec); }
+    std::string path(const char* name) const { return dir + "/" + name; }
+};
+void bank_io_good(int st) { if (st != RAD_OK) throw std::runtime_error(rad_strerror(st)); }
+void bank_io_metadata(RadWriter& w) {
+    w.set_arch("deepseek41"); w.set_model_name("synthetic-bank-Mover"); w.set_quant("");
+    w.meta_i("n_layers",40); w.meta_i("n_embd",5120); w.meta_i("n_ff",2304);
+    w.meta_i("n_expert",384); w.meta_i("n_expert_used",6); w.meta_i("n_vocab",129280);
+    w.meta_i("num_nextn_predict_layers",3); w.meta_i("dspark_block_size",5);
+    w.meta_i("dspark_n_routed_experts",128); w.meta_i("dspark_num_experts_per_tok",3);
+}
+void bank_io_add(RadWriter& writer, const std::string& name, const std::vector<uint8_t>& bytes) {
+    RadWriter::Weight w; w.name = name; w.enc = rad_enc_plain(RAD_U8);
+    w.rank = 1; w.shape[0] = int64_t(bytes.size());
+    const void* planes[] = {bytes.data()};
+    if (writer.add_weight(w, planes) < 0) throw std::runtime_error("bank Mover write tiny weight");
+}
+struct BankIoFixture {
+    BankIoTemp temp;
+    Fixture f;
+    RadFile main, donor;
+    DsparkRadBanks banks;
+    std::vector<std::vector<uint8_t>> payload;
+    Plan plan;
+    BankIoFixture() {
+        build_moe_layers(f,3,2,768*KiB+17,256*KiB-17);
+        payload.resize(f.prog.weights.size());
+        for (size_t h=1;h<f.prog.weights.size();++h) {
+            auto& w=f.prog.weights[h];
+            const bool draft=w.decl.group.expert>=0&&(w.decl.group.expert&1);
+            w.source=draft?"dspark.synthetic."+w.name:w.name;
+            w.enc=rad_enc_plain(RAD_U8); w.stored_bytes=w.logical_bytes;
+            w.n_sel=1; w.sel[0]=0; w.sel_rows[0]=1; w.sel_cols[0]=w.stored_bytes;
+            payload[h].resize(size_t(w.stored_bytes));
+            for(size_t j=0;j<payload[h].size();++j)
+                payload[h][j]=uint8_t(container_byte(int64_t(j)+int64_t(h)*1048583)^(draft?0xa5:0x3c));
+        }
+        {
+            RadWriter writer; bank_io_good(writer.begin(temp.path("main.rad").c_str()));
+            bank_io_metadata(writer);
+            for(size_t h=1;h<f.prog.weights.size();++h) {
+                const auto& w=f.prog.weights[h];
+                if(w.decl.group.expert<0||!(w.decl.group.expert&1))bank_io_add(writer,w.source,payload[h]);
+            }
+            bank_io_good(writer.finish()); bank_io_good(main.open(temp.path("main.rad").c_str()));
+        }
+        {
+            RadWriter writer; bank_io_good(writer.begin(temp.path("draft.rad").c_str()));
+            bank_io_metadata(writer); std::string digest;
+            bank_io_good(DsparkRadBanks::metadata_digest(main,&digest));
+            writer.meta_i("draft_bank.version",1); writer.meta_s("draft_bank.kind","deepseek41.dspark");
+            writer.meta_s("draft_bank.parent_metadata_sha256",digest);
+            writer.meta_i("draft_bank.parent_file_bytes",main.size());
+            writer.meta_s("draft_bank.parent_payload_sha256",std::string(64,'a'));
+            writer.meta_s("draft_bank.source_identity","synthetic-only-not-a-model-payload-proof");
+            bank_io_add(writer,"dspark.synthetic.padding",payload[1]); // same plane alignment as canonical embedding
+            for(size_t h=1;h<f.prog.weights.size();++h) {
+                const auto& w=f.prog.weights[h];
+                if(w.decl.group.expert>=0&&(w.decl.group.expert&1))bank_io_add(writer,w.source,payload[h]);
+            }
+            bank_io_good(writer.finish()); bank_io_good(donor.open(temp.path("draft.rad").c_str()));
+        }
+        bank_io_good(banks.bind(main,&donor)); bank_io_good(banks.bind_weights(f.prog.weights));
+        for(size_t h=1;h<f.prog.weights.size();++h) {
+            auto& w=f.prog.weights[h]; DsparkRadBanks::Entry src;
+            bank_io_good(banks.bound(w,&src));
+            w.file_offset=src.file->plane(*src.entry,0).offset;
+            w.file_plane_offset[0]=w.file_offset;
+        }
+        Config cfg=base_config(); cfg.placement="expert_tiered";cfg.deterministic=true;
+        cfg.vram_weights_mib=6;cfg.host_pool_mib=133;cfg.weights_disk_tier=true;
+        PlannerInput in{&f.prog,&cfg,0,1,nullptr,0};
+        bank_io_good(Planner(in).plan(&plan));
+    }
+    std::vector<int32_t> pair() const {
+        for(int layer=0;layer<3;++layer) {
+            std::vector<int32_t> units;
+            for(size_t u=0;u<plan.units.size();++u)
+                if(plan.units[u].layer==layer&&plan.units[u].expert>=0&&plan.units[u].tier==Tier::SSD)
+                    units.push_back(int32_t(u));
+            if(units.size()==2)return units;
+        }
+        throw std::runtime_error("bank Mover fixture requires actual two-owner SSD pair");
+    }
+};
+struct BankIoTransport {
+    // The owners in BankIoFixture outlive this whole stream/Mover scope.
+    RadStream compute=nullptr; RadEvent done=nullptr; std::unique_ptr<Mover> mover;
+    ~BankIoTransport() {
+        if(mover&&mover->transfer_stream()&&rad_stream_sync(mover->transfer_stream())<0)std::abort();
+        if(compute&&rad_stream_sync(compute)<0)std::abort();
+        mover.reset(); if(done)rad_event_destroy(done); if(compute)rad_stream_destroy(compute);
+    }
+    void start(BankIoFixture& f,int64_t cache) {
+        bank_io_good(rad_stream_create(&compute,0)); bank_io_good(rad_event_create(&done));
+        mover=std::make_unique<Mover>(); MoverConfig c;
+        c.container_path=f.main.path();c.source_banks=&f.banks;c.native_file_cache_bytes=cache;
+        bank_io_good(mover->init(f.f.prog,f.plan,c));
+        bank_io_good(mover->bind_compute_stream(compute));
+    }
+    void pass(BankIoFixture& f,const std::vector<int32_t>& units,NativeFileCacheReadPolicy policy=NativeFileCacheReadPolicy::Normal) {
+        std::vector<int32_t> staged;
+        bank_io_good(mover->stage_file_units(units,mover->file_buffer(0),mover->file_buffer_bytes(),nullptr,done,&staged,policy));
+        REQUIRE(staged==units); bank_io_good(rad_event_wait(compute,done));
+        for(auto u:units)for(auto h:f.plan.units[size_t(u)].weights) {
+            const auto* slot=mover->residency()->lookup(h); REQUIRE(slot&&slot->ptr);
+            std::vector<uint8_t> got(f.payload[h].size());
+            bank_io_good(rad_memcpy_async(got.data(),slot->ptr,int64_t(got.size()),compute));
+            bank_io_good(rad_stream_sync(compute)); CHECK(got==f.payload[h]);
+        }
+        bank_io_good(rad_stream_sync(mover->transfer_stream()));
+        mover->unstage_units(staged);
+    }
+};
+struct BankIoLegacyCacheEnv {
+    const char* key="RADIANCE_EXPERIMENTAL_NATIVE_CACHE_MAPPED_SOURCE";
+    bool present; std::string old;
+    BankIoLegacyCacheEnv():present(std::getenv(key)!=nullptr),old(present?std::getenv(key):"") {
+        if(::setenv(key,"0",1))throw std::runtime_error("bank fixture cache selection");
+    }
+    ~BankIoLegacyCacheEnv() { if(present)::setenv(key,old.c_str(),1);else ::unsetenv(key); }
+};
+void bank_io_case(bool cached) {
+    REQUIRE(device_is_host());
+    BankIoLegacyCacheEnv legacy; // explicit legacy-cache control; mapped-native shape proof is separate
+
+    BankIoFixture f; const auto units=f.pair();
+    const auto& a=f.plan.units[size_t(units[0])];const auto& b=f.plan.units[size_t(units[1])];
+    REQUIRE_EQ(f.f.prog.weights[a.weights[0]].file_id,uint32_t(0));
+    REQUIRE_EQ(f.f.prog.weights[b.weights[0]].file_id,uint32_t(1));
+    // Equal numeric file offsets from different immutable owners must never be coalesced or aliased.
+    REQUIRE_EQ(f.f.prog.weights[a.weights[0]].file_offset,f.f.prog.weights[b.weights[0]].file_offset);
+    BankIoTransport t;t.start(f,cached?4*MiB:0);
+    t.pass(f,units);const auto before=t.mover->stats();
+    t.pass(f,units,cached?NativeFileCacheReadPolicy::ReadOnly:NativeFileCacheReadPolicy::Normal);
+    if(cached)CHECK_EQ(t.mover->stats().file_prefill_ro_hits-before.file_prefill_ro_hits,uint64_t(4));
+    else CHECK(t.mover->stats().file_preads>before.file_preads);
+    if(cached) {
+        const auto old=t.mover->stats();
+        const int fd=::open(f.donor.path(),O_WRONLY|O_CLOEXEC);REQUIRE(fd>=0);
+        const int changed=::ftruncate(fd,off_t(f.donor.size()+1));const int closed=::close(fd);
+        REQUIRE_EQ(changed,0);REQUIRE_EQ(closed,0);
+        std::vector<int32_t> staged;
+        CHECK_EQ(t.mover->stage_file_units({units[0]},t.mover->file_buffer(0),t.mover->file_buffer_bytes(),nullptr,t.done,&staged),RAD_E_STATE);
+        CHECK_EQ(t.mover->stats().h2d_bytes,old.h2d_bytes); CHECK(staged.empty());
+    }
+}
+}
+TEST(dspark_two_bank_actual_HOST_mover_direct_extents_keep_equal_offsets_separate) { bank_io_case(false); }
+TEST(dspark_two_bank_actual_HOST_mover_cache_hit_checks_donor_epoch_for_main_source) { bank_io_case(true); }
+TEST(dspark_two_bank_actual_HOST_mover_refuses_wrong_open_owner_and_stale_generation) {
+    REQUIRE(device_is_host()); BankIoFixture f;
+    {
+        Mover m;MoverConfig c;c.container_path=f.donor.path();c.source_banks=&f.banks;
+        CHECK_EQ(m.init(f.f.prog,f.plan,c),RAD_E_STATE);
+    }
+    auto& w=f.f.prog.weights[1];++w.source_bank_generation;
+    Mover m;MoverConfig c;c.container_path=f.main.path();c.source_banks=&f.banks;
+    CHECK_EQ(m.init(f.f.prog,f.plan,c),RAD_E_STATE);
+}
+
+namespace {
+//Pure actual Planner regression: native-sized metadata only, no allocations or payload IO.
+//The forced heads deliberately retain identity=false/no-relayout, so losing their
+//preplacement cannot silently fall back to a synthetic SSD encoding.
+Program bank_expert_tiered_program(int rank) {
+    Program p = bank_placement_program(rank);
+    for (int layer=0; layer<40; ++layer) for (int slot=0; slot<2; ++slot) {
+        OpInfo op; op.op="moe_gemm_ggml"; op.index=int32_t(p.ops.size());
+        op.base.set_i("n_expert",96); op.base.set_i("top_k",6);
+        op.base.set_i("N",slot?5120:4608); op.base.set_i("K",slot?2304:5120);
+        op.base.set_s("type","mxfp4"); op.base.set_s("dtype","bf16");
+        op.base.set_s("a_order",slot?"sorted":"token");
+        Band band; band.hi=1<<20; band.dom[RAD_DOMAIN_DEVICE].row=&g_dev_row;
+        op.bands.push_back(band);
+        for (int expert=0; expert<96; ++expert) {
+            WeightInfo w;
+            w.name=w.source="blk."+std::to_string(layer)+
+                (slot?".ffn_down_exps.":".ffn_gate_up_exps.")+std::to_string(rank*96+expert)+".weight";
+            w.decl.dtype=RAD_U8; w.decl.rank=2;
+            w.decl.shape[0]=slot?5120:4608; w.decl.shape[1]=slot?2304:5120;
+            w.decl.access=RAD_ACCESS_CONDITIONAL; w.decl.shard=RAD_SHARD_NONE;
+            w.decl.group.layer=layer; w.decl.group.expert=expert; w.decl.group.slot=slot;
+            w.stored_bytes=slot?6266880:12533760; w.align=RAD_ALIGN_UNIT;
+            w.layout_tag="ggml_mxfp4"; w.identity=true;
+            w.first_use_op=w.last_use_op=op.index;
+            op.weights.push_back(rad_weight(p.weights.size())); p.weights.push_back(std::move(w));
+        }
+        p.ops.push_back(std::move(op));
+    }
+    return p;
+}
+Config bank_expert_tiered_config() {
+    Config cfg=bank_placement_config();
+    cfg.placement="expert_tiered"; cfg.vram_weights_mib=4096;
+    cfg.host_pool_mib=4096; cfg.weights_disk_tier=true;
+    cfg.draft_bank_expert_placement="host";
+    return cfg;
+}
+void check_bank_expert_tiered_forced_heads(const Program& prog,const Config& cfg,const Plan& p) {
+    constexpr int64_t P=18800640;
+    int heads=0,main_vram=0,main_pinned=0,main_ssd=0;
+    int64_t head_bytes=0;
+    CHECK(p.strategy==Strategy::ExpertTiered); CHECK(!p.dynamic); CHECK(p.fits());
+    for (const auto&mu:p.units) {
+        if (mu.expert<0) continue;
+        if (mu.layer>=40) {
+            ++heads; head_bytes+=mu.slot_bytes;
+            CHECK(mu.layer<43); CHECK(mu.expert>=0&&mu.expert<32);
+            CHECK(mu.host_forced); CHECK(mu.preplaced()); CHECK(!mu.movable);
+            CHECK(mu.tier==Tier::HostPinned); CHECK(mu.site==Site::DeviceZeroCopy);
+            CHECK_EQ(mu.slab_slot,-1); CHECK_EQ(mu.slot_bytes,P); CHECK_EQ(mu.weights.size(),size_t(2));
+            for (auto h:mu.weights) {
+                CHECK(prog.weights[h].decl.access==RAD_ACCESS_CONDITIONAL);
+                CHECK(!prog.weights[h].identity); //not a file-tier escape hatch
+                CHECK(p.weight[h].tier==Tier::HostPinned);
+                CHECK(p.weight[h].site==Site::DeviceZeroCopy);
+            }
+        } else {
+            CHECK(!mu.host_forced);
+            if (mu.tier==Tier::VRAM) ++main_vram;
+            else if (mu.tier==Tier::HostPinned) ++main_pinned;
+            else if (mu.tier==Tier::SSD) ++main_ssd;
+            else CHECK(false);
+        }
+    }
+    CHECK_EQ(heads,96); CHECK_EQ(head_bytes,96*P); CHECK_EQ(p.forced_host_used,96*P);
+    CHECK_EQ(main_vram+main_pinned+main_ssd,40*96);
+    CHECK(main_vram>0); CHECK(main_pinned>0); CHECK(main_ssd>0);
+    CHECK(p.file_layer_max>0); CHECK(p.file_stage_vram>0);
+    CHECK_EQ(p.host_budget,cfg.host_pool_mib*MiB-p.file_stage_reserve-96*P);
+    CHECK(p.totals.bytes[int(Tier::HostPinned)]+p.file_stage_reserve<=cfg.host_pool_mib*MiB);
+    CHECK(p.totals.bytes[int(Tier::VRAM)]+p.slab_overhead+p.file_stage_vram<=cfg.vram_weights_mib*MiB);
+    CHECK_EQ(cfg.host_pool_mib,int64_t(4096));
+}
+}
+TEST(dspark_bank_expert_tiered_preserves_forced_heads_with_SSD_trunk_all_ranks) {
+    for (int rank=0; rank<4; ++rank) {
+        Program prog=bank_expert_tiered_program(rank); Config cfg=bank_expert_tiered_config();
+        PlannerInput input{&prog,&cfg,rank,4,nullptr,0}; input.container=true;
+        Plan p; REQUIRE(Planner(input).plan(&p)==RAD_OK);
+        check_bank_expert_tiered_forced_heads(prog,cfg,p);
+    }
+}
+TEST(dspark_bank_expert_tiered_hot_head_profile_cannot_override_forced_placement) {
+    for (int rank=0; rank<4; ++rank) {
+        Program prog=bank_expert_tiered_program(rank); Config cfg=bank_expert_tiered_config();
+        PlannerInput input{&prog,&cfg,rank,4,nullptr,0}; input.container=true;
+        Plan cold; REQUIRE(Planner(input).plan(&cold)==RAD_OK);
+        std::vector<RadFileProfile> only_heads;
+        for (int layer=40;layer<43;++layer) for (int expert=0;expert<32;++expert) {
+            RadFileProfile row{}; row.layer=layer; row.expert=expert; row.share=1.0f/32.0f;
+            only_heads.push_back(row);
+        }
+        input.profile=only_heads.data(); input.n_profile=int64_t(only_heads.size());
+        Plan hot; REQUIRE(Planner(input).plan(&hot)==RAD_OK);
+        check_bank_expert_tiered_forced_heads(prog,cfg,hot);
+        REQUIRE(cold.units.size()==hot.units.size());
+        for (size_t u=0;u<cold.units.size();++u) {
+            CHECK(cold.units[u].tier==hot.units[u].tier); CHECK(cold.units[u].site==hot.units[u].site);
+            CHECK_EQ(cold.units[u].movable,hot.units[u].movable);
+            CHECK_EQ(cold.units[u].host_forced,hot.units[u].host_forced);
+            if (hot.units[u].layer>=40) CHECK_EQ(hot.units[u].profile_share,1.0f/32.0f);
+        }
+        CHECK_EQ(cold.host_budget,hot.host_budget); CHECK_EQ(cold.file_layer_max,hot.file_layer_max);
+        CHECK_EQ(cold.file_stage_vram,hot.file_stage_vram);
+    }
+}
+
+TEST(dspark_bank_manual_collision_refuses_before_any_direct_plan_or_budget_mutation) {
+    Program prog=bank_placement_program(0);
+    for(bool explicit_auto : {false,true}) {
+        Config cfg=bank_placement_config();cfg.draft_bank_expert_placement="host";
+        cfg.draft_expert_placement=explicit_auto?"auto":"host";
+        cfg.draft_expert_placement_given=explicit_auto;
+        Plan out;out.host_budget=123;out.vram_budget=456;out.notes.push_back("unchanged");
+        PlannerInput in{&prog,&cfg,0,4,nullptr,0};
+        CHECK_EQ(Planner(in).plan(&out),RAD_E_INVAL);
+        CHECK_EQ(out.host_budget,int64_t(123));CHECK_EQ(out.vram_budget,int64_t(456));
+        CHECK(out.units.empty());CHECK_EQ(out.notes.size(),size_t(1));CHECK(out.notes[0]=="unchanged");
+        CHECK_EQ(cfg.host_pool_mib,int64_t(4096));
+    }
+}
+
+/* ================================================================== packed VRAM residents
+ *
+ * RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED (core/place/vram_packed.h): the expert fill charges a static
+ * resident what the card holds of it -- its weights in the packed-scale form where the scan allows -- and
+ * the mover places and publishes that layout. Without the callback, or in a dynamic plan, nothing
+ * changes. */
+namespace {
+
+/* DeepSeek-V4.1's served unit: gate_up and down in block_mxfp4 at the ggml layout's 64-byte alignment,
+ * and their packed forms with room for 512 and 320 raw rounds (ds41hx::packed_bytes). */
+constexpr int64_t kGuBlock = 12533760, kDnBlock = 6266880, kGuPacked = 11999296, kDnPacked = 6001984;
+
+void build_ds41_like(Fixture& f, int layers, int n, int64_t gu, int64_t dn) {
+    build_moe_layers(f, layers, n, gu, dn);
+    for (size_t w = 1; w < f.prog.weights.size(); ++w) {
+        WeightInfo& wi = f.prog.weights[w];
+        wi.align = 64;
+        if (wi.name.find("ffn_down_exps") != std::string::npos) wi.decl.group.slot = 1;
+    }
+}
+
+/* RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS for the scope, as the recommended configuration runs. */
+struct FileBufferUnitsEnv {
+    std::string old;
+    bool had = false;
+    explicit FileBufferUnitsEnv(const char* v) {
+        const char* o = std::getenv("RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS");
+        had = o != nullptr;
+        if (o) old = o;
+        ::setenv("RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS", v, 1);
+    }
+    ~FileBufferUnitsEnv() {
+        if (had) ::setenv("RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS", old.c_str(), 1);
+        else ::unsetenv("RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS");
+    }
+};
+
+/* A stand-in for the engine's callback: every routed weight eligible at `gu` / `dn` bytes packed (slot 0
+ * / 1), its scan within budget unless it is in `over` (then 600 raw rounds against its room). Counts the
+ * scans. */
+struct FakePack {
+    const Program* prog = nullptr;
+    int64_t gu = kGuPacked, dn = kDnPacked;
+    std::vector<rad_weight> over;
+    int scans = 0;
+    std::function<int64_t(rad_weight, bool, int32_t*, int32_t*)> fn() {
+        return [this](rad_weight w, bool scan, int32_t* cap, int32_t* raw) -> int64_t {
+            const WeightInfo& wi = prog->weights[w];
+            if (wi.decl.group.expert < 0) return 0;
+            const bool down = wi.decl.group.slot == 1;
+            if (cap) *cap = down ? 320 : 512;
+            if (!scan) return down ? dn : gu;
+            ++scans;
+            const bool bad = std::find(over.begin(), over.end(), w) != over.end();
+            if (raw) *raw = bad ? 600 : 3;
+            return bad ? 0 : (down ? dn : gu);
+        };
+    }
+};
+
+int vram_residents(const Plan& p) {
+    int n = 0;
+    for (const MoveUnit& mu : p.units)
+        if (mu.expert >= 0 && mu.tier == Tier::VRAM) ++n;
+    return n;
+}
+
+}  /* namespace */
+
+TEST(packed_vram_residents_are_charged_what_the_card_holds) {
+    /* 8 layers of 48 experts at the served sizes, the file tier for the rest and the file buffers capped
+     * at one unit, as the recommended configuration runs. */
+    FileBufferUnitsEnv cap("1");
+    Fixture f;
+    build_ds41_like(f, 8, 48, kGuBlock, kDnBlock);
+    Config c = base_config();
+    c.placement = "expert_tiered";
+    c.vram_weights_mib = 4000;
+    c.host_pool_mib = 210;   /* the file tier's staging and windows, no room for a pooled expert */
+    c.weights_disk_tier = true;
+    c.deterministic = true;
+
+    PlannerInput in0{&f.prog, &c, 0, 1, nullptr, 0};
+    Plan p0;
+    CHECK_OK(Planner(in0).plan(&p0));
+    const int r0 = vram_residents(p0);
+    CHECK(r0 > 100);
+    CHECK_EQ(p0.vram_packed.units, (int64_t)0);
+
+    FakePack fake;
+    fake.prog = &f.prog;
+    PlannerInput in1{&f.prog, &c, 0, 1, nullptr, 0};
+    in1.vram_pack = fake.fn();
+    Plan p1;
+    CHECK_OK(Planner(in1).plan(&p1));
+    CHECK(p1.fits());
+    const int r1 = vram_residents(p1);
+    /* The same room at 18,001,920 bytes a unit instead of 18,800,640: x1.0444 the residents. */
+    const int64_t room = (int64_t)r0 * 18800640;
+    CHECK(r1 >= (int)(room / 18001920) - 1);
+    CHECK(r1 > r0 + r0 * 4 / 100 - 1);
+    CHECK_EQ(p1.vram_packed.units, (int64_t)r1);
+    CHECK_EQ(p1.vram_packed.weights, (int64_t)2 * r1);
+    CHECK_EQ(p1.vram_packed.gate_up, (int64_t)r1);
+    CHECK_EQ(p1.vram_packed.down, (int64_t)r1);
+    CHECK_EQ(p1.vram_packed.bytes, (int64_t)r1 * 18001920);
+    CHECK_EQ(p1.vram_packed.block_bytes, (int64_t)r1 * 18800640);
+    CHECK_EQ(p1.vram_packed.over_budget, (int64_t)0);
+    /* Only the units the fill considered were read: the residents and the few the room turned down. */
+    CHECK(p1.vram_packed.scanned >= 2 * r1 && p1.vram_packed.scanned <= 2 * r1 + 4);
+    CHECK_EQ((int64_t)fake.scans, p1.vram_packed.scanned);
+    for (const MoveUnit& mu : p1.units) {
+        if (mu.expert < 0) continue;
+        if (mu.tier != Tier::VRAM) {
+            CHECK_EQ(mu.vram_bytes, (int64_t)0);
+            for (rad_weight w : mu.weights) CHECK_EQ(p1.weight[w].vram_bytes, (int64_t)0);
+            continue;
+        }
+        CHECK(!mu.movable);
+        CHECK_EQ(mu.vram_bytes, kGuPacked + kDnPacked);
+        REQUIRE(mu.vram_offset.size() == 2);
+        CHECK_EQ(mu.vram_offset[0], (int64_t)0);
+        CHECK_EQ(mu.vram_offset[1], kGuPacked);
+        /* The stored layout is untouched: every other tier and the file tier read it. */
+        CHECK_EQ(mu.bytes, align_up(kGuBlock, 64) + kDnBlock);
+        CHECK_EQ(p1.weight[mu.weights[0]].vram_bytes, kGuPacked);
+        CHECK_EQ(p1.weight[mu.weights[0]].vram_pk_cap, 512);
+        CHECK_EQ(p1.weight[mu.weights[1]].vram_bytes, kDnPacked);
+        CHECK_EQ(p1.weight[mu.weights[1]].vram_pk_cap, 320);
+    }
+    /* Residents, spares and the file buffers still fit the weights pool. */
+    CHECK(p1.totals.bytes[(int)Tier::VRAM] + p1.slab_overhead + p1.file_stage_vram <= p1.vram_budget);
+    CHECK(p1.report(f.prog).find("vram packed") != std::string::npos);
+}
+
+TEST(a_packed_weight_over_its_budget_stays_block_and_is_charged_so) {
+    FileBufferUnitsEnv cap("1");
+    Fixture f;
+    build_ds41_like(f, 4, 32, kGuBlock, kDnBlock);
+    Config c = base_config();
+    c.placement = "expert_tiered";
+    c.vram_weights_mib = 1500;
+    c.host_pool_mib = 210;
+    c.weights_disk_tier = true;
+    c.deterministic = true;
+    /* Every unit ranks alike, so expert 0 of every layer is resident first (rank_units): layer 0
+     * expert 0's down is over budget. */
+    FakePack fake;
+    fake.prog = &f.prog;
+    PlannerInput in{&f.prog, &c, 0, 1, nullptr, 0};
+    Plan probe;
+    CHECK_OK(Planner(in).plan(&probe));
+    int32_t u00 = -1;
+    for (int32_t u = 0; u < (int32_t)probe.units.size(); ++u)
+        if (probe.units[(size_t)u].layer == 0 && probe.units[(size_t)u].expert == 0) u00 = u;
+    REQUIRE(u00 >= 0);
+    REQUIRE(probe.units[(size_t)u00].tier == Tier::VRAM);
+    fake.over.push_back(probe.units[(size_t)u00].weights[1]);
+    in.vram_pack = fake.fn();
+    Plan p;
+    CHECK_OK(Planner(in).plan(&p));
+    const MoveUnit& mu = p.units[(size_t)u00];
+    REQUIRE(mu.tier == Tier::VRAM);
+    /* gate_up packed, down kept block_mxfp4 at its stored size, laid out as the card holds them. */
+    CHECK_EQ(mu.vram_bytes, kGuPacked + kDnBlock);
+    REQUIRE(mu.vram_offset.size() == 2);
+    CHECK_EQ(mu.vram_offset[1], kGuPacked);
+    CHECK_EQ(p.weight[mu.weights[0]].vram_bytes, kGuPacked);
+    CHECK_EQ(p.weight[mu.weights[1]].vram_bytes, (int64_t)0);
+    CHECK_EQ(p.vram_packed.over_budget, (int64_t)1);
+    CHECK_EQ(p.vram_packed.weights, 2 * p.vram_packed.units - 1);
+    CHECK_EQ(p.vram_packed.raw_max, (int64_t)3);
+    CHECK(p.totals.bytes[(int)Tier::VRAM] + p.slab_overhead + p.file_stage_vram <= p.vram_budget);
+}
+
+TEST(without_packing_the_plan_is_the_plain_one) {
+    /* No callback, a callback that finds nothing eligible, and a dynamic plan with the callback: all
+     * three give the plain plan, decision for decision. */
+    FileBufferUnitsEnv cap("1");
+    Fixture f;
+    build_ds41_like(f, 4, 32, kGuBlock, kDnBlock);
+    Config c = base_config();
+    c.placement = "expert_tiered";
+    c.vram_weights_mib = 1500;
+    c.host_pool_mib = 210;
+    c.weights_disk_tier = true;
+    c.deterministic = true;
+    PlannerInput in0{&f.prog, &c, 0, 1, nullptr, 0};
+    Plan p0;
+    CHECK_OK(Planner(in0).plan(&p0));
+
+    int asked = 0;
+    PlannerInput in1{&f.prog, &c, 0, 1, nullptr, 0};
+    in1.vram_pack = [&](rad_weight, bool, int32_t*, int32_t*) -> int64_t { ++asked; return 0; };
+    Plan p1;
+    CHECK_OK(Planner(in1).plan(&p1));
+    CHECK_EQ(digest(f.prog, p0), digest(f.prog, p1));
+    CHECK(asked > 0);
+    CHECK_EQ(p1.vram_packed.units, (int64_t)0);
+    CHECK_EQ(p1.vram_packed.scanned, (int64_t)0);
+    CHECK_EQ(p1.totals.bytes[(int)Tier::VRAM], p0.totals.bytes[(int)Tier::VRAM]);
+
+    c.deterministic = false;
+    PlannerInput in2{&f.prog, &c, 0, 1, nullptr, 0};
+    Plan d0;
+    CHECK_OK(Planner(in2).plan(&d0));
+    FakePack fake;
+    fake.prog = &f.prog;
+    PlannerInput in3{&f.prog, &c, 0, 1, nullptr, 0};
+    in3.vram_pack = fake.fn();
+    Plan d1;
+    CHECK_OK(Planner(in3).plan(&d1));
+    CHECK_EQ(digest(f.prog, d0), digest(f.prog, d1));
+    CHECK_EQ(fake.scans, 0);
+    CHECK_EQ(d1.vram_packed.units, (int64_t)0);
+    for (const MoveUnit& mu : d1.units) CHECK_EQ(mu.vram_bytes, (int64_t)0);
+}
+
+TEST(the_mover_places_and_publishes_packed_residents_as_the_card_holds_them) {
+    /* Small units on the host backend: 12 KiB gate_ups and 6 KiB downs, packed to 11 KiB + 64 and
+     * 5 KiB + 64 (each packed size off a 64-byte boundary, so the down's offset shows the alignment). */
+    Fixture f;
+    build_ds41_like(f, 2, 8, 12 * KiB, 6 * KiB);
+    Config c = base_config();
+    c.placement = "expert_tiered";
+    c.vram_weights_mib = 2;   /* the 1 MiB embedding and every unit */
+    c.host_pool_mib = 64;
+    c.deterministic = true;
+    FakePack fake;
+    fake.prog = &f.prog;
+    fake.gu = 11 * KiB + 40;
+    fake.dn = 5 * KiB + 40;
+    PlannerInput in{&f.prog, &c, 0, 1, nullptr, 0};
+    in.vram_pack = fake.fn();
+    Plan p;
+    CHECK_OK(Planner(in).plan(&p));
+    CHECK(p.vram_packed.units > 0);
+
+    Mover m;
+    MoverConfig mc;
+    CHECK_OK(m.init(f.prog, p, mc));
+    ResidencyTable* rt = m.residency();
+    const int64_t want_dn_off = align_up(fake.gu, 64);
+    int packed_units = 0;
+    std::vector<std::pair<uintptr_t, int64_t>> spans;
+    for (const MoveUnit& mu : p.units) {
+        if (mu.expert < 0 || mu.tier != Tier::VRAM) continue;
+        const WeightSlot* g = rt->lookup(mu.weights[0]);
+        const WeightSlot* d = rt->lookup(mu.weights[1]);
+        REQUIRE(g && d && g->ptr && d->ptr);
+        CHECK_EQ((uintptr_t)g->ptr % 64, (uintptr_t)0);
+        if (mu.vram_bytes > 0) {
+            ++packed_units;
+            CHECK_EQ((int64_t)((const char*)d->ptr - (const char*)g->ptr), want_dn_off);
+            spans.emplace_back((uintptr_t)g->ptr, mu.vram_bytes);
+        } else {
+            CHECK_EQ((int64_t)((const char*)d->ptr - (const char*)g->ptr), mu.offset[1]);
+        }
+    }
+    CHECK_EQ((int64_t)packed_units, p.vram_packed.units);
+    /* Each packed unit starts on its own allocation unit and no two overlap. */
+    std::sort(spans.begin(), spans.end());
+    for (size_t i = 0; i < spans.size(); ++i) {
+        CHECK_EQ(spans[i].first % RAD_ALIGN_UNIT, (uintptr_t)0);
+        if (i) CHECK(spans[i - 1].first + (uintptr_t)spans[i - 1].second <= spans[i].first);
+    }
+}
+
+TEST(the_load_packs_a_weight_and_checks_what_the_card_will_read) {
+    /* vram_pack_weight, the loader's packer: a [64, 2304] weight (down's shape: two full rounds and a partial
+     * one of 8 blocks a row) with scales at 120..121 and a few raw rounds. */
+    const int N = 64, K = 2304, UK = K / 32;
+    std::vector<uint8_t> codes((size_t)N * K / 2), scales((size_t)N * UK);
+    uint64_t z = 7;
+    auto next = [&] { z = z * 6364136223846793005ull + 1442695040888963407ull; return (uint32_t)(z >> 33); };
+    for (auto& c : codes) c = (uint8_t)next();
+    for (auto& v : scales) v = (uint8_t)(120 + (next() & 1));
+    scales[5] = 200;                          /* row 0, round 0: raw */
+    scales[(size_t)3 * UK + 70] = 2;          /* row 3, the partial round: raw */
+    scales[(size_t)40 * UK + 33] = 255;       /* row 40, round 1: raw */
+    const int cap = 4;
+    const size_t bytes = ds41hx::packed_bytes(N, K, cap);
+    REQUIRE(bytes > 0);
+    std::vector<uint8_t> dst(bytes, 0xA5);
+    int n_exc = -1;
+    CHECK_EQ(vram_pack_weight(codes.data(), scales.data(), N, K, cap, dst.data(), (int64_t)bytes, &n_exc), RAD_OK);
+    CHECK_EQ(n_exc, 3);
+    ds41hx::Mx v;
+    REQUIRE(ds41hx::packed_view(dst.data(), bytes, N, K, &v));
+    CHECK(ds41hx::packed_scales_equal(v, scales.data()));
+    CHECK_EQ(std::memcmp(v.codes, codes.data(), codes.size()), 0);
+    /* The same values as the block form, row for row (the host's reference decode of each layout). */
+    std::vector<uint16_t> x(K), y_pk(N), y_pl(N);
+    for (auto& e : x) e = (uint16_t)(0x3c00 + (next() & 0x3ff));
+    ds41hx::Mx pl;
+    pl.N = N; pl.K = K; pl.codes = codes.data(); pl.scales = scales.data();
+    ds41hx::gemv_ref(v, x.data(), y_pk.data(), 0, N);
+    ds41hx::gemv_ref(pl, x.data(), y_pl.data(), 0, N);
+    CHECK(y_pk == y_pl);
+    /* More raw rounds than room: refused, nothing claimed. */
+    std::vector<uint8_t> small(ds41hx::packed_bytes(N, K, 2));
+    CHECK_EQ(vram_pack_weight(codes.data(), scales.data(), N, K, 2, small.data(), (int64_t)small.size(), &n_exc),
+             RAD_E_FULL);
+    CHECK_EQ(n_exc, 3);
+    /* A destination short of the form, and a shape it cannot hold. */
+    CHECK_EQ(vram_pack_weight(codes.data(), scales.data(), N, K, cap, dst.data(), (int64_t)bytes - 1, &n_exc),
+             RAD_E_SHAPE);
+    CHECK_EQ(vram_pack_weight(codes.data(), scales.data(), N, K + 16, cap, dst.data(), (int64_t)bytes, &n_exc),
+             RAD_E_SHAPE);
+}
+
+TEST(the_vram_packed_switch_and_its_budget_parse) {
+    struct Env {
+        const char* k;
+        std::string old;
+        bool had;
+        explicit Env(const char* key) : k(key) { const char* o = std::getenv(k); had = o; if (o) old = o; }
+        ~Env() { if (had) ::setenv(k, old.c_str(), 1); else ::unsetenv(k); }
+    } on("RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED"), raw("RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED_RAW");
+    VramPackConfig c;
+    ::unsetenv("RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED");
+    ::unsetenv("RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED_RAW");
+    CHECK_OK(vram_pack_config(&c));
+    CHECK(!c.on);
+    ::setenv("RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED", "0", 1);
+    CHECK_OK(vram_pack_config(&c));
+    CHECK(!c.on);
+    ::setenv("RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED", "1", 1);
+    CHECK_OK(vram_pack_config(&c));
+    CHECK(c.on);
+    CHECK_EQ(c.raw[0], 512);
+    CHECK_EQ(c.raw[1], 320);
+    ::setenv("RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED_RAW", "600,3400", 1);
+    CHECK_OK(vram_pack_config(&c));
+    CHECK_EQ(c.raw[0], 600);
+    CHECK_EQ(c.raw[1], 3400);
+    ::setenv("RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED_RAW", "600", 1);
+    CHECK_EQ(vram_pack_config(&c), RAD_E_INVAL);
+    ::setenv("RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED_RAW", "512,320", 1);
+    ::setenv("RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED", "yes", 1);
+    CHECK_EQ(vram_pack_config(&c), RAD_E_INVAL);
+}
+
+/* ================================================================== which weights may be packed
+ *
+ * vram_pack_eligible decides from the declaration and the container's directory alone, before any scale
+ * is read, and it alone keeps every other reader away from a packed weight's bytes: only a trunk routed
+ * expert's ggml_mxfp4 gate_up or down, read by moe_gemm_ggml tables and nothing else, every band of each
+ * such op resolved to gemv_vp on the card, whole in the container and smaller packed. vram_pack_scan reads
+ * one weight's scales and vram_pack_query is the engine's answer to the planner from both. A container
+ * written by RadWriter, and a Program declared as deepseek41's routed layers are once the layout pass has
+ * chosen libr4d's block_mxfp4: gate_up [64, 1024] (one full round of 32 blocks a row) and down [32, 512]
+ * (a partial round of 16). */
+namespace {
+
+const RadKernelInfo g_vp_info = { kVramPackRow, "moe_gemm_ggml", "moe", "", "", "",
+                                  RAD_DOMAIN_DEVICE, 59, nullptr, 0, nullptr, 0,
+                                  nullptr, nullptr, nullptr, nullptr, nullptr, nullptr };
+const RadKernelInfo g_mx_gemv_info = { "moe_gemm_ggml_mxfp4_gemv", "moe_gemm_ggml", "moe", "", "", "",
+                                       RAD_DOMAIN_DEVICE, 58, nullptr, 0, nullptr, 0,
+                                       nullptr, nullptr, nullptr, nullptr, nullptr, nullptr };
+const RadKernelInfo g_mx_tiled_info = { "moe_gemm_ggml_mxfp4_tiled", "moe_gemm_ggml", "moe", "", "", "",
+                                        RAD_DOMAIN_DEVICE, 57, nullptr, 0, nullptr, 0,
+                                        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr };
+KernelRow g_vp_row, g_mx_gemv_row, g_mx_tiled_row;
+
+constexpr int kVpN[2] = { 64, 32 }, kVpK[2] = { 1024, 512 };   /* gate_up, down */
+
+/* `layers` routed layers of `experts` experts, a gate_up and a down each, written in movement-unit order;
+ * layers at or past `trunk` (meta.n_layers) are a draft head's. Every scale is 120 or 121 but three blocks
+ * of layer 0 expert 0's gate_up, rows 0, 5 and 40: three raw rounds. */
+struct VpModel {
+    Fixture f;
+    RadFile file;
+    std::vector<std::vector<uint8_t>> scales;   /* per weight handle, the e8m0 plane written */
+    std::vector<std::vector<rad_weight>> w;     /* [layer][2 * expert + slot] */
+    bool ok = false;
+
+    VpModel(int layers, int experts, int trunk, const char* name) {
+        g_vp_row.info = &g_vp_info;
+        g_mx_gemv_row.info = &g_mx_gemv_info;
+        g_mx_tiled_row.info = &g_mx_tiled_info;
+        f.prog.meta.n_layers = trunk;
+        RadEncoding enc{};
+        rad_enc_copy_str(enc.scheme, "affine");
+        rad_enc_add_plane(&enc, "codes", RAD_FP4E2M1, 1, 1);
+        rad_enc_add_plane(&enc, "scale", RAD_E8M0, 1, 32);
+        const std::string path = radtest::tmp_path(name);
+        RadWriter writer;
+        if (writer.begin(path.c_str()) != RAD_OK) return;
+        writer.set_arch("deepseek41");
+        writer.meta_i("n_layers", trunk);
+        uint64_t z = 11;
+        auto next = [&] { z = z * 6364136223846793005ull + 1442695040888963407ull; return (uint32_t)(z >> 33); };
+        w.assign((size_t)layers, {});
+        for (int l = 0; l < layers; ++l)
+            for (int e = 0; e < experts; ++e)
+                for (int s = 0; s < 2; ++s) {
+                    const int N = kVpN[s], K = kVpK[s];
+                    const std::string nm = fmt("blk.%d.ffn_%s_exps.%d.weight", l, s ? "down" : "gate_up", e);
+                    const rad_weight h = f.weight(nm, (int64_t)N * (K / 32) * 17, RAD_ACCESS_CONDITIONAL, l, e);
+                    WeightInfo& wi = f.prog.weights[h];
+                    wi.decl.group.slot = s;
+                    wi.source = nm;
+                    wi.enc = enc;
+                    wi.enc_known = true;
+                    wi.n_sel = 2;
+                    wi.sel[0] = 0;
+                    wi.sel[1] = 1;
+                    wi.sel_rows[0] = wi.sel_rows[1] = N;
+                    wi.sel_cols[0] = K;
+                    wi.sel_cols[1] = K / 32;
+                    wi.layout_tag = "ggml_mxfp4";
+                    wi.identity = false;   /* the loader relayouts it to block_mxfp4 */
+                    wi.stored_bytes = (int64_t)N * (K / 32) * 17;
+                    wi.align = 64;
+                    std::vector<uint8_t> codes((size_t)N * K / 2), sc((size_t)N * (K / 32));
+                    for (auto& c : codes) c = (uint8_t)next();
+                    for (auto& v : sc) v = (uint8_t)(120 + (next() & 1));
+                    if (l == 0 && e == 0 && s == 0) {
+                        sc[5] = 200;
+                        sc[(size_t)5 * 32 + 7] = 2;
+                        sc[(size_t)40 * 32 + 31] = 255;
+                    }
+                    RadWriter::Weight rw;
+                    rw.name = nm;
+                    rw.enc = enc;
+                    rw.rank = 2;
+                    rw.shape[0] = N;
+                    rw.shape[1] = K;
+                    rw.layer = l;
+                    rw.expert = e;
+                    rw.slot = s;
+                    const void* planes[2] = { codes.data(), sc.data() };
+                    if (writer.add_weight(rw, planes) < 0) return;
+                    if (scales.size() <= (size_t)h) scales.resize((size_t)h + 1);
+                    scales[(size_t)h] = std::move(sc);
+                    w[(size_t)l].push_back(h);
+                }
+        if (writer.finish() != RAD_OK) return;
+        ok = file.open(path.c_str()) == RAD_OK;
+    }
+    rad_weight at(int l, int e, int s) const { return w[(size_t)l][(size_t)(2 * e + s)]; }
+    /* A moe_gemm_ggml op whose weight table (operand 1) is layer l's gate_ups (s 0) or downs (s 1), a band
+     * a row: up to 16 tokens, then past them; a null row is a band the card has no kernel for. */
+    void op(int l, int s, const std::vector<const KernelRow*>& rows) {
+        OpInfo o;
+        o.op = "moe_gemm_ggml";
+        o.index = (int32_t)f.prog.ops.size();
+        for (size_t k = (size_t)s; k < w[(size_t)l].size(); k += 2) o.weights.push_back(w[(size_t)l][k]);
+        o.weight_opd.assign(o.weights.size(), 1);
+        int64_t hi = 16;
+        for (const KernelRow* r : rows) {
+            Band b;
+            b.hi = hi;
+            b.span = hi == 16 ? "M <= 16" : "M in (16, 1048576]";
+            if (r) b.dom[RAD_DOMAIN_DEVICE].row = r;
+            else b.miss[RAD_DOMAIN_DEVICE] = "no device kernel";
+            o.bands.push_back(b);
+            hi = 1 << 20;
+        }
+        f.prog.ops.push_back(o);
+    }
+};
+
+bool listed(const std::vector<rad_weight>& v, rad_weight w) { return std::find(v.begin(), v.end(), w) != v.end(); }
+
+}  /* namespace */
+
+TEST(vram_pack_eligible_packs_only_what_gemv_vp_tables_alone_read) {
+    VpModel m(3, 4, 2, "vp_eligible.rad");
+    REQUIRE(m.ok);
+    /* Layer 0: both ops gemv_vp. Layer 1: the gate_up op has a band past 16 tokens the tiled row took, so
+     * that band reads its table as block_mxfp4; the down op is gemv_vp, but expert 3's down is also a
+     * dense op's operand. Layer 2: a draft head's experts, though gemv_vp tables read them. */
+    m.op(0, 0, { &g_vp_row });
+    m.op(0, 1, { &g_vp_row });
+    m.op(1, 0, { &g_vp_row, &g_mx_tiled_row });
+    m.op(1, 1, { &g_vp_row });
+    m.f.op("gemm", { m.at(1, 3, 1) }, false);
+    m.op(2, 0, { &g_vp_row });
+    m.op(2, 1, { &g_vp_row });
+    /* Two the gemv_vp tables alone read that the form cannot take: one stored as the container holds it
+     * (the file tier would read it in place), and one this rank holds half of. */
+    m.f.prog.weights[m.at(0, 2, 0)].identity = true;
+    WeightInfo& half = m.f.prog.weights[m.at(0, 3, 1)];
+    half.sel_rows[0] = half.sel_rows[1] = kVpN[1] / 2;
+    half.stored_bytes /= 2;
+
+    VramPackConfig cfg;
+    cfg.on = true;
+    cfg.raw[0] = 16;
+    cfg.raw[1] = 4;
+    std::vector<VramPackWeight> t;
+    std::string why;
+    vram_pack_eligible(m.f.prog, m.file, cfg, &t, &why);
+    REQUIRE(t.size() == m.f.prog.weights.size());
+    const std::vector<rad_weight> want = { m.at(0, 0, 0), m.at(0, 1, 0), m.at(0, 3, 0), m.at(0, 0, 1),
+                                           m.at(0, 1, 1), m.at(0, 2, 1), m.at(1, 0, 1), m.at(1, 1, 1),
+                                           m.at(1, 2, 1) };
+    int packed = 0;
+    for (rad_weight h = 1; (size_t)h < t.size(); ++h) {
+        const VramPackWeight& v = t[(size_t)h];
+        const WeightInfo& wi = m.f.prog.weights[h];
+        if (!listed(want, h)) {
+            if (v.bytes != 0) std::printf("  %s is eligible and should not be\n", wi.name.c_str());
+            CHECK_EQ(v.bytes, (int64_t)0);
+            continue;
+        }
+        ++packed;
+        const int s = wi.decl.group.slot;
+        CHECK_EQ(v.bytes, (int64_t)ds41hx::packed_bytes(kVpN[s], kVpK[s], cfg.raw[s]));
+        CHECK(v.bytes > 0 && v.bytes < wi.stored_bytes);
+        CHECK_EQ(v.cap, cfg.raw[s]);
+        CHECK_EQ(v.N, kVpN[s]);
+        CHECK_EQ(v.K, kVpK[s]);
+        const RadFileEntry* e = m.file.find(wi.source);
+        REQUIRE(e != nullptr);
+        CHECK_EQ(v.scales_off, m.file.plane(*e, 1).offset);
+        CHECK_EQ(v.scales_bytes, (int64_t)kVpN[s] * (kVpK[s] / 32));
+    }
+    CHECK_EQ(packed, 9);
+    /* The startup log says why the rest stay block_mxfp4. */
+    CHECK(why.find("1 routed moe_gemm_ggml op(s) have a band moe_gemm_ggml_mxfp4_gemv_vp does not serve") !=
+          std::string::npos);
+    CHECK(why.find("M in (16, 1048576]: moe_gemm_ggml_mxfp4_tiled") != std::string::npos);
+    CHECK(why.find("10 of the 19 weights the gemv_vp tables read stay block_mxfp4: 8 not a trunk expert's "
+                   "gate_up or down, 1 not ggml_mxfp4 over fp4 codes and e8m0 planes, 1 not whole in the "
+                   "container, 0 no smaller packed") != std::string::npos);
+    if (why.find("10 of the 19") == std::string::npos) std::printf("  why: %s\n", why.c_str());
+
+    /* Room for so many raw rounds that the form is no smaller than block_mxfp4: nothing packs. */
+    cfg.raw[0] = cfg.raw[1] = 64;
+    vram_pack_eligible(m.f.prog, m.file, cfg, &t, &why);
+    for (const VramPackWeight& v : t) CHECK_EQ(v.bytes, (int64_t)0);
+    CHECK(why.find("19 of the 19 weights") != std::string::npos);
+    CHECK(why.find("9 no smaller packed") != std::string::npos);
+
+    /* Off: nothing, and nothing to say. */
+    cfg.on = false;
+    vram_pack_eligible(m.f.prog, m.file, cfg, &t, &why);
+    REQUIRE(t.size() == m.f.prog.weights.size());
+    for (const VramPackWeight& v : t) CHECK_EQ(v.bytes, (int64_t)0);
+    CHECK(why.empty());
+}
+
+TEST(vram_pack_eligible_refuses_a_table_any_other_row_or_position_reads) {
+    VpModel m(2, 2, 2, "vp_readers.rad");
+    REQUIRE(m.ok);
+    /* The plain gemv row (the fact unset), a band past 16 tokens the card has no kernel for (the host's),
+     * and a table position other than the weight table (operand 2) beside gemv_vp tables. */
+    m.op(0, 0, { &g_mx_gemv_row });
+    m.op(0, 1, { &g_vp_row, nullptr });
+    m.op(1, 0, { &g_vp_row });
+    m.f.prog.ops.back().weight_opd[1] = 2;
+    m.op(1, 1, { &g_vp_row });
+    VramPackConfig cfg;
+    cfg.on = true;
+    cfg.raw[0] = 16;
+    cfg.raw[1] = 4;
+    std::vector<VramPackWeight> t;
+    std::string why;
+    vram_pack_eligible(m.f.prog, m.file, cfg, &t, &why);
+    REQUIRE(t.size() == m.f.prog.weights.size());
+    const std::vector<rad_weight> want = { m.at(1, 0, 0), m.at(1, 0, 1), m.at(1, 1, 1) };
+    for (rad_weight h = 1; (size_t)h < t.size(); ++h) {
+        if ((t[(size_t)h].bytes > 0) != listed(want, h))
+            std::printf("  %s: %lld bytes packed\n", m.f.prog.weights[h].name.c_str(),
+                        (long long)t[(size_t)h].bytes);
+        CHECK_EQ(t[(size_t)h].bytes > 0, listed(want, h));
+    }
+    CHECK(why.find("2 routed moe_gemm_ggml op(s) have a band") != std::string::npos);
+    CHECK(why.find("the first: op 0 (M <= 16: moe_gemm_ggml_mxfp4_gemv)") != std::string::npos);
+
+    /* No op reads a weight table: nothing, and the log says so. */
+    Fixture empty;
+    vram_pack_eligible(empty.prog, m.file, cfg, &t, &why);
+    CHECK_EQ(t.size(), (size_t)1);
+    CHECK(why.find("no moe_gemm_ggml op reads a weight table") != std::string::npos);
+}
+
+TEST(the_scan_reads_a_weights_scales_and_the_query_keeps_one_over_its_room_block) {
+    VpModel m(1, 2, 1, "vp_scan.rad");
+    REQUIRE(m.ok);
+    m.op(0, 0, { &g_vp_row });
+    m.op(0, 1, { &g_vp_row });
+    VramPackConfig cfg;
+    cfg.on = true;
+    cfg.raw[0] = 16;
+    cfg.raw[1] = 4;
+    std::vector<VramPackWeight> t;
+    std::string why;
+    vram_pack_eligible(m.f.prog, m.file, cfg, &t, &why);
+    CHECK(why.empty());
+    const rad_weight raw3 = m.at(0, 0, 0), plain = m.at(0, 1, 0), down = m.at(0, 1, 1);
+    REQUIRE(t[raw3].bytes > 0 && t[plain].bytes > 0 && t[down].bytes > 0);
+
+    /* The scan: the raw rounds ds41hx::pack_plan finds in the container's scales, left in buf. */
+    std::vector<uint8_t> buf;
+    CHECK_EQ(vram_pack_scan(m.file, t[raw3], &buf), 3);
+    CHECK(buf == m.scales[raw3]);
+    CHECK_EQ(vram_pack_scan(m.file, t[plain], &buf), 0);
+    CHECK(buf == m.scales[plain]);
+    CHECK_EQ(vram_pack_scan(m.file, t[down], &buf), 0);
+    CHECK(buf == m.scales[down]);
+
+    /* The planner's question: unscanned, the table's answer and nothing read; scanned, the same within
+     * the room. */
+    int32_t cap = -9, raw = -9;
+    CHECK_EQ(vram_pack_query(m.file, t, raw3, false, &cap, &raw, &buf), t[raw3].bytes);
+    CHECK_EQ(cap, 16);
+    CHECK_EQ(raw, -9);
+    CHECK_EQ(vram_pack_query(m.file, t, raw3, true, &cap, &raw, &buf), t[raw3].bytes);
+    CHECK_EQ(raw, 3);
+    CHECK_EQ(vram_pack_query(m.file, t, down, true, &cap, &raw, &buf), t[down].bytes);
+    CHECK_EQ(cap, 4);
+    CHECK_EQ(raw, 0);
+
+    /* Room for two raw rounds: eligible from the declaration, but the scan finds three, so the weight
+     * stays block_mxfp4 (0) and says how many it needs; its neighbour packs. */
+    cfg.raw[0] = 2;
+    std::vector<VramPackWeight> t2;
+    vram_pack_eligible(m.f.prog, m.file, cfg, &t2, &why);
+    REQUIRE(t2[raw3].bytes > 0);
+    CHECK_EQ(vram_pack_query(m.file, t2, raw3, false, &cap, &raw, &buf), t2[raw3].bytes);
+    CHECK_EQ(vram_pack_query(m.file, t2, raw3, true, &cap, &raw, &buf), (int64_t)0);
+    CHECK_EQ(cap, 2);
+    CHECK_EQ(raw, 3);
+    CHECK_EQ(vram_pack_query(m.file, t2, plain, true, &cap, &raw, &buf), t2[plain].bytes);
+    CHECK_EQ(raw, 0);
+
+    /* Not eligible, or past the table: 0, nothing set. */
+    cap = raw = -9;
+    const std::vector<VramPackWeight> none(t.size());
+    CHECK_EQ(vram_pack_query(m.file, none, raw3, true, &cap, &raw, &buf), (int64_t)0);
+    CHECK_EQ(vram_pack_query(m.file, t, (rad_weight)t.size(), true, &cap, &raw, &buf), (int64_t)0);
+    CHECK_EQ(cap, -9);
+    CHECK_EQ(raw, -9);
+
+    /* Unreadable scales (past the container's end) or a plane of the wrong size: -1, and the query keeps
+     * the weight block_mxfp4. */
+    std::vector<VramPackWeight> bad = t;
+    bad[raw3].scales_off = (uint64_t)m.file.size();
+    CHECK_EQ(vram_pack_scan(m.file, bad[raw3], &buf), -1);
+    CHECK_EQ(vram_pack_query(m.file, bad, raw3, true, &cap, &raw, &buf), (int64_t)0);
+    CHECK_EQ(raw, -1);
+    bad[raw3] = t[raw3];
+    bad[raw3].scales_bytes -= 1;
+    CHECK_EQ(vram_pack_scan(m.file, bad[raw3], &buf), -1);
 }
 
 RAD_TEST_MAIN()

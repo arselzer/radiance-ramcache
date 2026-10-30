@@ -136,6 +136,7 @@ void Metrics::sample(const SchedMetrics& m) {
     g_kv_util_.set(m.kv_util);
     g_kv_max_tokens_.set((double)m.kv_tokens_max);
     g_kv_max_bytes_.set((double)m.kv_bytes_carved);
+    g_kv_resident_blocks_.set((double)m.kv_resident_blocks);
     g_prefix_hit_.set(m.prefix_hit_rate);
     g_prefill_tps_.set(m.prefill_tps);
     g_decode_tps_.set(m.decode_tps);
@@ -179,8 +180,31 @@ void Metrics::sample(const SchedMetrics& m) {
     c_decode_tokens_.advance_to(m.decode_tokens);
     c_draft_tokens_.advance_to(m.draft_tokens);
     c_draft_accepted_.advance_to(m.draft_accepted);
+    if (m.draft_origin.enabled) {
+        g_draft_compute_off_.set(m.draft_origin.compute_off ? 1 : 0);
+        g_draft_verify_cap_.set(m.draft_origin.verify_cap);
+        c_origin_learned_publications.advance_to(m.draft_origin.learned_publications);
+        c_origin_learned_published_tokens.advance_to(m.draft_origin.learned_published_tokens);
+        c_origin_fallback_offers.advance_to(m.draft_origin.fallback_offers);
+        c_origin_fallback_offered_tokens.advance_to(m.draft_origin.fallback_offered_tokens);
+        c_origin_fallback_publications.advance_to(m.draft_origin.fallback_publications);
+        c_origin_fallback_published_tokens.advance_to(m.draft_origin.fallback_published_tokens);
+        c_origin_learned_verified_tokens.advance_to(m.draft_origin.learned_verified_tokens);
+        c_origin_learned_accepted_tokens.advance_to(m.draft_origin.learned_accepted_tokens);
+        c_origin_fallback_verified_tokens.advance_to(m.draft_origin.fallback_verified_tokens);
+        c_origin_fallback_accepted_tokens.advance_to(m.draft_origin.fallback_accepted_tokens);
+        c_origin_block_context_issues.advance_to(m.draft_origin.block_context_issues);
+        c_origin_block_context_rows.advance_to(m.draft_origin.block_context_rows);
+        c_origin_block_query_issues.advance_to(m.draft_origin.block_query_issues);
+        c_origin_block_query_rows.advance_to(m.draft_origin.block_query_rows);
+        draft_origin_on_.store(true, std::memory_order_release);
+    }
     c_draft_refills_.advance_to(m.draft_refills);
     c_draft_refill_tokens_.advance_to(m.draft_refill_tokens);
+    c_lookup_proposals_.advance_to(m.lookup_proposals);
+    c_lookup_held_.advance_to(m.lookup_held);
+    c_lookup_held_drafts_.advance_to(m.lookup_held_drafts);
+    c_lookup_held_hits_.advance_to(m.lookup_held_hits);
     c_attn_cached_.advance_to(m.attn_cached_tokens);
     c_linear_cached_.advance_to(m.linear_cached_tokens);
     c_checkpoints_.advance_to(m.checkpoints_written);
@@ -200,6 +224,8 @@ void Metrics::sample(const SchedMetrics& m) {
     c_cut_resumed_below_.advance_to(m.hit_cut_resumed_below);
     c_restore_cuts_.advance_to(m.prefix_restore_cuts);
     c_cut_tokens_.advance_to(m.hit_cut_tokens);
+    c_kv_stream_misses_.advance_to((double)m.kv_stream_misses);
+    c_kv_stream_bytes_.advance_to((double)m.kv_stream_bytes_in);
     g_linear_hit_.set(m.linear_hit_rate);
 }
 
@@ -281,6 +307,20 @@ std::string Metrics::render() const {
     w.gauge("radiance:kv_cache_max_bytes",
             "VRAM the KV cache holds with every block it lends the experts taken back, one card.",
             L, g_kv_max_bytes_.get());
+    w.gauge("radiance:kv_resident_blocks",
+            "Blocks of every streamed KV group the device ring holds; 0 when no group streams.",
+            L, g_kv_resident_blocks_.get());
+    w.counter("radiance:kv_stream_misses_total",
+              "Blocks copied into a streamed KV group's ring from the host mirror.",
+              L, c_kv_stream_misses_.get());
+    /* Labelled by direction; the resolve only copies in. */
+    w.help("radiance:kv_stream_bytes_total",
+           "Bytes a streamed KV group's resolve moved, by direction.", "counter");
+    w.out += "radiance:kv_stream_bytes_total";
+    w.out += L.substr(0, L.size() - 1);
+    w.out += ",dir=\"in\"} ";
+    w.out += num(c_kv_stream_bytes_.get());
+    w.out += '\n';
     w.gauge("vllm:gpu_prefix_cache_hit_rate",
             "GPU prefix cache block hit rate.", L, g_prefix_hit_.get());
 
@@ -393,12 +433,60 @@ std::string Metrics::render() const {
     w.counter("radiance:draft_accepted_total",
               "Speculative tokens accepted; the pair the acceptance ratio is computed from.",
               L, c_draft_accepted_.get());
+    if (draft_origin_on_.load(std::memory_order_acquire)) {
+        w.gauge("radiance:experimental_draft_compute_off",
+                "Runtime drafting disabled while declared speculative geometry is retained.",
+                L, g_draft_compute_off_.get());
+        w.gauge("radiance:experimental_draft_verify_cap",
+                "Configured private verify cap0..5, or minus1 for no experimental cap; not a measured depth histogram.",
+                L, g_draft_verify_cap_.get());
+        w.counter("radiance:experimental_draft_learned_publications_total",
+                  "Positive head proposals successfully installed on the host; may be overwritten or unused.", L, c_origin_learned_publications.get());
+        w.counter("radiance:experimental_draft_learned_published_tokens_total",
+                  "Head tokens successfully installed, after caps; not necessarily verified.", L, c_origin_learned_published_tokens.get());
+        w.counter("radiance:experimental_draft_fallback_offers_total",
+                  "Positive lookup or debug-oracle offers before gate, budget and context caps.", L, c_origin_fallback_offers.get());
+        w.counter("radiance:experimental_draft_fallback_offered_tokens_total",
+                  "Lookup or debug-oracle tokens offered before final caps; not necessarily verified.", L, c_origin_fallback_offered_tokens.get());
+        w.counter("radiance:experimental_draft_fallback_publications_total",
+                  "Lookup or debug-oracle proposals installed in a StepPlan after gates, caps and KV reservation; not necessarily issued or committed.", L, c_origin_fallback_publications.get());
+        w.counter("radiance:experimental_draft_fallback_published_tokens_total",
+                  "Lookup or debug-oracle tokens installed in a StepPlan after final caps; not necessarily issued or committed.", L, c_origin_fallback_published_tokens.get());
+        w.counter("radiance:experimental_draft_learned_verified_tokens_total",
+                  "Committed verify tokens tagged head-origin by the immutable step entry.", L, c_origin_learned_verified_tokens.get());
+        w.counter("radiance:experimental_draft_learned_accepted_tokens_total",
+                  "Accepted head-origin tokens at the aggregate draft commit point.", L, c_origin_learned_accepted_tokens.get());
+        w.counter("radiance:experimental_draft_fallback_verified_tokens_total",
+                  "Committed verify tokens tagged lookup or debug-oracle origin.", L, c_origin_fallback_verified_tokens.get());
+        w.counter("radiance:experimental_draft_fallback_accepted_tokens_total",
+                  "Accepted lookup or debug-oracle tokens at the aggregate draft commit point.", L, c_origin_fallback_accepted_tokens.get());
+        w.counter("radiance:experimental_draft_block_context_issues_total",
+                  "Block context passes issued with known0 status on every rank, not completed GPU passes.", L, c_origin_block_context_issues.get());
+        w.counter("radiance:experimental_draft_block_context_rows_total",
+                  "Rows in known0 all-rank block context issues, counted once rather than per rank.", L, c_origin_block_context_rows.get());
+        w.counter("radiance:experimental_draft_block_query_issues_total",
+                  "Block query passes issued with known0 status on every rank, not completed GPU passes.", L, c_origin_block_query_issues.get());
+        w.counter("radiance:experimental_draft_block_query_rows_total",
+                  "Rows in known0 all-rank block query issues, counted once rather than per rank.", L, c_origin_block_query_rows.get());
+    }
     w.counter("radiance:draft_refills_total",
               "Prefix hits ended a drafter window early so a windowed block drafter has context.",
               L, c_draft_refills_.get());
     w.counter("radiance:draft_refill_tokens_total",
               "Cached prompt tokens those hits gave back to be recomputed.",
               L, c_draft_refill_tokens_.get());
+    w.counter("radiance:lookup_proposals_total",
+              "Prompt-lookup proposals made, with prompt lookup the only drafter.",
+              L, c_lookup_proposals_.get());
+    w.counter("radiance:lookup_held_total",
+              "Prompt-lookup proposals held back unverified: not expected to pay for their "
+              "verify rows at the measured step cost.", L, c_lookup_held_.get());
+    w.counter("radiance:lookup_held_drafts_total",
+              "Drafts in the held-back proposals.", L, c_lookup_held_drafts_.get());
+    w.counter("radiance:lookup_held_hits_total",
+              "Of the held-back proposals scored against the text that followed, the drafts "
+              "that came true: what verifying them would have accepted.",
+              L, c_lookup_held_hits_.get());
 
     /* Decoupled prefix caching (spec §7.3). vllm:gpu_prefix_cache_hit_rate is the attention hit
      * rate, as in vLLM. The linear side hits at a different granularity (whole checkpoints, not

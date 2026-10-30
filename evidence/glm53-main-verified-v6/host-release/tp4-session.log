@@ -1,8 +1,0 @@
-RAM_ADMISSION MemAvailable=10224209920
-I device: host backend, 1 device(s) [0:host]
-E declare: GLM TP4 cache requires metadata-first verified source admission
-E declare: GLM TP4 cache profile after declare finished
-E declare: GLM TP4 cache profile cannot replace PermanentV1
-E declare: PermanentV1 and GLM TP4 cache fail-stop are separate profiles
-E experimental GLM TP4 cache is closed: complete verified four-rank source/placement factory is not implemented
-PASS actual Core TP4 protocol groups=5 checks=165 refusals=33; runtime source gate CLOSED, no model/GPU inference claim

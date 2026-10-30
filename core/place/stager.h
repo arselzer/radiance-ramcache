@@ -88,6 +88,7 @@
 #include "ep_route_counts.h"
 #include "dspark_head_tail.h"
 #include "host_expert_pool.h"
+#include "card_expert_stager.h"
 #include "hx_fetch_list.h"
 #include "hx_side_store.h"
 #include "readahead.h"
@@ -498,7 +499,13 @@ public:
     bool begin_pass(const RadBatch* b) override;
     int  before_op(rad_op h, RadStream s, bool* resync) override;
     int  operands(rad_op h, RadStream s, const RadTensor* t, int n_t) override;
+    int  launched(rad_op h, RadStream s, const RadArgs* a, int (*launch)(const RadArgs*, RadStream)) override;
+    int  after_op(rad_op h, RadStream s) override;
     int  end_pass(RadStream s) override;
+    /* ---- prefill Phase 1 (card_expert_stager.h): RADIANCE_EXPERIMENTAL_DS41_P1=1 beside LCP ----------
+     * p1_on: this rank took it (p1_init); p1_stats_line: kLogStats's line for the shutdown. */
+    bool p1_on() const { return p1_ && p1_->on(); }
+    std::string p1_stats_line() const;
     //Must run before Ctx::shutdown and before Mover/bank/buffer owners disappear.
     int shutdown_head_cache();
 
@@ -568,6 +575,43 @@ private:
      * requires the CPU to take every routed unit, and says what was admitted (lcp_report). */
     int  lcp_init(const Program& prog, int64_t C);
     void lcp_report() const;
+    /* ---- prefill Phase 1 (card_expert_stager.h) -------------------------------------------------
+     *
+     * Under RADIANCE_EXPERIMENTAL_DS41_P1=1 (p1_state_ 1, read at lcp_init), lcp_init admits the P1
+     * twin above 16 rows (ds41p1::kTwinRow, refusing LCP's own twin) and the packed residents' gemv_vp
+     * at 16 or fewer; hx_init needs the CPU to take only passes of up to 16 tokens; p1_init then
+     * checks the rest (every routed layer's three expert ops found, no pooled routed unit, the ring,
+     * the tunables) and starts the path. An armed pass (p1_armed_: a pure prefill pass of at least
+     * ds41p1::kMinArmRows tokens) hands each routed layer to the path at start_ep_routed (p1_layer),
+     * captures the layer's three launches (launched) and runs its waves behind its down projection
+     * (after_op). */
+    int  p1_state_ = 0;
+    std::unique_ptr<p1::CardExpertPath> p1_;
+    bool p1_armed_ = false;
+    int32_t p1_li_ = -1;                 /* the layer the path holds this pass, or -1 */
+    int  p1_units_ = 0;                  /* its units on the ring */
+    struct P1Ops { int32_t sw = -1, dn = -1; };
+    std::vector<P1Ops> p1_ops_;          /* by routed layer */
+    RadEvent p1_end_ = nullptr;          /* behind an armed pass's last reader of the ring */
+    std::vector<int32_t> p1_nonres_, p1_ahead_;
+    bool p1_order_ = false;              /* this layer's sorted order fetched for the admission */
+    int64_t p1_pass_rows_ = 0;
+    std::chrono::steady_clock::time_point p1_t0_{};
+    uint64_t p1_touched_ = 0, p1_slab_ = 0, p1_order_moved_ = 0, p1_layers_ = 0;
+    int  p1_init(const Program& prog);
+    int  p1_layer(int32_t li, RadStream s);
+    bool p1_admits(int32_t li, int32_t e) const;
+    /* ..._P1_VERIFY=N: after a layer's waves, N of its RAM-cache units' expert-rows recomputed by the
+     * CPU pool from the cache's bytes (borrowed again, read-only) and compared with the card's down
+     * rows; the pass waits for the readback. Drive units are not sampled (their pinned slot is reused
+     * by then). */
+    int  p1_verify(int32_t li, RadStream s);
+    std::vector<uint8_t> p1_ram_;        /* parallel to p1_nonres_: a RAM-cache hit */
+    int32_t*  p1_vidx_ = nullptr;        /* pinned: the sorted order and the offsets */
+    uint16_t* p1_vx_ = nullptr;          /* pinned: the sampled token rows */
+    uint16_t* p1_vy_ = nullptr;          /* pinned: the card's down rows */
+    uint16_t* p1_vh_ = nullptr;          /* the host's */
+    RadEvent  p1_vev_ = nullptr;
     int64_t lcp_ = 0;                  /* C once lcp_init admitted it, else 0 */
     int64_t lcp_reach_ = 0;            /* the twin's bound, as its bands state it */
     int     lcp_moe_ = 0, lcp_twin_ = 0, lcp_split_ = 0, lcp_runs_ = 0, lcp_ops_ = 0, lcp_pair_ops_ = 0;

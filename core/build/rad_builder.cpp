@@ -12,6 +12,7 @@
 #include "kvstream/bringup.h"
 #include "lora/lora.h"
 #include "../device/device.h"
+#include "ds41_p1.h"
 
 #include <algorithm>
 #include <climits>
@@ -2443,6 +2444,34 @@ void Builder::finish_buffer_liveness() {
          * sharing; the undeclared-use guard in core/runtime/issue.cpp enforces it. The pooled
          * output likewise: the engine reads it after the last op. */
         if ((rad_buf)i == prog_.logits_buf || (rad_buf)i == prog_.pooled_buf) b.last_use = last_op;
+    }
+
+    /* RADIANCE_EXPERIMENTAL_DS41_P1=1 (core/place/card_expert_stager.h): the file stager launches a
+     * routed layer's gate_up and SwiGLU again right behind its down projection, in waves, so every
+     * buffer those two read or write -- the MoE input rows, the gate_up rows, the sorted order -- must
+     * stay its own until the down projection: none may share bytes with the down projection's output
+     * or anything else that starts there. Their lives are stretched to it. Only the arena's packing
+     * changes, never a kernel's bytes; with the switch off nothing here runs. */
+    if (ds41p1::env_state(std::getenv(ds41p1::kEnv)) == 1) {
+        for (size_t o = 1; o < prog_.ops.size() && o < op_bufs_.size(); ++o) {
+            const OpInfo& gu = prog_.ops[o];
+            const char* ord = gu.base.get_s("a_order");
+            const char* ty = gu.base.get_s("type");
+            if (gu.op != "moe_gemm_ggml" || !ord || std::strcmp(ord, "token") || !ty || std::strcmp(ty, "mxfp4"))
+                continue;
+            size_t dn = 0;
+            for (size_t d = o + 1; d < prog_.ops.size() && d <= o + 8; ++d) {
+                const char* od = prog_.ops[d].base.get_s("a_order");
+                if (prog_.ops[d].op == "moe_gemm_ggml" && od && !std::strcmp(od, "sorted")) { dn = d; break; }
+            }
+            if (!dn) continue;
+            for (size_t k = o; k < dn && k < op_bufs_.size(); ++k)
+                for (const std::vector<rad_buf>* v : { &op_bufs_[k].reads, &op_bufs_[k].writes })
+                    for (rad_buf h : *v) {
+                        BufferInfo& b = prog_.buffers[h];
+                        if (b.decl.kind == RAD_BUF_TRANSIENT && b.last_use < (int32_t)dn) b.last_use = (int32_t)dn;
+                    }
+        }
     }
 
     /* Region 1 holds what an op the second lane may issue asks for (Program::scratch_bytes_lane1):

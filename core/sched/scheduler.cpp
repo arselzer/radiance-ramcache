@@ -3,6 +3,7 @@
 #include "scheduler.h"
 #include "mm/processor.h"
 #include "place/ep_route_counts.h"
+#include "sched/p1_chunk.h"
 
 #include "server/sink.h"
 
@@ -119,6 +120,33 @@ int Scheduler::lcp_init(const Program& prog, const Config& cfg, const std::vecto
         return RAD_E_INVAL;
     }
     lcp_ = C;
+    /* Prefill Phase 1 (RADIANCE_EXPERIMENTAL_DS41_P1=1, the file stager's p1_init): chunks aligned to the
+     * prompt's end unless ..._P1_ALIGN=start or --prefix-resume exact; a checkpoint interval of at least
+     * C (end-aligned chunks then write a snapshot only where one ends on it, and at the prompt's tail). */
+    p1_end_ = false;
+    p1_grid_ = p1_grid();
+    if (ds41p1::env_state(std::getenv(ds41p1::kEnv)) == 1) {
+        const char* al = std::getenv(ds41p1::kAlignEnv);
+        if (al && *al && std::strcmp(al, "end") && std::strcmp(al, "start")) {
+            RAD_ERR("%s=%s: end or start", ds41p1::kAlignEnv, al);
+            return RAD_E_INVAL;
+        }
+        if (periodic && I < C) {
+            RAD_ERR("%s=1 beside %s=%lld refused: the checkpoint interval %lld is below the chunk: give "
+                    "--checkpoint-interval %lld or more (the Lc arms pass --max-num-batched-tokens %lld, and the "
+                    "default interval is 2048)", ds41p1::kEnv, kLcpEnv, (long long)C, (long long)I, (long long)C,
+                    (long long)C);
+            lcp_ = 0;
+            return RAD_E_INVAL;
+        }
+        const bool start = al && !std::strcmp(al, "start");
+        p1_end_ = !start && !geo_.exact;
+        RAD_INFO("ds41 p1: a lone prompt's chunks are %s%s", p1_end_ ? "aligned to its end" : "aligned to the start",
+                 start ? fmt(" (%s=start)", ds41p1::kAlignEnv).c_str()
+                 : geo_.exact ? " (--prefix-resume exact resumes on the start-aligned chunks' grid)"
+                              : fmt(": the first is cut so the last is full, every chunk ending on a %lld-token grid",
+                                    (long long)p1_grid_).c_str());
+    }
     /* RADIANCE_EXPERIMENTAL_DS41_LCP_ADMIT: the RAM cache admits a chunk's units from the prompt's last
      * N tokens only (128), none (0) or all (`all`, as at 16-token passes). */
     int64_t admit = 128;
@@ -1488,6 +1516,32 @@ int64_t Scheduler::plan_chunk(int64_t n_computed, int64_t n_target, int64_t budg
     if (checkpoint_pos) *checkpoint_pos = -1;
     int64_t remaining = n_target - n_computed;
     if (remaining <= 0 || budget <= 0) return 0;
+
+    /* Prefill Phase 1's end-aligned chunks (p1_end_, sched/p1_chunk.h), at the whole step only: the
+     * cut that makes the prompt's last chunk full, every chunk ending on p1_grid_ (the quantum's
+     * multiple); a snapshot where a chunk ends on the interval, at the prompt's tail (the tail rule
+     * below), and where the request asked (keep_at). Never under --prefix-resume exact (lcp_init). */
+    if (p1_end_ && lcp_ > 0 && budget >= lcp_ && !geo_.exact) {
+        int64_t want = p1::end_aligned_chunk(n_computed, n_target, lcp_, p1_grid_);
+        if (want <= 0) return 0;
+        if (geo_.checkpoints()) {
+            const int64_t I = geo_.checkpoint_interval;
+            const bool periodic = !geo_.window_ckpt || geo_.window_periodic;
+            const int64_t tail = tail_checkpoint(n_target);
+            if (n_computed + want == n_target && tail > n_computed && tail < n_target) {
+                want = tail - n_computed;
+                if (checkpoint_pos) *checkpoint_pos = tail;
+            } else if (periodic && (n_computed + want) % I == 0) {
+                if (checkpoint_pos) *checkpoint_pos = n_computed + want;
+            }
+            const int64_t keep = keep_at / geo_.quantum * geo_.quantum;
+            if (keep > n_computed && keep < n_computed + want && keep <= n_target) {
+                want = keep - n_computed;
+                if (checkpoint_pos) *checkpoint_pos = keep;
+            }
+        }
+        return want;
+    }
 
     int64_t want = remaining < budget ? remaining : budget;
 

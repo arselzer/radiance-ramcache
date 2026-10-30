@@ -152,6 +152,8 @@ Engine::~Engine() {
                          "kept readers (..._MISS_POST; between choose and submit, in neither)",
                          (double)ep.d_miss_post_ns * 1e-3 / (double)ep.d_reads);
         }
+        /* Prefill Phase 1 (place/card_expert_stager.h): each rank's line (ds41p1::kLogStats). */
+        if (r->fstager.p1_on()) RAD_INFO("%s", r->fstager.p1_stats_line().c_str());
         const auto& hx = r->fstager.host_stats();
         if (r->fstager.host_experts())
             RAD_INFO("host experts: %llu layers handed %llu experts (%llu rows) to the CPU; "

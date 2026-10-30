@@ -817,3 +817,15 @@ foreach(cost IN ITEMS kbench_ref:500 r4d_selftest:350 r4d_emu_attn_sweep:80 kben
     set_tests_properties(${t} PROPERTIES COST ${c})
   endif()
 endforeach()
+
+# ---- P1 (S)
+# Prefill Phase 1's stager and end-aligned chunks (core/place/card_expert_stager.h, core/sched/p1_chunk.h):
+# p1_stager_test (the scheduling on a simulated card, the ring stress, the tunables, the admission) and
+# p1_chunk_test (Scheduler::plan_chunk's end alignment on the scheduler fakes), registered by the glob
+# above. Host only: the cards hidden, in the fast tier.
+foreach(t p1_stager_test p1_chunk_test)
+  if(TEST ${t})
+    set_property(TEST ${t} APPEND PROPERTY ENVIRONMENT "ROCR_VISIBLE_DEVICES=99")
+    set_property(TEST ${t} APPEND PROPERTY LABELS fast)
+  endif()
+endforeach()

@@ -89,6 +89,21 @@
 # `sweep0` on card 0 (TALL_LIBR4D and TALL_CHECK named, as for `tall`), and an Lc arm runs only on the
 # libr4d.so (sha256) those passed on, at a chunk of at most LCP_CHECK_C.
 #
+# P1 (prefill Phase 1, RADIANCE_EXPERIMENTAL_DS41_P1=1; core/place/card_expert_stager.h): with an LcN part,
+# every routed expert row of a pure prefill pass above 16 tokens on the cards (residents in place, RAM-cache
+# units and drive misses through a VRAM ring of the file buffers, waves of a few units); needs BN with N >= 2
+# (the ring: B6, 12 slots, is the measured one) and an M part of 16 or more (the CPU path takes the passes of
+# up to 16 tokens); no Mr part is needed. QwN units a wave (..._P1_WAVE, 2), QiN drive units in flight a
+# rank (..._P1_INFLIGHT, 16), QrN pinned ready slots a rank (..._P1_READY, 6), QaN units read ahead
+# (..._P1_AHEAD, 8; Qa0 off), QvN expert-rows a layer recomputed on the host (..._P1_VERIFY, 0), Qs chunks
+# aligned to the start (..._P1_ALIGN=start; end by default); each needs P1. Every other arm states
+# RADIANCE_EXPERIMENTAL_DS41_P1=0 and the Q knobs empty. A P1 arm is measured only if the server logs
+# "ds41 p1: card experts on" at startup (and a plain arm only without it), and runs only on the libr4d.so
+# (sha256) on which `p1` in DEVICE_CHECKS passed (ds41_mxfp4_device_check TALL_LIBR4D p1 P1_CHECK_M
+# P1_ROUTES on card 0, "p1: PASS" its last line; P1_CHECK_M 4096 by default, P1_ROUTES a p0_tables.py
+# routes file, none by default); an Lc2048 arm needs LCP_CHECK_C=2048 as before. The window log takes each
+# P1 arm's "ds41 p1 stats, rank" and "ds41 p1 chunk:" lines.
+#
 # Environment: RADIANCE_BIN (the binary), RADIANCE_HOME_DIR (kernels/ and architectures/ for it),
 # SILU_TABLE (the card's silu table), ARMS (default "base verify greedy"), HX_THREADS (16),
 # VERIFY_REQUESTS (3), DEVICE_CHECKS (1; a list: `tall` the exact-tall checks, `lcp` the large-chunk
@@ -236,7 +251,7 @@ xt_check() {   # name
 # start otherwise), and the scheduler the chunks and the cache admission. An Lc arm without that line,
 # or a plain arm with it, is not measured.
 lcp_check() {   # name
-  local name=$1 lc_lines
+  local name=$1 lc_lines p1_lines
   lc_lines=$(grep -c 'large-chunk prefill: passes of up to [0-9]* tokens' "$OUT/$name.server.log")
   if [[ -n "${ARM_LC:-}" ]] && ! grep -q "large-chunk prefill: passes of up to ${ARM_LC} tokens" "$OUT/$name.server.log"; then
     log "arm $name: Lc${ARM_LC}, but the server log has no 'large-chunk prefill: passes of up to ${ARM_LC} tokens' line ($(grep -m2 -E 'large-chunk prefill' "$OUT/$name.server.log" | tr '\n' ' ')); not measured"
@@ -250,6 +265,18 @@ lcp_check() {   # name
     grep -m3 -E 'large-chunk prefill: |chunk geometry: ' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
     grep -m1 -E 'consumer skip: ' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   fi
+  # P1 (RADIANCE_EXPERIMENTAL_DS41_P1): rank 0's "ds41 p1: card experts on" line at startup, in a P1 arm
+  # only.
+  p1_lines=$(grep -c 'ds41 p1: card experts on' "$OUT/$name.server.log")
+  if [[ -n "${ARM_P1:-}" && "$p1_lines" == 0 ]]; then
+    log "arm $name: P1, but the server log has no 'ds41 p1: card experts on' line ($(grep -m2 -E 'ds41 p1|P1' "$OUT/$name.server.log" | tr '\n' ' ')); not measured"
+    return 1
+  fi
+  if [[ -z "${ARM_P1:-}" && "$p1_lines" != 0 ]]; then
+    log "arm $name: no P1 part, but the server runs the card path (the knob set for the window?); not measured"
+    return 1
+  fi
+  [[ -n "${ARM_P1:-}" ]] && grep -m2 -E 'ds41 p1: ' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   return 0
 }
 
@@ -748,6 +775,7 @@ EOF2
   grep -E 'planned units VRAM=|VRAM packed' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   grep -E 'route trace' "$OUT/$name.server.log" | tail -6 | tee -a "$OUT/window.log"   # Rt: per rank, and the files
   grep -E 'consumer skip: [0-9]+ (prefill|cut) passes|rank 0: consumer skip' "$OUT/$name.server.log" | tee -a "$OUT/window.log"   # Cs: what the cut ran
+  grep -E 'ds41 p1 stats, rank|ds41 p1 chunk:' "$OUT/$name.server.log" | tail -24 | tee -a "$OUT/window.log"   # P1: each rank's totals, rank 0's chunks
   grep -E 'prefill hash: seq [0-9]+, [0-9]+ tokens: all ranks' "$OUT/$name.server.log" | tee -a "$OUT/window.log"   # Kh: a digest a prompt
   grep -E '^libr4d: RADIANCE_EXPERIMENTAL_DS41_DRAFT_GEMV' "$OUT/$name.server.log" | tail -2 | tee -a "$OUT/window.log"   # Dk/Dkt: calls taken
   grep -E 'host expert pool: |host experts, pre-wake: |host experts, one-token passes: ' "$OUT/$name.server.log" | tee -a "$OUT/window.log"   # Fw/WpN: the wake-up, decode's gather waits
@@ -826,6 +854,41 @@ if [[ " ${DEVICE_CHECKS:-1} " == *" lcp "* ]]; then
     else
       LCP_WHY="the large-chunk prefill device checks did not pass on $TL:$lcp_bad"
       log "$LCP_WHY no Lc arm is measured"
+    fi
+  fi
+fi
+# The P1 arms' gate (RADIANCE_EXPERIMENTAL_DS41_P1), like Lc's: a P1 arm runs only on the libr4d.so
+# (sha256) on which ds41_mxfp4_device_check `p1` passed in this window (the P1 row against the gemv in
+# passes of 16, the marks, the live tail and the wave composition; the check sets LCP=2048 and P1=1 itself).
+P1_OK="" P1_LIB="" P1_SUM=""
+P1_WHY="no prefill Phase 1 device check in this window (DEVICE_CHECKS=p1 with TALL_CHECK and TALL_LIBR4D)"
+if [[ " ${DEVICE_CHECKS:-1} " == *" p1 "* ]]; then
+  TL=${TALL_LIBR4D:-} TC=${TALL_CHECK:-} PM=${P1_CHECK_M:-4096} PR=${P1_ROUTES:-}
+  if [[ ! -x "$TC" || ! -f "$TL" ]]; then
+    P1_WHY="TALL_CHECK=$TC is not an executable or TALL_LIBR4D=$TL is not a file"
+    log "prefill Phase 1 device check: $P1_WHY; no P1 arm is measured"
+  elif ! [[ $PM =~ ^[0-9]+$ ]] || (( 10#$PM < 17 || 10#$PM > 4096 )); then
+    P1_WHY="P1_CHECK_M=$PM is not in 17..4096"
+    log "prefill Phase 1 device check: $P1_WHY; no P1 arm is measured"
+  elif [[ -n "$PR" && ! -f "$PR" ]]; then
+    P1_WHY="P1_ROUTES=$PR is not a file"
+    log "prefill Phase 1 device check: $P1_WHY; no P1 arm is measured"
+  else
+    log "prefill Phase 1 device check on card 0 with $TL ($TC), M up to $PM${PR:+, routes $PR}"
+    ( export HIP_VISIBLE_DEVICES=0
+      unset RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL RADIANCE_EXPERIMENTAL_DS41_LCP RADIANCE_EXPERIMENTAL_DS41_P1
+      timeout 1800 "$TC" "$TL" p1 $((10#$PM)) $PR >"$OUT/devcheck-p1.log" 2>&1
+      echo "p1 exit $?" >>"$OUT/devcheck-p1.log" )
+    grep -E '^p1( time)?:|exit' "$OUT/devcheck-p1.log" | tail -14 | tee -a "$OUT/window.log"
+    p1_bad=""
+    grep -qx "p1 exit 0" "$OUT/devcheck-p1.log" || p1_bad+=" p1 exited non-zero;"
+    [[ "$(grep -E '^p1: (PASS|FAIL)' "$OUT/devcheck-p1.log" | tail -1)" == "p1: PASS"* ]] || p1_bad+=" its last p1 line is not PASS;"
+    if [[ -z "$p1_bad" ]]; then
+      P1_OK=1 P1_LIB=$TL P1_SUM=$(sha256sum "$TL" 2>/dev/null | cut -d' ' -f1)
+      log "prefill Phase 1 device check passed on $TL, sha256 ${P1_SUM:0:16}: P1 arms on it are measured"
+    else
+      P1_WHY="the prefill Phase 1 device check did not pass on $TL:$p1_bad"
+      log "$P1_WHY no P1 arm is measured"
     fi
   fi
 fi
@@ -1220,6 +1283,7 @@ for a in $ARMS; do
 # offline in bf16, int8 and int4 against the container's routers); needs a predictor part.
   IFS=- read -r -a parts <<< "$a"
   xt="" bt="" kld="" dk="" db="" pu="" ins_nt="" ins_kib="" ins_wait="" lean="" lc="" ad="" dv="" xd="" hs="" dg="" df="" pmr=""
+  p1="" q1=()
   pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 HOST_POOL_MIB=4096 EXTRA_ARGS="" ARM_HOME="$RHOME" ARM_CONC=
   ARM_PROMPTS= ARM_N= ARM_LQ= rt=
   power="" skip="" ARGS=() f8="" f8x="" rb="" rbf=0 pred="" cs="" ck="" kh="" pc="" pcopt="" fw="" wp="" wl=""
@@ -1347,6 +1411,17 @@ for a in $ARMS; do
                if [[ $lc =~ ^[0-9]+$ ]] && (( 10#$lc >= 64 && 10#$lc <= 2048 && 10#$lc % 16 == 0 )); then
                  lc=$((10#$lc)); ARGS+=(--max-num-batched-tokens "$lc"); env+=(RADIANCE_EXPERIMENTAL_DS41_LCP=$lc)
                else log "arm $a: $p: a chunk is a multiple of 16 in 64..2048; the arm is skipped"; skip=1; fi ;;
+      P1)      p1=1 ;;                                                  # prefill Phase 1: card experts in large chunks (needs Lc)
+      Qw[0-9]*|Qi[0-9]*|Qr[0-9]*|Qa[0-9]*|Qv[0-9]*)                   # ...its wave / in flight / ready slots / read-ahead / verify
+               qn=${p:2}
+               case ${p:0:2} in
+                 Qw) qk=WAVE qlo=1 qhi=16 ;; Qi) qk=INFLIGHT qlo=1 qhi=64 ;; Qr) qk=READY qlo=1 qhi=32 ;;
+                 Qa) qk=AHEAD qlo=0 qhi=64 ;; *) qk=VERIFY qlo=0 qhi=4096 ;;
+               esac
+               if [[ $qn =~ ^[0-9]+$ ]] && (( 10#$qn >= qlo && 10#$qn <= qhi )); then
+                 q1+=(RADIANCE_EXPERIMENTAL_DS41_P1_$qk=$((10#$qn)))
+               else log "arm $a: $p: ${p:0:2} takes $qlo-$qhi; the arm is skipped"; skip=1; fi ;;
+      Qs)      q1+=(RADIANCE_EXPERIMENTAL_DS41_P1_ALIGN=start) ;;       # ...chunks aligned to the start
       Ad[0-9]*) ad=${p#Ad}; env+=(RADIANCE_EXPERIMENTAL_DS41_LCP_ADMIT=$((10#$ad))) ;;   # admit the last N tokens' units
       Ada)     ad=all; env+=(RADIANCE_EXPERIMENTAL_DS41_LCP_ADMIT=all) ;;       # admit every unit (as at 16 rows)
       Lp[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_LCP_PLANES=${p#Lp}) ;;        # missed units read at once a layer
@@ -1598,18 +1673,48 @@ for a in $ARMS; do
   # RADIANCE_EXPERIMENTAL_DS41_LCP: an Lc arm's chunk, 0 in every other arm.
   if [[ -n "$lc" ]]; then
     [[ -n "$xt$bt" ]] && { log "arm $a: Lc goes with neither Xt nor BT (it sets the step itself); the arm is skipped"; skip=1; }
-    [[ " ${env[*]} " == *" RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS=1 "* ]] ||
-      { log "arm $a: Lc needs B1 (the CPU takes every routed unit); the arm is skipped"; skip=1; }
     mm=$(grep -oE ' RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MISSES=[0-9]+' <<< " ${env[*]}" | tail -1 | cut -d= -f2)
-    (( ${mm:-0} >= lc )) || { log "arm $a: Lc$lc needs M$lc or more (the CPU computes a chunk's misses); the arm is skipped"; skip=1; }
-    # The pool's job size is not a matter of bits, but 4-row jobs (the default) take a chunk about twice
-    # the CPU time of the many-row kernel's: an Lc arm names it (Mr32 or Mr64; Mr4 for a control).
-    [[ " ${env[*]} " == *" RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MAX_ROWS="* ]] ||
-      { log "arm $a: Lc needs an Mr part (Mr32 or Mr64: a chunk's experts in many-row jobs); the arm is skipped"; skip=1; }
+    bn=$(grep -oE ' RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS=[0-9]+' <<< " ${env[*]}" | tail -1 | cut -d= -f2)
+    if [[ -n "$p1" ]]; then
+      # P1: the ring is the file buffers (B2 or more); the CPU path keeps passes of up to 16 tokens.
+      (( ${bn:-0} >= 2 )) || { log "arm $a: P1 needs B2 or more (the ring: 2N slots; B6 is the measured one); the arm is skipped"; skip=1; }
+      (( ${mm:-0} >= 16 )) || { log "arm $a: P1 needs M16 or more (the CPU path takes the passes of up to 16 tokens); the arm is skipped"; skip=1; }
+    else
+      [[ " ${env[*]} " == *" RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS=1 "* ]] ||
+        { log "arm $a: Lc needs B1 (the CPU takes every routed unit); the arm is skipped"; skip=1; }
+      (( ${mm:-0} >= lc )) || { log "arm $a: Lc$lc needs M$lc or more (the CPU computes a chunk's misses); the arm is skipped"; skip=1; }
+      # The pool's job size is not a matter of bits, but 4-row jobs (the default) take a chunk about twice
+      # the CPU time of the many-row kernel's: an Lc arm names it (Mr32 or Mr64; Mr4 for a control).
+      [[ " ${env[*]} " == *" RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MAX_ROWS="* ]] ||
+        { log "arm $a: Lc needs an Mr part (Mr32 or Mr64: a chunk's experts in many-row jobs); the arm is skipped"; skip=1; }
+    fi
     env+=(RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=)
   elif [[ -n "$xt" ]]; then env+=(RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=1 RADIANCE_EXPERIMENTAL_DS41_LCP=0)
   else env+=(RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=0 RADIANCE_EXPERIMENTAL_DS41_LCP=0); fi
   if [[ -n "$ad" && -z "$lc" ]]; then log "arm $a: Ad$ad needs Lc (it acts on large chunks only); the arm is skipped"; skip=1; fi
+  # P1 (RADIANCE_EXPERIMENTAL_DS41_P1): with Lc, on the libr4d.so the `p1` device check passed on; every
+  # other arm states the switch 0 and the Q knobs empty, so a window's VAR=val cannot turn them on.
+  if [[ -n "$p1" ]]; then
+    [[ -n "$lc" ]] || { log "arm $a: P1 needs an Lc part (the chunk the cards take); the arm is skipped"; skip=1; }
+    if [[ -z "$skip" ]]; then
+      IFS=: read -r -a homes <<< "$ARM_HOME"
+      lib=""
+      for h in "${homes[@]}"; do [[ -f "$h/kernels/libr4d.so" ]] && { lib=$h/kernels/libr4d.so; break; }; done
+      if [[ -z "$P1_OK" ]]; then
+        log "arm $a: P1 refused: $P1_WHY"; skip=1
+      elif [[ -z "$lib" || "$(sha256sum "$lib" 2>/dev/null | cut -d' ' -f1)" != "$P1_SUM" ]]; then
+        log "arm $a: P1 refused: its libr4d.so (${lib:-none under $ARM_HOME}) is not the one the p1 check passed on ($P1_LIB, sha256 ${P1_SUM:0:16})"; skip=1
+      fi
+    fi
+    env+=(RADIANCE_EXPERIMENTAL_DS41_P1=1 RADIANCE_EXPERIMENTAL_DS41_P1_WAVE= RADIANCE_EXPERIMENTAL_DS41_P1_INFLIGHT=
+          RADIANCE_EXPERIMENTAL_DS41_P1_READY= RADIANCE_EXPERIMENTAL_DS41_P1_AHEAD= RADIANCE_EXPERIMENTAL_DS41_P1_VERIFY=
+          RADIANCE_EXPERIMENTAL_DS41_P1_ALIGN= "${q1[@]}")
+  else
+    (( ${#q1[@]} )) && { log "arm $a: the Q parts (${q1[*]}) need P1; the arm is skipped"; skip=1; }
+    env+=(RADIANCE_EXPERIMENTAL_DS41_P1=0 RADIANCE_EXPERIMENTAL_DS41_P1_WAVE= RADIANCE_EXPERIMENTAL_DS41_P1_INFLIGHT=
+          RADIANCE_EXPERIMENTAL_DS41_P1_READY= RADIANCE_EXPERIMENTAL_DS41_P1_AHEAD= RADIANCE_EXPERIMENTAL_DS41_P1_VERIFY=
+          RADIANCE_EXPERIMENTAL_DS41_P1_ALIGN=)
+  fi
   [[ -n "$ad" ]] || env+=(RADIANCE_EXPERIMENTAL_DS41_LCP_ADMIT=)
   # Fw / WpN (the CPU pool's wake-up): every arm states both switches, 0 off, so a window's VAR=val
   # cannot turn them on for an arm whose name does not say so; arm() checks the server log both ways.
@@ -1648,7 +1753,7 @@ for a in $ARMS; do
     rm -rf "$OUT/kld-$a"
     ARGS=(--max-model-len "${KLD_LEN:-2048}" "${ARGS[@]}" --kld-record "$OUT/kld-$a" --kld-corpus "$OUT/kld-corpus.jsonl")
   fi
-  ARM_XT=$xt ARM_BT=$bt ARM_KLD=$kld ARM_LC=$lc
+  ARM_XT=$xt ARM_BT=$bt ARM_KLD=$kld ARM_LC=$lc ARM_P1=$p1
   [[ -n "$skip" ]] && continue
   [[ -n "$power" ]] && power_set "$power"
   case $pol in

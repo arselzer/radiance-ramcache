@@ -1119,6 +1119,13 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
 
     if (s < 0) return abort_step(h, b, dom, ip, n, s);
     if (rec_ && !host_paused) haz_note(p, ip, t, n_opd, rec0, tape_mark());
+    /* The stager sees what was launched, to launch the same row again later in the pass with its
+     * own weight table (OpStager::launched; prefill Phase 1's waves). Same condition as operands(). */
+    if (staging_ && stager_ && dom == RAD_DOMAIN_DEVICE) {
+        const int sl = stager_->launched(h, cur_stream(), la, ip.launch);
+        if (sl < 0)
+            return abort_step_msg(h, sl, "the weight stager could not take this op's launch");
+    }
 
     if (dom == RAD_DOMAIN_HOST) {
         rad_dev_host_wrote();

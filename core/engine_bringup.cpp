@@ -3923,7 +3923,8 @@ int Engine::start() {
     }
     startup_begin_ns_ = rad_mono_ns();
     if (!draft_experiment_.valid()) {
-        RAD_ERR("experimental draft control: stats/OFF must be absent or0|1, verify cap absent or0..5, with no positive-cap/OFF conflict");
+        RAD_ERR("experimental draft control: stats/OFF must be absent or0|1, verify cap absent or0..5, with no positive-cap/OFF conflict; "
+                "%s absent, 0, 1 or T[,W[,R]] (T in (0, 64], W 1..64, R 1..4096), and not with compute OFF", kDraftGateEnv);
         return RAD_E_INVAL;
     }
     std::vector<int> devs;

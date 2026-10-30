@@ -72,11 +72,19 @@ struct SchedReq {
         draft_filled = 0;
         draft_lo     = 0;
         draft_hi     = 0;
+        dgate_held   = false;
     }
 
     /* The adaptive draft window's estimate (--draft-window adaptive, draft.h). Not reset by
      * drafter_reset(): it describes the text, which preemption does not change. */
     DraftAdapt adapt;
+    /* RADIANCE_EXPERIMENTAL_DS41_DSPARK_GATE (draft_gate.h): its last verifies and counters.
+     * Likewise kept through preemption; a new request starts it over. */
+    DraftGateSeq dgate;
+    /* The gate declined this sequence's draft in the step just run (block_begin), so the next
+     * step verifies nothing for it: the prompt-lookup fallback, which fills an empty proposal in
+     * step(), does not stand in. Consumed by the next step's planning. */
+    bool       dgate_held = false;
     /* The proposal the step being planned carries came from prompt lookup (StepEntry::ngram). */
     bool       draft_ngram = false;
     /* Prompt lookup's index over prompt ++ output (ngram.h), built at the sequence's first lookup
@@ -461,6 +469,12 @@ public:
     const RadBatch* block_query(int step);
     void block_end();
 
+    /* RADIANCE_EXPERIMENTAL_DS41_DSPARK_GATE: the shutdown report. One line for every sequence
+     * and the decode steps by kind, then a line for each of the last kGateRecs sequences that
+     * finished (gated steps, probes, acceptance). Nothing while the gate is off. */
+    void draft_gate_report() const;
+    const DraftGateCfg&  draft_gate() const { return dgate_cfg_; }
+
     const StepPlan&      plan() const { return plan_; }
     const ChunkGeometry& geometry() const { return geo_; }
     DraftController&     draft() { return draft_; }
@@ -604,6 +618,18 @@ private:
     BatchBuilder  builder_;
     DraftController draft_;
     DraftExperiment draft_experiment_; // Engine validates OFF scope before load/serve
+    /* RADIANCE_EXPERIMENTAL_DS41_DSPARK_GATE (draft_gate.h), from draft_experiment_ at init: the
+     * configuration; the finished sequences' counters and the decode steps by kind; the last
+     * kGateRecs finished sequences' records for the shutdown report, a ring reserved at init so
+     * close_request allocates nothing; and the rows the open step's block_begin let draft, for
+     * step_finished's kind. */
+    static constexpr int kGateRecs = 256;
+    struct GateRec { uint64_t id = 0; int64_t out = 0; DraftGateSeq g; };
+    DraftGateCfg         dgate_cfg_{};
+    DraftGateStats       dgate_tot_{};
+    std::vector<GateRec> dgate_recs_;
+    int64_t              dgate_recs_n_ = 0;
+    int32_t              dgate_step_drafts_ = 0;
 
     /* Where this sequence's block-drafter cache begins; block_begin's guard reads it and
      * block_end records it. */

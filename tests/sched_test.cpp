@@ -7324,6 +7324,363 @@ TEST(fixed_verify_cap_zero_is_the_same_runtime_off_and_preserves_declared_depth)
     }
 }
 
+/* ===== RADIANCE_EXPERIMENTAL_DS41_DSPARK_GATE: the per-sequence acceptance gate (draft_gate.h) ===== */
+TEST(dspark_gate_spec_parses_strictly) {
+    DraftGateCfg c;
+    CHECK(DraftGateCfg::parse(nullptr, &c)); CHECK(!c.on);
+    CHECK(DraftGateCfg::parse("", &c)); CHECK(!c.on);
+    CHECK(DraftGateCfg::parse("0", &c)); CHECK(!c.on);
+    CHECK(DraftGateCfg::parse("1", &c)); CHECK(c.on);
+    CHECK_NEAR(c.threshold, DraftGateCfg::kThreshold, 1e-12);
+    CHECK_EQ(c.window, DraftGateCfg::kWindow); CHECK_EQ(c.probe, DraftGateCfg::kProbe);
+    CHECK_NEAR(DraftGateCfg::kThreshold, 0.78, 1e-12);
+    CHECK_EQ(DraftGateCfg::kWindow, 8); CHECK_EQ(DraftGateCfg::kProbe, 8);
+    CHECK(DraftGateCfg::parse("0.55", &c)); CHECK(c.on); CHECK_NEAR(c.threshold, 0.55, 1e-12);
+    CHECK_EQ(c.window, 8); CHECK_EQ(c.probe, 8);
+    CHECK(DraftGateCfg::parse("0.6,12", &c)); CHECK_EQ(c.window, 12); CHECK_EQ(c.probe, 8);
+    CHECK(DraftGateCfg::parse("1.0,4,16", &c)); CHECK_NEAR(c.threshold, 1.0, 1e-12);
+    CHECK_EQ(c.window, 4); CHECK_EQ(c.probe, 16);
+    CHECK(DraftGateCfg::parse("2.5,64,4096", &c)); CHECK_EQ(c.window, 64); CHECK_EQ(c.probe, 4096);
+    CHECK(DraftGateCfg::parse("0.7,8,2", &c)); CHECK_EQ(c.probe, 2);   /* R = 1 is refused (below) */
+    /* The threshold applied, in whole drafts over a full window (the startup line's "k of W"). */
+    for (const auto& w : { std::pair<const char*, int>{ "0.78,8", 7 }, { "0.70,8", 6 }, { "0.65,8", 6 },
+                           { "0.75,8", 6 }, { "0.62,8", 5 }, { "0.60,8", 5 }, { "1.0,4", 4 },
+                           { "0.5,4", 2 }, { "1.5,2", 3 } }) {
+        REQUIRE(DraftGateCfg::parse(w.first, &c));
+        CHECK_EQ(draft_gate_open_at(c), w.second);
+        DraftGateSeq g;
+        g.n = c.window;
+        g.sum = w.second;
+        CHECK(draft_gate_open(c, g));
+        g.sum = w.second - 1;
+        CHECK(!draft_gate_open(c, g));
+    }
+    for (const char* bad : { "x", "-0.5", "0.0", "64.5", "nan", "inf", "0.7,", "0.7,0", "0.7,65",
+                             "0.7,8,", "0.7,8,0", "0.7,8,1", "0.7,8,4097", "0.7,8,8,1", "0.7 ", "0.7;8",
+                             ",8" }) {
+        DraftGateCfg keep;
+        CHECK(!DraftGateCfg::parse(bad, &keep));
+        CHECK(!keep.on);   /* a refused spec writes nothing */
+    }
+    /* Through the experiment: refused rather than ignored, and refused with compute OFF (a cap of
+     * 0 included), where nothing would draft for it to gate. */
+    CHECK(DraftExperiment::capture("0", "0", "1", "0.7,8,8").valid());
+    CHECK(DraftExperiment::capture("0", "0", "1", "0.7,8,8").gate().on);
+    CHECK(DraftExperiment::capture("0", "0", nullptr, "1").valid());
+    CHECK(!DraftExperiment::capture("0", "0", "1", "bogus").valid());
+    CHECK(!DraftExperiment::capture("0", "1", nullptr, "1").valid());
+    CHECK(!DraftExperiment::capture("0", "0", "0", "1").valid());
+    CHECK(DraftExperiment::capture("0", "0", "0", "0").valid());
+    CHECK(!DraftExperiment::capture("0", "0", "1", nullptr).gate().on);
+    /* The gate alone is no draft-control scope: it leaves compute, cap and pipelining as they are. */
+    const auto g = DraftExperiment::capture(nullptr, nullptr, nullptr, "1");
+    CHECK(!g.compute_off()); CHECK_EQ(g.verify_cap(), -1); CHECK(!g.scope_required());
+    CHECK_EQ(g.runtime_depth(5), 5);
+}
+
+TEST(dspark_gate_warms_up_closes_probes_and_reopens) {
+    DraftGateCfg c;
+    REQUIRE(DraftGateCfg::parse("0.75,4,3", &c));
+    DraftGateSeq g;
+    /* Open from the start until four verifies are in, whatever they took. */
+    for (int i = 0; i < 4; ++i) {
+        CHECK_EQ(draft_gate_ask(c, g), (int)kDraftGateWarm);
+        draft_gate_observe(c, g, 1, 0, false);
+    }
+    CHECK_EQ(g.n, 4); CHECK_EQ(g.sum, 0);
+    /* 0 of 4 is under 0.75: closed; every third ask of the closed run probes, and each probe's
+     * taken draft pushes out the oldest rejection. */
+    for (int probe = 1; probe <= 3; ++probe) {
+        CHECK_EQ(draft_gate_ask(c, g), (int)kDraftGateGated);
+        CHECK_EQ(draft_gate_ask(c, g), (int)kDraftGateGated);
+        CHECK_EQ(draft_gate_ask(c, g), (int)kDraftGateProbe);
+        draft_gate_observe(c, g, 1, 1, true);
+        CHECK_EQ(g.sum, probe);
+    }
+    CHECK_EQ(g.closes, 1); CHECK_EQ(g.gated, 6); CHECK_EQ(g.probes, 3); CHECK_EQ(g.closed, 9);
+    /* 3 of 4 is the threshold itself: open again, and it stays so without new verifies. */
+    CHECK_NEAR(draft_gate_mean(g), 0.75, 1e-12);
+    CHECK_EQ(draft_gate_ask(c, g), (int)kDraftGateOpen);
+    CHECK_EQ(g.reopens, 1); CHECK_EQ(g.closed, 0);
+    CHECK_EQ(draft_gate_ask(c, g), (int)kDraftGateOpen);
+    /* An ask whose draft was not staged after all is uncounted. */
+    draft_gate_unask(g, kDraftGateOpen);
+    CHECK_EQ(g.asks, 4 + 9 + 1); CHECK_EQ(g.open, 1); CHECK_EQ(g.warm, 4);
+    draft_gate_unask(g, kDraftGateGated);   /* nothing to take back */
+    CHECK_EQ(g.asks, 4 + 9 + 1);
+    /* Its oldest entry is the last warm-up rejection, so one more rejection keeps 3 of 4 and the
+     * next takes a probe's acceptance out: closed again, a second run. */
+    draft_gate_observe(c, g, 1, 0, false);
+    CHECK_EQ(g.sum, 3); CHECK_EQ(draft_gate_ask(c, g), (int)kDraftGateOpen);
+    draft_gate_observe(c, g, 1, 0, false);
+    CHECK_EQ(g.sum, 2); CHECK_EQ(draft_gate_ask(c, g), (int)kDraftGateGated);
+    CHECK_EQ(g.closes, 2);
+    CHECK_EQ(g.verifies, 9); CHECK_EQ(g.verified, 9); CHECK_EQ(g.accepted, 3);
+    CHECK_EQ(g.probe_verified, 3); CHECK_EQ(g.probe_accepted, 3);
+    /* A deeper verify enters as its count of accepted drafts, clamped to what it verified. */
+    DraftGateCfg c2;
+    REQUIRE(DraftGateCfg::parse("1.5,2,8", &c2));
+    DraftGateSeq h;
+    draft_gate_observe(c2, h, 3, 2, false);
+    draft_gate_observe(c2, h, 3, 9, false);
+    draft_gate_observe(c2, h, 0, 1, false);   /* no drafts verified: no entry */
+    CHECK_EQ(h.n, 2); CHECK_EQ(h.sum, 5); CHECK_EQ(h.verified, 6); CHECK_EQ(h.accepted, 5);
+    CHECK_EQ(draft_gate_ask(c2, h), (int)kDraftGateOpen);   /* 2.5 >= 1.5 */
+    /* The defaults: at 0.78 over 8 a sequence drafts with at most one rejection in its last 8. */
+    DraftGateCfg d;
+    REQUIRE(DraftGateCfg::parse("1", &d));
+    DraftGateSeq q;
+    for (int i = 0; i < 8; ++i) draft_gate_observe(d, q, 1, i == 0 ? 0 : 1, false);
+    CHECK_EQ(draft_gate_ask(d, q), (int)kDraftGateOpen);     /* 7 of 8 */
+    draft_gate_observe(d, q, 1, 0, false);                   /* the 0 leaves, a 0 comes: 7 of 8 */
+    CHECK_EQ(draft_gate_ask(d, q), (int)kDraftGateOpen);
+    draft_gate_observe(d, q, 1, 0, false);                   /* 6 of 8 */
+    CHECK_EQ(draft_gate_ask(d, q), (int)kDraftGateGated);
+}
+
+/* The gate on the issue-ahead pipeline, as the engine drives a block drafter with the card's
+ * acceptance (the steps of fixed_verify_cap_preserves_full5_query_and_exact_ahead_prefix_transport):
+ * cap 1, W 4, threshold 0.75, a probe one step in 3. The first four verified drafts are rejected
+ * and every later one taken, so the sequence warms up for five asks, closes, probes twice and
+ * reopens. A closed step keeps its context pass, stages no query pass and reserves nothing for
+ * one, and the step issued ahead behind it verifies no drafts; the replies are the scripted
+ * target's throughout. */
+TEST(dspark_gate_closes_probes_and_reopens_on_the_issue_ahead_pipeline) {
+    const auto x = DraftExperiment::capture("0", "0", "1", "0.75,4,3");
+    REQUIRE(x.valid());
+    Fixture f; f.build(); f.cfg.n_spec = 5; f.cfg.max_seqs = 1;
+    f.prog.drafter.kind = RAD_DRAFT_BLOCK; f.prog.drafter.depth = 5;
+    CHECK_OK(f.start(&x));
+    CHECK(f.sch.draft_gate().on); CHECK_EQ(f.sch.draft_gate().window, 4);
+    auto r = f.request(40, 0); r->speculation_fixed = true;
+    const auto id = f.add(std::move(r));
+    const RadBatch* b = f.sch.step(); REQUIRE(b);
+    std::vector<StepSlot> slots((size_t)f.cfg.max_seqs);
+    std::vector<int32_t> expected;
+    /* What step t's block_begin lets draft, and how many drafts step t verifies (step 0 is the
+     * prompt's). */
+    const int want_drafted[20]  = { 1, 1, 1, 1, 1, 0, 0, 1, 0, 0, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1 };
+    const int want_verified[20] = { 0, 1, 1, 1, 1, 1, 0, 0, 1, 0, 0, 1, 0, 1, 1, 1, 1, 1, 1, 1 };
+    int verifies = 0;
+    for (int t = 0; t < 20; ++t) {
+        const StepEntry entry = f.sch.plan().e[0];
+        CHECK_EQ(entry.n_spec, want_verified[t]);
+        const int accepted = entry.n_spec > 0 ? (verifies++ < 4 ? 0 : 1) : 0;
+        std::vector<int32_t> sampled((size_t)b->n_out + 1, -1);
+        for (int j = 0; j <= entry.n_spec; ++j)
+            sampled[(size_t)(entry.dev_out + j)] = j < accepted ? ahead_draft(id, t, j) : ahead_tok(id, t);
+        AdvanceArgs accept = f.sch.advance_args(0); accept.mode = ADV_ACCEPT;
+        accept.st = slots.data(); accept.src = sampled.data(); adv_row(accept, 0);
+        CHECK_EQ(slots[(size_t)entry.card].acc, accepted);
+        const int64_t held_before = f.kv.seqs.at(id).n;
+        Scheduler::BlockRow row[1];
+        const int n = f.sch.block_begin(5, 5, 129, 128799, row, 1, true);
+        CHECK_EQ(n, want_drafted[t]);
+        /* A gated sequence reserves no query block. */
+        if (n == 0) CHECK_EQ(f.kv.seqs.at(id).n, held_before);
+        const RadBatch* context = f.sch.block_context(t + 1);
+        REQUIRE(context);
+        CHECK_EQ(context->n_tok, entry.n_tokens);
+        const RadBatch* query = f.sch.block_query(t + 1);
+        CHECK_EQ(query != nullptr, n == 1);
+        int32_t generated[5];
+        for (int j = 0; j < 5; ++j) generated[j] = ahead_draft(id, t + 1, j);
+        if (n == 1) {
+            CHECK_EQ(query->n_tok, 5);
+            AdvanceArgs q = f.sch.advance_args(0); q.mode = ADV_BLOCK; q.st = slots.data(); adv_row(q, 0);
+            AdvanceArgs take = f.sch.advance_args(0); take.mode = ADV_BTAKE; take.round = 5;
+            take.src = generated; take.src_pitch = 5; take.st = slots.data(); adv_row(take, 0);
+            f.sch.expect_draft(id, 5);
+        }
+        const RadBatch* next = f.sch.step_next();
+        REQUIRE(next);
+        CHECK_EQ(next->n_spec, n);
+        CHECK_EQ(next->n_tok, 1 + n);
+        AdvanceArgs tr = f.sch.advance_args(0); tr.mode = ADV_TRUNK; tr.st = slots.data(); adv_row(tr, 0);
+        CHECK_EQ(next->token_ids[0], ahead_tok(id, t));
+        if (n == 1) CHECK_EQ(next->token_ids[1], generated[0]);
+        for (int j = 0; j < accepted; ++j) expected.push_back(ahead_draft(id, t, j));
+        expected.push_back(ahead_tok(id, t));
+        CHECK_OK(f.commit(ahead_tok(id, t), 0, [accepted](const StepEntry&) { return accepted; }));
+        f.sch.block_end();
+        /* The drafter publishes only for the rows it ran. */
+        if (n == 1) CHECK_OK(f.sch.set_draft(id, generated, 5));
+        f.sch.step_finished();
+        f.sch.promote_next();
+        b = next;
+        CHECK(f.sch.find(id)->output == expected);
+    }
+    DraftGateStats g = f.sch.metrics().draft_gate;
+    CHECK(g.on); CHECK_EQ(g.window, 4); CHECK_EQ(g.probe, 3); CHECK_NEAR(g.threshold, 0.75, 1e-12);
+    CHECK_EQ(g.seqs, 1);    /* the running sequence, so far */
+    CHECK_EQ(g.asks, 20); CHECK_EQ(g.warm, 5); CHECK_EQ(g.gated, 5); CHECK_EQ(g.probes, 2);
+    CHECK_EQ(g.open, 8); CHECK_EQ(g.closes, 1); CHECK_EQ(g.reopens, 1);
+    CHECK_EQ(g.verifies, 14); CHECK_EQ(g.verified, 14); CHECK_EQ(g.accepted, 10);
+    CHECK_EQ(g.probe_verified, 2); CHECK_EQ(g.probe_accepted, 2);
+    /* Decode steps by kind: [verified drafts][drafted]; step 0 was the prompt's. */
+    CHECK_EQ(g.step_n[1][1], 11); CHECK_EQ(g.step_n[1][0], 3);
+    CHECK_EQ(g.step_n[0][0], 2); CHECK_EQ(g.step_n[0][1], 3);
+    for (int v = 0; v < 2; ++v)
+        for (int d = 0; d < 2; ++d) CHECK(g.step_ms(v, d) > 0.0);
+    /* The scheduler's own totals agree: every verify was the head's. */
+    const SchedMetrics m = f.sch.metrics();
+    CHECK_EQ(m.draft_tokens, 14); CHECK_EQ(m.draft_accepted, 10);
+    /* The request ends at the next commit, which verifies the last draft (taken): its record is
+     * kept for the shutdown report, and the totals no longer count it as running. */
+    CHECK_EQ(f.sch.plan().e[0].n_spec, 1);
+    {
+        std::vector<int32_t> sampled((size_t)b->n_out + 1, -1);
+        const StepEntry entry = f.sch.plan().e[0];
+        sampled[(size_t)entry.dev_out] = ahead_draft(id, 20, 0);
+        sampled[(size_t)entry.dev_out + 1] = ahead_tok(id, 20);
+        AdvanceArgs accept = f.sch.advance_args(0); accept.mode = ADV_ACCEPT;
+        accept.st = slots.data(); accept.src = sampled.data(); adv_row(accept, 0);
+    }
+    CHECK_OK(f.commit(ahead_tok(id, 20), 1, [](const StepEntry&) { return 1; }));
+    CHECK(f.sch.find(id)->state == ReqState::Finished);
+    g = f.sch.metrics().draft_gate;
+    CHECK_EQ(g.seqs, 1); CHECK_EQ(g.verifies, 15); CHECK_EQ(g.accepted, 11);
+    f.sch.draft_gate_report();   /* prints the totals and the one sequence's line */
+}
+
+/* A sequence the gate holds gets no prompt-lookup proposal in place of the declined draft (the
+ * step after it is planned after the commit here, where step() fills an empty proposal from the
+ * lookup), while the same text with the head merely declining does get one. */
+TEST(dspark_gate_held_sequence_gets_no_lookup_fallback) {
+    for (int gated = 0; gated < 2; ++gated) {
+        const auto x = DraftExperiment::capture("0", "0", nullptr, gated ? "1.0,1,1000" : nullptr);
+        REQUIRE(x.valid());
+        Fixture f; f.build(); f.cfg.n_spec = 5;
+        f.prog.drafter.kind = RAD_DRAFT_BLOCK; f.prog.drafter.depth = 5;
+        CHECK_OK(f.start(&x));
+        auto r = f.request(160, 2000);
+        for (int i = 0; i < 160; ++i) r->prompt[(size_t)i] = 100 + i % 8;
+        const auto id = f.add(std::move(r));
+        REQUIRE(id);
+        REQUIRE(f.sch.step()); f.commit_plain(100);
+        Scheduler::BlockRow row[1];
+        /* The first ask warms up: the head drafts, its block is verified and rejected. */
+        CHECK_EQ(f.sch.block_begin(5, 5, 0, 128799, row, 1), 1);
+        f.sch.block_end();
+        const int32_t d[5] = { 1, 2, 3, 4, 5 };
+        CHECK_OK(f.sch.set_draft(id, d, 5));
+        REQUIRE(f.sch.step());
+        CHECK_EQ(f.sch.plan().e[0].n_spec, 5); CHECK(!f.sch.plan().e[0].ngram);
+        /* The target emits 101, so the text continues the prompt's pattern and the lookup has a
+         * proposal to make. */
+        CHECK_OK(f.commit(101, 0, [](const StepEntry&) { return 0; }));
+        /* Closed at 0 of 1 under 1.0: no query row, while the context pass still has one. */
+        CHECK_EQ(f.sch.block_begin(5, 5, 0, 128799, row, 1), gated ? 0 : 1);
+        CHECK(f.sch.block_context(3) != nullptr);
+        CHECK_EQ(f.sch.block_query(3) == nullptr, gated == 1);
+        f.sch.block_end();
+        /* No head proposal either way (the drafter published nothing for this step). */
+        REQUIRE(f.sch.step());
+        const StepEntry& e = f.sch.plan().e[0];
+        if (gated) {
+            CHECK_EQ(e.n_spec, 0); CHECK(!e.ngram);
+        } else {
+            CHECK(e.ngram); CHECK(e.n_spec > 0);
+        }
+        CHECK_OK(f.commit(103));
+        if (gated) {
+            const DraftGateStats g = f.sch.metrics().draft_gate;
+            CHECK_EQ(g.asks, 2); CHECK_EQ(g.warm, 1); CHECK_EQ(g.gated, 1); CHECK_EQ(g.closes, 1);
+        } else {
+            CHECK(!f.sch.metrics().draft_gate.on);
+        }
+    }
+}
+
+/* The gate needs a block drafter: refused at init under any other, rather than gating nothing. */
+TEST(dspark_gate_is_refused_without_a_block_drafter) {
+    const auto x = DraftExperiment::capture("0", "0", nullptr, "1");
+    {
+        Fixture f; f.build(); f.cfg.n_spec = 4;   /* prompt lookup alone */
+        CHECK_EQ(f.start(&x), RAD_E_UNSUPPORTED);
+    }
+    {
+        Fixture f; f.build(); f.cfg.n_spec = 2;
+        f.prog.drafter.kind = RAD_DRAFT_SERIAL; f.prog.drafter.depth = 2;
+        CHECK_EQ(f.start(&x), RAD_E_UNSUPPORTED);
+    }
+    {
+        Fixture f; f.build(); f.cfg.n_spec = 0;
+        f.prog.drafter.kind = RAD_DRAFT_BLOCK; f.prog.drafter.depth = 5;
+        CHECK_EQ(f.start(&x), RAD_E_UNSUPPORTED);
+    }
+    {
+        Fixture f; f.build(); f.cfg.n_spec = 5;
+        f.prog.drafter.kind = RAD_DRAFT_BLOCK; f.prog.drafter.depth = 5;
+        CHECK_OK(f.start(&x));
+        CHECK(f.sch.metrics().draft_gate.on);
+    }
+    /* Off, nothing of it is reported. */
+    Fixture f; f.build(); f.cfg.n_spec = 5;
+    f.prog.drafter.kind = RAD_DRAFT_BLOCK; f.prog.drafter.depth = 5;
+    CHECK_OK(f.start());
+    CHECK(!f.sch.draft_gate().on); CHECK(!f.sch.metrics().draft_gate.on);
+    f.sch.draft_gate_report();
+}
+
+/* K1's short query block (RADIANCE_EXPERIMENTAL_DS41_DSPARK_SHORT_BLOCK=2, --draft-short-from 1)
+ * under the verify cap of 1 and the gate, as the engine stages it (Engine::block_shape: block 2,
+ * 2 proposals; the plugin's proposal pitch stays the drafter's 5): a two-row query pass, the step
+ * issued ahead verifying its first proposal, the cap cutting the published pair to it. */
+TEST(dspark_short_block_of_two_under_cap_one_and_the_gate_verifies_its_first_proposal) {
+    for (int gate = 0; gate < 2; ++gate) {
+        const auto x = DraftExperiment::capture("0", "0", "1", gate ? "1" : nullptr);
+        Fixture f; f.build(); f.cfg.n_spec = 5; f.cfg.max_seqs = 1;
+        f.prog.drafter.kind = RAD_DRAFT_BLOCK; f.prog.drafter.depth = 5;
+        CHECK_OK(f.start(&x));
+        auto r = f.request(40, 0); r->speculation_fixed = true;
+        const auto id = f.add(std::move(r));
+        const RadBatch* b = f.sch.step(); REQUIRE(b);
+        std::vector<StepSlot> slots((size_t)f.cfg.max_seqs);
+        std::vector<int32_t> expected;
+        for (int t = 0; t < 6; ++t) {
+            const StepEntry entry = f.sch.plan().e[0];
+            CHECK_EQ(entry.n_spec, t ? 1 : 0);
+            const int accepted = ahead_acc(id, t, entry.n_spec);
+            std::vector<int32_t> sampled((size_t)b->n_out + 1, -1);
+            for (int j = 0; j <= entry.n_spec; ++j)
+                sampled[(size_t)(entry.dev_out + j)] = j < accepted ? ahead_draft(id, t, j) : ahead_tok(id, t);
+            AdvanceArgs accept = f.sch.advance_args(0); accept.mode = ADV_ACCEPT;
+            accept.st = slots.data(); accept.src = sampled.data(); adv_row(accept, 0);
+            Scheduler::BlockRow row[1];
+            /* Six asks, all within the default window's warm-up: the gate lets each draft. */
+            CHECK_EQ(f.sch.block_begin(2, 2, 129, 128799, row, 1, true), 1);
+            REQUIRE(f.sch.block_context(t + 1));
+            const RadBatch* query = f.sch.block_query(t + 1);
+            REQUIRE(query);
+            CHECK_EQ(query->n_tok, 2); CHECK_EQ(query->n_out, 2);
+            AdvanceArgs q = f.sch.advance_args(0); q.mode = ADV_BLOCK; q.st = slots.data(); adv_row(q, 0);
+            int32_t generated[5];
+            for (int j = 0; j < 5; ++j) generated[j] = j < 2 ? ahead_draft(id, t + 1, j) : -7;
+            AdvanceArgs take = f.sch.advance_args(0); take.mode = ADV_BTAKE; take.round = 2;
+            take.src = generated; take.src_pitch = 5; take.st = slots.data(); adv_row(take, 0);
+            CHECK_EQ(slots[(size_t)entry.card].tok[1], generated[0]);
+            CHECK_EQ(slots[(size_t)entry.card].tok[2], generated[1]);
+            f.sch.expect_draft(id, 2);
+            const RadBatch* next = f.sch.step_next();
+            REQUIRE(next);
+            CHECK_EQ(next->n_spec, 1); CHECK_EQ(next->n_tok, 2);
+            AdvanceArgs tr = f.sch.advance_args(0); tr.mode = ADV_TRUNK; tr.st = slots.data(); adv_row(tr, 0);
+            CHECK_EQ(next->token_ids[1], generated[0]);
+            for (int j = 0; j < accepted; ++j) expected.push_back(ahead_draft(id, t, j));
+            expected.push_back(ahead_tok(id, t));
+            CHECK_OK(f.commit(ahead_tok(id, t), 0, [accepted](const StepEntry&) { return accepted; }));
+            f.sch.block_end();
+            CHECK_OK(f.sch.set_draft(id, generated, 2));
+            f.sch.promote_next();
+            b = next;
+            CHECK(f.sch.find(id)->output == expected);
+        }
+        CHECK_EQ(f.sch.metrics().draft_gate.on, gate == 1);
+        if (gate) CHECK_EQ(f.sch.metrics().draft_gate.warm, 6);
+    }
+}
+
 /* RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE. DeepSeek-V4.1 is served with the budget at the chunk
  * quantum (--max-num-batched-tokens 16 against a 16-token attention block), so a decode row ahead
  * of a chunk leaves it under the quantum. Without the switch a request arriving while another

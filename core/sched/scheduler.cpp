@@ -365,6 +365,39 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     }
     draft_est_.clear();
     draft_est_.reserve((size_t)cfg.max_seqs);
+    /* RADIANCE_EXPERIMENTAL_DS41_DSPARK_GATE (draft_gate.h). It decides per block whether a block
+     * drafter's query pass runs, so it needs one; under any other drafter it is refused rather
+     * than left to gate nothing under its name. */
+    dgate_cfg_ = draft_experiment_.gate();
+    dgate_tot_ = DraftGateStats{};
+    dgate_recs_.clear();
+    dgate_recs_n_ = 0;
+    dgate_step_drafts_ = 0;
+    if (dgate_cfg_.on) {
+        const RadDrafterDecl& dd = prog.drafter;
+        if (cfg.n_spec <= 0 || dd.kind != RAD_DRAFT_BLOCK || dd.depth <= 0) {
+            RAD_ERR("%s: the acceptance gate decides whether a block drafter (DSpark) drafts; this "
+                    "deployment runs %s", kDraftGateEnv,
+                    cfg.n_spec <= 0 ? "no drafter" : "a drafter that proposes no block");
+            return RAD_E_UNSUPPORTED;
+        }
+        dgate_tot_.on = true;
+        dgate_tot_.threshold = dgate_cfg_.threshold;
+        dgate_tot_.window = dgate_cfg_.window;
+        dgate_tot_.probe = dgate_cfg_.probe;
+        dgate_recs_.assign((size_t)kGateRecs, GateRec{});
+        const int cap = draft_experiment_.runtime_depth(cfg.n_spec);
+        const int open_at = draft_gate_open_at(dgate_cfg_);
+        RAD_INFO("DSpark acceptance gate: on (%s): a sequence drafts nothing while the mean of its "
+                 "last %d verifies of head drafts is under %.3f accepted a verify (opens at %d of %d "
+                 "drafts accepted over a full window: effectively %.3f) (its query pass "
+                 "skipped, the context pass run, the next step verifying no drafts), and probes "
+                 "one step in %d of a closed run; it drafts from its start until %d verifies are "
+                 "in; %d draft(s) verified a step", kDraftGateEnv, dgate_cfg_.window,
+                 dgate_cfg_.threshold, open_at, dgate_cfg_.window,
+                 (double)open_at / (double)dgate_cfg_.window, dgate_cfg_.probe, dgate_cfg_.window,
+                 cap);
+    }
 
     RAD_TRY(builder_.init(prog, cfg, geo_, kvgeom_, ranks));
     RAD_TRY(lcp_init(prog, cfg, ranks));
@@ -662,6 +695,7 @@ int Scheduler::add_locked(std::unique_ptr<Request> r) {
     s.adapt.depth = 0;
     s.adapt.held  = 0;
     s.look.started = false;
+    s.dgate = DraftGateSeq{};
     s.sched_tokens = 0;
     s.entry = -1;
     s.entry_next = -1;
@@ -940,6 +974,20 @@ void Scheduler::close_request(SchedReq& s, ReqState st, const char* reason, bool
                   (long long)s.look.held_hits, lookup_.max_depth(),
                   lookup_.step_cost(1 + lookup_.max_depth()) / lookup_.step_cost(1));
     s.look.started = false;
+    /* The acceptance gate's record of this text (draft_gate.h), once: cleared after, so a second
+     * close adds nothing. A sequence the gate never asked (it ended at its first token) has none.
+     * The ring was reserved at init: nothing here allocates. */
+    if (dgate_cfg_.on && s.dgate.asks > 0) {
+        dgate_tot_.add(s.dgate);
+        if (!dgate_recs_.empty()) {
+            GateRec& rec = dgate_recs_[(size_t)(dgate_recs_n_ % (int64_t)dgate_recs_.size())];
+            rec.id = s.req->id;
+            rec.out = (int64_t)s.req->output.size();
+            rec.g = s.dgate;
+        }
+        ++dgate_recs_n_;
+        s.dgate = DraftGateSeq{};
+    }
     /* Fold what the draft head did on this text into the next text's starting estimate, once:
      * marking it unstarted makes a second close add nothing. */
     if (draft_.adaptive()) {
@@ -2098,6 +2146,9 @@ replan:
             const int cap = draft_.adaptive() ? draft_cap(s) : depth;
             bool ngram = false;
             if (draft_experiment_.compute_off() || !r.may_speculate) s.n_draft = 0;
+            /* A sequence the acceptance gate held this step (block_begin) verifies nothing: the
+             * lookup does not stand in for the draft the gate declined. */
+            else if (s.dgate_held) s.n_draft = 0;
             else if (s.n_draft == 0) {
                 /* As the only drafter under the adaptive window, the lookup is the head: its
                  * proposal is cut to the sequence's own window. */
@@ -2126,6 +2177,7 @@ replan:
             }
             if (!ngram && s.n_draft > cap) s.n_draft = cap;
             s.draft_ngram = ngram;
+            s.dgate_held = false;
             /* No verified position at or past the context end: nothing past ctx_limit_ - 1 has a
              * rotary row or block-table column. commit() finishes a sequence before it reaches
              * the limit, so the one token itself always fits. */
@@ -2746,6 +2798,7 @@ void Scheduler::promote_next() {
         s.entry      = (int32_t)i;
         s.entry_next = -1;
         s.draft_next = 0;
+        s.dgate_held = false;   /* planned (step_next_locked), as step() consumes it */
         s.sched_tokens = plan_.e[i].n_tokens;
         if (s.req) { s.req->n_draft = plan_.e[i].n_spec; s.req->draft = s.draft; }
     }
@@ -2932,6 +2985,13 @@ int Scheduler::commit(StepResult& res) {
 
             if (e.n_spec > 0) {
                 draft_.observe(e.n_spec, a);
+                /* The acceptance gate's mean takes the head's drafts only (draft_gate.h). The
+                 * open step is step_ - 1 (block_begin), the number a probe recorded. */
+                if (dgate_cfg_.on && !e.ngram) {
+                    const bool probe = s.dgate.probe_step == (int64_t)step_ - 1;
+                    draft_gate_observe(dgate_cfg_, s.dgate, e.n_spec, a, probe);
+                    if (probe) s.dgate.probe_step = -1;
+                }
                 /* And this sequence's own estimate under the adaptive window, only when the head
                  * drafted: a prompt-lookup proposal is accepted on different text by a different
                  * rule. A move takes effect at the next draft; this step's drafter already ran. */
@@ -3092,6 +3152,17 @@ void Scheduler::step_finished() {
         for (const StepEntry& e : plan_.e) rows += (e.produces_token && !e.is_prefill) ? 1 : 0;
         draft_.step_time((int)plan_.n_spec, rows, wall * 1e3);
     }
+    /* The acceptance gate's decode steps of one sequence by kind (draft_gate.h): whether they
+     * verified head drafts, and whether their drafter ran a query pass (block_begin), timed as the
+     * lookup gate's are. Over steady runs of each, [1][1] / [0][0] is rho + d. A step whose
+     * drafts came from the prompt-lookup fallback is no kind. */
+    if (dgate_cfg_.on && plan_.phase == RAD_PHASE_DECODE && plan_.e.size() == 1 &&
+        !plan_.e[0].is_prefill && !plan_.e[0].ngram && wall > 0) {
+        const int v = plan_.e[0].n_spec > 0 ? 1 : 0, d = dgate_step_drafts_ > 0 ? 1 : 0;
+        ++dgate_tot_.step_n[v][d];
+        dgate_tot_.step_ns[v][d] += (int64_t)(wall * 1e9);
+    }
+    dgate_step_drafts_ = 0;
     last_step_at_ = step_end;
     /* So a second call, or one on a loop iteration that ran no step, charges nothing. */
     step_start_ = {};
@@ -3434,24 +3505,34 @@ int Scheduler::block_begin(int block, int depth, int window, int32_t mask, Block
         /* The query block writes positions n_computed .. n_computed + block - 1, and none of them
          * may be at or past the end of the context. */
         const bool ok_ctx  = ctx_limit_ <= 0 || next_hi + block <= ctx_limit_;
-        const bool ok_kv   = ok_room && ok_ctx &&
+        /* RADIANCE_EXPERIMENTAL_DS41_DSPARK_GATE (draft_gate.h): asked only where the sequence
+         * could draft, and before its block's KV is reserved, which a gated sequence does not
+         * take. Its row stays in the context pass either way. */
+        int gate = -1;
+        if (dgate_cfg_.on && may_draft && have_tok && reach && ok_room && ok_ctx)
+            gate = draft_gate_ask(dgate_cfg_, s.dgate);
+        const bool ok_gate = gate != kDraftGateGated;
+        const bool ok_kv   = ok_room && ok_ctx && ok_gate &&
                              kv_->ensure_from(r.id, next_hi + block, r.n_computed) >= 0;
         static const bool dbg = [] { const char* v = std::getenv("RADIANCE_DEBUG_DRAFT");
                                      return v && *v && *v != '0'; }();
         if (dbg) {
-            static int64_t n_call = 0, n_depth = 0, n_tok = 0, n_reach = 0, n_room = 0, n_kv = 0, n_ok = 0;
+            static int64_t n_call = 0, n_depth = 0, n_tok = 0, n_reach = 0, n_room = 0, n_kv = 0,
+                           n_gate = 0, n_ok = 0;
             ++n_call;
             if (!may_draft)      ++n_depth;
             else if (!have_tok)  ++n_tok;
             else if (!reach)     ++n_reach;
             else if (!ok_room)   ++n_room;
+            else if (!ok_gate)   ++n_gate;
             else if (!ok_kv)     ++n_kv;
             else                 ++n_ok;
             if ((n_call % 256) == 0)
                 RAD_INFO("draft gates over %lld asks: ok %lld | declined depth %lld tok %lld "
-                         "reach %lld room %lld kv %lld  (window %d, floor %lld, ctx_len %lld)",
+                         "reach %lld room %lld acceptance %lld kv %lld  (window %d, floor %lld, "
+                         "ctx_len %lld)",
                          (long long)n_call, (long long)n_ok, (long long)n_depth, (long long)n_tok,
-                         (long long)n_reach, (long long)n_room, (long long)n_kv,
+                         (long long)n_reach, (long long)n_room, (long long)n_gate, (long long)n_kv,
                          window, (long long)lo, (long long)e.ctx_len);
         }
         if (may_draft && have_tok && reach && ok_kv) {
@@ -3460,9 +3541,18 @@ int Scheduler::block_begin(int block, int depth, int window, int32_t mask, Block
             out[n_draft_rows].slot = d.slot;
             out[n_draft_rows].card = d.card;
             ++n_draft_rows;
+            /* The step after this one verifies the probe's draft. During an open step the
+             * counter is already that step's number (one past the open step's, step() and
+             * promote_next alike), which commit() reads back as step_ - 1. */
+            if (gate == kDraftGateProbe) s.dgate.probe_step = (int64_t)step_;
+        } else if (gate > kDraftGateGated) {
+            draft_gate_unask(s.dgate, gate);   /* the gate let it draft, but its KV was refused */
         }
+        /* No proposal for the next step, from the head or the prompt-lookup fallback. */
+        s.dgate_held = gate == kDraftGateGated;
         block_.push_back(d);
     }
+    dgate_step_drafts_ = n_draft_rows;
     return n_draft_rows;
 }
 
@@ -3713,6 +3803,13 @@ SchedMetrics Scheduler::metrics_locked() const {
     m.lookup_held        = lookup_.held_count();
     m.lookup_held_drafts = lookup_.held_drafts();
     m.lookup_held_hits   = lookup_.held_hits();
+    /* The acceptance gate: the finished sequences' counters and the running ones' so far. */
+    m.draft_gate = dgate_tot_;
+    if (dgate_cfg_.on)
+        for (int32_t slot : running_) {
+            const SchedReq& q = *reqs_[(size_t)slot];
+            if (q.req && q.dgate.asks > 0) m.draft_gate.add(q.dgate);
+        }
     if (draft_.adaptive()) {
         m.draft_adaptive = true;
         /* Over the running sequences whose estimate has started; one that has not drafted yet
@@ -3730,6 +3827,59 @@ SchedMetrics Scheduler::metrics_locked() const {
         for (int d = 0; d < kDepth; ++d) m.draft_verify_depth[d] = draft_.verified_at(d);
     }
     return m;
+}
+
+/* ------------------------------------------------------------------ the acceptance gate's report */
+void Scheduler::draft_gate_report() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (!dgate_cfg_.on) return;
+    DraftGateStats t = dgate_tot_;
+    for (int32_t slot : running_) {
+        const SchedReq& q = *reqs_[(size_t)slot];
+        if (q.req && q.dgate.asks > 0) t.add(q.dgate);
+    }
+    const auto rate = [](int64_t a, int64_t v) { return v > 0 ? (double)a / (double)v : 0.0; };
+    RAD_INFO("DSpark acceptance gate: %lld sequence(s), %lld step(s) asked: %lld drafted (%lld "
+             "warming up, %lld open, %lld probe(s)), %lld gated; %lld closed run(s), %lld "
+             "reopened; %lld verifies of head drafts, %lld drafts verified, %lld accepted (%.3f); "
+             "the probes' %lld verified, %lld accepted (%.3f); threshold %.3f over %d verifies, "
+             "probe one step in %d",
+             (long long)t.seqs, (long long)t.asks, (long long)(t.warm + t.open + t.probes),
+             (long long)t.warm, (long long)t.open, (long long)t.probes, (long long)t.gated,
+             (long long)t.closes, (long long)t.reopens, (long long)t.verifies,
+             (long long)t.verified, (long long)t.accepted, rate(t.accepted, t.verified),
+             (long long)t.probe_verified, (long long)t.probe_accepted,
+             rate(t.probe_accepted, t.probe_verified), dgate_cfg_.threshold, dgate_cfg_.window,
+             dgate_cfg_.probe);
+    char be[160] = "";
+    if (t.step_n[0][0] > 0 && t.step_n[1][1] > 0)
+        std::snprintf(be, sizeof be, "; measured break-even acceptance (verify + draft over plain, "
+                      "less one) %.3f", t.step_ms(1, 1) / t.step_ms(0, 0) - 1.0);
+    RAD_INFO("DSpark acceptance gate: decode steps of one sequence by kind: verify + draft %lld at "
+             "%.2f ms, plain %lld at %.2f ms, draft only (a probe's) %lld at %.2f ms, verify only "
+             "(after a probe) %lld at %.2f ms%s",
+             (long long)t.step_n[1][1], t.step_ms(1, 1), (long long)t.step_n[0][0],
+             t.step_ms(0, 0), (long long)t.step_n[0][1], t.step_ms(0, 1),
+             (long long)t.step_n[1][0], t.step_ms(1, 0), be);
+    const int64_t cap = (int64_t)dgate_recs_.size();
+    const int64_t n = std::min<int64_t>(dgate_recs_n_, cap);
+    for (int64_t i = dgate_recs_n_ - n; i < dgate_recs_n_; ++i) {
+        const GateRec& r = dgate_recs_[(size_t)(i % cap)];
+        const DraftGateSeq& g = r.g;
+        RAD_INFO("DSpark acceptance gate: request %llu (%lld tokens): asked %lld, drafted %lld "
+                 "(warm-up %lld, open %lld, probes %lld), gated %lld; closed %lld, reopened %lld; "
+                 "%lld drafts verified, %lld accepted (%.3f), the probes' %lld / %lld; last mean "
+                 "%.3f over %d verifies",
+                 (unsigned long long)r.id, (long long)r.out, (long long)g.asks,
+                 (long long)(g.warm + g.open + g.probes), (long long)g.warm, (long long)g.open,
+                 (long long)g.probes, (long long)g.gated, (long long)g.closes,
+                 (long long)g.reopens, (long long)g.verified, (long long)g.accepted,
+                 rate(g.accepted, g.verified), (long long)g.probe_verified,
+                 (long long)g.probe_accepted, draft_gate_mean(g), (int)g.n);
+    }
+    if (dgate_recs_n_ > n)
+        RAD_INFO("DSpark acceptance gate: those are the last %lld of %lld finished sequences",
+                 (long long)n, (long long)dgate_recs_n_);
 }
 
 }  /* namespace rad */

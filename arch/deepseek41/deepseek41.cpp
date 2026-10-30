@@ -556,6 +556,15 @@ struct Model {
     std::vector<std::string> f8_skip;
     int64_t f8_codes = 0;
     int f8_n = 0, f8_kept = 0;
+    /* RADIANCE_EXPERIMENTAL_DS41_DSPARK_FP8=1 (dsp_f8_gate): the DSpark drafter's dense linears the
+     * same way. The release ships its mtp.* stages' (wq_a, wq_b, wkv, wo_a, wo_b, the shared
+     * expert, main_proj) as E4M3 with an E8M0 exponent a 32x32 block too, and the draft bank keeps
+     * them cast to bf16, as the container keeps the trunk's. Needs ..._DENSE_FP8 on. Counted apart
+     * from the trunk's, on a startup line of their own: `dsp_f8_n` weights the op reads,
+     * `dsp_f8_codes` their code bytes, `dsp_f8_kept` those left on gemm_nt. */
+    bool dsp_f8 = false;
+    int64_t dsp_f8_codes = 0;
+    int dsp_f8_n = 0, dsp_f8_kept = 0;
     int64_t win_bs = 0;
     /* model-wide weights and ops */
     rad_weight token = 0, head = 0, final_gain = 0, tmap = 0, ple_table = 0;
@@ -1843,12 +1852,18 @@ static int dsp_stage_weights(RadBuilder* b, Model& m, Layer& L, int s) {
     if (!L.hc_a_fn || !L.hc_a_scale || !L.hc_a_base || !L.hc_f_fn || !L.hc_f_scale || !L.hc_f_base || !L.ffn_norm)
         return RAD_E_INVAL;
     if (m.zero) return RAD_OK;
+    /* With ..._DSPARK_FP8 the trunk's lw8() (dsp_f8_gate): the same eligibility and exclusions. */
+    const auto dlw = [&](const char* name, int64_t n, int64_t k, int shard = RAD_SHARD_NONE,
+                         int64_t lo = 0, int64_t hi = 0, bool mapped = false) {
+        return m.dsp_f8 ? lw8(b, m, name, n, k, grp, shard, lo, hi, mapped)
+                        : lw(b, m, name, n, k, grp, shard, lo, hi, mapped);
+    };
     L.attn_norm = w("blk.%d.attn_norm.weight", RAD_F32, { D });
-    L.wq_a = lw(b, m, nm.f("blk.%d.attn_q_a.weight", l), c.q_lora, D, grp);
+    L.wq_a = dlw(nm.f("blk.%d.attn_q_a.weight", l), c.q_lora, D);
     L.q_norm = w("blk.%d.attn_q_a_norm.weight", RAD_F32, { c.q_lora });
-    L.wq_b = lw(b, m, nm.f("blk.%d.attn_q_b.weight", l), HD, c.q_lora, grp, RAD_SHARD_ROW, m.ar * HD,
-                (m.ar + 1) * HD);
-    L.wkv = lw(b, m, nm.f("blk.%d.attn_kv.weight", l), hd, D, grp);
+    L.wq_b = dlw(nm.f("blk.%d.attn_q_b.weight", l), HD, c.q_lora, RAD_SHARD_ROW, m.ar * HD,
+                 (m.ar + 1) * HD);
+    L.wkv = dlw(nm.f("blk.%d.attn_kv.weight", l), hd, D);
     L.kv_norm = w("blk.%d.attn_kv_a_norm.weight", RAD_F32, { hd });
     L.sinks = wts(b, g, nm.f("blk.%d.attn_sinks.weight", l), RAD_F32, { g.n_head }, grp, RAD_SHARD_ROW,
                   m.ar * g.n_head, (m.ar + 1) * g.n_head);
@@ -1857,12 +1872,12 @@ static int dsp_stage_weights(RadBuilder* b, Model& m, Layer& L, int s) {
         const int gi_ = (int)(m.ar * m.gr + j);
         const char* n = nm.f("blk.%d.attn_output_a.g%d.weight", l, gi_);
         DS_TRY(map_rows(b, n, { { ckpt_name(nm.f("blk.%d.attn_output_a.weight", l)), (int)(gi_ * c.o_rank), c.o_rank } }));
-        L.wo_a.push_back(lw(b, m, n, c.o_rank, gd, grp, RAD_SHARD_NONE, 0, 0, true));
+        L.wo_a.push_back(dlw(n, c.o_rank, gd, RAD_SHARD_NONE, 0, 0, true));
         if (!L.wo_a.back()) return RAD_E_INVAL;
     }
     const int64_t ok = m.gr * c.o_rank;
-    L.wo_b = lw(b, m, nm.f("blk.%d.attn_output_b.weight", l), D, ok, grp, RAD_SHARD_COL, m.ar * ok,
-                (m.ar + 1) * ok);
+    L.wo_b = dlw(nm.f("blk.%d.attn_output_b.weight", l), D, ok, RAD_SHARD_COL, m.ar * ok,
+                 (m.ar + 1) * ok);
     return L.attn_norm && L.wq_a && L.q_norm && L.wq_b && L.wkv && L.kv_norm && L.sinks && L.wo_b ? RAD_OK
                                                                                                   : RAD_E_INVAL;
 }
@@ -1954,8 +1969,21 @@ static int dsp_stage_ops(RadBuilder* b, Model& m, Layer& L) {
     s.cfg.route_scale = c.route_scale;
     s.cfg.swiglu_limit = c.swiglu_limit;
     s.cfg.shared_ungated = 1;
+    /* With ..._DSPARK_FP8 the shared expert's two linears as the trunk's (layer()). */
+    const bool sh_f8 = m.dsp_f8 && !f8_skipped(m, nm.f("blk.%d.ffn_gate_up_shexp.weight", l)) &&
+                       !f8_skipped(m, nm.f("blk.%d.ffn_down_shexp.weight", l));
+    s.cfg.shared_bf16_op = sh_f8 ? kDenseF8 : nullptr;
     DS_TRY(MoeFP8::probe(b, nm, l, s, &s.cfg));
     DS_TRY(L.moe.declare(b, nm, g, l, d.mw, s, false, false));
+    if (m.dsp_f8 && g.n_ff > 0)
+        for (const LinearFP8* sl : { &L.moe.sh_gate_up, &L.moe.sh_down }) {
+            if (sl->bf16_alt) {
+                ++m.f8_n;
+                m.f8_codes += sl->N * sl->K;
+            } else {
+                ++m.f8_kept;
+            }
+        }
     L.post_f = op(b, "mhc_post", hcp, {}, { d.act.x, d.h1, d.post, d.comb }, { d.h0 });
     return L.mix_a && L.col_a && L.post_a && L.mix_f && L.col_f && L.norm_f && L.post_f ? RAD_OK : RAD_E_INVAL;
 }
@@ -1970,6 +1998,9 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
     const int64_t T = g.max_tok, Q = d.Q, D = c.n_embd, HD = g.n_head * c.head_dim, hd = c.head_dim;
     const int64_t R = d.cand;
     auto bf = [&](const char* n, std::initializer_list<int64_t> s) { return decl_b(b, nm.f("%s", n), RAD_BF16, s); };
+    /* ..._DSPARK_FP8: what the drafter adds to the FP8 counts is its own (Model::dsp_f8_n). */
+    const int f8_n0 = m.f8_n, f8_kept0 = m.f8_kept;
+    const int64_t f8_codes0 = m.f8_codes;
 
     /* ---- buffers: the context pass (a trunk step's rows), the query pass (Q rows), the head */
     d.c = bf("dspark_main", { T, D });
@@ -2032,7 +2063,8 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
     const int64_t nt = (int64_t)d.taps.size();
     /* The context pass runs on the attention ranks only (an attention-zero rank keeps no keys). */
     if (!m.zero) {
-        d.fc = lw(b, m, nm.f("dspark.fc.weight"), D, nt * D, grp_model());
+        d.fc = m.dsp_f8 ? lw8(b, m, nm.f("dspark.fc.weight"), D, nt * D, grp_model())
+                        : lw(b, m, nm.f("dspark.fc.weight"), D, nt * D, grp_model());
         d.main_norm = wt(b, nm.f("dspark.enc.output_norm.weight"), RAD_F32, { D }, grp_model());
         if (!d.fc || !d.main_norm) return RAD_E_INVAL;
     }
@@ -2172,6 +2204,13 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
                            { d.mk1, d.mk2 }, { d.cand_, d.unary }, { d.tokens })))
         return RAD_E_INVAL;
 
+    m.dsp_f8_n = m.f8_n - f8_n0;
+    m.dsp_f8_kept = m.f8_kept - f8_kept0;
+    m.dsp_f8_codes = m.f8_codes - f8_codes0;
+    m.f8_n = f8_n0;
+    m.f8_kept = f8_kept0;
+    m.f8_codes = f8_codes0;
+
     RadDrafterDecl drf{};
     drf.name = "dspark";
     drf.kind = RAD_DRAFT_BLOCK;
@@ -2309,6 +2348,24 @@ static bool dense_f8_gate(RadBuilder* b, const RadModelMeta* meta, Model& m) {
     return true;
 }
 
+/* RADIANCE_EXPERIMENTAL_DS41_DSPARK_FP8=1 (Model::dsp_f8): the DSpark drafter's dense linears
+ * read by gemm_nt_bf16f8 as the trunk's are (lw8, MoeFP8::Config::shared_bf16_op), behind the
+ * trunk's gate: the same checkpoint statement and library, the same exclusions. A note and
+ * nothing else without it. The drafter's proposals are the same bits: the op gives gemm_nt's
+ * bytes (no tune cache, as for the trunk's), so only its weight reads halve. */
+static bool dsp_f8_gate(const Model& m) {
+    const char* on = std::getenv("RADIANCE_EXPERIMENTAL_DS41_DSPARK_FP8");
+    if (!on || std::strcmp(on, "1")) return false;
+    if (!m.dsp.on) return false;   /* no drafter in this serve */
+    if (!m.f8_on) {
+        fprintf(stderr, "radiance: deepseek41: RADIANCE_EXPERIMENTAL_DS41_DSPARK_FP8 is set, but the "
+                        "trunk's dense FP8 is off (RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8=1, which it "
+                        "extends to the drafter); the drafter's linears stay on gemm_nt\n");
+        return false;
+    }
+    return true;
+}
+
 /* ------------------------------------------------------------------ the consumer skip */
 /* The per-row cut's grain (RadConsumerSuffix::row_grain): the chunk quantum, the window cache's
  * 16-token blocks, on which every chunk starts. */
@@ -2421,6 +2478,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     DS_TRY(geometry(m, ctx));
     m.f8_on = dense_f8_gate(b, meta, m);
     DS_TRY(dsp_config(b, m, meta, ctx));
+    m.dsp_f8 = dsp_f8_gate(m);
     m.router_bf16 = router_bf16_on();
     if (m.router_bf16 && !rad_op_declared(b, "gemm_nt_f32bf16")) {
         fprintf(stderr, "radiance: deepseek41: RADIANCE_EXPERIMENTAL_DS41_ROUTER_BF16=1 needs "
@@ -2612,6 +2670,19 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                       ctx->rank, m.f8_n, (double)m.f8_codes / 1048576.0,
                       2.0 * (double)m.f8_codes / 1048576.0, m.f8_kept,
                       m.f8_skip.empty() ? "" : " (some by RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8_EXCLUDE)");
+        fprintf(stderr, "radiance: %s\n", msg);
+        rad_note(b, "%s", msg);
+    }
+    if (m.dsp_f8) {
+        /* ab_window.sh's Df part requires this line of an arm that sets the knob, with N above 0,
+         * and no other arm may have it. */
+        char msg[400];
+        std::snprintf(msg, sizeof msg,
+                      "deepseek41: rank %d: DSpark drafter: %d dense weights read by gemm_nt_bf16f8 "
+                      "(RADIANCE_EXPERIMENTAL_DS41_DSPARK_FP8): %.1f MiB of E4M3 codes where bf16 "
+                      "held %.1f MiB; %d left on gemm_nt",
+                      ctx->rank, m.dsp_f8_n, (double)m.dsp_f8_codes / 1048576.0,
+                      2.0 * (double)m.dsp_f8_codes / 1048576.0, m.dsp_f8_kept);
         fprintf(stderr, "radiance: %s\n", msg);
         rad_note(b, "%s", msg);
     }

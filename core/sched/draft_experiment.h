@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <cstring>
 
+#include "draft_gate.h"
+
 namespace rad {
 inline constexpr char kDraftOriginEnv[] = "RADIANCE_EXPERIMENTAL_DS41_DRAFT_ORIGIN_STATS";
 inline constexpr char kDraftComputeOffEnv[] = "RADIANCE_EXPERIMENTAL_DS41_DSPARK_COMPUTE_OFF";
@@ -13,14 +15,19 @@ class DraftExperiment {
 public:
     DraftExperiment() = default;
     static DraftExperiment capture(const char* stats, const char* off,
-                                   const char* verify_cap = nullptr) noexcept {
+                                   const char* verify_cap = nullptr,
+                                   const char* gate = nullptr) noexcept {
         DraftExperiment x;
         const bool valid_cap = !verify_cap ||
             (verify_cap[0] >= '0' && verify_cap[0] <= '5' && verify_cap[1] == '\0');
         x.cap_ = valid_cap && verify_cap ? verify_cap[0] - '0' : -1;
+        // The acceptance gate (draft_gate.h): a spec it cannot read is refused, not ignored.
+        const bool valid_gate = DraftGateCfg::parse(gate, &x.gate_);
         // A positive cap and explicit compute-OFF conflict rather than silently overriding.
-        x.valid_ = flag(stats) && flag(off) && valid_cap && !(one(off) && x.cap_ > 0);
+        x.valid_ = flag(stats) && flag(off) && valid_cap && !(one(off) && x.cap_ > 0) && valid_gate;
         x.off_ = one(off) || x.cap_ == 0;
+        // Nothing drafts with compute OFF, so a gate there would gate nothing under its name.
+        if (x.off_ && x.gate_.on) x.valid_ = false;
         x.observe_ = one(stats) || x.off_ || x.cap_ >= 0;
         return x;
     }
@@ -29,6 +36,7 @@ public:
     bool observe() const noexcept { return observe_; }
     bool head_enabled(bool declared) const noexcept { return declared && !off_; }
     int verify_cap() const noexcept { return cap_; } // -1 means the original uncapped path
+    const DraftGateCfg& gate() const noexcept { return gate_; } // the acceptance gate; off by default
     bool scope_required() const noexcept { return off_ || cap_ >= 0; }
     int runtime_depth(int configured) const noexcept {
         return off_ ? 0 : cap_ >= 0 && configured > cap_ ? cap_ : configured;
@@ -39,6 +47,7 @@ public:
 private:
     bool valid_ = true, off_ = false, observe_ = false;
     int cap_ = -1;
+    DraftGateCfg gate_{};
     static bool one(const char* x) noexcept { return x && std::strcmp(x,"1") == 0; }
     static bool flag(const char* x) noexcept {
         return !x || std::strcmp(x,"0") == 0 || std::strcmp(x,"1") == 0;

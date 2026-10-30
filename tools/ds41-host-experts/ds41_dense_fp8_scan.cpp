@@ -12,7 +12,9 @@
  *                       [--exclude OUT.txt] [--yield NAME] [--limit N]
  *
  * Entries: blk.N.{attn_q_a, attn_q_b, attn_kv, attn_output_a.gK, attn_output_b, ffn_gate_up_shexp,
- * ffn_down_shexp, indexer.attn_q_b, engram_kv}.weight, the call sites deepseek41 opts in. Each is
+ * ffn_down_shexp, indexer.attn_q_b, engram_kv}.weight, the call sites deepseek41 opts in, and in a
+ * DSpark draft bank its stages' (the same names) and dspark.fc.weight
+ * (RADIANCE_EXPERIMENTAL_DS41_DSPARK_FP8). Each is
  * read in bands of 1024 rows (whole 32-row blocks; bounded memory), dropped from the page cache
  * after use, and each band goes through the library's own r4d_rad_layout_bf16f8 and
  * r4d_rad_relayout_bf16f8 as a plain bf16 [rows, K] plane, then back through
@@ -83,6 +85,13 @@ struct Entry {
 std::string cls_of(const std::string& name, int* layer) {
     static const std::regex re(
         R"(^blk\.(\d+)\.(attn_q_a|attn_q_b|attn_kv|attn_output_a\.g\d+|attn_output_b|ffn_gate_up_shexp|ffn_down_shexp|indexer\.attn_q_b|engram_kv)\.weight$)");
+    /* A DSpark draft bank (draft.rad) holds its stages under the same blk.N names (40-42) and the
+     * drafter's input projection beside them, which ..._DSPARK_FP8 opts in too (whole on every
+     * attention rank, so no cut). */
+    if (name == "dspark.fc.weight") {
+        *layer = -1;
+        return "dspark.fc";
+    }
     std::smatch m;
     if (!std::regex_match(name, m, re)) return "";
     *layer = std::atoi(m[1].str().c_str());

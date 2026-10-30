@@ -187,7 +187,61 @@ block's first ones: the replies stay the target's, acceptance may move (the draf
 5, and a short block has never been measured). Its own ops where the block length is a parameter:
 the offsets placing every row at the block's last position, each stage's attention window (`window`
 context keys before the anchor plus the block's), and the walk. Arm part `DbN` (with a `Ds` part);
-off, nothing of it is declared.
+off, nothing of it is declared. Run in ab-20261030T070039Z with `Dk` on the best settings' DSpark
+form (`...-Pm56-Pe-Rm7-Ds1-Dk-Db2`): every reply identical; acceptance 216/268 against 217/268 for
+the full block on the held-out prompts (384/548 on chat); a drafting step 108.5 ms against 113.9
+(63.7 drafting off), so the draft costs ~0.2 of a plain step instead of ~0.3.
+
+## DSpark's acceptance gate (`RADIANCE_EXPERIMENTAL_DS41_DSPARK_GATE`)
+
+A drafting step pays when 1 + a > rho + d (a: drafts accepted; rho + d: the drafting step's cost
+in plain steps). On the best settings' DSpark form rho + d is 1.78 at cap 1 with the full block
+(ab-20261029T220909Z: 110.5 against 62.1 ms a step held-out, 126.4 against 71.4 chat) and 1.70
+with `Db2` (ab-20261030T070039Z), while acceptance per reply runs from 0.27 to 1.00. The gate
+(`core/sched/draft_gate.h`, decided in `Scheduler::block_begin`) keeps each sequence's last W
+verifies of head drafts; while the mean drafts accepted a verify is under the threshold the
+sequence drafts nothing: its query pass is skipped, the step issued ahead verifies no drafts for it
+(nor does the prompt-lookup fallback stand in), and the context pass, which fills the drafter's
+window cache, still runs. One step in R of a closed run drafts anyway, a probe whose verify enters
+the mean. A sequence drafts from its start until W verifies are in. The mean lags one verify (the
+open step's acceptance is still on the card), and nothing waits on the card.
+
+`=1` takes the defaults, threshold 0.78 (the full block's break-even at cap 1), W 8, R 8;
+`=T,W,R` sets them (T in drafts accepted a verify: at a deeper cap use that cap's rho + d - 1;
+`Db2` breaks even at 0.70). Refused at startup when unreadable, with compute OFF (`Ds0`), and
+without a block drafter. Startup line `DSpark acceptance gate: on (...)`; at shutdown a line with
+every sequence's counts (steps asked, drafted while warming up / open / as probes, gated, closed
+runs and reopenings, drafts verified and accepted, the probes'), a line of the decode steps of one
+sequence by kind (verify + draft, plain, a probe's draft, its verify) with their mean wall time and
+the measured break-even (verify + draft over plain, less one) to set T from, and a line for each of
+the last 256 sequences. `/stats` carries the same under `draft_gate`. Only how many drafts a step
+verifies changes, so replies stay identical. Arm part `Dg` or `DgTT[wW][rR]` (threshold 0.TT, or
+T.TT for three digits; W and R default to 8), with a `Ds` part other than `Ds0`.
+
+Replay of the gate on the measured per-reply acceptance (i.i.d. outcomes within a reply,
+`gate_sim2.py`-style, against drafting off with the bank): with `Db2` always-on gives +5.4%
+held-out and -0.4% chat; the gate at 0.70/8/8 +5.1% and +2.0% (+5.2% and +2.7% on 256-token
+replies), the per-reply oracle +6.2% and +5.0%. With the full block (rho + d 1.78) the gate at the
+defaults +1.6% held-out and -0.3% chat against +1.0% and -2.8% always on.
+
+## The drafter's dense linears in FP8 (`RADIANCE_EXPERIMENTAL_DS41_DSPARK_FP8`)
+
+The release ships the DSpark stages' dense linears as the trunk's: `mtp.{0,1,2}.attn.{wq_a, wq_b,
+wkv, wo_a, wo_b}`, `ffn.shared_experts.{w1, w2, w3}` and `mtp.0.main_proj` are F8_E4M3 with
+F8_E8M0 scales one per 32x32 block (model-00044..46's headers), and the draft bank holds them cast
+to bf16 (`blk.40-42.*`, `dspark.fc.weight`). With `=1` (and `..._DENSE_FP8=1`, which it extends)
+the deepseek41 plugin marks them as lw8() marks the trunk's and gives the drafter's shared expert
+`gemm_nt_bf16f8`; the load re-encodes each and refuses one that is not exactly so
+(`ds41_dense_fp8_scan` now covers a bank's `dspark.fc.weight` too; over the bank of
+ds41-dspark-bank-20261028T140400Z: 43 / 43 entries exact, 551,424 blocks, none refused, every
+tensor-parallel cut on 32). The op writes gemm_nt's bytes, so
+the drafter proposes the same tokens; the stored form halves those weights, 25 a rank (fc and, per
+stage, q_a, q_b, kv, wo_b, two wo_a groups and the shared pair): 438 MiB of bf16 become 219 MiB of
+codes on rank 0 and 415.5 become 207.8 on ranks 1-3 (`ds41_dspark_fp8_arch_test`), about 11 more
+resident experts a rank, and the draft's and the context pass's reads of them halve. Startup line per rank `deepseek41: rank R: DSpark
+drafter: N dense weights read by gemm_nt_bf16f8 (...)`, apart from the trunk's. Arm part `Df` (with
+`F8` and a `Ds` part); at the window's end each `Df` arm's `draft_n`/`draft_n_accepted` must equal
+the same arm's without `Df`.
 
 ## The draft bank's hot set in VRAM (`RADIANCE_EXPERIMENTAL_DS41_DRAFT_VRAM`)
 

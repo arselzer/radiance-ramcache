@@ -1669,6 +1669,22 @@ int FileStager::hx_init_impl(const Program& prog) {
             live = std::clamp(std::atoi(l), 1, 64);
         const char* fin = std::getenv("RADIANCE_EXPERIMENTAL_DS41_PREFETCH_FINISH");
         hx_ra_finish_ = !fin || std::strcmp(fin, "0") != 0;
+        /* RADIANCE_EXPERIMENTAL_DS41_PREFETCH_URGENT (stager.h, hx_ra_rest_): 0, 1 or 2. */
+        hx_ra_rest_ = 0;
+        if (const char* g = std::getenv("RADIANCE_EXPERIMENTAL_DS41_PREFETCH_URGENT"); g && *g) {
+            if (std::strcmp(g, "0") && std::strcmp(g, "1") && std::strcmp(g, "2")) {
+                RAD_ERR("RADIANCE_EXPERIMENTAL_DS41_PREFETCH_URGENT=%s: 0 (urgent pieces), 1 (the rest in the "
+                        "layer's own read) or 2 (the same, with the plane mirror's share)", g);
+                return RAD_E_INVAL;
+            }
+            hx_ra_rest_ = std::atoi(g);
+            if (hx_ra_rest_ && !hx_ra_finish_) {
+                if (plan_->rank == 0)
+                    RAD_WARN("read-ahead: RADIANCE_EXPERIMENTAL_DS41_PREFETCH_URGENT=%d does nothing with "
+                             "..._PREFETCH_FINISH=0 (a partly read unit is read afresh)", hx_ra_rest_);
+                hx_ra_rest_ = 0;
+            }
+        }
         PieceReader& r = PieceReader::process();
         if (!r.start(qd, piece_kb << 10)) {
             if (plan_->rank == 0)
@@ -1695,9 +1711,11 @@ int FileStager::hx_init_impl(const Program& prog) {
                          "experts are read at layer L in %lld KiB pieces, %d readers over the process, "
                          "yielding to demand reads; at most %d live units a rank; a partly read unit "
                          "its layer needs is %s", hx_pred_->k(), (long long)(r.piece_bytes() >> 10),
-                         r.readers(), live, hx_ra_finish_ ? "finished by the readers" : "read afresh");
+                         r.readers(), live, !hx_ra_finish_ ? "read afresh"
+                         : hx_ra_rest_ ? "finished by its layer's own read (below)" : "finished by the readers");
         }
     }
+    if (!hx_ra_) hx_ra_rest_ = 0;   /* no read-ahead in pieces: nothing to finish */
     if (hx_miss_rows_ > 0 && hx_bg_.empty()) {
         hx_bg_stop_ = false;
         int n = 4;
@@ -1710,6 +1728,19 @@ int FileStager::hx_init_impl(const Program& prog) {
                      hx_miss_rows_);
         /* A second copy of the planes on another drive, read beside the container (plane_mirror.h). */
         RAD_TRY(mover_->mirror_init());
+        /* ..._PREFETCH_URGENT on every rank, once its decode mirror is known: what a partly read
+         * unit's rest is read from. */
+        if (hx_ra_ && hx_ra_rest_) {
+            const int64_t mb = mover_->decode_mirror_bytes();
+            RAD_INFO("read-ahead: rank %d reads the rest of a partly read unit its layer needs in the "
+                     "layer's own call on the kept readers (RADIANCE_EXPERIMENTAL_DS41_PREFETCH_URGENT=%d), %s",
+                     plan_->rank, hx_ra_rest_,
+                     hx_ra_rest_ == 2 && mb > 0
+                         ? fmt("with the plane mirror's decode share of it (%s of a whole unit)",
+                               humanb(mb).c_str()).c_str()
+                         : hx_ra_rest_ == 2 ? "from the container alone: this rank has no decode mirror"
+                                            : "from the container alone");
+        }
         if (const char* a = std::getenv("RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_ASYNC_MISSES");
             a && std::atoi(a) > 0 && !hx_mw_.joinable()) {
             hx_async_rows_ = std::atoi(a);
@@ -1724,7 +1755,8 @@ int FileStager::hx_init_impl(const Program& prog) {
          * readers at the choice instead of after hx_submit (its pool wake, 28-32 us a layer) and
          * the copy path's staging; the same reads, so the same bytes. Units read ahead whole and
          * the ones the piece readers finish (..._PREFETCH=pieces) are not among them, as in
-         * hx_submit_misses_now (hx_unread_misses). */
+         * hx_submit_misses_now (hx_unread_misses); with ..._PREFETCH_URGENT a stopped unit's rest
+         * is. */
         if (const char* mp = std::getenv("RADIANCE_EXPERIMENTAL_DS41_MISS_POST"); mp && !std::strcmp(mp, "1")) {
             hx_miss_post_on_ = true;
             if (plan_->rank == 0)
@@ -1775,7 +1807,10 @@ void FileStager::hx_choose(int32_t li) {
     hx_ra_handed_ = 0;
     hx_slot_.assign(want_.size(), -1);
     const bool ra = hx_ra_ && pass_tok_ == 1;   /* read-ahead in pieces: this layer's units */
-    if (ra) hx_ra_begin(li);
+    if (ra) {
+        hx_ra_begin(li);
+        hx_ra_chose_ns_ = rt_now_ns();
+    }
     const double cb = hx_pool_->cpu_bytes_per_ns(), lb = hx_pool_->link_bytes_per_ns();
     const bool misses = hx_miss_rows_ > 0 && pass_tok_ <= hx_miss_rows_;
     int64_t link = 0;
@@ -2336,20 +2371,39 @@ void FileStager::hx_mw_loop() {
     }
 }
 
-/* The misses hx_submit_misses_now reads (stager.h): neither read ahead whole nor urgent. */
-bool FileStager::hx_unread_misses(std::vector<Mover::HostPlanes*>* out) const {
-    bool urgent = false;   /* units the piece readers are finishing for this layer */
+/* The misses hx_submit_misses_now reads (stager.h): neither read ahead whole nor finished by the
+ * piece readers; with ..._PREFETCH_URGENT also the rest of the stopped units. */
+bool FileStager::hx_unread_misses(std::vector<Mover::HostPlanes*>* out, std::vector<Mover::PlanesIn>* in,
+                                  bool* alone) const {
+    int fin = 0, other = 0;   /* partly read units finished for this layer; misses read whole */
     for (size_t i = 0; i < hx_miss_.size(); ++i) {
-        if (i < hx_miss_ra_.size() && hx_miss_ra_[i]) urgent = true;
-        else if (i >= hx_miss_ready_.size() || !hx_miss_ready_[i]) out->push_back(hx_miss_[i].get());
+        const ReadAheadUnit* ra = i < hx_miss_ra_.size() ? hx_miss_ra_[i].get() : nullptr;
+        if (ra) {
+            ++fin;
+            if (!hx_ra_rest_) continue;   /* the piece readers read the rest */
+            /* Stopped (hx_ra_take): the pieces started are the readers', the rest is this call's;
+             * every piece started leaves only the wait for them. */
+            Mover::PlanesIn f;
+            for (int w = 0; w < 2; ++w) f.bytes[w] = ra->front(w);
+            if (f.bytes[0] >= ra->extent(0).len && f.bytes[1] >= ra->extent(1).len) continue;
+            out->push_back(hx_miss_[i].get());
+            in->push_back(f);
+        } else if (i >= hx_miss_ready_.size() || !hx_miss_ready_[i]) {
+            ++other;
+            out->push_back(hx_miss_[i].get());
+            in->push_back(Mover::PlanesIn{});
+        }
     }
-    return urgent;
+    if (alone) *alone = fin == 1 && other == 0;
+    return fin > 0;
 }
 
 /* Reads the misses' planes (rows: the pass's tokens) and submits their jobs to the pool. */
 int FileStager::hx_submit_misses_now(int rows) {
     std::vector<Mover::HostPlanes*> ptrs;
-    const bool urgent = hx_unread_misses(&ptrs);
+    std::vector<Mover::PlanesIn> in;
+    bool alone = false;
+    const bool urgent = hx_unread_misses(&ptrs, &in, &alone);
     const auto t0 = std::chrono::steady_clock::now();
     Mover::PlaneReadTiming tm;
     bool read = false;
@@ -2383,7 +2437,11 @@ int FileStager::hx_submit_misses_now(int rows) {
             hx_miss_posted_ = false;
             ok = mover_->finish_unit_planes(&tm, wake);
             read = true;
-            if (ptrs != hx_miss_post_ptrs_) {
+            bool same = ptrs == hx_miss_post_ptrs_ && in.size() == hx_miss_post_in_.size();
+            for (size_t i = 0; same && i < in.size(); ++i)
+                same = in[i].bytes[0] == hx_miss_post_in_[i].bytes[0] &&
+                       in[i].bytes[1] == hx_miss_post_in_[i].bytes[1];
+            if (!same) {
                 demand.demand_leave();
                 RAD_ERR("host experts: layer %d's misses changed after their reads were posted",
                         layers_[(size_t)hx_li_].layer);
@@ -2392,9 +2450,17 @@ int FileStager::hx_submit_misses_now(int rows) {
         } else {
             demand.demand_enter();
             if (!ptrs.empty()) {
-                ok = mover_->read_unit_planes(ptrs.data(), (int)ptrs.size(), rows, &tm, wake);
+                /* With ..._PREFETCH_URGENT the stopped units' rest in the same call, the readers
+                 * taking it beside the new misses while their pieces in flight land. */
+                ok = mover_->read_unit_planes(ptrs.data(), (int)ptrs.size(), rows, &tm,
+                                              hx_ra_rest_ ? in.data() : nullptr, hx_ra_rest_ == 2, wake);
                 read = true;
             }
+        }
+        if (read) {
+            hx_stats_.ra_rest += (uint64_t)tm.rest;
+            hx_stats_.ra_rest_bytes += (uint64_t)tm.rest_bytes;
+            hx_stats_.ra_rest_mirror_bytes += (uint64_t)tm.rest_mirror_bytes;
         }
         if (ok && urgent) ok = hx_ra_settle(rows);
         demand.demand_leave();
@@ -2402,6 +2468,17 @@ int FileStager::hx_submit_misses_now(int rows) {
             RAD_ERR("host experts: reading layer %d's missed units for the CPU failed",
                     layers_[(size_t)hx_li_].layer);
             return RAD_E_IO;
+        }
+        /* The layer's wait for its partly read units, either way they were finished: from its
+         * choice, where urgent pieces start (a rest's read starts here, in this call). */
+        if (urgent) {
+            const uint64_t ns = rt_now_ns() - hx_ra_chose_ns_;
+            ++hx_stats_.ra_fin_layers;
+            hx_stats_.ra_fin_ns += ns;
+            if (alone) {
+                ++hx_stats_.ra_alone;
+                hx_stats_.ra_alone_ns += ns;
+            }
         }
     }
     /* Units read ahead whole: handed over only from the container the program was loaded from. */
@@ -2465,18 +2542,24 @@ int FileStager::hx_submit_misses_now(int rows) {
  * Only where hx_submit_misses_now reads on this thread (one-token passes, not on hx_mw_). Never a
  * unit read ahead (..._PREFETCH): whole ones are not read again, and an urgent one is the piece
  * readers' until hx_ra_settle, which may give its slot fresh planes and the old ones back to the
- * free list. A demand read from the post on (PieceReader's count: no read-ahead piece starts) until
- * hx_submit_misses_now or hx_join_miss_post leaves it. Nothing posted (one in flight, no kept
- * readers, the readers busy with another thread's call): hx_submit_misses_now reads as before. */
+ * free list. With ..._PREFETCH_URGENT a stopped unit's rest is posted too: no reader starts a piece
+ * of it any more, its pieces in flight land before the rest's offsets, and hx_ra_settle runs only
+ * after the post's finish. A demand read from the post on (PieceReader's count: no read-ahead piece
+ * starts) until hx_submit_misses_now or hx_join_miss_post leaves it. Nothing posted (one in flight,
+ * no kept readers, the readers busy with another thread's call): hx_submit_misses_now reads as
+ * before. */
 void FileStager::hx_post_misses() {
     if (hx_miss_posted_ || pass_tok_ != 1 || (hx_async_ && pass_tok_ >= hx_async_rows_)) return;
     hx_miss_post_ptrs_.clear();
-    (void)hx_unread_misses(&hx_miss_post_ptrs_);
+    hx_miss_post_in_.clear();
+    (void)hx_unread_misses(&hx_miss_post_ptrs_, &hx_miss_post_in_);
     if (hx_miss_post_ptrs_.empty()) return;
     PieceReader& demand = PieceReader::process();
     demand.demand_enter();
     hx_miss_posted_ = mover_->start_unit_planes(hx_miss_post_ptrs_.data(),
-                                                (int)hx_miss_post_ptrs_.size(), (int)pass_tok_);
+                                                (int)hx_miss_post_ptrs_.size(), (int)pass_tok_,
+                                                hx_ra_rest_ ? hx_miss_post_in_.data() : nullptr,
+                                                hx_ra_rest_ == 2);
     if (!hx_miss_posted_) demand.demand_leave();
 }
 
@@ -2492,12 +2575,14 @@ void FileStager::hx_join_miss_post() {
 /* One one-token miss read's timing into hx_stats_.mr (see HostStats::MissReads), and with
  * ..._HOST_EXPERTS_PREWAKE its landing into the ring the next reads' pre-wake time comes from. */
 void FileStager::hx_note_reads(const Mover::PlaneReadTiming& t) {
-    if (hx_wake_) {
+    /* Not a call that carried a read-ahead unit's rest (..._PREFETCH_URGENT): the pre-wake is armed
+     * only in layers with no unit being finished, so their landings predict fresh reads alone. */
+    if (hx_wake_ && !t.rest) {
         const int k = t.units == 1 ? 0 : 1;
         const int64_t land = std::max(t.container_ns, t.mirror_ns);
         if (land > 0) hx_wake_ring_[k][hx_wake_seen_[k]++ % kWakeRing] = land;
     }
-    HostStats::MissReads& s = hx_stats_.mr[t.units == 1 ? 0 : 1];
+    HostStats::MissReads& s = hx_stats_.mr[t.rest ? 2 : t.units == 1 ? 0 : 1];
     ++s.calls;
     s.posted += t.posted;
     s.split += t.mirror_reads > t.units;
@@ -2868,14 +2953,18 @@ std::shared_ptr<Mover::HostPlanes> FileStager::hx_ra_take(int32_t u, bool* ready
     }
     /* Barely started: the demand read with the plane mirror's share beats the container alone for
      * the rest (or ..._PREFETCH_FINISH=0). A fresh buffer, since pieces in flight still land in
-     * this one. */
-    if (!hx_ra_finish_ || (int64_t)ra->started() * hx_ra_->piece_bytes() < mover_->decode_mirror_bytes()) {
+     * this one. With ..._PREFETCH_URGENT=2 the rest takes the mirror's share too: finished. */
+    if (!hx_ra_finish_ || (hx_ra_rest_ != 2 && (int64_t)ra->started() * hx_ra_->piece_bytes() <
+                                                   mover_->decode_mirror_bytes())) {
         hx_ra_->cancel(*ra);
         ++hx_stats_.ra_fresh;
         hx_stats_.ra_dropped_bytes += (uint64_t)ra->bytes_in();
         return nullptr;
     }
-    hx_ra_->make_urgent(*ra);
+    /* Finished: the readers read the rest as urgent pieces, or (..._PREFETCH_URGENT) they start no
+     * further piece and the layer's own call reads the rest (hx_unread_misses). */
+    if (hx_ra_rest_) hx_ra_->stop(*ra);
+    else hx_ra_->make_urgent(*ra);
     ++hx_stats_.ra_finished;
     hx_stats_.ra_used_bytes += (uint64_t)ra->bytes_in();
     *urgent = std::move(ra);
@@ -2891,15 +2980,17 @@ void FileStager::hx_ra_drop(RaEntry& e, bool hit) {
     e.p.reset();
 }
 
-/* Inside the demand read: the urgent units' last pieces, then the units with a failed piece read
- * again whole into fresh buffers, and the container's epoch. */
+/* Inside the demand read: the urgent units' last pieces (..._PREFETCH_URGENT: the stopped units'
+ * pieces in flight, their rest read by the layer's call before this), then the units with a failed
+ * piece read again whole into fresh buffers, and the container's epoch. */
 bool FileStager::hx_ra_settle(int rows) {
     std::vector<Mover::HostPlanes*> again;
     for (size_t i = 0; i < hx_miss_ra_.size() && i < hx_miss_.size(); ++i) {
         std::shared_ptr<ReadAheadUnit>& ra = hx_miss_ra_[i];
         if (!ra) continue;
         hx_stats_.ra_wait_ns += hx_ra_->wait(*ra);
-        if (!ra->whole()) {
+        /* A stopped unit is never whole by its pieces: the rest was the call's. */
+        if (hx_ra_rest_ ? ra->failed() : !ra->whole()) {
             ++hx_stats_.ra_refetched;
             hx_miss_[i] = hx_planes_get(hx_miss_[i]->unit);
             again.push_back(hx_miss_[i].get());

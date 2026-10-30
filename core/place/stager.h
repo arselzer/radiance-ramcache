@@ -317,6 +317,16 @@ public:
         uint64_t ra_unselected = 0, ra_cached = 0, ra_stale = 0;
         uint64_t ra_misses = 0, ra_miss_planned = 0;
         uint64_t ra_used_bytes = 0, ra_dropped_bytes = 0, ra_wait_ns = 0;
+        /* The layers that finished partly read units (either way): their time from the layer's
+         * choice (hx_choose took the units: urgent pieces start there, a rest's read a little
+         * later) until every such unit was whole; and of them the layers with one such unit and
+         * nothing else to read, which is that unit's own wait: the per-unit wait to compare with
+         * and without ..._PREFETCH_URGENT. */
+        uint64_t ra_fin_layers = 0, ra_fin_ns = 0, ra_alone = 0, ra_alone_ns = 0;
+        /* ..._PREFETCH_URGENT: finished units whose rest their layer's own call read on the kept
+         * readers, the rest's bytes, and of them the plane mirror's (ra_wait_ns is then the wait,
+         * after that call, for their pieces in flight). */
+        uint64_t ra_rest = 0, ra_rest_bytes = 0, ra_rest_mirror_bytes = 0;
         uint64_t linked = 0;          /* cached experts the schedule left on the copy link */
         uint64_t missed = 0;          /* routed experts the RAM cache did not hold */
         uint64_t wait_ns = 0;         /* the issuing thread waiting at gathers for the CPU */
@@ -346,7 +356,8 @@ public:
         uint64_t wk_rt = 0, wk_rt_ready = 0, wk_rt_gap_ns = 0, wk_rt_call_ns = 0;
         uint64_t wk_rd_armed = 0, wk_rd_fired = 0, wk_rd_lead_ns = 0, wk_rd_early_ns = 0;
         /* One-token passes' miss reads (Mover::PlaneReadTiming), [0] those of one missed unit and
-         * [1] of more: calls; posted at the choice (..._MISS_POST); with the mirror's tail in
+         * [1] of more, [2] those with a read-ahead unit's rest (..._PREFETCH_URGENT, whatever else
+         * they read): calls; posted at the choice (..._MISS_POST); with the mirror's tail in
          * pieces (..._MIRROR_SPLIT). Of the calls with a mirror leg and a container leg: those the
          * mirror landed last in, and how far the last leg trailed the other, summed by which one
          * it was. Then sums from the dispatch: the mirror leg (its copy included), its longest
@@ -360,10 +371,13 @@ public:
             uint64_t first_ns = 0, first_container_ns = 0, last_start_ns = 0, back_ns = 0;
             uint64_t join_ns = 0, total_ns = 0;
         };
-        MissReads mr[2];
+        MissReads mr[3];
     };
     const HostStats& host_stats() const { return hx_stats_; }
     bool host_experts() const { return hx_pool_ != nullptr; }
+    /* RADIANCE_EXPERIMENTAL_DS41_PREFETCH_URGENT as it took effect (0: off, or no read-ahead in
+     * pieces to finish). */
+    int  prefetch_urgent() const { return hx_ra_rest_; }
     /* RADIANCE_EXPERIMENTAL_DS41_ROUTE_TRACE (route_trace.h): this rank's part. Passes and layer
      * records written; of the layers, one-token ones; layers with rank 0's router outputs, with
      * its logits, with a RAM-cache snapshot; bias records; layers whose router op this pass did
@@ -729,9 +743,21 @@ private:
     /* ..._PREFETCH_FINISH (1): a partly read unit its layer selects is finished by the readers
      * (urgent); 0 cancels it and the layer reads it afresh, as a unit barely started always is. */
     bool    hx_ra_finish_ = true;
+    /* RADIANCE_EXPERIMENTAL_DS41_PREFETCH_URGENT (0): 1 or 2 finish a partly read unit with large
+     * reads instead of urgent pieces: hx_ra_take stops it (no further piece starts), and its
+     * layer's own call -- the one that reads the layer's other misses, on the mover's kept
+     * readers -- reads the rest of each extent past the pieces started (hx_unread_misses, PlanesIn),
+     * while the pieces in flight land; hx_ra_settle then waits for those. The same bytes at the
+     * same offsets. 1: the rest from the container alone; 2: the plane mirror takes its decode
+     * share of the rest beside it (Mover::rest_mirror_tail), so a barely started unit is
+     * finished too, never read afresh. Needs ..._PREFETCH_FINISH (on by default). */
+    int     hx_ra_rest_ = 0;
     int     hx_ra_handed_ = 0;               /* whole units handed to this layer: no drive read at
                                               * the layer; the epoch is checked before their jobs */
-    /* Parallel to hx_miss_: the unit the readers are finishing for this layer, or null. */
+    uint64_t hx_ra_chose_ns_ = 0;            /* when hx_choose took this layer's units (steady ns):
+                                              * where the per-unit wait (ra_fin_ns) starts */
+    /* Parallel to hx_miss_: the unit the readers are finishing for this layer (with
+     * ..._PREFETCH_URGENT: stopped, its rest the layer's call's), or null. */
     std::vector<std::shared_ptr<ReadAheadUnit>> hx_miss_ra_;
     static void hx_ra_ready(void* ctx, uint32_t pass, int layer, const int32_t* experts, int k);
     static int  hx_ra_read(void* ctx, const PlaneExtent& piece);
@@ -739,36 +765,45 @@ private:
     /* At layer li's routing: its live units into hx_ra_here_, stale ones dropped. */
     void hx_ra_begin(int32_t li);
     /* Layer li's selected miss u: its planes when read ahead (whole: *ready; partly read: *urgent,
-     * the readers finish it), or null when the layer reads it as any miss. */
+     * the readers finish it, or with ..._PREFETCH_URGENT it is stopped and the layer's call reads
+     * its rest), or null when the layer reads it as any miss. */
     std::shared_ptr<Mover::HostPlanes> hx_ra_take(int32_t u, bool* ready,
                                                   std::shared_ptr<ReadAheadUnit>* urgent);
     /* Drops a unit the layer does not read (hit: a RAM-cache hit, else not selected). */
     void hx_ra_drop(RaEntry& e, bool hit);
     /* Cancels this rank's live units of passes before `pass`, and of `pass` up to routed layer li. */
     void hx_ra_drop_stale(uint32_t pass, int32_t li);
-    /* hx_submit_misses_now's part: waits for the urgent units, re-reads failed ones whole, checks
-     * the container's epoch. False on a failed read. */
+    /* hx_submit_misses_now's part: waits for the urgent units (with ..._PREFETCH_URGENT, for the
+     * pieces in flight of the stopped ones, whose rest the layer's call has read), re-reads failed
+     * ones whole, checks the container's epoch. False on a failed read. */
     bool hx_ra_settle(int rows);
     std::vector<std::shared_ptr<Mover::HostPlanes>> hx_miss_;     /* this layer's */
     std::vector<std::unique_ptr<Mover::HostPlanes>> hx_planes_free_;
     std::mutex hx_planes_mu_;
     std::shared_ptr<Mover::HostPlanes> hx_planes_get(int32_t unit);
     int  hx_submit_misses();
-    /* The misses hx_submit_misses_now reads, into *out: the layer's not read ahead whole and not
-     * being finished by the piece readers. True when some are (urgent: hx_ra_settle waits for
-     * them, and may give their slots fresh planes). */
-    bool hx_unread_misses(std::vector<Mover::HostPlanes*>* out) const;
+    /* The misses hx_submit_misses_now reads, into *out, with what each has in already into *in:
+     * the layer's not read ahead whole and not being finished by the piece readers (nothing in),
+     * and with ..._PREFETCH_URGENT its stopped units that have a rest (their pieces started in).
+     * True when the layer finishes partly read units (urgent: hx_ra_settle waits for them, and
+     * may give their slots fresh planes). *alone: one such unit and nothing else to read. */
+    bool hx_unread_misses(std::vector<Mover::HostPlanes*>* out, std::vector<Mover::PlanesIn>* in,
+                          bool* alone = nullptr) const;
     /* RADIANCE_EXPERIMENTAL_DS41_MISS_POST=1: a one-token pass's missed planes start on the
      * mover's kept readers as soon as hx_choose knows them (hx_post_misses, before hx_submit), and
      * hx_submit_misses_now waits for them before anything else reads on those readers
      * (hx_ra_settle); hx_join_miss_post on every other way out (HxMissPostJoin in start_ep_routed
-     * and hx_early_decide, hx_drain). The post takes hx_unread_misses' set -- never an urgent unit,
-     * whose slot hx_ra_settle may refill -- and is a demand read from the post on
+     * and hx_early_decide, hx_drain). The post takes hx_unread_misses' set -- never a unit the
+     * piece readers are finishing, whose slot hx_ra_settle may refill, but with
+     * ..._PREFETCH_URGENT a stopped unit's rest: no reader starts a piece of it any more, its
+     * pieces in flight land before its rest's offsets, and hx_ra_settle, which may refill its
+     * slot, runs only after the post's finish -- and is a demand read from the post on
      * (PieceReader::demand_enter; left after the finish). hx_miss_posted_: a posted read awaits its
      * finish; only the issuing thread. (Not the predictor's post: hx_pred_->post, d_post_ns.) */
     bool hx_miss_post_on_ = false;
     bool hx_miss_posted_ = false;
     std::vector<Mover::HostPlanes*> hx_miss_post_ptrs_;
+    std::vector<Mover::PlanesIn>    hx_miss_post_in_;
     void hx_post_misses();
     void hx_join_miss_post();
     struct HxMissPostJoin {

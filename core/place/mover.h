@@ -644,13 +644,28 @@ public:
         int64_t join_ns = 0;        /* posted: the caller came to wait (finish_unit_planes) */
         int64_t return_ns = 0;      /* the caller back, every read landed */
         int64_t t0_ns = 0;          /* the dispatch itself (steady clock ns) */
+        /* Units read past bytes they had in already (PlanesIn: a read-ahead's rest), and the
+         * bytes read for them, of those the plane mirror's. */
+        int     rest = 0;
+        int64_t rest_bytes = 0, rest_mirror_bytes = 0;
     };
-    /* `rows`: the pass's tokens, which decide whether the plane mirror takes a share. `hook`: a call
-     * on the issuing thread while it waits for the kept readers, its at_ns counted from the call's
-     * dispatch (NativeReadWorkers::WaitHook; the CPU pool's pre-wake, stager.h hx_wake_*); none on
-     * the threads-a-call fallback. */
+    /* A unit whose planes are partly in already (a read-ahead's pieces, readahead.h): the first
+     * bytes[k] of weight k's extent -- [a0, a0 + len) as lay_out_unit_planes laid it out -- are
+     * read, or being read, by someone else, and a call reads only the rest of each extent, into
+     * the same places; each is 0, a multiple of the O_DIRECT alignment, or the whole extent. All
+     * zero: the whole unit, as without. */
+    struct PlanesIn { int64_t bytes[2] = { 0, 0 }; };
+    /* `rows`: the pass's tokens, which decide whether the plane mirror takes a share. `in` (one a
+     * unit, or null for none): what each unit has in already; `rest_mirror`: the plane mirror
+     * takes its decode share of such a unit's rest (rest_mirror_tail), else the rest is read from
+     * the container alone (RADIANCE_EXPERIMENTAL_DS41_PREFETCH_URGENT=2 / 1). A unit with bytes
+     * in must be laid out where they are (its buffers big enough already): it is never moved.
+     * `hook`: a call on the issuing thread while it waits for the kept readers, its at_ns counted
+     * from the call's dispatch (NativeReadWorkers::WaitHook; the CPU pool's pre-wake, stager.h
+     * hx_wake_*); none on the threads-a-call fallback. */
     using ReadWaitHook = NativeReadWorkers::WaitHook;
     bool  read_unit_planes(HostPlanes* const* units, int n, int rows = 1, PlaneReadTiming* timing = nullptr,
+                           const PlanesIn* in = nullptr, bool rest_mirror = false,
                            const ReadWaitHook* hook = nullptr);
     /* read_unit_planes in two halves, for the issuing thread (RADIANCE_EXPERIMENTAL_DS41_MISS_POST):
      * start_unit_planes hands the reads to the kept readers and returns at once, so they run while
@@ -660,8 +675,23 @@ public:
      * another thread's read_unit_planes -- start never waits for them -- or a unit not eligible),
      * read as before. One call in flight a Mover; the same thread calls both, and calls nothing
      * else that reads planes between them; the units' buffers stay put until the finish. */
-    bool  start_unit_planes(HostPlanes* const* units, int n, int rows);
+    bool  start_unit_planes(HostPlanes* const* units, int n, int rows, const PlanesIn* in = nullptr,
+                            bool rest_mirror = false);
     bool  finish_unit_planes(PlaneReadTiming* timing = nullptr, const ReadWaitHook* hook = nullptr);
+    /* One read of a weight's extent, in bytes from its a0: the container's, or the plane mirror's
+     * copy of the same bytes (mirror). */
+    struct PlaneSpan { int64_t off = 0, len = 0; bool mirror = false; };
+    /* The reads of an extent of `len` bytes whose first `in` are in already, the plane mirror
+     * taking [end - tail, end) (end: its codes plane's end; tail 0: no mirror): the container's
+     * head up to the mirror's part, the mirror's part, the container's tail past `end`, each only
+     * where bytes are left, into out in that order. Returns how many (0: nothing left). With
+     * nothing in, the reads read_unit_planes has always made of a whole extent. */
+    static int plane_spans(int64_t len, int64_t in, int64_t end, int64_t tail, PlaneSpan out[3]);
+    /* The mirror's part of a unit's rest (RADIANCE_EXPERIMENTAL_DS41_PREFETCH_URGENT=2): the decode
+     * tail `tail` scaled by the share of the unit's `total` bytes still to read (`left`), at most
+     * the mirrored w3 codes (`w3` bytes ending at `end`) past `in`, rounded down to `align`. */
+    static int64_t rest_mirror_tail(int64_t tail, int64_t left, int64_t total, int64_t in,
+                                    int64_t end, int64_t w3, int64_t align);
     bool  unit_planes_started() const { return plane_posted_; }
     bool  host_planes_eligible(int32_t u) const;   /* what read_unit_planes accepts */
     /* lay_out_unit_planes  for a read-ahead (readahead.h): unit p->unit laid out in p exactly as
@@ -943,6 +973,8 @@ private:
         std::vector<Read> reads;
         std::atomic<size_t> next{ 0 };
         int weights = 0, units = 0;
+        int rest = 0;                                    /* PlaneReadTiming::rest */
+        int64_t rest_bytes = 0, rest_mirror_bytes = 0;   /* ...and its bytes */
         bool posted = false;
         int64_t t0 = 0;        /* steady_clock ns: the dispatch */
         int64_t join_ns = 0;   /* posted: the caller came to wait, from t0 */
@@ -950,7 +982,8 @@ private:
     };
     PlaneCall plane_call_;
     bool      plane_posted_ = false;
-    bool plane_reads(HostPlanes* const* units, int n, int rows, PlaneCall* c);
+    bool plane_reads(HostPlanes* const* units, int n, int rows, PlaneCall* c,
+                     const PlanesIn* in = nullptr, bool rest_mirror = false);
     bool plane_reads_done(PlaneCall* c, bool readers_failed, PlaneReadTiming* timing);
     bool                 native_file_workers_on_ = false;
     int  read_relaid(const WeightInfo& w, void* dst, int64_t dst_cap, RelayIn* in);

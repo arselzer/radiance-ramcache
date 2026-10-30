@@ -968,8 +968,34 @@ void Mover::PlaneCall::operator()(int) {
     }
 }
 
-/* The call's reads: each unit's buffers sized and its planes' pointers set, a read an extent. */
-bool Mover::plane_reads(HostPlanes* const* units, int n, int rows, PlaneCall* c) {
+int Mover::plane_spans(int64_t len, int64_t in, int64_t end, int64_t tail, PlaneSpan out[3]) {
+    in = std::max<int64_t>(in, 0);
+    if (len <= 0 || in >= len) return 0;
+    int n = 0;
+    /* The mirror's part only where it lies whole in what is left of the codes plane. */
+    if (tail > 0 && end <= len && end - tail >= in) {
+        const int64_t cut = end - tail;
+        if (cut > in) out[n++] = PlaneSpan{ in, cut - in, false };
+        out[n++] = PlaneSpan{ cut, tail, true };
+        if (len > end) out[n++] = PlaneSpan{ end, len - end, false };
+        return n;
+    }
+    out[n++] = PlaneSpan{ in, len - in, false };
+    return n;
+}
+
+int64_t Mover::rest_mirror_tail(int64_t tail, int64_t left, int64_t total, int64_t in, int64_t end,
+                                int64_t w3, int64_t align) {
+    if (tail <= 0 || left <= 0 || total <= 0 || align <= 0 || in >= end) return 0;
+    int64_t t = left >= total ? tail : (int64_t)((double)tail * ((double)left / (double)total));
+    t = std::min({ t, end - std::max<int64_t>(in, 0), w3 });
+    return t > 0 ? t / align * align : 0;
+}
+
+/* The call's reads: each unit's buffers sized and its planes' pointers set, a read an extent (or,
+ * for a unit with bytes in already, a read of what is left of each extent: PlanesIn). */
+bool Mover::plane_reads(HostPlanes* const* units, int n, int rows, PlaneCall* c, const PlanesIn* in,
+                        bool rest_mirror) {
     if (!units || n <= 0 || !plan_ || !prog_ || !relayout_ || !file_.ok() || !mapped_file_cache_on_)
         return false;
     /* As read_native_file: the container must still be the one the Program was loaded from,
@@ -982,6 +1008,8 @@ bool Mover::plane_reads(HostPlanes* const* units, int n, int rows, PlaneCall* c)
     c->next.store(0);
     c->weights = 0;
     c->units = n;
+    c->rest = 0;
+    c->rest_bytes = c->rest_mirror_bytes = 0;
     c->posted = false;
     c->join_ns = 0;
     /* Passes of min_rows or more take the mirror's share, smaller ones (decode) its decode share. */
@@ -991,6 +1019,7 @@ bool Mover::plane_reads(HostPlanes* const* units, int n, int rows, PlaneCall* c)
     c->mirror = mirror;
     /* A lone decode miss's tail in pieces (mirror_split; the default 1 is one read, as before). */
     const int pieces = mirror && n == 1 && rows < pm->min_rows() ? mirror_split() : 1;
+    const int64_t A = DirectFile::alignment();
     for (int i = 0; i < n; ++i) {
         HostPlanes* p = units[i];
         const int32_t u = p ? p->unit : -1;
@@ -999,33 +1028,66 @@ bool Mover::plane_reads(HostPlanes* const* units, int n, int rows, PlaneCall* c)
         if (us.tier != Tier::SSD || us.slab_slot >= 0 || us.klass < 0) return false;
         const MoveUnit& mu = plan_->units[(size_t)u];
         if (mu.weights.size() != 2) return false;
-        p->n = 0;
+        const PlanesIn got = in ? in[i] : PlanesIn{};
+        const bool part = got.bytes[0] != 0 || got.bytes[1] != 0;
+        if (part) {
+            /* Laid out for this unit already (lay_out_unit_planes), its first bytes in or landing:
+             * kept as it is, since a new layout could move the buffers under them. */
+            if (p->n != 2) return false;
+            for (int k = 0; k < 2; ++k) {
+                const int64_t b = got.bytes[k];
+                if (p->w[k] != mu.weights[(size_t)k] || !p->buf[k] || b < 0 || b > p->len[k] ||
+                    (b < p->len[k] && b % A))
+                    return false;
+            }
+            ++c->rest;
+        } else {
+            p->n = 0;
+            for (int k = 0; k < 2; ++k)
+                if (!lay_out_weight(p, k, mu.weights[(size_t)k])) return false;
+        }
+        const int64_t total = p->len[0] + p->len[1];
+        const int64_t left = total - got.bytes[0] - got.bytes[1];
         for (int k = 0; k < 2; ++k) {
-            if (!lay_out_weight(p, k, mu.weights[(size_t)k])) return false;
             const WeightInfo& w = prog_->weights[mu.weights[(size_t)k]];
-            const int64_t a0 = p->a0[k], hi = a0 + p->len[k];
-            ++c->weights;
+            const int64_t a0 = p->a0[k], b = got.bytes[k];
             /* The gate_up codes' tail from the mirror (mirror_init checked the layout: codes, then
-             * scales, both 4 KiB-aligned): the container reads the head and the scales. */
+             * scales, both 4 KiB-aligned): the container reads the head and the scales. A unit's
+             * rest takes the mirror's share of what is left (..._PREFETCH_URGENT=2), or none. */
             const PlaneMirror::Ref* m = mirror && (size_t)u < mirror_ref_.size() &&
                 mirror_ref_[(size_t)u].shard >= 0 && mirror_k_[(size_t)u] == k ? &mirror_ref_[(size_t)u] : nullptr;
+            int64_t end = 0, t = 0;
             if (m) {
-                const int64_t codes = (int64_t)w.file_plane_offset[0] - a0;
-                const int64_t end = codes + (int64_t)(2 * m->bytes), cut = end - tail;
-                /* At the front, in order; one piece (no split) as the unit's one mirror read. */
-                int64_t piece[4];
-                const int np = PlaneMirror::split(tail, pieces, piece);
-                int64_t at = 0;
-                for (int q = 0; q < np; at += piece[q], ++q)
-                    reads.insert(reads.begin() + q, Read{ w.file_id, a0 + cut + at, piece[q],
-                                                          p->buf[k] + cut + at, piece[q], m,
-                                                          m->bytes - (uint64_t)(tail - at) });
-                reads.push_back(Read{ w.file_id, a0, cut, p->buf[k], cut, nullptr, 0 });
-                reads.push_back(Read{ w.file_id, a0 + end, hi - a0 - end, p->buf[k] + end,
-                                      p->cap[k] - end, nullptr, 0 });
-                continue;
+                end = (int64_t)w.file_plane_offset[0] - a0 + (int64_t)(2 * m->bytes);
+                t = !part ? tail
+                    : rest_mirror ? rest_mirror_tail(tail, left, total, b, end, (int64_t)m->bytes, A) : 0;
             }
-            reads.push_back(Read{ w.file_id, a0, hi - a0, p->buf[k], p->cap[k], nullptr, 0 });
+            PlaneSpan sp[3];
+            const int ns = plane_spans(p->len[k], b, end, t, sp);
+            if (!ns) continue;
+            ++c->weights;
+            int q = 0;   /* the mirror's reads go to the front, in order */
+            for (int j = 0; j < ns; ++j) {
+                const PlaneSpan& s = sp[j];
+                if (part) {
+                    c->rest_bytes += s.len;
+                    if (s.mirror) c->rest_mirror_bytes += s.len;
+                }
+                if (!s.mirror) {
+                    /* A read to the extent's end may round up into the buffer's slack. */
+                    const int64_t cap = s.off + s.len == p->len[k] ? p->cap[k] - s.off : s.len;
+                    reads.push_back(Read{ w.file_id, a0 + s.off, s.len, p->buf[k] + s.off, cap, nullptr, 0 });
+                    continue;
+                }
+                /* One piece (no split) as the unit's one mirror read. */
+                int64_t piece[4];
+                const int np = PlaneMirror::split(s.len, pieces, piece);
+                int64_t at = 0;
+                for (int r = 0; r < np; at += piece[r], ++r, ++q)
+                    reads.insert(reads.begin() + q, Read{ w.file_id, a0 + s.off + at, piece[r],
+                                                          p->buf[k] + s.off + at, piece[r], m,
+                                                          m->bytes - (uint64_t)(s.len - at) });
+            }
         }
     }
     return true;
@@ -1068,6 +1130,9 @@ bool Mover::plane_reads_done(PlaneCall* c, bool readers_failed, PlaneReadTiming*
         t.join_ns = c->join_ns;
         t.return_ns = back;
         t.t0_ns = c->t0;
+        t.rest = c->rest;
+        t.rest_bytes = c->rest_bytes;
+        t.rest_mirror_bytes = c->rest_mirror_bytes;
         *timing = t;
     }
     for (const PlaneCall::Read& r : c->reads) if (r.rc < 0) return false;
@@ -1075,9 +1140,9 @@ bool Mover::plane_reads_done(PlaneCall* c, bool readers_failed, PlaneReadTiming*
 }
 
 bool Mover::read_unit_planes(HostPlanes* const* units, int n, int rows, PlaneReadTiming* timing,
-                             const ReadWaitHook* hook) {
+                             const PlanesIn* in, bool rest_mirror, const ReadWaitHook* hook) {
     PlaneCall c;
-    if (!plane_reads(units, n, rows, &c)) return false;
+    if (!plane_reads(units, n, rows, &c, in, rest_mirror)) return false;
     c.t0 = steady_ns();
     ReadWaitHook at;
     if (hook && hook->fn) {
@@ -1102,10 +1167,11 @@ bool Mover::read_unit_planes(HostPlanes* const* units, int n, int rows, PlaneRea
     return plane_reads_done(&c, pr == NativeReadWorkers::Result::CallbackFailed, timing);
 }
 
-bool Mover::start_unit_planes(HostPlanes* const* units, int n, int rows) {
+bool Mover::start_unit_planes(HostPlanes* const* units, int n, int rows, const PlanesIn* in,
+                              bool rest_mirror) {
     if (plane_posted_ || !plane_read_pool()) return false;
     PlaneCall& c = plane_call_;
-    if (!plane_reads(units, n, rows, &c) || c.reads.empty()) return false;
+    if (!plane_reads(units, n, rows, &c, in, rest_mirror) || c.reads.empty()) return false;
     c.posted = true;
     c.t0 = steady_ns();
     /* A reader a read, seven at most (the eighth worker is the caller, in finish_unit_planes). */

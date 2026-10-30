@@ -212,8 +212,11 @@ Engine::~Engine() {
                      (unsigned long long)hx.fl_plain);
         /* The miss reads' legs and handoffs (FileStager::HostStats::MissReads): the gates of
          * ..._MIRROR_SPLIT (how often the mirror's leg lands last, its copy) and ..._MISS_POST (the
-         * readers' start, the caller's return). Means a call, or a call with a mirror leg. */
-        for (int k = 0; k < 2; ++k) {
+         * readers' start, the caller's return), and ..._PREFETCH_URGENT's calls with a read-ahead
+         * unit's rest apart. Means a call, or a call with a mirror leg. */
+        static const char* const kMrWhat[3] = { "one unit", "two or more units",
+                                                "with a read-ahead unit's rest" };
+        for (int k = 0; k < 3; ++k) {
             const auto& m = hx.mr[k];
             if (!m.calls) continue;
             const double c = (double)m.calls, mc = (double)(m.mirror_calls ? m.mirror_calls : 1);
@@ -223,7 +226,7 @@ Engine::~Engine() {
                      "last in %llu (%.1f%%, %.3f ms after the container) and the container in %llu "
                      "(%.3f ms after the mirror); from the dispatch: mirror leg %.3f ms (its copy %.3f ms, "
                      "all its copies %.3f), container leg %.3f ms, the caller back %.3f ms",
-                     k ? "two or more units" : "one unit", (unsigned long long)m.calls,
+                     kMrWhat[k], (unsigned long long)m.calls,
                      (unsigned long long)m.posted, (unsigned long long)m.split,
                      (unsigned long long)m.mirror_calls, (unsigned long long)m.mirror_last,
                      100.0 * (double)m.mirror_last / mc,
@@ -235,7 +238,7 @@ Engine::~Engine() {
             RAD_INFO("host experts' one-token miss reads, %s, readers: the first read begun %.1f us "
                      "after the dispatch, the first container read %.1f us, the last read %.1f us; the "
                      "caller back %.1f us after the last read landed%s",
-                     k ? "two or more units" : "one unit", (double)m.first_ns * 1e-3 / c,
+                     kMrWhat[k], (double)m.first_ns * 1e-3 / c,
                      (double)m.first_container_ns * 1e-3 / c, (double)m.last_start_ns * 1e-3 / c,
                      (double)m.back_ns * 1e-3 / c,
                      m.posted ? fmt("; posted calls: the caller came to wait %.1f us after the dispatch",
@@ -282,15 +285,20 @@ Engine::~Engine() {
                      (unsigned long long)hx.pf_taken, (double)hx.pf_yield_ns / 1e6);
         if (hx.ra_planned || hx.ra_misses) {
             const uint64_t used = hx.ra_whole + hx.ra_finished;
+            /* ..._PREFETCH_URGENT: the finished units' rest was the layer's own read, and the wait
+             * here is only for their pieces in flight after it (the line below has the layers'). */
+            const int rest = r->fstager.prefetch_urgent();
             RAD_INFO("read-ahead in pieces: %llu units planned (%llu more too late, %llu over the "
-                     "live cap); at their layer %llu used (%llu whole, %llu finished while the layer "
-                     "waited %.1f ms in all, %.3f ms each), %llu read as any miss, %llu re-read after a "
+                     "live cap); at their layer %llu used (%llu whole, %llu %s %.1f ms in all, %.3f ms "
+                     "each), %llu read as any miss, %llu re-read after a "
                      "failed piece; %llu dropped (%llu not selected, %llu cache hits, %llu stale); "
                      "%llu of %llu one-token misses planned (%.1f%%), %llu used (%.1f%%); read ahead "
                      "%.0f MB for units used, %.0f MB for units dropped",
                      (unsigned long long)hx.ra_planned, (unsigned long long)hx.ra_late,
                      (unsigned long long)hx.ra_capped, (unsigned long long)used,
                      (unsigned long long)hx.ra_whole, (unsigned long long)hx.ra_finished,
+                     rest ? "finished by the layer's own read, their pieces in flight waited for"
+                          : "finished while the layer waited",
                      (double)hx.ra_wait_ns / 1e6,
                      hx.ra_finished ? (double)hx.ra_wait_ns / 1e6 / (double)hx.ra_finished : 0.0,
                      (unsigned long long)hx.ra_fresh, (unsigned long long)hx.ra_refetched,
@@ -302,6 +310,25 @@ Engine::~Engine() {
                      (unsigned long long)used,
                      hx.ra_misses ? 100.0 * (double)used / (double)hx.ra_misses : 0.0,
                      (double)hx.ra_used_bytes / 1e6, (double)hx.ra_dropped_bytes / 1e6);
+            /* The per-unit wait, the same measure with and without ..._PREFETCH_URGENT: from the
+             * layer's choice until its partly read units were whole. */
+            if (hx.ra_fin_layers)
+                RAD_INFO("read-ahead in pieces, partly read units at their layer: %llu layers waited "
+                         "for them, %.3f ms each from the layer's choice until every such unit was "
+                         "whole; %llu of those layers read nothing else, %.3f ms each (one unit's own "
+                         "wait)", (unsigned long long)hx.ra_fin_layers,
+                         (double)hx.ra_fin_ns * 1e-6 / (double)hx.ra_fin_layers,
+                         (unsigned long long)hx.ra_alone,
+                         hx.ra_alone ? (double)hx.ra_alone_ns * 1e-6 / (double)hx.ra_alone : 0.0);
+            if (rest)
+                RAD_INFO("read-ahead in pieces, rests on the kept readers "
+                         "(RADIANCE_EXPERIMENTAL_DS41_PREFETCH_URGENT=%d): %llu units' rest read in their "
+                         "layer's own call, %.0f MB (%.0f MB of it from the plane mirror; %.2f MB a unit); "
+                         "%.1f ms waiting after the call for their pieces in flight", rest,
+                         (unsigned long long)hx.ra_rest, (double)hx.ra_rest_bytes / 1e6,
+                         (double)hx.ra_rest_mirror_bytes / 1e6,
+                         hx.ra_rest ? (double)hx.ra_rest_bytes / 1e6 / (double)hx.ra_rest : 0.0,
+                         (double)hx.ra_wait_ns / 1e6);
         }
         /* RADIANCE_EXPERIMENTAL_DS41_ROUTE_TRACE (place/route_trace.h): this rank's records, and
          * its one-token layers' picks by what it did with them (the trace's own tally of them). */
@@ -342,14 +369,16 @@ Engine::~Engine() {
                  "failed), %.0f MB in %.1f ms of reads (%.3f ms a piece), at most %llu in flight; "
                  "%.1f ms of reader time held back by demand reads; %llu demand reads, %llu of them "
                  "started with read-ahead pieces in flight, %.1f ms in all until those pieces were in "
-                 "(%.3f ms each)", pr.readers(), (unsigned long long)(pr.piece_bytes() >> 10),
+                 "(%.3f ms each)%s", pr.readers(), (unsigned long long)(pr.piece_bytes() >> 10),
                  (unsigned long long)s.pieces, (unsigned long long)s.urgent_pieces,
                  (unsigned long long)s.failed, (double)s.bytes / 1e6, (double)s.read_ns / 1e6,
                  s.pieces ? (double)s.read_ns / 1e6 / (double)s.pieces : 0.0,
                  (unsigned long long)s.max_in_flight, (double)s.held_ns / 1e6,
                  (unsigned long long)s.demand_reads, (unsigned long long)s.demand_met,
                  (double)s.demand_wait_ns / 1e6,
-                 s.demand_met ? (double)s.demand_wait_ns / 1e6 / (double)s.demand_met : 0.0);
+                 s.demand_met ? (double)s.demand_wait_ns / 1e6 / (double)s.demand_met : 0.0,
+                 s.stopped ? fmt("; %llu units stopped for their layer to read the rest "
+                                 "(..._PREFETCH_URGENT)", (unsigned long long)s.stopped).c_str() : "");
     }
     if (RouterPredictor* rp = RouterPredictor::get(); rp && rp->pieces()) {
         const RouterPredictor::Stats s = rp->stats();

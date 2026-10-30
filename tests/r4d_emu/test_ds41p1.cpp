@@ -13,7 +13,7 @@
  *             read, so a read of its weight stops the test); the slots past off[96] are zeros (T4); exactly two
  *             launches, gemv_vp's kernel then the tail's zero fill;
  *   split     the same call with other work splits (grids, items of one row group, few and many items a block,
- *             two gate_up rows a pass) gives the same bytes (T5 changes which block computes a pass, never a bit);
+ *             one gate_up row a pass where the default stages two) gives the same bytes (T5 changes which block computes a pass, never a bit);
  *   waves     the stager's composition: a main launch with a subset skipped, then waves of 1, 2 and 3 experts
  *             over a partition of that subset (each wave's table skipping every other expert), the clamped
  *             SwiGLU relaunched over all rows after each gate_up, leaves the gate_up, SwiGLU and down outputs
@@ -24,7 +24,7 @@
  * no local slot at all, and the real routing of the 3,086-token prompt's first rows (Phase 0's routes file:
  * DS41_P1_ROUTES or work/p0/routes-long3086.bin, skipped with a note when absent). Activations carry NaN, inf
  * and subnormal values on some token rows; a NaN compares equal to a NaN. Shapes are ds41's K (5120 for gate_up,
- * one row staged a pass; 2304 for down, three) with N cut short (each output is its own weight row's sum, so N
+ * two rows staged a pass by default, one under a forced 36 KiB; 2304 for down, three) with N cut short (each output is its own weight row's sum, so N
  * changes no sum), and a short K with two weight rows a wave. Runs with the cards hidden. */
 #include "rad_abi.h"
 #include "rad_plugin.h"
@@ -448,9 +448,9 @@ void rows_case(const Bank& b, const Shape& sh, int M, int kind, uint32_t seed, b
     /* Other work splits: the same bytes. */
     int nsplit = 0;
     if (splits) {
-        const Split sps[] = { { 5, 1, 1, 0 }, { 64, 4, 64, 0 }, { 300, 1000, 2, 0 }, { 0, 0, 0, 56 } };
+        const Split sps[] = { { 5, 1, 1, 0 }, { 64, 4, 64, 0 }, { 300, 1000, 2, 0 }, { 0, 0, 0, 36 }, { 0, 0, 0, 56 } };
         for (const Split& s2 : sps) {
-            if (s2.lds_kib && sh.K != 5120) continue;   /* two gate_up rows a pass */
+            if (s2.lds_kib && sh.K != 5120) continue;   /* one gate_up row a pass (36 KiB), or two */
             std::vector<uint16_t> y2((size_t)T * N, 0xAAAAu);
             if (p1(&s2, xin.data(), AR, K, tab, N, full, sh.sorted, y2.data(), &why)) {
                 fail(label + ": a forced split: " + why);

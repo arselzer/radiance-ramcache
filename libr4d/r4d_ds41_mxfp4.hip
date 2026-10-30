@@ -1921,6 +1921,10 @@ struct MxP1Opts {
 };
 constexpr int kP1ItemKib = 192;   /* weight rows an item at most: about 4 row groups of gate_up, 8 of down */
 constexpr int kP1Fill = 8;        /* items a block on average: a tail of small items, not of one big one */
+/* Blocks a call (at most; fewer when the live experts' row groups are fewer). ds41_mxfp4_device_check `p1` on a
+ * 9070 XT, M 2048, real routing: 256 blocks 20.9 us an expert-row, 512 20.1, 1024 19.9 (items of ~192 KiB and 8
+ * a block; item size and fill within 1.5% of each other from 96 KiB and 2 a block up). */
+constexpr int kP1Grid = 512;
 
 int mx_moe(const RadArgs* a, RadStream s, bool gemv,bool baseline=false,unsigned long long* probe=nullptr,int force=-1,
            bool vp=false, bool tall=false, int vpvar=-1, int balf=-1, bool p1=false, const MxP1Opts* po=nullptr) {
@@ -2014,9 +2018,16 @@ int mx_moe(const RadArgs* a, RadStream s, bool gemv,bool baseline=false,unsigned
         A.sorted = (const int32_t*)so->data; A.off = (const int32_t*)of->data;
         A.M = (int)T; A.N = (int)N; A.K = (int)K;
         A.XM = (int)(tokens < kMxXM ? (tokens < 1 ? 1 : tokens) : kMxXM);
-        /* The staged rows' budget: 36 KiB as the gemv's (a call may raise it, up to 56 KiB, so the gate_up's
-         * passes take two rows: the same sums, other passes). */
-        const long long budget = o.lds_kib > 0 ? (long long)(o.lds_kib < 56 ? o.lds_kib : 56) * 256 : 9216;
+        /* The staged rows' budget: the gemv's 36 KiB, except that where that holds a single whole row (gate_up's
+         * K 5120) it holds two, so a pass decodes each weight block once for two activation rows (gate_up 26% less
+         * time at M 2048 on the card). Each output keeps its own sum in the same lane and block order, so only the
+         * passes change, never a bit. A checker's call may force any budget up to 56 KiB. */
+        long long budget = 9216;
+        if (o.lds_kib > 0) {
+            budget = (long long)(o.lds_kib < 56 ? o.lds_kib : 56) * 256;
+        } else if (A.XM >= 2 && budget / (K + K / 8) == 1 && 2 * (K + K / 8) <= 56LL * 256) {
+            budget = 2 * (K + K / 8);
+        }
         const long long xbuf = mx_xbuf(A.XM, K, &A.XLM, &A.XR, &A.KC, budget);
         A.n_expert = (int)ne; A.top_k = (int)top_k; A.a_sorted = a_sorted ? 1 : 0; A.AR = (int)AR;
         A.live_end = 1;
@@ -2032,8 +2043,8 @@ int mx_moe(const RadArgs* a, RadStream s, bool gemv,bool baseline=false,unsigned
         A.p1_fill = o.fill > 0 ? o.fill : kP1Fill;
         const long long nrg = (N + 15) / 16;
         const long long items = L * nrg;
-        const unsigned grid =
-            o.grid > 0 ? (unsigned)(o.grid < 65535 ? o.grid : 65535) : (unsigned)(items < 256 ? items : 256);
+        const unsigned grid = o.grid > 0 ? (unsigned)(o.grid < 65535 ? o.grid : 65535)
+                                         : (unsigned)(items < kP1Grid ? items : kP1Grid);
         const int mcx = A.XLM >= 1 && A.XLM < A.XM ? A.XLM : A.XM;
         const long long ub = A.XLM >= 1 ? K / 32 : A.KC / 32;   /* blocks of a row pass (whole, or a chunk) */
         const int uf = ub > 96 ? 5 : 3;

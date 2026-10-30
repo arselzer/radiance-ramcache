@@ -2323,7 +2323,7 @@ void p1_rows(P1Ctx& c, const P1Routing& r, int M, std::mt19937_64& rng, bool spl
         size_t sdiff = 0;
         int nsplit = 0;
         if (splits) {
-            const int sps[][4] = { { 64, 48, 1, 0 }, { 1024, 4096, 32, 0 }, { 0, 0, 0, 56 }, { 2000, 20, 4, 0 } };
+            const int sps[][4] = { { 64, 48, 1, 0 }, { 1024, 4096, 32, 0 }, { 0, 0, 0, 36 }, { 2000, 20, 4, 0 } };
             for (const auto& sp : sps) {
                 if (sp[3] && !g) continue;
                 HC(hipMemset(d_y.p, 0xAA, d_y.n));
@@ -2589,14 +2589,14 @@ int p1_check(const Lib& L, int mmax, const char* routes_path) {
                 }
         }
     }
-    /* The work split at M 2048 (or MMAX's largest): grid, item size, items a block, staged rows. */
-    {
-        const int M = std::min(2048, mmax);
+    /* The work split (grid, item size, items a block, staged rows; 0 the default) at M 256, 1024 and 2048. */
+    for (int M : { 256, 1024, 2048 }) {
+        if (M > mmax) continue;
         const P1Routing r = real ? p1_routing("real", M, 0, 12, rng) : p1_routing("skewed", M, 0, 0, rng);
         const P1Pass p = p1_pass(r, 0, M);
-        const int sps[][4] = { { 0, 0, 0, 0 },    { 128, 0, 0, 0 },  { 512, 0, 0, 0 },  { 1024, 0, 0, 0 },
-                               { 0, 48, 0, 0 },   { 0, 96, 0, 0 },   { 0, 768, 0, 0 },  { 0, 1 << 20, 0, 0 },
-                               { 0, 0, 2, 0 },    { 0, 0, 32, 0 },   { 0, 0, 0, 56 },   { 512, 96, 16, 0 } };
+        const int sps[][4] = { { 0, 0, 0, 0 },    { 256, 0, 0, 36 }, { 256, 0, 0, 0 },  { 1024, 0, 0, 0 },
+                               { 2048, 0, 0, 0 }, { 0, 0, 0, 36 },   { 0, 96, 0, 0 },   { 0, 768, 0, 0 },
+                               { 0, 0, 4, 0 },    { 0, 0, 16, 0 },   { 1024, 96, 0, 0 } };
         for (const auto& sp : sps) {
             double gu = 0;
             const double us = p1_pass_time(c, p, M, 0, 0, sp, &gu, 5);

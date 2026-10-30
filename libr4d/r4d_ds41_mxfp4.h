@@ -32,7 +32,7 @@ int r4d_rad_moe_gemm_mxfp4_gemv_tall(const RadArgs*, RadStream);
 int r4d_rad_moe_gemm_mxfp4_gemv_tall_p1(const RadArgs*, RadStream);
 /* Checker-only: the same with its work split forced for the call (0 or less: the launcher's own choice): `grid`
  * blocks, at most `item_kib` KiB of weight rows a work item, `fill` work items a block on average, `lds_kib` KiB
- * of staged activation rows (36 by default, up to 56: two gate_up rows a pass). Same bits. */
+ * of staged activation rows (by default 36, or two whole rows where 36 holds one: gate_up; at most 56). Same bits. */
 int r4d_rad_moe_gemm_mxfp4_gemv_tall_p1_opts(const RadArgs*, RadStream, int grid, int item_kib, int fill, int lds_kib);
 /* Checker-only: the gemv row (`tall` 0) or the twin (1) with RADIANCE_EXPERIMENTAL_DS41_MOE_BALANCE forced off
  * (`bal` 0) or on (1) for the call: work items by row passes, dropped passes without weight reads, same bits. */

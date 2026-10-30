@@ -22,7 +22,7 @@
 # is the DSpark drafter's dense linears from E4M3 codes (RADIANCE_EXPERIMENTAL_DS41_DSPARK_FP8) on it.
 set(RAD_TESTS_NO_CORE arch_test glm5next_test mapped_slab_pregrow_test ds41_prefetch_arch_test
                       ds41_prefetch_plan_test ds41_consumer_skip_arch_test consumer_skip_test
-                      ds41_dspark_fp8_arch_test)
+                      ds41_dspark_fp8_arch_test ds41_dspark_defer_arch_test)
 
 # fixture_test tests tools/kfixture.cpp and tools/opshapes.cpp (the seeded draw, the reduction and
 # the on-disk recording) directly, kbench_test tools/kbench_core.cpp (rad-kbench's rules), and

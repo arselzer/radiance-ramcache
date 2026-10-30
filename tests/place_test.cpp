@@ -3512,6 +3512,47 @@ TEST(embedding_ram_goes_to_the_pinned_pool_read_in_place_and_costs_no_vram) {
     CHECK_EQ(plan2.embedding_host_bytes, 0ll);
 }
 
+/* RADIANCE_EXPERIMENTAL_DS41_DSPARK_CODEBOOK_RAM: a drafter's codebooks, model-level and read only
+ * by dflash_select, are lookup tables beside the embedding, pinned with it; off, they stay
+ * statics. A codebook a GEMM also reads is not one. */
+TEST(dspark_codebook_ram_pins_the_codebooks_with_the_embedding) {
+    for (int on = 0; on < 2; ++on) {
+        if (on) setenv(kDraftCodebookRamEnv, "1", 1);
+        else unsetenv(kDraftCodebookRamEnv);
+        Fixture f;
+        build_dense_lookup(f, /*layers=*/2, /*per_layer=*/4 * MiB);
+        const rad_weight w1 = f.weight("dspark.markov_w1.weight", 2 * MiB, RAD_ACCESS_VOCAB, -1, -1);
+        const rad_weight w2 = f.weight("dspark.markov_w2.weight", 2 * MiB, RAD_ACCESS_VOCAB, -1, -1);
+        f.op("dflash_select", { w1, w2 }, false);
+        const rad_weight w3 = f.weight("other.weight", 1 * MiB, RAD_ACCESS_VOCAB, -1, -1);
+        f.op("dflash_select", { w3 }, false);
+        f.op("gemm", { w3 }, false);
+        CHECK_EQ(is_embedding_table(f.prog, w1), on == 1);
+        CHECK_EQ(is_embedding_table(f.prog, w2), on == 1);
+        CHECK(!is_embedding_table(f.prog, w3));
+        WeightFootprint fp;
+        weight_footprint(f.prog, &fp, TablePlacement::Ram, TablePlacement::Disk, false, true);
+        CHECK_EQ(fp.embedding, on ? 5 * MiB : 1 * MiB);
+        CHECK_EQ(fp.hosted, on ? 5 * MiB : 1 * MiB);
+        Config cfg = base_config();
+        cfg.placement = "all_vram";
+        cfg.vram_weights_mib = on ? 10 : 14;   /* the layers, the head, w3 (and off, both codebooks) */
+        cfg.host_pool_mib = 0;
+        cfg.embedding_host_mib = on ? 5 : 1;
+        cfg.embedding_resolved = TablePlacement::Ram;
+        Plan plan;
+        PlannerInput in{&f.prog, &cfg, 0, 1, nullptr, 0};
+        CHECK_OK(Planner(in).plan(&plan));
+        CHECK(plan.weight[1].tier == Tier::HostPinned);
+        CHECK(plan.weight[w1].tier == (on ? Tier::HostPinned : Tier::VRAM));
+        CHECK(plan.weight[w2].tier == (on ? Tier::HostPinned : Tier::VRAM));
+        if (on) CHECK(plan.weight[w1].site == Site::DeviceZeroCopy);
+        CHECK(plan.weight[w3].tier == Tier::VRAM);
+        CHECK_EQ(plan.embedding_host_bytes, on ? 5 * MiB : 1 * MiB);
+    }
+    unsetenv(kDraftCodebookRamEnv);
+}
+
 /* The embedding gets its own room: the resolver sizes Config::embedding_host_mib on top of
  * --host-pool-mib, so a dense model with no pool still places the table, and the experts keep all
  * of --host-pool-mib after the table is pinned. */

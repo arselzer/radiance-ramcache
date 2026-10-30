@@ -540,6 +540,14 @@ int Engine::resolve_table_placement(const std::vector<VramFacts>& facts,
     } else {
         emb_why = "as asked";
     }
+    /* RADIANCE_EXPERIMENTAL_DS41_DSPARK_CODEBOOK_RAM (place/planner.h): the drafter's codebooks go
+     * where the embedding goes, so they leave the card only with --embedding-placement ram. */
+    if (draft_codebook_ram() && emb != TablePlacement::Ram) {
+        RAD_ERR("%s: the drafter's codebooks are pinned with the token embedding, and the embedding "
+                "stays in VRAM here (%s): use --embedding-placement ram", kDraftCodebookRamEnv,
+                emb_why.c_str());
+        return RAD_E_INVAL;
+    }
     cfg_.embedding_resolved = emb;
     cfg_.embedding_host_mib = emb == TablePlacement::Ram ? align_up(emb_max, MiB) / MiB : 0;
 
@@ -4000,7 +4008,10 @@ int Engine::start() {
     startup_begin_ns_ = rad_mono_ns();
     if (!draft_experiment_.valid()) {
         RAD_ERR("experimental draft control: stats/OFF must be absent or0|1, verify cap absent or0..5, with no positive-cap/OFF conflict; "
-                "%s absent, 0, 1 or T[,W[,R]] (T in (0, 64], W 1..64, R 1..4096), and not with compute OFF", kDraftGateEnv);
+                "%s absent, 0, 1 or T[,W[,R]] (T in (0, 64], W 1..64, R 1..4096), and not with compute OFF; "
+                "%s absent, 0, 1 or T[,R] (T in (0, 1), R 2..4096), not with %s; %s absent, 0, 1 or N (2..64); "
+                "%s absent, 0 or 1; none of the three with compute OFF", kDraftGateEnv, kDraftConfEnv,
+                kDraftGateEnv, kDraftLoadEnv, kDraftCtxDeferEnv);
         return RAD_E_INVAL;
     }
     std::vector<int> devs;

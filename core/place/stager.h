@@ -93,6 +93,7 @@
 #include "route_trace.h"
 
 #include <array>
+#include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <deque>
@@ -319,6 +320,8 @@ public:
         uint64_t linked = 0;          /* cached experts the schedule left on the copy link */
         uint64_t missed = 0;          /* routed experts the RAM cache did not hold */
         uint64_t wait_ns = 0;         /* the issuing thread waiting at gathers for the CPU */
+        /* ...in one-token passes: the gathers and their wait, [0] layers without a miss, [1] with */
+        uint64_t d_waits[2] = {}, d_wait_ns[2] = {};
         uint64_t async_wait_ns = 0;   /* ...for a miss read still on hx_mw_ (async), before that */
         uint64_t verified = 0, differ = 0;   /* ..._POLICY=verify: rows compared with the card's */
         uint64_t moved = 0;           /* a gate_up's operands at new addresses (kept the newest) */
@@ -333,6 +336,15 @@ public:
         /* ..._FETCH_LIST: round trips copied in one ranged dispatch, range lists (re)written, and
          * round trips left as separate copies (addresses the copy kernel cannot take). */
         uint64_t fl_copies = 0, fl_armed = 0, fl_plain = 0;
+        /* ..._HOST_EXPERTS_PREWAKE (hx_wake_*): one-token layers whose router event this thread
+         * waited for before the pool's pre-wake, and those whose counts were in by then (no
+         * pre-wake); from the router event to the counts as this thread saw them, and its time in
+         * the pre-wake calls (the pool's own line counts what they woke). Miss reads (one-token)
+         * with a pre-wake armed: those whose reads were still out at its time, so it fired, how long
+         * after it the last read landed (the lead it gave: want ~the workers' wake-up, 30-60 us),
+         * and those whose reads landed first (`early`, by how much). */
+        uint64_t wk_rt = 0, wk_rt_ready = 0, wk_rt_gap_ns = 0, wk_rt_call_ns = 0;
+        uint64_t wk_rd_armed = 0, wk_rd_fired = 0, wk_rd_lead_ns = 0, wk_rd_early_ns = 0;
         /* One-token passes' miss reads (Mover::PlaneReadTiming), [0] those of one missed unit and
          * [1] of more: calls; posted at the choice (..._MISS_POST); with the mirror's tail in
          * pieces (..._MIRROR_SPLIT). Of the calls with a mirror leg and a container leg: those the
@@ -764,6 +776,38 @@ private:
         ~HxMissPostJoin() { s->hx_join_miss_post(); }
     };
     void hx_note_reads(const Mover::PlaneReadTiming& t);
+    /* ---- RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_PREWAKE=N (host_expert_pool.h, prewake) --------
+     *
+     * The pool's workers sleep between a layer's bursts, and a submit then pays their wake-up: the
+     * waker's broadcast, each worker's C-state exit (C2: 30 us) and, through the condition
+     * variable, the lock's convoy. Two points of a one-token layer come shortly before its CPU
+     * work, and the pool's pre-wake (N workers, a short window) runs there:
+     *  - the card's progress: an event (card-local, host-waited) recorded right before the
+     *    layer's router GEMV, the gemm reading blk.L.glm_router.weight (hx_wake_init finds it;
+     *    hx_wake_op_). At the decision (hx_early_decide, or start_ep_routed without early issue)
+     *    the issuing thread waits for it first, pre-wakes, then waits for the counts, which follow
+     *    the router by its GEMV, the select, the scatter and the copies (hx_wake_route). Every rank
+     *    records its own; the pool takes the first call of the layer (prewake's window).
+     *  - a miss read: while the issuing thread, done with its own share (the mirror's tail, which
+     *    lands first in ~78% of calls), waits for the readers, at ..._PREWAKE_LEAD_US before the
+     *    read's predicted landing: the median landing, from the dispatch, of the last kWakeRing
+     *    reads of one unit (or of more; hx_wake_at), through Mover's wait hook (hx_wake_miss). Not
+     *    in a layer whose read-ahead units are being finished (hx_ra_settle waits after the read),
+     *    and nothing when the reads land first.
+     * Off, nothing here runs: no event, no hook. The bytes the card and the pool compute are the
+     * same either way; only when workers wake changes. */
+    static constexpr int kWakeRing = 32;
+    bool     hx_wake_ = false;
+    RadEvent hx_wake_ev_ = nullptr;
+    std::vector<int32_t> hx_wake_op_;   /* by op: the routed layer whose router GEMV it is, or -1 */
+    int32_t  hx_wake_li_ = -1;          /* the layer whose router event this pass recorded last */
+    int64_t  hx_wake_ring_[2][kWakeRing] = {};   /* miss reads' landings (ns from dispatch): one unit, more */
+    uint64_t hx_wake_seen_[2] = {};
+    int64_t  hx_wake_fired_ns_ = 0;     /* when this read's pre-wake ran (steady ns), 0 none */
+    int  hx_wake_init(const Program& prog);
+    int  hx_wake_route(int32_t li, std::chrono::steady_clock::time_point* woke);
+    int64_t hx_wake_at(size_t units) const;
+    static void hx_wake_miss(void* self);
     std::vector<std::thread> hx_bg_;   /* ..._INSERT_THREADS of them (4) */
     std::mutex hx_bg_mu_;
     std::condition_variable hx_bg_cv_;

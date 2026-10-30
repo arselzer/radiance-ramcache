@@ -5,12 +5,18 @@
  *
  * Jobs carry up to 32 token rows here (RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MAX_ROWS, set before
  * the pool reads it unless the environment already sets it: run with ..._MAX_ROWS=4 for the default
- * limit, where the many-row case skips). */
+ * limit, where the many-row case skips).
+ *
+ * The workers sleep through the condition variable here (..._FUTEX unset; the futex path has
+ * host_expert_pool_futex_test), with ..._PREWAKE=2 and a 50 ms pre-wake window: woken workers
+ * spin their window and sleep again, a second call within the window wakes nobody, and pre-woken
+ * workers take the next submit's tiles. */
 #include "rad_test.h"
 
 #include "place/host_expert_pool.h"
 #include "../tools/ds41-host-experts/ds41_host_experts.h"
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -53,6 +59,9 @@ std::vector<float> g_silu;
 
 /* Before anything reads it (max_rows() reads it once); an outside setting wins. */
 const bool g_max_rows_set = setenv("RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MAX_ROWS", "32", 0) == 0;
+/* The pre-wake (read once, at the pool's start): two workers, a 50 ms window. */
+const bool g_prewake_set = setenv("RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_PREWAKE", "2", 0) == 0 &&
+                           setenv("RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_PREWAKE_SPIN_US", "50000", 0) == 0;
 
 /* The pool reads its configuration once: four workers and the host's silu table. */
 HostExpertPool* pool() {
@@ -398,6 +407,60 @@ TEST(host_expert_pool_many_row_jobs_match) {
     CHECK(p->submit(&over, 1, &t3) < 0);
     CHECK_EQ(t3.left.load(), 0);
     CHECK_EQ(HostExpertPool::cost_rows(40), HostExpertPool::job_cost(32) + HostExpertPool::job_cost(8));
+}
+
+/* Polls `ok` for up to `s` seconds. */
+template <class F> static bool eventually(F ok, int s = 5) {
+    const auto t0 = std::chrono::steady_clock::now();
+    while (!ok()) {
+        if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(s)) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return true;
+}
+
+/* ..._PREWAKE through the condition variable: two of the four workers woken, both back asleep after
+ * their window with no tile; a call inside the window wakes nobody; a submit right after a pre-wake
+ * finds woken workers spinning, and the submit counters see it. */
+TEST(host_expert_pool_prewake_wakes_a_subset_for_its_window) {
+    HostExpertPool* p = pool();
+    if (!p || !__builtin_cpu_supports("avx2")) { SKIP("no AVX2 or no pool"); return; }
+    REQUIRE(g_prewake_set);
+    if (p->prewake_n() != 2 || p->futex()) { SKIP("the environment sets the pre-wake or the futex"); return; }
+    constexpr int R = HostExpertPool::kWakeRouter, M = HostExpertPool::kWakeMiss;
+    /* Every worker asleep: well past the 200 us idle spin. */
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    const HostExpertPool::Stats s0 = p->stats();
+    CHECK_EQ(p->prewake(R), 2);
+    CHECK_EQ(p->prewake(M), 0);   /* inside the window: nobody */
+    CHECK(eventually([&] { return p->stats().pre_slept[R] >= s0.pre_slept[R] + 2; }));
+    HostExpertPool::Stats s1 = p->stats();
+    CHECK_EQ(s1.pre_calls[R], s0.pre_calls[R] + 1);
+    CHECK_EQ(s1.pre_woken[R], s0.pre_woken[R] + 2);
+    CHECK_EQ(s1.pre_skipped[M], s0.pre_skipped[M] + 1);
+    CHECK_EQ(s1.pre_used[R], s0.pre_used[R]);   /* no work came */
+    CHECK(s1.pre_spin_ns[R] - s0.pre_spin_ns[R] >= 2ull * 45'000'000);   /* their window, each */
+    /* A pre-wake, then a job: a woken worker takes some of its tiles. */
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));   /* past the window */
+    Expert e{ blocks(2 * kFf, kEmbd, 81), blocks(kEmbd, kFf, 82) };
+    const auto x = row(83);
+    std::vector<uint16_t> y(kEmbd, 0xffff);
+    HostExpertPool::Job j;
+    j.gu = e.gu.data(); j.dn = e.dn.data(); j.x = x.data(); j.y = y.data();
+    CHECK_EQ(p->prewake(M), 2);
+    HostExpertPool::Ticket t;
+    p->reserve(HostExpertPool::kExpertBytes);
+    CHECK_EQ(p->submit(&j, 1, &t), 0);
+    p->wait(&t);
+    CHECK(y == reference_avx2(e, x));
+    CHECK(eventually([&] { return p->stats().pre_used[M] >= s1.pre_used[M] + 1; }));
+    const HostExpertPool::Stats s2 = p->stats();
+    CHECK_EQ(s2.submits, s1.submits + 1);
+    CHECK_EQ(s2.first_n, s1.first_n + 1);
+    CHECK_EQ(s2.ramp_n, s1.ramp_n + 1);
+    CHECK(p->report().find("router pre-wakes: ") != std::string::npos);
+    CHECK(p->report().find("condition-variable wake") != std::string::npos);
+    CHECK_EQ(p->backlog(), (int64_t)0);
 }
 
 TEST(host_expert_pool_refuses_incomplete_jobs) {

@@ -321,6 +321,31 @@ arm() {   # name, then env assignments for the server; CACHE_MIB the RAM cache (
     stop_server; return 1
   fi
   [[ -n "${ARM_DB:-}" ]] && grep -m2 -E 'runs its short block|short[0-9] query' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
+  # RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_FUTEX (Fw) and _PREWAKE (WpN): the pool names what it
+  # took at startup, and rank 0's file stager how many routers' GEMVs it found for the pre-wake. An
+  # arm whose name says either and whose server did not take it, or one without that took it (the
+  # knob set for the window), is not measured.
+  local fw_on wp_on wp_rt
+  fw_on=$(grep -c 'host experts: idle workers sleep on a futex' "$OUT/$name.server.log")
+  wp_on=$(grep -cE 'host experts: pre-wake of up to [0-9]+ workers' "$OUT/$name.server.log")
+  wp_rt=$(grep -cE 'host experts: pre-wake: an event before [1-9][0-9]* of [0-9]+ routed layers' "$OUT/$name.server.log")
+  if [[ -n "${ARM_FW:-}" && "$fw_on" == 0 ]]; then
+    log "arm $name: Fw, but the server log has no 'idle workers sleep on a futex' line (a radiance without the switch?); not measured"
+    stop_server; return 1
+  fi
+  if [[ -z "${ARM_FW:-}" && "$fw_on" != 0 ]]; then
+    log "arm $name: no Fw part, but the pool's workers sleep on a futex (the knob set for the window?); not measured"
+    stop_server; return 1
+  fi
+  if [[ -n "${ARM_WP:-}" ]] && { [[ "$wp_rt" == 0 ]] || ! grep -qE "host experts: pre-wake of up to ${ARM_WP} workers" "$OUT/$name.server.log"; }; then
+    log "arm $name: Wp${ARM_WP}, but the server log lacks 'pre-wake of up to ${ARM_WP} workers' or a router event ($(grep -m2 -E 'pre-wake' "$OUT/$name.server.log" | tr '\n' ' ')); not measured"
+    stop_server; return 1
+  fi
+  if [[ -z "${ARM_WP:-}" && "$wp_on" != 0 ]]; then
+    log "arm $name: no Wp part, but the server pre-wakes the pool (the knob set for the window?); not measured"
+    stop_server; return 1
+  fi
+  [[ -n "${ARM_FW:-}${ARM_WP:-}" ]] && grep -E 'idle workers sleep on a futex|pre-wake' "$OUT/$name.server.log" | head -3 | tee -a "$OUT/window.log"
   # The NVMe drive's busy time (io_ticks, ms) and temperature over the requests: read-ahead arms
   # move it from ~45% busy towards saturation.
   local d0 d1 t0 t1 rc temp
@@ -364,6 +389,21 @@ arm() {   # name, then env assignments for the server; CACHE_MIB the RAM cache (
     log "arm $name: $dk_bad; not measured (results kept as $name.unmeasured.json)"
     [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
   fi
+  # Fw / WpN at shutdown: the pool's line ("host expert pool: ..."). A Wp arm counts only if its
+  # router pre-wakes woke workers; an Fw arm only if its pool woke through the futex. Otherwise its
+  # results are set aside as <arm>.unmeasured.json (the window's comparisons skip it).
+  local pool_line wk_bad=""
+  pool_line=$(grep -E 'host expert pool: ' "$OUT/$name.server.log" | tail -1)
+  if [[ -n "${ARM_WP:-}" ]] && ! grep -qE 'router pre-wakes: [0-9]+ calls woke [1-9][0-9]* workers' <<< "$pool_line"; then
+    wk_bad="Wp${ARM_WP}, but no router pre-wake woke a worker (${pool_line:-no 'host expert pool' line})"
+  fi
+  if [[ -n "${ARM_FW:-}" && "$pool_line" != *" futex wake "* ]]; then
+    wk_bad="Fw, but the pool's line does not say futex wake (${pool_line:-no 'host expert pool' line})"
+  fi
+  if [[ -n "$wk_bad" && -f "$OUT/$name.json" ]]; then
+    log "arm $name: $wk_bad; not measured (results kept as $name.unmeasured.json)"
+    mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
+  fi
   grep -E 'host experts|EP scoped|live chain|error|ERR' "$OUT/$name.server.log" | tail -16 | tee -a "$OUT/window.log"
   grep -E 'read-ahead (in pieces|readers)|router predictor \(' "$OUT/$name.server.log" | tail -6 | tee -a "$OUT/window.log"
   grep -E 'rank 0: on-die reads' "$OUT/$name.server.log" | tee -a "$OUT/window.log"   # Pa/Pm/Pl/Pe: plan, counts
@@ -374,6 +414,7 @@ arm() {   # name, then env assignments for the server; CACHE_MIB the RAM cache (
   grep -E 'consumer skip: [0-9]+ (prefill|cut) passes|rank 0: consumer skip' "$OUT/$name.server.log" | tee -a "$OUT/window.log"   # Cs: what the cut ran
   grep -E 'prefill hash: seq [0-9]+, [0-9]+ tokens: all ranks' "$OUT/$name.server.log" | tee -a "$OUT/window.log"   # Kh: a digest a prompt
   grep -E '^libr4d: RADIANCE_EXPERIMENTAL_DS41_DRAFT_GEMV' "$OUT/$name.server.log" | tail -2 | tee -a "$OUT/window.log"   # Dk/Dkt: calls taken
+  grep -E 'host expert pool: |host experts, pre-wake: |host experts, one-token passes: ' "$OUT/$name.server.log" | tee -a "$OUT/window.log"   # Fw/WpN: the wake-up, decode's gather waits
 }
 
 if [[ "$("${DOCKER[@]}" inspect "$NAME" --format '{{.State.Status}}' 2>/dev/null)" != running ]]; then
@@ -700,11 +741,21 @@ for a in $ARMS; do
 # with tile form N (1-8, r4d_selftest --perff32's names) for the bf16 GEMV at decode; an Rb arm runs
 # only on the libr4d.so whose gemm_nt_f32bf16 passed SELFTEST_F32BF16's card checks in this window.
 # An arm with a predictor part (Ps, Po, Pt, Pp) is measured only if the router predictor loaded.
+# Fw the CPU pool's idle workers sleep on a futex and a submit wakes them with one FUTEX_WAKE, no
+# lock (RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_FUTEX=1; exact: only when workers wake changes);
+# WpN up to N sleeping workers pre-woken before a one-token layer's CPU work: at the layer's router
+# event (an event before each decode router GEMV, waited for ahead of the counts) and in a miss
+# read ..._PREWAKE_LEAD_US (60) before its predicted landing; they spin ..._PREWAKE_SPIN_US (100)
+# and sleep again if no work came (RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_PREWAKE=N, 1 .. the
+# arm's threads; exact). Every other arm runs with both at 0. Fw must show the pool's futex line at
+# startup, WpN its pre-wake line for N workers and the stager's router events, and at shutdown the
+# pool's line with router pre-wakes that woke workers (else the arm's results are set aside as
+# <arm>.unmeasured.json); an arm without them must show neither startup line.
   IFS=- read -r -a parts <<< "$a"
   xt="" bt="" kld="" dk="" db=""
   pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 HOST_POOL_MIB=4096 EXTRA_ARGS="" ARM_HOME="$RHOME" ARM_CONC=
   ARM_PROMPTS= ARM_N= ARM_LQ= rt=
-  power="" skip="" ARGS=() f8="" f8x="" rb="" rbf=0 pred="" cs="" kh="" pc="" pcopt=""
+  power="" skip="" ARGS=() f8="" f8x="" rb="" rbf=0 pred="" cs="" kh="" pc="" pcopt="" fw="" wp=""
   unset ARM_NOPC   # --no-prefix-cache unless a Pc part sets it empty
   for p in "${parts[@]:1}"; do
     case $p in
@@ -804,6 +855,11 @@ for a in $ARMS; do
       Fl)      env+=(RADIANCE_EXPERIMENTAL_DS41_FETCH_LIST=1) ;;       # counts + CPU rows in one ranged copy
       Ms[0-9]) env+=(RADIANCE_EXPERIMENTAL_DS41_MIRROR_SPLIT=${p#Ms}) ;;  # a lone decode miss's mirror tail in N pieces
       Mp)      env+=(RADIANCE_EXPERIMENTAL_DS41_MISS_POST=1) ;;       # miss reads start at the choice, before the pool's wake
+      Fw)      fw=1; env+=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_FUTEX=1) ;;   # pool workers sleep on a futex, woken without a lock
+      Wp[0-9]*) # pre-wake N pool workers before a decode layer's CPU work (router event, miss read)
+               if [[ ${p#Wp} =~ ^[0-9]+$ ]] && (( 10#${p#Wp} >= 1 && 10#${p#Wp} <= 256 )); then
+                 wp=$((10#${p#Wp})); env+=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_PREWAKE=$wp)
+               else log "arm $a: $p: a pre-wake takes 1-256 workers; the arm is skipped"; skip=1; fi ;;
       U?*)     ARM_PROMPTS=/home/as/ds41-claude-build/work/extra-prompts/${p#U}-receipt.json ARM_N=999
                [[ -f $ARM_PROMPTS ]] || { log "arm $a: no prompts $ARM_PROMPTS; the arm is skipped"; skip=1; } ;;
       Rt)      mkdir -p "$OUT/rtrace-$a"   # the routing trace, exact (rtrace.py reads it)
@@ -902,6 +958,18 @@ for a in $ARMS; do
       log "arm $a: Xt refused: its libr4d.so (${lib:-none under $ARM_HOME}) is not the one the tall checks passed on ($TALL_LIB, sha256 ${TALL_SUM:0:16})"; skip=1
     fi
   fi
+  # Fw / WpN (the CPU pool's wake-up): every arm states both switches, 0 off, so a window's VAR=val
+  # cannot turn them on for an arm whose name does not say so; arm() checks the server log both ways.
+  # A pre-wake of more workers than the arm's pool has would be cut to its threads: refused instead.
+  [[ -n "$fw" ]] || env+=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_FUTEX=0)
+  [[ -n "$wp" ]] || env+=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_PREWAKE=0)
+  if [[ -n "$wp" && "$pol" != base ]] && (( wp > threads )); then
+    log "arm $a: Wp$wp pre-wakes more workers than the pool's $threads threads; the arm is skipped"; skip=1
+  fi
+  if [[ -n "$fw$wp" && "$pol" == base ]]; then
+    log "arm $a: Fw / WpN act on the host experts' pool, which a base arm has not; the arm is skipped"; skip=1
+  fi
+  ARM_FW=$fw ARM_WP=$wp
   # RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL: on only in an Xt arm, explicitly off in every other one.
   if [[ -n "$xt" ]]; then env+=(RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=1); else env+=(RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=0); fi
   if [[ -n "$kld" ]]; then

@@ -9,6 +9,7 @@
 #include "kld.h"
 #include "mm/processor.h"
 #include "mm/media.h"
+#include "place/host_expert_pool.h"
 #include "place/readahead.h"
 #include "place/route_trace.h"
 #include "place/router_predictor.h"
@@ -165,6 +166,13 @@ Engine::~Engine() {
                      (unsigned long long)hx.moved, (unsigned long long)hx.probed,
                      (unsigned long long)hx.miss_units, (unsigned long long)hx.miss_rows,
                      (double)hx.miss_read_ns / 1e6);
+        if (hx.d_waits[0] || hx.d_waits[1])
+            RAD_INFO("host experts, one-token passes: %llu gathers without a miss waited %.1f ms for the "
+                     "CPU's rows (%.1f us each), %llu with one %.1f ms (%.1f us each)",
+                     (unsigned long long)hx.d_waits[0], (double)hx.d_wait_ns[0] / 1e6,
+                     hx.d_waits[0] ? (double)hx.d_wait_ns[0] * 1e-3 / (double)hx.d_waits[0] : 0.0,
+                     (unsigned long long)hx.d_waits[1], (double)hx.d_wait_ns[1] / 1e6,
+                     hx.d_waits[1] ? (double)hx.d_wait_ns[1] * 1e-3 / (double)hx.d_waits[1] : 0.0);
         if (hx.async_wait_ns)
             RAD_INFO("host experts: %.1f ms waiting at gathers for misses still being read on the worker "
                      "(not in the gather waits above)", (double)hx.async_wait_ns / 1e6);
@@ -180,6 +188,23 @@ Engine::~Engine() {
                      (unsigned long long)hx.early, (double)hx.early_wait_ns / 1e6,
                      (double)hx.early_wait_ns * 1e-3 / (double)hx.early,
                      (unsigned long long)hx.early_ready, (unsigned long long)hx.early_refetch);
+        /* RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_PREWAKE (place/stager.h, hx_wake_*): the triggers as
+         * this rank saw them; the pool's line below counts what the pre-wakes woke. */
+        if (hx.wk_rt || hx.wk_rt_ready || hx.wk_rd_armed) {
+            const uint64_t early = hx.wk_rd_armed - hx.wk_rd_fired;
+            RAD_INFO("host experts, pre-wake: %llu one-token layers waited for their router's event and "
+                     "then called the pool's pre-wake (%.1f us a call), their counts %.1f us after the "
+                     "event; %llu had their counts in first (no pre-wake); one-token miss reads: %llu with "
+                     "a pre-wake armed, %llu fired it (the last read landed %.1f us after it), %llu landed "
+                     "first (%.1f us before its time)",
+                     (unsigned long long)hx.wk_rt,
+                     hx.wk_rt ? (double)hx.wk_rt_call_ns * 1e-3 / (double)hx.wk_rt : 0.0,
+                     hx.wk_rt ? (double)hx.wk_rt_gap_ns * 1e-3 / (double)hx.wk_rt : 0.0,
+                     (unsigned long long)hx.wk_rt_ready, (unsigned long long)hx.wk_rd_armed,
+                     (unsigned long long)hx.wk_rd_fired,
+                     hx.wk_rd_fired ? (double)hx.wk_rd_lead_ns * 1e-3 / (double)hx.wk_rd_fired : 0.0,
+                     (unsigned long long)early, early ? (double)hx.wk_rd_early_ns * 1e-3 / (double)early : 0.0);
+        }
         if (hx.fl_copies || hx.fl_plain)
             RAD_INFO("host experts, fetch lists: %llu counts syncs fetched in one ranged copy, %llu range "
                      "lists written, %llu fetches left as separate copies",
@@ -308,6 +333,8 @@ Engine::~Engine() {
         rt->close();
         RAD_INFO("%s", rt->report().c_str());
     }
+    /* The CPU pool serves every rank: its wake-up and pre-wakes, once for the process. */
+    if (const HostExpertPool* hp = HostExpertPool::running()) RAD_INFO("%s", hp->report().c_str());
     /* The read-ahead's readers and the predictor serve every rank: one report for the process. */
     if (PieceReader& pr = PieceReader::process(); pr.started()) {
         const PieceReader::Stats s = pr.stats();

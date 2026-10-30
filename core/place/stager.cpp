@@ -3,6 +3,8 @@
 #include "place/dspark_native_scope.h"
 #include "place/router_predictor.h"
 
+#include <sys/prctl.h>
+
 #include <algorithm>
 #include <chrono>
 #include <cstring>
@@ -549,6 +551,7 @@ FileStager::~FileStager() {
     if (hx_fl_ev_) rad_event_destroy(hx_fl_ev_);
     if (hx_fl_dev_) rad_dev_free(hx_fl_dev_, RAD_MEM_DEVICE);
     if (hx_fl_pin_) rad_dev_free(hx_fl_pin_, RAD_MEM_HOST_PINNED);
+    if (hx_wake_ev_) rad_event_destroy(hx_wake_ev_);
 }
 
 int FileStager::init(const Program& prog, const Plan& plan, Mover* mover, CountsRow counts,
@@ -680,6 +683,7 @@ bool FileStager::begin_pass(const RadBatch* b) {
     pass_tok_ = b->n_tok;
     pass_full_ = b->consumer_full > 0 ? b->consumer_full : INT32_MAX;
     hx_defer_li_ = -1;
+    hx_wake_li_ = -1;
     ++trace_pass_;
     if (rt_) rt_pass(b);
     routed_ = counts_host_ && b->n_tok > 0 && b->n_tok <= kRoutedRows;
@@ -809,8 +813,14 @@ int FileStager::start_ep_routed(int32_t li, RadStream s, bool* read) {
         return RAD_OK;
     }
     const auto t_sync = std::chrono::steady_clock::now();
+    /* ..._HOST_EXPERTS_PREWAKE: the router's event, the pool's pre-wake, then the counts (all in the
+     * router wait). */
+    std::chrono::steady_clock::time_point t_woke{};
+    if (hx && hx_wake_) RAD_TRY(hx_wake_route(li, &t_woke));
     RAD_TRY(rad_event_sync(counts_ev_));
     const auto t_counts = std::chrono::steady_clock::now();
+    if (t_woke.time_since_epoch().count())
+        hx_stats_.wk_rt_gap_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(t_counts - t_woke).count();
     const uint64_t sync_ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(t_counts - t_sync).count();
     ep_stats_.sync_ns += sync_ns;
     if (pass_tok_ == 1) { ++ep_stats_.d_reads; ep_stats_.d_sync_ns += sync_ns; }
@@ -1473,6 +1483,7 @@ int FileStager::tall_init(const Program& prog) {
  * 48), and the misses must be the CPU's in all of them. */
 int FileStager::hx_init(const Program& prog) {
     RAD_TRY(hx_init_impl(prog));
+    RAD_TRY(hx_wake_init(prog));
     /* The misses the CPU must take: every pass's. Without the switch that is 16 tokens whatever
      * --max-num-batched-tokens says (as before); with it the step's (tall_init: ep_rows_ is the
      * step, at least 16). */
@@ -2107,8 +2118,13 @@ int FileStager::hx_early_decide() {
      * back the CPU's start by their issue time (what the switch can lose). */
     if (rad_event_query(counts_ev_) == 1) ++hx_stats_.early_ready;
     const auto t_sync = std::chrono::steady_clock::now();
+    /* ..._HOST_EXPERTS_PREWAKE: the router's event, the pool's pre-wake, then the counts (all in the
+     * counts wait, as the router wait it is). */
+    std::chrono::steady_clock::time_point t_woke{};
+    if (hx_wake_) RAD_TRY(hx_wake_route(li, &t_woke));
     RAD_TRY(rad_event_sync(counts_ev_));
     const auto t_counts = std::chrono::steady_clock::now();
+    if (t_woke.time_since_epoch().count()) hx_stats_.wk_rt_gap_ns += ns(t_woke, t_counts);
     const uint64_t sync_ns = ns(t_sync, t_counts);
     ep_stats_.sync_ns += sync_ns;
     if (pass_tok_ == 1) { ++ep_stats_.d_reads; ep_stats_.d_sync_ns += sync_ns; }
@@ -2337,6 +2353,24 @@ int FileStager::hx_submit_misses_now(int rows) {
     const auto t0 = std::chrono::steady_clock::now();
     Mover::PlaneReadTiming tm;
     bool read = false;
+    /* ..._HOST_EXPERTS_PREWAKE (stager.h): a one-token pass's demand read pre-wakes the pool at
+     * ..._PREWAKE_LEAD_US before its predicted landing, if the reads are still out by then. Not
+     * with units being finished by the piece readers: their wait comes after the read. */
+    Mover::ReadWaitHook wake_hook;
+    if (hx_wake_ && rows == 1 && !urgent) {
+        const int64_t at = hx_wake_at(hx_miss_posted_ ? hx_miss_post_ptrs_.size() : ptrs.size());
+        if (at >= 0) {
+            wake_hook.fn = &FileStager::hx_wake_miss;
+            wake_hook.ctx = this;
+            wake_hook.at_ns = at;
+            hx_wake_fired_ns_ = 0;
+            ++hx_stats_.wk_rd_armed;
+            /* The wait's timer fires at its time, not up to the default 50 us slack later. */
+            static thread_local const bool slack = prctl(PR_SET_TIMERSLACK, 1000UL, 0UL, 0UL, 0UL) == 0;
+            (void)slack;
+        }
+    }
+    const Mover::ReadWaitHook* wake = wake_hook.fn ? &wake_hook : nullptr;
     if (hx_miss_posted_ || !ptrs.empty() || urgent) {
         /* A demand read in flight: every rank's read-ahead holds back (hx_pf_loop, readahead.h).
          * The urgent units' last pieces are part of it. A read posted at the choice (..._MISS_POST,
@@ -2347,7 +2381,7 @@ int FileStager::hx_submit_misses_now(int rows) {
             /* Finished before hx_ra_settle, which may read on the same readers (read_unit_planes):
              * the post holds their call until this finish. */
             hx_miss_posted_ = false;
-            ok = mover_->finish_unit_planes(&tm);
+            ok = mover_->finish_unit_planes(&tm, wake);
             read = true;
             if (ptrs != hx_miss_post_ptrs_) {
                 demand.demand_leave();
@@ -2358,7 +2392,7 @@ int FileStager::hx_submit_misses_now(int rows) {
         } else {
             demand.demand_enter();
             if (!ptrs.empty()) {
-                ok = mover_->read_unit_planes(ptrs.data(), (int)ptrs.size(), rows, &tm);
+                ok = mover_->read_unit_planes(ptrs.data(), (int)ptrs.size(), rows, &tm, wake);
                 read = true;
             }
         }
@@ -2379,6 +2413,18 @@ int FileStager::hx_submit_misses_now(int rows) {
     hx_stats_.miss_read_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
                                   std::chrono::steady_clock::now() - t0).count();
     if (read && rows == 1) hx_note_reads(tm);
+    /* The armed pre-wake: how long after it the last read landed, or how long before its time (the
+     * reads' landing from their dispatch, which tm counts, against the hook's time from it). */
+    if (wake && read) {
+        const int64_t land = std::max(tm.container_ns, tm.mirror_ns);
+        if (hx_wake_fired_ns_) {
+            ++hx_stats_.wk_rd_fired;
+            hx_stats_.wk_rd_lead_ns += (uint64_t)std::max<int64_t>(tm.t0_ns + land - hx_wake_fired_ns_, 0);
+        } else {
+            hx_stats_.wk_rd_early_ns += (uint64_t)std::max<int64_t>(wake->at_ns - land, 0);
+        }
+        hx_wake_fired_ns_ = 0;
+    }
     const size_t first = hx_jobs_.size();
     for (auto& p : hx_miss_) {
         if (p->n != 2) return RAD_E_STATE;
@@ -2443,8 +2489,14 @@ void FileStager::hx_join_miss_post() {
     PieceReader::process().demand_leave();
 }
 
-/* One one-token miss read's timing into hx_stats_.mr (see HostStats::MissReads). */
+/* One one-token miss read's timing into hx_stats_.mr (see HostStats::MissReads), and with
+ * ..._HOST_EXPERTS_PREWAKE its landing into the ring the next reads' pre-wake time comes from. */
 void FileStager::hx_note_reads(const Mover::PlaneReadTiming& t) {
+    if (hx_wake_) {
+        const int k = t.units == 1 ? 0 : 1;
+        const int64_t land = std::max(t.container_ns, t.mirror_ns);
+        if (land > 0) hx_wake_ring_[k][hx_wake_seen_[k]++ % kWakeRing] = land;
+    }
     HostStats::MissReads& s = hx_stats_.mr[t.units == 1 ? 0 : 1];
     ++s.calls;
     s.posted += t.posted;
@@ -2470,6 +2522,106 @@ void FileStager::hx_note_reads(const Mover::PlaneReadTiming& t) {
         t.return_ns - std::max({ t.mirror_ns, t.container_ns, t.join_ns }), 0);
     s.join_ns += (uint64_t)t.join_ns;
     s.total_ns += (uint64_t)t.return_ns;
+}
+
+/* ..._HOST_EXPERTS_PREWAKE (stager.h): each routed layer's router GEMV -- the widest gemm reading
+ * blk.L.glm_router.weight (the whole projection; a TP-split pass's part is a quarter of it, and an
+ * on-die read is no gemm) -- and the event recorded before it in one-token passes. A layer whose
+ * router is not found gets no router pre-wake (its misses still do). */
+int FileStager::hx_wake_init(const Program& prog) {
+    hx_wake_ = false;
+    hx_wake_li_ = -1;
+    hx_wake_op_.clear();
+    if (!hx_pool_ || hx_pool_->prewake_n() <= 0) return RAD_OK;
+    std::map<std::string, int32_t> want;   /* router weight name: routed layer */
+    for (size_t li = 0; li < layers_.size(); ++li)
+        if (li < hx_ops_.size() && hx_ops_[li].gu >= 0)
+            want[fmt("blk.%d.glm_router.weight", layers_[li].layer)] = (int32_t)li;
+    std::vector<int32_t> li_of_w(prog.weights.size(), -1);
+    for (size_t w = 1; w < prog.weights.size(); ++w)
+        if (const auto it = want.find(prog.weights[w].name); it != want.end()) li_of_w[w] = it->second;
+    std::vector<int32_t> op(layers_.size(), -1);
+    std::vector<long long> width(layers_.size(), 0);
+    for (size_t h = 0; h < prog.ops.size(); ++h) {
+        const OpInfo& o = prog.ops[h];
+        long long N = 0;
+        if (o.op.compare(0, 4, "gemm") != 0 || !o.base.get_i("N", &N)) continue;
+        for (const rad_weight w : o.weights) {
+            const int32_t li = w < li_of_w.size() ? li_of_w[w] : -1;
+            if (li < 0 || N <= width[(size_t)li]) continue;
+            op[(size_t)li] = (int32_t)h;
+            width[(size_t)li] = N;
+        }
+    }
+    hx_wake_op_.assign(prog.ops.size(), -1);
+    size_t found = 0;
+    for (size_t li = 0; li < op.size(); ++li)
+        if (op[li] >= 0) {
+            hx_wake_op_[(size_t)op[li]] = (int32_t)li;
+            ++found;
+        }
+    if (!hx_wake_ev_ && rad_event_create_as(&hx_wake_ev_, RAD_EVENT_LOCAL | RAD_EVENT_HOST_WAIT) < 0) {
+        hx_wake_ev_ = nullptr;
+        RAD_ERR("host experts: pre-wake: no event for the router (%s); no pre-wake", rad_dev_last_error());
+        hx_wake_op_.clear();
+        return RAD_OK;
+    }
+    hx_wake_ = true;
+    if (plan_->rank == 0)
+        RAD_INFO("host experts: pre-wake: an event before %zu of %zu routed layers' router GEMVs in "
+                 "one-token passes%s", found, layers_.size(),
+                 hx_pool_->prewake_lead_ns() > 0 ? "; miss reads pre-wake before their predicted landing"
+                                                  : "; none in miss reads (..._PREWAKE_LEAD_US=0)");
+    return RAD_OK;
+}
+
+/* Layer li's decision, before its counts sync: when this pass recorded li's router event and the
+ * counts are not in yet, the event (the card has reached the router), then the pool's pre-wake --
+ * unless the counts came meanwhile: the submit is then a few us away, and the pre-wake's wake loop
+ * would only delay it. *woke: when the event was seen, for the router-to-counts counter;
+ * untouched when there was no pre-wake. */
+int FileStager::hx_wake_route(int32_t li, std::chrono::steady_clock::time_point* woke) {
+    if (hx_wake_li_ != li) return RAD_OK;
+    hx_wake_li_ = -1;
+    if (rad_event_query(counts_ev_) == 1) {
+        ++hx_stats_.wk_rt_ready;
+        return RAD_OK;
+    }
+    RAD_TRY(rad_event_sync(hx_wake_ev_));
+    if (rad_event_query(counts_ev_) == 1) {
+        ++hx_stats_.wk_rt_ready;
+        return RAD_OK;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    hx_pool_->prewake(HostExpertPool::kWakeRouter);
+    ++hx_stats_.wk_rt;
+    hx_stats_.wk_rt_call_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   std::chrono::steady_clock::now() - t0).count();
+    *woke = t0;
+    return RAD_OK;
+}
+
+/* A one-token miss read of `units` units: its pre-wake's time from the dispatch, the median landing
+ * of the last kWakeRing such reads less the lead (at least 0); -1 for none (fewer than 8 seen yet,
+ * no units, or ..._PREWAKE_LEAD_US=0). */
+int64_t FileStager::hx_wake_at(size_t units) const {
+    if (!hx_wake_ || !units || !hx_pool_ || hx_pool_->prewake_lead_ns() <= 0) return -1;
+    const int k = units == 1 ? 0 : 1;
+    if (hx_wake_seen_[k] < 8) return -1;
+    const size_t n = (size_t)std::min<uint64_t>(hx_wake_seen_[k], kWakeRing);
+    int64_t v[kWakeRing];
+    std::copy(hx_wake_ring_[k], hx_wake_ring_[k] + n, v);
+    std::nth_element(v, v + n / 2, v + n);
+    return std::max<int64_t>(v[n / 2] - hx_pool_->prewake_lead_ns(), 0);
+}
+
+/* A miss read's hook (Mover::ReadWaitHook), on the issuing thread: the reads are still out at
+ * their predicted landing less the lead. */
+void FileStager::hx_wake_miss(void* self) {
+    FileStager* fs = static_cast<FileStager*>(self);
+    fs->hx_wake_fired_ns_ = (int64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch()).count();
+    fs->hx_pool_->prewake(HostExpertPool::kWakeMiss);
 }
 
 /* A HostPlanes whose buffers are reused: the deleter returns it to the free list. */
@@ -2962,8 +3114,14 @@ int FileStager::hx_finish(RadStream s, const RadTensor* t, int n_t) {
     }
     const auto t0 = std::chrono::steady_clock::now();
     hx_pool_->wait(&hx_ticket_);
-    hx_stats_.wait_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
-                             std::chrono::steady_clock::now() - t0).count();
+    const uint64_t waited = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - t0).count();
+    hx_stats_.wait_ns += waited;
+    if (pass_tok_ == 1) {   /* decode's own share, the misses' layers apart */
+        const int m = hx_miss_.empty() ? 0 : 1;
+        ++hx_stats_.d_waits[m];
+        hx_stats_.d_wait_ns[m] += waited;
+    }
     for (int k = 0; k < hx_n_; ++k) mover_->release_host_unit(&hx_units_[k]);
     hx_n_ = 0;
     hx_miss_.clear();
@@ -3110,6 +3268,13 @@ int FileStager::before_op(rad_op h, RadStream s, bool* resync) {
         if (head_first_) { head_first_ = false; RAD_TRY(head_prepare(s, resync)); }
     }
     if ((int32_t)h > last_issued_) last_issued_ = (int32_t)h;
+    /* ..._HOST_EXPERTS_PREWAKE (stager.h): a one-token pass's router GEMV gets an event right before
+     * it, which the layer's decision waits for ahead of its counts (hx_wake_route). */
+    if (hx_wake_ && routed_ && pass_tok_ == 1 && (size_t)h < hx_wake_op_.size() && hx_wake_op_[(size_t)h] >= 0 &&
+        moe_runs(layers_[(size_t)hx_wake_op_[(size_t)h]].layer)) {
+        RAD_TRY(rad_event_record(hx_wake_ev_, s));
+        hx_wake_li_ = hx_wake_op_[(size_t)h];
+    }
 
     /* Read the pass's first routed layer at its first op of any kind -- unless the pass reads
      * routed experts only, which cannot be known before the layer's router has run. */

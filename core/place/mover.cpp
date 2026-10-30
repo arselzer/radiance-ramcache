@@ -1067,22 +1067,29 @@ bool Mover::plane_reads_done(PlaneCall* c, bool readers_failed, PlaneReadTiming*
         if (t.first_container_ns == INT64_MAX) t.first_container_ns = 0;
         t.join_ns = c->join_ns;
         t.return_ns = back;
+        t.t0_ns = c->t0;
         *timing = t;
     }
     for (const PlaneCall::Read& r : c->reads) if (r.rc < 0) return false;
     return source_file_epoch();
 }
 
-bool Mover::read_unit_planes(HostPlanes* const* units, int n, int rows, PlaneReadTiming* timing) {
+bool Mover::read_unit_planes(HostPlanes* const* units, int n, int rows, PlaneReadTiming* timing,
+                             const ReadWaitHook* hook) {
     PlaneCall c;
     if (!plane_reads(units, n, rows, &c)) return false;
     c.t0 = steady_ns();
+    ReadWaitHook at;
+    if (hook && hook->fn) {
+        at = *hook;
+        at.at_ns = c.t0 + hook->at_ns;
+    }
     /* Readers each take the next read (the mirror's first: they take the longest): up to 8 kept
      * workers (plane_workers_, this thread one of them), or with ..._READ_POOL=0 up to 16 threads
      * started for the call; a reader that cannot be started leaves its share to the others. */
     const NativeReadWorkers::Result pr = !plane_read_pool() || c.reads.size() < 2
         ? NativeReadWorkers::Result::Invalid
-        : plane_workers_.run(8, (int)std::min<size_t>(c.reads.size(), 8), c);
+        : plane_workers_.run(8, (int)std::min<size_t>(c.reads.size(), 8), c, at.fn ? &at : nullptr);
     if (pr == NativeReadWorkers::Result::Invalid) {
         std::vector<std::thread> th;
         try {
@@ -1107,12 +1114,17 @@ bool Mover::start_unit_planes(HostPlanes* const* units, int n, int rows) {
     return true;
 }
 
-bool Mover::finish_unit_planes(PlaneReadTiming* timing) {
+bool Mover::finish_unit_planes(PlaneReadTiming* timing, const ReadWaitHook* hook) {
     if (!plane_posted_) return false;
     plane_posted_ = false;
     PlaneCall& c = plane_call_;
     c.join_ns = steady_ns() - c.t0;
-    const NativeReadWorkers::Result pr = plane_workers_.join();
+    ReadWaitHook at;
+    if (hook && hook->fn) {
+        at = *hook;
+        at.at_ns = c.t0 + hook->at_ns;
+    }
+    const NativeReadWorkers::Result pr = plane_workers_.join(at.fn ? &at : nullptr);
     return plane_reads_done(&c, pr != NativeReadWorkers::Result::Complete, timing);
 }
 

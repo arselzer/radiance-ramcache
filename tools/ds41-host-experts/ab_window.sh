@@ -624,9 +624,10 @@ EOF2
   # round, is not measured.
   local want got pat
   for pat in "Dc:DSpark confidence head: " "Dl:DSpark load-aware drafting: on" "Dx:DSpark context pass deferred (" \
-             "Dm:placement: 'dspark.markov_w"; do
+             "Dm:placement: 'dspark.markov_w" "Ds with NK:DSpark draft bank with up to "; do
     want=${pat%%:*}; got=$(grep -cF "${pat#*:}" "$OUT/$name.server.log")
-    local flag; case $want in Dc) flag=${ARM_DC:-};; Dl) flag=${ARM_DL:-};; Dx) flag=${ARM_DX:-};; Dm) flag=${ARM_DM:-};; esac
+    local flag; case $want in Dc) flag=${ARM_DC:-};; Dl) flag=${ARM_DL:-};; Dx) flag=${ARM_DX:-};; Dm) flag=${ARM_DM:-};;
+                              "Ds with NK") flag=${ARM_SOLO:-};; esac
     if [[ -n "$flag" && "$got" == 0 ]]; then
       log "arm $name: $want, but the server log has no '${pat#*:}' line (a radiance or plugin without the switch?); not measured"
       stop_server; return 1
@@ -636,7 +637,7 @@ EOF2
       stop_server; return 1
     fi
   done
-  grep -E "DSpark (confidence controller|confidence head|load-aware drafting|context pass deferred) \(|DSpark confidence head: |placement: 'dspark.markov_w" "$OUT/$name.server.log" | tee -a "$OUT/window.log"
+  grep -E "DSpark (confidence controller|confidence head|load-aware drafting|context pass deferred) \(|DSpark confidence head: |placement: 'dspark.markov_w|DSpark draft bank with up to " "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   # Df (RADIANCE_EXPERIMENTAL_DS41_DSPARK_FP8): the plugin names, on each rank, the drafter's dense
   # weights it reads from E4M3 codes. A Df arm without such a line with N above 0, or another arm
   # with one, is not measured.
@@ -807,8 +808,9 @@ EOF2
   grep -E 'host expert pool: |host experts, pre-wake: |host experts, one-token passes: ' "$OUT/$name.server.log" | tee -a "$OUT/window.log"   # Fw/WpN: the wake-up, decode's gather waits
   # Dg: the gate's totals, the decode steps by kind (the measured break-even), each sequence's line.
   grep -E 'DSpark acceptance gate: ' "$OUT/$name.server.log" | grep -v 'DSpark acceptance gate: on' | tee -a "$OUT/window.log"
-  # Dc / Dl / Dx: their shutdown report (totals, calibration, context passes, steps by kind, each request).
-  grep -E 'DSpark (confidence controller|load-aware drafting|context pass deferred|controls): ' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
+  # Dc / Dl / Dx / a Ds part with NK: their shutdown report (totals, calibration, context passes, steps by
+  # kind and of two or more sequences, each request).
+  grep -E 'DSpark (confidence controller|load-aware drafting|context pass deferred|controls|draft bank with several sequences): ' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   grep -E 'end-of-request snapshots: [0-9]+ reserved' "$OUT/$name.server.log" | tail -1 | tee -a "$OUT/window.log"   # Pce/Pcl: stored, hits, store
 }
 
@@ -1146,7 +1148,11 @@ for a in $ARMS; do
 # / Xi miss reads on threads started per call / on 4 KiB pages / relaid via scratch (the old ways,
 # as A/B switches); Ds / DsN / Dsa DSpark speculation from $DRAFT_BANK at depth 5 / capped at N
 # drafts a step (Ds0: the bank loaded, drafting off) / with the adaptive window (the bank pins its
-# experts in the host pool: give the arm pN of ~2048); Dk the draft bank's grouped GEMMs take the
+# experts in the host pool: give the arm pN of ~2048); a Ds part goes with NK / CK / Pf like any
+# other: with K above 1 a sequence drafts only in a step that carries it alone while no other decodes,
+# and a step of two or more decoding sequences verifies no draft (the plain batch); a drafting Ds arm
+# with K above 1 is measured only with the scheduler's "DSpark draft bank with up to K sequences" line
+# (a radiance that has it), and every other arm must not have it; Dk the draft bank's grouped GEMMs take the
 # live tail and one pass over each expert's weights (RADIANCE_EXPERIMENTAL_DS41_DRAFT_GEMV=1: no
 # slot routed to another rank runs against the rank's last expert, and an expert's rows share one
 # read of its pinned host weights; exact; a libr4d that has it, and a Ds part), Dkt the live tail
@@ -1183,7 +1189,10 @@ for a in $ARMS; do
 # drafts while the confidence head's p for its newest draft is at least 0.TT, 0.55 by default, and below
 # it only one step in R, 8, as a probe), Dl / DlN load-aware drafting (..._DSPARK_LOAD=1 or N: no
 # drafts while 2, or N, sequences decode), Dx the drafter's context pass deferred while nothing drafts
-# (..._DSPARK_CTX_DEFER=1; one sequence's rows caught up in one pass, others dropped), Dm the drafter's
+# (..._DSPARK_CTX_DEFER=1: the trunk keeps every sequence's taps in the drafter cache's slots, and a
+# pass runs only for a drafting sequence, over what it owes: from its cache's end, or the window below
+# its anchor, in passes of 16; with NK, steps of several sequences run none and the one left alone
+# drafts at once), Dm the drafter's
 # Markov codebooks pinned in host memory with the embedding (..._DSPARK_CODEBOOK_RAM=1; needs Er): each
 # needs a Ds part (Dc / Dl / Dx not Ds0, Dc not with Dg) and a radiance (Dc, Dx: and a deepseek41
 # plugin) that has it; measured only with its startup line, and every other arm runs with it 0 and must
@@ -1313,7 +1322,7 @@ for a in $ARMS; do
 # offline in bf16, int8 and int4 against the container's routers); needs a predictor part.
   IFS=- read -r -a parts <<< "$a"
   xt="" bt="" kld="" dk="" db="" pu="" ins_nt="" ins_kib="" ins_wait="" lean="" lc="" ad="" dv="" xd="" hs="" dg="" df="" pmr=""
-  mb="" lf="" dc="" dl="" dx="" dm=""
+  mb="" lf="" dc="" dl="" dx="" dm="" ds="" nseq=""
   pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 HOST_POOL_MIB=4096 EXTRA_ARGS="" ARM_HOME="$RHOME" ARM_CONC=
   ARM_PROMPTS= ARM_N= ARM_LQ= rt=
   power="" skip="" ARGS=() f8="" f8x="" rb="" rbf=0 pred="" cs="" ck="" kh="" pc="" pcopt="" fw="" wp="" wl=""
@@ -1381,6 +1390,7 @@ for a in $ARMS; do
       Xh)      env+=(RADIANCE_EXPERIMENTAL_DS41_PLANE_HUGEPAGES=0) ;;  # miss buffers on 4 KiB pages
       Xi)      env+=(RADIANCE_EXPERIMENTAL_DS41_INSERT_DIRECT=0) ;;    # missed units relaid via scratch
       Ds|Ds[0-9]|Dsa)
+               ds=$p
                if [[ -z "$DRAFT_BANK" ]]; then log "arm $a: $p needs DRAFT_BANK=<draft.rad>"; skip=1; fi
                env+=(RADIANCE_EXPERIMENTAL_DS41_DSPARK_RAD_BANK=1)
                # host: the bank's 96 expert pairs pinned in the host pool and read in place by the card,
@@ -1436,7 +1446,7 @@ for a in $ARMS; do
       Pcm[0-9]*) pcopt+=" $p"; hpm=1; ARGS+=(--prefix-cache-mib "${p#Pcm}") ;;                 # host KV tier of N MiB
       Pcr)     pcopt+=" $p"; hpr=1; env+=(RADIANCE_EXPERIMENTAL_DS41_KV_REPLICATED=1) ;;       # index/compressed caches replicated
       Pf)      env+=(RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE=1) ;;   # a prefill chunk alone in its step; decode rows batched
-      N[0-9]*) ARGS+=(--max-num-seqs "${p#N}") ;;                     # this arm's --max-num-seqs (MAX_SEQS for every arm)
+      N[0-9]*) ARGS+=(--max-num-seqs "${p#N}"); nseq=${p#N} ;;        # this arm's --max-num-seqs (MAX_SEQS for every arm)
       C[0-9]*) ARM_CONC=${p#C} ;;                                     # this arm's requests sent K at a time (AB_CONCURRENCY)
       L[0-9]*) ARGS+=(--max-model-len "${p#L}") ;;                    # this arm's --max-model-len (KV for N sequences)
       Ov)      env+=(RADIANCE_EXPERIMENTAL_DS41_CHAIN_OVERLAP=1) ;;    # independent dispatches overlap, decode passes
@@ -1665,6 +1675,10 @@ for a in $ARMS; do
         RADIANCE_EXPERIMENTAL_DS41_DSPARK_LOAD=${dl:-0} RADIANCE_EXPERIMENTAL_DS41_DSPARK_CTX_DEFER=${dx:-0}
         RADIANCE_EXPERIMENTAL_DS41_DSPARK_CODEBOOK_RAM=${dm:-0})
   ARM_DC=$dc ARM_DL=$dl ARM_DX=$dx ARM_DM=$dm
+  # A drafting Ds part under --max-num-seqs above 1 (an NK part, or MAX_SEQS for the window): the
+  # scheduler drafts for a sequence alone and says so at startup (arm() checks the line both ways).
+  ARM_SOLO=
+  if [[ -n "$ds" && "$ds" != Ds0 ]] && (( 10#${nseq:-${MAX_SEQS:-1}} > 1 )); then ARM_SOLO=1; fi
   # Every arm states these switches (0 is off for each), so a window's VAR=val cannot turn them on;
   # arm() checks the logs both ways. A Dk arm runs only on the libr4d.so the draft check passed on.
   env+=(RADIANCE_EXPERIMENTAL_DS41_DRAFT_GEMV=${dk:-0} RADIANCE_EXPERIMENTAL_DS41_DSPARK_SHORT_BLOCK=${db:-0}

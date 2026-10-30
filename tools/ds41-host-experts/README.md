@@ -79,9 +79,13 @@ every window). On 256 GB with the 192 GiB cache, against the configuration above
 residents on both sides (ab-20261030T205440Z): code prompts **+12.5%** (29.79 vs 26.48 tok/s, 16 coding
 tasks), held-out prompts **+9.3%** (34.15 vs 31.24), chat +1.2% (26.92 vs 26.60). On 128 GB it won only
 on code (+9.2%; held-out a tie, chat -1.3%): there the experts the drafter displaces from VRAM fell to the
-drive, while the bigger cache keeps them in RAM. The draft bank needs a single sequence (the server
-refuses it beside concurrent requests), so leave it off where several requests decode at once: plain
-decode gives 38.7 tok/s in total at 4 streams and 42.2 at 8 (ab-20261030T205440Z).
+drive, while the bigger cache keeps them in RAM. With claude/ds41-dsconc the bank also serves beside
+concurrent requests (--max-num-seqs above 1, with RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE=1): a sequence
+drafts only while it decodes alone, every step of two or more decoding sequences is a plain batch, and
+with RADIANCE_EXPERIMENTAL_DS41_DSPARK_CTX_DEFER=1 those steps run no drafter pass at all, the one left
+alone catching its drafter up from a per-sequence tap history. Not measured yet: until a window does,
+leave the bank off where several requests decode at once: plain decode gives 38.7 tok/s in total at 4
+streams and 42.2 at 8 (ab-20261030T205440Z).
 ```
 RADIANCE_EXPERIMENTAL_DS41_DSPARK_RAD_BANK=1                # the 3-stage DSpark drafter from its bank
 RADIANCE_EXPERIMENTAL_DS41_DSPARK_VERIFY_CAP=1              # one drafted token a step

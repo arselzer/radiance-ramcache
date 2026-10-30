@@ -586,6 +586,21 @@ prompt tokens over the 13 turns; with `Pce` about 19K. Run it at `Lm32768` (both
 three quarters of the pool). `ab_requests.py --ttft` prints per turn the TTFT, the tokens the cache
 supplied and the text against the first (cold) arm, then per session the sums and the cached share.
 
+**Reading a `Pce` window.** Two results gate it, both printed at the end of the window:
+`ab_requests.py --hashes` must report every prompt identical against the cold arm (the prefill
+hashes of every KV group and the last row's logits at the end of each prompt: 13 of 13 on
+`Uharness`), and `--ttft` must show every text `same`. The rest is advisory, because it moves with
+the replies' lengths and with how each reply re-tokenizes when it is sent back: the shutdown line's
+`H admission(s) resumed from one` (11 on `Uharness` when every later turn reaches its predecessor's
+last snapshot) and, in `--ttft`, each later turn's cached tokens equal to its predecessor's last grid
+position (the grid floor of that request's prompt and reply, less its last token). A reply whose text
+re-tokenizes to other ids than the generated ones (the `sent back` lines list them; on 29 Oct the
+23:27 window had a reply come back as 40 tokens for 41 generated) parts the chain early, and that
+turn resumes, still exactly, at the deepest snapshot before the parting, with fewer tokens cached.
+A hash that differs is (A) failing for some op on the cards: if the `Pc` arm without `Pce` (which
+adopts decode-written cache blocks too, from the third turn on) agrees, suspect the decode-written
+window or compressor-tail state in the snapshot; if it differs too, the decode-written blocks.
+
 ## Correctness
 
 Each row the CPU computes uses the card's arithmetic: the same lane and block order, butterfly,

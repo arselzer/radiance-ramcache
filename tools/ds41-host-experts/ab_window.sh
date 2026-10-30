@@ -60,7 +60,9 @@
 # holds both without a trim; Uharness1 is its first session alone. Each Pc* arm's startup and
 # shutdown lines for these go into window.log, and --ttft at the end reads per-turn TTFT, the
 # tokens the cache supplied and identity against the first arm (the cold one), with Kh arms'
-# prefill hashes compared prompt by prompt.
+# prefill hashes compared prompt by prompt. Those two gate a Pce arm (--hashes: every prompt
+# identical; --ttft: every text same); its shutdown line's admissions resumed and each turn's cached
+# tokens are advisory, since they move with reply lengths and with how a reply re-tokenizes.
 #
 # Exact tall passes (RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL): Xt sets the switch (every other arm runs
 # with it 0) and BTN the step, --max-num-batched-tokens N (16 otherwise), e.g. ...-M32-...-Xt-BT32; an

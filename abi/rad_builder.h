@@ -850,6 +850,19 @@ int rad_declare_consumer_suffix(RadBuilder* b, const RadConsumerSuffix* d);
  * the per-row cut has neither this export (a weak reference is null) nor the field. Additive export. */
 int rad_consumer_row_grain(RadBuilder* b);
 
+/* ================================================================== two-batch overlap */
+/* The plugin issues a pure decode step of two or more sequences, one row each, as two micro-batches
+ * (RADIANCE_EXPERIMENTAL_SCHED_TBO=1; the split, its order and its contract: core/sched/tbo.h): the
+ * first ceil(S / 2) sequences' rows and the rest, each a micro-batch computing exactly what a step
+ * of its rows alone computes, one micro-batch's layer up to its MoE gather issued between the other's
+ * MoE and its gather. The core then keeps every transient buffer's bytes its own (the declared op
+ * order no longer bounds when they are live), and the file stager and the routing witness take each
+ * routed layer as two passes, one a micro-batch. Called at most once, during declare, by a plugin
+ * that splits exactly the steps tbo::step_splits names. Additive export; RAD_ABI_VERSION does not
+ * move: a plugin reaches it through a weak reference, null on an engine older than the call, and
+ * splits only once it returned RAD_OK. */
+int rad_declare_two_batch(RadBuilder* b);
+
 /* ================================================================== the encoder */
 /* A media encoder the plugin runs on an encoder pass (RadBatch::enc). The core drives the pass and
  * reads its result, so the plugin declares it. A plugin that declares none serves text only, and

@@ -126,6 +126,10 @@ struct RadBuilder {
     /* The consumer suffix (rad_declare_consumer_suffix), n_layer 0 when none, and the calls. */
     RadConsumerSuffix consumer{};
     int               consumer_calls = 0;
+    /* Two-batch overlap (rad_declare_two_batch): declared, and the calls. Declared, no transient
+     * shares bytes (liveness, as Builder::finish_buffer_liveness). */
+    bool two_batch = false;
+    int  two_batch_calls = 0;
 
     /* The buffers named to rad_buf_concurrent: the ones a second lane touches. */
     std::vector<rad_buf> concurrent;
@@ -431,6 +435,12 @@ extern "C" int rad_declare_consumer_suffix(RadBuilder* b, const RadConsumerSuffi
     ++b->consumer_calls;
     if (b->consumer.n_layer > 0) return RAD_E_STATE;
     b->consumer = *d;
+    return RAD_OK;
+}
+extern "C" int rad_declare_two_batch(RadBuilder* b) {
+    if (!b) return RAD_E_INVAL;
+    ++b->two_batch_calls;
+    b->two_batch = true;
     return RAD_OK;
 }
 /* The grain the engine takes (rad_builder.h): the declared one, as the core records it. */
@@ -829,7 +839,7 @@ std::vector<Live> liveness(const RadBuilder& b) {
         Live& l = L[h];
         l.transient = d.kind == RAD_BUF_TRANSIENT;
         l.domain    = d.domain;
-        if (!l.transient || first[h] < 0 || (conc.count((rad_buf)h) && b.lane1_w1 < 0)) {
+        if (!l.transient || first[h] < 0 || b.two_batch || (conc.count((rad_buf)h) && b.lane1_w1 < 0)) {
             l.lo = 0;
             l.hi = last_op;
             continue;

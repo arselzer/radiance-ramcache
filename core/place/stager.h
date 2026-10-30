@@ -92,6 +92,7 @@
 #include "hx_side_store.h"
 #include "readahead.h"
 #include "route_trace.h"
+#include "../sched/tbo.h"
 
 #include <algorithm>
 #include <array>
@@ -316,6 +317,8 @@ public:
     static constexpr int kProfBuckets = 4;
     bool profile_on() const { return prof_on_; }
     const PassProfile& profile(int b) const { return prof_[b]; }
+    /* RADIANCE_EXPERIMENTAL_SCHED_TBO: routed layers' slices B begun (a split pass, stager.h tbo_). */
+    uint64_t tbo_slices() const { return tbo_slices_; }
     /* Routed experts the CPU computed (HostExpertPool) instead of a copy to the card. */
     struct HostStats {
         uint64_t layers = 0, units = 0, rows = 0;
@@ -560,11 +563,27 @@ private:
      * jobs over layer_rows); 0 and the pass on every pass without it. */
     std::vector<int32_t> pass_row0_;   /* by model layer; empty: no cut by row */
     int64_t layer_r0(int32_t li) const {
+        if (tbo_) return tbo::first_row(tbo_tok_, tbo_slice_);
         if (pass_row0_.empty() || li < 0 || (size_t)li >= layers_.size()) return 0;
         const int32_t l = layers_[(size_t)li].layer;
         return l >= 0 && (size_t)l < pass_row0_.size() ? std::clamp<int64_t>(pass_row0_[(size_t)l], 0, pass_tok_) : 0;
     }
-    int64_t layer_rows(int32_t li) const { return pass_tok_ - layer_r0(li); }
+    int64_t layer_rows(int32_t li) const { return tbo_ ? pass_tok_ : pass_tok_ - layer_r0(li); }
+    /* RADIANCE_EXPERIMENTAL_SCHED_TBO (core/sched/tbo.h): a split pass issues each routed layer as
+     * two slices one after the other, micro-batch A's rows [0, Sa) and then B's [Sa, n_tok), each
+     * from its gate_up to its gather (the architecture's other card work between them names no
+     * file-tier weight). While a slice runs, pass_tok_ is its rows and layer_r0 its first row, so
+     * its counts witness, its rows' copies, the CPU's choice and jobs, its misses and the
+     * read-ahead take it as a pass of its own rows. A layer's second gate_up starts slice B
+     * (tbo_second); entering a layer starts slice A. */
+    bool    tbo_ = false;
+    int     tbo_slice_ = 0;
+    int64_t tbo_tok_ = 0;     /* the step's tokens */
+    void tbo_enter(int slice);
+    int  tbo_second(int32_t li, RadStream s);
+    /* Whether slice A's read-ahead entries it did not select stay for slice B (which reads ahead). */
+    bool tbo_keeps_ra() const;
+    uint64_t tbo_slices_ = 0;   /* slices B started (the shutdown report) */
     int32_t n_model_layers_ = 0;
     /* The layers whose MoE this pass runs: RadBatch::consumer_full on a pass the consumer skip
      * cut (core/sched/consumer_skip.h), every layer otherwise. Nothing is read, staged, predicted

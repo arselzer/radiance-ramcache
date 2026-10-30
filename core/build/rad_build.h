@@ -132,6 +132,7 @@ public:
     int         drafter_short_block(int64_t block);
     int         declare_consumer_suffix(const RadConsumerSuffix* d);
     int         consumer_row_grain() const;
+    int         declare_two_batch();
     int         declare_encoder(const RadEncoderDecl* d);
     int         declare_generator(const RadGeneratorDecl* d);
     int         declare_audio_generator(const RadAudioGenDecl* d);

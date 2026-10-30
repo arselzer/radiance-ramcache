@@ -63,5 +63,33 @@ inline bool r4d_ds41_exact_tall() {
     return on;
 }
 
-/* The twin's bound on M: kR4dDs41LcpMax under LCP, kR4dDs41TallRows under EXACT_TALL alone. */
-inline int r4d_ds41_tall_rows() { return r4d_ds41_lcp() > 0 ? kR4dDs41LcpMax : kR4dDs41TallRows; }
+/* Prefill Phase 1, RADIANCE_EXPERIMENTAL_DS41_P1 (tools/ds41-host-experts/ds41_p1.h, the contract between the
+ * card kernel side and the core's card expert stager; restated here because a plugin includes nothing of the
+ * core or the tools, and ds41_mxfp4_device_check `p1` static_asserts that the two agree):
+ *
+ *   "1" beside a valid LCP: the routed GEMM's twin is registered as kR4dDs41P1Row (in place of
+ *   moe_gemm_ggml_mxfp4_gemv_tall) with its bound on M raised to kR4dDs41P1MaxRows, and its launcher
+ *   (r4d_rad_moe_gemm_mxfp4_gemv_tall_p1, r4d_ds41_mxfp4.hip) serves a weight table through gemv_vp's kernel at
+ *   every height: entries marked kR4dDs41MarkPacked are packed-scale weights, entries marked kR4dDs41MarkSkip
+ *   are not computed (none of their rows written, none of their bytes read), every expert owns the live-tail
+ *   range [off[e], off[e + 1]), the slots past off[n_expert] are written as zeros by every call, and the work is
+ *   spread by row passes. Anything else, or "1" without a valid LCP, is off here (the core refuses an invalid
+ *   value and P1 without LCP). Read once. */
+constexpr const char* kR4dDs41P1Env = "RADIANCE_EXPERIMENTAL_DS41_P1";
+constexpr const char* kR4dDs41P1Row = "moe_gemm_ggml_mxfp4_gemv_tall_p1";
+constexpr int kR4dDs41P1MaxRows = 4096;
+constexpr unsigned long long kR4dDs41MarkPacked = 1, kR4dDs41MarkSkip = 2;
+
+inline bool r4d_ds41_p1() {
+    static const bool on = [] {
+        const char* e = std::getenv(kR4dDs41P1Env);
+        return e && e[0] == '1' && e[1] == '\0' && r4d_ds41_lcp() > 0;
+    }();
+    return on;
+}
+
+/* The twin's bound on M: kR4dDs41P1MaxRows under P1, kR4dDs41LcpMax under LCP, kR4dDs41TallRows under EXACT_TALL
+ * alone. */
+inline int r4d_ds41_tall_rows() {
+    return r4d_ds41_p1() ? kR4dDs41P1MaxRows : r4d_ds41_lcp() > 0 ? kR4dDs41LcpMax : kR4dDs41TallRows;
+}

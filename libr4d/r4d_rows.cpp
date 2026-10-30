@@ -10122,6 +10122,7 @@ const std::vector<TallTwin>& tall_twins() {
         if (!r4d_ds41_exact_tall()) return t;
         const int reach = r4d_ds41_tall_rows();
         const bool lcp = r4d_ds41_lcp() > 0;
+        const bool p1 = r4d_ds41_p1();
         for (const RadKernelInfo& k : kKernels) {
             if (std::strcmp(k.name, "moe_gemm_ggml_mxfp4_gemv") != 0) continue;
             TallTwin h;
@@ -10137,11 +10138,19 @@ const std::vector<TallTwin>& tall_twins() {
             if (bound != 1) continue;   /* not the row this was written for: no twin */
             h.info = k;
             h.info.priority = k.priority - 1;
-            h.info.launch = r4d_rad_moe_gemm_mxfp4_gemv_tall;
-            h.name = std::string(k.name) + "_tall";
+            /* Prefill Phase 1 (RADIANCE_EXPERIMENTAL_DS41_P1=1 beside LCP, r4d_ds41_tall.h): the twin under its own
+             * name, reaching kR4dDs41P1MaxRows, its launcher gemv_vp's kernel at every height with the table's
+             * packed and skip marks, the live-tail ranges and the work spread by row passes. The core tells the
+             * two twins apart by name and refuses a P1 run on a libr4d that registered the plain one. */
+            h.info.launch = p1 ? r4d_rad_moe_gemm_mxfp4_gemv_tall_p1 : r4d_rad_moe_gemm_mxfp4_gemv_tall;
+            h.name = p1 ? std::string(kR4dDs41P1Row) : std::string(k.name) + "_tall";
             h.computes = std::string(k.computes) +
                          "; in passes of up to " + std::to_string(reach) +
-                         (lcp ? " tokens (RADIANCE_EXPERIMENTAL_DS41_LCP)" : " tokens (RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL)") +
+                         (p1    ? " tokens (RADIANCE_EXPERIMENTAL_DS41_P1 beside RADIANCE_EXPERIMENTAL_DS41_LCP: table "
+                                  "entries marked packed (bit 0) or skipped (bit 1), the slots past the live end "
+                                  "written as zeros)"
+                          : lcp ? " tokens (RADIANCE_EXPERIMENTAL_DS41_LCP)"
+                                : " tokens (RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL)") +
                          ", each output the decode band's bits";
             h.shape = "M 17.." + std::to_string(reach) +
                       " tokens (the passes the gemv row leaves to the tiled one), any N, K a multiple of 32, up to "

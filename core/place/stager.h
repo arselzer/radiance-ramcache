@@ -300,6 +300,22 @@ public:
         uint64_t d_miss_post_ns = 0;
     };
     const EpStats& ep_stats() const { return ep_stats_; }
+    /* RADIANCE_EXPERIMENTAL_DS41_LCP_PROFILE=1 (an instrument; nothing it measures changes): the routed
+     * layers' host-side times by the pass's height -- bucket 0 one token, 1 two to 16, 2 17 to 256, 3 more.
+     * layers: routed layer-passes; rows: their routed rows (the pass's rows from the layer's cut);
+     * cpu_rows: rows handed to the pool; sync: waiting for the card at the counts (the router wait: the
+     * card's work up to this layer's router not hidden behind the host, e.g. the layer before's experts);
+     * miss_wait: at the gather for misses still being read; gather: at the gather for the pool's rows;
+     * miss_units / miss_read: the misses read and the read call's time (on the worker, overlapping);
+     * waves: large-chunk read waves; span: from one routed layer's counts to the next layer's in the same
+     * pass (the layer-pass's wall time; a pass's first layer has none). */
+    struct PassProfile {
+        uint64_t layers = 0, rows = 0, cpu_rows = 0, sync_ns = 0, miss_wait_ns = 0, gather_ns = 0;
+        uint64_t miss_units = 0, miss_read_ns = 0, waves = 0, spans = 0, span_ns = 0;
+    };
+    static constexpr int kProfBuckets = 4;
+    bool profile_on() const { return prof_on_; }
+    const PassProfile& profile(int b) const { return prof_[b]; }
     /* Routed experts the CPU computed (HostExpertPool) instead of a copy to the card. */
     struct HostStats {
         uint64_t layers = 0, units = 0, rows = 0;
@@ -528,6 +544,12 @@ private:
     RadEvent  counts_ev_ = nullptr;
     bool      routed_ = false;                   /* this pass reads routed experts only */
     int64_t   pass_tok_ = 0;
+    /* RADIANCE_EXPERIMENTAL_DS41_LCP_PROFILE (PassProfile above). */
+    bool prof_on_ = false;
+    PassProfile prof_[kProfBuckets];
+    std::chrono::steady_clock::time_point prof_last_counts_{};
+    int prof_bucket() const { return pass_tok_ <= 1 ? 0 : pass_tok_ <= 16 ? 1 : pass_tok_ <= 256 ? 2 : 3; }
+    void prof_counts(int32_t li, uint64_t sync_ns, std::chrono::steady_clock::time_point t_counts);
 public:
     /* LCP's chunk C once this rank's stager admitted it (lcp_init, hx_init), else 0. */
     int64_t lcp_rows() const { return lcp_; }

@@ -849,6 +849,39 @@ passes: a plain `Kld` arm first, then `...-M1024-...-Lc1024-Kld` (identical reco
 with and without `Cs` (identical prefill hashes). Leave `Vp` out of an Lc arm (refused) and `Rb` too
 (`gemm_nt_f32bf16` is not in the sweep).
 
+### Balanced routed gemv (`RADIANCE_EXPERIMENTAL_DS41_MOE_BALANCE`)
+
+Window H (`ab-20261030T105535Z`) measured large-chunk prefill exact but 3-4x slower than 16-token
+passes: on rank 0 of the `Lc1024-Cs` Ulong arm, 388 s of its ~463 s of prefill was the issuing thread
+waiting for the card at the routers' counts (1.19 s a layer-pass, against 4.3 ms a 16-token
+layer-pass), 72 s waiting for misses still being read and 2.4 s for the pool. The card's time is the
+routed GEMM's twin: the plain gemv kernel gives each live expert the same number of work items, and
+`mx_range` hands an EP rank's last local expert every slot routed to the other ranks (`[off[96], T)`:
+about 4,600-5,500 of a 1,024-token chunk's 6,144 slots), one weight pass each at gate_up's XLM 1, on
+the 4-6 blocks that expert gets. Phase 0's `m3-twin` fits that to the percent: (T − local) × rgpi row
+groups at 5.1 us each on a lone block is 1.05 s / 1.24 s / 2.56 s for L25 rank 0 / L25 rank 2 /
+uniform at M 1024 (measured 1.09 / 1.25 / 2.59 s of gate_up) and 60 ms at M 64 (61 ms). The same tail
+is most of a 16-token pass's card time (about 72 dropped slots a pass).
+
+Under `..._MOE_BALANCE=1` (every plain gemv call: the decode band and the twin) or `=2` (the twin above
+16 tokens only) `mx_gemv_kernel` cuts each live expert's row passes into chunks of P passes up to the
+live end `off[ne]` (P sized so the chunks fill the grid once) and the passes past it into chunks of 64 P,
+and a pass whose slots are all dropped writes its zeros without reading weights. Every pass is the plain
+loop's (the same rows from the expert's first row in steps of XLM) and every output one wave's sum in the
+same lane and block order, so the bytes are the plain kernel's; `r4d_emu_ds41bal` holds that on the
+host (gemv and twin, XLM 1 / 3 / 8, six routings including tail-only and no local slot) and
+`r4d_emu_ds41tall_bal` reruns the twin-against-16-token-passes check with the switch on;
+`ds41_mxfp4_device_check LIBR4D bal [C] [ROUTES]` holds it on a card at ds41's shapes and times both
+(the checker export `r4d_rad_moe_gemm_mxfp4_gemv_bal` forces the switch per call). Not for gemv_vp
+(`Vp`), the live tail (`..._LIVE_TAIL`) or the draft bank's one-pass mode.
+
+Arm parts: `Mb1` / `Mb2`; `bal` in `DEVICE_CHECKS` (with `TALL_CHECK`, `TALL_LIBR4D`, `LCP_CHECK_C`, and
+optionally `BAL_ROUTES`, a `p0_tables.py routes` file) runs the card check (`devcheck-bal.log`) and gates
+the Mb arms on its libr4d.so. `Lf` sets `RADIANCE_EXPERIMENTAL_DS41_LCP_PROFILE=1`: at exit each rank logs
+`pass profile, rank R, <height>: ...` for passes of 1, 2-16, 17-256 and 257+ tokens -- routed layer-passes,
+rows, a layer-pass's wall time (counts to counts), its wait for the card at the counts, for misses at the
+gather, for the pool at the gather, misses and read waves a layer-pass.
+
 ## Many token rows of one expert
 
 `gemv_avx2_many` computes up to 32 token rows of one matrix in one call (more in calls of 32), for

@@ -198,7 +198,8 @@ def one(b, url, replies=None):
     text = None if choice is None else (choice.get("message", {}).get("content") if chat else choice.get("text"))
     print("%s: %.1f s, decode %.2f tok/s, prefill %.0f ms%s%s" % (
         b["name"], wall, t.get("predicted_per_second") or 0.0, t.get("prompt_ms") or 0.0,
-        ", %d of %d prompt tokens cached" % (t.get("cache_n") or 0, t.get("prompt_n") or 0)
+        # The server's prompt_n is the prompt tokens it computed: the prompt less the cached ones.
+        ", %d of %d prompt tokens cached" % (t.get("cache_n") or 0, prompt_tokens(t) or 0)
         if t.get("cache_n") else "",
         "" if text is not None else " ERROR %s" % resp.get("error")), flush=True)
     row = {"name": b["name"], "family": family(b), "wall_s": wall, "text": text, "timings": t,
@@ -323,6 +324,15 @@ def compare(d, arms):
             "%12.2f tok/s" % (tot[a][1] / tot[a][0] * 1e3 if tot[a][0] else 0.0) for a in cols))
 
 
+def prompt_tokens(t):
+    """A request's prompt tokens from its timings: the server's prompt_n counts only the ones it
+    computed (the prompt less cache_n, core/server/server.cpp timings_of), so the two together. None
+    without timings."""
+    if t.get("prompt_n") is None:
+        return None
+    return (t.get("prompt_n") or 0) + (t.get("cache_n") or 0)
+
+
 def ttft(d, arms):
     """Prefix-cache A/Bs, per group of arms that sent the same requests (by_receipt), each request
     against the group's first arm that sent it (put the arm without Pc first: every request cold).
@@ -352,7 +362,7 @@ def ttft(d, arms):
                     cells.append("%24s" % "-")
                     continue
                 t = r.get("timings") or {}
-                p = p if p is not None else t.get("prompt_n")
+                p = p if p is not None else prompt_tokens(t)
                 s = (t.get("ttft_ms") if t.get("ttft_ms") is not None else t.get("prompt_ms") or 0.0) / 1e3
                 c = t.get("cache_n") or 0
                 same = r["text"] == ref.get("text")
@@ -382,7 +392,7 @@ def ttft(d, arms):
                 prompt = 0
                 cells = []
                 for a in cols:
-                    st, sc, sp, ss, k = 0.0, 0, 0, 0, 0
+                    st, sc, sp, ss, k = 0.0, 0, 0, 0, 0   # ttft, cached and prompt tokens, same, turns
                     for n in ns:
                         r = data[a].get(n)
                         if not r or r.get("text") is None:
@@ -390,7 +400,7 @@ def ttft(d, arms):
                         t = r.get("timings") or {}
                         st += (t.get("ttft_ms") if t.get("ttft_ms") is not None else t.get("prompt_ms") or 0.0) / 1e3
                         sc += t.get("cache_n") or 0
-                        sp += t.get("prompt_n") or 0
+                        sp += prompt_tokens(t) or 0
                         ss += r["text"] == data[ref_arm(data, cols, n)][n].get("text")
                         k += 1
                     prompt = max(prompt, sp)

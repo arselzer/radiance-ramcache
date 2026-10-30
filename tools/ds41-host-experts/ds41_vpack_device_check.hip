@@ -27,10 +27,13 @@
  *                                                      copies (past the 64 MB on-die cache); the outputs
  *                                                      compared too.
  *
- * When the library exports r4d_rad_moe_gemm_mxfp4_gemv_vp_variant, every gemv_vp kernel it has (the default,
- * the first form "old", mx_vp2_kernel "r2" and "r4") is checked against the plain row in `check`, and timed in
- * `time`: each call alone (a host round trip around it, as above) and 24 calls back to back on the stream
- * (each its own table of experts, so no weight is read twice in a run), whose time a call is the card's.
+ * When the library exports r4d_rad_moe_gemm_mxfp4_gemv_vp_variant, every gemv_vp kernel it has (the default
+ * and r4d_rad_moe_gemm_mxfp4_gemv_vp_variants' names) is checked against the plain row in `check`, and timed in
+ * `time`: each call alone (a host round trip around it, as above) and in bursts of 24 calls back to back on the
+ * stream, every burst of every mode enqueued one after another with no host gap (their routings uploaded
+ * first), so the card stays busy and at its clocks as in a decode step; the first round of bursts warms up and
+ * is not counted. Two rows tell where the time goes: live=0 (no expert has a row: the launch, the live scan and
+ * nothing else) and `hot` (live=1, every call on the same weight copy, so its bytes come from the on-die cache).
  *
  * Needs a free card (HIP device 0 unless HIP_VISIBLE_DEVICES says otherwise): run it in a GPU window, as
  * ab_window.sh runs ds41_mxfp4_device_check. Build (as build_hx.sh builds the other harness):
@@ -467,7 +470,7 @@ struct Call {
     std::vector<void*> table;
     std::vector<int32_t> off, sorted;
 };
-Call make_call(const std::vector<std::unique_ptr<Weight>>& ws, int live, int it, bool pk) {
+Call make_call(const std::vector<std::unique_ptr<Weight>>& ws, int live, int it, bool pk, int fixed = -1) {
     std::mt19937_64 rr(1000 + it);
     std::vector<int> ex;
     while ((int)ex.size() < live) {
@@ -483,7 +486,7 @@ Call make_call(const std::vector<std::unique_ptr<Weight>>& ws, int live, int it,
     for (int i = 0; i < live; ++i) c.sorted[(size_t)i] = i;
     c.table.assign(kNe, ws[0]->d_block->p);
     for (int i = 0; i < live; ++i) {
-        Weight& w = *ws[(size_t)((it * live + i) % (int)ws.size())];
+        Weight& w = *ws[(size_t)(fixed >= 0 ? (fixed + i) % (int)ws.size() : (it * live + i) % (int)ws.size())];
         c.table[(size_t)ex[(size_t)i]] = pk ? (void*)((uintptr_t)w.d_packed->p | 1u) : w.d_block->p;
     }
     return c;
@@ -509,13 +512,6 @@ int timing(const Lib& lib) {
     }
     Dev tab(kNe * sizeof(void*)), d_sorted(kTop * 4), d_off((kNe + 1) * 4), d_x(kEmbd * 2),
         d_a((size_t)kTop * kFf * 2), y1((size_t)kTop * kEmbd * 2), y2((size_t)kTop * kEmbd * 2);
-    /* The burst's own tables and routings, uploaded before it starts. */
-    std::vector<std::unique_ptr<Dev>> btab, boff, bsorted;
-    for (int i = 0; i < kBurst; ++i) {
-        btab.emplace_back(new Dev(kNe * sizeof(void*)));
-        boff.emplace_back(new Dev((kNe + 1) * 4));
-        bsorted.emplace_back(new Dev(kTop * 4));
-    }
     std::vector<uint16_t> x(kEmbd), act((size_t)kTop * kFf);
     for (auto& v : x) v = f2bf(0.5f * (float)((int)(rng() % 200) - 100) / 100.f);
     for (auto& v : act) v = f2bf(0.1f * (float)((int)(rng() % 200) - 100) / 100.f);
@@ -539,13 +535,16 @@ int timing(const Lib& lib) {
     };
     size_t differ = 0;
     int cc = 0;   /* the call counter: every call reads copies no call has read for the last 23 */
-    for (int live = 1; live <= 3; ++live)
+    /* live 0..3, then (live 4) the hot row: live=1 on copy 0 every call, back to back only. */
+    for (int live = 0; live <= 4; ++live)
         for (int which = 0; which < 2; ++which) {
+            const bool hot = live == 4;
+            const int nlive = hot ? 1 : live;
             const bool gu = which == 0;
             const int N = gu ? 2 * kFf : kEmbd, K = gu ? kEmbd : kFf;
             const auto& ws = gu ? gus : dns;
             auto one = [&](int mode, int it, void* y) {
-                const Call c = make_call(ws, live, it, mode_pk(mode));
+                const Call c = make_call(ws, nlive, it, mode_pk(mode));
                 tab.put(c.table.data());
                 d_sorted.put(c.sorted.data());
                 d_off.put(c.off.data());
@@ -559,53 +558,81 @@ int timing(const Lib& lib) {
                 HC(hipEventElapsedTime(&ms, e0, e1));
                 return ms;
             };
-            /* kBurst calls back to back (calls `it0` .. + kBurst - 1), the card's time a call. */
-            auto burst = [&](int mode, int it0) {
-                cc += kBurst;
-                for (int i = 0; i < kBurst; ++i) {
-                    const Call c = make_call(ws, live, it0 + i, mode_pk(mode));
-                    btab[(size_t)i]->put(c.table.data());
-                    bsorted[(size_t)i]->put(c.sorted.data());
-                    boff[(size_t)i]->put(c.off.data());
-                }
-                HC(hipStreamSynchronize(s));
-                HC(hipEventRecord(e0, s));
-                for (int i = 0; i < kBurst; ++i)
-                    if (run_moe(lib, mode_kernel(mode), s, gu ? d_x.p : d_a.p, gu ? 1 : kTop, btab[(size_t)i]->p, N, K,
-                                bsorted[(size_t)i]->p, boff[(size_t)i]->p, y1.p, gu ? "token" : "sorted", kTop) < 0)
-                        std::exit(3);
-                HC(hipEventRecord(e1, s));
-                HC(hipEventSynchronize(e1));
-                float ms = 0;
-                HC(hipEventElapsedTime(&ms, e0, e1));
-                return ms / kBurst;
-            };
-            std::vector<double> iso((size_t)nmodes), bur((size_t)nmodes);
+            std::vector<double> iso((size_t)nmodes, 0.0), bur((size_t)nmodes);
             /* Alone: warm-up, then 60 calls a mode, the modes interleaved call by call so drift falls on all. */
-            std::vector<std::vector<float>> t((size_t)nmodes);
-            for (int it = 0; it < 5; ++it)
-                for (int mode = 0; mode < nmodes; ++mode) (void)one(mode, cc++, y1.p);
-            for (int it = 0; it < 60; ++it)
-                for (int mode = 0; mode < nmodes; ++mode) t[(size_t)mode].push_back(one(mode, cc++, y1.p));
-            for (int mode = 0; mode < nmodes; ++mode) {
-                std::sort(t[(size_t)mode].begin(), t[(size_t)mode].end());
-                iso[(size_t)mode] = t[(size_t)mode][t[(size_t)mode].size() / 2];
+            if (!hot) {
+                std::vector<std::vector<float>> t((size_t)nmodes);
+                for (int it = 0; it < 5; ++it)
+                    for (int mode = 0; mode < nmodes; ++mode) (void)one(mode, cc++, y1.p);
+                for (int it = 0; it < 60; ++it)
+                    for (int mode = 0; mode < nmodes; ++mode) t[(size_t)mode].push_back(one(mode, cc++, y1.p));
+                for (int mode = 0; mode < nmodes; ++mode) {
+                    std::sort(t[(size_t)mode].begin(), t[(size_t)mode].end());
+                    iso[(size_t)mode] = t[(size_t)mode][t[(size_t)mode].size() / 2];
+                }
             }
-            /* Back to back: 7 bursts a mode, interleaved, the median burst. */
+            /* Back to back: 8 rounds of one burst a mode (round 0 warms up), every call's routing uploaded first,
+             * then all bursts enqueued with an event pair around each and nothing between them; the median of a
+             * mode's 7 counted bursts. */
+            constexpr int kRounds = 8;
+            const int nb = kRounds * nmodes;
+            const size_t tsz = kNe * sizeof(void*), osz = (kNe + 1) * 4, ssz = kTop * 4;
+            Dev btab((size_t)nb * kBurst * tsz), boff((size_t)nb * kBurst * osz), bsort((size_t)nb * kBurst * ssz);
+            {
+                std::vector<uint8_t> ht((size_t)nb * kBurst * tsz), ho((size_t)nb * kBurst * osz),
+                    hs((size_t)nb * kBurst * ssz);
+                for (int bi = 0; bi < nb; ++bi)
+                    for (int i = 0; i < kBurst; ++i) {
+                        const size_t at = (size_t)bi * kBurst + i;
+                        const Call c = make_call(ws, nlive, cc + bi * kBurst + i, mode_pk(bi % nmodes), hot ? 0 : -1);
+                        std::memcpy(ht.data() + at * tsz, c.table.data(), tsz);
+                        std::memcpy(ho.data() + at * osz, c.off.data(), osz);
+                        std::memcpy(hs.data() + at * ssz, c.sorted.data(), ssz);
+                    }
+                btab.put(ht.data());
+                boff.put(ho.data());
+                bsort.put(hs.data());
+            }
+            cc += nb * kBurst;
+            std::vector<hipEvent_t> ev((size_t)2 * nb);
+            for (auto& e : ev) HC(hipEventCreate(&e));
+            HC(hipStreamSynchronize(s));
+            for (int bi = 0; bi < nb; ++bi) {
+                HC(hipEventRecord(ev[(size_t)2 * bi], s));
+                for (int i = 0; i < kBurst; ++i) {
+                    const size_t at = (size_t)bi * kBurst + i;
+                    if (run_moe(lib, mode_kernel(bi % nmodes), s, gu ? d_x.p : d_a.p, gu ? 1 : kTop,
+                                (uint8_t*)btab.p + at * tsz, N, K, (uint8_t*)bsort.p + at * ssz,
+                                (uint8_t*)boff.p + at * osz, y1.p, gu ? "token" : "sorted", kTop) < 0)
+                        std::exit(3);
+                }
+                HC(hipEventRecord(ev[(size_t)2 * bi + 1], s));
+            }
+            HC(hipEventSynchronize(ev.back()));
             std::vector<std::vector<float>> b((size_t)nmodes);
-            for (int rep = 0; rep < 7; ++rep)
-                for (int mode = 0; mode < nmodes; ++mode) b[(size_t)mode].push_back(burst(mode, cc));
+            for (int bi = nmodes; bi < nb; ++bi) {
+                float ms = 0;
+                HC(hipEventElapsedTime(&ms, ev[(size_t)2 * bi], ev[(size_t)2 * bi + 1]));
+                b[(size_t)(bi % nmodes)].push_back(ms / kBurst);
+            }
+            for (auto& e : ev) HC(hipEventDestroy(e));
             for (int mode = 0; mode < nmodes; ++mode) {
                 std::sort(b[(size_t)mode].begin(), b[(size_t)mode].end());
                 bur[(size_t)mode] = b[(size_t)mode][b[(size_t)mode].size() / 2];
             }
             for (int mode = 0; mode < nmodes; ++mode) {
-                const double bytes = (double)live * (mode_pk(mode) ? (double)ws[0]->packed.size() : (double)N * K / 32 * 17);
-                std::printf("%s %s live=%d: median %.1f us, %.0f GB/s of weights; back to back %.1f us a call, %.0f GB/s\n",
-                            mode_name(mode), gu ? "gate_up" : "down   ", live, 1e3 * iso[(size_t)mode],
-                            bytes / (iso[(size_t)mode] * 1e-3) / 1e9, 1e3 * bur[(size_t)mode],
-                            bytes / (bur[(size_t)mode] * 1e-3) / 1e9);
+                const double bytes = (double)nlive * (mode_pk(mode) ? (double)ws[0]->packed.size() : (double)N * K / 32 * 17);
+                if (hot)
+                    std::printf("%s %s hot   : back to back %.1f us a call, %.0f GB/s (one copy, from the on-die cache)\n",
+                                mode_name(mode), gu ? "gate_up" : "down   ", 1e3 * bur[(size_t)mode],
+                                bytes / (bur[(size_t)mode] * 1e-3) / 1e9);
+                else
+                    std::printf("%s %s live=%d: median %.1f us, %.0f GB/s of weights; back to back %.1f us a call, %.0f GB/s\n",
+                                mode_name(mode), gu ? "gate_up" : "down   ", live, 1e3 * iso[(size_t)mode],
+                                bytes / (iso[(size_t)mode] * 1e-3) / 1e9, 1e3 * bur[(size_t)mode],
+                                bytes / (bur[(size_t)mode] * 1e-3) / 1e9);
             }
+            if (live == 0 || hot) continue;   /* no rows to compare (live 0); the hot calls are the live=1 ones */
             for (int it = 0; it < 20; ++it)
                 for (int mode = 1; mode < nmodes; ++mode) {
                     (void)one(0, cc, y1.p);

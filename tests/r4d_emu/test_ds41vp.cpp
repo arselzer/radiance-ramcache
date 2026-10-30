@@ -7,8 +7,9 @@
  * tools/ds41-host-experts' pack_planes -- the code the engine packs its VRAM residents with. Every output
  * must be the same bf16 bits, and gemv_vp over the block table alone must be the plain row too. Every kernel the
  * row can run is held to it: the default, and each of r4d_rad_moe_gemm_mxfp4_gemv_vp_variant's (the first form,
- * mx_gemv_kernel's packed path, and mx_vp2_kernel at two and four weight rows a wave, each also with its
- * activation staging hoisted under the first row group's loads).
+ * mx_gemv_kernel's packed path; mx_vp2_kernel on its own grid and on the plain row's; mx_vp2_kernel_free; and
+ * the vp2 forms with the raw rounds' bytes through the scalar unit, with one rolled block loop, and with the
+ * next row group's loads issued under this one's decode, at two weight rows a wave and at one).
  *
  * The cases reach every way the kernel walks a row: whole K and K in chunks (rows past the LDS), one and
  * two weight rows a wave (N >= 1024), one to sixteen token rows (one pass, whole sub-passes), token and
@@ -208,9 +209,13 @@ int call(Launch f, const std::vector<uint16_t>& x, int AR, int K, std::vector<co
  * mx_vp2_kernel. */
 int vp_old(const RadArgs* a, RadStream s) { return r4d_rad_moe_gemm_mxfp4_gemv_vp_variant(a, s, 1); }
 int vp_r2(const RadArgs* a, RadStream s) { return r4d_rad_moe_gemm_mxfp4_gemv_vp_variant(a, s, 2); }
-int vp_r4(const RadArgs* a, RadStream s) { return r4d_rad_moe_gemm_mxfp4_gemv_vp_variant(a, s, 3); }
-int vp_r2h(const RadArgs* a, RadStream s) { return r4d_rad_moe_gemm_mxfp4_gemv_vp_variant(a, s, 4); }
-int vp_r4h(const RadArgs* a, RadStream s) { return r4d_rad_moe_gemm_mxfp4_gemv_vp_variant(a, s, 5); }
+int vp_r2g(const RadArgs* a, RadStream s) { return r4d_rad_moe_gemm_mxfp4_gemv_vp_variant(a, s, 3); }
+int vp_r2f(const RadArgs* a, RadStream s) { return r4d_rad_moe_gemm_mxfp4_gemv_vp_variant(a, s, 4); }
+int vp_r2s(const RadArgs* a, RadStream s) { return r4d_rad_moe_gemm_mxfp4_gemv_vp_variant(a, s, 5); }
+int vp_r2c(const RadArgs* a, RadStream s) { return r4d_rad_moe_gemm_mxfp4_gemv_vp_variant(a, s, 6); }
+int vp_r2cf(const RadArgs* a, RadStream s) { return r4d_rad_moe_gemm_mxfp4_gemv_vp_variant(a, s, 7); }
+int vp_r2p(const RadArgs* a, RadStream s) { return r4d_rad_moe_gemm_mxfp4_gemv_vp_variant(a, s, 8); }
+int vp_r1p(const RadArgs* a, RadStream s) { return r4d_rad_moe_gemm_mxfp4_gemv_vp_variant(a, s, 9); }
 struct VpRow {
     const char* name;
     Launch f;
@@ -218,10 +223,14 @@ struct VpRow {
 };
 const VpRow kVp[] = { { "gemv_vp", r4d_rad_moe_gemm_mxfp4_gemv_vp, nullptr },
                       { "first form", vp_old, "false, true>" },
-                      { "vp2 two rows a wave", vp_r2, "mx_vp2_kernel" },
-                      { "vp2 four rows a wave", vp_r4, "mx_vp2_kernel" },
-                      { "vp2 two rows a wave, staging hoisted", vp_r2h, "mx_vp2_kernel" },
-                      { "vp2 four rows a wave, staging hoisted", vp_r4h, "mx_vp2_kernel" } };
+                      { "vp2", vp_r2, "mx_vp2_kernel<" },
+                      { "vp2 on the plain row's grid", vp_r2g, "mx_vp2_kernel<" },
+                      { "vp2 without an occupancy target", vp_r2f, "mx_vp2_kernel_free<" },
+                      { "vp2, raw bytes through the scalar unit", vp_r2s, "mx_vp2_kernel<" },
+                      { "vp2, scalar raw bytes, one rolled block loop", vp_r2c, "mx_vp2_kernel<" },
+                      { "vp2 free, scalar raw bytes, one rolled block loop", vp_r2cf, "mx_vp2_kernel_free<" },
+                      { "vp2 free, pipelined row groups", vp_r2p, "mx_vp2_kernel_free<" },
+                      { "vp2 at one weight row a wave, pipelined row groups", vp_r1p, "mx_vp2_kernel<" } };
 bool vp_kernel(const std::string& k) {
     return k.find("false, true>") != std::string::npos || k.find("mx_vp2_kernel") != std::string::npos;
 }

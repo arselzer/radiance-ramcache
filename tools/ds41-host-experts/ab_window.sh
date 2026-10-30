@@ -485,6 +485,7 @@ Pk${ARM_PK:-}|${ARM_PK:-}|router predictor: .*one prediction in [0-9]+ checked a
 Pw|${ARM_PW:-}|rank 0 posts the read-ahead's router input once a layer's CPU work is submitted
 Ns${ARM_NS:-}|${ARM_NS:-}|side store: the planes of up to [0-9]+ units a rank
 Pv|${ARM_PV:-}|router predictor: every posted router input is recorded to
+Tb|${ARM_TB:-}|two-batch overlap \(RADIANCE_EXPERIMENTAL_SCHED_TBO=1\): a decode step
 EOF2
   if [[ -n "$sw_bad" ]]; then
     log "arm $name:$sw_bad not measured"
@@ -857,6 +858,15 @@ EOF2
   grep -E 'route trace' "$OUT/$name.server.log" | tail -6 | tee -a "$OUT/window.log"   # Rt: per rank, and the files
   grep -E 'consumer skip: [0-9]+ (prefill|cut) passes|rank 0: consumer skip' "$OUT/$name.server.log" | tee -a "$OUT/window.log"   # Cs: what the cut ran
   grep -E 'ds41 p1 stats, rank|ds41 p1 chunk:' "$OUT/$name.server.log" | tail -24 | tee -a "$OUT/window.log"   # P1: each rank's totals, rank 0's chunks
+  # Tb: the steps each rank issued as two micro-batches and the routed layers rank stagers ran as two
+  # slices. A Tb arm that sent requests together (CK, K > 1) and split no step did not do what its
+  # name says: its results are set aside as <arm>.unmeasured.json.
+  grep -E 'two-batch overlap: [0-9]+ (decode steps|routed layers)' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
+  if [[ -n "${ARM_TB:-}" && "${ARM_CONC:-${AB_CONCURRENCY:-1}}" -gt 1 ]] &&
+     ! grep -qE 'rank 0: two-batch overlap: [1-9][0-9]* decode steps' "$OUT/$name.server.log"; then
+    log "arm $name: Tb, but rank 0 split no decode step; not measured (results kept as $name.unmeasured.json)"
+    [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
+  fi
   grep -E 'prefill hash: seq [0-9]+, [0-9]+ tokens: all ranks' "$OUT/$name.server.log" | tee -a "$OUT/window.log"   # Kh: a digest a prompt
   grep -E '^libr4d: RADIANCE_EXPERIMENTAL_DS41_DRAFT_GEMV' "$OUT/$name.server.log" | tail -2 | tee -a "$OUT/window.log"   # Dk/Dkt: calls taken
   grep -E 'host expert pool: |host experts, pre-wake: |host experts, one-token passes: ' "$OUT/$name.server.log" | tee -a "$OUT/window.log"   # Fw/WpN: the wake-up, decode's gather waits
@@ -1284,7 +1294,9 @@ for a in $ARMS; do
 # knob off; Pf a prefill chunk runs in a step of its own and the decode rows of concurrent requests
 # run together (RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE); NK --max-num-seqs K, CK the arm's requests
 # sent K at a time (AB_CONCURRENCY), LK --max-model-len K (the KV pool backs about one sequence of K
-# tokens in all: 512 holds four 110-token requests, 1024 eight, 2048 sixteen); rN a repeat (ignored).
+# tokens in all: 512 holds four 110-token requests, 1024 eight, 2048 sixteen); Tb a decode step of two or
+# more sequences issued as two micro-batches, each layer's MoE gather of one behind the other's card
+# work (RADIANCE_EXPERIMENTAL_SCHED_TBO; a radiance and deepseek41 from claude/ds41-tbo); rN a repeat (ignored).
 # the RAM cache's profile-hot units get N second chances before eviction; Ov / Ov2 a launch whose
 # first dispatch depends on nothing in flight on its queue goes without the barrier bit, in decode
 # passes / in every pass issued live (RADIANCE_EXPERIMENTAL_DS41_CHAIN_OVERLAP=1 / 2; exact, only
@@ -1391,7 +1403,7 @@ for a in $ARMS; do
 # input, ~190 MB an arm of the held-out prompts; an instrument: router_score_eval scores the file
 # offline in bf16, int8 and int4 against the container's routers); needs a predictor part.
   IFS=- read -r -a parts <<< "$a"
-  xt="" bt="" kld="" dk="" db="" pu="" ins_nt="" ins_kib="" ins_wait="" lean="" lc="" ad="" dv="" xd="" hs="" dg="" df="" pmr=""
+  xt="" bt="" kld="" dk="" db="" pu="" ins_nt="" ins_kib="" ins_wait="" lean="" lc="" ad="" dv="" xd="" hs="" dg="" df="" pmr="" tb=""
   mb="" lf=""
   p1="" q1=() qm="" ql="" qg=""
   pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 HOST_POOL_MIB=4096 EXTRA_ARGS="" ARM_HOME="$RHOME" ARM_CONC=
@@ -1503,6 +1515,7 @@ for a in $ARMS; do
       Pcm[0-9]*) pcopt+=" $p"; hpm=1; ARGS+=(--prefix-cache-mib "${p#Pcm}") ;;                 # host KV tier of N MiB
       Pcr)     pcopt+=" $p"; hpr=1; env+=(RADIANCE_EXPERIMENTAL_DS41_KV_REPLICATED=1) ;;       # index/compressed caches replicated
       Pf)      env+=(RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE=1) ;;   # a prefill chunk alone in its step; decode rows batched
+      Tb)      tb=1 ;;                                                 # two-batch overlap of concurrent decode steps
       N[0-9]*) ARGS+=(--max-num-seqs "${p#N}") ;;                     # this arm's --max-num-seqs (MAX_SEQS for every arm)
       C[0-9]*) ARM_CONC=${p#C} ;;                                     # this arm's requests sent K at a time (AB_CONCURRENCY)
       L[0-9]*) ARGS+=(--max-model-len "${p#L}") ;;                    # this arm's --max-model-len (KV for N sequences)
@@ -1651,6 +1664,10 @@ for a in $ARMS; do
   fi
   env+=(RADIANCE_EXPERIMENTAL_DS41_PREFETCH_MULTIROW=${pmr:-0})
   ARM_PMR=$pmr
+  # Tb: stated by every arm (0 off), so a window's VAR=val cannot split another arm's steps; arm()
+  # checks deepseek41's startup line both ways.
+  env+=(RADIANCE_EXPERIMENTAL_SCHED_TBO=${tb:-0})
+  ARM_TB=$tb
   # Ss: the read-back runs in an arm only if its name says so, whatever the window's environment.
   [[ " ${env[*]} " == *" RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP=1 "* ]] || env+=(RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP=0)
   # Pi8 / Pi4, PkN, Pw, NsN, Pv: each acts only with what it changes (a predictor; Pi; Ei and the

@@ -506,6 +506,14 @@ struct MoeFP8 {
      * all-reduce itself (issue_ar), as GdnFP8::step describes. */
     void pass(RadCtx* c, int64_t T, int64_t r0, int64_t rows, bool own_ar = true,
               const Beside* beside = nullptr) const;
+    /* pass() in two halves, issued back to back by pass(): everything before the gather (router,
+     * expert GEMMs, the shared arm, `beside`), and the gather onward (the gather, the all-reduces,
+     * the combine). A caller may issue other rows' work between them (core/sched/tbo.h, the two-batch
+     * overlap): nothing the head writes for the tail is touched by anything but this block's own
+     * next pass. */
+    void pass_head(RadCtx* c, int64_t T, int64_t r0, int64_t rows,
+                   const Beside* beside = nullptr) const;
+    void pass_tail(RadCtx* c, int64_t T, int64_t r0, int64_t rows, bool own_ar = true) const;
     /* The heat engine's handoff, after a step's last pass (step() says what it reports). */
     void route_report(RadCtx* c) const;
     bool issues_ar(int64_t T, int64_t rows) const {
@@ -1703,6 +1711,12 @@ inline void MoeFP8::shared_up(RadCtx* c_, int64_t T, int64_t r0, int64_t rows,
  * pass-relative. Only step-tall operands (residual stream, normed input) carry the offset. */
 inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool own_ar,
                           const Beside* beside) const {
+    pass_head(c_, T, r0, rows, beside);
+    pass_tail(c_, T, r0, rows, own_ar);
+}
+
+inline void MoeFP8::pass_head(RadCtx* c_, int64_t T, int64_t r0, int64_t rows,
+                              const Beside* beside) const {
     /* `ne` is this rank's expert count, `ne_all` the model's: logits and top-k are model-wide,
      * everything after the scatter is this rank's slice. */
     const int64_t ne = c.n_expert, ne_all = c.n_expert_all, k = c.top_k;
@@ -1892,6 +1906,10 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
         }
     }
 
+}
+
+inline void MoeFP8::pass_tail(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool own_ar) const {
+    const int64_t k = c.top_k;
     /* The gather last, since with the fold it reads the shared arm (`sout`, `sgate`); it writes
      * the block's delta into `h.x`. */
     if (op_combine || !gather_taken(g, T, gather_out_rows, gather_out_rows6))

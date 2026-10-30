@@ -2148,6 +2148,17 @@ int Builder::declare_consumer_suffix(const RadConsumerSuffix* d) {
     return RAD_OK;
 }
 
+/* Two-batch overlap (rad_builder.h, core/sched/tbo.h). Only recorded: finish_buffer_liveness keeps
+ * every transient's bytes its own, and the file stager and the routing witness read it. */
+int Builder::declare_two_batch() {
+    if (finished_) {
+        err(RAD_E_STATE, "declare_two_batch after declare finished");
+        return RAD_E_STATE;
+    }
+    prog_.two_batch = true;
+    return RAD_OK;
+}
+
 void Builder::note_v(const char* f, va_list ap) {
     char msg[1024];
     vsnprintf(msg, sizeof msg, f ? f : "", ap);
@@ -2433,7 +2444,10 @@ void Builder::finish_buffer_liveness() {
          * rule); a buffer on the second lane, whose declared range does not bound when its bytes
          * are in use; and one with no declared use, since an op may issue any handle in any
          * order (--debug-graph reports the cost). */
-        if (b.decl.kind != RAD_BUF_TRANSIENT || first[i] < 0 ||
+        /* Two-batch overlap (rad_declare_two_batch, core/sched/tbo.h): a split decode step issues
+         * one micro-batch's attention between the other's MoE and its gather, so no declared range
+         * bounds a transient's live bytes; every transient keeps its own. */
+        if (b.decl.kind != RAD_BUF_TRANSIENT || first[i] < 0 || prog_.two_batch ||
             (concurrent_bufs_.count((rad_buf)i) && lane1_w1_ < 0)) {
             b.first_def = 0;
             b.last_use  = last_op;
@@ -2728,6 +2742,11 @@ int rad_declare_consumer_suffix(RadBuilder* b, const RadConsumerSuffix* d) {
 int rad_consumer_row_grain(RadBuilder* b) {
     if (!b) return 0;
     return B(b)->consumer_row_grain();
+}
+
+int rad_declare_two_batch(RadBuilder* b) {
+    if (!b) return RAD_E_INVAL;
+    return B(b)->declare_two_batch();
 }
 
 int rad_declare_encoder(RadBuilder* b, const RadEncoderDecl* d) {

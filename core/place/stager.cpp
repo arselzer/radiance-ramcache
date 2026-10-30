@@ -733,6 +733,12 @@ bool FileStager::begin_pass(const RadBatch* b) {
               (b->n_tok <= kRoutedRows || (lcp_ && hx_capped_ && b->n_tok <= ep_rows_));
     /* A one-token pass, or with ..._PREFETCH_MULTIROW a trunk decode pass of 2..N rows. */
     hx_ra_pass_ = ra_pass_reads_ahead(b->phase == RAD_PHASE_DECODE, b->draft_pass, b->n_tok, hx_ra_rows_);
+    /* Two-batch overlap (stager.h, tbo_): the architecture declared it (rad_declare_two_batch) and
+     * issues this pass as two micro-batches, so each routed layer arrives as slice A, then slice B. */
+    tbo_ = ep_program_ && ep_program_->two_batch && tbo::step_splits(b);
+    tbo_tok_ = b->n_tok;
+    tbo_slice_ = 0;
+    if (tbo_) tbo_enter(0);
     if (hx_ra_) {   /* predictions for this pass may come; units of earlier ones are stale */
         hx_ra_at_.store((uint64_t)trace_pass_ << 32, std::memory_order_release);
         hx_ra_drop_stale(trace_pass_, -1);
@@ -2314,7 +2320,7 @@ void FileStager::hx_choose(int32_t li) {
         }
         link += plan_->units[(size_t)u].bytes;
     }
-    if (ra) {   /* the layer's units it did not select */
+    if (ra && !tbo_keeps_ra()) {   /* the layer's units it did not select */
         for (RaEntry& r : hx_ra_here_) hx_ra_drop(r, false);
         hx_ra_here_.clear();
     }
@@ -2451,6 +2457,11 @@ int FileStager::hx_fetch(int32_t li, RadStream s) {
 int FileStager::hx_fetch_list(int32_t li, const int32_t* row, RadStream s) {
     const HxOps& o = hx_ops_[(size_t)li];
     const int64_t T = pass_tok_;
+    /* A split pass's slice B starts past row 0, which the list's copies do not: separate copies. */
+    if (tbo_ && layer_r0(li) != 0) {
+        ++hx_stats_.fl_plain;
+        return 0;
+    }
     const size_t at = (size_t)li * (size_t)ep_rows_ + (size_t)(T - 1);
     if (T < 1 || T > ep_rows_ || at >= hx_fl_key_.size() || at >= hx_fl_cap_) {
         ++hx_stats_.fl_plain;
@@ -3687,7 +3698,8 @@ void FileStager::hx_ra_drop_stale(uint32_t pass, int32_t li) {
 
 void FileStager::hx_ra_begin(int32_t li) {
     hx_ra_at_.store(((uint64_t)trace_pass_ << 32) | (uint32_t)(li + 1), std::memory_order_release);
-    hx_ra_here_.clear();
+    /* A split pass's slice B keeps what slice A left of this layer (tbo_keeps_ra). */
+    if (!(tbo_ && tbo_slice_ == 1)) hx_ra_here_.clear();
     {
         std::lock_guard<std::mutex> lk(hx_ra_mu_);
         for (size_t i = 0; i < hx_ra_live_.size();) {
@@ -4358,6 +4370,13 @@ int FileStager::before_op(rad_op h, RadStream s, bool* resync) {
     if ((size_t)h >= first_of_.size()) return RAD_OK;
     const int32_t li = first_of_[(size_t)h];
     if (li < 0) return RAD_OK;
+    if (li == cur_ && tbo_) {
+        /* A split pass: micro-batch B's slice of the layer, behind A's gather. */
+        RAD_TRY(tbo_second(li, s));
+        *resync = true;
+        return RAD_OK;
+    }
+    if (li != cur_ && tbo_) tbo_enter(0);   /* a split pass enters a layer with micro-batch A */
     if (li == cur_) {
         /* The layer's first op again: a block that slices the pass routes each slice afresh, so
          * an expert aliased for the slice before may be wanted now. Read the whole layer behind
@@ -4402,6 +4421,46 @@ int FileStager::before_op(rad_op h, RadStream s, bool* resync) {
         RAD_TRY(start(next));
         *resync = true;
     }
+    return RAD_OK;
+}
+
+/* RADIANCE_EXPERIMENTAL_SCHED_TBO (stager.h, tbo_): slice `slice` of the step's rows runs. */
+void FileStager::tbo_enter(int slice) {
+    tbo_slice_ = slice;
+    pass_tok_ = tbo::rows_of(tbo_tok_, slice);
+    hx_ra_pass_ = ra_pass_reads_ahead(true, 0, pass_tok_, hx_ra_rows_);
+}
+
+bool FileStager::tbo_keeps_ra() const {
+    return tbo_ && tbo_slice_ == 0 &&
+           ra_pass_reads_ahead(true, 0, tbo::rows_of(tbo_tok_, 1), hx_ra_rows_);
+}
+
+/* Layer li's second gate_up in a split pass: slice A has had its gather (its CPU rows were copied
+ * there, or it had none), so its holds go and slice B's reads start as a layer's first op's do. */
+int FileStager::tbo_second(int32_t li, RadStream s) {
+    if (tbo_slice_ != 0) {
+        RAD_ERR("two-batch overlap: layer %d's gate_up issued a third time in one pass",
+                layers_[(size_t)li].layer);
+        return RAD_E_STATE;
+    }
+    if ((hx_li_ == li && hx_stage_ == 2) || hx_early_li_ == li) {
+        RAD_ERR("two-batch overlap: layer %d's slice B issued before slice A's gather",
+                layers_[(size_t)li].layer);
+        return RAD_E_STATE;
+    }
+    hx_drain();
+    tbo_enter(1);
+    const int b = li & 1;
+    if (holds_[b] == li) RAD_TRY(finish(b, s));
+    bool read = false;
+    const bool ep = ep_counts_ && pass_tok_ > 0 && pass_tok_ <= ep_rows_ &&
+                    (size_t)li < ep_layer_eligible_.size() && ep_layer_eligible_[(size_t)li];
+    if (routed_ && ep) RAD_TRY(start_ep_routed(li, s, &read));
+    if (routed_ && !ep) RAD_TRY(start_routed(li, s, &read));
+    if (!read) RAD_TRY(start(li));
+    if (holds_[b] == li && pending_[b]) RAD_TRY(rad_event_wait(s, done_[b]));
+    ++tbo_slices_;
     return RAD_OK;
 }
 
@@ -4456,6 +4515,7 @@ int FileStager::end_pass(RadStream s) {
     if (lost) RAD_ERR("host experts: layer %d's CPU rows reached no gather before the pass ended",
                       layers_[(size_t)(hx_early_li_ >= 0 ? hx_early_li_ : hx_li_)].layer);
     hx_drain();
+    tbo_ = false;
     /* A cut pass ends early by design: its last op says nothing of where a whole pass ends. */
     if (pass_full_ == INT32_MAX) pass_last_[pass_kind_] = last_issued_;
     int rc = lost ? RAD_E_STATE : RAD_OK;

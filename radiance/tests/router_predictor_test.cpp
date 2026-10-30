@@ -341,7 +341,7 @@ TEST(router_predictor_quantized_picks_are_bf16s_when_among_the_rescored) {
         /* The worker: each posted input's prediction handed over, as predict() gives it. */
         struct Got { std::mutex mu; std::condition_variable cv; std::map<int, std::array<int32_t, 4>> by_pass; };
         Got got;
-        p->on_ready([](void* ctx, uint32_t pass, int, const int32_t* e, int k) {
+        p->on_ready([](void* ctx, uint32_t pass, int, const int32_t* e, int k, int) {
             Got* g = static_cast<Got*>(ctx);
             std::array<int32_t, 4> a{};
             std::copy(e, e + std::min(k, 4), a.begin());

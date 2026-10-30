@@ -409,6 +409,7 @@ struct FakePC : IPrefixCache {
         }
         CacheHit h{ attn, lin, src };
         h.branch_at = branch_at;
+        h.ckpt_eors = eors_hit && src >= 0;
         const int64_t whole = src >= 0 ? lin : 0;
         if (cap && attn > cap->tokens / 16 * 16 && whole > cap->tokens) {
             const int64_t a = cap->tokens / 16 * 16;
@@ -480,6 +481,13 @@ struct FakePC : IPrefixCache {
         trims.push_back(n);
         return 0;
     }
+    /* trim_except's calls (RADIANCE_EXPERIMENTAL_PREFIX_EORS): whose chain, how far, how many. */
+    struct TrimExcept { uint64_t seq; int64_t n_tokens; int64_t n; };
+    std::vector<TrimExcept> trims_except;
+    int64_t trim_except(const Request& r, int64_t n_tokens, int64_t n) override {
+        trims_except.push_back({ r.id, n_tokens, n });
+        return 0;
+    }
     /* Cumulative, like the real cache's: the scheduler publishes it as a counter and the server
      * takes deltas, so a per-call value would read as a cache that never evicts. */
     int64_t evictions() const override { return evicted; }
@@ -490,11 +498,26 @@ struct FakePC : IPrefixCache {
     }
     std::vector<int64_t> committed;
     void commit_checkpoint(const Request&, int64_t pos) override { committed.push_back(pos); }
-    int reserve_checkpoint(const Request&, int64_t, int32_t* slot_out) override {
+    /* Every reservation's position, and of those the end-of-request ones. Reserved up front and
+     * recorded only while there is room: the step path must not allocate, and the allocation
+     * tests count every operator new during a step, the fakes' included. */
+    std::vector<int64_t> reserved_at, reserved_eors;
+    FakePC() {
+        reserved_at.reserve(4096);
+        reserved_eors.reserve(1024);
+    }
+    int reserve_checkpoint(const Request&, int64_t pos, int32_t* slot_out) override {
         ++reserved;
+        if (reserved_at.size() < reserved_at.capacity()) reserved_at.push_back(pos);
         *slot_out = next_slot++;
         return RAD_OK;
     }
+    int reserve_eors_checkpoint(const Request& r, int64_t pos, int32_t* slot_out) override {
+        if (reserved_eors.size() < reserved_eors.capacity()) reserved_eors.push_back(pos);
+        return reserve_checkpoint(r, pos, slot_out);
+    }
+    /* A hit at `lin` with `src` reports an end-of-request snapshot (CacheHit::ckpt_eors). */
+    bool eors_hit = false;
 };
 
 }  /* namespace sched_fake */

@@ -14,18 +14,26 @@
  *                                                      has them, raw rounds anywhere, e8m0 edges, and the
  *                                                      research sample's real scales when its directory is
  *                                                      there (DS41_HX_SAMPLE or the default). Every value of
- *                                                      every row must be the plain row's bits; a damaged
- *                                                      header must give NaN rows. Exit 0 on PASS. `tail`:
- *                                                      both rows with the live-tail ranges on
- *                                                      (RADIANCE_EXPERIMENTAL_DS41_LIVE_TAIL=1, otherwise
- *                                                      off, as the A/B runs), every call at their geometry,
- *                                                      and the dropped slots' rows must be zeros in both.
+ *                                                      every row must be the plain row's bits, the dropped
+ *                                                      slots' rows zeros in both; a damaged header must give
+ *                                                      NaN rows. Exit 0 on PASS. `tail`: both rows with the
+ *                                                      live-tail ranges on (RADIANCE_EXPERIMENTAL_DS41_LIVE_
+ *                                                      TAIL=1, otherwise off, as the A/B runs), every call at
+ *                                                      their geometry.
  *   ds41_vpack_device_check LIBR4D.so time              decode GEMV time a call, plain over block_mxfp4,
  *                                                      gemv_vp over packed and gemv_vp over block_mxfp4 (a
  *                                                      table of unmarked entries: what the new kernel costs
  *                                                      the experts it does not pack), 1..3 live experts, 24
  *                                                      copies (past the 64 MB on-die cache); the outputs
  *                                                      compared too.
+ *
+ * When the library exports r4d_rad_moe_gemm_mxfp4_gemv_vp_variant, every gemv_vp kernel it has (the default
+ * and r4d_rad_moe_gemm_mxfp4_gemv_vp_variants' names) is checked against the plain row in `check`, and timed in
+ * `time`: each call alone (a host round trip around it, as above) and in bursts of 24 calls back to back on the
+ * stream, every burst of every mode enqueued one after another with no host gap (their routings uploaded
+ * first), so the card stays busy and at its clocks as in a decode step; the first round of bursts warms up and
+ * is not counted. Two rows tell where the time goes: live=0 (no expert has a row: the launch, the live scan and
+ * nothing else) and `hot` (live=1, every call on the same weight copy, so its bytes come from the on-die cache).
  *
  * Needs a free card (HIP device 0 unless HIP_VISIBLE_DEVICES says otherwise): run it in a GPU window, as
  * ab_window.sh runs ds41_mxfp4_device_check. Build (as build_hx.sh builds the other harness):
@@ -58,17 +66,46 @@ constexpr int kEmbd = 5120, kFf = 2304, kNe = 96, kTop = 6;
 constexpr int kRaw[2] = { 512, 320 };   /* the engine's room, core/place/vram_packed.h */
 typedef int (*Launch)(const RadArgs*, RadStream);
 
+typedef int (*LaunchVar)(const RadArgs*, RadStream, int);
+typedef int (*Variants)(const char**, int, int*);
+
+/* The gemv_vp kernels a library has: [0] the row itself (its default), then the variant export's 1.. (their
+ * names from r4d_rad_moe_gemm_mxfp4_gemv_vp_variants). */
+constexpr int kKernels = 16;
+char kKernelName[kKernels][48] = { "gemv_vp" };
+
 struct Lib {
     Launch plain = nullptr, vp = nullptr;
+    LaunchVar vpv = nullptr;   /* r4d_rad_moe_gemm_mxfp4_gemv_vp_variant, when the library has it */
+    int nk = 1;
     explicit Lib(const char* path) {
         void* h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
         if (!h) { std::fprintf(stderr, "dlopen %s: %s\n", path, dlerror()); std::exit(2); }
         plain = (Launch)dlsym(h, "r4d_rad_moe_gemm_mxfp4_gemv");
         vp = (Launch)dlsym(h, "r4d_rad_moe_gemm_mxfp4_gemv_vp");
+        vpv = (LaunchVar)dlsym(h, "r4d_rad_moe_gemm_mxfp4_gemv_vp_variant");
+        const Variants var = (Variants)dlsym(h, "r4d_rad_moe_gemm_mxfp4_gemv_vp_variants");
         if (!plain || !vp) {
             std::fprintf(stderr, "%s lacks r4d_rad_moe_gemm_mxfp4_gemv%s\n", path, plain ? "_vp" : "");
             std::exit(2);
         }
+        if (vpv && var) {
+            const char* names[kKernels] = {};
+            int deflt = -1;
+            nk = std::min(var(names, kKernels, &deflt), kKernels);
+            for (int k = 1; k < nk; ++k) std::snprintf(kKernelName[k], sizeof kKernelName[k], "gemv_vp[%s]", names[k]);
+            std::printf("%s: gemv_vp runs variant %d (%s) by default; %d kernels checked\n", path, deflt,
+                        deflt > 0 && deflt < nk ? names[deflt] : "?", nk);
+        } else {
+            vpv = nullptr;
+        }
+    }
+    int kernels() const { return nk; }
+    /* kernel -1 the plain row, 0 gemv_vp, 1.. its variants. */
+    int launch(int kernel, const RadArgs* a, RadStream s) const {
+        if (kernel < 0) return plain(a, s);
+        if (kernel == 0) return vp(a, s);
+        return vpv(a, s, kernel);
     }
 };
 
@@ -229,8 +266,8 @@ RadTensor tensor(void* p, uint32_t dt, std::initializer_list<int64_t> shape) {
 RadParam pi(const char* k, long long v) { RadParam p{}; p.key = k; p.kind = RAD_P_INT; p.ival = v; return p; }
 RadParam ps(const char* k, const char* v) { RadParam p{}; p.key = k; p.kind = RAD_P_STR; p.sval = v; return p; }
 
-int run_moe(Launch f, hipStream_t s, void* x, int AR, void* table, int N, int K, void* sorted, void* off, void* y,
-            const char* order, int T) {
+int run_moe(const Lib& lib, int kernel, hipStream_t s, void* x, int AR, void* table, int N, int K, void* sorted,
+            void* off, void* y, const char* order, int T) {
     RadTensor t[5] = { tensor(x, RAD_BF16, { AR, K }), tensor(table, RAD_U8, { kNe, N, K / 32 * 17 }),
                        tensor(sorted, RAD_I32, { T }), tensor(off, RAD_I32, { kNe + 1 }),
                        tensor(y, RAD_BF16, { T, N }) };
@@ -239,7 +276,7 @@ int run_moe(Launch f, hipStream_t s, void* x, int AR, void* table, int N, int K,
                       ps("a_order", order) };
     RadArgs a{};
     a.t = t; a.n_t = 5; a.p = p; a.n_p = 6;
-    return f(&a, (RadStream)s);
+    return lib.launch(kernel, &a, (RadStream)s);
 }
 
 /* `tokens` tokens' routes on this rank: each token's top-6 of the 384, those in 0..95 this rank's rows,
@@ -311,7 +348,9 @@ int check(const Lib& lib, int trials, bool tail) {
         stray.put(junk.data());
     }
     Dev tab_plain(kNe * sizeof(void*)), tab_vp(kNe * sizeof(void*));
+    const int nk = lib.kernels();
     size_t values = 0, differ = 0, nan_ok = 0, nan_bad = 0, calls = 0, dropped = 0, dropped_bad = 0;
+    size_t kdiffer[kKernels] = {}, kvalues[kKernels] = {};
     const int token_counts[] = { 1, 2, 4, 16 };
     std::vector<int> pool;
     for (int e = 0; e < kNe; ++e) pool.push_back(e);
@@ -355,53 +394,64 @@ int check(const Lib& lib, int trials, bool tail) {
             d_x.put(x.data());
             d_sorted.put(r.sorted.data());
             d_off.put(r.off.data());
+            const char* order = gu ? "token" : "sorted";
             /* Rows no kernel writes stay 0xffff: under `tail` the dropped slots' zeros are the tail kernel's. */
             HC(hipMemsetAsync(y1.p, 0xff, y1.n, s));
-            HC(hipMemsetAsync(y2.p, 0xff, y2.n, s));
-            const char* order = gu ? "token" : "sorted";
-            if (run_moe(lib.plain, s, d_x.p, AR, tab_plain.p, N, K, d_sorted.p, d_off.p, y1.p, order, r.T) < 0 ||
-                run_moe(lib.vp, s, d_x.p, AR, tab_vp.p, N, K, d_sorted.p, d_off.p, y2.p, order, r.T) < 0) {
+            if (run_moe(lib, -1, s, d_x.p, AR, tab_plain.p, N, K, d_sorted.p, d_off.p, y1.p, order, r.T) < 0) {
                 std::fprintf(stderr, "a launch refused its arguments\n");
                 return 2;
             }
-            HC(hipStreamSynchronize(s));
-            ++calls;
             std::vector<uint16_t> a((size_t)r.T * N), b((size_t)r.T * N);
+            HC(hipStreamSynchronize(s));
             y1.get(a.data());
-            y2.get(b.data());
-            for (int i = 0; i < r.T; ++i) {
-                if (r.sorted[(size_t)i] < 0) {
-                    /* A dropped slot (another rank's expert): written by neither row without the live-tail
-                     * ranges, so not compared; with them, zeroed by both (mx_tail_zero). */
-                    if (tail)
+            for (int k = 0; k < nk; ++k) {
+                HC(hipMemsetAsync(y2.p, 0xff, y2.n, s));
+                if (run_moe(lib, k, s, d_x.p, AR, tab_vp.p, N, K, d_sorted.p, d_off.p, y2.p, order, r.T) < 0) {
+                    std::fprintf(stderr, "%s refused its arguments\n", kKernelName[k]);
+                    return 2;
+                }
+                HC(hipStreamSynchronize(s));
+                ++calls;
+                y2.get(b.data());
+                for (int i = 0; i < r.T; ++i) {
+                    if (r.sorted[(size_t)i] < 0) {
+                        /* A dropped slot (another rank's expert): zeros in both rows -- the rank's last expert's
+                         * (mx_range gives it the slots past the routed rows; gemv_vp's kVpZero stores them without
+                         * a pass) or, with the live-tail ranges, mx_tail_zero's. */
                         for (int n = 0; n < N; ++n) {
                             ++dropped;
                             dropped_bad += a[(size_t)i * N + n] != 0 || b[(size_t)i * N + n] != 0;
                         }
-                    continue;
-                }
-                const bool dmg = damaged_e >= 0 && i >= r.off[(size_t)damaged_e] && i < r.off[(size_t)damaged_e + 1];
-                for (int n = 0; n < N; ++n) {
-                    const uint16_t p = a[(size_t)i * N + n], q = b[(size_t)i * N + n];
-                    if (dmg) { if (nan16(q)) ++nan_ok; else ++nan_bad; continue; }
-                    ++values;
-                    if (p != q && !(nan16(p) && nan16(q))) {
-                        if (differ < 8)
-                            std::printf("  differ: trial %d %s row %d col %d plain %04x gemv_vp %04x\n", trial,
-                                        gu ? "gate_up" : "down", i, n, p, q);
-                        ++differ;
+                        continue;
+                    }
+                    const bool dmg =
+                        damaged_e >= 0 && i >= r.off[(size_t)damaged_e] && i < r.off[(size_t)damaged_e + 1];
+                    for (int n = 0; n < N; ++n) {
+                        const uint16_t p = a[(size_t)i * N + n], q = b[(size_t)i * N + n];
+                        if (dmg) { if (nan16(q)) ++nan_ok; else ++nan_bad; continue; }
+                        ++values;
+                        ++kvalues[k];
+                        if (p != q && !(nan16(p) && nan16(q))) {
+                            if (differ < 8)
+                                std::printf("  differ: %s trial %d %s row %d col %d plain %04x gemv_vp %04x\n",
+                                            kKernelName[k], trial, gu ? "gate_up" : "down", i, n, p, q);
+                            ++differ;
+                            ++kdiffer[k];
+                        }
                     }
                 }
             }
             delete damaged;
         }
     }
+    for (int k = 0; k < nk; ++k)
+        std::printf("%s: %zu values compared with the plain row, %zu differ\n", kKernelName[k], kvalues[k],
+                    kdiffer[k]);
     std::printf("%zu calls, %zu values compared: %zu differ; damaged headers: %zu values NaN, %zu not\n", calls,
                 values, differ, nan_ok, nan_bad);
-    if (tail)
-        std::printf("live-tail ranges on: %zu dropped slots' values, %zu not zero in both rows\n", dropped,
-                    dropped_bad);
-    const bool ok = !differ && !nan_bad && values > 0 && !dropped_bad && (!tail || dropped > 0);
+    std::printf("%s: %zu dropped slots' values, %zu not zero in both rows\n",
+                tail ? "live-tail ranges on" : "dropped slots", dropped, dropped_bad);
+    const bool ok = !differ && !nan_bad && values > 0 && !dropped_bad && dropped > 0;
     if (ok)
         std::printf("PASS: gemv_vp over packed experts is bit-identical to the plain row over block_mxfp4%s\n",
                     tail ? " (live-tail ranges on)" : "");
@@ -410,11 +460,43 @@ int check(const Lib& lib, int trials, bool tail) {
     return ok ? 0 : 1;
 }
 
+/* Timed call `c`'s routing: `live` distinct experts of the 96 for one token, the rest of the top-6 dropped, and the
+ * table naming them (packed entries when `pk`, block_mxfp4 otherwise; every other entry a block copy). Call c's
+ * experts are copies c * live .. + live - 1 (mod the copies), so consecutive calls of any modes walk every copy
+ * before one is read again: 300 MB of gate_up and 150 MB of down between two reads of a copy, past the 64 MB
+ * on-die cache, whichever modes are interleaved. */
+struct Call {
+    std::vector<void*> table;
+    std::vector<int32_t> off, sorted;
+};
+Call make_call(const std::vector<std::unique_ptr<Weight>>& ws, int live, int it, bool pk, int fixed = -1) {
+    std::mt19937_64 rr(1000 + it);
+    std::vector<int> ex;
+    while ((int)ex.size() < live) {
+        const int e = (int)(rr() % kNe);
+        if (std::find(ex.begin(), ex.end(), e) == ex.end()) ex.push_back(e);
+    }
+    std::sort(ex.begin(), ex.end());
+    Call c;
+    c.off.assign(kNe + 1, 0);
+    c.sorted.assign(kTop, -1);
+    for (int e = 0; e < kNe; ++e)
+        c.off[(size_t)e + 1] = c.off[(size_t)e] + (std::find(ex.begin(), ex.end(), e) != ex.end());
+    for (int i = 0; i < live; ++i) c.sorted[(size_t)i] = i;
+    c.table.assign(kNe, ws[0]->d_block->p);
+    for (int i = 0; i < live; ++i) {
+        Weight& w = *ws[(size_t)(fixed >= 0 ? (fixed + i) % (int)ws.size() : (it * live + i) % (int)ws.size())];
+        c.table[(size_t)ex[(size_t)i]] = pk ? (void*)((uintptr_t)w.d_packed->p | 1u) : w.d_block->p;
+    }
+    return c;
+}
+
 int timing(const Lib& lib) {
     hipStream_t s;
     HC(hipStreamCreate(&s));
     std::mt19937_64 rng(77);
     constexpr int kCopies = 24;   /* 24 x 12 MB of gate_up: past the 64 MB on-die cache */
+    constexpr int kBurst = 24;    /* calls back to back on the stream, each its own table */
     std::vector<std::unique_ptr<Weight>> gus, dns;
     for (int i = 0; i < kCopies; ++i) {
         gus.emplace_back(new Weight());
@@ -437,38 +519,36 @@ int timing(const Lib& lib) {
     hipEvent_t e0, e1;
     HC(hipEventCreate(&e0));
     HC(hipEventCreate(&e1));
+    const int nk = lib.kernels();
+    /* Modes: 0 the plain row over block_mxfp4; then for each gemv_vp kernel k, 1 + 2k over packed entries and
+     * 2 + 2k over the same block_mxfp4 entries unmarked (the experts it does not pack: staged, aliased, over
+     * budget). */
+    const int nmodes = 1 + 2 * nk;
+    auto mode_kernel = [&](int mode) { return mode == 0 ? -1 : (mode - 1) / 2; };
+    auto mode_pk = [&](int mode) { return mode > 0 && (mode - 1) % 2 == 0; };
+    auto mode_name = [&](int mode) {
+        static char buf[64];
+        if (mode == 0) return (const char*)"plain/block   ";
+        std::snprintf(buf, sizeof buf, "%s/%s", kKernelName[mode_kernel(mode)], mode_pk(mode) ? "packed" : "block ");
+        return (const char*)buf;
+    };
     size_t differ = 0;
-    for (int live = 1; live <= 3; ++live)
+    int cc = 0;   /* the call counter: every call reads copies no call has read for the last 23 */
+    /* live 0..3, then (live 4) the hot row: live=1 on copy 0 every call, back to back only. */
+    for (int live = 0; live <= 4; ++live)
         for (int which = 0; which < 2; ++which) {
+            const bool hot = live == 4;
+            const int nlive = hot ? 1 : live;
             const bool gu = which == 0;
             const int N = gu ? 2 * kFf : kEmbd, K = gu ? kEmbd : kFf;
-            /* mode 0 the plain row over block_mxfp4, 1 gemv_vp over packed entries, 2 gemv_vp over the same
-             * block_mxfp4 entries unmarked (the experts it does not pack: staged, aliased, over budget). */
+            const auto& ws = gu ? gus : dns;
             auto one = [&](int mode, int it, void* y) {
-                const bool vp = mode != 0, pk = mode == 1;
-                std::mt19937_64 rr(1000 + it);
-                std::vector<int> pool;
-                for (int e = 0; e < kNe; ++e) pool.push_back(e);
-                /* `live` distinct experts, one token's rows, the rest of the top-6 dropped. */
-                std::vector<int> ex;
-                while ((int)ex.size() < live) {
-                    const int e = (int)(rr() % kNe);
-                    if (std::find(ex.begin(), ex.end(), e) == ex.end()) ex.push_back(e);
-                }
-                std::sort(ex.begin(), ex.end());
-                std::vector<int32_t> off(kNe + 1, 0), sorted(kTop, -1);
-                for (int e = 0; e < kNe; ++e) off[(size_t)e + 1] = off[(size_t)e] + (std::find(ex.begin(), ex.end(), e) != ex.end());
-                for (int i = 0; i < live; ++i) sorted[(size_t)i] = i;
-                std::vector<void*> t(kNe, (gu ? gus : dns)[0]->d_block->p);
-                for (int i = 0; i < live; ++i) {
-                    Weight& w = *(gu ? gus : dns)[(size_t)((it * 3 + i) % kCopies)];
-                    t[(size_t)ex[(size_t)i]] = pk ? (void*)((uintptr_t)w.d_packed->p | 1u) : w.d_block->p;
-                }
-                tab.put(t.data());
-                d_sorted.put(sorted.data());
-                d_off.put(off.data());
+                const Call c = make_call(ws, nlive, it, mode_pk(mode));
+                tab.put(c.table.data());
+                d_sorted.put(c.sorted.data());
+                d_off.put(c.off.data());
                 HC(hipEventRecord(e0, s));
-                if (run_moe(vp ? lib.vp : lib.plain, s, gu ? d_x.p : d_a.p, gu ? 1 : kTop, tab.p, N, K, d_sorted.p,
+                if (run_moe(lib, mode_kernel(mode), s, gu ? d_x.p : d_a.p, gu ? 1 : kTop, tab.p, N, K, d_sorted.p,
                             d_off.p, y, gu ? "token" : "sorted", kTop) < 0)
                     std::exit(3);
                 HC(hipEventRecord(e1, s));
@@ -477,27 +557,90 @@ int timing(const Lib& lib) {
                 HC(hipEventElapsedTime(&ms, e0, e1));
                 return ms;
             };
-            static const char* const kMode[3] = { "plain/block   ", "gemv_vp/packed", "gemv_vp/block " };
-            for (int mode = 0; mode < 3; ++mode) {
-                for (int it = 0; it < 5; ++it) (void)one(mode, it, y1.p);
-                std::vector<float> t;
-                for (int it = 0; it < 60; ++it) t.push_back(one(mode, it, y1.p));
-                std::sort(t.begin(), t.end());
-                const double med = t[t.size() / 2];
-                const double bytes = (double)live * (mode == 1 ? (double)(gu ? gus : dns)[0]->packed.size()
-                                                               : (double)N * K / 32 * 17);
-                std::printf("%s %s live=%d: median %.1f us, %.0f GB/s of weights\n", kMode[mode],
-                            gu ? "gate_up" : "down   ", live, 1e3 * med, bytes / (med * 1e-3) / 1e9);
+            std::vector<double> iso((size_t)nmodes, 0.0), bur((size_t)nmodes);
+            /* Alone: warm-up, then 60 calls a mode, the modes interleaved call by call so drift falls on all. */
+            if (!hot) {
+                std::vector<std::vector<float>> t((size_t)nmodes);
+                for (int it = 0; it < 5; ++it)
+                    for (int mode = 0; mode < nmodes; ++mode) (void)one(mode, cc++, y1.p);
+                for (int it = 0; it < 60; ++it)
+                    for (int mode = 0; mode < nmodes; ++mode) t[(size_t)mode].push_back(one(mode, cc++, y1.p));
+                for (int mode = 0; mode < nmodes; ++mode) {
+                    std::sort(t[(size_t)mode].begin(), t[(size_t)mode].end());
+                    iso[(size_t)mode] = t[(size_t)mode][t[(size_t)mode].size() / 2];
+                }
             }
+            /* Back to back: 8 rounds of one burst a mode (round 0 warms up), every call's routing uploaded first,
+             * then all bursts enqueued with an event pair around each and nothing between them; the median of a
+             * mode's 7 counted bursts. */
+            constexpr int kRounds = 8;
+            const int nb = kRounds * nmodes;
+            const size_t tsz = kNe * sizeof(void*), osz = (kNe + 1) * 4, ssz = kTop * 4;
+            Dev btab((size_t)nb * kBurst * tsz), boff((size_t)nb * kBurst * osz), bsort((size_t)nb * kBurst * ssz);
+            {
+                std::vector<uint8_t> ht((size_t)nb * kBurst * tsz), ho((size_t)nb * kBurst * osz),
+                    hs((size_t)nb * kBurst * ssz);
+                for (int bi = 0; bi < nb; ++bi)
+                    for (int i = 0; i < kBurst; ++i) {
+                        const size_t at = (size_t)bi * kBurst + i;
+                        const Call c = make_call(ws, nlive, cc + bi * kBurst + i, mode_pk(bi % nmodes), hot ? 0 : -1);
+                        std::memcpy(ht.data() + at * tsz, c.table.data(), tsz);
+                        std::memcpy(ho.data() + at * osz, c.off.data(), osz);
+                        std::memcpy(hs.data() + at * ssz, c.sorted.data(), ssz);
+                    }
+                btab.put(ht.data());
+                boff.put(ho.data());
+                bsort.put(hs.data());
+            }
+            cc += nb * kBurst;
+            std::vector<hipEvent_t> ev((size_t)2 * nb);
+            for (auto& e : ev) HC(hipEventCreate(&e));
+            HC(hipStreamSynchronize(s));
+            for (int bi = 0; bi < nb; ++bi) {
+                HC(hipEventRecord(ev[(size_t)2 * bi], s));
+                for (int i = 0; i < kBurst; ++i) {
+                    const size_t at = (size_t)bi * kBurst + i;
+                    if (run_moe(lib, mode_kernel(bi % nmodes), s, gu ? d_x.p : d_a.p, gu ? 1 : kTop,
+                                (uint8_t*)btab.p + at * tsz, N, K, (uint8_t*)bsort.p + at * ssz,
+                                (uint8_t*)boff.p + at * osz, y1.p, gu ? "token" : "sorted", kTop) < 0)
+                        std::exit(3);
+                }
+                HC(hipEventRecord(ev[(size_t)2 * bi + 1], s));
+            }
+            HC(hipEventSynchronize(ev.back()));
+            std::vector<std::vector<float>> b((size_t)nmodes);
+            for (int bi = nmodes; bi < nb; ++bi) {
+                float ms = 0;
+                HC(hipEventElapsedTime(&ms, ev[(size_t)2 * bi], ev[(size_t)2 * bi + 1]));
+                b[(size_t)(bi % nmodes)].push_back(ms / kBurst);
+            }
+            for (auto& e : ev) HC(hipEventDestroy(e));
+            for (int mode = 0; mode < nmodes; ++mode) {
+                std::sort(b[(size_t)mode].begin(), b[(size_t)mode].end());
+                bur[(size_t)mode] = b[(size_t)mode][b[(size_t)mode].size() / 2];
+            }
+            for (int mode = 0; mode < nmodes; ++mode) {
+                const double bytes = (double)nlive * (mode_pk(mode) ? (double)ws[0]->packed.size() : (double)N * K / 32 * 17);
+                if (hot)
+                    std::printf("%s %s hot   : back to back %.1f us a call, %.0f GB/s (one copy, from the on-die cache)\n",
+                                mode_name(mode), gu ? "gate_up" : "down   ", 1e3 * bur[(size_t)mode],
+                                bytes / (bur[(size_t)mode] * 1e-3) / 1e9);
+                else
+                    std::printf("%s %s live=%d: median %.1f us, %.0f GB/s of weights; back to back %.1f us a call, %.0f GB/s\n",
+                                mode_name(mode), gu ? "gate_up" : "down   ", live, 1e3 * iso[(size_t)mode],
+                                bytes / (iso[(size_t)mode] * 1e-3) / 1e9, 1e3 * bur[(size_t)mode],
+                                bytes / (bur[(size_t)mode] * 1e-3) / 1e9);
+            }
+            if (live == 0 || hot) continue;   /* no rows to compare (live 0); the hot calls are the live=1 ones */
             for (int it = 0; it < 20; ++it)
-                for (int mode = 1; mode < 3; ++mode) {
-                    (void)one(0, it, y1.p);
-                    (void)one(mode, it, y2.p);
-                    std::vector<uint16_t> a((size_t)kTop * N), b((size_t)kTop * N);
+                for (int mode = 1; mode < nmodes; ++mode) {
+                    (void)one(0, cc, y1.p);
+                    (void)one(mode, cc++, y2.p);
+                    std::vector<uint16_t> a((size_t)kTop * N), bb((size_t)kTop * N);
                     HC(hipMemcpy(a.data(), y1.p, a.size() * 2, hipMemcpyDeviceToHost));
-                    HC(hipMemcpy(b.data(), y2.p, b.size() * 2, hipMemcpyDeviceToHost));
+                    HC(hipMemcpy(bb.data(), y2.p, bb.size() * 2, hipMemcpyDeviceToHost));
                     for (int i = 0; i < live; ++i)
-                        for (int n = 0; n < N; ++n) differ += a[(size_t)i * N + n] != b[(size_t)i * N + n];
+                        for (int n = 0; n < N; ++n) differ += a[(size_t)i * N + n] != bb[(size_t)i * N + n];
                 }
         }
     std::printf(differ ? "FAIL: gemv_vp differs from the plain row in %zu values\n"

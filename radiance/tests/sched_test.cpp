@@ -5,6 +5,7 @@
 
 #include "mm/processor.h"
 #include "sched/mtp_couple_bind.h"
+#include "place/ep_route_counts.h"
 #include "sched/scheduler.h"
 #include "sched/advance_impl.h"
 #include "sched/derive.h"
@@ -57,6 +58,7 @@ void  operator delete(void* p, size_t) noexcept { std::free(p); }
 void  operator delete[](void* p, size_t) noexcept { std::free(p); }
 
 #include "sched_fakes.h"
+#include "consumer_sim.h"
 
 using namespace sched_fake;
 
@@ -7322,6 +7324,363 @@ TEST(fixed_verify_cap_zero_is_the_same_runtime_off_and_preserves_declared_depth)
     }
 }
 
+/* ===== RADIANCE_EXPERIMENTAL_DS41_DSPARK_GATE: the per-sequence acceptance gate (draft_gate.h) ===== */
+TEST(dspark_gate_spec_parses_strictly) {
+    DraftGateCfg c;
+    CHECK(DraftGateCfg::parse(nullptr, &c)); CHECK(!c.on);
+    CHECK(DraftGateCfg::parse("", &c)); CHECK(!c.on);
+    CHECK(DraftGateCfg::parse("0", &c)); CHECK(!c.on);
+    CHECK(DraftGateCfg::parse("1", &c)); CHECK(c.on);
+    CHECK_NEAR(c.threshold, DraftGateCfg::kThreshold, 1e-12);
+    CHECK_EQ(c.window, DraftGateCfg::kWindow); CHECK_EQ(c.probe, DraftGateCfg::kProbe);
+    CHECK_NEAR(DraftGateCfg::kThreshold, 0.78, 1e-12);
+    CHECK_EQ(DraftGateCfg::kWindow, 8); CHECK_EQ(DraftGateCfg::kProbe, 8);
+    CHECK(DraftGateCfg::parse("0.55", &c)); CHECK(c.on); CHECK_NEAR(c.threshold, 0.55, 1e-12);
+    CHECK_EQ(c.window, 8); CHECK_EQ(c.probe, 8);
+    CHECK(DraftGateCfg::parse("0.6,12", &c)); CHECK_EQ(c.window, 12); CHECK_EQ(c.probe, 8);
+    CHECK(DraftGateCfg::parse("1.0,4,16", &c)); CHECK_NEAR(c.threshold, 1.0, 1e-12);
+    CHECK_EQ(c.window, 4); CHECK_EQ(c.probe, 16);
+    CHECK(DraftGateCfg::parse("2.5,64,4096", &c)); CHECK_EQ(c.window, 64); CHECK_EQ(c.probe, 4096);
+    CHECK(DraftGateCfg::parse("0.7,8,2", &c)); CHECK_EQ(c.probe, 2);   /* R = 1 is refused (below) */
+    /* The threshold applied, in whole drafts over a full window (the startup line's "k of W"). */
+    for (const auto& w : { std::pair<const char*, int>{ "0.78,8", 7 }, { "0.70,8", 6 }, { "0.65,8", 6 },
+                           { "0.75,8", 6 }, { "0.62,8", 5 }, { "0.60,8", 5 }, { "1.0,4", 4 },
+                           { "0.5,4", 2 }, { "1.5,2", 3 } }) {
+        REQUIRE(DraftGateCfg::parse(w.first, &c));
+        CHECK_EQ(draft_gate_open_at(c), w.second);
+        DraftGateSeq g;
+        g.n = c.window;
+        g.sum = w.second;
+        CHECK(draft_gate_open(c, g));
+        g.sum = w.second - 1;
+        CHECK(!draft_gate_open(c, g));
+    }
+    for (const char* bad : { "x", "-0.5", "0.0", "64.5", "nan", "inf", "0.7,", "0.7,0", "0.7,65",
+                             "0.7,8,", "0.7,8,0", "0.7,8,1", "0.7,8,4097", "0.7,8,8,1", "0.7 ", "0.7;8",
+                             ",8" }) {
+        DraftGateCfg keep;
+        CHECK(!DraftGateCfg::parse(bad, &keep));
+        CHECK(!keep.on);   /* a refused spec writes nothing */
+    }
+    /* Through the experiment: refused rather than ignored, and refused with compute OFF (a cap of
+     * 0 included), where nothing would draft for it to gate. */
+    CHECK(DraftExperiment::capture("0", "0", "1", "0.7,8,8").valid());
+    CHECK(DraftExperiment::capture("0", "0", "1", "0.7,8,8").gate().on);
+    CHECK(DraftExperiment::capture("0", "0", nullptr, "1").valid());
+    CHECK(!DraftExperiment::capture("0", "0", "1", "bogus").valid());
+    CHECK(!DraftExperiment::capture("0", "1", nullptr, "1").valid());
+    CHECK(!DraftExperiment::capture("0", "0", "0", "1").valid());
+    CHECK(DraftExperiment::capture("0", "0", "0", "0").valid());
+    CHECK(!DraftExperiment::capture("0", "0", "1", nullptr).gate().on);
+    /* The gate alone is no draft-control scope: it leaves compute, cap and pipelining as they are. */
+    const auto g = DraftExperiment::capture(nullptr, nullptr, nullptr, "1");
+    CHECK(!g.compute_off()); CHECK_EQ(g.verify_cap(), -1); CHECK(!g.scope_required());
+    CHECK_EQ(g.runtime_depth(5), 5);
+}
+
+TEST(dspark_gate_warms_up_closes_probes_and_reopens) {
+    DraftGateCfg c;
+    REQUIRE(DraftGateCfg::parse("0.75,4,3", &c));
+    DraftGateSeq g;
+    /* Open from the start until four verifies are in, whatever they took. */
+    for (int i = 0; i < 4; ++i) {
+        CHECK_EQ(draft_gate_ask(c, g), (int)kDraftGateWarm);
+        draft_gate_observe(c, g, 1, 0, false);
+    }
+    CHECK_EQ(g.n, 4); CHECK_EQ(g.sum, 0);
+    /* 0 of 4 is under 0.75: closed; every third ask of the closed run probes, and each probe's
+     * taken draft pushes out the oldest rejection. */
+    for (int probe = 1; probe <= 3; ++probe) {
+        CHECK_EQ(draft_gate_ask(c, g), (int)kDraftGateGated);
+        CHECK_EQ(draft_gate_ask(c, g), (int)kDraftGateGated);
+        CHECK_EQ(draft_gate_ask(c, g), (int)kDraftGateProbe);
+        draft_gate_observe(c, g, 1, 1, true);
+        CHECK_EQ(g.sum, probe);
+    }
+    CHECK_EQ(g.closes, 1); CHECK_EQ(g.gated, 6); CHECK_EQ(g.probes, 3); CHECK_EQ(g.closed, 9);
+    /* 3 of 4 is the threshold itself: open again, and it stays so without new verifies. */
+    CHECK_NEAR(draft_gate_mean(g), 0.75, 1e-12);
+    CHECK_EQ(draft_gate_ask(c, g), (int)kDraftGateOpen);
+    CHECK_EQ(g.reopens, 1); CHECK_EQ(g.closed, 0);
+    CHECK_EQ(draft_gate_ask(c, g), (int)kDraftGateOpen);
+    /* An ask whose draft was not staged after all is uncounted. */
+    draft_gate_unask(g, kDraftGateOpen);
+    CHECK_EQ(g.asks, 4 + 9 + 1); CHECK_EQ(g.open, 1); CHECK_EQ(g.warm, 4);
+    draft_gate_unask(g, kDraftGateGated);   /* nothing to take back */
+    CHECK_EQ(g.asks, 4 + 9 + 1);
+    /* Its oldest entry is the last warm-up rejection, so one more rejection keeps 3 of 4 and the
+     * next takes a probe's acceptance out: closed again, a second run. */
+    draft_gate_observe(c, g, 1, 0, false);
+    CHECK_EQ(g.sum, 3); CHECK_EQ(draft_gate_ask(c, g), (int)kDraftGateOpen);
+    draft_gate_observe(c, g, 1, 0, false);
+    CHECK_EQ(g.sum, 2); CHECK_EQ(draft_gate_ask(c, g), (int)kDraftGateGated);
+    CHECK_EQ(g.closes, 2);
+    CHECK_EQ(g.verifies, 9); CHECK_EQ(g.verified, 9); CHECK_EQ(g.accepted, 3);
+    CHECK_EQ(g.probe_verified, 3); CHECK_EQ(g.probe_accepted, 3);
+    /* A deeper verify enters as its count of accepted drafts, clamped to what it verified. */
+    DraftGateCfg c2;
+    REQUIRE(DraftGateCfg::parse("1.5,2,8", &c2));
+    DraftGateSeq h;
+    draft_gate_observe(c2, h, 3, 2, false);
+    draft_gate_observe(c2, h, 3, 9, false);
+    draft_gate_observe(c2, h, 0, 1, false);   /* no drafts verified: no entry */
+    CHECK_EQ(h.n, 2); CHECK_EQ(h.sum, 5); CHECK_EQ(h.verified, 6); CHECK_EQ(h.accepted, 5);
+    CHECK_EQ(draft_gate_ask(c2, h), (int)kDraftGateOpen);   /* 2.5 >= 1.5 */
+    /* The defaults: at 0.78 over 8 a sequence drafts with at most one rejection in its last 8. */
+    DraftGateCfg d;
+    REQUIRE(DraftGateCfg::parse("1", &d));
+    DraftGateSeq q;
+    for (int i = 0; i < 8; ++i) draft_gate_observe(d, q, 1, i == 0 ? 0 : 1, false);
+    CHECK_EQ(draft_gate_ask(d, q), (int)kDraftGateOpen);     /* 7 of 8 */
+    draft_gate_observe(d, q, 1, 0, false);                   /* the 0 leaves, a 0 comes: 7 of 8 */
+    CHECK_EQ(draft_gate_ask(d, q), (int)kDraftGateOpen);
+    draft_gate_observe(d, q, 1, 0, false);                   /* 6 of 8 */
+    CHECK_EQ(draft_gate_ask(d, q), (int)kDraftGateGated);
+}
+
+/* The gate on the issue-ahead pipeline, as the engine drives a block drafter with the card's
+ * acceptance (the steps of fixed_verify_cap_preserves_full5_query_and_exact_ahead_prefix_transport):
+ * cap 1, W 4, threshold 0.75, a probe one step in 3. The first four verified drafts are rejected
+ * and every later one taken, so the sequence warms up for five asks, closes, probes twice and
+ * reopens. A closed step keeps its context pass, stages no query pass and reserves nothing for
+ * one, and the step issued ahead behind it verifies no drafts; the replies are the scripted
+ * target's throughout. */
+TEST(dspark_gate_closes_probes_and_reopens_on_the_issue_ahead_pipeline) {
+    const auto x = DraftExperiment::capture("0", "0", "1", "0.75,4,3");
+    REQUIRE(x.valid());
+    Fixture f; f.build(); f.cfg.n_spec = 5; f.cfg.max_seqs = 1;
+    f.prog.drafter.kind = RAD_DRAFT_BLOCK; f.prog.drafter.depth = 5;
+    CHECK_OK(f.start(&x));
+    CHECK(f.sch.draft_gate().on); CHECK_EQ(f.sch.draft_gate().window, 4);
+    auto r = f.request(40, 0); r->speculation_fixed = true;
+    const auto id = f.add(std::move(r));
+    const RadBatch* b = f.sch.step(); REQUIRE(b);
+    std::vector<StepSlot> slots((size_t)f.cfg.max_seqs);
+    std::vector<int32_t> expected;
+    /* What step t's block_begin lets draft, and how many drafts step t verifies (step 0 is the
+     * prompt's). */
+    const int want_drafted[20]  = { 1, 1, 1, 1, 1, 0, 0, 1, 0, 0, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1 };
+    const int want_verified[20] = { 0, 1, 1, 1, 1, 1, 0, 0, 1, 0, 0, 1, 0, 1, 1, 1, 1, 1, 1, 1 };
+    int verifies = 0;
+    for (int t = 0; t < 20; ++t) {
+        const StepEntry entry = f.sch.plan().e[0];
+        CHECK_EQ(entry.n_spec, want_verified[t]);
+        const int accepted = entry.n_spec > 0 ? (verifies++ < 4 ? 0 : 1) : 0;
+        std::vector<int32_t> sampled((size_t)b->n_out + 1, -1);
+        for (int j = 0; j <= entry.n_spec; ++j)
+            sampled[(size_t)(entry.dev_out + j)] = j < accepted ? ahead_draft(id, t, j) : ahead_tok(id, t);
+        AdvanceArgs accept = f.sch.advance_args(0); accept.mode = ADV_ACCEPT;
+        accept.st = slots.data(); accept.src = sampled.data(); adv_row(accept, 0);
+        CHECK_EQ(slots[(size_t)entry.card].acc, accepted);
+        const int64_t held_before = f.kv.seqs.at(id).n;
+        Scheduler::BlockRow row[1];
+        const int n = f.sch.block_begin(5, 5, 129, 128799, row, 1, true);
+        CHECK_EQ(n, want_drafted[t]);
+        /* A gated sequence reserves no query block. */
+        if (n == 0) CHECK_EQ(f.kv.seqs.at(id).n, held_before);
+        const RadBatch* context = f.sch.block_context(t + 1);
+        REQUIRE(context);
+        CHECK_EQ(context->n_tok, entry.n_tokens);
+        const RadBatch* query = f.sch.block_query(t + 1);
+        CHECK_EQ(query != nullptr, n == 1);
+        int32_t generated[5];
+        for (int j = 0; j < 5; ++j) generated[j] = ahead_draft(id, t + 1, j);
+        if (n == 1) {
+            CHECK_EQ(query->n_tok, 5);
+            AdvanceArgs q = f.sch.advance_args(0); q.mode = ADV_BLOCK; q.st = slots.data(); adv_row(q, 0);
+            AdvanceArgs take = f.sch.advance_args(0); take.mode = ADV_BTAKE; take.round = 5;
+            take.src = generated; take.src_pitch = 5; take.st = slots.data(); adv_row(take, 0);
+            f.sch.expect_draft(id, 5);
+        }
+        const RadBatch* next = f.sch.step_next();
+        REQUIRE(next);
+        CHECK_EQ(next->n_spec, n);
+        CHECK_EQ(next->n_tok, 1 + n);
+        AdvanceArgs tr = f.sch.advance_args(0); tr.mode = ADV_TRUNK; tr.st = slots.data(); adv_row(tr, 0);
+        CHECK_EQ(next->token_ids[0], ahead_tok(id, t));
+        if (n == 1) CHECK_EQ(next->token_ids[1], generated[0]);
+        for (int j = 0; j < accepted; ++j) expected.push_back(ahead_draft(id, t, j));
+        expected.push_back(ahead_tok(id, t));
+        CHECK_OK(f.commit(ahead_tok(id, t), 0, [accepted](const StepEntry&) { return accepted; }));
+        f.sch.block_end();
+        /* The drafter publishes only for the rows it ran. */
+        if (n == 1) CHECK_OK(f.sch.set_draft(id, generated, 5));
+        f.sch.step_finished();
+        f.sch.promote_next();
+        b = next;
+        CHECK(f.sch.find(id)->output == expected);
+    }
+    DraftGateStats g = f.sch.metrics().draft_gate;
+    CHECK(g.on); CHECK_EQ(g.window, 4); CHECK_EQ(g.probe, 3); CHECK_NEAR(g.threshold, 0.75, 1e-12);
+    CHECK_EQ(g.seqs, 1);    /* the running sequence, so far */
+    CHECK_EQ(g.asks, 20); CHECK_EQ(g.warm, 5); CHECK_EQ(g.gated, 5); CHECK_EQ(g.probes, 2);
+    CHECK_EQ(g.open, 8); CHECK_EQ(g.closes, 1); CHECK_EQ(g.reopens, 1);
+    CHECK_EQ(g.verifies, 14); CHECK_EQ(g.verified, 14); CHECK_EQ(g.accepted, 10);
+    CHECK_EQ(g.probe_verified, 2); CHECK_EQ(g.probe_accepted, 2);
+    /* Decode steps by kind: [verified drafts][drafted]; step 0 was the prompt's. */
+    CHECK_EQ(g.step_n[1][1], 11); CHECK_EQ(g.step_n[1][0], 3);
+    CHECK_EQ(g.step_n[0][0], 2); CHECK_EQ(g.step_n[0][1], 3);
+    for (int v = 0; v < 2; ++v)
+        for (int d = 0; d < 2; ++d) CHECK(g.step_ms(v, d) > 0.0);
+    /* The scheduler's own totals agree: every verify was the head's. */
+    const SchedMetrics m = f.sch.metrics();
+    CHECK_EQ(m.draft_tokens, 14); CHECK_EQ(m.draft_accepted, 10);
+    /* The request ends at the next commit, which verifies the last draft (taken): its record is
+     * kept for the shutdown report, and the totals no longer count it as running. */
+    CHECK_EQ(f.sch.plan().e[0].n_spec, 1);
+    {
+        std::vector<int32_t> sampled((size_t)b->n_out + 1, -1);
+        const StepEntry entry = f.sch.plan().e[0];
+        sampled[(size_t)entry.dev_out] = ahead_draft(id, 20, 0);
+        sampled[(size_t)entry.dev_out + 1] = ahead_tok(id, 20);
+        AdvanceArgs accept = f.sch.advance_args(0); accept.mode = ADV_ACCEPT;
+        accept.st = slots.data(); accept.src = sampled.data(); adv_row(accept, 0);
+    }
+    CHECK_OK(f.commit(ahead_tok(id, 20), 1, [](const StepEntry&) { return 1; }));
+    CHECK(f.sch.find(id)->state == ReqState::Finished);
+    g = f.sch.metrics().draft_gate;
+    CHECK_EQ(g.seqs, 1); CHECK_EQ(g.verifies, 15); CHECK_EQ(g.accepted, 11);
+    f.sch.draft_gate_report();   /* prints the totals and the one sequence's line */
+}
+
+/* A sequence the gate holds gets no prompt-lookup proposal in place of the declined draft (the
+ * step after it is planned after the commit here, where step() fills an empty proposal from the
+ * lookup), while the same text with the head merely declining does get one. */
+TEST(dspark_gate_held_sequence_gets_no_lookup_fallback) {
+    for (int gated = 0; gated < 2; ++gated) {
+        const auto x = DraftExperiment::capture("0", "0", nullptr, gated ? "1.0,1,1000" : nullptr);
+        REQUIRE(x.valid());
+        Fixture f; f.build(); f.cfg.n_spec = 5;
+        f.prog.drafter.kind = RAD_DRAFT_BLOCK; f.prog.drafter.depth = 5;
+        CHECK_OK(f.start(&x));
+        auto r = f.request(160, 2000);
+        for (int i = 0; i < 160; ++i) r->prompt[(size_t)i] = 100 + i % 8;
+        const auto id = f.add(std::move(r));
+        REQUIRE(id);
+        REQUIRE(f.sch.step()); f.commit_plain(100);
+        Scheduler::BlockRow row[1];
+        /* The first ask warms up: the head drafts, its block is verified and rejected. */
+        CHECK_EQ(f.sch.block_begin(5, 5, 0, 128799, row, 1), 1);
+        f.sch.block_end();
+        const int32_t d[5] = { 1, 2, 3, 4, 5 };
+        CHECK_OK(f.sch.set_draft(id, d, 5));
+        REQUIRE(f.sch.step());
+        CHECK_EQ(f.sch.plan().e[0].n_spec, 5); CHECK(!f.sch.plan().e[0].ngram);
+        /* The target emits 101, so the text continues the prompt's pattern and the lookup has a
+         * proposal to make. */
+        CHECK_OK(f.commit(101, 0, [](const StepEntry&) { return 0; }));
+        /* Closed at 0 of 1 under 1.0: no query row, while the context pass still has one. */
+        CHECK_EQ(f.sch.block_begin(5, 5, 0, 128799, row, 1), gated ? 0 : 1);
+        CHECK(f.sch.block_context(3) != nullptr);
+        CHECK_EQ(f.sch.block_query(3) == nullptr, gated == 1);
+        f.sch.block_end();
+        /* No head proposal either way (the drafter published nothing for this step). */
+        REQUIRE(f.sch.step());
+        const StepEntry& e = f.sch.plan().e[0];
+        if (gated) {
+            CHECK_EQ(e.n_spec, 0); CHECK(!e.ngram);
+        } else {
+            CHECK(e.ngram); CHECK(e.n_spec > 0);
+        }
+        CHECK_OK(f.commit(103));
+        if (gated) {
+            const DraftGateStats g = f.sch.metrics().draft_gate;
+            CHECK_EQ(g.asks, 2); CHECK_EQ(g.warm, 1); CHECK_EQ(g.gated, 1); CHECK_EQ(g.closes, 1);
+        } else {
+            CHECK(!f.sch.metrics().draft_gate.on);
+        }
+    }
+}
+
+/* The gate needs a block drafter: refused at init under any other, rather than gating nothing. */
+TEST(dspark_gate_is_refused_without_a_block_drafter) {
+    const auto x = DraftExperiment::capture("0", "0", nullptr, "1");
+    {
+        Fixture f; f.build(); f.cfg.n_spec = 4;   /* prompt lookup alone */
+        CHECK_EQ(f.start(&x), RAD_E_UNSUPPORTED);
+    }
+    {
+        Fixture f; f.build(); f.cfg.n_spec = 2;
+        f.prog.drafter.kind = RAD_DRAFT_SERIAL; f.prog.drafter.depth = 2;
+        CHECK_EQ(f.start(&x), RAD_E_UNSUPPORTED);
+    }
+    {
+        Fixture f; f.build(); f.cfg.n_spec = 0;
+        f.prog.drafter.kind = RAD_DRAFT_BLOCK; f.prog.drafter.depth = 5;
+        CHECK_EQ(f.start(&x), RAD_E_UNSUPPORTED);
+    }
+    {
+        Fixture f; f.build(); f.cfg.n_spec = 5;
+        f.prog.drafter.kind = RAD_DRAFT_BLOCK; f.prog.drafter.depth = 5;
+        CHECK_OK(f.start(&x));
+        CHECK(f.sch.metrics().draft_gate.on);
+    }
+    /* Off, nothing of it is reported. */
+    Fixture f; f.build(); f.cfg.n_spec = 5;
+    f.prog.drafter.kind = RAD_DRAFT_BLOCK; f.prog.drafter.depth = 5;
+    CHECK_OK(f.start());
+    CHECK(!f.sch.draft_gate().on); CHECK(!f.sch.metrics().draft_gate.on);
+    f.sch.draft_gate_report();
+}
+
+/* K1's short query block (RADIANCE_EXPERIMENTAL_DS41_DSPARK_SHORT_BLOCK=2, --draft-short-from 1)
+ * under the verify cap of 1 and the gate, as the engine stages it (Engine::block_shape: block 2,
+ * 2 proposals; the plugin's proposal pitch stays the drafter's 5): a two-row query pass, the step
+ * issued ahead verifying its first proposal, the cap cutting the published pair to it. */
+TEST(dspark_short_block_of_two_under_cap_one_and_the_gate_verifies_its_first_proposal) {
+    for (int gate = 0; gate < 2; ++gate) {
+        const auto x = DraftExperiment::capture("0", "0", "1", gate ? "1" : nullptr);
+        Fixture f; f.build(); f.cfg.n_spec = 5; f.cfg.max_seqs = 1;
+        f.prog.drafter.kind = RAD_DRAFT_BLOCK; f.prog.drafter.depth = 5;
+        CHECK_OK(f.start(&x));
+        auto r = f.request(40, 0); r->speculation_fixed = true;
+        const auto id = f.add(std::move(r));
+        const RadBatch* b = f.sch.step(); REQUIRE(b);
+        std::vector<StepSlot> slots((size_t)f.cfg.max_seqs);
+        std::vector<int32_t> expected;
+        for (int t = 0; t < 6; ++t) {
+            const StepEntry entry = f.sch.plan().e[0];
+            CHECK_EQ(entry.n_spec, t ? 1 : 0);
+            const int accepted = ahead_acc(id, t, entry.n_spec);
+            std::vector<int32_t> sampled((size_t)b->n_out + 1, -1);
+            for (int j = 0; j <= entry.n_spec; ++j)
+                sampled[(size_t)(entry.dev_out + j)] = j < accepted ? ahead_draft(id, t, j) : ahead_tok(id, t);
+            AdvanceArgs accept = f.sch.advance_args(0); accept.mode = ADV_ACCEPT;
+            accept.st = slots.data(); accept.src = sampled.data(); adv_row(accept, 0);
+            Scheduler::BlockRow row[1];
+            /* Six asks, all within the default window's warm-up: the gate lets each draft. */
+            CHECK_EQ(f.sch.block_begin(2, 2, 129, 128799, row, 1, true), 1);
+            REQUIRE(f.sch.block_context(t + 1));
+            const RadBatch* query = f.sch.block_query(t + 1);
+            REQUIRE(query);
+            CHECK_EQ(query->n_tok, 2); CHECK_EQ(query->n_out, 2);
+            AdvanceArgs q = f.sch.advance_args(0); q.mode = ADV_BLOCK; q.st = slots.data(); adv_row(q, 0);
+            int32_t generated[5];
+            for (int j = 0; j < 5; ++j) generated[j] = j < 2 ? ahead_draft(id, t + 1, j) : -7;
+            AdvanceArgs take = f.sch.advance_args(0); take.mode = ADV_BTAKE; take.round = 2;
+            take.src = generated; take.src_pitch = 5; take.st = slots.data(); adv_row(take, 0);
+            CHECK_EQ(slots[(size_t)entry.card].tok[1], generated[0]);
+            CHECK_EQ(slots[(size_t)entry.card].tok[2], generated[1]);
+            f.sch.expect_draft(id, 2);
+            const RadBatch* next = f.sch.step_next();
+            REQUIRE(next);
+            CHECK_EQ(next->n_spec, 1); CHECK_EQ(next->n_tok, 2);
+            AdvanceArgs tr = f.sch.advance_args(0); tr.mode = ADV_TRUNK; tr.st = slots.data(); adv_row(tr, 0);
+            CHECK_EQ(next->token_ids[1], generated[0]);
+            for (int j = 0; j < accepted; ++j) expected.push_back(ahead_draft(id, t, j));
+            expected.push_back(ahead_tok(id, t));
+            CHECK_OK(f.commit(ahead_tok(id, t), 0, [accepted](const StepEntry&) { return accepted; }));
+            f.sch.block_end();
+            CHECK_OK(f.sch.set_draft(id, generated, 2));
+            f.sch.promote_next();
+            b = next;
+            CHECK(f.sch.find(id)->output == expected);
+        }
+        CHECK_EQ(f.sch.metrics().draft_gate.on, gate == 1);
+        if (gate) CHECK_EQ(f.sch.metrics().draft_gate.warm, 6);
+    }
+}
+
 /* RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE. DeepSeek-V4.1 is served with the budget at the chunk
  * quantum (--max-num-batched-tokens 16 against a 16-token attention block), so a decode row ahead
  * of a chunk leaves it under the quantum. Without the switch a request arriving while another
@@ -7415,15 +7774,24 @@ struct CsRun {
     int cut = 0, prefill_steps = 0, bad_full = 0, sampled_cut = 0, shared_cut = 0;
     std::vector<int64_t> ckpts;   /* positions the snapshots were reserved at */
     int64_t end = -1;             /* the target every prefill entry carried; -2 when they differed */
+    /* The request's prefill passes and each one's F (the layer count when it was not cut), for
+     * the dependency simulation (consumer_sim.h). */
+    std::vector<csim::Pass> passes;
+    std::vector<int32_t> F;
 };
 
 /* Runs every request the fixture holds to the end, checking each step's cut against the schedule
- * for `target` (the chunk's last row) and collecting the checkpoints the steps reserve. */
-CsRun consumer_run(Fixture& f, uint64_t id, int64_t target) {
+ * for `target` (the chunk's last row) and the checkpoints below it made whole (`whole`, ascending:
+ * the first at or after the chunk's end raises F to its cone; consumer_skip.h), and collecting
+ * the checkpoints the steps reserve. The shape is the program's declared suffix. */
+CsRun consumer_run(Fixture& f, uint64_t id, int64_t target,
+                   const std::vector<int64_t>& whole = {}) {
     CsRun out;
-    const ConsumerShape shape{ 16, 4, 64, f.cfg.max_tok, f.sch.geometry().quantum };
+    const RadConsumerSuffix& d = f.prog.consumer;
+    const ConsumerShape shape{ d.n_layer, d.boundary, d.window, f.cfg.max_tok,
+                               f.sch.geometry().quantum };
     const std::vector<int64_t> th = consumer_thresholds(shape, target);
-    for (int k = 0; k < 400; ++k) {
+    for (int k = 0; k < 4000; ++k) {
         const RadBatch* b = f.sch.step();
         if (!b) break;
         const StepPlan& p = f.sch.plan();
@@ -7433,15 +7801,22 @@ CsRun consumer_run(Fixture& f, uint64_t id, int64_t target) {
             if (out.end == -1) out.end = e.consumer_end;
             else if (out.end != e.consumer_end) out.end = -2;
             if (e.ckpt_slot >= 0) out.ckpts.push_back((int64_t)e.ctx_len + e.ckpt_tok + 1);
-            const int32_t F = consumer_full_layers(shape, th, (int64_t)e.ctx_len + e.n_tokens - 1);
-            const int32_t want = p.e.size() == 1 && F < 16 ? F : 0;
+            const int64_t end = (int64_t)e.ctx_len + e.n_tokens;
+            const auto it = std::lower_bound(whole.begin(), whole.end(), end);
+            const int32_t F = it == whole.end()
+                ? consumer_full_layers(shape, th, end - 1)
+                : consumer_pass_layers(shape, th, consumer_ckpt_thresholds(shape, *it), end - 1);
+            const int32_t want = p.e.size() == 1 && F < d.n_layer ? F : 0;
             if (b->consumer_full != want) ++out.bad_full;
+            if (e.consumer_ckpt != (it == whole.end() ? 0 : *it)) ++out.bad_full;
             if (b->consumer_full) {
                 ++out.cut;
                 if (b->consumer_end != target) ++out.bad_full;
                 if (e.produces_token || b->n_out) ++out.sampled_cut;
                 if (p.e.size() != 1) ++out.shared_cut;
             }
+            out.passes.push_back({ (int64_t)e.ctx_len, end });
+            out.F.push_back(b->consumer_full ? b->consumer_full : d.n_layer);
         }
         if (b->consumer_full && (p.e.size() != 1 || !p.e[0].is_prefill)) ++out.shared_cut;
         f.commit_plain();
@@ -7451,13 +7826,16 @@ CsRun consumer_run(Fixture& f, uint64_t id, int64_t target) {
 
 }  /* namespace */
 
-/* A lone prompt with the prefix cache on: cut for its tail checkpoint (1072, a block short of
- * 1100), every pass's F the schedule's, the snapshots at 256 .. 1024 not written (their windows
- * are incomplete) and the one at the tail written; the prompt's last passes run every layer. */
+/* A lone prompt with the prefix cache on and ..._CKPT=0: cut for its tail checkpoint (1072, a
+ * block short of 1100), every pass's F the schedule's, the snapshots at 256 .. 1024 not written
+ * (their windows are incomplete) and the one at the tail written; the prompt's last passes run
+ * every layer. */
 TEST(consumer_skip_cuts_a_lone_prefill_for_its_tail_checkpoint) {
     Fixture f;
     consumer_fixture(f, 16);
+    f.cfg.consumer_skip_ckpt = 0;   /* none below the target made whole: they are not written */
     REQUIRE_EQ(f.start(), RAD_OK);
+    CHECK_EQ(f.sch.consumer_ckpt_policy(), (int64_t)0);
     REQUIRE(f.sch.consumer_on());
     REQUIRE(f.sch.geometry().window_ckpt);
     CHECK_EQ(f.sch.geometry().quantum, 16);
@@ -7590,9 +7968,9 @@ TEST(consumer_skip_is_refused_where_its_derivation_does_not_reach) {
 }
 
 /* The consumer skip in DeepSeek-V4.1's own shape (ds41_fixture: linear state beside the window, a
- * state chunk of 1, 16-token chunks), with the prefix cache on, in both resume modes: a prompt is
- * cut for the deepest snapshot its idle prefill writes, and that one is written, so every prompt
- * that would have a snapshot keeps one. With --prefix-resume nearest the chunk before a prompt's
+ * state chunk of 1, 16-token chunks), with the prefix cache on and ..._CKPT=0, in both resume
+ * modes: a prompt is cut for the deepest snapshot its idle prefill writes, and that one is
+ * written, so every prompt that would have a snapshot keeps one. With --prefix-resume nearest the chunk before a prompt's
  * last ends on the quantum boundary under its end and the last chunk starts there, so no tail
  * snapshot is taken (plan_chunk only splits a final chunk for one): cutting for tail_checkpoint()
  * dropped the interval snapshots below it and wrote none. With exact a prompt just past an
@@ -7609,6 +7987,7 @@ TEST(consumer_skip_in_ds41s_shape_keeps_the_deepest_snapshot_its_prefill_writes)
                 f.cfg.prefix_exact = exact;
                 f.prog.consumer = RadConsumerSuffix{ (uint32_t)sizeof(RadConsumerSuffix), 16, 4, 64 };
                 f.cfg.consumer_skip = 1;
+                f.cfg.consumer_skip_ckpt = 0;
                 f.cfg.max_seqs = 1;
                 REQUIRE_EQ(f.start(), RAD_OK);
                 REQUIRE(f.sch.consumer_on());
@@ -7649,6 +8028,7 @@ TEST(consumer_skip_in_ds41s_shape_keeps_the_deepest_snapshot_its_prefill_writes)
         f.cfg.prefix_exact = false;
         f.prog.consumer = RadConsumerSuffix{ (uint32_t)sizeof(RadConsumerSuffix), 16, 4, 64 };
         f.cfg.consumer_skip = 1;
+        f.cfg.consumer_skip_ckpt = 0;
         f.cfg.max_seqs = 1;
         REQUIRE_EQ(f.start(), RAD_OK);
         CHECK_EQ(f.sch.tail_checkpoint(3086), 3072);
@@ -7726,5 +8106,922 @@ TEST(consumer_skip_is_refused_for_unlike_ranks_and_kv_streaming) {
         f.cfg.kv_resident = 1024;
         REQUIRE_EQ(f.start(), RAD_OK);
         CHECK(!f.sch.consumer_on());
+    }
+}
+
+/* ================================================================== complete checkpoints */
+/* RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP_CKPT (consumer_skip.h, "complete checkpoints") on the
+ * scheduler, in DeepSeek-V4.1's own shape and suffix: ds41_fixture's 16-token chunks with linear
+ * state beside the window, and the declared suffix of 40 layers past boundary 20 with the
+ * 128-position window. Each run's passes and F go through the dependency simulation
+ * (consumer_sim.h), which holds every snapshot to the base engine's window and state bytes. */
+namespace {
+
+void ds41_cs_fixture(Fixture& f, int64_t interval, bool exact, int64_t policy) {
+    ds41_fixture(f, interval);
+    f.cfg.prefix_exact = exact;
+    f.prog.consumer = RadConsumerSuffix{ (uint32_t)sizeof(RadConsumerSuffix), 40, 20, 128 };
+    f.cfg.consumer_skip = 1;
+    f.cfg.consumer_skip_ckpt = policy;
+    f.cfg.max_seqs = 1;
+}
+
+const ConsumerShape kDs41Shape{ 40, 20, 128, 16, 16 };
+
+/* The snapshots an uncut idle prefill from `from` to `n` writes with keep point `keep`. */
+std::vector<int64_t> idle_ckpts(const Scheduler& s, int64_t from, int64_t n, int64_t keep = 0) {
+    std::vector<int64_t> v;
+    for (int64_t pos = from; pos < n;) {
+        int64_t ck = -1;
+        const int64_t k = s.plan_chunk(pos, n, 16, &ck, keep);
+        if (k <= 0) break;
+        pos += k;
+        if (ck > 0) v.push_back(ck);
+    }
+    return v;
+}
+
+}  /* namespace */
+
+/* With every checkpoint made whole (..._CKPT=all; the default with the prefix cache is a band of 512), a cut prompt
+ * writes every snapshot its uncut idle prefill writes, each with the base engine's bytes: in both
+ * resume modes at intervals 16, 256 and 2048, over prompt lengths around the interval and tail
+ * boundaries, cold and resumed at one of its own snapshots (a prefix hit), the real scheduler's
+ * snapshots are the uncut run's (and csim::ds41_idle_snapshots, the lists consumer_skip_test
+ * simulates), every pass's F is the schedule's for the target and the first checkpoint ahead,
+ * each pass that writes one below the target is cut at layer 39's keys, nothing sampled is cut,
+ * and the simulation of the passes the scheduler ran finds every snapshot whole and every computed
+ * row exact. */
+TEST(consumer_skip_in_ds41s_shape_writes_every_snapshot_whole) {
+    int runs = 0, with = 0, resumed = 0;
+    for (const bool exact : { false, true }) {
+        for (const int64_t interval : { 16, 256, 2048 }) {
+            for (const int64_t n : { 19, 40, 255, 256, 257, 300, 1100, 1221, 2047, 2048, 2050, 2064,
+                                     2065, 2655, 3086 }) {
+                const std::vector<int64_t> model = csim::ds41_idle_snapshots(0, n, interval, exact);
+                /* Cold, then resumed at the first snapshot below the end, if any. */
+                std::vector<int64_t> starts{ 0 };
+                for (int64_t k : model) if (k < n && k <= 1024) { starts.push_back(k); break; }
+                for (const int64_t p0 : starts) {
+                    Fixture f;
+                    ds41_cs_fixture(f, interval, exact, -1);
+                    REQUIRE_EQ(f.start(), RAD_OK);
+                    REQUIRE(f.sch.consumer_on());
+                    CHECK_EQ(f.sch.consumer_ckpt_policy(), (int64_t)-1);
+                    if (p0 > 0) {
+                        f.pc.seed((int32_t)p0);
+                        f.pc.lin = (int32_t)p0;   /* a snapshot of its own, on the grid */
+                        f.pc.src = 3;
+                    }
+                    const std::vector<int64_t> cold = idle_ckpts(f.sch, p0, n);
+                    if (p0 == 0) CHECK(cold == model);
+                    CHECK(cold == csim::ds41_idle_snapshots(p0, n, interval, exact));
+                    const int64_t deepest = cold.empty() ? -1 : cold.back();
+                    const int64_t target = deepest > p0 && deepest < n ? deepest : n;
+                    std::vector<int64_t> whole;
+                    for (int64_t k : cold) if (k < target) whole.push_back(k);
+                    const uint64_t id = f.submit((int)n, 1);
+                    REQUIRE(id != 0);
+                    const CsRun r = consumer_run(f, id, target, whole);
+                    REQUIRE(!r.passes.empty());
+                    CHECK_EQ(r.passes.front().first, p0);
+                    CHECK_EQ(r.end, target);
+                    CHECK_EQ(r.bad_full, 0);
+                    CHECK_EQ(r.sampled_cut, 0);
+                    CHECK_EQ(r.shared_cut, 0);
+                    CHECK(r.ckpts == cold);
+                    CHECK_EQ(f.sch.metrics().consumer_ckpt_whole, (int64_t)whole.size());
+                    CHECK_EQ(f.sch.metrics().consumer_ckpt_dropped, (int64_t)0);
+                    CHECK_EQ(f.sch.metrics().checkpoints_written, (int64_t)cold.size());
+                    const BatchBuilder::ConsumerStats& cs = f.sch.consumer_stats();
+                    CHECK_EQ(cs.ckpt_insured, (uint64_t)0);
+                    CHECK_EQ(cs.ckpt_cut, (uint64_t)whole.size());
+                    CHECK_EQ(cs.full + cs.key + cs.skipped, (uint64_t)r.prefill_steps * 40);
+                    const csim::Sim sim = csim::simulate_passes(kDs41Shape, n, p0, r.passes, r.F,
+                                                                r.ckpts);
+                    CHECK(sim.ok);
+                    if (!sim.ok)
+                        fprintf(stderr, "    %s I %lld n %lld p0 %lld: %s\n",
+                                exact ? "exact" : "nearest", (long long)interval, (long long)n,
+                                (long long)p0, sim.why.c_str());
+                    ++runs;
+                    with += !whole.empty();
+                    resumed += p0 > 0;
+                }
+            }
+        }
+    }
+    CHECK(runs >= 90);
+    CHECK(resumed > 20);
+    CHECK(with > 40);
+}
+
+/* ..._CKPT=N: of the snapshots below the target, those within N tokens of it are made whole and
+ * written, the rest not (counted as dropped); the target's is written. In both modes at intervals
+ * 16, 256 and 2048, for N = 32 and 512: the written list is the uncut run's from target - N on,
+ * every pass's F the schedule's for that set, and every written snapshot whole in the simulation;
+ * the band costs less than every checkpoint and more than none. */
+TEST(consumer_skip_band_writes_the_snapshots_near_the_target_whole) {
+    int runs = 0, dropped_some = 0;
+    for (const bool exact : { false, true }) {
+        for (const int64_t interval : { 16, 256, 2048 }) {
+            for (const int64_t band : { 32, 512 }) {
+                for (const int64_t n : { 300, 1221, 2655, 3086 }) {
+                    int64_t full[3] = { 0, 0, 0 };   /* policies 0, band, all */
+                    for (int k = 0; k < 3; ++k) {
+                        const int64_t policy = k == 0 ? 0 : k == 1 ? band : -1;
+                        Fixture f;
+                        ds41_cs_fixture(f, interval, exact, policy);
+                        REQUIRE_EQ(f.start(), RAD_OK);
+                        CHECK_EQ(f.sch.consumer_ckpt_policy(), policy);
+                        const std::vector<int64_t> cold = idle_ckpts(f.sch, 0, n);
+                        const int64_t deepest = cold.empty() ? -1 : cold.back();
+                        const int64_t target = deepest > 0 && deepest < n ? deepest : n;
+                        std::vector<int64_t> whole, written;
+                        for (int64_t c : cold) {
+                            const bool kept = c >= target || policy < 0 ||
+                                              (policy > 0 && c >= target - policy);
+                            if (kept) written.push_back(c);
+                            if (kept && c < target) whole.push_back(c);
+                        }
+                        const uint64_t id = f.submit((int)n, 1);
+                        REQUIRE(id != 0);
+                        const CsRun r = consumer_run(f, id, target, whole);
+                        CHECK_EQ(r.bad_full, 0);
+                        CHECK(r.ckpts == written);
+                        CHECK_EQ(f.sch.metrics().consumer_ckpt_whole, (int64_t)whole.size());
+                        CHECK_EQ(f.sch.metrics().consumer_ckpt_dropped,
+                                 (int64_t)(cold.size() - written.size()));
+                        const csim::Sim sim = csim::simulate_passes(kDs41Shape, n, 0, r.passes,
+                                                                    r.F, r.ckpts);
+                        CHECK(sim.ok);
+                        if (!sim.ok)
+                            fprintf(stderr, "    %s I %lld N %lld n %lld: %s\n",
+                                    exact ? "exact" : "nearest", (long long)interval,
+                                    (long long)policy, (long long)n, sim.why.c_str());
+                        full[k] = csim::full_layer_passes(r.F);
+                        dropped_some += k == 1 && written.size() < cold.size();
+                        ++runs;
+                    }
+                    CHECK(full[0] <= full[1]);
+                    CHECK(full[1] <= full[2]);
+                }
+            }
+        }
+    }
+    CHECK_EQ(runs, 2 * 3 * 2 * 4 * 3);
+    CHECK(dropped_some > 10);
+}
+
+/* A request's keep point (Request::checkpoint_at, a head other requests resume at; set here from
+ * the cache's CacheHit::branch_at) is made whole under ..._CKPT=N wherever it falls: a 3,086-token
+ * prompt at interval 2048 (exact) with a shared head ending at 1,000 writes the head's snapshot at
+ * 992 (plan_chunk's quantum), its tail at 3072, and not 2048, which is outside a band of 256; with
+ * every checkpoint 2048 too; with none only the tail. */
+TEST(consumer_skip_band_keeps_a_shared_head_whole) {
+    struct Want { int64_t policy; std::vector<int64_t> written; int64_t whole, dropped; };
+    for (const Want& w : { Want{ 256, { 992, 3072 }, 1, 1 }, Want{ -1, { 992, 2048, 3072 }, 2, 0 },
+                           Want{ 0, { 3072 }, 0, 2 } }) {
+        Fixture f;
+        ds41_cs_fixture(f, 2048, true, w.policy);
+        REQUIRE_EQ(f.start(), RAD_OK);
+        f.pc.branch_at = 1000;
+        CHECK((idle_ckpts(f.sch, 0, 3086, 1000) == std::vector<int64_t>{ 992, 2048, 3072 }));
+        const uint64_t id = f.submit(3086, 1);
+        REQUIRE(id != 0);
+        std::vector<int64_t> whole;
+        for (int64_t c : w.written) if (c < 3072) whole.push_back(c);
+        const CsRun r = consumer_run(f, id, 3072, whole);
+        CHECK_EQ(r.bad_full, 0);
+        CHECK(r.ckpts == w.written);
+        CHECK_EQ(f.sch.metrics().consumer_ckpt_whole, w.whole);
+        CHECK_EQ(f.sch.metrics().consumer_ckpt_dropped, w.dropped);
+        const csim::Sim sim = csim::simulate_passes(kDs41Shape, 3086, 0, r.passes, r.F, r.ckpts);
+        CHECK(sim.ok);
+        if (!sim.ok) fprintf(stderr, "    policy %lld: %s\n", (long long)w.policy, sim.why.c_str());
+    }
+}
+
+/* The policy from RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP_CKPT: unset the default band of 512,
+ * "all" every checkpoint, a token count that band, 0 none, anything else the default band (with a
+ * warning); and 0 without
+ * the prefix cache, which writes no snapshot. */
+TEST(consumer_skip_ckpt_policy_from_the_environment) {
+    struct Want { const char* v; int64_t policy; };
+    const Log was = log_level();
+    for (const Want w : { Want{ nullptr, 512 }, Want{ "", 512 }, Want{ "all", -1 }, Want{ "0", 0 },
+                          Want{ "512", 512 }, Want{ "256", 256 }, Want{ "junk", 512 },
+                          Want{ "-4", 512 }, Want{ "12x", 512 } }) {
+        Fixture f;
+        ds41_cs_fixture(f, 256, true, -2);
+        if (w.v) setenv("RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP_CKPT", w.v, 1);
+        else unsetenv("RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP_CKPT");
+        log_set_level(Log::Error);
+        const int rc = f.start();
+        log_set_level(was);
+        unsetenv("RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP_CKPT");
+        REQUIRE_EQ(rc, RAD_OK);
+        REQUIRE(f.sch.consumer_on());
+        CHECK_EQ(f.sch.consumer_ckpt_policy(), w.policy);
+    }
+    {
+        Fixture f;
+        ds41_cs_fixture(f, 256, true, -1);
+        f.cfg.prefix_cache = false;
+        REQUIRE_EQ(f.start(), RAD_OK);
+        REQUIRE(f.sch.consumer_on());
+        CHECK_EQ(f.sch.consumer_ckpt_policy(), (int64_t)0);
+    }
+}
+
+/* The startup lines say which policy runs, as ab_window.sh checks them: `all` and a band name the
+ * variable's value in a "complete checkpoints" line with the cost of a lone whole checkpoint at the
+ * deployed shape (1,520 layer-passes for DeepSeek-V4.1's suffix at 16-row passes); 0 says so in
+ * the "on" line and has no such line; without the prefix cache neither appears. */
+TEST(consumer_skip_ckpt_policy_is_named_at_startup) {
+    struct Want { int64_t policy; bool cache; const char* has; const char* lacks; };
+    for (const Want& w : {
+             Want{ -1, true, "consumer skip: complete checkpoints (RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP_CKPT=all) -- every checkpoint", nullptr },
+             Want{ 512, true, "consumer skip: complete checkpoints (RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP_CKPT=512) -- a cut prompt's checkpoints within 512 tokens", nullptr },
+             Want{ 0, true, "none below it is written (RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP_CKPT=0)", "complete checkpoints" },
+             Want{ -1, false, "consumer skip: on", "CONSUMER_SKIP_CKPT" } }) {
+        Fixture f;
+        ds41_cs_fixture(f, 256, true, w.policy);
+        f.cfg.prefix_cache = w.cache;
+        int rc = RAD_E_STATE;
+        const std::string text = info_of([&] { rc = f.start(); });
+        REQUIRE_EQ(rc, RAD_OK);
+        CHECK(text.find(w.has) != std::string::npos);
+        if (w.lacks) CHECK(text.find(w.lacks) == std::string::npos);
+        if (w.policy != 0 && w.cache)
+            CHECK(text.find("a lone one adds up to 1520 layer-passes in full") != std::string::npos);
+    }
+}
+
+/* ================================================================== large-chunk prefill */
+/* RADIANCE_EXPERIMENTAL_DS41_LCP=<C> on the scheduler (Scheduler::lcp_init; the kernels' side is
+ * FileStager::lcp_init, tests/ds41_tall_test.cpp): in DeepSeek-V4.1's shape (linear state beside the
+ * window, so the checkpoint interval caps chunks even without the prefix cache) a lone prompt runs
+ * in chunks of C, split only at the interval and the tail; the deployments that would cut chunks
+ * short, share a chunk's step or speculate are refused, and so is LCP no file stager took. */
+namespace {
+
+/* Forces the switch (and the ranks whose stager admitted it) for one case. */
+struct LcpOn {
+    LcpOn(int64_t c, int admitted) {
+        ds41_lcp_set_for_test(c);
+        lcp_admitted_reset_for_test(admitted);
+    }
+    ~LcpOn() {
+        ds41_lcp_set_for_test(-2);
+        lcp_admitted_reset_for_test(0);
+    }
+};
+
+/* ds41_fixture's shape (linear state beside the window, the state chunk 1) at chunks of C and 8,192
+ * tokens of context, the prefix cache off (the A/B's). */
+void lcp_fixture(Fixture& f, int64_t C, int64_t interval) {
+    f.build(8192, 64, /*max_tok=*/C, 8192, /*windowed=*/true, /*linear=*/true);
+    f.prog.meta.n_ctx_train = 8192;
+    f.prog.ops.resize(1);
+    f.kv.snap = { 3 };
+    f.pc.groups = { 0 };
+    f.cfg.checkpoint_interval = interval;
+    f.cfg.prefix_exact = true;
+    f.cfg.max_seqs = 1;
+    f.cfg.prefix_cache = false;
+}
+
+}  /* namespace */
+
+TEST(lcp_runs_a_lone_prompt_in_chunks_of_c) {
+    for (const int64_t C : { 256, 512, 1024, 2048 }) {
+        LcpOn on(C, 1);
+        Fixture f;
+        lcp_fixture(f, C, 2048);
+        REQUIRE_EQ(f.start(), RAD_OK);
+        CHECK_EQ(f.sch.lcp_rows(), C);
+        CHECK_EQ(f.sch.geometry().quantum, 16);
+        /* 3,086 and 6,817 tokens: chunks of C up to the interval grid, the tail chunk split at its last
+         * quantum boundary as at 16-token chunks. */
+        for (const int64_t n : { 933, 3086, 6817 }) {
+            const Cut c = cut_from(f.sch, 0, n, C);
+            REQUIRE(!c.ends.empty());
+            int64_t prev = 0, short_chunks = 0;
+            for (size_t i = 0; i < c.ends.size(); ++i) {
+                const int64_t len = c.ends[i] - prev;
+                CHECK(len <= C);
+                CHECK_EQ(prev % 16, (int64_t)0);
+                if (len < C && i + 2 < c.ends.size()) ++short_chunks;   /* only the last two may be short */
+                prev = c.ends[i];
+            }
+            CHECK_EQ(prev, n);
+            CHECK_EQ(short_chunks, (int64_t)0);
+        }
+    }
+    /* At 1,024 a 3,086-token prompt: [0, 1024), [1024, 2048), [2048, 3072), [3072, 3086). */
+    {
+        LcpOn on(1024, 1);
+        Fixture f;
+        lcp_fixture(f, 1024, 2048);
+        REQUIRE_EQ(f.start(), RAD_OK);
+        const Cut c = cut_from(f.sch, 0, 3086, 1024);
+        CHECK(c.ends == std::vector<int64_t>({ 1024, 2048, 3072, 3086 }));
+    }
+    /* A span over a smaller interval: chunks of C after the first interval. */
+    {
+        LcpOn on(1024, 1);
+        Fixture f;
+        lcp_fixture(f, 1024, 256);
+        f.cfg.prefix_cache = true;
+        f.cfg.prefill_span = 4;
+        REQUIRE_EQ(f.start(), RAD_OK);
+        CHECK_EQ(f.sch.lcp_rows(), (int64_t)1024);
+    }
+    /* Off: no LCP whatever the budget. */
+    {
+        LcpOn off(0, 0);
+        Fixture f;
+        lcp_fixture(f, 1024, 2048);
+        REQUIRE_EQ(f.start(), RAD_OK);
+        CHECK_EQ(f.sch.lcp_rows(), (int64_t)0);
+    }
+}
+
+TEST(lcp_is_refused_where_chunks_would_not_be_c_or_share_a_step) {
+    auto refused = [](Fixture& f, const char* what) {
+        std::string err;
+        int rc = 0;
+        err = stderr_of([&] { rc = f.start(); });
+        CHECK_EQ(rc, (int)RAD_E_INVAL);
+        CHECK(has(err, "large-chunk prefill) refused"));
+        CHECK(has(err, what));
+    };
+    {   /* the budget is not C */
+        LcpOn on(1024, 1);
+        Fixture f;
+        lcp_fixture(f, 512, 2048);
+        refused(f, "--max-num-batched-tokens 512");
+    }
+    {   /* an interval below C with no span: chunks of the interval */
+        LcpOn on(1024, 1);
+        Fixture f;
+        lcp_fixture(f, 1024, 256);
+        refused(f, "below the chunk");
+    }
+    {   /* an interval past C and not a multiple of it */
+        LcpOn on(1024, 1);
+        Fixture f;
+        lcp_fixture(f, 1024, 1536);
+        refused(f, "not a multiple of the chunk");
+    }
+    {   /* a span too short for C */
+        LcpOn on(1024, 1);
+        Fixture f;
+        lcp_fixture(f, 1024, 256);
+        f.cfg.prefix_cache = true;
+        f.cfg.prefill_span = 2;
+        refused(f, "--prefill-span 2");
+    }
+    {   /* concurrent sequences without prefill-alone steps */
+        LcpOn on(1024, 1);
+        Fixture f;
+        lcp_fixture(f, 1024, 2048);
+        f.cfg.max_seqs = 4;
+        refused(f, "--max-num-seqs 4");
+    }
+    {   /* speculation */
+        LcpOn on(1024, 1);
+        Fixture f;
+        lcp_fixture(f, 1024, 2048);
+        f.cfg.n_spec = 2;
+        refused(f, "speculation");
+    }
+    {   /* KV streaming: a ring of the context on the card */
+        LcpOn on(1024, 1);
+        Fixture f;
+        lcp_fixture(f, 1024, 2048);
+        f.cfg.kv_resident = 4096;
+        refused(f, "KV streaming");
+    }
+    {   /* no file stager took it */
+        LcpOn on(1024, 0);
+        Fixture f;
+        lcp_fixture(f, 1024, 2048);
+        refused(f, "took it on 0 of 1 ranks");
+    }
+    {   /* a value outside the switch's range */
+        LcpOn on(-1, 1);
+        Fixture f;
+        lcp_fixture(f, 1024, 2048);
+        int rc = 0;
+        (void)stderr_of([&] { rc = f.start(); });
+        CHECK_EQ(rc, (int)RAD_E_INVAL);
+    }
+}
+
+/* A lone 3,086-token prompt (and a 6,817-token one) at C = 1,024 with the consumer skip declared at the
+ * 16-row grain: every chunk past the first rows carries the per-row cut of the 16-row schedule for its
+ * target (consumer_row_starts at M = A = 16), the last chunk none that cuts its sampled row, and every
+ * chunk of more than 16 tokens its admission row (the prompt's last 128 tokens); a decode step carries
+ * neither. Without the declared grain the cut is the whole-pass one at M = C. */
+TEST(lcp_steps_carry_the_row_cut_and_the_admission_row) {
+    for (const int64_t n : { 3086, 6817 }) {
+        LcpOn on(1024, 1);
+        Fixture f;
+        lcp_fixture(f, 1024, 2048);
+        f.prog.consumer = RadConsumerSuffix{ (uint32_t)sizeof(RadConsumerSuffix), 16, 4, 64, 16 };
+        f.cfg.consumer_skip = 1;
+        REQUIRE_EQ(f.start(), RAD_OK);
+        REQUIRE(f.sch.consumer_on());
+        REQUIRE_EQ(f.sch.lcp_rows(), (int64_t)1024);
+        const uint64_t id = f.submit((int)n, 2);
+        REQUIRE(id != 0);
+        const ConsumerShape c16{ 16, 4, 64, 16, 16 };
+        int chunks = 0, cut = 0, bad_row0 = 0, bad_admit = 0, decode_marked = 0;
+        int64_t target = -1;
+        for (int k = 0; k < 40; ++k) {
+            const RadBatch* b = f.sch.step();
+            if (!b) break;
+            const StepPlan& p = f.sch.plan();
+            REQUIRE_EQ(p.e.size(), (size_t)1);
+            const StepEntry& e = p.e[0];
+            if (!e.is_prefill) {
+                decode_marked += b->consumer_row0 != nullptr || b->lcp_admit_row != 0 || b->consumer_full != 0;
+                f.commit_plain();
+                continue;
+            }
+            ++chunks;
+            if (target < 0) target = e.consumer_end;
+            CHECK_EQ(e.consumer_end, target);
+            /* The admission row: the chunk's rows inside the prompt's last 128 tokens. */
+            const int32_t want_admit = e.n_tokens > 16
+                ? (int32_t)std::clamp<int64_t>(n - 128 - e.ctx_len, 0, e.n_tokens) : 0;
+            bad_admit += b->lcp_admit_row != want_admit;
+            /* The row cut. */
+            const std::vector<int64_t> th = consumer_thresholds(c16, target);
+            std::vector<int32_t> want(16);
+            REQUIRE(consumer_row_starts(c16, th.data(), e.ctx_len, (int64_t)e.ctx_len + e.n_tokens, want.data()));
+            bool any = false;
+            for (int32_t v : want) any = any || v > 0;
+            int32_t F = 4;
+            while (F < 16 && want[(size_t)F] < e.n_tokens) ++F;
+            any = any || F < 16;
+            if (!any) {
+                bad_row0 += b->consumer_row0 != nullptr;
+            } else {
+                ++cut;
+                if (!b->consumer_row0) { ++bad_row0; }
+                else
+                    for (int L = 0; L < 16; ++L) bad_row0 += b->consumer_row0[L] != want[(size_t)L];
+                bad_row0 += b->consumer_full != (F < 16 ? F : 0);
+                if (e.produces_token) bad_row0 += want[15] > e.n_tokens - 1;
+            }
+            f.commit_plain();
+        }
+        CHECK(chunks >= (int)((n + 1023) / 1024));
+        CHECK(cut >= 2);
+        CHECK_EQ(bad_row0, 0);
+        CHECK_EQ(bad_admit, 0);
+        CHECK_EQ(decode_marked, 0);
+        const BatchBuilder::ConsumerStats& cs = f.sch.consumer_stats();
+        CHECK(cs.rows_skipped > 0);
+        CHECK_EQ(cs.rows_full + cs.rows_key + cs.rows_skipped, (uint64_t)(16 * n));
+    }
+    /* No grain declared: the whole-pass cut (M = C), no row0. */
+    {
+        LcpOn on(1024, 1);
+        Fixture f;
+        lcp_fixture(f, 1024, 2048);
+        f.prog.consumer = RadConsumerSuffix{ (uint32_t)sizeof(RadConsumerSuffix), 16, 4, 64, 0 };
+        f.cfg.consumer_skip = 1;
+        REQUIRE_EQ(f.start(), RAD_OK);
+        REQUIRE(f.sch.consumer_on());
+        const uint64_t id = f.submit(3086, 2);
+        REQUIRE(id != 0);
+        int rows_marked = 0;
+        for (int k = 0; k < 10; ++k) {
+            const RadBatch* b = f.sch.step();
+            if (!b) break;
+            rows_marked += b->consumer_row0 != nullptr;
+            f.commit_plain();
+        }
+        CHECK_EQ(rows_marked, 0);
+    }
+}
+
+/* Complete checkpoints (claude/ds41-csckpt) under large-chunk prefill's per-row cut: a lone 3,086-token
+ * prompt at C = 1,024 with the prefix cache on, interval 1,024 and ..._CKPT=all, cut for its tail
+ * snapshot at 3,072. The snapshots at 1,024 and 2,048 below it are reserved by the chunks that end
+ * there, each chunk's rows are consumer_row_starts of the least of the target's thresholds and the
+ * next checkpoint's 16-row cone (consumer_row_thresholds), the chunks ending at a checkpoint store
+ * layer n-1's keys on its window (consumer_ckpt_covered_rows: counted cut, none insured), and the
+ * snapshot list is the uncut run's. With ..._CKPT=0 none below the target is written. */
+TEST(lcp_row_cut_makes_the_checkpoints_below_the_target_whole) {
+    for (const int64_t policy : { (int64_t)-1, (int64_t)0 }) {
+        LcpOn on(1024, 1);
+        Fixture f;
+        lcp_fixture(f, 1024, 1024);
+        f.cfg.prefix_cache = true;
+        f.prog.consumer = RadConsumerSuffix{ (uint32_t)sizeof(RadConsumerSuffix), 16, 4, 64, 16 };
+        f.cfg.consumer_skip = 1;
+        f.cfg.consumer_skip_ckpt = policy;
+        REQUIRE_EQ(f.start(), RAD_OK);
+        REQUIRE(f.sch.consumer_on());
+        REQUIRE_EQ(f.sch.lcp_rows(), (int64_t)1024);
+        CHECK_EQ(f.sch.consumer_ckpt_policy(), policy);
+        const int64_t n = 3086;
+        const uint64_t id = f.submit((int)n, 2);
+        REQUIRE(id != 0);
+        const ConsumerShape c16{ 16, 4, 64, 16, 16 };
+        std::vector<int64_t> snaps;
+        int bad_row0 = 0, prefills = 0;
+        int64_t target = -1;
+        for (int k = 0; k < 40; ++k) {
+            const RadBatch* b = f.sch.step();
+            if (!b) break;
+            const StepPlan& p = f.sch.plan();
+            REQUIRE_EQ(p.e.size(), (size_t)1);
+            const StepEntry& e = p.e[0];
+            if (!e.is_prefill) { f.commit_plain(); continue; }
+            ++prefills;
+            if (target < 0) target = e.consumer_end;
+            if (e.ckpt_slot >= 0 && e.ckpt_tok >= 0) snaps.push_back((int64_t)e.ctx_len + e.ckpt_tok + 1);
+            const int64_t s = e.ctx_len, end = s + e.n_tokens;
+            std::vector<int64_t> th = consumer_thresholds(c16, target);
+            if (e.consumer_ckpt > end - 1 && e.consumer_ckpt < target) {
+                std::vector<int64_t> g = consumer_ckpt_thresholds(c16, e.consumer_ckpt), h(16);
+                REQUIRE(consumer_row_thresholds(c16, th.data(), g.data(), h.data()));
+                th = h;
+            }
+            std::vector<int32_t> want(16);
+            REQUIRE(consumer_row_starts(c16, th.data(), s, end, want.data()));
+            bool any = false;
+            for (int32_t v : want) any = any || v > 0;
+            int32_t F = 4;
+            while (F < 16 && want[(size_t)F] < e.n_tokens) ++F;
+            any = any || F < 16;
+            if (any && !e.produces_token) {
+                if (!b->consumer_row0) ++bad_row0;
+                else for (int L = 0; L < 16; ++L) bad_row0 += b->consumer_row0[L] != want[(size_t)L];
+            }
+            f.commit_plain();
+        }
+        CHECK_EQ(target, (int64_t)3072);
+        CHECK(prefills >= 4);
+        CHECK_EQ(bad_row0, 0);
+        const BatchBuilder::ConsumerStats& cs = f.sch.consumer_stats();
+        CHECK_EQ(cs.ckpt_insured, (uint64_t)0);
+        if (policy < 0) {
+            CHECK(snaps == std::vector<int64_t>({ 1024, 2048, 3072 }));
+            CHECK_EQ(cs.ckpt_cut, (uint64_t)2);
+            CHECK(cs.ckpt_raised > 0);
+        } else {
+            CHECK(snaps == std::vector<int64_t>({ 3072 }));
+            CHECK_EQ(cs.ckpt_cut, (uint64_t)0);
+        }
+        CHECK(cs.rows_skipped > 0);
+    }
+}
+
+/* ================================================================== end-of-request snapshots */
+/* RADIANCE_EXPERIMENTAL_PREFIX_EORS (Scheduler::eors_): a decode step whose row completes a
+ * position on the resume grid past its prompt snapshots the state there, a prompt ending on the
+ * grid snapshots its end, every prompt takes its tail snapshot, and a step that would carry a
+ * decode snapshot is planned after its predecessor's commit, never issued ahead. */
+namespace {
+/* init reads the switch, so it is set around start() alone; `window` the opt-in a model whose only
+ * state is a sliding window needs beside it (RADIANCE_EXPERIMENTAL_PREFIX_EORS_WINDOW). */
+int eors_start(Fixture& f, bool on, bool window = false) {
+    if (on) setenv("RADIANCE_EXPERIMENTAL_PREFIX_EORS", "1", 1);
+    else unsetenv("RADIANCE_EXPERIMENTAL_PREFIX_EORS");
+    if (window) setenv("RADIANCE_EXPERIMENTAL_PREFIX_EORS_WINDOW", "1", 1);
+    else unsetenv("RADIANCE_EXPERIMENTAL_PREFIX_EORS_WINDOW");
+    log_set_level(Log::Error);
+    const int rc = f.start();
+    unsetenv("RADIANCE_EXPERIMENTAL_PREFIX_EORS");
+    unsetenv("RADIANCE_EXPERIMENTAL_PREFIX_EORS_WINDOW");
+    return rc;
+}
+
+struct EorsRun {
+    std::vector<int64_t> ckpts, eors;   /* every snapshot reserved for the request; the e-o-r ones */
+    std::vector<int64_t> ckpt_rows;     /* the rows a decode snapshot is taken after */
+    int64_t n_computed = 0;
+    int64_t cut_end = -1;               /* the consumer skip's target its prefill carried */
+    int ahead = 0;                      /* steps issued ahead */
+};
+
+/* One request to its end as the engine drives the scheduler: each open step's successor issued
+ * ahead where the scheduler allows it (step_next), the step committed, then the successor promoted
+ * or the next step planned afresh. */
+EorsRun eors_run(Fixture& f, uint64_t id, bool ahead) {
+    EorsRun out;
+    const RadBatch* b = f.sch.step();
+    for (int k = 0; k < 4000 && b; ++k) {
+        for (const StepEntry& e : f.sch.plan().e) {
+            if (e.seq != id) continue;
+            if (e.is_prefill && out.cut_end < 0) out.cut_end = e.consumer_end;
+            if (e.ckpt_slot < 0) continue;
+            const int64_t p = (int64_t)e.ctx_len + e.ckpt_tok + 1;
+            out.ckpts.push_back(p);
+            if (e.ckpt_eors) out.eors.push_back(p);
+            if (!e.is_prefill) out.ckpt_rows.push_back((int64_t)e.ctx_len + e.ckpt_tok);
+        }
+        if (Request* r = f.sch.find(id)) r->speculation_fixed = true;
+        const RadBatch* nb = ahead ? f.sch.step_next() : nullptr;
+        f.commit_plain();
+        if (nb) {
+            ++out.ahead;
+            f.sch.promote_next();
+            b = nb;
+        } else {
+            b = f.sch.step();
+        }
+    }
+    if (const Request* r = f.sch.find(id)) out.n_computed = r->n_computed;
+    return out;
+}
+}  /* namespace */
+
+/* DeepSeek-V4.1's shape at the default interval (2048): a 1,000-token prompt and 40 tokens out
+ * compute 1,039 positions, so the reply crosses the grid at 1008 and 1024, and the prompt's tail
+ * (992, the start of its last chunk) is taken although it is inside the first interval. A prompt
+ * ending on the grid (1008) also snapshots its end. Issued ahead or not, the same snapshots, and
+ * the two decode steps that carry one are the two not issued ahead for it. Off: the ladder alone,
+ * which holds nothing for a prompt inside the first interval. */
+TEST(eors_snapshots_the_reply_on_the_grid_and_every_prompts_tail) {
+    for (const bool ahead : { false, true }) {
+        for (const int n : { 1000, 1008 }) {
+            Fixture f;
+            ds41_fixture(f, 2048);
+            REQUIRE_EQ(eors_start(f, true), RAD_OK);
+            REQUIRE(f.sch.eors_on());
+            const uint64_t id = f.submit(n, 40, 0, true);
+            REQUIRE(id != 0);
+            const EorsRun r = eors_run(f, id, ahead);
+            CHECK_EQ(r.n_computed, (int64_t)n + 39);
+            const std::vector<int64_t> eors = n == 1000 ? std::vector<int64_t>{ 1008, 1024 }
+                                                        : std::vector<int64_t>{ 1008, 1024, 1040 };
+            std::vector<int64_t> all = { 992 };
+            all.insert(all.end(), eors.begin(), eors.end());
+            CHECK(r.eors == eors);
+            CHECK(r.ckpts == all);
+            CHECK(f.pc.reserved_eors == eors);
+            CHECK(f.pc.committed == all);
+            /* A decode snapshot is the state after its step's only row. */
+            for (size_t i = 0; i < r.ckpt_rows.size(); ++i)
+                CHECK_EQ(r.ckpt_rows[i] + 1, r.eors[r.eors.size() - r.ckpt_rows.size() + i]);
+            const SchedMetrics m = f.sch.metrics();
+            CHECK_EQ(m.eors_reserved, (int64_t)eors.size());
+            CHECK_EQ(m.checkpoints_written, (int64_t)all.size());
+            if (ahead) {
+                CHECK(r.ahead > 30);
+                CHECK_EQ(m.eors_ahead_withheld, 2ll);
+            } else {
+                CHECK_EQ(r.ahead, 0);
+                CHECK_EQ(m.eors_ahead_withheld, 0ll);
+            }
+        }
+    }
+    Fixture f;
+    ds41_fixture(f, 2048);
+    REQUIRE_EQ(eors_start(f, false), RAD_OK);
+    CHECK(!f.sch.eors_on());
+    const uint64_t id = f.submit(1000, 40, 0, true);
+    const EorsRun r = eors_run(f, id, true);
+    CHECK_EQ(r.n_computed, 1039ll);
+    CHECK(r.ckpts.empty());
+    CHECK(f.pc.reserved_eors.empty());
+    CHECK_EQ(f.sch.metrics().eors_ahead_withheld, 0ll);
+    CHECK(r.ahead > 30);
+}
+
+/* The grid is whatever exact resumption allows: with chunks split at an interval of 256 inside a
+ * 512-token budget the reply's snapshots fall every 256 tokens, beside the interval ladder and the
+ * tail. Linear state with no chunked scan (DeepSeek-V4.1's shape, at that budget), and a model
+ * whose only state is a sliding window, which takes the switch with its opt-in alone. */
+TEST(eors_snapshots_follow_the_resume_grid) {
+    for (const bool window : { false, true }) {
+        Fixture f;
+        if (window) {
+            exact_fixture(f, 3);
+        } else {
+            f.build(4096, 64, /*max_tok=*/512, 4096, /*windowed=*/true, /*linear=*/true);
+            f.prog.ops.resize(1);          /* no gdn_chunk_scan: a state chunk of 1 */
+            f.kv.snap = { 3 };
+            f.pc.groups = { 0 };
+            f.cfg.prefix_exact = true;
+        }
+        REQUIRE_EQ(eors_start(f, true, window), RAD_OK);
+        REQUIRE(f.sch.eors_on());
+        REQUIRE_EQ(f.sch.geometry().state_chunk, 1);
+        REQUIRE(f.sch.geometry().window_ckpt == window);
+        REQUIRE_EQ(f.sch.geometry().grid, 256);
+        const uint64_t id = f.submit(1000, 300, 0, true);
+        const EorsRun r = eors_run(f, id, true);
+        CHECK_EQ(r.n_computed, 1299ll);
+        CHECK((r.ckpts == std::vector<int64_t>{ 256, 512, 768, 1024, 1280 }));
+        CHECK((r.eors == std::vector<int64_t>{ 1024, 1280 }));
+    }
+}
+
+/* Refused, with the reason, where the exactness argument does not reach: without the exact grid,
+ * without a prefix cache, with speculation, beside exact publish (which keeps out the decode
+ * blocks a snapshot past the prompt stands on), and on a model with no state a snapshot holds.
+ * Refused where it is known to fail: the GDN hybrids, whose recurrent state is scanned in chunks
+ * of 64 (qwen35 and QFN decode a row otherwise than their chunked prefill rounds it), at every
+ * interval, budget and span. A model whose only state is a sliding window takes it only with
+ * RADIANCE_EXPERIMENTAL_PREFIX_EORS_WINDOW=1, periodic snapshots or tip-only. */
+TEST(eors_is_refused_where_its_exactness_is_not_shown) {
+    {
+        Fixture f;
+        ds41_fixture(f, 2048);
+        f.cfg.prefix_exact = false;
+        REQUIRE_EQ(eors_start(f, true), RAD_OK);
+        CHECK(!f.sch.eors_on());
+    }
+    {
+        Fixture f;
+        ds41_fixture(f, 2048);
+        f.cfg.prefix_cache = false;
+        REQUIRE_EQ(eors_start(f, true), RAD_OK);
+        CHECK(!f.sch.eors_on());
+    }
+    {
+        Fixture f;
+        ds41_fixture(f, 2048);
+        f.cfg.n_spec = 2;
+        REQUIRE_EQ(eors_start(f, true), RAD_OK);
+        CHECK(!f.sch.eors_on());
+    }
+    {
+        Fixture f;
+        ds41_fixture(f, 2048);
+        setenv("RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH", "1", 1);
+        const int rc = eors_start(f, true);
+        unsetenv("RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH");
+        REQUIRE_EQ(rc, RAD_OK);
+        CHECK(!f.sch.eors_on());
+    }
+    {
+        Fixture f;
+        exact_fixture(f, 5);                  /* full attention alone */
+        REQUIRE_EQ(eors_start(f, true), RAD_OK);
+        CHECK(!f.sch.eors_on());
+    }
+    /* The GDN hybrid at interval 256 / budget 512, at interval 1024, and with a span of 2: its scan
+     * is chunked, with or without the window opt-in. */
+    for (const int kind : { 0, 1, 2 }) {
+        for (const bool window : { false, true }) {
+            Fixture f;
+            exact_fixture(f, kind);
+            REQUIRE_EQ(eors_start(f, true, window), RAD_OK);
+            CHECK_EQ(f.sch.geometry().state_chunk, 64);
+            CHECK(!f.sch.eors_on());
+        }
+    }
+    /* Sliding-window models, periodic snapshots and tip-only: the opt-in alone takes them. */
+    for (const int kind : { 3, 4 }) {
+        for (const bool window : { false, true }) {
+            Fixture f;
+            exact_fixture(f, kind);
+            REQUIRE_EQ(eors_start(f, true, window), RAD_OK);
+            CHECK(f.sch.geometry().window_ckpt);
+            CHECK(f.sch.eors_on() == window);
+        }
+    }
+    /* Linear state without a chunked scan (DeepSeek-V4.1's) needs no opt-in, and takes none. */
+    for (const bool window : { false, true }) {
+        Fixture f;
+        ds41_fixture(f, 2048);
+        REQUIRE_EQ(eors_start(f, true, window), RAD_OK);
+        CHECK(f.sch.eors_on());
+    }
+    /* The same model with a trunk GEMM resolved to libavx (whose blocking follows the row count, so
+     * a decode row rounds otherwise than in a prefill pass): refused; libr4d's row is taken. */
+    for (const char* lib : { "libavx", "libr4d" }) {
+        static KernelRow row;
+        row.plugin = lib;
+        Fixture f;
+        ds41_fixture(f, 2048);
+        OpInfo gemm;
+        gemm.op = "gemm_nt";
+        Band band;
+        band.dom[RAD_DOMAIN_HOST].row = &row;
+        gemm.bands.push_back(band);
+        f.prog.ops.push_back(gemm);
+        REQUIRE_EQ(eors_start(f, true), RAD_OK);
+        CHECK(f.sch.eors_on() == (std::string(lib) != "libavx"));
+    }
+}
+
+/* A hit that resumes at an end-of-request snapshot is counted as one, with the tokens it reused;
+ * the same hit at a prompt's snapshot is not. */
+TEST(eors_counts_the_hits_that_resume_from_an_end_of_request_snapshot) {
+    for (const bool eors_hit : { true, false }) {
+        Fixture f;
+        ds41_fixture(f, 2048);
+        REQUIRE_EQ(eors_start(f, true), RAD_OK);
+        f.pc.seed(1040);
+        f.pc.lin = 1024;                      /* a reply's snapshot, on the 16-token grid */
+        f.pc.src = 5;
+        f.pc.eors_hit = eors_hit;
+        const uint64_t id = f.submit(1100, 4);
+        REQUIRE(f.sch.step() != nullptr);
+        CHECK_EQ(f.sch.find(id)->n_computed, 1024);
+        CHECK_EQ(f.sch.plan().e[0].ckpt_restore, 5);
+        CHECK_EQ(f.sch.plan().e[0].n_tokens, 16);   /* the cold run's chunk [1024, 1040) */
+        const SchedMetrics m = f.sch.metrics();
+        CHECK_EQ(m.eors_hits, eors_hit ? 1ll : 0ll);
+        CHECK_EQ(m.eors_hit_tokens, eors_hit ? 1024ll : 0ll);
+        CHECK_EQ(m.eors_hit_deepest, eors_hit ? 1024ll : 0ll);
+        CHECK_EQ(m.linear_cached_tokens, 1024ll);
+    }
+}
+
+/* The trim after a publish is trim_except over the chain just published, before the sequence is
+ * freed: the entries the request recomputed rather than adopted stay, which a plain trim takes
+ * once the live sequences hold more than three quarters of the pool, cutting the chain below its
+ * new snapshot (mem_test trim_except_keeps_the_entries_a_resumed_turn_recomputed). Without the
+ * switch, a plain trim. */
+TEST(eors_trim_after_a_publish_spares_the_chain_published) {
+    for (const bool on : { false, true }) {
+        Fixture f;
+        f.build(/*blocks=*/80, 64, /*max_tok=*/16, 4096, /*windowed=*/true, /*linear=*/true);
+        f.prog.ops.resize(1);
+        f.kv.snap = { 3 };
+        f.pc.groups = { 0 };
+        f.cfg.checkpoint_interval = 2048;
+        f.cfg.prefix_exact = true;
+        REQUIRE_EQ(eors_start(f, on), RAD_OK);
+        const uint64_t id = f.submit(1000, 40, 0, true);
+        (void)eors_run(f, id, false);
+        /* 1,039 tokens hold 65 of the 80 blocks at the publish: 5 short of a free quarter. */
+        REQUIRE_EQ(f.pc.published.size(), (size_t)1);
+        CHECK_EQ(f.pc.published[0].n_tokens, 1039ll);
+        if (on) {
+            CHECK(f.pc.trims.empty());
+            REQUIRE_EQ(f.pc.trims_except.size(), (size_t)1);
+            CHECK_EQ(f.pc.trims_except[0].seq, id);
+            CHECK_EQ(f.pc.trims_except[0].n_tokens, 1039ll);
+            CHECK(f.pc.trims_except[0].n > 0);
+        } else {
+            CHECK(f.pc.trims_except.empty());
+            REQUIRE_EQ(f.pc.trims.size(), (size_t)1);
+            CHECK(f.pc.trims[0] > 0);
+        }
+    }
+}
+
+/* With the consumer skip a prompt is cut for the deepest snapshot its idle prefill writes, which
+ * end-of-request snapshots make its tail (992) inside the first interval, or its end on the grid
+ * (1008, where the tail below it is then dropped as incomplete). Decode rows run every layer, so
+ * the reply's snapshots are all written. */
+TEST(eors_with_the_consumer_skip_writes_every_snapshot_past_the_cut) {
+    for (const int n : { 1000, 1008 }) {
+        Fixture f;
+        ds41_fixture(f, 2048);
+        f.prog.consumer = RadConsumerSuffix{ (uint32_t)sizeof(RadConsumerSuffix), 16, 4, 64 };
+        f.cfg.consumer_skip = 1;
+        f.cfg.consumer_skip_ckpt = 0;   /* none below the cut made whole (claude/ds41-csckpt's =0) */
+        f.cfg.max_seqs = 1;
+        REQUIRE_EQ(eors_start(f, true), RAD_OK);
+        REQUIRE(f.sch.consumer_on());
+        REQUIRE(f.sch.eors_on());
+        const uint64_t id = f.submit(n, 40, 0, true);
+        const EorsRun r = eors_run(f, id, true);
+        CHECK_EQ(r.cut_end, n == 1000 ? 992ll : 1008ll);
+        const std::vector<int64_t> want = n == 1000 ? std::vector<int64_t>{ 992, 1008, 1024 }
+                                                    : std::vector<int64_t>{ 1008, 1024, 1040 };
+        CHECK(r.ckpts == want);
+        CHECK_EQ(f.sch.metrics().consumer_ckpt_dropped, n == 1000 ? 0ll : 1ll);
+    }
+}
+
+/* The same under the default complete-checkpoint policy (the band of 512, csckpt): the tail below a
+ * prompt that ends on the grid (992 under 1008) is made whole instead of dropped, so every snapshot
+ * the uncut run writes is written; the cut target and the reply's snapshots are as above. */
+TEST(eors_with_the_consumer_skip_and_the_default_band_drops_nothing) {
+    for (const int n : { 1000, 1008 }) {
+        Fixture f;
+        ds41_fixture(f, 2048);
+        f.prog.consumer = RadConsumerSuffix{ (uint32_t)sizeof(RadConsumerSuffix), 16, 4, 64 };
+        f.cfg.consumer_skip = 1;
+        f.cfg.max_seqs = 1;
+        unsetenv("RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP_CKPT");
+        REQUIRE_EQ(eors_start(f, true), RAD_OK);
+        REQUIRE(f.sch.consumer_on());
+        REQUIRE(f.sch.eors_on());
+        CHECK_EQ(f.sch.consumer_ckpt_policy(), Scheduler::kConsumerSkipCkptDefault);
+        const uint64_t id = f.submit(n, 40, 0, true);
+        const EorsRun r = eors_run(f, id, true);
+        CHECK_EQ(r.cut_end, n == 1000 ? 992ll : 1008ll);
+        const std::vector<int64_t> want = n == 1000 ? std::vector<int64_t>{ 992, 1008, 1024 }
+                                                    : std::vector<int64_t>{ 992, 1008, 1024, 1040 };
+        CHECK(r.ckpts == want);
+        CHECK_EQ(f.sch.metrics().consumer_ckpt_dropped, 0ll);
+        CHECK_EQ(f.sch.metrics().consumer_ckpt_whole, n == 1000 ? 0ll : 1ll);
+        CHECK_EQ(f.sch.consumer_stats().ckpt_insured, (uint64_t)0);
     }
 }

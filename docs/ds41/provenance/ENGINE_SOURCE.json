@@ -1,15 +1,15 @@
 {
-  "commit": "d243fba88646da9ab2343965675318466919ce43",
-  "tree": "54ef641e4312a4ab8a67cf8e22ae596f8fbd8c68",
+  "commit": "4ec552dfc747bf09300d151aad32d7fdc404e49b",
+  "tree": "5373e7784f09cdf9c50490efaa60a8c138cf059d",
   "branch": "claude/ds41-decode-impl",
-  "subject": "README: the futex wake in the recommended configuration",
-  "committed_utc": "2026-10-30T09:24:27Z",
-  "files": 1428,
-  "bytes": 56050835,
+  "subject": "README: large-chunk prefill with the balanced gemv in the recommended configuration",
+  "committed_utc": "2026-10-30T15:19:28Z",
+  "files": 1442,
+  "bytes": 56758612,
   "executable_files": 57,
   "pins": "docs/ds41/provenance/ENGINE_SOURCE_PINS.json",
-  "pins_sha256": "91571b5bcdcc0bbc2b97a562aef0301f2469112a2662ca6232565d3761d60a4a",
-  "export": "git archive --format=tar d243fba88646da9ab2343965675318466919ce43 (tracked files only, modes kept)",
+  "pins_sha256": "bc304eb478445b2b9f8d529606445d9aa7a39dd4a9e15029636a4829d8b73dc1",
+  "export": "git archive --format=tar 4ec552dfc747bf09300d151aad32d7fdc404e49b (tracked files only, modes kept)",
   "upstream": {
     "repository": "https://codeberg.org/StillDeadcode/radiance",
     "note": "Radiance upstream plus the deepseek41 architecture work of its pull request 266; the commits after them are this work (ds41 RAM cache and CPU experts)",
@@ -17,17 +17,17 @@
       "upstream main as fetched (origin/main)": {
         "commit": "6c33ee4e1267fc0a016fc0a4a333b0221326a1be",
         "contained": true,
-        "commits_after": 285
+        "commits_after": 328
       },
       "newest upstream commit contained (review-upstream/main)": {
         "commit": "4374bea1c4bca1c00c59890d10b799a274d5e8b4",
         "contained": true,
-        "commits_after": 252
+        "commits_after": 295
       },
       "pull request 266, deepseek41 (origin/pr-266)": {
         "commit": "bd65d4e58f7c4233de09ad5245a82c9510eb8962",
         "contained": true,
-        "commits_after": 371
+        "commits_after": 414
       }
     }
   }

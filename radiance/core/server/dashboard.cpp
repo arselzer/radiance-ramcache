@@ -312,6 +312,17 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
         /* RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH: computed tokens left unpublished, past the
          * chunks an idle cold prefill cuts alike. 0 without the switch. */
         o["publish_held_tokens"] = (double)m.prefix_publish_held_tokens;
+        /* RADIANCE_EXPERIMENTAL_PREFIX_EORS: end-of-request snapshots reserved and committed,
+         * steps not issued ahead for one, and the admissions that resumed from one (their tokens
+         * reused, the deepest); the snapshot store's occupancy now and at most, what it gave up by
+         * session (..._SESSION_LRU), and the entries a publish's trim kept on the chain it published
+         * that a plain trim would have taken (the ones the request recomputed). */
+        o["eors"] = { { "reserved", m.eors_reserved }, { "committed", m.eors_committed },
+                      { "ahead_withheld", m.eors_ahead_withheld }, { "hits", m.eors_hits },
+                      { "hit_tokens", m.eors_hit_tokens }, { "hit_deepest", m.eors_hit_deepest } };
+        o["snapshot_store"] = { { "held", m.store_held }, { "peak", m.store_peak },
+                                { "session_lru", m.store_session_lru },
+                                { "trim_spared", m.trim_spared } };
         /* Why snapshots went and why hits reused nothing: on a hybrid model these say why a
          * long prompt was prefilled again. `hit_cut_tokens` is the checkpoint shortfall,
          * prompt tokens the attention cache held and admission computed again. */
@@ -356,6 +367,23 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
             pos.push_back(std::move(p));
         }
         o["draft_positions"] = std::move(pos);
+        /* RADIANCE_EXPERIMENTAL_DS41_DSPARK_GATE (sched/draft_gate.h): only while it is on. */
+        if (m.draft_gate.on) {
+            const DraftGateStats& g = m.draft_gate;
+            json k = json::object();
+            const char* names[2][2] = { { "plain", "draft_only" }, { "verify_only", "verify_draft" } };
+            for (int v = 0; v < 2; ++v)
+                for (int d = 0; d < 2; ++d)
+                    k[names[v][d]] = { { "steps", g.step_n[v][d] }, { "ms", g.step_ms(v, d) } };
+            o["draft_gate"] = { { "threshold", g.threshold }, { "window", g.window },
+                                { "probe", g.probe }, { "seqs", g.seqs }, { "asks", g.asks },
+                                { "warm", g.warm }, { "open", g.open }, { "probes", g.probes },
+                                { "gated", g.gated }, { "closes", g.closes },
+                                { "reopens", g.reopens }, { "verifies", g.verifies },
+                                { "verified", g.verified }, { "accepted", g.accepted },
+                                { "probe_verified", g.probe_verified },
+                                { "probe_accepted", g.probe_accepted }, { "steps", std::move(k) } };
+        }
 
         /* Live request table: counters and timestamps. `decode_tps` is the request's own average
          * since its first token. */

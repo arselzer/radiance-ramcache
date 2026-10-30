@@ -7927,3 +7927,173 @@ TEST(a_streamed_op_exists_only_for_a_capable_architecture_and_a_ring) {
     CHECK(!kvstream_op_gated(ctx, "kv_store"));
     CHECK(!kvstream_op_gated(ctx, "attn_paged"));
 }
+
+/* ================================================================== end-of-request snapshots
+ *
+ * RADIANCE_EXPERIMENTAL_PREFIX_EORS: the scheduler reserves a decode step's snapshot through
+ * PCBinding::reserve_eors_checkpoint, keyed like any other by the chain over prompt ++ output; the
+ * cache counts it apart, the next turn's lookup reaches it through the reply and says so
+ * (CacheHit::ckpt_eors), and the trim after the publish, before the sequence is freed, keeps the
+ * entries of that chain the request recomputed rather than adopted. */
+TEST(an_end_of_request_snapshot_is_counted_and_the_next_turn_resumes_there) {
+    Fixture f;
+    REQUIRE_EQ(f.build(/*with_linear=*/true, /*ckpt_slots=*/4), RAD_OK);
+    PCBinding<PrefixCache> b(&f.pc);
+    /* A 300-token prompt and 40 tokens out: decode computed 339, its last grid snapshot is 336. */
+    const Request r = turn(7, tok_run(100, 300), tok_run(9000, 40));
+    CHECK_OK(f.kv.add_sequence(r.id));
+    CHECK_OK(f.kv.ensure(r.id, 339));
+    int32_t ladder = -1, tip = -1;
+    CHECK_OK(b.reserve_checkpoint(r, 288, &ladder));        /* the prompt's tail */
+    b.commit_checkpoint(r, 288);
+    CHECK_OK(b.reserve_eors_checkpoint(r, 336, &tip));      /* the reply's last grid position */
+    b.commit_checkpoint(r, 336);
+    std::vector<std::vector<int32_t>> bt;
+    for (int32_t g : f.pc.cached_groups()) bt.push_back(f.kv.block_table(r.id, g));
+    CHECK_OK(b.insert(r, bt, 339));
+    f.kv.free_sequence(r.id);
+    CHECK_EQ(f.pc.stats().ckpt_eors, 1ll);
+    CHECK_EQ(b.store_counts().eors, 1ll);
+    CHECK_EQ(b.store_counts().held, 2ll);
+    CHECK_EQ(b.store_counts().peak, 2ll);
+
+    /* The next turn: the reply sent back and a new message. */
+    const Request next = turn(8, cat(cat(r.prompt, r.output), tok_run(20000, 50)), {});
+    f.pc.begin_step();
+    const CacheHit h = b.lookup(next, nullptr, nullptr);
+    CHECK_EQ(h.n_attn_tokens, 336);
+    CHECK_EQ(h.n_linear_tokens, 336);
+    CHECK_EQ(h.checkpoint_slot, tip);
+    CHECK(h.ckpt_eors);
+    CHECK_EQ(f.pc.stats().ckpt_eors_hits, 1ll);
+    CHECK_EQ(b.store_counts().eors_hits, 1ll);
+    /* A turn that rewrote the reply resumes at the prompt's tail, which is not one. */
+    const Request edit = turn(9, cat(cat(r.prompt, tok_run(30000, 40)), tok_run(20000, 50)), {});
+    f.pc.begin_step();
+    const CacheHit e = b.lookup(edit, nullptr, nullptr);
+    CHECK_EQ(e.n_linear_tokens, 288);
+    CHECK_EQ(e.checkpoint_slot, ladder);
+    CHECK(!e.ckpt_eors);
+    CHECK_EQ(f.pc.stats().ckpt_eors_hits, 1ll);
+}
+
+/* trim_except runs where close_request calls it: before the closing request frees its sequence.
+ * Every block that sequence holds is safe from any trim then (shared with a live sequence), so what
+ * a plain trim can take of the chain just published is the entries the request recomputed rather
+ * than adopted. Here turn 2 resumes at turn 1's snapshot at 160 although the cache holds turn 1's
+ * chain to 192: it recomputes [160, 192) into its own blocks, and the cache keeps the first-published
+ * copies, which nothing else holds. A trim asking for more than the idle conversation beside it
+ * has takes them, cutting the chain at 160 below turn 2's end; trim_except keeps them and counts
+ * them. Once turn 2's sequence is freed nothing protects the conversation: a later trim takes its
+ * end first, as it would take any idle conversation's. */
+TEST(trim_except_keeps_the_entries_a_resumed_turn_recomputed) {
+    for (const bool except : { false, true }) {
+        Fixture f;
+        REQUIRE_EQ(f.build(/*with_linear=*/true, /*ckpt_slots=*/4), RAD_OK);
+        const auto other = tok_run(30000, 96);      /* an idle conversation: 6 entries */
+        publish(f, 9, other, 96);
+        f.kv.free_sequence(9);
+        const auto t1 = tok_run(5000, 192);         /* turn 1: 12 entries, its snapshot at 160 */
+        publish(f, 1, t1, 192);
+        f.kv.free_sequence(1);
+        (void)ckpt_at(f, 1, chain_of(t1), 160);
+        std::vector<int32_t> t2 = t1;               /* turn 2: turn 1 and 128 tokens more */
+        for (int32_t t : tok_run(8000, 128)) t2.push_back(t);
+        std::vector<std::vector<int32_t>> found;
+        f.pc.begin_step();
+        const CacheHit h = f.pc.lookup(t2, {}, &found);
+        CHECK_EQ(h.n_attn_tokens, 192);
+        REQUIRE_EQ(h.n_linear_tokens, 160);
+        REQUIRE_EQ(found.size(), (size_t)1);
+        found[0].resize(10);                         /* it adopts the 10 entries below 160 */
+        CHECK_OK(f.kv.add_sequence(2));
+        CHECK_OK(f.kv.adopt(2, f.pc.cached_groups()[0], found[0], 160));
+        CHECK_OK(f.kv.ensure(2, 320));
+        std::vector<std::vector<int32_t>> bt;
+        for (int32_t g : f.pc.cached_groups()) bt.push_back(f.kv.block_table(2, g));
+        CHECK_OK(f.pc.insert(2, t2, {}, bt, 320));
+        /* The close's trim, before the free, short by more than the idle conversation's 6. */
+        const int64_t took = except ? f.pc.trim_except(t2, {}, 320, 10) : f.pc.trim(10);
+        CHECK_EQ(took, except ? 6ll : 8ll);
+        CHECK_EQ(f.pc.stats().trim_spared, except ? 2ll : 0ll);
+        f.kv.free_sequence(2);
+        std::vector<int32_t> t3 = t2;               /* turn 3 */
+        for (int32_t t : tok_run(12000, 32)) t3.push_back(t);
+        f.pc.begin_step();
+        CHECK_EQ(f.pc.lookup(t3, {}).n_attn_tokens, except ? 320 : 160);
+        CHECK_EQ(f.pc.lookup(other, {}).n_attn_tokens, 0);
+        if (except) {
+            /* Idle now: another session's trim takes the conversation's end first. */
+            CHECK_EQ(f.pc.trim(2), 2ll);
+            f.pc.begin_step();
+            CHECK_EQ(f.pc.lookup(t3, {}).n_attn_tokens, 288);
+            CHECK_EQ(f.pc.stats().trim_spared, 2ll);
+        }
+    }
+}
+
+/* With the host tier on, a trim drops only entries whose copy has landed, so trim_except counts as
+ * spared only those a plain trim would have dropped: none while the copies are in flight. */
+TEST(trim_except_counts_only_what_a_plain_trim_would_take) {
+    TierFixture x;
+    CHECK_OK(x.build());
+    const auto b = tok_run(9600, 336);
+    publish(x.f, 2, b, 320);
+    x.f.kv.free_sequence(2);                        /* no copy yet */
+    CHECK_EQ(x.f.pc.trim_except(b, {}, 320, 1000), 0);
+    CHECK_EQ(x.f.pc.stats().trim_spared, 0ll);
+    copy_now(x.t);                                  /* the copies land */
+    CHECK_EQ(x.f.pc.trim_except(b, {}, 320, 5), 0);
+    CHECK_EQ(x.f.pc.stats().trim_spared, 5ll);
+    CHECK_EQ(x.f.pc.lookup(b, {}).n_attn_tokens, 320);
+    CHECK_EQ(x.f.pc.trim(5), 5);                    /* what a plain trim drops */
+}
+
+/* RADIANCE_EXPERIMENTAL_PREFIX_SESSION_LRU: once retention has run, a full store gives up the least
+ * recently used session's snapshots, its shallowest first and its tip last, before any snapshot of
+ * a session used since. Without it the least recently used snapshot of any session goes: here the
+ * busy session's anchor, older than the idle session's whole ladder. */
+TEST(a_full_store_by_session_gives_up_the_idle_conversation_first) {
+    for (const bool by_session : { false, true }) {
+        Fixture f;
+        CHECK_OK(f.build(/*with_linear=*/true, /*ckpt_slots=*/4));
+        f.pc.set_policy(std::make_unique<KeepAll>());
+        f.pc.set_session_lru(by_session);
+        const auto a = tok_run(5151, 16 * 9);
+        const auto c = tok_run(7171, 16 * 9);
+        publish(f, 1, a, 16 * 8);
+        publish(f, 2, c, 16 * 8);
+        const std::vector<BlockHash> ha = chain_of(a), hc = chain_of(c);
+        ckpt_at(f, 1, ha, 64);                /* session 1's anchor, the oldest snapshot */
+        ckpt_at(f, 2, hc, 64);                /* session 2's ladder */
+        ckpt_at(f, 2, hc, 128);
+        ckpt_at(f, 1, ha, 128);               /* session 1's tip */
+        f.pc.begin_step();
+        REQUIRE_EQ(f.pc.lookup(a, {}).n_linear_tokens, 128);   /* session 1 is used again */
+        f.pc.begin_step();
+        BlockHash n1 = ha[3]; n1.lo ^= 0x55ull;
+        int32_t s = -1;
+        CHECK_OK(f.pc.reserve_checkpoint(3, 64, n1, &s));
+        if (by_session) {
+            CHECK(f.pc.checkpoints(1) == (std::vector<int64_t>{ 64, 128 }));
+            CHECK(f.pc.checkpoints(2) == (std::vector<int64_t>{ 128 }));   /* shallowest first */
+            CHECK_EQ(f.pc.stats().ckpt_session_lru, 1ll);
+        } else {
+            CHECK(f.pc.checkpoints(1) == (std::vector<int64_t>{ 128 }));
+            CHECK(f.pc.checkpoints(2) == (std::vector<int64_t>{ 64, 128 }));
+            CHECK_EQ(f.pc.stats().ckpt_session_lru, 0ll);
+        }
+        /* One more: by session, session 2's tip goes before anything of session 1. */
+        f.pc.begin_step();
+        BlockHash n2 = ha[3]; n2.lo ^= 0x56ull;
+        CHECK_OK(f.pc.reserve_checkpoint(4, 64, n2, &s));
+        if (by_session) {
+            CHECK(f.pc.checkpoints(1) == (std::vector<int64_t>{ 64, 128 }));
+            CHECK(f.pc.checkpoints(2).empty());
+        } else {
+            CHECK(f.pc.checkpoints(2) == (std::vector<int64_t>{ 128 }));
+        }
+        CHECK_EQ(f.pc.stats().ckpt_lru, 2ll);
+        CHECK_EQ(f.pc.stats().ckpt_peak, 4ll);
+    }
+}

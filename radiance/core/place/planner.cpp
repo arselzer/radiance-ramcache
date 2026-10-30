@@ -10,6 +10,7 @@
  * RadDeviceProps::arch, never on index or capacity.
  */
 #include "planner.h"
+#include "draft_vram.h"
 #include "dspark_native_scope.h"
 #include <array>
 
@@ -657,13 +658,18 @@ int Planner::assign_layer_offload(Plan* p) {
  * routing from the first dispatch.
  */
 int Planner::assign_expert_tiered(Plan* p) {
-    int64_t fixed = 0;
+    /* RADIANCE_EXPERIMENTAL_DS41_DRAFT_VRAM: a hot draft expert placed before the strategy is a
+     * static VRAM resident, charged like a dense unit, so the fill below has that much less room
+     * and gives up as many residents. Zero without the switch. */
+    int64_t fixed = 0, draft_fixed = 0;
     for (MoveUnit& mu : p->units) {
+        if (mu.draft_vram) { draft_fixed += mu.slot_bytes; continue; }
         if (mu.preplaced()) continue;
         mu.tier = Tier::VRAM;
         mu.site = Site::Device;
         if (mu.access != RAD_ACCESS_CONDITIONAL) fixed += mu.slot_bytes;
     }
+    fixed += draft_fixed;
 
     if (p->vram_budget > 0 && fixed > p->vram_budget) {
         /* The dense part alone does not fit: delegate to layer offload rather than duplicating
@@ -672,7 +678,7 @@ int Planner::assign_expert_tiered(Plan* p) {
                  "falling through to layer offload for them",
                  humanb(fixed).c_str(), humanb(p->vram_budget).c_str());
         RAD_TRY(assign_layer_offload(p));
-        fixed = 0;
+        fixed = draft_fixed;
         for (const MoveUnit& mu : p->units)
             if (mu.access != RAD_ACCESS_CONDITIONAL && mu.tier == Tier::VRAM) fixed += mu.slot_bytes;
     }
@@ -1070,7 +1076,9 @@ void Planner::finish(const Program& prog, Plan* p) {
                 pl.vram_pk_cap = pk_cap_[w];
                 pl.bytes = pl.vram_bytes;
             }
-            p->totals.bytes[(int)mu.tier] += pl.bytes;
+            /* A parked draft expert (RADIANCE_EXPERIMENTAL_DS41_DRAFT_VRAM) is held nowhere: its
+             * bytes stay in Plan::draft_parked_bytes, not the mapped total. */
+            if (!mu.draft_parked) p->totals.bytes[(int)mu.tier] += pl.bytes;
             if (mu.host_forced) p->forced_host_used += pl.bytes;
         }
     }
@@ -1262,7 +1270,7 @@ void Planner::pin_hot(const Config& cfg, Plan* p) const {
     p->profile_units = (int64_t)shares.size();
     int64_t pinned = 0, left = 0;
     for (MoveUnit& mu : p->units) {
-        if (mu.expert < 0 || mu.tier == Tier::Mapped || mu.host_forced) continue;
+        if (mu.expert < 0 || mu.tier == Tier::Mapped || mu.host_forced || mu.draft_vram) continue;
         if (mu.profile_share <= threshold) continue;
         if (mu.tier != Tier::VRAM) { ++left; continue; }
         mu.pinned = true;
@@ -1329,6 +1337,141 @@ int Planner::pin_draft_bank_experts(const Program& prog, const Config& cfg, Plan
     RAD_INFO("draft-bank experts: %lld rank-local pairs (%s) in the existing pinned pool; "
              "DEVICE zero-copy, immutable; no automatic budget growth", (long long)count,
              humanb(need).c_str());
+    return RAD_OK;
+}
+
+/* RADIANCE_EXPERIMENTAL_DS41_DRAFT_VRAM (draft_vram.h), in place of pin_draft_bank_experts: the same
+ * exact native bank, but the rank's hot draft experts (PlannerInput::draft_vram, N a stage) become
+ * static VRAM residents and every other draft expert is parked on the mapped tier with no class,
+ * slot or pool. Nothing is pinned in the host pool. The hot units are preplaced, so no strategy moves
+ * them, and assign_expert_tiered charges their slots beside the dense units: the fill gives up as
+ * many trunk residents (a pair is a trunk expert's size). Refused, with nothing changed, unless the
+ * declaration is the native bank at EP4 under expert_tiered and the rank keeps exactly N of every
+ * stage. */
+int Planner::place_draft_bank_vram(const Program& prog, const Config& cfg, Plan* p) const {
+    const DraftVramRank& dv = *in_.draft_vram;
+    if (cfg.draft_bank_expert_placement != "host" || cfg.draft_bank.empty() || in_.host_backend ||
+        in_.world_size != 4 || in_.rank != prog.ctx.rank || !dspark_native_program_scope(prog)) {
+        RAD_ERR("RADIANCE_EXPERIMENTAL_DS41_DRAFT_VRAM needs --draft-bank with --draft-bank-expert-placement "
+                "host (whose pinned pool it replaces) and the exact native DSpark EP4 DEVICE declaration");
+        return RAD_E_UNSUPPORTED;
+    }
+    if (p->strategy != Strategy::ExpertTiered) {
+        RAD_ERR("RADIANCE_EXPERIMENTAL_DS41_DRAFT_VRAM charges the hot draft experts to the expert fill, "
+                "which only --placement expert_tiered runs (this plan: %s)", strategy_name(p->strategy));
+        return RAD_E_UNSUPPORTED;
+    }
+    if (dv.n < 1 || dv.n > kDraftRankExperts || dv.resident.size() != (size_t)kDraftStages)
+        return RAD_E_INVAL;
+    for (const auto& st : dv.resident) if (st.size() != (size_t)kDraftRankExperts) return RAD_E_INVAL;
+    std::array<int, kDraftStages> kept{};
+    std::array<std::array<bool, kDraftRankExperts>, kDraftStages> seen{};
+    int64_t count = 0;
+    for (const MoveUnit& mu : p->units) {
+        if (mu.layer < kDraftFirstLayer || mu.expert < 0) continue;
+        if (mu.layer >= kDraftFirstLayer + kDraftStages || mu.expert >= kDraftRankExperts ||
+            mu.weights.size() != 2 || mu.tier == Tier::Mapped || mu.host_forced || mu.slot_bytes <= 0 ||
+            mu.slab_class < 0)
+            return RAD_E_UNSUPPORTED;
+        unsigned slots = 0;
+        for (rad_weight h : mu.weights) {
+            if (!h || size_t(h) >= prog.weights.size() || h >= device_ok_.size() ||
+                !device_ok_[h] || !dspark_native_weight_scope(prog.weights[h]))
+                return RAD_E_UNSUPPORTED;
+            const auto& g = prog.weights[h].decl.group;
+            if (g.layer != mu.layer || g.expert != mu.expert || (slots & (1u << g.slot)))
+                return RAD_E_UNSUPPORTED;
+            slots |= 1u << g.slot;
+        }
+        if (slots != 3) return RAD_E_UNSUPPORTED;
+        const size_t s = size_t(mu.layer - kDraftFirstLayer), e = size_t(mu.expert);
+        if (seen[s][e]) return RAD_E_UNSUPPORTED;
+        seen[s][e] = true;
+        kept[s] += dv.resident[s][e] ? 1 : 0;
+        ++count;
+    }
+    if (count != kDraftStages * kDraftRankExperts) return RAD_E_UNSUPPORTED;
+    for (int s = 0; s < kDraftStages; ++s)
+        if (kept[(size_t)s] != dv.n) {
+            RAD_ERR("RADIANCE_EXPERIMENTAL_DS41_DRAFT_VRAM: rank %d keeps %d experts of stage %d, not the %d "
+                    "asked for", in_.rank, kept[(size_t)s], kDraftFirstLayer + s, dv.n);
+            return RAD_E_INVAL;
+        }
+    int64_t hot = 0, hot_bytes = 0, parked = 0, parked_bytes = 0;
+    for (MoveUnit& mu : p->units) {
+        if (mu.layer < kDraftFirstLayer || mu.expert < 0) continue;
+        if (dv.resident[size_t(mu.layer - kDraftFirstLayer)][size_t(mu.expert)]) {
+            mu.tier = Tier::VRAM;
+            mu.site = Site::Device;
+            mu.movable = false;
+            mu.draft_vram = true;
+            mu.reason = "RADIANCE_EXPERIMENTAL_DS41_DRAFT_VRAM: a hot draft-bank expert, static in VRAM";
+            ++hot;
+            hot_bytes += mu.slot_bytes;
+        } else {
+            /* As pin_mapped and build_classes leave a mapped unit: no class, no slot, no budget. */
+            --p->classes[(size_t)mu.slab_class].n_units;
+            mu.slab_class = -1;
+            mu.slot_bytes = 0;
+            mu.tier = Tier::Mapped;
+            mu.site = Site::Device;
+            mu.movable = false;
+            mu.draft_parked = true;
+            mu.reason = "RADIANCE_EXPERIMENTAL_DS41_DRAFT_VRAM: a draft-bank expert outside the hot set, "
+                        "never loaded; masked out of the draft router";
+            ++parked;
+            parked_bytes += mu.bytes;
+        }
+    }
+    p->draft_vram_units = hot;
+    p->draft_vram_bytes = hot_bytes;
+    p->draft_parked_units = parked;
+    p->draft_parked_bytes = parked_bytes;
+    RAD_INFO("draft-bank experts: RADIANCE_EXPERIMENTAL_DS41_DRAFT_VRAM=%d: rank %d holds %lld hot pairs "
+             "static in VRAM (%s, charged to the weights pool before the expert fill), %lld parked and "
+             "never loaded (%s); nothing in the pinned pool (in place of --draft-bank-expert-placement "
+             "host)", dv.n, in_.rank, (long long)hot, humanb(hot_bytes).c_str(), (long long)parked,
+             humanb(parked_bytes).c_str());
+    return RAD_OK;
+}
+
+int Planner::check_draft_bank_vram(Plan* p) const {
+    const DraftVramRank& dv = *in_.draft_vram;
+    std::array<int, kDraftStages> hot{}, parked{};
+    std::array<std::array<bool, kDraftRankExperts>, kDraftStages> seen{};
+    int64_t bytes = 0;
+    bool valid = true;
+    for (const MoveUnit& mu : p->units) {
+        if (mu.layer < kDraftFirstLayer || mu.expert < 0) continue;
+        if (mu.layer >= kDraftFirstLayer + kDraftStages || mu.expert >= kDraftRankExperts) { valid = false; continue; }
+        const size_t s = size_t(mu.layer - kDraftFirstLayer), e = size_t(mu.expert);
+        if (seen[s][e]) valid = false;
+        seen[s][e] = true;
+        if (dv.resident[s][e]) {
+            valid = valid && mu.draft_vram && !mu.draft_parked && mu.tier == Tier::VRAM &&
+                    mu.site == Site::Device && !mu.movable && mu.slab_slot == -1 && !mu.host_forced &&
+                    mu.slot_bytes == kDraftPairBytes && mu.weights.size() == 2;
+            ++hot[s];
+            bytes += mu.slot_bytes;
+        } else {
+            valid = valid && mu.draft_parked && !mu.draft_vram && mu.tier == Tier::Mapped &&
+                    mu.slab_class < 0 && mu.slot_bytes == 0 && !mu.movable && !mu.host_forced;
+            ++parked[s];
+        }
+    }
+    for (int s = 0; s < kDraftStages; ++s) {
+        valid = valid && hot[(size_t)s] == dv.n && hot[(size_t)s] + parked[(size_t)s] == kDraftRankExperts;
+        for (bool present : seen[(size_t)s]) valid = valid && present;
+    }
+    if (!valid || bytes != p->draft_vram_bytes) {
+        RAD_ERR("draft VRAM final placement: rank=%d refused after assignment; expected %d static VRAM pairs "
+                "and %d parked a stage", p->rank, dv.n, kDraftRankExperts - dv.n);
+        return RAD_E_STATE;
+    }
+    RAD_INFO("draft VRAM final placement: rank=%d strategy=%s hot=%d/%d/%d (static VRAM, %lld bytes) "
+             "parked=%d/%d/%d (no slot, no pool); checked after assignment", p->rank,
+             strategy_name(p->strategy), hot[0], hot[1], hot[2], (long long)bytes, parked[0], parked[1],
+             parked[2]);
     return RAD_OK;
 }
 
@@ -1423,8 +1566,11 @@ int Planner::plan(Plan* out) {
     /* Not RAD_TRY: a refusal still leaves `out` filled in far enough to print. The pins ran above,
      * once slot_bytes was known. */
 
-    // Custom bank mode uses only the remaining explicitly budgeted host pool.
-    if (hrc >= 0) hrc = pin_draft_bank_experts(prog, cfg, out);
+    // Custom bank mode uses only the remaining explicitly budgeted host pool, or with
+    // RADIANCE_EXPERIMENTAL_DS41_DRAFT_VRAM the hot set in VRAM instead and nothing pinned.
+    const bool draft_vram = in_.draft_vram && in_.draft_vram->n > 0;
+    if (hrc >= 0) hrc = draft_vram ? place_draft_bank_vram(prog, cfg, out)
+                                   : pin_draft_bank_experts(prog, cfg, out);
     int rc = assign(out);
     /* The staging was sized for routed units only: a fill that still put another unit on the file
      * tier needs the full reserve, so refuse as the reserve above would have. */
@@ -1444,7 +1590,9 @@ int Planner::plan(Plan* out) {
     //The preassignment pin log is an intent, not final-residency evidence. Refuse
     //a successful strategy that has moved any already-charged native bank head.
     //Keep the original error class when pinning or the strategy itself refused.
-    if (hrc >= 0 && rc >= 0 && cfg.draft_bank_expert_placement == "host") {
+    if (hrc >= 0 && rc >= 0 && draft_vram) {
+        if (const int vc = check_draft_bank_vram(out); vc < 0) return vc;
+    } else if (hrc >= 0 && rc >= 0 && cfg.draft_bank_expert_placement == "host") {
         constexpr int64_t pair_bytes = 18800640;
         int64_t heads = 0, bytes = 0;
         bool valid = true;
@@ -1603,6 +1751,11 @@ std::string Plan::report(const Program& prog) const {
     if (draft_host_bytes)
         s += fmt("  drafter       %12s  %12s   (--draft-expert-placement host, pinned, read in place)\n",
                  "-", humanb(draft_host_bytes).c_str());
+    if (draft_vram_units || draft_parked_units)
+        s += fmt("  draft vram    %12s  %12s   (RADIANCE_EXPERIMENTAL_DS41_DRAFT_VRAM: %lld hot draft experts "
+                 "static in VRAM, in `vram weights` above; %lld parked, %s never loaded)\n", "-",
+                 humanb(draft_vram_bytes).c_str(), (long long)draft_vram_units,
+                 (long long)draft_parked_units, humanb(draft_parked_bytes).c_str());
     if (pinned_units)
         s += fmt("  pinned hot    %12s  %12lld   (--expert-pin-top: resident, heat never demotes them, "
                  "share above %.4g of %lld)\n", "-", (long long)pinned_units, (double)pin_threshold,

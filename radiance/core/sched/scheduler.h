@@ -72,11 +72,19 @@ struct SchedReq {
         draft_filled = 0;
         draft_lo     = 0;
         draft_hi     = 0;
+        dgate_held   = false;
     }
 
     /* The adaptive draft window's estimate (--draft-window adaptive, draft.h). Not reset by
      * drafter_reset(): it describes the text, which preemption does not change. */
     DraftAdapt adapt;
+    /* RADIANCE_EXPERIMENTAL_DS41_DSPARK_GATE (draft_gate.h): its last verifies and counters.
+     * Likewise kept through preemption; a new request starts it over. */
+    DraftGateSeq dgate;
+    /* The gate declined this sequence's draft in the step just run (block_begin), so the next
+     * step verifies nothing for it: the prompt-lookup fallback, which fills an empty proposal in
+     * step(), does not stand in. Consumed by the next step's planning. */
+    bool       dgate_held = false;
     /* The proposal the step being planned carries came from prompt lookup (StepEntry::ngram). */
     bool       draft_ngram = false;
     /* Prompt lookup's index over prompt ++ output (ngram.h), built at the sequence's first lookup
@@ -107,8 +115,15 @@ struct SchedReq {
     /* The consumer skip's target for this prefill (consumer_skip.h): the first position whose
      * state must be exact, its end or the deepest checkpoint below it; 0 when its prefill is not
      * cut. Set at each admission (Scheduler::consumer_target), carried by its prefill entries
-     * (StepEntry::consumer_end); a checkpoint below it is not written. */
+     * (StepEntry::consumer_end); a checkpoint below it is written only if it is one of
+     * `consumer_ckpts`. */
     int64_t  consumer_end = 0;
+    /* The checkpoints below that target its cut makes whole (consumer_skip.h, "complete
+     * checkpoints"), ascending: those its idle prefill writes that the policy keeps
+     * (RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP_CKPT). Set with consumer_end; each prefill entry
+     * carries the first at or after its chunk's end (StepEntry::consumer_ckpt). The slot keeps the
+     * capacity. */
+    std::vector<int64_t> consumer_ckpts;
 
     /* The checkpoint the linear state is seeded from on admission, handed to the sequence's first
      * entry as StepEntry::ckpt_restore. Never held across a step: nothing pins a checkpoint slot,
@@ -121,6 +136,9 @@ struct SchedReq {
      * fit would inflate the prompt and hit totals. */
     int32_t  hit_attn = 0;
     bool     hit_owed = false;
+    /* That hit resumes from an end-of-request snapshot (CacheHit::ckpt_eors), for the counters
+     * (SchedMetrics::eors_hits). */
+    bool     hit_eors = false;
     /* Why that hit was cut, for the counters (SchedMetrics::hit_cut_*): to nothing, or to a
      * snapshot more than an interval below it. */
     enum class HitCut : uint8_t { None, NoSnapshot, Window, Adopt, ResumedBelow };
@@ -454,6 +472,12 @@ public:
     const RadBatch* block_query(int step);
     void block_end();
 
+    /* RADIANCE_EXPERIMENTAL_DS41_DSPARK_GATE: the shutdown report. One line for every sequence
+     * and the decode steps by kind, then a line for each of the last kGateRecs sequences that
+     * finished (gated steps, probes, acceptance). Nothing while the gate is off. */
+    void draft_gate_report() const;
+    const DraftGateCfg&  draft_gate() const { return dgate_cfg_; }
+
     const StepPlan&      plan() const { return plan_; }
     const ChunkGeometry& geometry() const { return geo_; }
     DraftController&     draft() { return draft_; }
@@ -476,10 +500,29 @@ public:
      * end, or the deepest checkpoint below it its idle prefill writes (idle_prefill_checkpoint)
      * when the prefix cache is on. */
     bool    consumer_on() const { return cs_on_; }
-    int64_t consumer_target(const SchedReq& s) const;
+    /* With `ckpts`, also the checkpoints below the target the cut makes whole (SchedReq::
+     * consumer_ckpts): those its idle prefill writes that the policy keeps. */
+    int64_t consumer_target(const SchedReq& s, std::vector<int64_t>* ckpts = nullptr) const;
+    /* RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP_CKPT's band when the variable is unset (or not a
+     * token count): the checkpoints within 512 tokens below a cut prompt's target are made whole
+     * (keeps most of the skip and every hit of the pfxchat / pfxlong receipts; "all" restores the
+     * base engine's snapshot list, 0 none). */
+    static constexpr int64_t kConsumerSkipCkptDefault = 512;
+    /* RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP_CKPT as init resolved it: which checkpoints below a
+     * cut prompt's target are made whole. -1 every one its idle prefill writes ("all"), 0 none
+     * (they are not written), N > 0 those within N tokens below the target and the request's own
+     * keep point (Request::checkpoint_at); 512 (kConsumerSkipCkptDefault) with the prefix cache
+     * when the variable is unset. */
+    int64_t consumer_ckpt_policy() const { return cs_band_; }
+    /* Large-chunk prefill (RADIANCE_EXPERIMENTAL_DS41_LCP): C once init admitted it, else 0. */
+    int64_t lcp_rows() const { return lcp_; }
     /* The deepest checkpoint plan_chunk's chunks write for `r` from its computed tokens to `end`
-     * at the whole step budget, or -1. */
-    int64_t idle_prefill_checkpoint(const Request& r, int64_t end) const;
+     * at the whole step budget, or -1; with `all`, every one of them, ascending. */
+    int64_t idle_prefill_checkpoint(const Request& r, int64_t end,
+                                    std::vector<int64_t>* all = nullptr) const;
+    /* The first of `s`'s checkpoints to make whole at or after `end` (StepEntry::consumer_ckpt),
+     * or 0. */
+    static int64_t consumer_next_ckpt(const SchedReq& s, int64_t end);
     /* What the cut ran (BatchBuilder::ConsumerStats). */
     const BatchBuilder::ConsumerStats& consumer_stats() const { return builder_.consumer_stats(); }
     /* The least recompute a snapshot at a shared head (CacheHit::branch_at) must save each later
@@ -515,6 +558,16 @@ public:
      * multi-token chunk past the floor would overwrite keys its own earlier rows still read, while
      * one token a step attends as its decode step did. Otherwise `n_target`. */
     int64_t chunk_end(const Request& r, int64_t n_target) const;
+
+    /* RADIANCE_EXPERIMENTAL_PREFIX_EORS (eors_): whether init turned end-of-request snapshots on,
+     * and the position the next snapshot of a sequence decoding at `n_computed` with a
+     * `n_prompt`-token prompt lands on: the state after the row at `n_computed`, when that is on
+     * the resume grid past the prompt (-1 otherwise). */
+    bool    eors_on() const { return eors_; }
+    int64_t eors_position(int64_t n_computed, int64_t n_prompt) const {
+        const int64_t p = n_computed + 1;
+        return eors_ && p > n_prompt && geo_.on_grid(p) ? p : -1;
+    }
 
 private:
     Program*      prog_ = nullptr;
@@ -578,6 +631,18 @@ private:
     BatchBuilder  builder_;
     DraftController draft_;
     DraftExperiment draft_experiment_; // Engine validates OFF scope before load/serve
+    /* RADIANCE_EXPERIMENTAL_DS41_DSPARK_GATE (draft_gate.h), from draft_experiment_ at init: the
+     * configuration; the finished sequences' counters and the decode steps by kind; the last
+     * kGateRecs finished sequences' records for the shutdown report, a ring reserved at init so
+     * close_request allocates nothing; and the rows the open step's block_begin let draft, for
+     * step_finished's kind. */
+    static constexpr int kGateRecs = 256;
+    struct GateRec { uint64_t id = 0; int64_t out = 0; DraftGateSeq g; };
+    DraftGateCfg         dgate_cfg_{};
+    DraftGateStats       dgate_tot_{};
+    std::vector<GateRec> dgate_recs_;
+    int64_t              dgate_recs_n_ = 0;
+    int32_t              dgate_step_drafts_ = 0;
 
     /* Where this sequence's block-drafter cache begins; block_begin's guard reads it and
      * block_end records it. */
@@ -781,8 +846,13 @@ private:
      * step, since the step after it must bring them back. */
     int     prefill_alone_ = 0;
     int64_t pf_skipped_ = 0;
-    /* The consumer skip, as init decided it (consumer_on). */
+    /* The consumer skip, as init decided it (consumer_on), and its checkpoint policy
+     * (consumer_ckpt_policy). */
     bool    cs_on_ = false;
+    int64_t cs_band_ = 0;
+    /* Large-chunk prefill, as lcp_init decided it (lcp_rows). */
+    int64_t lcp_ = 0;
+    int     lcp_init(const Program& prog, const Config& cfg, const std::vector<BatchBuilder::RankIO>& ranks);
     /* RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH=1 (read at init; acts under --prefix-resume
      * exact): a finished sequence publishes only up to SchedReq::grid_upto. An exact hit resumes
      * where a cold prefill starts a chunk and recomputes the cold chunks from there, but it also
@@ -792,6 +862,25 @@ private:
      * those positions. Bit-identical only if every kernel rounds a row the same at every pass
      * height; with this, every published block is a cold chunk's own. */
     bool    exact_publish_ = false;
+    /* RADIANCE_EXPERIMENTAL_PREFIX_EORS=1 (read at init; refused, with the reason, outside
+     * --prefix-resume exact, with speculation or with ..._EXACT_PUBLISH, on a recurrent state
+     * scanned in chunks, whose decode rows round otherwise than its prefill's, and on a model whose
+     * only state is a sliding window unless RADIANCE_EXPERIMENTAL_PREFIX_EORS_WINDOW=1):
+     * end-of-request snapshots. Decode writes none otherwise, so a conversation's next turn resumes
+     * at most at the previous prompt's last chunk start and prefills the reply and everything after
+     * it again. With it, a decode step whose row completes a position on the resume grid
+     * (ChunkGeometry::grid) past its prompt snapshots the state there, a prompt ending on the grid
+     * snapshots its end, and every prompt takes its tail snapshot (the start of its last chunk)
+     * however short it is (under the consumer skip only the deeper of the two, its cut target, and
+     * nothing below it). The deepest stands when the request ends: at most grid - 1 tokens below
+     * its last computed position, and the next turn resumes there and recomputes the cold run's own
+     * chunks from it. Such a step is never issued ahead (step_next_locked): its key hashes the
+     * token the step before samples. The trim after a publish keeps the entries of the chain just
+     * published that the request recomputed rather than adopted (trim_prefix_cache). Exact where a
+     * row computed alone (decode) has the bits of the same row in a prefill pass of up to
+     * --max-num-batched-tokens rows: see the exactness argument in scheduler.cpp ("end-of-request
+     * snapshots", at init). */
+    bool    eors_ = false;
     /* The throughput window (step_finished): each kind's tokens and the wall time the steps
      * covered, both decayed with the same time constant, so their ratio is tokens over time. */
     double  tps_win_prefill_ = 0.0, tps_win_decode_ = 0.0, tps_win_time_ = 0.0;
@@ -841,8 +930,10 @@ private:
     /* Both snapshots resolve the same way; the two wrappers exist because the row types differ. */
     const Request* live_req(int32_t slot, uint64_t id) const;
     void preempt_back();
-    /* Give blocks back from the prefix cache until the pool has headroom again. */
-    void trim_prefix_cache();
+    /* Give blocks back from the prefix cache until the pool has headroom again. With `spare`
+     * (end-of-request snapshots on; before its sequence is freed), the first `spare_tokens` of that
+     * request's chain stay, the entries it recomputed rather than adopted among them. */
+    void trim_prefix_cache(const Request* spare = nullptr, int64_t spare_tokens = 0);
     /* RAD_OK, or a negative status when the request cannot be admitted now, nor anything behind
      * it. `reserve`: tokens of the step to leave for the requests queued behind this one
      * (--busy-prefill-chunk; busy_cap); 0 plans the chunk on the whole budget. */

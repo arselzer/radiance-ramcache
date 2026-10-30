@@ -99,6 +99,10 @@ struct CacheHit {
      * enough: the next could be the same conversation going on. A snapshot there serves every
      * request that starts with that head (Scheduler::admit_one). Uncapped by a HitCap. */
     int32_t branch_at       = 0;
+    /* The snapshot at checkpoint_slot is an end-of-request one (RADIANCE_EXPERIMENTAL_PREFIX_EORS:
+     * written by a decode step, or at the end of a prompt, past the prompt ladder), for the
+     * scheduler's counters. */
+    bool    ckpt_eors       = false;
 };
 
 /* Ends a hit early on purpose: at or below `tokens`, on a block and (with recurrent state) on the
@@ -270,6 +274,23 @@ public:
      * that cannot wait goes to evict_lru. Returns how many entries went: each gave back
      * blocks_per_entry(i) blocks of cached group i. */
     int64_t trim(int64_t n_entries);
+    /* trim(), sparing the chain of the first `n_tokens` of `tokens` (whole entries): the
+     * conversation a request just published, whose next turn resumes at its deepest snapshot
+     * (RADIANCE_EXPERIMENTAL_PREFIX_EORS). Called before the closing request frees its sequence,
+     * so most of that chain is safe from a plain trim anyway: every block the sequence holds is
+     * shared with it, and trim skips those. What a plain trim could take is the chain's entries
+     * the sequence does not hold: the ones it recomputed rather than adopted (those between the
+     * snapshot it resumed from and the end of its hit, whose first-published copy the cache keeps
+     * and nothing else holds; a grid less one entry at most when it resumed at its predecessor's
+     * last snapshot, 7 two-token entries on ds41), and taking them would cut the chain below its
+     * new snapshot. That happens only once every other entry the trim may take is gone: when the
+     * live sequences hold more than three quarters of the pool. The chain's entries stay where
+     * they are, in their order (its end first) for later trims; Stats::trim_spared counts those a
+     * plain trim would have taken. It protects nothing once the sequence is freed: other sessions'
+     * trims and admissions (evict_lru) take an idle conversation as any entries, least recently
+     * used first and its end first; the host tier is what keeps it under pressure. */
+    int64_t trim_except(const std::vector<int32_t>& tokens, const std::vector<MMContentKey>& mm,
+                        int64_t n_tokens, int64_t n_entries);
     /* Give up every VRAM copy that costs nothing to drop: host copy landed and no running sequence
      * reading it. Used when the memory has a better use (the expert slab's loan). Entries still
      * shared are retried after a sequence frees blocks. Returns how many entries left VRAM. */
@@ -386,9 +407,20 @@ public:
      * Nor is one this call reserved and commit_checkpoint has not yet committed: the engine saves
      * into the slot after the step, and a later reservation in the same step must not run
      * retention over a save target (a second request reserving a snapshot a first session holds
-     * below its tip). RAD_E_FULL when nothing can be given up. */
+     * below its tip). RAD_E_FULL when nothing can be given up. `eors`: an end-of-request snapshot
+     * (RADIANCE_EXPERIMENTAL_PREFIX_EORS), counted apart and reported by lookup (CacheHit::
+     * ckpt_eors); retention treats it as any other. */
     int  reserve_checkpoint(uint64_t session, int64_t pos, const BlockHash& prefix,
-                            int32_t* slot_out);
+                            int32_t* slot_out, bool eors = false);
+    /* RADIANCE_EXPERIMENTAL_PREFIX_SESSION_LRU: a full store, once retention has run, gives up
+     * the least recently used session's snapshots, its shallowest first and its tip last, before
+     * any snapshot of a session used since; a session's last use is the latest of its snapshots'
+     * (a reservation, or a lookup resuming from one). Off: the least recently used snapshot of
+     * any session, which takes a busy session's ladder before an idle session's tip. */
+    void set_session_lru(bool on) { session_lru_ = on; }
+    bool session_lru() const { return session_lru_; }
+    /* Snapshots held now (reserved or committed), and the most held at once. */
+    int64_t snapshots_held() const { return (int64_t)ck_by_prefix_.size(); }
     /* The state for `prefix` is now in its slot; lookup() offers it only after this (Ckpt::valid). */
     void commit_checkpoint(const BlockHash& prefix);
     /* Every checkpoint of a session, ascending. */
@@ -417,6 +449,14 @@ public:
         int64_t expired = 0, ckpt_expired = 0;
         /* Entries and snapshots a client released (release_session). */
         int64_t released = 0, ckpt_released = 0;
+        /* RADIANCE_EXPERIMENTAL_PREFIX_EORS: end-of-request snapshots committed, and lookups that
+         * handed one out; the most snapshots held at once (the store's high-water mark); and
+         * snapshots a full store gave up as the least recently used session's
+         * (RADIANCE_EXPERIMENTAL_PREFIX_SESSION_LRU), a subset of ckpt_lru. */
+        int64_t ckpt_eors = 0, ckpt_eors_hits = 0, ckpt_peak = 0, ckpt_session_lru = 0;
+        /* Entries of the chain just published that trim_except kept and a plain trim would have
+         * taken: the closing request's recomputed ones (trim_except); 0 while the pool has room. */
+        int64_t trim_spared = 0;
     };
     const Stats& stats() const { return stats_; }
 
@@ -450,15 +490,19 @@ private:
          * planned and the copy after the step that computes it; in between the slot still holds
          * the previous tenant's state and must not be handed out. */
         bool      valid = false;
+        /* An end-of-request snapshot (reserve_checkpoint's `eors`). */
+        bool      eors = false;
     };
 
     std::vector<BlockHash> chain_all(const std::vector<int32_t>& tokens,
                                      const std::vector<MMContentKey>& mm,
                                      int64_t n_blocks) const;
     void touch(const BlockHash& h, uint64_t now_ns) const;
-    /* trim(), leaving the entries in `spare` (when given) where they are. */
+    /* trim(), leaving the entries in `spare` (when given) where they are; `spared`, when given,
+     * gets the number of those a plain trim would have taken (trim_except). */
     int64_t trim_sparing(int64_t n_entries,
-                         const std::unordered_set<BlockHash, BlockHashHash>* spare);
+                         const std::unordered_set<BlockHash, BlockHashHash>* spare,
+                         int64_t* spared = nullptr);
     /* A live sequence also holds one of this entry's blocks, so releasing it frees nothing. */
     bool shared_with_live(const Entry& e) const;
     /* Whether `e` holds the block_size_ token ids at `src`, so a hash collision is a miss. */
@@ -529,6 +573,11 @@ private:
         return std::find(reserved_.begin(), reserved_.end(), h) != reserved_.end();
     }
     mutable uint64_t clock_ = 0;
+    bool        session_lru_ = false;     /* set_session_lru */
+    /* The snapshot a full store gives up (reserve_checkpoint): the least recently used one, or
+     * under session_lru_ the shallowest of the least recently used session's; never one handed
+     * out or reserved this step. end() when every one is. */
+    std::unordered_map<BlockHash, Ckpt, BlockHashHash>::iterator store_victim();
     std::unique_ptr<CheckpointPolicy> policy_;
     mutable Stats stats_;
     std::string report_;

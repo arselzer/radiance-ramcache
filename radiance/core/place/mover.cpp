@@ -879,7 +879,7 @@ void Mover::alias_file_units(const std::vector<int32_t>& units, char* base,
     }
 }
 
-bool Mover::borrow_host_unit(int32_t u, HostUnit* out) {
+bool Mover::borrow_host_unit(int32_t u, HostUnit* out, bool touch) {
     if (!out || out->n != 0 || !plan_ || !prog_ || !mapped_file_cache_on_ || u < 0 ||
         (size_t)u >= unit_.size())
         return false;
@@ -899,6 +899,11 @@ bool Mover::borrow_host_unit(int32_t u, HostUnit* out) {
                     : w.stored_bytes == (int64_t)NativeMappedFileCache::DN ? 1 : -1;
         const size_t want = !packed ? (size_t)w.stored_bytes : c < 0 ? 0 : slots[(size_t)c];
         auto take = [&] {
+            if (!touch)
+                return !packed ? (mapped_file_cache_.supports_readonly_borrow()
+                                      ? mapped_file_cache_.borrow_readonly(key, (size_t)w.stored_bytes, &l)
+                                      : mapped_file_cache_.borrow(key, (size_t)w.stored_bytes, &l))
+                               : mapped_file_cache_.borrow_packed_readonly(key, c, &l);
             return !packed ? mapped_file_cache_.borrow(key, (size_t)w.stored_bytes, &l)
                            : mapped_file_cache_.borrow_packed(key, c, &l);
         };
@@ -955,7 +960,9 @@ int mirror_split() {
 
 }  /* namespace */
 
-/* A reader: takes the next read until none is left, and notes when it began and landed. */
+/* A reader: takes the next read until none is left, and notes when it began and landed. With
+ * `landed`, the reader that lands a unit's last read hands it on (read_unit_planes): the release
+ * of each reader's decrement orders its bytes before the last one's acquire. */
 void Mover::PlaneCall::operator()(int) {
     for (size_t j; (j = next.fetch_add(1)) < reads.size();) {
         Read& r = reads[j];
@@ -965,6 +972,12 @@ void Mover::PlaneCall::operator()(int) {
                    : mover->read_source_file(r.file, (uint64_t)r.off, r.len, r.dst, r.cap);
         r.copy_ns = (int64_t)copy;
         r.end_ns = steady_ns() - t0;
+        if (landed && r.unit >= 0 && r.unit < units) {
+            if (r.rc < 0) failed[(size_t)r.unit].store(1, std::memory_order_relaxed);
+            if (left[(size_t)r.unit].fetch_sub(1, std::memory_order_acq_rel) == 1 &&
+                !failed[(size_t)r.unit].load(std::memory_order_relaxed))
+                landed(ctx, r.unit);
+        }
     }
 }
 
@@ -1005,6 +1018,8 @@ bool Mover::plane_reads(HostPlanes* const* units, int n, int rows, PlaneCall* c,
     std::vector<Read>& reads = c->reads;
     reads.clear();
     c->mover = this;
+    c->landed = nullptr;   /* read_unit_planes sets it after this, for its own call only */
+    c->ctx = nullptr;
     c->next.store(0);
     c->weights = 0;
     c->units = n;
@@ -1080,16 +1095,19 @@ bool Mover::plane_reads(HostPlanes* const* units, int n, int rows, PlaneCall* c,
                     /* A read to the extent's end may round up into the buffer's slack. */
                     const int64_t cap = s.off + s.len == p->len[k] ? p->cap[k] - s.off : s.len;
                     reads.push_back(Read{ w.file_id, a0 + s.off, s.len, p->buf[k] + s.off, cap, nullptr, 0 });
+                    reads.back().unit = i;
                     continue;
                 }
                 /* One piece (no split) as the unit's one mirror read. */
                 int64_t piece[4];
                 const int np = PlaneMirror::split(s.len, pieces, piece);
                 int64_t at = 0;
-                for (int r = 0; r < np; at += piece[r], ++r, ++q)
+                for (int r = 0; r < np; at += piece[r], ++r, ++q) {
                     reads.insert(reads.begin() + q, Read{ w.file_id, a0 + s.off + at, piece[r],
                                                           p->buf[k] + s.off + at, piece[r], m,
                                                           m->bytes - (uint64_t)(s.len - at) });
+                    reads[(size_t)q].unit = i;
+                }
             }
         }
     }
@@ -1144,9 +1162,22 @@ bool Mover::plane_reads_done(PlaneCall* c, bool readers_failed, PlaneReadTiming*
 }
 
 bool Mover::read_unit_planes(HostPlanes* const* units, int n, int rows, PlaneReadTiming* timing,
-                             const PlanesIn* in, bool rest_mirror, const ReadWaitHook* hook) {
+                             const PlanesIn* in, bool rest_mirror, const ReadWaitHook* hook,
+                             PlaneLanded landed, void* ctx) {
     PlaneCall c;
     if (!plane_reads(units, n, rows, &c, in, rest_mirror)) return false;
+    if (landed) {
+        c.left.reset(new std::atomic<int>[(size_t)n]);
+        c.failed.reset(new std::atomic<uint8_t>[(size_t)n]);
+        for (int i = 0; i < n; ++i) {
+            c.left[(size_t)i].store(0, std::memory_order_relaxed);
+            c.failed[(size_t)i].store(0, std::memory_order_relaxed);
+        }
+        for (const PlaneCall::Read& r : c.reads)
+            if (r.unit >= 0 && r.unit < n) c.left[(size_t)r.unit].fetch_add(1, std::memory_order_relaxed);
+        c.landed = landed;
+        c.ctx = ctx;
+    }
     c.t0 = steady_ns();
     ReadWaitHook at;
     if (hook && hook->fn) {
@@ -1254,6 +1285,12 @@ int Mover::read_piece(uint32_t file, int64_t off, int64_t len, void* dst, int64_
 int64_t Mover::decode_mirror_bytes() const {
     PlaneMirror* const pm = PlaneMirror::get();
     return pm && pm->on() && !mirror_ref_.empty() ? mirror_tail_decode_ : 0;
+}
+
+int64_t Mover::mirror_bytes(int rows) const {
+    PlaneMirror* const pm = PlaneMirror::get();
+    if (!pm || !pm->on() || mirror_ref_.empty()) return 0;
+    return rows >= pm->min_rows() ? mirror_tail_ : mirror_tail_decode_;   /* as plane_reads picks it */
 }
 
 int64_t Mover::mapped_pair_bytes() const {

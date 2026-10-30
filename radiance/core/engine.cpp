@@ -53,7 +53,8 @@ Engine::Engine(Config cfg)
     : cfg_(std::move(cfg)),
       draft_experiment_(DraftExperiment::capture(std::getenv(kDraftOriginEnv),
                                                   std::getenv(kDraftComputeOffEnv),
-                                                  std::getenv(kDraftVerifyCapEnv))), env_set_(diag::env_names(environ, "RADIANCE_")) {}
+                                                  std::getenv(kDraftVerifyCapEnv),
+                                                  std::getenv(kDraftGateEnv))), env_set_(diag::env_names(environ, "RADIANCE_")) {}
 
 int32_t* Engine::Readback::reserve(int64_t count) {
     if (count <= n) return p;
@@ -206,6 +207,47 @@ Engine::~Engine() {
                      ss.units, ss.cap, humanb(ss.bytes).c_str(), (unsigned long long)hx.side_hits,
                      (unsigned long long)hx.side_d_hits, (unsigned long long)ss.full);
         }
+        if (r->index == 0 && r->fstager.host_experts())
+            if (const HostExpertPool* pool = HostExpertPool::get(); pool && pool->submit_waits())
+                RAD_INFO("host experts: submitters waited %llu times for a free job slot (%d slots), %.1f ms "
+                         "in all, outside the submit lock", (unsigned long long)pool->submit_waits(),
+                         HostExpertPool::slots(), (double)pool->submit_wait_ns() / 1e6);
+        /* RADIANCE_EXPERIMENTAL_DS41_LCP_PROFILE (FileStager::PassProfile): per pass height, a routed
+         * layer-pass's mean times on the issuing thread. */
+        if (r->fstager.profile_on()) {
+            static const char* const kName[FileStager::kProfBuckets] = { "1 token", "2-16 tokens", "17-256 tokens",
+                                                                         "257+ tokens" };
+            for (int b = 0; b < FileStager::kProfBuckets; ++b) {
+                const FileStager::PassProfile& p = r->fstager.profile(b);
+                if (!p.layers) continue;
+                const double L = (double)p.layers, ms = 1e-6;
+                RAD_INFO("pass profile, rank %d, %s: %llu routed layer-passes, %.1f rows each (%.1f to the CPU); "
+                         "a layer-pass %.2f ms wall (counts to counts, %llu spans), of it %.2f ms waiting for the "
+                         "card at the counts, %.2f ms at the gather for misses being read, %.2f ms at the gather for "
+                         "the pool; misses %.2f units a layer-pass (%.2f ms in the read call on the worker), %.2f "
+                         "read waves; totals: wall %.1f s, card %.1f s, misses %.1f s, pool %.1f s",
+                         r->index, kName[b], (unsigned long long)p.layers, (double)p.rows / L, (double)p.cpu_rows / L,
+                         p.spans ? (double)p.span_ns * ms / (double)p.spans : 0.0, (unsigned long long)p.spans,
+                         (double)p.sync_ns * ms / L, (double)p.miss_wait_ns * ms / L, (double)p.gather_ns * ms / L,
+                         (double)p.miss_units / L, (double)p.miss_read_ns * ms / L, (double)p.waves / L,
+                         (double)p.span_ns * 1e-9, (double)p.sync_ns * 1e-9, (double)p.miss_wait_ns * 1e-9,
+                         (double)p.gather_ns * 1e-9);
+            }
+        }
+        if (hx.lcp_layers)
+            RAD_INFO("large-chunk prefill, rank %d: %llu layers streamed their misses in %llu read waves; "
+                     "%llu units went to the pool as their reads landed, %llu after the call (a leg read "
+                     "again); %.1f ms waiting for a wave's jobs before reusing its planes",
+                     r->index, (unsigned long long)hx.lcp_layers, (unsigned long long)hx.lcp_waves,
+                     (unsigned long long)hx.lcp_landed, (unsigned long long)hx.lcp_late,
+                     (double)hx.lcp_wave_wait_ns / 1e6);
+        if (hx.lcp_hit_admit || hx.lcp_hit_ro || hx.lcp_miss_admit || hx.lcp_miss_ro || hx.lcp_miss_dropped)
+            RAD_INFO("large-chunk prefill, rank %d: RAM cache admission over chunks: %llu cached units leased "
+                     "admitted (LRU touch) and %llu read-only; %llu misses relaid into the cache, %llu computed "
+                     "and let go (read-only), %llu admitted but dropped at the insert queue's cap",
+                     r->index, (unsigned long long)hx.lcp_hit_admit, (unsigned long long)hx.lcp_hit_ro,
+                     (unsigned long long)hx.lcp_miss_admit, (unsigned long long)hx.lcp_miss_ro,
+                     (unsigned long long)hx.lcp_miss_dropped);
         if (hx.early)
             RAD_INFO("host experts, early issue: %llu layers issued their card ops ahead of their counts "
                      "sync and waited %.1f ms for the counts at their gathers (%.1f us a layer; also in "
@@ -320,7 +362,7 @@ Engine::~Engine() {
                      "live cap); at their layer %llu used (%llu whole, %llu %s %.1f ms in all, %.3f ms "
                      "each), %llu read as any miss, %llu re-read after a "
                      "failed piece; %llu dropped (%llu not selected, %llu cache hits, %llu stale); "
-                     "%llu of %llu one-token misses planned (%.1f%%), %llu used (%.1f%%); read ahead "
+                     "%llu of %llu misses planned (%.1f%%), %llu used (%.1f%%); read ahead "
                      "%.0f MB for units used, %.0f MB for units dropped",
                      (unsigned long long)hx.ra_planned, (unsigned long long)hx.ra_late,
                      (unsigned long long)hx.ra_capped, (unsigned long long)used,
@@ -362,6 +404,24 @@ Engine::~Engine() {
                          (double)hx.ra_rest_mirror_bytes / 1e6, (unsigned long long)hx.ra_rest_mirror,
                          hx.ra_rest ? (double)hx.ra_rest_bytes / 1e6 / (double)hx.ra_rest : 0.0,
                          (double)hx.ra_wait_ns / 1e6);
+            /* The same by the pass's rows: one-token passes, and the decode passes of 2..N rows that
+             * RADIANCE_EXPERIMENTAL_DS41_PREFETCH_MULTIROW reads ahead in. */
+            std::string by;
+            for (int r = 1; r <= FileStager::HostStats::kRaRows; ++r) {
+                const auto& s = hx.ra_rows[r];
+                if (!s.planned && !s.skipped && !s.misses && !s.dropped) continue;
+                by += fmt("%s%d row%s: %llu planned (%llu too late or over the cap), %llu used (%llu whole, "
+                          "%llu finished, %.1f ms waited), %llu read as any miss, %llu re-read, %llu dropped, "
+                          "%llu of %llu misses planned, %.0f MB used, %.0f MB dropped",
+                          by.empty() ? "" : "; ", r, r == 1 ? "" : "s", (unsigned long long)s.planned,
+                          (unsigned long long)s.skipped, (unsigned long long)(s.whole + s.finished),
+                          (unsigned long long)s.whole, (unsigned long long)s.finished,
+                          (double)s.wait_ns / 1e6, (unsigned long long)s.fresh,
+                          (unsigned long long)s.refetched, (unsigned long long)s.dropped,
+                          (unsigned long long)s.miss_planned, (unsigned long long)s.misses,
+                          (double)s.used_bytes / 1e6, (double)s.dropped_bytes / 1e6);
+            }
+            if (!by.empty()) RAD_INFO("read-ahead in pieces by pass size: %s", by.c_str());
         }
         /* RADIANCE_EXPERIMENTAL_DS41_ROUTE_TRACE (place/route_trace.h): this rank's records, and
          * its one-token layers' picks by what it did with them (the trace's own tally of them). */
@@ -437,6 +497,18 @@ Engine::~Engine() {
                  s.computed ? (double)s.compute_ns / 1e3 / (double)s.computed : 0.0,
                  (double)s.ready_ns / 1e6,
                  s.computed ? (double)s.ready_ns / 1e3 / (double)s.computed : 0.0);
+        /* RADIANCE_EXPERIMENTAL_DS41_PREFETCH_MULTIROW: the multi-row decode passes' posts among
+         * them, against the one-row predictions' cost. */
+        if (s.multi) {
+            const uint64_t one = s.computed - s.multi, one_ns = s.compute_ns - s.multi_ns;
+            RAD_INFO("router predictor, multi-row decode passes: %llu of the predictions from %llu rows "
+                     "(%.2f a post), %.1f ms scoring (%.1f us a prediction, %.1f us a row; one-row "
+                     "predictions %.1f us)", (unsigned long long)s.multi,
+                     (unsigned long long)s.multi_rows, (double)s.multi_rows / (double)s.multi,
+                     (double)s.multi_ns / 1e6, (double)s.multi_ns / 1e3 / (double)s.multi,
+                     s.multi_rows ? (double)s.multi_ns / 1e3 / (double)s.multi_rows : 0.0,
+                     one ? (double)one_ns / 1e3 / (double)one : 0.0);
+        }
     }
     /* ..._PREFETCH_RECORD: the inputs written for offline scoring (router_predictor.h). */
     if (RouterPredictor* rp = RouterPredictor::get(); rp && !rp->record_path().empty()) {
@@ -626,6 +698,12 @@ void Engine::find_histograms(Rank& r, int before_step) {
     }
 }
 
+/* The experts a layer's histogram row counts: its last report's, at most the staging's width. */
+static int64_t route_row_experts(const Ctx& ctx, int layer) {
+    const RadRouting* rt = ctx.last_routing(layer);
+    return rt ? std::min<int64_t>(rt->n_expert, ctx.route_n_expert()) : 0;
+}
+
 /* --expert-stats: one found histogram into the rank's tally (place/xstats.h), from the same row
  * the heat engine reads. The caller holds the tally. */
 static void xstats_credit(XsTally* xs, Ctx& ctx, int layer, int bank, const int32_t* h) {
@@ -642,6 +720,7 @@ void Engine::xstats_drain(Rank& r, XsTally* xs, int before_step) {
     std::lock_guard<std::mutex> lk(xs->mutex());
     for (const Rank::HeatRow& hr : r.heat_rows) {
         xstats_credit(xs, r.ctx, hr.layer, hr.bank, hr.h);
+        if (draft_vram_n_ > 0) draft_vram_credit(r, hr.layer, hr.h, route_row_experts(r.ctx, hr.layer));
         r.heat_seen[(size_t)hr.layer] = r.ctx.last_histogram_step(hr.layer, hr.bank);
         r.ctx.mark_credited(hr.layer, hr.bank);
         ++r.heat_credited;
@@ -653,6 +732,7 @@ void Engine::tiering_dispatch(Rank& r, int step) {
     XsTally* const xs = xstats_ ? xstats_->tally(r.index) : nullptr;
     if (!r.heat.enabled()) {
         if (xs) xstats_drain(r, xs, step);
+        else if (draft_vram_n_ > 0) draft_vram_drain(r, step);   /* RADIANCE_EXPERIMENTAL_DS41_DRAFT_VRAM's tally */
         return;
     }
 
@@ -674,6 +754,7 @@ void Engine::tiering_dispatch(Rank& r, int step) {
         r.heat.observe(hr.layer, hr.h, n_ex, reps > 1 ? (float)reps : 1.0f);
         /* The row is in cache now. */
         if (xs) xstats_credit(xs, r.ctx, hr.layer, hr.bank, hr.h);
+        if (draft_vram_n_ > 0) draft_vram_credit(r, hr.layer, hr.h, route_row_experts(r.ctx, hr.layer));
         r.heat_seen[(size_t)hr.layer] = r.ctx.last_histogram_step(hr.layer, hr.bank);
         r.ctx.mark_credited(hr.layer, hr.bank);
         ++r.heat_credited;
@@ -1413,7 +1494,27 @@ int Engine::step_loop() {
         }
     }
     post_stop_report();
+    /* RADIANCE_EXPERIMENTAL_DS41_DSPARK_GATE: its counters and every finished sequence's. */
+    sched_.draft_gate_report();
+    eors_report();
     return RAD_OK;
+}
+
+void Engine::eors_report() {
+    const SchedMetrics m = sched_.metrics();
+    const bool session_lru = !ranks_.empty() && ranks_[0]->prefix.session_lru();
+    if (!sched_.eors_on() && !session_lru && m.eors_reserved == 0) return;
+    const int64_t slot = ck_store_.enabled() ? ck_store_.slot_bytes() : 0;
+    RAD_INFO("end-of-request snapshots: %lld reserved, %lld stored (%s written, %s a snapshot over "
+             "the ranks), %lld step(s) not issued ahead for one; %lld admission(s) resumed from "
+             "one, %lld tokens reused (deepest %lld); snapshot store: %lld of %lld slots held, at "
+             "most %lld, %lld given up by session, %lld entries a publish's trim spared",
+             (long long)m.eors_reserved, (long long)m.eors_committed,
+             humanb(slot * m.eors_committed).c_str(), humanb(slot).c_str(),
+             (long long)m.eors_ahead_withheld, (long long)m.eors_hits,
+             (long long)m.eors_hit_tokens, (long long)m.eors_hit_deepest,
+             (long long)m.store_held, (long long)(ck_store_.enabled() ? ck_store_.capacity() : 0),
+             (long long)m.store_peak, (long long)m.store_session_lru, (long long)m.trim_spared);
 }
 
 /* Issue the copy of the sampled ids into pinned memory behind the sampler, without waiting.
@@ -2478,6 +2579,7 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
     for (auto& t : rank_threads_) if (t.joinable()) t.join();
     rank_threads_.clear();
     xstats_close();
+    draft_vram_close();
     /* A step-loop error takes precedence over the transport's status. */
     const int ls = loop_status_.load(std::memory_order_acquire);
     return ls < 0 ? ls : s;

@@ -41,6 +41,11 @@
 /* rad_declare_consumer_suffix (abi/rad_builder.h) is an additive export: referenced weakly, it is
  * null on an engine older than the call, and the consumer skip is then refused (cut_declare). */
 #pragma weak rad_declare_consumer_suffix
+/* rad_consumer_row_grain likewise: null on an engine older than the per-row cut, which then never
+ * hands a step RadBatch::consumer_row0 (cut_declare leaves Model::cut_rows false). */
+#pragma weak rad_consumer_row_grain
+/* The same for rad_kv_group_replicated (RADIANCE_EXPERIMENTAL_DS41_KV_REPLICATED, kv_replicate). */
+#pragma weak rad_kv_group_replicated
 
 namespace deepseek41 {
 using namespace rad::arch;
@@ -553,6 +558,15 @@ struct Model {
     std::vector<std::string> f8_skip;
     int64_t f8_codes = 0;
     int f8_n = 0, f8_kept = 0;
+    /* RADIANCE_EXPERIMENTAL_DS41_DSPARK_FP8=1 (dsp_f8_gate): the DSpark drafter's dense linears the
+     * same way. The release ships its mtp.* stages' (wq_a, wq_b, wkv, wo_a, wo_b, the shared
+     * expert, main_proj) as E4M3 with an E8M0 exponent a 32x32 block too, and the draft bank keeps
+     * them cast to bf16, as the container keeps the trunk's. Needs ..._DENSE_FP8 on. Counted apart
+     * from the trunk's, on a startup line of their own: `dsp_f8_n` weights the op reads,
+     * `dsp_f8_codes` their code bytes, `dsp_f8_kept` those left on gemm_nt. */
+    bool dsp_f8 = false;
+    int64_t dsp_f8_codes = 0;
+    int dsp_f8_n = 0, dsp_f8_kept = 0;
     int64_t win_bs = 0;
     /* model-wide weights and ops */
     rad_weight token = 0, head = 0, final_gain = 0, tmap = 0, ple_table = 0;
@@ -592,8 +606,13 @@ struct Model {
      * skipped. Only this rank's thread writes them. */
     bool cut_on = false;
     int  cut_b = -1;
+    /* The per-row cut (RadBatch::consumer_row0): the engine took the 16-row grain this plugin
+     * declares (cut_declare), so a step may run each layer on its own suffix of the rows. */
+    bool cut_rows = false;
     struct CutStats {
         uint64_t passes = 0, full = 0, key = 0, skipped = 0;
+        /* Steps cut by row, and their layer-rows in full, key ops alone and skipped. */
+        uint64_t row_passes = 0, rows_full = 0, rows_key = 0, rows_skipped = 0;
     } cuts;
 };
 static std::unique_ptr<Model> models[MAX_RANKS];
@@ -1835,12 +1854,18 @@ static int dsp_stage_weights(RadBuilder* b, Model& m, Layer& L, int s) {
     if (!L.hc_a_fn || !L.hc_a_scale || !L.hc_a_base || !L.hc_f_fn || !L.hc_f_scale || !L.hc_f_base || !L.ffn_norm)
         return RAD_E_INVAL;
     if (m.zero) return RAD_OK;
+    /* With ..._DSPARK_FP8 the trunk's lw8() (dsp_f8_gate): the same eligibility and exclusions. */
+    const auto dlw = [&](const char* name, int64_t n, int64_t k, int shard = RAD_SHARD_NONE,
+                         int64_t lo = 0, int64_t hi = 0, bool mapped = false) {
+        return m.dsp_f8 ? lw8(b, m, name, n, k, grp, shard, lo, hi, mapped)
+                        : lw(b, m, name, n, k, grp, shard, lo, hi, mapped);
+    };
     L.attn_norm = w("blk.%d.attn_norm.weight", RAD_F32, { D });
-    L.wq_a = lw(b, m, nm.f("blk.%d.attn_q_a.weight", l), c.q_lora, D, grp);
+    L.wq_a = dlw(nm.f("blk.%d.attn_q_a.weight", l), c.q_lora, D);
     L.q_norm = w("blk.%d.attn_q_a_norm.weight", RAD_F32, { c.q_lora });
-    L.wq_b = lw(b, m, nm.f("blk.%d.attn_q_b.weight", l), HD, c.q_lora, grp, RAD_SHARD_ROW, m.ar * HD,
-                (m.ar + 1) * HD);
-    L.wkv = lw(b, m, nm.f("blk.%d.attn_kv.weight", l), hd, D, grp);
+    L.wq_b = dlw(nm.f("blk.%d.attn_q_b.weight", l), HD, c.q_lora, RAD_SHARD_ROW, m.ar * HD,
+                 (m.ar + 1) * HD);
+    L.wkv = dlw(nm.f("blk.%d.attn_kv.weight", l), hd, D);
     L.kv_norm = w("blk.%d.attn_kv_a_norm.weight", RAD_F32, { hd });
     L.sinks = wts(b, g, nm.f("blk.%d.attn_sinks.weight", l), RAD_F32, { g.n_head }, grp, RAD_SHARD_ROW,
                   m.ar * g.n_head, (m.ar + 1) * g.n_head);
@@ -1849,12 +1874,12 @@ static int dsp_stage_weights(RadBuilder* b, Model& m, Layer& L, int s) {
         const int gi_ = (int)(m.ar * m.gr + j);
         const char* n = nm.f("blk.%d.attn_output_a.g%d.weight", l, gi_);
         DS_TRY(map_rows(b, n, { { ckpt_name(nm.f("blk.%d.attn_output_a.weight", l)), (int)(gi_ * c.o_rank), c.o_rank } }));
-        L.wo_a.push_back(lw(b, m, n, c.o_rank, gd, grp, RAD_SHARD_NONE, 0, 0, true));
+        L.wo_a.push_back(dlw(n, c.o_rank, gd, RAD_SHARD_NONE, 0, 0, true));
         if (!L.wo_a.back()) return RAD_E_INVAL;
     }
     const int64_t ok = m.gr * c.o_rank;
-    L.wo_b = lw(b, m, nm.f("blk.%d.attn_output_b.weight", l), D, ok, grp, RAD_SHARD_COL, m.ar * ok,
-                (m.ar + 1) * ok);
+    L.wo_b = dlw(nm.f("blk.%d.attn_output_b.weight", l), D, ok, RAD_SHARD_COL, m.ar * ok,
+                 (m.ar + 1) * ok);
     return L.attn_norm && L.wq_a && L.q_norm && L.wq_b && L.wkv && L.kv_norm && L.sinks && L.wo_b ? RAD_OK
                                                                                                   : RAD_E_INVAL;
 }
@@ -1946,8 +1971,21 @@ static int dsp_stage_ops(RadBuilder* b, Model& m, Layer& L) {
     s.cfg.route_scale = c.route_scale;
     s.cfg.swiglu_limit = c.swiglu_limit;
     s.cfg.shared_ungated = 1;
+    /* With ..._DSPARK_FP8 the shared expert's two linears as the trunk's (layer()). */
+    const bool sh_f8 = m.dsp_f8 && !f8_skipped(m, nm.f("blk.%d.ffn_gate_up_shexp.weight", l)) &&
+                       !f8_skipped(m, nm.f("blk.%d.ffn_down_shexp.weight", l));
+    s.cfg.shared_bf16_op = sh_f8 ? kDenseF8 : nullptr;
     DS_TRY(MoeFP8::probe(b, nm, l, s, &s.cfg));
     DS_TRY(L.moe.declare(b, nm, g, l, d.mw, s, false, false));
+    if (m.dsp_f8 && g.n_ff > 0)
+        for (const LinearFP8* sl : { &L.moe.sh_gate_up, &L.moe.sh_down }) {
+            if (sl->bf16_alt) {
+                ++m.f8_n;
+                m.f8_codes += sl->N * sl->K;
+            } else {
+                ++m.f8_kept;
+            }
+        }
     L.post_f = op(b, "mhc_post", hcp, {}, { d.act.x, d.h1, d.post, d.comb }, { d.h0 });
     return L.mix_a && L.col_a && L.post_a && L.mix_f && L.col_f && L.norm_f && L.post_f ? RAD_OK : RAD_E_INVAL;
 }
@@ -1962,6 +2000,9 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
     const int64_t T = g.max_tok, Q = d.Q, D = c.n_embd, HD = g.n_head * c.head_dim, hd = c.head_dim;
     const int64_t R = d.cand;
     auto bf = [&](const char* n, std::initializer_list<int64_t> s) { return decl_b(b, nm.f("%s", n), RAD_BF16, s); };
+    /* ..._DSPARK_FP8: what the drafter adds to the FP8 counts is its own (Model::dsp_f8_n). */
+    const int f8_n0 = m.f8_n, f8_kept0 = m.f8_kept;
+    const int64_t f8_codes0 = m.f8_codes;
 
     /* ---- buffers: the context pass (a trunk step's rows), the query pass (Q rows), the head */
     d.c = bf("dspark_main", { T, D });
@@ -2024,7 +2065,8 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
     const int64_t nt = (int64_t)d.taps.size();
     /* The context pass runs on the attention ranks only (an attention-zero rank keeps no keys). */
     if (!m.zero) {
-        d.fc = lw(b, m, nm.f("dspark.fc.weight"), D, nt * D, grp_model());
+        d.fc = m.dsp_f8 ? lw8(b, m, nm.f("dspark.fc.weight"), D, nt * D, grp_model())
+                        : lw(b, m, nm.f("dspark.fc.weight"), D, nt * D, grp_model());
         d.main_norm = wt(b, nm.f("dspark.enc.output_norm.weight"), RAD_F32, { D }, grp_model());
         if (!d.fc || !d.main_norm) return RAD_E_INVAL;
     }
@@ -2164,6 +2206,13 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
                            { d.mk1, d.mk2 }, { d.cand_, d.unary }, { d.tokens })))
         return RAD_E_INVAL;
 
+    m.dsp_f8_n = m.f8_n - f8_n0;
+    m.dsp_f8_kept = m.f8_kept - f8_kept0;
+    m.dsp_f8_codes = m.f8_codes - f8_codes0;
+    m.f8_n = f8_n0;
+    m.f8_kept = f8_kept0;
+    m.f8_codes = f8_codes0;
+
     RadDrafterDecl drf{};
     drf.name = "dspark";
     drf.kind = RAD_DRAFT_BLOCK;
@@ -2301,7 +2350,28 @@ static bool dense_f8_gate(RadBuilder* b, const RadModelMeta* meta, Model& m) {
     return true;
 }
 
+/* RADIANCE_EXPERIMENTAL_DS41_DSPARK_FP8=1 (Model::dsp_f8): the DSpark drafter's dense linears
+ * read by gemm_nt_bf16f8 as the trunk's are (lw8, MoeFP8::Config::shared_bf16_op), behind the
+ * trunk's gate: the same checkpoint statement and library, the same exclusions. A note and
+ * nothing else without it. The drafter's proposals are the same bits: the op gives gemm_nt's
+ * bytes (no tune cache, as for the trunk's), so only its weight reads halve. */
+static bool dsp_f8_gate(const Model& m) {
+    const char* on = std::getenv("RADIANCE_EXPERIMENTAL_DS41_DSPARK_FP8");
+    if (!on || std::strcmp(on, "1")) return false;
+    if (!m.dsp.on) return false;   /* no drafter in this serve */
+    if (!m.f8_on) {
+        fprintf(stderr, "radiance: deepseek41: RADIANCE_EXPERIMENTAL_DS41_DSPARK_FP8 is set, but the "
+                        "trunk's dense FP8 is off (RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8=1, which it "
+                        "extends to the drafter); the drafter's linears stay on gemm_nt\n");
+        return false;
+    }
+    return true;
+}
+
 /* ------------------------------------------------------------------ the consumer skip */
+/* The per-row cut's grain (RadConsumerSuffix::row_grain): the chunk quantum, the window cache's
+ * 16-token blocks, on which every chunk starts. */
+static constexpr int32_t kCutRowGrain = 16;
 /* RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP=1: the engine runs a prompt's early passes on a prefix of
  * the layers (core/sched/consumer_skip.h holds the schedule and its proof; rad_builder.h,
  * rad_declare_consumer_suffix, the contract). This plugin's half is the declaration below, made
@@ -2364,6 +2434,9 @@ static void cut_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
         d.n_layer = (int32_t)c.n_layer;
         d.boundary = B;
         d.window = (int32_t)c.window;
+        /* Every op of a layer can run on a suffix of the step's rows that starts on the 16-row grid
+         * (step(), "the per-row cut"): the engine uses it under large-chunk prefill. */
+        d.row_grain = kCutRowGrain;
         const int rc = rad_declare_consumer_suffix(b, &d);
         if (rc != RAD_OK) why = "the engine refused the declaration (" + std::to_string(rc) + ")";
     }
@@ -2375,12 +2448,51 @@ static void cut_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
     }
     m.cut_on = true;
     m.cut_b = B;
+    m.cut_rows = rad_consumer_row_grain && rad_consumer_row_grain(b) == kCutRowGrain;
     if (ctx->rank == 0)
         fprintf(stderr, "radiance: deepseek41: consumer suffix declared: layers %d..%lld see earlier "
                         "rows only through their own %lld-row windows and layer %d's compressed and "
                         "index keys; a cut pass runs layers [0, F) in full and layer F's key ops alone\n",
                 B + 1, (long long)c.n_layer - 1, (long long)c.window, B);
     rad_note(b, "consumer suffix declared: boundary %d, window %lld", B, (long long)c.window);
+}
+
+/* RADIANCE_EXPERIMENTAL_DS41_KV_REPLICATED=1: the compressed and index key caches declared
+ * replicated (rad_kv_group_replicated), so the prefix cache's host tier (--prefix-cache-mib) keeps
+ * one copy of an entry instead of every rank's: 6,400 B a 2-token entry instead of 25,600 at TP4,
+ * four times the conversations in the same bytes. Every attention rank computes them whole from the
+ * replicated residual stream with replicated weights (one latent KV head), so the four ranks hold
+ * the same bytes: the Kh arms' per-rank hashes of kv_index_r* and kv_compressed_r* agree in every
+ * prompt of the 29 Oct prefill window, and RADIANCE_DEBUG_TIER_VERIFY checks it at each restore.
+ * Only with every rank attending (no attention-zero rank, whose groups are zeroed) and more than
+ * one; it changes nothing but the tier's slot layout. */
+static int kv_replicate(RadBuilder* b, Model& m) {
+    const char* v = std::getenv("RADIANCE_EXPERIMENTAL_DS41_KV_REPLICATED");
+    if (!v || std::strcmp(v, "1") != 0) return RAD_OK;
+    const char* why = nullptr;
+    if (!rad_kv_group_replicated) why = "this engine has no rad_kv_group_replicated";
+    else if (m.g.world <= 1) why = "one rank holds every byte already";
+    else if (m.zero || m.aw != m.g.world) why = "a rank keeps no attention cache (attention-zero)";
+    if (why) {
+        if (m.g.rank == 0)
+            fprintf(stderr, "radiance: deepseek41: RADIANCE_EXPERIMENTAL_DS41_KV_REPLICATED refused: "
+                            "%s\n", why);
+        return RAD_OK;
+    }
+    int n = 0;
+    std::string names;
+    for (const auto* groups : { &m.index, &m.comp })
+        for (const auto& kv : *groups) {
+            DS_TRY(rad_kv_group_replicated(b, kv.second));
+            ++n;
+        }
+    for (const auto& kv : m.index) names += (names.empty() ? "" : ",") + std::string("kv_index_r") + std::to_string(kv.first);
+    for (const auto& kv : m.comp) names += (names.empty() ? "" : ",") + std::string("kv_compressed_r") + std::to_string(kv.first);
+    if (m.g.rank == 0)
+        fprintf(stderr, "radiance: deepseek41: RADIANCE_EXPERIMENTAL_DS41_KV_REPLICATED: %d paged "
+                        "group(s) declared replicated (%s): a host-tier slot holds them once, not "
+                        "once a rank\n", n, names.c_str());
+    return RAD_OK;
 }
 
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
@@ -2406,6 +2518,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     DS_TRY(geometry(m, ctx));
     m.f8_on = dense_f8_gate(b, meta, m);
     DS_TRY(dsp_config(b, m, meta, ctx));
+    m.dsp_f8 = dsp_f8_gate(m);
     m.router_bf16 = router_bf16_on();
     if (m.router_bf16 && !rad_op_declared(b, "gemm_nt_f32bf16")) {
         fprintf(stderr, "radiance: deepseek41: RADIANCE_EXPERIMENTAL_DS41_ROUTER_BF16=1 needs "
@@ -2547,6 +2660,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     }
     m.layers.resize((size_t)c.n_layer);
     for (int l = 0; l < c.n_layer; ++l) DS_TRY(layer(b, m, m.layers[(size_t)l], l));
+    DS_TRY(kv_replicate(b, m));
     if (m.router_bf16 && g.rank == 0)
         fprintf(stderr, "radiance: deepseek41: RADIANCE_EXPERIMENTAL_DS41_ROUTER_BF16: %d routers "
                         "and %d compressor kv|gate projections read as bf16 (gemm_nt_f32bf16), "
@@ -2597,6 +2711,19 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                       ctx->rank, m.f8_n, (double)m.f8_codes / 1048576.0,
                       2.0 * (double)m.f8_codes / 1048576.0, m.f8_kept,
                       m.f8_skip.empty() ? "" : " (some by RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8_EXCLUDE)");
+        fprintf(stderr, "radiance: %s\n", msg);
+        rad_note(b, "%s", msg);
+    }
+    if (m.dsp_f8) {
+        /* ab_window.sh's Df part requires this line of an arm that sets the knob, with N above 0,
+         * and no other arm may have it. */
+        char msg[400];
+        std::snprintf(msg, sizeof msg,
+                      "deepseek41: rank %d: DSpark drafter: %d dense weights read by gemm_nt_bf16f8 "
+                      "(RADIANCE_EXPERIMENTAL_DS41_DSPARK_FP8): %.1f MiB of E4M3 codes where bf16 "
+                      "held %.1f MiB; %d left on gemm_nt",
+                      ctx->rank, m.dsp_f8_n, (double)m.dsp_f8_codes / 1048576.0,
+                      2.0 * (double)m.dsp_f8_codes / 1048576.0, m.dsp_f8_kept);
         fprintf(stderr, "radiance: %s\n", msg);
         rad_note(b, "%s", msg);
     }
@@ -2725,6 +2852,7 @@ struct MixBeside {
     const Layer* L;
     const Model* m;
     int64_t T;
+    int64_t r0 = 0;   /* the layer's first row (the per-row cut); the mix runs on [r0, T) */
     /* The reads pf_tail issues (the next layer's Layer::pf) and their counters; null: none. */
     const std::vector<PfRead>* pf = nullptr;
     Model::PfStats* pfs = nullptr;
@@ -2768,9 +2896,10 @@ static void mix_f_beside(RadCtx* x, void* a) {
     const MixBeside& p = *(const MixBeside*)a;
     const Layer& L = *p.L;
     const Model& m = *p.m;
-    const int64_t T = p.T;
-    RAD_ISSUE_N(x, L.mix_f, T, brows(m.h1, T), RAD_W(L.hc_f_fn), RAD_W(L.hc_f_scale),
-                RAD_W(L.hc_f_base), brows(m.pre_f, T), brows(m.post, T), brows(m.comb, T));
+    const int64_t T = p.T, r0 = p.r0, n = T - r0, hc = m.c.hc;
+    RAD_ISSUE_N(x, L.mix_f, n, brow_slice(m.h1, r0, n, hc * m.c.n_embd), RAD_W(L.hc_f_fn), RAD_W(L.hc_f_scale),
+                RAD_W(L.hc_f_base), brow_slice(m.pre_f, r0, n, hc), brow_slice(m.post, r0, n, hc),
+                brow_slice(m.comb, r0, n, hc * hc));
 }
 
 static void step(RadCtx* x, const RadBatch* batch) {
@@ -2848,7 +2977,35 @@ static void step(RadCtx* x, const RadBatch* batch) {
     /* The consumer skip (cut_declare): a pass the engine cut runs layers [0, F) in full, layer F's
      * key ops alone and nothing past it; no final norm, no head. Read only once the declaration
      * was taken: an engine without the call has no such field. */
-    const int32_t cut_full = m.cut_on ? batch->consumer_full : 0;
+    /* The per-row cut (cut_declare, RadBatch::consumer_row0): each layer L on its own rows, in full on
+     * [row0[L], T) and its key ops on [row0[L - 1], T) (from 0 at and below the boundary), the rows
+     * of every op offset to them and every per-row buffer kept at the step's row index; a layer with
+     * no key rows issues nothing, and neither does any after it. consumer_full is then the first such
+     * layer's F, which row0 already says. */
+    const int32_t* const row0 = m.cut_on && m.cut_rows ? batch->consumer_row0 : nullptr;
+    if (row0) {
+        bool ok = S == 1 && batch->n_seq_decode == 0 && batch->n_spec == 0 && batch->n_mm_rows == 0 &&
+                  batch->n_out <= 1;
+        for (int l = 0; l < (int)c.n_layer && ok; ++l)
+            ok = row0[l] >= 0 && row0[l] <= T && (l >= m.cut_b || row0[l] == 0) &&
+                 (l <= m.cut_b || row0[l] >= row0[l - 1]);
+        /* The sampled row (the chunk's last, S = 1) must be one every layer runs. */
+        if (ok && batch->n_out > 0) ok = row0[c.n_layer - 1] <= T - 1;
+        if (!ok) {
+            rad_step_fail(x, "deepseek41: a per-row cut outside the declared consumer suffix (rows past the "
+                             "step, a layer's rows not nested in the one below, a sampled row cut, or a "
+                             "step that mixes decode rows, media or speculation)");
+            return;
+        }
+        ++m.cuts.row_passes;
+        for (int l = 0; l < (int)c.n_layer; ++l) {
+            const int64_t kf = l <= m.cut_b ? 0 : row0[l - 1], ff = row0[l];
+            m.cuts.rows_full += (uint64_t)(T - std::min<int64_t>(ff, T));
+            m.cuts.rows_key += (uint64_t)std::max<int64_t>(std::min<int64_t>(ff, T) - kf, 0);
+            m.cuts.rows_skipped += (uint64_t)std::min<int64_t>(kf, T);
+        }
+    }
+    const int32_t cut_full = m.cut_on && !row0 ? batch->consumer_full : 0;
     if (cut_full != 0 &&
         (cut_full < m.cut_b || cut_full >= (int32_t)c.n_layer || batch->n_out != 0 || S != 1 ||
          batch->n_seq_decode != 0 || batch->n_spec != 0 || batch->n_mm_rows != 0)) {
@@ -2872,7 +3029,26 @@ static void step(RadCtx* x, const RadBatch* batch) {
         const int64_t r = L.r;
         /* A cut pass: past layer F nothing; layer F its collapse, norm and key ops (below). */
         if (cut_full && l > cut_full) break;
-        const bool key_only = cut_full && l == cut_full;
+        /* The rows this layer runs (the per-row cut; the whole step otherwise): its key ops -- the
+         * collapse and norm that feed them, the window key, at a source the compressor and the index
+         * keys -- on [rk, T), everything else on [rf, T). A source is at or below the boundary, so its
+         * key rows are all of the step's. */
+        const int64_t rk = row0 && l > m.cut_b ? row0[l - 1] : 0;
+        const int64_t rf = row0 ? row0[l] : 0;
+        if (row0 && rk >= T) break;
+        const bool key_only = (cut_full && l == cut_full) || (row0 && rf >= T);
+        const int64_t nk = T - rk, nf = T - rf;
+        if (L.src && rk != 0) {
+            rad_step_fail(x, "deepseek41: a per-row cut that leaves a key source's rows out");
+            return;
+        }
+        const int64_t HN = c.hc * D, hc = c.hc;
+        /* Rows [rk, T) / [rf, T) of a [T, w] buffer; a column slice of them; the rows' positions. */
+        const auto KR = [&](rad_buf h, int64_t w) { return brow_slice(h, rk, nk, w); };
+        const auto FR = [&](rad_buf h, int64_t w) { return brow_slice(h, rf, nf, w); };
+        const auto FC = [&](rad_buf h, int64_t w, int64_t c0, int64_t cw) { return bcol_at(h, rf, w, c0, cw, nf); };
+        const RadOperand kpos = praw(batch->positions + rk, RAD_I32, nk);
+        const RadOperand fpos = praw(batch->positions + rf, RAD_I32, nf);
         if (L.e_ids) {
             const int64_t H = c.ple_heads;
             const int pi = c.ple_index(l);
@@ -2922,24 +3098,24 @@ static void step(RadCtx* x, const RadBatch* batch) {
          *   alone at the layer's start; on the attention-zero rank it follows the collapse. */
         const bool late = !m.zero;
         const auto mix_a = [&] {
-            RAD_ISSUE_N(x, L.mix_a, T, brows(m.h0, T), RAD_W(L.hc_a_fn), RAD_W(L.hc_a_scale),
-                        RAD_W(L.hc_a_base), brows(m.pre_a, T), brows(m.post, T), brows(m.comb, T));
+            RAD_ISSUE_N(x, L.mix_a, nf, FR(m.h0, HN), RAD_W(L.hc_a_fn), RAD_W(L.hc_a_scale),
+                        RAD_W(L.hc_a_base), FR(m.pre_a, hc), FR(m.post, hc), FR(m.comb, hc * hc));
         };
         const auto col_a = [&] {
             if (L.cn_a)
-                RAD_ISSUE_N(x, L.cn_a, T, brows(m.h0, T), brows(m.pre_f, T), brows(m.xcol, T),
-                            RAD_W(L.attn_norm), brows(m.xn, T));
+                RAD_ISSUE_N(x, L.cn_a, nk, KR(m.h0, HN), KR(m.pre_f, hc), KR(m.xcol, D),
+                            RAD_W(L.attn_norm), KR(m.xn, D));
             else if (L.col_a)   /* 0 under pcn_a: issued for the previous post_f */
-                RAD_ISSUE_N(x, L.col_a, T, brows(m.h0, T), brows(m.pre_f, T), brows(m.xcol, T));
+                RAD_ISSUE_N(x, L.col_a, nk, KR(m.h0, HN), KR(m.pre_f, hc), KR(m.xcol, D));
         };
         col_a();
         if (!late && !key_only) mix_a();
         if (m.zero) {
             /* An attention-zero rank stores no keys (its caches are zeroed). */
-            if (!key_only) RAD_ISSUE_N(x, L.attn_fill, T, brows(m.attn_out, T));
+            if (!key_only) RAD_ISSUE_N(x, L.attn_fill, nf, FR(m.attn_out, D));
         } else {
             if (L.norm_a)
-                RAD_ISSUE_N(x, L.norm_a, T, brows(m.xcol, T), RAD_W(L.attn_norm), brows(m.xn, T));
+                RAD_ISSUE_N(x, L.norm_a, nk, KR(m.xcol, D), RAD_W(L.attn_norm), KR(m.xn, D));
             const rad_buf cs = r > 0 ? m.cs_b : m.cs_a;
             /* The compressor (at a kv source) and the indexer (at an index source) read xn and qrn
              * as the query and key chains do, and their only order with them is the compressed
@@ -2975,29 +3151,31 @@ static void step(RadCtx* x, const RadBatch* batch) {
              * is in the other chain, so a recorded pass can leave it unordered behind it (the
              * tape's hazard check) and the two chains' dispatches overlap; one after the other,
              * every op but kv_g waits for the one before. Same kernels on the same operands. */
-            const auto q_a = [&] { RAD_ISSUE_N(x, L.q_a, T, brows(m.xn, T), RAD_W(L.wq_a), brows(m.qr, T)); };
-            const auto q_an = [&] { RAD_ISSUE_N(x, L.q_an, T, brows(m.qr, T), RAD_W(L.q_norm), brows(m.qrn, T)); };
-            const auto q_b = [&] { RAD_ISSUE_N(x, L.q_b, T, brows(m.qrn, T), RAD_W(L.wq_b), brows(m.q, T)); };
-            const auto q_rope = [&] { RAD_ISSUE_N(x, L.q_rope, T, brows(m.q, T), brows(cs, g.max_ctx), pos); };
-            const auto kv_g = [&] { RAD_ISSUE_N(x, L.kv_g, T, brows(m.xn, T), RAD_W(L.wkv), brows(m.kv, T)); };
+            const int64_t ql = c.q_lora;
+            const auto q_a = [&] { RAD_ISSUE_N(x, L.q_a, nf, FR(m.xn, D), RAD_W(L.wq_a), FR(m.qr, ql)); };
+            const auto q_an = [&] { RAD_ISSUE_N(x, L.q_an, nf, FR(m.qr, ql), RAD_W(L.q_norm), FR(m.qrn, ql)); };
+            const auto q_b = [&] { RAD_ISSUE_N(x, L.q_b, nf, FR(m.qrn, ql), RAD_W(L.wq_b), FR(m.q, HD)); };
+            const auto q_rope = [&] { RAD_ISSUE_N(x, L.q_rope, nf, FR(m.q, HD), brows(cs, g.max_ctx), fpos); };
+            const auto kv_g = [&] { RAD_ISSUE_N(x, L.kv_g, nk, KR(m.xn, D), RAD_W(L.wkv), KR(m.kv, hd)); };
             /* The window key's norm, rope and round trip: one op (kv_f) where declared, else
              * kv_n here and kv_rope / kv_q at the next two points. */
             const auto kv_n = [&] {
                 if (L.kv_f)
-                    RAD_ISSUE_N(x, L.kv_f, T, brows(m.kv, T), RAD_W(L.kv_norm), brows(m.kvn, T),
-                                brows(cs, g.max_ctx), pos);
+                    RAD_ISSUE_N(x, L.kv_f, nk, KR(m.kv, hd), RAD_W(L.kv_norm), KR(m.kvn, hd),
+                                brows(cs, g.max_ctx), kpos);
                 else
-                    RAD_ISSUE_N(x, L.kv_n, T, brows(m.kv, T), RAD_W(L.kv_norm), brows(m.kvn, T));
+                    RAD_ISSUE_N(x, L.kv_n, nk, KR(m.kv, hd), RAD_W(L.kv_norm), KR(m.kvn, hd));
             };
             const auto kv_rope = [&] {
-                if (!L.kv_f) RAD_ISSUE_N(x, L.kv_rope, T, brows(m.kvn, T), brows(cs, g.max_ctx), pos);
+                if (!L.kv_f) RAD_ISSUE_N(x, L.kv_rope, nk, KR(m.kvn, hd), brows(cs, g.max_ctx), kpos);
             };
             const auto kv_q = [&] {
-                if (L.kv_q) RAD_ISSUE_N(x, L.kv_q, T, brows(m.kvn, T));
+                if (L.kv_q) RAD_ISSUE_N(x, L.kv_q, nk, KR(m.kvn, hd));
             };
             const auto kv_st = [&] {
-                RAD_ISSUE_N(x, L.kv_st, T, bcol(m.kvn, 0, hd / 2, T), bcol(m.kvn, hd / 2, hd / 2, T),
-                            praw(wb->slot_mapping, RAD_I32, T), kv_cache(m.win, l));
+                RAD_ISSUE_N(x, L.kv_st, nk, bcol_at(m.kvn, rk, hd, 0, hd / 2, nk),
+                            bcol_at(m.kvn, rk, hd, hd / 2, hd / 2, nk),
+                            praw(wb->slot_mapping + rk, RAD_I32, nk), kv_cache(m.win, l));
             };
             const auto c_gemm = [&] {
                 if (L.src)
@@ -3066,21 +3244,22 @@ static void step(RadCtx* x, const RadBatch* batch) {
                     RAD_ISSUE_N(x, L.c_tail, T, brows(m.kvs, T), pos, cu, kv_cache(m.tail[r], l),
                                 praw2(tb->state_index, RAD_I32, S, tpitch));
             };
+            const int64_t iqw = c.ih * c.idim;
             const auto i_q = [&] {
-                if (L.i_score) RAD_ISSUE_N(x, L.i_q, T, brows(m.qrn, T), RAD_W(L.iq_w), brows(m.iq, T));
+                if (L.i_score) RAD_ISSUE_N(x, L.i_q, nf, FR(m.qrn, ql), RAD_W(L.iq_w), FR(m.iq, iqw));
             };
             const auto i_rope = [&] {
                 if (!L.i_score) return;
                 if (L.i_f)
-                    RAD_ISSUE_N(x, L.i_f, T, brows(m.iq, T), brows(m.cs_b, g.max_ctx), pos);
+                    RAD_ISSUE_N(x, L.i_f, nf, FR(m.iq, iqw), brows(m.cs_b, g.max_ctx), fpos);
                 else
-                    RAD_ISSUE_N(x, L.i_rope, T, brows(m.iq, T), brows(m.cs_b, g.max_ctx), pos);
+                    RAD_ISSUE_N(x, L.i_rope, nf, FR(m.iq, iqw), brows(m.cs_b, g.max_ctx), fpos);
             };
             const auto i_qq = [&] {
-                if (L.i_score && L.i_qq) RAD_ISSUE_N(x, L.i_qq, T, brows(m.iq, T));
+                if (L.i_score && L.i_qq) RAD_ISSUE_N(x, L.i_qq, nf, FR(m.iq, iqw));
             };
             const auto i_w = [&] {
-                if (L.i_score) RAD_ISSUE_N(x, L.i_w, T, brows(m.xn, T), RAD_W(L.iproj), brows(m.iw, T));
+                if (L.i_score) RAD_ISSUE_N(x, L.i_w, nf, FR(m.xn, D), RAD_W(L.iproj), FR(m.iw, c.ih));
             };
             const auto i_score = [&] {   /* the scores, the candidates and the selection */
                 if (!L.i_score) return;
@@ -3092,21 +3271,24 @@ static void step(RadCtx* x, const RadBatch* batch) {
                 const bool uses = c.cand >= 0 && c.cand < l;
                 /* Run by run (index_runs()): score R rows into the plane, then select from them
                  * before the next run overwrites it. Rows are independent, so each row's score,
-                 * candidates and selection are the whole step's. */
-                const int64_t n = (T + m.irows - 1) / m.irows, R = (T + n - 1) / n;
-                for (int64_t p = 0; p * R < T; ++p) {
-                    const int64_t r0 = p * R, rows = std::min(R, T - r0);
-                    const RadOperand prow = praw(batch->positions + r0, RAD_I32, rows);
-                    RAD_ISSUE_N(x, L.i_runs[(size_t)p], R, brows(m.iq, T), brows(m.iw, T),
+                 * candidates and selection are the whole step's. Under the per-row cut the runs
+                 * cover the layer's rows [rf, T): the operands start there (with one sequence every
+                 * row is cu's sequence 0 wherever it starts), the keep mask and the selection at the
+                 * step's own rows. */
+                const int64_t n = (nf + m.irows - 1) / m.irows, R = (nf + n - 1) / n;
+                for (int64_t p = 0; p * R < nf; ++p) {
+                    const int64_t r0 = p * R, rows = std::min(R, nf - r0), at = rf + r0;
+                    const RadOperand prow = praw(batch->positions + at, RAD_I32, rows);
+                    RAD_ISSUE_N(x, L.i_runs[(size_t)p], R, FR(m.iq, iqw), FR(m.iw, c.ih),
                                 kv_cache(m.index[r], src),
-                                praw2(ib->block_table, RAD_I32, S, ib->block_table_pitch), pos, cu,
+                                praw2(ib->block_table, RAD_I32, S, ib->block_table_pitch), fpos, cu,
                                 bcol(m.score, 0, live, R));
                     if (L.i_cand)
                         RAD_ISSUE_N(x, L.i_cand, rows, bcol(m.score, 0, live, rows), prow,
-                                    bcol_at(m.keep, r0, m.kwords, 0, kw, rows));
+                                    bcol_at(m.keep, at, m.kwords, 0, kw, rows));
                     RAD_ISSUE_N(x, L.i_topk, rows, bcol(m.score, 0, live, rows),
-                                uses ? bcol_at(m.keep, r0, m.kwords, 0, kw, rows) : RAD_NONE, prow,
-                                brow_slice(m.sel, r0, rows, c.itopk));
+                                uses ? bcol_at(m.keep, at, m.kwords, 0, kw, rows) : RAD_NONE, prow,
+                                brow_slice(m.sel, at, rows, c.itopk));
                 }
             };
 
@@ -3147,39 +3329,41 @@ static void step(RadCtx* x, const RadBatch* batch) {
             if (L.src) i_qq();
             l_q(); k_q(); l_st(); k_st(); i_score();
 
+            /* The attention over the layer's rows: with one sequence its window base comes from the
+             * operand's last row, the step's own (attn_dec_emit), wherever the rows start. */
             if (r > 0) {
                 const int src = c.src_of[(size_t)l];
                 const auto* cb = kv_batch(batch, m.comp[r]);
-                RAD_ISSUE_N(x, L.attn, T, brows(m.q, T), kv_cache(m.win, l), wbt, wused,
+                RAD_ISSUE_N(x, L.attn, nf, FR(m.q, HD), kv_cache(m.win, l), wbt, wused,
                             kv_cache(m.comp[r], src),
-                            praw2(cb->block_table, RAD_I32, S, cb->block_table_pitch), brows(m.sel, T),
-                            pos, cu, RAD_W(L.sinks), brows(m.o, T));
+                            praw2(cb->block_table, RAD_I32, S, cb->block_table_pitch), FR(m.sel, c.itopk),
+                            fpos, cu, RAD_W(L.sinks), FR(m.o, HD));
             } else {
-                RAD_ISSUE_N(x, L.attn, T, brows(m.q, T), kv_cache(m.win, l), wbt, wused, RAD_NONE,
-                            RAD_NONE, RAD_NONE, pos, cu, RAD_W(L.sinks), brows(m.o, T));
+                RAD_ISSUE_N(x, L.attn, nf, FR(m.q, HD), kv_cache(m.win, l), wbt, wused, RAD_NONE,
+                            RAD_NONE, RAD_NONE, fpos, cu, RAD_W(L.sinks), FR(m.o, HD));
             }
             if (L.o_f) {
-                RAD_ISSUE_N(x, L.o_f, T, brows(m.o, T), brows(cs, g.max_ctx), pos);
+                RAD_ISSUE_N(x, L.o_f, nf, FR(m.o, HD), brows(cs, g.max_ctx), fpos);
             } else {
-                RAD_ISSUE_N(x, L.o_rope, T, brows(m.o, T), brows(cs, g.max_ctx), pos);
-                if (L.o_q) RAD_ISSUE_N(x, L.o_q, T, brows(m.o, T));
+                RAD_ISSUE_N(x, L.o_rope, nf, FR(m.o, HD), brows(cs, g.max_ctx), fpos);
+                if (L.o_q) RAD_ISSUE_N(x, L.o_q, nf, FR(m.o, HD));
             }
-            const int64_t gd = HD / m.gr;
+            const int64_t gd = HD / m.gr, ow = m.gr * c.o_rank;
             for (int j = 0; j < m.gr; ++j)
-                RAD_ISSUE_N(x, L.o_a[(size_t)j], T, bcol(m.o, j * gd, gd, T), RAD_W(L.wo_a[(size_t)j]),
-                            bcol(m.oa, j * c.o_rank, c.o_rank, T));
+                RAD_ISSUE_N(x, L.o_a[(size_t)j], nf, FC(m.o, HD, j * gd, gd), RAD_W(L.wo_a[(size_t)j]),
+                            FC(m.oa, ow, j * c.o_rank, c.o_rank));
             if (late) mix_a();
-            RAD_ISSUE_N(x, L.o_b, T, brows(m.oa, T), RAD_W(L.wo_b), brows(m.attn_out, T));
+            RAD_ISSUE_N(x, L.o_b, nf, FR(m.oa, ow), RAD_W(L.wo_b), FR(m.attn_out, D));
         }
         if (key_only) break;   /* an attention-zero rank's key layer: its collapse alone */
-        if (L.ar_attn) RAD_ISSUE_N(x, L.ar_attn, T * D, brows(m.attn_out, T), RAD_NONE);
+        if (L.ar_attn) RAD_ISSUE_N(x, L.ar_attn, nf * D, FR(m.attn_out, D), RAD_NONE);
         if (L.pcn_f)   /* post_a, col_f and norm_f in one */
-            RAD_ISSUE_N(x, L.pcn_f, T, brows(m.attn_out, T), brows(m.h0, T), brows(m.post, T),
-                        brows(m.comb, T), brows(m.h1, T), brows(m.pre_a, T), brows(m.xcol, T),
-                        RAD_W(L.ffn_norm), brows(m.act.x, T));
+            RAD_ISSUE_N(x, L.pcn_f, nf, FR(m.attn_out, D), FR(m.h0, HN), FR(m.post, hc),
+                        FR(m.comb, hc * hc), FR(m.h1, HN), FR(m.pre_a, hc), FR(m.xcol, D),
+                        RAD_W(L.ffn_norm), FR(m.act.x, D));
         else
-            RAD_ISSUE_N(x, L.post_a, T, brows(m.attn_out, T), brows(m.h0, T), brows(m.post, T),
-                        brows(m.comb, T), brows(m.h1, T));
+            RAD_ISSUE_N(x, L.post_a, nf, FR(m.attn_out, D), FR(m.h0, HN), FR(m.post, hc),
+                        FR(m.comb, hc * hc), FR(m.h1, HN));
 
         /* The ffn connection's mix is likewise needed first by the next mhc_post, so the MoE block
          * issues it (MoeFP8::Beside) behind its routed and shared gate_up, where a recorded pass
@@ -3188,15 +3372,16 @@ static void step(RadCtx* x, const RadBatch* batch) {
         const auto col_f = [&] {
             if (L.pcn_f) {
             } else if (L.cn_f) {
-                RAD_ISSUE_N(x, L.cn_f, T, brows(m.h1, T), brows(m.pre_a, T), brows(m.xcol, T),
-                            RAD_W(L.ffn_norm), brows(m.act.x, T));
+                RAD_ISSUE_N(x, L.cn_f, nf, FR(m.h1, HN), FR(m.pre_a, hc), FR(m.xcol, D),
+                            RAD_W(L.ffn_norm), FR(m.act.x, D));
             } else {
-                RAD_ISSUE_N(x, L.col_f, T, brows(m.h1, T), brows(m.pre_a, T), brows(m.xcol, T));
-                RAD_ISSUE_N(x, L.norm_f, T, brows(m.xcol, T), RAD_W(L.ffn_norm), brows(m.act.x, T));
+                RAD_ISSUE_N(x, L.col_f, nf, FR(m.h1, HN), FR(m.pre_a, hc), FR(m.xcol, D));
+                RAD_ISSUE_N(x, L.norm_f, nf, FR(m.xcol, D), RAD_W(L.ffn_norm), FR(m.act.x, D));
             }
         };
         col_f();
         MixBeside mb{ &L, &m, T };
+        mb.r0 = rf;
         /* The next layer's reads (decode passes only). Ahead of an Engram layer that is at most
          * its engram_kv, since its 79 MB GEMM would evict anything else before the attention
          * (pf_layer()); by default nothing. */
@@ -3209,30 +3394,45 @@ static void step(RadCtx* x, const RadBatch* batch) {
         bs.fn = mix_f_beside;
         bs.arg = &mb;
         bs.tail = pf_tail;
-        L.moe.step(x, batch, bs);
-        /* post_f, or post_f with the next collapse + norm (the next layer's pcn_a, or pcn_fin). */
+        if (row0) {
+            /* The layer's rows alone, one pass (a chunk is at most the block's pass height). */
+            bs.first_row = rf;
+            L.moe.pass(x, T, rf, nf, true, &bs);
+            L.moe.route_report(x);
+        } else {
+            L.moe.step(x, batch, bs);
+        }
+        /* post_f, or post_f with the next collapse + norm (the next layer's pcn_a, or pcn_fin). Under the
+         * per-row cut the next layer's key rows are this layer's rows. */
         const Layer* nx = L.l + 1 < c.n_layer ? &m.layers[(size_t)L.l + 1] : nullptr;
         if (nx && nx->pcn_a)
-            RAD_ISSUE_N(x, nx->pcn_a, T, brows(m.act.x, T), brows(m.h1, T), brows(m.post, T),
-                        brows(m.comb, T), brows(m.h0, T), brows(m.pre_f, T), brows(m.xcol, T),
-                        RAD_W(nx->attn_norm), brows(m.xn, T));
+            RAD_ISSUE_N(x, nx->pcn_a, nf, FR(m.act.x, D), FR(m.h1, HN), FR(m.post, hc),
+                        FR(m.comb, hc * hc), FR(m.h0, HN), FR(m.pre_f, hc), FR(m.xcol, D),
+                        RAD_W(nx->attn_norm), FR(m.xn, D));
         else if (!nx && m.pcn_fin)
-            RAD_ISSUE_N(x, m.pcn_fin, T, brows(m.act.x, T), brows(m.h1, T), brows(m.post, T),
-                        brows(m.comb, T), brows(m.h0, T), brows(m.pre_f, T), brows(m.xcol, T),
-                        RAD_W(m.final_gain), brows(m.final_hidden, T));
+            RAD_ISSUE_N(x, m.pcn_fin, nf, FR(m.act.x, D), FR(m.h1, HN), FR(m.post, hc),
+                        FR(m.comb, hc * hc), FR(m.h0, HN), FR(m.pre_f, hc), FR(m.xcol, D),
+                        RAD_W(m.final_gain), FR(m.final_hidden, D));
         else
-            RAD_ISSUE_N(x, L.post_f, T, brows(m.act.x, T), brows(m.h1, T), brows(m.post, T),
-                        brows(m.comb, T), brows(m.h0, T));
+            RAD_ISSUE_N(x, L.post_f, nf, FR(m.act.x, D), FR(m.h1, HN), FR(m.post, hc),
+                        FR(m.comb, hc * hc), FR(m.h0, HN));
     }
     if (m.pfs.reads != pf_reads0) ++m.pfs.steps;
     if (cut_full) return;   /* a cut pass samples nothing: no final norm, no head */
+    /* Under the per-row cut the final norm runs on the last layer's rows, and nothing when it has none
+     * (the step samples nothing then: checked above). */
+    const int64_t fr = row0 ? row0[c.n_layer - 1] : 0, fn = T - fr;
+    if (row0 && fr >= T) return;
+    const int64_t HN = c.hc * D;
     if (m.pcn_fin) {
     } else if (m.cn_fin) {
-        RAD_ISSUE_N(x, m.cn_fin, T, brows(m.h0, T), brows(m.pre_f, T), brows(m.xcol, T),
-                    RAD_W(m.final_gain), brows(m.final_hidden, T));
+        RAD_ISSUE_N(x, m.cn_fin, fn, brow_slice(m.h0, fr, fn, HN), brow_slice(m.pre_f, fr, fn, c.hc),
+                    brow_slice(m.xcol, fr, fn, D), RAD_W(m.final_gain), brow_slice(m.final_hidden, fr, fn, D));
     } else {
-        RAD_ISSUE_N(x, m.contract, T, brows(m.h0, T), brows(m.pre_f, T), brows(m.xcol, T));
-        RAD_ISSUE_N(x, m.fnorm, T, brows(m.xcol, T), RAD_W(m.final_gain), brows(m.final_hidden, T));
+        RAD_ISSUE_N(x, m.contract, fn, brow_slice(m.h0, fr, fn, HN), brow_slice(m.pre_f, fr, fn, c.hc),
+                    brow_slice(m.xcol, fr, fn, D));
+        RAD_ISSUE_N(x, m.fnorm, fn, brow_slice(m.xcol, fr, fn, D), RAD_W(m.final_gain),
+                    brow_slice(m.final_hidden, fr, fn, D));
     }
     if (batch->n_out > 0) {
         RAD_ISSUE_N(x, m.gather, batch->n_out, brows(m.final_hidden, T),
@@ -3286,6 +3486,11 @@ static void cut_report() {
                              "%llu layer-passes in full, %llu key ops alone and skipped %llu\n",
                      r, (unsigned long long)s.passes, (unsigned long long)s.full,
                      (unsigned long long)s.key, (unsigned long long)s.skipped);
+        if (s.row_passes)
+            std::fprintf(stderr, "radiance: deepseek41: rank %d: consumer skip, per row: %llu steps cut by "
+                                 "row issued %llu layer-rows in full, %llu key ops alone and skipped %llu\n",
+                         r, (unsigned long long)s.row_passes, (unsigned long long)s.rows_full,
+                         (unsigned long long)s.rows_key, (unsigned long long)s.rows_skipped);
     }
 }
 }  // namespace deepseek41

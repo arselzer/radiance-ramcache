@@ -12,7 +12,14 @@
  *     compressed and index key stores;
  *   - a cut that samples, or names a layer outside the suffix, fails the step;
  *   - over a whole prompt's passes (the schedule's F for each), every layer's stores are issued on
- *     exactly the passes the schedule says. */
+ *     exactly the passes the schedule says;
+ *   - the per-row cut (RadBatch::consumer_row0, large-chunk prefill): the 16-row grain is declared
+ *     and taken; a step with every row0 at 0 issues the plain step's ops with its operands; a cut
+ *     1,024-row chunk issues each layer's key ops on [row0[L-1], T) and its other ops on [row0[L],
+ *     T) with operands offset to those rows (positions, slot mapping and the per-row buffers at the
+ *     step's own rows), its stores before its attention, its MoE pass from row0[L] with the ffn mix
+ *     beside it, nothing of the layers with no rows and no head; a malformed row0, or one given
+ *     without the declaration's grain, is refused or ignored. */
 #define RAD_ARCH_NO_EXPORTS 1
 
 #include "arch_fakes.h"
@@ -20,6 +27,7 @@
 #include "../arch/deepseek41/deepseek41.cpp"
 #include "../core/sched/consumer_skip.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <set>
 #include <string>
@@ -32,7 +40,8 @@ constexpr int kWorld = 4;
 const char* const kVars[] = { "RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP",
                               "RADIANCE_EXPERIMENTAL_DS41_PREFETCH_ATTN",
                               "RADIANCE_EXPERIMENTAL_DS41_ENGRAM_SPLIT",
-                              "RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8" };
+                              "RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8",
+                              "RADIANCE_EXPERIMENTAL_DS41_KV_REPLICATED" };
 struct Env {
     Env(std::initializer_list<std::pair<const char*, const char*>> kv) {
         for (const char* n : kVars) unsetenv(n);
@@ -108,11 +117,12 @@ struct Decl {
     deepseek41::Model* m = nullptr;
 };
 /* deepseek41's declare for `rank` of four at 16 rows a step, under the current environment. */
-std::unique_ptr<Decl> declare(int rank, MetaKV meta, int max_spec = 0, int world = kWorld) {
+std::unique_ptr<Decl> declare(int rank, MetaKV meta, int max_spec = 0, int world = kWorld,
+                              int64_t max_tok = 16) {
     auto d = std::make_unique<Decl>();
     d->b.kv_block_of = block_of;
     RadBuildCtx ctx = build_ctx(rank, world);
-    ctx.max_tok = 16;
+    ctx.max_tok = max_tok;
     ctx.max_ctx = 8192;
     ctx.max_spec = max_spec;
     d->err = stderr_of([&] { d->rc = deepseek41::declare(&d->b, meta.meta(), &ctx); });
@@ -390,6 +400,315 @@ TEST(ds41_a_prompt_under_the_schedule_stores_what_the_schedule_says) {
     }
     CHECK(cut > 0);
     CHECK_EQ(m.cuts.passes, (uint64_t)cut);
+}
+
+/* The same with checkpoints below the target made whole (consumer_skip.h, "complete
+ * checkpoints"): F follows each checkpoint's cone up to it and falls back after it, so the passes
+ * of one prompt cut deeper, then shallower, then deeper again; each pass still stores each layer's
+ * keys exactly when it runs the layer in full or its keys alone, the pass ending at a checkpoint
+ * stores layer 39's keys, and nothing is sampled before the last pass. */
+TEST(ds41_a_prompt_with_whole_checkpoints_stores_what_the_schedule_says) {
+    Env env({ { "RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP", "1" } });
+    auto d = declare(1);
+    REQUIRE_EQ(d->rc, (int)RAD_OK);
+    const deepseek41::Model& m = *d->m;
+    const rad::ConsumerShape shape{ 40, 20, 128, 16, 16 };
+    const int64_t n = 1600, target = 1584;
+    const std::vector<int64_t> whole = { 256, 512, 768, 1024, 1280 };
+    const std::vector<int64_t> f = rad::consumer_thresholds(shape, target);
+    REQUIRE_EQ(f.size(), (size_t)40);
+    int cut = 0, falls = 0;
+    int32_t prev = 0;
+    for (int64_t s = 0; s < n; s += 16) {
+        const int64_t e = std::min<int64_t>(n, s + 16);
+        const auto it = std::lower_bound(whole.begin(), whole.end(), e);
+        const int32_t F = it == whole.end()
+            ? rad::consumer_full_layers(shape, f, e - 1)
+            : rad::consumer_pass_layers(shape, f, rad::consumer_ckpt_thresholds(shape, *it), e - 1);
+        if (std::binary_search(whole.begin(), whole.end(), e)) CHECK_EQ(F, 39);
+        falls += F < prev;
+        prev = F;
+        auto k = kit(d->b, {}, { (int)(e - s) }, (int32_t)s);
+        if (e < n) {
+            k->out.clear();
+            k->b.n_out = 0;
+            k->b.out_ids = nullptr;
+        }
+        k->b.consumer_full = F < 40 ? F : 0;
+        cut += F < 40;
+        auto r = run_passes(d->b, deepseek41::step, { k.get() }, 1, kWorld);
+        REQUIRE(steps_ok(r));
+        const std::vector<rad_op> got = issued(*r[0]);
+        for (int l = 0; l < 40; ++l) {
+            const deepseek41::Layer& L = m.layers[(size_t)l];
+            int stores = 0;
+            for (rad_op h : got) stores += h == L.kv_st;
+            CHECK_EQ(stores, l <= F ? 1 : 0);   /* in full, or its keys alone */
+        }
+        const std::vector<std::string> names = issued_ops(d->b, *r[0]);
+        CHECK_EQ(count_issued(names, "logits_gemm") + count_issued(names, "logits_gemm_ggml"),
+                 e == n ? 1 : 0);
+    }
+    CHECK(falls >= 4);   /* after each checkpoint but the last ones the target's cone covers */
+    CHECK(cut > 0);
+    CHECK_EQ(m.cuts.passes, (uint64_t)cut);
+}
+
+/* ================================================================== the per-row cut */
+namespace {
+
+/* The 1,024-row chunk at `at` of a 3,086-token prompt, cut by row for that target (or not: plain). */
+std::unique_ptr<Kit> row_chunk(const RadBuilder& b, int32_t at, int32_t T, std::vector<int32_t>* row0, bool cut,
+                               bool sample = false) {
+    auto k = kit(b, {}, { T }, at);
+    if (!sample) {
+        k->out.clear();
+        k->b.n_out = 0;
+        k->b.out_ids = nullptr;
+    }
+    row0->assign(40, 0);
+    if (cut) {
+        const rad::ConsumerShape c16{ 40, 20, 128, 16, 16 };
+        const std::vector<int64_t> f = rad::consumer_thresholds(c16, 3086);
+        rad::consumer_row_starts(c16, f.data(), at, at + T, row0->data());
+        int32_t F = 20;
+        while (F < 40 && (*row0)[(size_t)F] < T) ++F;
+        k->b.consumer_full = F < 40 ? F : 0;
+        k->b.consumer_end = 3086;
+    }
+    k->b.consumer_row0 = row0->data();
+    return k;
+}
+
+}  // namespace
+
+TEST(ds41_row_cut_declares_its_grain) {
+    Env env({ { "RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP", "1" } });
+    auto d = declare(0, flash_meta(), 0, kWorld, 1024);
+    REQUIRE_EQ(d->rc, (int)RAD_OK);
+    CHECK_EQ(d->b.consumer.row_grain, 16);
+    CHECK(d->m->cut_rows);
+}
+
+/* Every row0 at 0 is the plain step, op for op and operand for operand. One kit runs both steps, so
+ * the raw operands (pointers into its batch fields) are comparable, without and then with the row
+ * starts; operands compare field by field (a RadOperand has padding a memcmp would read). */
+bool same_operand(const RadOperand& a, const RadOperand& b) {
+    return a.kind == b.kind && a.dtype == b.dtype && a.handle == b.handle && a.raw == b.raw &&
+           a.offset == b.offset && a.rows == b.rows && a.cols == b.cols;
+}
+TEST(ds41_row_cut_at_row_zero_is_the_plain_step) {
+    Env env({ { "RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP", "1" } });
+    for (int rank : { 0, 3 }) {
+        auto d = declare(rank, flash_meta(), 0, kWorld, 1024);
+        REQUIRE_EQ(d->rc, (int)RAD_OK);
+        std::vector<int32_t> z;
+        auto k = row_chunk(d->b, 0, 1024, &z, false);
+        k->b.consumer_row0 = nullptr;
+        auto rp = run_passes(d->b, deepseek41::step, { k.get() }, rank, kWorld);
+        k->b.consumer_row0 = z.data();
+        auto rz = run_passes(d->b, deepseek41::step, { k.get() }, rank, kWorld);
+        REQUIRE(steps_ok(rp));
+        REQUIRE(steps_ok(rz));
+        REQUIRE_EQ(rp[0]->issues.size(), rz[0]->issues.size());
+        int differ = 0;
+        for (size_t i = 0; i < rp[0]->issues.size(); ++i) {
+            const RecIssue &a = rp[0]->issues[i], &b = rz[0]->issues[i];
+            bool same = a.op == b.op && a.n == b.n && a.opd.size() == b.opd.size();
+            for (size_t j = 0; same && j < a.opd.size(); ++j) same = same_operand(a.opd[j], b.opd[j]);
+            if (!same && differ++ < 4) fprintf(stderr, "    issue %zu (%s) differs\n", i, op_name(d->b, a.op).c_str());
+        }
+        CHECK_EQ(differ, 0);
+        CHECK_EQ(d->m->cuts.row_passes, (uint64_t)1);   /* the second step took the row path */
+    }
+}
+
+/* A cut 1,024-row chunk (the first of a 3,086-token prompt: layers 20, 21, 22 on 384, 256 and 128
+ * rows, layer 23's keys on 128, nothing after it). */
+TEST(ds41_row_cut_issues_each_layer_on_its_rows) {
+    Env env({ { "RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP", "1" } });
+    for (int rank = 0; rank < kWorld; ++rank) {
+        auto d = declare(rank, flash_meta(), 0, kWorld, 1024);
+        REQUIRE_EQ(d->rc, (int)RAD_OK);
+        const deepseek41::Model& m = *d->m;
+        std::vector<int32_t> row0;
+        auto k = row_chunk(d->b, 0, 1024, &row0, true);
+        CHECK_EQ(1024 - row0[20], 384);
+        CHECK_EQ(1024 - row0[22], 128);
+        CHECK_EQ(k->b.consumer_full, 23);
+        auto r = run_passes(d->b, deepseek41::step, { k.get() }, rank, kWorld);
+        REQUIRE(steps_ok(r));
+        const RadCtx& c = *r[0];
+        const int64_t T = 1024;
+        int bad_rows = 0, bad_off = 0, moe = 0, mixf = 0;
+        const int64_t HD = m.g.n_head * m.c.head_dim;
+        for (int l = 20; l < 40; ++l) {
+            const deepseek41::Layer& L = m.layers[(size_t)l];
+            const int64_t rk = l <= 20 ? 0 : row0[(size_t)l - 1], rf = row0[(size_t)l];
+            std::set<rad_op> own, keys;
+            layer_ops(L, &own, &keys);
+            int64_t kv_st_at = -1, attn_at = -1;
+            for (size_t i = 0; i < c.issues.size(); ++i) {
+                const RecIssue& is = c.issues[i];
+                if (!own.count(is.op) || is.op == L.pcn_a) continue;
+                if (rk >= T) { ++bad_rows; continue; }   /* a layer with no rows issues nothing */
+                if (is.op == L.kv_st) kv_st_at = (int64_t)i;   /* a source's too (its keys are on every row) */
+                if (L.src && keys.count(is.op)) continue;   /* the compressor's own row counts */
+                const bool key = keys.count(is.op) != 0;
+                const int64_t want = is.op == L.ar_attn ? (T - rf) * 5120 : key ? T - rk : T - rf;
+                if (is.op == L.i_score || std::find(L.i_runs.begin(), L.i_runs.end(), is.op) != L.i_runs.end())
+                    continue;   /* scored in runs of the plane's rows */
+                if (is.n != want) {
+                    if (bad_rows < 4)
+                        fprintf(stderr, "    layer %d %s: %lld rows, want %lld\n", l, op_name(d->b, is.op).c_str(),
+                                (long long)is.n, (long long)want);
+                    ++bad_rows;
+                }
+                if (is.op == L.kv_st) {
+                    /* the window key's halves from row rk, the slot mapping from rk */
+                    if (is.opd[0].offset != rk * 512 || is.opd[2].raw != (const void*)(k->slot.data() + rk)) ++bad_off;
+                }
+                if (is.op == L.attn) {
+                    attn_at = (int64_t)i;
+                    if (is.opd[0].offset != rf * HD) ++bad_off;                              /* q from rf */
+                    if (is.opd[7].raw != (const void*)(k->pos.data() + rf)) ++bad_off;   /* positions from rf */
+                }
+                if (is.op == L.mix_f) ++mixf;
+            }
+            if (rk < T && attn_at >= 0) CHECK(kv_st_at >= 0 && kv_st_at < attn_at);   /* keys before attention */
+        }
+        /* Each layer's MoE (MoeFP8's own handles): layers 0..22 run it once, its router, scatter and
+         * grouped GEMMs on the layer's rows [rf, T) (the gate_up's token rows from rf), the ffn mix beside
+         * it; layers 23.. run none of it. */
+        int bad_moe = 0;
+        for (int l = 0; l < 40; ++l) {
+            const deepseek41::Layer& L = m.layers[(size_t)l];
+            const int64_t rf = row0[(size_t)l];
+            const rad_op route[] = { L.moe.op_router, L.moe.op_router_fused, L.moe.op_topk, L.moe.op_scatter,
+                                     L.moe.op_topk_scatter, L.moe.op_sigmoid_scatter };
+            int gu = 0, dn = 0;
+            for (const RecIssue& is : c.issues) {
+                if (is.op == L.moe.op_gu) {
+                    ++gu;
+                    ++moe;
+                    if (is.n != T - rf || is.opd.empty() || is.opd[0].offset != rf * 5120 || is.opd[0].rows != T - rf)
+                        ++bad_moe;
+                } else if (is.op == L.moe.op_dn) {
+                    ++dn;
+                    ++moe;
+                    if (is.n != T - rf) ++bad_moe;
+                } else {
+                    for (rad_op h : route)
+                        if (h && is.op == h && is.n != T - rf) ++bad_moe;
+                }
+            }
+            if (l < 23 ? gu != 1 || dn != 1 : gu + dn != 0) {
+                if (bad_moe < 4) fprintf(stderr, "    layer %d: %d gate_up and %d down issues\n", l, gu, dn);
+                ++bad_moe;
+            }
+        }
+        CHECK_EQ(bad_rows, 0);
+        CHECK_EQ(bad_off, 0);
+        CHECK_EQ(bad_moe, 0);
+        CHECK_EQ(mixf, 3);     /* the ffn mix beside every cut layer that runs its MoE (20..22) */
+        CHECK_EQ(moe, 23 * 2);
+        const std::vector<std::string> names = issued_ops(d->b, c);
+        CHECK_EQ(count_issued(names, "logits_gemm") + count_issued(names, "gather_rows"), 0);
+        CHECK_EQ(m.cuts.row_passes, (uint64_t)1);
+        CHECK_EQ(m.cuts.rows_full, (uint64_t)(20 * 1024 + 384 + 256 + 128));
+    }
+}
+
+/* The last chunk of the prompt (14 rows, sampling): every row0 is 0, the head runs. A sampled row
+ * outside the last layer's rows, a row0 not nested, a step of two sequences: the step fails. A row0
+ * the plugin did not declare the grain for is not read. */
+TEST(ds41_row_cut_refuses_what_its_contract_does_not_cover) {
+    Env env({ { "RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP", "1" } });
+    auto d = declare(0, flash_meta(), 0, kWorld, 1024);
+    REQUIRE_EQ(d->rc, (int)RAD_OK);
+    std::vector<int32_t> row0;
+    auto last = row_chunk(d->b, 3072, 14, &row0, true, /*sample=*/true);
+    for (int32_t v : row0) CHECK_EQ(v, 0);
+    auto r = run_passes(d->b, deepseek41::step, { last.get() }, 0, kWorld);
+    REQUIRE(steps_ok(r));
+    const std::vector<std::string> names = issued_ops(d->b, *r[0]);
+    CHECK_EQ(count_issued(names, "logits_gemm"), 1);
+    /* Sampling a row the last layer does not run. */
+    auto bad = row_chunk(d->b, 0, 1024, &row0, true, /*sample=*/true);
+    r = run_passes(d->b, deepseek41::step, { bad.get() }, 0, kWorld);
+    CHECK(r[0]->step_fail.find("per-row cut") != std::string::npos);
+    /* Not nested. */
+    std::vector<int32_t> odd;
+    auto nn = row_chunk(d->b, 0, 1024, &odd, true);
+    odd[30] = 0;
+    r = run_passes(d->b, deepseek41::step, { nn.get() }, 0, kWorld);
+    CHECK(r[0]->step_fail.find("per-row cut") != std::string::npos);
+    /* Two sequences. */
+    auto two = kit(d->b, {}, { 512, 512 }, 0);
+    std::vector<int32_t> z(40, 0);
+    z[39] = 16;
+    two->out.clear();
+    two->b.n_out = 0;
+    two->b.out_ids = nullptr;
+    two->b.consumer_row0 = z.data();
+    r = run_passes(d->b, deepseek41::step, { two.get() }, 0, kWorld);
+    CHECK(r[0]->step_fail.find("per-row cut") != std::string::npos);
+    /* Without the grain taken, a row0 is not read: the plain step. */
+    d->m->cut_rows = false;
+    std::vector<int32_t> ig;
+    auto ign = row_chunk(d->b, 0, 1024, &ig, true);
+    ign->b.consumer_full = 0;
+    auto plain = kit(d->b, {}, { 1024 }, 0);
+    plain->out.clear();
+    plain->b.n_out = 0;
+    plain->b.out_ids = nullptr;
+    auto ri = run_passes(d->b, deepseek41::step, { ign.get() }, 0, kWorld);
+    auto rp = run_passes(d->b, deepseek41::step, { plain.get() }, 0, kWorld);
+    REQUIRE(steps_ok(ri));
+    REQUIRE(steps_ok(rp));
+    CHECK(issued(*ri[0]) == issued(*rp[0]));
+}
+
+/* RADIANCE_EXPERIMENTAL_DS41_KV_REPLICATED (kv_replicate): the compressed and index caches are
+ * declared replicated on every rank of four, so a host-tier entry holds one copy; the window, the
+ * compressor tails and the Engram history are left alone, and without the switch nothing is
+ * declared. At three ranks one keeps no attention cache (attention-zero), so it is refused there
+ * on every rank, with its line from rank 0. */
+TEST(ds41_kv_replicated_declares_the_full_caches_on_every_rank) {
+    for (int on = 0; on < 2; ++on) {
+        Env env({});
+        if (on) setenv("RADIANCE_EXPERIMENTAL_DS41_KV_REPLICATED", "1", 1);
+        for (int rank = 0; rank < kWorld; ++rank) {
+            auto d = declare(rank);
+            REQUIRE_EQ(d->rc, (int)RAD_OK);
+            int full = 0, rep = 0;
+            for (const RecKV& k : d->b.kv_groups) {
+                const bool f = k.name.rfind("kv_index_r", 0) == 0 ||
+                               k.name.rfind("kv_compressed_r", 0) == 0;
+                full += f;
+                if (k.replicated) {
+                    ++rep;
+                    CHECK(f);
+                }
+            }
+            CHECK_EQ(full, 4);                    /* index and compressed, at ratios 2 and 1 */
+            CHECK_EQ(rep, on ? 4 : 0);
+            const bool line = d->err.find("KV_REPLICATED: 4 paged group(s) declared replicated "
+                                          "(kv_index_r1,kv_index_r2,kv_compressed_r1,"
+                                          "kv_compressed_r2)") != std::string::npos;
+            CHECK_EQ(line, on && rank == 0);
+        }
+    }
+    Env env({ { "RADIANCE_EXPERIMENTAL_DS41_KV_REPLICATED", "1" } });
+    for (int rank = 0; rank < 3; ++rank) {
+        auto d = declare(rank, flash_meta(), 0, 3);
+        REQUIRE_EQ(d->rc, (int)RAD_OK);
+        CHECK_EQ(d->m->zero, rank == 2);
+        for (const RecKV& k : d->b.kv_groups) CHECK(!k.replicated);
+        const bool refused = d->err.find("KV_REPLICATED refused: a rank keeps no attention cache") !=
+                             std::string::npos;
+        CHECK_EQ(refused, rank == 0);
+    }
 }
 
 RAD_TEST_MAIN()

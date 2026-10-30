@@ -975,6 +975,13 @@ struct Config {
     /* RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP (core/sched/consumer_skip.h): -1 reads the variable
      * at the scheduler's start ("1" turns it on), 0 off, 1 on. A field so a test can set it. */
     int     consumer_skip = -1;
+    /* RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP_CKPT, the checkpoints below a cut prompt's target
+     * the cut makes whole (consumer_skip.h, "complete checkpoints"; Scheduler::consumer_target):
+     * -2 reads the variable (unset: a band of 512, the default with the prefix cache; "all"; a
+     * token count N; 0), -1
+     * every one its idle prefill writes, 0 none (not written), N > 0 those within N tokens below
+     * the target and the request's keep point. */
+    int64_t consumer_skip_ckpt = -2;
     /* Cap on linear-state (or sliding-window) snapshots held at once, for the whole server. The
      * slots are pinned host memory, all allocated at startup and never on the card (spec §7.3).
      * A slot is a sizeable fraction of a gigabyte on a linear-attention model, so raising the cap

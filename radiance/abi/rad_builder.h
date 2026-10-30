@@ -832,8 +832,23 @@ typedef struct RadConsumerSuffix {
     int32_t  n_layer;     /* the trunk's layers: RadModelMeta::n_layers */
     int32_t  boundary;    /* B: layers below it are never cut; it always runs at least its key ops */
     int32_t  window;      /* W: an attention at position p reads its layer's keys p - W + 1 .. p */
+    /* ---- appended: the per-row cut (large-chunk prefill). 0 (or a declaration from a header
+     * without it, struct_size 16): passes are cut by layer only. A grain G > 0: the plugin can also
+     * run a layer on a suffix of a step's rows that starts on a multiple of G within the step and
+     * reads RadBatch::consumer_row0 in a step that carries it: layer L in full on rows
+     * [consumer_row0[L], n_tok) only, its key ops (as above) on [consumer_row0[L - 1], n_tok) (all
+     * rows at the boundary), every op's operands offset to those rows, and every per-row buffer kept
+     * at the step's own row index; a layer whose key rows are empty issues nothing, and the final
+     * norm and head run only where the output rows are (every one at or past consumer_row0's last).
+     * Every other step runs as before. The engine takes the grain only where it equals its chunk
+     * quantum (core/sched/consumer_skip.h, consumer_row_starts). */
+    int32_t  row_grain;
 } RadConsumerSuffix;
 int rad_declare_consumer_suffix(RadBuilder* b, const RadConsumerSuffix* d);
+/* The row grain the engine recorded from the declaration above (0: none, or no declaration): a plugin
+ * reads RadBatch::consumer_row0 only when this says its grain was taken, since an engine older than
+ * the per-row cut has neither this export (a weak reference is null) nor the field. Additive export. */
+int rad_consumer_row_grain(RadBuilder* b);
 
 /* ================================================================== the encoder */
 /* A media encoder the plugin runs on an encoder pass (RadBatch::enc). The core drives the pass and

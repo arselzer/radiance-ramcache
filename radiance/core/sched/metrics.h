@@ -114,7 +114,8 @@ struct SchedMetrics {
      * state or a window snapshot), a windowed trunk group no window snapshot covers, or blocks
      * that could not be adopted. `hit_cut_resumed_below` counts those that resumed at a
      * snapshot more than one checkpoint interval below the hit: the previous reply was longer
-     * than an interval (decode writes no snapshot), the retention policy kept nothing nearer, or
+     * than an interval (decode writes no snapshot without RADIANCE_EXPERIMENTAL_PREFIX_EORS), the
+     * retention policy kept nothing nearer, or
      * a restore was cut (prefix_restore_cuts). `hit_cut_tokens` is the checkpoint shortfall:
      * prompt tokens the attention cache held and the admission computed again, because the hit
      * resumed at a snapshot below it or was cut to nothing. */
@@ -131,12 +132,26 @@ struct SchedMetrics {
     float   linear_hit_rate = 0.0f;
     int64_t checkpoints_written = 0;
     /* Checkpoints the consumer skip did not write: below their prompt's target, where its cut
-     * leaves the last layers' windows incomplete (core/sched/consumer_skip.h). */
+     * leaves the last layers' windows incomplete (core/sched/consumer_skip.h), and outside the
+     * ones it makes whole (RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP_CKPT); and those below the
+     * target it wrote whole. */
     int64_t consumer_ckpt_dropped = 0;
+    int64_t consumer_ckpt_whole = 0;
     /* RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH: finished sequences' computed tokens left
      * unpublished, past the last chunk an idle cold prefill would have cut the same way (the
      * prompt's last chunk, decode, a shared step). Cumulative; 0 without the switch. */
     int64_t prefix_publish_held_tokens = 0;
+    /* RADIANCE_EXPERIMENTAL_PREFIX_EORS (Scheduler::eors_): end-of-request snapshots reserved
+     * (decode steps at a grid position past their prompt, and prompts ending on the grid), and of
+     * those the cache committed (the save landed); steps not issued ahead because they carry one
+     * (their tokens are hashed into its key only after the step before commits); admissions that
+     * resumed from one, the tokens they reused and the deepest; and the store: snapshots held now
+     * and at most, given up by session (..._SESSION_LRU), and the entries of the conversation just
+     * published that its trim kept and a plain trim would have taken (the ones the request
+     * recomputed rather than adopted: IPrefixCache::trim_except). All 0 without the switch. */
+    int64_t eors_reserved = 0, eors_committed = 0, eors_ahead_withheld = 0;
+    int64_t eors_hits = 0, eors_hit_tokens = 0, eors_hit_deepest = 0;
+    int64_t store_held = 0, store_peak = 0, store_session_lru = 0, trim_spared = 0;
 
     /* Throughput: tokens over wall time in a 1-second decaying window (Scheduler::step_finished);
      * the counters beside them are exact. */
@@ -176,6 +191,10 @@ struct SchedMetrics {
     int64_t lookup_held = 0;
     int64_t lookup_held_drafts = 0;
     int64_t lookup_held_hits = 0;
+    /* RADIANCE_EXPERIMENTAL_DS41_DSPARK_GATE (draft_gate.h): every sequence's gate counters, the
+     * finished and the running, and the single-sequence decode steps by kind; `on` false and all
+     * zero while off. */
+    DraftGateStats draft_gate;
 };
 
 

@@ -7,6 +7,10 @@ and read each request's TTFT and cached prompt tokens (ab_requests.py --ttft).
   python3 -I make_prefix_receipt.py --long OUT.json LONG_RECEIPT.json
       the long-context receipt (work/extra-prompts/pfxlong-receipt.json, part Upfxlong), from
       long-receipt.json's 3,086-token document
+  python3 -I make_prefix_receipt.py --harness OUT.json REPO [--one]
+      the agent-harness receipt (work/extra-prompts/harness-receipt.json, part Uharness; with
+      --one harness1-receipt.json, Uharness1, its first session alone), from the repository REPO's
+      own public texts at the commit the window's run home was built from (see harness() below)
 
 Every reply is capped at MAX_TOKENS. Prompts are built by ab_requests.py from chat_turns in
 DeepSeek-V4.1's chat framing, every text tokenized by the server on its own, so each turn starts
@@ -44,6 +48,7 @@ compressed keys rather than keeping them all), one 3,086-token GPL-3 text:
      last chunk and decode blocks beneath L4's tail).
 """
 import json
+import subprocess
 import sys
 
 MAX_TOKENS = 48
@@ -176,9 +181,133 @@ def long_ctx(out, long_receipt):
     print("%s: %d requests; text %d chars, cut at %d" % (out, len(reqs), len(text), cut))
 
 
+# ------------------------------------------------------------------ the agent-harness receipt
+#
+# What an agent harness sends: every turn is the whole conversation again -- a system prompt, then
+# the turns so far, each with the model's own reply sent back (assistant_from), then the new user
+# message or tool output. Two sessions, interleaved turn by turn (A1 B1 A2 B2 ...), as two agents
+# sharing a server would send them:
+#   hxA  a code-review agent: a system prompt of about 2,900 tokens (its rules and the project's
+#        NOTICE), a task, five tool outputs of source code from the repository (prefix.h in three
+#        parts, the retention policies of prefix.cpp, geometry.h), and a closing request: 7 turns,
+#        about 9.4K tokens at the last (the official tokenizer's count, replies at their cap).
+#   hxB  a licence-compliance agent: a system prompt of about 2,300 tokens (its rules and the
+#        Apache-2.0 LICENSE), a task, four tool outputs (the two vendored MIT licences,
+#        consumer_skip.h, geometry.cpp) and a closing request: 6 turns, about 9.8K at the last.
+# Each turn adds 0.4-3.4K tokens and asks for a reply of up to HX_MAX_TOKENS. Under the prefix
+# cache with end-of-request snapshots a turn should prefill only what it added, plus at most 15
+# reply tokens; cold, the whole conversation: about 79K prompt tokens over the 13 turns, against
+# about 19K. The texts are sliced by line from HX_REV and their first line checked, so the receipt
+# is the same wherever it is built.
+HX_MAX_TOKENS = 128
+
+HX_A_RULES = (
+    "You are a code-review agent working inside a C++ inference engine's repository. You can call "
+    "one tool, read_file(path, first_line, last_line), and the harness answers each call with the "
+    "file's lines in a fenced block. Work in small steps: read what you need, then say what you "
+    "found before you read more. Keep every answer under 120 words, name functions and fields "
+    "exactly as the source spells them, and say when a conclusion rests on code you have not read. "
+    "Never invent a line number. When you are asked to summarize, give five bullet points and "
+    "nothing else. The project's NOTICE file follows; credit contributors by the names it uses.\n\n")
+HX_B_RULES = (
+    "You are a licence-compliance agent. You read the licence texts of a project and of the code "
+    "it vendors and answer questions about what a redistributor must do. You can call one tool, "
+    "read_file(path), and the harness answers each call with the file in a fenced block. Quote the "
+    "clause you rely on, give its section number, and keep every answer under 120 words. When two "
+    "licences impose different duties, list each one apart. The project's own LICENSE follows.\n\n")
+
+
+# The texts are read from this commit of the repository (git show), not its working tree, so the
+# receipt does not move when the files do.
+HX_REV = "b0a84f7c"
+
+
+def hx_slice(repo, path, first, last, starts):
+    """Lines [first, last] (1-based) of `path` at HX_REV in the repository `repo`, which must begin
+    with `starts`."""
+    src = subprocess.run(["git", "-C", repo, "show", "%s:%s" % (HX_REV, path)], check=True,
+                         capture_output=True).stdout.decode("utf-8")
+    lines = src.splitlines(keepends=True)
+    text = "".join(lines[first - 1:last])
+    if not text.lstrip().startswith(starts):
+        raise SystemExit("%s:%d: expected %r, found %r" % (path, first, starts, text[:60]))
+    return text
+
+
+def hx_tool(path, first, last, text):
+    return ("Tool output for read_file(\"%s\", %d, %d):\n```\n%s```\n" % (path, first, last, text))
+
+
+def harness(out, repo, one=False):
+    notice = hx_slice(repo, "NOTICE", 1, 130, "radiance")
+    license_ = hx_slice(repo, "LICENSE", 1, 202, "Apache License")
+    a_tools = [
+        ("core/mem/prefix.h", 1, 60, "/* prefix.h -- prefix caching"),
+        ("core/mem/prefix.h", 91, 162, "/* ------------------------------------------------------------------ the split lookup"),
+        ("core/mem/prefix.h", 163, 235, "/* The policy --checkpoint-policy names"),
+        ("core/mem/prefix.cpp", 58, 138, "/* ------------------------------------------------------------------ retention policies"),
+        ("core/sched/geometry.h", 1, 101, "/* geometry.h"),
+    ]
+    a_asks = [
+        "Read the top of core/mem/prefix.h first: what does the prefix cache key a block by, and why "
+        "is a linear-state hit handled apart from an attention hit?",
+        "Which fields of CacheHit tell the scheduler how far it may resume, and what does a HitCap do?",
+        "What decides the size of the snapshot store, and what bounds it?",
+        "Explain in your own words which snapshots GeometricBackoff::select keeps.",
+        "How does the resume grid of --prefix-resume exact follow from the chunk geometry?",
+    ]
+    b_tools = [
+        ("vendor/nlohmann/LICENSE.MIT", 1, 21, "MIT License"),
+        ("vendor/cpp-httplib/LICENSE", 1, 22, "The MIT License"),
+        ("core/sched/consumer_skip.h", 1, 151, "/* consumer_skip.h"),
+        ("core/sched/geometry.cpp", 1, 239, "/* geometry.cpp"),
+    ]
+    b_asks = [
+        "What must a redistributor of a binary that contains this code do under the MIT licence above?",
+        "Does this second MIT licence add anything to the first? Answer by clause.",
+        "This header is the project's own code: which licence covers it, and must a modified copy say "
+        "so?",
+        "Same question for this file, and name the section of the Apache licence that governs "
+        "modified files.",
+    ]
+    for path, first, last, starts in a_tools + b_tools:
+        hx_slice(repo, path, first, last, starts)   # every slice checked before anything is written
+
+    def session(tag, system, task, tools, asks, closing):
+        reqs, turns = [], []
+        users = [task] + [hx_tool(p, f, l, hx_slice(repo, p, f, l, s)) + "\n" + q
+                          for (p, f, l, s), q in zip(tools, asks)] + [closing]
+        for i, u in enumerate(users):
+            name = "%s-%d" % (tag, i + 1)
+            r = req(name, turns + [{"user": u}], HX_MAX_TOKENS)
+            r["request"]["chat_system"] = system
+            r["family"] = tag
+            reqs.append(r)
+            turns = turns + [{"user": u, "assistant_from": name}]
+        return reqs
+
+    a = session("hxA", HX_A_RULES + notice,
+                "We are reviewing how this engine reuses a conversation's prefix between turns. Start "
+                "with core/mem/prefix.h and tell me what you will read first and why.",
+                a_tools, a_asks, "Summarize your review.")
+    b = session("hxB", HX_B_RULES + license_,
+                "List the licences a binary distribution of this project must carry, and tell me which "
+                "files you will read to be sure.",
+                b_tools, b_asks, "Write the attribution section for a binary distribution, in at most "
+                "eight lines.")
+    reqs = a if one else [r for pair in zip(a, b) for r in pair] + a[len(b):] + b[len(a):]
+    json.dump({"benchmark_requests": reqs}, open(out, "w"), indent=1, ensure_ascii=False)
+    print("%s: %d requests (%s); system prompts %d and %d chars" % (
+        out, len(reqs), "hxA alone" if one else "hxA and hxB interleaved",
+        len(HX_A_RULES + notice), len(HX_B_RULES + license_)))
+
+
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == "--long":
         long_ctx(sys.argv[2], sys.argv[3])
+        return
+    if len(sys.argv) > 1 and sys.argv[1] == "--harness":
+        harness(sys.argv[2], sys.argv[3], one="--one" in sys.argv[4:])
         return
     out = sys.argv[1]
     mpl = sys.argv[2] if len(sys.argv) > 2 else "/usr/share/common-licenses/MPL-2.0"

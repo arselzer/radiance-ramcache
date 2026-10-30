@@ -26,6 +26,7 @@
 #include "place/plane_mirror.h"
 #include "place/dspark_native_scope.h"
 #include "place/dspark_draft_control_scope.h"
+#include "place/draft_vram_load.h"
 #include "kvstream/bringup.h"
 #include "kvstream/plan.h"
 #include "runtime/arena.h"
@@ -1626,6 +1627,9 @@ int Engine::plan() {
     PlaneMirror::configure({ cfg_.expert_plane_mirror, cfg_.expert_plane_mirror_share,
                              (int)cfg_.expert_plane_mirror_min_rows,
                              cfg_.expert_plane_mirror_decode_share });
+    /* RADIANCE_EXPERIMENTAL_DS41_DRAFT_VRAM (place/draft_vram.h, engine_dvram.cpp): every rank's hot
+     * draft experts, resolved against the container's directory before any rank plans. */
+    RAD_TRY(draft_vram_open());
     // The external DECODE vector owns its rows until every rank's Planner has consumed them.
     NativeDecodeProfile decode_profile;
     const bool native_profile = meta_.arch_id && !std::strcmp(meta_.arch_id, "deepseek41");
@@ -2030,6 +2034,7 @@ int Engine::plan() {
         in.config     = &rc;
         in.rank       = r->index;
         in.world_size = cfg_.tp;
+        in.draft_vram = draft_vram_n_ > 0 ? &draft_vram_rank_[ri] : nullptr;
         std::vector<RadFileProfile> rank_profile;
         if (!decode_profile.rows.empty()) {
             in.profile = decode_profile.rows.data();
@@ -3003,6 +3008,7 @@ static int fill_from_checkpoint(const CkptWeight& cw, const std::vector<PlaneSha
 
 int Engine::load_weights() {
     int64_t total = 0, n_loaded = 0, n_missing = 0;
+    int64_t n_parked = 0;   /* RADIANCE_EXPERIMENTAL_DS41_DRAFT_VRAM: parked draft weights published */
     /* Counted apart from `n_loaded`: mapped weights are published in place, not loaded. */
     int64_t n_mapped = 0, mapped_bytes = 0;
     std::array<std::vector<std::pair<int64_t, int64_t>>,2> mapped_ranges;   /* kept cached by the sweep's drop */
@@ -3050,6 +3056,16 @@ int Engine::load_weights() {
             });
         }
         RAD_TRY(r->mover.init(r->program, r->plan, mc, &r->pools));
+        /* RADIANCE_EXPERIMENTAL_DS41_DRAFT_VRAM: where each parked draft weight is published (its
+         * stage's first resident, slot for slot), now that the residents have addresses. */
+        std::vector<void*> dv_alias;
+        if (draft_vram_n_ > 0) {
+            std::string why;
+            if (const int st = draft_vram_aliases(r->program, r->plan, r->mover, &dv_alias, &why); st < 0) {
+                RAD_ERR("draft VRAM: rank %d: %s", r->index, why.c_str());
+                return st;
+            }
+        }
         /* What the mover took, before the first copy. Its slabs are allocated in init, so the pool
          * is as full as it will get; a load stopping with zero free is a placement failure, not
          * a loader one. */
@@ -3139,6 +3155,17 @@ int Engine::load_weights() {
             w.file_offset = e ? source->plane(*e, w.sel[0]).offset : 0;
             for (int k = 0; k < w.n_sel && e; ++k)
                 w.file_plane_offset[k] = source->plane(*e, w.sel[k]).offset;
+            /* RADIANCE_EXPERIMENTAL_DS41_DRAFT_VRAM: a parked draft expert is never read. It is
+             * published at a resident draft expert's weight of its slot on this card, so every
+             * pointer the grouped GEMM is handed names card memory; the masked router never routes
+             * to it (draft_vram_mask). No copy, no mapping, no page touched. */
+            if (!dv_alias.empty() && dv_alias[i]) {
+                w.ptr = dv_alias[i];
+                w.host_ptr = nullptr;
+                r->mover.publish_mapped((rad_weight)i, w.ptr);
+                ++n_parked;
+                continue;
+            }
             const bool direct = weight_file_direct(w, cfg_.tp);
             /* The file tier also serves a weight it relays on every read (weight_file_relaid):
              * each selected plane whole in the container, as many bytes as the plane holds. */
@@ -3433,6 +3460,11 @@ int Engine::load_weights() {
                  humanb(mapped_bytes).c_str(),
                  cfg_.tp > 1 ? " (summed over ranks, which map the same file: the resident bytes "
                                "are that divided by --tp)" : "");
+    if (draft_vram_n_ > 0) {
+        RAD_INFO("load: %lld parked draft weight(s) (RADIANCE_EXPERIMENTAL_DS41_DRAFT_VRAM, all ranks) "
+                 "published at resident draft experts' addresses; nothing read for them", (long long)n_parked);
+        RAD_TRY(draft_vram_mask());
+    }
     return RAD_OK;
 }
 
@@ -3494,6 +3526,49 @@ int Engine::size_checkpoint_store(int64_t slot, const char* what) {
     }
     const int64_t total = meminfo_bytes("MemTotal");
     const int64_t share = total > 0 ? total / 8 : room;
+
+    /* RADIANCE_EXPERIMENTAL_CHECKPOINT_STORE_MIB=N: the store as a byte budget rather than the
+     * live sequences' share. Auto sizes it for --max-num-seqs sessions at --max-model-len, which
+     * is the store a server needs while its running turns write snapshots; a harness keeps many
+     * more conversations than it runs at once, each wanting its own ladder and its tip back
+     * (QFN's 40 snapshots in 4.42 GiB). N MiB holds N MiB over a slot's size of them, bounded by
+     * what the host can pin, which on a box with the expert RAM cache is the binding figure. */
+    if (const char* sm = std::getenv("RADIANCE_EXPERIMENTAL_CHECKPOINT_STORE_MIB"); sm && *sm) {
+        char* end = nullptr;
+        const long long mib = std::strtoll(sm, &end, 10);
+        if (end && *end == '\0' && mib > 0 && mib <= ((int64_t)1 << 30)) {
+            const int64_t want = mib * ((int64_t)1 << 20) / slot;
+            const int64_t n = std::min(want, std::max<int64_t>(room, 0) / slot);
+            cfg_.checkpoint_slots = n;
+            const std::string why =
+                fmt("RADIANCE_EXPERIMENTAL_CHECKPOINT_STORE_MIB %lld: %lld %s snapshot(s) of %s%s",
+                    (long long)mib, (long long)want, what, humanb(slot).c_str(),
+                    n < want ? fmt(", held to %lld by what the host can pin: %s", (long long)n,
+                                   limit.c_str()).c_str() : "");
+            decide("--checkpoint-slots", std::to_string(n), why);
+            if (n == 0) {
+                RAD_WARN("checkpoint slots: %s -- no room for one, so every prefix hit on this model "
+                         "prefills from the start%s", why.c_str(), cache_margin_hint().c_str());
+                return RAD_OK;
+            }
+            const std::string line =
+                fmt("checkpoint slots: a byte budget: %lld %s snapshot(s) of %s in pinned host "
+                    "memory (%s of the %lld MiB asked), none of it on the card; that is %.1f "
+                    "sessions of the %lld snapshots %s keeps for a %lld-token one at a "
+                    "%lld-token interval, its running turn's included",
+                    (long long)n, what, humanb(slot).c_str(), humanb(slot * n).c_str(),
+                    (long long)mib,
+                    (double)n / (double)std::max<int64_t>(1, pol->held(ctx, interval) + 1),
+                    (long long)(pol->held(ctx, interval) + 1), pol->name(), (long long)ctx,
+                    (long long)interval);
+            if (n < want) RAD_WARN("%s", line.c_str());
+            else RAD_INFO("%s", line.c_str());
+            return RAD_OK;
+        }
+        RAD_WARN("checkpoint slots: RADIANCE_EXPERIMENTAL_CHECKPOINT_STORE_MIB=%s is not a size in "
+                 "MiB; sized by --checkpoint-slots auto", sm);
+    }
+
     const CheckpointSlots c = checkpoint_slots_auto(*pol, cfg_.max_seqs, ctx, interval, slot,
                                                     share, room);
     cfg_.checkpoint_slots = c.slots;
@@ -3689,6 +3764,23 @@ int Engine::configure_kv() {
     for (auto& r : ranks_) {
         LogRank lr(r->index);
         RAD_TRY(r->prefix.configure(cfg_, &r->kv, geo_.checkpoint_interval));
+    }
+    /* RADIANCE_EXPERIMENTAL_PREFIX_SESSION_LRU=1: a full snapshot store gives up the least recently
+     * used session's snapshots, shallowest first, before any of a session used since
+     * (PrefixCache::set_session_lru). Rank 0's cache hands out the slots; every rank's is set. */
+    if (const char* sl = std::getenv("RADIANCE_EXPERIMENTAL_PREFIX_SESSION_LRU");
+        sl && !std::strcmp(sl, "1")) {
+        for (auto& r : ranks_) r->prefix.set_session_lru(true);
+        if (cfg_.prefix_cache && ck_store_.enabled())
+            RAD_INFO("snapshot store: by session (RADIANCE_EXPERIMENTAL_PREFIX_SESSION_LRU) -- once "
+                     "retention has run, a full store gives up the least recently used "
+                     "conversation's snapshots, its shallowest first and its tip last, before any "
+                     "snapshot of a conversation used since (%lld slots of %s)",
+                     (long long)ck_store_.capacity(), humanb(ck_store_.slot_bytes()).c_str());
+        else
+            RAD_WARN("snapshot store: RADIANCE_EXPERIMENTAL_PREFIX_SESSION_LRU has nothing to order: "
+                     "there is no snapshot store (no prefix cache, no state to snapshot, or "
+                     "--checkpoint-slots 0)");
     }
 
     /* ---------------- the idle session tiers (spec §7.3) ---------------- */
@@ -3891,7 +3983,8 @@ int Engine::start() {
     }
     startup_begin_ns_ = rad_mono_ns();
     if (!draft_experiment_.valid()) {
-        RAD_ERR("experimental draft control: stats/OFF must be absent or0|1, verify cap absent or0..5, with no positive-cap/OFF conflict");
+        RAD_ERR("experimental draft control: stats/OFF must be absent or0|1, verify cap absent or0..5, with no positive-cap/OFF conflict; "
+                "%s absent, 0, 1 or T[,W[,R]] (T in (0, 64], W 1..64, R 1..4096), and not with compute OFF", kDraftGateEnv);
         return RAD_E_INVAL;
     }
     std::vector<int> devs;
@@ -4056,11 +4149,13 @@ int Engine::start() {
          * verified ones. */
         const bool short_ok = cfg_.draft_short_from == 0 || (cfg_.draft_short_from == 1 && drafter_short_ > 0);
         for (const auto& r : ranks_) {
-            if (!dspark_draft_control_scope(r->program, r->plan, cfg_, bool(source_banks_)) ||
+            if (!dspark_draft_control_scope(r->program, r->plan, cfg_, bool(source_banks_), draft_vram_n_) ||
                 (draft_experiment_.verify_cap() >= 0 && !short_ok)) {
                 RAD_ERR("experimental draft control requires a bound native DSpark EP4 "
-                        "fixed-depth5 bank and all96 final immutable host-pinned head pairs (verify cap "
-                        "also requires draft-short-from0, or 1 with the drafter's short block)");
+                        "fixed-depth5 bank and all96 final immutable host-pinned head pairs, or with "
+                        "RADIANCE_EXPERIMENTAL_DS41_DRAFT_VRAM=N N static VRAM pairs a stage and the rest "
+                        "parked (verify cap also requires draft-short-from0, or 1 with the drafter's "
+                        "short block)");
                 return RAD_E_UNSUPPORTED;
             }
         }

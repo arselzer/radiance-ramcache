@@ -375,10 +375,12 @@ CacheHit PrefixCache::lookup(const std::vector<int32_t>& tokens,
     }
     hit.n_linear_tokens = (int32_t)best->second.pos;
     hit.checkpoint_slot = best->second.slot;
+    hit.ckpt_eors = best->second.eors;
     best->second.used = best->second.resumed = ++clock_;
     best->second.used_ns = now;
     handed_.push_back(best->first);
     ++stats_.ckpt_hits;
+    if (best->second.eors) ++stats_.ckpt_eors_hits;
     if (session != 0) take_over(session, hs, hit.n_attn_tokens);
     return hit;
 }
@@ -652,12 +654,29 @@ int64_t PrefixCache::evict_lru(int64_t n) {
 
 int64_t PrefixCache::trim(int64_t n_entries) { return trim_sparing(n_entries, nullptr); }
 
+int64_t PrefixCache::trim_except(const std::vector<int32_t>& tokens,
+                                 const std::vector<MMContentKey>& mm, int64_t n_tokens,
+                                 int64_t n_entries) {
+    if (!enabled_ || n_entries <= 0) return 0;
+    const int64_t n = std::min<int64_t>(std::max<int64_t>(n_tokens, 0), (int64_t)tokens.size());
+    const std::vector<BlockHash> hs = chain_all(tokens, mm, n / block_size_);
+    if (hs.empty()) return trim_sparing(n_entries, nullptr);
+    const std::unordered_set<BlockHash, BlockHashHash> spare(hs.begin(), hs.end());
+    int64_t spared = 0;
+    const int64_t done = trim_sparing(n_entries, &spare, &spared);
+    stats_.trim_spared += spared;
+    return done;
+}
+
 int64_t PrefixCache::trim_sparing(int64_t n_entries,
-                                  const std::unordered_set<BlockHash, BlockHashHash>* spare) {
+                                  const std::unordered_set<BlockHash, BlockHashHash>* spare,
+                                  int64_t* spared) {
     /* Tiers attached but off count as no tiers: no copy will ever land, so do not wait for one. */
     const bool keep = tiers_ && tiers_->host_on();
     const uint64_t now = rad_mono_ns();
     int64_t done = 0;
+    /* The entries a plain trim would have taken so far, spared or not: it stops at n_entries. */
+    int64_t takeable = 0;
     auto it = lru_.begin();
     for (int64_t seen = (int64_t)lru_.size(); it != lru_.end() && done < n_entries && seen > 0;
          --seen) {
@@ -665,7 +684,16 @@ int64_t PrefixCache::trim_sparing(int64_t n_entries,
         auto m = map_.find(h);
         if (m == map_.end()) { it = lru_.erase(it); continue; }
         Entry& e = m->second;
-        if (spare && spare->count(h)) { ++it; continue; }
+        if (spare && spare->count(h)) {
+            /* trim_except: counted when a plain trim would take it here (not shared, its copy
+             * landed if one is waited for, and the trim not yet done). Left in place, as the whole
+             * chain is, so it keeps its order, its end first, for the trims after. */
+            if (spared && !shared_with_live(e) && !(keep && demotable_ && !tiers_->droppable(h)) &&
+                takeable++ < n_entries)
+                ++*spared;
+            ++it;
+            continue;
+        }
         if (shared_with_live(e)) {
             /* In use: to the back, as in evict_lru. */
             auto next = std::next(it);
@@ -676,6 +704,7 @@ int64_t PrefixCache::trim_sparing(int64_t n_entries,
         }
         /* Skip an entry whose copy is still in flight; one the tier cannot hold never gets a copy. */
         if (keep && demotable_ && !tiers_->droppable(h)) { ++it; continue; }
+        ++takeable;
         it = lru_.erase(it);
         e.in_lru = false;
         release_blocks(e);
@@ -824,8 +853,55 @@ int64_t PrefixCache::retain(uint64_t session) {
     return freed;
 }
 
+std::unordered_map<BlockHash, PrefixCache::Ckpt, BlockHashHash>::iterator
+PrefixCache::store_victim() {
+    auto victim = ck_by_prefix_.end();
+    if (!session_lru_) {
+        for (auto it = ck_by_prefix_.begin(); it != ck_by_prefix_.end(); ++it) {
+            if (handed(it->first) || reserved(it->first)) continue;
+            if (victim == ck_by_prefix_.end() || it->second.used < victim->second.used) victim = it;
+        }
+        return victim;
+    }
+    /* By session: each session's last use is the latest of its snapshots' (a snapshot handed out
+     * or reserved this step counts as a use now, and is itself never the victim); the session
+     * used longest ago gives up its shallowest snapshot. */
+    uint64_t oldest = UINT64_MAX;
+    uint64_t pick = 0;
+    bool found = false;
+    for (const auto& s : ck_by_session_) {
+        uint64_t last = 0;
+        bool any = false;
+        for (const BlockHash& h : s.second) {
+            auto it = ck_by_prefix_.find(h);
+            if (it == ck_by_prefix_.end()) continue;
+            const bool busy = handed(h) || reserved(h);
+            last = std::max(last, busy ? UINT64_MAX : it->second.used);
+            any = any || !busy;
+        }
+        if (!any || last >= oldest) continue;
+        oldest = last;
+        pick = s.first;
+        found = true;
+    }
+    if (found) {
+        for (const BlockHash& h : ck_by_session_[pick]) {
+            auto it = ck_by_prefix_.find(h);
+            if (it == ck_by_prefix_.end() || handed(h) || reserved(h)) continue;
+            if (victim == ck_by_prefix_.end() || it->second.pos < victim->second.pos) victim = it;
+        }
+        if (victim != ck_by_prefix_.end()) return victim;
+    }
+    /* A snapshot indexed under no session (one a take_over left behind) goes as before. */
+    for (auto it = ck_by_prefix_.begin(); it != ck_by_prefix_.end(); ++it) {
+        if (handed(it->first) || reserved(it->first)) continue;
+        if (victim == ck_by_prefix_.end() || it->second.used < victim->second.used) victim = it;
+    }
+    return victim;
+}
+
 int PrefixCache::reserve_checkpoint(uint64_t session, int64_t pos, const BlockHash& prefix,
-                                    int32_t* slot_out) {
+                                    int32_t* slot_out, bool eors) {
     if (!enabled_ || !has_linear_) return RAD_E_UNSUPPORTED;
     if (!slot_out) return RAD_E_INVAL;
     /* The key is the chained hash of whole blocks, so `pos` must be on a block boundary. The
@@ -840,6 +916,7 @@ int PrefixCache::reserve_checkpoint(uint64_t session, int64_t pos, const BlockHa
     if (existing != ck_by_prefix_.end()) {
         existing->second.used = ++clock_;
         existing->second.used_ns = rad_mono_ns();
+        existing->second.eors = existing->second.eors || eors;
         /* Another session's snapshot, this step's save target: retention run by a later
          * reservation in this step places its ladder from THAT session's tip and may not keep
          * this position. Held until the save is committed. */
@@ -862,28 +939,28 @@ int PrefixCache::reserve_checkpoint(uint64_t session, int64_t pos, const BlockHa
              * restores from the slot ahead of the step; the save lands in it after). A tip gets
              * no protection beyond its recency: sessions are request ids, and a client that
              * rewrites its last message leaves one tip per turn that no later turn reaches, while
-             * the anchor every turn resumes from is used each turn. */
-            const Ckpt* victim = nullptr;
-            for (const auto& kvp : ck_by_prefix_) {
-                if (handed(kvp.first) || reserved(kvp.first)) continue;
-                if (!victim || kvp.second.used < victim->used) victim = &kvp.second;
-            }
-            if (!victim) {
+             * the anchor every turn resumes from is used each turn. Under session_lru_ the least
+             * recently used session's shallowest instead (store_victim). */
+            const auto vit = store_victim();
+            if (vit == ck_by_prefix_.end()) {
                 ++stats_.ckpt_refused;
                 RAD_DEBUG("prefix cache: no snapshot at %lld for session %llu: every one of the "
                           "%lld slots was handed out this step or awaits its save", (long long)pos,
                           (unsigned long long)session, (long long)ck_by_prefix_.size());
                 return RAD_E_FULL;
             }
+            const Ckpt* victim = &vit->second;
             RAD_DEBUG("prefix cache: store full, snapshot at %lld of session %llu (%s) evicted "
-                      "as the least recently used, unused for %.1f s", (long long)victim->pos,
+                      "as the least recently used%s, unused for %.1f s", (long long)victim->pos,
                       (unsigned long long)victim->session,
-                      is_tip(*victim) ? "its tip" : "below its tip", idle_s(victim->used_ns));
+                      is_tip(*victim) ? "its tip" : "below its tip",
+                      session_lru_ ? " session's shallowest" : "", idle_s(victim->used_ns));
             const BlockHash vh = victim->prefix;
             const uint64_t vs = victim->session;
-            retire_ckpt(ck_by_prefix_.find(vh));
+            retire_ckpt(vit);
             ++stats_.ckpt_evictions;
             ++stats_.ckpt_lru;
+            if (session_lru_) ++stats_.ckpt_session_lru;
             unindex_ckpt(vs, vh);
             if (kv_->alloc_checkpoint(&slot) < 0) { ++stats_.ckpt_refused; return RAD_E_FULL; }
         }
@@ -893,8 +970,10 @@ int PrefixCache::reserve_checkpoint(uint64_t session, int64_t pos, const BlockHa
     c.session = session; c.pos = pos; c.prefix = prefix; c.slot = slot;
     c.used = c.made = ++clock_;
     c.used_ns = rad_mono_ns();
+    c.eors = eors;
     ck_by_prefix_.emplace(prefix, c);
     ck_by_session_[session].push_back(prefix);
+    stats_.ckpt_peak = std::max<int64_t>(stats_.ckpt_peak, (int64_t)ck_by_prefix_.size());
     /* A save target until committed: a lookup's take_over may index it under another session
      * before the save, where retention run by a later reservation in this step would weigh it by
      * that session's ladder. */
@@ -911,6 +990,7 @@ void PrefixCache::commit_checkpoint(const BlockHash& prefix) {
     /* One that lost its slot since the reservation holds nothing to serve. */
     if (it->second.slot < 0) return;
     it->second.valid = true;
+    if (it->second.eors) ++stats_.ckpt_eors;
     /* Tell the tiers (for the session view) only now that the slot holds this state. */
     if (tiers_) tiers_->note_snapshot(prefix, it->second.slot, it->second.pos);
 }

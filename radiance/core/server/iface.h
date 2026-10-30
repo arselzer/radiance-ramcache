@@ -95,6 +95,11 @@ struct SchedMetrics {
     /* RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH: computed tokens left unpublished (the
      * scheduler's SchedMetrics::prefix_publish_held_tokens). 0 without the switch. */
     int64_t prefix_publish_held_tokens = 0;
+    /* RADIANCE_EXPERIMENTAL_PREFIX_EORS and the snapshot store (rad::SchedMetrics::eors_*,
+     * store_*, trim_spared). 0 without the switch, the store's figures aside. */
+    int64_t eors_reserved = 0, eors_committed = 0, eors_ahead_withheld = 0;
+    int64_t eors_hits = 0, eors_hit_tokens = 0, eors_hit_deepest = 0;
+    int64_t store_held = 0, store_peak = 0, store_session_lru = 0, trim_spared = 0;
     double  prefill_tps = 0.0;
     double  decode_tps = 0.0;
     /* Exact cumulative counts behind the EWMA rates above, for comparing runs.
@@ -104,6 +109,8 @@ struct SchedMetrics {
     double  draft_acceptance = 0.0;   /* 0..1, spec §10 */
     /* The exact pair the ratio is computed from. */
     rad::DraftOriginStats draft_origin;
+    /* RADIANCE_EXPERIMENTAL_DS41_DSPARK_GATE's counters (sched/draft_gate.h); `on` false while off. */
+    rad::DraftGateStats draft_gate;
     int64_t draft_tokens = 0;
     int64_t draft_accepted = 0;
     /* Prefix hits ended early for a windowed block drafter, and the tokens they gave back. */

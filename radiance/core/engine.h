@@ -36,6 +36,7 @@
 #include "format/table_copy.h"
 #include "format/dspark_rad_banks.h"
 #include "place/vram_packed.h"
+#include "place/draft_vram.h"
 #include "lora/adapter.h"
 #include "lora/slots.h"
 
@@ -157,6 +158,28 @@ private:
 
     /* --expert-stats FILE (place/xstats.h); null without the flag. */
     std::unique_ptr<ExpertStats> xstats_;
+
+    /* RADIANCE_EXPERIMENTAL_DS41_DRAFT_VRAM (place/draft_vram.h): the experts a stage a rank keeps in
+     * VRAM (0: off), the hot-set file, each rank's resident and model-wide ids, each stage's experts
+     * kept on some rank (the router's mask), and per rank and stage the draft routing histograms
+     * credited and the selections they counted on resident and on parked experts (want none). */
+    int                               draft_vram_n_ = 0;
+    DraftHotset                       draft_hotset_;
+    std::vector<DraftVramRank>        draft_vram_rank_;
+    std::vector<std::vector<uint8_t>> draft_vram_allowed_;
+    struct DraftVramTally {
+        uint64_t hist[kDraftStages] = {}, resident[kDraftStages] = {}, parked[kDraftStages] = {};
+        uint64_t masked_planes = 0;   /* correction planes written and read back masked at load */
+    };
+    std::vector<DraftVramTally>       draft_vram_tally_;
+    /* Before the planner: the switch, the file, and every rank's part, checked against the
+     * container's directory; at the load's end: the masked correction planes; per credited draft
+     * histogram: the tally; after the rank threads stop: the last banks and the shutdown line. */
+    int  draft_vram_open();
+    int  draft_vram_mask();
+    void draft_vram_credit(Rank& r, int layer, const int32_t* h, int64_t n);
+    void draft_vram_drain(Rank& r, int before_step);
+    void draft_vram_close();
 
     RadModelMeta   meta_{};
     LoadedPlugins  plugins_;
@@ -469,6 +492,10 @@ private:
     uint64_t post_stop_issued_ = 0, post_stop_turn_ns_ = 0;
     std::chrono::steady_clock::time_point post_stop_t_{};
     void post_stop_report();
+    /* RADIANCE_EXPERIMENTAL_PREFIX_EORS's shutdown line (Scheduler::eors_on): the end-of-request
+     * snapshots stored and their bytes, the steps not issued ahead for one, the hits that resumed
+     * from one (tokens reused, the deepest), and the snapshot store's occupancy. */
+    void eors_report();
     /* The arena level and the followers' pools, before any release that runs a forward pass. */
     int  prepare_release(const RadBatch* b);
     /* Whether a step may be issued ahead: requires that the drafter, if any, runs on the card (the

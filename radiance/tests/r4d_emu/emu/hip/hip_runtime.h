@@ -115,6 +115,7 @@ inline unsigned __byte_perm(unsigned x, unsigned y, unsigned s) {
 #define __builtin_amdgcn_s_barrier() __syncthreads()
 #define __builtin_amdgcn_fence(...) ((void)0)
 #define __builtin_amdgcn_sched_barrier(m) ((void)0)
+#define __builtin_amdgcn_sched_group_barrier(m, n, s) ((void)0)
 /* LDS atomics: fibers switch only at barriers, so a plain read-modify-write is indivisible */
 template <class T>
 inline T atomicAdd(T* p, T v) { const T o = *p; *p = o + v; return o; }

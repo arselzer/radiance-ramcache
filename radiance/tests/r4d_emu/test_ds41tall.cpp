@@ -19,8 +19,17 @@
  * The norms (r4d_ds41_elem.hip's fused mhc_collapse_rmsnorm, mhc_post_collapse_rmsnorm and
  * rmsnorm_rope_roundtrip, which take rmsnorm_bf16's width from r4d_act_threads): each row at pass
  * heights 1 to 48 against the same row launched alone and in launches of 16. Up to libr4d's reach
- * (32 without the switch, where the width stays 1024; kR4dDs41TallRows with it) every row must keep
- * its bytes; above it a row may differ, and the test counts how many did. */
+ * (32 without the switch, where the width stays 1024; r4d_ds41_tall_rows() with it) every row must
+ * keep its bytes; above it a row may differ, and the test counts how many did.
+ *
+ * Under RADIANCE_EXPERIMENTAL_DS41_LCP=<C> (large-chunk prefill; r4d_emu_ds41tall_lcp runs it with
+ * C = 1024) the twin's reach is kR4dDs41LcpMax: the routed GEMM is also held at 100, 171 and 256
+ * tokens, the norms at sampled heights up to 1024 rows of 1024 (against the same rows alone and 16 at
+ * a time), and two height switches of the graph that libr4d keeps byte-identical by construction are
+ * held to it here: gemm_nt_f32's tile forms over the router's 384 columns against the four 96-column
+ * slices a rank computes once the plugin splits the router by columns (from 256 rows, rad_glm_tp.h
+ * SplitF32Proj), and gemm_nt's tiled row against its skinny m64 row at 65 to 256 rows (the band the
+ * tiled row takes above 64 rows; N 128, K 512). */
 #include "rad_abi.h"
 #include "rad_plugin.h"
 #include "r4d_plugin.h"
@@ -266,9 +275,10 @@ int check(const Shape& sh, int T, int P, uint32_t seed, int* rows_checked) {
 
 /* ---- the norms ---------------------------------------------------------------------------------- */
 
-constexpr int kNormRows = 48;
+/* The rows a norm case holds: 48, or 1024 under LCP (norms_rows()). */
+int g_norm_rows = 48;
 
-/* One fused norm over kNormRows rows: `launch(r0, n)` runs rows [r0, r0 + n) as one pass and writes
+/* One fused norm over g_norm_rows rows: `launch(r0, n)` runs rows [r0, r0 + n) as one pass and writes
  * their outputs, which `outs` (buffer, bytes a row) hold row-major. */
 struct NormCase {
     const char* name;
@@ -287,32 +297,38 @@ std::vector<std::vector<uint8_t>> norm_run(NormCase& c, const std::vector<std::p
     for (auto& o : c.outs) std::memset(o.first->data(), 0xA5, o.first->size());
     for (const auto& r : runs)
         if (c.launch(r.first, r.second) != RAD_OK) return {};
-    std::vector<std::vector<uint8_t>> rows(kNormRows);
+    std::vector<std::vector<uint8_t>> rows((size_t)g_norm_rows);
     for (auto& o : c.outs)
-        for (int m = 0; m < kNormRows; ++m)
+        for (int m = 0; m < g_norm_rows; ++m)
             rows[(size_t)m].insert(rows[(size_t)m].end(), o.first->begin() + (size_t)m * o.second,
                                    o.first->begin() + (size_t)(m + 1) * o.second);
     return rows;
 }
 
-/* Heights 1..48 against rows alone and launches of 16. Returns the failures (a differing row at or
+/* The heights a norm case launches: 1..48, and under LCP sampled heights up to 1024. */
+std::vector<int> norm_height_list() {
+    if (g_norm_rows > 48) return { 1, 16, 17, 33, 48, 49, 65, 100, 171, 256, 257, 512, 1000, 1024 };
+    return { 1, 16, 17, 24, 25, 32, 33, 40, 48 };
+}
+
+/* The heights against rows alone and launches of 16. Returns the failures (a differing row at or
  * below `reach`); *above counts the rows that differed above it. */
 int norm_heights(NormCase& c, int reach, int* above) {
     std::vector<std::pair<int, int>> one, sixteen;
-    for (int m = 0; m < kNormRows; ++m) one.push_back({ m, 1 });
-    for (int m = 0; m < kNormRows; m += 16) sixteen.push_back({ m, std::min(16, kNormRows - m) });
+    for (int m = 0; m < g_norm_rows; ++m) one.push_back({ m, 1 });
+    for (int m = 0; m < g_norm_rows; m += 16) sixteen.push_back({ m, std::min(16, g_norm_rows - m) });
     const auto ref1 = norm_run(c, one), ref16 = norm_run(c, sixteen);
     if (ref1.empty() || ref16.empty()) {
         std::printf("FAIL %s: a launch was refused\n", c.name);
         return 1;
     }
     int fails = 0;
-    for (int m = 0; m < kNormRows; ++m)
+    for (int m = 0; m < g_norm_rows; ++m)
         if (ref1[(size_t)m] != ref16[(size_t)m]) {
             std::printf("FAIL %s: row %d differs between a launch of 1 and of 16\n", c.name, m);
             ++fails;
         }
-    for (int M : { 1, 16, 17, 24, 25, 32, 33, 40, 48 }) {
+    for (int M : norm_height_list()) {
         const auto got = norm_run(c, { { 0, M } });
         if (got.empty()) {
             std::printf("FAIL %s: the launch of %d rows was refused\n", c.name, M);
@@ -335,7 +351,9 @@ int norm_heights(NormCase& c, int reach, int* above) {
 
 int norms(int* above_out) {
     const auto t0 = std::chrono::steady_clock::now();
-    const int reach = r4d_ds41_exact_tall() ? kR4dDs41TallRows : 32;
+    const int reach = r4d_ds41_exact_tall() ? r4d_ds41_tall_rows() : 32;
+    const int kNormRows = g_norm_rows;
+    const int trials = kNormRows > 48 ? 1 : 3;
     const int n = 5120, hc = 4, rot = 64, P = 512;
     std::mt19937_64 rng(77);
     std::normal_distribution<float> nd(0.f, 1.f);
@@ -353,7 +371,7 @@ int norms(int* above_out) {
         return v;
     };
     int fails = 0, above = 0;
-    for (int trial = 0; trial < 3; ++trial) {
+    for (int trial = 0; trial < trials; ++trial) {
         /* mhc_collapse_rmsnorm: x = sum_j pre[j] h[j] (stored), y = rmsnorm(x). */
         {
             auto h = bf((size_t)kNormRows * hc * n, 1.f);
@@ -426,13 +444,123 @@ int norms(int* above_out) {
             fails += norm_heights(c, reach, &above);
         }
     }
-    std::printf("%s: norms at pass heights 1..48 against rows alone and launches of 16, every row's bytes "
-                "kept up to %d rows (%s); %d rows differed above it (%.1f s)\n", fails ? "FAIL" : "PASS", reach,
-                r4d_ds41_exact_tall() ? "RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=1: libr4d's reach"
-                                      : "no switch: the width r4d_act_threads keeps to 32 rows", above,
+    std::printf("%s: norms at pass heights 1..%d against rows alone and launches of 16, every row's bytes "
+                "kept up to %d rows (%s); %d rows differed above it (%.1f s)\n", fails ? "FAIL" : "PASS",
+                kNormRows, reach,
+                r4d_ds41_lcp() > 0         ? "RADIANCE_EXPERIMENTAL_DS41_LCP: libr4d's reach"
+                : r4d_ds41_exact_tall() ? "RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=1: libr4d's reach"
+                                        : "no switch: the width r4d_act_threads keeps to 32 rows", above,
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     *above_out = above;
     return fails;
+}
+
+
+/* ---- LCP: the graph's other height switches ------------------------------------------------------ */
+
+/* gemm_nt_f32 (r4d_glm.hip) at M rows over [N, K] f32 weight rows w0 .. w0 + N, into y (pitch yp). */
+int f32_rows(const std::vector<uint16_t>& x, const float* w, int M, int N, int K, float* y, int yp) {
+    RadTensor t[3] = { tens((void*)x.data(), RAD_BF16, { M, K }), tens((void*)w, RAD_F32, { N, K }),
+                       tens(y, RAD_F32, { M, N }) };
+    t[2].stride[0] = yp;
+    RadParam p[4] = { pint("M", M), pint("N", N), pint("K", K), pstr("dtype", "bf16") };
+    RadArgs a{};
+    a.t = t;
+    a.n_t = 3;
+    a.p = p;
+    a.n_p = 4;
+    return r4d_rad_gemm_nt_f32(&a, nullptr);
+}
+
+/* The router's projection (384 experts) at M rows: one launch over every column against the four
+ * 96-column slices the ranks compute once the plugin splits it by columns, the tile form the rule
+ * takes for each. K is cut short of ds41's 5120 (each output is its own row's sum, and the rule
+ * reads only M and N). Returns the differing outputs. */
+int f32_split(int M, std::mt19937_64& rng) {
+    const int N = 384, K = 320, parts = 4, cols = N / parts;
+    std::normal_distribution<float> nd(0.f, 1.f);
+    std::vector<uint16_t> x((size_t)M * K);
+    for (auto& v : x) v = bf16(nd(rng));
+    std::vector<float> w((size_t)N * K);
+    for (auto& v : w) v = 0.05f * nd(rng);
+    std::vector<float> all((size_t)M * N, -3.f), split((size_t)M * N, -5.f);
+    if (f32_rows(x, w.data(), M, N, K, all.data(), N) != RAD_OK) return 1 << 20;
+    for (int r = 0; r < parts; ++r)
+        if (f32_rows(x, w.data() + (size_t)r * cols * K, M, cols, K, split.data() + (size_t)r * cols, N) != RAD_OK)
+            return 1 << 20;
+    int bad = 0;
+    for (size_t i = 0; i < all.size(); ++i) bad += std::memcmp(&all[i], &split[i], 4) != 0;
+    return bad;
+}
+
+/* gemm_nt bf16 (C = A W^T): `f` at rows [r0, r0 + m) of A into the same rows of C. */
+int nt_rows(Launch f, const std::vector<uint16_t>& A, const std::vector<uint16_t>& W, std::vector<uint16_t>& C,
+            int r0, int m, int N, int K) {
+    RadTensor t[3] = { tens((void*)(A.data() + (size_t)r0 * K), RAD_BF16, { m, K }),
+                       tens((void*)W.data(), RAD_BF16, { N, K }), tens(C.data() + (size_t)r0 * N, RAD_BF16, { m, N }) };
+    RadParam p[4] = { pint("M", m), pint("N", N), pint("K", K), pstr("dtype", "bf16") };
+    RadArgs a{};
+    a.t = t;
+    a.n_t = 3;
+    a.p = p;
+    a.n_p = 4;
+    return f(&a, nullptr);
+}
+
+/* gemm_nt's tiled row (above 64 rows) against its skinny m64 row, N 128 and K 512 (ds41's ik_w), at
+ * 65 .. 256 rows, and the skinny row at those heights against itself in launches of 16 (the base
+ * engine's passes). Returns the differing rows. */
+int nt_tiled(std::mt19937_64& rng, int* rows_checked) {
+    const int N = 128, K = 512, R = 256;
+    std::normal_distribution<float> nd(0.f, 1.f);
+    std::vector<uint16_t> A((size_t)R * K), W((size_t)N * K);
+    for (auto& v : A) v = bf16(nd(rng));
+    for (auto& v : W) v = bf16(0.02f * nd(rng));
+    std::vector<uint16_t> c16((size_t)R * N, 0xAAAA);
+    for (int r0 = 0; r0 < R; r0 += 16)
+        if (nt_rows(r4d_rad_gemm_bf16_m64, A, W, c16, r0, 16, N, K) != RAD_OK) return 1 << 20;
+    int bad = 0;
+    for (int M : { 65, 100, 128, 171, 256 }) {
+        for (Launch f : { (Launch)r4d_rad_gemm_bf16_m64, (Launch)r4d_rad_gemm_bf16_tiled }) {
+            std::vector<uint16_t> c((size_t)R * N, 0x5555);
+            if (nt_rows(f, A, W, c, 0, M, N, K) != RAD_OK) {
+                std::printf("FAIL gemm_nt M=%d: %s refused\n", M, f == r4d_rad_gemm_bf16_m64 ? "m64" : "tiled");
+                return 1 << 20;
+            }
+            for (int m = 0; m < M; ++m) {
+                ++*rows_checked;
+                if (std::memcmp(&c[(size_t)m * N], &c16[(size_t)m * N], (size_t)N * 2) != 0) {
+                    if (bad < 6)
+                        std::printf("FAIL gemm_nt %s M=%d: row %d differs from the launches of 16\n",
+                                    f == r4d_rad_gemm_bf16_m64 ? "m64" : "tiled", M, m);
+                    ++bad;
+                }
+            }
+        }
+    }
+    return bad;
+}
+
+int lcp_extras() {
+    const auto t0 = std::chrono::steady_clock::now();
+    std::mt19937_64 rng(1024);
+    int fails = 0;
+    for (int M : { 16, 255, 256, 1024 }) {
+        const int d = f32_split(M, rng);
+        if (d) {
+            std::printf("FAIL gemm_nt_f32 M=%d: %d outputs of the 384-column launch differ from the 96-column slices\n",
+                        M, d);
+            ++fails;
+        }
+    }
+    std::printf("%s: gemm_nt_f32 over 384 columns equals its four 96-column slices at 16..1024 rows\n",
+                fails ? "FAIL" : "PASS");
+    int rows = 0;
+    const int d = nt_tiled(rng, &rows);
+    std::printf("%s: gemm_nt N 128 K 512: the tiled and m64 rows at 65..256 rows equal launches of 16 (%d rows, "
+                "%d differ) (%.1f s)\n", d ? "FAIL" : "PASS", rows, d,
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    return fails + (d ? 1 : 0);
 }
 
 }  // namespace
@@ -450,8 +578,16 @@ int main() {
         { "K 512 (eight rows staged), two weight rows a wave", 512, 512, 3 },
     };
     /* Heights by shape: the gate_up's K takes the most (one row staged at a time); the others one
-     * height over 16 and the CPU path's largest. */
-    const std::vector<int> heights[3] = { { 17, 31, 48, 64 }, { 17, 48 }, { 33 } };
+     * height over 16 and the CPU path's largest. Under LCP also chunk heights past 64 (the scatter's
+     * one launch ends at 170 rows). */
+    const bool lcp = r4d_ds41_lcp() > 0;
+    std::vector<int> heights[3] = { { 17, 31, 48, 64 }, { 17, 48 }, { 33 } };
+    if (lcp) {
+        for (int T : { 100, 171, 256 }) heights[0].push_back(T);
+        for (int T : { 100, 256 }) heights[1].push_back(T);
+        heights[2].push_back(171);
+        g_norm_rows = 1024;
+    }
     int fails = 0, rows = 0, cases = 0;
     for (int si = 0; si < 3; ++si)
         for (int T : heights[si])
@@ -472,5 +608,6 @@ int main() {
                 fails ? "FAIL" : "PASS", cases, rows);
     int above = 0;
     fails += norms(&above);
+    if (lcp) fails += lcp_extras();
     return fails ? 1 : 0;
 }

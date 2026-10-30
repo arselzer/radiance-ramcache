@@ -121,6 +121,7 @@ inline SchedMetrics bridge_metrics(const rad::SchedMetrics& m) {
     o.draft_acceptance = m.draft_acceptance;
     o.prefill_tokens = m.prefill_tokens;   o.decode_tokens = m.decode_tokens;
     o.draft_origin = m.draft_origin;
+    o.draft_gate = m.draft_gate;
     o.draft_tokens = m.draft_tokens;       o.draft_accepted = m.draft_accepted;
     o.draft_refills = m.draft_refills;     o.draft_refill_tokens = m.draft_refill_tokens;
     o.lookup_proposals = m.lookup_proposals;     o.lookup_held = m.lookup_held;
@@ -130,6 +131,12 @@ inline SchedMetrics bridge_metrics(const rad::SchedMetrics& m) {
     o.linear_cached_tokens = m.linear_cached_tokens;
     o.checkpoints_written = m.checkpoints_written;
     o.prefix_publish_held_tokens = m.prefix_publish_held_tokens;
+    o.eors_reserved = m.eors_reserved;        o.eors_committed = m.eors_committed;
+    o.eors_ahead_withheld = m.eors_ahead_withheld;
+    o.eors_hits = m.eors_hits;                o.eors_hit_tokens = m.eors_hit_tokens;
+    o.eors_hit_deepest = m.eors_hit_deepest;
+    o.store_held = m.store_held;              o.store_peak = m.store_peak;
+    o.store_session_lru = m.store_session_lru; o.trim_spared = m.trim_spared;
     o.draft_depth_seen = m.draft_depth_seen;
     if (o.draft_depth_seen > SchedMetrics::MAX_DRAFT_POS)
         o.draft_depth_seen = SchedMetrics::MAX_DRAFT_POS;

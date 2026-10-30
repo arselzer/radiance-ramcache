@@ -28,6 +28,32 @@
  *                                                      17..100 rows against the same rows one at a
  *                                                      time and in launches of 16. Every value equal
  *                                                      or FAIL.
+ *   ds41_mxfp4_device_check LIBR4D.so lcp [C] [trials] RADIANCE_EXPERIMENTAL_DS41_LCP=C (default 1024,
+ *                                                      set here; EXACT_TALL unset): `tall` at chunk
+ *                                                      heights up to C (the twin's reach must cover
+ *                                                      C), the sparse ops also as the suffix launches
+ *                                                      a per-row consumer cut issues, then `sweep` at
+ *                                                      heights up to 2048 with gemm_nt by the row the
+ *                                                      table resolves at each height (m16 / m64 /
+ *                                                      tiled), gemm_nt_f32 over the router's 384
+ *                                                      columns and its 96-column slices, and
+ *                                                      gemm_nt_bf16f8 at N 1280 and 4096 (its one
+ *                                                      skinny row at every height).
+ *   ds41_mxfp4_device_check LIBR4D.so bal [C] [ROUTES] RADIANCE_EXPERIMENTAL_DS41_MOE_BALANCE through the
+ *                                                      checker export r4d_rad_moe_gemm_mxfp4_gemv_bal
+ *                                                      (LCP=C set here, 1024 by default): the gemv row at
+ *                                                      1..16 tokens and the twin at 17..C, ds41's gate_up
+ *                                                      and down over 96 VRAM experts on an EP4 rank's
+ *                                                      served slots (the other ranks' as -1 past the
+ *                                                      local ones), skewed and uniform routings (and the
+ *                                                      route file's layers, as ds41_p0_bench reads it,
+ *                                                      when given): every output value of the balanced
+ *                                                      launch equal to the plain one's, and both timed
+ *                                                      (hipEvent, median of 3).
+ *   ds41_mxfp4_device_check LIBR4D.so sweep [trials]   the height sweep under EXACT_TALL, or under
+ *                                                      RADIANCE_EXPERIMENTAL_DS41_LCP when that is in
+ *                                                      the environment (its heights); sweep0 without
+ *                                                      either switch.
  *
  * Needs a free card (HIP device 0 unless HIP_VISIBLE_DEVICES says otherwise). Uses the
  * live-tail ranges as the measured runs do (RADIANCE_EXPERIMENTAL_DS41_LIVE_TAIL=1), except `tall`,
@@ -49,6 +75,7 @@
 
 #include "rad_abi.h"
 #include "ds41_host_experts.h"
+#include "r4d_bf16f8_layout.h"
 
 using namespace ds41hx;
 
@@ -57,6 +84,10 @@ using namespace ds41hx;
 namespace {
 
 constexpr int kEmbd = 5120, kFf = 2304, kNe = 96, kTop = 6;
+/* `lcp`, or `sweep` with RADIANCE_EXPERIMENTAL_DS41_LCP in the environment: the chunk C (0 otherwise). */
+int g_lcp = 0;
+/* libr4d's R4D_DT_BF16F8 (r4d_args.h): gemm_nt_bf16f8's stored form. */
+constexpr uint32_t R4D_BF16F8_DTYPE = RAD_DT_PLUGIN_BASE + 10;
 constexpr float kLimit = 10.0f;
 typedef int (*Launch)(const RadArgs*, RadStream);
 
@@ -75,6 +106,11 @@ struct Lib {
     /* For `sweep`: the other ops whose launcher reads the pass height. */
     Launch rmsnorm = nullptr, collapse_norm = nullptr, post_collapse_norm = nullptr, norm_rope = nullptr,
            mix = nullptr, gemm64 = nullptr, logits = nullptr;
+    /* For `lcp`: gemm_nt's other rows and the f32 projection (the router and the compressor), and
+     * gemm_nt_bf16f8 (the FP8-stored dense weights, RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8). */
+    Launch gemm16 = nullptr, gemm_tiled = nullptr, gemm_f32 = nullptr, gemm_f8 = nullptr;
+    /* For `bal`: the checker export with RADIANCE_EXPERIMENTAL_DS41_MOE_BALANCE forced per call. */
+    int (*moe_bal)(const RadArgs*, RadStream, int tall, int bal) = nullptr;
     int (*count)(void) = nullptr;
     const RadKernelInfo* (*at)(int) = nullptr;
     explicit Lib(const char* path) {
@@ -95,6 +131,11 @@ struct Lib {
         mix = (Launch)dlsym(h, "r4d_rad_mhc_mix");
         gemm64 = (Launch)dlsym(h, "r4d_rad_gemm_bf16_m64");
         logits = (Launch)dlsym(h, "r4d_rad_logits_gemm");
+        gemm16 = (Launch)dlsym(h, "r4d_rad_gemm_bf16_m16");
+        gemm_tiled = (Launch)dlsym(h, "r4d_rad_gemm_bf16_tiled");
+        gemm_f32 = (Launch)dlsym(h, "r4d_rad_gemm_nt_f32");
+        gemm_f8 = (Launch)dlsym(h, "r4d_rad_gemm_bf16f8_m64");
+        moe_bal = (int (*)(const RadArgs*, RadStream, int, int))dlsym(h, "r4d_rad_moe_gemm_mxfp4_gemv_bal");
         count = (int (*)(void))dlsym(h, "rad_kernel_count");
         at = (const RadKernelInfo* (*)(int))dlsym(h, "rad_kernel_at");
         if (!moe) { std::fprintf(stderr, "%s lacks r4d_rad_moe_gemm_mxfp4_gemv\n", path); std::exit(2); }
@@ -846,9 +887,10 @@ int tall_row_table(const Lib& L, long long* reach) {
         }
     const bool ok = tall->launch == L.moe_tall && m_le == 1 && *reach > 16 && tall->priority == gemv->priority - 1 &&
                     tall->n_constraints == gemv->n_constraints && tall->layout == gemv->layout &&
-                    tall->relayout == gemv->relayout;
-    std::printf("%s: row table: %s, priority %d (the gemv's %d), %d constraints, M up to %lld\n",
-                ok ? "PASS" : "FAIL", tall->name, tall->priority, gemv->priority, tall->n_constraints, *reach);
+                    tall->relayout == gemv->relayout && (!g_lcp || *reach >= g_lcp);
+    std::printf("%s: row table: %s, priority %d (the gemv's %d), %d constraints, M up to %lld%s\n",
+                ok ? "PASS" : "FAIL", tall->name, tall->priority, gemv->priority, tall->n_constraints, *reach,
+                g_lcp ? (" (LCP: at least " + std::to_string(g_lcp) + ")").c_str() : "");
     return ok ? 0 : 1;
 }
 
@@ -1136,6 +1178,20 @@ size_t tall_sparse(const Lib& L, hipStream_t s, int M, int H, size_t* rows_check
     std::vector<float> sc;
     if (sparse_launch(L, s, f, 0, M, &out, &sc) < 0) { std::printf("FAIL: a sparse launch refused M=%d\n", M); return (size_t)1 << 40; }
     size_t differ = 0;
+    /* The suffixes a per-row consumer cut launches: rows [r0, M) for r0 on the 16-row grid. */
+    for (int r0 : { 16, M / 2 / 16 * 16, (M - 1) / 16 * 16 }) {
+        if (r0 <= 0 || r0 >= M) continue;
+        std::vector<uint16_t> o2;
+        std::vector<float> s2;
+        if (sparse_launch(L, s, f, r0, M, &o2, &s2) < 0) { std::printf("FAIL: a sparse launch refused\n"); return (size_t)1 << 40; }
+        const size_t da = count_diff(&out[(size_t)r0 * f.H * f.D], o2.data(), o2.size());
+        size_t ds = 0;
+        for (size_t i = 0; i < s2.size(); ++i) ds += std::memcmp(&sc[(size_t)r0 * f.C + i], &s2[i], 4) != 0;
+        if ((da || ds) && differ < 4)
+            std::printf("  M=%d H=%d suffix %d..%d: attention %zu, index score %zu differing values\n", M, H, r0,
+                        M - 1, da, ds);
+        differ += da + ds;
+    }
     for (int cut : { 1, 16 })
         for (int r0 = 0; r0 < M; r0 += cut) {
             const int r1 = std::min(M, r0 + cut);
@@ -1180,8 +1236,12 @@ int tall_check(const Lib& L, const std::vector<int>& Ts) {
         return 1;
     }
     size_t sp_bad = 0, sp_rows = 0;
+    std::vector<int> sp_heights = { 17, 24, 33, 40, 47, 48, 64, 100 };
+    if (g_lcp)
+        for (int M : { 49, 65, 128, 171, 256, 512, 1000, 1024 })
+            if (M <= g_lcp) sp_heights.push_back(M);
     for (int H : { 16, 32 })
-        for (int M : { 17, 24, 33, 40, 47, 48, 64, 100 }) {
+        for (int M : sp_heights) {
             size_t rows = 0;
             const size_t d = tall_sparse(L, s, M, H, &rows);
             std::printf("attn_sparse_sink (%d heads) + index_score M=%3d: %zu rows against single rows and launches "
@@ -1189,8 +1249,8 @@ int tall_check(const Lib& L, const std::vector<int>& Ts) {
             sp_bad += d;
             sp_rows += rows;
         }
-    std::printf("%s: sparse attention and index score at 17..100 rows equal their rows launched alone and 16 at a "
-                "time (%zu rows)\n", sp_bad ? "FAIL" : "PASS", sp_rows);
+    std::printf("%s: sparse attention and index score at 17..%d rows equal their rows launched alone, 16 at a "
+                "time and as suffixes (%zu rows)\n", sp_bad ? "FAIL" : "PASS", sp_heights.back(), sp_rows);
     rc |= sp_bad ? 1 : 0;
     std::printf(rc ? "FAIL\n" : "PASS: tall passes give 16-token passes' bits on all three ops\n");
     return rc;
@@ -1223,7 +1283,8 @@ struct SweepOp {
     }
 };
 
-constexpr int kSweepRows = 48;
+/* The rows a sweep case holds: 48, or 2048 under LCP (sweep_check). */
+int kSweepRows = 48;
 
 void fill_bf16(Dev* d, std::mt19937_64& rng, float sd, float mean = 0.f) {
     std::normal_distribution<float> nd(mean, sd);
@@ -1381,7 +1442,9 @@ std::unique_ptr<SweepOp> sweep_mix(Launch f, bool scratch, std::mt19937_64& rng)
     Dev* pre = o->buf((size_t)kSweepRows * hc * 4);
     Dev* post = o->buf((size_t)kSweepRows * hc * 4);
     Dev* comb = o->buf((size_t)kSweepRows * hc * hc * 4);
-    Dev* scr = o->buf(4u << 20);
+    /* The split form's partials for every row of the case (libr4d's r4d_rad_mhc_mix_scratch: rows x
+     * chunks of 1024 columns x (mix + 1) floats), as the engine sizes them at the band's top. */
+    Dev* scr = o->buf(std::max<size_t>(4u << 20, (size_t)kSweepRows * ((W + 1023) / 1024) * (mix + 1) * 4));
     fill_bf16(h, rng, 1.0f);
     fill_f32(fn, rng, 0.01f);
     { const float v[3] = { 0.7f, 0.9f, 1.1f }; sc->put(v); }
@@ -1424,6 +1487,100 @@ std::unique_ptr<SweepOp> sweep_gemm(Launch f, int N, int K, std::mt19937_64& rng
     return o;
 }
 
+/* gemm_nt at the row the table resolves at each height (LCP): gemm_bf16_nt_m16 up to 16 rows, the
+ * tiled row above 64 where it serves (N >= 128, K a multiple of 64), gemm_bf16_nt_m64 elsewhere.
+ * ds41's index projection (64 x 5120), its index key (128 x 512) and layer 20's compressor (512 x
+ * 5120). */
+std::unique_ptr<SweepOp> sweep_gemm_rows(const Lib& L, int N, int K, std::mt19937_64& rng) {
+    auto o = std::make_unique<SweepOp>();
+    o->name = "gemm_nt (m16/m64/tiled) N=" + std::to_string(N) + " K=" + std::to_string(K);
+    Dev* A = o->buf((size_t)kSweepRows * K * 2);
+    Dev* Wt = o->buf((size_t)N * K * 2);
+    Dev* C = o->buf((size_t)kSweepRows * N * 2);
+    fill_bf16(A, rng, 1.0f);
+    fill_bf16(Wt, rng, 0.02f);
+    o->outs = { { C, (size_t)N * 2 } };
+    const Launch m16 = L.gemm16, m64 = L.gemm64, tiled = L.gemm_tiled;
+    o->launch = [=](int r0, int m, hipStream_t s) {
+        const Launch f = m <= 16 && m16 ? m16 : (m > 64 && N >= 128 && K % 64 == 0 && tiled ? tiled : m64);
+        RadTensor t[3] = { rows_of(A, RAD_BF16, K, r0, m), tensor(Wt->p, RAD_BF16, { N, K }),
+                           rows_of(C, RAD_BF16, N, r0, m) };
+        RadParam p[4] = { pi("M", m), pi("N", N), pi("K", K), ps("dtype", "bf16") };
+        RadArgs a{};
+        a.t = t; a.n_t = 3; a.p = p; a.n_p = 4;
+        return f(&a, (RadStream)s);
+    };
+    return o;
+}
+
+/* gemm_nt_bf16f8 (r4d_gemm_bf16f8_nt_m64.hip: the FP8-stored dense weights' one row at every M) over
+ * its stored form (r4d_bf16f8_layout.h), written here from random E4M3 codes -- the NaN codes left
+ * out, signed zeros and subnormals in -- and an E8M0 exponent a 32x32 block in [112, 120): ds41's
+ * q_a (1280 x 5120) and wo_b-shaped (4096 x 1024) projections, N >= 128, where gemm_nt's bf16 rows
+ * would go tiled above 64 rows while this one stays skinny (lcp review M1). */
+std::unique_ptr<SweepOp> sweep_bf16f8(Launch f, int N, int K, std::mt19937_64& rng) {
+    auto o = std::make_unique<SweepOp>();
+    o->name = "gemm_nt_bf16f8 N=" + std::to_string(N) + " K=" + std::to_string(K);
+    Dev* A = o->buf((size_t)kSweepRows * K * 2);
+    const int64_t bytes = r4d_bf16f8_bytes(N, K);
+    Dev* Wt = o->buf((size_t)bytes);
+    Dev* C = o->buf((size_t)kSweepRows * N * 2);
+    fill_bf16(A, rng, 1.0f);
+    std::vector<uint8_t> h((size_t)bytes, 0);
+    for (int64_t n = 0; n < N; ++n)
+        for (int64_t k = 0; k < K; ++k) {
+            uint8_t b = (uint8_t)(rng() % 256);
+            if ((b & 0x7F) == 0x7F) b ^= 1;   /* NaN: never stored */
+            h[(size_t)r4d_bf16f8_slot(K, n, k)] = b;
+        }
+    const int64_t off = r4d_bf16f8_scale_off(N, K), ldws = r4d_bf16f8_ldws(K);
+    for (int64_t nb = 0; nb < (N + 31) / 32; ++nb)
+        for (int64_t kb = 0; kb < K / 32; ++kb) h[(size_t)(off + nb * ldws + kb)] = (uint8_t)(112 + rng() % 8);
+    Wt->put(h.data());
+    o->outs = { { C, (size_t)N * 2 } };
+    o->launch = [=](int r0, int m, hipStream_t s) {
+        RadTensor t[3] = { rows_of(A, RAD_BF16, K, r0, m), tensor(Wt->p, R4D_BF16F8_DTYPE, { N, K }),
+                           rows_of(C, RAD_BF16, N, r0, m) };
+        RadParam p[4] = { pi("M", m), pi("N", N), pi("K", K), ps("dtype", "bf16") };
+        RadArgs a{};
+        a.t = t; a.n_t = 3; a.p = p; a.n_p = 4;
+        return f(&a, (RadStream)s);
+    };
+    return o;
+}
+
+/* gemm_nt_f32 (bf16 x, f32 weight, f32 out): the router (384 x 5120), and with `parts` 4 the same
+ * outputs as the four 96-column slices the ranks compute once the plugin splits it by columns
+ * (rad_glm_tp.h SplitF32Proj, from 256 rows), each launch into its own columns; the compressor's
+ * kv|gate projection (1024 x 5120). */
+std::unique_ptr<SweepOp> sweep_f32(Launch f, int N, int K, int parts, std::mt19937_64& rng) {
+    auto o = std::make_unique<SweepOp>();
+    o->name = "gemm_nt_f32 N=" + std::to_string(N) + " K=" + std::to_string(K) +
+              (parts > 1 ? " in " + std::to_string(parts) + " column slices" : "");
+    Dev* x = o->buf((size_t)kSweepRows * K * 2);
+    Dev* w = o->buf((size_t)N * K * 4);
+    Dev* y = o->buf((size_t)kSweepRows * N * 4);
+    fill_bf16(x, rng, 1.0f);
+    fill_f32(w, rng, 0.05f);
+    o->outs = { { y, (size_t)N * 4 } };
+    o->launch = [=](int r0, int m, hipStream_t s) {
+        const int cols = N / parts;
+        for (int c = 0; c < parts; ++c) {
+            RadTensor t[3] = { rows_of(x, RAD_BF16, K, r0, m),
+                               tensor((char*)w->p + (size_t)c * cols * K * 4, RAD_F32, { cols, K }),
+                               tensor((char*)y->p + ((size_t)r0 * N + (size_t)c * cols) * 4, RAD_F32, { m, cols }) };
+            t[2].stride[0] = N;
+            RadParam p[4] = { pi("M", m), pi("N", cols), pi("K", K), ps("dtype", "bf16") };
+            RadArgs a{};
+            a.t = t; a.n_t = 3; a.p = p; a.n_p = 4;
+            const int rc = f(&a, (RadStream)s);
+            if (rc < 0) return rc;
+        }
+        return 0;
+    };
+    return o;
+}
+
 /* The lm_head over 1024 vocabulary columns (each rank holds 32320; a column's sum is its own). */
 std::unique_ptr<SweepOp> sweep_logits(Launch f, std::mt19937_64& rng) {
     const int K = kEmbd, V = 1024;
@@ -1450,14 +1607,17 @@ std::unique_ptr<SweepOp> sweep_logits(Launch f, std::mt19937_64& rng) {
  * refused launch. */
 std::vector<std::vector<uint8_t>> sweep_run(SweepOp& o, hipStream_t s, const std::vector<std::pair<int, int>>& runs) {
     for (const SweepOut& q : o.outs) HC(hipMemset(q.d->p, 0xA5, q.d->n));
-    for (const auto& r : runs)
+    int top = 0;   /* the rows the runs cover: only those are read back */
+    for (const auto& r : runs) {
         if (o.launch(r.first, r.second, s) < 0) return {};
+        top = std::max(top, r.first + r.second);
+    }
     HC(hipStreamSynchronize(s));
-    std::vector<std::vector<uint8_t>> rows((size_t)kSweepRows);
+    std::vector<std::vector<uint8_t>> rows((size_t)top);
     for (const SweepOut& q : o.outs) {
-        std::vector<uint8_t> h(q.d->n);
-        q.d->get(h.data());
-        for (int m = 0; m < kSweepRows; ++m)
+        std::vector<uint8_t> h((size_t)top * q.row_bytes);
+        HC(hipMemcpy(h.data(), q.d->p, h.size(), hipMemcpyDeviceToHost));
+        for (int m = 0; m < top; ++m)
             rows[(size_t)m].insert(rows[(size_t)m].end(), h.begin() + (size_t)m * q.row_bytes,
                                    h.begin() + (size_t)(m + 1) * q.row_bytes);
     }
@@ -1471,9 +1631,15 @@ int sweep_check(const Lib& L, bool on, int trials) {
         if (tall_row_table(L, &r) != 0) return 1;
         reach = r;
     }
-    const std::vector<int> heights = { 1, 16, 17, 24, 25, 32, 33, 40, 48 };
-    std::printf("sweep: RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL %s; heights up to %lld must give every row its "
-                "bytes launched alone and in launches of 16; %d trials\n", on ? "1" : "unset", reach, trials);
+    std::vector<int> heights = { 1, 16, 17, 24, 25, 32, 33, 40, 48 };
+    if (on && g_lcp) {
+        heights = { 1, 16, 17, 32, 33, 48, 49, 64, 65, 100, 128, 170, 171, 255, 256, 257, 512, 1000, 1024, 2048 };
+        kSweepRows = 2048;
+    }
+    std::printf("sweep: %s; heights up to %lld must give every row its bytes launched alone and in launches of 16; "
+                "%d trials\n", !on ? "RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL unset"
+                : g_lcp ? ("RADIANCE_EXPERIMENTAL_DS41_LCP=" + std::to_string(g_lcp)).c_str()
+                        : "RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL 1", reach, trials);
     hipStream_t s;
     HC(hipStreamCreate(&s));
     int rc = 0;
@@ -1497,7 +1663,30 @@ int sweep_check(const Lib& L, bool on, int trials) {
             ops.push_back(sweep_gemm(L.gemm64, 512, 5120, rng));
         }
         if (L.logits) ops.push_back(sweep_logits(L.logits, rng));
-        if (trial == 0 && ops.size() < 13) {
+        size_t want = 13;
+        if (on && g_lcp) {
+            if (L.gemm16 && L.gemm64 && L.gemm_tiled) {
+                ops.push_back(sweep_gemm_rows(L, 64, 5120, rng));
+                ops.push_back(sweep_gemm_rows(L, 128, 512, rng));
+                ops.push_back(sweep_gemm_rows(L, 512, 5120, rng));
+            }
+            if (L.gemm_f32) {
+                ops.push_back(sweep_f32(L.gemm_f32, 384, 5120, 1, rng));
+                ops.push_back(sweep_f32(L.gemm_f32, 384, 5120, 4, rng));
+                if (trial == 0) ops.push_back(sweep_f32(L.gemm_f32, 1024, 5120, 1, rng));
+            }
+            if (L.gemm_f8) {
+                ops.push_back(sweep_bf16f8(L.gemm_f8, 1280, 5120, rng));
+                ops.push_back(sweep_bf16f8(L.gemm_f8, 4096, 1024, rng));
+            }
+            want += trial == 0 ? 8 : 7;
+            if (trial == 0 && (!L.gemm16 || !L.gemm_tiled || !L.gemm_f32 || !L.gemm_f8)) {
+                std::printf("FAIL: the plugin lacks some of r4d_rad_gemm_bf16_m16, _gemm_bf16_tiled, _gemm_nt_f32, "
+                            "_gemm_bf16f8_m64\n");
+                rc = 1;
+            }
+        }
+        if (trial == 0 && ops.size() < want) {
             std::printf("FAIL: the plugin lacks some of r4d_rad_rmsnorm, _mhc_collapse_rmsnorm, "
                         "_mhc_post_collapse_rmsnorm, _rmsnorm_rope_roundtrip, _mhc_mix, _gemm_bf16_m64, _logits_gemm\n");
             rc = 1;
@@ -1553,14 +1742,255 @@ int sweep_check(const Lib& L, bool on, int trials) {
 
 }  // namespace
 
+
+/* ================================================================== bal (RADIANCE_EXPERIMENTAL_DS41_MOE_BALANCE)
+ *
+ * The balanced kernel against the plain one through r4d_rad_moe_gemm_mxfp4_gemv_bal, byte for byte over every
+ * output (dropped slots included, both poisoned first), at ds41's real expert shapes, and both timed. */
+struct BalRoute {
+    std::vector<int32_t> sorted, off;
+    int local = 0, busiest = 0, live = 0;
+};
+/* One EP4 rank's slots of M tokens (picks(t) its top_k of 384), as moe_scatter writes them. */
+BalRoute bal_route(const std::function<void(int, int*)>& picks, int M, int rank) {
+    std::vector<std::vector<int32_t>> by(kNe);
+    int pk[kTop];
+    for (int t = 0; t < M; ++t) {
+        picks(t, pk);
+        for (int k = 0; k < kTop; ++k)
+            if (pk[k] / kNe == rank) by[(size_t)(pk[k] % kNe)].push_back(t * kTop + k);
+    }
+    BalRoute r;
+    r.off.assign(kNe + 1, 0);
+    for (int e = 0; e < kNe; ++e) {
+        r.off[(size_t)e + 1] = r.off[(size_t)e] + (int)by[(size_t)e].size();
+        for (int32_t f : by[(size_t)e]) r.sorted.push_back(f);
+        r.busiest = std::max(r.busiest, (int)by[(size_t)e].size());
+        r.live += !by[(size_t)e].empty();
+    }
+    r.local = (int)r.sorted.size();
+    r.sorted.resize((size_t)M * kTop, -1);
+    return r;
+}
+
+double bal_median(std::vector<double> v) {
+    std::sort(v.begin(), v.end());
+    return v.empty() ? -1 : v[v.size() / 2];
+}
+
+int bal_check(const Lib& L, const char* routes_path) {
+    if (!L.moe_bal) {
+        std::printf("FAIL: the plugin has no r4d_rad_moe_gemm_mxfp4_gemv_bal (a libr4d without ..._MOE_BALANCE)\n");
+        return 1;
+    }
+    long long reach = 0;
+    int rc = tall_row_table(L, &reach);
+    const int C = g_lcp;
+    hipStream_t s;
+    HC(hipStreamCreate(&s));
+    std::mt19937_64 rng(4242);
+    /* 96 experts of each projection, distinct bytes. */
+    const size_t gu_b = (size_t)2 * kFf * (kEmbd / 32) * 17, dn_b = (size_t)kEmbd * (kFf / 32) * 17;
+    Dev egu(gu_b * kNe), edn(dn_b * kNe);
+    {
+        std::vector<uint8_t> h(gu_b);
+        for (int e = 0; e < kNe; ++e) {
+            h = make_blocks(2 * kFf, kEmbd, rng, e % 7 == 0);
+            HC(hipMemcpy((char*)egu.p + gu_b * e, h.data(), gu_b, hipMemcpyHostToDevice));
+        }
+        for (int e = 0; e < kNe; ++e) {
+            h = make_blocks(kEmbd, kFf, rng, e % 7 == 0);
+            HC(hipMemcpy((char*)edn.p + dn_b * e, h.data(), dn_b, hipMemcpyHostToDevice));
+        }
+    }
+    std::vector<void*> tgu(kNe), tdn(kNe);
+    for (int e = 0; e < kNe; ++e) { tgu[(size_t)e] = (char*)egu.p + gu_b * e; tdn[(size_t)e] = (char*)edn.p + dn_b * e; }
+    Dev tab_gu(kNe * sizeof(void*)), tab_dn(kNe * sizeof(void*));
+    tab_gu.put(tgu.data());
+    tab_dn.put(tdn.data());
+    const int Mmax = std::max(16, C);
+    Dev x((size_t)Mmax * kEmbd * 2), act((size_t)Mmax * kTop * kFf * 2), so((size_t)Mmax * kTop * 4), of((kNe + 1) * 4);
+    Dev y0((size_t)Mmax * kTop * kEmbd * 2), y1((size_t)Mmax * kTop * kEmbd * 2);   /* the larger N of the two */
+    {
+        std::vector<uint16_t> h((size_t)Mmax * kTop * kFf);
+        for (size_t i = 0; i < (size_t)Mmax * kEmbd; i += kEmbd) {
+            auto r = make_x(kEmbd, rng, i == 0);
+            std::copy(r.begin(), r.end(), h.begin() + (long)i);
+        }
+        HC(hipMemcpy(x.p, h.data(), (size_t)Mmax * kEmbd * 2, hipMemcpyHostToDevice));
+        for (size_t i = 0; i < h.size(); i += kFf) {
+            auto r = make_x(kFf, rng, false);
+            std::copy(r.begin(), r.end(), h.begin() + (long)i);
+        }
+        act.put(h.data());
+    }
+    /* Skewed popularity: expert ranks shuffled over the 384, weight 1 / (1 + rank)^0.9. */
+    std::vector<int> perm(4 * kNe);
+    for (int i = 0; i < 4 * kNe; ++i) perm[(size_t)i] = i;
+    std::shuffle(perm.begin(), perm.end(), rng);
+    std::vector<double> wts(4 * kNe);
+    for (int i = 0; i < 4 * kNe; ++i) wts[(size_t)perm[(size_t)i]] = 1.0 / std::pow(1.0 + i, 0.9);
+    std::discrete_distribution<int> skew(wts.begin(), wts.end());
+    auto pick6 = [&](bool skewed, int* pk) {
+        int n = 0;
+        while (n < kTop) {
+            const int e = skewed ? skew(rng) : (int)(rng() % (4 * kNe));
+            bool dup = false;
+            for (int j = 0; j < n; ++j) dup |= pk[j] == e;
+            if (!dup) pk[n++] = e;
+        }
+    };
+    /* The route file (ds41_p0_bench's: i32 layers, rows, k, then i16 picks [layers][rows][k]), if given. */
+    std::vector<int16_t> rp;
+    int r_layers = 0, r_rows = 0, r_k = 0;
+    if (routes_path) {
+        FILE* f = std::fopen(routes_path, "rb");
+        int32_t h[3];
+        if (f && std::fread(h, 4, 3, f) == 3 && h[2] == kTop) {
+            r_layers = h[0]; r_rows = h[1]; r_k = h[2];
+            rp.resize((size_t)r_layers * r_rows * r_k);
+            if (std::fread(rp.data(), 2, rp.size(), f) != rp.size()) rp.clear();
+        }
+        if (f) std::fclose(f);
+        if (rp.empty()) std::printf("note: cannot read the routes %s; synthetic routings only\n", routes_path);
+    }
+    auto timed = [&](const std::function<int()>& launch, double* us) {
+        std::vector<double> t;
+        hipEvent_t a, b;
+        HC(hipEventCreate(&a));
+        HC(hipEventCreate(&b));
+        if (launch() != RAD_OK) return false;   /* warm-up */
+        for (int r = 0; r < 3; ++r) {
+            HC(hipEventRecord(a, s));
+            if (launch() != RAD_OK) return false;
+            HC(hipEventRecord(b, s));
+            HC(hipEventSynchronize(b));
+            float ms = 0;
+            HC(hipEventElapsedTime(&ms, a, b));
+            t.push_back(ms * 1000.0);
+        }
+        (void)hipEventDestroy(a);
+        (void)hipEventDestroy(b);
+        *us = bal_median(t);
+        return true;
+    };
+    size_t bad = 0, values = 0;
+    double sum0 = 0, sum1 = 0;
+    std::printf("bal: moe_gemm_ggml mxfp4 gate_up [%d, %d] and down [%d, %d], 96 VRAM experts, EP4 rank slots as served\n",
+                2 * kFf, kEmbd, kEmbd, kFf);
+    std::printf("%-14s %5s %5s %6s %5s %7s | %11s %11s | %11s %11s | %7s\n", "routing", "M", "rank", "local", "live",
+                "busiest", "gu plain us", "gu bal us", "dn plain us", "dn bal us", "speedup");
+    auto point = [&](const char* label, const BalRoute& r, int M, int rank) {
+        HC(hipMemcpy(so.p, r.sorted.data(), r.sorted.size() * 4, hipMemcpyHostToDevice));
+        of.put(r.off.data());
+        const int T = M * kTop, tall = M > 16 ? 1 : 0;
+        double us[4] = { 0, 0, 0, 0 };
+        for (int proj = 0; proj < 2; ++proj) {
+            const bool g = proj == 0;
+            const int N = g ? 2 * kFf : kEmbd, K = g ? kEmbd : kFf;
+            void* tab = g ? tab_gu.p : tab_dn.p;
+            void* xin = g ? x.p : act.p;
+            const int AR = g ? M : T;
+            const char* order = g ? "token" : "sorted";
+            const size_t n = (size_t)T * N;
+            HC(hipMemset(y0.p, 0xAA, n * 2));
+            HC(hipMemset(y1.p, 0x55, n * 2));
+            for (int bal = 0; bal < 2; ++bal) {
+                void* y = bal ? y1.p : y0.p;
+                auto launch = [&] {
+                    RadTensor t[5] = { tensor(xin, RAD_BF16, { AR, K }), tensor(tab, RAD_U8, { kNe, N, K / 32 * 17 }),
+                                       tensor(so.p, RAD_I32, { T }), tensor(of.p, RAD_I32, { kNe + 1 }),
+                                       tensor(y, RAD_BF16, { T, N }) };
+                    t[1].stride[0] = 0;
+                    RadParam p[6] = { ps("type", "mxfp4"), pi("N", N), pi("K", K), pi("n_expert", kNe),
+                                      pi("top_k", kTop), ps("a_order", order) };
+                    RadArgs a{};
+                    a.t = t; a.n_t = 5; a.p = p; a.n_p = 6;
+                    return L.moe_bal(&a, (RadStream)s, tall, bal);
+                };
+                if (!timed(launch, &us[proj * 2 + bal])) {
+                    std::printf("FAIL %s M=%d: a launch was refused\n", label, M);
+                    ++bad;
+                    return;
+                }
+            }
+            HC(hipStreamSynchronize(s));
+            std::vector<uint16_t> h0(n), h1(n);
+            HC(hipMemcpy(h0.data(), y0.p, n * 2, hipMemcpyDeviceToHost));
+            HC(hipMemcpy(h1.data(), y1.p, n * 2, hipMemcpyDeviceToHost));
+            const size_t d = count_diff(h0.data(), h1.data(), n);
+            if (d) std::printf("FAIL %s M=%d rank %d %s: %zu of %zu values differ\n", label, M, rank, g ? "gate_up" : "down", d, n);
+            bad += d;
+            values += n;
+        }
+        const double p0 = us[0] + us[2], p1 = us[1] + us[3];
+        sum0 += p0;
+        sum1 += p1;
+        std::printf("%-14s %5d %5d %6d %5d %7d | %11.1f %11.1f | %11.1f %11.1f | %6.1fx\n", label, M, rank, r.local, r.live,
+                    r.busiest, us[0], us[1], us[2], us[3], p1 > 0 ? p0 / p1 : 0.0);
+        std::fflush(stdout);
+    };
+    std::vector<int> Ms = { 1, 6, 16 };
+    for (int M : { 17, 64, 256, 512, 1024, 2048 })
+        if (M <= C && M <= reach) Ms.push_back(M);
+    for (int M : Ms) {
+        for (int skewed = 1; skewed >= 0; --skewed) {
+            std::vector<int> picks((size_t)M * kTop);
+            for (int t = 0; t < M; ++t) pick6(skewed != 0, &picks[(size_t)t * kTop]);
+            for (int rank : { 0, 3 }) {
+                const BalRoute r = bal_route([&](int t, int* pk) { std::copy_n(&picks[(size_t)t * kTop], kTop, pk); }, M, rank);
+                point(skewed ? "skewed" : "uniform", r, M, rank);
+            }
+        }
+        if (!rp.empty() && M <= r_rows)
+            for (int l : { 3, 12, 25, 36 }) {
+                if (l >= r_layers) continue;
+                char lab[32];
+                std::snprintf(lab, sizeof lab, "real L%d", l);
+                for (int rank : { 0, 2 }) {
+                    const BalRoute r = bal_route([&](int t, int* pk) {
+                        const int16_t* q = &rp[((size_t)l * r_rows + t) * r_k];
+                        for (int k = 0; k < kTop; ++k) pk[k] = q[k];
+                    }, M, rank);
+                    point(lab, r, M, rank);
+                }
+            }
+    }
+    (void)hipStreamDestroy(s);
+    std::printf("bal: %zu output values compared; summed time %.1f ms plain, %.1f ms balanced (%.1fx)\n", values,
+                sum0 / 1000.0, sum1 / 1000.0, sum1 > 0 ? sum0 / sum1 : 0.0);
+    if (bad) {
+        std::printf("FAIL: bal: %zu values differ between the balanced and the plain kernel\n", bad);
+        return 1;
+    }
+    std::printf(rc ? "FAIL: bal: the row table check failed\n"
+                   : "PASS: bal: the balanced gemv and twin give the plain kernel's bytes at 1..%d tokens\n", Ms.back());
+    return rc;
+}
+
 int main(int argc, char** argv) {
-    if (argc < 3) { std::fprintf(stderr, "usage: %s LIBR4D.so check [trials] [table] | swiglu TABLE | time [LIB2.so] | ptime [T[:P]...] | draft [trials] | tall [T...] | sweep [trials] | sweep0 [trials]\n", argv[0]); return 2; }
+    if (argc < 3) { std::fprintf(stderr, "usage: %s LIBR4D.so check [trials] [table] | swiglu TABLE | time [LIB2.so] | ptime [T[:P]...] | draft [trials] | tall [T...] | lcp [C] [trials] | bal [C] [ROUTES] | sweep [trials] | sweep0 [trials]\n", argv[0]); return 2; }
     /* `tall`: the switch before the plugin's row table and its sparse launchers first read it, and
      * the routed GEMM as the A/B's servers run it (no live tail); the other modes as the loop's
      * measured runs ran it. */
-    if (!std::strcmp(argv[2], "tall") || !std::strcmp(argv[2], "sweep"))
+    /* `lcp [C]`: RADIANCE_EXPERIMENTAL_DS41_LCP=C and EXACT_TALL unset, as an Lc arm's server has them;
+     * `sweep` keeps an LCP already in the environment (its heights) instead of setting EXACT_TALL. */
+    if (!std::strcmp(argv[2], "lcp") || !std::strcmp(argv[2], "bal")) {
+        const int c = argc > 3 ? std::atoi(argv[3]) : 1024;
+        if (c < 64 || c > 2048 || c % 16) { std::fprintf(stderr, "lcp C: a multiple of 16 in 64 .. 2048\n"); return 2; }
+        setenv("RADIANCE_EXPERIMENTAL_DS41_LCP", std::to_string(c).c_str(), 1);
+        unsetenv("RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL");
+        g_lcp = c;
+    } else if (!std::strcmp(argv[2], "sweep") && std::getenv("RADIANCE_EXPERIMENTAL_DS41_LCP") &&
+               std::atoi(std::getenv("RADIANCE_EXPERIMENTAL_DS41_LCP")) >= 64) {
+        g_lcp = std::atoi(std::getenv("RADIANCE_EXPERIMENTAL_DS41_LCP"));
+        unsetenv("RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL");
+    } else if (!std::strcmp(argv[2], "tall") || !std::strcmp(argv[2], "sweep"))
         setenv("RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL", "1", 1);
-    else if (!std::strcmp(argv[2], "sweep0")) unsetenv("RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL");
+    else if (!std::strcmp(argv[2], "sweep0")) {
+        unsetenv("RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL");
+        unsetenv("RADIANCE_EXPERIMENTAL_DS41_LCP");
+    }
     else setenv("RADIANCE_EXPERIMENTAL_DS41_LIVE_TAIL", "1", 1);
     /* The draft check's served entry runs under the switch, read once at the first draft-shaped call. */
     if (!std::strcmp(argv[2], "draft")) setenv("RADIANCE_EXPERIMENTAL_DS41_DRAFT_GEMV", "1", 1);
@@ -1586,6 +2016,17 @@ int main(int argc, char** argv) {
         if (argc > 3) { const Lib b(argv[3]); return timing(lib, &b); }
         return timing(lib, nullptr);
     }
+    if (!std::strcmp(argv[2], "lcp")) {
+        std::vector<int> Ts = { 17, 48, 64, 100, 171, 256 };
+        for (int T : { 512, 1024 })
+            if (T <= g_lcp) Ts.push_back(T);
+        int rc = tall_check(lib, Ts);
+        rc |= sweep_check(lib, true, argc > 4 ? std::max(1, std::atoi(argv[4])) : 2);
+        std::printf(rc ? "FAIL: lcp %d\n" : "PASS: lcp %d: tall passes and the height sweep keep 16-token passes' bits\n",
+                    g_lcp);
+        return rc;
+    }
+    if (!std::strcmp(argv[2], "bal")) return bal_check(lib, argc > 4 ? argv[4] : nullptr);
     if (!std::strcmp(argv[2], "tall")) {
         std::vector<int> Ts;
         for (int i = 3; i < argc; ++i) Ts.push_back(std::atoi(argv[i]));

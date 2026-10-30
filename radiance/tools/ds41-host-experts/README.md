@@ -20,7 +20,8 @@ step was measured as an A/B window; the log is `/home/as/ds41-decode-review-2026
 - `core/place/plane_mirror.*`: an optional second copy of the planes on another drive.
 - `core/place/router_predictor.*`: the next-layer predictor (shadow statistics; read-ahead is off).
 - `core/place/readahead.*`: read-ahead in pieces (`..._PREFETCH=pieces`, off): the predicted misses
-  of layer L+2 read at layer L in small pieces that give way to demand reads.
+  of layer L+2 read at layer L in small pieces that give way to demand reads; one-token passes, and
+  with `..._PREFETCH_MULTIROW=N` decode passes of 2..N rows (every row predicted, the union read).
 
 ## Configuration
 
@@ -50,7 +51,11 @@ RADIANCE_EXPERIMENTAL_DS41_PREFETCH=pieces                 # read-ahead of predi
 RADIANCE_EXPERIMENTAL_DS41_PREFETCH_K=4
 RADIANCE_EXPERIMENTAL_DS41_EARLY_ISSUE=1                    # routed card ops queued before the counts sync
 RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP=1                 # prefill: layers 21-39 only on rows that reach the output
-RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MAX_ROWS=16          # prefill: CPU jobs of up to 16 rows of one expert, many-row kernel
+RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP_CKPT=512          # with the prefix cache: the snapshots within 512 tokens below a cut prompt's target whole (the default when unset; all: every one, N: those within N tokens, 0: none -- see the table)
+RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MAX_ROWS=32          # prefill: CPU jobs of up to 32 rows of one expert, many-row kernel
+RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MISSES=1024         # misses computed on the CPU in passes of up to 1024 tokens
+RADIANCE_EXPERIMENTAL_DS41_LCP=1024                         # large-chunk prefill: chunks of 1024 tokens (with --max-num-batched-tokens 1024)
+RADIANCE_EXPERIMENTAL_DS41_MOE_BALANCE=1                    # routed gemv: work split by row passes, all-dropped passes skipped (exact)
 RADIANCE_EXPERIMENTAL_DS41_ROUTER_BF16=1                   # routers and compressor kv|gate held as bf16 halves (needs the libr4d whose f32bf16 card checks passed)
 RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED=1                   # VRAM residents in the packed-scale form, ~31 more a card (needs the libr4d whose gemv_vp card check passed)
 RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP=1                # no pass after a reply's end-of-generation token
@@ -62,7 +67,7 @@ RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_FUTEX=1            # pool workers sleep 
 
 radiance ... --tp 4 --placement expert_tiered --weights-disk-tier \
   --expert-ram-cache-total-mib 98304 --host-pool-mib 256 --embedding-placement ram \
-  --max-num-batched-tokens 16 --expert-profile <decode profile> \
+  --max-num-batched-tokens 1024 --expert-profile <decode profile> \
   --expert-plane-mirror <dir of the checkpoint's model-*.safetensors> \
   --expert-plane-mirror-decode-share 0.13                              # the mirror is optional, see below
 ```
@@ -80,6 +85,7 @@ the engine or the scripts assumes where the checkpoint is. `ab_window.sh` takes 
 | `..._HOST_EXPERTS=N`, `_POLICY=all` | cached experts on the CPU: 5.63 → 5.96 tok/s | `greedy` splits with the copy link (no better); `verify` computes both and compares rows |
 | `..._MISSES=16` | misses on the CPU: 5.96 → 8.89 tok/s | needs the mapped RAM cache |
 | `RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=1` with `--max-num-batched-tokens 32` (or 48) | byte-identical (--kld-record over 1,512 positions; card sweep up to 32 rows) but alone slower: TTFT 99.5 → 108.4 s at 3,086 tokens (+9%), held-out +4.5%; to be tried with 32-row CPU jobs (MAX_ROWS=32) | prefill passes of up to 32 (48) tokens, every reply, logit and KV entry the 16-token chunking's. Four kinds of op change arithmetic with the pass height: the routed MoE GEMM above 16 tokens (the gemv row's band ends there; the tiled row sums in another order), the sparse attention and the indexer score above 48 rows (WMMA forms), and every norm above 32 rows (`r4d_act_threads` halves the width, which regroups the sum of squares). Under the switch libr4d adds `moe_gemm_ggml_mxfp4_gemv_tall`, the gemv one priority below the gemv row with its bound on M raised to the tallest pass libr4d keeps exact (`libr4d/r4d_ds41_tall.h`), and keeps the sparse ops on their scalar forms at every height; the core raises the counts contract to 48 tokens and the CPU path to the step (its pinned rows, sorted order, output rows and fetch lists), and lets the file-buffer cap take passes of the step with the misses on the CPU in all of them (`..._MISSES` at least the step). At startup `FileStager::tall_init` refuses a step whose passes would change bits: above 48 tokens, a routed MXFP4 GEMM band off the gemv rows (a libr4d without the twin, or a step past its bound), or any other op on two kernels other than gemm_nt's m16 / m64; rank 0 then logs `exact tall passes: passes of up to N tokens ...`. Arm parts `Xt` and `BTN` (e.g. `...-M32-...-Xt-BT32`); the byte gate is a pair of `Kld` arms (below, Tools). Tests: `ds41_tall_test`, `hx_fetch_list_test` (16 / 32 / 48-row tables), `r4d_emu_ds41tall` and `r4d_emu_ds41tall_on` (the twin's rows = the gemv's in passes of 16; the fused norms at heights 1..48), `ds41_mxfp4_device_check LIBR4D tall` and `sweep` / `sweep0` on a card |
+| `RADIANCE_EXPERIMENTAL_DS41_LCP=C` with `--max-num-batched-tokens C` (C = 1024) | measured (ab-20261030T105535Z, ab-20261030T144409Z): exact everywhere (Kld identical at C=256/512/1024, prefill hashes 5/5); alone it was 2.3-3.4x slower than 16-token passes (3,086 tokens 202.5 s with Cs), 84% of it the twin's dead-slot passes; with `..._MOE_BALANCE=1` 3,086 tokens take 31.7 s (97 tok/s; 16-token Cs+Mr16 64.5 s, +Mb1 59.8 s), 1,890 tokens 28.7 s, 933 tokens 14.3 s, 272 tokens 11.4 s (16-token 10.5 s); a 1024-row layer-pass is then 355 ms, 279 ms of it waiting for miss reads (the drive) | large-chunk prefill: chunks of C tokens with every row, logit and KV entry the 16-token chunking's. libr4d keeps the exact-tall pins at every height and raises its twin `moe_gemm_ggml_mxfp4_gemv_tall` to 2048 rows (`libr4d/r4d_ds41_tall.h`); `FileStager::lcp_init` admits a step only when every routed MXFP4 band is on the gemv rows with the twin reaching C, every other op is on one kernel or on a known byte-identical pair (gemm_nt m16 / m64 / tiled, the exact all-reduce's one- and two-shot), `--max-num-batched-tokens` is C, and nothing outside what was proven is on (EXACT_TALL other than 1, speculation, `..._FETCH_LIST`, `..._VRAM_PACKED`); `hx_init` requires the CPU to take every routed unit (`..._POLICY=all`, `..._MISSES` ≥ C, `B1`); `Scheduler::lcp_init` requires chunks of C (the checkpoint interval a multiple of C, or a span) and a step a chunk alone (`--max-num-seqs 1` or `..._PREFILL_ALONE`), and every rank's stager to have taken it. Misses stream to the pool as each unit lands (at most `..._LCP_PLANES` read at once), jobs are cut evenly and submitted longest first, and the RAM cache admits only what the prompt's last `..._LCP_ADMIT` tokens (128) select, as the chunks reach them (earlier rows borrow read-only; at most `..._LCP_INSERTQ` admitted misses queued). With `Cs` and the plugin's declared 16-row grain the consumer skip cuts each chunk per row (`RadBatch::consumer_row0`). Rank 0 logs `large-chunk prefill: passes of up to C tokens ...`. Arm parts `LcN`, `AdN` / `Ada`, `LpN`, `LiN` (below) |
 | `--embedding-placement ram` | +1.5%, TTFT −2.4% | the engine's default (the A/B script had forced `vram`): the token embedding pinned in host RAM (1.26 GB), its 316 MiB a rank of VRAM to ~17 more resident experts |
 | `--host-pool-mib 256`, cache 96 GiB | +9% (vs the 4 GiB pool) | the pinned pool's RAM is worth more as cache; 256 MiB since the planner fix (was 1900); 96 GiB leaves ~14 GiB free (102 GiB: +4.3% in two runs of three, ~8 GiB free, sensitive to other jobs) |
 | `..._NATIVE_CACHE_PREGROW=1` | request 2 TTFT 13.7 → 5.0 s | slabs pinned at startup (+~30 s startup) |
@@ -93,6 +99,7 @@ the engine or the scripts assumes where the checkpoint is. `ab_window.sh` takes 
 | `RADIANCE_EXPERIMENTAL_DS41_PREFETCH_URGENT=1` (`=2`) | not yet measured (estimate: the per-unit wait 2.4–2.7 → ~2.1 ms with 1 and ~1.9 ms with 2, on ~2.4 such units a token: +0.5 to +1.4%; the drive-cache verifier priced the container-only form at about 0 and the mirror's share at +0.4–0.5%) | a partly read unit its layer needs (`PpK`, ~6.5 MB of its ~18.8 read ahead) is finished by the layer's own read instead of urgent 512 KiB pieces (~20 reader round trips a unit, 4.9 GB/s): `hx_ra_take` stops it (`PieceReader::stop`: no further piece starts), and the call that reads the layer's other misses on the mover's kept readers reads the rest of each extent, one large read an extent's rest at the demand read's depth (`Mover::read_unit_planes` with `PlanesIn`), while the pieces in flight land; `hx_ra_settle` then waits for those (a failed piece: the unit read again whole). The same bytes at the same offsets: the planes are the container's either way. `=2` gives the plane mirror its decode share of the rest (`Mover::rest_mirror_tail`: the decode tail scaled by the share of the unit left, at most the w3 codes past the pieces), so a barely started unit is finished too instead of read afresh; it needs the decode mirror (`R`, `RdNN`). With `_MISS_POST` the rest is posted with the other misses. Needs `_PREFETCH_FINISH` (on by default). Arm parts `Pu` (1), `Pu2` (2), pinned to 0 in every other arm; every rank names it at startup ("reads the rest of a partly read unit its layer needs ... PREFETCH_URGENT=N)"), and the shutdown report's "read-ahead in pieces, rests on the kept readers" line counts the rests and their mirror MB, "read-ahead in pieces, partly read units" (in every `PpK` arm) the per-unit wait from the layer's choice to the unit whole, and the same wait on the units every arm finishes (started at least the mirror's decode share when the layer took them: `=2` also finishes barely started units, ~16-18 MB rests, which the others read afresh; the gate: that figure must fall), the rests line the units whose rest the mirror read part of (a count, which a Pu2 arm must show above 0), the readers' line the units stopped, and "one-token miss reads, with a read-ahead unit's rest" these calls' legs apart from the plain misses' |
 | `..._PREFETCH_SCORE=int8\|int4`, `_PREFETCH_RESCORE` (12), `_PREFETCH_SCORE_CHECK=N`, `_PREFETCH_RECORD=<path>` | not yet measured on the engine (estimates: the predictor's ~597 us a prediction to ~300 us with int8 and ~150-200 us with int4, +0.3-0.8% decode). Offline (`router_score_eval` on the container's routers, 3,648 synthetic inputs, iid and aligned): int8 with 12 rescored gave bf16's own top 4, in its order, every time (bf16's picks all within int8's best 8); int4 98.6 / 99.5% at 12, 99.3 / 99.8% at 16, 99.9 / 100% at 24. One thread, quiet box, tables cold: bf16 228 us a prediction, int8 133 + 12 us rescoring, int4 100 + 11 us. No trace keeps real router inputs yet: a `Pv` arm records them for the tool, and a `PkN` arm checks against bf16 live | the read-ahead's predictor (`router_predictor.h`, arithmetic in `core/place/router_score.h`) scores every expert from a quantized copy of the routers first -- one scale an expert (int8 `max\|w\|/127`; int4 `w ~ s (n - 8)` with the clip of `max\|w\|` that gives the row the least squared error), the input quantized once to int16, integer dots (`vpmaddwd`, exact) -- and only its best `_PREFETCH_RESCORE` again in bf16; the best k of those are the prediction, so it is bf16's own whenever bf16's best k are among the rescored. A prediction streams 1.97 / 0.98 MB instead of 3.93 MB from DRAM during the pool's bursts (79 / 39 MB of RAM beside the bf16 copy, 2 MiB pages; quantized at load, ~0.2 / ~0.25 s). Only reads ahead change, never a reply. `_PREFETCH_SCORE_CHECK=N`: one prediction in N is also scored in bf16 alone after it was handed over and compared (a precision arm, not a timed one). Startup: the predictor's line says `scored in int8\|int4 (...), the best 12 scored again in bf16`; shutdown: `router predictor scoring` (the quantized pass and the rescoring a prediction) and `router predictor check against bf16 alone` (the same set, the same order, bf16's picks by their rank in the quantized scores, those past the rescored). `_PREFETCH_RECORD=<path>` (any predictor mode): every posted router input is appended to the file after its prediction was handed over (64-byte header `RADPRDR1`, then u32 pass, i32 layer, 5120 bf16 a record, ~190 MB an arm of the held-out prompts) for `router_score_eval` (Tools) to score offline in bf16, int8 and int4; shutdown line `router predictor record`. Arm parts `Pi8`, `Pi4`, `Pi8rN` / `Pi4rN` (rescore N), `PkN` (with Pi), `Pv` (the record) |
 | `RADIANCE_EXPERIMENTAL_DS41_PREFETCH_POST_LATE=1` | not yet measured (estimate +0.1-0.2%; rank 0's EP-decision `choose` 8.1-8.9 us should fall to ~4.3 us, the `predictor post` part showing the post's 4-6 us after the submit) | with `..._EARLY_ISSUE=1` and the read-ahead in pieces: at an early-issued layer's gather rank 0 posts the read-ahead's router input after the layer's CPU work is submitted, as `start_ep_routed` does, instead of before `hx_choose`, where the post (its copy of the input and the predictor's wake) held back the pool's start. Refused without Ei and pieces. Startup line `rank 0 posts the read-ahead's router input once a layer's CPU work is submitted`; arm part `Pw` |
+| `RADIANCE_EXPERIMENTAL_DS41_PREFETCH_MULTIROW=N` (2-16) | not yet measured | the read-ahead in pieces in decode passes of 2..N rows too: DSpark's verify passes (2 rows at cap 1, up to 6) and several sequences' decode rows, which otherwise all go without it (window C's `Ds1`/`Ds2` arms: 0 inputs posted, 0 pieces read). Rank 0 posts every row's router input at the one-token pass's points; the predictor reads layer L+2's router once for all the rows (each row's logits bit for bit the one-row kernel's) and hands every rank the union of the rows' top K (every row's best before any row's second), planned under the same live cap, with the same yields to demand reads, finishing rule (the plane mirror's share for the pass's rows) and epoch check. One-token passes go as without it; prefill chunks, mixed passes and the drafter's own passes never read ahead. Reads only. Refused unless the read-ahead in pieces runs (`..._PREFETCH=pieces`, `..._MISSES` ≥ N). The on-die reads (`Pa`/`PmN`/`Pe`: decode passes of up to 16 rows) and early issue (`Ei`) already covered verify passes (window C's Ds1 arm: on-die reads in all 269 verify passes, 11,640 early layers). Arm part `PmrN` (`Pmr`: 6), with a `PpK` part; startup line `read-ahead: decode passes of 2-N rows read ahead too`; shutdown lines `read-ahead in pieces by pass size` (each rank's planned / used / dropped by the pass's rows) and `router predictor, multi-row decode passes` (the scoring a row) |
 | `RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE=1` with `--max-num-seqs N` | aggregate decode 16.2 → 20.1 tok/s at N=4 (+24%), 20.6 at N=8; per stream ~1/N | concurrent requests' decode rows run in one step and a prefill chunk runs in a step of its own (the 16-token budget otherwise admits nothing beside a decode row, so N>1 served requests one after another). Every reply identical to running alone. `--max-model-len` must cover N sequences (512 holds four ~110-token requests). Arm parts Pf, NK, CK, LK |
 | `..._ACCESS_TRACE=<dir>` | | per-rank access traces for `cache_sim.py` |
 | `RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP=1` | alone 17.40 / 17.80 / 17.35 against 17.37 / 17.65 / 17.69 tok/s (−0.3%), replies identical; with Rb and Vp 17.86 / 17.99 / 17.96 (+2.1%); being separated | Every step is followed by a step issued ahead (`Scheduler::step_next`) before the host has read its tokens, so the step that samples a reply's end-of-generation token gets one more forward pass, for the finished request (max_tokens ends are predicted and get none). On the CPU path issuing a pass waits for the card at every routed layer, so `issue_ahead` returns only once most of that pass has run, and the commit that ends the reply comes after it: the reply, its `predicted_ms` and the next request all wait it out (29 Oct trace: 204-207 of its 240 selections off the card, 103-105 misses). Nothing reads that pass: its token is dropped, the prefix cache publishes a finished sequence up to its last token's position and the pass writes the one after, and its blocks are freed at its commit. With the switch, a step of one sequence that its own token can end (not `ignore_eos`) has its ids read back first (`Engine::peek_outcome`: collect_step's rules without its effects), and `step_next` issues nothing behind a step whose outcome ends every request it carries (commit's own end conditions, `Scheduler::outcome_ends_every_request`). Exact: every pass that runs ran before, and the commits are the same. The cost is the host's turnaround between two such passes, while the card waits: the next step's build, advance and the ranks' release (tens of µs a token). Steps of two or more sequences keep the step issued ahead. Arm part `Ss`; the shutdown's `post-stop passes:` line counts the passes run after a reply's last token and, with the switch, the steps read back, the wait for their ids, the turnaround and the passes withheld |
@@ -104,7 +111,7 @@ the engine or the scripts assumes where the checkpoint is. `ab_window.sh` takes 
 | `..._PREFETCH_ATTN=1` | +2.8% | in the deepseek41 plugin: while the card waits for a layer's CPU rows, lane 1 reads the next layer's q_a, kv, q_b and wo_a (~56 MB a card) into the 64 MB on-die cache (libr4d `prefetch`, read-only); decode passes only, and not ahead of an Engram layer. That stays its behaviour unless one of the three modifiers below is set |
 | `..._PREFETCH_MIB=N`, `..._PREFETCH_SET=k1,k2,..`, `..._PREFETCH_ENGRAM=1` | MIB=56: 17.65 / 17.29 / 17.58; MIB=56 + ENGRAM: 17.65 / 17.73 / 17.36 tok/s against 16.53 (a dip) / 17.51 / 17.24 (+1.0 to +1.4%), every reply identical; ENGRAM overlaps the Engram all_gather, so it was also checked on the 16 chat prompts with 256-token replies: 16/16 identical, 15.84 against 15.74 tok/s. Adopted (MIB=56 + ENGRAM) | modifiers of `..._PREFETCH_ATTN=1` (deepseek41 plugin, `arch/deepseek41/ds41_prefetch_plan.h`). `MIB`: a budget of N MiB an issue point, filled in use order (`ekv` engram_kv, `comp` the compressor, `qa`, `kv`, `iq` the indexer's q_b, `qb`, `oa` wo_a's groups, `ob` wo_b, `rt` the f32 router, `sgu`/`sdn` the shared expert's gate\|up and down), the read that crosses it cut to what is left: at bf16 56 MiB is the four reads above plus 2.5 MiB of wo_b; with `..._DENSE_FP8=1`, whose E4M3 codes halve the reads (the four alone are then 26.75 MiB), the whole list through the shared expert (rank 0 55.5 MiB). `SET`: the reads named, in that order (also `iw`, `ik`: the indexer's small projections; `ma`, `mf`: the connections' mixes), whole unless a budget is set. `ENGRAM`: an Engram layer (1, 14) is read too, its engram_kv by the layer before when `ekv` is listed, the rest right behind its Engram GEMM. Each rank prints its plan at startup and its counts at shutdown (`rank R: on-die reads`). Arm parts `PmN`, `Pl<k1+k2+..>`, `Pe` |
 | `..._CACHE_SECOND_CHANCE=N` | N=1 +3.9%, N=2 +5.1% (TTFT −1.5% / +1.2%) | a cached unit the decode profile calls hot (`..._CACHE_PROTECT_SHARE`, default 6 of the sealed profile's 4326 selections a layer: ~1150 units a rank) moves to the front up to N times between uses before an insert may evict it. The held-out prompts share task families with the profile; replayed on the 16 chat prompts too, critical decode misses fell 7.9% (N=1) |
-| `RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED=1` | alone 17.56 / 17.60 / 17.58 against 17.37 / 17.65 / 17.69 tok/s (+0.1%), TTFT −3%, replies identical; the gemv_vp kernel is 27-51% slower a call than the plain row (register spills), being rewritten | the cards' static expert residents in the same packed form (below): 18,001,920 instead of 18,800,640 bytes a unit, so x1.0444 the residents (with F8, 712 / 720 a rank should become ~743 / 752); needs a `libr4d.so` with the row `moe_gemm_ggml_mxfp4_gemv_vp` in the run home, `--deterministic` and passes of at most 16 tokens; `..._VRAM_PACKED_RAW=<gate_up>,<down>` (512,320) sets the raw rounds of room; arm part `Vp`, which runs only on a `libr4d.so` the device check passed (`VPACK_CHECK`, below) |
+| `RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED=1` | alone 17.56 / 17.60 / 17.58 against 17.37 / 17.65 / 17.69 tok/s (+0.1%), TTFT −3%, replies identical; those runs used the first gemv_vp kernel, 27-51% slower a call than the plain row (register spills). claude/ds41-vpk2's default kernel (r2cz: the raw rounds' bytes through the scalar unit, one rolled block loop, and a pass of dropped slots alone storing its zeros) is 2.3-5.3x faster a call than the plain row (gate_up 28 / 54 / 73 us against 148 / 169 / 177 at 1 / 2 / 3 live experts; down 20 / 30 / 43 against 105 / 105 / 99), mostly from the dropped-slot skip (5 of a decode call's 6 passes with the live tail off); r2cf, the kernel without the skip, is 0.69-0.77 of plain. Every bit identical (card `check 48` and `check 48 tail`, 0 of 6,087,680 values differ; dropped slots 0 non-zero). `RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED_KERNEL=old|r2|r2cf|r2cz` picks a kernel for an A/B (an unknown value refuses every gemv_vp call); not yet measured end to end | the cards' static expert residents in the same packed form (below): 18,001,920 instead of 18,800,640 bytes a unit, so x1.0444 the residents (with F8, 712 / 720 a rank should become ~743 / 752); needs a `libr4d.so` with the row `moe_gemm_ggml_mxfp4_gemv_vp` in the run home, `--deterministic` and passes of at most 16 tokens; `..._VRAM_PACKED_RAW=<gate_up>,<down>` (512,320) sets the raw rounds of room; arm part `Vp`, which runs only on a `libr4d.so` the device check passed (`VPACK_CHECK`, below) |
 | `..._PACKED_CACHE=1` | +3.2% alone, TTFT −5.5%; with `..._CACHE_SECOND_CHANCE=2` 15.52 / 15.48 tok/s (+8.2%) | the RAM cache holds each expert's codes plane plus its e8m0 scales packed to 2 bits from one base a weight (raw rounds beside, budget 512 / 320, `..._PACKED_CACHE_RAW`): x1.0444 slots and 4.4% fewer bytes a CPU hit; 7 of 15,360 experts never fit and stay misses. Refused unless the CPU takes every routed unit (all, M16, B1); the card's copy path never reads or fills it |
 | `RADIANCE_EXPERIMENTAL_DS41_SIDE_STORE=N` | not yet measured (estimate +0.3-0.5% decode: the 7 never-packable experts' ~0.1 misses a token, ~2.7 ms each, gone; refused inserts down to one per distinct unit) | with the packed cache (`..._PACKED_CACHE=1`) and misses on the CPU: the planes of up to N units a rank whose inserts the packed cache refuses over its raw-round room (7 of 15,360 experts; 1-2 a rank in the held-out runs) are kept after their first miss (the insert thread, `core/place/hx_side_store.h`) and handed to their later misses as a unit read ahead whole is: no drive read, the same bytes, the container's epoch checked first; never inserted again, and the read-ahead treats them as cached. ~18 MiB of planes a unit held (2 MiB-rounded buffers); the store only ever holds units the cache refused, 1-2 a rank in the held-out runs (~36 MiB a rank), and N bounds it (N=7: every never-packable expert even if one rank had them all). Refused without the packed cache or the CPU's misses. Startup line `side store: the planes of up to N units a rank ...`; shutdown `host experts' side store: K of at most N units held (...); M misses handed their planes without a read`, and the mover's `unit inserts refused over a raw-round budget` count should equal the distinct units. Arm part `NsN` |
 | `RADIANCE_EXPERIMENTAL_DS41_CHAIN_OVERLAP=1` (`=2`) | neutral: 16.85 / 16.65 against 17.07 / 16.36 tok/s (47% of launches went unordered; the card's chain is not the critical path) | in decode passes (in every pass issued live), a device launch whose first dispatch reads nothing the dispatches in flight on its queue write, and writes nothing they read or write, goes without the AQL barrier bit (`core/runtime/live_chain.h`): what `haz_mark` does for recorded passes, which a staged pass never is. Exact: only start order changes. Anything on the queue the issue path did not write (events, waits, copies, table patches) orders the next launch; collectives, kernels without `rad_kernel_concurrent` and host-visible launches never go unordered. Shutdown line `live chain: ...`; arm parts `Ov` / `Ov2` |
@@ -117,7 +124,8 @@ the engine or the scripts assumes where the checkpoint is. `ab_window.sh` takes 
 | `RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_PREWAKE=N` | not yet measured (estimate +1 to +3% with `FUTEX`, ~+1.5% central; the awake cost ~24 workers x ~50-100 us a layer, against MWAITX's 40 x 1.5 ms) | up to N sleeping workers (about 24) woken shortly before a one-token layer's CPU work, then back to sleep after `_PREWAKE_SPIN_US` (100) if none came: (1) every rank records a card-local, host-waited event right before each routed layer's router GEMV (the gemm reading `blk.L.glm_router.weight`, found at startup), and at the layer's decision its issuing thread waits for that event before the counts, then calls the pre-wake (the pool takes the first rank's call of the layer: one call a window); (2) in a miss read the issuing thread, done with its own share (the mirror's tail), waits for the kept readers with a deadline `_PREWAKE_LEAD_US` (60; 0 turns this trigger off) before the read's predicted landing (the median of the last 32 reads of as many units, from their dispatch; armed from the eighth), and pre-wakes there if the reads are still out. Not while read-ahead units are being finished (their wait follows the read). Exact: the same jobs, rows and bytes. Spins of 2.5 ms (-8.5%) and MWAITX (-7.2%) lost more than the wake was worth by keeping all 40 workers runnable, so N is a subset, the window short and the shutdown line counts what it cost: `host expert pool:` (router / miss pre-wakes: calls, workers woken, those that took a tile and those that slept again, their spin; the first tile and the 24th of a submit's first job; idle spin in all) and per rank `host experts, pre-wake:` (router event to counts, the calls' time, miss-read pre-wakes fired and the lead they gave); every host-experts arm also prints per rank `host experts, one-token passes:` (decode gathers' waits for the CPU rows, layers with and without a miss apart: the number the switch should cut by 20 us or more, with the router waits flat). Arm part `WpN` (1 .. the arm's threads), with `WlN` the miss-read trigger's lead (`_PREWAKE_LEAD_US`, 60 in every other arm; `Wl0` the router trigger alone); startup lines `pre-wake of up to N workers ... at its router and 60 us before a miss read's predicted end` (`Wl0`: `... and not in miss reads`) and `pre-wake: an event before K of 40 routed layers' router GEMVs`. The per-rank line also counts the router calls whose layer had its counts in when the call returned (the call held the decision back); the miss trigger's 1 us timer slack covers that wait alone |
 | `RADIANCE_EXPERIMENTAL_DS41_ROUTER_BF16=1` | alone 17.84 / 17.92 / 17.26 against 17.37 / 17.65 / 17.69 tok/s (+0.6%, noisy), replies identical, card checks passed; with Vp and Ss +2.1% every round | in the deepseek41 plugin and libr4d (build both from this branch): the 40 routers ([384, 5120], 300 MiB a card replicated) and the kv\|gate projections of the 3 compressors with a ratio above 1 ([1024, 5120], layers 2, 8, 14) are f32 in `gemm_nt_f32` but ship bf16. The container holds the routers widened to f32 (`scan_low_halves.py`: 0 of 78.6M low halves nonzero), which libr4d's `gemm_nt_f32bf16` stores as their bf16 halves, and the compressors as bf16, which the loader had widened and which are now read as they are: 180 MiB a card back to the experts (~+10 a rank; 150 MiB of it the routers'). The kernel widens each by a shift in the same tiles, lanes and order, so every logit is bit-identical. The load refuses an f32 weight with a nonzero low half rather than rounding it; startup prints a `ROUTER_BF16:` line on rank 0 counting the weights held at two bytes an element. The on-die reads (`PmN`, `Pl..`) take both at their bf16 bytes (`rt` 3.75 MiB, `comp` 10), and the router predictor (`PpK` and the others) reads the router's f32 plane from the container as before. Gate: `r4d_selftest --perff32 384 5120 1` at or under 14 us for the halves (19.7 us f32 in the engine); the same run byte-compares and times tile forms 1-8, and `..._ROUTER_BF16_FORM=N` makes the halves take form N at passes of up to 16 rows without a rebuild (forms are byte-identical). Arm parts `Rb`, `RbN`: `ab_window.sh` measures them only when `SELFTEST_F32BF16=<r4d_selftest>`'s card checks (the check case, then every form byte-compared and timed at 1 and 16 rows at both shapes) passed in the same window on the arm's own libr4d.so |
 | `RADIANCE_EXPERIMENTAL_DS41_ROUTE_TRACE=<prefix>` | instrument, exact; overhead not yet measured (rank 0: three more copies, ~1.6 KB, a routed layer behind its counts row's, which the CPU's choice does not wait for; every rank: one cache lock a decode layer) | the routing trace for the lossy track (`core/place/route_trace.h` has the format; below). Arm part `Rt` (files under `rtrace-<arm>/`); shutdown lines `route trace: ...` per rank (picks by status) and for the files (records, bytes, drops) |
-| `RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP=1` | TTFT 99.2 → 69.1 s at 3,086 prompt tokens (−30%), 68.0 → 50.3 s at 1,890 (−26%), 31.1 → 27.6 s at 933, 224 → 125 s at 6,817 (−44%); every prefill's KV-group and last-row-logit hashes identical to the base (5/5 and 1/1, all cut), replies identical, decode unchanged (window ab-20261029T200958Z). Adopted | the exact consumer-suffix skip (`core/sched/consumer_skip.h`, schedule and proof; the deepseek41 plugin's `cut_declare` / `step()`). Layers 21..39 see earlier rows only through layer 20's compressed and index keys and their own 128-row windows, so a prompt's early pure prefill passes run layers 0..F-1 in full, layer F's window-key ops alone (the full layer's own ops, so the stored bytes are the same; layer 20 also its compressor and key stores), and skip the rest, F ≥ 20 rising by 8 passes a layer to 40 at the prompt's last pass. Every computed row and stored key is the base engine's, and no row reads a key the request did not write; the next step's windows and the tail checkpoint's are complete (with the prefix cache on, a prompt is cut for the deepest checkpoint its idle prefill writes -- its tail, else the last interval boundary, else a shared head -- and no snapshot below it is written, nor counted as dropped without the cache). Refused also when the ranks' declarations differ or KV streams (`--kv-resident`); a step that writes a checkpoint is never cut. Nothing is read, staged, predicted or computed for a skipped layer (file stager, read-ahead, CPU path, next-layer prefetch). Refused, with the reason, for speculation, KL or embedding modes, media, R-SWA, concurrent sequences with chunks wider than the 16-token quantum (unless `..._SCHED_PREFILL_ALONE=1`), and a model the derivation does not cover. Startup lines `consumer skip: on` (scheduler) and `consumer suffix declared` (plugin); shutdown lines `consumer skip: ... layer-passes run in full, ... key ops alone, ... skipped` (engine) and `rank R: consumer skip: ...` (plugin, the same counts). Needs a radiance and a deepseek41 from `claude/ds41-cskip` (run home `home-cskip`); arm part `Cs` |
+| `RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP=1` | TTFT 99.2 → 69.1 s at 3,086 prompt tokens (−30%), 68.0 → 50.3 s at 1,890 (−26%), 31.1 → 27.6 s at 933, 224 → 125 s at 6,817 (−44%); every prefill's KV-group and last-row-logit hashes identical to the base (5/5 and 1/1, all cut), replies identical, decode unchanged (window ab-20261029T200958Z). Adopted | the exact consumer-suffix skip (`core/sched/consumer_skip.h`, schedule and proof; the deepseek41 plugin's `cut_declare` / `step()`). Layers 21..39 see earlier rows only through layer 20's compressed and index keys and their own 128-row windows, so a prompt's early pure prefill passes run layers 0..F-1 in full, layer F's window-key ops alone (the full layer's own ops, so the stored bytes are the same; layer 20 also its compressor and key stores), and skip the rest, F ≥ 20 rising by 8 passes a layer to 40 at the prompt's last pass. Every computed row and stored key is the base engine's, and no row reads a key the request did not write; the next step's windows and the tail checkpoint's are complete (with the prefix cache on, a prompt is cut for the deepest checkpoint its idle prefill writes -- its tail, else the last interval boundary, else a shared head -- and the snapshots below it are made whole or not written: `..._CONSUMER_SKIP_CKPT`, next row; none is counted as dropped without the cache). Refused also when the ranks' declarations differ or KV streams (`--kv-resident`); a step that writes a checkpoint is never cut. Nothing is read, staged, predicted or computed for a skipped layer (file stager, read-ahead, CPU path, next-layer prefetch). Refused, with the reason, for speculation, KL or embedding modes, media, R-SWA, concurrent sequences with chunks wider than the 16-token quantum (unless `..._SCHED_PREFILL_ALONE=1`), and a model the derivation does not cover. Startup lines `consumer skip: on` (scheduler) and `consumer suffix declared` (plugin); shutdown lines `consumer skip: ... layer-passes run in full, ... key ops alone, ... skipped` (engine) and `rank R: consumer skip: ...` (plugin, the same counts). Needs a radiance and a deepseek41 from `claude/ds41-cskip` (run home `home-cskip`); arm part `Cs` |
+| `RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP_CKPT=512` (default with the prefix cache when unset), `=all`, `=N`, `=0` | not yet measured on the cards (claude/ds41-csckpt). Predicted from the schedule, layer-passes run in full against the base engine's, idle 16-token prefill, exact resume (nearest is the same but where its fewer snapshots move the target): at `--checkpoint-interval` 16 and 256 `all` keeps 97.5% and 96.3% at every length (the cut saves 2.5-4%), at 2048 `all` 82.3% at 3,086 tokens, 78.9-78.8% from 4,096 to 32,768; `=512` 77.6-77.8% at 3,086, 60.3-60.4% at 8,192, 52.6% at 32,768 at any interval; `=0` (the cut alone) 70.2%, 57.5%, 51.9%; 1,221 tokens 87.3% alone, 91.2-90.2% at `=256`, 96.4-97.6% `all` (table below) | which snapshots below a cut prompt's target are written, each holding the base engine's bytes (`core/sched/consumer_skip.h`, "complete checkpoints", with the proof). Without them a later prompt that shares only an earlier prefix of a cut one finds no snapshot (window ab-20261029T232708Z, `Cs-Pc-Pci256`: chat turns A2-A4 31 s instead of 5.2-5.8 s, `pfxL-3` 56 s instead of 3 s, `hit_cuts no_snapshot`). Key ops alone do not make a snapshot whole: a layer's window key at a row is computed from that layer's input there, layer L-1's output, so layer L-1 must run in full on that row, reading its own window W-1 rows further back, and so on down. A whole snapshot at P costs its own dependency cone: layer L in 21..38 in full on the 128 (39-L) rows before P, layer 39's keys on the last 128, layer 20 in full on the 2,432 before it; 1,520 16-row layer-passes for a lone one far from the target (20% of a 3,086-token prompt), about 17 a pass of distance near the target, none within a pass of it. A pass runs F = max(the target's F, the first whole checkpoint ahead's), still one number a pass, so the plugin is unchanged; checkpoints every I tokens overlap their cones for every layer L with 128 (39-L) >= I, which then runs in full throughout. `all`: every snapshot the uncut prefill writes (the base engine's prefix-cache contents, hit for hit); `N`: those within N tokens below the target and the request's shared head (keep point), the rest not written (unset or not a token count: `512`, the default, which keeps most of the skip and every hit of both receipts); `0`: none, as before. A step that writes a snapshot below the target is cut only if it is the one planned and stores layer 39's keys (else it runs every layer: `run in full off the plan`, stays 0). Startup: `consumer skip: on ...` names the policy, and `consumer skip: complete checkpoints (..._CKPT=all|N) -- ...` (with the cost of a lone one at the deployed shape) unless 0; shutdown: `checkpoints below a prompt's target: W written whole, D not written; their cones raised P passes by X layer-passes in full (the key ops alone stay one a cut pass), K snapshot passes cut at the last layer's keys, 0 run in full off the plan`. Arm parts: none (= `512`, the default) / `Ck` (= `all`), `CkN`, `Ck0`, with `Cs` and `Pc`; a Cs Pc arm must log its policy line or it is not measured. Tests: `consumer_skip_test` (any set of snapshots on random grids, the scheduler's sets at intervals 16, 256, 2048 in both modes, negative controls: the target alone, key ops alone, a cone a pass short or for narrower passes), `sched_test` (the real scheduler: every snapshot of the uncut run written and whole, per-pass F, bands, a shared head, a resumed prefill, the variable), `ds41_consumer_skip_arch_test` (the plugin on a non-monotone F) |
 | `RADIANCE_EXPERIMENTAL_DS41_PREFILL_HASH=1` | instrument | the exactness evidence for the consumer skip, usable without it (`core/engine_hash.cpp`): at the end of each prompt's prefill, before its sampler and before the next step, every rank hashes each KV group the prompt wrote (whole blocks of a full group, the last window of the windowed one, the state slots), each layer apart, and the last row's logits; lines `prefill hash: seq S, N tokens (...), rank R: <group>[layers]=<hash> ... logits=<hash>`, the window group by layer, and `prefill hash: seq S, N tokens: all ranks <digest>`. Steps are not issued ahead while it is on, so time prompts in arms without it. Arm part `Kh`; the window compares the Kh arms' hashes with the first Kh arm's (`ab_requests.py --hashes DIR ARM...`) |
 
 The shutdown report counts the miss reads of one-token passes whatever the switches (two lines a
@@ -184,7 +192,109 @@ block's first ones: the replies stay the target's, acceptance may move (the draf
 5, and a short block has never been measured). Its own ops where the block length is a parameter:
 the offsets placing every row at the block's last position, each stage's attention window (`window`
 context keys before the anchor plus the block's), and the walk. Arm part `DbN` (with a `Ds` part);
-off, nothing of it is declared.
+off, nothing of it is declared. Run in ab-20261030T070039Z with `Dk` on the best settings' DSpark
+form (`...-Pm56-Pe-Rm7-Ds1-Dk-Db2`): every reply identical; acceptance 216/268 against 217/268 for
+the full block on the held-out prompts (384/548 on chat); a drafting step 108.5 ms against 113.9
+(63.7 drafting off), so the draft costs ~0.2 of a plain step instead of ~0.3.
+
+## DSpark's acceptance gate (`RADIANCE_EXPERIMENTAL_DS41_DSPARK_GATE`)
+
+A drafting step pays when 1 + a > rho + d (a: drafts accepted; rho + d: the drafting step's cost
+in plain steps). On the best settings' DSpark form rho + d is 1.78 at cap 1 with the full block
+(ab-20261029T220909Z: 110.5 against 62.1 ms a step held-out, 126.4 against 71.4 chat) and 1.70
+with `Db2` (ab-20261030T070039Z), while acceptance per reply runs from 0.27 to 1.00. The gate
+(`core/sched/draft_gate.h`, decided in `Scheduler::block_begin`) keeps each sequence's last W
+verifies of head drafts; while the mean drafts accepted a verify is under the threshold the
+sequence drafts nothing: its query pass is skipped, the step issued ahead verifies no drafts for it
+(nor does the prompt-lookup fallback stand in), and the context pass, which fills the drafter's
+window cache, still runs. One step in R of a closed run drafts anyway, a probe whose verify enters
+the mean. A sequence drafts from its start until W verifies are in. The mean lags one verify (the
+open step's acceptance is still on the card), and nothing waits on the card.
+
+`=1` takes the defaults, threshold 0.78 (the full block's break-even at cap 1), W 8, R 8;
+`=T,W,R` sets them (T in drafts accepted a verify: at a deeper cap use that cap's rho + d - 1;
+`Db2` breaks even at 0.70). Refused at startup when unreadable, with compute OFF (`Ds0`), and
+without a block drafter. Startup line `DSpark acceptance gate: on (...)`; at shutdown a line with
+every sequence's counts (steps asked, drafted while warming up / open / as probes, gated, closed
+runs and reopenings, drafts verified and accepted, the probes'), a line of the decode steps of one
+sequence by kind (verify + draft, plain, a probe's draft, its verify) with their mean wall time and
+the measured break-even (verify + draft over plain, less one) to set T from, and a line for each of
+the last 256 sequences. `/stats` carries the same under `draft_gate`. Only how many drafts a step
+verifies changes, so replies stay identical. Arm part `Dg` or `DgTT[wW][rR]` (threshold 0.TT, or
+T.TT for three digits; W and R default to 8), with a `Ds` part other than `Ds0`.
+
+Replay of the gate on the measured per-reply acceptance (i.i.d. outcomes within a reply,
+`gate_sim2.py`-style, against drafting off with the bank): with `Db2` always-on gives +5.4%
+held-out and -0.4% chat; the gate at 0.70/8/8 +5.1% and +2.0% (+5.2% and +2.7% on 256-token
+replies), the per-reply oracle +6.2% and +5.0%. With the full block (rho + d 1.78) the gate at the
+defaults +1.6% held-out and -0.3% chat against +1.0% and -2.8% always on.
+
+## The drafter's dense linears in FP8 (`RADIANCE_EXPERIMENTAL_DS41_DSPARK_FP8`)
+
+The release ships the DSpark stages' dense linears as the trunk's: `mtp.{0,1,2}.attn.{wq_a, wq_b,
+wkv, wo_a, wo_b}`, `ffn.shared_experts.{w1, w2, w3}` and `mtp.0.main_proj` are F8_E4M3 with
+F8_E8M0 scales one per 32x32 block (model-00044..46's headers), and the draft bank holds them cast
+to bf16 (`blk.40-42.*`, `dspark.fc.weight`). With `=1` (and `..._DENSE_FP8=1`, which it extends)
+the deepseek41 plugin marks them as lw8() marks the trunk's and gives the drafter's shared expert
+`gemm_nt_bf16f8`; the load re-encodes each and refuses one that is not exactly so
+(`ds41_dense_fp8_scan` now covers a bank's `dspark.fc.weight` too; over the bank of
+ds41-dspark-bank-20261028T140400Z: 43 / 43 entries exact, 551,424 blocks, none refused, every
+tensor-parallel cut on 32). The op writes gemm_nt's bytes, so
+the drafter proposes the same tokens; the stored form halves those weights, 25 a rank (fc and, per
+stage, q_a, q_b, kv, wo_b, two wo_a groups and the shared pair): 438 MiB of bf16 become 219 MiB of
+codes on rank 0 and 415.5 become 207.8 on ranks 1-3 (`ds41_dspark_fp8_arch_test`), about 11 more
+resident experts a rank, and the draft's and the context pass's reads of them halve. Startup line per rank `deepseek41: rank R: DSpark
+drafter: N dense weights read by gemm_nt_bf16f8 (...)`, apart from the trunk's. Arm part `Df` (with
+`F8` and a `Ds` part); at the window's end each `Df` arm's `draft_n`/`draft_n_accepted` must equal
+the same arm's without `Df`.
+
+## The draft bank's hot set in VRAM (`RADIANCE_EXPERIMENTAL_DS41_DRAFT_VRAM`)
+
+The pinned bank costs the best arm ~4.5% before it drafts anything: `--draft-bank-expert-placement
+host` takes 1.68 GiB a rank of pinned pool (p2048 instead of p256) and the RAM cache drops to 90 GiB.
+`RADIANCE_EXPERIMENTAL_DS41_DRAFT_VRAM=N` (1-32) with `..._DRAFT_HOTSET=<file>` replaces that
+placement (the flag stays `host`, the bank's manual contract; core/place/draft_vram.h):
+
+- each rank keeps the first N experts of each of its three stage lists in the hot-set file as
+  static VRAM residents, charged to the weights pool before the expert fill (`Planner::
+  place_draft_bank_vram`): the trunk gives up 3N residents a rank (a pair is a trunk expert's size);
+- the other draft experts are parked: mapped tier with no class, slot or pool, never read; each is
+  published at its stage's first resident's weight of the same slot on its card, so every pointer the
+  grouped GEMM is handed names card memory (`draft_vram_aliases`);
+- nothing of the bank is pinned, so the arm runs at B's p256 and m98304;
+- after the load every rank's three router correction planes (the bank ships them zero) are read
+  back, written with -inf at every expert no rank keeps, and read back again (`draft_vram_mask_planes`).
+  `router_scored_topk` never takes a -inf key, so the router takes the best three kept experts,
+  weighted by their unbiased scores renormalised over the three. A stage keeping fewer than three in
+  all is refused (with two kept, libref refuses the launch and libr4d's third pick is a masked
+  expert's id; `r4d_emu_ds41mask`).
+
+The target verifies every draft: the mask moves acceptance and speed, never a reply byte. With
+`DRAFT_GEMV=2` (`Dkt`) the live tail serves the VRAM weights and a parked expert is never read; even
+without it the aliases keep every read inside card memory. Every rank tallies its draft routing
+histograms (the ones the core already copies back) and prints at exit the selections on its resident
+experts and on its parked ones, which must be none (`draft VRAM: rank R at exit: ... (none: the mask
+held)`).
+
+The hot set comes from a capture: `--expert-stats` in an unmasked DSpark arm (part `Xd`, with a `Ds`
+part) counts each stage's selections by model-wide expert from the router's own histograms, every
+query pass's five rows. `draft_hotset.py write OUT.json xstats-*.json [--top N]` sums captures and
+ranks each rank's 32 experts of each stage by count (rank r holds 32r..32r+31; the engine checks each
+listed id against the container's directory and refuses one the rank does not hold); `show`, `cover`
+(a capture's selections the first N keep: held-out coverage when the capture is another prompt set's),
+`summary` and `check` (a capture taken under the mask selects only the kept experts). On the 2-prompt
+capture of 28 Oct (37 query passes) N = 8 keeps 88.6% of the selections in sample (stage 40 78.9%, 41
+88.8%, 42 98.2%), N = 16 98.9%.
+
+Arm part `DvN` (with a `Ds` part). Its hot set is the first set of `DRAFT_HOTSET_<set>_db<K>`,
+`DRAFT_HOTSET_<set>`, `DRAFT_HOTSET_db<K>`, `DRAFT_HOTSET`, where `<set>` is its `U` part's name
+(`heldout` without one) and `K` its `DbK` part's: so each prompt set can be scored on the other's
+capture, and a short-block arm on a capture taken with the short block. A `Dv` arm is measured only if its log has the
+switch's line, all four ranks' "draft VRAM final placement ... hot=N/N/N" and masked-plane lines, and
+at exit all four "(none: the mask held)"; every other arm runs with `..._DRAFT_VRAM=0` and must have
+no "draft VRAM" line. At the window's end `ab_requests.py --acceptance` prints each DSpark arm's drafts,
+acceptance and its ratio r to the first arm with the same `Ds` and `Db` parts in its prompt set (put the
+pinned-bank arm first), tokens a step and decode tokens/s.
 
 ## The packed RAM cache
 
@@ -505,6 +615,181 @@ because an earlier reply differed and was sent back, the earlier `DIFF` is the o
 sent back with their own token count against the generated count (equal means the next turn's
 chain runs through the decode steps' blocks), and the `/stats` prefix counters.
 
+### With the consumer skip (`Cs`)
+
+Cut, a prompt's layers 21..39 never run on most of its early rows, so a snapshot below its cut
+target holds their windows incomplete, and until claude/ds41-csckpt none was written: in window
+ab-20261029T232708Z `Cs-Pc-Pci256` took A2-A4 at 31 s instead of 5.2-5.8 s and L3 at 56 s instead of
+3.2 s (`hit_cuts no_snapshot`). `RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP_CKPT` (the table above)
+now makes them whole, byte for byte the base engine's (`core/sched/consumer_skip.h`, "complete
+checkpoints"). That is not a matter of key ops: layer L's key at a row is computed from layer L's
+input there, which is layer L-1's output, so a snapshot at P costs its own dependency cone (layer
+L in 21..38 in full on the 128 (39-L) rows before it, layer 39's keys on the last 128, layer 20 in
+full on 2,432), 1,520 16-row layer-passes alone far from the target, about 17 a pass of distance
+near it. Snapshots every I tokens share their cones for each layer with 128 (39-L) >= I, which
+then runs in full throughout, so `all` takes back most of the cut at small intervals; the default
+(unset) is therefore a band of 512, which keeps most of the cut and every hit of both receipts. Layer-passes
+in full against the base engine's, idle 16-token prefill, exact resume (`consumer_skip_test`,
+`CSCKPT_TABLE=1`, prints every length and both modes):
+
+| Interval | Prompt | Base layer-passes | `=0` (cut alone) | `=256` | `=512` | `=1024` | `all` |
+|---|---|---|---|---|---|---|---|
+| 16 | 1,221 | 3,080 | 87.3% | 91.2% | 94.3% | 97.4% | 97.6% |
+| 16 | 3,086 | 7,720 | 70.2% | 73.9% | 77.8% | 85.1% | 97.5% |
+| 16 | 8,192 | 20,480 | 57.5% | 58.9% | 60.4% | 63.4% | 97.5% |
+| 16 | 32,768 | 81,920 | 51.9% | 52.2% | 52.6% | 53.3% | 97.5% |
+| 256 | 1,221 | 3,080 | 87.3% | 90.2% | 93.3% | 96.4% | 96.4% |
+| 256 | 3,086 | 7,720 | 70.2% | 73.8% | 77.6% | 84.7% | 96.3% |
+| 256 | 8,192 | 20,480 | 57.5% | 58.9% | 60.3% | 63.2% | 96.3% |
+| 256 | 32,768 | 81,920 | 51.9% | 52.2% | 52.6% | 53.3% | 96.3% |
+| 2048 | 3,086 | 7,720 | 70.2% | 70.2% | 70.2% | 82.3% | 82.3% |
+| 2048 | 8,192 | 20,480 | 57.5% | 57.5% | 57.5% | 57.5% | 78.8% |
+| 2048 | 32,768 | 81,920 | 51.9% | 51.9% | 51.9% | 51.9% | 78.8% |
+
+The receipts' hits (the tables above) under each policy, from the snapshots each request writes:
+`all` keeps every one; `=512` keeps every one at `Pci16` and `Pci256` (the deepest a hit uses below a
+target is L3's 2,560 under L1's 3,072, A2-A4's 1,024 under A1's 1,216 at `Pci256`, 1,184 at
+`Pci16`); `=256` loses L3 (2,560 is 512 below 3,072); `=32` keeps the `pfxchat` hits at `Pci16`,
+loses A2-A4 and D1 at `Pci256` and L3 at either; `=0` loses A2-A4, D1 (768/832, it takes B2's 752)
+and L3, as the window showed. Turns that extend the previous prompt (B, C, L4, L5) hit at its target under any policy.
+Run `Cs` arms against the same arms without `Cs` (and `Ck0`/`CkN` beside them): replies `same`,
+`cache_n` as above, and TTFT; `Kh` on the cold arms holds the cut prefill's state to the base's.
+
+### Harness-grade prefix reuse
+
+An agent harness sends the whole conversation every turn: the system prompt, every turn so far
+with the model's reply sent back, and the new tool output. Cold, every turn pays prefill on all of
+it (31-45 tokens/s here). The prefix cache above resumes a turn at the previous *prompt's* last
+snapshot, so it still prefills the previous reply and whatever follows the last chunk start. The
+switches below (claude/ds41-eors) make a turn prefill only what it added, exactly.
+
+**End-of-request snapshots** (`RADIANCE_EXPERIMENTAL_PREFIX_EORS=1`, part `Pce`). A decode step
+whose row completes a position on the resume grid past its prompt snapshots the state there
+(reserved when the step is planned, saved after it, as a prefill chunk's is), a prompt ending on the
+grid snapshots its end, and every prompt its tail (the start of its last chunk) however short. So
+for a request that computed n positions (its prompt and every output token but the last) the
+resumable positions are the grid positions g with prompt < g <= n, the prompt's end when on the
+grid, its tail, and the prompt ladder below. Under the consumer skip (`Cs`, in every core arm) a
+prefill writes no snapshot below its prompt's cut target, where the last layers' windows would be
+incomplete; the target is the deepest snapshot its idle prefill writes, the prompt's end when on the
+grid and its tail otherwise. So there the resumable positions are the target and the grid positions
+past the prompt (decode rows run every layer): not the prompt ladder below the target, nor the tail
+of a prompt ending on the grid. Either way the next turn resumes at grid_floor(n), at most 15 tokens
+before the end of the reply at `--max-num-batched-tokens 16` (31 under `Xt-BT32`, whose grid is 32).
+A step that carries a decode snapshot is planned after its predecessor's commit, not issued ahead
+(its key hashes the token that step samples): one host turnaround every 16 tokens, plus a 5.65 MiB
+copy a rank (~0.3 ms). The trim after a publish runs before the request frees its blocks, which are
+safe from any trim then; with `Pce` it also keeps the few entries the request recomputed rather than
+adopted (between the snapshot it resumed from and the end of its hit: up to seven 2-token entries),
+which a plain trim takes once the live sequences hold more than three quarters of the pool, cutting
+the chain below the new snapshot (`trim_spared` counts them). An idle conversation has no such
+protection: other sessions' trims and admissions take it least recently used first, its end first,
+and its end-of-request snapshot with it; the host tier (`PcmN`) is what keeps its KV under pressure.
+Refused, with the reason in the log, without `--prefix-resume exact`, with speculation, with `Pcx`
+(which keeps out the decode blocks such a snapshot stands on), on a model with no state to snapshot,
+and on one whose recurrent state is scanned in chunks (a gated delta net: qwen35, QFN), where a
+decoded row is not the row a prefill computes. A model whose only state is a sliding window takes it
+only with `RADIANCE_EXPERIMENTAL_PREFIX_EORS_WINDOW=1` (nothing yet shows (A) below for one).
+DeepSeek-V4.1 is neither: its linear state (the compressor's tail, the Engram tokens) has a state
+chunk of 1, and its window rides in the snapshot beside it. Counters: `/stats` `eors` (reserved,
+committed, ahead_withheld, hits, hit_tokens, hit_deepest) and `snapshot_store`, and the shutdown
+line `end-of-request snapshots: N reserved, M stored (X written, ...), K step(s) not issued ahead
+for one; H admission(s) resumed from one, T tokens reused (deepest D); snapshot store: ...`.
+
+Why it is exact (the full argument is at `Scheduler::init`, "end-of-request snapshots"): the next
+turn resumes on the grid, so from there it computes the cold run's own chunks from the same state;
+that state is the cold run's because every row below it is, by induction, given (A) a row computed
+alone (decode) has the bits of the same row in a prefill pass of up to `--max-num-batched-tokens`
+rows, (B) deterministic arithmetic, (C) a snapshot restoring the whole per-sequence state on every
+rank. (A) is what the exact-tall device sweep checks op by op (each row against the same row alone
+and in launches of 16, up to the reach), and what the `Kh` arms below check end to end: the prefill
+hashes of every KV group and the last row's logits at the end of each prompt of the resumed turns
+must equal the cold arm's. On libref the e2e test
+`a_turn_resumed_at_an_end_of_request_snapshot_returns_what_a_cold_run_does` holds it for LFM2 (a
+convolution's state: with the switch the next turn resumes at the reply's last grid position, 192,
+without it at nothing) and Gemma 4 (no state to snapshot: the switch is refused and the hit adopts
+the decode-written blocks at 192 either way); every reply and probability is a cold server's.
+qwen35's gated delta net decodes by another recurrence than its chunked prefill, so (A) fails
+there, as it would on any such model: with the switch taken, a turn resumed at its decode snapshot
+gave other probabilities than a cold run (review of 30 Oct). The switch is now refused there, and
+the same e2e case holds the refusal: qwen35's next turn, with the switch asked or not, resumes
+nowhere and answers as a cold server. On the cards the first evidence came from today's cache:
+in window ab-20261029T232708Z `Pc-Pci256` on `Upfxchat` answered 15/15 as the cold arm, C3 among
+them, which adopts 46 of C1's decode-step blocks beneath C2's recompute snapshot (token level; the
+`Kh` arms are the byte level). Under the consumer skip (`Cs`) the snapshots are at or past each
+prompt's cut target and decode rows run every layer; under `Xt` (A) is the tall checks, but no
+window has yet shown `Pce` with `Xt` end to end, so `ab_window.sh` skips an arm with both; the
+window variable `PCE_XT=1` runs them for that evidence (a `Kh` pair at `Xt-BT32`, cold and `Pce`,
+whose `--hashes` must agree).
+
+**The snapshot store for harness sessions.** `--checkpoint-slots auto` sizes the store for the
+running sequences (7 slots of 22.6 MiB at `Lm32768`, interval 2048, one sequence: one session's
+ladder). A harness keeps more conversations than it runs: `RADIANCE_EXPERIMENTAL_CHECKPOINT_STORE_MIB=N`
+(part `PcbN`) sizes it as a byte budget instead (`Pcb1024`: 45 slots, about six sessions at 7;
+QFN's production store is 40 slots of 113 MiB, 4.42 GiB). `RADIANCE_EXPERIMENTAL_PREFIX_SESSION_LRU=1`
+(part `Pcl`) makes a full store give up the least recently used conversation's snapshots, its
+shallowest first and its tip last, before any of a conversation used since (otherwise the least
+recently used snapshot of any conversation goes, which can be a busy one's anchor). The KV blocks of
+idle conversations can move to the host tier, `--prefix-cache-mib N` (part `PcmN`), restored over
+PCIe on the next turn; with `RADIANCE_EXPERIMENTAL_DS41_KV_REPLICATED=1` (part `Pcr`, a deepseek41
+plugin from this branch) the compressed and index caches are declared replicated, which they are
+(every rank's `Kh` hashes of them agree), so a host-tier entry holds one copy, 3,200 B a token
+instead of 12,800 at TP4.
+
+Host memory, measured: with the 96 GiB RAM cache pregrown (`m98304-G`) MemAvailable runs at 12.0-12.7
+GiB at its lowest during serving (12.6-16.8 GiB mean; the 29 Oct 20:09 and 22:09 windows' `.mem`
+files, QFN stopped). Under `Pc` startup's checks keep 8.02 GiB free after the load ("host headroom:
+... the RAM cache's slabs already hold 95.98 GiB of its 96.00 GiB budget, so the checks from here on
+keep 8.02 GiB free": `--host-headroom-mib` 8192 and the 16 MiB the cache has yet to grow), so about
+4-5 GiB can still be pinned; the auto store at `Lm8192` took 5 slots (113 MiB) there. `Pcb1024`
+(45 slots) alone, or `Pcb512` with `Pcm2048`, keeps MemAvailable above 9 GiB, well clear of the
+window's memory guard (3 GiB); more needs a smaller `--host-headroom-mib`.
+
+**Long contexts.** The KV a token costs a card: `kv_index_r2` 384 B, `kv_compressed_r2` 1,536 B,
+`kv_index_r1` 256 B, `kv_compressed_r1` 1,024 B, 3,200 B in all (the startup table: 32.70 MiB at
+`Lm8448`, 19.42 MiB at `Lm4096`), plus the window's 6.88 MiB a sequence. `--max-model-len` also
+sizes two persistent rope tables on every card, `rope_window` and `rope_compressed`, [max_ctx, 64]
+f32 each (`deepseek41.cpp` `buffers`): 512 B more a context token, 2 MiB at `Lm4096`, 16 MiB at
+`Lm32768`, 32 MiB at `Lm65536`; and the indexer's score plane in the step arena, [16, max_ctx] f32
+at `M16`, up to 64 B more. The VRAM split gives the pool one `--max-model-len` sequence and the
+experts what is left, so against `Lm4096` a card gives up 101.5 MiB at `Lm32768` (87.5 MiB more
+pool, 107 MiB in all, and 14 MiB more rope tables) and 217.5 MiB at `Lm65536` (187.5 MiB more pool,
+207 MiB in all, and 30), plus at most 2 and 4 MiB of score plane: about 5.7 expert units of 17.9 MiB
+a card (23 over the four) and 12.2 (49). By the sealed decode profile the units given up are the
+coldest of the ~710-719 a card holds, about 9 selections each in 721 decode tokens: 0.28 (32K) to
+0.61 (64K) of a token's 240 expert selections move from the card to the CPU path, about 0.35-0.75%
+more CPU work, so an estimated 0.25-0.6% of decode (measure it: `Lm4096` against `Lm32768`/`Lm65536`
+on the held-out prompts). The conversations kept idle must fit three quarters of the pool together
+to keep their chains whole (each publish trims the pool to a quarter free, the least recently used
+conversation's end first), or live in the host tier; one larger than that alone stays whole through
+its own turns with `Pce`, not through another session's. Parts: `Lm32768`, `Lm65536` (the `LmN`
+part).
+
+**The harness receipt** (`make_prefix_receipt.py --harness`, part `Uharness`; `Uharness1` is its
+first session alone): two agent sessions interleaved turn by turn, each turn the whole
+conversation with the model's own replies sent back (up to 128 tokens each) and a system prompt
+(`chat_system`, right after BOS): hxA, a code-review agent (2.9K-token system prompt, five tool
+outputs of repository source, 7 turns, 9.4K tokens at the last), and hxB, a licence agent (2.3K
+system prompt, two MIT licences, consumer_skip.h and geometry.cpp, 6 turns, 9.8K). Cold: about 79K
+prompt tokens over the 13 turns; with `Pce` about 19K. Run it at `Lm32768` (both sessions under
+three quarters of the pool). `ab_requests.py --ttft` prints per turn the TTFT, the tokens the cache
+supplied and the text against the first (cold) arm, then per session the sums and the cached share.
+
+**Reading a `Pce` window.** Two results gate it, both printed at the end of the window:
+`ab_requests.py --hashes` must report every prompt identical against the cold arm (the prefill
+hashes of every KV group and the last row's logits at the end of each prompt: 13 of 13 on
+`Uharness`), and `--ttft` must show every text `same`. The rest is advisory, because it moves with
+the replies' lengths and with how each reply re-tokenizes when it is sent back: the shutdown line's
+`H admission(s) resumed from one` (11 on `Uharness` when every later turn reaches its predecessor's
+last snapshot) and, in `--ttft`, each later turn's cached tokens equal to its predecessor's last grid
+position (the grid floor of that request's prompt and reply, less its last token). A reply whose text
+re-tokenizes to other ids than the generated ones (the `sent back` lines list them; on 29 Oct the
+23:27 window had a reply come back as 40 tokens for 41 generated) parts the chain early, and that
+turn resumes, still exactly, at the deepest snapshot before the parting, with fewer tokens cached.
+A hash that differs is (A) failing for some op on the cards: if the `Pc` arm without `Pce` (which
+adopts decode-written cache blocks too, from the third turn on) agrees, suspect the decode-written
+window or compressor-tail state in the snapshot; if it differs too, the decode-written blocks.
+
 ## Correctness
 
 Each row the CPU computes uses the card's arithmetic: the same lane and block order, butterfly,
@@ -527,18 +812,91 @@ log-probabilities, its top 16 in f32, and the next token's NLL and the whole row
 one changed logit anywhere in a row shows), and the second must equal the first byte for byte
 (`ab_requests.py --kld-compare`).
 
+## Large-chunk prefill
+
+`RADIANCE_EXPERIMENTAL_DS41_LCP=C` (C a multiple of 16 in 64..2048) runs a lone prompt's prefill in
+chunks of C tokens, each giving every row the bits of the same tokens in 16-token passes. It needs
+`--max-num-batched-tokens C`, the CPU path on every routed unit (`..._POLICY=all`, `..._MISSES` ≥ C,
+`..._FILE_BUFFER_UNITS`), chunks of C (the default checkpoint interval 2048 serves C up to 2048;
+above it, `--checkpoint-interval C`; with the prefix cache and a smaller interval, `--prefill-span
+C/I`), and a step a chunk alone; the server refuses anything else at startup with the reason (also
+speculation, KV streaming, `..._FETCH_LIST`, `..._VRAM_PACKED` and `..._EXACT_TALL` other than 1),
+and refuses a libr4d.so whose twin does not reach C (so a run home with an old plugin cannot mix
+sums).
+Under it libr4d's `ds41_mxfp4_device_check LIBR4D lcp [C]` holds the twin, the sparse ops (also as
+the suffix launches of the per-row cut) and every other height-dependent op (gemm_nt by the row the
+table resolves, the router's f32 projection and its 96-column split, the norms, mhc_mix, the head) to
+their rows launched alone and 16 at a time, up to 2048 rows; `r4d_emu_ds41tall_lcp` holds the twin to
+256 tokens, the norms to 1024 rows, gemm_nt's tiled row and the f32 split on the host.
+
+The CPU path at C rows: jobs of up to `..._HOST_EXPERTS_MAX_ROWS` (now up to 64: two many-row calls
+on one weight tile; set it to 32 or 64, since at the default 4 a chunk's experts take about twice the
+CPU time a row, and rank 0 warns) cut evenly, hits submitted longest first, 256 pool slots, a submitter waiting for a
+slot outside the submit lock; a chunk's misses are laid out and their jobs built before the reads, and
+each unit's jobs go to the pool as its last extent lands (`Mover::read_unit_planes`' `landed`), at most
+`..._LCP_PLANES` (48) units read at once. The RAM cache admits a chunk's units only where the prompt's
+last `..._LCP_ADMIT` tokens (128; 0 none; `all` every unit) select them, decided as the chunks reach
+those rows (`RadBatch::lcp_admit_row`); other units are leased without an LRU touch
+(`borrow_packed_readonly`) and their misses computed and let go; at most `..._LCP_INSERTQ` (16) admitted
+misses wait for the insert threads. With `Cs` and the plugin's 16-row grain, each chunk runs the
+16-row schedule in each of its 16-row groups: layer L in full on the chunk's rows from
+`consumer_row0[L]`, its key ops from the layer below's (`core/sched/consumer_skip.h`,
+`consumer_row_starts`; the same (layer, row) set as 16-row passes).
+
+Arm parts: `LcN` (needs `MN`, `B1` and an `Mr` part, `Mr32` or `Mr64`; never with `Xt` or `BT`; never
+the Kld reference), `AdN` / `Ada`, `LpN`, `LiN`, `Mr` up to 64. `lcp` in `DEVICE_CHECKS` (with
+`TALL_CHECK` and `TALL_LIBR4D` named, `LCP_CHECK_C` the chunk, 1024) runs `lcp C`, `sweep` under LCP and
+`sweep0` on card 0 (logs `devcheck-lcp-*.log`), and the window measures an Lc arm only on the libr4d.so
+(sha256) those passed on, at a chunk of at most `LCP_CHECK_C`. The byte gates are those of exact tall
+passes: a plain `Kld` arm first, then `...-M1024-...-Lc1024-Kld` (identical records), and `Kh` arms
+with and without `Cs` (identical prefill hashes). Leave `Vp` out of an Lc arm (refused) and `Rb` too
+(`gemm_nt_f32bf16` is not in the sweep).
+
+### Balanced routed gemv (`RADIANCE_EXPERIMENTAL_DS41_MOE_BALANCE`)
+
+Window H (`ab-20261030T105535Z`) measured large-chunk prefill exact but 3-4x slower than 16-token
+passes: on rank 0 of the `Lc1024-Cs` Ulong arm, 388 s of its ~463 s of prefill was the issuing thread
+waiting for the card at the routers' counts (1.19 s a layer-pass, against 4.3 ms a 16-token
+layer-pass), 72 s waiting for misses still being read and 2.4 s for the pool. The card's time is the
+routed GEMM's twin: the plain gemv kernel gives each live expert the same number of work items, and
+`mx_range` hands an EP rank's last local expert every slot routed to the other ranks (`[off[96], T)`:
+about 4,600-5,500 of a 1,024-token chunk's 6,144 slots), one weight pass each at gate_up's XLM 1, on
+the 4-6 blocks that expert gets. Phase 0's `m3-twin` fits that to the percent: (T − local) × rgpi row
+groups at 5.1 us each on a lone block is 1.05 s / 1.24 s / 2.56 s for L25 rank 0 / L25 rank 2 /
+uniform at M 1024 (measured 1.09 / 1.25 / 2.59 s of gate_up) and 60 ms at M 64 (61 ms). The same tail
+is most of a 16-token pass's card time (about 72 dropped slots a pass).
+
+Under `..._MOE_BALANCE=1` (every plain gemv call: the decode band and the twin) or `=2` (the twin above
+16 tokens only) `mx_gemv_kernel` cuts each live expert's row passes into chunks of P passes up to the
+live end `off[ne]` (P sized so the chunks fill the grid once) and the passes past it into chunks of 64 P,
+and a pass whose slots are all dropped writes its zeros without reading weights. Every pass is the plain
+loop's (the same rows from the expert's first row in steps of XLM) and every output one wave's sum in the
+same lane and block order, so the bytes are the plain kernel's; `r4d_emu_ds41bal` holds that on the
+host (gemv and twin, XLM 1 / 3 / 8, six routings including tail-only and no local slot) and
+`r4d_emu_ds41tall_bal` reruns the twin-against-16-token-passes check with the switch on;
+`ds41_mxfp4_device_check LIBR4D bal [C] [ROUTES]` holds it on a card at ds41's shapes and times both
+(the checker export `r4d_rad_moe_gemm_mxfp4_gemv_bal` forces the switch per call). Not for gemv_vp
+(`Vp`), the live tail (`..._LIVE_TAIL`) or the draft bank's one-pass mode.
+
+Arm parts: `Mb1` / `Mb2`; `bal` in `DEVICE_CHECKS` (with `TALL_CHECK`, `TALL_LIBR4D`, `LCP_CHECK_C`, and
+optionally `BAL_ROUTES`, a `p0_tables.py routes` file) runs the card check (`devcheck-bal.log`) and gates
+the Mb arms on its libr4d.so. `Lf` sets `RADIANCE_EXPERIMENTAL_DS41_LCP_PROFILE=1`: at exit each rank logs
+`pass profile, rank R, <height>: ...` for passes of 1, 2-16, 17-256 and 257+ tokens -- routed layer-passes,
+rows, a layer-pass's wall time (counts to counts), its wait for the card at the counts, for misses at the
+gather, for the pool at the gather, misses and read waves a layer-pass.
+
 ## Many token rows of one expert
 
-`gemv_avx2_many` computes up to 32 token rows of one matrix in one call, for prefill passes whose
-rows meet in one expert. A tile's output rows go in blocks of 16; each round of each row is decoded
+`gemv_avx2_many` computes up to 32 token rows of one matrix in one call (more in calls of 32), for
+prefill passes whose rows meet in one expert. A tile's output rows go in blocks of 16; each round of each row is decoded
 once into f32 weights (w = kv · 2^(e−128), exact), and each token row adds x · w value by value in
 register blocks of two output rows by four token rows. Those are the card's two operations a value,
 in its order, so every row equals `gemv_avx2` on that row alone: `ds41_host_experts_test check`
-holds that at 1–33 rows in every layout (block_mxfp4, planes, packed) of every case (the release's
+holds that at 1–64 rows in every layout (block_mxfp4, planes, packed) of every case (the release's
 scales, the edges with NaN and Inf rows, partial rounds) and over output rows [8, N); `packed` adds
 nine rows on every packed case.
 
-`RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MAX_ROWS=N` (1–32; default 4, the behaviour so far) lets a
+`RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MAX_ROWS=N` (1–64; default 4, the behaviour so far) lets a
 pool job carry up to N token rows of one expert; with N above 4, jobs of four or more rows run
 `gemv_avx2_many` and smaller ones `gemv_avx2_few` (at four rows the many-row kernel is 10–18%
 faster, at three about even, at one or two slower). Arm part `MrN`. The startup line names the

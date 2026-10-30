@@ -605,7 +605,9 @@ public:
         int64_t        slot[2] = { 0, 0 };
         NativeMappedFileCache::Lease lease[2];
     };
-    bool  borrow_host_unit(int32_t u, HostUnit* out);
+    /* `touch` false: the entries are leased as they are, no move to the LRU front and their second
+     * chances kept (borrow_readonly / borrow_packed_readonly), the hits counted all the same. */
+    bool  borrow_host_unit(int32_t u, HostUnit* out, bool touch = true);
     void  release_host_unit(HostUnit* hu);
     /* read_unit_planes  for a host reader of units the RAM cache misses: reads each unit's
      *                   weights from the container as the release stores them (codes and scales
@@ -665,11 +667,20 @@ public:
      * in must be laid out where they are (its buffers big enough already): it is never moved.
      * `hook`: a call on the issuing thread while it waits for the kept readers, its at_ns counted
      * from the call's dispatch (NativeReadWorkers::WaitHook; the CPU pool's pre-wake, stager.h
-     * hx_wake_*); none on the threads-a-call fallback. */
+     * hx_wake_*); none on the threads-a-call fallback. With `landed`, each unit i (its index in
+     * `units`) is handed to landed(ctx, i) by the reader that lands its last extent, every extent
+     * of it read without error, while the other units' reads go on: a caller can start computing a
+     * unit as soon as its bytes are in (large-chunk prefill). A unit one of whose reads failed is
+     * not called back (a mirror leg is read again from the container after the readers, and the
+     * call's result says whether that worked); nor is any unit of a call that could not start its
+     * readers. `landed` runs on a reader thread, at most once a unit, and must not call into this
+     * Mover. */
     using ReadWaitHook = NativeReadWorkers::WaitHook;
+    using PlaneLanded = void (*)(void* ctx, int i);
     bool  read_unit_planes(HostPlanes* const* units, int n, int rows = 1, PlaneReadTiming* timing = nullptr,
                            const PlanesIn* in = nullptr, bool rest_mirror = false,
-                           const ReadWaitHook* hook = nullptr);
+                           const ReadWaitHook* hook = nullptr, PlaneLanded landed = nullptr,
+                           void* ctx = nullptr);
     /* read_unit_planes in two halves, for the issuing thread (RADIANCE_EXPERIMENTAL_DS41_MISS_POST):
      * start_unit_planes hands the reads to the kept readers and returns at once, so they run while
      * the caller goes on (the pool's jobs for the cached units); finish_unit_planes reads whatever
@@ -706,10 +717,13 @@ public:
      * read_piece           one O_DIRECT read of [off, off + len) of container `file` into dst (cap
      *                      bytes there), as read_unit_planes reads an extent; thread-safe.
      * decode_mirror_bytes  the bytes of a missed unit a one-token pass reads from the plane mirror
-     *                      instead of the container (0 with no mirror, or one turned off). */
+     *                      instead of the container (0 with no mirror, or one turned off).
+     * mirror_bytes         the same for a pass of `rows` tokens, as read_unit_planes picks the share
+     *                      (the decode share under the mirror's min_rows, its share from there). */
     bool  lay_out_unit_planes(HostPlanes* p, PlaneExtent ext[2]);
     int   read_piece(uint32_t file, int64_t off, int64_t len, void* dst, int64_t cap);
     int64_t decode_mirror_bytes() const;
+    int64_t mirror_bytes(int rows) const;
     /* read_weight_file  a whole weight as the container holds it (every row on this rank) into
      *                   dst, weight_file_bytes(w) long (rad_core.h), for a host reader such as
      *                   the router predictor: a weight stored as is, or the one plane a kernel's
@@ -980,7 +994,13 @@ private:
             const PlaneMirror::Ref* m = nullptr; uint64_t from = 0;   /* m: the mirror's bytes [from, from+len) */
             int rc = 0;
             int64_t start_ns = 0, end_ns = 0, copy_ns = 0;
+            int unit = -1;   /* its unit's index in the call */
         };
+        /* read_unit_planes' `landed`: each unit's reads left, and whether one failed. */
+        PlaneLanded landed = nullptr;
+        void* ctx = nullptr;
+        std::unique_ptr<std::atomic<int>[]> left;
+        std::unique_ptr<std::atomic<uint8_t>[]> failed;
         Mover* mover = nullptr;
         PlaneMirror* mirror = nullptr;
         std::vector<Read> reads;

@@ -10094,11 +10094,12 @@ const std::vector<HostTwin>& host_twins() {
 
 /* ================================================================================ exact tall passes
  *
- * RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=1 (r4d_ds41_tall.h; read when the rows are first counted, at load):
- * DeepSeek-V4.1's routed GEMMs keep their decode-band kernel in passes taller than 16 tokens, so such a pass gives a
- * 16-token pass's bits. moe_gemm_ggml_mxfp4_gemv serves M <= 16 tokens and moe_gemm_ggml_mxfp4_tiled anything
- * above, summing each output in another order. The twin `moe_gemm_ggml_mxfp4_gemv_tall` is the gemv row with its
- * bound on M raised from 16 to kR4dDs41TallRows, one priority below it: it takes the bands from 17 to that bound from
+ * RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=1 or RADIANCE_EXPERIMENTAL_DS41_LCP=<C> (r4d_ds41_tall.h; read when the rows
+ * are first counted, at load): DeepSeek-V4.1's routed GEMMs keep their decode-band kernel in passes taller than 16
+ * tokens, so such a pass gives a 16-token pass's bits. moe_gemm_ggml_mxfp4_gemv serves M <= 16 tokens and
+ * moe_gemm_ggml_mxfp4_tiled anything above, summing each output in another order. The twin
+ * `moe_gemm_ggml_mxfp4_gemv_tall` is the gemv row with its bound on M raised from 16 to r4d_ds41_tall_rows() (48
+ * under EXACT_TALL, kR4dDs41LcpMax under LCP), one priority below it: it takes the bands from 17 to that bound from
  * the tiled row and none from the gemv. The gemv gives each output its weight row dotted with its activation row in
  * the same lane and block order at any height (r4d_ds41_mxfp4.hip, mx_row), so the twin's rows are the gemv's bit
  * for bit. The bound is the tallest pass at which every kernel ds41 runs keeps the decode band's bits under the
@@ -10119,6 +10120,8 @@ const std::vector<TallTwin>& tall_twins() {
     static const std::vector<TallTwin> v = [] {
         std::vector<TallTwin> t;
         if (!r4d_ds41_exact_tall()) return t;
+        const int reach = r4d_ds41_tall_rows();
+        const bool lcp = r4d_ds41_lcp() > 0;
         for (const RadKernelInfo& k : kKernels) {
             if (std::strcmp(k.name, "moe_gemm_ggml_mxfp4_gemv") != 0) continue;
             TallTwin h;
@@ -10127,7 +10130,7 @@ const std::vector<TallTwin>& tall_twins() {
                 RadConstraint c = k.constraints[i];
                 if (!std::strcmp(c.key, "M") && c.op == RAD_C_LE) {
                     ++bound;
-                    c.ival = kR4dDs41TallRows;   /* the gemv's 16, raised */
+                    c.ival = reach;   /* the gemv's 16, raised */
                 }
                 h.c.push_back(c);
             }
@@ -10137,9 +10140,10 @@ const std::vector<TallTwin>& tall_twins() {
             h.info.launch = r4d_rad_moe_gemm_mxfp4_gemv_tall;
             h.name = std::string(k.name) + "_tall";
             h.computes = std::string(k.computes) +
-                         "; in passes of up to " + std::to_string(kR4dDs41TallRows) +
-                         " tokens (RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL), each output the decode band's bits";
-            h.shape = "M 17.." + std::to_string(kR4dDs41TallRows) +
+                         "; in passes of up to " + std::to_string(reach) +
+                         (lcp ? " tokens (RADIANCE_EXPERIMENTAL_DS41_LCP)" : " tokens (RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL)") +
+                         ", each output the decode band's bits";
+            h.shape = "M 17.." + std::to_string(reach) +
                       " tokens (the passes the gemv row leaves to the tiled one), any N, K a multiple of 32, up to "
                       "1024 experts";
             t.push_back(std::move(h));

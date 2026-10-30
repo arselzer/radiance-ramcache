@@ -41,6 +41,29 @@
 # blocks before L5, which then tests nothing; a U part's receipt name holds no "-", which splits
 # parts). Put the same arm without Pc first: it is the cold reference.
 #
+# Harness-grade prefix reuse (each needs Pc or Pc0, or the arm is skipped; every arm without one
+# runs with its switch off, and is not measured if its server says otherwise): Pce end-of-request
+# snapshots (RADIANCE_EXPERIMENTAL_PREFIX_EORS: a decode step completing a position on the resume
+# grid past its prompt snapshots the state there, so a conversation's next turn resumes at most 15
+# tokens before the reply's end; refused, and the arm skipped, with Pcx or speculation; skipped
+# with Xt, which no Kh run has yet covered end to end, unless the window sets PCE_XT=1 for that
+# Kh run); Pcl the
+# snapshot store gives up the least recently used conversation first (..._PREFIX_SESSION_LRU); PcbN
+# the store as a byte budget of N MiB (..._CHECKPOINT_STORE_MIB, auto otherwise; not with PcsN);
+# PcmN --prefix-cache-mib N (the host KV tier: a finished conversation's KV copied to pinned host
+# memory and restored on its next turn); Pcr the compressed and index key caches declared
+# replicated, so a host-tier entry holds one copy rather than one a rank
+# (RADIANCE_EXPERIMENTAL_DS41_KV_REPLICATED; a deepseek41 plugin from claude/ds41-eors, run home
+# home-eors). The harness receipt is Uharness (work/extra-prompts/harness-receipt.json: two
+# interleaved agent sessions, a system prompt of 2-3K tokens and tool outputs of public texts from
+# the repository, 6 and 7 turns, final contexts of about 8K and 10K tokens) at Lm32768, whose pool
+# holds both without a trim; Uharness1 is its first session alone. Each Pc* arm's startup and
+# shutdown lines for these go into window.log, and --ttft at the end reads per-turn TTFT, the
+# tokens the cache supplied and identity against the first arm (the cold one), with Kh arms'
+# prefill hashes compared prompt by prompt. Those two gate a Pce arm (--hashes: every prompt
+# identical; --ttft: every text same); its shutdown line's admissions resumed and each turn's cached
+# tokens are advisory, since they move with reply lengths and with how a reply re-tokenizes.
+#
 # Exact tall passes (RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL): Xt sets the switch (every other arm runs
 # with it 0) and BTN the step, --max-num-batched-tokens N (16 otherwise), e.g. ...-M32-...-Xt-BT32; an
 # Xt arm must log "exact tall passes" at startup and a plain one must not, or it is not measured. Kld
@@ -52,9 +75,34 @@
 # f16 log-probabilities, its top 16 in f32, and the next token's NLL and the whole row's entropy in
 # f32, so one changed logit anywhere in a row shows).
 #
+# Large-chunk prefill (RADIANCE_EXPERIMENTAL_DS41_LCP=C): LcN sets it and --max-num-batched-tokens N
+# (N a multiple of 16 in 64..2048), e.g. ...-M1024-...-B1-...-Lc1024-Mr32; it needs MN (..._MISSES at
+# least N), B1 (the CPU takes every routed unit) and an Mr part (Mr32 or Mr64; Mr4 only as a control),
+# cannot go with Xt or BT, and leaves
+# RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL unset (LCP keeps its pins; every other arm runs with LCP=0).
+# AdN the RAM cache admits a chunk's units from the prompt's last N tokens only (..._LCP_ADMIT=N; 0
+# none, the chunks read-only), Ada every unit (as at 16-token passes; 128 without either); LpN
+# ..._LCP_PLANES (missed units read at once a layer, 48); LiN ..._LCP_INSERTQ (admitted misses queued
+# for the cache, 16). An Lc arm must log "large-chunk prefill: passes of up to N tokens" at startup and
+# a plain one must not, or it is not measured; an Lc arm is never the Kld reference. `lcp` in
+# DEVICE_CHECKS (a list) runs ds41_mxfp4_device_check `lcp LCP_CHECK_C` (1024), `sweep` under LCP and
+# `sweep0` on card 0 (TALL_LIBR4D and TALL_CHECK named, as for `tall`), and an Lc arm runs only on the
+# libr4d.so (sha256) those passed on, at a chunk of at most LCP_CHECK_C.
+#
+# MbN: RADIANCE_EXPERIMENTAL_DS41_MOE_BALANCE=N (libr4d, read by the routed MXFP4 gemv): 1 every call of the
+# plain gemv kernel (the decode band to 16 tokens and the twin above), 2 the twin above 16 tokens only;
+# the work items follow each expert's row passes, and a pass of dropped slots (the other ranks' rows,
+# which mx_range hands the rank's last expert) writes zeros without reading weights. Same bytes by
+# construction. Every arm without the part runs with it at 0. `bal` in DEVICE_CHECKS runs
+# ds41_mxfp4_device_check `bal LCP_CHECK_C [BAL_ROUTES]` on card 0 (TALL_CHECK and TALL_LIBR4D, as for
+# `lcp`): the balanced kernel against the plain one, every output value, and both timed (devcheck-bal.log);
+# an Mb arm runs only on the libr4d.so (sha256) that passed it. Lf: RADIANCE_EXPERIMENTAL_DS41_LCP_PROFILE=1,
+# the file stager's per-pass-size time lines at exit (an instrument; no change to what runs).
+#
 # Environment: RADIANCE_BIN (the binary), RADIANCE_HOME_DIR (kernels/ and architectures/ for it),
 # SILU_TABLE (the card's silu table), ARMS (default "base verify greedy"), HX_THREADS (16),
-# VERIFY_REQUESTS (3), DEVICE_CHECKS (1; `tall`: the exact-tall checks, TALL_LIBR4D and TALL_CHECK),
+# VERIFY_REQUESTS (3), DEVICE_CHECKS (1; a list: `tall` the exact-tall checks, `lcp` the large-chunk
+# ones at LCP_CHECK_C, both with TALL_LIBR4D and TALL_CHECK),
 # SELFTEST_F32BF16 (an r4d_selftest: gemm_nt_f32bf16's checks and timings on card 0 before the
 # arms; unset, none, and no Rb arm runs).
 set -u
@@ -70,6 +118,20 @@ R=/home/as/radiance-setup/research/deepseek-v41-1017-20261024
 MODEL=$R/native-models/ds41-native-mxfp4-v3-20261027T121600Z/model.rad
 MIRROR=${MIRROR:-}   # the checkpoint's model-*.safetensors for R arms; no default
 DRAFT_BANK=${DRAFT_BANK:-}   # a DSpark draft bank (draft.rad) bound to $MODEL, for Ds arms; no default
+# Dv arms' hot set (draft_hotset.py write; RADIANCE_EXPERIMENTAL_DS41_DRAFT_HOTSET); no default. An arm
+# takes the first of DRAFT_HOTSET_<set>_db<K>, DRAFT_HOTSET_<set>, DRAFT_HOTSET_db<K>, DRAFT_HOTSET that
+# is set, <set> its U part's name (heldout without one) and K its DbK part's (e.g. DRAFT_HOTSET_chat: the
+# held-out capture's hot set for the chat prompts and DRAFT_HOTSET_heldout the chat capture's, so neither
+# set is scored on its own capture; DRAFT_HOTSET_db2 one taken with the short block the Db2 arms route).
+DRAFT_HOTSET=${DRAFT_HOTSET:-}
+hotset_for() {   # an arm's name: its hot-set file (above), or empty
+  local a=$1 u k v
+  u=$(tr '-' '\n' <<< "$a" | grep -m1 -E '^U.+'); u=${u#U}; u=${u:-heldout}
+  k=$(tr '-' '\n' <<< "$a" | grep -m1 -E '^Db[0-9]+$'); k=${k#Db}
+  for v in ${k:+DRAFT_HOTSET_${u}_db$k} DRAFT_HOTSET_$u ${k:+DRAFT_HOTSET_db$k} DRAFT_HOTSET; do
+    [[ $v =~ ^[A-Za-z_][A-Za-z0-9_]*$ && -n "${!v:-}" ]] && { echo "${!v}"; return; }
+  done
+}
 PROFILE=$R/ds41-dev-window-profile-calibration-20261028T034300Z/sealed-decode-profile.json
 PROMPTS=${PROMPTS:-$R/ds41-pack-tail-dev-window-tail1-heldout-20261028T085400Z/receipt.json}
 PORT=18089
@@ -176,6 +238,28 @@ xt_check() {   # name
   fi
   [[ -n "${ARM_XT:-}" ]] && grep -m1 -E 'exact tall passes: ' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   [[ -n "${ARM_BT:-}" ]] && grep -m1 -E 'chunk geometry: ' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
+  lcp_check "$name"
+}
+
+# RADIANCE_EXPERIMENTAL_DS41_LCP (the LcN part): the file stager says at startup that it took passes of
+# up to N tokens (after checking every op's bands, the CPU path and the switches beside it; it refuses to
+# start otherwise), and the scheduler the chunks and the cache admission. An Lc arm without that line,
+# or a plain arm with it, is not measured.
+lcp_check() {   # name
+  local name=$1 lc_lines
+  lc_lines=$(grep -c 'large-chunk prefill: passes of up to [0-9]* tokens' "$OUT/$name.server.log")
+  if [[ -n "${ARM_LC:-}" ]] && ! grep -q "large-chunk prefill: passes of up to ${ARM_LC} tokens" "$OUT/$name.server.log"; then
+    log "arm $name: Lc${ARM_LC}, but the server log has no 'large-chunk prefill: passes of up to ${ARM_LC} tokens' line ($(grep -m2 -E 'large-chunk prefill' "$OUT/$name.server.log" | tr '\n' ' ')); not measured"
+    return 1
+  fi
+  if [[ -z "${ARM_LC:-}" && "$lc_lines" != 0 ]]; then
+    log "arm $name: no Lc part, but the server runs large-chunk prefill (the knob set for the window?); not measured"
+    return 1
+  fi
+  if [[ -n "${ARM_LC:-}" ]]; then
+    grep -m3 -E 'large-chunk prefill: |chunk geometry: ' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
+    grep -m1 -E 'consumer skip: ' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
+  fi
   return 0
 }
 
@@ -195,10 +279,10 @@ kld_finish() {   # name; the run is SERVER_PID
   (( rc == 0 )) || return 1
   xt_check "$name" || return 1
   if [[ -z "$KLD_REF" ]]; then
-    # The reference must be a 16-token arm's bits: an Xt arm first (the plain one failed or is
-    # missing) would let a later Xt arm be compared with another Xt arm.
-    if [[ -n "${ARM_XT:-}" ]]; then
-      log "arm $name: an Xt arm cannot be the window's kld reference (no plain Kld arm finished before it); not compared"
+    # The reference must be a 16-token arm's bits: an Xt or Lc arm first (the plain one failed or is
+    # missing) would let a later Xt or Lc arm be compared with another one.
+    if [[ -n "${ARM_XT:-}${ARM_LC:-}" ]]; then
+      log "arm $name: an Xt or Lc arm cannot be the window's kld reference (no plain Kld arm finished before it); not compared"
       return 1
     fi
     KLD_REF=$OUT/kld-$name
@@ -243,7 +327,25 @@ arm() {   # name, then env assignments for the server; CACHE_MIB the RAM cache (
   log "arm $name: serving after ${t}s"
   # A Pc arm: the prefix cache's startup lines (the snapshot store, the interval, the resume rule).
   [[ -z "${ARM_NOPC---no-prefix-cache}" ]] && \
-    grep -E 'host headroom|chunk geometry|prefix resume|prefix cache|checkpoint slots' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
+    grep -E 'host headroom|chunk geometry|prefix resume|prefix cache|checkpoint slots|end-of-request snapshots|snapshot store|kv tiers' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
+  # The harness parts (Pce, Pcl, PcbN, PcmN, Pcr): each switch's startup line in an arm that names
+  # it, and none in an arm that does not (a switch left set for the window), or the arm is not
+  # measured.
+  local hp_bad=""
+  hp_check() {   # part, set in this arm (1 or empty), the line that says it took effect
+    local n; n=$(grep -cE "$3" "$OUT/$name.server.log")
+    if [[ -n "$2" && "$n" == 0 ]]; then hp_bad+=" $1 asked, but no '$3' line;"; fi
+    if [[ -z "$2" && "$n" != 0 ]]; then hp_bad+=" no $1 part, but a '$3' line;"; fi
+  }
+  hp_check Pce "${ARM_EORS:-}" 'end-of-request snapshots: on'
+  hp_check Pcl "${ARM_SLRU:-}" 'snapshot store: by session'
+  hp_check PcbN "${ARM_STOREMIB:-}" 'checkpoint slots: a byte budget'
+  hp_check PcmN "${ARM_TIER:-}" "kv tiers: a finished conversation's KV is copied"
+  hp_check Pcr "${ARM_KVREP:-}" 'KV_REPLICATED: [0-9]+ paged group'
+  if [[ -n "$hp_bad" ]]; then
+    log "arm $name: not measured:$hp_bad $(grep -m2 -E 'end-of-request snapshots: refused|KV_REPLICATED refused' "$OUT/$name.server.log" | tr '\n' ' ')"
+    stop_server; return 1
+  fi
   # RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8 (the F8 parts): the plugin names the weights it reads from
   # E4M3 codes on each rank, and an arm must have exactly what its name says. An F8 arm whose
   # plugin did not take the knob, or a plain arm that took it from the window's environment, is
@@ -306,6 +408,19 @@ EOF2
   fi
   grep -m1 -E 'router predictor: [0-9]+ routers loaded .*scored in int' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   grep -m1 -E "side store: the planes of up to|rank 0 posts the read-ahead's router input" "$OUT/$name.server.log" | tee -a "$OUT/window.log"
+  # RADIANCE_EXPERIMENTAL_DS41_PREFETCH_MULTIROW (the Pmr parts): rank 0's file stager names it at
+  # startup with its N. A Pmr arm without that line for its N (a radiance without the switch: decode
+  # passes of 2+ rows go without the read-ahead), or another arm with the line, is not measured.
+  local pmr_lines; pmr_lines=$(grep -cE 'read-ahead: decode passes of 2-[0-9]+ rows read ahead too' "$OUT/$name.server.log")
+  if [[ -n "${ARM_PMR:-}" ]] && ! grep -qE "read-ahead: decode passes of 2-${ARM_PMR} rows read ahead too" "$OUT/$name.server.log"; then
+    log "arm $name: Pmr${ARM_PMR}, but the server log has no 'read-ahead: decode passes of 2-${ARM_PMR} rows read ahead too' line ($(grep -m1 -E 'PREFETCH_MULTIROW' "$OUT/$name.server.log")); not measured"
+    stop_server; return 1
+  fi
+  if [[ -z "${ARM_PMR:-}" && "$pmr_lines" != 0 ]]; then
+    log "arm $name: no Pmr part, but the server reads ahead in multi-row decode passes (the knob set for the window?); not measured"
+    stop_server; return 1
+  fi
+  [[ -n "${ARM_PMR:-}" ]] && grep -m1 -E 'read-ahead: decode passes of 2-' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   # RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED (the Vp part): the engine names the switch at startup and
   # each rank how many static residents it holds packed. A Vp arm without the switch's line or with
   # no rank holding any packed (a radiance without the switch, a dynamic plan, a DSpark bank), or a
@@ -329,6 +444,22 @@ EOF2
     stop_server; return 1
   fi
   [[ -n "${ARM_CS:-}" ]] && grep -m2 -E 'consumer skip: on|consumer suffix declared' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
+  # A Cs arm with the prefix cache: the server states which snapshots below a cut prompt's target it
+  # makes whole (claude/ds41-csckpt), and it must be what the arm's Ck part says (512 without one).
+  # A radiance without the line (writes none below the target) is not measured as anything but Ck0.
+  if [[ -n "${ARM_CK:-}" ]]; then
+    local ck_ok=""
+    if [[ "$ARM_CK" == 0 ]]; then
+      grep -q 'consumer skip: on .*CONSUMER_SKIP_CKPT=0)' "$OUT/$name.server.log" && ck_ok=1
+    else
+      grep -q "consumer skip: complete checkpoints (RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP_CKPT=$ARM_CK)" "$OUT/$name.server.log" && ck_ok=1
+    fi
+    if [[ -z "$ck_ok" ]]; then
+      log "arm $name: Cs with Pc wants ..._CONSUMER_SKIP_CKPT=$ARM_CK, but the server log does not state it ($(grep -m2 -E 'consumer skip: (on|complete)' "$OUT/$name.server.log" | cut -c1-200 | tr '\n' ' ')); not measured"
+      stop_server; return 1
+    fi
+    grep -m1 -E 'consumer skip: complete checkpoints' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
+  fi
   xt_check "$name" || { stop_server; return 1; }
   # In / Is (RADIANCE_EXPERIMENTAL_DS41_INSERT_NT / _SLICE_KIB) and Ph (_HOST_EXPERTS_LEAN_TILES):
   # rank 0 names what it took at startup. An arm whose line is missing or says otherwise (a radiance
@@ -423,6 +554,60 @@ EOF2
     log "arm $name: no Pu part, but the server reads a partly read unit's rest in the layer's own call (the knob set for the window?); not measured"
     stop_server; return 1
   fi
+  # DvN (RADIANCE_EXPERIMENTAL_DS41_DRAFT_VRAM): the engine names N and the hot set, every rank its final
+  # placement (N hot pairs a stage static in VRAM, the rest parked) and its three masked correction
+  # planes. A Dv arm without all of them, or another arm with any "draft VRAM" line, is not measured.
+  local dv_on dv_place dv_mask dv_any
+  dv_on=$(grep -c "draft VRAM: RADIANCE_EXPERIMENTAL_DS41_DRAFT_VRAM=${ARM_DV:-none} from" "$OUT/$name.server.log")
+  dv_place=$(grep -cE "draft VRAM final placement: rank=[0-3] .*hot=${ARM_DV:-none}/${ARM_DV:-none}/${ARM_DV:-none} " "$OUT/$name.server.log")
+  dv_mask=$(grep -cE 'draft VRAM: rank [0-3]: the router correction planes of stages 40/41/42 masked' "$OUT/$name.server.log")
+  dv_any=$(grep -c 'draft VRAM' "$OUT/$name.server.log")
+  if [[ -n "${ARM_DV:-}" ]] && [[ "$dv_on" == 0 || "$dv_place" != 4 || "$dv_mask" != 4 ]]; then
+    log "arm $name: Dv${ARM_DV}, but the server log has $dv_on switch line(s), $dv_place of 4 'draft VRAM final placement' and $dv_mask of 4 masked-plane lines (a radiance without the switch?); not measured"
+    stop_server; return 1
+  fi
+  if [[ -z "${ARM_DV:-}" && "$dv_any" != 0 ]]; then
+    log "arm $name: no Dv part, but the server placed the draft bank in VRAM (the switch set for the window?); not measured"
+    stop_server; return 1
+  fi
+  [[ -n "${ARM_DV:-}" ]] && grep -E 'draft VRAM|draft-bank experts: RADIANCE' "$OUT/$name.server.log" | head -16 | tee -a "$OUT/window.log"
+  # Xd (--expert-stats): the startup line counts the trunk's 40 routed layers and the drafter's 3; an
+  # arm without Xd must not count anything.
+  local xd_lines; xd_lines=$(grep -cE 'expert stats: [0-9]+ routed layers' "$OUT/$name.server.log")
+  if [[ -n "${ARM_XD:-}" ]] && ! grep -qE 'expert stats: 43 routed layers' "$OUT/$name.server.log"; then
+    log "arm $name: Xd, but the server log has no 'expert stats: 43 routed layers' line ($(grep -m1 'expert stats' "$OUT/$name.server.log")); not measured"
+    stop_server; return 1
+  fi
+  if [[ -z "${ARM_XD:-}" && "$xd_lines" != 0 ]]; then
+    log "arm $name: no Xd part, but the server counts expert selections (--expert-stats from the window?); not measured"
+    stop_server; return 1
+  fi
+  # Dg (RADIANCE_EXPERIMENTAL_DS41_DSPARK_GATE): the scheduler says at startup that the acceptance
+  # gate is on, with its threshold, window and probe. A Dg arm without that line (a radiance without
+  # the switch), or another arm with it, is not measured.
+  local dg_lines; dg_lines=$(grep -c 'DSpark acceptance gate: on' "$OUT/$name.server.log")
+  if [[ -n "${ARM_DG:-}" && "$dg_lines" == 0 ]]; then
+    log "arm $name: Dg, but the server log has no 'DSpark acceptance gate: on' line (a radiance without the switch?); not measured"
+    stop_server; return 1
+  fi
+  if [[ -z "${ARM_DG:-}" && "$dg_lines" != 0 ]]; then
+    log "arm $name: no Dg part, but the scheduler ran the acceptance gate (the switch set for the window?); not measured"
+    stop_server; return 1
+  fi
+  [[ -n "${ARM_DG:-}" ]] && grep -m1 'DSpark acceptance gate: on' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
+  # Df (RADIANCE_EXPERIMENTAL_DS41_DSPARK_FP8): the plugin names, on each rank, the drafter's dense
+  # weights it reads from E4M3 codes. A Df arm without such a line with N above 0, or another arm
+  # with one, is not measured.
+  local df_lines; df_lines=$(grep -cE 'DSpark drafter: [1-9][0-9]* dense weights read by gemm_nt_bf16f8' "$OUT/$name.server.log")
+  if [[ -n "${ARM_DF:-}" && "$df_lines" == 0 ]]; then
+    log "arm $name: Df, but the server log has no 'DSpark drafter: N dense weights read by gemm_nt_bf16f8' line (a plugin without the switch, or F8 off?); not measured"
+    stop_server; return 1
+  fi
+  if [[ -z "${ARM_DF:-}" && "$df_lines" != 0 ]]; then
+    log "arm $name: no Df part, but the drafter read its dense weights from E4M3 codes (the switch set for the window?); not measured"
+    stop_server; return 1
+  fi
+  [[ -n "${ARM_DF:-}" ]] && grep -E 'DSpark drafter: [0-9]+ dense weights' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   # The NVMe drive's busy time (io_ticks, ms) and temperature over the requests: read-ahead arms
   # move it from ~45% busy towards saturation.
   local d0 d1 t0 t1 rc temp
@@ -465,6 +650,20 @@ EOF2
   if [[ -n "$dk_bad" ]]; then
     log "arm $name: $dk_bad; not measured (results kept as $name.unmeasured.json)"
     [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
+  fi
+  # Pmr with a drafting Ds part (DSpark's 2+ row verify passes) at shutdown: the predictor's
+  # multi-row line, and some rank's "by pass size" line with a "2 rows:" entry that planned units;
+  # otherwise the switch never acted on a verify pass and the arm is set aside (mrra review B3).
+  if [[ -n "${ARM_PMR:-}" && "-$name-" =~ -Ds([1-9]|a)[0-9]*- ]]; then
+    local pmr_bad="" pmr2
+    grep -q 'router predictor, multi-row decode passes: [1-9]' "$OUT/$name.server.log" ||
+      pmr_bad="no 'router predictor, multi-row decode passes' line with posts"
+    pmr2=$(grep -oE '2 rows: [0-9]+ planned' "$OUT/$name.server.log" | grep -oE '[0-9]+ planned' | grep -oE '^[0-9]+' | awk '{s += $1} END {print s + 0}')
+    [[ -z "$pmr_bad" && "$pmr2" == 0 ]] && pmr_bad="no rank planned a unit in a 2-row pass ('2 rows: N planned')"
+    if [[ -n "$pmr_bad" ]]; then
+      log "arm $name: Pmr${ARM_PMR}, but $pmr_bad; not measured (results kept as $name.unmeasured.json)"
+      [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
+    fi
   fi
   # Fw / WpN at shutdown: the pool's line ("host expert pool: ..."). A Wp arm counts only if its
   # router pre-wakes woke workers; an Fw arm only if its pool woke through the futex. Otherwise its
@@ -527,8 +726,28 @@ EOF2
     [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
   fi
   grep -E "host experts' background inserts: |host expert pool, lean tiles: " "$OUT/$name.server.log" | tee -a "$OUT/window.log"
+  # Dv at exit: every rank tallies its draft routing histograms; a selection of a parked expert would
+  # name weights the card never loaded. Measured only if all four ranks report none.
+  if [[ -n "${ARM_DV:-}" ]]; then
+    local dv_exit dv_held
+    dv_exit=$(grep -cE 'draft VRAM: rank [0-3] at exit: ' "$OUT/$name.server.log")
+    dv_held=$(grep -cE 'draft VRAM: rank [0-3] at exit: .*\(none: the mask held\)' "$OUT/$name.server.log")
+    grep -E 'draft VRAM: rank [0-3] at exit: ' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
+    if [[ "$dv_exit" != 4 || "$dv_held" != 4 ]]; then
+      log "arm $name: Dv${ARM_DV}: $dv_held of 4 ranks report at exit that no parked expert was routed to ($dv_exit exit lines); not measured (results kept as $name.unmeasured.json)"
+      [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
+    fi
+  fi
+  # Xd: the capture, written at shutdown; a file without draft passes captured nothing.
+  if [[ -n "${ARM_XD:-}" ]]; then
+    local xd_sum xd_rc
+    xd_sum=$(python3 -I "$HERE/draft_hotset.py" summary "$OUT/xstats-$name.json" 2>&1); xd_rc=$?
+    echo "$xd_sum" | tee -a "$OUT/window.log"
+    (( xd_rc == 0 )) || log "arm $name: Xd, but xstats-$name.json holds no draft capture (exit $xd_rc)"
+  fi
   grep -E 'host experts|EP scoped|live chain|error|ERR' "$OUT/$name.server.log" | tail -16 | tee -a "$OUT/window.log"
-  grep -E 'read-ahead (in pieces:|readers)|router predictor \(' "$OUT/$name.server.log" | tail -6 | tee -a "$OUT/window.log"
+  # (Pmr: a rank's "by pass size" line beside its totals, and the predictor's multi-row line.)
+  grep -E 'read-ahead (in pieces:|in pieces by pass size|readers)|router predictor( \(|, multi-row)' "$OUT/$name.server.log" | tail -11 | tee -a "$OUT/window.log"
   # The per-unit wait for partly read units, every arm with read-ahead in pieces (the Pu parts' gate),
   # and a Pu arm's rests.
   grep -E 'read-ahead in pieces, (partly read units|rests on the kept readers)' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
@@ -542,6 +761,9 @@ EOF2
   grep -E 'prefill hash: seq [0-9]+, [0-9]+ tokens: all ranks' "$OUT/$name.server.log" | tee -a "$OUT/window.log"   # Kh: a digest a prompt
   grep -E '^libr4d: RADIANCE_EXPERIMENTAL_DS41_DRAFT_GEMV' "$OUT/$name.server.log" | tail -2 | tee -a "$OUT/window.log"   # Dk/Dkt: calls taken
   grep -E 'host expert pool: |host experts, pre-wake: |host experts, one-token passes: ' "$OUT/$name.server.log" | tee -a "$OUT/window.log"   # Fw/WpN: the wake-up, decode's gather waits
+  # Dg: the gate's totals, the decode steps by kind (the measured break-even), each sequence's line.
+  grep -E 'DSpark acceptance gate: ' "$OUT/$name.server.log" | grep -v 'DSpark acceptance gate: on' | tee -a "$OUT/window.log"
+  grep -E 'end-of-request snapshots: [0-9]+ reserved' "$OUT/$name.server.log" | tail -1 | tee -a "$OUT/window.log"   # Pce/Pcl: stored, hits, store
 }
 
 if [[ "$("${DOCKER[@]}" inspect "$NAME" --format '{{.State.Status}}' 2>/dev/null)" != running ]]; then
@@ -563,6 +785,85 @@ if [[ "${DEVICE_CHECKS:-1}" == ptime && -x "$HERE/build/ds41_mxfp4_device_check"
     timeout 900 "$HERE/build/ds41_mxfp4_device_check" "$RHOME/kernels/libr4d.so" ptime ${PTIME_ARGS:-1 2 4 8 16} >"$OUT/ptime.log" 2>&1
     echo "ptime exit $?" >>"$OUT/ptime.log" )
   grep -E 'prefill|exit' "$OUT/ptime.log" | tee -a "$OUT/window.log"
+fi
+# The Lc arms' gate (RADIANCE_EXPERIMENTAL_DS41_LCP), like Xt's: an Lc arm runs only on the
+# libr4d.so (sha256) the large-chunk checks passed on in this window, at a chunk no taller than they
+# checked (LCP_CHECK_C).
+LCP_OK="" LCP_LIB="" LCP_SUM="" LCP_C=0
+LCP_WHY="no large-chunk prefill device checks in this window (DEVICE_CHECKS=lcp with TALL_CHECK and TALL_LIBR4D)"
+if [[ " ${DEVICE_CHECKS:-1} " == *" lcp "* ]]; then
+  # RADIANCE_EXPERIMENTAL_DS41_LCP on card 0: the twin and the sparse ops at chunk heights up to
+  # LCP_CHECK_C (`lcp`, which also sweeps every other height-dependent op to 2048 rows, gemm_nt by the
+  # row the table resolves, the router's column split and gemm_nt_bf16f8 at N 1280 and 4096 among
+  # them), the sweep under LCP alone, and
+  # without any switch (`sweep0`), each row against the same row alone and in launches of 16.
+  # TALL_LIBR4D: the plugin the Lc arms load; TALL_CHECK: a harness built with the lcp mode (both must
+  # be named, as for `tall`). The logs are devcheck-lcp-*.log, apart from `tall`'s.
+  TL=${TALL_LIBR4D:-} TC=${TALL_CHECK:-} LC=${LCP_CHECK_C:-1024}
+  if [[ ! -x "$TC" || ! -f "$TL" ]]; then
+    LCP_WHY="TALL_CHECK=$TC is not an executable or TALL_LIBR4D=$TL is not a file"
+    log "large-chunk prefill device checks: $LCP_WHY; no Lc arm is measured"
+  elif ! [[ $LC =~ ^[0-9]+$ ]] || (( 10#$LC < 64 || 10#$LC > 2048 || 10#$LC % 16 )); then
+    LCP_WHY="LCP_CHECK_C=$LC is not a multiple of 16 in 64..2048"
+    log "large-chunk prefill device checks: $LCP_WHY; no Lc arm is measured"
+  else
+    LC=$((10#$LC))
+    log "large-chunk prefill device checks on card 0 with $TL ($TC), chunks of up to $LC"
+    lcp_bad=""
+    for m in "lcp $LC" sweep sweep0; do
+      f=${m%% *}
+      ( export HIP_VISIBLE_DEVICES=0
+        unset RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL RADIANCE_EXPERIMENTAL_DS41_LCP
+        [[ $f == sweep ]] && export RADIANCE_EXPERIMENTAL_DS41_LCP=$LC
+        timeout 1800 "$TC" "$TL" $m >"$OUT/devcheck-lcp-$f.log" 2>&1
+        echo "$f exit $?" >>"$OUT/devcheck-lcp-$f.log" )
+      grep -E '^(PASS|FAIL)|exit|norm rows' "$OUT/devcheck-lcp-$f.log" | tail -10 | tee -a "$OUT/window.log"
+      grep -qx "$f exit 0" "$OUT/devcheck-lcp-$f.log" || lcp_bad+=" $f exited non-zero;"
+      grep -q '^FAIL' "$OUT/devcheck-lcp-$f.log" && lcp_bad+=" $f printed FAIL;"
+    done
+    grep -q "^PASS: lcp $LC: " "$OUT/devcheck-lcp-lcp.log" || lcp_bad+=" lcp has no PASS line;"
+    grep -q "^PASS: tall passes give 16-token passes' bits" "$OUT/devcheck-lcp-lcp.log" || lcp_bad+=" lcp's chunk heights have no PASS line;"
+    grep -q '^PASS: sweep' "$OUT/devcheck-lcp-sweep.log" || lcp_bad+=" sweep has no PASS line;"
+    # The FP8-stored dense weights' gemm_nt_bf16f8 (one skinny row at every height, N >= 128) is in the
+    # sweep under LCP: a harness from before its case (lcp review M1) is not taken for one that checked it.
+    for f in lcp sweep; do
+      grep -q 'gemm_nt_bf16f8 N=1280 K=5120' "$OUT/devcheck-lcp-$f.log" && grep -q 'gemm_nt_bf16f8 N=4096 K=1024' "$OUT/devcheck-lcp-$f.log" ||
+        lcp_bad+=" $f did not sweep gemm_nt_bf16f8 (a harness without its case?);"
+    done
+    if [[ -z "$lcp_bad" ]]; then
+      LCP_OK=1 LCP_LIB=$TL LCP_C=$LC LCP_SUM=$(sha256sum "$TL" 2>/dev/null | cut -d' ' -f1)
+      log "large-chunk prefill device checks passed on $TL, sha256 ${LCP_SUM:0:16}: Lc arms of up to $LC tokens on it are measured"
+    else
+      LCP_WHY="the large-chunk prefill device checks did not pass on $TL:$lcp_bad"
+      log "$LCP_WHY no Lc arm is measured"
+    fi
+  fi
+fi
+# The Mb arms' gate (RADIANCE_EXPERIMENTAL_DS41_MOE_BALANCE): an Mb arm runs only on the libr4d.so (sha256)
+# whose `bal` check passed in this window (the balanced gemv and twin give the plain kernel's bytes).
+BAL_OK="" BAL_LIB="" BAL_SUM=""
+BAL_WHY="no balanced-gemv device check in this window (DEVICE_CHECKS=bal with TALL_CHECK and TALL_LIBR4D)"
+if [[ " ${DEVICE_CHECKS:-1} " == *" bal "* ]]; then
+  TL=${TALL_LIBR4D:-} TC=${TALL_CHECK:-} LC=${LCP_CHECK_C:-1024}
+  if [[ ! -x "$TC" || ! -f "$TL" ]]; then
+    BAL_WHY="TALL_CHECK=$TC is not an executable or TALL_LIBR4D=$TL is not a file"
+    log "balanced gemv device check: $BAL_WHY; no Mb arm is measured"
+  else
+    log "balanced gemv device check on card 0 with $TL ($TC), up to $LC tokens${BAL_ROUTES:+, routes $BAL_ROUTES}"
+    ( export HIP_VISIBLE_DEVICES=0
+      unset RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL RADIANCE_EXPERIMENTAL_DS41_LCP RADIANCE_EXPERIMENTAL_DS41_MOE_BALANCE
+      timeout 1800 "$TC" "$TL" bal "$LC" ${BAL_ROUTES:-} >"$OUT/devcheck-bal.log" 2>&1
+      echo "bal exit $?" >>"$OUT/devcheck-bal.log" )
+    grep -E '^(PASS|FAIL)|exit|^bal: ' "$OUT/devcheck-bal.log" | tail -6 | tee -a "$OUT/window.log"
+    if grep -qx "bal exit 0" "$OUT/devcheck-bal.log" && grep -q '^PASS: bal: ' "$OUT/devcheck-bal.log" &&
+       ! grep -q '^FAIL' "$OUT/devcheck-bal.log"; then
+      BAL_OK=1 BAL_LIB=$TL BAL_SUM=$(sha256sum "$TL" 2>/dev/null | cut -d' ' -f1)
+      log "balanced gemv device check passed on $TL, sha256 ${BAL_SUM:0:16}: Mb arms on it are measured"
+    else
+      BAL_WHY="the balanced gemv device check did not pass on $TL (devcheck-bal.log)"
+      log "$BAL_WHY; no Mb arm is measured"
+    fi
+  fi
 fi
 # The Xt arms' gate (RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL), like Dk's: an Xt arm runs only on the
 # libr4d.so (sha256) the tall checks passed on in this window.
@@ -779,7 +1080,12 @@ for a in $ARMS; do
   # every other arm runs with the switch 0, and a Pu arm is measured only if every rank names it at
   # startup (Pu2: with its decode mirror) and a shutdown line counts rests read (Pu2: some from the
   # mirror); the "read-ahead in pieces, partly read units" line has the per-unit wait in every
-  # arm with PpK; o --profile-ops;
+  # arm with PpK; PmrN / Pmr the read-ahead in pieces in
+  # decode passes of 2..N rows too (Pmr: N = 6; a DSpark verify pass, or several sequences' tokens):
+  # rank 0 posts every row's router input, each row predicts layer L+2's top K, each rank reads the
+  # union under the same live cap (RADIANCE_EXPERIMENTAL_DS41_PREFETCH_MULTIROW=N; needs a Pp part;
+  # reads only; measured only if the server names it at startup with its N, and every other arm runs
+  # with it 0 and must not name it); o --profile-ops;
   # H the second run home (RADIANCE_HOME_DIR2); iN background insert threads for missed units;
 # pN --host-pool-mib (4096: a rank's pinned expert slots and the file tier's staging); G pin the
 # RAM cache's slabs at startup; R / RNN read part of each missed expert from the checkpoint's
@@ -805,7 +1111,28 @@ for a in $ARMS; do
 # DbN DSpark's query pass as a short block of N rows (2-4), [anchor, noise x (N - 1)],
 # on every decoding step (RADIANCE_EXPERIMENTAL_DS41_DSPARK_SHORT_BLOCK=N, --draft-short-from 1;
 # with DsK, N = K + 1 drafts what the cap verifies; the replies stay the target's, acceptance may
-# move; a deepseek41 plugin that has it, and a Ds part); H3 the third run home (RADIANCE_HOME_DIR3); Es
+# move; a deepseek41 plugin that has it, and a Ds part); DvN the bank's hot set in VRAM
+# (RADIANCE_EXPERIMENTAL_DS41_DRAFT_VRAM=N with ..._DRAFT_HOTSET=$DRAFT_HOTSET or a variable by prompt set
+# and short block, hotset_for): each rank keeps the first N experts (1-32) of each of its stage lists as
+# static VRAM residents charged to the weights pool (the trunk gives up 3N residents a rank), loads no other
+# draft expert, pins nothing in the host pool (so the arm runs at B's p256 and m98304), and the draft
+# router is masked to the kept experts (-inf in the correction planes); a Ds part, and with Dkt the live
+# tail serves the VRAM weights; measured only if the server names the switch, every rank its final
+# placement (N/N/N hot) and its masked planes, and at exit every rank its draft selections with none on
+# a parked expert (otherwise <arm>.unmeasured.json); every other arm runs with ..._DRAFT_VRAM=0 and must
+# have no "draft VRAM" line; Xd the draft-routing capture: --expert-stats into xstats-<arm>.json (a Ds
+# part; the startup line must count 43 routed layers and the file draft passes, draft_hotset.py
+# summary), the input of draft_hotset.py write; Dg / DgTT[wW][rR] DSpark's per-sequence
+# acceptance gate (RADIANCE_EXPERIMENTAL_DS41_DSPARK_GATE=1, or 0.TT,W,R: a sequence drafts nothing
+# while the mean drafts accepted by its last W verifies, 8 by default, is under 0.TT, 0.78 by default
+# (DgTTT: T.TT), and drafts one step in R, 8, of a closed run as a probe; the context pass still
+# runs; a radiance that has it, a Ds part other than Ds0; measured only with the scheduler's
+# "DSpark acceptance gate: on" line, and every other arm runs with it 0 and must not have the line);
+# Df the drafter's dense linears from E4M3 codes as F8 reads the trunk's
+# (RADIANCE_EXPERIMENTAL_DS41_DSPARK_FP8; needs F8, a Ds part and a deepseek41 plugin that has it;
+# measured only with its "DSpark drafter: N dense weights read by gemm_nt_bf16f8" lines, every other
+# arm runs with it 0 and must not have them; at the end each Df arm's draft_n/draft_n_accepted must
+# equal the same arm's without Df); H3 the third run home (RADIANCE_HOME_DIR3); Es
 # engram_kv's rows split over the ranks (needs a deepseek41 plugin that has it); Pa the next layer's
 # attention weights read into the card's on-die cache during the CPU-row wait (same); PmN those reads
 # from the use-order list up to N MiB an issue point, the read that crosses it cut
@@ -859,7 +1186,11 @@ for a in $ARMS; do
 # skip (RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP=1: a prompt's early prefill passes run layers 21..39
 # only where their rows reach its last token or its state; needs a radiance and a deepseek41 from
 # claude/ds41-cskip, and the server's "consumer skip: on" line, or the arm is not measured; every
-# other arm runs with it off); Kh at the end of each prompt's prefill every rank hashes its KV groups
+# other arm runs with it off); Ck / CkN with Cs and Pc: which snapshots below a cut prompt's target
+# the cut makes whole (RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP_CKPT: none a band of 512, the
+# default; Ck every one its idle prefill writes (all); CkN those within N tokens below the target and a shared head; Ck0
+# none, the behaviour before claude/ds41-csckpt), checked in the server's policy line, which a Cs Pc
+# arm must have (a radiance from claude/ds41-csckpt); Kh at the end of each prompt's prefill every rank hashes its KV groups
 # and the last row's logits (RADIANCE_EXPERIMENTAL_DS41_PREFILL_HASH=1; steps are not issued ahead
 # while it is on, so time a prompt in an arm without it), and the window compares each Kh arm's
 # hashes with those of the first Kh arm with the same prompts (ab_requests.py --hashes); Rt the
@@ -924,11 +1255,13 @@ for a in $ARMS; do
 # input, ~190 MB an arm of the held-out prompts; an instrument: router_score_eval scores the file
 # offline in bf16, int8 and int4 against the container's routers); needs a predictor part.
   IFS=- read -r -a parts <<< "$a"
-  xt="" bt="" kld="" dk="" db="" pu="" ins_nt="" ins_kib="" ins_wait="" lean=""
+  xt="" bt="" kld="" dk="" db="" pu="" ins_nt="" ins_kib="" ins_wait="" lean="" lc="" ad="" dv="" xd="" hs="" dg="" df="" pmr=""
+  mb="" lf=""
   pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 HOST_POOL_MIB=4096 EXTRA_ARGS="" ARM_HOME="$RHOME" ARM_CONC=
   ARM_PROMPTS= ARM_N= ARM_LQ= rt=
-  power="" skip="" ARGS=() f8="" f8x="" rb="" rbf=0 pred="" cs="" kh="" pc="" pcopt="" fw="" wp="" wl=""
+  power="" skip="" ARGS=() f8="" f8x="" rb="" rbf=0 pred="" cs="" ck="" kh="" pc="" pcopt="" fw="" wp="" wl=""
   psc="" prs=12 pk="" pw="" ns="" pv=""
+  hpe="" hpl="" hpb="" hpm="" hpr=""
   unset ARM_NOPC   # --no-prefix-cache unless a Pc part sets it empty
   for p in "${parts[@]:1}"; do
     case $p in
@@ -942,10 +1275,10 @@ for a in $ARMS; do
       n[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_NICE=${p#n}) ;;
       m[0-9]*) CACHE_MIB=${p#m} ;;
       M[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MISSES=${p#M}) ;;
-      Mr[0-9]*) # pool jobs of up to N token rows of one expert (1-32, default 4; above 4, jobs of 4+ rows take the many-row kernel)
-               if [[ ${p#Mr} =~ ^[0-9]+$ ]] && (( 10#${p#Mr} >= 1 && 10#${p#Mr} <= 32 )); then
+      Mr[0-9]*) # pool jobs of up to N token rows of one expert (1-64, default 4; above 4, jobs of 4+ rows take the many-row kernel)
+               if [[ ${p#Mr} =~ ^[0-9]+$ ]] && (( 10#${p#Mr} >= 1 && 10#${p#Mr} <= 64 )); then
                  env+=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MAX_ROWS=${p#Mr})
-               else log "arm $a: $p: a job takes 1-32 rows; the arm is skipped"; skip=1; fi ;;
+               else log "arm $a: $p: a job takes 1-64 rows; the arm is skipped"; skip=1; fi ;;
       o)       EXTRA_ARGS="--profile-ops" ;;
       H)       ARM_HOME=${RADIANCE_HOME_DIR2:?H needs RADIANCE_HOME_DIR2} ;;
       H3)      ARM_HOME=${RADIANCE_HOME_DIR3:?H3 needs RADIANCE_HOME_DIR3} ;;
@@ -1003,6 +1336,21 @@ for a in $ARMS; do
       Dkt)     dk=2 ;;                     # draft GEMVs: the live tail alone (DRAFT_GEMV=2)
       Db[2-4]) db=${p#Db}                  # DSpark's short query block (DSPARK_SHORT_BLOCK=N)
                ARGS+=(--draft-short-from 1) ;;
+      Dv[0-9]*) dv=${p#Dv}                 # the bank's hot set in VRAM, router masked (DRAFT_VRAM=N)
+               if ! [[ $dv =~ ^[0-9]+$ ]] || (( 10#$dv < 1 || 10#$dv > 32 )); then
+                 log "arm $a: $p: a stage keeps 1-32 experts a rank; the arm is skipped"; skip=1
+               fi ;;
+      Xd)      xd=1 ;;                     # the draft-routing capture (--expert-stats xstats-<arm>.json)
+      Dg|Dg[0-9]*)                         # DSpark's acceptance gate (DSPARK_GATE): defaults, or DgTT[wW][rR]
+               if [[ $p == Dg ]]; then dg=1
+               elif [[ $p =~ ^Dg([0-9]{2,3})(w([0-9]+))?(r([0-9]+))?$ ]]; then
+                 t=${BASH_REMATCH[1]}
+                 if (( ${#t} == 2 )); then t=0.$t; else t=${t:0:1}.${t:1}; fi
+                 dg="$t,${BASH_REMATCH[3]:-8},${BASH_REMATCH[5]:-8}"
+                 # R = 1 is refused by the engine (consecutive probes would share one probe step).
+                 (( 10#${BASH_REMATCH[5]:-8} >= 2 )) || { log "arm $a: $p: a probe one step in R needs R >= 2; the arm is skipped"; skip=1; }
+               else log "arm $a: $p: the gate is Dg or DgTT[wW][rR] (threshold 0.TT or T.TT, W verifies, a probe one step in R); the arm is skipped"; skip=1; fi ;;
+      Df)      df=1 ;;                     # the drafter's dense linears from E4M3 codes (DSPARK_FP8; needs F8)
       K)       env+=(RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE=1) ;;     # the RAM cache packed for the CPU only
       Vp)      env+=(RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED=1) ;;      # VRAM residents in the packed-scale form (vpack_gate)
       Lm[0-9]*) ARGS+=(--max-model-len "${p#Lm}") ;;   # a longer context (default 512), e.g. for long-prompt TTFT
@@ -1012,6 +1360,11 @@ for a in $ARMS; do
       Pci[0-9]*) pcopt+=" $p"; ARGS+=(--checkpoint-interval "${p#Pci}") ;;                    # snapshot interval (2048)
       Pcs[0-9]*) pcopt+=" $p"; ARGS+=(--checkpoint-slots "${p#Pcs}") ;;                       # snapshot store slots (auto)
       Pcx)     pcopt+=" $p"; env+=(RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH=1) ;;           # publish only cold-cut chunks
+      Pce)     pcopt+=" $p"; hpe=1; env+=(RADIANCE_EXPERIMENTAL_PREFIX_EORS=1) ;;              # end-of-request snapshots
+      Pcl)     pcopt+=" $p"; hpl=1; env+=(RADIANCE_EXPERIMENTAL_PREFIX_SESSION_LRU=1) ;;       # snapshot store LRU by session
+      Pcb[0-9]*) pcopt+=" $p"; hpb=1; env+=(RADIANCE_EXPERIMENTAL_CHECKPOINT_STORE_MIB=${p#Pcb}) ;;   # snapshot store as N MiB
+      Pcm[0-9]*) pcopt+=" $p"; hpm=1; ARGS+=(--prefix-cache-mib "${p#Pcm}") ;;                 # host KV tier of N MiB
+      Pcr)     pcopt+=" $p"; hpr=1; env+=(RADIANCE_EXPERIMENTAL_DS41_KV_REPLICATED=1) ;;       # index/compressed caches replicated
       Pf)      env+=(RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE=1) ;;   # a prefill chunk alone in its step; decode rows batched
       N[0-9]*) ARGS+=(--max-num-seqs "${p#N}") ;;                     # this arm's --max-num-seqs (MAX_SEQS for every arm)
       C[0-9]*) ARM_CONC=${p#C} ;;                                     # this arm's requests sent K at a time (AB_CONCURRENCY)
@@ -1027,6 +1380,16 @@ for a in $ARMS; do
       Xt)      xt=1 ;;                                                 # exact tall passes (RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=1)
       BT[0-9]*) bt=${p#BT}; ARGS+=(--max-num-batched-tokens "$bt") ;;  # this arm's step: prefill chunks of N
       Kld)     kld=1 ;;                                                # --kld-record over the corpus instead of serving
+      Lc[0-9]*) lc=${p#Lc}                                             # large-chunk prefill: chunks of N (RADIANCE_EXPERIMENTAL_DS41_LCP)
+               if [[ $lc =~ ^[0-9]+$ ]] && (( 10#$lc >= 64 && 10#$lc <= 2048 && 10#$lc % 16 == 0 )); then
+                 lc=$((10#$lc)); ARGS+=(--max-num-batched-tokens "$lc"); env+=(RADIANCE_EXPERIMENTAL_DS41_LCP=$lc)
+               else log "arm $a: $p: a chunk is a multiple of 16 in 64..2048; the arm is skipped"; skip=1; fi ;;
+      Ad[0-9]*) ad=${p#Ad}; env+=(RADIANCE_EXPERIMENTAL_DS41_LCP_ADMIT=$((10#$ad))) ;;   # admit the last N tokens' units
+      Ada)     ad=all; env+=(RADIANCE_EXPERIMENTAL_DS41_LCP_ADMIT=all) ;;       # admit every unit (as at 16 rows)
+      Lp[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_LCP_PLANES=${p#Lp}) ;;        # missed units read at once a layer
+      Li[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_LCP_INSERTQ=${p#Li}) ;;       # admitted misses queued for the cache
+      Mb1|Mb2) mb=${p#Mb} ;;                                           # balanced routed gemv (..._MOE_BALANCE)
+      Lf)      lf=1 ;;                                                 # per-pass-size time lines (..._LCP_PROFILE)
       Fl)      env+=(RADIANCE_EXPERIMENTAL_DS41_FETCH_LIST=1) ;;       # counts + CPU rows in one ranged copy
       Ms[0-9]) env+=(RADIANCE_EXPERIMENTAL_DS41_MIRROR_SPLIT=${p#Ms}) ;;  # a lone decode miss's mirror tail in N pieces
       Mp)      env+=(RADIANCE_EXPERIMENTAL_DS41_MISS_POST=1) ;;       # miss reads start at the choice, before the pool's wake
@@ -1045,6 +1408,8 @@ for a in $ARMS; do
                rt=1; env+=(RADIANCE_EXPERIMENTAL_DS41_ROUTE_TRACE=$(cd "$OUT" && pwd)/rtrace-$a/rt) ;;
       Lq)      ARM_LQ=1 ;;                 # the quality harness after the timed requests
       Cs)      cs=1 ;;                     # the exact consumer-suffix skip (checked in the server log)
+      Ck|Cka)  ck=all ;;                   # Cs with Pc: every snapshot below a cut prompt's target made whole (without a Ck part: 512, the default)
+      Ck[0-9]*) ck=${p#Ck} ;;              # ... only those within N tokens below it and a shared head (Ck0: none, as before)
       Kh)      kh=1 ;;                     # KV and logits hashes at each prompt's end
       In)      ins_nt=1 ;;                 # background inserts' codes by non-temporal stores (INSERT_NT)
       Is)      ins_kib=256 ;;              # ... in 256 KiB pieces, a decode insert waiting for an idle pool
@@ -1065,6 +1430,11 @@ for a in $ARMS; do
       Pv)      pv=1 ;;                     # the predictor's inputs recorded (an instrument)
       Ns[0-9]*) # side store: up to N units a rank the packed cache refuses keep their planes
                if [[ ${p#Ns} =~ ^[0-9]+$ ]]; then ns=$((10#${p#Ns})); else log "arm $a: $p: NsN takes a number; the arm is skipped"; skip=1; fi ;;
+      Pmr|Pmr[0-9]*)                       # read-ahead in pieces in decode passes of 2..N rows too (Pmr: 6)
+               pmr=${p#Pmr}; pmr=${pmr:-6}
+               if ! [[ $pmr =~ ^[0-9]+$ ]] || (( 10#$pmr < 2 || 10#$pmr > 16 )); then
+                 log "arm $a: $p: N is 2-16 rows; the arm is skipped"; skip=1
+               else pmr=$((10#$pmr)); fi ;;
       *)     log "arm $a: unknown part $p; the arm is skipped (it would run without what its name says)"; skip=1 ;;
     esac
   done
@@ -1121,6 +1491,14 @@ for a in $ARMS; do
     env+=(RADIANCE_EXPERIMENTAL_DS41_PREFETCH_URGENT=0)
   fi
   ARM_PU=$pu
+  # Pmr: the multi-row read-ahead acts only on the read-ahead in pieces (a Pp part); without one the
+  # server refuses the switch. Every arm states it (0 is off), so a window's VAR=val cannot turn it on
+  # for the others; arm() checks the server log both ways.
+  if [[ -n "$pmr" && " ${env[*]} " != *" RADIANCE_EXPERIMENTAL_DS41_PREFETCH=pieces "* ]]; then
+    log "arm $a: Pmr needs a Pp part (the read-ahead in pieces); the arm is skipped"; skip=1
+  fi
+  env+=(RADIANCE_EXPERIMENTAL_DS41_PREFETCH_MULTIROW=${pmr:-0})
+  ARM_PMR=$pmr
   # Ss: the read-back runs in an arm only if its name says so, whatever the window's environment.
   [[ " ${env[*]} " == *" RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP=1 "* ]] || env+=(RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP=0)
   # Pi8 / Pi4, PkN, Pw, NsN, Pv: each acts only with what it changes (a predictor; Pi; Ei and the
@@ -1145,6 +1523,16 @@ for a in $ARMS; do
   [[ -z "$rt" ]] && env+=(RADIANCE_EXPERIMENTAL_DS41_ROUTE_TRACE=)   # traced only with Rt
   if [[ -n "$cs" ]]; then env+=(RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP=1); else env+=(RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP=0); fi
   ARM_CS=$cs
+  # Ck / CkN: which snapshots below a cut prompt's target are made whole; it acts only under Cs with
+  # the prefix cache. Every arm states it (512, the engine's default, without a Ck part), so a
+  # window's VAR=val cannot change what a Cs Pc arm's name says; arm() checks the server's policy
+  # line.
+  if [[ -n "$ck" && ( -z "$cs" || -z "$pc" ) ]]; then
+    log "arm $a: a Ck part (..._CONSUMER_SKIP_CKPT=$ck) acts only with Cs and Pc (or Pc0); the arm is skipped"; skip=1
+  fi
+  env+=(RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP_CKPT=${ck:-512})
+  ARM_CK=
+  [[ -n "$cs" && -n "$pc" ]] && ARM_CK=${ck:-512}
   if [[ -n "$kh" ]]; then env+=(RADIANCE_EXPERIMENTAL_DS41_PREFILL_HASH=1); else env+=(RADIANCE_EXPERIMENTAL_DS41_PREFILL_HASH=0); fi
   # The prefix cache's parts: PciN, PcsN and Pcx act only with the cache on (Pc or Pc0); without it
   # the arm would run cold under their names. Every arm states both prefix switches, so a window's
@@ -1154,16 +1542,48 @@ for a in $ARMS; do
   fi
   [[ " ${env[*]} " == *" RADIANCE_EXPERIMENTAL_CACHE_HEADROOM_BACKED=1 "* ]] || env+=(RADIANCE_EXPERIMENTAL_CACHE_HEADROOM_BACKED=0)
   [[ " ${env[*]} " == *" RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH=1 "* ]] || env+=(RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH=0)
+  # The harness parts: combinations the engine refuses are skipped here, and every arm states each
+  # switch, so a window's VAR=val cannot turn one on for an arm whose name does not say it (arm()
+  # also checks the server's lines both ways).
+  if [[ -n "$hpe" && " ${env[*]} " == *" RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH=1 "* ]]; then
+    log "arm $a: Pce with Pcx (exact publish keeps out the decode-written blocks an end-of-request snapshot stands on; the engine refuses it); the arm is skipped"; skip=1
+  fi
+  if [[ -n "$hpe" && ( " ${ARGS[*]} " == *" --num-speculative-tokens "[1-9]* || " ${env[*]} " == *" RADIANCE_EXPERIMENTAL_DS41_DSPARK_RAD_BANK=1 "* ) ]]; then
+    log "arm $a: Pce with speculation (the engine refuses it); the arm is skipped"; skip=1
+  fi
+  # Pce with exact tall passes: the engine takes it (the tall checks are (A) up to their reach), but
+  # no window has yet shown it end to end (a Kh arm's prefill hashes of resumed turns against a
+  # cold arm's at Xt-BT32), so it is not measured; PCE_XT=1 runs it, for that evidence alone.
+  if [[ -n "$hpe" && -n "$xt" && "${PCE_XT:-}" != 1 ]]; then
+    log "arm $a: Pce with Xt (no end-to-end evidence yet that a turn resumed from a tall-pass run's decode snapshot is a cold run's; PCE_XT=1 runs it for a Kh check); the arm is skipped"; skip=1
+  fi
+  if [[ -n "$hpb" && " ${ARGS[*]} " == *" --checkpoint-slots "* ]]; then
+    log "arm $a: PcbN with PcsN (a count given takes no byte budget); the arm is skipped"; skip=1
+  fi
+  [[ -n "$hpe" ]] || env+=(RADIANCE_EXPERIMENTAL_PREFIX_EORS=0)
+  [[ -n "$hpl" ]] || env+=(RADIANCE_EXPERIMENTAL_PREFIX_SESSION_LRU=0)
+  [[ -n "$hpb" ]] || env+=(RADIANCE_EXPERIMENTAL_CHECKPOINT_STORE_MIB=)
+  [[ -n "$hpr" ]] || env+=(RADIANCE_EXPERIMENTAL_DS41_KV_REPLICATED=0)
+  ARM_EORS=$hpe ARM_SLRU=$hpl ARM_STOREMIB=$hpb ARM_TIER=$hpm ARM_KVREP=$hpr
   # MrN: arms without it take jobs of the default 4 rows, whatever the window's environment (0 is
   # not this switch's off: any value outside 1-32 turns host experts off).
   [[ " ${env[*]} " == *" RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MAX_ROWS="* ]] || env+=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MAX_ROWS=4)
-  # Dk / Dkt / DbN act on the DSpark drafter only: without a Ds part the arm would not test them.
-  if [[ -n "$dk$db" && " ${env[*]} " != *" RADIANCE_EXPERIMENTAL_DS41_DSPARK_RAD_BANK=1 "* ]]; then
-    log "arm $a: Dk / Dkt / DbN need a Ds part (the DSpark draft bank); the arm is skipped"; skip=1
+  # Dk / Dkt / DbN / Dg / Df act on the DSpark drafter only: without a Ds part the arm would not test
+  # them. Dg gates drafts, so not with Ds0 (nothing drafts; the engine refuses the pair); Df extends
+  # the trunk's FP8 to the drafter, so it needs F8 (without it the plugin keeps the drafter bf16).
+  if [[ -n "$dk$db$dg$df" && " ${env[*]} " != *" RADIANCE_EXPERIMENTAL_DS41_DSPARK_RAD_BANK=1 "* ]]; then
+    log "arm $a: Dk / Dkt / DbN / Dg / Df need a Ds part (the DSpark draft bank); the arm is skipped"; skip=1
   fi
-  # Every arm states both switches (0 is off for both), so a window's VAR=val cannot turn them on;
+  if [[ -n "$dg" && " ${env[*]} " == *" RADIANCE_EXPERIMENTAL_DS41_DSPARK_VERIFY_CAP=0 "* ]]; then
+    log "arm $a: Dg with Ds0 (no draft to gate); the arm is skipped"; skip=1
+  fi
+  if [[ -n "$df" && -z "$f8" ]]; then
+    log "arm $a: Df needs F8 (the drafter's FP8 extends the trunk's); the arm is skipped"; skip=1
+  fi
+  # Every arm states these switches (0 is off for each), so a window's VAR=val cannot turn them on;
   # arm() checks the logs both ways. A Dk arm runs only on the libr4d.so the draft check passed on.
-  env+=(RADIANCE_EXPERIMENTAL_DS41_DRAFT_GEMV=${dk:-0} RADIANCE_EXPERIMENTAL_DS41_DSPARK_SHORT_BLOCK=${db:-0})
+  env+=(RADIANCE_EXPERIMENTAL_DS41_DRAFT_GEMV=${dk:-0} RADIANCE_EXPERIMENTAL_DS41_DSPARK_SHORT_BLOCK=${db:-0}
+        RADIANCE_EXPERIMENTAL_DS41_DSPARK_GATE=${dg:-0} RADIANCE_EXPERIMENTAL_DS41_DSPARK_FP8=${df:-0})
   if [[ -n "$dk" && -z "$skip" ]]; then
     IFS=: read -r -a homes <<< "$ARM_HOME"
     lib=""
@@ -1174,7 +1594,22 @@ for a in $ARMS; do
       log "arm $a: Dk refused: its libr4d.so (${lib:-none under $ARM_HOME}) is not the one the draft check passed on ($DK_LIB, sha256 ${DK_SUM:0:16})"; skip=1
     fi
   fi
-  ARM_DK=$dk ARM_DB=$db
+  ARM_DK=$dk ARM_DB=$db ARM_DG=$dg ARM_DF=$df
+  # DvN / Xd act on the DSpark drafter only: without a Ds part the arm would not test them. A Dv arm's
+  # hot set: DRAFT_HOTSET_<name> for its U<name> part when set, else DRAFT_HOTSET.
+  if [[ -n "$dv$xd" && " ${env[*]} " != *" RADIANCE_EXPERIMENTAL_DS41_DSPARK_RAD_BANK=1 "* ]]; then
+    log "arm $a: Dv / Xd need a Ds part (the DSpark draft bank); the arm is skipped"; skip=1
+  fi
+  if [[ -n "$dv" ]]; then
+    hs=$(hotset_for "$a")
+    if [[ ! -f "$hs" ]]; then
+      log "arm $a: Dv needs a hot-set file (DRAFT_HOTSET, or DRAFT_HOTSET_<set>[_db<K>] / DRAFT_HOTSET_db<K>; draft_hotset.py write), not '${hs}'; the arm is skipped"; skip=1
+    fi
+  fi
+  # Every arm states the switch (0 is off), so a window's VAR=val cannot put the bank in VRAM.
+  env+=(RADIANCE_EXPERIMENTAL_DS41_DRAFT_VRAM=${dv:-0} "RADIANCE_EXPERIMENTAL_DS41_DRAFT_HOTSET=${dv:+$hs}")
+  [[ -n "$xd" ]] && ARGS+=(--expert-stats "$(cd "$OUT" && pwd)/xstats-$a.json")
+  ARM_DV=$dv ARM_XD=$xd ARM_HS=$hs
   if [[ -n "$xt" && -z "$skip" ]]; then
     IFS=: read -r -a homes <<< "$ARM_HOME"
     lib=""
@@ -1185,6 +1620,48 @@ for a in $ARMS; do
       log "arm $a: Xt refused: its libr4d.so (${lib:-none under $ARM_HOME}) is not the one the tall checks passed on ($TALL_LIB, sha256 ${TALL_SUM:0:16})"; skip=1
     fi
   fi
+  # RADIANCE_EXPERIMENTAL_DS41_MOE_BALANCE and ..._LCP_PROFILE: stated in every arm (0 off).
+  env+=(RADIANCE_EXPERIMENTAL_DS41_MOE_BALANCE=${mb:-0} RADIANCE_EXPERIMENTAL_DS41_LCP_PROFILE=${lf:-0})
+  if [[ -n "$mb" && -z "$skip" ]]; then
+    IFS=: read -r -a homes <<< "$ARM_HOME"
+    lib=""
+    for h in "${homes[@]}"; do [[ -f "$h/kernels/libr4d.so" ]] && { lib=$h/kernels/libr4d.so; break; }; done
+    if [[ -z "$BAL_OK" ]]; then
+      log "arm $a: Mb refused: $BAL_WHY"; skip=1
+    elif [[ -z "$lib" || "$(sha256sum "$lib" 2>/dev/null | cut -d' ' -f1)" != "$BAL_SUM" ]]; then
+      log "arm $a: Mb refused: its libr4d.so (${lib:-none under $ARM_HOME}) is not the one the bal check passed on ($BAL_LIB, sha256 ${BAL_SUM:0:16})"; skip=1
+    fi
+  fi
+  if [[ -n "$lc" && -z "$skip" ]]; then
+    IFS=: read -r -a homes <<< "$ARM_HOME"
+    lib=""
+    for h in "${homes[@]}"; do [[ -f "$h/kernels/libr4d.so" ]] && { lib=$h/kernels/libr4d.so; break; }; done
+    if [[ -z "$LCP_OK" ]]; then
+      log "arm $a: Lc refused: $LCP_WHY"; skip=1
+    elif (( lc > LCP_C )); then
+      log "arm $a: Lc refused: the large-chunk checks ran at chunks of up to $LCP_C (LCP_CHECK_C), not $lc"; skip=1
+    elif [[ -z "$lib" || "$(sha256sum "$lib" 2>/dev/null | cut -d' ' -f1)" != "$LCP_SUM" ]]; then
+      log "arm $a: Lc refused: its libr4d.so (${lib:-none under $ARM_HOME}) is not the one the large-chunk checks passed on ($LCP_LIB, sha256 ${LCP_SUM:0:16})"; skip=1
+    fi
+  fi
+  # RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL: on only in an Xt arm, explicitly off in every other one but an
+  # Lc arm, where it is unset (LCP keeps its pins; the core refuses EXACT_TALL=0 beside it).
+  # RADIANCE_EXPERIMENTAL_DS41_LCP: an Lc arm's chunk, 0 in every other arm.
+  if [[ -n "$lc" ]]; then
+    [[ -n "$xt$bt" ]] && { log "arm $a: Lc goes with neither Xt nor BT (it sets the step itself); the arm is skipped"; skip=1; }
+    [[ " ${env[*]} " == *" RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS=1 "* ]] ||
+      { log "arm $a: Lc needs B1 (the CPU takes every routed unit); the arm is skipped"; skip=1; }
+    mm=$(grep -oE ' RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MISSES=[0-9]+' <<< " ${env[*]}" | tail -1 | cut -d= -f2)
+    (( ${mm:-0} >= lc )) || { log "arm $a: Lc$lc needs M$lc or more (the CPU computes a chunk's misses); the arm is skipped"; skip=1; }
+    # The pool's job size is not a matter of bits, but 4-row jobs (the default) take a chunk about twice
+    # the CPU time of the many-row kernel's: an Lc arm names it (Mr32 or Mr64; Mr4 for a control).
+    [[ " ${env[*]} " == *" RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MAX_ROWS="* ]] ||
+      { log "arm $a: Lc needs an Mr part (Mr32 or Mr64: a chunk's experts in many-row jobs); the arm is skipped"; skip=1; }
+    env+=(RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=)
+  elif [[ -n "$xt" ]]; then env+=(RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=1 RADIANCE_EXPERIMENTAL_DS41_LCP=0)
+  else env+=(RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=0 RADIANCE_EXPERIMENTAL_DS41_LCP=0); fi
+  if [[ -n "$ad" && -z "$lc" ]]; then log "arm $a: Ad$ad needs Lc (it acts on large chunks only); the arm is skipped"; skip=1; fi
+  [[ -n "$ad" ]] || env+=(RADIANCE_EXPERIMENTAL_DS41_LCP_ADMIT=)
   # Fw / WpN (the CPU pool's wake-up): every arm states both switches, 0 off, so a window's VAR=val
   # cannot turn them on for an arm whose name does not say so; arm() checks the server log both ways.
   # A pre-wake of more workers than the arm's pool has would be cut to its threads: refused instead.
@@ -1202,8 +1679,6 @@ for a in $ARMS; do
     log "arm $a: Fw / WpN act on the host experts' pool, which a base arm has not; the arm is skipped"; skip=1
   fi
   ARM_FW=$fw ARM_WP=$wp ARM_WL=$wl
-  # RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL: on only in an Xt arm, explicitly off in every other one.
-  if [[ -n "$xt" ]]; then env+=(RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=1); else env+=(RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=0); fi
   # In / Is / Iw / Ph: every arm states the switches, so a window's VAR=val cannot turn them on for
   # an arm whose name does not say so; arm() checks the server log both ways.
   if [[ -n "$ins_kib" ]] && (( ins_kib <= 0 )); then log "arm $a: Is0 slices nothing; the arm is skipped"; skip=1; fi
@@ -1224,7 +1699,7 @@ for a in $ARMS; do
     rm -rf "$OUT/kld-$a"
     ARGS=(--max-model-len "${KLD_LEN:-2048}" "${ARGS[@]}" --kld-record "$OUT/kld-$a" --kld-corpus "$OUT/kld-corpus.jsonl")
   fi
-  ARM_XT=$xt ARM_BT=$bt ARM_KLD=$kld
+  ARM_XT=$xt ARM_BT=$bt ARM_KLD=$kld ARM_LC=$lc
   [[ -n "$skip" ]] && continue
   [[ -n "$power" ]] && power_set "$power"
   case $pol in
@@ -1264,6 +1739,31 @@ done
 for a in $ARMS; do
   [[ "-$a-" == *-Dk-* || "-$a-" == *-Dkt-* ]] || continue
   b=$(sed -E 's/-Dkt?(-|$)/\1/' <<< "$a")
+  if [[ " $ARMS " != *" $b "* ]]; then log "draft stats: no arm $b in this window to hold $a to"; continue; fi
+  log "draft stats: $a against $b"
+  python3 -I "$HERE/ab_requests.py" --draft-stats "$OUT" "$b" "$a" | tee -a "$OUT/window.log"
+done
+# DSpark arms (a Ds part): drafts verified and accepted, the acceptance and its ratio r to the first
+# arm with the same Ds and Db parts in each prompt set (put the pinned-bank arm first, so a Dv arm's masked
+# draft is read against the bank's unmasked one at its verify cap), tokens a step and decode tokens/s.
+ds_arms=""
+for a in $ARMS; do [[ "-$a-" =~ -Ds[0-9a]?- && -f "$OUT/$a.json" ]] && ds_arms+="$a "; done
+[[ -n "$ds_arms" ]] && python3 -I "$HERE/ab_requests.py" --acceptance "$OUT" $ds_arms | tee -a "$OUT/window.log"
+# Xd arms: each capture's share of draft selections the hot set its prompts' Dv arms use keeps at N = 8,
+# 16, 24 (held-out coverage when that hot set was written from the other prompt set's capture).
+for a in $ARMS; do
+  [[ "-$a-" == *-Xd-* && -f "$OUT/xstats-$a.json" ]] || continue
+  h=$(hotset_for "$a")
+  [[ -f "$h" ]] && python3 -I "$HERE/draft_hotset.py" cover "$h" "$OUT/xstats-$a.json" 8 16 24 | tee -a "$OUT/window.log"
+  # A Dv arm with Xd: its capture, taken under the mask, must select only the first N of each list.
+  n=$(tr '-' '\n' <<< "$a" | grep -m1 -E '^Dv[0-9]+$'); n=${n#Dv}
+  [[ -n "$n" && -f "$h" ]] && python3 -I "$HERE/draft_hotset.py" check "$h" "$n" "$OUT/xstats-$a.json" | tee -a "$OUT/window.log"
+done
+# Df arms: gemm_nt_bf16f8 gives gemm_nt's bytes, so the drafter proposes the same tokens; each Df
+# arm's draft_n and draft_n_accepted must equal the same arm's without Df, as for Dk.
+for a in $ARMS; do
+  [[ "-$a-" == *-Df-* ]] || continue
+  b=$(sed -E 's/-Df(-|$)/\1/' <<< "$a")
   if [[ " $ARMS " != *" $b "* ]]; then log "draft stats: no arm $b in this window to hold $a to"; continue; fi
   log "draft stats: $a against $b"
   python3 -I "$HERE/ab_requests.py" --draft-stats "$OUT" "$b" "$a" | tee -a "$OUT/window.log"

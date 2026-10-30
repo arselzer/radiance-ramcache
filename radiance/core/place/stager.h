@@ -93,6 +93,7 @@
 #include "readahead.h"
 #include "route_trace.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -103,6 +104,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -224,6 +226,26 @@ private:
     void retire(Place& p);
 };
 
+/* The read-ahead in pieces' pass policy (FileStager, RADIANCE_EXPERIMENTAL_DS41_PREFETCH=pieces).
+ * ra_multirow_rows: RADIANCE_EXPERIMENTAL_DS41_PREFETCH_MULTIROW's value -- 1 unset, empty or "0"
+ * (one-token passes only, as always), N for 2 <= N <= limit, -1 for anything else (refused).
+ * ra_pass_reads_ahead: every one-token pass, as always, and for max_rows > 1 a trunk decode pass
+ * (decode: RAD_PHASE_DECODE; draft_pass 0) of 2..max_rows rows; never a prefill or mixed pass of
+ * more rows, nor the drafter's own passes. */
+inline int ra_multirow_rows(const char* v, int64_t limit) {
+    if (!v || !*v || (v[0] == '0' && !v[1])) return 1;
+    int64_t n = 0;
+    for (const char* p = v; *p; ++p) {
+        if (*p < '0' || *p > '9' || n > 1000) return -1;
+        n = n * 10 + (*p - '0');
+    }
+    return n >= 2 && n <= limit ? (int)n : -1;
+}
+inline bool ra_pass_reads_ahead(bool decode, int32_t draft_pass, int64_t n_tok, int max_rows) {
+    if (n_tok == 1) return true;
+    return max_rows > 1 && decode && draft_pass == 0 && n_tok >= 2 && n_tok <= max_rows;
+}
+
 /* ---- the file stager: routed layers read from the container -------------------------------------
  *
  * A routed unit on the file tier (--weights-disk-tier) has no address of its own, and a grouped
@@ -278,10 +300,36 @@ public:
         uint64_t d_miss_post_ns = 0;
     };
     const EpStats& ep_stats() const { return ep_stats_; }
+    /* RADIANCE_EXPERIMENTAL_DS41_LCP_PROFILE=1 (an instrument; nothing it measures changes): the routed
+     * layers' host-side times by the pass's height -- bucket 0 one token, 1 two to 16, 2 17 to 256, 3 more.
+     * layers: routed layer-passes; rows: their routed rows (the pass's rows from the layer's cut);
+     * cpu_rows: rows handed to the pool; sync: waiting for the card at the counts (the router wait: the
+     * card's work up to this layer's router not hidden behind the host, e.g. the layer before's experts);
+     * miss_wait: at the gather for misses still being read; gather: at the gather for the pool's rows;
+     * miss_units / miss_read: the misses read and the read call's time (on the worker, overlapping);
+     * waves: large-chunk read waves; span: from one routed layer's counts to the next layer's in the same
+     * pass (the layer-pass's wall time; a pass's first layer has none). */
+    struct PassProfile {
+        uint64_t layers = 0, rows = 0, cpu_rows = 0, sync_ns = 0, miss_wait_ns = 0, gather_ns = 0;
+        uint64_t miss_units = 0, miss_read_ns = 0, waves = 0, spans = 0, span_ns = 0;
+    };
+    static constexpr int kProfBuckets = 4;
+    bool profile_on() const { return prof_on_; }
+    const PassProfile& profile(int b) const { return prof_[b]; }
     /* Routed experts the CPU computed (HostExpertPool) instead of a copy to the card. */
     struct HostStats {
         uint64_t layers = 0, units = 0, rows = 0;
         uint64_t miss_units = 0, miss_rows = 0, miss_read_ns = 0;   /* misses computed from planes */
+        /* Large-chunk prefill (hx_stream_misses): layers whose misses were streamed, their read
+         * waves (past ..._LCP_PLANES units a wave), the units handed to the pool as each landed and
+         * the ones handed over after the call (a leg read again), and the issuing thread's waits
+         * for an earlier wave's jobs before reusing its planes. */
+        uint64_t lcp_layers = 0, lcp_waves = 0, lcp_landed = 0, lcp_late = 0, lcp_wave_wait_ns = 0;
+        /* Large-chunk prefill's admission (RadBatch::lcp_admit_row, ..._LCP_ADMIT), over the chunks
+         * of more than 16 tokens: cached units leased with an LRU touch (admitted) and without one
+         * (read-only); missed units relaid into the cache, computed and let go (read-only), and
+         * admitted ones not relaid because ..._LCP_INSERTQ units were already queued (dropped). */
+        uint64_t lcp_hit_admit = 0, lcp_hit_ro = 0, lcp_miss_admit = 0, lcp_miss_ro = 0, lcp_miss_dropped = 0;
         /* Pool jobs that run the many-row kernel (HostExpertPool::many_from: four or more rows of
          * one expert with ..._HOST_EXPERTS_MAX_ROWS above 4), and their rows. */
         uint64_t many_jobs = 0, many_rows = 0;
@@ -305,7 +353,8 @@ public:
         /* ...and the entries their layer took before their read began, and the read-ahead's time
          * holding back for demand reads. */
         uint64_t pf_taken = 0, pf_yield_ns = 0;
-        /* Read-ahead in pieces (..._PREFETCH=pieces, readahead.h), one-token layers: units
+        /* Read-ahead in pieces (..._PREFETCH=pieces, readahead.h), the layers of passes that read
+         * ahead (one-token passes; with ..._PREFETCH_MULTIROW also decode passes of 2..N rows): units
          * planned (predicted, uncached, eligible); planned for a layer this rank had decided
          * already, or past the cap of live units. At their layer, the selected misses: whole
          * (every piece read), finished (partly read, the rest read urgently while the layer
@@ -338,6 +387,20 @@ public:
         /* ..._SIDE_STORE (hx_side_store.h): misses handed the planes the store holds (no drive
          * read), and of them in one-token passes. */
         uint64_t side_hits = 0, side_d_hits = 0;
+        /* The same by the pass's rows (ra_rows[r], r = 1..kRaRows; [0] unused): one-token passes,
+         * and with RADIANCE_EXPERIMENTAL_DS41_PREFETCH_MULTIROW the decode passes of 2..N rows.
+         * Planned and skipped (too late, or past the live cap) by the rows of the post that
+         * predicted them; the rest by the rows of the pass that decided them. used = whole +
+         * finished; dropped = not selected + cache hits + stale. */
+        struct RaRows {
+            uint64_t planned = 0, skipped = 0;
+            uint64_t whole = 0, finished = 0, fresh = 0, refetched = 0, dropped = 0;
+            uint64_t misses = 0, miss_planned = 0;
+            uint64_t used_bytes = 0, dropped_bytes = 0, wait_ns = 0;
+        };
+        static constexpr int kRaRows = 16;
+        RaRows ra_rows[kRaRows + 1];
+        static int ra_slot(int64_t rows) { return rows < 1 ? 1 : rows > kRaRows ? kRaRows : (int)rows; }
         uint64_t linked = 0;          /* cached experts the schedule left on the copy link */
         uint64_t missed = 0;          /* routed experts the RAM cache did not hold */
         uint64_t wait_ns = 0;         /* the issuing thread waiting at gathers for the CPU */
@@ -481,6 +544,28 @@ private:
     RadEvent  counts_ev_ = nullptr;
     bool      routed_ = false;                   /* this pass reads routed experts only */
     int64_t   pass_tok_ = 0;
+    /* RADIANCE_EXPERIMENTAL_DS41_LCP_PROFILE (PassProfile above). */
+    bool prof_on_ = false;
+    PassProfile prof_[kProfBuckets];
+    std::chrono::steady_clock::time_point prof_last_counts_{};
+    int prof_bucket() const { return pass_tok_ <= 1 ? 0 : pass_tok_ <= 16 ? 1 : pass_tok_ <= 256 ? 2 : 3; }
+    void prof_counts(int32_t li, uint64_t sync_ns, std::chrono::steady_clock::time_point t_counts);
+public:
+    /* LCP's chunk C once this rank's stager admitted it (lcp_init, hx_init), else 0. */
+    int64_t lcp_rows() const { return lcp_; }
+private:
+    /* The per-row consumer cut (RadBatch::consumer_row0, core/sched/consumer_skip.h): routed layer li
+     * runs on the pass's rows [layer_r0(li), pass_tok_), its router, scatter and expert GEMMs over
+     * those rows alone, and the CPU path with them (hx_fetch from the gate_up's row layer_r0, the
+     * jobs over layer_rows); 0 and the pass on every pass without it. */
+    std::vector<int32_t> pass_row0_;   /* by model layer; empty: no cut by row */
+    int64_t layer_r0(int32_t li) const {
+        if (pass_row0_.empty() || li < 0 || (size_t)li >= layers_.size()) return 0;
+        const int32_t l = layers_[(size_t)li].layer;
+        return l >= 0 && (size_t)l < pass_row0_.size() ? std::clamp<int64_t>(pass_row0_[(size_t)l], 0, pass_tok_) : 0;
+    }
+    int64_t layer_rows(int32_t li) const { return pass_tok_ - layer_r0(li); }
+    int32_t n_model_layers_ = 0;
     /* The layers whose MoE this pass runs: RadBatch::consumer_full on a pass the consumer skip
      * cut (core/sched/consumer_skip.h), every layer otherwise. Nothing is read, staged, predicted
      * or read ahead for a layer at or past it. */
@@ -494,8 +579,21 @@ private:
     /* RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL: sets ep_rows_, and refuses a step whose passes would not
      * give a 16-token pass's bits: one taller than kEpRouteTallRows, a routed MXFP4 GEMM band off the
      * decode-band kernel (no twin row moe_gemm_ggml_mxfp4_gemv_tall, or a step taller than its
-     * bound), or another op on two kernels other than gemm_nt's m16 / m64; says so at startup. */
+     * bound), or another op on two kernels other than gemm_nt's m16 / m64; says so at startup.
+     * With RADIANCE_EXPERIMENTAL_DS41_LCP=<C> it is lcp_init's. */
     int  tall_init(const Program& prog);
+    /* RADIANCE_EXPERIMENTAL_DS41_LCP=<C> (large-chunk prefill, ep_route_counts.h): ep_rows_ = C when the
+     * bands say chunks of C give 16-token passes' bits (stager.cpp: the routed GEMMs on the gemv rows,
+     * the twin reaching C; any other op on one kernel or on a known byte-identical pair), the step is
+     * C, and nothing beside it is outside what was proven (EXACT_TALL other than 1, speculation, the
+     * fetch lists, the packed VRAM residents); refused otherwise, with the reason. hx_init then
+     * requires the CPU to take every routed unit, and says what was admitted (lcp_report). */
+    int  lcp_init(const Program& prog, int64_t C);
+    void lcp_report() const;
+    int64_t lcp_ = 0;                  /* C once lcp_init admitted it, else 0 */
+    int64_t lcp_reach_ = 0;            /* the twin's bound, as its bands state it */
+    int     lcp_moe_ = 0, lcp_twin_ = 0, lcp_split_ = 0, lcp_runs_ = 0, lcp_ops_ = 0, lcp_pair_ops_ = 0;
+    std::string lcp_pairs_;            /* the multi-kernel ops admitted, by family */
     /* Batch eligibility only. start() additionally requires this exact native EP layer;
      * selected-routed starts always use Normal. Immutable copy passed per mover call. */
     NativeFileCacheReadPolicy pass_cache_policy_ = NativeFileCacheReadPolicy::Normal;
@@ -634,6 +732,7 @@ private:
     std::vector<int32_t> hx_keep_, hx_slot_;
     std::vector<HostExpertPool::Job> hx_jobs_;
     std::vector<int32_t> hx_rows_;                /* the sorted row each job writes */
+    std::vector<int>     hx_order_;               /* hx_submit's units, longest first */
     HostExpertPool::Ticket hx_ticket_;
     uint16_t* hx_x_ = nullptr;                    /* pinned [ep_rows_, 5120] token rows */
     int32_t*  hx_idx_ = nullptr;                  /* pinned sorted_tok [hx_sorted_max()], expert_offset */
@@ -649,6 +748,29 @@ private:
     int  hx_deferred(int32_t li, RadStream s);
     int  hx_warm();
     int  hx_submit_misses_now(int rows);
+    /* Large-chunk prefill's misses (stager.cpp): each unit's jobs built before its read and handed
+     * to the pool the moment its last extent lands (Mover::read_unit_planes' `landed`), longest
+     * first, in waves of at most hx_lcp_planes_ units. */
+    int  hx_stream_misses(int rows);
+    int  hx_lcp_planes_ = 48;     /* RADIANCE_EXPERIMENTAL_DS41_LCP_PLANES */
+    /* Large-chunk prefill's causal admission: the pass's RadBatch::lcp_admit_row (0: everything), and
+     * by miss (parallel to hx_miss_) whether it is admitted; the cap on the insert queue. */
+    int32_t lcp_admit_row_ = 0;
+    std::vector<uint8_t> hx_miss_admit_;
+    int  hx_lcp_insertq_ = 16;    /* RADIANCE_EXPERIMENTAL_DS41_LCP_INSERTQ */
+    /* Whether local expert e of routed layer li, whose sorted order hx_idx_ holds, has a row at or
+     * past lcp_admit_row_ (always with no admission row). */
+    bool hx_admits(int32_t li, int32_t e) const;
+    /* The misses idx[0..n) of hx_miss_ to the insert threads with the pass's tokens `rows`, the
+     * admitted ones only and not the side store's, at most hx_lcp_insertq_ queued at once in a
+     * large chunk (the rest dropped, counted). */
+    void hx_queue_inserts(const size_t* idx, size_t n, int rows);
+    /* The same over all of hx_miss_ (hx_submit_misses_now's call). */
+    void hx_queue_inserts(int rows) {
+        std::vector<size_t> all(hx_miss_.size());
+        for (size_t i = 0; i < all.size(); ++i) all[i] = i;
+        hx_queue_inserts(all.data(), all.size(), rows);
+    }
     /* RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_ASYNC_MISSES=N: in passes of N or more tokens a
      * layer's missed planes are read and their jobs submitted on hx_mw_ (a thread a rank) while
      * the issuing thread goes on issuing the layer's card ops; hx_finish and hx_drain wait for it
@@ -766,6 +888,7 @@ private:
         std::shared_ptr<Mover::HostPlanes> p;
         uint32_t pass = 0;
         int32_t  li = -1, unit = -1;
+        int32_t  rows = 1;                   /* the rows of the post that predicted it */
     };
     PieceReader* hx_ra_ = nullptr;           /* set in pieces mode once the readers run */
     std::mutex   hx_ra_mu_;                  /* hx_ra_live_, and the ra_ counters the planner bumps */
@@ -798,9 +921,29 @@ private:
     /* Parallel to hx_miss_: the unit the readers are finishing for this layer (with
      * ..._PREFETCH_URGENT: stopped, its rest the layer's call's), or null. */
     std::vector<std::shared_ptr<ReadAheadUnit>> hx_miss_ra_;
-    static void hx_ra_ready(void* ctx, uint32_t pass, int layer, const int32_t* experts, int k);
+    /* ---- RADIANCE_EXPERIMENTAL_DS41_PREFETCH_MULTIROW=N (2..16; needs the read-ahead in pieces):
+     * decode passes of 2..N rows read ahead too -- a DSpark verify pass (the last token and its
+     * drafts), or one token from each of several sequences. Rank 0 posts every row's router input
+     * at the one-token pass's points (start_ep_routed after the CPU's submission, hx_early_decide
+     * after the counts); the predictor reads layer L+2's router once for all the rows and hands
+     * every rank the union of the rows' top k (router_predictor.h); hx_ra_plan lays it out under
+     * the same live cap, and hx_choose decides a layer's units as in a one-token pass: the
+     * readers' yields to demand reads, the finishing rule (with the plane mirror's share for the
+     * pass's rows) and the epoch check are the same. A one-token pass goes exactly as without the
+     * switch; prefill chunks and the drafter's own passes never read ahead. Reads only: the bytes
+     * handed to the CPU are the container's either way. */
+    int  hx_ra_rows_ = 1;                    /* the largest pass that reads ahead (1: one-token only) */
+    bool hx_ra_pass_ = false;                /* this pass reads ahead (ra_pass_reads_ahead) */
+    int  hx_ra_rows_init();
+    /* hx_ra_take's finishing rule: the bytes of a missed unit this pass's demand read takes from
+     * the plane mirror (a one-token pass: the decode share, as always). */
+    int64_t hx_ra_mirror_bytes() const;
+    static void hx_ra_ready(void* ctx, uint32_t pass, int layer, const int32_t* experts, int n,
+                            int rows);
     static int  hx_ra_read(void* ctx, const PlaneExtent& piece);
-    void hx_ra_plan(uint32_t pass, int layer, const int32_t* experts, int k);
+    /* Layer `layer`'s predicted global experts for pass `pass` (n of them, best first) from a post
+     * of `rows` rows: this rank's uncached ones laid out and queued, up to the live cap. */
+    void hx_ra_plan(uint32_t pass, int layer, const int32_t* experts, int n, int rows = 1);
     /* At layer li's routing: its live units into hx_ra_here_, stale ones dropped. */
     void hx_ra_begin(int32_t li);
     /* Layer li's selected miss u: its planes when read ahead (whole: *ready; partly read: *urgent,
@@ -830,6 +973,7 @@ private:
     /* hx_init_impl, before the insert threads see a refusal: the switch, refused unless the packed
      * cache and misses on the CPU are on. */
     int hx_side_init();
+    std::shared_ptr<Mover::HostPlanes> hx_planes_backed(int32_t unit);
     int  hx_submit_misses();
     /* The misses hx_submit_misses_now reads, into *out, with what each has in already into *in:
      * the layer's not read ahead whole and not being finished by the piece readers (nothing in),
@@ -904,7 +1048,6 @@ private:
     bool hx_bg_stop_ = false;
     int  hx_bg_busy_ = 0;
     void hx_bg_loop();
-    void hx_queue_inserts(int rows);   /* hx_submit_misses_now: the layer's misses to hx_bg_loop */
     /* RADIANCE_EXPERIMENTAL_DS41_INSERT_NT=1: the background inserts write a unit's codes planes
      * into the packed RAM cache by non-temporal stores (ds41hx::PackCopy), so the ~18 MB neither
      * reads each line first nor fills the caches the pool reads through. ..._INSERT_SLICE_KIB=N

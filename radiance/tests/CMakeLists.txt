@@ -460,6 +460,12 @@ endif()
 add_test(NAME isa_tools COMMAND sh ${CMAKE_SOURCE_DIR}/libr4d/isa/selftest.sh)
 set_tests_properties(isa_tools PROPERTIES TIMEOUT ${RAD_TEST_TIMEOUT})
 
+# ab_window.sh's Vp part beside a DSpark bank (tools/ds41-host-experts): the server-log gate on synthetic
+# logs and the arm loop with every action stubbed. No card, no server, no model.
+add_test(NAME ab_window_vp_test COMMAND bash ${CMAKE_SOURCE_DIR}/tools/ds41-host-experts/ab_window_vp_test.sh)
+set_tests_properties(ab_window_vp_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT}
+                     ENVIRONMENT "ROCR_VISIBLE_DEVICES=99")
+
 # ================================================================== libr4d's kernels, on the host
 #
 # Some libr4d ops (the sandwich-norm joins, expert_scale) have no libref oracle by design

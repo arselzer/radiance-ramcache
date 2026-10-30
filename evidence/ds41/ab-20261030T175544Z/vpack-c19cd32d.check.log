@@ -1,0 +1,12 @@
+Warning: Resource leak detected by SharedSignalPool, 77 Signals leaked.
+/home/as/ds41-claude-build/home-dsad/kernels/libr4d.so: gemv_vp runs variant 4 (r2cz) by default; 5 kernels checked
+9 experts (6 with the research sample's scales); at most 368 raw rounds in a gate_up, 189 in a down
+gemv_vp: 6087680 values compared with the plain row, 0 differ
+gemv_vp[old]: 6087680 values compared with the plain row, 0 differ
+gemv_vp[r2]: 6087680 values compared with the plain row, 0 differ
+gemv_vp[r2cf]: 6087680 values compared with the plain row, 0 differ
+gemv_vp[r2cz]: 6087680 values compared with the plain row, 0 differ
+480 calls, 30438400 values compared: 0 differ; damaged headers: 363520 values NaN, 0 not
+dropped slots: 49745920 dropped slots' values, 0 not zero in both rows
+PASS: gemv_vp over packed experts is bit-identical to the plain row over block_mxfp4
+vpack check exit 0

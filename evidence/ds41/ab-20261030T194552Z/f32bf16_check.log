@@ -1,0 +1,15 @@
+  ok    gemm_nt_f32bf16 at M=1 N=384 K=5120: byte-identical to gemm_nt_f32 and the host arithmetic
+  ok    gemm_nt_f32bf16 at M=2 N=384 K=5120: byte-identical to gemm_nt_f32 and the host arithmetic
+  ok    gemm_nt_f32bf16 at M=16 N=384 K=5120: byte-identical to gemm_nt_f32 and the host arithmetic
+  ok    gemm_nt_f32bf16 at M=33 N=384 K=5120: byte-identical to gemm_nt_f32 and the host arithmetic
+  ok    gemm_nt_f32bf16 at M=64 N=384 K=5120: byte-identical to gemm_nt_f32 and the host arithmetic
+  ok    gemm_nt_f32bf16 at M=130 N=384 K=5120: byte-identical to gemm_nt_f32 and the host arithmetic
+  ok    gemm_nt_f32bf16 at M=1 N=1024 K=5120: byte-identical to gemm_nt_f32 and the host arithmetic
+  ok    gemm_nt_f32bf16 at M=16 N=1024 K=5120: byte-identical to gemm_nt_f32 and the host arithmetic
+  ok    gemm_nt_f32bf16 at M=70 N=1024 K=5120: byte-identical to gemm_nt_f32 and the host arithmetic
+  ok    gemm_nt_f32bf16 at M=3 N=4 K=4096: byte-identical to gemm_nt_f32 and the host arithmetic
+  ok    gemm_nt_f32bf16 at M=3 N=36 K=4096: byte-identical to gemm_nt_f32 and the host arithmetic
+  ok    gemm_nt_f32bf16 at M=3 N=96 K=4096: byte-identical to gemm_nt_f32 and the host arithmetic
+  ok    gemm_nt_f32bf16 at M=7 N=31 K=129: byte-identical to gemm_nt_f32 and the host arithmetic
+  ok    gemm_nt_f32bf16 at M=70 N=13 K=130: byte-identical to gemm_nt_f32 and the host arithmetic
+check exit 0

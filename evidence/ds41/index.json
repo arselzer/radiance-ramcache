@@ -8,7 +8,11 @@
     "ab-20261029T220909Z": "3,086-token prefill, 99.3 s without and 63.1 s with the consumer skip and 16-row CPU jobs",
     "ab-20261029T200958Z": "the consumer skip's exactness: per-rank prefill hashes and the 32-token byte gate",
     "ab-20261029T232708Z": "prefix-cache follow-up turns, 97.6-102.3 s cold and 0.42-2.75 s cached",
-    "ab-20261029T153750Z": "four concurrent requests, 20.0 / 20.2 tok/s aggregate decode"
+    "ab-20261029T153750Z": "four concurrent requests, 20.0 / 20.2 tok/s aggregate decode",
+    "ab-20261030T194552Z": "decode after the RAM upgrade (31.2 tok/s, 4 streams)",
+    "ab-20261030T201710Z": "Phase 1 prefill exactness and speed",
+    "ab-20261030T205440Z": "DSpark and 8 streams at 192 GiB",
+    "ab-20261030T213623Z": "DSpark verify depth"
   },
   "windows": {
     "ab-20261028T220036Z": {
@@ -3084,6 +3088,355 @@
           "reason": "KLD logit records (binary f16/f32/i32)"
         }
       ]
+    },
+    "ab-20261030T151840Z": {
+      "files": 5,
+      "bytes": 127912,
+      "server_logs": 0,
+      "server_log_bytes": 0,
+      "server_log_xz_bytes": 0,
+      "started_utc": "2026-10-30T15:18:40Z",
+      "arms_started": 2,
+      "qfn_restored": true,
+      "left_out": [
+        {
+          "path": "all-t40-f-M16-H-p256-m98304-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw.server.log",
+          "bytes": 92256,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        },
+        {
+          "path": "all-t40-f-M16-H-p256-m98304-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw.vm",
+          "bytes": 2228,
+          "reason": "not a text result, log or memory trace"
+        },
+        {
+          "path": "all-t40-f-M16-H-p57-m102400-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Nf.server.log",
+          "bytes": 92707,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        },
+        {
+          "path": "all-t40-f-M16-H-p57-m102400-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Nf.vm",
+          "bytes": 2984,
+          "reason": "not a text result, log or memory trace"
+        }
+      ]
+    },
+    "ab-20261030T154217Z": {
+      "files": 16,
+      "bytes": 411901,
+      "server_logs": 0,
+      "server_log_bytes": 0,
+      "server_log_xz_bytes": 0,
+      "started_utc": "2026-10-30T15:42:44Z",
+      "arms_started": 5,
+      "qfn_restored": true,
+      "left_out": [
+        {
+          "path": "all-t40-f-M16-H-p256-m98304-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds1-Dkt-Db2-Dv24-Pmr-Df-Vp-Uchat.server.log",
+          "bytes": 102527,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        },
+        {
+          "path": "all-t40-f-M16-H-p256-m98304-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds1-Dkt-Db2-Dv24-Pmr-Df-Vp.server.log",
+          "bytes": 95336,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        },
+        {
+          "path": "all-t40-f-M16-H-p256-m98304-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds1-Dkt-Db2-Dv24-Pmr-Df.server.log",
+          "bytes": 90018,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        },
+        {
+          "path": "all-t40-f-M16-H-p256-m98304-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Vp-Ss-Pu-Is-Pi8-Ns7-Fw-Uchat.server.log",
+          "bytes": 96591,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        },
+        {
+          "path": "all-t40-f-M16-H-p256-m98304-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Vp-Ss-Pu-Is-Pi8-Ns7-Fw.server.log",
+          "bytes": 94382,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        }
+      ]
+    },
+    "ab-20261030T160056Z": {
+      "files": 10,
+      "bytes": 220444,
+      "server_logs": 0,
+      "server_log_bytes": 0,
+      "server_log_xz_bytes": 0,
+      "started_utc": "2026-10-30T16:14:04Z",
+      "arms_started": 2,
+      "qfn_restored": true,
+      "left_out": [
+        {
+          "path": "all-t40-f-M16-H-p256-m98304-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds1-Dkt-Db2-Dv24-Pmr-Df-Vp-Ucode256.server.log",
+          "bytes": 104707,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        },
+        {
+          "path": "all-t40-f-M16-H-p256-m98304-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Vp-Ss-Pu-Is-Pi8-Ns7-Fw-Ucode256.server.log",
+          "bytes": 96896,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        }
+      ]
+    },
+    "ab-20261030T164247Z": {
+      "files": 21,
+      "bytes": 358288,
+      "server_logs": 0,
+      "server_log_bytes": 0,
+      "server_log_xz_bytes": 0,
+      "started_utc": "2026-10-30T16:42:58Z",
+      "arms_started": 4,
+      "qfn_restored": true,
+      "left_out": [
+        {
+          "path": "all-t40-f-M1024-H-p256-m98304-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc1024-Cs-Mb1-Lm4096-Ulong.server.log",
+          "bytes": 97763,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        },
+        {
+          "path": "all-t40-f-M1024-H-p256-m98304-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc1024-Cs-Mb1-Lm8448-Ulong8k.server.log",
+          "bytes": 96525,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        },
+        {
+          "path": "all-t40-f-M16-H-p256-m98304-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Cs-Mr16-Lm4096.server.log",
+          "bytes": 94494,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        },
+        {
+          "path": "all-t40-f-M16-H-p256-m98304-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Kh-Lm4096-Ulong.server.log",
+          "bytes": 108540,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        },
+        {
+          "path": "all-t40-f-M16-H-p256-m98304-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Lm4096-Kld.server.log",
+          "bytes": 84009,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        },
+        {
+          "path": "all-t40-f-M16-H-p256-m98304-G-R-B2-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr16-Lc2048-P1-Qw1-Qv64-Cs-Kh-Lm4096-Ulong.server.log",
+          "bytes": 62196,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        },
+        {
+          "path": "all-t40-f-M16-H-p256-m98304-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr16-Lc2048-P1-Cs-Kh-Lm4096-Ulong.server.log",
+          "bytes": 62200,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        },
+        {
+          "path": "all-t40-f-M16-H-p256-m98304-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr16-Lc2048-P1-Cs-Lm4096.server.log",
+          "bytes": 62200,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        },
+        {
+          "path": "all-t40-f-M16-H-p256-m98304-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr16-Lc2048-P1-Cs-Lm8448-Ulong8k.server.log",
+          "bytes": 62205,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        },
+        {
+          "path": "all-t40-f-M16-H-p256-m98304-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr16-Lc2048-P1-Lm4096-Kld.server.log",
+          "bytes": 61337,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        },
+        {
+          "path": "kld-all-t40-f-M16-H-p256-m98304-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Lm4096-Kld/",
+          "bytes": 878806066,
+          "reason": "KLD logit records (binary f16/f32/i32)"
+        }
+      ]
+    },
+    "ab-20261030T171410Z": {
+      "files": 17,
+      "bytes": 419038,
+      "server_logs": 0,
+      "server_log_bytes": 0,
+      "server_log_xz_bytes": 0,
+      "started_utc": "2026-10-30T17:15:03Z",
+      "arms_started": 6,
+      "qfn_restored": true,
+      "left_out": [
+        {
+          "path": "all-t40-f-M16-H-p256-m98304-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Vp-Ss-Pu-Is-Pi8-Ns7-Fw-Pf-N2-C2-Tb.server.log",
+          "bytes": 97233,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        },
+        {
+          "path": "all-t40-f-M16-H-p256-m98304-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Vp-Ss-Pu-Is-Pi8-Ns7-Fw-Pf-N4-C4-Tb-Pmr4.server.log",
+          "bytes": 96522,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        },
+        {
+          "path": "all-t40-f-M16-H-p256-m98304-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Vp-Ss-Pu-Is-Pi8-Ns7-Fw-Pf-N4-C4-Tb.server.log",
+          "bytes": 96365,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        },
+        {
+          "path": "all-t40-f-M16-H-p256-m98304-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Vp-Ss-Pu-Is-Pi8-Ns7-Fw-Pf-N4-C4.server.log",
+          "bytes": 81775,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        },
+        {
+          "path": "all-t40-f-M16-H-p256-m98304-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Vp-Ss-Pu-Is-Pi8-Ns7-Fw-Pf-N8-C8-L1024-Tb.server.log",
+          "bytes": 82782,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        },
+        {
+          "path": "all-t40-f-M16-H-p256-m98304-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Vp-Ss-Pu-Is-Pi8-Ns7-Fw.server.log",
+          "bytes": 94424,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        }
+      ]
+    },
+    "ab-20261030T173032Z": {
+      "files": 14,
+      "bytes": 161308,
+      "server_logs": 0,
+      "server_log_bytes": 0,
+      "server_log_xz_bytes": 0,
+      "started_utc": "2026-10-30T17:30:32Z",
+      "arms_started": 1,
+      "qfn_restored": true,
+      "left_out": [
+        {
+          "path": "all-t40-f-M1024-H-p256-m98304-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc1024-Cs-Mb1-Lm4096-Ulong.server.log",
+          "bytes": 11271,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        },
+        {
+          "path": "all-t40-f-M16-H-p256-m98304-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Kh-Lm4096-Ulong.server.log",
+          "bytes": 108538,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        },
+        {
+          "path": "all-t40-f-M16-H-p256-m98304-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Lm4096-Kld.server.log",
+          "bytes": 84010,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        },
+        {
+          "path": "all-t40-f-M16-H-p256-m98304-G-R-B2-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr16-Lc2048-P1-Qw1-Qv64-Cs-Kh-Lm4096-Ulong.server.log",
+          "bytes": 62262,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        },
+        {
+          "path": "all-t40-f-M16-H-p256-m98304-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr16-Lc2048-P1-Cs-Kh-Lm4096-Ulong.server.log",
+          "bytes": 62263,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        },
+        {
+          "path": "all-t40-f-M16-H-p256-m98304-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr16-Lc2048-P1-Lm4096-Kld.server.log",
+          "bytes": 61400,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        },
+        {
+          "path": "kld-all-t40-f-M16-H-p256-m98304-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Lm4096-Kld/",
+          "bytes": 878806066,
+          "reason": "KLD logit records (binary f16/f32/i32)"
+        }
+      ]
+    },
+    "ab-20261030T175544Z": {
+      "files": 19,
+      "bytes": 576767,
+      "server_logs": 0,
+      "server_log_bytes": 0,
+      "server_log_xz_bytes": 0,
+      "started_utc": "2026-10-30T17:55:44Z",
+      "arms_started": 6,
+      "qfn_restored": true,
+      "left_out": [
+        {
+          "path": "all-t40-f-M16-H-p256-m98304-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds1-Dkt-Db2-Dv24-Pmr-Df-Vp-Dc-Dl-Dx-Dm-Ucode256.server.log",
+          "bytes": 114590,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        },
+        {
+          "path": "all-t40-f-M16-H-p256-m98304-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds1-Dkt-Db2-Dv24-Pmr-Df-Vp-Dc-Dl-Dx-L1024-Pf-N4-C4.server.log",
+          "bytes": 20857,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        },
+        {
+          "path": "all-t40-f-M16-H-p256-m98304-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds1-Dkt-Db2-Dv24-Pmr-Df-Vp-Dc-Dl-Dx-Uchat.server.log",
+          "bytes": 113238,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        },
+        {
+          "path": "all-t40-f-M16-H-p256-m98304-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Ss-Pu-Is-Pi8-Ns7-Fw-Rm7-Ds1-Dkt-Db2-Dv24-Pmr-Df-Vp-Dc-Dl-Dx-Ucode256.server.log",
+          "bytes": 113627,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        },
+        {
+          "path": "all-t40-f-M16-H-p256-m98304-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Vp-Ss-Pu-Is-Pi8-Ns7-Fw-L1024-Pf-N4-C4-Pmr.server.log",
+          "bytes": 88865,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        },
+        {
+          "path": "all-t40-f-M16-H-p256-m98304-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Vp-Ss-Pu-Is-Pi8-Ns7-Fw-Uchat.server.log",
+          "bytes": 96823,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        },
+        {
+          "path": "all-t40-f-M16-H-p256-m98304-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Rb-Vp-Ss-Pu-Is-Pi8-Ns7-Fw-Ucode256.server.log",
+          "bytes": 97130,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        }
+      ]
+    },
+    "ab-20261030T194552Z": {
+      "files": 21,
+      "bytes": 451483,
+      "server_logs": 6,
+      "server_log_bytes": 554529,
+      "server_log_xz_bytes": 93772,
+      "started_utc": "2026-10-30T19:45:52Z",
+      "arms_started": 6,
+      "qfn_restored": true,
+      "left_out": []
+    },
+    "ab-20261030T201710Z": {
+      "files": 25,
+      "bytes": 611970,
+      "server_logs": 10,
+      "server_log_bytes": 969113,
+      "server_log_xz_bytes": 162776,
+      "started_utc": "2026-10-30T20:17:10Z",
+      "arms_started": 8,
+      "qfn_restored": true,
+      "left_out": [
+        {
+          "path": "kld-all-t40-f-M16-H-p210-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr16-Lc2048-P1-Lm4096-Kld/",
+          "bytes": 878806066,
+          "reason": "KLD logit records (binary f16/f32/i32)"
+        },
+        {
+          "path": "kld-all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Lm4096-Kld/",
+          "bytes": 878806066,
+          "reason": "KLD logit records (binary f16/f32/i32)"
+        }
+      ]
+    },
+    "ab-20261030T205440Z": {
+      "files": 20,
+      "bytes": 590782,
+      "server_logs": 7,
+      "server_log_bytes": 663075,
+      "server_log_xz_bytes": 112752,
+      "started_utc": "2026-10-30T20:54:41Z",
+      "arms_started": 7,
+      "qfn_restored": true,
+      "left_out": []
+    },
+    "ab-20261030T213623Z": {
+      "files": 20,
+      "bytes": 679762,
+      "server_logs": 7,
+      "server_log_bytes": 683315,
+      "server_log_xz_bytes": 116860,
+      "started_utc": "2026-10-30T21:36:23Z",
+      "arms_started": 7,
+      "qfn_restored": true,
+      "left_out": []
     }
   }
 }

@@ -3,6 +3,7 @@
 
 #include "ds41_host_experts.h"
 #include "format/radfile.h"
+#include "planner.h"
 
 #include <climits>
 #include <cstdio>
@@ -80,11 +81,18 @@ void vram_pack_eligible(const Program& prog, const RadFile& file, const VramPack
     if (why && !vp_ops && !other_ops) *why = "no moe_gemm_ggml op reads a weight table";
 
     /* Weights the gemv_vp tables read that are still refused, by reason, for the startup log. */
-    int64_t read = 0, not_trunk = 0, not_planes = 0, not_whole = 0, not_smaller = 0;
+    int64_t read = 0, not_trunk = 0, not_planes = 0, not_whole = 0, not_smaller = 0, in_bank = 0;
     for (size_t w = 1; w < prog.weights.size(); ++w) {
         if (state[w] != 1) continue;
-        ++read;
         const WeightInfo& wi = prog.weights[w];
+        /* A DSpark bank's weight (DsparkRadBanks::bind_weights: file_id 1, the draft's) keeps its block
+         * form and its own GEMV path; `file` is the main container, which holds the trunk's. Counted
+         * apart, so the line below reads as it does without a bank. */
+        if (wi.file_id != 0) {
+            ++in_bank;
+            continue;
+        }
+        ++read;
         const int32_t L = wi.decl.group.layer, E = wi.decl.group.expert, S = wi.decl.group.slot;
         /* The trunk's routed experts: gate_up (slot 0) or down (slot 1) of a layer below n_layers, so a
          * draft head's experts (layers past the trunk) are never repacked. */
@@ -131,6 +139,9 @@ void vram_pack_eligible(const Program& prog, const RadFile& file, const VramPack
                     why->empty() ? "" : "; ", (long long)(not_trunk + not_planes + not_whole + not_smaller),
                     (long long)read, (long long)not_trunk, (long long)not_planes, (long long)not_whole,
                     (long long)not_smaller);
+    if (why && in_bank)
+        *why += fmt("%s%lld more weights the gemv_vp tables read are a DSpark bank's (the draft's) and stay "
+                    "block_mxfp4", why->empty() ? "" : "; ", (long long)in_bank);
 }
 
 int vram_pack_scan(const RadFile& file, const VramPackWeight& w, std::vector<uint8_t>* buf) {
@@ -173,6 +184,46 @@ int vram_pack_weight(const uint8_t* codes, const uint8_t* scales, int N, int K, 
     if (!ds41hx::packed_view(dst, (size_t)dst_bytes, N, K, &v) || !ds41hx::packed_scales_equal(v, scales) ||
         std::memcmp(v.codes, codes, (size_t)N * (size_t)(K / 2)) != 0)
         return RAD_E_STATE;
+    return RAD_OK;
+}
+
+int vram_pack_bank_check(const Program& prog, const Plan& plan, VramPackBankReport* out, std::string* why) {
+    *out = VramPackBankReport{};
+    if (why) why->clear();
+    const int64_t trunk = prog.meta.n_layers;
+    auto draft = [&](rad_weight w) {
+        if (w == 0 || (size_t)w >= prog.weights.size()) return false;
+        const WeightInfo& wi = prog.weights[w];
+        return wi.file_id != 0 || (trunk > 0 && wi.decl.group.layer >= trunk);
+    };
+    for (const OpInfo& o : prog.ops) {
+        if (o.op != "moe_gemm_ggml") continue;
+        bool d = false;
+        for (rad_weight w : o.weights) d = d || draft(w);
+        if (!d) continue;
+        ++out->draft_ops;
+        for (const Band& b : o.bands) {
+            const Resolved& r = b.dom[RAD_DOMAIN_DEVICE];
+            if (r && r.row->info && r.row->info->name && !std::strcmp(r.row->info->name, kVramPackRow)) {
+                if (why) *why = fmt("op %d, over the draft's experts, resolved %s at %s", (int)o.index,
+                                    kVramPackRow, b.span.c_str());
+                return RAD_E_STATE;
+            }
+        }
+    }
+    for (size_t w = 1; w < prog.weights.size(); ++w) {
+        const int64_t vb = w < plan.weight.size() ? plan.weight[w].vram_bytes : 0;
+        if (prog.weights[w].file_id == 0) {
+            out->trunk_packed += vb > 0;
+            continue;
+        }
+        ++out->bank_weights;
+        if (w < plan.weight.size() && plan.weight[w].tier == Tier::VRAM) ++out->bank_vram;
+        if (vb > 0) {
+            if (why) *why = fmt("'%s', a DSpark bank's, is planned packed", prog.weights[w].name.c_str());
+            return RAD_E_STATE;
+        }
+    }
     return RAD_OK;
 }
 

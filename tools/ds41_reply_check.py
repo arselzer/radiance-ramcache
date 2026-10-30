@@ -5,8 +5,9 @@
 
 Each file is an ab_requests.py result: `requests`, each with a `name` and the reply `text`. Every
 request of an arm whose name the reference also has must carry the same text, byte for byte.
-Requests the reference lacks are counted apart. Exits 0 only when every arm compared at least one
-request and none differed.
+Requests the reference lacks are counted apart, and an arm with none in common (another prompt set:
+code, chat, long documents) is skipped. Exits 0 only when at least one request was compared and none
+differed.
 
 Example (the README's identity claim):
 
@@ -47,15 +48,19 @@ def main(argv):
             print("skip  %s: not an arm result" % path)
             continue
         common = sorted(set(arm) & set(reference))
+        if not common:
+            print("skip  %s: no request in common with the reference (%d requests)" % (path, len(arm)))
+            continue
         same = sum(1 for name in common if arm[name] == reference[name])
         differ = [name for name in common if arm[name] != reference[name]]
         print("%s  %s: %d of %d replies identical%s%s" % (
-            "ok  " if common and not differ else "FAIL", path, same, len(common),
+            "ok  " if not differ else "FAIL", path, same, len(common),
             "; differ: " + ", ".join(differ) if differ else "",
             "; %d not in the reference" % (len(arm) - len(common)) if len(arm) > len(common) else ""))
-        failed |= bool(differ) or not common
+        failed |= bool(differ)
         total_same += same
         total += len(common)
+    failed |= total == 0
     print("%s: %d of %d compared replies identical to %s" % (
         "FAIL" if failed else "PASS", total_same, total, argv[1]))
     return 1 if failed else 0

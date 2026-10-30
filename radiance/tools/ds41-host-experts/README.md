@@ -66,10 +66,38 @@ RADIANCE_EXPERIMENTAL_DS41_SIDE_STORE=7                    # up to 7 units a ran
 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_FUTEX=1            # pool workers sleep on a futex, woken without a lock
 
 radiance ... --tp 4 --placement expert_tiered --weights-disk-tier \
-  --expert-ram-cache-total-mib 98304 --host-pool-mib 256 --embedding-placement ram \
+  --expert-ram-cache-total-mib 196608 --host-pool-mib 256 --embedding-placement ram \   # 192 GiB on a 256 GB box (98304 on 128 GB)
   --max-num-batched-tokens 1024 --expert-profile <decode profile> \
   --expert-plane-mirror <dir of the checkpoint's model-*.safetensors> \
   --expert-plane-mirror-decode-share 0.13                              # the mirror is optional, see below
+```
+
+**On 256 GB of RAM (8x 32 GB DDR4-2666) with a 192 GiB expert cache** (ab-20261030T194..., replies identical): decode **31.2 tok/s** a stream (19.9 with 96 GiB on 128 GB of DDR4-2133; 20.9 with 96 GiB on the new RAM, so the cache size, not the memory speed, is the gain: rank 0's misses fall 2,073 → 361 on the held-out prompts); **38.7 tok/s in all at 4 streams**; prefill 3,086 tokens in 28.1 s (110 tok/s) and 6,817 in 51.7 s (132 tok/s). 192 and 208 GiB measure the same.
+
+**For single-stream use, add DSpark speculation.** Exact (every draft is verified; replies identical in
+every window). On 256 GB with the 192 GiB cache, against the configuration above with packed VRAM
+residents on both sides (ab-20261030T205440Z): code prompts **+12.5%** (29.79 vs 26.48 tok/s, 16 coding
+tasks), held-out prompts **+9.3%** (34.15 vs 31.24), chat +1.2% (26.92 vs 26.60). On 128 GB it won only
+on code (+9.2%; held-out a tie, chat -1.3%): there the experts the drafter displaces from VRAM fell to the
+drive, while the bigger cache keeps them in RAM. The draft bank needs a single sequence (the server
+refuses it beside concurrent requests), so leave it off where several requests decode at once: plain
+decode gives 38.7 tok/s in total at 4 streams and 42.2 at 8 (ab-20261030T205440Z). Verifying two
+drafted tokens a step (`RADIANCE_EXPERIMENTAL_DS41_DSPARK_VERIFY_CAP=2`) adds 3.3% on code (30.73 vs
+29.75 tok/s, 80% of second drafts accepted) but loses 12% on chat (43%); three lose on both
+(ab-20261030T213623Z). Each verified row costs ~21 ms a step, the RAM reads of its experts, so keep 1
+unless the load is code alone.
+```
+RADIANCE_EXPERIMENTAL_DS41_DSPARK_RAD_BANK=1                # the 3-stage DSpark drafter from its bank
+RADIANCE_EXPERIMENTAL_DS41_DSPARK_VERIFY_CAP=1              # one drafted token a step
+RADIANCE_EXPERIMENTAL_DS41_DSPARK_SHORT_BLOCK=2             # 2-row query block (with --draft-short-from 1)
+RADIANCE_EXPERIMENTAL_DS41_DRAFT_GEMV=2                     # draft expert GEMVs on the live tail
+RADIANCE_EXPERIMENTAL_DS41_DRAFT_VRAM=24                    # 24 hot draft experts a stage and card in VRAM, router masked
+RADIANCE_EXPERIMENTAL_DS41_DRAFT_HOTSET=<hot set file>      # draft_hotset.py write (ranked from an --expert-stats capture)
+RADIANCE_EXPERIMENTAL_DS41_DSPARK_FP8=1                     # the drafter's dense linears from E4M3 codes
+RADIANCE_EXPERIMENTAL_DS41_PREFETCH_MULTIROW=6              # read-ahead in 2-row verify passes too
+
+radiance ... (as above) --draft-bank <draft.rad> --draft-bank-expert-placement host \
+  --num-speculative-tokens 5 --spec-ngram 0 --draft-short-from 1 --expert-plane-mirror-min-rows 7
 ```
 
 With the planner's routed-only staging reserve (`bba1fda6`) the pinned pool needs only 256 MiB a rank,

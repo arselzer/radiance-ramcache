@@ -2,7 +2,7 @@
   "scope": "DeepSeek-V4.1-Flash (ds41) CPU-expert research checkpoint: exact engine source, reports and A/B window evidence; no model payload, research binaries, private serving configuration, credentials or deployment",
   "engine_repo": "/home/as/radiance-ds41-claude",
   "engine_branch": "claude/ds41-decode-impl",
-  "engine_commit": "4ec552dfc747bf09300d151aad32d7fdc404e49b",
+  "engine_commit": "7bfa66ad3e982ba374307d62458897de1b25a4b4",
   "engine_upstream": {
     "repository": "https://codeberg.org/StillDeadcode/radiance",
     "note": "Radiance upstream plus the deepseek41 architecture work of its pull request 266; the commits after them are this work (ds41 RAM cache and CPU experts)",
@@ -39,7 +39,9 @@
     "PREFILL-CRITIQUE.md",
     "PREFILL-ENGINE-SURVEY.md",
     "PREFILL-REPLAY.md",
-    "PREFILL-200-DESIGN.md"
+    "PREFILL-200-DESIGN.md",
+    "PHASE1-PLAN.md",
+    "PREFILL-P0.md"
   ],
   "research": [
     "ds41_supply_model.py",
@@ -54,7 +56,10 @@
     "mrbench.cpp",
     "mtp_windows.py",
     "mtp_windows.out.txt",
-    "cache_sim2.py"
+    "cache_sim2.py",
+    "membw_dur.cpp",
+    "membw_dur.bwmix.sh",
+    "membw_dur.bwmix.out.txt"
   ],
   "docs_left_out": {
     "READAHEAD-PLAN-EXCERPT.md": "scratch: a verbatim excerpt of RESEARCH-2-RANKED-PLAN.md section #5, used as an agent prompt",
@@ -154,7 +159,18 @@
     "ab-20261030T105535Z",
     "ab-20261030T124207Z",
     "ab-20261030T134728Z",
-    "ab-20261030T144409Z"
+    "ab-20261030T144409Z",
+    "ab-20261030T151840Z",
+    "ab-20261030T154217Z",
+    "ab-20261030T160056Z",
+    "ab-20261030T164247Z",
+    "ab-20261030T171410Z",
+    "ab-20261030T173032Z",
+    "ab-20261030T175544Z",
+    "ab-20261030T194552Z",
+    "ab-20261030T201710Z",
+    "ab-20261030T205440Z",
+    "ab-20261030T213623Z"
   ],
   "server_log_windows": {
     "ab-20261028T223812Z": "base engine decode, 5.03 tok/s",
@@ -163,11 +179,16 @@
     "ab-20261029T220909Z": "3,086-token prefill, 99.3 s without and 63.1 s with the consumer skip and 16-row CPU jobs",
     "ab-20261029T200958Z": "the consumer skip's exactness: per-rank prefill hashes and the 32-token byte gate",
     "ab-20261029T232708Z": "prefix-cache follow-up turns, 97.6-102.3 s cold and 0.42-2.75 s cached",
-    "ab-20261029T153750Z": "four concurrent requests, 20.0 / 20.2 tok/s aggregate decode"
+    "ab-20261029T153750Z": "four concurrent requests, 20.0 / 20.2 tok/s aggregate decode",
+    "ab-20261030T194552Z": "decode after the RAM upgrade (31.2 tok/s, 4 streams)",
+    "ab-20261030T201710Z": "Phase 1 prefill exactness and speed",
+    "ab-20261030T205440Z": "DSpark and 8 streams at 192 GiB",
+    "ab-20261030T213623Z": "DSpark verify depth"
   },
   "allowed_emails": [
     "aselzer3@gmail.com",
-    "noreply@anthropic.com"
+    "noreply@anthropic.com",
+    "n@pytest.mark.parametrize"
   ],
   "private_hostnames": [],
   "quiet_box": {

@@ -14,12 +14,12 @@
  *                                                      has them, raw rounds anywhere, e8m0 edges, and the
  *                                                      research sample's real scales when its directory is
  *                                                      there (DS41_HX_SAMPLE or the default). Every value of
- *                                                      every row must be the plain row's bits; a damaged
- *                                                      header must give NaN rows. Exit 0 on PASS. `tail`:
- *                                                      both rows with the live-tail ranges on
- *                                                      (RADIANCE_EXPERIMENTAL_DS41_LIVE_TAIL=1, otherwise
- *                                                      off, as the A/B runs), every call at their geometry,
- *                                                      and the dropped slots' rows must be zeros in both.
+ *                                                      every row must be the plain row's bits, the dropped
+ *                                                      slots' rows zeros in both; a damaged header must give
+ *                                                      NaN rows. Exit 0 on PASS. `tail`: both rows with the
+ *                                                      live-tail ranges on (RADIANCE_EXPERIMENTAL_DS41_LIVE_
+ *                                                      TAIL=1, otherwise off, as the A/B runs), every call at
+ *                                                      their geometry.
  *   ds41_vpack_device_check LIBR4D.so time              decode GEMV time a call, plain over block_mxfp4,
  *                                                      gemv_vp over packed and gemv_vp over block_mxfp4 (a
  *                                                      table of unmarked entries: what the new kernel costs
@@ -415,13 +415,13 @@ int check(const Lib& lib, int trials, bool tail) {
                 y2.get(b.data());
                 for (int i = 0; i < r.T; ++i) {
                     if (r.sorted[(size_t)i] < 0) {
-                        /* A dropped slot (another rank's expert): written by neither row without the live-tail
-                         * ranges, so not compared; with them, zeroed by both (mx_tail_zero). */
-                        if (tail)
-                            for (int n = 0; n < N; ++n) {
-                                ++dropped;
-                                dropped_bad += a[(size_t)i * N + n] != 0 || b[(size_t)i * N + n] != 0;
-                            }
+                        /* A dropped slot (another rank's expert): zeros in both rows -- the rank's last expert's
+                         * (mx_range gives it the slots past the routed rows; gemv_vp's kVpZero stores them without
+                         * a pass) or, with the live-tail ranges, mx_tail_zero's. */
+                        for (int n = 0; n < N; ++n) {
+                            ++dropped;
+                            dropped_bad += a[(size_t)i * N + n] != 0 || b[(size_t)i * N + n] != 0;
+                        }
                         continue;
                     }
                     const bool dmg =
@@ -449,10 +449,9 @@ int check(const Lib& lib, int trials, bool tail) {
                     kdiffer[k]);
     std::printf("%zu calls, %zu values compared: %zu differ; damaged headers: %zu values NaN, %zu not\n", calls,
                 values, differ, nan_ok, nan_bad);
-    if (tail)
-        std::printf("live-tail ranges on: %zu dropped slots' values, %zu not zero in both rows\n", dropped,
-                    dropped_bad);
-    const bool ok = !differ && !nan_bad && values > 0 && !dropped_bad && (!tail || dropped > 0);
+    std::printf("%s: %zu dropped slots' values, %zu not zero in both rows\n",
+                tail ? "live-tail ranges on" : "dropped slots", dropped, dropped_bad);
+    const bool ok = !differ && !nan_bad && values > 0 && !dropped_bad && dropped > 0;
     if (ok)
         std::printf("PASS: gemv_vp over packed experts is bit-identical to the plain row over block_mxfp4%s\n",
                     tail ? " (live-tail ranges on)" : "");

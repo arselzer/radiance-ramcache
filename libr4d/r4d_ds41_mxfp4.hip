@@ -34,8 +34,10 @@
  * bit 0. Each packed block is widened back to its e8m0 byte and decoded by the block path's arithmetic, value
  * for value in the same order, so its outputs are the block row's bit for bit; an unmarked entry is read as
  * block_mxfp4 exactly as the plain row reads it. Its kernel is mx_vp2_kernel ("gemv_vp's kernel (vp2)" below:
- * a pass's loads issued together, a row's blocks in one pass, the scales' raw rounds found on the scalar unit),
- * faster than the plain row's own; RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED_KERNEL=old keeps the first form.
+ * a pass's loads issued together, a row's blocks in one pass decoded by one rolled loop, the scales' raw rounds
+ * found and read on the scalar unit, a pass of dropped slots storing its zeros alone), faster a call than the
+ * plain row's own over packed and over block_mxfp4 entries alike; RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED_KERNEL
+ * keeps the earlier kernels selectable (old: the first form; r2, r2cf: earlier vp2 forms).
  *
  * Design after r4d_ds41_ggml.hip's qk32 rows (this unit is MXFP4's own so the two can change apart).
  */
@@ -687,13 +689,11 @@ __global__ __launch_bounds__(kMxThreads) void mx_gemv_kernel(MxGemvArgs A) {
  *     add a value: its base is a link-time constant the load's offset field cannot hold);
  *   - the wave index, the expert, its range and its weight's address sit in scalar registers; the live
  *     scan issues its offset loads together and keeps each live expert's range in LDS;
- *   - the activation row's token through the scalar unit and its chunks loaded before any is stored;
- *   - built for 10 waves a SIMD (R4D_WAVES; 144 VGPRs, where it would take 180 for gate_up), so five blocks fit
- *     a WGP beside their LDS (24 KB at gate_up) and the 144 work items of a one-expert gate_up are all resident
- *     at once instead of 128 and then 16, and launched as 160 blocks (32 WGPs x 5) so two or three experts' row
- *     groups go in one round too (more row groups a block, not a second round of blocks).
- * Two weight rows a wave (four measured slower: 236-255 VGPRs). RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED_KERNEL
- * keeps the first form selectable for an A/B (mx_vp_pick). */
+ *   - the activation row's token through the scalar unit and its chunks loaded before any is stored.
+ * Two weight rows a wave (four measured slower: 236-255 VGPRs), the compiler's own register budget (a target of
+ * 10 waves a SIMD measured slower). Its forms (kVpSraw, kVpRoll, kVpZero, below) change how a pass is
+ * decoded, never what; RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED_KERNEL keeps the first form and the first vp2 form
+ * selectable for an A/B (mx_vp_pick). */
 typedef __attribute__((address_space(4))) const uint32_t* mx_cu32;
 /* A dword every lane reads at the same 4-aligned address, through the scalar unit. */
 __device__ __forceinline__ uint32_t mx_s32(const void* p) { return *(mx_cu32)p; }
@@ -780,11 +780,15 @@ __device__ __forceinline__ uint32_t mx_vp2_raw(const MxPk2& v, uint32_t g, int* 
  *            own loads alone (a raw byte loaded into a block's register makes every block wait for every load);
  *   kVpRoll  the pass's blocks decoded by one rolled loop, each from the front of the loaded words (which then
  *            move up one place), so the code a pass runs is one block's decode instead of UF copies of it;
- *   kVpPipe  (with kVpSraw, at one token row a pass whose weight rows are one pass each) the next row group's
- *            loads issued before this one's decode, so a wave's round trips run under its own arithmetic
- *            (mx_vp2_pipe).
- * Every form reads the same words and does the same arithmetic in the same order. */
-enum : int { kVpSraw = 1, kVpRoll = 2, kVpPipe = 4 };
+ *   kVpZero  a pass whose rows are all dropped slots (rows routed to other ranks, which mx_range gives the
+ *            rank's last expert: five of a decode call's six passes) stores its zeros and nothing else -- every
+ *            form stores 0.0f for a dropped slot whatever its sums are, so its loads, staging and arithmetic
+ *            change no bit.
+ * Every form gives the same bits; kVpSraw and kVpRoll read the same words and do the same arithmetic in the same
+ * order as the first form. (Measured and dropped: each block's words read in place through M0-relative moves
+ * instead of moved up, and packed values two at a time from a 256-entry pair table -- fewer VALU operations,
+ * but slower a call: more registers and a full wait, and LDS bank conflicts on the table.) */
+enum : int { kVpSraw = 1, kVpRoll = 2, kVpZero = 4 };
 
 /* Lane `lane`'s byte of the 32 at p (4-aligned, the same for the whole wave), through the scalar unit. */
 __device__ __forceinline__ uint32_t mx_s_lane_byte(const uint8_t* p, int lane) {
@@ -1073,97 +1077,6 @@ __device__ __forceinline__ void mx_vp2_row(const MxGemvArgs& A, const uint8_t* w
     }
 }
 
-/* kVpPipe: the item's row groups rg0 .. rg1 - 1 of a pass of one token row (p0) whose weight rows are one pass
- * each (UK <= 32 UF; whole rows staged): each row group's sums as mx_vp2_row's, but the next row group's loads
- * are issued before this one's decode (the last row group loads itself again, from the caches), so a wave's
- * round trips run under its own arithmetic. Rows past N read row N - 1 and are never stored; a wave with no
- * rows in a group loads and skips it. The stores are mx_vp2_body's (`live`: the pass's row is not dropped). */
-template <bool PK, int RPW, int UF, int FL>
-__device__ __forceinline__ void mx_vp2_pipe(const MxGemvArgs& A, const uint8_t* wb, const MxPk2& v, const float* xs,
-                                            int UK, int rg0, int rg1, int wave, int lane, const float* tab, int p0,
-                                            bool live) {
-    static_assert((FL & kVpSraw) != 0, "kVpPipe reads the raw rounds' bytes through the scalar unit");
-    constexpr bool ROLL = (FL & kVpRoll) != 0;
-    constexpr int RG = kMxWaves * RPW;
-    [[maybe_unused]] const int fb = lane & 7, fs = 2 * (lane >> 3);
-    [[maybe_unused]] int pb = 0, ps = 0;
-    if constexpr (PK) {
-        pb = v.tbl ? lane % v.tbl : 0;
-        ps = v.tbl ? 2 * (lane / v.tbl) : 0;
-    }
-    uint32_t ra[UF][RPW][5], rb[UF][RPW][5];
-    {
-        int nr[RPW];
-#pragma unroll
-        for (int r = 0; r < RPW; ++r) nr[r] = min(rg0 * RG + wave * RPW + r, A.N - 1);
-        mx_vp2_load<PK, RPW, UF>(A, wb, v, nr, lane, UK, 0, fb, pb, ra);
-    }
-    for (int rg = rg0; rg < rg1; ++rg) {
-        {
-            const int rn = rg + 1 < rg1 ? rg + 1 : rg;
-            int nr[RPW];
-#pragma unroll
-            for (int r = 0; r < RPW; ++r) nr[r] = min(rn * RG + wave * RPW + r, A.N - 1);
-            mx_vp2_load<PK, RPW, UF>(A, wb, v, nr, lane, UK, 0, fb, pb, rb);
-        }
-        /* rb's loads stay in flight under ra's decode. */
-        sched_barrier();
-        const int n0 = rg * RG + wave * RPW;
-        if (n0 < A.N) {   /* wave-uniform */
-            int nr[RPW];
-#pragma unroll
-            for (int r = 0; r < RPW; ++r) nr[r] = min(n0 + r, A.N - 1);
-            uint32_t rawm[RPW];
-            int first[RPW];
-#pragma unroll
-            for (int r = 0; r < RPW; ++r) {
-                rawm[r] = 0;
-                first[r] = 0;
-            }
-            if constexpr (PK) {
-                if (v.n_exc > 0) mx_vp2_raw_rows<RPW, UF>(v, nr, 0, rawm, first);
-            }
-            float acc[RPW][1];
-#pragma unroll
-            for (int r = 0; r < RPW; ++r) acc[r][0] = 0.0f;
-            if constexpr (!ROLL) {
-                mx_for<UF>([&](auto fi) {
-                    constexpr int F = decltype(fi)::value;
-                    mx_vp2_block<PK, true, RPW, 1>(A, wb, v, ra[F], nr, F, lane, UK, 0, 0, rawm, first, fs, ps, xs,
-                                                   A.XR, 1, lane, tab, acc);
-                });
-            } else {
-#pragma unroll 1
-                for (int F = 0; F < UF; ++F) {
-                    mx_vp2_block<PK, true, RPW, 1>(A, wb, v, ra[0], nr, F, lane, UK, 0, 0, rawm, first, fs, ps, xs,
-                                                   A.XR, 1, lane, tab, acc);
-#pragma unroll
-                    for (int f = 0; f + 1 < UF; ++f)
-#pragma unroll
-                        for (int r = 0; r < RPW; ++r)
-#pragma unroll
-                            for (int i = 0; i < 5; ++i) ra[f][r][i] = ra[f + 1][r][i];
-                }
-            }
-#pragma unroll
-            for (int r = 0; r < RPW; ++r) {
-                const int n = n0 + r;
-                if (n >= A.N) continue;
-                const float s = r4d_wave_sum(acc[r][0]);
-                if (lane == 0) mx_put(A.y + (long long)p0 * A.y_ld + n, live ? s : 0.0f);
-            }
-        }
-        /* The next row group's words become this one's once they are in (its wait is here, after the decode). */
-        sched_barrier();
-#pragma unroll
-        for (int f = 0; f < UF; ++f)
-#pragma unroll
-            for (int r = 0; r < RPW; ++r)
-#pragma unroll
-                for (int i = 0; i < 5; ++i) ra[f][r][i] = rb[f][r][i];
-    }
-}
-
 /* One weight's rows: a marked entry its packed rows, or NaN sums when its header is not a packed [N, K]
  * weight's (as mx_row_vp); any other entry block_mxfp4. */
 template <int RPW, int MC, int UF, int FL>
@@ -1302,6 +1215,23 @@ __device__ __forceinline__ void mx_vp2_body(const MxGemvArgs& A) {
         for (int p0 = rs; p0 < re; p0 += step) {
             const int mc = min(step, re - p0);
             const bool whole = mc <= A.XLM;            /* block-uniform */
+            /* The pass's live rows (a dropped slot writes zeros). */
+            uint32_t livem = 0;
+            if constexpr ((FL & kVpZero) != 0) {
+                for (int m = 0; m < mc; ++m)
+                    if (mx_vp2_tok(A, p0 + m) >= 0) livem |= 1u << m;
+                if (livem == 0) {   /* block-uniform: only dropped slots, whose rows are zeros in every form */
+                    for (int rg = rg0; rg < rg1; ++rg) {
+                        const int n0 = rg * RG + wave * RPW;
+                        if (lane == 0)
+                            for (int r = 0; r < RPW; ++r)
+                                if (n0 + r < A.N)
+                                    for (int m = 0; m < mc; ++m)
+                                        mx_put(A.y + (long long)(p0 + m) * A.y_ld + n0 + r, 0.0f);
+                    }
+                    continue;
+                }
+            }
             if (whole && (cur_e != e || cur_p != p0)) {
                 lds_barrier();
                 mx_vp2_stage<MC>(A, xs, p0, mc, 0, A.K, A.XR, tid);
@@ -1309,16 +1239,9 @@ __device__ __forceinline__ void mx_vp2_body(const MxGemvArgs& A) {
                 cur_e = e;
                 cur_p = p0;
             }
-            /* The pass's live rows (a dropped slot writes zeros). */
-            uint32_t livem = 0;
-            for (int m = 0; m < mc; ++m)
-                if (mx_vp2_tok(A, p0 + m) >= 0) livem |= 1u << m;
-            if constexpr (MC == 1 && (FL & kVpPipe) != 0) {
-                if (whole && UK <= 32 * UF && (!pk || pv.ok)) {   /* block-uniform */
-                    if (pk) mx_vp2_pipe<true, RPW, UF, FL>(A, wb, pv, xs, UK, rg0, rg1, wave, lane, tab, p0, livem & 1u);
-                    else mx_vp2_pipe<false, RPW, UF, FL>(A, wb, pv, xs, UK, rg0, rg1, wave, lane, tab, p0, livem & 1u);
-                    continue;
-                }
+            if constexpr ((FL & kVpZero) == 0) {
+                for (int m = 0; m < mc; ++m)
+                    if (mx_vp2_tok(A, p0 + m) >= 0) livem |= 1u << m;
             }
             for (int rg = rg0; rg < rg1; ++rg) {
                 const int n0 = rg * RG + wave * RPW;
@@ -1361,14 +1284,9 @@ __device__ __forceinline__ void mx_vp2_body(const MxGemvArgs& A) {
     }
 }
 
-/* gemv_vp's kernel: the body (in form FL) built for 10 waves a SIMD (at most 144 VGPRs: five blocks a WGP). */
+/* gemv_vp's kernel: the body in form FL, at the compiler's own register budget. */
 template <int RPW, int MC, int UF, int FL>
-__global__ __launch_bounds__(kMxThreads) R4D_WAVES(10) void mx_vp2_kernel(MxGemvArgs A) {
-    mx_vp2_body<RPW, MC, UF, FL>(A);
-}
-/* The same body with no occupancy target (the compiler's own choice: 180 VGPRs at gate_up's shape), for an A/B. */
-template <int RPW, int MC, int UF, int FL>
-__global__ __launch_bounds__(kMxThreads) void mx_vp2_kernel_free(MxGemvArgs A) {
+__global__ __launch_bounds__(kMxThreads) void mx_vp2_kernel(MxGemvArgs A) {
     mx_vp2_body<RPW, MC, UF, FL>(A);
 }
 
@@ -1611,46 +1529,25 @@ int mx_launch_gemv_vp(RadStream s, int rpw, const MxGemvArgs& A, unsigned grid, 
     return R4D_EMIT(s, (mx_gemv_kernel<MX_FP4, 1, true, false, true>), dim3(grid), dim3(kMxThreads), lds, A);
 }
 
-/* gemv_vp's kernels: kVpOld the first form (mx_gemv_kernel's VP path); the others mx_vp2_kernel (10 waves a SIMD)
- * or mx_vp2_kernel_free (no occupancy target) in a form (kVpSraw, kVpRoll) on a grid of up to `cap` blocks:
- *   r2   mx_vp2_kernel, the first vp2 form, 160 blocks      r2g  the same on mx_moe's grid (up to 256 blocks)
- *   r2f  mx_vp2_kernel_free, the first vp2 form, 256        r2s  mx_vp2_kernel, kVpSraw, 160
- *   r2c  mx_vp2_kernel, kVpSraw | kVpRoll, 160              r2cf mx_vp2_kernel_free, kVpSraw | kVpRoll, 256
- *   r2p  mx_vp2_kernel_free, kVpSraw | kVpRoll | kVpPipe, 256
- *   r1p  mx_vp2_kernel, one weight row a wave, kVpSraw | kVpRoll | kVpPipe, 160
- * kVpDefault is kVpDefaultIs. RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED_KERNEL=<name> picks one for every call of the
- * process (read once, said once on stderr); the checker export r4d_rad_moe_gemm_mxfp4_gemv_vp_variant picks one a
- * call. Every one gives the plain row's bits. The forms other than the first exist at one token row a pass (the
- * decode); a pass of more rows takes the first form's kernel of the same occupancy. */
-enum : int { kVpDefault = 0, kVpOld = 1, kVpTwo = 2, kVpTwoG = 3, kVpTwoF = 4, kVpTwoS = 5, kVpTwoC = 6,
-             kVpTwoCF = 7, kVpTwoP = 8, kVpOneP = 9, kVpN = 10 };
-constexpr int kVpDefaultIs = kVpTwo;
-const char* const kVpName[kVpN] = { "default", "old", "r2", "r2g", "r2f", "r2s", "r2c", "r2cf", "r2p", "r1p" };
-/* Each variant's kernel: its form, free of the occupancy target or not, and its grid's cap. 160 blocks is 32
- * WGPs x five, all resident at once at 10 waves a SIMD (gate_up's 24 KB of LDS also allows five). The kernel
- * spreads the live experts' row groups over whatever grid it gets, so the grid changes the speed, never the
- * bits. */
-struct MxVpForm {
-    int fl;
-    bool free;
-    unsigned cap;
-    int rpw;   /* weight rows a wave at one token row a pass */
-};
-constexpr int kVpSRP = kVpSraw | kVpRoll | kVpPipe;
-constexpr MxVpForm kVpForm[kVpN] = { { 0, false, 160, 2 },          { 0, false, 0, 2 },
-                                     { 0, false, 160, 2 },          { 0, false, 256, 2 },
-                                     { 0, true, 256, 2 },           { kVpSraw, false, 160, 2 },
-                                     { kVpSraw | kVpRoll, false, 160, 2 }, { kVpSraw | kVpRoll, true, 256, 2 },
-                                     { kVpSRP, true, 256, 2 },      { kVpSRP, false, 160, 1 } };
+/* gemv_vp's kernels: kVpOld the first form (mx_gemv_kernel's VP path); the others mx_vp2_kernel in a form, on a grid
+ * of up to 256 blocks (mx_moe's):
+ *   r2    the first vp2 form (each block's decode unrolled)       r2cf  kVpSraw | kVpRoll
+ *   r2cz  kVpSraw | kVpRoll | kVpZero, the default
+ * RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED_KERNEL=<name> picks one for every call of the process (read once, said once
+ * on stderr); the checker export r4d_rad_moe_gemm_mxfp4_gemv_vp_variant picks one a call. Every one gives the plain
+ * row's bits. kVpSraw and kVpRoll exist at one token row a pass (the decode, and gate_up's passes at any height:
+ * one row of K 5120 fits the LDS); a pass of more rows takes the first form, with the variant's kVpZero. */
+enum : int { kVpDefault = 0, kVpOld = 1, kVpTwo = 2, kVpTwoCF = 3, kVpTwoCZ = 4, kVpN = 5 };
+constexpr int kVpDefaultIs = kVpTwoCZ;
+const char* const kVpName[kVpN] = { "default", "old", "r2", "r2cf", "r2cz" };
+/* Each variant's form (kVpForm[kVpDefault] is unused: the default runs kVpDefaultIs). The kernel spreads the live
+ * experts' row groups over whatever grid it gets, so the grid changes the speed, never the bits. */
+constexpr int kVpForm[kVpN] = { kVpSraw | kVpRoll | kVpZero, 0, 0, kVpSraw | kVpRoll, kVpSraw | kVpRoll | kVpZero };
 const char* const kVpWhat[kVpN] = {
     "its default kernel", "its first kernel (mx_gemv_kernel's packed path)",
-    "mx_vp2_kernel (10 waves a SIMD) on 160 blocks", "mx_vp2_kernel (10 waves a SIMD) on the plain row's grid",
-    "mx_vp2_kernel_free (no occupancy target) on the plain row's grid",
-    "mx_vp2_kernel with the raw rounds' bytes through the scalar unit, on 160 blocks",
-    "mx_vp2_kernel with the scalar raw bytes and one rolled block loop, on 160 blocks",
-    "mx_vp2_kernel_free with the scalar raw bytes and one rolled block loop, on the plain row's grid",
-    "mx_vp2_kernel_free, scalar raw bytes, rolled, the next row group's loads under this one's decode, 256 blocks",
-    "mx_vp2_kernel, one weight row a wave, scalar raw bytes, rolled, pipelined row groups, 160 blocks" };
+    "mx_vp2_kernel, each block's decode unrolled",
+    "mx_vp2_kernel, the raw rounds' bytes through the scalar unit and one rolled block loop",
+    "mx_vp2_kernel, the same, with a pass of dropped slots alone storing its zeros and nothing else" };
 int mx_vp_env() {
     static const int k = [] {
         const char* p = std::getenv("RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED_KERNEL");
@@ -1675,54 +1572,41 @@ int mx_vp_pick(int var) {
     return v == kVpDefault ? kVpDefaultIs : v;
 }
 
-/* mx_vp2_kernel (or _free) in form FL at MC >= the pass height (mcx) and UF blocks a lane a pass (uf: 5 when a
- * row pass is more than three rounds, else 3), RPW weight rows a wave at one token row; passes of more than one
- * row take form 0 at two rows a wave. */
-template <bool FREE, int FL, int RPW = 2>
+/* mx_vp2_kernel in form FL at MC >= the pass height (mcx) and UF blocks a lane a pass (uf: 5 when a row pass is
+ * more than three rounds, else 3), two weight rows a wave; passes of more than one row take the first form, with
+ * FL's kVpZero (FM). */
+template <int FL>
 int mx_launch_vp2_t(RadStream s, int mcx, int uf, const MxGemvArgs& A, unsigned grid, unsigned lds) {
-    if constexpr (FREE) {
-        if (mcx <= 1) {
-            if (uf >= 5) return R4D_EMIT(s, (mx_vp2_kernel_free<RPW, 1, 5, FL>), dim3(grid), dim3(kMxThreads), lds, A);
-            return R4D_EMIT(s, (mx_vp2_kernel_free<RPW, 1, 3, FL>), dim3(grid), dim3(kMxThreads), lds, A);
-        }
-        if (mcx <= 4) return R4D_EMIT(s, (mx_vp2_kernel_free<2, 4, 3, 0>), dim3(grid), dim3(kMxThreads), lds, A);
-        return R4D_EMIT(s, (mx_vp2_kernel_free<2, 8, 3, 0>), dim3(grid), dim3(kMxThreads), lds, A);
-    } else {
-        if (mcx <= 1) {
-            if (uf >= 5) return R4D_EMIT(s, (mx_vp2_kernel<RPW, 1, 5, FL>), dim3(grid), dim3(kMxThreads), lds, A);
-            return R4D_EMIT(s, (mx_vp2_kernel<RPW, 1, 3, FL>), dim3(grid), dim3(kMxThreads), lds, A);
-        }
-        if (mcx <= 4) return R4D_EMIT(s, (mx_vp2_kernel<2, 4, 3, 0>), dim3(grid), dim3(kMxThreads), lds, A);
-        return R4D_EMIT(s, (mx_vp2_kernel<2, 8, 3, 0>), dim3(grid), dim3(kMxThreads), lds, A);
+    constexpr int FM = FL & kVpZero;
+    if (mcx <= 1) {
+        if (uf >= 5) return R4D_EMIT(s, (mx_vp2_kernel<2, 1, 5, FL>), dim3(grid), dim3(kMxThreads), lds, A);
+        return R4D_EMIT(s, (mx_vp2_kernel<2, 1, 3, FL>), dim3(grid), dim3(kMxThreads), lds, A);
     }
+    if (mcx <= 4) return R4D_EMIT(s, (mx_vp2_kernel<2, 4, 3, FM>), dim3(grid), dim3(kMxThreads), lds, A);
+    return R4D_EMIT(s, (mx_vp2_kernel<2, 8, 3, FM>), dim3(grid), dim3(kMxThreads), lds, A);
 }
 /* gemv_vp's launch for the kernel `var` (mx_vp_pick's): `A`, `rpw`, `grid` and `lds` as mx_moe sized them for
- * the plain kernel; mx_vp2_kernel takes its own row groups, grid and dynamic LDS (three words a live expert, then
- * the staged rows: `xbuf` floats; its table and live count are static LDS). */
+ * the plain kernel; mx_vp2_kernel takes its own row groups and dynamic LDS (three words a live expert, then the
+ * staged rows: `xbuf` floats; its tables and live count are static LDS). */
 int mx_launch_vp(RadStream s, int var, int rpw, const MxGemvArgs& A, unsigned grid, unsigned lds, long long L,
                  long long xbuf) {
     if (var == kVpOld) return mx_launch_gemv_vp(s, rpw, A, grid, lds);
-    const MxVpForm f = kVpForm[var];
     MxGemvArgs B = A;
     B.live_off = kMxVp2Live;
     B.x_off = (int)(kMxVp2Live + mx_r16(12LL * A.n_expert));
     const long long lds2 = B.x_off + xbuf * 4;
     const long long nrg = ((long long)A.N + 15) / 16;
     const long long items = L * nrg;
-    const unsigned grid2 = (unsigned)(items < (long long)f.cap ? items : (long long)f.cap);
+    const unsigned grid2 = (unsigned)(items < 256 ? items : 256);
     const int mcx = !A.one_pass && A.XLM >= 1 && A.XLM < A.XM ? A.XLM : A.XM;
     const long long ub = A.XLM >= 1 ? A.K / 32 : A.KC / 32;   /* blocks of a row pass (whole, or a chunk) */
     const int uf = ub > 96 ? 5 : 3;
     const unsigned l2 = (unsigned)lds2;
-    if (f.free) {
-        if (f.fl == kVpSRP) return mx_launch_vp2_t<true, kVpSRP>(s, mcx, uf, B, grid2, l2);
-        if (f.fl == (kVpSraw | kVpRoll)) return mx_launch_vp2_t<true, kVpSraw | kVpRoll>(s, mcx, uf, B, grid2, l2);
-        return mx_launch_vp2_t<true, 0>(s, mcx, uf, B, grid2, l2);
+    switch (kVpForm[var]) {
+    case kVpSraw | kVpRoll: return mx_launch_vp2_t<kVpSraw | kVpRoll>(s, mcx, uf, B, grid2, l2);
+    case kVpSraw | kVpRoll | kVpZero: return mx_launch_vp2_t<kVpSraw | kVpRoll | kVpZero>(s, mcx, uf, B, grid2, l2);
+    default: return mx_launch_vp2_t<0>(s, mcx, uf, B, grid2, l2);
     }
-    if (f.fl == kVpSRP) return mx_launch_vp2_t<false, kVpSRP, 1>(s, mcx, uf, B, grid2, l2);
-    if (f.fl == kVpSraw) return mx_launch_vp2_t<false, kVpSraw>(s, mcx, uf, B, grid2, l2);
-    if (f.fl == (kVpSraw | kVpRoll)) return mx_launch_vp2_t<false, kVpSraw | kVpRoll>(s, mcx, uf, B, grid2, l2);
-    return mx_launch_vp2_t<false, 0>(s, mcx, uf, B, grid2, l2);
 }
 
 int mx_launch_tiled(RadStream s, int ty, int bm, bool moe, const MxTiledArgs& A, dim3 grid, unsigned lds) {

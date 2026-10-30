@@ -298,6 +298,17 @@ public:
         if(rc==Status::Hit)lease->packed_=true;
         return rc;
     }
+    /* borrow_packed without touching the entry: no move to the LRU front, its second chances kept,
+     * the hit counted (borrow_readonly's packed twin). Large-chunk prefill's read-only chunks
+     * (RADIANCE_EXPERIMENTAL_DS41_LCP_ADMIT): a chunk's rows outside the prompt's last tokens leave the
+     * cache's order to the decode that follows. */
+    Status borrow_packed_readonly(size_t key,int klass,Lease* lease) noexcept {
+        if(!lease||!lease->empty()||klass<0||klass>1)return Status::Invalid;
+        if(!packed())return Status::Layout;
+        const auto rc=slab_cache_.borrow_no_touch(1,key,slab_sizes_[size_t(klass)],&lease->slab_);
+        if(rc==Status::Hit)lease->packed_=true;
+        return rc;
+    }
     Status reserve_packed(size_t key,int klass,Write* out) noexcept {
         if(!out||!out->empty()||klass<0||klass>1)return Status::Invalid;
         if(!packed())return Status::Layout;

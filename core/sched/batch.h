@@ -8,6 +8,8 @@
  * tear a block table) and the host can stage several passes ahead of the card.
  */
 #pragma once
+#include <algorithm>
+
 #include "advance.h"
 #include "consumer_skip.h"
 #include "device/device.h"
@@ -76,6 +78,9 @@ struct StepEntry {
      * chunk's end (SchedReq::consumer_ckpts; consumer_skip.h, "complete checkpoints"): the
      * builder runs at least the layers its cone needs; 0 for none. */
     int64_t consumer_ckpt = 0;
+    /* A prefill entry: the position its prompt's prefill ends at (SchedReq::seq_len()), 0 for any
+     * other entry. Large-chunk prefill's admission (RadBatch::lcp_admit_row) counts back from it. */
+    int64_t prompt_end = 0;
 };
 
 struct StepPlan {
@@ -152,13 +157,17 @@ public:
     /* The consumer skip (consumer_skip.h), as the scheduler enabled it: a step whose only entry is
      * a prefill chunk carrying StepEntry::consumer_end gets RadBatch::consumer_full from the
      * declared shape, the chunk's last row and that target. An invalid shape turns it off. */
-    void set_consumer(const ConsumerShape& c);
+    /* `rows`: the per-row cut (consumer_row_starts; the shape is then the 16-row grid's, M = A): a
+     * step carries RadBatch::consumer_row0, each layer's first row. */
+    void set_consumer(const ConsumerShape& c, bool rows = false);
     /* What the cut ran, over the trunk prefill passes of prompts it cut: those passes, the ones
      * cut, the ones that shared their step (run in full), and their layer-passes run in full,
      * key ops alone and skipped. */
     struct ConsumerStats {
         uint64_t passes = 0, cut = 0, shared = 0;
         uint64_t full = 0, key = 0, skipped = 0;
+        /* The per-row cut, over the same passes: layer-rows run in full, key ops alone, skipped. */
+        uint64_t rows_full = 0, rows_key = 0, rows_skipped = 0;
         /* Passes of a cut prompt off the grid the derivation assumes (a start off the quantum, or
          * more rows than the budget): the scheduler makes none, so this stays 0 (a warning names
          * the first). */
@@ -173,6 +182,20 @@ public:
         uint64_t ckpt_cut = 0, ckpt_insured = 0;
     };
     const ConsumerStats& consumer_stats() const { return cs_stats_; }
+    /* Large-chunk prefill (RADIANCE_EXPERIMENTAL_DS41_LCP=C, Scheduler::lcp_init): a step whose only
+     * entry is a pure prefill chunk carries RadBatch::lcp_admit_row, the first of its rows whose units
+     * the RAM cache admits: those within the prompt's last `admit` tokens (0 none, -1 all). Off
+     * (C 0): every step's is 0, the cache's policy as before. */
+    void set_lcp(int64_t C, int64_t admit) {
+        lcp_ = C;
+        lcp_admit_ = admit;
+    }
+    /* RadBatch::lcp_admit_row for a step of one prefill entry `e` (and nothing else beside it). */
+    static int32_t lcp_admit_row_for(int64_t admit, int64_t ctx_len, int64_t n_tokens, int64_t prompt_end) {
+        if (admit < 0 || n_tokens <= 0) return 0;
+        const int64_t first = prompt_end - admit - ctx_len;   /* the chunk's first row in the last `admit` */
+        return (int32_t)std::clamp<int64_t>(first, 0, n_tokens);
+    }
 
     /* An encoder pass (RadBatch::enc): patches of whole segments of one or more media items,
      * staged into every rank's encoder input, since each rank runs the tower itself. Returns rank
@@ -286,6 +309,7 @@ private:
         /* Per rank and group, the RadKVStream a batch names: each rank's own copy, outside the slab. */
         std::vector<std::vector<RadKVStream>>     stream;
         std::vector<RadBatch>                     batch;
+        std::vector<int32_t>                      row0;   /* RadBatch::consumer_row0 (per-row cut) */
     };
 
     struct Derived {
@@ -311,12 +335,15 @@ private:
     /* The consumer skip: the shape, the target `cs_f_` holds the thresholds for (-1: none), and
      * the counters. */
     ConsumerShape cs_{};
-    bool          cs_on_ = false;
+    bool          cs_on_ = false, cs_rows_ = false;
+    int64_t       lcp_ = 0, lcp_admit_ = 128;   /* set_lcp */
     int64_t       cs_end_ = -1;
     std::vector<int64_t> cs_f_;
     /* The thresholds of the checkpoint `cs_ck_` (-1: none) a step's cone is built for. */
     int64_t       cs_ck_ = -1;
     std::vector<int64_t> cs_g_;
+    /* Under the per-row cut, the elementwise least of cs_f_ and cs_g_ (consumer_row_thresholds). */
+    std::vector<int64_t> cs_h_;
     ConsumerStats cs_stats_;
     /* Per KV group, 0 for a non-conv group. This and `h_convslot` only feed DeriveInput for the
      * `conv_state_index` derivation, which no plugin calls at present; conv kernels read

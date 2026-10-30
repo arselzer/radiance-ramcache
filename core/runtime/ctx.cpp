@@ -630,6 +630,15 @@ int Ctx::begin_ep_route_generation() {
     return RAD_OK;
 }
 
+/* The rows a routed layer runs in this step: the step's, or under the per-row consumer cut
+ * (RadBatch::consumer_row0) the suffix from the layer's first row. */
+static int64_t ep_layer_rows(const RadBatch* b, const Program* p, int64_t layer) {
+    if (!b) return 0;
+    if (!b->consumer_row0 || !p || layer < 0 || layer >= p->meta.n_layers) return b->n_tok;
+    const int64_t r0 = b->consumer_row0[layer];
+    return r0 >= 0 && r0 <= b->n_tok ? b->n_tok - r0 : 0;
+}
+
 void Ctx::note_ep_route_producer(const OpInfo& op, const RadTensor* t, int n_t,
                                  int64_t rows, RadStream issued_stream) {
     if (ep_route_.empty() || !batch_ || !staging_ || step_status_ < 0 || !route_dev_ ||
@@ -649,7 +658,7 @@ void Ctx::note_ep_route_producer(const OpInfo& op, const RadTensor* t, int n_t,
             (op.op != "moe_scatter" && op.op != "moe_scatter_inv" &&
              op.op != "router_topk_scatter" && op.op != "router_gemm_topk_scatter")) continue;
         if (lane_ != 0 || issued_stream != stream_ || rows <= 0 || rows > ep_route_max_rows() ||
-            rows != batch_->n_tok || t[i].dtype != RAD_I32 ||
+            rows != ep_layer_rows(batch_, program_, (int64_t)layer) || t[i].dtype != RAD_I32 ||
             !((t[i].rank == 1 && t[i].shape[0] == 96 && t[i].stride[0] == 1) ||
               (t[i].rank == 2 && t[i].shape[0] == 96 && t[i].shape[1] == 1 &&
                t[i].stride[0] == 1 && t[i].stride[1] == 1))) continue;
@@ -674,7 +683,8 @@ bool Ctx::ep_route_counts_live(int layer, EpRouteCounts* out) const {
     if (!out || !batch_ || !staging_ || step_status_ < 0 || layer < 0 ||
         (size_t)layer >= ep_route_.size()) return false;
     const EpRouteCounts& v = ep_route_[(size_t)layer];
-    if (!ep_route_current(v, program_, stream_, ep_route_generation_, layer, batch_->n_tok))
+    if (!ep_route_current(v, program_, stream_, ep_route_generation_, layer,
+                          ep_layer_rows(batch_, program_, layer)))
         return false;
     *out = v;
     return true;
@@ -1008,7 +1018,7 @@ int Ctx::lane_join(int from, int to) {
  * field added to RadBatch changes its size: decide whether the key must read it, then update the
  * size here. `agen_b` and `vgen_b` are set only on generator passes, which are never recorded
  * (below). */
-static_assert(sizeof(void*) != 8 || sizeof(RadBatch) == 376,
+static_assert(sizeof(void*) != 8 || sizeof(RadBatch) == 392,
               "RadBatch changed: check that Ctx::pass_key reads every new field a pass depends on");
 static_assert(sizeof(void*) != 8 || sizeof(RadKVGroupBatch) == 80,
               "RadKVGroupBatch changed: check that Ctx::pass_key reads every new field");
@@ -1044,6 +1054,11 @@ uint64_t Ctx::pass_key(const RadBatch* b) const {
     /* A cut prefill step issues a prefix of the layers (RadBatch::consumer_full); consumer_end
      * changes nothing it issues. */
     mix((uint64_t)(uint32_t)b->consumer_full);
+    /* A per-row cut issues each layer on its own rows (RadBatch::consumer_row0): the ranges, not the
+     * pointer (a step's host array is reused). lcp_admit_row changes only what the file stager admits
+     * into the RAM cache, nothing a pass issues. */
+    if (b->consumer_row0 && program_)
+        for (int64_t L = 0; L < program_->meta.n_layers; ++L) mix((uint64_t)(uint32_t)b->consumer_row0[L]);
     for (int g = 0; g < b->n_kv_groups; ++g) {
         const RadKVGroupBatch& k = b->kv[g];
         mix((uint64_t)k.group);  ptr(k.slot_mapping); ptr(k.block_table);

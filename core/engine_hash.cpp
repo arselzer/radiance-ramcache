@@ -248,6 +248,11 @@ void Engine::consumer_skip_report() {
              (long long)m.consumer_ckpt_whole, (long long)m.consumer_ckpt_dropped,
              (unsigned long long)c.ckpt_raised, (unsigned long long)c.ckpt_full,
              (unsigned long long)c.ckpt_cut, (unsigned long long)c.ckpt_insured);
+    const uint64_t lr = c.rows_full + c.rows_key + c.rows_skipped;
+    if (lr)
+        RAD_INFO("consumer skip, per row: %llu layer-rows run in full, %llu key ops alone, %llu skipped "
+                 "(%.1f%% in full)", (unsigned long long)c.rows_full, (unsigned long long)c.rows_key,
+                 (unsigned long long)c.rows_skipped, 100.0 * (double)c.rows_full / (double)lr);
 }
 
 }  /* namespace rad */

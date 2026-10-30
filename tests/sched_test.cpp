@@ -5,6 +5,7 @@
 
 #include "mm/processor.h"
 #include "sched/mtp_couple_bind.h"
+#include "place/ep_route_counts.h"
 #include "sched/scheduler.h"
 #include "sched/advance_impl.h"
 #include "sched/derive.h"
@@ -7997,5 +7998,331 @@ TEST(consumer_skip_ckpt_policy_is_named_at_startup) {
         if (w.lacks) CHECK(text.find(w.lacks) == std::string::npos);
         if (w.policy != 0 && w.cache)
             CHECK(text.find("a lone one adds up to 1520 layer-passes in full") != std::string::npos);
+    }
+}
+
+/* ================================================================== large-chunk prefill */
+/* RADIANCE_EXPERIMENTAL_DS41_LCP=<C> on the scheduler (Scheduler::lcp_init; the kernels' side is
+ * FileStager::lcp_init, tests/ds41_tall_test.cpp): in DeepSeek-V4.1's shape (linear state beside the
+ * window, so the checkpoint interval caps chunks even without the prefix cache) a lone prompt runs
+ * in chunks of C, split only at the interval and the tail; the deployments that would cut chunks
+ * short, share a chunk's step or speculate are refused, and so is LCP no file stager took. */
+namespace {
+
+/* Forces the switch (and the ranks whose stager admitted it) for one case. */
+struct LcpOn {
+    LcpOn(int64_t c, int admitted) {
+        ds41_lcp_set_for_test(c);
+        lcp_admitted_reset_for_test(admitted);
+    }
+    ~LcpOn() {
+        ds41_lcp_set_for_test(-2);
+        lcp_admitted_reset_for_test(0);
+    }
+};
+
+/* ds41_fixture's shape (linear state beside the window, the state chunk 1) at chunks of C and 8,192
+ * tokens of context, the prefix cache off (the A/B's). */
+void lcp_fixture(Fixture& f, int64_t C, int64_t interval) {
+    f.build(8192, 64, /*max_tok=*/C, 8192, /*windowed=*/true, /*linear=*/true);
+    f.prog.meta.n_ctx_train = 8192;
+    f.prog.ops.resize(1);
+    f.kv.snap = { 3 };
+    f.pc.groups = { 0 };
+    f.cfg.checkpoint_interval = interval;
+    f.cfg.prefix_exact = true;
+    f.cfg.max_seqs = 1;
+    f.cfg.prefix_cache = false;
+}
+
+}  /* namespace */
+
+TEST(lcp_runs_a_lone_prompt_in_chunks_of_c) {
+    for (const int64_t C : { 256, 512, 1024, 2048 }) {
+        LcpOn on(C, 1);
+        Fixture f;
+        lcp_fixture(f, C, 2048);
+        REQUIRE_EQ(f.start(), RAD_OK);
+        CHECK_EQ(f.sch.lcp_rows(), C);
+        CHECK_EQ(f.sch.geometry().quantum, 16);
+        /* 3,086 and 6,817 tokens: chunks of C up to the interval grid, the tail chunk split at its last
+         * quantum boundary as at 16-token chunks. */
+        for (const int64_t n : { 933, 3086, 6817 }) {
+            const Cut c = cut_from(f.sch, 0, n, C);
+            REQUIRE(!c.ends.empty());
+            int64_t prev = 0, short_chunks = 0;
+            for (size_t i = 0; i < c.ends.size(); ++i) {
+                const int64_t len = c.ends[i] - prev;
+                CHECK(len <= C);
+                CHECK_EQ(prev % 16, (int64_t)0);
+                if (len < C && i + 2 < c.ends.size()) ++short_chunks;   /* only the last two may be short */
+                prev = c.ends[i];
+            }
+            CHECK_EQ(prev, n);
+            CHECK_EQ(short_chunks, (int64_t)0);
+        }
+    }
+    /* At 1,024 a 3,086-token prompt: [0, 1024), [1024, 2048), [2048, 3072), [3072, 3086). */
+    {
+        LcpOn on(1024, 1);
+        Fixture f;
+        lcp_fixture(f, 1024, 2048);
+        REQUIRE_EQ(f.start(), RAD_OK);
+        const Cut c = cut_from(f.sch, 0, 3086, 1024);
+        CHECK(c.ends == std::vector<int64_t>({ 1024, 2048, 3072, 3086 }));
+    }
+    /* A span over a smaller interval: chunks of C after the first interval. */
+    {
+        LcpOn on(1024, 1);
+        Fixture f;
+        lcp_fixture(f, 1024, 256);
+        f.cfg.prefix_cache = true;
+        f.cfg.prefill_span = 4;
+        REQUIRE_EQ(f.start(), RAD_OK);
+        CHECK_EQ(f.sch.lcp_rows(), (int64_t)1024);
+    }
+    /* Off: no LCP whatever the budget. */
+    {
+        LcpOn off(0, 0);
+        Fixture f;
+        lcp_fixture(f, 1024, 2048);
+        REQUIRE_EQ(f.start(), RAD_OK);
+        CHECK_EQ(f.sch.lcp_rows(), (int64_t)0);
+    }
+}
+
+TEST(lcp_is_refused_where_chunks_would_not_be_c_or_share_a_step) {
+    auto refused = [](Fixture& f, const char* what) {
+        std::string err;
+        int rc = 0;
+        err = stderr_of([&] { rc = f.start(); });
+        CHECK_EQ(rc, (int)RAD_E_INVAL);
+        CHECK(has(err, "large-chunk prefill) refused"));
+        CHECK(has(err, what));
+    };
+    {   /* the budget is not C */
+        LcpOn on(1024, 1);
+        Fixture f;
+        lcp_fixture(f, 512, 2048);
+        refused(f, "--max-num-batched-tokens 512");
+    }
+    {   /* an interval below C with no span: chunks of the interval */
+        LcpOn on(1024, 1);
+        Fixture f;
+        lcp_fixture(f, 1024, 256);
+        refused(f, "below the chunk");
+    }
+    {   /* an interval past C and not a multiple of it */
+        LcpOn on(1024, 1);
+        Fixture f;
+        lcp_fixture(f, 1024, 1536);
+        refused(f, "not a multiple of the chunk");
+    }
+    {   /* a span too short for C */
+        LcpOn on(1024, 1);
+        Fixture f;
+        lcp_fixture(f, 1024, 256);
+        f.cfg.prefix_cache = true;
+        f.cfg.prefill_span = 2;
+        refused(f, "--prefill-span 2");
+    }
+    {   /* concurrent sequences without prefill-alone steps */
+        LcpOn on(1024, 1);
+        Fixture f;
+        lcp_fixture(f, 1024, 2048);
+        f.cfg.max_seqs = 4;
+        refused(f, "--max-num-seqs 4");
+    }
+    {   /* speculation */
+        LcpOn on(1024, 1);
+        Fixture f;
+        lcp_fixture(f, 1024, 2048);
+        f.cfg.n_spec = 2;
+        refused(f, "speculation");
+    }
+    {   /* KV streaming: a ring of the context on the card */
+        LcpOn on(1024, 1);
+        Fixture f;
+        lcp_fixture(f, 1024, 2048);
+        f.cfg.kv_resident = 4096;
+        refused(f, "KV streaming");
+    }
+    {   /* no file stager took it */
+        LcpOn on(1024, 0);
+        Fixture f;
+        lcp_fixture(f, 1024, 2048);
+        refused(f, "took it on 0 of 1 ranks");
+    }
+    {   /* a value outside the switch's range */
+        LcpOn on(-1, 1);
+        Fixture f;
+        lcp_fixture(f, 1024, 2048);
+        int rc = 0;
+        (void)stderr_of([&] { rc = f.start(); });
+        CHECK_EQ(rc, (int)RAD_E_INVAL);
+    }
+}
+
+/* A lone 3,086-token prompt (and a 6,817-token one) at C = 1,024 with the consumer skip declared at the
+ * 16-row grain: every chunk past the first rows carries the per-row cut of the 16-row schedule for its
+ * target (consumer_row_starts at M = A = 16), the last chunk none that cuts its sampled row, and every
+ * chunk of more than 16 tokens its admission row (the prompt's last 128 tokens); a decode step carries
+ * neither. Without the declared grain the cut is the whole-pass one at M = C. */
+TEST(lcp_steps_carry_the_row_cut_and_the_admission_row) {
+    for (const int64_t n : { 3086, 6817 }) {
+        LcpOn on(1024, 1);
+        Fixture f;
+        lcp_fixture(f, 1024, 2048);
+        f.prog.consumer = RadConsumerSuffix{ (uint32_t)sizeof(RadConsumerSuffix), 16, 4, 64, 16 };
+        f.cfg.consumer_skip = 1;
+        REQUIRE_EQ(f.start(), RAD_OK);
+        REQUIRE(f.sch.consumer_on());
+        REQUIRE_EQ(f.sch.lcp_rows(), (int64_t)1024);
+        const uint64_t id = f.submit((int)n, 2);
+        REQUIRE(id != 0);
+        const ConsumerShape c16{ 16, 4, 64, 16, 16 };
+        int chunks = 0, cut = 0, bad_row0 = 0, bad_admit = 0, decode_marked = 0;
+        int64_t target = -1;
+        for (int k = 0; k < 40; ++k) {
+            const RadBatch* b = f.sch.step();
+            if (!b) break;
+            const StepPlan& p = f.sch.plan();
+            REQUIRE_EQ(p.e.size(), (size_t)1);
+            const StepEntry& e = p.e[0];
+            if (!e.is_prefill) {
+                decode_marked += b->consumer_row0 != nullptr || b->lcp_admit_row != 0 || b->consumer_full != 0;
+                f.commit_plain();
+                continue;
+            }
+            ++chunks;
+            if (target < 0) target = e.consumer_end;
+            CHECK_EQ(e.consumer_end, target);
+            /* The admission row: the chunk's rows inside the prompt's last 128 tokens. */
+            const int32_t want_admit = e.n_tokens > 16
+                ? (int32_t)std::clamp<int64_t>(n - 128 - e.ctx_len, 0, e.n_tokens) : 0;
+            bad_admit += b->lcp_admit_row != want_admit;
+            /* The row cut. */
+            const std::vector<int64_t> th = consumer_thresholds(c16, target);
+            std::vector<int32_t> want(16);
+            REQUIRE(consumer_row_starts(c16, th.data(), e.ctx_len, (int64_t)e.ctx_len + e.n_tokens, want.data()));
+            bool any = false;
+            for (int32_t v : want) any = any || v > 0;
+            int32_t F = 4;
+            while (F < 16 && want[(size_t)F] < e.n_tokens) ++F;
+            any = any || F < 16;
+            if (!any) {
+                bad_row0 += b->consumer_row0 != nullptr;
+            } else {
+                ++cut;
+                if (!b->consumer_row0) { ++bad_row0; }
+                else
+                    for (int L = 0; L < 16; ++L) bad_row0 += b->consumer_row0[L] != want[(size_t)L];
+                bad_row0 += b->consumer_full != (F < 16 ? F : 0);
+                if (e.produces_token) bad_row0 += want[15] > e.n_tokens - 1;
+            }
+            f.commit_plain();
+        }
+        CHECK(chunks >= (int)((n + 1023) / 1024));
+        CHECK(cut >= 2);
+        CHECK_EQ(bad_row0, 0);
+        CHECK_EQ(bad_admit, 0);
+        CHECK_EQ(decode_marked, 0);
+        const BatchBuilder::ConsumerStats& cs = f.sch.consumer_stats();
+        CHECK(cs.rows_skipped > 0);
+        CHECK_EQ(cs.rows_full + cs.rows_key + cs.rows_skipped, (uint64_t)(16 * n));
+    }
+    /* No grain declared: the whole-pass cut (M = C), no row0. */
+    {
+        LcpOn on(1024, 1);
+        Fixture f;
+        lcp_fixture(f, 1024, 2048);
+        f.prog.consumer = RadConsumerSuffix{ (uint32_t)sizeof(RadConsumerSuffix), 16, 4, 64, 0 };
+        f.cfg.consumer_skip = 1;
+        REQUIRE_EQ(f.start(), RAD_OK);
+        REQUIRE(f.sch.consumer_on());
+        const uint64_t id = f.submit(3086, 2);
+        REQUIRE(id != 0);
+        int rows_marked = 0;
+        for (int k = 0; k < 10; ++k) {
+            const RadBatch* b = f.sch.step();
+            if (!b) break;
+            rows_marked += b->consumer_row0 != nullptr;
+            f.commit_plain();
+        }
+        CHECK_EQ(rows_marked, 0);
+    }
+}
+
+/* Complete checkpoints (claude/ds41-csckpt) under large-chunk prefill's per-row cut: a lone 3,086-token
+ * prompt at C = 1,024 with the prefix cache on, interval 1,024 and ..._CKPT=all, cut for its tail
+ * snapshot at 3,072. The snapshots at 1,024 and 2,048 below it are reserved by the chunks that end
+ * there, each chunk's rows are consumer_row_starts of the least of the target's thresholds and the
+ * next checkpoint's 16-row cone (consumer_row_thresholds), the chunks ending at a checkpoint store
+ * layer n-1's keys on its window (consumer_ckpt_covered_rows: counted cut, none insured), and the
+ * snapshot list is the uncut run's. With ..._CKPT=0 none below the target is written. */
+TEST(lcp_row_cut_makes_the_checkpoints_below_the_target_whole) {
+    for (const int64_t policy : { (int64_t)-1, (int64_t)0 }) {
+        LcpOn on(1024, 1);
+        Fixture f;
+        lcp_fixture(f, 1024, 1024);
+        f.cfg.prefix_cache = true;
+        f.prog.consumer = RadConsumerSuffix{ (uint32_t)sizeof(RadConsumerSuffix), 16, 4, 64, 16 };
+        f.cfg.consumer_skip = 1;
+        f.cfg.consumer_skip_ckpt = policy;
+        REQUIRE_EQ(f.start(), RAD_OK);
+        REQUIRE(f.sch.consumer_on());
+        REQUIRE_EQ(f.sch.lcp_rows(), (int64_t)1024);
+        CHECK_EQ(f.sch.consumer_ckpt_policy(), policy);
+        const int64_t n = 3086;
+        const uint64_t id = f.submit((int)n, 2);
+        REQUIRE(id != 0);
+        const ConsumerShape c16{ 16, 4, 64, 16, 16 };
+        std::vector<int64_t> snaps;
+        int bad_row0 = 0, prefills = 0;
+        int64_t target = -1;
+        for (int k = 0; k < 40; ++k) {
+            const RadBatch* b = f.sch.step();
+            if (!b) break;
+            const StepPlan& p = f.sch.plan();
+            REQUIRE_EQ(p.e.size(), (size_t)1);
+            const StepEntry& e = p.e[0];
+            if (!e.is_prefill) { f.commit_plain(); continue; }
+            ++prefills;
+            if (target < 0) target = e.consumer_end;
+            if (e.ckpt_slot >= 0 && e.ckpt_tok >= 0) snaps.push_back((int64_t)e.ctx_len + e.ckpt_tok + 1);
+            const int64_t s = e.ctx_len, end = s + e.n_tokens;
+            std::vector<int64_t> th = consumer_thresholds(c16, target);
+            if (e.consumer_ckpt > end - 1 && e.consumer_ckpt < target) {
+                std::vector<int64_t> g = consumer_ckpt_thresholds(c16, e.consumer_ckpt), h(16);
+                REQUIRE(consumer_row_thresholds(c16, th.data(), g.data(), h.data()));
+                th = h;
+            }
+            std::vector<int32_t> want(16);
+            REQUIRE(consumer_row_starts(c16, th.data(), s, end, want.data()));
+            bool any = false;
+            for (int32_t v : want) any = any || v > 0;
+            int32_t F = 4;
+            while (F < 16 && want[(size_t)F] < e.n_tokens) ++F;
+            any = any || F < 16;
+            if (any && !e.produces_token) {
+                if (!b->consumer_row0) ++bad_row0;
+                else for (int L = 0; L < 16; ++L) bad_row0 += b->consumer_row0[L] != want[(size_t)L];
+            }
+            f.commit_plain();
+        }
+        CHECK_EQ(target, (int64_t)3072);
+        CHECK(prefills >= 4);
+        CHECK_EQ(bad_row0, 0);
+        const BatchBuilder::ConsumerStats& cs = f.sch.consumer_stats();
+        CHECK_EQ(cs.ckpt_insured, (uint64_t)0);
+        if (policy < 0) {
+            CHECK(snaps == std::vector<int64_t>({ 1024, 2048, 3072 }));
+            CHECK_EQ(cs.ckpt_cut, (uint64_t)2);
+            CHECK(cs.ckpt_raised > 0);
+        } else {
+            CHECK(snaps == std::vector<int64_t>({ 3072 }));
+            CHECK_EQ(cs.ckpt_cut, (uint64_t)0);
+        }
+        CHECK(cs.rows_skipped > 0);
     }
 }

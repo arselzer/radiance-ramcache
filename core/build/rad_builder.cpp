@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <climits>
 #include <cmath>
+#include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -2094,16 +2095,21 @@ int Builder::drafter_short_block(int64_t block) {
 
 /* An exact consumer suffix (rad_builder.h). Only recorded: the engine decides which steps it cuts
  * (core/sched/consumer_skip.h), and a step it does not cut runs as before. */
+int Builder::consumer_row_grain() const { return prog_.consumer.n_layer > 0 ? prog_.consumer.row_grain : 0; }
+
 int Builder::declare_consumer_suffix(const RadConsumerSuffix* d) {
     if (finished_) {
         err(RAD_E_STATE, "declare_consumer_suffix after declare finished");
         return RAD_E_STATE;
     }
-    if (!d || d->struct_size < sizeof(RadConsumerSuffix)) {
+    /* Four fields at least (row_grain came later and reads as 0 from an older header). */
+    constexpr uint32_t kFirst = (uint32_t)offsetof(RadConsumerSuffix, row_grain);
+    if (!d || d->struct_size < kFirst) {
         err(RAD_E_INVAL, "declare_consumer_suffix: no declaration, or one from a header older than "
                          "its four fields");
         return RAD_E_INVAL;
     }
+    const int32_t grain = d->struct_size >= sizeof(RadConsumerSuffix) ? d->row_grain : 0;
     if (prog_.consumer.n_layer > 0) {
         err(RAD_E_STATE, "declare_consumer_suffix: declared twice");
         return RAD_E_STATE;
@@ -2116,8 +2122,17 @@ int Builder::declare_consumer_suffix(const RadConsumerSuffix* d) {
             d->window);
         return RAD_E_INVAL;
     }
-    prog_.consumer = *d;
-    prog_.consumer.struct_size = sizeof(RadConsumerSuffix);
+    if (grain < 0) {
+        err(RAD_E_INVAL, "declare_consumer_suffix: row_grain %d (0 or a row count)", grain);
+        return RAD_E_INVAL;
+    }
+    RadConsumerSuffix c{};
+    c.struct_size = sizeof(RadConsumerSuffix);
+    c.n_layer = d->n_layer;
+    c.boundary = d->boundary;
+    c.window = d->window;
+    c.row_grain = grain;
+    prog_.consumer = c;
     return RAD_OK;
 }
 
@@ -2668,6 +2683,11 @@ int rad_drafter_short_block(RadBuilder* b, int64_t block) {
 int rad_declare_consumer_suffix(RadBuilder* b, const RadConsumerSuffix* d) {
     if (!b) return RAD_E_INVAL;
     return B(b)->declare_consumer_suffix(d);
+}
+
+int rad_consumer_row_grain(RadBuilder* b) {
+    if (!b) return 0;
+    return B(b)->consumer_row_grain();
 }
 
 int rad_declare_encoder(RadBuilder* b, const RadEncoderDecl* d) {

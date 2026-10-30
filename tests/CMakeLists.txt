@@ -481,7 +481,10 @@ set_tests_properties(isa_tools PROPERTIES TIMEOUT ${RAD_TEST_TIMEOUT})
 # twin row of RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL is held to the decode band's kernel over the
 # same tokens in passes of 16, byte for byte, and its fused norms (r4d_ds41_elem.hip) at pass
 # heights 1 to 48 to the same rows alone and in launches of 16 up to libr4d's reach (test_ds41tall;
-# r4d_emu_ds41tall_on runs it with the switch set).
+# r4d_emu_ds41tall_on runs it with the switch set). r4d_emu_ds41tall_lcp runs it under
+# RADIANCE_EXPERIMENTAL_DS41_LCP=1024 (large-chunk prefill): the routed GEMM to 256 tokens, the norms
+# to 1024 rows, the router's 384 columns against its four 96-column slices (gemm_nt_f32) and gemm_nt's
+# tiled row against its m64 row and launches of 16.
 #
 # Requires clang (ext_vector_type) and x86-64 (SysV fiber switch in inline assembly). With a clang
 # C++ compiler the .hip files build here as C++ (`-x c++`; the property is per directory, so
@@ -499,6 +502,7 @@ set(R4D_EMU_HIP ${R4D_DIR}/r4d_attn_paged_window.hip ${R4D_DIR}/r4d_pair_argmax_
                 ${R4D_DIR}/r4d_kv_resolve.hip ${R4D_DIR}/r4d_dsa.hip
                 ${R4D_DIR}/r4d_gemm_m2xfp4a8_decode.hip ${R4D_DIR}/r4d_gemm_m2xfp4a8_tiled.hip
                 ${R4D_DIR}/r4d_gemm_bf16_nt_m64.hip ${R4D_DIR}/r4d_gemm_bf16f8_nt_m64.hip
+                ${R4D_DIR}/r4d_gemm_bf16_nt_tiled.hip
                 ${R4D_DIR}/r4d_ds41_mxfp4.hip ${R4D_DIR}/r4d_ds41_elem.hip)
 # The M2XFP4 units' plugin entries call two cfg readers that r4d_rows.cpp defines, which is not in
 # this build: cfg_stub.cpp defines them at their axis defaults, in both arms below, and the bf16
@@ -613,6 +617,9 @@ if(R4D_EMU_BUILT)
   endforeach()
   add_test(NAME r4d_emu_ds41tall_on COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_ds41tall)
   set_tests_properties(r4d_emu_ds41tall_on PROPERTIES ENVIRONMENT "RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=1"
+                       LABELS "r4d_emu" TIMEOUT ${RAD_TEST_TIMEOUT})
+  add_test(NAME r4d_emu_ds41tall_lcp COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_ds41tall)
+  set_tests_properties(r4d_emu_ds41tall_lcp PROPERTIES ENVIRONMENT "RADIANCE_EXPERIMENTAL_DS41_LCP=1024"
                        LABELS "r4d_emu" TIMEOUT ${RAD_TEST_TIMEOUT})
   # The attention cases take about 11 s, 7 of them in the two long prefills on the WMMA kernel,
   # which three shards put in different entries.

@@ -81,6 +81,7 @@ the engine or the scripts assumes where the checkpoint is. `ab_window.sh` takes 
 | `..._HOST_EXPERTS=N`, `_POLICY=all` | cached experts on the CPU: 5.63 → 5.96 tok/s | `greedy` splits with the copy link (no better); `verify` computes both and compares rows |
 | `..._MISSES=16` | misses on the CPU: 5.96 → 8.89 tok/s | needs the mapped RAM cache |
 | `RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=1` with `--max-num-batched-tokens 32` (or 48) | byte-identical (--kld-record over 1,512 positions; card sweep up to 32 rows) but alone slower: TTFT 99.5 → 108.4 s at 3,086 tokens (+9%), held-out +4.5%; to be tried with 32-row CPU jobs (MAX_ROWS=32) | prefill passes of up to 32 (48) tokens, every reply, logit and KV entry the 16-token chunking's. Four kinds of op change arithmetic with the pass height: the routed MoE GEMM above 16 tokens (the gemv row's band ends there; the tiled row sums in another order), the sparse attention and the indexer score above 48 rows (WMMA forms), and every norm above 32 rows (`r4d_act_threads` halves the width, which regroups the sum of squares). Under the switch libr4d adds `moe_gemm_ggml_mxfp4_gemv_tall`, the gemv one priority below the gemv row with its bound on M raised to the tallest pass libr4d keeps exact (`libr4d/r4d_ds41_tall.h`), and keeps the sparse ops on their scalar forms at every height; the core raises the counts contract to 48 tokens and the CPU path to the step (its pinned rows, sorted order, output rows and fetch lists), and lets the file-buffer cap take passes of the step with the misses on the CPU in all of them (`..._MISSES` at least the step). At startup `FileStager::tall_init` refuses a step whose passes would change bits: above 48 tokens, a routed MXFP4 GEMM band off the gemv rows (a libr4d without the twin, or a step past its bound), or any other op on two kernels other than gemm_nt's m16 / m64; rank 0 then logs `exact tall passes: passes of up to N tokens ...`. Arm parts `Xt` and `BTN` (e.g. `...-M32-...-Xt-BT32`); the byte gate is a pair of `Kld` arms (below, Tools). Tests: `ds41_tall_test`, `hx_fetch_list_test` (16 / 32 / 48-row tables), `r4d_emu_ds41tall` and `r4d_emu_ds41tall_on` (the twin's rows = the gemv's in passes of 16; the fused norms at heights 1..48), `ds41_mxfp4_device_check LIBR4D tall` and `sweep` / `sweep0` on a card |
+| `RADIANCE_EXPERIMENTAL_DS41_LCP=C` with `--max-num-batched-tokens C` (C = 1024) | not yet measured (model: 3,086 tokens in ~37 s alone, ~27 s with the per-row consumer cut, against 99.5 s at 16-token passes and 69 s with `Cs`; decode about −1.3% at C = 1024 for the permanent arena) | large-chunk prefill: chunks of C tokens with every row, logit and KV entry the 16-token chunking's. libr4d keeps the exact-tall pins at every height and raises its twin `moe_gemm_ggml_mxfp4_gemv_tall` to 2048 rows (`libr4d/r4d_ds41_tall.h`); `FileStager::lcp_init` admits a step only when every routed MXFP4 band is on the gemv rows with the twin reaching C, every other op is on one kernel or on a known byte-identical pair (gemm_nt m16 / m64 / tiled, the exact all-reduce's one- and two-shot), `--max-num-batched-tokens` is C, and nothing outside what was proven is on (EXACT_TALL other than 1, speculation, `..._FETCH_LIST`, `..._VRAM_PACKED`); `hx_init` requires the CPU to take every routed unit (`..._POLICY=all`, `..._MISSES` ≥ C, `B1`); `Scheduler::lcp_init` requires chunks of C (the checkpoint interval a multiple of C, or a span) and a step a chunk alone (`--max-num-seqs 1` or `..._PREFILL_ALONE`), and every rank's stager to have taken it. Misses stream to the pool as each unit lands (at most `..._LCP_PLANES` read at once), jobs are cut evenly and submitted longest first, and the RAM cache admits only what the prompt's last `..._LCP_ADMIT` tokens (128) select, as the chunks reach them (earlier rows borrow read-only; at most `..._LCP_INSERTQ` admitted misses queued). With `Cs` and the plugin's declared 16-row grain the consumer skip cuts each chunk per row (`RadBatch::consumer_row0`). Rank 0 logs `large-chunk prefill: passes of up to C tokens ...`. Arm parts `LcN`, `AdN` / `Ada`, `LpN`, `LiN` (below) |
 | `--embedding-placement ram` | +1.5%, TTFT −2.4% | the engine's default (the A/B script had forced `vram`): the token embedding pinned in host RAM (1.26 GB), its 316 MiB a rank of VRAM to ~17 more resident experts |
 | `--host-pool-mib 256`, cache 96 GiB | +9% (vs the 4 GiB pool) | the pinned pool's RAM is worth more as cache; 256 MiB since the planner fix (was 1900); 96 GiB leaves ~14 GiB free (102 GiB: +4.3% in two runs of three, ~8 GiB free, sensitive to other jobs) |
 | `..._NATIVE_CACHE_PREGROW=1` | request 2 TTFT 13.7 → 5.0 s | slabs pinned at startup (+~30 s startup) |
@@ -569,18 +570,58 @@ log-probabilities, its top 16 in f32, and the next token's NLL and the whole row
 one changed logit anywhere in a row shows), and the second must equal the first byte for byte
 (`ab_requests.py --kld-compare`).
 
+## Large-chunk prefill
+
+`RADIANCE_EXPERIMENTAL_DS41_LCP=C` (C a multiple of 16 in 64..2048) runs a lone prompt's prefill in
+chunks of C tokens, each giving every row the bits of the same tokens in 16-token passes. It needs
+`--max-num-batched-tokens C`, the CPU path on every routed unit (`..._POLICY=all`, `..._MISSES` ≥ C,
+`..._FILE_BUFFER_UNITS`), chunks of C (the default checkpoint interval 2048 serves C up to 2048;
+above it, `--checkpoint-interval C`; with the prefix cache and a smaller interval, `--prefill-span
+C/I`), and a step a chunk alone; the server refuses anything else at startup with the reason (also
+speculation, KV streaming, `..._FETCH_LIST`, `..._VRAM_PACKED` and `..._EXACT_TALL` other than 1),
+and refuses a libr4d.so whose twin does not reach C (so a run home with an old plugin cannot mix
+sums).
+Under it libr4d's `ds41_mxfp4_device_check LIBR4D lcp [C]` holds the twin, the sparse ops (also as
+the suffix launches of the per-row cut) and every other height-dependent op (gemm_nt by the row the
+table resolves, the router's f32 projection and its 96-column split, the norms, mhc_mix, the head) to
+their rows launched alone and 16 at a time, up to 2048 rows; `r4d_emu_ds41tall_lcp` holds the twin to
+256 tokens, the norms to 1024 rows, gemm_nt's tiled row and the f32 split on the host.
+
+The CPU path at C rows: jobs of up to `..._HOST_EXPERTS_MAX_ROWS` (now up to 64: two many-row calls
+on one weight tile; set it to 32 or 64, since at the default 4 a chunk's experts take about twice the
+CPU time a row, and rank 0 warns) cut evenly, hits submitted longest first, 256 pool slots, a submitter waiting for a
+slot outside the submit lock; a chunk's misses are laid out and their jobs built before the reads, and
+each unit's jobs go to the pool as its last extent lands (`Mover::read_unit_planes`' `landed`), at most
+`..._LCP_PLANES` (48) units read at once. The RAM cache admits a chunk's units only where the prompt's
+last `..._LCP_ADMIT` tokens (128; 0 none; `all` every unit) select them, decided as the chunks reach
+those rows (`RadBatch::lcp_admit_row`); other units are leased without an LRU touch
+(`borrow_packed_readonly`) and their misses computed and let go; at most `..._LCP_INSERTQ` (16) admitted
+misses wait for the insert threads. With `Cs` and the plugin's 16-row grain, each chunk runs the
+16-row schedule in each of its 16-row groups: layer L in full on the chunk's rows from
+`consumer_row0[L]`, its key ops from the layer below's (`core/sched/consumer_skip.h`,
+`consumer_row_starts`; the same (layer, row) set as 16-row passes).
+
+Arm parts: `LcN` (needs `MN`, `B1` and an `Mr` part, `Mr32` or `Mr64`; never with `Xt` or `BT`; never
+the Kld reference), `AdN` / `Ada`, `LpN`, `LiN`, `Mr` up to 64. `lcp` in `DEVICE_CHECKS` (with
+`TALL_CHECK` and `TALL_LIBR4D` named, `LCP_CHECK_C` the chunk, 1024) runs `lcp C`, `sweep` under LCP and
+`sweep0` on card 0 (logs `devcheck-lcp-*.log`), and the window measures an Lc arm only on the libr4d.so
+(sha256) those passed on, at a chunk of at most `LCP_CHECK_C`. The byte gates are those of exact tall
+passes: a plain `Kld` arm first, then `...-M1024-...-Lc1024-Kld` (identical records), and `Kh` arms
+with and without `Cs` (identical prefill hashes). Leave `Vp` out of an Lc arm (refused) and `Rb` too
+(`gemm_nt_f32bf16` is not in the sweep).
+
 ## Many token rows of one expert
 
-`gemv_avx2_many` computes up to 32 token rows of one matrix in one call, for prefill passes whose
-rows meet in one expert. A tile's output rows go in blocks of 16; each round of each row is decoded
+`gemv_avx2_many` computes up to 32 token rows of one matrix in one call (more in calls of 32), for
+prefill passes whose rows meet in one expert. A tile's output rows go in blocks of 16; each round of each row is decoded
 once into f32 weights (w = kv · 2^(e−128), exact), and each token row adds x · w value by value in
 register blocks of two output rows by four token rows. Those are the card's two operations a value,
 in its order, so every row equals `gemv_avx2` on that row alone: `ds41_host_experts_test check`
-holds that at 1–33 rows in every layout (block_mxfp4, planes, packed) of every case (the release's
+holds that at 1–64 rows in every layout (block_mxfp4, planes, packed) of every case (the release's
 scales, the edges with NaN and Inf rows, partial rounds) and over output rows [8, N); `packed` adds
 nine rows on every packed case.
 
-`RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MAX_ROWS=N` (1–32; default 4, the behaviour so far) lets a
+`RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MAX_ROWS=N` (1–64; default 4, the behaviour so far) lets a
 pool job carry up to N token rows of one expert; with N above 4, jobs of four or more rows run
 `gemv_avx2_many` and smaller ones `gemv_avx2_few` (at four rows the many-row kernel is 10–18%
 faster, at three about even, at one or two slower). Arm part `MrN`. The startup line names the

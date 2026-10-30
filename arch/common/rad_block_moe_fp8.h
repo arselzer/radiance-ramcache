@@ -493,6 +493,10 @@ struct MoeFP8 {
          * inputs, such as reads of the next layer's weights into the on-die cache. Same rule:
          * it touches nothing the block reads or writes. */
         void (*tail)(RadCtx*, void*) = nullptr;
+        /* The first row of the step's first pass: `fn` and `tail` run in the pass that starts here,
+         * once a step (0, the step's first row, unless the caller runs the block on a suffix of its
+         * rows alone: deepseek41's per-row consumer cut). */
+        int64_t first_row = 0;
     };
     void step(RadCtx* c, const RadBatch* batch, const Beside& beside) const;
     /* The block over the first `T` rows of its buffers, for passes that need fewer rows than the
@@ -1805,7 +1809,7 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
                     brows(w.egu, rows * k));
     if (shared) shared_up(c_, T, r0, rows,
                           (rfused && router_fused_gate) || (sfused && sigmoid_scatter_gate));
-    if (beside && beside->fn && r0 == 0) beside->fn(c_, beside->arg);
+    if (beside && beside->fn && r0 == beside->first_row) beside->fn(c_, beside->arg);
     gq_exp.step(c_, w.egu, rows * k, 0, rows * k);
     if (shared) gq_sh.step(c_, w.sgu, T, r0, rows);
     if (act_bf16())
@@ -1843,7 +1847,7 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
                     brows(w.sorted, rows * k), poff, brows(w.edn, rows * k));
     }
     if (shared) sh_down.step(c_, w.sff, w.sout, T, r0, rows);
-    if (beside && beside->tail && r0 == 0) beside->tail(c_, beside->arg);
+    if (beside && beside->tail && r0 == beside->first_row) beside->tail(c_, beside->arg);
     /* The calibration tap reads the GEMMs' operands and writes nothing they touch, so it does not
      * change the model's output. */
     if (op_gram_gu && !calib_done) {

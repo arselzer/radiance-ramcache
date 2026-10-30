@@ -497,6 +497,8 @@ public:
      * keep point (Request::checkpoint_at); 512 (kConsumerSkipCkptDefault) with the prefix cache
      * when the variable is unset. */
     int64_t consumer_ckpt_policy() const { return cs_band_; }
+    /* Large-chunk prefill (RADIANCE_EXPERIMENTAL_DS41_LCP): C once init admitted it, else 0. */
+    int64_t lcp_rows() const { return lcp_; }
     /* The deepest checkpoint plan_chunk's chunks write for `r` from its computed tokens to `end`
      * at the whole step budget, or -1; with `all`, every one of them, ascending. */
     int64_t idle_prefill_checkpoint(const Request& r, int64_t end,
@@ -809,6 +811,9 @@ private:
      * (consumer_ckpt_policy). */
     bool    cs_on_ = false;
     int64_t cs_band_ = 0;
+    /* Large-chunk prefill, as lcp_init decided it (lcp_rows). */
+    int64_t lcp_ = 0;
+    int     lcp_init(const Program& prog, const Config& cfg, const std::vector<BatchBuilder::RankIO>& ranks);
     /* RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH=1 (read at init; acts under --prefix-resume
      * exact): a finished sequence publishes only up to SchedReq::grid_upto. An exact hit resumes
      * where a cold prefill starts a chunk and recomputes the cold chunks from there, but it also

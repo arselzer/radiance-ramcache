@@ -44,8 +44,8 @@ device-check: $(O)/ds41_bf16f8_device_check
 MXFLAGS ?= -O2 -std=c++17 --offload-arch=gfx1201
 $(O)/ds41_host_experts_dc.o: ds41_host_experts.cpp ds41_host_experts.h
 	$(CXX) -O2 -std=c++17 -mavx2 -ffp-contract=off -fno-fast-math -fPIC -c ds41_host_experts.cpp -o $@
-$(O)/ds41_mxfp4_device_check.o: ds41_mxfp4_device_check.hip ds41_host_experts.h
-	$(HIPCC) $(MXFLAGS) -I. -I$(TREE)/abi -c ds41_mxfp4_device_check.hip -o $@
+$(O)/ds41_mxfp4_device_check.o: ds41_mxfp4_device_check.hip ds41_host_experts.h $(TREE)/libr4d/r4d_bf16f8_layout.h
+	$(HIPCC) $(MXFLAGS) -I. -I$(TREE)/abi -I$(TREE)/libr4d -c ds41_mxfp4_device_check.hip -o $@
 $(O)/ds41_mxfp4_device_check: $(O)/ds41_mxfp4_device_check.o $(O)/ds41_host_experts_dc.o
 	$(HIPCC) $(O)/ds41_mxfp4_device_check.o $(O)/ds41_host_experts_dc.o -o $@ -ldl
 mxfp4-check: $(O)/ds41_mxfp4_device_check

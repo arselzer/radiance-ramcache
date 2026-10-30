@@ -590,14 +590,17 @@ void BatchBuilder::fini() {
     derived_.clear();
 }
 
-void BatchBuilder::set_consumer(const ConsumerShape& c) {
+void BatchBuilder::set_consumer(const ConsumerShape& c, bool rows) {
     cs_ = c;
     cs_on_ = c.valid();
+    cs_rows_ = cs_on_ && rows;
     cs_end_ = -1;
     cs_ck_ = -1;
+    for (Out& o : out_) o.row0.assign(cs_rows_ ? (size_t)c.n_layer : 0, 0);
     /* Sized once here: build() fills them in place, and the step path allocates nothing. */
     cs_f_.assign(cs_on_ ? (size_t)c.n_layer : 0, -1);
     cs_g_.assign(cs_on_ ? (size_t)c.n_layer : 0, -1);
+    cs_h_.assign(cs_rows_ ? (size_t)c.n_layer : 0, -1);
     cs_stats_ = ConsumerStats{};
 }
 
@@ -1094,7 +1097,107 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
      * its target's row and is never cut. */
     int32_t cs_full = 0;
     int64_t cs_end = 0;
-    if (cs_on_ && plan.draft_pass == 0 && plan.tok_shift == 0) {
+    const int32_t* cs_row0 = nullptr;
+    if (cs_on_ && cs_rows_ && plan.draft_pass == 0 && plan.tok_shift == 0) {
+        /* The per-row cut (consumer_row_starts): the 16-row schedule in every 16-row group of the
+         * chunk, each layer on its own suffix of the chunk's rows. A chunk that samples may be cut
+         * too, as long as its output row is inside every layer's rows (it is: the prompt's last chunk
+         * holds the target's row, where every layer runs). */
+        bool any = false;
+        for (const StepEntry& e : plan.e) any = any || (e.is_prefill && e.consumer_end > 0);
+        if (any) {
+            ++cs_stats_.passes;
+            const StepEntry& e = plan.e[0];
+            const bool alone = n_seq == 1 && plan.n_seq_decode == 0 && plan.n_spec == 0 &&
+                               e.is_prefill && e.consumer_end > 0 && e.hidden_row < 0 &&
+                               n_mm == 0 && n_dout == 0 && n_out == (e.produces_token ? 1 : 0);
+            const int64_t nl = cs_.n_layer, rows = e.n_tokens;
+            if (e.is_prefill && e.consumer_end > 0 && e.ctx_len % cs_.align != 0) {
+                if (cs_stats_.off_grid++ == 0)
+                    RAD_WARN("consumer skip: a chunk at %d..%d is off the %lld-row grid the per-row cut "
+                             "assumes", (int)e.ctx_len, (int)(e.ctx_len + e.n_tokens), (long long)cs_.align);
+            }
+            bool cut = false;
+            if (alone && e.ctx_len % cs_.align == 0) {
+                if (cs_end_ != e.consumer_end)
+                    cs_end_ = consumer_thresholds(cs_, e.consumer_end, cs_f_.data()) ? e.consumer_end : -1;
+                int32_t* const r0 = o.row0.data();
+                const int64_t s0 = e.ctx_len, e0 = (int64_t)e.ctx_len + rows, last = e0 - 1;
+                /* The checkpoint ahead that the scheduler makes whole: its 16-row cone, each group
+                 * running every layer either schedule runs (consumer_row_thresholds). */
+                const int64_t* thr = cs_f_.data();
+                int32_t F_t = nl;
+                const int64_t ck = e.consumer_ckpt;
+                if (cs_end_ == e.consumer_end && ck > last && ck < e.consumer_end) {
+                    if (cs_ck_ != ck)
+                        cs_ck_ = consumer_ckpt_thresholds(cs_, ck, cs_g_.data()) ? ck : -1;
+                    if (cs_ck_ == ck && (int64_t)cs_h_.size() == nl &&
+                        consumer_row_thresholds(cs_, cs_f_.data(), cs_g_.data(), cs_h_.data())) {
+                        F_t = consumer_full_layers(cs_, cs_f_.data(), last);
+                        thr = cs_h_.data();
+                    }
+                }
+                if (cs_end_ == e.consumer_end && (int64_t)o.row0.size() == nl &&
+                    consumer_row_starts(cs_, thr, s0, e0, r0)) {
+                    int32_t F = cs_.boundary;
+                    while (F < nl && r0[F] < rows) ++F;
+                    bool any_row = F < nl;
+                    for (int32_t L = 0; L < nl; ++L) any_row = any_row || r0[L] > 0;
+                    if (any_row && e.produces_token && r0[nl - 1] > rows - 1) {
+                        RAD_ERR("consumer skip: the chunk at %d..%d samples its last row, yet the per-row "
+                                "cut for %lld starts layer %d at row %d; every layer runs", (int)e.ctx_len,
+                                (int)(e.ctx_len + rows), (long long)e.consumer_end, (int)(nl - 1),
+                                (int)r0[nl - 1]);
+                        any_row = false;
+                    }
+                    /* A step that writes a snapshot below the target is cut only where the snapshot
+                     * is the one it was planned to make whole and it stores every layer's keys on
+                     * the snapshot's window (consumer_ckpt_covered_rows); otherwise every layer runs. */
+                    if (any_row && n_ck > 0) {
+                        const int64_t pos = (int64_t)e.ctx_len + e.ckpt_tok + 1;
+                        if (e.ckpt_slot >= 0 && e.ckpt_tok >= 0 &&
+                            consumer_ckpt_covered_rows(cs_, pos, s0, e0, e.consumer_end, e.consumer_ckpt, r0)) {
+                            if (pos < e.consumer_end) ++cs_stats_.ckpt_cut;
+                        } else {
+                            if (cs_stats_.ckpt_insured++ == 0)
+                                RAD_WARN("consumer skip: the chunk at %d..%d writes a snapshot at %lld "
+                                         "that its per-row cut for %lld was not planned to make whole "
+                                         "(next %lld); every layer runs", (int)e.ctx_len, (int)e0,
+                                         (long long)pos, (long long)e.consumer_end, (long long)e.consumer_ckpt);
+                            any_row = false;
+                        }
+                    }
+                    if (any_row && thr != cs_f_.data() && F > F_t) {
+                        ++cs_stats_.ckpt_raised;
+                        cs_stats_.ckpt_full += (uint64_t)(F - F_t);
+                    }
+                    if (any_row) {
+                        cut = true;
+                        cs_full = F < nl ? F : 0;
+                        cs_end = e.consumer_end;
+                        cs_row0 = r0;
+                        ++cs_stats_.cut;
+                        cs_stats_.full += (uint64_t)F;
+                        cs_stats_.key += F < nl ? 1 : 0;
+                        cs_stats_.skipped += (uint64_t)(F < nl ? nl - F - 1 : 0);
+                        for (int32_t L = 0; L < nl; ++L) {
+                            const int64_t kf = L <= cs_.boundary ? 0 : r0[L - 1], ff = r0[L];
+                            cs_stats_.rows_full += (uint64_t)(rows - std::min<int64_t>(ff, rows));
+                            cs_stats_.rows_key += (uint64_t)std::max<int64_t>(std::min<int64_t>(ff, rows) - kf, 0);
+                            cs_stats_.rows_skipped += (uint64_t)std::min<int64_t>(kf, rows);
+                        }
+                    }
+                }
+            } else if (!alone) {
+                ++cs_stats_.shared;
+            }
+            if (!cut) {
+                cs_stats_.full += (uint64_t)nl;
+                cs_stats_.rows_full += (uint64_t)(nl * rows);
+            }
+        }
+    }
+    if (cs_on_ && !cs_rows_ && plan.draft_pass == 0 && plan.tok_shift == 0) {
         bool any = false;
         for (const StepEntry& e : plan.e) any = any || (e.is_prefill && e.consumer_end > 0);
         if (any) {
@@ -1177,6 +1280,17 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
                 cs_stats_.full += (uint64_t)cs_.n_layer;
             }
         }
+    }
+
+    /* Large-chunk prefill's admission (RadBatch::lcp_admit_row): a step whose only entry is a pure
+     * prefill chunk (no decode or speculative rows, no draft pass, more than 16 tokens: the predicate
+     * of native_file_cache_prefill_policy) admits only its rows inside the prompt's last N tokens into
+     * the RAM cache; every other step admits everything, as before. */
+    int32_t lcp_admit = 0;
+    if (lcp_ > 0 && plan.draft_pass == 0 && plan.e.size() == 1 && plan.n_seq_decode == 0 && plan.n_spec == 0) {
+        const StepEntry& e = plan.e[0];
+        if (e.is_prefill && e.n_tokens > 16 && e.prompt_end > 0)
+            lcp_admit = lcp_admit_row_for(lcp_admit_, e.ctx_len, e.n_tokens, e.prompt_end);
     }
 
     /* build_groups consumes the manager's change marks, so any failure before every rank's
@@ -1299,6 +1413,9 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
         B.consumer_full = cs_full;
         B.consumer_rsv = 0;
         B.consumer_end = cs_end;
+        B.lcp_admit_row = lcp_admit;
+        B.lcp_rsv = 0;
+        B.consumer_row0 = cs_row0;
     }
     /* Record the flight behind everything reading this span: the upload and the derivation
      * copies. */

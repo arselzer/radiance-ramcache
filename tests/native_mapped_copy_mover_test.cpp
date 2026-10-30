@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <functional>
 #include <cerrno>
 #include <chrono>
 #include <climits>
@@ -751,6 +752,40 @@ TEST(mapped_slab_real_HOST_adapter_packed_layout_is_CPU_only){
     CHECK(block.slot_bytes()==ds41_mapped::SlabCache::block_sizes);
     need(block.clear(),"block terminal cleanup");
 }
+/* Large-chunk prefill's read-only chunks (RADIANCE_EXPERIMENTAL_DS41_LCP_ADMIT): borrow_packed_readonly
+ * leases a packed entry as borrow_packed does (the same bytes, a packed lease, the hit counted) but leaves
+ * the LRU order alone: of two entries, the older one borrowed read-only is still the one the next
+ * reservation evicts, where a touching borrow would have moved it to the front. */
+TEST(mapped_slab_packed_readonly_borrow_keeps_the_lru_order){
+    const ds41_mapped::SlabCache::Sizes packed{11999296,6001984};
+    Environment environment("1","1");
+    for(int touch=0;touch<2;++touch){
+        Adapter adapter;need(adapter.configure(40*MiB,4,0,0,Adapter::Layout::Packed,packed),"packed two-pair slab");
+        if(adapter.stats().slabs.classes[0].capacity_slots<2){SKIP("the slab holds fewer than two gate_up slots");return;}
+        if(adapter.stats().slabs.classes[0].capacity_slots>2)continue;   //the eviction below needs exactly two
+        for(size_t key:{size_t(0),size_t(1)}){
+            Adapter::Write w;REQUIRE(adapter.reserve_packed(key,0,&w)==Adapter::Status::Ok);
+            std::memset(w.host(),int(0x40+key),packed[0]);
+            Adapter::Lease l;REQUIRE(w.publish(&l)==Adapter::Status::Ok);CHECK(l.release()==Adapter::Status::Ok);
+        }
+        const uint64_t hits0=adapter.stats().cache.hits;
+        Adapter::Lease h;
+        REQUIRE((touch?adapter.borrow_packed(0,0,&h):adapter.borrow_packed_readonly(0,0,&h))==Adapter::Status::Hit);
+        CHECK(h.packed());CHECK_EQ(h.bytes(),packed[0]);CHECK(h.host()[0]==0x40);
+        CHECK(h.release()==Adapter::Status::Ok);
+        CHECK_EQ(adapter.stats().cache.hits,hits0+1);
+        /* A third entry evicts the LRU tail: key 0 after a read-only borrow, key 1 after a touching one. */
+        Adapter::Write w;REQUIRE(adapter.reserve_packed(2,0,&w)==Adapter::Status::Ok);
+        Adapter::Lease l;REQUIRE(w.publish(&l)==Adapter::Status::Ok);CHECK(l.release()==Adapter::Status::Ok);
+        CHECK_EQ(adapter.present(0),touch==1);
+        CHECK_EQ(adapter.present(1),touch==0);
+        Adapter::Lease cls;CHECK(adapter.borrow_packed_readonly(2,2,&cls)==Adapter::Status::Invalid);
+        need(adapter.clear(),"packed terminal cleanup");
+    }
+    Adapter block;need(block.configure(22*MiB,4,0),"block one-pair slab");
+    Adapter::Lease bl;CHECK(block.borrow_packed_readonly(0,0,&bl)==Adapter::Status::Layout);
+    need(block.clear(),"block terminal cleanup");
+}
 TEST(mapped_slab_real_HOST_adapter_alias_failure_is_owned_until_terminal_cleanup){
     for(const char* flag:{static_cast<const char*>(nullptr),"0","true","01"}){
         Environment off("1",flag);Adapter a;need(a.configure(22*MiB,4,0),"slabs default off");CHECK(!a.stats().slab_policy);
@@ -1167,6 +1202,51 @@ TEST(mapped_actual_mover_reads_a_read_ahead_units_rest_in_place){
     Mover::PlanesIn all;all.bytes[0]=lay.len[0];all.bytes[1]=lay.len[1];Mover::PlaneReadTiming tz;
     CHECK(t.mover->read_unit_planes(pl,1,1,&tz,&all));CHECK_EQ(tz.reads,0);CHECK_EQ(tz.rest,1);CHECK_EQ(tz.rest_bytes,int64_t(0));
     CHECK(!t.mover->start_unit_planes(pl,1,1,&all));   //nothing to post
+}
+
+/* read_unit_planes' `landed` (large-chunk prefill's streamed misses, FileStager::hx_stream_misses): each
+ * unit handed over exactly once, by a reader, with its bytes in place when it is; the call's result and
+ * bytes as without it. */
+namespace {
+struct Landed {
+    std::atomic<int> calls{0};
+    std::atomic<int> per[4]={};
+    std::atomic<int> wrong{0};
+    std::function<bool(int)> check;
+};
+void on_landed(void* ctx,int i){
+    Landed& l=*(Landed*)ctx;
+    l.calls.fetch_add(1);
+    if(i<0||i>=4){l.wrong.fetch_add(1);return;}
+    l.per[i].fetch_add(1);
+    if(l.check&&!l.check(i))l.wrong.fetch_add(1);
+}
+}
+TEST(mapped_actual_mover_unit_planes_landed_each_once_with_its_bytes){
+    Environment mapped("1","1");
+    Fixture f;f.experts();f.info.relayout=mx_relayout;Image image(lay_out_mxfp4(f));write_scales(f,image);
+    Config cfg=plan_config(false);Plan plan=planned(f,cfg,true);const auto units=two_ssd_experts(plan);
+    std::atomic<uint64_t> calls{0};Access::Driver driver;Transport t;t.open(f,plan,image,80*MiB,calls);Access::attach(*t.mover,driver);
+    auto same=[&](const Mover::HostPlanes& p){
+        if(p.n!=2)return false;
+        for(int k=0;k<2;++k){const auto& w=f.prog.weights[p.w[k]];const size_t N=size_t(mx_rows(w)),K=size_t(mx_cols(w));
+            if(std::memcmp(p.codes[k],image.bytes.data()+w.file_plane_offset[0],N*K/2)||
+               std::memcmp(p.scales[k],image.bytes.data()+w.file_plane_offset[1],N*(K/32)))return false;}
+        return true;};
+    for(int round=0;round<3;++round){
+        Mover::HostPlanes a0,a1;a0.unit=units[0];a1.unit=units[1];Mover::HostPlanes* pa[2]={&a0,&a1};
+        Landed l;l.check=[&](int i){return same(*pa[i]);};
+        Mover::PlaneReadTiming ta;
+        REQUIRE(t.mover->read_unit_planes(pa,2,64,&ta,nullptr,false,nullptr,on_landed,&l));
+        CHECK_EQ(l.calls.load(),2);CHECK_EQ(l.per[0].load(),1);CHECK_EQ(l.per[1].load(),1);CHECK_EQ(l.wrong.load(),0);
+        CHECK(same(a0));CHECK(same(a1));
+        CHECK_EQ(ta.units,2);CHECK_EQ(ta.reads,4);
+        /* A posted call afterwards has no `landed` left over from this one. */
+        Mover::HostPlanes b0;b0.unit=units[0];Mover::HostPlanes* pb[1]={&b0};
+        REQUIRE(t.mover->start_unit_planes(pb,1,1));
+        REQUIRE(t.mover->finish_unit_planes());
+        CHECK(same(b0));CHECK_EQ(l.calls.load(),2);
+    }
 }
 
 /* Mover::plane_spans and Mover::rest_mirror_tail (RADIANCE_EXPERIMENTAL_DS41_PREFETCH_URGENT): with

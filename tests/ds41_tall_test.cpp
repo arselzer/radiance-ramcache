@@ -87,7 +87,7 @@ struct EpCountsHostProbe {
     static void queue_inserts(FileStager& fs) {
         std::vector<size_t> idx(fs.hx_miss_.size());
         for (size_t i = 0; i < idx.size(); ++i) idx[i] = i;
-        fs.hx_queue_inserts(idx.data(), idx.size());
+        fs.hx_queue_inserts(idx.data(), idx.size(), (int)fs.pass_tok_);
     }
     static size_t queued(FileStager& fs) {
         std::lock_guard<std::mutex> lk(fs.hx_bg_mu_);

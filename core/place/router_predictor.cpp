@@ -39,8 +39,9 @@ int parse_score(const char* v) {
     return -1;
 }
 
-/* dot_avx2 for R rows at once: the weights converted once, and each row's two accumulators taking
- * exactly dot_avx2's operations in its order, so out[r] is dot_avx2(w, x[r], n) bit for bit. R <=
+/* rscore::dot_bf16_avx2 for R rows at once: the weights converted once, and each row's two
+ * accumulators taking exactly its operations in its order, so out[r] is
+ * rscore::dot_bf16_avx2(w, x[r], n) bit for bit. R <=
  * 6 keeps the twelve accumulators and the two weight vectors in the sixteen ymm registers. */
 template <int R>
 __attribute__((target("avx2,fma"))) void dot_rows_avx2(const uint16_t* w, const float* const* x, int n,
@@ -87,11 +88,11 @@ void router_logits_rows(const uint16_t* w, int n_expert, int embd, const float* 
     for (int e = 0; e < n_expert; ++e) {
         const uint16_t* we = w + (size_t)e * (size_t)embd;
         if (!avx2) {
-            for (int r = 0; r < rows; ++r) logits[(size_t)r * n_expert + e] = dot_ref(we, xs[r], embd);
+            for (int r = 0; r < rows; ++r) logits[(size_t)r * n_expert + e] = rscore::dot_bf16_ref(we, xs[r], embd);
             continue;
         }
         if (rows == 1) {   /* the single-row kernel itself */
-            logits[e] = dot_avx2(we, xs[0], embd);
+            logits[e] = rscore::dot_bf16_avx2(we, xs[0], embd);
             continue;
         }
         float out[RouterPredictor::kMaxRows];

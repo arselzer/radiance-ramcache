@@ -3048,9 +3048,7 @@ int FileStager::hx_submit_misses_now(int rows) {
     hx_reserved_ = 0;
     RAD_TRY(hx_pool_->submit(hx_jobs_.data() + first, n, &hx_ticket_));
     std::sort(hx_rows_.begin(), hx_rows_.end());
-    std::vector<size_t> all(hx_miss_.size());
-    for (size_t i = 0; i < all.size(); ++i) all[i] = i;
-    hx_queue_inserts(all.data(), all.size(), rows);
+    hx_queue_inserts(rows);
     return RAD_OK;
 }
 

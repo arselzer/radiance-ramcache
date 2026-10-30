@@ -743,6 +743,12 @@ private:
      * admitted ones only and not the side store's, at most hx_lcp_insertq_ queued at once in a
      * large chunk (the rest dropped, counted). */
     void hx_queue_inserts(const size_t* idx, size_t n, int rows);
+    /* The same over all of hx_miss_ (hx_submit_misses_now's call). */
+    void hx_queue_inserts(int rows) {
+        std::vector<size_t> all(hx_miss_.size());
+        for (size_t i = 0; i < all.size(); ++i) all[i] = i;
+        hx_queue_inserts(all.data(), all.size(), rows);
+    }
     /* RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_ASYNC_MISSES=N: in passes of N or more tokens a
      * layer's missed planes are read and their jobs submitted on hx_mw_ (a thread a rank) while
      * the issuing thread goes on issuing the layer's card ops; hx_finish and hx_drain wait for it

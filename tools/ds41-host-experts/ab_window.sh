@@ -61,13 +61,15 @@
 # none, the chunks read-only), Ada every unit (as at 16-token passes; 128 without either); LpN
 # ..._LCP_PLANES (missed units read at once a layer, 48); LiN ..._LCP_INSERTQ (admitted misses queued
 # for the cache, 16). An Lc arm must log "large-chunk prefill: passes of up to N tokens" at startup and
-# a plain one must not, or it is not measured; an Lc arm is never the Kld reference. DEVICE_CHECKS=lcp
-# runs ds41_mxfp4_device_check `lcp LCP_CHECK_C` (1024), `sweep` under LCP and `sweep0` on card 0
-# (TALL_LIBR4D, TALL_CHECK as for `tall`).
+# a plain one must not, or it is not measured; an Lc arm is never the Kld reference. `lcp` in
+# DEVICE_CHECKS (a list) runs ds41_mxfp4_device_check `lcp LCP_CHECK_C` (1024), `sweep` under LCP and
+# `sweep0` on card 0 (TALL_LIBR4D and TALL_CHECK named, as for `tall`), and an Lc arm runs only on the
+# libr4d.so (sha256) those passed on, at a chunk of at most LCP_CHECK_C.
 #
 # Environment: RADIANCE_BIN (the binary), RADIANCE_HOME_DIR (kernels/ and architectures/ for it),
 # SILU_TABLE (the card's silu table), ARMS (default "base verify greedy"), HX_THREADS (16),
-# VERIFY_REQUESTS (3), DEVICE_CHECKS (1; `tall`: the exact-tall checks, TALL_LIBR4D and TALL_CHECK),
+# VERIFY_REQUESTS (3), DEVICE_CHECKS (1; a list: `tall` the exact-tall checks, `lcp` the large-chunk
+# ones at LCP_CHECK_C, both with TALL_LIBR4D and TALL_CHECK),
 # SELFTEST_F32BF16 (an r4d_selftest: gemm_nt_f32bf16's checks and timings on card 0 before the
 # arms; unset, none, and no Rb arm runs).
 set -u
@@ -431,21 +433,51 @@ if [[ "${DEVICE_CHECKS:-1}" == ptime && -x "$HERE/build/ds41_mxfp4_device_check"
     echo "ptime exit $?" >>"$OUT/ptime.log" )
   grep -E 'prefill|exit' "$OUT/ptime.log" | tee -a "$OUT/window.log"
 fi
+# The Lc arms' gate (RADIANCE_EXPERIMENTAL_DS41_LCP), like Xt's: an Lc arm runs only on the
+# libr4d.so (sha256) the large-chunk checks passed on in this window, at a chunk no taller than they
+# checked (LCP_CHECK_C).
+LCP_OK="" LCP_LIB="" LCP_SUM="" LCP_C=0
+LCP_WHY="no large-chunk prefill device checks in this window (DEVICE_CHECKS=lcp with TALL_CHECK and TALL_LIBR4D)"
 if [[ " ${DEVICE_CHECKS:-1} " == *" lcp "* ]]; then
   # RADIANCE_EXPERIMENTAL_DS41_LCP on card 0: the twin and the sparse ops at chunk heights up to
   # LCP_CHECK_C (`lcp`, which also sweeps every other height-dependent op to 2048 rows, gemm_nt by the
   # row the table resolves and the router's column split among them), the sweep under LCP alone, and
   # without any switch (`sweep0`), each row against the same row alone and in launches of 16.
-  TL=${TALL_LIBR4D:-$RHOME/kernels/libr4d.so} TC=${TALL_CHECK:-$HERE/build/ds41_mxfp4_device_check}
-  log "large-chunk prefill device checks on card 0 with $TL ($TC)"
-  for m in "lcp ${LCP_CHECK_C:-1024}" sweep sweep0; do
-    f=${m%% *}
-    ( export HIP_VISIBLE_DEVICES=0
-      [[ $f == sweep ]] && export RADIANCE_EXPERIMENTAL_DS41_LCP=${LCP_CHECK_C:-1024}
-      timeout 1800 "$TC" "$TL" $m >"$OUT/devcheck-$f.log" 2>&1
-      echo "$f exit $?" >>"$OUT/devcheck-$f.log" )
-    grep -E '^(PASS|FAIL)|exit|norm rows' "$OUT/devcheck-$f.log" | tail -10 | tee -a "$OUT/window.log"
-  done
+  # TALL_LIBR4D: the plugin the Lc arms load; TALL_CHECK: a harness built with the lcp mode (both must
+  # be named, as for `tall`). The logs are devcheck-lcp-*.log, apart from `tall`'s.
+  TL=${TALL_LIBR4D:-} TC=${TALL_CHECK:-} LC=${LCP_CHECK_C:-1024}
+  if [[ ! -x "$TC" || ! -f "$TL" ]]; then
+    LCP_WHY="TALL_CHECK=$TC is not an executable or TALL_LIBR4D=$TL is not a file"
+    log "large-chunk prefill device checks: $LCP_WHY; no Lc arm is measured"
+  elif ! [[ $LC =~ ^[0-9]+$ ]] || (( 10#$LC < 64 || 10#$LC > 2048 || 10#$LC % 16 )); then
+    LCP_WHY="LCP_CHECK_C=$LC is not a multiple of 16 in 64..2048"
+    log "large-chunk prefill device checks: $LCP_WHY; no Lc arm is measured"
+  else
+    LC=$((10#$LC))
+    log "large-chunk prefill device checks on card 0 with $TL ($TC), chunks of up to $LC"
+    lcp_bad=""
+    for m in "lcp $LC" sweep sweep0; do
+      f=${m%% *}
+      ( export HIP_VISIBLE_DEVICES=0
+        unset RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL RADIANCE_EXPERIMENTAL_DS41_LCP
+        [[ $f == sweep ]] && export RADIANCE_EXPERIMENTAL_DS41_LCP=$LC
+        timeout 1800 "$TC" "$TL" $m >"$OUT/devcheck-lcp-$f.log" 2>&1
+        echo "$f exit $?" >>"$OUT/devcheck-lcp-$f.log" )
+      grep -E '^(PASS|FAIL)|exit|norm rows' "$OUT/devcheck-lcp-$f.log" | tail -10 | tee -a "$OUT/window.log"
+      grep -qx "$f exit 0" "$OUT/devcheck-lcp-$f.log" || lcp_bad+=" $f exited non-zero;"
+      grep -q '^FAIL' "$OUT/devcheck-lcp-$f.log" && lcp_bad+=" $f printed FAIL;"
+    done
+    grep -q "^PASS: lcp $LC: " "$OUT/devcheck-lcp-lcp.log" || lcp_bad+=" lcp has no PASS line;"
+    grep -q "^PASS: tall passes give 16-token passes' bits" "$OUT/devcheck-lcp-lcp.log" || lcp_bad+=" lcp's chunk heights have no PASS line;"
+    grep -q '^PASS: sweep' "$OUT/devcheck-lcp-sweep.log" || lcp_bad+=" sweep has no PASS line;"
+    if [[ -z "$lcp_bad" ]]; then
+      LCP_OK=1 LCP_LIB=$TL LCP_C=$LC LCP_SUM=$(sha256sum "$TL" 2>/dev/null | cut -d' ' -f1)
+      log "large-chunk prefill device checks passed on $TL, sha256 ${LCP_SUM:0:16}: Lc arms of up to $LC tokens on it are measured"
+    else
+      LCP_WHY="the large-chunk prefill device checks did not pass on $TL:$lcp_bad"
+      log "$LCP_WHY no Lc arm is measured"
+    fi
+  fi
 fi
 # The Xt arms' gate (RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL), like Dk's: an Xt arm runs only on the
 # libr4d.so (sha256) the tall checks passed on in this window.
@@ -959,6 +991,18 @@ for a in $ARMS; do
       log "arm $a: Xt refused: $TALL_WHY"; skip=1
     elif [[ -z "$lib" || "$(sha256sum "$lib" 2>/dev/null | cut -d' ' -f1)" != "$TALL_SUM" ]]; then
       log "arm $a: Xt refused: its libr4d.so (${lib:-none under $ARM_HOME}) is not the one the tall checks passed on ($TALL_LIB, sha256 ${TALL_SUM:0:16})"; skip=1
+    fi
+  fi
+  if [[ -n "$lc" && -z "$skip" ]]; then
+    IFS=: read -r -a homes <<< "$ARM_HOME"
+    lib=""
+    for h in "${homes[@]}"; do [[ -f "$h/kernels/libr4d.so" ]] && { lib=$h/kernels/libr4d.so; break; }; done
+    if [[ -z "$LCP_OK" ]]; then
+      log "arm $a: Lc refused: $LCP_WHY"; skip=1
+    elif (( lc > LCP_C )); then
+      log "arm $a: Lc refused: the large-chunk checks ran at chunks of up to $LCP_C (LCP_CHECK_C), not $lc"; skip=1
+    elif [[ -z "$lib" || "$(sha256sum "$lib" 2>/dev/null | cut -d' ' -f1)" != "$LCP_SUM" ]]; then
+      log "arm $a: Lc refused: its libr4d.so (${lib:-none under $ARM_HOME}) is not the one the large-chunk checks passed on ($LCP_LIB, sha256 ${LCP_SUM:0:16})"; skip=1
     fi
   fi
   # RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL: on only in an Xt arm, explicitly off in every other one but an

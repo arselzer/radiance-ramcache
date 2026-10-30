@@ -513,8 +513,10 @@ chunks of C tokens, each giving every row the bits of the same tokens in 16-toke
 `--max-num-batched-tokens C`, the CPU path on every routed unit (`..._POLICY=all`, `..._MISSES` ≥ C,
 `..._FILE_BUFFER_UNITS`), chunks of C (the default checkpoint interval 2048 serves C up to 2048;
 above it, `--checkpoint-interval C`; with the prefix cache and a smaller interval, `--prefill-span
-C/I`), and a step a chunk alone; the server refuses anything else at startup with the reason, and
-refuses a libr4d.so whose twin does not reach C (so a run home with an old plugin cannot mix sums).
+C/I`), and a step a chunk alone; the server refuses anything else at startup with the reason (also
+speculation, KV streaming, `..._FETCH_LIST`, `..._VRAM_PACKED` and `..._EXACT_TALL` other than 1),
+and refuses a libr4d.so whose twin does not reach C (so a run home with an old plugin cannot mix
+sums).
 Under it libr4d's `ds41_mxfp4_device_check LIBR4D lcp [C]` holds the twin, the sparse ops (also as
 the suffix launches of the per-row cut) and every other height-dependent op (gemm_nt by the row the
 table resolves, the router's f32 projection and its 96-column split, the norms, mhc_mix, the head) to
@@ -536,23 +538,26 @@ misses wait for the insert threads. With `Cs` and the plugin's 16-row grain, eac
 `consumer_row_starts`; the same (layer, row) set as 16-row passes).
 
 Arm parts: `LcN` (needs `MN`, `B1` and an `Mr` part, `Mr32` or `Mr64`; never with `Xt` or `BT`; never
-the Kld reference), `AdN` /
-`Ada`, `LpN`, `LiN`, `Mr` up to 64; `DEVICE_CHECKS=lcp` runs `lcp`, `sweep` under LCP and `sweep0`.
-The byte gates are those of exact tall passes: a plain `Kld` arm first, then `...-M1024-...-Lc1024-Kld`
-(identical records), and `Kh` arms with and without `Cs` (identical prefill hashes).
+the Kld reference), `AdN` / `Ada`, `LpN`, `LiN`, `Mr` up to 64. `lcp` in `DEVICE_CHECKS` (with
+`TALL_CHECK` and `TALL_LIBR4D` named, `LCP_CHECK_C` the chunk, 1024) runs `lcp C`, `sweep` under LCP and
+`sweep0` on card 0 (logs `devcheck-lcp-*.log`), and the window measures an Lc arm only on the libr4d.so
+(sha256) those passed on, at a chunk of at most `LCP_CHECK_C`. The byte gates are those of exact tall
+passes: a plain `Kld` arm first, then `...-M1024-...-Lc1024-Kld` (identical records), and `Kh` arms
+with and without `Cs` (identical prefill hashes). Leave `Vp` out of an Lc arm (refused) and `Rb` too
+(`gemm_nt_f32bf16` is not in the sweep).
 
 ## Many token rows of one expert
 
-`gemv_avx2_many` computes up to 32 token rows of one matrix in one call, for prefill passes whose
-rows meet in one expert. A tile's output rows go in blocks of 16; each round of each row is decoded
+`gemv_avx2_many` computes up to 32 token rows of one matrix in one call (more in calls of 32), for
+prefill passes whose rows meet in one expert. A tile's output rows go in blocks of 16; each round of each row is decoded
 once into f32 weights (w = kv · 2^(e−128), exact), and each token row adds x · w value by value in
 register blocks of two output rows by four token rows. Those are the card's two operations a value,
 in its order, so every row equals `gemv_avx2` on that row alone: `ds41_host_experts_test check`
-holds that at 1–33 rows in every layout (block_mxfp4, planes, packed) of every case (the release's
+holds that at 1–64 rows in every layout (block_mxfp4, planes, packed) of every case (the release's
 scales, the edges with NaN and Inf rows, partial rounds) and over output rows [8, N); `packed` adds
 nine rows on every packed case.
 
-`RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MAX_ROWS=N` (1–32; default 4, the behaviour so far) lets a
+`RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MAX_ROWS=N` (1–64; default 4, the behaviour so far) lets a
 pool job carry up to N token rows of one expert; with N above 4, jobs of four or more rows run
 `gemv_avx2_many` and smaller ones `gemv_avx2_few` (at four rows the many-row kernel is 10–18%
 faster, at three about even, at one or two slower). Arm part `MrN`. The startup line names the

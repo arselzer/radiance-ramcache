@@ -1002,3 +1002,14 @@ their copies, and the ring stress (2 to 12 slots, waves of 1 to 3, 440 random ru
 tunables; the end-aligned chunks for every length to 20,000; the admission against the sorted order.
 `p1_chunk_test` runs `Scheduler::plan_chunk`'s end alignment on the scheduler fakes, with and without a
 checkpoint interval.
+
+P1 twin (package K). Under `RADIANCE_EXPERIMENTAL_DS41_P1=1` beside `LCP`, libr4d registers
+`moe_gemm_ggml_mxfp4_gemv_tall_p1` (M ≤ 4096) in place of `_gemv_tall`. It runs gemv_vp's vp2 kernel at
+every height over a weight table. Bit 0 marks a packed-scale entry; bit 1 (skip) means no rows written and
+no bytes read. Experts own the live-tail ranges, every call zero-fills `[off[96], T)`, and work is cut into
+items by row passes, so one expert with 2,000 rows does not serialise a launch. gate_up stages two
+activation rows a pass and down three, on 512 blocks. Each output is one wave's sum in the gemv's lane and
+block order, so the bytes equal 16-token passes. Gate: `ds41_mxfp4_device_check LIB p1 4096 ROUTES` prints
+`p1: PASS` (rows, host rows, skip, tail, splits, waves of 1-3). On a 9070 XT with real routing at M
+1024-2048 it costs about 16.4 µs an expert-row in block form and 18.8 packed, against 2,238 for the served
+LCP twin and 30 for lcpfast's balanced twin.

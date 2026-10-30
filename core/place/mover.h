@@ -588,6 +588,12 @@ public:
      *                   back like read ones. */
     void  alias_file_units(const std::vector<int32_t>& units, char* base,
                            std::vector<int32_t>* staged);
+    /* The same with `mark` in the published address's low bits (tools/ds41-host-experts/ds41_p1.h:
+     * kMarkSkip): prefill Phase 1 publishes a touched non-resident expert so that the plugin's own
+     * expert ops leave its rows alone (place/card_expert_stager.h). The weight's 64-byte alignment
+     * leaves the bits free; only a pass whose rows resolve to the P1 twin may see such an entry. */
+    void  alias_file_units(const std::vector<int32_t>& units, char* base,
+                           std::vector<int32_t>* staged, uintptr_t mark);
     /* borrow_host_unit  for a reader on the host (place/host_expert_pool.h): when the mapped RAM
      *                   cache holds every weight of file-tier unit `u`, a lease on each, which
      *                   keeps its bytes in place until release_host_unit, and their host
@@ -601,6 +607,7 @@ public:
         int            n = 0;
         bool           packed = false;
         const uint8_t* host[2] = { nullptr, nullptr };
+        const void*    dev[2] = { nullptr, nullptr };   /* the same bytes as the card's DMA reads them */
         int64_t        bytes[2] = { 0, 0 };
         int64_t        slot[2] = { 0, 0 };
         NativeMappedFileCache::Lease lease[2];
@@ -796,6 +803,32 @@ public:
     using FileRelayout = std::function<int(const WeightInfo& w, const RadTensor* planes,
                                            void* dst, int64_t dst_bytes)>;
     void  set_file_relayout(FileRelayout fn) { relayout_ = std::move(fn); }
+    /* ---- prefill Phase 1 (place/card_expert_stager.h) ---------------------------------------
+     *
+     * file_region       the file stager's two buffers as one region (the ring of whole slots), its
+     *                   bytes in *bytes; null without buffers.
+     * ring_copy         copies `n` segments on the mover's stream (the card's DMA lane, one list),
+     *                   behind each of `waits` (null entries skipped), and records `done` after them.
+     * mover_wait        the mover's stream waits on `ev` (a hand-over: copies queued later run
+     *                   behind it).
+     * file_unit_in_slab a file-tier unit the slab holds: published at its slab slot, never aliased.
+     * pack_unit_for_ring one missed unit's planes into `dst` (cap bytes, at least ds41p1::kSlotBytes)
+     *                   as a ring slot holds it: gate_up at 0, down at ds41p1::kDnOff; in the packed
+     *                   RAM cache's form (pack_planes with the cache's raw budgets and its round-trip
+     *                   check) when that cache is on and both weights fit their budgets, else in the
+     *                   stored block form (the file tier's relayout). *packed says which. Pure and
+     *                   thread-safe, for a packer thread beside the issuing one. */
+    char* file_region(int64_t* bytes) const {
+        if (bytes) *bytes = file_vram_ ? 2 * file_buf_bytes_ : 0;
+        return file_vram_;
+    }
+    int   ring_copy(const RadCopySeg* segs, int n, const RadEvent* waits, int n_waits, RadEvent done);
+    int   mover_wait(RadEvent ev);
+    bool  file_unit_in_slab(int32_t u) const {
+        return u >= 0 && (size_t)u < unit_.size() && unit_[(size_t)u].slab_slot >= 0;
+    }
+    int   pack_unit_for_ring(const HostPlanes& p, uint8_t* dst, int64_t cap, bool* packed,
+                             int64_t bytes[2]) const;   /* bytes: gate_up's and down's, as written */
     char* file_buffer(int i) const {
         return (file_vram_ && (i == 0 || i == 1)) ? file_vram_ + i * file_buf_bytes_ : nullptr;
     }

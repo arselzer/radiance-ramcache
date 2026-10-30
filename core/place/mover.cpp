@@ -8,6 +8,7 @@
 #include "format/dspark_rad_banks.h"
 #include "../device/device.h"
 #include "ds41_host_experts.h"
+#include "ds41_p1.h"
 
 #include <algorithm>
 #include <atomic>
@@ -879,6 +880,97 @@ void Mover::alias_file_units(const std::vector<int32_t>& units, char* base,
     }
 }
 
+void Mover::alias_file_units(const std::vector<int32_t>& units, char* base,
+                             std::vector<int32_t>* staged, uintptr_t mark) {
+    if (!mark) return alias_file_units(units, base, staged);
+    if (!plan_ || !base || !staged || ((uintptr_t)base & 63)) return;
+    char* const marked = (char*)((uintptr_t)base | (mark & 63));
+    for (int32_t u : units) {
+        if (u < 0 || (size_t)u >= unit_.size()) continue;
+        const UnitState& us = unit_[(size_t)u];
+        if (us.tier != Tier::SSD || us.slab_slot >= 0 || us.klass < 0) continue;
+        const MoveUnit& mu = plan_->units[(size_t)u];
+        for (rad_weight w : mu.weights) res_.publish(w, marked);
+        staged->push_back(u);
+        ++stats_.file_aliased;
+    }
+}
+
+int Mover::ring_copy(const RadCopySeg* segs, int n, const RadEvent* waits, int n_waits, RadEvent done) {
+    if (!mover_ || n < 0 || (n > 0 && !segs) || !done) return RAD_E_INVAL;
+    for (int i = 0; i < n_waits; ++i)
+        if (waits && waits[i]) RAD_TRY(rad_event_wait(mover_, waits[i]));
+    if (n > 0) RAD_TRY(rad_memcpy_list_async(segs, n, RAD_COPY_YIELD, mover_));
+    for (int i = 0; i < n; ++i) stats_.h2d_bytes += (uint64_t)segs[i].bytes;
+    return rad_event_record(done, mover_);
+}
+
+int Mover::mover_wait(RadEvent ev) {
+    if (!mover_ || !ev) return RAD_E_INVAL;
+    return rad_event_wait(mover_, ev);
+}
+
+int Mover::pack_unit_for_ring(const HostPlanes& p, uint8_t* dst, int64_t cap, bool* packed,
+                              int64_t bytes[2]) const {
+    if (!prog_ || !dst || !packed || !bytes || p.n != 2 || cap < ds41p1::kSlotBytes) return RAD_E_INVAL;
+    *packed = false;
+    int klass[2] = { -1, -1 };
+    for (int k = 0; k < 2; ++k) {
+        const WeightInfo& w = prog_->weights[p.w[k]];
+        klass[k] = w.stored_bytes == ds41p1::kGuBlockBytes ? 0 : w.stored_bytes == ds41p1::kDnBlockBytes ? 1 : -1;
+        if (klass[k] < 0 || p.rows[k] != kPackedShape[klass[k]][0] || p.cols[k] != kPackedShape[klass[k]][1] ||
+            !p.codes[k] || !p.scales[k])
+            return RAD_E_STATE;
+    }
+    if (klass[0] == klass[1]) return RAD_E_STATE;
+    const int64_t off[2] = { 0, ds41p1::kDnOff };
+    /* The packed RAM cache's form when it is on and both weights fit its raw budgets: the bytes a
+     * RAM-cache hit's slot holds, so a ring slot's entry is gemv_vp's form either way. */
+    if (mapped_file_cache_on_ && mapped_file_cache_.packed()) {
+        ds41hx::PackInfo plan[2];
+        bool fits = true;
+        for (int k = 0; k < 2 && fits; ++k) {
+            const int c = klass[k];
+            fits = ds41hx::pack_plan(p.scales[k], kPackedShape[c][0], kPackedShape[c][1], &plan[k]) &&
+                   plan[k].n_exc <= packed_raw_[c] &&
+                   (int64_t)ds41hx::packed_bytes(kPackedShape[c][0], kPackedShape[c][1], packed_raw_[c]) <=
+                       (c == 0 ? ds41p1::kDnOff : ds41p1::kSlotBytes - ds41p1::kDnOff);
+        }
+        if (fits) {
+            bool ok = true;
+            for (int k = 0; k < 2 && ok; ++k) {
+                const int c = klass[k], N = kPackedShape[c][0], K = kPackedShape[c][1];
+                const int64_t bytes = (int64_t)ds41hx::packed_bytes(N, K, packed_raw_[c]);
+                uint8_t* const at = dst + off[c];
+                ds41hx::Mx view;
+                ok = ds41hx::pack_planes(p.codes[k], p.scales[k], N, K, packed_raw_[c], plan[k], at, (size_t)bytes,
+                                         nullptr) == ds41hx::kPackOk &&
+                     ds41hx::packed_view(at, (size_t)bytes, N, K, &view) &&
+                     ds41hx::packed_scales_equal(view, p.scales[k]);
+            }
+            if (ok) {
+                *packed = true;
+                for (int c = 0; c < 2; ++c)
+                    bytes[c] = (int64_t)ds41hx::packed_bytes(kPackedShape[c][0], kPackedShape[c][1], packed_raw_[c]);
+                return RAD_OK;
+            }
+        }
+    }
+    /* The stored block form, as the file tier relays a weight for the card. */
+    if (!relayout_) return RAD_E_STATE;
+    for (int k = 0; k < 2; ++k) {
+        const WeightInfo& w = prog_->weights[p.w[k]];
+        RadTensor pt[RAD_ENC_MAX_PLANES];
+        weight_planes(w, pt);
+        pt[0].data = const_cast<uint8_t*>(p.codes[k]);
+        pt[1].data = const_cast<uint8_t*>(p.scales[k]);
+        const int st = relayout_(w, pt, dst + off[klass[k]], w.stored_bytes);
+        if (st < 0) return st;
+        bytes[klass[k]] = w.stored_bytes;
+    }
+    return RAD_OK;
+}
+
 bool Mover::borrow_host_unit(int32_t u, HostUnit* out, bool touch) {
     if (!out || out->n != 0 || !plan_ || !prog_ || !mapped_file_cache_on_ || u < 0 ||
         (size_t)u >= unit_.size())
@@ -915,6 +1007,7 @@ bool Mover::borrow_host_unit(int32_t u, HostUnit* out, bool touch) {
             return false;
         }
         out->host[out->n] = l.host();
+        out->dev[out->n] = l.device() ? l.device() : (const void*)l.host();
         out->bytes[out->n] = w.stored_bytes;
         out->slot[out->n] = (int64_t)l.bytes();
         ++out->n;
@@ -1589,6 +1682,7 @@ void Mover::release_host_unit(HostUnit* hu) {
     for (int i = 0; i < hu->n; ++i) {
         (void)hu->lease[i].release();
         hu->host[i] = nullptr;
+        hu->dev[i] = nullptr;
         hu->bytes[i] = 0;
         hu->slot[i] = 0;
     }

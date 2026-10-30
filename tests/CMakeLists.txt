@@ -861,3 +861,15 @@ if(R4D_EMU_BUILT)
   add_test(NAME r4d_emu_ds41p1_quick COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_ds41p1 quick)
   set_tests_properties(r4d_emu_ds41p1_quick PROPERTIES LABELS "r4d_emu;fast" TIMEOUT ${RAD_TEST_TIMEOUT})
 endif()
+
+# ---- P1 (S)
+# Prefill Phase 1's stager and end-aligned chunks (core/place/card_expert_stager.h, core/sched/p1_chunk.h):
+# p1_stager_test (the scheduling on a simulated card, the ring stress, the tunables, the admission) and
+# p1_chunk_test (Scheduler::plan_chunk's end alignment on the scheduler fakes), registered by the glob
+# above. Host only: the cards hidden, in the fast tier.
+foreach(t p1_stager_test p1_chunk_test)
+  if(TEST ${t})
+    set_property(TEST ${t} APPEND PROPERTY ENVIRONMENT "ROCR_VISIBLE_DEVICES=99")
+    set_property(TEST ${t} APPEND PROPERTY LABELS fast)
+  endif()
+endforeach()

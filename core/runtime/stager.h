@@ -32,6 +32,14 @@ public:
      * here runs right before the op. `t` holds one tensor a schema operand. */
     virtual int operands(rad_op, RadStream, const RadTensor*, int) { return RAD_OK; }
 
+    /* After op `h`'s kernel was launched on `s` (device domain, a pass the stager armed for): the
+     * resolved arguments and the launch function, so the stager may launch the same row again later
+     * in the pass with a changed weight table (prefill Phase 1's waves, place/card_expert_stager.h).
+     * `a` and what it points to live only for this call. */
+    virtual int launched(rad_op, RadStream, const RadArgs*, int (*)(const RadArgs*, RadStream)) {
+        return RAD_OK;
+    }
+
     /* After op `h` was issued on stream `s`: the point a staged weight's last reader is behind. */
     virtual int after_op(rad_op, RadStream) { return RAD_OK; }
 
@@ -70,6 +78,12 @@ public:
     int operands(rad_op h, RadStream s, const RadTensor* t, int n_t) override {
         for (int i = 0; i < 2; ++i)
             if (on_[i]) { const int rc = s_[i]->operands(h, s, t, n_t); if (rc < 0) return rc; }
+        return RAD_OK;
+    }
+    int launched(rad_op h, RadStream s, const RadArgs* a,
+                 int (*launch)(const RadArgs*, RadStream)) override {
+        for (int i = 0; i < 2; ++i)
+            if (on_[i]) { const int rc = s_[i]->launched(h, s, a, launch); if (rc < 0) return rc; }
         return RAD_OK;
     }
     int after_op(rad_op h, RadStream s) override {

@@ -72,6 +72,27 @@ radiance ... --tp 4 --placement expert_tiered --weights-disk-tier \
   --expert-plane-mirror-decode-share 0.13                              # the mirror is optional, see below
 ```
 
+**For code-heavy single-stream use (agent harnesses), add DSpark speculation.** Exact (every draft is
+verified; replies identical in every window), measured against the configuration above with packed
+VRAM residents on both sides: code prompts **+9.2%** (19.20 vs 17.59 tok/s, 16 coding tasks, 89% of
+drafts accepted, every prompt +5 to +12%, ab-20261030T160056Z); held-out prompts a tie (19.85 vs 19.84);
+chat -1.3% (creative prompts lose 10-18% at 34-50% acceptance, ab-20261030T154217Z). Until the
+load-aware switch lands, leave it off when several requests decode at once.
+
+```
+RADIANCE_EXPERIMENTAL_DS41_DSPARK_RAD_BANK=1                # the 3-stage DSpark drafter from its bank
+RADIANCE_EXPERIMENTAL_DS41_DSPARK_VERIFY_CAP=1              # one drafted token a step
+RADIANCE_EXPERIMENTAL_DS41_DSPARK_SHORT_BLOCK=2             # 2-row query block (with --draft-short-from 1)
+RADIANCE_EXPERIMENTAL_DS41_DRAFT_GEMV=2                     # draft expert GEMVs on the live tail
+RADIANCE_EXPERIMENTAL_DS41_DRAFT_VRAM=24                    # 24 hot draft experts a stage and card in VRAM, router masked
+RADIANCE_EXPERIMENTAL_DS41_DRAFT_HOTSET=<hot set file>      # draft_hotset.py write (ranked from an --expert-stats capture)
+RADIANCE_EXPERIMENTAL_DS41_DSPARK_FP8=1                     # the drafter's dense linears from E4M3 codes
+RADIANCE_EXPERIMENTAL_DS41_PREFETCH_MULTIROW=6              # read-ahead in 2-row verify passes too
+
+radiance ... (as above) --draft-bank <draft.rad> --draft-bank-expert-placement host \
+  --num-speculative-tokens 5 --spec-ngram 0 --draft-short-from 1 --expert-plane-mirror-min-rows 7
+```
+
 With the planner's routed-only staging reserve (`bba1fda6`) the pinned pool needs only 256 MiB a rank,
 which frees ~6.4 GB. Given to the cache instead (`--expert-ram-cache-total-mib 104448`, the RAM the
 earlier 96 GiB + 1900 MiB configuration used): decode +4.3% and TTFT −6% in two runs of three, misses −9%, but with ~8 GB free the third lost 15% when the box ran short of memory (other jobs, the n-gram table's page cache).

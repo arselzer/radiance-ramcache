@@ -213,7 +213,9 @@ F8_E8M0 scales one per 32x32 block (model-00044..46's headers), and the draft ba
 to bf16 (`blk.40-42.*`, `dspark.fc.weight`). With `=1` (and `..._DENSE_FP8=1`, which it extends)
 the deepseek41 plugin marks them as lw8() marks the trunk's and gives the drafter's shared expert
 `gemm_nt_bf16f8`; the load re-encodes each and refuses one that is not exactly so
-(`ds41_dense_fp8_scan` now covers a bank's `dspark.fc.weight` too). The op writes gemm_nt's bytes, so
+(`ds41_dense_fp8_scan` now covers a bank's `dspark.fc.weight` too; over the bank of
+ds41-dspark-bank-20261028T140400Z: 43 / 43 entries exact, 551,424 blocks, none refused, every
+tensor-parallel cut on 32). The op writes gemm_nt's bytes, so
 the drafter proposes the same tokens; the stored form halves those weights, 25 a rank (fc and, per
 stage, q_a, q_b, kv, wo_b, two wo_a groups and the shared pair): 438 MiB of bf16 become 219 MiB of
 codes on rank 0 and 415.5 become 207.8 on ranks 1-3 (`ds41_dspark_fp8_arch_test`), about 11 more

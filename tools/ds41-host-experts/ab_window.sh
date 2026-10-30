@@ -679,8 +679,9 @@ EOF2
     local pmr_bad="" pmr2
     grep -q 'router predictor, multi-row decode passes: [1-9]' "$OUT/$name.server.log" ||
       pmr_bad="no 'router predictor, multi-row decode passes' line with posts"
-    pmr2=$(grep -oE '2 rows: [0-9]+ planned' "$OUT/$name.server.log" | grep -oE '[0-9]+ planned' | grep -oE '^[0-9]+' | awk '{s += $1} END {print s + 0}')
-    [[ -z "$pmr_bad" && "$pmr2" == 0 ]] && pmr_bad="no rank planned a unit in a 2-row pass ('2 rows: N planned')"
+    # Any pass of 2..9 rows: a DsK arm's verify passes have K + 1 rows.
+    pmr2=$(grep -oE '[2-9] rows: [0-9]+ planned' "$OUT/$name.server.log" | grep -oE '[0-9]+ planned' | grep -oE '^[0-9]+' | awk '{s += $1} END {print s + 0}')
+    [[ -z "$pmr_bad" && "$pmr2" == 0 ]] && pmr_bad="no rank planned a unit in a pass of 2-9 rows ('K rows: N planned')"
     if [[ -n "$pmr_bad" ]]; then
       log "arm $name: Pmr${ARM_PMR}, but $pmr_bad; not measured (results kept as $name.unmeasured.json)"
       [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"

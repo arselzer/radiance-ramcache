@@ -38,7 +38,7 @@ RADIANCE_EXPERIMENTAL_NATIVE_CACHE_MAPPED_SOURCE=1
 RADIANCE_EXPERIMENTAL_NATIVE_CACHE_DIRECT_FILL=1
 RADIANCE_EXPERIMENTAL_NATIVE_CACHE_PREGROW=1               # pin the cache's slabs at startup
 RADIANCE_EXPERIMENTAL_DS41_MXFP4_PACK_SSE2=1
-RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS=1             # VRAM file buffers to residents
+RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS=6             # two VRAM file buffers of 6 units: Phase 1's 12-slot ring (1 without P1)
 RADIANCE_EXPERIMENTAL_DS41_CACHE_WARM=1                    # fill the cache from the profile
 RADIANCE_EXPERIMENTAL_DS41_ENGRAM_SPLIT=1                  # engram_kv's rows split over the ranks
 RADIANCE_EXPERIMENTAL_DS41_PREFETCH_ATTN=1                 # next layer's attention weights into the on-die cache
@@ -56,6 +56,7 @@ RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MAX_ROWS=32          # prefill: CPU jobs
 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MISSES=1024         # misses computed on the CPU in passes of up to 1024 tokens
 RADIANCE_EXPERIMENTAL_DS41_LCP=1024                         # large-chunk prefill: chunks of 1024 tokens (with --max-num-batched-tokens 1024)
 RADIANCE_EXPERIMENTAL_DS41_MOE_BALANCE=1                    # routed gemv: work split by row passes, all-dropped passes skipped (exact)
+RADIANCE_EXPERIMENTAL_DS41_P1=1                             # prefill Phase 1: layer passes of >= 320 rows (..._P1_MIN_ROWS) compute every routed expert on the cards (needs the libr4d whose P1 card check passed)
 RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP=1                # no pass after a reply's end-of-generation token
 RADIANCE_EXPERIMENTAL_DS41_PREFETCH_URGENT=1               # a partly read read-ahead unit's rest read whole in its layer's own read
 RADIANCE_EXPERIMENTAL_DS41_INSERT_SLICE_KIB=256            # background inserts in 256 KiB pieces, waiting for an idle pool
@@ -70,11 +71,23 @@ radiance ... --tp 4 --placement expert_tiered --weights-disk-tier \
   --expert-plane-mirror-decode-share 0.13                              # the mirror is optional, see below
 ```
 
+**Phase 1 prefill** (`..._P1=1` with the 6-unit file buffers; ab-20261030T231526Z, every reply and prefill hash
+identical to the large-chunk path): time to first token 1.9 / 3.7 / 4.2 / 7.4 / 8.7 s for prompts of 82 / 272 / 933 /
+1,890 / 3,086 tokens, against 1.9 / 3.7 / 10.5 / 18.5 / 28.0 s without it (355 tok/s at 3,086 tokens); 6,817 tokens
+in 26.7 s against 51.2 s. Layer passes below 320 rows keep the large-chunk path, so short prompts are unchanged.
+Decode stays within ~1% (29.68 against 29.88 tok/s on the held-out prompts). `..._P1_LEND` (decode residents in the
+ring's idle slots) measured nothing more and stays off. 2,048-token chunks are faster still for long prompts
+(6.6 s at 3,086 tokens in ab-20261030T201710Z) but their activation arena costs ~50 VRAM residents a card.
+
 `RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED=1` (packed VRAM residents, ~31 more a card, about +1% decode) and
 `RADIANCE_EXPERIMENTAL_DS41_ROUTER_BF16=1` (bf16 routers, +0.6%) are left out above. Large-chunk prefill refuses the
 packed residents, because their gemv_vp serves passes of up to 16 tokens (found in ab-20261030T223155Z), and the
 bf16 routers were never measured beside it: the windows behind the large-chunk numbers ran without both. For a
-decode-only server without `..._LCP`, add both (with their card checks).
+decode-only server without `..._LCP`, add both (with their card checks). Under Phase 1 the packer packs no residents, so `..._VRAM_PACKED` does
+nothing there either.
+
+Two-batch overlap of concurrent decode steps (`RADIANCE_EXPERIMENTAL_SCHED_TBO=1`, opt-in, exact) loses on 256 GB
+too: 37.4 against 38.7 tok/s in total at 4 streams and 40.7 against 42.9 at 8 (ab-20261030T231526Z). Leave it off.
 
 **On 256 GB of RAM (8x 32 GB DDR4-2666) with a 192 GiB expert cache** (ab-20261030T194..., replies identical): decode **31.2 tok/s** a stream (19.9 with 96 GiB on 128 GB of DDR4-2133; 20.9 with 96 GiB on the new RAM, so the cache size, not the memory speed, is the gain: rank 0's misses fall 2,073 → 361 on the held-out prompts); **38.7 tok/s in all at 4 streams**; prefill 3,086 tokens in 28.1 s (110 tok/s) and 6,817 in 51.7 s (132 tok/s). 192 and 208 GiB measure the same.
 

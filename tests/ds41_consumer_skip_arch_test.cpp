@@ -40,7 +40,8 @@ constexpr int kWorld = 4;
 const char* const kVars[] = { "RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP",
                               "RADIANCE_EXPERIMENTAL_DS41_PREFETCH_ATTN",
                               "RADIANCE_EXPERIMENTAL_DS41_ENGRAM_SPLIT",
-                              "RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8" };
+                              "RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8",
+                              "RADIANCE_EXPERIMENTAL_DS41_KV_REPLICATED" };
 struct Env {
     Env(std::initializer_list<std::pair<const char*, const char*>> kv) {
         for (const char* n : kVars) unsetenv(n);
@@ -666,6 +667,48 @@ TEST(ds41_row_cut_refuses_what_its_contract_does_not_cover) {
     REQUIRE(steps_ok(ri));
     REQUIRE(steps_ok(rp));
     CHECK(issued(*ri[0]) == issued(*rp[0]));
+}
+
+/* RADIANCE_EXPERIMENTAL_DS41_KV_REPLICATED (kv_replicate): the compressed and index caches are
+ * declared replicated on every rank of four, so a host-tier entry holds one copy; the window, the
+ * compressor tails and the Engram history are left alone, and without the switch nothing is
+ * declared. At three ranks one keeps no attention cache (attention-zero), so it is refused there
+ * on every rank, with its line from rank 0. */
+TEST(ds41_kv_replicated_declares_the_full_caches_on_every_rank) {
+    for (int on = 0; on < 2; ++on) {
+        Env env({});
+        if (on) setenv("RADIANCE_EXPERIMENTAL_DS41_KV_REPLICATED", "1", 1);
+        for (int rank = 0; rank < kWorld; ++rank) {
+            auto d = declare(rank);
+            REQUIRE_EQ(d->rc, (int)RAD_OK);
+            int full = 0, rep = 0;
+            for (const RecKV& k : d->b.kv_groups) {
+                const bool f = k.name.rfind("kv_index_r", 0) == 0 ||
+                               k.name.rfind("kv_compressed_r", 0) == 0;
+                full += f;
+                if (k.replicated) {
+                    ++rep;
+                    CHECK(f);
+                }
+            }
+            CHECK_EQ(full, 4);                    /* index and compressed, at ratios 2 and 1 */
+            CHECK_EQ(rep, on ? 4 : 0);
+            const bool line = d->err.find("KV_REPLICATED: 4 paged group(s) declared replicated "
+                                          "(kv_index_r1,kv_index_r2,kv_compressed_r1,"
+                                          "kv_compressed_r2)") != std::string::npos;
+            CHECK_EQ(line, on && rank == 0);
+        }
+    }
+    Env env({ { "RADIANCE_EXPERIMENTAL_DS41_KV_REPLICATED", "1" } });
+    for (int rank = 0; rank < 3; ++rank) {
+        auto d = declare(rank, flash_meta(), 0, 3);
+        REQUIRE_EQ(d->rc, (int)RAD_OK);
+        CHECK_EQ(d->m->zero, rank == 2);
+        for (const RecKV& k : d->b.kv_groups) CHECK(!k.replicated);
+        const bool refused = d->err.find("KV_REPLICATED refused: a rank keeps no attention cache") !=
+                             std::string::npos;
+        CHECK_EQ(refused, rank == 0);
+    }
 }
 
 RAD_TEST_MAIN()

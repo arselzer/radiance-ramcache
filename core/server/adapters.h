@@ -131,6 +131,12 @@ inline SchedMetrics bridge_metrics(const rad::SchedMetrics& m) {
     o.linear_cached_tokens = m.linear_cached_tokens;
     o.checkpoints_written = m.checkpoints_written;
     o.prefix_publish_held_tokens = m.prefix_publish_held_tokens;
+    o.eors_reserved = m.eors_reserved;        o.eors_committed = m.eors_committed;
+    o.eors_ahead_withheld = m.eors_ahead_withheld;
+    o.eors_hits = m.eors_hits;                o.eors_hit_tokens = m.eors_hit_tokens;
+    o.eors_hit_deepest = m.eors_hit_deepest;
+    o.store_held = m.store_held;              o.store_peak = m.store_peak;
+    o.store_session_lru = m.store_session_lru; o.trim_spared = m.trim_spared;
     o.draft_depth_seen = m.draft_depth_seen;
     if (o.draft_depth_seen > SchedMetrics::MAX_DRAFT_POS)
         o.draft_depth_seen = SchedMetrics::MAX_DRAFT_POS;

@@ -8683,3 +8683,345 @@ TEST(lcp_row_cut_makes_the_checkpoints_below_the_target_whole) {
         CHECK(cs.rows_skipped > 0);
     }
 }
+
+/* ================================================================== end-of-request snapshots */
+/* RADIANCE_EXPERIMENTAL_PREFIX_EORS (Scheduler::eors_): a decode step whose row completes a
+ * position on the resume grid past its prompt snapshots the state there, a prompt ending on the
+ * grid snapshots its end, every prompt takes its tail snapshot, and a step that would carry a
+ * decode snapshot is planned after its predecessor's commit, never issued ahead. */
+namespace {
+/* init reads the switch, so it is set around start() alone; `window` the opt-in a model whose only
+ * state is a sliding window needs beside it (RADIANCE_EXPERIMENTAL_PREFIX_EORS_WINDOW). */
+int eors_start(Fixture& f, bool on, bool window = false) {
+    if (on) setenv("RADIANCE_EXPERIMENTAL_PREFIX_EORS", "1", 1);
+    else unsetenv("RADIANCE_EXPERIMENTAL_PREFIX_EORS");
+    if (window) setenv("RADIANCE_EXPERIMENTAL_PREFIX_EORS_WINDOW", "1", 1);
+    else unsetenv("RADIANCE_EXPERIMENTAL_PREFIX_EORS_WINDOW");
+    log_set_level(Log::Error);
+    const int rc = f.start();
+    unsetenv("RADIANCE_EXPERIMENTAL_PREFIX_EORS");
+    unsetenv("RADIANCE_EXPERIMENTAL_PREFIX_EORS_WINDOW");
+    return rc;
+}
+
+struct EorsRun {
+    std::vector<int64_t> ckpts, eors;   /* every snapshot reserved for the request; the e-o-r ones */
+    std::vector<int64_t> ckpt_rows;     /* the rows a decode snapshot is taken after */
+    int64_t n_computed = 0;
+    int64_t cut_end = -1;               /* the consumer skip's target its prefill carried */
+    int ahead = 0;                      /* steps issued ahead */
+};
+
+/* One request to its end as the engine drives the scheduler: each open step's successor issued
+ * ahead where the scheduler allows it (step_next), the step committed, then the successor promoted
+ * or the next step planned afresh. */
+EorsRun eors_run(Fixture& f, uint64_t id, bool ahead) {
+    EorsRun out;
+    const RadBatch* b = f.sch.step();
+    for (int k = 0; k < 4000 && b; ++k) {
+        for (const StepEntry& e : f.sch.plan().e) {
+            if (e.seq != id) continue;
+            if (e.is_prefill && out.cut_end < 0) out.cut_end = e.consumer_end;
+            if (e.ckpt_slot < 0) continue;
+            const int64_t p = (int64_t)e.ctx_len + e.ckpt_tok + 1;
+            out.ckpts.push_back(p);
+            if (e.ckpt_eors) out.eors.push_back(p);
+            if (!e.is_prefill) out.ckpt_rows.push_back((int64_t)e.ctx_len + e.ckpt_tok);
+        }
+        if (Request* r = f.sch.find(id)) r->speculation_fixed = true;
+        const RadBatch* nb = ahead ? f.sch.step_next() : nullptr;
+        f.commit_plain();
+        if (nb) {
+            ++out.ahead;
+            f.sch.promote_next();
+            b = nb;
+        } else {
+            b = f.sch.step();
+        }
+    }
+    if (const Request* r = f.sch.find(id)) out.n_computed = r->n_computed;
+    return out;
+}
+}  /* namespace */
+
+/* DeepSeek-V4.1's shape at the default interval (2048): a 1,000-token prompt and 40 tokens out
+ * compute 1,039 positions, so the reply crosses the grid at 1008 and 1024, and the prompt's tail
+ * (992, the start of its last chunk) is taken although it is inside the first interval. A prompt
+ * ending on the grid (1008) also snapshots its end. Issued ahead or not, the same snapshots, and
+ * the two decode steps that carry one are the two not issued ahead for it. Off: the ladder alone,
+ * which holds nothing for a prompt inside the first interval. */
+TEST(eors_snapshots_the_reply_on_the_grid_and_every_prompts_tail) {
+    for (const bool ahead : { false, true }) {
+        for (const int n : { 1000, 1008 }) {
+            Fixture f;
+            ds41_fixture(f, 2048);
+            REQUIRE_EQ(eors_start(f, true), RAD_OK);
+            REQUIRE(f.sch.eors_on());
+            const uint64_t id = f.submit(n, 40, 0, true);
+            REQUIRE(id != 0);
+            const EorsRun r = eors_run(f, id, ahead);
+            CHECK_EQ(r.n_computed, (int64_t)n + 39);
+            const std::vector<int64_t> eors = n == 1000 ? std::vector<int64_t>{ 1008, 1024 }
+                                                        : std::vector<int64_t>{ 1008, 1024, 1040 };
+            std::vector<int64_t> all = { 992 };
+            all.insert(all.end(), eors.begin(), eors.end());
+            CHECK(r.eors == eors);
+            CHECK(r.ckpts == all);
+            CHECK(f.pc.reserved_eors == eors);
+            CHECK(f.pc.committed == all);
+            /* A decode snapshot is the state after its step's only row. */
+            for (size_t i = 0; i < r.ckpt_rows.size(); ++i)
+                CHECK_EQ(r.ckpt_rows[i] + 1, r.eors[r.eors.size() - r.ckpt_rows.size() + i]);
+            const SchedMetrics m = f.sch.metrics();
+            CHECK_EQ(m.eors_reserved, (int64_t)eors.size());
+            CHECK_EQ(m.checkpoints_written, (int64_t)all.size());
+            if (ahead) {
+                CHECK(r.ahead > 30);
+                CHECK_EQ(m.eors_ahead_withheld, 2ll);
+            } else {
+                CHECK_EQ(r.ahead, 0);
+                CHECK_EQ(m.eors_ahead_withheld, 0ll);
+            }
+        }
+    }
+    Fixture f;
+    ds41_fixture(f, 2048);
+    REQUIRE_EQ(eors_start(f, false), RAD_OK);
+    CHECK(!f.sch.eors_on());
+    const uint64_t id = f.submit(1000, 40, 0, true);
+    const EorsRun r = eors_run(f, id, true);
+    CHECK_EQ(r.n_computed, 1039ll);
+    CHECK(r.ckpts.empty());
+    CHECK(f.pc.reserved_eors.empty());
+    CHECK_EQ(f.sch.metrics().eors_ahead_withheld, 0ll);
+    CHECK(r.ahead > 30);
+}
+
+/* The grid is whatever exact resumption allows: with chunks split at an interval of 256 inside a
+ * 512-token budget the reply's snapshots fall every 256 tokens, beside the interval ladder and the
+ * tail. Linear state with no chunked scan (DeepSeek-V4.1's shape, at that budget), and a model
+ * whose only state is a sliding window, which takes the switch with its opt-in alone. */
+TEST(eors_snapshots_follow_the_resume_grid) {
+    for (const bool window : { false, true }) {
+        Fixture f;
+        if (window) {
+            exact_fixture(f, 3);
+        } else {
+            f.build(4096, 64, /*max_tok=*/512, 4096, /*windowed=*/true, /*linear=*/true);
+            f.prog.ops.resize(1);          /* no gdn_chunk_scan: a state chunk of 1 */
+            f.kv.snap = { 3 };
+            f.pc.groups = { 0 };
+            f.cfg.prefix_exact = true;
+        }
+        REQUIRE_EQ(eors_start(f, true, window), RAD_OK);
+        REQUIRE(f.sch.eors_on());
+        REQUIRE_EQ(f.sch.geometry().state_chunk, 1);
+        REQUIRE(f.sch.geometry().window_ckpt == window);
+        REQUIRE_EQ(f.sch.geometry().grid, 256);
+        const uint64_t id = f.submit(1000, 300, 0, true);
+        const EorsRun r = eors_run(f, id, true);
+        CHECK_EQ(r.n_computed, 1299ll);
+        CHECK((r.ckpts == std::vector<int64_t>{ 256, 512, 768, 1024, 1280 }));
+        CHECK((r.eors == std::vector<int64_t>{ 1024, 1280 }));
+    }
+}
+
+/* Refused, with the reason, where the exactness argument does not reach: without the exact grid,
+ * without a prefix cache, with speculation, beside exact publish (which keeps out the decode
+ * blocks a snapshot past the prompt stands on), and on a model with no state a snapshot holds.
+ * Refused where it is known to fail: the GDN hybrids, whose recurrent state is scanned in chunks
+ * of 64 (qwen35 and QFN decode a row otherwise than their chunked prefill rounds it), at every
+ * interval, budget and span. A model whose only state is a sliding window takes it only with
+ * RADIANCE_EXPERIMENTAL_PREFIX_EORS_WINDOW=1, periodic snapshots or tip-only. */
+TEST(eors_is_refused_where_its_exactness_is_not_shown) {
+    {
+        Fixture f;
+        ds41_fixture(f, 2048);
+        f.cfg.prefix_exact = false;
+        REQUIRE_EQ(eors_start(f, true), RAD_OK);
+        CHECK(!f.sch.eors_on());
+    }
+    {
+        Fixture f;
+        ds41_fixture(f, 2048);
+        f.cfg.prefix_cache = false;
+        REQUIRE_EQ(eors_start(f, true), RAD_OK);
+        CHECK(!f.sch.eors_on());
+    }
+    {
+        Fixture f;
+        ds41_fixture(f, 2048);
+        f.cfg.n_spec = 2;
+        REQUIRE_EQ(eors_start(f, true), RAD_OK);
+        CHECK(!f.sch.eors_on());
+    }
+    {
+        Fixture f;
+        ds41_fixture(f, 2048);
+        setenv("RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH", "1", 1);
+        const int rc = eors_start(f, true);
+        unsetenv("RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH");
+        REQUIRE_EQ(rc, RAD_OK);
+        CHECK(!f.sch.eors_on());
+    }
+    {
+        Fixture f;
+        exact_fixture(f, 5);                  /* full attention alone */
+        REQUIRE_EQ(eors_start(f, true), RAD_OK);
+        CHECK(!f.sch.eors_on());
+    }
+    /* The GDN hybrid at interval 256 / budget 512, at interval 1024, and with a span of 2: its scan
+     * is chunked, with or without the window opt-in. */
+    for (const int kind : { 0, 1, 2 }) {
+        for (const bool window : { false, true }) {
+            Fixture f;
+            exact_fixture(f, kind);
+            REQUIRE_EQ(eors_start(f, true, window), RAD_OK);
+            CHECK_EQ(f.sch.geometry().state_chunk, 64);
+            CHECK(!f.sch.eors_on());
+        }
+    }
+    /* Sliding-window models, periodic snapshots and tip-only: the opt-in alone takes them. */
+    for (const int kind : { 3, 4 }) {
+        for (const bool window : { false, true }) {
+            Fixture f;
+            exact_fixture(f, kind);
+            REQUIRE_EQ(eors_start(f, true, window), RAD_OK);
+            CHECK(f.sch.geometry().window_ckpt);
+            CHECK(f.sch.eors_on() == window);
+        }
+    }
+    /* Linear state without a chunked scan (DeepSeek-V4.1's) needs no opt-in, and takes none. */
+    for (const bool window : { false, true }) {
+        Fixture f;
+        ds41_fixture(f, 2048);
+        REQUIRE_EQ(eors_start(f, true, window), RAD_OK);
+        CHECK(f.sch.eors_on());
+    }
+    /* The same model with a trunk GEMM resolved to libavx (whose blocking follows the row count, so
+     * a decode row rounds otherwise than in a prefill pass): refused; libr4d's row is taken. */
+    for (const char* lib : { "libavx", "libr4d" }) {
+        static KernelRow row;
+        row.plugin = lib;
+        Fixture f;
+        ds41_fixture(f, 2048);
+        OpInfo gemm;
+        gemm.op = "gemm_nt";
+        Band band;
+        band.dom[RAD_DOMAIN_HOST].row = &row;
+        gemm.bands.push_back(band);
+        f.prog.ops.push_back(gemm);
+        REQUIRE_EQ(eors_start(f, true), RAD_OK);
+        CHECK(f.sch.eors_on() == (std::string(lib) != "libavx"));
+    }
+}
+
+/* A hit that resumes at an end-of-request snapshot is counted as one, with the tokens it reused;
+ * the same hit at a prompt's snapshot is not. */
+TEST(eors_counts_the_hits_that_resume_from_an_end_of_request_snapshot) {
+    for (const bool eors_hit : { true, false }) {
+        Fixture f;
+        ds41_fixture(f, 2048);
+        REQUIRE_EQ(eors_start(f, true), RAD_OK);
+        f.pc.seed(1040);
+        f.pc.lin = 1024;                      /* a reply's snapshot, on the 16-token grid */
+        f.pc.src = 5;
+        f.pc.eors_hit = eors_hit;
+        const uint64_t id = f.submit(1100, 4);
+        REQUIRE(f.sch.step() != nullptr);
+        CHECK_EQ(f.sch.find(id)->n_computed, 1024);
+        CHECK_EQ(f.sch.plan().e[0].ckpt_restore, 5);
+        CHECK_EQ(f.sch.plan().e[0].n_tokens, 16);   /* the cold run's chunk [1024, 1040) */
+        const SchedMetrics m = f.sch.metrics();
+        CHECK_EQ(m.eors_hits, eors_hit ? 1ll : 0ll);
+        CHECK_EQ(m.eors_hit_tokens, eors_hit ? 1024ll : 0ll);
+        CHECK_EQ(m.eors_hit_deepest, eors_hit ? 1024ll : 0ll);
+        CHECK_EQ(m.linear_cached_tokens, 1024ll);
+    }
+}
+
+/* The trim after a publish is trim_except over the chain just published, before the sequence is
+ * freed: the entries the request recomputed rather than adopted stay, which a plain trim takes
+ * once the live sequences hold more than three quarters of the pool, cutting the chain below its
+ * new snapshot (mem_test trim_except_keeps_the_entries_a_resumed_turn_recomputed). Without the
+ * switch, a plain trim. */
+TEST(eors_trim_after_a_publish_spares_the_chain_published) {
+    for (const bool on : { false, true }) {
+        Fixture f;
+        f.build(/*blocks=*/80, 64, /*max_tok=*/16, 4096, /*windowed=*/true, /*linear=*/true);
+        f.prog.ops.resize(1);
+        f.kv.snap = { 3 };
+        f.pc.groups = { 0 };
+        f.cfg.checkpoint_interval = 2048;
+        f.cfg.prefix_exact = true;
+        REQUIRE_EQ(eors_start(f, on), RAD_OK);
+        const uint64_t id = f.submit(1000, 40, 0, true);
+        (void)eors_run(f, id, false);
+        /* 1,039 tokens hold 65 of the 80 blocks at the publish: 5 short of a free quarter. */
+        REQUIRE_EQ(f.pc.published.size(), (size_t)1);
+        CHECK_EQ(f.pc.published[0].n_tokens, 1039ll);
+        if (on) {
+            CHECK(f.pc.trims.empty());
+            REQUIRE_EQ(f.pc.trims_except.size(), (size_t)1);
+            CHECK_EQ(f.pc.trims_except[0].seq, id);
+            CHECK_EQ(f.pc.trims_except[0].n_tokens, 1039ll);
+            CHECK(f.pc.trims_except[0].n > 0);
+        } else {
+            CHECK(f.pc.trims_except.empty());
+            REQUIRE_EQ(f.pc.trims.size(), (size_t)1);
+            CHECK(f.pc.trims[0] > 0);
+        }
+    }
+}
+
+/* With the consumer skip a prompt is cut for the deepest snapshot its idle prefill writes, which
+ * end-of-request snapshots make its tail (992) inside the first interval, or its end on the grid
+ * (1008, where the tail below it is then dropped as incomplete). Decode rows run every layer, so
+ * the reply's snapshots are all written. */
+TEST(eors_with_the_consumer_skip_writes_every_snapshot_past_the_cut) {
+    for (const int n : { 1000, 1008 }) {
+        Fixture f;
+        ds41_fixture(f, 2048);
+        f.prog.consumer = RadConsumerSuffix{ (uint32_t)sizeof(RadConsumerSuffix), 16, 4, 64 };
+        f.cfg.consumer_skip = 1;
+        f.cfg.consumer_skip_ckpt = 0;   /* none below the cut made whole (claude/ds41-csckpt's =0) */
+        f.cfg.max_seqs = 1;
+        REQUIRE_EQ(eors_start(f, true), RAD_OK);
+        REQUIRE(f.sch.consumer_on());
+        REQUIRE(f.sch.eors_on());
+        const uint64_t id = f.submit(n, 40, 0, true);
+        const EorsRun r = eors_run(f, id, true);
+        CHECK_EQ(r.cut_end, n == 1000 ? 992ll : 1008ll);
+        const std::vector<int64_t> want = n == 1000 ? std::vector<int64_t>{ 992, 1008, 1024 }
+                                                    : std::vector<int64_t>{ 1008, 1024, 1040 };
+        CHECK(r.ckpts == want);
+        CHECK_EQ(f.sch.metrics().consumer_ckpt_dropped, n == 1000 ? 0ll : 1ll);
+    }
+}
+
+/* The same under the default complete-checkpoint policy (the band of 512, csckpt): the tail below a
+ * prompt that ends on the grid (992 under 1008) is made whole instead of dropped, so every snapshot
+ * the uncut run writes is written; the cut target and the reply's snapshots are as above. */
+TEST(eors_with_the_consumer_skip_and_the_default_band_drops_nothing) {
+    for (const int n : { 1000, 1008 }) {
+        Fixture f;
+        ds41_fixture(f, 2048);
+        f.prog.consumer = RadConsumerSuffix{ (uint32_t)sizeof(RadConsumerSuffix), 16, 4, 64 };
+        f.cfg.consumer_skip = 1;
+        f.cfg.max_seqs = 1;
+        unsetenv("RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP_CKPT");
+        REQUIRE_EQ(eors_start(f, true), RAD_OK);
+        REQUIRE(f.sch.consumer_on());
+        REQUIRE(f.sch.eors_on());
+        CHECK_EQ(f.sch.consumer_ckpt_policy(), Scheduler::kConsumerSkipCkptDefault);
+        const uint64_t id = f.submit(n, 40, 0, true);
+        const EorsRun r = eors_run(f, id, true);
+        CHECK_EQ(r.cut_end, n == 1000 ? 992ll : 1008ll);
+        const std::vector<int64_t> want = n == 1000 ? std::vector<int64_t>{ 992, 1008, 1024 }
+                                                    : std::vector<int64_t>{ 992, 1008, 1024, 1040 };
+        CHECK(r.ckpts == want);
+        CHECK_EQ(f.sch.metrics().consumer_ckpt_dropped, 0ll);
+        CHECK_EQ(f.sch.metrics().consumer_ckpt_whole, n == 1000 ? 0ll : 1ll);
+        CHECK_EQ(f.sch.consumer_stats().ckpt_insured, (uint64_t)0);
+    }
+}

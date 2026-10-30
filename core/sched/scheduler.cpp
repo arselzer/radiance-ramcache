@@ -202,6 +202,129 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
                      "exact; everything computed is published as before");
     }
 
+    /* ---------------------------------------------------------- end-of-request snapshots
+     *
+     * RADIANCE_EXPERIMENTAL_PREFIX_EORS=1 (eors_ in scheduler.h). Which positions it makes
+     * resumable, under --prefix-resume exact with resume grid G (ChunkGeometry::grid: 16 at
+     * --max-num-batched-tokens 16, the chunk an idle prefill cuts): for a request R1 with prompt P1
+     * that ends having computed n1 positions (its prompt and every output token but the last), the
+     * grid positions g with |P1| < g <= n1 (a decode step's, reserved on the step whose row is
+     * g - 1), |P1| itself when it is on the grid, and the start of P1's last chunk (its tail) -- on
+     * top of the prompt ladder (interval boundaries, a shared head). Under the consumer skip a
+     * prefill writes none below its prompt's cut target (consumer_target: the deepest snapshot its
+     * idle prefill writes, |P1| when on the grid, else the tail), whose last layers' windows would
+     * be incomplete (reserve_ckpt drops them, SchedMetrics::consumer_ckpt_dropped); there the
+     * resumable positions are that target and the decode ones, not the ladder below the target nor
+     * the tail of a prompt ending on the grid. The deepest, grid_floor(n1) once the reply crossed
+     * a grid position, is what the next turn of the conversation reaches: its prompt P2 begins with
+     * P1 ++ R1's reply (the client sends the reply back), so the prefix cache's chain over P1 ++
+     * output runs through it, and the hit resumes there.
+     *
+     * Why the resumed turn R2 computes what a cold run of P2 computes, bit for bit (its KV in every
+     * group, its last row's logits, so its reply), on an idle server:
+     *   (A) every op's output for a row depends only on that row's inputs and the KV and state it
+     *       reads, not on how many rows (up to --max-num-batched-tokens) share its pass nor which:
+     *       a decode row computed alone has the bits of the same row in a prefill chunk. The
+     *       device checks of every height-dependent op (ab_window.sh DEVICE_CHECKS=tall: the
+     *       sweep holds each row against the same row launched alone and in launches of 16, up to
+     *       the exact-tall reach) are its evidence, and the window's Kh arms hash every KV group
+     *       and the last row's logits at each prompt's end against a cold run's.
+     *   (B) the arithmetic is deterministic (--deterministic; the CPU expert path is bit-exact
+     *       against the card's kernels).
+     *   (C) a snapshot restores the whole per-sequence state at its position on every rank (the
+     *       linear state slots, and the window pages behind the position), and the adopted blocks
+     *       hold the cached groups' rows below it.
+     * By induction over positions: rows below p equal the cold run's, so the KV and state they
+     * leave do, so by (A) and (B) row p does, whatever pass computed it (R1's prefill chunks, its
+     * short last chunk, its 1-row decode passes; the tokens are P2's by the prefix match). So the
+     * snapshot at g and the blocks below it are the cold run's state at g, and R2 restores and
+     * adopts them (C). From g, R2 cuts the cold run's own chunks (g is on the grid:
+     * an_exact_hit_from_any_checkpoint_recomputes_the_cold_runs_own_chunks in sched_test), so its
+     * rows from g run in the cold run's pass shapes from equal state, which needs not even (A).
+     * Its last row's logits, and so every later token, are the cold run's.
+     * Under the consumer skip a snapshot lies at or past its prompt's cut target, where every
+     * layer's window is complete (consumer_skip.h), and decode rows run every layer; the cut of
+     * R2's own prefill depends only on its target. Under exact tall passes (Xt) G is the tall
+     * chunk and (A) the tall checks up to their reach. Refused, below, where it is not shown:
+     * without the exact grid, with speculation (a verify step's rows past an accepted draft roll
+     * back, and its position is the card's), and with ..._EXACT_PUBLISH, which withholds the
+     * decode-written blocks a snapshot past the prompt stands on. Refused too where (A) is known
+     * to fail: a recurrent state scanned in chunks (ChunkGeometry::state_chunk > 1: a gated delta
+     * net, as qwen35's and QFN's), whose prefill runs a chunked scan, another algorithm than the
+     * one-row recurrence of a decode step, rounding otherwise (engine_e2e_test
+     * a_decoded_token_has_the_probabilities_prefilling_it_gives holds qwen35 within 0.1 in a
+     * log-probability, not bit for bit, and a turn resumed at a snapshot its decode wrote answered
+     * with other probabilities than a cold run). A model whose only state is a sliding window
+     * (ChunkGeometry::window_ckpt) takes it only with RADIANCE_EXPERIMENTAL_PREFIX_EORS_WINDOW=1:
+     * its snapshots are decode-written window rows, and nothing yet holds (A) for one end to
+     * end. */
+    eors_ = false;
+    if (const char* es = std::getenv("RADIANCE_EXPERIMENTAL_PREFIX_EORS"); es && !std::strcmp(es, "1")) {
+        const char* ew = std::getenv("RADIANCE_EXPERIMENTAL_PREFIX_EORS_WINDOW");
+        const bool window_ok = ew && !std::strcmp(ew, "1");
+        std::string why;
+        if (!cfg.prefix_cache)
+            why = "the prefix cache is off (--no-prefix-cache)";
+        else if (!geo_.exact || geo_.grid <= 0)
+            why = "it needs --prefix-resume exact: only an exact resume grid says where a later "
+                  "turn's recompute cuts the cold run's chunks";
+        else if (!geo_.checkpoints())
+            why = "this model keeps no state a snapshot would hold (no linear state, no trunk "
+                  "window): a decode step's blocks are published and hit as they are";
+        else if (geo_.state_chunk > 1)
+            why = "this model scans its recurrent state in chunks of " +
+                  std::to_string(geo_.state_chunk) +
+                  " tokens (a gated delta net, as qwen35's and QFN's): a decode step runs the "
+                  "recurrence one row at a time, which rounds otherwise than a prefill's chunked "
+                  "scan, so the state a decode step would snapshot is not the one a cold prefill "
+                  "reaches";
+        else if (geo_.window_ckpt && !window_ok)
+            why = "this model's only state is a sliding window, and nothing yet shows its decode "
+                  "rows equal to the same rows in a prefill pass; "
+                  "RADIANCE_EXPERIMENTAL_PREFIX_EORS_WINDOW=1 takes it anyway";
+        else if (cfg.n_spec != 0 || prog.drafter.kind != RAD_DRAFT_NONE)
+            why = "speculation is on: a verify step's position past its drafts is the card's, and "
+                  "its rejected rows roll back";
+        else if (exact_publish_)
+            why = "RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH keeps decode-written blocks out of "
+                  "the cache, and a snapshot past the prompt stands on them";
+        if (why.empty()) {
+            /* libavx's GEMMs pick their blocking by the row count, so a decode row rounds otherwise
+             * than the same row in a prefill pass (LFM2 through libavx answered a resumed turn
+             * otherwise than a cold run): property (A) fails, whatever the state's shape. */
+            for (const OpInfo& op : prog.ops) {
+                if (op.op.compare(0, 4, "gemm") != 0) continue;
+                for (const Band& b : op.bands)
+                    for (int d = 0; d < RAD_N_DOMAINS && why.empty(); ++d)
+                        if (b.dom[d] && b.dom[d].row->plugin == "libavx")
+                            why = "the trunk's " + op.op + " resolves to libavx, whose GEMMs block by "
+                                  "the row count: a decode row rounds otherwise than the same row in "
+                                  "a prefill pass, so a decode step's snapshot is not the state a cold "
+                                  "prefill reaches";
+                if (!why.empty()) break;
+            }
+        }
+        if (why.empty()) {
+            eors_ = true;
+            RAD_INFO("end-of-request snapshots: on (RADIANCE_EXPERIMENTAL_PREFIX_EORS) -- a decode "
+                     "step whose row completes a position on the %lld-token resume grid past its "
+                     "prompt snapshots the state there, a prompt ending on the grid snapshots its end "
+                     "and every prompt the start of its last chunk, so a conversation's next turn "
+                     "resumes at most %lld tokens before the reply's last computed position and "
+                     "recomputes the cold run's own chunks from there; such a step is not issued "
+                     "ahead, and the trim after a publish keeps the entries of the chain just "
+                     "published that the request recomputed rather than adopted",
+                     (long long)geo_.grid, (long long)(geo_.grid - 1));
+            if (geo_.window_ckpt)
+                RAD_WARN("end-of-request snapshots: a sliding-window model, taken by "
+                         "RADIANCE_EXPERIMENTAL_PREFIX_EORS_WINDOW=1 -- exact only if its decode "
+                         "rows have the bits of the same rows in a prefill pass on these kernels");
+        } else {
+            RAD_WARN("end-of-request snapshots: refused -- %s; decode writes no snapshot",
+                     why.c_str());
+        }
+    }
+
     kvgeom_ = KVGeom::of(prog.kv_groups);
     for (size_t i = 0; i < kvgeom_.g.size(); ++i) {
         const int64_t w = kv->state_index_width((int32_t)i);
@@ -704,6 +827,7 @@ int Scheduler::add_locked(std::unique_ptr<Request> r) {
     s.ckpt_src = -1;
     s.hit_attn = 0;
     s.hit_owed = false;
+    s.hit_eors = false;
     /* Slots are reused: a request that inherited `restore_waited` would never wait for a deferred
      * release and its restore would be cut. */
     s.restore_waited = false;
@@ -892,7 +1016,7 @@ int Scheduler::release_session(const std::string& label, uint64_t id, int64_t ke
     return rc;
 }
 
-void Scheduler::trim_prefix_cache() {
+void Scheduler::trim_prefix_cache(const Request* spare, int64_t spare_tokens) {
     if (!pc_ || !cfg_.prefix_cache) return;
     const std::vector<int32_t>& cg = pc_->cached_groups();
     if (cg.empty()) return;
@@ -916,7 +1040,17 @@ void Scheduler::trim_prefix_cache() {
         const int64_t per = std::max<int64_t>(entry / bs, 1);
         if (blocks > 0) short_by = std::max(short_by, (blocks + per - 1) / per);
     }
-    if (short_by > 0) (void)pc_->trim(short_by);
+    if (short_by <= 0) return;
+    /* End-of-request snapshots: the conversation just published keeps its chain whole. The trim
+     * runs before close_request frees the sequence, so the blocks the sequence holds are safe from
+     * any trim; what a plain trim could still take, once the live sequences hold more than three
+     * quarters of the pool, is the chain's entries the request recomputed rather than adopted
+     * (between the snapshot it resumed from and the end of its hit), and that would cut the chain
+     * below its new snapshot (PrefixCache::trim_except). Once idle, the conversation has no such
+     * protection: other sessions' trims and admissions take it least recently used first, its end
+     * first, and the host tier (--prefix-cache-mib) is what keeps it. */
+    if (spare && spare_tokens > 0) (void)pc_->trim_except(*spare, spare_tokens, short_by);
+    else (void)pc_->trim(short_by);
 }
 
 void Scheduler::close_request(SchedReq& s, ReqState st, const char* reason, bool defer_free,
@@ -959,7 +1093,8 @@ void Scheduler::close_request(SchedReq& s, ReqState st, const char* reason, bool
             if (rc < 0)
                 RAD_DEBUG("prefix cache: request %llu not published: %s",
                           (unsigned long long)s.req->id, rad_strerror(rc));
-            trim_prefix_cache();
+            if (eors_ && rc >= 0) trim_prefix_cache(s.req.get(), n_pub);
+            else trim_prefix_cache();
         }
     }
 
@@ -1043,12 +1178,19 @@ void Scheduler::reserve_ckpt(StepEntry& e, const Request& r, int64_t pos, int32_
      * the ring is not the [lo, pos) block list a restore seeds. The prefix cache can never reuse
      * it either, so the copy would be dead weight. */
     if (kv_->has_runtime_window(r.id)) return;
-    if (pc_->reserve_checkpoint(r, pos, &cs) < 0 || cs < 0) return;
+    /* End-of-request snapshots: one at the prompt's end or past it (a decode step's) is reserved
+     * as such, for the cache's counters and the hit that resumes from it. */
+    const bool eors = eors_ && pos >= (int64_t)r.prompt.size();
+    const int rc = eors ? pc_->reserve_eors_checkpoint(r, pos, &cs)
+                        : pc_->reserve_checkpoint(r, pos, &cs);
+    if (rc < 0 || cs < 0) return;
     e.ckpt_tok = tok;
     e.ckpt_slot = cs;
+    e.ckpt_eors = eors;
     ++m_.checkpoints_written;
     /* One below the target that the cut makes whole (StepEntry::consumer_ckpt). */
     if (below) ++m_.consumer_ckpt_whole;
+    if (eors) ++m_.eors_reserved;
 }
 
 int Scheduler::fail_prefilling(const char* why) {
@@ -1372,6 +1514,10 @@ int64_t Scheduler::plan_chunk(int64_t n_computed, int64_t n_target, int64_t budg
             if (checkpoint_pos) *checkpoint_pos = tail;
         } else if (periodic && (n_computed + want) % I == 0 && geo_.on_grid(n_computed + want)) {
             if (checkpoint_pos) *checkpoint_pos = n_computed + want;
+        } else if (eors_ && n_computed + want == n_target && geo_.on_grid(n_target)) {
+            /* End-of-request snapshots: a prompt ending on the grid snapshots its end, where its
+             * last chunk ends, for a reply too short to reach the next grid position. */
+            if (checkpoint_pos) *checkpoint_pos = n_target;
         }
         /* A request's own checkpoint (Request::checkpoint_at) as below, wherever it falls: the
          * head the request shares with others resumes there by design. */
@@ -1471,6 +1617,9 @@ int64_t Scheduler::tail_checkpoint(int64_t target) const {
          * point under the end less a block. Past the first interval, as below. */
         const int64_t margin = geo_.window_ckpt ? std::max<int64_t>(Q, 16) : 1;
         const int64_t t = geo_.grid_floor(target - margin);
+        /* End-of-request snapshots: every prompt's, however short. Every turn of a conversation is
+         * then resumable at least at its last chunk start, for one copy a prompt and no step. */
+        if (eors_) return t > 0 ? t : -1;
         if (geo_.window_ckpt) return t >= I ? t : -1;
         return t > I ? t : -1;
     }
@@ -1626,6 +1775,7 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
         s.ckpt_src = -1;
         s.hit_attn = 0;
         s.hit_owed = true;
+        s.hit_eors = false;
         s.hit_cut = SchedReq::HitCut::None;
     }
 
@@ -1704,8 +1854,9 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
         } else if (reuse < h.n_attn_tokens) {
             /* Within an interval of the hit is the ordinary case: a turn's tail past its last
              * checkpoint. Further down, the previous reply was longer than an interval (decode
-             * writes no snapshot), the retention policy kept nothing nearer, or the attention
-             * blocks reach past the snapshot a cut restore stopped at. */
+             * writes no snapshot, unless RADIANCE_EXPERIMENTAL_PREFIX_EORS: then one at most a
+             * grid short of the reply's end), the retention policy kept nothing nearer, or the
+             * attention blocks reach past the snapshot a cut restore stopped at. */
             if (geo_.checkpoints() && h.n_attn_tokens - reuse > geo_.checkpoint_interval)
                 s.hit_cut = SchedReq::HitCut::ResumedBelow;
             RAD_DEBUG("admit %llu: prefix hit of %lld tokens resumes at the snapshot at %lld",
@@ -1783,6 +1934,7 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
         s.ckpt_src = (reuse > 0 && reuse == h.n_linear_tokens &&
                       (has_linear_state_ || win_hit)) ? h.checkpoint_slot : -1;
         s.hit_attn = h.n_attn_tokens;
+        s.hit_eors = s.ckpt_src >= 0 && h.ckpt_eors;
     }
 
     int64_t target = s.seq_len();
@@ -1840,6 +1992,11 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
             m_.linear_cached_tokens += r.n_cached;
             if (s.hit_attn > r.n_cached) m_.hit_cut_tokens += s.hit_attn - r.n_cached;
             if (s.restore_cut) ++m_.prefix_restore_cuts;
+            if (s.hit_eors && r.n_cached > 0) {
+                ++m_.eors_hits;
+                m_.eors_hit_tokens += r.n_cached;
+                m_.eors_hit_deepest = std::max<int64_t>(m_.eors_hit_deepest, r.n_cached);
+            }
             switch (s.hit_cut) {
                 case SchedReq::HitCut::NoSnapshot: ++m_.hit_cut_no_snapshot; break;
                 case SchedReq::HitCut::Window:     ++m_.hit_cut_window;      break;
@@ -2261,6 +2418,13 @@ replan:
         /* The checkpoint is the state after the chunk's last token, which the split put at the
          * interval boundary. */
         if (ckpt > 0) reserve_ckpt(e, r, ckpt, (int32_t)(want - 1));
+        /* End-of-request snapshots: a decode row that completes a grid position past the prompt
+         * snapshots the state after it (eors_position). Speculation is refused with the switch,
+         * so the row is the entry's only one and its position the host's. */
+        if (!prefill && e.n_spec == 0) {
+            const int64_t p = eors_position((int64_t)r.n_computed, (int64_t)r.prompt.size());
+            if (p > 0) reserve_ckpt(e, r, p, 0);
+        }
         s.entry = (int32_t)plan_.e.size();
         s.sched_tokens = (int32_t)want;
         plan_.e.push_back(e);
@@ -2720,6 +2884,22 @@ const RadBatch* Scheduler::step_next_locked(const StepResult* known) {
         ++m_.steps_ahead_withheld;
         return nullptr;
     }
+    /* End-of-request snapshots: a next row that completes a grid position past its prompt takes a
+     * snapshot, keyed by the chain over every token before it, the last of which this step has
+     * yet to sample. step() plans it after the commit instead: one host turnaround a grid's worth
+     * of tokens. */
+    if (eors_)
+        for (const StepEntry& e : plan_.e) {
+            if (e.slot < 0 || (size_t)e.slot >= reqs_.size() || !reqs_[(size_t)e.slot]) continue;
+            const SchedReq& s = *reqs_[(size_t)e.slot];
+            /* Only a step the loop below would issue counts as withheld for a snapshot. */
+            if (!s.req || !e.produces_token || !s.req->speculation_fixed) continue;
+            if (eors_position((int64_t)s.req->n_computed + e.n_tokens,
+                              (int64_t)s.req->prompt.size()) > 0) {
+                ++m_.eors_ahead_withheld;
+                return nullptr;
+            }
+        }
 
     plan_next_.reset();
     for (const StepEntry& e : plan_.e) {
@@ -3782,7 +3962,13 @@ SchedMetrics Scheduler::metrics_locked() const {
                m.prefix_ckpt_expired = pc_->ckpt_expired();
                m.prefix_released = pc_->released();
                m.prefix_ckpt_released = pc_->ckpt_released();
-               m.prefix_held_tokens = pc_->held_tokens(); }
+               m.prefix_held_tokens = pc_->held_tokens();
+               const IPrefixCache::StoreCounts sc = pc_->store_counts();
+               m.eors_committed = sc.eors;
+               m.store_held = sc.held;
+               m.store_peak = sc.peak;
+               m.store_session_lru = sc.session_lru;
+               m.trim_spared = sc.trim_spared; }
     m.attn_hit_rate = m.prompt_tokens
         ? (float)((double)m.attn_cached_tokens / (double)m.prompt_tokens) : 0.0f;
     m.linear_hit_rate = m.prompt_tokens

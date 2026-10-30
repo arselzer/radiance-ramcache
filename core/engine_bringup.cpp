@@ -3526,6 +3526,49 @@ int Engine::size_checkpoint_store(int64_t slot, const char* what) {
     }
     const int64_t total = meminfo_bytes("MemTotal");
     const int64_t share = total > 0 ? total / 8 : room;
+
+    /* RADIANCE_EXPERIMENTAL_CHECKPOINT_STORE_MIB=N: the store as a byte budget rather than the
+     * live sequences' share. Auto sizes it for --max-num-seqs sessions at --max-model-len, which
+     * is the store a server needs while its running turns write snapshots; a harness keeps many
+     * more conversations than it runs at once, each wanting its own ladder and its tip back
+     * (QFN's 40 snapshots in 4.42 GiB). N MiB holds N MiB over a slot's size of them, bounded by
+     * what the host can pin, which on a box with the expert RAM cache is the binding figure. */
+    if (const char* sm = std::getenv("RADIANCE_EXPERIMENTAL_CHECKPOINT_STORE_MIB"); sm && *sm) {
+        char* end = nullptr;
+        const long long mib = std::strtoll(sm, &end, 10);
+        if (end && *end == '\0' && mib > 0 && mib <= ((int64_t)1 << 30)) {
+            const int64_t want = mib * ((int64_t)1 << 20) / slot;
+            const int64_t n = std::min(want, std::max<int64_t>(room, 0) / slot);
+            cfg_.checkpoint_slots = n;
+            const std::string why =
+                fmt("RADIANCE_EXPERIMENTAL_CHECKPOINT_STORE_MIB %lld: %lld %s snapshot(s) of %s%s",
+                    (long long)mib, (long long)want, what, humanb(slot).c_str(),
+                    n < want ? fmt(", held to %lld by what the host can pin: %s", (long long)n,
+                                   limit.c_str()).c_str() : "");
+            decide("--checkpoint-slots", std::to_string(n), why);
+            if (n == 0) {
+                RAD_WARN("checkpoint slots: %s -- no room for one, so every prefix hit on this model "
+                         "prefills from the start%s", why.c_str(), cache_margin_hint().c_str());
+                return RAD_OK;
+            }
+            const std::string line =
+                fmt("checkpoint slots: a byte budget: %lld %s snapshot(s) of %s in pinned host "
+                    "memory (%s of the %lld MiB asked), none of it on the card; that is %.1f "
+                    "sessions of the %lld snapshots %s keeps for a %lld-token one at a "
+                    "%lld-token interval, its running turn's included",
+                    (long long)n, what, humanb(slot).c_str(), humanb(slot * n).c_str(),
+                    (long long)mib,
+                    (double)n / (double)std::max<int64_t>(1, pol->held(ctx, interval) + 1),
+                    (long long)(pol->held(ctx, interval) + 1), pol->name(), (long long)ctx,
+                    (long long)interval);
+            if (n < want) RAD_WARN("%s", line.c_str());
+            else RAD_INFO("%s", line.c_str());
+            return RAD_OK;
+        }
+        RAD_WARN("checkpoint slots: RADIANCE_EXPERIMENTAL_CHECKPOINT_STORE_MIB=%s is not a size in "
+                 "MiB; sized by --checkpoint-slots auto", sm);
+    }
+
     const CheckpointSlots c = checkpoint_slots_auto(*pol, cfg_.max_seqs, ctx, interval, slot,
                                                     share, room);
     cfg_.checkpoint_slots = c.slots;
@@ -3721,6 +3764,23 @@ int Engine::configure_kv() {
     for (auto& r : ranks_) {
         LogRank lr(r->index);
         RAD_TRY(r->prefix.configure(cfg_, &r->kv, geo_.checkpoint_interval));
+    }
+    /* RADIANCE_EXPERIMENTAL_PREFIX_SESSION_LRU=1: a full snapshot store gives up the least recently
+     * used session's snapshots, shallowest first, before any of a session used since
+     * (PrefixCache::set_session_lru). Rank 0's cache hands out the slots; every rank's is set. */
+    if (const char* sl = std::getenv("RADIANCE_EXPERIMENTAL_PREFIX_SESSION_LRU");
+        sl && !std::strcmp(sl, "1")) {
+        for (auto& r : ranks_) r->prefix.set_session_lru(true);
+        if (cfg_.prefix_cache && ck_store_.enabled())
+            RAD_INFO("snapshot store: by session (RADIANCE_EXPERIMENTAL_PREFIX_SESSION_LRU) -- once "
+                     "retention has run, a full store gives up the least recently used "
+                     "conversation's snapshots, its shallowest first and its tip last, before any "
+                     "snapshot of a conversation used since (%lld slots of %s)",
+                     (long long)ck_store_.capacity(), humanb(ck_store_.slot_bytes()).c_str());
+        else
+            RAD_WARN("snapshot store: RADIANCE_EXPERIMENTAL_PREFIX_SESSION_LRU has nothing to order: "
+                     "there is no snapshot store (no prefix cache, no state to snapshot, or "
+                     "--checkpoint-slots 0)");
     }
 
     /* ---------------- the idle session tiers (spec §7.3) ---------------- */

@@ -312,6 +312,17 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
         /* RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH: computed tokens left unpublished, past the
          * chunks an idle cold prefill cuts alike. 0 without the switch. */
         o["publish_held_tokens"] = (double)m.prefix_publish_held_tokens;
+        /* RADIANCE_EXPERIMENTAL_PREFIX_EORS: end-of-request snapshots reserved and committed,
+         * steps not issued ahead for one, and the admissions that resumed from one (their tokens
+         * reused, the deepest); the snapshot store's occupancy now and at most, what it gave up by
+         * session (..._SESSION_LRU), and the entries a publish's trim kept on the chain it published
+         * that a plain trim would have taken (the ones the request recomputed). */
+        o["eors"] = { { "reserved", m.eors_reserved }, { "committed", m.eors_committed },
+                      { "ahead_withheld", m.eors_ahead_withheld }, { "hits", m.eors_hits },
+                      { "hit_tokens", m.eors_hit_tokens }, { "hit_deepest", m.eors_hit_deepest } };
+        o["snapshot_store"] = { { "held", m.store_held }, { "peak", m.store_peak },
+                                { "session_lru", m.store_session_lru },
+                                { "trim_spared", m.trim_spared } };
         /* Why snapshots went and why hits reused nothing: on a hybrid model these say why a
          * long prompt was prefilled again. `hit_cut_tokens` is the checkpoint shortfall,
          * prompt tokens the attention cache held and admission computed again. */

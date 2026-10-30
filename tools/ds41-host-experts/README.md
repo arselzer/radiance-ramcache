@@ -652,6 +652,141 @@ and L3, as the window showed. Turns that extend the previous prompt (B, C, L4, L
 Run `Cs` arms against the same arms without `Cs` (and `Ck0`/`CkN` beside them): replies `same`,
 `cache_n` as above, and TTFT; `Kh` on the cold arms holds the cut prefill's state to the base's.
 
+### Harness-grade prefix reuse
+
+An agent harness sends the whole conversation every turn: the system prompt, every turn so far
+with the model's reply sent back, and the new tool output. Cold, every turn pays prefill on all of
+it (31-45 tokens/s here). The prefix cache above resumes a turn at the previous *prompt's* last
+snapshot, so it still prefills the previous reply and whatever follows the last chunk start. The
+switches below (claude/ds41-eors) make a turn prefill only what it added, exactly.
+
+**End-of-request snapshots** (`RADIANCE_EXPERIMENTAL_PREFIX_EORS=1`, part `Pce`). A decode step
+whose row completes a position on the resume grid past its prompt snapshots the state there
+(reserved when the step is planned, saved after it, as a prefill chunk's is), a prompt ending on the
+grid snapshots its end, and every prompt its tail (the start of its last chunk) however short. So
+for a request that computed n positions (its prompt and every output token but the last) the
+resumable positions are the grid positions g with prompt < g <= n, the prompt's end when on the
+grid, its tail, and the prompt ladder below. Under the consumer skip (`Cs`, in every core arm) a
+prefill writes no snapshot below its prompt's cut target, where the last layers' windows would be
+incomplete; the target is the deepest snapshot its idle prefill writes, the prompt's end when on the
+grid and its tail otherwise. So there the resumable positions are the target and the grid positions
+past the prompt (decode rows run every layer): not the prompt ladder below the target, nor the tail
+of a prompt ending on the grid. Either way the next turn resumes at grid_floor(n), at most 15 tokens
+before the end of the reply at `--max-num-batched-tokens 16` (31 under `Xt-BT32`, whose grid is 32).
+A step that carries a decode snapshot is planned after its predecessor's commit, not issued ahead
+(its key hashes the token that step samples): one host turnaround every 16 tokens, plus a 5.65 MiB
+copy a rank (~0.3 ms). The trim after a publish runs before the request frees its blocks, which are
+safe from any trim then; with `Pce` it also keeps the few entries the request recomputed rather than
+adopted (between the snapshot it resumed from and the end of its hit: up to seven 2-token entries),
+which a plain trim takes once the live sequences hold more than three quarters of the pool, cutting
+the chain below the new snapshot (`trim_spared` counts them). An idle conversation has no such
+protection: other sessions' trims and admissions take it least recently used first, its end first,
+and its end-of-request snapshot with it; the host tier (`PcmN`) is what keeps its KV under pressure.
+Refused, with the reason in the log, without `--prefix-resume exact`, with speculation, with `Pcx`
+(which keeps out the decode blocks such a snapshot stands on), on a model with no state to snapshot,
+and on one whose recurrent state is scanned in chunks (a gated delta net: qwen35, QFN), where a
+decoded row is not the row a prefill computes. A model whose only state is a sliding window takes it
+only with `RADIANCE_EXPERIMENTAL_PREFIX_EORS_WINDOW=1` (nothing yet shows (A) below for one).
+DeepSeek-V4.1 is neither: its linear state (the compressor's tail, the Engram tokens) has a state
+chunk of 1, and its window rides in the snapshot beside it. Counters: `/stats` `eors` (reserved,
+committed, ahead_withheld, hits, hit_tokens, hit_deepest) and `snapshot_store`, and the shutdown
+line `end-of-request snapshots: N reserved, M stored (X written, ...), K step(s) not issued ahead
+for one; H admission(s) resumed from one, T tokens reused (deepest D); snapshot store: ...`.
+
+Why it is exact (the full argument is at `Scheduler::init`, "end-of-request snapshots"): the next
+turn resumes on the grid, so from there it computes the cold run's own chunks from the same state;
+that state is the cold run's because every row below it is, by induction, given (A) a row computed
+alone (decode) has the bits of the same row in a prefill pass of up to `--max-num-batched-tokens`
+rows, (B) deterministic arithmetic, (C) a snapshot restoring the whole per-sequence state on every
+rank. (A) is what the exact-tall device sweep checks op by op (each row against the same row alone
+and in launches of 16, up to the reach), and what the `Kh` arms below check end to end: the prefill
+hashes of every KV group and the last row's logits at the end of each prompt of the resumed turns
+must equal the cold arm's. On libref the e2e test
+`a_turn_resumed_at_an_end_of_request_snapshot_returns_what_a_cold_run_does` holds it for LFM2 (a
+convolution's state: with the switch the next turn resumes at the reply's last grid position, 192,
+without it at nothing) and Gemma 4 (no state to snapshot: the switch is refused and the hit adopts
+the decode-written blocks at 192 either way); every reply and probability is a cold server's.
+qwen35's gated delta net decodes by another recurrence than its chunked prefill, so (A) fails
+there, as it would on any such model: with the switch taken, a turn resumed at its decode snapshot
+gave other probabilities than a cold run (review of 30 Oct). The switch is now refused there, and
+the same e2e case holds the refusal: qwen35's next turn, with the switch asked or not, resumes
+nowhere and answers as a cold server. On the cards the first evidence came from today's cache:
+in window ab-20261029T232708Z `Pc-Pci256` on `Upfxchat` answered 15/15 as the cold arm, C3 among
+them, which adopts 46 of C1's decode-step blocks beneath C2's recompute snapshot (token level; the
+`Kh` arms are the byte level). Under the consumer skip (`Cs`) the snapshots are at or past each
+prompt's cut target and decode rows run every layer; under `Xt` (A) is the tall checks, but no
+window has yet shown `Pce` with `Xt` end to end, so `ab_window.sh` skips an arm with both; the
+window variable `PCE_XT=1` runs them for that evidence (a `Kh` pair at `Xt-BT32`, cold and `Pce`,
+whose `--hashes` must agree).
+
+**The snapshot store for harness sessions.** `--checkpoint-slots auto` sizes the store for the
+running sequences (7 slots of 22.6 MiB at `Lm32768`, interval 2048, one sequence: one session's
+ladder). A harness keeps more conversations than it runs: `RADIANCE_EXPERIMENTAL_CHECKPOINT_STORE_MIB=N`
+(part `PcbN`) sizes it as a byte budget instead (`Pcb1024`: 45 slots, about six sessions at 7;
+QFN's production store is 40 slots of 113 MiB, 4.42 GiB). `RADIANCE_EXPERIMENTAL_PREFIX_SESSION_LRU=1`
+(part `Pcl`) makes a full store give up the least recently used conversation's snapshots, its
+shallowest first and its tip last, before any of a conversation used since (otherwise the least
+recently used snapshot of any conversation goes, which can be a busy one's anchor). The KV blocks of
+idle conversations can move to the host tier, `--prefix-cache-mib N` (part `PcmN`), restored over
+PCIe on the next turn; with `RADIANCE_EXPERIMENTAL_DS41_KV_REPLICATED=1` (part `Pcr`, a deepseek41
+plugin from this branch) the compressed and index caches are declared replicated, which they are
+(every rank's `Kh` hashes of them agree), so a host-tier entry holds one copy, 3,200 B a token
+instead of 12,800 at TP4.
+
+Host memory, measured: with the 96 GiB RAM cache pregrown (`m98304-G`) MemAvailable runs at 12.0-12.7
+GiB at its lowest during serving (12.6-16.8 GiB mean; the 29 Oct 20:09 and 22:09 windows' `.mem`
+files, QFN stopped). Under `Pc` startup's checks keep 8.02 GiB free after the load ("host headroom:
+... the RAM cache's slabs already hold 95.98 GiB of its 96.00 GiB budget, so the checks from here on
+keep 8.02 GiB free": `--host-headroom-mib` 8192 and the 16 MiB the cache has yet to grow), so about
+4-5 GiB can still be pinned; the auto store at `Lm8192` took 5 slots (113 MiB) there. `Pcb1024`
+(45 slots) alone, or `Pcb512` with `Pcm2048`, keeps MemAvailable above 9 GiB, well clear of the
+window's memory guard (3 GiB); more needs a smaller `--host-headroom-mib`.
+
+**Long contexts.** The KV a token costs a card: `kv_index_r2` 384 B, `kv_compressed_r2` 1,536 B,
+`kv_index_r1` 256 B, `kv_compressed_r1` 1,024 B, 3,200 B in all (the startup table: 32.70 MiB at
+`Lm8448`, 19.42 MiB at `Lm4096`), plus the window's 6.88 MiB a sequence. `--max-model-len` also
+sizes two persistent rope tables on every card, `rope_window` and `rope_compressed`, [max_ctx, 64]
+f32 each (`deepseek41.cpp` `buffers`): 512 B more a context token, 2 MiB at `Lm4096`, 16 MiB at
+`Lm32768`, 32 MiB at `Lm65536`; and the indexer's score plane in the step arena, [16, max_ctx] f32
+at `M16`, up to 64 B more. The VRAM split gives the pool one `--max-model-len` sequence and the
+experts what is left, so against `Lm4096` a card gives up 101.5 MiB at `Lm32768` (87.5 MiB more
+pool, 107 MiB in all, and 14 MiB more rope tables) and 217.5 MiB at `Lm65536` (187.5 MiB more pool,
+207 MiB in all, and 30), plus at most 2 and 4 MiB of score plane: about 5.7 expert units of 17.9 MiB
+a card (23 over the four) and 12.2 (49). By the sealed decode profile the units given up are the
+coldest of the ~710-719 a card holds, about 9 selections each in 721 decode tokens: 0.28 (32K) to
+0.61 (64K) of a token's 240 expert selections move from the card to the CPU path, about 0.35-0.75%
+more CPU work, so an estimated 0.25-0.6% of decode (measure it: `Lm4096` against `Lm32768`/`Lm65536`
+on the held-out prompts). The conversations kept idle must fit three quarters of the pool together
+to keep their chains whole (each publish trims the pool to a quarter free, the least recently used
+conversation's end first), or live in the host tier; one larger than that alone stays whole through
+its own turns with `Pce`, not through another session's. Parts: `Lm32768`, `Lm65536` (the `LmN`
+part).
+
+**The harness receipt** (`make_prefix_receipt.py --harness`, part `Uharness`; `Uharness1` is its
+first session alone): two agent sessions interleaved turn by turn, each turn the whole
+conversation with the model's own replies sent back (up to 128 tokens each) and a system prompt
+(`chat_system`, right after BOS): hxA, a code-review agent (2.9K-token system prompt, five tool
+outputs of repository source, 7 turns, 9.4K tokens at the last), and hxB, a licence agent (2.3K
+system prompt, two MIT licences, consumer_skip.h and geometry.cpp, 6 turns, 9.8K). Cold: about 79K
+prompt tokens over the 13 turns; with `Pce` about 19K. Run it at `Lm32768` (both sessions under
+three quarters of the pool). `ab_requests.py --ttft` prints per turn the TTFT, the tokens the cache
+supplied and the text against the first (cold) arm, then per session the sums and the cached share.
+
+**Reading a `Pce` window.** Two results gate it, both printed at the end of the window:
+`ab_requests.py --hashes` must report every prompt identical against the cold arm (the prefill
+hashes of every KV group and the last row's logits at the end of each prompt: 13 of 13 on
+`Uharness`), and `--ttft` must show every text `same`. The rest is advisory, because it moves with
+the replies' lengths and with how each reply re-tokenizes when it is sent back: the shutdown line's
+`H admission(s) resumed from one` (11 on `Uharness` when every later turn reaches its predecessor's
+last snapshot) and, in `--ttft`, each later turn's cached tokens equal to its predecessor's last grid
+position (the grid floor of that request's prompt and reply, less its last token). A reply whose text
+re-tokenizes to other ids than the generated ones (the `sent back` lines list them; on 29 Oct the
+23:27 window had a reply come back as 40 tokens for 41 generated) parts the chain early, and that
+turn resumes, still exactly, at the deepest snapshot before the parting, with fewer tokens cached.
+A hash that differs is (A) failing for some op on the cards: if the `Pc` arm without `Pce` (which
+adopts decode-written cache blocks too, from the third turn on) agrees, suspect the decode-written
+window or compressor-tail state in the snapshot; if it differs too, the decode-written blocks.
+
 ## Correctness
 
 Each row the CPU computes uses the card's arithmetic: the same lane and block order, butterfly,

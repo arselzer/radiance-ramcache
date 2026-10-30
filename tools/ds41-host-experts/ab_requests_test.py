@@ -9,7 +9,9 @@ exact model follows every token with every position bit-identical, KL 0 and top-
 a perturbed model still follows every forced token (teacher forcing does not depend on the arm's
 own choice), with KL above 0 and top-1 agreement below 100%.
 """
+import contextlib
 import http.server
+import io
 import json
 import math
 import os
@@ -217,6 +219,78 @@ class Harness(unittest.TestCase):
         with open(os.path.join(moved, os.path.basename(self.same)), "w") as f:
             json.dump(js, f)
         ab_requests.kl_dir(moved)
+
+
+class HarnessTurns(unittest.TestCase):
+    """The agent-harness receipt's shape (make_prefix_receipt.py --harness): chat_turns with a
+    chat_system, replies sent back with assistant_from, and --ttft's per-session sums."""
+
+    def test_a_system_prompt_follows_bos_and_every_turn_begins_with_the_last(self):
+        srv, url = serve(Model())
+        d = tempfile.mkdtemp(prefix="abreq-hx-")
+        try:
+            reqs, turns = [], []
+            for i, u in enumerate(["the task", "tool output one", "tool output two"]):
+                name = "hxT-%d" % (i + 1)
+                reqs.append({"name": name, "family": "hxT",
+                             "request": {"max_tokens": 6, "temperature": 0, "stream": False,
+                                         "chat_system": "the rules", "chat_turns": turns + [{"user": u}]}})
+                turns = turns + [{"user": u, "assistant_from": name}]
+            receipt = os.path.join(d, "receipt.json")
+            with open(receipt, "w") as f:
+                json.dump({"benchmark_requests": reqs}, f)
+            ab_requests.run(receipt, url, 99, os.path.join(d, "cold.json"))
+            ab_requests.run(receipt, url, 99, os.path.join(d, "warm.json"))
+            with open(os.path.join(d, "cold.json")) as f:
+                rows = json.load(f)["requests"]
+            self.assertEqual([r["family"] for r in rows], ["hxT"] * 3)
+            system = ab_requests.tokenize(url, "the rules")
+            for r in rows:
+                self.assertIsNone(r["error"])
+                self.assertEqual(r["prompt_ids"][:1 + len(system)], [ab_requests.BOS] + system)
+                self.assertEqual(r["prompt_ids"][1 + len(system)], ab_requests.USER)
+            for a, b in zip(rows, rows[1:]):
+                self.assertEqual(b["prompt_ids"][:len(a["prompt_ids"])], a["prompt_ids"])
+                self.assertEqual(b["sent_back"][-1]["from"], a["name"])
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                ab_requests.ttft(d, ["cold", "warm"])
+            text = out.getvalue()
+            self.assertIn("session", text)
+            self.assertRegex(text, r"\nhxT +3 ")
+            self.assertIn("3/3", text)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_a_sessions_cached_share_is_of_every_prompt_token_it_sent(self):
+        """The server's prompt_n is the prompt less what the cache supplied: two turns of 1,000 and
+        2,200 tokens, the second resuming at 1,000, sent 3,200 prompt tokens of which 1,000 (31.2%)
+        came from the cache; cached over computed would say 1,000 of 2,200 (45.5%)."""
+        d = tempfile.mkdtemp(prefix="abreq-share-")
+        try:
+            def arm(name, cached):
+                rows = [{"name": "hxS-%d" % (i + 1), "family": "hxS", "text": "t%d" % i,
+                         "prompt_ids": [1] * n,
+                         "timings": {"ttft_ms": 100.0, "cache_n": c, "prompt_n": n - c}}
+                        for i, (n, c) in enumerate(zip((1000, 2200), cached))]
+                with open(os.path.join(d, name + ".json"), "w") as f:
+                    json.dump({"requests": rows}, f)
+            arm("cold", (0, 0))
+            arm("warm", (0, 1000))
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                ab_requests.ttft(d, ["cold", "warm"])
+            text = out.getvalue()
+            session = re.search(r"\nhxS +2 +(\d+) .*", text)
+            self.assertIsNotNone(session, text)
+            self.assertEqual(session.group(1), "3200")
+            self.assertIn(" 1000  31.2%  2/2", session.group(0))
+            self.assertIn("    0   0.0%  2/2", session.group(0))
+            self.assertRegex(text, r"\nhxS-2 +2200 ")      # a request's prompt, cached or not
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
 
 
 if __name__ == "__main__":

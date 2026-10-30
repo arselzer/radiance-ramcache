@@ -193,6 +193,14 @@ struct IPrefixCache {
      * whose blocks are shorter than the entry (PrefixCache::blocks_per_entry). Returns the number
      * of entries freed. */
     virtual int64_t trim(int64_t n_entries) = 0;
+    /* trim(), sparing the chain of the first `n_tokens` of this request's prompt ++ output: the
+     * conversation it just published, before its sequence is freed (PrefixCache::trim_except;
+     * RADIANCE_EXPERIMENTAL_PREFIX_EORS). The sequence's own blocks are safe from a trim anyway;
+     * this keeps the entries it recomputed rather than adopted, whose loss would cut the chain
+     * below its new snapshot. A cache that cannot tell chains apart trims as trim() does. */
+    virtual int64_t trim_except(const Request& /*r*/, int64_t /*n_tokens*/, int64_t n_entries) {
+        return trim(n_entries);
+    }
 
     /* Drop every entry in every tier. Implementations with idle tiers must override this: there,
      * evict() keeps an entry whose host copy has landed. Returns the number of entries dropped. */
@@ -242,10 +250,26 @@ struct IPrefixCache {
      * about 9 GiB), so RAD_E_FULL is ordinary: no checkpoint is written at that boundary and a
      * later hit replays from the previous one. */
     virtual int reserve_checkpoint(const Request& r, int64_t pos, int32_t* slot_out) = 0;
+    /* The same for an end-of-request snapshot (RADIANCE_EXPERIMENTAL_PREFIX_EORS: a decode step's,
+     * or a prompt's end), which the cache counts apart and reports on the hit that resumes from
+     * it (CacheHit::ckpt_eors). */
+    virtual int reserve_eors_checkpoint(const Request& r, int64_t pos, int32_t* slot_out) {
+        return reserve_checkpoint(r, pos, slot_out);
+    }
 
     /* The reserved state is now in its slot. Reservation happens at planning, before the step
      * computes the state, so lookup does not offer the slot until this is called. */
     virtual void commit_checkpoint(const Request& r, int64_t pos) = 0;
+
+    /* The snapshot store as the end-of-request counters read it (PrefixCache::Stats): end-of-request
+     * snapshots committed and lookups that handed one out, snapshots held now and at most, the
+     * snapshots a full store gave up by session (RADIANCE_EXPERIMENTAL_PREFIX_SESSION_LRU), and
+     * the entries of a chain just published that its trim kept and a plain trim would have taken
+     * (trim_except: the ones the request recomputed rather than adopted). */
+    struct StoreCounts {
+        int64_t eors = 0, eors_hits = 0, held = 0, peak = 0, session_lru = 0, trim_spared = 0;
+    };
+    virtual StoreCounts store_counts() const { return {}; }
 };
 
 /* ------------------------------------------------------------------ block geometry */
@@ -512,6 +536,15 @@ struct PCBinding final : IPrefixCache {
         return k;
     }
     int64_t trim(int64_t n) override { return m->trim(n); }
+    /* The chain insert() indexed for this request: prompt ++ output, its media keys. */
+    int64_t trim_except(const Request& r, int64_t n_tokens, int64_t n) override {
+        std::vector<int32_t> toks;
+        toks.reserve(r.prompt.size() + r.output.size());
+        toks.insert(toks.end(), r.prompt.begin(), r.prompt.end());
+        toks.insert(toks.end(), r.output.begin(), r.output.end());
+        media_keys(r, &mm_, salt_id);
+        return m->trim_except(toks, mm_, n_tokens, n);
+    }
     int64_t reset() override {
         const int64_t n = m->size();
         m->clear();
@@ -541,9 +574,23 @@ struct PCBinding final : IPrefixCache {
          * share a snapshot; whole blocks only, since a partial block's key would change. */
         return m->reserve_checkpoint(r.id, pos, prefix_hash(r, pos), slot_out);
     }
+    int reserve_eors_checkpoint(const Request& r, int64_t pos, int32_t* slot_out) override {
+        return m->reserve_checkpoint(r.id, pos, prefix_hash(r, pos), slot_out, /*eors=*/true);
+    }
 
     void commit_checkpoint(const Request& r, int64_t pos) override {
         m->commit_checkpoint(prefix_hash(r, pos));
+    }
+    StoreCounts store_counts() const override {
+        const auto& st = m->stats();
+        StoreCounts c;
+        c.eors = st.ckpt_eors;
+        c.eors_hits = st.ckpt_eors_hits;
+        c.held = m->snapshots_held();
+        c.peak = st.ckpt_peak;
+        c.session_lru = st.ckpt_session_lru;
+        c.trim_spared = st.trim_spared;
+        return c;
     }
 
 private:

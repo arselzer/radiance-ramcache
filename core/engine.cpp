@@ -1474,7 +1474,25 @@ int Engine::step_loop() {
     post_stop_report();
     /* RADIANCE_EXPERIMENTAL_DS41_DSPARK_GATE: its counters and every finished sequence's. */
     sched_.draft_gate_report();
+    eors_report();
     return RAD_OK;
+}
+
+void Engine::eors_report() {
+    const SchedMetrics m = sched_.metrics();
+    const bool session_lru = !ranks_.empty() && ranks_[0]->prefix.session_lru();
+    if (!sched_.eors_on() && !session_lru && m.eors_reserved == 0) return;
+    const int64_t slot = ck_store_.enabled() ? ck_store_.slot_bytes() : 0;
+    RAD_INFO("end-of-request snapshots: %lld reserved, %lld stored (%s written, %s a snapshot over "
+             "the ranks), %lld step(s) not issued ahead for one; %lld admission(s) resumed from "
+             "one, %lld tokens reused (deepest %lld); snapshot store: %lld of %lld slots held, at "
+             "most %lld, %lld given up by session, %lld entries a publish's trim spared",
+             (long long)m.eors_reserved, (long long)m.eors_committed,
+             humanb(slot * m.eors_committed).c_str(), humanb(slot).c_str(),
+             (long long)m.eors_ahead_withheld, (long long)m.eors_hits,
+             (long long)m.eors_hit_tokens, (long long)m.eors_hit_deepest,
+             (long long)m.store_held, (long long)(ck_store_.enabled() ? ck_store_.capacity() : 0),
+             (long long)m.store_peak, (long long)m.store_session_lru, (long long)m.trim_spared);
 }
 
 /* Issue the copy of the sampled ids into pinned memory behind the sampler, without waiting.

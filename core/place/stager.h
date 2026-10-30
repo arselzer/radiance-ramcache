@@ -636,8 +636,13 @@ private:
      * three launches (launched) and runs its waves behind its down projection (after_op). */
     int  p1_state_ = 0;
     int64_t p1_min_rows_ = ds41p1::kDefMinRows;   /* ..._P1_MIN_ROWS as lcp_init read it */
+    bool    p1_lend_asked_ = false;               /* ..._P1_LEND > 0 as lcp_init read it */
     /* The rows the CPU path takes under P1: every layer pass below the threshold (ds41p1::cpu_rows). */
     int64_t p1_cpu_rows() const { return ds41p1::cpu_rows(ep_rows_, p1_min_rows_); }
+    /* hx_init's ..._MISSES bound: every pass's rows (ep_rows_), but under P1 without the lent ring only the
+     * layer passes below the threshold (p1_cpu_rows); with it a pass that does not arm P1 would stage its
+     * misses in the file buffers, whose idle slots then hold published residents. */
+    int64_t hx_need_rows() const { return lcp_ && p1_state_ == 1 && !p1_lend_asked_ ? p1_cpu_rows() : ep_rows_; }
     std::unique_ptr<p1::CardExpertPath> p1_;
     bool p1_armed_ = false;
     int32_t p1_li_ = -1;                 /* the layer the path holds this pass, or -1 */

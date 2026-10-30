@@ -73,6 +73,12 @@ struct EpCountsHostProbe {
     static bool card(const FileStager& fs, int32_t li) { return fs.p1_layer_on(li); }
     static int64_t miss_need(const FileStager& fs, int32_t li) { return fs.hx_miss_need(li); }
     static int64_t cpu_rows(const FileStager& fs) { return fs.p1_cpu_rows(); }
+    static int64_t need_rows(FileStager& fs, int64_t lcp, int p1_state, bool lend) {
+        fs.lcp_ = lcp;
+        fs.p1_state_ = p1_state;
+        fs.p1_lend_asked_ = lend;
+        return fs.hx_need_rows();
+    }
     static void disarm(FileStager& fs) { fs.p1_armed_ = false; fs.layers_.clear(); fs.pass_row0_.clear(); }
     /* The host-pool source (FileStager::p1_pool_source) over a mover and its plan. */
     static void bind(FileStager& fs, Mover* m, const Plan* plan, const Program* prog) {
@@ -1086,6 +1092,21 @@ int lend_pass(RingLender& l, FakeLend& h, bool p1, int64_t now) {
     return r;
 }
 }  // namespace
+
+/* hx_init's bound: under P1 the CPU takes the layer passes below the threshold, and with the lent ring every
+ * pass that does not arm P1 as well, or a decode step of more rows than the bound (or a mixed step) would stage
+ * its misses into lent slots whose residents are still published (review of 01279cbe). */
+TEST(p1_lend_makes_the_cpu_path_take_every_pass_that_does_not_arm) {
+    FileStager fs;
+    EpCountsHostProbe::cut(fs, false, 1, {}, 1, 320, 1024);
+    CHECK_EQ(EpCountsHostProbe::need_rows(fs, 1024, 1, false), (int64_t)319);
+    CHECK_EQ(EpCountsHostProbe::need_rows(fs, 1024, 1, true), (int64_t)1024);
+    CHECK_EQ(EpCountsHostProbe::need_rows(fs, 1024, 0, false), (int64_t)1024);
+    CHECK_EQ(EpCountsHostProbe::need_rows(fs, 0, 0, false), (int64_t)1024);
+    EpCountsHostProbe::cut(fs, false, 1, {}, 1, 17, 1024);
+    CHECK_EQ(EpCountsHostProbe::need_rows(fs, 1024, 1, false), (int64_t)16);
+    CHECK_EQ(EpCountsHostProbe::need_rows(fs, 1024, 1, true), (int64_t)1024);
+}
 
 TEST(p1_lend_returns_after_the_grace_and_takes_back_for_the_card_path) {
     FakeLend h(5, 6);

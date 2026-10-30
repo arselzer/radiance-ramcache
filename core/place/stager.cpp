@@ -1006,6 +1006,12 @@ int FileStager::start_ep_routed(int32_t li, RadStream s, bool* read) {
     const int64_t available = head_.pending() ? head_.budget().serving_bytes : cap_;
     const auto trace = m1_trace_scope(trace_requested_,trace_target_m1_,v);
     mover_->prefetch_trace_route(trace,counts_host_,want_.size());
+    /* The lent ring's slots are the file buffers' idle ones (p1_lend_init), so with it nothing may take
+     * the card's copy path (hx_init sends every miss to the CPU): staging would overwrite residents. */
+    if (p1_ && p1_->lending() && !want_.empty()) {
+        RAD_ERR("ds41 p1: lent ring: %zu routed units of layer %d reached the card's copy path", want_.size(), (int)li);
+        return RAD_E_STATE;
+    }
     const int stage_status = mover_->stage_file_units(want_, buf_[b], available,
         free_rec_[b] ? free_[b] : nullptr, done_[b], &staged_[b], NativeFileCacheReadPolicy::Normal,trace);
     mover_->prefetch_trace_stage_done(trace,stage_status);
@@ -1089,6 +1095,12 @@ int FileStager::start_routed(int32_t li, RadStream s, bool* read) {
         const int32_t e = plan_->units[(size_t)u].expert;
         if (e < 0 || e >= ne || counts_host_[e] != 0) want_.push_back(u);
         else skip_.push_back(u);
+    }
+    /* The lent ring's slots are the file buffers' idle ones (p1_lend_init), so with it nothing may take
+     * the card's copy path (hx_init sends every miss to the CPU): staging would overwrite residents. */
+    if (p1_ && p1_->lending() && !want_.empty()) {
+        RAD_ERR("ds41 p1: lent ring: %zu routed units of layer %d reached the card's copy path", want_.size(), (int)li);
+        return RAD_E_STATE;
     }
     RAD_TRY(mover_->stage_file_units(want_, buf_[b], cap_, free_rec_[b] ? free_[b] : nullptr,
                                      done_[b], &staged_[b]));
@@ -1518,7 +1530,10 @@ int FileStager::lcp_init(const Program& prog, int64_t C) {
     p1_min_rows_ = ds41p1::kDefMinRows;
     if (p1) {
         p1::Tunables t;
-        if (p1::parse_tunables([](const char* k) { return std::getenv(k); }, &t, nullptr)) p1_min_rows_ = t.min_rows;
+        if (p1::parse_tunables([](const char* k) { return std::getenv(k); }, &t, nullptr)) {
+            p1_min_rows_ = t.min_rows;
+            p1_lend_asked_ = t.lend > 0;
+        }
     }
     if (xt && *xt && std::strcmp(xt, "1") != 0)
         why = fmt("%s=%s beside it: large-chunk prefill keeps EXACT_TALL's pins at every height; leave it unset "
@@ -1833,8 +1848,10 @@ int FileStager::hx_init(const Program& prog) {
      * step, at least 16). */
     /* Under P1 every layer pass of the threshold's rows or more is the card path's (p1_init), so the
      * CPU takes the layer passes below it only (p1_cpu_rows: 16 at the threshold 17), whatever the
-     * chunk. */
-    const int64_t need = lcp_ && p1_state_ == 1 ? p1_cpu_rows() : ep_rows_;
+     * chunk. With the lent ring (..._P1_LEND) the CPU takes every other pass's misses too (hx_need_rows):
+     * a pass that does not arm P1 (a decode step of more rows than the bound, a mixed step) would
+     * otherwise stage them in the file buffers, whose idle slots then hold published residents. */
+    const int64_t need = hx_need_rows();
     hx_need_misses_ = need;
     auto packed_ok = [&]() -> int {
         if (!mover_ || !mover_->packed_cache() || hx_capped_) return hx_init_fetch();

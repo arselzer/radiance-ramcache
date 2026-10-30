@@ -386,10 +386,15 @@ TEST(p1_end_aligned_chunks_fill_the_last_chunk_for_every_length_to_20000) {
                         sum += ch[i];
                         ok = ok && ch[i] >= 1 && ch[i] <= C;
                         if (i + 1 < ch.size()) ok = ok && (start + sum) % g == 0;   /* a non-final chunk ends on the grid */
-                        if (i > 0 && i + 1 < ch.size()) ok = ok && ch[i] == C;      /* the middle ones are full */
+                        if (start % g == 0 && i > 0 && i + 1 < ch.size()) ok = ok && ch[i] == C;   /* the middle ones are full */
                     }
-                    ok = ok && sum == P && (int64_t)ch.size() == (P + C - 1) / C;  /* no more chunks than start alignment */
-                    if (P > C) ok = ok && ch.back() > C - g;                       /* the last is as full as the grid allows */
+                    /* From a grid position: no more chunks than start alignment, and the last as full as the
+                     * grid allows. From off the grid (a resume that is not on it) the first chunk's end must
+                     * reach the grid within C, which can cost one chunk more. */
+                    const bool on = start % g == 0;
+                    const int64_t n0 = (P + C - 1) / C;
+                    ok = ok && sum == P && (int64_t)ch.size() >= n0 && (int64_t)ch.size() <= n0 + (on ? 0 : 1);
+                    if (P > C && on) ok = ok && ch.back() > C - g;
                     if (!ok) {
                         CHECK(ok);
                         std::fprintf(stderr, "C %lld g %lld start %lld P %lld: %zu chunks\n", (long long)C, (long long)g,
@@ -423,7 +428,7 @@ TEST(p1_waves_take_ram_units_first_in_descending_rows_then_the_drive) {
     CHECK(sim.copy_order[4] == 2 || sim.copy_order[4] == 6);
     CHECK_EQ(sim.violations, 0);
     if (sim.violations) std::fprintf(stderr, "%s\n", sim.first.c_str());
-    for (const auto& kv : sim.expect) CHECK_EQ(sim.computed[{ 0, kv.first }], 1);
+    for (const auto& kv : sim.expect) CHECK_EQ(sim.computed[std::make_pair(0, kv.first)], 1);
     CHECK_EQ(st.held(), 0);
     CHECK_EQ(st.stats().waves, (uint64_t)3);
 }
@@ -622,3 +627,5 @@ TEST(p1_admission_follows_the_sorted_order_past_the_admission_row) {
         for (int e = 0; e < 96; e += 7) CHECK_EQ(EpCountsHostProbe::admits(fs, e), admit_row <= 0);
     }
 }
+
+RAD_TEST_MAIN()

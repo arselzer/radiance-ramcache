@@ -1528,7 +1528,7 @@ int64_t Scheduler::plan_chunk(int64_t n_computed, int64_t n_target, int64_t budg
             const int64_t I = geo_.checkpoint_interval;
             const bool periodic = !geo_.window_ckpt || geo_.window_periodic;
             const int64_t tail = tail_checkpoint(n_target);
-            if (n_computed + want == n_target && tail > n_computed && tail < n_target) {
+            if (n_computed + want == n_target && tail > n_computed && tail <= n_target) {
                 want = tail - n_computed;
                 if (checkpoint_pos) *checkpoint_pos = tail;
             } else if (periodic && (n_computed + want) % I == 0) {

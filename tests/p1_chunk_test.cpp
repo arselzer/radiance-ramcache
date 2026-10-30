@@ -156,10 +156,10 @@ TEST(p1_plan_chunk_end_aligns_every_prompt_without_an_interval) {
         }
     }
     /* A shared step (a budget below the chunk) is cut as before. */
-    CHECK_EQ(f.sch.plan_chunk(0, 3086, 512), (int64_t)512);
+    { int64_t ck = -1; CHECK_EQ(f.sch.plan_chunk(0, 3086, 512, &ck), (int64_t)512); }
     /* Off: start-aligned, as without the switch. */
     f.sch.set_p1_end_align(false, C);
-    CHECK_EQ(f.sch.plan_chunk(0, 3086, C), C);
+    { int64_t ck = -1; CHECK_EQ(f.sch.plan_chunk(0, 3086, C, &ck), C); }
 }
 
 TEST(p1_plan_chunk_keeps_the_interval_snapshots_and_the_tail_with_a_linear_group) {
@@ -201,3 +201,5 @@ TEST(p1_plan_chunk_keeps_the_interval_snapshots_and_the_tail_with_a_linear_group
     }
     CHECK(true);
 }
+
+RAD_TEST_MAIN()

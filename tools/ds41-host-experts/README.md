@@ -58,6 +58,7 @@ RADIANCE_EXPERIMENTAL_DS41_PREFETCH_URGENT=1               # a partly read read-
 RADIANCE_EXPERIMENTAL_DS41_INSERT_SLICE_KIB=256            # background inserts in 256 KiB pieces, waiting for an idle pool
 RADIANCE_EXPERIMENTAL_DS41_PREFETCH_SCORE=int8             # the read-ahead predictor scores in int8, its best 12 again in bf16
 RADIANCE_EXPERIMENTAL_DS41_SIDE_STORE=7                    # up to 7 units a rank the packed cache refuses keep their planes
+RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_FUTEX=1            # pool workers sleep on a futex, woken without a lock
 
 radiance ... --tp 4 --placement expert_tiered --weights-disk-tier \
   --expert-ram-cache-total-mib 98304 --host-pool-mib 256 --embedding-placement ram \

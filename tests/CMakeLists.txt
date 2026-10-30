@@ -510,7 +510,7 @@ set(R4D_EMU_HIP ${R4D_DIR}/r4d_attn_paged_window.hip ${R4D_DIR}/r4d_pair_argmax_
 # this build: cfg_stub.cpp defines them at their axis defaults, in both arms below, and the bf16
 # skinny GEMM's (r4d_cfg_gemm) for it and its bf16f8 twin, whose outputs test_bf16f8 compares.
 set(R4D_EMU_TESTS attn pick norm escale qsa lora f32 mhc fp8f32 kda moemx mla moefuse kvres
-                  dsa m2xfp4 bf16f8 ds41vp ds41mx ds41tall ds41mask)
+                  dsa m2xfp4 bf16f8 ds41vp ds41mx ds41tall ds41mask ds41bal)
 # ds41mask holds the DSpark draft router (router_scored_topk, r4d_ds41_elem.hip) under
 # RADIANCE_EXPERIMENTAL_DS41_DRAFT_VRAM's mask (core/place/draft_vram.h, built with the engine's own
 # helpers): never a masked expert, the best three kept ones, their weights renormalised.
@@ -565,7 +565,7 @@ else()
                 ${R4D_EMU}/test_moefuse.cpp ${R4D_EMU}/test_kvres.cpp
                 ${R4D_EMU}/test_dsa.cpp ${R4D_EMU}/test_m2xfp4.cpp ${R4D_EMU}/test_bf16f8.cpp
                 ${R4D_EMU}/test_ds41vp.cpp ${R4D_EMU}/test_ds41mx.cpp ${R4D_EMU}/test_ds41tall.cpp
-                ${R4D_EMU}/test_ds41mask.cpp ${R4D_EMU}/cfg_stub.cpp)
+                ${R4D_EMU}/test_ds41mask.cpp ${R4D_EMU}/test_ds41bal.cpp ${R4D_EMU}/cfg_stub.cpp)
       get_filename_component(stem ${src} NAME_WE)
       set(lang "")
       if(src MATCHES "\\.hip$")
@@ -617,9 +617,16 @@ else()
 endif()
 if(R4D_EMU_BUILT)
   foreach(t pick norm escale qsa lora f32 mhc fp8f32 kda moemx mla moefuse kvres dsa m2xfp4 bf16f8
-            ds41vp ds41mx ds41tall ds41mask)
+            ds41vp ds41mx ds41tall ds41mask ds41bal)
     add_test(NAME r4d_emu_${t} COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_${t})
   endforeach()
+  # ds41tall again with RADIANCE_EXPERIMENTAL_DS41_MOE_BALANCE=1 beside LCP: the balanced twin and gemv rows
+  # (both sides of its comparison) still give the 16-token passes' bits (test_ds41bal holds the balanced
+  # kernel to the plain one directly).
+  add_test(NAME r4d_emu_ds41tall_bal COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_ds41tall)
+  set_tests_properties(r4d_emu_ds41tall_bal PROPERTIES
+                       ENVIRONMENT "RADIANCE_EXPERIMENTAL_DS41_LCP=1024;RADIANCE_EXPERIMENTAL_DS41_MOE_BALANCE=1"
+                       LABELS "r4d_emu" TIMEOUT ${RAD_TEST_TIMEOUT})
   add_test(NAME r4d_emu_ds41tall_on COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_ds41tall)
   set_tests_properties(r4d_emu_ds41tall_on PROPERTIES ENVIRONMENT "RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=1"
                        LABELS "r4d_emu" TIMEOUT ${RAD_TEST_TIMEOUT})
@@ -638,7 +645,7 @@ if(R4D_EMU_BUILT)
   set_tests_properties(r4d_emu_attn_shard0 r4d_emu_attn_shard1 r4d_emu_attn_shard2 r4d_emu_pick
                        r4d_emu_norm r4d_emu_escale r4d_emu_qsa r4d_emu_lora r4d_emu_mla r4d_emu_moefuse
                        r4d_emu_dsa r4d_emu_m2xfp4 r4d_emu_bf16f8 r4d_emu_ds41vp r4d_emu_ds41vp_tail r4d_emu_ds41mx
-                       r4d_emu_ds41tall r4d_emu_ds41mask
+                       r4d_emu_ds41tall r4d_emu_ds41mask r4d_emu_ds41bal
                        PROPERTIES LABELS "r4d_emu" TIMEOUT ${RAD_TEST_TIMEOUT})
   # The LoRA pair has a libref oracle, and the test holds the emulated kernels to it when it can
   # load one -- expand bit for bit, shrink to its bound. kda_update is held to libref's within

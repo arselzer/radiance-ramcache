@@ -24,6 +24,9 @@ int r4d_rad_moe_gemm_mxfp4_gemv_vp(const RadArgs*, RadStream);
 /* The `_gemv` kernel at any number of tokens: the launch of moe_gemm_ggml_mxfp4_gemv_tall, the twin r4d_rows.cpp
  * adds under RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=1. */
 int r4d_rad_moe_gemm_mxfp4_gemv_tall(const RadArgs*, RadStream);
+/* Checker-only: the gemv row (`tall` 0) or the twin (1) with RADIANCE_EXPERIMENTAL_DS41_MOE_BALANCE forced off
+ * (`bal` 0) or on (1) for the call: work items by row passes, dropped passes without weight reads, same bits. */
+int r4d_rad_moe_gemm_mxfp4_gemv_bal(const RadArgs*, RadStream, int tall, int bal);
 
 /* -- operand descriptions (r4d_ds41_mxfp4_shapes.inc), libref's for type=mxfp4: the weight in its float
  * logical form. */

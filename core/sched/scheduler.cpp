@@ -112,10 +112,15 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
      * that ends having computed n1 positions (its prompt and every output token but the last), the
      * grid positions g with |P1| < g <= n1 (a decode step's, reserved on the step whose row is
      * g - 1), |P1| itself when it is on the grid, and the start of P1's last chunk (its tail) -- on
-     * top of the prompt ladder (interval boundaries, a shared head). The deepest, grid_floor(n1)
-     * once the reply crossed a grid position, is what the next turn of the conversation reaches:
-     * its prompt P2 begins with P1 ++ R1's reply (the client sends the reply back), so the prefix
-     * cache's chain over P1 ++ output runs through it, and the hit resumes there.
+     * top of the prompt ladder (interval boundaries, a shared head). Under the consumer skip a
+     * prefill writes none below its prompt's cut target (consumer_target: the deepest snapshot its
+     * idle prefill writes, |P1| when on the grid, else the tail), whose last layers' windows would
+     * be incomplete (reserve_ckpt drops them, SchedMetrics::consumer_ckpt_dropped); there the
+     * resumable positions are that target and the decode ones, not the ladder below the target nor
+     * the tail of a prompt ending on the grid. The deepest, grid_floor(n1) once the reply crossed
+     * a grid position, is what the next turn of the conversation reaches: its prompt P2 begins with
+     * P1 ++ R1's reply (the client sends the reply back), so the prefix cache's chain over P1 ++
+     * output runs through it, and the hit resumes there.
      *
      * Why the resumed turn R2 computes what a cold run of P2 computes, bit for bit (its KV in every
      * group, its last row's logits, so its reply), on an idle server:

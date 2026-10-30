@@ -814,7 +814,8 @@ private:
      * it again. With it, a decode step whose row completes a position on the resume grid
      * (ChunkGeometry::grid) past its prompt snapshots the state there, a prompt ending on the grid
      * snapshots its end, and every prompt takes its tail snapshot (the start of its last chunk)
-     * however short it is. The deepest stands when the request ends: at most grid - 1 tokens below
+     * however short it is (under the consumer skip only the deeper of the two, its cut target, and
+     * nothing below it). The deepest stands when the request ends: at most grid - 1 tokens below
      * its last computed position, and the next turn resumes there and recomputes the cold run's own
      * chunks from it. Such a step is never issued ahead (step_next_locked): its key hashes the
      * token the step before samples. The trim after a publish keeps the entries of the chain just

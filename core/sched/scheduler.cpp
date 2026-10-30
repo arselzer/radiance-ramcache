@@ -145,9 +145,20 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
      * chunk and (A) the tall checks up to their reach. Refused, below, where it is not shown:
      * without the exact grid, with speculation (a verify step's rows past an accepted draft roll
      * back, and its position is the card's), and with ..._EXACT_PUBLISH, which withholds the
-     * decode-written blocks a snapshot past the prompt stands on. */
+     * decode-written blocks a snapshot past the prompt stands on. Refused too where (A) is known
+     * to fail: a recurrent state scanned in chunks (ChunkGeometry::state_chunk > 1: a gated delta
+     * net, as qwen35's and QFN's), whose prefill runs a chunked scan, another algorithm than the
+     * one-row recurrence of a decode step, rounding otherwise (engine_e2e_test
+     * a_decoded_token_has_the_probabilities_prefilling_it_gives holds qwen35 within 0.1 in a
+     * log-probability, not bit for bit, and a turn resumed at a snapshot its decode wrote answered
+     * with other probabilities than a cold run). A model whose only state is a sliding window
+     * (ChunkGeometry::window_ckpt) takes it only with RADIANCE_EXPERIMENTAL_PREFIX_EORS_WINDOW=1:
+     * its snapshots are decode-written window rows, and nothing yet holds (A) for one end to
+     * end. */
     eors_ = false;
     if (const char* es = std::getenv("RADIANCE_EXPERIMENTAL_PREFIX_EORS"); es && !std::strcmp(es, "1")) {
+        const char* ew = std::getenv("RADIANCE_EXPERIMENTAL_PREFIX_EORS_WINDOW");
+        const bool window_ok = ew && !std::strcmp(ew, "1");
         std::string why;
         if (!cfg.prefix_cache)
             why = "the prefix cache is off (--no-prefix-cache)";
@@ -157,6 +168,17 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
         else if (!geo_.checkpoints())
             why = "this model keeps no state a snapshot would hold (no linear state, no trunk "
                   "window): a decode step's blocks are published and hit as they are";
+        else if (geo_.state_chunk > 1)
+            why = "this model scans its recurrent state in chunks of " +
+                  std::to_string(geo_.state_chunk) +
+                  " tokens (a gated delta net, as qwen35's and QFN's): a decode step runs the "
+                  "recurrence one row at a time, which rounds otherwise than a prefill's chunked "
+                  "scan, so the state a decode step would snapshot is not the one a cold prefill "
+                  "reaches";
+        else if (geo_.window_ckpt && !window_ok)
+            why = "this model's only state is a sliding window, and nothing yet shows its decode "
+                  "rows equal to the same rows in a prefill pass; "
+                  "RADIANCE_EXPERIMENTAL_PREFIX_EORS_WINDOW=1 takes it anyway";
         else if (cfg.n_spec != 0 || prog.drafter.kind != RAD_DRAFT_NONE)
             why = "speculation is on: a verify step's position past its drafts is the card's, and "
                   "its rejected rows roll back";
@@ -173,6 +195,10 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
                      "recomputes the cold run's own chunks from there; such a step is not issued "
                      "ahead, and the trim after a publish spares the chain just published",
                      (long long)geo_.grid, (long long)(geo_.grid - 1));
+            if (geo_.window_ckpt)
+                RAD_WARN("end-of-request snapshots: a sliding-window model, taken by "
+                         "RADIANCE_EXPERIMENTAL_PREFIX_EORS_WINDOW=1 -- exact only if its decode "
+                         "rows have the bits of the same rows in a prefill pass on these kernels");
         } else {
             RAD_WARN("end-of-request snapshots: refused -- %s; decode writes no snapshot",
                      why.c_str());

@@ -806,19 +806,21 @@ private:
      * height; with this, every published block is a cold chunk's own. */
     bool    exact_publish_ = false;
     /* RADIANCE_EXPERIMENTAL_PREFIX_EORS=1 (read at init; refused, with the reason, outside
-     * --prefix-resume exact, with speculation or with ..._EXACT_PUBLISH): end-of-request
-     * snapshots. Decode writes none otherwise, so a conversation's next turn resumes at most at the
-     * previous prompt's last chunk start and prefills the reply and everything after it again. With
-     * it, a decode step whose row completes a position on the resume grid (ChunkGeometry::grid)
-     * past its prompt snapshots the state there, a prompt ending on the grid snapshots its end, and
-     * every prompt takes its tail snapshot (the start of its last chunk) however short it is. The
-     * deepest stands when the request ends: at most grid - 1 tokens below its last computed
-     * position, and the next turn resumes there and recomputes the cold run's own chunks from it.
-     * Such a step is never issued ahead (step_next_locked): its key hashes the token the step
-     * before samples. The trim after a publish spares the chain just published. Exact where a row
-     * computed alone (decode) has the bits of the same row in a prefill pass of up to
-     * --max-num-batched-tokens rows: see the exactness argument in scheduler.cpp ("end-of-request
-     * snapshots", at init). */
+     * --prefix-resume exact, with speculation or with ..._EXACT_PUBLISH, on a recurrent state
+     * scanned in chunks, whose decode rows round otherwise than its prefill's, and on a model whose
+     * only state is a sliding window unless RADIANCE_EXPERIMENTAL_PREFIX_EORS_WINDOW=1):
+     * end-of-request snapshots. Decode writes none otherwise, so a conversation's next turn resumes
+     * at most at the previous prompt's last chunk start and prefills the reply and everything after
+     * it again. With it, a decode step whose row completes a position on the resume grid
+     * (ChunkGeometry::grid) past its prompt snapshots the state there, a prompt ending on the grid
+     * snapshots its end, and every prompt takes its tail snapshot (the start of its last chunk)
+     * however short it is. The deepest stands when the request ends: at most grid - 1 tokens below
+     * its last computed position, and the next turn resumes there and recomputes the cold run's own
+     * chunks from it. Such a step is never issued ahead (step_next_locked): its key hashes the
+     * token the step before samples. The trim after a publish spares the chain just published.
+     * Exact where a row computed alone (decode) has the bits of the same row in a prefill pass of
+     * up to --max-num-batched-tokens rows: see the exactness argument in scheduler.cpp
+     * ("end-of-request snapshots", at init). */
     bool    eors_ = false;
     /* The throughput window (step_finished): each kind's tokens and the wall time the steps
      * covered, both decayed with the same time constant, so their ratio is tokens over time. */

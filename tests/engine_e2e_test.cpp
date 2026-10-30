@@ -1935,8 +1935,13 @@ TEST(a_prompt_resumed_from_the_prefix_cache_returns_what_a_cold_run_does) {
  * property the exactness rests on; without the switch its next turn finds no snapshot past the
  * previous prompt's tail and prefills it all again. Gemma 4 here keeps no state a snapshot holds (its
  * sliding layers are a full group), so the switch is refused and a hit adopts the decode-written
- * blocks as they are, with or without it: the same property on attention alone. The gated delta
- * net's recurrence decodes otherwise than its chunked prefill rounds, so qwen35 is no case for it. */
+ * blocks as they are, with or without it: the same property on attention alone. qwen35's gated
+ * delta net decodes a row by a recurrence its chunked prefill does not round alike (within 0.1 in
+ * a log-probability there, not equal), so a snapshot its decode wrote is not the state a cold
+ * prefill reaches, and a turn resumed at one answered with other probabilities: the switch is
+ * refused for a chunked recurrent scan, and its next turn, as without the switch, finds no
+ * snapshot past the previous prompt (whose tail is inside the first interval), prefills it all
+ * and returns a cold run's answer. */
 TEST(a_turn_resumed_at_an_end_of_request_snapshot_returns_what_a_cold_run_does) {
     REQUIRE(world().ok);
     const std::vector<std::string> warm = { "--num-speculative-tokens", "0",
@@ -1944,14 +1949,22 @@ TEST(a_turn_resumed_at_an_end_of_request_snapshot_returns_what_a_cold_run_does) 
                                             "exact" };
     const std::vector<std::string> cold = { "--num-speculative-tokens", "0",
                                             "--max-num-batched-tokens", "64", "--no-prefix-cache" };
-    struct Run { const char* name; std::string World::*model; bool state; };
-    const Run kRuns[] = { { "lfm2", &World::lfm2, true }, { "gemma4", &World::gemma4, false } };
+    /* What the switch does on each model: taken (LFM2), refused for want of a state to snapshot
+     * (Gemma 4), refused for a chunked recurrent scan (qwen35), each refusal with its reason. */
+    enum class Eors { On, NoState, Scan };
+    struct Run { const char* name; std::string World::*model; Eors eors; };
+    const Run kRuns[] = { { "lfm2", &World::lfm2, Eors::On },
+                          { "gemma4", &World::gemma4, Eors::NoState },
+                          { "qwen35", &World::qwen35, Eors::Scan } };
     for (const Run& run : kRuns) {
         const std::vector<int32_t> p1 = prompt_ids(41, 150);
         const int64_t n1 = (int64_t)p1.size();
         std::vector<int32_t> out1, p2;
         json with, without;
         int64_t cached_with = -1, cached_without = -1;
+        const char* reason = run.eors == Eors::NoState
+            ? "end-of-request snapshots: refused -- this model keeps no state a snapshot would hold"
+            : "end-of-request snapshots: refused -- this model scans its recurrent state in chunks";
         for (const bool eors : { true, false }) {
             Server s;
             REQUIRE(s.start(world().*run.model, warm,
@@ -1975,15 +1988,17 @@ TEST(a_turn_resumed_at_an_end_of_request_snapshot_returns_what_a_cold_run_does) 
             CHECK_EQ(s.stop(), 0);
             const std::string log = s.output();
             const bool on = has(log, "end-of-request snapshots: on");
-            const bool refused = has(log, "end-of-request snapshots: refused -- this model keeps no "
-                                          "state a snapshot would hold");
+            const bool refused = has(log, "end-of-request snapshots: refused");
+            const bool why = has(log, reason);
             const bool hit = has(log, "1 admission(s) resumed from one");
-            const bool want_on = eors && run.state;
-            if (on != want_on || hit != want_on || refused != (eors && !run.state))
+            const bool want_on = eors && run.eors == Eors::On;
+            const bool want_refused = eors && run.eors != Eors::On;
+            if (on != want_on || hit != want_on || refused != want_refused || why != want_refused)
                 fprintf(stderr, "    %s eors=%d:\n%s\n", run.name, (int)eors, tail(log, 30).c_str());
             CHECK(on == want_on);
             CHECK(hit == want_on);
-            CHECK(refused == (eors && !run.state));
+            CHECK(refused == want_refused);
+            CHECK(why == want_refused);
         }
         Server c;
         REQUIRE(c.start(world().*run.model, cold));
@@ -1991,15 +2006,16 @@ TEST(a_turn_resumed_at_an_end_of_request_snapshot_returns_what_a_cold_run_does) 
         CHECK_EQ(c.stop(), 0);
         /* Turn 1 computed its prompt and 99 of its tokens; the next turn resumes at the deepest grid
          * position at or below them, past the prompt: at a snapshot (LFM2, with the switch), or at
-         * a block (Gemma 4, either way). */
+         * a block (Gemma 4, either way). qwen35 resumes nowhere, either way. */
         const int64_t want = (n1 + 99) / 64 * 64;
-        const int64_t want_without = run.state ? 0 : want;
-        if (cached_with != want || cached_without != want_without)
+        const int64_t want_with = run.eors == Eors::Scan ? 0 : want;
+        const int64_t want_without = run.eors == Eors::NoState ? want : 0;
+        if (cached_with != want_with || cached_without != want_without)
             fprintf(stderr, "    %s: prompt %lld, cached with %lld (want %lld), without %lld "
                             "(want %lld)\n", run.name, (long long)n1, (long long)cached_with,
-                    (long long)want, (long long)cached_without, (long long)want_without);
+                    (long long)want_with, (long long)cached_without, (long long)want_without);
         CHECK(want > n1);
-        CHECK_EQ(cached_with, want);
+        CHECK_EQ(cached_with, want_with);
         CHECK_EQ(cached_without, want_without);
         REQUIRE(ref.contains("completion_probabilities"));
         for (const json* r : { &with, &without }) {

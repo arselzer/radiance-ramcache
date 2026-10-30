@@ -7735,13 +7735,17 @@ TEST(consumer_skip_is_refused_for_unlike_ranks_and_kv_streaming) {
  * grid snapshots its end, every prompt takes its tail snapshot, and a step that would carry a
  * decode snapshot is planned after its predecessor's commit, never issued ahead. */
 namespace {
-/* init reads the switch, so it is set around start() alone. */
-int eors_start(Fixture& f, bool on) {
+/* init reads the switch, so it is set around start() alone; `window` the opt-in a model whose only
+ * state is a sliding window needs beside it (RADIANCE_EXPERIMENTAL_PREFIX_EORS_WINDOW). */
+int eors_start(Fixture& f, bool on, bool window = false) {
     if (on) setenv("RADIANCE_EXPERIMENTAL_PREFIX_EORS", "1", 1);
     else unsetenv("RADIANCE_EXPERIMENTAL_PREFIX_EORS");
+    if (window) setenv("RADIANCE_EXPERIMENTAL_PREFIX_EORS_WINDOW", "1", 1);
+    else unsetenv("RADIANCE_EXPERIMENTAL_PREFIX_EORS_WINDOW");
     log_set_level(Log::Error);
     const int rc = f.start();
     unsetenv("RADIANCE_EXPERIMENTAL_PREFIX_EORS");
+    unsetenv("RADIANCE_EXPERIMENTAL_PREFIX_EORS_WINDOW");
     return rc;
 }
 
@@ -7838,25 +7842,42 @@ TEST(eors_snapshots_the_reply_on_the_grid_and_every_prompts_tail) {
     CHECK(r.ahead > 30);
 }
 
-/* The grid is whatever exact resumption allows: on the GDN hybrid (chunks and interval of 256) the
- * reply's snapshots fall every 256 tokens, beside the interval ladder and the tail. */
+/* The grid is whatever exact resumption allows: with chunks split at an interval of 256 inside a
+ * 512-token budget the reply's snapshots fall every 256 tokens, beside the interval ladder and the
+ * tail. Linear state with no chunked scan (DeepSeek-V4.1's shape, at that budget), and a model
+ * whose only state is a sliding window, which takes the switch with its opt-in alone. */
 TEST(eors_snapshots_follow_the_resume_grid) {
-    Fixture f;
-    exact_fixture(f, 0);
-    REQUIRE_EQ(eors_start(f, true), RAD_OK);
-    REQUIRE(f.sch.eors_on());
-    REQUIRE_EQ(f.sch.geometry().grid, 256);
-    const uint64_t id = f.submit(1000, 300, 0, true);
-    const EorsRun r = eors_run(f, id, true);
-    CHECK_EQ(r.n_computed, 1299ll);
-    CHECK((r.ckpts == std::vector<int64_t>{ 256, 512, 768, 1024, 1280 }));
-    CHECK((r.eors == std::vector<int64_t>{ 1024, 1280 }));
+    for (const bool window : { false, true }) {
+        Fixture f;
+        if (window) {
+            exact_fixture(f, 3);
+        } else {
+            f.build(4096, 64, /*max_tok=*/512, 4096, /*windowed=*/true, /*linear=*/true);
+            f.prog.ops.resize(1);          /* no gdn_chunk_scan: a state chunk of 1 */
+            f.kv.snap = { 3 };
+            f.pc.groups = { 0 };
+            f.cfg.prefix_exact = true;
+        }
+        REQUIRE_EQ(eors_start(f, true, window), RAD_OK);
+        REQUIRE(f.sch.eors_on());
+        REQUIRE_EQ(f.sch.geometry().state_chunk, 1);
+        REQUIRE(f.sch.geometry().window_ckpt == window);
+        REQUIRE_EQ(f.sch.geometry().grid, 256);
+        const uint64_t id = f.submit(1000, 300, 0, true);
+        const EorsRun r = eors_run(f, id, true);
+        CHECK_EQ(r.n_computed, 1299ll);
+        CHECK((r.ckpts == std::vector<int64_t>{ 256, 512, 768, 1024, 1280 }));
+        CHECK((r.eors == std::vector<int64_t>{ 1024, 1280 }));
+    }
 }
 
 /* Refused, with the reason, where the exactness argument does not reach: without the exact grid,
  * without a prefix cache, with speculation, beside exact publish (which keeps out the decode
  * blocks a snapshot past the prompt stands on), and on a model with no state a snapshot holds.
- * Taken on the GDN hybrid and on a sliding-window model. */
+ * Refused where it is known to fail: the GDN hybrids, whose recurrent state is scanned in chunks
+ * of 64 (qwen35 and QFN decode a row otherwise than their chunked prefill rounds it), at every
+ * interval, budget and span. A model whose only state is a sliding window takes it only with
+ * RADIANCE_EXPERIMENTAL_PREFIX_EORS_WINDOW=1, periodic snapshots or tip-only. */
 TEST(eors_is_refused_where_its_exactness_is_not_shown) {
     {
         Fixture f;
@@ -7894,10 +7915,32 @@ TEST(eors_is_refused_where_its_exactness_is_not_shown) {
         REQUIRE_EQ(eors_start(f, true), RAD_OK);
         CHECK(!f.sch.eors_on());
     }
-    for (const int kind : { 0, 3 }) {
+    /* The GDN hybrid at interval 256 / budget 512, at interval 1024, and with a span of 2: its scan
+     * is chunked, with or without the window opt-in. */
+    for (const int kind : { 0, 1, 2 }) {
+        for (const bool window : { false, true }) {
+            Fixture f;
+            exact_fixture(f, kind);
+            REQUIRE_EQ(eors_start(f, true, window), RAD_OK);
+            CHECK_EQ(f.sch.geometry().state_chunk, 64);
+            CHECK(!f.sch.eors_on());
+        }
+    }
+    /* Sliding-window models, periodic snapshots and tip-only: the opt-in alone takes them. */
+    for (const int kind : { 3, 4 }) {
+        for (const bool window : { false, true }) {
+            Fixture f;
+            exact_fixture(f, kind);
+            REQUIRE_EQ(eors_start(f, true, window), RAD_OK);
+            CHECK(f.sch.geometry().window_ckpt);
+            CHECK(f.sch.eors_on() == window);
+        }
+    }
+    /* Linear state without a chunked scan (DeepSeek-V4.1's) needs no opt-in, and takes none. */
+    for (const bool window : { false, true }) {
         Fixture f;
-        exact_fixture(f, kind);
-        REQUIRE_EQ(eors_start(f, true), RAD_OK);
+        ds41_fixture(f, 2048);
+        REQUIRE_EQ(eors_start(f, true, window), RAD_OK);
         CHECK(f.sch.eors_on());
     }
 }

@@ -493,22 +493,26 @@ switches below (claude/ds41-eors) make a turn prefill only what it added, exactl
 
 **End-of-request snapshots** (`RADIANCE_EXPERIMENTAL_PREFIX_EORS=1`, part `Pce`). A decode step
 whose row completes a position on the resume grid past its prompt snapshots the state there
-(reserved when the step is planned, saved after it, as a prefill chunk's is), a prompt ending on
-the grid snapshots its end, and every prompt its tail (the start of its last chunk) however short.
-So for a request that computed n positions (its prompt and every output token but the last) the
+(reserved when the step is planned, saved after it, as a prefill chunk's is), a prompt ending on the
+grid snapshots its end, and every prompt its tail (the start of its last chunk) however short. So
+for a request that computed n positions (its prompt and every output token but the last) the
 resumable positions are the grid positions g with prompt < g <= n, the prompt's end when on the
 grid, its tail, and the prompt ladder below; the next turn resumes at grid_floor(n), at most 15
 tokens before the end of the reply at `--max-num-batched-tokens 16` (31 under `Xt-BT32`, whose grid
 is 32). A step that carries a decode snapshot is planned after its predecessor's commit, not issued
-ahead (its key hashes the token that step samples): one host turnaround every 16 tokens, plus a
-5.65 MiB copy a rank (~0.3 ms). The trim after a publish spares the conversation just published
-(a plain one reaches its end first, and with it that snapshot, once it holds more than three
-quarters of the pool). Refused, with the reason in the log, without `--prefix-resume exact`, with
-speculation, with `Pcx` (which keeps out the decode blocks such a snapshot stands on) and on a
-model with no state to snapshot. Counters: `/stats` `eors` (reserved, committed, ahead_withheld,
-hits, hit_tokens, hit_deepest) and `snapshot_store`, and the shutdown line `end-of-request
-snapshots: N reserved, M stored (X written, ...), K step(s) not issued ahead for one; H
-admission(s) resumed from one, T tokens reused (deepest D); snapshot store: ...`.
+ahead (its key hashes the token that step samples): one host turnaround every 16 tokens, plus a 5.65
+MiB copy a rank (~0.3 ms). The trim after a publish spares the conversation just published (a plain
+one reaches its end first, and with it that snapshot, once it holds more than three quarters of the
+pool). Refused, with the reason in the log, without `--prefix-resume exact`, with speculation, with
+`Pcx` (which keeps out the decode blocks such a snapshot stands on), on a model with no state to
+snapshot, and on one whose recurrent state is scanned in chunks (a gated delta net: qwen35, QFN),
+where a decoded row is not the row a prefill computes. A model whose only state is a sliding window
+takes it only with `RADIANCE_EXPERIMENTAL_PREFIX_EORS_WINDOW=1` (nothing yet shows (A) below for
+one). DeepSeek-V4.1 is neither: its linear state (the compressor's tail, the Engram tokens) has a
+state chunk of 1, and its window rides in the snapshot beside it. Counters: `/stats` `eors`
+(reserved, committed, ahead_withheld, hits, hit_tokens, hit_deepest) and `snapshot_store`, and the
+shutdown line `end-of-request snapshots: N reserved, M stored (X written, ...), K step(s) not issued
+ahead for one; H admission(s) resumed from one, T tokens reused (deepest D); snapshot store: ...`.
 
 Why it is exact (the full argument is at `Scheduler::init`, "end-of-request snapshots"): the next
 turn resumes on the grid, so from there it computes the cold run's own chunks from the same state;
@@ -524,7 +528,10 @@ convolution's state: with the switch the next turn resumes at the reply's last g
 without it at nothing) and Gemma 4 (no state to snapshot: the switch is refused and the hit adopts
 the decode-written blocks at 192 either way); every reply and probability is a cold server's.
 qwen35's gated delta net decodes by another recurrence than its chunked prefill, so (A) fails
-there, as it would on any such model. On the cards the first evidence came from today's cache:
+there, as it would on any such model: with the switch taken, a turn resumed at its decode snapshot
+gave other probabilities than a cold run (review of 30 Oct). The switch is now refused there, and
+the same e2e case holds the refusal: qwen35's next turn, with the switch asked or not, resumes
+nowhere and answers as a cold server. On the cards the first evidence came from today's cache:
 in window ab-20261029T232708Z `Pc-Pci256` on `Upfxchat` answered 15/15 as the cold arm, C3 among
 them, which adopts 46 of C1's decode-step blocks beneath C2's recompute snapshot (token level; the
 `Kh` arms are the byte level). Under the consumer skip (`Cs`) the snapshots are at or past each

@@ -1008,7 +1008,7 @@ bool Mover::plane_reads(HostPlanes* const* units, int n, int rows, PlaneCall* c,
     c->next.store(0);
     c->weights = 0;
     c->units = n;
-    c->rest = 0;
+    c->rest = c->rest_mirror = 0;
     c->rest_bytes = c->rest_mirror_bytes = 0;
     c->posted = false;
     c->join_ns = 0;
@@ -1071,7 +1071,10 @@ bool Mover::plane_reads(HostPlanes* const* units, int n, int rows, PlaneCall* c,
                 const PlaneSpan& s = sp[j];
                 if (part) {
                     c->rest_bytes += s.len;
-                    if (s.mirror) c->rest_mirror_bytes += s.len;
+                    if (s.mirror) {   /* one weight of a unit has a mirror part, in one span */
+                        c->rest_mirror_bytes += s.len;
+                        ++c->rest_mirror;
+                    }
                 }
                 if (!s.mirror) {
                     /* A read to the extent's end may round up into the buffer's slack. */
@@ -1131,6 +1134,7 @@ bool Mover::plane_reads_done(PlaneCall* c, bool readers_failed, PlaneReadTiming*
         t.return_ns = back;
         t.t0_ns = c->t0;
         t.rest = c->rest;
+        t.rest_mirror = c->rest_mirror;
         t.rest_bytes = c->rest_bytes;
         t.rest_mirror_bytes = c->rest_mirror_bytes;
         *timing = t;

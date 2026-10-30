@@ -400,8 +400,9 @@ EOF2
   if [[ -n "${ARM_PU:-}" ]]; then
     pu_lines=$(grep -c "reads the rest of a partly read unit its layer needs .*PREFETCH_URGENT=${ARM_PU})" "$OUT/$name.server.log")
     pu_cont=$(grep -c "PREFETCH_URGENT=${ARM_PU}), from the container alone: this rank has no decode mirror" "$OUT/$name.server.log")
-    if [[ "$pu_lines" == 0 || "$pu_lines" != "$pu_any" ]]; then
-      log "arm $name: Pu${ARM_PU#1}, but the server log has $pu_lines 'reads the rest of a partly read unit ... PREFETCH_URGENT=${ARM_PU})' lines of $pu_any ($(grep -m1 -E 'a partly read unit its layer needs is' "$OUT/$name.server.log")); not measured"
+    # One a rank (--tp 4): a rank that did not take the switch would read its rests as before.
+    if [[ "$pu_lines" != 4 || "$pu_lines" != "$pu_any" ]]; then
+      log "arm $name: Pu${ARM_PU#1}, but the server log has $pu_lines 'reads the rest of a partly read unit ... PREFETCH_URGENT=${ARM_PU})' lines of $pu_any, not one on each of the 4 ranks ($(grep -m1 -E 'a partly read unit its layer needs is' "$OUT/$name.server.log")); not measured"
       stop_server; return 1
     fi
     if [[ "$pu_cont" != 0 ]]; then
@@ -475,11 +476,13 @@ EOF2
   # some of it from the plane mirror), or the switch never acted and the arm is not measured (set
   # aside as <arm>.unmeasured.json, as a Dk arm's).
   if [[ -n "${ARM_PU:-}" ]]; then
-    local pu_rest pu_mb pu_bad=""
+    local pu_rest pu_mir pu_bad=""
     pu_rest=$(grep -oE "PREFETCH_URGENT=${ARM_PU}\): [0-9]+ units' rest" "$OUT/$name.server.log" | grep -oE ': [0-9]+' | tr -d ': ' | awk '{s += $1} END {print s + 0}')
-    pu_mb=$(grep -E "PREFETCH_URGENT=${ARM_PU}\): [0-9]+ units' rest" "$OUT/$name.server.log" | grep -oE '\([0-9]+ MB of it from the plane mirror' | grep -oE '[0-9]+' | awk '{s += $1} END {print s + 0}')
+    # Pu2's mirror share as a count of rests: the MB, even with one decimal, can round to 0 in a
+    # verify arm, whose rests fall mostly in the down extent, which has no mirror part.
+    pu_mir=$(grep -E "PREFETCH_URGENT=${ARM_PU}\): [0-9]+ units' rest" "$OUT/$name.server.log" | grep -oE "[0-9]+ units' rests with a part from it" | grep -oE '^[0-9]+' | awk '{s += $1} END {print s + 0}')
     [[ "$pu_rest" == 0 ]] && pu_bad="no rank's shutdown line counts a unit's rest read in its layer's own call"
-    [[ -z "$pu_bad" && "$ARM_PU" == 2 && "$pu_mb" == 0 ]] && pu_bad="no rank read any of a rest from the plane mirror"
+    [[ -z "$pu_bad" && "$ARM_PU" == 2 && "$pu_mir" == 0 ]] && pu_bad="no rank read any of a rest from the plane mirror"
     if [[ -n "$pu_bad" ]]; then
       log "arm $name: Pu${ARM_PU#1}, but $pu_bad; not measured (results kept as $name.unmeasured.json)"
       [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"

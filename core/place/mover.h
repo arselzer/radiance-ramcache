@@ -646,9 +646,10 @@ public:
         int64_t join_ns = 0;        /* posted: the caller came to wait (finish_unit_planes) */
         int64_t return_ns = 0;      /* the caller back, every read landed */
         int64_t t0_ns = 0;          /* the dispatch itself (steady clock ns) */
-        /* Units read past bytes they had in already (PlanesIn: a read-ahead's rest), and the
-         * bytes read for them, of those the plane mirror's. */
-        int     rest = 0;
+        /* Units read past bytes they had in already (PlanesIn: a read-ahead's rest), of them those
+         * whose rest the plane mirror read part of, and the bytes read for them, of those the plane
+         * mirror's. */
+        int     rest = 0, rest_mirror = 0;
         int64_t rest_bytes = 0, rest_mirror_bytes = 0;
     };
     /* A unit whose planes are partly in already (a read-ahead's pieces, readahead.h): the first
@@ -985,7 +986,7 @@ private:
         std::vector<Read> reads;
         std::atomic<size_t> next{ 0 };
         int weights = 0, units = 0;
-        int rest = 0;                                    /* PlaneReadTiming::rest */
+        int rest = 0, rest_mirror = 0;                   /* PlaneReadTiming::rest, rest_mirror */
         int64_t rest_bytes = 0, rest_mirror_bytes = 0;   /* ...and its bytes */
         bool posted = false;
         int64_t t0 = 0;        /* steady_clock ns: the dispatch */

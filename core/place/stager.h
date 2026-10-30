@@ -325,10 +325,16 @@ public:
          * nothing else to read, which is that unit's own wait: the per-unit wait to compare with
          * and without ..._PREFETCH_URGENT. */
         uint64_t ra_fin_layers = 0, ra_fin_ns = 0, ra_alone = 0, ra_alone_ns = 0;
+        /* Of the alone layers, those whose unit had at least the plane mirror's decode share of
+         * pieces started when the layer took it (decode_mirror_bytes(), 0 without a mirror): every
+         * finished unit without ..._PREFETCH_URGENT=2, which also finishes the barely started units
+         * the others read afresh (a rest of ~16-18 MB, a whole demand read's wait). The per-unit
+         * wait on the same set of units in every arm. */
+        uint64_t ra_alone_b = 0, ra_alone_b_ns = 0;
         /* ..._PREFETCH_URGENT: finished units whose rest their layer's own call read on the kept
          * readers, the rest's bytes, and of them the plane mirror's (ra_wait_ns is then the wait,
-         * after that call, for their pieces in flight). */
-        uint64_t ra_rest = 0, ra_rest_bytes = 0, ra_rest_mirror_bytes = 0;
+         * after that call, for their pieces in flight); the units whose rest the mirror read part of. */
+        uint64_t ra_rest = 0, ra_rest_bytes = 0, ra_rest_mirror_bytes = 0, ra_rest_mirror = 0;
         /* ..._SIDE_STORE (hx_side_store.h): misses handed the planes the store holds (no drive
          * read), and of them in one-token passes. */
         uint64_t side_hits = 0, side_d_hits = 0;
@@ -785,6 +791,8 @@ private:
                                               * the layer; the epoch is checked before their jobs */
     uint64_t hx_ra_chose_ns_ = 0;            /* when hx_choose took this layer's units (steady ns):
                                               * where the per-unit wait (ra_fin_ns) starts */
+    int     hx_ra_fin_b_ = 0;                /* units finished for this layer that every arm finishes
+                                              * (HostStats::ra_alone_b) */
     /* Parallel to hx_miss_: the unit the readers are finishing for this layer (with
      * ..._PREFETCH_URGENT: stopped, its rest the layer's call's), or null. */
     std::vector<std::shared_ptr<ReadAheadUnit>> hx_miss_ra_;

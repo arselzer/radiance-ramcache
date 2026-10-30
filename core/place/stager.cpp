@@ -1850,6 +1850,7 @@ void FileStager::hx_choose(int32_t li) {
     hx_miss_ready_.clear();
     hx_miss_ra_.clear();
     hx_ra_handed_ = 0;
+    hx_ra_fin_b_ = 0;
     hx_side_handed_ = 0;
     hx_slot_.assign(want_.size(), -1);
     const bool ra = hx_ra_ && pass_tok_ == 1;   /* read-ahead in pieces: this layer's units */
@@ -2541,6 +2542,7 @@ int FileStager::hx_submit_misses_now(int rows) {
             hx_stats_.ra_rest += (uint64_t)tm.rest;
             hx_stats_.ra_rest_bytes += (uint64_t)tm.rest_bytes;
             hx_stats_.ra_rest_mirror_bytes += (uint64_t)tm.rest_mirror_bytes;
+            hx_stats_.ra_rest_mirror += (uint64_t)tm.rest_mirror;
         }
         if (ok && urgent) ok = hx_ra_settle(rows);
         demand.demand_leave();
@@ -2558,6 +2560,10 @@ int FileStager::hx_submit_misses_now(int rows) {
             if (alone) {
                 ++hx_stats_.ra_alone;
                 hx_stats_.ra_alone_ns += ns;
+                if (hx_ra_fin_b_ > 0) {
+                    ++hx_stats_.ra_alone_b;
+                    hx_stats_.ra_alone_b_ns += ns;
+                }
             }
         }
     }
@@ -3046,7 +3052,12 @@ std::shared_ptr<Mover::HostPlanes> FileStager::hx_ra_take(int32_t u, bool* ready
         return nullptr;
     }
     /* Finished: the readers read the rest as urgent pieces, or (..._PREFETCH_URGENT) they start no
-     * further piece and the layer's own call reads the rest (hx_unread_misses). */
+     * further piece and the layer's own call reads the rest (hx_unread_misses). One that would be
+     * finished without ..._PREFETCH_URGENT=2 too counts for the per-unit wait every arm compares
+     * (HostStats::ra_alone_b; no mover in a test: no mirror). */
+    if (hx_ra_rest_ != 2 || (int64_t)ra->started() * hx_ra_->piece_bytes() >=
+                                (mover_ ? mover_->decode_mirror_bytes() : 0))
+        ++hx_ra_fin_b_;
     if (hx_ra_rest_) hx_ra_->stop(*ra);
     else hx_ra_->make_urgent(*ra);
     ++hx_stats_.ra_finished;

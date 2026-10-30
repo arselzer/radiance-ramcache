@@ -342,17 +342,22 @@ Engine::~Engine() {
                 RAD_INFO("read-ahead in pieces, partly read units at their layer: %llu layers waited "
                          "for them, %.3f ms each from the layer's choice until every such unit was "
                          "whole; %llu of those layers read nothing else, %.3f ms each (one unit's own "
-                         "wait)", (unsigned long long)hx.ra_fin_layers,
+                         "wait); %llu of them with the unit started at least the plane mirror's decode share, "
+                         "%.3f ms each (the per-unit wait on the units every arm finishes)",
+                         (unsigned long long)hx.ra_fin_layers,
                          (double)hx.ra_fin_ns * 1e-6 / (double)hx.ra_fin_layers,
                          (unsigned long long)hx.ra_alone,
-                         hx.ra_alone ? (double)hx.ra_alone_ns * 1e-6 / (double)hx.ra_alone : 0.0);
+                         hx.ra_alone ? (double)hx.ra_alone_ns * 1e-6 / (double)hx.ra_alone : 0.0,
+                         (unsigned long long)hx.ra_alone_b,
+                         hx.ra_alone_b ? (double)hx.ra_alone_b_ns * 1e-6 / (double)hx.ra_alone_b : 0.0);
             if (rest)
                 RAD_INFO("read-ahead in pieces, rests on the kept readers "
                          "(RADIANCE_EXPERIMENTAL_DS41_PREFETCH_URGENT=%d): %llu units' rest read in their "
-                         "layer's own call, %.0f MB (%.0f MB of it from the plane mirror; %.2f MB a unit); "
-                         "%.1f ms waiting after the call for their pieces in flight", rest,
+                         "layer's own call, %.0f MB (%.1f MB of it from the plane mirror, %llu units' rests with "
+                         "a part from it; %.2f MB a unit); %.1f ms waiting after the call for their pieces in "
+                         "flight", rest,
                          (unsigned long long)hx.ra_rest, (double)hx.ra_rest_bytes / 1e6,
-                         (double)hx.ra_rest_mirror_bytes / 1e6,
+                         (double)hx.ra_rest_mirror_bytes / 1e6, (unsigned long long)hx.ra_rest_mirror,
                          hx.ra_rest ? (double)hx.ra_rest_bytes / 1e6 / (double)hx.ra_rest : 0.0,
                          (double)hx.ra_wait_ns / 1e6);
         }

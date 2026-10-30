@@ -2075,8 +2075,11 @@ int Engine::plan() {
         std::vector<uint8_t> vpk_buf;
         if (vram_pack_cfg_.on) {
             std::string why;
-            if (!file_ || source_banks_)
-                why = "the experts are not read from one container (a checkpoint, or a DSpark bank)";
+            /* With a DSpark bank bound the trunk's experts are still the main container's (file_); the
+             * bank's (file_id 1) are refused by vram_pack_eligible and their ops never resolved
+             * gemv_vp (the trunk-only row, Engine::start). */
+            if (!file_)
+                why = "the experts are not read from a container (a checkpoint)";
             else
                 vram_pack_eligible(r->program, *file_, vram_pack_cfg_, &vpk, &why);
             int64_t n_ok = 0;
@@ -2105,6 +2108,19 @@ int Engine::plan() {
                      (long long)vp.scanned, vp.scan_s, (long long)vp.scan_failed, (long long)vp.raw_rounds,
                      (long long)vp.raw_max,
                      r->plan.dynamic ? " (a dynamic plan packs nothing: give --deterministic)" : "");
+            if (source_banks_) {
+                VramPackBankReport bk;
+                std::string bwhy;
+                if (vram_pack_bank_check(r->program, r->plan, &bk, &bwhy) < 0) {
+                    RAD_ERR("VRAM packed experts: rank %d: the DSpark bank's side must keep its block form: %s",
+                            r->index, bwhy.c_str());
+                    return RAD_E_STATE;
+                }
+                RAD_INFO("VRAM packed experts: rank %d: DSpark bank bound; %lld trunk weights packed from the "
+                         "main container; the bank's %lld weights stay block_mxfp4 (%lld VRAM residents) and its "
+                         "%lld draft moe_gemm_ggml ops keep their row", r->index, (long long)bk.trunk_packed,
+                         (long long)bk.bank_weights, (long long)bk.bank_vram, (long long)bk.draft_ops);
+            }
         }
         if (!decode_profile.rows.empty()) {
             size_t vram_units = 0, pinned_units = 0, disk_units = 0;
@@ -4074,6 +4090,7 @@ int Engine::start() {
          * moe_gemm_ggml_mxfp4_gemv_vp row take the routed GEMMs' decode band, set before selection as
          * device.p2p is. Without it the row never matches and nothing below packs. */
         RAD_TRY(vram_pack_config(&vram_pack_cfg_));
+        rad_tools_registry().set_trunk_only_rows({});
         if (vram_pack_cfg_.on) {
             const char* oracle = std::getenv("RADIANCE_OP_ORACLE");
             if (oracle && *oracle) {
@@ -4083,6 +4100,13 @@ int Engine::start() {
                 return RAD_E_INVAL;
             }
             rad_tools_registry().set_device_fact(kVramPackFact, 1);
+            /* A DSpark bank's grouped GEMMs keep the plain gemv row (and ..._DRAFT_GEMV's path): the
+             * packed form is the trunk's alone (vram_packed.h, `bank`). */
+            if (source_banks_) {
+                rad_tools_registry().set_trunk_only_rows({ kVramPackRow });
+                RAD_INFO("VRAM packed experts: a DSpark bank is bound: %s serves the trunk's routed GEMMs only; "
+                         "the draft layers' keep the plain row and their experts block_mxfp4", kVramPackRow);
+            }
             RAD_INFO("VRAM packed experts (RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED): %s selects %s for the routed "
                      "GEMMs' decode band; static residents with room for %d (gate_up) and %d (down) raw rounds",
                      kVramPackFact, kVramPackRow, vram_pack_cfg_.raw[0], vram_pack_cfg_.raw[1]);

@@ -6101,4 +6101,167 @@ TEST(dspark_bank_vram_mover_holds_only_the_hot_set_and_parked_weights_publish_at
     CHECK_EQ(draft_vram_aliases(prog, broken, m, &none, &why), RAD_E_STATE);
 }
 
+/* ================================================================== packed trunk residents beside a DSpark bank
+ *
+ * RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED with --draft-bank (vram_packed.h, `bank`): the trunk's routed
+ * experts come from the main container and pack as without a bank; every bank weight (file_id 1, the draft
+ * layers') keeps its block form whatever reads it, and the hot draft set of ..._DRAFT_VRAM is charged at its
+ * slots before the fill exactly as without the switch. */
+TEST(vram_pack_eligible_with_a_dspark_bank_packs_the_trunk_and_never_a_bank_weight) {
+    VpModel m(3, 4, 2, "vp_bank.rad");
+    REQUIRE(m.ok);
+    /* Every op on gemv_vp, the draft layer's too (which the trunk-only row prevents; refused here anyway). */
+    for (int l = 0; l < 3; ++l) {
+        m.op(l, 0, { &g_vp_row });
+        m.op(l, 1, { &g_vp_row });
+    }
+    VramPackConfig cfg;
+    cfg.on = true;
+    cfg.raw[0] = 16;
+    cfg.raw[1] = 4;
+    std::vector<VramPackWeight> plain, bank;
+    std::string why_plain, why_bank;
+    vram_pack_eligible(m.f.prog, m.file, cfg, &plain, &why_plain);
+    int trunk_plain = 0;
+    for (rad_weight h = 1; (size_t)h < plain.size(); ++h) {
+        const bool trunk = m.f.prog.weights[h].decl.group.layer < 2;
+        CHECK_EQ(plain[(size_t)h].bytes > 0, trunk);
+        trunk_plain += plain[(size_t)h].bytes > 0;
+    }
+    CHECK_EQ(trunk_plain, 16);
+    /* Bound as DsparkRadBanks::bind_weights binds them: the draft layer's weights to the bank. And one
+     * trunk-shaped weight in the bank too: the bank alone keeps it block_mxfp4. */
+    for (int e = 0; e < 4; ++e)
+        for (int s = 0; s < 2; ++s) m.f.prog.weights[m.at(2, e, s)].file_id = 1;
+    m.f.prog.weights[m.at(0, 1, 1)].file_id = 1;
+    vram_pack_eligible(m.f.prog, m.file, cfg, &bank, &why_bank);
+    REQUIRE(bank.size() == plain.size());
+    int trunk_bank = 0;
+    for (rad_weight h = 1; (size_t)h < bank.size(); ++h) {
+        if (m.f.prog.weights[h].file_id != 0) {
+            CHECK_EQ(bank[(size_t)h].bytes, (int64_t)0);
+            continue;
+        }
+        /* The main container's: the same answer as without a bank, field for field. */
+        CHECK_EQ(bank[(size_t)h].bytes, plain[(size_t)h].bytes);
+        CHECK_EQ(bank[(size_t)h].cap, plain[(size_t)h].cap);
+        CHECK_EQ(bank[(size_t)h].scales_off, plain[(size_t)h].scales_off);
+        trunk_bank += bank[(size_t)h].bytes > 0;
+    }
+    CHECK_EQ(trunk_bank, 15);
+    CHECK(why_bank.find("9 more weights the gemv_vp tables read are a DSpark bank's (the draft's) and stay "
+                        "block_mxfp4") != std::string::npos);
+    if (why_bank.find("9 more weights") == std::string::npos) std::printf("  why: %s\n", why_bank.c_str());
+    /* No bank, no clause: the line reads as before. */
+    CHECK(why_plain.find("DSpark bank") == std::string::npos);
+}
+
+TEST(vram_pack_bank_check_refuses_a_draft_op_on_gemv_vp_or_a_packed_bank_weight) {
+    VpModel m(3, 2, 2, "vp_bank_check.rad");
+    REQUIRE(m.ok);
+    m.op(0, 0, { &g_vp_row });
+    m.op(0, 1, { &g_vp_row });
+    m.op(1, 0, { &g_vp_row, &g_mx_tiled_row });
+    m.op(1, 1, { &g_vp_row });
+    /* The draft's ops as the trunk-only row leaves them: the plain gemv row, then the tiled one. */
+    m.op(2, 0, { &g_mx_gemv_row, &g_mx_tiled_row });
+    m.op(2, 1, { &g_mx_gemv_row, &g_mx_tiled_row });
+    for (int e = 0; e < 2; ++e)
+        for (int s = 0; s < 2; ++s) m.f.prog.weights[m.at(2, e, s)].file_id = 1;
+    Plan p;
+    p.weight.resize(m.f.prog.weights.size());
+    p.weight[m.at(0, 0, 0)].vram_bytes = 1000;
+    p.weight[m.at(0, 1, 1)].vram_bytes = 1000;
+    p.weight[m.at(2, 0, 0)].tier = Tier::VRAM;
+    p.weight[m.at(2, 0, 1)].tier = Tier::VRAM;
+    p.weight[m.at(2, 1, 0)].tier = Tier::Mapped;
+    p.weight[m.at(2, 1, 1)].tier = Tier::Mapped;
+    VramPackBankReport r;
+    std::string why;
+    CHECK_OK(vram_pack_bank_check(m.f.prog, p, &r, &why));
+    CHECK(why.empty());
+    CHECK_EQ(r.draft_ops, (int64_t)2);
+    CHECK_EQ(r.bank_weights, (int64_t)4);
+    CHECK_EQ(r.bank_vram, (int64_t)2);
+    CHECK_EQ(r.trunk_packed, (int64_t)2);
+    /* A bank weight planned packed. */
+    Plan bad = p;
+    bad.weight[m.at(2, 0, 1)].vram_bytes = 1000;
+    CHECK_EQ(vram_pack_bank_check(m.f.prog, bad, &r, &why), RAD_E_STATE);
+    CHECK(why.find("blk.2.ffn_down_exps.0.weight") != std::string::npos);
+    /* A draft op that resolved gemv_vp: by its layer, even with the weights not bound to the bank. */
+    for (int e = 0; e < 2; ++e)
+        for (int s = 0; s < 2; ++s) m.f.prog.weights[m.at(2, e, s)].file_id = 0;
+    m.f.prog.ops.back().bands[0].dom[RAD_DOMAIN_DEVICE].row = &g_vp_row;
+    CHECK_EQ(vram_pack_bank_check(m.f.prog, p, &r, &why), RAD_E_STATE);
+    CHECK(why.find(kVramPackRow) != std::string::npos);
+}
+
+/* The accounting with the draft hot set in VRAM: the hot pairs are charged at their block slots before the
+ * fill (as without the switch) and are never packed, even by a callback that would pack them; the trunk's
+ * residents pack, and the room that frees goes to more trunk residents. */
+TEST(dspark_bank_vram_with_packed_trunk_residents_keeps_the_hot_set_block_and_fills_the_freed_room) {
+    FileBufferUnitsEnv units("1");
+    constexpr int64_t P = 18800640;
+    for (int rank : {0, 3}) {
+        Program prog = bank_expert_tiered_program(rank);
+        for (size_t w = 1; w < prog.weights.size(); ++w)
+            if (prog.weights[w].decl.group.layer >= 40) prog.weights[w].file_id = 1;
+        Config cfg = bank_expert_tiered_config();
+        REQUIRE(cfg.deterministic);
+        const DraftVramRank dv = dv_spec(rank, 24);
+        PlannerInput in{&prog, &cfg, rank, 4, nullptr, 0};
+        in.container = true;
+        in.draft_vram = &dv;
+        Plan plain;
+        REQUIRE(Planner(in).plan(&plain) == RAD_OK);
+        /* As the engine answers (vram_pack_eligible: the bank's weights 0), and a callback that would pack
+         * every expert, the draft's too. */
+        FakePack trunk_only;
+        trunk_only.prog = &prog;
+        auto trunk_fn = trunk_only.fn();
+        FakePack every;
+        every.prog = &prog;
+        for (int which = 0; which < 2; ++which) {
+            PlannerInput pin = in;
+            if (which == 0)
+                pin.vram_pack = [&](rad_weight w, bool scan, int32_t* cap, int32_t* raw) -> int64_t {
+                    return prog.weights[w].file_id != 0 ? 0 : trunk_fn(w, scan, cap, raw);
+                };
+            else
+                pin.vram_pack = every.fn();
+            Plan p;
+            REQUIRE(Planner(pin).plan(&p) == RAD_OK);
+            CHECK(p.fits());
+            CHECK(dspark_draft_control_scope(prog, p, cfg, true, 24));
+            /* The hot set: the same units, block form, the same charge. */
+            CHECK_EQ(p.draft_vram_units, plain.draft_vram_units);
+            CHECK_EQ(p.draft_vram_bytes, plain.draft_vram_bytes);
+            CHECK_EQ(p.draft_vram_bytes, (int64_t)72 * P);
+            CHECK_EQ(p.draft_parked_units, plain.draft_parked_units);
+            for (size_t u = 0; u < p.units.size(); ++u) {
+                const MoveUnit& mu = p.units[u];
+                if (mu.layer < 40 || mu.expert < 0) continue;
+                CHECK_EQ(mu.draft_vram, plain.units[u].draft_vram);
+                CHECK(mu.tier == plain.units[u].tier);
+                CHECK_EQ(mu.vram_bytes, (int64_t)0);
+                if (mu.draft_vram) CHECK_EQ(mu.slot_bytes, P);
+                for (rad_weight w : mu.weights) CHECK_EQ(p.weight[w].vram_bytes, (int64_t)0);
+            }
+            /* The trunk: every resident packed, and x1.0444 as many in the room the hot set leaves. */
+            const int r0 = trunk_vram_residents(plain), r1 = trunk_vram_residents(p);
+            CHECK(r1 > r0 + r0 * 4 / 100 - 1);
+            CHECK_EQ(p.vram_packed.units, (int64_t)r1);
+            CHECK_EQ(p.vram_packed.weights, (int64_t)2 * r1);
+            CHECK_EQ(p.vram_packed.bytes, (int64_t)r1 * align_up(align_up(kGuPacked, RAD_ALIGN_UNIT) + kDnPacked, RAD_ALIGN_UNIT));
+            VramPackBankReport rep;
+            std::string why;
+            CHECK_OK(vram_pack_bank_check(prog, p, &rep, &why));
+            CHECK_EQ(rep.trunk_packed, (int64_t)2 * r1);
+            CHECK_EQ(rep.bank_vram, (int64_t)2 * 72);
+            CHECK(p.totals.bytes[int(Tier::VRAM)] + p.slab_overhead + p.file_stage_vram <= p.vram_budget);
+        }
+    }
+}
+
 RAD_TEST_MAIN()

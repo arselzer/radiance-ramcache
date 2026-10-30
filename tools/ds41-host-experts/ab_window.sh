@@ -292,6 +292,36 @@ kld_finish() {   # name; the run is SERVER_PID
   python3 -I "$HERE/ab_requests.py" --kld-compare "$KLD_REF" "$OUT/kld-$name" 2>&1 | tee -a "$OUT/window.log"
 }
 
+# RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED (the Vp part), from a server log: the engine names the switch at
+# startup and each rank how many static residents it holds packed. A Vp arm without the switch's line or
+# with no rank holding any packed (a radiance without the switch, a dynamic plan), or a plain arm with
+# either line (the switch taken from the window's environment), is not measured. With a DSpark bank (a Ds
+# part: --draft-bank) the trunk packs from the main container and the bank keeps its block form and its
+# own GEMV path (claude/ds41-dsvp; an older radiance refused the switch with a bank, so no rank held any):
+# a Vp arm with a bank also needs every rank's 'DSpark bank bound; N trunk weights packed' line, N above 0,
+# the engine's check that no draft op took gemv_vp and no bank weight was packed.
+# Arguments: the log, the arm's Vp (non-empty: on), its bank (non-empty: bound). 0 when the arm may be
+# measured; otherwise 1, the reason on stdout.
+vp_server_gate() {
+  local f=$1 vp=$2 bank=$3 vp_on vp_held vp_bank
+  vp_on=$(grep -c 'VRAM packed experts (RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED)' "$f")
+  vp_held=$(grep -cE 'holds [1-9][0-9]* static residents' "$f")
+  vp_bank=$(grep -cE 'VRAM packed experts: rank [0-9]+: DSpark bank bound; [1-9][0-9]* trunk weights packed' "$f")
+  if [[ -n "$vp" ]] && [[ "$vp_on" == 0 || "$vp_held" == 0 ]]; then
+    echo "Vp, but the server log has $vp_on 'VRAM packed experts (RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED)' and $vp_held 'holds N static residents' lines with N above 0 ($(grep -m2 -E 'VRAM packed experts' "$f" | tr '\n' ' '))"
+    return 1
+  fi
+  if [[ -n "$vp" && -n "$bank" && "$vp_bank" != 4 ]]; then
+    echo "Vp with a DSpark bank, but $vp_bank of the 4 ranks logged 'DSpark bank bound; N trunk weights packed' with N above 0 ($(grep -m2 -E 'VRAM packed experts: (rank [0-9]+: DSpark|a DSpark)' "$f" | tr '\n' ' '))"
+    return 1
+  fi
+  if [[ -z "$vp" ]] && [[ "$vp_on" != 0 || "$vp_held" != 0 ]]; then
+    echo "no Vp part, but the server held experts packed (the switch set for the window?)"
+    return 1
+  fi
+  return 0
+}
+
 arm() {   # name, then env assignments for the server; CACHE_MIB the RAM cache (default 81920)
   local name=$1; shift
   local n=${ARM_N:-${AB_REQUESTS:-8}}; [[ "$name" == verify* ]] && n=$VERIFY_REQUESTS
@@ -421,19 +451,10 @@ EOF2
     stop_server; return 1
   fi
   [[ -n "${ARM_PMR:-}" ]] && grep -m1 -E 'read-ahead: decode passes of 2-' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
-  # RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED (the Vp part): the engine names the switch at startup and
-  # each rank how many static residents it holds packed. A Vp arm without the switch's line or with
-  # no rank holding any packed (a radiance without the switch, a dynamic plan, a DSpark bank), or a
-  # plain arm with either line (the switch taken from the window's environment), is not measured.
-  local vp_on vp_held
-  vp_on=$(grep -c 'VRAM packed experts (RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED)' "$OUT/$name.server.log")
-  vp_held=$(grep -cE 'holds [1-9][0-9]* static residents' "$OUT/$name.server.log")
-  if [[ -n "${ARM_VP:-}" ]] && [[ "$vp_on" == 0 || "$vp_held" == 0 ]]; then
-    log "arm $name: Vp, but the server log has $vp_on 'VRAM packed experts (RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED)' and $vp_held 'holds N static residents' lines with N above 0 ($(grep -m2 -E 'VRAM packed experts' "$OUT/$name.server.log" | tr '\n' ' ')); not measured"
-    stop_server; return 1
-  fi
-  if [[ -z "${ARM_VP:-}" ]] && [[ "$vp_on" != 0 || "$vp_held" != 0 ]]; then
-    log "arm $name: no Vp part, but the server held experts packed (the switch set for the window?); not measured"
+  # RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED (the Vp part): vp_server_gate (above) on the server log.
+  local vp_why
+  if ! vp_why=$(vp_server_gate "$OUT/$name.server.log" "${ARM_VP:-}" "$([[ " ${ARGS[*]} " == *" --draft-bank "* ]] && echo 1)"); then
+    log "arm $name: $vp_why; not measured"
     stop_server; return 1
   fi
   # RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP (the Cs part): the scheduler says at startup whether it
@@ -1174,7 +1195,9 @@ for a in $ARMS; do
 # run home, --deterministic and passes of at most 16 tokens, which every arm here has); runs only on a
 # libr4d.so VPACK_CHECK's device check passed (vpack_gate above), skipped otherwise, and is measured
 # only if its server log names the switch and a rank holding N > 0 residents packed; every other arm
-# runs with the switch at 0 and must have neither line.
+# runs with the switch at 0 and must have neither line. With a Ds part the trunk's residents pack and
+# the bank's draft experts (Dv's hot set too) stay block_mxfp4 on their own GEMV path (Dk / Dkt), and
+# every rank must log the engine's bank check (arm() above).
 # the RAM cache's profile-hot units get N second chances before eviction; MsN a decode pass that
 # misses one unit reads the plane mirror's tail in N pieces on N readers
 # (RADIANCE_EXPERIMENTAL_DS41_MIRROR_SPLIT, 2-4, designed for 3; needs R and RdNN); Mp a one-token

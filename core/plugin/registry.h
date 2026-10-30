@@ -189,6 +189,17 @@ public:
      * Set before the first selection by whoever chose the devices; without a fact, a kernel
      * constrained on it is not selected. */
     void set_device_fact(std::string_view key, long long v) { device_facts_.set_i(key, v); }
+    /* Rows a declaration resolves only for ops that read no draft head's weight (one of a layer at or past
+     * the model's n_layers, as the builder counts a drafter's KV groups): for such an op the builder passes
+     * them over as if their constraints failed, and the next row takes the band. The engine names libr4d's
+     * moe_gemm_ggml_mxfp4_gemv_vp here while a DSpark bank is bound under RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED
+     * (place/vram_packed.h), so the bank's grouped GEMMs keep the row they have without the switch. Set, like
+     * the device facts, before the first declaration; empty (the default) changes nothing. */
+    void set_trunk_only_rows(std::vector<std::string> names) { trunk_only_rows_ = std::move(names); }
+    bool trunk_only_row(std::string_view name) const {
+        for (const std::string& n : trunk_only_rows_) if (n == name) return true;
+        return false;
+    }
 
     void close();                       /* fini instances, close hooks, dlclose, forget everything */
 
@@ -330,6 +341,7 @@ private:
     int code_device_ = 0;
     bool no_device_code_ = false;
     Geometry device_facts_;
+    std::vector<std::string> trunk_only_rows_;
     TuneCache tune_;
 
     int  stage_(const std::string& path, Staged* out);

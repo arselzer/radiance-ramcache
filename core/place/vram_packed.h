@@ -27,6 +27,14 @@
  *           more raw rounds than its budget stays block_mxfp4 in VRAM and is charged so. Only a
  *           static plan (--deterministic) packs: a movable resident sits in a slot of its class's
  *           stride and the heat engine copies slots as they are.
+ *   bank    With a DSpark bank bound (--draft-bank) the trunk's experts still come from the main
+ *           container, which is the `file` here, and pack as without one. The bank's weights (file_id
+ *           1, the draft layers') never do: Engine::start names kVramPackRow trunk-only
+ *           (Registry::set_trunk_only_rows), so the draft's grouped GEMMs keep the plain gemv row and
+ *           RADIANCE_EXPERIMENTAL_DS41_DRAFT_GEMV's path, and vram_pack_eligible refuses a bank weight
+ *           whatever reads it. RADIANCE_EXPERIMENTAL_DS41_DRAFT_VRAM's hot set stays block_mxfp4,
+ *           charged at its slots before the fill as without the switch; packed trunk residents free
+ *           room for more trunk residents only.
  *   load    The loader packs each such weight from its planes (vram_pack_weight) and checks it
  *           before the upload: every block's e8m0, as the kernels widen it, equals the planes' byte
  *           for byte and the codes plane is unchanged. A mismatch refuses the load.
@@ -51,6 +59,7 @@
 namespace rad {
 
 class RadFile;
+class Plan;
 
 /* libr4d's R4D_FACT_DS41_VRAM_PACKED and the row it selects (r4d_ds41_mxfp4.h, .inc), restated: the
  * core links no plugin. */
@@ -100,5 +109,17 @@ int64_t vram_pack_query(const RadFile& file, const std::vector<VramPackWeight>& 
  * when the check fails; RAD_E_SHAPE for a shape the form cannot hold. `n_exc` gets the raw rounds. */
 int vram_pack_weight(const uint8_t* codes, const uint8_t* scales, int N, int K, int cap, uint8_t* dst,
                      int64_t dst_bytes, int* n_exc);
+
+/* With a DSpark bank bound, after the plan: what the bank's side holds, and the check that none of it went
+ * the packed way. A draft op is a moe_gemm_ggml reading a bank weight (file_id != 0) or a draft layer's (at
+ * or past meta.n_layers). RAD_E_STATE, with `why`, when a draft op's band resolved kVramPackRow or a bank
+ * weight is planned packed (Placement::vram_bytes); RAD_OK otherwise. */
+struct VramPackBankReport {
+    int64_t draft_ops = 0;       /* moe_gemm_ggml ops over the draft's experts */
+    int64_t bank_weights = 0;    /* weights bound to the bank */
+    int64_t bank_vram = 0;       /* ...of them VRAM residents, block_mxfp4 */
+    int64_t trunk_packed = 0;    /* the main container's weights planned packed */
+};
+int vram_pack_bank_check(const Program& prog, const Plan& plan, VramPackBankReport* out, std::string* why);
 
 }  /* namespace rad */

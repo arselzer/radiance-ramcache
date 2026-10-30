@@ -66,11 +66,13 @@ RADIANCE_EXPERIMENTAL_DS41_SIDE_STORE=7                    # up to 7 units a ran
 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_FUTEX=1            # pool workers sleep on a futex, woken without a lock
 
 radiance ... --tp 4 --placement expert_tiered --weights-disk-tier \
-  --expert-ram-cache-total-mib 98304 --host-pool-mib 256 --embedding-placement ram \
+  --expert-ram-cache-total-mib 196608 --host-pool-mib 256 --embedding-placement ram \   # 192 GiB on a 256 GB box (98304 on 128 GB)
   --max-num-batched-tokens 1024 --expert-profile <decode profile> \
   --expert-plane-mirror <dir of the checkpoint's model-*.safetensors> \
   --expert-plane-mirror-decode-share 0.13                              # the mirror is optional, see below
 ```
+
+**On 256 GB of RAM (8x 32 GB DDR4-2666) with a 192 GiB expert cache** (ab-20261030T194..., replies identical): decode **31.2 tok/s** a stream (19.9 with 96 GiB on 128 GB of DDR4-2133; 20.9 with 96 GiB on the new RAM, so the cache size, not the memory speed, is the gain: rank 0's misses fall 2,073 → 361 on the held-out prompts); **38.7 tok/s in all at 4 streams**; prefill 3,086 tokens in 28.1 s (110 tok/s) and 6,817 in 51.7 s (132 tok/s). 192 and 208 GiB measure the same.
 
 **For code-heavy single-stream use (agent harnesses), add DSpark speculation.** Exact (every draft is
 verified; replies identical in every window), measured against the configuration above with packed

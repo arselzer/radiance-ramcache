@@ -356,6 +356,23 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
             pos.push_back(std::move(p));
         }
         o["draft_positions"] = std::move(pos);
+        /* RADIANCE_EXPERIMENTAL_DS41_DSPARK_GATE (sched/draft_gate.h): only while it is on. */
+        if (m.draft_gate.on) {
+            const DraftGateStats& g = m.draft_gate;
+            json k = json::object();
+            const char* names[2][2] = { { "plain", "draft_only" }, { "verify_only", "verify_draft" } };
+            for (int v = 0; v < 2; ++v)
+                for (int d = 0; d < 2; ++d)
+                    k[names[v][d]] = { { "steps", g.step_n[v][d] }, { "ms", g.step_ms(v, d) } };
+            o["draft_gate"] = { { "threshold", g.threshold }, { "window", g.window },
+                                { "probe", g.probe }, { "seqs", g.seqs }, { "asks", g.asks },
+                                { "warm", g.warm }, { "open", g.open }, { "probes", g.probes },
+                                { "gated", g.gated }, { "closes", g.closes },
+                                { "reopens", g.reopens }, { "verifies", g.verifies },
+                                { "verified", g.verified }, { "accepted", g.accepted },
+                                { "probe_verified", g.probe_verified },
+                                { "probe_accepted", g.probe_accepted }, { "steps", std::move(k) } };
+        }
 
         /* Live request table: counters and timestamps. `decode_tps` is the request's own average
          * since its first token. */

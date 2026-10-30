@@ -176,6 +176,10 @@ struct SchedMetrics {
     int64_t lookup_held = 0;
     int64_t lookup_held_drafts = 0;
     int64_t lookup_held_hits = 0;
+    /* RADIANCE_EXPERIMENTAL_DS41_DSPARK_GATE (draft_gate.h): every sequence's gate counters, the
+     * finished and the running, and the single-sequence decode steps by kind; `on` false and all
+     * zero while off. */
+    DraftGateStats draft_gate;
 };
 
 

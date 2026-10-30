@@ -52,7 +52,8 @@ Engine::Engine(Config cfg)
     : cfg_(std::move(cfg)),
       draft_experiment_(DraftExperiment::capture(std::getenv(kDraftOriginEnv),
                                                   std::getenv(kDraftComputeOffEnv),
-                                                  std::getenv(kDraftVerifyCapEnv))), env_set_(diag::env_names(environ, "RADIANCE_")) {}
+                                                  std::getenv(kDraftVerifyCapEnv),
+                                                  std::getenv(kDraftGateEnv))), env_set_(diag::env_names(environ, "RADIANCE_")) {}
 
 int32_t* Engine::Readback::reserve(int64_t count) {
     if (count <= n) return p;
@@ -1277,6 +1278,8 @@ int Engine::step_loop() {
         }
     }
     post_stop_report();
+    /* RADIANCE_EXPERIMENTAL_DS41_DSPARK_GATE: its counters and every finished sequence's. */
+    sched_.draft_gate_report();
     return RAD_OK;
 }
 

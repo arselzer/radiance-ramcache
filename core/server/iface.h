@@ -104,6 +104,8 @@ struct SchedMetrics {
     double  draft_acceptance = 0.0;   /* 0..1, spec §10 */
     /* The exact pair the ratio is computed from. */
     rad::DraftOriginStats draft_origin;
+    /* RADIANCE_EXPERIMENTAL_DS41_DSPARK_GATE's counters (sched/draft_gate.h); `on` false while off. */
+    rad::DraftGateStats draft_gate;
     int64_t draft_tokens = 0;
     int64_t draft_accepted = 0;
     /* Prefix hits ended early for a windowed block drafter, and the tokens they gave back. */

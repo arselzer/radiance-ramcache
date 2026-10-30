@@ -121,6 +121,7 @@ inline SchedMetrics bridge_metrics(const rad::SchedMetrics& m) {
     o.draft_acceptance = m.draft_acceptance;
     o.prefill_tokens = m.prefill_tokens;   o.decode_tokens = m.decode_tokens;
     o.draft_origin = m.draft_origin;
+    o.draft_gate = m.draft_gate;
     o.draft_tokens = m.draft_tokens;       o.draft_accepted = m.draft_accepted;
     o.draft_refills = m.draft_refills;     o.draft_refill_tokens = m.draft_refill_tokens;
     o.lookup_proposals = m.lookup_proposals;     o.lookup_held = m.lookup_held;

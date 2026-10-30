@@ -7,6 +7,8 @@
 #include "device/directio.h"
 #include "place/mover.h"
 #include "place/planner.h"
+#include "place/host_expert_pool.h"
+#include "place/stager.h"
 #include "tiny_model.h"
 #include "../tools/ds41-host-experts/ds41_host_experts.h"
 #ifdef RAD_NATIVE_CACHE_ENGINE_CASE
@@ -1199,6 +1201,149 @@ TEST(mover_plane_spans_tile_a_rest_and_keep_the_mirror_in_w3){
     CHECK_EQ(Mover::rest_mirror_tail(4*w3,total,total,0,end,w3,A),w3);                  //no more than w3
     CHECK_EQ(Mover::rest_mirror_tail(0,total,total,0,end,w3,A),int64_t(0));
     CHECK_EQ(Mover::rest_mirror_tail(tail,0,total,0,end,w3,A),int64_t(0));
+}
+
+/* RADIANCE_EXPERIMENTAL_DS41_SIDE_STORE in the file stager (place/hx_side_store.h) on this file's packed
+ * fixture, where expert 1's down plane has more raw rounds than its budget, so the packed cache refuses its
+ * unit for good. Through the stager's test friend, with the actual HOST Mover:
+ *  - the insert threads' loop (hx_bg_loop) offers a unit to the store only after the packed cache refused
+ *    it: the unit that fits is cached and not held, the refused one held, and a later refusal of the same
+ *    unit keeps the planes held first;
+ *  - the read-ahead planner (hx_ra_plan) plans the refused unit before it is held, and neither the cached
+ *    unit nor the held one after;
+ *  - a layer that selects the held unit (hx_choose) takes its planes with no read: hx_miss_ready_ 2, the
+ *    held buffers themselves, the read-ahead planned before they were held dropped as cached, nothing on
+ *    the layer's read list (hx_unread_misses), counted as a side-store hit;
+ *  - no insert is queued for it (hx_queue_inserts), while another miss of the layer is;
+ *  - once the container changes, the layer refuses the held planes before any job (the epoch check, as
+ *    for units read ahead whole). */
+namespace {
+/* The process's CPU pool for hx_choose (its schedule estimates and reservations; no job runs here): two
+ * workers and a silu table of zeros, the switches unset again so no later case sees them. */
+HostExpertPool* side_store_pool(){
+    static HostExpertPool* p=[]()->HostExpertPool*{
+        const std::string path=radtest::tmpdir()+"/silu_side_store.bin";
+        std::vector<float> silu(65536,0.0f);FILE* f=std::fopen(path.c_str(),"wb");if(!f)return nullptr;
+        const bool ok=std::fwrite(silu.data(),4,65536,f)==65536;std::fclose(f);if(!ok)return nullptr;
+        ::setenv("RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS","2",1);::setenv("RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU",path.c_str(),1);
+        HostExpertPool* got=HostExpertPool::get();
+        ::unsetenv("RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS");::unsetenv("RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU");
+        return got;}();
+    return p;
+}
+} //namespace
+namespace rad {
+/* FileStager's test friend (stager.h). The piece readers outlive the stager: its destructor forgets its
+ * units on them. */
+struct EpCountsHostProbe {
+    PieceReader r;
+    FileStager fs;
+    void side_store_holds_what_the_packed_cache_refuses();
+};
+void EpCountsHostProbe::side_store_holds_what_the_packed_cache_refuses(){
+    Environment mapped("1","1");PackedEnvironment packed;
+    Fixture f;f.experts();f.info.relayout=mx_relayout;Image image(lay_out_mxfp4(f));write_scales(f,image);
+    Config cfg=plan_config(false);Plan plan=planned(f,cfg,true);const auto units=two_ssd_experts(plan);
+    std::atomic<uint64_t> calls{0};Access::Driver driver;Transport t;t.open(f,plan,image,80*MiB,calls);Access::attach(*t.mover,driver);
+    REQUIRE(t.mover->packed_cache());
+    HostExpertPool* pool=side_store_pool();
+    if(!pool||!__builtin_cpu_supports("avx2")){SKIP("no AVX2 or no CPU pool");return;}
+    const int32_t held=plan.units[size_t(units[0])].expert==1?units[0]:units[1],fits=held==units[0]?units[1]:units[0];
+    const int layer=plan.units[size_t(held)].layer,e_held=plan.units[size_t(held)].expert,e_fits=plan.units[size_t(fits)].expert;
+    REQUIRE_EQ(e_held,1);REQUIRE_EQ(plan.units[size_t(fits)].layer,layer);REQUIRE_EQ(plan.rank,0);
+    /* The stager as hx_init_impl leaves it for this rank's one routed layer: misses on the CPU, read-ahead
+     * in pieces on these readers, the store's room two units. */
+    REQUIRE(r.start(1,512*KiB));
+    fs.mover_=t.mover.get();fs.plan_=&plan;fs.hx_pool_=pool;fs.hx_policy_=FileStager::kHxAll;fs.hx_miss_rows_=1;
+    fs.hx_units_.reset(new Mover::HostUnit[FileStager::kHxUnits]);
+    StagedLayer L;L.layer=layer;L.units={fits,held};fs.layers_={L};
+    fs.hx_ra_=&r;fs.hx_ra_li_.assign(size_t(layer+1),-1);fs.hx_ra_li_[size_t(layer)]=0;
+    std::array<int32_t,96> uo;uo.fill(-1);uo[size_t(e_held)]=held;uo[size_t(e_fits)]=fits;fs.hx_unit_of_={uo};
+    fs.hx_ra_ok_.assign(plan.units.size(),0);fs.hx_ra_ok_[size_t(held)]=fs.hx_ra_ok_[size_t(fits)]=1;
+    fs.hx_side_.configure(2);
+    std::vector<int32_t> counts(96,0);counts[size_t(e_held)]=counts[size_t(e_fits)]=1;
+    fs.counts_host_=counts.data();fs.counts_cap_=96;
+    std::shared_ptr<ReadAheadUnit> ahead;
+    {
+        /* Pass 1, layer 0's misses, read as the layer would (the stager's own planes). */
+        auto pf=fs.hx_planes_get(fits),ph=fs.hx_planes_get(held);
+        Mover::HostPlanes* ps[2]={pf.get(),ph.get()};
+        REQUIRE(t.mover->read_unit_planes(ps,2,1));
+        /* Before anything is held or cached, the planner reads the refused unit ahead for pass 1. */
+        const int32_t g1[1]={e_held};
+        fs.hx_ra_plan(1,layer,g1,1);
+        CHECK_EQ(fs.hx_stats_.ra_planned,uint64_t(1));
+        {std::lock_guard<std::mutex> lk(fs.hx_ra_mu_);REQUIRE_EQ(fs.hx_ra_live_.size(),size_t(1));
+         CHECK_EQ(fs.hx_ra_live_[0].unit,held);ahead=fs.hx_ra_live_[0].u;}
+        REQUIRE(ahead!=nullptr);
+        /* The insert threads' loop: the fitting unit is cached and not held; the refused one is held. */
+        auto run_inserts=[&](std::vector<FileStager::HxInsert> jobs){
+            {std::lock_guard<std::mutex> lk(fs.hx_bg_mu_);for(auto& j:jobs)fs.hx_bg_q_.push_back(std::move(j));fs.hx_bg_stop_=true;}
+            std::thread bg([&]{fs.hx_bg_loop();});bg.join();
+            std::lock_guard<std::mutex> lk(fs.hx_bg_mu_);fs.hx_bg_stop_=false;
+        };
+        run_inserts({FileStager::HxInsert{pf,1},FileStager::HxInsert{ph,1}});
+        CHECK(t.mover->unit_cached(fits));CHECK(!t.mover->unit_cached(held));
+        CHECK(t.mover->packed_refused(held));CHECK(!t.mover->packed_refused(fits));
+        CHECK(fs.hx_side_.find(held)==ph);CHECK(!fs.hx_side_.holds(fits));CHECK_EQ(fs.hx_side_.stats().units,1);
+        CHECK_EQ(fs.insert_stats().units,uint64_t(2));
+        /* A later miss of the refused unit, inserted again: refused again, the planes held first stay. */
+        auto ph2=fs.hx_planes_get(held);Mover::HostPlanes* p2=ph2.get();
+        REQUIRE(t.mover->read_unit_planes(&p2,1,1));
+        run_inserts({FileStager::HxInsert{ph2,1}});
+        CHECK(fs.hx_side_.find(held)==ph);CHECK_EQ(fs.hx_side_.stats().units,1);CHECK_EQ(fs.hx_side_.stats().full,uint64_t(0));
+        CHECK_EQ(t.mover->packed_stats().over_budget_units,uint64_t(1));
+        ph2.reset();
+        /* Pass 2's planner: the cached unit and the held one both count as in, so nothing is planned. */
+        const int32_t g2[2]={e_held,e_fits};
+        fs.hx_ra_plan(2,layer,g2,2);
+        CHECK_EQ(fs.hx_stats_.ra_planned,uint64_t(1));
+        {std::lock_guard<std::mutex> lk(fs.hx_ra_mu_);CHECK_EQ(fs.hx_ra_live_.size(),size_t(1));}
+        /* Pass 1's layer selects both: the fitting unit lent from the packed cache, the held one handed its
+         * planes, the read-ahead planned for it before it was held dropped as cached. */
+        fs.trace_pass_=1;fs.pass_tok_=1;fs.want_={fits,held};
+        fs.hx_choose(0);
+        REQUIRE_EQ(fs.hx_miss_.size(),size_t(1));REQUIRE_EQ(fs.hx_miss_ready_.size(),size_t(1));
+        CHECK(fs.hx_miss_[0]==ph);CHECK_EQ(int(fs.hx_miss_ready_[0]),2);
+        CHECK_EQ(fs.hx_side_handed_,1);CHECK_EQ(fs.hx_ra_handed_,0);
+        CHECK_EQ(fs.hx_stats_.side_hits,uint64_t(1));CHECK_EQ(fs.hx_stats_.side_d_hits,uint64_t(1));
+        CHECK_EQ(fs.hx_stats_.ra_cached,uint64_t(1));CHECK(ahead->cancelled());
+        CHECK(fs.hx_ra_here_.empty());
+        {std::lock_guard<std::mutex> lk(fs.hx_ra_mu_);CHECK(fs.hx_ra_live_.empty());}
+        CHECK_EQ(fs.hx_n_,1);CHECK_EQ(fs.hx_li_,0);CHECK(fs.want_.empty());
+        r.wait(*ahead);   /* its pieces in flight land in its own buffers */
+        /* Nothing for the layer to read. */
+        std::vector<Mover::HostPlanes*> out;std::vector<Mover::PlanesIn> in;bool alone=true;
+        CHECK(!fs.hx_unread_misses(&out,&in,&alone));CHECK(out.empty());CHECK(!alone);
+        /* No insert queued for the held unit; another miss of the layer is queued, with its pass's rows. */
+        fs.hx_queue_inserts(1);
+        {std::lock_guard<std::mutex> lk(fs.hx_bg_mu_);CHECK(fs.hx_bg_q_.empty());}
+        auto other=fs.hx_planes_get(fits);
+        fs.hx_miss_={ph,other};fs.hx_miss_ready_={2,0};fs.hx_miss_ra_={nullptr,nullptr};
+        fs.hx_queue_inserts(1);
+        {std::lock_guard<std::mutex> lk(fs.hx_bg_mu_);REQUIRE_EQ(fs.hx_bg_q_.size(),size_t(1));
+         CHECK(fs.hx_bg_q_.front().p==other);CHECK_EQ(fs.hx_bg_q_.front().rows,1);fs.hx_bg_q_.clear();}
+        fs.hx_miss_={ph};fs.hx_miss_ready_={2};fs.hx_miss_ra_={nullptr};other.reset();
+        /* The container changes under the held planes: the layer refuses them before any job. */
+        REQUIRE_EQ(::ftruncate(image.fd,off_t(image.bytes.size()+1)),0);REQUIRE_EQ(::fsync(image.fd),0);
+        CHECK(!t.mover->source_epochs_current());
+        CHECK_EQ(fs.hx_submit_misses_now(1),RAD_E_IO);
+        CHECK(fs.hx_jobs_.empty());CHECK_EQ(pool->work(),int64_t(0));
+        /* Let go of everything the mover lent or the readers hold before the mover goes. */
+        fs.hx_drain();
+        fs.hx_side_.clear();
+        r.forget(&fs);
+    }
+    ahead.reset();
+    {std::lock_guard<std::mutex> lk(fs.hx_ra_mu_);fs.hx_ra_live_.clear();fs.hx_ra_here_.clear();}
+    {std::lock_guard<std::mutex> lk(fs.hx_planes_mu_);fs.hx_planes_free_.clear();}
+    CHECK_EQ(pool->backlog(),int64_t(0));
+    fs.counts_host_=nullptr;fs.counts_cap_=0;fs.mover_=nullptr;fs.plan_=nullptr;
+    t.drain();
+}
+} //namespace rad
+TEST(mapped_packed_side_store_holds_refused_units_for_the_stager){
+    rad::EpCountsHostProbe p;p.side_store_holds_what_the_packed_cache_refuses();
 }
 
 int main(int argc,char** argv){

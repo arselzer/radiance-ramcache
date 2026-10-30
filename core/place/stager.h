@@ -904,6 +904,7 @@ private:
     bool hx_bg_stop_ = false;
     int  hx_bg_busy_ = 0;
     void hx_bg_loop();
+    void hx_queue_inserts(int rows);   /* hx_submit_misses_now: the layer's misses to hx_bg_loop */
     /* RADIANCE_EXPERIMENTAL_DS41_INSERT_NT=1: the background inserts write a unit's codes planes
      * into the packed RAM cache by non-temporal stores (ds41hx::PackCopy), so the ~18 MB neither
      * reads each line first nor fills the caches the pool reads through. ..._INSERT_SLICE_KIB=N

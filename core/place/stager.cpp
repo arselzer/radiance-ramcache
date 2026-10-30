@@ -2614,13 +2614,19 @@ int FileStager::hx_submit_misses_now(int rows) {
     hx_reserved_ = 0;
     RAD_TRY(hx_pool_->submit(hx_jobs_.data() + first, n, &hx_ticket_));
     std::sort(hx_rows_.begin(), hx_rows_.end());
-    {   /* the side store's units are not inserted again: the packed cache refuses them */
+    hx_queue_inserts(rows);
+    return RAD_OK;
+}
+
+/* The layer's misses to the insert threads (hx_bg_loop), with the pass's tokens; not the side
+ * store's units (hx_miss_ready_ 2): the packed cache refuses them, and their planes stay held. */
+void FileStager::hx_queue_inserts(int rows) {
+    {
         std::lock_guard<std::mutex> lk(hx_bg_mu_);
         for (size_t i = 0; i < hx_miss_.size(); ++i)
             if (i >= hx_miss_ready_.size() || hx_miss_ready_[i] != 2) hx_bg_q_.push_back(HxInsert{ hx_miss_[i], rows });
     }
     hx_bg_cv_.notify_all();
-    return RAD_OK;
 }
 
 /* RADIANCE_EXPERIMENTAL_DS41_MISS_POST: the layer's unread misses (hx_unread_misses: the set

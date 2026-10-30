@@ -1174,6 +1174,12 @@ int64_t Mover::decode_mirror_bytes() const {
     return pm && pm->on() && !mirror_ref_.empty() ? mirror_tail_decode_ : 0;
 }
 
+int64_t Mover::mirror_bytes(int rows) const {
+    PlaneMirror* const pm = PlaneMirror::get();
+    if (!pm || !pm->on() || mirror_ref_.empty()) return 0;
+    return rows >= pm->min_rows() ? mirror_tail_ : mirror_tail_decode_;   /* as plane_reads picks it */
+}
+
 int64_t Mover::mapped_pair_bytes() const {
     const auto b = mapped_file_cache_.slot_bytes();
     return (int64_t)(b[0] + b[1] + 6 * 64);

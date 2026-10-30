@@ -683,6 +683,8 @@ bool FileStager::begin_pass(const RadBatch* b) {
     ++trace_pass_;
     if (rt_) rt_pass(b);
     routed_ = counts_host_ && b->n_tok > 0 && b->n_tok <= kRoutedRows;
+    /* A one-token pass, or with ..._PREFETCH_MULTIROW a trunk decode pass of 2..N rows. */
+    hx_ra_pass_ = ra_pass_reads_ahead(b->phase == RAD_PHASE_DECODE, b->draft_pass, b->n_tok, hx_ra_rows_);
     if (hx_ra_) {   /* predictions for this pass may come; units of earlier ones are stale */
         hx_ra_at_.store((uint64_t)trace_pass_ << 32, std::memory_order_release);
         hx_ra_drop_stale(trace_pass_, -1);
@@ -881,9 +883,10 @@ int FileStager::start_ep_routed(int32_t li, RadStream s, bool* read) {
         t_submitted = std::chrono::steady_clock::now();
         t_posted = t_submitted;
         /* Pieces mode: the prediction of layer L+2 once this layer's CPU work is out, so the
-         * predictor's thread does not compete with the pool's wake-up. */
-        if (hx_ra_ && hx_pred_ && pass_tok_ == 1 && plan_->rank == 0 && moe_runs(L.layer + 2)) {
-            hx_pred_->post(trace_pass_, L.layer, hx_x_);
+         * predictor's thread does not compete with the pool's wake-up. A multi-row decode pass
+         * (..._PREFETCH_MULTIROW) posts every row; a one-token pass its one, as always. */
+        if (hx_ra_ && hx_pred_ && hx_ra_pass_ && plan_->rank == 0 && moe_runs(L.layer + 2)) {
+            hx_pred_->post(trace_pass_, L.layer, hx_x_, (int)pass_tok_);
             t_posted = std::chrono::steady_clock::now();
         }
     } else if (rt_) {
@@ -1473,6 +1476,7 @@ int FileStager::tall_init(const Program& prog) {
  * 48), and the misses must be the CPU's in all of them. */
 int FileStager::hx_init(const Program& prog) {
     RAD_TRY(hx_init_impl(prog));
+    RAD_TRY(hx_ra_rows_init());   /* ..._PREFETCH_MULTIROW, once the read-ahead is (or is not) up */
     /* The misses the CPU must take: every pass's. Without the switch that is 16 tokens whatever
      * --max-num-batched-tokens says (as before); with it the step's (tall_init: ep_rows_ is the
      * step, at least 16). */
@@ -1763,7 +1767,9 @@ void FileStager::hx_choose(int32_t li) {
     hx_miss_ra_.clear();
     hx_ra_handed_ = 0;
     hx_slot_.assign(want_.size(), -1);
-    const bool ra = hx_ra_ && pass_tok_ == 1;   /* read-ahead in pieces: this layer's units */
+    /* Read-ahead in pieces: this layer's units (a one-token pass, or a multi-row decode pass with
+     * ..._PREFETCH_MULTIROW). */
+    const bool ra = hx_ra_ && hx_ra_pass_;
     if (ra) hx_ra_begin(li);
     const double cb = hx_pool_->cpu_bytes_per_ns(), lb = hx_pool_->link_bytes_per_ns();
     const bool misses = hx_miss_rows_ > 0 && pass_tok_ <= hx_miss_rows_;
@@ -2116,9 +2122,12 @@ int FileStager::hx_early_decide() {
     hx_stats_.early_wait_ns += sync_ns;
     RAD_TRY(mover_->retire_file_windows());
     const auto t_retired = std::chrono::steady_clock::now();
-    if (hx_pred_ && pass_tok_ == 1 && plan_->rank == 0 &&
+    /* The predictor's input: a one-token pass's (either mode), or every row of a multi-row decode
+     * pass that reads ahead in pieces (..._PREFETCH_MULTIROW). */
+    const bool post_rows = pass_tok_ > 1 && hx_ra_ && hx_ra_pass_ && hx_pred_ && hx_pred_->pieces();
+    if (hx_pred_ && (pass_tok_ == 1 || post_rows) && plan_->rank == 0 &&
         moe_runs(L.layer + (hx_pred_->pieces() ? 2 : 1)))
-        hx_pred_->post(trace_pass_, L.layer, hx_x_);
+        hx_pred_->post(trace_pass_, L.layer, hx_x_, (int)pass_tok_);
     int64_t total = 0;
     if (!ep_route_counts_valid(hx_early_v_, counts_host_, counts_cap_, &total)) {
         ++ep_stats_.corrupt;
@@ -2584,9 +2593,40 @@ void FileStager::hx_pf_loop() {
 /* ---- read-ahead in pieces (stager.h, readahead.h) ---------------------------------------------- */
 
 /* On the predictor's thread: layer `layer`'s prediction to every rank's stager. */
-void FileStager::hx_ra_ready(void*, uint32_t pass, int layer, const int32_t* experts, int k) {
+void FileStager::hx_ra_ready(void*, uint32_t pass, int layer, const int32_t* experts, int n,
+                             int rows) {
     std::lock_guard<std::mutex> lk(g_ra_mu);
-    for (FileStager* s : g_ra_stagers) s->hx_ra_plan(pass, layer, experts, k);
+    for (FileStager* s : g_ra_stagers) s->hx_ra_plan(pass, layer, experts, n, rows);
+}
+
+/* RADIANCE_EXPERIMENTAL_DS41_PREFETCH_MULTIROW (stager.h), once hx_init_impl has set up (or not)
+ * the read-ahead in pieces: a value the configuration cannot honour is refused rather than
+ * ignored, so an A/B arm never runs without what its name says. */
+int FileStager::hx_ra_rows_init() {
+    hx_ra_rows_ = 1;
+    const char* v = std::getenv("RADIANCE_EXPERIMENTAL_DS41_PREFETCH_MULTIROW");
+    const int64_t limit = std::min<int64_t>(ep_rows_, RouterPredictor::kMaxRows);
+    const int n = ra_multirow_rows(v, limit);
+    if (n == 1) return RAD_OK;
+    if (n < 2 || !hx_ra_ || !hx_pred_ || !hx_pred_->pieces() || n > hx_miss_rows_) {
+        RAD_ERR("RADIANCE_EXPERIMENTAL_DS41_PREFETCH_MULTIROW=%s: N (2-%lld) reads ahead in decode passes "
+                "of 2..N rows too, which needs the read-ahead in pieces running "
+                "(RADIANCE_EXPERIMENTAL_DS41_PREFETCH=pieces, host experts with ..._MISSES of at least N)%s",
+                v, (long long)limit, hx_ra_ ? "" : "; it is not running on this rank");
+        return RAD_E_INVAL;
+    }
+    hx_ra_rows_ = n;
+    if (plan_ && plan_->rank == 0)
+        RAD_INFO("read-ahead: decode passes of 2-%d rows read ahead too "
+                 "(RADIANCE_EXPERIMENTAL_DS41_PREFETCH_MULTIROW=%d): rank 0 posts every row's router "
+                 "input, each row predicts layer L+2's top %d, and each rank reads the union of the rows' "
+                 "predictions under the same live cap; one-token passes as before", n, n, hx_pred_->k());
+    return RAD_OK;
+}
+
+int64_t FileStager::hx_ra_mirror_bytes() const {
+    if (!mover_) return 0;
+    return pass_tok_ == 1 ? mover_->decode_mirror_bytes() : mover_->mirror_bytes((int)pass_tok_);
 }
 
 int FileStager::hx_ra_read(void* ctx, const PlaneExtent& p) {
@@ -2605,13 +2645,15 @@ inline bool ra_too_late(uint64_t at, uint32_t pass, int32_t li) {
 /* On the predictor's thread: this rank's predicted experts of `layer` that are on its file tier,
  * readable by the CPU path and not in the RAM cache, laid out in planes buffers and queued for the
  * readers, best prediction first. Only the plan, the program, the cache's own lock and the free
- * list are touched here, never what the issuing thread writes. */
-void FileStager::hx_ra_plan(uint32_t pass, int layer, const int32_t* g, int k) {
+ * list are touched here, never what the issuing thread writes. A multi-row post's list is the
+ * union of its rows' predictions (router_topk_union), taken the same way. */
+void FileStager::hx_ra_plan(uint32_t pass, int layer, const int32_t* g, int n, int rows) {
     if (!hx_ra_ || layer < 0 || layer >= (int)hx_ra_li_.size()) return;
     const int32_t li = hx_ra_li_[(size_t)layer];
     if (li < 0 || (size_t)li >= hx_unit_of_.size()) return;
     const int base = 96 * plan_->rank;
-    for (int pos = 0; pos < k; ++pos) {
+    HostStats::RaRows& by = hx_stats_.ra_rows[HostStats::ra_slot(rows)];
+    for (int pos = 0; pos < n; ++pos) {
         const int e = g[pos] - base;
         if (e < 0 || e >= 96) continue;
         const int32_t u = hx_unit_of_[(size_t)li][(size_t)e];
@@ -2621,10 +2663,12 @@ void FileStager::hx_ra_plan(uint32_t pass, int layer, const int32_t* g, int k) {
             std::lock_guard<std::mutex> lk(hx_ra_mu_);
             if (ra_too_late(hx_ra_at_.load(std::memory_order_acquire), pass, li)) {
                 ++hx_stats_.ra_late;
+                ++by.skipped;
                 return;
             }
             if ((int)hx_ra_live_.size() >= hx_ra_cap_) {
                 ++hx_stats_.ra_capped;
+                ++by.skipped;
                 return;
             }
             bool dup = false;
@@ -2634,18 +2678,22 @@ void FileStager::hx_ra_plan(uint32_t pass, int layer, const int32_t* g, int k) {
         std::shared_ptr<Mover::HostPlanes> p = hx_planes_get(u);
         PlaneExtent ext[2];
         if (!mover_->lay_out_unit_planes(p.get(), ext) || !mover_->source_epochs_current()) continue;
+        /* Readers take earlier passes, then earlier layers, then better predictions first (a union
+         * is at most 16 rows of 16, so its position fits the byte). */
         auto ra = std::make_shared<ReadAheadUnit>(
-            this, ((uint64_t)pass << 24) | ((uint64_t)layer << 8) | (uint64_t)pos, ext, 2,
+            this, ((uint64_t)pass << 24) | ((uint64_t)layer << 8) | (uint64_t)std::min(pos, 255), ext, 2,
             hx_ra_->piece_bytes(), &FileStager::hx_ra_read, mover_, p);
         {
             std::lock_guard<std::mutex> lk(hx_ra_mu_);
             /* The rank may have reached the layer while the unit was laid out. */
             if (ra_too_late(hx_ra_at_.load(std::memory_order_acquire), pass, li)) {
                 ++hx_stats_.ra_late;
+                ++by.skipped;
                 return;
             }
-            hx_ra_live_.push_back(RaEntry{ ra, p, pass, li, u });
+            hx_ra_live_.push_back(RaEntry{ ra, p, pass, li, u, rows });
             ++hx_stats_.ra_planned;
+            ++by.planned;
         }
         hx_ra_->submit(std::move(ra));
     }
@@ -2670,6 +2718,9 @@ void FileStager::hx_ra_drop_stale(uint32_t pass, int32_t li) {
         hx_ra_->cancel(*e.u);
         ++hx_stats_.ra_stale;
         hx_stats_.ra_dropped_bytes += (uint64_t)e.u->bytes_in();
+        HostStats::RaRows& by = hx_stats_.ra_rows[HostStats::ra_slot(e.rows)];
+        ++by.dropped;
+        by.dropped_bytes += (uint64_t)e.u->bytes_in();
     }
 }
 
@@ -2694,17 +2745,22 @@ void FileStager::hx_ra_begin(int32_t li) {
 std::shared_ptr<Mover::HostPlanes> FileStager::hx_ra_take(int32_t u, bool* ready,
                                                           std::shared_ptr<ReadAheadUnit>* urgent) {
     *ready = false;
+    HostStats::RaRows& by = hx_stats_.ra_rows[HostStats::ra_slot(pass_tok_)];
     ++hx_stats_.ra_misses;
+    ++by.misses;
     RaEntry* e = nullptr;
     for (RaEntry& r : hx_ra_here_)
         if (r.u && r.unit == u) { e = &r; break; }
     if (!e) return nullptr;
     ++hx_stats_.ra_miss_planned;
+    ++by.miss_planned;
     std::shared_ptr<ReadAheadUnit> ra = std::move(e->u);
     std::shared_ptr<Mover::HostPlanes> p = std::move(e->p);
     if (ra->whole()) {   /* every piece in: the epoch is checked before the jobs go out */
         ++hx_stats_.ra_whole;
+        ++by.whole;
         hx_stats_.ra_used_bytes += (uint64_t)ra->bytes_in();
+        by.used_bytes += (uint64_t)ra->bytes_in();
         ++hx_ra_handed_;
         *ready = true;
         return p;
@@ -2712,20 +2768,25 @@ std::shared_ptr<Mover::HostPlanes> FileStager::hx_ra_take(int32_t u, bool* ready
     /* No piece started: the layer reads it as any miss, into the buffers laid out for it. */
     if (hx_ra_->take_whole(*ra)) {
         ++hx_stats_.ra_fresh;
+        ++by.fresh;
         return p;
     }
     /* Barely started: the demand read with the plane mirror's share beats the container alone for
      * the rest (or ..._PREFETCH_FINISH=0). A fresh buffer, since pieces in flight still land in
      * this one. */
-    if (!hx_ra_finish_ || (int64_t)ra->started() * hx_ra_->piece_bytes() < mover_->decode_mirror_bytes()) {
+    if (!hx_ra_finish_ || (int64_t)ra->started() * hx_ra_->piece_bytes() < hx_ra_mirror_bytes()) {
         hx_ra_->cancel(*ra);
         ++hx_stats_.ra_fresh;
+        ++by.fresh;
         hx_stats_.ra_dropped_bytes += (uint64_t)ra->bytes_in();
+        by.dropped_bytes += (uint64_t)ra->bytes_in();
         return nullptr;
     }
     hx_ra_->make_urgent(*ra);
     ++hx_stats_.ra_finished;
+    ++by.finished;
     hx_stats_.ra_used_bytes += (uint64_t)ra->bytes_in();
+    by.used_bytes += (uint64_t)ra->bytes_in();
     *urgent = std::move(ra);
     return p;
 }
@@ -2735,20 +2796,28 @@ void FileStager::hx_ra_drop(RaEntry& e, bool hit) {
     hx_ra_->cancel(*e.u);
     ++(hit ? hx_stats_.ra_cached : hx_stats_.ra_unselected);
     hx_stats_.ra_dropped_bytes += (uint64_t)e.u->bytes_in();
+    HostStats::RaRows& by = hx_stats_.ra_rows[HostStats::ra_slot(e.rows)];
+    ++by.dropped;
+    by.dropped_bytes += (uint64_t)e.u->bytes_in();
     e.u.reset();
     e.p.reset();
 }
 
 /* Inside the demand read: the urgent units' last pieces, then the units with a failed piece read
- * again whole into fresh buffers, and the container's epoch. */
+ * again whole into fresh buffers, and the container's epoch. `rows`: the pass's (on hx_mw_ too,
+ * where pass_tok_ is the issuing thread's). */
 bool FileStager::hx_ra_settle(int rows) {
     std::vector<Mover::HostPlanes*> again;
+    HostStats::RaRows& by = hx_stats_.ra_rows[HostStats::ra_slot(rows)];
     for (size_t i = 0; i < hx_miss_ra_.size() && i < hx_miss_.size(); ++i) {
         std::shared_ptr<ReadAheadUnit>& ra = hx_miss_ra_[i];
         if (!ra) continue;
-        hx_stats_.ra_wait_ns += hx_ra_->wait(*ra);
+        const uint64_t waited = hx_ra_->wait(*ra);
+        hx_stats_.ra_wait_ns += waited;
+        by.wait_ns += waited;
         if (!ra->whole()) {
             ++hx_stats_.ra_refetched;
+            ++by.refetched;
             hx_miss_[i] = hx_planes_get(hx_miss_[i]->unit);
             again.push_back(hx_miss_[i].get());
         }

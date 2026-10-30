@@ -7,6 +7,9 @@
 #include "device/directio.h"
 #include "place/mover.h"
 #include "place/planner.h"
+#include "place/readahead.h"
+#include "place/router_predictor.h"
+#include "place/stager.h"
 #include "tiny_model.h"
 #include "../tools/ds41-host-experts/ds41_host_experts.h"
 #ifdef RAD_NATIVE_CACHE_ENGINE_CASE
@@ -1019,6 +1022,94 @@ void read_ahead_case(bool packed){
 } //namespace
 TEST(mapped_read_ahead_pieces_read_and_insert_as_the_demand_read){read_ahead_case(false);}
 TEST(mapped_packed_read_ahead_pieces_read_and_insert_as_the_demand_read){read_ahead_case(true);}
+/* RADIANCE_EXPERIMENTAL_DS41_PREFETCH_MULTIROW through the actual HOST Mover and the file stager's
+ * read-ahead parts (stager.h's test friend): a multi-row post's union is planned as a one-token
+ * post's list is -- this rank's uncached file-tier units of the layer, laid out by the mover and read
+ * in pieces from the container, an id the rank does not own or one naming no file-tier unit passed
+ * over, a unit already live not planned twice, the live cap and the too-late rule kept -- each unit
+ * tagged with the post's rows and queued in the union's order; the planes a whole unit hands over are
+ * the demand read's; planned and skipped units count under the post's rows, the deciding pass's
+ * under its own. */
+namespace rad {
+struct EpCountsHostProbe {
+    PieceReader r;   /* outlives the stager, whose destructor forgets its units on it */
+    FileStager fs;
+    void multirow_union(Mover* m,const Plan& plan,const std::vector<int32_t>& units){
+        REQUIRE(r.start(2,64*KiB));
+        const int32_t layer=plan.units[size_t(units[0])].layer;
+        const int32_t e0=plan.units[size_t(units[0])].expert,e1=plan.units[size_t(units[1])].expert;
+        REQUIRE(e0>=0&&e0<96&&e1>=0&&e1<96&&layer>=0&&layer<RouterPredictor::kLayers);
+        fs.plan_=&plan;fs.mover_=m;fs.hx_ra_=&r;fs.hx_ra_cap_=8;
+        fs.hx_ra_li_.assign(RouterPredictor::kLayers,-1);fs.hx_ra_li_[size_t(layer)]=0;
+        fs.hx_unit_of_.assign(1,{});fs.hx_unit_of_[0].fill(-1);
+        fs.hx_unit_of_[0][size_t(e0)]=units[0];fs.hx_unit_of_[0][size_t(e1)]=units[1];
+        fs.hx_ra_ok_.assign(plan.units.size(),0);
+        for(int32_t u:units){REQUIRE(m->host_planes_eligible(u));fs.hx_ra_ok_[size_t(u)]=1;}
+        const auto& by=fs.hx_stats_.ra_rows;const auto& hx=fs.hx_stats_;
+        /* Pass 5, a 2-row verify pass: the union of row 0's {e1, ..} and row 1's {e0, ..}, with 200
+         * (not this rank's: it owns 0..95) and 7 (no file-tier unit) among them. */
+        const int32_t un[4]={e1,200,e0,7};
+        fs.trace_pass_=5;fs.pass_tok_=2;fs.hx_ra_at_.store(uint64_t(5)<<32);
+        fs.hx_ra_plan(5,layer,un,4,2);
+        REQUIRE_EQ(fs.hx_ra_live_.size(),size_t(2));
+        CHECK_EQ(fs.hx_ra_live_[0].unit,units[1]);CHECK_EQ(fs.hx_ra_live_[1].unit,units[0]);
+        for(const auto& e:fs.hx_ra_live_){CHECK_EQ(e.rows,2);CHECK_EQ(e.pass,uint32_t(5));CHECK_EQ(e.li,0);}
+        CHECK(fs.hx_ra_live_[0].u->order()<fs.hx_ra_live_[1].u->order());
+        CHECK_EQ(by[2].planned,uint64_t(2));CHECK_EQ(by[1].planned,uint64_t(0));CHECK_EQ(hx.ra_planned,uint64_t(2));
+        fs.hx_ra_plan(5,layer,un,4,2);   /* live already: nothing twice */
+        CHECK_EQ(fs.hx_ra_live_.size(),size_t(2));CHECK_EQ(by[2].planned,uint64_t(2));
+        for(const auto& e:fs.hx_ra_live_){r.wait(*e.u);CHECK(e.u->whole());}
+        CHECK_EQ(r.stats().failed,uint64_t(0));
+        /* The pass decides routed layer 0: e1's unit selected and missed, e0's not selected. */
+        fs.hx_ra_begin(0);
+        REQUIRE_EQ(fs.hx_ra_here_.size(),size_t(2));
+        {
+            bool ready=false;std::shared_ptr<ReadAheadUnit> urgent;
+            auto p=fs.hx_ra_take(units[1],&ready,&urgent);
+            REQUIRE(p!=nullptr);CHECK(ready);CHECK(!urgent);REQUIRE_EQ(p->n,2);
+            Mover::HostPlanes demand;demand.unit=units[1];Mover::HostPlanes* pd=&demand;
+            REQUIRE(m->read_unit_planes(&pd,1,2));
+            for(int k=0;k<2;++k){
+                const size_t codes=size_t(p->rows[k]*p->cols[k]/2),scales=size_t(p->rows[k]*p->cols[k]/32);
+                CHECK(std::memcmp(p->codes[k],demand.codes[k],codes)==0);
+                CHECK(std::memcmp(p->scales[k],demand.scales[k],scales)==0);
+            }
+        }
+        for(auto& e:fs.hx_ra_here_)fs.hx_ra_drop(e,false);
+        fs.hx_ra_here_.clear();
+        CHECK_EQ(by[2].misses,uint64_t(1));CHECK_EQ(by[2].miss_planned,uint64_t(1));CHECK_EQ(by[2].whole,uint64_t(1));
+        CHECK_EQ(by[2].dropped,uint64_t(1));CHECK(by[2].used_bytes>0);CHECK(by[2].dropped_bytes>0);
+        /* Pass 6, a 3-row post with room for one live unit: one planned, the next past the cap. */
+        fs.hx_ra_cap_=1;fs.trace_pass_=6;fs.pass_tok_=3;fs.hx_ra_at_.store(uint64_t(6)<<32);
+        fs.hx_ra_plan(6,layer,un,4,3);
+        CHECK_EQ(by[3].planned,uint64_t(1));CHECK_EQ(by[3].skipped,uint64_t(1));CHECK_EQ(hx.ra_capped,uint64_t(1));
+        fs.hx_ra_drop_stale(7,-1);   /* the next pass begins: pass 6's unit is stale */
+        CHECK(fs.hx_ra_live_.empty());CHECK_EQ(by[3].dropped,uint64_t(1));CHECK_EQ(hx.ra_stale,uint64_t(1));
+        /* Too late: this rank has decided routed layer 0 of pass 8 already. */
+        fs.hx_ra_cap_=8;fs.hx_ra_at_.store((uint64_t(8)<<32)|1u);
+        fs.hx_ra_plan(8,layer,un,4,4);
+        CHECK_EQ(by[4].planned,uint64_t(0));CHECK_EQ(by[4].skipped,uint64_t(1));CHECK_EQ(hx.ra_late,uint64_t(1));
+        /* A one-row post (rows by default) counts under 1 row. */
+        const int32_t one[2]={e0,e1};
+        fs.hx_ra_at_.store(uint64_t(9)<<32);
+        fs.hx_ra_plan(9,layer,one,2);
+        CHECK_EQ(by[1].planned,uint64_t(2));
+        fs.hx_ra_drop_stale(10,-1);
+        CHECK_EQ(by[1].dropped,uint64_t(2));CHECK_EQ(hx.ra_planned,uint64_t(5));
+        /* No plane mirror here: the finishing rule has no share to beat at any pass size. */
+        CHECK_EQ(m->mirror_bytes(1),m->decode_mirror_bytes());CHECK_EQ(m->mirror_bytes(2),int64_t(0));
+        r.forget(&fs);
+    }
+};
+} //namespace rad
+TEST(mapped_read_ahead_multirow_union_through_the_file_stager){
+    Environment mapped("1","1");
+    Fixture f;f.experts();f.info.relayout=mx_relayout;Image image(lay_out_mxfp4(f));write_scales(f,image);
+    Config cfg=plan_config(false);Plan plan=planned(f,cfg,true);const auto units=two_ssd_experts(plan);
+    std::atomic<uint64_t> calls{0};Access::Driver driver;Transport t;t.open(f,plan,image,80*MiB,calls);Access::attach(*t.mover,driver);
+    {rad::EpCountsHostProbe p;p.multirow_union(t.mover.get(),plan,units);}
+    t.drain();
+}
 /* read_unit_planes and its two halves (start_unit_planes / finish_unit_planes, which
  * RADIANCE_EXPERIMENTAL_DS41_MISS_POST uses) land the container's planes byte for byte and report the
  * call's timing; a second start while one is in flight (before it touches any buffer) and a finish

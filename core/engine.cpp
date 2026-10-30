@@ -645,6 +645,12 @@ void Engine::find_histograms(Rank& r, int before_step) {
     }
 }
 
+/* The experts a layer's histogram row counts: its last report's, at most the staging's width. */
+static int64_t route_row_experts(const Ctx& ctx, int layer) {
+    const RadRouting* rt = ctx.last_routing(layer);
+    return rt ? std::min<int64_t>(rt->n_expert, ctx.route_n_expert()) : 0;
+}
+
 /* --expert-stats: one found histogram into the rank's tally (place/xstats.h), from the same row
  * the heat engine reads. The caller holds the tally. */
 static void xstats_credit(XsTally* xs, Ctx& ctx, int layer, int bank, const int32_t* h) {
@@ -661,6 +667,7 @@ void Engine::xstats_drain(Rank& r, XsTally* xs, int before_step) {
     std::lock_guard<std::mutex> lk(xs->mutex());
     for (const Rank::HeatRow& hr : r.heat_rows) {
         xstats_credit(xs, r.ctx, hr.layer, hr.bank, hr.h);
+        if (draft_vram_n_ > 0) draft_vram_credit(r, hr.layer, hr.h, route_row_experts(r.ctx, hr.layer));
         r.heat_seen[(size_t)hr.layer] = r.ctx.last_histogram_step(hr.layer, hr.bank);
         r.ctx.mark_credited(hr.layer, hr.bank);
         ++r.heat_credited;
@@ -672,6 +679,7 @@ void Engine::tiering_dispatch(Rank& r, int step) {
     XsTally* const xs = xstats_ ? xstats_->tally(r.index) : nullptr;
     if (!r.heat.enabled()) {
         if (xs) xstats_drain(r, xs, step);
+        else if (draft_vram_n_ > 0) draft_vram_drain(r, step);   /* RADIANCE_EXPERIMENTAL_DS41_DRAFT_VRAM's tally */
         return;
     }
 
@@ -693,6 +701,7 @@ void Engine::tiering_dispatch(Rank& r, int step) {
         r.heat.observe(hr.layer, hr.h, n_ex, reps > 1 ? (float)reps : 1.0f);
         /* The row is in cache now. */
         if (xs) xstats_credit(xs, r.ctx, hr.layer, hr.bank, hr.h);
+        if (draft_vram_n_ > 0) draft_vram_credit(r, hr.layer, hr.h, route_row_experts(r.ctx, hr.layer));
         r.heat_seen[(size_t)hr.layer] = r.ctx.last_histogram_step(hr.layer, hr.bank);
         r.ctx.mark_credited(hr.layer, hr.bank);
         ++r.heat_credited;
@@ -2497,6 +2506,7 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
     for (auto& t : rank_threads_) if (t.joinable()) t.join();
     rank_threads_.clear();
     xstats_close();
+    draft_vram_close();
     /* A step-loop error takes precedence over the transport's status. */
     const int ls = loop_status_.load(std::memory_order_acquire);
     return ls < 0 ? ls : s;

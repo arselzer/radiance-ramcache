@@ -26,6 +26,7 @@
 #include "place/plane_mirror.h"
 #include "place/dspark_native_scope.h"
 #include "place/dspark_draft_control_scope.h"
+#include "place/draft_vram_load.h"
 #include "kvstream/bringup.h"
 #include "kvstream/plan.h"
 #include "runtime/arena.h"
@@ -1626,6 +1627,9 @@ int Engine::plan() {
     PlaneMirror::configure({ cfg_.expert_plane_mirror, cfg_.expert_plane_mirror_share,
                              (int)cfg_.expert_plane_mirror_min_rows,
                              cfg_.expert_plane_mirror_decode_share });
+    /* RADIANCE_EXPERIMENTAL_DS41_DRAFT_VRAM (place/draft_vram.h, engine_dvram.cpp): every rank's hot
+     * draft experts, resolved against the container's directory before any rank plans. */
+    RAD_TRY(draft_vram_open());
     // The external DECODE vector owns its rows until every rank's Planner has consumed them.
     NativeDecodeProfile decode_profile;
     const bool native_profile = meta_.arch_id && !std::strcmp(meta_.arch_id, "deepseek41");
@@ -2030,6 +2034,7 @@ int Engine::plan() {
         in.config     = &rc;
         in.rank       = r->index;
         in.world_size = cfg_.tp;
+        in.draft_vram = draft_vram_n_ > 0 ? &draft_vram_rank_[ri] : nullptr;
         std::vector<RadFileProfile> rank_profile;
         if (!decode_profile.rows.empty()) {
             in.profile = decode_profile.rows.data();
@@ -3003,6 +3008,7 @@ static int fill_from_checkpoint(const CkptWeight& cw, const std::vector<PlaneSha
 
 int Engine::load_weights() {
     int64_t total = 0, n_loaded = 0, n_missing = 0;
+    int64_t n_parked = 0;   /* RADIANCE_EXPERIMENTAL_DS41_DRAFT_VRAM: parked draft weights published */
     /* Counted apart from `n_loaded`: mapped weights are published in place, not loaded. */
     int64_t n_mapped = 0, mapped_bytes = 0;
     std::array<std::vector<std::pair<int64_t, int64_t>>,2> mapped_ranges;   /* kept cached by the sweep's drop */
@@ -3050,6 +3056,16 @@ int Engine::load_weights() {
             });
         }
         RAD_TRY(r->mover.init(r->program, r->plan, mc, &r->pools));
+        /* RADIANCE_EXPERIMENTAL_DS41_DRAFT_VRAM: where each parked draft weight is published (its
+         * stage's first resident, slot for slot), now that the residents have addresses. */
+        std::vector<void*> dv_alias;
+        if (draft_vram_n_ > 0) {
+            std::string why;
+            if (const int st = draft_vram_aliases(r->program, r->plan, r->mover, &dv_alias, &why); st < 0) {
+                RAD_ERR("draft VRAM: rank %d: %s", r->index, why.c_str());
+                return st;
+            }
+        }
         /* What the mover took, before the first copy. Its slabs are allocated in init, so the pool
          * is as full as it will get; a load stopping with zero free is a placement failure, not
          * a loader one. */
@@ -3139,6 +3155,17 @@ int Engine::load_weights() {
             w.file_offset = e ? source->plane(*e, w.sel[0]).offset : 0;
             for (int k = 0; k < w.n_sel && e; ++k)
                 w.file_plane_offset[k] = source->plane(*e, w.sel[k]).offset;
+            /* RADIANCE_EXPERIMENTAL_DS41_DRAFT_VRAM: a parked draft expert is never read. It is
+             * published at a resident draft expert's weight of its slot on this card, so every
+             * pointer the grouped GEMM is handed names card memory; the masked router never routes
+             * to it (draft_vram_mask). No copy, no mapping, no page touched. */
+            if (!dv_alias.empty() && dv_alias[i]) {
+                w.ptr = dv_alias[i];
+                w.host_ptr = nullptr;
+                r->mover.publish_mapped((rad_weight)i, w.ptr);
+                ++n_parked;
+                continue;
+            }
             const bool direct = weight_file_direct(w, cfg_.tp);
             /* The file tier also serves a weight it relays on every read (weight_file_relaid):
              * each selected plane whole in the container, as many bytes as the plane holds. */
@@ -3433,6 +3460,11 @@ int Engine::load_weights() {
                  humanb(mapped_bytes).c_str(),
                  cfg_.tp > 1 ? " (summed over ranks, which map the same file: the resident bytes "
                                "are that divided by --tp)" : "");
+    if (draft_vram_n_ > 0) {
+        RAD_INFO("load: %lld parked draft weight(s) (RADIANCE_EXPERIMENTAL_DS41_DRAFT_VRAM, all ranks) "
+                 "published at resident draft experts' addresses; nothing read for them", (long long)n_parked);
+        RAD_TRY(draft_vram_mask());
+    }
     return RAD_OK;
 }
 
@@ -4056,11 +4088,13 @@ int Engine::start() {
          * verified ones. */
         const bool short_ok = cfg_.draft_short_from == 0 || (cfg_.draft_short_from == 1 && drafter_short_ > 0);
         for (const auto& r : ranks_) {
-            if (!dspark_draft_control_scope(r->program, r->plan, cfg_, bool(source_banks_)) ||
+            if (!dspark_draft_control_scope(r->program, r->plan, cfg_, bool(source_banks_), draft_vram_n_) ||
                 (draft_experiment_.verify_cap() >= 0 && !short_ok)) {
                 RAD_ERR("experimental draft control requires a bound native DSpark EP4 "
-                        "fixed-depth5 bank and all96 final immutable host-pinned head pairs (verify cap "
-                        "also requires draft-short-from0, or 1 with the drafter's short block)");
+                        "fixed-depth5 bank and all96 final immutable host-pinned head pairs, or with "
+                        "RADIANCE_EXPERIMENTAL_DS41_DRAFT_VRAM=N N static VRAM pairs a stage and the rest "
+                        "parked (verify cap also requires draft-short-from0, or 1 with the drafter's "
+                        "short block)");
                 return RAD_E_UNSUPPORTED;
             }
         }

@@ -26,6 +26,13 @@
                                           text of arm B against arm A (exit 1 on any difference): a
                                           Dk arm against the same arm without Dk, whose exact draft
                                           GEMV must propose the same tokens
+  ab_requests.py --acceptance DIR ARM...  DSpark arms by prompt set: each arm's drafts verified and accepted
+                                          (draft_n, draft_n_accepted summed over its requests), the
+                                          acceptance and its ratio to the set's first arm with the same
+                                          Ds and Db parts (r: a masked draft's share of the unmasked
+                                          one's at the same verify cap and block), tokens a step
+                                          (predicted_n / (predicted_n - accepted)) and decode tokens/s,
+                                          and whether its texts equal the first arm's
   ab_requests.py --kld-compare REF DIR    two --kld-record directories byte for byte: every
                                           position's log-probabilities, top entries and row values
                                           (exit 1 when any differ, naming the first positions)
@@ -449,6 +456,49 @@ def kld_compare(ref, cand):
     return 1 if bad else 0
 
 
+def acceptance(d, arms):
+    """DSpark arms grouped by the requests they sent (by_receipt): per arm the drafts verified and
+    accepted over its requests, the acceptance, its ratio to the group's first arm with the same Ds
+    and Db parts (the verify cap and query block), tokens a step and decode tokens/s, and its texts
+    against the first arm's
+    (they must be the same: the target verifies every draft). 1 when a text differs."""
+    data, _ = load(d, arms)
+    bad = 0
+
+    def cap(a):   # the verify cap and the query block: the Ds part and any DbN part
+        return tuple(p for p in a.split("-") if re.fullmatch(r"Ds[0-9a]?|Db[0-9]+", p))
+
+    for names, cols in by_receipt(data):
+        print("DSpark acceptance, %d requests (%s .. %s); r against the first arm with the same Ds and Db parts:" % (
+            len(names), names[0], names[-1]))
+        print("  %-8s %-9s %7s %7s %6s %10s %7s  %s" % ("drafts", "accepted", "accept", "r", "tok/st", "tok/s", "texts", "arm"))
+        ref = {}
+        for a in cols:
+            dn = acc = pn = 0
+            pms = 0.0
+            same = 0
+            for n in names:
+                r = data[a].get(n)
+                if not r or r.get("text") is None:
+                    continue
+                t = r.get("timings") or {}
+                dn += t.get("draft_n") or 0
+                acc += t.get("draft_n_accepted") or 0
+                pn += t.get("predicted_n") or 0
+                pms += t.get("predicted_ms") or 0.0
+                same += r["text"] == data[ref_arm(data, cols, n)][n]["text"]
+            rate = acc / dn if dn else float("nan")
+            ref_acc = ref.setdefault(cap(a), rate)
+            ratio = rate / ref_acc if dn and ref_acc and ref_acc == ref_acc else float("nan")
+            tps = pn / pms * 1e3 if pms else 0.0
+            step = pn / (pn - acc) if pn > acc else float("nan")
+            sent = sum(1 for n in names if data[a].get(n))
+            bad += same != sent
+            print("  %-8d %-9d %6.1f%% %7.3f %6.3f %10.2f %3d/%-3d  %s" % (dn, acc, 100.0 * rate, ratio, step, tps,
+                                                                       same, sent, a))
+    return 1 if bad else 0
+
+
 def draft_stats(d, a, b):
     """Arm b's requests against arm a's, by name: the drafter's draft_n and draft_n_accepted and the
     reply text must be the same (the K1 review's draft_stats_cmp.py). 1 on any difference."""
@@ -801,6 +851,8 @@ if __name__ == "__main__":
         ttft(a[1], a[2:])
     elif a[0] == "--draft-stats":
         sys.exit(draft_stats(a[1], a[2], a[3]))
+    elif a[0] == "--acceptance":
+        sys.exit(acceptance(a[1], a[2:]))
     elif a[0] == "--kld-corpus":
         sys.exit(0 if kld_corpus(a[1], int(a[2]), a[3:]) > 0 else 1)
     elif a[0] == "--kld-compare":

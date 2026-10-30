@@ -85,6 +85,20 @@ R=/home/as/radiance-setup/research/deepseek-v41-1017-20261024
 MODEL=$R/native-models/ds41-native-mxfp4-v3-20261027T121600Z/model.rad
 MIRROR=${MIRROR:-}   # the checkpoint's model-*.safetensors for R arms; no default
 DRAFT_BANK=${DRAFT_BANK:-}   # a DSpark draft bank (draft.rad) bound to $MODEL, for Ds arms; no default
+# Dv arms' hot set (draft_hotset.py write; RADIANCE_EXPERIMENTAL_DS41_DRAFT_HOTSET); no default. An arm
+# takes the first of DRAFT_HOTSET_<set>_db<K>, DRAFT_HOTSET_<set>, DRAFT_HOTSET_db<K>, DRAFT_HOTSET that
+# is set, <set> its U part's name (heldout without one) and K its DbK part's (e.g. DRAFT_HOTSET_chat: the
+# held-out capture's hot set for the chat prompts and DRAFT_HOTSET_heldout the chat capture's, so neither
+# set is scored on its own capture; DRAFT_HOTSET_db2 one taken with the short block the Db2 arms route).
+DRAFT_HOTSET=${DRAFT_HOTSET:-}
+hotset_for() {   # an arm's name: its hot-set file (above), or empty
+  local a=$1 u k v
+  u=$(tr '-' '\n' <<< "$a" | grep -m1 -E '^U.+'); u=${u#U}; u=${u:-heldout}
+  k=$(tr '-' '\n' <<< "$a" | grep -m1 -E '^Db[0-9]+$'); k=${k#Db}
+  for v in ${k:+DRAFT_HOTSET_${u}_db$k} DRAFT_HOTSET_$u ${k:+DRAFT_HOTSET_db$k} DRAFT_HOTSET; do
+    [[ $v =~ ^[A-Za-z_][A-Za-z0-9_]*$ && -n "${!v:-}" ]] && { echo "${!v}"; return; }
+  done
+}
 PROFILE=$R/ds41-dev-window-profile-calibration-20261028T034300Z/sealed-decode-profile.json
 PROMPTS=${PROMPTS:-$R/ds41-pack-tail-dev-window-tail1-heldout-20261028T085400Z/receipt.json}
 PORT=18089
@@ -476,6 +490,34 @@ EOF2
     log "arm $name: no Pu part, but the server reads a partly read unit's rest in the layer's own call (the knob set for the window?); not measured"
     stop_server; return 1
   fi
+  # DvN (RADIANCE_EXPERIMENTAL_DS41_DRAFT_VRAM): the engine names N and the hot set, every rank its final
+  # placement (N hot pairs a stage static in VRAM, the rest parked) and its three masked correction
+  # planes. A Dv arm without all of them, or another arm with any "draft VRAM" line, is not measured.
+  local dv_on dv_place dv_mask dv_any
+  dv_on=$(grep -c "draft VRAM: RADIANCE_EXPERIMENTAL_DS41_DRAFT_VRAM=${ARM_DV:-none} from" "$OUT/$name.server.log")
+  dv_place=$(grep -cE "draft VRAM final placement: rank=[0-3] .*hot=${ARM_DV:-none}/${ARM_DV:-none}/${ARM_DV:-none} " "$OUT/$name.server.log")
+  dv_mask=$(grep -cE 'draft VRAM: rank [0-3]: the router correction planes of stages 40/41/42 masked' "$OUT/$name.server.log")
+  dv_any=$(grep -c 'draft VRAM' "$OUT/$name.server.log")
+  if [[ -n "${ARM_DV:-}" ]] && [[ "$dv_on" == 0 || "$dv_place" != 4 || "$dv_mask" != 4 ]]; then
+    log "arm $name: Dv${ARM_DV}, but the server log has $dv_on switch line(s), $dv_place of 4 'draft VRAM final placement' and $dv_mask of 4 masked-plane lines (a radiance without the switch?); not measured"
+    stop_server; return 1
+  fi
+  if [[ -z "${ARM_DV:-}" && "$dv_any" != 0 ]]; then
+    log "arm $name: no Dv part, but the server placed the draft bank in VRAM (the switch set for the window?); not measured"
+    stop_server; return 1
+  fi
+  [[ -n "${ARM_DV:-}" ]] && grep -E 'draft VRAM|draft-bank experts: RADIANCE' "$OUT/$name.server.log" | head -16 | tee -a "$OUT/window.log"
+  # Xd (--expert-stats): the startup line counts the trunk's 40 routed layers and the drafter's 3; an
+  # arm without Xd must not count anything.
+  local xd_lines; xd_lines=$(grep -cE 'expert stats: [0-9]+ routed layers' "$OUT/$name.server.log")
+  if [[ -n "${ARM_XD:-}" ]] && ! grep -qE 'expert stats: 43 routed layers' "$OUT/$name.server.log"; then
+    log "arm $name: Xd, but the server log has no 'expert stats: 43 routed layers' line ($(grep -m1 'expert stats' "$OUT/$name.server.log")); not measured"
+    stop_server; return 1
+  fi
+  if [[ -z "${ARM_XD:-}" && "$xd_lines" != 0 ]]; then
+    log "arm $name: no Xd part, but the server counts expert selections (--expert-stats from the window?); not measured"
+    stop_server; return 1
+  fi
   # The NVMe drive's busy time (io_ticks, ms) and temperature over the requests: read-ahead arms
   # move it from ~45% busy towards saturation.
   local d0 d1 t0 t1 rc temp
@@ -580,6 +622,25 @@ EOF2
     [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
   fi
   grep -E "host experts' background inserts: |host expert pool, lean tiles: " "$OUT/$name.server.log" | tee -a "$OUT/window.log"
+  # Dv at exit: every rank tallies its draft routing histograms; a selection of a parked expert would
+  # name weights the card never loaded. Measured only if all four ranks report none.
+  if [[ -n "${ARM_DV:-}" ]]; then
+    local dv_exit dv_held
+    dv_exit=$(grep -cE 'draft VRAM: rank [0-3] at exit: ' "$OUT/$name.server.log")
+    dv_held=$(grep -cE 'draft VRAM: rank [0-3] at exit: .*\(none: the mask held\)' "$OUT/$name.server.log")
+    grep -E 'draft VRAM: rank [0-3] at exit: ' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
+    if [[ "$dv_exit" != 4 || "$dv_held" != 4 ]]; then
+      log "arm $name: Dv${ARM_DV}: $dv_held of 4 ranks report at exit that no parked expert was routed to ($dv_exit exit lines); not measured (results kept as $name.unmeasured.json)"
+      [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
+    fi
+  fi
+  # Xd: the capture, written at shutdown; a file without draft passes captured nothing.
+  if [[ -n "${ARM_XD:-}" ]]; then
+    local xd_sum xd_rc
+    xd_sum=$(python3 -I "$HERE/draft_hotset.py" summary "$OUT/xstats-$name.json" 2>&1); xd_rc=$?
+    echo "$xd_sum" | tee -a "$OUT/window.log"
+    (( xd_rc == 0 )) || log "arm $name: Xd, but xstats-$name.json holds no draft capture (exit $xd_rc)"
+  fi
   grep -E 'host experts|EP scoped|live chain|error|ERR' "$OUT/$name.server.log" | tail -16 | tee -a "$OUT/window.log"
   grep -E 'read-ahead (in pieces:|readers)|router predictor \(' "$OUT/$name.server.log" | tail -6 | tee -a "$OUT/window.log"
   # The per-unit wait for partly read units, every arm with read-ahead in pieces (the Pu parts' gate),
@@ -911,7 +972,18 @@ for a in $ARMS; do
 # DbN DSpark's query pass as a short block of N rows (2-4), [anchor, noise x (N - 1)],
 # on every decoding step (RADIANCE_EXPERIMENTAL_DS41_DSPARK_SHORT_BLOCK=N, --draft-short-from 1;
 # with DsK, N = K + 1 drafts what the cap verifies; the replies stay the target's, acceptance may
-# move; a deepseek41 plugin that has it, and a Ds part); H3 the third run home (RADIANCE_HOME_DIR3); Es
+# move; a deepseek41 plugin that has it, and a Ds part); DvN the bank's hot set in VRAM
+# (RADIANCE_EXPERIMENTAL_DS41_DRAFT_VRAM=N with ..._DRAFT_HOTSET=$DRAFT_HOTSET or a variable by prompt set
+# and short block, hotset_for): each rank keeps the first N experts (1-32) of each of its stage lists as
+# static VRAM residents charged to the weights pool (the trunk gives up 3N residents a rank), loads no other
+# draft expert, pins nothing in the host pool (so the arm runs at B's p256 and m98304), and the draft
+# router is masked to the kept experts (-inf in the correction planes); a Ds part, and with Dkt the live
+# tail serves the VRAM weights; measured only if the server names the switch, every rank its final
+# placement (N/N/N hot) and its masked planes, and at exit every rank its draft selections with none on
+# a parked expert (otherwise <arm>.unmeasured.json); every other arm runs with ..._DRAFT_VRAM=0 and must
+# have no "draft VRAM" line; Xd the draft-routing capture: --expert-stats into xstats-<arm>.json (a Ds
+# part; the startup line must count 43 routed layers and the file draft passes, draft_hotset.py
+# summary), the input of draft_hotset.py write; H3 the third run home (RADIANCE_HOME_DIR3); Es
 # engram_kv's rows split over the ranks (needs a deepseek41 plugin that has it); Pa the next layer's
 # attention weights read into the card's on-die cache during the CPU-row wait (same); PmN those reads
 # from the use-order list up to N MiB an issue point, the read that crosses it cut
@@ -1034,7 +1106,7 @@ for a in $ARMS; do
 # input, ~190 MB an arm of the held-out prompts; an instrument: router_score_eval scores the file
 # offline in bf16, int8 and int4 against the container's routers); needs a predictor part.
   IFS=- read -r -a parts <<< "$a"
-  xt="" bt="" kld="" dk="" db="" pu="" ins_nt="" ins_kib="" ins_wait="" lean="" lc="" ad=""
+  xt="" bt="" kld="" dk="" db="" pu="" ins_nt="" ins_kib="" ins_wait="" lean="" lc="" ad="" dv="" xd="" hs=""
   pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 HOST_POOL_MIB=4096 EXTRA_ARGS="" ARM_HOME="$RHOME" ARM_CONC=
   ARM_PROMPTS= ARM_N= ARM_LQ= rt=
   power="" skip="" ARGS=() f8="" f8x="" rb="" rbf=0 pred="" cs="" ck="" kh="" pc="" pcopt="" fw="" wp="" wl=""
@@ -1113,6 +1185,11 @@ for a in $ARMS; do
       Dkt)     dk=2 ;;                     # draft GEMVs: the live tail alone (DRAFT_GEMV=2)
       Db[2-4]) db=${p#Db}                  # DSpark's short query block (DSPARK_SHORT_BLOCK=N)
                ARGS+=(--draft-short-from 1) ;;
+      Dv[0-9]*) dv=${p#Dv}                 # the bank's hot set in VRAM, router masked (DRAFT_VRAM=N)
+               if ! [[ $dv =~ ^[0-9]+$ ]] || (( 10#$dv < 1 || 10#$dv > 32 )); then
+                 log "arm $a: $p: a stage keeps 1-32 experts a rank; the arm is skipped"; skip=1
+               fi ;;
+      Xd)      xd=1 ;;                     # the draft-routing capture (--expert-stats xstats-<arm>.json)
       K)       env+=(RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE=1) ;;     # the RAM cache packed for the CPU only
       Vp)      env+=(RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED=1) ;;      # VRAM residents in the packed-scale form (vpack_gate)
       Lm[0-9]*) ARGS+=(--max-model-len "${p#Lm}") ;;   # a longer context (default 512), e.g. for long-prompt TTFT
@@ -1305,6 +1382,21 @@ for a in $ARMS; do
     fi
   fi
   ARM_DK=$dk ARM_DB=$db
+  # DvN / Xd act on the DSpark drafter only: without a Ds part the arm would not test them. A Dv arm's
+  # hot set: DRAFT_HOTSET_<name> for its U<name> part when set, else DRAFT_HOTSET.
+  if [[ -n "$dv$xd" && " ${env[*]} " != *" RADIANCE_EXPERIMENTAL_DS41_DSPARK_RAD_BANK=1 "* ]]; then
+    log "arm $a: Dv / Xd need a Ds part (the DSpark draft bank); the arm is skipped"; skip=1
+  fi
+  if [[ -n "$dv" ]]; then
+    hs=$(hotset_for "$a")
+    if [[ ! -f "$hs" ]]; then
+      log "arm $a: Dv needs a hot-set file (DRAFT_HOTSET, or DRAFT_HOTSET_<set>[_db<K>] / DRAFT_HOTSET_db<K>; draft_hotset.py write), not '${hs}'; the arm is skipped"; skip=1
+    fi
+  fi
+  # Every arm states the switch (0 is off), so a window's VAR=val cannot put the bank in VRAM.
+  env+=(RADIANCE_EXPERIMENTAL_DS41_DRAFT_VRAM=${dv:-0} "RADIANCE_EXPERIMENTAL_DS41_DRAFT_HOTSET=${dv:+$hs}")
+  [[ -n "$xd" ]] && ARGS+=(--expert-stats "$(cd "$OUT" && pwd)/xstats-$a.json")
+  ARM_DV=$dv ARM_XD=$xd ARM_HS=$hs
   if [[ -n "$xt" && -z "$skip" ]]; then
     IFS=: read -r -a homes <<< "$ARM_HOME"
     lib=""
@@ -1425,6 +1517,22 @@ for a in $ARMS; do
   if [[ " $ARMS " != *" $b "* ]]; then log "draft stats: no arm $b in this window to hold $a to"; continue; fi
   log "draft stats: $a against $b"
   python3 -I "$HERE/ab_requests.py" --draft-stats "$OUT" "$b" "$a" | tee -a "$OUT/window.log"
+done
+# DSpark arms (a Ds part): drafts verified and accepted, the acceptance and its ratio r to the first
+# arm with the same Ds and Db parts in each prompt set (put the pinned-bank arm first, so a Dv arm's masked
+# draft is read against the bank's unmasked one at its verify cap), tokens a step and decode tokens/s.
+ds_arms=""
+for a in $ARMS; do [[ "-$a-" =~ -Ds[0-9a]?- && -f "$OUT/$a.json" ]] && ds_arms+="$a "; done
+[[ -n "$ds_arms" ]] && python3 -I "$HERE/ab_requests.py" --acceptance "$OUT" $ds_arms | tee -a "$OUT/window.log"
+# Xd arms: each capture's share of draft selections the hot set its prompts' Dv arms use keeps at N = 8,
+# 16, 24 (held-out coverage when that hot set was written from the other prompt set's capture).
+for a in $ARMS; do
+  [[ "-$a-" == *-Xd-* && -f "$OUT/xstats-$a.json" ]] || continue
+  h=$(hotset_for "$a")
+  [[ -f "$h" ]] && python3 -I "$HERE/draft_hotset.py" cover "$h" "$OUT/xstats-$a.json" 8 16 24 | tee -a "$OUT/window.log"
+  # A Dv arm with Xd: its capture, taken under the mask, must select only the first N of each list.
+  n=$(tr '-' '\n' <<< "$a" | grep -m1 -E '^Dv[0-9]+$'); n=${n#Dv}
+  [[ -n "$n" && -f "$h" ]] && python3 -I "$HERE/draft_hotset.py" check "$h" "$n" "$OUT/xstats-$a.json" | tee -a "$OUT/window.log"
 done
 [[ " $ARMS" == *-Pc* ]] && python3 -I "$HERE/ab_requests.py" --ttft "$OUT" $ARMS | tee -a "$OUT/window.log"
 log "arms done"

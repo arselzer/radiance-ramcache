@@ -22,6 +22,9 @@
 #include "format/radfile.h"
 #include "dspark_bank_plan_fixture.h"
 #include "format/dspark_rad_banks.h"
+#include "place/draft_vram.h"
+#include "place/draft_vram_load.h"
+#include "place/dspark_draft_control_scope.h"
 #include <filesystem>
 #include <functional>
 #include <stdexcept>
@@ -5877,6 +5880,225 @@ TEST(the_scan_reads_a_weights_scales_and_the_query_keeps_one_over_its_room_block
     bad[raw3] = t[raw3];
     bad[raw3].scales_bytes -= 1;
     CHECK_EQ(vram_pack_scan(m.file, bad[raw3], &buf), -1);
+}
+
+/* ================================================================== the draft bank in VRAM
+ *
+ * RADIANCE_EXPERIMENTAL_DS41_DRAFT_VRAM (core/place/draft_vram.h): Planner::place_draft_bank_vram puts
+ * a rank's hot draft experts static in VRAM, charged to the weights pool before the expert fill, and
+ * parks the rest with no class, slot or pool; nothing of the bank is pinned. On the native-sized bank
+ * fixtures above (bank_expert_tiered_program: 40 trunk layers of 96 experts beside the three stages). */
+namespace {
+/* Rank r keeps, of stage s, the local experts (7 i + 3 s + r) mod 32 for i < n: a spread that differs
+ * by stage and rank (7 is prime to 32, so they are distinct). */
+DraftVramRank dv_spec(int rank, int n) {
+    DraftVramRank d;
+    d.n = n;
+    d.resident.assign(3, std::vector<uint8_t>(32, 0));
+    d.global.assign(3, std::vector<int32_t>(32, -1));
+    for (int st = 0; st < 3; ++st) {
+        for (int e = 0; e < 32; ++e) d.global[(size_t)st][(size_t)e] = 32 * rank + e;
+        for (int i = 0; i < n; ++i) d.resident[(size_t)st][(size_t)((7 * i + 3 * st + rank) % 32)] = 1;
+    }
+    return d;
+}
+int trunk_vram_residents(const Plan& p) {
+    int n = 0;
+    for (const MoveUnit& mu : p.units) n += mu.expert >= 0 && mu.layer < 40 && mu.tier == Tier::VRAM;
+    return n;
+}
+bool no_draft_vram_marks(const Plan& p) {
+    for (const MoveUnit& mu : p.units) if (mu.draft_vram || mu.draft_parked) return false;
+    return true;
+}
+}  /* namespace */
+
+TEST(dspark_bank_vram_holds_the_hot_set_static_and_parks_the_rest_on_all_ranks) {
+    constexpr int64_t P = 18800640;
+    for (int rank = 0; rank < 4; ++rank) {
+        Program prog = bank_expert_tiered_program(rank);
+        Config cfg = bank_expert_tiered_config();
+        const DraftVramRank dv = dv_spec(rank, 8);
+        PlannerInput in{&prog, &cfg, rank, 4, nullptr, 0};
+        in.container = true;
+        in.draft_vram = &dv;
+        Plan p;
+        REQUIRE(Planner(in).plan(&p) == RAD_OK);
+        CHECK(p.fits());
+        CHECK(p.strategy == Strategy::ExpertTiered);
+        int hot = 0, parked = 0, trunk = 0;
+        for (const MoveUnit& mu : p.units) {
+            if (mu.expert < 0 || mu.layer < 40) {
+                CHECK(!mu.draft_vram); CHECK(!mu.draft_parked);
+                if (mu.expert >= 0) { ++trunk; CHECK(mu.tier == Tier::VRAM || mu.tier == Tier::HostPinned || mu.tier == Tier::SSD); }
+                continue;
+            }
+            const bool keep = dv.resident[(size_t)(mu.layer - 40)][(size_t)mu.expert] != 0;
+            CHECK_EQ(mu.draft_vram, keep);
+            CHECK_EQ(mu.draft_parked, !keep);
+            CHECK(!mu.host_forced); CHECK(!mu.movable); CHECK(mu.preplaced());
+            if (keep) {
+                ++hot;
+                CHECK(mu.tier == Tier::VRAM); CHECK(mu.site == Site::Device);
+                CHECK_EQ(mu.slab_slot, -1); CHECK_EQ(mu.slot_bytes, P); CHECK(mu.slab_class >= 0);
+                for (auto w : mu.weights) {
+                    CHECK(p.weight[w].tier == Tier::VRAM); CHECK(p.weight[w].site == Site::Device);
+                }
+            } else {
+                ++parked;
+                CHECK(mu.tier == Tier::Mapped); CHECK(mu.site == Site::Device);
+                CHECK_EQ(mu.slab_class, -1); CHECK_EQ(mu.slot_bytes, (int64_t)0);
+                for (auto w : mu.weights) CHECK(p.weight[w].tier == Tier::Mapped);
+            }
+        }
+        CHECK_EQ(hot, 24); CHECK_EQ(parked, 72); CHECK_EQ(trunk, 40 * 96);
+        CHECK_EQ(p.draft_vram_units, (int64_t)24); CHECK_EQ(p.draft_vram_bytes, 24 * P);
+        CHECK_EQ(p.draft_parked_units, (int64_t)72); CHECK_EQ(p.draft_parked_bytes, 72 * P);
+        /* Nothing of the bank in the host pool: the budget is the flag's less the file tier's staging. */
+        CHECK_EQ(p.forced_host_used, (int64_t)0); CHECK_EQ(p.draft_host_bytes, (int64_t)0);
+        CHECK_EQ(p.host_budget, cfg.host_pool_mib * MiB - p.file_stage_reserve);
+        /* A parked expert is held nowhere: no tier counts it (the fixture maps nothing else). */
+        CHECK_EQ(p.totals.bytes[int(Tier::Mapped)], (int64_t)0);
+        CHECK(p.totals.bytes[int(Tier::VRAM)] + p.slab_overhead + p.file_stage_vram <= cfg.vram_weights_mib * MiB);
+        CHECK(p.report(prog).find("draft vram") != std::string::npos);
+    }
+}
+
+/* The charge: with the file buffers held at one unit (RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS=1, as
+ * the recommended configuration runs), every hot pair costs the trunk exactly one VRAM resident, and the
+ * VRAM total is unchanged (a pair is a trunk expert's size). */
+TEST(dspark_bank_vram_charges_the_weights_pool_so_the_trunk_gives_up_as_many_residents) {
+    FileBufferUnitsEnv units("1");
+    for (int rank : {0, 3}) {
+        Program prog = bank_expert_tiered_program(rank);
+        Config cfg = bank_expert_tiered_config();
+        PlannerInput host_in{&prog, &cfg, rank, 4, nullptr, 0};
+        host_in.container = true;
+        Plan host;
+        REQUIRE(Planner(host_in).plan(&host) == RAD_OK);
+        const int base = trunk_vram_residents(host);
+        CHECK(base > 100);
+        for (int n : {1, 8, 16, 24}) {
+            const DraftVramRank dv = dv_spec(rank, n);
+            PlannerInput in = host_in;
+            in.draft_vram = &dv;
+            Plan p;
+            REQUIRE(Planner(in).plan(&p) == RAD_OK);
+            CHECK_EQ(trunk_vram_residents(p), base - 3 * n);
+            CHECK_EQ(p.draft_vram_units, (int64_t)(3 * n));
+            CHECK_EQ(p.file_stage_vram, host.file_stage_vram);
+            CHECK_EQ(p.totals.bytes[int(Tier::VRAM)], host.totals.bytes[int(Tier::VRAM)]);
+            /* The host pool the bank no longer takes goes to the trunk's spill. */
+            CHECK(p.totals.bytes[int(Tier::HostPinned)] > host.totals.bytes[int(Tier::HostPinned)] - host.forced_host_used);
+        }
+    }
+}
+
+TEST(dspark_bank_vram_refuses_without_placing_or_parking_anything) {
+    for (int bad = 0; bad < 6; ++bad) {
+        Program prog = bank_expert_tiered_program(0);
+        Config cfg = bank_expert_tiered_config();
+        DraftVramRank dv = dv_spec(0, 8);
+        PlannerInput in{&prog, &cfg, 0, 4, nullptr, 0};
+        in.container = true;
+        int want = RAD_E_UNSUPPORTED;
+        if (bad == 0) { dv.resident[1][(size_t)((3 * 1) % 32)] = 0; want = RAD_E_INVAL; }   /* stage 41 keeps 7 */
+        if (bad == 1) cfg.placement = "all_vram";                    /* no expert fill to charge */
+        if (bad == 2) cfg.draft_bank_expert_placement = "auto";      /* not the bank's manual contract */
+        if (bad == 3) cfg.draft_bank.clear();
+        if (bad == 4) in.host_backend = true;
+        if (bad == 5) prog.ctx.max_spec = 4;                          /* not the native bank */
+        in.draft_vram = &dv;
+        Plan p;
+        CHECK_EQ(Planner(in).plan(&p), want);
+        CHECK(no_draft_vram_marks(p));
+        for (const MoveUnit& mu : p.units) CHECK(!mu.host_forced);
+    }
+}
+
+TEST(dspark_bank_vram_passes_the_draft_control_scope_only_as_placed) {
+    FileBufferUnitsEnv units("1");   /* 48 hot pairs beside two whole-layer file buffers overfill 4 GiB */
+    Program prog = bank_expert_tiered_program(1);
+    Config cfg = bank_expert_tiered_config();
+    const DraftVramRank dv = dv_spec(1, 16);
+    PlannerInput in{&prog, &cfg, 1, 4, nullptr, 0};
+    in.container = true;
+    Plan host;
+    REQUIRE(Planner(in).plan(&host) == RAD_OK);
+    in.draft_vram = &dv;
+    Plan vram;
+    REQUIRE(Planner(in).plan(&vram) == RAD_OK);
+    CHECK(dspark_draft_control_scope(prog, host, cfg, true));
+    CHECK(dspark_draft_control_scope(prog, host, cfg, true, 0));
+    CHECK(!dspark_draft_control_scope(prog, host, cfg, true, 16));
+    CHECK(dspark_draft_control_scope(prog, vram, cfg, true, 16));
+    CHECK(!dspark_draft_control_scope(prog, vram, cfg, true, 0));
+    CHECK(!dspark_draft_control_scope(prog, vram, cfg, true, 8));
+    CHECK(!dspark_draft_control_scope(prog, vram, cfg, false, 16));
+    Config off = cfg;
+    off.max_seqs = 2;
+    CHECK(!dspark_draft_control_scope(prog, vram, off, true, 16));
+}
+
+/* The mover gives the hot set static addresses and the parked experts none (no class, no pool); the
+ * engine then publishes each parked weight at its stage's first resident's weight of the same slot
+ * (draft_vram_aliases), so the grouped GEMM's table names card memory for every expert. A small plan
+ * (the bank alone, one expert a stage), so the host backend allocates 56 MB. */
+TEST(dspark_bank_vram_mover_holds_only_the_hot_set_and_parked_weights_publish_at_residents) {
+    Program prog = bank_placement_program(2);
+    Config cfg = bank_placement_config();
+    cfg.placement = "expert_tiered";
+    cfg.vram_weights_mib = 256;
+    cfg.host_pool_mib = 64;
+    cfg.draft_bank_expert_placement = "host";
+    const DraftVramRank dv = dv_spec(2, 1);
+    PlannerInput in{&prog, &cfg, 2, 4, nullptr, 0};
+    in.draft_vram = &dv;
+    Plan p;
+    REQUIRE(Planner(in).plan(&p) == RAD_OK);
+    CHECK_EQ(p.totals.bytes[int(Tier::HostPinned)], (int64_t)0);
+    Mover m;
+    MoverConfig mc;
+    REQUIRE(m.init(prog, p, mc) == RAD_OK);
+    std::vector<void*> alias;
+    std::string why;
+    REQUIRE_EQ(draft_vram_aliases(prog, p, m, &alias, &why), RAD_OK);
+    void* first[3][2] = {};
+    int hot_w = 0, parked_w = 0;
+    for (const MoveUnit& mu : p.units) {
+        if (!mu.draft_vram) continue;
+        for (auto w : mu.weights) {
+            const WeightSlot* ws = m.residency()->lookup(w);
+            REQUIRE(ws && ws->ptr);
+            CHECK(alias[w] == nullptr);
+            first[mu.layer - 40][prog.weights[w].decl.group.slot] = ws->ptr;
+            ++hot_w;
+        }
+    }
+    CHECK(first[0][0] != first[0][1]);
+    for (const MoveUnit& mu : p.units) {
+        if (!mu.draft_parked) continue;
+        for (auto w : mu.weights) {
+            const WeightSlot* ws = m.residency()->lookup(w);
+            CHECK(!ws || !ws->ptr);
+            void* want = first[mu.layer - 40][prog.weights[w].decl.group.slot];
+            REQUIRE(want != nullptr);
+            CHECK(alias[w] == want);
+            m.publish_mapped(w, alias[w]);
+            const WeightSlot* now = m.residency()->lookup(w);
+            REQUIRE(now != nullptr);
+            CHECK(now->ptr == want);
+            ++parked_w;
+        }
+    }
+    CHECK_EQ(hot_w, 2 * 3);
+    CHECK_EQ(parked_w, 2 * 93);
+    /* A stage with no resident leaves its parked weights nowhere to be published: refused. */
+    Plan broken = p;
+    for (MoveUnit& mu : broken.units)
+        if (mu.draft_vram && mu.layer == 41) { mu.draft_vram = false; mu.draft_parked = true; }
+    std::vector<void*> none;
+    CHECK_EQ(draft_vram_aliases(prog, broken, m, &none, &why), RAD_E_STATE);
 }
 
 RAD_TEST_MAIN()

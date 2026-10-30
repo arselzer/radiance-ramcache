@@ -23,6 +23,7 @@
 #include "rad_philox.h"
 #include "rad_runtime.h"   /* RAD_VGEOM_* */
 #include "rad_planes.h"
+#include "place/draft_vram.h"   /* RADIANCE_EXPERIMENTAL_DS41_DRAFT_VRAM's mask */
 
 #include <algorithm>
 #include <cmath>
@@ -399,6 +400,76 @@ TEST(router_scored_topk_names_its_score_function) {
     A d; d.t(lg).t(bias).t(ids).t(w).i("M", 2).i("n_expert", 5).i("top_k", 3).i("norm", 1)
         .d("route_scale", 1.5).s("score", "relu").s("dtype", "f32");
     CHECK_EQ(run("router_scored_topk", d), RAD_E_UNSUPPORTED);
+}
+
+/* RADIANCE_EXPERIMENTAL_DS41_DRAFT_VRAM (core/place/draft_vram.h): a DSpark draft stage's router
+ * (128 experts, top-3, sqrt(softplus), norm, route scale 1.5) with its correction plane masked by the
+ * engine's own helpers to the experts kept in VRAM (draft_vram_allowed over ranked per-rank lists,
+ * then draft_mask_plane: -inf at every other expert) never takes a masked expert: it takes the best
+ * three kept ones by score + correction, in that order, weighted by their unbiased scores over the
+ * three -- a serial restatement of the oracle's float arithmetic, compared exactly. Below top-3 kept
+ * (which the engine refuses at load) the oracle refuses the launch rather than take a masked one. */
+TEST(router_scored_topk_never_takes_an_expert_the_draft_mask_drops) {
+    constexpr int NE = 128, K = 3, M = 15;
+    uint32_t seed = 12345;
+    auto next = [&]() { seed = seed * 1664525u + 1013904223u; return seed >> 8; };
+    auto sp = [](float x) { return x > 20.0f ? x : std::log1p(std::exp(x)); };
+    int picks = 0;
+    for (int n : {1, 2, 8, 16, 24, 32}) {
+        rad::DraftHotset hs;
+        hs.hot.assign(3, std::vector<std::vector<int32_t>>(4));
+        for (int st = 0; st < 3; ++st)
+            for (int r = 0; r < 4; ++r) {
+                std::vector<int32_t> l(32);
+                for (int i = 0; i < 32; ++i) l[(size_t)i] = 32 * r + i;
+                for (int i = 31; i > 0; --i) std::swap(l[(size_t)i], l[(size_t)(next() % (uint32_t)(i + 1))]);
+                hs.hot[(size_t)st][(size_t)r] = l;
+            }
+        std::vector<std::vector<uint8_t>> allowed;
+        std::string why;
+        REQUIRE_EQ(rad::draft_vram_allowed(hs, n, &allowed, &why), RAD_OK);
+        for (int st = 0; st < 3; ++st) {
+            const std::vector<float> zero(NE, 0.0f);
+            std::vector<float> plane(NE);
+            rad::draft_mask_plane(zero.data(), allowed[(size_t)st].data(), NE, plane.data());
+            T lg(RAD_F32, {M, NE}), bias(RAD_F32, {NE}), ids(RAD_I32, {M, K}), w(RAD_F32, {M, K});
+            for (int e = 0; e < NE; ++e) bias.set(e, plane[(size_t)e]);
+            for (int i = 0; i < M * NE; ++i) lg.set(i, ((float)(next() % 4001) - 2000.0f) / 500.0f);
+            A a; a.t(lg).t(bias).t(ids).t(w).i("M", M).i("n_expert", NE).i("top_k", K).i("norm", 1)
+                .d("route_scale", 1.5).s("score", "sqrtsoftplus").s("dtype", "f32");
+            REQUIRE_EQ(run("router_scored_topk", a), RAD_OK);
+            for (int r = 0; r < M; ++r) {
+                float sel[NE], score[NE], sum = 0;
+                for (int e = 0; e < NE; ++e) {
+                    score[e] = std::sqrt(sp(lg.at((int64_t)r * NE + e)));
+                    sel[e] = score[e] + plane[(size_t)e];
+                }
+                for (int j = 0; j < K; ++j) {
+                    int best = -1;
+                    for (int e = 0; e < NE; ++e)
+                        if (sel[e] > -INFINITY && (best < 0 || sel[e] > sel[best])) best = e;
+                    REQUIRE(best >= 0);
+                    const int got = (int)ids.iat((int64_t)r * K + j);
+                    CHECK_EQ(got, best);
+                    CHECK(allowed[(size_t)st][(size_t)got]);
+                    sum += score[best];
+                    sel[best] = -INFINITY;
+                    ++picks;
+                }
+                for (int j = 0; j < K; ++j) {
+                    const int got = (int)ids.iat((int64_t)r * K + j);
+                    CHECK_EQ(w.at((int64_t)r * K + j), score[got] * (1.5f / (sum + 1e-20f)));
+                }
+            }
+        }
+    }
+    CHECK_EQ(picks, 6 * 3 * M * K);
+    /* Two kept: the oracle refuses rather than take a masked expert. */
+    T lg(RAD_F32, {1, NE}), bias(RAD_F32, {NE}), ids(RAD_I32, {1, K}), w(RAD_F32, {1, K});
+    for (int e = 0; e < NE; ++e) { bias.set(e, e == 7 || e == 99 ? 0.0f : -INFINITY); lg.set(e, (float)(e % 9)); }
+    A two; two.t(lg).t(bias).t(ids).t(w).i("M", 1).i("n_expert", NE).i("top_k", K).i("norm", 1)
+        .d("route_scale", 1.5).s("score", "sqrtsoftplus").s("dtype", "f32");
+    CHECK_EQ(run("router_scored_topk", two), RAD_E_SHAPE);
 }
 
 /* rope_rows over DeepSeek-V4's layout: the last rot columns of each head, adjacent pairs, angles

@@ -340,7 +340,7 @@ Engine::~Engine() {
                      "live cap); at their layer %llu used (%llu whole, %llu %s %.1f ms in all, %.3f ms "
                      "each), %llu read as any miss, %llu re-read after a "
                      "failed piece; %llu dropped (%llu not selected, %llu cache hits, %llu stale); "
-                     "%llu of %llu one-token misses planned (%.1f%%), %llu used (%.1f%%); read ahead "
+                     "%llu of %llu misses planned (%.1f%%), %llu used (%.1f%%); read ahead "
                      "%.0f MB for units used, %.0f MB for units dropped",
                      (unsigned long long)hx.ra_planned, (unsigned long long)hx.ra_late,
                      (unsigned long long)hx.ra_capped, (unsigned long long)used,
@@ -382,6 +382,24 @@ Engine::~Engine() {
                          (double)hx.ra_rest_mirror_bytes / 1e6, (unsigned long long)hx.ra_rest_mirror,
                          hx.ra_rest ? (double)hx.ra_rest_bytes / 1e6 / (double)hx.ra_rest : 0.0,
                          (double)hx.ra_wait_ns / 1e6);
+            /* The same by the pass's rows: one-token passes, and the decode passes of 2..N rows that
+             * RADIANCE_EXPERIMENTAL_DS41_PREFETCH_MULTIROW reads ahead in. */
+            std::string by;
+            for (int r = 1; r <= FileStager::HostStats::kRaRows; ++r) {
+                const auto& s = hx.ra_rows[r];
+                if (!s.planned && !s.skipped && !s.misses && !s.dropped) continue;
+                by += fmt("%s%d row%s: %llu planned (%llu too late or over the cap), %llu used (%llu whole, "
+                          "%llu finished, %.1f ms waited), %llu read as any miss, %llu re-read, %llu dropped, "
+                          "%llu of %llu misses planned, %.0f MB used, %.0f MB dropped",
+                          by.empty() ? "" : "; ", r, r == 1 ? "" : "s", (unsigned long long)s.planned,
+                          (unsigned long long)s.skipped, (unsigned long long)(s.whole + s.finished),
+                          (unsigned long long)s.whole, (unsigned long long)s.finished,
+                          (double)s.wait_ns / 1e6, (unsigned long long)s.fresh,
+                          (unsigned long long)s.refetched, (unsigned long long)s.dropped,
+                          (unsigned long long)s.miss_planned, (unsigned long long)s.misses,
+                          (double)s.used_bytes / 1e6, (double)s.dropped_bytes / 1e6);
+            }
+            if (!by.empty()) RAD_INFO("read-ahead in pieces by pass size: %s", by.c_str());
         }
         /* RADIANCE_EXPERIMENTAL_DS41_ROUTE_TRACE (place/route_trace.h): this rank's records, and
          * its one-token layers' picks by what it did with them (the trace's own tally of them). */
@@ -457,6 +475,18 @@ Engine::~Engine() {
                  s.computed ? (double)s.compute_ns / 1e3 / (double)s.computed : 0.0,
                  (double)s.ready_ns / 1e6,
                  s.computed ? (double)s.ready_ns / 1e3 / (double)s.computed : 0.0);
+        /* RADIANCE_EXPERIMENTAL_DS41_PREFETCH_MULTIROW: the multi-row decode passes' posts among
+         * them, against the one-row predictions' cost. */
+        if (s.multi) {
+            const uint64_t one = s.computed - s.multi, one_ns = s.compute_ns - s.multi_ns;
+            RAD_INFO("router predictor, multi-row decode passes: %llu of the predictions from %llu rows "
+                     "(%.2f a post), %.1f ms scoring (%.1f us a prediction, %.1f us a row; one-row "
+                     "predictions %.1f us)", (unsigned long long)s.multi,
+                     (unsigned long long)s.multi_rows, (double)s.multi_rows / (double)s.multi,
+                     (double)s.multi_ns / 1e6, (double)s.multi_ns / 1e3 / (double)s.multi,
+                     s.multi_rows ? (double)s.multi_ns / 1e3 / (double)s.multi_rows : 0.0,
+                     one ? (double)one_ns / 1e3 / (double)one : 0.0);
+        }
     }
     /* ..._PREFETCH_RECORD: the inputs written for offline scoring (router_predictor.h). */
     if (RouterPredictor* rp = RouterPredictor::get(); rp && !rp->record_path().empty()) {

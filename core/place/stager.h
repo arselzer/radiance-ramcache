@@ -226,6 +226,26 @@ private:
     void retire(Place& p);
 };
 
+/* The read-ahead in pieces' pass policy (FileStager, RADIANCE_EXPERIMENTAL_DS41_PREFETCH=pieces).
+ * ra_multirow_rows: RADIANCE_EXPERIMENTAL_DS41_PREFETCH_MULTIROW's value -- 1 unset, empty or "0"
+ * (one-token passes only, as always), N for 2 <= N <= limit, -1 for anything else (refused).
+ * ra_pass_reads_ahead: every one-token pass, as always, and for max_rows > 1 a trunk decode pass
+ * (decode: RAD_PHASE_DECODE; draft_pass 0) of 2..max_rows rows; never a prefill or mixed pass of
+ * more rows, nor the drafter's own passes. */
+inline int ra_multirow_rows(const char* v, int64_t limit) {
+    if (!v || !*v || (v[0] == '0' && !v[1])) return 1;
+    int64_t n = 0;
+    for (const char* p = v; *p; ++p) {
+        if (*p < '0' || *p > '9' || n > 1000) return -1;
+        n = n * 10 + (*p - '0');
+    }
+    return n >= 2 && n <= limit ? (int)n : -1;
+}
+inline bool ra_pass_reads_ahead(bool decode, int32_t draft_pass, int64_t n_tok, int max_rows) {
+    if (n_tok == 1) return true;
+    return max_rows > 1 && decode && draft_pass == 0 && n_tok >= 2 && n_tok <= max_rows;
+}
+
 /* ---- the file stager: routed layers read from the container -------------------------------------
  *
  * A routed unit on the file tier (--weights-disk-tier) has no address of its own, and a grouped
@@ -317,7 +337,8 @@ public:
         /* ...and the entries their layer took before their read began, and the read-ahead's time
          * holding back for demand reads. */
         uint64_t pf_taken = 0, pf_yield_ns = 0;
-        /* Read-ahead in pieces (..._PREFETCH=pieces, readahead.h), one-token layers: units
+        /* Read-ahead in pieces (..._PREFETCH=pieces, readahead.h), the layers of passes that read
+         * ahead (one-token passes; with ..._PREFETCH_MULTIROW also decode passes of 2..N rows): units
          * planned (predicted, uncached, eligible); planned for a layer this rank had decided
          * already, or past the cap of live units. At their layer, the selected misses: whole
          * (every piece read), finished (partly read, the rest read urgently while the layer
@@ -350,6 +371,20 @@ public:
         /* ..._SIDE_STORE (hx_side_store.h): misses handed the planes the store holds (no drive
          * read), and of them in one-token passes. */
         uint64_t side_hits = 0, side_d_hits = 0;
+        /* The same by the pass's rows (ra_rows[r], r = 1..kRaRows; [0] unused): one-token passes,
+         * and with RADIANCE_EXPERIMENTAL_DS41_PREFETCH_MULTIROW the decode passes of 2..N rows.
+         * Planned and skipped (too late, or past the live cap) by the rows of the post that
+         * predicted them; the rest by the rows of the pass that decided them. used = whole +
+         * finished; dropped = not selected + cache hits + stale. */
+        struct RaRows {
+            uint64_t planned = 0, skipped = 0;
+            uint64_t whole = 0, finished = 0, fresh = 0, refetched = 0, dropped = 0;
+            uint64_t misses = 0, miss_planned = 0;
+            uint64_t used_bytes = 0, dropped_bytes = 0, wait_ns = 0;
+        };
+        static constexpr int kRaRows = 16;
+        RaRows ra_rows[kRaRows + 1];
+        static int ra_slot(int64_t rows) { return rows < 1 ? 1 : rows > kRaRows ? kRaRows : (int)rows; }
         uint64_t linked = 0;          /* cached experts the schedule left on the copy link */
         uint64_t missed = 0;          /* routed experts the RAM cache did not hold */
         uint64_t wait_ns = 0;         /* the issuing thread waiting at gathers for the CPU */
@@ -825,6 +860,7 @@ private:
         std::shared_ptr<Mover::HostPlanes> p;
         uint32_t pass = 0;
         int32_t  li = -1, unit = -1;
+        int32_t  rows = 1;                   /* the rows of the post that predicted it */
     };
     PieceReader* hx_ra_ = nullptr;           /* set in pieces mode once the readers run */
     std::mutex   hx_ra_mu_;                  /* hx_ra_live_, and the ra_ counters the planner bumps */
@@ -857,9 +893,29 @@ private:
     /* Parallel to hx_miss_: the unit the readers are finishing for this layer (with
      * ..._PREFETCH_URGENT: stopped, its rest the layer's call's), or null. */
     std::vector<std::shared_ptr<ReadAheadUnit>> hx_miss_ra_;
-    static void hx_ra_ready(void* ctx, uint32_t pass, int layer, const int32_t* experts, int k);
+    /* ---- RADIANCE_EXPERIMENTAL_DS41_PREFETCH_MULTIROW=N (2..16; needs the read-ahead in pieces):
+     * decode passes of 2..N rows read ahead too -- a DSpark verify pass (the last token and its
+     * drafts), or one token from each of several sequences. Rank 0 posts every row's router input
+     * at the one-token pass's points (start_ep_routed after the CPU's submission, hx_early_decide
+     * after the counts); the predictor reads layer L+2's router once for all the rows and hands
+     * every rank the union of the rows' top k (router_predictor.h); hx_ra_plan lays it out under
+     * the same live cap, and hx_choose decides a layer's units as in a one-token pass: the
+     * readers' yields to demand reads, the finishing rule (with the plane mirror's share for the
+     * pass's rows) and the epoch check are the same. A one-token pass goes exactly as without the
+     * switch; prefill chunks and the drafter's own passes never read ahead. Reads only: the bytes
+     * handed to the CPU are the container's either way. */
+    int  hx_ra_rows_ = 1;                    /* the largest pass that reads ahead (1: one-token only) */
+    bool hx_ra_pass_ = false;                /* this pass reads ahead (ra_pass_reads_ahead) */
+    int  hx_ra_rows_init();
+    /* hx_ra_take's finishing rule: the bytes of a missed unit this pass's demand read takes from
+     * the plane mirror (a one-token pass: the decode share, as always). */
+    int64_t hx_ra_mirror_bytes() const;
+    static void hx_ra_ready(void* ctx, uint32_t pass, int layer, const int32_t* experts, int n,
+                            int rows);
     static int  hx_ra_read(void* ctx, const PlaneExtent& piece);
-    void hx_ra_plan(uint32_t pass, int layer, const int32_t* experts, int k);
+    /* Layer `layer`'s predicted global experts for pass `pass` (n of them, best first) from a post
+     * of `rows` rows: this rank's uncached ones laid out and queued, up to the live cap. */
+    void hx_ra_plan(uint32_t pass, int layer, const int32_t* experts, int n, int rows = 1);
     /* At layer li's routing: its live units into hx_ra_here_, stale ones dropped. */
     void hx_ra_begin(int32_t li);
     /* Layer li's selected miss u: its planes when read ahead (whole: *ready; partly read: *urgent,

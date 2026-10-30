@@ -717,10 +717,13 @@ public:
      * read_piece           one O_DIRECT read of [off, off + len) of container `file` into dst (cap
      *                      bytes there), as read_unit_planes reads an extent; thread-safe.
      * decode_mirror_bytes  the bytes of a missed unit a one-token pass reads from the plane mirror
-     *                      instead of the container (0 with no mirror, or one turned off). */
+     *                      instead of the container (0 with no mirror, or one turned off).
+     * mirror_bytes         the same for a pass of `rows` tokens, as read_unit_planes picks the share
+     *                      (the decode share under the mirror's min_rows, its share from there). */
     bool  lay_out_unit_planes(HostPlanes* p, PlaneExtent ext[2]);
     int   read_piece(uint32_t file, int64_t off, int64_t len, void* dst, int64_t cap);
     int64_t decode_mirror_bytes() const;
+    int64_t mirror_bytes(int rows) const;
     /* read_weight_file  a whole weight as the container holds it (every row on this rank) into
      *                   dst, weight_file_bytes(w) long (rad_core.h), for a host reader such as
      *                   the router predictor: a weight stored as is, or the one plane a kernel's

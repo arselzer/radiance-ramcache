@@ -357,6 +357,19 @@ EOF2
   fi
   grep -m1 -E 'router predictor: [0-9]+ routers loaded .*scored in int' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   grep -m1 -E "side store: the planes of up to|rank 0 posts the read-ahead's router input" "$OUT/$name.server.log" | tee -a "$OUT/window.log"
+  # RADIANCE_EXPERIMENTAL_DS41_PREFETCH_MULTIROW (the Pmr parts): rank 0's file stager names it at
+  # startup with its N. A Pmr arm without that line for its N (a radiance without the switch: decode
+  # passes of 2+ rows go without the read-ahead), or another arm with the line, is not measured.
+  local pmr_lines; pmr_lines=$(grep -cE 'read-ahead: decode passes of 2-[0-9]+ rows read ahead too' "$OUT/$name.server.log")
+  if [[ -n "${ARM_PMR:-}" ]] && ! grep -qE "read-ahead: decode passes of 2-${ARM_PMR} rows read ahead too" "$OUT/$name.server.log"; then
+    log "arm $name: Pmr${ARM_PMR}, but the server log has no 'read-ahead: decode passes of 2-${ARM_PMR} rows read ahead too' line ($(grep -m1 -E 'PREFETCH_MULTIROW' "$OUT/$name.server.log")); not measured"
+    stop_server; return 1
+  fi
+  if [[ -z "${ARM_PMR:-}" && "$pmr_lines" != 0 ]]; then
+    log "arm $name: no Pmr part, but the server reads ahead in multi-row decode passes (the knob set for the window?); not measured"
+    stop_server; return 1
+  fi
+  [[ -n "${ARM_PMR:-}" ]] && grep -m1 -E 'read-ahead: decode passes of 2-' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   # RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED (the Vp part): the engine names the switch at startup and
   # each rank how many static residents it holds packed. A Vp arm without the switch's line or with
   # no rank holding any packed (a radiance without the switch, a dynamic plan, a DSpark bank), or a
@@ -587,6 +600,20 @@ EOF2
     log "arm $name: $dk_bad; not measured (results kept as $name.unmeasured.json)"
     [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
   fi
+  # Pmr with a drafting Ds part (DSpark's 2+ row verify passes) at shutdown: the predictor's
+  # multi-row line, and some rank's "by pass size" line with a "2 rows:" entry that planned units;
+  # otherwise the switch never acted on a verify pass and the arm is set aside (mrra review B3).
+  if [[ -n "${ARM_PMR:-}" && "-$name-" =~ -Ds([1-9]|a)[0-9]*- ]]; then
+    local pmr_bad="" pmr2
+    grep -q 'router predictor, multi-row decode passes: [1-9]' "$OUT/$name.server.log" ||
+      pmr_bad="no 'router predictor, multi-row decode passes' line with posts"
+    pmr2=$(grep -oE '2 rows: [0-9]+ planned' "$OUT/$name.server.log" | grep -oE '[0-9]+ planned' | grep -oE '^[0-9]+' | awk '{s += $1} END {print s + 0}')
+    [[ -z "$pmr_bad" && "$pmr2" == 0 ]] && pmr_bad="no rank planned a unit in a 2-row pass ('2 rows: N planned')"
+    if [[ -n "$pmr_bad" ]]; then
+      log "arm $name: Pmr${ARM_PMR}, but $pmr_bad; not measured (results kept as $name.unmeasured.json)"
+      [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
+    fi
+  fi
   # Fw / WpN at shutdown: the pool's line ("host expert pool: ..."). A Wp arm counts only if its
   # router pre-wakes woke workers; an Fw arm only if its pool woke through the futex. Otherwise its
   # results are set aside as <arm>.unmeasured.json (the window's comparisons skip it).
@@ -668,7 +695,8 @@ EOF2
     (( xd_rc == 0 )) || log "arm $name: Xd, but xstats-$name.json holds no draft capture (exit $xd_rc)"
   fi
   grep -E 'host experts|EP scoped|live chain|error|ERR' "$OUT/$name.server.log" | tail -16 | tee -a "$OUT/window.log"
-  grep -E 'read-ahead (in pieces:|readers)|router predictor \(' "$OUT/$name.server.log" | tail -6 | tee -a "$OUT/window.log"
+  # (Pmr: a rank's "by pass size" line beside its totals, and the predictor's multi-row line.)
+  grep -E 'read-ahead (in pieces:|in pieces by pass size|readers)|router predictor( \(|, multi-row)' "$OUT/$name.server.log" | tail -11 | tee -a "$OUT/window.log"
   # The per-unit wait for partly read units, every arm with read-ahead in pieces (the Pu parts' gate),
   # and a Pu arm's rests.
   grep -E 'read-ahead in pieces, (partly read units|rests on the kept readers)' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
@@ -974,7 +1002,12 @@ for a in $ARMS; do
   # every other arm runs with the switch 0, and a Pu arm is measured only if every rank names it at
   # startup (Pu2: with its decode mirror) and a shutdown line counts rests read (Pu2: some from the
   # mirror); the "read-ahead in pieces, partly read units" line has the per-unit wait in every
-  # arm with PpK; o --profile-ops;
+  # arm with PpK; PmrN / Pmr the read-ahead in pieces in
+  # decode passes of 2..N rows too (Pmr: N = 6; a DSpark verify pass, or several sequences' tokens):
+  # rank 0 posts every row's router input, each row predicts layer L+2's top K, each rank reads the
+  # union under the same live cap (RADIANCE_EXPERIMENTAL_DS41_PREFETCH_MULTIROW=N; needs a Pp part;
+  # reads only; measured only if the server names it at startup with its N, and every other arm runs
+  # with it 0 and must not name it); o --profile-ops;
   # H the second run home (RADIANCE_HOME_DIR2); iN background insert threads for missed units;
 # pN --host-pool-mib (4096: a rank's pinned expert slots and the file tier's staging); G pin the
 # RAM cache's slabs at startup; R / RNN read part of each missed expert from the checkpoint's
@@ -1144,7 +1177,7 @@ for a in $ARMS; do
 # input, ~190 MB an arm of the held-out prompts; an instrument: router_score_eval scores the file
 # offline in bf16, int8 and int4 against the container's routers); needs a predictor part.
   IFS=- read -r -a parts <<< "$a"
-  xt="" bt="" kld="" dk="" db="" pu="" ins_nt="" ins_kib="" ins_wait="" lean="" lc="" ad="" dv="" xd="" hs="" dg="" df=""
+  xt="" bt="" kld="" dk="" db="" pu="" ins_nt="" ins_kib="" ins_wait="" lean="" lc="" ad="" dv="" xd="" hs="" dg="" df="" pmr=""
   pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 HOST_POOL_MIB=4096 EXTRA_ARGS="" ARM_HOME="$RHOME" ARM_CONC=
   ARM_PROMPTS= ARM_N= ARM_LQ= rt=
   power="" skip="" ARGS=() f8="" f8x="" rb="" rbf=0 pred="" cs="" ck="" kh="" pc="" pcopt="" fw="" wp="" wl=""
@@ -1310,6 +1343,11 @@ for a in $ARMS; do
       Pv)      pv=1 ;;                     # the predictor's inputs recorded (an instrument)
       Ns[0-9]*) # side store: up to N units a rank the packed cache refuses keep their planes
                if [[ ${p#Ns} =~ ^[0-9]+$ ]]; then ns=$((10#${p#Ns})); else log "arm $a: $p: NsN takes a number; the arm is skipped"; skip=1; fi ;;
+      Pmr|Pmr[0-9]*)                       # read-ahead in pieces in decode passes of 2..N rows too (Pmr: 6)
+               pmr=${p#Pmr}; pmr=${pmr:-6}
+               if ! [[ $pmr =~ ^[0-9]+$ ]] || (( 10#$pmr < 2 || 10#$pmr > 16 )); then
+                 log "arm $a: $p: N is 2-16 rows; the arm is skipped"; skip=1
+               else pmr=$((10#$pmr)); fi ;;
       *)     log "arm $a: unknown part $p; the arm is skipped (it would run without what its name says)"; skip=1 ;;
     esac
   done
@@ -1366,6 +1404,14 @@ for a in $ARMS; do
     env+=(RADIANCE_EXPERIMENTAL_DS41_PREFETCH_URGENT=0)
   fi
   ARM_PU=$pu
+  # Pmr: the multi-row read-ahead acts only on the read-ahead in pieces (a Pp part); without one the
+  # server refuses the switch. Every arm states it (0 is off), so a window's VAR=val cannot turn it on
+  # for the others; arm() checks the server log both ways.
+  if [[ -n "$pmr" && " ${env[*]} " != *" RADIANCE_EXPERIMENTAL_DS41_PREFETCH=pieces "* ]]; then
+    log "arm $a: Pmr needs a Pp part (the read-ahead in pieces); the arm is skipped"; skip=1
+  fi
+  env+=(RADIANCE_EXPERIMENTAL_DS41_PREFETCH_MULTIROW=${pmr:-0})
+  ARM_PMR=$pmr
   # Ss: the read-back runs in an arm only if its name says so, whatever the window's environment.
   [[ " ${env[*]} " == *" RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP=1 "* ]] || env+=(RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP=0)
   # Pi8 / Pi4, PkN, Pw, NsN, Pv: each acts only with what it changes (a predictor; Pi; Ei and the

@@ -56,7 +56,6 @@ RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MAX_ROWS=32          # prefill: CPU jobs
 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MISSES=1024         # misses computed on the CPU in passes of up to 1024 tokens
 RADIANCE_EXPERIMENTAL_DS41_LCP=1024                         # large-chunk prefill: chunks of 1024 tokens (with --max-num-batched-tokens 1024)
 RADIANCE_EXPERIMENTAL_DS41_MOE_BALANCE=1                    # routed gemv: work split by row passes, all-dropped passes skipped (exact)
-RADIANCE_EXPERIMENTAL_DS41_ROUTER_BF16=1                   # routers and compressor kv|gate held as bf16 halves (needs the libr4d whose f32bf16 card checks passed)
 RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP=1                # no pass after a reply's end-of-generation token
 RADIANCE_EXPERIMENTAL_DS41_PREFETCH_URGENT=1               # a partly read read-ahead unit's rest read whole in its layer's own read
 RADIANCE_EXPERIMENTAL_DS41_INSERT_SLICE_KIB=256            # background inserts in 256 KiB pieces, waiting for an idle pool
@@ -71,10 +70,11 @@ radiance ... --tp 4 --placement expert_tiered --weights-disk-tier \
   --expert-plane-mirror-decode-share 0.13                              # the mirror is optional, see below
 ```
 
-`RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED=1` (packed VRAM residents, ~31 more a card, about +1% decode) is left out
-above: large-chunk prefill refuses it, because the packed residents' gemv_vp serves passes of up to 16 tokens
-(found in ab-20261030T223155Z; the earlier windows measured the two in separate arms). Add it only without
-`..._LCP`, or with Phase 1 prefill (`..._P1`), whose row kernel decodes the packed form.
+`RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED=1` (packed VRAM residents, ~31 more a card, about +1% decode) and
+`RADIANCE_EXPERIMENTAL_DS41_ROUTER_BF16=1` (bf16 routers, +0.6%) are left out above. Large-chunk prefill refuses the
+packed residents, because their gemv_vp serves passes of up to 16 tokens (found in ab-20261030T223155Z), and the
+bf16 routers were never measured beside it: the windows behind the large-chunk numbers ran without both. For a
+decode-only server without `..._LCP`, add both (with their card checks).
 
 **On 256 GB of RAM (8x 32 GB DDR4-2666) with a 192 GiB expert cache** (ab-20261030T194..., replies identical): decode **31.2 tok/s** a stream (19.9 with 96 GiB on 128 GB of DDR4-2133; 20.9 with 96 GiB on the new RAM, so the cache size, not the memory speed, is the gain: rank 0's misses fall 2,073 → 361 on the held-out prompts); **38.7 tok/s in all at 4 streams**; prefill 3,086 tokens in 28.1 s (110 tok/s) and 6,817 in 51.7 s (132 tok/s). 192 and 208 GiB measure the same.
 

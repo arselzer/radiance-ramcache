@@ -4,15 +4,19 @@
  *
  * ---- what it does ------------------------------------------------------------------------------
  *
- * Under RADIANCE_EXPERIMENTAL_DS41_P1=1 beside RADIANCE_EXPERIMENTAL_DS41_LCP=<C>, a pure prefill pass
- * of at least ds41p1::kMinArmRows tokens gives no routed expert to the CPU. At each routed layer the
- * file stager (stager.h) learns the layer's counts as it always does, then:
+ * Under RADIANCE_EXPERIMENTAL_DS41_P1=1 beside RADIANCE_EXPERIMENTAL_DS41_LCP=<C>, a routed layer of a
+ * pure prefill pass that runs on at least the threshold's rows (RADIANCE_EXPERIMENTAL_DS41_P1_MIN_ROWS,
+ * 320; ds41p1::card_layer) gives no routed expert to the CPU; a shorter one takes the CPU path exactly
+ * as without the switch. At each such layer the file stager (stager.h) learns the layer's counts as
+ * it always does, then:
  *   - VRAM residents run in the plugin's own three expert ops (gate_up, the clamped SwiGLU, down);
  *   - every touched expert that is not resident is published to those ops with kMarkSkip, so the P1
  *     twin leaves its rows alone (T3);
  *   - each such expert is copied into a slot of a VRAM ring on the card's DMA lane: a RAM-cache unit
- *     straight from its pinned slab slot (borrowed read-only, packed or block form), a drive miss
- *     after it was read into host planes and packed by a packer thread into a pinned ready slot;
+ *     straight from its pinned slab slot (borrowed read-only, packed or block form), a unit the plan
+ *     pinned in the host pool straight from its pool slot (block form; the card would otherwise read
+ *     it across the link once a row pass), a drive miss after it was read into host planes and
+ *     packed by a packer thread into a pinned ready slot;
  *   - right after the layer's down projection was issued, the stager launches the same three ops
  *     again, in waves of a few ring units, each with its own expert table: the wave's units name
  *     their ring slots (kMarkPacked where packed) and every other entry carries kMarkSkip. The same
@@ -74,11 +78,12 @@ struct Tunables {
     int  ready = ds41p1::kDefReady;
     int  ahead = ds41p1::kDefAhead;
     int  verify = 0;
+    int  min_rows = ds41p1::kDefMinRows;
     bool align_end = true;
 };
 /* The tunables from `get` (getenv for the engine): each a whole number in its range (wave 1-16,
- * inflight 1-64, ready 1-32, ahead 0-64, verify 0-4096), align "end" or "start". False with the reason
- * on anything else. */
+ * inflight 1-64, ready 1-32, ahead 0-64, verify 0-4096, min_rows 17-4096), align "end" or "start".
+ * False with the reason on anything else. */
 bool parse_tunables(const std::function<const char*(const char*)>& get, Tunables* t, std::string* why);
 
 /* ---- the scheduling -------------------------------------------------------------------------------- */
@@ -92,7 +97,9 @@ struct Source {
     int64_t     dn_bytes = 0;
     bool        packed = false;
 };
-enum class Kind : uint8_t { Ram = 0, Drive = 1 };
+/* Ram: a RAM-cache lease (let go after its copy); Drive: a pinned ready slot (likewise); Pool: a unit
+ * the plan pinned in the host pool, read in place (nothing to let go). */
+enum class Kind : uint8_t { Ram = 0, Drive = 1, Pool = 2 };
 
 /* The outside world of CardExpertStager. Events are small ids the device hands out. */
 class Device {
@@ -120,7 +127,7 @@ public:
 class CardExpertStager {
 public:
     struct Stats {
-        uint64_t layers = 0, ram = 0, drive = 0, waves = 0, copies = 0, copy_bytes = 0;
+        uint64_t layers = 0, ram = 0, drive = 0, pool = 0, waves = 0, copies = 0, copy_bytes = 0;
         uint64_t drive_waits = 0, ring_full_waits = 0, release_syncs = 0, max_waves = 0;
     };
 
@@ -135,6 +142,9 @@ public:
      * ring allows), then run (every wave). begin_layer refuses while an earlier layer is unfinished. */
     int  begin_layer(int parity);
     int  add_ram(int e, int32_t unit, int rows, const Source& s, int32_t handle);
+    /* A unit pinned in the host pool: copied like a RAM unit, in the same descending-rows order, with
+     * no source to let go. */
+    int  add_pool(int e, int32_t unit, int rows, const Source& s);
     int  add_drive(int e, int32_t unit, int rows);
     /* A drive unit of this layer is packed in a pinned ready slot (`handle`). */
     int  drive_ready(int32_t unit, const Source& s, int32_t handle);
@@ -162,6 +172,7 @@ private:
         Source  src;
         int     slot = -1;
     };
+    int  add_ready(Kind k, int e, int32_t unit, int rows, const Source& s, int32_t handle);
     struct Slot {
         int     copy_ev = -1, free_ev = -1;
         bool    free_rec = false;
@@ -176,7 +187,7 @@ private:
     uint64_t    head_ = 0;             /* units queued since init */
     std::vector<Slot> slot_;
     std::vector<U>    u_;
-    std::vector<int>  ram_order_;      /* RAM units by rows, descending */
+    std::vector<int>  ram_order_;      /* RAM and pool units by rows, descending */
     size_t            ram_next_ = 0;
     std::deque<int>   drive_q_;        /* drive units ready, in landing order */
     std::deque<int>   queued_;         /* copied, not yet launched, oldest first */
@@ -232,6 +243,9 @@ public:
     /* A cached unit, borrowed (touch: with the LRU touch an admitted unit gets): false when the RAM
      * cache does not hold it (the caller adds it as a drive miss then). */
     int  add_ram(int e, int32_t unit, int rows, bool touch, bool* hit);
+    /* A unit the plan pinned in the host pool, from its pool slot as the card's DMA reads it (`src`,
+     * block form; FileStager::p1_pool_source). */
+    int  add_pool(int e, int32_t unit, int rows, const Source& src);
     int  add_drive(int e, int32_t unit, int rows, bool admit);
     int  start();
     /* Layer li + 1's likely misses, read after this layer's demand reads (up to `ahead`). */

@@ -36,6 +36,7 @@ bool parse_tunables(const std::function<const char*(const char*)>& get, Tunables
         { ds41p1::kReadyEnv, 1, 32, &r.ready },
         { ds41p1::kAheadEnv, 0, 64, &r.ahead },
         { ds41p1::kVerifyEnv, 0, 4096, &r.verify },
+        { ds41p1::kMinRowsEnv, ds41p1::kMinArmRows, ds41p1::kTwinMaxRows, &r.min_rows },
     };
     for (const K& k : ks) {
         const char* v = get(k.env);
@@ -106,7 +107,7 @@ int CardExpertStager::begin_layer(int parity) {
     return 0;
 }
 
-int CardExpertStager::add_ram(int e, int32_t unit, int rows, const Source& s, int32_t handle) {
+int CardExpertStager::add_ready(Kind k, int e, int32_t unit, int rows, const Source& s, int32_t handle) {
     if (!open_ || started_ || e < 0 || e >= n_local_ || !s.gu || !s.dn || s.gu_bytes <= 0 ||
         s.dn_bytes <= 0 || s.gu_bytes > ds41p1::kDnOff || s.dn_bytes > ds41p1::kSlotBytes - ds41p1::kDnOff)
         return -1;
@@ -117,12 +118,21 @@ int CardExpertStager::add_ram(int e, int32_t unit, int rows, const Source& s, in
     u.unit = unit;
     u.rows = rows;
     u.handle = handle;
-    u.kind = Kind::Ram;
+    u.kind = k;
     u.st = St::Ready;
     u.src = s;
     u_.push_back(u);
-    ++st_.ram;
+    ++(k == Kind::Pool ? st_.pool : st_.ram);
     return 0;
+}
+
+int CardExpertStager::add_ram(int e, int32_t unit, int rows, const Source& s, int32_t handle) {
+    return add_ready(Kind::Ram, e, unit, rows, s, handle);
+}
+
+int CardExpertStager::add_pool(int e, int32_t unit, int rows, const Source& s) {
+    if (s.packed) return -1;   /* the pool holds the card's block form */
+    return add_ready(Kind::Pool, e, unit, rows, s, -1);
 }
 
 int CardExpertStager::add_drive(int e, int32_t unit, int rows) {
@@ -162,7 +172,7 @@ int CardExpertStager::start() {
     if (!open_ || started_) return -1;
     started_ = true;
     for (size_t i = 0; i < u_.size(); ++i)
-        if (u_[i].kind == Kind::Ram) ram_order_.push_back((int)i);
+        if (u_[i].kind != Kind::Drive) ram_order_.push_back((int)i);
     std::stable_sort(ram_order_.begin(), ram_order_.end(),
                      [&](int a, int b) { return u_[(size_t)a].rows > u_[(size_t)b].rows; });
     ++st_.layers;
@@ -207,7 +217,7 @@ int CardExpertStager::queue_one(int i) {
     if (const int r = let_go(s, true); r < 0) return r;
     const int rc = dev_->copy(s, u.src, sl.free_rec ? sl.free_ev : -1, sl.copy_ev);
     if (rc < 0) return rc;
-    sl.held = true;
+    sl.held = u.kind != Kind::Pool;   /* a pool unit is read in place: nothing to let go */
     sl.kind = u.kind;
     sl.handle = u.handle;
     u.slot = s;
@@ -220,8 +230,8 @@ int CardExpertStager::queue_one(int i) {
 }
 
 /* Copies into the ring as far as it has room: a drive unit first while the pinned ready slots are
- * at least half full (they hold the drive's pipeline), else the RAM units in descending rows, then the
- * drive units in the order they were packed. */
+ * at least half full (they hold the drive's pipeline), else the RAM and pool units in descending rows,
+ * then the drive units in the order they were packed. */
 int CardExpertStager::pump() {
     while ((int)queued_.size() < n_) {
         const bool ram_left = ram_next_ < ram_order_.size();
@@ -333,7 +343,7 @@ int CardExpertStager::end_pass() {
     }
     /* Units of an unfinished layer still holding their sources outside the ring. */
     for (U& u : u_)
-        if (u.st == St::Ready && u.handle >= 0) {
+        if (u.st == St::Ready && u.handle >= 0 && u.kind != Kind::Pool) {
             dev_->release(u.kind, u.handle);
             u.handle = -1;
         }
@@ -485,6 +495,7 @@ int CardExpertPath::wave(int parity, int w, const void* const* gu_tab, const voi
 }
 
 void CardExpertPath::release(Kind k, int32_t handle) {
+    if (k == Kind::Pool) return;   /* read in place */
     if (k == Kind::Ram) {
         if (handle < 0 || (size_t)handle >= hu_.size() || !hu_[(size_t)handle]) return;
         mover_->release_host_unit(hu_[(size_t)handle].get());
@@ -607,6 +618,15 @@ int CardExpertPath::add_ram(int e, int32_t unit, int rows, bool touch, bool* hit
     }
     *hit = true;
     if (touch) ++c_.admitted;
+    return RAD_OK;
+}
+
+int CardExpertPath::add_pool(int e, int32_t unit, int rows, const Source& src) {
+    if (st_.add_pool(e, unit, rows, src) < 0) {
+        RAD_ERR("ds41 p1: routed layer %d's unit %d (expert %d) in the host pool does not fit a ring slot", li_,
+                unit, e);
+        return RAD_E_STATE;
+    }
     return RAD_OK;
 }
 
@@ -929,16 +949,16 @@ void CardExpertPath::packer_loop() {
 std::string CardExpertPath::stats_line(int rank) const {
     const CardExpertStager::Stats& s = st_.stats();
     const double pass_s = (double)c_.pass_ns * 1e-9;
-    char buf[1024];
+    char buf[1536];
     std::snprintf(buf, sizeof buf,
                   "%s %d: %" PRIu64 " chunks, %" PRIu64 " card-path layers; units RAM %" PRIu64 " / drive %" PRIu64
-                  " (read ahead: %" PRIu64 " posted, %" PRIu64 " used, %" PRIu64 " dropped); %" PRIu64
+                  " / host pool %" PRIu64 " (read ahead: %" PRIu64 " posted, %" PRIu64 " used, %" PRIu64 " dropped); %" PRIu64
                   " waves (at most %" PRIu64 " a layer), %" PRIu64 " ring copies, %.2f GB over DMA; drive %" PRIu64
                   " units, %.2f GB, busy %.1f%% of %.2f s in chunks; issuing thread: %.3f s waiting for drive units (%" PRIu64
                   " waits), %" PRIu64 " ring-full waves, %" PRIu64 " release syncs; packer %.2f ms a unit (%" PRIu64
                   " packed, %" PRIu64 " block), %.3f s waiting for ready slots; admitted %" PRIu64 "; leases at pass end %" PRIu64
                   "; verify rows %" PRIu64 ", differ %" PRIu64 " (%" PRIu64 " samples skipped)",
-                  ds41p1::kLogStats, rank, c_.passes, s.layers, s.ram, s.drive, c_.ahead_posted, c_.ahead_used,
+                  ds41p1::kLogStats, rank, c_.passes, s.layers, s.ram, s.drive, s.pool, c_.ahead_posted, c_.ahead_used,
                   c_.ahead_dropped, s.waves, s.max_waves, s.copies, (double)s.copy_bytes * 1e-9, c_.drive_units,
                   (double)c_.drive_bytes * 1e-9, pass_s > 0 ? 100.0 * (double)c_.drive_busy_ns * 1e-9 / pass_s : 0.0,
                   pass_s, (double)c_.wait_drive_ns * 1e-9, s.drive_waits, s.ring_full_waits, s.release_syncs,

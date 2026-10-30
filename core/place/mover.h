@@ -594,6 +594,12 @@ public:
      * leaves the bits free; only a pass whose rows resolve to the P1 twin may see such an entry. */
     void  alias_file_units(const std::vector<int32_t>& units, char* base,
                            std::vector<int32_t>* staged, uintptr_t mark);
+    /* alias_pool_units  the same for units pinned in the host pool, which prefill Phase 1 copies to
+     *                   its ring from their pool slots: every weight published at `base` with `mark`,
+     *                   appended to `staged`; unstage_units publishes them at their pool slots again.
+     *                   A unit not in the pool, or in a slab slot, is left as it is. */
+    void  alias_pool_units(const std::vector<int32_t>& units, char* base, std::vector<int32_t>* staged,
+                           uintptr_t mark);
     /* borrow_host_unit  for a reader on the host (place/host_expert_pool.h): when the mapped RAM
      *                   cache holds every weight of file-tier unit `u`, a lease on each, which
      *                   keeps its bytes in place until release_host_unit, and their host

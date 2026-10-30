@@ -100,20 +100,25 @@
 # the file stager's per-pass-size time lines at exit (an instrument; no change to what runs).
 #
 # P1 (prefill Phase 1, RADIANCE_EXPERIMENTAL_DS41_P1=1; core/place/card_expert_stager.h): with an LcN part,
-# every routed expert row of a pure prefill pass above 16 tokens on the cards (residents in place, RAM-cache
-# units and drive misses through a VRAM ring of the file buffers, waves of a few units); needs BN with N >= 2
-# (the ring: B6, 12 slots, is the measured one) and an M part of 16 or more (the CPU path takes the passes of
-# up to 16 tokens); no Mr part is needed. QwN units a wave (..._P1_WAVE, 2), QiN drive units in flight a
-# rank (..._P1_INFLIGHT, 16), QrN pinned ready slots a rank (..._P1_READY, 6), QaN units read ahead
-# (..._P1_AHEAD, 8; Qa0 off), QvN expert-rows a layer recomputed on the host (..._P1_VERIFY, 0), Qs chunks
-# aligned to the start (..._P1_ALIGN=start; end by default); each needs P1. Every other arm states
-# RADIANCE_EXPERIMENTAL_DS41_P1=0 and the Q knobs empty. A P1 arm is measured only if the server logs
-# "ds41 p1: card experts on" at startup (and a plain arm only without it), and runs only on the libr4d.so
-# (sha256) on which `p1` in DEVICE_CHECKS passed (ds41_mxfp4_device_check TALL_LIBR4D p1 P1_CHECK_M
-# P1_ROUTES on card 0, "p1: PASS" its last line; P1_CHECK_M 4096 by default, P1_ROUTES a p0_tables.py
-# routes file, none by default); an Lc2048 arm needs LCP_CHECK_C=2048 as before. The window log takes each
-# P1 arm's "ds41 p1 stats, rank" and "ds41 p1 chunk:" lines; a P1 arm whose stats lines count a lease held
-# at a pass end, or (Qv) a host-verified expert-row that differs from the card's, is not measured.
+# every routed expert row of a pure prefill pass's routed layer of at least the threshold's rows on the
+# cards (residents in place, RAM-cache units, units pinned in the host pool and drive misses through a VRAM
+# ring of the file buffers, waves of a few units); a shorter layer pass takes the CPU path exactly as an Lc
+# arm without P1 does. Needs BN with N >= 2 (the ring: B6, 12 slots, is the measured one) and an M part of
+# min(N_Lc, threshold - 1) or more (the CPU path takes the layer passes below the threshold: M319 at the
+# default, M16 at Qm17); the arm's Mr part serves those passes. QmN the threshold (..._P1_MIN_ROWS, 17-4096,
+# 320; Qm17 is the card path for every pass above 16 tokens, as before the threshold), QwN units a wave
+# (..._P1_WAVE, 2), QiN drive units in flight a rank (..._P1_INFLIGHT, 16), QrN pinned ready slots a rank
+# (..._P1_READY, 6), QaN units read ahead (..._P1_AHEAD, 8; Qa0 off), QvN expert-rows a layer recomputed on
+# the host (..._P1_VERIFY, 0), Qs chunks aligned to the start (..._P1_ALIGN=start; end by default); each
+# needs P1. Every other arm states RADIANCE_EXPERIMENTAL_DS41_P1=0 and the Q knobs empty. A P1 arm is
+# measured only if the server logs "ds41 p1: card experts on" at startup with its threshold and chunk ("a
+# pure prefill pass's layer of N to C rows") (and a plain arm only without it), and runs only on the
+# libr4d.so (sha256) on which `p1` in DEVICE_CHECKS passed (ds41_mxfp4_device_check TALL_LIBR4D p1
+# P1_CHECK_M P1_ROUTES on card 0, "p1: PASS" its last line; P1_CHECK_M 4096 by default, P1_ROUTES a
+# p0_tables.py routes file, none by default); an Lc2048 arm needs LCP_CHECK_C=2048 as before. The window log
+# takes each P1 arm's "ds41 p1 stats, rank" and "ds41 p1 chunk:" lines; a P1 arm whose stats lines count a
+# lease held at a pass end, or (Qv) a host-verified expert-row that differs from the card's, is not
+# measured.
 #
 # Environment: RADIANCE_BIN (the binary), RADIANCE_HOME_DIR (kernels/ and architectures/ for it),
 # SILU_TABLE (the card's silu table), ARMS (default "base verify greedy"), HX_THREADS (16),
@@ -285,6 +290,12 @@ lcp_check() {   # name
   fi
   if [[ -z "${ARM_P1:-}" && "$p1_lines" != 0 ]]; then
     log "arm $name: no P1 part, but the server runs the card path (the knob set for the window?); not measured"
+    return 1
+  fi
+  # ...and the line states the arm's threshold (QmN, 320 without one) and chunk.
+  if [[ -n "${ARM_P1:-}" ]] &&
+     ! grep -q "ds41 p1: card experts on: every routed expert row of a pure prefill pass's layer of ${ARM_QM:-320} to ${ARM_LC} rows" "$OUT/$name.server.log"; then
+    log "arm $name: P1, but the card path's line does not state layer passes of ${ARM_QM:-320} to ${ARM_LC} rows ($(grep -m1 'ds41 p1: card experts on' "$OUT/$name.server.log")); not measured"
     return 1
   fi
   [[ -n "${ARM_P1:-}" ]] && grep -m2 -E 'ds41 p1: ' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
@@ -1365,7 +1376,7 @@ for a in $ARMS; do
   IFS=- read -r -a parts <<< "$a"
   xt="" bt="" kld="" dk="" db="" pu="" ins_nt="" ins_kib="" ins_wait="" lean="" lc="" ad="" dv="" xd="" hs="" dg="" df="" pmr=""
   mb="" lf=""
-  p1="" q1=()
+  p1="" q1=() qm=""
   pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 HOST_POOL_MIB=4096 EXTRA_ARGS="" ARM_HOME="$RHOME" ARM_CONC=
   ARM_PROMPTS= ARM_N= ARM_LQ= rt=
   power="" skip="" ARGS=() f8="" f8x="" rb="" rbf=0 pred="" cs="" ck="" kh="" pc="" pcopt="" fw="" wp="" wl=""
@@ -1494,14 +1505,15 @@ for a in $ARMS; do
                  lc=$((10#$lc)); ARGS+=(--max-num-batched-tokens "$lc"); env+=(RADIANCE_EXPERIMENTAL_DS41_LCP=$lc)
                else log "arm $a: $p: a chunk is a multiple of 16 in 64..2048; the arm is skipped"; skip=1; fi ;;
       P1)      p1=1 ;;                                                  # prefill Phase 1: card experts in large chunks (needs Lc)
-      Qw[0-9]*|Qi[0-9]*|Qr[0-9]*|Qa[0-9]*|Qv[0-9]*)                   # ...its wave / in flight / ready slots / read-ahead / verify
+      Qw[0-9]*|Qi[0-9]*|Qr[0-9]*|Qa[0-9]*|Qv[0-9]*|Qm[0-9]*)          # ...its wave / in flight / ready slots / read-ahead / verify / threshold
                qn=${p:2}
                case ${p:0:2} in
                  Qw) qk=WAVE qlo=1 qhi=16 ;; Qi) qk=INFLIGHT qlo=1 qhi=64 ;; Qr) qk=READY qlo=1 qhi=32 ;;
-                 Qa) qk=AHEAD qlo=0 qhi=64 ;; *) qk=VERIFY qlo=0 qhi=4096 ;;
+                 Qa) qk=AHEAD qlo=0 qhi=64 ;; Qm) qk=MIN_ROWS qlo=17 qhi=4096 ;; *) qk=VERIFY qlo=0 qhi=4096 ;;
                esac
                if [[ $qn =~ ^[0-9]+$ ]] && (( 10#$qn >= qlo && 10#$qn <= qhi )); then
                  q1+=(RADIANCE_EXPERIMENTAL_DS41_P1_$qk=$((10#$qn)))
+                 [[ $qk == MIN_ROWS ]] && qm=$((10#$qn))
                else log "arm $a: $p: ${p:0:2} takes $qlo-$qhi; the arm is skipped"; skip=1; fi ;;
       Qs)      q1+=(RADIANCE_EXPERIMENTAL_DS41_P1_ALIGN=start) ;;       # ...chunks aligned to the start
       Ad[0-9]*) ad=${p#Ad}; env+=(RADIANCE_EXPERIMENTAL_DS41_LCP_ADMIT=$((10#$ad))) ;;   # admit the last N tokens' units
@@ -1772,9 +1784,12 @@ for a in $ARMS; do
     mm=$(grep -oE ' RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MISSES=[0-9]+' <<< " ${env[*]}" | tail -1 | cut -d= -f2)
     bn=$(grep -oE ' RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS=[0-9]+' <<< " ${env[*]}" | tail -1 | cut -d= -f2)
     if [[ -n "$p1" ]]; then
-      # P1: the ring is the file buffers (B2 or more); the CPU path keeps passes of up to 16 tokens.
+      # P1: the ring is the file buffers (B2 or more); the CPU path takes every layer pass below the threshold
+      # (QmN, 320 without one): its misses up to min(C, N - 1) rows (M16 at Qm17, M319 at the default).
+      qmin=${qm:-320}
+      qcpu=$(( qmin - 1 < lc ? qmin - 1 : lc ))
       (( ${bn:-0} >= 2 )) || { log "arm $a: P1 needs B2 or more (the ring: 2N slots; B6 is the measured one); the arm is skipped"; skip=1; }
-      (( ${mm:-0} >= 16 )) || { log "arm $a: P1 needs M16 or more (the CPU path takes the passes of up to 16 tokens); the arm is skipped"; skip=1; }
+      (( ${mm:-0} >= qcpu )) || { log "arm $a: P1 at the threshold $qmin needs M$qcpu or more (the CPU path takes the layer passes below it, up to $qcpu rows); the arm is skipped"; skip=1; }
     else
       [[ " ${env[*]} " == *" RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS=1 "* ]] ||
         { log "arm $a: Lc needs B1 (the CPU takes every routed unit); the arm is skipped"; skip=1; }
@@ -1804,12 +1819,12 @@ for a in $ARMS; do
     fi
     env+=(RADIANCE_EXPERIMENTAL_DS41_P1=1 RADIANCE_EXPERIMENTAL_DS41_P1_WAVE= RADIANCE_EXPERIMENTAL_DS41_P1_INFLIGHT=
           RADIANCE_EXPERIMENTAL_DS41_P1_READY= RADIANCE_EXPERIMENTAL_DS41_P1_AHEAD= RADIANCE_EXPERIMENTAL_DS41_P1_VERIFY=
-          RADIANCE_EXPERIMENTAL_DS41_P1_ALIGN= "${q1[@]}")
+          RADIANCE_EXPERIMENTAL_DS41_P1_ALIGN= RADIANCE_EXPERIMENTAL_DS41_P1_MIN_ROWS= "${q1[@]}")
   else
     (( ${#q1[@]} )) && { log "arm $a: the Q parts (${q1[*]}) need P1; the arm is skipped"; skip=1; }
     env+=(RADIANCE_EXPERIMENTAL_DS41_P1=0 RADIANCE_EXPERIMENTAL_DS41_P1_WAVE= RADIANCE_EXPERIMENTAL_DS41_P1_INFLIGHT=
           RADIANCE_EXPERIMENTAL_DS41_P1_READY= RADIANCE_EXPERIMENTAL_DS41_P1_AHEAD= RADIANCE_EXPERIMENTAL_DS41_P1_VERIFY=
-          RADIANCE_EXPERIMENTAL_DS41_P1_ALIGN=)
+          RADIANCE_EXPERIMENTAL_DS41_P1_ALIGN= RADIANCE_EXPERIMENTAL_DS41_P1_MIN_ROWS=)
   fi
   [[ -n "$ad" ]] || env+=(RADIANCE_EXPERIMENTAL_DS41_LCP_ADMIT=)
   # Fw / WpN (the CPU pool's wake-up): every arm states both switches, 0 off, so a window's VAR=val
@@ -1849,7 +1864,7 @@ for a in $ARMS; do
     rm -rf "$OUT/kld-$a"
     ARGS=(--max-model-len "${KLD_LEN:-2048}" "${ARGS[@]}" --kld-record "$OUT/kld-$a" --kld-corpus "$OUT/kld-corpus.jsonl")
   fi
-  ARM_XT=$xt ARM_BT=$bt ARM_KLD=$kld ARM_LC=$lc ARM_P1=$p1
+  ARM_XT=$xt ARM_BT=$bt ARM_KLD=$kld ARM_LC=$lc ARM_P1=$p1 ARM_QM=${qm:-320}
   [[ -n "$skip" ]] && continue
   [[ -n "$power" ]] && power_set "$power"
   case $pol in

@@ -11,8 +11,9 @@
  *
  * ---- what Phase 1 does, in one paragraph -------------------------------------------------------
  *
- * Under RADIANCE_EXPERIMENTAL_DS41_P1=1, beside RADIANCE_EXPERIMENTAL_DS41_LCP=<C>, a pure prefill
- * pass taller than 16 tokens no longer gives any routed expert to the CPU. The layer's VRAM
+ * Under RADIANCE_EXPERIMENTAL_DS41_P1=1, beside RADIANCE_EXPERIMENTAL_DS41_LCP=<C>, a routed layer
+ * of a pure prefill pass that runs on at least kMinRowsEnv's rows (320 by default, never 16 or
+ * fewer) no longer gives any routed expert to the CPU. The layer's VRAM
  * residents run in the plugin's own expert ops. Every touched non-resident expert is published to
  * those ops with kMarkSkip, so they leave its rows alone. The stager then copies each such expert
  * into a VRAM ring slot: a RAM-cache unit from its pinned slab slot, a drive miss after it is read
@@ -20,7 +21,8 @@
  * again (gate_up, the clamped SwiGLU, down) with its own expert table, in which the wave's experts
  * name ring slots and every other entry carries kMarkSkip. The plugin's moe_gather then reads every
  * row as it would after a 16-token pass. The CPU's expert path is unchanged for decode and for
- * passes of up to 16 tokens.
+ * every layer pass below the threshold: a P1 pass streams nearly every routed expert of a layer to
+ * the cards whatever its rows, which a short pass does not repay (the crossover is near 300 rows).
  */
 #pragma once
 #include <cstdint>
@@ -83,16 +85,19 @@ constexpr const char* kLcpTwinRow  = "moe_gemm_ggml_mxfp4_gemv_tall";
 constexpr const char* kGemvRow     = "moe_gemm_ggml_mxfp4_gemv";
 constexpr const char* kGemvVpRow   = "moe_gemm_ggml_mxfp4_gemv_vp";
 constexpr int         kTwinMaxRows = 4096;
-/* The smallest pass the card path is armed for: anything shorter runs on the gemv row, which
+/* The smallest pass the card path can be armed for: anything shorter runs on the gemv row, which
  * honours neither mark (T2 holds there only for gemv_vp, T3 nowhere), so the stager never marks a
- * table for it. */
+ * table for it. The threshold (kMinRowsEnv) is at least this. */
 constexpr int         kMinArmRows  = 17;
-/* The same bound a routed layer at a time: under the consumer skip's per-row cut
- * (consumer_row_starts) a layer of an armed pass runs on the pass's rows [row0(L), n) alone, so a
- * deep layer of a prompt's last chunk can run on 16 rows or fewer, on the gemv row again. Such a
- * layer is not the card path's: it takes the CPU path for its non-resident experts, as a pass of
- * its height does, with no mark and no wave. */
-constexpr bool card_layer(int64_t layer_rows) { return layer_rows >= kMinArmRows; }
+/* The same bound a routed layer at a time, with the threshold `min_rows` (kMinRowsEnv): under the
+ * consumer skip's per-row cut (consumer_row_starts) a layer of an armed pass runs on the pass's rows
+ * [row0(L), n) alone, so a deep layer of a prompt's last chunk can run on fewer rows than the
+ * threshold, or on 16 or fewer, on the gemv row again. Such a layer is not the card path's: it takes
+ * the CPU path for its non-resident experts, as a pass of its height does, with no mark and no
+ * wave. */
+constexpr bool card_layer(int64_t layer_rows, int64_t min_rows = kMinArmRows) {
+    return layer_rows >= kMinArmRows && layer_rows >= min_rows;
+}
 
 /* ---- table entry marks --------------------------------------------------------------------------
  *
@@ -136,8 +141,19 @@ constexpr const char* kReadyEnv    = "RADIANCE_EXPERIMENTAL_DS41_P1_READY";     
 constexpr const char* kAheadEnv    = "RADIANCE_EXPERIMENTAL_DS41_P1_AHEAD";     /* next layer's units read ahead a rank (8; 0 off) */
 constexpr const char* kVerifyEnv   = "RADIANCE_EXPERIMENTAL_DS41_P1_VERIFY";    /* expert-rows a layer recomputed on the host (0) */
 constexpr const char* kAlignEnv    = "RADIANCE_EXPERIMENTAL_DS41_P1_ALIGN";     /* "end" (default) or "start" */
-constexpr int kDefWave = 2, kDefInflight = 16, kDefReady = 6, kDefAhead = 8;
+/* The threshold: a routed layer's pass of at least this many rows is the card path's, any shorter
+ * one the CPU path's exactly as without the switch (kMinArmRows to kTwinMaxRows; 320). The CPU path
+ * then takes misses up to min(C, threshold - 1) rows, and never fewer than 16 (cpu_rows). */
+constexpr const char* kMinRowsEnv  = "RADIANCE_EXPERIMENTAL_DS41_P1_MIN_ROWS";
+constexpr int kDefWave = 2, kDefInflight = 16, kDefReady = 6, kDefAhead = 8, kDefMinRows = 320;
 constexpr int kMinRingSlots = 4;
+
+/* The tallest layer pass the CPU path takes under the threshold, at chunk C: every pass or layer
+ * below `min_rows`, and the 16-token passes (kMinArmRows - 1) whatever the threshold. */
+constexpr int64_t cpu_rows(int64_t C, int64_t min_rows) {
+    const int64_t below = (min_rows > kMinArmRows ? min_rows : kMinArmRows) - 1;
+    return C < below ? C : below;
+}
 
 /* End-aligned chunks (kAlignEnv "end"): of a prompt part of P tokens still to compute, in chunks of
  * at most C on a grid of g rows (16), the first chunk takes P - (n - 1) * C rounded up to the grid,

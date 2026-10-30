@@ -465,6 +465,11 @@ set_tests_properties(isa_tools PROPERTIES TIMEOUT ${RAD_TEST_TIMEOUT})
 add_test(NAME ab_window_vp_test COMMAND bash ${CMAKE_SOURCE_DIR}/tools/ds41-host-experts/ab_window_vp_test.sh)
 set_tests_properties(ab_window_vp_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT}
                      ENVIRONMENT "ROCR_VISIBLE_DEVICES=99")
+# ab_window.sh's P1 parts (P1, QmN): the server-log gate on synthetic logs and the arm loop with
+# every action stubbed. No card, no server, no model.
+add_test(NAME ab_window_p1_test COMMAND bash ${CMAKE_SOURCE_DIR}/tools/ds41-host-experts/ab_window_p1_test.sh)
+set_tests_properties(ab_window_p1_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT}
+                     ENVIRONMENT "ROCR_VISIBLE_DEVICES=99")
 
 # ================================================================== libr4d's kernels, on the host
 #

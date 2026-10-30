@@ -896,6 +896,19 @@ void Mover::alias_file_units(const std::vector<int32_t>& units, char* base,
     }
 }
 
+void Mover::alias_pool_units(const std::vector<int32_t>& units, char* base, std::vector<int32_t>* staged,
+                             uintptr_t mark) {
+    if (!plan_ || !base || !staged || ((uintptr_t)base & 63)) return;
+    char* const marked = (char*)((uintptr_t)base | (mark & 63));
+    for (int32_t u : units) {
+        if (u < 0 || (size_t)u >= unit_.size()) continue;
+        const UnitState& us = unit_[(size_t)u];
+        if (us.tier != Tier::HostPinned || us.pool_slot < 0 || us.slab_slot >= 0 || us.klass < 0) continue;
+        for (rad_weight w : plan_->units[(size_t)u].weights) res_.publish(w, marked);
+        staged->push_back(u);
+    }
+}
+
 int Mover::ring_copy(const RadCopySeg* segs, int n, const RadEvent* waits, int n_waits, RadEvent done) {
     if (!mover_ || n < 0 || (n > 0 && !segs) || !done) return RAD_E_INVAL;
     for (int i = 0; i < n_waits; ++i)

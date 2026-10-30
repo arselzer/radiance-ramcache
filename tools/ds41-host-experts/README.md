@@ -946,8 +946,11 @@ for `gemv_avx2_few`, where Zen 3's two multiply and two add pipes allow 0.0625.
 
 Prefill Phase 1 (`RADIANCE_EXPERIMENTAL_DS41_P1=1` beside `RADIANCE_EXPERIMENTAL_DS41_LCP=<C>`; the
 contract with libr4d is `ds41_p1.h`, the plan `PHASE1-PLAN.md` in the review directory, the engine side
-`core/place/card_expert_stager.h`). A pure prefill pass of 17 or more tokens gives no routed expert to
-the CPU:
+`core/place/card_expert_stager.h`). A routed layer of a pure prefill pass that runs on at least the
+threshold's rows (`..._P1_MIN_ROWS`, 320; under the consumer skip a deep layer can run on fewer than its
+pass) gives no routed expert to the CPU; a shorter layer pass takes the CPU path exactly as the adopted
+large-chunk path does (a P1 layer streams nearly every routed expert of the layer to the cards whatever
+its rows, which does not pay below ~300 rows):
 
 - **VRAM residents** run in the plugin's own expert ops (gate_up, the clamped SwiGLU, down).
 - **Every other touched expert** is published to those ops with the skip mark (`kMarkSkip`, bit 1), so
@@ -955,7 +958,9 @@ the CPU:
 - **The ring.** Each such expert is copied, on the card's DMA lane, into a slot of a VRAM ring: the file
   stager's two buffers seen as whole 18,800,640-byte slots (`FILE_BUFFER_UNITS=N` gives 2N slots; B6 is
   12 slots, 215 MiB a card). A RAM-cache unit is copied from its pinned slab slot (borrowed read-only,
-  packed or block form); a drive miss is read into host planes by the kept readers (with the plane
+  packed or block form); a unit the plan pinned in the host pool (a static plan's, `--host-pool-mib`
+  256 leaves three a rank) from its pool slot, published skipped for its layer like the others instead of
+  being read across the link once a row pass; a drive miss is read into host planes by the kept readers (with the plane
   mirror's prefill share), packed by a packer thread a rank into a pinned ready slot in the packed RAM
   cache's form (or block form where the packer refuses it, or without the packed cache), and copied from
   there.
@@ -985,7 +990,8 @@ the CPU:
   6,817 are 688 + 2,048 + 2,048 + 2,033. The interval's snapshots are written where a chunk ends on the
   interval, and the prompt's tail snapshot as before. Start-aligned under `--prefix-resume exact` and with
   `..._P1_ALIGN=start`, with a startup line saying so.
-- **Unchanged.** Decode and every pass of up to 16 tokens run the CPU path as before.
+- **Unchanged.** Decode, every pass of up to 16 tokens and every layer pass below the threshold run the
+  CPU path as before.
 
 Switches (each a whole number; anything else refuses to start): `..._P1_WAVE` (2; 1-16),
 `..._P1_INFLIGHT` (drive units read at once a rank, 16), `..._P1_READY` (pinned ready slots a rank, 6,
@@ -994,27 +1000,35 @@ expert-rows of its RAM-cache units are recomputed by the CPU pool from the cache
 read-only, and compared with the card's down rows; the pass waits for the readback, so it is for exactness
 arms only; drive units are not sampled, their pinned slot being reused by then; the stats line counts rows
 compared and differing, and samples skipped because the unit was evicted since its copy),
-`..._P1_ALIGN` (`end` or `start`).
+`..._P1_ALIGN` (`end` or `start`), `..._P1_MIN_ROWS` (the threshold, 320; 17-4096: 17 is the card path
+for every pass above 16 tokens, as before the threshold).
 
 Refused at startup, with the reason: an invalid switch value; P1 without an admitted LCP chunk, or above
 2048; a routed band of 17 rows or more not on the P1 row (a libr4d with LCP's twin is named as such); a
 band of up to 16 rows not on the gemv or gemv_vp; `FILE_BUFFER_UNITS` unset or below 2 (fewer than 4 ring
-slots); the CPU path not taking the passes of up to 16 tokens (host experts with `..._POLICY=all`,
-`..._MISSES` 16 or more); speculation; `..._FETCH_LIST`; the route trace; the DSpark head tail; a routed
-layer whose gate_up, single `swiglu_clamped` and down cannot be named; a routed unit pinned in the host
-pool; a checkpoint interval below C. Under P1, LCP admits `..._VRAM_PACKED=1` (the P1 row decodes the
-packed form; gemv_vp serves 16 rows or fewer).
+slots); the CPU path not taking the layer passes below the threshold (host experts with `..._POLICY=all`,
+`..._MISSES` of min(C, threshold - 1) or more: 319 at the default, 16 at 17); speculation (so no DSpark
+bank serves beside P1); `..._FETCH_LIST`; the route trace; the DSpark head tail; a routed
+layer whose gate_up, single `swiglu_clamped` and down cannot be named; a routed unit off the card neither on
+the file tier nor pinned in the host pool of a static plan (`--deterministic`) as a block_mxfp4 gate_up and
+down pair; a checkpoint interval below C. Under P1, LCP admits
+`..._VRAM_PACKED=1` (the P1 row decodes the packed form; gemv_vp serves 16 rows or fewer).
 
-Log lines: rank 0's `ds41 p1: card experts on: ...` at startup (ring, tunables); the scheduler's
+Log lines: rank 0's `ds41 p1: card experts on: every routed expert row of a pure prefill pass's layer of
+N to C rows ...` at startup (the threshold, the CPU path's bound, ring, tunables, pooled units); the
+scheduler's
 `ds41 p1: a lone prompt's chunks are aligned to ...`; rank 0's `ds41 p1 chunk: rows R, layers L, wall S s
 (issue), rank 0 drive units D, G GB/s, MemAvailable M MiB` after each card-path chunk; each rank's
 `ds41 p1 stats, rank R: ...` at shutdown (chunks, layers, units RAM / drive, read-ahead posted / used /
 dropped, waves, ring copies and DMA GB, drive units, GB and busy % of the chunks' wall time, the issuing
 thread's waits, the packer's ms a unit, admitted units, leases at pass end (must be 0), touched experts
-split into VRAM residents / slab / ring).
+split into VRAM residents / slab / ring); the large-chunk line names the threshold and the
+CPU path's bound, and each chunk line the layers left below the threshold.
 
-Window parts (`ab_window.sh`): `P1` (needs `LcN`, `B2`..`B8` and `M16` or more; no `Mr` part needed),
-`QwN`, `QiN`, `QrN`, `QaN`, `QvN`, `Qs`; `DEVICE_CHECKS` gains `p1` (`P1_CHECK_M`, 4096, and `P1_ROUTES`),
+Window parts (`ab_window.sh`): `P1` (needs `LcN`, `B2`..`B8` and an `M` part of min(N, threshold - 1)
+or more; the arm's `Mr` part serves the CPU path's passes), `QwN`, `QiN`, `QrN`, `QaN`, `QvN`, `Qs`,
+`QmN` (the threshold); a P1 arm is measured only if the startup line states its threshold and chunk;
+`DEVICE_CHECKS` gains `p1` (`P1_CHECK_M`, 4096, and `P1_ROUTES`),
 and a P1 arm runs only on the libr4d.so its `p1: PASS` was on; `LCP_CHECK_C=2048` for Lc2048 arms. The
 prompt receipts `Up1len` (five documents of ~1K, ~2K, ~5K, ~8K and ~16K tokens, `max_tokens` 16, from
 license texts the long receipts do not use) and `Up1reply` (the ~2K and ~5K ones at 256 tokens) are made
@@ -1024,8 +1038,13 @@ arm logs them.
 Host tests (cards hidden): `p1_stager_test` runs the ring's scheduling on a simulated card (two streams
 in random order, events with record generations, slots that a copy in flight leaves garbage): every
 unit in exactly one wave, RAM units first by rows, table parity by layer, sources let go only after
-their copies, and the ring stress (2 to 12 slots, waves of 1 to 3, 440 random runs of 12 layers); the
-tunables; the end-aligned chunks for every length to 20,000; the admission against the sorted order.
+their copies, and the ring stress (2 to 12 slots, waves of 1 to 3, 440 random runs of 12 layers), also
+with pooled units beside RAM and drive ones (never let go, block form only); the host-pool source (a pooled
+unit's two weights at its pool slot whatever their order; skip marks on and off around a layer); the
+threshold over the end-aligned chunks of every length to 6,000 under the consumer cut (a pass arms only
+from the threshold, a layer is the card path's exactly at its own rows, every other layer within the CPU
+path's bound, decode, mixed, draft and speculative passes never); the tunables; the end-aligned chunks for every length to 20,000; the admission
+against the sorted order.
 `p1_chunk_test` runs `Scheduler::plan_chunk`'s end alignment on the scheduler fakes, with and without a
 checkpoint interval.
 

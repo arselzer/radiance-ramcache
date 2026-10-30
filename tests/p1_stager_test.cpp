@@ -23,6 +23,7 @@
 #include "sched/p1_chunk.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <map>
@@ -56,10 +57,13 @@ struct EpCountsHostProbe {
     static int64_t sorted_max(const FileStager& fs) { return fs.hx_sorted_max(); }
     static bool admits(const FileStager& fs, int32_t e) { return fs.p1_admits(0, e); }
     /* A pass of pass_tok rows over n routed layers (routed layer li is model layer li), cut by row0 (by model
-     * layer; empty: no cut), armed for P1 or not. */
-    static void cut(FileStager& fs, bool armed, int64_t pass_tok, const std::vector<int32_t>& row0, int32_t n) {
+     * layer; empty: no cut), armed for P1 or not, at the threshold min_rows and chunk C. */
+    static void cut(FileStager& fs, bool armed, int64_t pass_tok, const std::vector<int32_t>& row0, int32_t n,
+                    int64_t min_rows = ds41p1::kMinArmRows, int64_t C = 2048) {
         fs.pass_tok_ = pass_tok;
         fs.p1_armed_ = armed;
+        fs.p1_min_rows_ = min_rows;
+        fs.ep_rows_ = C;
         fs.pass_row0_ = row0;
         fs.layers_.assign((size_t)n, StagedLayer{});
         for (int32_t li = 0; li < n; ++li) fs.layers_[(size_t)li].layer = li;
@@ -67,7 +71,20 @@ struct EpCountsHostProbe {
     static int64_t rows(const FileStager& fs, int32_t li) { return fs.layer_rows(li); }
     static bool card(const FileStager& fs, int32_t li) { return fs.p1_layer_on(li); }
     static int64_t miss_need(const FileStager& fs, int32_t li) { return fs.hx_miss_need(li); }
+    static int64_t cpu_rows(const FileStager& fs) { return fs.p1_cpu_rows(); }
     static void disarm(FileStager& fs) { fs.p1_armed_ = false; fs.layers_.clear(); fs.pass_row0_.clear(); }
+    /* The host-pool source (FileStager::p1_pool_source) over a mover and its plan. */
+    static void bind(FileStager& fs, Mover* m, const Plan* plan, const Program* prog) {
+        fs.mover_ = m;
+        fs.plan_ = plan;
+        fs.ep_program_ = prog;
+    }
+    static bool pool_source(const FileStager& fs, int32_t u, p1::Source* out) { return fs.p1_pool_source(u, out); }
+    static void unbind(FileStager& fs) {
+        fs.mover_ = nullptr;
+        fs.plan_ = nullptr;
+        fs.ep_program_ = nullptr;
+    }
 };
 
 }  // namespace rad
@@ -292,8 +309,8 @@ struct Sim final : Device {
     }
 };
 
-/* One routed layer's units on the ring: (expert, rows, drive?, packed?). */
-struct LUnit { int e, rows; bool drive, packed; };
+/* One routed layer's units on the ring: (expert, rows, drive?, packed?, pinned in the host pool?). */
+struct LUnit { int e, rows; bool drive, packed, pool = false; };
 
 /* Runs a layer: adds every unit (unique unit ids from `*uid`), start, run. */
 int run_layer(Sim& sim, CardExpertStager& st, int layer, const std::vector<LUnit>& us, int* uid) {
@@ -307,6 +324,9 @@ int run_layer(Sim& sim, CardExpertStager& st, int layer, const std::vector<LUnit
             sim.drive_pending.push_back({ u, x.e });
             sim.drive_packed_form[u] = x.packed;
             if (st.add_drive(x.e, u, x.rows) < 0) return -1;
+        } else if (x.pool) {
+            Source s{ src_gu(u), ds41p1::kDnOff, src_dn(u), 6266880, false };
+            if (st.add_pool(x.e, u, x.rows, s) < 0) return -1;
         } else {
             const int h = sim.next_handle++;
             sim.handle_unit[{ (int)Kind::Ram, h }] = u;
@@ -369,6 +389,25 @@ TEST(p1_tunables_take_whole_numbers_in_range_and_end_or_start) {
     env[ds41p1::kAlignEnv] = "middle";
     CHECK(!parse_tunables(get, &t, &why));
     CHECK(why.find("end or start") != std::string::npos);
+    /* The threshold: 320 unset or empty, 17 to 4096 (the gemv rows below, the twin's bound above). */
+    env.erase(ds41p1::kAlignEnv);
+    CHECK(parse_tunables(get, &t, &why));
+    CHECK_EQ(t.min_rows, 320);
+    CHECK_EQ(t.min_rows, ds41p1::kDefMinRows);
+    env[ds41p1::kMinRowsEnv] = "";
+    CHECK(parse_tunables(get, &t, &why));
+    CHECK_EQ(t.min_rows, 320);
+    for (const char* ok : { "17", "320", "1024", "4096" }) {
+        env[ds41p1::kMinRowsEnv] = ok;
+        CHECK(parse_tunables(get, &t, &why));
+        CHECK_EQ(t.min_rows, std::atoi(ok));
+    }
+    for (const char* bad : { "16", "0", "4097", "320x", "-320", " 320" }) {
+        env[ds41p1::kMinRowsEnv] = bad;
+        CHECK(!parse_tunables(get, &t, &why));
+        CHECK(why.find(ds41p1::kMinRowsEnv) != std::string::npos);
+        CHECK(why.find("17 to 4096") != std::string::npos);
+    }
 }
 
 /* ---- end-aligned chunks ---------------------------------------------------------------------------- */
@@ -601,6 +640,321 @@ TEST(p1_ring_stress_two_slots_waves_of_one_random_completion) {
     CHECK_EQ(runs, (2 + 3 + 3 + 3) * 40);
 }
 
+/* ---- units the plan pinned in the host pool ---------------------------------------------------------------
+ *
+ * A pooled unit goes to the ring as a RAM-cache unit does (in the same descending-rows order, before the drive's),
+ * but from its pool slot, read in place: its slot holds no source, nothing is let go for it (the simulated card
+ * flags any release of an unknown source), and a packed form is refused (the pool holds the card's block form). */
+TEST(p1_pool_units_are_copied_with_the_ram_units_and_never_let_go) {
+    Sim sim(31, 12);
+    CardExpertStager st;
+    std::string why;
+    sim.st = &st;
+    REQUIRE_EQ(st.init(&sim, g_ring, 12, 2, 96, g_alias, 32, &why), 0);
+    sim.lag = 0;
+    REQUIRE_EQ(st.begin_layer(0), 0);
+    sim.layer = 0;
+    /* RAM unit 1 (rows 40), pool unit 2 (rows 600), drive unit 3 (rows 900), pool unit 4 (rows 5), RAM unit 5
+     * (rows 300). */
+    const int ram_h1 = sim.next_handle++, ram_h5 = sim.next_handle++;
+    sim.handle_unit[{ (int)Kind::Ram, ram_h1 }] = 1;
+    sim.handle_unit[{ (int)Kind::Ram, ram_h5 }] = 5;
+    auto block = [](int u) { return Source{ src_gu(u), ds41p1::kDnOff, src_dn(u), 6266880, false }; };
+    sim.expect[10] = { 1, false };
+    sim.expect[11] = { 2, false };
+    sim.expect[12] = { 3, false };
+    sim.expect[13] = { 4, false };
+    sim.expect[14] = { 5, false };
+    REQUIRE_EQ(st.add_ram(10, 1, 40, block(1), ram_h1), 0);
+    REQUIRE_EQ(st.add_pool(11, 2, 600, block(2)), 0);
+    sim.drive_pending.push_back({ 3, 12 });
+    sim.drive_packed_form[3] = false;
+    REQUIRE_EQ(st.add_drive(12, 3, 900), 0);
+    REQUIRE_EQ(st.add_pool(13, 4, 5, block(4)), 0);
+    REQUIRE_EQ(st.add_ram(14, 5, 300, block(5), ram_h5), 0);
+    Source packed{ src_gu(6), 11999296, src_dn(6), 6001984, true };
+    CHECK(st.add_pool(15, 6, 7, packed) < 0);    /* not the pool's form */
+    CHECK(st.add_pool(10, 7, 7, block(7)) < 0);  /* one unit an expert, whatever its kind */
+    REQUIRE_EQ(st.start(), 0);
+    REQUIRE_EQ(st.run(), 0);
+    REQUIRE_EQ(st.end_pass(), 0);
+    sim.drain();
+    REQUIRE(sim.copy_order.size() == (size_t)5);
+    CHECK_EQ(sim.copy_order[0], 2);   /* 600 rows */
+    CHECK_EQ(sim.copy_order[1], 5);   /* 300 */
+    CHECK_EQ(sim.copy_order[2], 1);   /* 40 */
+    CHECK_EQ(sim.copy_order[3], 4);   /* 5 */
+    CHECK_EQ(sim.copy_order[4], 3);   /* the drive's, once packed */
+    for (int e = 10; e <= 14; ++e) CHECK_EQ(sim.computed[std::make_pair(0, e)], 1);
+    CHECK_EQ(sim.violations, 0);
+    if (sim.violations) std::fprintf(stderr, "%s\n", sim.first.c_str());
+    CHECK_EQ(st.held(), 0);
+    CHECK_EQ(st.stats().pool, (uint64_t)2);
+    CHECK_EQ(st.stats().ram, (uint64_t)2);
+    CHECK_EQ(st.stats().drive, (uint64_t)1);
+    /* Released: the two RAM leases and the drive's ready slot, never a pool unit. */
+    CHECK_EQ(sim.released.size(), (size_t)3);
+    for (const auto& r : sim.released) CHECK(r.first != (int)Kind::Pool);
+}
+
+/* The host-pool source: a pooled unit's gate_up and down where the card's DMA reads them (its pool slot at each
+ * weight's offset in the unit, told apart by their block sizes whatever their order), block form; none for a
+ * VRAM resident or a weight not in the card's block_mxfp4. Mover::alias_pool_units publishes the pooled ones
+ * skipped (the mark on the alias base) and leaves the rest; unstage_units publishes them at their pool slots
+ * again, as the file stager's release of the layer does. */
+TEST(p1_pool_source_reads_a_pooled_unit_in_place_and_its_skip_mark_comes_off_at_release) {
+    const int64_t gu = ds41p1::kGuBlockBytes, dn = ds41p1::kDnBlockBytes;
+    Program prog;
+    prog.weights.resize(1);
+    auto weight = [&](const std::string& name, int64_t bytes, int32_t e) {
+        WeightInfo w;
+        w.name = name;
+        w.decl.dtype = RAD_U8;
+        w.decl.rank = 1;
+        w.decl.shape[0] = bytes;
+        w.decl.access = RAD_ACCESS_CONDITIONAL;
+        w.decl.shard = RAD_SHARD_NONE;
+        w.decl.group.layer = 7;
+        w.decl.group.expert = e;
+        w.logical_bytes = w.stored_bytes = bytes;
+        w.align = RAD_ALIGN_UNIT;
+        w.layout_tag = "ggml_mxfp4";
+        prog.weights.push_back(w);
+        return (rad_weight)(prog.weights.size() - 1);
+    };
+    Plan plan;
+    plan.rank = 0;
+    plan.world_size = 1;
+    plan.dynamic = false;
+    SlabClass sc;
+    sc.name = "expert";
+    sc.stride = ds41p1::kSlotBytes;
+    sc.n_units = 3;
+    plan.classes.push_back(sc);
+    /* Unit 0 pinned (gate_up first), unit 1 a static VRAM resident, unit 2 pinned with down first. */
+    for (int e = 0; e < 3; ++e) {
+        MoveUnit mu;
+        mu.layer = 7;
+        mu.expert = e;
+        mu.slab_class = 0;
+        mu.bytes = mu.slot_bytes = ds41p1::kSlotBytes;
+        mu.access = RAD_ACCESS_CONDITIONAL;
+        mu.tier = e == 1 ? Tier::VRAM : Tier::HostPinned;
+        mu.site = e == 1 ? Site::Device : Site::DeviceZeroCopy;
+        const std::string b = "blk.7.ffn_" + std::to_string(e);
+        if (e < 2) {
+            mu.weights = { weight(b + "_gate_up", gu, e), weight(b + "_down", dn, e) };
+            mu.offset = { 0, gu };
+        } else {
+            mu.weights = { weight(b + "_down", dn, e), weight(b + "_gate_up", gu, e) };
+            mu.offset = { 0, dn };
+        }
+        plan.units.push_back(mu);
+    }
+    plan.unit_of_weight.assign(prog.weights.size(), -1);
+    for (size_t u = 0; u < plan.units.size(); ++u)
+        for (rad_weight w : plan.units[u].weights) plan.unit_of_weight[w] = (int32_t)u;
+    Mover m;
+    MoverConfig mc;
+    REQUIRE_EQ(m.init(prog, plan, mc), RAD_OK);
+    FileStager fs;
+    EpCountsHostProbe::bind(fs, &m, &plan, &prog);
+    p1::Source src;
+    REQUIRE(EpCountsHostProbe::pool_source(fs, 0, &src));
+    const char* b0 = (const char*)m.unit_base(0);
+    REQUIRE(b0 != nullptr);
+    CHECK(src.gu == b0);
+    CHECK_EQ(src.gu_bytes, gu);
+    CHECK(src.dn == b0 + gu);
+    CHECK_EQ(src.dn_bytes, dn);
+    CHECK(!src.packed);
+    REQUIRE(EpCountsHostProbe::pool_source(fs, 2, &src));
+    const char* b2 = (const char*)m.unit_base(2);
+    CHECK(src.gu == b2 + dn);   /* the gate_up is the unit's second weight */
+    CHECK_EQ(src.gu_bytes, gu);
+    CHECK(src.dn == b2);
+    CHECK_EQ(src.dn_bytes, dn);
+    CHECK(b2 != b0);
+    CHECK(!EpCountsHostProbe::pool_source(fs, 1, &src));    /* a VRAM resident is read in place */
+    CHECK(!EpCountsHostProbe::pool_source(fs, 3, &src));    /* no such unit */
+    prog.weights[plan.units[2].weights[0]].layout_tag = "ggml_mxfp4_packed";
+    CHECK(!EpCountsHostProbe::pool_source(fs, 2, &src));    /* not the card's block form */
+    prog.weights[plan.units[2].weights[0]].layout_tag = "ggml_mxfp4";
+    /* Published skipped for the layer, then at the pool slots again. */
+    ResidencyTable* rt = m.residency();
+    const char* res1 = (const char*)rt->lookup(plan.units[1].weights[0])->ptr;
+    REQUIRE(res1 != nullptr);
+    alignas(64) static char alias[64];
+    std::vector<int32_t> staged;
+    m.alias_pool_units({ 0, 1, 2 }, alias, &staged, ds41p1::kMarkSkip);
+    REQUIRE(staged.size() == (size_t)2);
+    CHECK_EQ(staged[0], 0);
+    CHECK_EQ(staged[1], 2);
+    for (int32_t u : { 0, 2 })
+        for (rad_weight w : plan.units[(size_t)u].weights) {
+            const void* p = rt->lookup(w)->ptr;
+            CHECK(ds41p1::is_skip(p));
+            CHECK(!ds41p1::is_packed(p));
+            CHECK(ds41p1::unmark(p) == (const void*)alias);
+        }
+    CHECK((const char*)rt->lookup(plan.units[1].weights[0])->ptr == res1);   /* the resident left as it was */
+    m.unstage_units(staged);
+    for (int32_t u : { 0, 2 }) {
+        const char* base = (const char*)m.unit_base(u);
+        for (size_t k = 0; k < 2; ++k)
+            CHECK((const char*)rt->lookup(plan.units[(size_t)u].weights[k])->ptr == base + plan.units[(size_t)u].offset[k]);
+    }
+    /* A misaligned alias base marks nothing. */
+    staged.clear();
+    m.alias_pool_units({ 0 }, alias + 8, &staged, ds41p1::kMarkSkip);
+    CHECK(staged.empty());
+    CHECK((const char*)rt->lookup(plan.units[0].weights[0])->ptr == b0);
+    EpCountsHostProbe::unbind(fs);
+}
+
+TEST(p1_ring_stress_with_pool_units_beside_ram_and_drive_units) {
+    int runs = 0;
+    for (int n_slots : { 2, 4, 12 })
+        for (unsigned seed = 1; seed <= 30; ++seed) {
+            Sim sim(seed * 104729u + (unsigned)n_slots, n_slots);
+            sim.lag = 1 + (int)(seed % 5);
+            sim.max_hand = 1 + (int)(seed % 3);
+            CardExpertStager st;
+            std::string why;
+            sim.st = &st;
+            const int ready = 1 + (int)(seed % 6);
+            sim.ready_cap = ready;
+            REQUIRE_EQ(st.init(&sim, g_ring, n_slots, 1 + (int)(seed % std::min(3, n_slots)), 96, g_alias, ready, &why), 0);
+            std::mt19937 rng(seed);
+            int uid = 1;
+            for (int layer = 0; layer < 6; ++layer) {
+                auto us = random_layer(rng, (int)(rng() % 40), (int)(rng() % 60), 40);
+                for (LUnit& x : us)
+                    if (!x.drive && (int)(rng() % 100) < 25) { x.pool = true; x.packed = false; }
+                REQUIRE_EQ(run_layer(sim, st, layer, us, &uid), 0);
+            }
+            REQUIRE_EQ(st.end_pass(), 0);
+            REQUIRE_EQ(st.held(), 0);
+            sim.drain();
+            if (sim.violations) {
+                CHECK_EQ(sim.violations, 0);
+                std::fprintf(stderr, "slots %d seed %u: %s\n", n_slots, seed, sim.first.c_str());
+                return;
+            }
+            for (const auto& kv : sim.computed)
+                if (kv.second != 1) {
+                    CHECK_EQ(kv.second, 1);
+                    return;
+                }
+            CHECK_EQ(sim.released.size(), sim.handle_unit.size());
+            ++runs;
+        }
+    CHECK_EQ(runs, 3 * 30);
+}
+
+/* ---- the threshold (..._P1_MIN_ROWS) ------------------------------------------------------------------------
+ *
+ * A routed layer's pass of at least the threshold's rows is the card path's; any shorter one, in an armed pass or
+ * not, takes the CPU path exactly as without the switch, and the CPU path's miss bound (..._MISSES >= cpu_rows)
+ * must then cover it. Over the end-aligned chunks of every prompt length to 6,000 at C = 1024 and 2048, under the
+ * consumer cut, at thresholds 17 .. 4096: a pass arms only as a pure prefill pass of the threshold's rows or more;
+ * an armed layer is the card path's exactly when its own rows reach the threshold (and 17); every layer the card
+ * path does not take needs no more than cpu_rows(C, threshold) rows of the CPU path; a decode, mixed, draft or
+ * speculative pass never arms. */
+TEST(p1_threshold_arms_long_layer_passes_and_leaves_the_rest_to_the_cpu_path) {
+    /* The CPU path's bound: everything below the threshold, at most the chunk, never fewer than 16 rows. */
+    CHECK_EQ(ds41p1::cpu_rows(1024, 320), (int64_t)319);
+    CHECK_EQ(ds41p1::cpu_rows(1024, 17), (int64_t)16);
+    CHECK_EQ(ds41p1::cpu_rows(1024, 1), (int64_t)16);
+    CHECK_EQ(ds41p1::cpu_rows(256, 320), (int64_t)256);
+    CHECK_EQ(ds41p1::cpu_rows(2048, 4096), (int64_t)2048);
+    CHECK_EQ(ds41p1::cpu_rows(2048, 1024), (int64_t)1023);
+    for (int64_t r = 0; r <= 5000; ++r)
+        for (int64_t m : { 17, 64, 320, 1024, 4096 }) {
+            CHECK_EQ(ds41p1::card_layer(r, m), r >= 17 && r >= m);
+            if (r >= 17 && r < m) CHECK(r <= ds41p1::cpu_rows(4096, m));
+        }
+    CHECK(!ds41p1::card_layer(16));
+    CHECK(ds41p1::card_layer(17));
+    /* Which passes arm. */
+    RadBatch b{};
+    b.phase = RAD_PHASE_PREFILL;
+    for (int64_t n : { 1, 16, 17, 100, 319, 320, 321, 1024, 1025 }) {
+        b.n_tok = n;
+        CHECK_EQ(FileStager::p1_pass_arms(b, 320, 1024), n >= 320 && n <= 1024);
+        CHECK_EQ(FileStager::p1_pass_arms(b, 17, 1024), n >= 17 && n <= 1024);
+    }
+    b.n_tok = 600;
+    CHECK(FileStager::p1_pass_arms(b, 320, 1024));
+    RadBatch mixed = b;
+    mixed.n_tok_decode = 3;
+    RadBatch decode = b;
+    decode.phase = RAD_PHASE_DECODE;
+    RadBatch draft = b;
+    draft.draft_pass = -1;
+    RadBatch spec = b;
+    spec.n_spec = 5;
+    for (const RadBatch* x : { &mixed, &decode, &draft, &spec }) CHECK(!FileStager::p1_pass_arms(*x, 320, 1024));
+
+    const ConsumerShape c16{ 43, 20, 128, 16, 16 };
+    FileStager fs;
+    std::vector<int64_t> f((size_t)c16.n_layer);
+    std::vector<int32_t> row0((size_t)c16.n_layer);
+    for (int64_t C : { 1024, 2048 })
+        for (int64_t thr : { 17, 64, 320, 1024, 2048, 4096 }) {
+            int64_t card = 0, cpu = 0, armed_passes = 0, cpu_in_armed = 0, passes = 0;
+            int64_t short_prompt_armed = 0;
+            for (int64_t P = 1; P <= 6000; P += (P < 400 ? 1 : 13)) {
+                REQUIRE(consumer_thresholds(c16, P, f.data()));
+                for (int64_t s = 0, e = ds41p1::first_chunk_end_aligned(P, C, 16); s < P; s = e, e = std::min(P, e + C)) {
+                    const int64_t n = e - s;
+                    REQUIRE(consumer_row_starts(c16, f.data(), s, e, row0.data()));
+                    b = RadBatch{};
+                    b.phase = RAD_PHASE_PREFILL;
+                    b.n_tok = n;
+                    const bool armed = FileStager::p1_pass_arms(b, thr, C);
+                    CHECK_EQ(armed, n >= std::max<int64_t>(thr, 17) && n <= C);
+                    if (armed && P < thr) ++short_prompt_armed;
+                    EpCountsHostProbe::cut(fs, armed, n, row0, c16.n_layer, thr, C);
+                    CHECK_EQ(EpCountsHostProbe::cpu_rows(fs), ds41p1::cpu_rows(C, thr));
+                    ++passes;
+                    armed_passes += armed;
+                    for (int32_t li = 0; li < c16.n_layer; ++li) {
+                        const int64_t r = EpCountsHostProbe::rows(fs, li);
+                        const bool want = armed && r >= thr && r >= 17;
+                        CHECK_EQ(EpCountsHostProbe::card(fs, li), want);
+                        if (want) { ++card; continue; }
+                        /* Not the card path's: the CPU path must take it at ..._MISSES = cpu_rows (a layer with no
+                         * row of its own needs none). */
+                        ++cpu;
+                        cpu_in_armed += armed && r > 0;
+                        const int64_t need = EpCountsHostProbe::miss_need(fs, li);
+                        if (r > 0 && need > ds41p1::cpu_rows(C, thr)) {
+                            CHECK(need <= ds41p1::cpu_rows(C, thr));
+                            std::fprintf(stderr, "C %lld thr %lld P %lld chunk [%lld, %lld) layer %d: %lld rows for the CPU path\n",
+                                         (long long)C, (long long)thr, (long long)P, (long long)s, (long long)e, (int)li,
+                                         (long long)need);
+                            return;
+                        }
+                    }
+                }
+            }
+            CHECK_EQ(short_prompt_armed, (int64_t)0);   /* a prompt below the threshold never arms */
+            if (thr <= C) {
+                CHECK(armed_passes > 0);
+                CHECK(card > 0);
+            } else {
+                CHECK_EQ(armed_passes, (int64_t)0);    /* a threshold above the chunk: never the card path */
+                CHECK_EQ(card, (int64_t)0);
+            }
+            if (thr == 320) CHECK(cpu_in_armed > 0);    /* the cut leaves deep layers of armed passes on the CPU */
+            std::printf("  C %lld threshold %lld: %lld passes, %lld armed; %lld layer passes on the card path, %lld on the "
+                        "CPU path (%lld of them in armed passes)\n", (long long)C, (long long)thr, (long long)passes,
+                        (long long)armed_passes, (long long)card, (long long)cpu, (long long)cpu_in_armed);
+        }
+    EpCountsHostProbe::disarm(fs);
+}
+
 /* ---- the admission predicate --------------------------------------------------------------------------- */
 TEST(p1_admission_follows_the_sorted_order_past_the_admission_row) {
     const int64_t C = 256, T = C * 6;
@@ -644,6 +998,7 @@ TEST(p1_admission_follows_the_sorted_order_past_the_admission_row) {
 
 /* ---- a layer the per-row cut leaves short ------------------------------------------------------------------
  *
+ * At the threshold 17 (..._P1_MIN_ROWS=17, the card path's bound before the threshold existed).
  * Under the consumer skip's per-row cut a routed layer of an armed pass runs on its rows [row0(L), n) alone, so a deep
  * layer of a prompt's last chunk can be left with 16 rows or fewer, which the plugin serves on the gemv rows (no skip
  * mark honoured). The card path is decided a layer at a time: such a layer takes the CPU path as a 16-row pass does
@@ -665,7 +1020,7 @@ TEST(p1_card_path_is_decided_per_layer_under_the_per_row_cut) {
                 const int64_t n = e - s;
                 REQUIRE(consumer_row_starts(c16, f.data(), s, e, row0.data()));
                 const bool armed = n >= ds41p1::kMinArmRows && n <= C;
-                EpCountsHostProbe::cut(fs, armed, n, row0, c16.n_layer);
+                EpCountsHostProbe::cut(fs, armed, n, row0, c16.n_layer, ds41p1::kMinArmRows, C);
                 ++chunks;
                 bool seen_card = false;
                 for (int32_t li = 0; li < c16.n_layer; ++li) {
@@ -690,7 +1045,7 @@ TEST(p1_card_path_is_decided_per_layer_under_the_per_row_cut) {
     CHECK(card_layers > 1000);
     CHECK(short_after_card);   /* the armed passes where card-path layers precede the short ones */
     /* Without the cut, an armed pass's every layer is the card path's. */
-    EpCountsHostProbe::cut(fs, true, 2048, {}, c16.n_layer);
+    EpCountsHostProbe::cut(fs, true, 2048, {}, c16.n_layer, ds41p1::kMinArmRows, 2048);
     for (int32_t li = 0; li < c16.n_layer; ++li) {
         CHECK(EpCountsHostProbe::card(fs, li));
         CHECK_EQ(EpCountsHostProbe::miss_need(fs, li), 2048);

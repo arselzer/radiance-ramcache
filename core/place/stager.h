@@ -522,6 +522,14 @@ public:
      * p1_on: this rank took it (p1_init); p1_stats_line: kLogStats's line for the shutdown. */
     bool p1_on() const { return p1_ && p1_->on(); }
     std::string p1_stats_line() const;
+    /* Whether pass `b` is armed for the card path at the threshold `min_rows` (..._P1_MIN_ROWS): a pure
+     * prefill pass (no decode row, no draft or speculation) of at least min_rows and at most
+     * `max_rows` (the chunk) tokens. Its routed layers then each take the card path or the CPU path by
+     * their own rows (ds41p1::card_layer); any other pass runs as without the switch. */
+    static bool p1_pass_arms(const RadBatch& b, int64_t min_rows, int64_t max_rows) {
+        return b.phase == RAD_PHASE_PREFILL && b.n_tok_decode == 0 && b.draft_pass == 0 && b.n_spec == 0 &&
+               b.n_tok >= ds41p1::kMinArmRows && b.n_tok >= min_rows && b.n_tok <= max_rows;
+    }
     //Must run before Ctx::shutdown and before Mover/bank/buffer owners disappear.
     int shutdown_head_cache();
 
@@ -599,15 +607,18 @@ private:
     void lcp_report() const;
     /* ---- prefill Phase 1 (card_expert_stager.h) -------------------------------------------------
      *
-     * Under RADIANCE_EXPERIMENTAL_DS41_P1=1 (p1_state_ 1, read at lcp_init), lcp_init admits the P1
-     * twin above 16 rows (ds41p1::kTwinRow, refusing LCP's own twin) and the packed residents' gemv_vp
-     * at 16 or fewer; hx_init needs the CPU to take only passes of up to 16 tokens; p1_init then
-     * checks the rest (every routed layer's three expert ops found, no pooled routed unit, the ring,
-     * the tunables) and starts the path. An armed pass (p1_armed_: a pure prefill pass of at least
-     * ds41p1::kMinArmRows tokens) hands each routed layer to the path at start_ep_routed (p1_layer),
-     * captures the layer's three launches (launched) and runs its waves behind its down projection
-     * (after_op). */
+     * Under RADIANCE_EXPERIMENTAL_DS41_P1=1 (p1_state_ 1, read at lcp_init with the threshold
+     * p1_min_rows_), lcp_init admits the P1 twin above 16 rows (ds41p1::kTwinRow, refusing LCP's own
+     * twin) and the packed residents' gemv_vp at 16 or fewer; hx_init needs the CPU to take every layer
+     * pass below the threshold (p1_cpu_rows); p1_init then checks the rest (every routed layer's three
+     * expert ops found, the routed units off the card in the container or the host pool, the ring, the
+     * tunables) and starts the path. An armed pass (p1_armed_, p1_pass_arms) hands each routed layer
+     * of at least the threshold's rows to the path at start_ep_routed (p1_layer), captures the layer's
+     * three launches (launched) and runs its waves behind its down projection (after_op). */
     int  p1_state_ = 0;
+    int64_t p1_min_rows_ = ds41p1::kDefMinRows;   /* ..._P1_MIN_ROWS as lcp_init read it */
+    /* The rows the CPU path takes under P1: every layer pass below the threshold (ds41p1::cpu_rows). */
+    int64_t p1_cpu_rows() const { return ds41p1::cpu_rows(ep_rows_, p1_min_rows_); }
     std::unique_ptr<p1::CardExpertPath> p1_;
     bool p1_armed_ = false;
     int32_t p1_li_ = -1;                 /* the layer the path holds this pass, or -1 */
@@ -616,21 +627,30 @@ private:
     std::vector<P1Ops> p1_ops_;          /* by routed layer */
     RadEvent p1_end_ = nullptr;          /* behind an armed pass's last reader of the ring */
     std::vector<int32_t> p1_nonres_, p1_ahead_;
+    /* By routed layer: its routed units the plan pinned in the host pool, which the card would read
+     * across the link once a row pass; an armed layer copies the selected ones to the ring as it does
+     * a RAM-cache unit (p1_layer). p1_pool_sel_: this layer's selected ones, published skipped. */
+    std::vector<std::vector<int32_t>> p1_pool_;
+    std::vector<int32_t> p1_pool_sel_;
+    int  p1_pool_units_ = 0;
+    /* A pooled unit's two weights where the card's DMA reads them (its pool slot), block form; false
+     * when it has no pool address or is not a gate_up and down pair. */
+    bool p1_pool_source(int32_t u, p1::Source* out) const;
     bool p1_order_ = false;              /* this layer's sorted order fetched for the admission */
     int64_t p1_pass_rows_ = 0;
     std::chrono::steady_clock::time_point p1_t0_{};
     uint64_t p1_touched_ = 0, p1_slab_ = 0, p1_order_moved_ = 0, p1_layers_ = 0;
     int  p1_init(const Program& prog);
     /* Whether routed layer li of this pass is the card path's: an armed pass, and the layer's own rows
-     * (layer_rows: under the per-row cut a deep layer can run on 16 or fewer) at least
-     * ds41p1::kMinArmRows (ds41p1::card_layer). Any other layer of an armed pass takes the CPU path for
+     * (layer_rows: under the per-row cut a deep layer can run on fewer) at least the threshold and
+     * never 16 or fewer (ds41p1::card_layer). Any other layer of an armed pass takes the CPU path for
      * its non-resident experts as a pass of its height does: plain aliases, no mark, no wave. */
-    bool p1_layer_on(int32_t li) const { return p1_armed_ && ds41p1::card_layer(layer_rows(li)); }
+    bool p1_layer_on(int32_t li) const { return p1_armed_ && ds41p1::card_layer(layer_rows(li), p1_min_rows_); }
     /* The rows the CPU path's miss bound (..._MISSES, hx_miss_rows_) is held to: the pass's, or in an
-     * armed pass the layer's own (a layer the card path does not take, of 16 rows or fewer, beside
-     * ..._MISSES=16). */
+     * armed pass the layer's own (a layer the card path does not take, below the threshold, beside
+     * ..._MISSES of at least p1_cpu_rows). */
     int64_t hx_miss_need(int32_t li) const { return p1_armed_ ? layer_rows(li) : pass_tok_; }
-    uint64_t p1_cpu_layers_ = 0;         /* this armed pass's routed layers on the CPU path (16 rows or fewer) */
+    uint64_t p1_cpu_layers_ = 0;         /* this armed pass's routed layers on the CPU path (below the threshold) */
     int  p1_layer(int32_t li, RadStream s);
     bool p1_admits(int32_t li, int32_t e) const;
     /* ..._P1_VERIFY=N: after a layer's waves, N of its RAM-cache units' expert-rows recomputed by the

@@ -253,6 +253,10 @@ struct MxGemvArgs {
     int one_pass;                        /* an expert's rows (up to XM) in one pass over its weights */
     int probe_passes;                    /* the probe also counts weight passes (probe[5]) */
     unsigned long long* probe;
+    /* RADIANCE_EXPERIMENTAL_DS41_MOE_BALANCE (mx_gemv_kernel, MOE, plain row only): work items cut by an
+     * expert's row passes as well as its row groups, and a pass whose slots are all dropped writes its
+     * zeros without reading weights. bal_off: LDS byte offset of the chunk table (3 n_expert + 1 ints). */
+    int bal, bal_off;
 };
 
 /* A staged row: its values with 4 floats of pad after every 32, so the lanes' blocks read different banks. */
@@ -517,6 +521,7 @@ __global__ __launch_bounds__(kMxThreads) void mx_gemv_kernel(MxGemvArgs A) {
     R4D_DYN_LDS(r4d_u32x4, mx_lds);
     uint8_t* const mx_smem = (uint8_t*)mx_lds;
     __shared__ int s_nlive;
+    __shared__ int s_bal_p;                           /* ..._MOE_BALANCE: passes a chunk */
     const int tid = (int)threadIdx.x, lane = tid & 31, wave = tid >> 5;
     mx_load_table<T>(mx_smem);
     const void* tab = mx_smem;
@@ -554,15 +559,85 @@ __global__ __launch_bounds__(kMxThreads) void mx_gemv_kernel(MxGemvArgs A) {
     } else {
         __syncthreads();
     }
+    const int step = !A.one_pass && A.XLM >= 1 && A.XLM < A.XM ? A.XLM : A.XM;
+    /* ..._MOE_BALANCE: an item is (expert, chunk of its row passes, row-group range). Without it an expert
+     * is ipe items whatever its rows, so the expert with the most passes sets the launch's time -- and
+     * mx_range hands the rank's last expert every slot routed to other ranks ([off[ne], T): about
+     * 5 * M of a tall pass's 6 * M), one pass each at gate_up's XLM 1, on ipe blocks. Here the passes
+     * up to the live end off[ne] go in chunks of P (P sized so the chunks fill the grid once over), the
+     * passes past it in chunks of 64 P (they are dropped slots: zeros, no weight read; a live one there
+     * would still be computed). Each pass is the plain loop's pass (same rows, from rs in steps of
+     * `step`) and each output is still one wave's sum in the same lane and block order, so the bits are
+     * the plain kernel's; only which block runs a pass changes. */
+    int bP = 1, bPT = 64, bLE = A.M;
+    int* bpre = nullptr;
+    if constexpr (MOE) {
+        if (A.bal) {
+            bpre = (int*)(mx_smem + A.bal_off);       /* chunk prefix over the live experts, nlive + 1 */
+            int* const blp = bpre + A.n_expert + 1;   /* each live expert's passes up to the live end */
+            int* const bnp = blp + A.n_expert;        /* and all its passes */
+            bLE = ds41_live_tail::end(A.off, A.n_expert, A.M);
+            if (wave == 0)
+                for (int j = lane; j < s_nlive; j += 32) {
+                    int rs = 0, re = 0;
+                    mx_range(A.off, live[j], A.n_expert, A.M, &rs, &re);
+                    const int split = bLE < rs ? rs : (bLE > re ? re : bLE);
+                    blp[j] = (split - rs + step - 1) / step;
+                    bnp[j] = (re - rs + step - 1) / step;
+                }
+            __syncthreads();
+            if (tid == 0) {
+                long long wl = 0;
+                for (int j = 0; j < s_nlive; ++j) wl += blp[j];
+                const long long p = (wl * ipe + (long long)gridDim.x - 1) / (long long)gridDim.x;
+                const int P = p < 1 ? 1 : (p > (1 << 20) ? (1 << 20) : (int)p);
+                bpre[0] = 0;
+                for (int j = 0; j < s_nlive; ++j) {
+                    const int tp = bnp[j] - blp[j];
+                    bpre[j + 1] = bpre[j] + (blp[j] + P - 1) / P + (tp + 64 * P - 1) / (64 * P);
+                }
+                s_bal_p = P;
+            }
+            __syncthreads();
+            bP = s_bal_p;
+            bPT = 64 * bP;
+            n_items = bpre[s_nlive] * ipe;
+        }
+    }
     bool did_work=false;unsigned long long owned_rows=0,passes=0;
     int cur_e = -1, cur_p = -1;                       /* the rows the LDS buffer holds whole */
     for (int it = (int)blockIdx.x; it < n_items; it += (int)gridDim.x) {
         int e = 0, ri = it, rs = 0, re = A.M;
+        int pb = 0, pe = 1 << 30;                     /* ..._MOE_BALANCE: the item's passes [pb, pe) */
         const uint8_t* wb = A.w;
         if constexpr (MOE) {
-            e = live[it / ipe];
-            ri = it - (it / ipe) * ipe;
-            if(A.live_end)ds41_live_tail::range(A.off,e,A.M,&rs,&re);else mx_range(A.off, e, A.n_expert, A.M, &rs, &re);
+            if (A.bal) {
+                const int g = it / ipe;
+                ri = it - g * ipe;
+                int lo = 0, hi = s_nlive;             /* the live expert whose chunks hold g */
+                while (hi - lo > 1) {
+                    const int mid = (lo + hi) >> 1;
+                    if (bpre[mid] <= g) lo = mid; else hi = mid;
+                }
+                e = live[lo];
+                mx_range(A.off, e, A.n_expert, A.M, &rs, &re);
+                const int split = bLE < rs ? rs : (bLE > re ? re : bLE);
+                const int lp = (split - rs + step - 1) / step, np = (re - rs + step - 1) / step;
+                const int cl = (lp + bP - 1) / bP;
+                int c = g - bpre[lo];
+                if (c < cl) {
+                    pb = c * bP;
+                    pe = min(pb + bP, lp);
+                } else {
+                    c -= cl;
+                    pb = lp + c * bPT;
+                    pe = min(pb + bPT, np);
+                }
+            } else {
+                e = live[it / ipe];
+                ri = it - (it / ipe) * ipe;
+                if(A.live_end)ds41_live_tail::range(A.off,e,A.M,&rs,&re);else mx_range(A.off, e, A.n_expert, A.M, &rs, &re);
+            }
             wb = A.wtab ? A.wtab[e] : A.w + (long long)e * A.w_es;
         }
         /* gemv_vp: bit 0 of a table entry marks a packed weight (block-uniform: one expert an item). Weights are
@@ -593,10 +668,30 @@ __global__ __launch_bounds__(kMxThreads) void mx_gemv_kernel(MxGemvArgs A) {
          * the bits are again unchanged. In whole passes of one row the draft's gate_up took 6.1-6.7 ms
          * a call on ranks 0 and 1 and 11.2-11.8 ms on ranks 2 and 3 (whose cards share a root
          * complex), its down (three rows a pass) 0.5-1.2 ms (ab-20261029T154954Z, Ds1-o). */
-        const int step = !A.one_pass && A.XLM >= 1 && A.XLM < A.XM ? A.XLM : A.XM;
         if constexpr(PROBE)if(ri==0)passes+=(unsigned long long)((re-rs+step-1)/step);
-        for (int p0 = rs; p0 < re; p0 += step) {
+        /* The item's passes: all of the expert's, or (..._MOE_BALANCE) its chunk [pb, pe). */
+        const long long pend = (long long)rs + (long long)pe * step;
+        const int p1 = pend < re ? (int)pend : re;
+        for (int p0 = rs + pb * step; p0 < p1; p0 += step) {
             const int mc = min(step, re - p0);
+            if constexpr (MOE) {
+                /* ..._MOE_BALANCE: a pass of dropped slots only (block-uniform) writes the zeros the plain
+                 * loop writes for it -- every output of its rows in the item's row groups -- and reads no
+                 * weight. */
+                if (A.bal) {
+                    bool any = false;
+                    for (int m = 0; m < mc && !any; ++m)
+                        any = mx_moe_tok(A.sorted, p0 + m, A.top_k, A.a_sorted, A.AR) >= 0;
+                    if (!any) {
+                        const int c0 = rg0 * RG, c1 = min(rg1 * RG, A.N), w = c1 - c0;
+                        for (int idx = tid; idx < mc * w; idx += kMxThreads) {
+                            const int m = idx / w;
+                            mx_put(A.y + (long long)(p0 + m) * A.y_ld + c0 + (idx - m * w), 0.0f);
+                        }
+                        continue;
+                    }
+                }
+            }
             const bool whole = mc <= A.XLM;            /* block-uniform */
             if (whole && (cur_e != e || cur_p != p0)) {
                 lds_barrier();
@@ -1618,6 +1713,24 @@ int mx_launch_tiled(RadStream s, int ty, int bm, bool moe, const MxTiledArgs& A,
                         : mx_launch_tiled_t<MX_F32>(s, bm, moe, A, grid, lds);
 }
 
+/* RADIANCE_EXPERIMENTAL_DS41_MOE_BALANCE: "1" every call of the plain gemv kernel on a routed MoE GEMM (the
+ * decode band to 16 tokens and the twin moe_gemm_ggml_mxfp4_gemv_tall above), "2" the twin's calls above 16
+ * tokens only; else off. Work items by row passes and dropped passes without weight reads (mx_gemv_kernel):
+ * the same bits, read once a process, with one line on stderr the first time it takes a call. */
+int mx_balance_mode() {
+    static const int m = [] {
+        const char* e = std::getenv("RADIANCE_EXPERIMENTAL_DS41_MOE_BALANCE");
+        if (!e || !e[0] || e[1]) return 0;
+        return e[0] == '1' ? 1 : e[0] == '2' ? 2 : 0;
+    }();
+    static std::atomic<bool> said{false};
+    if (m && !said.exchange(true))
+        std::fprintf(stderr, "libr4d: RADIANCE_EXPERIMENTAL_DS41_MOE_BALANCE=%d: the routed MXFP4 gemv's work items "
+                             "follow each expert's row passes and dropped slots' passes read no weights (%s)\n",
+                     m, m == 1 ? "the decode band and the twin" : "the twin above 16 tokens");
+    return m;
+}
+
 bool mx_tail_opt_in(){static const bool on=ds41_live_tail::opt_in(std::getenv("RADIANCE_EXPERIMENTAL_DS41_LIVE_TAIL"));return on;}
 
 /* RADIANCE_EXPERIMENTAL_DS41_DRAFT_GEMV (ds41_live_tail::draft_mode): the DSpark draft bank's
@@ -1743,7 +1856,7 @@ int mx_gemm(const RadArgs* a, RadStream s, bool gemv) {
  * gemv at any number of tokens (moe_gemm_ggml_mxfp4_gemv_tall, RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL),
  * not only up to 16. */
 int mx_moe(const RadArgs* a, RadStream s, bool gemv,bool baseline=false,unsigned long long* probe=nullptr,int force=-1,
-           bool vp=false, bool tall=false, int vpvar=-1) {
+           bool vp=false, bool tall=false, int vpvar=-1, int balf=-1) {
     if (!a || a->n_t < 5) return R4D_NO(RAD_E_INVAL);
     const RadTensor *A_ = r4d_opt(a, 0), *W = r4d_opt(a, 1), *so = r4d_opt(a, 2), *of = r4d_opt(a, 3),
                     *Y = r4d_opt(a, 4);
@@ -1845,7 +1958,17 @@ int mx_moe(const RadArgs* a, RadStream s, bool gemv,bool baseline=false,unsigned
         A.x_al = mx_al16(A_->data, x_ld) ? 1 : 0;
         A.live_off = (int)tb;
         A.x_off = (int)(tb + mx_r16(ne * 4));
-        const long long lds = A.x_off + xbuf * 4;
+        long long lds = A.x_off + xbuf * 4;
+        /* ..._MOE_BALANCE (mx_balance_mode; `balf` a checker's 0 or 1 in its place): the plain kernel only,
+         * not the tail, the probes, gemv_vp or one pass. Its chunk table sits before the rows, and when a
+         * whole row fits (XLM >= 1, so no pass takes the chunked path) the rows' buffer is XLM whole rows. */
+        const int bm = balf >= 0 ? balf : mx_balance_mode();
+        if (bm && !tail && !probe && !vpk && !A.one_pass && (bm == 1 || balf >= 0 || tokens > 16)) {
+            A.bal = 1;
+            A.bal_off = A.x_off;
+            A.x_off = (int)(A.bal_off + mx_r16((3 * ne + 1) * 4));
+            lds = A.x_off + (A.XLM >= 1 ? (long long)A.XLM * A.XR : xbuf) * 4;
+        }
         /* Enough blocks for every row group of L experts: the kernel spreads whichever experts
          * turn out live over all of them. */
         const long long items = L * nrg;
@@ -1909,6 +2032,13 @@ extern "C" int r4d_rad_moe_gemm_mxfp4_gemv_vp_variants(const char** names, int c
  * the decode band's kernel at every pass height. */
 extern "C" int r4d_rad_moe_gemm_mxfp4_gemv_tall(const RadArgs* a, RadStream s) {
     return mx_moe(a, s, true, false, nullptr, -1, false, true);
+}
+/* Checker-only: the gemv row (`tall` 0, up to 16 tokens) or the twin (`tall` 1) with
+ * RADIANCE_EXPERIMENTAL_DS41_MOE_BALANCE forced off (`bal` 0) or on (1) for this call, whatever the
+ * environment says, so a check holds the balanced kernel to the plain one byte for byte and times both. */
+extern "C" int r4d_rad_moe_gemm_mxfp4_gemv_bal(const RadArgs* a, RadStream s, int tall, int bal) {
+    if (bal < 0 || bal > 1) return RAD_E_INVAL;
+    return mx_moe(a, s, true, false, nullptr, -1, false, tall != 0, -1, bal);
 }
 
 // Checker-only exports do not alter registered rows/public ABI.

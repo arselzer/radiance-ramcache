@@ -563,6 +563,8 @@ int FileStager::init(const Program& prog, const Plan& plan, Mover* mover, Counts
     if (head_.configured()) return RAD_E_STATE; //a head-cache FileStager is single-initialization
     layers_.clear();
     trace_requested_ = m1_trace_opt_in(std::getenv(kM1PrefetchTraceEnv));
+    if (const char* pf = std::getenv("RADIANCE_EXPERIMENTAL_DS41_LCP_PROFILE"); pf && !std::strcmp(pf, "1"))
+        prof_on_ = true;
     ep_counts_ = std::move(ep_counts);
     ep_program_ = &prog;
     ep_stats_ = {};
@@ -684,6 +686,7 @@ bool FileStager::begin_pass(const RadBatch* b) {
     pass_kind_ = b->draft_pass;
     last_issued_ = -1;
     pass_tok_ = b->n_tok;
+    prof_last_counts_ = {};   /* ..._LCP_PROFILE: a pass's first layer has no span */
     pass_full_ = b->consumer_full > 0 ? b->consumer_full : INT32_MAX;
     lcp_admit_row_ = lcp_ ? std::max<int32_t>(b->lcp_admit_row, 0) : 0;
     if (b->consumer_row0 && n_model_layers_ > 0) pass_row0_.assign(b->consumer_row0, b->consumer_row0 + n_model_layers_);
@@ -835,6 +838,7 @@ int FileStager::start_ep_routed(int32_t li, RadStream s, bool* read) {
     const uint64_t sync_ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(t_counts - t_sync).count();
     ep_stats_.sync_ns += sync_ns;
     if (pass_tok_ == 1) { ++ep_stats_.d_reads; ep_stats_.d_sync_ns += sync_ns; }
+    if (prof_on_) prof_counts(li, sync_ns, t_counts);
     /* Every earlier layer's window copies fed a gather this sync followed on the card: their
      * cache leases go back now, not when a window next comes round (Mover::retire_file_windows). */
     if (hx) RAD_TRY(mover_->retire_file_windows());
@@ -2485,6 +2489,7 @@ int FileStager::hx_early_decide() {
     const uint64_t sync_ns = ns(t_sync, t_counts);
     ep_stats_.sync_ns += sync_ns;
     if (pass_tok_ == 1) { ++ep_stats_.d_reads; ep_stats_.d_sync_ns += sync_ns; }
+    if (prof_on_) prof_counts(li, sync_ns, t_counts);
     ++hx_stats_.early;
     hx_stats_.early_wait_ns += sync_ns;
     RAD_TRY(mover_->retire_file_windows());
@@ -2679,6 +2684,7 @@ int FileStager::hx_submit() {
     hx_confirmed_ = false;
     ++hx_stats_.layers;
     hx_stats_.rows += hx_rows_.size();
+    if (prof_on_) prof_[prof_bucket()].cpu_rows += hx_rows_.size();
     return RAD_OK;
 }
 
@@ -2798,6 +2804,7 @@ int FileStager::hx_stream_misses(int rows) {
         const size_t w1 = std::min(order.size(), w0 + cap);
         const bool last = w1 == order.size();
         ++hx_stats_.lcp_waves;
+        if (prof_on_) ++prof_[prof_bucket()].waves;
         std::vector<Mover::HostPlanes*> ptrs;
         std::vector<std::pair<size_t, int>> ranges;
         std::vector<int64_t> costs;
@@ -2833,6 +2840,7 @@ int FileStager::hx_stream_misses(int rows) {
                 return n;
             }
             ++hx_stats_.miss_units;
+            if (prof_on_) ++prof_[prof_bucket()].miss_units;
             hx_stats_.miss_rows += (uint64_t)n;
             int64_t c = 0;
             for (size_t k = first; k < hx_jobs_.size(); ++k) c += hx_jobs_[k].cost;
@@ -2898,8 +2906,12 @@ int FileStager::hx_stream_misses(int rows) {
         hx_queue_inserts(order.data() + w0, w1 - w0, rows);
         for (size_t q = w0; q < w1; ++q) hx_miss_[order[q]].reset();   /* not admitted: to the free list now */
     }
-    hx_stats_.miss_read_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                  std::chrono::steady_clock::now() - t0).count();
+    {
+        const uint64_t rd = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - t0).count();
+        hx_stats_.miss_read_ns += rd;
+        if (prof_on_) prof_[prof_bucket()].miss_read_ns += rd;
+    }
     std::sort(hx_rows_.begin(), hx_rows_.end());
     /* The last wave's (the earlier ones went above). */
     const size_t from = order.empty() ? 0 : (order.size() - 1) / cap * cap;
@@ -3008,8 +3020,12 @@ int FileStager::hx_submit_misses_now(int rows) {
                 "side store", layers_[(size_t)hx_li_].layer);
         return RAD_E_IO;
     }
-    hx_stats_.miss_read_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                  std::chrono::steady_clock::now() - t0).count();
+    {
+        const uint64_t rd = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - t0).count();
+        hx_stats_.miss_read_ns += rd;
+        if (prof_on_) prof_[prof_bucket()].miss_read_ns += rd;
+    }
     if (read && rows == 1) hx_note_reads(tm);
     /* The armed pre-wake: how long after it the last read landed, or how long before its time (the
      * reads' landing from their dispatch, which tm counts, against the hook's time from it). */
@@ -3039,6 +3055,7 @@ int FileStager::hx_submit_misses_now(int rows) {
         const int n = hx_jobs_for(plan_->units[(size_t)p->unit].expert, proto);
         if (n < 0) return n;
         ++hx_stats_.miss_units;
+        if (prof_on_) ++prof_[prof_bucket()].miss_units;
         hx_stats_.miss_rows += (uint64_t)n;
     }
     const int n = (int)(hx_jobs_.size() - first);
@@ -3999,14 +4016,29 @@ int FileStager::hx_capture(int32_t li, RadStream s, const RadTensor* t, int n_t)
     return RAD_OK;
 }
 
+/* ..._LCP_PROFILE: a routed layer's counts reached (PassProfile, stager.h). */
+void FileStager::prof_counts(int32_t li, uint64_t sync_ns, std::chrono::steady_clock::time_point t_counts) {
+    PassProfile& p = prof_[prof_bucket()];
+    ++p.layers;
+    p.rows += (uint64_t)std::max<int64_t>(0, layer_rows(li));
+    p.sync_ns += sync_ns;
+    if (prof_last_counts_.time_since_epoch().count()) {
+        ++p.spans;
+        p.span_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(t_counts - prof_last_counts_).count();
+    }
+    prof_last_counts_ = t_counts;
+}
+
 /* The layer's gather, before its launch: the pool's rows over the card's in its y_expert, on
  * the gather's stream, or with ..._POLICY=verify the card's rows compared with the pool's. */
 int FileStager::hx_finish(RadStream s, const RadTensor* t, int n_t) {
     if (hx_async_) {   /* the misses' jobs join the ticket first */
         const auto w0 = std::chrono::steady_clock::now();
         const int rc = hx_mw_wait();
-        hx_stats_.async_wait_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                       std::chrono::steady_clock::now() - w0).count();
+        const uint64_t mw = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - w0).count();
+        hx_stats_.async_wait_ns += mw;
+        if (prof_on_) prof_[prof_bucket()].miss_wait_ns += mw;
         if (rc < 0) {
             hx_drain();   /* the layer is given up: no second report of rows that reached no gather */
             return rc;
@@ -4017,6 +4049,7 @@ int FileStager::hx_finish(RadStream s, const RadTensor* t, int n_t) {
     const uint64_t waited = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
                                 std::chrono::steady_clock::now() - t0).count();
     hx_stats_.wait_ns += waited;
+    if (prof_on_) prof_[prof_bucket()].gather_ns += waited;
     if (pass_tok_ == 1) {   /* decode's own share, the misses' layers apart */
         const int m = hx_miss_.empty() ? 0 : 1;
         ++hx_stats_.d_waits[m];

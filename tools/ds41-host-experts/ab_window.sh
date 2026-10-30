@@ -89,6 +89,16 @@
 # `sweep0` on card 0 (TALL_LIBR4D and TALL_CHECK named, as for `tall`), and an Lc arm runs only on the
 # libr4d.so (sha256) those passed on, at a chunk of at most LCP_CHECK_C.
 #
+# MbN: RADIANCE_EXPERIMENTAL_DS41_MOE_BALANCE=N (libr4d, read by the routed MXFP4 gemv): 1 every call of the
+# plain gemv kernel (the decode band to 16 tokens and the twin above), 2 the twin above 16 tokens only;
+# the work items follow each expert's row passes, and a pass of dropped slots (the other ranks' rows,
+# which mx_range hands the rank's last expert) writes zeros without reading weights. Same bytes by
+# construction. Every arm without the part runs with it at 0. `bal` in DEVICE_CHECKS runs
+# ds41_mxfp4_device_check `bal LCP_CHECK_C [BAL_ROUTES]` on card 0 (TALL_CHECK and TALL_LIBR4D, as for
+# `lcp`): the balanced kernel against the plain one, every output value, and both timed (devcheck-bal.log);
+# an Mb arm runs only on the libr4d.so (sha256) that passed it. Lf: RADIANCE_EXPERIMENTAL_DS41_LCP_PROFILE=1,
+# the file stager's per-pass-size time lines at exit (an instrument; no change to what runs).
+#
 # Environment: RADIANCE_BIN (the binary), RADIANCE_HOME_DIR (kernels/ and architectures/ for it),
 # SILU_TABLE (the card's silu table), ARMS (default "base verify greedy"), HX_THREADS (16),
 # VERIFY_REQUESTS (3), DEVICE_CHECKS (1; a list: `tall` the exact-tall checks, `lcp` the large-chunk
@@ -829,6 +839,32 @@ if [[ " ${DEVICE_CHECKS:-1} " == *" lcp "* ]]; then
     fi
   fi
 fi
+# The Mb arms' gate (RADIANCE_EXPERIMENTAL_DS41_MOE_BALANCE): an Mb arm runs only on the libr4d.so (sha256)
+# whose `bal` check passed in this window (the balanced gemv and twin give the plain kernel's bytes).
+BAL_OK="" BAL_LIB="" BAL_SUM=""
+BAL_WHY="no balanced-gemv device check in this window (DEVICE_CHECKS=bal with TALL_CHECK and TALL_LIBR4D)"
+if [[ " ${DEVICE_CHECKS:-1} " == *" bal "* ]]; then
+  TL=${TALL_LIBR4D:-} TC=${TALL_CHECK:-} LC=${LCP_CHECK_C:-1024}
+  if [[ ! -x "$TC" || ! -f "$TL" ]]; then
+    BAL_WHY="TALL_CHECK=$TC is not an executable or TALL_LIBR4D=$TL is not a file"
+    log "balanced gemv device check: $BAL_WHY; no Mb arm is measured"
+  else
+    log "balanced gemv device check on card 0 with $TL ($TC), up to $LC tokens${BAL_ROUTES:+, routes $BAL_ROUTES}"
+    ( export HIP_VISIBLE_DEVICES=0
+      unset RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL RADIANCE_EXPERIMENTAL_DS41_LCP RADIANCE_EXPERIMENTAL_DS41_MOE_BALANCE
+      timeout 1800 "$TC" "$TL" bal "$LC" ${BAL_ROUTES:-} >"$OUT/devcheck-bal.log" 2>&1
+      echo "bal exit $?" >>"$OUT/devcheck-bal.log" )
+    grep -E '^(PASS|FAIL)|exit|^bal: ' "$OUT/devcheck-bal.log" | tail -6 | tee -a "$OUT/window.log"
+    if grep -qx "bal exit 0" "$OUT/devcheck-bal.log" && grep -q '^PASS: bal: ' "$OUT/devcheck-bal.log" &&
+       ! grep -q '^FAIL' "$OUT/devcheck-bal.log"; then
+      BAL_OK=1 BAL_LIB=$TL BAL_SUM=$(sha256sum "$TL" 2>/dev/null | cut -d' ' -f1)
+      log "balanced gemv device check passed on $TL, sha256 ${BAL_SUM:0:16}: Mb arms on it are measured"
+    else
+      BAL_WHY="the balanced gemv device check did not pass on $TL (devcheck-bal.log)"
+      log "$BAL_WHY; no Mb arm is measured"
+    fi
+  fi
+fi
 # The Xt arms' gate (RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL), like Dk's: an Xt arm runs only on the
 # libr4d.so (sha256) the tall checks passed on in this window.
 TALL_OK="" TALL_LIB="" TALL_SUM="" TALL_WHY="no exact-tall device checks in this window (DEVICE_CHECKS=tall with TALL_CHECK and TALL_LIBR4D)"
@@ -1220,6 +1256,7 @@ for a in $ARMS; do
 # offline in bf16, int8 and int4 against the container's routers); needs a predictor part.
   IFS=- read -r -a parts <<< "$a"
   xt="" bt="" kld="" dk="" db="" pu="" ins_nt="" ins_kib="" ins_wait="" lean="" lc="" ad="" dv="" xd="" hs="" dg="" df="" pmr=""
+  mb="" lf=""
   pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 HOST_POOL_MIB=4096 EXTRA_ARGS="" ARM_HOME="$RHOME" ARM_CONC=
   ARM_PROMPTS= ARM_N= ARM_LQ= rt=
   power="" skip="" ARGS=() f8="" f8x="" rb="" rbf=0 pred="" cs="" ck="" kh="" pc="" pcopt="" fw="" wp="" wl=""
@@ -1351,6 +1388,8 @@ for a in $ARMS; do
       Ada)     ad=all; env+=(RADIANCE_EXPERIMENTAL_DS41_LCP_ADMIT=all) ;;       # admit every unit (as at 16 rows)
       Lp[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_LCP_PLANES=${p#Lp}) ;;        # missed units read at once a layer
       Li[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_LCP_INSERTQ=${p#Li}) ;;       # admitted misses queued for the cache
+      Mb1|Mb2) mb=${p#Mb} ;;                                           # balanced routed gemv (..._MOE_BALANCE)
+      Lf)      lf=1 ;;                                                 # per-pass-size time lines (..._LCP_PROFILE)
       Fl)      env+=(RADIANCE_EXPERIMENTAL_DS41_FETCH_LIST=1) ;;       # counts + CPU rows in one ranged copy
       Ms[0-9]) env+=(RADIANCE_EXPERIMENTAL_DS41_MIRROR_SPLIT=${p#Ms}) ;;  # a lone decode miss's mirror tail in N pieces
       Mp)      env+=(RADIANCE_EXPERIMENTAL_DS41_MISS_POST=1) ;;       # miss reads start at the choice, before the pool's wake
@@ -1579,6 +1618,18 @@ for a in $ARMS; do
       log "arm $a: Xt refused: $TALL_WHY"; skip=1
     elif [[ -z "$lib" || "$(sha256sum "$lib" 2>/dev/null | cut -d' ' -f1)" != "$TALL_SUM" ]]; then
       log "arm $a: Xt refused: its libr4d.so (${lib:-none under $ARM_HOME}) is not the one the tall checks passed on ($TALL_LIB, sha256 ${TALL_SUM:0:16})"; skip=1
+    fi
+  fi
+  # RADIANCE_EXPERIMENTAL_DS41_MOE_BALANCE and ..._LCP_PROFILE: stated in every arm (0 off).
+  env+=(RADIANCE_EXPERIMENTAL_DS41_MOE_BALANCE=${mb:-0} RADIANCE_EXPERIMENTAL_DS41_LCP_PROFILE=${lf:-0})
+  if [[ -n "$mb" && -z "$skip" ]]; then
+    IFS=: read -r -a homes <<< "$ARM_HOME"
+    lib=""
+    for h in "${homes[@]}"; do [[ -f "$h/kernels/libr4d.so" ]] && { lib=$h/kernels/libr4d.so; break; }; done
+    if [[ -z "$BAL_OK" ]]; then
+      log "arm $a: Mb refused: $BAL_WHY"; skip=1
+    elif [[ -z "$lib" || "$(sha256sum "$lib" 2>/dev/null | cut -d' ' -f1)" != "$BAL_SUM" ]]; then
+      log "arm $a: Mb refused: its libr4d.so (${lib:-none under $ARM_HOME}) is not the one the bal check passed on ($BAL_LIB, sha256 ${BAL_SUM:0:16})"; skip=1
     fi
   fi
   if [[ -n "$lc" && -z "$skip" ]]; then

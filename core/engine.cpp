@@ -212,6 +212,28 @@ Engine::~Engine() {
                 RAD_INFO("host experts: submitters waited %llu times for a free job slot (%d slots), %.1f ms "
                          "in all, outside the submit lock", (unsigned long long)pool->submit_waits(),
                          HostExpertPool::slots(), (double)pool->submit_wait_ns() / 1e6);
+        /* RADIANCE_EXPERIMENTAL_DS41_LCP_PROFILE (FileStager::PassProfile): per pass height, a routed
+         * layer-pass's mean times on the issuing thread. */
+        if (r->fstager.profile_on()) {
+            static const char* const kName[FileStager::kProfBuckets] = { "1 token", "2-16 tokens", "17-256 tokens",
+                                                                         "257+ tokens" };
+            for (int b = 0; b < FileStager::kProfBuckets; ++b) {
+                const FileStager::PassProfile& p = r->fstager.profile(b);
+                if (!p.layers) continue;
+                const double L = (double)p.layers, ms = 1e-6;
+                RAD_INFO("pass profile, rank %d, %s: %llu routed layer-passes, %.1f rows each (%.1f to the CPU); "
+                         "a layer-pass %.2f ms wall (counts to counts, %llu spans), of it %.2f ms waiting for the "
+                         "card at the counts, %.2f ms at the gather for misses being read, %.2f ms at the gather for "
+                         "the pool; misses %.2f units a layer-pass (%.2f ms in the read call on the worker), %.2f "
+                         "read waves; totals: wall %.1f s, card %.1f s, misses %.1f s, pool %.1f s",
+                         r->index, kName[b], (unsigned long long)p.layers, (double)p.rows / L, (double)p.cpu_rows / L,
+                         p.spans ? (double)p.span_ns * ms / (double)p.spans : 0.0, (unsigned long long)p.spans,
+                         (double)p.sync_ns * ms / L, (double)p.miss_wait_ns * ms / L, (double)p.gather_ns * ms / L,
+                         (double)p.miss_units / L, (double)p.miss_read_ns * ms / L, (double)p.waves / L,
+                         (double)p.span_ns * 1e-9, (double)p.sync_ns * 1e-9, (double)p.miss_wait_ns * 1e-9,
+                         (double)p.gather_ns * 1e-9);
+            }
+        }
         if (hx.lcp_layers)
             RAD_INFO("large-chunk prefill, rank %d: %llu layers streamed their misses in %llu read waves; "
                      "%llu units went to the pool as their reads landed, %llu after the call (a leg read "

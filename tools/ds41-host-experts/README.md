@@ -81,7 +81,11 @@ tasks), held-out prompts **+9.3%** (34.15 vs 31.24), chat +1.2% (26.92 vs 26.60)
 on code (+9.2%; held-out a tie, chat -1.3%): there the experts the drafter displaces from VRAM fell to the
 drive, while the bigger cache keeps them in RAM. The draft bank needs a single sequence (the server
 refuses it beside concurrent requests), so leave it off where several requests decode at once: plain
-decode gives 38.7 tok/s in total at 4 streams and 42.2 at 8 (ab-20261030T205440Z).
+decode gives 38.7 tok/s in total at 4 streams and 42.2 at 8 (ab-20261030T205440Z). Verifying two
+drafted tokens a step (`RADIANCE_EXPERIMENTAL_DS41_DSPARK_VERIFY_CAP=2`) adds 3.3% on code (30.73 vs
+29.75 tok/s, 80% of second drafts accepted) but loses 12% on chat (43%); three lose on both
+(ab-20261030T213623Z). Each verified row costs ~21 ms a step, the RAM reads of its experts, so keep 1
+unless the load is code alone.
 ```
 RADIANCE_EXPERIMENTAL_DS41_DSPARK_RAD_BANK=1                # the 3-stage DSpark drafter from its bank
 RADIANCE_EXPERIMENTAL_DS41_DSPARK_VERIFY_CAP=1              # one drafted token a step

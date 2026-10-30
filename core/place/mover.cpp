@@ -1372,10 +1372,11 @@ int Mover::mirror_init() {
 /* The packed cache's insert: both weights' raw rounds counted first, so a unit is cached whole or
  * not at all (a weight with more raw rounds than its slot holds keeps the unit a miss, computed
  * from its planes); then each weight packed straight into a reserved slot -- its codes plane
- * copied, its scales packed -- and checked before it is published: every block's e8m0 as the
- * kernels widen it from the slot must equal the planes' byte for byte, or the slot goes back
- * unpublished (the Write's destructor) and the weight stays a miss. */
-int Mover::insert_unit_packed(const HostPlanes& p) {
+ * copied (as `copy` says: by non-temporal stores, in pieces, each piece's sfence before the
+ * publication; null, one memcpy), its scales packed -- and checked before it is published: every
+ * block's e8m0 as the kernels widen it from the slot must equal the planes' byte for byte, or the
+ * slot goes back unpublished (the Write's destructor) and the weight stays a miss. */
+int Mover::insert_unit_packed(const HostPlanes& p, const ds41hx::PackCopy* copy) {
     using S = NativeMappedFileCache::Status;
     if (p.n != 2) return RAD_E_STATE;
     int klass[2] = { -1, -1 };
@@ -1408,7 +1409,7 @@ int Mover::insert_unit_packed(const HostPlanes& p) {
             if (!write.packed() || !write.host()) return RAD_E_STATE;
             ds41hx::Mx view;
             const int rc = ds41hx::pack_planes(p.codes[k], p.scales[k], N, K, packed_raw_[c], plan[k], write.host(),
-                                               write.bytes());
+                                               write.bytes(), copy);
             if (rc != ds41hx::kPackOk || !ds41hx::packed_view(write.host(), write.bytes(), N, K, &view) ||
                 !ds41hx::packed_scales_equal(view, p.scales[k])) {
                 packed_round_trip_failed_.fetch_add(1, std::memory_order_relaxed);
@@ -1428,9 +1429,9 @@ int Mover::insert_unit_packed(const HostPlanes& p) {
     return RAD_OK;
 }
 
-int Mover::insert_unit_planes(const HostPlanes& p, std::vector<uint8_t>* scratch) {
+int Mover::insert_unit_planes(const HostPlanes& p, std::vector<uint8_t>* scratch, const ds41hx::PackCopy* copy) {
     if (!scratch || !relayout_ || !mapped_file_cache_on_) return RAD_E_STATE;
-    if (mapped_file_cache_.packed()) return insert_unit_packed(p);
+    if (mapped_file_cache_.packed()) return insert_unit_packed(p, copy);
     using S = NativeMappedFileCache::Status;
     for (int k = 0; k < p.n; ++k) {
         /* The check-insert-check bracket of read_native_file: never admit another epoch's bytes. */

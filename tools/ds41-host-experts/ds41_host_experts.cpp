@@ -456,15 +456,11 @@ inline float wave_sum4(__m256 (&acc)[4]) {
     return _mm_cvtss_f32(_mm_add_ss(_mm256_castps256_ps128(s), _mm256_extractf128_ps(s, 1)));   /* 0+1 */
 }
 
+/* gemv_avx2_t on x's lanes as x_lanes lays them out (R * 1024 floats at xt). */
 template <bool kGgml>
-void gemv_avx2_t(const Mx& w, const uint16_t* x, uint16_t* y, int n0, int n1) {
+void gemv_xt_t(const Mx& w, const float* xt, uint16_t* y, int n0, int n1) {
     constexpr size_t BS = kGgml ? 17 : 16, SS = kGgml ? 17 : 1;
     const int UK = w.K / 32, R = (UK + 31) / 32, RF = UK / 32;   /* rounds, full rounds */
-    struct alignas(32) X8 { float f[8]; };
-    thread_local std::vector<X8> xbuf;
-    xbuf.resize((size_t)R * 128);
-    float* const xt = xbuf.data()->f;
-    x_lanes(x, UK, xt);
     for (int n = n0; n < n1; ++n) {
         const uint8_t* const codes = kGgml ? w.blocks + (size_t)n * UK * 17 + 1 : w.codes + (size_t)n * (size_t)(w.K / 2);
         const uint8_t* const scl = kGgml ? codes - 1 : w.scales + (size_t)n * UK;
@@ -478,6 +474,17 @@ void gemv_avx2_t(const Mx& w, const uint16_t* x, uint16_t* y, int n0, int n1) {
         if (RF < R) add_tail<kGgml>(acc, codes, scl, 32 * RF, UK, xt + (size_t)RF * 1024);
         y[n] = bf16_rne_nan(wave_sum4(acc));
     }
+}
+
+template <bool kGgml>
+void gemv_avx2_t(const Mx& w, const uint16_t* x, uint16_t* y, int n0, int n1) {
+    const int UK = w.K / 32, R = (UK + 31) / 32;
+    struct alignas(32) X8 { float f[8]; };
+    thread_local std::vector<X8> xbuf;
+    xbuf.resize((size_t)R * 128);
+    float* const xt = xbuf.data()->f;
+    x_lanes(x, UK, xt);
+    gemv_xt_t<kGgml>(w, xt, y, n0, n1);
 }
 
 /* ---- several token rows of one matrix ---- */
@@ -500,19 +507,12 @@ __attribute__((noinline)) void add_round_rows(__m256 (*acc)[4], const uint8_t* c
 }
 
 /* gemv_avx2_t for 2 .. kFewRows rows: x transposed once a row, the full rounds through
- * add_round_rows, each row's last, partial round (down's eight blocks) on its own. */
+ * add_round_rows, each row's last, partial round (down's eight blocks) on its own. gemv_rows_xt_t
+ * runs on the rows' lanes (xt[i], as x_lanes lays them out). */
 template <bool kGgml>
-void gemv_avx2_rows_t(const Mx& w, const uint16_t* const* x, uint16_t* const* y, int rows, int n0, int n1) {
+void gemv_rows_xt_t(const Mx& w, const float* const* xt, uint16_t* const* y, int rows, int n0, int n1) {
     constexpr size_t BS = kGgml ? 17 : 16, SS = kGgml ? 17 : 1;
     const int UK = w.K / 32, R = (UK + 31) / 32, RF = UK / 32;
-    struct alignas(32) X8 { float f[8]; };
-    thread_local std::vector<X8> xbuf;
-    xbuf.resize((size_t)kFewRows * R * 128);
-    float* xt[kFewRows];
-    for (int i = 0; i < rows; ++i) {
-        xt[i] = xbuf.data()->f + (size_t)i * R * 1024;
-        x_lanes(x[i], UK, xt[i]);
-    }
     for (int n = n0; n < n1; ++n) {
         const uint8_t* const codes = kGgml ? w.blocks + (size_t)n * UK * 17 + 1 : w.codes + (size_t)n * (size_t)(w.K / 2);
         const uint8_t* const scl = kGgml ? codes - 1 : w.scales + (size_t)n * UK;
@@ -532,6 +532,20 @@ void gemv_avx2_rows_t(const Mx& w, const uint16_t* const* x, uint16_t* const* y,
             y[i][n] = bf16_rne_nan(wave_sum4(acc[i]));
         }
     }
+}
+
+template <bool kGgml>
+void gemv_avx2_rows_t(const Mx& w, const uint16_t* const* x, uint16_t* const* y, int rows, int n0, int n1) {
+    const int UK = w.K / 32, R = (UK + 31) / 32;
+    struct alignas(32) X8 { float f[8]; };
+    thread_local std::vector<X8> xbuf;
+    xbuf.resize((size_t)kFewRows * R * 128);
+    float* xt[kFewRows];
+    for (int i = 0; i < rows; ++i) {
+        xt[i] = xbuf.data()->f + (size_t)i * R * 1024;
+        x_lanes(x[i], UK, xt[i]);
+    }
+    gemv_rows_xt_t<kGgml>(w, xt, y, rows, n0, n1);
 }
 
 /* ---- the packed form: a round's codes widened into its e8m0 bytes, then the planar rounds ----
@@ -575,14 +589,10 @@ HX_INLINE const uint8_t* pk_round(PkRounds& c, uint32_t g, const uint8_t* p, int
     return buf;
 }
 
-void gemv_avx2_pk(const Mx& w, const uint16_t* x, uint16_t* y, int n0, int n1) {
+/* gemv_avx2_pk on x's lanes (gemv_xt_t's). */
+void gemv_pk_xt(const Mx& w, const float* xt, uint16_t* y, int n0, int n1) {
     const int UK = w.K / 32, R = (UK + 31) / 32, RF = UK / 32, t = UK % 32;
     const size_t PB = (size_t)(8 * RF + (t + 3) / 4);
-    struct alignas(32) X8 { float f[8]; };
-    thread_local std::vector<X8> xbuf;
-    xbuf.resize((size_t)R * 128);
-    float* const xt = xbuf.data()->f;
-    x_lanes(x, UK, xt);
     PkRounds ex = pk_rounds_from(w, (uint32_t)n0 * (uint32_t)R);
     alignas(32) uint8_t sb[32];
     for (int n = n0; n < n1; ++n) {
@@ -605,17 +615,20 @@ void gemv_avx2_pk(const Mx& w, const uint16_t* x, uint16_t* y, int n0, int n1) {
     }
 }
 
-void gemv_avx2_rows_pk(const Mx& w, const uint16_t* const* x, uint16_t* const* y, int rows, int n0, int n1) {
-    const int UK = w.K / 32, R = (UK + 31) / 32, RF = UK / 32, t = UK % 32;
-    const size_t PB = (size_t)(8 * RF + (t + 3) / 4);
+void gemv_avx2_pk(const Mx& w, const uint16_t* x, uint16_t* y, int n0, int n1) {
+    const int UK = w.K / 32, R = (UK + 31) / 32;
     struct alignas(32) X8 { float f[8]; };
     thread_local std::vector<X8> xbuf;
-    xbuf.resize((size_t)kFewRows * R * 128);
-    float* xt[kFewRows];
-    for (int i = 0; i < rows; ++i) {
-        xt[i] = xbuf.data()->f + (size_t)i * R * 1024;
-        x_lanes(x[i], UK, xt[i]);
-    }
+    xbuf.resize((size_t)R * 128);
+    float* const xt = xbuf.data()->f;
+    x_lanes(x, UK, xt);
+    gemv_pk_xt(w, xt, y, n0, n1);
+}
+
+/* gemv_avx2_rows_pk on the rows' lanes (gemv_rows_xt_t's). */
+void gemv_rows_pk_xt(const Mx& w, const float* const* xt, uint16_t* const* y, int rows, int n0, int n1) {
+    const int UK = w.K / 32, R = (UK + 31) / 32, RF = UK / 32, t = UK % 32;
+    const size_t PB = (size_t)(8 * RF + (t + 3) / 4);
     PkRounds ex = pk_rounds_from(w, (uint32_t)n0 * (uint32_t)R);
     alignas(32) uint8_t sb[32];
     for (int n = n0; n < n1; ++n) {
@@ -640,6 +653,25 @@ void gemv_avx2_rows_pk(const Mx& w, const uint16_t* const* x, uint16_t* const* y
             y[i][n] = bf16_rne_nan(wave_sum4(acc[i]));
         }
     }
+}
+
+void gemv_avx2_rows_pk(const Mx& w, const uint16_t* const* x, uint16_t* const* y, int rows, int n0, int n1) {
+    const int UK = w.K / 32, R = (UK + 31) / 32;
+    struct alignas(32) X8 { float f[8]; };
+    thread_local std::vector<X8> xbuf;
+    xbuf.resize((size_t)kFewRows * R * 128);
+    float* xt[kFewRows];
+    for (int i = 0; i < rows; ++i) {
+        xt[i] = xbuf.data()->f + (size_t)i * R * 1024;
+        x_lanes(x[i], UK, xt[i]);
+    }
+    gemv_rows_pk_xt(w, xt, y, rows, n0, n1);
+}
+
+/* few_lanes: each row's lanes, x_lanes' layout, row i at xt + i * R * 1024. */
+void few_lanes_t(const uint16_t* const* x, int rows, int K, float* xt) {
+    const int UK = K / 32, R = (UK + 31) / 32;
+    for (int i = 0; i < rows; ++i) x_lanes(x[i], UK, xt + (size_t)i * R * 1024);
 }
 
 /* ---- many token rows of one matrix (gemv_avx2_many) ------------------------------------------------
@@ -953,12 +985,20 @@ void pk_plan_rounds(const uint8_t* scales, int N, int K, PackInfo* plan) {
     plan->n_exc = (int)((int64_t)N * R - best);
 }
 
-/* pack_planes' sections after the header, every byte written; the raw rounds, or -1 past cap. */
+/* pack_planes' sections after the header, every byte written, the codes plane as `cp` says (null:
+ * one memcpy); the raw rounds, or -1 past cap. */
 int pk_pack_rounds(const uint8_t* codes, const uint8_t* scales, int N, int K, int cap, uint8_t e0,
-                   uint8_t* dst, const PkLayout& L) {
+                   uint8_t* dst, const PkLayout& L, const PackCopy* cp) {
     const int UK = K / 32, R = (UK + 31) / 32, RF = UK / 32, t = UK % 32, tb = (t + 3) / 4;
     const size_t PB = (size_t)(8 * RF + tb), cb = (size_t)N * (size_t)(K / 2);
-    std::memcpy(dst + L.codes, codes, cb);
+    if (!cp) std::memcpy(dst + L.codes, codes, cb);
+    else
+        for (size_t at = 0, step = cp->slice ? cp->slice : cb; at < cb; at += step) {
+            const size_t n = std::min(step, cb - at);
+            if (cp->before) cp->before(cp->ctx, n);
+            if (cp->nt) copy_nt(dst + L.codes + at, codes + at, n);
+            else std::memcpy(dst + L.codes + at, codes + at, n);
+        }
     std::memset(dst + L.codes + cb, 0, L.pk - L.codes - cb);
     std::memset(dst + L.pk, 0, L.total - L.pk);
     uint8_t* const pk = dst + L.pk;
@@ -1106,6 +1146,48 @@ void gemv_avx2_rows(const Mx& w, const uint16_t* const* x, uint16_t* const* y, i
     else gemv_avx2_many(w, x, y, rows, n0, n1);
 }
 
+size_t few_lanes_floats(int K) { return (size_t)((K / 32 + 31) / 32) * 1024; }
+
+void few_lanes(const uint16_t* const* x, int rows, int K, float* xt) { few_lanes_t(x, rows, K, xt); }
+
+/* gemv_avx2_few's dispatch, its lanes laid out already. */
+void gemv_avx2_few_lanes(const Mx& w, const float* xt, uint16_t* const* y, int rows, int n0, int n1) {
+    const size_t f = few_lanes_floats(w.K);
+    for (int i = 0; i < rows; i += kFewRows) {
+        const int m = rows - i < kFewRows ? rows - i : kFewRows;
+        const float* xr[kFewRows];
+        for (int k = 0; k < m; ++k) xr[k] = xt + (size_t)(i + k) * f;
+        if (m == 1) {
+            if (w.blocks) gemv_xt_t<true>(w, xr[0], y[i], n0, n1);
+            else if (w.pk) gemv_pk_xt(w, xr[0], y[i], n0, n1);
+            else gemv_xt_t<false>(w, xr[0], y[i], n0, n1);
+        } else if (w.blocks) gemv_rows_xt_t<true>(w, xr, y + i, m, n0, n1);
+        else if (w.pk) gemv_rows_pk_xt(w, xr, y + i, m, n0, n1);
+        else gemv_rows_xt_t<false>(w, xr, y + i, m, n0, n1);
+    }
+}
+
+/* Whole 64-byte lines of dst by streaming stores (SSE2, x86-64's baseline), loads unaligned. */
+void copy_nt(uint8_t* dst, const uint8_t* src, size_t n) {
+    const size_t head = std::min(n, (size_t)(-(uintptr_t)dst & 63));
+    std::memcpy(dst, src, head);
+    dst += head;
+    src += head;
+    n -= head;
+    for (; n >= 64; n -= 64, dst += 64, src += 64) {
+        const __m128i a = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src));
+        const __m128i b = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + 16));
+        const __m128i c = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + 32));
+        const __m128i d = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + 48));
+        _mm_stream_si128(reinterpret_cast<__m128i*>(dst), a);
+        _mm_stream_si128(reinterpret_cast<__m128i*>(dst + 16), b);
+        _mm_stream_si128(reinterpret_cast<__m128i*>(dst + 32), c);
+        _mm_stream_si128(reinterpret_cast<__m128i*>(dst + 48), d);
+    }
+    std::memcpy(dst, src, n);
+    _mm_sfence();
+}
+
 /* ---- the packed form ---- */
 
 size_t pk_row_bytes(int K) {
@@ -1126,7 +1208,7 @@ bool pack_plan(const uint8_t* scales, int N, int K, PackInfo* plan) {
 }
 
 int pack_planes(const uint8_t* codes, const uint8_t* scales, int N, int K, int cap,
-                const PackInfo& plan, uint8_t* dst, size_t dst_bytes) {
+                const PackInfo& plan, uint8_t* dst, size_t dst_bytes, const PackCopy* copy) {
     PkLayout L;
     if (!codes || !scales || !dst || !pk_layout(N, K, cap, &L) || dst_bytes < L.total ||
         plan.e0 < 0 || plan.e0 > 252 || plan.n_exc < 0)
@@ -1134,7 +1216,7 @@ int pack_planes(const uint8_t* codes, const uint8_t* scales, int N, int K, int c
     if (plan.n_exc > cap) return kPackOverBudget;
     /* With the plan's count within cap, more raw rounds than cap, or another count, means the plan
      * is not these scales'. */
-    const int ne = pk_pack_rounds(codes, scales, N, K, cap, (uint8_t)plan.e0, dst, L);
+    const int ne = pk_pack_rounds(codes, scales, N, K, cap, (uint8_t)plan.e0, dst, L, copy);
     if (ne != plan.n_exc) return kPackInvalid;
     PkHeader h{};
     h.magic = kPkMagic;

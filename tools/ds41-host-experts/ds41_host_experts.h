@@ -79,12 +79,27 @@ size_t packed_bytes(int N, int K, int cap);
  * such e0), and that count. False for an unusable shape. Writes nothing: a caller can check a
  * weight against a slot's cap before it takes the slot. */
 bool pack_plan(const uint8_t* scales, int N, int K, PackInfo* plan);
+/* How pack_planes writes the codes plane, a slot's bulk (11.8 of a gate_up's 12.0 MB): with `nt`
+ * by non-temporal stores (copy_nt), in pieces of `slice` bytes (0: one piece), before(ctx, bytes)
+ * called before each piece with its size, the first included: a background insert gives way to the
+ * expert pool there. The bytes written are memcpy's. With `nt` every piece ends in an sfence, so the
+ * codes are in memory, ordered before anything the caller stores after pack_planes returns (the
+ * slot's publication). */
+struct PackCopy {
+    bool   nt = false;
+    size_t slice = 0;
+    void (*before)(void* ctx, size_t bytes) = nullptr;
+    void*  ctx = nullptr;
+};
 /* Packs planes (codes [N, K / 2], scales [N, K / 32]) with pack_plan's `plan` for these scales into
- * dst (dst_bytes >= packed_bytes(N, K, cap)), every byte of the slot written. kPackOverBudget when
- * more than cap rounds are raw, kPackInvalid for an unusable shape or a plan that does not match
- * the scales; dst is then unspecified. */
+ * dst (dst_bytes >= packed_bytes(N, K, cap)), every byte of the slot written; `copy` as above (null:
+ * one memcpy). kPackOverBudget when more than cap rounds are raw, kPackInvalid for an unusable shape
+ * or a plan that does not match the scales; dst is then unspecified. */
 int  pack_planes(const uint8_t* codes, const uint8_t* scales, int N, int K, int cap,
-                 const PackInfo& plan, uint8_t* dst, size_t dst_bytes);
+                 const PackInfo& plan, uint8_t* dst, size_t dst_bytes, const PackCopy* copy = nullptr);
+/* memcpy(dst, src, n), dst's whole 64-byte lines by non-temporal stores (neither read first nor kept
+ * in the caches) and its partial ends by ordinary ones; ends in an sfence. */
+void copy_nt(uint8_t* dst, const uint8_t* src, size_t n);
 /* The view of the packed weight at p (`bytes` long): false unless its header describes exactly a
  * [N, K] weight of packed_bytes(N, K, cap) inside those bytes. */
 bool packed_view(const uint8_t* p, size_t bytes, int N, int K, Mx* out);
@@ -108,6 +123,14 @@ void gemv_avx2_rows(const Mx& w, const uint16_t* const* x, uint16_t* const* y, i
  * row's sums then run gemv_avx2's own round code. */
 constexpr int kFewRows = 4;
 void gemv_avx2_few(const Mx& w, const uint16_t* const* x, uint16_t* const* y, int rows, int n0, int n1);
+/* gemv_avx2_few in two halves, for a caller that runs many row ranges of one matrix on the same x
+ * (the pool's tiles of one job): few_lanes lays x out in the kernel's lanes, as every gemv_avx2_few
+ * call does first (halved, transposed; few_lanes_floats(K) floats a row, row i at xt + i *
+ * few_lanes_floats(K), xt 32-byte aligned), and gemv_avx2_few_lanes runs [n0, n1) on them, with
+ * gemv_avx2_few's bits. rows 1 .. kFewRows. */
+size_t few_lanes_floats(int K);
+void few_lanes(const uint16_t* const* x, int rows, int K, float* xt);
+void gemv_avx2_few_lanes(const Mx& w, const float* xt, uint16_t* const* y, int rows, int n0, int n1);
 /* Up to kGemvRows rows at once (more go in calls of kGemvRows), for a prefill pass's many rows of one
  * expert: the output rows in blocks of 16, each round of each of them decoded once into f32 weights,
  * the token rows' sums in register blocks of two output rows by four token rows. */

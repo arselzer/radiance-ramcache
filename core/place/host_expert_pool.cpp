@@ -35,6 +35,7 @@ constexpr const char* kEnvLink    = "RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_LIN
 constexpr const char* kEnvSpin    = "RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SPIN_US";
 constexpr const char* kEnvNice    = "RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_NICE";
 constexpr const char* kEnvMaxRows = "RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MAX_ROWS";
+constexpr const char* kEnvLean    = "RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_LEAN_TILES";
 constexpr const char* kEnvFutex   = "RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_FUTEX";
 constexpr const char* kEnvPrewake = "RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_PREWAKE";
 constexpr const char* kEnvPreSpin = "RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_PREWAKE_SPIN_US";
@@ -109,7 +110,23 @@ double env_f(const char* k, double dflt) {
 int64_t g_spin_ns = 200000;
 int     g_nice = 0;     /* workers' nice value: positive yields the cores to the drive readers */
 
+/* A count only its own worker writes (lean_stats reads it from another thread). */
+inline void bump(std::atomic<uint64_t>& c, uint64_t v = 1) {
+    c.store(c.load(std::memory_order_relaxed) + v, std::memory_order_relaxed);
+}
+
+/* ..._LEAN_TILES: the lanes this worker laid out for its last tile, under their job's sequence and
+ * projection (seq * 2 + down; sequences start at 1, so 0 is none). */
+struct alignas(32) X8 { float f[8]; };
+struct TileLanes {
+    uint64_t key = 0;
+    std::vector<X8> buf;
+};
+thread_local TileLanes t_lanes;
+
 }  /* namespace */
+
+thread_local HostExpertPool::WorkerCounts* HostExpertPool::t_counts_ = nullptr;
 
 int HostExpertPool::max_rows() {
     static const int m = [] {
@@ -180,6 +197,7 @@ HostExpertPool* HostExpertPool::get() {
         const std::vector<int> cpus = parse_cpus(cl);
         if (cl && *cl && cpus.empty())
             RAD_WARN("%s=%s is not a CPU list (\"4-23\", \"4,5,6\"); the workers float", kEnvCpus, cl);
+        if (const char* l = std::getenv(kEnvLean); l && !std::strcmp(l, "1")) p->lean_ = true;
         if (p->start(threads, cpus) < 0) {
             delete p;
             return nullptr;
@@ -202,6 +220,9 @@ HostExpertPool* HostExpertPool::get() {
                          : "not in miss reads",
                      (long long)(p->prewake_spin_ns_ / 1000), kEnvPrewake,
                      pw > threads ? fmt("; %ld asked, %d threads", pw, threads).c_str() : "");
+        if (p->lean_)
+            RAD_INFO("host experts: lean tiles: a worker reuses the x lanes of its last tile on a tile of the "
+                     "same job and projection, and claims look only at the slots holding a job (%s)", kEnvLean);
         g_running.store(p, std::memory_order_release);
         return p;
     }();
@@ -213,6 +234,10 @@ HostExpertPool* HostExpertPool::running() { return g_running.load(std::memory_or
 int HostExpertPool::start(int threads, const std::vector<int>& cpus) {
     slots_.reset(new (std::nothrow) Slot[kSlots]);
     if (!slots_) return RAD_E_NOMEM;
+    if (lean_) {
+        counts_.reset(new (std::nothrow) WorkerCounts[(size_t)threads]);
+        if (!counts_) return RAD_E_NOMEM;
+    }
     /* Each slot's gate_up and act rows, 64-byte aligned (a slot's rows take max_rows() * 13824 bytes:
      * 7 MB in all at four rows, 57 MB at 32). */
     const size_t per = (size_t)max_rows() * 3 * kFf;
@@ -311,6 +336,9 @@ int HostExpertPool::submit(const Job* jobs, int n, Ticket* t) {
         if (j == 0) s.pub_ns = now_ns();
         /* Publishes everything above: a worker reads the job only after claiming a tile. */
         s.claim.store((uint64_t)(uint32_t)seq << 32, std::memory_order_release);
+        /* ..._LEAN_TILES: claims look at this slot from now; its job's last tile clears the bit
+         * before the slot is free, so a later job's bit is never cleared by an earlier one. */
+        if (lean_) active_[slot / 64].fetch_or((uint64_t)1 << (slot % 64), std::memory_order_release);
     }
     lk.unlock();
     /* Outside the lock: waking ~40 sleeping workers takes the waker ~30 us, which another rank's
@@ -395,24 +423,37 @@ bool HostExpertPool::run_one() {
          * urgent ones. */
         Slot* best = nullptr;
         uint64_t best_claim = 0, best_key = UINT64_MAX;
-        for (int i = 0; i < kSlots; ++i) {
-            Slot& s = slots_[i];
+        auto consider = [&](Slot& s) {
             const uint64_t c = s.claim.load(std::memory_order_acquire);
             const uint32_t k = (uint32_t)c;
-            if (k >= (uint32_t)(kGuTiles + kDnTiles)) continue;
+            if (k >= (uint32_t)(kGuTiles + kDnTiles)) return;
             if (k >= (uint32_t)kGuTiles &&
-                s.open.load(std::memory_order_acquire) != (uint32_t)(c >> 32)) continue;
+                s.open.load(std::memory_order_acquire) != (uint32_t)(c >> 32)) return;
             const uint64_t key = s.seq.load(std::memory_order_relaxed) |
                                  (s.urgent.load(std::memory_order_relaxed) ? 0 : (uint64_t)1 << 63);
-            if (key >= best_key) continue;
+            if (key >= best_key) return;
             best = &s;
             best_claim = c;
             best_key = key;
+        };
+        uint64_t looked = 0;
+        if (lean_) {
+            /* ..._LEAN_TILES: the slots holding a job. One published after this read is looked
+             * for again before the worker sleeps (work_gen_), as a claim word read too early is. */
+            for (int w = 0; w < kSlots / 64; ++w)
+                for (uint64_t b = active_[w].load(std::memory_order_acquire); b; b &= b - 1, ++looked)
+                    consider(slots_[w * 64 + __builtin_ctzll(b)]);
+        } else {
+            for (int i = 0; i < kSlots; ++i) consider(slots_[i]);
         }
         if (!best) return false;
         if (!best->claim.compare_exchange_strong(best_claim, best_claim + 1,
                                                  std::memory_order_acq_rel)) continue;
         const int k = (int)(uint32_t)best_claim;
+        if (t_counts_) {
+            bump(t_counts_->claims);
+            bump(t_counts_->scanned, looked);
+        }
         if (best->head && (k == 0 || k == kRampTiles - 1)) claimed(*best, k);
         tile(*best, (uint32_t)(best_claim >> 32), k);
         return true;
@@ -437,6 +478,34 @@ void HostExpertPool::claimed(const Slot& s, int k) {
     }
 }
 
+void HostExpertPool::lanes_gemv(const Slot& s, bool down, const ds41hx::Mx& m, const uint16_t* const* xs,
+                                uint16_t* const* ys, int rows, int n0, int n1) {
+    TileLanes& l = t_lanes;
+    const uint64_t key = s.seq.load(std::memory_order_relaxed) * 2 + (down ? 1 : 0);
+    if (l.key != key) {
+        if (l.buf.empty()) l.buf.resize((size_t)ds41hx::kFewRows * ds41hx::few_lanes_floats(kEmbd) / 8);
+        ds41hx::few_lanes(xs, rows, m.K, l.buf.data()->f);
+        l.key = key;
+        if (t_counts_) bump(t_counts_->built);
+    } else if (t_counts_) {
+        bump(t_counts_->reused);
+    }
+    ds41hx::gemv_avx2_few_lanes(m, l.buf.data()->f, ys, rows, n0, n1);
+}
+
+HostExpertPool::LeanStats HostExpertPool::lean_stats() const {
+    LeanStats st;
+    if (!counts_) return st;
+    for (size_t i = 0; i < workers_.size(); ++i) {
+        const WorkerCounts& c = counts_[i];
+        st.claims += c.claims.load(std::memory_order_relaxed);
+        st.scanned += c.scanned.load(std::memory_order_relaxed);
+        st.lanes_built += c.built.load(std::memory_order_relaxed);
+        st.lanes_reused += c.reused.load(std::memory_order_relaxed);
+    }
+    return st;
+}
+
 /* A packed slot's view: submit checked it, and the slot is leased and unchanged until the job is done. */
 static void packed_or_die(const uint8_t* p, int64_t bytes, int N, int K, ds41hx::Mx* m) {
     if (ds41hx::packed_view(p, (size_t)bytes, N, K, m)) return;
@@ -447,6 +516,8 @@ static void packed_or_die(const uint8_t* p, int64_t bytes, int N, int K, ds41hx:
 void HostExpertPool::tile(Slot& s, uint32_t gen, int k) {
     ds41hx::Mx m;
     const bool planes = s.job.gu_scales != nullptr;
+    /* ..._LEAN_TILES: a job the few-row kernel runs takes it on this worker's lanes of its x. */
+    const bool lanes = lean_ && 1 + s.job.more < many_from();
     if (k < kGuTiles) {
         m.N = 2 * kFf;
         m.K = kEmbd;
@@ -456,8 +527,11 @@ void HostExpertPool::tile(Slot& s, uint32_t gen, int k) {
         const uint16_t* xs[kMaxRowsCap];
         uint16_t* ys[kMaxRowsCap];
         for (int r = 0; r <= s.job.more; ++r) { xs[r] = r ? s.job.xs[r - 1] : s.job.x; ys[r] = s.gate_up + (size_t)r * 2 * kFf; }
-        (1 + s.job.more >= many_from() ? ds41hx::gemv_avx2_many : ds41hx::gemv_avx2_few)(m, xs, ys, 1 + s.job.more, k * kTile,
-                                                                                         (k + 1) * kTile);
+        if (lanes)
+            lanes_gemv(s, false, m, xs, ys, 1 + s.job.more, k * kTile, (k + 1) * kTile);
+        else
+            (1 + s.job.more >= many_from() ? ds41hx::gemv_avx2_many : ds41hx::gemv_avx2_few)(m, xs, ys, 1 + s.job.more,
+                                                                                             k * kTile, (k + 1) * kTile);
         if (s.gu_left.fetch_sub(1, std::memory_order_acq_rel) == 1) {
             /* The job's down tiles wait for this, so it runs eight values a step (12 -> ~2 us a
              * row); RADIANCE_EXPERIMENTAL_DS41_SWIGLU_SCALAR=1 keeps the scalar loop (an A/B switch). */
@@ -482,15 +556,26 @@ void HostExpertPool::tile(Slot& s, uint32_t gen, int k) {
     const uint16_t* xs[kMaxRowsCap];
     uint16_t* ys[kMaxRowsCap];
     for (int r = 0; r <= s.job.more; ++r) { xs[r] = s.act + (size_t)r * kFf; ys[r] = r ? s.job.ys[r - 1] : s.job.y; }
-    (1 + s.job.more >= many_from() ? ds41hx::gemv_avx2_many : ds41hx::gemv_avx2_few)(m, xs, ys, 1 + s.job.more, d * kTile,
-                                                                                     (d + 1) * kTile);
+    if (lanes)
+        lanes_gemv(s, true, m, xs, ys, 1 + s.job.more, d * kTile, (d + 1) * kTile);
+    else
+        (1 + s.job.more >= many_from() ? ds41hx::gemv_avx2_many : ds41hx::gemv_avx2_few)(m, xs, ys, 1 + s.job.more,
+                                                                                         d * kTile, (d + 1) * kTile);
     if (s.dn_left.fetch_sub(1, std::memory_order_acq_rel) != 1) return;
     /* The job's last tile: nothing reads the slot after this. */
     Ticket* t = s.ticket;
-    drained(backlog_.fetch_sub(s.job.cost, std::memory_order_relaxed) - s.job.cost);
+    const int64_t left = backlog_.fetch_sub(s.job.cost, std::memory_order_relaxed) - s.job.cost;
+    const bool late = quiet_late_.load(std::memory_order_relaxed);
+    if (!late) drained(left);
+    if (lean_) {
+        const int i = (int)(&s - slots_.get());
+        active_[i / 64].fetch_and(~((uint64_t)1 << (i % 64)), std::memory_order_relaxed);
+    }
     s.state.store(0, std::memory_order_release);
     t->left.fetch_sub(1, std::memory_order_acq_rel);
     slot_cv_.notify_one();
+    /* quiet_after_tickets: the ticket's waiter goes on first. */
+    if (late) drained(left);
 }
 
 void HostExpertPool::drained(int64_t left) {
@@ -513,6 +598,7 @@ void HostExpertPool::wait_idle(int64_t max_ns) {
 }
 
 void HostExpertPool::worker(int i, int cpu) {
+    t_counts_ = counts_ ? &counts_[(size_t)i] : nullptr;
     if (cpu >= 0) {
         cpu_set_t set;
         CPU_ZERO(&set);

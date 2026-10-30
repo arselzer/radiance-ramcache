@@ -968,6 +968,44 @@ TEST(mapped_packed_actual_mover_inserts_lends_and_keeps_the_card_out){
     CHECK(has(t.mover->report(),"packed RAM cache"));
 }
 
+/* RADIANCE_EXPERIMENTAL_DS41_INSERT_NT / _SLICE_KIB (the background inserts' ds41hx::PackCopy): a unit
+ * inserted with its codes planes written by non-temporal stores in 4 KiB pieces lends slots holding
+ * every byte one memcpy's pack writes there (the codes, header, 2-bit codes and raw rounds), and the
+ * hook ran once a piece, for every byte of both codes planes. */
+TEST(mapped_packed_insert_by_streaming_stores_in_pieces_writes_the_same_slots){
+    Environment mapped("1","1");PackedEnvironment packed;
+    Fixture f;f.experts();f.info.relayout=mx_relayout;Image image(lay_out_mxfp4(f));write_scales(f,image);
+    Config cfg=plan_config(false);Plan plan=planned(f,cfg,true);const auto units=two_ssd_experts(plan);
+    std::atomic<uint64_t> calls{0};Access::Driver driver;Transport t;t.open(f,plan,image,80*MiB,calls);Access::attach(*t.mover,driver);
+    REQUIRE(t.mover->packed_cache());
+    const int32_t u=plan.units[size_t(units[0])].expert==1?units[1]:units[0];   //write_scales: expert 1's down is over budget
+    Mover::HostPlanes p;p.unit=u;Mover::HostPlanes* pp=&p;
+    REQUIRE(t.mover->read_unit_planes(&pp,1,1));REQUIRE_EQ(p.n,2);
+    struct Count{size_t calls=0,bytes=0;};Count cnt;
+    ds41hx::PackCopy cp;cp.nt=true;cp.slice=4096;cp.ctx=&cnt;
+    cp.before=+[](void* c,size_t n){Count* k=static_cast<Count*>(c);++k->calls;k->bytes+=n;};
+    std::vector<uint8_t> scratch;
+    CHECK_EQ(t.mover->insert_unit_planes(p,&scratch,&cp),RAD_OK);
+    REQUIRE(t.mover->unit_cached(u));
+    Mover::HostUnit hu;REQUIRE(t.mover->borrow_host_unit(u,&hu));REQUIRE(hu.packed);REQUIRE_EQ(hu.n,2);
+    size_t codes=0,pieces=0;
+    for(int k=0;k<2;++k){
+        const auto& w=f.prog.weights[p.w[k]];const int N=int(mx_rows(w)),K=int(mx_cols(w));
+        const int cap=w.stored_bytes==int64_t(NativeMappedFileCache::GU)?512:320;   //the default budgets
+        const uint8_t* const c=image.bytes.data()+w.file_plane_offset[0];const uint8_t* const sc=image.bytes.data()+w.file_plane_offset[1];
+        ds41hx::PackInfo pi;REQUIRE(ds41hx::pack_plan(sc,N,K,&pi));
+        std::vector<uint8_t> want(ds41hx::packed_bytes(N,K,cap),0xA5);
+        REQUIRE_EQ(ds41hx::pack_planes(c,sc,N,K,cap,pi,want.data(),want.size()),ds41hx::kPackOk);
+        REQUIRE(hu.slot[k]>=int64_t(want.size()));
+        CHECK(std::memcmp(hu.host[k],want.data(),want.size())==0);
+        codes+=size_t(N)*size_t(K/2);pieces+=(size_t(N)*size_t(K/2)+4095)/4096;
+    }
+    t.mover->release_host_unit(&hu);
+    CHECK_EQ(cnt.bytes,codes);CHECK_EQ(cnt.calls,pieces);
+    CHECK_EQ(t.mover->packed_stats().inserted,uint64_t(2));CHECK_EQ(t.mover->packed_stats().round_trip_failed,uint64_t(0));
+    t.drain();
+}
+
 /* Read-ahead in pieces (place/readahead.h) through the actual HOST Mover: lay_out_unit_planes lays
  * a unit out exactly as read_unit_planes does, its pieces read through read_piece (the container,
  * O_DIRECT, 64 KiB pieces, three readers, a demand read holding them back midway) leave the same

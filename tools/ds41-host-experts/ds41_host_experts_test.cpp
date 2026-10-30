@@ -14,6 +14,10 @@
  *                                           four rows against one job of every row (gemv_avx2_many)
  *   ds41_host_experts_test rhot [reps] [rows] [block|packed|planes] [n] [tile]  few and many rows, one
  *                                           matrix in cache, one thread, in 64-row tiles
+ *   ds41_host_experts_test insbench [experts] [threads] [units] [batch]  the pool's packed GEMV, `batch`
+ *                                           experts a burst, with a background insert beside it: none,
+ *                                           memcpy's cached stores, copy_nt's streaming stores
+ *                                           (..._INSERT_NT), or a spinning core
  *
  * The bench streams `experts` distinct DeepSeek-V4.1 experts (gate_up 4608 x 5120 and down
  * 5120 x 2304, 18.8 MB each) so the weights come from DRAM, as they would from the RAM cache. */
@@ -24,6 +28,7 @@
 #include <sched.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <functional>
 #include <memory>
@@ -192,6 +197,67 @@ size_t diff(const std::vector<uint16_t>& a, const std::vector<uint16_t>& b) {
     return d;
 }
 
+/* copy_nt against memcpy, and pack_planes writing the codes plane by non-temporal stores and in pieces
+ * (PackCopy, the background inserts' ..._INSERT_NT and ..._INSERT_SLICE_KIB): every slot byte as one
+ * memcpy writes it, at the release's shapes and an odd one, into a slot on and off a 64-byte line,
+ * with before() called once a piece, the first included, for the piece's bytes. */
+int packed_copy() {
+    int failures = 0;
+    std::mt19937_64 rng(4242u);
+    std::vector<uint8_t> src(70000), a(70000 + 128), b(70000 + 128);
+    for (auto& v : src) v = (uint8_t)rng();
+    size_t dcopy = 0;
+    for (size_t n : { (size_t)0, (size_t)1, (size_t)63, (size_t)64, (size_t)65, (size_t)127, (size_t)4096, (size_t)65537 })
+        for (size_t d0 : { (size_t)0, (size_t)1, (size_t)8, (size_t)63 })
+            for (size_t s0 : { (size_t)0, (size_t)3 }) {
+                std::fill(a.begin(), a.end(), 0x5A);
+                std::fill(b.begin(), b.end(), 0x5A);
+                const size_t base = (size_t)(-(uintptr_t)a.data() & 63), bbase = (size_t)(-(uintptr_t)b.data() & 63);
+                std::memcpy(a.data() + base + d0, src.data() + s0, n);
+                copy_nt(b.data() + bbase + d0, src.data() + s0, n);
+                dcopy += std::memcmp(a.data() + base, b.data() + bbase, 70000) != 0;
+            }
+    std::printf("%-26s copy_nt against memcpy, 8 sizes x 4 offsets x 2 sources: %zu differ\n", "copy_nt", dcopy);
+    failures += dcopy != 0;
+    struct Count { size_t calls = 0, bytes = 0, max = 0; };
+    auto before = [](void* ctx, size_t bytes) {
+        Count* c = static_cast<Count*>(ctx);
+        ++c->calls;
+        c->bytes += bytes;
+        c->max = std::max(c->max, bytes);
+    };
+    auto mix = [](int, int, uint64_t r) { return release_like(r, 119, 3000); };
+    struct Shape { int N, K; };
+    for (const Shape sh : { Shape{ 2 * kFf, kEmbd }, Shape{ kEmbd, kFf }, Shape{ 64, 1056 } }) {
+        const Mat m = make_mat_with(sh.N, sh.K, 77u + (uint64_t)sh.N, mix);
+        const Packed want = pack(m);
+        if (!want.ok()) { std::printf("packed copy %dx%d: FAIL: pack_planes returned %d\n", sh.N, sh.K, want.rc); ++failures; continue; }
+        const size_t cb = (size_t)sh.N * (size_t)(sh.K / 2);
+        size_t bad = 0, calls_off = 0;
+        for (const bool nt : { true, false })
+            for (const size_t slice : { (size_t)0, (size_t)1000, (size_t)4096, (size_t)256 << 10 })
+                for (const size_t off : { (size_t)0, (size_t)8 }) {
+                    std::vector<uint8_t> buf(want.bytes + 64 + 128, 0xA5);
+                    uint8_t* const dst = buf.data() + (size_t)(-(uintptr_t)buf.data() & 63) + off;
+                    Count cnt;
+                    PackCopy cp;
+                    cp.nt = nt;
+                    cp.slice = slice;
+                    cp.before = +before;
+                    cp.ctx = &cnt;
+                    const int rc = pack_planes(m.codes.data(), m.scales.data(), sh.N, sh.K, rounds_of(sh.N, sh.K), want.plan, dst,
+                                               want.bytes, &cp);
+                    bad += rc != kPackOk || std::memcmp(dst, want.slot.data(), want.bytes) != 0;
+                    const size_t pieces = slice ? (cb + slice - 1) / slice : 1;
+                    calls_off += cnt.calls != pieces || cnt.bytes != cb || cnt.max != (slice ? std::min(slice, cb) : cb);
+                }
+        std::printf("packed copy %4dx%-4d    by streaming stores and not, pieces of 0 / 1000 / 4 KiB / 256 KiB, slot on and "
+                    "off a line: %zu slots differ, %zu piece counts off\n", sh.N, sh.K, bad, calls_off);
+        failures += bad != 0 || calls_off != 0;
+    }
+    return failures;
+}
+
 int check() {
     int failures = 0;
     struct Case { const char* name; int N, K; Scales sc; Acts act; };
@@ -250,7 +316,7 @@ int check() {
         std::vector<std::vector<uint16_t>> xr(kRowsMax);
         for (int i = 0; i < kRowsMax; ++i)
             xr[(size_t)i] = i ? make_x(c.K, 31u * (uint64_t)i + (uint64_t)c.K + 3u * (uint64_t)c.act, c.act) : x;
-        size_t dfew = 0, dmany = 0, drows = 0;
+        size_t dfew = 0, dmany = 0, drows = 0, dlanes = 0;
         for (int lay = 0; lay < (pk.ok() ? 3 : 2); ++lay) {
             const Mx mx = lay == 2 ? pk.view() : lay ? m.planes() : m.ggml();
             std::vector<std::vector<uint16_t>> one(kRowsMax, std::vector<uint16_t>((size_t)c.N));
@@ -281,16 +347,31 @@ int check() {
                         d += got[(size_t)i][(size_t)n] != (n < 8 ? (uint16_t)0xffff : one[(size_t)i][(size_t)n]);
                 return d;
             };
+            /* gemv_avx2_few_lanes on few_lanes' lanes, laid out once and used for every 64-row tile
+             * of the output rows, as the pool runs a job's tiles (..._HOST_EXPERTS_LEAN_TILES). */
+            auto run_lanes = [&](int rows) {
+                struct alignas(32) F8 { float f[8]; };
+                std::vector<F8> lanes((size_t)rows * few_lanes_floats(c.K) / 8);
+                few_lanes(xs, rows, c.K, lanes.data()->f);
+                std::vector<std::vector<uint16_t>> got((size_t)rows, std::vector<uint16_t>((size_t)c.N, 0xffff));
+                uint16_t* ys[kRowsMax];
+                for (int i = 0; i < rows; ++i) ys[i] = got[(size_t)i].data();
+                for (int n0 = 0; n0 < c.N; n0 += 64) gemv_avx2_few_lanes(mx, lanes.data()->f, ys, rows, n0, std::min(n0 + 64, c.N));
+                size_t d = 0;
+                for (int i = 0; i < rows; ++i) d += diff(one[(size_t)i], got[(size_t)i]);
+                return d;
+            };
             for (int rows = 2; rows <= 5; ++rows) dfew += run(gemv_avx2_few, rows);
+            for (int rows = 1; rows <= 5; ++rows) dlanes += run_lanes(rows);
             for (int rows = 1; rows <= kRowsMax; ++rows) {
                 dmany += run(gemv_avx2_many, rows);
                 drows += run(gemv_avx2_rows, rows);
             }
             for (int rows : { 1, 3, 4, 6, 32, 33 }) dmany += run_from8(rows);
         }
-        std::printf("%-26s every layout: avx2 few 2..5 rows %zu, many 1..33 %zu, rows 1..33 %zu differing values\n",
-                    c.name, dfew, dmany, drows);
-        failures += dfew || dmany || drows;
+        std::printf("%-26s every layout: avx2 few 2..5 rows %zu, few on laid-out lanes 1..5 %zu, many 1..33 %zu, "
+                    "rows 1..33 %zu differing values\n", c.name, dfew, dlanes, dmany, drows);
+        failures += dfew || dlanes || dmany || drows;
     }
     /* A whole expert: gate_up, swiglu_clamped and down, scalar vs AVX2 at four threads. */
     const Mat gu = make_mat(2 * kFf, kEmbd, 7u, kReal), dn = make_mat(kEmbd, kFf, 8u, kReal);
@@ -350,6 +431,7 @@ int check() {
     std::printf("%-26s packed (gate_up %d, down %d rounds raw): %zu differing values\n", "expert forward packed",
                 kgu.plan.n_exc, kdn.plan.n_exc, dk);
     failures += dk != 0;
+    failures += packed_copy();
     std::printf(failures ? "FAIL: %d case(s) differ\n" : "PASS: every case bit-identical\n", failures);
     return failures ? 1 : 0;
 }
@@ -864,6 +946,173 @@ int pkbench(int experts, const std::vector<int>& counts, const std::string& dir)
     return 0;
 }
 
+/* ---- insbench: a background insert beside the pool's streaming --------------------------------------
+ *
+ * The RAM cache's background inserts (RADIANCE_EXPERIMENTAL_DS41_INSERT_NT) against the pool's GEMV:
+ * `threads` workers stream `experts` distinct packed experts in 64-row tiles, `batch` experts' tiles
+ * from one shared counter at a time (a burst of four ranks' jobs: the DRAM-bound regime), while one
+ * more thread packs `units` missed units' planes into slots of their own, back to back (the insert's
+ * work, ~18 MB a unit): with memcpy's cached stores, with copy_nt's streaming stores, not at all
+ * (asleep), or spinning without touching memory (the control for a busy core). Seven samples of each,
+ * the order rotated each time; the median GEMV rate, the ms an insert took, and what the inserts cost
+ * the GEMV in bytes per byte inserted. One unit's slots by the two copies are compared first. */
+int insbench(int experts, int threads, int units, int batch) {
+    batch = std::max(1, std::min(batch, experts));
+    std::printf("building %d packed experts and %d missed units with slots (%.2f GB)...\n", experts, units,
+                (experts * 18.0e6 + units * (17.7e6 + 1.1e6 + 18.0e6)) / 1e9);
+    auto mix = [](int, int, uint64_t r) { return release_like(r, 119, 3000); };
+    std::vector<Packed> pgu, pdn;
+    double packed_read = 0;
+    for (int i = 0; i < experts; ++i) {
+        const Mat g = make_mat_with(2 * kFf, kEmbd, 100u + (uint64_t)i, mix), d = make_mat_with(kEmbd, kFf, 900u + (uint64_t)i, mix);
+        pgu.push_back(pack(g, 512));   /* the engine's raw-round budgets */
+        pdn.push_back(pack(d, 320));
+        if (!pgu.back().ok() || !pdn.back().ok()) { std::printf("packing failed\n"); return 1; }
+        for (const Packed* q : { &pgu.back(), &pdn.back() })
+            packed_read += (double)q->N * (q->K / 2) + (double)q->N * (double)pk_row_bytes(q->K) + 36.0 * q->plan.n_exc;
+    }
+    struct Unit { Mat w[2]; PackInfo plan[2]; std::vector<uint8_t> slot[2]; };
+    const int shape[2][3] = { { 2 * kFf, kEmbd, 512 }, { kEmbd, kFf, 320 } };   /* N, K, cap */
+    std::vector<Unit> u((size_t)units);
+    double unit_bytes = 0;
+    for (int i = 0; i < units; ++i)
+        for (int k = 0; k < 2; ++k) {
+            Unit& x = u[(size_t)i];
+            x.w[k] = make_mat_with(shape[k][0], shape[k][1], 5000u + 2u * (uint64_t)i + (uint64_t)k, mix);
+            std::vector<uint8_t>().swap(x.w[k].blocks);
+            if (!pack_plan(x.w[k].scales.data(), shape[k][0], shape[k][1], &x.plan[k]) || x.plan[k].n_exc > shape[k][2]) {
+                std::printf("unit %d over its budget\n", i);
+                return 1;
+            }
+            x.slot[k].assign(packed_bytes(shape[k][0], shape[k][1], shape[k][2]), 0);
+            if (i == 0) unit_bytes += (double)x.slot[k].size();
+        }
+    auto insert = [&](Unit& x, bool nt) {
+        PackCopy cp;
+        cp.nt = true;
+        for (int k = 0; k < 2; ++k)
+            if (pack_planes(x.w[k].codes.data(), x.w[k].scales.data(), shape[k][0], shape[k][1], shape[k][2], x.plan[k],
+                            x.slot[k].data(), x.slot[k].size(), nt ? &cp : nullptr) != kPackOk)
+                return false;
+        return true;
+    };
+    {
+        Unit& x = u[0];
+        std::vector<uint8_t> a[2];
+        bool ok = insert(x, false);
+        for (int k = 0; k < 2; ++k) a[k] = x.slot[k];
+        ok = ok && insert(x, true);
+        for (int k = 0; k < 2; ++k) ok = ok && a[k] == x.slot[k];
+        std::printf("one unit packed by memcpy and by copy_nt: %s\n", ok ? "identical slots" : "SLOTS DIFFER");
+        if (!ok) return 1;
+    }
+    std::vector<float> silu(65536);
+    silu_table_host(silu.data(), kLimit);
+    const auto xv = make_x(kEmbd, 3u, kNormal);
+    std::vector<std::vector<uint16_t>> g((size_t)batch, std::vector<uint16_t>(2 * kFf)), act((size_t)batch, std::vector<uint16_t>(kFf)),
+                                       d((size_t)batch, std::vector<uint16_t>(kEmbd));
+    Pool pool(threads);
+    /* The inserter's mode: 0 asleep between looks, 1 memcpy, 2 copy_nt, 3 spinning (no memory). */
+    enum { kNone, kMemcpy, kNt, kSpin, kModes };
+    std::atomic<int> mode{ kNone };
+    std::atomic<bool> quit{ false }, busy{ false };
+    std::atomic<uint64_t> ins_n{ 0 }, ins_ns{ 0 };
+    std::thread inserter([&] {
+        if (threads < 48) Pool::pin(threads);
+        for (size_t i = 0; !quit.load();) {
+            const int md = mode.load();
+            if (md == kNone) {
+                busy = false;
+                std::this_thread::sleep_for(std::chrono::microseconds(100));
+                continue;
+            }
+            busy = true;
+            if (md == kSpin) {
+                for (int r = 0; r < 256; ++r) _mm_pause();
+                continue;
+            }
+            const auto t0 = std::chrono::steady_clock::now();
+            insert(u[i++ % (size_t)units], md == kNt);
+            ins_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+            ++ins_n;
+        }
+    });
+    std::atomic<int> next{ 0 };
+    /* `nb` matrices' tiles of `per` 64-row tiles each, from one counter. */
+    auto tiles = [&](const Mx* const* m, const uint16_t* const* in, uint16_t* const* out, int nb, int per) {
+        for (int t; (t = next.fetch_add(1)) < nb * per;) {
+            const int e = t / per, r = t % per;
+            gemv_avx2(*m[e], in[e], out[e], r * 64, std::min(m[e]->N, (r + 1) * 64));
+        }
+    };
+    const int passes = std::max(1, 640 / experts), samples = 7;
+    auto timed = [&](int md) {   /* s a pass over the set; the inserts it saw, and their ns */
+        mode = md;
+        while (md != kNone && !busy.load()) _mm_pause();
+        const uint64_t n0 = ins_n.load(), t0n = ins_ns.load();
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int p = 0; p < passes; ++p)
+            for (int i0 = 0; i0 < experts; i0 += batch) {
+                const int nb = std::min(batch, experts - i0);
+                std::vector<Mx> G, D;
+                std::vector<const Mx*> gp, dp;
+                std::vector<const uint16_t*> xin, ain;
+                std::vector<uint16_t*> gout, dout;
+                for (int b = 0; b < nb; ++b) {
+                    G.push_back(pgu[(size_t)(i0 + b)].view());
+                    D.push_back(pdn[(size_t)(i0 + b)].view());
+                }
+                for (int b = 0; b < nb; ++b) {
+                    gp.push_back(&G[(size_t)b]);
+                    dp.push_back(&D[(size_t)b]);
+                    xin.push_back(xv.data());
+                    ain.push_back(act[(size_t)b].data());
+                    gout.push_back(g[(size_t)b].data());
+                    dout.push_back(d[(size_t)b].data());
+                }
+                next = 0;
+                pool.run([&](int) { tiles(gp.data(), xin.data(), gout.data(), nb, 2 * kFf / 64); });
+                for (int b = 0; b < nb; ++b) swiglu(silu.data(), g[(size_t)b].data(), act[(size_t)b].data(), kFf, kLimit);
+                next = 0;
+                pool.run([&](int) { tiles(dp.data(), ain.data(), dout.data(), nb, kEmbd / 64); });
+            }
+        const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() / passes;
+        const std::array<double, 3> r{ s, (double)(ins_n.load() - n0), (double)(ins_ns.load() - t0n) };
+        mode = kNone;
+        while (busy.load()) _mm_pause();   /* the insert in flight ends before the next sample */
+        return r;
+    };
+    for (int md = 0; md < kModes; ++md) timed(md);   /* warm the code and the pages */
+    std::vector<std::array<double, 3>> ts[kModes];
+    for (int rep = 0; rep < samples; ++rep)
+        for (int j = 0; j < kModes; ++j) {
+            const int md = (rep + j) % kModes;
+            ts[md].push_back(timed(md));
+        }
+    quit = true;
+    inserter.join();
+    const char* const name[kModes] = { "no inserts", "memcpy", "copy_nt", "spin" };
+    std::printf("%d threads, %d experts a burst, %d samples of %d passes over %d packed experts (%.0f MB a pass), an insert "
+                "%.1f MB:\n", threads, batch, samples, passes, experts, packed_read / 1e6, unit_bytes / 1e6);
+    double base = 0;
+    for (int md = 0; md < kModes; ++md) {
+        std::sort(ts[md].begin(), ts[md].end());
+        const auto& m = ts[md][(size_t)samples / 2];
+        double n = 0, ns = 0, s = 0;
+        for (const auto& t : ts[md]) { n += t[1]; ns += t[2]; s += t[0] * passes; }
+        const double gemv = packed_read / m[0], ins_rate = n * unit_bytes / s;
+        if (md == kNone) base = gemv;
+        std::printf("   %-10s GEMV %.4f ms an expert (best %.4f, worst %.4f), %5.1f GB/s, %+.2f%%", name[md], 1e3 * m[0] / experts,
+                    1e3 * ts[md][0][0] / experts, 1e3 * ts[md][(size_t)samples - 1][0] / experts, gemv / 1e9,
+                    100.0 * (gemv / base - 1.0));
+        if (md == kMemcpy || md == kNt)
+            std::printf("; inserts %.2f ms each, %.2f GB/s; %.2f GEMV bytes lost a byte inserted", n ? ns / n / 1e6 : 0.0,
+                        ins_rate / 1e9, ins_rate > 0 ? (base - gemv) / ins_rate : 0.0);
+        std::printf("\n");
+    }
+    return 0;
+}
+
 /* ---- rbench: what a token row more costs the pool ---------------------------------------------------
  *
  * `experts` distinct experts in one layout (block, packed or planes; the research sample's real scales
@@ -1144,6 +1393,9 @@ int main(int argc, char** argv) {
         return pkbench(argc > 2 ? std::atoi(argv[2]) : 32, counts, sample_dir(0, argv, 1));
     }
     if (argc > 1 && !std::strcmp(argv[1], "packed")) return packed_test(sample_dir(argc, argv, 2));
+    if (argc > 1 && !std::strcmp(argv[1], "insbench"))   /* insbench [experts] [threads] [units] [batch] */
+        return insbench(argc > 2 ? std::atoi(argv[2]) : 32, argc > 3 ? std::atoi(argv[3]) : 40, argc > 4 ? std::atoi(argv[4]) : 8,
+                        argc > 5 ? std::atoi(argv[5]) : 4);
     if (argc > 1 && !std::strcmp(argv[1], "hot"))   /* hot [reps] [rows] [planes] */
         return hot(argc > 2 ? std::atoi(argv[2]) : 200, argc > 3 ? std::atoi(argv[3]) : 2 * kFf,
                    argc > 4 && !std::strcmp(argv[4], "planes"));

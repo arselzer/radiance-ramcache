@@ -308,6 +308,28 @@ arm() {   # name, then env assignments for the server; CACHE_MIB the RAM cache (
   fi
   [[ -n "${ARM_CS:-}" ]] && grep -m2 -E 'consumer skip: on|consumer suffix declared' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   xt_check "$name" || { stop_server; return 1; }
+  # In / Is (RADIANCE_EXPERIMENTAL_DS41_INSERT_NT / _SLICE_KIB) and Ph (_HOST_EXPERTS_LEAN_TILES):
+  # rank 0 names what it took at startup. An arm whose line is missing or says otherwise (a radiance
+  # without the switch, a cache that is not packed), or a plain arm with one, is not measured.
+  local ins_line lean_lines want_ins=""
+  ins_line=$(grep -m1 -E "background inserts write a missed unit's codes by non-temporal stores" "$OUT/$name.server.log")
+  lean_lines=$(grep -c 'host experts: lean tiles:' "$OUT/$name.server.log")
+  if [[ -n "${ARM_INS_KIB:-}" ]]; then want_ins="in pieces of ${ARM_INS_KIB} KiB; a one-token pass's insert sleeps before each piece while the pool has work, at most ${ARM_INS_WAIT} us"
+  elif [[ -n "${ARM_INS_NT:-}" ]]; then want_ins="by non-temporal stores (RADIANCE_EXPERIMENTAL_DS41_INSERT_NT)"; fi
+  if [[ -n "$want_ins" && "$ins_line" != *"$want_ins"* ]]; then
+    log "arm $name: In / Is, but the server log does not say it (${ins_line:-no 'background inserts write' line}); not measured"
+    stop_server; return 1
+  fi
+  if [[ -z "$want_ins" && -n "$ins_line" ]]; then
+    log "arm $name: no In / Is part, but the server writes its inserts by non-temporal stores (the knob set for the window?); not measured"
+    stop_server; return 1
+  fi
+  if [[ -n "${ARM_LEAN:-}" && "$lean_lines" == 0 ]] || [[ -z "${ARM_LEAN:-}" && "$lean_lines" != 0 ]]; then
+    log "arm $name: $([[ -n "${ARM_LEAN:-}" ]] && echo "a Ph part" || echo "no Ph part"), but the server log has $lean_lines 'lean tiles:' line(s); not measured"
+    stop_server; return 1
+  fi
+  [[ -n "$ins_line" ]] && echo "$ins_line" | tee -a "$OUT/window.log"
+  [[ -n "${ARM_LEAN:-}" ]] && grep -m1 'host experts: lean tiles:' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   # DbN (RADIANCE_EXPERIMENTAL_DS41_DSPARK_SHORT_BLOCK): the engine says at startup that the drafter
   # runs its short block. A Db arm without that line (a plugin without the switch: the full block
   # runs), or another arm with it, is not measured.
@@ -441,6 +463,36 @@ arm() {   # name, then env assignments for the server; CACHE_MIB the RAM cache (
       [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
     fi
   fi
+  # In / Is / Ph at shutdown: every rank's "background inserts" line counts the pieces its inserts
+  # wrote by non-temporal stores (an In or Is arm: above 0 on every rank, an Is arm's pieces after a
+  # wait above 0 in all; a plain arm: 0), and the pool's "lean tiles" line the tiles claimed and the
+  # lanes reused (Ph: both above 0; a plain arm has no such line). Otherwise not measured.
+  local ins_bad="" ins_ranks=0 ins_zero=0 ins_pieces=0 ins_waited=0 l np nw lean_line
+  while IFS= read -r l; do
+    np=$(sed -nE 's/.*non-temporal: ([0-9]+) pieces.*/\1/p' <<< "$l")
+    nw=$(sed -nE 's/.*waited before ([0-9]+) pieces.*/\1/p' <<< "$l")
+    ins_ranks=$((ins_ranks + 1)); ins_pieces=$((ins_pieces + ${np:-0})); ins_waited=$((ins_waited + ${nw:-0}))
+    (( ${np:-0} == 0 )) && ins_zero=$((ins_zero + 1))
+  done < <(grep -E "host experts' background inserts: " "$OUT/$name.server.log")
+  if [[ -n "${ARM_INS_NT:-}${ARM_INS_KIB:-}" ]]; then
+    (( ins_ranks == 0 || ins_zero > 0 )) && ins_bad="$ins_zero of $ins_ranks ranks' 'background inserts' lines show no non-temporal piece"
+    [[ -n "${ARM_INS_KIB:-}" ]] && (( ins_waited == 0 )) && ins_bad="${ins_bad:+$ins_bad; }no piece waited for an idle pool"
+  elif (( ins_pieces > 0 )); then
+    ins_bad="no In / Is part, but $ins_pieces pieces went by non-temporal stores"
+  fi
+  lean_line=$(grep -m1 -E 'host expert pool, lean tiles: ' "$OUT/$name.server.log")
+  if [[ -n "${ARM_LEAN:-}" ]]; then
+    [[ "$lean_line" =~ lean\ tiles:\ ([0-9]+)\ tiles\ claimed.*reused\ on\ ([0-9]+) ]] &&
+      (( BASH_REMATCH[1] > 0 && BASH_REMATCH[2] > 0 )) ||
+      ins_bad="${ins_bad:+$ins_bad; }Ph, but the pool's lean tiles line is ${lean_line:-missing} (no tile claimed or no lanes reused)"
+  elif [[ -n "$lean_line" ]]; then
+    ins_bad="${ins_bad:+$ins_bad; }no Ph part, but the pool ran lean tiles"
+  fi
+  if [[ -n "$ins_bad" ]]; then
+    log "arm $name: $ins_bad; not measured (results kept as $name.unmeasured.json)"
+    [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
+  fi
+  grep -E "host experts' background inserts: |host expert pool, lean tiles: " "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   grep -E 'host experts|EP scoped|live chain|error|ERR' "$OUT/$name.server.log" | tail -16 | tee -a "$OUT/window.log"
   grep -E 'read-ahead (in pieces:|readers)|router predictor \(' "$OUT/$name.server.log" | tail -6 | tee -a "$OUT/window.log"
   # The per-unit wait for partly read units, every arm with read-ahead in pieces (the Pu parts' gate),
@@ -800,8 +852,21 @@ for a in $ARMS; do
 # startup, WpN its pre-wake line for N workers and the stager's router events, and at shutdown the
 # pool's line with router pre-wakes that woke workers (else the arm's results are set aside as
 # <arm>.unmeasured.json); an arm without them must show neither startup line.
+# In the background inserts write a missed unit's codes into the packed RAM cache by non-temporal
+# stores (RADIANCE_EXPERIMENTAL_DS41_INSERT_NT=1; needs K); Is / IsN the same in pieces of N KiB
+# (256), a one-token pass's insert sleeping before each piece while the pool has work, at most
+# ..._INSERT_WAIT_US an insert (RADIANCE_EXPERIMENTAL_DS41_INSERT_SLICE_KIB; needs K), IwN that wait
+# (4000 us; needs Is); Ph the pool's lean tiles: a worker reuses its last tile's x lanes on a tile of
+# the same job and projection, and claims look only at the slots holding a job
+# (RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_LEAN_TILES=1). All exact (the cache's bytes, every row).
+# Every arm states the three switches (0 without In / Is / Ph, the wait empty, i.e. its default,
+# without Iw), and is measured only if the server log shows what its name says: the startup line
+# ("background inserts write ... by non-temporal stores", "in pieces of N KiB"; "lean tiles:") and
+# at shutdown every rank's "background inserts" line with non-temporal pieces (Is: some after a
+# wait), the "lean tiles" line with tiles claimed and lanes reused; a plain arm none of it (results
+# otherwise kept as <arm>.unmeasured.json).
   IFS=- read -r -a parts <<< "$a"
-  xt="" bt="" kld="" dk="" db="" pu=""
+  xt="" bt="" kld="" dk="" db="" pu="" ins_nt="" ins_kib="" ins_wait="" lean=""
   pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 HOST_POOL_MIB=4096 EXTRA_ARGS="" ARM_HOME="$RHOME" ARM_CONC=
   ARM_PROMPTS= ARM_N= ARM_LQ= rt=
   power="" skip="" ARGS=() f8="" f8x="" rb="" rbf=0 pred="" cs="" kh="" pc="" pcopt="" fw="" wp=""
@@ -918,6 +983,13 @@ for a in $ARMS; do
       Lq)      ARM_LQ=1 ;;                 # the quality harness after the timed requests
       Cs)      cs=1 ;;                     # the exact consumer-suffix skip (checked in the server log)
       Kh)      kh=1 ;;                     # KV and logits hashes at each prompt's end
+      In)      ins_nt=1 ;;                 # background inserts' codes by non-temporal stores (INSERT_NT)
+      Is)      ins_kib=256 ;;              # ... in 256 KiB pieces, a decode insert waiting for an idle pool
+      Is[0-9]*|Iw[0-9]*)                   # ... in pieces of N KiB (INSERT_SLICE_KIB); at most N us of waiting (INSERT_WAIT_US)
+               if [[ ${p:2} =~ ^[0-9]+$ ]] && (( 10#${p:2} <= 100000 )); then
+                 if [[ $p == Is* ]]; then ins_kib=$((10#${p:2})); else ins_wait=$((10#${p:2})); fi
+               else log "arm $a: $p: a number of KiB / us up to 100000; the arm is skipped"; skip=1; fi ;;
+      Ph)      lean=1 ;;                   # the pool's lean tiles (HOST_EXPERTS_LEAN_TILES)
       *)     log "arm $a: unknown part $p; the arm is skipped (it would run without what its name says)"; skip=1 ;;
     esac
   done
@@ -1033,6 +1105,16 @@ for a in $ARMS; do
   ARM_FW=$fw ARM_WP=$wp
   # RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL: on only in an Xt arm, explicitly off in every other one.
   if [[ -n "$xt" ]]; then env+=(RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=1); else env+=(RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=0); fi
+  # In / Is / Iw / Ph: every arm states the switches, so a window's VAR=val cannot turn them on for
+  # an arm whose name does not say so; arm() checks the server log both ways.
+  if [[ -n "$ins_kib" ]] && (( ins_kib <= 0 )); then log "arm $a: Is0 slices nothing; the arm is skipped"; skip=1; fi
+  if [[ -n "$ins_wait" && -z "$ins_kib" ]]; then log "arm $a: Iw needs an Is part (the wait is the pieces'); the arm is skipped"; skip=1; fi
+  if [[ -n "$ins_nt$ins_kib" && " ${env[*]} " != *" RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE=1 "* ]]; then
+    log "arm $a: In / Is write into the packed RAM cache only (a K part); the arm is skipped"; skip=1
+  fi
+  env+=(RADIANCE_EXPERIMENTAL_DS41_INSERT_NT=${ins_nt:-0} RADIANCE_EXPERIMENTAL_DS41_INSERT_SLICE_KIB=${ins_kib:-0}
+        RADIANCE_EXPERIMENTAL_DS41_INSERT_WAIT_US=${ins_wait} RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_LEAN_TILES=${lean:-0})
+  ARM_INS_NT=$ins_nt ARM_INS_KIB=$ins_kib ARM_INS_WAIT=${ins_wait:-4000} ARM_LEAN=$lean
   if [[ -n "$kld" ]]; then
     if [[ ! -s "$OUT/kld-corpus.jsonl" ]] &&
        ! python3 -I "$HERE/ab_requests.py" --kld-corpus "$OUT/kld-corpus.jsonl" "${KLD_MAX_CHARS:-6000}" \

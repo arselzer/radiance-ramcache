@@ -718,8 +718,9 @@ EOF2
     fi
   fi
   # In / Is / Ph at shutdown: every rank's "background inserts" line counts the pieces its inserts
-  # wrote by non-temporal stores (an In or Is arm: above 0 on every rank, an Is arm's pieces after a
-  # wait above 0 in all; a plain arm: 0), and the pool's "lean tiles" line the tiles claimed and the
+  # wrote by non-temporal stores (an In or Is arm: above 0 on every rank; a plain arm: 0; an Is arm's
+  # pieces after a wait are only noted: one-token passes' inserts wait, but a DSpark verify pass or a
+  # batched step never does, and a large cache leaves few inserts), and the pool's "lean tiles" line the tiles claimed and the
   # lanes reused (Ph: both above 0; a plain arm has no such line). Otherwise not measured.
   local ins_bad="" ins_ranks=0 ins_zero=0 ins_pieces=0 ins_waited=0 l np nw lean_line
   while IFS= read -r l; do
@@ -730,7 +731,7 @@ EOF2
   done < <(grep -E "host experts' background inserts: " "$OUT/$name.server.log")
   if [[ -n "${ARM_INS_NT:-}${ARM_INS_KIB:-}" ]]; then
     (( ins_ranks == 0 || ins_zero > 0 )) && ins_bad="$ins_zero of $ins_ranks ranks' 'background inserts' lines show no non-temporal piece"
-    [[ -n "${ARM_INS_KIB:-}" ]] && (( ins_waited == 0 )) && ins_bad="${ins_bad:+$ins_bad; }no piece waited for an idle pool"
+    [[ -n "${ARM_INS_KIB:-}" ]] && (( ins_waited == 0 )) && log "arm $name: Is, but no piece waited for an idle pool (passes of several rows, or few inserts)"
   elif (( ins_pieces > 0 )); then
     ins_bad="no In / Is part, but $ins_pieces pieces went by non-temporal stores"
   fi

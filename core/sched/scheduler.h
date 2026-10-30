@@ -787,7 +787,7 @@ private:
     bool    cs_on_ = false;
     /* Large-chunk prefill, as lcp_init decided it (lcp_rows). */
     int64_t lcp_ = 0;
-    int     lcp_init(const Program& prog, const Config& cfg, size_t world);
+    int     lcp_init(const Program& prog, const Config& cfg, const std::vector<BatchBuilder::RankIO>& ranks);
     /* RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH=1 (read at init; acts under --prefix-resume
      * exact): a finished sequence publishes only up to SchedReq::grid_upto. An exact hit resumes
      * where a cold prefill starts a chunk and recomputes the cold chunks from there, but it also

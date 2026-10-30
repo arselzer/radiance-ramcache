@@ -7869,6 +7869,13 @@ TEST(lcp_is_refused_where_chunks_would_not_be_c_or_share_a_step) {
         f.cfg.n_spec = 2;
         refused(f, "speculation");
     }
+    {   /* KV streaming: a ring of the context on the card */
+        LcpOn on(1024, 1);
+        Fixture f;
+        lcp_fixture(f, 1024, 2048);
+        f.cfg.kv_resident = 4096;
+        refused(f, "KV streaming");
+    }
     {   /* no file stager took it */
         LcpOn on(1024, 0);
         Fixture f;

@@ -52,6 +52,18 @@ void Scheduler::queue_erase(std::vector<int32_t>& q, int32_t slot) {
 }
 
 /* ------------------------------------------------------------------ large-chunk prefill */
+/* Whether any KV group streams (--kv-resident, or a rank's group with a stream): neither large-chunk
+ * prefill nor the consumer skip covers a streamed group (both refuse it, below). */
+static bool any_kv_streams(const Config& cfg, const std::vector<BatchBuilder::RankIO>& ranks) {
+    bool streams = cfg.kv_resident > 0 || cfg.kv_streams;
+    for (size_t i = 0; i < ranks.size() && !streams; ++i) {
+        if (!ranks[i].kv_streams || !ranks[i].prog) continue;
+        for (size_t g = 0; g < ranks[i].prog->kv_groups.size() && !streams; ++g)
+            streams = ranks[i].kv_streams[g] != nullptr;
+    }
+    return streams;
+}
+
 /* RADIANCE_EXPERIMENTAL_DS41_LCP=<C> (core/place/ep_route_counts.h; the file stager's lcp_init holds
  * the kernels' side): the scheduler's half. Every chunk a lone prefill takes must be C tokens, the
  * pass the bands were checked at, except a prompt's first interval under a span and its last
@@ -59,10 +71,13 @@ void Scheduler::queue_erase(std::vector<int32_t>& q, int32_t slot) {
  * even without the prefix cache) that is a multiple of C, or with --prefill-span one that C is a
  * multiple of, spanned to at least C. A step holds one sequence's chunk unless prefill runs alone
  * (a C-token chunk holds the card ~10 s, and decode rows beside it would wait that long anyway).
- * Refused, too, with speculation, and unless every rank's file stager took it (its line says
- * what it admitted, or why not). `world` 0 skips that last check (tests). */
-int Scheduler::lcp_init(const Program& prog, const Config& cfg, size_t world) {
+ * Refused, too, with speculation, with KV streaming (a streamed group keeps a ring of its context on
+ * the card, which a C-token chunk's window and keys were never checked against), and unless every
+ * rank's file stager took it (its line says what it admitted, or why not). No ranks (tests) skips
+ * that last check. */
+int Scheduler::lcp_init(const Program& prog, const Config& cfg, const std::vector<BatchBuilder::RankIO>& ranks) {
     lcp_ = 0;
+    const size_t world = ranks.size();
     const int64_t C = ds41_lcp_rows();
     if (ds41_lcp_state() < 0) {
         RAD_ERR("%s: large-chunk prefill takes a chunk C, a multiple of 16 from %lld to %lld", kLcpEnv,
@@ -89,6 +104,9 @@ int Scheduler::lcp_init(const Program& prog, const Config& cfg, size_t world) {
         why = fmt("the checkpoint interval %lld is not a multiple of the chunk %lld", (long long)I, (long long)C);
     else if (cfg.n_spec != 0 || prog.drafter.kind != RAD_DRAFT_NONE)
         why = "speculation is on: verify steps and a drafter's passes are not covered";
+    else if (any_kv_streams(cfg, ranks))
+        why = "KV streaming (--kv-resident) is not covered: a streamed group keeps a ring of its context on the "
+              "card, and no chunk of C tokens was checked against one";
     else if (cfg.max_seqs > 1 && !prefill_alone_)
         why = fmt("--max-num-seqs %lld: a chunk would share its step with decode rows; run "
                   "RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE=1 (a %lld-token chunk then holds the decode rows "
@@ -349,7 +367,7 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     draft_est_.reserve((size_t)cfg.max_seqs);
 
     RAD_TRY(builder_.init(prog, cfg, geo_, kvgeom_, ranks));
-    RAD_TRY(lcp_init(prog, cfg, ranks.size()));
+    RAD_TRY(lcp_init(prog, cfg, ranks));
     /* The consumer skip (consumer_skip.h): off unless asked for, and refused, with the reason,
      * wherever its derivation does not cover the deployment. Read here, beside the other
      * scheduler switch, so a test sets Config::consumer_skip instead of the environment. */
@@ -390,12 +408,7 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
             }
             /* KV streaming: a streamed group keeps only a ring of its context on the card, which
              * the derivation (whole windows of stored keys) does not cover. */
-            bool streams = cfg.kv_resident > 0 || cfg.kv_streams;
-            for (size_t i = 0; i < ranks.size() && !streams; ++i) {
-                if (!ranks[i].kv_streams || !ranks[i].prog) continue;
-                for (size_t g = 0; g < ranks[i].prog->kv_groups.size() && !streams; ++g)
-                    streams = ranks[i].kv_streams[g] != nullptr;
-            }
+            const bool streams = any_kv_streams(cfg, ranks);
             if (d.n_layer <= 0)
                 why = "the model's plugin declared no consumer suffix (deepseek41 declares one for "
                       "DeepSeek-V4.1-Flash's own topology only; its line above says why not)";

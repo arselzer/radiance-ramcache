@@ -824,3 +824,40 @@ foreach(cost IN ITEMS kbench_ref:500 r4d_selftest:350 r4d_emu_attn_sweep:80 kben
     set_tests_properties(${t} PROPERTIES COST ${c})
   endif()
 endforeach()
+
+# ---- P1 (K)
+# Prefill Phase 1's twin moe_gemm_ggml_mxfp4_gemv_tall_p1 (RADIANCE_EXPERIMENTAL_DS41_P1, r4d_ds41_mxfp4.hip, the
+# contract in tools/ds41-host-experts/ds41_p1.h) on the emulator: at 17 to 1024 tokens over tables mixing
+# block_mxfp4, packed and skipped entries against the plain gemv in passes of 16, skipped rows untouched, the slots
+# past the live end zeros, other work splits the same bytes, and the stager's wave composition (a main launch with
+# a subset skipped, then waves over it, the clamped SwiGLU relaunched) equal to one launch. Built like ds41vp (the
+# engine's packer linked in), in whichever arm built the emulator above.
+if(R4D_EMU_BUILT)
+  if(TARGET r4d_emu_kernels)
+    add_executable(r4d_emu_ds41p1 ${R4D_EMU}/test_ds41p1.cpp ${R4D_EMU_HX_SRC})
+    target_link_libraries(r4d_emu_ds41p1 PRIVATE r4d_emu_kernels ${CMAKE_DL_LIBS})
+    target_include_directories(r4d_emu_ds41p1 PRIVATE ${R4D_EMU_HX_DIR})
+    target_compile_options(r4d_emu_ds41p1 PRIVATE -ffp-contract=off -Wno-psabi)
+    set_target_properties(r4d_emu_ds41p1 PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+  else()
+    add_custom_command(OUTPUT ${dir}/test_ds41p1.o
+      COMMAND ${R4D_EMU_CXX} ${flags} -MD -MF ${dir}/test_ds41p1.o.d -c ${R4D_EMU}/test_ds41p1.cpp
+              -o ${dir}/test_ds41p1.o
+      DEPENDS ${R4D_EMU}/test_ds41p1.cpp
+      DEPFILE ${dir}/test_ds41p1.o.d
+      COMMENT "Building r4d_emu test_ds41p1.o with ${R4D_EMU_CXX}"
+      VERBATIM)
+    add_custom_command(OUTPUT ${CMAKE_BINARY_DIR}/tests/r4d_emu_ds41p1
+      COMMAND ${R4D_EMU_CXX} ${dir}/test_ds41p1.o ${objs} ${dir}/ds41_host_experts.o ${dl}
+              -o ${CMAKE_BINARY_DIR}/tests/r4d_emu_ds41p1
+      DEPENDS ${dir}/test_ds41p1.o ${objs} ${dir}/ds41_host_experts.o
+      COMMENT "Linking r4d_emu_ds41p1"
+      VERBATIM)
+    add_custom_target(r4d_emu_ds41p1_bin ALL DEPENDS ${CMAKE_BINARY_DIR}/tests/r4d_emu_ds41p1)
+  endif()
+  add_test(NAME r4d_emu_ds41p1 COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_ds41p1)
+  set_tests_properties(r4d_emu_ds41p1 PROPERTIES LABELS "r4d_emu;slow" TIMEOUT 3600)
+  # The same at the small heights, in the fast tier.
+  add_test(NAME r4d_emu_ds41p1_quick COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_ds41p1 quick)
+  set_tests_properties(r4d_emu_ds41p1_quick PROPERTIES LABELS "r4d_emu;fast" TIMEOUT ${RAD_TEST_TIMEOUT})
+endif()

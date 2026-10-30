@@ -257,6 +257,10 @@ struct MxGemvArgs {
      * expert's row passes as well as its row groups, and a pass whose slots are all dropped writes its
      * zeros without reading weights. bal_off: LDS byte offset of the chunk table (3 n_expert + 1 ints). */
     int bal, bal_off;
+    /* Prefill Phase 1 (mx_vp2_kernel's kVpP1 form, r4d_rad_moe_gemm_mxfp4_gemv_tall_p1): an entry with bit 1 (the
+     * skip mark) has no rows; work items cut by row passes (the chunk prefix at bal_off: n_expert + 1 ints), at
+     * most p1_rgcap row groups an item (0: no cap) and about p1_fill items a block. */
+    int p1_rgcap, p1_fill;
 };
 
 /* A staged row: its values with 4 floats of pad after every 32, so the lanes' blocks read different banks. */
@@ -879,11 +883,14 @@ __device__ __forceinline__ uint32_t mx_vp2_raw(const MxPk2& v, uint32_t g, int* 
  *            rank's last expert: five of a decode call's six passes) stores its zeros and nothing else -- every
  *            form stores 0.0f for a dropped slot whatever its sums are, so its loads, staging and arithmetic
  *            change no bit.
+ *   kVpP1    prefill Phase 1's twin (r4d_rad_moe_gemm_mxfp4_gemv_tall_p1): an entry with the skip mark (bit 1) has
+ *            no rows (no item, no store, no byte of its weight read), and the work items are cut by row passes as
+ *            well as row groups (MxGemvArgs::p1_*). A compile-time form, so gemv_vp's own kernels are unchanged.
  * Every form gives the same bits; kVpSraw and kVpRoll read the same words and do the same arithmetic in the same
  * order as the first form. (Measured and dropped: each block's words read in place through M0-relative moves
  * instead of moved up, and packed values two at a time from a 256-entry pair table -- fewer VALU operations,
  * but slower a call: more registers and a full wait, and LDS bank conflicts on the table.) */
-enum : int { kVpSraw = 1, kVpRoll = 2, kVpZero = 4 };
+enum : int { kVpSraw = 1, kVpRoll = 2, kVpZero = 4, kVpP1 = 8 };
 
 /* Lane `lane`'s byte of the 32 at p (4-aligned, the same for the whole wave), through the scalar unit. */
 __device__ __forceinline__ uint32_t mx_s_lane_byte(const uint8_t* p, int lane) {
@@ -1258,20 +1265,26 @@ __device__ __forceinline__ void mx_vp2_body(const MxGemvArgs& A) {
     int* const live_s = live_e + A.n_expert;
     int* const live_t = live_s + A.n_expert;
     float* const xs = (float*)(mx_smem + A.x_off);
-    /* The experts with rows, ascending, with their ranges: four groups of 32 experts' offsets loaded at once. */
+    constexpr bool P1 = (FL & kVpP1) != 0;
+    /* The experts with rows, ascending, with their ranges: four groups of 32 experts' offsets loaded at once.
+     * Under kVpP1 an entry carrying the skip mark (bit 1) has no rows here: no item, no store, no byte of it read
+     * past the entry itself. */
     if (wave == 0) {
         int cnt = 0;
         for (int e0 = 0; e0 < A.n_expert; e0 += 128) {
             int s[4], t[4];
+            bool sk[4] = { false, false, false, false };
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
                 const int e = e0 + 32 * j + lane;
-                mx_vp2_range(A, e < A.n_expert ? e : A.n_expert - 1, &s[j], &t[j]);
+                const int ec = e < A.n_expert ? e : A.n_expert - 1;
+                mx_vp2_range(A, ec, &s[j], &t[j]);
+                if constexpr (P1) sk[j] = ((uintptr_t)A.wtab[ec] & 2u) != 0;
             }
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
                 const int e = e0 + 32 * j + lane;
-                const bool nz = e < A.n_expert && t[j] > s[j];
+                const bool nz = e < A.n_expert && t[j] > s[j] && !sk[j];
                 const uint32_t bal = __builtin_amdgcn_ballot_w32(nz);
                 if (nz) {
                     const int at = cnt + __builtin_popcount(bal & ((1u << lane) - 1u));
@@ -1291,14 +1304,54 @@ __device__ __forceinline__ void mx_vp2_body(const MxGemvArgs& A) {
     const int XRC = A.KC + A.KC / 8;
     /* mx_gemv_kernel's split: the live experts' row groups over every launched block, a row one wave's. */
     const int total = *s_nlive * nrg;
-    const int rgpi = total > (int)gridDim.x ? (total + (int)gridDim.x - 1) / (int)gridDim.x : 1;
+    int rgpi = total > (int)gridDim.x ? (total + (int)gridDim.x - 1) / (int)gridDim.x : 1;
+    if (P1 && A.p1_rgcap > 0 && rgpi > A.p1_rgcap) rgpi = A.p1_rgcap;
     const int ipe = (nrg + rgpi - 1) / rgpi;
-    const int n_items = *s_nlive * ipe;
+    int n_items = *s_nlive * ipe;
     const int step = !A.one_pass && A.XLM >= 1 && A.XLM < A.XM ? A.XLM : A.XM;
+    /* P1's balance (lcpfast's, for this kernel): an item is a live expert's chunk of P row passes over a range of
+     * rgpi row groups, P sized so that the items average p1_fill a block. Each pass is the loop's pass below (the
+     * same rows, from the expert's first row in steps of `step`) and each output is still one wave's sum in the
+     * same lane and block order, so the bits are those of any other split; one expert of 2,000 rows no longer
+     * serialises a launch. Ranges are the live-tail ones (no expert owns the dropped slots past off[n_expert]),
+     * so no chunk is spent on them. */
+    __shared__ int s_bal_p;
+    int* const bpre = (int*)(mx_smem + A.bal_off);   /* chunk prefix over the live experts (kVpP1 only) */
+    int bP = 1 << 30;
+    if constexpr (P1) {
+        if (tid == 0) {
+            long long wl = 0;
+            for (int j = 0; j < *s_nlive; ++j) wl += (live_t[j] - live_s[j] + step - 1) / step;
+            const long long den = (long long)(A.p1_fill > 0 ? A.p1_fill : 1) * (long long)gridDim.x;
+            const long long p = (wl * ipe + den - 1) / den;
+            const int P = p < 1 ? 1 : (p > (1 << 20) ? (1 << 20) : (int)p);
+            bpre[0] = 0;
+            for (int j = 0; j < *s_nlive; ++j)
+                bpre[j + 1] = bpre[j] + ((live_t[j] - live_s[j] + step - 1) / step + P - 1) / P;
+            s_bal_p = P;
+        }
+        __syncthreads();
+        bP = s_bal_p;
+        n_items = bpre[*s_nlive] * ipe;
+    }
     int cur_e = -1, cur_p = -1;
     for (int it = (int)blockIdx.x; it < n_items; it += (int)gridDim.x) {
-        const int li = it / ipe;
-        const int ri = it - li * ipe;
+        int li, ri, pb = 0, pe = 1 << 30;             /* pe: past every pass */
+        if constexpr (P1) {
+            const int g = it / ipe;
+            ri = it - g * ipe;
+            int lo = 0, hi = *s_nlive;                /* the live expert whose chunks hold g */
+            while (hi - lo > 1) {
+                const int mid = (lo + hi) >> 1;
+                if (bpre[mid] <= g) lo = mid; else hi = mid;
+            }
+            li = lo;
+            pb = (g - bpre[lo]) * bP;
+            pe = pb + bP;
+        } else {
+            li = it / ipe;
+            ri = it - li * ipe;
+        }
         const int e = mx_uni(live_e[li]), rs = mx_uni(live_s[li]), re = mx_uni(live_t[li]);
         /* Bit 0 of the entry marks a packed weight (block-uniform: one expert an item). */
         const uint8_t* wb = mx_uni_ptr(A.wtab[e]);
@@ -1307,7 +1360,14 @@ __device__ __forceinline__ void mx_vp2_body(const MxGemvArgs& A) {
         MxPk2 pv{};
         if (pk) pv = mx_pk2_open(wb, A.N, A.K);
         const int rg0 = ri * rgpi, rg1 = min(rg0 + rgpi, nrg);
-        for (int p0 = rs; p0 < re; p0 += step) {
+        /* The item's passes: all of the expert's, or (kVpP1's balance) its chunk [pb, pe). */
+        int p0s = rs, p1e = re;
+        if constexpr (P1) {
+            const long long pend = (long long)rs + (long long)pe * step;
+            p1e = pend < re ? (int)pend : re;
+            p0s = rs + pb * step;
+        }
+        for (int p0 = p0s; p0 < p1e; p0 += step) {
             const int mc = min(step, re - p0);
             const bool whole = mc <= A.XLM;            /* block-uniform */
             /* The pass's live rows (a dropped slot writes zeros). */
@@ -1576,11 +1636,11 @@ int mx_tab_bytes(int ty) { return ty == MX_FP4 ? Mx<MX_FP4>::TB : 0; }
  * fit 36 KiB, at most `xm` (0 when one row does not fit). Past that a pass's rows are staged in chunks of KC
  * values, a multiple of 1024 (32 blocks of 32), as many as fit the same 36 KiB for `xm` rows. Returns the buffer's
  * floats. */
-long long mx_xbuf(int xm, long long K, int* xlm, int* xr, int* kc) {
+long long mx_xbuf(int xm, long long K, int* xlm, int* xr, int* kc, long long budget = 9216) {
     *xr = (int)(K + K / 8);
-    const long long f = 9216 / (K + K / 8);
+    const long long f = budget / (K + K / 8);
     *xlm = (int)(f < xm ? f : xm);
-    long long c = 9216 / ((long long)xm * 1152);
+    long long c = budget / ((long long)xm * 1152);
     if (c < 1) c = 1;
     const long long kr = (K + 1023) / 1024 * 1024;
     *kc = (int)(1024LL * c < kr ? 1024LL * c : kr);
@@ -1672,10 +1732,10 @@ int mx_vp_pick(int var) {
 
 /* mx_vp2_kernel in form FL at MC >= the pass height (mcx) and UF blocks a lane a pass (uf: 5 when a row pass is
  * more than three rounds, else 3), two weight rows a wave; passes of more than one row take the first form, with
- * FL's kVpZero (FM). */
+ * FL's kVpZero and kVpP1 (FM). */
 template <int FL>
 int mx_launch_vp2_t(RadStream s, int mcx, int uf, const MxGemvArgs& A, unsigned grid, unsigned lds) {
-    constexpr int FM = FL & kVpZero;
+    constexpr int FM = FL & (kVpZero | kVpP1);
     if (mcx <= 1) {
         if (uf >= 5) return R4D_EMIT(s, (mx_vp2_kernel<2, 1, 5, FL>), dim3(grid), dim3(kMxThreads), lds, A);
         return R4D_EMIT(s, (mx_vp2_kernel<2, 1, 3, FL>), dim3(grid), dim3(kMxThreads), lds, A);
@@ -1855,8 +1915,15 @@ int mx_gemm(const RadArgs* a, RadStream s, bool gemv) {
  * ..._DRAFT_GEMV mode does not apply and the call is counted as left on the old path. `tall`: the
  * gemv at any number of tokens (moe_gemm_ggml_mxfp4_gemv_tall, RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL),
  * not only up to 16. */
+/* Prefill Phase 1's work split for a call (r4d_rad_moe_gemm_mxfp4_gemv_tall_p1_opts; 0 or less: the default). */
+struct MxP1Opts {
+    int grid = 0, item_kib = 0, fill = 0, lds_kib = 0;
+};
+constexpr int kP1ItemKib = 192;   /* weight rows an item at most: about 4 row groups of gate_up, 8 of down */
+constexpr int kP1Fill = 8;        /* items a block on average: a tail of small items, not of one big one */
+
 int mx_moe(const RadArgs* a, RadStream s, bool gemv,bool baseline=false,unsigned long long* probe=nullptr,int force=-1,
-           bool vp=false, bool tall=false, int vpvar=-1, int balf=-1) {
+           bool vp=false, bool tall=false, int vpvar=-1, int balf=-1, bool p1=false, const MxP1Opts* po=nullptr) {
     if (!a || a->n_t < 5) return R4D_NO(RAD_E_INVAL);
     const RadTensor *A_ = r4d_opt(a, 0), *W = r4d_opt(a, 1), *so = r4d_opt(a, 2), *of = r4d_opt(a, 3),
                     *Y = r4d_opt(a, 4);
@@ -1928,6 +1995,53 @@ int mx_moe(const RadArgs* a, RadStream s, bool gemv,bool baseline=false,unsigned
     const bool tail = (mode & ds41_live_tail::kTail) != 0;
     if (probe && (ty != MX_FP4 || (!tail && force < 0))) return R4D_NO(RAD_E_UNSUPPORTED); // Refuse before any enqueue.
     const long long L = ne < T ? ne : T;       /* experts that can have rows */
+    /* Prefill Phase 1 (r4d_rad_moe_gemm_mxfp4_gemv_tall_p1; contract T1-T6, tools/ds41-host-experts/ds41_p1.h): an
+     * MXFP4 table at any number of tokens through gemv_vp's kernel (mx_vp2_kernel, the default form), whose bits are
+     * the plain gemv's for a block_mxfp4 entry and gemv_vp's for a packed one at every height: each output is its
+     * weight row dotted with its activation row in the same lane and block order whatever the pass, its grouping
+     * or the work split. On top of gemv_vp's call: the skip mark (bit 1: no rows, no bytes read), the live-tail
+     * ranges with every slot past off[ne] written as zeros by mx_tail_zero (whatever the marks), and the work
+     * spread by row passes (mx_vp2_kernel's kVpP1 form). A stacked or float weight carries no marks: the plain twin below. */
+    if (p1 && gemv && table && ty == MX_FP4) {
+        if (probe || force >= 0) return R4D_NO(RAD_E_UNSUPPORTED);
+        const MxP1Opts o = po ? *po : MxP1Opts{};
+        MxGemvArgs A{};
+        A.x = (const uint16_t*)A_->data; A.x_ld = x_ld;
+        A.w = nullptr;
+        A.wtab = (const uint8_t* const*)W->data;
+        A.w_ld = w_ld; A.w_es = w_es;
+        A.y = (uint16_t*)Y->data; A.y_ld = y_ld;
+        A.sorted = (const int32_t*)so->data; A.off = (const int32_t*)of->data;
+        A.M = (int)T; A.N = (int)N; A.K = (int)K;
+        A.XM = (int)(tokens < kMxXM ? (tokens < 1 ? 1 : tokens) : kMxXM);
+        /* The staged rows' budget: 36 KiB as the gemv's (a call may raise it, up to 56 KiB, so the gate_up's
+         * passes take two rows: the same sums, other passes). */
+        const long long budget = o.lds_kib > 0 ? (long long)(o.lds_kib < 56 ? o.lds_kib : 56) * 256 : 9216;
+        const long long xbuf = mx_xbuf(A.XM, K, &A.XLM, &A.XR, &A.KC, budget);
+        A.n_expert = (int)ne; A.top_k = (int)top_k; A.a_sorted = a_sorted ? 1 : 0; A.AR = (int)AR;
+        A.live_end = 1;
+        A.x_al = mx_al16(A_->data, x_ld) ? 1 : 0;
+        /* Dynamic LDS: the live experts' records (three words each), the chunk prefix, then the staged rows. */
+        A.live_off = kMxVp2Live;
+        A.bal_off = (int)(kMxVp2Live + mx_r16(12LL * ne));
+        A.x_off = (int)(A.bal_off + mx_r16(4LL * (ne + 1)));
+        const long long lds = A.x_off + xbuf * 4;
+        const long long rgb = 16LL * (K / kQK) * kBB;  /* bytes of a row group's block_mxfp4 rows (two a wave) */
+        const long long ik = (long long)(o.item_kib > 0 ? o.item_kib : kP1ItemKib) * 1024;
+        A.p1_rgcap = (int)(ik / rgb < 1 ? 1 : (ik / rgb > (1 << 20) ? (1 << 20) : ik / rgb));
+        A.p1_fill = o.fill > 0 ? o.fill : kP1Fill;
+        const long long nrg = (N + 15) / 16;
+        const long long items = L * nrg;
+        const unsigned grid =
+            o.grid > 0 ? (unsigned)(o.grid < 65535 ? o.grid : 65535) : (unsigned)(items < 256 ? items : 256);
+        const int mcx = A.XLM >= 1 && A.XLM < A.XM ? A.XLM : A.XM;
+        const long long ub = A.XLM >= 1 ? K / 32 : A.KC / 32;   /* blocks of a row pass (whole, or a chunk) */
+        const int uf = ub > 96 ? 5 : 3;
+        const int rc = mx_launch_vp2_t<kVpSraw | kVpRoll | kVpZero | kVpP1>(s, mcx, uf, A, grid, (unsigned)lds);
+        if (rc != RAD_OK) return rc;
+        /* T4: the slots routed to other ranks, [off[ne], T), are zeros after every call. */
+        return mx_tail_zero(s, A.y, A.y_ld, A.off, A.n_expert, A.M, A.N, nullptr);
+    }
     /* Above 16 tokens the gemv is still exact: each output is its weight row dotted with its activation row in the
      * same lane and block order at any height (mx_row; an expert's rows go in whole passes of XLM), so a tall pass
      * gives a 16-token pass's bits. The tiled path below sums in another order. */
@@ -2032,6 +2146,18 @@ extern "C" int r4d_rad_moe_gemm_mxfp4_gemv_vp_variants(const char** names, int c
  * the decode band's kernel at every pass height. */
 extern "C" int r4d_rad_moe_gemm_mxfp4_gemv_tall(const RadArgs* a, RadStream s) {
     return mx_moe(a, s, true, false, nullptr, -1, false, true);
+}
+/* The row moe_gemm_ggml_mxfp4_gemv_tall_p1 (r4d_rows.cpp, registered in place of the twin above under
+ * RADIANCE_EXPERIMENTAL_DS41_P1=1 beside LCP): prefill Phase 1's twin, mx_moe's p1 branch. */
+extern "C" int r4d_rad_moe_gemm_mxfp4_gemv_tall_p1(const RadArgs* a, RadStream s) {
+    return mx_moe(a, s, true, false, nullptr, -1, false, true, -1, -1, true);
+}
+/* Checker-only: the same with its work split forced for the call (r4d_ds41_mxfp4.h). */
+extern "C" int r4d_rad_moe_gemm_mxfp4_gemv_tall_p1_opts(const RadArgs* a, RadStream s, int grid, int item_kib,
+                                                        int fill, int lds_kib) {
+    MxP1Opts o;
+    o.grid = grid; o.item_kib = item_kib; o.fill = fill; o.lds_kib = lds_kib;
+    return mx_moe(a, s, true, false, nullptr, -1, false, true, -1, -1, true, &o);
 }
 /* Checker-only: the gemv row (`tall` 0, up to 16 tokens) or the twin (`tall` 1) with
  * RADIANCE_EXPERIMENTAL_DS41_MOE_BALANCE forced off (`bal` 0) or on (1) for this call, whatever the

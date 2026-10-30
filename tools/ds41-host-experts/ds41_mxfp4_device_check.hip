@@ -50,6 +50,16 @@
  *                                                      when given): every output value of the balanced
  *                                                      launch equal to the plain one's, and both timed
  *                                                      (hipEvent, median of 3).
+ *   ds41_mxfp4_device_check LIBR4D.so p1 [MMAX] [ROUTES] prefill Phase 1 (RADIANCE_EXPERIMENTAL_DS41_P1=1 and
+ *                                                      LCP=2048, set here; tools/ds41-host-experts/ds41_p1.h):
+ *                                                      the row moe_gemm_ggml_mxfp4_gemv_tall_p1 in the table,
+ *                                                      reaching MMAX (4096), and its launcher at 17..MMAX
+ *                                                      tokens over tables mixing block_mxfp4, packed and
+ *                                                      skipped entries against the gemv in passes of 16 and
+ *                                                      the host kernels, skipped rows untouched, the tail
+ *                                                      zeros, other work splits and the stager's waves equal
+ *                                                      to one launch; then "p1 time:" lines. Last line
+ *                                                      "p1: PASS ..." or "p1: FAIL ...".
  *   ds41_mxfp4_device_check LIBR4D.so sweep [trials]   the height sweep under EXACT_TALL, or under
  *                                                      RADIANCE_EXPERIMENTAL_DS41_LCP when that is in
  *                                                      the environment (its heights); sweep0 without
@@ -75,9 +85,18 @@
 
 #include "rad_abi.h"
 #include "ds41_host_experts.h"
+#include "ds41_p1.h"
 #include "r4d_bf16f8_layout.h"
+#include "r4d_ds41_tall.h"
 
 using namespace ds41hx;
+
+/* libr4d restates prefill Phase 1's constants (r4d_ds41_tall.h); they must agree with the shared header. */
+constexpr bool p1_same_str(const char* a, const char* b) { return *a == *b && (!*a || p1_same_str(a + 1, b + 1)); }
+static_assert(p1_same_str(ds41p1::kEnv, kR4dDs41P1Env), "the switch's name");
+static_assert(p1_same_str(ds41p1::kTwinRow, kR4dDs41P1Row), "the twin row's name");
+static_assert(ds41p1::kTwinMaxRows == kR4dDs41P1MaxRows, "the twin's bound");
+static_assert(ds41p1::kMarkPacked == kR4dDs41MarkPacked && ds41p1::kMarkSkip == kR4dDs41MarkSkip, "the marks");
 
 #define HC(x) do { hipError_t e_ = (x); if (e_ != hipSuccess) { std::fprintf(stderr, "%s: %s\n", #x, hipGetErrorString(e_)); std::exit(2); } } while (0)
 
@@ -111,6 +130,9 @@ struct Lib {
     Launch gemm16 = nullptr, gemm_tiled = nullptr, gemm_f32 = nullptr, gemm_f8 = nullptr;
     /* For `bal`: the checker export with RADIANCE_EXPERIMENTAL_DS41_MOE_BALANCE forced per call. */
     int (*moe_bal)(const RadArgs*, RadStream, int tall, int bal) = nullptr;
+    /* For `p1`: prefill Phase 1's twin and its checker export with the work split forced. */
+    Launch moe_p1 = nullptr;
+    int (*moe_p1_opts)(const RadArgs*, RadStream, int, int, int, int) = nullptr;
     int (*count)(void) = nullptr;
     const RadKernelInfo* (*at)(int) = nullptr;
     explicit Lib(const char* path) {
@@ -136,6 +158,8 @@ struct Lib {
         gemm_f32 = (Launch)dlsym(h, "r4d_rad_gemm_nt_f32");
         gemm_f8 = (Launch)dlsym(h, "r4d_rad_gemm_bf16f8_m64");
         moe_bal = (int (*)(const RadArgs*, RadStream, int, int))dlsym(h, "r4d_rad_moe_gemm_mxfp4_gemv_bal");
+        moe_p1 = (Launch)dlsym(h, "r4d_rad_moe_gemm_mxfp4_gemv_tall_p1");
+        moe_p1_opts = (int (*)(const RadArgs*, RadStream, int, int, int, int))dlsym(h, "r4d_rad_moe_gemm_mxfp4_gemv_tall_p1_opts");
         count = (int (*)(void))dlsym(h, "rad_kernel_count");
         at = (const RadKernelInfo* (*)(int))dlsym(h, "rad_kernel_at");
         if (!moe) { std::fprintf(stderr, "%s lacks r4d_rad_moe_gemm_mxfp4_gemv\n", path); std::exit(2); }
@@ -1968,14 +1992,652 @@ int bal_check(const Lib& L, const char* routes_path) {
     return rc;
 }
 
+
+/* ================================================================== p1 (prefill Phase 1's twin)
+ *
+ * RADIANCE_EXPERIMENTAL_DS41_P1=1 beside RADIANCE_EXPERIMENTAL_DS41_LCP=2048 (both set by main before the plugin
+ * loads): the row moe_gemm_ggml_mxfp4_gemv_tall_p1 in the table in place of the LCP twin, reaching MMAX, and its
+ * launcher's promises T1-T5 (tools/ds41-host-experts/ds41_p1.h) at ds41's shapes on 96 VRAM experts in both forms:
+ *
+ *   rows    at M in {17, 33, 48, 64, 100, 256, 1024, 2048, MMAX} tokens, real (ROUTES), skewed, uniform and
+ *           hot routings of an EP4 rank, tables mixing block_mxfp4, packed and skipped entries (a skipped
+ *           entry's pointer names unreadable memory): every computed row equal to the plain gemv over every
+ *           expert in block_mxfp4 in passes of 16 tokens, sampled rows to the host kernels, skipped experts'
+ *           rows untouched, the slots past off[96] zeros; NaN, inf and subnormal activations on some tokens;
+ *   split   other work splits of the same call give the same bytes;
+ *   waves   the stager's composition (main launch with a subset skipped, waves of 1-3 over it, swiglu_clamped
+ *           relaunched over every row) equal to one launch, gate_up, SwiGLU and down;
+ *   time    "p1 time:" lines: gate_up + down a call, us a local expert-row and a token row-layer, real routing
+ *           at M 64 .. 2048, the forms (every entry block_mxfp4, every entry packed, a mix with a sixth skipped),
+ *           against the served LCP twin, that twin cut to the local slots (Phase 0's twin-cut) and the
+ *           balanced LCP twin (..._MOE_BALANCE); then a sweep of the work split at M 2048.
+ * The last line is "p1: PASS ..." or "p1: FAIL ...". */
+namespace {
+
+typedef int (*P1Opts)(const RadArgs*, RadStream, int grid, int item_kib, int fill, int lds_kib);
+
+/* One projection's 96 experts on the card in both forms, and their block bytes on the host. */
+struct P1Bank {
+    int N = 0, K = 0;
+    size_t bb = 0;                        /* block bytes a weight */
+    std::vector<std::vector<uint8_t>> host;
+    std::unique_ptr<Dev> blocks;          /* 96 weights back to back */
+    std::vector<std::unique_ptr<Dev>> packed;
+    std::vector<void*> blk, pkd;          /* device addresses */
+    int raw_rounds = 0;
+};
+void p1_bank(P1Bank* b, int N, int K, std::mt19937_64& rng) {
+    b->N = N;
+    b->K = K;
+    const int UK = K / 32, R = (UK + 31) / 32;
+    b->bb = (size_t)N * UK * 17;
+    b->blocks.reset(new Dev(b->bb * kNe));
+    b->host.resize(kNe);
+    std::uniform_real_distribution<double> u01(0.0, 1.0);
+    static const uint8_t edges[] = { 0, 1, 2, 3, 60, 100, 127, 128, 135, 140, 254 };
+    for (int e = 0; e < kNe; ++e) {
+        /* The release's planes: codes random, e8m0 mostly 120 / 121 as the release's experts have them, a few raw
+         * rounds (a block outside any window of four), every 7th expert also e8m0 edges. */
+        std::vector<uint8_t> codes((size_t)N * (K / 2)), scales((size_t)N * UK);
+        for (size_t i = 0; i < codes.size(); i += 8) {
+            const uint64_t r = rng();
+            std::memcpy(&codes[i], &r, std::min<size_t>(8, codes.size() - i));
+        }
+        for (auto& s : scales) {
+            const double r = u01(rng);
+            s = r < 0.58 ? 120 : r < 0.995 ? 121 : r < 0.998 ? 119 : 122;
+        }
+        for (int n = 0; n < N; ++n)
+            for (int r = 0; r < R; ++r)
+                if (u01(rng) < (e % 7 == 3 ? 0.2 : 0.01)) {
+                    const int t = r < UK / 32 ? 32 : UK % 32;
+                    scales[(size_t)n * UK + 32 * r + (size_t)(rng() % (uint64_t)t)] = edges[rng() % sizeof edges];
+                }
+        std::vector<uint8_t>& h = b->host[(size_t)e];
+        h.resize(b->bb);
+        for (int n = 0; n < N; ++n)
+            for (int u = 0; u < UK; ++u) {
+                uint8_t* blk = &h[((size_t)n * UK + u) * 17];
+                const uint8_t* c = &codes[(size_t)n * (K / 2) + (size_t)u * 16];
+                auto val = [&](int v) { return (c[v >> 1] >> (4 * (v & 1))) & 15; };
+                blk[0] = scales[(size_t)n * UK + u];
+                for (int j = 0; j < 16; ++j) blk[1 + j] = (uint8_t)(val(j) | (val(j + 16) << 4));
+            }
+        HC(hipMemcpy((char*)b->blocks->p + b->bb * e, h.data(), b->bb, hipMemcpyHostToDevice));
+        b->blk.push_back((char*)b->blocks->p + b->bb * e);
+        PackInfo plan;
+        if (!pack_plan(scales.data(), N, K, &plan)) { std::fprintf(stderr, "pack_plan refused expert %d\n", e); std::exit(2); }
+        const int cap = std::min(plan.n_exc + 2, N * R);
+        const size_t pb = packed_bytes(N, K, cap);
+        std::vector<uint8_t> pk(pb);
+        Mx v;
+        if (pack_planes(codes.data(), scales.data(), N, K, cap, plan, pk.data(), pb) != kPackOk ||
+            !packed_view(pk.data(), pb, N, K, &v) || !packed_scales_equal(v, scales.data())) {
+            std::fprintf(stderr, "the packer refused expert %d\n", e);
+            std::exit(2);
+        }
+        b->raw_rounds += plan.n_exc;
+        b->packed.emplace_back(new Dev(pb));
+        b->packed.back()->put(pk.data());
+        b->pkd.push_back(b->packed.back()->p);
+    }
+}
+
+/* A table's entries: 0 block_mxfp4, 1 packed, 2 skipped. */
+std::vector<void*> p1_table(const P1Bank& b, const std::vector<int>& forms, const void* noread) {
+    std::vector<void*> t(kNe);
+    for (int e = 0; e < kNe; ++e)
+        t[(size_t)e] = forms[(size_t)e] == 2   ? (void*)((uintptr_t)noread | ds41p1::kMarkSkip)
+                       : forms[(size_t)e] == 1 ? (void*)((uintptr_t)b.pkd[(size_t)e] | ds41p1::kMarkPacked)
+                                               : b.blk[(size_t)e];
+    return t;
+}
+
+/* Token t's top-6 of 384 under a routing. */
+struct P1Routing {
+    std::vector<int> p;
+    int rank = 0;
+    std::string name;
+};
+std::vector<int16_t> g_p1_routes;
+int g_p1_layers = 0, g_p1_rows = 0;
+P1Routing p1_routing(const char* kind, int M, int rank, int layer, std::mt19937_64& rng) {
+    P1Routing r;
+    r.rank = rank;
+    r.name = kind;
+    r.p.resize((size_t)M * kTop);
+    if (!std::strcmp(kind, "real")) {
+        r.name = "real L" + std::to_string(layer);
+        for (int t = 0; t < M; ++t) {   /* past the file's rows: the next layer's first rows */
+            const int l = (layer + t / g_p1_rows) % g_p1_layers, row = t % g_p1_rows;
+            for (int k = 0; k < kTop; ++k) r.p[(size_t)t * kTop + k] = g_p1_routes[((size_t)l * g_p1_rows + row) * kTop + k];
+        }
+        return r;
+    }
+    std::vector<double> w(4 * kNe);
+    std::vector<int> perm(4 * kNe);
+    for (int i = 0; i < 4 * kNe; ++i) perm[(size_t)i] = i;
+    std::shuffle(perm.begin(), perm.end(), rng);
+    for (int i = 0; i < 4 * kNe; ++i) w[(size_t)perm[(size_t)i]] = 1.0 / std::pow(1.0 + i, 0.9);
+    std::discrete_distribution<int> skew(w.begin(), w.end());
+    const int hot = rank * kNe + (int)(rng() % kNe);
+    for (int t = 0; t < M; ++t) {
+        int* pk = &r.p[(size_t)t * kTop];
+        int n = 0;
+        if (!std::strcmp(kind, "hot") && rng() % 50) pk[n++] = hot;
+        while (n < kTop) {
+            const int e = !std::strcmp(kind, "skewed") ? skew(rng) : (int)(rng() % (4 * kNe));
+            bool dup = false;
+            for (int j = 0; j < n; ++j) dup |= pk[j] == e;
+            if (!dup) pk[n++] = e;
+        }
+    }
+    return r;
+}
+/* Tokens [t0, t1) as one pass on the rank, as moe_scatter writes it. */
+struct P1Pass {
+    std::vector<int32_t> sorted, off;
+    int local = 0, live = 0, busiest = 0;
+};
+P1Pass p1_pass(const P1Routing& r, int t0, int t1) {
+    std::vector<std::vector<int32_t>> by(kNe);
+    for (int t = t0; t < t1; ++t)
+        for (int k = 0; k < kTop; ++k) {
+            const int e = r.p[(size_t)t * kTop + k];
+            if (e / kNe == r.rank) by[(size_t)(e % kNe)].push_back((t - t0) * kTop + k);
+        }
+    P1Pass p;
+    p.off.assign(kNe + 1, 0);
+    for (int e = 0; e < kNe; ++e) {
+        p.off[(size_t)e + 1] = p.off[(size_t)e] + (int)by[(size_t)e].size();
+        for (int32_t f : by[(size_t)e]) p.sorted.push_back(f);
+        p.live += !by[(size_t)e].empty();
+        p.busiest = std::max(p.busiest, (int)by[(size_t)e].size());
+    }
+    p.local = (int)p.sorted.size();
+    p.sorted.resize((size_t)(t1 - t0) * kTop, -1);
+    return p;
+}
+
+bool p1_nan(uint16_t v) { return (v & 0x7f80u) == 0x7f80u && (v & 0x7fu); }
+/* Values that differ, a NaN equal to any NaN (two kernels may carry different NaN payloads); the NaN pairs
+ * counted apart. */
+size_t p1_diff(const uint16_t* a, const uint16_t* b, size_t n, size_t* nans) {
+    size_t d = 0;
+    for (size_t i = 0; i < n; ++i)
+        if (a[i] != b[i]) {
+            if (p1_nan(a[i]) && p1_nan(b[i])) ++*nans;
+            else ++d;
+        }
+    return d;
+}
+
+struct P1Ctx {
+    const Lib* L = nullptr;
+    P1Opts opts = nullptr;
+    Launch p1 = nullptr;
+    hipStream_t s{};
+    P1Bank gu, dn;
+    const void* noread = nullptr;
+    size_t bad = 0, rows = 0, host_rows = 0, nan_pairs = 0;
+    int cases = 0;
+};
+
+/* One moe_gemm_ggml launch over device buffers. */
+int p1_launch(P1Ctx& c, Launch f, const int* split, void* x, int AR, int K, void* tab, int N, void* so, void* of,
+              int T, void* y, bool sorted_order) {
+    RadTensor t[5] = { tensor(x, RAD_BF16, { AR, K }), tensor(tab, RAD_U8, { kNe, N, K / 32 * 17 }),
+                       tensor(so, RAD_I32, { T }), tensor(of, RAD_I32, { kNe + 1 }), tensor(y, RAD_BF16, { T, N }) };
+    t[1].stride[0] = 0;
+    RadParam p[6] = { ps("type", "mxfp4"), pi("N", N), pi("K", K), pi("n_expert", kNe), pi("top_k", kTop),
+                      ps("a_order", sorted_order ? "sorted" : "token") };
+    RadArgs a{};
+    a.t = t; a.n_t = 5; a.p = p; a.n_p = 6;
+    if (split) return c.opts(&a, (RadStream)c.s, split[0], split[1], split[2], split[3]);
+    return f(&a, (RadStream)c.s);
+}
+
+/* The rows check of one (routing, M, forms) for both projections. */
+void p1_rows(P1Ctx& c, const P1Routing& r, int M, std::mt19937_64& rng, bool splits) {
+    ++c.cases;
+    const P1Pass full = p1_pass(r, 0, M);
+    const int T = M * kTop;
+    /* Token rows for gate_up (NaN, inf and subnormal values on every 11th token), a row a slot for down. */
+    std::vector<uint16_t> x((size_t)M * kEmbd), act((size_t)T * kFf);
+    for (int t = 0; t < M; ++t) {
+        const auto row = make_x(kEmbd, rng, t % 11 == 4);
+        std::copy(row.begin(), row.end(), x.begin() + (size_t)t * kEmbd);
+    }
+    {
+        std::normal_distribution<float> nd(0.f, 0.3f);
+        for (auto& v : act) v = f32_to_bf16(nd(rng));
+        static const uint16_t sp[] = { 0x7fc0, 0xff80, 0x7f80, 0x0001, 0x8001 };
+        for (int i = 0; i < 64; ++i) act[(size_t)(rng() % act.size())] = sp[rng() % 5];
+    }
+    std::vector<int> forms(kNe);
+    int nskip = 0, npk = 0;
+    for (int e = 0; e < kNe; ++e) {
+        const uint64_t q = rng() % 20;
+        forms[(size_t)e] = q < 4 ? 2 : q < 10 ? 1 : 0;
+        const bool live = full.off[(size_t)e + 1] > full.off[(size_t)e];
+        nskip += live && forms[(size_t)e] == 2;
+        npk += live && forms[(size_t)e] == 1;
+    }
+    std::vector<int> row_of((size_t)T, -1);
+    for (int i = 0; i < full.local; ++i) row_of[(size_t)full.sorted[(size_t)i]] = i;
+    std::vector<int> expert_of((size_t)std::max(1, full.local));
+    for (int e = 0; e < kNe; ++e)
+        for (int i = full.off[(size_t)e]; i < full.off[(size_t)e + 1]; ++i) expert_of[(size_t)i] = e;
+    Dev d_so(full.sorted.size() * 4), d_of((kNe + 1) * 4), d_x(x.size() * 2);
+    d_so.put(full.sorted.data());
+    d_of.put(full.off.data());
+    d_x.put(x.data());
+    char label[96];
+    std::snprintf(label, sizeof label, "M=%d %s rank %d", M, r.name.c_str(), r.rank);
+    for (int proj = 0; proj < 2; ++proj) {
+        const bool g = proj == 0;
+        P1Bank& b = g ? c.gu : c.dn;
+        const int N = b.N, K = b.K;
+        std::vector<void*> tab = p1_table(b, forms, c.noread), blk = b.blk;
+        Dev d_tab(kNe * sizeof(void*)), d_blk(kNe * sizeof(void*));
+        d_tab.put(tab.data());
+        d_blk.put(blk.data());
+        std::unique_ptr<Dev> d_in;
+        if (!g) {
+            std::vector<uint16_t> in((size_t)T * K, 0);
+            for (int i = 0; i < full.local; ++i)
+                std::memcpy(&in[(size_t)i * K], &act[(size_t)full.sorted[(size_t)i] * K], (size_t)K * 2);
+            d_in.reset(new Dev(in.size() * 2));
+            d_in->put(in.data());
+        }
+        void* xin = g ? d_x.p : d_in->p;
+        const int AR = g ? M : T;
+        Dev d_y((size_t)T * N * 2);
+        HC(hipMemset(d_y.p, 0xAA, d_y.n));
+        if (p1_launch(c, c.p1, nullptr, xin, AR, K, d_tab.p, N, d_so.p, d_of.p, T, d_y.p, !g) != RAD_OK) {
+            std::printf("FAIL %s %s: the P1 twin refused the call\n", label, g ? "gate_up" : "down");
+            ++c.bad;
+            return;
+        }
+        HC(hipStreamSynchronize(c.s));
+        std::vector<uint16_t> y((size_t)T * N);
+        d_y.get(y.data());
+        /* The decode band: the plain gemv in passes of 16 over every expert in block_mxfp4. */
+        size_t differ = 0, untouched = 0, tail = 0;
+        for (int t0 = 0; t0 < M; t0 += 16) {
+            const int t1 = std::min(M, t0 + 16), n = t1 - t0;
+            const P1Pass pp = p1_pass(r, t0, t1);
+            Dev c_so(pp.sorted.size() * 4), c_of((kNe + 1) * 4), c_y((size_t)n * kTop * N * 2);
+            c_so.put(pp.sorted.data());
+            c_of.put(pp.off.data());
+            std::unique_ptr<Dev> c_in;
+            void* cin = (char*)d_x.p + (size_t)t0 * kEmbd * 2;
+            if (!g) {
+                std::vector<uint16_t> in((size_t)n * kTop * K, 0);
+                for (int i = 0; i < pp.local; ++i)
+                    std::memcpy(&in[(size_t)i * K], &act[(size_t)(pp.sorted[(size_t)i] + t0 * kTop) * K], (size_t)K * 2);
+                c_in.reset(new Dev(in.size() * 2));
+                c_in->put(in.data());
+                cin = c_in->p;
+            }
+            if (p1_launch(c, c.L->moe, nullptr, cin, g ? n : n * kTop, K, d_blk.p, N, c_so.p, c_of.p, n * kTop, c_y.p,
+                          !g) != RAD_OK) {
+                std::printf("FAIL %s: a 16-token gemv launch was refused\n", label);
+                ++c.bad;
+                return;
+            }
+            HC(hipStreamSynchronize(c.s));
+            std::vector<uint16_t> yc((size_t)n * kTop * N);
+            c_y.get(yc.data());
+            for (int i = 0; i < pp.local; ++i) {
+                const int f = pp.sorted[(size_t)i] + t0 * kTop, ra = row_of[(size_t)f], e = expert_of[(size_t)ra];
+                const uint16_t* got = &y[(size_t)ra * N];
+                if (forms[(size_t)e] == 2) {
+                    for (int q = 0; q < N; ++q) untouched += got[q] != 0xAAAAu;
+                    continue;
+                }
+                const size_t d = p1_diff(got, &yc[(size_t)i * N], (size_t)N, &c.nan_pairs);
+                if (d && differ < 4)
+                    std::printf("  %s %s: token %d slot %d (expert %d, %s) differs in %zu of %d values from its "
+                                "16-token pass\n", label, g ? "gate_up" : "down", f / kTop, f % kTop, e,
+                                forms[(size_t)e] ? "packed" : "block", d, N);
+                differ += d;
+                ++c.rows;
+            }
+        }
+        for (size_t i = (size_t)full.local * N; i < y.size(); ++i) tail += y[i] != 0;
+        /* The host kernels on a few computed rows. */
+        size_t hdiff = 0;
+        for (int q = 0; q < 6 && full.local; ++q) {
+            const int i = (int)(rng() % (uint64_t)full.local), e = expert_of[(size_t)i];
+            if (forms[(size_t)e] == 2) continue;
+            Mx W;
+            W.N = N; W.K = K; W.blocks = b.host[(size_t)e].data();
+            std::vector<uint16_t> hy((size_t)N);
+            const int f = full.sorted[(size_t)i];
+            gemv_avx2(W, g ? &x[(size_t)(f / kTop) * kEmbd] : &act[(size_t)f * K], hy.data(), 0, N);
+            hdiff += p1_diff(hy.data(), &y[(size_t)i * N], (size_t)N, &c.nan_pairs);
+            ++c.host_rows;
+        }
+        /* Other work splits: the same bytes. */
+        size_t sdiff = 0;
+        int nsplit = 0;
+        if (splits) {
+            const int sps[][4] = { { 64, 48, 1, 0 }, { 1024, 4096, 32, 0 }, { 0, 0, 0, 56 }, { 2000, 20, 4, 0 } };
+            for (const auto& sp : sps) {
+                if (sp[3] && !g) continue;
+                HC(hipMemset(d_y.p, 0xAA, d_y.n));
+                if (p1_launch(c, nullptr, sp, xin, AR, K, d_tab.p, N, d_so.p, d_of.p, T, d_y.p, !g) != RAD_OK) {
+                    std::printf("FAIL %s: a forced split was refused\n", label);
+                    ++c.bad;
+                    continue;
+                }
+                HC(hipStreamSynchronize(c.s));
+                std::vector<uint16_t> y2((size_t)T * N);
+                d_y.get(y2.data());
+                sdiff += p1_diff(y.data(), y2.data(), y.size(), &c.nan_pairs);
+                ++nsplit;
+            }
+        }
+        std::printf("p1 rows %-16s %-7s local %5d live %2d (skipped %2d, packed %2d) busiest %4d: %zu differ from "
+                    "16-token passes, %zu from the host, %zu skipped values written, %zu tail values not zero, %d "
+                    "splits %zu differ\n", label, g ? "gate_up" : "down", full.local, full.live, nskip, npk,
+                    full.busiest, differ, hdiff, untouched, tail, nsplit, sdiff);
+        std::fflush(stdout);
+        c.bad += differ + hdiff + untouched + tail + sdiff;
+    }
+}
+
+/* The stager's wave composition at ds41's shapes against one launch over every expert. */
+void p1_waves(P1Ctx& c, const P1Routing& r, int M, std::mt19937_64& rng) {
+    ++c.cases;
+    if (!c.L->swiglu) { std::printf("FAIL: the plugin has no r4d_rad_swiglu_clamped\n"); ++c.bad; return; }
+    const P1Pass p = p1_pass(r, 0, M);
+    const int T = M * kTop;
+    std::vector<uint16_t> x((size_t)M * kEmbd);
+    for (int t = 0; t < M; ++t) {
+        const auto row = make_x(kEmbd, rng, false);
+        std::copy(row.begin(), row.end(), x.begin() + (size_t)t * kEmbd);
+    }
+    Dev d_so(p.sorted.size() * 4), d_of((kNe + 1) * 4), d_x(x.size() * 2);
+    d_so.put(p.sorted.data());
+    d_of.put(p.off.data());
+    d_x.put(x.data());
+    std::vector<int> full_forms(kNe);
+    for (int e = 0; e < kNe; ++e) full_forms[(size_t)e] = rng() % 3 == 0 ? 1 : 0;
+    std::vector<int> sub;
+    for (int e = 0; e < kNe; ++e) {
+        const bool live = p.off[(size_t)e + 1] > p.off[(size_t)e];
+        if ((live && rng() % 4 != 0) || (!live && rng() % 8 == 0)) sub.push_back(e);
+    }
+    std::shuffle(sub.begin(), sub.end(), rng);
+    Dev G((size_t)T * 2 * kFf * 2), S((size_t)T * kFf * 2), D((size_t)T * kEmbd * 2);
+    Dev G2(G.n), S2(S.n), D2(D.n), tg(kNe * sizeof(void*)), td(kNe * sizeof(void*));
+    for (Dev* d : { &G, &S, &D, &G2, &S2, &D2 }) HC(hipMemset(d->p, 0xAA, d->n));
+    auto chain = [&](const std::vector<int>& forms, Dev& g, Dev& sw, Dev& dn) {
+        std::vector<void*> a = p1_table(c.gu, forms, c.noread), b = p1_table(c.dn, forms, c.noread);
+        tg.put(a.data());
+        td.put(b.data());
+        int rc = p1_launch(c, c.p1, nullptr, d_x.p, M, kEmbd, tg.p, 2 * kFf, d_so.p, d_of.p, T, g.p, false);
+        rc |= run_swiglu(c.L->swiglu, c.s, g.p, sw.p, T, kFf);
+        rc |= p1_launch(c, c.p1, nullptr, sw.p, T, kFf, td.p, kEmbd, d_so.p, d_of.p, T, dn.p, true);
+        HC(hipStreamSynchronize(c.s));   /* the tables are rewritten next */
+        return rc;
+    };
+    int rc = chain(full_forms, G, S, D);
+    std::vector<int> main_forms = full_forms;
+    for (int e : sub) main_forms[(size_t)e] = 2;
+    rc |= chain(main_forms, G2, S2, D2);
+    int waves = 0;
+    for (size_t w0 = 0, sz = 1; w0 < sub.size(); w0 += sz, sz = sz % 3 + 1, ++waves) {
+        std::vector<int> wf(kNe, 2);
+        for (size_t j = w0; j < std::min(sub.size(), w0 + sz); ++j) wf[(size_t)sub[j]] = full_forms[(size_t)sub[j]];
+        rc |= chain(wf, G2, S2, D2);
+    }
+    size_t d[3] = { 0, 0, 0 };
+    const Dev* a[3] = { &G, &S, &D };
+    const Dev* b[3] = { &G2, &S2, &D2 };
+    for (int i = 0; i < 3; ++i) {
+        std::vector<uint16_t> ha(a[i]->n / 2), hb(b[i]->n / 2);
+        a[i]->get(ha.data());
+        b[i]->get(hb.data());
+        d[i] = count_diff(ha.data(), hb.data(), ha.size());
+    }
+    std::printf("p1 waves M=%d %s rank %d: %d local slots, %zu experts in %d waves of 1-3: %zu gate_up, %zu swiglu, "
+                "%zu down values differ from one launch%s\n", M, r.name.c_str(), r.rank, p.local, sub.size(), waves,
+                d[0], d[1], d[2], rc ? " (a launch was refused)" : "");
+    std::fflush(stdout);
+    c.bad += d[0] + d[1] + d[2] + (rc ? 1 : 0);
+}
+
+/* hipEvent time of `launch`, median of `reps` after a warm-up (us), or -1 when refused. */
+double p1_time(P1Ctx& c, const std::function<int()>& launch, int reps) {
+    if (launch() != RAD_OK) return -1;
+    std::vector<double> t;
+    hipEvent_t a, b;
+    HC(hipEventCreate(&a));
+    HC(hipEventCreate(&b));
+    for (int i = 0; i < reps; ++i) {
+        HC(hipEventRecord(a, c.s));
+        if (launch() != RAD_OK) return -1;
+        HC(hipEventRecord(b, c.s));
+        HC(hipEventSynchronize(b));
+        float ms = 0;
+        HC(hipEventElapsedTime(&ms, a, b));
+        t.push_back(ms * 1000.0);
+    }
+    (void)hipEventDestroy(a);
+    (void)hipEventDestroy(b);
+    std::sort(t.begin(), t.end());
+    return t[t.size() / 2];
+}
+
+/* gate_up + down of one pass, timed: `kind` 0 the P1 twin (forms: 0 block, 1 packed, 2 a mix with a sixth
+ * skipped), 1 the served LCP twin, 2 that twin cut to the local slots, 3 the balanced LCP twin. Returns us (gate_up
+ * in *gu_us), -1 refused. */
+double p1_pass_time(P1Ctx& c, const P1Pass& p, int M, int kind, int form, const int* split, double* gu_us, int reps) {
+    const int T = kind == 2 ? std::max(1, p.local) : M * kTop;
+    std::vector<int32_t> so(p.sorted.begin(), p.sorted.begin() + T);
+    Dev d_so((size_t)T * 4), d_of((kNe + 1) * 4), d_x((size_t)M * kEmbd * 2), d_a((size_t)T * kFf * 2);
+    Dev g((size_t)T * 2 * kFf * 2), dn((size_t)T * kEmbd * 2), tg(kNe * sizeof(void*)), td(kNe * sizeof(void*));
+    d_so.put(so.data());
+    d_of.put(p.off.data());
+    HC(hipMemset(d_x.p, 0x3c, d_x.n));   /* finite activations: timing only */
+    HC(hipMemset(d_a.p, 0x3c, d_a.n));
+    std::vector<int> forms(kNe, kind == 0 ? (form == 1 ? 1 : 0) : 0);
+    if (kind == 0 && form == 2)
+        for (int e = 0; e < kNe; ++e) forms[(size_t)e] = e % 6 == 5 ? 2 : e % 3 == 1 ? 1 : 0;
+    std::vector<void*> a = p1_table(c.gu, forms, c.noread), b = p1_table(c.dn, forms, c.noread);
+    tg.put(a.data());
+    td.put(b.data());
+    auto run = [&](bool gate) -> int {
+        void* x = gate ? d_x.p : d_a.p;
+        const int AR = gate ? M : T, N = gate ? 2 * kFf : kEmbd, K = gate ? kEmbd : kFf;
+        void* tab = gate ? tg.p : td.p;
+        void* y = gate ? g.p : dn.p;
+        if (kind == 0) return p1_launch(c, c.p1, split, x, AR, K, tab, N, d_so.p, d_of.p, T, y, !gate);
+        if (kind == 3) {
+            RadTensor t[5] = { tensor(x, RAD_BF16, { AR, K }), tensor(tab, RAD_U8, { kNe, N, K / 32 * 17 }),
+                               tensor(d_so.p, RAD_I32, { T }), tensor(d_of.p, RAD_I32, { kNe + 1 }),
+                               tensor(y, RAD_BF16, { T, N }) };
+            t[1].stride[0] = 0;
+            RadParam pr[6] = { ps("type", "mxfp4"), pi("N", N), pi("K", K), pi("n_expert", kNe), pi("top_k", kTop),
+                               ps("a_order", gate ? "token" : "sorted") };
+            RadArgs ra{};
+            ra.t = t; ra.n_t = 5; ra.p = pr; ra.n_p = 6;
+            return c.L->moe_bal ? c.L->moe_bal(&ra, (RadStream)c.s, 1, 1) : RAD_E_UNSUPPORTED;
+        }
+        return p1_launch(c, c.L->moe_tall, nullptr, x, AR, K, tab, N, d_so.p, d_of.p, T, y, !gate);
+    };
+    const double tg_us = p1_time(c, [&] { return run(true); }, reps);
+    const double td_us = p1_time(c, [&] { return run(false); }, reps);
+    if (tg_us < 0 || td_us < 0) return -1;
+    *gu_us = tg_us;
+    return tg_us + td_us;
+}
+
+int p1_check(const Lib& L, int mmax, const char* routes_path) {
+    P1Ctx c;
+    c.L = &L;
+    int rc = 0;
+    /* The row table: the P1 twin in place of the LCP twin, reaching MMAX, one priority below the gemv. */
+    {
+        const RadKernelInfo *gemv = nullptr, *twin = nullptr, *lcp_twin = nullptr;
+        for (int i = 0; L.count && i < L.count(); ++i) {
+            const RadKernelInfo* k = L.at(i);
+            if (!k || !k->name) continue;
+            if (!std::strcmp(k->name, ds41p1::kGemvRow)) gemv = k;
+            if (!std::strcmp(k->name, ds41p1::kTwinRow)) twin = k;
+            if (!std::strcmp(k->name, ds41p1::kLcpTwinRow)) lcp_twin = k;
+        }
+        long long reach = 0;
+        int m_le = 0;
+        for (int i = 0; twin && i < twin->n_constraints; ++i)
+            if (!std::strcmp(twin->constraints[i].key, "M") && twin->constraints[i].op == RAD_C_LE) {
+                ++m_le;
+                reach = twin->constraints[i].ival;
+            }
+        const bool ok = gemv && twin && !lcp_twin && L.moe_p1 && twin->launch == L.moe_p1 && m_le == 1 &&
+                        reach >= mmax && reach <= ds41p1::kTwinMaxRows && twin->priority == gemv->priority - 1 &&
+                        twin->n_constraints == gemv->n_constraints && twin->layout == gemv->layout;
+        std::printf("%s: row table: %s %s (reach %lld, priority %d, the gemv's %d), %s %s\n", ok ? "PASS" : "FAIL",
+                    ds41p1::kTwinRow, twin ? "present" : "missing", reach, twin ? twin->priority : -1,
+                    gemv ? gemv->priority : -1, ds41p1::kLcpTwinRow, lcp_twin ? "present (must not be)" : "absent");
+        rc |= ok ? 0 : 1;
+        if (!L.moe_p1 || !L.moe_p1_opts) {
+            std::printf("p1: FAIL: the plugin lacks r4d_rad_moe_gemm_mxfp4_gemv_tall_p1 or its _opts export\n");
+            return 1;
+        }
+    }
+    c.p1 = L.moe_p1;
+    c.opts = L.moe_p1_opts;
+    HC(hipStreamCreate(&c.s));
+    /* The weight under every skip mark: an address in the never-mapped first 64 KiB, so a read of it faults (T3:
+     * the pointer under the mark need not be readable). */
+    c.noread = (const void*)(uintptr_t)0x1000;
+    if (routes_path) {
+        FILE* f = std::fopen(routes_path, "rb");
+        int32_t h[3];
+        if (f && std::fread(h, 4, 3, f) == 3 && h[2] == kTop && h[0] > 0 && h[1] > 0) {
+            g_p1_layers = h[0];
+            g_p1_rows = h[1];
+            g_p1_routes.resize((size_t)h[0] * h[1] * kTop);
+            if (std::fread(g_p1_routes.data(), 2, g_p1_routes.size(), f) != g_p1_routes.size()) g_p1_routes.clear();
+        }
+        if (f) std::fclose(f);
+        if (g_p1_routes.empty()) std::printf("note: cannot read the routes %s; synthetic routings only\n", routes_path);
+    }
+    const bool real = !g_p1_routes.empty();
+    const auto t0 = std::chrono::steady_clock::now();
+    std::mt19937_64 rng(1717);
+    p1_bank(&c.gu, 2 * kFf, kEmbd, rng);
+    p1_bank(&c.dn, kEmbd, kFf, rng);
+    std::printf("p1: 96 experts of gate_up [%d, %d] and down [%d, %d] in VRAM, block_mxfp4 and packed (%d and %d raw "
+                "rounds), made in %.1f s\n", 2 * kFf, kEmbd, kEmbd, kFf, c.gu.raw_rounds, c.dn.raw_rounds,
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    std::fflush(stdout);
+    std::vector<int> Ms = { 17, 33, 48, 64, 100, 256, 1024, 2048 };
+    if (mmax > 2048) Ms.push_back(mmax);
+    for (int M : Ms) {
+        if (M > mmax) continue;
+        if (real) {
+            p1_rows(c, p1_routing("real", M, 0, 3 + M % 30, rng), M, rng, M == 256 || M == 1024);
+            p1_rows(c, p1_routing("real", M, 2, 25, rng), M, rng, false);
+        }
+        p1_rows(c, p1_routing("skewed", M, 1, 0, rng), M, rng, !real && (M == 256 || M == 1024));
+        if (M <= 256) {
+            p1_rows(c, p1_routing("uniform", M, 3, 0, rng), M, rng, false);
+            p1_rows(c, p1_routing("hot", M, 0, 0, rng), M, rng, M == 64);
+        }
+    }
+    for (int M : { 64, 256, 2048 }) {
+        if (M > mmax) continue;
+        p1_waves(c, real ? p1_routing("real", M, 0, 12, rng) : p1_routing("skewed", M, 0, 0, rng), M, rng);
+        if (M == 256) p1_waves(c, p1_routing("hot", M, 3, 0, rng), M, rng);
+    }
+    std::printf("p1: %d cases, %zu (token, slot) rows against 16-token passes, %zu against the host kernels, %zu NaN "
+                "pairs (any NaN equal), %zu bad values, %.0f s\n", c.cases, c.rows, c.host_rows, c.nan_pairs, c.bad,
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    std::fflush(stdout);
+    /* Timing. */
+    std::printf("p1 time: gate_up + down a pass (hipEvent, median), us a local expert-row and a token row-layer\n");
+    const char* fname[3] = { "block", "packed", "mix 1/6 skip" };
+    const char* kname[4] = { "P1 twin", "LCP twin (served)", "LCP twin cut", "LCP twin balanced" };
+    for (int M : { 64, 256, 1024, 2048 }) {
+        if (M > mmax) continue;
+        for (int lr = 0; lr < (real ? 3 : 1); ++lr) {
+            const int layer = lr == 0 ? 12 : lr == 1 ? 25 : 36, rank = lr == 1 ? 2 : 0;
+            const P1Routing r = real ? p1_routing("real", M, rank, layer, rng) : p1_routing("skewed", M, rank, 0, rng);
+            const P1Pass p = p1_pass(r, 0, M);
+            for (int kind = 0; kind < 4; ++kind)
+                for (int form = 0; form < (kind == 0 ? 3 : 1); ++form) {
+                    /* The served twin costs seconds a call at these heights: one layer, M <= 1024, one rep. */
+                    if (kind == 1 && (M > 1024 || lr)) continue;
+                    if ((kind == 2 || kind == 3) && lr) continue;
+                    double gu = 0;
+                    const double us = p1_pass_time(c, p, M, kind, form, nullptr, &gu, kind == 0 ? 5 : 1);
+                    const int counted = kind == 0 && form == 2 ? p.local - [&] {
+                        int sk = 0;
+                        for (int e = 5; e < kNe; e += 6) sk += p.off[(size_t)e + 1] - p.off[(size_t)e];
+                        return sk;
+                    }() : p.local;
+                    std::printf("p1 time: M %4d %-8s rank %d %-18s %-12s local %5d live %2d busiest %4d: gate_up %9.1f "
+                                "down %9.1f us = %7.2f us an expert-row, %8.2f us a row-L\n", M, r.name.c_str(), rank,
+                                kname[kind], kind == 0 ? fname[form] : "block", counted, p.live, p.busiest, gu, us - gu,
+                                counted > 0 ? us / counted : 0.0, us / M);
+                    std::fflush(stdout);
+                }
+        }
+    }
+    /* The work split at M 2048 (or MMAX's largest): grid, item size, items a block, staged rows. */
+    {
+        const int M = std::min(2048, mmax);
+        const P1Routing r = real ? p1_routing("real", M, 0, 12, rng) : p1_routing("skewed", M, 0, 0, rng);
+        const P1Pass p = p1_pass(r, 0, M);
+        const int sps[][4] = { { 0, 0, 0, 0 },    { 128, 0, 0, 0 },  { 512, 0, 0, 0 },  { 1024, 0, 0, 0 },
+                               { 0, 48, 0, 0 },   { 0, 96, 0, 0 },   { 0, 768, 0, 0 },  { 0, 1 << 20, 0, 0 },
+                               { 0, 0, 2, 0 },    { 0, 0, 32, 0 },   { 0, 0, 0, 56 },   { 512, 96, 16, 0 } };
+        for (const auto& sp : sps) {
+            double gu = 0;
+            const double us = p1_pass_time(c, p, M, 0, 0, sp, &gu, 5);
+            std::printf("p1 time split: M %d %s rank 0 grid %4d item %7d KiB fill %2d lds %2d KiB: gate_up %8.1f down "
+                        "%8.1f us = %6.2f us an expert-row\n", M, r.name.c_str(), sp[0], sp[1], sp[2], sp[3], gu,
+                        us - gu, p.local ? us / p.local : 0.0);
+            std::fflush(stdout);
+        }
+    }
+    (void)hipStreamDestroy(c.s);
+    rc |= c.bad ? 1 : 0;
+    if (rc)
+        std::printf("p1: FAIL: %zu bad values in %d cases (rows, splits, waves; see FAIL and the counts above)%s\n",
+                    c.bad, c.cases, c.bad ? "" : ", or the row table");
+    else
+        std::printf("p1: PASS: %s at M 17..%d: %zu rows equal to 16-token passes, skipped rows untouched, tail zeros, "
+                    "splits and waves of 1-3 equal to one launch (%d cases)\n", ds41p1::kTwinRow, Ms.back(), c.rows,
+                    c.cases);
+    return rc;
+}
+
+}  // namespace
+
 int main(int argc, char** argv) {
-    if (argc < 3) { std::fprintf(stderr, "usage: %s LIBR4D.so check [trials] [table] | swiglu TABLE | time [LIB2.so] | ptime [T[:P]...] | draft [trials] | tall [T...] | lcp [C] [trials] | bal [C] [ROUTES] | sweep [trials] | sweep0 [trials]\n", argv[0]); return 2; }
+    if (argc < 3) { std::fprintf(stderr, "usage: %s LIBR4D.so check [trials] [table] | swiglu TABLE | time [LIB2.so] | ptime [T[:P]...] | draft [trials] | tall [T...] | lcp [C] [trials] | bal [C] [ROUTES] | p1 [MMAX] [ROUTES] | sweep [trials] | sweep0 [trials]\n", argv[0]); return 2; }
     /* `tall`: the switch before the plugin's row table and its sparse launchers first read it, and
      * the routed GEMM as the A/B's servers run it (no live tail); the other modes as the loop's
      * measured runs ran it. */
     /* `lcp [C]`: RADIANCE_EXPERIMENTAL_DS41_LCP=C and EXACT_TALL unset, as an Lc arm's server has them;
      * `sweep` keeps an LCP already in the environment (its heights) instead of setting EXACT_TALL. */
-    if (!std::strcmp(argv[2], "lcp") || !std::strcmp(argv[2], "bal")) {
+    /* Every mode but `p1` runs without prefill Phase 1's switch (its twin replaces the LCP twin `lcp` checks). */
+    if (std::strcmp(argv[2], ds41p1::kCheckMode)) unsetenv(ds41p1::kEnv);
+    if (!std::strcmp(argv[2], ds41p1::kCheckMode)) {
+        /* `p1 [MMAX] [ROUTES]`: LCP=2048 and the switch, as a P1 arm's server has them. */
+        setenv("RADIANCE_EXPERIMENTAL_DS41_LCP", "2048", 1);
+        setenv(ds41p1::kEnv, "1", 1);
+        unsetenv("RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL");
+        unsetenv("RADIANCE_EXPERIMENTAL_DS41_LIVE_TAIL");
+        unsetenv("RADIANCE_EXPERIMENTAL_DS41_MOE_BALANCE");
+        g_lcp = 2048;
+    } else if (!std::strcmp(argv[2], "lcp") || !std::strcmp(argv[2], "bal")) {
         const int c = argc > 3 ? std::atoi(argv[3]) : 1024;
         if (c < 64 || c > 2048 || c % 16) { std::fprintf(stderr, "lcp C: a multiple of 16 in 64 .. 2048\n"); return 2; }
         setenv("RADIANCE_EXPERIMENTAL_DS41_LCP", std::to_string(c).c_str(), 1);
@@ -2027,6 +2689,14 @@ int main(int argc, char** argv) {
         return rc;
     }
     if (!std::strcmp(argv[2], "bal")) return bal_check(lib, argc > 4 ? argv[4] : nullptr);
+    if (!std::strcmp(argv[2], ds41p1::kCheckMode)) {
+        const int mmax = argc > 3 ? std::atoi(argv[3]) : ds41p1::kTwinMaxRows;
+        if (mmax < 17 || mmax > ds41p1::kTwinMaxRows) {
+            std::fprintf(stderr, "p1 MMAX: 17 .. %d\n", ds41p1::kTwinMaxRows);
+            return 2;
+        }
+        return p1_check(lib, mmax, argc > 4 ? argv[4] : nullptr);
+    }
     if (!std::strcmp(argv[2], "tall")) {
         std::vector<int> Ts;
         for (int i = 3; i < argc; ++i) Ts.push_back(std::atoi(argv[i]));

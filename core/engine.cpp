@@ -194,6 +194,16 @@ Engine::~Engine() {
             RAD_INFO("host experts: %llu jobs of four or more rows of one expert (%llu rows) went "
                      "through the many-row kernel", (unsigned long long)hx.many_jobs,
                      (unsigned long long)hx.many_rows);
+        /* RADIANCE_EXPERIMENTAL_DS41_SIDE_STORE (place/hx_side_store.h): the units the packed RAM
+         * cache refuses, held, and the misses that read nothing for them. */
+        if (r->fstager.side_store()) {
+            const HxSideStore::Stats ss = r->fstager.side_store_stats();
+            RAD_INFO("host experts' side store: %d of at most %d units held (%s) whose inserts the "
+                     "packed RAM cache refuses; %llu misses handed their planes without a read (%llu "
+                     "in one-token passes); %llu refused units turned away for want of room",
+                     ss.units, ss.cap, humanb(ss.bytes).c_str(), (unsigned long long)hx.side_hits,
+                     (unsigned long long)hx.side_d_hits, (unsigned long long)ss.full);
+        }
         if (hx.early)
             RAD_INFO("host experts, early issue: %llu layers issued their card ops ahead of their counts "
                      "sync and waited %.1f ms for the counts at their gathers (%.1f us a layer; also in "
@@ -418,6 +428,39 @@ Engine::~Engine() {
                  s.computed ? (double)s.compute_ns / 1e3 / (double)s.computed : 0.0,
                  (double)s.ready_ns / 1e6,
                  s.computed ? (double)s.ready_ns / 1e3 / (double)s.computed : 0.0);
+    }
+    /* ..._PREFETCH_RECORD: the inputs written for offline scoring (router_predictor.h). */
+    if (RouterPredictor* rp = RouterPredictor::get(); rp && !rp->record_path().empty()) {
+        rp->flush_record();
+        RAD_INFO("router predictor record: %llu router inputs written to %s",
+                 (unsigned long long)rp->stats().recorded, rp->record_path().c_str());
+    }
+    /* ..._PREFETCH_SCORE=int8|int4: the scoring's parts, and with ..._SCORE_CHECK the predictions
+     * against bf16 alone (router_predictor.h). */
+    if (RouterPredictor* rp = RouterPredictor::get(); rp && rp->score_mode() != RouterPredictor::kScoreBf16) {
+        const RouterPredictor::Stats s = rp->stats();
+        const char* q = rp->score_mode() == RouterPredictor::kScoreInt8 ? "int8" : "int4";
+        const double n = s.computed ? (double)s.computed : 1.0;
+        RAD_INFO("router predictor scoring: %s (%.0f MB, one scale an expert), the best %d scored again "
+                 "in bf16: %llu predictions, %.1f us a prediction in the %s pass and %.1f us rescoring",
+                 q, (double)rp->quant_bytes() / 1e6, rp->rescore(), (unsigned long long)s.computed,
+                 (double)s.quant_ns / 1e3 / n, q, (double)s.rescore_ns / 1e3 / n);
+        if (s.checked) {
+            std::string ranks;
+            for (int b = 0; b < RouterPredictor::kRankBuckets; ++b)
+                ranks += b < RouterPredictor::kRankBuckets - 1
+                    ? fmt(" under %d %llu,", RouterPredictor::kRankEdge[b], (unsigned long long)s.check_rank[b])
+                    : fmt(" %d or more %llu", RouterPredictor::kRankEdge[b - 1], (unsigned long long)s.check_rank[b]);
+            const double c = (double)s.checked;
+            RAD_INFO("router predictor check against bf16 alone: %llu predictions checked (one in %d); "
+                     "bf16's top %d the same set in %llu (%.2f%%) and in the same order in %llu (%.2f%%); "
+                     "bf16's picks by their rank in the %s scores:%s; %llu at or past the %d rescored; "
+                     "%.1f ms checking", (unsigned long long)s.checked, rp->check_every(),
+                     rp->k(), (unsigned long long)s.check_set,
+                     100.0 * (double)s.check_set / c, (unsigned long long)s.check_order,
+                     100.0 * (double)s.check_order / c, q, ranks.c_str(),
+                     (unsigned long long)s.check_outside, rp->rescore(), (double)s.check_ns / 1e6);
+        }
     }
     /* Drain the transfer streams before the contexts. Ctx::shutdown drains the compute streams
      * and frees the arena, but the mover's stream also copies into the arena (the prefill

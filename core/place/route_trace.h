@@ -94,7 +94,8 @@ enum Status : uint8_t {
     kOnCard = 0,       /* a VRAM resident: the card computed it */
     kRamHit = 1,       /* the RAM cache held it: the CPU computed it from the cache */
     kMiss = 2,         /* read from the drive while the layer waited, then computed by the CPU */
-    kAheadWhole = 3,   /* read ahead whole before its layer (the read-ahead's unit): no wait */
+    kAheadWhole = 3,   /* read ahead whole before its layer (the read-ahead's unit), or held
+                        * by the side store (..._SIDE_STORE, hx_side_store.h): no wait */
     kAheadPart = 4,    /* read ahead in part, the rest read while the layer waited */
     kCopyPath = 5,     /* the card's copy path (a unit the CPU path could not take) */
     kUndecided = 6,    /* file tier, no CPU choice on this pass (none ran) */

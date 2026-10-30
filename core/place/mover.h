@@ -750,6 +750,12 @@ public:
      * units); weights whose packed scales failed the round trip (never published). */
     struct PackedStats { uint64_t inserted = 0, over_budget = 0, over_budget_units = 0, round_trip_failed = 0; };
     PackedStats packed_stats() const;
+    /* The packed cache refused unit u over its raw-round budget (at least once: a refusal is the
+     * unit's for good, its scales decide it). */
+    bool packed_refused(int32_t u) const {
+        return packed_refused_ && u >= 0 && (size_t)u < unit_.size() &&
+               packed_refused_[(size_t)u].load(std::memory_order_relaxed) != 0;
+    }
     /* retire_file_windows  gives back the RAM-cache leases the read windows keep for their last
      *                      copies, for a caller that knows those copies are done (the file
      *                      stager, past a routing sync the card reached after them). A window

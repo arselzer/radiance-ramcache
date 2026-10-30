@@ -537,6 +537,7 @@ FileStager::~FileStager() {
         for (std::thread& t : hx_bg_) t.join();
         hx_bg_.clear();
     }
+    hx_side_.clear();   /* its planes back to hx_planes_free_ while the list is there */
     if (trace_fp_) std::fclose(trace_fp_);
     /* The route trace's pinned staging, once its last copies have landed. */
     if (rt_ev_rec_ && rt_ev_) (void)rad_event_sync(rt_ev_);
@@ -933,7 +934,8 @@ int FileStager::start_ep_routed(int32_t li, RadStream s, bool* read) {
         /* The CPU path's drive reads count too (verify reads them on the card path as well). */
         /* (Units read ahead whole were read before the layer.) */
         const uint64_t missed = mover_->stats().file_relaid - relaid0 +
-            (hx_li_ == li && hx_policy_ != kHxVerify ? 2 * (uint64_t)(hx_miss_.size() - (size_t)hx_ra_handed_) : 0);
+            (hx_li_ == li && hx_policy_ != kHxVerify
+                 ? 2 * (uint64_t)(hx_miss_.size() - (size_t)hx_ra_handed_ - (size_t)hx_side_handed_) : 0);
         ep_stats_.stage_ns += ns;
         if (missed) { ++ep_stats_.miss_layers; ep_stats_.miss_stage_ns += ns; }
         if (pass_tok_ == 1) {
@@ -1241,6 +1243,7 @@ void FileStager::rt_choice(int32_t li, bool decided) {
             if (slot >= 0) {
                 st = rtrace::kRamHit;
             } else if (slot == -2) {
+                /* 1 read ahead whole, 2 the side store's: neither waited for a read */
                 const bool whole = k < hx_miss_ready_.size() && hx_miss_ready_[k] != 0;
                 const bool part = k < hx_miss_ra_.size() && hx_miss_ra_[k] != nullptr;
                 st = whole ? rtrace::kAheadWhole : part ? rtrace::kAheadPart : rtrace::kMiss;
@@ -1471,6 +1474,35 @@ int FileStager::tall_init(const Program& prog) {
     return RAD_OK;
 }
 
+namespace {
+/* RADIANCE_EXPERIMENTAL_DS41_SIDE_STORE: set and not 0. */
+const char* side_store_asked() {
+    const char* v = std::getenv("RADIANCE_EXPERIMENTAL_DS41_SIDE_STORE");
+    return v && *v && std::strcmp(v, "0") != 0 ? v : nullptr;
+}
+}  /* namespace */
+
+/* RADIANCE_EXPERIMENTAL_DS41_SIDE_STORE=N (hx_side_store.h), from hx_init_impl once the misses'
+ * rows are known and before the insert threads can see a refusal (the warm-up's). */
+int FileStager::hx_side_init() {
+    const char* v = side_store_asked();
+    if (!v) return RAD_OK;
+    const int n = std::atoi(v);
+    if (n < 1 || n > 64 || std::to_string(n) != v || !mover_ || !mover_->packed_cache() ||
+        hx_miss_rows_ <= 0) {
+        RAD_ERR("RADIANCE_EXPERIMENTAL_DS41_SIDE_STORE=%s: N (1-64) units a rank whose inserts the packed "
+                "RAM cache refuses keep their planes, which needs RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE=1 "
+                "and the misses on the CPU (host experts, ..._MISSES)", v);
+        return RAD_E_INVAL;
+    }
+    hx_side_.configure(n);
+    if (plan_->rank == 0)
+        RAD_INFO("host experts: side store: the planes of up to %d units a rank whose inserts the packed "
+                 "RAM cache refuses are kept and handed to their later misses, which read nothing "
+                 "(~18 MiB a unit; RADIANCE_EXPERIMENTAL_DS41_SIDE_STORE)", n);
+    return RAD_OK;
+}
+
 /* Which layers can hand units to the pool: the EP-routed ones whose first expert op is a decode
  * gate_up (moe_gemm_ggml mxfp4 [4608, 5120], token order), whose last is the down projection
  * ([5120, 2304], sorted order) with a swiglu_clamped at the pool's limit between, and whose
@@ -1485,6 +1517,12 @@ int FileStager::tall_init(const Program& prog) {
 int FileStager::hx_init(const Program& prog) {
     RAD_TRY(hx_init_impl(prog));
     RAD_TRY(hx_wake_init(prog));
+    /* Asked for, the store must run (hx_side_init): host experts with misses on the CPU. */
+    if (const char* v = side_store_asked(); v && !hx_side_.on()) {
+        RAD_ERR("RADIANCE_EXPERIMENTAL_DS41_SIDE_STORE=%s: no store without host experts that compute "
+                "the misses on the CPU (..._HOST_EXPERTS, ..._MISSES) from the packed RAM cache", v);
+        return RAD_E_INVAL;
+    }
     /* The misses the CPU must take: every pass's. Without the switch that is 16 tokens whatever
      * --max-num-batched-tokens says (as before); with it the step's (tall_init: ep_rows_ is the
      * step, at least 16). */
@@ -1529,6 +1567,9 @@ int FileStager::hx_init_impl(const Program& prog) {
     hx_defer_ok_ = false;
     hx_defer_li_ = -1;
     hx_capped_ = false;
+    hx_side_.clear();
+    hx_side_.configure(0);
+    hx_side_handed_ = 0;
     hx_ops_.assign(layers_.size(), HxOps{});
     /* The DSpark head tail owns the routed layers' file buffers and their copy budget. */
     if (head_.configured()) {
@@ -1717,6 +1758,8 @@ int FileStager::hx_init_impl(const Program& prog) {
         }
     }
     if (!hx_ra_) hx_ra_rest_ = 0;   /* no read-ahead in pieces: nothing to finish */
+    /* ..._SIDE_STORE: before the insert threads can see a refusal (the warm-up's below). */
+    RAD_TRY(hx_side_init());
     if (hx_miss_rows_ > 0 && hx_bg_.empty()) {
         hx_bg_stop_ = false;
         int n = 4;
@@ -1807,6 +1850,7 @@ void FileStager::hx_choose(int32_t li) {
     hx_miss_ready_.clear();
     hx_miss_ra_.clear();
     hx_ra_handed_ = 0;
+    hx_side_handed_ = 0;
     hx_slot_.assign(want_.size(), -1);
     const bool ra = hx_ra_ && pass_tok_ == 1;   /* read-ahead in pieces: this layer's units */
     if (ra) {
@@ -1845,8 +1889,18 @@ void FileStager::hx_choose(int32_t li) {
              * read has not begun is read below as any miss (the read-ahead then skips it). */
             std::shared_ptr<Mover::HostPlanes> ahead;
             std::shared_ptr<ReadAheadUnit> urgent;
-            bool ready = false;
-            if (hx_pf_.joinable()) {
+            bool ready = false, side = false;
+            /* ..._SIDE_STORE: a unit the packed cache refuses, its planes kept from an earlier miss
+             * (hx_side_store.h): nothing to read. A read-ahead planned before they were kept goes. */
+            if (hx_side_.on() && (ahead = hx_side_.find(u))) {
+                side = true;
+                if (ra)
+                    for (RaEntry& r : hx_ra_here_)
+                        if (r.u && r.unit == u) hx_ra_drop(r, true);
+                ++hx_side_handed_;
+                ++hx_stats_.side_hits;
+                hx_stats_.side_d_hits += pass_tok_ == 1;
+            } else if (hx_pf_.joinable()) {
                 std::unique_lock<std::mutex> lk(hx_pf_mu_);
                 PfBatch& pb = hx_pf_batch_[li & 1];
                 if (pb.pass == trace_pass_ && pb.li == li)
@@ -1873,7 +1927,7 @@ void FileStager::hx_choose(int32_t li) {
             } else if (ra) {
                 ahead = hx_ra_take(u, &ready, &urgent);
             }
-            hx_miss_ready_.push_back(ready ? 1 : 0);
+            hx_miss_ready_.push_back(side ? 2 : ready ? 1 : 0);
             if (hx_ra_) hx_miss_ra_.push_back(std::move(urgent));
             hx_miss_.push_back(ahead ? ahead : hx_planes_get(u));
             const int rows = e >= 0 && e < counts_cap_ ? std::max<int32_t>(counts_host_[e], 1) : 1;
@@ -2093,6 +2147,21 @@ int FileStager::hx_init_fetch() {
             RAD_INFO("host experts: early issue: a routed layer's card ops go ahead of its counts sync, "
                      "and its CPU share is chosen at its gather");
     }
+    hx_post_late_ = false;
+    const char* pl = nullptr;
+    if (asked("RADIANCE_EXPERIMENTAL_DS41_PREFETCH_POST_LATE", &pl)) {
+        if (std::strcmp(pl, "1") != 0 || !hx_early_ || !hx_pred_ || !hx_pred_->pieces() || !hx_ra_) {
+            RAD_ERR("RADIANCE_EXPERIMENTAL_DS41_PREFETCH_POST_LATE=%s: 1 posts the read-ahead's prediction "
+                    "after an early-issued layer's CPU work is submitted, which needs "
+                    "RADIANCE_EXPERIMENTAL_DS41_EARLY_ISSUE=1 and the read-ahead in pieces "
+                    "(RADIANCE_EXPERIMENTAL_DS41_PREFETCH=pieces, its readers running)", pl);
+            return RAD_E_INVAL;
+        }
+        hx_post_late_ = true;
+        if (plan_->rank == 0)
+            RAD_INFO("host experts: early issue: rank 0 posts the read-ahead's router input once a layer's "
+                     "CPU work is submitted (RADIANCE_EXPERIMENTAL_DS41_PREFETCH_POST_LATE)");
+    }
     const char* f = nullptr;
     if (asked("RADIANCE_EXPERIMENTAL_DS41_FETCH_LIST", &f)) {
         if (std::strcmp(f, "1") != 0 || !hx_pool_) {
@@ -2169,7 +2238,8 @@ int FileStager::hx_early_decide() {
     hx_stats_.early_wait_ns += sync_ns;
     RAD_TRY(mover_->retire_file_windows());
     const auto t_retired = std::chrono::steady_clock::now();
-    if (hx_pred_ && pass_tok_ == 1 && plan_->rank == 0 &&
+    /* ..._PREFETCH_POST_LATE: after hx_submit below instead. */
+    if (hx_pred_ && pass_tok_ == 1 && plan_->rank == 0 && !hx_post_late_ &&
         moe_runs(L.layer + (hx_pred_->pieces() ? 2 : 1)))
         hx_pred_->post(trace_pass_, L.layer, hx_x_);
     int64_t total = 0;
@@ -2206,6 +2276,13 @@ int FileStager::hx_early_decide() {
     }
     if (hx_li_ == li) RAD_TRY(hx_submit());
     const auto t_submitted = std::chrono::steady_clock::now();
+    auto t_posted = t_submitted;
+    /* ..._PREFETCH_POST_LATE: the prediction of layer L+2 once this layer's CPU work is out, as
+     * start_ep_routed posts it, so the post does not hold back the pool's start. */
+    if (hx_post_late_ && pass_tok_ == 1 && plan_->rank == 0 && moe_runs(L.layer + 2)) {
+        hx_pred_->post(trace_pass_, L.layer, hx_x_);
+        t_posted = std::chrono::steady_clock::now();
+    }
     /* This layer took its read-ahead entries: now the next layer's (predicted from this one). */
     if (hx_pf_.joinable() && pass_tok_ == 1 && (size_t)(li + hx_pf_ahead_) < layers_.size() &&
         moe_runs(layers_[(size_t)(li + hx_pf_ahead_)].layer))
@@ -2217,11 +2294,12 @@ int FileStager::hx_early_decide() {
         ep_stats_.d_choose_ns += ns(t_retired, t_chosen);
         ep_stats_.d_miss_post_ns += ns(t_chosen, t_miss_posted);
         ep_stats_.d_submit_ns += ns(t_miss_posted, t_submitted);
+        ep_stats_.d_post_ns += ns(t_submitted, t_posted);
         ep_stats_.d_decide_ns += ns(t_counts, t_stage);
     }
     /* Nothing is staged (the card reads only aliases); the misses' drive reads count as the
      * ordinary path counts them, two weights a missed unit. */
-    const uint64_t missed = hx_li_ == li ? 2 * (uint64_t)hx_miss_.size() : 0;
+    const uint64_t missed = hx_li_ == li ? 2 * (uint64_t)(hx_miss_.size() - (size_t)hx_side_handed_) : 0;
     if (missed) {
         ++ep_stats_.miss_layers;
         if (pass_tok_ == 1) ++ep_stats_.d_miss_layers;
@@ -2483,10 +2561,11 @@ int FileStager::hx_submit_misses_now(int rows) {
             }
         }
     }
-    /* Units read ahead whole: handed over only from the container the program was loaded from. */
-    if (hx_ra_handed_ > 0 && !mover_->source_epochs_current()) {
-        RAD_ERR("host experts: the container changed under layer %d's units read ahead",
-                layers_[(size_t)hx_li_].layer);
+    /* Units read ahead whole, or held by the side store: handed over only from the container the
+     * program was loaded from. */
+    if ((hx_ra_handed_ > 0 || hx_side_handed_ > 0) && !mover_->source_epochs_current()) {
+        RAD_ERR("host experts: the container changed under layer %d's units read ahead or kept in the "
+                "side store", layers_[(size_t)hx_li_].layer);
         return RAD_E_IO;
     }
     hx_stats_.miss_read_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -2529,9 +2608,10 @@ int FileStager::hx_submit_misses_now(int rows) {
     hx_reserved_ = 0;
     RAD_TRY(hx_pool_->submit(hx_jobs_.data() + first, n, &hx_ticket_));
     std::sort(hx_rows_.begin(), hx_rows_.end());
-    {
+    {   /* the side store's units are not inserted again: the packed cache refuses them */
         std::lock_guard<std::mutex> lk(hx_bg_mu_);
-        for (auto& p : hx_miss_) hx_bg_q_.push_back(HxInsert{ p, rows });
+        for (size_t i = 0; i < hx_miss_.size(); ++i)
+            if (i >= hx_miss_ready_.size() || hx_miss_ready_[i] != 2) hx_bg_q_.push_back(HxInsert{ hx_miss_[i], rows });
     }
     hx_bg_cv_.notify_all();
     return RAD_OK;
@@ -2782,7 +2862,8 @@ void FileStager::hx_pf_loop() {
             const int e = g[k] - base;
             if (e < 0 || e >= 96) continue;
             const int32_t u = hx_unit_of_[(size_t)li][(size_t)e];
-            if (u < 0 || !mover_->host_planes_eligible(u) || mover_->unit_cached(u)) continue;
+            if (u < 0 || !mover_->host_planes_eligible(u) || mover_->unit_cached(u) || hx_side_.holds(u))
+                continue;
             PfEntry pe;
             pe.unit = u;
             pe.p = hx_planes_get(u);
@@ -2854,7 +2935,8 @@ void FileStager::hx_ra_plan(uint32_t pass, int layer, const int32_t* g, int k) {
         const int e = g[pos] - base;
         if (e < 0 || e >= 96) continue;
         const int32_t u = hx_unit_of_[(size_t)li][(size_t)e];
-        if (u < 0 || (size_t)u >= hx_ra_ok_.size() || !hx_ra_ok_[(size_t)u] || mover_->unit_cached(u))
+        if (u < 0 || (size_t)u >= hx_ra_ok_.size() || !hx_ra_ok_[(size_t)u] || mover_->unit_cached(u) ||
+            hx_side_.holds(u))   /* ..._SIDE_STORE: its planes are in */
             continue;
         {
             std::lock_guard<std::mutex> lk(hx_ra_mu_);
@@ -3167,6 +3249,9 @@ void FileStager::hx_bg_loop() {
                      "a miss", rad_strerror(rc));
             told = true;
         }
+        /* ..._SIDE_STORE: the packed cache refused it over its raw-round budget, as it always will:
+         * its planes stay for its later misses (hx_side_store.h). */
+        if (rc >= 0 && hx_side_.on() && mover_->packed_refused(job.p->unit)) (void)hx_side_.offer(job.p);
         job.p.reset();
         lk.lock();
         --hx_bg_busy_;
@@ -3258,7 +3343,7 @@ int FileStager::hx_deferred(int32_t li, RadStream s) {
                 "has only aliases for them", layers_[(size_t)li].layer, want_.size(), selected);
         return RAD_E_STATE;
     }
-    if (trace_fp_) trace_layer(layers_[(size_t)li].layer, 2 * (uint32_t)hx_miss_.size());
+    if (trace_fp_) trace_layer(layers_[(size_t)li].layer, 2 * (uint32_t)(hx_miss_.size() - (size_t)hx_side_handed_));
     if (hx_li_ != li) {
         if (rt_) rt_layer(li);
         return RAD_OK;

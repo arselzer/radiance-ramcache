@@ -34,6 +34,8 @@
 
 namespace rad {
 
+struct DraftVramRank;   /* place/draft_vram.h */
+
 /* ------------------------------------------------------------------ strategy */
 enum class Strategy { AllVram = 0, LayerOffload = 1, ExpertTiered = 2, Auto = 3 };
 
@@ -83,10 +85,17 @@ struct MoveUnit {
     bool    pinned = false;      /* a decode-hot resident --expert-pin-top kept: heat never demotes it */
     bool    host_forced = false; /* a placement flag put it in the pinned pool: the embedding's,
                                   * the encoder tower's or the draft head's experts' */
+    /* RADIANCE_EXPERIMENTAL_DS41_DRAFT_VRAM (draft_vram.h): a hot DSpark draft-bank expert, a
+     * static VRAM resident placed before any strategy (the expert fill charges it as a fixed
+     * unit), or one outside the hot set, parked on the mapped tier with no class, slot or pool:
+     * never read, and published at a resident draft expert's address. */
+    bool    draft_vram = false;
+    bool    draft_parked = false;
 
     /* Placed before any strategy runs, so every assignment pass skips it and no VRAM total counts
-     * it: the mapped tier, --embedding-placement ram and --vision-tower-placement ram. */
-    bool preplaced() const { return tier == Tier::Mapped || host_forced; }
+     * it: the mapped tier, --embedding-placement ram and --vision-tower-placement ram. A hot draft
+     * expert is skipped too, and assign_expert_tiered charges it beside the dense units. */
+    bool preplaced() const { return tier == Tier::Mapped || host_forced || draft_vram; }
     const char* reason = "fits in vram";   /* a fixed string for the report */
 
     /* The group's internal layout, computed once here: `offset[i]` is where weights[i] sits in the
@@ -244,6 +253,12 @@ public:
     int64_t tower_host_bytes = 0;
     int64_t draft_host_bytes = 0;
     int64_t forced_host_used = 0;
+    /* RADIANCE_EXPERIMENTAL_DS41_DRAFT_VRAM (draft_vram.h): the hot draft-bank experts this rank
+     * holds as static VRAM residents, and their slots' bytes, charged to the weights pool before
+     * the expert fill; and the draft experts parked (no slot, no pool, never read), with their
+     * bytes, which no tier total counts. */
+    int64_t draft_vram_units = 0, draft_vram_bytes = 0;
+    int64_t draft_parked_units = 0, draft_parked_bytes = 0;
     /* --expert-profile and --expert-pin-top: the profile's units the planner pinned resident and the
      * share threshold it derived from the fraction. Reported so the window can see what the decode
      * set costs the card. */
@@ -329,6 +344,11 @@ struct PlannerInput {
      * for the conditional units it considers for VRAM in a static plan; null leaves every weight in
      * its stored form and the plan exactly as without it. */
     std::function<int64_t(rad_weight w, bool scan, int32_t* cap, int32_t* raw)> vram_pack;
+    /* RADIANCE_EXPERIMENTAL_DS41_DRAFT_VRAM (draft_vram.h): this rank's hot draft-bank experts,
+     * which Planner::place_draft_bank_vram makes static VRAM residents in place of
+     * --draft-bank-expert-placement host's pinned pool, parking the rest. Null (or n 0): off, and
+     * the plan is exactly as without it. */
+    const DraftVramRank* draft_vram = nullptr;
 };
 
 /* Whether a host-only unit stays in the container's mapping. On a card, always: a host kernel
@@ -381,6 +401,10 @@ private:
     int  pin_towers(const Config& cfg, Plan* p) const;
     int  pin_draft_experts(const Program& prog, const Config& cfg, Plan* p) const;
     int  pin_draft_bank_experts(const Program& prog, const Config& cfg, Plan* p) const;
+    int  place_draft_bank_vram(const Program& prog, const Config& cfg, Plan* p) const;
+    /* After the strategy: the hot set still static in VRAM and every other draft expert still
+     * parked, exactly as PlannerInput::draft_vram names them. */
+    int  check_draft_bank_vram(Plan* p) const;
     void pin_hot(const Config& cfg, Plan* p) const;
     void build_classes(Plan* p);
     void rank_units(Plan* p, std::vector<int32_t>* order) const;

@@ -170,6 +170,54 @@ the offsets placing every row at the block's last position, each stage's attenti
 context keys before the anchor plus the block's), and the walk. Arm part `DbN` (with a `Ds` part);
 off, nothing of it is declared.
 
+## The draft bank's hot set in VRAM (`RADIANCE_EXPERIMENTAL_DS41_DRAFT_VRAM`)
+
+The pinned bank costs the best arm ~4.5% before it drafts anything: `--draft-bank-expert-placement
+host` takes 1.68 GiB a rank of pinned pool (p2048 instead of p256) and the RAM cache drops to 90 GiB.
+`RADIANCE_EXPERIMENTAL_DS41_DRAFT_VRAM=N` (1-32) with `..._DRAFT_HOTSET=<file>` replaces that
+placement (the flag stays `host`, the bank's manual contract; core/place/draft_vram.h):
+
+- each rank keeps the first N experts of each of its three stage lists in the hot-set file as
+  static VRAM residents, charged to the weights pool before the expert fill (`Planner::
+  place_draft_bank_vram`): the trunk gives up 3N residents a rank (a pair is a trunk expert's size);
+- the other draft experts are parked: mapped tier with no class, slot or pool, never read; each is
+  published at its stage's first resident's weight of the same slot on its card, so every pointer the
+  grouped GEMM is handed names card memory (`draft_vram_aliases`);
+- nothing of the bank is pinned, so the arm runs at B's p256 and m98304;
+- after the load every rank's three router correction planes (the bank ships them zero) are read
+  back, written with -inf at every expert no rank keeps, and read back again (`draft_vram_mask_planes`).
+  `router_scored_topk` never takes a -inf key, so the router takes the best three kept experts,
+  weighted by their unbiased scores renormalised over the three. A stage keeping fewer than three in
+  all is refused (with two kept, libref refuses the launch and libr4d's third pick is a masked
+  expert's id; `r4d_emu_ds41mask`).
+
+The target verifies every draft: the mask moves acceptance and speed, never a reply byte. With
+`DRAFT_GEMV=2` (`Dkt`) the live tail serves the VRAM weights and a parked expert is never read; even
+without it the aliases keep every read inside card memory. Every rank tallies its draft routing
+histograms (the ones the core already copies back) and prints at exit the selections on its resident
+experts and on its parked ones, which must be none (`draft VRAM: rank R at exit: ... (none: the mask
+held)`).
+
+The hot set comes from a capture: `--expert-stats` in an unmasked DSpark arm (part `Xd`, with a `Ds`
+part) counts each stage's selections by model-wide expert from the router's own histograms, every
+query pass's five rows. `draft_hotset.py write OUT.json xstats-*.json [--top N]` sums captures and
+ranks each rank's 32 experts of each stage by count (rank r holds 32r..32r+31; the engine checks each
+listed id against the container's directory and refuses one the rank does not hold); `show`, `cover`
+(a capture's selections the first N keep: held-out coverage when the capture is another prompt set's),
+`summary` and `check` (a capture taken under the mask selects only the kept experts). On the 2-prompt
+capture of 28 Oct (37 query passes) N = 8 keeps 88.6% of the selections in sample (stage 40 78.9%, 41
+88.8%, 42 98.2%), N = 16 98.9%.
+
+Arm part `DvN` (with a `Ds` part). Its hot set is the first set of `DRAFT_HOTSET_<set>_db<K>`,
+`DRAFT_HOTSET_<set>`, `DRAFT_HOTSET_db<K>`, `DRAFT_HOTSET`, where `<set>` is its `U` part's name
+(`heldout` without one) and `K` its `DbK` part's: so each prompt set can be scored on the other's
+capture, and a short-block arm on a capture taken with the short block. A `Dv` arm is measured only if its log has the
+switch's line, all four ranks' "draft VRAM final placement ... hot=N/N/N" and masked-plane lines, and
+at exit all four "(none: the mask held)"; every other arm runs with `..._DRAFT_VRAM=0` and must have
+no "draft VRAM" line. At the window's end `ab_requests.py --acceptance` prints each DSpark arm's drafts,
+acceptance and its ratio r to the first arm with the same `Ds` and `Db` parts in its prompt set (put the
+pinned-bank arm first), tokens a step and decode tokens/s.
+
 ## The packed RAM cache
 
 With the file buffers capped (`..._FILE_BUFFER_UNITS`) the card never reads the RAM cache: the CPU

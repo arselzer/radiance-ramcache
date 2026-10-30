@@ -36,6 +36,7 @@
 #include "format/table_copy.h"
 #include "format/dspark_rad_banks.h"
 #include "place/vram_packed.h"
+#include "place/draft_vram.h"
 #include "lora/adapter.h"
 #include "lora/slots.h"
 
@@ -157,6 +158,28 @@ private:
 
     /* --expert-stats FILE (place/xstats.h); null without the flag. */
     std::unique_ptr<ExpertStats> xstats_;
+
+    /* RADIANCE_EXPERIMENTAL_DS41_DRAFT_VRAM (place/draft_vram.h): the experts a stage a rank keeps in
+     * VRAM (0: off), the hot-set file, each rank's resident and model-wide ids, each stage's experts
+     * kept on some rank (the router's mask), and per rank and stage the draft routing histograms
+     * credited and the selections they counted on resident and on parked experts (want none). */
+    int                               draft_vram_n_ = 0;
+    DraftHotset                       draft_hotset_;
+    std::vector<DraftVramRank>        draft_vram_rank_;
+    std::vector<std::vector<uint8_t>> draft_vram_allowed_;
+    struct DraftVramTally {
+        uint64_t hist[kDraftStages] = {}, resident[kDraftStages] = {}, parked[kDraftStages] = {};
+        uint64_t masked_planes = 0;   /* correction planes written and read back masked at load */
+    };
+    std::vector<DraftVramTally>       draft_vram_tally_;
+    /* Before the planner: the switch, the file, and every rank's part, checked against the
+     * container's directory; at the load's end: the masked correction planes; per credited draft
+     * histogram: the tally; after the rank threads stop: the last banks and the shutdown line. */
+    int  draft_vram_open();
+    int  draft_vram_mask();
+    void draft_vram_credit(Rank& r, int layer, const int32_t* h, int64_t n);
+    void draft_vram_drain(Rank& r, int before_step);
+    void draft_vram_close();
 
     RadModelMeta   meta_{};
     LoadedPlugins  plugins_;

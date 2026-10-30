@@ -72,6 +72,10 @@ struct StepEntry {
      * builder derives the step's RadBatch::consumer_full from when the entry is the step's only
      * one; 0 otherwise. */
     int64_t consumer_end = 0;
+    /* And the first checkpoint below that target the scheduler makes whole at or after this
+     * chunk's end (SchedReq::consumer_ckpts; consumer_skip.h, "complete checkpoints"): the
+     * builder runs at least the layers its cone needs; 0 for none. */
+    int64_t consumer_ckpt = 0;
 };
 
 struct StepPlan {
@@ -159,6 +163,14 @@ public:
          * more rows than the budget): the scheduler makes none, so this stays 0 (a warning names
          * the first). */
         uint64_t off_grid = 0;
+        /* Complete checkpoints (StepEntry::consumer_ckpt): the passes whose F a checkpoint's cone
+         * raised above the target's, and the layer-passes that added in full (each such pass keeps
+         * one layer of key ops alone, one layer higher, so the key ops alone do not change in
+         * number: what a whole snapshot costs is these full layer-passes); and of the passes that
+         * wrote a snapshot below their target, those cut (layer n-1's keys alone, F = n - 1) and
+         * those run in full because the snapshot was not the one planned (stays 0). */
+        uint64_t ckpt_raised = 0, ckpt_full = 0;
+        uint64_t ckpt_cut = 0, ckpt_insured = 0;
     };
     const ConsumerStats& consumer_stats() const { return cs_stats_; }
 
@@ -302,6 +314,9 @@ private:
     bool          cs_on_ = false;
     int64_t       cs_end_ = -1;
     std::vector<int64_t> cs_f_;
+    /* The thresholds of the checkpoint `cs_ck_` (-1: none) a step's cone is built for. */
+    int64_t       cs_ck_ = -1;
+    std::vector<int64_t> cs_g_;
     ConsumerStats cs_stats_;
     /* Per KV group, 0 for a non-conv group. This and `h_convslot` only feed DeriveInput for the
      * `conv_state_index` derivation, which no plugin calls at present; conv kernels read

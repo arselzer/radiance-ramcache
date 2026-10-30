@@ -20,6 +20,7 @@
 #include "../arch/deepseek41/deepseek41.cpp"
 #include "../core/sched/consumer_skip.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <set>
 #include <string>
@@ -388,6 +389,58 @@ TEST(ds41_a_prompt_under_the_schedule_stores_what_the_schedule_says) {
         CHECK_EQ(count_issued(names, "logits_gemm") + count_issued(names, "logits_gemm_ggml"),
                  e == n ? 1 : 0);
     }
+    CHECK(cut > 0);
+    CHECK_EQ(m.cuts.passes, (uint64_t)cut);
+}
+
+/* The same with checkpoints below the target made whole (consumer_skip.h, "complete
+ * checkpoints"): F follows each checkpoint's cone up to it and falls back after it, so the passes
+ * of one prompt cut deeper, then shallower, then deeper again; each pass still stores each layer's
+ * keys exactly when it runs the layer in full or its keys alone, the pass ending at a checkpoint
+ * stores layer 39's keys, and nothing is sampled before the last pass. */
+TEST(ds41_a_prompt_with_whole_checkpoints_stores_what_the_schedule_says) {
+    Env env({ { "RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP", "1" } });
+    auto d = declare(1);
+    REQUIRE_EQ(d->rc, (int)RAD_OK);
+    const deepseek41::Model& m = *d->m;
+    const rad::ConsumerShape shape{ 40, 20, 128, 16, 16 };
+    const int64_t n = 1600, target = 1584;
+    const std::vector<int64_t> whole = { 256, 512, 768, 1024, 1280 };
+    const std::vector<int64_t> f = rad::consumer_thresholds(shape, target);
+    REQUIRE_EQ(f.size(), (size_t)40);
+    int cut = 0, falls = 0;
+    int32_t prev = 0;
+    for (int64_t s = 0; s < n; s += 16) {
+        const int64_t e = std::min<int64_t>(n, s + 16);
+        const auto it = std::lower_bound(whole.begin(), whole.end(), e);
+        const int32_t F = it == whole.end()
+            ? rad::consumer_full_layers(shape, f, e - 1)
+            : rad::consumer_pass_layers(shape, f, rad::consumer_ckpt_thresholds(shape, *it), e - 1);
+        if (std::binary_search(whole.begin(), whole.end(), e)) CHECK_EQ(F, 39);
+        falls += F < prev;
+        prev = F;
+        auto k = kit(d->b, {}, { (int)(e - s) }, (int32_t)s);
+        if (e < n) {
+            k->out.clear();
+            k->b.n_out = 0;
+            k->b.out_ids = nullptr;
+        }
+        k->b.consumer_full = F < 40 ? F : 0;
+        cut += F < 40;
+        auto r = run_passes(d->b, deepseek41::step, { k.get() }, 1, kWorld);
+        REQUIRE(steps_ok(r));
+        const std::vector<rad_op> got = issued(*r[0]);
+        for (int l = 0; l < 40; ++l) {
+            const deepseek41::Layer& L = m.layers[(size_t)l];
+            int stores = 0;
+            for (rad_op h : got) stores += h == L.kv_st;
+            CHECK_EQ(stores, l <= F ? 1 : 0);   /* in full, or its keys alone */
+        }
+        const std::vector<std::string> names = issued_ops(d->b, *r[0]);
+        CHECK_EQ(count_issued(names, "logits_gemm") + count_issued(names, "logits_gemm_ggml"),
+                 e == n ? 1 : 0);
+    }
+    CHECK(falls >= 4);   /* after each checkpoint but the last ones the target's cone covers */
     CHECK(cut > 0);
     CHECK_EQ(m.cuts.passes, (uint64_t)cut);
 }

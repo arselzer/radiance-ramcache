@@ -107,8 +107,15 @@ struct SchedReq {
     /* The consumer skip's target for this prefill (consumer_skip.h): the first position whose
      * state must be exact, its end or the deepest checkpoint below it; 0 when its prefill is not
      * cut. Set at each admission (Scheduler::consumer_target), carried by its prefill entries
-     * (StepEntry::consumer_end); a checkpoint below it is not written. */
+     * (StepEntry::consumer_end); a checkpoint below it is written only if it is one of
+     * `consumer_ckpts`. */
     int64_t  consumer_end = 0;
+    /* The checkpoints below that target its cut makes whole (consumer_skip.h, "complete
+     * checkpoints"), ascending: those its idle prefill writes that the policy keeps
+     * (RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP_CKPT). Set with consumer_end; each prefill entry
+     * carries the first at or after its chunk's end (StepEntry::consumer_ckpt). The slot keeps the
+     * capacity. */
+    std::vector<int64_t> consumer_ckpts;
 
     /* The checkpoint the linear state is seeded from on admission, handed to the sequence's first
      * entry as StepEntry::ckpt_restore. Never held across a step: nothing pins a checkpoint slot,
@@ -476,10 +483,27 @@ public:
      * end, or the deepest checkpoint below it its idle prefill writes (idle_prefill_checkpoint)
      * when the prefix cache is on. */
     bool    consumer_on() const { return cs_on_; }
-    int64_t consumer_target(const SchedReq& s) const;
+    /* With `ckpts`, also the checkpoints below the target the cut makes whole (SchedReq::
+     * consumer_ckpts): those its idle prefill writes that the policy keeps. */
+    int64_t consumer_target(const SchedReq& s, std::vector<int64_t>* ckpts = nullptr) const;
+    /* RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP_CKPT's band when the variable is unset (or not a
+     * token count): the checkpoints within 512 tokens below a cut prompt's target are made whole
+     * (keeps most of the skip and every hit of the pfxchat / pfxlong receipts; "all" restores the
+     * base engine's snapshot list, 0 none). */
+    static constexpr int64_t kConsumerSkipCkptDefault = 512;
+    /* RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP_CKPT as init resolved it: which checkpoints below a
+     * cut prompt's target are made whole. -1 every one its idle prefill writes ("all"), 0 none
+     * (they are not written), N > 0 those within N tokens below the target and the request's own
+     * keep point (Request::checkpoint_at); 512 (kConsumerSkipCkptDefault) with the prefix cache
+     * when the variable is unset. */
+    int64_t consumer_ckpt_policy() const { return cs_band_; }
     /* The deepest checkpoint plan_chunk's chunks write for `r` from its computed tokens to `end`
-     * at the whole step budget, or -1. */
-    int64_t idle_prefill_checkpoint(const Request& r, int64_t end) const;
+     * at the whole step budget, or -1; with `all`, every one of them, ascending. */
+    int64_t idle_prefill_checkpoint(const Request& r, int64_t end,
+                                    std::vector<int64_t>* all = nullptr) const;
+    /* The first of `s`'s checkpoints to make whole at or after `end` (StepEntry::consumer_ckpt),
+     * or 0. */
+    static int64_t consumer_next_ckpt(const SchedReq& s, int64_t end);
     /* What the cut ran (BatchBuilder::ConsumerStats). */
     const BatchBuilder::ConsumerStats& consumer_stats() const { return builder_.consumer_stats(); }
     /* The least recompute a snapshot at a shared head (CacheHit::branch_at) must save each later
@@ -781,8 +805,10 @@ private:
      * step, since the step after it must bring them back. */
     int     prefill_alone_ = 0;
     int64_t pf_skipped_ = 0;
-    /* The consumer skip, as init decided it (consumer_on). */
+    /* The consumer skip, as init decided it (consumer_on), and its checkpoint policy
+     * (consumer_ckpt_policy). */
     bool    cs_on_ = false;
+    int64_t cs_band_ = 0;
     /* RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH=1 (read at init; acts under --prefix-resume
      * exact): a finished sequence publishes only up to SchedReq::grid_upto. An exact hit resumes
      * where a cold prefill starts a chunk and recomputes the cold chunks from there, but it also

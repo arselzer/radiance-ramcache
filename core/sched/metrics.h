@@ -131,8 +131,11 @@ struct SchedMetrics {
     float   linear_hit_rate = 0.0f;
     int64_t checkpoints_written = 0;
     /* Checkpoints the consumer skip did not write: below their prompt's target, where its cut
-     * leaves the last layers' windows incomplete (core/sched/consumer_skip.h). */
+     * leaves the last layers' windows incomplete (core/sched/consumer_skip.h), and outside the
+     * ones it makes whole (RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP_CKPT); and those below the
+     * target it wrote whole. */
     int64_t consumer_ckpt_dropped = 0;
+    int64_t consumer_ckpt_whole = 0;
     /* RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH: finished sequences' computed tokens left
      * unpublished, past the last chunk an idle cold prefill would have cut the same way (the
      * prompt's last chunk, decode, a shared step). Cumulative; 0 without the switch. */

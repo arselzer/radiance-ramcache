@@ -329,6 +329,22 @@ EOF2
     stop_server; return 1
   fi
   [[ -n "${ARM_CS:-}" ]] && grep -m2 -E 'consumer skip: on|consumer suffix declared' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
+  # A Cs arm with the prefix cache: the server states which snapshots below a cut prompt's target it
+  # makes whole (claude/ds41-csckpt), and it must be what the arm's Ck part says (512 without one).
+  # A radiance without the line (writes none below the target) is not measured as anything but Ck0.
+  if [[ -n "${ARM_CK:-}" ]]; then
+    local ck_ok=""
+    if [[ "$ARM_CK" == 0 ]]; then
+      grep -q 'consumer skip: on .*CONSUMER_SKIP_CKPT=0)' "$OUT/$name.server.log" && ck_ok=1
+    else
+      grep -q "consumer skip: complete checkpoints (RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP_CKPT=$ARM_CK)" "$OUT/$name.server.log" && ck_ok=1
+    fi
+    if [[ -z "$ck_ok" ]]; then
+      log "arm $name: Cs with Pc wants ..._CONSUMER_SKIP_CKPT=$ARM_CK, but the server log does not state it ($(grep -m2 -E 'consumer skip: (on|complete)' "$OUT/$name.server.log" | cut -c1-200 | tr '\n' ' ')); not measured"
+      stop_server; return 1
+    fi
+    grep -m1 -E 'consumer skip: complete checkpoints' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
+  fi
   xt_check "$name" || { stop_server; return 1; }
   # In / Is (RADIANCE_EXPERIMENTAL_DS41_INSERT_NT / _SLICE_KIB) and Ph (_HOST_EXPERTS_LEAN_TILES):
   # rank 0 names what it took at startup. An arm whose line is missing or says otherwise (a radiance
@@ -859,7 +875,11 @@ for a in $ARMS; do
 # skip (RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP=1: a prompt's early prefill passes run layers 21..39
 # only where their rows reach its last token or its state; needs a radiance and a deepseek41 from
 # claude/ds41-cskip, and the server's "consumer skip: on" line, or the arm is not measured; every
-# other arm runs with it off); Kh at the end of each prompt's prefill every rank hashes its KV groups
+# other arm runs with it off); Ck / CkN with Cs and Pc: which snapshots below a cut prompt's target
+# the cut makes whole (RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP_CKPT: none a band of 512, the
+# default; Ck every one its idle prefill writes (all); CkN those within N tokens below the target and a shared head; Ck0
+# none, the behaviour before claude/ds41-csckpt), checked in the server's policy line, which a Cs Pc
+# arm must have (a radiance from claude/ds41-csckpt); Kh at the end of each prompt's prefill every rank hashes its KV groups
 # and the last row's logits (RADIANCE_EXPERIMENTAL_DS41_PREFILL_HASH=1; steps are not issued ahead
 # while it is on, so time a prompt in an arm without it), and the window compares each Kh arm's
 # hashes with those of the first Kh arm with the same prompts (ab_requests.py --hashes); Rt the
@@ -927,7 +947,7 @@ for a in $ARMS; do
   xt="" bt="" kld="" dk="" db="" pu="" ins_nt="" ins_kib="" ins_wait="" lean=""
   pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 HOST_POOL_MIB=4096 EXTRA_ARGS="" ARM_HOME="$RHOME" ARM_CONC=
   ARM_PROMPTS= ARM_N= ARM_LQ= rt=
-  power="" skip="" ARGS=() f8="" f8x="" rb="" rbf=0 pred="" cs="" kh="" pc="" pcopt="" fw="" wp="" wl=""
+  power="" skip="" ARGS=() f8="" f8x="" rb="" rbf=0 pred="" cs="" ck="" kh="" pc="" pcopt="" fw="" wp="" wl=""
   psc="" prs=12 pk="" pw="" ns="" pv=""
   unset ARM_NOPC   # --no-prefix-cache unless a Pc part sets it empty
   for p in "${parts[@]:1}"; do
@@ -1045,6 +1065,8 @@ for a in $ARMS; do
                rt=1; env+=(RADIANCE_EXPERIMENTAL_DS41_ROUTE_TRACE=$(cd "$OUT" && pwd)/rtrace-$a/rt) ;;
       Lq)      ARM_LQ=1 ;;                 # the quality harness after the timed requests
       Cs)      cs=1 ;;                     # the exact consumer-suffix skip (checked in the server log)
+      Ck|Cka)  ck=all ;;                   # Cs with Pc: every snapshot below a cut prompt's target made whole (without a Ck part: 512, the default)
+      Ck[0-9]*) ck=${p#Ck} ;;              # ... only those within N tokens below it and a shared head (Ck0: none, as before)
       Kh)      kh=1 ;;                     # KV and logits hashes at each prompt's end
       In)      ins_nt=1 ;;                 # background inserts' codes by non-temporal stores (INSERT_NT)
       Is)      ins_kib=256 ;;              # ... in 256 KiB pieces, a decode insert waiting for an idle pool
@@ -1145,6 +1167,16 @@ for a in $ARMS; do
   [[ -z "$rt" ]] && env+=(RADIANCE_EXPERIMENTAL_DS41_ROUTE_TRACE=)   # traced only with Rt
   if [[ -n "$cs" ]]; then env+=(RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP=1); else env+=(RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP=0); fi
   ARM_CS=$cs
+  # Ck / CkN: which snapshots below a cut prompt's target are made whole; it acts only under Cs with
+  # the prefix cache. Every arm states it (512, the engine's default, without a Ck part), so a
+  # window's VAR=val cannot change what a Cs Pc arm's name says; arm() checks the server's policy
+  # line.
+  if [[ -n "$ck" && ( -z "$cs" || -z "$pc" ) ]]; then
+    log "arm $a: a Ck part (..._CONSUMER_SKIP_CKPT=$ck) acts only with Cs and Pc (or Pc0); the arm is skipped"; skip=1
+  fi
+  env+=(RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP_CKPT=${ck:-512})
+  ARM_CK=
+  [[ -n "$cs" && -n "$pc" ]] && ARM_CK=${ck:-512}
   if [[ -n "$kh" ]]; then env+=(RADIANCE_EXPERIMENTAL_DS41_PREFILL_HASH=1); else env+=(RADIANCE_EXPERIMENTAL_DS41_PREFILL_HASH=0); fi
   # The prefix cache's parts: PciN, PcsN and Pcx act only with the cache on (Pc or Pc0); without it
   # the arm would run cold under their names. Every arm states both prefix switches, so a window's

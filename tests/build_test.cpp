@@ -169,6 +169,48 @@ TEST(bucket_table_resolves_per_band) {
     CHECK_EQ(b.program().weight(w)->last_use_op, 1);
 }
 
+/* Registry::set_trunk_only_rows: a named row is no candidate for an op reading a draft head's weight (a
+ * layer at or past meta.n_layers), so the next row takes its band, and a trunk op still resolves it.
+ * The engine names libr4d's moe_gemm_ggml_mxfp4_gemv_vp so while a DSpark bank is bound under
+ * RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED (core/place/vram_packed.h). */
+TEST(a_trunk_only_row_is_passed_over_for_a_draft_heads_op) {
+    NEED_PLUGIN(reg)
+    struct Reset { Registry& r; ~Reset() { r.set_trunk_only_rows({}); } } reset{ reg };
+    auto rows = [](const OpInfo* o) {
+        std::vector<std::string> v;
+        for (const Band& band : o->bands)
+            v.push_back(band.dom[RAD_DOMAIN_DEVICE] ? band.dom[RAD_DOMAIN_DEVICE].row->info->name : "-");
+        return v;
+    };
+    for (int on = 0; on < 2; ++on) {
+        reg.set_trunk_only_rows(on ? std::vector<std::string>{ "t_gemm_m16" } : std::vector<std::string>{});
+        Builder b(reg, make_meta(), make_ctx());   /* n_layers 2: layer 2 is a draft head's */
+        const rad_weight wt = decl_w(b, "blk.1.ffn_gate.weight");
+        RadWeightDecl d{};
+        d.dtype = RAD_BF16;
+        d.rank = 2;
+        d.shape[0] = d.shape[1] = 4096;
+        d.access = RAD_ACCESS_PER_TOKEN;
+        d.shard = RAD_SHARD_ROW;
+        d.group = rad_group_layer(2);
+        const rad_weight wd = b.decl_weight("blk.2.ffn_gate.weight", &d);
+        REQUIRE(wt > 0 && wd > 0);
+        const rad_op ht = decl_gemm(b, wt), hd = decl_gemm(b, wd);
+        CHECK_EQ(b.op_resolved(ht), 1);
+        CHECK_EQ(b.op_resolved(hd), 1);
+        CHECK_EQ((int)b.errors().size(), 0);
+        const std::vector<std::string> trunk = rows(b.program().op(ht)), draft = rows(b.program().op(hd));
+        /* The bands are the same either way: the boundaries come from every candidate row. */
+        REQUIRE(trunk.size() == 3 && draft.size() == 3);
+        CHECK(trunk[0] == "t_gemm_m16");
+        CHECK(draft[0] == (on ? "t_gemm_m64" : "t_gemm_m16"));
+        CHECK(trunk[1] == "t_gemm_m64" && draft[1] == "t_gemm_m64");
+        CHECK(trunk[2] == "t_gemm_any" && draft[2] == "t_gemm_any");
+        CHECK_EQ(b.program().op(hd)->bands[0].hi, 16);
+        CHECK_EQ((int)b.program().misses.size(), 0);
+    }
+}
+
 TEST(an_op_with_no_ranged_parameter_is_one_band) {
     NEED_PLUGIN(reg)
     Builder b(reg, make_meta(), make_ctx());

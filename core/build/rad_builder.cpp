@@ -529,6 +529,17 @@ void Builder::resolve_bands(OpInfo& oi) {
      * canonically and is gated elsewhere. */
     const Registry::RowFilter accept = [&](const KernelRow& r, const Geometry& g) -> std::string {
         const RadKernelInfo* ki = r.info;
+        /* A trunk-only row (Registry::set_trunk_only_rows) is no candidate for an op that reads a draft
+         * head's weight. */
+        if (ki && ki->name && prog_.meta.n_layers > 0 && reg_.trunk_only_row(ki->name))
+            for (const rad_weight h : oi.weights) {
+                if (h == 0 || h >= prog_.weights.size()) continue;
+                const int32_t l = prog_.weights[h].decl.group.layer;
+                if (l >= (int32_t)prog_.meta.n_layers)
+                    return fmt("%s serves the trunk's ops only, and '%s' is a draft head's (layer %d of a "
+                               "%lld-layer trunk)", ki->name, prog_.weights[h].name.c_str(), (int)l,
+                               (long long)prog_.meta.n_layers);
+            }
         for (size_t wi = 0; wi < oi.weights.size(); ++wi) {
             const rad_weight h = oi.weights[wi];
             if (h == 0 || h >= prog_.weights.size()) continue;

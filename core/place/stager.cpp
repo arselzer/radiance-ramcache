@@ -714,6 +714,7 @@ bool FileStager::begin_pass(const RadBatch* b) {
             p1_pass_rows_ = b->n_tok;
             p1_t0_ = std::chrono::steady_clock::now();
             p1_layers_ = 0;
+            p1_cpu_layers_ = 0;
         }
     }
     ++trace_pass_;
@@ -800,14 +801,19 @@ int FileStager::start_ep_routed(int32_t li, RadStream s, bool* read) {
             return RAD_E_STATE;
         }
     }
+    /* Prefill Phase 1 decides a layer at a time: in an armed pass a layer of 16 rows or fewer (the
+     * per-row cut's deep layers of a prompt's last chunk) runs on the gemv rows, which honour no skip
+     * mark, so it takes the CPU path below as a pass of its height does (p1_layer_on). */
+    const bool p1 = p1_layer_on(li);
+    if (p1_armed_ && !p1) ++p1_cpu_layers_;
     /* With the pool, the pass's token rows and sorted order ride the same wait (hx_fetch). */
-    const bool hx = !p1_armed_ && hx_pool_ && !head_.configured() && (size_t)li < hx_ops_.size() &&
+    const bool hx = !p1 && hx_pool_ && !head_.configured() && (size_t)li < hx_ops_.size() &&
                     hx_ops_[(size_t)li].gu >= 0 && hx_ops_[(size_t)li].x;
     /* Never seen at its gate_up (the first pass): nothing to fetch the rows from yet, so the CPU's
      * part waits for the gate_up's operands (hx_deferred) and the card gets aliases for all. */
-    const bool defer = !p1_armed_ && !hx && hx_defer_ok_ && hx_pool_ && !head_.configured() &&
+    const bool defer = !p1 && !hx && hx_defer_ok_ && hx_pool_ && !head_.configured() &&
                        (size_t)li < hx_ops_.size() && hx_ops_[(size_t)li].gu >= 0 &&
-                       pass_tok_ <= hx_miss_rows_;
+                       hx_miss_need(li) <= hx_miss_rows_;
     /* Same actual producer stream; this host-wait event is the completion proof.
      * The Ctx witness means successfully issued, never completed before this wait.
      * With ..._FETCH_LIST the counts row and the pool's rows go as one ranged copy. */
@@ -821,7 +827,7 @@ int FileStager::start_ep_routed(int32_t li, RadStream s, bool* read) {
      * the offsets ride the counts' wait (from the addresses the layer's gate_up last read, as hx_fetch
      * takes them; hx_capture counts it if this pass's gate_up reads others). */
     p1_order_ = false;
-    if (p1_armed_ && lcp_admit_row_ > 0 && lcp_admit_row_ < pass_tok_ && hx_idx_ && (size_t)li < hx_ops_.size() &&
+    if (p1 && lcp_admit_row_ > 0 && lcp_admit_row_ < pass_tok_ && hx_idx_ && (size_t)li < hx_ops_.size() &&
         hx_ops_[(size_t)li].sorted && hx_ops_[(size_t)li].off) {
         const HxOps& o = hx_ops_[(size_t)li];
         const int64_t T = layer_rows(li) * o.top_k;
@@ -900,7 +906,7 @@ int FileStager::start_ep_routed(int32_t li, RadStream s, bool* read) {
      * below, with the stage's drive reads. */
     if (trace_fp_) trace_units_ = want_;
     /* Prefill Phase 1: every selected unit goes to the cards' ring (p1_layer). */
-    if (p1_armed_) {
+    if (p1) {
         RAD_TRY(p1_layer(li, s));
         if (trace_fp_) trace_layer(L.layer, 0);
         ++ep_stats_.reads;
@@ -2207,7 +2213,7 @@ void FileStager::hx_choose(int32_t li) {
         hx_ra_chose_ns_ = rt_now_ns();
     }
     const double cb = hx_pool_->cpu_bytes_per_ns(), lb = hx_pool_->link_bytes_per_ns();
-    const bool misses = hx_miss_rows_ > 0 && pass_tok_ <= hx_miss_rows_;
+    const bool misses = hx_miss_rows_ > 0 && hx_miss_need(li) <= hx_miss_rows_;
     int64_t link = 0;
     for (size_t i = 0; i < want_.size(); ++i) {
         const int32_t u = want_[i];
@@ -4407,9 +4413,9 @@ int FileStager::end_pass(RadStream s) {
                     if (std::sscanf(line, "MemAvailable: %lld kB", &avail_kb) == 1) break;
                 std::fclose(f);
             }
-            RAD_INFO("%s rows %lld, layers %llu, wall %.3f s (issue), rank 0 drive units %llu, %.2f GB/s, "
-                     "MemAvailable %lld MiB", ds41p1::kLogChunk, (long long)p1_pass_rows_,
-                     (unsigned long long)p1_layers_, wall, (unsigned long long)du,
+            RAD_INFO("%s rows %lld, layers %llu (and %llu cut to 16 rows or fewer, on the CPU path), wall %.3f s "
+                     "(issue), rank 0 drive units %llu, %.2f GB/s, MemAvailable %lld MiB", ds41p1::kLogChunk,
+                     (long long)p1_pass_rows_, (unsigned long long)p1_layers_, (unsigned long long)p1_cpu_layers_, wall, (unsigned long long)du,
                      wall > 0 ? (double)db * 1e-9 / wall : 0.0, avail_kb >= 0 ? avail_kb / 1024 : -1);
         }
     }
@@ -4462,7 +4468,8 @@ int FileStager::p1_init(const Program& prog) {
     if (const char* fl = std::getenv("RADIANCE_EXPERIMENTAL_DS41_FETCH_LIST"); fl && !std::strcmp(fl, "1"))
         return refuse("RADIANCE_EXPERIMENTAL_DS41_FETCH_LIST=1 is not covered");
     if (prog.ctx.max_spec > 0) return refuse("speculation is on");
-    if (rt_ || std::getenv("RADIANCE_EXPERIMENTAL_DS41_ROUTE_TRACE"))
+    /* Set but empty is off (ab_window.sh states the switch on every arm without Rt). */
+    if (const char* rte = std::getenv("RADIANCE_EXPERIMENTAL_DS41_ROUTE_TRACE"); rt_ || (rte && *rte))
         return refuse("RADIANCE_EXPERIMENTAL_DS41_ROUTE_TRACE is on: its records follow the CPU path's choice");
     if (head_.configured()) return refuse("the DSpark head tail holds the routed layers' file buffers");
     if (!hx_pool_ || !hx_capped_)
@@ -4600,7 +4607,7 @@ int FileStager::p1_layer(int32_t li, RadStream s) {
     /* The next routed layer's likely misses: its file-tier units neither in the slab nor in the RAM
      * cache, by the sealed profile's share (best first). */
     const int32_t nx = li + 1;
-    if (p1_->tunables().ahead > 0 && (size_t)nx < layers_.size() && will_issue(nx)) {
+    if (p1_->tunables().ahead > 0 && (size_t)nx < layers_.size() && will_issue(nx) && p1_layer_on(nx)) {
         p1_ahead_.clear();
         for (int32_t u : layers_[(size_t)nx].units)
             if (!mover_->file_unit_in_slab(u) && mover_->host_planes_eligible(u) && !mover_->unit_cached(u))

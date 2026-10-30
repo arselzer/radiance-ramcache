@@ -87,6 +87,12 @@ constexpr int         kTwinMaxRows = 4096;
  * honours neither mark (T2 holds there only for gemv_vp, T3 nowhere), so the stager never marks a
  * table for it. */
 constexpr int         kMinArmRows  = 17;
+/* The same bound a routed layer at a time: under the consumer skip's per-row cut
+ * (consumer_row_starts) a layer of an armed pass runs on the pass's rows [row0(L), n) alone, so a
+ * deep layer of a prompt's last chunk can run on 16 rows or fewer, on the gemv row again. Such a
+ * layer is not the card path's: it takes the CPU path for its non-resident experts, as a pass of
+ * its height does, with no mark and no wave. */
+constexpr bool card_layer(int64_t layer_rows) { return layer_rows >= kMinArmRows; }
 
 /* ---- table entry marks --------------------------------------------------------------------------
  *

@@ -17,7 +17,11 @@
  *   waves     the stager's composition: a main launch with a subset skipped, then waves of 1, 2 and 3 experts
  *             over a partition of that subset (each wave's table skipping every other expert), the clamped
  *             SwiGLU relaunched over all rows after each gate_up, leaves the gate_up, SwiGLU and down outputs
- *             equal to one launch over every expert.
+ *             equal to one launch over every expert;
+ *   cut       a layer the consumer skip's per-row cut leaves 1 .. 40 rows of a 64- or 2048-row pass: on the path
+ *             the stager picks for its height (ds41p1::card_layer), the gate_up, SwiGLU and down equal the plain
+ *             gemv's in passes of 16 from the layer's first row; at 16 rows or fewer the card path's marked
+ *             composition on gemv_vp is shown to differ (the defect the per-layer decision removes).
  *
  * Routings, one EP4 rank's slots as moe_scatter writes them (top-6 of 384, the rank's 96, -1 past them): uniform,
  * skewed, one hot local expert on nearly every token, the rank's last expert without rows of its own (tail only),
@@ -545,6 +549,164 @@ void waves_case(const Bank& gu, const Bank& dn, int M, int kind, uint32_t seed) 
     std::fflush(stdout);
 }
 
+/* ---- a layer the per-row cut leaves short --------------------------------------------------------------
+ *
+ * Under the consumer skip's per-row cut (core/sched/consumer_skip.h, consumer_row_starts) routed layer L of a pass
+ * of M rows runs on its rows [row0(L), M) alone. In a prompt's last chunk a deep layer can be left with R <= 16 of
+ * them: the plugin serves that call on the decode band (gemv, or gemv_vp under P1), which honours no skip mark. The
+ * stager decides a layer at a time (ds41p1::card_layer, FileStager::p1_layer_on): R >= 17 the card path (the twin,
+ * the non-residents skipped, then waves); R <= 16 the CPU path's layer, one gemv_vp launch over the plain table
+ * (packed residents under the packed mark, every other entry plain; a non-resident's rows here stand for the CPU's,
+ * which the host experts' own tests hold to the gemv). Either way the layer's gate_up, clamped SwiGLU and down give
+ * the bytes of the plain gemv over the same rows in passes of 16 from row0 (the 16-row schedule's groups). For
+ * R <= 16 it also shows the defect the per-layer decision removes: the card path's composition (non-residents
+ * skip-marked, then waves) launched on gemv_vp reads each marked entry as an address and gives other bytes. */
+struct Padded {   /* each expert's block copied with room past it: a skip-marked entry read as an address */
+    std::vector<uint8_t*> p;
+    explicit Padded(const Bank& b) {
+        const size_t n = (size_t)b.N * (b.K / 32) * 17;
+        for (int e = 0; e < kNe; ++e) {
+            p.push_back(aligned_bytes(n + 64));
+            std::memcpy(p.back(), b.e[(size_t)e]->block, n);
+        }
+    }
+    ~Padded() { for (uint8_t* q : p) std::free(q); }
+};
+
+void cut_case(const Bank& gu, const Bank& dn, const Padded& pgu, const Padded& pdn, int M, int R, int kind,
+              uint32_t seed) {
+    ++g_cases;
+    std::mt19937_64 rng(seed);
+    const Picks pk = make_picks(kind, M, rng);
+    const int r0 = M - R;
+    const Pass p = make_pass(pk, r0, M);   /* the layer's own scatter, over its rows */
+    const int T = R * kTop, n = gu.N / 2, E = gu.K;
+    const std::vector<uint16_t> x = make_x(R, E, rng);
+    const bool card = ds41p1::card_layer(R);
+    std::string label = std::string("cut M=") + std::to_string(M) + " row0=" + std::to_string(r0) + " (" +
+                        std::to_string(R) + " rows, " + (card ? "card path" : "CPU path") + ") " + kind_name(kind);
+    if (card != (R >= 17)) {
+        fail(label + ": ds41p1::card_layer disagrees with the gemv band's bound");
+        return;
+    }
+    /* Residents (block or packed) and non-residents; at least one live non-resident. */
+    std::vector<int> res((size_t)kNe);   /* 0 non-resident, 1 block resident, 2 packed resident */
+    for (int e = 0; e < kNe; ++e) res[(size_t)e] = (int)(rng() % 3);
+    bool live_nr = false;
+    for (int e = 0; e < kNe; ++e) live_nr |= res[(size_t)e] == 0 && p.off[(size_t)e + 1] > p.off[(size_t)e];
+    for (int e = 0; e < kNe && !live_nr; ++e)
+        if (p.off[(size_t)e + 1] > p.off[(size_t)e]) { res[(size_t)e] = 0; live_nr = true; }
+    /* And a live resident when two experts or more are live: every wave then rewrites its rows on gemv_vp. */
+    int live = 0, live_res = 0;
+    for (int e = 0; e < kNe; ++e)
+        if (p.off[(size_t)e + 1] > p.off[(size_t)e]) { ++live; live_res += res[(size_t)e] != 0; }
+    for (int e = kNe - 1; e >= 0 && live >= 2 && !live_res; --e)
+        if (p.off[(size_t)e + 1] > p.off[(size_t)e] && !res[(size_t)e]) { res[(size_t)e] = 2; live_res = 1; }
+    std::vector<const void*> fgu((size_t)kNe), fdn((size_t)kNe);
+    for (int e = 0; e < kNe; ++e) {
+        const bool pkd = res[(size_t)e] == 2;
+        fgu[(size_t)e] = pkd ? ds41p1::mark(gu.e[(size_t)e]->packed, ds41p1::kMarkPacked) : gu.e[(size_t)e]->block;
+        fdn[(size_t)e] = pkd ? ds41p1::mark(dn.e[(size_t)e]->packed, ds41p1::kMarkPacked) : dn.e[(size_t)e]->block;
+    }
+    std::string why;
+    auto chain = [&](Launch f, const std::vector<const void*>& tg, const std::vector<const void*>& td,
+                     std::vector<uint16_t>& G, std::vector<uint16_t>& S, std::vector<uint16_t>& D) {
+        if (f == r4d_rad_moe_gemm_mxfp4_gemv_tall_p1)
+            return p1(nullptr, x.data(), R, E, tg, gu.N, p, false, G.data(), &why) ||
+                   swiglu(G.data(), S.data(), T, n) != RAD_OK ||
+                   p1(nullptr, S.data(), T, n, td, dn.N, p, true, D.data(), &why);
+        why = "a decode-band launch was refused";
+        return moe(f, nullptr, x.data(), R, E, tg, gu.N, p, false, G.data()) != RAD_OK ||
+               swiglu(G.data(), S.data(), T, n) != RAD_OK ||
+               moe(f, nullptr, S.data(), T, n, td, dn.N, p, true, D.data()) != RAD_OK;
+    };
+    /* The stager's composition for a layer of R rows: the main launch with every non-resident skipped (`mark`
+     * its entry), then waves of 1, 2, 3 non-residents, each skipping every other expert. */
+    auto composed = [&](Launch f, auto mark, std::vector<uint16_t>& D) {
+        std::vector<uint16_t> G((size_t)T * 2 * n, 0xAAAAu), S((size_t)T * n, 0xAAAAu);
+        std::vector<const void*> mg = fgu, md = fdn;
+        std::vector<int> nr;
+        for (int e = 0; e < kNe; ++e)
+            if (!res[(size_t)e]) {
+                nr.push_back(e);
+                mg[(size_t)e] = mark(true, e);
+                md[(size_t)e] = mark(false, e);
+            }
+        std::shuffle(nr.begin(), nr.end(), rng);
+        if (chain(f, mg, md, G, S, D)) return false;
+        for (size_t w0 = 0, sz = 1; w0 < nr.size(); w0 += sz, sz = sz % 3 + 1) {
+            std::vector<const void*> wg((size_t)kNe), wd((size_t)kNe);
+            for (int e = 0; e < kNe; ++e) { wg[(size_t)e] = mark(true, e); wd[(size_t)e] = mark(false, e); }
+            for (size_t j = w0; j < std::min(nr.size(), w0 + sz); ++j) {
+                wg[(size_t)nr[j]] = fgu[(size_t)nr[j]];
+                wd[(size_t)nr[j]] = fdn[(size_t)nr[j]];
+            }
+            if (chain(f, wg, wd, G, S, D)) return false;
+        }
+        return true;
+    };
+    std::vector<uint16_t> D((size_t)T * dn.N, 0xAAAAu);
+    if (card) {
+        if (!composed(r4d_rad_moe_gemm_mxfp4_gemv_tall_p1, [](bool, int) { return skip_entry(); }, D)) {
+            fail(label + ": the card path: " + why);
+            return;
+        }
+    } else {
+        std::vector<uint16_t> G((size_t)T * 2 * n, 0xAAAAu), S((size_t)T * n, 0xAAAAu);
+        if (chain(r4d_rad_moe_gemm_mxfp4_gemv_vp, fgu, fdn, G, S, D)) {
+            fail(label + ": the CPU path's layer: " + why);
+            return;
+        }
+    }
+    /* The 16-row schedule: the plain gemv over [row0, M) in passes of 16 from row0, every expert block_mxfp4. */
+    std::vector<const void*> bg((size_t)kNe), bd((size_t)kNe);
+    for (int e = 0; e < kNe; ++e) { bg[(size_t)e] = gu.e[(size_t)e]->block; bd[(size_t)e] = dn.e[(size_t)e]->block; }
+    std::vector<int> row_of((size_t)T, -1);
+    for (int i = 0; i < p.local; ++i) row_of[(size_t)p.sorted[(size_t)i]] = i;
+    std::vector<uint16_t> ref((size_t)T * dn.N, 0xAAAAu);
+    for (int t0 = r0; t0 < M; t0 += 16) {
+        const int t1 = std::min(M, t0 + 16), m = t1 - t0, Tm = m * kTop;
+        const Pass pp = make_pass(pk, t0, t1);
+        std::vector<uint16_t> G((size_t)Tm * 2 * n), S((size_t)Tm * n), Dm((size_t)Tm * dn.N);
+        if (moe(r4d_rad_moe_gemm_mxfp4_gemv, nullptr, x.data() + (size_t)(t0 - r0) * E, m, E, bg, gu.N, pp, false,
+                G.data()) != RAD_OK ||
+            swiglu(G.data(), S.data(), Tm, n) != RAD_OK ||
+            moe(r4d_rad_moe_gemm_mxfp4_gemv, nullptr, S.data(), Tm, n, bd, dn.N, pp, true, Dm.data()) != RAD_OK) {
+            fail(label + ": a 16-token gemv launch was refused");
+            return;
+        }
+        for (int i = 0; i < pp.local; ++i) {
+            const int ra = row_of[(size_t)(pp.sorted[(size_t)i] + (t0 - r0) * kTop)];
+            std::memcpy(&ref[(size_t)ra * dn.N], &Dm[(size_t)i * dn.N], (size_t)dn.N * 2);
+        }
+    }
+    auto differ = [&](const std::vector<uint16_t>& a) {
+        size_t d = 0;
+        for (size_t i = 0; i < (size_t)p.local * dn.N; ++i) d += !same16(a[i], ref[i]);
+        return d;
+    };
+    if (const size_t d = differ(D)) fail(label + ": " + std::to_string(d) + " down values differ from the 16-row passes");
+    g_rows += p.local;
+    /* The defect: at R <= 16 the card path's composition on the band's kernel. */
+    size_t bad = 0;
+    if (!card) {
+        std::vector<uint16_t> D2((size_t)T * dn.N, 0xAAAAu);
+        auto marked = [&](bool g, int e) {
+            return ds41p1::mark(g ? pgu.p[(size_t)e] : pdn.p[(size_t)e], ds41p1::kMarkSkip);
+        };
+        if (!composed(r4d_rad_moe_gemm_mxfp4_gemv_vp, marked, D2)) {
+            fail(label + ": the marked composition on gemv_vp: " + why);
+            return;
+        }
+        bad = differ(D2);
+        if (!bad && live >= 2)
+            fail(label + ": the marked composition on gemv_vp gave the 16-row bytes: the case does not see the defect");
+    }
+    std::printf("  %s: %d local slots, equal to the 16-row passes%s\n", label.c_str(), p.local,
+                card ? "" : (", the marked composition on gemv_vp differs in " + std::to_string(bad) + " values").c_str());
+    std::fflush(stdout);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -583,6 +745,16 @@ int main(int argc, char** argv) {
             waves_case(wg0, wd0, M, k, 31337u * (uint32_t)M + (uint32_t)k);
             if (M <= 64) waves_case(wg1, wd1, M, k, 4242u * (uint32_t)M + (uint32_t)k);
         }
+    /* A layer the per-row cut leaves short in an armed pass (FileStager::p1_layer_on). */
+    {
+        const Padded pg0(wg0), pd0(wd0);
+        for (int M : { 64, 2048 })   /* at most 40 rows computed: quick too */
+            for (int R : { 1, 6, 16, 17, 40 })
+                for (int k : { kUniform, kHot, kReal }) {
+                    if (k == kReal && !real) continue;
+                    cut_case(wg0, wd0, pg0, pd0, M, R, k, 271u * (uint32_t)M + 13u * (uint32_t)R + (uint32_t)k);
+                }
+    }
     std::printf("%s: %d cases, %lld (token, slot) rows held to the 16-token gemv, %.0f s; P1 twin %s (M <= %d)\n",
                 g_fails ? "FAIL" : "PASS", g_cases, g_rows,
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), kR4dDs41P1Row,

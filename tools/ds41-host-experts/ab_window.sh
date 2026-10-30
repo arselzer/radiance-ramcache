@@ -112,7 +112,8 @@
 # (sha256) on which `p1` in DEVICE_CHECKS passed (ds41_mxfp4_device_check TALL_LIBR4D p1 P1_CHECK_M
 # P1_ROUTES on card 0, "p1: PASS" its last line; P1_CHECK_M 4096 by default, P1_ROUTES a p0_tables.py
 # routes file, none by default); an Lc2048 arm needs LCP_CHECK_C=2048 as before. The window log takes each
-# P1 arm's "ds41 p1 stats, rank" and "ds41 p1 chunk:" lines.
+# P1 arm's "ds41 p1 stats, rank" and "ds41 p1 chunk:" lines; a P1 arm whose stats lines count a lease held
+# at a pass end, or (Qv) a host-verified expert-row that differs from the card's, is not measured.
 #
 # Environment: RADIANCE_BIN (the binary), RADIANCE_HOME_DIR (kernels/ and architectures/ for it),
 # SILU_TABLE (the card's silu table), ARMS (default "base verify greedy"), HX_THREADS (16),
@@ -677,6 +678,27 @@ EOF2
   if [[ -n "$dk_bad" ]]; then
     log "arm $name: $dk_bad; not measured (results kept as $name.unmeasured.json)"
     [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
+  fi
+  # P1 at exit: each rank's "ds41 p1 stats, rank" line counts the leases its passes still held at their
+  # end (released there: a source not let go in order) and, with a Qv part, the expert-rows the host
+  # recomputed and how many differ from the card's. A P1 arm with a lease at a pass end or a differing
+  # row on any rank is not measured (results kept as <arm>.unmeasured.json), with the reason.
+  if [[ -n "${ARM_P1:-}" ]]; then
+    local p1_bad="" p1_ranks=0 p1_leases=0 p1_vrows=0 p1_differ=0 p1l pl pv pd
+    while IFS= read -r p1l; do
+      pl=$(sed -nE 's/.*leases at pass end ([0-9]+).*/\1/p' <<< "$p1l")
+      pv=$(sed -nE 's/.*verify rows ([0-9]+), differ ([0-9]+).*/\1/p' <<< "$p1l")
+      pd=$(sed -nE 's/.*verify rows ([0-9]+), differ ([0-9]+).*/\2/p' <<< "$p1l")
+      p1_ranks=$((p1_ranks + 1)); p1_leases=$((p1_leases + ${pl:-0}))
+      p1_vrows=$((p1_vrows + ${pv:-0})); p1_differ=$((p1_differ + ${pd:-0}))
+      [[ -z "$pl" || -z "$pd" ]] && p1_bad="a 'ds41 p1 stats, rank' line without its leases or verify counts ($p1l)"
+    done < <(grep -E 'ds41 p1 stats, rank [0-9]+: ' "$OUT/$name.server.log")
+    (( p1_leases > 0 )) && p1_bad="${p1_bad:+$p1_bad; }$p1_leases leases still held at a pass end over $p1_ranks ranks"
+    (( p1_differ > 0 )) && p1_bad="${p1_bad:+$p1_bad; }the host verify: $p1_differ of $p1_vrows expert-rows differ from the card's over $p1_ranks ranks"
+    if [[ -n "$p1_bad" ]]; then
+      log "arm $name: P1, but $p1_bad; not measured (results kept as $name.unmeasured.json)"
+      [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
+    fi
   fi
   # Pmr with a drafting Ds part (DSpark's 2+ row verify passes) at shutdown: the predictor's
   # multi-row line, and some rank's "by pass size" line with a "2 rows:" entry that planned units;

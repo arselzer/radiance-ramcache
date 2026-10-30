@@ -19,6 +19,7 @@
 #include "device/device.h"
 #include "place/card_expert_stager.h"
 #include "place/stager.h"
+#include "sched/consumer_skip.h"
 #include "sched/p1_chunk.h"
 
 #include <algorithm>
@@ -54,6 +55,19 @@ struct EpCountsHostProbe {
     static int32_t* idx(FileStager& fs) { return fs.hx_idx_; }
     static int64_t sorted_max(const FileStager& fs) { return fs.hx_sorted_max(); }
     static bool admits(const FileStager& fs, int32_t e) { return fs.p1_admits(0, e); }
+    /* A pass of pass_tok rows over n routed layers (routed layer li is model layer li), cut by row0 (by model
+     * layer; empty: no cut), armed for P1 or not. */
+    static void cut(FileStager& fs, bool armed, int64_t pass_tok, const std::vector<int32_t>& row0, int32_t n) {
+        fs.pass_tok_ = pass_tok;
+        fs.p1_armed_ = armed;
+        fs.pass_row0_ = row0;
+        fs.layers_.assign((size_t)n, StagedLayer{});
+        for (int32_t li = 0; li < n; ++li) fs.layers_[(size_t)li].layer = li;
+    }
+    static int64_t rows(const FileStager& fs, int32_t li) { return fs.layer_rows(li); }
+    static bool card(const FileStager& fs, int32_t li) { return fs.p1_layer_on(li); }
+    static int64_t miss_need(const FileStager& fs, int32_t li) { return fs.hx_miss_need(li); }
+    static void disarm(FileStager& fs) { fs.p1_armed_ = false; fs.layers_.clear(); fs.pass_row0_.clear(); }
 };
 
 }  // namespace rad
@@ -626,6 +640,64 @@ TEST(p1_admission_follows_the_sorted_order_past_the_admission_row) {
         EpCountsHostProbe::admission(fs, C, rows, admit_row, false);
         for (int e = 0; e < 96; e += 7) CHECK_EQ(EpCountsHostProbe::admits(fs, e), admit_row <= 0);
     }
+}
+
+/* ---- a layer the per-row cut leaves short ------------------------------------------------------------------
+ *
+ * Under the consumer skip's per-row cut a routed layer of an armed pass runs on its rows [row0(L), n) alone, so a deep
+ * layer of a prompt's last chunk can be left with 16 rows or fewer, which the plugin serves on the gemv rows (no skip
+ * mark honoured). The card path is decided a layer at a time: such a layer takes the CPU path as a 16-row pass does
+ * (no marks, no waves), its miss bound held to its own rows. Over the end-aligned chunks of every prompt length to
+ * 6,000 at C = 2048 and 1024 (ds41's 43 layers, the cut from layer 20, groups of 16), every armed layer's choice is
+ * its own rows' (ds41p1::card_layer), a disarmed pass's never the card path's, and short layers occur. The bytes of
+ * such a layer on that path against 16-row passes: r4d_emu_ds41p1's cut cases. */
+TEST(p1_card_path_is_decided_per_layer_under_the_per_row_cut) {
+    const ConsumerShape c16{ 43, 20, 128, 16, 16 };
+    FileStager fs;
+    std::vector<int64_t> f((size_t)c16.n_layer);
+    std::vector<int32_t> row0((size_t)c16.n_layer);
+    int64_t short_layers = 0, card_layers = 0, chunks = 0;
+    bool short_after_card = false;
+    for (int64_t C : { 2048, 1024 })
+        for (int64_t P = 17; P <= 6000; P += (P < 300 ? 1 : 7)) {
+            REQUIRE(consumer_thresholds(c16, P, f.data()));
+            for (int64_t s = 0, e = ds41p1::first_chunk_end_aligned(P, C, 16); s < P; s = e, e = std::min(P, e + C)) {
+                const int64_t n = e - s;
+                REQUIRE(consumer_row_starts(c16, f.data(), s, e, row0.data()));
+                const bool armed = n >= ds41p1::kMinArmRows && n <= C;
+                EpCountsHostProbe::cut(fs, armed, n, row0, c16.n_layer);
+                ++chunks;
+                bool seen_card = false;
+                for (int32_t li = 0; li < c16.n_layer; ++li) {
+                    const int64_t r = EpCountsHostProbe::rows(fs, li);
+                    REQUIRE(r >= 0 && r <= n);
+                    CHECK_EQ(r, n - row0[(size_t)li]);
+                    const bool want = armed && r >= ds41p1::kMinArmRows;
+                    CHECK_EQ(EpCountsHostProbe::card(fs, li), want);
+                    CHECK_EQ(ds41p1::card_layer(r), r >= 17);
+                    CHECK_EQ(EpCountsHostProbe::miss_need(fs, li), armed ? r : n);
+                    if (armed && r > 0 && r < ds41p1::kMinArmRows) {
+                        ++short_layers;
+                        short_after_card = short_after_card || seen_card;
+                    }
+                    card_layers += want;
+                    seen_card = seen_card || want;
+                }
+            }
+        }
+    /* Each length's last chunk leaves its deepest layers on the last rows' group: 16 or fewer. */
+    CHECK(short_layers > 1000);
+    CHECK(card_layers > 1000);
+    CHECK(short_after_card);   /* the armed passes where card-path layers precede the short ones */
+    /* Without the cut, an armed pass's every layer is the card path's. */
+    EpCountsHostProbe::cut(fs, true, 2048, {}, c16.n_layer);
+    for (int32_t li = 0; li < c16.n_layer; ++li) {
+        CHECK(EpCountsHostProbe::card(fs, li));
+        CHECK_EQ(EpCountsHostProbe::miss_need(fs, li), 2048);
+    }
+    std::printf("  %lld chunks: %lld armed layers of 16 rows or fewer on the CPU path, %lld on the card path\n",
+                (long long)chunks, (long long)short_layers, (long long)card_layers);
+    EpCountsHostProbe::disarm(fs);
 }
 
 RAD_TEST_MAIN()

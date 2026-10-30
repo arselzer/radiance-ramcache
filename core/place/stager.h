@@ -621,6 +621,16 @@ private:
     std::chrono::steady_clock::time_point p1_t0_{};
     uint64_t p1_touched_ = 0, p1_slab_ = 0, p1_order_moved_ = 0, p1_layers_ = 0;
     int  p1_init(const Program& prog);
+    /* Whether routed layer li of this pass is the card path's: an armed pass, and the layer's own rows
+     * (layer_rows: under the per-row cut a deep layer can run on 16 or fewer) at least
+     * ds41p1::kMinArmRows (ds41p1::card_layer). Any other layer of an armed pass takes the CPU path for
+     * its non-resident experts as a pass of its height does: plain aliases, no mark, no wave. */
+    bool p1_layer_on(int32_t li) const { return p1_armed_ && ds41p1::card_layer(layer_rows(li)); }
+    /* The rows the CPU path's miss bound (..._MISSES, hx_miss_rows_) is held to: the pass's, or in an
+     * armed pass the layer's own (a layer the card path does not take, of 16 rows or fewer, beside
+     * ..._MISSES=16). */
+    int64_t hx_miss_need(int32_t li) const { return p1_armed_ ? layer_rows(li) : pass_tok_; }
+    uint64_t p1_cpu_layers_ = 0;         /* this armed pass's routed layers on the CPU path (16 rows or fewer) */
     int  p1_layer(int32_t li, RadStream s);
     bool p1_admits(int32_t li, int32_t e) const;
     /* ..._P1_VERIFY=N: after a layer's waves, N of its RAM-cache units' expert-rows recomputed by the

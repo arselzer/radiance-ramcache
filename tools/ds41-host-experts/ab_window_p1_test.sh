@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# ab_window_p1_test.sh [ab_window.sh] -- ab_window.sh's P1 parts (P1, QmN) with no GPU, no server and no
-# model:
+# ab_window_p1_test.sh [ab_window.sh] -- ab_window.sh's P1 parts (P1, QmN, QlK, QhMS) with no GPU, no
+# server and no model:
 #   1. lcp_check on synthetic server logs: a P1 arm is measured only when the card path's startup line
-#      states its threshold and chunk, and an arm without P1 only without that line;
+#      states its threshold and chunk, a Ql arm only with its lent-ring line, and an arm without either
+#      part only without those lines;
 #   2. the arm loop, every action stubbed (as ab_window_vp_test.sh): the adopted large-chunk arm with P1
-#      on top of it (B6, M1024, Mr32, Mb1, Cs) is launched with the switches it names and the rest stated
-#      off; the adopted arm itself states P1 off; P1 at the default threshold with M16 is skipped; Qm17
-#      with M16 is launched.
+#      on top of it (B6, Ql10, M1024, Mr32, Mb1, Cs) is launched with the switches it names and the rest
+#      stated off; the adopted arm itself states P1 off; P1 at the default threshold with M16, Ql12 on
+#      B6's ring, Qh without Ql and Ql without P1 are skipped; Qm17 with M16 is launched.
 # Exit 0 when every check passes.
 set -u
 W=${1:-$(dirname "$0")/ab_window.sh}
@@ -24,20 +25,26 @@ mkdir -p "$OUT"
 log() { echo "LOG: $*" >> "$OUT/window.log"; }
 lc_line='I[0] large-chunk prefill: passes of up to 1024 tokens (RADIANCE_EXPERIMENTAL_DS41_LCP=1024): ...'
 p1_line() { echo "I[0] ds41 p1: card experts on: every routed expert row of a pure prefill pass's layer of $1 to 1024 rows on the cards (RADIANCE_EXPERIMENTAL_DS41_P1_MIN_ROWS=$1; ...)"; }
+lend_line() { echo "I[0] ds41 p1: lent ring: $1 of the ring's 12 slots (10 of them past the file buffers' alias bases; RADIANCE_EXPERIMENTAL_DS41_P1_LEND=$1) hold ..."; }
 mk() { local n=$1; shift; printf '%s\n' "$@" > "$OUT/$n.server.log"; }
 mk p1def "$lc_line" "$(p1_line 320)"
+mk p1lend "$lc_line" "$(p1_line 320)" "$(lend_line 10)"
 mk p1q17 "$lc_line" "$(p1_line 17)"
 mk plain "$lc_line"
-expect() {   # want(0/1) what log LC P1 QM
+expect() {   # want(0/1) what log LC P1 QM QL
   local want=$1 what=$2 rc
-  ARM_LC=$4 ARM_P1=$5 ARM_QM=$6 lcp_check "$3" >/dev/null 2>&1; rc=$?
+  ARM_LC=$4 ARM_P1=$5 ARM_QM=$6 ARM_QL=$7 lcp_check "$3" >/dev/null 2>&1; rc=$?
   if [[ $rc == "$want" ]]; then ok "$what"; else bad "$what: exit $rc, want $want ($(tail -1 "$OUT/window.log"))"; fi
 }
-expect 0 "P1 at the default threshold, its line"                      p1def  1024 1 320
-expect 1 "P1 at Qm17 on a server that took 320"                       p1def  1024 1 17
-expect 0 "P1 at Qm17, its line"                                       p1q17  1024 1 17
-expect 1 "no P1 part on a server that runs the card path"             p1def  1024 "" 320
-expect 0 "the plain Lc arm"                                           plain  1024 "" 320
+expect 0 "P1 at the default threshold, its line"                      p1def  1024 1 320 ""
+expect 1 "P1 at Qm17 on a server that took 320"                       p1def  1024 1 17  ""
+expect 0 "P1 at Qm17, its line"                                       p1q17  1024 1 17  ""
+expect 0 "P1 with Ql10, both lines"                                   p1lend 1024 1 320 10
+expect 1 "P1 with Ql10, no lent-ring line"                            p1def  1024 1 320 10
+expect 1 "P1 with Ql8 on a server that lent 10"                       p1lend 1024 1 320 8
+expect 1 "P1 without Ql on a server that lends (the knob from the window)" p1lend 1024 1 320 ""
+expect 1 "no P1 part on a server that runs the card path"             p1def  1024 "" 320 ""
+expect 0 "the plain Lc arm"                                           plain  1024 "" 320 ""
 
 # ---- 2. the arm loop, stubbed
 H=$T/home
@@ -48,10 +55,14 @@ pre=all-t40-f
 mid=H-p256-m196608-G-R
 post=W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc1024
 REF=$pre-M1024-$mid-B1-$post-Cs-Mb1-Lm4096
-NEW=$pre-M1024-$mid-B6-$post-P1-Cs-Mb1-Lm4096
+NEW=$pre-M1024-$mid-B6-$post-P1-Ql10-Cs-Mb1-Lm4096
+NEWG=$pre-M1024-$mid-B6-$post-P1-Ql10-Qh3000-Cs-Mb1-Lm4096
 SHORTM=$pre-M16-$mid-B6-$post-P1-Cs-Mb1-Lm4096
 Q17=$pre-M16-$mid-B6-$post-P1-Qm17-Cs-Mb1-Lm4096
-ARMS="$REF $NEW $SHORTM $Q17"
+OVERL=$pre-M1024-$mid-B6-$post-P1-Ql12-Cs-Mb1-Lm4096
+GNOL=$pre-M1024-$mid-B6-$post-P1-Qh3000-Cs-Mb1-Lm4096
+LNOP=$pre-M1024-$mid-B1-$post-Ql10-Cs-Mb1-Lm4096
+ARMS="$REF $NEW $NEWG $SHORTM $Q17 $OVERL $GNOL $LNOP"
 out=$(
   set +u
   log() { echo "LOG: $*"; }
@@ -85,15 +96,18 @@ sec=$(section "$REF")
 if [[ -z "$sec" ]]; then bad "the adopted arm was not launched: $(grep -m3 "arm $REF" "$T/loop.txt")"
 else
   has adopted "$sec" RADIANCE_EXPERIMENTAL_DS41_P1 0
+  has adopted "$sec" RADIANCE_EXPERIMENTAL_DS41_P1_LEND 0
   has adopted "$sec" RADIANCE_EXPERIMENTAL_DS41_P1_MIN_ROWS ""
   has adopted "$sec" RADIANCE_EXPERIMENTAL_DS41_LCP 1024
   has adopted "$sec" RADIANCE_EXPERIMENTAL_DS41_MOE_BALANCE 1
 fi
-for a in "$NEW"; do
+for a in "$NEW" "$NEWG"; do
   sec=$(section "$a")
   if [[ -z "$sec" ]]; then bad "arm $a not launched: $(grep -m3 "arm $a" "$T/loop.txt")"; continue; fi
-  n=P1
+  n=P1+Ql10
+  [[ "$a" == *-Qh3000-* ]] && n=P1+Ql10+Qh3000
   has "$n" "$sec" RADIANCE_EXPERIMENTAL_DS41_P1 1
+  has "$n" "$sec" RADIANCE_EXPERIMENTAL_DS41_P1_LEND 10
   has "$n" "$sec" RADIANCE_EXPERIMENTAL_DS41_P1_MIN_ROWS ""
   has "$n" "$sec" RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS 6
   has "$n" "$sec" RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MISSES 1024
@@ -102,14 +116,16 @@ for a in "$NEW"; do
   has "$n" "$sec" RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP 1
   [[ "$sec" == *"--max-num-batched-tokens 1024"* ]] && ok "$n: chunks of 1024" || bad "$n: no --max-num-batched-tokens 1024"
 done
+has "P1+Ql10+Qh3000" "$(section "$NEWG")" RADIANCE_EXPERIMENTAL_DS41_P1_GRACE_MS 3000
+has "P1+Ql10" "$(section "$NEW")" RADIANCE_EXPERIMENTAL_DS41_P1_GRACE_MS ""
 sec=$(section "$Q17")
 [[ -n "$sec" ]] && has "Qm17 with M16" "$sec" RADIANCE_EXPERIMENTAL_DS41_P1_MIN_ROWS 17 || bad "the Qm17 M16 arm was not launched"
-for a in "$SHORTM"; do
+for a in "$SHORTM" "$OVERL" "$GNOL" "$LNOP"; do
   if [[ -n "$(section "$a")" ]]; then bad "arm $a was launched"
   elif grep -q "LOG: arm $a: .*skipped" "$T/loop.txt"; then ok "skipped: $(grep -m1 "LOG: arm $a: " "$T/loop.txt" | sed "s|LOG: arm $a: ||")"
   else bad "arm $a neither launched nor skipped"; fi
 done
-for a in "$REF" "$NEW" "$Q17"; do
+for a in "$REF" "$NEW" "$NEWG" "$Q17"; do
   if grep -q "LOG: arm $a: .*\(skipped\|refused\)" "$T/loop.txt"; then bad "arm $a: $(grep -m1 "LOG: arm $a: " "$T/loop.txt")"; fi
 done
 

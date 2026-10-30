@@ -17,6 +17,7 @@
 
 #include "rad_internal.h"
 #include "device/device.h"
+#include "device/directio.h"
 #include "place/card_expert_stager.h"
 #include "place/stager.h"
 #include "sched/consumer_skip.h"
@@ -953,6 +954,465 @@ TEST(p1_threshold_arms_long_layer_passes_and_leaves_the_rest_to_the_cpu_path) {
                         (long long)armed_passes, (long long)card, (long long)cpu, (long long)cpu_in_armed);
         }
     EpCountsHostProbe::disarm(fs);
+}
+
+/* ---- the lent ring ------------------------------------------------------------------------------------------
+ *
+ * RingLender against a simulated host: loads land and copies pass at random host calls, the host's two reload
+ * buffers bound the loads in flight (a RAM-cache hit needs none and lands at once), and failures are injected.
+ * The host keeps, by slot, the card path generation of the last copy that passed into the slot (a copy queued
+ * before a pass that armed the card path runs before the card path's own copies on the DMA lane, which then
+ * overwrite the slot): a unit may be published only from a copy queued in the current generation, never while
+ * a card-path pass runs, and every source is let go once, after its read and its copy. */
+namespace {
+struct FakeLend final : LendHost {
+    struct S {
+        int  src = 0;                  /* 0 none, 1 a reload buffer, 2 a RAM-cache lease */
+        bool reading = false, copying = false, copy_done = false, published = false;
+        uint64_t copy_gen = 0, content_gen = ~0ull;
+        int  loads = 0, copies = 0;
+    };
+    std::mt19937 rng;
+    std::vector<S> s;
+    std::vector<uint8_t> ram;          /* slot k's unit hits the RAM cache in the card's form */
+    std::deque<std::pair<int, bool>> landings;
+    int bufs = 2, bufs_used = 0, land_pct = 50, copy_pct = 50;
+    uint64_t gen = 0;                  /* card-path passes begun */
+    std::set<int> fail_load_once, fail_copy_once, fail_query_once, refuse;
+    int violations = 0;
+    std::string first;
+
+    FakeLend(unsigned seed, int n) : rng(seed) { s.assign((size_t)n, S{}); ram.assign((size_t)n, 0); }
+    void bad(const std::string& w) {
+        if (!violations++) first = w;
+    }
+    void step() {
+        for (size_t k = 0; k < s.size(); ++k) {
+            if (s[k].reading && (int)(rng() % 100) < land_pct) {
+                s[k].reading = false;
+                landings.push_back({ (int)k, !fail_load_once.erase((int)k) });
+            }
+            if (s[k].copying && !s[k].copy_done && (int)(rng() % 100) < copy_pct) s[k].copy_done = true;
+        }
+    }
+    void settle_all() {   /* the background catches up: every read lands, every copy passes */
+        for (size_t k = 0; k < s.size(); ++k) {
+            if (s[k].reading) {
+                s[k].reading = false;
+                landings.push_back({ (int)k, !fail_load_once.erase((int)k) });
+            }
+            if (s[k].copying) s[k].copy_done = true;
+        }
+    }
+    int load(int k) override {
+        if (refuse.count(k)) return -1;
+        if (s[(size_t)k].src) bad("a load of slot " + std::to_string(k) + " that holds a source");
+        if (ram[(size_t)k]) {
+            s[(size_t)k].src = 2;
+            ++s[(size_t)k].loads;
+            landings.push_back({ k, true });
+            return 1;
+        }
+        if (bufs_used >= bufs) return 0;
+        ++bufs_used;
+        s[(size_t)k].src = 1;
+        s[(size_t)k].reading = true;
+        ++s[(size_t)k].loads;
+        return 1;
+    }
+    int landed(bool* ok) override {
+        step();
+        if (landings.empty()) return -1;
+        const auto d = landings.front();
+        landings.pop_front();
+        *ok = d.second;
+        return d.first;
+    }
+    int copy(int k) override {
+        S& x = s[(size_t)k];
+        if (!x.src || x.reading) bad("a copy of slot " + std::to_string(k) + " without landed bytes");
+        if (x.copying) bad("a second copy of slot " + std::to_string(k));
+        if (fail_copy_once.erase(k)) return -1;
+        x.copying = true;
+        x.copy_done = false;
+        x.copy_gen = gen;
+        ++x.copies;
+        return 0;
+    }
+    int copied(int k) override {
+        S& x = s[(size_t)k];
+        if (!x.copying) { bad("a query of slot " + std::to_string(k) + " with no copy"); return -1; }
+        if (fail_query_once.erase(k)) return -1;
+        step();
+        return x.copy_done ? 1 : 0;
+    }
+    void drop(int k) override {
+        S& x = s[(size_t)k];
+        if (!x.src) bad("slot " + std::to_string(k) + " let go of nothing");
+        if (x.reading) bad("slot " + std::to_string(k) + "'s buffer let go while its read runs");
+        if (x.copying && x.copy_done) x.content_gen = x.copy_gen;
+        if (x.src == 1) --bufs_used;
+        x.src = 0;
+        x.copying = false;
+        x.copy_done = false;
+    }
+    void publish(int k, bool on) override {
+        S& x = s[(size_t)k];
+        if (on) {
+            if (x.published) bad("slot " + std::to_string(k) + " published twice");
+            if (x.content_gen != gen)
+                bad("slot " + std::to_string(k) + " published from a copy of generation " + std::to_string(x.content_gen) +
+                    " in generation " + std::to_string(gen) + " (the card path may have written it since)");
+            x.published = true;
+        } else {
+            if (!x.published) bad("slot " + std::to_string(k) + " withdrawn unpublished");
+            x.published = false;
+            x.content_gen = ~0ull;   /* the card path takes the slot */
+        }
+    }
+    int published() const {
+        int n = 0;
+        for (const S& x : s) n += x.published;
+        return n;
+    }
+};
+
+/* A pass of either kind through the lender, the host's checks around it. */
+int lend_pass(RingLender& l, FakeLend& h, bool p1, int64_t now) {
+    if (p1) ++h.gen;
+    const int r = l.begin_pass(p1, now);
+    if (p1 && h.published()) h.bad("a unit published while a card-path pass runs");
+    if (l.residents() != h.published()) h.bad("the lender's residents and the host's published units differ");
+    return r;
+}
+}  // namespace
+
+TEST(p1_lend_returns_after_the_grace_and_takes_back_for_the_card_path) {
+    FakeLend h(5, 6);
+    h.land_pct = 100;
+    h.copy_pct = 100;
+    RingLender l;
+    REQUIRE_EQ(l.init(&h, 6, 1000), 0);
+    CHECK(l.lent());
+    /* The first pass that does not arm the card path begins the reloads; every later one copies what landed
+     * and publishes what passed, two buffers at a time. */
+    int64_t t = 0;
+    for (int i = 0; i < 20 && l.residents() < 6; ++i) lend_pass(l, h, false, t += 10);
+    CHECK_EQ(l.residents(), 6);
+    CHECK(!l.lent());
+    CHECK_EQ(l.stats().returns, (uint64_t)1);
+    CHECK_EQ(l.stats().reloaded, (uint64_t)6);
+    CHECK_EQ(h.bufs_used, 0);
+    CHECK_EQ(l.busy(), 0);
+    /* A card-path pass takes every slot back. */
+    CHECK_EQ(lend_pass(l, h, true, t += 10), 1);
+    CHECK_EQ(l.residents(), 0);
+    CHECK(l.lent());
+    CHECK_EQ(l.stats().lends, (uint64_t)1);
+    CHECK_EQ(l.stats().withdrawn, (uint64_t)6);
+    l.end_p1(t += 500);
+    const int64_t end = t;
+    /* Back-to-back: inside the grace nothing reloads, a second card-path pass finds nothing to take. */
+    lend_pass(l, h, false, end + 400);
+    CHECK_EQ(lend_pass(l, h, true, end + 600), 0);
+    l.end_p1(end + 700);
+    lend_pass(l, h, false, end + 1699);
+    CHECK(l.lent());
+    CHECK_EQ(l.residents(), 0);
+    for (const auto& x : h.s) CHECK_EQ(x.loads, 1);
+    CHECK_EQ(l.stats().held_back, (uint64_t)2);
+    /* The grace runs from the last card-path pass's end. */
+    lend_pass(l, h, false, end + 1700);
+    CHECK(!l.lent());
+    CHECK_EQ(l.stats().returns, (uint64_t)2);
+    for (int i = 0; i < 20 && l.residents() < 6; ++i) lend_pass(l, h, false, end + 1710 + i);
+    CHECK_EQ(l.residents(), 6);
+    for (const auto& x : h.s) CHECK_EQ(x.loads, 2);
+    CHECK_EQ(h.violations, 0);
+    if (h.violations) std::fprintf(stderr, "%s\n", h.first.c_str());
+    /* A grace of 0: the pass after the card path's reloads at once. */
+    FakeLend h0(6, 2);
+    h0.land_pct = h0.copy_pct = 100;
+    RingLender l0;
+    REQUIRE_EQ(l0.init(&h0, 2, 0), 0);
+    for (int i = 0; i < 5; ++i) lend_pass(l0, h0, false, i);
+    CHECK_EQ(l0.residents(), 2);
+    lend_pass(l0, h0, true, 10);
+    l0.end_p1(11);
+    lend_pass(l0, h0, false, 11);
+    CHECK(!l0.lent());
+    CHECK_EQ(h0.violations, 0);
+    RingLender bad;
+    CHECK(bad.init(nullptr, 2, 0) < 0);
+    CHECK(bad.init(&h0, 0, 0) < 0);
+    CHECK(bad.init(&h0, ds41p1::kMaxLend + 1, 0) < 0);
+    CHECK(bad.init(&h0, 2, -1) < 0);
+}
+
+TEST(p1_lend_failed_reloads_leave_their_units_on_the_cpu_path_until_the_next_return) {
+    FakeLend h(9, 5);
+    h.land_pct = h.copy_pct = 100;
+    h.fail_load_once = { 1 };     /* a read that fails */
+    h.fail_copy_once = { 2 };     /* a copy that cannot be queued */
+    h.fail_query_once = { 3 };    /* a copy whose event errs */
+    h.refuse = { 4 };             /* a unit no load can take */
+    RingLender l;
+    REQUIRE_EQ(l.init(&h, 5, 100), 0);
+    for (int i = 0; i < 30; ++i) lend_pass(l, h, false, i);
+    CHECK_EQ(l.residents(), 1);
+    CHECK(l.resident(0));
+    for (int k = 1; k < 5; ++k) CHECK(!l.resident(k));
+    CHECK_EQ(l.stats().failed, (uint64_t)4);
+    CHECK_EQ(h.bufs_used, 0);
+    CHECK_EQ(l.busy(), 0);
+    for (int k = 1; k < 4; ++k) CHECK_EQ(h.s[(size_t)k].loads, 1);   /* no retry inside a return */
+    /* The next return tries them again (the injected failures were once each; slot 4 is refused for good). */
+    lend_pass(l, h, true, 100);
+    l.end_p1(110);
+    for (int i = 0; i < 30; ++i) lend_pass(l, h, false, 300 + i);
+    CHECK_EQ(l.residents(), 4);
+    CHECK(!l.resident(4));
+    CHECK_EQ(h.violations, 0);
+    if (h.violations) std::fprintf(stderr, "%s\n", h.first.c_str());
+}
+
+TEST(p1_lend_loads_and_copies_a_card_path_pass_overtakes_are_never_published) {
+    FakeLend h(13, 3);
+    h.land_pct = 0;
+    h.copy_pct = 0;
+    RingLender l;
+    REQUIRE_EQ(l.init(&h, 3, 50), 0);
+    h.ram[2] = 1;                 /* slot 2 a RAM-cache hit: lands at once, no buffer */
+    lend_pass(l, h, false, 0);    /* slots 0, 1 reading (both buffers), 2 landed */
+    CHECK_EQ(h.bufs_used, 2);
+    lend_pass(l, h, false, 1);    /* slot 2's copy queued */
+    REQUIRE(h.s[2].copying);
+    h.s[0].reading = false;       /* slot 0's read lands */
+    h.landings.push_back({ 0, true });
+    /* Slot 0 landed (not yet seen), 1 reading, 2 copying: the card path overtakes all three. */
+    CHECK_EQ(lend_pass(l, h, true, 2), 0);
+    CHECK_EQ(l.residents(), 0);
+    CHECK_EQ(h.bufs_used, 1);     /* slot 0's buffer given back at once; slot 1's read still runs */
+    CHECK(h.s[2].copying);        /* its source stays until its copy passes */
+    l.end_p1(3);
+    h.settle_all();
+    lend_pass(l, h, false, 10);   /* inside the grace: the overtaken ones only let go */
+    CHECK_EQ(h.bufs_used, 0);
+    CHECK_EQ(h.s[2].src, 0);
+    CHECK_EQ(l.residents(), 0);
+    CHECK_EQ(l.busy(), 0);
+    CHECK_EQ(l.stats().cancelled, (uint64_t)3);
+    /* After the grace each is reloaded from the start, and only those copies are published. */
+    h.land_pct = h.copy_pct = 100;
+    for (int i = 0; i < 20; ++i) lend_pass(l, h, false, 100 + i);
+    CHECK_EQ(l.residents(), 3);
+    for (const auto& x : h.s) CHECK_EQ(x.loads, 2);
+    CHECK_EQ(h.violations, 0);
+    if (h.violations) std::fprintf(stderr, "%s\n", h.first.c_str());
+}
+
+/* Decode beside the card path: a pass that does not arm it (decode, or a step that mixes prefill and decode rows,
+ * which p1_pass_arms never arms) never takes residents back, and while the slots are lent such a pass sees the
+ * units non-resident (the CPU path's) until a later pass publishes their reloads; residency changes only at a
+ * pass's begin. */
+TEST(p1_lend_decode_beside_the_card_path_sees_residency_change_only_between_passes) {
+    RadBatch mixed{};
+    mixed.phase = RAD_PHASE_PREFILL;
+    mixed.n_tok = 700;
+    mixed.n_tok_decode = 4;
+    RadBatch decode{};
+    decode.phase = RAD_PHASE_DECODE;
+    decode.n_tok = 4;
+    decode.n_tok_decode = 4;
+    RadBatch chunk{};
+    chunk.phase = RAD_PHASE_PREFILL;
+    chunk.n_tok = 1024;
+    FakeLend h(17, 4);
+    h.land_pct = h.copy_pct = 100;
+    RingLender l;
+    REQUIRE_EQ(l.init(&h, 4, 300), 0);
+    int64_t t = 0;
+    for (int i = 0; i < 10; ++i) lend_pass(l, h, FileStager::p1_pass_arms(decode, 320, 1024), t += 5);
+    CHECK_EQ(l.residents(), 4);
+    lend_pass(l, h, FileStager::p1_pass_arms(mixed, 320, 1024), t += 5);
+    CHECK_EQ(l.residents(), 4);   /* a mixed step keeps them */
+    CHECK_EQ(lend_pass(l, h, FileStager::p1_pass_arms(chunk, 320, 1024), t += 5), 1);
+    l.end_p1(t += 2000);
+    /* Decode steps between two chunks of a long prompt: lent, nothing published, nothing read again. */
+    for (int i = 0; i < 5; ++i) {
+        const int before = h.published();
+        lend_pass(l, h, FileStager::p1_pass_arms(decode, 320, 1024), t += 20);
+        CHECK_EQ(h.published(), before);
+        CHECK_EQ(h.published(), 0);
+    }
+    CHECK_EQ(lend_pass(l, h, FileStager::p1_pass_arms(chunk, 320, 1024), t += 5), 0);
+    l.end_p1(t += 2000);
+    for (const auto& x : h.s) CHECK_EQ(x.loads, 1);
+    /* Then the decode steps after the prompt: held back for the grace, reloaded after it, each unit published at
+     * a pass's begin once its copy passed. */
+    int seen = 0;
+    for (int i = 0; i < 40; ++i) {
+        lend_pass(l, h, FileStager::p1_pass_arms(decode, 320, 1024), t += 20);
+        CHECK(h.published() >= seen);
+        seen = h.published();
+    }
+    CHECK_EQ(l.residents(), 4);
+    CHECK_EQ(h.violations, 0);
+    if (h.violations) std::fprintf(stderr, "%s\n", h.first.c_str());
+}
+
+TEST(p1_lend_stress_random_passes_landings_and_failures) {
+    int runs = 0;
+    for (unsigned seed = 1; seed <= 200; ++seed) {
+        std::mt19937 rng(seed);
+        const int n = 1 + (int)(rng() % 12);
+        FakeLend h(seed * 7u + 1u, n);
+        h.bufs = 1 + (int)(rng() % 3);
+        h.land_pct = 10 + (int)(rng() % 90);
+        h.copy_pct = 10 + (int)(rng() % 90);
+        for (int k = 0; k < n; ++k) h.ram[(size_t)k] = rng() % 4 == 0;
+        RingLender l;
+        REQUIRE_EQ(l.init(&h, n, (int64_t)(rng() % 200)), 0);
+        int64_t t = 0;
+        bool in_p1 = false;
+        for (int i = 0; i < 400; ++i) {
+            t += 1 + (int64_t)(rng() % 40);
+            if (rng() % 9 == 0) h.fail_load_once.insert((int)(rng() % (unsigned)n));
+            if (rng() % 13 == 0) h.fail_copy_once.insert((int)(rng() % (unsigned)n));
+            if (rng() % 17 == 0) h.fail_query_once.insert((int)(rng() % (unsigned)n));
+            if (in_p1) l.end_p1(t);
+            in_p1 = rng() % 5 == 0;
+            lend_pass(l, h, in_p1, t);
+            if (h.bufs_used > h.bufs) h.bad("more buffers in use than the host has");
+        }
+        /* One more card-path pass (a failed reload waits for the next return), then a long idle stretch of
+         * decode passes: every unit is resident again, nothing held. */
+        if (in_p1) l.end_p1(t);
+        lend_pass(l, h, true, t += 1);
+        l.end_p1(t += 1);
+        h.fail_load_once.clear();
+        h.fail_copy_once.clear();
+        h.fail_query_once.clear();
+        h.land_pct = h.copy_pct = 100;
+        for (int i = 0; i < 4 * n + 20; ++i) lend_pass(l, h, false, t += 1000);
+        if (l.residents() != n || l.busy() || h.bufs_used || h.violations) {
+            CHECK_EQ(l.residents(), n);
+            CHECK_EQ(l.busy(), 0);
+            CHECK_EQ(h.bufs_used, 0);
+            CHECK_EQ(h.violations, 0);
+            std::fprintf(stderr, "seed %u: %s\n", seed, h.first.c_str());
+            return;
+        }
+        ++runs;
+    }
+    CHECK_EQ(runs, 200);
+}
+
+/* The mover's side: a lent-ring resident is published at its ring slot (weight i at its offset), never aliased,
+ * borrowed or read into a file buffer, counts as the slot's for the card path (file_unit_in_slab), and is a
+ * file-tier unit again (published as null) once taken back. */
+TEST(p1_lend_ring_residents_are_published_at_their_slots_and_aliased_never) {
+    const std::string path = "p1_stager_test_ring.rad";
+    {
+        std::vector<uint8_t> img((size_t)(2 * RAD_ALIGN_UNIT), 7);
+        FILE* fp = std::fopen(path.c_str(), "wb");
+        REQUIRE(fp != nullptr);
+        REQUIRE(std::fwrite(img.data(), 1, img.size(), fp) == img.size());
+        std::fclose(fp);
+        DirectFile probe;
+        if (probe.open(path.c_str(), RAD_DIO_READ) < 0) {
+            std::printf("  SKIP the working directory has no O_DIRECT\n");
+            std::remove(path.c_str());
+            return;
+        }
+    }
+    const int64_t gu = ds41p1::kGuBlockBytes, dn = ds41p1::kDnBlockBytes;
+    Program prog;
+    prog.weights.resize(1);
+    Plan plan;
+    plan.rank = 0;
+    plan.world_size = 1;
+    plan.dynamic = false;
+    SlabClass sc;
+    sc.name = "expert";
+    sc.stride = ds41p1::kSlotBytes;
+    sc.n_units = 2;
+    plan.classes.push_back(sc);
+    for (int e = 0; e < 2; ++e) {
+        MoveUnit mu;
+        mu.layer = 3;
+        mu.expert = e;
+        mu.slab_class = 0;
+        mu.bytes = mu.slot_bytes = ds41p1::kSlotBytes;
+        mu.access = RAD_ACCESS_CONDITIONAL;
+        mu.tier = Tier::SSD;
+        mu.site = Site::DeviceStaged;
+        for (int k = 0; k < 2; ++k) {
+            WeightInfo w;
+            w.name = "blk.3.ffn_" + std::string(k ? "down" : "gate_up") + "." + std::to_string(e);
+            w.decl.dtype = RAD_U8;
+            w.decl.rank = 1;
+            w.decl.shape[0] = k ? dn : gu;
+            w.decl.access = RAD_ACCESS_CONDITIONAL;
+            w.decl.group.layer = 3;
+            w.decl.group.expert = e;
+            w.logical_bytes = w.stored_bytes = k ? dn : gu;
+            w.align = RAD_ALIGN_UNIT;
+            w.layout_tag = "ggml_mxfp4";
+            w.file_offset = 0;
+            prog.weights.push_back(w);
+            mu.weights.push_back((rad_weight)(prog.weights.size() - 1));
+        }
+        mu.offset = { 0, gu };
+        plan.units.push_back(mu);
+    }
+    plan.unit_of_weight.assign(prog.weights.size(), -1);
+    for (size_t u = 0; u < plan.units.size(); ++u)
+        for (rad_weight w : plan.units[u].weights) plan.unit_of_weight[w] = (int32_t)u;
+    Mover m;
+    MoverConfig mc;
+    mc.container_path = path;
+    mc.stage_slots = 0;
+    REQUIRE_EQ(m.init(prog, plan, mc), RAD_OK);
+    ResidencyTable* rt = m.residency();
+    alignas(64) static char slot[64];
+    alignas(64) static char alias[64];
+    CHECK(rt->lookup(plan.units[0].weights[0])->ptr == nullptr);   /* a file-tier unit has no address */
+    CHECK(!m.ring_resident(0));
+    CHECK(!m.file_unit_in_slab(0));
+    m.set_ring_resident(0, slot);
+    CHECK(m.ring_resident(0));
+    CHECK(m.file_unit_in_slab(0));
+    CHECK(!m.ring_resident(1));
+    CHECK((const char*)m.unit_base(0) == slot);
+    CHECK((const char*)rt->lookup(plan.units[0].weights[0])->ptr == slot);
+    CHECK((const char*)rt->lookup(plan.units[0].weights[1])->ptr == slot + gu);
+    /* Aliases, marked or not, leave it where it is and take the other. */
+    std::vector<int32_t> staged;
+    m.alias_file_units({ 0, 1 }, alias, &staged);
+    REQUIRE(staged.size() == (size_t)1);
+    CHECK_EQ(staged[0], 1);
+    CHECK((const char*)rt->lookup(plan.units[0].weights[0])->ptr == slot);
+    CHECK((const char*)rt->lookup(plan.units[1].weights[0])->ptr == alias);
+    staged.clear();
+    m.alias_file_units({ 0 }, alias, &staged, ds41p1::kMarkSkip);
+    CHECK(staged.empty());
+    /* Releasing a layer's staged units republishes the resident at its slot, the rest as null. */
+    m.unstage_units({ 0, 1 });
+    CHECK((const char*)rt->lookup(plan.units[0].weights[1])->ptr == slot + gu);
+    CHECK(rt->lookup(plan.units[1].weights[0])->ptr == nullptr);
+    Mover::HostUnit hu;
+    CHECK(!m.borrow_host_unit(0, &hu, false));
+    /* Taken back: a file-tier unit again. */
+    m.set_ring_resident(0, nullptr);
+    CHECK(!m.ring_resident(0));
+    CHECK(!m.file_unit_in_slab(0));
+    CHECK(rt->lookup(plan.units[0].weights[0])->ptr == nullptr);
+    CHECK(m.unit_base(0) == nullptr);
+    staged.clear();
+    m.alias_file_units({ 0 }, alias, &staged);
+    CHECK_EQ(staged.size(), (size_t)1);
+    std::remove(path.c_str());
 }
 
 /* ---- the admission predicate --------------------------------------------------------------------------- */

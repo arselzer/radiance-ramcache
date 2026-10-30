@@ -490,6 +490,7 @@ FileStager::~FileStager() {
     /* The card path's threads use this stager's planes and insert queue: they stop first. */
     p1_.reset();
     if (p1_end_) rad_event_destroy(p1_end_);
+    if (p1_lend_ev_) rad_event_destroy(p1_lend_ev_);
     if (p1_vev_) rad_event_destroy(p1_vev_);
     for (void* p : { (void*)p1_vidx_, (void*)p1_vx_, (void*)p1_vy_, (void*)p1_vh_ })
         if (p) rad_dev_free(p, RAD_MEM_HOST_PINNED);
@@ -705,9 +706,16 @@ bool FileStager::begin_pass(const RadBatch* b) {
      * readers of the file buffers before it. */
     p1_armed_ = false;
     p1_li_ = -1;
-    if (p1_on() && lcp_ && p1_pass_arms(*b, p1_min_rows_, ep_rows_)) {
-        const RadEvent hand[2] = { free_rec_[0] ? free_[0] : nullptr, free_rec_[1] ? free_[1] : nullptr };
-        if (p1_->begin_pass(b->n_tok, hand, 2) < 0) {
+    const bool p1_arms = p1_on() && lcp_ && p1_pass_arms(*b, p1_min_rows_, ep_rows_);
+    /* The lent ring (card_expert_stager.h): a pass that arms the card path takes the residents' slots
+     * back, and its first ring copy waits on their last reader too; any other pass, once the grace has
+     * run out, reloads them and publishes those whose copies have passed. Here only, before the run
+     * phase brings the weight tables up to date. */
+    if (p1_on() && p1_->lending()) (void)p1_->lender().begin_pass(p1_arms, p1_now_ms());
+    if (p1_arms) {
+        const RadEvent hand[3] = { free_rec_[0] ? free_[0] : nullptr, free_rec_[1] ? free_[1] : nullptr,
+                                   p1_lend_rec_ ? p1_lend_ev_ : nullptr };
+        if (p1_->begin_pass(b->n_tok, hand, 3) < 0) {
             RAD_ERR("ds41 p1: an armed pass could not begin; this pass goes to the CPU path");
         } else {
             p1_armed_ = true;
@@ -897,6 +905,7 @@ int FileStager::start_ep_routed(int32_t li, RadStream s, bool* read) {
     }
     want_.clear(); skip_.clear();
     for (int32_t u : L.units) {
+        if (mover_->ring_resident(u)) continue;   /* a lent-ring resident: the card's, as a VRAM one */
         bool selected = false;
         if (!ep_route_unit_selected(counts_host_, plan_->units[(size_t)u].expert, &selected))
             return RAD_E_STATE;
@@ -2625,6 +2634,7 @@ int FileStager::hx_early_decide() {
     want_.clear();
     skip_.clear();
     for (int32_t u : L.units) {
+        if (mover_->ring_resident(u)) continue;   /* a lent-ring resident: the card's, as a VRAM one */
         bool selected = false;
         if (!ep_route_unit_selected(counts_host_, plan_->units[(size_t)u].expert, &selected))
             return RAD_E_STATE;
@@ -4401,12 +4411,23 @@ int FileStager::end_pass(RadStream s) {
     /* Prefill Phase 1: every copy seen and every source let go before the buffers are released; the
      * mover's stream then waits behind this pass's last reader of the ring. */
     int p1_rc = RAD_OK;
+    /* The lent ring: the grace runs from the card path's last pass, and the residents' last reader so
+     * far is behind this pass, which a later armed pass's first ring copy waits on. */
+    if (p1_ && p1_->lending()) {
+        if (p1_armed_) p1_->lender().end_p1(p1_now_ms());
+        if (p1_->lender().residents() > 0) {
+            const int r = s ? rad_event_record(p1_lend_ev_, s) : RAD_E_STATE;
+            if (r >= 0) p1_lend_rec_ = true;
+            else p1_rc = r;
+        }
+    }
     if (p1_armed_) {
         p1_armed_ = false;
         if (p1_li_ >= 0)
             RAD_ERR("ds41 p1: routed layer %d's down projection was never issued this pass",
                     layers_[(size_t)p1_li_].layer);
-        p1_rc = p1_->end_pass(s, p1_end_);
+        const int er = p1_->end_pass(s, p1_end_);
+        if (p1_rc >= 0) p1_rc = er;
         if (p1_li_ >= 0 && p1_rc >= 0) p1_rc = RAD_E_STATE;
         p1_li_ = -1;
         if (plan_->rank == 0) {
@@ -4582,6 +4603,10 @@ int FileStager::p1_init(const Program& prog) {
     if (rc < 0) return refuse(why);
     p1_ = std::move(path);
     p1_min_rows_ = t.min_rows;
+    if (t.lend > 0 && p1_lend_init(t, &why) < 0) {
+        p1_.reset();
+        return refuse(why);
+    }
     if (plan_->rank == 0)
         RAD_INFO("%s: every routed expert row of a pure prefill pass's layer of %lld to %lld rows on the cards "
                  "(%s=%lld; a shorter layer pass takes the CPU path, up to %lld rows); ring %d slots of %lld bytes "
@@ -4616,6 +4641,79 @@ bool FileStager::p1_pool_source(int32_t u, p1::Source* out) const {
     if (!src.gu || !src.dn) return false;
     *out = src;
     return true;
+}
+
+/* The lent ring (card_expert_stager.h): the ring's slots that neither file buffer's alias base names,
+ * each lent to one of this rank's hottest file-tier units by the profile (a trunk layer's, one the CPU
+ * path can read), at most ..._P1_LEND of them; the reloads begin at once, and every pass from the next
+ * publishes what has landed. Refused when no slot or no unit can be lent. */
+int FileStager::p1_lend_init(const p1::Tunables& t, std::string* why) {
+    const char* const ring = p1_->ring_base();
+    const int n_slots = p1_->ring_slots();
+    std::vector<int> slots;
+    for (int r = 0; r < n_slots; ++r) {
+        const char* at = ring + (int64_t)r * ds41p1::kSlotBytes;
+        bool alias = false;
+        for (int b = 0; b < 2; ++b)
+            alias = alias || (buf_[b] && at < buf_[b] + ds41p1::kSlotBytes && buf_[b] < at + ds41p1::kSlotBytes);
+        if (!alias) slots.push_back(r);
+    }
+    std::vector<int32_t> cand;
+    for (size_t li = 0; li < layers_.size(); ++li) {
+        if (layers_[li].layer < 0 || layers_[li].layer >= n_model_layers_ || li >= ep_layer_eligible_.size() ||
+            !ep_layer_eligible_[li])
+            continue;
+        for (int32_t u : layers_[li].units) {
+            const MoveUnit& mu = plan_->units[(size_t)u];
+            if (mu.bytes == ds41p1::kSlotBytes && mu.weights.size() == 2 && mu.offset.size() == 2 &&
+                !mover_->file_unit_in_slab(u) && mover_->host_planes_eligible(u))
+                cand.push_back(u);
+        }
+    }
+    std::stable_sort(cand.begin(), cand.end(), [&](int32_t a, int32_t c) {
+        return plan_->units[(size_t)a].profile_share > plan_->units[(size_t)c].profile_share;
+    });
+    const int alias_slots = n_slots - (int)slots.size();
+    const int k = std::min<int>(t.lend, (int)std::min(slots.size(), cand.size()));
+    if (k <= 0) {
+        if (why)
+            *why = fmt("%s=%d: no ring slot (%d slots, %zu past the file buffers' alias bases) or file-tier unit "
+                       "(%zu) to lend", ds41p1::kLendEnv, t.lend, n_slots, slots.size(), cand.size());
+        return RAD_E_INVAL;
+    }
+    std::vector<p1::CardExpertPath::LendUnit> units((size_t)k);
+    for (int i = 0; i < k; ++i) {
+        const MoveUnit& mu = plan_->units[(size_t)cand[(size_t)i]];
+        p1::CardExpertPath::LendUnit& lu = units[(size_t)i];
+        lu.unit = cand[(size_t)i];
+        for (int w = 0; w < 2; ++w) {
+            lu.off[w] = mu.offset[(size_t)w];
+            lu.bytes[w] = ep_program_->weights[mu.weights[(size_t)w]].stored_bytes;
+        }
+    }
+    slots.resize((size_t)k);
+    if (!p1_lend_ev_ && rad_event_create_local(&p1_lend_ev_) < 0) {
+        p1_lend_ev_ = nullptr;
+        if (why) *why = "could not create the lent ring's event";
+        return RAD_E_DEVICE;
+    }
+    p1_lend_rec_ = false;
+    RAD_TRY(p1_->lend_init(units, slots, t.grace_ms, why));
+    (void)p1_->lender().begin_pass(false, p1_now_ms());   /* the first reloads begin now */
+    if (plan_->rank == 0) {
+        double share = 0.0;
+        for (int i = 0; i < k; ++i) share += plan_->units[(size_t)cand[(size_t)i]].profile_share;
+        RAD_INFO("%s: %d of the ring's %d slots (%d of them past the file buffers' alias bases; %s=%d) hold "
+                 "rank 0's %d hottest file-tier units (profile share %.4f) as decode residents outside the card "
+                 "path's passes; a pass that arms it takes them back, and %d ms after its last pass (%s) they are "
+                 "reloaded in the background (from the RAM cache where it holds the card's block form, else read "
+                 "from the drive and relaid into two pinned buffers of %.0f MiB) and published again; a unit not "
+                 "yet reloaded, or whose reload failed, takes the CPU path",
+                 ds41p1::kLogLend, k, n_slots, n_slots - alias_slots, ds41p1::kLendEnv, t.lend, k, share, t.grace_ms,
+                 ds41p1::kGraceEnv,
+                 (double)ds41p1::kSlotBytes / 1048576.0);
+    }
+    return RAD_OK;
 }
 
 /* Layer li of an armed pass, its counts in counts_host_ and its selected file-tier units in want_

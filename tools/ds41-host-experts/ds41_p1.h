@@ -134,7 +134,9 @@ static_assert(kDnOff % 256 == 0 && kSlotBytes % 4096 == 0, "slot layout alignmen
  *
  * The ring is the file stager's two layer buffers seen as one region of whole slots, sized by
  * RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS=N (2N slots; the arm part BN). P1 needs N >= 2, and
- * the window measures N = 6 (12 slots, 215 MiB a card). */
+ * the window measures N = 6 (12 slots, 215 MiB a card). With kLendEnv the slots past the file
+ * stager's own two (where its aliases point, B1's share) hold decode residents between the card
+ * path's passes (card_expert_stager.h, the lent ring), so the ring costs decode nothing. */
 constexpr const char* kWaveEnv     = "RADIANCE_EXPERIMENTAL_DS41_P1_WAVE";      /* units a wave (2) */
 constexpr const char* kInflightEnv = "RADIANCE_EXPERIMENTAL_DS41_P1_INFLIGHT";  /* drive units read at once a rank (16) */
 constexpr const char* kReadyEnv    = "RADIANCE_EXPERIMENTAL_DS41_P1_READY";     /* pinned packed slots a rank (6) */
@@ -145,7 +147,13 @@ constexpr const char* kAlignEnv    = "RADIANCE_EXPERIMENTAL_DS41_P1_ALIGN";     
  * one the CPU path's exactly as without the switch (kMinArmRows to kTwinMaxRows; 320). The CPU path
  * then takes misses up to min(C, threshold - 1) rows, and never fewer than 16 (cpu_rows). */
 constexpr const char* kMinRowsEnv  = "RADIANCE_EXPERIMENTAL_DS41_P1_MIN_ROWS";
+/* The lent ring: up to this many ring slots hold the hottest file-tier units as decode residents
+ * outside the card path's passes (0 off, the default; at most the ring's slots less the file
+ * stager's two), given back kGraceEnv ms after the card path's last pass (1000; 0-60000). */
+constexpr const char* kLendEnv     = "RADIANCE_EXPERIMENTAL_DS41_P1_LEND";
+constexpr const char* kGraceEnv    = "RADIANCE_EXPERIMENTAL_DS41_P1_GRACE_MS";
 constexpr int kDefWave = 2, kDefInflight = 16, kDefReady = 6, kDefAhead = 8, kDefMinRows = 320;
+constexpr int kDefGraceMs = 1000, kMaxLend = 64;
 constexpr int kMinRingSlots = 4;
 
 /* The tallest layer pass the CPU path takes under the threshold, at chunk C: every pass or layer
@@ -171,6 +179,7 @@ inline int64_t first_chunk_end_aligned(int64_t P, int64_t C, int64_t g) {
 constexpr const char* kLogOn    = "ds41 p1: card experts on";   /* rank 0, at startup, with the ring and tunables */
 constexpr const char* kLogStats = "ds41 p1 stats, rank";        /* each rank, at exit */
 constexpr const char* kLogChunk = "ds41 p1 chunk:";             /* rank 0, after each card-path chunk */
+constexpr const char* kLogLend  = "ds41 p1: lent ring";         /* rank 0, at startup, with kLendEnv */
 
 /* ---- the device check (package K) --------------------------------------------------------------
  *

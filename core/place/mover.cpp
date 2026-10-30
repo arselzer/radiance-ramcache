@@ -255,6 +255,8 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
 
     unit_.assign(plan.units.size(), UnitState{});
     copying_.assign(plan.units.size(), 0);
+    ring_res_.reset(new std::atomic<char*>[plan.units.size() ? plan.units.size() : 1]);
+    for (size_t u = 0; u < plan.units.size(); ++u) ring_res_[u].store(nullptr, std::memory_order_relaxed);
     pool_layer_.assign(plan.classes.size(), {});
     donors_.assign(plan.classes.size(), DonorRank{});
     n_layers_ = 0;
@@ -588,6 +590,8 @@ void* Mover::unit_base(int32_t unit) const {
     if (unit < 0 || (size_t)unit >= unit_.size()) return nullptr;
     const UnitState& us = unit_[(size_t)unit];
     if (us.klass < 0) return nullptr;
+    /* A lent-ring resident (set_ring_resident): its ring slot, laid out as the unit is. */
+    if (char* const r = ring_res_ ? ring_res_[(size_t)unit].load(std::memory_order_relaxed) : nullptr) return r;
     const ClassPools& cp = pools_[(size_t)us.klass];
     if (us.slab_slot >= 0 && (cp.is_flex(us.slab_slot) || cp.slab_base))
         return cp.slot_ptr(us.slab_slot);
@@ -872,7 +876,7 @@ void Mover::alias_file_units(const std::vector<int32_t>& units, char* base,
     for (int32_t u : units) {
         if (u < 0 || (size_t)u >= unit_.size()) continue;
         const UnitState& us = unit_[(size_t)u];
-        if (us.tier != Tier::SSD || us.slab_slot >= 0 || us.klass < 0) continue;
+        if (!file_off_card(u, us)) continue;
         const MoveUnit& mu = plan_->units[(size_t)u];
         for (rad_weight w : mu.weights) res_.publish(w, base);
         staged->push_back(u);
@@ -888,7 +892,7 @@ void Mover::alias_file_units(const std::vector<int32_t>& units, char* base,
     for (int32_t u : units) {
         if (u < 0 || (size_t)u >= unit_.size()) continue;
         const UnitState& us = unit_[(size_t)u];
-        if (us.tier != Tier::SSD || us.slab_slot >= 0 || us.klass < 0) continue;
+        if (!file_off_card(u, us)) continue;
         const MoveUnit& mu = plan_->units[(size_t)u];
         for (rad_weight w : mu.weights) res_.publish(w, marked);
         staged->push_back(u);
@@ -907,6 +911,34 @@ void Mover::alias_pool_units(const std::vector<int32_t>& units, char* base, std:
         for (rad_weight w : plan_->units[(size_t)u].weights) res_.publish(w, marked);
         staged->push_back(u);
     }
+}
+
+void Mover::set_ring_resident(int32_t u, char* slot) {
+    if (!plan_ || !ring_res_ || u < 0 || (size_t)u >= unit_.size()) return;
+    const UnitState& us = unit_[(size_t)u];
+    if (us.tier != Tier::SSD || us.slab_slot >= 0 || us.klass < 0) return;
+    ring_res_[(size_t)u].store(slot, std::memory_order_relaxed);
+    republish(u);
+}
+
+int Mover::relay_unit_block(const HostPlanes& p, uint8_t* dst, int64_t cap) const {
+    if (!prog_ || !plan_ || !dst || p.n != 2 || p.unit < 0 || (size_t)p.unit >= unit_.size() || !relayout_)
+        return RAD_E_INVAL;
+    const MoveUnit& mu = plan_->units[(size_t)p.unit];
+    if (mu.weights.size() != 2 || mu.offset.size() != 2 || cap < mu.bytes) return RAD_E_INVAL;
+    for (int k = 0; k < 2; ++k) {
+        const WeightInfo& w = prog_->weights[p.w[k]];
+        if (p.w[k] != mu.weights[(size_t)k] || !p.codes[k] || !p.scales[k] || mu.offset[(size_t)k] < 0 ||
+            mu.offset[(size_t)k] + w.stored_bytes > cap)
+            return RAD_E_STATE;
+        RadTensor pt[RAD_ENC_MAX_PLANES];
+        weight_planes(w, pt);
+        pt[0].data = const_cast<uint8_t*>(p.codes[k]);
+        pt[1].data = const_cast<uint8_t*>(p.scales[k]);
+        const int st = relayout_(w, pt, dst + mu.offset[(size_t)k], w.stored_bytes);
+        if (st < 0) return st;
+    }
+    return RAD_OK;
 }
 
 int Mover::ring_copy(const RadCopySeg* segs, int n, const RadEvent* waits, int n_waits, RadEvent done) {
@@ -989,7 +1021,7 @@ bool Mover::borrow_host_unit(int32_t u, HostUnit* out, bool touch) {
         (size_t)u >= unit_.size())
         return false;
     const UnitState& us = unit_[(size_t)u];
-    if (us.tier != Tier::SSD || us.slab_slot >= 0 || us.klass < 0) return false;
+    if (!file_off_card(u, us)) return false;
     const MoveUnit& mu = plan_->units[(size_t)u];
     if (mu.weights.empty() || mu.weights.size() > 2 || !source_file_epoch()) return false;
     /* The packed cache's slots are borrowed by class, and their leases must say packed; a block
@@ -2153,7 +2185,7 @@ int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_
     for (int32_t u : units) {
         if (u < 0 || (size_t)u >= unit_.size()) return RAD_E_INVAL;
         const UnitState& us = unit_[(size_t)u];
-        if (us.tier != Tier::SSD || us.slab_slot >= 0 || us.klass < 0) continue;
+        if (!file_off_card(u, us)) continue;
         const int64_t need = align_up(us.bytes, RAD_ALIGN_UNIT);
         if (off + need > cap) {
             RAD_ERR("file stager: a routed layer's file-tier units need more than the %s buffer "

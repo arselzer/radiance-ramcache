@@ -37,6 +37,8 @@ bool parse_tunables(const std::function<const char*(const char*)>& get, Tunables
         { ds41p1::kAheadEnv, 0, 64, &r.ahead },
         { ds41p1::kVerifyEnv, 0, 4096, &r.verify },
         { ds41p1::kMinRowsEnv, ds41p1::kMinArmRows, ds41p1::kTwinMaxRows, &r.min_rows },
+        { ds41p1::kLendEnv, 0, ds41p1::kMaxLend, &r.lend },
+        { ds41p1::kGraceEnv, 0, 60000, &r.grace_ms },
     };
     for (const K& k : ks) {
         const char* v = get(k.env);
@@ -362,6 +364,156 @@ int CardExpertStager::slot_of(const void* entry) const {
     return (int)s;
 }
 
+/* ---- the lent ring ------------------------------------------------------------------------------------- */
+int RingLender::init(LendHost* host, int n, int64_t grace_ms) {
+    if (!host || n < 1 || n > ds41p1::kMaxLend || grace_ms < 0) return -1;
+    host_ = host;
+    slot_.assign((size_t)n, Slot{});
+    grace_ = grace_ms;
+    last_p1_ = 0;
+    lent_ = true;
+    any_p1_ = false;
+    st_ = Stats{};
+    return 0;
+}
+
+int RingLender::residents() const {
+    int n = 0;
+    for (const Slot& s : slot_) n += s.st == St::Resident;
+    return n;
+}
+
+int RingLender::busy() const {
+    int n = 0;
+    for (const Slot& s : slot_) n += s.st == St::Reading || s.st == St::Landed || s.st == St::Copying;
+    return n;
+}
+
+/* Slot k's load or copy ended without a resident: Idle while lent; Want for one a card-path pass
+ * overtook (whatever became of it: its ring slot may hold the card path's bytes now, so it reloads from
+ * the start); else it failed, and its unit stays on the CPU path until the next return. */
+void RingLender::settle(int k) {
+    Slot& s = slot_[(size_t)k];
+    const bool overtaken = s.cancel || lent_;
+    ++(overtaken ? st_.cancelled : st_.failed);
+    s.cancel = false;
+    s.st = lent_ ? St::Idle : overtaken ? St::Want : St::Failed;
+}
+
+/* Landed loads copied (or let go, overtaken), passed copies published (or let go). */
+void RingLender::poll() {
+    bool ok = false;
+    for (int k; (k = host_->landed(&ok)) >= 0;) {
+        if (k >= n() || slot_[(size_t)k].st != St::Reading) continue;   /* not a load begun here */
+        Slot& s = slot_[(size_t)k];
+        if (!ok || s.cancel || lent_) {
+            host_->drop(k);
+            settle(k);
+            continue;
+        }
+        s.st = St::Landed;
+    }
+    for (int k = 0; k < n(); ++k) {
+        Slot& s = slot_[(size_t)k];
+        if (s.st == St::Landed) {
+            if (lent_) {
+                host_->drop(k);
+                settle(k);
+                continue;
+            }
+            if (host_->copy(k) < 0) {
+                host_->drop(k);
+                settle(k);
+                continue;
+            }
+            s.st = St::Copying;
+        }
+        if (s.st != St::Copying) continue;
+        const int q = host_->copied(k);
+        if (q == 0) continue;
+        host_->drop(k);
+        if (q < 0 || s.cancel || lent_) {
+            settle(k);
+            continue;
+        }
+        host_->publish(k, true);
+        s.st = St::Resident;
+        ++st_.reloaded;
+    }
+}
+
+/* Loads for the slots that want one, as far as the host has buffers. */
+void RingLender::pump() {
+    for (int k = 0; k < n(); ++k) {
+        Slot& s = slot_[(size_t)k];
+        if (s.st != St::Want) continue;
+        const int r = host_->load(k);
+        if (r == 0) continue;
+        if (r < 0) {
+            s.st = St::Failed;
+            ++st_.failed;
+            continue;
+        }
+        s.st = St::Reading;
+        s.cancel = false;
+    }
+}
+
+int RingLender::begin_pass(bool p1, int64_t now_ms) {
+    if (!host_) return 0;
+    if (p1) {
+        int withdrawn = 0;
+        for (int k = 0; k < n(); ++k) {
+            Slot& s = slot_[(size_t)k];
+            switch (s.st) {
+            case St::Resident:
+                host_->publish(k, false);
+                ++withdrawn;
+                s.st = St::Idle;
+                break;
+            case St::Landed:
+                host_->drop(k);
+                ++st_.cancelled;
+                s.st = St::Idle;
+                break;
+            case St::Reading:
+            case St::Copying:
+                s.cancel = true;
+                break;
+            default:
+                s.st = St::Idle;
+                break;
+            }
+        }
+        if (!lent_) ++st_.lends;
+        st_.withdrawn += (uint64_t)withdrawn;
+        lent_ = true;
+        any_p1_ = true;
+        last_p1_ = now_ms;
+        poll();   /* overtaken loads and copies that have ended give their buffers back */
+        return withdrawn ? 1 : 0;
+    }
+    if (lent_) {
+        if (any_p1_ && now_ms - last_p1_ < grace_) {
+            ++st_.held_back;
+            poll();
+            return 0;
+        }
+        lent_ = false;
+        ++st_.returns;
+        for (Slot& s : slot_)
+            if (s.st == St::Idle || s.st == St::Failed) s.st = St::Want;
+    }
+    poll();
+    pump();
+    return 0;
+}
+
+void RingLender::end_p1(int64_t now_ms) {
+    any_p1_ = true;
+    last_p1_ = now_ms;
+}
+
 /* ---- the engine's side ------------------------------------------------------------------------------ */
 namespace {
 uint64_t ns_since(std::chrono::steady_clock::time_point t0) {
@@ -372,6 +524,7 @@ constexpr int kWaveRows = 96;   /* wave table rows a parity: a wave a touched ex
 }  /* namespace */
 
 CardExpertPath::~CardExpertPath() {
+    lend_stop();
     {
         std::lock_guard<std::mutex> lk(mu_);
         stop_ = true;
@@ -790,6 +943,172 @@ int CardExpertPath::end_pass(RadStream s, RadEvent end) {
     return rc < 0 ? (rc == -1 ? RAD_E_STATE : rc) : RAD_OK;
 }
 
+/* ---- the lent ring's host ---------------------------------------------------------------------------- */
+int CardExpertPath::lend_init(const std::vector<LendUnit>& units, const std::vector<int>& ring_slots,
+                              int64_t grace_ms, std::string* why) {
+    auto no = [&](const std::string& w) { if (why) *why = w; return RAD_E_INVAL; };
+    if (!on_ || lending()) return no("the card path is not on, or lends already");
+    const int n = (int)units.size();
+    if (n < 1 || n > ds41p1::kMaxLend || (int)ring_slots.size() != n)
+        return no("a lent ring of " + std::to_string(n) + " slots");
+    std::vector<uint8_t> used((size_t)st_.n_slots(), 0);
+    for (int k = 0; k < n; ++k) {
+        const int r = ring_slots[(size_t)k];
+        if (r < 0 || r >= st_.n_slots() || used[(size_t)r]++) return no("lent ring slot " + std::to_string(r));
+        const LendUnit& u = units[(size_t)k];
+        for (int i = 0; i < 2; ++i)
+            if (u.off[i] < 0 || u.bytes[i] <= 0 || u.off[i] + u.bytes[i] > ds41p1::kSlotBytes)
+                return no("lent unit " + std::to_string(u.unit) + " does not fit a ring slot");
+    }
+    lu_ = units;
+    lring_ = ring_slots;
+    lev_.assign((size_t)n, -1);
+    lsrc_.assign((size_t)n, -2);
+    lhu_.clear();
+    for (int k = 0; k < n; ++k) {
+        lhu_.emplace_back(new Mover::HostUnit());
+        lev_[(size_t)k] = event_create(true);
+        if (lev_[(size_t)k] < 0) return no("could not create the lent ring's events");
+    }
+    for (int b = 0; b < 2; ++b) {
+        uint8_t* buf = (uint8_t*)rad_dev_alloc(ds41p1::kSlotBytes, RAD_MEM_HOST_PINNED);
+        if (!buf) return no("no pinned memory for the lent ring's two reload buffers");
+        lbuf_.push_back(buf);
+        lplanes_.emplace_back(new Mover::HostPlanes());
+        lbuf_free_.push_back(b);
+    }
+    if (lend_.init(this, n, grace_ms) < 0) return no("the lent ring's state");
+    lstop_ = false;
+    lth_ = std::thread(&CardExpertPath::lend_loop, this);
+    return RAD_OK;
+}
+
+/* The reload thread: a unit's two extents read whole from the container (Mover::read_piece, beside the
+ * kept readers), relaid into the reload buffer in the unit's layout (Mover::relay_unit_block). */
+void CardExpertPath::lend_loop() {
+    for (;;) {
+        std::pair<int, int> job;
+        {
+            std::unique_lock<std::mutex> lk(lmu_);
+            lcv_.wait(lk, [&] { return lstop_ || !lq_.empty(); });
+            if (lstop_) return;
+            job = lq_.front();
+            lq_.pop_front();
+        }
+        const int k = job.first, b = job.second;
+        Mover::HostPlanes& p = *lplanes_[(size_t)b];
+        p.unit = lu_[(size_t)k].unit;
+        const auto t0 = std::chrono::steady_clock::now();
+        PlaneExtent ext[2];
+        bool ok = mover_->lay_out_unit_planes(&p, ext) && mover_->source_epochs_current();
+        for (int i = 0; ok && i < 2; ++i) ok = mover_->read_piece(ext[i].file, ext[i].off, ext[i].len, ext[i].dst, ext[i].cap) >= 0;
+        ok = ok && mover_->relay_unit_block(p, lbuf_[(size_t)b], ds41p1::kSlotBytes) >= 0;
+        const uint64_t took = ns_since(t0);
+        {
+            std::lock_guard<std::mutex> lk(lmu_);
+            ldone_.push_back({ k, ok });
+            ++c_.lend_drive;
+            c_.lend_drive_ns += took;
+            c_.lend_read_failed += !ok;
+        }
+    }
+}
+
+void CardExpertPath::lend_stop() {
+    {
+        std::lock_guard<std::mutex> lk(lmu_);
+        lstop_ = true;
+    }
+    lcv_.notify_all();
+    if (lth_.joinable()) lth_.join();
+    /* A copy still in flight reads its source until its event passes. */
+    for (size_t k = 0; k < lsrc_.size(); ++k) {
+        if (lsrc_[k] == -2) continue;
+        if (lev_[k] >= 0 && (size_t)lev_[k] < ev_.size() && ev_[(size_t)lev_[k]]) (void)rad_event_sync(ev_[(size_t)lev_[k]]);
+        if (lsrc_[k] == -1 && mover_) mover_->release_host_unit(lhu_[k].get());
+        lsrc_[k] = -2;
+    }
+    for (uint8_t* b : lbuf_)
+        if (b) rad_dev_free(b, RAD_MEM_HOST_PINNED);
+    lbuf_.clear();
+}
+
+int CardExpertPath::load(int k) {
+    if (k < 0 || k >= (int)lu_.size() || lsrc_[(size_t)k] != -2) return -1;
+    /* The RAM cache in the card's block form: its lease is the source, landed at once. */
+    if (!mover_->packed_cache()) {
+        Mover::HostUnit& hu = *lhu_[(size_t)k];
+        if (mover_->borrow_host_unit(lu_[(size_t)k].unit, &hu, false)) {
+            bool fit = hu.n == 2 && !hu.packed;
+            for (int i = 0; fit && i < 2; ++i) fit = hu.dev[i] && hu.bytes[i] == lu_[(size_t)k].bytes[i];
+            if (fit) {
+                lsrc_[(size_t)k] = -1;
+                std::lock_guard<std::mutex> lk(lmu_);
+                ldone_.push_back({ k, true });
+                ++c_.lend_ram;
+                return 1;
+            }
+            mover_->release_host_unit(&hu);
+        }
+    }
+    std::lock_guard<std::mutex> lk(lmu_);
+    if (lbuf_free_.empty()) return 0;
+    const int b = lbuf_free_.back();
+    lbuf_free_.pop_back();
+    lsrc_[(size_t)k] = b;
+    lq_.push_back({ k, b });
+    lcv_.notify_all();
+    return 1;
+}
+
+int CardExpertPath::landed(bool* ok) {
+    std::lock_guard<std::mutex> lk(lmu_);
+    if (ldone_.empty()) return -1;
+    const std::pair<int, bool> d = ldone_.front();
+    ldone_.pop_front();
+    *ok = d.second;
+    return d.first;
+}
+
+int CardExpertPath::copy(int k) {
+    if (k < 0 || k >= (int)lu_.size()) return RAD_E_INVAL;
+    char* const at = ring_ + (int64_t)lring_[(size_t)k] * ds41p1::kSlotBytes;
+    const LendUnit& u = lu_[(size_t)k];
+    RadCopySeg segs[2];
+    int n = 0;
+    if (lsrc_[(size_t)k] == -1) {   /* the lease, weight by weight in the unit's order */
+        const Mover::HostUnit& hu = *lhu_[(size_t)k];
+        for (int i = 0; i < 2; ++i) segs[n++] = { hu.dev[i], at + u.off[i], hu.bytes[i] };
+    } else if (lsrc_[(size_t)k] >= 0) {   /* the reload buffer, laid out as the slot */
+        segs[n++] = { lbuf_[(size_t)lsrc_[(size_t)k]], at, ds41p1::kSlotBytes };
+    } else {
+        return RAD_E_STATE;
+    }
+    return mover_->ring_copy(segs, n, nullptr, 0, ev_[(size_t)lev_[(size_t)k]]);
+}
+
+int CardExpertPath::copied(int k) {
+    if (k < 0 || k >= (int)lu_.size()) return RAD_E_INVAL;
+    return rad_event_query(ev_[(size_t)lev_[(size_t)k]]);
+}
+
+void CardExpertPath::drop(int k) {
+    if (k < 0 || k >= (int)lu_.size()) return;
+    const int src = lsrc_[(size_t)k];
+    lsrc_[(size_t)k] = -2;
+    if (src == -1) {
+        mover_->release_host_unit(lhu_[(size_t)k].get());
+    } else if (src >= 0) {
+        std::lock_guard<std::mutex> lk(lmu_);
+        lbuf_free_.push_back(src);
+    }
+}
+
+void CardExpertPath::publish(int k, bool on) {
+    if (k < 0 || k >= (int)lu_.size()) return;
+    mover_->set_ring_resident(lu_[(size_t)k].unit, on ? ring_ + (int64_t)lring_[(size_t)k] * ds41p1::kSlotBytes : nullptr);
+}
+
 /* ---- the drive's pipeline ---------------------------------------------------------------------------- */
 void CardExpertPath::landed(void* ctx, int i) {
     LandCtx& c = *(LandCtx*)ctx;
@@ -965,7 +1284,19 @@ std::string CardExpertPath::stats_line(int rank) const {
                   (c_.packed_units + c_.block_units) ? (double)c_.pack_ns * 1e-6 / (double)(c_.packed_units + c_.block_units) : 0.0,
                   c_.packed_units, c_.block_units, (double)c_.ready_wait_ns * 1e-9, c_.admitted, c_.leases_at_end,
                   c_.verified, c_.differ, c_.verify_skipped);
-    return buf;
+    std::string line = buf;
+    if (lending()) {
+        const RingLender::Stats& l = lend_.stats();
+        std::snprintf(buf, sizeof buf,
+                      "; lent ring: %d slots, %d residents now; %" PRIu64 " card-path bursts took them back (%" PRIu64
+                      " residents withdrawn), %" PRIu64 " returns, %" PRIu64 " reloaded (RAM cache %" PRIu64 ", drive %" PRIu64
+                      " at %.1f ms a unit), %" PRIu64 " failed, %" PRIu64 " overtaken, %" PRIu64 " passes held back by the grace",
+                      lend_.n(), lend_.residents(), l.lends, l.withdrawn, l.returns, l.reloaded, c_.lend_ram, c_.lend_drive,
+                      c_.lend_drive ? (double)c_.lend_drive_ns * 1e-6 / (double)c_.lend_drive : 0.0, l.failed, l.cancelled,
+                      l.held_back);
+        line += buf;
+    }
+    return line;
 }
 
 }  /* namespace p1 */

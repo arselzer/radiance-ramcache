@@ -79,11 +79,13 @@ struct Tunables {
     int  ahead = ds41p1::kDefAhead;
     int  verify = 0;
     int  min_rows = ds41p1::kDefMinRows;
+    int  lend = 0;
+    int  grace_ms = ds41p1::kDefGraceMs;
     bool align_end = true;
 };
 /* The tunables from `get` (getenv for the engine): each a whole number in its range (wave 1-16,
- * inflight 1-64, ready 1-32, ahead 0-64, verify 0-4096, min_rows 17-4096), align "end" or "start".
- * False with the reason on anything else. */
+ * inflight 1-64, ready 1-32, ahead 0-64, verify 0-4096, min_rows 17-4096, lend 0-64, grace_ms
+ * 0-60000), align "end" or "start". False with the reason on anything else. */
 bool parse_tunables(const std::function<const char*(const char*)>& get, Tunables* t, std::string* why);
 
 /* ---- the scheduling -------------------------------------------------------------------------------- */
@@ -204,6 +206,93 @@ private:
     void poll();
 };
 
+/* ---- the lent ring --------------------------------------------------------------------------------
+ *
+ * Under RADIANCE_EXPERIMENTAL_DS41_P1_LEND=K the ring's slots past the file stager's own two (the ones
+ * its aliases name: B1's share) hold K file-tier units as decode residents between the card path's
+ * passes: the hottest by the profile, each in a slot of its own, published there once its bytes are
+ * in (Mover::set_ring_resident) and from then on computed by the plugin's own ops like any VRAM
+ * resident, never aliased or handed to the CPU. A pass that arms the card path takes the slots back
+ * before the run phase brings its weight tables up to date: each resident is published as a file-tier
+ * unit again, which the card path or the CPU path then takes as it does any other, and the pass's
+ * first ring copy waits on the residents' last reader (an event behind the pass before it). Once
+ * RADIANCE_EXPERIMENTAL_DS41_P1_GRACE_MS have passed since the card path's last pass, the units are
+ * reloaded in the background, so back-to-back prompts do not reload between them: from the RAM cache
+ * where it holds the card's block form, else read from the drive and relaid into one of two pinned
+ * buffers by a reload thread, then copied into their slots on the DMA lane, behind the card path's
+ * last ring reader. Each is published again at a later pass's start, once the host has seen its copy
+ * pass. Until then it is non-resident and the CPU path takes it; a reload that fails leaves it there
+ * until the next return. A copy begun before the slots were taken back runs before the card path's
+ * own copies (one DMA lane) and is never published. Residency moves, bytes do not: every unit is
+ * computed from the same bytes wherever it is, so replies stay byte-identical.
+ *
+ * RingLender is the state machine alone, against LendHost (tests/p1_stager_test.cpp drives it with
+ * random landings, copy completions and failures); CardExpertPath is the engine's LendHost. */
+class LendHost {
+public:
+    virtual ~LendHost() = default;
+    /* Lent slot k's unit read for its slot in the background: 1 begun, 0 not now (every reload
+     * buffer busy), < 0 not possible (the unit stays on the CPU path). */
+    virtual int  load(int k) = 0;
+    /* A begun load that landed since the last call: its slot (and *ok whether it read), or -1. */
+    virtual int  landed(bool* ok) = 0;
+    /* Slot k's landed bytes copied into its ring slot on the DMA lane, an event recorded after. */
+    virtual int  copy(int k) = 0;
+    /* Slot k's copy: 1 passed, 0 not yet, < 0 an error. */
+    virtual int  copied(int k) = 0;
+    /* Slot k's landed bytes may go (its buffer back to the reload thread, or its RAM-cache lease). */
+    virtual void drop(int k) = 0;
+    /* Slot k's unit published at its ring slot (on), or as a file-tier unit again (off). */
+    virtual void publish(int k, bool on) = 0;
+};
+
+class RingLender {
+public:
+    struct Stats {
+        uint64_t lends = 0;        /* card-path bursts that took the slots back */
+        uint64_t withdrawn = 0;    /* residents published as file-tier units again for them */
+        uint64_t returns = 0;      /* reload rounds begun after a grace */
+        uint64_t reloaded = 0;     /* units published at their slots */
+        uint64_t failed = 0;       /* loads or copies that failed: their units left on the CPU path */
+        uint64_t cancelled = 0;    /* loads or copies a card-path pass overtook, never published */
+        uint64_t held_back = 0;    /* passes that found the grace still running */
+    };
+    /* n slots (1..ds41p1::kMaxLend), the grace in ms. Every slot starts empty and lent, as after a
+     * card-path pass long ago: the first pass that does not arm the card path begins the reloads. */
+    int  init(LendHost* host, int n, int64_t grace_ms);
+    int  n() const { return (int)slot_.size(); }
+    /* A pass begins at now_ms; p1: it arms the card path. With p1 every resident is published as a
+     * file-tier unit again and every load or copy in flight is cancelled; returns 1 when some resident
+     * was (the pass's first ring copy must wait on the residents' last reader). Without, once the grace
+     * has run out the reloads begin; landed loads are copied, passed copies published, and further
+     * loads begun as buffers come free. Never fails: a host call that fails leaves its unit on the CPU
+     * path. */
+    int  begin_pass(bool p1, int64_t now_ms);
+    /* A pass that armed the card path ended at now_ms: the grace runs from here. */
+    void end_p1(int64_t now_ms);
+    bool lent() const { return lent_; }
+    int  residents() const;
+    /* Slots holding a buffer or lease (a load in flight, landed, or a copy in flight). */
+    int  busy() const;
+    bool resident(int k) const { return k >= 0 && k < n() && slot_[(size_t)k].st == St::Resident; }
+    const Stats& stats() const { return st_; }
+
+private:
+    /* Idle: not resident and nothing wanted (lent, or nothing yet). Want: a reload wanted, not begun
+     * (no buffer). Reading: begun; Landed: its bytes in; Copying: its copy queued. cancel: a reading
+     * or copying slot a card-path pass overtook, which goes back to Idle or Want once it ends. */
+    enum class St : uint8_t { Idle, Want, Reading, Landed, Copying, Resident, Failed };
+    struct Slot { St st = St::Idle; bool cancel = false; };
+    LendHost* host_ = nullptr;
+    std::vector<Slot> slot_;
+    int64_t grace_ = 0, last_p1_ = 0;
+    bool lent_ = true, any_p1_ = false;
+    Stats st_;
+    void settle(int k);
+    void poll();
+    void pump();
+};
+
 /* ---- the engine's side ----------------------------------------------------------------------------
  *
  * One a rank, owned by its FileStager. The real Device: the ring's events, the mover's copy lists,
@@ -213,7 +302,7 @@ private:
  * each landed unit the layer wants into a pinned ready slot (Mover::pack_unit_for_ring), and the
  * issuing thread copies it to the ring. Units read ahead for the next layer wait, read, for that
  * layer's choice. */
-class CardExpertPath final : public Device {
+class CardExpertPath final : public Device, public LendHost {
 public:
     using PlanesGet = std::function<std::shared_ptr<Mover::HostPlanes>(int32_t unit)>;
     using Insert = std::function<void(std::shared_ptr<Mover::HostPlanes> p, int rows)>;
@@ -227,6 +316,7 @@ public:
     int  ring_slots() const { return st_.n_slots(); }
     const Tunables& tunables() const { return t_; }
     const void* alias_base() const { return alias_; }
+    const char* ring_base() const { return ring_; }
 
     /* An armed pass of `rows` tokens begins; `hand_over` (null entries skipped): events behind the
      * last readers of the file buffers before it, which the first copy waits on. */
@@ -261,6 +351,26 @@ public:
     int  run(RadStream s);
     bool layer_open() const { return st_.layer_open(); }
 
+    /* ---- the lent ring (RingLender's host) ----
+     * lend_init: units[k] (its two weights' offsets and sizes in the unit's layout, as the plan lays it
+     * out) lent ring slot ring_slots[k]; their reloads begin at the first pass that does not arm the
+     * card path. < 0 with *why when it cannot run (the caller refuses the switch then). */
+    struct LendUnit { int32_t unit = -1; int64_t off[2] = { 0, 0 }, bytes[2] = { 0, 0 }; };
+    int  lend_init(const std::vector<LendUnit>& units, const std::vector<int>& ring_slots, int64_t grace_ms,
+                   std::string* why);
+    bool lending() const { return lend_.n() > 0; }
+    RingLender& lender() { return lend_; }
+    const RingLender& lender() const { return lend_; }
+    int  lend_ring_slot(int k) const { return k >= 0 && k < (int)lring_.size() ? lring_[(size_t)k] : -1; }
+    int32_t lend_unit(int k) const { return k >= 0 && k < (int)lu_.size() ? lu_[(size_t)k].unit : -1; }
+    /* LendHost */
+    int  load(int k) override;
+    int  landed(bool* ok) override;
+    int  copy(int k) override;
+    int  copied(int k) override;
+    void drop(int k) override;
+    void publish(int k, bool on) override;
+
     /* Device */
     int  event_create(bool host) override;
     int  copy(int slot, const Source& src, int wait, int done) override;
@@ -278,6 +388,9 @@ public:
         uint64_t wait_drive_ns = 0, pack_ns = 0, packed_units = 0, block_units = 0, ready_wait_ns = 0;
         uint64_t admitted = 0, leases_at_end = 0;
         uint64_t verified = 0, differ = 0, verify_skipped = 0;   /* FileStager::p1_verify's */
+        /* The lent ring's reloads: from the RAM cache, read from the drive (and the reload thread's
+         * time in them), failed reads. */
+        uint64_t lend_ram = 0, lend_drive = 0, lend_drive_ns = 0, lend_read_failed = 0;
     };
     Counts& counts_mut() { return c_; }
     const Counts& counts() const { return c_; }
@@ -345,6 +458,25 @@ private:
     void packer_loop();
     static void landed(void* ctx, int i);
     int  drop_all();
+    /* The lent ring: by lent slot its unit, ring slot, copy event (host) and source (a reload buffer,
+     * -1 its RAM-cache lease in lhu_, -2 none); the two pinned reload buffers, each with planes for
+     * the drive's read; the reload thread's queue (lent slot, buffer) and what it landed. lmu_ guards
+     * lbuf_free_, lq_ and ldone_. */
+    RingLender lend_;
+    std::vector<LendUnit> lu_;
+    std::vector<int> lring_, lev_, lsrc_;
+    std::vector<std::unique_ptr<Mover::HostUnit>> lhu_;
+    std::vector<uint8_t*> lbuf_;
+    std::vector<std::unique_ptr<Mover::HostPlanes>> lplanes_;
+    std::vector<int> lbuf_free_;
+    std::deque<std::pair<int, int>> lq_;
+    std::deque<std::pair<int, bool>> ldone_;
+    std::mutex lmu_;
+    std::condition_variable lcv_;
+    bool lstop_ = false;
+    std::thread lth_;
+    void lend_loop();
+    void lend_stop();
 };
 
 }  /* namespace p1 */

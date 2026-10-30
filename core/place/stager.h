@@ -626,6 +626,15 @@ private:
     struct P1Ops { int32_t sw = -1, dn = -1; };
     std::vector<P1Ops> p1_ops_;          /* by routed layer */
     RadEvent p1_end_ = nullptr;          /* behind an armed pass's last reader of the ring */
+    /* The lent ring (card_expert_stager.h, RingLender; ..._P1_LEND): behind the last pass that read a
+     * ring resident, recorded at its end; an armed pass's first ring copy waits on it. */
+    RadEvent p1_lend_ev_ = nullptr;
+    bool     p1_lend_rec_ = false;
+    int  p1_lend_init(const p1::Tunables& t, std::string* why);
+    static int64_t p1_now_ms() {
+        return (int64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
     std::vector<int32_t> p1_nonres_, p1_ahead_;
     /* By routed layer: its routed units the plan pinned in the host pool, which the card would read
      * across the link once a row pass; an armed layer copies the selected ones to the ring as it does

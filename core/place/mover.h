@@ -817,7 +817,18 @@ public:
      *                   behind each of `waits` (null entries skipped), and records `done` after them.
      * mover_wait        the mover's stream waits on `ev` (a hand-over: copies queued later run
      *                   behind it).
-     * file_unit_in_slab a file-tier unit the slab holds: published at its slab slot, never aliased.
+     * file_unit_in_slab a file-tier unit the slab or a ring slot holds (set_ring_resident): published
+     *                   at its slot, never aliased.
+     * set_ring_resident the lent ring (card_expert_stager.h, RingLender): file-tier unit u, whose bytes
+     *                   were copied into `slot` (a ring slot of the file region, laid out as the unit is:
+     *                   weight i at its offset) and whose copy the host has seen pass, published there
+     *                   and from then on a resident -- never aliased, staged or borrowed -- until
+     *                   set_ring_resident(u, nullptr) makes it a file-tier unit again (published as
+     *                   null; its layer's passes stage or alias it as any other). The issuing thread
+     *                   only, between passes; ring_resident may be asked from any thread.
+     * relay_unit_block  one missed unit's planes in the stored block form, each weight at its offset in
+     *                   the unit, into `dst` (cap bytes, at least the unit's): the bytes a VRAM copy of
+     *                   the unit holds. Pure and thread-safe (the lent ring's reload thread).
      * pack_unit_for_ring one missed unit's planes into `dst` (cap bytes, at least ds41p1::kSlotBytes)
      *                   as a ring slot holds it: gate_up at 0, down at ds41p1::kDnOff; in the packed
      *                   RAM cache's form (pack_planes with the cache's raw budgets and its round-trip
@@ -831,8 +842,14 @@ public:
     int   ring_copy(const RadCopySeg* segs, int n, const RadEvent* waits, int n_waits, RadEvent done);
     int   mover_wait(RadEvent ev);
     bool  file_unit_in_slab(int32_t u) const {
-        return u >= 0 && (size_t)u < unit_.size() && unit_[(size_t)u].slab_slot >= 0;
+        return u >= 0 && (size_t)u < unit_.size() && (unit_[(size_t)u].slab_slot >= 0 || ring_resident(u));
     }
+    void  set_ring_resident(int32_t u, char* slot);
+    bool  ring_resident(int32_t u) const {
+        return ring_res_ && u >= 0 && (size_t)u < unit_.size() &&
+               ring_res_[(size_t)u].load(std::memory_order_relaxed) != nullptr;
+    }
+    int   relay_unit_block(const HostPlanes& p, uint8_t* dst, int64_t cap) const;
     int   pack_unit_for_ring(const HostPlanes& p, uint8_t* dst, int64_t cap, bool* packed,
                              int64_t bytes[2]) const;   /* bytes: gate_up's and down's, as written */
     char* file_buffer(int i) const {
@@ -1072,6 +1089,14 @@ private:
     /* The packed cache (packed_cache()): each class's raw-round budget, and its outcomes. */
     int  packed_raw_[2] = { 0, 0 };
     std::unique_ptr<std::atomic<uint8_t>[]> packed_refused_;   /* by unit: refused once already */
+    /* By unit: the ring slot a lent-ring resident is published at (set_ring_resident), or null. Atomic
+     * because the read-ahead threads ask (ring_resident); only the issuing thread writes. */
+    std::unique_ptr<std::atomic<char*>[]> ring_res_;
+    /* A file-tier unit with no address of its own on the card: neither in a slab slot nor a ring
+     * resident. What the file stager's reads, aliases and borrows take. */
+    bool file_off_card(int32_t u, const UnitState& us) const {
+        return us.tier == Tier::SSD && us.slab_slot < 0 && us.klass >= 0 && !ring_resident(u);
+    }
     std::atomic<uint64_t> packed_inserts_{0}, packed_over_budget_{0}, packed_over_budget_units_{0},
                           packed_round_trip_failed_{0};
     int  insert_unit_packed(const HostPlanes& p, const ds41hx::PackCopy* copy);

@@ -7969,8 +7969,11 @@ TEST(eors_counts_the_hits_that_resume_from_an_end_of_request_snapshot) {
     }
 }
 
-/* The trim after a publish spares the conversation just published: a plain trim reaches its end
- * first (a chain is touched deepest first) and with it the snapshot its next turn resumes from. */
+/* The trim after a publish is trim_except over the chain just published, before the sequence is
+ * freed: the entries the request recomputed rather than adopted stay, which a plain trim takes
+ * once the live sequences hold more than three quarters of the pool, cutting the chain below its
+ * new snapshot (mem_test trim_except_keeps_the_entries_a_resumed_turn_recomputed). Without the
+ * switch, a plain trim. */
 TEST(eors_trim_after_a_publish_spares_the_chain_published) {
     for (const bool on : { false, true }) {
         Fixture f;

@@ -817,10 +817,11 @@ private:
      * however short it is. The deepest stands when the request ends: at most grid - 1 tokens below
      * its last computed position, and the next turn resumes there and recomputes the cold run's own
      * chunks from it. Such a step is never issued ahead (step_next_locked): its key hashes the
-     * token the step before samples. The trim after a publish spares the chain just published.
-     * Exact where a row computed alone (decode) has the bits of the same row in a prefill pass of
-     * up to --max-num-batched-tokens rows: see the exactness argument in scheduler.cpp
-     * ("end-of-request snapshots", at init). */
+     * token the step before samples. The trim after a publish keeps the entries of the chain just
+     * published that the request recomputed rather than adopted (trim_prefix_cache). Exact where a
+     * row computed alone (decode) has the bits of the same row in a prefill pass of up to
+     * --max-num-batched-tokens rows: see the exactness argument in scheduler.cpp ("end-of-request
+     * snapshots", at init). */
     bool    eors_ = false;
     /* The throughput window (step_finished): each kind's tokens and the wall time the steps
      * covered, both decayed with the same time constant, so their ratio is tokens over time. */
@@ -872,7 +873,8 @@ private:
     const Request* live_req(int32_t slot, uint64_t id) const;
     void preempt_back();
     /* Give blocks back from the prefix cache until the pool has headroom again. With `spare`
-     * (end-of-request snapshots on), the first `spare_tokens` of that request's chain stay. */
+     * (end-of-request snapshots on; before its sequence is freed), the first `spare_tokens` of that
+     * request's chain stay, the entries it recomputed rather than adopted among them. */
     void trim_prefix_cache(const Request* spare = nullptr, int64_t spare_tokens = 0);
     /* RAD_OK, or a negative status when the request cannot be admitted now, nor anything behind
      * it. `reserve`: tokens of the step to leave for the requests queued behind this one

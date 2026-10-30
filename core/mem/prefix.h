@@ -275,11 +275,20 @@ public:
      * blocks_per_entry(i) blocks of cached group i. */
     int64_t trim(int64_t n_entries);
     /* trim(), sparing the chain of the first `n_tokens` of `tokens` (whole entries): the
-     * conversation a request just published, whose next turn resumes at its deepest snapshot, the
-     * end of that chain (RADIANCE_EXPERIMENTAL_PREFIX_EORS). A plain trim takes the least recently
-     * used entries first, and a chain is touched deepest first, so a conversation larger than
-     * three quarters of the pool would lose its own end, and with it that snapshot, right after
-     * its publish. An admission that needs the blocks still gets them (evict_lru). */
+     * conversation a request just published, whose next turn resumes at its deepest snapshot
+     * (RADIANCE_EXPERIMENTAL_PREFIX_EORS). Called before the closing request frees its sequence,
+     * so most of that chain is safe from a plain trim anyway: every block the sequence holds is
+     * shared with it, and trim skips those. What a plain trim could take is the chain's entries
+     * the sequence does not hold: the ones it recomputed rather than adopted (those between the
+     * snapshot it resumed from and the end of its hit, whose first-published copy the cache keeps
+     * and nothing else holds; a grid less one entry at most when it resumed at its predecessor's
+     * last snapshot, 7 two-token entries on ds41), and taking them would cut the chain below its
+     * new snapshot. That happens only once every other entry the trim may take is gone: when the
+     * live sequences hold more than three quarters of the pool. The chain's entries stay where
+     * they are, in their order (its end first) for later trims; Stats::trim_spared counts those a
+     * plain trim would have taken. It protects nothing once the sequence is freed: other sessions'
+     * trims and admissions (evict_lru) take an idle conversation as any entries, least recently
+     * used first and its end first; the host tier is what keeps it under pressure. */
     int64_t trim_except(const std::vector<int32_t>& tokens, const std::vector<MMContentKey>& mm,
                         int64_t n_tokens, int64_t n_entries);
     /* Give up every VRAM copy that costs nothing to drop: host copy landed and no running sequence
@@ -445,7 +454,8 @@ public:
          * snapshots a full store gave up as the least recently used session's
          * (RADIANCE_EXPERIMENTAL_PREFIX_SESSION_LRU), a subset of ckpt_lru. */
         int64_t ckpt_eors = 0, ckpt_eors_hits = 0, ckpt_peak = 0, ckpt_session_lru = 0;
-        /* Entries trim_except left in place for the chain just published. */
+        /* Entries of the chain just published that trim_except kept and a plain trim would have
+         * taken: the closing request's recomputed ones (trim_except); 0 while the pool has room. */
         int64_t trim_spared = 0;
     };
     const Stats& stats() const { return stats_; }
@@ -488,9 +498,11 @@ private:
                                      const std::vector<MMContentKey>& mm,
                                      int64_t n_blocks) const;
     void touch(const BlockHash& h, uint64_t now_ns) const;
-    /* trim(), leaving the entries in `spare` (when given) where they are. */
+    /* trim(), leaving the entries in `spare` (when given) where they are; `spared`, when given,
+     * gets the number of those a plain trim would have taken (trim_except). */
     int64_t trim_sparing(int64_t n_entries,
-                         const std::unordered_set<BlockHash, BlockHashHash>* spare);
+                         const std::unordered_set<BlockHash, BlockHashHash>* spare,
+                         int64_t* spared = nullptr);
     /* A live sequence also holds one of this entry's blocks, so releasing it frees nothing. */
     bool shared_with_live(const Entry& e) const;
     /* Whether `e` holds the block_size_ token ids at `src`, so a hash collision is a miss. */

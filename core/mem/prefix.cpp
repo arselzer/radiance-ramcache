@@ -662,27 +662,21 @@ int64_t PrefixCache::trim_except(const std::vector<int32_t>& tokens,
     const std::vector<BlockHash> hs = chain_all(tokens, mm, n / block_size_);
     if (hs.empty()) return trim_sparing(n_entries, nullptr);
     const std::unordered_set<BlockHash, BlockHashHash> spare(hs.begin(), hs.end());
-    const int64_t done = trim_sparing(n_entries, &spare);
-    /* The spared chain's entries a plain trim would have taken: as many of the rest as it was
-     * short, the chain's first in the order the walk reaches them. */
-    if (done < n_entries) {
-        int64_t spared = 0;
-        for (const BlockHash& h : lru_) {
-            if (spared >= n_entries - done) break;
-            auto m = map_.find(h);
-            if (spare.count(h) && m != map_.end() && !shared_with_live(m->second)) ++spared;
-        }
-        stats_.trim_spared += spared;
-    }
+    int64_t spared = 0;
+    const int64_t done = trim_sparing(n_entries, &spare, &spared);
+    stats_.trim_spared += spared;
     return done;
 }
 
 int64_t PrefixCache::trim_sparing(int64_t n_entries,
-                                  const std::unordered_set<BlockHash, BlockHashHash>* spare) {
+                                  const std::unordered_set<BlockHash, BlockHashHash>* spare,
+                                  int64_t* spared) {
     /* Tiers attached but off count as no tiers: no copy will ever land, so do not wait for one. */
     const bool keep = tiers_ && tiers_->host_on();
     const uint64_t now = rad_mono_ns();
     int64_t done = 0;
+    /* The entries a plain trim would have taken so far, spared or not: it stops at n_entries. */
+    int64_t takeable = 0;
     auto it = lru_.begin();
     for (int64_t seen = (int64_t)lru_.size(); it != lru_.end() && done < n_entries && seen > 0;
          --seen) {
@@ -690,7 +684,16 @@ int64_t PrefixCache::trim_sparing(int64_t n_entries,
         auto m = map_.find(h);
         if (m == map_.end()) { it = lru_.erase(it); continue; }
         Entry& e = m->second;
-        if (spare && spare->count(h)) { ++it; continue; }
+        if (spare && spare->count(h)) {
+            /* trim_except: counted when a plain trim would take it here (not shared, its copy
+             * landed if one is waited for, and the trim not yet done). Left in place, as the whole
+             * chain is, so it keeps its order, its end first, for the trims after. */
+            if (spared && !shared_with_live(e) && !(keep && demotable_ && !tiers_->droppable(h)) &&
+                takeable++ < n_entries)
+                ++*spared;
+            ++it;
+            continue;
+        }
         if (shared_with_live(e)) {
             /* In use: to the back, as in evict_lru. */
             auto next = std::next(it);
@@ -701,6 +704,7 @@ int64_t PrefixCache::trim_sparing(int64_t n_entries,
         }
         /* Skip an entry whose copy is still in flight; one the tier cannot hold never gets a copy. */
         if (keep && demotable_ && !tiers_->droppable(h)) { ++it; continue; }
+        ++takeable;
         it = lru_.erase(it);
         e.in_lru = false;
         release_blocks(e);

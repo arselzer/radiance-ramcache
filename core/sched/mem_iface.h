@@ -194,8 +194,10 @@ struct IPrefixCache {
      * of entries freed. */
     virtual int64_t trim(int64_t n_entries) = 0;
     /* trim(), sparing the chain of the first `n_tokens` of this request's prompt ++ output: the
-     * conversation it just published (PrefixCache::trim_except; RADIANCE_EXPERIMENTAL_PREFIX_EORS).
-     * A cache that cannot tell chains apart trims as trim() does. */
+     * conversation it just published, before its sequence is freed (PrefixCache::trim_except;
+     * RADIANCE_EXPERIMENTAL_PREFIX_EORS). The sequence's own blocks are safe from a trim anyway;
+     * this keeps the entries it recomputed rather than adopted, whose loss would cut the chain
+     * below its new snapshot. A cache that cannot tell chains apart trims as trim() does. */
     virtual int64_t trim_except(const Request& /*r*/, int64_t /*n_tokens*/, int64_t n_entries) {
         return trim(n_entries);
     }
@@ -262,7 +264,8 @@ struct IPrefixCache {
     /* The snapshot store as the end-of-request counters read it (PrefixCache::Stats): end-of-request
      * snapshots committed and lookups that handed one out, snapshots held now and at most, the
      * snapshots a full store gave up by session (RADIANCE_EXPERIMENTAL_PREFIX_SESSION_LRU), and
-     * the entries a trim spared for the chain just published. */
+     * the entries of a chain just published that its trim kept and a plain trim would have taken
+     * (trim_except: the ones the request recomputed rather than adopted). */
     struct StoreCounts {
         int64_t eors = 0, eors_hits = 0, held = 0, peak = 0, session_lru = 0, trim_spared = 0;
     };

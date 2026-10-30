@@ -315,7 +315,8 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
         /* RADIANCE_EXPERIMENTAL_PREFIX_EORS: end-of-request snapshots reserved and committed,
          * steps not issued ahead for one, and the admissions that resumed from one (their tokens
          * reused, the deepest); the snapshot store's occupancy now and at most, what it gave up by
-         * session (..._SESSION_LRU), and what a publish's trim spared. */
+         * session (..._SESSION_LRU), and the entries a publish's trim kept on the chain it published
+         * that a plain trim would have taken (the ones the request recomputed). */
         o["eors"] = { { "reserved", m.eors_reserved }, { "committed", m.eors_committed },
                       { "ahead_withheld", m.eors_ahead_withheld }, { "hits", m.eors_hits },
                       { "hit_tokens", m.eors_hit_tokens }, { "hit_deepest", m.eors_hit_deepest } };

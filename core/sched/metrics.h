@@ -143,8 +143,9 @@ struct SchedMetrics {
      * those the cache committed (the save landed); steps not issued ahead because they carry one
      * (their tokens are hashed into its key only after the step before commits); admissions that
      * resumed from one, the tokens they reused and the deepest; and the store: snapshots held now
-     * and at most, given up by session (..._SESSION_LRU), and the entries a publish's trim spared
-     * for the conversation it published. All 0 without the switch. */
+     * and at most, given up by session (..._SESSION_LRU), and the entries of the conversation just
+     * published that its trim kept and a plain trim would have taken (the ones the request
+     * recomputed rather than adopted: IPrefixCache::trim_except). All 0 without the switch. */
     int64_t eors_reserved = 0, eors_committed = 0, eors_ahead_withheld = 0;
     int64_t eors_hits = 0, eors_hit_tokens = 0, eors_hit_deepest = 0;
     int64_t store_held = 0, store_peak = 0, store_session_lru = 0, trim_spared = 0;

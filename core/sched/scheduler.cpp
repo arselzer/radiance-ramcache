@@ -193,7 +193,8 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
                      "and every prompt the start of its last chunk, so a conversation's next turn "
                      "resumes at most %lld tokens before the reply's last computed position and "
                      "recomputes the cold run's own chunks from there; such a step is not issued "
-                     "ahead, and the trim after a publish spares the chain just published",
+                     "ahead, and the trim after a publish keeps the entries of the chain just "
+                     "published that the request recomputed rather than adopted",
                      (long long)geo_.grid, (long long)(geo_.grid - 1));
             if (geo_.window_ckpt)
                 RAD_WARN("end-of-request snapshots: a sliding-window model, taken by "
@@ -800,9 +801,14 @@ void Scheduler::trim_prefix_cache(const Request* spare, int64_t spare_tokens) {
         if (blocks > 0) short_by = std::max(short_by, (blocks + per - 1) / per);
     }
     if (short_by <= 0) return;
-    /* End-of-request snapshots: the conversation just published keeps its chain. It is touched
-     * deepest first, so a plain trim reaches its end first, and with that the snapshot its next
-     * turn resumes from, whenever it holds more than three quarters of the pool alone. */
+    /* End-of-request snapshots: the conversation just published keeps its chain whole. The trim
+     * runs before close_request frees the sequence, so the blocks the sequence holds are safe from
+     * any trim; what a plain trim could still take, once the live sequences hold more than three
+     * quarters of the pool, is the chain's entries the request recomputed rather than adopted
+     * (between the snapshot it resumed from and the end of its hit), and that would cut the chain
+     * below its new snapshot (PrefixCache::trim_except). Once idle, the conversation has no such
+     * protection: other sessions' trims and admissions take it least recently used first, its end
+     * first, and the host tier (--prefix-cache-mib) is what keeps it. */
     if (spare && spare_tokens > 0) (void)pc_->trim_except(*spare, spare_tokens, short_by);
     else (void)pc_->trim(short_by);
 }

@@ -7933,7 +7933,8 @@ TEST(a_streamed_op_exists_only_for_a_capable_architecture_and_a_ring) {
  * RADIANCE_EXPERIMENTAL_PREFIX_EORS: the scheduler reserves a decode step's snapshot through
  * PCBinding::reserve_eors_checkpoint, keyed like any other by the chain over prompt ++ output; the
  * cache counts it apart, the next turn's lookup reaches it through the reply and says so
- * (CacheHit::ckpt_eors), and a trim after the publish spares the chain just published. */
+ * (CacheHit::ckpt_eors), and the trim after the publish, before the sequence is freed, keeps the
+ * entries of that chain the request recomputed rather than adopted. */
 TEST(an_end_of_request_snapshot_is_counted_and_the_next_turn_resumes_there) {
     Fixture f;
     REQUIRE_EQ(f.build(/*with_linear=*/true, /*ckpt_slots=*/4), RAD_OK);
@@ -7976,26 +7977,76 @@ TEST(an_end_of_request_snapshot_is_counted_and_the_next_turn_resumes_there) {
     CHECK_EQ(f.pc.stats().ckpt_eors_hits, 1ll);
 }
 
-/* The trim after a publish spares the conversation just published: a plain trim takes the least
- * recently used entries, and a chain is touched deepest first, so it reaches that conversation's
- * end once the older ones are gone; trim_except takes only the others. */
-TEST(trim_except_spares_the_chain_just_published) {
+/* trim_except runs where close_request calls it: before the closing request frees its sequence.
+ * Every block that sequence holds is safe from any trim then (shared with a live sequence), so what
+ * a plain trim can take of the chain just published is the entries the request recomputed rather
+ * than adopted. Here turn 2 resumes at turn 1's snapshot at 160 although the cache holds turn 1's
+ * chain to 192: it recomputes [160, 192) into its own blocks, and the cache keeps the first-published
+ * copies, which nothing else holds. A trim asking for more than the idle conversation beside it
+ * has takes them, cutting the chain at 160 below turn 2's end; trim_except keeps them and counts
+ * them. Once turn 2's sequence is freed nothing protects the conversation: a later trim takes its
+ * end first, as it would take any idle conversation's. */
+TEST(trim_except_keeps_the_entries_a_resumed_turn_recomputed) {
     for (const bool except : { false, true }) {
         Fixture f;
-        CHECK_OK(f.build(/*with_linear=*/false));
-        const auto a = tok_run(7600, 336);
-        const auto b = tok_run(9600, 336);
-        publish(f, 1, a, 320);
+        REQUIRE_EQ(f.build(/*with_linear=*/true, /*ckpt_slots=*/4), RAD_OK);
+        const auto other = tok_run(30000, 96);      /* an idle conversation: 6 entries */
+        publish(f, 9, other, 96);
+        f.kv.free_sequence(9);
+        const auto t1 = tok_run(5000, 192);         /* turn 1: 12 entries, its snapshot at 160 */
+        publish(f, 1, t1, 192);
         f.kv.free_sequence(1);
-        publish(f, 2, b, 320);
+        (void)ckpt_at(f, 1, chain_of(t1), 160);
+        std::vector<int32_t> t2 = t1;               /* turn 2: turn 1 and 128 tokens more */
+        for (int32_t t : tok_run(8000, 128)) t2.push_back(t);
+        std::vector<std::vector<int32_t>> found;
+        f.pc.begin_step();
+        const CacheHit h = f.pc.lookup(t2, {}, &found);
+        CHECK_EQ(h.n_attn_tokens, 192);
+        REQUIRE_EQ(h.n_linear_tokens, 160);
+        REQUIRE_EQ(found.size(), (size_t)1);
+        found[0].resize(10);                         /* it adopts the 10 entries below 160 */
+        CHECK_OK(f.kv.add_sequence(2));
+        CHECK_OK(f.kv.adopt(2, f.pc.cached_groups()[0], found[0], 160));
+        CHECK_OK(f.kv.ensure(2, 320));
+        std::vector<std::vector<int32_t>> bt;
+        for (int32_t g : f.pc.cached_groups()) bt.push_back(f.kv.block_table(2, g));
+        CHECK_OK(f.pc.insert(2, t2, {}, bt, 320));
+        /* The close's trim, before the free, short by more than the idle conversation's 6. */
+        const int64_t took = except ? f.pc.trim_except(t2, {}, 320, 10) : f.pc.trim(10);
+        CHECK_EQ(took, except ? 6ll : 8ll);
+        CHECK_EQ(f.pc.stats().trim_spared, except ? 2ll : 0ll);
         f.kv.free_sequence(2);
-        const int64_t took = except ? f.pc.trim_except(b, {}, 320, 25) : f.pc.trim(25);
-        CHECK_EQ(took, except ? 20ll : 25ll);
-        CHECK_EQ(f.pc.lookup(a, {}).n_attn_tokens, 0);
-        /* b's five deepest entries went in the plain trim; none in trim_except. */
-        CHECK_EQ(f.pc.lookup(b, {}).n_attn_tokens, except ? 320 : 240);
-        CHECK_EQ(f.pc.stats().trim_spared, except ? 5ll : 0ll);
+        std::vector<int32_t> t3 = t2;               /* turn 3 */
+        for (int32_t t : tok_run(12000, 32)) t3.push_back(t);
+        f.pc.begin_step();
+        CHECK_EQ(f.pc.lookup(t3, {}).n_attn_tokens, except ? 320 : 160);
+        CHECK_EQ(f.pc.lookup(other, {}).n_attn_tokens, 0);
+        if (except) {
+            /* Idle now: another session's trim takes the conversation's end first. */
+            CHECK_EQ(f.pc.trim(2), 2ll);
+            f.pc.begin_step();
+            CHECK_EQ(f.pc.lookup(t3, {}).n_attn_tokens, 288);
+            CHECK_EQ(f.pc.stats().trim_spared, 2ll);
+        }
     }
+}
+
+/* With the host tier on, a trim drops only entries whose copy has landed, so trim_except counts as
+ * spared only those a plain trim would have dropped: none while the copies are in flight. */
+TEST(trim_except_counts_only_what_a_plain_trim_would_take) {
+    TierFixture x;
+    CHECK_OK(x.build());
+    const auto b = tok_run(9600, 336);
+    publish(x.f, 2, b, 320);
+    x.f.kv.free_sequence(2);                        /* no copy yet */
+    CHECK_EQ(x.f.pc.trim_except(b, {}, 320, 1000), 0);
+    CHECK_EQ(x.f.pc.stats().trim_spared, 0ll);
+    copy_now(x.t);                                  /* the copies land */
+    CHECK_EQ(x.f.pc.trim_except(b, {}, 320, 5), 0);
+    CHECK_EQ(x.f.pc.stats().trim_spared, 5ll);
+    CHECK_EQ(x.f.pc.lookup(b, {}).n_attn_tokens, 320);
+    CHECK_EQ(x.f.pc.trim(5), 5);                    /* what a plain trim drops */
 }
 
 /* RADIANCE_EXPERIMENTAL_PREFIX_SESSION_LRU: once retention has run, a full store gives up the least

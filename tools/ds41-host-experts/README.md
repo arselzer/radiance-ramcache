@@ -54,6 +54,10 @@ RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MAX_ROWS=16          # prefill: CPU jobs
 RADIANCE_EXPERIMENTAL_DS41_ROUTER_BF16=1                   # routers and compressor kv|gate held as bf16 halves (needs the libr4d whose f32bf16 card checks passed)
 RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED=1                   # VRAM residents in the packed-scale form, ~31 more a card (needs the libr4d whose gemv_vp card check passed)
 RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP=1                # no pass after a reply's end-of-generation token
+RADIANCE_EXPERIMENTAL_DS41_PREFETCH_URGENT=1               # a partly read read-ahead unit's rest read whole in its layer's own read
+RADIANCE_EXPERIMENTAL_DS41_INSERT_SLICE_KIB=256            # background inserts in 256 KiB pieces, waiting for an idle pool
+RADIANCE_EXPERIMENTAL_DS41_PREFETCH_SCORE=int8             # the read-ahead predictor scores in int8, its best 12 again in bf16
+RADIANCE_EXPERIMENTAL_DS41_SIDE_STORE=7                    # up to 7 units a rank the packed cache refuses keep their planes
 
 radiance ... --tp 4 --placement expert_tiered --weights-disk-tier \
   --expert-ram-cache-total-mib 98304 --host-pool-mib 256 --embedding-placement ram \

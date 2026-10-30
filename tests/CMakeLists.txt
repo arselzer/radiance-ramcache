@@ -266,6 +266,13 @@ set_property(TEST host_expert_pool_test APPEND PROPERTY ENVIRONMENT
              "RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_LEAN_TILES=0")
 set_property(TEST host_expert_pool_test_lean APPEND PROPERTY ENVIRONMENT
              "RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_LEAN_TILES=1")
+# ...and once with the wake-up's switches off: the binary sets ..._PREWAKE=2 for its pre-wake case,
+# so the plain entries would otherwise never run the reference cases on the pool as it runs by default.
+rad_unit_test(host_expert_pool_test_wake_off host_expert_pool_test)
+set_property(TEST host_expert_pool_test_wake_off APPEND PROPERTY ENVIRONMENT
+             "RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_LEAN_TILES=0"
+             "RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_PREWAKE=0"
+             "RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_FUTEX=0")
 
 # ================================================================== perf_ cases
 #

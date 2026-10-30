@@ -136,23 +136,19 @@ TEST(host_expert_pool_futex_four_submitters_match_the_reference) {
     CHECK_EQ(p->backlog(), (int64_t)0);
 }
 
-/* Four threads submit one job at a time after a random pause of 0-400 us: the workers' 20 us spin
- * ends in most pauses, so each submit races workers on their way to sleep. Every ticket must finish
- * (a lost wake-up would leave its job queued with every worker asleep) and every row be right. */
-TEST(host_expert_pool_futex_loses_no_wakeup) {
-    HostExpertPool* p = pool();
-    if (!p || !__builtin_cpu_supports("avx2")) { SKIP("no AVX2 or no pool"); return; }
-    if (!p->futex()) { SKIP("..._FUTEX=0 in the environment"); return; }
+/* `threads` threads submit one job at a time after a random pause of 0-400 us: the workers' 20 us
+ * spin ends in most pauses, so each submit races workers on their way to sleep. Every ticket must
+ * finish (a lost wake-up would leave its job queued with every worker asleep) and every row be right. */
+static void no_wakeup_lost(HostExpertPool* p, int kThreads, int kRounds, unsigned seed) {
     const Expert e{ blocks(2 * kFf, kEmbd, 140), blocks(kEmbd, kFf, 141) };
     const auto x = row(142);
     const auto want = reference(e, x);
     const HostExpertPool::Stats s0 = p->stats();
-    constexpr int kThreads = 4, kRounds = 30;
     std::atomic<int> lost{ 0 }, wrong{ 0 };
     std::vector<std::thread> th;
     for (int r = 0; r < kThreads; ++r)
         th.emplace_back([&, r] {
-            std::mt19937 rng(1234u + (unsigned)r);
+            std::mt19937 rng(seed + (unsigned)r);
             std::vector<uint16_t> y(kEmbd);
             for (int i = 0; i < kRounds; ++i) {
                 std::this_thread::sleep_for(std::chrono::microseconds(rng() % 400));
@@ -181,6 +177,22 @@ TEST(host_expert_pool_futex_loses_no_wakeup) {
     CHECK(s1.sleeps > s0.sleeps);           /* the workers did go to sleep between jobs */
     CHECK(s1.submit_woke > s0.submit_woke);   /* and submits woke them */
     CHECK_EQ(p->backlog(), (int64_t)0);
+}
+
+TEST(host_expert_pool_futex_loses_no_wakeup) {
+    HostExpertPool* p = pool();
+    if (!p || !__builtin_cpu_supports("avx2")) { SKIP("no AVX2 or no pool"); return; }
+    if (!p->futex()) { SKIP("..._FUTEX=0 in the environment"); return; }
+    no_wakeup_lost(p, 4, 30, 1234u);
+}
+
+/* One submitter: no other thread's submit can rescue a lost wake-up, so a ticket that misses its
+ * deadline is one (the four-submitter case above can hide it behind another thread's wake). */
+TEST(host_expert_pool_futex_loses_no_wakeup_with_one_submitter) {
+    HostExpertPool* p = pool();
+    if (!p || !__builtin_cpu_supports("avx2")) { SKIP("no AVX2 or no pool"); return; }
+    if (!p->futex()) { SKIP("..._FUTEX=0 in the environment"); return; }
+    no_wakeup_lost(p, 1, 120, 4321u);
 }
 
 /* ..._PREWAKE on the futex: three of the four workers woken, all back asleep after their window

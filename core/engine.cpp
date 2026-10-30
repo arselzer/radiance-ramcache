@@ -220,12 +220,14 @@ Engine::~Engine() {
             const uint64_t early = hx.wk_rd_armed - hx.wk_rd_fired;
             RAD_INFO("host experts, pre-wake: %llu one-token layers waited for their router's event and "
                      "then called the pool's pre-wake (%.1f us a call), their counts %.1f us after the "
-                     "event; %llu had their counts in first (no pre-wake); one-token miss reads: %llu with "
+                     "event, %llu of them with the counts in when the call returned (the call held them "
+                     "back); %llu had their counts in first (no pre-wake); one-token miss reads: %llu with "
                      "a pre-wake armed, %llu fired it (the last read landed %.1f us after it), %llu landed "
                      "first (%.1f us before its time)",
                      (unsigned long long)hx.wk_rt,
                      hx.wk_rt ? (double)hx.wk_rt_call_ns * 1e-3 / (double)hx.wk_rt : 0.0,
                      hx.wk_rt ? (double)hx.wk_rt_gap_ns * 1e-3 / (double)hx.wk_rt : 0.0,
+                     (unsigned long long)hx.wk_rt_late,
                      (unsigned long long)hx.wk_rt_ready, (unsigned long long)hx.wk_rd_armed,
                      (unsigned long long)hx.wk_rd_fired,
                      hx.wk_rd_fired ? (double)hx.wk_rd_lead_ns * 1e-3 / (double)hx.wk_rd_fired : 0.0,

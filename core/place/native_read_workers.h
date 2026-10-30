@@ -17,6 +17,8 @@
  * before.
  */
 #pragma once
+#include <sys/prctl.h>
+
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -44,11 +46,13 @@ public:
     using Launch = std::thread (*)(Entry, void*, int);
     /* fn(ctx) once, on the caller's thread and without the readers' state lock, when the caller
      * (its own share done) still waits for readers at `at_ns` (steady clock): at once if that has
-     * passed by then; never when every reader is done first. */
+     * passed by then; never when every reader is done first. `slack_ns` (0: the thread's own, 50 us
+     * by default) is the caller's timer slack for that wait alone, restored after it. */
     struct WaitHook {
         void (*fn)(void*) = nullptr;
         void*   ctx = nullptr;
         int64_t at_ns = 0;
+        unsigned long slack_ns = 0;
     };
 
     /* Launch injection lets the HOST checker exercise partial startup failure. The production
@@ -174,7 +178,11 @@ private:
     void wait_done(std::unique_lock<std::mutex>& state, const WaitHook* hook) {
         if (hook && hook->fn && pending_ != 0) {
             const std::chrono::steady_clock::time_point at{ std::chrono::nanoseconds(hook->at_ns) };
-            if (!done_.wait_until(state, at, [&] { return pending_ == 0; })) {
+            const int slack = hook->slack_ns ? prctl(PR_GET_TIMERSLACK, 0, 0, 0, 0) : -1;
+            if (slack >= 0) prctl(PR_SET_TIMERSLACK, hook->slack_ns, 0UL, 0UL, 0UL);
+            const bool done = done_.wait_until(state, at, [&] { return pending_ == 0; });
+            if (slack >= 0) prctl(PR_SET_TIMERSLACK, (unsigned long)slack, 0UL, 0UL, 0UL);
+            if (!done) {
                 state.unlock();
                 hook->fn(hook->ctx);
                 state.lock();

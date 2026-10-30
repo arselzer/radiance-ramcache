@@ -385,6 +385,15 @@ EOF2
     log "arm $name: Wp${ARM_WP}, but the server log lacks 'pre-wake of up to ${ARM_WP} workers' or a router event ($(grep -m2 -E 'pre-wake' "$OUT/$name.server.log" | tr '\n' ' ')); not measured"
     stop_server; return 1
   fi
+  # WlN: the pool's pre-wake line names the miss-read trigger's lead (60 without the part; Wl0: none).
+  if [[ -n "${ARM_WP:-}" ]]; then
+    local want_lead="${ARM_WL:-60} us before a miss read's predicted end"
+    [[ "${ARM_WL:-}" == 0 ]] && want_lead="not in miss reads"
+    if ! grep -qF "before a one-token layer's CPU work, at its router and ${want_lead}" "$OUT/$name.server.log"; then
+      log "arm $name: Wp${ARM_WP}${ARM_WL:+-Wl$ARM_WL}, but the pool's pre-wake line does not say '${want_lead}' ($(grep -m1 -E 'pre-wake of up to' "$OUT/$name.server.log")); not measured"
+      stop_server; return 1
+    fi
+  fi
   if [[ -z "${ARM_WP:-}" && "$wp_on" != 0 ]]; then
     log "arm $name: no Wp part, but the server pre-wakes the pool (the knob set for the window?); not measured"
     stop_server; return 1
@@ -874,7 +883,9 @@ for a in $ARMS; do
 # event (an event before each decode router GEMV, waited for ahead of the counts) and in a miss
 # read ..._PREWAKE_LEAD_US (60) before its predicted landing; they spin ..._PREWAKE_SPIN_US (100)
 # and sleep again if no work came (RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_PREWAKE=N, 1 .. the
-# arm's threads; exact). Every other arm runs with both at 0. Fw must show the pool's futex line at
+# arm's threads; exact); WlN with WpN the miss-read trigger's lead in us (..._PREWAKE_LEAD_US, 60 in
+# every arm without it; Wl0: no miss-read trigger, the router's alone). Every other arm runs with
+# both at 0. Fw must show the pool's futex line at
 # startup, WpN its pre-wake line for N workers and the stager's router events, and at shutdown the
 # pool's line with router pre-wakes that woke workers (else the arm's results are set aside as
 # <arm>.unmeasured.json); an arm without them must show neither startup line.
@@ -916,7 +927,7 @@ for a in $ARMS; do
   xt="" bt="" kld="" dk="" db="" pu="" ins_nt="" ins_kib="" ins_wait="" lean=""
   pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 HOST_POOL_MIB=4096 EXTRA_ARGS="" ARM_HOME="$RHOME" ARM_CONC=
   ARM_PROMPTS= ARM_N= ARM_LQ= rt=
-  power="" skip="" ARGS=() f8="" f8x="" rb="" rbf=0 pred="" cs="" kh="" pc="" pcopt="" fw="" wp=""
+  power="" skip="" ARGS=() f8="" f8x="" rb="" rbf=0 pred="" cs="" kh="" pc="" pcopt="" fw="" wp="" wl=""
   psc="" prs=12 pk="" pw="" ns="" pv=""
   unset ARM_NOPC   # --no-prefix-cache unless a Pc part sets it empty
   for p in "${parts[@]:1}"; do
@@ -1024,6 +1035,10 @@ for a in $ARMS; do
                if [[ ${p#Wp} =~ ^[0-9]+$ ]] && (( 10#${p#Wp} >= 1 && 10#${p#Wp} <= 256 )); then
                  wp=$((10#${p#Wp})); env+=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_PREWAKE=$wp)
                else log "arm $a: $p: a pre-wake takes 1-256 workers; the arm is skipped"; skip=1; fi ;;
+      Wl[0-9]*) # ...its miss-read trigger N us before the read's predicted landing (Wl0: none)
+               if [[ ${p#Wl} =~ ^[0-9]+$ ]] && (( 10#${p#Wl} <= 100000 )); then
+                 wl=$((10#${p#Wl})); env+=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_PREWAKE_LEAD_US=$wl)
+               else log "arm $a: $p: a pre-wake lead takes 0-100000 us; the arm is skipped"; skip=1; fi ;;
       U?*)     ARM_PROMPTS=/home/as/ds41-claude-build/work/extra-prompts/${p#U}-receipt.json ARM_N=999
                [[ -f $ARM_PROMPTS ]] || { log "arm $a: no prompts $ARM_PROMPTS; the arm is skipped"; skip=1; } ;;
       Rt)      mkdir -p "$OUT/rtrace-$a"   # the routing trace, exact (rtrace.py reads it)
@@ -1175,13 +1190,18 @@ for a in $ARMS; do
   # A pre-wake of more workers than the arm's pool has would be cut to its threads: refused instead.
   [[ -n "$fw" ]] || env+=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_FUTEX=0)
   [[ -n "$wp" ]] || env+=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_PREWAKE=0)
+  # WlN: the miss-read trigger's lead, 60 (the default) in every arm without the part.
+  [[ -n "$wl" ]] || env+=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_PREWAKE_LEAD_US=60)
+  if [[ -n "$wl" && -z "$wp" ]]; then
+    log "arm $a: Wl$wl sets the pre-wake's miss-read lead, which needs a WpN part; the arm is skipped"; skip=1
+  fi
   if [[ -n "$wp" && "$pol" != base ]] && (( wp > threads )); then
     log "arm $a: Wp$wp pre-wakes more workers than the pool's $threads threads; the arm is skipped"; skip=1
   fi
   if [[ -n "$fw$wp" && "$pol" == base ]]; then
     log "arm $a: Fw / WpN act on the host experts' pool, which a base arm has not; the arm is skipped"; skip=1
   fi
-  ARM_FW=$fw ARM_WP=$wp
+  ARM_FW=$fw ARM_WP=$wp ARM_WL=$wl
   # RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL: on only in an Xt arm, explicitly off in every other one.
   if [[ -n "$xt" ]]; then env+=(RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=1); else env+=(RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=0); fi
   # In / Is / Iw / Ph: every arm states the switches, so a window's VAR=val cannot turn them on for

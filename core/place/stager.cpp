@@ -2500,9 +2500,9 @@ int FileStager::hx_submit_misses_now(int rows) {
             wake_hook.at_ns = at;
             hx_wake_fired_ns_ = 0;
             ++hx_stats_.wk_rd_armed;
-            /* The wait's timer fires at its time, not up to the default 50 us slack later. */
-            static thread_local const bool slack = prctl(PR_SET_TIMERSLACK, 1000UL, 0UL, 0UL, 0UL) == 0;
-            (void)slack;
+            /* The wait's timer fires at its time, not up to the default 50 us slack later: 1 us for
+             * that wait alone (the thread's other timed waits keep theirs). */
+            wake_hook.slack_ns = 1000;
         }
     }
     const Mover::ReadWaitHook* wake = wake_hook.fn ? &wake_hook : nullptr;
@@ -2770,6 +2770,8 @@ int FileStager::hx_wake_route(int32_t li, std::chrono::steady_clock::time_point*
     ++hx_stats_.wk_rt;
     hx_stats_.wk_rt_call_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
                                    std::chrono::steady_clock::now() - t0).count();
+    /* The counts landed while the call ran: it held the layer's decision back by up to its time. */
+    if (rad_event_query(counts_ev_) == 1) ++hx_stats_.wk_rt_late;
     *woke = t0;
     return RAD_OK;
 }

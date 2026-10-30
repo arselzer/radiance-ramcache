@@ -327,6 +327,40 @@ TEST(native_read_workers_a_wait_hook_never_runs_when_the_readers_finish_first) {
     CHECK_EQ(w.run(8, 3, x, nullptr), NativeReadWorkers::Result::Complete);
 }
 
+/* A hook's slack_ns is the caller's timer slack for the wait for its time alone: the thread's own
+ * slack is back by the time the hook runs and after the call, and a hook without one leaves it. */
+struct SlackProbe {
+    std::atomic<int> calls{ 0 }, slack{ -1 };
+    static void fn(void* self) {
+        auto* p = static_cast<SlackProbe*>(self);
+        p->calls.fetch_add(1);
+        p->slack.store(prctl(PR_GET_TIMERSLACK, 0, 0, 0, 0));
+    }
+};
+
+TEST(native_read_workers_a_wait_hooks_timer_slack_is_for_its_wait_alone) {
+    const int own = prctl(PR_GET_TIMERSLACK, 0, 0, 0, 0);
+    REQUIRE(own > 0);
+    REQUIRE(own != 1000);
+    NativeReadWorkers w;
+    Uneven u;
+    SlackProbe p;
+    NativeReadWorkers::WaitHook hook{ &SlackProbe::fn, &p, now_plus_ns(15'000'000), 1000UL };
+    CHECK_EQ(w.run(8, 3, u, &hook), NativeReadWorkers::Result::Complete);
+    CHECK_EQ(p.calls.load(), 1);
+    CHECK_EQ(p.slack.load(), own);   /* restored before the hook's call */
+    CHECK_EQ(prctl(PR_GET_TIMERSLACK, 0, 0, 0, 0), own);
+    /* Through post and join, the readers done first: no call, the slack still the thread's. */
+    Uneven v;
+    v.reader_ms = 1;
+    SlackProbe q;
+    REQUIRE(w.post(8, 2, v));
+    NativeReadWorkers::WaitHook far{ &SlackProbe::fn, &q, now_plus_ns(5'000'000'000), 1000UL };
+    CHECK_EQ(w.join(&far), NativeReadWorkers::Result::Complete);
+    CHECK_EQ(q.calls.load(), 0);
+    CHECK_EQ(prctl(PR_GET_TIMERSLACK, 0, 0, 0, 0), own);
+}
+
 TEST(native_read_workers_a_failed_start_posts_nothing) {
     /* Every thread start fails: the post is refused, nothing is held, run() reads on the caller. */
     NativeReadWorkers w([](NativeReadWorkers::Entry, void*, int) -> std::thread {

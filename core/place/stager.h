@@ -363,8 +363,10 @@ public:
          * the pre-wake calls (the pool's own line counts what they woke). Miss reads (one-token)
          * with a pre-wake armed: those whose reads were still out at its time, so it fired, how long
          * after it the last read landed (the lead it gave: want ~the workers' wake-up, 30-60 us),
-         * and those whose reads landed first (`early`, by how much). */
-        uint64_t wk_rt = 0, wk_rt_ready = 0, wk_rt_gap_ns = 0, wk_rt_call_ns = 0;
+         * and those whose reads landed first (`early`, by how much). wk_rt_late: of the layers that
+         * called the pre-wake, those whose counts were in when the call returned (it held their
+         * decision back by up to its own time). */
+        uint64_t wk_rt = 0, wk_rt_ready = 0, wk_rt_gap_ns = 0, wk_rt_call_ns = 0, wk_rt_late = 0;
         uint64_t wk_rd_armed = 0, wk_rd_fired = 0, wk_rd_lead_ns = 0, wk_rd_early_ns = 0;
         /* One-token passes' miss reads (Mover::PlaneReadTiming), [0] those of one missed unit and
          * [1] of more, [2] those with a read-ahead unit's rest (..._PREFETCH_URGENT, whatever else

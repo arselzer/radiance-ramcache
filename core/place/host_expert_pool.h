@@ -131,9 +131,17 @@ public:
     void    wait_idle(int64_t max_ns);
     /* From now on wait_idle's sleepers are woken after the job that drained the pool has counted
      * its ticket down, not before: the lock and the broadcast to every sleeping insert thread then
-     * stay off the path of the rank waiting for that ticket (the sliced background inserts,
-     * RADIANCE_EXPERIMENTAL_DS41_INSERT_SLICE_KIB, which wait before every piece). */
+     * stay off the path of the rank waiting for that ticket (wait_work's sleepers always are). */
     void    quiet_after_tickets() { quiet_late_.store(true, std::memory_order_relaxed); }
+    /* The cost of the jobs submitted and not yet finished: backlog() without the reservations of
+     * jobs still to be submitted (a decode miss holds its reservation through its whole drive read,
+     * ~2.8 ms, while the pool may have nothing to do); a job counts until its ticket is counted
+     * down. wait_work sleeps until it is 0, or `max_ns` has passed; the job that takes it to 0 wakes
+     * the sleepers after its ticket, so the wake stays off the path of the rank waiting for that
+     * ticket. The sliced background inserts wait on this (RADIANCE_EXPERIMENTAL_DS41_INSERT_SLICE_KIB);
+     * backlog(), wait_idle and every other caller are as before. */
+    int64_t work() const { return work_.load(std::memory_order_relaxed); }
+    void    wait_work(int64_t max_ns);
     /* RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_LEAN_TILES=1, read once: two costs a tile pays come
      * off. A worker keeps the x lanes it laid out for its last tile (ds41hx::few_lanes) and runs
      * its next tile on them when that tile is of the same job and projection, instead of laying x
@@ -234,6 +242,7 @@ private:
     bool run_one();                  /* one tile of the oldest job with work; false when none */
     void tile(Slot& s, uint32_t gen, int k);
     void drained(int64_t left);      /* backlog_ now `left`: wake wait_idle at 0 */
+    void work_done();                /* work_ now 0: wake wait_work */
     void claimed(const Slot& s, int k);   /* a head job's tile k claimed: the ramp counters */
     /* lean_: gemv_avx2_few for a tile of job s's projection `down`, on this worker's lanes of
      * it, laid out again only when its last tile was of another job or projection. */
@@ -254,6 +263,7 @@ private:
     std::unique_ptr<WorkerStats[]> wstats_;
     std::atomic<bool>     stop_{ false };
     std::atomic<int64_t>  backlog_{ 0 };
+    std::atomic<int64_t>  work_{ 0 };   /* work(): beside backlog_, which the same calls change */
     /* The work generation: wake() moves it on, a worker sleeps while it is what the worker saw
      * before looking for work. 32 bits: with ..._FUTEX it is the futex word itself. */
     std::atomic<uint32_t> work_gen_{ 0 };
@@ -274,6 +284,9 @@ private:
     std::mutex              quiet_mu_;   /* wait_idle */
     std::condition_variable quiet_cv_;
     std::atomic<int>        quiet_waiters_{ 0 };
+    std::mutex              work_mu_;    /* wait_work */
+    std::condition_variable work_cv_;
+    std::atomic<int>        work_waiters_{ 0 };
     /* Stats that are not a worker's own (submits, claims, pre-wake calls). */
     struct alignas(64) PoolStats {
         std::atomic<uint64_t> submits{ 0 }, submit_woke{ 0 }, wake_ns{ 0 };

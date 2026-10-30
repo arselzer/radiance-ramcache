@@ -183,13 +183,15 @@ Engine::~Engine() {
             RAD_INFO("host experts' background inserts: %llu units relaid from passes, %.3f ms a unit from "
                      "the queue to published (%llu from one-token passes, %.3f ms a unit); non-temporal: "
                      "%llu pieces, %.0f MB of codes; waited before %llu pieces, %.1f ms asleep, %llu inserts "
-                     "out of their wait; %.0f MB in %.1f ms copied while the pool had work queued or reserved",
+                     "out of their wait; %.0f MB in %.1f ms copied while the pool had submitted jobs unfinished, "
+                     "%llu pieces begun while it held only reservations",
                      (unsigned long long)is.units, (double)is.ns * 1e-6 / (double)is.units,
                      (unsigned long long)is.d_units,
                      is.d_units ? (double)is.d_ns * 1e-6 / (double)is.d_units : 0.0,
                      (unsigned long long)is.pieces, (double)is.nt_bytes / 1e6,
                      (unsigned long long)is.waited, (double)is.wait_ns / 1e6,
-                     (unsigned long long)is.capped, (double)is.busy_bytes / 1e6, (double)is.busy_ns / 1e6);
+                     (unsigned long long)is.capped, (double)is.busy_bytes / 1e6, (double)is.busy_ns / 1e6,
+                     (unsigned long long)is.reserved);
         if (hx.many_jobs)
             RAD_INFO("host experts: %llu jobs of four or more rows of one expert (%llu rows) went "
                      "through the many-row kernel", (unsigned long long)hx.many_jobs,

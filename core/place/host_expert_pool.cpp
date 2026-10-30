@@ -326,6 +326,7 @@ int HostExpertPool::submit(const Job* jobs, int n, Ticket* t) {
         s.seq.store(seq, std::memory_order_relaxed);
         s.job = jobs[j];
         if (!s.job.cost) s.job.cost = job_cost(1 + s.job.more);
+        work_.fetch_add(s.job.cost, std::memory_order_relaxed);   /* before the job is visible */
         s.ticket = t;
         s.gu_left.store(kGuTiles, std::memory_order_relaxed);
         s.dn_left.store(kDnTiles, std::memory_order_relaxed);
@@ -565,6 +566,7 @@ void HostExpertPool::tile(Slot& s, uint32_t gen, int k) {
     /* The job's last tile: nothing reads the slot after this. */
     Ticket* t = s.ticket;
     const int64_t left = backlog_.fetch_sub(s.job.cost, std::memory_order_relaxed) - s.job.cost;
+    const int64_t cost = s.job.cost;   /* work_'s share, given back once the ticket is counted */
     const bool late = quiet_late_.load(std::memory_order_relaxed);
     if (!late) drained(left);
     if (lean_) {
@@ -574,8 +576,11 @@ void HostExpertPool::tile(Slot& s, uint32_t gen, int k) {
     s.state.store(0, std::memory_order_release);
     t->left.fetch_sub(1, std::memory_order_acq_rel);
     slot_cv_.notify_one();
-    /* quiet_after_tickets: the ticket's waiter goes on first. */
+    /* quiet_after_tickets: the ticket's waiter goes on first. The job is work() until its ticket is
+     * counted (a thread that sees work() at 0 sees the ticket done), and wait_work's sleepers are
+     * woken after it. */
     if (late) drained(left);
+    if (work_.fetch_sub(cost, std::memory_order_release) - cost <= 0) work_done();
 }
 
 void HostExpertPool::drained(int64_t left) {
@@ -584,6 +589,24 @@ void HostExpertPool::drained(int64_t left) {
     if (quiet_waiters_.load(std::memory_order_relaxed) == 0) return;
     std::lock_guard<std::mutex> lk(quiet_mu_);
     quiet_cv_.notify_all();
+}
+
+void HostExpertPool::work_done() {
+    std::atomic_thread_fence(std::memory_order_seq_cst);   /* against wait_work's count, then check */
+    if (work_waiters_.load(std::memory_order_relaxed) == 0) return;
+    std::lock_guard<std::mutex> lk(work_mu_);
+    work_cv_.notify_all();
+}
+
+void HostExpertPool::wait_work(int64_t max_ns) {
+    if (max_ns <= 0 || work_.load(std::memory_order_acquire) <= 0) return;
+    std::unique_lock<std::mutex> lk(work_mu_);
+    work_waiters_.fetch_add(1);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    work_cv_.wait_for(lk, std::chrono::nanoseconds(max_ns), [&] {
+        return work_.load(std::memory_order_acquire) <= 0 || stop_.load(std::memory_order_relaxed);
+    });
+    work_waiters_.fetch_sub(1);
 }
 
 void HostExpertPool::wait_idle(int64_t max_ns) {

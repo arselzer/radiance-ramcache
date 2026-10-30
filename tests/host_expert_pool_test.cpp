@@ -538,6 +538,50 @@ TEST(host_expert_pool_wait_idle_wakes_after_the_ticket) {
     }
 }
 
+/* work() / wait_work (the sliced background inserts' gate, ..._INSERT_SLICE_KIB): a reservation alone
+ * (a miss whose planes are being read) is not work, so it never holds the gate, while backlog() and
+ * wait_idle still count it; a submitted job is work until its last tile, and a wait_work sleeper is
+ * woken when it ends, after its ticket has counted down, never left to its timeout. */
+TEST(host_expert_pool_work_counts_submitted_jobs_not_reservations) {
+    HostExpertPool* p = pool();
+    if (!p || !__builtin_cpu_supports("avx2")) { SKIP("no AVX2 or no pool"); return; }
+    REQUIRE_EQ(p->work(), (int64_t)0);
+    p->reserve(HostExpertPool::kExpertBytes);
+    CHECK_EQ(p->work(), (int64_t)0);
+    CHECK(p->backlog() > 0);
+    auto t0 = std::chrono::steady_clock::now();
+    p->wait_work(2000000000LL);   /* nothing submitted: back at once */
+    CHECK(std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() < 0.5);
+    Expert e{ blocks(2 * kFf, kEmbd, 95), blocks(kEmbd, kFf, 96) };
+    const auto x = row(97);
+    const auto want = reference(e, x);
+    for (int round = 0; round < 3; ++round) {
+        std::vector<uint16_t> y(kEmbd, 0xffff);
+        HostExpertPool::Job j;
+        j.gu = e.gu.data();
+        j.dn = e.dn.data();
+        j.x = x.data();
+        j.y = y.data();
+        HostExpertPool::Ticket t;
+        if (round) p->reserve(HostExpertPool::kExpertBytes);
+        std::atomic<bool> woke{ false };
+        t0 = std::chrono::steady_clock::now();
+        CHECK_EQ(p->submit(&j, 1, &t), 0);
+        std::thread sleeper([&] {
+            p->wait_work(4000000000LL);
+            woke = true;
+            CHECK(p->done(&t));   /* woken after the ticket counted down */
+        });
+        p->wait(&t);
+        sleeper.join();
+        CHECK(woke.load());
+        CHECK(std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() < 2.0);
+        CHECK(y == want);
+        CHECK_EQ(p->work(), (int64_t)0);
+        CHECK_EQ(p->backlog(), (int64_t)0);
+    }
+}
+
 TEST(host_expert_pool_refuses_incomplete_jobs) {
     HostExpertPool* p = pool();
     if (!p) { SKIP("no pool"); return; }

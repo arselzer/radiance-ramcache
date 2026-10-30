@@ -336,7 +336,7 @@ EOF2
   local ins_line lean_lines want_ins=""
   ins_line=$(grep -m1 -E "background inserts write a missed unit's codes by non-temporal stores" "$OUT/$name.server.log")
   lean_lines=$(grep -c 'host experts: lean tiles:' "$OUT/$name.server.log")
-  if [[ -n "${ARM_INS_KIB:-}" ]]; then want_ins="in pieces of ${ARM_INS_KIB} KiB; a one-token pass's insert sleeps before each piece while the pool has work, at most ${ARM_INS_WAIT} us"
+  if [[ -n "${ARM_INS_KIB:-}" ]]; then want_ins="in pieces of ${ARM_INS_KIB} KiB; a one-token pass's insert sleeps before each piece while the pool has submitted jobs unfinished (not for a miss's reservation alone), at most ${ARM_INS_WAIT} us"
   elif [[ -n "${ARM_INS_NT:-}" ]]; then want_ins="by non-temporal stores (RADIANCE_EXPERIMENTAL_DS41_INSERT_NT)"; fi
   if [[ -n "$want_ins" && "$ins_line" != *"$want_ins"* ]]; then
     log "arm $name: In / Is, but the server log does not say it (${ins_line:-no 'background inserts write' line}); not measured"
@@ -877,8 +877,9 @@ for a in $ARMS; do
 # <arm>.unmeasured.json); an arm without them must show neither startup line.
 # In the background inserts write a missed unit's codes into the packed RAM cache by non-temporal
 # stores (RADIANCE_EXPERIMENTAL_DS41_INSERT_NT=1; needs K); Is / IsN the same in pieces of N KiB
-# (256), a one-token pass's insert sleeping before each piece while the pool has work, at most
-# ..._INSERT_WAIT_US an insert (RADIANCE_EXPERIMENTAL_DS41_INSERT_SLICE_KIB; needs K), IwN that wait
+# (256), a one-token pass's insert sleeping before each piece while the pool has submitted jobs
+# unfinished (not while it holds only a miss's reservation), at most ..._INSERT_WAIT_US an insert
+# (RADIANCE_EXPERIMENTAL_DS41_INSERT_SLICE_KIB; needs K), IwN that wait
 # (4000 us; needs Is); Ph the pool's lean tiles: a worker reuses its last tile's x lanes on a tile of
 # the same job and projection, and claims look only at the slots holding a job
 # (RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_LEAN_TILES=1). All exact (the cache's bytes, every row).

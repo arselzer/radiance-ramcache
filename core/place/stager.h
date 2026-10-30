@@ -388,12 +388,13 @@ public:
      * front to published (waits included). With RADIANCE_EXPERIMENTAL_DS41_INSERT_NT or
      * ..._INSERT_SLICE_KIB: the pieces of the codes planes written by non-temporal stores and their
      * bytes, the pieces that first waited for an idle pool and the time asleep, the inserts whose
-     * wait budget ran out with the pool still busy, and the bytes (and time) copied while the pool
-     * had work queued or reserved. */
+     * wait budget ran out with the pool still busy, the bytes (and time) copied while the pool had
+     * submitted jobs unfinished (HostExpertPool::work), and the pieces begun while it held only
+     * reservations (a miss's read: a wait on backlog() would have slept through them). */
     struct InsertStats {
         uint64_t units = 0, d_units = 0, ns = 0, d_ns = 0;
         uint64_t pieces = 0, nt_bytes = 0, waited = 0, wait_ns = 0, capped = 0;
-        uint64_t busy_bytes = 0, busy_ns = 0;
+        uint64_t busy_bytes = 0, busy_ns = 0, reserved = 0;
     };
     InsertStats insert_stats() const;
     /* ..._SIDE_STORE: what the store holds now (the insert threads fill it). */
@@ -897,8 +898,10 @@ private:
      * into the packed RAM cache by non-temporal stores (ds41hx::PackCopy), so the ~18 MB neither
      * reads each line first nor fills the caches the pool reads through. ..._INSERT_SLICE_KIB=N
      * (implies it): in pieces of N KiB, and a one-token pass's insert sleeps before each piece while
-     * the pool has work queued or reserved (HostExpertPool::wait_idle), at most ..._INSERT_WAIT_US
-     * (4000) an insert; the slot is published whole, after the last piece's sfence, as before.
+     * the pool has submitted jobs unfinished (HostExpertPool::wait_work; not while it holds only the
+     * reservations of misses whose planes are being read, when it has nothing to stream), at most
+     * ..._INSERT_WAIT_US (4000) an insert; the slot is published whole, after the last piece's
+     * sfence, as before.
      * Read by hx_ins_init; only with the packed cache. */
     bool    hx_ins_nt_ = false;
     size_t  hx_ins_slice_ = 0;
@@ -907,7 +910,7 @@ private:
     struct InsertCounts {
         std::atomic<uint64_t> units{ 0 }, d_units{ 0 }, ns{ 0 }, d_ns{ 0 };
         std::atomic<uint64_t> pieces{ 0 }, nt_bytes{ 0 }, waited{ 0 }, wait_ns{ 0 }, capped{ 0 };
-        std::atomic<uint64_t> busy_bytes{ 0 }, busy_ns{ 0 };
+        std::atomic<uint64_t> busy_bytes{ 0 }, busy_ns{ 0 }, reserved{ 0 };
     };
     InsertCounts hx_ins_;   /* the insert threads add to it */
 public:

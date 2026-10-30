@@ -3096,27 +3096,31 @@ struct InsertGate {
     HostExpertPool* pool = nullptr;
     int64_t budget_ns = 0;
     uint64_t pieces = 0, bytes = 0, waited = 0, wait_ns = 0, busy_bytes = 0, busy_ns = 0;
+    uint64_t reserved = 0; /* pieces begun with only reservations in the pool (a miss's read) */
     bool capped = false;   /* the budget ran out with the pool still busy */
     bool busy = false;     /* the piece being copied began while the pool had work, at t0 */
     Clock::time_point t0{};
 
     static void before(void* ctx, size_t n) { static_cast<InsertGate*>(ctx)->piece(n); }
+    /* "Work": jobs submitted and not yet finished (HostExpertPool::work), not the reservations a
+     * decode miss holds while its planes are read, when the pool has nothing to stream. */
     void piece(size_t n) {
         Clock::time_point now = end(Clock::now());
-        if (budget_ns > 0 && pool->backlog() > 0) {
-            pool->wait_idle(budget_ns);
+        if (budget_ns > 0 && pool->work() > 0) {
+            pool->wait_work(budget_ns);
             const Clock::time_point t = Clock::now();
             const int64_t w = std::chrono::duration_cast<std::chrono::nanoseconds>(t - now).count();
             ++waited;
             wait_ns += (uint64_t)w;
             budget_ns -= w;
-            capped = capped || (budget_ns <= 0 && pool->backlog() > 0);
+            capped = capped || (budget_ns <= 0 && pool->work() > 0);
             now = t;
         }
         ++pieces;
         bytes += n;
-        busy = pool->backlog() > 0;
+        busy = pool->work() > 0;
         if (busy) busy_bytes += n;
+        else if (pool->backlog() > 0) ++reserved;
         t0 = now;
     }
     /* The piece being copied ended at `now`. */
@@ -3156,15 +3160,15 @@ void FileStager::hx_ins_init() {
         if (const char* w = std::getenv("RADIANCE_EXPERIMENTAL_DS41_INSERT_WAIT_US"); w && *w)
             us = std::clamp<int64_t>(std::atoll(w), 0, 100000);
         hx_ins_wait_ns_ = us * 1000;
-        /* The pool's last tile would otherwise wake the sleeping inserts before the rank waiting
-         * for it goes on (HostExpertPool::quiet_after_tickets). */
-        hx_pool_->quiet_after_tickets();
+        /* The gate waits on the pool's submitted work (HostExpertPool::wait_work), whose sleepers
+         * are woken after the draining job's ticket; wait_idle (..._INSERT_YIELD_US) is as before. */
     }
     if (plan_->rank == 0) {
         if (kib > 0)
             RAD_INFO("host experts: background inserts write a missed unit's codes by non-temporal stores in "
                      "pieces of %lld KiB; a one-token pass's insert sleeps before each piece while the pool has "
-                     "work, at most %lld us an insert (RADIANCE_EXPERIMENTAL_DS41_INSERT_SLICE_KIB)",
+                     "submitted jobs unfinished (not for a miss's reservation alone), at most %lld us an insert "
+                     "(RADIANCE_EXPERIMENTAL_DS41_INSERT_SLICE_KIB)",
                      (long long)kib, (long long)(hx_ins_wait_ns_ / 1000));
         else
             RAD_INFO("host experts: background inserts write a missed unit's codes by non-temporal stores "
@@ -3186,6 +3190,7 @@ FileStager::InsertStats FileStager::insert_stats() const {
     st.capped = get(hx_ins_.capped);
     st.busy_bytes = get(hx_ins_.busy_bytes);
     st.busy_ns = get(hx_ins_.busy_ns);
+    st.reserved = get(hx_ins_.reserved);
     return st;
 }
 
@@ -3230,6 +3235,7 @@ void FileStager::hx_bg_loop() {
                 hx_ins_.capped.fetch_add(g.capped ? 1 : 0, std::memory_order_relaxed);
                 hx_ins_.busy_bytes.fetch_add(g.busy_bytes, std::memory_order_relaxed);
                 hx_ins_.busy_ns.fetch_add(g.busy_ns, std::memory_order_relaxed);
+                hx_ins_.reserved.fetch_add(g.reserved, std::memory_order_relaxed);
             }
         } else {
             rc = mover_->insert_unit_planes(*job.p, &scratch);

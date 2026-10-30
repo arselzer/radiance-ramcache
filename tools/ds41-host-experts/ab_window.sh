@@ -284,6 +284,19 @@ arm() {   # name, then env assignments for the server; CACHE_MIB the RAM cache (
     log "arm $name: a predictor part, but the server log has no 'router predictor: N routers loaded' line ($(grep -m1 -E 'router predictor' "$OUT/$name.server.log")); not measured"
     stop_server; return 1
   fi
+  # RADIANCE_EXPERIMENTAL_DS41_PREFETCH_MULTIROW (the Pmr parts): rank 0's file stager names it at
+  # startup with its N. A Pmr arm without that line for its N (a radiance without the switch: decode
+  # passes of 2+ rows go without the read-ahead), or another arm with the line, is not measured.
+  local pmr_lines; pmr_lines=$(grep -cE 'read-ahead: decode passes of 2-[0-9]+ rows read ahead too' "$OUT/$name.server.log")
+  if [[ -n "${ARM_PMR:-}" ]] && ! grep -qE "read-ahead: decode passes of 2-${ARM_PMR} rows read ahead too" "$OUT/$name.server.log"; then
+    log "arm $name: Pmr${ARM_PMR}, but the server log has no 'read-ahead: decode passes of 2-${ARM_PMR} rows read ahead too' line ($(grep -m1 -E 'PREFETCH_MULTIROW' "$OUT/$name.server.log")); not measured"
+    stop_server; return 1
+  fi
+  if [[ -z "${ARM_PMR:-}" && "$pmr_lines" != 0 ]]; then
+    log "arm $name: no Pmr part, but the server reads ahead in multi-row decode passes (the knob set for the window?); not measured"
+    stop_server; return 1
+  fi
+  [[ -n "${ARM_PMR:-}" ]] && grep -m1 -E 'read-ahead: decode passes of 2-' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   # RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED (the Vp part): the engine names the switch at startup and
   # each rank how many static residents it holds packed. A Vp arm without the switch's line or with
   # no rank holding any packed (a radiance without the switch, a dynamic plan, a DSpark bank), or a
@@ -365,7 +378,8 @@ arm() {   # name, then env assignments for the server; CACHE_MIB the RAM cache (
     [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
   fi
   grep -E 'host experts|EP scoped|live chain|error|ERR' "$OUT/$name.server.log" | tail -16 | tee -a "$OUT/window.log"
-  grep -E 'read-ahead (in pieces|readers)|router predictor \(' "$OUT/$name.server.log" | tail -6 | tee -a "$OUT/window.log"
+  # (Pmr: a rank's "by pass size" line beside its totals, and the predictor's multi-row line.)
+  grep -E 'read-ahead (in pieces|readers)|router predictor( \(|, multi-row)' "$OUT/$name.server.log" | tail -11 | tee -a "$OUT/window.log"
   grep -E 'rank 0: on-die reads' "$OUT/$name.server.log" | tee -a "$OUT/window.log"   # Pa/Pm/Pl/Pe: plan, counts
   grep -E 'post-stop passes: [0-9]' "$OUT/$name.server.log" | tail -1 | tee -a "$OUT/window.log"   # passes after a reply's end (Ss)
   # Every arm's VRAM residents a rank; a Vp arm's packed-form lines (what packed, the scan, the load's checks).
@@ -602,7 +616,12 @@ for a in $ARMS; do
   # pieces, 4 in flight over the process, none started while a demand read is in flight, handed to
   # their layer only whole (the rest read at once when the layer needs a partly read one); PqN its
   # readers (pieces in flight, 4), PbN its piece size in KiB (512), and Pf0 a partly read unit its
-  # layer needs read afresh instead of finished, with PpK; o --profile-ops;
+  # layer needs read afresh instead of finished, with PpK; PmrN / Pmr the read-ahead in pieces in
+  # decode passes of 2..N rows too (Pmr: N = 6; a DSpark verify pass, or several sequences' tokens):
+  # rank 0 posts every row's router input, each row predicts layer L+2's top K, each rank reads the
+  # union under the same live cap (RADIANCE_EXPERIMENTAL_DS41_PREFETCH_MULTIROW=N; needs a Pp part;
+  # reads only; measured only if the server names it at startup with its N, and every other arm runs
+  # with it 0 and must not name it); o --profile-ops;
   # H the second run home (RADIANCE_HOME_DIR2); iN background insert threads for missed units;
 # pN --host-pool-mib (4096: a rank's pinned expert slots and the file tier's staging); G pin the
 # RAM cache's slabs at startup; R / RNN read part of each missed expert from the checkpoint's
@@ -701,7 +720,7 @@ for a in $ARMS; do
 # only on the libr4d.so whose gemm_nt_f32bf16 passed SELFTEST_F32BF16's card checks in this window.
 # An arm with a predictor part (Ps, Po, Pt, Pp) is measured only if the router predictor loaded.
   IFS=- read -r -a parts <<< "$a"
-  xt="" bt="" kld="" dk="" db=""
+  xt="" bt="" kld="" dk="" db="" pmr=""
   pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 HOST_POOL_MIB=4096 EXTRA_ARGS="" ARM_HOME="$RHOME" ARM_CONC=
   ARM_PROMPTS= ARM_N= ARM_LQ= rt=
   power="" skip="" ARGS=() f8="" f8x="" rb="" rbf=0 pred="" cs="" kh="" pc="" pcopt=""
@@ -811,6 +830,11 @@ for a in $ARMS; do
       Lq)      ARM_LQ=1 ;;                 # the quality harness after the timed requests
       Cs)      cs=1 ;;                     # the exact consumer-suffix skip (checked in the server log)
       Kh)      kh=1 ;;                     # KV and logits hashes at each prompt's end
+      Pmr|Pmr[0-9]*)                       # read-ahead in pieces in decode passes of 2..N rows too (Pmr: 6)
+               pmr=${p#Pmr}; pmr=${pmr:-6}
+               if ! [[ $pmr =~ ^[0-9]+$ ]] || (( 10#$pmr < 2 || 10#$pmr > 16 )); then
+                 log "arm $a: $p: N is 2-16 rows; the arm is skipped"; skip=1
+               else pmr=$((10#$pmr)); fi ;;
       *)     log "arm $a: unknown part $p; the arm is skipped (it would run without what its name says)"; skip=1 ;;
     esac
   done
@@ -857,6 +881,14 @@ for a in $ARMS; do
     fi
   fi
   ARM_RB=$rb ARM_PRED=$pred
+  # Pmr: the multi-row read-ahead acts only on the read-ahead in pieces (a Pp part); without one the
+  # server refuses the switch. Every arm states it (0 is off), so a window's VAR=val cannot turn it on
+  # for the others; arm() checks the server log both ways.
+  if [[ -n "$pmr" && " ${env[*]} " != *" RADIANCE_EXPERIMENTAL_DS41_PREFETCH=pieces "* ]]; then
+    log "arm $a: Pmr needs a Pp part (the read-ahead in pieces); the arm is skipped"; skip=1
+  fi
+  env+=(RADIANCE_EXPERIMENTAL_DS41_PREFETCH_MULTIROW=${pmr:-0})
+  ARM_PMR=$pmr
   # Ss: the read-back runs in an arm only if its name says so, whatever the window's environment.
   [[ " ${env[*]} " == *" RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP=1 "* ]] || env+=(RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP=0)
   [[ -z "$rt" ]] && env+=(RADIANCE_EXPERIMENTAL_DS41_ROUTE_TRACE=)   # traced only with Rt

@@ -249,6 +249,35 @@ TEST(router_score_the_inputs_int16_copy) {
     CHECK_EQ(sum, (int64_t)0);
 }
 
+/* quantize_x16 (the AVX2 form where it applies) gives quantize_x16_ref's values, scale and sum, bit for
+ * bit: gaussian rows with outliers, values at the rounding midpoints, not-finite lanes, all zeros, the
+ * largest magnitude negative, a row too short or not a multiple of 16 (the reference's own path). */
+TEST(router_score_the_inputs_int16_copy_by_avx2_is_the_references) {
+    if (!__builtin_cpu_supports("avx2")) { SKIP("no AVX2"); return; }
+    Rng r(29);
+    for (int n : { D, 16, 4096 + 16, 65536, D + 8, 7 }) {
+        std::vector<float> x((size_t)n);
+        for (int t = 0; t < 12; ++t) {
+            for (auto& v : x) v = r.gauss();
+            if (t % 3 == 1) x[(size_t)(t % n)] = 300.0f * (t & 4 ? -1.0f : 1.0f);   /* an outlier channel */
+            if (t % 4 == 2 && n >= 16) { x[3] = NAN; x[9] = INFINITY; x[n - 1] = -INFINITY; }
+            if (t == 5) {   /* every value at a rounding midpoint of the int16 grid */
+                const float amax = 32767.0f;
+                for (int k = 0; k < n; ++k) x[(size_t)k] = (k == 0 ? -amax : (float)(k % 64) + 0.5f);
+            }
+            if (t == 7) std::fill(x.begin(), x.end(), 0.0f);
+            if (t == 8) { std::fill(x.begin(), x.end(), NAN); }
+            std::vector<int16_t> a((size_t)n, 7), b((size_t)n, 9);
+            int64_t sa = -1, sb = -2;
+            const float fa = rs::quantize_x16_ref(x.data(), n, a.data(), &sa);
+            const float fb = rs::quantize_x16(x.data(), n, b.data(), &sb);
+            CHECK(a == b);
+            CHECK_EQ(sa, sb);
+            CHECK_EQ(std::memcmp(&fa, &fb, sizeof fa), 0);
+        }
+    }
+}
+
 TEST(router_score_quantized_logits_are_the_dequantized_dot) {
     /* s sx (sum q xq) and s sx (sum n xq - 8 sum xq) are the dot of the dequantized row and input,
      * and that lands near the f32 dot: int8 within 5% of the logits' spread (|w| rms(x)), int4

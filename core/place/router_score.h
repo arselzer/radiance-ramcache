@@ -185,8 +185,8 @@ inline int u4_at(const uint8_t* q, int k) {
 }
 
 /* The input x[n] into xq[n]: returns sx (x ~ sx xq; 0 when x is all zeros), *sum = sum of xq. A
- * value that is not finite counts as 0. */
-inline float quantize_x16(const float* x, int n, int16_t* xq, int64_t* sum) {
+ * value that is not finite counts as 0. The reference form; quantize_x16 below takes the AVX2 one. */
+inline float quantize_x16_ref(const float* x, int n, int16_t* xq, int64_t* sum) {
     float amax = 0.0f;
     for (int k = 0; k < n; ++k)
         if (std::isfinite(x[k])) amax = std::max(amax, std::fabs(x[k]));
@@ -204,6 +204,56 @@ inline float quantize_x16(const float* x, int n, int16_t* xq, int64_t* sum) {
     }
     *sum = s;
     return amax / 32767.0f;
+}
+
+/* quantize_x16_ref's values eight lanes at a time (n a multiple of 16): the same max over the
+ * finite |x| (a lane not finite is masked to 0 in both passes), _mm256_cvtps_epi32 rounding to
+ * nearest even as lrint does in the default mode, the same clamp; the lanes' sums in int32, which
+ * n <= 65536 keeps under 2^31 (each lane adds n / 16 pairs of at most 32767). A scalar libm lrint a
+ * value cost ~16 us a prediction of 5120 against ~0.7 (the predictor review). */
+__attribute__((target("avx2"))) inline float quantize_x16_avx2(const float* x, int n, int16_t* xq, int64_t* sum) {
+    const __m256 abs = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff));
+    const __m256 inf = _mm256_set1_ps(INFINITY);
+    __m256 m = _mm256_setzero_ps();
+    for (int k = 0; k < n; k += 8) {
+        const __m256 a = _mm256_and_ps(_mm256_loadu_ps(x + k), abs);
+        m = _mm256_max_ps(m, _mm256_and_ps(a, _mm256_cmp_ps(a, inf, _CMP_LT_OQ)));
+    }
+    alignas(32) float t[8];
+    _mm256_store_ps(t, m);
+    float amax = 0.0f;
+    for (float v : t) amax = std::max(amax, v);
+    if (!(amax > 0.0f)) {
+        std::memset(xq, 0, sizeof(int16_t) * (size_t)n);
+        *sum = 0;
+        return 0.0f;
+    }
+    const __m256 inv = _mm256_set1_ps(32767.0f / amax);
+    const __m256i hi = _mm256_set1_epi32(32767), lo = _mm256_set1_epi32(-32767);
+    __m256i s = _mm256_setzero_si256();
+    for (int k = 0; k < n; k += 16) {
+        __m256 a0 = _mm256_loadu_ps(x + k), a1 = _mm256_loadu_ps(x + k + 8);
+        a0 = _mm256_and_ps(a0, _mm256_cmp_ps(_mm256_and_ps(a0, abs), inf, _CMP_LT_OQ));
+        a1 = _mm256_and_ps(a1, _mm256_cmp_ps(_mm256_and_ps(a1, abs), inf, _CMP_LT_OQ));
+        __m256i i0 = _mm256_cvtps_epi32(_mm256_mul_ps(a0, inv)), i1 = _mm256_cvtps_epi32(_mm256_mul_ps(a1, inv));
+        i0 = _mm256_max_epi32(_mm256_min_epi32(i0, hi), lo);
+        i1 = _mm256_max_epi32(_mm256_min_epi32(i1, hi), lo);
+        s = _mm256_add_epi32(s, _mm256_add_epi32(i0, i1));
+        _mm256_storeu_si256((__m256i*)(xq + k), _mm256_permute4x64_epi64(_mm256_packs_epi32(i0, i1), 0xD8));
+    }
+    alignas(32) int32_t u[8];
+    _mm256_store_si256((__m256i*)u, s);
+    int64_t a = 0;
+    for (int32_t v : u) a += v;
+    *sum = a;
+    return amax / 32767.0f;
+}
+
+/* quantize_x16_ref's result, by the AVX2 form where it applies. */
+inline float quantize_x16(const float* x, int n, int16_t* xq, int64_t* sum) {
+    static const bool avx2 = __builtin_cpu_supports("avx2");
+    if (avx2 && n > 0 && n % 16 == 0 && n <= 65536) return quantize_x16_avx2(x, n, xq, sum);
+    return quantize_x16_ref(x, n, xq, sum);
 }
 
 /* ---- integer dots: sum q[k] xq[k] (int8), sum n[k] xq[k] (int4, n the unsigned nibble) ------- */

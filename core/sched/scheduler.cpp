@@ -528,10 +528,15 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     dload_from_ = draft_experiment_.load_from();
     dctx_ = DraftCtxDefer{};
     dctx_.on = draft_experiment_.ctx_defer();
+    /* The DSpark bank under several sequences drafts for a sequence alone (draft_conf.h); at one
+     * sequence the rule decides nothing, so it is not on there. */
+    dsolo_ = !cfg.draft_bank.empty() && cfg.max_seqs > 1 && cfg.n_spec > 0 &&
+             prog.drafter.kind == RAD_DRAFT_BLOCK && prog.drafter.depth > 0 &&
+             !draft_experiment_.compute_off();
     dconf_tot_ = DraftConfStats{};
     dconf_recs_.clear();
     dconf_recs_n_ = 0;
-    dconf_any_ = dconf_cfg_.on || dload_from_ > 0 || dctx_.on;
+    dconf_any_ = dconf_cfg_.on || dload_from_ > 0 || dctx_.on || dsolo_;
     if (dconf_any_) {
         const RadDrafterDecl& dd = prog.drafter;
         if (cfg.n_spec <= 0 || dd.kind != RAD_DRAFT_BLOCK || dd.depth <= 0) {
@@ -545,7 +550,13 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
         dconf_tot_.probe = dconf_cfg_.probe;
         dconf_tot_.load_from = dload_from_;
         dconf_tot_.deferred = dctx_.on;
+        dconf_tot_.solo = dsolo_;
         dconf_recs_.assign((size_t)kConfRecs, ConfRec{});
+        if (dsolo_)
+            RAD_INFO("DSpark draft bank with up to %lld sequences: a sequence drafts only in a step that "
+                     "carries it alone while no other decodes; a step of two or more decoding sequences "
+                     "verifies no draft (one made alone is dropped) and runs as the plain engine's batch",
+                     (long long)cfg.max_seqs);
         if (dconf_cfg_.on)
             RAD_INFO("DSpark confidence controller: on (%s): a sequence drafts while the confidence "
                      "head's p for its newest draft is at least %.3f, and below it drafts only every %d-th "
@@ -557,36 +568,41 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
                      kDraftLoadEnv, dload_from_);
     }
     if (dctx_.on) {
-        /* The plugin's room for rows waiting (arch/deepseek41 Dsp::ctx_defer): its source rows less a
-         * step budget, found by name; the window bounds it too, so a catch-up never reaches below
-         * the drafter's (or the trunk's) window. A plugin that declares no room cannot defer. */
+        /* The plugin's tap history (arch/deepseek41 Dsp::ctx_defer), found by name: persistent, with a
+         * row for every slot carved for the drafter's own cache, which its trunk steps scatter into by
+         * slot, so it must hold all of them (a slot past it would write past the buffer). A catch-up
+         * reaches the drafter's window less one below a query's anchor, which needs that window. */
         int64_t rows = 0;
         bool persist = false;
         for (const BufferInfo& bi : prog.buffers) {
             const std::string& n = bi.name;
-            const char* suf = "dspark_src";
+            const char* suf = "dspark_hist";
             const size_t k = std::strlen(suf);
             if (n.size() >= k && n.compare(n.size() - k, k, suf) == 0) {
                 rows = bi.decl.shape[0];
                 persist = bi.decl.kind == RAD_BUF_PERSIST;
             }
         }
-        int64_t cap = rows - cfg.max_tok;
-        const int64_t win = (int64_t)prog.drafter.window - 1;
-        if (win > 0 && cap > win) cap = win;
-        const int64_t room = cfg.max_tok - 1 - std::max<int64_t>(cfg.n_spec, 0);
-        if (cap > room) cap = room;
-        if (!persist || cap < 1) {
-            RAD_ERR("%s: the drafter's source rows (%lld, %s) leave no room past the step budget (%lld): "
-                    "this architecture plugin does not defer its context pass", kDraftCtxDeferEnv,
-                    (long long)rows, persist ? "persistent" : "not persistent", (long long)cfg.max_tok);
+        int64_t slots = -1;
+        for (size_t i = 0; i < prog.kv_groups.size(); ++i)
+            if (prog.kv_groups[i].drafter && kv->block_tokens((int32_t)i) > 0)
+                slots = std::max<int64_t>(slots, kv->total_blocks((int32_t)i) * kv->block_tokens((int32_t)i));
+        const int64_t win = (int64_t)prog.drafter.window;
+        if (!persist || rows <= 0 || slots < 0 || slots > rows || win < 2) {
+            RAD_ERR("%s: the drafter's tap history (%lld rows, %s) must cover its own cache's %lld slots, "
+                    "and its window (%lld) be bounded: this architecture plugin does not defer its "
+                    "context pass", kDraftCtxDeferEnv, (long long)rows,
+                    persist ? "persistent" : "not persistent", (long long)slots, (long long)win);
             return RAD_E_UNSUPPORTED;
         }
-        dctx_.cap = cap;
-        RAD_INFO("DSpark context pass deferred (%s): a step whose sequences draft nothing runs none; the "
-                 "rows wait (at most %lld) and one sequence's are caught up in one pass when it drafts "
-                 "again, anyone else's dropped (that sequence drafts again once its window is rebuilt)",
-                 kDraftCtxDeferEnv, (long long)cap);
+        dctx_.cap = win - 1;
+        dctx_.rows = rows;
+        RAD_INFO("DSpark context pass deferred (%s): the trunk's taps are kept a sequence in the drafter "
+                 "cache's slots (%lld rows for %lld slots); a context pass runs only for a sequence that "
+                 "drafts, over the positions it owes (from its cache's end, or the %lld below its anchor), "
+                 "in passes of at most %lld rows; a step in which nothing drafts runs none",
+                 kDraftCtxDeferEnv, (long long)rows, (long long)slots, (long long)dctx_.cap,
+                 (long long)(geo_.shared_tok > 0 ? geo_.shared_tok : cfg.max_tok));
     }
 
     RAD_TRY(builder_.init(prog, cfg, geo_, kvgeom_, ranks));
@@ -2287,6 +2303,20 @@ replan:
     int32_t capped_at = -1;
     int64_t capped_full = 0;
 
+    /* One sequence alone (dsolo_, draft_conf.h): with two or more sequences decoding, this step is
+     * the plain engine's batch, so a proposal made while its sequence was alone is not verified. */
+    bool solo_hold = false;
+    if (dsolo_) {
+        int dec = 0;
+        for (int32_t slot : running_) {
+            const SchedReq& g = *reqs_[(size_t)slot];
+            if (!g.req || !g.running) continue;
+            const Request& gr = *g.req;
+            if (gr.n_computed >= (int64_t)gr.prompt.size() && gr.n_computed + 1 >= g.seq_len()) ++dec;
+        }
+        solo_hold = dec >= 2;
+    }
+
     /* The verify gate's view of the step: every decoding sequence's own row, before any drafts. */
     if (lookup_gate_on_) {
         gate_rows_ = 0;
@@ -2386,6 +2416,11 @@ replan:
             /* A sequence the acceptance gate held this step (block_begin) verifies nothing: the
              * lookup does not stand in for the draft the gate declined. */
             else if (s.dgate_held) s.n_draft = 0;
+            /* Nor one decoding beside another under the bank's one-sequence rule (solo_hold). */
+            else if (solo_hold) {
+                if (s.n_draft > 0) ++dconf_tot_.solo_dropped;
+                s.n_draft = 0;
+            }
             else if (s.n_draft == 0) {
                 /* As the only drafter under the adaptive window, the lookup is the head: its
                  * proposal is cut to the sequence's own window. */
@@ -3433,6 +3468,9 @@ void Scheduler::step_finished() {
         const int v = plan_.e[0].n_spec > 0 ? 1 : 0, d = dgate_step_drafts_ > 0 ? 1 : 0;
         ++dconf_tot_.step_n[v][d];
         dconf_tot_.step_ns[v][d] += (int64_t)(wall * 1e9);
+    } else if (dconf_any_ && plan_.phase == RAD_PHASE_DECODE && plan_.e.size() > 1 && wall > 0) {
+        ++dconf_tot_.multi_n;
+        dconf_tot_.multi_ns += (int64_t)(wall * 1e9);
     }
     dgate_step_drafts_ = 0;
     last_step_at_ = step_end;
@@ -3702,24 +3740,31 @@ int Scheduler::block_begin(int block, int depth, int window, int32_t mask, Block
                            bool on_card) {
     std::lock_guard<std::mutex> lk(mu_);
     block_.clear();
+    block_ctx_passes_ = 0;
+    block_ctx_at_ = 0;
     block_len_ = 0;
     block_depth_ = 0;
-    /* RADIANCE_EXPERIMENTAL_DS41_DSPARK_CTX_DEFER (draft_conf.h): the rows this trunk step appended to
-     * the plugin's source rows, whatever happens below. A return before the rows are known drops
-     * whatever waits (no pass runs to cover it): every sequence that had rows waiting restarts its
-     * drafter cache. */
-    int64_t step_rows = 0;
-    for (const StepEntry& e : plan_.e) step_rows += e.n_tokens;
-    const auto defer_drop_all = [&] {
-        if (!dctx_.on) return;
-        if (dctx_.clean && dctx_.rows > 0) ctx_hole_locked(dctx_.seq);
-        for (const StepEntry& e : plan_.e) ctx_hole_locked(e.seq);
-        dctx_.rows += step_rows;
-        dctx_.clean = false;
-        ++dconf_tot_.ctx_skip;
+    /* Where a row of the step starts: a row on the card where its sequence's commit left it (the
+     * card positioned it, advance.h), any other where the build put it. */
+    const auto row_pos = [&](const StepEntry& e) -> int64_t {
+        const SchedReq* q = (e.slot >= 0 && (size_t)e.slot < reqs_.size()) ? reqs_[(size_t)e.slot].get()
+                                                                            : nullptr;
+        if (on_card && e.dev && q && q->req) return (int64_t)q->req->n_computed;
+        return (int64_t)e.ctx_len;
     };
+    /* RADIANCE_EXPERIMENTAL_DS41_DSPARK_CTX_DEFER (draft_conf.h): a sequence's tap history begins at
+     * its first trunk step since it was admitted, whatever happens below. */
+    if (dctx_.on)
+        for (const StepEntry& e : plan_.e) {
+            SchedReq* q = (e.slot >= 0 && (size_t)e.slot < reqs_.size()) ? reqs_[(size_t)e.slot].get()
+                                                                          : nullptr;
+            if (q && q->req && q->req->id == e.seq && q->tap_lo < 0) q->tap_lo = row_pos(e);
+        }
     if (draft_experiment_.compute_off()) return 0;
-    if (block < 2 || depth <= 0 || depth > block || !out || max <= 0) { defer_drop_all(); return 0; }
+    if (block < 2 || depth <= 0 || depth > block || !out || max <= 0) {
+        if (dctx_.on) ++dconf_tot_.ctx_skip;
+        return 0;
+    }
     block_len_   = (int32_t)block;
     block_depth_ = (int32_t)depth;
     block_mask_.assign((size_t)(block - 1), mask);
@@ -3734,7 +3779,10 @@ int Scheduler::block_begin(int block, int depth, int window, int32_t mask, Block
      * max_tok without a span. */
     const int64_t mixed = geo_.shared_tok > 0 ? geo_.shared_tok : cfg_.max_tok;
     if ((int64_t)max * block > mixed) max = (int)(mixed / block);
-    if (max <= 0) { defer_drop_all(); return 0; }
+    if (max <= 0) {
+        if (dctx_.on) ++dconf_tot_.ctx_skip;
+        return 0;
+    }
 
     /* RADIANCE_EXPERIMENTAL_DS41_DSPARK_LOAD (draft_conf.h): with N or more sequences decoding, none
      * drafts. Decoding: running and past its prompt. */
@@ -3750,24 +3798,32 @@ int Scheduler::block_begin(int block, int depth, int window, int32_t mask, Block
         load_held = decoding >= dload_from_;
         if (load_held) ++dconf_tot_.load_steps;
     }
-    /* The deferred context pass: can the rows waiting be caught up behind this step? Only when they
-     * are one sequence's, contiguous, and this step is that sequence's next rows alone. Otherwise
-     * they are dropped when the next pass runs, and their sequence's drafter cache restarts there:
-     * marked now, so it does not draft over the hole below. */
-    const auto row_pos = [&](const StepEntry& e) -> int64_t {
-        const SchedReq* q = (e.slot >= 0 && (size_t)e.slot < reqs_.size()) ? reqs_[(size_t)e.slot].get()
-                                                                            : nullptr;
-        if (on_card && e.dev && q && q->req) return (int64_t)q->req->n_computed;
-        return (int64_t)e.ctx_len;
-    };
-    bool catch_ok = true;
-    if (dctx_.on && dctx_.rows > 0) {
-        catch_ok = dctx_.clean && plan_.e.size() == 1 && plan_.e[0].seq == dctx_.seq &&
-                   dctx_.from + dctx_.rows == row_pos(plan_.e[0]);
-        if (!catch_ok && dctx_.clean) {
-            ctx_hole_locked(dctx_.seq);
-            dctx_.clean = false;
+    /* One sequence alone (dsolo_, draft_conf.h): nothing drafts in a step that carries more than one
+     * running sequence, or one while another running sequence decodes (as step() counts decoding:
+     * past its prompt and any recompute). A sequence whose last prefill chunk this step is decodes
+     * from the next step on, so beside a decoding one it does not draft either. */
+    bool solo_held = false;
+    if (dsolo_) {
+        int live = 0;
+        uint64_t one = 0;
+        for (const StepEntry& e : plan_.e) {
+            const SchedReq* q = (e.slot >= 0 && (size_t)e.slot < reqs_.size()) ? reqs_[(size_t)e.slot].get()
+                                                                                : nullptr;
+            if (q && q->req && q->req->id == e.seq && q->req->state == ReqState::Running && q->running) {
+                ++live;
+                one = e.seq;
+            }
         }
+        bool other = false;
+        for (int32_t slot : running_) {
+            const SchedReq& q = *reqs_[(size_t)slot];
+            if (!q.req || q.req->id == one || q.req->state != ReqState::Running || !q.running) continue;
+            if ((int64_t)q.req->n_computed >= (int64_t)q.req->prompt.size() &&
+                (int64_t)q.req->n_computed + 1 >= q.seq_len())
+                other = true;
+        }
+        solo_held = live > 1 || (live == 1 && other);
+        if (solo_held) ++dconf_tot_.solo_steps;
     }
 
     int n_draft_rows = 0;
@@ -3813,12 +3869,20 @@ int Scheduler::block_begin(int block, int depth, int window, int32_t mask, Block
         /* Where this sequence's draft cache starts once the context pass has run: its own floor,
          * or for a sequence that never had one, this step's first row (0 for an ordinary prefill,
          * the hit length after a prefix-cache hit). The binding query row is the lowest, at
-         * n_computed, and it reads back to n_computed - window + 1. A sequence whose deferred
-         * context rows were dropped (SchedReq::ctx_hole) starts at this step's rows at the
-         * earliest. */
-        const int64_t lo = s.ctx_hole ? (int64_t)d.ctx_len : draft_floor(s, (int64_t)d.ctx_len);
-        const bool reach = lo <= 0 ? true
-                                   : (window > 0 && next_lo - window + 1 >= lo);
+         * n_computed, and it reads back to n_computed - window + 1. Deferred, the cache starts
+         * where its catch-up does when that starts it over (draft_ctx_from), and the catch-up
+         * never reaches below the sequence's tap history (SchedReq::tap_lo). */
+        int64_t lo = 0, from = d.ctx_len;
+        bool restart = false, reach = false;
+        if (dctx_.on) {
+            const int64_t need = std::max<int64_t>(0, next_lo - window + 1);
+            from = draft_ctx_from(s.draft_lo, s.draft_hi, std::max<int64_t>(s.tap_lo, 0), need,
+                                  &restart, &reach);
+            lo = restart ? from : s.draft_lo;
+        } else {
+            lo = draft_floor(s, (int64_t)d.ctx_len);
+            reach = lo <= 0 ? true : (window > 0 && next_lo - window + 1 >= lo);
+        }
 
         /* RADIANCE_DEBUG_DRAFT counts which gate declined. A drafter that silently stops
          * proposing looks like collapsed acceptance downstream (accept% is conditional on
@@ -3827,20 +3891,24 @@ int Scheduler::block_begin(int block, int depth, int window, int32_t mask, Block
         /* The query block writes positions n_computed .. n_computed + block - 1, and none of them
          * may be at or past the end of the context. */
         const bool ok_ctx  = ctx_limit_ <= 0 || next_hi + block <= ctx_limit_;
+        /* One sequence alone: a sequence it holds is asked by no gate below. */
+        const bool held_solo = solo_held && may_draft && have_tok && reach && ok_room && ok_ctx;
+        if (held_solo) ++dconf_tot_.solo_held;
         /* RADIANCE_EXPERIMENTAL_DS41_DSPARK_GATE (draft_gate.h): asked only where the sequence
          * could draft, and before its block's KV is reserved, which a gated sequence does not
          * take. Its row stays in the context pass either way. */
         int gate = -1;
-        if (dgate_cfg_.on && may_draft && have_tok && reach && ok_room && ok_ctx)
+        if (dgate_cfg_.on && may_draft && have_tok && reach && ok_room && ok_ctx && !solo_held)
             gate = draft_gate_ask(dgate_cfg_, s.dgate);
         /* Load-aware drafting, then the confidence controller (draft_conf.h), asked likewise. A
          * sequence the load holds is not asked. */
-        const bool could = may_draft && have_tok && reach && ok_room && ok_ctx;
+        const bool could = may_draft && have_tok && reach && ok_room && ok_ctx && !solo_held;
         const bool held_load = load_held && could;
         if (held_load) ++dconf_tot_.load_held;
         int cgate = -1;
         if (dconf_cfg_.on && could && !held_load) cgate = draft_conf_ask(dconf_cfg_, s.dconf);
-        const bool ok_gate = gate != kDraftGateGated && cgate != kDraftConfGated && !held_load;
+        const bool ok_gate = gate != kDraftGateGated && cgate != kDraftConfGated && !held_load &&
+                             !solo_held;
         const bool ok_kv   = ok_room && ok_ctx && ok_gate &&
                              kv_->ensure_from(r.id, next_hi + block, r.n_computed) >= 0;
         static const bool dbg = [] { const char* v = std::getenv("RADIANCE_DEBUG_DRAFT");
@@ -3881,71 +3949,36 @@ int Scheduler::block_begin(int block, int depth, int window, int32_t mask, Block
             if (cgate > kDraftConfGated) draft_conf_unask(s.dconf, cgate);
         }
         /* No proposal for the next step, from the head or the prompt-lookup fallback. */
-        s.dgate_held = gate == kDraftGateGated || cgate == kDraftConfGated || held_load;
-        d.ctx_from = d.ctx_len;
-        d.ctx_n = d.n_tokens;
+        s.dgate_held = gate == kDraftGateGated || cgate == kDraftConfGated || held_load || held_solo;
+        if (dctx_.on) {
+            /* Deferred: only a drafting sequence's pass runs, over what it owes through its own
+             * rows; anyone else's positions wait in the history. */
+            d.ctx_from = d.can_draft ? from : d.ctx_len;
+            d.ctx_n = d.can_draft ? (int32_t)((int64_t)d.ctx_len + d.n_tokens - from) : 0;
+            d.ctx_restart = d.can_draft && restart;
+        } else {
+            d.ctx_from = d.ctx_len;
+            d.ctx_n = d.n_tokens;
+        }
         block_.push_back(d);
     }
     dgate_step_drafts_ = n_draft_rows;
 
-    /* The deferred context pass: skip it when nothing drafts and the rows can still wait (one
-     * sequence decoding alone, plain, whose rows a later catch-up covers; or under load, dropped);
-     * otherwise run it, over the rows waiting too when they can be caught up. */
-    dctx_.mode = kDraftCtxRun;
+    /* The deferred context pass's counters: a step in which nothing drafts runs none. */
     if (dctx_.on) {
-        const StepEntry* e0 = plan_.e.size() == 1 ? &plan_.e[0] : nullptr;
-        /* A sequence whose cache restarts (SchedReq::ctx_hole) runs its pass: the restart is at the
-         * first row written, and deferring that row would keep it from ever drafting again. */
-        const SchedReq* s0 = e0 && !block_[0].mirror ? reqs_[(size_t)e0->slot].get() : nullptr;
-        const bool single_plain = s0 && !s0->ctx_hole && e0->produces_token && !e0->is_prefill &&
-                                  e0->n_spec == 0;
-        const bool skip = n_draft_rows == 0 && draft_ctx_may_wait(dctx_, step_rows) &&
-                          (load_held || single_plain);
-        if (skip) {
-            const bool keep = single_plain && !load_held;
-            if (dctx_.rows == 0) {
-                dctx_.clean = keep;
-                dctx_.seq = keep ? e0->seq : 0;
-                dctx_.from = keep ? block_[0].ctx_len : -1;
-            } else if (dctx_.clean && !(keep && catch_ok)) {
-                ctx_hole_locked(dctx_.seq);
-                dctx_.clean = false;
-            }
-            if (!dctx_.clean)
-                for (const BlockSeq& d : block_)
-                    if (!d.mirror) ctx_hole_locked(d.seq);
-            dctx_.rows += step_rows;
-            dctx_.mode = kDraftCtxSkip;
-            for (BlockSeq& d : block_) d.ctx_n = 0;
-            ++dconf_tot_.ctx_skip;
-        } else {
-            if (dctx_.rows > 0 && dctx_.clean && catch_ok && !block_[0].mirror) {
-                BlockSeq& d = block_[0];
-                d.ctx_from = dctx_.from;
-                d.ctx_n = (int32_t)(dctx_.rows + d.n_tokens);
-                dctx_.mode = kDraftCtxCatchUp;
+        bool any = false;
+        for (const BlockSeq& d : block_) {
+            if (d.ctx_n <= 0) continue;
+            any = true;
+            if (d.ctx_from < d.ctx_len) {
                 ++dconf_tot_.ctx_catch;
-                dconf_tot_.ctx_catch_rows += dctx_.rows;
-            } else if (dctx_.rows > 0) {
-                ++dconf_tot_.ctx_drop;
-                dconf_tot_.ctx_drop_rows += dctx_.rows;
+                dconf_tot_.ctx_catch_rows += d.ctx_len - d.ctx_from;
             }
-            if (n_draft_rows == 0 && (load_held || single_plain)) ++dconf_tot_.ctx_full;
-            ++dconf_tot_.ctx_run;
-            dctx_.rows = 0;
-            dctx_.clean = true;
-            dctx_.seq = 0;
-            dctx_.from = -1;
+            if (d.ctx_restart) ++dconf_tot_.ctx_restart;
         }
+        if (!any) ++dconf_tot_.ctx_skip;
     }
     return n_draft_rows;
-}
-
-void Scheduler::ctx_hole_locked(uint64_t id) {
-    auto it = by_id_.find(id);
-    if (it == by_id_.end()) return;
-    SchedReq& s = *reqs_[(size_t)it->second];
-    if (s.req && s.req->id == id) s.ctx_hole = true;
 }
 
 int Scheduler::decoded_seqs() const {
@@ -3965,14 +3998,59 @@ const Request* Scheduler::serial_req(const SerialSeq& m) const { return live_req
 const RadBatch* Scheduler::block_context(int step) {
     std::lock_guard<std::mutex> lk(mu_);
     if (block_.empty()) return nullptr;
-    /* RADIANCE_EXPERIMENTAL_DS41_DSPARK_CTX_DEFER: block_begin skipped it this step. */
-    if (dctx_.mode == kDraftCtxSkip) return nullptr;
 
     block_plan_.reset();
     block_plan_.phase      = RAD_PHASE_DECODE;
     block_plan_.draft_pass = -1;           /* the sign is what the plugin reads (rad_runtime.h) */
     block_plan_.e.reserve(block_.size());
 
+    /* RADIANCE_EXPERIMENTAL_DS41_DSPARK_CTX_DEFER (draft_conf.h): the drafting sequences' owed
+     * positions, each from its ctx_from, in passes of at most a shared step's rows (the builder's
+     * staging, the plugin's context rows); one sequence's positions may run on into the next pass.
+     * The plugin gathers each row's taps by its slot, so no row has to line up with the trunk
+     * step's, and a step in which nothing drafts has no pass. */
+    if (dctx_.on) {
+        const int64_t cap = geo_.shared_tok > 0 ? geo_.shared_tok : cfg_.max_tok;
+        for (size_t at = block_ctx_at_; at < block_.size() && block_plan_.n_tok < cap; ++at) {
+            const BlockSeq& d = block_[at];
+            const int64_t left = (int64_t)d.ctx_n - d.ctx_done;
+            if (d.mirror || left <= 0) continue;
+            const Request* rq = block_req(d);
+            if (!rq) return nullptr;   /* see below */
+            StepEntry e;
+            e.req        = rq;
+            e.seq        = d.seq;
+            e.slot       = d.slot;
+            e.card       = d.card;
+            e.ctx_len    = (int32_t)(d.ctx_from + d.ctx_done);
+            e.n_tokens   = (int32_t)std::min<int64_t>(left, cap - block_plan_.n_tok);
+            e.n_spec     = 0;
+            e.n_accepted = 1;
+            e.produces_token = false;
+            block_plan_.e.push_back(e);
+            block_plan_.n_tok += e.n_tokens;
+        }
+        if (block_plan_.e.empty()) return nullptr;
+        const RadBatch* b = builder_.build(block_plan_, *kv_, step);
+        if (!b) return nullptr;
+        /* Built: its rows are in a pass, and the next one continues after them. Entry k is the k-th
+         * row with positions left from the cursor on, as the walk above took them. */
+        size_t at = block_ctx_at_;
+        for (const StepEntry& e : block_plan_.e) {
+            while (at < block_.size() && (block_[at].mirror || block_[at].ctx_done >= block_[at].ctx_n)) ++at;
+            if (at >= block_.size()) break;
+            BlockSeq& d = block_[at];
+            d.ctx_done += e.n_tokens;
+            if (d.ctx_done >= d.ctx_n) ++at;
+        }
+        block_ctx_at_ = at;
+        ++block_ctx_passes_;
+        ++dconf_tot_.ctx_run;
+        return b;
+    }
+
+    /* One pass, the trunk step's rows row for row. */
+    if (block_ctx_passes_ > 0) return nullptr;
     for (const BlockSeq& d : block_) {
         const Request* rq = block_req(d);
         /* Unreachable for a live row while reap() defers on block_holds(); if it happens the pass
@@ -3987,11 +4065,6 @@ const RadBatch* Scheduler::block_context(int step) {
         e.card       = d.card;
         e.n_tokens   = d.n_tokens;
         e.ctx_len    = d.ctx_len;
-        /* A catch-up (block_begin): the rows a deferral held back, then this step's, one entry. */
-        if (dctx_.mode == kDraftCtxCatchUp && !d.mirror) {
-            e.n_tokens = d.ctx_n;
-            e.ctx_len  = (int32_t)d.ctx_from;
-        }
         e.n_spec     = 0;
         e.n_accepted = 1;               /* one-based; nothing in this pass reads it */
         /* The context pass reads tapped hidden states, not token ids: nothing to shift and no
@@ -4001,7 +4074,9 @@ const RadBatch* Scheduler::block_context(int step) {
         block_plan_.n_tok += e.n_tokens;
     }
     if (block_plan_.e.empty()) return nullptr;
-    return builder_.build(block_plan_, *kv_, step);
+    const RadBatch* b = builder_.build(block_plan_, *kv_, step);
+    if (b) ++block_ctx_passes_;
+    return b;
 }
 
 /* One entry per drafting sequence, `block` tokens: the anchor at the sequence's next position,
@@ -4072,15 +4147,18 @@ void Scheduler::block_end() {
         if (d.slot < 0 || (size_t)d.slot >= reqs_.size() || !reqs_[(size_t)d.slot]) continue;
         SchedReq& s = *reqs_[(size_t)d.slot];
         if (!s.req || s.req->id != d.seq) continue;
-        /* What the context pass wrote for it (BlockSeq::ctx_from / ctx_n): this step's rows, a
-         * catch-up's, or nothing when it was deferred. After dropped rows (SchedReq::ctx_hole) the
-         * cache starts over at the first row written. */
-        if (d.ctx_n <= 0) continue;
-        if (s.ctx_hole) {
-            s.draft_lo = d.ctx_from;
-            s.draft_hi = d.ctx_from;
-            s.ctx_hole = false;
+        /* Deferred (draft_conf.h): the owed positions its passes covered, a restart's from
+         * ctx_from, of which only the committed count: a rejected draft's keys, and the query
+         * block's, are rewritten by the next pass, which starts at draft_hi. */
+        if (dctx_.on) {
+            if (d.ctx_done <= 0) continue;
+            if (d.ctx_restart || s.draft_hi <= s.draft_lo) s.draft_lo = d.ctx_from;
+            s.draft_hi = std::max<int64_t>(s.draft_lo, std::min<int64_t>(d.ctx_from + d.ctx_done,
+                                                                         (int64_t)s.req->n_computed));
+            continue;
         }
+        /* What the context pass wrote for it (BlockSeq::ctx_from / ctx_n): this step's rows. */
+        if (d.ctx_n <= 0) continue;
         if (s.draft_hi == 0 && s.draft_lo == 0) s.draft_lo = draft_floor(s, d.ctx_from);
         const int64_t hi = d.ctx_from + d.ctx_n;
         if (hi > s.draft_hi) s.draft_hi = hi;
@@ -4358,17 +4436,24 @@ void Scheduler::draft_conf_report() const {
     if (dload_from_ > 0)
         RAD_INFO("DSpark load-aware drafting: %lld step(s) with %d or more sequences decoding, %lld "
                  "draft(s) held back", (long long)t.load_steps, dload_from_, (long long)t.load_held);
+    if (dsolo_)
+        RAD_INFO("DSpark draft bank with several sequences: %lld step(s) carried more than one, or one "
+                 "beside another decoding (%lld draft(s) held back); %lld proposal(s) made alone dropped "
+                 "from a step of two or more decoding sequences", (long long)t.solo_steps,
+                 (long long)t.solo_held, (long long)t.solo_dropped);
     if (dctx_.on)
-        RAD_INFO("DSpark context pass deferred: %lld run (%lld catch-up(s) over %lld waiting row(s), "
-                 "%lld run with nothing drafting because %lld rows were waiting or the shape could not "
-                 "wait), %lld skipped, %lld dropped (%lld rows); %lld row(s) waiting at exit",
-                 (long long)t.ctx_run, (long long)t.ctx_catch, (long long)t.ctx_catch_rows,
-                 (long long)t.ctx_full, (long long)dctx_.cap, (long long)t.ctx_skip,
-                 (long long)t.ctx_drop, (long long)t.ctx_drop_rows, (long long)dctx_.rows);
+        RAD_INFO("DSpark context pass deferred: %lld pass(es) run, %lld step(s) ran none; %lld catch-up(s) "
+                 "over %lld row(s) below their step's, %lld start(s) of a cache at the lowest key its query "
+                 "reads (at most %lld below its anchor); a tap history of %lld rows",
+                 (long long)t.ctx_run, (long long)t.ctx_skip, (long long)t.ctx_catch,
+                 (long long)t.ctx_catch_rows, (long long)t.ctx_restart, (long long)dctx_.cap,
+                 (long long)dctx_.rows);
     RAD_INFO("DSpark controls: decode steps of one sequence by kind: verify + draft %lld at %.2f ms, "
-             "plain %lld at %.2f ms, draft only %lld at %.2f ms, verify only %lld at %.2f ms",
+             "plain %lld at %.2f ms, draft only %lld at %.2f ms, verify only %lld at %.2f ms; of two or "
+             "more sequences %lld at %.2f ms",
              (long long)t.step_n[1][1], t.step_ms(1, 1), (long long)t.step_n[0][0], t.step_ms(0, 0),
-             (long long)t.step_n[0][1], t.step_ms(0, 1), (long long)t.step_n[1][0], t.step_ms(1, 0));
+             (long long)t.step_n[0][1], t.step_ms(0, 1), (long long)t.step_n[1][0], t.step_ms(1, 0),
+             (long long)t.multi_n, t.multi_ms());
     if (!dconf_cfg_.on) return;
     const int64_t cap = (int64_t)dconf_recs_.size();
     const int64_t n = std::min<int64_t>(dconf_recs_n_, cap);

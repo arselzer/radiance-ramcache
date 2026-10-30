@@ -6,12 +6,13 @@
 namespace rad {
 /* `draft_vram_n` > 0 (RADIANCE_EXPERIMENTAL_DS41_DRAFT_VRAM, place/draft_vram.h): the bank's experts
  * are not the 96 pinned pairs but N static VRAM residents of every stage, the rest parked on the
- * mapped tier (Planner::place_draft_bank_vram); the rest of the scope is the same. */
+ * mapped tier (Planner::place_draft_bank_vram); the rest of the scope is the same. Any
+ * --max-num-seqs: a step that drafts carries one sequence (sched/draft_conf.h, one sequence alone). */
 inline bool dspark_draft_control_scope(const Program& prog, const Plan& plan,
                                        const Config& cfg, bool banks_bound,
                                        int draft_vram_n = 0) noexcept {
     if (!banks_bound || cfg.draft_bank.empty() || cfg.draft_bank_expert_placement != "host" ||
-        cfg.n_spec != 5 || cfg.tp != 4 || cfg.max_seqs != 1 || cfg.kld() ||
+        cfg.n_spec != 5 || cfg.tp != 4 || cfg.max_seqs < 1 || cfg.kld() ||
         cfg.spec_ngram != 0 || cfg.draft_coupling || cfg.kv_cache_dtype != "bf16" ||
         cfg.draft_window != DraftWindow::Fixed || !cfg.debug_draft_oracle.empty() ||
         !dspark_native_program_scope(prog) || plan.world_size != 4 || plan.rank != prog.ctx.rank ||

@@ -413,8 +413,9 @@ struct FileStager::HeadOps {
 
 int FileStager::init_head_cache(const Program& prog,const Plan& plan) {
     if (!dspark_exact_one(std::getenv(kDsparkHeadTailEnv))) return RAD_OK;
+    /* One sequence: its passes are told apart as one sequence's (dspark_head_tail_pass). */
     if (!mover_ || plan.dynamic || plan.world_size!=4 || plan.rank!=prog.ctx.rank ||
-        prog.ctx.max_tok!=16 || !counts_ || !ep_counts_ || !dspark_native_program_scope(prog) ||
+        prog.ctx.max_tok!=16 || prog.ctx.max_seqs!=1 || !counts_ || !ep_counts_ || !dspark_native_program_scope(prog) ||
         layers_.empty() || !mover_->source_epochs_current()) return RAD_E_UNSUPPORTED;
     for (size_t i=0;i<layers_.size();++i)
         if (layers_[i].layer<0 || layers_[i].layer>=40 || !ep_layer_eligible_[i]) return RAD_E_UNSUPPORTED;

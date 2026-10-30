@@ -544,8 +544,11 @@ int Engine::issue_block_drafter(int step, StepOut& so) {
     if (mtp_couple_ && n > 0) RAD_TRY(stage_couple_draws(block_row_.data(), n));
 
     /* The context pass runs even when nothing drafts: a mid-prompt sequence has hidden states the
-     * drafter will need, and skipping would leave a permanent hole in its cache. */
-    if (const RadBatch* cb = sched_.block_context(step)) RAD_TRY(block_pass(cb, "context", step));
+     * drafter will need, and skipping would leave a permanent hole in its cache. Deferred
+     * (RADIANCE_EXPERIMENTAL_DS41_DSPARK_CTX_DEFER) it runs only for a drafting sequence, over what it
+     * owes, which can take several passes (Scheduler::block_context), and none when nothing drafts:
+     * the trunk keeps every sequence's taps in the drafter's history meanwhile. */
+    while (const RadBatch* cb = sched_.block_context(step)) RAD_TRY(block_pass(cb, "context", step));
     if (n <= 0) return RAD_OK;
     const RadBatch* qb = sched_.block_query(step);
     if (!qb) return RAD_OK;

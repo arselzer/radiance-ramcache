@@ -502,15 +502,18 @@ struct Dsp {
     rad_op poff_lo = 0, select_lo = 0;
     std::vector<Layer> st;
     /* RADIANCE_EXPERIMENTAL_DS41_DSPARK_CTX_DEFER=1 (the core's Scheduler::block_begin decides): the
-     * context pass may be skipped while nothing drafts and caught up later in one multi-row pass. The
-     * trunk's taps then append to `src` (declared persistent, `src_rows` = max_tok + the drafter's window
-     * + 1 rows) at row `tap_rows`, the rows written since the last context pass, in issue order; a
-     * context pass of T rows reads the last T of them and starts the count over. Unset: the taps go to
-     * rows [0, T) and the pass reads them, as before. Only the drafter's proposals can change (a draft is
-     * always verified), and only through a multi-row pass's rounding. */
+     * context pass runs only for a sequence that drafts, over the positions it owes. Every trunk step
+     * still taps into `src` rows [0, T), then scatters them into `hist` (persistent, a row for each slot
+     * of the drafter's own cache: `hist_rows`, what the core carves for kv_dspark, dsp_hist_rows) at
+     * the step's kv_dspark slot_mapping, so each sequence keeps its window's taps in the blocks its
+     * window holds; a context pass gathers its rows' taps back by its own slot_mapping, whichever
+     * sequences and positions it covers. Unset: the taps go to rows [0, T) and the pass reads them, as
+     * before. Only the drafter's proposals can change (a draft is always verified), and only through a
+     * multi-row pass's rounding. */
     bool ctx_defer = false;
-    int64_t src_rows = 0, tap_rows = 0;
-    bool defer_warned = false;
+    rad_buf hist = 0;
+    int64_t hist_rows = 0;
+    rad_op hist_put = 0, hist_get = 0;
     /* RADIANCE_EXPERIMENTAL_DS41_DSPARK_CONF set: the last stage's collapsed rows (`x`, the confidence
      * head's input) are declared persistent, so the engine can read them back after the query pass. */
     bool conf_x = false;
@@ -1855,6 +1858,20 @@ static int dsp_config(RadBuilder* b, Model& m, const RadModelMeta* meta, const R
     return RAD_OK;
 }
 
+/* The drafter's own cache (kv_dspark): the context keys of a window of committed positions, then the
+ * block a query pass writes past them, in blocks of kDspKvBlock (its kv_store's block_size). */
+constexpr int64_t kDspKvBlock = 16;
+static int64_t dsp_kv_window(const Model& m) { return m.c.window + m.dsp.block + m.g.max_spec; }
+
+/* Dsp::ctx_defer: a history row for each slot the core carves for kv_dspark, by KVManager's own
+ * bound on a windowed group (window_pool_cap: max_seqs windows of window_blocks + 1 blocks, with
+ * window_blocks = ceil(window / block) + 1, and a step's blocks). The core refuses the deferral when
+ * the group it carved holds more slots than this (Scheduler::init), so a slot never lands past it. */
+static int64_t dsp_hist_rows(const Model& m) {
+    const int64_t bs = kDspKvBlock, wb = (dsp_kv_window(m) + bs - 1) / bs + 1;
+    return (std::max<int64_t>(m.g.max_seqs, 1) * (wb + 1) + (m.g.max_tok + bs - 1) / bs) * bs;
+}
+
 /* One stage's weights (blk.{base + s}.*, the trunk's suffixes) and its context-pass key ops. */
 static int dsp_stage_weights(RadBuilder* b, Model& m, Layer& L, int s) {
     auto& g = m.g;
@@ -2107,11 +2124,11 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
     RadKVGroupDecl kd{};
     kd.kind = RAD_KV_WINDOW;
     kd.dtype = RAD_BF16;
-    kd.window = c.window + d.block + g.max_spec;
+    kd.window = dsp_kv_window(m);
     kd.n_head_kv = 1;
     kd.head_dim = hd / 2;
     const std::vector<RadParam> stp = { RAD_RANGE("M", 1, T), RAD_INT("head_dim", hd / 2), RAD_INT("n_head_kv", 1),
-                                        RAD_INT("block_size", 16), RAD_STR("kv_dtype", "bf16") };
+                                        RAD_INT("block_size", kDspKvBlock), RAD_STR("kv_dtype", "bf16") };
     if (m.zero) {
         if (!(d.kv = rad_decl_kv_group(b, nm.f("kv_dspark"), &kd))) return RAD_E_INVAL;
         d.sizing = op(b, "kv_store", stp, {}, { d.ckvn }, {});   /* fixes the block size; never issued */
@@ -2120,6 +2137,14 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
                      { RAD_RANGE("M", 1, T), RAD_INT("rot", c.rope), RAD_F64("theta", c.theta),
                        RAD_F64("scale", 1.0), RAD_STR("dtype", "f32") },
                      {}, {}, { m.cs_a });
+        /* Dsp::ctx_defer: the trunk step's taps into the history at its kv_dspark slots (issued by the
+         * trunk step after its last tap), and a context pass's rows back out of it by theirs. */
+        if (d.hist) {
+            const std::vector<RadParam> rp = { RAD_RANGE("M", 1, T), RAD_INT("n", nt * D), RAD_STR("dtype", "bf16") };
+            d.hist_put = op(b, "scatter_rows", rp, {}, { d.src, d.hist }, { d.hist });
+            d.hist_get = op(b, "gather_rows", rp, {}, { d.hist }, { d.src });
+            if (!d.hist_put || !d.hist_get) return RAD_E_INVAL;
+        }
         d.c_fc = linear(b, m, T, d.fc, D, nt * D, d.src, d.c);
         d.c_norm = rmsnorm(b, m, T, d.main_norm, D, d.c, d.cn);
         for (auto& L : d.st) {
@@ -2135,6 +2160,12 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
     }
     d.kv_bs = rad_kv_block_size(b, d.kv);
     if (d.kv_bs < 1) return RAD_E_INVAL;
+    if (d.hist && d.kv_bs != kDspKvBlock) {
+        fprintf(stderr, "radiance: deepseek41: RADIANCE_EXPERIMENTAL_DS41_DSPARK_CTX_DEFER sized the drafter's tap "
+                        "history for %lld-token blocks of kv_dspark and the group took %lld\n",
+                (long long)kDspKvBlock, (long long)d.kv_bs);
+        return RAD_E_UNSUPPORTED;
+    }
     for (const auto& L : d.st) DS_TRY(rad_bind_layer_kv(b, L.l, d.kv));
     if (m.zero) DS_TRY(rad_kv_group_zero(b, d.kv));
 
@@ -2560,14 +2591,19 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.cmax = g.max_ctx / std::max<int64_t>(rmin, 1) + 1;
     index_runs(m);
     DS_TRY(buffers(b, m));
-    /* The drafter's source rows, one hc-mean row a target layer, written by the trunk step. */
-    /* With ..._DSPARK_CTX_DEFER persistent, and a window's rows more (Dsp::ctx_defer). */
+    /* The drafter's source rows, one hc-mean row a target layer, written by the trunk step. With
+     * ..._DSPARK_CTX_DEFER, beside them the persistent history of every sequence's (Dsp::ctx_defer). */
     if (m.dsp.on && !m.zero) {
-        m.dsp.src_rows = g.max_tok + (m.dsp.ctx_defer ? c.window + 1 : 0);
-        if (!(m.dsp.src = decl_b(b, nm.f("dspark_src"), RAD_BF16,
-                                 { m.dsp.src_rows, (int64_t)m.dsp.taps.size() * c.n_embd },
-                                 m.dsp.ctx_defer ? RAD_BUF_PERSIST : RAD_BUF_TRANSIENT)))
+        const int64_t w = (int64_t)m.dsp.taps.size() * c.n_embd;
+        if (!(m.dsp.src = decl_b(b, nm.f("dspark_src"), RAD_BF16, { g.max_tok, w })))
             return RAD_E_INVAL;
+        if (m.dsp.ctx_defer) {
+            m.dsp.hist_rows = dsp_hist_rows(m);
+            if (!(m.dsp.hist = decl_b(b, nm.f("dspark_hist"), RAD_BF16, { m.dsp.hist_rows, w }, RAD_BUF_PERSIST)))
+                return RAD_E_INVAL;
+            rad_note(b, "DSpark context pass deferred: a tap history of %lld rows (%.1f MiB), a slot of kv_dspark each",
+                     (long long)m.dsp.hist_rows, (double)(m.dsp.hist_rows * w * 2) / 1048576.0);
+        }
     }
 
     const int64_t T = g.max_tok, D = c.n_embd;
@@ -2773,25 +2809,14 @@ static void dsp_context(RadCtx* x, Model& m, const RadBatch* batch) {
         return;
     }
     const RadOperand pos = praw(batch->positions, RAD_I32, T);
-    /* Dsp::ctx_defer: the last T rows the trunk appended. A pass longer than what was appended is a
-     * defect of the core's count; it reads from row 0 as before (the drafter's proposals may suffer,
-     * nothing else can), and says so once. */
-    RadOperand srows = brows(d.src, T);
-    if (d.ctx_defer) {
-        auto& dm = m.dsp;
-        if (T > dm.tap_rows) {
-            if (!dm.defer_warned)
-                fprintf(stderr, "radiance: deepseek41: rank %d: a DSpark context pass of %lld rows after %lld "
-                                "appended (RADIANCE_EXPERIMENTAL_DS41_DSPARK_CTX_DEFER count out of step); read "
-                                "from row 0 (logged once)\n", rad_rank(x), (long long)T, (long long)dm.tap_rows);
-            dm.defer_warned = true;
-        } else {
-            srows = brow_slice(d.src, dm.tap_rows - T, T, (int64_t)d.taps.size() * m.c.n_embd);
-        }
-        dm.tap_rows = 0;
-    }
+    /* Dsp::ctx_defer: the pass's rows' taps out of the history, by the slots its keys go to; the
+     * trunk step that computed each position put them there. Otherwise the trunk step just run left
+     * them in rows [0, T), row for row. */
+    if (d.hist_get)
+        RAD_ISSUE_N(x, d.hist_get, T, brows(d.hist, d.hist_rows), praw(kb->slot_mapping, RAD_I32, T),
+                    brows(d.src, T));
     RAD_ISSUE_N(x, d.c_tab, T, pos, brows(m.cs_a, g.max_ctx));
-    RAD_ISSUE_N(x, d.c_fc, T, srows, RAD_W(d.fc), brows(d.c, T));
+    RAD_ISSUE_N(x, d.c_fc, T, brows(d.src, T), RAD_W(d.fc), brows(d.c, T));
     RAD_ISSUE_N(x, d.c_norm, T, brows(d.c, T), RAD_W(d.main_norm), brows(d.cn, T));
     for (const auto& L : d.st) {
         RAD_ISSUE_N(x, L.d_kv, T, brows(d.cn, T), RAD_W(L.wkv), brows(d.ckv, T));
@@ -2968,22 +2993,14 @@ static void step(RadCtx* x, const RadBatch* batch) {
     const int64_t HD = g.n_head * c.head_dim, hd = c.head_dim;
     const RadOperand pos = praw(batch->positions, RAD_I32, T);
     const RadOperand cu = praw(batch->cu_seqlens, RAD_I32, S + 1);
-    /* Dsp::ctx_defer: this step's taps go after the rows still waiting for a context pass. Past the
-     * rows declared (the core's count out of step) they start over at row 0, logged once: the
-     * drafter's proposals may suffer, nothing else reads these rows. */
-    int64_t tap_off = 0;
-    if (m.dsp.on && m.dsp.ctx_defer && m.dsp.src) {
-        if (m.dsp.tap_rows + T > m.dsp.src_rows) {
-            if (!m.dsp.defer_warned)
-                fprintf(stderr, "radiance: deepseek41: rank %d: %lld DSpark tap rows waiting and %lld more do "
-                                "not fit %lld (RADIANCE_EXPERIMENTAL_DS41_DSPARK_CTX_DEFER count out of step); "
-                                "started over (logged once)\n", rad_rank(x), (long long)m.dsp.tap_rows,
-                        (long long)T, (long long)m.dsp.src_rows);
-            m.dsp.defer_warned = true;
-            m.dsp.tap_rows = 0;
+    /* Dsp::ctx_defer: where this step's taps go into the history, its rows' kv_dspark slots. */
+    const RadKVGroupBatch* hb = nullptr;
+    if (m.dsp.hist_put) {
+        hb = kv_batch(batch, m.dsp.kv);
+        if (!hb || !hb->slot_mapping) {
+            rad_step_fail(x, "deepseek41: the DSpark cache has no slots on a trunk step (its tap history)");
+            return;
         }
-        tap_off = m.dsp.tap_rows;
-        m.dsp.tap_rows += T;
     }
     const auto* wb = kv_batch(batch, m.win);
     if (!wb || !wb->block_table || !wb->slot_mapping) {
@@ -3150,10 +3167,7 @@ static void step(RadCtx* x, const RadBatch* batch) {
             RAD_ISSUE_N(x, L.e_back, T, brows(m.h1, T), brows(m.h0, T));
         }
         if (L.tap && !key_only)
-            RAD_ISSUE_N(x, L.tap, T, brows(m.h0, T),
-                        m.dsp.ctx_defer ? bcol_at(m.dsp.src, tap_off, (int64_t)m.dsp.taps.size() * D,
-                                                  L.tap_col * D, D, T)
-                                        : bcol(m.dsp.src, L.tap_col * D, D, T));
+            RAD_ISSUE_N(x, L.tap, T, brows(m.h0, T), bcol(m.dsp.src, L.tap_col * D, D, T));
         /* Issue order of the connections' mixes (Ctx::haz_mark: a recorded pass leaves a dispatch
          * unordered when it touches nothing in flight). Each connection's collapse reads the gates
          * the previous connection's mix wrote, never what its own mix writes, and nothing reads a
@@ -3486,6 +3500,14 @@ static void step(RadCtx* x, const RadBatch* batch) {
                         FR(m.comb, hc * hc), FR(m.h0, HN));
     }
     if (m.pfs.reads != pf_reads0) ++m.pfs.steps;
+    /* Dsp::ctx_defer: every tap is in, so the step's rows go into the history at their kv_dspark slots
+     * (the drafter's own cache's, so each sequence's land in the blocks its window holds). A speculative
+     * row's are rewritten by the step that computes its position again; a context pass covers committed
+     * positions and the rows of the step it follows. The consumer skip, whose cut layers would leave
+     * taps unwritten, is refused with any drafter. */
+    if (hb)
+        RAD_ISSUE_N(x, m.dsp.hist_put, T, brows(m.dsp.src, T), praw(hb->slot_mapping, RAD_I32, T),
+                    brows(m.dsp.hist, m.dsp.hist_rows));
     if (cut_full) return;   /* a cut pass samples nothing: no final norm, no head */
     /* Under the per-row cut the final norm runs on the last layer's rows, and nothing when it has none
      * (the step samples nothing then: checked above). */

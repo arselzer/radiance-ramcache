@@ -1,9 +1,11 @@
 /* ds41_dspark_defer_arch_test.cpp -- deepseek41's half of two DSpark controls (core/sched/draft_conf.h),
  * on the recording builder (arch_fakes.h) at DeepSeek-V4.1-Flash's geometry with its three stages:
- *   - RADIANCE_EXPERIMENTAL_DS41_DSPARK_CTX_DEFER: the drafter's source rows are persistent with the
- *     drafter's window (129 rows) more; each trunk step's taps go after the rows still waiting; a
- *     context pass of T rows reads the last T of them and starts the count over; past the room the
- *     taps start over at row 0 (said once), and a pass longer than what waits reads from row 0;
+ *   - RADIANCE_EXPERIMENTAL_DS41_DSPARK_CTX_DEFER: a persistent tap history beside the source rows, a
+ *     row for each slot the core carves for the drafter's own cache (kv_dspark: a window of blocks a
+ *     sequence and a step's); every trunk step taps into rows [0, T) as before and scatters them into
+ *     the history at its kv_dspark slot_mapping once its last tap is in; a context pass gathers its
+ *     rows back from the history by its own slot_mapping before its fc; an attention-zero rank has
+ *     neither;
  *   - RADIANCE_EXPERIMENTAL_DS41_DSPARK_CONF: the last stage's collapsed rows are persistent;
  *   - unset, both declare and issue what they did before (transient buffers, taps at row 0, the
  *     context pass at row 0). */
@@ -13,6 +15,7 @@
 
 #include "../arch/deepseek41/deepseek41.cpp"
 
+#include <algorithm>
 #include <cstdlib>
 #include <memory>
 #include <string>
@@ -116,13 +119,13 @@ struct Decl {
     deepseek41::Model* m = nullptr;
 };
 
-std::unique_ptr<Decl> declare(int rank) {
+std::unique_ptr<Decl> declare(int rank, int max_seqs = 1) {
     auto d = std::make_unique<Decl>();
     d->b.kv_block_of = block_of;
     MetaKV meta = dspark_meta();
     RadBuildCtx ctx = spec_ctx(rank, kWorld, 5);
     ctx.max_tok = 16;
-    ctx.max_seqs = 1;
+    ctx.max_seqs = max_seqs;
     d->err = stderr_of([&] { d->rc = deepseek41::declare(&d->b, meta.meta(), &ctx); });
     d->m = deepseek41::models[rank].get();
     return d;
@@ -134,6 +137,19 @@ std::vector<RadOperand> operands_of(const RadCtx& c, rad_op op, size_t i) {
     for (const auto& is : c.issues)
         if (is.op == op && is.opd.size() > i) v.push_back(is.opd[i]);
     return v;
+}
+
+/* The index of the first and last issue of `op` in a pass, -1 when none. */
+int first_issue(const RadCtx& c, rad_op op) {
+    for (size_t i = 0; i < c.issues.size(); ++i)
+        if (c.issues[i].op == op) return (int)i;
+    return -1;
+}
+int last_issue(const RadCtx& c, rad_op op) {
+    int at = -1;
+    for (size_t i = 0; i < c.issues.size(); ++i)
+        if (c.issues[i].op == op) at = (int)i;
+    return at;
 }
 
 }  // namespace
@@ -153,6 +169,8 @@ TEST(ds41_dspark_controls_off_declare_and_issue_as_before) {
     CHECK_EQ(src->d.shape[0], (int64_t)16);
     CHECK_EQ(src->d.kind, (int)RAD_BUF_TRANSIENT);
     CHECK_EQ(x->d.kind, (int)RAD_BUF_TRANSIENT);
+    CHECK(find_b(d->b, "dspark_hist") == nullptr);
+    CHECK(!ds.hist); CHECK(!ds.hist_put); CHECK(!ds.hist_get);
     /* Two decode steps and a context pass: every tap and the pass's fc at row 0. */
     auto t1 = kit(d->b, { 1 }, {});
     auto t2 = kit(d->b, { 1 }, {});
@@ -172,93 +190,125 @@ TEST(ds41_dspark_controls_off_declare_and_issue_as_before) {
     CHECK_EQ(fc[0].rows, (int64_t)1);
 }
 
-TEST(ds41_dspark_ctx_defer_appends_taps_and_reads_the_last_rows) {
+/* The history's rows are the slots the core carves for kv_dspark (KVManager::window_pool_cap): the
+ * window 128 + 5 + 5 is ceil(138 / 16) + 1 = 10 blocks, so 11 a sequence, and one step's block: 12
+ * blocks at one sequence (the 192 tokens a served bank's report shows), 45 at four, 89 at eight. */
+TEST(ds41_dspark_ctx_defer_declares_a_tap_history_a_row_a_drafter_cache_slot) {
+    Env env({ { "RADIANCE_EXPERIMENTAL_DS41_DSPARK_CTX_DEFER", "1" } });
+    const int seqs[3] = { 1, 4, 8 };
+    const int64_t blocks[3] = { 12, 45, 89 };
+    for (int k = 0; k < 3; ++k)
+        for (int rank = 0; rank < kWorld; ++rank) {
+            auto d = declare(rank, seqs[k]);
+            REQUIRE_EQ(d->rc, (int)RAD_OK);
+            const auto& ds = d->m->dsp;
+            REQUIRE(ds.ctx_defer);
+            if (d->m->zero) {   /* an attention-zero rank keeps no keys: no source rows, no history */
+                CHECK(!ds.hist); CHECK(!ds.hist_put); CHECK(!ds.hist_get);
+                CHECK(find_b(d->b, "dspark_hist") == nullptr);
+                continue;
+            }
+            const RecBuf* src = find_b(d->b, "dspark_src");
+            const RecBuf* hist = find_b(d->b, "dspark_hist");
+            REQUIRE(src);
+            REQUIRE(hist);
+            CHECK_EQ(src->d.shape[0], (int64_t)16);
+            CHECK_EQ(src->d.kind, (int)RAD_BUF_TRANSIENT);
+            CHECK_EQ(hist->d.kind, (int)RAD_BUF_PERSIST);
+            CHECK_EQ(hist->d.dtype, (uint32_t)RAD_BF16);
+            CHECK_EQ(hist->d.shape[0], blocks[k] * 16);
+            CHECK_EQ(hist->d.shape[1], (int64_t)3 * 5120);
+            CHECK_EQ(ds.hist_rows, blocks[k] * 16);
+            CHECK(ds.hist_put); CHECK(ds.hist_get);
+            CHECK_EQ(ds.kv_bs, (int64_t)16);
+        }
+}
+
+/* Two decode steps of one row, a two-row verify, then a context pass of three rows (whichever
+ * sequences and positions the core puts in it). Every tap still goes to rows [0, T); the trunk step
+ * then scatters its T rows into the history at its own kv_dspark slot_mapping, after its last tap;
+ * the context pass gathers its T rows from the history at its slot_mapping before its fc reads them
+ * from row 0. The lint (aliasing, spans, declared ranges, unwritten reads) finds nothing over the four
+ * for the source rows, the history or the two ops; the whole lint also flags DeepSeek-V4.1 trunk
+ * patterns this fake does not model (gemm_nt over column views of attn_o, the routed MoE's operands),
+ * which is why no other ds41 arch test runs it. */
+TEST(ds41_dspark_ctx_defer_scatters_each_steps_taps_and_gathers_a_pass_by_slot) {
     Env env({ { "RADIANCE_EXPERIMENTAL_DS41_DSPARK_CTX_DEFER", "1" } });
     for (int rank = 0; rank < kWorld; ++rank) {
-        auto d = declare(rank);
+        auto d = declare(rank, 4);
         REQUIRE_EQ(d->rc, (int)RAD_OK);
-        auto& ds = d->m->dsp;
-        REQUIRE(ds.ctx_defer);
-        if (d->m->zero) continue;   /* an attention-zero rank keeps no keys and has no source rows */
-        const RecBuf* src = find_b(d->b, "dspark_src");
-        REQUIRE(src);
-        CHECK_EQ(src->d.shape[0], (int64_t)(16 + 129));
-        CHECK_EQ(src->d.kind, (int)RAD_BUF_PERSIST);
-        CHECK_EQ(ds.src_rows, (int64_t)(16 + 129));
+        const auto& ds = d->m->dsp;
+        if (d->m->zero) continue;
         const int64_t pitch = 3 * 5120;
-        /* Three decode steps of one row, a two-row verify, then a context pass of three rows: the
-         * taps at rows 0, 1, 2, 3..4; the pass reads rows 2..4, the last three. */
         auto t1 = kit(d->b, { 1 }, {});
         auto t2 = kit(d->b, { 1 }, {});
-        auto t3 = kit(d->b, { 1 }, {});
-        auto t4 = kit(d->b, { 2 }, {});
+        auto t3 = kit(d->b, { 2 }, {});
         auto cp = kit(d->b, { 3 }, {});
         cp->b.draft_pass = -1;
-        auto r = run_passes(d->b, deepseek41::step, { t1.get(), t2.get(), t3.get(), t4.get(), cp.get() },
-                            rank, kWorld);
+        auto r = run_passes(d->b, deepseek41::step, { t1.get(), t2.get(), t3.get(), cp.get() }, rank, kWorld);
         REQUIRE(steps_ok(r));
-        const int64_t at[4] = { 0, 1, 2, 3 };
-        for (int p = 0; p < 4; ++p)
+        std::vector<std::string> mine;
+        for (const std::string& f : lint_step(d->b, view(r)))
+            for (const char* k : { "dspark_src", "dspark_hist", "scatter_rows", "gather_rows" })
+                if (f.find(k) != std::string::npos) { mine.push_back(f); break; }
+        CHECK_EQ(report_lint(mine), (size_t)0);
+        const Kit* trunk[3] = { t1.get(), t2.get(), t3.get() };
+        for (int p = 0; p < 3; ++p) {
+            const int64_t T = trunk[p]->b.n_tok;
+            int last_tap = -1;
             for (const auto& L : d->m->layers) {
                 if (!L.tap) continue;
                 const auto o = operands_of(*r[(size_t)p], L.tap, 1);
                 REQUIRE_EQ(o.size(), (size_t)1);
-                CHECK_EQ(o[0].offset, at[p] * pitch + (int64_t)L.tap_col * 5120);
-                CHECK_EQ(o[0].rows, p == 3 ? (int64_t)2 : (int64_t)1);
-                CHECK_EQ(o[0].cols, (int64_t)5120);
+                CHECK_EQ(o[0].offset, (int64_t)L.tap_col * 5120);
+                CHECK_EQ(o[0].rows, T);
+                last_tap = std::max(last_tap, last_issue(*r[(size_t)p], L.tap));
             }
-        CHECK_EQ(ds.tap_rows, (int64_t)0);
-        const auto fc = operands_of(*r[4], ds.c_fc, 0);
-        REQUIRE_EQ(fc.size(), (size_t)1);
-        CHECK_EQ(fc[0].offset, 2 * pitch);
-        CHECK_EQ(fc[0].rows, (int64_t)3);
-        /* The next trunk step starts over at row 0. */
-        auto t5 = kit(d->b, { 1 }, {});
-        auto r5 = run_passes(d->b, deepseek41::step, { t5.get() }, rank, kWorld);
-        REQUIRE(steps_ok(r5));
-        for (const auto& L : d->m->layers)
-            if (L.tap) CHECK_EQ(operands_of(*r5[0], L.tap, 1)[0].offset, (int64_t)L.tap_col * 5120);
-        CHECK_EQ(ds.tap_rows, (int64_t)1);
-        CHECK(d->err.find("count out of step") == std::string::npos);
+            const int put = first_issue(*r[(size_t)p], ds.hist_put);
+            REQUIRE(put >= 0);
+            CHECK(put > last_tap);
+            CHECK_EQ(last_issue(*r[(size_t)p], ds.hist_put), put);   /* once a step */
+            CHECK_EQ(first_issue(*r[(size_t)p], ds.hist_get), -1);
+            const auto& opd = r[(size_t)p]->issues[(size_t)put].opd;
+            REQUIRE_EQ(opd.size(), (size_t)3);
+            CHECK_EQ(opd[0].handle, ds.src); CHECK_EQ(opd[0].offset, (int64_t)0); CHECK_EQ(opd[0].rows, T);
+            CHECK_EQ((int)opd[1].kind, (int)RAD_OPK_RAW);
+            CHECK(opd[1].raw == (void*)trunk[p]->b.kv[ds.kv - 1].slot_mapping);
+            CHECK_EQ(opd[1].rows, T);
+            CHECK_EQ(opd[2].handle, ds.hist); CHECK_EQ(opd[2].rows, ds.hist_rows);
+        }
+        /* The context pass: the gather, then the fc over the rows it wrote. */
+        const int get = first_issue(*r[3], ds.hist_get);
+        const int fc = first_issue(*r[3], ds.c_fc);
+        REQUIRE(get >= 0);
+        CHECK(get < fc);
+        CHECK_EQ(first_issue(*r[3], ds.hist_put), -1);
+        const auto& g = r[3]->issues[(size_t)get].opd;
+        REQUIRE_EQ(g.size(), (size_t)3);
+        CHECK_EQ(g[0].handle, ds.hist); CHECK_EQ(g[0].rows, ds.hist_rows);
+        CHECK_EQ((int)g[1].kind, (int)RAD_OPK_RAW);
+        CHECK(g[1].raw == (void*)cp->b.kv[ds.kv - 1].slot_mapping);
+        CHECK_EQ(g[1].rows, (int64_t)3);
+        CHECK_EQ(g[2].handle, ds.src); CHECK_EQ(g[2].offset, (int64_t)0); CHECK_EQ(g[2].rows, (int64_t)3);
+        const auto f = operands_of(*r[3], ds.c_fc, 0);
+        REQUIRE_EQ(f.size(), (size_t)1);
+        CHECK_EQ(f[0].handle, ds.src); CHECK_EQ(f[0].offset, (int64_t)0); CHECK_EQ(f[0].rows, (int64_t)3);
+        CHECK_EQ(pitch, (int64_t)3 * 5120);
     }
 }
 
-TEST(ds41_dspark_ctx_defer_out_of_step_is_said_once_and_never_overruns) {
+/* A trunk step whose batch carries no kv_dspark slots cannot keep its taps: the step fails, said by
+ * name, rather than scattering nowhere. */
+TEST(ds41_dspark_ctx_defer_refuses_a_trunk_step_without_drafter_slots) {
     Env env({ { "RADIANCE_EXPERIMENTAL_DS41_DSPARK_CTX_DEFER", "1" } });
     auto d = declare(0);
     REQUIRE_EQ(d->rc, (int)RAD_OK);
-    auto& ds = d->m->dsp;
-    /* Nine full steps (144 rows) fit 145; the tenth starts over at row 0. */
-    std::vector<std::unique_ptr<Kit>> ks;
-    std::vector<const Kit*> ps;
-    for (int i = 0; i < 10; ++i) {
-        ks.push_back(kit(d->b, { 16 }, {}));
-        ps.push_back(ks.back().get());
-    }
-    std::string err = stderr_of([&] {
-        auto r = run_passes(d->b, deepseek41::step, ps, 0, kWorld);
-        CHECK(steps_ok(r));
-        for (const auto& L : d->m->layers)
-            if (L.tap) CHECK_EQ(operands_of(*r[9], L.tap, 1)[0].offset, (int64_t)L.tap_col * 5120);
-    });
-    CHECK(err.find("count out of step") != std::string::npos);
-    CHECK_EQ(ds.tap_rows, (int64_t)16);
-    /* A pass of what waits reads it; one longer than what waits (nothing now) reads from row 0, and
-     * is said no more (once a run). */
-    auto cp = kit(d->b, { 16 }, {});
-    cp->b.draft_pass = -1;
-    auto c1 = kit(d->b, { 1 }, {});
-    c1->b.draft_pass = -1;
-    err = stderr_of([&] {
-        auto r = run_passes(d->b, deepseek41::step, { cp.get(), c1.get() }, 0, kWorld);
-        CHECK(steps_ok(r));
-        CHECK_EQ(operands_of(*r[0], ds.c_fc, 0)[0].offset, (int64_t)0);
-        CHECK_EQ(operands_of(*r[0], ds.c_fc, 0)[0].rows, (int64_t)16);
-        CHECK_EQ(operands_of(*r[1], ds.c_fc, 0)[0].offset, (int64_t)0);
-        CHECK_EQ(operands_of(*r[1], ds.c_fc, 0)[0].rows, (int64_t)1);
-    });
-    CHECK_EQ(ds.tap_rows, (int64_t)0);
-    CHECK(err.find("count out of step") == std::string::npos);
+    REQUIRE(!d->m->zero);
+    auto t1 = kit(d->b, { 1 }, {});
+    t1->kv[d->m->dsp.kv - 1].slot_mapping = nullptr;
+    auto r = run_passes(d->b, deepseek41::step, { t1.get() }, 0, kWorld);
+    REQUIRE_EQ(r.size(), (size_t)1);
+    CHECK(r[0]->step_fail.find("tap history") != std::string::npos);
 }
 
 TEST(ds41_dspark_conf_keeps_the_collapsed_rows) {

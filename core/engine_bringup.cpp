@@ -758,8 +758,10 @@ int Engine::read_metadata() {
     RAD_TRY(file_->open(cfg_.model.c_str()));
     if(!cfg_.draft_bank.empty()){
         const char* opt=std::getenv("RADIANCE_EXPERIMENTAL_DS41_DSPARK_RAD_BANK");
-        if(!opt||std::strcmp(opt,"1")||cfg_.tp!=4||cfg_.max_seqs!=1||cfg_.max_tok<5||cfg_.n_spec!=5||cfg_.spec_ngram!=0||cfg_.kv_cache_dtype!="bf16"){
-            RAD_ERR("--draft-bank first scope requires opt-in, EP4, one sequence, batch>=5, depth5, lookup0 and BF16 KV");return RAD_E_INVAL;}
+        /* Any --max-num-seqs: with several the scheduler lets a sequence draft only while it decodes
+         * alone, and every step of two or more is a plain batch (sched/draft_conf.h). */
+        if(!opt||std::strcmp(opt,"1")||cfg_.tp!=4||cfg_.max_seqs<1||cfg_.max_tok<5||cfg_.n_spec!=5||cfg_.spec_ngram!=0||cfg_.kv_cache_dtype!="bf16"){
+            RAD_ERR("--draft-bank first scope requires opt-in, EP4, batch>=5, depth5, lookup0 and BF16 KV");return RAD_E_INVAL;}
         draft_file_=std::make_unique<RadFile>();RAD_TRY(draft_file_->open(cfg_.draft_bank.c_str()));
         source_banks_=std::make_unique<DsparkRadBanks>();std::string why;
         const int st=source_banks_->bind(*file_,draft_file_.get(),&why);
@@ -4180,7 +4182,8 @@ int Engine::start() {
         if (ranks_.size() != 4) return RAD_E_UNSUPPORTED;
         /* The cap measures the full block's query unless the drafter declared a short block
          * (deepseek41's RADIANCE_EXPERIMENTAL_DS41_DSPARK_SHORT_BLOCK) and --draft-short-from 1
-         * runs it on every decoding step (max_seqs is 1 here): its first k proposals are then the
+         * runs it on every decoding step (a step that drafts carries one sequence, under any
+         * --max-num-seqs: Scheduler's one-sequence rule): its first k proposals are then the
          * verified ones. */
         const bool short_ok = cfg_.draft_short_from == 0 || (cfg_.draft_short_from == 1 && drafter_short_ > 0);
         for (const auto& r : ranks_) {

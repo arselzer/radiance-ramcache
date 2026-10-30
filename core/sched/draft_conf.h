@@ -1,8 +1,10 @@
-/* draft_conf.h -- three opt-in controls for a block drafter (DSpark), each off by default:
+/* draft_conf.h -- three opt-in controls for a block drafter (DSpark), each off by default, and the
+ * DSpark bank's rule under several sequences:
  *
  *   RADIANCE_EXPERIMENTAL_DS41_DSPARK_CONF=T[,R]        the confidence controller
  *   RADIANCE_EXPERIMENTAL_DS41_DSPARK_LOAD=N            load-aware drafting
  *   RADIANCE_EXPERIMENTAL_DS41_DSPARK_CTX_DEFER=1       the context pass deferred while nothing drafts
+ *   --draft-bank with --max-num-seqs above 1            one sequence alone
  *
  * THE CONFIDENCE CONTROLLER. DSpark's last stage carries a confidence head (the reference's
  * DSparkConfidenceHead): for block row i, proj . [x_i, markov_embed(output_ids[i])], a logit for
@@ -29,25 +31,37 @@
  * sequence drafts: on this engine every decode row brings its own experts, so a draft row competes
  * with the other streams' rows for the step, and concurrent throughput comes first.
  *
+ * ONE SEQUENCE ALONE (no switch: the DSpark bank under --max-num-seqs above 1, Scheduler::dsolo_).
+ * A sequence drafts only in a step that carries it alone while no other running sequence decodes,
+ * and a step planned with two or more decoding sequences verifies no drafter proposal either (one
+ * made while its sequence was alone is dropped), so those steps are the plain engine's batches. A
+ * step beside another request's prefill chunk drafts nothing.
+ *
  * THE CONTEXT PASS DEFERRED (the plugin's half: arch/deepseek41 Dsp::ctx_defer). The drafter's
  * context pass, a pass of its own after every trunk step, keeps the drafter's window cache current
- * for every committed position whether or not anything drafts. Deferred, a step whose sequences
- * draft nothing skips it; the trunk's tapped rows wait in the plugin's source buffer (appended in
- * issue order), and the next pass that runs covers them:
- *   - one sequence decoding alone, plain steps (no drafts verified): the waiting rows are its own,
- *     positions contiguous, and the next pass is a catch-up, one entry over all of them. Exact
- *     drafter state: the same keys as one pass a step.
- *   - anything else (several sequences, a prefill chunk, another sequence): the waiting rows are
- *     dropped (the next pass covers its own step's rows only) and each sequence that missed rows
- *     has a hole: it drafts again only once its window has been rebuilt past the hole, as after a
- *     prefix-cache hit (Scheduler::draft_floor).
- * At most `cap` rows wait (the plugin declares the room: its source rows less the step budget), so a
- * pass runs at least every `cap` rows.
+ * for every committed position whether or not anything drafts. Deferred, it runs only for a sequence
+ * that drafts, over what that sequence owes. Every trunk step scatters its tapped rows into a history
+ * with a row for each slot of the drafter's own cache, so each sequence keeps the taps of its window
+ * in the blocks that window holds, and a context pass gathers its rows back by slot, for whichever
+ * sequences and positions it covers:
+ *   - drafting step after step, a sequence owes the rows of the step it follows: one pass, as before;
+ *   - after steps it drafted nothing in (gated, held, beside other sequences, its prompt), it owes
+ *     everything since its cache's end, and its pass is a catch-up from there; when that reaches
+ *     below the lowest key its query reads (`cap` positions below its anchor: the drafter's window
+ *     less one), its cache starts over there instead. A catch-up longer than a step is split into
+ *     passes of at most a step's rows;
+ *   - its history begins where its trunk began (SchedReq::tap_lo: after a prefix-cache or
+ *     end-of-request snapshot hit, the restored position), and no catch-up reads below it: the
+ *     draft refill recomputes the window above a hit where it can, or the sequence drafts once its
+ *     window lies past the hit, as without the deferral (Scheduler::draft_floor).
+ * A step in which nothing drafts runs no context pass.
  *
- * Exactness: none of the three changes a reply. A draft is verified like any other; these choose
- * only whether a draft is made and how many proposals a verify takes, and a deferred pass computes
- * the same keys from the same rows (any rounding a multi-row pass brings can move a proposal, never
- * an emitted token: core/sample/accept.h). Off, every path is the branch's.
+ * Exactness: none of them changes a reply. A draft is verified like any other; these choose only
+ * whether a draft is made and how many proposals a verify takes, and a deferred pass computes the
+ * same keys from the same rows (any rounding a multi-row pass brings can move a proposal, never an
+ * emitted token: core/sample/accept.h); a step of two or more decoding sequences under the bank is
+ * the plain engine's batch. Off (and at one sequence for the bank's rule), every path is the
+ * branch's.
  */
 #pragma once
 #include <cmath>
@@ -221,29 +235,35 @@ inline bool draft_ctx_defer_parse(const char* s, bool* on) {
     return false;
 }
 
-/* The context pass this step (Scheduler::block_begin decides, block_context builds). */
-enum DraftCtxMode { kDraftCtxRun = 0, kDraftCtxSkip, kDraftCtxCatchUp };
-
-/* The deferral's bookkeeping, in the core's count of the plugin's waiting rows (Dsp::tap_rows). */
+/* The deferred context pass (Scheduler::block_begin decides what each drafting sequence owes,
+ * block_context builds its passes), as Scheduler::init found the plugin's half. */
 struct DraftCtxDefer {
-    bool     on = false;
-    int64_t  cap = 0;          /* rows that may wait: the plugin's source rows less the step budget */
-    int64_t  rows = 0;         /* rows the trunk appended since the last pass */
-    uint64_t seq = 0;          /* while `clean`: the one sequence they belong to, from `from` */
-    int64_t  from = -1;
-    bool     clean = true;
-    int      mode = kDraftCtxRun;
+    bool    on = false;
+    int64_t cap = 0;    /* positions a query reads below its anchor: the drafter's window less one */
+    int64_t rows = 0;   /* the plugin's tap history (arch/deepseek41 Dsp::hist), a row a cache slot */
 };
 
-/* Whether the rows waiting plus this step's `t` can still wait for a later pass: the plugin holds
- * cap + one step budget, and the next trunk step may append a whole budget. */
-inline bool draft_ctx_may_wait(const DraftCtxDefer& d, int64_t t) {
-    return d.rows + t <= d.cap;
+/* Where a drafting sequence's context pass starts, its catch-up: its cache [lo, hi) of committed
+ * positions (lo == hi: none), its history's start `tap_lo`, and `need`, the lowest position its
+ * query reads. From `hi` when the cache reaches down to `need` (the query reads only keys it holds);
+ * otherwise the cache starts over at max(need, tap_lo) (*restart), and the sequence may draft only if
+ * that is `need` (*reach false: its history starts above what the query reads). */
+inline int64_t draft_ctx_from(int64_t lo, int64_t hi, int64_t tap_lo, int64_t need, bool* restart,
+                              bool* reach) {
+    if (hi > lo && lo <= need && hi >= need) {
+        *restart = false;
+        *reach = true;
+        return hi;
+    }
+    const int64_t from = need > tap_lo ? need : tap_lo;
+    *restart = true;
+    *reach = from <= need;
+    return from;
 }
 
 /* Every controller's totals over the run, for metrics and the shutdown report. */
 struct DraftConfStats {
-    bool    on = false, deferred = false;
+    bool    on = false, deferred = false, solo = false;
     int     load_from = 0;
     double  threshold = 0.0;
     int     probe = 0;
@@ -253,13 +273,18 @@ struct DraftConfStats {
     int64_t own[kDraftConfBins][2] = {}, dec[kDraftConfBins][2] = {}, dec1[kDraftConfBins][2] = {};
     /* Load-aware: steps in which N or more sequences decoded, and the drafts it held back. */
     int64_t load_steps = 0, load_held = 0;
-    /* The context pass: run, skipped, caught up (and the rows those covered), dropped (and the
-     * rows lost), and run only because the rows waiting had reached the cap. */
-    int64_t ctx_run = 0, ctx_skip = 0, ctx_catch = 0, ctx_catch_rows = 0, ctx_drop = 0,
-            ctx_drop_rows = 0, ctx_full = 0;
+    /* One sequence alone: steps that carried more than one sequence, or one beside another that
+     * decodes; the drafts that held back; proposals dropped from a step of two or more decoding
+     * sequences (made while their sequence was alone). */
+    int64_t solo_steps = 0, solo_held = 0, solo_dropped = 0;
+    /* The deferred context pass: passes run, steps that ran none, catch-ups (a pass reaching below
+     * its step's rows) and the rows below, and of those the restarts (the cache started over at the
+     * lowest position its query reads). */
+    int64_t ctx_run = 0, ctx_skip = 0, ctx_catch = 0, ctx_catch_rows = 0, ctx_restart = 0;
     /* Decode steps of one sequence by whether they verified head drafts and whether a query pass ran
-     * behind them, with their wall time (as DraftGateStats). */
+     * behind them, with their wall time (as DraftGateStats); and decode steps of two or more. */
     int64_t step_n[2][2] = {}, step_ns[2][2] = {};
+    int64_t multi_n = 0, multi_ns = 0;
 
     void add(const DraftConfSeq& g) {
         ++seqs;
@@ -277,6 +302,7 @@ struct DraftConfStats {
     double step_ms(int v, int d) const {
         return step_n[v][d] > 0 ? (double)step_ns[v][d] * 1e-6 / (double)step_n[v][d] : 0.0;
     }
+    double multi_ms() const { return multi_n > 0 ? (double)multi_ns * 1e-6 / (double)multi_n : 0.0; }
 };
 
 }  /* namespace rad */

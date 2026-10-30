@@ -6076,9 +6076,13 @@ TEST(dspark_bank_vram_passes_the_draft_control_scope_only_as_placed) {
     CHECK(!dspark_draft_control_scope(prog, vram, cfg, true, 0));
     CHECK(!dspark_draft_control_scope(prog, vram, cfg, true, 8));
     CHECK(!dspark_draft_control_scope(prog, vram, cfg, false, 16));
-    Config off = cfg;
-    off.max_seqs = 2;
-    CHECK(!dspark_draft_control_scope(prog, vram, off, true, 16));
+    /* Any --max-num-seqs: a step that drafts carries one sequence (the scheduler's one-sequence
+     * rule, sched/draft_conf.h). */
+    Config several = cfg;
+    several.max_seqs = 4;
+    CHECK(dspark_draft_control_scope(prog, vram, several, true, 16));
+    several.max_seqs = 0;
+    CHECK(!dspark_draft_control_scope(prog, vram, several, true, 16));
 }
 
 /* The mover gives the hot set static addresses and the parked experts none (no class, no pool); the

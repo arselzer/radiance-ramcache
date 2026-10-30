@@ -321,6 +321,32 @@ arm() {   # name, then env assignments for the server; CACHE_MIB the RAM cache (
     stop_server; return 1
   fi
   [[ -n "${ARM_DB:-}" ]] && grep -m2 -E 'runs its short block|short[0-9] query' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
+  # Dg (RADIANCE_EXPERIMENTAL_DS41_DSPARK_GATE): the scheduler says at startup that the acceptance
+  # gate is on, with its threshold, window and probe. A Dg arm without that line (a radiance without
+  # the switch), or another arm with it, is not measured.
+  local dg_lines; dg_lines=$(grep -c 'DSpark acceptance gate: on' "$OUT/$name.server.log")
+  if [[ -n "${ARM_DG:-}" && "$dg_lines" == 0 ]]; then
+    log "arm $name: Dg, but the server log has no 'DSpark acceptance gate: on' line (a radiance without the switch?); not measured"
+    stop_server; return 1
+  fi
+  if [[ -z "${ARM_DG:-}" && "$dg_lines" != 0 ]]; then
+    log "arm $name: no Dg part, but the scheduler ran the acceptance gate (the switch set for the window?); not measured"
+    stop_server; return 1
+  fi
+  [[ -n "${ARM_DG:-}" ]] && grep -m1 'DSpark acceptance gate: on' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
+  # Df (RADIANCE_EXPERIMENTAL_DS41_DSPARK_FP8): the plugin names, on each rank, the drafter's dense
+  # weights it reads from E4M3 codes. A Df arm without such a line with N above 0, or another arm
+  # with one, is not measured.
+  local df_lines; df_lines=$(grep -cE 'DSpark drafter: [1-9][0-9]* dense weights read by gemm_nt_bf16f8' "$OUT/$name.server.log")
+  if [[ -n "${ARM_DF:-}" && "$df_lines" == 0 ]]; then
+    log "arm $name: Df, but the server log has no 'DSpark drafter: N dense weights read by gemm_nt_bf16f8' line (a plugin without the switch, or F8 off?); not measured"
+    stop_server; return 1
+  fi
+  if [[ -z "${ARM_DF:-}" && "$df_lines" != 0 ]]; then
+    log "arm $name: no Df part, but the drafter read its dense weights from E4M3 codes (the switch set for the window?); not measured"
+    stop_server; return 1
+  fi
+  [[ -n "${ARM_DF:-}" ]] && grep -E 'DSpark drafter: [0-9]+ dense weights' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   # The NVMe drive's busy time (io_ticks, ms) and temperature over the requests: read-ahead arms
   # move it from ~45% busy towards saturation.
   local d0 d1 t0 t1 rc temp
@@ -374,6 +400,8 @@ arm() {   # name, then env assignments for the server; CACHE_MIB the RAM cache (
   grep -E 'consumer skip: [0-9]+ (prefill|cut) passes|rank 0: consumer skip' "$OUT/$name.server.log" | tee -a "$OUT/window.log"   # Cs: what the cut ran
   grep -E 'prefill hash: seq [0-9]+, [0-9]+ tokens: all ranks' "$OUT/$name.server.log" | tee -a "$OUT/window.log"   # Kh: a digest a prompt
   grep -E '^libr4d: RADIANCE_EXPERIMENTAL_DS41_DRAFT_GEMV' "$OUT/$name.server.log" | tail -2 | tee -a "$OUT/window.log"   # Dk/Dkt: calls taken
+  # Dg: the gate's totals, the decode steps by kind (the measured break-even), each sequence's line.
+  grep -E 'DSpark acceptance gate: ' "$OUT/$name.server.log" | grep -v 'DSpark acceptance gate: on' | tee -a "$OUT/window.log"
 }
 
 if [[ "$("${DOCKER[@]}" inspect "$NAME" --format '{{.State.Status}}' 2>/dev/null)" != running ]]; then
@@ -628,7 +656,17 @@ for a in $ARMS; do
 # DbN DSpark's query pass as a short block of N rows (2-4), [anchor, noise x (N - 1)],
 # on every decoding step (RADIANCE_EXPERIMENTAL_DS41_DSPARK_SHORT_BLOCK=N, --draft-short-from 1;
 # with DsK, N = K + 1 drafts what the cap verifies; the replies stay the target's, acceptance may
-# move; a deepseek41 plugin that has it, and a Ds part); H3 the third run home (RADIANCE_HOME_DIR3); Es
+# move; a deepseek41 plugin that has it, and a Ds part); Dg / DgTT[wW][rR] DSpark's per-sequence
+# acceptance gate (RADIANCE_EXPERIMENTAL_DS41_DSPARK_GATE=1, or 0.TT,W,R: a sequence drafts nothing
+# while the mean drafts accepted by its last W verifies, 8 by default, is under 0.TT, 0.78 by default
+# (DgTTT: T.TT), and drafts one step in R, 8, of a closed run as a probe; the context pass still
+# runs; a radiance that has it, a Ds part other than Ds0; measured only with the scheduler's
+# "DSpark acceptance gate: on" line, and every other arm runs with it 0 and must not have the line);
+# Df the drafter's dense linears from E4M3 codes as F8 reads the trunk's
+# (RADIANCE_EXPERIMENTAL_DS41_DSPARK_FP8; needs F8, a Ds part and a deepseek41 plugin that has it;
+# measured only with its "DSpark drafter: N dense weights read by gemm_nt_bf16f8" lines, every other
+# arm runs with it 0 and must not have them; at the end each Df arm's draft_n/draft_n_accepted must
+# equal the same arm's without Df); H3 the third run home (RADIANCE_HOME_DIR3); Es
 # engram_kv's rows split over the ranks (needs a deepseek41 plugin that has it); Pa the next layer's
 # attention weights read into the card's on-die cache during the CPU-row wait (same); PmN those reads
 # from the use-order list up to N MiB an issue point, the read that crosses it cut
@@ -701,7 +739,7 @@ for a in $ARMS; do
 # only on the libr4d.so whose gemm_nt_f32bf16 passed SELFTEST_F32BF16's card checks in this window.
 # An arm with a predictor part (Ps, Po, Pt, Pp) is measured only if the router predictor loaded.
   IFS=- read -r -a parts <<< "$a"
-  xt="" bt="" kld="" dk="" db=""
+  xt="" bt="" kld="" dk="" db="" dg="" df=""
   pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 HOST_POOL_MIB=4096 EXTRA_ARGS="" ARM_HOME="$RHOME" ARM_CONC=
   ARM_PROMPTS= ARM_N= ARM_LQ= rt=
   power="" skip="" ARGS=() f8="" f8x="" rb="" rbf=0 pred="" cs="" kh="" pc="" pcopt=""
@@ -777,6 +815,14 @@ for a in $ARMS; do
       Dkt)     dk=2 ;;                     # draft GEMVs: the live tail alone (DRAFT_GEMV=2)
       Db[2-4]) db=${p#Db}                  # DSpark's short query block (DSPARK_SHORT_BLOCK=N)
                ARGS+=(--draft-short-from 1) ;;
+      Dg|Dg[0-9]*)                         # DSpark's acceptance gate (DSPARK_GATE): defaults, or DgTT[wW][rR]
+               if [[ $p == Dg ]]; then dg=1
+               elif [[ $p =~ ^Dg([0-9]{2,3})(w([0-9]+))?(r([0-9]+))?$ ]]; then
+                 t=${BASH_REMATCH[1]}
+                 if (( ${#t} == 2 )); then t=0.$t; else t=${t:0:1}.${t:1}; fi
+                 dg="$t,${BASH_REMATCH[3]:-8},${BASH_REMATCH[5]:-8}"
+               else log "arm $a: $p: the gate is Dg or DgTT[wW][rR] (threshold 0.TT or T.TT, W verifies, a probe one step in R); the arm is skipped"; skip=1; fi ;;
+      Df)      df=1 ;;                     # the drafter's dense linears from E4M3 codes (DSPARK_FP8; needs F8)
       K)       env+=(RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE=1) ;;     # the RAM cache packed for the CPU only
       Vp)      env+=(RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED=1) ;;      # VRAM residents in the packed-scale form (vpack_gate)
       Lm[0-9]*) ARGS+=(--max-model-len "${p#Lm}") ;;   # a longer context (default 512), e.g. for long-prompt TTFT
@@ -874,13 +920,22 @@ for a in $ARMS; do
   # MrN: arms without it take jobs of the default 4 rows, whatever the window's environment (0 is
   # not this switch's off: any value outside 1-32 turns host experts off).
   [[ " ${env[*]} " == *" RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MAX_ROWS="* ]] || env+=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MAX_ROWS=4)
-  # Dk / Dkt / DbN act on the DSpark drafter only: without a Ds part the arm would not test them.
-  if [[ -n "$dk$db" && " ${env[*]} " != *" RADIANCE_EXPERIMENTAL_DS41_DSPARK_RAD_BANK=1 "* ]]; then
-    log "arm $a: Dk / Dkt / DbN need a Ds part (the DSpark draft bank); the arm is skipped"; skip=1
+  # Dk / Dkt / DbN / Dg / Df act on the DSpark drafter only: without a Ds part the arm would not test
+  # them. Dg gates drafts, so not with Ds0 (nothing drafts; the engine refuses the pair); Df extends
+  # the trunk's FP8 to the drafter, so it needs F8 (without it the plugin keeps the drafter bf16).
+  if [[ -n "$dk$db$dg$df" && " ${env[*]} " != *" RADIANCE_EXPERIMENTAL_DS41_DSPARK_RAD_BANK=1 "* ]]; then
+    log "arm $a: Dk / Dkt / DbN / Dg / Df need a Ds part (the DSpark draft bank); the arm is skipped"; skip=1
   fi
-  # Every arm states both switches (0 is off for both), so a window's VAR=val cannot turn them on;
+  if [[ -n "$dg" && " ${env[*]} " == *" RADIANCE_EXPERIMENTAL_DS41_DSPARK_VERIFY_CAP=0 "* ]]; then
+    log "arm $a: Dg with Ds0 (no draft to gate); the arm is skipped"; skip=1
+  fi
+  if [[ -n "$df" && -z "$f8" ]]; then
+    log "arm $a: Df needs F8 (the drafter's FP8 extends the trunk's); the arm is skipped"; skip=1
+  fi
+  # Every arm states these switches (0 is off for each), so a window's VAR=val cannot turn them on;
   # arm() checks the logs both ways. A Dk arm runs only on the libr4d.so the draft check passed on.
-  env+=(RADIANCE_EXPERIMENTAL_DS41_DRAFT_GEMV=${dk:-0} RADIANCE_EXPERIMENTAL_DS41_DSPARK_SHORT_BLOCK=${db:-0})
+  env+=(RADIANCE_EXPERIMENTAL_DS41_DRAFT_GEMV=${dk:-0} RADIANCE_EXPERIMENTAL_DS41_DSPARK_SHORT_BLOCK=${db:-0}
+        RADIANCE_EXPERIMENTAL_DS41_DSPARK_GATE=${dg:-0} RADIANCE_EXPERIMENTAL_DS41_DSPARK_FP8=${df:-0})
   if [[ -n "$dk" && -z "$skip" ]]; then
     IFS=: read -r -a homes <<< "$ARM_HOME"
     lib=""
@@ -891,7 +946,7 @@ for a in $ARMS; do
       log "arm $a: Dk refused: its libr4d.so (${lib:-none under $ARM_HOME}) is not the one the draft check passed on ($DK_LIB, sha256 ${DK_SUM:0:16})"; skip=1
     fi
   fi
-  ARM_DK=$dk ARM_DB=$db
+  ARM_DK=$dk ARM_DB=$db ARM_DG=$dg ARM_DF=$df
   if [[ -n "$xt" && -z "$skip" ]]; then
     IFS=: read -r -a homes <<< "$ARM_HOME"
     lib=""
@@ -954,6 +1009,15 @@ done
 for a in $ARMS; do
   [[ "-$a-" == *-Dk-* || "-$a-" == *-Dkt-* ]] || continue
   b=$(sed -E 's/-Dkt?(-|$)/\1/' <<< "$a")
+  if [[ " $ARMS " != *" $b "* ]]; then log "draft stats: no arm $b in this window to hold $a to"; continue; fi
+  log "draft stats: $a against $b"
+  python3 -I "$HERE/ab_requests.py" --draft-stats "$OUT" "$b" "$a" | tee -a "$OUT/window.log"
+done
+# Df arms: gemm_nt_bf16f8 gives gemm_nt's bytes, so the drafter proposes the same tokens; each Df
+# arm's draft_n and draft_n_accepted must equal the same arm's without Df, as for Dk.
+for a in $ARMS; do
+  [[ "-$a-" == *-Df-* ]] || continue
+  b=$(sed -E 's/-Df(-|$)/\1/' <<< "$a")
   if [[ " $ARMS " != *" $b "* ]]; then log "draft stats: no arm $b in this window to hold $a to"; continue; fi
   log "draft stats: $a against $b"
   python3 -I "$HERE/ab_requests.py" --draft-stats "$OUT" "$b" "$a" | tee -a "$OUT/window.log"

@@ -57,6 +57,12 @@ $(O)/ds41_n128_device_check: $(TREE)/tests/r4d_emu/test_ds41n128.cpp $(TREE)/lib
 	$(HIPCC) $(HIPFLAGS) -DDS41_N128_DEVICE -I$(TREE)/abi -I$(TREE)/libr4d -o $@ $< -ldl
 n128-check: $(O)/ds41_n128_device_check
 
+# Strict standalone FP8-window bytes against the actual current producer; GPU window only.
+$(O)/ds41_window_codec_device_check: ds41_window_codec_device_check.hip $(TREE)/arch/common/rad_ds41_window_codec.h
+	$(HIPCC) $(HIPFLAGS) -I$(TREE)/abi -o $@ $< -ldl
+window-codec-check: $(O)/ds41_window_codec_device_check
+.PHONY: window-codec-check
+
 clean:
 	rm -f ds41_host_experts_test ds41_dense_fp8_scan ds41_bf16f8_device_check
 

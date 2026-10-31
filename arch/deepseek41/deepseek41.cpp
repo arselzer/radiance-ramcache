@@ -2661,10 +2661,12 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         if (c.ratio[(size_t)l] > 0 && (rmin == 0 || c.ratio[(size_t)l] < rmin)) rmin = c.ratio[(size_t)l];
     m.work = g.max_tok + g.max_seqs;
     m.work_fit = norms_pinned();
-    /* A sizing declare keeps the real bound: step() issues the compressor tail's page, bpos and stage,
-     * and the pooled, latent and index-key rows after them, at up to m.work rows (work_rows()), so
-     * those buffers (~20 MiB at 2,048 rows) keep their real rows at every level. */
-    if (m.probe && real) m.work = real->work;
+    /* A sizing declare keeps the real bound where step() issues the compressor tail's page, bpos and
+     * stage, and the pooled, latent and index-key rows after them, at m.work rows whatever the step's
+     * size (no work_fit), so those buffers (~20 MiB at 2,048 rows) keep their real rows at every level.
+     * Fitted, a step of at most a level's rows issues at most that level's own bound (work_rows():
+     * T + S at most), so the level declares them for its rows. */
+    if (m.probe && real && !m.work_fit) m.work = real->work;
     m.cmax = g.max_ctx / std::max<int64_t>(rmin, 1) + 1;
     index_runs(m, real);
     DS_TRY(buffers(b, m));

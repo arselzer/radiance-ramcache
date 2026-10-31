@@ -17,6 +17,8 @@
  *     (the core's operand guard checks the active level's extents): the compressor tail's work-sized
  *     buffers, which step() issues at the real bound whatever the step, keep their real rows; a
  *     2,048-row step does not fit the level (the guard's control);
+ *   - beside LCP, as P1 runs, step() issues those at a step's own bound (work_rows()), so the level
+ *     declares them for its own rows, and steps of its rows still fit;
  *   - laid out as the core does (persistent buffers at the bottom, transients packed largest first
  *     by lifetime), the 256-row level ends far below the full plan: the lent arena's room, printed. */
 #define RAD_ARCH_NO_EXPORTS 1
@@ -38,6 +40,8 @@ constexpr int kWorld = 4;
 
 const char* const kVars[] = { "RADIANCE_EXPERIMENTAL_DS41_P1",
                               "RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA",
+                              "RADIANCE_EXPERIMENTAL_DS41_LCP",
+                              "RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL",
                               "RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP",
                               "RADIANCE_EXPERIMENTAL_DS41_PREFETCH_ATTN",
                               "RADIANCE_EXPERIMENTAL_DS41_PREFETCH_MIB",
@@ -363,6 +367,51 @@ TEST(a_step_of_the_levels_rows_stays_inside_its_buffers) {
         CHECK(!overruns(real->b, probe->b, big->b, rank, nullptr).empty());
         CHECK(overruns(real->b, real->b, big->b, rank, nullptr).empty());
     }
+}
+
+TEST(beside_lcp_a_level_sizes_the_compressors_work_rows_for_itself) {
+    int64_t level_at[2] = { 0, 0 };
+    for (int lcp = 0; lcp < 2; ++lcp) {
+        Env e{ WINDOW_SWITCHES };
+        if (lcp) setenv("RADIANCE_EXPERIMENTAL_DS41_LCP", "2048", 1);
+        for (int rank = 0; rank < kWorld; ++rank) {
+            auto real = declare(rank, 2048, false);
+            REQUIRE_EQ(real->rc, RAD_OK);
+            CHECK_EQ(real->m->work_fit, lcp == 1);
+            auto probe = declare(rank, 256, true);
+            REQUIRE_EQ(probe->rc, RAD_OK);
+            const std::string why = differs(real->b, probe->b);
+            CHECK(why.empty());
+            if (!why.empty()) std::fprintf(stderr, "  rank %d: %s\n", rank, why.c_str());
+            /* The work bound, max_tok + max_seqs: the real one's without the pins, the level's beside them. */
+            const RecBuf* st = find_b(probe->b, "comp_stage");
+            const RecBuf* pg = find_b(probe->b, "comp_page");
+            REQUIRE(st != nullptr && pg != nullptr);
+            CHECK_EQ(pg->d.shape[0], lcp ? (int64_t)257 : (int64_t)2049);
+            CHECK_EQ(st->d.shape[0], 2 * pg->d.shape[0]);
+            struct Step { std::vector<int> dq, pq; int32_t at; } steps[] = {
+                { { 1 }, {}, 0 }, { {}, { 16 }, 0 }, { {}, { 256 }, 0 }, { {}, { 256 }, 1041 }, { {}, { 37 }, 300 },
+            };
+            for (const Step& s : steps) {
+                auto k = kit(real->b, s.dq, s.pq, s.at);
+                std::string fail;
+                const std::vector<std::string> past = overruns(real->b, probe->b, k->b, rank, &fail);
+                CHECK(fail.empty());
+                CHECK(past.empty());
+                if (!fail.empty() || !past.empty())
+                    std::fprintf(stderr, "  rank %d, %lld rows: %s%s\n", rank, (long long)k->b.n_tok, fail.c_str(),
+                                 past.empty() ? "" : past[0].c_str());
+            }
+            auto big = kit(real->b, {}, { 2048 }, 1040);
+            CHECK(!overruns(real->b, probe->b, big->b, rank, nullptr).empty());
+            if (rank) continue;
+            int64_t full = 0;
+            arena(real->b, probe->b, &full, &level_at[lcp]);
+        }
+    }
+    std::fprintf(stderr, "  T 2048: the 256-row level ends at %.1f MiB, %.1f beside LCP\n", level_at[0] / 1048576.0,
+                 level_at[1] / 1048576.0);
+    CHECK(level_at[1] < level_at[0]);
 }
 
 TEST(the_256_row_level_ends_far_below_the_full_plan) {

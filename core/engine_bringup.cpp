@@ -4432,7 +4432,7 @@ int Engine::start() {
             return RAD_E_UNSUPPORTED;
         }
         bool concurrent_policy = false;
-        if (draft_experiment_.query_free()) {
+        if (draft_experiment_.query_free() || draft_experiment_.query_copy_stats()) {
             bool native = bool(source_banks_) && !cfg_.lora.enabled() && !cfg_.media_flags_set();
             for (const auto& r : ranks_)
                 native &= dspark_draft_control_scope(r->program, r->plan, cfg_, bool(source_banks_), draft_vram_n_) &&
@@ -4445,7 +4445,7 @@ int Engine::start() {
                 (lend && std::strcmp(lend, "0"))) {
                 RAD_ERR("%s requires native deterministic TP4 fixed bank, max-num-seqs1, "
                         "Db2/from1/depth5, fixed early0 and explicit Dx1; no TBO/tree/media/LoRA/lender",
-                        kDraftQueryFreeEnv);
+                        draft_experiment_.query_free() ? kDraftQueryFreeEnv : kDraftQueryCopyEnv);
                 return RAD_E_UNSUPPORTED;
             }
         }

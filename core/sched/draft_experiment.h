@@ -10,6 +10,7 @@
 #include "draft_prob.h"
 #include "draft_policy.h"
 #include "draft_query_free.h"
+#include "draft_query_copy.h"
 
 namespace rad {
 inline constexpr char kDraftOriginEnv[] = "RADIANCE_EXPERIMENTAL_DS41_DRAFT_ORIGIN_STATS";
@@ -27,7 +28,8 @@ public:
                                    const char* prob = nullptr,
                                    const char* early = nullptr,
                                    const char* prefix_policy = nullptr,
-                                   const char* query_free = nullptr) noexcept {
+                                   const char* query_free = nullptr,
+                                   const char* query_copy = nullptr) noexcept {
         DraftExperiment x;
         const bool valid_cap = !verify_cap ||
             (verify_cap[0] >= '0' && verify_cap[0] <= '5' && verify_cap[1] == '\0');
@@ -60,6 +62,9 @@ public:
         x.query_free_ = one(query_free);
         if (!flag(query_free) || (x.query_free_ &&
             (x.early_ != 0 || !x.ctx_defer_ || x.prob_ || x.prefix_policy_.on))) x.valid_ = false;
+        x.query_copy_ = one(query_copy);
+        if (!flag(query_copy) || (x.query_copy_ &&
+            (x.early_ != 0 || !x.ctx_defer_ || x.prob_ || x.prefix_policy_.on))) x.valid_ = false;
         return x;
     }
     bool valid() const noexcept { return valid_; }
@@ -76,6 +81,7 @@ public:
     const DraftPrefixPolicy& prefix_policy() const noexcept { return prefix_policy_; }
     bool early_boundary() const noexcept { return early_ >= 0 || prefix_policy_.on; }
     bool query_free() const noexcept { return query_free_; }
+    bool query_copy_stats() const noexcept { return query_copy_; }
     bool scope_required() const noexcept { return off_ || cap_ >= 0 || early_boundary(); }
     int runtime_depth(int configured) const noexcept {
         if (off_) return 0;
@@ -94,6 +100,7 @@ private:
     bool ctx_defer_ = false;
     bool prob_ = false;
     bool query_free_ = false;
+    bool query_copy_ = false;
     int early_ = -1;
     DraftPrefixPolicy prefix_policy_{};
     static bool one(const char* x) noexcept { return x && std::strcmp(x,"1") == 0; }

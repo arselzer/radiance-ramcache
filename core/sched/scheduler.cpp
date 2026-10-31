@@ -996,9 +996,9 @@ void Scheduler::add_all(std::unique_ptr<Request>* rs, size_t n, int* rc) {
 
 int Scheduler::add_locked(std::unique_ptr<Request> r) {
     if (!r) return RAD_E_INVAL;
-    if (draft_experiment_.query_free() && !draft_query_free_request(*r)) {
+    if ((draft_experiment_.query_free() || draft_experiment_.query_copy_stats()) && !draft_query_free_request(*r)) {
         RAD_WARN("request %llu refused: %s requires a plain greedy text request",
-                 (unsigned long long)r->id, kDraftQueryFreeEnv);
+                 (unsigned long long)r->id, draft_experiment_.query_free() ? kDraftQueryFreeEnv : kDraftQueryCopyEnv);
         return RAD_E_UNSUPPORTED;
     }
     if (r->prompt.empty()) return RAD_E_INVAL;

@@ -5,6 +5,20 @@ admission policy or performance result. It must not delay the separate packed/gr
 The earlier historical/feasibility audit is commit b7077af2, `DS41-QUERY-ADMISSION-AUDIT.md`.
 No thresholds are changed and no held-out cases are selected, fitted or replayed here.
 
+The separate `DSPARK_QUERY_COPY_STATS=1` measurement instrumentation requires the same native
+fixed0/Dx1/Db2/N1/greedy profile in both Q and NQ. It counts successful observer and StepSlot D2H
+enqueue calls and their actual byte arguments at the two existing rank0 query-copy sites. A real
+pre-epoch step/seq/slot/card owner is bound to the normal query epoch only AFTER existing context
+and observation-echo ownership validation. No target copy, timer, copy or device operation is
+added. Its six pure host source cases cover successes, failed enqueues, orphan/duplicate/wrong
+width copies, pending-frame refusal, owner/epoch mismatch and empty NQ state; still unexecuted.
+Existing totals append rank0 scope, calls/bytes, actual physical widths, bound epochs and final
+unbound/mismatch counts only with this explicit flag. NQ must have no pending frame/epoch/copy;
+Q requires exactly one successful observer/slot pair per actual bound epoch. Flag0 preserves
+previous summary text. The new SOURCE runner in `work/autonomous-20261031/query-free-cost` uses
+the explicit paired flag, actual origin metrics and normal guarded lifecycle; the old default
+Dmnq harness guard intentionally does not accept this richer receipt without its dedicated gate.
+
 ## Exact scope and seam
 
 `RADIANCE_EXPERIMENTAL_DS41_DSPARK_QUERY_FREE=1` requires explicit fixed early0 and Dx1.

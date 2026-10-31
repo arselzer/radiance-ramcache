@@ -638,6 +638,8 @@ int Engine::issue_block_drafter(int step, StepOut& so) {
     if (n <= 0) return RAD_OK;
     const RadBatch* qb = sched_.block_query(step);
     if (!qb) return RAD_OK;
+    if (draft_experiment_.query_copy_stats() && (n != 1 ||
+        !dquery_copy_.begin(step, block_row_[0].seq, block_row_[0].slot, block_row_[0].card))) return RAD_E_STATE;
     RAD_TRY(advance_all(ADV_BLOCK, 0, false));
     RAD_TRY(block_pass(qb, "query", step));
     if (draft_bank_loan_) RAD_TRY(draft_bank_lend_query_issued(step, qb->n_tok));
@@ -655,8 +657,12 @@ int Engine::issue_block_drafter(int step, StepOut& so) {
                                     (int64_t)n * (int64_t)sizeof(RadMtpCoupleState), steps,
                                     r0.ctx.stream()));
     }
-    RAD_TRY(rad_memcpy_async(slots_host_, r0.step_slots,
-                             (int64_t)cfg_.max_seqs * (int64_t)sizeof(StepSlot), r0.ctx.stream()));
+    const int64_t slot_copy_bytes = (int64_t)cfg_.max_seqs * (int64_t)sizeof(StepSlot);
+    const int slot_copy_status = rad_memcpy_async(slots_host_, r0.step_slots, slot_copy_bytes, r0.ctx.stream());
+    if (draft_experiment_.query_copy_stats() &&
+        !dquery_copy_.copied(slot_copy_status, DraftQueryCopyStats::Slots, (uint64_t)slot_copy_bytes))
+        return slot_copy_status < 0 ? slot_copy_status : RAD_E_STATE;
+    RAD_TRY(slot_copy_status);
     block_rows_ = n;
     return RAD_OK;
 }

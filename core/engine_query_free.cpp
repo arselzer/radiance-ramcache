@@ -7,6 +7,8 @@
 namespace rad {
 int Engine::dnq_ready(const RadBatch* batch, const StepOut& so) {
     if (!draft_experiment_.query_free() || !batch || block_rows_ != 0) return RAD_E_STATE;
+    if (dquery_copy_.pending() || dquery_copy_.started || dquery_copy_.observer_calls || dquery_copy_.slot_calls)
+        return RAD_E_STATE; // NQ cannot carry even a pending query-copy frame
     if (!dnq_candidate_.seq) { dnq_.pause(); return RAD_OK; }
     if (dnq_candidate_.step != batch->step || so.first_row.size() != 1 ||
         so.first_row[0] != 0 || !so.rb || so.n_rows != 1 || dnq_boundary_ == UINT64_MAX)
@@ -41,13 +43,14 @@ int Engine::dnq_finish(const StepOut& so) {
 
 void Engine::dnq_report() const {
     const DraftQueryFreeMeter& s = dnq_;
+    const std::string query_copy = dquery_copy_summary();
     RAD_INFO("DSpark query-free totals: opportunities=%llu waits=%llu wait_ns=%llu context_rows=%llu "
              "query_issues=0 query_rows=0 observers=0 query_epochs=0 publications=0 "
-             "transition=%llu no_opportunity=%llu end_cancel=%llu unclosed_boundary=%llu",
+             "transition=%llu no_opportunity=%llu end_cancel=%llu unclosed_boundary=%llu%s",
              (unsigned long long)s.boundaries, (unsigned long long)s.waits,
              (unsigned long long)s.wait_all_ns, (unsigned long long)s.context_rows,
              (unsigned long long)s.transition, (unsigned long long)s.no_opportunity,
-             (unsigned long long)s.end_cancel, (unsigned long long)s.pending.boundary);
+             (unsigned long long)s.end_cancel, (unsigned long long)s.pending.boundary, query_copy.c_str());
     RAD_INFO("DSpark query-free costs: label=C0NQ n=%llu cycle_ns=%llu wait_ns=%llu emitted=%llu "
              "mean_ms=%.6f; consecutive target-commit-bound pure-decode opportunities only; "
              "context retained, early wait retained, no query/observer/query readback",

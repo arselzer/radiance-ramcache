@@ -71,6 +71,15 @@ int Engine::dprob_init() {
     dprob_host_ = static_cast<float*>(rad_dev_alloc(
         dprob_rows_ * rad_dflash_observe::kWidth * (int64_t)sizeof(float), RAD_MEM_HOST_PINNED));
     if (!dprob_host_) return RAD_E_NOMEM;
+    if (draft_experiment_.query_copy_stats()) {
+        if (!dquery_copy_.configure(rad_dflash_observe::kWidth * sizeof(float),
+                                   (uint64_t)cfg_.max_seqs * sizeof(StepSlot))) return RAD_E_STATE;
+        RAD_INFO("DSpark query-copy counters: on (%s); scope=rank0 successful query-owned enqueues, "
+                 "observer_row_bytes=%llu slot_bytes=%llu binding=step/seq/slot/card/epoch; "
+                 "no target copies counted and no copy/timer added", kDraftQueryCopyEnv,
+                 (unsigned long long)dquery_copy_.observer_row_bytes,
+                 (unsigned long long)dquery_copy_.slot_copy_bytes);
+    }
     if (draft_experiment_.prob_capture() && !policy)
         RAD_INFO("DSpark read-only proposal capture: on (%s); depths 1/2, candidate_p is softmax at "
              "temperature 1 over the existing %d Markov-conditioned candidates, NOT full-vocabulary "
@@ -118,8 +127,12 @@ int Engine::dprob_issue(int n) {
     Rank& r0 = *ranks_[0];
     const void* src = r0.ctx.buf_ptr(dprob_buf_);
     if (!src) return RAD_E_STATE;
-    return rad_memcpy_async(dprob_host_, src,
-                           (int64_t)n * rad_dflash_observe::kWidth * (int64_t)sizeof(float), r0.ctx.stream());
+    const int64_t bytes = (int64_t)n * rad_dflash_observe::kWidth * (int64_t)sizeof(float);
+    const int status = rad_memcpy_async(dprob_host_, src, bytes, r0.ctx.stream());
+    if (draft_experiment_.query_copy_stats() &&
+        !dquery_copy_.copied(status, DraftQueryCopyStats::Observer, (uint64_t)bytes))
+        return status < 0 ? status : RAD_E_STATE;
+    return status;
 }
 
 void Engine::dprob_finish(int row, const int32_t* tokens, int n, bool published) {
@@ -184,6 +197,10 @@ int Engine::dmeasure_ready(const RadBatch* batch) {
     frame.invalid_depths = invalid_depths;
     frame.ready_ns = ready; frame.wait_ns = ready - begin;
     std::copy(slot.tok + 1, slot.tok + 1 + block_steps_, frame.ids);
+    /* Only after the existing sequence/slot/context and observation echo checks. The copy
+     * sites recorded their real pre-epoch owner; no wait is treated as evidence of a copy. */
+    if (draft_experiment_.query_copy_stats() &&
+        !dquery_copy_.bind(frame.step, frame.seq, row.slot, frame.card, frame.epoch)) return RAD_E_STATE;
     const StepPlan& plan = sched_.plan();
     frame.pure_decode = plan.phase == RAD_PHASE_DECODE && plan.e.size() == 1 &&
                         !plan.e[0].is_prefill && !plan.e[0].ngram && plan.e[0].produces_token;
@@ -279,6 +296,7 @@ void Engine::dmeasure_finish(const StepOut& so) {
 void Engine::dmeasure_report() const {
     if (!draft_experiment_.early_boundary()) return;
     if (draft_experiment_.query_free()) { dnq_report(); return; }
+    const std::string query_copy = dquery_copy_summary();
     const DraftMeasureStats& s = dmeasure_.stats;
     if (draft_experiment_.prefix_policy().on) {
         RAD_INFO("DSpark prefix policy totals: queries=%llu query_rows=%llu observers=%llu waits=%llu "
@@ -294,12 +312,12 @@ void Engine::dmeasure_report() const {
     }
     RAD_INFO("DSpark matched early totals: queries=%llu query_rows=%llu observers=%llu waits=%llu "
              "wait_ns=%llu transition=%llu no_query=%llu end_cancel=%llu unpublished=%llu "
-             "invalid_queries=%llu invalid_cycles=%llu unclosed_epoch=%llu",
+             "invalid_queries=%llu invalid_cycles=%llu unclosed_epoch=%llu%s",
              (unsigned long long)s.queries, (unsigned long long)s.query_rows, (unsigned long long)s.queries,
              (unsigned long long)s.waits, (unsigned long long)s.wait_all_ns, (unsigned long long)s.transition,
              (unsigned long long)s.no_query, (unsigned long long)s.end_cancel, (unsigned long long)s.unpublished,
              (unsigned long long)s.invalid_queries, (unsigned long long)s.invalid_cycles,
-             (unsigned long long)dmeasure_.pending.epoch);
+             (unsigned long long)dmeasure_.pending.epoch, query_copy.c_str());
     for (int k = 0; k < 3; ++k)
         RAD_INFO("DSpark matched early costs: k=%d n=%llu cycle_ns=%llu wait_ns=%llu accepted=%llu emitted=%llu "
                  "mean_ms=%.6f; consecutive same-sequence/epoch-bound pure-decode cycles only; includes query/observer/wait and logging=%s",
@@ -307,5 +325,20 @@ void Engine::dmeasure_report() const {
                  (unsigned long long)s.accepted[k], (unsigned long long)s.emitted[k],
                  s.n[k] ? (double)s.ns[k] / (double)s.n[k] * 1e-6 : 0.,
                  draft_experiment_.prob_capture() ? "capture" : "quiet (debug logs follow RADIANCE_LOG/-v)");
+}
+
+std::string Engine::dquery_copy_summary() const {
+    if (!draft_experiment_.query_copy_stats()) return {};
+    const DraftQueryCopyStats& s = dquery_copy_;
+    return fmt(" query_copy_scope=rank0 query_observer_d2h_calls=%llu query_observer_d2h_bytes=%llu "
+               "query_slot_d2h_calls=%llu query_slot_d2h_bytes=%llu query_copy_bound_epochs=%llu "
+               "query_copy_unbound=%llu query_copy_owner_mismatches=%llu query_copy_observer_row_bytes=%llu "
+               "query_copy_slot_bytes=%llu query_copy_last_epoch=%llu query_copy_last_seq=%llu",
+               (unsigned long long)s.observer_calls, (unsigned long long)s.observer_bytes,
+               (unsigned long long)s.slot_calls, (unsigned long long)s.slot_bytes,
+               (unsigned long long)s.bound_epochs, (unsigned long long)s.unbound(),
+               (unsigned long long)s.owner_mismatches, (unsigned long long)s.observer_row_bytes,
+               (unsigned long long)s.slot_copy_bytes, (unsigned long long)s.last_epoch,
+               (unsigned long long)s.last_seq);
 }
 }

@@ -680,6 +680,8 @@ private:
     DraftQueryFreeFrame dnq_candidate_{};
     DraftQueryFreeMeter dnq_{};
     uint64_t dnq_boundary_ = 0;
+    DraftQueryCopyStats dquery_copy_{};
+    std::string dquery_copy_summary() const;
     int dpolicy_concurrent_open();
     void dpolicy_pause(int step, const char* reason);
     int dmeasure_check(int row, const int32_t* tokens, int n) const;

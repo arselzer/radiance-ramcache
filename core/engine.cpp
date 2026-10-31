@@ -62,7 +62,8 @@ Engine::Engine(Config cfg)
                                                   std::getenv(rad_dflash_observe::kEnv),
                                                   std::getenv(rad_dflash_observe::kEarlyEnv),
                                                   std::getenv(rad_dflash_observe::kPolicyEnv),
-                                                  std::getenv(kDraftQueryFreeEnv))), env_set_(diag::env_names(environ, "RADIANCE_")) {}
+                                                  std::getenv(kDraftQueryFreeEnv),
+                                                  std::getenv(kDraftQueryCopyEnv))), env_set_(diag::env_names(environ, "RADIANCE_")) {}
 
 int32_t* Engine::Readback::reserve(int64_t count) {
     if (count <= n) return p;

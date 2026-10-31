@@ -1884,9 +1884,9 @@ TEST(every_packed_kv_operand_refuses_plain_writers_readers_wrong_roles_and_later
             });
         };
         refused(f, high(row_fallback), RAD_E_SHAPE, "explicit packed reader/writer contract");
-        refused(f, high(format_fallback), RAD_E_SHAPE, "matching explicit declared and resolved kv_format");
+        refused(f, high(format_fallback), RAD_E_SHAPE, "matching explicit declared and resolved storage format");
         refused(f, issue_once(f, step++, missing_declaration, operands), RAD_E_SHAPE,
-                 "matching explicit declared and resolved kv_format");
+                 "matching explicit declared and resolved storage format");
         refused(f, issue_once(f, step++, old_writer, operands), RAD_E_SHAPE, "packed");
         refused(f, issue_once(f, step++, old_reader, operands), RAD_E_SHAPE, "packed");
         std::vector<RadOperand> wrong(operands.size(), RAD_NONE);

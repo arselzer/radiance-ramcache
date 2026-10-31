@@ -369,7 +369,7 @@ TEST(ds41_packed_full_pages_leave_raw_f32_and_window_snapshot_bytes_unchanged) {
     REQUIRE_EQ(f.kv.ensure(1, 8), RAD_OK);
     std::vector<int32_t> source((size_t)f.kv.n_groups(), -1), target = source;
     source[Tail] = f.kv.state_slot(1, Tail);
-    target[Tail] = f.kv.state_slot(2, Tail);
+    REQUIRE(source[Tail] >= 0);
     for (int64_t l = 0; l < tail->n_layers; ++l)
         std::memset(f.kv.state_ptr(Tail, (int32_t)l, source[Tail]), (int)(0x41 + l),
                     (size_t)tail->layer_bytes_per_state());
@@ -383,11 +383,15 @@ TEST(ds41_packed_full_pages_leave_raw_f32_and_window_snapshot_bytes_unchanged) {
     REQUIRE_EQ(f.kv.alloc_checkpoint(&ck), RAD_OK);
     RadStream stream = nullptr;
     REQUIRE_EQ(rad_stream_create(&stream, 0), RAD_OK);
-    CHECK_OK(f.kv.checkpoint_save(source.data(), (int)source.size(), ck, stream, &rows));
-    CHECK_OK(f.kv.seed_window(2, 8));
+    REQUIRE_EQ(f.kv.checkpoint_save(source.data(), (int)source.size(), ck, stream, &rows), RAD_OK);
+    REQUIRE_EQ(f.kv.seed_window(2, 8), RAD_OK);
+    // Match admission after a prefix hit: seed first, then reserve the next chunk's state.
+    REQUIRE_EQ(f.kv.ensure(2, 12, 8), RAD_OK);
+    target[Tail] = f.kv.state_slot(2, Tail);
+    REQUIRE(target[Tail] >= 0);
     std::vector<int32_t> restored;
     REQUIRE(f.kv.window_rows(2, 8, &restored));
-    CHECK_OK(f.kv.checkpoint_restore(target.data(), (int)target.size(), ck, stream, &restored));
+    REQUIRE_EQ(f.kv.checkpoint_restore(target.data(), (int)target.size(), ck, stream, &restored), RAD_OK);
     CHECK_OK(rad_stream_sync(stream));
     for (int64_t l = 0; l < tail->n_layers; ++l)
         CHECK_EQ(std::memcmp(f.kv.state_ptr(Tail, (int32_t)l, source[Tail]),
@@ -427,10 +431,14 @@ TEST(ds41_packed_native_window_uses_physical_floor_and_checkpoint_fragments) {
     CHECK_EQ(binding[Window].shape[1],8448ll);
     HostArena store;REQUIRE_EQ(store.open(f.kv.checkpoint_bytes(),2*f.kv.checkpoint_bytes()),RAD_OK);
     f.kv.set_checkpoint_store(&store,0);REQUIRE_EQ(f.kv.add_sequence(1),RAD_OK);REQUIRE_EQ(f.kv.add_sequence(2),RAD_OK);
-    REQUIRE_EQ(f.kv.ensure(1,23),RAD_OK);
+    // Native window snapshots require the original block16 checkpoint boundary.
+    constexpr int64_t pos = 32;
+    REQUIRE_EQ(f.kv.ensure(1,pos),RAD_OK);
     std::vector<int32_t> source((size_t)f.kv.n_groups(),-1),target=source;
-    source[Tail]=f.kv.state_slot(1,Tail);target[Tail]=f.kv.state_slot(2,Tail);
-    std::vector<int32_t> rows;REQUIRE(f.kv.window_rows(1,23,&rows));
+    source[Tail]=f.kv.state_slot(1,Tail);REQUIRE(source[Tail]>=0);
+    std::vector<int32_t> rows;
+    CHECK(!f.kv.window_rows(1,23,&rows)); // A partial block is not a snapshot.
+    REQUIRE(f.kv.window_rows(1,pos,&rows));
     for(int64_t l=0;l<win->n_layers;++l)for(size_t j=0;j<rows.size();++j)if(rows[j]>=0){
         auto*dst=page(*win,l,rows[j]);
         for(int r=0;r<16;++r)for(int g=0;g<16;++g){auto*p=dst+r*528+g*32;
@@ -441,9 +449,12 @@ TEST(ds41_packed_native_window_uses_physical_floor_and_checkpoint_fragments) {
     }
     int32_t ck=-1;REQUIRE_EQ(f.kv.alloc_checkpoint(&ck),RAD_OK);RadStream stream=nullptr;
     REQUIRE_EQ(rad_stream_create(&stream,0),RAD_OK);
-    CHECK_OK(f.kv.checkpoint_save(source.data(),source.size(),ck,stream,&rows));
-    CHECK_OK(f.kv.seed_window(2,23));std::vector<int32_t> restored;REQUIRE(f.kv.window_rows(2,23,&restored));
-    CHECK_OK(f.kv.checkpoint_restore(target.data(),target.size(),ck,stream,&restored));CHECK_OK(rad_stream_sync(stream));
+    REQUIRE_EQ(f.kv.checkpoint_save(source.data(),source.size(),ck,stream,&rows),RAD_OK);
+    REQUIRE_EQ(f.kv.seed_window(2,pos),RAD_OK);
+    REQUIRE_EQ(f.kv.ensure(2,pos+16,pos),RAD_OK);
+    target[Tail]=f.kv.state_slot(2,Tail);REQUIRE(target[Tail]>=0);
+    std::vector<int32_t> restored;REQUIRE(f.kv.window_rows(2,pos,&restored));
+    REQUIRE_EQ(f.kv.checkpoint_restore(target.data(),target.size(),ck,stream,&restored),RAD_OK);CHECK_OK(rad_stream_sync(stream));
     REQUIRE_EQ(rows.size(),restored.size());
     for(int64_t l=0;l<win->n_layers;++l)for(size_t j=0;j<rows.size();++j)if(rows[j]>=0){
         REQUIRE(restored[j]>=0);CHECK_EQ(std::memcmp(page(*win,l,rows[j]),page(*win,l,restored[j]),8448),0);}

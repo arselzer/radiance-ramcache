@@ -137,7 +137,7 @@
 #
 # Environment: RADIANCE_BIN (the binary), RADIANCE_HOME_DIR (kernels/ and architectures/ for it),
 # SILU_TABLE (the card's silu table), ARMS (default "base verify greedy"), HX_THREADS (16),
-# VERIFY_REQUESTS (3), DEVICE_CHECKS (1; a list: `tall` the exact-tall checks, `lcp` the large-chunk
+# VERIFY_REQUESTS (3), DEVICE_CHECKS (1; a list: `swiglu` the default checks, `tall` the exact-tall checks, `lcp` the large-chunk
 # ones at LCP_CHECK_C, both with TALL_LIBR4D and TALL_CHECK),
 # SELFTEST_F32BF16 (an r4d_selftest: gemm_nt_f32bf16's checks and timings on card 0 before the
 # arms; unset, none, and no Rb arm runs).
@@ -1094,7 +1094,7 @@ if [[ " ${DEVICE_CHECKS:-1} " == *" tall "* ]]; then
     fi
   fi
 fi
-if [[ "${DEVICE_CHECKS:-1}" == 1 && -x "$HERE/build/ds41_mxfp4_device_check" ]]; then
+if [[ ( "${DEVICE_CHECKS:-1}" == 1 || " ${DEVICE_CHECKS:-1} " == *" swiglu "* ) && -x "$HERE/build/ds41_mxfp4_device_check" ]]; then
   # The served plugin's swiglu over every (gate, up) pair, mismatches classified, and the
   # whole host chain against its decode kernels; the table recaptured and compared.
   log "device checks on card 0 with $RHOME/kernels/libr4d.so"

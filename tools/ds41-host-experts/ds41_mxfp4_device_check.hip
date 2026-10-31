@@ -1847,7 +1847,10 @@ int bal_check(const Lib& L, const char* routes_path) {
     tab_dn.put(tdn.data());
     const int Mmax = std::max(16, C);
     Dev x((size_t)Mmax * kEmbd * 2), act((size_t)Mmax * kTop * kFf * 2), so((size_t)Mmax * kTop * 4), of((kNe + 1) * 4);
-    Dev y0((size_t)Mmax * kTop * kEmbd * 2), y1((size_t)Mmax * kTop * kEmbd * 2);   /* the larger N of the two */
+    /* Keep redzones immediately around the active output shape, including when gate_up's N is
+     * smaller than down's. A shared wrong extent must not pass old/new output equality. */
+    constexpr size_t guard = 256;
+    Dev y0((size_t)Mmax * kTop * kEmbd * 2 + 2 * guard), y1((size_t)Mmax * kTop * kEmbd * 2 + 2 * guard);
     {
         std::vector<uint16_t> h((size_t)Mmax * kTop * kFf);
         for (size_t i = 0; i < (size_t)Mmax * kEmbd; i += kEmbd) {
@@ -1917,10 +1920,13 @@ int bal_check(const Lib& L, const char* routes_path) {
                 2 * kFf, kEmbd, kEmbd, kFf);
     std::printf("%-14s %5s %5s %6s %5s %7s | %11s %11s | %11s %11s | %7s\n", "routing", "M", "rank", "local", "live",
                 "busiest", "gu plain us", "gu bal us", "dn plain us", "dn bal us", "speedup");
+    if (C > 2048)
+        std::printf("bal: heights above M2048 are byte-only: one plain and one balanced launch per projection/profile; no timings\n");
     auto point = [&](const char* label, const BalRoute& r, int M, int rank) {
         HC(hipMemcpy(so.p, r.sorted.data(), r.sorted.size() * 4, hipMemcpyHostToDevice));
         of.put(r.off.data());
         const int T = M * kTop, tall = M > 16 ? 1 : 0;
+        const bool byte_only = M > 2048;
         double us[4] = { 0, 0, 0, 0 };
         for (int proj = 0; proj < 2; ++proj) {
             const bool g = proj == 0;
@@ -1930,10 +1936,14 @@ int bal_check(const Lib& L, const char* routes_path) {
             const int AR = g ? M : T;
             const char* order = g ? "token" : "sorted";
             const size_t n = (size_t)T * N;
-            HC(hipMemset(y0.p, 0xAA, n * 2));
-            HC(hipMemset(y1.p, 0x55, n * 2));
+            for (Dev* d : { &y0, &y1 }) {
+                HC(hipMemset(d->p, 0xA5, guard));
+                HC(hipMemset((char*)d->p + guard + n * 2, 0xA5, guard));
+            }
+            HC(hipMemset((char*)y0.p + guard, 0xAA, n * 2));
+            HC(hipMemset((char*)y1.p + guard, 0x55, n * 2));
             for (int bal = 0; bal < 2; ++bal) {
-                void* y = bal ? y1.p : y0.p;
+                void* y = (char*)(bal ? y1.p : y0.p) + guard;
                 auto launch = [&] {
                     RadTensor t[5] = { tensor(xin, RAD_BF16, { AR, K }), tensor(tab, RAD_U8, { kNe, N, K / 32 * 17 }),
                                        tensor(so.p, RAD_I32, { T }), tensor(of.p, RAD_I32, { kNe + 1 }),
@@ -1945,7 +1955,7 @@ int bal_check(const Lib& L, const char* routes_path) {
                     a.t = t; a.n_t = 5; a.p = p; a.n_p = 6;
                     return L.moe_bal(&a, (RadStream)s, tall, bal);
                 };
-                if (!timed(launch, &us[proj * 2 + bal])) {
+                if (!(byte_only ? launch() == RAD_OK : timed(launch, &us[proj * 2 + bal]))) {
                     std::printf("FAIL %s M=%d: a launch was refused\n", label, M);
                     ++bad;
                     return;
@@ -1953,12 +1963,29 @@ int bal_check(const Lib& L, const char* routes_path) {
             }
             HC(hipStreamSynchronize(s));
             std::vector<uint16_t> h0(n), h1(n);
-            HC(hipMemcpy(h0.data(), y0.p, n * 2, hipMemcpyDeviceToHost));
-            HC(hipMemcpy(h1.data(), y1.p, n * 2, hipMemcpyDeviceToHost));
+            HC(hipMemcpy(h0.data(), (char*)y0.p + guard, n * 2, hipMemcpyDeviceToHost));
+            HC(hipMemcpy(h1.data(), (char*)y1.p + guard, n * 2, hipMemcpyDeviceToHost));
             const size_t d = count_diff(h0.data(), h1.data(), n);
             if (d) std::printf("FAIL %s M=%d rank %d %s: %zu of %zu values differ\n", label, M, rank, g ? "gate_up" : "down", d, n);
             bad += d;
             values += n;
+            for (int bal = 0; bal < 2; ++bal) {
+                const Dev& y = bal ? y1 : y0;
+                std::vector<uint8_t> pre(guard), post(guard);
+                HC(hipMemcpy(pre.data(), y.p, guard, hipMemcpyDeviceToHost));
+                HC(hipMemcpy(post.data(), (char*)y.p + guard + n * 2, guard, hipMemcpyDeviceToHost));
+                const size_t gd = (size_t)std::count_if(pre.begin(), pre.end(), [](uint8_t v) { return v != 0xA5; }) +
+                                  (size_t)std::count_if(post.begin(), post.end(), [](uint8_t v) { return v != 0xA5; });
+                if (gd) std::printf("FAIL %s M=%d rank %d %s %s: %zu output guard bytes changed\n", label, M,
+                                    rank, g ? "gate_up" : "down", bal ? "balanced" : "plain", gd);
+                bad += gd;
+            }
+        }
+        if (byte_only) {
+            std::printf("%-14s %5d %5d %6d %5d %7d | %11s %11s | %11s %11s | byte-only\n", label, M,
+                        rank, r.local, r.live, r.busiest, "byte-only", "byte-only", "byte-only", "byte-only");
+            std::fflush(stdout);
+            return;
         }
         const double p0 = us[0] + us[2], p1 = us[1] + us[3];
         sum0 += p0;
@@ -1968,8 +1995,12 @@ int bal_check(const Lib& L, const char* routes_path) {
         std::fflush(stdout);
     };
     std::vector<int> Ms = { 1, 6, 16 };
-    for (int M : { 17, 64, 256, 512, 1024, 2048 })
+    for (int M : { 17, 64, 256, 512, 1024, 2048, 3072, 4096 })
         if (M <= C && M <= reach) Ms.push_back(M);
+    /* An intermediate valid C (for example 4000) must be tested itself, not inferred from the
+     * next lower fixed sweep height. Sorting keeps the reported maximum the actual last height. */
+    if (C <= reach && std::find(Ms.begin(), Ms.end(), C) == Ms.end()) Ms.push_back(C);
+    std::sort(Ms.begin(), Ms.end());
     for (int M : Ms) {
         for (int skewed = 1; skewed >= 0; --skewed) {
             std::vector<int> picks((size_t)M * kTop);
@@ -1994,14 +2025,20 @@ int bal_check(const Lib& L, const char* routes_path) {
             }
     }
     (void)hipStreamDestroy(s);
-    std::printf("bal: %zu output values compared; summed time %.1f ms plain, %.1f ms balanced (%.1fx)\n", values,
+    std::printf("bal: %zu output values and output redzones compared; timed heights at M<=2048 only: summed time %.1f ms plain, %.1f ms balanced (%.1fx)\n", values,
                 sum0 / 1000.0, sum1 / 1000.0, sum1 > 0 ? sum0 / sum1 : 0.0);
     if (bad) {
-        std::printf("FAIL: bal: %zu values differ between the balanced and the plain kernel\n", bad);
+        std::printf("FAIL: bal: %zu output values or guard bytes differ between the balanced and the plain kernel\n", bad);
         return 1;
     }
-    std::printf(rc ? "FAIL: bal: the row table check failed\n"
-                   : "PASS: bal: the balanced gemv and twin give the plain kernel's bytes at 1..%d tokens\n", Ms.back());
+    if (rc) std::printf("FAIL: bal: the row table check failed\n");
+    else {
+        /* Machine-readable coverage belongs to this successful run, not its requested C alone. */
+        std::printf("bal: byte coverage max_M=%d requested_C=%d heights=", Ms.back(), C);
+        for (size_t i = 0; i < Ms.size(); ++i) std::printf("%s%d", i ? "," : "", Ms[i]);
+        std::printf("\nPASS: bal: the balanced gemv and twin give the plain kernel's bytes at %zu tested heights through M%d tokens (requested C%d; byte-only above M2048)\n",
+                    Ms.size(), Ms.back(), C);
+    }
     return rc;
 }
 

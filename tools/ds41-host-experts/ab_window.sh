@@ -108,7 +108,8 @@
 # which mx_range hands the rank's last expert) writes zeros without reading weights. Same bytes by
 # construction. Every arm without the part runs with it at 0. `bal` in DEVICE_CHECKS runs
 # ds41_mxfp4_device_check `bal LCP_CHECK_C [BAL_ROUTES]` on card 0 (TALL_CHECK and TALL_LIBR4D, as for
-# `lcp`): the balanced kernel against the plain one, every output value, and both timed (devcheck-bal.log);
+# `lcp`): the balanced kernel against the plain one, every output value and redzones, timed through
+# M2048 and byte-only above it (devcheck-bal.log); Mb+Lc needs the receipt's actual BAL_MAX_M to cover Lc;
 # an Mb arm runs only on the libr4d.so (sha256) that passed it. Lf: RADIANCE_EXPERIMENTAL_DS41_LCP_PROFILE=1,
 # the file stager's per-pass-size time lines at exit (an instrument; no change to what runs).
 #
@@ -462,6 +463,27 @@ n128_arm_gate() {   # library, conservative work-row bound; receipt is set by th
     return 1
   fi
   return 0
+}
+
+# Read a successful bal run's actual height list, never its command line alone or a legacy
+# generic PASS. The maximum and the requested C must both be present in the increasing list.
+bal_receipt_bound() {   # log, requested C; actual checked maximum on stdout, or refusal
+  local f=$1 want=$2 line bound requested heights prev=0 h found=""
+  [[ $want =~ ^[1-9][0-9]{0,3}$ ]] || return 1
+  line=$(grep -E '^bal: byte coverage max_M=[0-9]+ requested_C=[0-9]+ heights=[0-9]+(,[0-9]+)*$' "$f")
+  [[ $line =~ ^bal:\ byte\ coverage\ max_M=([1-9][0-9]{0,3})\ requested_C=([1-9][0-9]{0,3})\ heights=([0-9]+(,[0-9]+)*)$ ]] || return 1
+  bound=${BASH_REMATCH[1]} requested=${BASH_REMATCH[2]} heights=${BASH_REMATCH[3]}
+  (( bound <= 4096 && requested == want && bound == requested )) || return 1
+  local -a tested=()
+  IFS=, read -r -a tested <<< "$heights"
+  for h in "${tested[@]}"; do
+    [[ $h =~ ^[1-9][0-9]{0,3}$ ]] || return 1
+    (( h > prev && h <= bound )) || return 1
+    (( h == requested )) && found=1
+    prev=$h
+  done
+  [[ -n "$found" ]] && (( prev == bound )) || return 1
+  echo "$bound"
 }
 
 # A Kld arm: its server records the corpus (--kld-record) instead of serving, then exits. The
@@ -1197,7 +1219,7 @@ if [[ " ${DEVICE_CHECKS:-1} " == *" lcp "* ]]; then
 fi
 # The Mb arms' gate (RADIANCE_EXPERIMENTAL_DS41_MOE_BALANCE): an Mb arm runs only on the libr4d.so (sha256)
 # whose `bal` check passed in this window (the balanced gemv and twin give the plain kernel's bytes).
-BAL_OK="" BAL_LIB="" BAL_SUM=""
+BAL_OK="" BAL_LIB="" BAL_SUM="" BAL_MAX_M=0
 BAL_WHY="no balanced-gemv device check in this window (DEVICE_CHECKS=bal with TALL_CHECK and TALL_LIBR4D)"
 if [[ " ${DEVICE_CHECKS:-1} " == *" bal "* ]]; then
   TL=${TALL_LIBR4D:-} TC=${TALL_CHECK:-} LC=${LCP_CHECK_C:-1024}
@@ -1212,11 +1234,13 @@ if [[ " ${DEVICE_CHECKS:-1} " == *" bal "* ]]; then
       echo "bal exit $?" >>"$OUT/devcheck-bal.log" )
     grep -E '^(PASS|FAIL)|exit|^bal: ' "$OUT/devcheck-bal.log" | tail -6 | tee -a "$OUT/window.log"
     if grep -qx "bal exit 0" "$OUT/devcheck-bal.log" && grep -q '^PASS: bal: ' "$OUT/devcheck-bal.log" &&
+       BAL_MAX_M=$(bal_receipt_bound "$OUT/devcheck-bal.log" "$LC") &&
        ! grep -q '^FAIL' "$OUT/devcheck-bal.log"; then
       BAL_OK=1 BAL_LIB=$TL BAL_SUM=$(sha256sum "$TL" 2>/dev/null | cut -d' ' -f1)
-      log "balanced gemv device check passed on $TL, sha256 ${BAL_SUM:0:16}: Mb arms on it are measured"
+      log "balanced gemv device check passed through M$BAL_MAX_M on $TL, sha256 ${BAL_SUM:0:16}: covered Mb arms on it are measured"
     else
-      BAL_WHY="the balanced gemv device check did not pass on $TL (devcheck-bal.log)"
+      BAL_MAX_M=0
+      BAL_WHY="the balanced gemv device check or its actual requested-height receipt did not pass on $TL (devcheck-bal.log)"
       log "$BAL_WHY; no Mb arm is measured"
       fi
     fi
@@ -2348,6 +2372,8 @@ for a in $ARMS; do
     for h in "${homes[@]}"; do [[ -f "$h/kernels/libr4d.so" ]] && { lib=$h/kernels/libr4d.so; break; }; done
     if [[ -z "$BAL_OK" ]]; then
       log "arm $a: Mb refused: $BAL_WHY"; skip=1
+    elif (( ${lc:-${bt:-16}} > ${BAL_MAX_M:-0} )); then
+      log "arm $a: Mb refused: its row bound ${lc:-${bt:-16}} exceeds the balance oracle's actual M${BAL_MAX_M:-0}; the arm is skipped"; skip=1
     elif [[ -z "$lib" || "$(sha256sum "$lib" 2>/dev/null | cut -d' ' -f1)" != "$BAL_SUM" ]]; then
       log "arm $a: Mb refused: its libr4d.so (${lib:-none under $ARM_HOME}) is not the one the bal check passed on ($BAL_LIB, sha256 ${BAL_SUM:0:16})"; skip=1
     fi

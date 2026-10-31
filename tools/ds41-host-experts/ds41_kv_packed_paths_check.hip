@@ -181,9 +181,13 @@ bool fused_producers(void* lib) {
     return pass;
 }
 }
+// A nested byte oracle may reuse fixtures without importing this standalone entry.
+#ifndef DS41_KV_PACKED_PATHS_NO_MAIN
 int main(int argc,char**argv){
     if(argc!=2){std::fprintf(stderr,"usage: %s LIBR4D.so\n",argv[0]);return 2;}
     if(ds41_codec_oracle_main(argc,argv))return 1;
     void*lib=dlopen(argv[1],RTLD_NOW|RTLD_LOCAL);if(!lib)return 2;
     const bool a=fused_producers(lib),b=readers(lib);dlclose(lib);return a&&b?0:1;
 }
+
+#endif  // DS41_KV_PACKED_PATHS_NO_MAIN

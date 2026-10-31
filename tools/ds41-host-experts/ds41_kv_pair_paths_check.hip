@@ -1,8 +1,8 @@
 /* Future guarded GPU window ONLY. Reuse unchanged allocation/ABI/reference fixtures; no timing.
  * Existing all-form/producer checker remains a separate required gate, with unchanged output. */
-#define main ds41_kv_pair_unused_full_oracle_main
+#define DS41_KV_PACKED_PATHS_NO_MAIN
 #include "ds41_kv_packed_paths_check.hip"
-#undef main
+#undef DS41_KV_PACKED_PATHS_NO_MAIN
 #include "../../arch/common/rad_ds41_kv_pair.h"
 
 namespace {

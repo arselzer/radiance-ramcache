@@ -20,6 +20,8 @@
 #include <string_view>
 #include <vector>
 
+struct RadModelMeta;
+
 namespace rad {
 namespace gen { struct Request; struct AudioRequest; class AudioTicket; struct VideoRequest; class VideoTicket; }
 namespace mm { struct Frame; struct Item; }
@@ -135,6 +137,7 @@ struct SchedMetrics {
     double  draft_depth_adaptive = 0.0;
     int64_t draft_verify_depth[MAX_DRAFT_POS + 1] = {};
     int64_t preemptions = 0;
+    int64_t preempt_forced = 0;       /* --preempt-wait-ms fallback victims */
     int64_t total_requests = 0;
     /* Engine steps: one forward pass plus any draft rounds after it. With speculation a step
      * emits more than one token, so step time cannot be derived from tokens per second. */
@@ -550,6 +553,8 @@ public:
     virtual std::string default_prompt() const { return std::string(); }
     /* The chat template a `messages` input renders through, or null. */
     virtual IChatTemplate* message_template() const { return nullptr; }
+    /* Read-only checkpoint metadata for the server's input formatter; null when unknown. */
+    virtual const RadModelMeta* metadata() const { return nullptr; }
 };
 
 /* Multimodal preprocessing (spec §11). The server pulls the bytes out of a content part; the

@@ -55,20 +55,8 @@ constexpr uint32_t kBlock = 128;
 // bandwidth; 128 B is also full speed; 512 B needs 64 VGPRs of prefetch and does not build).
 constexpr uint32_t kFKNarrow = 256;
 
-// ---- the prefill tile's geometry ---------------------------------------------------------------
-//
-// A block owns 128 weight rows x 128 activation rows: eight waves as kPWW (weight) x kPWA
-// (activation), each wave kPTW weight tiles x kPTA activation tiles of 16 x 16. Eight accumulator
-// tiles a wave is a hard cap: each is two f32 sets (`raw` and `out`), so more spills. The staged K
-// tile is kPFK bytes, two per 128-column scale block. See gemm_8a8_prefill_kernel for the layout
-// and what was measured.
-constexpr uint32_t kPTW = 2, kPTA = 4, kPWW = 4, kPWA = 2;
-constexpr uint32_t kPBN = kPWW * kPTW * 16, kPBM = kPWA * kPTA * 16;   // weight x activation rows
-constexpr uint32_t kPWaves = kPWW * kPWA;
-constexpr uint32_t kPFK = 64;
-static_assert(kPBN == kBlock, "a block's weight rows are one scale row");
-// Activation bands per raster group of the prefill tile; see the kernel's grouping.
-constexpr uint32_t kGroupM = 8;
+// ---- the prefill tile: its geometry and body (shared with the IQR tile) ------------------------
+#include "r4d_gemm_8a8_prefill.h"
 
 // Blocks the split aims for. A fixed tuning default, not derived from the CU count: `ksplit` sets
 // the order K partials are summed in, so deriving it would make output depend on the card.
@@ -159,11 +147,11 @@ constexpr uint32_t f8_waves(bool full, uint32_t nt, uint32_t mw, uint32_t fk, bo
         if (fk == 128u)
             return nt == 1u ? 16u : nt == 2u ? (full ? 16u : 12u) : nt == 3u ? 10u
                  : (full && mw >= 8u) ? 10u : 9u;
-        /* The gated three-tile form at 8, not 9. At 9 waves' 168 registers its epilogue spilled
-         * 57 at the full tile (48 rows), which ran gate_up 51 % slower than 56 rows, and 10 below
-         * it, 70 with the LDS-staged scales. 8 waves leave 192, where it spills 9 and 10. The gated
-         * form is always MW 16, four waves a SIMD a block, so 8 and 9 both hold two blocks a WGP:
-         * no occupancy is lost. */
+        /* The gated three-tile form pins 8 waves, not 9. At 9 waves (168 registers) its epilogue
+         * spills 57 registers at the full tile (48 rows) and 10 below it, 70 with the LDS-staged
+         * scales; the full-tile spill makes gate_up 51% slower than at 56 rows. At 8 waves (192
+         * registers) it spills 9 and 10. The gated form is always MW 16, four waves a SIMD a
+         * block, so 8 and 9 waves both hold two blocks a WGP and no occupancy is lost. */
         return nt == 1u ? 12u : nt == 2u ? 10u : nt == 3u ? (gated ? 8u : 9u)
              : mw == 4u ? 7u : 8u;
     }
@@ -171,7 +159,7 @@ constexpr uint32_t f8_waves(bool full, uint32_t nt, uint32_t mw, uint32_t fk, bo
         return nt == 1u ? 16u : nt == 2u ? (full ? 10u : 12u) : nt == 3u ? (full ? 9u : 10u)
              : full ? 7u : 9u;
     /* 10, not 12. The fold's LDS-staged scales (gemm_fp8a8_kernel) need a few more
-     * registers than 12 waves' 120 leave, and spilled. gfx12 allocates registers 24 at a time, so
+     * registers than the 120 that 12 waves leave, and spill there. gfx12 allocates registers 24 at a time, so
      * 11 waves leave 120 as well and 10 is the next step (144). No decode shape puts more than 8 of
      * these waves on a SIMD, so the lower pin costs no occupancy. */
     if (nt == 1u) return 10u;
@@ -294,16 +282,15 @@ __device__ __forceinline__ void gemm_fp8a8_body(
             afrag + (size_t)(arow * ksuper + st) * r4d_fp8::kTileBytes, alive && st < ksuper);
     }
 
-    /* The fold's scales are staged through LDS a K tile ahead, beside the B tile. The
-     * fold loaded them itself, after the next tile's prefetch had been issued; loads return in
-     * order, so each fold waited for that whole prefetch, twice a tile at FK = 256, and the "one
-     * tile ahead" overlapped nothing. Now the block's threads each load one weight-scale dword and
-     * one activation scale of tile c0+FK with its B prefetch (a few each only in the selftest's
-     * one- and two-wave pins) and store them at the top of the next pass with the B tile, so a fold
-     * reads LDS. Two registers a thread: holding a tile's scales a lane (8 + 2*NT registers)
-     * spilled at the decode shapes' register pins. Same values as before: bit-identical. A dead
-     * wave's fp8 block scale reads as 0 instead of the plane row past the end it used to read; its
-     * rows are never stored.
+    /* The fold's scales are staged through LDS one K tile ahead, beside the B tile. A fold that
+     * loaded its own scales after the next tile's prefetch was issued would wait for that whole
+     * prefetch (loads return in order), twice a tile at FK = 256. Instead each thread loads one
+     * weight-scale dword and one activation scale of tile c0+FK with its B prefetch (a few each
+     * only in the selftest's one- and two-wave pins) and stores them with the B tile at the top of
+     * the next pass, so a fold reads LDS. That costs two registers a thread; holding a tile's
+     * scales per lane (8 + 2*NT registers) spills at the decode shapes' register pins. The staged
+     * values are the ones a direct load reads, so results are bit-identical. A dead wave's fp8
+     * block scale reads as 0; its rows are never stored.
      *
      * A tile holds kFolds = FK / kBlock scale blocks, and the fold at `ks` uses block ks / kBlock
      * of its tile. s_ws: I8, each wave's 16 bf16 row scales a block, [MW][kFolds][8] dwords
@@ -647,12 +634,10 @@ __device__ __forceinline__ void gemm_fp8a8_body(
             const float* const w0 = (const float*)Y;
             uint16_t* const cy = (uint16_t*)C;
             /* Consecutive threads take consecutive weight rows, which are adjacent in a
-             * partial plane ([nb][rows]), four rows a thread as one 16-byte load and kFinU quads in
-             * flight at each z. The loop walked the token index fastest, `rows` floats apart, one
-             * element a thread at a time: a cache line a load and a round trip each, which at
-             * N = 512, M = 64 (four columns of blocks finishing 8,192 elements over four planes)
-             * was most of a 45 us call. Each element is still summed from 0.0f in ascending z:
-             * bit-identical. */
+             * partial plane ([nb][rows]): four rows a thread as one 16-byte load, kFinU quads in
+             * flight at each z. Walking the token index fastest would put consecutive threads
+             * `rows` floats apart, a cache line and a round trip per element. Both branches sum
+             * each element from 0.0f in ascending z, so they are bit-identical. */
             const uint32_t nr = rhi - rlo;
             const size_t zs = (size_t)rows * nb;
             if ((rows & 3u) == 0u && (nr & 3u) == 0u && ((uintptr_t)C & 7u) == 0u
@@ -757,70 +742,55 @@ __global__ void splitk_reduce_kernel(const float* __restrict__ ws, uint16_t* __r
     y[i] = f32_to_bf16(acc);
 }
 
-// ---- the prefill tile ---------------------------------------------------------------------------
-//
-// 128 weight rows x 128 activation rows a block, eight waves as kPWW (weight) x kPWA (activation),
-// a wave kPTW weight tiles x kPTA activation tiles. The weight is the WMMA A operand, read from the
-// fragment-order plane straight into registers: a lane's 32 bytes are its four fragments for 64 k,
-// so a wave's load is one contiguous KiB and the weight never touches LDS. The activation is the B
-// operand, staged through LDS and read by the four waves that share its rows. A lane's accumulator
-// is eight consecutive weight rows of one activation row, so the fold takes one activation scale a
-// lane a tile (and the block's one weight scale), and the store is one 16-byte write.
-//
-// What decides the layout is LDS bandwidth. gfx1201 serves 64 bytes of LDS a clock per CU, loads
-// and stores alike, and issues an fp8 WMMA every 8 clocks per SIMD, so a CU has 256 bytes of LDS
-// per WMMA at the WMMA rate (libr4d/isa/wmmamix.hip). Staging both operands with one activation
-// tile x eight weight tiles a wave moves 288 bytes of fragment reads and 64 of stores per WMMA,
-// which alone caps a loop at ~73% of the WMMA rate (measured with nothing else in it). This layout
-// reads 128 bytes and stores 32 per WMMA, and the weight's 64 bytes come through the vector cache.
-//
-// At the 300 W limit every GEMM shape here is power-bound (sclk 2.1-2.3 GHz against 2.55 for bare
-// WMMA on random operands), so a variant's speed tracks the bytes it moves as much as the
-// instructions it issues. Measured against the both-operands-through-LDS 1x8 tile at the DiT's
-// shapes (M 18648) and LLM prefill shapes (M 300-4096), 160 TFLOP/s at gate_up:
-//   - this layout with the per-row activation scales gathered from global, mul + add fold: +12%;
-//   - the activation scales staged through LDS (`s_as`), one row a thread: +4%. A lane's gather
-//     touched sixteen cachelines a load, more bytes than its weight fragments;
-//   - the fold as one fma instead of a rounded multiply and an add: +4-5%. Not bit-identical to
-//     the separate multiply (rel_l2 ~2e-5 against it, both well inside bf16 output);
-//   - unconditional prefetch (the last tile's prefetch re-reads the last tile, discarded): +1%.
-//     A conditional load joins two paths with different counts and the compiler waits for zero;
-//   - the LDS-only barrier (lds_barrier) instead of __syncthreads: +1%; the latter's release waits
-//     for every outstanding load, the weight prefetch included;
-//   - kGroupM 8 instead of 16: +1-3%; 4 ties 8.
-// Measured and rejected:
-//   - 2 x 4 waves of 4 weight x 2 activation tiles (half the LDS reads, twice the weight bytes
-//     through the vector cache): 3-5% slower;
-//   - 8 x 1 waves (256 x 64 blocks, no weight tile read twice in a block): ties at o and gate_up;
-//   - the weight two tiles ahead: 240 VGPRs and scratch spills, 25-38% slower;
-//   - 12 or 16 waves (192 or 256 activation rows a block, up to a quarter less L2 traffic): ties
-//     to 1% slower, a higher clock at a lower rate per clock;
-//   - four threads an activation row, 16 bytes each (whole 64-byte segments a load): neutral;
-//   - raw buffer loads with 32-bit offsets for both operands: 20% slower;
-//   - s_setprio around the WMMA run: neutral. CU mode (-mcumode): ~10% slower.
-template <bool I8>
+template <bool I8, int RB = 0>
 __global__ __launch_bounds__(kPWaves * kWave) R4D_WAVES(6)
 void gemm_8a8_prefill_kernel(const uint8_t* __restrict__ A, const float* __restrict__ Sa,
                              const uint8_t* __restrict__ W, const uint16_t* __restrict__ Sw,
                              uint16_t* __restrict__ C, uint32_t M, uint32_t K, uint32_t N,
                              uint32_t a_ld, uint32_t sa_ld, uint32_t sw_ld) {
+    gemm_8a8_prefill_body<I8, RB>(A, Sa, W, Sw, C, M, K, N, a_ld, sa_ld, sw_ld, PrefillPlain{});
+}
+
+// ---- the prefill tile, gated -------------------------------------------------------------------
+//
+// gemm_nt_q_gated at prefill row counts: the gate|up GEMM with SwiGLU and the E4M3 quantiser in the
+// epilogue, so the [M, 2n] bf16 product is never written and gated_quant_fp8 never re-reads it
+// (7% of a 400-token prefill step of d1-3B on gfx1200: 74 us a layer).
+//
+// The 8-accumulator cap (above) holds by halving the activation side: a block owns 128 output
+// columns, i.e. 128 gate rows and the same 128 up rows of the weight, against 64 activation rows.
+// The eight waves are kPWW over the weight and kPWA over the activation as on the prefill tile; a
+// wave owns kPTW gate tiles and the kPTW up tiles of the same columns, against kGPTA activation
+// tiles. Since the accumulator mapping does not depend on the weight rows, a lane holds the gate
+// and the up value of the same (token, column) and the gate needs no exchange; the per-token amax
+// over the block's 128 columns closes across the four weight waves through LDS.
+//
+// Byte-identical to gemm_8a8_prefill_kernel followed by gated_quant_fp8: the K loop, the fold
+// (ws * as, one fma) and so every accumulator are the prefill tile's; the accumulator is rounded to
+// bf16 as that kernel's store rounds it, and from there the arithmetic is the narrow gated
+// epilogue's, which is gated_quant_fp8's.
+constexpr uint32_t kGPTA = 2;                       // activation tiles a wave
+constexpr uint32_t kGBM  = kPWA * kGPTA * 16;       // 64 activation rows a block
+constexpr uint32_t kGTW  = 2 * kPTW;                // the gate tiles, then the up tiles
+static_assert(kGBM * 2u <= kPWaves * kWave, "two threads stage an activation row");
+
+__global__ __launch_bounds__(kPWaves * kWave)
+void gemm_8a8_gated_prefill_kernel(const uint8_t* __restrict__ A, const float* __restrict__ Sa,
+                                   const uint8_t* __restrict__ W, const uint16_t* __restrict__ Sw,
+                                   uint8_t* __restrict__ Q, float* __restrict__ Sc,
+                                   uint16_t* __restrict__ Yb, uint32_t M, uint32_t K,
+                                   uint32_t nout, uint32_t a_ld, uint32_t sa_ld, uint32_t sw_ld,
+                                   uint32_t q_ld, uint32_t s_ld, uint32_t y_ld) {
     constexpr uint32_t P = lds_pitch<kPFK>();
-    static_assert(kPBM * 2u == kPWaves * kWave, "two threads stage an activation row");
-    // Double-buffered: one barrier a staged tile, which publishes it.
-    __shared__ __attribute__((aligned(16))) uint8_t s_a[2][kPBM * P];
-    // The activation scales of the current and the next 128-column block, one per block row.
-    __shared__ float s_as[2][kPBM];
+    __shared__ __attribute__((aligned(16))) uint8_t s_a[2][kGBM * P];
+    __shared__ float s_as[2][kGBM];
+    __shared__ float s_amx[kPWW][kGBM];
 
     const uint32_t tid = threadIdx.x, lane = tid % kWave;
-    // Uniform per wave, and through readfirstlane known so, so what derives from it stays scalar.
     const uint32_t wave = __builtin_amdgcn_readfirstlane(tid / kWave);
     const uint32_t ww = wave % kPWW, wa = wave / kPWW;
 
-    // The grid runs in groups of kGroupM activation bands. Blocks dispatch in flattened-id order;
-    // with the plain x-fastest grid the activation is read once per 128 weight rows, which halves
-    // the rate once it exceeds the 64 MB MALL. Within a group the bands stay cached across the N
-    // sweep and the weight is read once per group. With kGroupM bands or fewer the plain order is
-    // used and the division skipped.
+    // The prefill tile's raster groups over activation bands.
     uint32_t bm = blockIdx.x, bn = blockIdx.y;
     if (gridDim.x > kGroupM) {
         const uint32_t per = kGroupM * gridDim.y;
@@ -830,117 +800,134 @@ void gemm_8a8_prefill_kernel(const uint8_t* __restrict__ A, const float* __restr
         bm = first + r % gm;
         bn = r / gm;
     }
-    const uint32_t m0 = bm * kPBM, n0 = bn * kPBN;
+    const uint32_t m0 = bm * kGBM, c0 = bn * kBlock;   // output columns [c0, c0 + 128)
     const uint32_t ksuper = K / kSuperK, nkb = K / kBlock;
 
-    // Staging: two threads a row, 32 bytes each. Rows past M re-read row M-1, and every load is
-    // issued unconditionally (the last tile's prefetch re-reads the last tile), so the loop has no
-    // branch and its waits count exactly; nothing past M is stored.
-    const uint32_t sr = tid / 2u, sc = (tid % 2u) * 32u;
+    // Staging: two threads a row over the block's 64 rows (the first 128 threads), rows past M
+    // re-reading row M-1, every load issued as on the prefill tile.
+    const bool stager = tid < kGBM * 2u;
+    const uint32_t sr = (tid / 2u) % kGBM, sc = (tid % 2u) * 32u;
     const uint8_t* const asrc = A + (size_t)min(m0 + sr, M - 1u) * a_ld + sc;
-    // Thread t loads the scale of block row t % 128; both threads of a row write the same value.
-    const float* const ssrc = Sa + (size_t)min(m0 + tid % kPBM, M - 1u) * sa_ld;
-    // This wave's weight tiles, kTileBytes a 64-k supertile, `ksuper` supertiles a tile row.
-    const uint32_t wt0 = n0 / 16u + ww * kPTW;
-    const uint8_t* const wsrc = W + (size_t)wt0 * ksuper * kTileBytes + lane * kLaneBytes;
-    // Activation rows this wave reads from the staged tile, and the lane's column in each.
-    const uint32_t arow = wa * kPTA * 16u;
+    const float* const ssrc = Sa + (size_t)min(m0 + tid % kGBM, M - 1u) * sa_ld;
+    // Weight tiles: the gate rows [c0, c0+128) and the up rows [nout + c0, ...), kPTW each a wave.
+    const uint32_t wtg = c0 / 16u + ww * kPTW, wtu = (nout + c0) / 16u + ww * kPTW;
+    const uint8_t* const wsg = W + (size_t)wtg * ksuper * kTileBytes + lane * kLaneBytes;
+    const uint8_t* const wsu = W + (size_t)wtu * ksuper * kTileBytes + lane * kLaneBytes;
+    auto wsrc = [&](uint32_t i) {
+        return i < kPTW ? wsg + (size_t)i * ksuper * kTileBytes
+                        : wsu + (size_t)(i - kPTW) * ksuper * kTileBytes;
+    };
+    const uint32_t arow = wa * kGPTA * 16u;
 
-    f8v raw[kPTW][kPTA], out[kPTW][kPTA];
+    f8v raw[kGTW][kGPTA], out[kGTW][kGPTA];
 #pragma unroll
-    for (uint32_t i = 0; i < kPTW; ++i)
+    for (uint32_t i = 0; i < kGTW; ++i)
 #pragma unroll
-        for (uint32_t j = 0; j < kPTA; ++j) out[i][j] = acc_zero();
+        for (uint32_t j = 0; j < kGPTA; ++j) out[i][j] = acc_zero();
 
-    Stage8 pa = stage8_load(asrc, true);
-    Stage8 w0[kPTW], w1[kPTW];
+    Stage8 pa = stage8_load(asrc, stager);
+    Stage8 w0[kGTW], w1[kGTW];
 #pragma unroll
-    for (uint32_t i = 0; i < kPTW; ++i)
-        w0[i] = stage8_load(wsrc + (size_t)i * ksuper * kTileBytes, true);
-    s_as[0][tid % kPBM] = ssrc[0];
+    for (uint32_t i = 0; i < kGTW; ++i) w0[i] = stage8_load(wsrc(i), true);
+    s_as[0][tid % kGBM] = ssrc[0];
     float scn = ssrc[min(1u, nkb - 1u)];
 
-    /* One staged K tile, the first or second half of scale block `kb`: publish the activation
-     * tile (and in the second half the next block's scales), issue the next tile's loads, then four
-     * k steps from `cur`. The first k step of a block starts from a zero accumulator, so `raw` needs
-     * no clearing after the fold. */
-    auto tile = [&](uint32_t kb, uint32_t half, Stage8 (&cur)[kPTW], Stage8 (&nxt)[kPTW]) {
-        stage8_store<kPFK>(s_a[half], sr, sc, pa);
-        if (half == 1u) s_as[(kb + 1u) % 2u][tid % kPBM] = scn;
+    auto tile = [&](uint32_t kb, uint32_t half, Stage8 (&cur)[kGTW], Stage8 (&nxt)[kGTW]) {
+        if (stager) stage8_store<kPFK>(s_a[half], sr, sc, pa);
+        if (half == 1u) s_as[(kb + 1u) % 2u][tid % kGBM] = scn;
         lds_barrier();
         const uint32_t c1 = min(kb * kBlock + (half + 1u) * kPFK, K - kPFK);
-        pa = stage8_load(asrc + c1, true);
+        pa = stage8_load(asrc + c1, stager);
 #pragma unroll
-        for (uint32_t i = 0; i < kPTW; ++i)
-            nxt[i] = stage8_load(wsrc + ((size_t)i * ksuper + c1 / kSuperK) * kTileBytes, true);
+        for (uint32_t i = 0; i < kGTW; ++i)
+            nxt[i] = stage8_load(wsrc(i) + (size_t)(c1 / kSuperK) * kTileBytes, true);
         if (half == 1u) scn = ssrc[min(kb + 2u, nkb - 1u)];
 #pragma unroll
         for (uint32_t ks = 0; ks < kPFK / kK; ++ks) {
-            i2v bf[kPTA];
+            i2v bf[kGPTA];
 #pragma unroll
-            for (uint32_t j = 0; j < kPTA; ++j) bf[j] = frag<kPFK>(s_a[half], arow + j * 16u, ks * kK, lane);
+            for (uint32_t j = 0; j < kGPTA; ++j) bf[j] = frag<kPFK>(s_a[half], arow + j * 16u, ks * kK, lane);
 #pragma unroll
-            for (uint32_t i = 0; i < kPTW; ++i) {
+            for (uint32_t i = 0; i < kGTW; ++i) {
                 const i2v af = frag_of(cur[i], ks);
 #pragma unroll
-                for (uint32_t j = 0; j < kPTA; ++j)
-                    raw[i][j] = mma8<I8>(af, bf[j], (half == 0u && ks == 0u) ? acc_zero() : raw[i][j]);
+                for (uint32_t j = 0; j < kGPTA; ++j)
+                    raw[i][j] = mma8<false>(af, bf[j], (half == 0u && ks == 0u) ? acc_zero() : raw[i][j]);
             }
         }
     };
 
     for (uint32_t kb = 0; kb < nkb; ++kb) {
-        // The weight's scales for this block, read ahead of the two tiles that hide them: one bf16
-        // for the block's 128 rows, or with I8 one per row, a lane's eight rows of a tile adjacent
-        // in the tile-major [N/16][K/128][16] plane.
-        float ws = 0.0f;
-        uint4 w8[I8 ? kPTW : 1u];
-        if constexpr (I8) {
-#pragma unroll
-            for (uint32_t i = 0; i < kPTW; ++i)
-                w8[i] = *(const uint4*)(Sw + ((size_t)(wt0 + i) * nkb + kb) * 16u + (lane >> 4) * 8u);
-        } else {
-            ws = bscale(Sw[(size_t)(n0 / kBlock) * sw_ld + kb]);
-        }
+        const float wg = bscale(Sw[(size_t)(c0 / kBlock) * sw_ld + kb]);
+        const float wu = bscale(Sw[(size_t)((nout + c0) / kBlock) * sw_ld + kb]);
         tile(kb, 0u, w0, w1);
         tile(kb, 1u, w1, w0);
 #pragma unroll
-        for (uint32_t j = 0; j < kPTA; ++j) {
+        for (uint32_t j = 0; j < kGPTA; ++j) {
             const float as = s_as[kb % 2u][arow + j * 16u + frag_c(lane)];
 #pragma unroll
-            for (uint32_t i = 0; i < kPTW; ++i) {
-                float s[8];
-                if constexpr (I8) {
-                    const uint32_t d[4] = { w8[i].x, w8[i].y, w8[i].z, w8[i].w };
-#pragma unroll
-                    for (uint32_t t = 0; t < 8; ++t)
-                        s[t] = as * bscale((uint16_t)(d[t / 2] >> (16 * (t % 2))));
-                } else {
-#pragma unroll
-                    for (uint32_t t = 0; t < 8; ++t) s[t] = ws * as;
-                }
+            for (uint32_t i = 0; i < kGTW; ++i) {
+                const float s8 = (i < kPTW ? wg : wu) * as;
 #pragma unroll
                 for (uint32_t t = 0; t < 8; ++t)
-                    out[i][j][t] = __builtin_fmaf(acc_val<I8>(raw[i][j][t]), s[t], out[i][j][t]);
+                    out[i][j][t] = __builtin_fmaf(acc_val<false>(raw[i][j][t]), s8, out[i][j][t]);
             }
         }
     }
 
-    // D is [weight row][activation row]: eight consecutive columns of one C row a lane a tile.
+    // gate and up rounded to bf16 as the prefill tile stores them, silu in f32, the product
+    // rounded to bf16, then the per-(token, 128 columns) E4M3 quantiser.
+    float v[kPTW][kGPTA][8];
 #pragma unroll
-    for (uint32_t i = 0; i < kPTW; ++i)
+    for (uint32_t j = 0; j < kGPTA; ++j) {
+        float m = 0.0f;
 #pragma unroll
-        for (uint32_t j = 0; j < kPTA; ++j) {
-            const uint32_t m = m0 + arow + j * 16u + frag_c(lane);
-            const uint32_t n = n0 + (ww * kPTW + i) * 16u + acc_row(lane, 0);
-            if (m < M) {
-                const f8v v = out[i][j];
-                /* Packed in whole registers (bf16x2_rne, f32_to_bf16's bits). */
-                *(uint4*)(C + (size_t)m * N + n) =
-                    make_uint4(bf16x2_rne(v[0], v[1]), bf16x2_rne(v[2], v[3]),
-                               bf16x2_rne(v[4], v[5]), bf16x2_rne(v[6], v[7]));
+        for (uint32_t i = 0; i < kPTW; ++i)
+#pragma unroll
+            for (uint32_t t = 0; t < 8; ++t) {
+                const float g = bf16_to_f32(f32_to_bf16(out[i][j][t]));
+                const float a = g / (1.0f + expf(-g));
+                const uint16_t h = f32_to_bf16(a * bf16_to_f32(f32_to_bf16(out[i + kPTW][j][t])));
+                v[i][j][t] = bf16_to_f32(h);
+                m = fmaxf(m, fabsf(v[i][j][t]));
+            }
+        // A token's 16 columns of a tile are in lanes c and c ^ 16; the other wave columns are in
+        // the other three weight waves. fmaxf is exact and order-free.
+        m = fmaxf(m, r4d_xor_lane<16>(m));
+        if (lane < 16u) s_amx[ww][arow + j * 16u + lane] = m;
+    }
+    __syncthreads();
+#pragma unroll
+    for (uint32_t j = 0; j < kGPTA; ++j) {
+        const uint32_t r = arow + j * 16u + frag_c(lane), tok = m0 + r;
+        if (tok >= M) continue;
+        float mm = 0.0f;
+#pragma unroll
+        for (uint32_t u = 0; u < kPWW; ++u) mm = fmaxf(mm, s_amx[u][r]);
+        const float sc8 = mm > 0.0f ? mm * (1.0f / 448.0f) : 1.0f;
+        if (ww == 0u && (lane >> 4) == 0u) Sc[(size_t)tok * s_ld + bn] = sc8;
+        const float inv = 1.0f / sc8;
+#pragma unroll
+        for (uint32_t i = 0; i < kPTW; ++i) {
+            const uint32_t col0 = c0 + (ww * kPTW + i) * 16u + (lane >> 4) * 8u;
+            // The clamp is required (see r4d_q8.h): the builtin returns NaN out of range.
+            float qc[8];
+#pragma unroll
+            for (uint32_t t = 0; t < 8; ++t) qc[t] = fminf(fmaxf(v[i][j][t] * inv, -448.0f), 448.0f);
+            int pk[2] = { 0, 0 };
+#pragma unroll
+            for (uint32_t d = 0; d < 2; ++d) {
+                pk[d] = __builtin_amdgcn_cvt_pk_fp8_f32(qc[d * 4 + 0], qc[d * 4 + 1], pk[d], false);
+                pk[d] = __builtin_amdgcn_cvt_pk_fp8_f32(qc[d * 4 + 2], qc[d * 4 + 3], pk[d], true);
+            }
+            *(uint2*)(Q + (size_t)tok * q_ld + col0) = make_uint2((uint32_t)pk[0], (uint32_t)pk[1]);
+            if (Yb) {
+                uint16_t* const yr = Yb + (size_t)tok * y_ld + col0;
+                *(uint4*)yr = make_uint4(bf16x2_rne(v[i][j][0], v[i][j][1]), bf16x2_rne(v[i][j][2], v[i][j][3]),
+                                         bf16x2_rne(v[i][j][4], v[i][j][5]), bf16x2_rne(v[i][j][6], v[i][j][7]));
             }
         }
+    }
 }
 
 // The narrow tile's K width is kFKNarrow (256 B); 128 B loses at every wave count (see `kTPR`), and
@@ -959,13 +946,19 @@ constexpr uint32_t kMaxCtr = 8192;
  * (rad_kernel_concurrent); overlapping launches on one stream write disjoint outputs, and launches
  * sharing an output on one stream are ordered by their dependency. A step has a few dozen distinct
  * outputs at fixed arena addresses, so this is a few dozen 32 KiB blocks, allocated once. A block
- * is never freed: a recorded pass replays the pointer. */
+ * is never freed: a recorded pass replays the pointer.
+ *
+ * The lock is not held while a block is made. Zeroing it waits for the card, and under tensor
+ * parallelism the card can be inside an all-reduce whose other half the peer rank has yet to issue;
+ * if the peer's first launch of a split GEMM then waited on this lock, neither rank would advance. */
 unsigned int* split_ctr(RadStream s, const void* out) {
     static std::mutex m;
     static std::map<std::pair<RadStream, const void*>, unsigned int*> blocks;
-    std::lock_guard<std::mutex> lk(m);
     const auto key = std::make_pair(s, out);
-    if (auto it = blocks.find(key); it != blocks.end()) return it->second;
+    {
+        std::lock_guard<std::mutex> lk(m);
+        if (auto it = blocks.find(key); it != blocks.end()) return it->second;
+    }
     void* p = nullptr;
     if (hipMalloc(&p, (size_t)kMaxCtr * sizeof(unsigned int)) != hipSuccess) return nullptr;
     /* Zero before any launch reads it. In the engine hipMemset is the AQL backend's and has
@@ -976,8 +969,15 @@ unsigned int* split_ctr(RadStream s, const void* out) {
         (void)hipFree(p);
         return nullptr;
     }
-    blocks.emplace(key, (unsigned int*)p);
-    return (unsigned int*)p;
+    unsigned int* kept = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(m);
+        const auto [it, fresh] = blocks.emplace(key, (unsigned int*)p);
+        if (fresh) return it->second;
+        kept = it->second;
+    }
+    (void)hipFree(p);  // another thread made this key's block in the meantime
+    return kept;
 }
 // The narrow tile's wave count MW, which is its M tile: the wave grid is MW x 1, so a block covers
 // MW*16 weight rows and the grid over N is N/(MW*16). The rule is fitted together with
@@ -1043,15 +1043,32 @@ uint32_t narrow_mw(uint32_t n, uint32_t m) {
  * must agree. */
 inline uint32_t narrow_fk(uint32_t K) { return (K % kFKNarrow == 0u) ? kFKNarrow : 128u; }
 
+/* Test hook behind r4d_gemm_i8a8_pin_split_waves: zero is each caller's own target, anything else
+ * overrides every call's. The selftest pins the IQR narrow tile's target around its int8
+ * reference, so the two sum their K partials in one order and compare to the byte. */
+std::atomic<uint32_t> g_split_waves_force{0u};
+
 // The split, given the narrow grid. Shared by the scratch query and the launch so they agree on the
-// number of partial planes.
-uint32_t narrow_ksplit(uint32_t N, uint32_t K, uint32_t M, uint32_t* ck_out) {
+// number of partial planes. `short_unsplit` is the `gemm_nt_q_short` row's opt-in (see below).
+// `target` is the waves the split aims for: kSplitTarget for the fp8a8 and i8a8 tiles; the IQR
+// narrow tile (r4d_gemm_iqr.hip), whose waves decode before they multiply, asks for more.
+uint32_t narrow_ksplit(uint32_t N, uint32_t K, uint32_t M, uint32_t* ck_out,
+                       bool short_unsplit = false, uint32_t target = kSplitTarget) {
     *ck_out = 0;
+    if (const uint32_t f = g_split_waves_force.load(std::memory_order_relaxed)) target = f;
     const uint32_t mw = narrow_mw(N, M);
     const uint32_t fm = mw * 16u;   // the narrow tile is one M tile a wave
     const uint32_t gx = (N + fm - 1) / fm;              // the M grid runs over the weight rows
-    if (K < 512u || gx * mw >= kSplitTarget) return 1;
-    const uint32_t want = (kSplitTarget + gx * mw - 1) / (gx * mw);
+    if (K < 512u || gx * mw >= target) return 1;
+    /* A narrow weight (N <= 512, the attention k/v projections) at more than 40 tokens: the split
+     * runs into a cliff there (gfx1200, cold weights: N = 512, K = 2048, M = 44..64 split 51-54 us,
+     * unsplit 23-26; K = 5120, M = 41..64 58-63 against 40-48), while at K >= 8192 the split still
+     * wins. Unsplit changes the order these outputs are summed in, so a k/v row at 41..64 tokens
+     * differs from the split result in its last bits; the rows are as exact either way. Hence an
+     * opt-in: only `gemm_nt_q_short`, whose declaration the model owns, takes it, and every other
+     * caller keeps the split and its bits. */
+    if (short_unsplit && N <= 512u && M > 40u && K <= 5120u) return 1;
+    const uint32_t want = (target + gx * mw - 1) / (gx * mw);
     uint32_t ckw = ((K / want) + kBlock - 1u) / kBlock * kBlock;
     if (ckw < kBlock) ckw = kBlock;
     uint32_t k2 = (K + ckw - 1) / ckw;
@@ -1070,13 +1087,22 @@ uint32_t narrow_ksplit(uint32_t N, uint32_t K, uint32_t M, uint32_t* ck_out) {
 
 }  // namespace
 
+/* The narrow tile's grid and split rules and its finisher's counters, for the IQR narrow tile
+ * (r4d_gemm_iqr.hip): its split sums each output as this tile's does. */
+uint32_t r4d_8a8_narrow_mw(uint32_t n, uint32_t m) { return narrow_mw(n, m); }
+uint32_t r4d_8a8_narrow_ksplit(uint32_t N, uint32_t K, uint32_t M, uint32_t* ck, uint32_t target) {
+    return narrow_ksplit(N, K, M, ck, false, target);
+}
+unsigned int* r4d_8a8_split_ctr(RadStream s, const void* out) { return split_ctr(s, out); }
+
 // ================================================================== the entry points
 
 extern "C" int r4d_gemm_fp8a8_block(void)          { return (int)kBlock; }
 static int gemm_fp8a8_nt_m16_emit(long a, long ascale, long wq, long ws, long c,
                                   int M, int K, int N, int a_ld, int sa_ld, int w_ld, int sw_ld,
                                   long scratch, long scratch_bytes, RadStream stream,
-                                  bool i8 = false, int split_n = 0, bool chain = false);
+                                  bool i8 = false, int split_n = 0, bool chain = false,
+                                  bool short_unsplit = false);
 
 extern "C" int r4d_gemm_fp8a8_nt_m16(long a, long ascale, long wq, long ws, long c,
                                      int M, int K, int N, int a_ld, int sa_ld, int w_ld, int sw_ld,
@@ -1089,6 +1115,10 @@ extern "C" int r4d_gemm_fp8a8_nt_m16_max_m(void)   { return 64; }
 
 /* See r4d.h. Only instantiated wave counts are accepted; anything else clears the override rather
  * than falling through to the dispatch's last arm. */
+extern "C" void r4d_gemm_i8a8_pin_split_waves(int waves) {
+    g_split_waves_force.store(waves > 0 ? (uint32_t)waves : 0u, std::memory_order_relaxed);
+}
+
 extern "C" void r4d_gemm_fp8a8_pin_mw(int mw) {
     const uint32_t v = (mw == 1 || mw == 2 || mw == 4 || mw == 8 || mw == 16) ? (uint32_t)mw : 0u;
     g_mw_force.store(v, std::memory_order_relaxed);
@@ -1111,11 +1141,11 @@ extern "C" void r4d_gemm_fp8a8_pin_nt(int nt) {
 // fixes the order K partials are summed in, so a row slice of a wider linear (N rows of a
 // split_n-row weight) passes the whole width to sum each output as the whole linear does: the
 // slice's outputs are then the linear's to the bit.
-static long m16_scratch(int M, int K, int N, int split_n) {
+static long m16_scratch(int M, int K, int N, int split_n, bool short_unsplit = false) {
     if (M <= 0 || K <= 0 || N <= 0 || M > r4d_gemm_fp8a8_nt_m16_max_m()) return 0;
     uint32_t ck = 0;
     const uint32_t k2 = narrow_ksplit((uint32_t)(split_n > 0 ? split_n : N), (uint32_t)K,
-                                      (uint32_t)M, &ck);
+                                      (uint32_t)M, &ck, short_unsplit);
     return k2 > 1 ? (long)k2 * M * N * (long)sizeof(float) : 0;
 }
 extern "C" long r4d_gemm_fp8a8_nt_m16_scratch(int M, int K, int N) {
@@ -1135,7 +1165,7 @@ extern "C" long r4d_gemm_fp8a8_nt_m16_scratch(int M, int K, int N) {
 static int gemm_fp8a8_nt_m16_emit(long a, long ascale, long wq, long ws, long c,
                                   int M, int K, int N, int a_ld, int sa_ld, int w_ld, int sw_ld,
                                   long scratch, long scratch_bytes, RadStream stream, bool i8,
-                                  int split_n, bool chain) {
+                                  int split_n, bool chain, bool short_unsplit) {
     int emit_rc = RAD_OK;
     if (!a || !ascale || !wq || !ws || !c) return -1;
     if (M <= 0 || K <= 0 || N <= 0) return -2;
@@ -1157,7 +1187,7 @@ static int gemm_fp8a8_nt_m16_emit(long a, long ascale, long wq, long ws, long c,
 
     uint32_t ck = 0;
     uint32_t ksplit = narrow_ksplit((uint32_t)(split_n > 0 ? split_n : N), (uint32_t)K,
-                                    (uint32_t)M, &ck);
+                                    (uint32_t)M, &ck, short_unsplit);
     const long need = ksplit > 1 ? (long)ksplit * M * N * (long)sizeof(float) : 0;
     if (need && (!scratch || scratch_bytes < need)) { ksplit = 1; ck = 0; }
 
@@ -1307,7 +1337,7 @@ extern "C" int r4d_gemm_fp8a8_gated_nt_m16_max_m(void) { return 64; }
 static int gemm_fp8a8_gated_launch(long a, long ascale, long wq, long ws, long q, long s,
                                    long y, int act, int M, int K, int nout, int a_ld, int sa_ld,
                                    int w_ld, int sw_ld, int q_ld, int s_ld, int y_ld, long stream,
-                                   bool chain);
+                                   bool chain, bool wide = false);
 extern "C" int r4d_gemm_fp8a8_gated_nt_m16(long a, long ascale, long wq, long ws,
                                            long q, long s, long y, int act,
                                            int M, int K, int nout,
@@ -1316,14 +1346,24 @@ extern "C" int r4d_gemm_fp8a8_gated_nt_m16(long a, long ascale, long wq, long ws
     return gemm_fp8a8_gated_launch(a, ascale, wq, ws, q, s, y, act, M, K, nout, a_ld, sa_ld,
                                    w_ld, sw_ld, q_ld, s_ld, y_ld, stream, false);
 }
+/* The same fold over every row count (`gemm_nt_q_gated_wide`): past the narrow tile's 64 rows it
+ * takes the gated prefill tile, whose accumulators are the unfused prefill GEMM's. Opt-in by op
+ * name, so the narrow row above keeps its refusal. */
+extern "C" int r4d_gemm_fp8a8_gated_nt_wide(long a, long ascale, long wq, long ws,
+                                           long q, long s, long y, int act,
+                                           int M, int K, int nout,
+                                           int a_ld, int sa_ld, int w_ld, int sw_ld,
+                                           int q_ld, int s_ld, int y_ld, long stream) {
+    return gemm_fp8a8_gated_launch(a, ascale, wq, ws, q, s, y, act, M, K, nout, a_ld, sa_ld,
+                                   w_ld, sw_ld, q_ld, s_ld, y_ld, stream, false, true);
+}
 /* `chain`: the chained form (r4d_rad_gemm_fp8a8_gated_m16 passes the row's parameter). */
 static int gemm_fp8a8_gated_launch(long a, long ascale, long wq, long ws, long q, long s,
                                    long y, int act, int M, int K, int nout, int a_ld, int sa_ld,
                                    int w_ld, int sw_ld, int q_ld, int s_ld, int y_ld, long stream,
-                                   bool chain) {
+                                   bool chain, bool wide) {
     if (!a || !ascale || !wq || !ws || !q || !s) return -1;
     if (M <= 0 || K <= 0 || nout <= 0) return -2;
-    if (M > r4d_gemm_fp8a8_gated_nt_m16_max_m()) return -3;
     if (K % (int)kFKNarrow) return -4;
     // A block emits 128 fused columns, one scale group, so nout must be a multiple of 128.
     if (nout % 128) return -5;
@@ -1339,6 +1379,21 @@ static int gemm_fp8a8_gated_launch(long a, long ascale, long wq, long ws, long q
     if (!s_ld)  s_ld  = nout / 128;
     if (!y_ld)  y_ld  = nout;
 
+    /* Past the narrow tile's rows, the gated prefill tile (gemm_8a8_gated_prefill_kernel), whose
+     * accumulators are the unfused prefill GEMM's. Only the wide row (`gemm_nt_q_gated_wide`) takes
+     * it: the narrow op refuses there, as it always has. */
+    if (M > r4d_gemm_fp8a8_gated_nt_m16_max_m()) {
+        if (!wide) return -3;
+        if ((q_ld | y_ld) % 8 || (q & 7) || (y && (y & 15))) return -7;
+        const dim3 grid(((uint32_t)M + kGBM - 1) / kGBM, (uint32_t)(nout / 128), 1);
+        hipLaunchKernelGGL(gemm_8a8_gated_prefill_kernel, grid, dim3(kPWaves * kWave), 0,
+                           (hipStream_t)stream, (const uint8_t*)a, (const float*)ascale,
+                           (const uint8_t*)wq, (const uint16_t*)ws, (uint8_t*)q, (float*)s,
+                           (uint16_t*)y, (uint32_t)M, (uint32_t)K, (uint32_t)nout, (uint32_t)a_ld,
+                           (uint32_t)sa_ld, (uint32_t)sw_ld, (uint32_t)q_ld, (uint32_t)s_ld,
+                           (uint32_t)y_ld);
+        return hipGetLastError() == hipSuccess ? 0 : -6;
+    }
     // The fold cannot split K, so a shape the split rule would split is refused (gate_up's shape,
     // N/16 = 1088, never splits).
     uint32_t ck = 0;
@@ -1379,7 +1434,7 @@ static int gemm_fp8a8_gated_launch(long a, long ascale, long wq, long ws, long q
 // The same GEMM for prefill row counts: same operands and layouts, the 128x128 prefill tile
 // (gemm_8a8_prefill_kernel). No split-K: the grid is ceil(M/128) x N/128, hundreds of blocks at any
 // prefill shape.
-template <bool I8>
+template <bool I8, int RB = 0>
 static int gemm_8a8_tiled(long a, long ascale, long wq, long ws, long c, int M, int K, int N,
                           int a_ld, int sa_ld, int w_ld, int sw_ld, long stream);
 
@@ -1397,6 +1452,23 @@ extern "C" int r4d_gemm_i8a8_tiled(long a, long ascale, long wq, long ws, long c
     return gemm_8a8_tiled<true>(a, ascale, wq, ws, c, M, K, N, a_ld, sa_ld, w_ld, sw_ld, stream);
 }
 
+// The same with the weight's scale one per 8 rows and 128 K (each row of the plane holding its
+// block's value), folded as the fp8 tile folds (gemm_8a8_prefill_kernel's RB).
+extern "C" int r4d_gemm_i8a8_rb8_tiled(long a, long ascale, long wq, long ws, long c,
+                                       int M, int K, int N, int a_ld, int sa_ld, int w_ld,
+                                       int sw_ld, long stream) {
+    return gemm_8a8_tiled<true, 8>(a, ascale, wq, ws, c, M, K, N, a_ld, sa_ld, w_ld, sw_ld,
+                                   stream);
+}
+
+// The same at a weight scale per 32 rows, a wave's: the fp8 tile's fold.
+extern "C" int r4d_gemm_i8a8_rb32_tiled(long a, long ascale, long wq, long ws, long c,
+                                        int M, int K, int N, int a_ld, int sa_ld, int w_ld,
+                                        int sw_ld, long stream) {
+    return gemm_8a8_tiled<true, 32>(a, ascale, wq, ws, c, M, K, N, a_ld, sa_ld, w_ld, sw_ld,
+                                    stream);
+}
+
 extern "C" int r4d_gemm_i8a8_nt_m16(long a, long ascale, long wq, long ws, long c,
                                     int M, int K, int N, int a_ld, int sa_ld, int w_ld, int sw_ld,
                                     long scratch, long scratch_bytes, long stream) {
@@ -1404,7 +1476,7 @@ extern "C" int r4d_gemm_i8a8_nt_m16(long a, long ascale, long wq, long ws, long 
                                   scratch, scratch_bytes, (RadStream)(uintptr_t)stream, true);
 }
 
-template <bool I8>
+template <bool I8, int RB>
 static int gemm_8a8_tiled(long a, long ascale, long wq, long ws, long c, int M, int K, int N,
                           int a_ld, int sa_ld, int w_ld, int sw_ld, long stream) {
     if (!a || !ascale || !wq || !ws || !c) return -1;
@@ -1422,7 +1494,7 @@ static int gemm_8a8_tiled(long a, long ascale, long wq, long ws, long c, int M, 
     if (!sw_ld) sw_ld = nkb;
 
     const dim3 grid(((uint32_t)M + kPBM - 1) / kPBM, (uint32_t)N / kPBN, 1);
-    const int rc = R4D_EMIT((RadStream)(uintptr_t)stream, gemm_8a8_prefill_kernel<I8>, grid,
+    const int rc = R4D_EMIT((RadStream)(uintptr_t)stream, (gemm_8a8_prefill_kernel<I8, RB>), grid,
                             dim3(kPWaves * kWave), 0, (const uint8_t*)a, (const float*)ascale,
                             (const uint8_t*)wq, (const uint16_t*)ws, (uint16_t*)c, (uint32_t)M,
                             (uint32_t)K, (uint32_t)N, (uint32_t)a_ld, (uint32_t)sa_ld,
@@ -1453,6 +1525,30 @@ extern "C" int r4d_rad_gemm_fp8a8_m16(const RadArgs* a, RadStream stream) {
         (int)g.M, (int)g.K, (int)g.N, (int)g.a_ld, (int)g.sa_ld, (int)g.w_ld, (int)g.sw_ld,
         (long)(uintptr_t)a->scratch, (long)a->scratch_bytes, stream, false,
         (int)r4d_geti_or(a, "split_n", 0), r4d_geti_or(a, "chain", 0) != 0);
+    return e == 0 ? RAD_OK : RAD_E_SHAPE;
+}
+
+/* `gemm_nt_q_short`: the narrow row above with the short-prompt split rule, whose declaration the
+ * model owns (narrow_ksplit's `short_unsplit`). The scratch query matches it, so the split the
+ * launch takes is the one the arena was sized for. */
+extern "C" int64_t r4d_rad_gemm_fp8a8_m16_short_scratch(const RadArgs* a) {
+    const long long M = r4d_geti_or(a, "M", 0), N = r4d_geti_or(a, "N", 0),
+                    K = r4d_geti_or(a, "K", 0), sn = r4d_geti_or(a, "split_n", 0);
+    if (M < 1 || N < 1 || K < 1) return 0;
+    if (M > r4d_gemm_fp8a8_nt_m16_max_m()) return 0;
+    return (int64_t)m16_scratch((int)M, (int)K, (int)N, (int)sn, true);
+}
+
+extern "C" int r4d_rad_gemm_fp8a8_m16_short(const RadArgs* a, RadStream stream) {
+    Fp8Ops g;
+    int rc = fp8_ops(a, &g, 1);
+    if (rc != RAD_OK) return rc;
+    if (g.M > r4d_gemm_fp8a8_nt_m16_max_m()) return R4D_NO(RAD_E_SHAPE);
+    const int e = gemm_fp8a8_nt_m16_emit(
+        r4d_addr(g.a), r4d_addr(g.ascale), r4d_addr(g.b), r4d_addr(g.bscale), r4d_addr(g.y),
+        (int)g.M, (int)g.K, (int)g.N, (int)g.a_ld, (int)g.sa_ld, (int)g.w_ld, (int)g.sw_ld,
+        (long)(uintptr_t)a->scratch, (long)a->scratch_bytes, stream, false,
+        (int)r4d_geti_or(a, "split_n", 0), r4d_geti_or(a, "chain", 0) != 0, true);
     return e == 0 ? RAD_OK : RAD_E_SHAPE;
 }
 
@@ -1501,7 +1597,9 @@ extern "C" int r4d_rad_gemm_fp8a8_bias_m16(const RadArgs* a, RadStream s) {
  * `gemm_nt_q_gated`'s (oGemmNtQGated in r4d_rows.cpp). */
 enum { GG_A = 0, GG_AS = 1, GG_B = 2, GG_BS = 3, GG_Q = 4, GG_S = 5, GG_Y = 6 };
 
-extern "C" int r4d_rad_gemm_fp8a8_gated_m16(const RadArgs* a, RadStream s) {
+/* The gated shim's body, for the narrow row (`wide` false: M <= 64, the fold's narrow tile) and for
+ * `gemm_nt_q_gated_wide` (`wide` true: the gated prefill tile past it). */
+static int r4d_rad_gemm_fp8a8_gated(const RadArgs* a, RadStream s, bool wide) {
     const RadTensor* x   = r4d_opt(a, GG_A);
     const RadTensor* xs  = r4d_opt(a, GG_AS);
     const RadTensor* w   = r4d_opt(a, GG_B);
@@ -1522,7 +1620,6 @@ extern "C" int r4d_rad_gemm_fp8a8_gated_m16(const RadArgs* a, RadStream s) {
      * it. */
     const long long M = q->shape[0], nout = q->shape[1], K = w->shape[1];
     if (M < 1 || nout < 1 || K < 1) return R4D_NO(RAD_E_SHAPE);
-    if (M > r4d_gemm_fp8a8_gated_nt_m16_max_m()) return R4D_NO(RAD_E_SHAPE);
     if (w->shape[0] != 2 * nout) return R4D_NO(RAD_E_SHAPE);
     const long long nkb = (K + blk - 1) / blk;
     if (wsc->shape[0] != (2 * nout + blk - 1) / blk || wsc->shape[1] != nkb)
@@ -1547,8 +1644,16 @@ extern "C" int r4d_rad_gemm_fp8a8_gated_m16(const RadArgs* a, RadStream s) {
         r4d_addr(x), r4d_addr(xs), r4d_addr(w), r4d_addr(wsc),
         r4d_addr(q), r4d_addr(sc), y ? r4d_addr(y) : 0, 0,
         (int)M, (int)K, (int)nout, (int)ap, (int)asp, (int)wp, (int)wsp,
-        (int)qp, (int)sp, (int)yp, (long)(uintptr_t)s, r4d_geti_or(a, "chain", 0) != 0);
+        (int)qp, (int)sp, (int)yp, (long)(uintptr_t)s, r4d_geti_or(a, "chain", 0) != 0, wide);
     return e == 0 ? RAD_OK : RAD_E_SHAPE;
+}
+
+extern "C" int r4d_rad_gemm_fp8a8_gated_m16(const RadArgs* a, RadStream s) {
+    return r4d_rad_gemm_fp8a8_gated(a, s, false);
+}
+
+extern "C" int r4d_rad_gemm_fp8a8_gated_wide(const RadArgs* a, RadStream s) {
+    return r4d_rad_gemm_fp8a8_gated(a, s, true);
 }
 
 /* ---- the int8 twins' shims: the same operands with i8 codes and the weight's scale plane per
@@ -1577,6 +1682,30 @@ extern "C" int r4d_rad_gemm_i8a8_tiled(const RadArgs* a, RadStream s) {
     if (rc != RAD_OK) return rc;
     if (g.a->dtype != RAD_I8) return R4D_NO(RAD_E_DTYPE);
     const int e = r4d_gemm_i8a8_tiled(
+        r4d_addr(g.a), r4d_addr(g.ascale), r4d_addr(g.b), r4d_addr(g.bscale), r4d_addr(g.y),
+        (int)g.M, (int)g.K, (int)g.N, (int)g.a_ld, (int)g.sa_ld, (int)g.w_ld, (int)g.sw_ld,
+        (long)(uintptr_t)s);
+    return e == 0 ? RAD_OK : RAD_E_SHAPE;
+}
+
+extern "C" int r4d_rad_gemm_i8a8_rb8_tiled(const RadArgs* a, RadStream s) {
+    Fp8Ops g;
+    int rc = fp8_ops(a, &g, 1, FP8_OPS_ROW_SCALE);
+    if (rc != RAD_OK) return rc;
+    if (g.a->dtype != RAD_I8) return R4D_NO(RAD_E_DTYPE);
+    const int e = r4d_gemm_i8a8_rb8_tiled(
+        r4d_addr(g.a), r4d_addr(g.ascale), r4d_addr(g.b), r4d_addr(g.bscale), r4d_addr(g.y),
+        (int)g.M, (int)g.K, (int)g.N, (int)g.a_ld, (int)g.sa_ld, (int)g.w_ld, (int)g.sw_ld,
+        (long)(uintptr_t)s);
+    return e == 0 ? RAD_OK : RAD_E_SHAPE;
+}
+
+extern "C" int r4d_rad_gemm_i8a8_rb32_tiled(const RadArgs* a, RadStream s) {
+    Fp8Ops g;
+    int rc = fp8_ops(a, &g, 1, FP8_OPS_ROW_SCALE);
+    if (rc != RAD_OK) return rc;
+    if (g.a->dtype != RAD_I8) return R4D_NO(RAD_E_DTYPE);
+    const int e = r4d_gemm_i8a8_rb32_tiled(
         r4d_addr(g.a), r4d_addr(g.ascale), r4d_addr(g.b), r4d_addr(g.bscale), r4d_addr(g.y),
         (int)g.M, (int)g.K, (int)g.N, (int)g.a_ld, (int)g.sa_ld, (int)g.w_ld, (int)g.sw_ld,
         (long)(uintptr_t)s);

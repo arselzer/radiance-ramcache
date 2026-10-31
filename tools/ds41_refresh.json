@@ -2,14 +2,13 @@
   "scope": "DeepSeek-V4.1-Flash (ds41) CPU-expert research checkpoint: exact engine source, reports and A/B window evidence; no model payload, research binaries, private serving configuration, credentials or deployment",
   "engine_repo": "/home/as/radiance-ds41-claude",
   "engine_branch": "claude/ds41-decode-impl",
-  "engine_commit": "fa856f3e1bc6659f494d097df7fd1e89b5df6521",
+  "engine_commit": "5ac96fc9f3e602ae448c8e9ce404159156c6e870",
   "engine_upstream": {
     "repository": "https://codeberg.org/StillDeadcode/radiance",
     "note": "Radiance upstream plus the deepseek41 architecture work of its pull request 266; the commits after them are this work (ds41 RAM cache and CPU experts)",
     "commits": {
-      "upstream main as fetched (origin/main)": "6c33ee4e1267fc0a016fc0a4a333b0221326a1be",
-      "newest upstream commit contained (review-upstream/main)": "4374bea1c4bca1c00c59890d10b799a274d5e8b4",
-      "pull request 266, deepseek41 (origin/pr-266)": "bd65d4e58f7c4233de09ad5245a82c9510eb8962"
+      "upstream main (upstream/main, v1.15.0 + 12)": "b6acbd69e475b064f61c76ef7dbdea4e22956394",
+      "pull request 266, deepseek41 (upstream/pr-266 as of 2026-10-28)": "bd65d4e58f7c4233de09ad5245a82c9510eb8962"
     }
   },
   "docs_dir": "/home/as/ds41-decode-review-20261028",
@@ -41,7 +40,8 @@
     "PREFILL-REPLAY.md",
     "PREFILL-200-DESIGN.md",
     "PHASE1-PLAN.md",
-    "PREFILL-P0.md"
+    "PREFILL-P0.md",
+    "UPSTREAM-SYNC-20261031.md"
   ],
   "research": [
     "ds41_supply_model.py",
@@ -59,7 +59,8 @@
     "cache_sim2.py",
     "membw_dur.cpp",
     "membw_dur.bwmix.sh",
-    "membw_dur.bwmix.out.txt"
+    "membw_dur.bwmix.out.txt",
+    "kl_docs.py"
   ],
   "docs_left_out": {
     "READAHEAD-PLAN-EXCERPT.md": "scratch: a verbatim excerpt of RESEARCH-2-RANKED-PLAN.md section #5, used as an agent prompt",
@@ -180,7 +181,9 @@
     "ab-20261031T030023Z",
     "ab-20261031T034433Z",
     "ab-20261031T041410Z",
-    "ab-20261031T090154Z"
+    "ab-20261031T090154Z",
+    "ab-20261031T100852Z",
+    "ab-20261031T104524Z"
   ],
   "server_log_windows": {
     "ab-20261028T223812Z": "base engine decode, 5.03 tok/s",
@@ -199,7 +202,9 @@
     "ab-20261031T022949Z": "the compressor tail sized to the step, lent arena gate",
     "ab-20261031T030023Z": "the prefill configurations under concurrency",
     "ab-20261031T034433Z": "harness turns with the adopted prefill and the prefix cache",
-    "ab-20261031T090154Z": "harness turns resuming at the previous request's end"
+    "ab-20261031T090154Z": "harness turns resuming at the previous request's end",
+    "ab-20261031T100852Z": "the upstream sync's speeds and its Kld, Kh and reply gates",
+    "ab-20261031T104524Z": "the merged base engine's replies and the CPU-path checks"
   },
   "allowed_emails": [
     "aselzer3@gmail.com",

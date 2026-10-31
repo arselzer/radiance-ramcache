@@ -395,9 +395,16 @@ public:
      * encoder-only or embedding-only plugin does; the engine refuses to serve such a program at
      * startup. */
     rad_buf logits_buf = 0;
+    /* Scored steps (rad_declare_scores): the final-normed hidden rows and the bf16 head table.
+     * Zero when the plugin declared none. */
+    rad_buf    score_hidden = 0;
+    rad_weight score_table  = 0;
     /* The step's pooled vectors (rad_declare_pooled): set only by an embedding program, which has
      * no logits buffer. */
     rad_buf pooled_buf = 0;
+    /* The most words one request hands the plugin (rad_declare_plugin_words,
+     * RadBatch::plugin_words); 0 when the plugin reads none. */
+    int64_t plugin_words = 0;
 
     /* Runtime LoRA (core/lora/), empty unless the engine was started with adapters enabled. */
     std::vector<LoraIssueSite> lora_sites;
@@ -428,6 +435,10 @@ public:
     int32_t        drafter_pos_offset = 0;
     /* A block drafter's shorter block (rad_drafter_short_block), 0 when it serves only its own. */
     int64_t        drafter_short_block = 0;
+    /* A block drafter that proposes a tree (rad_drafter_tree): `drafter_parents` holds each
+     * proposal's parent node, at the proposal's pitch. False and 0 for a chain drafter. */
+    bool           drafter_tree = false;
+    rad_buf        drafter_parents = 0;
 
     /* The exact consumer suffix the plugin declared (rad_declare_consumer_suffix), n_layer 0 when
      * it declared none. What the engine does with it: core/sched/consumer_skip.h. */
@@ -768,6 +779,9 @@ struct Request {
      * (SchedReq owns this Request, so it outlives it) and is written alongside n_draft. Null when
      * n_draft is 0. */
     const int32_t*       draft = nullptr;
+    /* A tree drafter's parents for `draft` (StepEntry::draft_parent): draft[j]'s parent node,
+     * 0 the bonus token. Null for a chain. The sampler reads each row's ancestors from it. */
+    const int32_t*       draft_parent = nullptr;
     int32_t              n_accepted = 0;      /* from the previous verify */
 
     /* Whether this request may be speculated on. Written by the engine after every step, read by
@@ -804,6 +818,12 @@ struct Request {
      * The request still samples the one token max_tokens allows; the caller discards it. */
     std::shared_ptr<TokenScores> token_scores;
 
+    /* Words the plugin reads on the step that samples the prompt's first token
+     * (RadBatch::plugin_words): word 0 is the engine's, the rest the caller's. At most
+     * Program::plugin_words of them, which the server checks before submission; clef's are laid
+     * out by abi/rad_clef.h. Empty for every other request. */
+    std::vector<int32_t> plugin_words;
+
     /* An embedding request: the whole prompt in one step, never split (a bidirectional encoder
      * cannot take half its input), finished at that step with its pooled vector in the sink
      * (Sink::embedding). Nothing is generated. Only an embedding program (rad_declare_pooled)
@@ -829,6 +849,8 @@ struct Config {
     std::string draft_bank_expert_placement = "auto"; /* existing pinned pool; no automatic growth */
     LoraConfig  lora;                  /* --lora, --max-loras, --max-lora-rank, --lora-target-modules */
     std::string download_dir;          /* where a repo id is fetched to; empty = the XDG cache */
+    std::string model_revision;        /* --model-revision: the hub revision a repo id fetches;
+                                          empty = the repo's moving default branch */
     std::string radiance_home;
     std::vector<std::string> kernel_hierarchy;   /* ordered; first wins */
 
@@ -865,6 +887,10 @@ struct Config {
      * the chunk at N tokens on such a step. See Scheduler::step, docs/GUIDE.md. */
     int64_t busy_prefill_chunk = -1;
     int64_t prefill_interleave = 0;    /* --prefill-interleave: decode-only steps between chunks */
+    /* --preempt-wait-ms: how long a preempted prefill may wait for the whole-recompute gate
+     * before the scheduler evicts cache blocks and preempts a lower-priority running request to
+     * make room for it. 0 = fall back on the next step; default 5000 ms. */
+    int64_t preempt_wait_ms = 5000;
     int64_t max_seqs = 256;
     int64_t max_ctx = 0;               /* 0 = the model's training context */
     /* --rope-scaling: "yarn:FACTOR[:ORIG]" writes YaRN over the checkpoint's own rotary keys (the
@@ -943,6 +969,9 @@ struct Config {
     TablePlacement embedding_placement = TablePlacement::Ram;
     bool           embedding_placement_given = false;
     TablePlacement ngram_placement     = TablePlacement::Auto;
+    /* --ngram-placement ram=DIR: the pinned n-gram copy is the file DIR/ngram-<id>.tab (a tmpfs),
+     * mapped shared, so engines on separate cards hold one table. Empty: a private copy. */
+    std::string    ngram_share_dir;
     TablePlacement embedding_resolved  = TablePlacement::Vram;
     TablePlacement ngram_resolved      = TablePlacement::Disk;
     /* Set by the resolver: pinned host MiB per rank for the token embedding when it resolves to
@@ -993,13 +1022,15 @@ struct Config {
      * store is opened (checkpoint_slots_auto in core/mem/prefix.h). */
     int64_t checkpoint_slots = -1;
     bool    prefix_cache = true;
-    /* --prefix-resume exact|nearest. Exact (the default) resumes a prefix hit only on the grid an
-     * idle server's cold prefill chunks the same prompt on (ChunkGeometry::grid), and takes a
-     * prompt's tail snapshot where its last chunk starts: the hit recomputes the cold run's own
-     * chunks, so its output is the cold run's bit for bit, where a kernel rounds a row differently
-     * at another chunk length. Nearest resumes at the deepest snapshot or block, a prompt's tail
-     * snapshot at its last quantum boundary: up to a chunk less re-prefilled a turn, and a hit that
-     * can differ from a cold run in the last bits (a near-tie in greedy text). */
+    /* --prefix-resume exact|nearest.
+     * - exact (the default): a prefix hit resumes only on the grid an idle server's cold prefill
+     *   chunks the same prompt on (ChunkGeometry::grid), and a prompt's tail snapshot is taken
+     *   where its last chunk starts. The hit recomputes the cold run's own chunks, so its output
+     *   is the cold run's bit for bit even where a kernel rounds a row differently at another
+     *   chunk length.
+     * - nearest: a hit resumes at the deepest snapshot or block, and a prompt's tail snapshot is
+     *   at its last quantum boundary. Up to a chunk less is re-prefilled a turn, and a hit can
+     *   differ from a cold run in the last bits (a near-tie in greedy text). */
     bool    prefix_exact = true;
     /* geometric-backoff | tip-only | keep-all. §19.1 records the default as unmeasured;
      * core/mem/prefix.h ships the two extremes so they can be compared. */
@@ -1039,8 +1070,8 @@ struct Config {
     int     n_spec = -1;                /* --num-speculative-tokens; -1 = auto, 0 = off */
     /* --spec-ngram K: speculate by prompt lookup alone, K drafts a step (core/sched/ngram.h), each
      * proposal verified only when it pays for its verify rows (core/sched/lookup.h).
-     * Sets the window to K and tells the plugin to declare no draft head
-     * (RadBuildCtx::draft_head_off), so a head the container carries costs no memory. 0 (the
+     * Sets the window to K; a container that declares a draft head is refused at startup, since
+     * the head would draft in lookup's place. 0 (the
      * default) is off: a deployment that speculates still uses prompt lookup for any sequence its
      * head declines, and a container without a head speculates by prompt lookup at
      * --num-speculative-tokens N. */
@@ -1051,8 +1082,10 @@ struct Config {
     int     spec_ngram_max = 4;
     DraftWindow draft_window = kDraftWindowDefault;   /* --draft-window */
     /* A block drafter's short block (rad_drafter_short_block) from this many decoding sequences in
-     * the step just run; 0 never. Ignored without a drafter that declares one. */
-    int64_t draft_short_from = 0;       /* --draft-short-from */
+     * the step just run; 0 never. -1, auto: never for a chain, and from two for a tree
+     * (rad_drafter_tree), whose nodes are verify rows every drafting sequence pays for. Ignored
+     * without a drafter that declares a short block. */
+    int64_t draft_short_from = -1;      /* --draft-short-from */
 
     /* --draft-coupling off|on: a linear serial drafter (or DFlash2's block walk) samples its
      * proposals and the sampler applies the maximal coupling at the verify
@@ -1072,6 +1105,17 @@ struct Config {
     std::string kld_lora;               /* --kld-lora NAME: score through this --lora adapter */
     std::string kld_lora_sources;       /* --kld-lora-sources PREFIX: only documents whose source starts so */
     std::string kld_corpus;             /* --kld-corpus FILE, read by --kld-record only */
+    int         kld_top = 0;            /* --kld-top N: record the N most likely tokens and the tail; 0 the whole vocabulary */
+
+    /* ---------------- CALIBRATION (GPTQ Hessians) ----------------
+     * `--calib-corpus FILE` replaces the server like the KL mode: every document of a JSONL corpus
+     * goes through prefill once, nothing is scored, and a plugin that keeps calibration statistics
+     * records them into --calib-dir (RadBuildCtx::calib_dir) for --calib-layers. */
+    std::string calib_corpus;           /* --calib-corpus FILE */
+    std::string calib_dir;              /* --calib-dir DIR */
+    int32_t     calib_layer_lo = 0;     /* --calib-layers LO:HI, HI exclusive; 0:0 every layer */
+    int32_t     calib_layer_hi = 0;
+    bool calib() const { return !calib_corpus.empty(); }
     std::string kld_out;                /* --kld-out FILE: the report as JSON, rows beside it */
     bool kld() const { return !kld_record.empty() || !kld_ref.empty(); }
 
@@ -1080,6 +1124,11 @@ struct Config {
      * when the container carries a vision tower and 0 when it does not. 0 serves text only and
      * keeps a tower the container carries off the card. */
     int64_t mm_max_patches = -1;
+    /* An image generator's bounds (RadBuildCtx::gen_max_pixels, gen_max_refs): the largest image it
+     * makes, in pixels, and the reference pictures a request. 0: the model's own. A smaller image
+     * shrinks the buffers the generator sizes for it, the activation arena with them. */
+    int64_t image_gen_max_pixels = 0;
+    int64_t image_gen_max_refs = 0;
     /* The audio encoder's pass in frames, resolved at bring-up from the plugin's probe when the
      * container carries an audio encoder; --mm-max-patches 0 (text only) turns it off too. */
     int64_t mm_audio_frames = -1;
@@ -1097,6 +1146,16 @@ struct Config {
     /* --api-key: the bearer key every request but the probes and the dashboard page must carry.
      * Empty serves without one. */
     std::string api_key;
+    /* --api-key-env: the environment variable api_key was read from, recorded so the config
+     * report can say where the key came from. Empty when the key came from the command line. */
+    std::string api_key_env;
+    /* --allow-host, repeatable: Host names the keyless loopback-only routes accept beside the
+     * loopback names themselves, for operators who reach the box by another name. */
+    std::vector<std::string> allow_hosts;
+    /* --trusted-proxy, repeatable: CIDRs whose sockets may vouch for the caller behind them
+     * through X-Forwarded-For. The vouched address names who the log and audit talk about --
+     * it grants nothing: loopback, the Host name and the key stay the guards' whole world. */
+    std::vector<std::string> trusted_proxies;
     /* --served-model-name: the id /v1/models lists, a response names when its request named none,
      * and the metrics carry. Empty takes the container's own name. A request may still name any
      * model: one model is loaded and every request is served by it. */
@@ -1201,10 +1260,10 @@ struct Config {
      * share, keeping them resident: heat never demotes them. 0 is off. */
     float   expert_pin_top = 0.0f;
     bool    expert_pin_top_given = false;
-    /* --draft-expert-placement auto|host: a draft head's (MTP/DSpark) routed experts are pinned in
-     * the host pool before any strategy runs, streamed in place like a pooled expert. `auto` (the
-     * default) leaves them to the strategy. `host` is what lets a drafter's experts fit beside a
-     * trunk that already fills the card. */
+    /* --draft-expert-placement auto|host. `host` pins a draft head's (MTP/DSpark) routed experts
+     * in the host pool before any strategy runs, read in place like a pooled expert, so they fit
+     * beside a trunk that already fills the card. `auto` (the default) leaves them to the
+     * strategy. */
     std::string draft_expert_placement = "auto";
     bool    draft_expert_placement_given = false;
     /* --live: the live view (spec §16). Off by default like everything else in that section. */
@@ -1214,6 +1273,11 @@ struct Config {
      * of magnitude slower with no visible sign. It is refused unless this debug flag is set
      * (startup.h, rad_gate_reference_kernels). */
     bool    accept_reference_kernels = false;
+
+    /* A machine setting known to break radiance (compute wave save/restore off where cards serve)
+     * stops startup with what to change (core/diag/checks.cpp, incompatible()). This starts anyway:
+     * unsupported, with a banner at the top of the log and of the startup report. */
+    bool    proceed_incompatible = false;
 
     /* Where each operator-set option came from, keyed by the option table's spelling: "command
      * line" or the supplying environment variable. Absent means default or resolved at startup;

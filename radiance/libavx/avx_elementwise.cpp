@@ -20,6 +20,9 @@
 #include "avx_vec.h"
 #include "avx_common.h"
 
+#include <algorithm>
+#include <cmath>
+
 using namespace avx;
 
 /* Round a row through an operand's storage dtype and back, as an unfused store-and-reload would.
@@ -534,6 +537,40 @@ AVX_KERNEL(seg_mean) {
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------------ seg_softmax_pool */
+/* One output row per cu_seqlens segment: its rows summed with the softmax of their scores as
+ * weights, the softmax in f32 with the maximum subtracted, the sum in f32, rounded once, as in
+ * libref. A segment is a question's few options, so the scores are read plainly. */
+AVX_KERNEL(seg_softmax_pool) {
+    if (!rad_args_have(a, 4)) return RAD_E_INVAL;
+    const RadTensor *Sc = &a->t[0], *V = &a->t[1], *cu = &a->t[2], *Y = &a->t[3];
+    const int64_t n = p_int(a, "n", 0);
+    const int64_t S = numel(cu) - 1;
+    if (n <= 0 || S <= 0 || numel(Y) < S * n) return RAD_E_SHAPE;
+    const int64_t total = ldi(cu, offlin(cu, S));
+    if (total <= 0 || numel(V) < total * n || numel(Sc) < total) return RAD_E_SHAPE;
+
+    AVX_PARALLEL_FOR_IF(S >= 2)
+    for (int64_t s = 0; s < S; ++s) {
+        const int64_t b0 = ldi(cu, offlin(cu, s)), b1 = ldi(cu, offlin(cu, s + 1));
+        float* acc = scratch_f32_b((size_t)n);
+        float* sy = scratch_f32_c((size_t)n);
+        float one = 0.0f;
+        float m = -INFINITY, z = 0.0f;
+        for (int64_t r = b0; r < b1; ++r) m = std::max(m, in_row(Sc, rowoff(Sc, r, 1), 1, &one)[0]);
+        for (int64_t r = b0; r < b1; ++r) z += std::exp(in_row(Sc, rowoff(Sc, r, 1), 1, &one)[0] - m);
+        for (int64_t i = 0; i < n; ++i) acc[i] = 0.0f;
+        for (int64_t r = b0; r < b1; ++r) {
+            const float w = std::exp(in_row(Sc, rowoff(Sc, r, 1), 1, &one)[0] - m) / z;
+            const float* x = in_row(V, rowoff(V, r, n), n, sy);
+            for (int64_t i = 0; i < n; ++i) acc[i] += w * x[i];
+        }
+        for (int64_t i = 0; i < n; ++i) sy[i] = b1 > b0 ? acc[i] : 0.0f;
+        out_row(Y, rowoff(Y, s, n), n, sy);
+    }
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------------ pool_rows */
 /* As libref: the mean of each k consecutive rows, summed in f32 and rounded to y's dtype, then the
  * multiplier and a second rounding (the unfused pair). Parallel over output rows. */
@@ -593,6 +630,33 @@ AVX_KERNEL(pool_cols) {
         roundtrip(Y->dtype, acc, nw, sx);
         for (int64_t c = 0; c < nw; ++c) acc[c] *= mult;
         out_row(Y, rowoff(Y, r, nw), nw, acc);
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ position_scale */
+/* Ministral 3's query multiplier is rounded before multiplication, as in libref. */
+AVX_KERNEL(position_scale) {
+    if (!rad_args_have(a, 2)) return RAD_E_INVAL;
+    const RadTensor *x = &a->t[0], *pos = &a->t[1];
+    // M in the resolved geometry is a capacity band; issued views carry the active rows.
+    const int64_t M = x->rank == 2 ? x->shape[0] : 0;
+    const int64_t n = p_int(a, "n", 0), orig = p_int(a, "original", 0);
+    const float beta = p_f32(a, "beta", -1);
+    if (M <= 0 || M > p_int(a, "M", 0) || n <= 0 || orig <= 0 || !std::isfinite(beta) || beta < 0 ||
+        x->rank != 2 || x->shape[0] < M || x->shape[1] != n || pos->rank != 1 || numel(pos) < M)
+        return RAD_E_SHAPE;
+    if (pos->dtype != RAD_I32 || (x->dtype != RAD_BF16 && x->dtype != RAD_F32)) return RAD_E_DTYPE;
+    for (int64_t r = 0; r < M; ++r)
+        if (ldi(pos, offlin(pos, r)) < 0) return RAD_E_INVAL;
+    AVX_PARALLEL_FOR_IF(M * n >= AVX_PAR_MIN)
+    for (int64_t r = 0; r < M; ++r) {
+        const int64_t p = ldi(pos, offlin(pos, r));
+        const float scale = narrow1(x->dtype, 1.0f + beta * std::log(1.0f + (float)(p / orig)));
+        for (int64_t j = 0; j < n; ++j) {
+            const int64_t at = rowoff(x, r, n) + j * laststride(x);
+            stt(x, at, ldt(x, at) * scale);
+        }
     }
     return RAD_OK;
 }

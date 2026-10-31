@@ -186,7 +186,7 @@ static const RadConstraint cDs41PostCollapseNorm[] = {
            "Per row and stream s: dot = sum h w k * rsqrt(mean h^2 + eps) rsqrt(mean k^2 + eps) / sqrt(n), "
            "gate = sigmoid(copysign(sqrt(max(|dot|, gate_eps)), dot)), out = h + gate v; f32, rounded "
            "once. v is one [n] row a token shared by the hc streams; w is f32 [hc*n]."),
-    SCHEMA("rope_rows", pDs41RopeRows, oDs41RopeRows,
+    SCHEMA("ds41_rope_rows", pDs41RopeRows, oDs41RopeRows,
            "rope from a rope_table plane over columns [off, off+rot) of each head_dim-wide head of x, in "
            "place: gptj pairs adjacent columns, neox i with i+rot/2; (a,b)(c+is) in f32, rounded once; "
            "inverse 1 conjugates the rotation. A negative or out-of-table position leaves its row."),
@@ -250,11 +250,11 @@ static const RadConstraint cDs41PostCollapseNorm[] = {
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cDs41StreamGate), NOTUNE,
   nullptr, nullptr, r4d_rad_stream_gate_add, nullptr, nullptr, nullptr,
   r4d_shape_stream_gate_add },
-{ "rope_rows_bf16", "rope_rows", "attn",
+{ "rope_rows_bf16", "ds41_rope_rows", "attn",
   "rotary from a rope_table plane over columns [off, off+rot) of each head, in place",
   "any M, heads and head_dim, gptj or neox, inverse 0/1; one thread a pair",
   "bf16 x, f32 cos_sin, i32 positions", RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cDs41RopeRows),
-  NOTUNE, nullptr, nullptr, r4d_rad_rope_rows, nullptr, nullptr, nullptr, r4d_shape_rope_rows },
+  NOTUNE, nullptr, nullptr, r4d_rad_ds41_rope_rows, nullptr, nullptr, nullptr, r4d_shape_rope_rows },
 { "quant_roundtrip_fp8_bf16", "quant_roundtrip", "quant",
   "block-scaled E4M3 quantise-dequantise in place, ue8m0 or f32 scale",
   "any M, n a multiple of block; a lane group a block up to 32 (powers of two), else a thread",

@@ -487,7 +487,7 @@ TEST(rope_rows_rotates_a_window_of_each_head_and_inverts) {
     for (int64_t i = 0; i < M * nh * hd; ++i) { x.set(i, std::sin(0.7f * (float)i + 0.1f)); x0.set(i, x.at(i)); }
     A a; a.t(x).t(cs).t(pos).i("M", M).i("n_head", nh).i("head_dim", hd).i("rot", rot).i("off", off)
         .s("mode", "gptj").i("inverse", 0).s("dtype", "f32");
-    REQUIRE_EQ(run("rope_rows", a), RAD_OK);
+    REQUIRE_EQ(run("ds41_rope_rows", a), RAD_OK);
     for (int64_t m = 0; m < M; ++m)
         for (int64_t h = 0; h < nh; ++h) {
             const int64_t b = m * nh * hd + h * hd;
@@ -502,14 +502,14 @@ TEST(rope_rows_rotates_a_window_of_each_head_and_inverts) {
             }
         }
     a.ps[6].ival = 1;   /* inverse */
-    REQUIRE_EQ(run("rope_rows", a), RAD_OK);
+    REQUIRE_EQ(run("ds41_rope_rows", a), RAD_OK);
     for (int64_t i = 0; i < M * nh * hd; ++i) CHECK(std::fabs(x.at(i) - x0.at(i)) < 1e-5f);
     /* neox pairs i with i + rot/2. */
     T y(RAD_F32, {M, nh * hd});
     for (int64_t i = 0; i < M * nh * hd; ++i) y.set(i, x0.at(i));
     A n; n.t(y).t(cs).t(pos).i("M", M).i("n_head", nh).i("head_dim", hd).i("rot", rot).i("off", off)
         .s("mode", "neox").i("inverse", 0).s("dtype", "f32");
-    REQUIRE_EQ(run("rope_rows", n), RAD_OK);
+    REQUIRE_EQ(run("ds41_rope_rows", n), RAD_OK);
     {
         const int64_t b = 1 * nh * hd + 2 * hd;   /* row 1 (position 5), head 2 */
         const float va = x0.at(b + off + 1), vb = x0.at(b + off + 1 + rot / 2);
@@ -520,10 +520,10 @@ TEST(rope_rows_rotates_a_window_of_each_head_and_inverts) {
     /* A window past the head is refused, as is an unknown mode. */
     A w; w.t(x).t(cs).t(pos).i("M", M).i("n_head", nh).i("head_dim", hd).i("rot", rot).i("off", off + 2)
         .s("mode", "gptj").i("inverse", 0).s("dtype", "f32");
-    CHECK_EQ(run("rope_rows", w), RAD_E_SHAPE);
+    CHECK_EQ(run("ds41_rope_rows", w), RAD_E_SHAPE);
     A u; u.t(x).t(cs).t(pos).i("M", M).i("n_head", nh).i("head_dim", hd).i("rot", rot).i("off", off)
         .s("mode", "spiral").i("inverse", 0).s("dtype", "f32");
-    CHECK_EQ(run("rope_rows", u), RAD_E_UNSUPPORTED);
+    CHECK_EQ(run("ds41_rope_rows", u), RAD_E_UNSUPPORTED);
 }
 
 /* quant_roundtrip against hand-worked blocks: fp8 with a power-of-two scale, fp4 with an e4m3
@@ -1777,9 +1777,11 @@ TEST(op_vocabulary) {
         "rmsnorm", "rmsnorm_p", "rmsnorm_add", "hc_enter", "hc_read", "hc_write", "hc_project",
         "mtp_enter",
         "mhc_pre", "mhc_pre_partial", "mhc_pre_finish", "mhc_post", "mhc_contract",
-        "mhc_mix", "mhc_collapse", "swiglu_clamped", "router_sigmoid_topk", "router_scored_topk", "rope_rows", "quant_roundtrip", "softmax_pool", "attn_sparse_sink", "index_score", "index_candidates", "index_topk", "entry_store", "token_map", "stream_gate_add", "gemm_nt_ggml", "moe_gemm_ggml", "logits_gemm_ggml", "embed_lookup_ggml", "embed_lookup_planes", "dsa_pool", "dsa_query", "dsa_score", "mla_attn", "mla_project", "gemm_nt_f32",
+        "mhc_mix", "mhc_collapse", "swiglu_clamped", "router_sigmoid_topk", "router_scored_topk", "ds41_rope_rows", "quant_roundtrip", "softmax_pool", "attn_sparse_sink", "index_score", "index_candidates", "index_topk", "entry_store", "token_map", "stream_gate_add", "gemm_nt_ggml", "moe_gemm_ggml", "logits_gemm_ggml", "embed_lookup_ggml", "embed_lookup_planes", "dsa_pool", "dsa_query", "dsa_score", "mla_attn", "mla_project", "gemm_nt_f32",
         "kda_update",
         "layernorm", "add", "mul", "mul_weight", "silu_mul", "gelu_mul", "act_mul", "seg_mean",
+        "seg_softmax_pool",
+        "seg_mean_bf16_sum",
         "pool_rows", "pool_cols", "relu", "clamp", "conv2d", "conv2d_unfold", "conv1d_dw",
         "rel_sinusoid",
         "seg_sinusoid", "attn_local_rel", "gelu", "silu", "sigmoid", "logit_softcap", "scale",
@@ -1794,6 +1796,8 @@ TEST(op_vocabulary) {
         /* The fused fp8 forms. A host run needs every op covered, so these keep a host-backend run
          * from failing with "site 'host' is unavailable for this band". */
         "rmsnorm_quant_fp8", "gated_quant_fp8", "gemm_nt_q_gated", "dflash_select",
+        /* Tree verification (rad_drafter_tree): the drafter's tree and the attention over it. */
+        "dflash_tree", "attn_paged_tree",
         "rmsnorm_had_quant_i8",
         "gated_had_quant_i8",
         "dequant",
@@ -1803,6 +1807,8 @@ TEST(op_vocabulary) {
         "grid_embed_aa",
         "attn_paged", "attn_dense", "kv_store", "kv_store_streamed", "rope", "rope_table",
         "qk_norm_rope", "qsa_block_key",
+        /* libr4d's row-form names, served by the base op's row. */
+        "rmsnorm_rows", "rope_rows", "gemm_nt_q_short", "gemm_nt_q_gated_wide",
         /* The rest of the QSA indexer and DFlash2's convolution: not fusions, so a model that
          * issues them has no other host path. */
         "qsa_score", "qsa_select", "qsa_tail_store", "qsa_work", "kv_resolve", "dflash_conv",
@@ -1869,6 +1875,7 @@ TEST(op_vocabulary) {
         "sam_attn",
         /* A pipelined prefill's first-piece KV length, a device length less a device offset. */
         "sub_i32",
+        "position_scale", "embed_attn", "ministral_rope", "pixtral_rope", "pixtral_merge",
     };
     for (const char* op : kOps) {
         if (!kern(op)) fprintf(stderr, "    missing op '%s'\n", op);
@@ -1876,15 +1883,17 @@ TEST(op_vocabulary) {
     }
     CHECK_EQ(api().kernel_count(), (int)(sizeof(kOps) / sizeof(kOps[0])));
 
-    /* The two structural constraints, and only those; everything else must match anything. */
+    /* The structural constraint on the paged block, and only that; everything else must match
+     * anything. attn_paged_tree is attn_paged's row with the tree operand, the same constraint. */
     CHECK_EQ(kern("attn_paged")->n_constraints, 1);
     CHECK(std::strcmp(kern("attn_paged")->constraints[0].key, "block_size") == 0);
+    CHECK_EQ(kern("attn_paged_tree")->n_constraints, 1);
     CHECK_EQ(kern("kv_store")->n_constraints, 1);
     CHECK_EQ(kern("gemm_nt")->n_constraints, 0);
     CHECK_EQ(kern("gdn_chunk_scan")->n_constraints, 0);
     int constrained = 0;
     for (int i = 0; i < api().kernel_count(); ++i) constrained += api().kernel_at(i)->n_constraints > 0;
-    CHECK_EQ(constrained, 2);
+    CHECK_EQ(constrained, 3);
 }
 
 /* ================================================================== the numerics
@@ -4070,6 +4079,21 @@ TEST(op_seg_mean) {
     CHECK_NEAR(y.at(0), 3.0f, 1e-6); CHECK_NEAR(y.at(1), 4.0f, 1e-6);
     CHECK_EQ(y.at(2), 0.0f);         CHECK_EQ(y.at(3), 0.0f);
     CHECK_NEAR(y.at(4), 7.0f, 1e-6); CHECK_NEAR(y.at(5), 9.0f, 1e-6);
+}
+
+/* seg_softmax_pool: a segment's rows summed with the softmax of their scores as weights. Scores 0
+ * and ln 3 weigh two rows 1/4 and 3/4; an empty segment is a zero row. */
+TEST(op_seg_softmax_pool) {
+    T sc(RAD_F32, {4});   sc.f({ 0.0f, 1.0986123f, 5.0f, 2.0f });
+    T v(RAD_F32, {4, 2}); v.f({ 1, 2,  5, 6,  7, 9,  3, 3 });
+    T cu(RAD_I32, {4});   cu.n({0, 2, 2, 4});
+    T y(RAD_F32, {3, 2});
+    A a; a.t(sc).t(v).t(cu).t(y).i("M", 4).i("n", 2).s("dtype", "f32");
+    CHECK_OK(run("seg_softmax_pool", a));
+    CHECK_NEAR(y.at(0), 4.0f, 1e-5);   CHECK_NEAR(y.at(1), 5.0f, 1e-5);
+    CHECK_EQ(y.at(2), 0.0f);           CHECK_EQ(y.at(3), 0.0f);
+    /* Scores 5 and 2: weights 1 / (1 + e^-3) and the rest. */
+    CHECK_NEAR(y.at(4), 6.8103f, 1e-3); CHECK_NEAR(y.at(5), 8.7155f, 1e-3);
 }
 
 /* relu and clamp: the plain element rules. */
@@ -10412,7 +10436,17 @@ struct Geo {
 #define G(op, key, r, body) { op, key, r, [](A& a, int64_t R) { body; } }
 std::vector<Geo> geometries() {
     return {
+        G("position_scale", "M", 3, a.i("M", R).i("n", 8).i("original", 16384)
+                                       .d("beta", 0.1).s("dtype", "f32")),
+        G("embed_attn", "M", 3, a.i("M", R).i("head_dim", 8).i("n_head", 2).i("gqa", 2)
+                                    .i("causal", 0).s("dtype", "f32")),
+        G("ministral_rope", "M", 3, a.i("M", R).i("head_dim", 8).i("n_head", 2)
+                                       .i("n_head_kv", 1).d("theta", 1e6).s("dtype", "f32")),
+        G("pixtral_rope", "M", 3, a.i("M", R).i("head_dim", 8).i("n_head", 2)
+                                     .d("theta", 10000.0).s("dtype", "f32")),
+        G("pixtral_merge", "M", 4, a.i("M", R).i("n", 8).i("merge", 2).s("dtype", "f32")),
         G("rmsnorm", "M", 3, a.i("M", R).i("n", 8).d("eps", 1e-6).s("dtype", "f32")),
+        G("rmsnorm_rows", "M", 3, a.i("M", R).i("n", 8).d("eps", 1e-6).s("dtype", "f32")),
         G("rmsnorm_p", "M", 3, a.i("M", R).i("n", 8).d("eps", 1e-6).s("dtype", "f32")),
         G("rmsnorm_add", "M", 3, a.i("M", R).i("n", 8).d("eps", 1e-6).s("dtype", "f32")),
         G("hc_enter", "M", 2, a.i("M", R).i("n", 8).i("hc", 2).s("dtype", "f32")),
@@ -10429,6 +10463,8 @@ std::vector<Geo> geometries() {
         G("mul_weight", "M", 3, a.i("M", R).i("n", 8).s("dtype", "f32")),
         G("act_mul", "M", 3, a.i("M", R).i("n", 8).s("act", "silu").s("dtype", "f32")),
         G("seg_mean", "M", 6, a.i("M", R).i("n", 8).s("dtype", "f32").i("n_seq", 2)),
+        G("seg_softmax_pool", "M", 6, a.i("M", R).i("n", 8).s("dtype", "f32").i("n_seq", 2)),
+        G("seg_mean_bf16_sum", "M", 6, a.i("M", R).i("n", 8).s("dtype", "bf16").i("n_seq", 2)),
         G("pool_rows", "M", 6, a.i("M", R).i("n", 8).i("k", 2).s("dtype", "f32")),
         G("pool_cols", "M", 6, a.i("M", R).i("n", 8).i("k", 2).s("dtype", "f32")),
         G("relu", "M", 3, a.i("M", R).i("n", 8).s("dtype", "f32")),
@@ -10480,11 +10516,16 @@ std::vector<Geo> geometries() {
                                      .s("act", "silu")),
         G("gemm_nt_q_gated", "M", 3, a.i("M", R).i("N", 32).i("K", 128).i("group", 128)
                                      .s("dtype", "fp8a8").s("act", "silu")),
+        G("gemm_nt_q_gated_wide", "M", 3, a.i("M", R).i("N", 32).i("K", 128).i("group", 128)
+                                     .s("dtype", "fp8a8").s("act", "silu")),
         G("dflash_select", "M", 2, a.i("M", R).i("steps", 3).i("top_k", 4).i("rank", 8)
                                    .i("n_vocab", 30).s("dtype", "bf16")),
+        G("dflash_tree", "M", 2, a.i("M", R).i("steps", 3).i("top_k", 4).i("rank", 8)
+                                 .i("n_vocab", 30).i("nodes", 3).s("dtype", "bf16")),
         G("gemm_nt", "M", 3, a.i("M", R).i("N", 20).i("K", 40).s("dtype", "f32")),
         G("gemm_nt_bias", "M", 3, a.i("M", R).i("N", 20).i("K", 40).s("dtype", "f32")),
         G("gemm_nt_q", "M", 3, a.i("M", R).i("N", 20).i("K", 256).i("group", 128).s("dtype", "fp8a8")),
+        G("gemm_nt_q_short", "M", 3, a.i("M", R).i("N", 20).i("K", 256).i("group", 128).s("dtype", "fp8a8")),
         G("gemm_nt_q_bias", "M", 3, a.i("M", R).i("N", 20).i("K", 256).i("group", 128)
                                     .s("dtype", "fp8a8")),
         G("lora_shrink", "M", 3, a.i("M", R).i("K", 40).i("R", 8).i("S", 2).s("dtype", "f32")),
@@ -10493,6 +10534,10 @@ std::vector<Geo> geometries() {
         G("attn_paged", "q_len", 3, a.i("q_len", R).i("head_dim", 8).i("gqa", 2).i("block_size", 4)
                                     .i("causal", 1).i("window", 0).s("q_dtype", "f32")
                                     .s("kv_dtype", "f32").i("n_head", 4).i("ctx", 9)),
+        G("attn_paged_tree", "q_len", 3, a.i("q_len", R).i("head_dim", 8).i("gqa", 2)
+                                         .i("block_size", 4).i("causal", 1).i("window", 0)
+                                         .s("q_dtype", "f32").s("kv_dtype", "f32").i("n_head", 4)
+                                         .i("ctx", 9)),
         G("attn_dense", "M", 6, a.i("M", R).i("head_dim", 8).i("gqa", 2).i("causal", 1)
                                 .s("dtype", "f32").i("n_head", 4)),
         /* One-row segments, so M is also the segment count (n_seq, the description's hint for
@@ -10506,6 +10551,8 @@ std::vector<Geo> geometries() {
           a.i("M", R).i("head_dim", 8).i("n_head_kv", 2).i("block_size", 8)
            .s("kv_dtype", "fp8_e4m3")),
         G("rope", "M", 3, a.i("M", R).i("head_dim", 8).i("n_head", 2).i("n_head_kv", 1)
+                          .d("theta", 1e4).d("scale", 1.0).s("mode", "neox")),
+        G("rope_rows", "M", 3, a.i("M", R).i("head_dim", 8).i("n_head", 2).i("n_head_kv", 1)
                           .d("theta", 1e4).d("scale", 1.0).s("mode", "neox")),
         G("qk_norm_rope", "M", 3, a.i("M", R).i("head_dim", 8).i("n_head", 2).i("n_head_kv", 1)
                                   .d("theta", 1e4).d("eps", 1e-6)),
@@ -10529,7 +10576,7 @@ std::vector<Geo> geometries() {
         G("gemm_nt_ggml", "M", 3, a.i("M", R).i("N", 5).i("K", 64).s("type", "q8_0").s("dtype", "bf16")),
         G("stream_gate_add", "M", 3, a.i("M", R).i("n", 8).i("hc", 4).d("eps", 1e-6).d("gate_eps", 1e-6)
                                      .s("dtype", "bf16")),
-        G("rope_rows", "M", 3, a.i("M", R).i("n_head", 2).i("head_dim", 12).i("rot", 8).i("off", 4)
+        G("ds41_rope_rows", "M", 3, a.i("M", R).i("n_head", 2).i("head_dim", 12).i("rot", 8).i("off", 4)
                                .s("mode", "gptj").i("inverse", 0).s("dtype", "f32")),
         G("qsa_block_key", "M", 2, a.i("M", R).i("n", 32).i("ratio", 4).i("rotary_dim", 8)
                                    .d("eps", 1e-6).d("theta", 1e4).s("dtype", "bf16")),
@@ -10782,8 +10829,10 @@ std::vector<Geo> geometries() {
  * cannot be drawn; ref_shapes.cpp says why). The sweeps skip them; their hand cases above cover
  * them. */
 bool undrawable(const char* op) {
+    // Complete raster grids need the hand-built cases in nemotron35_test, not random indices.
     return !std::strcmp(op, "givens_dense_quant") || !std::strcmp(op, "givens_rotate") ||
-           !std::strcmp(op, "sample_merge_topk") || !std::strcmp(op, "gather_rows2");
+           !std::strcmp(op, "sample_merge_topk") || !std::strcmp(op, "gather_rows2") ||
+           !std::strcmp(op, "pixtral_merge");
 }
 
 uint32_t lcg(uint32_t* s) { *s = *s * 1664525u + 1013904223u; return *s >> 8; }

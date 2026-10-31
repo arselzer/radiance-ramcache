@@ -2100,7 +2100,7 @@ extern "C" int r4d_rad_token_map(const RadArgs* a, RadStream s) { return token_m
 extern "C" int r4d_rad_stream_gate_add(const RadArgs* a, RadStream s) {
     return stream_gate_body(a, s);
 }
-extern "C" int r4d_rad_rope_rows(const RadArgs* a, RadStream s) { return rope_rows_body(a, s); }
+extern "C" int r4d_rad_ds41_rope_rows(const RadArgs* a, RadStream s) { return rope_rows_body(a, s); }
 extern "C" int r4d_rad_quant_roundtrip(const RadArgs* a, RadStream s) { return quant_rt_body(a, s); }
 extern "C" int r4d_rad_mhc_mix(const RadArgs* a, RadStream s) { return mhc_mix_body(a, s); }
 /* Partials of every chunk of every row of the band, so the projection spreads over workgroups. */

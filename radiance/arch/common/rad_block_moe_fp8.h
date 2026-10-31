@@ -1527,9 +1527,9 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
     }
 
     if (separate_fp32_combine) {
-        /* BF16 add widens both inputs to FP32, adds, then rounds once to BF16: exactly the
-         * former cast + cast + F32 add + cast chain. Keep the routed gather's BF16 rounding
-         * and the separate TP reductions; a local gather cannot fold those reductions. */
+        /* BF16 add widens both inputs to FP32, adds, then rounds once to BF16: the same bytes as
+         * cast + cast + F32 add + cast. The routed gather's BF16 rounding and the separate TP
+         * reductions stay; a local gather cannot fold those reductions. */
         op_combine = rw(b, RAD_OP(b, "add",
                            RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
                                       RAD_STR("dtype", "bf16")),
@@ -1737,7 +1737,10 @@ inline void MoeFP8::pass_head(RadCtx* c_, int64_t T, int64_t r0, int64_t rows,
     if (xp_next && xp_next->xp.n_parts > 0)
         (void)rad_expert_prefetch(c_, &xp_next->xp, w.h.x, r0, rows, g.n_embd);
     /* Write the routing counts straight into the core's row for this layer when it keeps one, so
-     * the report in step() needs no copy (otherwise a dependent blit per routed layer). */
+     * the report in step() needs no copy (otherwise a dependent blit per routed layer). Ours: kept
+     * over upstream's switch to the block's own ecnt buffer, because the ds41 file stager's routed
+     * reads find a layer's counts by that row (Ctx::route_counts_live, and the EP witness in
+     * Ctx::note_ep_route_producer); every pass it arms is issued live, never replayed from a tape. */
     int32_t* const counts = rad_route_counts(c_, layer, ne);
     const RadOperand ecnt = counts ? praw(counts, RAD_I32, ne) : brows(w.ecnt, ne);
     /* The fused router when it resolved and the pass fits: router, topk + scatter and (with
@@ -2013,6 +2016,7 @@ inline void MoeFP8::route_report(RadCtx* c_) const {
     RadRouting r{};
     r.expert_ids    = (const int32_t*)rad_buf_ptr(c_, w.ids);
     r.expert_w      = nullptr;
+    /* Ours: the row pass_head had the router write (see there), as before upstream's change. */
     const int32_t* const counts = rad_route_counts(c_, layer, c.n_expert);
     r.expert_count  = counts ? counts : (const int32_t*)rad_buf_ptr(c_, w.ecnt);
     r.sorted_tok    = (const int32_t*)rad_buf_ptr(c_, w.sorted);

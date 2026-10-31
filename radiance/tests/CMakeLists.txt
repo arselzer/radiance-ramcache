@@ -26,7 +26,7 @@
 # Phase 1's lent arena) on it: the real declare's graph at fewer rows, and the arena levels' sizes.
 # ds41_work_rows_arch_test is deepseek41's compressor tail at the rows a step needs (work_rows) on it:
 # the bound, the same bytes at either bound on host forms of the ops, and the recorded passes' key.
-set(RAD_TESTS_NO_CORE arch_test glm5next_test mapped_slab_pregrow_test ds41_prefetch_arch_test
+set(RAD_TESTS_NO_CORE arch_test glm5next_test nemotron35_test mapped_slab_pregrow_test ds41_prefetch_arch_test
                       ds41_prefetch_plan_test ds41_consumer_skip_arch_test consumer_skip_test
                       ds41_dspark_fp8_arch_test ds41_tbo_arch_test ds41_dspark_defer_arch_test
                       ds41_shape_probe_arch_test ds41_work_rows_arch_test)
@@ -184,6 +184,28 @@ foreach(t ${RAD_TESTS})
   get_filename_component(n ${t} NAME_WE)
   if(n IN_LIST RAD_TESTS_NO_CORE)
     add_executable(${n} ${t} ${CMAKE_SOURCE_DIR}/core/util/rad_util.cpp)
+    if(n STREQUAL "nemotron35_test")
+      target_sources(${n} PRIVATE ${CMAKE_SOURCE_DIR}/core/mm/processor.cpp
+                                 ${CMAKE_SOURCE_DIR}/core/mm/item.cpp
+                                 ${CMAKE_SOURCE_DIR}/core/mm/media.cpp
+                                 ${CMAKE_SOURCE_DIR}/core/server/nemotron35.cpp
+                                 ${CMAKE_SOURCE_DIR}/core/server/oai.cpp)
+      # Exercise the actual request parser without pulling the unrelated core runtime into the
+      # recording-builder test. Unused completion/response helpers are discarded at link time.
+      target_compile_options(${n} PRIVATE -ffunction-sections -fdata-sections)
+      target_link_options(${n} PRIVATE -Wl,--gc-sections)
+      file(GLOB NEMOTRON_TEST_TOKENIZER CONFIGURE_DEPENDS
+           ${CMAKE_SOURCE_DIR}/core/text/tokenizer*.cpp ${CMAKE_SOURCE_DIR}/core/text/unicode_norm*.cpp)
+      target_sources(${n} PRIVATE ${NEMOTRON_TEST_TOKENIZER})
+      target_link_libraries(${n} PRIVATE rad_vendor_llama)
+      target_link_libraries(${n} PRIVATE ${CMAKE_DL_LIBS})
+      target_include_directories(${n} PRIVATE ${CMAKE_SOURCE_DIR}/vendor)
+      add_dependencies(${n} libref)
+      if(TARGET libavx)
+        add_dependencies(${n} libavx)
+        target_compile_definitions(${n} PRIVATE RAD_NEMOTRON_TEST_AVX=1)
+      endif()
+    endif()
   elseif(n IN_LIST RAD_TESTS_HARNESS)
     add_executable(${n} ${t})
     add_dependencies(${n} harness_fixture)
@@ -296,10 +318,11 @@ set_property(DIRECTORY APPEND PROPERTY TEST_INCLUDE_FILES
 # ================================================================== the device tests on a card
 #
 # The unit entries run on the host backend. These run the tests whose code differs on a card (the
-# AQL backend, the driver's elastic commit, the mover's copies) on the card, one at a time: a test
-# that commits device memory fails beside another holding it, or beside a server.
+# AQL backend, the driver's elastic commit, the mover's copies, libquant's trellis GPTQ) on the
+# card, one at a time: a test that commits device memory fails beside another holding it, or beside
+# a server.
 if(RAD_HIP_FOUND)
-  foreach(n device_test mem_test place_test runtime_test)
+  foreach(n device_test mem_test place_test runtime_test quant_tcq_gpu_test)
     add_test(NAME ${n}_card COMMAND ${n} -perf_)
     set_tests_properties(${n}_card PROPERTIES
       LABELS gpu
@@ -331,23 +354,41 @@ endif()
 # the host backend; convert_test runs rad-convert on the same checkpoints. Both start the built
 # binaries as children, so they depend on them and on every plugin the checkpoints select
 # (llama_fp8 for convert_test's --set of an fp8 quantization_config).
-set(RAD_E2E_DEPS radiance rad-convert libref libquant qwen35_bf16 lfm2_bf16 gemma4 gemma4_bf16
+set(RAD_E2E_DEPS radiance rad-convert libref libquant nemotron35_embed qwen35_bf16 lfm2_bf16 gemma4 gemma4_bf16
                  llama_dense_fp8 llama_fp8 qwenimage21)
 if(TARGET libavx)
   list(APPEND RAD_E2E_DEPS libavx)
 endif()
-foreach(t engine_e2e_test convert_test)
+foreach(t engine_e2e_test convert_test clef_decision_test laya_decision_test)
   if(TARGET ${t})
     target_compile_definitions(${t} PRIVATE
       RAD_E2E_SERVER="$<TARGET_FILE:radiance>" RAD_E2E_CONVERT="$<TARGET_FILE:rad-convert>"
       RAD_E2E_HOME="${RAD_PLUGIN_OUT}" RAD_E2E_RECIPES="${CMAKE_SOURCE_DIR}/data/recipes")
-    add_dependencies(${t} ${RAD_E2E_DEPS})
+    if(t STREQUAL "clef_decision_test")
+      # The tiny clef's golden (tests/mkclefgolden.py) and the one plugin a clef container selects.
+      target_compile_definitions(${t} PRIVATE
+        RAD_CLEF_GOLDEN="${CMAKE_CURRENT_SOURCE_DIR}/data/golden/clef_tiny.json")
+      add_dependencies(${t} radiance rad-convert libref libquant clef_bf16)
+    elseif(t STREQUAL "laya_decision_test")
+      # The tiny Laya's golden (tests/mklayagolden.py) and the plugin a Laya container selects.
+      target_compile_definitions(${t} PRIVATE
+        RAD_LAYA_GOLDEN="${CMAKE_CURRENT_SOURCE_DIR}/data/golden/laya_tiny.json")
+      add_dependencies(${t} radiance rad-convert libref libquant laya)
+    else()
+      add_dependencies(${t} ${RAD_E2E_DEPS})
+    endif()
   endif()
 endforeach()
 # 6 to 17 s by build type and load, mostly libref's GEMMs and decode steps and the engine's own
 # startups, so labelled `e2e` and kept out of the fast tier; the host and full tiers run it.
 if(TARGET engine_e2e_test)
   set_tests_properties(engine_e2e_test PROPERTIES LABELS "e2e" TIMEOUT 300)
+endif()
+if(TARGET clef_decision_test)
+  set_tests_properties(clef_decision_test PROPERTIES LABELS "e2e" TIMEOUT 300)
+endif()
+if(TARGET laya_decision_test)
+  set_tests_properties(laya_decision_test PROPERTIES LABELS "e2e" TIMEOUT 300)
 endif()
 
 # abi_layout_test compares the ABI's struct layouts with a C translation unit's: abi_c_test.c
@@ -398,6 +439,17 @@ if(RAD_HIP_FOUND AND TARGET r4d_selftest)
     LABELS "slow;gpu"
     TIMEOUT 2400
     ENVIRONMENT "RADIANCE_HOME=${CMAKE_BINARY_DIR}/radiance_home")
+endif()
+
+# ================================================================== libhalo's interface parity
+#
+# libhalo serves gfx1151 behind libr4d's exact interface (libhalo/halo_parity.cpp): the same op
+# schemas and rows, so every model plugin runs on either. Host-only (the tables, no device calls);
+# present when one build produces both plugins.
+if(TARGET halo_parity)
+  add_test(NAME halo_parity
+           COMMAND halo_parity ${RAD_PLUGIN_OUT}/kernels/libr4d.so ${RAD_PLUGIN_OUT}/kernels/libhalo.so)
+  set_tests_properties(halo_parity PROPERTIES LABELS "fast" TIMEOUT 60)
 endif()
 
 # ================================================================== the device layer without SVM
@@ -679,6 +731,168 @@ if(R4D_EMU_BUILT)
   set_tests_properties(r4d_emu_qsa_sweep PROPERTIES LABELS "r4d_emu;slow" TIMEOUT 900)
 endif()
 
+# ---- P1 (K)
+# Prefill Phase 1's twin moe_gemm_ggml_mxfp4_gemv_tall_p1 (RADIANCE_EXPERIMENTAL_DS41_P1, r4d_ds41_mxfp4.hip, the
+# contract in tools/ds41-host-experts/ds41_p1.h) on the emulator: at 17 to 1024 tokens over tables mixing
+# block_mxfp4, packed and skipped entries against the plain gemv in passes of 16, skipped rows untouched, the slots
+# past the live end zeros, other work splits the same bytes, and the stager's wave composition (a main launch with
+# a subset skipped, then waves over it, the clamped SwiGLU relaunched) equal to one launch. Built like ds41vp (the
+# engine's packer linked in), in whichever arm built the emulator above.
+if(R4D_EMU_BUILT)
+  if(TARGET r4d_emu_kernels)
+    add_executable(r4d_emu_ds41p1 ${R4D_EMU}/test_ds41p1.cpp ${R4D_EMU_HX_SRC})
+    target_link_libraries(r4d_emu_ds41p1 PRIVATE r4d_emu_kernels ${CMAKE_DL_LIBS})
+    target_include_directories(r4d_emu_ds41p1 PRIVATE ${R4D_EMU_HX_DIR})
+    target_compile_options(r4d_emu_ds41p1 PRIVATE -ffp-contract=off -Wno-psabi)
+    set_target_properties(r4d_emu_ds41p1 PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+  else()
+    add_custom_command(OUTPUT ${dir}/test_ds41p1.o
+      COMMAND ${R4D_EMU_CXX} ${flags} -MD -MF ${dir}/test_ds41p1.o.d -c ${R4D_EMU}/test_ds41p1.cpp
+              -o ${dir}/test_ds41p1.o
+      DEPENDS ${R4D_EMU}/test_ds41p1.cpp
+      DEPFILE ${dir}/test_ds41p1.o.d
+      COMMENT "Building r4d_emu test_ds41p1.o with ${R4D_EMU_CXX}"
+      VERBATIM)
+    add_custom_command(OUTPUT ${CMAKE_BINARY_DIR}/tests/r4d_emu_ds41p1
+      COMMAND ${R4D_EMU_CXX} ${dir}/test_ds41p1.o ${objs} ${dir}/ds41_host_experts.o ${dl}
+              -o ${CMAKE_BINARY_DIR}/tests/r4d_emu_ds41p1
+      DEPENDS ${dir}/test_ds41p1.o ${objs} ${dir}/ds41_host_experts.o
+      COMMENT "Linking r4d_emu_ds41p1"
+      VERBATIM)
+    add_custom_target(r4d_emu_ds41p1_bin ALL DEPENDS ${CMAKE_BINARY_DIR}/tests/r4d_emu_ds41p1)
+  endif()
+  add_test(NAME r4d_emu_ds41p1 COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_ds41p1)
+  set_tests_properties(r4d_emu_ds41p1 PROPERTIES LABELS "r4d_emu;slow" TIMEOUT 3600)
+  # The same at the small heights, in the fast tier.
+  add_test(NAME r4d_emu_ds41p1_quick COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_ds41p1 quick)
+  set_tests_properties(r4d_emu_ds41p1_quick PROPERTIES LABELS "r4d_emu;fast" TIMEOUT ${RAD_TEST_TIMEOUT})
+endif()
+
+# ================================================================== libhalo on the emulator
+#
+# tests/halo_emu runs libhalo units (gfx1151) on the same SIMT emulator through its gfx11 WMMA
+# forms: the LDS-tiled prefill GEMMs against the narrow rows whose bytes they promise, and the
+# MXFP4 decode's activation plane against its in-kernel decode (test_gemm.cpp says which). The
+# units are the plugin's own sources, compiled as C++ the way r4d_emu compiles libr4d's, so a
+# card-less build checks them on every run. Same toolchain rules as r4d_emu above.
+set(HALO_DIR ${CMAKE_SOURCE_DIR}/libhalo)
+set(HALO_EMU ${CMAKE_CURRENT_SOURCE_DIR}/halo_emu)
+set(HALO_EMU_HIP ${HALO_DIR}/halo_gemm_fp8a8.hip ${HALO_DIR}/halo_gemm_mxfp4a8_tiled.hip
+                 ${HALO_DIR}/halo_gemm_mxfp4a8_nt_m64.hip ${HALO_DIR}/halo_gemm_mxfp4a8_decode.hip
+                 ${HALO_DIR}/halo_norm_join_bf16.hip ${HALO_DIR}/halo_expert_scale_bf16.hip
+                 ${HALO_DIR}/halo_pair_argmax_f32.hip ${HALO_DIR}/halo_attn_paged_window.hip
+                 ${HALO_DIR}/halo_qsa_select_bf16.hip ${HALO_DIR}/halo_lora_bf16.hip
+                 ${HALO_DIR}/halo_glm.hip ${HALO_DIR}/halo_mhc.hip
+                 ${HALO_DIR}/halo_gemm_fp8_f32scale.hip ${HALO_DIR}/halo_kda.hip
+                 ${HALO_DIR}/halo_moe_mxfp4.hip ${HALO_DIR}/halo_mla.hip
+                 ${HALO_DIR}/halo_quant_act_fp8.hip ${HALO_DIR}/halo_kv_resolve.hip
+                 ${HALO_DIR}/halo_dsa.hip ${HALO_DIR}/halo_gemm_nt_f32.hip
+                 ${HALO_DIR}/halo_router_sigmoid_topk_f32.hip ${HALO_DIR}/halo_router_scatter.hip
+                 ${HALO_DIR}/halo_gen.hip ${HALO_DIR}/halo_audio.hip ${HALO_DIR}/halo_encoder_bf16.hip
+                 ${HALO_DIR}/halo_model_bf16.hip ${HALO_DIR}/halo_hc_bf16.hip
+                 ${HALO_DIR}/halo_p2p_copy2d.hip
+                 ${HALO_DIR}/halo_attn_paged_gqa8.hip ${HALO_DIR}/halo_attn_paged_h128_gqa1.hip
+                 ${HALO_DIR}/halo_attn_paged_h128_gqa2.hip ${HALO_DIR}/halo_attn_paged_h128_gqa2w.hip
+                 ${HALO_DIR}/halo_attn_paged_h128_gqa4.hip ${HALO_DIR}/halo_attn_paged_h256_gqa2.hip
+                 ${HALO_DIR}/halo_attn_paged_h256_gqa4.hip ${HALO_DIR}/halo_attn_paged_h256_gqa6.hip
+                 ${HALO_DIR}/halo_gemm_bf16_nt_tiled.hip ${HALO_DIR}/halo_gemm_bf16_nt_m64.hip)
+# gemm: test_gemm.cpp above. norm, escale, pick: r4d_emu's tests of the same three ops, renamed --
+# the sandwich-norm joins, expert_scale and pair_argmax have no libref oracle by design (Gemma 4's
+# trunk runs the joins every layer), so the unfused chain bit for bit is the only check they get.
+# attn: r4d_emu's windowed paged attention test against its port of libref's ref_attn_paged --
+# the h128/h256/h512 window rows Gemma 4 runs, prefill and decode, plus a seeded shape sweep.
+# The rest are r4d_emu's other tests by the rename transform, over the libhalo ports of the same
+# units: QSA selection, the LoRA pair, GLM's F32 routing projection and MoE decode fusions, mHC,
+# the F32-scale E4M3 GEMM, KDA, the MXFP4 expert GEMM, MLA, kv_resolve and DSA's split.
+# ref: the elementwise and data-movement rows no model fixture reaches and halo_selftest has no
+# case for, each held to libref's row on operands drawn from libref's own descriptions.
+# paged: every block-size-16 attn_paged decode and prefill row (the decode and prefill bodies through
+# the units that own each geometry) against test_attn's reference.
+set(HALO_EMU_TESTS gemm norm escale pick attn qsa lora f32 mhc fp8f32 kda moemx mla moefuse kvres
+                   dsa ref paged)
+set(HALO_EMU_BUILT OFF)
+if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
+  # No fiber switch for this ISA.
+elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND NOT RAD_ASAN AND NOT RAD_TSAN)
+  set_source_files_properties(${HALO_EMU_HIP} PROPERTIES LANGUAGE CXX COMPILE_OPTIONS "-x;c++")
+  add_library(halo_emu_kernels OBJECT ${HALO_EMU_HIP} ${HALO_EMU}/cfg_host.cpp ${R4D_EMU}/ref_host.cpp
+                                     ${R4D_EMU}/emu/emu.cpp)
+  target_include_directories(halo_emu_kernels PUBLIC ${R4D_EMU}/emu ${R4D_EMU} ${HALO_DIR})
+  target_link_libraries(halo_emu_kernels PUBLIC rad_abi)
+  target_compile_options(halo_emu_kernels PRIVATE -ffp-contract=off -Wno-psabi)
+  foreach(t ${HALO_EMU_TESTS})
+    add_executable(halo_emu_${t} ${HALO_EMU}/test_${t}.cpp)
+    target_link_libraries(halo_emu_${t} PRIVATE halo_emu_kernels ${CMAKE_DL_LIBS})
+    target_compile_options(halo_emu_${t} PRIVATE -ffp-contract=off -Wno-psabi)
+    set_target_properties(halo_emu_${t} PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+  endforeach()
+  set(HALO_EMU_BUILT ON)
+elseif(R4D_EMU_CXX)
+  set(dir ${CMAKE_CURRENT_BINARY_DIR}/halo_emu)
+  file(MAKE_DIRECTORY ${dir})
+  set(flags -std=c++20 -O2 -ffp-contract=off -Wno-psabi -I${R4D_EMU}/emu -I${R4D_EMU} -I${HALO_DIR}
+            -I${CMAKE_SOURCE_DIR}/abi)
+  set(objs "")
+  set(srcs ${HALO_EMU_HIP} ${HALO_EMU}/cfg_host.cpp ${R4D_EMU}/ref_host.cpp ${R4D_EMU}/emu/emu.cpp)
+  foreach(t ${HALO_EMU_TESTS})
+    list(APPEND srcs ${HALO_EMU}/test_${t}.cpp)
+  endforeach()
+  foreach(src ${srcs})
+    get_filename_component(stem ${src} NAME_WE)
+    set(lang "")
+    if(src MATCHES "\\.hip$")
+      set(lang -x c++)
+    endif()
+    add_custom_command(OUTPUT ${dir}/${stem}.o
+      COMMAND ${R4D_EMU_CXX} ${flags} -MD -MF ${dir}/${stem}.o.d ${lang} -c ${src}
+              -o ${dir}/${stem}.o
+      DEPENDS ${src}
+      DEPFILE ${dir}/${stem}.o.d
+      COMMENT "Building halo_emu ${stem}.o with ${R4D_EMU_CXX}"
+      VERBATIM)
+    if(NOT stem MATCHES "^test_")
+      list(APPEND objs ${dir}/${stem}.o)
+    endif()
+  endforeach()
+  # test_lora, test_kda and test_ref open libref with dlopen.
+  set(dl "")
+  foreach(l ${CMAKE_DL_LIBS})
+    list(APPEND dl -l${l})
+  endforeach()
+  set(exes "")
+  foreach(t ${HALO_EMU_TESTS})
+    set(exe ${CMAKE_BINARY_DIR}/tests/halo_emu_${t})
+    add_custom_command(OUTPUT ${exe}
+      COMMAND ${R4D_EMU_CXX} ${dir}/test_${t}.o ${objs} ${dl} -o ${exe}
+      DEPENDS ${dir}/test_${t}.o ${objs}
+      COMMENT "Linking halo_emu_${t}"
+      VERBATIM)
+    list(APPEND exes ${exe})
+  endforeach()
+  add_custom_target(halo_emu ALL DEPENDS ${exes})
+  set(HALO_EMU_BUILT ON)
+endif()
+if(HALO_EMU_BUILT)
+  foreach(t gemm norm escale pick qsa lora f32 mhc fp8f32 kda mla moefuse kvres dsa ref paged)
+    add_test(NAME halo_emu_${t} COMMAND ${CMAKE_BINARY_DIR}/tests/halo_emu_${t})
+    set_tests_properties(halo_emu_${t} PROPERTIES LABELS "halo_emu;fast" TIMEOUT ${RAD_TEST_TIMEOUT})
+  endforeach()
+  # As r4d_emu: the LoRA pair and KDA are held to libref itself when the test can load it.
+  set_tests_properties(halo_emu_lora halo_emu_kda halo_emu_ref PROPERTIES
+                       ENVIRONMENT "RADIANCE_HOME=${CMAKE_BINARY_DIR}/radiance_home")
+  # As r4d_emu_attn: three shards of the fixed cases, and the seeded sweep as `slow`.
+  foreach(k 0 1 2)
+    add_test(NAME halo_emu_attn_shard${k} COMMAND ${CMAKE_BINARY_DIR}/tests/halo_emu_attn --shard ${k}/3)
+    set_tests_properties(halo_emu_attn_shard${k} PROPERTIES LABELS "halo_emu;fast"
+                         TIMEOUT ${RAD_TEST_TIMEOUT})
+  endforeach()
+  # libhalo's one MXFP4 expert kernel takes about 160 s here (libr4d's shape-specialised forms 30 s).
+  add_test(NAME halo_emu_moemx COMMAND ${CMAKE_BINARY_DIR}/tests/halo_emu_moemx)
+  set_tests_properties(halo_emu_moemx PROPERTIES LABELS "halo_emu;slow" TIMEOUT 900)
+  add_test(NAME halo_emu_attn_sweep COMMAND ${CMAKE_BINARY_DIR}/tests/halo_emu_attn sweep 40)
+  set_tests_properties(halo_emu_attn_sweep PROPERTIES LABELS "halo_emu;slow" TIMEOUT 900)
+endif()
+
 # ================================================================== the document as a test
 #
 # docs/OPS.md is the authoritative op table, so this test checks it against what the plugins dump
@@ -701,9 +915,9 @@ set_tests_properties(ops_doc PROPERTIES
   TIMEOUT ${RAD_TEST_TIMEOUT}
   ENVIRONMENT "ROCR_VISIBLE_DEVICES=99")
 
-# docs/KERNELS.md is generated by rad-kbench and merged by hand; a partial merge leaves a
-# library's "rows not reached" header from one run above a table from another (v1.13.0: 239
-# against 243 rows). The counts must agree with each other and with the headline; cheap.
+# docs/KERNELS.md is generated by rad-kbench and merged by hand; a partial merge can leave a
+# library's "rows not reached" header from one run above a table from another. The counts must
+# agree with each other and with the headline; cheap.
 if(EXISTS ${CMAKE_SOURCE_DIR}/docs/KERNELS.md)
   add_test(NAME kernel_report_check
            COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/kernel_report_check.sh
@@ -729,16 +943,18 @@ endif()
 # vocabulary and registration, and serve rad-kbench's fixture through the installed tools
 # (tests/oot_plugins.sh). libr4d is included when the tree built it, with the same HIP compiler,
 # targets and RAD_HIP_VOPD_REPEATABLE. Labelled `oot`: it rebuilds every plugin and takes minutes.
-set(RAD_OOT_HIP "")
+set(RAD_OOT_COMPILER "")
+set(RAD_OOT_TARGETS "")
 if(RAD_HIP_FOUND AND TARGET libr4d)
   get_target_property(RAD_OOT_R4D_ARCH libr4d HIP_ARCHITECTURES)
   string(REPLACE ";" "\\;" RAD_OOT_R4D_ARCH "${RAD_OOT_R4D_ARCH}")
-  set(RAD_OOT_HIP ${CMAKE_HIP_COMPILER} "${RAD_OOT_R4D_ARCH}" ${RAD_HIP_VOPD_REPEATABLE})
+  set(RAD_OOT_COMPILER "${CMAKE_HIP_COMPILER}")
+  set(RAD_OOT_TARGETS "${RAD_OOT_R4D_ARCH}")
 endif()
 add_test(NAME oot_plugins
          COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/oot_plugins.sh
-                 ${CMAKE_BINARY_DIR} ${CMAKE_SOURCE_DIR} ${CMAKE_BINARY_DIR}/oot ${RAD_OOT_HIP}
-                 ${CMAKE_CXX_COMPILER})
+                 ${CMAKE_BINARY_DIR} ${CMAKE_SOURCE_DIR} ${CMAKE_BINARY_DIR}/oot "${RAD_OOT_COMPILER}" "${RAD_OOT_TARGETS}"
+                 "${RAD_HIP_VOPD_REPEATABLE}" "${CMAKE_CXX_COMPILER}")
 # RESOURCE_LOCK kbench_memory: its replay holds operands in host memory as the kbench entries do.
 set_tests_properties(oot_plugins PROPERTIES
   LABELS "oot"
@@ -843,43 +1059,37 @@ foreach(cost IN ITEMS kbench_ref:500 r4d_selftest:350 r4d_emu_attn_sweep:80 kben
   endif()
 endforeach()
 
-# ---- P1 (K)
-# Prefill Phase 1's twin moe_gemm_ggml_mxfp4_gemv_tall_p1 (RADIANCE_EXPERIMENTAL_DS41_P1, r4d_ds41_mxfp4.hip, the
-# contract in tools/ds41-host-experts/ds41_p1.h) on the emulator: at 17 to 1024 tokens over tables mixing
-# block_mxfp4, packed and skipped entries against the plain gemv in passes of 16, skipped rows untouched, the slots
-# past the live end zeros, other work splits the same bytes, and the stager's wave composition (a main launch with
-# a subset skipped, then waves over it, the clamped SwiGLU relaunched) equal to one launch. Built like ds41vp (the
-# engine's packer linked in), in whichever arm built the emulator above.
-if(R4D_EMU_BUILT)
-  if(TARGET r4d_emu_kernels)
-    add_executable(r4d_emu_ds41p1 ${R4D_EMU}/test_ds41p1.cpp ${R4D_EMU_HX_SRC})
-    target_link_libraries(r4d_emu_ds41p1 PRIVATE r4d_emu_kernels ${CMAKE_DL_LIBS})
-    target_include_directories(r4d_emu_ds41p1 PRIVATE ${R4D_EMU_HX_DIR})
-    target_compile_options(r4d_emu_ds41p1 PRIVATE -ffp-contract=off -Wno-psabi)
-    set_target_properties(r4d_emu_ds41p1 PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
-  else()
-    add_custom_command(OUTPUT ${dir}/test_ds41p1.o
-      COMMAND ${R4D_EMU_CXX} ${flags} -MD -MF ${dir}/test_ds41p1.o.d -c ${R4D_EMU}/test_ds41p1.cpp
-              -o ${dir}/test_ds41p1.o
-      DEPENDS ${R4D_EMU}/test_ds41p1.cpp
-      DEPFILE ${dir}/test_ds41p1.o.d
-      COMMENT "Building r4d_emu test_ds41p1.o with ${R4D_EMU_CXX}"
-      VERBATIM)
-    add_custom_command(OUTPUT ${CMAKE_BINARY_DIR}/tests/r4d_emu_ds41p1
-      COMMAND ${R4D_EMU_CXX} ${dir}/test_ds41p1.o ${objs} ${dir}/ds41_host_experts.o ${dl}
-              -o ${CMAKE_BINARY_DIR}/tests/r4d_emu_ds41p1
-      DEPENDS ${dir}/test_ds41p1.o ${objs} ${dir}/ds41_host_experts.o
-      COMMENT "Linking r4d_emu_ds41p1"
-      VERBATIM)
-    add_custom_target(r4d_emu_ds41p1_bin ALL DEPENDS ${CMAKE_BINARY_DIR}/tests/r4d_emu_ds41p1)
+# Model-local device kernels are checked on the actual engine queue against libref.
+if(TARGET nemotron35_device_test)
+  set_target_properties(nemotron35_device_test PROPERTIES ENABLE_EXPORTS ON)
+  add_dependencies(nemotron35_device_test libref)
+  if(TARGET libr4d)
+    add_dependencies(nemotron35_device_test libr4d)
+    add_test(NAME nemotron35_device_test_card COMMAND nemotron35_device_test)
+    set_tests_properties(nemotron35_device_test_card PROPERTIES LABELS "gpu" RUN_SERIAL TRUE
+      ENVIRONMENT "RADIANCE_HOME=${RAD_PLUGIN_OUT};RAD_TEST_CPU_BUDGET=0" TIMEOUT 180)
   endif()
-  add_test(NAME r4d_emu_ds41p1 COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_ds41p1)
-  set_tests_properties(r4d_emu_ds41p1 PROPERTIES LABELS "r4d_emu;slow" TIMEOUT 3600)
-  # The same at the small heights, in the fast tier.
-  add_test(NAME r4d_emu_ds41p1_quick COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_ds41p1 quick)
-  set_tests_properties(r4d_emu_ds41p1_quick PROPERTIES LABELS "r4d_emu;fast" TIMEOUT ${RAD_TEST_TIMEOUT})
 endif()
 
+# Large BF16 GEMMs require real device memory; ordinary host entries skip them.
+if(TARGET r4d_bf16_capacity_test)
+  set_target_properties(r4d_bf16_capacity_test PROPERTIES ENABLE_EXPORTS ON)
+  if(TARGET libr4d)
+    add_dependencies(r4d_bf16_capacity_test libr4d)
+    add_test(NAME r4d_bf16_capacity_test_card COMMAND r4d_bf16_capacity_test)
+    set_tests_properties(r4d_bf16_capacity_test_card PROPERTIES LABELS "gpu" RUN_SERIAL TRUE
+      ENVIRONMENT "RADIANCE_HOME=${RAD_PLUGIN_OUT};RAD_TEST_CPU_BUDGET=0" TIMEOUT 300)
+  endif()
+endif()
+
+# The vendor record, verified: every file under vendor/ -- the lifts, the patch series, the record
+# itself -- hashed against vendor/SHA256SUMS. A changed file the record does not carry, or one that
+# arrived unrecorded, is an unrecorded change to a lifted dependency, which is the thing UPSTREAM
+# exists to prevent and nothing else notices. It reads the source tree only: no build inputs, no
+# machine state, so it runs wherever the suite runs.
+add_test(NAME vendor_sums
+         COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/vendor_sums.sh ${CMAKE_SOURCE_DIR})
+set_tests_properties(vendor_sums PROPERTIES LABELS "fast;unit" TIMEOUT 120)
 # ---- P1 (S)
 # Prefill Phase 1's stager and end-aligned chunks (core/place/card_expert_stager.h, core/sched/p1_chunk.h):
 # p1_stager_test (the scheduling on a simulated card, the ring stress, the tunables, the admission) and

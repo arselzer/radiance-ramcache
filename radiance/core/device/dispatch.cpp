@@ -525,6 +525,10 @@ std::string dev_pci_address(int device) {
     if (!dev()->pci_address) return std::string();
     return dev_string(64, [&](char* b, int n) { return dev()->pci_address(device, b, n); });
 }
+int64_t dev_stuck_ms() {
+    const auto f = dev()->stuck_ms;
+    return f ? f() : 0;
+}
 std::string dev_dma_lane(int device) {
     if (!dev()->dma_lane) return std::string();
     return dev_string(256, [&](char* b, int n) { return dev()->dma_lane(device, b, n); });
@@ -605,10 +609,14 @@ int  rad_event_elapsed_ms(RadEvent a, RadEvent b, float* out) {
 }
 
 int rad_memcpy_async(void* dst, const void* src, int64_t bytes, RadStream s) {
+    /* One address space (unified memory, or a host view of a device allocation): a copy
+     * onto itself is already done. */
+    if (dst == src) return RAD_OK;
     return dev()->memcpy_async(dst, src, bytes, s);
 }
 int rad_memcpy_2d_async(void* dst, int64_t dpitch, const void* src, int64_t spitch,
                         int64_t width, int64_t height, RadStream s) {
+    if (dst == src && dpitch == spitch) return RAD_OK;
     return dev()->memcpy_2d_async(dst, dpitch, src, spitch, width, height, s);
 }
 int rad_memset_async(void* dst, int value, int64_t bytes, RadStream s) {
@@ -663,6 +671,20 @@ int64_t rad_xp_behind(int device) {
 void* rad_dev_alloc_uncached(int64_t bytes) {
     if (const auto f = dev()->alloc_uncached) return f(bytes);
     return nullptr;
+}
+void* rad_dev_map_file(int fd, int64_t foff, int64_t bytes) {
+    const auto f = dev()->map_file;
+    if (!f) {
+        rad::device_set_error("rad_dev_map_file: the %s backend has no pinned host memory to map a "
+                              "file into", dev()->name);
+        return nullptr;
+    }
+    void* p = f(fd, foff, bytes);
+    if (p) {
+        rad::g_ledger[RAD_MEM_HOST_MAPPED].bytes.fetch_add(bytes, std::memory_order_relaxed);
+        rad::g_ledger[RAD_MEM_HOST_MAPPED].count.fetch_add(1, std::memory_order_relaxed);
+    }
+    return p;
 }
 void rad_dev_free_uncached(void* p) {
     if (const auto f = dev()->free_uncached) f(p);

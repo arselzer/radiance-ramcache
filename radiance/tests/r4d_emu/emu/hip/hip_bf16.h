@@ -1,18 +1,14 @@
-/* tests/r4d_emu: the part of HIP's hip_bf16.h the bf16 GEMM units use. __hip_bfloat16 holds the
- * bf16 bits and is made from a float by round to nearest even with a NaN kept quiet, as HIP's
- * conversion (the language's float to __bf16) does. Test-only. */
+/* tests/r4d_emu (and halo_emu): HIP's __hip_bfloat16, round-to-nearest-even from float (NaN kept quiet), as ROCm's. */
 #pragma once
 #include <cstdint>
 #include <cstring>
-
 struct __hip_bfloat16 {
-    unsigned short __x;
+    uint16_t data;
     __hip_bfloat16() = default;
-    __hip_bfloat16(float v) {
-        uint32_t u;
-        std::memcpy(&u, &v, 4);
-        if ((u & 0x7fffffffu) > 0x7f800000u) __x = (unsigned short)((u >> 16) | 0x0040u);
-        else __x = (unsigned short)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+    __hip_bfloat16(float f) {
+        uint32_t u; std::memcpy(&u, &f, 4);
+        if ((u & 0x7fffffffu) > 0x7f800000u) data = (uint16_t)((u >> 16) | 0x40u);
+        else data = (uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
     }
+    operator float() const { uint32_t u = (uint32_t)data << 16; float f; std::memcpy(&f, &u, 4); return f; }
 };
-static_assert(sizeof(__hip_bfloat16) == 2, "a bf16 is two bytes");

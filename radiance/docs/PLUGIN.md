@@ -23,9 +23,11 @@ quantisers, and §13 building, installing and the search path.
 
 ```c
 #include "rad_abi.h"          /* required */
+#include "rad_abi_layout.h"   /* required: the layout fingerprint */
 #include "rad_plugin.h"       /* optional helpers -- see §6 */
 
 uint32_t rad_plugin_abi_version(void) { return RAD_ABI_VERSION; }
+RAD_PLUGIN_ABI_LAYOUT_EXPORT    /* uint64_t rad_plugin_abi_layout(void) */
 
 const RadPluginInfo* rad_plugin_info(void) {
     static const RadPluginInfo i = {
@@ -42,7 +44,16 @@ const RadKernelInfo* rad_kernel_at(int i);
 
 A plugin whose `rad_plugin_abi_version` differs from the engine's is refused at load, by name, with
 both numbers printed. Return the macro, not the integer, and rebuild when it changes; it changes
-with any shape change in a header a plugin compiles against (`rad_abi.h` lists them).
+with any shape change in a header a plugin compiles against (`rad_abi.h` lists them), a field
+appended to a struct included, and the release that ships the change assigns the number: a tree of
+your own never bumps it for its own fields.
+
+`rad_plugin_abi_layout` is a fingerprint of those headers' struct layouts as your plugin was
+compiled (every struct's size and every field's offset and size, `rad_abi_layout_rows.h`). A plugin
+whose fingerprint differs from the engine's under the same version -- built against another tree's
+headers that gave a different layout the same number -- is refused with both fingerprints printed,
+and so is one that does not export it. Every kind of plugin (kernel, architecture, quantiser)
+exports both.
 
 `build_target` is printed, not trusted: the targets the library was built for (`"gfx1100"`,
 `"gfx11-generic"`, several separated by spaces or commas), `"host"` for CPU kernels, or `""` for a
@@ -389,17 +400,19 @@ says so with `RAD_ARCH_SERVES_IMPORTS(0)` (`qwen35_w8a8` does), and imports keep
 - **A block drafter may serve a shorter block.** `rad_drafter_short_block(b, block)`, called once
   after `rad_declare_drafter`, says the plugin declared its query pass at `block` rows a sequence as
   well as at `RadDrafterDecl::block`, with the same anchor convention, so the core may stage a step
-  at either; the short block proposes `block - (RadDrafterDecl::block - depth)` tokens. The builder
-  refuses it without a block drafter, at or above the drafter's own block, and where it would
-  propose nothing. The engine runs it under `--draft-short-from` (GUIDE §4.6) and reads row `s` of
+  at either; the short block proposes `block - (RadDrafterDecl::block - depth)` tokens. A tree
+  drafter (`rad_drafter_tree`, called first) grows a tree of its own over the shorter pass, at most
+  `block - 1` nodes, and its short block needs only 2 rows. The builder refuses it without a block
+  drafter, at or above the drafter's own block, and where it would propose nothing. The engine runs it under `--draft-short-from` (GUIDE §4.6) and reads row `s` of
   the proposals at `s * proposal_pitch`; a block drafter's `proposal_pitch` defaults to its
   depth (a row holds the whole block's proposals and a short block fills its front) and is refused
   below it. The pass's block is `n_tok / n_seq`; a block the plugin has no ops for should fail the
   step (`rad_block_dflash2.h` does). Appended in ABI 27.
 - **Media preprocessing is the core's** (`core/mm`): resizing, patching, placeholder-token
-  expansion and positions, in five processor families (Qwen-VL, Gemma 4, LFM2-VL, Unlimited-OCR,
-  GLM-5.3) chosen by the container's `vision_config.model_type` (Unlimited-OCR's by its
-  `model_type`). A vision model with another pipeline needs a core change.
+  expansion and positions, in six processor families (Qwen-VL, Gemma 4, LFM2-VL, Unlimited-OCR,
+  GLM-5.3 and Pixtral for Nemotron 3.5) chosen by the container's `vision_config.model_type`
+  and owning-model checks (Unlimited-OCR's by its `model_type`). A vision model with another
+  pipeline needs a core change.
   Audio goes through one of two feature extractors, Gemma 4's and Qwen3-ASR's (Whisper's), chosen
   by `audio_config.model_type`.
 - **A speech model says how it hears**, through the optional
@@ -434,6 +447,13 @@ blk.*.ffn_*_exps.*.weight    myquant    bits=3 group=64
 `rad-convert --list-quantizers` prints every loaded quantiser and its options. A recipe option the
 quantiser does not declare is refused before anything is quantised. Two plugins naming the same
 quantiser are refused, both named.
+
+A quantiser that can use a card exports `int rad_quant_devices(const int* ids, int n)`
+(`RadQuantDevicesFn`). `rad-convert --gpus 0,1` calls it once, before the first weight; without
+the flag the plugin runs on the host. Which device a weight ran on is not recorded anywhere, so the
+planes must be the host's byte for byte: libquant's trellis GPTQ keeps the host's operations and
+their order on the card (`tests/quant_tcq_gpu_test.cpp` compares the two). Return
+`RAD_E_UNSUPPORTED` from a build with no device path.
 
 The core decodes the `plain` and `affine` schemes. Your own scheme is decoded by your `decode`
 hook, which the oracle, `rad-kbench` and `rad-convert`'s error report use; return

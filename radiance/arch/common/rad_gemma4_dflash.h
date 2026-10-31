@@ -188,6 +188,10 @@ inline bool dflash2_probe(const RadModelMeta* meta, RadArchProbe* out) {
     out->draft_depth = (int)(bs - 1);
     out->draft_depth_fixed = 1;
     out->chain_pays = 1;
+    /* Its proposals verified as a tree of the same node count (dflash_tree, rad_drafter_tree): on
+     * 4x R9700 +7% single-stream decode and +6-9% aggregate at 1-16 users over the selector's
+     * chain (BetterBench, thinking off; on two cards +4% and +6-12%). */
+    out->tree_pays = 1;
     return true;
 }
 
@@ -200,7 +204,7 @@ inline bool dflash2_probe(const RadModelMeta* meta, RadArchProbe* out) {
  * 58. Id 0 would be the embedding, which no layer outputs, and is refused. */
 inline int dflash2_taps(const RadModelMeta* meta, const RadBuildCtx* ctx, int64_t n_layer, int* out,
                         int max) {
-    if (!rad_ctx_draft_head(ctx) || dflash_kind(meta) != 2) return 0;
+    if (ctx->max_spec <= 0 || dflash_kind(meta) != 2) return 0;
     const char* aux = rad_meta_gets(meta, "draft.aux_hidden_state_layer_ids", nullptr);
     int n = 0;
     if (aux) {
@@ -536,7 +540,7 @@ inline int Dflash1::Lin::declare(RadBuilder* b, Names& nm, const char* base, int
 
 inline int Dflash1::taps(const RadModelMeta* meta, const RadBuildCtx* ctx, int64_t n_layer,
                          int* out, int max) {
-    if (!rad_ctx_draft_head(ctx)) return 0;
+    if (ctx->max_spec <= 0) return 0;
     const int kind = dflash_kind(meta);
     if (kind == 0) return 0;
     if (kind == 2) {

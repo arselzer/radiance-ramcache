@@ -190,6 +190,7 @@ at once. Run it before adding a kernel plugin; the loader names only the first c
 | op | params | operands |
 |---|---|---|
 | `rmsnorm` | `M`(range) `n` `eps`:f64 `dtype` `wadd`:f64/opt `mult`:f64/opt | `x`, `w`w? → `y` (no gain operand: a gain of one) |
+| `rmsnorm_rows` | `M`(range) `n` `eps`:f64 `dtype` `wadd`:f64/opt `mult`:f64/opt | `x`, `w`w? → `y` (the same norm; at n <= 256 with 1024+ rows a wave a row, byte-identical) |
 | `rmsnorm_p` | `M`(range) `n` `eps`:f64 `dtype` | `x` → `y` |
 | `rmsnorm_add` | `M`(range) `n` `eps`:f64 `dtype` `wadd`:f64/opt | `x`, `residual`, `w`w → `y`, `residual_out` |
 | `hc_enter` | `M`(range) `n` `hc` `dtype` | `x` → `h` |
@@ -215,12 +216,15 @@ at once. Run it before adding a kernel plugin; the loader names only the first c
 | `mul_weight` | `M`(range) `n` `dtype` `scalar`/opt | `x`, `w`w → `y` (w one element or one row) |
 | `act_mul` | `M`(range) `n` `act` `dtype` | `a`, `b` → `y` (act(a)·b, two operands) |
 | `seg_mean` | `M`(range) `n` `dtype` | `x`, `cu_seqlens` → `y` (one mean row a segment) |
+| `seg_softmax_pool` | `M`(range) `n` `dtype` | `score`, `v`, `cu_seqlens` → `y` (one softmax-weighted row a segment) |
+| `seg_mean_bf16_sum` | `M`(range) `n` `dtype` | `x`, `cu_seqlens` → `y` (BF16 sum, then BF16 quotient) |
 | `pool_rows` | `M`(range) `n` `k` `mult`:f64/opt `dtype` | `x` → `y` (one mean row a window of k rows) |
 | `pool_cols` | `M`(range) `n` `k` `mult`:f64/opt `dtype` | `x` → `y` (one mean column a window of k columns) |
 | `relu` | `M`(range) `n` `dtype` | `x` → `y` |
 | `clamp` | `M`(range) `n` `dtype` | `x`, `lo`w, `hi`w → `y` |
 | `conv2d` | `M`(range) `width` `cin` `cout` `kh` `kw` `stride` `pad` `cu_div`/opt `valid_stride`/opt `dtype` `t_last`/opt `act`/opt | `x`, `w`w, `cu_seqlens`, `valid`? → `y`; `b`w? |
 | `conv2d_unfold` | `M`(range) `width` `cin` `kh` `kw` `stride` `pad` `cu_div`/opt `valid_stride`/opt `t_last`/opt `dtype` | `x`, `cu_seqlens`, `valid`? → `y` |
+| `pixtral_merge` | `M`(range) `n` `merge` `dtype` | `x`, `coord` → `y` |
 | `conv1d_dw` | `M`(range) `n` `k` `cu_div`/opt `dtype` | `x`, `w`w, `cu_seqlens` → `y`; `b`w? |
 | `rel_sinusoid` | `M`(range) `n` `max_timescale`:f64/opt `dtype` | → `y` |
 | `gelu_mul` | `M`(range) `n` `dtype` | `gate_up` → `y` (splits `[M,2n]` into gelu·up, tanh approx) |
@@ -300,6 +304,20 @@ rounded to `y`'s dtype before the product, as the unfused pair stores it.
 **`seg_mean`** is mean pooling over a ragged batch: row `s` of `y` is the mean of `x`'s rows
 `[cu[s], cu[s+1])`, summed in double and rounded once. `M` is the step's token count and bands the
 op; the segment count is `cu_seqlens`' length less one. An empty segment is a zero row.
+
+**`seg_softmax_pool`** is `seg_mean` with learned weights: row `s` of `y` is `v`'s rows
+`[cu[s], cu[s+1])` summed with the softmax of their `score`s (one a row of `v`, f32, the maximum
+subtracted) as the weights, the sum in f32 and rounded once. It is a query reading its few
+candidates: clef's joint schema head routes each question over its options this way, the scores
+the options' dot products with the question. `M` bands the op as `seg_mean`'s does, and an empty
+segment is a zero row.
+
+**`seg_mean_bf16_sum`** preserves the two BF16 stores of Nemotron 3.5 Rerank's masked
+mean: sum the segment in f32, round the sum to BF16, divide by its valid-token count,
+then round the quotient to BF16. Input and output are BF16; cumulative lengths are
+int32, begin at zero, end at the active input row count and describe nonempty segments.
+Pitched rows are supported. This is a separate operation so `seg_mean` and existing
+embedding models keep their one-rounding contract.
 
 **`pool_rows`** is a vision pooler over windows laid out consecutively: row `r` of `y` is the mean
 of `x`'s rows `[r*k, r*k + k)`, summed in f32 and rounded to `y`'s dtype, then times `mult` and
@@ -476,7 +494,25 @@ at h128/gqa8 up to q_len 16 by reading each kv head for two query groups of 4 (a
 then holds each kv head once). Since no host library declares the op, a plugin that asks for it
 learns whether a card serves the geometry.
 
-libref has no row for any of them, deliberately. An architecture asks for a fusion and declares
+Tree verification (`rad_drafter_tree`, abi/rad_builder.h) adds one operand to both: the step's
+`RadBatch::spec_parent`, `[rows]` i32.
+
+| op | params | operands |
+|---|---|---|
+| `attn_paged_tree` | `q_len`(range) `head_dim` `gqa` `block_size`/der `causal` `window` `q_dtype` `kv_dtype` `scale`:f64/opt `max_ctx`/opt `n_head`/opt `max_seqs`/opt `prefill_fp8`/opt | `q`, `kv_cache`, `block_table`, `seqused`, `k_descale`?, `v_descale`?, `cu_seqlens`? → `out`; `spec_parent` |
+| `attn_paged_qrow_tree` | `q_len`(range) `head_dim` `gqa` `block_size`/der `causal` `window` `q_dtype` `kv_dtype` `scale`:f64/opt `max_ctx`/opt `n_head`/opt `max_seqs`/opt `prefill_fp8`/opt | `q`, `kv_cache`, `block_table`, `seqused`, `k_descale`?, `v_descale`?, `cu_seqlens`? → `out`; `spec_parent` |
+
+A row whose `spec_parent` is -2 is an ordinary causal row. Any other row is a node of its sequence's
+verify block, and its entry names its parent by row within the sequence's rows (`cu_seqlens`), -1
+for the block's first row, every parent before its child. Inside the block (keys from
+`seqused - q_len` on) such a row sees itself and its ancestors only; before it, every key as an
+ordinary row does, except that a window is measured from the block's first position plus the row's
+depth, the position its token takes once its path is committed. Causal layers only. libref serves
+`attn_paged_tree`; libr4d `attn_paged_qrow_tree` at h256/gqa2 on the split-KV decode kernel and at
+every geometry of the windowed kernels, to 64 rows a block.
+
+Of the ops above, libref serves only `attn_paged_tree`, which is not a fusion but `attn_paged`'s
+tree form. It has no row for any of the fusions, deliberately. An architecture asks for a fusion and declares
 the chain where it does not resolve (`rad_op_resolved`); a reference row would make it resolve
 everywhere, so a model loaded without the serving library would resolve to the reference and be
 refused at serve, instead of running the chain on libr4d or libavx. libr4d declares them with
@@ -524,7 +560,7 @@ second of a clip apart and attends in windows of eight seconds:
 | `rmsnorm_had_quant_i8` | `M`(range) `n` `eps`:f64 `group` `dtype` `wadd`:f64/opt | `x`, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`? |
 | `gated_had_quant_i8` | `M`(range) `n` `group` `dtype` `act`:str/opt `mode`/opt | `a`, `b`? → `q`, `scale` |
 | `dequant` | `M`(range) `n` `group` `dtype` | `q`, `scale` → `y` |
-| `gram_accum` | `M`(range) `n` `group` `dtype` | `a`, `a_scale`?, `h`:inout |
+| `gram_accum` | `M`(range) `n` `group` `dtype` `upper`/opt | `a`, `a_scale`?, `h`:inout |
 
 **`gram_accum`** characterises a quantiser's output:
 `h[k1][k2] += sum over rows of dequant(a)[m][k1] * dequant(a)[m][k2]`, the Hessian a GPTQ packer
@@ -534,7 +570,10 @@ block. It is not `gemm_nt` with a transposed operand: that op contracts the last
 and this one the first. It is the one op here that no forward pass issues; it runs under a
 calibration flag and its result is read at convert time, in another process, through a file.
 `dtype` says how `a` is read: `fp8a8` is E4M3 codes with an f32 dequant scale per (row, `group`
-columns) in `a_scale`; `bf16` is a plain activation with no `a_scale` and no grouping.
+columns) in `a_scale`; `bf16` is a plain activation with no `a_scale` and no grouping. `upper` 1
+accumulates only `k2 >= k1`, the half a reader of the symmetric `h` needs, for half the work; the
+entries below the diagonal are then outside the contract (libr4d adds whole 64-wide tiles, so it
+writes some of them).
 
 **Activation widths.** Which width a linear's activation takes follows from the weight. Where the
 checkpoint ships E4M3 weights and a block scale plane, every linear is `fp8a8`
@@ -611,6 +650,7 @@ and is optional.
 | `gated_quant_fp8` | `M` `n` `group` `dtype` `act`:str/opt | `gate_up` → `q`, `scale`, `out_bf16`? |
 | `swiglu_clamped_quant_fp8` | `M`(range) `n` `limit`:f64 `group` `dtype` | `gate_up` → `q`, `scale`, `out_bf16`? |
 | `gemm_nt_q_gated` | `M` `N` `K` `group` `dtype` `act` | `a`, `a_scale`, `b`w, `b_scale`w → `q`, `scale`, `out_bf16`? |
+| `gemm_nt_q_gated_wide` | `M` `N` `K` `group` `dtype` `act` | `a`, `a_scale`, `b`w, `b_scale`w → `q`, `scale`, `out_bf16`? (the same fold at every M: the narrow tile to 64 rows, past them the gated prefill tile) |
 | `gemm_nt_q_gated_mx` | `M` `N` `K` `group` `dtype` `act` | `a`, `a_scale`, `b`w, `b_scale`w, `b_ref`w → `q`, `scale`, `out_bf16`? |
 
 `quant_cols_fp8` is the same E4M3 quantiser with one scale per column over all `M` rows,
@@ -724,7 +764,8 @@ may not have arrived.
 | `gemm_nt_f32` | `M`(range) `N` `K` `dtype` | `a`, `b`w → `y` |
 | `gemm_nt_f32bf16` | `M`(range) `N` `K` `dtype` | `a`, `b`w → `y` |
 | `gemm_nt_bias` | `M`(range) `N` `K` `dtype` `act`/opt | `a`, `b`w, `bias`w, `res`? → `y` |
-| `gemm_nt_q` | `M`(range) `N` `K` `group` `dtype` `pb1`/opt `pb2`/opt `split_n`/opt | `a`, `a_scale`?, `b`w, `b_scale`w → `y`; `a_sum`?, `b_ref`w? |
+| `gemm_nt_q` | `M`(range) `N` `K` `group` `dtype` `pb1`/opt `pb2`/opt `split_n`/opt `w_rb`/opt | `a`, `a_scale`?, `b`w, `b_scale`w → `y`; `a_sum`?, `b_ref`w? |
+| `gemm_nt_q_short` | `M`(range) `N` `K` `group` `dtype` `pb1`/opt `pb2`/opt `split_n`/opt `w_rb`/opt | `a`, `a_scale`?, `b`w, `b_scale`w → `y`; `a_sum`?, `b_ref`w? (the narrow fp8 row with the short-prompt split rule: N <= 512, K <= 5120 and 41..64 rows run unsplit) |
 | `gemm_nt_q_bias` | `M`(range) `N` `K` `group` `dtype` | `a`, `a_scale`, `b`w, `b_scale`w, `bias`w → `y` |
 | `gemm_nt_ggml` | `M`(range) `N` `K` `type` `dtype` | `a`, `w`w → `y` |
 | `gemm_nt_bf16f8` | `M`(range) `N` `K` `dtype` | `a`, `b`w → `y` |
@@ -769,6 +810,15 @@ weight element (n, k) is `(code - zero) * scale`, one f16 scale and one integer 
 `a_sum` is `quant_act_i8`'s `asum`, group-major `[K/group][Mpad]` with `Mpad = ceil(M/16)*16`. The
 ParoQuant grids (the four 4- and 5-bit ones) take parts (`pb1`, `pb2`); `w2a8` and `w4a8_asym` do
 not, and none has a bias form.
+
+`w_rb` is the weight rows one int8 scale covers, when the weight's form makes it more than one: a
+trellis on libquant's `tcq_rb` grid, each value read against its block's largest scale. Absent, 1.
+An IQR weight under one f32 scale a row and one f32 factor a 128-K block for all rows (`kRowF32`,
+a computed trellis's form) needs none: `gemm_iqr_*` fold the block's factor with the activation's
+per-128 scale and take the row's in the epilogue.
+A kernel may then fold one scale a block of rows: libr4d's `gemm_iqr_tiled` does (its form says
+how many), as do `gemm_i8a8_rb8_tiled` and `gemm_i8a8_rb32_tiled` for an int8 weight whose
+per-row scale plane holds each block's one value in each row.
 
 `split_n` is the output width whose K split the call takes, when it is a row slice of a wider
 linear (a rank's share of a weight whose rows do not divide among the ranks, issued as two slices).
@@ -912,11 +962,16 @@ as the weight's GEMM stored them and claims no form. It changes no value.
 | `kv_store` | `M`(range) `head_dim` `n_head_kv` `block_size` `kv_dtype` `k_scale`:f64/opt `v_scale`:f64/opt | `k`, `v`, `slot_mapping`, `kv_cache`:inout |
 | `kv_store_streamed` | `M`(range) `head_dim` `n_head_kv` `block_size` `kv_dtype` `k_scale`:f64/opt `v_scale`:f64/opt | `k`, `v`, `slot_mapping`, `kv_cache`:inout, `res`, `host`:inout |
 | `rope` | `M`(range) `head_dim` `n_head` `n_head_kv` `theta`:f64 `scale`:f64 `mode` `rotary_dim`/opt `sections`/opt `yarn_factor`:f64/opt `yarn_low`:f64/opt `yarn_high`:f64/opt `yarn_magnitude`:f64/opt `ladder`/opt `llama3_factor`:f64/opt `llama3_low`:f64/opt `llama3_high`:f64/opt `llama3_orig`:f64/opt | `qkv`:inout, `positions` |
+| `rope_rows` | `M`(range) `head_dim` `n_head` `n_head_kv` `theta`:f64 `scale`:f64 `mode` `rotary_dim`/opt `sections`/opt `yarn_factor`:f64/opt `yarn_low`:f64/opt `yarn_high`:f64/opt `yarn_magnitude`:f64/opt `ladder`/opt `llama3_factor`:f64/opt `llama3_low`:f64/opt `llama3_high`:f64/opt `llama3_orig`:f64/opt | `qkv`:inout, `positions` (the same rotation; at 64+ rows and 4+ heads one angle a (token, pair), byte-identical) |
 | `rope_table` | `M`(range) `rot` `theta`:f64 `scale`:f64 `dtype` `yarn_factor`:f64/opt `yarn_low`:f64/opt `yarn_high`:f64/opt `yarn_magnitude`:f64/opt `head_dim`/opt `ladder`/opt | `positions` → `cos_sin` |
-| `rope_rows` | `M`(range) `n_head` `head_dim` `rot` `off` `mode` `inverse` `dtype` | `x`:inout, `cos_sin`, `positions` |
+| `position_scale` | `M`(range) `n` `original` `beta`:f64 `dtype` | `x`:inout, `positions` |
+| `embed_attn` | `M`(range) `head_dim` `gqa` `causal` `max_seqlen`/opt `dtype` `scale`:f64/opt | `q`, `k`, `v`, `cu_seqlens` → `out` |
+| `ministral_rope` | `M`(range) `head_dim` `n_head` `n_head_kv` `theta`:f64 `dtype` `yarn_factor`:f64/opt `yarn_low`:f64/opt `yarn_high`:f64/opt `yarn_magnitude`:f64/opt | `qkv`:inout, `pos` |
+| `pixtral_rope` | `M`(range) `head_dim` `n_head` `theta`:f64 `dtype` | `qkv`:inout, `coord` |
+| `ds41_rope_rows` | `M`(range) `n_head` `head_dim` `rot` `off` `mode` `inverse` `dtype` | `x`:inout, `cos_sin`, `positions` |
 | `quant_roundtrip` | `M`(range) `n` `block` `format`:str `scale`:str `dtype` | `x`:inout |
-| `rope_rows_roundtrip` | `M`(range) `n_head` `head_dim` `rot` `off` `mode` `inverse` `block` `format`:str `scale`:str `dtype` | `x`:inout, `cos_sin`, `positions` (device-only: rope_rows then quant_roundtrip over n_head * head_dim columns) |
-| `rmsnorm_rope_roundtrip` | `M`(range) `n` `eps`:f64 `n_head` `head_dim` `rot` `off` `mode` `inverse` `block` `format`:str `scale`:str `dtype` `wadd`:f64/opt `mult`:f64/opt | `x`, `w`w → `y`; `cos_sin`, `positions` (device-only: rmsnorm, then rope_rows and quant_roundtrip over y; n = n_head * head_dim) |
+| `rope_rows_roundtrip` | `M`(range) `n_head` `head_dim` `rot` `off` `mode` `inverse` `block` `format`:str `scale`:str `dtype` | `x`:inout, `cos_sin`, `positions` (device-only: ds41_rope_rows then quant_roundtrip over n_head * head_dim columns) |
+| `rmsnorm_rope_roundtrip` | `M`(range) `n` `eps`:f64 `n_head` `head_dim` `rot` `off` `mode` `inverse` `block` `format`:str `scale`:str `dtype` `wadd`:f64/opt `mult`:f64/opt | `x`, `w`w → `y`; `cos_sin`, `positions` (device-only: rmsnorm, then ds41_rope_rows and quant_roundtrip over y; n = n_head * head_dim) |
 | `softmax_pool` | `M`(range) `n` `ratio` `dtype` | `stage` → `out`; `page`? |
 | `attn_sparse_sink` | `M`(range) `heads` `dim` `window` `ratio` `topk` `scale`:f64 `dtype` | `q`, `window_cache`, `window_bt`, `window_used`, `comp_cache`?, `comp_bt`?, `sel`?, `positions`, `cu_seqlens`, `sinks`w → `out` |
 | `index_score` | `M`(range) `heads` `dim` `ratio` `width` `wscale`:f64 `dtype` `row_part`/opt | `q`, `w`, `index_cache`, `bt`, `positions`, `cu_seqlens` → `score` |
@@ -1049,6 +1104,42 @@ prefix of the full-width table: at `head_dim 512, rotary_dim 128`, frequency `i 
 `theta^(-1 / 256)`, not `theta^(-1 / 64)`. Only the base ladder moves (`axial` keeps its per-section
 ladders), and the head past `rotary_dim` is untouched either way. `rope_table` takes `head_dim` for
 the same reason: its angles must stay `rope`'s exactly.
+
+**`position_scale`** multiplies query row `r` by
+`1 + beta * log(1 + floor(positions[r] / original))`, rounding the multiplier to the input's
+dtype before multiplying. It takes a pitched `[M, n]` query view and nonnegative i32 positions;
+columns outside that view (keys and values in a fused QKV buffer) are unchanged. `original` must
+be positive and `beta` finite and nonnegative. It currently has host rows for bf16 and f32 only.
+It implements Ministral 3's query scaling after RoPE; it is independent of YaRN's cos/sin
+magnitude and does not change existing `rope` behavior.
+
+**`embed_attn`** serves complete noncausal segments of at most 32768 rows. QK dot products
+are rounded to the activation dtype, multiplied by `scale` (default `1/sqrt(head_dim)`) and
+rounded again. Softmax is float32; its probabilities are rounded to the activation dtype before
+the value product. This reproduces the eager BF16 materialization boundaries used by the
+Nemotron reference. `causal` must be zero. Existing `attn_dense` semantics are unchanged.
+
+**`ministral_rope`** rotates the Q and K heads of fused QKV rows with NeoX pairing and the
+resolved YaRN frequency ladder. Cosine/sine are rounded to the activation dtype, as are each
+of the two products before addition/subtraction, matching Ministral's BF16 rotary expression.
+V heads are unchanged. Active rows come from the issued tensor views; `M` is the capacity band.
+This separate operation preserves every existing `rope` implementation and schema.
+
+**`pixtral_rope`** rotates Q and K of `[M, 3 * n_head * head_dim]` fused QKV rows, leaving V
+unchanged. `coord` is `[2, M]` nonnegative i32 `(height, width)` patch coordinates. The head
+dimension must be divisible by four. NeoX pairs `(i, i + head_dim/2)` use the height ladder
+`theta^(-4j/head_dim)` for `i = j < head_dim/4`, then the width ladder
+`theta^(-(4j+2)/head_dim)` for `i = j + head_dim/4`. In BF16, cos/sin and each product are
+rounded before the addition, as in Transformers. Host rows support BF16 and f32. This is a
+separate contract from `rope`'s existing axial mode, whose two ladders are identical.
+
+**`pixtral_merge`** packs `[M, n]` raster patch rows into `[M / merge^2, n * merge^2]` rows.
+`coord` is `[4, M]` i32 `(row, column, height, width)` patch coordinates; it must describe whole
+raster grids, each side divisible by `merge`. Images may have different widths. One output row
+is a merged spatial cell with columns `(channel, dy, dx)`, matching PyTorch `unfold`; values
+are copied exactly. The complete coordinates are validated before writing, so invalid grids
+leave the output unchanged. Host rows support BF16 and f32. Automatic random shape fixtures
+cannot supply this coupled coordinate grid; callers must provide a valid grid fixture.
 
 **`qk_norm_rope`** RMS-norms each q and k head of a fused `[q | k | v]` row against its gain (plus
 `wadd`), rounds, and rotates in place. `positions` is read as `rope` reads it, integer or f32.
@@ -2807,7 +2898,7 @@ greedy request's row (draw mode 0) keeps `dflash_select`'s tokens (`status = 0`)
 another card, or a position whose eight cannot form a `Q`, takes the walk's argmax (`status = -1`)
 and the ordinary verify. `Q_l` depends on the committed text and on `x_0 .. x_{l-1}`, never on the
 verify, and is stored exactly, which is all the coupling needs to be lossless; `q_temp` (the
-architecture's, `RADIANCE_DFLASH_Q_TEMP` on Qwen3.5/3.8) moves acceptance only. Each edge is eight
+architecture's, 0.6 on Qwen3.5/3.8) moves acceptance only. Each edge is eight
 partial `fmaf` chains over contiguous slices of the rank, added in order, so the device kernel and
 the host oracle agree bit for bit.
 
@@ -3273,6 +3364,17 @@ candidates, and what enters the head from the trunk.
 | op | params | operands |
 |---|---|---|
 | `dflash_select` | `M` `steps` `top_k` `rank` `n_vocab` `anchor_stride`/opt `dtype` | `cand`, `unary`, `hp`?, `anchor`, `pred`w, `succ`w → `tokens` |
+| `dflash_tree` | `M` `steps` `top_k` `rank` `n_vocab` `anchor_stride`/opt `nodes` `temp`:f64/opt `dtype` | `cand`, `unary`, `hp`?, `anchor`, `pred`w, `succ`w → `tokens`, `parents` |
+
+`dflash_tree` grows the same lattice into a tree of `nodes` nodes instead of walking one path
+(`rad_drafter_tree`). Node 0 is the anchor at lattice position -1 with log probability 0. A node at
+position l with token t has a child for every candidate c at l + 1 whose id is in the vocabulary,
+scored as `dflash_select` scores c after t; with x = score / `temp` (default 1) over those
+candidates, the child's log probability is its parent's plus x - logsumexp(x). Best-first: each
+round takes the not-yet-taken child of a taken node with the largest log probability, ties to the
+one pushed first (lower parent, then lower c), until `nodes` are taken. Taken node j (1-based, so
+every parent comes before its child) is `tokens[s, j-1]`, and `parents[s, j-1]` its parent's node
+index, 0 for the anchor. A frontier that runs dry pads with token 0 under the last node.
 
 `dflash_conv` is the drafter's grouped convolution (coefficient add and every tap in one pass):
 

@@ -150,6 +150,7 @@ inline SchedMetrics bridge_metrics(const rad::SchedMetrics& m) {
          d < std::size(m.draft_verify_depth) && d < std::size(o.draft_verify_depth); ++d)
         o.draft_verify_depth[d] = m.draft_verify_depth[d];
     o.preemptions = m.preemptions;
+    o.preempt_forced = m.preempt_forced;
     o.total_requests = m.admitted;
     o.steps = m.steps;
     o.steps_prefill = m.steps_prefill;  o.steps_mixed = m.steps_mixed;

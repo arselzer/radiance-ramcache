@@ -51,8 +51,9 @@ driver. [`DOCKER.md`](DOCKER.md) covers it, with compose files per model.
 | Required | Linux, a C++20 compiler, CMake 3.21+, Ninja, pthreads |
 | Optional | ROCm with `hipcc`, for AMD device kernels; without it you get the host backend. Set `ROCM_PATH` if ROCm is not at `/opt/rocm` |
 | With a card | Resizable BAR on (Above 4G Decoding and Resizable BAR in the firmware setup). The host writes every dispatch's arguments into VRAM there. On a card whose BAR is smaller than its VRAM they stay in pinned host memory and every dispatch reads them over the link: on R9700s, Qwen3.8-27B fp8 decode steps take 0.4-1.8% longer at `--tp 1` and 2 than with the arguments in VRAM. Peer access needs the large BAR too, so at `--tp 2` and above such a card takes the collectives through host memory (§4.7) |
+| With a card | `amdgpu.cwsr_enable=1` (the default). With compute wave save/restore off the driver cannot preempt a queue it must evict, and the card hangs and resets. Startup refuses to serve on cards with it off and says what to change; `--proceed-with-incompatible-configuration` starts anyway, **unsupported**, with a banner at the top of the log and of the startup report and `unsupported_configuration: true` in `/diagnostics` |
 | Optional | OpenMP, used by the host kernel libraries if present |
-| Optional | `libavformat-dev libavcodec-dev libavutil-dev libswscale-dev libswresample-dev` (ffmpeg 6+), for image, video and audio input. The probe is `RAD_WITH_FFMPEG` (`ON` fatal, `OFF` off, default `AUTO`): built without them the engine boots normal, serves text, and refuses every image/video/audio part with HTTP 500 — the configure log is the only warning (`radiance: no libavformat ...`). `GET /diagnostics` shows `media decoders` |
+| Optional | `libavformat-dev libavcodec-dev libavutil-dev libswscale-dev libswresample-dev` (ffmpeg 6+), for image, video and audio input. CMake option `RAD_WITH_FFMPEG`: `AUTO` (default) uses them when found, `ON` fails the configure without them, `OFF` builds without. A build without them starts and serves text, and refuses every image, video and audio part with HTTP 500; the only warning is the configure log line `radiance: no libavformat ...`. The diagnostics report says which (`media decoders`; `host.media` in `GET /diagnostics`) |
 | Optional | `clang++` (or ROCm's), for `tests/r4d_emu` when the C++ compiler is g++; CMake 3.25+ for `CMakePresets.json` |
 | Shell harnesses | `curl` and `jq` |
 
@@ -93,10 +94,10 @@ cmake --build build -j
 ctest --test-dir build -L fast -j8 --output-on-failure
 ```
 
-A ROCm SDK installed outside `/opt/rocm` — a userspace SDK tree under a virtualenv, a core-only
-system install — needs more than `ROCM_PATH`: hipcc is found, then device compilation dies inside
-`cuda_wrappers/cmath` with `Could not find standard C++ header 'cmath'`, because ROCm's clang
-does not pick up the distro gcc's libstdc++ headers on its own. The flags that make it work:
+A ROCm SDK installed outside `/opt/rocm` (a userspace SDK tree under a virtualenv, or a core-only
+system install) needs more than `ROCM_PATH`. hipcc is found, but device compilation fails inside
+`cuda_wrappers/cmath` with `Could not find standard C++ header 'cmath'`, because ROCm's clang does
+not pick up the distro gcc's libstdc++ headers on its own. Configure with:
 
 ```sh
 ROCM=/path/to/_rocm_sdk_devel   # the SDK root (the venv's site-packages/_rocm_sdk_devel)
@@ -108,11 +109,11 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
 export LD_LIBRARY_PATH=$ROCM/lib:$LD_LIBRARY_PATH
 ```
 
-`--gcc-install-dir` takes the distro gcc's directory (the installed gcc-15's; after a distro gcc
-upgrade it must be repointed, and the configure cached in `build/CMakeCache.txt` reset with
-`-c`). The device-lib path is where the SDK tree keeps `amdgcn/bitcode` (under `lib/llvm/` in a
-userspace SDK, `$ROCM/amdgcn/bitcode` in a core system install). The flags are not needed for a
-full `/opt/rocm` install, and `DOCKER.md`'s container sidesteps them.
+`--gcc-install-dir` is the distro gcc's directory (gcc 15 in the example). After a gcc upgrade,
+repoint it and reset the configure cached in `build/CMakeCache.txt` (`-c`). The device-lib path is
+where the SDK keeps `amdgcn/bitcode`: under `lib/llvm/` in a userspace SDK, `$ROCM/amdgcn/bitcode`
+in a core system install. A full `/opt/rocm` install needs none of these flags, and the container
+in `DOCKER.md` avoids them.
 
 ### 1.3 Check that it works
 
@@ -304,6 +305,7 @@ and runs.
 | `lfm2_bf16` | LiquidAI LFM2 and LFM2-VL in bf16, including d1 (§5.13) |
 | `embgemma2` | EmbeddingGemma 2, an embedding model (§5.6) |
 | `nomicbert` | nomic-embed-text-v2-moe, an embedding model (§5.6) |
+| `nemotron35_embed` | Nemotron 3.5 Embed 1B/8B and Rerank 8B, BF16 text/image retrieval at TP1 (§5.6) |
 | `qwenimage21` | Qwen-Image 2.1 and 2.1-Turbo, an image model (§5.6) |
 | `krea2` | Krea 2 Raw and Turbo, an image model from text (§5.6) |
 | `anima` | Anima Base, Aesthetic and Turbo, an anime and illustration image model from text (§5.6) |
@@ -338,7 +340,13 @@ It needs only `curl` and `jq`. Re-running resumes: a file whose local size match
 short one is continued. When a repo carries `.safetensors`, other weight formats (`.bin`, ONNX, GGUF,
 ...) are not fetched. `HF_TOKEN` authenticates a gated or private repo; `HFGET_JOBS` sets concurrency
 (default 4). A complete fetch records each file's content key (its LFS sha256, or a small file's size)
-in `.hfget-manifest`, so the next run also fetches a file that changed at the same size. The
+in `.hfget-manifest`, so the next run also fetches a file that changed at the same size. An LFS
+file's recorded key is verified, not just claimed: the download is hashed and compared against
+the sha256 the listing names before the file is kept. A listing that names a file outside the
+destination — an absolute path, a `..` segment — is refused whole rather than half-obeyed.
+Fetch what you will serve from a revision you chose: without `--model-revision` a repo id tracks
+the repo's `main` branch, so a restart can bring weights nobody reviewed; name a tag or a
+commit sha. The
 free-space check counts only what is still to fetch.
 
 `--model` also takes a repo id:
@@ -368,7 +376,7 @@ planes, with the tokeniser and chat template.
 
 **A recipe decides what is quantised**, in rules from weight names to quantisers. Without one,
 every weight keeps the checkpoint's encoding, which suits a bf16 or block-fp8 checkpoint served at
-its own precision. Flash-Next's four-bit experts need one:
+its own precision (Qwen3.8-Flash-Next-FP8 included). Flash-Next's four-bit experts need one:
 
 ```sh
 rad-convert /srv/models/Qwen/Qwen3.8-Flash-Next -o /srv/models/rad/flashnext-w4.rad \
@@ -842,6 +850,22 @@ for the gather (no libr4d) the table is read on the host: `vram` is refused, and
 locked huge pages, which also needs a memlock limit that large (`--ulimit memlock=-1` in Docker,
 `LimitMEMLOCK=infinity` under systemd).
 
+`--ngram-placement ram=DIR` makes the pinned copy a file, `DIR/ngram-<id>.tab`, in a tmpfs, mapped
+`MAP_SHARED` and pinned for the cards as `ram` pins it, so two engines on separate card sets
+(`ROCR_VISIBLE_DEVICES`) hold one table in host memory. The first engine to start fills the file
+from the container; a second finds it complete, checks samples of it against its own container and
+only pins it. The `<id>` is a hash of the container's path, size and mtime and the table's place in
+it, so a file never serves another model. A weight under 32 MiB the gather reads beside the table
+(its scale) keeps a private pinned copy, since its file would be mostly header. The engine that
+leaves last deletes the file, and one that leaves while another still holds it waits up to a second
+for it, so two engines stopped together still remove it; after a crash a complete file stays and is
+reused, or removed by hand. `DIR` must be a tmpfs (`/dev/shm`, or a tmpfs mounted for it, sized for
+the table); `ram=DIR` needs the card gather kernel and the driver's SVM API, and is refused
+otherwise. The driver counts a shared page against every process that pins it, so with two engines
+the pinned total is twice the table: set `amdgpu.no_system_mem_limit=1` (the cap is RAM less 1/64
+and 1.5 GiB) or the second pin can be refused. The kernel charges the tmpfs pages to the memory
+cgroup of the engine that filled them.
+
 **`--weights-disk-tier`** serves a model larger than the card and the host pool together, with every
 step paced by the drive. A routed expert that fits neither lives only in the container. Before each
 routed layer's first expert op, on every pass, the engine reads all that layer's on-disk experts into
@@ -1200,30 +1224,32 @@ snapshot lets it skip at least 256 tokens of that head, the request takes one wh
 ends, at the cost of one chunk split, and the requests after it resume there. A conversation's
 next turn has only its own earlier turn past that point, so it splits nothing extra.
 
-A prefix hit answers exactly as the same prompt prefilled cold, by default
-(`--prefix-resume exact`). A kernel can round a row differently at another chunk
-length (the fp8 GEMM's split-K count is chosen from `M`, spec §17), so a hit that
-recomputes its tail in other chunks than a cold prefill can flip a near-tie in
-greedy text. The hit therefore resumes only where an idle server's cold prefill of
-that prompt starts a chunk: every `--max-num-batched-tokens` tokens (rounded down
-to the chunk quantum), or every `--checkpoint-interval` when that is smaller. A
-prompt's tail snapshot is taken where its last chunk starts, a boundary the chunk
-already ends on, so it costs a copy and no step. An exact repeat re-prefills the
-cold run's last chunk; an appended turn, that chunk and what the turn added: up to
-one chunk more than `--prefix-resume nearest`, which resumes at the deepest
-snapshot or block and splits a prompt's last chunk at its last quantum boundary.
-The interval must be a multiple of the chunk when it is larger; otherwise it is
-rounded up, and startup says so:
+**Where a hit resumes** (`--prefix-resume`). A kernel can round a row differently at another
+chunk length (the fp8 GEMM's split-K count is chosen from `M`, spec §17), so a hit that recomputes
+its tail in other chunks than a cold prefill can flip a near-tie in greedy text. Two modes:
+
+- `exact` (the default): a hit answers exactly as the same prompt prefilled cold. It resumes only
+  where an idle server's cold prefill of that prompt starts a chunk: every
+  `--max-num-batched-tokens` tokens (rounded down to the chunk quantum), or every
+  `--checkpoint-interval` when that is smaller. A prompt's tail snapshot is taken where its last
+  chunk starts, a boundary the chunk already ends on, so it costs a copy and no step. An exact
+  repeat re-prefills the cold run's last chunk; an appended turn re-prefills that chunk and what
+  the turn added.
+- `nearest`: a hit resumes at the deepest snapshot or block, and a prompt's tail snapshot is at
+  its last quantum boundary. A turn re-prefills up to one chunk less than under `exact`.
+
+Under `exact` an interval larger than the chunk must be a multiple of it; otherwise it is rounded
+up, and startup says so:
 
   ```
   --checkpoint-interval 6144 resolves to 8192: --prefix-resume exact needs it a multiple of the
   4096-token prefill chunk (--max-num-batched-tokens 4096) ...
   ```
 
-It is an idle-server property, as greedy batching is: a prefill that shares its
-steps with other requests or decode rows (`--busy-prefill-chunk`,
-`--prefill-interleave`) is cut differently, and a request's own checkpoint
-(`/v1/systemone`'s shared head) resumes where it was asked.
+Exactness holds on an idle server, as greedy batching does: a prefill that shares its steps with
+other requests or decode rows (`--busy-prefill-chunk`, `--prefill-interleave`) is cut
+differently, and a request's own checkpoint (`/v1/systemone`'s shared head) resumes where it was
+asked.
 
 **One prefill sequence in two pieces.** At two ranks, on `qwen35_fp8` (and `qwen35_w8a8`, built
 from it, where its norms do not write rotated int8 codes) and on `gemma3`'s MXFP4 trunk with the
@@ -1303,10 +1329,15 @@ head inside the target checkpoint, which needs no flag. `radiance --draft-model`
 says so. Measure speculation by step time, not tokens per second.
 
 A drafter with a sliding window over its own cache (DFlash2) keeps that cache outside the prefix
-cache, so after a prefix hit it cannot draft until its window has slid past the hit, which on a
-chat's follow-up turn is most of the reply. Such a hit is therefore ended one drafter window before
-the end of the prompt, at a checkpoint, and the window is recomputed; the reply is the same. A hit
-whose nearest checkpoint below that point would give back more than two windows is kept whole.
+cache. Where a hit resumes from a window snapshot (a model whose sliding layers the cache does not
+index and that keeps no linear state, as the Gemma 4 31B under gemma4_bf16; the 26B-A4B declares
+its sliding layers full and takes no snapshot), the snapshot carries the drafter's window with the
+trunk's, so the hit leaves it whole and it drafts from the first decoded token. Elsewhere (a
+model with linear state, as Qwen3.8), after a prefix hit it could not draft until its window had
+slid past the hit, which on a chat's follow-up turn is most of the reply. Such a hit is therefore
+ended one drafter window before the end of the prompt, at a checkpoint, and the window is
+recomputed; the reply is the same. A hit whose nearest checkpoint below that point would give back
+more than two windows is kept whole. The startup line `draft floor` says which applies;
 `radiance:draft_refills_total` counts the hits ended early and `radiance:draft_refill_tokens_total`
 the tokens recomputed.
 
@@ -1339,13 +1370,12 @@ radiance --model m.rad --spec-ngram 5 --draft-window adaptive # each sequence's 
 radiance --model m.rad --num-speculative-tokens 4             # a head drafts; lookup fills in where it declines
 ```
 
-`--spec-ngram K` sets the window to K (a different `--num-speculative-tokens` is refused) and asks
-the plugin to leave out any draft head the container carries (`RadBuildCtx::draft_head_off`), so
-the head's weights take no memory: the choice for a model whose head does not fit, or does not pay.
-A plugin that declares its head regardless is refused at startup. Without the flag, prompt lookup
-still drafts for every sequence a declared head declines, and is the only drafter when speculation
-is on (`--num-speculative-tokens N`) and the container has no head. Startup says which
-(`speculation: prompt lookup only (--spec-ngram K)`), and the drafts count in `draft_n` /
+`--spec-ngram K` sets the window to K (a different `--num-speculative-tokens` is refused) for a
+container that declares no draft head; one that declares a head is refused at startup, because the
+head would draft in lookup's place (serve it with `--num-speculative-tokens N`). Without the flag,
+prompt lookup still drafts for every sequence a declared head declines, and is the only drafter when
+speculation is on (`--num-speculative-tokens N`) and the container has no head. Startup says which
+(`speculation: prompt lookup only -- this container declares no draft head`), and the drafts count in `draft_n` /
 `draft_n_accepted` and the `radiance:draft_*` metrics like a head's. Prompt lookup reads the
 committed sequence, so a step is not issued ahead of the previous one's readback.
 
@@ -1385,14 +1415,31 @@ behind the packet processor's barrier bit, which saves most of the launch gap be
 kernels. The bytes are the same. Plain decode measured slower with them, so they stay off there
 and on every other model; the startup report's `chained launches` row says which and why.
 
+**Draft trees.** Where the model's plugin measured a gain (the Gemma 4 31B with DFlash2: +7%
+single-stream decode and +6-9% aggregate at 1-16 users on 4x R9700, +4% and +6-12% on two,
+BetterBench with thinking off), a block drafter's proposals are verified as a tree: grown best-first
+over the drafter's candidates, the deepest path the target agrees with is accepted, and its K and V
+move into place. A tree changes no token, only how many drafts land a step; the startup report's
+`draft trees` row says when it is on. Under a tree `--num-speculative-tokens` counts the tree's
+nodes, grown over the block the drafter was trained at. A request with a grammar (`response_format`,
+tools) speculates on a tree too: each row is masked against the grammar after its own ancestors.
+`--draft-coupling on` samples one path, so a coupled drafter proposes the chain.
+
 **A shorter block under load: `--draft-short-from N`.** A block drafter's block is paid for by
 every drafting sequence, whatever each one verifies. At one sequence a long block pays; at many, its
 drafter rows and its weaker first positions cost more than the extra drafts bring. A drafter that also
 serves a shorter block declares it (PLUGIN.md §11); DFlash2 declares a block of 4 (3 drafts) wherever its
-own is longer, on `qwen35_fp8` and `gemma3`. With `--draft-short-from N` the engine runs that short block
-once N sequences decoded in the step just run, and the drafter's own block again only once the count
-falls two below N, so a load wavering at N does not change the pass shape every step. `0`, the default,
-never switches. Startup names what it will run:
+own is longer, on `qwen35_fp8` and `gemma3`, and the Gemma 4 31B's block-16 DFlash2 drafter, as a tree of
+15 nodes, a block of 8 (a 7-node tree over it). With `--draft-short-from N` the engine runs that short block
+once N sequences decoded in the step just run, and the drafter's own block again once the count
+falls two below N or to one sequence, where the long block pays. From N of 3 on, a load wavering at
+N does not change the pass shape every step; at 2, a load between one and two sequences does, which
+costs only the other shape's pass. `0` never
+switches. `auto`, the default, never switches a chain and switches a tree drafter
+from 2: a tree's nodes are verify rows every drafting sequence pays for, which a wide tree's extra nodes
+repay at one sequence and not at many; it switches back at one decoding sequence. At the short block the
+drafter grows a tree of its own over the shorter pass, at most `block - 1` nodes. Startup names what it
+will run:
 
 ```
 speculation: from 16 decoding sequences on, 'dflash2' runs its short block of 4 row(s), 3 token(s)
@@ -1625,6 +1672,17 @@ hit. Snapshots never take VRAM: each is copied to host memory after the step tha
 back before the step that resumes from it. `/sessions` shows what is stored, where, and whether the
 linear half is served.
 
+On a model with sliding-window layers and no linear state (Gemma 3, and the Gemma 4 31B as gemma4_bf16
+declares it), the cache does not
+index the sliding layers, so a hit resumes only from a window snapshot, taken a block short of a
+prompt's end, where the next turn's rendering still agrees. Under `--prefix-resume nearest` one is
+taken at the end of every prompt of 528 tokens or more (with `--checkpoint-interval` under 512,
+from that interval plus a block). Under `exact` it is taken at the start of the prompt's last
+chunk, once that lies at least one checkpoint interval in, so a conversation whose prompts stay
+under one prefill chunk reuses nothing there; serve such a model with `--prefix-resume nearest`
+where short chats matter more than bit-identical hits. A shorter prompt is recomputed: its
+prefill is cheap, and its snapshot would take a slot from a longer conversation.
+
 **How many snapshots.** The snapshot store (`--checkpoint-slots`) is shared by every conversation,
 running or not, and a conversation without a snapshot under its next prompt reuses nothing. With
 `auto`, the default, each of `--max-num-seqs` gets what `--checkpoint-policy` keeps for one
@@ -1641,6 +1699,23 @@ checkpoint slots: auto: 80 linear-state snapshot(s) of 113.50 MiB in pinned host
 none of it on the card; 10 a sequence for --max-num-seqs 8: geometric-backoff keeps 9 for a
 200000-token session at a 2048-token interval, and one more for a running turn
 ```
+
+**The floor outranks the reserve.** A store one snapshot short of its floor is not a smaller store:
+it is every prefix hit prefilling from the start. `--host-headroom-mib` is a courtesy to the system
+— the unpooled allocations, the load's staging, the page cache — and it may not, alone, decide the
+feature off. So when the floor does not fit with the reserve held free, the reserve gives back
+exactly the shortfall, never below 1 GiB and never above the margin asked for, and the startup line
+says how much it gave:
+
+```
+checkpoint slots: auto: 8 linear-state snapshot(s) of 112.73 MiB ... ; 16 wanted, held to what the
+host can pin: ... ; the host reserve gave back 835.00 MiB of its 4.00 GiB for the floor of 8
+snapshot(s), holding 3.19 GiB
+```
+
+It is a byte rule over the host's own measurement, so it needs no second case for a wider slot (a
+model with more linear state), a wider streaming mirror (any KV encoding), or a larger `--tp`: a
+host that can pin the floor gets it, and one that cannot says what it is short.
 
 A line that says `held to an eighth of host memory`, or (a warning) `held to what the host can
 pin`, means the store is smaller than the policy wants; `--checkpoint-slots N` sets the count
@@ -1967,6 +2042,7 @@ by 0.002-0.003 nats.
 |---|---|
 | `--model PATH` | required: the `.rad` container, a checkpoint served as it stands (§3.4), or a Hugging Face repo id fetched before startup (§3.1) |
 | `--download-dir DIR` | where a repo id is fetched to. Default `$XDG_CACHE_HOME/radiance/hf`, else `~/.cache/radiance/hf` |
+| `--model-revision REV` | the hub revision a repo id is fetched at — a branch, tag, full commit sha or `refs/pr/N`. Default the repo's moving `main` branch; a deployment that must not restart onto weights nobody reviewed should name a tag or a sha (§3.1) |
 | `--control-vector off\|on\|disabled` | `disabled` (and no flag at all) loads nothing, declares no projection op and refuses a request that asks; `off` loads the vector found for this model and starts requests off; `on` starts them on. Refused at startup when the model's plugin does not apply control vectors or no compatible file is found (§4.10) |
 | `--radiance-home DIRS` | where `kernels/`, `architectures/` and `quantizers/` live; homes separated by `:` are searched in order, the first winning (§1.5) |
 | `--kernels LIST` | the kernel libraries to use, separated by `,` or `:`, first wins; a library not named is not loaded. Default: every library found |
@@ -1977,6 +2053,7 @@ by 0.002-0.003 nats.
 |---|---|---|
 | `--max-num-batched-tokens N` | 2048 | largest token count one step may carry |
 | `--prefill-interleave N` | 0 (off) | decode-only steps after each prefill chunk while other sequences decode (§4.5), at most 64 |
+| `--preempt-wait-ms N` | 5000 | how long a preempted prefill may wait for its whole-recompute gate before reclaiming cache blocks and preempting lowest-priority running requests until one overdue request can prefill; `0` falls back on the next step |
 | `--busy-prefill-chunk MODE` | auto | a prefill chunk's share of a step that has other work: `auto` leaves decode rows and waiting requests their room (§4.5), `off` takes the whole step, `N` holds it to N tokens |
 | `--max-num-seqs N` | 256 | largest number of sequences one step may carry |
 | `--max-model-len N` | 0 | context bound; 0 takes the model's training context |
@@ -1992,7 +2069,7 @@ by 0.002-0.003 nats.
 | `--attn-prefill-fp8 MODE` | off | `off`, `qk`, `pv` or `both`: the prefill attention's Q·Kᵀ, P·V or both in E4M3 over an `fp8`, `fp8_v4` or `k6_v4` cache; lossy, Qwen3.8-27B (§4.4) |
 | `--host-pool-mib N` | 0 | pinned host tier (weights) |
 | `--kv-resident N` | 0 (off) | stream the sparse attention group's KV from pinned host memory, keeping a ring of N tokens on the card. Raised to 32 768 and to one decode step's selection; a ring that covers the context streams nothing. Ignored with a warning on an architecture that cannot stream (§4.4.1, [KV-STREAMING.md](KV-STREAMING.md)) |
-| `--host-headroom-mib N` | 4096 | host RAM left free for the system when startup pins host memory — kept for the unpooled allocations, staging and page cache (§4.3) |
+| `--host-headroom-mib N` | 4096 | host RAM left free for the system when startup pins host memory — kept for the unpooled allocations, staging and page cache (§4.3). A snapshot store's floor takes back the shortfall from it, down to 1 GiB, rather than come up with none (`--checkpoint-slots`, §4.8) |
 | `--embedding-placement WHERE` | ram | `ram` or `vram`: the token embedding pinned in host memory beside `--host-pool-mib` and read in place, or on the card (§4.3) |
 | `--ngram-placement WHERE` | auto | `auto`, `vram`, `ram` or `disk`: an n-gram table on the card, as a copy in RAM made at load and read by the card, or read from the container (§4.3) |
 | `--vision-tower-placement WHERE` | vram | `vram` or `ram`: the encoder towers (vision, and audio where a model has one) on the card, or pinned in host memory beside `--host-pool-mib` and read in place once an image (§4.3) |
@@ -2029,7 +2106,7 @@ by 0.002-0.003 nats.
 | `--deterministic` | off | pin placement to the loader's plan, so the resident set cannot change under the heat engine |
 | `--checkpoint-interval N` | 2048 | linear-attention state checkpoint interval, in tokens |
 | `--prefill-span N` | 1 | checkpoint intervals one step may carry of a prefill alone in its step, from the prompt's second interval on; needs `--max-num-batched-tokens` of N intervals. Every other step is planned at the budget less the extra intervals, and the checkpoints inside a span are not written (§4.5) |
-| `--checkpoint-slots N` | auto | linear-state (hybrid) or sliding-window snapshots the server may hold at once, in total, not per sequence. They live in pinned host memory, allocated at startup: one slot is a snapshot of every rank's shard (113 MB on Flash-Next at `--tp 2`, 144 MiB on Qwen3.8-27B; on Gemma 4 31B the 1024-token window of every sliding layer, 406 MiB at `--tp 2`). `auto` gives each of `--max-num-seqs` what `--checkpoint-policy` keeps for a `--max-model-len` session plus one (10 at 200K tokens under geometric backoff), within an eighth of host memory and what the host can pin; the startup line and the report say what it chose and why (§4.8). A full store retires its least recently used snapshot. A count is taken as given: a store the host memory cannot hold or pin stops the start, and a table placed in host memory leaves room for it; `0` serves with none, every prefix hit then prefilling from the start |
+| `--checkpoint-slots N` | auto | linear-state (hybrid) or sliding-window snapshots the server may hold at once, in total, not per sequence. They live in pinned host memory, allocated at startup: one slot is a snapshot of every rank's shard (113 MB on Flash-Next at `--tp 2`, 144 MiB on Qwen3.8-27B; on Gemma 4 31B the 1024-token window of every sliding layer, 406 MiB, and with its DFlash2 drafter that drafter's 2048-token window too, 487 MiB). `auto` gives each of `--max-num-seqs` what `--checkpoint-policy` keeps for a `--max-model-len` session plus one (10 at 200K tokens under geometric backoff), within an eighth of host memory and what the host can pin; a floor of 8 (or what the policy wants, if fewer) outranks `--host-headroom-mib`, which gives back exactly the shortfall down to 1 GiB rather than take the store to none, and the startup line says so. The startup line and the report say what it chose and why (§4.8). A full store retires its least recently used snapshot. A count is taken as given: a store the host memory cannot hold or pin stops the start, and a table placed in host memory leaves room for it; `0` serves with none, every prefix hit then prefilling from the start |
 | `--checkpoint-policy NAME` | geometric-backoff | also `tip-only`, `keep-all` |
 | `--prefix-resume MODE` | exact | `exact`: a prefix hit resumes only where an idle server's cold prefill of the prompt starts a chunk, and a prompt's tail snapshot is taken where its last chunk starts, so a hit answers bit-identically to a cold run; an interval past the chunk is rounded up to a multiple of it. `nearest`: the deepest snapshot or block, up to a chunk less re-prefilled a turn |
 | `--no-prefix-cache` | prefix cache on | disable prefix caching |
@@ -2050,10 +2127,10 @@ by 0.002-0.003 nats.
 | flag | default | |
 |---|---|---|
 | `--num-speculative-tokens N` | auto | speculative window; 0 disables. The ceiling under `--draft-window adaptive` |
-| `--spec-ngram K` | 0 | prompt lookup alone: up to K drafts a step from the sequence's own n-grams, each proposal verified when it pays at the measured step cost; no draft head declared; sets the window to K (§4.6) |
+| `--spec-ngram K` | 0 | prompt lookup alone: up to K drafts a step from the sequence's own n-grams, each proposal verified when it pays at the measured step cost; a container that declares a draft head is refused; sets the window to K (§4.6) |
 | `--spec-ngram-min N`, `--spec-ngram-max N` | 2, 4 | the pattern lengths prompt lookup tries, longest first (at most 15), wherever it drafts |
-| `--draft-window MODE` | fixed | `fixed` drafts N every step; `adaptive` follows each sequence's acceptance and the measured step cost, for a draft head or prompt lookup alone (§4.6) |
-| `--draft-short-from N` | 0 | a block drafter that declares a shorter block runs it from N decoding sequences on, its own block again two below; 0 never (§4.6) |
+| `--draft-window MODE` | fixed | `fixed` drafts N every step; `adaptive` follows each sequence's acceptance and the measured step cost, for a serial draft head or prompt lookup alone (§4.6) |
+| `--draft-short-from N` | auto | a block drafter that declares a shorter block runs it from N decoding sequences on, its own block again two below or at one sequence; 0 never; auto never for a chain and 2 for a tree drafter, which then verifies the short block's nodes (§4.6) |
 | `--draft-coupling MODE` | off | `on`: a linear MTP drafter with a 2-bit candidate head (Qwen3.8-Flash-Next) samples each proposal from its reranked top-8 and the sampler maximally couples the target's draw to it. The output distribution is unchanged and a fixed seed yields other tokens than `off`. The head's law is taken at temperature 1, so it pays at high request temperatures and costs at low ones: on Flash-Next TP2 at 2x R9700, tokens per decode step +18% at temperature 1.0 and c1, +11% at 0.7 and c4, -4% at 0.3. Greedy rows are unchanged. A DFlash2 drafter (Qwen3.5/3.8) couples its candidate walk instead: each position is sampled from the softmax of the walk's own scores over its best eight candidates, at temperature `RADIANCE_DFLASH_Q_TEMP` (default 0.6, where acceptance peaked); on Qwen3.8-27B MXFP4 TP2 at 2x R9700 and request temperature 1, tokens per verify step +8% on held-out prompts at c4 (3.53 to 3.82) and decode +2..8% per stream at c1/c4. Any other drafter is refused at startup |
 | `--draft-model PATH` | | not implemented: merge the drafter at convert time |
 
@@ -2063,7 +2140,10 @@ by 0.002-0.003 nats.
 |---|---|---|
 | `--host ADDR` | 0.0.0.0 | listen address |
 | `--port N` | 8000 | listen port |
-| `--api-key KEY` | none | require `Authorization: Bearer KEY` or `X-Api-Key: KEY` on every request but `/health`, `/v1/health`, `/ping` and the dashboard page (§6.6) |
+| `--api-key KEY` | none | require `Authorization: Bearer KEY` or `X-Api-Key: KEY` on every request but `/health`, `/v1/health`, `/ping` and the dashboard page (§6.6); the key must be non-empty |
+| `--api-key-env NAME` | — | read the API key from the environment variable `NAME` instead of the command line, where every process on the machine reads it in `ps`; an unset or empty `NAME` refuses startup like an empty `--api-key` |
+| `--allow-host NAME` | — | a `Host` name the keyless loopback-only routes accept besides the loopback names; repeatable (§6.6) |
+| `--trusted-proxy CIDR` | — | a network whose sockets may name the client behind them, via `X-Forwarded-For`, for the log; vouching changes attribution, never access; repeatable (§6.6) |
 | `--served-model-name NAME` | container's name | the model id `/v1/models` lists, the metrics carry and a response names when its request named none. A request may name any model; the loaded one serves it |
 | `--mm-max-patches N` | auto | patches one vision-encoder pass carries, and so the largest image (a patch is 16x16 pixels, 14x14 on GLM-5.3). `auto` is 16384 when the container carries a vision tower; 0 serves text only and keeps the tower off the card. A pass is not one tower invocation: inside it the tower batches at most 8 tiles per weight read, and the pass size may reduce that (4 tiles at the 64-pixel grid with the default 16384 patches); a picture contributes a separate pass per grid. See the concurrency notes for Unlimited-OCR (§5.17) |
 | `--override-chat-template PATH` | container's | a Jinja chat template file served in place of the container's. The reply format (reasoning markers, tool calls) is derived from it too, unless the architecture plugin declares one. An unreadable or empty file stops startup |
@@ -2111,6 +2191,7 @@ flags are refused on it, and so are the pixel bands.
 | `--video-min-frames N`, `--video-max-frames N` | container's | the fewest and most frames sampled from a video |
 | `--video-max-frame-tokens N` | container's | the most prompt tokens one frame may become; 0 is no cap. A token-budget processor (Gemma 4's) takes 70, 140, 280, 560 or 1120 |
 | `--image-tokens N` | container's | a token-budget processor's image budget: Gemma 4's 70, 140, 280, 560 or 1120, which a request's `image_tokens` overrides; GLM-5.3's ceiling, at most `--mm-max-patches` / 4 (the checkpoint states 8000, which `auto` lowers to 4096). The pixel-band flags are refused on such a model |
+| `--image-gen-max-pixels N`, `--image-gen-max-refs N` | the model's | an image generator's largest image, in pixels, and the reference pictures a request. The generator sizes its per-image and conditioning buffers, and so the activation arena, for them; on a card the weights nearly fill, a smaller image is what makes room. Larger requests are refused; a generator that keeps fixed buffers is named at startup. Images in flight follow `--max-num-seqs` |
 | `--max-source-pixels N` | 67108864 | the largest image or frame the decoder accepts, before any resize |
 
 **Quality measurement**, instead of serving; see [TOOLS.md](TOOLS.md#the-kl-mode)
@@ -2120,6 +2201,10 @@ flags are refused on it, and so are the pixel bands.
 | `--kld-record DIR` | run `--kld-corpus` through prefill and write this model's log-probabilities at every scored position to `DIR`: the reference a quantised model is measured against |
 | `--kld-ref DIR` | score this model against the reference in `DIR`: mean, median, 99/99.9/99.99th percentile KL divergence and top-1 agreement |
 | `--kld-corpus FILE` | JSONL, one `{"prompt", "score_from"?, "source"?}` a line; `--kld-record` only |
+| `--calib-corpus FILE` | instead of serving, run a JSONL corpus (`{"prompt"}` a line) through prefill once, every token, and record the calibration statistics the model keeps: the whole Hessian of each linear's input (docs/TOOLS.md) |
+| `--calib-dir DIR` | where `--calib-corpus` writes them, one safetensors file per input; beside `--kld-record`, that run records them over the KL corpus too |
+| `--calib-layers LO:HI` | record layers `LO`..`HI-1` only (default every layer), for a model whose statistics do not fit in host memory in one run |
+| `--kld-top N` | `--kld-record` keeps each position's `N` most likely tokens exactly and the mass of the rest instead of the whole vocabulary, for a corpus too large for full rows; 0 (default) keeps the whole vocabulary |
 | `--kld-out FILE` | the `--kld-ref` report as JSON, and every position's numbers in `FILE.rows` |
 | `--kld-lora NAME` | run the documents through the `--lora` adapter `NAME` (§4.9.1), e.g. against a reference recorded from the merged checkpoint |
 | `--kld-lora-sources PREFIX` | with `--kld-lora`, only the documents whose `source` starts with `PREFIX` run through the adapter; the rest run as the base, in the same steps |
@@ -2134,6 +2219,7 @@ flags are refused on it, and so are the pixel bands.
 | `--debug-draft-oracle FILE` | a verify-path test, not a drafter: with `--spec-ngram`, prompt lookup proposes from the token ids in `FILE` (a plain greedy run's continuation of the one prompt the test sends) with 30% of the drafts corrupted, so verifies accept and reject at every depth; the text must stay the plain run's |
 | `--debug-tape-dump` | list the dispatches of the first recorded pass of each kind (`TAPEDUMP` lines on stderr, every rank) and which of them start unordered behind the one before |
 | `--debug-accept-reference-kernels` | serve even when ops resolve to `libref`. Not a production configuration |
+| `--proceed-with-incompatible-configuration` | start on a machine configuration startup refuses (§1.1: CWSR off where cards serve). **Unsupported**: all guarantees are off, and the log and the startup report say so |
 | `--profile-ops` | per-op device timing |
 | `--expert-stats FILE` | count the routed experts every layer selects, apart for prefill, decode, mixed steps and draft-head passes, and write them to `FILE` as JSON every 30 s and at shutdown (written through a temporary and a rename). Counted on the host from the routing histograms the core already copies back for the heat engine, so it adds no device work and no synchronisation; under expert parallelism each rank's slice is mapped to the model's expert ids through the container's directory |
 | `--live` | the live terminal view (§6.4) |
@@ -2151,7 +2237,7 @@ flags are refused on it, and so are the pixel bands.
 | `POST /v1/completions` | raw text completion |
 | `POST /v1/embeddings` | needs a model with an embedding head, else 501 |
 | `POST /v1/images/generations`, `POST /v1/images/edits` | OpenAI's images API; needs an image model (Qwen-Image 2.1), else 501 (§5.6) |
-| `POST /v1/systemone` | LiquidAI d1's decisions over a state: named yes/no, choice and score questions answered as probabilities, nothing generated; needs a container converted as d1, else 501 (§5.13) |
+| `POST /v1/systemone` | Decisions over a state: named yes/no, choice and score questions answered as probabilities, nothing generated; LiquidAI's d1, Cloudflare's clef and clef-flash with their joint head on the card, or Convai Innovations' Laya; needs a container converted as one, else 501 (§5.13). `POST /v1/decisions` is the same endpoint under LiteLLM's name |
 | `POST /v1/audio/transcriptions` | OpenAI's speech to text, for a model whose plugin transcribes (Qwen3-ASR), else 501 (§5.14) |
 | `GET /v1/realtime` (WebSocket) | OpenAI's realtime transcription session: audio streamed in, the words back as they are spoken (§5.14) |
 | `POST /v1/audio/speech` | OpenAI's speech API, whole or streamed: speech from a speech model (Breeze-TTS-2, `instructions` describing the voice; drama-3, speakers and direction in the input); songs from a music model (MiniMax-Music3), `input` the lyrics and `instructions` the song; else 501 (§5.15) |
@@ -2346,16 +2432,68 @@ token ids mixed, with its `add_special` and `parse_special` and their defaults);
 returns `tokens` as llama-server does, as `{id, piece}` objects with `with_pieces`. `/detokenize`
 returns the text as both `prompt` (vLLM) and `content` (llama-server).
 
-**An embedding model** (EmbeddingGemma 2, nomic-embed-text-v2-moe) serves `/v1/embeddings` only;
+**An embedding model** (EmbeddingGemma 2, nomic-embed-text-v2-moe, Nemotron 3.5 Embed) serves `/v1/embeddings` only;
 completions and chat answer 501. One input is one vector and must fit one step
 (`--max-num-batched-tokens`); a longer one is refused with `context_length_exceeded`.
 
-nomic-embed-text-v2-moe is converted from its f32 checkpoint with `rad-convert <checkpoint dir>
+nomic-embed-text-v2-moe converts from its f32 checkpoint with `rad-convert <checkpoint dir>
 --recipe data/recipes/nomic-embed-v2-moe-bf16.recipe -o nomic-embed-v2-moe-bf16.rad` (959 MB);
-the directory must contain `tokenizer.json`. The `search_query: ` and `search_document: ` prefixes
-are the client's text and the engine adds neither; the checkpoint's prompt names work through
-`prompt_name`. The checkpoint's shared `experts.bias` tensors are not applied and stay in the
-checkpoint.
+the directory must contain `tokenizer.json`. The engine adds neither the `search_query: ` nor the
+`search_document: ` prefix: the client sends it, or names the checkpoint's prompt with
+`prompt_name`. The checkpoint's shared `experts.bias` tensors are not applied.
+
+Nemotron 3.5 Embed 1B and 8B load directly from their native BF16 safetensors snapshots, including
+the tokenizer, processor and retrieval-prompt files; no conversion is needed. Use the normal
+HIP/FFmpeg build for R9700 (`-DRAD_WITH_HIP=ON -DRAD_GPU_TARGETS=gfx1201 -DRAD_WITH_FFMPEG=ON`):
+
+```sh
+RADIANCE_HOME="$PWD/build/radiance_home" build/bin/radiance \
+  --model /models/Nemotron-3.5-Embed-1B-BF16 --kernels libr4d,libavx --tp 1 \
+  --max-model-len 32768 --max-num-batched-tokens 32768 --max-num-seqs 4 \
+  --mm-max-patches 6400
+```
+
+Use the 8B checkpoint path for 8B, or a CPU build and `--kernels libavx` on x86-64. Named prompts
+are `query` (`query: `) and `document` (`passage: `). Typed text/image inputs and one user message
+with an optional leading system prefix follow the checkpoint's retrieval template: escaped user
+text, images before text, exact spacing and no implicit BOS/EOS. Images use data URLs. Raw token
+arrays are already formatted and receive no named prefix. Custom `--override-chat-template`
+files are rejected; use a named prompt or system prefix instead.
+
+The 32768-token maximum counts prefixes, image placeholders and separators. `--max-model-len`
+may lower it. Four full inputs need `--max-num-batched-tokens 131072 --max-num-seqs 4` to share
+one step; requests arriving during an active forward wait for the next step. Configured budgets
+size the arenas, so raising a budget reserves more memory even for smaller requests. The BF16
+GEMMs use bounded row launches and rebased pointers for tall combined batches, preserving whole
+attention sequences and existing arithmetic; unsupported multi-launch chains are refused.
+`--mm-max-patches 6400` covers the default 1120-square image in one encoder pass. See
+[ARCHITECTURES.md](ARCHITECTURES.md#nemotron35_embed-embedding-models) for geometry, numerical
+contracts and validation limits.
+
+**Nemotron 3.5 Rerank 8B BF16** uses the same architecture plugin with its own native
+checkpoint and learned scalar head. Serve it with `--max-model-len 32768` and enough
+`--max-num-batched-tokens` for each whole query/document pair. It serves `POST /rerank`
+and `/v1/rerank`, using the vLLM/Jina-style request and result fields:
+
+```sh
+curl -s http://localhost:8000/rerank -H 'Content-Type: application/json' \
+  -d '{"query":"Where can I borrow books?","documents":["A public library lends books.","A football match."],"top_n":2}'
+```
+
+Each result has the original document `index`, a raw `relevance_score` (higher is more
+relevant), and `document`. Scores may be negative; no sigmoid, L2 normalization or
+dimensional truncation applies. Results are sorted descending, with ties retaining
+input order. `top_n` omitted or zero returns all documents; `return_documents:false`
+omits document contents. Token usage includes all scored pairs, even with `top_n`.
+
+Queries are text strings. A document is a string, or `{"content":[...]}` containing
+typed `text` and `image_url` blocks, with an image data URL as for embeddings. At most
+one image is allowed per document. The checkpoint's exact `query`/`document` template
+places its image first, escapes literal controls and adds no BOS/EOS. The 32768-token
+limit covers query, document, prefixes and image tokens together. Overlong pairs are
+rejected, never truncated. Custom instructions, template overrides and activation
+options that change the native score are refused. This model does not serve
+`/v1/embeddings`; the embedding checkpoints continue to use that endpoint unchanged.
 
 ```sh
 # text, a batch of texts, or token ids
@@ -2865,6 +3003,107 @@ together. A single question is one pass of the whole prompt, tokenised as one te
 
 Against d1's own runner in float32, on eight text cases (one and several questions, JSON and long log
 states): every choice and every `input_tokens` equal, worst probability difference 0.0044.
+
+#### clef and clef-flash
+
+Cloudflare's clef (27B) and clef-flash (9B) are decision models on Qwen3.5 that answer the same
+request, every question of it jointly: a joint schema head reads the backbone's final hidden state
+at every prompt position, the mean over each question's instructions and each option's text, and
+the lm_head rows of each option's tokens, and gives one logit an option. radiance runs that head
+on the card, after the trunk, in the `clef_bf16` and `clef_fp8` plugins (`arch/clef_bf16`,
+`arch/clef_fp8`: the qwen35 plugins' own code with `arch/common/rad_block_clef.h` after it): there
+is no second process. The head's own tensors ship as
+`joint_head.safetensors` beside the checkpoint and are added at convert; `joint_head_config.json`
+beside them gives the head's geometry.
+
+```sh
+rad-convert /srv/models/clef-flash -o clef-flash.rad --arch clef \
+    --add /srv/models/clef-flash/joint_head.safetensors --set decision.type=clef
+radiance --model clef-flash.rad --port 8000
+```
+
+`--arch clef` selects the `clef_bf16` and `clef_fp8` plugins, the qwen35 trunk built again with
+the head after it; a container left as `qwen35` serves generation and answers `/v1/systemone`
+with 501.
+
+The request and the response are the same as d1's above; `/v1/decisions` is the same endpoint
+under LiteLLM's name. What differs:
+
+- One request is one prompt, the state and every question together, so questions are not shared
+  through the prefix cache; a state many requests share (the rules in front of each respondent)
+  is, with the head's own per-token rows beside the trunk's cache.
+- `state` must be a non-empty string or JSON value; pictures answer 501 for now.
+- A prompt longer than the context answers 400 with `context_length_exceeded` (clef's own code
+  cuts it silently). A request has at most 64 questions, 512 options and 8192 option tokens.
+- The head runs on one rank, and the lm_head stays bf16 (a recipe that quantises it is refused).
+- `GET /v1/models` reports `"decision": "clef"` in the model's capabilities.
+
+Against clef's own head on the CPU reference, on a tiny model with random weights
+(`tests/clef_decision_test.cpp`): worst probability difference 0.0004.
+
+#### Laya
+
+Convai Innovations' Laya checkpoints (`laya`, `laya-typed-decisions` on ModernBERT-large, and
+`laya-multilingual` on mmBERT-base) are encoder decision models. Laya reads one sequence a
+question, `[CLS] <type> question: <instructions> [SEP] [MASK] option ... [SEP] <state> [SEP]`, and
+scores each option at its `[MASK]` with a small head after the encoder. radiance builds those
+sequences in the server (`core/server/laya.cpp`, a rewrite of the `laya` package's own code) and
+runs the encoder and head in the `laya` plugin (`arch/laya`), on the embedding path: no KV cache,
+every question of a request in one step, each answered in its pooled row.
+
+```sh
+rad-convert /srv/models/laya-typed-decisions -o laya-typed-decisions.rad --set decision.type=laya
+radiance --model laya-typed-decisions.rad --port 8000
+```
+
+rad-convert reads the release's folders: `encoder/config.json` for the geometry,
+`rl_agent_config.json` for the sequence budget and the fitted temperatures, and `tokenizer/`. The
+checkpoint's `config.json` already says `model_type: laya`, so `--set decision.type=laya` is
+optional. A checkpoint as the `laya` package downloads it, with no `config.json` of its own,
+converts the same way. The release ships f16 weights. rad-convert rounds the linears and tables to
+bf16 itself, which is how the release computes them on a card, and records the rule in the
+container's recipe.
+
+The request and the response are the same as d1's above. What differs:
+
+- A state longer than the room a question leaves is cut, as the `laya` package cuts it: to its
+  start, or to its end for a list of turns. `usage` reports the cut with the package's own keys:
+  `state_tokens`, `state_tokens_dropped`, `truncated` and `truncated_questions`.
+- `confidence` is the package's: 1 minus the normalised entropy for choice and score. The fitted
+  temperatures are clamped to [0.5, 5], as the package clamps them.
+- A choice has at most 255 options, and options that do not fit the sequence answer 400.
+- `state` must be a non-empty string or JSON value. Pictures answer 501, and `/v1/embeddings`
+  answers 501 (the pooled row holds option logits, not a vector).
+- `GET /v1/models` reports `"decision": "laya"` in the model's capabilities.
+
+Against the `laya` package's own `Agent.predict` on the CPU reference, on a tiny model with random
+weights (`tests/laya_decision_test.cpp`): every `usage` field equal, worst probability difference
+0.0162 (0.0266 on a score's expected level).
+
+#### Mica
+
+Mica (`sky7350/Mica-v0.5-4B`, a fine-tune of Qwen3.5-4B) answers with d1's readout: one prompt a
+question -- a fixed system message, the state, the question and its candidates under labels -- and
+a softmax over the label tokens' logits at the prompt's last position (`No`/`Yes` for a yes/no
+question, `A`, `B`, ... for a choice or a score). The qwen35 plugins serve it as they serve the base
+model. The prompts and the response are built in the server (`core/server/mica.cpp`, a rewrite of
+Mica's `contract.py` and `native.py`), and a request's questions share the state through the prefix
+cache.
+
+```sh
+rad-convert /srv/models/Mica-v0.5-4B -o mica.rad --set decision.type=mica \
+    --set decision.mica.temperature=T --set decision.mica.noul_logit_bias=B
+radiance --model mica.rad --port 8000
+```
+
+`T` and `B` are the release's calibration (`calibration.json`): one temperature for every question
+type and a bias on a yes/no question's true logit. Unset, the temperature is 1 and the bias 0.
+
+The request and the response are the same as d1's above. What differs: every prompt is Mica's exact
+"plain" profile (its runtime's long-input mode, which approximates prompts over about 1K tokens, is
+not served), and `GET /v1/models` reports `"decision": "mica"`. Against the contract fixtures Mica's
+repository ships (`tests/mica_test.cpp`): every prompt byte for byte, every response value for
+value.
 
 ### 5.14 Speech to text
 
@@ -3540,7 +3779,8 @@ there is none.
 | `prefix_restore_cuts_total` | restores from the host tier the pool could not hold whole, even after giving up other conversations' VRAM copies (§4.8); `RADIANCE_LOG=debug` logs where each was cut |
 | `prefix_cache_expired_total`, `prefix_cache_ckpt_expired_total` | what `--prefix-cache-ttl` removed (§4.8) |
 | `prefix_cache_released_total{what}` | entries and snapshots clients forgot through `DELETE /sessions` (§4.8) |
-| `num_requests_preempted` | |
+| `num_requests_preempted` | | 
+| `preempt_forced_total` | preempted prefill waits that ended by reclaiming cache blocks and forcing a lowest-priority running victim (`--preempt-wait-ms`) |
 | `http_queue_depth`, `http_responses_total`, `http_admission_rejected_total` | |
 | `client_disconnect_total`, `stream_overflow_total` | |
 
@@ -3591,11 +3831,39 @@ With a key, every request must carry `Authorization: Bearer KEY` (or Anthropic's
 or it is answered 401, `/tokenize` and `/server_info` included. Exempt are `/health`, `/v1/health` and
 `/ping`, because load balancers cannot send a bearer token, and the dashboard page (`/`,
 `/dashboard`), which holds no data: on a 401 it asks for the key, keeps it in the browser's storage
-and sends it on every data fetch.
+and sends it on every data fetch. The exemption follows those paths' methods -- reads, plus the
+`POST /ping` of the health-check convention -- so it cannot follow a method no route answers.
+An empty `--api-key` value is a startup error: it would guard nothing.
 
-Without a key, `/diagnostics` answers only loopback clients (others get 403), because it describes
-the host: kernel, boot parameters, PCI layout, memory limits. Read it on the machine, or start the
-server with `--api-key`.
+Without a key, the routes that see the machine or change its state answer the machine itself only:
+`/diagnostics` (it describes the host — kernel, boot parameters, PCI layout, memory limits),
+`GET|POST /admin/control-vector`, `/v1/load_lora_adapter` and `/v1/unload_lora_adapter` (they read
+paths from disk), `DELETE /sessions/...` and `/reset_prefix_cache` (they destroy other clients'
+cached conversations). Others get 403. "The machine itself" means the socket comes from loopback,
+carries no foreign `Origin` — a browser page on another origin does not qualify even when its own
+machine serves the port, which is how a hostile web page would reach these routes through a
+victim's browser — **and its `Host` names the loopback** (`localhost`, `127.0.0.1`,
+`[::1]`): a DNS-rebinding page is same-origin with your server and its victim's own browser *is*
+the loopback peer, and behind a localhost TLS proxy every remote client arrives on a loopback
+socket — only the `Host` still tells which machine the client asked for. A browser that typed your
+public name into the address bar is therefore refused; `localhost`, a `127.x` address and an SSH
+tunnel pass. If you reach the box by another name from the box itself, list it: `--allow-host box`
+(repeatable). A local user on the server's own console is admitted either way — the boundary is
+against remote callers, not against whoever owns the machine.
+
+Behind a reverse proxy every socket arrives as the proxy, and every log line names it instead of
+the caller. `--trusted-proxy 127.0.0.0/8` (repeatable; a numeric network with a prefix, like
+`::1/128`) vouches for those networks: a request whose socket belongs to a vouched network is
+attributed to the client it names, reading `X-Forwarded-For` from the right and skipping vouched
+hops — the first address no vouched network covers is the caller, a chain of only vouched hops
+ends at its leftmost, and anything else falls back to the socket. Attribution is not authority:
+the guards above read the socket and never the named address, so a proxy on loopback hands the
+loopback-only routes to none of its clients — it only puts their addresses in the log where the
+proxy's would stand. An `X-Forwarded-For` from an unvouched socket is never read: the header
+says nothing until the machine sending it has been named. (This is why the server parses the
+header itself rather than arming the HTTP library's own trusted-proxy support: that support
+rewrites the very address the handlers read as the socket peer, so one over-broad vouched
+network would move the guard, not just the log line.)
 
 The key is not encrypted in transit. On a network you do not control, bind to localhost behind a
 TLS-terminating reverse proxy:
@@ -3620,8 +3888,10 @@ The last block startup prints before `serving on` is `STARTUP REPORT`. A startup
 it too, after the error, with what it had resolved, and ends with an `E` line repeating the error. It
 is the part of a log to paste into an issue. Its sections:
 
-- **CONFIGURATION**: every option `--help` lists, with the value in force and its source
-  (`default`, `command line`, an environment variable, or `auto`). An `auto` line carries the reason
+- **CONFIGURATION**: the options not at their default, with the value in force and its source
+  (`command line`, an environment variable, or `auto`), then a count of the options at their
+  default; `-v` lists every option `--help` lists, and `/diagnostics` always carries every one. An
+  `auto` line carries the reason
   under it: the drafter's depth, where the embedding and n-gram table went, the VRAM split, the
   placement strategy, each sampler default and the file it came from. `--api-key` shows only `set` or
   `not set`.
@@ -3639,7 +3909,7 @@ is the part of a log to paste into an issue. Its sections:
   warning is also printed as a `W` line of its own.
 
 ```
-I STARTUP REPORT -- radiance 1.13.0
+I STARTUP REPORT -- radiance 1.15.0
 I CONFIGURATION -- every option, the value in force, and where it came from
 I   --model                            /models/flashnext.rad                       [command line]
 I   --tp                               2                                           [command line]
@@ -3675,6 +3945,7 @@ curl -s -H "Authorization: Bearer $KEY" localhost:8000/diagnostics | jq '.findin
 | Message | Meaning | Action |
 |---|---|---|
 | `N declared op(s) resolve only to a reference implementation (libref)` and the engine exits | No kernel library covers those ops on this card (§2) | Install a library that covers them, or accept the cost with `--debug-accept-reference-kernels`. The named ops are what a new library must implement |
+| `incompatible configuration: ...` and `radiance does not start on a configuration it does not support` | A machine setting known to break radiance (§1.1) | Make the change the line names (`Fix:`) |
 | `DID NOT FIT` in the placement plan, naming a weight class, or `KV group '...': ... did not fit the KV pool` | The split left one side too little. A routed expert cannot be served from the file tier, so it has nowhere else to go | If weights did not fit: add or raise `--host-pool-mib`, or lower `--max-model-len` or `--max-num-seqs`. If a KV group did not fit: `--kv-cache-dtype fp8`, or a larger `--host-pool-mib` (RAM permitting), which takes experts off the card. The plan report names which, by class, with the shortfall |
 | `this kernel's amdgpu interface is 3.N ... a map here would never return` | The HIP 7.16 (ROCm 10.1) runtime waits for the kernel to finish every virtual-memory map on a page-table timeline, which amdgpu signals only from interface 3.64 (Linux 6.16) on; an older kernel never signals it, so the card runs without virtual memory management: the KV cache holds its whole carve and lends nothing to the experts (§4.3) | A 6.16 or later kernel, or an amdgpu-dkms driver of interface 3.64 or later |
 | `chat is 501` in the `serving on` line | The container carries no chat template | Re-convert with `--tokenizer`, and check that a `chat_template.jinja` sits beside `tokenizer_config.json` in the checkpoint. Meanwhile use `/v1/completions` |

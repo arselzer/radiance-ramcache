@@ -1,9 +1,8 @@
-/* abi_layout_table.h -- actual C11/C++20-identical ABI 32 / RAD_FORMAT_VER 2 table.
- * Generated from Root's owned live dump, 2026-10-27T21:43:51Z, 870 rows.
- * Evidence: ds41-v113-ABI32-live-layout-20261027T214350Z/receipt.json;
- * table SHA256 04b3151f712c0b6ddfc9b8931b1ef4639448390dfb8b6a9a27c1fb18d9193bdf.
- * Regenerate from the live dump only together with an ABI or format version change. */
-{ "RadArchProbe", "", 0, 96 },
+/* abi_layout_table.h -- every abi/ struct's size and field offsets at RAD_ABI_VERSION 32 and
+ * RAD_FORMAT_VER 2, as { type, field, offset, size } rows ("" is the struct itself). A snapshot
+ * of the headers on x86-64 Linux, which abi_layout_test.cpp holds the layout to; regenerate it
+ * from the test's printout only together with a version bump. */
+{ "RadArchProbe", "", 0, 120 },
 { "RadArchProbe", "draft_depth", 0, 4 },
 { "RadArchProbe", "draft_depth_fixed", 4, 4 },
 { "RadArchProbe", "shape_probe_ok", 8, 4 },
@@ -20,6 +19,9 @@
 { "RadArchProbe", "control_vector_ok", 80, 4 },
 { "RadArchProbe", "tp_attn_rows_ok", 84, 4 },
 { "RadArchProbe", "state_f16_ok", 88, 4 },
+{ "RadArchProbe", "tree_pays", 96, 8 },
+{ "RadArchProbe", "gen_max_pixels", 104, 8 },
+{ "RadArchProbe", "gen_max_refs", 112, 8 },
 { "RadArgs", "", 0, 64 },
 { "RadArgs", "t", 0, 8 },
 { "RadArgs", "n_t", 8, 4 },
@@ -30,7 +32,7 @@
 { "RadArgs", "instance", 48, 8 },
 { "RadArgs", "rank", 56, 4 },
 { "RadArgs", "world_size", 60, 4 },
-{ "RadBatch", "", 0, 360 },
+{ "RadBatch", "", 0, 408 },
 { "RadBatch", "phase", 0, 4 },
 { "RadBatch", "step", 4, 4 },
 { "RadBatch", "n_tok", 8, 8 },
@@ -81,6 +83,12 @@
 { "RadBatch", "control_vector", 336, 4 },
 { "RadBatch", "enc_seg_h", 344, 8 },
 { "RadBatch", "enc_seg_w", 352, 8 },
+{ "RadBatch", "score_only", 360, 4 },
+{ "RadBatch", "n_plugin_words", 368, 8 },
+{ "RadBatch", "plugin_words", 376, 8 },
+{ "RadBatch", "plugin_cu", 384, 8 },
+{ "RadBatch", "plugin_words_h", 392, 8 },
+{ "RadBatch", "plugin_cu_h", 400, 8 },
 { "RadBufDecl", "", 0, 80 },
 { "RadBufDecl", "dtype", 0, 4 },
 { "RadBufDecl", "rank", 4, 4 },
@@ -89,7 +97,7 @@
 { "RadBufDecl", "domain", 60, 4 },
 { "RadBufDecl", "derive", 64, 8 },
 { "RadBufDecl", "kv", 72, 4 },
-{ "RadBuildCtx", "", 0, 160 },
+{ "RadBuildCtx", "", 0, 200 },
 { "RadBuildCtx", "rank", 0, 4 },
 { "RadBuildCtx", "world_size", 4, 4 },
 { "RadBuildCtx", "max_tok", 8, 8 },
@@ -115,7 +123,13 @@
 { "RadBuildCtx", "state_dtype", 140, 4 },
 { "RadBuildCtx", "draft_coupling", 144, 4 },
 { "RadBuildCtx", "weight_prefetch_off", 148, 4 },
-{ "RadBuildCtx", "draft_head_off", 152, 4 },
+{ "RadBuildCtx", "draft_tree", 152, 8 },
+{ "RadBuildCtx", "calib_dir", 160, 8 },
+{ "RadBuildCtx", "calib_layer_lo", 168, 4 },
+{ "RadBuildCtx", "calib_layer_hi", 172, 4 },
+{ "RadBuildCtx", "calib_tokens", 176, 8 },
+{ "RadBuildCtx", "gen_max_pixels", 184, 8 },
+{ "RadBuildCtx", "gen_max_refs", 192, 8 },
 { "RadAudioGenBatch", "", 0, 344 },
 { "RadAudioGenBatch", "n_lane", 0, 8 },
 { "RadAudioGenBatch", "lane", 8, 8 },
@@ -253,7 +267,7 @@
 { "RadConstraint", "op", 8, 4 },
 { "RadConstraint", "ival", 16, 8 },
 { "RadConstraint", "sval", 24, 8 },
-{ "RadDeviceProps", "", 0, 208 },
+{ "RadDeviceProps", "", 0, 216 },
 { "RadDeviceProps", "name", 0, 128 },
 { "RadDeviceProps", "arch", 128, 32 },
 { "RadDeviceProps", "device_id", 160, 4 },
@@ -264,6 +278,7 @@
 { "RadDeviceProps", "lds_bytes", 192, 8 },
 { "RadDeviceProps", "supports_p2p", 200, 4 },
 { "RadDeviceProps", "is_host_backend", 204, 4 },
+{ "RadDeviceProps", "unified", 208, 4 },
 { "RadDrafterDecl", "", 0, 56 },
 { "RadDrafterDecl", "name", 0, 8 },
 { "RadDrafterDecl", "kind", 8, 4 },

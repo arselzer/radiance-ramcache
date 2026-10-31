@@ -68,8 +68,9 @@ std::string rad_home_file(const std::string& home, const std::string& rel);
  * its descriptor names the producing tool and no plugin claims it. The family's quantised plugin
  * serves it: the one plugin claiming a descriptor, or the only plugin if none does. Two quantised
  * plugins are refused by name. A plugin whose rad_arch_serves_imports returns 0 is left out of
- * both counts. `out->arch_quant` is the chosen descriptor, which a container
- * converted from it records. */
+ * both counts. Block-scaled fp8 (`fp8_e4m3`) that no plugin of the family claims is served the
+ * same way, since its weights read stock. `out->arch_quant` is the chosen descriptor, which a
+ * container converted from it records. */
 int rad_tools_load_plugins(const std::string& radiance_home,
                            const std::vector<std::string>& hierarchy,
                            const std::string& arch_id,
@@ -78,7 +79,10 @@ int rad_tools_load_plugins(const std::string& radiance_home,
                            bool imported = false);
 
 /* The architecture plugin's rad_arch_probe answers, given before declare. */
-int rad_tools_probe(const LoadedPlugins& plugins, const RadModelMeta& meta, RadArchProbe* out);
+/* `gen_max_pixels`, `gen_max_refs`: the probe's inputs (RadArchProbe), the deployment's
+ * --image-gen-max-pixels and --image-gen-max-refs; 0 the model's own. */
+int rad_tools_probe(const LoadedPlugins& plugins, const RadModelMeta& meta, RadArchProbe* out,
+                    int64_t gen_max_pixels = 0, int64_t gen_max_refs = 0);
 
 /* The architecture plugin's declared reply format (rad_arch_chat_format), or null when it
  * declares none and the format is to be derived from the chat template. */

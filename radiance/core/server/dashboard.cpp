@@ -13,6 +13,7 @@
  * collapsing while the pooled acceptance rate stays plausible.
  */
 #include "server.h"
+#include "oai.h"
 
 #include "rad_internal.h"
 
@@ -42,6 +43,18 @@ namespace server {
  * and answers with the same object. A deployment with no vector loaded answers 404 on both: it has
  * no such feature, and its requests refuse `control_vector: true` by name. */
 HttpResponse Server::handle_control_vector(const HttpRequest& req) {
+    /* Keyless, the vector and its switch belong to the machine: a rebinding page, a page on
+     * any origin a localhost proxy fronts, or a plain remote client reads neither the state
+     * nor the 404-that-means-no-vector. With --api-key both verbs are behind the key anyway. */
+    if (opt_.api_key.empty() && !local_operator(req)) {
+        ApiError e;
+        e.status  = 403;
+        e.type    = "permission_error";
+        e.message = "without --api-key, the control vector is read and its default changed only "
+                    "from a loopback client naming this machine; start the server with --api-key "
+                    "to reach it from elsewhere";
+        return error_response(e, req.peer);
+    }
     const bool have = deps_.control_vector.available && deps_.control_vector.available();
     if (!have) {
         /* 404, like a model the server does not serve: the route exists, this deployment has nothing
@@ -55,24 +68,12 @@ HttpResponse Server::handle_control_vector(const HttpRequest& req) {
     }
 
     if (req.method == "POST") {
-        /* The default applies to every client's requests that name no choice, so a server
-         * started without --api-key takes the change from a loopback client only, as it does a
-         * runtime adapter load. */
-        if (opt_.api_key.empty() && !req.peer_is_loopback()) {
-            ApiError e;
-            e.status  = 403;
-            e.type    = "permission_error";
-            e.message = "without --api-key, the control-vector default is changed only from a "
-                        "loopback client; start the server with --api-key to change it from "
-                        "elsewhere";
-            return error_response(e, req.peer);
-        }
-        json body;
-        try {
-            body = json::parse(req.body.empty() ? "{}" : req.body);
-        } catch (const std::exception& e) {
-            return error_response(err_bad("body", std::string("not JSON: ") + e.what()), req.peer);
-        }
+        bool over = false, deep = false;
+        json body = parse_json_bounded(req.body.empty() ? "{}" : req.body, 0, &over, &deep);
+        if (body.is_discarded()) return error_response(err_bad("body", "not JSON"), req.peer);
+        if (over || deep)
+            return error_response(err_bad("body", "expected {\"enabled\": true|false} and "
+                                                  "nothing deeper than that"), req.peer);
         const auto it = body.find("enabled");
         if (it == body.end() || !it->is_boolean())
             return error_response(err_bad("enabled", "a boolean is required"), req.peer);
@@ -191,6 +192,15 @@ HttpResponse Server::handle_sessions(const HttpRequest&) {
 HttpResponse Server::handle_session_release(const HttpRequest& req) {
     if (!deps_.sched)
         return error_response(err_not_implemented("the server has no engine attached"), req.peer);
+
+    /* Releasing a session destroys another client's cached conversation: keyless, that is an
+     * operator act, not something any page or client that reaches the port may do. */
+    if (opt_.api_key.empty() && !local_operator(req))
+        return error_response(
+            err_forbidden("without --api-key, sessions are released only from a loopback client "
+                          "naming this machine; start the server with --api-key to do it from "
+                          "elsewhere"),
+            req.peer);
 
     const std::string label = req.param("label");
     uint64_t id = 0;
@@ -489,10 +499,18 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
             l["d2h_bytes"]      = s.link.d2h_bytes;
             l["ssd_reads"]      = s.link.ssd_reads;
             l["ssd_bytes"]      = s.link.ssd_bytes;
+            l["ssd_staging_bytes"] = s.link.ssd_staging_bytes;
+            l["ssd_promoted_bytes"] = s.link.ssd_promoted_bytes;
+            l["ssd_deposits"]      = s.link.ssd_deposits;
+            l["ssd_deposit_bytes"] = s.link.ssd_deposit_bytes;
+            l["pool_evictions"]     = s.link.pool_evictions;
             l["prefetched"]     = s.link.prefetched;
             l["prefetch_bytes"] = s.link.prefetch_bytes;
             l["staged_bytes"]   = s.link.staged_bytes;
             l["stream_bytes"]   = s.link.stream_bytes;
+            l["kv_stream_bytes"]  = s.link.kv_stream_bytes;
+            l["kv_streaming"]   = s.link.kv_streaming;
+            l["kv_stream_active"] = s.link.kv_stream_active;
             o["link"] = std::move(l);
         }
         if (s.passes.present) {
@@ -1213,7 +1231,7 @@ nav button.on { color:var(--fg); background:var(--track); }
          otherwise have had, and a percentage of the paged pool's token capacity says nothing
          about it: it is a preemption signal, so it is kept, underneath, where it reads as one. -->
     <div class="cell"><div class="n" id="m-kv">–<u></u></div>
-         <span class="cap">kv cache in vram</span>
+         <span class="cap" id="m-kvcap">kv cache in vram</span>
          <span class="det" id="m-kvdet"></span>
          <svg viewBox="0 0 200 22" preserveAspectRatio="none"><path/></svg></div>
     <div class="cell"><div class="n" id="m-accept">–<u>%</u></div>
@@ -1384,7 +1402,7 @@ nav button.on { color:var(--fg); background:var(--track); }
            <span class="cap">conversations can resume</span>
            <span class="det" id="s-livedet"></span></div>
       <div class="cell"><div class="n" id="s-vram">–<u>tok</u></div>
-           <span class="cap">context in vram</span>
+           <span class="cap" id="s-vramcap">context in vram</span>
            <span class="det" id="s-vramdet"></span></div>
       <div class="cell" id="s-hostcell"><div class="n" id="s-host">–<u></u></div>
            <span class="cap">moved to host ram</span>
@@ -1669,6 +1687,9 @@ const RECENT = 30;   /* 15 s at the 500 ms poll for a figure sampled every poll;
 const RECENT_PREFILL = 10;   /* 5 s */
 const extAt = {}, winAt = {};
 let lastActiveC = 0;
+/* Whether the server streams its KV (--kv-resident). Settled at bringup, so it cannot change under
+ * a running page: the cells that name a memory tier read it instead of guessing. */
+let kvStreamOn = false;
 /* `win` false records the extreme only: acceptance pools its window in accPool and reads only
  * `highest` from extAt. */
 function noteSample(key, c, value, cap, win) {
@@ -1898,7 +1919,13 @@ const linkSegs = segs("linkbar", "linkrows");
  * own mapping, read in place -- so it is the one that is not a grey. */
 const TIER_INK = ["#f5f5f5", "#9a9a9a", "#5e5e5e", "#2b2b2b", "#3f6fa8"];
 const INK_AR = "#60a5fa", INK_UP = "#4ade80", INK_DOWN = "#fbbf24", INK_SSD = "#a78bfa";
-const INK_STREAM = "#f472b6", INK_PREFETCH = "#2dd4bf";
+const INK_SSD_STAGE = "#f9a8d4", INK_SSD_PROMOTE = "#86efac", INK_SSD_DEPOSIT = "#c4b5fd";
+/* The Expert SSD rows take their inks from where their bytes come from or go: staging is a
+ * lighter Expert streaming -- it is that traffic's own second leg, the same extents copied
+ * host to GPU after the drive read them; deposits wear a light tier violet, the kept copy in
+ * host RAM that lands just short of VRAM; promotions are a lighter Promotions (#4ade80), the
+ * same keep-forever copy heat's is, one tier further down. */
+const INK_STREAM = "#f472b6", INK_PREFETCH = "#2dd4bf", INK_KV = "#fb923c";
 /* The plane is painted as raw pixels, so the same inks are wanted as RGB triples. Parsed from
  * TIER_INK rather than written out a second time: two lists of five colours is one list that
  * will drift, and the drift is a legend that names the wrong band of the picture. */
@@ -2274,7 +2301,13 @@ function update(s, dt) {
    * wrong headline: the drafter's own window group is sized one block-run per slot and therefore
    * sits at 100% for the whole life of the server, so a headline reading the max reads 100% on a
    * server using 4% of its cache. */
-  const kvFrac = s.kv_tokens_total > 0 ? s.kv_tokens_used / s.kv_tokens_total : 0;
+  /* ONE UNIT FOR ONE METER. The figure is bytes -- every group's, which is the only unit groups
+   * can be summed in -- and the bar used to be TOKENS, the binding group's. Groups hold different
+   * bytes per token, so the two were answering at different rates: the figure reached its total
+   * while the bar was half full and then the figure stood still while the bar went on climbing.
+   * A streamed group's host mirror, whose pages arrive in their own order, made the gap wide
+   * enough to read as a bug, and it was one. Both are bytes now, and the percentage is the bar. */
+  const kvFrac = s.kv_bytes_total > 0 ? (s.kv_bytes_used || 0) / s.kv_bytes_total : 0;
   /* HELD, NOT READ. A finished turn's blocks stay held by the prefix cache so the next turn can
    * reuse them, and they occupy the card for exactly as long as they are held -- so they belong
    * in this figure. What leaves it is a block that reached the free list, which is where an
@@ -2286,14 +2319,31 @@ function update(s, dt) {
    * holds, in place, so what it keeps for itself is below what the carve gave it -- and the gap is
    * the expert plane's "Borrowed VRAM". The line says both numbers rather than one, because
    * "of 3.1 GiB" alone would read as a smaller budget. */
-  const kvGave = (s.kv_bytes_carved || 0) - s.kv_bytes_total;
-  /* TWO LINES, because the slot is two lines and a third is clipped rather than drawn. The share
-     of the pool is not among them: it is the bar in the memory panel, and repeating it here cost
-     the line that says how much context the bytes are actually holding. */
+  const kvGave = (s.kv_bytes_carved || 0) - (s.kv_bytes_total || 0);
+  /* KV STREAMING CHANGES WHAT THESE BYTES ARE -- but only where it is switched on in fact, not
+   * where it was asked for: --kv-resident is a preference (zeroed when the architecture refuses
+   * it, and a no-op at or above the group's context), while kv_stream_active says a group really
+   * keeps a resident window under its context. Without it every block the cache holds is on the
+   * card, so "of <total>" is VRAM and the carve is its ceiling. With it the card holds only the
+   * ring and every other block's K/V sits in a pinned host mirror: the figure above is the
+   * mirror, which is the whole context and therefore larger than the carve -- printing the carve
+   * beside it as a "max", or below as "can grow to", put a smaller number next to the larger one,
+   * and the pool read full the moment the mirror did. The line names the tier instead, and the
+   * ring keeps its own figure. */
+  const kvStream = !!(s.link && s.link.kv_stream_active);
+  /* THE TIER THE NUMBER IS IN, spelled. A streamed group's held context lives in the host mirror,
+   * so the same figure is "in ram" on this card; without streaming every block is on the card and
+   * it stays "in vram". The sessions view asks the same question of the same pool and renames its
+   * cell from the flag this poll settles. `kvStream` is the ring's actual state, not the switch. */
+  kvStreamOn = kvStream;
+  $("m-kvcap").textContent = kvStream ? "kv cache in ram" : "kv cache in vram";
   $("m-kvdet").textContent = s.kv_bytes_total > 0
-      ? "of " + hb(s.kv_bytes_total) + " (max " + hb(s.kv_bytes_carved || 0) + ")  ·  "
-        + cnt3(s.kv_tokens_used) + " tok"
-        + (kvGave > 0 ? "  ·  " + hb(kvGave) + " lent to experts" : "")
+      ? (kvStream
+          ? "of " + hb(s.kv_bytes_total) + " in host mirror  ·  " + cnt3(s.kv_tokens_used) + " tok"
+            + "  ·  " + hb(s.kv_bytes_carved || 0) + " VRAM ring"
+          : "of " + hb(s.kv_bytes_total) + " (max " + hb(s.kv_bytes_carved || 0) + ")  ·  "
+            + cnt3(s.kv_tokens_used) + " tok"
+            + (kvGave > 0 ? "  ·  " + hb(kvGave) + " lent to experts" : ""))
       : "";
   const aw = accWindow(s);
   const awR = aw ? aw.ratio : null;
@@ -2329,29 +2379,31 @@ function update(s, dt) {
   /* ONE MERGED FIGURE. The pool is carved into groups by state kind -- paged attention, the
    * linear state, the drafter's own window -- and which of them a token landed in is an
    * implementation detail of the carve, not a question anybody watching a server is asking. */
-  /* THE BAR IS THE BYTES BECAUSE THE PANEL IS ABOUT THE CARD, and it is filled from every group
-   * -- the recurrent ones included -- while the token figure beside it is the binding paged
-   * group's alone. They are not a unit conversion of each other and the panel says both.
-   *
-   * THE FILL IS IN TWO PARTS, and the second is the one that answers "why is the pool full when
-   * one conversation is running". The bytes are apportioned by the token split rather than
-   * measured, because the cache counts in blocks of the shared token axis and the bytes are
-   * every group's -- the ratio is what is being drawn, and it is exact in the unit it is taken
-   * in. */
+  /* THE FILL IS IN TWO PARTS, and the second is the one that answers "why is the pool full when
+   * one conversation is running". The share comes from the tokens (which blocks a running request
+   * reads versus which only the cache keeps is a fact about blocks) and is then spent in BYTES,
+   * the unit the figure and the percentage beside it are in, so the three cannot disagree. */
   const kvCached = Math.min(s.kv_tokens_cached || 0, s.kv_tokens_used || 0);
   const kvLive = Math.max(0, (s.kv_tokens_used || 0) - kvCached);
+  const kvCachedShare = (s.kv_tokens_used || 0) > 0 ? kvCached / s.kv_tokens_used : 0;
   mKv.v.textContent = hbOf(s.kv_bytes_used, s.kv_bytes_total, " / ") + "  ·  " + pct(kvFrac);
-  setSplit(mKv, kvLive, kvCached, s.kv_tokens_total || 0);
+  /* The two shares are FRACTIONS OF THE FILL, not of the track: spent as widths against a total
+   * of 1 they would draw a full bar for a pool holding 29 KiB. */
+  setSplit(mKv, (1 - kvCachedShare) * kvFrac, kvCachedShare * kvFrac, 1);
   /* The segments named by what reclaiming them would cost, since a dimmer bar is not
      self-explanatory. The split is by who references the blocks: the first part is context a
      request on the card is reading, the second context nothing reads and the next eviction frees. */
   mKvSub.textContent = s.kv_tokens_used > 0
       ? cnt3(kvLive) + " tok read by running requests  ·  " + cnt3(kvCached) + " kept for reuse"
       : "";
-  mKvMax.textContent = s.kv_tokens_max > 0
-      ? "can grow to " + hb(s.kv_bytes_carved || 0) + "  ·  " + cnt3(s.kv_tokens_max)
-        + " tok, with what the experts borrowed taken back"
-      : "";
+  mKvMax.textContent = kvStream
+      ? (s.kv_tokens_max > 0
+          ? "a miss streams the missing blocks from the mirror into the ring"
+          : "")
+      : (s.kv_tokens_max > 0
+          ? "can grow to " + hb(s.kv_bytes_carved || 0) + "  ·  " + cnt3(s.kv_tokens_max)
+            + " tok, with what the experts borrowed taken back"
+          : "");
   mPc.v.textContent = pct(s.prefix_hit_rate); setBar(mPc.i, s.prefix_hit_rate, false);
 
   /* ---- draft. The bar is the CONDITIONAL acceptance at that position; the reach row under the
@@ -2487,8 +2539,16 @@ function update(s, dt) {
     $("layv").textContent = !lu.length ? DASH
         : wf >= 0.999 ? "all resident"
         : pct(sum / lu.length) + " mean  ·  worst L" + worst + " " + pct(wf);
+    /* Residency, not capability: every bucket says where units are, and the buckets add up to
+     * the plan. The old "N movable" read as if cold disk experts could not move -- deposits and
+     * the stager move them constantly; what they lack is an address heat can relocate without
+     * reading the container. Tier names come from the engine; the page only phrases the two
+     * common ones. */
+    const rest = (ex.tiers || []).slice(1).filter(t => t.units > 0).map(t =>
+        cnt(t.units) + " " + (t.name === "pinned" ? "in host pool"
+                            : t.name === "ssd" ? "on the file tier" : t.name));
     $("planev").textContent = cnt(res) + " of " + cnt(ex.n_units) + " in VRAM" +
-        (ex.movable ? "  ·  " + cnt(ex.movable) + " movable" : "  ·  none movable");
+        (rest.length ? "  ·  " + rest.join("  ·  ") : "  ·  fully resident");
 
     /* ---- the plane itself.
      *
@@ -2529,8 +2589,20 @@ function update(s, dt) {
     const pre = (f) => lk[f] || 0;
     const dP  = (f) => prev.link[f] == null ? 0 : Math.max(0, (pre(f) - prev.link[f]) / dt);
     const ar = d("ar_bytes"), dn = d("d2h_bytes"), sd = d("ssd_bytes"), st = d("stream_bytes");
+    const sg = d("ssd_staging_bytes");
+    const sp = d("ssd_promoted_bytes");
+    const wp = d("ssd_deposits");
+    /* Null-safe until a server reports it: an older one, or the switch off, reads as zero. */
+    const kv = lk.kv_streaming ? dP("kv_stream_bytes") : 0;
     const pf = dP("staged_bytes") + dP("prefetch_bytes");
-    const up = Math.max(0, d("h2d_bytes") - pf);
+    /* Promotions is a residual: every host-to-device byte that is not prefill prefetch.
+     * Under the file tier the biggest such bytes are the SSD tier's staging leg -- the same
+     * extents ssd_bytes read from the container, copied window to staging buffer -- which
+     * would otherwise make Promotions read as the streaming it is spent on, not heat's churn.
+     * The counter pairs with ssd_bytes (two legs of the same extents). The hot cache's
+     * promotions are the third leg: extents copied into a slab slot that
+     * stays, which get their own row and come out of the residual too. */
+    const up = Math.max(0, d("h2d_bytes") - d("ssd_staging_bytes") - sp - pf);
     const pfAll = pre("staged_bytes") + pre("prefetch_bytes");
     const upAll = Math.max(0, lk.h2d_bytes - pfAll);
     /* AN IDLE LINK STILL HAS A COMPOSITION, and an empty bar is not it. Between two polls of a
@@ -2539,7 +2611,7 @@ function update(s, dt) {
      * proportion then falls back to the CUMULATIVE bytes, which is the same question asked over
      * the whole run, and the panel says out loud which of the two it is showing. The rates stay
      * in the rows either way: they are never wrong, only sometimes zero. */
-    const live = ar + up + pf + dn + sd + st > 0;
+    const live = ar + up + pf + dn + sd + st + kv > 0;
     const w = (now, all) => live ? now : all;
     linkSegs([
       { name: "All-reduce", ink: INK_AR,   w: w(ar, lk.ar_bytes),
@@ -2558,10 +2630,30 @@ function update(s, dt) {
        * fault when the page is not there. Neither goes past this counter, and neither crosses
        * the link this panel is about. A zero here means no expert was fetched from the SSD tier;
        * it does not mean the process touched no disk. */
-      { name: "Expert SSD tier",  ink: INK_SSD,  w: w(sd, lk.ssd_bytes),
-        a: rate(sd), b: hb(lk.ssd_bytes) },
       { name: "Expert streaming", ink: INK_STREAM, w: w(st, lk.stream_bytes),
         a: rate(st), b: hb(lk.stream_bytes) },
+      /* KV STREAMING, --kv-resident (core/kvstream): each step's resolve copies the blocks a
+       * streamed group missed from the pinned host mirror into the VRAM ring. The row rides the
+       * switch, not the traffic: a server that took --kv-resident but never streams -- a pipeline
+       * that never enters the streaming path -- is exactly what a zero row with the switch on
+       * says, and that is a question worth answering at a glance. The bytes are rank 0's resolve
+       * counters times the world: the ranks see the same misses through maps brought up
+       * identically, so each card's link carries one rank's figure. */
+      ...(lk.kv_streaming ? [{ name: "KV streaming", ink: INK_KV,
+        w: w(kv, pre("kv_stream_bytes")),
+        a: rate(kv), b: hb(pre("kv_stream_bytes")) }] : []),
+      /* THE HOT CACHE'S OWN ROW: SSD-tier reads whose destination was a
+       * slab slot -- the expert stays resident -- read above the deposits row, whose bytes
+       * stop in host RAM. A server from before the hot cache reports none, which reads as
+       * zero. Ink: a lighter Promotions, the same keep-forever copy one tier further down. */
+      { name: "Expert SSD promotions", ink: INK_SSD_PROMOTE, w: w(sp, pre("ssd_promoted_bytes")),
+        a: rate(sp), b: hb(pre("ssd_promoted_bytes")) },
+      { name: "Expert SSD deposits", ink: INK_SSD_DEPOSIT, w: w(wp, pre("ssd_deposit_bytes")),
+        a: rate(wp), b: hb(pre("ssd_deposit_bytes")) },
+      { name: "Expert SSD staging", ink: INK_SSD_STAGE,  w: w(sg, lk.ssd_staging_bytes),
+        a: rate(sg), b: hb(lk.ssd_staging_bytes) },
+      { name: "Expert SSD tier",  ink: INK_SSD,  w: w(sd, lk.ssd_bytes),
+        a: rate(sd), b: hb(lk.ssd_bytes) },
     ]);
     /* THE HEADLINE IS THE PCIe TOTAL, which is the all-reduce plus the moves. The SSD tier is
      * left out of it on purpose: those bytes come off a disk into host memory and only the ones
@@ -2571,8 +2663,12 @@ function update(s, dt) {
      * EXPERT STREAMING IS IN IT. A routed expert that was not resident is read by the MoE GEMM
      * where it lies, which for every tier above VRAM means crossing the link on the critical
      * path of the step. It is not a move and not a collective, and it is the traffic a promotion
-     * is spent to remove -- so the two belong on one axis. */
-    const lr = rates(ar + up + pf + dn + st);
+     * is spent to remove -- so the two belong on one axis.
+     *
+     * KV STREAMING IS IN IT WHILE THE SWITCH IS ON. Its resolve copies cross the same PCIe the
+     * movers use, already summed over the cards; with the switch off the term is zero and the
+     * headline reads as it did without the counter. */
+    const lr = rates(ar + up + pf + dn + st + kv);
     $("lnk_n").firstChild.nodeValue = lr.n;
     $("lnk_n").querySelector("u").textContent = lr.u;
     /* WHAT IS SUMMED AND WHAT IS NOT. The move and stream rows are every card's added up,
@@ -3493,6 +3589,9 @@ async function loadSessions() {
   /* VRAM IN TOKENS, HOST MEMORY IN BYTES. The pool's token count is the context the card can
      serve without a copy; the host tier is sized by --prefix-cache-mib and read against it. A
      tier that is off has no cell. */
+  /* A streamed server holds that context in its host mirror, not on the card, so the cell says
+   * where the tokens are; the flag comes from the stats poll (kvStreamOn). */
+  $("s-vramcap").textContent = kvStreamOn ? "context in ram" : "context in vram";
   $("s-vram").firstChild.nodeValue = cnt3(pool.tokens_used || 0);
   $("s-vramdet").textContent = pool.tokens_total ? "of " + cnt3(pool.tokens_total) + " tok" : "";
   for (const [id, used, cap] of [["s-host", occ.host_bytes, occ.host_cap_bytes]]) {
@@ -3650,6 +3749,17 @@ HttpResponse Server::handle_dashboard(const HttpRequest&) {
     /* No caching: the page must match the binary's /stats shape, and a stale copy shows only
      * blank panels. */
     r.set_header("Cache-Control", "no-store");
+    /* The page is fixed markup that talks only to its own origin, and CSP is how that promise
+     * becomes enforceable: even a future markup bug could not phone an injected payload's
+     * findings home, and could not reach the key beyond this origin. script/style 'unsafe-inline'
+     * is the cost of shipping as one compiled-in literal with its own <style> and <script>;
+     * frame-ancestors keeps a hostile page from framing the Model view and clickjacking its
+     * guardrail toggle. */
+    r.set_header("Content-Security-Policy",
+                 "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
+                 "connect-src 'self'; img-src 'self'; frame-ancestors 'none'; base-uri 'none'; "
+                 "form-action 'none'");
+    r.set_header("X-Frame-Options", "DENY");
     return r;
 }
 

@@ -166,6 +166,7 @@ void Metrics::sample(const SchedMetrics& m) {
         draft_adapt_on_.store(true, std::memory_order_release);
     }
     c_preemptions_.advance_to(m.preemptions);
+    c_preempt_forced_.advance_to(m.preempt_forced);
     c_steps_.advance_to(m.steps);
     c_steps_prefill_.advance_to(m.steps_prefill);
     c_steps_mixed_.advance_to(m.steps_mixed);
@@ -331,6 +332,9 @@ std::string Metrics::render() const {
               "Number of generation tokens processed.", L, c_generation_tokens_.get());
     w.counter("vllm:num_preemptions_total",
               "Cumulative number of preemptions from the engine.", L, c_preemptions_.get());
+    w.counter("radiance:preempt_forced_total",
+              "Preempted prefill waits that ended by reclaiming cache blocks and forcing a "
+              "lowest-priority running victim (--preempt-wait-ms).", L, c_preempt_forced_.get());
 
     w.help("vllm:request_success_total",
            "Count of successfully processed requests.", "counter");

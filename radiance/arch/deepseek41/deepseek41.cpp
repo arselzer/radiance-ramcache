@@ -899,7 +899,7 @@ static rad_op rmsnorm(RadBuilder* b, const Model& m, int64_t rows, rad_weight w,
 }
 static rad_op rope_rows(RadBuilder* b, const Model& m, int64_t rows, int64_t heads, int64_t hd,
                         int inverse, rad_buf x, rad_buf cs) {
-    return op(b, "rope_rows",
+    return op(b, "ds41_rope_rows",
               { RAD_RANGE("M", 1, rows), RAD_INT("n_head", heads), RAD_INT("head_dim", hd),
                 RAD_INT("rot", m.c.rope), RAD_INT("off", hd - m.c.rope), RAD_STR("mode", "gptj"),
                 RAD_INT("inverse", inverse), RAD_STR("dtype", "bf16") },
@@ -1819,6 +1819,14 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
  * stages, and get no drafter. The official checkpoint's own stages (mtp.*, fp8 / MXFP4) reach a GGUF
  * trunk as one more split shard in these names, re-spelled value for value (BF16 linears, Q8_0 experts)
  * by a graft outside the tree, so they arrive here as any GGUF weight does. */
+/* Prompt lookup alone on a container that carries the DSpark drafter (ours): upstream refuses
+ * --spec-ngram where a draft head is declared, so RADIANCE_EXPERIMENTAL_DS41_LOOKUP_ALONE=1 leaves
+ * the drafter out and the core drafts by lookup alone (the A/B harness's Sg arms set it). */
+static bool ds41_lookup_alone() {
+    const char* e = std::getenv("RADIANCE_EXPERIMENTAL_DS41_LOOKUP_ALONE");
+    return e && !std::strcmp(e, "1");
+}
+
 static int dsp_config(RadBuilder* b, Model& m, const RadModelMeta* meta, const RadBuildCtx* ctx) {
     auto& d = m.dsp;
     const auto& c = m.c;
@@ -1830,11 +1838,12 @@ static int dsp_config(RadBuilder* b, Model& m, const RadModelMeta* meta, const R
                     "stages (no nextn_predict_layers): no drafter", (long long)blk);
         return RAD_OK;
     }
-    if (!rad_ctx_draft_head(ctx)) return RAD_OK;   /* no speculation, or prompt lookup alone */
+    if (ctx->max_spec <= 0 || ds41_lookup_alone()) return RAD_OK;   /* no speculation, or prompt lookup alone */
     if (ctx->max_spec != blk) {
         fprintf(stderr, "radiance: deepseek41: the DSpark drafter proposes a whole block of %lld tokens "
                         "(dspark.block_size, the length it was trained at) and this serve asks for %d; run "
-                        "--num-speculative-tokens %lld (or auto)\n", (long long)blk, ctx->max_spec, (long long)blk);
+                        "--num-speculative-tokens %lld (or auto), or RADIANCE_EXPERIMENTAL_DS41_LOOKUP_ALONE=1 for "
+                        "prompt lookup alone\n", (long long)blk, ctx->max_spec, (long long)blk);
         return RAD_E_UNSUPPORTED;
     }
     d.n_expert = gi(meta, "dspark.expert_count", c.n_expert);

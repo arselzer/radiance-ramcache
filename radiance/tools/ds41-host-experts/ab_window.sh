@@ -137,7 +137,7 @@
 #
 # Environment: RADIANCE_BIN (the binary), RADIANCE_HOME_DIR (kernels/ and architectures/ for it),
 # SILU_TABLE (the card's silu table), ARMS (default "base verify greedy"), HX_THREADS (16),
-# VERIFY_REQUESTS (3), DEVICE_CHECKS (1; a list: `tall` the exact-tall checks, `lcp` the large-chunk
+# VERIFY_REQUESTS (3), DEVICE_CHECKS (1; a list: `swiglu` the default checks, `tall` the exact-tall checks, `lcp` the large-chunk
 # ones at LCP_CHECK_C, both with TALL_LIBR4D and TALL_CHECK),
 # SELFTEST_F32BF16 (an r4d_selftest: gemm_nt_f32bf16's checks and timings on card 0 before the
 # arms; unset, none, and no Rb arm runs).
@@ -1094,14 +1094,20 @@ if [[ " ${DEVICE_CHECKS:-1} " == *" tall "* ]]; then
     fi
   fi
 fi
-if [[ "${DEVICE_CHECKS:-1}" == 1 && -x "$HERE/build/ds41_mxfp4_device_check" ]]; then
+# launch_window.sh runs a snapshot copy of this script, whose directory has no build/: TALL_CHECK (the same
+# ds41_mxfp4_device_check) is used when given.
+MX_CHECK=${TALL_CHECK:-$HERE/build/ds41_mxfp4_device_check}
+if [[ ( "${DEVICE_CHECKS:-1}" == 1 || " ${DEVICE_CHECKS:-1} " == *" swiglu "* ) && ! -x "$MX_CHECK" ]]; then
+  log "swiglu and chain checks asked for, but $MX_CHECK is not an executable: not run"
+fi
+if [[ ( "${DEVICE_CHECKS:-1}" == 1 || " ${DEVICE_CHECKS:-1} " == *" swiglu "* ) && -x "$MX_CHECK" ]]; then
   # The served plugin's swiglu over every (gate, up) pair, mismatches classified, and the
   # whole host chain against its decode kernels; the table recaptured and compared.
   log "device checks on card 0 with $RHOME/kernels/libr4d.so"
   ( export HIP_VISIBLE_DEVICES=0
-    timeout 1200 "$HERE/build/ds41_mxfp4_device_check" "$RHOME/kernels/libr4d.so" swiglu "$OUT/silu_recheck.bin" >"$OUT/swiglu_proof.log" 2>&1
+    timeout 1200 "$MX_CHECK" "$RHOME/kernels/libr4d.so" swiglu "$OUT/silu_recheck.bin" >"$OUT/swiglu_proof.log" 2>&1
     echo "swiglu exit $?" >>"$OUT/swiglu_proof.log"
-    timeout 1200 "$HERE/build/ds41_mxfp4_device_check" "$RHOME/kernels/libr4d.so" check 24 "$SILU" >"$OUT/chain_check.log" 2>&1
+    timeout 1200 "$MX_CHECK" "$RHOME/kernels/libr4d.so" check 24 "$SILU" >"$OUT/chain_check.log" 2>&1
     echo "chain exit $?" >>"$OUT/chain_check.log" )
   tail -3 "$OUT/swiglu_proof.log" | tee -a "$OUT/window.log"
   tail -3 "$OUT/chain_check.log" | tee -a "$OUT/window.log"
@@ -1519,8 +1525,10 @@ for a in $ARMS; do
       A[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_ASYNC_MISSES=${p#A}) ;;
       Rm[0-9]*) ARGS+=(--expert-plane-mirror-min-rows "${p#Rm}") ;;
       Rd[0-9]*) ARGS+=(--expert-plane-mirror-decode-share "0.${p#Rd}") ;;
-      Sga[0-9]*) ARGS+=(--num-speculative-tokens "${p#Sga}" --spec-ngram "${p#Sga}" --draft-window adaptive) ;;
-      Sg[0-9]*) ARGS+=(--num-speculative-tokens "${p#Sg}" --spec-ngram "${p#Sg}") ;;
+      Sga[0-9]*) ARGS+=(--num-speculative-tokens "${p#Sga}" --spec-ngram "${p#Sga}" --draft-window adaptive)
+                 env+=(RADIANCE_EXPERIMENTAL_DS41_LOOKUP_ALONE=1) ;;   # the plugin leaves its drafter out
+      Sg[0-9]*) ARGS+=(--num-speculative-tokens "${p#Sg}" --spec-ngram "${p#Sg}")
+                env+=(RADIANCE_EXPERIMENTAL_DS41_LOOKUP_ALONE=1) ;;
       R|R[0-9]*)
                if [[ -z "$MIRROR" ]]; then log "arm $a: $p needs MIRROR=<directory of the checkpoint's model-*.safetensors>"; skip=1; fi
                ARGS+=(--expert-plane-mirror "$MIRROR")

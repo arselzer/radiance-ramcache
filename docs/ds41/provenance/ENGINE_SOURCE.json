@@ -1,33 +1,28 @@
 {
-  "commit": "fa856f3e1bc6659f494d097df7fd1e89b5df6521",
-  "tree": "3582b43010a258dd389f8ca02188deb85121a45b",
+  "commit": "5ac96fc9f3e602ae448c8e9ce404159156c6e870",
+  "tree": "80238329bca7d143f5aeddb4eaf88a4f36917921",
   "branch": "claude/ds41-decode-impl",
-  "subject": "README: harness sessions with end-of-request snapshots on a 16-token grid (72.7 s vs 82.5 s over 13 turns; exact)",
-  "committed_utc": "2026-10-31T09:43:30Z",
-  "files": 1462,
-  "bytes": 57464685,
-  "executable_files": 59,
+  "subject": "ds41 README: the merged base engine is the reference after the upstream sync (windows SV, SV2)",
+  "committed_utc": "2026-10-31T10:51:25Z",
+  "files": 1793,
+  "bytes": 70327810,
+  "executable_files": 61,
   "pins": "docs/ds41/provenance/ENGINE_SOURCE_PINS.json",
-  "pins_sha256": "655c7f11ab1a27af73618d9eb4ab9855344bdaa97e1606a5b70443a952494778",
-  "export": "git archive --format=tar fa856f3e1bc6659f494d097df7fd1e89b5df6521 (tracked files only, modes kept)",
+  "pins_sha256": "bd47edc85a051ab0e04a273cdad5c92929345107b59cc5111d918fc084fae7e3",
+  "export": "git archive --format=tar 5ac96fc9f3e602ae448c8e9ce404159156c6e870 (tracked files only, modes kept)",
   "upstream": {
     "repository": "https://codeberg.org/StillDeadcode/radiance",
     "note": "Radiance upstream plus the deepseek41 architecture work of its pull request 266; the commits after them are this work (ds41 RAM cache and CPU experts)",
     "commits": {
-      "upstream main as fetched (origin/main)": {
-        "commit": "6c33ee4e1267fc0a016fc0a4a333b0221326a1be",
+      "upstream main (upstream/main, v1.15.0 + 12)": {
+        "commit": "b6acbd69e475b064f61c76ef7dbdea4e22956394",
         "contained": true,
-        "commits_after": 377
+        "commits_after": 352
       },
-      "newest upstream commit contained (review-upstream/main)": {
-        "commit": "4374bea1c4bca1c00c59890d10b799a274d5e8b4",
-        "contained": true,
-        "commits_after": 344
-      },
-      "pull request 266, deepseek41 (origin/pr-266)": {
+      "pull request 266, deepseek41 (upstream/pr-266 as of 2026-10-28)": {
         "commit": "bd65d4e58f7c4233de09ad5245a82c9510eb8962",
         "contained": true,
-        "commits_after": 463
+        "commits_after": 531
       }
     }
   }

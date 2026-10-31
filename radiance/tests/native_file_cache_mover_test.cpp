@@ -202,7 +202,7 @@ void routed_case(bool cached,bool relaid,bool mutate){
     const auto c=Io::capture();routed_pass(t,f,p,image,units);const auto d=Io::capture();const auto warm=delta(c,d);
     if(cached){CHECK_EQ(warm.calls,uint64_t(0));CHECK_EQ(warm.bytes,uint64_t(0));CHECK_EQ(calls.load(),relaid?uint64_t(4):uint64_t(0));CHECK_EQ(t.mover->stats().file_relaid,before_relaid);}
     else{CHECK(warm.calls>=4);CHECK(warm.bytes>0);CHECK_EQ(calls.load(),relaid?uint64_t(8):uint64_t(0));}
-    CHECK_EQ(t.mover->stats().file_units,uint64_t(4));
+    CHECK_EQ(t.mover->stats().ssd_units,uint64_t(4));
     std::printf("  actual HOST Mover cached=%d relaid=%d cold logical reads=%llu/%lluB warm=%llu/%lluB callbacks=%llu\n",int(cached),int(relaid),
         (unsigned long long)cold.calls,(unsigned long long)cold.bytes,(unsigned long long)warm.calls,(unsigned long long)warm.bytes,(unsigned long long)calls.load());
     if(mutate){
@@ -210,7 +210,7 @@ void routed_case(bool cached,bool relaid,bool mutate){
         std::vector<WeightSlot> slots;for(auto u:units)for(auto h:p.units[size_t(u)].weights)slots.push_back(*t.mover->residency()->lookup(h));
         REQUIRE_EQ(::ftruncate(image.fd,off_t(image.bytes.size()+1)),0);REQUIRE_EQ(::fsync(image.fd),0);
         std::vector<int32_t> staged;CHECK_EQ(t.mover->stage_file_units(units,t.mover->file_buffer(0),t.mover->file_buffer_bytes(),nullptr,t.done,&staged),RAD_E_STATE);
-        t.drain();CHECK_EQ(calls.load(),callback_before);CHECK_EQ(t.mover->stats().h2d_bytes,before.h2d_bytes);CHECK_EQ(t.mover->stats().file_units,before.file_units);
+        t.drain();CHECK_EQ(calls.load(),callback_before);CHECK_EQ(t.mover->stats().h2d_bytes,before.h2d_bytes);CHECK_EQ(t.mover->stats().ssd_units,before.ssd_units);
         size_t i=0;for(auto u:units)for(auto h:p.units[size_t(u)].weights){const auto* s=t.mover->residency()->lookup(h);CHECK(s&&s->ptr==slots[i].ptr&&s->ready==slots[i].ready&&s->generation==slots[i].generation);++i;}
     }
 }

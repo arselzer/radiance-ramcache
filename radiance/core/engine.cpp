@@ -32,6 +32,7 @@
 #include <atomic>
 #include <chrono>
 #include <csignal>
+#include <cstdio>
 #include <cstring>
 #include <cstdint>
 #include <cstdlib>
@@ -579,6 +580,8 @@ Engine::~Engine() {
     table_copies_.clear();
     for (void* p : card_copies_) rad_dev_free(p, RAD_MEM_HOST_MAPPED);
     card_copies_.clear();
+    for (TableShare& t : table_shares_) table_share_close(&t);
+    table_shares_.clear();
     rad_tools_registry().close();
 }
 
@@ -968,9 +971,11 @@ int Engine::prepare_release(const RadBatch* b) {
             step_status_.store(RAD_E_NOMEM, std::memory_order_release);
     }
     if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
-    /* The stage bound for every rank (kvstream/stage.h, "Volume"). Rank 0's allocator hands out the
-     * block ids every rank uses, and the ranks are parked, so no allocation races the read. */
-    for (auto& rk : ranks_) kvstream_bound_live(&rk->ctx, ranks_[0]->kv);
+    /* The stage's ranges for every rank (kvstream/stage.h, "Volume"): the blocks the step's own
+     * tables name. Rank 0's allocator hands out the block ids every rank uses, and the ranks are
+     * parked, so no allocation races the read. */
+    kvstream_step_runs(ranks_[0]->kv, b, sched_.step_seqs(b), &stage_runs_);
+    for (auto& rk : ranks_) kvstream_bound_live(&rk->ctx, stage_runs_);
     return RAD_OK;
 }
 
@@ -1049,9 +1054,17 @@ int Engine::step_loop() {
     std::vector<RtStepEntry> rt_entries;   /* ..._ROUTE_TRACE's step records */
     /* Not in KL mode: its scored rows are copied out of the logits buffer after collection, and a
      * pass issued ahead would overwrite them. */
-    pipelining_ = draft_experiment_.target_pipelining(!cfg_.kld() && !embedding_,
+    pipelining_ = draft_experiment_.target_pipelining(!cfg_.kld() && !cfg_.calib() && !embedding_,
                               serial_drafting(), block_drafting(), cfg_.n_spec);
     early_ids_ = !cfg_.kld() && !embedding_;
+    /* A tree's acceptance moves K and V on the card behind the step issued ahead. The KL mode
+     * drafts nothing and an embedding model declares no drafter, so no server reaches this today;
+     * it keeps a tree from running unverified should another path turn pipelining off. */
+    if (tree_ && !pipelining_) {
+        RAD_ERR("speculation: drafter '%s' proposes trees, which are verified only on steps issued "
+                "ahead, and this server issues none; ask the plugin for a chain", drafter_.name);
+        return fail_loop(RAD_E_UNSUPPORTED);
+    }
     prefill_hash_init();
     /* RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP (read in serve()): only where steps are issued
      * ahead; without that no pass follows a reply's last token. */
@@ -1152,7 +1165,7 @@ int Engine::step_loop() {
             so.reqs.push_back(const_cast<Request*>(e.req));
         }
         so.n_rows = logit_row;
-        if (const int ss = stage_scored_rows(plan, so); ss < 0) return fail_loop(ss);
+        if (const int ss = stage_scored_rows(plan, so, cancel); ss < 0) return fail_loop(ss);
 
         /* The sampler's host work, run while the ranks enqueue (see build_mu_ in engine.h). It
          * touches only request state and host grammar automata; Sampler::run issues the uploads
@@ -1201,7 +1214,9 @@ int Engine::step_loop() {
         return RAD_OK;
         };
 
-        cancel.clear();
+        /* No clear here: `cancel` is empty when the step's staging begins (applied and cleared at
+         * the join below), and stage_scored_rows may already have filled it — a scored request
+         * whose pinned rows could not be allocated rides the same deferred path. */
         int bst = RAD_OK;
 
         /* RADIANCE_LOG_STEPS: one line per step with its phase and each sequence's slot, query
@@ -1321,46 +1336,11 @@ int Engine::step_loop() {
             return fail_loop(st);
         }
 
-        /* Snapshot after the step that produced the state: the chunker ended this chunk at the
-         * checkpoint position, so copy 0 holds exactly that state. The copy to the host slot is
-         * issued before collect_step's readback and before any step issued ahead, which orders the
-         * next write of the state after it. Under the scheduler's lock, as the restore. */
-        bool any_save = false;
-        for (const StepEntry& e : plan.e)
-            if (e.ckpt_slot >= 0 && e.ckpt_tok >= 0) { any_save = true; break; }
-        if (any_save) {
-            const int ss = sched_.locked([&]() -> int {
-                for (const StepEntry& e : plan.e) {
-                    if (e.ckpt_slot < 0 || e.ckpt_tok < 0) continue;
-                    if (!state_slots_of(e.seq, &ckpt_slots_)) continue;
-                    /* The window behind the checkpoint position. The chunk ending there still
-                     * holds it, so a miss is a broken invariant; skipping would commit a slot
-                     * holding another sequence's pages. */
-                    if (ranks_[0]->kv.has_window_snapshot() &&
-                        !ranks_[0]->kv.window_rows(e.seq, e.ctx_len + e.ckpt_tok + 1,
-                                                   &ckpt_win_)) {
-                        RAD_ERR("sequence %llu: the window behind checkpoint %d is not held",
-                                (unsigned long long)e.seq, (int)(e.ctx_len + e.ckpt_tok + 1));
-                        return RAD_E_STATE;
-                    }
-                    for (auto& rk : ranks_) {
-                        if (ranks_.size() > 1) (void)rad_dev_set(rk->device);
-                        const int s = rk->kv.checkpoint_save(ckpt_slots_.data(),
-                                                             (int)ckpt_slots_.size(),
-                                                             e.ckpt_slot, rk->ctx.stream(),
-                                                             &ckpt_win_);
-                        if (s < 0) {
-                            RAD_ERR("rank %d could not snapshot sequence %llu into checkpoint slot "
-                                    "%d: %s", rk->index, (unsigned long long)e.seq,
-                                    (int)e.ckpt_slot, rad_strerror(s));
-                            if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
-                            return s;
-                        }
-                    }
-                    if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
-                }
-                return RAD_OK;
-            });
+        /* Snapshot after the step that produced the state (save_checkpoints). Where a block
+         * drafter's window rides in the snapshot, its context pass must store the step's rows
+         * first, so the card's driver saves right behind that pass instead. */
+        if (!(block_drafting() && drafter_snap_)) {
+            const int ss = save_checkpoints();
             if (ss < 0) return fail_loop(ss);
         }
 
@@ -1435,6 +1415,7 @@ int Engine::step_loop() {
             res.lp        = so.lp.data();
             res.first_row = so.first_row.data();
         }
+        res.path = so.path.empty() ? nullptr : so.path.data();
         st = sched_.commit(res);
         if (t_on) phase_mark(PH_COMMIT);
         if (st < 0) { RAD_ERR("commit: %s", rad_strerror(st)); return fail_loop(st); }
@@ -1728,47 +1709,166 @@ int Engine::collect_pooled(const RadBatch* b, StepOut& so) {
     return RAD_OK;
 }
 
+/* Snapshot after the step that produced the state. Linear state is what the chunk's last token
+ * leaves, so the chunker ended the chunk at the checkpoint and copy 0 holds exactly that state; a
+ * window snapshot is the window's rows behind the checkpoint, which may lie inside the chunk
+ * (plan_chunk) and are still held when it ends. The copy to the host slot is issued before
+ * collect_step's readback and before any step issued ahead, which orders the next write of the
+ * state after it. Under the scheduler's lock, as the restore. A block drafter's window in the
+ * snapshot (drafter_snap_) is saved behind the drafter's context pass (issue_block_drafter),
+ * which writes only the drafter's groups. */
+int Engine::save_checkpoints() {
+    const StepPlan& plan = sched_.plan();
+    bool any_save = false;
+    for (const StepEntry& e : plan.e)
+        if (e.ckpt_slot >= 0 && e.ckpt_tok >= 0) { any_save = true; break; }
+    if (any_save) {
+        const int ss = sched_.locked([&]() -> int {
+            for (const StepEntry& e : plan.e) {
+                if (e.ckpt_slot < 0 || e.ckpt_tok < 0) continue;
+                if (!state_slots_of(e.seq, &ckpt_slots_)) continue;
+                /* The window behind the checkpoint position. This step's chunk reaches it, and
+                 * a window slides only from a step's first query, so a miss is a broken
+                 * invariant; skipping would commit a slot holding another sequence's pages. */
+                if (ranks_[0]->kv.has_window_snapshot() &&
+                    !ranks_[0]->kv.window_rows(e.seq, e.ctx_len + e.ckpt_tok + 1,
+                                               &ckpt_win_)) {
+                    RAD_ERR("sequence %llu: the window behind checkpoint %d is not held",
+                            (unsigned long long)e.seq, (int)(e.ctx_len + e.ckpt_tok + 1));
+                    return RAD_E_STATE;
+                }
+                for (auto& rk : ranks_) {
+                    if (ranks_.size() > 1) (void)rad_dev_set(rk->device);
+                    const int s = rk->kv.checkpoint_save(ckpt_slots_.data(),
+                                                         (int)ckpt_slots_.size(),
+                                                         e.ckpt_slot, rk->ctx.stream(),
+                                                         &ckpt_win_);
+                    if (s < 0) {
+                        RAD_ERR("rank %d could not snapshot sequence %llu into checkpoint slot "
+                                "%d: %s", rk->index, (unsigned long long)e.seq,
+                                (int)e.ckpt_slot, rad_strerror(s));
+                        if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
+                        return s;
+                    }
+                }
+                if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
+            }
+            return RAD_OK;
+        });
+        if (ss < 0) return ss;
+    }
+    return RAD_OK;
+}
+
 /* Scored rows (Request::token_scores): the logits row at a scored prompt's last position, copied
  * to the host before the sampler can rewrite it in place. stage_scored_rows picks the rows while
  * every rank is parked; issue_scored_rows copies one row per rank stream ahead of its sampler;
  * collect_scored_rows reads each request's ids after the step's wait, before the commit. A whole
- * row is copied (512 KB at a 128K vocabulary), which is cheaper than one copy per id. */
-int Engine::stage_scored_rows(const StepPlan& plan, const StepOut& so) {
+ * row is copied (512 KB at a 128K vocabulary), which is cheaper than one copy per id.
+ *
+ * The pinned host buffer is grow-only and its growth is the one part of staging that can fail
+ * on resources rather than on a broken program: then the scored requests are the ones cancelled
+ * (into `cancel`, applied the way the sampler's cancellations are), not the engine — a request
+ * whose scores the box cannot hold is that request's failure, and every other row on this step
+ * and every other connection on the server keeps running. */
+int Engine::stage_scored_rows(const StepPlan& plan, const StepOut& so,
+                              std::vector<uint64_t>& cancel) {
     score_rows_.clear();
+    score_only_ = false;
+    score_ids_.clear();
     if (embedding_) return RAD_OK;
+    std::vector<uint64_t> scored;
     for (size_t i = 0; i < plan.e.size(); ++i) {
         const Request* r = plan.e[i].req;
         if (so.first_row[i] < 0 || !r || !r->token_scores || !r->output.empty()) continue;
         score_rows_.push_back({ so.first_row[i], r->token_scores.get() });
+        scored.push_back(r->id);
     }
     if (score_rows_.empty()) return RAD_OK;
     const int64_t n = (int64_t)score_rows_.size();
+
+    /* A scored step reads back the hidden rows and the candidates' table rows instead of whole
+     * logits rows (BatchBuilder set the flag on the same facts). */
+    const RadBatch* b0 = sched_.batch_for(0);
+    score_only_ = b0 && b0->score_only;
+    if (score_only_) {
+        const Program& p = ranks_[0]->program;
+        score_embd_ = p.buffers[p.score_hidden].decl.shape[1];
+        for (const auto& sr : score_rows_)
+            for (int32_t t : sr.second->tokens) score_ids_.push_back(t);
+        std::sort(score_ids_.begin(), score_ids_.end());
+        score_ids_.erase(std::unique(score_ids_.begin(), score_ids_.end()), score_ids_.end());
+    }
+    bool host_failed = false;
+    int64_t failed_rows = 0;
     for (auto& rk : ranks_) {
-        if (n <= rk->score_rows_cap) continue;
+        const int64_t width = rk->sampler.config().n_vocab_local;
+        /* In floats: n logits rows, or the bf16 hidden and table rows of a scored step. */
+        int64_t rows = n;
+        if (score_only_) {
+            const int64_t need = ((n + (int64_t)score_ids_.size()) * score_embd_ + 1) / 2;
+            rows = std::max(rows, (need + width - 1) / width);
+        }
+        if (rows <= rk->score_rows_cap) continue;
         if (ranks_.size() > 1) RAD_TRY(rad_dev_set(rk->device));
         if (rk->score_host) rad_dev_free(rk->score_host, RAD_MEM_HOST_PINNED);
-        const int64_t width = rk->sampler.config().n_vocab_local;
         rk->score_host = static_cast<float*>(
-            rad_dev_alloc(n * width * (int64_t)sizeof(float), RAD_MEM_HOST_PINNED));
-        rk->score_rows_cap = rk->score_host ? n : 0;
-        if (!rk->score_host) {
-            RAD_ERR("scored rows: no pinned memory for %lld logits rows", (long long)n);
-            return RAD_E_NOMEM;
-        }
+            rad_dev_alloc(rows * width * (int64_t)sizeof(float), RAD_MEM_HOST_PINNED));
+        rk->score_rows_cap = rk->score_host ? rows : 0;
+        if (!rk->score_host) { host_failed = true; failed_rows = rows; break; }
     }
     if (ranks_.size() > 1) RAD_TRY(rad_dev_set(ranks_[0]->device));
+    if (host_failed) {
+        RAD_ERR("scored rows: no pinned memory for %lld logits rows; cancelling the scored "
+                "requests, not the engine", (long long)failed_rows);
+        cancel.insert(cancel.end(), scored.begin(), scored.end());
+        score_rows_.clear();
+        score_only_ = false;
+        score_ids_.clear();
+    }
     return RAD_OK;
 }
 
 int Engine::issue_scored_rows(Rank& r) {
     const int64_t width = r.sampler.config().n_vocab_local;
-    const char* logits = static_cast<const char*>(r.ctx.buf_ptr(r.program.logits_buf));
+    char* const logits = static_cast<char*>(r.ctx.buf_ptr(r.program.logits_buf));
     if (!logits || !r.score_host) return RAD_E_STATE;
+    if (score_only_) {
+        /* The plugin left the hidden rows and ran no lm_head: read back each scored row's hidden
+         * state and the table rows its candidates name, then zero the logits rows the sampler is
+         * about to read, so the token it draws (and the caller discards) is drawn from defined
+         * values. One rank (BatchBuilder). */
+        const int64_t rb = score_embd_ * (int64_t)sizeof(uint16_t);
+        const char* hid = static_cast<const char*>(r.ctx.buf_ptr(r.program.score_hidden));
+        const char* tab = static_cast<const char*>(r.ctx.weight_ptr(r.program.score_table));
+        if (!hid || !tab) return RAD_E_STATE;
+        char* host = reinterpret_cast<char*>(r.score_host);
+        const int64_t n = (int64_t)score_rows_.size();
+        for (int64_t k = 0; k < n; ++k)
+            RAD_TRY(rad_memcpy_async(host + k * rb, hid + (int64_t)score_rows_[(size_t)k].first * rb,
+                                     rb, r.ctx.stream()));
+        for (size_t j = 0; j < score_ids_.size(); ++j)
+            RAD_TRY(rad_memcpy_async(host + (n + (int64_t)j) * rb, tab + (int64_t)score_ids_[j] * rb,
+                                     rb, r.ctx.stream()));
+        return rad_memset_async(logits, 0, n * width * (int64_t)sizeof(float), r.ctx.stream());
+    }
     for (size_t k = 0; k < score_rows_.size(); ++k)
         RAD_TRY(rad_memcpy_async(r.score_host + (int64_t)k * width,
                                  logits + (int64_t)score_rows_[k].first * width * 4,
                                  width * 4, r.ctx.stream()));
     return RAD_OK;
+}
+
+/* A scored step's logits: the dot product of a row's hidden state with each candidate's table row,
+ * bf16 operands widened exactly and summed in f64, then rounded once to f32. */
+static float score_dot(const uint16_t* h, const uint16_t* w, int64_t n) {
+    double acc = 0.0;
+    for (int64_t i = 0; i < n; ++i) {
+        const float a = __builtin_bit_cast(float, (uint32_t)h[i] << 16);
+        const float b = __builtin_bit_cast(float, (uint32_t)w[i] << 16);
+        acc += (double)a * (double)b;
+    }
+    return (float)acc;
 }
 
 int Engine::collect_scored_rows() {
@@ -1779,6 +1879,23 @@ int Engine::collect_scored_rows() {
         RAD_TRY(rad_stream_sync(ranks_[i]->ctx.stream()));
     }
     if (ranks_.size() > 1) RAD_TRY(rad_dev_set(ranks_[0]->device));
+    if (score_only_) {
+        const uint16_t* host = reinterpret_cast<const uint16_t*>(ranks_[0]->score_host);
+        const int64_t n = (int64_t)score_rows_.size();
+        for (int64_t k = 0; k < n; ++k) {
+            TokenScores& ts = *score_rows_[(size_t)k].second;
+            ts.logits.assign(ts.tokens.size(), 0.0f);
+            for (size_t j = 0; j < ts.tokens.size(); ++j) {
+                const auto it = std::lower_bound(score_ids_.begin(), score_ids_.end(), ts.tokens[j]);
+                const int64_t c = it - score_ids_.begin();
+                ts.logits[j] = score_dot(host + k * score_embd_, host + (n + c) * score_embd_,
+                                         score_embd_);
+            }
+        }
+        score_rows_.clear();
+        score_only_ = false;
+        return RAD_OK;
+    }
     for (size_t k = 0; k < score_rows_.size(); ++k) {
         TokenScores& ts = *score_rows_[k].second;
         ts.logits.assign(ts.tokens.size(), 0.0f);
@@ -1799,10 +1916,11 @@ int Engine::collect_scored_rows() {
 /* One sampled row's logprobs into the step's table, sized on first use. A non-finite row
  * (RAD_E_INVAL) is left at token -1, and the scheduler fails only that request. A row outside the
  * step, or never staged for logprobs, is an engine error. */
-int Engine::row_logprobs(StepOut& so, int32_t row, int32_t token) {
+int Engine::row_logprobs(StepOut& so, int32_t row, int32_t token, int32_t at) {
     if (so.lp.empty()) so.lp.resize((size_t)so.n_rows);
-    if (row < 0 || row >= so.n_rows) return RAD_E_STATE;
-    TokenLogprobs& lp = so.lp[(size_t)row];
+    if (at < 0) at = row;
+    if (row < 0 || row >= so.n_rows || at >= so.n_rows) return RAD_E_STATE;
+    TokenLogprobs& lp = so.lp[(size_t)at];
     const int s = ranks_[0]->sampler.logprobs_for(row, token, &lp);
     if (s == RAD_E_INVAL) { lp = TokenLogprobs{}; return RAD_OK; }
     return s;
@@ -1816,6 +1934,7 @@ int Engine::collect_step(const RadBatch* b, StepOut& so) {
     so.accepted.assign(plan.e.size(), 0);
     so.eos.assign(plan.e.size(), 0);
     so.lp.clear();
+    so.path.clear();
     if (so.n_rows <= 0) return RAD_OK;
 
     so.rows.resize((size_t)so.n_rows);
@@ -1866,7 +1985,16 @@ int Engine::collect_step(const RadBatch* b, StepOut& so) {
             if (!e.req) continue;
             int32_t out[RAD_SCHED_MAX_SPEC + 1] = { 0 };
             int32_t acc = 0;
-            RAD_TRY(accept_greedy(e.draft, e.n_spec, &so.rows[(size_t)so.first_row[i]], out, &acc));
+            /* A tree step verifies every proposal as a tree (a chain one as the chain-shaped
+             * tree), as the card's acceptance does; `path` names the accepted nodes. */
+            int32_t path[RAD_SCHED_MAX_SPEC] = { 0 };
+            const bool tree = plan.spec_is_tree;
+            if (tree)
+                RAD_TRY(accept_tree(e.draft, e.draft_parent, e.n_spec,
+                                    &so.rows[(size_t)so.first_row[i]], out, path, &acc));
+            else
+                RAD_TRY(accept_greedy(e.draft, e.n_spec, &so.rows[(size_t)so.first_row[i]], out,
+                                      &acc));
 
             /* Truncated at the first end-of-generation token, so `accepted` and `token` (which
              * drive the KV rollback, the conv cursor and the emitted text) say how far the step
@@ -1877,11 +2005,19 @@ int Engine::collect_step(const RadBatch* b, StepOut& so) {
             so.accepted[i] = acc;
             so.token[i]    = out[acc];
             so.eos[i]      = vocab_ && vocab_->is_eog(so.token[i]) ? 1 : 0;
+            if (tree) {
+                if (so.path.empty()) so.path.assign(plan.e.size() * RAD_SCHED_MAX_SPEC, 0);
+                for (int32_t t = 0; t < acc; ++t) so.path[i * RAD_SCHED_MAX_SPEC + t] = path[t];
+            }
             /* Each emitted token's logprobs come from its own row, the distribution it was drawn
-             * from. */
+             * from: on a tree, the row of the node it follows. They are filed as the entry's j-th
+             * emitted token (StepResult::lp), whichever row they came from. */
             if (e.req && e.req->sp.n_probs >= 0)
-                for (int32_t j = 0; j <= acc; ++j)
-                    RAD_TRY(row_logprobs(so, so.first_row[i] + j, out[j]));
+                for (int32_t j = 0; j <= acc; ++j) {
+                    const int32_t from = tree && j > 0 ? path[j - 1] : j;
+                    RAD_TRY(row_logprobs(so, so.first_row[i] + from, out[j],
+                                         so.first_row[i] + j));
+                }
             /* Advance the grammar over every emitted token, accepted drafts included, up to the
              * truncated `acc`, so it sees exactly what the client sees. */
             if (e.req)
@@ -2573,11 +2709,11 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
     for (int i = 0; i < cfg_.tp; ++i) rank_threads_.emplace_back([this, i] { rank_loop(i); });
     std::thread stepper([this] { if (gen_) gen_loop(); else step_loop(); });
 
-    if (cfg_.kld()) {
+    if (cfg_.kld() || cfg_.calib()) {
         print_startup_report(RAD_OK);
         startup_watch_.reset();
     }
-    int s = cfg_.kld() ? run_kld() : run_server();
+    int s = cfg_.kld() ? run_kld() : cfg_.calib() ? run_calib() : run_server();
     startup_watch_.reset();
 
     /* Stop the step loop before the server's storage is destroyed: Request::sink points into it,
@@ -2926,8 +3062,8 @@ int Engine::run_server() {
                 s.experts.n_experts = n_expert;
                 s.experts.tier.assign((size_t)n_layer * (size_t)n_expert, (uint8_t)Tier::VRAM);
                 /* The live tier when the heat engine runs, else the plan's (where a unit started).
-                 * HeatEngine::tier is a plain vector written by the dispatch thread at step
-                 * boundaries, so a racing read sees either side of a single store. */
+                 * tier_published is the HTTP-readable mirror HeatEngine::set_tier keeps; reading
+                 * the dispatch thread's own tier_ here would be a data race. */
                 const HeatEngine& heat = ranks_[0]->heat;
                 const bool live_tier = heat.enabled();
                 s.experts.heat_enabled = live_tier;
@@ -2936,7 +3072,7 @@ int Engine::run_server() {
                 for (size_t u = 0; u < p.units.size(); ++u) {
                     const MoveUnit& mu = p.units[u];
                     if (mu.expert < 0 || mu.layer < 0) continue;
-                    const Tier t = live_tier ? heat.tier((int32_t)u) : mu.tier;
+                    const Tier t = live_tier ? heat.tier_published((int32_t)u) : mu.tier;
                     s.experts.tier[(size_t)mu.layer * (size_t)n_expert + (size_t)mu.expert]
                         = (uint8_t)t;
                     /* Count residency over units, not plane cells: the plane is a rectangle a
@@ -3005,17 +3141,38 @@ int Engine::run_server() {
             s.link.h2d_bytes = s.link.d2h_bytes = s.link.ssd_reads = 0;
             s.link.ssd_bytes = s.link.prefetched = s.link.prefetch_bytes = 0;
             s.link.stream_bytes = s.link.staged_bytes = 0;
+            s.link.ssd_staging_bytes = s.link.ssd_promoted_bytes = 0;
+            s.link.ssd_deposits = s.link.ssd_deposit_bytes = 0;
+            s.link.pool_evictions = 0;
+            s.link.kv_stream_bytes = 0;
+            s.link.kv_streaming = cfg_.kv_resident > 0;   /* zeroed here if the arch refused it */
+            /* The ring's depth, not the flag: KVStreamStats::resident_blocks sums the device pool
+             * of every group that really runs a window under its context, so this is zero when
+             * --kv-resident was asked for and nothing streams anyway. */
+            s.link.kv_stream_active = ranks_[0]->kv.stream_stats().resident_blocks > 0;
             for (const auto& rk : ranks_) {
                 const MoverStats rms = rk->mover.stats();
                 s.link.h2d_bytes      += (int64_t)rms.h2d_bytes;
                 s.link.d2h_bytes      += (int64_t)rms.d2h_bytes;
                 s.link.ssd_reads      += (int64_t)rms.ssd_reads;
                 s.link.ssd_bytes      += (int64_t)rms.ssd_bytes;
+                s.link.ssd_staging_bytes += (int64_t)rms.ssd_staging_bytes;
+                s.link.ssd_promoted_bytes += (int64_t)rms.ssd_promoted_bytes;
+                s.link.ssd_deposits    += (int64_t)rms.ssd_deposits;
+                s.link.ssd_deposit_bytes += (int64_t)rms.ssd_deposit_bytes;
+                s.link.pool_evictions   += (int64_t)rms.pool_evictions;
                 s.link.prefetched     += (int64_t)rms.prefetched;
                 s.link.prefetch_bytes += (int64_t)rms.prefetch_bytes;
                 s.link.staged_bytes   += (int64_t)rms.staged_bytes;
                 if (rk->heat.enabled()) s.link.stream_bytes += (int64_t)rk->heat.stats().stream_bytes;
             }
+            /* KV streaming: only rank 0's resolve counters are read -- every rank sees the same
+             * misses by design -- so the figure takes the world factor to reach all cards, the
+             * way the summed move rows sit there. The counters ride the step's ctl read; nothing
+             * here costs a step. */
+            if (s.link.kv_streaming)
+                s.link.kv_stream_bytes =
+                    (int64_t)ranks_[0]->kv.stream_stats().bytes_in * (int64_t)ranks_.size();
         }
     };
 
@@ -3024,6 +3181,7 @@ int Engine::run_server() {
     d.tok   = &tok_bridge;
     d.grammar = &grammar_bridge;
     d.live  = snap;
+    d.stuck_ms = [] { return dev_stuck_ms(); };
     /* The control vector, when one was found. The admin endpoint flips the
      * default through this; nothing rebuilds a graph, so a toggle takes effect on the next request
      * and leaves the running ones alone. */
@@ -3055,11 +3213,19 @@ int Engine::run_server() {
             return v ? std::string(v) : std::string();
         }
         server::IChatTemplate* message_template() const override { return tpl; }
+        const RadModelMeta* metadata() const override { return meta; }
     } embed_info;
     embed_info.d = pooled_dim_;
     embed_info.n = cfg_.max_tok;
     embed_info.meta = &meta_;
     if (embedding_) d.embed = &embed_info;
+    std::string embed_why;
+    const int embed_rc = server::check_embedding_template(
+        d.embed, !cfg_.override_chat_template.empty(), &embed_why);
+    if (embed_rc < 0) {
+        RAD_ERR("%s", embed_why.c_str());
+        return embed_rc;
+    }
 
     /* The template loader warns on its own about a missing or broken template; this only decides
      * whether the chat endpoint exists. The reply format is the architecture plugin's when it
@@ -3085,11 +3251,49 @@ int Engine::run_server() {
     o.audio_model = aud_gen_ != nullptr;
     o.video_model = vid_gen_ != nullptr;
     o.decision_type = rad_meta_gets(&meta_, "decision.type", "");
+    /* clef's learned scalars, which the server applies to what the head returns (server/clef.h);
+     * rad-convert writes them beside decision.type. */
+    if (o.decision_type == "clef") {
+        const char* const keys[3] = { "decision.clef.prior_logit_scale",
+                                      "decision.clef.joint_logit_scale",
+                                      "decision.clef.residual_gate" };
+        o.clef_scalars = true;
+        for (const char* k : keys) o.clef_scalars = o.clef_scalars && rad_meta_gets(&meta_, k, nullptr);
+        o.clef_prior_logit_scale = rad_meta_getf(&meta_, keys[0], 0.0);
+        o.clef_joint_logit_scale = rad_meta_getf(&meta_, keys[1], 0.0);
+        o.clef_residual_gate     = rad_meta_getf(&meta_, keys[2], 0.0);
+    }
+    /* Laya's sequence lengths, special tokens and fitted temperatures, which the server builds
+     * and reads each question with (server/laya.h); rad-convert writes them from the checkpoint's
+     * rl_agent_config.json and tokenizer/. */
+    /* Mica's calibration: one temperature, and a bias on a noul's true logit (server/mica.h). */
+    if (o.decision_type == "mica") {
+        o.mica.temperature     = rad_meta_getf(&meta_, "decision.mica.temperature", 1.0);
+        o.mica.noul_logit_bias = rad_meta_getf(&meta_, "decision.mica.noul_logit_bias", 0.0);
+    }
+    if (o.decision_type == "laya") {
+        server::LayaSettings& l = o.laya;
+        l.max_len      = rad_meta_geti(&meta_, "decision.laya.max_len", 0);
+        l.head_max_len = rad_meta_geti(&meta_, "decision.laya.head_max_len", 0);
+        l.cls  = (int32_t)rad_meta_geti(&meta_, "decision.laya.cls", -1);
+        l.sep  = (int32_t)rad_meta_geti(&meta_, "decision.laya.sep", -1);
+        l.mask = (int32_t)rad_meta_geti(&meta_, "decision.laya.mask", -1);
+        l.mask_token = rad_meta_gets(&meta_, "decision.laya.mask_token", "");
+        std::sscanf(rad_meta_gets(&meta_, "decision.laya.temperature", "1 1 1"), "%lf %lf %lf",
+                    &l.temperature[0], &l.temperature[1], &l.temperature[2]);
+        const std::string tbo = "decision.laya.temperature_by_options.";
+        for (int i = 0; i < meta_.n_kv; ++i)
+            if (std::strncmp(meta_.kv_key[i], tbo.c_str(), tbo.size()) == 0)
+                l.temperature_by_options[meta_.kv_key[i] + tbo.size()] = std::strtod(meta_.kv_val[i], nullptr);
+    }
+    o.plugin_words = ranks_.empty() ? 0 : ranks_[0]->program.plugin_words;
     o.model_id = !cfg_.served_model_name.empty() ? cfg_.served_model_name
                : meta_.name && *meta_.name       ? meta_.name : "radiance";
     o.host     = cfg_.host;
     o.port     = cfg_.port;
     o.api_key  = cfg_.api_key;
+    o.local_hosts = cfg_.allow_hosts;
+    o.trusted_proxies = cfg_.trusted_proxies;
     o.max_seqs = cfg_.max_seqs;
     /* `n` fans one request out over the batch, so the default scales with --max-num-seqs; the
      * floor of 8 keeps a small batch from refusing what it would queue. */
@@ -3456,10 +3660,23 @@ int Engine::run_server() {
         int64_t queued() const override { return drv->queued(); }
         int64_t running() const override { return drv->running(); }
     } image_bridge;
+    if (!img_gen_ && (cfg_.image_gen_max_pixels > 0 || cfg_.image_gen_max_refs > 0))
+        RAD_WARN("--image-gen-max-pixels / --image-gen-max-refs: this model makes no images; "
+                 "ignored");
     if (img_gen_) {
         const Program& pg = ranks_[0]->program;
         const RadGeneratorDecl& gd = pg.generator;
         server::ImageGenInfo& in = image_bridge.inf;
+        /* The bounds are the plugin's to apply: one that keeps fixed buffers is named. */
+        const int64_t px = gd.max_tokens * gd.latent_scale * gd.latent_scale;
+        if (cfg_.image_gen_max_pixels > 0 && px > cfg_.image_gen_max_pixels)
+            RAD_WARN("--image-gen-max-pixels %lld: '%s' sizes its buffers for %lld pixels and does "
+                     "not take the bound", (long long)cfg_.image_gen_max_pixels,
+                     pg.gen_str.name.c_str(), (long long)px);
+        if (cfg_.image_gen_max_refs > 0 && gd.max_refs > cfg_.image_gen_max_refs)
+            RAD_WARN("--image-gen-max-refs %lld: '%s' takes %lld reference pictures and does not "
+                     "take the bound", (long long)cfg_.image_gen_max_refs, pg.gen_str.name.c_str(),
+                     (long long)gd.max_refs);
         in.name = pg.gen_str.name;
         in.tmpl_text = pg.gen_str.tmpl_text;
         in.tmpl_edit = pg.gen_str.tmpl_edit;

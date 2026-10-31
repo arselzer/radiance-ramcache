@@ -209,7 +209,10 @@ class Stream:
             p = urllib.parse.urlsplit(self.url)
             need(p.scheme in ("http", "https") and not p.query and not p.fragment, "invalid server URL")
             cls = http.client.HTTPSConnection if p.scheme == "https" else http.client.HTTPConnection
-            conn = cls(p.hostname, p.port, timeout=15)
+            # A queued prefill or a synchronous bank transition can delay the
+            # first SSE chunk. run_probe still owns its overall bounded deadline
+            # and closes every stream on failure/cancellation.
+            conn = cls(p.hostname, p.port, timeout=240)
             with self.lock:
                 self.connection = conn
                 self.result["submitted_s"] = self.clock()

@@ -542,6 +542,9 @@ set_tests_properties(ab_window_ag_test PROPERTIES LABELS "unit;fast" TIMEOUT ${R
 add_test(NAME ab_window_shared_test COMMAND bash ${CMAKE_SOURCE_DIR}/tools/ds41-host-experts/ab_window_shared_test.sh)
 set_tests_properties(ab_window_shared_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT}
                      ENVIRONMENT "ROCR_VISIBLE_DEVICES=99")
+add_test(NAME ab_window_kv_test COMMAND bash ${CMAKE_SOURCE_DIR}/tools/ds41-host-experts/ab_window_kv_test.sh)
+set_tests_properties(ab_window_kv_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT}
+                     ENVIRONMENT "ROCR_VISIBLE_DEVICES=99")
 
 # ================================================================== libr4d's kernels, on the host
 #

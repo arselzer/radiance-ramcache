@@ -24,6 +24,12 @@
 # Rb (the routers read as bf16) are also checked in the server log, and so is a predictor part's
 # router predictor. An Rb arm runs only after SELFTEST_F32BF16's card checks passed in the window,
 # and a Vp arm only on a libr4d.so VPACK_CHECK passed (below).
+# Kvfp4 selects exact packed main/index KV (window/raw state unchanged); Kvfast requires Kvfp4.
+# Both flags reset to0 in EVERY arm. Before any packed arm, KV_CODEC_CHECK and KV_PATHS_CHECK
+# must pass freshly on its full served library SHA in unpinned/EXACT_TALL1/LCP2048+N1281 processes.
+# Kvfast additionally needs KV_FAST_CHECK and FAST1 packed-path receipts in all three profiles.
+# KV_COHORT_MANIFEST binds the exact engine/architecture/libref/library/checker hashes; see
+# kv_cohort_key's schema. Neither packed feature may supply the KLD reference.
 # Fn128 selects the default-off n128 fused index-key norm. It needs DEVICE_CHECKS=n128,
 # N128_CHECK_BIN (ds41_n128_device_check) and N128_CHECK_LIB, with the card oracle through M4096
 # passing on the arm's library SHA. Every normal rank must actually dispatch the fast kernel.
@@ -172,6 +178,8 @@ SILU=${SILU_TABLE:?the card silu table}
 ARMS=${ARMS-"base verify greedy"}
 HX_THREADS=${HX_THREADS:-16}
 VERIFY_REQUESTS=${VERIFY_REQUESTS:-3}
+# Arm parts alone authorize packed formats/readers; global settings must not leak into any check.
+export RADIANCE_EXPERIMENTAL_DS41_KV_PACKED=0 RADIANCE_EXPERIMENTAL_DS41_KV_PACKED_FAST=0
 HERE=$(cd "$(dirname "$0")" && pwd)
 R=/home/as/radiance-setup/research/deepseek-v41-1017-20261024
 MODEL=$R/native-models/ds41-native-mxfp4-v3-20261027T121600Z/model.rad
@@ -266,6 +274,7 @@ restore() {
   trap '' INT TERM HUP
   [[ -n "${RESTORED:-}" ]] && return 0
   RESTORED=1
+  KV_WINDOW_ACTIVE=0 KV_PROOFS_OPEN=0
   stop_server
   power_restore
   log "restoring $NAME"
@@ -468,6 +477,201 @@ n128_arm_gate() {   # library, conservative work-row bound; receipt is set by th
   return 0
 }
 
+# Kvfp4: exact original-code main/index pages; Kvfast: optional integer reader, requires Kvfp4.
+# No binary is probed/dlopen'd before QFN stops. KV_COHORT_MANIFEST is an explicit build-owner
+# receipt, not inferred source/ABI authority: header ds41-kv-cohort-v1, then exactly one each of
+# source_commit(40hex), engine/architecture/libref/library/codec_checker/paths_checker(64hex),
+# fast_checker(64hex or none). The engine's real ABI loader and per-rank paths remain mandatory.
+kv_cohort_key() {   # run homes, served library, fast0/1; full manifest hash on stdout
+  local home=$1 lib=$2 fast=$3 key value extra h path actual
+  local -a homes=()
+  local -A expected=() files=()
+  [[ ( $fast == 0 || $fast == 1 ) && -f ${KV_COHORT_MANIFEST:-} && -f $lib && -x ${BIN:-} && -x ${KV_CODEC_CHECK:-} && -x ${KV_PATHS_CHECK:-} ]] || return 1
+  [[ $(head -1 "$KV_COHORT_MANIFEST") == ds41-kv-cohort-v1 ]] || return 1
+  while read -r key value extra; do
+    [[ -n $key && -n $value && -z ${extra:-} ]] || return 1
+    case $key in
+      source_commit) [[ $value =~ ^[0-9a-f]{40}$ ]] || return 1 ;;
+      engine|architecture|libref|library|codec_checker|paths_checker) [[ $value =~ ^[0-9a-f]{64}$ ]] || return 1 ;;
+      fast_checker) [[ $value == none || $value =~ ^[0-9a-f]{64}$ ]] || return 1 ;;
+      *) return 1 ;;
+    esac
+    [[ -z ${expected[$key]+present} ]] || return 1
+    expected[$key]=$value
+  done < <(tail -n +2 "$KV_COHORT_MANIFEST")
+  [[ ${#expected[@]} == 8 ]] || return 1
+  files[engine]=$BIN files[library]=$lib files[codec_checker]=$KV_CODEC_CHECK files[paths_checker]=$KV_PATHS_CHECK
+  IFS=: read -r -a homes <<< "$home"
+  for key in architecture libref; do
+    path=architectures/deepseek41.so; [[ $key == libref ]] && path=kernels/libref.so
+    for h in "${homes[@]}"; do [[ -f $h/$path ]] && { files[$key]=$h/$path; break; }; done
+    [[ -n ${files[$key]:-} ]] || return 1
+  done
+  if [[ ${expected[fast_checker]} != none ]]; then
+    [[ -x ${KV_FAST_CHECK:-} ]] || return 1
+    files[fast_checker]=$KV_FAST_CHECK
+  elif [[ $fast == 1 ]]; then return 1; fi
+  for key in "${!files[@]}"; do
+    actual=$(sha256sum "${files[$key]}" 2>/dev/null | cut -d' ' -f1)
+    [[ $actual == "${expected[$key]}" ]] || return 1
+  done
+  sha256sum "$KV_COHORT_MANIFEST" | cut -d' ' -f1
+}
+
+kv_server_gate() {   # log, packed flag, fast flag, start/exit, attending ranks (TP4)
+  local f=$1 on=${2:-0} fast=${3:-0} stage=${4:-exit} ranks=${5:-4} r count line re old=0 modern=0 kind bytes role decoder
+  [[ -f $f && $ranks == 4 && ( $stage == start || $stage == exit ) && ( $on == 0 || $on == 1 ) && ( $fast == 0 || $fast == 1 ) ]] || return 1
+  if [[ $on == 0 ]]; then
+    ! grep -qF 'KV_PACKED' "$f" || { echo 'no Kvfp4 part, but packed KV was enabled/logged'; return 1; }
+    [[ $fast == 0 ]] || return 1
+    return 0
+  fi
+  [[ $(grep -c '^radiance: deepseek41: KV_PACKED rank=' "$f") == "$ranks" ]] || { echo 'packed startup rank count/duplicates'; return 1; }
+  for ((r=0;r<ranks;++r)); do
+    line=$(grep -E "^radiance: deepseek41: KV_PACKED rank=$r " "$f")
+    re="^radiance: deepseek41: KV_PACKED rank=$r zero=0( fast=$fast)? latent_format=1 row_bytes=288 groups=2 index_format=2 row_bytes=68 groups=2; BF16 reader math, plain window/F32 tail$"
+    [[ $line =~ $re ]] || { echo "rank$r lacks exact native packed startup geometry/decoder"; return 1; }
+    if [[ $line == *' fast='* ]]; then modern=$((modern+1)); else old=$((old+1)); fi
+  done
+  [[ $old == 0 || ( $old == 4 && $fast == 0 ) ]] || { echo 'mixed/legacy startup cannot prove requested decoder'; return 1; }
+  [[ $stage == start ]] && return 0
+  [[ $stage == exit && $(grep -c '^\[r4d\] ds41 KV_PACKED active rank=' "$f") == 16 ]] || { echo 'packed actual-path count/duplicates'; return 1; }
+  for ((r=0;r<ranks;++r)); do
+    for count in '1 288' '2 68'; do
+      read -r kind bytes <<< "$count"
+      [[ $(grep -Fxc "[r4d] ds41 KV_PACKED active rank=$r role=entry_store format=$kind row_bytes=$bytes" "$f") == 1 ]] || { echo "rank$r lacks one store for format$kind"; return 1; }
+    done
+    for count in 'index_score 2 68' 'attention 1 288'; do
+      read -r role kind bytes <<< "$count"
+      decoder='( decoder=reference)?'; [[ $modern == 4 ]] && decoder=' decoder=reference'
+      [[ $fast == 1 ]] && decoder=' decoder=integer-fast'
+      re="^\[r4d\] ds41 KV_PACKED active rank=$r role=$role format=$kind row_bytes=$bytes dispatch=original${decoder} M=[1-9][0-9]*$"
+      [[ $(grep -Ec "$re" "$f") == 1 ]] || { echo "rank$r lacks one normal $role dispatch for requested decoder"; return 1; }
+    done
+  done
+}
+
+kv_tool_receipt_ok() {   # captured tool section, codec/paths/fast, fast mode
+  local body=$1 tool=$2 mode=$3 line re normal pair ftz hp hn
+  [[ ( $tool == codec && $mode == 0 ) || ( $tool == paths && ( $mode == 0 || $mode == 1 ) ) || ( $tool == fast && $mode == 1 ) ]] || return 1
+  ! grep -Eq '(^|[[:space:]])(FAIL|SKIP|skip)([[:space:]:]|$)' <<< "$body" || return 1
+  if [[ $tool == fast ]]; then
+    [[ $(grep -Fxc 'PASS ds41 fast codec vs reference: normal=131072 pair=131072 rows=256 metadata=1 bad=0' <<< "$body") == 1 ]] || return 1
+    [[ $(grep -c '^PASS' <<< "$body") == 1 ]] || return 1
+    return 0
+  fi
+  line=$(grep '^PASS codec-domain:' <<< "$body")
+  re='^PASS codec-domain: 382 groups, normal([0-9]+) pair([0-9]+) half-ftz([0-9]+) raw0 bad0; actual minimum half bits \+([0-9a-f]{4}) -([0-9a-f]{4})$'
+  [[ $line =~ $re ]] || return 1
+  normal=${BASH_REMATCH[1]} pair=${BASH_REMATCH[2]} ftz=${BASH_REMATCH[3]} hp=${BASH_REMATCH[4]} hn=${BASH_REMATCH[5]}
+  [[ $normal =~ ^(378|379)$ && $pair == 3 && $ftz =~ ^[01]$ ]] || return 1
+  (( normal + pair + ftz == 382 && pair == 3 && (ftz == 0 || ftz == 1) )) || return 1
+  [[ ( $ftz == 0 && $hp == 0040 && $hn == 8040 ) || ( $ftz == 1 && $hp == 0000 && $hn == 8000 ) ]] || return 1
+  [[ $(grep -Fxc 'PASS producer+packed-store: 0 uint16/guard differences' <<< "$body") == 1 ]] || return 1
+  [[ $(grep -Fxc 'PASS producer+packed-store coverage: cases=20 kinds=1,2 blocks=1,2 M=1,7,33,257,512 exhaustive_bf16=65536' <<< "$body") == 1 ]] || return 1
+  if [[ $tool == paths ]]; then
+    [[ $(grep -Fxc 'PASS packed reader normal/scalar6/decode7/WMMA: 504 cases 0 byte failures' <<< "$body") == 1 ]] || return 1
+    [[ $(grep -Fxc 'PASS packed fused rope/norm old+n128: 28 cases 0 byte failures' <<< "$body") == 1 ]] || return 1
+    [[ $(grep -Fxc 'PASS packed fused coverage: cases=28 max_M=4096 heights=1,7,33,49,257,2048,4096 norm_forms=normal,old,n128 rope=normal' <<< "$body") == 1 ]] || return 1
+    [[ $(grep -c '^PASS' <<< "$body") == 6 ]] || return 1
+    [[ $(grep -Ec '^\[r4d\] ds41 KV_PACKED active rank=.* role=(index_score|attention) ' <<< "$body") == 2 ]] || return 1
+    local decoder='( decoder=reference)?' role format bytes
+    [[ $mode == 1 ]] && decoder=' decoder=integer-fast'
+    for role in index_score attention; do
+      format=2 bytes=68; [[ $role == attention ]] && { format=1; bytes=288; }
+      re="^\[r4d\] ds41 KV_PACKED active rank=0 role=$role format=$format row_bytes=$bytes dispatch=original${decoder} M=[1-9][0-9]*$"
+      [[ $(grep -Ec "$re" <<< "$body") == 1 ]] || return 1
+    done
+  else [[ $tool == codec && $(grep -c '^PASS' <<< "$body") == 3 ]] || return 1; fi
+}
+
+kv_receipt_ok() {   # receipt, full library hash, cohort hash, fast0/1; nonce prevents stale-window reuse
+  local f=$1 sum=$2 cohort=$3 mode=$4 profile tool body begin end count=6
+  [[ -f $f && $sum =~ ^[0-9a-f]{64}$ && $cohort =~ ^[0-9a-f]{64}$ && -n ${KV_WINDOW_TOKEN:-} && ( $mode == 0 || $mode == 1 ) ]] || return 1
+  [[ $(grep -Fxc "kv receipt v1 token=$KV_WINDOW_TOKEN lib=$sum cohort=$cohort fast=$mode" "$f") == 1 ]] || return 1
+  [[ $(grep -Fxc "kv finished token=$KV_WINDOW_TOKEN lib=$sum cohort=$cohort fast=$mode" "$f") == 1 ]] || return 1
+  [[ $(grep -Fxc 'kv exit 0' "$f") == 1 ]] || return 1
+  [[ $(grep -c '^kv begin ' "$f") == $count && $(grep -c '^kv end ' "$f") == $count ]] || return 1
+  ! grep -Eq '(^|[[:space:]])(FAIL|SKIP|skip)([[:space:]:]|$)|^kv .*exit=[1-9]|^kv exit [1-9]' "$f" || return 1
+  for profile in unpinned exact lcp; do
+    for tool in $([[ $mode == 0 ]] && echo 'codec paths' || echo 'fast paths'); do
+      begin="kv begin profile=$profile tool=$tool fast=$mode"
+      end="kv end profile=$profile tool=$tool fast=$mode exit=0"
+      [[ $(grep -Fxc "$begin" "$f") == 1 && $(grep -Fxc "$end" "$f") == 1 ]] || return 1
+      body=$(awk -v b="$begin" -v e="$end" '$0==b{on=1;next} $0==e{on=0} on{print}' "$f")
+      kv_tool_receipt_ok "$body" "$tool" "$mode" || return 1
+    done
+  done
+}
+
+kv_check() {   # homes, served library, mode; fresh GPU work only BEFORE all model arms
+  local home=$1 lib=$2 mode=$3 sum cohort after key f profile tool bin rc failed=0
+  if [[ ${KV_WINDOW_ACTIVE:-} != 1 || ${KV_PROOFS_OPEN:-} != 1 || -z ${KV_WINDOW_TOKEN:-} ]] ||
+     [[ $("${DOCKER[@]}" inspect "$NAME" --format '{{.State.Status}}' 2>/dev/null) != exited ]]; then
+    log 'packed KV check refused: no active stopped-QFN window'; return 1
+  fi
+  cohort=$(kv_cohort_key "$home" "$lib" "$mode") || { log 'packed KV check refused: missing/mismatched explicit cohort hashes'; return 1; }
+  sum=$(sha256sum "$lib" | cut -d' ' -f1); key=$sum:$cohort:$mode
+  if [[ -n ${KV_PASSED[$key]+present} ]]; then
+    [[ ${KV_PASSED[$key]} == 1 ]] && kv_receipt_ok "${KV_RECEIPT[$key]:-}" "$sum" "$cohort" "$mode"; return
+  fi
+  if [[ $mode == 1 ]]; then
+    [[ ${KV_PASSED[$sum:$cohort:0]:-} == 1 ]] && kv_receipt_ok "${KV_RECEIPT[$sum:$cohort:0]:-}" "$sum" "$cohort" 0 || return 1
+  fi
+  f=$OUT/kv-packed-$sum-$cohort-fast$mode.log
+  KV_PASSED[$key]=0 KV_RECEIPT[$key]=$f
+  printf 'kv receipt v1 token=%s lib=%s cohort=%s fast=%s\n' "$KV_WINDOW_TOKEN" "$sum" "$cohort" "$mode" >"$f"
+  for profile in unpinned exact lcp; do
+    for tool in $([[ $mode == 0 ]] && echo 'codec paths' || echo 'fast paths'); do
+      bin=${KV_CODEC_CHECK:-}; [[ $tool == paths ]] && bin=$KV_PATHS_CHECK; [[ $tool == fast ]] && bin=$KV_FAST_CHECK
+      echo "kv begin profile=$profile tool=$tool fast=$mode" >>"$f"
+      ( unset HIP_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES GPU_DEVICE_ORDINAL HSA_VISIBLE_DEVICES R4D_SELFTEST_ONE_CARD RADIANCE_TUNE
+        while read -r knob; do unset "$knob"; done < <(compgen -v RADIANCE_EXPERIMENTAL_DS41_)
+        export HIP_VISIBLE_DEVICES=0 RADIANCE_EXPERIMENTAL_DS41_KV_PACKED=1
+        export RADIANCE_EXPERIMENTAL_DS41_KV_PACKED_FAST=$mode RADIANCE_EXPERIMENTAL_DS41_P1=0
+        case $profile in
+          unpinned) export RADIANCE_EXPERIMENTAL_DS41_N128=0 ;;
+          exact) export RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=1 RADIANCE_EXPERIMENTAL_DS41_N128=0 ;;
+          lcp) export RADIANCE_EXPERIMENTAL_DS41_LCP=2048 RADIANCE_EXPERIMENTAL_DS41_N128=1 ;;
+        esac
+        if [[ $tool == fast ]]; then timeout 1800 "$bin"; else timeout 1800 "$bin" "$lib"; fi
+      ) >>"$f" 2>&1
+      rc=$?; (( rc == 0 )) || failed=1
+      echo "kv end profile=$profile tool=$tool fast=$mode exit=$rc" >>"$f"
+    done
+  done
+  after=$(kv_cohort_key "$home" "$lib" "$mode") || failed=1
+  [[ $after == "$cohort" && $(sha256sum "$lib" | cut -d' ' -f1) == "$sum" ]] || failed=1
+  echo "kv exit $failed" >>"$f"
+  echo "kv finished token=$KV_WINDOW_TOKEN lib=$sum cohort=$cohort fast=$mode" >>"$f"
+  if (( failed == 0 )) && kv_receipt_ok "$f" "$sum" "$cohort" "$mode"; then KV_PASSED[$key]=1; fi
+  log "packed KV oracle fast$mode passed=${KV_PASSED[$key]} LIBsha256=$sum cohort=$cohort receipt=$f"
+  [[ ${KV_PASSED[$key]} == 1 ]]
+}
+
+kv_gate() {   # arm, homes, served library, mode; never invokes a checker after models have begun
+  local arm=$1 home=$2 lib=$3 mode=$4 sum cohort key m
+  [[ ${KV_WINDOW_ACTIVE:-} == 1 && -n ${KV_WINDOW_TOKEN:-} ]] || return 1
+  [[ $("${DOCKER[@]}" inspect "$NAME" --format '{{.State.Status}}' 2>/dev/null) == exited ]] || return 1
+  cohort=$(kv_cohort_key "$home" "$lib" "$mode") || { log "arm $arm: packed KV cohort mismatch; skipped"; return 1; }
+  sum=$(sha256sum "$lib" | cut -d' ' -f1)
+  for m in 0 $([[ $mode == 1 ]] && echo 1); do
+    key=$sum:$cohort:$m
+    [[ ${KV_PASSED[$key]:-} == 1 ]] && kv_receipt_ok "${KV_RECEIPT[$key]:-}" "$sum" "$cohort" "$m" || {
+      log "arm $arm: packed KV needs fresh fast$m receipt for served fullSHA=$sum; skipped"; return 1; }
+  done
+}
+
+kv_parts() {   # preflight-only parse, same strict semantics as the arm loop
+  local arm=$1 p packed=0 fast=0; local -a list=()
+  IFS=- read -r -a list <<< "$arm"
+  for p in "${list[@]:1}"; do
+    case $p in Kvfp4) packed=$((packed+1)) ;; Kvfast) fast=$((fast+1)) ;; Kv*) return 1 ;; esac
+  done
+  (( packed <= 1 && fast <= 1 && (fast == 0 || packed == 1) )) || return 1
+  echo "$packed $fast"
+}
+
 # Read a successful bal run's actual height list, never its command line alone or a legacy
 # generic PASS. The maximum and the requested C must both be present in the increasing list.
 bal_receipt_bound() {   # log, requested C; actual checked maximum on stdout, or refusal
@@ -503,6 +707,12 @@ kld_finish() {   # name; the run is SERVER_PID
   log "arm $name: kld run exit $rc after ${t}s"
   grep -E 'kld:|error|ERR' "$OUT/$name.server.log" | tail -6 | tee -a "$OUT/window.log"
   (( rc == 0 )) || return 1
+  local kv_why
+  if [[ ${ARM_KVFP4:-0} == 1 || ${ARM_KVFAST:-0} == 1 ]] || grep -qF 'KV_PACKED' "$OUT/$name.server.log"; then
+    if ! kv_why=$(kv_server_gate "$OUT/$name.server.log" "${ARM_KVFP4:-0}" "${ARM_KVFAST:-0}" exit 4); then
+      log "arm $name: $kv_why; packed KLD not measured"; return 1
+    fi
+  fi
   local n128_why
   if ! n128_why=$(n128_server_gate "$OUT/$name.server.log" "${ARM_N128:-}" 4); then
     log "arm $name: $n128_why; not measured"
@@ -519,8 +729,8 @@ kld_finish() {   # name; the run is SERVER_PID
   if [[ -z "$KLD_REF" ]]; then
     # The reference must be a plain 16-token arm's bits: a feature arm first (the plain one failed
     # or is missing) would let a later feature arm be compared with another one.
-    if [[ -n "${ARM_XT:-}${ARM_LC:-}${ARM_N128:-}${ARM_AR_ROWS:-}${ARM_AG_ROWS:-}" ]]; then
-      log "arm $name: an Xt, Lc, Fn128, Ar or Ag arm cannot be the window's kld reference (no plain Kld arm finished before it); not compared"
+    if [[ -n "${ARM_XT:-}${ARM_LC:-}${ARM_N128:-}${ARM_AR_ROWS:-}${ARM_AG_ROWS:-}" || ${ARM_KVFP4:-0} == 1 || ${ARM_KVFAST:-0} == 1 ]]; then
+      log "arm $name: an Xt, Lc, Fn128, Ar, Ag or packed-KV arm cannot be the window's kld reference (no plain Kld arm finished before it); not compared"
       return 1
     fi
     KLD_REF=$OUT/kld-$name
@@ -624,6 +834,10 @@ arm() {   # name, then env assignments for the server; CACHE_MIB the RAM cache (
     if (( t > 600 )); then log "arm $name: no server after 600 s"; stop_server; return 1; fi
   done
   log "arm $name: serving after ${t}s"
+  local kv_why
+  if ! kv_why=$(kv_server_gate "$OUT/$name.server.log" "${ARM_KVFP4:-0}" "${ARM_KVFAST:-0}" start 4); then
+    log "arm $name: $kv_why; packed startup/ABI/capability not measured"; stop_server; return 1
+  fi
   # A Pc arm: the prefix cache's startup lines (the snapshot store, the interval, the resume rule).
   [[ -z "${ARM_NOPC---no-prefix-cache}" ]] && \
     grep -E 'host headroom|chunk geometry|prefix resume|prefix cache|checkpoint slots|end-of-request snapshots|snapshot store|kv tiers' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
@@ -965,6 +1179,13 @@ EOF2
     [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
     return 1
   fi
+  local kv_exit_why
+  if ! kv_exit_why=$(kv_server_gate "$OUT/$name.server.log" "${ARM_KVFP4:-0}" "${ARM_KVFAST:-0}" exit 4); then
+    log "arm $name: $kv_exit_why; not measured (results kept as $name.unmeasured.json)"
+    [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
+    return 1
+  fi
+  [[ ${ARM_KVFP4:-0} == 1 ]] && grep -F 'KV_PACKED' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   local n128_why
   if ! n128_why=$(n128_server_gate "$OUT/$name.server.log" "${ARM_N128:-}" 4); then
     log "arm $name: $n128_why; not measured (results kept as $name.unmeasured.json)"
@@ -1167,6 +1388,9 @@ sleep 5
 AR_AG_SHARED_WINDOW_ACTIVE=1
 AG_ROWS_WINDOW_ACTIVE=1
 AR_ROWS_WINDOW_ACTIVE=1   # the AR checker also verifies QFN's actual exited state
+KV_WINDOW_ACTIVE=1
+KV_PROOFS_OPEN=1
+KV_WINDOW_TOKEN="$(date -u +%Y%m%dT%H%M%S%NZ)-$$-$RANDOM"
 
 if [[ "${DEVICE_CHECKS:-1}" == ptime && -x "$HERE/build/ds41_mxfp4_device_check" ]]; then
   log "prefill-shaped moe_gemm_ggml timing on card 0 with $RHOME/kernels/libr4d.so"
@@ -1749,6 +1973,25 @@ if [[ -x ${SELFTEST_AR_AG_SHARED:-} ]]; then
   done
 fi
 
+# Packed KV proofs run up front, before ANY model arm. Only in-memory fresh-window receipts can
+# authorize later arms; pre-existing logs or externally set success variables cannot bypass this.
+declare -A KV_PASSED=() KV_RECEIPT=()
+for kv_arm in $ARMS; do
+  kv_modes=$(kv_parts "$kv_arm") || continue
+  read -r kv_on kv_fast <<< "$kv_modes"
+  [[ $kv_on == 1 ]] || continue
+  kv_home=$RHOME
+  [[ "-$kv_arm-" == *-H-* ]] && kv_home=${RADIANCE_HOME_DIR2:-$RHOME}
+  [[ "-$kv_arm-" == *-H3-* ]] && kv_home=${RADIANCE_HOME_DIR3:-$RHOME}
+  IFS=: read -r -a kv_homes <<< "$kv_home"
+  kv_lib=
+  for kv_h in "${kv_homes[@]}"; do [[ -f $kv_h/kernels/libr4d.so ]] && { kv_lib=$kv_h/kernels/libr4d.so; break; }; done
+  [[ -n $kv_lib ]] || continue
+  kv_check "$kv_home" "$kv_lib" 0 || continue
+  [[ $kv_fast == 1 ]] && kv_check "$kv_home" "$kv_lib" 1
+done
+KV_PROOFS_OPEN=0
+
 HX=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=$HX_THREADS RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU=$SILU)
 CANCEL=${CANCEL_FILE:-/home/as/ds41-claude-build/work/cancel_window}
 for a in $ARMS; do
@@ -1986,6 +2229,7 @@ for a in $ARMS; do
   ARM_PROMPTS= ARM_N= ARM_LQ= rt=
   power="" skip="" ARGS=() f8="" f8x="" rb="" rbf=0 pred="" cs="" ck="" kh="" pc="" pcopt="" fw="" wp="" wl=""
   fn128=""
+  kvfp4="" kvfast=""
   arm_checkpoint_interval=2048
   psc="" prs=12 pk="" pw="" ns="" pv=""
   hpe="" hpg="" hpl="" hpb="" hpm="" hpr=""
@@ -2020,6 +2264,8 @@ for a in $ARMS; do
       Iy[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_INSERT_YIELD_US=${p#Iy}) ;;     # background inserts wait up to N us for an idle pool
       Xs)      env+=(RADIANCE_EXPERIMENTAL_DS41_SWIGLU_SCALAR=1) ;;   # the pool's swiglu as the scalar loop (old way)
       Fn128)   fn128=1 ;;                  # exact n128 fused norm; byte oracle and per-rank dispatch proof
+      Kvfp4)   if [[ -n "$kvfp4" ]]; then log "arm $a: duplicate Kvfp4; skipped"; skip=1; else kvfp4=1; fi ;;
+      Kvfast)  if [[ -n "$kvfast" ]]; then log "arm $a: duplicate Kvfast; skipped"; skip=1; else kvfast=1; fi ;;
       F8)      f8=1 ;;                     # FP8-sourced dense linears from E4M3 codes (gemm_nt_bf16f8)
       F8n)     f8=1 f8x='*_shexp.weight' ;;   # the same, the shared expert left bf16
       i[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_INSERT_THREADS=${p#i}) ;;
@@ -2261,6 +2507,24 @@ for a in $ARMS; do
     fi
   fi
   ARM_RB=$rb ARM_PRED=$pred
+  # Main/index page format and the independent reader implementation are ALWAYS explicit, so a
+  # globally exported flag cannot silently alter a plain/reference arm.
+  env+=(RADIANCE_EXPERIMENTAL_DS41_KV_PACKED=${kvfp4:-0} RADIANCE_EXPERIMENTAL_DS41_KV_PACKED_FAST=${kvfast:-0})
+  ARM_KVFP4=${kvfp4:-0} ARM_KVFAST=${kvfast:-0}
+  if [[ -n "$kvfast" && -z "$kvfp4" ]]; then log "arm $a: Kvfast requires Kvfp4; skipped"; skip=1; fi
+  if [[ -n "$kvfp4" && -z "$skip" ]]; then
+    # Require the current C receipt's actual M4096 captured-producer coverage. Without the norm
+    # pins, max_tok+max_seqs can exceed4096 even at a4096-token cap and must remain refused.
+    kv_rows=${lc:-${bt:-16}} kv_seqs=${nseq:-${MAX_SEQS:-1}}
+    if [[ $kv_rows =~ ^[1-9][0-9]{0,8}$ && $kv_seqs =~ ^[1-9][0-9]{0,8}$ ]]; then
+      kv_rows=$((10#$kv_rows)); [[ -n "$lc$xt" ]] || kv_rows=$((kv_rows+10#$kv_seqs))
+      if (( kv_rows > 4096 )); then log "arm $a: packed producer bound$kv_rows exceeds fresh oracleM4096; skipped"; skip=1; fi
+    else log "arm $a: invalid packed producer work bound; skipped"; skip=1; fi
+    kvlib=""
+    IFS=: read -r -a homes <<< "$ARM_HOME"
+    for h in "${homes[@]}"; do [[ -f "$h/kernels/libr4d.so" ]] && { kvlib=$h/kernels/libr4d.so; break; }; done
+    [[ -n "$skip" ]] || kv_gate "$a" "$ARM_HOME" "$kvlib" "${kvfast:-0}" || skip=1
+  fi
   # Explicitly state the switch for every arm. Unpinned compressor work can use
   # max_tok+max_seqs rows, so check that conservative bound as well as the library SHA.
   env+=(RADIANCE_EXPERIMENTAL_DS41_N128=${fn128:-0})

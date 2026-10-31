@@ -55,11 +55,12 @@ void Scheduler::dprob_discard(SchedReq& s, const char* reason, bool cancelled) {
 
 void Scheduler::draft_prob_publish(uint64_t id, int64_t anchor, int32_t anchor_token,
                                    const int32_t* tokens, int n, const float* signal,
-                                   bool published, int candidates) {
+                                   bool published, int candidates, uint64_t reserved_epoch) {
     std::lock_guard<std::mutex> lk(mu_);
     if (!dprob_on_ || !tokens || !signal || n <= 0) return;
     DraftProbPending p;
-    p.epoch = ++dprob_epoch_; p.anchor = anchor; p.anchor_token = anchor_token;
+    p.epoch = reserved_epoch ? reserved_epoch : ++dprob_epoch_;
+    p.anchor = anchor; p.anchor_token = anchor_token;
     p.n = std::min(n, (int)rad_dflash_observe::kDepths); p.candidates = candidates;
     std::copy(tokens, tokens + p.n, p.token);
     std::copy(signal, signal + rad_dflash_observe::kWidth, p.signal);
@@ -94,5 +95,10 @@ void Scheduler::dprob_verify(SchedReq& s, const StepEntry& e, int64_t anchor, in
 DraftProbStats Scheduler::draft_prob_stats() const {
     std::lock_guard<std::mutex> lk(mu_);
     return dprob_stats_;
+}
+
+uint64_t Scheduler::draft_prob_reserve_epoch() {
+    std::lock_guard<std::mutex> lk(mu_);
+    return dprob_on_ || draft_experiment_.early_verify() >= 0 ? ++dprob_epoch_ : 0;
 }
 }

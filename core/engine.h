@@ -647,6 +647,12 @@ private:
     float* dprob_host_ = nullptr;
     int64_t dprob_rows_ = 0;
     int dprob_candidates_ = 0;
+    int dmeasure_ready(const RadBatch* batch);
+    int dmeasure_check(int row, const int32_t* tokens, int n) const;
+    void dmeasure_finish(const StepOut& so);
+    void dmeasure_report() const;
+    DraftMeasure dmeasure_{};
+    int dmeasure_query_rows_ = 0;
     /* Encoder driver (spec §11, core/engine_mm.cpp): encodes every media item the scheduler waits
      * on, in passes of whole segments, and reads it back into the item. Runs between steps, never
      * inside one. */

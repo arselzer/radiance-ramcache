@@ -4204,8 +4204,10 @@ int Engine::start() {
                 "%s absent, 0, 1 or T[,W[,R]] (T in (0, 64], W 1..64, R 1..4096), and not with compute OFF; "
                 "%s absent, 0, 1 or T[,R] (T in (0, 1), R 2..4096), not with %s; %s absent, 0, 1 or N (2..64); "
                 "%s absent, 0 or 1; none of the three with compute OFF; %s absent, 0 or 1 and not "
-                "with compute OFF", kDraftGateEnv, kDraftConfEnv,
-                kDraftGateEnv, kDraftLoadEnv, kDraftCtxDeferEnv, rad_dflash_observe::kEnv);
+                "with compute OFF; %s absent/off or0|1|2, not with OFF, a verify cap, gate, confidence "
+                "or load controller", kDraftGateEnv, kDraftConfEnv,
+                kDraftGateEnv, kDraftLoadEnv, kDraftCtxDeferEnv, rad_dflash_observe::kEnv,
+                rad_dflash_observe::kEarlyEnv);
         return RAD_E_INVAL;
     }
     std::vector<int> devs;
@@ -4381,6 +4383,18 @@ int Engine::start() {
          * --max-num-seqs: Scheduler's one-sequence rule): its first k proposals are then the
          * verified ones. */
         const bool short_ok = cfg_.draft_short_from == 0 || (cfg_.draft_short_from == 1 && drafter_short_ > 0);
+        const bool early = draft_experiment_.early_verify() >= 0;
+        /* Measurement holds the query shape fixed, independently of its verified prefix. In
+         * particular Db2/from1 remains a two-row query for ALL k, including0; no cap-sized query.
+         * Restrict this first instrument to one sequence and an unconditional full/short shape. */
+        if (early && (cfg_.max_seqs != 1 || tree_ ||
+                      !draft_measure_profile(short_from_, drafter_.block, drafter_.depth, drafter_short_))) {
+            RAD_ERR("%s requires max-num-seqs1, a chain with5 full query rows/proposals, and "
+                    "draft-short-from0 (or auto), or1 with an existing2..4-row short block; "
+                    "Db2 keeps its query, hot set and bank unchanged for fixed0/1/2",
+                    rad_dflash_observe::kEarlyEnv);
+            return RAD_E_UNSUPPORTED;
+        }
         for (const auto& r : ranks_) {
             if (!dspark_draft_control_scope(r->program, r->plan, cfg_, bool(source_banks_), draft_vram_n_) ||
                 (draft_experiment_.verify_cap() >= 0 && !short_ok)) {
@@ -4392,7 +4406,9 @@ int Engine::start() {
                 return RAD_E_UNSUPPORTED;
             }
         }
-        if (draft_experiment_.compute_off())
+        if (early) {
+            /* dprob_init logs the observer and actual fixed query shape after allocation. */
+        } else if (draft_experiment_.compute_off())
             RAD_INFO("experimental draft compute OFF: configured depth5, Program, banks and pools "
                      "retained; learned context/query and scheduler fallback disabled; "
                      "ordinary target pipelining restored");

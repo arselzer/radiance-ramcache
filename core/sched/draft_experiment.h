@@ -22,7 +22,8 @@ public:
                                    const char* conf = nullptr,
                                    const char* load = nullptr,
                                    const char* defer = nullptr,
-                                   const char* prob = nullptr) noexcept {
+                                   const char* prob = nullptr,
+                                   const char* early = nullptr) noexcept {
         DraftExperiment x;
         const bool valid_cap = !verify_cap ||
             (verify_cap[0] >= '0' && verify_cap[0] <= '5' && verify_cap[1] == '\0');
@@ -45,6 +46,9 @@ public:
         if (x.conf_.on && x.gate_.on) x.valid_ = false;
         if (!flag(prob) || (one(prob) && x.off_)) x.valid_ = false;
         x.prob_ = one(prob);
+        x.early_ = rad_dflash_observe::early_fixed(early);
+        if (x.early_ < -1 || (x.early_ >= 0 && (x.off_ || x.cap_ >= 0 || x.gate_.on ||
+                                               x.conf_.on || x.load_from_ > 0))) x.valid_ = false;
         x.observe_ = one(stats) || x.off_ || x.cap_ >= 0;
         return x;
     }
@@ -58,9 +62,12 @@ public:
     int load_from() const noexcept { return load_from_; }       // load-aware drafting from N decoders; 0 off
     bool ctx_defer() const noexcept { return ctx_defer_; }      // the deferred context pass; off by default
     bool prob_capture() const noexcept { return prob_; }      // read-only candidate-set signal
-    bool scope_required() const noexcept { return off_ || cap_ >= 0; }
+    int early_verify() const noexcept { return early_; }      // fixed matched measurement, absent/off=-1
+    bool scope_required() const noexcept { return off_ || cap_ >= 0 || early_ >= 0; }
     int runtime_depth(int configured) const noexcept {
-        return off_ ? 0 : cap_ >= 0 && configured > cap_ ? cap_ : configured;
+        if (off_) return 0;
+        if (early_ >= 0 && configured > early_) return early_;
+        return cap_ >= 0 && configured > cap_ ? cap_ : configured;
     }
     bool target_pipelining(bool eligible, bool serial, bool block, int configured) const noexcept {
         return eligible && (serial || block || configured <= 0 || off_);
@@ -73,6 +80,7 @@ private:
     int load_from_ = 0;
     bool ctx_defer_ = false;
     bool prob_ = false;
+    int early_ = -1;
     static bool one(const char* x) noexcept { return x && std::strcmp(x,"1") == 0; }
     static bool flag(const char* x) noexcept {
         return !x || std::strcmp(x,"0") == 0 || std::strcmp(x,"1") == 0;

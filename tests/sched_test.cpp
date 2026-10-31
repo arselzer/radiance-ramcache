@@ -10311,6 +10311,211 @@ TEST(dspark_probability_capture_preserves_the_issue_ahead_pipeline) {
     CHECK_EQ(b.probability.resolved, (uint64_t)7); // last epoch pending until fixture fini
 }
 
+TEST(dspark_matched_early_controls_parse_and_preserve_configured_query_depth) {
+    const auto early = [](const char* value, const char* cap = nullptr, const char* off = nullptr) {
+        return DraftExperiment::capture(nullptr, off, cap, nullptr, nullptr, nullptr, nullptr, nullptr, value);
+    };
+    for (const char* value : { (const char*)nullptr, "off" }) {
+        const auto x = early(value);
+        CHECK(x.valid()); CHECK_EQ(x.early_verify(), -1); CHECK_EQ(x.runtime_depth(5), 5);
+        CHECK(!x.scope_required());
+    }
+    for (int k = 0; k <= 2; ++k) {
+        const std::string value = std::to_string(k);
+        const auto x = early(value.c_str());
+        CHECK(x.valid()); CHECK_EQ(x.early_verify(), k); CHECK_EQ(x.runtime_depth(5), k);
+        CHECK_EQ(x.runtime_depth(2), k); CHECK_EQ(x.runtime_depth(0), 0);
+        CHECK(!x.compute_off()); CHECK(x.head_enabled(true)); CHECK(x.scope_required());
+        CHECK(!x.prob_capture()); // quiet observer is independent of JSON capture
+        CHECK(!early(value.c_str(), "1").valid());
+        CHECK(!early(value.c_str(), nullptr, "1").valid());
+        CHECK(!DraftExperiment::capture(nullptr, nullptr, nullptr, "1", nullptr, nullptr, nullptr, nullptr, value.c_str()).valid());
+        CHECK(!DraftExperiment::capture(nullptr, nullptr, nullptr, nullptr, "1", nullptr, nullptr, nullptr, value.c_str()).valid());
+        CHECK(!DraftExperiment::capture(nullptr, nullptr, nullptr, nullptr, nullptr, "1", nullptr, nullptr, value.c_str()).valid());
+        CHECK(DraftExperiment::capture(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, "1", "1", value.c_str()).valid());
+    }
+    for (const char* bad : { "", "3", "-1", "00", "1x", "OFF", "on" }) CHECK(!early(bad).valid());
+    CHECK(draft_measure_profile(0, 5, 5, 0));
+    CHECK(draft_measure_profile(1, 5, 5, 2)); // the measured Db2 profile
+    CHECK(draft_measure_profile(1, 5, 5, 4));
+    CHECK(!draft_measure_profile(2, 5, 5, 2)); // load-changing query shape
+    CHECK(!draft_measure_profile(1, 5, 5, 1)); // no depth2 observation
+    CHECK(!draft_measure_profile(1, 5, 5, 0));
+    CHECK(!draft_measure_profile(0, 6, 5, 0));
+    CHECK(!draft_measure_profile(0, 5, 4, 0));
+}
+
+TEST(dspark_matched_early_meter_excludes_transitions_caps_end_and_cancel) {
+    for (int k = 0; k <= 2; ++k) {
+        DraftMeasure m;
+        DraftMeasureFrame a;
+        a.seq = 1; a.epoch = 1; a.card = 0; a.k = k; a.query_rows = 2;
+        a.ready_ns = 100; a.wait_ns = 9; a.pure_decode = false;
+        m.ready(a, false); CHECK(!m.committed(true, true, 1, 0)); // prompt transition
+        a.epoch++; a.ready_ns += 100; a.pure_decode = true;
+        m.ready(a, true); CHECK(!m.committed(true, true, 2, 0)); // first decode excluded
+        a.epoch++; a.ready_ns += 100; a.wait_ns = 11;
+        m.ready(a, true); CHECK(m.committed(true, true, (uint64_t)(3 + k), k));
+        CHECK_EQ(m.stats.n[k], (uint64_t)1); CHECK_EQ(m.stats.ns[k], (uint64_t)100);
+        CHECK_EQ(m.stats.wait_ns[k], (uint64_t)11); CHECK_EQ(m.stats.accepted[k], (uint64_t)k);
+        CHECK_EQ(m.stats.emitted[k], (uint64_t)(1 + k));
+        /* The full query ran for0 too: all three boundaries have one observer and one wait. */
+        CHECK_EQ(m.stats.queries, (uint64_t)3); CHECK_EQ(m.stats.query_rows, (uint64_t)6);
+        CHECK_EQ(m.stats.waits, (uint64_t)3);
+        a.epoch++; a.ready_ns += 100;
+        m.ready(a, false); CHECK(!m.committed(true, true, 10, 0)); // wrong prefix / context cap
+        a.epoch++; a.ready_ns += 100;
+        m.ready(a, true); CHECK(!m.committed(false, false, 10, 0)); // EOS/budget/cancel at commit
+        CHECK_EQ(m.stats.end_cancel, (uint64_t)1);
+        a.epoch++; a.ready_ns += 100;
+        m.ready(a, false); CHECK(!m.committed(true, true, 11, 0));
+        a.epoch++; a.ready_ns += 100;
+        m.ready(a, true); CHECK(!m.committed(true, false, 12, 0)); // cancelled after commit
+        CHECK_EQ(m.stats.unpublished, (uint64_t)1);
+        a.epoch++; a.ready_ns += 100;
+        m.ready(a, false); CHECK(!m.committed(true, true, 20, 0));
+        a.epoch++; a.ready_ns += 100;
+        m.ready(a, true); CHECK(!m.committed(true, true, 20, 0)); // truncated emission
+        m.no_query(); CHECK_EQ(m.stats.no_query, (uint64_t)1);
+        CHECK_EQ(m.pending.epoch, (uint64_t)0); CHECK_EQ(m.stats.n[k], (uint64_t)1);
+        CHECK_EQ(m.stats.transition, (uint64_t)3);
+    }
+    DraftMeasure m;
+    DraftMeasureFrame a; a.seq = 1; a.card = 0; a.k = 1; a.query_rows = 2;
+    a.epoch = 1; a.ready_ns = 100; a.pure_decode = true;
+    m.ready(a, false); CHECK(!m.committed(true, true, 1, 0));
+    a.seq = 2; a.epoch = 2; a.ready_ns = 200;
+    m.ready(a, true); CHECK(!m.committed(true, true, 2, 0)); // recycled card, different request
+    CHECK_EQ(m.stats.transition, (uint64_t)1); CHECK_EQ(m.stats.n[1], (uint64_t)0);
+}
+
+TEST(dspark_matched_early_normal_planning_keeps_the_cap_and_drops_context_end_queries) {
+    for (int k = 0; k <= 2; ++k) {
+        const std::string value = std::to_string(k);
+        const auto x = DraftExperiment::capture(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                                                nullptr, nullptr, value.c_str());
+        Fixture f; f.build(); f.cfg.max_seqs = 1;
+        dspark_group(f, 4096, false, false);
+        CHECK_OK(f.start(&x));
+        const auto id = f.submit(40, 30);
+        REQUIRE(f.sch.step()); f.commit_plain(6); // deliberately no issue_ahead
+        const int32_t tokens[] = { 7, 8 };
+        CHECK_OK(f.sch.set_draft(id, tokens, 2));
+        REQUIRE(f.sch.step()); CHECK_EQ(f.sch.plan().e[0].n_spec, k);
+        for (int j = 0; j < k; ++j) CHECK_EQ(f.sch.plan().e[0].draft[j], tokens[j]);
+    }
+    const auto x = DraftExperiment::capture(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                                            nullptr, nullptr, "0");
+    Fixture f; f.build(4096, 64, 512, 42); f.cfg.max_seqs = 1;
+    dspark_group(f, 4096, false, false);
+    CHECK_OK(f.start(&x));
+    const auto id = f.submit(40, 0);
+    REQUIRE(f.sch.step()); f.commit_plain(6);
+    REQUIRE(f.sch.step()); // one plain token would fit, a complete Db2 query would not
+    Scheduler::BlockRow row[1];
+    CHECK_EQ(f.sch.block_begin(2, 2, 129, 128799, row, 1, true), 0);
+    CHECK(f.sch.block_query(3) == nullptr);
+    CHECK_EQ(f.sch.plan().e[0].n_spec, 0);
+    CHECK(f.sch.find(id) != nullptr);
+}
+
+/* Mirrors mark_step_end -> early sync -> expect_draft/step_next -> commit -> set_draft, with
+ * Db2's two generated tokens at pitch5 for ALL controls. No observer/timing fake decides a token. */
+TEST(dspark_matched_early_db2_keeps_query_and_ahead_publication_prefix_consistent) {
+    for (int k = 0; k <= 2; ++k) {
+        for (int tail : { 0, 1, 2 }) { // continuing, EOS/budget end, cancellation after early read
+            const std::string value = std::to_string(k);
+            const auto x = DraftExperiment::capture(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                                                    nullptr, "1", value.c_str());
+            Fixture f; f.build(); f.cfg.max_seqs = 1; f.cfg.draft_short_from = 1;
+            dspark_group(f, 4096, false, false);
+            CHECK_OK(f.start(&x));
+            auto r = f.request(40, 0); r->speculation_fixed = true;
+            const auto id = f.add(std::move(r));
+            const RadBatch* b = f.sch.step(); REQUIRE(b);
+            std::vector<StepSlot> slots(1);
+            DraftMeasure meter;
+            DraftMeasureFrame previous;
+            for (int t = 0; t < 6; ++t) {
+                const StepEntry entry = f.sch.plan().e[0];
+                REQUIRE_EQ(entry.n_spec, t ? k : 0);
+                const int accepted = t ? (t - 1) % (k + 1) : 0;
+                std::vector<int32_t> sampled((size_t)b->n_out + 1, -1);
+                for (int j = 0; j <= entry.n_spec; ++j)
+                    sampled[(size_t)(entry.dev_out + j)] = j < accepted ? ahead_draft(id, t, j) : ahead_tok(id, t);
+                AdvanceArgs accept = f.sch.advance_args(0); accept.mode = ADV_ACCEPT;
+                accept.st = slots.data(); accept.src = sampled.data(); adv_row(accept, 0);
+                Scheduler::BlockRow row[1];
+                REQUIRE_EQ(f.sch.block_begin(2, 2, 129, 128799, row, 1, true), 1);
+                REQUIRE(f.sch.block_context(t + 1));
+                const RadBatch* query = f.sch.block_query(t + 1); REQUIRE(query);
+                CHECK_EQ(query->n_tok, 2); CHECK_EQ(query->n_out, 2);
+                AdvanceArgs q = f.sch.advance_args(0); q.mode = ADV_BLOCK; q.st = slots.data(); adv_row(q, 0);
+                int32_t generated[5] = { ahead_draft(id, t + 1, 0), ahead_draft(id, t + 1, 1), -7, -7, -7 };
+                AdvanceArgs take = f.sch.advance_args(0); take.mode = ADV_BTAKE; take.round = 2;
+                take.src = generated; take.src_pitch = 5; take.st = slots.data(); adv_row(take, 0);
+                const StepSlot& slot = slots[(size_t)entry.card];
+                bool matches = false;
+                REQUIRE(f.sch.measure_block_binding(row[0], slot.ctx, slot.acc, previous, &matches));
+                CHECK_EQ(matches, t > 0);
+                auto wrong = row[0]; wrong.seq++;
+                CHECK(!f.sch.measure_block_binding(wrong, slot.ctx, slot.acc, previous, &matches));
+                CHECK(!f.sch.measure_block_binding(row[0], slot.ctx + 1, slot.acc, previous, &matches));
+                REQUIRE(f.sch.measure_block_binding(row[0], slot.ctx, slot.acc, previous, &matches));
+                DraftMeasureFrame frame;
+                frame.seq = id; frame.epoch = f.sch.draft_prob_reserve_epoch(); frame.card = entry.card;
+                frame.step = b->step; frame.ctx = slot.ctx; frame.anchor = slot.tok[0];
+                frame.k = k; frame.query_rows = 2; frame.ids[0] = generated[0]; frame.ids[1] = generated[1];
+                frame.ready_ns = (uint64_t)(100 + t * 100); frame.wait_ns = 10;
+                frame.pure_decode = !entry.is_prefill;
+                meter.ready(frame, matches);
+                if (t == 5 && tail == 2) CHECK_OK(f.sch.cancel(id));
+                f.sch.expect_draft(id, 2); // runtime cap, while generated/query count stays2
+                const RadBatch* next = f.sch.step_next();
+                if (tail != 2 || t != 5) {
+                    REQUIRE(next); CHECK_EQ(next->n_spec, k); CHECK_EQ(next->n_tok, 1 + k);
+                    AdvanceArgs tr = f.sch.advance_args(0); tr.mode = ADV_TRUNK; tr.st = slots.data(); adv_row(tr, 0);
+                    for (int j = 0; j < k; ++j) CHECK_EQ(next->token_ids[1 + j], generated[j]);
+                } else CHECK(next == nullptr);
+                CHECK_OK(f.commit(ahead_tok(id, t), t == 5 && tail == 1,
+                                  [accepted](const StepEntry&) { return accepted; }));
+                f.sch.block_end();
+                const int rc = f.sch.set_draft(id, generated, 2);
+                const float obs[10] = { .8f, 4, 2, (float)generated[0], (float)slot.tok[0],
+                                        .7f, 3, 1, (float)generated[1], (float)generated[0] };
+                f.sch.draft_prob_publish(id, frame.ctx, frame.anchor, generated, 2, obs, rc == RAD_OK, 16, frame.epoch);
+                uint64_t output = 0; bool live = false;
+                REQUIRE(f.sch.committed_seq(id, &output, &live));
+                const bool published = f.sch.measure_published(frame, &output);
+                if (t == 5 && tail) CHECK(!published);
+                else {
+                    REQUIRE_EQ(rc, (int)RAD_OK); CHECK(published);
+                    auto wrong_frame = frame; wrong_frame.seq++;
+                    CHECK(!f.sch.measure_published(wrong_frame, &output));
+                    wrong_frame = frame; wrong_frame.ctx++;
+                    CHECK(!f.sch.measure_published(wrong_frame, &output));
+                    if (k) {
+                        wrong_frame = frame; wrong_frame.ids[0]++;
+                        CHECK(!f.sch.measure_published(wrong_frame, &output));
+                        wrong_frame = frame; wrong_frame.k = k - 1;
+                        CHECK(!f.sch.measure_published(wrong_frame, &output));
+                    }
+                }
+                meter.committed(live, published, output, accepted);
+                previous = meter.pending;
+                f.sch.step_finished();
+                if (next) { f.sch.promote_next(); b = next; }
+            }
+            CHECK_EQ(meter.stats.queries, (uint64_t)6); CHECK_EQ(meter.stats.query_rows, (uint64_t)12);
+            CHECK_EQ(meter.stats.waits, (uint64_t)6);
+            CHECK_EQ(meter.stats.n[k], (uint64_t)(tail ? 3 : 4));
+            CHECK_EQ(meter.stats.ns[k], (uint64_t)(tail ? 300 : 400));
+            if (tail) CHECK_EQ(meter.stats.end_cancel, (uint64_t)1);
+            CHECK_EQ(f.sch.draft_prob_stats().proposed, (uint64_t)12);
+        }
+    }
+}
+
 /* The controller on the pipeline: T 0.5, a probe every 3rd step of a closed run. */
 TEST(dspark_conf_closes_probes_and_reopens_on_the_issue_ahead_pipeline) {
     const auto x = DraftExperiment::capture("0", "0", "1", nullptr, "0.5,3");

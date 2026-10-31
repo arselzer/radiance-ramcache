@@ -16,6 +16,12 @@
 #pragma once
 namespace rad_dflash_observe {
 constexpr const char* kEnv = "RADIANCE_EXPERIMENTAL_DS41_DSPARK_PROB_CAPTURE";
+constexpr const char* kEarlyEnv = "RADIANCE_EXPERIMENTAL_DS41_DSPARK_EARLY_VERIFY";
+/* Absent/off leaves the old issue order;0/1/2 are FIXED measurement controls, no policy. */
+inline int early_fixed(const char* value) {
+    if (!value || (value[0] == 'o' && value[1] == 'f' && value[2] == 'f' && value[3] == '\0')) return -1;
+    return value[0] >= '0' && value[0] <= '2' && value[1] == '\0' ? value[0] - '0' : -2;
+}
 constexpr const char* kBuffer = "dspark_proposal_observations";
 enum { kDepths = 2, kFields = 5, kWidth = kDepths * kFields };
 enum Field { kCandidateP, kScore, kMargin, kToken, kPredecessor };

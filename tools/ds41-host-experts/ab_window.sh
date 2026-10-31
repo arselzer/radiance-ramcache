@@ -829,10 +829,11 @@ EOF2
   local want got pat
   for pat in "Dc:DSpark confidence head: " "Dl:DSpark load-aware drafting: on" "Dx:DSpark context pass deferred (" \
              "Dm:placement: 'dspark.markov_w" "Dpc:DSpark read-only proposal capture: on" \
+             "Dme:DSpark matched early verify: on" \
              "Ds with NK:DSpark draft bank with up to "; do
     want=${pat%%:*}; got=$(grep -cF "${pat#*:}" "$OUT/$name.server.log")
     local flag; case $want in Dc) flag=${ARM_DC:-};; Dl) flag=${ARM_DL:-};; Dx) flag=${ARM_DX:-};; Dm) flag=${ARM_DM:-};;
-                              Dpc) flag=${ARM_DPC:-};; "Ds with NK") flag=${ARM_SOLO:-};; esac
+                              Dpc) flag=${ARM_DPC:-};; Dme) flag=${ARM_DME:-};; "Ds with NK") flag=${ARM_SOLO:-};; esac
     if [[ -n "$flag" && "$got" == 0 ]]; then
       log "arm $name: $want, but the server log has no '${pat#*:}' line (a radiance or plugin without the switch?); not measured"
       stop_server; return 1
@@ -842,7 +843,11 @@ EOF2
       stop_server; return 1
     fi
   done
-  grep -E "DSpark (confidence controller|confidence head|load-aware drafting|context pass deferred) \(|DSpark confidence head: |DSpark read-only proposal capture: on|placement: 'dspark.markov_w|DSpark draft bank with up to " "$OUT/$name.server.log" | tee -a "$OUT/window.log"
+  if [[ -n "${ARM_DME:-}" ]] && ! grep -qF "DSpark matched early verify: on k=${ARM_DME}" "$OUT/$name.server.log"; then
+    log "arm $name: Dme${ARM_DME}, but startup reports another fixed prefix; not measured"
+    stop_server; return 1
+  fi
+  grep -E "DSpark (confidence controller|confidence head|load-aware drafting|context pass deferred) \(|DSpark confidence head: |DSpark read-only proposal capture: on|DSpark matched early verify: on|placement: 'dspark.markov_w|DSpark draft bank with up to " "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   # Df (RADIANCE_EXPERIMENTAL_DS41_DSPARK_FP8): the plugin names, on each rank, the drafter's dense
   # weights it reads from E4M3 codes. A Df arm without such a line with N above 0, or another arm
   # with one, is not measured.
@@ -889,6 +894,13 @@ EOF2
     return 1
   fi
   [[ -n "${ARM_N128:-}" ]] && grep -F 'ds41 n128 active:' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
+  if [[ -n "${ARM_DME:-}" ]] && {
+       ! grep -qE "DSpark matched early costs: k=${ARM_DME} n=[1-9][0-9]* " "$OUT/$name.server.log" ||
+       ! grep -qE 'DSpark matched early totals: queries=[1-9][0-9]* .* waits=[1-9][0-9]* ' "$OUT/$name.server.log"; }; then
+    log "arm $name: matched early control lacks steady cycles/query/wait totals; not measured"
+    [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
+    return 1
+  fi
   # Dk / Dkt (RADIANCE_EXPERIMENTAL_DS41_DRAFT_GEMV): libr4d names the mode at its first draft call
   # and counts the calls when the server exits. A Dk arm without the first line, or whose exit line
   # leaves draft-shaped calls on the old path, or another arm with either line, is not measured:
@@ -1594,6 +1606,10 @@ for a in $ARMS; do
 # Dpc is read-only proposal probability/score/margin capture (DSPARK_PROB_CAPTURE), beside a drafting
 # Ds part only, never Ds0. It writes JSON events to the arm's server log; candidate_p is normalized
 # over the existing Markov-conditioned candidate set, not full vocabulary or target acceptance.
+# Dme0/1/2 is fixed-depth matched early-readback MEASUREMENT (DSPARK_EARLY_VERIFY), with bare Ds,
+# max-num-seqs1 and no Dc/Dl/Dg. Every action runs the SAME configured query (Db2 stays two rows),
+# observer and step_end wait before issue_ahead; only the verified/published prefix changes. Quiet
+# by default; Dpc adds proposal/cycle JSON. All arms explicitly set off unless a Dme part is present.
 # H3 the third run home (RADIANCE_HOME_DIR3); Es
 # engram_kv's rows split over the ranks (needs a deepseek41 plugin that has it); Pa the next layer's
 # attention weights read into the card's on-die cache during the CPU-row wait (same); PmN those reads
@@ -1722,7 +1738,7 @@ for a in $ARMS; do
 # offline in bf16, int8 and int4 against the container's routers); needs a predictor part.
   IFS=- read -r -a parts <<< "$a"
   xt="" bt="" kld="" dk="" db="" pu="" ins_nt="" ins_kib="" ins_wait="" lean="" lc="" ad="" dv="" xd="" hs="" dg="" df="" pmr="" tb=""
-  mb="" lf="" dc="" dl="" dx="" dm="" dpc="" ds="" nseq=""
+  mb="" lf="" dc="" dl="" dx="" dm="" dpc="" dme="" ds="" nseq=""
   p1="" q1=() qm="" ql="" qg="" qe="" qsp="" ar_rows=""
   pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 HOST_POOL_MIB=4096 EXTRA_ARGS="" ARM_HOME="$RHOME" ARM_CONC=
   ARM_PROMPTS= ARM_N= ARM_LQ= rt=
@@ -1836,6 +1852,9 @@ for a in $ARMS; do
                fi ;;
       Dx)      dx=1 ;;                     # the drafter's context pass deferred while nothing drafts (DSPARK_CTX_DEFER)
       Dpc)     dpc=1 ;;                    # read-only candidate-set probability/score/margin capture (DSPARK_PROB_CAPTURE)
+      Dme[0-2])                            # SAME query/observer/early wait, fixed verified prefix0/1/2 (measurement only)
+               if [[ -n "$dme" ]]; then log "arm $a: duplicate Dme prefix; the arm is skipped"; skip=1; fi
+               dme=${p#Dme} ;;
       Dm)      dm=1 ;;                     # the drafter's Markov codebooks pinned with the embedding (DSPARK_CODEBOOK_RAM; needs Er)
       K)       env+=(RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE=1) ;;     # the RAM cache packed for the CPU only
       Vp)      env+=(RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED=1) ;;      # VRAM residents in the packed-scale form (vpack_gate)
@@ -2139,11 +2158,17 @@ for a in $ARMS; do
   if [[ -n "$dpc" && ( -z "$ds" || "$ds" == Ds0 ) ]]; then
     log "arm $a: Dpc needs a drafting Ds part (not Ds0); the arm is skipped"; skip=1
   fi
+  # Matched costs, not a policy: bare Ds retains the same bank/query; Db2 remains two rows at ALL
+  # prefixes. Legacy DsN caps, adaptive/gated queries and multi-sequence load are refused.
+  if [[ -n "$dme" && ( "$ds" != Ds || -n "$dc$dl$dg" || "${nseq:-${MAX_SEQS:-1}}" != 1 ) ]]; then
+    log "arm $a: Dme0/1/2 needs bare Ds, one sequence and no Dc/Dl/Dg (Db2/Dkt/Dv/Df retained); the arm is skipped"; skip=1
+  fi
   env+=(RADIANCE_EXPERIMENTAL_DS41_DSPARK_CONF=${dc:-0} "RADIANCE_EXPERIMENTAL_DS41_DSPARK_CONF_HEAD=${dc:+$DRAFT_CONF_HEAD}"
         RADIANCE_EXPERIMENTAL_DS41_DSPARK_LOAD=${dl:-0} RADIANCE_EXPERIMENTAL_DS41_DSPARK_CTX_DEFER=${dx:-0}
         RADIANCE_EXPERIMENTAL_DS41_DSPARK_CODEBOOK_RAM=${dm:-0}
-        RADIANCE_EXPERIMENTAL_DS41_DSPARK_PROB_CAPTURE=${dpc:-0})
-  ARM_DC=$dc ARM_DL=$dl ARM_DX=$dx ARM_DM=$dm ARM_DPC=$dpc
+        RADIANCE_EXPERIMENTAL_DS41_DSPARK_PROB_CAPTURE=${dpc:-0}
+        RADIANCE_EXPERIMENTAL_DS41_DSPARK_EARLY_VERIFY=${dme:-off})
+  ARM_DC=$dc ARM_DL=$dl ARM_DX=$dx ARM_DM=$dm ARM_DPC=$dpc ARM_DME=$dme
   # A drafting Ds part under --max-num-seqs above 1 (an NK part, or MAX_SEQS for the window): the
   # scheduler drafts for a sequence alone and says so at startup (arm() checks the line both ways).
   ARM_SOLO=

@@ -682,6 +682,7 @@ int Engine::finish_block_drafter(const StepOut& so) {
     const bool show = (int)log_level() >= (int)Log::Debug;
     for (int i = 0; i < block_rows_; ++i) {
         const int32_t* d = &draft_out_[(size_t)i * (size_t)steps];
+        if (draft_experiment_.early_verify() >= 0) RAD_TRY(dmeasure_check(i, d, steps));
         if (show) {
             std::string t;
             for (int j = 0; j < steps; ++j) t += fmt(" %d", (int)d[j]);
@@ -704,6 +705,7 @@ int Engine::finish_block_drafter(const StepOut& so) {
     }
     /* The confidence head's p for each drafting row (engine_dconf.cpp). */
     dconf_finish();
+    if (draft_experiment_.early_verify() >= 0) dmeasure_finish(so);
     return RAD_OK;
 }
 

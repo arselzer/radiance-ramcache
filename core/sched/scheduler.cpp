@@ -1150,7 +1150,7 @@ int Scheduler::set_draft(uint64_t id, const int32_t* tokens, int n, const int32_
 
     // Full5 head generation is retained. Only this explicitly configured control
     // installs a prefix before fixed-ahead exact-count validation (as adaptive does).
-    if (draft_experiment_.verify_cap() >= 0) {
+    if (draft_experiment_.verify_cap() >= 0 || draft_experiment_.early_verify() >= 0) {
         if (n > cfg_.n_spec) return RAD_E_STATE; // malformed producer, not a longer legal prefix
         n = draft_experiment_.runtime_depth(n);
     }

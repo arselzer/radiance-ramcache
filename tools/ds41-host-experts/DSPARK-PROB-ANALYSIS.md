@@ -123,6 +123,11 @@ metadata leakage and unmatched costs). They have not been run by the preparation
 
 ## Smallest step2B decision and lifetime plan
 
+Source-only matched fixed controls are now described in
+[DSPARK-EARLY-CONTROLS.md](DSPARK-EARLY-CONTROLS.md). They preserve the Db2 query/hot set and use the
+existing `step_end_` event; they implement no probability decision. Their quiet C0/C1/C2 counters
+must be measured before fitting a cost policy. The plan below applies to a later policy.
+
 The current read-only capture is retired in `finish_block_drafter`, AFTER `issue_ahead` has planned
 and issued the next target verification. The existing CONF score is from a separate prediction
 head. Neither is a safe source for changing the depth of the proposal already issued.
@@ -131,7 +136,7 @@ After capture data exists and a candidate is chosen, the smallest host policy ca
 default-off branch:
 
 1. Keep query generation, selector IDs and observer arithmetic unchanged. Queue observations AND
-   the existing StepSlot snapshot on rank0's query stream. Record a narrow ready event after both
+   the existing StepSlot snapshot on rank0's query stream. Reuse the existing `step_end_` after both
    copies; an observation without its matching IDs/ctx is insufficient.
 2. In the policy branch only, wait for that event BEFORE `expect_draft`/`step_next` in
    `issue_ahead`. Bind each decision to the BlockRow sequence/card and this query's epoch/actual

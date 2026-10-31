@@ -14,6 +14,7 @@
 #pragma once
 #include "batch.h"
 #include "draft.h"
+#include "draft_measure.h"
 #include "lookup.h"
 #include "metrics.h"
 #include "ngram.h"
@@ -484,6 +485,10 @@ public:
      * in the order block_query() emits them. */
     int block_begin(int block, int depth, int window, int32_t mask, BlockRow* out, int max,
                     bool on_card = false);
+    /* Fixed early measurement only: actual device ctx and consumed prefix, under mu_. */
+    bool measure_block_binding(const BlockRow& row, int32_t ctx, int accepted,
+                                const DraftMeasureFrame& previous, bool* previous_matches) const;
+    bool measure_published(const DraftMeasureFrame& row, uint64_t* output) const;
     /* How many running sequences the step just run decoded (produced a token for), the load a
      * block drafter's block length is chosen by. Read before block_begin(). */
     int decoded_seqs() const;
@@ -525,7 +530,8 @@ public:
      * anchor and tokens come from the same StepSlot readback as the installed proposal. */
     void draft_prob_publish(uint64_t id, int64_t anchor, int32_t anchor_token,
                             const int32_t* tokens, int n, const float* signal, bool published,
-                            int candidates);
+                            int candidates, uint64_t reserved_epoch = 0);
+    uint64_t draft_prob_reserve_epoch(); // early boundary/capture share one identity, quiet too
     DraftProbStats draft_prob_stats() const;
 
     const StepPlan&      plan() const { return plan_; }

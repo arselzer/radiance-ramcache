@@ -59,7 +59,8 @@ Engine::Engine(Config cfg)
                                                   std::getenv(kDraftConfEnv),
                                                   std::getenv(kDraftLoadEnv),
                                                   std::getenv(kDraftCtxDeferEnv),
-                                                  std::getenv(rad_dflash_observe::kEnv))), env_set_(diag::env_names(environ, "RADIANCE_")) {}
+                                                  std::getenv(rad_dflash_observe::kEnv),
+                                                  std::getenv(rad_dflash_observe::kEarlyEnv))), env_set_(diag::env_names(environ, "RADIANCE_")) {}
 
 int32_t* Engine::Readback::reserve(int64_t count) {
     if (count <= n) return p;
@@ -1357,6 +1358,12 @@ int Engine::step_loop() {
         if (st < 0) return fail_loop(st);
         st = mark_step_end(b, so);
         if (st < 0) return fail_loop(st);
+        /* Default-off fixed measurement: the identical query/observer/slot readback completes
+         * before the next verify is planned, including fixed0 (which still queries). */
+        if (draft_experiment_.early_verify() >= 0) {
+            st = dmeasure_ready(b);
+            if (st < 0) return fail_loop(st);
+        }
         /* Then the next step's forward pass, before this step is read back. Its rows continue from
          * the card's acceptance and verify the new drafts; its sampler waits for this step's
          * commit. The card runs straight on while the host waits, commits and stages. */
@@ -1487,6 +1494,7 @@ int Engine::step_loop() {
     /* RADIANCE_EXPERIMENTAL_DS41_DSPARK_GATE: its counters and every finished sequence's. */
     sched_.draft_gate_report();
     sched_.draft_conf_report();
+    dmeasure_report();
     eors_report();
     return RAD_OK;
 }

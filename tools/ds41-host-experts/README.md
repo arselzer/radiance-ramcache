@@ -878,6 +878,17 @@ order, so the bits do not change, and an extra row costs 0.37–0.46 of a row in
 the base engine's; the final configuration also matched it on 16 chat-framed prompts, on the eight
 prompts three times on one server, and on 256-token replies.
 
+Since the upstream sync (upstream main `b6acbd69`, v1.15.0 + 12, merged on `claude/ds41-sync`) the base engine
+itself rounds differently: upstream's standalone rmsnorm sums over a fixed 256-lane partition, so decode steps and
+chunks of up to ~72 rows round ds41's 5120/1280/512-wide norms differently from before. The reference is the
+merged base engine: its held-out replies (`ab-20261031T104524Z/base.json`) differ from the pre-sync base's in 3 of 8
+(mid-reply, equally fluent), and every arm of `ab-20261031T100852Z` (decode-only, recommended prefill settings at
+1 / 4 / 8 streams) matched it, 32 of 32. The same plain `Kld` arm agrees with the pre-sync build's record on the
+top token at 98.9% of 1,512 positions (KL mean 0.012, median 0.00015). The swiglu and chain checks, the silu
+table recapture and a `POLICY=verify` arm (29,668 rows, 0 differ) passed on the merged libr4d. Every plugin must
+come from this tree (the loader checks an ABI layout fingerprint), and prompt lookup alone on ds41 needs
+`RADIANCE_EXPERIMENTAL_DS41_LOOKUP_ALONE=1` (upstream refuses `--spec-ngram` beside a declared draft head).
+
 Exact tall passes (`RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=1`) keep this: a pass of up to 32 (48)
 tokens gives every row the bits it gets in today's 16-token chunking, because every op either runs
 the decode band's arithmetic at every height or is checked to (`ds41_mxfp4_device_check tall` and

@@ -1157,11 +1157,11 @@ EOF2
   local want got pat
   for pat in "Dc:DSpark confidence head: " "Dl:DSpark load-aware drafting: on" "Dx:DSpark context pass deferred (" \
              "Dm:placement: 'dspark.markov_w" "Dpc:DSpark read-only proposal capture: on" \
-             "Dme:DSpark matched early verify: on" \
+             "Dme:DSpark matched early verify: on" "Dmnq:DSpark query-free control: on" \
              "Ds with NK:DSpark draft bank with up to "; do
     want=${pat%%:*}; got=$(grep -cF "${pat#*:}" "$OUT/$name.server.log")
     local flag; case $want in Dc) flag=${ARM_DC:-};; Dl) flag=${ARM_DL:-};; Dx) flag=${ARM_DX:-};; Dm) flag=${ARM_DM:-};;
-                              Dpc) flag=${ARM_DPC:-};; Dme) flag=${ARM_DME:-};; "Ds with NK") flag=${ARM_SOLO:-};; esac
+                              Dpc) flag=${ARM_DPC:-};; Dme) flag=${ARM_DME:-};; Dmnq) flag=${ARM_DMNQ:-};; "Ds with NK") flag=${ARM_SOLO:-};; esac
     if [[ -n "$flag" && "$got" == 0 ]]; then
       log "arm $name: $want, but the server log has no '${pat#*:}' line (a radiance or plugin without the switch?); not measured"
       stop_server; return 1
@@ -1177,6 +1177,10 @@ EOF2
   fi
   if ! python3 -I "$HERE/dspark_policy_gate.py" --config "${ARM_DPP:-off}" --nseq "${ARM_POLICY_NSEQ:-1}" --log "$OUT/$name.server.log" >>"$OUT/window.log" 2>&1; then
     log "arm $name: DSpark policy startup/config guard failed; not measured"
+    stop_server; return 1
+  fi
+  if ! python3 -I "$HERE/dspark_query_free_gate.py" --enabled "${ARM_DMNQ:-0}" --log "$OUT/$name.server.log" >>"$OUT/window.log" 2>&1; then
+    log "arm $name: query-free startup guard failed; not measured"
     stop_server; return 1
   fi
   [[ -n "${ARM_DPP:-}" ]] && grep -F 'DSpark prefix policy: on config=' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
@@ -1220,6 +1224,11 @@ EOF2
     log "arm $name: teacher-forced along $lpref: exit $?"
   fi
   stop_server
+  if ! python3 -I "$HERE/dspark_query_free_gate.py" --enabled "${ARM_DMNQ:-0}" --log "$OUT/$name.server.log" --complete >>"$OUT/window.log" 2>&1; then
+    log "arm $name: query-free complete guard failed; not measured"
+    [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
+    return 1
+  fi
   if ! python3 -I "$HERE/dspark_policy_gate.py" --config "${ARM_DPP:-off}" --nseq "${ARM_POLICY_NSEQ:-1}" --log "$OUT/$name.server.log" --complete >>"$OUT/window.log" 2>&1; then
     log "arm $name: DSpark policy action/cycle/config guard failed; not measured"
     [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
@@ -2152,6 +2161,9 @@ for a in $ARMS; do
 # max-num-seqs1 and no Dc/Dl/Dg. Every action runs the SAME configured query (Db2 stays two rows),
 # observer and step_end wait before issue_ahead; only the verified/published prefix changes. Quiet
 # by default; Dpc adds proposal/cycle JSON. All arms explicitly set off unless a Dme part is present.
+# Dmnq is the separate fixed0+Dx1 query-free cost CONTROL; requires Ds-Dme0-Dx-Db2/N1, retains
+# context/reservations/early wait, reports C0NQ and never claims a query epoch. It is off every arm
+# without Dmnq. This is measurement only, with no query-admission predictor or threshold changes.
 # Dpp is a separate default-off prefix policy, supplied ONLY by DSPARK_POLICY_CONFIG=v1:T1:T2
 # after TRAIN fitting. It requires bare Ds, Db2/from1 and no Dme/Dc/Dl/Dg. Multiple sequences
 # additionally require explicit Dx and the native bank's actual sole-drafter proof, no TBO.
@@ -2286,7 +2298,7 @@ for a in $ARMS; do
 # offline in bf16, int8 and int4 against the container's routers); needs a predictor part.
   IFS=- read -r -a parts <<< "$a"
   xt="" bt="" kld="" dk="" db="" pu="" ins_nt="" ins_kib="" ins_wait="" lean="" lc="" ad="" dv="" xd="" hs="" dg="" df="" pmr="" tb=""
-  mb="" lf="" dc="" dl="" dx="" dm="" dpc="" dme="" dpp="" ds="" nseq=""
+  mb="" lf="" dc="" dl="" dx="" dm="" dpc="" dme="" dmnq="" dpp="" ds="" nseq=""
   p1="" q1=() qm="" ql="" qg="" qe="" qsp="" ar_rows="" ag_rows=""
   pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 HOST_POOL_MIB=4096 EXTRA_ARGS="" ARM_HOME="$RHOME" ARM_CONC=
   ARM_PROMPTS= ARM_N= ARM_LQ= rt=
@@ -2406,6 +2418,8 @@ for a in $ARMS; do
                fi ;;
       Dx)      dx=1 ;;                     # the drafter's context pass deferred while nothing drafts (DSPARK_CTX_DEFER)
       Dpc)     dpc=1 ;;                    # read-only candidate-set probability/score/margin capture (DSPARK_PROB_CAPTURE)
+      Dmnq)    if [[ -n "$dmnq" ]]; then log "arm $a: duplicate Dmnq; the arm is skipped"; skip=1; fi
+               dmnq=1 ;;                  # matched fixed0/Dx1; omit ONLY query/observer/query readback
       Dme[0-2])                            # SAME query/observer/early wait, fixed verified prefix0/1/2 (measurement only)
                if [[ -n "$dme" ]]; then log "arm $a: duplicate Dme prefix; the arm is skipped"; skip=1; fi
                dme=${p#Dme} ;;
@@ -2765,6 +2779,10 @@ for a in $ARMS; do
   if [[ -n "$dme" && ( "$ds" != Ds || -n "$dc$dl$dg" || "${nseq:-${MAX_SEQS:-1}}" != 1 ) ]]; then
     log "arm $a: Dme0/1/2 needs bare Ds, one sequence and no Dc/Dl/Dg (Db2/Dkt/Dv/Df retained); the arm is skipped"; skip=1
   fi
+  if [[ -n "$dmnq" && ( "$dme" != 0 || "$dx" != 1 || "$db" != 2 || "$ds" != Ds ||
+                          -n "$dpc$dpp$tb" || "${nseq:-${MAX_SEQS:-1}}" != 1 ) ]]; then
+    log "arm $a: Dmnq requires Ds-Dme0-Dx-Db2, one sequence, no Dpc/Dpp/Tb; the arm is skipped"; skip=1
+  fi
   if [[ -n "$dpp" ]]; then
     policy_conflicts=0; [[ -n "$dme$dc$dl$dg" ]] && policy_conflicts=1
     if ! python3 -I "$HERE/dspark_policy_gate.py" --config "$dpp" --arm "${ds:-none}" "${db:-none}" "${nseq:-${MAX_SEQS:-1}}" "$policy_conflicts" \
@@ -2777,8 +2795,10 @@ for a in $ARMS; do
         RADIANCE_EXPERIMENTAL_DS41_DSPARK_CODEBOOK_RAM=${dm:-0}
         RADIANCE_EXPERIMENTAL_DS41_DSPARK_PROB_CAPTURE=${dpc:-0}
         RADIANCE_EXPERIMENTAL_DS41_DSPARK_EARLY_VERIFY=${dme:-off}
+        RADIANCE_EXPERIMENTAL_DS41_DSPARK_QUERY_FREE=${dmnq:-0}
         "RADIANCE_EXPERIMENTAL_DS41_DSPARK_PREFIX_POLICY=${dpp:-off}")
-  ARM_DC=$dc ARM_DL=$dl ARM_DX=$dx ARM_DM=$dm ARM_DPC=$dpc ARM_DME=$dme ARM_DPP=$dpp
+  ARM_DC=$dc ARM_DL=$dl ARM_DX=$dx ARM_DM=$dm ARM_DPC=$dpc ARM_DME=$dme ARM_DMNQ=$dmnq ARM_DPP=$dpp
+  [[ -n "$dmnq" ]] && ARM_DME= # distinct startup/profile: NQ must not claim an actual matched query
   ARM_POLICY_NSEQ=${nseq:-${MAX_SEQS:-1}}
   # A drafting Ds part under --max-num-seqs above 1 (an NK part, or MAX_SEQS for the window): the
   # scheduler drafts for a sequence alone and says so at startup (arm() checks the line both ways).

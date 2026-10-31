@@ -22,9 +22,12 @@
 # is the DSpark drafter's dense linears from E4M3 codes (RADIANCE_EXPERIMENTAL_DS41_DSPARK_FP8) on it.
 # ds41_tbo_arch_test is deepseek41's two-batch overlap (RADIANCE_EXPERIMENTAL_SCHED_TBO, core/sched/tbo.h)
 # on it: each micro-batch against a lone step of its rows, and no read of the other's writes.
+# ds41_shape_probe_arch_test is deepseek41's sizing declare (RadBuildCtx::shape_probe, for prefill
+# Phase 1's lent arena) on it: the real declare's graph at fewer rows, and the arena levels' sizes.
 set(RAD_TESTS_NO_CORE arch_test glm5next_test mapped_slab_pregrow_test ds41_prefetch_arch_test
                       ds41_prefetch_plan_test ds41_consumer_skip_arch_test consumer_skip_test
-                      ds41_dspark_fp8_arch_test ds41_tbo_arch_test ds41_dspark_defer_arch_test)
+                      ds41_dspark_fp8_arch_test ds41_tbo_arch_test ds41_dspark_defer_arch_test
+                      ds41_shape_probe_arch_test)
 
 # fixture_test tests tools/kfixture.cpp and tools/opshapes.cpp (the seeded draw, the reduction and
 # the on-disk recording) directly, kbench_test tools/kbench_core.cpp (rad-kbench's rules), and

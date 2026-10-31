@@ -27,6 +27,7 @@
 #include "ds41_prefetch_plan.h"
 #include "ista_dialect.h"
 #include "../../core/sched/tbo.h"
+#include "../../tools/ds41-host-experts/ds41_p1.h"   /* the lent arena's switch (probe) */
 
 #include <algorithm>
 #include <cmath>
@@ -533,6 +534,9 @@ struct Model {
      * plane (index_runs()), at most `iparts` runs a step; `kwords` is index_candidates' keep, a bit
      * a block of the candidate layer's width, i32 words a row (0: the model has no candidates). */
     int64_t irows = 0, iparts = 0, kwords = 0;
+    /* A sizing declare (RadBuildCtx::shape_probe; probe()): declared into scratch, never stepped, and
+     * silent (the server log's lines and the window's counts of them are the real declare's). */
+    bool probe = false;
     /* The attention world (geometry()): attention ranks [0, aw), this rank's index `ar` in it and
      * its `gr` output groups; `zero` for an attention-zero rank. */
     int aw = 1, ar = 0;
@@ -1054,11 +1058,18 @@ static int64_t keep_words(int64_t width, int64_t block) {
  * rows is one run, the op as before. */
 static constexpr int64_t kScorePlane = 256ll << 20;
 static constexpr int64_t kScoreRunMin = 256;
-static void index_runs(Model& m) {
+static void index_runs(Model& m, const Model* real) {
     const auto& g = m.g;
     const auto& c = m.c;
     m.irows = std::min(g.max_tok, std::max(kScoreRunMin, kScorePlane / (4 * m.cmax)));
     m.iparts = (g.max_tok + m.irows - 1) / m.irows;
+    /* A sizing declare declares the real one's index_score ops, one a run (their row_part differs), so
+     * it keeps the real run count; its plane is at most its own step's rows. A step of that size takes
+     * one run (step(): runs of the real irows), within the plane. */
+    if (m.probe && real) {
+        m.iparts = real->iparts;
+        m.irows = std::min(g.max_tok, real->irows);
+    }
     m.kwords = 0;
     if (c.cand >= 0 && c.cand < c.n_layer && c.cand_block > 0 && c.ratio[(size_t)c.cand] > 0)
         m.kwords = keep_words(g.max_ctx / c.ratio[(size_t)c.cand] + 1, c.cand_block);
@@ -2505,7 +2516,7 @@ static void cut_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
         if (rc != RAD_OK) why = "the engine refused the declaration (" + std::to_string(rc) + ")";
     }
     if (!why.empty()) {
-        if (ctx->rank == 0)
+        if (ctx->rank == 0 && !m.probe)
             fprintf(stderr, "radiance: deepseek41: consumer skip refused: %s\n", why.c_str());
         rad_note(b, "consumer skip refused: %s", why.c_str());
         return;
@@ -2513,7 +2524,7 @@ static void cut_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
     m.cut_on = true;
     m.cut_b = B;
     m.cut_rows = rad_consumer_row_grain && rad_consumer_row_grain(b) == kCutRowGrain;
-    if (ctx->rank == 0)
+    if (ctx->rank == 0 && !m.probe)
         fprintf(stderr, "radiance: deepseek41: consumer suffix declared: layers %d..%lld see earlier "
                         "rows only through their own %lld-row windows and layer %d's compressed and "
                         "index keys; a cut pass runs layers [0, F) in full and layer F's key ops alone\n",
@@ -2538,7 +2549,7 @@ static int kv_replicate(RadBuilder* b, Model& m) {
     else if (m.g.world <= 1) why = "one rank holds every byte already";
     else if (m.zero || m.aw != m.g.world) why = "a rank keeps no attention cache (attention-zero)";
     if (why) {
-        if (m.g.rank == 0)
+        if (m.g.rank == 0 && !m.probe)
             fprintf(stderr, "radiance: deepseek41: RADIANCE_EXPERIMENTAL_DS41_KV_REPLICATED refused: "
                             "%s\n", why);
         return RAD_OK;
@@ -2552,7 +2563,7 @@ static int kv_replicate(RadBuilder* b, Model& m) {
         }
     for (const auto& kv : m.index) names += (names.empty() ? "" : ",") + std::string("kv_index_r") + std::to_string(kv.first);
     for (const auto& kv : m.comp) names += (names.empty() ? "" : ",") + std::string("kv_compressed_r") + std::to_string(kv.first);
-    if (m.g.rank == 0)
+    if (m.g.rank == 0 && !m.probe)
         fprintf(stderr, "radiance: deepseek41: RADIANCE_EXPERIMENTAL_DS41_KV_REPLICATED: %d paged "
                         "group(s) declared replicated (%s): a host-tier slot holds them once, not "
                         "once a rank\n", n, names.c_str());
@@ -2567,9 +2578,15 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                         "values the model writes); run with --kv-cache-dtype bf16\n");
         return RAD_E_UNSUPPORTED;
     }
-    auto& slot = models[ctx->rank];
+    /* A sizing declare (RadBuildCtx::shape_probe) writes scratch: the step reads models[], which the
+     * real declare filled at the real max_tok. One a thread, as the core runs them (a level and a rank
+     * a thread); `real` is this rank's real declare, done by then. */
+    static thread_local std::unique_ptr<Model> probe_model;
+    const Model* const real = ctx->shape_probe ? models[ctx->rank].get() : nullptr;
+    auto& slot = ctx->shape_probe ? probe_model : models[ctx->rank];
     slot = std::make_unique<Model>();
     auto& m = *slot;
+    m.probe = ctx->shape_probe != 0;
     m.nm = Names(ctx->scope);
     auto& nm = m.nm;
     DS_TRY(read_cfg(m.c, meta));
@@ -2584,10 +2601,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     DS_TRY(dsp_config(b, m, meta, ctx));
     m.dsp_f8 = dsp_f8_gate(m);
     m.tbo = ::rad::tbo::env_on() && rad_declare_two_batch && rad_declare_two_batch(b) == RAD_OK;
-    if (::rad::tbo::env_on() && !m.tbo && ctx->rank == 0)
+    if (::rad::tbo::env_on() && !m.tbo && ctx->rank == 0 && !m.probe)
         fprintf(stderr, "radiance: deepseek41: RADIANCE_EXPERIMENTAL_SCHED_TBO=1, but this engine does not "
                         "carry rad_declare_two_batch (or refused it): no step is split\n");
-    if (m.tbo && ctx->rank == 0)
+    if (m.tbo && ctx->rank == 0 && !m.probe)
         fprintf(stderr, "radiance: deepseek41: two-batch overlap (RADIANCE_EXPERIMENTAL_SCHED_TBO=1): a "
                         "decode step of two or more sequences is issued as two micro-batches, each "
                         "layer's MoE gather of one behind the other's card work\n");
@@ -2604,8 +2621,12 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     for (int l = 0; l < c.n_layer; ++l)
         if (c.ratio[(size_t)l] > 0 && (rmin == 0 || c.ratio[(size_t)l] < rmin)) rmin = c.ratio[(size_t)l];
     m.work = g.max_tok + g.max_seqs;
+    /* A sizing declare keeps the real bound: step() issues the compressor tail's page, bpos and stage,
+     * and the pooled, latent and index-key rows after them, at m.work rows whatever the step's size, so
+     * those buffers (~20 MiB at 2,048 rows) keep their real rows at every level. */
+    if (m.probe && real) m.work = real->work;
     m.cmax = g.max_ctx / std::max<int64_t>(rmin, 1) + 1;
-    index_runs(m);
+    index_runs(m, real);
     DS_TRY(buffers(b, m));
     /* The drafter's source rows, one hc-mean row a target layer, written by the trunk step. With
      * ..._DSPARK_CTX_DEFER, beside them the persistent history of every sequence's (Dsp::ctx_defer). */
@@ -2743,7 +2764,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.layers.resize((size_t)c.n_layer);
     for (int l = 0; l < c.n_layer; ++l) DS_TRY(layer(b, m, m.layers[(size_t)l], l));
     DS_TRY(kv_replicate(b, m));
-    if (m.router_bf16 && g.rank == 0)
+    if (m.router_bf16 && g.rank == 0 && !m.probe)
         fprintf(stderr, "radiance: deepseek41: RADIANCE_EXPERIMENTAL_DS41_ROUTER_BF16: %d routers "
                         "and %d compressor kv|gate projections read as bf16 (gemm_nt_f32bf16), "
                         "%.1f MiB less a card; the load refuses any f32 one with a nonzero low "
@@ -2777,12 +2798,12 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * liveness, and its passes run behind the step). */
     if (m.dsp.on) DS_TRY(dsp_declare(b, m, ctx));
     cut_declare(b, m, ctx);
-    pf_note(m, ctx->rank);
+    if (!m.probe) pf_note(m, ctx->rank);
     rad_note(b, "DeepSeek-V4.1: %lld layers, hc %lld, window %lld, %zu kv sources, %zu index "
                 "sources, %lld experts top-%lld, Engram at %zu layers",
              (long long)c.n_layer, (long long)c.hc, (long long)c.window, c.kv_src.size(),
              c.idx_src.size(), (long long)c.n_expert, (long long)c.top_k, c.ple.size());
-    if (m.f8_on) {
+    if (m.f8_on && !m.probe) {
         /* In the server log, not only the graph dump: the A/B harness requires this line of an
          * arm that sets the knob (ab_window.sh's F8 part). */
         char msg[400];
@@ -2796,7 +2817,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         fprintf(stderr, "radiance: %s\n", msg);
         rad_note(b, "%s", msg);
     }
-    if (m.dsp_f8) {
+    if (m.dsp_f8 && !m.probe) {
         /* ab_window.sh's Df part requires this line of an arm that sets the knob, with N above 0,
          * and no other arm may have it. */
         char msg[400];
@@ -3634,6 +3655,12 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
         out->draft_depth = (int)blk;
         out->draft_depth_fixed = 1;
     }
+    /* declare() honours RadBuildCtx::shape_probe (a sizing declare into scratch, silent, with the real
+     * declare's op list), so the core can lay out the activation arena for smaller steps. Said only
+     * beside prefill Phase 1's lent arena (ds41p1::lend_arena_asked), its one user under a static plan:
+     * anywhere else the core would lend the arena to the expert slab of a dynamic plan, which nothing
+     * has measured for this model, and every other start stays as it was. */
+    out->shape_probe_ok = ds41p1::lend_arena_asked() ? 1 : 0;
     return RAD_OK;
 }
 

@@ -2,7 +2,7 @@
   "scope": "DeepSeek-V4.1-Flash (ds41) CPU-expert research checkpoint: exact engine source, reports and A/B window evidence; no model payload, research binaries, private serving configuration, credentials or deployment",
   "engine_repo": "/home/as/radiance-ds41-claude",
   "engine_branch": "claude/ds41-decode-impl",
-  "engine_commit": "5120c835dd431177f7a48537aa4b1bb731e3ba2d",
+  "engine_commit": "e184c6b7f019535a592e5c1474bac38b7ba6a360",
   "engine_upstream": {
     "repository": "https://codeberg.org/StillDeadcode/radiance",
     "note": "Radiance upstream plus the deepseek41 architecture work of its pull request 266; the commits after them are this work (ds41 RAM cache and CPU experts)",
@@ -41,7 +41,9 @@
     "PREFILL-200-DESIGN.md",
     "PHASE1-PLAN.md",
     "PREFILL-P0.md",
-    "UPSTREAM-SYNC-20261031.md"
+    "UPSTREAM-SYNC-20261031.md",
+    "LONG-CONTEXT.md",
+    "SECOND-SERVER.md"
   ],
   "research": [
     "ds41_supply_model.py",
@@ -60,7 +62,16 @@
     "membw_dur.cpp",
     "membw_dur.bwmix.sh",
     "membw_dur.bwmix.out.txt",
-    "kl_docs.py"
+    "kl_docs.py",
+    "ds41_policy_fit_once.py",
+    "ds41_policy_extract_quiet.py",
+    "ds41_policy_fit_plan.json",
+    "ds41_policy_fit_once.json",
+    "ds41_policy_matched_costs.json",
+    "ds41_policy_metadata_frozen.json",
+    "ds41_policy_real_summary.json",
+    "ds41_collective_summary.json",
+    "ds41_rows_summary.json"
   ],
   "docs_left_out": {
     "READAHEAD-PLAN-EXCERPT.md": "scratch: a verbatim excerpt of RESEARCH-2-RANKED-PLAN.md section #5, used as an agent prompt",
@@ -68,7 +79,8 @@
     "night-report.html": "generated HTML rendering of an older NIGHT-LOG.md",
     "plan.html": "generated HTML rendering of PLAN.md",
     "review.html": "generated HTML rendering of REVIEW.md",
-    "mrbench.out.txt": "names the machine's private hostname; its numbers are quoted in NIGHT-LOG.md (07:15-07:22)"
+    "mrbench.out.txt": "names the machine's private hostname; its numbers are quoted in NIGHT-LOG.md (07:15-07:22)",
+    "HANDOFF.md": "Operational handoff: active process/lock/service ownership and local continuation commands; results and plans are in NIGHT-LOG.md and NEXT-STEPS.md."
   },
   "windows_dir": "/home/as/radiance-ds41-claude/tools/ds41-host-experts/build",
   "windows": [
@@ -186,7 +198,19 @@
     "ab-20261031T104524Z",
     "ab-20261031T111018Z",
     "ab-20261031T114348Z",
-    "ab-20261031T115207Z"
+    "ab-20261031T115207Z",
+    "ab-20261031T123034Z",
+    "ab-20261031T130014Z",
+    "ab-20261031T134615Z",
+    "ab-20261031T144623Z",
+    "ab-20261031T152308Z",
+    "ab-20261031T154102Z",
+    "ab-20261031T162629Z",
+    "ab-20261031T165338Z",
+    "ab-20261031T175623Z",
+    "ab-20261031T180730Z",
+    "ab-20261031T182505Z",
+    "ab-20261031T185127Z"
   ],
   "server_log_windows": {
     "ab-20261028T223812Z": "base engine decode, 5.03 tok/s",
@@ -210,7 +234,19 @@
     "ab-20261031T104524Z": "the merged base engine's replies and the CPU-path checks",
     "ab-20261031T111018Z": "DSML device gates and off/on references; initial live request exposed missing template",
     "ab-20261031T114348Z": "DSML parsed live tool call; trivial request chose empty reasoning before probe revision",
-    "ab-20261031T115207Z": "DSML chat parsing and generated-token identity with explicit template on unchanged chat and harness prompts"
+    "ab-20261031T115207Z": "DSML chat parsing and generated-token identity with explicit template on unchanged chat and harness prompts",
+    "ab-20261031T123034Z": "Rb beside P1 initial long and concurrency gate",
+    "ab-20261031T130014Z": "Read-only proposal capture and complete outcome binding",
+    "ab-20261031T134615Z": "P1 Vp actual packed residents; invalid long leg retained",
+    "ab-20261031T144623Z": "Corrected long and96GiB spill plus reversed concurrency repeat",
+    "ab-20261031T152308Z": "Matched fixed0/1/2 proposal identity and context lifecycle audit",
+    "ab-20261031T154102Z": "Quiet TRAIN-only matched verification costs",
+    "ab-20261031T162629Z": "4K corpus and long/prefix/small-cache gate",
+    "ab-20261031T165338Z": "Frozen adaptive policy real engine and heldout results",
+    "ab-20261031T175623Z": "Failed mixed-client admission attempt and passing backup/window codec cards",
+    "ab-20261031T180730Z": "Exact bank lending192/96 transitions and measured short-burst loss",
+    "ab-20261031T182505Z": "Exact AR and Engram gather slices with mixed performance",
+    "ab-20261031T185127Z": "Exact P1 span and n128, nearly neutral timing"
   },
   "allowed_emails": [
     "aselzer3@gmail.com",
@@ -224,5 +260,5 @@
   },
   "max_file_bytes": 50000000,
   "max_text_bytes": 20000000,
-  "max_added_bytes": 60000000
+  "max_added_bytes": 100000000
 }

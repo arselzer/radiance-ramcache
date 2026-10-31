@@ -27548,6 +27548,145 @@ static bool ar_pattern_check(const RadKernelInfo* row, const std::vector<int>& d
     return true;
 }
 
+/* DS41's architecture-side row slices use these unchanged launchers on smaller messages. Hold
+ * the whole output, guard regions and exceptional-value payloads to an unsliced launch, across
+ * both message-size boundaries and sequence wrap. No tolerance or NaN-equivalence comparison. */
+using ArSeedSeq = int (*)(void*, unsigned int, unsigned int);
+struct ArRowsRank {
+    const RadKernelInfo *one = nullptr, *two = nullptr;
+    ArSeedSeq seed = nullptr;
+    StBarrier* barrier = nullptr;
+    std::vector<ArRowsRank>* all = nullptr;
+    int rank = 0, dev = 0, cap = 1024, ts_min = 32768;
+    unsigned int handshake = 0, parity = 0;
+    void *whole = nullptr, *sliced = nullptr;
+    int rc = RAD_OK, setup_rc = RAD_E_STATE;
+    size_t bad = 0, fold_bad = 0;
+};
+static uint16_t ar_rows_value(int rank, int64_t i) {
+    switch (i % 257) {
+    case 0: return 0;
+    case 1: return 0x8000;
+    case 2: return rank == 0 ? 0x7F80 : 0x3F80;
+    case 3: return rank == 1 ? 0xFF80 : 0x3F80;
+    case 4: return (uint16_t)(0x7F81 + rank);   /* distinct signaling NaN payloads */
+    case 5: return (uint16_t)(0x7FC1 + rank);
+    case 6: return (uint16_t)(rank + 1);         /* subnormal */
+    default: return h_to_bf16(ar_rough_value(rank, i));
+    }
+}
+static void ar_rows_worker(ArRowsRank* t) {
+    constexpr int64_t D = 5120, C = 2048, guard = 16, most = C * D, total = most + 2 * guard;
+    hipStream_t stream = nullptr;
+    void *a = nullptr, *b = nullptr, *ao = nullptr, *bo = nullptr;
+    t->rc = st_set_device(t->dev) == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+    if (t->rc == RAD_OK && hipStreamCreate(&stream) != hipSuccess) t->rc = RAD_E_DEVICE;
+    const RadParam whole[] = { PI("world_size", 4), PI("numel", most), PS("dtype", "bf16"), PI("exact", 1) };
+    const RadParam part[] = { PI("world_size", 4), PI("numel", (int64_t)t->cap * D),
+                              PS("dtype", "bf16"), PI("exact", 1) };
+    if (t->rc == RAD_OK) t->rc = t->two->init(whole, 4, t->rank, 4, &t->whole);
+    if (t->rc == RAD_OK) t->rc = t->two->init(part, 4, t->rank, 4, &t->sliced);
+    if (t->rc == RAD_OK && (hipMalloc(&a, total * 2) != hipSuccess || hipMalloc(&b, total * 2) != hipSuccess ||
+                            hipMalloc(&ao, total * 2) != hipSuccess || hipMalloc(&bo, total * 2) != hipSuccess))
+        t->rc = RAD_E_NOMEM;
+    if (t->rc == RAD_OK) t->rc = t->seed(t->whole, t->handshake, t->parity);
+    if (t->rc == RAD_OK) t->rc = t->seed(t->sliced, t->handshake, t->parity);
+    t->setup_rc = t->rc;
+    t->barrier->wait();   /* nobody launches while a peer is still allocating or seeding flags */
+    bool ready = true;
+    for (const auto& r : *t->all) ready = ready && r.setup_rc == RAD_OK;
+    if (ready) {
+        const int sizes[] = { 2048, 1, 6, 7, 102, 103, 1024, 1025, 1023, 17, 2048 };
+        std::vector<uint16_t> input(total, 0x5AA5), output(total, 0xA55A), gold(total), got(total);
+        auto launch = [&](void* in, void* out, int64_t off, int64_t n, void* inst, int blocks) {
+            RadTensor ts[2] = { T((uint16_t*)in + guard + off, RAD_BF16, { n }),
+                               T((uint16_t*)out + guard + off, RAD_BF16, { n }) };
+            const RadParam ps[] = { PI("world_size", 4), PI("numel", n), PS("dtype", "bf16"), PI("exact", 1),
+                                    PI("nblocks", blocks), PI("nthreads", 256), PI("ts_min", t->ts_min) };
+            RadArgs args{};
+            args.t = ts; args.n_t = out == in ? 1 : 2; args.p = ps; args.n_p = 7;
+            args.instance = inst; args.rank = t->rank; args.world_size = 4;
+            const RadKernelInfo* row = n <= 524288 ? t->one : t->two;
+            return row->launch(&args, stream);
+        };
+        for (size_t k = 0; k < sizeof(sizes) / sizeof(sizes[0]); ++k) {
+            const int64_t n = (int64_t)sizes[k] * D;
+            std::fill(input.begin(), input.end(), 0x5AA5);
+            for (int64_t i = 0; i < n; ++i) input[(size_t)guard + i] = ar_rows_value(t->rank, i);
+            st_memcpy(a, input.data(), total * 2, hipMemcpyHostToDevice);
+            st_memcpy(b, input.data(), total * 2, hipMemcpyHostToDevice);
+            const bool oop = k % 2 != 0;
+            void *ya = oop ? ao : a, *yb = oop ? bo : b;
+            if (oop) {
+                st_memcpy(ao, output.data(), total * 2, hipMemcpyHostToDevice);
+                st_memcpy(bo, output.data(), total * 2, hipMemcpyHostToDevice);
+            }
+            const int blocks = 2 << (k % 4);   /* blocks can disappear and return across tails */
+            int rc = launch(a, ya, 0, n, t->whole, blocks);
+            for (int64_t off = 0; off < n && rc >= 0; off += (int64_t)t->cap * D) {
+                const int64_t count = std::min((int64_t)t->cap * D, n - off);
+                rc = launch(b, yb, off, count, t->sliced, blocks);
+            }
+            st_stream_sync(stream);
+            if (rc < 0) t->rc = rc;
+            st_memcpy(gold.data(), ya, total * 2, hipMemcpyDeviceToHost);
+            st_memcpy(got.data(), yb, total * 2, hipMemcpyDeviceToHost);
+            for (int64_t i = 0; i < total; ++i) {
+                t->bad += gold[(size_t)i] != got[(size_t)i];
+                if (i < guard || i >= guard + n)
+                    t->bad += got[(size_t)i] != (oop ? output[(size_t)i] : input[(size_t)i]);
+            }
+            /* The byte comparison above covers every value, including NaN payloads. Also sample
+             * the finite reference fold, whose exponent spread detects a changed rank order. */
+            for (int64_t i = 0; i < n; i += 127) {
+                if (i % 257 < 7) continue;
+                volatile float acc = 0.0f;
+                for (int rank = 0; rank < 4; ++rank) acc = acc + h_bf16(ar_rows_value(rank, i));
+                t->fold_bad += got[(size_t)guard + i] != h_to_bf16(acc);
+            }
+            if (oop) {
+                st_memcpy(got.data(), a, total * 2, hipMemcpyDeviceToHost);
+                t->bad += got != input;
+                st_memcpy(got.data(), b, total * 2, hipMemcpyDeviceToHost);
+                t->bad += got != input;
+            }
+        }
+    }
+    for (void* p : { a, b, ao, bo }) if (p) st_free(p);
+    if (stream) hip_ck(hipStreamDestroy(stream), "hipStreamDestroy", __LINE__);
+}
+static void ds41_ar_rows_exact(const Plugin& pl, const std::vector<int>& devs) {
+    const char* name = "ds41_ar_rows_exact";
+    if (devs.size() < 4 || !ar_peer_path_ok(devs, 4)) { skip(name, "needs four P2P cards"); return; }
+    const RadKernelInfo *one = find(pl, "ar_oneshot_4rank_exact"), *two = find(pl, "ar_twoshot_4rank_exact");
+    const auto seed = (ArSeedSeq)dlsym(pl.h, "r4d_ar_test_seed_seq");
+    if (!one || !two || !seed) { ok(name, false, "missing exact rows or test seed hook"); return; }
+    for (int cap : { 1024, 64 }) for (int ts_min : { 0, 32768 }) {
+        std::vector<ArRowsRank> ranks(4);
+        StBarrier barrier(4);
+        std::vector<std::thread> threads;
+        for (int rank = 0; rank < 4; ++rank) {
+            auto& r = ranks[(size_t)rank];
+            r.one = one; r.two = two; r.seed = seed; r.barrier = &barrier; r.all = &ranks;
+            r.rank = rank; r.dev = devs[(size_t)rank]; r.cap = cap; r.ts_min = ts_min;
+            r.handshake = cap == 1024 ? 0x7FFFFFFEu : 0xFFFFFFFEu;
+            r.parity = cap == 1024 ? 0 : 1;
+            threads.emplace_back(ar_rows_worker, &r);
+        }
+        for (auto& t : threads) t.join();
+        size_t bad = 0, folds = 0;
+        bool up = true;
+        for (const auto& r : ranks) { bad += r.bad; folds += r.fold_bad; up = up && r.rc == RAD_OK; }
+        ok((std::string(name) + " cap " + std::to_string(cap) + ", ts_min " + std::to_string(ts_min)).c_str(),
+           up && !bad && !folds, std::to_string(bad) + " byte/guard/source differences, " +
+           std::to_string(folds) + " finite-fold samples differ (thresholds, tails, in/out of place, wrap)");
+        for (const auto& r : ranks) {
+            if (r.whole) two->fini(r.whole);
+            if (r.sliced) two->fini(r.sliced);
+        }
+    }
+}
+
 static void ar_wide_pattern(const Plugin& pl, const std::vector<int>& devs, const char* name,
                             int world) {
     const RadKernelInfo* row = find(pl, name);
@@ -32904,6 +33043,8 @@ static void device_phase(const Plugin& pl) {
                                           { 512, 5120 } };
         for (const auto& nk : kNK) bf16_band_edge(pl, nk[0], nk[1]);
     }
+
+    if (sel("ds41_ar_rows_exact")) ds41_ar_rows_exact(pl, devs);
 
     /* Every collective has a host twin (r4d_rows.cpp): the same kernel with its mailbox in pinned
      * host memory. A case is the pair's, so the twin is held to exactly the original's checks. */

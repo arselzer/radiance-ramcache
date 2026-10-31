@@ -32,6 +32,7 @@
 #include "../../tools/ds41-host-experts/ds41_p1.h"   /* the lent arena's switch (probe) */
 
 #include <algorithm>
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -555,6 +556,7 @@ struct Model {
     Cfg c{};
     std::vector<Layer> layers;
     int64_t work = 0, cmax = 0;
+    int64_t ar_rows = 0;   /* default-off exact collective row bound; Engram all_gather stays whole */
     /* The compressor tail's work rows a step issues (work_rows()): fitted to the step where libr4d
      * gives every op on them a row's bits at any height (norms_pinned()), else `work` whatever the
      * step, as before. */
@@ -1001,6 +1003,36 @@ static void shared_slice(int64_t n_ff, int world, int rank, int64_t* lo, int64_t
     const int64_t b0 = rank * base + std::min<int64_t>(rank, extra);
     *lo = b0 * kSharedBlock;
     *hi = (b0 + base + (rank < extra ? 1 : 0)) * kSharedBlock;
+}
+
+static constexpr const char* kArRowsEnv = "RADIANCE_EXPERIMENTAL_DS41_AR_ROWS";
+/* No model/cache-size constants: only the exact four-rank bf16 wire and its 64-element row-table
+ * alignment. Other deployments keep their original whole messages even with the switch set. */
+static int ar_rows_config(Model& m, const char* value) {
+    m.ar_rows = 0;
+    if (!value || !*value) return RAD_OK;
+    int64_t rows = 0;
+    for (const char* p = value; *p; ++p) {
+        if (*p < '0' || *p > '9' || rows > (INT64_MAX - (*p - '0')) / 10) return RAD_E_INVAL;
+        rows = rows * 10 + (*p - '0');
+    }
+    if (!rows) return RAD_OK;
+    if (m.g.world == 4 && m.g.n_embd > 0 && m.g.n_embd % 64 == 0)
+        m.ar_rows = std::min(rows, m.g.max_tok);
+    return RAD_OK;
+}
+static int64_t ar_bound_rows(const Model& m, int64_t rows) {
+    return m.ar_rows > 0 ? std::min(rows, m.ar_rows) : rows;
+}
+/* Each row keeps its original ascending-rank fp32 fold and single bf16 store. These are ordinary
+ * complete collectives in stream order: their own sequence/parity step and link hold per slice. */
+static void issue_ar_rows(RadCtx* x, rad_op ar, rad_buf buffer, int64_t r0, int64_t rows,
+                          int64_t width, int64_t cap) {
+    for (int64_t at = 0; at < rows;) {
+        const int64_t n = cap > 0 ? std::min(cap, rows - at) : rows - at;
+        RAD_ISSUE_N(x, ar, n * width, brow_slice(buffer, r0 + at, n, width), RAD_NONE);
+        at += n;
+    }
 }
 
 static int geometry(Model& m, const RadBuildCtx* ctx) {
@@ -1748,7 +1780,7 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
     /* The heads' partial outputs (zeros on an attention-zero rank) summed over every rank. */
     if (g.world > 1)
         L.ar_attn = op(b, "all_reduce",
-                       { RAD_INT("world_size", g.world), RAD_RANGE("numel", D, T * D),
+                       { RAD_INT("world_size", g.world), RAD_RANGE("numel", D, ar_bound_rows(m, T) * D),
                          RAD_STR("dtype", "bf16"), RAD_INT("exact", g.wire_exact),
                          RAD_INT("min_bytes", g.wire_min_bytes) },
                        {}, { m.attn_out }, { m.attn_out });
@@ -1794,6 +1826,7 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
                        !f8_skipped(m, nm.f("blk.%d.ffn_down_shexp.weight", l));
     s.cfg.shared_bf16_op = sh_f8 ? kDenseF8 : nullptr;
     DS_TRY(MoeFP8::probe(b, nm, l, s, &s.cfg));
+    L.moe.ar_rows = m.ar_rows;
     DS_TRY(L.moe.declare(b, nm, g, l, m.mw, s, false, false));
     if (m.f8_on && g.n_ff > 0)
         for (const LinearFP8* sl : { &L.moe.sh_gate_up, &L.moe.sh_down }) {
@@ -2060,7 +2093,7 @@ static int dsp_stage_ops(RadBuilder* b, Model& m, Layer& L) {
     }
     if (g.world > 1)
         L.ar_attn = op(b, "all_reduce",
-                       { RAD_INT("world_size", g.world), RAD_RANGE("numel", D, Q * D), RAD_STR("dtype", "bf16"),
+                       { RAD_INT("world_size", g.world), RAD_RANGE("numel", D, ar_bound_rows(m, Q) * D), RAD_STR("dtype", "bf16"),
                          RAD_INT("exact", g.wire_exact), RAD_INT("min_bytes", g.wire_min_bytes) },
                        {}, { d.attn_out }, { d.attn_out });
     L.post_a = op(b, "mhc_post", hcp, {}, { d.attn_out, d.h0, d.post, d.comb }, { d.h1 });
@@ -2091,6 +2124,7 @@ static int dsp_stage_ops(RadBuilder* b, Model& m, Layer& L) {
                        !f8_skipped(m, nm.f("blk.%d.ffn_down_shexp.weight", l));
     s.cfg.shared_bf16_op = sh_f8 ? kDenseF8 : nullptr;
     DS_TRY(MoeFP8::probe(b, nm, l, s, &s.cfg));
+    L.moe.ar_rows = m.ar_rows;
     DS_TRY(L.moe.declare(b, nm, g, l, d.mw, s, false, false));
     if (m.dsp_f8 && g.n_ff > 0)
         for (const LinearFP8* sl : { &L.moe.sh_gate_up, &L.moe.sh_down }) {
@@ -2263,7 +2297,7 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
                      { m.token }, {}, { d.x });
     if (g.world > 1)
         d.embed_ar = op(b, "all_reduce",
-                        { RAD_INT("world_size", g.world), RAD_RANGE("numel", D, Q * D), RAD_STR("dtype", "bf16"),
+                        { RAD_INT("world_size", g.world), RAD_RANGE("numel", D, ar_bound_rows(m, Q) * D), RAD_STR("dtype", "bf16"),
                           RAD_INT("exact", 1) },
                         {}, { d.x }, { d.x });
     d.expand = op(b, "cast", { RAD_RANGE("M", 1, Q), RAD_INT("n", D), RAD_STR("from", "bf16"), RAD_STR("to", "bf16") },
@@ -2671,6 +2705,13 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.pfc = pf_env();
     naming = &m;
     DS_TRY(geometry(m, ctx));
+    if (ar_rows_config(m, std::getenv(kArRowsEnv)) != RAD_OK) {
+        fprintf(stderr, "radiance: deepseek41: %s must be a nonnegative whole row count (0/unset off)\n", kArRowsEnv);
+        return RAD_E_INVAL;
+    }
+    if (m.ar_rows > 0 && ctx->rank == 0 && !m.probe)
+        fprintf(stderr, "radiance: deepseek41: exact AR row slices: at most %lld rows (%s); all_reduce "
+                        "bounds and launches sliced, Engram all_gather unchanged\n", (long long)m.ar_rows, kArRowsEnv);
     m.f8_on = dense_f8_gate(b, meta, m);
     DS_TRY(dsp_config(b, m, meta, ctx));
     m.dsp_f8 = dsp_f8_gate(m);
@@ -2745,7 +2786,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                      { m.token }, {}, { m.xcol });
     if (g.world > 1)
         m.embed_ar = op(b, "all_reduce",
-                        { RAD_INT("world_size", g.world), RAD_RANGE("numel", D, T * D),
+                        { RAD_INT("world_size", g.world), RAD_RANGE("numel", D, ar_bound_rows(m, T) * D),
                           RAD_STR("dtype", "bf16"), RAD_INT("exact", 1) },
                         {}, { m.xcol }, { m.xcol });
     m.expand = op(b, "cast",
@@ -2966,7 +3007,10 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
     }
 
     RAD_ISSUE_N(x, d.embed, T, praw(batch->token_ids, RAD_I32, T), RAD_W(m.token), brows(d.x, T));
-    if (d.embed_ar) RAD_ISSUE_N(x, d.embed_ar, T * D, brows(d.x, T), RAD_NONE);
+    if (d.embed_ar) {
+        if (m.ar_rows > 0) issue_ar_rows(x, d.embed_ar, d.x, 0, T, D, m.ar_rows);
+        else RAD_ISSUE_N(x, d.embed_ar, T * D, brows(d.x, T), RAD_NONE);
+    }
     for (int64_t i = 0; i < c.hc; ++i) RAD_ISSUE_N(x, d.expand, T, brows(d.x, T), bcol(d.h0, i * D, D, T));
     RAD_ISSUE_N(x, d.pre0, T, brows(d.pre_f, T));
     RAD_ISSUE_N(x, d.pre1, T, bcol(d.pre_f, 0, 1, T));
@@ -3004,7 +3048,10 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
                             bcol(d.oa, j * c.o_rank, c.o_rank, T));
             RAD_ISSUE_N(x, L.o_b, T, brows(d.oa, T), RAD_W(L.wo_b), brows(d.attn_out, T));
         }
-        if (L.ar_attn) RAD_ISSUE_N(x, L.ar_attn, T * D, brows(d.attn_out, T), RAD_NONE);
+        if (L.ar_attn) {
+            if (m.ar_rows > 0) issue_ar_rows(x, L.ar_attn, d.attn_out, 0, T, D, m.ar_rows);
+            else RAD_ISSUE_N(x, L.ar_attn, T * D, brows(d.attn_out, T), RAD_NONE);
+        }
         RAD_ISSUE_N(x, L.post_a, T, brows(d.attn_out, T), brows(d.h0, T), brows(d.post, T), brows(d.comb, T),
                     brows(d.h1, T));
         RAD_ISSUE_N(x, L.mix_f, T, brows(d.h1, T), RAD_W(L.hc_f_fn), RAD_W(L.hc_f_scale), RAD_W(L.hc_f_base),
@@ -3131,7 +3178,10 @@ static void step(RadCtx* x, const RadBatch* batch) {
     const RadOperand wused = praw(wb->seqused, RAD_I32, S);
 
     RAD_ISSUE_N(x, m.embed, T, praw(batch->token_ids, RAD_I32, T), RAD_W(m.token), brows(m.xcol, T));
-    if (m.embed_ar) RAD_ISSUE_N(x, m.embed_ar, T * D, brows(m.xcol, T), RAD_NONE);
+    if (m.embed_ar) {
+        if (m.ar_rows > 0) issue_ar_rows(x, m.embed_ar, m.xcol, 0, T, D, m.ar_rows);
+        else RAD_ISSUE_N(x, m.embed_ar, T * D, brows(m.xcol, T), RAD_NONE);
+    }
     for (int64_t i = 0; i < c.hc; ++i)
         RAD_ISSUE_N(x, m.expand, T, brows(m.xcol, T), bcol(m.h0, i * D, D, T));
     RAD_ISSUE_N(x, m.pre0, T, brows(m.pre_f, T));
@@ -3587,7 +3637,10 @@ static void step(RadCtx* x, const RadBatch* batch) {
             RAD_ISSUE_N(x, L.o_b, nf, FR(m.oa, ow), RAD_W(L.wo_b), FR(m.attn_out, D));
         }
         if (key_only) return 1;   /* an attention-zero rank's key layer: its collapse alone */
-        if (L.ar_attn) RAD_ISSUE_N(x, L.ar_attn, nf * D, FR(m.attn_out, D), RAD_NONE);
+        if (L.ar_attn) {
+            if (m.ar_rows > 0) issue_ar_rows(x, L.ar_attn, m.attn_out, rf, nf, D, m.ar_rows);
+            else RAD_ISSUE_N(x, L.ar_attn, nf * D, FR(m.attn_out, D), RAD_NONE);
+        }
         if (L.pcn_f)   /* post_a, col_f and norm_f in one */
             RAD_ISSUE_N(x, L.pcn_f, nf, FR(m.attn_out, D), FR(m.h0, HN), FR(m.post, hc),
                         FR(m.comb, hc * hc), FR(m.h1, HN), FR(m.pre_a, hc), FR(m.xcol, D),

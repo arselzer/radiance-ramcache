@@ -9,7 +9,8 @@
 #      stated off; the adopted arm itself states P1 off; P1 at the default threshold with M16, Ql12 on
 #      B6's ring, Qh without Ql and Ql without P1 are skipped; Qm17 with M16 is launched; P1 at Lc2048 with
 #      Qe64 and M2048 is launched with the lent arena on, Qh beside Qe alone too; Qe at M1024 beside Lc2048
-#      and Qe without P1 are skipped.
+#      and Qe without P1 are skipped; Lc4096 with explicit Pci4096 works cold or cached, while
+#      a missing/short interval, another prefix-only part without Pc, or Lc4112 are refused.
 # Exit 0 when every check passes.
 set -u
 W=${1:-$(dirname "$0")/ab_window.sh}
@@ -103,7 +104,14 @@ BIG=$pre-M2048-$mid-B6-$post2k-P1-Qe64-Cs-Mb1-Lm4096
 BIGG=$pre-M2048-$mid-B6-$post2k-P1-Qe64-Qh3000-Cs-Mb1-Lm4096
 BIGM=$pre-M1024-$mid-B6-$post2k-P1-Qe64-Cs-Mb1-Lm4096
 ENOP=$pre-M1024-$mid-B1-$post-Qe64-Cs-Mb1-Lm4096
-ARMS="$REF $NEW $NEWG $SHORTM $Q17 $OVERL $GNOL $LNOP $BIG $BIGG $BIGM $ENOP"
+post4k=${post%-Lc1024}-Lc4096
+COLD4K=$pre-M4096-$mid-B6-$post4k-P1-Qe64-Pci4096-Cs-Mb1-Lm8192
+PC4K=$pre-M4096-$mid-B6-$post4k-P1-Qe64-Pc-Pci4096-Cs-Mb1-Lm8192
+NOINT4K=$pre-M4096-$mid-B6-$post4k-P1-Qe64-Cs-Mb1-Lm8192
+LOWINT4K=$pre-M4096-$mid-B6-$post4k-P1-Qe64-Pci2048-Cs-Mb1-Lm8192
+NOPC4K=$pre-M4096-$mid-B6-$post4k-P1-Qe64-Pci4096-Pce-Cs-Mb1-Lm8192
+OVER4K=$pre-M4112-$mid-B6-${post%-Lc1024}-Lc4112-P1-Qe64-Pci8192-Cs-Mb1-Lm8192
+ARMS="$REF $NEW $NEWG $SHORTM $Q17 $OVERL $GNOL $LNOP $BIG $BIGG $BIGM $ENOP $COLD4K $PC4K $NOINT4K $LOWINT4K $NOPC4K $OVER4K"
 out=$(
   set +u
   log() { echo "LOG: $*"; }
@@ -115,7 +123,7 @@ out=$(
   unset RADIANCE_TUNE
   SUM=$(sha256sum "$H/kernels/libr4d.so" | cut -d' ' -f1); LIB=$H/kernels/libr4d.so
   TALL_OK=1 TALL_WHY=test TALL_SUM=$SUM TALL_LIB=$LIB DK_OK=1 DK_WHY=test DK_SUM=$SUM DK_LIB=$LIB
-  RB_OK=1 RB_WHY=test RB_SUM=$SUM RB_LIB=$LIB LCP_OK=1 LCP_WHY=test LCP_SUM=$SUM LCP_LIB=$LIB LCP_C=2048
+  RB_OK=1 RB_WHY=test RB_SUM=$SUM RB_LIB=$LIB LCP_OK=1 LCP_WHY=test LCP_SUM=$SUM LCP_LIB=$LIB LCP_C=4096
   BAL_OK=1 BAL_WHY=test BAL_SUM=$SUM BAL_LIB=$LIB P1_OK=1 P1_WHY=test P1_SUM=$SUM P1_LIB=$LIB
   OUT=$T/out; mkdir -p "$OUT"; CANCEL_FILE=/nonexistent/cancel; CANCEL=$CANCEL_FILE
   eval "$(sed -n '/^hotset_for() {/,/^}/p' "$W")"
@@ -176,12 +184,20 @@ for a in "$BIG" "$BIGG"; do
   [[ "$sec" == *"--max-num-batched-tokens 2048"* ]] && ok "$n: chunks of 2048" || bad "$n: no --max-num-batched-tokens 2048"
 done
 has "P1+Lc2048+Qe64+Qh3000" "$(section "$BIGG")" RADIANCE_EXPERIMENTAL_DS41_P1_GRACE_MS 3000
-for a in "$SHORTM" "$OVERL" "$GNOL" "$LNOP" "$BIGM" "$ENOP"; do
+for a in "$COLD4K" "$PC4K"; do
+  sec=$(section "$a")
+  if [[ -z "$sec" ]]; then bad "4K arm $a was not launched"; continue; fi
+  has "LCP4096" "$sec" RADIANCE_EXPERIMENTAL_DS41_LCP 4096
+  has "LCP4096" "$sec" RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MISSES 4096
+  has "LCP4096" "$sec" RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA 64
+  [[ "$sec" == *"--checkpoint-interval 4096"* ]] && ok "LCP4096: explicit interval 4096" || bad "LCP4096: missing interval 4096"
+done
+for a in "$SHORTM" "$OVERL" "$GNOL" "$LNOP" "$BIGM" "$ENOP" "$NOINT4K" "$LOWINT4K" "$NOPC4K" "$OVER4K"; do
   if [[ -n "$(section "$a")" ]]; then bad "arm $a was launched"
   elif grep -q "LOG: arm $a: .*skipped" "$T/loop.txt"; then ok "skipped: $(grep -m1 "LOG: arm $a: " "$T/loop.txt" | sed "s|LOG: arm $a: ||")"
   else bad "arm $a neither launched nor skipped"; fi
 done
-for a in "$REF" "$NEW" "$NEWG" "$Q17" "$BIG" "$BIGG"; do
+for a in "$REF" "$NEW" "$NEWG" "$Q17" "$BIG" "$BIGG" "$COLD4K" "$PC4K"; do
   if grep -q "LOG: arm $a: .*\(skipped\|refused\)" "$T/loop.txt"; then bad "arm $a: $(grep -m1 "LOG: arm $a: " "$T/loop.txt")"; fi
 done
 

@@ -86,7 +86,7 @@
 # f32, so one changed logit anywhere in a row shows).
 #
 # Large-chunk prefill (RADIANCE_EXPERIMENTAL_DS41_LCP=C): LcN sets it and --max-num-batched-tokens N
-# (N a multiple of 16 in 64..2048), e.g. ...-M1024-...-B1-...-Lc1024-Mr32; it needs MN (..._MISSES at
+# (N a multiple of 16 in 64..4096), e.g. ...-M1024-...-B1-...-Lc1024-Mr32; it needs MN (..._MISSES at
 # least N), B1 (the CPU takes every routed unit) and an Mr part (Mr32 or Mr64; Mr4 only as a control),
 # cannot go with Xt or BT, and leaves
 # RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL unset (LCP keeps its pins; every other arm runs with LCP=0).
@@ -98,6 +98,9 @@
 # DEVICE_CHECKS (a list) runs ds41_mxfp4_device_check `lcp LCP_CHECK_C` (1024), `sweep` under LCP and
 # `sweep0` on card 0 (TALL_LIBR4D and TALL_CHECK named, as for `tall`), and an Lc arm runs only on the
 # libr4d.so (sha256) those passed on, at a chunk of at most LCP_CHECK_C.
+# Above 2048, give an explicit PciN interval at least the chunk (Pci4096 for Lc4096), also for a
+# cold arm without Pc: linear-state checkpoints cap chunks even when the prefix cache is off.
+# The interval default remains 2048. Other Pci/Pc-only combinations retain their guards below.
 #
 # MbN: RADIANCE_EXPERIMENTAL_DS41_MOE_BALANCE=N (libr4d, read by the routed MXFP4 gemv): 1 every call of the
 # plain gemv kernel (the decode band to 16 tokens and the twin above), 2 the twin above 16 tokens only;
@@ -1102,7 +1105,7 @@ LCP_OK="" LCP_LIB="" LCP_SUM="" LCP_C=0
 LCP_WHY="no large-chunk prefill device checks in this window (DEVICE_CHECKS=lcp with TALL_CHECK and TALL_LIBR4D)"
 if [[ " ${DEVICE_CHECKS:-1} " == *" lcp "* ]]; then
   # RADIANCE_EXPERIMENTAL_DS41_LCP on card 0: the twin and the sparse ops at chunk heights up to
-  # LCP_CHECK_C (`lcp`, which also sweeps every other height-dependent op to 2048 rows, gemm_nt by the
+  # LCP_CHECK_C (`lcp`, which also sweeps every other height-dependent op through that chunk, gemm_nt by the
   # row the table resolves, the router's column split and gemm_nt_bf16f8 at N 1280 and 4096 among
   # them), the sweep under LCP alone, and
   # without any switch (`sweep0`), each row against the same row alone and in launches of 16.
@@ -1112,8 +1115,8 @@ if [[ " ${DEVICE_CHECKS:-1} " == *" lcp "* ]]; then
   if [[ ! -x "$TC" || ! -f "$TL" ]]; then
     LCP_WHY="TALL_CHECK=$TC is not an executable or TALL_LIBR4D=$TL is not a file"
     log "large-chunk prefill device checks: $LCP_WHY; no Lc arm is measured"
-  elif ! [[ $LC =~ ^[0-9]+$ ]] || (( 10#$LC < 64 || 10#$LC > 2048 || 10#$LC % 16 )); then
-    LCP_WHY="LCP_CHECK_C=$LC is not a multiple of 16 in 64..2048"
+  elif ! [[ $LC =~ ^[0-9]+$ ]] || (( 10#$LC < 64 || 10#$LC > 4096 || 10#$LC % 16 )); then
+    LCP_WHY="LCP_CHECK_C=$LC is not a multiple of 16 in 64..4096"
     log "large-chunk prefill device checks: $LCP_WHY; no Lc arm is measured"
   else
     LC=$((10#$LC))
@@ -1138,6 +1141,9 @@ if [[ " ${DEVICE_CHECKS:-1} " == *" lcp "* ]]; then
     for f in lcp sweep; do
       grep -q 'gemm_nt_bf16f8 N=1280 K=5120' "$OUT/devcheck-lcp-$f.log" && grep -q 'gemm_nt_bf16f8 N=4096 K=1024' "$OUT/devcheck-lcp-$f.log" ||
         lcp_bad+=" $f did not sweep gemm_nt_bf16f8 (a harness without its case?);"
+      if (( LC > 2048 )) && ! grep -Eq " ${LC}:ok([[:space:]]|$)" "$OUT/devcheck-lcp-$f.log"; then
+        lcp_bad+=" $f did not check the requested $LC-row height (an older 2048-only sweep?);"
+      fi
     done
     if [[ -z "$lcp_bad" ]]; then
       LCP_OK=1 LCP_LIB=$TL LCP_C=$LC LCP_SUM=$(sha256sum "$TL" 2>/dev/null | cut -d' ' -f1)
@@ -1744,6 +1750,7 @@ for a in $ARMS; do
   ARM_PROMPTS= ARM_N= ARM_LQ= rt=
   power="" skip="" ARGS=() f8="" f8x="" rb="" rbf=0 pred="" cs="" ck="" kh="" pc="" pcopt="" fw="" wp="" wl=""
   fn128=""
+  arm_checkpoint_interval=2048
   psc="" prs=12 pk="" pw="" ns="" pv=""
   hpe="" hpg="" hpl="" hpb="" hpm="" hpr=""
   unset ARM_NOPC   # --no-prefix-cache unless a Pc part sets it empty
@@ -1864,7 +1871,7 @@ for a in $ARMS; do
       Pc0)     pc=1 ARM_NOPC= ; ARGS+=(--prefix-resume exact) ;;                      # prefix cache on, the margin as before (the control)
       Pcn)     pc=1 ARM_NOPC= ; ARGS+=(--prefix-resume nearest)                        # prefix cache on, a hit resumes at the deepest snapshot
                env+=(RADIANCE_EXPERIMENTAL_CACHE_HEADROOM_BACKED=1) ;;              # ... (Kh against a cold arm checks it stays exact)
-      Pci[0-9]*) pcopt+=" $p"; ARGS+=(--checkpoint-interval "${p#Pci}") ;;                    # snapshot interval (2048)
+      Pci[0-9]*) pcopt+=" $p"; arm_checkpoint_interval=${p#Pci}; ARGS+=(--checkpoint-interval "${p#Pci}") ;;  # interval (default2048)
       Pcs[0-9]*) pcopt+=" $p"; ARGS+=(--checkpoint-slots "${p#Pcs}") ;;                       # snapshot store slots (auto)
       Pcx)     pcopt+=" $p"; env+=(RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH=1) ;;           # publish only cold-cut chunks
       Pce)     pcopt+=" $p"; hpe=1; env+=(RADIANCE_EXPERIMENTAL_PREFIX_EORS=1) ;;              # end-of-request snapshots
@@ -1893,9 +1900,9 @@ for a in $ARMS; do
       BT[0-9]*) bt=${p#BT}; ARGS+=(--max-num-batched-tokens "$bt") ;;  # this arm's step: prefill chunks of N
       Kld)     kld=1 ;;                                                # --kld-record over the corpus instead of serving
       Lc[0-9]*) lc=${p#Lc}                                             # large-chunk prefill: chunks of N (RADIANCE_EXPERIMENTAL_DS41_LCP)
-               if [[ $lc =~ ^[0-9]+$ ]] && (( 10#$lc >= 64 && 10#$lc <= 2048 && 10#$lc % 16 == 0 )); then
+               if [[ $lc =~ ^[0-9]+$ ]] && (( 10#$lc >= 64 && 10#$lc <= 4096 && 10#$lc % 16 == 0 )); then
                  lc=$((10#$lc)); ARGS+=(--max-num-batched-tokens "$lc"); env+=(RADIANCE_EXPERIMENTAL_DS41_LCP=$lc)
-               else log "arm $a: $p: a chunk is a multiple of 16 in 64..2048; the arm is skipped"; skip=1; fi ;;
+               else log "arm $a: $p: a chunk is a multiple of 16 in 64..4096; the arm is skipped"; skip=1; fi ;;
       P1)      p1=1 ;;                                                  # prefill Phase 1: card experts in large chunks (needs Lc)
       Qsp)     qsp=1 ;;                                                 # each P1 wave's covering sorted-slot SwiGLU span
       Qw[0-9]*|Qi[0-9]*|Qr[0-9]*|Qa[0-9]*|Qv[0-9]*|Qm[0-9]*|Ql[0-9]*|Qh[0-9]*|Qe[0-9]*)   # ...wave / in flight / ready / read-ahead / verify / threshold / lent slots / its hold / lent arena slots
@@ -2086,11 +2093,20 @@ for a in $ARMS; do
   ARM_CK=
   [[ -n "$cs" && -n "$pc" ]] && ARM_CK=${ck:-512}
   if [[ -n "$kh" ]]; then env+=(RADIANCE_EXPERIMENTAL_DS41_PREFILL_HASH=1); else env+=(RADIANCE_EXPERIMENTAL_DS41_PREFILL_HASH=0); fi
-  # The prefix cache's parts: PciN, PcsN and Pcx act only with the cache on (Pc or Pc0); without it
-  # the arm would run cold under their names. Every arm states both prefix switches, so a window's
+  # Prefix-only parts need Pc or Pc0. Above 2048 the interval also admits an Lc chunk with the
+  # prefix cache off, so allow that Pci part alone; retain every other prefix-only refusal.
+  # Every arm states both prefix switches, so a window's
   # VAR=val cannot turn a cold arm or the Pc0 control into something its name does not say.
-  if [[ -n "$pcopt" && -z "$pc" ]]; then
-    log "arm $a:$pcopt without Pc or Pc0 (the prefix cache stays off); the arm is skipped"; skip=1
+  pc_cache_parts=$pcopt
+  if [[ $lc =~ ^[0-9]+$ ]] && (( 10#$lc > 2048 )); then
+    pc_cache_parts=""
+    read -r -a pc_gate_parts <<< "$pcopt"
+    for pc_part in "${pc_gate_parts[@]}"; do
+      [[ $pc_part == Pci[0-9]* ]] || pc_cache_parts+=" $pc_part"
+    done
+  fi
+  if [[ -n "$pc_cache_parts" && -z "$pc" ]]; then
+    log "arm $a:$pc_cache_parts without Pc or Pc0 (the prefix cache stays off); the arm is skipped"; skip=1
   fi
   [[ " ${env[*]} " == *" RADIANCE_EXPERIMENTAL_CACHE_HEADROOM_BACKED=1 "* ]] || env+=(RADIANCE_EXPERIMENTAL_CACHE_HEADROOM_BACKED=0)
   [[ " ${env[*]} " == *" RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH=1 "* ]] || env+=(RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH=0)
@@ -2242,6 +2258,11 @@ for a in $ARMS; do
   # RADIANCE_EXPERIMENTAL_DS41_LCP: an Lc arm's chunk, 0 in every other arm.
   if [[ -n "$lc" ]]; then
     [[ -n "$xt$bt" ]] && { log "arm $a: Lc goes with neither Xt nor BT (it sets the step itself); the arm is skipped"; skip=1; }
+    if [[ $lc =~ ^[0-9]+$ ]] && (( 10#$lc > 2048 )); then
+      if ! [[ $arm_checkpoint_interval =~ ^[0-9]+$ ]] || (( 10#$arm_checkpoint_interval < lc )); then
+        log "arm $a: Lc$lc needs an explicit PciN interval at least $lc (default 2048 caps linear-state chunks even without Pc); the arm is skipped"; skip=1
+      fi
+    fi
     mm=$(grep -oE ' RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MISSES=[0-9]+' <<< " ${env[*]}" | tail -1 | cut -d= -f2)
     bn=$(grep -oE ' RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS=[0-9]+' <<< " ${env[*]}" | tail -1 | cut -d= -f2)
     if [[ -n "$p1" ]]; then

@@ -10576,7 +10576,7 @@ std::vector<Geo> geometries() {
         G("gemm_nt_ggml", "M", 3, a.i("M", R).i("N", 5).i("K", 64).s("type", "q8_0").s("dtype", "bf16")),
         G("stream_gate_add", "M", 3, a.i("M", R).i("n", 8).i("hc", 4).d("eps", 1e-6).d("gate_eps", 1e-6)
                                      .s("dtype", "bf16")),
-        G("rope_rows", "M", 3, a.i("M", R).i("n_head", 2).i("head_dim", 12).i("rot", 8).i("off", 4)
+        G("ds41_rope_rows", "M", 3, a.i("M", R).i("n_head", 2).i("head_dim", 12).i("rot", 8).i("off", 4)
                                .s("mode", "gptj").i("inverse", 0).s("dtype", "f32")),
         G("qsa_block_key", "M", 2, a.i("M", R).i("n", 32).i("ratio", 4).i("rotary_dim", 8)
                                    .d("eps", 1e-6).d("theta", 1e4).s("dtype", "bf16")),

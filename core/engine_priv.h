@@ -47,7 +47,7 @@ struct Engine::DraftBankLoan {
     static constexpr int64_t kSourcePayload = 18ll << 20;
     static constexpr int64_t kSourceBound = kSourcePayload + (4ll << 20);
     bool published = false, resume_pending = false;
-    uint64_t resume_epoch = 0, query_seq = 0;
+    uint64_t loan_epoch = 0, resume_epoch = 0, query_seq = 0;
     int64_t query_step = -1;
     uint64_t lends = 0, restores = 0, rollbacks = 0, fill_bytes = 0;
     uint64_t source_drive_bytes = 0, source_ram_bytes = 0, relay_bytes = 0;

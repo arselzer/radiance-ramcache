@@ -159,12 +159,15 @@ int Engine::draft_bank_lend_open() {
 int Engine::draft_bank_lend_transition(const draft_bank::Work& w, draft_bank::Action a, bool startup) {
     using namespace draft_bank;
     DraftBankLoan& l = *draft_bank_loan_;
-    const uint64_t epoch = l.controller.epoch();
+    const uint64_t ticket = l.controller.epoch();
+    if(a==Action::Lend)l.loan_epoch=ticket;
+    if(!l.loan_epoch){l.controller.fatal();return RAD_E_STATE;}
+    const uint64_t epoch = l.loan_epoch; // stable copy/loan identity across later restore frames
     const char* action = bank_action(a);
     RAD_INFO("DSBANKLEND transition epoch=%llu step=%lld seq=%llu action=%s phase=begin pending_ctx=%lld "
-             "pending_query=%lld solo_held=%d deferred=%d all_ranks=4",
+             "pending_query=%lld solo_held=%d deferred=%d all_ranks=4 frame_epoch=%llu",
         (unsigned long long)epoch, (long long)w.step, (unsigned long long)w.query_seq, action,
-        (long long)w.context_rows, (long long)w.query_rows, w.solo_held, w.deferred);
+        (long long)w.context_rows, (long long)w.query_rows, w.solo_held, w.deferred,(unsigned long long)w.epoch);
     const int64_t t = bank_now_ns();
     int rc = draft_bank_lend_drain(startup, action, epoch);
     if (rc < 0) { l.controller.fatal(); return rc; }
@@ -240,11 +243,11 @@ int Engine::draft_bank_lend_transition(const draft_bank::Work& w, draft_bank::Ac
             const int back=l.backup.restore_verify_all(&why);
             ++l.rollbacks;
             if(back<0){l.controller.fatal();RAD_ERR("DSBANKLEND fatal rollback: %s",why.c_str());return back;}
-            RAD_TRY(l.controller.finish(a,epoch,false,bank_now_ns()/1000000));
+            RAD_TRY(l.controller.finish(a,ticket,false,bank_now_ns()/1000000));
             RAD_ERR("DSBANKLEND rollback epoch=%llu restored=1 fill_error=%d",(unsigned long long)epoch,rc);
             return RAD_OK; // unchanged bank ready, no partial loan is usable
         }
-        RAD_TRY(l.controller.finish(a,epoch,true,bank_now_ns()/1000000));
+        RAD_TRY(l.controller.finish(a,ticket,true,bank_now_ns()/1000000));
         ++l.lends;l.fill_ns+=(uint64_t)(bank_now_ns()-t);
         for(int ri=0;ri<kDraftRanks;++ri)RAD_INFO("DSBANKLEND rank=%d epoch=%llu stage=lent slots=%d borrowed_bytes=%lld bank_bytes=%lld copied=1",
             ri,(unsigned long long)epoch,l.count[(size_t)ri],
@@ -253,7 +256,7 @@ int Engine::draft_bank_lend_transition(const draft_bank::Work& w, draft_bank::Ac
         const int revoked=publish_all(false);
         if(revoked<0){l.controller.fatal();return revoked;}
         rc=l.backup.restore_verify_all(&why);
-        const int finished=l.controller.finish(a,epoch,rc>=0,bank_now_ns()/1000000);
+        const int finished=l.controller.finish(a,ticket,rc>=0,bank_now_ns()/1000000);
         if(rc<0||finished<0){l.controller.fatal();RAD_ERR("DSBANKLEND fatal restore: %s",why.c_str());return rc<0?rc:finished;}
         ++l.restores;l.restore_ns+=(uint64_t)(bank_now_ns()-t);
         l.resume_pending=true;l.resume_epoch=epoch;
@@ -265,9 +268,9 @@ int Engine::draft_bank_lend_transition(const draft_bank::Work& w, draft_bank::Ac
             (long long)l.backup.slots(ri)*kDraftPairBytes,kDraftStages*512);
     }
     RAD_INFO("DSBANKLEND transition epoch=%llu step=%lld seq=%llu action=%s phase=ready pending_ctx=%lld pending_query=%lld "
-             "solo_held=%d deferred=%d all_ranks=4",
+             "solo_held=%d deferred=%d all_ranks=4 frame_epoch=%llu",
         (unsigned long long)epoch,(long long)w.step,(unsigned long long)w.query_seq,action,
-        (long long)w.context_rows,(long long)w.query_rows,w.solo_held,w.deferred);
+        (long long)w.context_rows,(long long)w.query_rows,w.solo_held,w.deferred,(unsigned long long)w.epoch);
     return RAD_OK;
 }
 

@@ -32,10 +32,13 @@ TEST(bank_lend_dwell_cooldown_duplicate_epoch_and_double_transition) {
     CHECK_EQ(c.decide(held(4),111,&a),RAD_E_STATE);
     CHECK_EQ(c.finish(Action::Lend,2,true,111),RAD_E_STATE);
     CHECK_OK(c.finish(Action::Lend,3,true,111));CHECK(c.lent());
+    CHECK_EQ(c.epoch(),(uint64_t)3); // receipt loan identity; NOT the later completion ticket
     CHECK_EQ(c.finish(Action::Lend,3,true,111),RAD_E_STATE);
     CHECK_OK(c.decide(held(4),112,&a));CHECK(a==Action::None);
     w=held(5);w.solo_held=false;w.query_rows=2;w.query_seq=77;
     CHECK_OK(c.decide(w,113,&a));CHECK(a==Action::Restore); // no grace on restore
+    CHECK_EQ(c.epoch(),(uint64_t)5);
+    CHECK_EQ(c.finish(Action::Restore,3,true,119),RAD_E_STATE); // old loan epoch cannot finish new frame
     CHECK_OK(c.finish(Action::Restore,5,true,120));CHECK(c.ready());
     CHECK_OK(c.decide(held(6),121,&a));CHECK(a==Action::None);
     CHECK_OK(c.decide(held(7),139,&a));CHECK(a==Action::None);

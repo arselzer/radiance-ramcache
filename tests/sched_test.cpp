@@ -11093,7 +11093,10 @@ TEST(dspark_bank_backing_observation_refuses_without_explicit_deferred_context_a
 
 TEST(dspark_bank_backing_transaction_refuses_after_issue_ahead_was_planned) {
     BankRun r;r.start(4,true,false,32);
-    (void)r.f.submit(40,400);(void)r.step();(void)r.step();
+    const uint64_t id=r.f.submit(40,400);(void)r.step();(void)r.step();
+    /* Like Engine's initialized sampler: step_next refuses an undecided grammar
+     * backend before it opens any future frame. This test needs an actual one. */
+    r.f.sch.find(id)->speculation_fixed=true;
     CHECK_OK(r.f.sch.enable_draft_bank_observation());
     const RadBatch* b=r.f.sch.step();REQUIRE(b!=nullptr);const int step=b->step;
     Scheduler::BlockRow rows[4];

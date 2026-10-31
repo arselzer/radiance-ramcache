@@ -380,12 +380,31 @@ TEST(kv_backing_manager_inventory_pins_prefix_refs_pending_cow_and_fixed_state_w
     REQUIRE_EQ(kv.add_sequence(1), RAD_OK);
     REQUIRE_EQ(kv.ensure(1, 3), RAD_OK);
     const auto original = kv.block_table(1, 1);
+    const auto original_window = kv.block_table(1, 3);
     REQUIRE_EQ(original.size(), 2u);
+    REQUIRE_EQ(original_window.size(), 1u);
     REQUIRE_EQ(kv.retain_block(1, original[0]), RAD_OK); // prefix owner survives sequence cancellation
     REQUIRE_EQ(kv.fork(1, 2), RAD_OK);
-    REQUIRE_EQ(kv.ensure(2, 4), RAD_OK); // queued COW source/dest
+    CHECK(kv.block_table(2, 1) == original);
+    CHECK(kv.block_table(2, 3) == original_window);
+    // At three tokens both paged groups have a shared partial block (block sizes 2 and 4).
+    REQUIRE_EQ(kv.ensure(2, 4), RAD_OK);
+    const auto child = kv.block_table(2, 1);
+    const auto child_window = kv.block_table(2, 3);
+    REQUIRE_EQ(child.size(), original.size());
+    REQUIRE_EQ(child_window.size(), original_window.size());
+    CHECK_EQ(child[0], original[0]);
+    CHECK(child[1] != original[1]);
+    CHECK(child_window[0] != original_window[0]);
+    CHECK(kv.block_table(1, 1) == original);
+    CHECK(kv.block_table(1, 3) == original_window);
     kv.free_sequence(1);
     kv.free_sequence(2);
+    CHECK_EQ(kv.block_refcount(1, original[0]), 1); // only the retained prefix
+    CHECK_EQ(kv.block_refcount(1, original[1]), 0);
+    CHECK_EQ(kv.block_refcount(1, child[1]), 0);
+    CHECK_EQ(kv.block_refcount(3, original_window[0]), 0);
+    CHECK_EQ(kv.block_refcount(3, child_window[0]), 0);
     std::vector<KVBackingRange> required, on_follower;
     REQUIRE_EQ(kv.backing_required_ranges(kv, &required), RAD_OK);
     REQUIRE_EQ(follower.backing_required_ranges(kv, &on_follower), RAD_OK);
@@ -393,25 +412,76 @@ TEST(kv_backing_manager_inventory_pins_prefix_refs_pending_cow_and_fixed_state_w
         for (const auto& r : ranges) if (off >= r.offset && bytes <= r.bytes - (off - r.offset)) return true;
         return false;
     };
+    const auto check_fixed = [&](const KVManager& manager, const std::vector<KVBackingRange>& ranges) {
+        for (int32_t g : { 2, 3 }) {
+            const auto* fixed = manager.plan(g);
+            CHECK(covers(ranges, fixed->pool_offset, fixed->pool_bytes));
+        }
+    };
     for (const KVManager* manager : { &kv, &follower }) {
         const auto& ranges = manager == &kv ? required : on_follower;
         const auto* p = manager->plan(1);
         for (int64_t l = 0; l < p->n_layers; ++l)
             for (int32_t b : original)
                 CHECK(covers(ranges, p->pool_offset + l * p->layer_stride() + b * 68, 68));
-        for (int32_t g : { 2, 3 }) {
-            const auto* fixed = manager->plan(g);
-            CHECK(covers(ranges, fixed->pool_offset, fixed->pool_bytes));
-        }
+        check_fixed(*manager, ranges);
     }
     const auto copies = kv.take_pending_copies();
-    REQUIRE_EQ(copies.size(), 1u);
-    const auto* p = kv.plan(1);
-    for (int64_t l = 0; l < p->n_layers; ++l)
-        CHECK(covers(required, p->pool_offset + l * p->layer_stride() + copies[0].dst_block * 68, 68));
+    REQUIRE_EQ(copies.size(), 2u);
+    int full_copies = 0, window_copies = 0;
+    for (const auto& copy : copies) {
+        if (copy.group == 1) {
+            ++full_copies;
+            CHECK_EQ(copy.src_block, original[1]);
+            CHECK_EQ(copy.dst_block, child[1]);
+        } else {
+            REQUIRE_EQ(copy.group, 3);
+            ++window_copies;
+            CHECK_EQ(copy.src_block, original_window[0]);
+            CHECK_EQ(copy.dst_block, child_window[0]);
+        }
+        // Neither endpoint has a sequence ref now. The pending reader/writer inventory must
+        // retain every physical layer fragment on both the owner and the follower rank.
+        for (const KVManager* manager : { &kv, &follower }) {
+            const auto& ranges = manager == &kv ? required : on_follower;
+            const auto* p = manager->plan(copy.group);
+            const int64_t frag = p->layer_bytes_per_block();
+            for (int64_t l = 0; l < p->n_layers; ++l)
+                for (int32_t b : { copy.src_block, copy.dst_block })
+                    CHECK(covers(ranges, p->pool_offset + l * p->layer_stride() + b * frag, frag));
+        }
+    }
+    CHECK_EQ(full_copies, 1);
+    CHECK_EQ(window_copies, 1);
+
+    // Taking pending copies stands in for the caller's checked drain here. With no external
+    // holders left, only the prefix pins FULL bytes; fixed state/window pools remain required.
+    REQUIRE_EQ(kv.backing_required_ranges(kv, &required), RAD_OK);
+    REQUIRE_EQ(follower.backing_required_ranges(kv, &on_follower), RAD_OK);
+    for (const KVManager* manager : { &kv, &follower }) {
+        const auto& ranges = manager == &kv ? required : on_follower;
+        const auto* p = manager->plan(1);
+        const int64_t frag = p->layer_bytes_per_block();
+        for (int64_t l = 0; l < p->n_layers; ++l) {
+            const int64_t base = p->pool_offset + l * p->layer_stride();
+            CHECK(covers(ranges, base + original[0] * frag, frag));
+            CHECK(!covers(ranges, base + original[1] * frag, frag));
+            CHECK(!covers(ranges, base + child[1] * frag, frag));
+        }
+        check_fixed(*manager, ranges);
+    }
     kv.release_block(1, original[0]);
     REQUIRE_EQ(kv.backing_required_ranges(kv, &required), RAD_OK);
-    CHECK(!covers(required, p->pool_offset + original[0] * 68, 68));
+    REQUIRE_EQ(follower.backing_required_ranges(kv, &on_follower), RAD_OK);
+    for (const KVManager* manager : { &kv, &follower }) {
+        const auto& ranges = manager == &kv ? required : on_follower;
+        const auto* p = manager->plan(1);
+        const int64_t frag = p->layer_bytes_per_block();
+        for (int64_t l = 0; l < p->n_layers; ++l)
+            for (int32_t b : { original[0], original[1], child[1] })
+                CHECK(!covers(ranges, p->pool_offset + l * p->layer_stride() + b * frag, frag));
+        check_fixed(*manager, ranges);
+    }
 }
 
 RAD_TEST_MAIN()

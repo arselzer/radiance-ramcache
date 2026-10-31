@@ -1,13 +1,22 @@
 # Native FP8 WINDOW storage candidate
 
-This is default-off source, not an adopted optimization. No build, host test, card oracle,
-model run or performance measurement was executed while preparing it. The independent codec
-source is `98f18434`; its numerical domain is still unproved on the cards. In particular, the
+This is default-off source, not an adopted optimization. The source author ran no build, host
+test, card oracle, model or performance measurement. The new runtime cohort and its fused/store/
+reader paths remain untested. The independent codec source is `98f18434`; original card0 evidence
+is recorded below. In particular, the
 sign/payload of a NaN after the original E4M3 decode and GPU float multiply has no source/ISA
 guarantee. A negative code-NaN in a group with several finite outputs could fail the candidate
 normal decoder and exceed the two-pattern escape. A nonzero Raw count blocks activation. Do
 not alter original FP8 bytes to hide that failure, tolerate numeric equality, or retry a partly
 modified sequence. A different captured exception format would be a separately reviewed change.
+
+Root subsequently reports that the ORIGINAL standalone codec/producer gate passed on card0 at
+`ab-20261031T175623Z/gate-window-codec.log`, with original libr4d SHA256
+`b4e376e5c2d1bd9952b5533ba31a56584c007c5a28d09f573ac09566c19a3d10`: four profiles, each65536
+groups and zero Raw/bad/scale_bad/byte_guard_bad, final `PASS ds41_window_codec_exact`. This is
+actual card0 evidence for the original producer/codec candidate, not a result for the new capture,
+fused producer, store, reader, other cards or newly built cohort below. The source author executed
+none of these gates. All new runtime gates remain required.
 
 `RADIANCE_EXPERIMENTAL_DS41_WINDOW_PACKED=1` requires `KV_PACKED=1`, the native 512-wide
 main window, and the coherent new core/arch/libr4d cohort. Missing, `0`, and the absent arm part
@@ -73,8 +82,8 @@ Standalone quant/rope capture exports remain independently oracle-covered for la
 ## Source verification and required serialized queue
 
 Rebuild the entire core, architecture, libref and libr4d cohort following `work/AGENT-LOAD-RULES.md`.
-Host targets are `ds41_window_packed_test` (three cases), `ds41_kv_page_test` (one new native-window
-physical/checkpoint case), existing `kv_storage_guard_test`, and `ab_window_window_kv_test`. Run
+Host targets are `ds41_window_packed_test` (three cases), `ds41_kv_page_test` (two new native-window
+physical/checkpoint/growth-floor and COW/cancel cases), existing `kv_storage_guard_test`, and `ab_window_window_kv_test`. Run
 only exact host test names with `-LE gpu` under `build.lock`; these sources have not been executed.
 The recording/shape probe includes one new cut/row-offset/sizing case in
 `ds41_shape_probe_arch_test`; it and the existing FP4 packed/fast suites must also continue to pass.

@@ -415,6 +415,11 @@ TEST(ds41_packed_native_window_uses_physical_floor_and_checkpoint_fragments) {
     const auto* win=f.kv.plan(Window);const auto* tail=f.kv.plan(Tail);REQUIRE(win&&tail);
     CHECK_EQ(win->layer_bytes_per_block(),8448ll);CHECK_EQ(win->bytes_per_block,16896ll);
     CHECK_EQ(win->pool_bytes,win->n_blocks*16896ll);
+    std::vector<KVBackingRange> retained;REQUIRE_EQ(f.kv.backing_required_ranges(f.kv,&retained),RAD_OK);
+    bool fixed_window=false;for(const auto&r:retained)
+        fixed_window|=r.offset==win->pool_offset&&r.bytes==win->pool_bytes;
+    CHECK(fixed_window); // Growth keeps the ENTIRE physically sized WINDOW pool, including free pages.
+
     CHECK_EQ(f.kv.checkpoint_bytes(),tail->bytes_per_state+win->window_blocks*16896ll);
     Program program;program.kv_groups=gs;std::vector<KVPoolBinding> binding;
     bind_kv_pools(program,[&](int32_t g){return f.kv.plan(g);},&binding);
@@ -444,6 +449,27 @@ TEST(ds41_packed_native_window_uses_physical_floor_and_checkpoint_fragments) {
         REQUIRE(restored[j]>=0);CHECK_EQ(std::memcmp(page(*win,l,rows[j]),page(*win,l,restored[j]),8448),0);}
     rad_stream_destroy(stream);f.kv.free_checkpoint(ck);
     f.kv.free_sequence(1);f.kv.free_sequence(2);
+}
+
+TEST(ds41_native_packed_window_cow_keeps_self_contained_pages_and_cancel_releases_them) {
+    if(!device_is_host())SKIP("native WINDOW COW requires host device backend");
+    auto all=groups(true,true);auto g=all[Window];g.name="native_fp8_window";g.block_size=16;
+    g.decl.window=32;g.decl.head_dim=256;g.decl.storage_format=RAD_KV_STORAGE_DS41_FP8_WINDOW_G32;
+    g.decl.storage_block_bytes=8448;std::vector<KVGroupInfo> gs(1);gs.push_back(g);
+    Fixture f;REQUIRE_EQ(f.build(gs),RAD_OK);REQUIRE_EQ(f.kv.add_sequence(1),RAD_OK);
+    REQUIRE_EQ(f.kv.ensure(1,3),RAD_OK);const auto*p=f.kv.plan(1);REQUIRE(p);
+    for(int64_t l=0;l<p->n_layers;++l)for(int32_t b:f.kv.block_table(1,1)) {
+        std::memset(page(*p,l,b),0,8448);page(*p,l,b)[0]=0xc1;page(*p,l,b)[1]=0x7f;
+        page(*p,l,b)[2]=0;page(*p,l,b)[3]=0x80;page(*p,l,b)[4]=0xa5;
+    }
+    REQUIRE_EQ(f.kv.fork(1,2),RAD_OK);REQUIRE_EQ(f.kv.ensure(2,4),RAD_OK);
+    const auto copies=f.kv.take_pending_copies();REQUIRE_EQ(copies.size(),size_t(1));
+    for(const auto&c:copies){CHECK_EQ(c.group,1);CHECK_EQ(p->layer_bytes_per_block(),8448ll);
+        for(int64_t l=0;l<p->n_layers;++l){std::vector<uint8_t> old(page(*p,l,c.src_block),page(*p,l,c.src_block)+8448);
+            std::memcpy(page(*p,l,c.dst_block),old.data(),8448);
+            CHECK_EQ(std::memcmp(page(*p,l,c.dst_block),old.data(),8448),0);
+            page(*p,l,c.dst_block)[4]^=1;CHECK_EQ(std::memcmp(page(*p,l,c.src_block),old.data(),8448),0);}}
+    f.kv.free_sequence(2);f.kv.free_sequence(1);CHECK_EQ(f.kv.free_blocks(1),f.kv.total_blocks(1));
 }
 
 RAD_TEST_MAIN()

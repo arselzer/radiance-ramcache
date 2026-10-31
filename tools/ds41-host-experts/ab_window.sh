@@ -179,8 +179,9 @@ ARMS=${ARMS-"base verify greedy"}
 HX_THREADS=${HX_THREADS:-16}
 VERIFY_REQUESTS=${VERIFY_REQUESTS:-3}
 # Arm parts alone authorize packed formats/readers; global settings must not leak into any check.
-export RADIANCE_EXPERIMENTAL_DS41_KV_PACKED=0 RADIANCE_EXPERIMENTAL_DS41_KV_PACKED_FAST=0
+export RADIANCE_EXPERIMENTAL_DS41_KV_PACKED=0 RADIANCE_EXPERIMENTAL_DS41_KV_PACKED_FAST=0 RADIANCE_EXPERIMENTAL_DS41_WINDOW_PACKED=0
 HERE=$(cd "$(dirname "$0")" && pwd)
+source "$HERE/ab_window_window_kv.sh"
 R=/home/as/radiance-setup/research/deepseek-v41-1017-20261024
 MODEL=$R/native-models/ds41-native-mxfp4-v3-20261027T121600Z/model.rad
 MIRROR=${MIRROR:-}   # the checkpoint's model-*.safetensors for R arms; no default
@@ -533,8 +534,32 @@ kv_cohort_key() {   # run homes, served library, fast0/1; full manifest hash on 
 }
 
 kv_server_gate() {   # log, packed flag, fast flag, start/exit, attending ranks (TP4)
-  local f=$1 on=${2:-0} fast=${3:-0} stage=${4:-exit} ranks=${5:-4} r count line re old=0 modern=0 kind bytes role decoder
+  local f=$1 on=${2:-0} fast=${3:-0} stage=${4:-exit} ranks=${5:-4} window=${6:-0} r count line re old=0 modern=0 kind bytes role decoder window_name=plain window_layers=
   [[ -f $f && $ranks == 4 && ( $stage == start || $stage == exit ) && ( $on == 0 || $on == 1 ) && ( $fast == 0 || $fast == 1 ) ]] || return 1
+  [[ $window == 0 || ( $window == 1 && $on == 1 ) ]] || return 1
+  if [[ $window == 0 ]]; then
+    ! grep -qF 'WINDOW_PACKED' "$f" || { echo 'no Kvwin part, but packed WINDOW was enabled/logged'; return 1; }
+  else
+    window_name='packed FP8'
+    [[ $(grep -c '^radiance: deepseek41: WINDOW_PACKED rank=' "$f") == 4 &&
+       $(grep -Ec 'ds41 WINDOW_PACKED admitted rank=' "$f") == 4 ]] || return 1
+    for ((r=0;r<4;++r)); do
+      [[ $(grep -Fxc "radiance: deepseek41: WINDOW_PACKED rank=$r zero=0 format=3 row_bytes=528 page_bytes=8448 block_size=16 groups=1; BF16 reader math, plain index-window/F32 tail" "$f") == 1 ]] || return 1
+      line=$(grep -E "ds41 WINDOW_PACKED admitted rank=$r " "$f")
+      re="ds41 WINDOW_PACKED admitted rank=$r format=3 row_bytes=528 page_bytes=8448 groups=1 layers=([1-9][0-9]*) producers=([1-9][0-9]*) stores=([1-9][0-9]*) readers=([1-9][0-9]*)$"
+      [[ $line =~ $re ]] || return 1
+      [[ ${BASH_REMATCH[1]} == "${BASH_REMATCH[2]}" && ${BASH_REMATCH[1]} == "${BASH_REMATCH[3]}" && ${BASH_REMATCH[1]} == "${BASH_REMATCH[4]}" ]] || return 1
+      [[ -z $window_layers || $window_layers == "${BASH_REMATCH[1]}" ]] || return 1
+      window_layers=${BASH_REMATCH[1]}
+    done
+    if [[ $stage == exit ]]; then
+      [[ $(grep -c '^\[r4d\] ds41 WINDOW_PACKED active rank=' "$f") == 8 ]] || return 1
+      for ((r=0;r<4;++r)); do
+        [[ $(grep -Fxc "[r4d] ds41 WINDOW_PACKED active rank=$r role=store format=3 row_bytes=528 page_bytes=8448" "$f") == 1 ]] || return 1
+        [[ $(grep -Ec "^\[r4d\] ds41 WINDOW_PACKED active rank=$r role=attention format=3 row_bytes=528 page_bytes=8448 decoder=reference M=[1-9][0-9]*$" "$f") == 1 ]] || return 1
+      done
+    fi
+  fi
   if [[ $on == 0 ]]; then
     ! grep -qF 'KV_PACKED' "$f" || { echo 'no Kvfp4 part, but packed KV was enabled/logged'; return 1; }
     [[ $fast == 0 ]] || return 1
@@ -543,7 +568,7 @@ kv_server_gate() {   # log, packed flag, fast flag, start/exit, attending ranks 
   [[ $(grep -c '^radiance: deepseek41: KV_PACKED rank=' "$f") == "$ranks" ]] || { echo 'packed startup rank count/duplicates'; return 1; }
   for ((r=0;r<ranks;++r)); do
     line=$(grep -E "^radiance: deepseek41: KV_PACKED rank=$r " "$f")
-    re="^radiance: deepseek41: KV_PACKED rank=$r zero=0( fast=$fast)? latent_format=1 row_bytes=288 groups=2 index_format=2 row_bytes=68 groups=2; BF16 reader math, plain window/F32 tail$"
+    re="^radiance: deepseek41: KV_PACKED rank=$r zero=0( fast=$fast)? latent_format=1 row_bytes=288 groups=2 index_format=2 row_bytes=68 groups=2; BF16 reader math, $window_name window/F32 tail$"
     [[ $line =~ $re ]] || { echo "rank$r lacks exact native packed startup geometry/decoder"; return 1; }
     if [[ $line == *' fast='* ]]; then modern=$((modern+1)); else old=$((old+1)); fi
   done
@@ -677,12 +702,12 @@ kv_gate() {   # arm, homes, served library, mode; never invokes a checker after 
 }
 
 kv_parts() {   # preflight-only parse, same strict semantics as the arm loop
-  local arm=$1 p packed=0 fast=0; local -a list=()
+  local arm=$1 p packed=0 fast=0 window=0; local -a list=()
   IFS=- read -r -a list <<< "$arm"
   for p in "${list[@]:1}"; do
-    case $p in Kvfp4) packed=$((packed+1)) ;; Kvfast) fast=$((fast+1)) ;; Kv*) return 1 ;; esac
+    case $p in Kvfp4) packed=$((packed+1)) ;; Kvfast) fast=$((fast+1)) ;; Kvwin) window=$((window+1)) ;; Kv*) return 1 ;; esac
   done
-  (( packed <= 1 && fast <= 1 && (fast == 0 || packed == 1) )) || return 1
+  (( packed <= 1 && fast <= 1 && window <= 1 && (fast == 0 || packed == 1) && (window == 0 || packed == 1) )) || return 1
   echo "$packed $fast"
 }
 
@@ -723,7 +748,7 @@ kld_finish() {   # name; the run is SERVER_PID
   (( rc == 0 )) || return 1
   local kv_why
   if [[ ${ARM_KVFP4:-0} == 1 || ${ARM_KVFAST:-0} == 1 ]] || grep -qF 'KV_PACKED' "$OUT/$name.server.log"; then
-    if ! kv_why=$(kv_server_gate "$OUT/$name.server.log" "${ARM_KVFP4:-0}" "${ARM_KVFAST:-0}" exit 4); then
+    if ! kv_why=$(kv_server_gate "$OUT/$name.server.log" "${ARM_KVFP4:-0}" "${ARM_KVFAST:-0}" exit 4 "${ARM_KVWIN:-0}"); then
       log "arm $name: $kv_why; packed KLD not measured"; return 1
     fi
   fi
@@ -853,7 +878,7 @@ arm() {   # name, then env assignments for the server; CACHE_MIB the RAM cache (
   done
   log "arm $name: serving after ${t}s"
   local kv_why
-  if ! kv_why=$(kv_server_gate "$OUT/$name.server.log" "${ARM_KVFP4:-0}" "${ARM_KVFAST:-0}" start 4); then
+  if ! kv_why=$(kv_server_gate "$OUT/$name.server.log" "${ARM_KVFP4:-0}" "${ARM_KVFAST:-0}" start 4 "${ARM_KVWIN:-0}"); then
     log "arm $name: $kv_why; packed startup/ABI/capability not measured"; stop_server; return 1
   fi
   # A Pc arm: the prefix cache's startup lines (the snapshot store, the interval, the resume rule).
@@ -1198,7 +1223,7 @@ EOF2
     return 1
   fi
   local kv_exit_why
-  if ! kv_exit_why=$(kv_server_gate "$OUT/$name.server.log" "${ARM_KVFP4:-0}" "${ARM_KVFAST:-0}" exit 4); then
+  if ! kv_exit_why=$(kv_server_gate "$OUT/$name.server.log" "${ARM_KVFP4:-0}" "${ARM_KVFAST:-0}" exit 4 "${ARM_KVWIN:-0}"); then
     log "arm $name: $kv_exit_why; not measured (results kept as $name.unmeasured.json)"
     [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
     return 1
@@ -1993,7 +2018,7 @@ fi
 
 # Packed KV proofs run up front, before ANY model arm. Only in-memory fresh-window receipts can
 # authorize later arms; pre-existing logs or externally set success variables cannot bypass this.
-declare -A KV_PASSED=() KV_RECEIPT=()
+declare -A KV_PASSED=() KV_RECEIPT=() WINDOW_KV_PASSED=() WINDOW_KV_RECEIPT=()
 for kv_arm in $ARMS; do
   kv_modes=$(kv_parts "$kv_arm") || continue
   read -r kv_on kv_fast <<< "$kv_modes"
@@ -2007,6 +2032,10 @@ for kv_arm in $ARMS; do
   [[ -n $kv_lib ]] || continue
   kv_check "$kv_home" "$kv_lib" 0 || continue
   [[ $kv_fast == 1 ]] && kv_check "$kv_home" "$kv_lib" 1
+  if [[ "-$kv_arm-" == *-Kvwin-* ]]; then
+    window_kv_check "$kv_home" "$kv_lib" 0 || continue
+    [[ $kv_fast == 1 ]] && window_kv_check "$kv_home" "$kv_lib" 1
+  fi
 done
 KV_PROOFS_OPEN=0
 # Fresh three-profile oracle for Ib16, after QFN stopped and before ANY enabled arm.
@@ -2258,7 +2287,7 @@ for a in $ARMS; do
   ARM_PROMPTS= ARM_N= ARM_LQ= rt=
   power="" skip="" ARGS=() f8="" f8x="" rb="" rbf=0 pred="" cs="" ck="" kh="" pc="" pcopt="" fw="" wp="" wl=""
   fn128="" index_b16=""
-  kvfp4="" kvfast=""
+  kvfp4="" kvfast="" kvwin=""
   arm_checkpoint_interval=2048
   psc="" prs=12 pk="" pw="" ns="" pv=""
   hpe="" hpg="" hpl="" hpb="" hpm="" hpr=""
@@ -2296,6 +2325,7 @@ for a in $ARMS; do
       Kvfp4)   if [[ -n "$kvfp4" ]]; then log "arm $a: duplicate Kvfp4; skipped"; skip=1; else kvfp4=1; fi ;;
       Kvfast)  if [[ -n "$kvfast" ]]; then log "arm $a: duplicate Kvfast; skipped"; skip=1; else kvfast=1; fi ;;
       Ib16)    index_b16=1 ;;              # lossless16-bit index score plane; fresh same-cohort card proof
+      Kvwin)   if [[ -n "$kvwin" ]]; then log "arm $a: duplicate Kvwin; skipped"; skip=1; else kvwin=1; fi ;;
       F8)      f8=1 ;;                     # FP8-sourced dense linears from E4M3 codes (gemm_nt_bf16f8)
       F8n)     f8=1 f8x='*_shexp.weight' ;;   # the same, the shared expert left bf16
       i[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_INSERT_THREADS=${p#i}) ;;
@@ -2539,9 +2569,10 @@ for a in $ARMS; do
   ARM_RB=$rb ARM_PRED=$pred
   # Main/index page format and the independent reader implementation are ALWAYS explicit, so a
   # globally exported flag cannot silently alter a plain/reference arm.
-  env+=(RADIANCE_EXPERIMENTAL_DS41_KV_PACKED=${kvfp4:-0} RADIANCE_EXPERIMENTAL_DS41_KV_PACKED_FAST=${kvfast:-0})
-  ARM_KVFP4=${kvfp4:-0} ARM_KVFAST=${kvfast:-0}
+  env+=(RADIANCE_EXPERIMENTAL_DS41_KV_PACKED=${kvfp4:-0} RADIANCE_EXPERIMENTAL_DS41_KV_PACKED_FAST=${kvfast:-0} RADIANCE_EXPERIMENTAL_DS41_WINDOW_PACKED=${kvwin:-0})
+  ARM_KVFP4=${kvfp4:-0} ARM_KVFAST=${kvfast:-0} ARM_KVWIN=${kvwin:-0}
   if [[ -n "$kvfast" && -z "$kvfp4" ]]; then log "arm $a: Kvfast requires Kvfp4; skipped"; skip=1; fi
+  if [[ -n "$kvwin" && -z "$kvfp4" ]]; then log "arm $a: Kvwin requires Kvfp4; skipped"; skip=1; fi
   if [[ -n "$kvfp4" && -z "$skip" ]]; then
     # Require the current C receipt's actual M4096 captured-producer coverage. Without the norm
     # pins, max_tok+max_seqs can exceed4096 even at a4096-token cap and must remain refused.
@@ -2554,6 +2585,9 @@ for a in $ARMS; do
     IFS=: read -r -a homes <<< "$ARM_HOME"
     for h in "${homes[@]}"; do [[ -f "$h/kernels/libr4d.so" ]] && { kvlib=$h/kernels/libr4d.so; break; }; done
     [[ -n "$skip" ]] || kv_gate "$a" "$ARM_HOME" "$kvlib" "${kvfast:-0}" || skip=1
+    if [[ -n "$kvwin" && -z "$skip" ]]; then
+      window_kv_gate "$ARM_HOME" "$kvlib" "${kvfast:-0}" || { log "arm $a: Kvwin lacks fresh original-producer/all-reader receipts; skipped"; skip=1; }
+    fi
   fi
   # Explicitly state the switch for every arm. Unpinned compressor work can use
   # max_tok+max_seqs rows, so check that conservative bound as well as the library SHA.

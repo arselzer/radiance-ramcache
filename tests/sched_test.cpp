@@ -10871,7 +10871,13 @@ TEST(dspark_prefix_policy_concurrent_frame_has_one_owner_and_survives_pause_canc
     while (f.sch.block_context(batch->step)) {}
     (void)f.sch.block_query(batch->step);
     CHECK_OK(f.commit(700)); f.sch.block_end(); f.sch.step_finished();
-    const int32_t ids[2] = {71, 72}; CHECK(f.sch.set_draft(anchor, ids, 0) < 0);
+    /* Commit's sweep still saw the immutable drafter snapshot. A retained terminal request
+     * accepts a zero-token clear; finish the idle deferred release before testing a stale ID. */
+    const int32_t ids[2] = {71, 72}; CHECK_OK(f.sch.set_draft(anchor, ids, 0));
+    CHECK(f.sch.has_deferred());
+    f.sch.release_deferred();
+    CHECK(f.sch.find(anchor) == nullptr);
+    CHECK_EQ(f.sch.set_draft(anchor, ids, 2), RAD_E_NOTFOUND);
     CHECK(!f.sch.policy_block_owner(batch->step, rows, 1, &after_cancel));
     const uint64_t next = add(40); CHECK(next != anchor);
     step(false); step(true);

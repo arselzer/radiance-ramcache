@@ -113,6 +113,7 @@ int Engine::draft_bank_lend_open() {
     DraftBankBackupRanks io{};
     DraftBankBackupBudget budget{};
     budget.backup_mib = draft_bank_config_.backup_cap / (1ll<<20);
+    budget.timings = draft_bank_config_.timings;
     budget.controller_metadata_bytes = sizeof(DraftBankLoan) + DraftBankLoan::kSourceBound;
     if (draft_bank_config_.packed_fill)
         budget.controller_metadata_bytes += draft_bank_packed_fill::kCallMetadataBound;

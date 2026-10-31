@@ -84,4 +84,16 @@ TEST(bank_lend_restore_is_required_when_query_cap_or_cancellation_leaves_zero_ro
     CHECK_OK(c.decide(capped,102,&a));CHECK(a==Action::Restore);
     CHECK_OK(c.finish(Action::Restore,2,true,103));CHECK(c.ready());
 }
+TEST(bank_lend_timing_opt_in_is_strict_and_requires_lending) {
+    Config c;
+    CHECK_OK(Config::parse(nullptr,"bad","bad","bad",&c,nullptr,nullptr));CHECK(!c.timings);
+    CHECK_OK(Config::parse("0","bad","bad","bad",&c,"0","0"));CHECK(!c.timings);
+    for(const char* s:{"","2","true","01","-1"})
+        CHECK_EQ(Config::parse("1","8192",nullptr,nullptr,&c,"0",s),RAD_E_INVAL);
+    CHECK_EQ(Config::parse(nullptr,"8192",nullptr,nullptr,&c,nullptr,"1"),RAD_E_INVAL);
+    CHECK_EQ(Config::parse("0","8192",nullptr,nullptr,&c,nullptr,"1"),RAD_E_INVAL);
+    CHECK_OK(Config::parse("1","8192",nullptr,nullptr,&c,"0","1"));CHECK(c.timings);CHECK(!c.packed_fill);
+    CHECK_OK(Config::parse("1","8192",nullptr,nullptr,&c,"1","1"));CHECK(c.timings);CHECK(c.packed_fill);
+    CHECK_OK(Config::parse("1","8192",nullptr,nullptr,&c,"1","0"));CHECK(!c.timings);CHECK(c.packed_fill);
+}
 RAD_TEST_MAIN()

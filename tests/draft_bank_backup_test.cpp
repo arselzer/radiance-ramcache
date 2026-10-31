@@ -363,4 +363,116 @@ TEST(draft_bank_backup_real_allocator_charge_covers_no_svm_padding) {
     CHECK_EQ(io.allocation_charge(INT64_MAX), int64_t{-1});
 }
 
+TEST(draft_bank_backup_timings_off_preserves_hash_bytes_and_exact_copy_order) {
+    struct TraceIO : IO {
+        Tiny* source=nullptr;
+        std::vector<uint64_t> trace;
+        int copy_sync(int rank,void* dst,const void* src,int64_t bytes) override {
+            const uintptr_t first=uintptr_t(source->data.data()), last=first+sizeof(source->data);
+            const bool write=uintptr_t(dst)>=first&&uintptr_t(dst)<last;
+            trace.push_back((uint64_t(rank)<<48)|(uint64_t(bytes)<<1)|uint64_t(write));
+            return IO::copy_sync(rank,dst,src,bytes);
+        }
+    };
+    Tiny a,b;TraceIO off,on;off.source=&a;on.source=&b;d::Image ia,ib;std::string why;
+    auto ba=budget(),bb=budget();bb.timings=true;
+    REQUIRE_EQ(ia.capture(a.image,ba,sizeof(ia),&off,&why),RAD_OK);
+    REQUIRE_EQ(ib.capture(b.image,bb,sizeof(ib),&on,&why),RAD_OK);
+    CHECK_EQ(ia.stats().image_hash,ib.stats().image_hash);CHECK(off.trace==on.trace);
+    ia.mark_borrowed();ib.mark_borrowed();a.lend();b.lend();
+    REQUIRE_EQ(ia.restore_verify_all(&why),RAD_OK);REQUIRE_EQ(ib.restore_verify_all(&why),RAD_OK);
+    CHECK(off.trace==on.trace);CHECK_EQ(std::memcmp(a.data.data(),b.data.data(),sizeof(a.data)),0);
+    CHECK_EQ(ia.stats().capture_copy_bytes,ib.stats().capture_copy_bytes);
+    CHECK_EQ(ia.stats().restore_copy_bytes,ib.stats().restore_copy_bytes);
+    CHECK_EQ(ia.stats().verify_copy_bytes,ib.stats().verify_copy_bytes);
+    CHECK(!ia.stats().timings.enabled);CHECK(!ia.stats().timings.overflow);
+    for(const auto& c:ia.stats().timings.part){CHECK_EQ(c.ns,uint64_t{0});CHECK_EQ(c.attempts,uint64_t{0});
+        CHECK_EQ(c.ok,uint64_t{0});CHECK_EQ(c.requested_bytes,uint64_t{0});CHECK_EQ(c.ok_bytes,uint64_t{0});}
+    CHECK_EQ(ib.stats().metadata_bytes-ia.stats().metadata_bytes,kDraftBankTimingWorkspaceBytes);
+}
+
+TEST(draft_bank_backup_timings_counter_overflow_is_transactional_and_latched) {
+    auto fields=[](const DraftBankTimingCounter& c){return std::array<uint64_t,5>{c.ns,c.attempts,c.ok,c.requested_bytes,c.ok_bytes};};
+    for(int field=0;field<5;++field){DraftBankTimingCounter c;
+        switch(field){case 0:c.ns=UINT64_MAX;break;case 1:c.attempts=UINT64_MAX;break;
+        case 2:c.ok=UINT64_MAX;break;case 3:c.requested_bytes=UINT64_MAX;break;case 4:c.ok_bytes=UINT64_MAX;break;}
+        const auto before=fields(c);CHECK(!c.record(1,1,true));CHECK(fields(c)==before);}
+    DraftBankTimings t;
+    CHECK(t.record(DraftBankTimingPart::CaptureD2H,3,4,true));CHECK_EQ(t.part[2].attempts,uint64_t{0});
+    t.enabled=true;t.part[2].requested_bytes=UINT64_MAX;
+    CHECK(!t.record(DraftBankTimingPart::CaptureD2H,1,1,true));CHECK(t.overflow);
+    CHECK(!t.record(DraftBankTimingPart::Zero,0,0,true));CHECK_EQ(t.part[1].attempts,uint64_t{0});
+    DraftBankTimings fresh;fresh.enabled=true;
+    CHECK(fresh.record(DraftBankTimingPart::Zero,0,0,true));CHECK(!fresh.overflow);
+    CHECK_EQ(fresh.part[1].attempts,uint64_t{1});CHECK_EQ(fresh.part[1].ok,uint64_t{1});
+}
+
+TEST(draft_bank_backup_timings_reconcile_exclusive_copy_counts_and_honest_workspace) {
+    Tiny t;IO io;d::Image image;std::string why;auto b=budget();b.timings=true;
+    REQUIRE_EQ(image.capture(t.image,b,sizeof(image),&io,&why),RAD_OK);
+    auto c=[&](DraftBankTimingPart p)->const DraftBankTimingCounter&{return image.stats().timings.part[size_t(p)];};
+    CHECK_EQ(c(DraftBankTimingPart::Allocation).attempts,uint64_t{4});
+    CHECK_EQ(c(DraftBankTimingPart::Allocation).ok_bytes,uint64_t{368});
+    for(auto p:{DraftBankTimingPart::Zero,DraftBankTimingPart::CaptureD2H,DraftBankTimingPart::CaptureFNV,
+                DraftBankTimingPart::CaptureComplement,DraftBankTimingPart::CaptureVerifyD2H,DraftBankTimingPart::CaptureMemcmp}) {
+        CHECK_EQ(c(p).attempts,uint64_t{12});CHECK_EQ(c(p).ok,uint64_t{12});
+        CHECK_EQ(c(p).requested_bytes,uint64_t{236});CHECK_EQ(c(p).ok_bytes,uint64_t{236});}
+    CHECK_EQ(image.stats().metadata_bytes,int64_t(sizeof(image))+b.controller_metadata_bytes+kDraftBankTimingWorkspaceBytes);
+    CHECK_EQ(io.need,image.stats().total_charge_bytes); // includes all retained stats + fixed log/logger stack BEFORE allocation
+    REQUIRE_EQ(image.verify_unchanged(&why),RAD_OK); // pre-lend invariant check
+    image.mark_borrowed();t.lend();REQUIRE_EQ(image.restore_verify_all(&why),RAD_OK);
+    for(auto p:{DraftBankTimingPart::RestoreH2D,DraftBankTimingPart::RestoreComplement,DraftBankTimingPart::RestoreD2H,DraftBankTimingPart::RestoreMemcmp}) {
+        CHECK_EQ(c(p).attempts,uint64_t{8});CHECK_EQ(c(p).ok_bytes,uint64_t{200});}
+    for(auto p:{DraftBankTimingPart::InvariantComplement,DraftBankTimingPart::InvariantD2H,DraftBankTimingPart::InvariantMemcmp}) {
+        CHECK_EQ(c(p).attempts,uint64_t{12});CHECK_EQ(c(p).ok_bytes,uint64_t{108});}
+    CHECK_EQ(uint64_t(image.stats().verify_copy_bytes),c(DraftBankTimingPart::CaptureVerifyD2H).ok_bytes+
+        c(DraftBankTimingPart::RestoreD2H).ok_bytes+c(DraftBankTimingPart::InvariantD2H).ok_bytes);
+    CHECK_EQ(uint64_t(image.stats().restore_copy_bytes),c(DraftBankTimingPart::RestoreH2D).ok_bytes);
+    CHECK(image.ready());CHECK(!image.stats().timings.overflow);
+}
+
+TEST(draft_bank_backup_timings_failed_allocation_copy_and_recapture_keep_partial_proof) {
+    std::string why;
+    {Tiny t;IO io;io.fail_alloc=3;d::Image image;auto b=budget();b.timings=true;
+        CHECK_EQ(image.capture(t.image,b,sizeof(image),&io,&why),RAD_E_NOMEM);
+        const auto before=image.stats().timings;
+        CHECK_EQ(before.part[size_t(DraftBankTimingPart::Allocation)].attempts,uint64_t{3});
+        CHECK_EQ(before.part[size_t(DraftBankTimingPart::Allocation)].ok,uint64_t{2});
+        CHECK_EQ(io.frees,2);CHECK_EQ(io.copies,0);b.timings=false;
+        CHECK(image.capture(t.image,b,sizeof(image),&io,&why)<0);
+        CHECK(image.stats().timings.enabled);CHECK_EQ(image.stats().timings.part[0].attempts,before.part[0].attempts);
+        CHECK(image.failed());CHECK(!image.ready());}
+    {Tiny t;IO io;io.fail_copy=1;d::Image image;auto b=budget();b.timings=true;
+        CHECK_EQ(image.capture(t.image,b,sizeof(image),&io,&why),RAD_E_IO);
+        const auto& c=image.stats().timings.part[size_t(DraftBankTimingPart::CaptureD2H)];
+        CHECK_EQ(c.attempts,uint64_t{1});CHECK_EQ(c.ok,uint64_t{0});CHECK_EQ(c.requested_bytes,uint64_t{17});CHECK_EQ(c.ok_bytes,uint64_t{0});
+        CHECK_EQ(io.frees,4);CHECK_EQ(io.copies,1);CHECK(image.failed());CHECK(!image.ready());}
+}
+
+TEST(draft_bank_backup_timings_short_restore_records_reported_copy_and_failed_memcmp) {
+    Tiny t;IO io;d::Image image;auto b=budget();b.timings=true;std::string why;
+    REQUIRE_EQ(image.capture(t.image,b,sizeof(image),&io,&why),RAD_OK);
+    image.mark_borrowed();t.lend();io.short_copy=io.copies+5; // four invariant reads, then first raw H2D
+    CHECK(image.restore_verify_all(&why)<0);CHECK(image.failed());CHECK(!image.ready());
+    const auto& w=image.stats().timings.part[size_t(DraftBankTimingPart::RestoreH2D)];
+    const auto& cmp=image.stats().timings.part[size_t(DraftBankTimingPart::RestoreMemcmp)];
+    CHECK_EQ(w.attempts,uint64_t{1});CHECK_EQ(w.ok,uint64_t{1});CHECK_EQ(w.ok_bytes,uint64_t{17});
+    CHECK_EQ(cmp.attempts,uint64_t{1});CHECK_EQ(cmp.ok,uint64_t{0});CHECK_EQ(cmp.requested_bytes,uint64_t{17});
+    const int copies=io.copies;CHECK(image.restore_verify_all(&why)<0);CHECK_EQ(io.copies,copies);
+}
+
+TEST(draft_bank_backup_timings_image_counter_overflow_poison_survives_retry) {
+    Tiny t;IO io;d::Image image;auto b=budget();b.timings=true;std::string why;
+    REQUIRE_EQ(image.capture(t.image,b,sizeof(image),&io,&why),RAD_OK);
+    // Host-only fault injection into a nonconst underlying Image. No runtime setter/env bypass.
+    auto& counters=const_cast<DraftBankTimings&>(image.stats().timings);
+    counters.part[size_t(DraftBankTimingPart::RestoreH2D)].attempts=UINT64_MAX;
+    image.mark_borrowed();t.lend();CHECK(image.restore_verify_all(&why)<0);
+    CHECK(image.stats().timings.overflow);CHECK(image.failed());CHECK(!image.ready());
+    const int copies=io.copies;CHECK(image.restore_verify_all(&why)<0);CHECK_EQ(io.copies,copies);
+    CHECK(image.capture(t.image,b,sizeof(image),&io,&why)<0);CHECK(image.stats().timings.overflow);
+    d::Image fresh;CHECK(!fresh.stats().timings.enabled);CHECK(!fresh.stats().timings.overflow);
+    CHECK_EQ(fresh.stats().timings.part[0].attempts,uint64_t{0});
+}
+
 RAD_TEST_MAIN()

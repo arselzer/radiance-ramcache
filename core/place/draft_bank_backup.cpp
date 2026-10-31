@@ -3,10 +3,12 @@
 #include "dspark_native_scope.h"
 #include "mover.h"
 #include "planner.h"
+#include "../rad_internal.h"
 #include "../engine_hostmem.h"
 #include "rad_format.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 
@@ -223,11 +225,53 @@ void* Image::scratch(int rank) const noexcept {
 int64_t Image::scratch_bytes(int rank) const noexcept {
     return rank >= 0 && rank < kDraftRanks ? ranks_[rank].scratch_bytes : 0;
 }
+int64_t Image::timing_begin() const noexcept {
+    if (!stats_.timings.enabled) return 0;
+    const uint64_t now=rad_mono_ns(); // existing steady_clock nanosecond source
+    return now<=uint64_t(INT64_MAX)?int64_t(now):-1;
+}
+int Image::timing_end(DraftBankTimingPart part, int64_t start, int64_t bytes, bool success, std::string* why) {
+    if (!stats_.timings.enabled) return RAD_OK;
+    const int64_t end = timing_begin();
+    if (start < 0 || end < start || bytes < 0 ||
+        !stats_.timings.record(part, uint64_t(end)-uint64_t(start), uint64_t(bytes), success)) {
+        stats_.timings.overflow = true;
+        return poison("bank timing counter overflow or steady-clock regression", why);
+    }
+    return RAD_OK;
+}
+void Image::timing_log(const char* operation, int status) const noexcept {
+    if (!stats_.timings.enabled) return;
+    static constexpr const char* names[] = {"alloc", "zero", "cap_d2h", "cap_fnv", "cap_complement", "cap_verify_d2h", "cap_memcmp",
+        "restore_h2d", "restore_complement", "restore_d2h", "restore_memcmp", "invariant_complement", "invariant_d2h", "invariant_memcmp"};
+    static_assert(sizeof(names)/sizeof(names[0]) == size_t(DraftBankTimingPart::Count));
+    char line[kDraftBankTimingLogBytes];
+    int used = std::snprintf(line,sizeof(line),
+        "DSBANKTIME operation=%s enabled=1 cumulative=1 clock=steady_ns status=%d overflow=%d ready=%d failed=%d "
+        "workspace=%lld stats_bytes=%zu restores=%llu hash=%016llx columns=ns/attempts/ok/requested/okbytes",
+        operation,status,stats_.timings.overflow,ready_,failed_,(long long)kDraftBankTimingWorkspaceBytes,
+        sizeof(stats_.timings),(unsigned long long)stats_.completed_restores,(unsigned long long)stats_.image_hash);
+    bool complete = used > 0 && size_t(used) < sizeof(line);
+    for (size_t i = 0; complete && i < stats_.timings.part.size(); ++i) {
+        const auto& t = stats_.timings.part[i];
+        const int n = std::snprintf(line+used,sizeof(line)-size_t(used)," %s=%llu/%llu/%llu/%llu/%llu",names[i],
+            (unsigned long long)t.ns,(unsigned long long)t.attempts,(unsigned long long)t.ok,
+            (unsigned long long)t.requested_bytes,(unsigned long long)t.ok_bytes);
+        complete = n > 0 && size_t(n) < sizeof(line)-size_t(used);
+        if (complete) used += n;
+    }
+    if (complete) RAD_INFO("%s",line);
+    else RAD_ERR("DSBANKTIME operation=%s enabled=1 invalid=log_overflow",operation);
+}
 int Image::capture(const std::array<ImageRank, kDraftRanks>& ranks, const DraftBankBackupBudget& b,
                    int64_t metadata, DraftBankBackupIO* io, std::string* why) {
     if (attempted_) return poison("bank image capture is one-shot", why);
     attempted_ = true;
+    stats_.timings.enabled = b.timings;
     auto fail = [&](const char* message) { release(); return poison(message, why); };
+    auto measure = [&](DraftBankTimingPart p,int64_t start,int64_t bytes,bool ok) -> int {
+        const int rc=timing_end(p,start,bytes,ok,why);if(rc<0)release();return rc;
+    };
     if (!io || b.backup_mib <= 0 || b.backup_mib > INT64_MAX / kMiB ||
         b.expert_cache_budget_bytes < 0 || b.expert_cache_backed_bytes < 0 ||
         b.other_future_bytes < 0 || b.system_headroom_bytes < 0 || b.controller_metadata_bytes < 0 ||
@@ -238,6 +282,8 @@ int Image::capture(const std::array<ImageRank, kDraftRanks>& ranks, const DraftB
     stats_.cap_bytes = b.backup_mib * kMiB;
     if (!add(metadata, b.controller_metadata_bytes, &stats_.metadata_bytes))
         return fail("bank metadata accounting overflow");
+    if (b.timings && !add(stats_.metadata_bytes,kDraftBankTimingWorkspaceBytes,&stats_.metadata_bytes))
+        return fail("bank timing workspace accounting overflow");
     stats_.controller_metadata_bytes = b.controller_metadata_bytes;
     stats_.total_charge_bytes = stats_.metadata_bytes;
     stats_.future_cache_bytes = std::max<int64_t>(0, b.expert_cache_budget_bytes - b.expert_cache_backed_bytes);
@@ -280,7 +326,10 @@ int Image::capture(const std::array<ImageRank, kDraftRanks>& ranks, const DraftB
         ready_ = false; failed_ = true; return RAD_E_NOMEM;
     }
     for (int r = 0; r < kDraftRanks; ++r) {
+        const int64_t timed=timing_begin();
         allocation_[r] = io_->alloc_pinned(requested[r]);
+        const int recorded=measure(DraftBankTimingPart::Allocation,timed,requested[r],allocation_[r]!=nullptr);
+        if(recorded<0)return recorded;
         if (!allocation_[r]) { fail("bank backup pinned allocation failed"); return RAD_E_NOMEM; }
     }
     uint64_t hash = UINT64_C(14695981039346656037);
@@ -288,29 +337,51 @@ int Image::capture(const std::array<ImageRank, kDraftRanks>& ranks, const DraftB
         for (int i = 0; i < ranks_[r].nspans; ++i) {
             const auto& s = ranks_[r].spans[i];
             auto* saved = static_cast<uint8_t*>(allocation_[r]) + offsets_[r][i];
+            int64_t timed=timing_begin();
             std::memset(saved, 0, size_t(s.bytes));
+            int recorded=measure(DraftBankTimingPart::Zero,timed,s.bytes,true);
+            if(recorded<0)return recorded;
+            timed=timing_begin();
             int rc = io_->copy_sync(r, saved, s.base, s.bytes);
+            recorded=measure(DraftBankTimingPart::CaptureD2H,timed,s.bytes,rc>=0);
+            if(recorded<0)return recorded;
             if (rc < 0) { fail("bank backup capture copy failed"); return rc; }
             count_bytes(&stats_.capture_copy_bytes, s.bytes);
-            if ((rc = verify(r, i, why)) < 0) { release(); return rc; }
+            if ((rc = verify(r, i, why, VerifyPhase::Capture)) < 0) { release(); return rc; }
+            timed=timing_begin();
             for (int64_t j = 0; j < s.bytes; ++j) { hash ^= saved[j]; hash *= UINT64_C(1099511628211); }
+            recorded=measure(DraftBankTimingPart::CaptureFNV,timed,s.bytes,true);
+            if(recorded<0)return recorded;
         }
     }
     stats_.image_hash = hash;
     captured_ = ready_ = true;
     return RAD_OK;
 }
-int Image::verify(int rank, int span, std::string* why) {
+int Image::verify(int rank, int span, std::string* why, VerifyPhase phase) {
     const auto& s = ranks_[rank].spans[span];
     const auto* saved = static_cast<const uint8_t*>(allocation_[rank]) + offsets_[rank][span];
     auto* back = static_cast<uint8_t*>(scratch(rank));
+    const auto complement = phase==VerifyPhase::Capture?DraftBankTimingPart::CaptureComplement:
+        phase==VerifyPhase::Restore?DraftBankTimingPart::RestoreComplement:DraftBankTimingPart::InvariantComplement;
+    const auto read = phase==VerifyPhase::Capture?DraftBankTimingPart::CaptureVerifyD2H:
+        phase==VerifyPhase::Restore?DraftBankTimingPart::RestoreD2H:DraftBankTimingPart::InvariantD2H;
+    const auto compare = phase==VerifyPhase::Capture?DraftBankTimingPart::CaptureMemcmp:
+        phase==VerifyPhase::Restore?DraftBankTimingPart::RestoreMemcmp:DraftBankTimingPart::InvariantMemcmp;
     // Every not-copied byte MUST disagree with its reference, including zero
     // tails. Ordinary constant poison cannot guarantee this for arbitrary data.
+    int64_t timed=timing_begin();
     for (int64_t j = 0; j < s.bytes; ++j) back[j] = uint8_t(~saved[j]);
+    RAD_TRY(timing_end(complement,timed,s.bytes,true,why));
+    timed=timing_begin();
     const int rc = io_->copy_sync(rank, back, s.base, s.bytes);
+    RAD_TRY(timing_end(read,timed,s.bytes,rc>=0,why));
     if (rc < 0) { poison("bank backup readback copy failed", why); return rc; }
     count_bytes(&stats_.verify_copy_bytes, s.bytes);
-    if (std::memcmp(saved, back, size_t(s.bytes))) return poison("bank backup strict byte readback differs", why);
+    timed=timing_begin();
+    const int different=std::memcmp(saved, back, size_t(s.bytes));
+    RAD_TRY(timing_end(compare,timed,s.bytes,different==0,why));
+    if (different) return poison("bank backup strict byte readback differs", why);
     return RAD_OK;
 }
 int Image::verify_unchanged(std::string* why) {
@@ -318,7 +389,7 @@ int Image::verify_unchanged(std::string* why) {
     for (int r = 0; r < kDraftRanks; ++r)
         for (int i = 0; i < ranks_[r].nspans; ++i)
             if (!ranks_[r].spans[i].restore) {
-                const int rc = verify(r, i, why);
+                const int rc = verify(r, i, why, VerifyPhase::Invariant);
                 if (rc < 0) return rc;
             }
     return RAD_OK;
@@ -333,10 +404,12 @@ int Image::restore_verify_all(std::string* why) {
             const auto& s = ranks_[r].spans[i];
             if (!s.restore) continue;
             const auto* saved = static_cast<const char*>(allocation_[r]) + offsets_[r][i];
+            const int64_t timed=timing_begin();
             rc = io_->copy_sync(r, s.base, saved, s.bytes);
+            RAD_TRY(timing_end(DraftBankTimingPart::RestoreH2D,timed,s.bytes,rc>=0,why));
             if (rc < 0) { poison("bank backup restore copy failed", why); return rc; }
             count_bytes(&stats_.restore_copy_bytes, s.bytes);
-            if ((rc = verify(r, i, why)) < 0) return rc;
+            if ((rc = verify(r, i, why, VerifyPhase::Restore)) < 0) return rc;
         }
     }
     if ((rc = verify_unchanged(why)) < 0) return rc;
@@ -377,8 +450,9 @@ int DraftBankBackup::capture(const DraftBankBackupRanks& ranks, int n, const Dra
     // Charge retained metadata PLUS the bounded capture descriptor on the stack.
     const int rc = image_.capture(image_ranks, budget, sizeof(*this) + sizeof(image_ranks),
                                   io ? io : &device_io_, why);
-    if (rc < 0) return rc;
-    return validate_invariants(why);
+    const int result=rc<0?rc:validate_invariants(why);
+    image_.timing_log("capture",result);
+    return result;
 }
 int DraftBankBackup::check_pointers(std::string* why) {
     if (!attempted_ || image_.failed()) return image_.poison("bank backup is not valid", why);
@@ -397,10 +471,10 @@ int DraftBankBackup::validate_invariants(std::string* why) {
 }
 int DraftBankBackup::restore_verify_all(std::string* why) {
     int rc = check_pointers(why);
-    if (rc < 0) return rc;
-    rc = image_.restore_verify_all(why);
-    if (rc < 0) return rc;
-    return validate_invariants(why);
+    if (rc >= 0) rc = image_.restore_verify_all(why);
+    if (rc >= 0) rc = validate_invariants(why);
+    image_.timing_log("restore",rc);
+    return rc;
 }
 int DraftBankBackup::slots(int rank) const noexcept {
     return rank >= 0 && rank < kDraftRanks ? layout_[rank].nslots : 0;

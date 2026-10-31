@@ -40,12 +40,14 @@ inline bool dspark_native_weight_scope(const WeightInfo& w) noexcept {
 /* Called at owning initialization, never on a cache hit. This validates actual
  * final Program/WTAB geometry in addition to advertised checkpoint metadata.
  * Each stage has exactly32 whole native GU/DN units and one32-entry op per slot.
- * Unsupported declarations must retain the conservative full-layer fallback. */
+ * Unsupported declarations must retain the conservative full-layer fallback.
+ * Any max_seqs: the scheduler drafts for one sequence alone (sched/draft_conf.h);
+ * a path that classifies passes as one sequence's checks max_seqs itself. */
 inline bool dspark_native_program_scope(const Program& p) noexcept {
     const auto& m=p.meta;const auto& c=p.ctx;const auto& d=p.drafter;
     if(!m.arch_id||std::strcmp(m.arch_id,"deepseek41")||m.n_layers!=40||m.n_embd!=5120||m.n_ff!=2304||
        m.n_expert!=384||m.n_expert_used!=6||m.n_vocab!=129280||c.world_size!=4||c.rank<0||c.rank>=4||
-       c.max_seqs!=1||c.max_tok<5||c.max_spec!=5||c.kv_dtype!=RAD_BF16||p.drafter_name!="dspark"||
+       c.max_seqs<1||c.max_tok<5||c.max_spec!=5||c.kv_dtype!=RAD_BF16||p.drafter_name!="dspark"||
        d.kind!=RAD_DRAFT_BLOCK||d.depth!=5||d.block!=5||d.proposal_pitch!=5||!d.proposal||
        d.mask_token!=128799||d.window!=129)return false;
     if(!dspark_meta_integer(m,"deepseek41.nextn_predict_layers","num_nextn_predict_layers",3)||

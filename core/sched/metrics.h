@@ -195,6 +195,10 @@ struct SchedMetrics {
      * finished and the running, and the single-sequence decode steps by kind; `on` false and all
      * zero while off. */
     DraftGateStats draft_gate;
+    /* draft_conf.h (the confidence controller, load-aware drafting, the deferred context pass): their
+     * counters, the finished sequences' and the running ones' so far. `on`/`deferred`/`load_from`
+     * say which are on. */
+    DraftConfStats draft_conf;
 };
 
 

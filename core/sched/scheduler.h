@@ -57,9 +57,15 @@ struct SchedReq {
 
     /* The range [draft_lo, draft_hi) of a block drafter's own KV cache that holds real K and V.
      * The low end is non-zero when a prefix hit left the drafter's group uncached
-     * (hit_holes_draft_); drafting then waits until the window has slid past it. */
+     * (hit_holes_draft_); drafting then waits until the window has slid past it. Under
+     * RADIANCE_EXPERIMENTAL_DS41_DSPARK_CTX_DEFER the range is of committed positions only (block_end
+     * stops it at the commit), so the next catch-up starts at draft_hi. */
     int64_t  draft_lo = 0;
     int64_t  draft_hi = 0;
+    /* RADIANCE_EXPERIMENTAL_DS41_DSPARK_CTX_DEFER: the first position the trunk computed for this
+     * sequence since it was admitted, where its tap history begins (-1 before its first step): a hit
+     * restored the positions below without computing them, so no catch-up reads there. */
+    int64_t  tap_lo = -1;
 
     /* Clears all drafter state for the sequence in this slot, on admission and on preemption.
      * Slots are recycled, so anything not reset here leaks into an unrelated sequence: a stale
@@ -73,6 +79,7 @@ struct SchedReq {
         draft_filled = 0;
         draft_lo     = 0;
         draft_hi     = 0;
+        tap_lo       = -1;
         dgate_held   = false;
     }
 
@@ -86,6 +93,9 @@ struct SchedReq {
      * step verifies nothing for it: the prompt-lookup fallback, which fills an empty proposal in
      * step(), does not stand in. Consumed by the next step's planning. */
     bool       dgate_held = false;
+    /* RADIANCE_EXPERIMENTAL_DS41_DSPARK_CONF (draft_conf.h): the confidence controller's estimate and
+     * counters. Kept through preemption; a new request starts it over. */
+    DraftConfSeq dconf;
     /* The proposal the step being planned carries came from prompt lookup (StepEntry::ngram). */
     bool       draft_ngram = false;
     /* Prompt lookup's index over prompt ++ output (ngram.h), built at the sequence's first lookup
@@ -429,7 +439,10 @@ public:
      *                  describes it. Reserves the draft KV block the query pass writes, and
      *                  returns which sequences may draft.
      *   block_context     the context pass, draft_pass -1. Its entries mirror the trunk step's
-     *                  row for row (BlockSeq).
+     *                  row for row (BlockSeq). Called until it returns null: under
+     *                  RADIANCE_EXPERIMENTAL_DS41_DSPARK_CTX_DEFER it covers each drafting
+     *                  sequence's owed positions instead, in as many passes of at most a step's
+     *                  rows as that takes (draft_conf.h), and nothing when nothing drafts.
      *   block_query       the query pass, draft_pass +1. One entry per drafting sequence: the
      *                  anchor at its next position, then `block - 1` masks; `out_ids` names the
      *                  last `depth` rows.
@@ -478,6 +491,20 @@ public:
      * finished (gated steps, probes, acceptance). Nothing while the gate is off. */
     void draft_gate_report() const;
     const DraftGateCfg&  draft_gate() const { return dgate_cfg_; }
+
+    /* draft_conf.h. The engine's estimate for a sequence's newest draft (p0 its first proposal's, p1
+     * its second's, -1 for none), after finish_block_drafter has read the query pass back; ignored
+     * while the controller is off. The shutdown report: totals, the calibration tables, the context
+     * passes, and a line for each of the last kConfRecs finished sequences; nothing while all three
+     * are off. */
+    void draft_conf_scored(uint64_t id, float p0, float p1);
+    void draft_conf_report() const;
+    const DraftConfCfg&  draft_conf() const { return dconf_cfg_; }
+    int                  draft_load_from() const { return dload_from_; }
+    bool                 ctx_deferred() const { return dctx_.on; }
+    int64_t              ctx_defer_cap() const { return dctx_.cap; }
+    /* The DSpark bank under several sequences (draft_conf.h, "one sequence alone"). */
+    bool                 draft_solo() const { return dsolo_; }
 
     const StepPlan&      plan() const { return plan_; }
     const ChunkGeometry& geometry() const { return geo_; }
@@ -644,6 +671,21 @@ private:
     std::vector<GateRec> dgate_recs_;
     int64_t              dgate_recs_n_ = 0;
     int32_t              dgate_step_drafts_ = 0;
+    /* draft_conf.h, from draft_experiment_ at init: the controller, load-aware drafting from
+     * `dload_from_` decoding sequences (0 off), the deferred context pass, their totals, and the last
+     * kConfRecs finished sequences' controller records (reserved at init, as the gate's). `dsolo_`:
+     * the DSpark bank under --max-num-seqs above 1, whose sequences draft only alone (draft_conf.h,
+     * "one sequence alone"); its counters and report go with the three's. */
+    static constexpr int kConfRecs = 256;
+    struct ConfRec { uint64_t id = 0; int64_t out = 0; DraftConfSeq g; };
+    DraftConfCfg         dconf_cfg_{};
+    int                  dload_from_ = 0;
+    DraftCtxDefer        dctx_{};
+    bool                 dsolo_ = false;
+    DraftConfStats       dconf_tot_{};
+    std::vector<ConfRec> dconf_recs_;
+    int64_t              dconf_recs_n_ = 0;
+    bool                 dconf_any_ = false;   /* any of the three on, or dsolo_ */
 
     /* Where this sequence's block-drafter cache begins; block_begin's guard reads it and
      * block_end records it. */
@@ -814,6 +856,15 @@ private:
          * nothing, but keeps its row so later rows stay aligned with the trunk's. The pass stores
          * nothing for it (a negative slot is padding). */
         bool           mirror = false;
+        /* The positions the context pass writes for it, [ctx_from, ctx_from + ctx_n): its own rows,
+         * or under the deferral a drafting sequence's owed positions through its own rows (a
+         * catch-up, which starts its cache over at ctx_from when `ctx_restart`) and nothing for any
+         * other. `ctx_done` of them are in passes built so far (block_context); block_end moves the
+         * filled range over exactly those. */
+        int64_t        ctx_from = 0;
+        int32_t        ctx_n = 0;
+        int32_t        ctx_done = 0;
+        bool           ctx_restart = false;
         /* No Request* here: block_ is read by later passes with the lock released in between,
          * and a disconnect could free the Request. Rows hold `slot` plus `seq`, resolved through
          * block_req(). */
@@ -822,6 +873,10 @@ private:
     StepPlan           block_plan_;
     int32_t            block_len_ = 0;
     int32_t            block_depth_ = 0;   /* tokens proposed; the head takes the last this many */
+    /* block_context's progress over block_: the passes it built (one without the deferral), and
+     * under the deferral the row whose owed positions the next pass continues. */
+    int32_t            block_ctx_passes_ = 0;
+    size_t             block_ctx_at_ = 0;
     /* `block` - 1 copies of the drafter's mask token, which a query entry's `draft` points at:
      * token_at() walks prompt ++ output ++ draft, so the mask positions come from the accessor
      * every other pass uses. */

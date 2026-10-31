@@ -6,6 +6,7 @@
 #include <cstring>
 
 #include "draft_gate.h"
+#include "draft_conf.h"
 
 namespace rad {
 inline constexpr char kDraftOriginEnv[] = "RADIANCE_EXPERIMENTAL_DS41_DRAFT_ORIGIN_STATS";
@@ -16,7 +17,10 @@ public:
     DraftExperiment() = default;
     static DraftExperiment capture(const char* stats, const char* off,
                                    const char* verify_cap = nullptr,
-                                   const char* gate = nullptr) noexcept {
+                                   const char* gate = nullptr,
+                                   const char* conf = nullptr,
+                                   const char* load = nullptr,
+                                   const char* defer = nullptr) noexcept {
         DraftExperiment x;
         const bool valid_cap = !verify_cap ||
             (verify_cap[0] >= '0' && verify_cap[0] <= '5' && verify_cap[1] == '\0');
@@ -28,6 +32,15 @@ public:
         x.off_ = one(off) || x.cap_ == 0;
         // Nothing drafts with compute OFF, so a gate there would gate nothing under its name.
         if (x.off_ && x.gate_.on) x.valid_ = false;
+        // draft_conf.h: the confidence controller, load-aware drafting, the deferred context pass.
+        // Each refused if unreadable or with compute OFF; the controller and the acceptance gate
+        // both decide whether a query pass runs, so not together.
+        const bool valid_conf = DraftConfCfg::parse(conf, &x.conf_);
+        const bool valid_load = draft_load_parse(load, &x.load_from_);
+        const bool valid_defer = draft_ctx_defer_parse(defer, &x.ctx_defer_);
+        if (!valid_conf || !valid_load || !valid_defer) x.valid_ = false;
+        if (x.off_ && (x.conf_.on || x.load_from_ > 0 || x.ctx_defer_)) x.valid_ = false;
+        if (x.conf_.on && x.gate_.on) x.valid_ = false;
         x.observe_ = one(stats) || x.off_ || x.cap_ >= 0;
         return x;
     }
@@ -37,6 +50,9 @@ public:
     bool head_enabled(bool declared) const noexcept { return declared && !off_; }
     int verify_cap() const noexcept { return cap_; } // -1 means the original uncapped path
     const DraftGateCfg& gate() const noexcept { return gate_; } // the acceptance gate; off by default
+    const DraftConfCfg& conf() const noexcept { return conf_; } // the confidence controller; off by default
+    int load_from() const noexcept { return load_from_; }       // load-aware drafting from N decoders; 0 off
+    bool ctx_defer() const noexcept { return ctx_defer_; }      // the deferred context pass; off by default
     bool scope_required() const noexcept { return off_ || cap_ >= 0; }
     int runtime_depth(int configured) const noexcept {
         return off_ ? 0 : cap_ >= 0 && configured > cap_ ? cap_ : configured;
@@ -48,6 +64,9 @@ private:
     bool valid_ = true, off_ = false, observe_ = false;
     int cap_ = -1;
     DraftGateCfg gate_{};
+    DraftConfCfg conf_{};
+    int load_from_ = 0;
+    bool ctx_defer_ = false;
     static bool one(const char* x) noexcept { return x && std::strcmp(x,"1") == 0; }
     static bool flag(const char* x) noexcept {
         return !x || std::strcmp(x,"0") == 0 || std::strcmp(x,"1") == 0;

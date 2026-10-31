@@ -540,6 +540,14 @@ int Engine::resolve_table_placement(const std::vector<VramFacts>& facts,
     } else {
         emb_why = "as asked";
     }
+    /* RADIANCE_EXPERIMENTAL_DS41_DSPARK_CODEBOOK_RAM (place/planner.h): the drafter's codebooks go
+     * where the embedding goes, so they leave the card only with --embedding-placement ram. */
+    if (draft_codebook_ram() && emb != TablePlacement::Ram) {
+        RAD_ERR("%s: the drafter's codebooks are pinned with the token embedding, and the embedding "
+                "stays in VRAM here (%s): use --embedding-placement ram", kDraftCodebookRamEnv,
+                emb_why.c_str());
+        return RAD_E_INVAL;
+    }
     cfg_.embedding_resolved = emb;
     cfg_.embedding_host_mib = emb == TablePlacement::Ram ? align_up(emb_max, MiB) / MiB : 0;
 
@@ -750,8 +758,10 @@ int Engine::read_metadata() {
     RAD_TRY(file_->open(cfg_.model.c_str()));
     if(!cfg_.draft_bank.empty()){
         const char* opt=std::getenv("RADIANCE_EXPERIMENTAL_DS41_DSPARK_RAD_BANK");
-        if(!opt||std::strcmp(opt,"1")||cfg_.tp!=4||cfg_.max_seqs!=1||cfg_.max_tok<5||cfg_.n_spec!=5||cfg_.spec_ngram!=0||cfg_.kv_cache_dtype!="bf16"){
-            RAD_ERR("--draft-bank first scope requires opt-in, EP4, one sequence, batch>=5, depth5, lookup0 and BF16 KV");return RAD_E_INVAL;}
+        /* Any --max-num-seqs: with several the scheduler lets a sequence draft only while it decodes
+         * alone, and every step of two or more is a plain batch (sched/draft_conf.h). */
+        if(!opt||std::strcmp(opt,"1")||cfg_.tp!=4||cfg_.max_seqs<1||cfg_.max_tok<5||cfg_.n_spec!=5||cfg_.spec_ngram!=0||cfg_.kv_cache_dtype!="bf16"){
+            RAD_ERR("--draft-bank first scope requires opt-in, EP4, batch>=5, depth5, lookup0 and BF16 KV");return RAD_E_INVAL;}
         draft_file_=std::make_unique<RadFile>();RAD_TRY(draft_file_->open(cfg_.draft_bank.c_str()));
         source_banks_=std::make_unique<DsparkRadBanks>();std::string why;
         const int st=source_banks_->bind(*file_,draft_file_.get(),&why);
@@ -4000,7 +4010,10 @@ int Engine::start() {
     startup_begin_ns_ = rad_mono_ns();
     if (!draft_experiment_.valid()) {
         RAD_ERR("experimental draft control: stats/OFF must be absent or0|1, verify cap absent or0..5, with no positive-cap/OFF conflict; "
-                "%s absent, 0, 1 or T[,W[,R]] (T in (0, 64], W 1..64, R 1..4096), and not with compute OFF", kDraftGateEnv);
+                "%s absent, 0, 1 or T[,W[,R]] (T in (0, 64], W 1..64, R 1..4096), and not with compute OFF; "
+                "%s absent, 0, 1 or T[,R] (T in (0, 1), R 2..4096), not with %s; %s absent, 0, 1 or N (2..64); "
+                "%s absent, 0 or 1; none of the three with compute OFF", kDraftGateEnv, kDraftConfEnv,
+                kDraftGateEnv, kDraftLoadEnv, kDraftCtxDeferEnv);
         return RAD_E_INVAL;
     }
     std::vector<int> devs;
@@ -4169,7 +4182,8 @@ int Engine::start() {
         if (ranks_.size() != 4) return RAD_E_UNSUPPORTED;
         /* The cap measures the full block's query unless the drafter declared a short block
          * (deepseek41's RADIANCE_EXPERIMENTAL_DS41_DSPARK_SHORT_BLOCK) and --draft-short-from 1
-         * runs it on every decoding step (max_seqs is 1 here): its first k proposals are then the
+         * runs it on every decoding step (a step that drafts carries one sequence, under any
+         * --max-num-seqs: Scheduler's one-sequence rule): its first k proposals are then the
          * verified ones. */
         const bool short_ok = cfg_.draft_short_from == 0 || (cfg_.draft_short_from == 1 && drafter_short_ > 0);
         for (const auto& r : ranks_) {

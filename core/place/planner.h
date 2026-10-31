@@ -514,8 +514,16 @@ int plan_check_weights_pool(const Plan& p, int64_t pool_bytes);
  * usable; a weight a GEMM also reads (an output head tied to the embedding) would stream whole
  * every step and is neither. Shared by the budget resolver and the planner. */
 bool read_only_by(const Program& prog, rad_weight w, const char* op);
+/* RADIANCE_EXPERIMENTAL_DS41_DSPARK_CODEBOOK_RAM=1: a block drafter's Markov codebooks, read only by
+ * `dflash_select` (K rows a position, gathered by token id, as a lookup reads a table), are lookup
+ * tables too, so --embedding-placement ram pins them beside the token embedding and their VRAM
+ * (DeepSeek-V4.1's DSpark: two [129280, 256] bf16 tables, 126 MiB a rank) goes to the trunk's
+ * experts. The kernel reads the same bytes in place over the link. Off by default. */
+inline constexpr char kDraftCodebookRamEnv[] = "RADIANCE_EXPERIMENTAL_DS41_DSPARK_CODEBOOK_RAM";
+bool draft_codebook_ram();
 inline bool is_embedding_table(const Program& prog, rad_weight w) {
-    return read_only_by(prog, w, "embed_lookup");
+    return read_only_by(prog, w, "embed_lookup") ||
+           (draft_codebook_ram() && read_only_by(prog, w, "dflash_select"));
 }
 inline bool is_ngram_table(const Program& prog, rad_weight w) {
     return read_only_by(prog, w, "embed_lookup_q") || read_only_by(prog, w, "embed_lookup_planes");

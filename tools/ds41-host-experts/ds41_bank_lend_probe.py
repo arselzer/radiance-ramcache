@@ -71,7 +71,7 @@ def check_window(path):
                 continue
             fcntl.flock(f, fcntl.LOCK_UN)
             raise Invalid("research lock is not held: " + str(path))
-    state = subprocess.run(["docker", "inspect", "--format", "{{.State.Running}}",
+    state = subprocess.run(["/usr/bin/sudo", "-n", "/usr/bin/docker", "inspect", "--format", "{{.State.Running}}",
                             "radiance-flashnext"], check=True, capture_output=True,
                            text=True, timeout=10).stdout.strip()
     need(state == "false", "production QFN must already be stopped by the window launcher")

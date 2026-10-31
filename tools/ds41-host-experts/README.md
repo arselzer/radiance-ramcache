@@ -72,6 +72,10 @@ radiance ... --tp 4 --placement expert_tiered --weights-disk-tier \
   --expert-plane-mirror-decode-share 0.13                              # the mirror is optional, see below
 ```
 
+**For concurrent requests** (agent harnesses) add `RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE=1` and `--max-num-seqs N`
+(with `--max-model-len` sized so N sequences' KV fit, e.g. 1024 at N = 4-8): large-chunk prefill refuses steps that
+mix a prompt's chunk with other sequences' decode rows, and the window arms at 4 and 8 streams below ran that way.
+
 **2,048-token chunks with the lent arena** (the block above; ab-20261031T011849Z, T022949Z, T030023Z: prefill hashes
 and every reply identical): time to first token 5.0 / 7.2 / 17.2 s for prompts of 1,890 / 3,086 / 6,817 tokens,
 against 7.5 / 8.6 / 26.7 s at 1,024-token chunks (shorter prompts unchanged); held-out decode 29.45 against 29.91

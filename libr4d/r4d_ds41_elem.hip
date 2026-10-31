@@ -23,9 +23,11 @@
 #include "r4d_launch.h"
 #include "r4d_plugin.h"
 
+#include <atomic>
 #include <climits>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <type_traits>
@@ -2005,12 +2007,25 @@ int norm_rope_rt_body(const RadArgs* a, RadStream stream, int n128 = -1) {
         return e && e[0] == '1' && e[1] == '\0';
     }();
     if (n128 == 1 && !short_key) return R4D_NO(RAD_E_UNSUPPORTED);
-    if (short_key && (n128 == 1 || (n128 < 0 && short_key_on)))
-        return R4D_EMIT(stream, norm_rope_rt_n128_kernel,
+    if (short_key && (n128 == 1 || (n128 < 0 && short_key_on))) {
+        const int launch = R4D_EMIT(stream, norm_rope_rt_n128_kernel,
                          dim3(r4d_cliff_rows(((uint32_t)M + 7u) / 8u, 1, 8)), dim3(256), 0,
                          (const uint16_t*)x.data, (uint32_t)x_ld, (const float*)w.data,
                          (uint16_t*)y.data, (uint32_t)y.stride[0], eps, wadd, mult, (uint32_t)M,
                          r, (uint32_t)thr / kFzWave);
+        /* Proof for a model arm, only after its normal dispatcher queued the fast kernel.
+         * Forced checker calls cannot produce it. After first use only a relaxed load remains;
+         * disabled, ineligible and failed launches never touch this state or perform any I/O. */
+        if (n128 < 0 && launch == RAD_OK) {
+            static std::atomic<bool> reported{false};
+            if (!reported.load(std::memory_order_relaxed) &&
+                !reported.exchange(true, std::memory_order_relaxed)) {
+                std::fprintf(stderr, "[r4d] ds41 n128 active: normal dispatch n=128 M=%lld old_thr=%d\n", M, thr);
+                std::fflush(stderr);
+            }
+        }
+        return launch;
+    }
     const uint32_t lds = (uint32_t)(n * sizeof(uint16_t));
 #define FZ_NRQ(WF, T)                                                                             \
     R4D_EMIT(stream, (norm_rope_rt_kernel<WF, T>), dim3(r4d_cliff_rows((uint32_t)M, 1, T / kFzWave)), \

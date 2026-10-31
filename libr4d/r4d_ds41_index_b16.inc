@@ -22,6 +22,14 @@ struct DsTopkB16Args {
     long sr, scs, kr, kcs, ps, selr, selc;
     int M, C, K, ratio, block, bshift;
 };
+/* The causal reach uses only pos/ps/ratio/C, whose types and meaning are the
+ * original DsTopkArgs fields. Keep its arithmetic/clamps literal, without a
+ * float score pointer projection or widening the original f32 helper. */
+__device__ __forceinline__ long ds_topk_reach(const DsTopkB16Args& a, long m) {
+    long reach = ((long)a.pos[m * a.ps] + 1) / a.ratio;
+    if (reach > a.C) reach = a.C;
+    return reach < 0 ? 0 : reach;
+}
 struct DsSplitB16Args {
     DsTopkB16Args t;
     unsigned long long* cand;

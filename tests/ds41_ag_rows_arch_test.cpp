@@ -167,29 +167,49 @@ TEST(ds41_ag_rows_defaults_validate_counts_and_require_the_existing_aligned_tp4_
 }
 
 TEST(ds41_ag_rows_bounds_both_engram_layers_only_at_2k_and_4k_on_every_rank) {
-    Env env("1024");
+    auto other_gathers = [](const Decl& d) {
+        std::vector<std::string> out;
+        for (const auto& o : d.b.ops) if (o.op == "all_gather" && pint(&o, "row") != d.m->esplit) {
+            std::string key;
+            for (const auto& p : o.p)
+                key += p.key + ":" + std::to_string(p.kind) + ":" + std::to_string(p.ival) +
+                       ":" + std::to_string(p.ihi) + ":" + std::to_string(p.dval) + ":" + p.sval + ";";
+            out.push_back(key);
+        }
+        return out;
+    };
     for (int64_t C : { 2048, 4096 }) for (int rank = 0; rank < 4; ++rank) {
+        std::vector<std::string> original;
+        {
+            Env env("0");
+            auto baseline = declare(rank, C);
+            REQUIRE_EQ(baseline->rc, (int)RAD_OK);
+            original = other_gathers(*baseline);
+        }
+        Env env("1024");
         auto d = declare(rank, C);
         REQUIRE_EQ(d->rc, (int)RAD_OK);
         REQUIRE(d->m && d->m->dsp.on);
         REQUIRE_EQ(d->m->esplit, int64_t(6400));
         CHECK_EQ(d->m->ar_rows, int64_t(0));
-        int ag = 0, other_ag = 0, whole_ar = 0;
+        int ag = 0, draft_ag = 0, whole_ar = 0;
+        CHECK(other_gathers(*d) == original);
         for (const auto& o : d->b.ops) {
             if (o.op == "all_gather" && pint(&o, "row") == d->m->esplit) {
                 CHECK_EQ(param(&o, "numel")->ihi, int64_t(1024 * 6400));
                 CHECK_EQ(param(&o, "numel")->ival, int64_t(6400));
                 ++ag;
-            } else if (o.op == "all_gather") {
+            } else if (&o == d->b.op_of(d->m->dsp.pgather)) {
                 CHECK_EQ(pstr(&o, "dtype"), std::string("f32"));
                 CHECK_EQ(pint(&o, "numel"), d->m->dsp.Q * d->m->dsp.cand * 2);
-                ++other_ag;
+                ++draft_ag;
             } else if (o.op == "all_reduce" && param(&o, "numel")->ihi == C * 5120) ++whole_ar;
         }
         CHECK_EQ(ag, 2);
-        CHECK_EQ(other_ag, 1);
+        CHECK_EQ(draft_ag, 1);
         CHECK(whole_ar >= 81);
     }
+    Env env("1024");
     auto d = declare(0, 16);
     REQUIRE_EQ(d->rc, (int)RAD_OK);
     CHECK_EQ(d->m->ag_rows, int64_t(16));

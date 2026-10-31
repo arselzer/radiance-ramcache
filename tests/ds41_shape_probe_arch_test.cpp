@@ -564,8 +564,8 @@ TEST(lcp4096_keeps_the_small_arena_level_and_full_step_bounds) {
             const int64_t room = full - level - (1 << 20);
             CHECK(room / ds41p1::kSlotBytes >= ds41p1::kMaxLend);
             std::fprintf(stderr, "  LCP4096 arena %.1f MiB, level256 %.1f MiB, %lld physical slots; "
-                                 "lending cap remains %d\n", full / 1048576.0, level / 1048576.0,
-                         (long long)(room / ds41p1::kSlotBytes), ds41p1::kMaxLend);
+                                 "arena lending cap %d (actual room still bounds slots)\n", full / 1048576.0, level / 1048576.0,
+                         (long long)(room / ds41p1::kSlotBytes), ds41p1::kMaxArenaLend);
         }
     }
 }

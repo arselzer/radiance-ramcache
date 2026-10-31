@@ -136,7 +136,7 @@
 # ..._P1_GRACE_MS, 1000; Qh needs Ql or Qe; Q[gnc] stays the power settings), so B6-Ql10 gives decode B1's
 # residents; QeK the lent arena: up to K slots of the activation arena's top, above its 256-row level (the
 # deepseek41 plugin must come from a tree that declares at a smaller step beside the switch), hold the next
-# hottest units the same way, taken back by every step at the full plan (..._P1_LEND_ARENA, 0 off, 1-64; Qe64
+# hottest units the same way, taken back by every step at the full plan (..._P1_LEND_ARENA, 0 off, 1-128; Qe64
 # takes what fits: ~42 slots a card at Lc2048, ~18 at Lc1024); with Ql or Qe the CPU path takes every pass
 # that does not arm P1, so the M part is N_Lc or more; each needs P1. Every other arm states
 # RADIANCE_EXPERIMENTAL_DS41_P1=0 and the Q knobs empty (..._P1_LEND and ..._P1_LEND_ARENA 0). A P1 arm is
@@ -2462,7 +2462,7 @@ for a in $ARMS; do
                case ${p:0:2} in
                  Qw) qk=WAVE qlo=1 qhi=16 ;; Qi) qk=INFLIGHT qlo=1 qhi=64 ;; Qr) qk=READY qlo=1 qhi=32 ;;
                  Qa) qk=AHEAD qlo=0 qhi=64 ;; Qm) qk=MIN_ROWS qlo=17 qhi=4096 ;; Ql) qk=LEND qlo=1 qhi=64 ;;
-                 Qh) qk=GRACE_MS qlo=0 qhi=60000 ;; Qe) qk=LEND_ARENA qlo=1 qhi=64 ;; *) qk=VERIFY qlo=0 qhi=4096 ;;
+                 Qh) qk=GRACE_MS qlo=0 qhi=60000 ;; Qe) qk=LEND_ARENA qlo=1 qhi=128 ;; *) qk=VERIFY qlo=0 qhi=4096 ;;
                esac
                if [[ $qn =~ ^[0-9]+$ ]] && (( 10#$qn >= qlo && 10#$qn <= qhi )); then
                  q1+=(RADIANCE_EXPERIMENTAL_DS41_P1_$qk=$((10#$qn)))

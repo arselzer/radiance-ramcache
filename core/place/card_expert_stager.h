@@ -291,7 +291,7 @@ public:
         uint64_t cancelled = 0;    /* loads or copies a card-path pass overtook, never published */
         uint64_t held_back = 0;    /* passes that found the grace still running */
     };
-    /* n slots (1..2 x ds41p1::kMaxLend: the ring's and the arena's), the grace in ms. Every slot starts
+    /* n slots (1..ds41p1::kMaxCombinedLend: the ring's and the arena's), the grace in ms. Every slot starts
      * empty and lent, as after a card-path pass long ago: the first pass that does not take the slots
      * begins the reloads. */
     int  init(LendHost* host, int n, int64_t grace_ms);

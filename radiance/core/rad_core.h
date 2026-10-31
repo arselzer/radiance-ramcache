@@ -433,6 +433,10 @@ public:
      * it declared none. What the engine does with it: core/sched/consumer_skip.h. */
     RadConsumerSuffix consumer{};
 
+    /* The plugin splits a pure decode step of two or more sequences into two micro-batches
+     * (rad_declare_two_batch, core/sched/tbo.h). */
+    bool           two_batch = false;
+
     /* The declared media encoder (rad_declare_encoder). `modalities == 0` when none: every
      * text-only program, and every deployment with RadBuildCtx::max_enc_patches 0.
      * `encoder_name` is a copy, as `drafter_name` is. */

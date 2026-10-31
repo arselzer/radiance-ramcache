@@ -2,7 +2,7 @@
   "scope": "DeepSeek-V4.1-Flash (ds41) CPU-expert research checkpoint: exact engine source, reports and A/B window evidence; no model payload, research binaries, private serving configuration, credentials or deployment",
   "engine_repo": "/home/as/radiance-ds41-claude",
   "engine_branch": "claude/ds41-decode-impl",
-  "engine_commit": "7bfa66ad3e982ba374307d62458897de1b25a4b4",
+  "engine_commit": "f52ba26771302bc7541012c08fdc4835aaf988a0",
   "engine_upstream": {
     "repository": "https://codeberg.org/StillDeadcode/radiance",
     "note": "Radiance upstream plus the deepseek41 architecture work of its pull request 266; the commits after them are this work (ds41 RAM cache and CPU experts)",
@@ -170,7 +170,10 @@
     "ab-20261030T194552Z",
     "ab-20261030T201710Z",
     "ab-20261030T205440Z",
-    "ab-20261030T213623Z"
+    "ab-20261030T213623Z",
+    "ab-20261030T223155Z",
+    "ab-20261030T225513Z",
+    "ab-20261030T231526Z"
   ],
   "server_log_windows": {
     "ab-20261028T223812Z": "base engine decode, 5.03 tok/s",
@@ -183,7 +186,8 @@
     "ab-20261030T194552Z": "decode after the RAM upgrade (31.2 tok/s, 4 streams)",
     "ab-20261030T201710Z": "Phase 1 prefill exactness and speed",
     "ab-20261030T205440Z": "DSpark and 8 streams at 192 GiB",
-    "ab-20261030T213623Z": "DSpark verify depth"
+    "ab-20261030T213623Z": "DSpark verify depth",
+    "ab-20261030T231526Z": "Phase 1 adoption, prefill hashes and two-batch overlap at 256 GB"
   },
   "allowed_emails": [
     "aselzer3@gmail.com",

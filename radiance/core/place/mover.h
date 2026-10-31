@@ -588,6 +588,18 @@ public:
      *                   back like read ones. */
     void  alias_file_units(const std::vector<int32_t>& units, char* base,
                            std::vector<int32_t>* staged);
+    /* The same with `mark` in the published address's low bits (tools/ds41-host-experts/ds41_p1.h:
+     * kMarkSkip): prefill Phase 1 publishes a touched non-resident expert so that the plugin's own
+     * expert ops leave its rows alone (place/card_expert_stager.h). The weight's 64-byte alignment
+     * leaves the bits free; only a pass whose rows resolve to the P1 twin may see such an entry. */
+    void  alias_file_units(const std::vector<int32_t>& units, char* base,
+                           std::vector<int32_t>* staged, uintptr_t mark);
+    /* alias_pool_units  the same for units pinned in the host pool, which prefill Phase 1 copies to
+     *                   its ring from their pool slots: every weight published at `base` with `mark`,
+     *                   appended to `staged`; unstage_units publishes them at their pool slots again.
+     *                   A unit not in the pool, or in a slab slot, is left as it is. */
+    void  alias_pool_units(const std::vector<int32_t>& units, char* base, std::vector<int32_t>* staged,
+                           uintptr_t mark);
     /* borrow_host_unit  for a reader on the host (place/host_expert_pool.h): when the mapped RAM
      *                   cache holds every weight of file-tier unit `u`, a lease on each, which
      *                   keeps its bytes in place until release_host_unit, and their host
@@ -601,6 +613,7 @@ public:
         int            n = 0;
         bool           packed = false;
         const uint8_t* host[2] = { nullptr, nullptr };
+        const void*    dev[2] = { nullptr, nullptr };   /* the same bytes as the card's DMA reads them */
         int64_t        bytes[2] = { 0, 0 };
         int64_t        slot[2] = { 0, 0 };
         NativeMappedFileCache::Lease lease[2];
@@ -796,6 +809,49 @@ public:
     using FileRelayout = std::function<int(const WeightInfo& w, const RadTensor* planes,
                                            void* dst, int64_t dst_bytes)>;
     void  set_file_relayout(FileRelayout fn) { relayout_ = std::move(fn); }
+    /* ---- prefill Phase 1 (place/card_expert_stager.h) ---------------------------------------
+     *
+     * file_region       the file stager's two buffers as one region (the ring of whole slots), its
+     *                   bytes in *bytes; null without buffers.
+     * ring_copy         copies `n` segments on the mover's stream (the card's DMA lane, one list),
+     *                   behind each of `waits` (null entries skipped), and records `done` after them.
+     * mover_wait        the mover's stream waits on `ev` (a hand-over: copies queued later run
+     *                   behind it).
+     * file_unit_in_slab a file-tier unit the slab or a ring slot holds (set_ring_resident): published
+     *                   at its slot, never aliased.
+     * set_ring_resident the lent ring (card_expert_stager.h, RingLender): file-tier unit u, whose bytes
+     *                   were copied into `slot` (a ring slot of the file region, laid out as the unit is:
+     *                   weight i at its offset) and whose copy the host has seen pass, published there
+     *                   and from then on a resident -- never aliased, staged or borrowed -- until
+     *                   set_ring_resident(u, nullptr) makes it a file-tier unit again (published as
+     *                   null; its layer's passes stage or alias it as any other). The issuing thread
+     *                   only, between passes; ring_resident may be asked from any thread.
+     * relay_unit_block  one missed unit's planes in the stored block form, each weight at its offset in
+     *                   the unit, into `dst` (cap bytes, at least the unit's): the bytes a VRAM copy of
+     *                   the unit holds. Pure and thread-safe (the lent ring's reload thread).
+     * pack_unit_for_ring one missed unit's planes into `dst` (cap bytes, at least ds41p1::kSlotBytes)
+     *                   as a ring slot holds it: gate_up at 0, down at ds41p1::kDnOff; in the packed
+     *                   RAM cache's form (pack_planes with the cache's raw budgets and its round-trip
+     *                   check) when that cache is on and both weights fit their budgets, else in the
+     *                   stored block form (the file tier's relayout). *packed says which. Pure and
+     *                   thread-safe, for a packer thread beside the issuing one. */
+    char* file_region(int64_t* bytes) const {
+        if (bytes) *bytes = file_vram_ ? 2 * file_buf_bytes_ : 0;
+        return file_vram_;
+    }
+    int   ring_copy(const RadCopySeg* segs, int n, const RadEvent* waits, int n_waits, RadEvent done);
+    int   mover_wait(RadEvent ev);
+    bool  file_unit_in_slab(int32_t u) const {
+        return u >= 0 && (size_t)u < unit_.size() && (unit_[(size_t)u].slab_slot >= 0 || ring_resident(u));
+    }
+    void  set_ring_resident(int32_t u, char* slot);
+    bool  ring_resident(int32_t u) const {
+        return ring_res_ && u >= 0 && (size_t)u < unit_.size() &&
+               ring_res_[(size_t)u].load(std::memory_order_relaxed) != nullptr;
+    }
+    int   relay_unit_block(const HostPlanes& p, uint8_t* dst, int64_t cap) const;
+    int   pack_unit_for_ring(const HostPlanes& p, uint8_t* dst, int64_t cap, bool* packed,
+                             int64_t bytes[2]) const;   /* bytes: gate_up's and down's, as written */
     char* file_buffer(int i) const {
         return (file_vram_ && (i == 0 || i == 1)) ? file_vram_ + i * file_buf_bytes_ : nullptr;
     }
@@ -1033,6 +1089,14 @@ private:
     /* The packed cache (packed_cache()): each class's raw-round budget, and its outcomes. */
     int  packed_raw_[2] = { 0, 0 };
     std::unique_ptr<std::atomic<uint8_t>[]> packed_refused_;   /* by unit: refused once already */
+    /* By unit: the ring slot a lent-ring resident is published at (set_ring_resident), or null. Atomic
+     * because the read-ahead threads ask (ring_resident); only the issuing thread writes. */
+    std::unique_ptr<std::atomic<char*>[]> ring_res_;
+    /* A file-tier unit with no address of its own on the card: neither in a slab slot nor a ring
+     * resident. What the file stager's reads, aliases and borrows take. */
+    bool file_off_card(int32_t u, const UnitState& us) const {
+        return us.tier == Tier::SSD && us.slab_slot < 0 && us.klass >= 0 && !ring_resident(u);
+    }
     std::atomic<uint64_t> packed_inserts_{0}, packed_over_budget_{0}, packed_over_budget_units_{0},
                           packed_round_trip_failed_{0};
     int  insert_unit_packed(const HostPlanes& p, const ds41hx::PackCopy* copy);

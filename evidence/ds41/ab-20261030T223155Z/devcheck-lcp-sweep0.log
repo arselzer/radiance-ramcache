@@ -1,0 +1,18 @@
+Warning: Resource leak detected by SharedSignalPool, 120 Signals leaked.
+sweep: RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL unset; heights up to 32 must give every row its bytes launched alone and in launches of 16; 4 trials
+     trial 0 rmsnorm n=5120                               launches of 16 vs alone: ok; 1:ok 16:ok 17:ok 24:ok 25:ok 32:ok 33:ok 40:ok 48:ok
+     trial 0 rmsnorm n=1280                               launches of 16 vs alone: ok; 1:ok 16:ok 17:ok 24:ok 25:ok 32:ok 33:1rows 40:1rows 48:1rows
+     trial 0 rmsnorm n=512                                launches of 16 vs alone: ok; 1:ok 16:ok 17:ok 24:ok 25:ok 32:ok 33:ok 40:ok 48:ok
+     trial 0 rmsnorm n=128                                launches of 16 vs alone: ok; 1:ok 16:ok 17:ok 24:ok 25:ok 32:ok 33:ok 40:ok 48:ok
+     trial 0 mhc_collapse_rmsnorm n=5120 hc=4             launches of 16 vs alone: ok; 1:ok 16:ok 17:ok 24:ok 25:ok 32:ok 33:1rows 40:1rows 48:1rows
+     trial 0 mhc_post_collapse_rmsnorm n=5120 hc=4        launches of 16 vs alone: ok; 1:ok 16:ok 17:ok 24:ok 25:ok 32:ok 33:1rows 40:1rows 48:1rows
+     trial 0 rmsnorm_rope_roundtrip n=512 fp8_e4m3        launches of 16 vs alone: ok; 1:ok 16:ok 17:ok 24:ok 25:ok 32:ok 33:ok 40:ok 48:ok
+     trial 0 rmsnorm_rope_roundtrip n=128 fp4_e2m1        launches of 16 vs alone: ok; 1:ok 16:ok 17:ok 24:ok 25:ok 32:ok 33:ok 40:ok 48:ok
+     trial 0 mhc_mix n=5120 hc=4 (split, scratch)         launches of 16 vs alone: ok; 1:ok 16:ok 17:ok 24:ok 25:ok 32:ok 33:ok 40:ok 48:ok
+     trial 0 mhc_mix n=5120 hc=4 (fused)                  launches of 16 vs alone: ok; 1:ok 16:ok 17:ok 24:ok 25:ok 32:ok 33:ok 40:ok 48:ok
+     trial 0 gemm_bf16_nt_m64 N=1280 K=5120               launches of 16 vs alone: ok; 1:ok 16:ok 17:ok 24:ok 25:ok 32:ok 33:ok 40:ok 48:ok
+     trial 0 gemm_bf16_nt_m64 N=512 K=5120                launches of 16 vs alone: ok; 1:ok 16:ok 17:ok 24:ok 25:ok 32:ok 33:ok 40:ok 48:ok
+     trial 0 logits_gemm n_embd=5120                      launches of 16 vs alone: ok; 1:ok 16:ok 17:ok 24:ok 25:ok 32:ok 33:ok 40:ok 48:ok
+norm rows in passes above the reach (32): 55 of 3872 differ from the same row alone
+PASS: sweep: every height up to the reach gives each row its bytes launched alone and in launches of 16 (rows above it, if any differ, only in a norm)
+sweep0 exit 0

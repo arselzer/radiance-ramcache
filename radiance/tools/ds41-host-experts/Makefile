@@ -39,12 +39,14 @@ device-check: $(O)/ds41_bf16f8_device_check
 # attention and the indexer score at passes taller than 16 tokens against the same rows in smaller
 # launches; `sweep` / `sweep0`: the other height-dependent ops, the norms among them, at heights
 # 1..48 with and without the switch). Run it in a GPU window:
-# HIP_VISIBLE_DEVICES=0 ds41_mxfp4_device_check <libr4d.so> tall (sweep, sweep0).
+# HIP_VISIBLE_DEVICES=0 ds41_mxfp4_device_check <libr4d.so> tall (sweep, sweep0). `p1 [MMAX] [ROUTES]` holds
+# prefill Phase 1's twin (ds41_p1.h) to the gemv in passes of 16 and times it.
 # Built as build_hx.sh builds it: the host kernels by $(CXX), the harness by hipcc, then linked.
 MXFLAGS ?= -O2 -std=c++17 --offload-arch=gfx1201
 $(O)/ds41_host_experts_dc.o: ds41_host_experts.cpp ds41_host_experts.h
 	$(CXX) -O2 -std=c++17 -mavx2 -ffp-contract=off -fno-fast-math -fPIC -c ds41_host_experts.cpp -o $@
-$(O)/ds41_mxfp4_device_check.o: ds41_mxfp4_device_check.hip ds41_host_experts.h $(TREE)/libr4d/r4d_bf16f8_layout.h
+$(O)/ds41_mxfp4_device_check.o: ds41_mxfp4_device_check.hip ds41_host_experts.h ds41_p1.h $(TREE)/libr4d/r4d_bf16f8_layout.h \
+                                 $(TREE)/libr4d/r4d_ds41_tall.h
 	$(HIPCC) $(MXFLAGS) -I. -I$(TREE)/abi -I$(TREE)/libr4d -c ds41_mxfp4_device_check.hip -o $@
 $(O)/ds41_mxfp4_device_check: $(O)/ds41_mxfp4_device_check.o $(O)/ds41_host_experts_dc.o
 	$(HIPCC) $(O)/ds41_mxfp4_device_check.o $(O)/ds41_host_experts_dc.o -o $@ -ldl

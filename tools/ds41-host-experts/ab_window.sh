@@ -1580,6 +1580,8 @@ for a in $ARMS; do
       Pc)      pc=1 ARM_NOPC= ; ARGS+=(--prefix-resume exact)                          # prefix cache on (exact resume, the default, named)
                env+=(RADIANCE_EXPERIMENTAL_CACHE_HEADROOM_BACKED=1) ;;              # ... and pinned slabs not reserved twice
       Pc0)     pc=1 ARM_NOPC= ; ARGS+=(--prefix-resume exact) ;;                      # prefix cache on, the margin as before (the control)
+      Pcn)     pc=1 ARM_NOPC= ; ARGS+=(--prefix-resume nearest)                        # prefix cache on, a hit resumes at the deepest snapshot
+               env+=(RADIANCE_EXPERIMENTAL_CACHE_HEADROOM_BACKED=1) ;;              # ... (Kh against a cold arm checks it stays exact)
       Pci[0-9]*) pcopt+=" $p"; ARGS+=(--checkpoint-interval "${p#Pci}") ;;                    # snapshot interval (2048)
       Pcs[0-9]*) pcopt+=" $p"; ARGS+=(--checkpoint-slots "${p#Pcs}") ;;                       # snapshot store slots (auto)
       Pcx)     pcopt+=" $p"; env+=(RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH=1) ;;           # publish only cold-cut chunks

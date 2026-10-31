@@ -13,6 +13,7 @@ for fn in ar_rows_parse ar_rows_server_gate ar_rows_server_check ar_rows_receipt
   declare -F "$fn" >/dev/null || { bad "missing $fn"; exit 1; }
 done
 OUT=$T/out
+HERE=$T
 mkdir -p "$OUT"
 log() { echo "LOG $*" >>"$OUT/window.log"; }
 for p in Ar1 Ar64 Ar1024 Ar00064; do
@@ -43,6 +44,11 @@ line 1024 >"$OUT/on.server.log"
 
 # KLD follows the same actual-cap gate; all process operations and the corpus comparison are stubbed.
 lcp_check() { return 0; }
+# Other independently tested instruments also guard KLD in the integration harness.
+n128_server_gate() { return 0; }
+vp_server_gate() { return 0; }
+qsp_gate() { return 0; }
+ARGS=()
 kill() { return 1; }
 wait() { return 0; }
 python3() { echo compared >>"$T/compares"; return 0; }

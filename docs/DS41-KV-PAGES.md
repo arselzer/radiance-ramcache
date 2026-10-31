@@ -37,6 +37,11 @@ The first packed contract permits only FULL, one-head, logical BF16 groups whose
 page is one original512/128-element row. The core checks the format, physical pitch and logical
 geometry during declaration and manager planning. It binds a packed layer as honest U8
 `[blocks, physical_page_bytes]`; an ordinary rank4 BF16 reader cannot mistake it for its layout.
+Every actual RAD_KV operand is guarded before launch against the selected band/domain: matching
+declared/resolved format, the exact dedicated packed op/kernel and its cache operand role, plus
+the physical dtype, shape and pitch. Plain fallback readers/writers, a later mismatching band,
+packed attention's ordinary BF16 window slot and sliced packed views are refused. Declaration
+alone cannot prove this: the ABI records buffer liveness, but actual KV handles arrive at issue.
 Packed streaming is refused. Plain BF16, the raw F32 compressor tail and the window remain
 available with their existing layout and configurable cache/expert budgets.
 
@@ -138,3 +143,7 @@ expectations are updated with the declaration. The codec lane supplies numerical
 oracles separately; the runtime lane supplies the default-off producers/readers and dispatch
 markers. All are required before a model byte/memory window; no source test result substitutes
 for the card gate or long KLD, logical `Kh`, prefix/cancel and concurrent reply checks.
+`kv_storage_guard_test` and the packed-KV case in `runtime_test` cover every allowed cache role
+and its format/op/band/physical-view refusals. LCP's index-run report counts the packed alias;
+producer aliases retain the existing one-kernel-per-op admission rule and require their original
+norm pins in the architecture, not a new permissive multi-kernel family.

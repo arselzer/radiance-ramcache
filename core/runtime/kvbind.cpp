@@ -18,6 +18,7 @@ void bind_kv_pools(const Program& p, const std::function<const KVGroupPlan*(int3
         b.layer_stride = gp->layer_stride();
         b.bytes        = gp->pool_bytes;
         b.dtype        = p.kv_groups[g].decl.dtype;
+        b.storage_format = p.kv_groups[g].decl.storage_format;
 
         /* The position of every bound layer, indexed by its absolute number. */
         const std::vector<int32_t>& ls = p.kv_groups[g].layers;

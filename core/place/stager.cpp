@@ -1616,7 +1616,8 @@ int FileStager::lcp_init(const Program& prog, int64_t C) {
         /* The plugin's own height switches, for the startup line: the router's column split (a
          * gemm_nt_f32 over a rank's 96 of 384 columns) and the indexer's runs (row_part > 0). */
         if ((op.op == "gemm_nt_f32" || op.op == "gemm_nt_f32bf16") && N == 96) ++n_split;
-        if (op.op == "index_score" && op.base.get_i("row_part", &part) && part > 0) ++n_runs;
+        if ((op.op == "index_score" || op.op == "index_score_kvpack") &&
+            op.base.get_i("row_part", &part) && part > 0) ++n_runs;
         const char* ty = op.base.get_s("type");
         if (op.op == "moe_gemm_ggml" && ty && !std::strcmp(ty, "mxfp4")) {
             ++n_moe;

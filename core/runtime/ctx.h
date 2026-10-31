@@ -174,6 +174,7 @@ struct KVPoolBinding {
     int64_t  layer_stride = 0;      /* bytes between one layer's cache and the next */
     int64_t  bytes = 0;             /* the whole group's pool, for the bounds check */
     uint32_t dtype = RAD_DT_INVALID;
+    uint32_t storage_format = RAD_KV_STORAGE_PLAIN; /* checked on EVERY actual RAD_KV operand */
     /* Absolute model layer -> cache slot in this group. A lookup, not a subtraction, because a
      * group's layers need not be contiguous. -1: the group does not hold that layer (a caller
      * bug). */

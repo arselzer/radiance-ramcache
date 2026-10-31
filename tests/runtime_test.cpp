@@ -1833,6 +1833,73 @@ TEST(a_kv_operand_resolves_through_the_groups_layer_binding) {
     next_step_clean(f, 5, op, { RAD_KV(1, 3) });
 }
 
+TEST(every_packed_kv_operand_refuses_plain_writers_readers_wrong_roles_and_later_band_fallbacks) {
+    struct Case { uint32_t format; const char* op; const char* row; int operand; } cases[] = {
+        { RAD_KV_STORAGE_DS41_FP4_E4M3_G16, "entry_store_kvpack", "ds41_entry_store_kvpack", 3 },
+        { RAD_KV_STORAGE_DS41_FP4_POW2_G32, "entry_store_kvpack", "ds41_entry_store_kvpack", 3 },
+        { RAD_KV_STORAGE_DS41_FP4_POW2_G32, "index_score_kvpack", "ds41_index_score_d128_kvpack", 2 },
+        { RAD_KV_STORAGE_DS41_FP4_E4M3_G16, "attn_sparse_sink_kvpack", "ds41_attn_sparse_sink_d512_kvpack", 4 },
+    };
+    for (const Case& c : cases) {
+        Fixture f;
+        bind_kv(f);
+        auto& binding = f.kv[1];
+        const int64_t pitch = c.format == RAD_KV_STORAGE_DS41_FP4_E4M3_G16 ? 288 : 68;
+        binding.dtype = RAD_U8;
+        binding.storage_format = c.format;
+        binding.rank = 2;
+        binding.shape[0] = 4;
+        binding.shape[1] = pitch;
+        binding.shape[2] = binding.shape[3] = 0;
+        binding.layer_stride = 4 * pitch;
+        binding.bytes = 3 * binding.layer_stride;
+        const auto packed_op = [&](const char* name, bool declare_format, bool bad_high_format,
+                                    const char* high_row) {
+            const auto op = f.add_op(name, "M", { 4, 8192 }, { k_pre, k_pre },
+                                     { c.row, high_row }, nullptr, {});
+            auto& oi = f.P.ops[op];
+            if (declare_format) oi.base.set_i("kv_format", c.format);
+            for (size_t i = 0; i < oi.bands.size(); ++i)
+                oi.bands[i].dom[RAD_DOMAIN_DEVICE].geom.set_i("kv_format",
+                    i && bad_high_format ? 3 - c.format : c.format);
+            return op;
+        };
+        const auto row_fallback = packed_op(c.op, true, false, "plain_fallback");
+        const auto format_fallback = packed_op(c.op, true, true, c.row);
+        const auto missing_declaration = packed_op(c.op, false, false, c.row);
+        const auto old_writer = packed_op("entry_store", true, false, c.row);
+        const auto old_reader = packed_op("attn_sparse_sink", true, false, c.row);
+        REQUIRE_EQ(f.start(), RAD_OK);
+        std::vector<RadOperand> operands((size_t)c.operand + 1, RAD_NONE);
+        operands[(size_t)c.operand] = RAD_KV(1, 7);
+        CHECK_OK(issue_once(f, 0, row_fallback, operands));
+        REQUIRE_EQ(g_rec.size(), 1u);
+        CHECK_EQ(g_rec[0].t[(size_t)c.operand].dtype, uint32_t(RAD_U8));
+        CHECK_EQ(g_rec[0].t[(size_t)c.operand].rank, 2u);
+        int step = 1;
+        const auto high = [&](rad_op op) {
+            g_rec.clear();
+            return f.step(32, step++, [&](Ctx& ctx) {
+                ctx.issue(op, operands.data(), (int)operands.size(), RAD_N_BATCH);
+            });
+        };
+        refused(f, high(row_fallback), RAD_E_SHAPE, "explicit packed reader/writer contract");
+        refused(f, high(format_fallback), RAD_E_SHAPE, "matching explicit declared and resolved kv_format");
+        refused(f, issue_once(f, step++, missing_declaration, operands), RAD_E_SHAPE,
+                 "matching explicit declared and resolved kv_format");
+        refused(f, issue_once(f, step++, old_writer, operands), RAD_E_SHAPE, "packed");
+        refused(f, issue_once(f, step++, old_reader, operands), RAD_E_SHAPE, "packed");
+        std::vector<RadOperand> wrong(operands.size(), RAD_NONE);
+        wrong[1] = RAD_KV(1, 7); // includes the BF16 window slot of packed attention
+        refused(f, issue_once(f, step++, row_fallback, wrong), RAD_E_SHAPE,
+                 "explicit packed reader/writer contract");
+        auto sliced = operands;
+        sliced[(size_t)c.operand].rows = 1;
+        refused(f, issue_once(f, step++, row_fallback, sliced), RAD_E_SHAPE, "invalid physical view");
+        next_step_clean(f, step, row_fallback, operands);
+    }
+}
+
 /* The binding the engine builds from the block manager's plans: each bound layer at its position
  * in the group, the pool and stride from the plan, and the shape libref's layouts define from the
  * declaration and the manager's sizes. */

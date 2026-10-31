@@ -2,7 +2,7 @@
   "scope": "DeepSeek-V4.1-Flash (ds41) CPU-expert research checkpoint: exact engine source, reports and A/B window evidence; no model payload, research binaries, private serving configuration, credentials or deployment",
   "engine_repo": "/home/as/radiance-ds41-claude",
   "engine_branch": "claude/ds41-decode-impl",
-  "engine_commit": "0a6167eba5d53517c2c971db486cb4486aaa151c",
+  "engine_commit": "9b395fc8d77989a9de24af4891ab72eb08a329b6",
   "engine_upstream": {
     "repository": "https://codeberg.org/StillDeadcode/radiance",
     "note": "Radiance upstream plus the deepseek41 architecture work of its pull request 266; the commits after them are this work (ds41 RAM cache and CPU experts)",
@@ -177,7 +177,9 @@
     "ab-20261030T234957Z",
     "ab-20261031T011849Z",
     "ab-20261031T022949Z",
-    "ab-20261031T030023Z"
+    "ab-20261031T030023Z",
+    "ab-20261031T034433Z",
+    "ab-20261031T041410Z"
   ],
   "server_log_windows": {
     "ab-20261028T223812Z": "base engine decode, 5.03 tok/s",
@@ -194,7 +196,8 @@
     "ab-20261030T231526Z": "Phase 1 adoption, prefill hashes and two-batch overlap at 256 GB",
     "ab-20261030T234957Z": "DSpark beside concurrent requests",
     "ab-20261031T022949Z": "the compressor tail sized to the step, lent arena gate",
-    "ab-20261031T030023Z": "the prefill configurations under concurrency"
+    "ab-20261031T030023Z": "the prefill configurations under concurrency",
+    "ab-20261031T034433Z": "harness turns with the adopted prefill and the prefix cache"
   },
   "allowed_emails": [
     "aselzer3@gmail.com",

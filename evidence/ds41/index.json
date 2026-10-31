@@ -16,7 +16,8 @@
     "ab-20261030T231526Z": "Phase 1 adoption, prefill hashes and two-batch overlap at 256 GB",
     "ab-20261030T234957Z": "DSpark beside concurrent requests",
     "ab-20261031T022949Z": "the compressor tail sized to the step, lent arena gate",
-    "ab-20261031T030023Z": "the prefill configurations under concurrency"
+    "ab-20261031T030023Z": "the prefill configurations under concurrency",
+    "ab-20261031T034433Z": "harness turns with the adopted prefill and the prefix cache"
   },
   "windows": {
     "ab-20261028T220036Z": {
@@ -3616,6 +3617,44 @@
       "arms_started": 7,
       "qfn_restored": true,
       "left_out": []
+    },
+    "ab-20261031T034433Z": {
+      "files": 12,
+      "bytes": 2627884,
+      "server_logs": 3,
+      "server_log_bytes": 465359,
+      "server_log_xz_bytes": 70460,
+      "started_utc": "2026-10-31T03:44:34Z",
+      "arms_started": 3,
+      "qfn_restored": true,
+      "left_out": []
+    },
+    "ab-20261031T041410Z": {
+      "files": 10,
+      "bytes": 933014,
+      "server_logs": 0,
+      "server_log_bytes": 0,
+      "server_log_xz_bytes": 0,
+      "started_utc": "2026-10-31T04:14:10Z",
+      "arms_started": 3,
+      "qfn_restored": true,
+      "left_out": [
+        {
+          "path": "all-t40-f-M1024-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc1024-P1-Cs-Mb1-Pcn-Pce-Kh-Lm32768-Uharness.server.log",
+          "bytes": 78510,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Cs-Mb1-Kh-Lm32768-Uharness.server.log",
+          "bytes": 156246,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Cs-Mb1-Pcn-Pce-Kh-Lm32768-Uharness.server.log",
+          "bytes": 81146,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        }
+      ]
     }
   }
 }

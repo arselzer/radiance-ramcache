@@ -30,6 +30,10 @@ public:
      * at once. Called on shutdown and on a device fault, so ranks are not left parked on a barrier
      * an exited rank can no longer complete; the engine must be able to exit (spec §17). */
     void abort();
+    /* Engine uses barrier pairs: even generation is before release/after all rank CPU issuers
+     * joined; odd is an issuing phase. With the scheduler itself not arriving again, an even
+     * generation proves ranks cannot issue more work. It does NOT prove GPU completion. */
+    bool parked_for_scheduler();
 
 
 private:

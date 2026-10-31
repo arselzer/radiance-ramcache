@@ -4618,6 +4618,16 @@ int FileStager::end_pass(RadStream s) {
     return rc<0 ? rc : head_status_;
 }
 
+int FileStager::quiesce_for_backing() {
+    if (p1_on() || p1_lend_arena_asked()) return RAD_E_UNSUPPORTED;
+    if (armed_ || hx_stage_ != 0 || hx_li_ >= 0 || hx_early_li_ >= 0 || p1_armed_)
+        return RAD_E_STATE;
+    /* end_pass/hx_drain already joined miss posts and expert jobs before the rank barrier. The
+     * remaining insert threads touch immutable expert planes/RAM cache only, never KV. */
+    drain_host_inserts();
+    return RAD_OK;
+}
+
 /* ---- prefill Phase 1 (card_expert_stager.h) ---------------------------------------------------------- */
 
 /* RADIANCE_EXPERIMENTAL_DS41_P1: the switch's checks beyond lcp_init's bands and hx_init's CPU path, and

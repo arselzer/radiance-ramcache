@@ -525,6 +525,9 @@ private:
     void eors_report();
     /* The arena level and the followers' pools, before any release that runs a forward pass. */
     int  prepare_release(const RadBatch* b);
+    /* UNUSED physical-KV prerequisite. The callback changes backing under scheduler ownership
+     * after all issuers/readers drain, before admission. No runtime flag/caller enables it yet. */
+    int kv_quiescent_plan(const std::function<int()>& change, const RadBatch** out);
     /* Whether a step may be issued ahead: requires that the drafter, if any, runs on the card (the
      * prompt-lookup drafter reads the committed sequence). */
     bool pipelining_ = false;

@@ -303,6 +303,50 @@ TEST(the_device_fakes_are_the_ones_linked) {
     rad_dev_free(p, RAD_MEM_DEVICE);
 }
 
+TEST(quiescent_planning_runs_before_prefix_adoption_or_page_allocation_and_refuses_without_mutation) {
+    Fixture f;
+    f.build(64, 8, 64, 4096, false, false);
+    REQUIRE_EQ(f.start(), RAD_OK);
+    f.pc.seed(32);
+    const auto seeded = f.pc.seeded;
+    const auto refcounts = f.kv.refcnt;
+    const auto free = f.kv.freelist;
+    const uint64_t id = f.submit(80, 8);
+    REQUIRE(id != 0);
+    const RadBatch* batch = reinterpret_cast<const RadBatch*>(1);
+    int calls = 0;
+    CHECK_EQ(f.sch.step_quiescent([&] {
+        ++calls;
+        CHECK(f.kv.seqs.empty());
+        CHECK(f.kv.refcnt == refcounts);
+        CHECK_EQ(f.pc.lookups, 0ll);
+        return int(RAD_E_DEVICE); // e.g. a failed rank stream drain; do not attempt admission
+    }, &batch), RAD_E_DEVICE);
+    CHECK(batch == nullptr);
+    CHECK_EQ(calls, 1);
+    CHECK(f.kv.seqs.empty());
+    CHECK(f.kv.refcnt == refcounts && f.kv.freelist == free);
+    CHECK(f.pc.seeded == seeded);
+    CHECK_EQ(f.pc.lookups, 0ll);
+    CHECK(f.pc.restores.empty());
+    CHECK_EQ(f.sch.step_quiescent([&] {
+        ++calls;
+        CHECK(f.kv.seqs.empty());
+        CHECK_EQ(f.pc.lookups, 0ll);
+        return int(RAD_OK);
+    }, &batch), RAD_OK);
+    REQUIRE(batch);
+    CHECK_EQ(calls, 2);
+    CHECK(f.kv.has_sequence(id));
+    CHECK(f.pc.lookups > 0);
+    for (size_t i = 0; i < seeded.size(); ++i) {
+        const int32_t g = f.pc.groups[i];
+        const auto& table = f.kv.block_table(id, g);
+        REQUIRE(table.size() >= seeded[i].size());
+        CHECK(std::equal(seeded[i].begin(), seeded[i].end(), table.begin()));
+    }
+}
+
 /* ================================================================== geometry + chunking */
 TEST(chunk_geometry_is_computed_not_configured) {
     Fixture f;

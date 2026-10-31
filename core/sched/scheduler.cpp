@@ -2509,6 +2509,21 @@ bool Scheduler::preempt_wait_overdue(const SchedReq& s) const {
 /* ------------------------------------------------------------------ the step */
 const RadBatch* Scheduler::step() {
     std::lock_guard<std::mutex> lk(mu_);
+    return step_locked();
+}
+
+int Scheduler::step_quiescent(const std::function<int()>& before_plan, const RadBatch** out) {
+    if (!out) return RAD_E_INVAL;
+    *out = nullptr;
+    if (!before_plan) return RAD_E_INVAL;
+    std::lock_guard<std::mutex> lk(mu_);
+    const int rc = before_plan();
+    if (rc < 0) return rc;
+    *out = step_locked();
+    return RAD_OK;
+}
+
+const RadBatch* Scheduler::step_locked() {
     /* A cycle opens here, so its head depth is chosen here (scheduler.h, draft_cycle). */
     draft_cycle();
 

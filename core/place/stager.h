@@ -1214,6 +1214,10 @@ private:
 public:
     /* Waits for the background relayouts of missed units; before the mover drains its cache. */
     void drain_host_inserts();
+    /* Initial physical-KV mode has no P1 or head/draft passes. Assert the rank CPU issuer ended
+     * its FileStager pass (end_pass already joined CPU expert/miss jobs), then drain RAM-cache
+     * insert helpers. Never calls Scheduler or waits for its ownership mutex. */
+    int quiesce_for_backing();
 private:
     int  finish(int32_t b, RadStream s);
     struct HeadOps;

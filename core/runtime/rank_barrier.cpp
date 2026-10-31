@@ -30,4 +30,9 @@ void RankBarrier::abort() {
     cv_.notify_all();
 }
 
+bool RankBarrier::parked_for_scheduler() {
+    std::lock_guard<std::mutex> lk(m_);
+    return !aborted_ && (gen_ % 2) == 0;
+}
+
 }  /* namespace rad */

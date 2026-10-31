@@ -21,6 +21,15 @@ namespace rad {
 Ctx::Ctx() = default;
 Ctx::~Ctx() { shutdown(); }
 
+int Ctx::quiesce_for_backing() {
+    if (!program_ || !stream_ || rec_) return RAD_E_STATE;
+    RAD_TRY(rad_dev_set(device_));
+    row_prefetch_done();
+    const int lane_status = lane1_ ? rad_stream_sync(lane1_) : RAD_OK;
+    const int main_status = rad_stream_sync(stream_);
+    return lane_status < 0 ? lane_status : main_status;
+}
+
 int Ctx::init(const CtxDesc& d) {
     if (!d.program) return RAD_E_INVAL;
     program_   = d.program;

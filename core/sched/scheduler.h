@@ -20,6 +20,7 @@
 #include "ngram.h"
 
 #include <chrono>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <numeric>
@@ -362,6 +363,11 @@ public:
     /* ---------------------------------------------------------- the step path */
     /* One decision, one batch. Null when there is nothing to run, which is not an error. */
     const RadBatch* step();
+    /* Physical-memory maintenance seam: hold the SAME ownership lock across the drain/change
+     * callback and ALL admission/prefix/COW planning. Failure runs no planning or batch uploads.
+     * Callback must not call any public Scheduler method (the mutex is not recursive). No engine
+     * mode installs this yet; ordinary step() remains unchanged. */
+    int step_quiescent(const std::function<int()>& before_plan, const RadBatch** out);
 
     /* ---------------------------------------------------- the next step, before this one commits
      *
@@ -1023,6 +1029,7 @@ private:
 
     /* arrival; mu_ held */
     int  add_locked(std::unique_ptr<Request> r);
+    const RadBatch* step_locked();
 
     /* ordering */
     bool ahead_of(int32_t a, int32_t b) const;

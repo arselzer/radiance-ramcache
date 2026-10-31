@@ -234,6 +234,10 @@ public:
 
     int  init(const CtxDesc& d);
     void shutdown();
+    /* Between paired-rank releases only. Drain BOTH compute lanes and the host row-prefetch
+     * helper without destroying captures/buffers or counting this as an ordinary step sync.
+     * Does not drain the mover/tier streams; the engine must do those separately. */
+    int quiesce_for_backing();
 
     /* ---------------------------------------------------------- the hot path */
     int issue(rad_op h, const RadOperand* opd, int n_opd, int64_t n);

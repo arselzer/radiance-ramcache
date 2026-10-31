@@ -11009,6 +11009,68 @@ TEST(dspark_bank_drafts_for_a_sequence_alone_and_catches_it_up_when_alone_again)
     }
 }
 
+/* The production seam is before commit: same actual block_begin epoch/step and existing solo
+ * decision, while cancellation/admission are owned by the scheduler callback. No GPU issue. */
+TEST(dspark_bank_backing_frame_binds_concurrency_cancellation_and_resume_before_commit) {
+    BankRun r;r.start(4,true,false,32);
+    const uint64_t a=r.f.submit(40,400);
+    (void)r.step();(void)r.step(); // anchor past prompt, with its existing host driver
+    CHECK_OK(r.f.sch.enable_draft_bank_observation());
+    CHECK_EQ(r.f.sch.enable_draft_bank_observation(),RAD_E_STATE);
+    const uint64_t b=r.f.submit(60,400);
+    const RadBatch* batch=r.f.sch.step();REQUIRE(batch!=nullptr);
+    const int step=batch->step;
+    Scheduler::BlockRow rows[4];
+    CHECK_EQ(r.f.sch.block_begin(5,5,129,128799,rows,4,/*on_card=*/true),0);
+    rad::draft_bank::Work original{};int calls=0;
+    CHECK_OK(r.f.sch.with_draft_bank_frame(step,[&](const rad::draft_bank::Work&w){original=w;++calls;return RAD_OK;}));
+    CHECK_EQ(calls,1);CHECK(original.lendable());CHECK_EQ(original.query_seq,(uint64_t)0);
+    CHECK_EQ(original.step,step);CHECK(original.epoch>0);
+    CHECK_EQ(r.f.sch.with_draft_bank_frame(step+1,[&](const rad::draft_bank::Work&){++calls;return RAD_OK;}),RAD_E_STATE);
+    CHECK_EQ(calls,1);
+    CHECK_EQ(r.f.sch.with_draft_bank_idle([]{return RAD_OK;}),RAD_E_STATE);
+    CHECK_OK(r.f.sch.cancel(b)); // old frame may only lose work; never reassigns a new request's bank work
+    CHECK_OK(r.f.sch.with_draft_bank_frame(step,[&](const rad::draft_bank::Work&w){
+        CHECK_EQ(w.epoch,original.epoch);CHECK(w.lendable());return RAD_OK;}));
+    CHECK(r.f.sch.block_context(step)==nullptr);CHECK(r.f.sch.block_query(step)==nullptr);
+    r.f.sch.block_end();
+    CHECK_EQ(r.f.sch.with_draft_bank_frame(step,[](const rad::draft_bank::Work&){return RAD_OK;}),RAD_E_STATE);
+    CHECK_OK(r.f.commit(712));r.f.sch.step_finished();
+    batch=r.f.sch.step();REQUIRE(batch!=nullptr);
+    const int next=batch->step;
+    CHECK_EQ(r.f.sch.block_begin(5,5,129,128799,rows,4,/*on_card=*/true),1);
+    CHECK_OK(r.f.sch.with_draft_bank_frame(next,[&](const rad::draft_bank::Work&w){
+        CHECK(w.epoch>original.epoch);CHECK(!w.solo_held);CHECK(!w.lendable());
+        CHECK(w.context_rows>0);CHECK_EQ(w.query_rows,5);CHECK_EQ(w.query_seq,a);return RAD_OK;}));
+    r.f.sch.block_end();CHECK_OK(r.f.commit(713));r.f.sch.step_finished();
+}
+
+TEST(dspark_bank_backing_observation_refuses_without_explicit_deferred_context_and_solo) {
+    for(int c=0;c<2;++c){BankRun r;r.start(c?1:4,c!=0,false,32);
+        CHECK_EQ(r.f.sch.enable_draft_bank_observation(),RAD_E_STATE);}
+    BankRun r;r.start(4,true,false,32);
+    CHECK_OK(r.f.sch.enable_draft_bank_observation());
+    int invoked=0;
+    CHECK_EQ(r.f.sch.with_draft_bank_frame(0,[&](const rad::draft_bank::Work&){++invoked;return RAD_OK;}),RAD_E_STATE);
+    CHECK_EQ(invoked,0);CHECK_OK(r.f.sch.with_draft_bank_idle([&]{++invoked;return RAD_OK;}));CHECK_EQ(invoked,1);
+}
+
+TEST(dspark_bank_backing_transaction_refuses_after_issue_ahead_was_planned) {
+    BankRun r;r.start(4,true,false,32);
+    (void)r.f.submit(40,400);(void)r.step();(void)r.step();
+    CHECK_OK(r.f.sch.enable_draft_bank_observation());
+    const RadBatch* b=r.f.sch.step();REQUIRE(b!=nullptr);const int step=b->step;
+    Scheduler::BlockRow rows[4];
+    CHECK_EQ(r.f.sch.block_begin(5,5,129,128799,rows,4,true),1);
+    CHECK_OK(r.f.sch.with_draft_bank_frame(step,[](const rad::draft_bank::Work&){return RAD_OK;}));
+    /* Normal planning may now hold future reads: the backing callback must fail,
+     * even though no device action was executed in this host fixture. */
+    REQUIRE(r.f.sch.step_next()!=nullptr);
+    int calls=0;
+    CHECK_EQ(r.f.sch.with_draft_bank_frame(step,[&](const rad::draft_bank::Work&){++calls;return RAD_OK;}),RAD_E_STATE);
+    CHECK_EQ(calls,0);
+}
+
 /* Past the window: after 140 steps of two sequences, the survivor's owed positions reach below the
  * lowest key its query reads, so its cache starts over there (129 - 1 positions below its anchor) in
  * 8 passes of 16, from the slots its trunk steps used; the step after covers its own rows. */

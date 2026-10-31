@@ -602,6 +602,9 @@ int Engine::issue_block_drafter(int step, StepOut& so) {
     const int head = tree_ ? block - 1 : steps;
     const int n = sched_.block_begin(block, head, (int)drafter_.window, drafter_.mask_token,
                                      block_row_.data(), (int)block_row_.size(), /*on_card=*/true);
+    /* Same frame, under Scheduler ownership, before ANY bank context/query and issue-ahead.
+     * Restoring at this seam is mandatory even when the depth/head later declines a query. */
+    if (draft_bank_loan_) RAD_TRY(draft_bank_lend_step(step));
 
     /* --draft-coupling: the draws before the query pass reads them (stage_couple_draws). */
     if (mtp_couple_ && n > 0) RAD_TRY(stage_couple_draws(block_row_.data(), n));
@@ -624,6 +627,7 @@ int Engine::issue_block_drafter(int step, StepOut& so) {
     if (!qb) return RAD_OK;
     RAD_TRY(advance_all(ADV_BLOCK, 0, false));
     RAD_TRY(block_pass(qb, "query", step));
+    if (draft_bank_loan_) RAD_TRY(draft_bank_lend_query_issued(step, qb->n_tok));
     RAD_TRY(advance_all(ADV_BTAKE, steps, true, n));
     /* The confidence head's input rows, behind the pass (engine_dconf.cpp). */
     RAD_TRY(dconf_issue(n, block));

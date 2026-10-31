@@ -18,6 +18,7 @@
 #include "lookup.h"
 #include "metrics.h"
 #include "ngram.h"
+#include "place/draft_bank_lend.h"
 
 #include <chrono>
 #include <functional>
@@ -532,6 +533,11 @@ public:
     int64_t              ctx_defer_cap() const { return dctx_.cap; }
     /* The DSpark bank under several sequences (draft_conf.h, "one sequence alone"). */
     bool                 draft_solo() const { return dsolo_; }
+    /* Private Engine backing-reuse transaction. Holds admission/cancellation out until the
+     * caller restores the complete cohort. The callback must not reenter Scheduler. */
+    int with_draft_bank_frame(int step, const std::function<int(const draft_bank::Work&)>&);
+    int with_draft_bank_idle(const std::function<int()>&);
+    int enable_draft_bank_observation(); // once, before rank threads start
     /* Read-only capture; publish AFTER set_draft and before this proposal's verify commits.
      * anchor and tokens come from the same StepSlot readback as the installed proposal. */
     void draft_prob_publish(uint64_t id, int64_t anchor, int32_t anchor_token,
@@ -931,6 +937,11 @@ private:
      * under the deferral the row whose owed positions the next pass continues. */
     int32_t            block_ctx_passes_ = 0;
     size_t             block_ctx_at_ = 0;
+    int                bank_frame_step_ = -1;
+    uint64_t           bank_frame_epoch_ = 0;
+    bool               bank_frame_solo_ = false;
+    bool               bank_observe_ = false;
+    bool               bank_frame_open_ = false;
     /* `block` - 1 copies of the drafter's mask token, which a query entry's `draft` points at:
      * token_at() walks prompt ++ output ++ draft, so the mask positions come from the accessor
      * every other pass uses. */

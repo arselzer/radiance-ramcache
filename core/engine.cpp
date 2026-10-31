@@ -76,6 +76,8 @@ Engine::Readback::~Readback() {
 }
 
 Engine::~Engine() {
+    // Startup failure/normal teardown: free the immutable host image while rank owners live.
+    if (draft_bank_loan_) (void)draft_bank_lend_close();
     /* The control vector's per-rank direction copies. Uploaded at declare, outside any arena, so
      * nothing else frees them; each rank's copy is freed with that rank's device bound, since the
      * allocator is per device. */
@@ -1107,6 +1109,10 @@ int Engine::step_loop() {
             /* Idle: back off in small steps instead of spinning; the first wait is short so a new
              * request into an empty engine is not delayed. */
             step_batch_.store(nullptr, std::memory_order_release);
+            if (draft_bank_loan_) {
+                const int ds = draft_bank_lend_idle();
+                if (ds < 0) return fail_loop(ds);
+            }
             drain_completed();
             sched_.publish(/*idle=*/true);
             /* Work is waiting only on the encoder: loop immediately. */
@@ -2693,6 +2699,7 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
                                 ? 8 * std::max<int64_t>(geo_.checkpoint_interval, 0) : 0);
     }
 
+    if (draft_bank_config_.on) RAD_TRY(draft_bank_lend_open());
     for (auto& r : ranks_) r->sampler.attach_vocab(vocab_view_.get());
 
     /* RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP=1 (issue_ahead): anything but 0 or 1 is refused
@@ -2735,10 +2742,11 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
     for (auto& t : rank_threads_) if (t.joinable()) t.join();
     rank_threads_.clear();
     xstats_close();
+    const int bank_close = draft_bank_loan_ ? draft_bank_lend_close() : RAD_OK;
     draft_vram_close();
     /* A step-loop error takes precedence over the transport's status. */
     const int ls = loop_status_.load(std::memory_order_acquire);
-    return ls < 0 ? ls : s;
+    return ls < 0 ? ls : bank_close < 0 ? bank_close : s;
 }
 
 /* The state slots a sequence owns, one per KV group, -1 where the group is not stateful. Read from

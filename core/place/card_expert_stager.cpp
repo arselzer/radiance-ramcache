@@ -1026,6 +1026,14 @@ int CardExpertPath::drop_all() {
     return error_;
 }
 
+int CardExpertPath::quiesce_for_draft_bank() {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (pass_ || lending() || reading_ || packing_ || owed_ ||
+        !read_q_.empty() || !pack_q_.empty() || !done_q_.empty() || !by_unit_.empty())
+        return RAD_E_STATE;
+    return error_ < 0 ? error_ : RAD_OK;
+}
+
 int CardExpertPath::end_pass(RadStream s, RadEvent end) {
     if (!pass_) return RAD_OK;
     int rc = st_.end_pass();

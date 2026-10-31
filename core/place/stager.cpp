@@ -951,7 +951,14 @@ int FileStager::start_ep_routed(int32_t li, RadStream s, bool* read) {
     }
     want_.clear(); skip_.clear();
     for (int32_t u : L.units) {
-        if (mover_->ring_resident(u)) continue;   /* a lent-ring resident: the card's, as a VRAM one */
+        if (mover_->ring_resident(u)) {
+            if (bank_track_) {
+                bool selected=false;
+                if (!ep_route_unit_selected(counts_host_,plan_->units[(size_t)u].expert,&selected)) return RAD_E_STATE;
+                bank_selected_ += selected;
+            }
+            continue;   /* a lent-ring resident: the card's, as a VRAM one */
+        }
         bool selected = false;
         if (!ep_route_unit_selected(counts_host_, plan_->units[(size_t)u].expert, &selected))
             return RAD_E_STATE;
@@ -2717,7 +2724,14 @@ int FileStager::hx_early_decide() {
     want_.clear();
     skip_.clear();
     for (int32_t u : L.units) {
-        if (mover_->ring_resident(u)) continue;   /* a lent-ring resident: the card's, as a VRAM one */
+        if (mover_->ring_resident(u)) {
+            if (bank_track_) {
+                bool selected=false;
+                if (!ep_route_unit_selected(counts_host_,plan_->units[(size_t)u].expert,&selected)) return RAD_E_STATE;
+                bank_selected_ += selected;
+            }
+            continue;   /* a lent-ring resident: the card's, as a VRAM one */
+        }
         bool selected = false;
         if (!ep_route_unit_selected(counts_host_, plan_->units[(size_t)u].expert, &selected))
             return RAD_E_STATE;
@@ -4540,6 +4554,14 @@ int FileStager::tbo_second(int32_t li, RadStream s) {
     if (!read) RAD_TRY(start(li, s));
     if (holds_[b] == li && pending_[b]) RAD_TRY(rad_event_wait(s, done_[b]));
     ++tbo_slices_;
+    return RAD_OK;
+}
+
+int FileStager::quiesce_for_draft_bank() {
+    if (draft_bank_lend_conflict() || armed_ || p1_armed_ || hx_stage_ || hx_li_ >= 0 ||
+        hx_early_li_ >= 0) return RAD_E_STATE;
+    if (p1_) RAD_TRY(p1_->quiesce_for_draft_bank());
+    drain_host_inserts();
     return RAD_OK;
 }
 

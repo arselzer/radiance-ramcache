@@ -362,6 +362,8 @@ public:
      * into the file buffers run behind this pass's last reader. */
     int  end_pass(RadStream s, RadEvent end);
     bool pass_on() const { return pass_; }
+    /* CPU-side proof only, after end_pass; the owner separately drains every device stream. */
+    int quiesce_for_draft_bank();
 
     /* A routed layer: its units, then start (RAM copies, demand reads posted), then the launches of
      * its three ops captured, then run (the waves) behind the down projection on `s`. */

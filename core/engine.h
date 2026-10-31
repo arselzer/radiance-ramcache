@@ -40,6 +40,7 @@
 #include "format/dspark_rad_banks.h"
 #include "place/vram_packed.h"
 #include "place/draft_vram.h"
+#include "place/draft_bank_lend.h"
 #include "lora/adapter.h"
 #include "lora/slots.h"
 
@@ -191,6 +192,16 @@ private:
     void draft_vram_credit(Rank& r, int layer, const int32_t* h, int64_t n);
     void draft_vram_drain(Rank& r, int before_step);
     void draft_vram_close();
+    draft_bank::Config draft_bank_config_{};
+    struct DraftBankLoan;
+    std::unique_ptr<DraftBankLoan> draft_bank_loan_;
+    int draft_bank_lend_open();
+    int draft_bank_lend_drain(bool startup, const char* action, uint64_t epoch);
+    int draft_bank_lend_transition(const draft_bank::Work&, draft_bank::Action, bool startup = false);
+    int draft_bank_lend_step(int step);
+    int draft_bank_lend_idle();
+    int draft_bank_lend_query_issued(int step, int64_t rows);
+    int draft_bank_lend_close();
 
     RadModelMeta   meta_{};
     LoadedPlugins  plugins_;

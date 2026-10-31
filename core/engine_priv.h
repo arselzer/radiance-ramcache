@@ -21,6 +21,7 @@
 #include "place/heat.h"
 #include "place/planner.h"
 #include "place/mover.h"
+#include "place/draft_bank_backup.h"
 #include "place/stager.h"
 #include "place/xstats.h"
 #include "runtime/ctx.h"
@@ -28,6 +29,30 @@
 #include "sched/advance.h"
 
 namespace rad {
+
+/* One bounded transaction, owned solely by the scheduler thread. No worker may publish a
+ * loan. Backup accounts this object's full size, including all target/slot metadata. */
+struct Engine::DraftBankLoan {
+    static constexpr int kSlots = kDraftStages * kDraftRankExperts;
+    explicit DraftBankLoan(draft_bank::Config c): controller(c) {}
+    draft_bank::Controller controller;
+    DraftBankBackup backup;
+    std::array<std::array<int32_t, kSlots>, kDraftRanks> target{};
+    std::array<int, kDraftRanks> count{};
+    std::array<uint64_t,kDraftRanks> selected_at_lend{};
+    // Sequential source extent reader; never overlaps relay/readback or another rank's fill.
+    Mover::HostPlanes source;
+    // Two independent 2MiB-rounded, 2MiB-aligned source buffers plus conservative
+    // alignment allocator overhead. Native plane sizes/4KiB extent rounding fit 18MiB.
+    static constexpr int64_t kSourcePayload = 18ll << 20;
+    static constexpr int64_t kSourceBound = kSourcePayload + (4ll << 20);
+    bool published = false, resume_pending = false;
+    uint64_t resume_epoch = 0, query_seq = 0;
+    int64_t query_step = -1;
+    uint64_t lends = 0, restores = 0, rollbacks = 0, fill_bytes = 0;
+    uint64_t source_drive_bytes = 0, source_ram_bytes = 0, relay_bytes = 0;
+    uint64_t startup_ns = 0, drain_ns = 0, fill_ns = 0, restore_ns = 0;
+};
 
 /* ================================================================== per-rank state */
 /* One tensor-parallel rank's state; see Engine::ranks_. */

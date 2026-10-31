@@ -156,8 +156,8 @@ std::unique_ptr<Decl> declare(int rank, int64_t max_tok, bool probe, int64_t max
 }
 
 /* The core's rules for laying a sizing declare over the real one (rad_builder.cpp's reference check,
- * rad_bufplan.cpp's plan_level): the first difference, or empty. `capacity` names the fixed integer
- * parameters a kernel declares RAD_PROLE_CAPACITY (both libraries' qsa_work `work`). */
+ * rad_bufplan.cpp's plan_level): the first difference, or empty. The one fixed integer a kernel declares
+ * RAD_PROLE_CAPACITY in this graph, qsa_work's `work` (both libraries), may shrink. */
 std::string differs(const RadBuilder& real, const RadBuilder& probe) {
     if (real.ops.size() != probe.ops.size())
         return say("%zu ops in the real declare, %zu in the sizing one", real.ops.size(), probe.ops.size());

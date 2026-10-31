@@ -27,6 +27,7 @@
 #include <arch/rad_deepseek41_chat.h>
 #include <arch/rad_dflash_observe.h>
 #include <arch/rad_ds41_kv_codec.h>
+#include <arch/rad_ds41_kv_pair.h>
 #include <arch/rad_ds41_window_codec.h>
 #include "ds41_prefetch_plan.h"
 #include "ds41_index_memory.h"
@@ -571,6 +572,7 @@ struct Model {
     bool kv_packed = false;
     bool window_packed = false; // native FP8 WINDOW only; requires packed compressed/index pages
     bool kv_packed_fast = false; // independent default-off reader arithmetic implementation
+    bool kv_packed_pair = false; // default-off M1/H16 direct-PV metadata sharing; same stored bytes
     /* The indexer scores a step's rows in runs of at most `irows` rows into one [irows, cmax] score
      * plane (index_runs()), at most `iparts` runs a step; `kwords` is index_candidates' keep, a bit
      * a block of the candidate layer's width, i32 words a row (0: the model has no candidates). */
@@ -2901,6 +2903,17 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     if (const char* e = std::getenv("RADIANCE_EXPERIMENTAL_DS41_WINDOW_PACKED")) {
         if (std::strcmp(e,"0") && std::strcmp(e,"1")) return RAD_E_INVAL;
         m.window_packed = !std::strcmp(e,"1");
+    }
+    const int pair_mode = rad_ds41_kv_pair::parse_mode(
+        std::getenv("RADIANCE_EXPERIMENTAL_DS41_KV_PACKED_PAIR"));
+    if (!rad_ds41_kv_pair::dependencies(pair_mode, m.kv_packed, m.kv_packed_fast, m.window_packed)) {
+        fprintf(stderr, "radiance: deepseek41: KV_PACKED_PAIR accepts 0/1 and requires KV_PACKED=1, KV_PACKED_FAST=1, WINDOW_PACKED=0\n");
+        return RAD_E_INVAL;
+    }
+    m.kv_packed_pair = pair_mode == 1;
+    if (m.kv_packed_pair && (g.world != 4 || m.aw != 4 || m.zero || g.n_head != 16 || c.head_dim != 512)) {
+        fprintf(stderr, "radiance: deepseek41: KV_PACKED_PAIR first gate requires native TP4 H16 D512\n");
+        return RAD_E_UNSUPPORTED;
     }
     if (m.window_packed) {
         if (!m.kv_packed || c.head_dim != 512) {

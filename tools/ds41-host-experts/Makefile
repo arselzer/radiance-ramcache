@@ -83,6 +83,14 @@ $(O)/ds41_kv_fast_device_check: ds41_kv_fast_device_check.hip ds41_kv_fast_oracl
 	$(HIPCC) $(HIPFLAGS) -I$(TREE)/abi -o $@ $<
 kv-fast-check: $(O)/ds41_kv_fast_device_check
 
+# Optional direct-PV adjacent-pair BYTE oracles. Future guarded GPU window only; no timings.
+$(O)/ds41_kv_pair_device_check: ds41_kv_pair_device_check.hip ds41_kv_pair_oracle.h $(TREE)/arch/common/rad_ds41_kv_pair.h $(TREE)/arch/common/rad_ds41_kv_fast.h $(TREE)/arch/common/rad_ds41_kv_codec.h
+	$(HIPCC) $(HIPFLAGS) -I$(TREE)/abi -o $@ $<
+$(O)/ds41_kv_pair_paths_check: ds41_kv_pair_paths_check.hip ds41_kv_packed_paths_check.hip ds41_kv_codec_device_check.hip $(TREE)/arch/common/rad_ds41_kv_pair.h $(TREE)/arch/common/rad_ds41_kv_fast.h $(TREE)/arch/common/rad_ds41_kv_codec.h
+	$(HIPCC) $(HIPFLAGS) -I$(TREE)/abi -I$(TREE)/libr4d -o $@ ds41_kv_pair_paths_check.hip -ldl
+kv-pair-check: $(O)/ds41_kv_pair_device_check $(O)/ds41_kv_pair_paths_check
+.PHONY: kv-pair-check
+
 # Strict standalone FP8-window bytes against the actual current producer; GPU window only.
 $(O)/ds41_window_codec_device_check: ds41_window_codec_device_check.hip $(TREE)/arch/common/rad_ds41_window_codec.h
 	$(HIPCC) $(HIPFLAGS) -I$(TREE)/abi -o $@ $< -ldl

@@ -36,6 +36,7 @@
 #include "../arch/common/rad_ds41_kv_codec.h"
 #include "../arch/common/rad_ds41_window_codec.h"
 #include "../arch/common/rad_ds41_kv_fast.h"
+#include "../arch/common/rad_ds41_kv_pair.h"
 
 #include <climits>
 #include <atomic>
@@ -58,6 +59,11 @@ int ds_kv_fast_mode() {
         const char* p = std::getenv("RADIANCE_EXPERIMENTAL_DS41_KV_PACKED_FAST");
         return !p || !std::strcmp(p, "0") ? 0 : !std::strcmp(p, "1") ? 1 : -1;
     }();
+    return mode;
+}
+int ds_kv_pair_mode() {
+    static const int mode = rad_ds41_kv_pair::parse_mode(
+        std::getenv("RADIANCE_EXPERIMENTAL_DS41_KV_PACKED_PAIR"));
     return mode;
 }
 
@@ -1033,7 +1039,7 @@ __device__ __forceinline__ void ds_dec_pv4(float (&acc)[HPT][DPT], float (&den)[
 
 /* The DPT columns at dcol of the 32 keys whose pointers lanes 0..31 hold (a wave-uniform pointer a
  * key, through readlane), straight from global. */
-template <int DPT>
+template <int DPT, bool PairWord = false>
 __device__ __forceinline__ void ds_dec_pvld(uint32_t (&kv)[32], const uint16_t* lp, int dcol,
                                            uint32_t kind, int win, int key0, bool fast) {
     const unsigned long long v = (unsigned long long)lp;
@@ -1044,7 +1050,16 @@ __device__ __forceinline__ void ds_dec_pvld(uint32_t (&kv)[32], const uint16_t* 
                                       (uint32_t)__builtin_amdgcn_readlane(lo, u);
         const uint16_t* p = (const uint16_t*)pu;
         if (kind && key0 + u >= win) {
-            if constexpr (DPT == 2) kv[u] = ds_kv_word(p, dcol, kind, kDsAttnD, fast);
+            if constexpr (PairWord) {
+                static_assert(DPT == 2, "pair reconstruction keeps the old DPT2 layout");
+                // Preserve the old sentinel/null behavior before any physical packed-row access.
+                if (!p || p == kDsZeroKey) kv[u] = 0;
+                else {
+                    if (kind != 1 || !fast) __builtin_trap();
+                    kv[u] = rad_ds41_kv_pair::decode_row2_bits<rad_ds41_kv_codec::Kind::Fp4E4M3G16,
+                                                             kDsAttnD>((const uint8_t*)p, dcol);
+                }
+            } else if constexpr (DPT == 2) kv[u] = ds_kv_word(p, dcol, kind, kDsAttnD, fast);
             else kv[u] = ds_kv_half(p, dcol, kind, kDsAttnD, fast);
         } else {
             if constexpr (DPT == 2) kv[u] = *(__attribute__((address_space(1))) const uint32_t*)(p + dcol);
@@ -1064,8 +1079,10 @@ __device__ __forceinline__ void ds_dec_pvsum(float (&acc)[HPT][DPT], float (&den
 }
 
 
-template <int HG, int NT, int DPT, int P, bool PVD>
+template <int HG, int NT, int DPT, int P, bool PVD, bool PairWord = false>
 __global__ __launch_bounds__(NT) void ds41_attn_dec_kernel(DsAttnArgs a) {
+    static_assert(!PairWord || (HG == 1 && NT == 1024 && DPT == 2 && PVD),
+                  "first pair experiment retains the served M1 direct-PV form only");
     constexpr int D = kDsAttnD, NW = NT / 32, NCG = D / DPT, TK = NT / 64;
     constexpr int NHP = (NT / NCG) < HG ? (NT / NCG) : HG;   /* head parts in PV */
     constexpr int HPT = HG / NHP;                           /* heads a PV thread */
@@ -1218,14 +1235,14 @@ __global__ __launch_bounds__(NT) void ds41_attn_dec_kernel(DsAttnArgs a) {
         if (pvt) {
             uint32_t kv[2][32];
             const uint16_t* lp = kp[lane];
-            ds_dec_pvld<DPT>(kv[0], lp, dcol, a.kv_format, a.win, 0, a.kv_fast);
+            ds_dec_pvld<DPT, PairWord>(kv[0], lp, dcol, a.kv_format, a.win, 0, a.kv_fast);
 #pragma unroll 1
             for (int kb = 0; kb < nkb; kb += 2) {
                 lp = kb + 1 < nkb ? kp[(kb + 1) * 32 + lane] : zero;
-                ds_dec_pvld<DPT>(kv[1], lp, dcol, a.kv_format, a.win, (kb + 1) * 32, a.kv_fast);
+                ds_dec_pvld<DPT, PairWord>(kv[1], lp, dcol, a.kv_format, a.win, (kb + 1) * 32, a.kv_fast);
                 ds_dec_pvsum<HPT, DPT>(acc, den, kv[0], ph, nkq, kb * 32, dw);
                 lp = kb + 2 < nkb ? kp[(kb + 2) * 32 + lane] : zero;
-                ds_dec_pvld<DPT>(kv[0], lp, dcol, a.kv_format, a.win, (kb + 2) * 32, a.kv_fast);
+                ds_dec_pvld<DPT, PairWord>(kv[0], lp, dcol, a.kv_format, a.win, (kb + 2) * 32, a.kv_fast);
                 if (kb + 1 < nkb) ds_dec_pvsum<HPT, DPT>(acc, den, kv[1], ph, nkq, (kb + 1) * 32, dw);
             }
         }
@@ -1851,14 +1868,14 @@ int attn_emit(RadStream stream, const DsAttnArgs& s, unsigned gz) {
     return R4D_EMIT(stream, (ds41_attn_sparse_sink_kernel<HG, DS>), grid, dim3(256), lds, s);
 }
 
-template <int HG, int NT, int DPT, bool PVD>
+template <int HG, int NT, int DPT, bool PVD, bool PairWord = false>
 int attn_dec_go(RadStream stream, const DsAttnArgs& s) {
     constexpr int P = 4;                                /* key tiles in flight in PV */
     const int nkq = (s.nk + 31) / 32 * 32;
     const long lds = ds_dec_lds(nkq, HG, PVD ? 0 : NT).total;
     if (lds > 65536) return RAD_E_UNSUPPORTED;
     const dim3 grid((unsigned)((s.H + HG - 1) / HG), (unsigned)s.M);
-    return R4D_EMIT(stream, (ds41_attn_dec_kernel<HG, NT, DPT, P, PVD>), grid, dim3(NT), (uint32_t)lds, s);
+    return R4D_EMIT(stream, (ds41_attn_dec_kernel<HG, NT, DPT, P, PVD, PairWord>), grid, dim3(NT), (uint32_t)lds, s);
 }
 
 /* The decode band's kernel. The form by how many (row, head) pairs the pass has, any choice giving
@@ -1903,6 +1920,9 @@ int attn_body(const RadArgs* a, RadStream stream, int oracle_form = -1) {
     const bool packed = kind != 0;
     if (packed && (kind != 1 || ratio < 1 || ratio > 2)) return R4D_NO(RAD_E_UNSUPPORTED);
     if (packed && ds_kv_fast_mode() < 0) return R4D_NO(RAD_E_INVAL);
+    if (packed && (ds_kv_pair_mode() < 0 ||
+                   (ds_kv_pair_mode() == 1 && ds_kv_fast_mode() != 1)))
+        return R4D_NO(RAD_E_INVAL);
     const float scale = (float)r4d_getf(a, "scale", 0.0);
     const bool comp = ratio > 0;
     if (H < 1 || D < 2 || D > 4096 || win < 1 || ratio < 0 || topk < 0 || !std::isfinite(scale) ||
@@ -1975,6 +1995,11 @@ int attn_body(const RadArgs* a, RadStream stream, int oracle_form = -1) {
     s.scale = scale;
     s.kv_format = kind; s.packed_stride = comp && packed ? (long)cc->stride[0] : 0;
     s.kv_fast = packed && ds_kv_fast_mode() == 1;
+    if (oracle_form == 15) {
+        if (!rad_ds41_kv_pair::normal_candidate(1, kind, s.kv_fast, s.M, s.H))
+            return R4D_NO(RAD_E_UNSUPPORTED);
+        return attn_dec_go<1, 1024, 2, true, true>(stream, s);
+    }
     /* Unregistered oracle exports force an existing reader without changing normal dispatch. */
     if (oracle_form >= 1 && oracle_form <= 7) {
         switch (oracle_form) {
@@ -2017,6 +2042,21 @@ int attn_body(const RadArgs* a, RadStream stream, int oracle_form = -1) {
      * in the same order, so the bits do not depend on it. A tall pass under ..._EXACT_TALL takes
      * the decode band's own kernel, as a 16-token pass does. */
     const long rows = s.M;
+    if (oracle_form < 0 && rad_ds41_kv_pair::normal_candidate(ds_kv_pair_mode(), kind, s.kv_fast, s.M, s.H)) {
+        const int rc = attn_dec_go<1, 1024, 2, true, true>(stream, s);
+        if (rc != RAD_E_UNSUPPORTED) {
+            if (rc == RAD_OK && a->rank >= 0 && a->rank < a->world_size && a->rank < 64) {
+                static std::atomic<uint64_t> reported{0};
+                const uint64_t bit = uint64_t(1) << (unsigned)a->rank;
+                if (!(reported.load(std::memory_order_relaxed) & bit) &&
+                    !(reported.fetch_or(bit, std::memory_order_relaxed) & bit)) {
+                    std::fprintf(stderr, "[r4d] ds41 KV_PACKED_PAIR active rank=%d normal=1 M=1 H=16 HG=1 NT=1024 DPT=2 PVD=1 row_bytes=288 decoder=integer-pair\n", a->rank);
+                    std::fflush(stderr);
+                }
+            }
+            return rc;
+        }
+    }
     if (oracle_form < 0 && (rows <= kWmRows || ds_exact_tall())) {
         const int rc = attn_dec_emit(stream, s);
         if (rc != RAD_E_UNSUPPORTED) return rc;
@@ -2055,6 +2095,11 @@ extern "C" int r4d_rad_ds41_index_score_kvpack_check(const RadArgs* a, RadStream
 }
 extern "C" int r4d_rad_ds41_attn_sparse_sink_kvpack_check(const RadArgs* a, RadStream s, int form) {
     return form >= 0 && form <= 14 ? attn_body(a, s, form) : RAD_E_INVAL;
+}
+/* Deliberately unregistered: 0 is the old direct-PV form, 1 the new same-layout pair form.
+ * The dedicated new export is a mandatory coherent-cohort oracle/capability receipt. */
+extern "C" int r4d_rad_ds41_attn_sparse_sink_kvpair_check(const RadArgs* a, RadStream s, int form) {
+    return form == 0 ? attn_body(a, s, 1) : form == 1 ? attn_body(a, s, 15) : RAD_E_INVAL;
 }
 extern "C" int r4d_rad_ds41_index_score_kvpack(const RadArgs* a, RadStream stream) {
     if (!a || r4d_geti_or(a, "kv_format", 0) != 2) return R4D_NO(RAD_E_UNSUPPORTED);

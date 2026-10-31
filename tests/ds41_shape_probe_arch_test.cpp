@@ -42,6 +42,7 @@ constexpr int kWorld = 4;
 const char* const kVars[] = { "RADIANCE_EXPERIMENTAL_DS41_P1",
                               "RADIANCE_EXPERIMENTAL_DS41_KV_PACKED",
                               "RADIANCE_EXPERIMENTAL_DS41_KV_PACKED_FAST",
+                              "RADIANCE_EXPERIMENTAL_DS41_KV_PACKED_PAIR",
                               "RADIANCE_EXPERIMENTAL_DS41_WINDOW_PACKED",
                               deepseek41::kIndexCompactEnv,
                               deepseek41::kIndexB16Env,

@@ -24,6 +24,9 @@
 # Rb (the routers read as bf16) are also checked in the server log, and so is a predictor part's
 # router predictor. An Rb arm runs only after SELFTEST_F32BF16's card checks passed in the window,
 # and a Vp arm only on a libr4d.so VPACK_CHECK passed (below).
+# Fn128 selects the default-off n128 fused index-key norm. It needs DEVICE_CHECKS=n128,
+# N128_CHECK_BIN (ds41_n128_device_check) and N128_CHECK_LIB, with the card oracle through M4096
+# passing on the arm's library SHA. Every normal rank must actually dispatch the fast kernel.
 #
 # Prefix caching (every other arm runs with --no-prefix-cache): Pc the prefix cache on, with
 # RADIANCE_EXPERIMENTAL_CACHE_HEADROOM_BACKED=1 (startup's checks after the load stop reserving the
@@ -138,7 +141,7 @@
 # Environment: RADIANCE_BIN (the binary), RADIANCE_HOME_DIR (kernels/ and architectures/ for it),
 # SILU_TABLE (the card's silu table), ARMS (default "base verify greedy"), HX_THREADS (16),
 # VERIFY_REQUESTS (3), DEVICE_CHECKS (1; a list: `swiglu` the default checks, `tall` the exact-tall checks, `lcp` the large-chunk
-# ones at LCP_CHECK_C, both with TALL_LIBR4D and TALL_CHECK),
+# ones at LCP_CHECK_C, both with TALL_LIBR4D and TALL_CHECK; `n128` uses N128_CHECK_BIN/LIB),
 # SELFTEST_F32BF16 (an r4d_selftest: gemm_nt_f32bf16's checks and timings on card 0 before the
 # arms; unset, none, and no Rb arm runs).
 set -u
@@ -344,8 +347,43 @@ lcp_check() {   # name
   return 0
 }
 
+# Fn128: require an actual normal dispatch on each active TP rank, not just a switch/startup
+# message. This window serves TP4. A plain arm must have no marker, including legacy markers.
+n128_server_gate() {   # server log, Fn128 flag, active ranks (4 here); explanation on failure
+  local f=$1 want=$2 ranks=${3:-4} r
+  if [[ -n "$want" ]]; then
+    for ((r=0; r<ranks; ++r)); do
+      if ! grep -qE "ds41 n128 active: normal dispatch rank=$r world=$ranks n=128 M=[1-9][0-9]* old_thr=(256|512|1024)([[:space:]]|$)" "$f"; then
+        echo "Fn128 has no successful normal n128 fast dispatch on rank $r of $ranks"
+        return 1
+      fi
+    done
+  elif grep -qF 'ds41 n128 active:' "$f"; then
+    echo "no Fn128 part, but a normal n128 fast dispatch was logged"
+    return 1
+  fi
+  return 0
+}
+
+n128_arm_gate() {   # library, conservative work-row bound; receipt is set by the device oracle
+  local lib=$1 rows=$2
+  if [[ "${N128_OK:-}" != 1 ]]; then
+    echo "${N128_WHY:-no n128 byte oracle}"
+    return 1
+  fi
+  if (( rows < 1 || rows > ${N128_MAX_M:-0} )); then
+    echo "work bound $rows exceeds oracle M${N128_MAX_M:-0}, or is invalid"
+    return 1
+  fi
+  if [[ ! -f "$lib" || "$(sha256sum "$lib" 2>/dev/null | cut -d' ' -f1)" != "${N128_SUM:-}" ]]; then
+    echo "libr4d.so (${lib:-none}) is not the oracle SHA ${N128_SUM:-none}"
+    return 1
+  fi
+  return 0
+}
+
 # A Kld arm: its server records the corpus (--kld-record) instead of serving, then exits. The
-# window's first Kld arm that finishes is the reference (KLD_REF), never an Xt arm; a later one's
+# window's first Kld arm that finishes is the reference (KLD_REF), never an Xt/Lc/Fn128 arm; a later one's
 # records must equal it byte for byte. KLD_TIMEOUT (900 s) bounds a run.
 KLD_REF=
 kld_finish() {   # name; the run is SERVER_PID
@@ -358,6 +396,12 @@ kld_finish() {   # name; the run is SERVER_PID
   log "arm $name: kld run exit $rc after ${t}s"
   grep -E 'kld:|error|ERR' "$OUT/$name.server.log" | tail -6 | tee -a "$OUT/window.log"
   (( rc == 0 )) || return 1
+  local n128_why
+  if ! n128_why=$(n128_server_gate "$OUT/$name.server.log" "${ARM_N128:-}" 4); then
+    log "arm $name: $n128_why; not measured"
+    return 1
+  fi
+  [[ -n "${ARM_N128:-}" ]] && grep -F 'ds41 n128 active:' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   xt_check "$name" || return 1
   lcp_check "$name" || return 1
   local extra_why
@@ -366,10 +410,10 @@ kld_finish() {   # name; the run is SERVER_PID
     log "arm $name: $extra_why; Kld not measured"; return 1
   fi
   if [[ -z "$KLD_REF" ]]; then
-    # The reference must be a 16-token arm's bits: an Xt or Lc arm first (the plain one failed or is
-    # missing) would let a later Xt or Lc arm be compared with another one.
-    if [[ -n "${ARM_XT:-}${ARM_LC:-}" ]]; then
-      log "arm $name: an Xt or Lc arm cannot be the window's kld reference (no plain Kld arm finished before it); not compared"
+    # The reference must be a plain 16-token arm's bits: a feature arm first (the plain one failed
+    # or is missing) would let a later feature arm be compared with another one.
+    if [[ -n "${ARM_XT:-}${ARM_LC:-}${ARM_N128:-}" ]]; then
+      log "arm $name: an Xt, Lc or Fn128 arm cannot be the window's kld reference (no plain Kld arm finished before it); not compared"
       return 1
     fi
     KLD_REF=$OUT/kld-$name
@@ -799,6 +843,13 @@ EOF2
     log "arm $name: teacher-forced along $lpref: exit $?"
   fi
   stop_server
+  local n128_why
+  if ! n128_why=$(n128_server_gate "$OUT/$name.server.log" "${ARM_N128:-}" 4); then
+    log "arm $name: $n128_why; not measured (results kept as $name.unmeasured.json)"
+    [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
+    return 1
+  fi
+  [[ -n "${ARM_N128:-}" ]] && grep -F 'ds41 n128 active:' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   # Dk / Dkt (RADIANCE_EXPERIMENTAL_DS41_DRAFT_GEMV): libr4d names the mode at its first draft call
   # and counts the calls when the server exits. A Dk arm without the first line, or whose exit line
   # leaves draft-shaped calls on the old path, or another arm with either line, is not measured:
@@ -1239,6 +1290,44 @@ elif [[ -n "${SELFTEST_F32BF16:-}" ]]; then
   log "$RB_WHY: no Rb arm is measured"
 fi
 
+# Fn128's byte gate: the same loaded library, forced old/new and public dispatch, original
+# THR1024/512/256 and LCP's pin. The exact final marker includes the tested bound and case count.
+# No cache/recommendation changes: this only authorizes explicitly named Fn128 arms in this window.
+N128_OK="" N128_LIB="" N128_SUM="" N128_MAX_M=0
+N128_WHY="no n128 device oracle in this window (DEVICE_CHECKS=n128, N128_CHECK_BIN and N128_CHECK_LIB)"
+if [[ " ${DEVICE_CHECKS:-1} " == *" n128 "* ]]; then
+  NB=${N128_CHECK_BIN:-} NL=${N128_CHECK_LIB:-}
+  if [[ ! -x "$NB" || ! -f "$NL" ]]; then
+    N128_WHY="N128_CHECK_BIN=$NB is not executable or N128_CHECK_LIB=$NL is not a file"
+  else
+    n128_before=$(sha256sum "$NL" 2>/dev/null | cut -d' ' -f1)
+    n128_bad=""
+    for mode in off on lcp; do
+      n128_switch=1 n128_lcp=0 n128_tall=0
+      [[ $mode == off ]] && n128_switch=0
+      [[ $mode == lcp ]] && { n128_lcp=2048; n128_tall=; }
+      log "n128 byte oracle on card 0, $mode, with $NL ($NB)"
+      ( export HIP_VISIBLE_DEVICES=0 RADIANCE_EXPERIMENTAL_DS41_N128=$n128_switch
+        export RADIANCE_EXPERIMENTAL_DS41_LCP=$n128_lcp RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=$n128_tall
+        export RADIANCE_EXPERIMENTAL_DS41_P1=0
+        timeout 900 "$NB" "$NL" >"$OUT/n128-$mode.log" 2>&1
+        echo "n128 $mode exit $?" >>"$OUT/n128-$mode.log" )
+      grep -E '^PASS: ds41 n128|^FAIL|^n128 .* exit ' "$OUT/n128-$mode.log" | tee -a "$OUT/window.log"
+      grep -qx "n128 $mode exit 0" "$OUT/n128-$mode.log" || n128_bad+=" $mode exit;"
+      grep -q '^FAIL' "$OUT/n128-$mode.log" && n128_bad+=" $mode FAIL;"
+      grep -qxF 'PASS: ds41 n128 wave norm matches unchanged fused norm, all output/guard bytes; exceptional and rounding cases, eligibility refusals; through M4096 (29 positive cases)' "$OUT/n128-$mode.log" ||
+        n128_bad+=" $mode missing M4096/29-case PASS;"
+    done
+    N128_SUM=$(sha256sum "$NL" 2>/dev/null | cut -d' ' -f1)
+    [[ -n "$N128_SUM" && "$N128_SUM" == "$n128_before" ]] || n128_bad+=" library changed or SHA unavailable;"
+    if [[ -z "$n128_bad" ]]; then
+      N128_OK=1 N128_LIB=$NL N128_MAX_M=4096
+      log "n128 byte oracle PASS through M4096 on $NL, sha256 $N128_SUM: Fn128 arms on it may run"
+    else N128_WHY="n128 device oracle did not pass:$n128_bad"; fi
+  fi
+  [[ -n "$N128_OK" ]] || log "$N128_WHY; no Fn128 arm is measured"
+fi
+
 # The Vp arms' gate (RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED). VPACK_CHECK=<ds41_vpack_device_check binary>
 # runs, once for each libr4d.so a Vp arm serves (the first of the arm's run homes holding one, the one its
 # server loads), libr4d's gemv_vp row against the plain gemv row on card 0, byte for byte (`check 48`), and
@@ -1532,6 +1621,7 @@ for a in $ARMS; do
   pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 HOST_POOL_MIB=4096 EXTRA_ARGS="" ARM_HOME="$RHOME" ARM_CONC=
   ARM_PROMPTS= ARM_N= ARM_LQ= rt=
   power="" skip="" ARGS=() f8="" f8x="" rb="" rbf=0 pred="" cs="" ck="" kh="" pc="" pcopt="" fw="" wp="" wl=""
+  fn128=""
   psc="" prs=12 pk="" pw="" ns="" pv=""
   hpe="" hpg="" hpl="" hpb="" hpm="" hpr=""
   unset ARM_NOPC   # --no-prefix-cache unless a Pc part sets it empty
@@ -1564,6 +1654,7 @@ for a in $ARMS; do
       Sc[0-9]) env+=(RADIANCE_EXPERIMENTAL_DS41_CACHE_SECOND_CHANCE=${p#Sc}) ;;   # profile-hot cached units get N second chances
       Iy[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_INSERT_YIELD_US=${p#Iy}) ;;     # background inserts wait up to N us for an idle pool
       Xs)      env+=(RADIANCE_EXPERIMENTAL_DS41_SWIGLU_SCALAR=1) ;;   # the pool's swiglu as the scalar loop (old way)
+      Fn128)   fn128=1 ;;                  # exact n128 fused norm; byte oracle and per-rank dispatch proof
       F8)      f8=1 ;;                     # FP8-sourced dense linears from E4M3 codes (gemm_nt_bf16f8)
       F8n)     f8=1 f8x='*_shexp.weight' ;;   # the same, the shared expert left bf16
       i[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_INSERT_THREADS=${p#i}) ;;
@@ -1791,6 +1882,25 @@ for a in $ARMS; do
     fi
   fi
   ARM_RB=$rb ARM_PRED=$pred
+  # Explicitly state the switch for every arm. Unpinned compressor work can use
+  # max_tok+max_seqs rows, so check that conservative bound as well as the library SHA.
+  env+=(RADIANCE_EXPERIMENTAL_DS41_N128=${fn128:-0})
+  ARM_N128=$fn128
+  if [[ -n "$fn128" ]]; then
+    IFS=: read -r -a homes <<< "$ARM_HOME"
+    lib=""
+    for h in "${homes[@]}"; do [[ -f "$h/kernels/libr4d.so" ]] && { lib=$h/kernels/libr4d.so; break; }; done
+    n128_tokens=${lc:-${bt:-16}} n128_seqs=${nseq:-${MAX_SEQS:-1}}
+    if ! [[ $n128_tokens =~ ^[0-9]{1,9}$ && $n128_seqs =~ ^[0-9]{1,9}$ ]]; then
+      log "arm $a: Fn128 refused: invalid token/sequence bound; the arm is skipped"; skip=1
+    else
+      n128_bound=$(( 10#$n128_tokens ))
+      [[ -n "$lc$xt" ]] || n128_bound=$(( n128_bound + 10#$n128_seqs ))
+      if ! n128_why=$(n128_arm_gate "$lib" "$n128_bound"); then
+        log "arm $a: Fn128 refused: $n128_why; the arm is skipped"; skip=1
+      fi
+    fi
+  fi
   # Pu / Pu2: a partly read unit's rest in its layer's own read only in an arm whose name says so,
   # whatever the window's environment (0: the urgent pieces, as before); arm() checks the log both
   # ways. Without a PpK part there is nothing to finish, and the arm would not test it.

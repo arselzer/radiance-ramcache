@@ -2014,13 +2014,15 @@ int norm_rope_rt_body(const RadArgs* a, RadStream stream, int n128 = -1) {
                          (uint16_t*)y.data, (uint32_t)y.stride[0], eps, wadd, mult, (uint32_t)M,
                          r, (uint32_t)thr / kFzWave);
         /* Proof for a model arm, only after its normal dispatcher queued the fast kernel.
-         * Forced checker calls cannot produce it. After first use only a relaxed load remains;
-         * disabled, ineligible and failed launches never touch this state or perform any I/O. */
-        if (n128 < 0 && launch == RAD_OK) {
-            static std::atomic<bool> reported{false};
-            if (!reported.load(std::memory_order_relaxed) &&
-                !reported.exchange(true, std::memory_order_relaxed)) {
-                std::fprintf(stderr, "[r4d] ds41 n128 active: normal dispatch n=128 M=%lld old_thr=%d\n", M, thr);
+         * Forced checker calls cannot produce it. After each rank's first use only a relaxed load
+         * remains; disabled, ineligible and failed launches never touch this state or perform I/O. */
+        if (n128 < 0 && launch == RAD_OK && a->rank >= 0 && a->rank < a->world_size && a->rank < 64) {
+            static std::atomic<uint64_t> reported{0};
+            const uint64_t bit = uint64_t(1) << (unsigned)a->rank;
+            if (!(reported.load(std::memory_order_relaxed) & bit) &&
+                !(reported.fetch_or(bit, std::memory_order_relaxed) & bit)) {
+                std::fprintf(stderr, "[r4d] ds41 n128 active: normal dispatch rank=%d world=%d n=128 M=%lld old_thr=%d\n",
+                             a->rank, a->world_size, M, thr);
                 std::fflush(stderr);
             }
         }

@@ -27,6 +27,7 @@
 #include <arch/rad_deepseek41_chat.h>
 #include <arch/rad_dflash_observe.h>
 #include "ds41_prefetch_plan.h"
+#include "ds41_index_memory.h"
 #include "ista_dialect.h"
 #include "../../core/sched/tbo.h"
 #include "../../tools/ds41-host-experts/ds41_p1.h"   /* the lent arena's switch (probe) */
@@ -566,6 +567,7 @@ struct Model {
      * plane (index_runs()), at most `iparts` runs a step; `kwords` is index_candidates' keep, a bit
      * a block of the candidate layer's width, i32 words a row (0: the model has no candidates). */
     int64_t irows = 0, iparts = 0, kwords = 0;
+    bool index_compact = false;  /* requested + valid LCP; actual library admitted by core before serving */
     /* A sizing declare (RadBuildCtx::shape_probe; probe()): declared into scratch, never stepped, and
      * silent (the server log's lines and the window's counts of them are the real declare's). */
     bool probe = false;
@@ -1145,13 +1147,25 @@ static int64_t keep_words(int64_t width, int64_t block) {
  * whole step would have taken: kernels pick their form by the pass height (libr4d's index_score
  * runs WMMA above 48 rows, a different dot order from the decode form's), and a run of a split
  * step is over irows / 2 >= 128 rows, as tall as any form's threshold. A step of at most irows
- * rows is one run, the op as before. */
-static constexpr int64_t kScorePlane = 256ll << 20;
-static constexpr int64_t kScoreRunMin = 256;
-static void index_runs(Model& m, const Model* real) {
+ * rows is one run, the op as before. With INDEX_SCORE_COMPACT and valid LCP the scalar form is
+ * pinned at every height: only then may the floor be64 and a balanced run cross48. The core also
+ * checks actual same-library known scalar/candidate/topk rows before admitting this request. */
+static int index_runs(Model& m, const Model* real) {
     const auto& g = m.g;
     const auto& c = m.c;
-    m.irows = std::min(g.max_tok, std::max(kScoreRunMin, kScorePlane / (4 * m.cmax)));
+    bool requested = false;
+    if (!index_compact_parse(std::getenv(kIndexCompactEnv), &requested)) {
+        fprintf(stderr, "radiance: deepseek41: %s must be0/unset or1\n", kIndexCompactEnv);
+        return RAD_E_INVAL;
+    }
+    /* EXACT_TALL alone is deliberately insufficient: the core's LCP admission is the authority.
+     * Unpinned/WMMA configurations keep the old floor and therefore the old dispatch partition. */
+    const char* lc = std::getenv("RADIANCE_EXPERIMENTAL_DS41_LCP");
+    char* end = nullptr;
+    const long chunk = lc && *lc ? std::strtol(lc, &end, 10) : 0;
+    const bool lcp = end && end != lc && !*end && chunk >= 64 && chunk <= 4096 && chunk % 16 == 0;
+    m.index_compact = requested && lcp;
+    m.irows = index_plane_rows(g.max_tok, m.cmax, m.index_compact);
     m.iparts = (g.max_tok + m.irows - 1) / m.irows;
     /* A sizing declare declares the real one's index_score ops, one a run (their row_part differs), so
      * it keeps the real run count; its plane is at most its own step's rows. A step of that size takes
@@ -1159,10 +1173,19 @@ static void index_runs(Model& m, const Model* real) {
     if (m.probe && real) {
         m.iparts = real->iparts;
         m.irows = std::min(g.max_tok, real->irows);
+        m.index_compact = real->index_compact;
     }
     m.kwords = 0;
     if (c.cand >= 0 && c.cand < c.n_layer && c.cand_block > 0 && c.ratio[(size_t)c.cand] > 0)
         m.kwords = keep_words(g.max_ctx / c.ratio[(size_t)c.cand] + 1, c.cand_block);
+    if (requested && !m.probe && g.rank == 0)
+        fprintf(stderr, "radiance: deepseek41: compact index score: %s rows=%lld parts=%lld width=%lld "
+                        "plane_bytes=%lld target_bytes=%lld floor=%lld (%s); %s; RoPE unchanged\n",
+                m.index_compact ? "requested" : "legacy fallback", (long long)m.irows,
+                (long long)m.iparts, (long long)m.cmax, (long long)(4 * m.irows * m.cmax),
+                (long long)kScorePlane, (long long)(m.index_compact ? kScoreCompactMin : kScoreRunMin),
+                kIndexCompactEnv, m.index_compact ? "requires actual scalar/LCP core admission" : "valid LCP absent");
+    return RAD_OK;
 }
 
 /* The rows a step issues the compressor tail's work at, at a source of ratio r over a step (or a
@@ -2776,7 +2799,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * T + S at most), so the level declares them for its rows. */
     if (m.probe && real && !m.work_fit) m.work = real->work;
     m.cmax = g.max_ctx / std::max<int64_t>(rmin, 1) + 1;
-    index_runs(m, real);
+    DS_TRY(index_runs(m, real));
     DS_TRY(buffers(b, m));
     if (ag_rows_config(m, std::getenv(kAgRowsEnv)) != RAD_OK) {
         fprintf(stderr, "radiance: deepseek41: %s must be a nonnegative whole row count (0/unset off)\n", kAgRowsEnv);

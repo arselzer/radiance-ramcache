@@ -1,6 +1,8 @@
 /* stager.cpp -- see stager.h. */
 #include "place/stager.h"
 #include "place/dspark_native_scope.h"
+#include "place/ds41_index_memory.h"
+#include "../../arch/deepseek41/ds41_index_memory.h"
 #include "place/router_predictor.h"
 #include "ds41_host_experts.h"
 
@@ -1701,6 +1703,20 @@ int FileStager::lcp_init(const Program& prog, int64_t C) {
                           "chunk: a libr4d that knows %s declares it to %lld", (long long)reach, kLcpEnv,
                           (long long)kEpRouteLcpMax).c_str());
         return RAD_E_INVAL;
+    }
+    /* The compact floor may cross the sparse launcher's internal48-row threshold. LCP's env
+     * pin is authoritative only for known untuned index rows from its actual admitted DSO. */
+    const char* compact = std::getenv(deepseek41::kIndexCompactEnv);
+    if (compact && !std::strcmp(compact, "1")) {
+        std::string reason;
+        if (!ds41_index_memory_admit(prog, &reason)) {
+            RAD_ERR("%s=1 refused after LCP admission: %s", deepseek41::kIndexCompactEnv, reason.c_str());
+            return RAD_E_UNSUPPORTED;
+        }
+        if (plan_ && plan_->rank == 0)
+            RAD_INFO("compact index score admitted: known untuned scalar/index selection rows from the "
+                     "same loaded LCP library (%s=1); target256MiB, floor64, guard column retained",
+                     deepseek41::kIndexCompactEnv);
     }
     ep_rows_ = C;
     lcp_ = C;

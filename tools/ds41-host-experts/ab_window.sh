@@ -1094,14 +1094,20 @@ if [[ " ${DEVICE_CHECKS:-1} " == *" tall "* ]]; then
     fi
   fi
 fi
-if [[ ( "${DEVICE_CHECKS:-1}" == 1 || " ${DEVICE_CHECKS:-1} " == *" swiglu "* ) && -x "$HERE/build/ds41_mxfp4_device_check" ]]; then
+# launch_window.sh runs a snapshot copy of this script, whose directory has no build/: TALL_CHECK (the same
+# ds41_mxfp4_device_check) is used when given.
+MX_CHECK=${TALL_CHECK:-$HERE/build/ds41_mxfp4_device_check}
+if [[ ( "${DEVICE_CHECKS:-1}" == 1 || " ${DEVICE_CHECKS:-1} " == *" swiglu "* ) && ! -x "$MX_CHECK" ]]; then
+  log "swiglu and chain checks asked for, but $MX_CHECK is not an executable: not run"
+fi
+if [[ ( "${DEVICE_CHECKS:-1}" == 1 || " ${DEVICE_CHECKS:-1} " == *" swiglu "* ) && -x "$MX_CHECK" ]]; then
   # The served plugin's swiglu over every (gate, up) pair, mismatches classified, and the
   # whole host chain against its decode kernels; the table recaptured and compared.
   log "device checks on card 0 with $RHOME/kernels/libr4d.so"
   ( export HIP_VISIBLE_DEVICES=0
-    timeout 1200 "$HERE/build/ds41_mxfp4_device_check" "$RHOME/kernels/libr4d.so" swiglu "$OUT/silu_recheck.bin" >"$OUT/swiglu_proof.log" 2>&1
+    timeout 1200 "$MX_CHECK" "$RHOME/kernels/libr4d.so" swiglu "$OUT/silu_recheck.bin" >"$OUT/swiglu_proof.log" 2>&1
     echo "swiglu exit $?" >>"$OUT/swiglu_proof.log"
-    timeout 1200 "$HERE/build/ds41_mxfp4_device_check" "$RHOME/kernels/libr4d.so" check 24 "$SILU" >"$OUT/chain_check.log" 2>&1
+    timeout 1200 "$MX_CHECK" "$RHOME/kernels/libr4d.so" check 24 "$SILU" >"$OUT/chain_check.log" 2>&1
     echo "chain exit $?" >>"$OUT/chain_check.log" )
   tail -3 "$OUT/swiglu_proof.log" | tee -a "$OUT/window.log"
   tail -3 "$OUT/chain_check.log" | tee -a "$OUT/window.log"

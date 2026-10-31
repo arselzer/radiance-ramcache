@@ -737,6 +737,9 @@ int CardExpertPath::wave(int parity, int w, const void* const* gu_tab, const voi
                 if (span.hi == span.lo) continue;   /* the wave has no local rows */
             } else {
                 ++c_.swiglu_fallbacks;
+                // Count executed rows too, so mixed full/span replay reports actual work.
+                if (c.t.size() >= 2 && c.t[1].shape[0] > 0)
+                    c_.swiglu_rows += (uint64_t)c.t[1].shape[0];
             }
         }
         const int rc = c.fn(&a, s_);

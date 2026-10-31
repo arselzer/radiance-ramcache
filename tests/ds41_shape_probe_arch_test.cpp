@@ -28,6 +28,7 @@
 #include "../arch/deepseek41/deepseek41.cpp"
 
 #include <algorithm>
+#include <array>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -288,7 +289,8 @@ std::vector<std::string> overruns(const RadBuilder& real, const RadBuilder& prob
 TEST(shape_probe_is_said_only_beside_the_lent_arena) {
     struct Case { const char* p1; const char* lend; bool want; } cases[] = {
         { nullptr, nullptr, false }, { "1", nullptr, false }, { nullptr, "40", false }, { "1", "40", true },
-        { "1", "1", true }, { "1", "64", true }, { "1", "0", false }, { "1", "65", false }, { "1", "4x", false },
+        { "1", "1", true }, { "1", "64", true }, { "1", "65", true }, { "1", "128", true },
+        { "1", "0", false }, { "1", "129", false }, { "1", "4x", false },
         { "1", "", false }, { "0", "40", false }, { "2", "40", false },
     };
     for (const Case& c : cases) CHECK_EQ(ds41p1::lend_arena_asked(c.p1, c.lend), c.want);
@@ -382,9 +384,12 @@ TEST(index_b16_score_plane_halves_only_storage_preserving_rows_runs_graph_and_si
         setenv(deepseek41::kIndexCompactEnv,compact?"1":"0",1);
         unsetenv(deepseek41::kIndexB16Env);
         auto old=declare(rank,2048,false,32768);REQUIRE_EQ(old->rc,RAD_OK);
+        /* A real declare replaces models[rank]; old->b owns its recording, old->m does not
+         * own the previous Model. Snapshot before the second real declare destroys it. */
+        const int64_t old_rows=old->m->irows,old_parts=old->m->iparts;
         setenv(deepseek41::kIndexB16Env,"1",1);
         auto b16=declare(rank,2048,false,32768);REQUIRE_EQ(b16->rc,RAD_OK);
-        CHECK_EQ(old->m->irows,b16->m->irows);CHECK_EQ(old->m->iparts,b16->m->iparts);
+        CHECK_EQ(old_rows,b16->m->irows);CHECK_EQ(old_parts,b16->m->iparts);
         const RecBuf* a=find_b(old->b,"index_score"),*b=find_b(b16->b,"index_score");REQUIRE(a&&b);
         CHECK_EQ(a->d.dtype,RAD_F32);CHECK_EQ(b->d.dtype,RAD_BF16);
         CHECK_EQ(a->d.shape[0],b->d.shape[0]);CHECK_EQ(a->d.shape[1],b->d.shape[1]);
@@ -582,18 +587,30 @@ TEST(native_packed_window_capture_tracks_actual_consumer_cuts_and_sizing_rows) {
         CHECK_EQ(win.d.kind,RAD_KV_WINDOW);CHECK_EQ(win.d.storage_format,uint32_t(3));
         CHECK_EQ(win.d.storage_block_bytes,8448ll);CHECK_EQ(win.d.head_dim,256ll);
         auto probe=declare(rank,256,true);REQUIRE_EQ(probe->rc,RAD_OK);CHECK(differs(real->b,probe->b).empty());
-        auto batch=kit(real->b,{1},{37},1040);RadCtx c;c.b=&real->b;c.batch=&batch->b;c.rank=rank;c.world=kWorld;
+        /* declare() admits one sequence / one sampled row. The former mixed {1}+{37}
+         * batch had two sampled rows and overran that head even with a plain window.
+         * Exercise actual nonzero consumer offsets with a valid single prefill instead. */
+        auto batch=kit(real->b,{}, {37},1040);
+        REQUIRE(m->cut_on&&m->cut_rows);
+        std::array<int32_t,40> cuts{};
+        for(int l=m->cut_b+1;l<m->c.n_layer;++l)cuts[(size_t)l]=l-m->cut_b;
+        batch->b.consumer_row0=cuts.data();
+        RadCtx c;c.b=&real->b;c.batch=&batch->b;c.rank=rank;c.world=kWorld;
         deepseek41::step(&c,&batch->b);CHECK(c.step_fail.empty());
-        int producers=0,stores=0,readers=0;
+        int producers=0,stores=0,readers=0,shifted=0;
         for(const auto&is:c.issues){
             const auto&op=real->b.ops[(size_t)is.op-1];
             if(op.op=="rmsnorm_rope_roundtrip_windowpack"){
                 REQUIRE_EQ(is.opd.size(),size_t(6));const auto&actual=is.opd[2];const auto&cap=is.opd[5];
+                const int64_t rk=producers>m->cut_b?cuts[(size_t)producers-1]:0;
+                CHECK_EQ(actual.rows,int64_t(37)-rk);CHECK_EQ(actual.offset,rk*512);
                 CHECK_EQ(actual.rows,cap.rows);CHECK_EQ(cap.handle,m->win_pack);
-                CHECK_EQ(cap.offset,(actual.offset/512)*528);++producers;
+                CHECK_EQ(cap.offset,(actual.offset/512)*528);shifted+=cap.offset>0;++producers;
             }
             if(op.op=="kv_store_windowpack"){
                 REQUIRE_EQ(is.opd.size(),size_t(4));const auto&actual=is.opd[0];const auto&cap=is.opd[1];
+                const int64_t rk=stores>m->cut_b?cuts[(size_t)stores-1]:0;
+                CHECK_EQ(actual.rows,int64_t(37)-rk);CHECK_EQ(actual.offset,rk*512);
                 CHECK_EQ(actual.rows,cap.rows);CHECK_EQ(cap.handle,m->win_pack);
                 CHECK_EQ(cap.offset,(actual.offset/512)*528);CHECK_EQ(is.opd[3].handle,m->win);++stores;
             }
@@ -602,7 +619,17 @@ TEST(native_packed_window_capture_tracks_actual_consumer_cuts_and_sizing_rows) {
             }
         }
         CHECK_EQ(producers,m->c.n_layer);CHECK_EQ(stores,m->c.n_layer);CHECK_EQ(readers,m->c.n_layer);
-        CHECK(overruns(real->b,probe->b,batch->b,rank,nullptr).empty());
+        CHECK(shifted>0);
+        std::string fail;
+        const auto past=overruns(real->b,probe->b,batch->b,rank,&fail);
+        CHECK(fail.empty());CHECK(past.empty());
+        if(!fail.empty()||!past.empty())std::fprintf(stderr,"  packed window rank %d: %s%s\n",rank,fail.c_str(),past.empty()?"":past[0].c_str());
+        /* The guard must still reject even one row beyond this level's capture storage;
+         * the same issued graph fits the real2048-row declaration. */
+        auto too_tall=kit(real->b,{}, {257},1040);
+        const auto outside=overruns(real->b,probe->b,too_tall->b,rank,nullptr);
+        CHECK(std::any_of(outside.begin(),outside.end(),[](const std::string&s){return s.find("span past 'window_original_fp8'")!=std::string::npos;}));
+        CHECK(overruns(real->b,real->b,too_tall->b,rank,nullptr).empty());
     }
     setenv("RADIANCE_EXPERIMENTAL_DS41_KV_PACKED","0",1);
     CHECK_EQ(declare(0,2048,false)->rc,RAD_E_UNSUPPORTED);

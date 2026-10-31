@@ -4606,7 +4606,8 @@ int FileStager::end_pass(RadStream s) {
 
 /* RADIANCE_EXPERIMENTAL_DS41_P1: the switch's checks beyond lcp_init's bands and hx_init's CPU path, and
  * the path's start. Off (unset, empty, 0): nothing. Refused, with the reason: an invalid value; P1
- * without an admitted LCP chunk or beyond 2048; the tunables out of range; FETCH_LIST; the route trace;
+ * without an admitted LCP chunk or beyond the proven twin's bound; the tunables out of range;
+ * FETCH_LIST; the route trace;
  * the DSpark head tail; a routed layer the counts path or the CPU path does not take, or whose gate_up,
  * SwiGLU and down cannot be named; a routed unit off the card neither in the container nor pinned in
  * the host pool of a static plan (a pooled unit is copied to the ring from its pool slot, p1_pool_; a
@@ -4625,8 +4626,10 @@ int FileStager::p1_init(const Program& prog) {
     if (st < 0) return refuse("1 is on, 0 / unset / empty off");
     if (!enabled() || !mover_ || !plan_) return refuse("no routed layer is read from the container on this rank");
     if (!lcp_) return refuse(fmt("it needs large-chunk prefill (%s=<C>, the chunk the cards take)", kLcpEnv));
-    if (lcp_ > ds41p1::kTwinMaxRows || lcp_ > 2048)
-        return refuse(fmt("%s=%lld: the first milestone takes chunks of up to 2048", kLcpEnv, (long long)lcp_));
+    if (lcp_ > ds41p1::kTwinMaxRows || lcp_ > kEpRouteLcpMax)
+        return refuse(fmt("%s=%lld: chunks must fit the admitted LCP and P1 twin bounds (up to %lld)",
+                          kLcpEnv, (long long)lcp_,
+                          (long long)std::min<int64_t>(ds41p1::kTwinMaxRows, kEpRouteLcpMax)));
     p1::Tunables t;
     std::string why;
     if (!p1::parse_tunables([](const char* k) { return std::getenv(k); }, &t, &why)) return refuse(why);

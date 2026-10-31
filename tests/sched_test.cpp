@@ -6,6 +6,7 @@
 #include "mm/processor.h"
 #include "sched/mtp_couple_bind.h"
 #include "place/ep_route_counts.h"
+#include "../tools/ds41-host-experts/ds41_p1.h"
 #include "sched/scheduler.h"
 #include "sched/draft_conf_head.h"
 #include "sched/advance_impl.h"
@@ -9114,10 +9115,10 @@ void lcp_fixture(Fixture& f, int64_t C, int64_t interval) {
 }  /* namespace */
 
 TEST(lcp_runs_a_lone_prompt_in_chunks_of_c) {
-    for (const int64_t C : { 256, 512, 1024, 2048 }) {
+    for (const int64_t C : { 256, 512, 1024, 2048, 4096 }) {
         LcpOn on(C, 1);
         Fixture f;
-        lcp_fixture(f, C, 2048);
+        lcp_fixture(f, C, std::max<int64_t>(2048, C));
         REQUIRE_EQ(f.start(), RAD_OK);
         CHECK_EQ(f.sch.lcp_rows(), C);
         CHECK_EQ(f.sch.geometry().quantum, 16);
@@ -9164,6 +9165,38 @@ TEST(lcp_runs_a_lone_prompt_in_chunks_of_c) {
         lcp_fixture(f, 1024, 2048);
         REQUIRE_EQ(f.start(), RAD_OK);
         CHECK_EQ(f.sch.lcp_rows(), (int64_t)0);
+    }
+}
+
+TEST(lcp4096_with_p1_requires_an_explicit_interval_and_preserves_the_chunk_grid) {
+    struct P1Env {
+        bool had; std::string old;
+        P1Env() {
+            const char* p = std::getenv(ds41p1::kEnv); had = p != nullptr; if (p) old = p;
+            setenv(ds41p1::kEnv, "1", 1);
+        }
+        ~P1Env() { if (had) setenv(ds41p1::kEnv, old.c_str(), 1); else unsetenv(ds41p1::kEnv); }
+    } p1;
+    for (int64_t I : { 2048, 4096, 8192 }) {
+        LcpOn on(4096, 1);
+        Fixture f;
+        lcp_fixture(f, 4096, I);
+        f.cfg.prefix_cache = true;
+        if (I == 2048) f.cfg.prefill_span = 2; // generic LCP permits this; P1 must still refuse I<C
+        int rc = RAD_OK;
+        const std::string err = stderr_of([&] { rc = f.start(); });
+        if (I == 2048) {
+            CHECK_EQ(rc, (int)RAD_E_INVAL);
+            CHECK(has(err, "checkpoint interval 2048 is below the chunk"));
+            continue;
+        }
+        REQUIRE_EQ(rc, RAD_OK);
+        CHECK_EQ(f.sch.lcp_rows(), (int64_t)4096);
+        CHECK_EQ(f.sch.geometry().grid, (int64_t)4096);
+        CHECK_EQ(f.sch.geometry().checkpoint_interval, I);
+        const Cut c = cut_from(f.sch, 0, 6817, 4096);
+        CHECK((c.ends == std::vector<int64_t>{ 4096, 6817 }));
+        CHECK((c.ckpts == (I == 4096 ? std::vector<int64_t>{ 4096 } : std::vector<int64_t>{})));
     }
 }
 
@@ -9762,8 +9795,8 @@ int resume_grid_start(Fixture& f, const char* grid, bool eors = true) {
 
 /* lcp_fixture's shape at the recommended chunk (2,048, the interval too) with the prefix cache on,
  * as the harness arms serve it (Pc). */
-void resume_fixture(Fixture& f) {
-    lcp_fixture(f, 2048, 2048);
+void resume_fixture(Fixture& f, int64_t C = 2048) {
+    lcp_fixture(f, C, C);
     f.cfg.prefix_cache = true;
 }
 
@@ -9857,32 +9890,35 @@ TEST(resume_grid_snapshots_the_reply_on_its_grid) {
  * boundary too), then the cold run's last chunk: every chunk end past its first is one the cold run
  * cuts, and so is every snapshot it writes. */
 TEST(resume_grid_hit_resumes_at_the_snapshot_then_cuts_the_cold_chunks) {
-    LcpOn on(2048, 1);
-    Fixture f;
-    resume_fixture(f);
-    REQUIRE_EQ(resume_grid_start(f, "16"), RAD_OK);
-    REQUIRE_EQ(f.sch.eors_grid(), (int64_t)16);
-    f.pc.seed(3040);
-    f.pc.lin = 3024;
-    f.pc.src = 5;
-    f.pc.eors_hit = true;
-    const uint64_t id = f.submit(5000, 4);
-    REQUIRE(id != 0);
-    REQUIRE(f.sch.step() != nullptr);
-    CHECK_EQ(f.sch.find(id)->n_computed, 3024);
-    const StepEntry& e = f.sch.plan().e[0];
-    CHECK_EQ(e.ckpt_restore, 5);
-    CHECK_EQ(e.ctx_len, 3024);
-    CHECK_EQ(e.n_tokens, 1072);                 /* [3024, 4096) */
-    CHECK_EQ((int64_t)e.ctx_len + e.ckpt_tok + 1, 4096ll);   /* the tail's snapshot, as cold */
-    const SchedMetrics m = f.sch.metrics();
-    CHECK_EQ(m.eors_hits, 1ll);
-    CHECK_EQ(m.eors_hit_tokens, 3024ll);
-    const Cut cold = cut_from(f.sch, 0, 5000, 2048), warm = cut_from(f.sch, 3024, 5000, 2048);
-    CHECK((cold.ends == std::vector<int64_t>{ 2048, 4096, 5000 }));
-    CHECK(warm.ends == ends_after(cold, 3024));
-    CHECK((warm.ckpts == std::vector<int64_t>{ 4096 }));
-    CHECK((cold.ckpts == std::vector<int64_t>{ 2048, 4096 }));
+    for (int64_t C : { 2048, 4096 }) {
+        LcpOn on(C, 1);
+        Fixture f;
+        resume_fixture(f, C);
+        REQUIRE_EQ(resume_grid_start(f, "16"), RAD_OK);
+        REQUIRE_EQ(f.sch.eors_grid(), (int64_t)16);
+        f.pc.seed(3040);
+        f.pc.lin = 3024;
+        f.pc.src = 5;
+        f.pc.eors_hit = true;
+        const uint64_t id = f.submit(5000, 4);
+        REQUIRE(id != 0);
+        REQUIRE(f.sch.step() != nullptr);
+        CHECK_EQ(f.sch.find(id)->n_computed, 3024);
+        const StepEntry& e = f.sch.plan().e[0];
+        CHECK_EQ(e.ckpt_restore, 5);
+        CHECK_EQ(e.ctx_len, 3024);
+        CHECK_EQ(e.n_tokens, 1072);                 /* [3024, 4096) */
+        CHECK_EQ((int64_t)e.ctx_len + e.ckpt_tok + 1, 4096ll);   /* the tail's snapshot, as cold */
+        const SchedMetrics m = f.sch.metrics();
+        CHECK_EQ(m.eors_hits, 1ll);
+        CHECK_EQ(m.eors_hit_tokens, 3024ll);
+        const Cut cold = cut_from(f.sch, 0, 5000, C), warm = cut_from(f.sch, 3024, 5000, C);
+        CHECK((cold.ends == (C == 2048 ? std::vector<int64_t>{ 2048, 4096, 5000 }
+                                      : std::vector<int64_t>{ 4096, 5000 })));
+        CHECK(warm.ends == ends_after(cold, 3024));
+        CHECK((warm.ckpts == std::vector<int64_t>{ 4096 }));
+        CHECK((cold.ckpts == (C == 2048 ? std::vector<int64_t>{ 2048, 4096 } : std::vector<int64_t>{ 4096 })));
+    }
 }
 
 /* What a resumed prefill issues for each row past its snapshot is what the cold run issues for it,

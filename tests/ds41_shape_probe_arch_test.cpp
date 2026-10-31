@@ -414,6 +414,40 @@ TEST(beside_lcp_a_level_sizes_the_compressors_work_rows_for_itself) {
     CHECK(level_at[1] < level_at[0]);
 }
 
+TEST(lcp4096_keeps_the_small_arena_level_and_full_step_bounds) {
+    Env e{ WINDOW_SWITCHES };
+    setenv("RADIANCE_EXPERIMENTAL_DS41_LCP", "4096", 1);
+    for (int rank = 0; rank < kWorld; ++rank) {
+        auto real = declare(rank, 4096, false);
+        auto probe = declare(rank, 256, true);
+        REQUIRE_EQ(real->rc, RAD_OK);
+        REQUIRE_EQ(probe->rc, RAD_OK);
+        CHECK(real->m->work_fit);
+        CHECK(differs(real->b, probe->b).empty());
+        const RecBuf* pg = find_b(probe->b, "comp_page");
+        REQUIRE(pg != nullptr);
+        CHECK_EQ(pg->d.shape[0], (int64_t)257);
+        for (const std::vector<int>& rows : { std::vector<int>{ 1 }, std::vector<int>{ 256 } }) {
+            auto small = kit(real->b, {}, rows, 4095);
+            std::string fail;
+            CHECK(overruns(real->b, probe->b, small->b, rank, &fail).empty());
+            CHECK(fail.empty());
+        }
+        auto large = kit(real->b, {}, { 4096 }, 1024);
+        CHECK(!overruns(real->b, probe->b, large->b, rank, nullptr).empty());
+        CHECK(overruns(real->b, real->b, large->b, rank, nullptr).empty());
+        if (rank == 0) {
+            int64_t full = 0, level = 0;
+            arena(real->b, probe->b, &full, &level);
+            const int64_t room = full - level - (1 << 20);
+            CHECK(room / ds41p1::kSlotBytes >= ds41p1::kMaxLend);
+            std::fprintf(stderr, "  LCP4096 arena %.1f MiB, level256 %.1f MiB, %lld physical slots; "
+                                 "lending cap remains %d\n", full / 1048576.0, level / 1048576.0,
+                         (long long)(room / ds41p1::kSlotBytes), ds41p1::kMaxLend);
+        }
+    }
+}
+
 TEST(the_256_row_level_ends_far_below_the_full_plan) {
     Env e{ WINDOW_SWITCHES };
     for (int64_t T : { (int64_t)1024, (int64_t)2048, (int64_t)4096 }) {

@@ -78,8 +78,8 @@ inline int state() {
  * A stacked (non-table) weight is served as the LCP twin serves it today.
  *
  * kTwinMaxRows is the kernel's bound. The chunk stays at most RADIANCE_EXPERIMENTAL_DS41_LCP's
- * maximum, 2048, in the first milestone. Chunks of 3072 or 4096 need the dense ops' height sweep
- * extended to them first (ds41_mxfp4_device_check `lcp`). */
+ * admitted maximum, 4096. Chunks above 2048 additionally need the dense ops' extended height sweep
+ * (ds41_mxfp4_device_check `lcp C`) and an explicit checkpoint interval of at least C. */
 constexpr const char* kTwinRow     = "moe_gemm_ggml_mxfp4_gemv_tall_p1";
 constexpr const char* kLcpTwinRow  = "moe_gemm_ggml_mxfp4_gemv_tall";
 constexpr const char* kGemvRow     = "moe_gemm_ggml_mxfp4_gemv";

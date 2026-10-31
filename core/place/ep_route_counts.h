@@ -57,7 +57,7 @@ inline void ds41_exact_tall_set_for_test(int state) {
  * makes chunks of C, and the CPU computes every routed unit of every pass. The counts witness then
  * admits passes of up to C tokens. */
 inline constexpr int64_t kEpRouteLcpMin = 64;
-inline constexpr int64_t kEpRouteLcpMax = 2048;
+inline constexpr int64_t kEpRouteLcpMax = 4096;
 inline constexpr const char* kLcpEnv = "RADIANCE_EXPERIMENTAL_DS41_LCP";
 
 namespace detail {

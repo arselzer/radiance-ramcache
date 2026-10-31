@@ -92,7 +92,7 @@ static bool router_bf16_on() {
 /* Whether libr4d gives a row of every op on the compressor tail's work rows (qsa_work, softmax_pool,
  * the latent's rmsnorm and rope table, the index-key gemm_nt, the fused norm and rope round trips, the
  * entry stores) the same bits at any launch height: RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=1, or
- * RADIANCE_EXPERIMENTAL_DS41_LCP at a chunk (a multiple of 16 in 64 .. 2048), pins every norm to the
+ * RADIANCE_EXPERIMENTAL_DS41_LCP at a chunk (a multiple of 16 in 64 .. 4096), pins every norm to the
  * width rows up to 32 get (libr4d/r4d_ds41_tall.h, read here as libr4d reads them); gemm_nt's m16,
  * m64 and tiled rows give a row the same bytes by contract (the core's LCP admission relies on it),
  * and the rest compute a row in a thread or a workgroup of its own whatever the height. Without the
@@ -106,7 +106,7 @@ static bool norms_pinned() {
     if (!s || !*s) return false;
     char* end = nullptr;
     const long c = std::strtol(s, &end, 10);
-    return !*end && c >= 64 && c <= 2048 && c % 16 == 0;
+    return !*end && c >= 64 && c <= 4096 && c % 16 == 0;
 }
 
 /* RAD_ARCH_TRY that names the call that failed: a refused declaration otherwise surfaces only as

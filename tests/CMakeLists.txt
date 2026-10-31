@@ -1112,6 +1112,20 @@ add_test(NAME vendor_sums
          COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/vendor_sums.sh ${CMAKE_SOURCE_DIR})
 set_tests_properties(vendor_sums PROPERTIES LABELS "fast;unit" TIMEOUT 120)
 # ---- P1 (S)
+add_executable(ds41_lcp_contract ${CMAKE_CURRENT_SOURCE_DIR}/ds41_lcp_contract.cpp)
+set_target_properties(ds41_lcp_contract PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+foreach(c 0 2048 3072 4096 4097 4112)
+  set(ds41_lcp_expected_core ${c})
+  set(ds41_lcp_expected_plugin ${c})
+  if(c GREATER 4096)
+    set(ds41_lcp_expected_core -1)
+    set(ds41_lcp_expected_plugin 0)
+  endif()
+  add_test(NAME ds41_lcp_contract_${c} COMMAND ds41_lcp_contract ${ds41_lcp_expected_core} ${ds41_lcp_expected_plugin})
+  set_tests_properties(ds41_lcp_contract_${c} PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT}
+    ENVIRONMENT "ROCR_VISIBLE_DEVICES=99;RADIANCE_EXPERIMENTAL_DS41_LCP=${c};RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=0;RADIANCE_EXPERIMENTAL_DS41_P1=0")
+endforeach()
+
 # Prefill Phase 1's stager and end-aligned chunks (core/place/card_expert_stager.h, core/sched/p1_chunk.h):
 # p1_stager_test (the scheduling on a simulated card, the ring stress, the tunables, the admission) and
 # p1_chunk_test (Scheduler::plan_chunk's end alignment on the scheduler fakes), registered by the glob

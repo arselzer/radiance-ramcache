@@ -6491,4 +6491,34 @@ TEST(dspark_bank_vram_with_packed_trunk_residents_keeps_the_hot_set_block_and_fi
     }
 }
 
+TEST(lcp4096_small_host_budgets_preserve_the_file_tier_and_the_planners_budget) {
+    /* The cache holds only two/four of 16 synthetic units. Changing the pass bound cannot
+     * promote the missing working set into unbudgeted RAM or require that it all be resident. */
+    const int64_t reserve = 4 * (MiB + MiB / 2) + RAD_PLACE_FILE_WINDOWS * RAD_PLACE_FILE_WINDOW_BYTES;
+    for (int extra_mib : { 3, 6 }) {
+        Fixture f;
+        build_moe_layers(f, 2, 8, MiB, MiB / 2);
+        Config c = base_config();
+        c.placement = "expert_tiered";
+        c.vram_weights_mib = 26;
+        c.host_pool_mib = (reserve + extra_mib * MiB) / MiB;
+        c.weights_disk_tier = true;
+        std::string baseline;
+        for (int64_t T : { 16, 4096 }) {
+            f.prog.ctx.max_tok = c.max_tok = T;
+            PlannerInput in{ &f.prog, &c, 0, 1, nullptr, 0 };
+            Plan p;
+            REQUIRE_EQ(Planner(in).plan(&p), RAD_OK);
+            CHECK(p.fits());
+            CHECK(count_tier(f.prog, p, Tier::SSD) > 0);
+            CHECK(p.totals.bytes[(int)Tier::HostPinned] <= p.host_budget);
+            CHECK(p.host_budget + p.file_stage_reserve <= c.host_pool_mib * MiB);
+            CHECK(p.totals.bytes[(int)Tier::VRAM] + p.slab_overhead + p.file_stage_vram <= p.vram_budget);
+            const std::string got = digest(f.prog, p);
+            if (T == 16) baseline = got;
+            else CHECK_EQ(got, baseline);
+        }
+    }
+}
+
 RAD_TEST_MAIN()

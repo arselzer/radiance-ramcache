@@ -652,7 +652,8 @@ std::string differ(const Mem& x, const Mem& y, int64_t count, int64_t r) {
 TEST(the_work_rows_fit_the_step_only_beside_the_pinned_norms) {
     struct Case { const char* lcp; const char* tall; bool fit; } cases[] = {
         { nullptr, nullptr, false }, { "1024", nullptr, true },  { "2048", nullptr, true },
-        { "64", nullptr, true },     { "48", nullptr, false },   { "4096", nullptr, false },
+        { "64", nullptr, true },     { "48", nullptr, false },   { "4096", nullptr, true },
+        { "3072", nullptr, true },   { "4097", nullptr, false }, { "4112", nullptr, false },
         { "1000", nullptr, false },  { "1024x", nullptr, false }, { "", nullptr, false },
         { "0", nullptr, false },     { nullptr, "1", true },     { nullptr, "0", false },
         { nullptr, "2", false },     { "100", "1", true },
@@ -709,11 +710,12 @@ TEST(the_bound_holds_every_block_a_step_completes) {
 
 /* The ops a one-row decode step ran on max_tok's rows, by name and layer; with the pins, none. */
 TEST(a_decode_step_at_2048_row_chunks_runs_nothing_on_max_toks_rows) {
+    for (int64_t T : { 2048, 4096 })
     for (int64_t S : { (int64_t)1, (int64_t)8 })
         for (bool fit : { false, true }) {
             Env e{ WINDOW_SWITCHES };
-            if (fit) setenv("RADIANCE_EXPERIMENTAL_DS41_LCP", "2048", 1);
-            auto d = declare(0, 2048, S);
+            if (fit) setenv("RADIANCE_EXPERIMENTAL_DS41_LCP", std::to_string(T).c_str(), 1);
+            auto d = declare(0, T, S);
             REQUIRE_EQ(d->rc, RAD_OK);
             REQUIRE_EQ(d->m->work_fit, fit);
             auto k = step_of(d->b, std::vector<Seq>((size_t)S, Seq{ 1, 41 }), {});
@@ -727,7 +729,7 @@ TEST(a_decode_step_at_2048_row_chunks_runs_nothing_on_max_toks_rows) {
                 const auto w = wo.find(is.op);
                 if (w != wo.end()) {
                     ++n_work;
-                    CHECK_EQ(work_rows_of(d->b, is), fit ? S : 2048 + S);
+                    CHECK_EQ(work_rows_of(d->b, is), fit ? S : T + S);
                 }
                 const int64_t rows = issue_rows(d->b, is, d->m->g.max_tok);
                 if (rows <= S * d->m->c.top_k) continue;

@@ -611,7 +611,7 @@ TEST(p1_end_aligned_chunks_fill_the_last_chunk_for_every_length_to_20000) {
     CHECK_EQ(end_aligned_chunk(4784, 6817, 2048, 16), (int64_t)2033);
     CHECK_EQ(end_aligned_chunk(0, 2048, 2048, 16), (int64_t)2048);
     CHECK_EQ(end_aligned_chunk(0, 17, 2048, 16), (int64_t)17);
-    for (int64_t C : { 1024, 2048 })
+    for (int64_t C : { 1024, 2048, 4096 })
         for (int64_t g : { 16, 64 })
             for (int64_t start : { 0, 5, 16, 1000, 2051 })
                 for (int64_t P = 17; P <= 20000; ++P) {
@@ -1059,6 +1059,7 @@ TEST(p1_threshold_arms_long_layer_passes_and_leaves_the_rest_to_the_cpu_path) {
     CHECK_EQ(ds41p1::cpu_rows(256, 320), (int64_t)256);
     CHECK_EQ(ds41p1::cpu_rows(2048, 4096), (int64_t)2048);
     CHECK_EQ(ds41p1::cpu_rows(2048, 1024), (int64_t)1023);
+    CHECK_EQ(ds41p1::cpu_rows(4096, 4096), (int64_t)4095);
     for (int64_t r = 0; r <= 5000; ++r)
         for (int64_t m : { 17, 64, 320, 1024, 4096 }) {
             CHECK_EQ(ds41p1::card_layer(r, m), r >= 17 && r >= m);
@@ -1090,7 +1091,7 @@ TEST(p1_threshold_arms_long_layer_passes_and_leaves_the_rest_to_the_cpu_path) {
     FileStager fs;
     std::vector<int64_t> f((size_t)c16.n_layer);
     std::vector<int32_t> row0((size_t)c16.n_layer);
-    for (int64_t C : { 1024, 2048 })
+    for (int64_t C : { 1024, 2048, 4096 })
         for (int64_t thr : { 17, 64, 320, 1024, 2048, 4096 }) {
             int64_t card = 0, cpu = 0, armed_passes = 0, cpu_in_armed = 0, passes = 0;
             int64_t short_prompt_armed = 0;
@@ -1306,6 +1307,16 @@ TEST(p1_lend_makes_the_cpu_path_take_every_pass_that_does_not_arm) {
     EpCountsHostProbe::cut(fs, false, 1, {}, 1, 17, 1024);
     CHECK_EQ(EpCountsHostProbe::need_rows(fs, 1024, 1, false), (int64_t)16);
     CHECK_EQ(EpCountsHostProbe::need_rows(fs, 1024, 1, true), (int64_t)1024);
+}
+
+TEST(p1_lcp4096_keeps_full_miss_capacity_when_the_lent_arena_is_requested) {
+    /* A smaller cache may miss every selected unit; lending never assumes those misses away. */
+    FileStager fs;
+    EpCountsHostProbe::cut(fs, false, 1, {}, 1, 320, 4096);
+    CHECK_EQ(EpCountsHostProbe::need_rows(fs, 4096, 1, false), (int64_t)319);
+    CHECK_EQ(EpCountsHostProbe::need_rows(fs, 4096, 1, true), (int64_t)4096);
+    CHECK_EQ(EpCountsHostProbe::need_rows(fs, 4096, 0, false), (int64_t)4096);
+    CHECK_EQ(EpCountsHostProbe::sorted_max(fs), (int64_t)6 * 4096);
 }
 
 TEST(p1_lend_returns_after_the_grace_and_takes_back_for_the_card_path) {
@@ -1956,7 +1967,7 @@ TEST(p1_card_path_is_decided_per_layer_under_the_per_row_cut) {
     std::vector<int32_t> row0((size_t)c16.n_layer);
     int64_t short_layers = 0, card_layers = 0, chunks = 0;
     bool short_after_card = false;
-    for (int64_t C : { 2048, 1024 })
+    for (int64_t C : { 2048, 1024, 4096 })
         for (int64_t P = 17; P <= 6000; P += (P < 300 ? 1 : 7)) {
             REQUIRE(consumer_thresholds(c16, P, f.data()));
             for (int64_t s = 0, e = ds41p1::first_chunk_end_aligned(P, C, 16); s < P; s = e, e = std::min(P, e + C)) {

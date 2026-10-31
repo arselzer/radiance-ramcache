@@ -1022,7 +1022,7 @@ size_t tall_moe(const Lib& L, hipStream_t s, int T, int P, size_t* rows_checked,
         std::vector<uint16_t> y_all((size_t)T * kTop * N);
         d_y.get(y_all.data());
         /* What the twin replaces: the tiled row at the same height (information only). */
-        if (L.moe_tiled && T > 16) {
+        if (L.moe_tiled && T > 16 && T <= 1024) {
             HC(hipMemset(d_y.p, 0, d_y.n));
             if (run_moe(L.moe_tiled, s, d_in.p, g ? T : T * kTop, table, N, K, d_so.p, d_of.p, d_y.p,
                         g ? "token" : "sorted", T * kTop) >= 0) {
@@ -1069,8 +1069,11 @@ size_t tall_moe(const Lib& L, hipStream_t s, int T, int P, size_t* rows_checked,
                 ++*rows_checked;
             }
         }
-        /* The host kernels (the CPU path's bits) on every local row. */
+        /* Keep the old host oracle on every local row through 1024 tokens. New larger heights
+         * already compare every output with gemv passes of 16 above; independently sample the
+         * first/middle/last host rows rather than repeat a multi-billion-op CPU sweep in a window. */
         for (int i = 0; i < local; ++i) {
+            if (T > 1024 && i != 0 && i != local / 2 && i != local - 1) continue;
             const int f = sorted[(size_t)i], e = [&] { int ee = 0; while (off[(size_t)ee + 1] <= i) ++ee; return ee; }();
             Mx W; W.N = N; W.K = K; W.blocks = g ? hgu[(size_t)e].data() : hdn[(size_t)e].data();
             std::vector<uint16_t> hy((size_t)N);
@@ -1265,6 +1268,11 @@ int tall_check(const Lib& L, const std::vector<int>& Ts) {
     if (g_lcp)
         for (int M : { 49, 65, 128, 171, 256, 512, 1000, 1024 })
             if (M <= g_lcp) sp_heights.push_back(M);
+    if (g_lcp > 2048) {
+        for (int M : { 2048, 3072, 4096 }) if (M <= g_lcp) sp_heights.push_back(M);
+        if (std::find(sp_heights.begin(), sp_heights.end(), g_lcp) == sp_heights.end())
+            sp_heights.push_back(g_lcp);
+    }
     for (int H : { 16, 32 })
         for (int M : sp_heights) {
             size_t rows = 0;
@@ -1659,7 +1667,11 @@ int sweep_check(const Lib& L, bool on, int trials) {
     std::vector<int> heights = { 1, 16, 17, 24, 25, 32, 33, 40, 48 };
     if (on && g_lcp) {
         heights = { 1, 16, 17, 32, 33, 48, 49, 64, 65, 100, 128, 170, 171, 255, 256, 257, 512, 1000, 1024, 2048 };
-        kSweepRows = 2048;
+        kSweepRows = std::max(2048, g_lcp);
+        if (g_lcp > 2048) {
+            for (int M : { 2049, 3072, 4095, 4096 }) if (M <= g_lcp) heights.push_back(M);
+            if (std::find(heights.begin(), heights.end(), g_lcp) == heights.end()) heights.push_back(g_lcp);
+        }
     }
     std::printf("sweep: %s; heights up to %lld must give every row its bytes launched alone and in launches of 16; "
                 "%d trials\n", !on ? "RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL unset"
@@ -2726,7 +2738,7 @@ int main(int argc, char** argv) {
         g_lcp = 2048;
     } else if (!std::strcmp(argv[2], "lcp") || !std::strcmp(argv[2], "bal")) {
         const int c = argc > 3 ? std::atoi(argv[3]) : 1024;
-        if (c < 64 || c > 2048 || c % 16) { std::fprintf(stderr, "lcp C: a multiple of 16 in 64 .. 2048\n"); return 2; }
+        if (c < 64 || c > 4096 || c % 16) { std::fprintf(stderr, "lcp C: a multiple of 16 in 64 .. 4096\n"); return 2; }
         setenv("RADIANCE_EXPERIMENTAL_DS41_LCP", std::to_string(c).c_str(), 1);
         unsetenv("RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL");
         g_lcp = c;
@@ -2769,6 +2781,12 @@ int main(int argc, char** argv) {
         std::vector<int> Ts = { 17, 48, 64, 100, 171, 256 };
         for (int T : { 512, 1024 })
             if (T <= g_lcp) Ts.push_back(T);
+        if (g_lcp > 2048) {
+            for (int T : { 2048, 3072, 4096 }) if (T <= g_lcp) Ts.push_back(T);
+            if (std::find(Ts.begin(), Ts.end(), g_lcp) == Ts.end()) Ts.push_back(g_lcp);
+            std::printf("lcp extended: every tall output against passes of 16; host expert oracle sampled "
+                        "first/middle/last above 1024; dense/sparse sweep through %d\n", g_lcp);
+        }
         int rc = tall_check(lib, Ts);
         rc |= sweep_check(lib, true, argc > 4 ? std::max(1, std::atoi(argv[4])) : 2);
         std::printf(rc ? "FAIL: lcp %d\n" : "PASS: lcp %d: tall passes and the height sweep keep 16-token passes' bits\n",

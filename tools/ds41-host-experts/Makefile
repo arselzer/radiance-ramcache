@@ -34,6 +34,12 @@ $(O)/ds41_bf16f8_device_check: ds41_bf16f8_device_check.hip $(TREE)/libr4d/r4d_b
 	$(HIPCC) $(HIPFLAGS) -I$(TREE)/abi -I$(TREE)/libr4d -o $@ ds41_bf16f8_device_check.hip -ldl
 device-check: $(O)/ds41_bf16f8_device_check
 
+# Original f32 score kernels remain the independent reference. Run only in a
+# guarded GPU window, in fresh unpinned/exact/lcp4096 processes on all4cards.
+$(O)/ds41_index_b16_device_check: ds41_index_b16_device_check.hip $(TREE)/arch/common/rad_ds41_score_b16.h
+	$(HIPCC) $(HIPFLAGS) -I$(TREE)/abi -o $@ ds41_index_b16_device_check.hip -ldl
+index-b16-check: $(O)/ds41_index_b16_device_check
+
 # The card check of the host experts against libr4d's decode kernels (check, swiglu, time, ptime)
 # and of RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL (`tall`: the routed GEMM's twin row, the sparse
 # attention and the indexer score at passes taller than 16 tokens against the same rows in smaller

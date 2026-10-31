@@ -29,6 +29,7 @@
 #include "place/dspark_native_scope.h"
 #include "place/dspark_draft_control_scope.h"
 #include "place/draft_vram_load.h"
+#include "place/ds41_index_b16.h"
 #include "kvstream/bringup.h"
 #include "kvstream/plan.h"
 #include "runtime/arena.h"
@@ -4440,6 +4441,26 @@ int Engine::start() {
             RAD_INFO("experimental draft verify cap: k=%d; configured depth5, full5 query/proposal, "
                      "Program, banks and pools retained; only the verified prefix is capped",
                      draft_experiment_.verify_cap());
+    }
+    /* Storage opt-in must be proven before Ctx init or ANY warmup/recorded launch. */
+    bool score_b16=false;
+    if(!deepseek41::index_compact_parse(std::getenv(deepseek41::kIndexB16Env),&score_b16))return RAD_E_INVAL;
+    if(score_b16) {
+        if(!meta_.arch_id||std::strcmp(meta_.arch_id,"deepseek41"))return RAD_E_UNSUPPORTED;
+        for(const auto&r:ranks_) {
+            Ds41IndexB16Proof proof;std::string why;
+            if(!ds41_index_b16_admit(r->program,&proof,&why)) {
+                RAD_ERR("%s=1 refused rank%d: %s",deepseek41::kIndexB16Env,r->index,why.c_str());return RAD_E_UNSUPPORTED;
+            }
+            const char*lc=std::getenv("RADIANCE_EXPERIMENTAL_DS41_LCP");
+            if(lc&&*lc&&std::strcmp(lc,"0")&&!ds41_index_memory_admit(r->program,&why)) {
+                RAD_ERR("%s=1 refuses unproven LCP pin origin rank%d: %s",deepseek41::kIndexB16Env,r->index,why.c_str());return RAD_E_UNSUPPORTED;
+            }
+            if(proof.rows>INT64_MAX/proof.columns/4)return RAD_E_INVAL;
+            RAD_INFO("ds41 index b16 admitted: rank=%d rows=%lld columns=%lld bytes=%lld legacy_bytes=%lld same_runs=1 writers=%d candidates=%d topk=%d",
+                r->index,(long long)proof.rows,(long long)proof.columns,(long long)(2*proof.rows*proof.columns),
+                (long long)(4*proof.rows*proof.columns),proof.writers,proof.candidates,proof.topk);
+        }
     }
     RAD_TRY(load_weights());
     RAD_TRY(configure_kv());

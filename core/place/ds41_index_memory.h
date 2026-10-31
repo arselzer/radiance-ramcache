@@ -15,6 +15,9 @@ inline const char* ds41_index_known_row(const std::string& op) {
     if (op == "index_score_kvpack") return "ds41_index_score_d128_kvpack";
     if (op == "index_candidates") return "ds41_index_candidates";
     if (op == "index_topk") return "ds41_index_topk";
+    if (op == "index_score_b16") return "ds41_index_score_d128_b16";
+    if (op == "index_candidates_b16") return "ds41_index_candidates_b16";
+    if (op == "index_topk_b16") return "ds41_index_topk_b16";
     return nullptr;
 }
 /* Called ONLY after ordinary LCP admission proved a routed twin reaches the real chunk. The
@@ -58,8 +61,8 @@ inline bool ds41_index_memory_admit(const Program& prog, std::string* why,
                 !r.choice.empty() || (!r.tune_source.empty() && r.tune_source != "axis defaults"))
                 return refuse("index op has unproven tuned axes or a nondefault point");
         }
-        scores += op.op == "index_score" || op.op == "index_score_kvpack";
-        selections += op.op == "index_topk";
+        scores += op.op == "index_score" || op.op == "index_score_kvpack" || op.op == "index_score_b16";
+        selections += op.op == "index_topk" || op.op == "index_topk_b16";
     }
     if (!scores || !selections) return refuse("program has no complete index-score/topk chain");
     if (why) why->clear();

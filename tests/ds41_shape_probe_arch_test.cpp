@@ -40,6 +40,7 @@ constexpr int kWorld = 4;
 
 const char* const kVars[] = { "RADIANCE_EXPERIMENTAL_DS41_P1",
                               deepseek41::kIndexCompactEnv,
+                              deepseek41::kIndexB16Env,
                               "RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA",
                               "RADIANCE_EXPERIMENTAL_DS41_LCP",
                               "RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL",
@@ -369,6 +370,34 @@ TEST(compact_index_score_metadata_keeps_32k_and_bounds_512k_1m_without_allocatin
             CHECK_EQ(rope->d.shape[0], ctx); CHECK_EQ(rope->d.shape[1], int64_t(64));
         }
     }
+}
+
+TEST(index_b16_score_plane_halves_only_storage_preserving_rows_runs_graph_and_sizing) {
+    Env e{ WINDOW_SWITCHES };
+    for(int rank=0;rank<4;++rank)for(int compact=0;compact<2;++compact) {
+        setenv("RADIANCE_EXPERIMENTAL_DS41_LCP","2048",1);
+        setenv(deepseek41::kIndexCompactEnv,compact?"1":"0",1);
+        unsetenv(deepseek41::kIndexB16Env);
+        auto old=declare(rank,2048,false,32768);REQUIRE_EQ(old->rc,RAD_OK);
+        setenv(deepseek41::kIndexB16Env,"1",1);
+        auto b16=declare(rank,2048,false,32768);REQUIRE_EQ(b16->rc,RAD_OK);
+        CHECK_EQ(old->m->irows,b16->m->irows);CHECK_EQ(old->m->iparts,b16->m->iparts);
+        const RecBuf* a=find_b(old->b,"index_score"),*b=find_b(b16->b,"index_score");REQUIRE(a&&b);
+        CHECK_EQ(a->d.dtype,RAD_F32);CHECK_EQ(b->d.dtype,RAD_BF16);
+        CHECK_EQ(a->d.shape[0],b->d.shape[0]);CHECK_EQ(a->d.shape[1],b->d.shape[1]);
+        CHECK_EQ(old->b.ops.size(),b16->b.ops.size());
+        for(size_t i=1;i<old->b.ops.size();++i) {
+            const std::string before=old->b.ops[i].op,after=b16->b.ops[i].op;
+            CHECK(after==(before=="index_score"?"index_score_b16":before=="index_candidates"?"index_candidates_b16":
+                before=="index_topk"?"index_topk_b16":before));
+        }
+        auto probe=declare(rank,64,true,32768);REQUIRE_EQ(probe->rc,RAD_OK);
+        CHECK(probe->m->index_b16);CHECK_EQ(probe->m->iparts,b16->m->iparts);
+        CHECK(differs(b16->b,probe->b).empty());
+    }
+    setenv(deepseek41::kIndexB16Env,"bad",1);CHECK_EQ(declare(0,2048,false)->rc,RAD_E_INVAL);
+    setenv(deepseek41::kIndexB16Env,"1",1);setenv("RADIANCE_EXPERIMENTAL_DS41_KV_PACKED","1",1);
+    CHECK_EQ(declare(0,2048,false)->rc,RAD_E_UNSUPPORTED);unsetenv("RADIANCE_EXPERIMENTAL_DS41_KV_PACKED");
 }
 
 TEST(compact_index_score_requires_lcp_and_sizing_levels_keep_the_real_run_graph) {

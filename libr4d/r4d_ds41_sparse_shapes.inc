@@ -84,3 +84,20 @@ extern "C" int r4d_shape_index_topk(const RadParam* p, int n_p, int operand, Rad
     };
     R4D_PICK(l);
 }
+
+/* Score storage only; all logical dimensions, index fill contracts and row parts are unchanged. */
+extern "C" int r4d_shape_index_score_b16(const RadParam* p,int n,int operand,RadOpdDesc* out) {
+    const int rc=r4d_shape_index_score(p,n,operand,out);
+    if(rc==RAD_OK&&operand==6)out->dtype=RAD_BF16;
+    return rc;
+}
+extern "C" int r4d_shape_index_candidates_b16(const RadParam* p,int n,int operand,RadOpdDesc* out) {
+    const int rc=r4d_shape_index_candidates(p,n,operand,out);
+    if(rc==RAD_OK&&operand==0)out->dtype=RAD_BF16;
+    return rc;
+}
+extern "C" int r4d_shape_index_topk_b16(const RadParam* p,int n,int operand,RadOpdDesc* out) {
+    const int rc=r4d_shape_index_topk(p,n,operand,out);
+    if(rc==RAD_OK&&operand==0)out->dtype=RAD_BF16;
+    return rc;
+}

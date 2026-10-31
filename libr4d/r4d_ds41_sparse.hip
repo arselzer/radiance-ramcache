@@ -2038,6 +2038,8 @@ int attn_body(const RadArgs* a, RadStream stream, int oracle_form = -1) {
     }
 }
 
+#include "r4d_ds41_index_b16.inc"
+
 }  // namespace
 
 extern "C" int r4d_rad_ds41_index_score(const RadArgs* a, RadStream stream) {
@@ -2096,3 +2098,24 @@ extern "C" int64_t r4d_rad_ds41_index_topk_scratch(const RadArgs* a) {
 extern "C" int r4d_rad_ds41_attn_sparse_sink(const RadArgs* a, RadStream stream) {
     return attn_body(a, stream);
 }
+
+/* Explicit aliases: old op/export callers never accept16-bit storage by accident. */
+static void ds41_index_b16_active(const RadArgs*a,int role,int rc) {
+    static std::atomic<uint32_t> seen[3]{};
+    if(rc!=RAD_OK||!a||a->rank<0||a->rank>=32)return;
+    const uint32_t bit=1u<<a->rank;
+    if(!(seen[role].fetch_or(bit,std::memory_order_relaxed)&bit))
+        std::fprintf(stderr,"ds41 index b16 active: rank=%d role=%s\n",a->rank,
+            role==0?"score":role==1?"candidates":"topk");
+}
+extern "C" int r4d_rad_ds41_index_score_b16(const RadArgs* a, RadStream stream) {
+    const int rc=index_score_b16_body(a,stream);ds41_index_b16_active(a,0,rc);return rc;
+}
+extern "C" int r4d_rad_ds41_index_candidates_b16(const RadArgs* a, RadStream stream) {
+    const int rc=index_candidates_b16_body(a,stream);ds41_index_b16_active(a,1,rc);return rc;
+}
+extern "C" int r4d_rad_ds41_index_topk_b16(const RadArgs* a, RadStream stream) {
+    const int rc=index_topk_b16_body(a,stream);ds41_index_b16_active(a,2,rc);return rc;
+}
+
+extern "C" uint32_t r4d_rad_ds41_index_b16_paths() { return ds_b16_paths.load(std::memory_order_relaxed); }

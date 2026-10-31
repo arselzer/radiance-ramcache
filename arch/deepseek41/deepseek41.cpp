@@ -573,6 +573,7 @@ struct Model {
      * a block of the candidate layer's width, i32 words a row (0: the model has no candidates). */
     int64_t irows = 0, iparts = 0, kwords = 0;
     bool index_compact = false;  /* requested + valid LCP; actual library admitted by core before serving */
+    bool index_b16 = false; // same irows/runs/math; lossless high16-bit score storage only
     /* A sizing declare (RadBuildCtx::shape_probe; probe()): declared into scratch, never stepped, and
      * silent (the server log's lines and the window's counts of them are the real declare's). */
     bool probe = false;
@@ -1184,6 +1185,18 @@ static int64_t keep_words(int64_t width, int64_t block) {
 static int index_runs(Model& m, const Model* real) {
     const auto& g = m.g;
     const auto& c = m.c;
+    if(!index_compact_parse(std::getenv(kIndexB16Env),&m.index_b16)) {
+        fprintf(stderr,"radiance: deepseek41: %s must be0/unset or1\n",kIndexB16Env);return RAD_E_INVAL;
+    }
+    /* A future packed-cache writer needs its OWN proven b16-store alias. Never
+     * fall through to the old f32 packed writer on a shortened score allocation. */
+    if(m.index_b16) {
+        const char* packed=std::getenv("RADIANCE_EXPERIMENTAL_DS41_KV_PACKED");
+        if(packed&&std::strcmp(packed,"0")&&*packed) {
+            fprintf(stderr,"radiance: deepseek41: %s requires a separately proven packed-cache score writer\n",kIndexB16Env);
+            return RAD_E_UNSUPPORTED;
+        }
+    }
     bool requested = false;
     if (!index_compact_parse(std::getenv(kIndexCompactEnv), &requested)) {
         fprintf(stderr, "radiance: deepseek41: %s must be0/unset or1\n", kIndexCompactEnv);
@@ -1205,6 +1218,7 @@ static int index_runs(Model& m, const Model* real) {
         m.iparts = real->iparts;
         m.irows = std::min(g.max_tok, real->irows);
         m.index_compact = real->index_compact;
+        m.index_b16 = real->index_b16;
     }
     m.kwords = 0;
     if (c.cand >= 0 && c.cand < c.n_layer && c.cand_block > 0 && c.ratio[(size_t)c.cand] > 0)
@@ -1213,7 +1227,7 @@ static int index_runs(Model& m, const Model* real) {
         fprintf(stderr, "radiance: deepseek41: compact index score: %s rows=%lld parts=%lld width=%lld "
                         "plane_bytes=%lld target_bytes=%lld floor=%lld (%s); %s; RoPE unchanged\n",
                 m.index_compact ? "requested" : "legacy fallback", (long long)m.irows,
-                (long long)m.iparts, (long long)m.cmax, (long long)(4 * m.irows * m.cmax),
+                (long long)m.iparts, (long long)m.cmax, (long long)((m.index_b16 ? 2 : 4) * m.irows * m.cmax),
                 (long long)kScorePlane, (long long)(m.index_compact ? kScoreCompactMin : kScoreRunMin),
                 kIndexCompactEnv, m.index_compact ? "requires actual scalar/LCP core admission" : "valid LCP absent");
     return RAD_OK;
@@ -1279,7 +1293,7 @@ static int buffers(RadBuilder* b, Model& m) {
     }
     m.iq = bf("index_q", { T, c.ih * c.idim });
     m.iw = bf("index_w", { T, c.ih });
-    m.score = decl_b(b, nm.f("index_score"), RAD_F32, { m.irows, m.cmax });
+    m.score = decl_b(b, nm.f("index_score"), m.index_b16 ? RAD_BF16 : RAD_F32, { m.irows, m.cmax });
     if (m.kwords > 0) m.keep = decl_b(b, nm.f("index_keep"), RAD_I32, { T, m.kwords });
     m.sel = decl_b(b, nm.f("index_sel"), RAD_I32, { T, c.itopk });
     m.cs_a = decl_b(b, nm.f("rope_window"), RAD_F32, { g.max_ctx, c.rope }, RAD_BUF_PERSIST);
@@ -1807,7 +1821,8 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
                                       RAD_F64("wscale", 1.0 / std::sqrt((double)c.idim * (double)c.ih)),
                                       RAD_STR("dtype", "bf16"), RAD_INT("row_part", p) };
                 if (m.kv_packed) isp.push_back(RAD_INT("kv_format", 2));
-                const rad_op h = op(b, m.kv_packed ? "index_score_kvpack" : "index_score", isp,
+                const rad_op h = op(b, m.kv_packed ? "index_score_kvpack" :
+                                    (m.index_b16 ? "index_score_b16" : "index_score"), isp,
                                     {}, { m.iq, m.iw }, { m.score });
                 if (!h) return RAD_E_INVAL;
                 L.i_runs.push_back(h);
@@ -1815,7 +1830,7 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
             L.i_score = L.i_runs[0];
             if (l == c.cand) {
                 if (!m.keep) return RAD_E_INVAL;
-                L.i_cand = op(b, "index_candidates",
+                L.i_cand = op(b, m.index_b16 ? "index_candidates_b16" : "index_candidates",
                               { RAD_RANGE("M", 1, IR), RAD_INT("width", width),
                                 RAD_INT("block", c.cand_block), RAD_INT("topk_blocks", c.cand_blocks),
                                 RAD_INT("ratio", r) },
@@ -1831,7 +1846,7 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
             std::vector<RadParam> tp = { RAD_RANGE("M", 1, IR), RAD_INT("width", width),
                                          RAD_INT("topk", c.itopk), RAD_INT("ratio", r) };
             if (uses) tp.push_back(RAD_INT("block", c.cand_block));
-            L.i_topk = op(b, "index_topk", tp, {},
+            L.i_topk = op(b, m.index_b16 ? "index_topk_b16" : "index_topk", tp, {},
                           uses ? std::initializer_list<rad_buf>{ m.score, m.keep }
                                : std::initializer_list<rad_buf>{ m.score },
                           { m.sel });

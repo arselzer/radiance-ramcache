@@ -275,7 +275,7 @@ int Engine::draft_bank_lend_transition(const draft_bank::Work& w, draft_bank::Ac
 }
 
 int Engine::draft_bank_lend_step(int step) {
-    return sched_.with_draft_bank_frame(step,[&](const draft_bank::Work&w){
+    return sched_.with_draft_bank_frame(step,[&](const draft_bank::Work&w) -> int {
         DraftBankLoan& l=*draft_bank_loan_;
         l.query_step=w.step;l.query_seq=w.query_seq;
         draft_bank::Action a;
@@ -287,7 +287,7 @@ int Engine::draft_bank_lend_step(int step) {
 }
 
 int Engine::draft_bank_lend_idle() {
-    return sched_.with_draft_bank_idle([&]{
+    return sched_.with_draft_bank_idle([&]() -> int {
         DraftBankLoan& l=*draft_bank_loan_;
         draft_bank::Action a;RAD_TRY(l.controller.restore_idle(l.controller.epoch(),&a));
         if(a==draft_bank::Action::None)return RAD_OK;

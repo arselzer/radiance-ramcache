@@ -105,12 +105,13 @@ def logs(epoch=1, seq=101):
         emit(epoch=epoch, rank=rank, action="lend", stage="drained", cpu_parked=1)
         emit(epoch=epoch, rank=rank, stage="lent", slots=72, borrowed_bytes=100, bank_bytes=120, copied=1)
     phase("lend", "ready", 10)
-    phase("restore", "begin", 300, seq)
+    phase("restore", "begin", 300 if seq else -1, seq)
     for rank in range(4):
         emit(epoch=epoch, rank=rank, action="restore", stage="drained", cpu_parked=1)
         emit(epoch=epoch, rank=rank, stage="restored", bytes=124, verified=1,
-             aliases_ok=1, masks_ok=1, hash="aabb1234", expected_hash="aabb1234")
-    phase("restore", "ready", 300, seq)
+             aliases_ok=1, masks_ok=1, hash="aabb1234", expected_hash="aabb1234",
+             hash_scope="cohort", strict_memcmp=1, selected_units=10)
+    phase("restore", "ready", 300 if seq else -1, seq)
     if seq:
         emit("resume", epoch=epoch, step=301, seq=seq, query_rows=2, ready=1)
     return "\n".join(lines)

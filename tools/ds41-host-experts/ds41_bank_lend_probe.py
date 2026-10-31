@@ -471,11 +471,13 @@ def validate_markers(text, receipt):
         need(all(r.get("pending_ctx") == "0" and r.get("pending_query") == "0" and
                  r.get("solo_held") == "1" for r in phases[:2]), "bank work was not completely deferred while lent")
         lend_step, restore_step = int(phases[1]["step"]), int(phases[3]["step"])
-        need(lend_step <= restore_step and phases[3].get("seq") in (anchor, "0"),
+        idle = phases[3].get("seq") == "0"
+        need(lend_step >= 0 and ((idle and restore_step == -1) or
+             (not idle and restore_step >= lend_step)) and phases[3].get("seq") in (anchor, "0"),
              "restoration was bound to an unknown solo sequence")
         need(phases[0].get("seq") == phases[1].get("seq") == "0" and
              phases[2].get("seq") == phases[3].get("seq"), "transition sequence binding changed")
-        borrowed = []
+        borrowed, selected_units, hashes = [], [], []
         for rank in range(4):
             rr = [r for r in er if r.get("rank") == str(rank)]
             for stage in ("lent", "restored"):
@@ -491,8 +493,11 @@ def validate_markers(text, receipt):
                 else:
                     need(int(row["bytes"]) > 0 and row.get("verified") == "1" and
                          row.get("aliases_ok") == "1" and row.get("masks_ok") == "1" and
+                         row.get("hash_scope") == "cohort" and row.get("strict_memcmp") == "1" and
                          re.fullmatch(r"[0-9a-fA-F]+", row.get("hash", "")) and
                          row["hash"] == row.get("expected_hash"), "unproven bank restoration")
+                    selected_units.append(int(row["selected_units"]))
+                    hashes.append(row["hash"])
             for action in ("lend", "restore"):
                 drained = [r for r in rr if r.get("stage") == "drained" and r.get("action") == action]
                 need(len(drained) == 1 and drained[0].get("cpu_parked") == "1",
@@ -523,7 +528,12 @@ def validate_markers(text, receipt):
                     stage = "lent" if r["action"] == "lend" else "restored"
                     done = next(x for x in rr if x.get("stage") == stage)
                     need(positions[id(r)] < positions[id(done)], "copy/restore proof preceded its drain")
-        summaries.append({"epoch": epoch, "borrowed_bytes": borrowed, "anchor": int(anchor) if selected else 0})
+        need(all(n >= 0 for n in selected_units) and len(set(hashes)) == 1,
+             "inconsistent cohort restoration receipt")
+        if selected:
+            need(sum(selected_units) > 0, "lent residents were never actually selected")
+        summaries.append({"epoch": epoch, "borrowed_bytes": borrowed, "selected_units": selected_units,
+                          "anchor": int(anchor) if selected else 0})
     need(any(row["anchor"] for row in summaries), "only idle restoration observed; anchor never resumed")
     return summaries
 

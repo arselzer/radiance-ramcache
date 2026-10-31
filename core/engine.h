@@ -546,6 +546,7 @@ private:
     int kv_growth_devices(const std::vector<int>& devices);
     int kv_growth_layout();
     int kv_growth_start();
+    int kv_layout_receipt();
     int kv_growth_scope(bool runtime) const;
     int kv_growth_drain();
     KVLiveOptions kv_growth_options_;

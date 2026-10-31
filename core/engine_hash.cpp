@@ -16,6 +16,7 @@
  * and copies layer pools to the host (only referenced physical runs with growing KV), and steps
  * are not issued ahead while it is on. */
 #include "engine_priv.h"
+#include "mem/kv_layout_receipt.h"
 #include "device/device.h"
 #include "mem/kv_storage_decode.h"
 #include "mem/kv_hash_runs.h"
@@ -120,20 +121,32 @@ void Engine::prefill_hash_rank(Rank& r, const RadBatch* b) {
         return;
     }
     const Program& p = r.program;
+    const bool receipt = kv_layout_flag(std::getenv(kKVLayoutEnv)) == 1;
+    uint64_t receipt_seq = 0;
+    int receipt_group = 0, receipt_layer = -1;
     /* One layer's pool at a time, through a pinned buffer as large as the largest. */
     auto fetch = [&](const void* src, int64_t bytes, const KVHashRuns* sparse = nullptr) -> const uint8_t* {
+        const auto record = [&](int64_t copied, bool ok) {
+            if (receipt) r.hash_lines.push_back(fmt("DS41_KV_HASH_COPY rank=%d seq=%llu group=%d layer=%d requested=%lld capacity=%lld "
+                "copied=%lld sparse=%d runs=%zu ok=%d", r.index, (unsigned long long)receipt_seq,
+                receipt_group, receipt_layer, (long long)bytes, (long long)r.hash_cap, (long long)copied, (int)bool(sparse),
+                sparse ? sparse->size() : size_t(1), (int)ok));
+        };
         if (bytes <= 0 || !src) return nullptr;
         if (bytes > r.hash_cap) {
             if (r.hash_host) rad_dev_free(r.hash_host, RAD_MEM_HOST_PINNED);
             r.hash_host = static_cast<uint8_t*>(rad_dev_alloc(bytes, RAD_MEM_HOST_PINNED));
             r.hash_cap = r.hash_host ? bytes : 0;
-            if (!r.hash_host) return nullptr;
+            if (!r.hash_host) { record(0, false); return nullptr; }
         }
         int copied = RAD_OK;
+        int64_t copy_bytes = sparse ? 0 : bytes;
         if (sparse) {
             for (const auto& run : *sparse)
                 if (run.first < 0 || run.second < 0 || run.first > bytes || run.second > bytes - run.first ||
-                    run.second == 0) return nullptr;
+                    run.second == 0 || (receipt && !kv_layout_add(copy_bytes, run.second, &copy_bytes))) {
+                    record(0, false); return nullptr;
+                }
             for (const auto& run : *sparse) {
                 copied = rad_memcpy_async(r.hash_host + run.first, (const char*)src + run.first,
                                           run.second, r.ctx.stream());
@@ -141,10 +154,12 @@ void Engine::prefill_hash_rank(Rank& r, const RadBatch* b) {
             }
         } else copied = rad_memcpy_async(r.hash_host, src, bytes, r.ctx.stream());
         const int drained = rad_stream_sync(r.ctx.stream()); // retire earlier runs even if a later copy failed
-        if (copied < 0 || drained < 0) return nullptr;
+        if (copied < 0 || drained < 0) { record(0, false); return nullptr; }
+        record(copy_bytes, true);
         return r.hash_host;
     };
     for (const PrefillHashJob::Seq& sq : job.seqs) {
+        receipt_seq = sq.seq;
         std::string line = fmt("prefill hash: seq %llu, %lld tokens (%s), rank %d:",
                                (unsigned long long)sq.seq, (long long)sq.n,
                                sq.cut > 0 ? fmt("cut for %lld", (long long)sq.cut).c_str() : "not cut",
@@ -204,6 +219,7 @@ void Engine::prefill_hash_rank(Rank& r, const RadBatch* b) {
                 if (sparse)
                     for (const auto& run : physical_runs)
                         backed &= r.pools.kv().is_backed(gp->pool_offset + layer_offset + run.first, run.second);
+                receipt_group = gr.g; receipt_layer = l;
                 if (!backed) {
                     RAD_ERR("prefill hash: unbacked or invalid physical runs in group '%s', layer %d",
                             name.c_str(), (int)l);
@@ -245,6 +261,7 @@ void Engine::prefill_hash_rank(Rank& r, const RadBatch* b) {
         }
         /* The last row's logits, this rank's shard, as the head wrote them. */
         const int64_t width = r.sampler.config().n_vocab_local;
+        receipt_group = 0; receipt_layer = -1;
         const char* lg = static_cast<const char*>(r.ctx.buf_ptr(p.logits_buf));
         const uint8_t* row = lg && width > 0 && sq.row >= 0
                                  ? fetch(lg + (int64_t)sq.row * width * 4, width * 4) : nullptr;

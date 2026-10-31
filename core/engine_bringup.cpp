@@ -4807,6 +4807,7 @@ int Engine::start() {
 
     RAD_TRY(step_state_init());
     RAD_TRY(kv_growth_start());
+    RAD_TRY(kv_layout_receipt());
 
     /* ---- the budget, checked against the card --------------------------------------------
      *

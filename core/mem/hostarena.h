@@ -34,6 +34,9 @@ public:
     int64_t used_slots() const { return used_; }
     int64_t cap_bytes()  const { return slot_bytes_ * capacity(); }
     int64_t free_slots() const { return cap_slots_ - used_; }
+    /* Diagnostic C++ allocation payload, excluding the allocator's private headers. No layout
+     * change: the live bitmap's actual vector capacity, not a guessed ceil(slot_count/64). */
+    uint64_t bitmap_capacity_words() const { return (uint64_t)bits_.capacity(); }
 
     /* alloc: -1 when full. The caller evicts and retries; victim policy belongs to the store's
      * owner, not the allocator. */

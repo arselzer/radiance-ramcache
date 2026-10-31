@@ -80,12 +80,13 @@ struct Tunables {
     int  verify = 0;
     int  min_rows = ds41p1::kDefMinRows;
     int  lend = 0;
+    int  lend_arena = 0;
     int  grace_ms = ds41p1::kDefGraceMs;
     bool align_end = true;
 };
 /* The tunables from `get` (getenv for the engine): each a whole number in its range (wave 1-16,
- * inflight 1-64, ready 1-32, ahead 0-64, verify 0-4096, min_rows 17-4096, lend 0-64, grace_ms
- * 0-60000), align "end" or "start". False with the reason on anything else. */
+ * inflight 1-64, ready 1-32, ahead 0-64, verify 0-4096, min_rows 17-4096, lend 0-64, lend_arena 0-64,
+ * grace_ms 0-60000), align "end" or "start". False with the reason on anything else. */
 bool parse_tunables(const std::function<const char*(const char*)>& get, Tunables* t, std::string* why);
 
 /* ---- the scheduling -------------------------------------------------------------------------------- */
@@ -226,6 +227,17 @@ private:
  * own copies (one DMA lane) and is never published. Residency moves, bytes do not: every unit is
  * computed from the same bytes wherever it is, so replies stay byte-identical.
  *
+ * The lent arena (RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA=K): the same, with up to K slots carved from
+ * the activation arena's top (arena_slots), above the buffers of the arena's smallest level (steps of up
+ * to 256 rows, the core's arena levels, Engine::probe_arena_levels) and its guard. The arena is sized
+ * for the chunk, so a step at the full plan (a card-path pass, or any step above that level's rows)
+ * writes there: such a step takes every lent slot back as a card-path pass does (FileStager::begin_pass,
+ * before its first op and its weight tables). Its ops run on the compute stream behind the residents'
+ * readers (the pass before it, lane 1 joined into lane 0 at its end), but a reload copy still in flight
+ * runs on the DMA lane: the compute stream waits on it first (LendHost::fence). And since its arena
+ * writes are not behind the DMA lane, the mover's stream waits on the end of every such step (as on an
+ * armed pass's end), so a later reload copy lands only after the step's last reader of the arena.
+ *
  * RingLender is the state machine alone, against LendHost (tests/p1_stager_test.cpp drives it with
  * random landings, copy completions and failures); CardExpertPath is the engine's LendHost. */
 class LendHost {
@@ -236,14 +248,18 @@ public:
     virtual int  load(int k) = 0;
     /* A begun load that landed since the last call: its slot (and *ok whether it read), or -1. */
     virtual int  landed(bool* ok) = 0;
-    /* Slot k's landed bytes copied into its ring slot on the DMA lane, an event recorded after. */
+    /* Slot k's landed bytes copied into its slot on the DMA lane, an event recorded after. */
     virtual int  copy(int k) = 0;
     /* Slot k's copy: 1 passed, 0 not yet, < 0 an error. */
     virtual int  copied(int k) = 0;
     /* Slot k's landed bytes may go (its buffer back to the reload thread, or its RAM-cache lease). */
     virtual void drop(int k) = 0;
-    /* Slot k's unit published at its ring slot (on), or as a file-tier unit again (off). */
+    /* Slot k's unit published at its slot (on), or as a file-tier unit again (off). */
     virtual void publish(int k, bool on) = 0;
+    /* A pass that takes the slots back found slot k's copy still queued: whatever writes the slot in
+     * that pass must wait for it (an arena slot: the compute stream waits on its event; a ring slot
+     * needs nothing, the card path's own copies run behind it on the DMA lane). */
+    virtual void fence(int k) = 0;
 };
 
 class RingLender {
@@ -257,18 +273,20 @@ public:
         uint64_t cancelled = 0;    /* loads or copies a card-path pass overtook, never published */
         uint64_t held_back = 0;    /* passes that found the grace still running */
     };
-    /* n slots (1..ds41p1::kMaxLend), the grace in ms. Every slot starts empty and lent, as after a
-     * card-path pass long ago: the first pass that does not arm the card path begins the reloads. */
+    /* n slots (1..2 x ds41p1::kMaxLend: the ring's and the arena's), the grace in ms. Every slot starts
+     * empty and lent, as after a card-path pass long ago: the first pass that does not take the slots
+     * begins the reloads. */
     int  init(LendHost* host, int n, int64_t grace_ms);
     int  n() const { return (int)slot_.size(); }
-    /* A pass begins at now_ms; p1: it arms the card path. With p1 every resident is published as a
-     * file-tier unit again and every load or copy in flight is cancelled; returns 1 when some resident
-     * was (the pass's first ring copy must wait on the residents' last reader). Without, once the grace
-     * has run out the reloads begin; landed loads are copied, passed copies published, and further
-     * loads begun as buffers come free. Never fails: a host call that fails leaves its unit on the CPU
-     * path. */
+    /* A pass begins at now_ms; p1: it takes the slots back (it arms the card path, or with the lent
+     * arena runs at the full plan). With p1 every resident is published as a file-tier unit again and
+     * every load or copy in flight is cancelled, each copy still queued fenced first (LendHost::fence);
+     * returns 1 when some resident was (the pass's first ring copy must wait on the residents' last
+     * reader). Without, once the grace has run out the reloads begin; landed loads are copied, passed
+     * copies published, and further loads begun as buffers come free. Never fails: a host call that
+     * fails leaves its unit on the CPU path. */
     int  begin_pass(bool p1, int64_t now_ms);
-    /* A pass that armed the card path ended at now_ms: the grace runs from here. */
+    /* A pass that took the slots back ended at now_ms: the grace runs from here. */
     void end_p1(int64_t now_ms);
     bool lent() const { return lent_; }
     int  residents() const;
@@ -351,17 +369,22 @@ public:
     int  run(RadStream s);
     bool layer_open() const { return st_.layer_open(); }
 
-    /* ---- the lent ring (RingLender's host) ----
+    /* ---- the lent ring and the lent arena (RingLender's host) ----
      * lend_init: units[k] (its two weights' offsets and sizes in the unit's layout, as the plan lays it
-     * out) lent ring slot ring_slots[k]; their reloads begin at the first pass that does not arm the
-     * card path. < 0 with *why when it cannot run (the caller refuses the switch then). */
+     * out) lent ring slot ring_slots[k] for k below their count, then the arena slots arena_slots[k -
+     * that count] (whole ds41p1::kSlotBytes slots of the activation arena's lent top, arena_slots);
+     * their reloads begin at the first pass that does not take the slots back. < 0 with *why when it
+     * cannot run (the caller refuses the switch then). */
     struct LendUnit { int32_t unit = -1; int64_t off[2] = { 0, 0 }, bytes[2] = { 0, 0 }; };
-    int  lend_init(const std::vector<LendUnit>& units, const std::vector<int>& ring_slots, int64_t grace_ms,
-                   std::string* why);
+    int  lend_init(const std::vector<LendUnit>& units, const std::vector<int>& ring_slots,
+                   const std::vector<char*>& arena_slots, int64_t grace_ms, std::string* why);
     bool lending() const { return lend_.n() > 0; }
     RingLender& lender() { return lend_; }
     const RingLender& lender() const { return lend_; }
+    /* Lent slot k's ring slot, or -1 (an arena slot); its address; the arena's lent slots. */
     int  lend_ring_slot(int k) const { return k >= 0 && k < (int)lring_.size() ? lring_[(size_t)k] : -1; }
+    char* lend_slot(int k) const { return k >= 0 && k < (int)lat_.size() ? lat_[(size_t)k] : nullptr; }
+    int  lend_arena_slots() const { return (int)(lat_.size() - lring_.size()); }
     int32_t lend_unit(int k) const { return k >= 0 && k < (int)lu_.size() ? lu_[(size_t)k].unit : -1; }
     /* LendHost */
     int  load(int k) override;
@@ -370,6 +393,7 @@ public:
     int  copied(int k) override;
     void drop(int k) override;
     void publish(int k, bool on) override;
+    void fence(int k) override;
 
     /* Device */
     int  event_create(bool host) override;
@@ -458,12 +482,13 @@ private:
     void packer_loop();
     static void landed(void* ctx, int i);
     int  drop_all();
-    /* The lent ring: by lent slot its unit, ring slot, copy event (host) and source (a reload buffer,
-     * -1 its RAM-cache lease in lhu_, -2 none); the two pinned reload buffers, each with planes for
-     * the drive's read; the reload thread's queue (lent slot, buffer) and what it landed. lmu_ guards
-     * lbuf_free_, lq_ and ldone_. */
+    /* The lent ring and arena: by lent slot its unit, address, copy event (host) and source (a reload
+     * buffer, -1 its RAM-cache lease in lhu_, -2 none), and for the ring's (the first lring_.size()) the
+     * ring slot; the two pinned reload buffers, each with planes for the drive's read; the reload
+     * thread's queue (lent slot, buffer) and what it landed. lmu_ guards lbuf_free_, lq_ and ldone_. */
     RingLender lend_;
     std::vector<LendUnit> lu_;
+    std::vector<char*> lat_;
     std::vector<int> lring_, lev_, lsrc_;
     std::vector<std::unique_ptr<Mover::HostUnit>> lhu_;
     std::vector<uint8_t*> lbuf_;
@@ -478,6 +503,11 @@ private:
     void lend_loop();
     void lend_stop();
 };
+
+/* The lent arena's slots in [lo, lo + bytes) (the activation arena's top above a level's buffers and
+ * guard): whole ds41p1::kSlotBytes slots from the top down, each on a 4 KiB boundary, at most `max`.
+ * The deepest slot lies highest, so a smaller count leaves the bytes nearest the buffers unused. */
+std::vector<char*> arena_slots(char* lo, int64_t bytes, int max);
 
 }  /* namespace p1 */
 }  /* namespace rad */

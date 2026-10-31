@@ -1031,6 +1031,23 @@ its rows, which does not pay below ~300 rows):
   has seen the copy pass; until then, or after a failed reload, they take the CPU path. Residency changes
   only at a pass's start, before the weight tables are brought up to date, and a copy a card-path pass
   overtakes is never published. Off by default.
+- **The lent arena** (`..._P1_LEND_ARENA=K`, for chunks of 2,048). The activation arena is sized for the
+  chunk and its buffers are live across the whole graph, so it is about the sum of its buffers: 935 MiB a
+  card at 2,048 rows, 468 at 1,024 (`expert_down` 60 KiB a row, `expert_gate_up` 54, `engram_kv` 50, the
+  two hyper-connection streams 40 each, `expert_ff` 27, ...; all but ~22 MiB of persistent buffers scale
+  with the rows). A step of at most 256 rows uses ~13% of it. Under the switch the deepseek41 plugin
+  declares again at smaller steps (`RadArchProbe::shape_probe_ok`, said only beside it; the sizing
+  declare writes scratch and keeps the real declare's op list), the core binds the 256-row arena level
+  (`Engine::probe_arena_levels`, `plan_level`) and hands each rank's file stager the arena's top above
+  that level's buffers and the 1 MiB guard; up to K whole slots there hold the next hottest file-tier
+  units after the lent ring's, exactly as the lent ring's slots do. A step at the full plan (above 256
+  rows: every card-path pass, and the CPU path's passes of 257-319 rows) takes them all back at its
+  begin_pass, before its first op; the compute stream first waits on any reload copy still queued
+  (`LendHost::fence`), and at its end the mover's stream waits on an event behind it, so a later reload
+  lands behind its last reader. The grace runs from the last such step. Residency moves, bytes do not:
+  replies stay byte-identical. At Lc2048 ~42 slots fit a card (the 39 residents Lc2048 costs against
+  Lc1024), at Lc1024 ~18. The plugin must come from a tree with the change (arch/deepseek41). Off by
+  default.
 - **Unchanged.** Decode, every pass of up to 16 tokens and every layer pass below the threshold run the
   CPU path as before.
 
@@ -1043,7 +1060,8 @@ arms only; drive units are not sampled, their pinned slot being reused by then; 
 compared and differing, and samples skipped because the unit was evicted since its copy),
 `..._P1_ALIGN` (`end` or `start`), `..._P1_MIN_ROWS` (the threshold, 320; 17-4096: 17 is the card path
 for every pass above 16 tokens, as before the threshold), `..._P1_LEND` (lent ring slots, 0 off; up to
-64, at most the ring's slots less two), `..._P1_GRACE_MS` (1000; 0-60000).
+64, at most the ring's slots less two), `..._P1_LEND_ARENA` (lent arena slots, 0 off; up to 64, as many
+as fit), `..._P1_GRACE_MS` (1000; 0-60000).
 
 Refused at startup, with the reason: an invalid switch value; P1 without an admitted LCP chunk, or above
 2048; a routed band of 17 rows or more not on the P1 row (a libr4d with LCP's twin is named as such); a
@@ -1053,12 +1071,16 @@ slots); the CPU path not taking the layer passes below the threshold (host exper
 bank serves beside P1 or its lent ring); `..._FETCH_LIST`; the route trace; the DSpark head tail; a routed
 layer whose gate_up, single `swiglu_clamped` and down cannot be named; a routed unit off the card neither on
 the file tier nor pinned in the host pool of a static plan (`--deterministic`) as a block_mxfp4 gate_up and
-down pair; `..._P1_LEND` with no slot or unit to lend; a checkpoint interval below C. Under P1, LCP admits
+down pair; `..._P1_LEND` with no slot or unit to lend; `..._P1_LEND_ARENA` with no arena level (a plugin
+without the change), a dynamic plan, or no slot or unit to lend; with either the CPU path not taking every
+pass that does not arm P1 (`..._MISSES` below C); a checkpoint interval below C. Under P1, LCP admits
 `..._VRAM_PACKED=1` (the P1 row decodes the packed form; gemv_vp serves 16 rows or fewer).
 
 Log lines: rank 0's `ds41 p1: card experts on: every routed expert row of a pure prefill pass's layer of
 N to C rows ...` at startup (the threshold, the CPU path's bound, ring, tunables, pooled units), with a
-lent ring `ds41 p1: lent ring: K of the ring's S slots ...`; the scheduler's
+lent ring `ds41 p1: lent ring: K of the ring's S slots ...`, with a lent arena `activation arena: steps of up
+to 256 tokens take E of A; the L above them and a 1 MiB guard go to prefill Phase 1's lent arena` and
+`ds41 p1: lent arena: N slots (..._P1_LEND_ARENA=K; F fit) ...`; the scheduler's
 `ds41 p1: a lone prompt's chunks are aligned to ...`; rank 0's `ds41 p1 chunk: rows R, layers L, wall S s
 (issue), rank 0 drive units D, G GB/s, MemAvailable M MiB` after each card-path chunk; each rank's
 `ds41 p1 stats, rank R: ...` at shutdown (chunks, layers, units RAM / drive, read-ahead posted / used /
@@ -1070,8 +1092,10 @@ CPU path's bound, and each chunk line the layers left below the threshold.
 
 Window parts (`ab_window.sh`): `P1` (needs `LcN`, `B2`..`B8` and an `M` part of min(N, threshold - 1)
 or more; the arm's `Mr` part serves the CPU path's passes), `QwN`, `QiN`, `QrN`, `QaN`, `QvN`, `Qs`,
-`QmN` (the threshold), `QlK` (the lent ring, K at most 2B - 2), `QhMS` (its grace, the hold; needs `Ql`); a P1 arm
-is measured only if the startup line states its threshold and chunk, a `Ql` arm only with its lent-ring
+`QmN` (the threshold), `QlK` (the lent ring, K at most 2B - 2), `QeK` (the lent arena, 1-64), `QhMS` (their
+grace, the hold; needs `Ql` or `Qe`; with either the `M` part is N or more); a P1 arm
+is measured only if the startup line states its threshold and chunk, a `Qe` arm only with its lent-arena
+line, a `Ql` arm only with its lent-ring
 line; `DEVICE_CHECKS` gains `p1` (`P1_CHECK_M`, 4096, and `P1_ROUTES`),
 and a P1 arm runs only on the libr4d.so its `p1: PASS` was on; `LCP_CHECK_C=2048` for Lc2048 arms. The
 prompt receipts `Up1len` (five documents of ~1K, ~2K, ~5K, ~8K and ~16K tokens, `max_tokens` 16, from
@@ -1090,7 +1114,11 @@ from the threshold, a layer is the card path's exactly at its own rows, every ot
 path's bound, decode, mixed, draft and speculative passes never); the lent ring's state machine on a
 simulated host (lend, return after the grace, back-to-back prompts, failed loads and copies left on the
 CPU path, loads and copies a card-path pass overtakes never published, decode between chunks, 200 random
-runs) and the mover's ring residents (published at their slots, never aliased or borrowed, file-tier
+runs, every copy still queued fenced when a pass takes the slots back), the lent arena (its slots whole,
+aligned and inside the arena's top; a simulated card's two streams in random order, where no reload copy
+ever lands inside a full step's activations and every resident read finds its unit, 300 runs, while the
+same runs without the fence or the end's hand-over find the race) and the mover's ring residents
+(published at their slots, never aliased or borrowed, file-tier
 again once taken back); the tunables; the end-aligned chunks for every length to 20,000; the admission
 against the sorted order.
 `p1_chunk_test` runs `Scheduler::plan_chunk`'s end alignment on the scheduler fakes, with and without a

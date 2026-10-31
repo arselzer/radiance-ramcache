@@ -404,6 +404,7 @@ public:
     /* The compute stream this rank issues on. Transfers are ordered against it and the
      * quarantine barrier is recorded on it; without one the mover refuses to move. */
     int bind_compute_stream(RadStream s);
+    RadStream compute_stream() const { return compute_; }
 
     /* The mover's stream, to be shared by any subsystem moving bytes off the critical path. Each
      * HIP stream costs a hardware queue, and on RDNA4 a fourth one is expensive: on two R9700s

@@ -113,11 +113,17 @@
 # lent ring: K of the ring's slots (at most 2N - 2: all but the two the file buffers' alias bases name, B1's
 # share) hold the rank's hottest file-tier units as decode residents between the card path's passes, taken
 # back by a pass that arms it and reloaded in the background QhMS ms after its last one (..._P1_LEND, 0 off;
-# ..._P1_GRACE_MS, 1000; Qh needs Ql; Q[gnc] stays the power settings), so B6-Ql10 gives decode B1's
-# residents; each needs P1. Every other arm states RADIANCE_EXPERIMENTAL_DS41_P1=0 and the Q knobs empty
-# (..._P1_LEND 0). A P1 arm is measured only if the server logs "ds41 p1: card experts on" at startup with
-# its threshold and chunk ("a pure prefill pass's layer of N to C rows") (and a plain arm only without it),
-# a Ql arm "ds41 p1: lent ring: K of the ring's" (and any other none), and runs only on the libr4d.so
+# ..._P1_GRACE_MS, 1000; Qh needs Ql or Qe; Q[gnc] stays the power settings), so B6-Ql10 gives decode B1's
+# residents; QeK the lent arena: up to K slots of the activation arena's top, above its 256-row level (the
+# deepseek41 plugin must come from a tree that declares at a smaller step beside the switch), hold the next
+# hottest units the same way, taken back by every step at the full plan (..._P1_LEND_ARENA, 0 off, 1-64; Qe64
+# takes what fits: ~42 slots a card at Lc2048, ~18 at Lc1024); with Ql or Qe the CPU path takes every pass
+# that does not arm P1, so the M part is N_Lc or more; each needs P1. Every other arm states
+# RADIANCE_EXPERIMENTAL_DS41_P1=0 and the Q knobs empty (..._P1_LEND and ..._P1_LEND_ARENA 0). A P1 arm is
+# measured only if the server logs "ds41 p1: card experts on" at startup with its threshold and chunk ("a
+# pure prefill pass's layer of N to C rows") (and a plain arm only without it), a Ql arm "ds41 p1: lent
+# ring: K of the ring's", a Qe arm "ds41 p1: lent arena: N slots (..._P1_LEND_ARENA=K;" (and any other
+# arm neither), and runs only on the libr4d.so
 # (sha256) on which `p1` in DEVICE_CHECKS passed (ds41_mxfp4_device_check TALL_LIBR4D p1 P1_CHECK_M
 # P1_ROUTES on card 0, "p1: PASS" its last line; P1_CHECK_M 4096 by default, P1_ROUTES a p0_tables.py routes
 # file, none by default); an Lc2048 arm needs LCP_CHECK_C=2048 as before. The window log takes each P1 arm's
@@ -316,7 +322,20 @@ lcp_check() {   # name
     log "arm $name: no Ql part, but the server lends the ring (the knob set for the window?); not measured"
     return 1
   fi
+  # QeK: rank 0's "ds41 p1: lent arena: N slots (..._P1_LEND_ARENA=K;" line at startup, in a Qe arm only.
+  local arena_lines
+  arena_lines=$(grep -c 'ds41 p1: lent arena: ' "$OUT/$name.server.log")
+  if [[ -n "${ARM_QE:-}" ]] &&
+     ! grep -qE "ds41 p1: lent arena: [0-9]+ slots \(RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA=${ARM_QE};" "$OUT/$name.server.log"; then
+    log "arm $name: Qe${ARM_QE}, but the server log has no 'ds41 p1: lent arena: N slots (..._P1_LEND_ARENA=${ARM_QE};' line ($(grep -m1 -E 'ds41 p1: lent arena|LEND_ARENA' "$OUT/$name.server.log")); not measured"
+    return 1
+  fi
+  if [[ -z "${ARM_QE:-}" && "$arena_lines" != 0 ]]; then
+    log "arm $name: no Qe part, but the server lends the arena (the knob set for the window?); not measured"
+    return 1
+  fi
   [[ -n "${ARM_P1:-}" ]] && grep -m2 -E 'ds41 p1: ' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
+  [[ -n "${ARM_QE:-}" ]] && grep -m2 -E 'ds41 p1: lent arena: |activation arena: .*lent arena' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   return 0
 }
 
@@ -1446,7 +1465,7 @@ for a in $ARMS; do
   IFS=- read -r -a parts <<< "$a"
   xt="" bt="" kld="" dk="" db="" pu="" ins_nt="" ins_kib="" ins_wait="" lean="" lc="" ad="" dv="" xd="" hs="" dg="" df="" pmr="" tb=""
   mb="" lf="" dc="" dl="" dx="" dm="" ds="" nseq=""
-  p1="" q1=() qm="" ql="" qg=""
+  p1="" q1=() qm="" ql="" qg="" qe=""
   pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 HOST_POOL_MIB=4096 EXTRA_ARGS="" ARM_HOME="$RHOME" ARM_CONC=
   ARM_PROMPTS= ARM_N= ARM_LQ= rt=
   power="" skip="" ARGS=() f8="" f8x="" rb="" rbf=0 pred="" cs="" ck="" kh="" pc="" pcopt="" fw="" wp="" wl=""
@@ -1590,18 +1609,19 @@ for a in $ARMS; do
                  lc=$((10#$lc)); ARGS+=(--max-num-batched-tokens "$lc"); env+=(RADIANCE_EXPERIMENTAL_DS41_LCP=$lc)
                else log "arm $a: $p: a chunk is a multiple of 16 in 64..2048; the arm is skipped"; skip=1; fi ;;
       P1)      p1=1 ;;                                                  # prefill Phase 1: card experts in large chunks (needs Lc)
-      Qw[0-9]*|Qi[0-9]*|Qr[0-9]*|Qa[0-9]*|Qv[0-9]*|Qm[0-9]*|Ql[0-9]*|Qh[0-9]*)   # ...wave / in flight / ready / read-ahead / verify / threshold / lent slots / its hold
+      Qw[0-9]*|Qi[0-9]*|Qr[0-9]*|Qa[0-9]*|Qv[0-9]*|Qm[0-9]*|Ql[0-9]*|Qh[0-9]*|Qe[0-9]*)   # ...wave / in flight / ready / read-ahead / verify / threshold / lent slots / its hold / lent arena slots
                qn=${p:2}
                case ${p:0:2} in
                  Qw) qk=WAVE qlo=1 qhi=16 ;; Qi) qk=INFLIGHT qlo=1 qhi=64 ;; Qr) qk=READY qlo=1 qhi=32 ;;
                  Qa) qk=AHEAD qlo=0 qhi=64 ;; Qm) qk=MIN_ROWS qlo=17 qhi=4096 ;; Ql) qk=LEND qlo=1 qhi=64 ;;
-                 Qh) qk=GRACE_MS qlo=0 qhi=60000 ;; *) qk=VERIFY qlo=0 qhi=4096 ;;
+                 Qh) qk=GRACE_MS qlo=0 qhi=60000 ;; Qe) qk=LEND_ARENA qlo=1 qhi=64 ;; *) qk=VERIFY qlo=0 qhi=4096 ;;
                esac
                if [[ $qn =~ ^[0-9]+$ ]] && (( 10#$qn >= qlo && 10#$qn <= qhi )); then
                  q1+=(RADIANCE_EXPERIMENTAL_DS41_P1_$qk=$((10#$qn)))
                  [[ $qk == MIN_ROWS ]] && qm=$((10#$qn))
                  [[ $qk == LEND ]] && ql=$((10#$qn))
                  [[ $qk == GRACE_MS ]] && qg=$((10#$qn))
+                 [[ $qk == LEND_ARENA ]] && qe=$((10#$qn))
                else log "arm $a: $p: ${p:0:2} takes $qlo-$qhi; the arm is skipped"; skip=1; fi ;;
       Qs)      q1+=(RADIANCE_EXPERIMENTAL_DS41_P1_ALIGN=start) ;;       # ...chunks aligned to the start
       Ad[0-9]*) ad=${p#Ad}; env+=(RADIANCE_EXPERIMENTAL_DS41_LCP_ADMIT=$((10#$ad))) ;;   # admit the last N tokens' units
@@ -1903,6 +1923,9 @@ for a in $ARMS; do
       (( ${mm:-0} >= qcpu )) || { log "arm $a: P1 at the threshold $qmin needs M$qcpu or more (the CPU path takes the layer passes below it, up to $qcpu rows); the arm is skipped"; skip=1; }
       # QlK lends K of the ring's 2N slots to decode residents: at most the 2N - 2 past the file buffers' alias bases.
       [[ -n "$ql" ]] && (( ql > 2 * ${bn:-0} - 2 )) && { log "arm $a: Ql$ql lends more than the $(( 2 * ${bn:-0} - 2 )) slots B${bn:-0}'s ring has past the file buffers' alias bases; the arm is skipped"; skip=1; }
+      # With lent slots (QlK, QeK) the CPU path takes every pass that does not arm P1 (the copy path refuses while
+      # a slot is lent): its misses up to the chunk.
+      [[ -n "$ql$qe" ]] && (( ${mm:-0} < lc )) && { log "arm $a: Ql / Qe need M$lc or more (with lent slots the CPU path takes every pass that does not arm P1); the arm is skipped"; skip=1; }
     else
       [[ " ${env[*]} " == *" RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS=1 "* ]] ||
         { log "arm $a: Lc needs B1 (the CPU takes every routed unit); the arm is skipped"; skip=1; }
@@ -1933,14 +1956,14 @@ for a in $ARMS; do
     env+=(RADIANCE_EXPERIMENTAL_DS41_P1=1 RADIANCE_EXPERIMENTAL_DS41_P1_WAVE= RADIANCE_EXPERIMENTAL_DS41_P1_INFLIGHT=
           RADIANCE_EXPERIMENTAL_DS41_P1_READY= RADIANCE_EXPERIMENTAL_DS41_P1_AHEAD= RADIANCE_EXPERIMENTAL_DS41_P1_VERIFY=
           RADIANCE_EXPERIMENTAL_DS41_P1_ALIGN= RADIANCE_EXPERIMENTAL_DS41_P1_MIN_ROWS= RADIANCE_EXPERIMENTAL_DS41_P1_LEND=0
-          RADIANCE_EXPERIMENTAL_DS41_P1_GRACE_MS= "${q1[@]}")
-    [[ -n "$qg" && -z "$ql" ]] && { log "arm $a: Qh$qg sets the lent ring's grace, which needs a QlK part; the arm is skipped"; skip=1; }
+          RADIANCE_EXPERIMENTAL_DS41_P1_GRACE_MS= RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA=0 "${q1[@]}")
+    [[ -n "$qg" && -z "$ql$qe" ]] && { log "arm $a: Qh$qg sets the lent slots' grace, which needs a QlK or QeK part; the arm is skipped"; skip=1; }
   else
     (( ${#q1[@]} )) && { log "arm $a: the Q parts (${q1[*]}) need P1; the arm is skipped"; skip=1; }
     env+=(RADIANCE_EXPERIMENTAL_DS41_P1=0 RADIANCE_EXPERIMENTAL_DS41_P1_WAVE= RADIANCE_EXPERIMENTAL_DS41_P1_INFLIGHT=
           RADIANCE_EXPERIMENTAL_DS41_P1_READY= RADIANCE_EXPERIMENTAL_DS41_P1_AHEAD= RADIANCE_EXPERIMENTAL_DS41_P1_VERIFY=
           RADIANCE_EXPERIMENTAL_DS41_P1_ALIGN= RADIANCE_EXPERIMENTAL_DS41_P1_MIN_ROWS= RADIANCE_EXPERIMENTAL_DS41_P1_LEND=0
-          RADIANCE_EXPERIMENTAL_DS41_P1_GRACE_MS=)
+          RADIANCE_EXPERIMENTAL_DS41_P1_GRACE_MS= RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA=0)
   fi
   [[ -n "$ad" ]] || env+=(RADIANCE_EXPERIMENTAL_DS41_LCP_ADMIT=)
   # Fw / WpN (the CPU pool's wake-up): every arm states both switches, 0 off, so a window's VAR=val
@@ -1980,7 +2003,7 @@ for a in $ARMS; do
     rm -rf "$OUT/kld-$a"
     ARGS=(--max-model-len "${KLD_LEN:-2048}" "${ARGS[@]}" --kld-record "$OUT/kld-$a" --kld-corpus "$OUT/kld-corpus.jsonl")
   fi
-  ARM_XT=$xt ARM_BT=$bt ARM_KLD=$kld ARM_LC=$lc ARM_P1=$p1 ARM_QM=${qm:-320} ARM_QL=$ql
+  ARM_XT=$xt ARM_BT=$bt ARM_KLD=$kld ARM_LC=$lc ARM_P1=$p1 ARM_QM=${qm:-320} ARM_QL=$ql ARM_QE=$qe
   [[ -n "$skip" ]] && continue
   [[ -n "$power" ]] && power_set "$power"
   case $pol in

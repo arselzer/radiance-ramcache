@@ -221,6 +221,48 @@ TEST(f32bf16_relayout_refuses_a_weight_with_any_nonzero_low_half) {
              RAD_E_DTYPE);
 }
 
+/* Large M does not weaken the load-time contract. In particular the split router's N=96
+ * reader must still reject a bad low half in any of the whole 384-row source plane, including
+ * the rows outside that reader's slice. The compressor can arrive directly as bf16, in which
+ * case this conversion remains unsupported and the loader keeps its existing bytes. */
+TEST(f32bf16_tall_served_geometries_check_the_whole_source_plane_before_slicing) {
+    const RadEncoding enc = rad_enc_plain(RAD_F32);
+    const int sel = 0;
+    constexpr int64_t K = 5120;
+    struct Shape { int64_t m, n, whole_n; };
+    const Shape shapes[] = { { 256, 96, 384 }, { 1024, 384, 384 }, { 2048, 1024, 1024 } };
+    for (const Shape& s : shapes) {
+        Geo g(s.n, K, s.m);
+        std::vector<uint32_t> w((size_t)(s.whole_n * K), widen(0x3f80));
+        const RadTensor source = plane(RAD_F32, s.whole_n, K, w.data());
+        RadLayout L{};
+        REQUIRE_EQ(r4d_rad_layout_f32bf16(g.p, 4, kW, &enc, &sel, &source, 1, &L), RAD_OK);
+        CHECK_EQ(L.shape[0], s.whole_n);
+        CHECK_EQ(L.shape[1], K);
+        CHECK_EQ(L.bytes, s.whole_n * K * 2);
+        std::vector<uint16_t> stored((size_t)(s.whole_n * K), 0xa5a5);
+        REQUIRE_EQ(r4d_rad_relayout_f32bf16(g.p, 4, kW, &enc, &sel, &source, 1,
+                                            stored.data(), L.bytes), RAD_OK);
+        int64_t bad = 0;
+        for (uint16_t h : stored) bad += h != 0x3f80;
+        CHECK_EQ(bad, 0);
+        const int64_t where[] = { 0, s.n * K / 2 + 211, s.whole_n * K - 1 };
+        const uint32_t low[] = { 0x0001u, 0x8000u, 0xffffu };
+        for (int i = 0; i < 3; ++i) {
+            w[(size_t)where[i]] |= low[i];
+            CHECK_EQ(r4d_rad_relayout_f32bf16(g.p, 4, kW, &enc, &sel, &source, 1,
+                                              stored.data(), L.bytes), RAD_E_DTYPE);
+            w[(size_t)where[i]] = widen(0x3f80);
+        }
+    }
+    Geo compressor(1024, K, 2048);
+    const RadEncoding direct = rad_enc_plain(RAD_BF16);
+    const RadTensor source = plane(RAD_BF16, 1024, K);
+    RadLayout L{};
+    CHECK_EQ(r4d_rad_layout_f32bf16(compressor.p, 4, kW, &direct, &sel, &source, 1, &L),
+             RAD_E_UNSUPPORTED);
+}
+
 TEST(f32bf16_relayout_and_inverse_check_the_stored_size) {
     const RadEncoding enc = rad_enc_plain(RAD_F32);
     const int sel = 0;

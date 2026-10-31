@@ -20443,6 +20443,147 @@ static void f32bf16_forms(const Plugin& pl, int64_t M, int64_t N, int64_t K, int
     a32.n_p = a16.n_p = 4;
 }
 
+/* Rb beside ds41's large-chunk prefill: compare every output byte with the current f32 row at
+ * the served heights, without the billions of host FMAs a full tall host oracle would require.
+ * The first, middle and last rows still have an independent host oracle. The 96-column case is
+ * TP4 rank 3's view of the whole 384-column router weight, after the real relayout hook has
+ * checked and converted the entire plane. No form sweep or timing loop is needed: above 16 rows
+ * the serving path uses the rule, not ROUTER_BF16_FORM's decode override. */
+static void ds41_f32bf16_tall_case(const Plugin& pl, int64_t M, int64_t N) {
+    const auto* rf = find(pl, "gemm_nt_f32_bf16");
+    const auto* rh = find(pl, "gemm_nt_f32bf16_bf16");
+    if (!rf || !rh || !rh->layout || !rh->relayout) {
+        ok("ds41 f32bf16 tall", false, "row or relayout hooks absent");
+        return;
+    }
+    constexpr int64_t K = 5120;
+    const int64_t whole_n = N == 96 ? 384 : N, first_col = N == 96 ? 288 : 0;
+    const int64_t xp = K + 5, yp = N + 3;
+    const size_t ybytes = (size_t)M * (size_t)yp * 4 + 256;
+    std::vector<uint16_t> x((size_t)(M * xp), 0x7fc1), halves((size_t)(whole_n * K));
+    std::vector<float> w((size_t)(whole_n * K));
+    for (int64_t row = 0; row < M; ++row)
+        for (int64_t k = 0; k < K; ++k)
+            x[(size_t)(row * xp + k)] = row == 0 ? 0 : h_to_bf16(
+                (float)((int)(st_mix32((uint32_t)(row * K + k)) % 2001) - 1000) / 1000);
+    for (size_t i = 0; i < w.size(); ++i) {
+        halves[i] = i % 1021 == 0 ? 0x8000 : h_to_bf16(
+            (float)((int)(st_mix32((uint32_t)i + 0x51ed27u) % 2001) - 1000) / 8000);
+        w[i] = h_bf16(halves[i]);
+    }
+    std::vector<RadParam> ps = { PI("M", M), PI("N", N), PI("K", K), PS("dtype", "bf16") };
+    const RadEncoding enc = rad_enc_plain(RAD_F32);
+    const int selected = 0;
+    const RadTensor source = T(w.data(), RAD_F32, { whole_n, K });
+    RadLayout layout{};
+    int rc = rh->layout(ps.data(), (int)ps.size(), 1, &enc, &selected, &source, 1, &layout);
+    std::vector<uint16_t> stored(halves.size(), 0xa5a5);
+    if (rc == RAD_OK && layout.dtype == RAD_BF16 && layout.bytes == (int64_t)stored.size() * 2)
+        rc = rh->relayout(ps.data(), (int)ps.size(), 1, &enc, &selected, &source, 1,
+                          stored.data(), (int64_t)stored.size() * 2);
+    else if (rc == RAD_OK)
+        rc = RAD_E_SHAPE;
+    if (rc != RAD_OK || stored != halves) {
+        ok("ds41 f32bf16 tall", false, fmt("whole-plane relayout rc=%d", rc));
+        return;
+    }
+    if (M == 2048) {
+        /* Exercise this loaded plugin's rejection, not just the separately linked host test.
+         * For N=96 the bad element is outside the TP slice, in the whole weight's last row. */
+        uint32_t original;
+        std::memcpy(&original, &w.back(), 4);
+        const uint32_t bad = original | (N == 96 ? 0x0001u : N == 384 ? 0x8000u : 0xffffu);
+        std::memcpy(&w.back(), &bad, 4);
+        std::vector<uint16_t> rejected(stored.size());
+        const int reject = rh->relayout(ps.data(), (int)ps.size(), 1, &enc, &selected, &source, 1,
+                                         rejected.data(), (int64_t)rejected.size() * 2);
+        std::memcpy(&w.back(), &original, 4);
+        ok(fmt("ds41 f32bf16 tall N=%lld: nonzero low half in last source element refused",
+               (long long)N).c_str(), reject == RAD_E_DTYPE, fmt("rc=%d", reject));
+        if (reject != RAD_E_DTYPE) return;
+    }
+    void* dx = dalloc(x.size() * 2);
+    void* dw32 = dalloc(w.size() * 4);
+    void* dw16 = dalloc(stored.size() * 2);
+    void* dy = dalloc(ybytes);
+    if (!dx || !dw32 || !dw16 || !dy) {
+        ok("ds41 f32bf16 tall", false, "allocation failed");
+        return;
+    }
+    st_memcpy(dx, x.data(), x.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(dw32, w.data(), w.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(dw16, stored.data(), stored.size() * 2, hipMemcpyHostToDevice);
+    std::vector<RadTensor> t32 = {
+        T(dx, RAD_BF16, { M, K }),
+        T((float*)dw32 + first_col * K, RAD_F32, { N, K }),
+        T((uint8_t*)dy + 128, RAD_F32, { M, N }),
+    };
+    auto t16 = t32;
+    t16[1] = T((uint16_t*)dw16 + first_col * K, RAD_BF16, { N, K });
+    t32[0].stride[0] = t16[0].stride[0] = xp;
+    t32[2].stride[0] = t16[2].stride[0] = yp;
+    RadArgs a32{};
+    a32.t = t32.data(); a32.n_t = 3; a32.p = ps.data(); a32.n_p = (int)ps.size();
+    a32.world_size = 1;
+    RadArgs a16 = a32;
+    a16.t = t16.data();
+    const std::vector<uint8_t> fill(ybytes, 0xa5);
+    auto run = [&](const RadKernelInfo* row, RadArgs* a, std::vector<uint8_t>* got) {
+        st_memcpy(dy, fill.data(), fill.size(), hipMemcpyHostToDevice);
+        int r = row->launch(a, nullptr);
+        if (r == RAD_OK && st_stream_sync(nullptr) != hipSuccess) r = RAD_E_DEVICE;
+        got->assign(ybytes, 0);
+        if (r == RAD_OK) st_memcpy(got->data(), dy, ybytes, hipMemcpyDeviceToHost);
+        return r;
+    };
+    std::vector<uint8_t> f32, bf16;
+    const int r32 = run(rf, &a32, &f32), r16 = run(rh, &a16, &bf16);
+    bool guards = true, host = true;
+    if (r32 == RAD_OK && r16 == RAD_OK) {
+        for (size_t i = 0; i < ybytes; ++i) {
+            const bool output = i >= 128 && i < ybytes - 128 &&
+                                (i - 128) % ((size_t)yp * 4) < (size_t)N * 4;
+            if (!output) guards = guards && f32[i] == 0xa5 && bf16[i] == 0xa5;
+        }
+        for (int64_t row : { int64_t(0), M / 2, M - 1 })
+            for (int64_t c = 0; c < N; ++c) {
+                float lane[32];
+                for (int l = 0; l < 32; ++l) {
+                    float sum = 0;
+                    for (int64_t k = l; k < K; k += 32)
+                        sum = std::fmaf(h_bf16(x[(size_t)(row * xp + k)]),
+                                         w[(size_t)((first_col + c) * K + k)], sum);
+                    lane[l] = sum;
+                }
+                for (int mask = 16; mask; mask >>= 1) {
+                    float next[32];
+                    for (int l = 0; l < 32; ++l) next[l] = lane[l] + lane[l ^ mask];
+                    std::memcpy(lane, next, sizeof lane);
+                }
+                const size_t off = 128 + (size_t)(row * yp + c) * 4;
+                host = host && std::memcmp(f32.data() + off, &lane[0], 4) == 0 &&
+                               std::memcmp(bf16.data() + off, &lane[0], 4) == 0;
+            }
+    }
+    const bool same = r32 == RAD_OK && r16 == RAD_OK && f32 == bf16 && guards && host;
+    ok(fmt("ds41 f32bf16 tall M=%lld N=%lld K=5120 weight_col=%lld: every output byte, "
+           "sampled host rows and guards", (long long)M, (long long)N, (long long)first_col).c_str(),
+       same, same ? "" : fmt("rc %d/%d, guards=%d, host=%d", r32, r16, guards, host));
+}
+
+static void ds41_f32bf16_tall(const Plugin& pl) {
+    const int before = g_fail;
+    for (int64_t M : { 256, 1024, 2048 })
+        for (int64_t N : { 96, 384, 1024 }) {
+            dfree_all();
+            ds41_f32bf16_tall_case(pl, M, N);
+        }
+    dfree_all();
+    if (g_fail == before)
+        std::printf("PASS: ds41 f32bf16 tall: 9 served shapes, every output byte equals f32; "
+                    "sampled host rows and guards match; 3 nonzero-low-half loads refused\n");
+}
+
 /* gemm_fp8a8_f32scale's dense form at the shape (a decode form or a row tile, by the rule)
  * compared byte for byte with the legacy 16x64 tile, which an activation pitch off 16 bytes takes;
  * the output keeps a filled pitch, so an overrun or a missed row shows. Timed, it also prints its
@@ -32236,7 +32377,11 @@ static void device_phase(const Plugin& pl) {
         for (int64_t cols : { 4, 36, 96 }) f32bf16_forms(pl, 3, cols, 4096, 0, false);
         f32bf16_forms(pl, 7, 31, 129, 0, false);
         f32bf16_forms(pl, 70, 13, 130, 0, false);
+        ds41_f32bf16_tall(pl);
     }
+    /* The compact tall gate alone, for a window whose unchanged decode/form checks are already
+     * pinned to this same libr4d hash. The row's ordinary smoke case above also runs this gate. */
+    if (g_case && sel("ds41_f32bf16_tall")) ds41_f32bf16_tall(pl);
     if (sel("dsa_score_fp8")) {
         dsa_score_check(pl, 1, 17);
         dsa_score_check(pl, 7, 257);
@@ -32894,6 +33039,8 @@ static void usage(void) {
                 "       r4d_selftest <plugin.so> --real <file> <woff> <soff> <N> <K>\n"
                 "  no --case: the catalogue, the static checks, then one child process per row\n"
                 "  --case:    that row's smoke test alone, in this process -- the reproducer\n"
+                "             ds41_f32bf16_tall runs only the nine tall router/compressor byte\n"
+                "             comparisons and three load refusals, without a timing/form sweep.\n"
                 "  --real:    the block-scaled fp8 matvec against a REAL checkpoint weight, at the\n"
                 "             given byte offsets in a safetensors file, compared with a host\n"
                 "             reference over the same bytes. An offset is 8 + <header length, a\n"

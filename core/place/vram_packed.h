@@ -21,8 +21,10 @@
  *           every other tier (the pinned pool, the file tier, the RAM cache and the CPU path, the
  *           expert profile's checks) keeps it untouched: the packed form is VRAM's alone.
  *   plan    A weight is eligible (vram_pack_eligible) when it is a trunk routed expert's ggml_mxfp4
- *           gate_up or down, whole on its rank, read only by moe_gemm_ggml ops every band of which
- *           resolved the gemv_vp row. The expert fill charges an eligible unit at its packed size,
+ *           gate_up or down, whole on its rank, read only by moe_gemm_ggml tables whose bands all
+ *           resolved gemv_vp, or whose M=1..16 bands resolved gemv_vp and every higher band the
+ *           packed-aware P1 twin through its 4096-row bound. Other readers, including the ordinary
+ *           LCP twin, keep the block form. The expert fill charges an eligible unit at its packed size,
  *           after reading its weights' scales from the container (vram_pack_scan): a weight with
  *           more raw rounds than its budget stays block_mxfp4 in VRAM and is charged so. Only a
  *           static plan (--deterministic) packs: a movable resident sits in a slot of its class's

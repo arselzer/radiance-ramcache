@@ -2,6 +2,7 @@
 #include "vram_packed.h"
 
 #include "ds41_host_experts.h"
+#include "ds41_p1.h"
 #include "format/radfile.h"
 #include "planner.h"
 
@@ -11,6 +12,43 @@
 #include <cstring>
 
 namespace rad {
+
+namespace {
+
+bool packed_table_reader(const OpInfo& o) {
+    if (o.op != "moe_gemm_ggml" || o.bands.empty()) return false;
+    auto row_is = [](const Band& b, const char* name) {
+        const Resolved& r = b.dom[RAD_DOMAIN_DEVICE];
+        return r && r.row->info && r.row->info->name && !std::strcmp(r.row->info->name, name);
+    };
+    bool only_vp = true;
+    for (const Band& b : o.bands) only_vp = only_vp && row_is(b, kVramPackRow);
+    if (only_vp) return true;   /* the existing decode-only admission */
+
+    /* P1's T2 contract decodes the same packed mark as gemv_vp, but only on a weight TABLE:
+     * stacked weights take the ordinary block-form twin. Admit precisely the demonstrated M
+     * bands: gemv_vp through 16, then P1 through its bound, with no other reader in between. */
+    if (o.ranged_key != "M" || o.range_lo != 1 || o.range_hi <= 16 ||
+        o.range_hi > ds41p1::kTwinMaxRows || !o.schema || !o.schema->operands ||
+        o.schema->n_operands <= 1 || o.schema->operands[1].role != RAD_OPD_WTAB)
+        return false;
+    int64_t prev = 0;
+    bool low = false, high = false;
+    for (const Band& b : o.bands) {
+        if (b.hi <= prev || b.hi > o.range_hi) return false;
+        if (prev < 16) {
+            if (b.hi > 16 || !row_is(b, kVramPackRow)) return false;
+            low = true;
+        } else {
+            if (!row_is(b, ds41p1::kTwinRow)) return false;
+            high = true;
+        }
+        prev = b.hi;
+    }
+    return low && high && prev == o.range_hi;
+}
+
+}  /* namespace */
 
 int vram_pack_config(VramPackConfig* out) {
     *out = VramPackConfig{};
@@ -41,19 +79,15 @@ void vram_pack_eligible(const Program& prog, const RadFile& file, const VramPack
     out->assign(prog.weights.size(), VramPackWeight{});
     if (why) why->clear();
     if (!cfg.on) return;
-    /* Each weight's readers: 1 only gemv_vp tables, 2 anything else as well. A routed GEMM with a band
-     * another row took (a pass over 16 tokens) reads its table as block_mxfp4 there, so none of its
-     * weights may be packed. */
+    /* Each weight's readers: 1 only packed-aware tables, 2 anything else as well. Only gemv_vp
+     * alone, or its decode bands followed by the bounded packed-aware P1 twin, may read packed
+     * static residents. The ordinary tall twin and every unknown reader keep the block form. */
     std::vector<uint8_t> state(prog.weights.size(), 0);
     int64_t vp_ops = 0, other_ops = 0;
     std::string other;
     for (const OpInfo& o : prog.ops) {
         if (o.weights.empty()) continue;
-        bool vp = o.op == "moe_gemm_ggml" && !o.bands.empty();
-        for (const Band& b : o.bands) {
-            const Resolved& r = b.dom[RAD_DOMAIN_DEVICE];
-            vp = vp && r && r.row->info && r.row->info->name && !std::strcmp(r.row->info->name, kVramPackRow);
-        }
+        const bool vp = packed_table_reader(o);
         for (size_t k = 0; k < o.weights.size(); ++k) {
             const rad_weight w = o.weights[k];
             if (w == 0 || (size_t)w >= prog.weights.size()) continue;
@@ -75,8 +109,8 @@ void vram_pack_eligible(const Program& prog, const RadFile& file, const VramPack
         }
     }
     if (why && other_ops)
-        *why = fmt("%lld routed moe_gemm_ggml op(s) have a band %s does not serve (passes over its 16 tokens, "
-                   "or another type), so their experts stay block_mxfp4 in VRAM; the first: %s",
+        *why = fmt("%lld routed moe_gemm_ggml op(s) have a band %s does not serve alone or in the bounded "
+                   "packed-aware P1 combination, so their experts stay block_mxfp4 in VRAM; the first: %s",
                    (long long)other_ops, kVramPackRow, other.c_str());
     if (why && !vp_ops && !other_ops) *why = "no moe_gemm_ggml op reads a weight table";
 

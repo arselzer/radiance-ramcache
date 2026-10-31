@@ -1538,7 +1538,7 @@ int FileStager::lcp_init(const Program& prog, int64_t C) {
         p1::Tunables t;
         if (p1::parse_tunables([](const char* k) { return std::getenv(k); }, &t, nullptr)) {
             p1_min_rows_ = t.min_rows;
-            p1_lend_asked_ = t.lend > 0;
+            p1_lend_asked_ = t.lend > 0 || t.lend_arena > 0;
         }
     }
     if (xt && *xt && std::strcmp(xt, "1") != 0)
@@ -4844,6 +4844,16 @@ int FileStager::p1_lend_arena(char* lo, int64_t bytes, int64_t rows, std::functi
     if (!p1_lend_arena_asked() || p1_->lending() || !full) {
         if (why) *why = "the card path does not wait for the arena, or lends already";
         return RAD_E_STATE;
+    }
+    /* The CPU path keeps a layer's gate_up operand addresses from an earlier pass (hx_capture), and a
+     * change of arena level moves them: only early issue's refetch takes the move, so without it (or
+     * with the M1 trace, which forces the ordinary path) the first pass after each level change would
+     * stop at its gate_up. */
+    if (!hx_early_ || trace_requested_) {
+        if (why)
+            *why = fmt("the lent arena needs RADIANCE_EXPERIMENTAL_DS41_EARLY_ISSUE=1 and no %s: an arena level change "
+                       "moves the gate_up operands the CPU path fetched from", kM1PrefetchTraceEnv);
+        return RAD_E_INVAL;
     }
     const std::vector<char*> slots = p1::arena_slots(lo, bytes, p1_tun_.lend_arena);
     if (slots.empty()) {

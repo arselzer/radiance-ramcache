@@ -525,6 +525,12 @@ add_test(NAME ab_window_vp_test COMMAND bash ${CMAKE_SOURCE_DIR}/tools/ds41-host
 set_tests_properties(ab_window_vp_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT}
                      ENVIRONMENT "ROCR_VISIBLE_DEVICES=99")
 add_test(NAME ab_window_n128_test COMMAND bash ${CMAKE_SOURCE_DIR}/tools/ds41-host-experts/ab_window_n128_test.sh)
+add_test(NAME ds41_index_b16_gate_test COMMAND python3 -I ${CMAKE_SOURCE_DIR}/tools/ds41-host-experts/ds41_index_b16_gate_test.py)
+set_tests_properties(ds41_index_b16_gate_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT}
+  ENVIRONMENT "${RAD_TEST_ENV}")
+add_test(NAME ab_window_index_b16_test COMMAND bash ${CMAKE_SOURCE_DIR}/tools/ds41-host-experts/ab_window_index_b16_test.sh)
+set_tests_properties(ab_window_index_b16_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT}
+  ENVIRONMENT "ROCR_VISIBLE_DEVICES=99")
 set_tests_properties(ab_window_n128_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT}
                      ENVIRONMENT "ROCR_VISIBLE_DEVICES=99")
 # ab_window.sh's P1 parts (P1, QmN, QlK, QhMS): the server-log gate on synthetic logs and the arm loop with

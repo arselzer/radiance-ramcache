@@ -311,7 +311,21 @@ xt_check() {   # name
   [[ -n "${ARM_BT:-}" ]] && grep -m1 -E 'chunk geometry: ' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   ar_rows_server_check "$name" || return 1
   ag_rows_server_check "$name" || return 1
+  if declare -F index_b16_server_check >/dev/null; then
+    index_b16_server_check "$name" || return 1
+  elif [[ -n "${ARM_INDEX_B16:-}" ]]; then return 1; fi
   lcp_check "$name"
+}
+
+index_b16_server_check() {
+  local name=$1 gate=${INDEX_B16_GATE:-$HERE/ds41_index_b16_gate.py}
+  if [[ ! -f "$gate" ]]; then
+    [[ -z "${ARM_INDEX_B16:-}" ]] && ! grep -qF 'ds41 index b16' "$OUT/$name.server.log"
+    return $?
+  fi
+  python3 -I "$gate" server --enabled "${ARM_INDEX_B16:-0}" --log "$OUT/$name.server.log" \
+    --cohort "${INDEX_B16_COHORT:-}" --receipt "${INDEX_B16_RECEIPT:-}" --window-id "${INDEX_B16_WINDOW_ID:-MISSING_WINDOW_ID}" \
+    --engine "$BIN" --home "${ARM_HOME:-$RHOME}"
 }
 
 ar_rows_parse() {   # ArN, positive whole rows; bounded spelling avoids shell arithmetic overflow
@@ -729,6 +743,10 @@ kld_finish() {   # name; the run is SERVER_PID
   if [[ -z "$KLD_REF" ]]; then
     # The reference must be a plain 16-token arm's bits: a feature arm first (the plain one failed
     # or is missing) would let a later feature arm be compared with another one.
+    if [[ -n "${ARM_INDEX_B16:-}" ]]; then
+      log "arm $name: an Ib16 arm cannot be the window's kld reference; not compared"
+      return 1
+    fi
     if [[ -n "${ARM_XT:-}${ARM_LC:-}${ARM_N128:-}${ARM_AR_ROWS:-}${ARM_AG_ROWS:-}" || ${ARM_KVFP4:-0} == 1 || ${ARM_KVFAST:-0} == 1 ]]; then
       log "arm $name: an Xt, Lc, Fn128, Ar, Ag or packed-KV arm cannot be the window's kld reference (no plain Kld arm finished before it); not compared"
       return 1
@@ -1991,6 +2009,17 @@ for kv_arm in $ARMS; do
   [[ $kv_fast == 1 ]] && kv_check "$kv_home" "$kv_lib" 1
 done
 KV_PROOFS_OPEN=0
+# Fresh three-profile oracle for Ib16, after QFN stopped and before ANY enabled arm.
+# The launcher must supply explicit source/artifact authority and its live lock holder.
+INDEX_B16_WINDOW_ID="$OUT:$$:$(date +%s%N)" # fresh even when a caller reuses an OUT directory
+if [[ " ${DEVICE_CHECKS:-1} " == *" index_b16 "* ]]; then
+  INDEX_B16_RECEIPT=${INDEX_B16_RECEIPT:-$OUT/index-b16-card.json}
+  if [[ -f "${INDEX_B16_GATE:-$HERE/ds41_index_b16_gate.py}" && -n "${INDEX_B16_COHORT:-}" && -n "${INDEX_B16_LOCK_HOLDER_PID:-}" ]]; then
+    python3 -I "${INDEX_B16_GATE:-$HERE/ds41_index_b16_gate.py}" card --inside-guarded-window \
+      --cohort "$INDEX_B16_COHORT" --window-id "$INDEX_B16_WINDOW_ID" --lock-holder-pid "$INDEX_B16_LOCK_HOLDER_PID" \
+      --out "$INDEX_B16_RECEIPT" >>"$OUT/window.log" 2>&1 || log 'index_b16 oracle failed; Ib16 arms will refuse'
+  else log 'index_b16 oracle authority/helper missing; Ib16 arms will refuse'; fi
+fi
 
 HX=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=$HX_THREADS RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU=$SILU)
 CANCEL=${CANCEL_FILE:-/home/as/ds41-claude-build/work/cancel_window}
@@ -2228,7 +2257,7 @@ for a in $ARMS; do
   pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 HOST_POOL_MIB=4096 EXTRA_ARGS="" ARM_HOME="$RHOME" ARM_CONC=
   ARM_PROMPTS= ARM_N= ARM_LQ= rt=
   power="" skip="" ARGS=() f8="" f8x="" rb="" rbf=0 pred="" cs="" ck="" kh="" pc="" pcopt="" fw="" wp="" wl=""
-  fn128=""
+  fn128="" index_b16=""
   kvfp4="" kvfast=""
   arm_checkpoint_interval=2048
   psc="" prs=12 pk="" pw="" ns="" pv=""
@@ -2266,6 +2295,7 @@ for a in $ARMS; do
       Fn128)   fn128=1 ;;                  # exact n128 fused norm; byte oracle and per-rank dispatch proof
       Kvfp4)   if [[ -n "$kvfp4" ]]; then log "arm $a: duplicate Kvfp4; skipped"; skip=1; else kvfp4=1; fi ;;
       Kvfast)  if [[ -n "$kvfast" ]]; then log "arm $a: duplicate Kvfast; skipped"; skip=1; else kvfast=1; fi ;;
+      Ib16)    index_b16=1 ;;              # lossless16-bit index score plane; fresh same-cohort card proof
       F8)      f8=1 ;;                     # FP8-sourced dense linears from E4M3 codes (gemm_nt_bf16f8)
       F8n)     f8=1 f8x='*_shexp.weight' ;;   # the same, the shared expert left bf16
       i[0-9]*) env+=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_INSERT_THREADS=${p#i}) ;;
@@ -2529,6 +2559,15 @@ for a in $ARMS; do
   # max_tok+max_seqs rows, so check that conservative bound as well as the library SHA.
   env+=(RADIANCE_EXPERIMENTAL_DS41_N128=${fn128:-0})
   ARM_N128=$fn128
+  env+=(RADIANCE_EXPERIMENTAL_DS41_INDEX_SCORE_BF16=${index_b16:-0})
+  ARM_INDEX_B16=$index_b16
+  if [[ -n "$index_b16" ]]; then
+    if ! python3 -I "${INDEX_B16_GATE:-$HERE/ds41_index_b16_gate.py}" receipt \
+      --cohort "${INDEX_B16_COHORT:-}" --receipt "${INDEX_B16_RECEIPT:-}" --window-id "${INDEX_B16_WINDOW_ID:-MISSING_WINDOW_ID}" \
+      --engine "$BIN" --home "$ARM_HOME"; then
+      log "arm $a: Ib16 refuses missing/stale/different-cohort card proof; skipped"; skip=1
+    fi
+  fi
   if [[ -n "$fn128" ]]; then
     IFS=: read -r -a homes <<< "$ARM_HOME"
     lib=""

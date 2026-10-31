@@ -265,6 +265,16 @@ void Image::timing_log(const char* operation, int status) const noexcept {
     if (complete) RAD_INFO("%s",line);
     else RAD_ERR("DSBANKTIME operation=%s enabled=1 invalid=log_overflow",operation);
 }
+void Image::complement_log(const char* operation, int status) const noexcept {
+    if(!stats_.complement_words)return;
+    const auto& w=stats_.complement_work;
+    RAD_INFO("DSBANKCOMPLEMENT event operation=%s enabled=1 status=%d ready=%d failed=%d scope=cohort_all4ranks "
+             "restores=%llu word_calls=%llu word_bytes=%llu byte_calls=%llu byte_bytes=%llu workspace=%lld",
+             operation,status,ready_,failed_,(unsigned long long)stats_.completed_restores,
+             (unsigned long long)w.word_calls,(unsigned long long)w.word_bytes,
+             (unsigned long long)w.byte_calls,(unsigned long long)w.byte_bytes,
+             (long long)kComplementWordWorkspaceBytes);
+}
 int Image::capture(const std::array<ImageRank, kDraftRanks>& ranks, const DraftBankBackupBudget& b,
                    int64_t metadata, DraftBankBackupIO* io, std::string* why) {
     if (attempted_) return poison("bank image capture is one-shot", why);
@@ -377,7 +387,9 @@ int Image::verify(int rank, int span, std::string* why, VerifyPhase phase) {
     // tails. Ordinary constant poison cannot guarantee this for arbitrary data.
     int64_t timed=timing_begin();
     if (stats_.complement_words) {
-        if (!complement_words(back, saved, s.bytes)) return poison("invalid bank complement range", why);
+        ComplementWork work;
+        if (!complement_words(back, saved, s.bytes, &work)) return poison("invalid bank complement range", why);
+        if (!stats_.complement_work.add(work)) return poison("bank complement counter overflow", why);
     } else {
         for (int64_t j = 0; j < s.bytes; ++j) back[j] = uint8_t(~saved[j]);
     }
@@ -461,6 +473,7 @@ int DraftBankBackup::capture(const DraftBankBackupRanks& ranks, int n, const Dra
                                   io ? io : &device_io_, why);
     const int result=rc<0?rc:validate_invariants(why);
     image_.timing_log("capture",result);
+    image_.complement_log("capture",result);
     return result;
 }
 int DraftBankBackup::check_pointers(std::string* why) {
@@ -483,6 +496,7 @@ int DraftBankBackup::restore_verify_all(std::string* why) {
     if (rc >= 0) rc = image_.restore_verify_all(why);
     if (rc >= 0) rc = validate_invariants(why);
     image_.timing_log("restore",rc);
+    image_.complement_log("restore",rc);
     return rc;
 }
 int DraftBankBackup::slots(int rank) const noexcept {

@@ -66,9 +66,19 @@ masks, fixed bank addresses and all-rank readiness/failure latch are unchanged.
 Every unread byte still disagrees with its own immutable saved byte. No partial
 restore, sampled verification, hash authority or mask repair is introduced.
 
+Enabled mode records checked cumulative `word_calls/word_bytes` only after an
+actual successful word loop; scalar tails/overlap fallbacks have distinct
+`byte_calls/byte_bytes`. Empty and sub-word spans cannot fake word use. Native
+capture/restore emit enabled-only `DSBANKCOMPLEMENT event` status/readiness/
+cohort receipts after the same wrapper invariant checks. Counts must reconcile
+to the unchanged three complement timing buckets. Native pair/mask sizes are
+all multiples of8, so successful native mode requires zero scalar bytes and
+positive word coverage of EVERY readback byte. Counter overflow poisons readiness.
+
 All retained `sizeof(Image)`/controller metadata remains charged. Enabled mode
-also conservatively charges128B for bounded transient word/address/index/call
-locals BEFORE pinned allocation. There is no new pinned/pageable payload or
+also conservatively charges8192B for bounded transient word/address/index/call
+locals and enabled-only receipt formatting (including the existing4096B logger
+buffer) BEFORE pinned allocation. There is no new pinned/pageable payload or
 additional relay, and no automatic cache-budget expansion or RAM-size premise.
 Future unbacked expert-cache and configured headroom reservations are unchanged.
 Compiler codegen still needs review: the old loop may already vectorize, or
@@ -80,7 +90,7 @@ Host targets are exact `draft_bank_backup_test` and `draft_bank_lend_test`, unde
 build.lock with GPU labels excluded. New backup cases cover all byte values,
 unaligned source/destination offsets, lengths around8/16/32/64/128 and256, zero/
 null/invalid address ranges, both overlap directions, untouched guards, exact
-old/new copy order/hash/coverage,128B accounting, and successful-but-short
+old/new copy order/hash/coverage,8192B accounting, and successful-but-short
 capture/H2D/D2H faults on every rank. Config cases preserve existing callers and
 prove strict opt-in/dependency behavior. No timing threshold is a host assertion.
 

@@ -198,6 +198,9 @@ void complement_proof(Cohort& cards,DraftBankBackupDeviceIO& real,DraftBankBacku
         need(io.cursor==order.size&&words.stats().capture_copy_bytes==capture_bytes&&
              words.stats().restore_copy_bytes==restore_bytes&&words.stats().verify_copy_bytes==verify_bytes,
              "old/new native copy coverage differs");
+        const auto& used=words.stats().complement_work;
+        need(used.word_calls==uint64_t(24*cards.hot_n+36)&&used.word_bytes==uint64_t(verify_bytes)&&
+             used.byte_calls==0&&used.byte_bytes==0,"native word-loop use counters do not cover every readback byte");
         // Real successful-but-short final-byte D2H on the last card. The source
         // device bytes are correct, so the complement itself must make the
         // missing readback byte disagree (including the seeded zero tail).

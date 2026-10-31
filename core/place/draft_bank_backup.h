@@ -4,6 +4,7 @@
 #pragma once
 #include "draft_vram.h"
 #include "draft_bank_timing.h"
+#include "draft_bank_complement.h"
 #include "rad_device.h"
 
 #include <array>
@@ -49,6 +50,7 @@ struct DraftBankBackupStats {
     uint64_t image_hash = 0; // diagnostic only; strict memcmp decides readiness
     uint64_t completed_restores = 0;
     bool complement_words = false;
+    draft_bank_backup_detail::ComplementWork complement_work{};
     DraftBankTimings timings{}; // included in sizeof(Image)/Loan accounting, even when off
 };
 
@@ -146,6 +148,7 @@ private:
     int64_t timing_begin() const noexcept;
     int timing_end(DraftBankTimingPart, int64_t start, int64_t bytes, bool success, std::string* why);
     void timing_log(const char* operation, int status) const noexcept;
+    void complement_log(const char* operation, int status) const noexcept;
     void release() noexcept;
     std::array<ImageRank, kDraftRanks> ranks_{};
     std::array<void*, kDraftRanks> allocation_{};

@@ -545,6 +545,14 @@ TEST(draft_bank_complement_words_image_preserves_hash_copy_order_bytes_and_fixed
         CHECK_EQ(x.attempts,y.attempts);CHECK_EQ(x.ok,y.ok);
         CHECK_EQ(x.requested_bytes,y.requested_bytes);CHECK_EQ(x.ok_bytes,y.ok_bytes);
     }
+    uint64_t calls=0,bytes=0;
+    for(auto part:{DraftBankTimingPart::CaptureComplement,DraftBankTimingPart::RestoreComplement,DraftBankTimingPart::InvariantComplement}){
+        const auto& c=ib.stats().timings.part[size_t(part)];calls+=c.ok;bytes+=c.ok_bytes;
+    }
+    CHECK_EQ(ia.stats().complement_work.word_calls,uint64_t{0});
+    CHECK_EQ(ib.stats().complement_work.word_calls,calls); // all tiny spans contain at least one word
+    CHECK_EQ(ib.stats().complement_work.byte_calls,calls); // each tiny span also has a one-byte tail
+    CHECK_EQ(ib.stats().complement_work.word_bytes+ib.stats().complement_work.byte_bytes,bytes);
 }
 
 TEST(draft_bank_complement_words_short_capture_and_restore_readbacks_stay_fatal) {
@@ -581,6 +589,31 @@ TEST(draft_bank_complement_words_workspace_cap_refuses_before_any_allocation) {
     CHECK_EQ(word_io.rooms,0);CHECK_EQ(word_io.allocs,0);CHECK_EQ(word_io.copies,0);
     CHECK(words.failed());CHECK(!words.ready());
     CHECK_EQ(words.stats().total_charge_bytes,old.stats().cap_bytes+d::kComplementWordWorkspaceBytes);
+}
+
+TEST(draft_bank_complement_words_counts_only_actual_word_loops_and_checks_overflow) {
+    std::array<uint8_t,64> source{},out{};d::ComplementWork work;
+    CHECK(d::complement_words(out.data(),source.data(),17,&work));
+    CHECK_EQ(work.word_calls,uint64_t{1});CHECK_EQ(work.word_bytes,uint64_t{16});
+    CHECK_EQ(work.byte_calls,uint64_t{1});CHECK_EQ(work.byte_bytes,uint64_t{1});
+    CHECK(d::complement_words(out.data(),source.data(),7,&work));
+    CHECK_EQ(work.word_calls,uint64_t{0});CHECK_EQ(work.word_bytes,uint64_t{0});
+    CHECK_EQ(work.byte_calls,uint64_t{1});CHECK_EQ(work.byte_bytes,uint64_t{7});
+    CHECK(d::complement_words(source.data()+1,source.data(),17,&work));
+    CHECK_EQ(work.word_calls,uint64_t{0});CHECK_EQ(work.word_bytes,uint64_t{0});
+    CHECK_EQ(work.byte_calls,uint64_t{1});CHECK_EQ(work.byte_bytes,uint64_t{17});
+    CHECK(d::complement_words(nullptr,nullptr,0,&work));
+    CHECK_EQ(work.word_calls+work.word_bytes+work.byte_calls+work.byte_bytes,uint64_t{0});
+    CHECK(!d::complement_words(nullptr,nullptr,-1,&work));
+    auto fields=[](const d::ComplementWork& w){return std::array<uint64_t,4>{w.word_calls,w.word_bytes,w.byte_calls,w.byte_bytes};};
+    for(int column=0;column<4;++column){
+        d::ComplementWork total{1,2,3,4},one{1,1,1,1};
+        if(column==0)total.word_calls=UINT64_MAX;
+        if(column==1)total.word_bytes=UINT64_MAX;
+        if(column==2)total.byte_calls=UINT64_MAX;
+        if(column==3)total.byte_bytes=UINT64_MAX;
+        const auto before=fields(total);CHECK(!total.add(one));CHECK(fields(total)==before);
+    }
 }
 
 RAD_TEST_MAIN()

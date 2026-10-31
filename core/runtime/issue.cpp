@@ -819,15 +819,17 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
                                           "plugin must not do", i, g));
             const KVPoolBinding& b = kv_[g];
             if (b.storage_format != RAD_KV_STORAGE_PLAIN) {
-                long long declared_format = -1;
+                long long declared_format = -1, actual_format = -1;
                 const char*format_key=b.storage_format==RAD_KV_STORAGE_DS41_FP8_WINDOW_G32&&p.info&&
                     p.info->op=="attn_sparse_sink_windowpack"?"window_format":"kv_format";
                 if (p.info) (void)p.info->base.get_i(format_key, &declared_format);
+                /* Missing/non-integer resolved parameters leave the refusal sentinel intact. */
+                (void)rad_args_geti(&ip.args, format_key, &actual_format);
                 const char* why = kv_storage_operand_error(b.storage_format,
                     p.info ? p.info->op.c_str() : nullptr,
                     ip.row && ip.row->info ? ip.row->info->name : nullptr,
                     ip.row && ip.row->info ? ip.row->info->op : nullptr, i, declared_format,
-                    rad_args_geti(&ip.args, format_key, -1));
+                    actual_format);
                 if (why) return abort_step_msg(h, RAD_E_SHAPE,
                     fmt("operand %d names packed KV group %u: %s", i, g, why));
                 const int64_t pitch = b.storage_format==RAD_KV_STORAGE_DS41_FP8_WINDOW_G32?16*528:

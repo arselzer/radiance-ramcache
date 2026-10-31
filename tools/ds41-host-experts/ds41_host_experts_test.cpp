@@ -14,6 +14,9 @@
  *                                           today's jobs of four rows against one job of every row
  *                                           (gemv_avx2_many) and the pool's even cuts at 32 and 64
  *                                           rows a job (..._MAX_ROWS)
+ *   ds41_host_experts_test rbench-stream [experts] [threads] [packed|planes] [1]
+ *                                           same working set, pool, tiles, warm-up and samples as
+ *                                           rbench at one row; only old vs direct-consume GEMV.
  *   ds41_host_experts_test rhot [reps] [rows] [block|packed|planes] [n] [tile]  few and many rows, one
  *                                           matrix in cache, one thread, in 64-row tiles
  *   ds41_host_experts_test insbench [experts] [threads] [units] [batch]  the pool's packed GEMV, `batch`
@@ -1148,7 +1151,14 @@ struct RJob {
     std::atomic<bool> open{ false };
 };
 
-int rbench(int experts, int threads, const char* layout, const std::vector<int>& row_counts, const std::string& dir) {
+int rbench(int experts, int threads, const char* layout, const std::vector<int>& row_counts, const std::string& dir,
+           bool stream_mode = false) {
+    if (stream_mode && (experts < 1 || experts > 256 || threads < 1 || threads > 256 || row_counts.empty() ||
+        (std::strcmp(layout, "packed") && std::strcmp(layout, "planes")) ||
+        std::any_of(row_counts.begin(), row_counts.end(), [](int r) { return r != 1; }))) {
+        std::fprintf(stderr, "rbench-stream requires 1..256 experts/threads, packed|planes, and only row count 1\n");
+        return 2;
+    }
     const int lay = !std::strcmp(layout, "block") ? 0 : !std::strcmp(layout, "planes") ? 2 : 1;
     const char* const lname[3] = { "block_mxfp4", "packed", "planes" };
     std::printf("building %d distinct experts as %s (%.1f GB)...\n", experts, lname[lay], experts * 18.8e6 / 1e9);
@@ -1182,6 +1192,15 @@ int rbench(int experts, int threads, const char* layout, const std::vector<int>&
         D[(size_t)i] = lay == 0 ? b.ggml() : b.planes();
     }
     std::printf("scales: %s\n", ids.empty() ? "synthetic release mix" : "the research sample's");
+    if (stream_mode) {
+        size_t weight_bytes = 0;
+        for (int i = 0; i < experts; ++i)
+            weight_bytes += lay == 1 ? pgu[(size_t)i].bytes + pdn[(size_t)i].bytes
+                                    : gu[(size_t)i].codes.size() + gu[(size_t)i].scales.size() +
+                                      dn[(size_t)i].codes.size() + dn[(size_t)i].scales.size();
+        std::printf("DS41HX_STREAM_BENCH working_set_bytes=%zu experts=%d rows=1 warmup=same_as_rbench samples=7 "
+                    "timed_call_counters=0 cache_flush=0\n", weight_bytes, experts);
+    }
     std::vector<float> silu(65536);
     silu_table_host(silu.data(), kLimit);
     int rmax = 1;
@@ -1195,9 +1214,11 @@ int rbench(int experts, int threads, const char* layout, const std::vector<int>&
     Pool pool(threads);
     using Kern = void (*)(const Mx&, const uint16_t* const*, uint16_t* const*, int, int, int);
     constexpr int kV = 5;
+    const int variants = stream_mode ? 2 : kV;
     const char* const vname[kV] = { "four", "rows", "many", "m32", "m64" };
     const Kern kern[kV] = { gemv_avx2_few, gemv_avx2_rows, gemv_avx2_many, gemv_avx2_many, gemv_avx2_many };
     double one_row = 0;   /* four's ms an expert at one row */
+    bool stream_ok = true;
     for (int R : row_counts) {
         R = std::max(1, std::min(R, kRbRows));
         const double bytes = 18.80064e6;
@@ -1224,8 +1245,9 @@ int rbench(int experts, int threads, const char* layout, const std::vector<int>&
                 }
         };
         std::vector<std::unique_ptr<RJob>> jobs[kV];
-        for (int v = 0; v < kV; ++v) build(v, jobs[v]);
-        auto run = [&](int v) {
+        for (int v = 0; v < variants; ++v) build(v, jobs[v]);
+        std::atomic<size_t> proof_calls{ 0 }, proof_fast{ 0 }, proof_fallback_only{ 0 };
+        auto run = [&](int v, bool proof = false) {
             std::vector<std::unique_ptr<RJob>>& js = jobs[v];
             for (auto& j : js) {
                 j->next.store(0, std::memory_order_relaxed);
@@ -1249,15 +1271,25 @@ int rbench(int experts, int threads, const char* layout, const std::vector<int>&
                             break;
                         }
                         if (!got) continue;
+                        auto project = [&](const Mx& w, const uint16_t* const* x, uint16_t* const* y, int n0, int n1) {
+                            if (stream_mode && v == 1) {
+                                const bool used = gemv_avx2_stream(w, x[0], y[0], n0, n1);
+                                // Only the explicit untimed byte proof counts. No timed atomics.
+                                if (proof) {
+                                    proof_calls.fetch_add(1, std::memory_order_relaxed);
+                                    (used ? proof_fast : proof_fallback_only).fetch_add(1, std::memory_order_relaxed);
+                                }
+                            } else k(w, x, y, j.rows, n0, n1);
+                        };
                         if (t < 72) {
-                            k(*j.gu, j.x, j.gate_up, j.rows, t * 64, t * 64 + 64);
+                            project(*j.gu, j.x, j.gate_up, t * 64, t * 64 + 64);
                             if (j.gu_left.fetch_sub(1, std::memory_order_acq_rel) == 1) {
                                 for (int i = 0; i < j.rows; ++i) swiglu_avx2(silu.data(), j.gate_up[i], j.act[i], kFf, kLimit);
                                 j.open.store(true, std::memory_order_release);
                             }
                         } else {
                             const int d = t - 72;
-                            k(*j.dn, j.act, j.y, j.rows, d * 64, d * 64 + 64);
+                            project(*j.dn, j.act, j.y, d * 64, d * 64 + 64);
                             if (j.dn_left.fetch_sub(1, std::memory_order_acq_rel) == 1) done.fetch_add(1, std::memory_order_acq_rel);
                         }
                     }
@@ -1266,17 +1298,28 @@ int rbench(int experts, int threads, const char* layout, const std::vector<int>&
             });
             return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         };
+        if (stream_mode) {
+            // Same buffers/weights/tiling, all three host-chain stages, before timing either arm.
+            run(0);
+            const auto old_gu = gub, old_act = acb, old_down = yb;
+            run(1, true);
+            const bool exact = old_gu == gub && old_act == acb && old_down == yb;
+            const size_t calls = proof_calls.load(), fast = proof_fast.load(), fallback = proof_fallback_only.load();
+            std::printf("DS41HX_STREAM_BENCH proof=untimed calls=%zu calls_with_fast=%zu calls_fallback_only=%zu "
+                        "gu_act_down_equal=%d\n", calls, fast, fallback, exact ? 1 : 0);
+            if (!exact || calls != (size_t)152 * experts || !fast || calls != fast + fallback) return 1;
+        }
         const int passes = std::max(1, 64 / (experts * R) + 1), samples = 7;
         auto timed = [&](int v) {
             double s = 0;
             for (int p = 0; p < passes; ++p) s += run(v);
             return s / passes;
         };
-        for (int v = 0; v < kV; ++v) timed(v);   /* warm the code and the pages, not the caches */
+        for (int v = 0; v < variants; ++v) timed(v);   /* warm the code and the pages, not the caches */
         std::vector<double> ts[kV];
         size_t bad[kV] = {};
         for (int rep = 0; rep < samples; ++rep)
-            for (int v = 0; v < kV; ++v) {
+            for (int v = 0; v < variants; ++v) {
                 std::fill(yb.begin(), yb.end(), (uint16_t)0xffff);
                 ts[v].push_back(timed(v));
                 if (v == 0 && rep == 0) y4 = yb;
@@ -1285,20 +1328,27 @@ int rbench(int experts, int threads, const char* layout, const std::vector<int>&
                         for (size_t i = 0; i < (size_t)R * kEmbd; ++i) bad[v] += yb[(size_t)e * per_e + i] != y4[(size_t)e * per_e + i];
             }
         double med[kV];
-        for (int v = 0; v < kV; ++v) {
+        for (int v = 0; v < variants; ++v) {
             std::sort(ts[v].begin(), ts[v].end());
             med[v] = 1e3 * ts[v][(size_t)samples / 2] / experts;
         }
         if (R == 1 || one_row == 0) one_row = med[0];
         std::printf("%2d rows, %d threads, %d experts, %s: median ms an expert (best, worst), per row past the first:\n", R, threads,
                     experts, lname[lay]);
-        for (int v = 0; v < kV; ++v) {
+        for (int v = 0; v < variants; ++v) {
             const int reads = v == 0 ? (R + 3) / 4 : v == 3 ? (R + 31) / 32 : v == 4 ? (R + 63) / 64 : 1;
-            std::printf("   %-4s %8.4f (%.4f, %.4f)  %.4f ms a row, %+.4f ms each row more%s  %5.1f GB/s  rows %s\n", vname[v], med[v],
+            const char* name = stream_mode ? (v == 0 ? "old" : "stream") : vname[v];
+            std::printf("   %-4s %8.4f (%.4f, %.4f)  %.4f ms a row, %+.4f ms each row more%s  %5.1f GB/s  rows %s\n", name, med[v],
                         1e3 * ts[v][0] / experts, 1e3 * ts[v][(size_t)samples - 1] / experts, med[v] / R,
                         R > 1 ? (med[v] - one_row) / (R - 1) : 0.0, R > 1 ? "" : " (one row)", bytes * reads / (med[v] * 1e-3) / 1e9,
                         bad[v] ? "DIFFER" : "identical");
+            if (stream_mode && bad[v]) stream_ok = false;
         }
+    }
+    if (stream_mode) {
+        std::printf(stream_ok ? "PASS: rbench-stream full outputs equal old host; timings include unchanged pool/tile/SwiGLU work\n"
+                              : "FAIL: rbench-stream output bytes differ\n");
+        return stream_ok ? 0 : 1;
     }
     return 0;
 }
@@ -1377,6 +1427,13 @@ int rhot(int reps, int rows, const char* layout, int n, int tile) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (argc > 1 && !std::strcmp(argv[1], "rbench-stream")) {
+        std::vector<int> rows;
+        for (int i = 5; i < argc; ++i) rows.push_back(std::atoi(argv[i]));
+        if (rows.empty()) rows = { 1 };
+        return rbench(argc > 2 ? std::atoi(argv[2]) : 32, argc > 3 ? std::atoi(argv[3]) : 40,
+                      argc > 4 ? argv[4] : "packed", rows, sample_dir(0, argv, 1), true);
+    }
     if (argc > 1 && !std::strcmp(argv[1], "rbench")) {
         /* rbench [experts] [threads] [block|packed|planes] [rows...] */
         std::vector<int> rows;

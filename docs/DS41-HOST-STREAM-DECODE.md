@@ -1,6 +1,6 @@
 # Native one-row decode-to-MAC prototype
 
-Source prepared off389bf676. Default off, unbuilt, untested and unmeasured. This is the narrow
+Source prepared off `389bf676`. Default off, unbuilt, untested and unmeasured. This is the narrow
 first experiment from `/home/as/ds41-decode-review-20261028/CPU-KERNEL-NEXT.md`, not an FMA
 experiment or an adopted configuration. Root owns all serialized builds, assembly checks,
 host/card gates and model windows. Query-free work is separate.
@@ -88,16 +88,45 @@ Then the root gates, in order:
    reloads, confirm no FMA or extra partial sums and no register-pressure regression. Direct
    consumption lengthens decode/accumulator live ranges; source alone proves no speed gain.
    Include flag0 old-wrapper code, since their optional internal stream dispatch shares storage.
-2. A separately bound micro driver must call `gemv_avx2_stream` / `_lanes` directly and compare
-   full output bytes before timing. Test hot and DRAM-sized distinct experts, GU/DN and a full
-   chain, packed/planar and lean/no-lean, then40-thread pool-shaped work. Avoid an L2-only claim
-   when current192GiB serving is bandwidth limited; retain smaller-cache/spill functional gates.
-   Existing `ds41_host_experts_test rbench` still calls the OLD entry and cannot prove this path.
-3. Inside the normal stopped-QFN, both-lock GPU window, run an actual stream host→GPU chain
-   oracle with card-captured SwiGLU table and fresh source/library hashes. Existing
-   `ds41_mxfp4_device_check ... check` still calls the OLD host entry; its PASS alone cannot be
-   used as the stream receipt. A new driver/mode or actual CPU-vs-card per-miss verification
-   must bind the new entry and require the first-use marker. No GPU checker mode was changed.
+2. `ds41_host_experts_test rbench-stream 32 40 packed 1` (repeat with `planes`) directly calls
+   `gemv_avx2_stream`, paired with the unchanged one-row entry on the same distinct experts,
+   activations, pool, 64-row tiles, explicit code/page warm-up, pass count and seven interleaved
+   timing samples as old `rbench`. It only admits row count 1 and native layouts. An additional
+   untimed preflight compares every gate/up, activation and down byte; it counts exactly
+   152 actual stream calls per expert and requires positive actual fast-use coverage. Counters
+   are disabled in timed passes. The source receipt labels them `proof=untimed`; zero fallback-only
+   calls can occur for a weight set with a fast round in every tile and is reported as zero.
+   Working-set bytes are actual allocated packed/planar bytes (including the existing benchmark's
+   exception capacity), not a bandwidth estimate. The conventional printed GB/s uses old rbench's
+   18.80064MB expert denominator for both arms. There is no cache flush; a small expert count
+   measures cache-hot work, while a DRAM-sized set is the relevant next gate. Treat preflight/load
+   and benchmark timing separately; only a model window measures full request costs. `_lanes`
+   and actual lean/Sc2 still need model/pool gates. Existing `rbench` continues to call the old
+   entry with its existing output; it alone cannot prove stream. No speed forecast is claimed.
+3. Inside the normal stopped-QFN, both-lock GPU window, build and run the new explicit mode:
+
+   ```
+   ds41_mxfp4_device_check LIBR4D.so check-stream 4 CAPTURED_SILU.bin
+   ```
+
+   It uses the same GPU launches and card table as old `check`, directly calls the stream entry
+   on planar AND packed copies of the exact GPU weight bytes, and compares all full GU/SwiGLU/DN
+   stages and the complete host chain to both the old host reference and current GPU. Profiles
+   cycle normal-fast, mixed first/last raw fallback, all-general scale112 and the old finite-edge
+   scales/activations; 4..64 trials are required. Host exceptional-value proofs remain mandatory
+   separately. For each layout its receipt requires `calls=4*expert_rows`, positive `calls_with_fast`
+   AND `calls_fallback_only`, `tail_calls=2*expert_rows`, and their actual call counts must sum.
+   These are per-CALL counts, not inferred fast/general ROUND counts. Final fields must be
+   `differing_gpu=0 differing_old=0 coverage=1`, followed by the literal marker:
+
+   ```
+   PASS: stream planar/packed gate_up swiglu down and full chain equal old host and libr4d
+   ```
+
+   Build the existing `mxfp4-check` Make target under the build lock, including its host object
+   rebuilt from this source, and bind fresh full source/library/checker/table hashes. Existing
+   `check` retains its old behavior/output and cannot serve as a stream receipt. CPU-vs-card
+   actual per-miss verification plus the first-use pool marker remains the model-path proof.
 4. Explicit flag0/1 model arms, all other knobs identical and current prompt sets unchanged,
    full texts/counts/Kh/KLD as appropriate versus same-cohort base and approved base. Require
    the actual-use marker in1 and its absence in0, TP4, current256GB/192GiB plus96GiB functional

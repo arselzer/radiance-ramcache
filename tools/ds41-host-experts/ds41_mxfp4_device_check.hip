@@ -284,7 +284,39 @@ std::vector<float> load_table(const char* path) {
     return t;
 }
 
-int check(const Lib& lib, int trials, const char* table_path) {
+/* `check-stream [4..64 trials] [table]`: all four profiles are required, both native layouts
+ * directly call the new entry, and all stages/full chains compare to the old host and GPU.
+ * Host native views of the SAME GPU block bytes; old checker modes remain unchanged. */
+struct StreamWeight {
+    std::vector<uint8_t> codes, scales, packed;
+    Mx planar, pk;
+    StreamWeight(const std::vector<uint8_t>& blocks, int N, int K) :
+        codes((size_t)N * K / 2), scales((size_t)N * K / 32) {
+        const int uk = K / 32;
+        for (int n = 0; n < N; ++n) for (int u = 0; u < uk; ++u) {
+            const uint8_t* b = blocks.data() + ((size_t)n * uk + u) * 17;
+            scales[(size_t)n * uk + u] = b[0];
+            for (int j = 0; j < 16; ++j) {
+                auto nibble = [&](int v) { return (b[1 + v % 16] >> (4 * (v / 16))) & 15; };
+                codes[(size_t)n * K / 2 + (size_t)u * 16 + j] = (uint8_t)(nibble(2 * j) | (nibble(2 * j + 1) << 4));
+            }
+        }
+        planar.N = N; planar.K = K; planar.codes = codes.data(); planar.scales = scales.data();
+        PackInfo plan;
+        if (!pack_plan(scales.data(), N, K, &plan)) { std::fprintf(stderr, "stream pack_plan refused\n"); std::exit(2); }
+        packed.resize(packed_bytes(N, K, plan.n_exc));
+        if (pack_planes(codes.data(), scales.data(), N, K, plan.n_exc, plan, packed.data(), packed.size()) != kPackOk ||
+            !packed_view(packed.data(), packed.size(), N, K, &pk) || !packed_scales_equal(pk, scales.data())) {
+            std::fprintf(stderr, "stream pack roundtrip refused\n"); std::exit(2);
+        }
+    }
+};
+
+int check(const Lib& lib, int trials, const char* table_path, bool stream = false) {
+    if (stream && (trials < 4 || trials > 64)) {
+        std::fprintf(stderr, "check-stream requires 4..64 trials to cover fast/mixed/general/edge profiles\n");
+        return 2;
+    }
     const std::vector<float> silu = load_table(table_path);
     hipStream_t s;
     HC(hipStreamCreate(&s));
@@ -297,6 +329,8 @@ int check(const Lib& lib, int trials, const char* table_path) {
     Dev tab_gu(kNe * sizeof(void*)), tab_dn(kNe * sizeof(void*)), d_sorted(kTop * 4), d_off((kNe + 1) * 4);
     Dev d_x(kEmbd * 2), d_gu((size_t)kTop * 2 * kFf * 2), d_act((size_t)kTop * kFf * 2), d_dn((size_t)kTop * kEmbd * 2);
     size_t bad_gu = 0, bad_act = 0, bad_dn = 0, bad_chain = 0, rows = 0;
+    size_t stream_calls[2] = {}, stream_fast[2] = {}, stream_fallback_only[2] = {}, stream_tail_calls[2] = {};
+    size_t stream_bad_gpu = 0, stream_bad_old = 0;
     for (int trial = 0; trial < trials; ++trial) {
         const bool edges = trial % 4 == 3;
         const int live = 1 + trial % 3;
@@ -307,6 +341,18 @@ int check(const Lib& lib, int trials, const char* table_path) {
         for (int i = 0; i < live; ++i) {
             hgu.push_back(make_blocks(2 * kFf, kEmbd, rng, edges));
             hdn.push_back(make_blocks(kEmbd, kFf, rng, edges));
+            if (stream && (trial % 4 == 1 || trial % 4 == 2)) {
+                // All-general profile2 proves actual fallback-only calls; profile1 mixes them
+                // with full fast rounds and a raw tail. Preserve identical CPU/GPU weight bytes.
+                auto profile = [&](std::vector<uint8_t>& b, int N, int K) {
+                    const int uk = K / 32;
+                    for (int n = 0; n < N; ++n) for (int u = 0; u < uk; ++u)
+                        if (trial % 4 == 2 || u == 0 || u == uk - 1)
+                            b[((size_t)n * uk + u) * 17] = 112;
+                };
+                profile(hgu.back(), 2 * kFf, kEmbd);
+                profile(hdn.back(), kEmbd, kFf);
+            }
             dgu.push_back(new Dev(gu_b)); dgu.back()->put(hgu.back().data());
             ddn.push_back(new Dev(dn_b)); ddn.back()->put(hdn.back().data());
             tgu[(size_t)r.experts[(size_t)i]] = dgu.back()->p;
@@ -340,6 +386,39 @@ int check(const Lib& lib, int trials, const char* table_path) {
             Expert e{ GU, DN };
             expert_forward(e, silu.data(), kLimit, x.data(), cg.data(), ca.data(), cd.data(), 1, false);
             bad_chain += count_diff(cd.data(), dn.data() + (size_t)i * kEmbd, kEmbd);
+            if (stream) {
+                StreamWeight sg(hgu[(size_t)i], 2 * kFf, kEmbd), sd(hdn[(size_t)i], kEmbd, kFf);
+                for (int layout = 0; layout < 2; ++layout) {
+                    const Mx& wg = layout ? sg.pk : sg.planar;
+                    const Mx& wd = layout ? sd.pk : sd.planar;
+                    std::vector<uint16_t> tg(2 * kFf), ta(kFf), td(kEmbd), tcg(2 * kFf), tca(kFf), tcd(kEmbd);
+                    auto run_stream = [&](const Mx& w, const uint16_t* in, uint16_t* out) {
+                        const bool used = gemv_avx2_stream(w, in, out, 0, w.N);
+                        ++stream_calls[layout];
+                        if (used) ++stream_fast[layout]; else ++stream_fallback_only[layout];
+                        if ((w.K / 32) % 32) ++stream_tail_calls[layout];
+                    };
+                    // Stage checks use the card's own inputs, then an independent all-host chain.
+                    run_stream(wg, x.data(), tg.data());
+                    swiglu_avx2(silu.data(), g.data() + (size_t)i * 2 * kFf, ta.data(), kFf, kLimit);
+                    run_stream(wd, a.data() + (size_t)i * kFf, td.data());
+                    stream_bad_gpu += count_diff(tg.data(), g.data() + (size_t)i * 2 * kFf, 2 * kFf);
+                    stream_bad_gpu += count_diff(ta.data(), a.data() + (size_t)i * kFf, kFf);
+                    stream_bad_gpu += count_diff(td.data(), dn.data() + (size_t)i * kEmbd, kEmbd);
+                    stream_bad_old += count_diff(tg.data(), hg.data(), 2 * kFf);
+                    stream_bad_old += count_diff(ta.data(), ha.data(), kFf);
+                    stream_bad_old += count_diff(td.data(), hd.data(), kEmbd);
+                    run_stream(wg, x.data(), tcg.data());
+                    swiglu_avx2(silu.data(), tcg.data(), tca.data(), kFf, kLimit);
+                    run_stream(wd, tca.data(), tcd.data());
+                    stream_bad_old += count_diff(tcg.data(), cg.data(), 2 * kFf);
+                    stream_bad_old += count_diff(tca.data(), ca.data(), kFf);
+                    stream_bad_old += count_diff(tcd.data(), cd.data(), kEmbd);
+                    stream_bad_gpu += count_diff(tcg.data(), g.data() + (size_t)i * 2 * kFf, 2 * kFf);
+                    stream_bad_gpu += count_diff(tca.data(), a.data() + (size_t)i * kFf, kFf);
+                    stream_bad_gpu += count_diff(tcd.data(), dn.data() + (size_t)i * kEmbd, kEmbd);
+                }
+            }
             ++rows;
         }
         for (auto* p : dgu) delete p;
@@ -348,6 +427,22 @@ int check(const Lib& lib, int trials, const char* table_path) {
     std::printf("%d trials, %zu expert rows: differing values gate_up %zu, swiglu %zu, down %zu, whole host chain %zu\n",
                 trials, rows, bad_gu, bad_act, bad_dn, bad_chain);
     const bool ok = !bad_gu && !bad_act && !bad_dn && !bad_chain;
+    if (stream) {
+        bool coverage = true;
+        for (int layout = 0; layout < 2; ++layout) {
+            std::printf("DS41HX_STREAM_CARD layout=%s calls=%zu calls_with_fast=%zu calls_fallback_only=%zu tail_calls=%zu\n",
+                        layout ? "packed" : "planar", stream_calls[layout], stream_fast[layout],
+                        stream_fallback_only[layout], stream_tail_calls[layout]);
+            coverage = coverage && stream_calls[layout] == 4 * rows && stream_fast[layout] > 0 &&
+                       stream_fallback_only[layout] > 0 && stream_tail_calls[layout] == 2 * rows &&
+                       stream_calls[layout] == stream_fast[layout] + stream_fallback_only[layout];
+        }
+        std::printf("DS41HX_STREAM_CARD differing_gpu=%zu differing_old=%zu coverage=%d\n",
+                    stream_bad_gpu, stream_bad_old, coverage ? 1 : 0);
+        const bool passed = ok && !stream_bad_gpu && !stream_bad_old && coverage;
+        std::printf(passed ? "PASS: stream planar/packed gate_up swiglu down and full chain equal old host and libr4d\n" : "FAIL\n");
+        return passed ? 0 : 1;
+    }
     std::printf(ok ? "PASS: host experts are bit-identical to libr4d's decode chain\n" : "FAIL\n");
     return ok ? 0 : 1;
 }
@@ -2795,6 +2890,8 @@ int main(int argc, char** argv) {
     const Lib lib(argv[1]);
     if (!std::strcmp(argv[2], "draft")) return draft_check(lib, argc > 3 ? std::atoi(argv[3]) : 36);
     if (!std::strcmp(argv[2], "check")) return check(lib, argc > 3 ? std::atoi(argv[3]) : 24, argc > 4 ? argv[4] : "silu_table.bin");
+    if (!std::strcmp(argv[2], "check-stream")) return check(lib, argc > 3 ? std::atoi(argv[3]) : 4,
+                                                        argc > 4 ? argv[4] : "silu_table.bin", true);
     if (!std::strcmp(argv[2], "swiglu")) return swiglu_proof(lib, argc > 3 ? argv[3] : "silu_table.bin");
     if (!std::strcmp(argv[2], "ptime")) {
         /* ptime T[:P] ...; PTIME_LIB2=<libr4d.so> also runs and compares a second plugin */

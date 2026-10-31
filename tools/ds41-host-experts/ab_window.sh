@@ -384,13 +384,23 @@ kld_finish() {   # name; the run is SERVER_PID
 # Arguments: the log, the arm's Vp (non-empty: on), its bank (non-empty: bound). 0 when the arm may be
 # measured; otherwise 1, the reason on stdout.
 vp_server_gate() {
-  local f=$1 vp=$2 bank=$3 vp_on vp_held vp_bank
+  local f=$1 vp=$2 bank=$3 vp_on vp_held vp_bank rank
   vp_on=$(grep -c 'VRAM packed experts (RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED)' "$f")
   vp_held=$(grep -cE 'holds [1-9][0-9]* static residents' "$f")
   vp_bank=$(grep -cE 'VRAM packed experts: rank [0-9]+: DSpark bank bound; [1-9][0-9]* trunk weights packed' "$f")
   if [[ -n "$vp" ]] && [[ "$vp_on" == 0 || "$vp_held" == 0 ]]; then
     echo "Vp, but the server log has $vp_on 'VRAM packed experts (RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED)' and $vp_held 'holds N static residents' lines with N above 0 ($(grep -m2 -E 'VRAM packed experts' "$f" | tr '\n' ' '))"
     return 1
+  fi
+  # A positive count on just one rank is insufficient, including P1's mixed reader bands.
+  # Actual packed static residents prove eligibility and placement both occurred on each rank.
+  if [[ -n "$vp" ]]; then
+    for rank in 0 1 2 3; do
+      if [[ $(grep -cE "VRAM packed experts: rank $rank holds [1-9][0-9]* static residents in the packed-scale form" "$f") != 1 ]]; then
+        echo "Vp, but rank $rank did not log exactly one nonzero packed static-resident count"
+        return 1
+      fi
+    done
   fi
   if [[ -n "$vp" && -n "$bank" && "$vp_bank" != 4 ]]; then
     echo "Vp with a DSpark bank, but $vp_bank of the 4 ranks logged 'DSpark bank bound; N trunk weights packed' with N above 0 ($(grep -m2 -E 'VRAM packed experts: (rank [0-9]+: DSpark|a DSpark)' "$f" | tr '\n' ' '))"

@@ -4,6 +4,7 @@ import copy
 import importlib.util
 from pathlib import Path
 import unittest
+import tempfile
 from unittest import mock
 
 spec = importlib.util.spec_from_file_location("ds41_bank_lend_probe", Path(__file__).with_name("ds41_bank_lend_probe.py"))
@@ -75,11 +76,16 @@ class FakeHTTP:
         return FakeStream()
 
 
-def receipt(role="lend"):
+def receipt(role="lend", settle_index=5):
     fake = FakeHTTP()
+    class Watch:
+        text = property(lambda self: logs())
+        def poll(self): pass
+        def settled(self): return fake.index >= settle_index
     result = m.run_probe("http://fake", workload(), role, timeout=2, interval=.1,
                          get=fake.get, stream_factory=fake.stream,
-                         clock=lambda: fake.now, sleep=fake.sleep)
+                         clock=lambda: fake.now, sleep=fake.sleep,
+                         log_watch=Watch() if role == "lend" else None)
     guard = dict(production_container="radiance-flashnext", production_stopped=True,
                  both_research_locks=True, lock_holder_pid=123)
     result["window_guard"] = result["window_guard_end"] = guard
@@ -111,6 +117,24 @@ def logs(epoch=1, seq=101):
 
 
 class BankProbeTest(unittest.TestCase):
+    def test_idle_stats_waits_for_late_restore_and_prices_that_drain(self):
+        r, _ = receipt(settle_index=7)
+        self.assertTrue(r["valid"], r.get("invalid_reason"))
+        self.assertAlmostEqual(r["workload_drain_s"], .6)
+        m.check_receipt(r)
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "server.log"
+            path.write_text("DSBANKLEND transition epoch=1 action=lend phase=begin\n")
+            watch = m.BankLogWatch(path); watch.poll()
+            self.assertFalse(watch.settled())
+            with path.open("a") as f:
+                f.write("DSBANKLEND transition epoch=1 action=restore phase=ready")
+            watch.poll(); self.assertFalse(watch.settled())
+            with path.open("a") as f: f.write("\n")
+            watch.poll(); self.assertTrue(watch.settled())
+            path.write_text("")
+            with self.assertRaises(m.Invalid): watch.poll()
+
     def test_fake_http_uses_exactly_four_requests_and_keeps_e2e_load_and_drain(self):
         r, f = receipt()
         self.assertTrue(r["valid"], r.get("invalid_reason"))

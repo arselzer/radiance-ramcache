@@ -64,6 +64,11 @@ cache budgets as reference and candidate for a speed claim.
 Use at least four scheduler slots and an explicit max-model-len of at least the frozen anchor's
 prompt token count plus1024 (2048 is sufficient for the supplied prompts). The usual512 default
 cannot admit this probe; a refusal is INVALID rather than evidence about lending.
+The lend invocation also requires `--server-log lend.server.log`, pointing at the live log of
+that fresh research process. The bounded incremental watcher waits for every opened lend epoch
+to have restore READY before ending the measured drain and validates the captured rank proofs.
+This is required because `/stats` can show idle before the engine's idle restore completes.
+Log rotation/truncation or more than64MiB during this short probe is a refusal.
 
 After process shutdown/complete logs and production restore, validate offline:
 

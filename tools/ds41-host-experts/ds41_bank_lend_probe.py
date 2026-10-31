@@ -322,10 +322,47 @@ def get_stats(url):
         return json.load(response)
 
 
+class BankLogWatch:
+    """Incremental, bounded proof: /stats idle alone can precede an idle bank restore."""
+    def __init__(self, path):
+        self.path = Path(path)
+        self.offset = 0
+        self.partial = b""
+        self.lines = []
+
+    @property
+    def text(self):
+        return "\n".join(self.lines)
+
+    def poll(self):
+        need(self.path.stat().st_size >= self.offset, "server log rotated/truncated during probe")
+        with self.path.open("rb") as f:
+            f.seek(self.offset)
+            data = f.read(64 * 1024 * 1024 - self.offset + 1)
+        self.offset += len(data)
+        need(self.offset <= 64 * 1024 * 1024, "live server log exceeds bounded64MiB probe scan")
+        lines = (self.partial + data).split(b"\n")
+        self.partial = lines.pop()
+        self.lines.extend(line.decode("utf-8") for line in lines if b"DSBANKLEND " in line)
+
+    def settled(self):
+        opened, seen = set(), False
+        for row in marker_rows(self.text):
+            if row["kind"] != "transition":
+                continue
+            key = int(row["epoch"])
+            if row.get("action") == "lend" and row.get("phase") == "begin":
+                opened.add(key); seen = True
+            if row.get("action") == "restore" and row.get("phase") == "ready":
+                opened.discard(key)
+        return seen and not opened
+
+
 def run_probe(url, workload, role, timeout=240, interval=.1, get=get_stats,
-              stream_factory=Stream, clock=time.monotonic, sleep=time.sleep):
+              stream_factory=Stream, clock=time.monotonic, sleep=time.sleep, log_watch=None):
     need(role in {"no-bank", "static", "lend"}, "invalid probe role")
     need(1 <= timeout <= 900 and .05 <= interval <= 1, "unbounded polling parameters")
+    need(role != "lend" or log_watch is not None, "lend role requires a live server-log restoration proof")
     before = get(url)
     fresh(before)
     traffic = Traffic(workload)
@@ -342,6 +379,8 @@ def run_probe(url, workload, role, timeout=240, interval=.1, get=get_stats,
             need(polls <= math.ceil(timeout / interval) + 2, "poll bound exceeded")
             now = clock()
             stats = get(url)
+            if log_watch:
+                log_watch.poll()
             need(stats.get("started_at") == before.get("started_at"), "server restarted during workload")
             ready = traffic.observe(stats, now)
             if ready and not launched:
@@ -360,6 +399,11 @@ def run_probe(url, workload, role, timeout=240, interval=.1, get=get_stats,
                      "anchor ended before all bursts; solo restoration was not exercised")
                 active = [r for r in stats["requests"] if r.get("state") in ACTIVE]
                 if stats["running"] == 0 and stats.get("waiting") == 0 and stats.get("in_flight") == 0 and not active:
+                    if role == "lend":
+                        if not log_watch.settled():
+                            sleep(interval)
+                            continue
+                        validate_markers(log_watch.text, {"seq_by_name": traffic.ids})
                     drained = True
                     break
             sleep(interval)
@@ -383,6 +427,8 @@ def run_probe(url, workload, role, timeout=240, interval=.1, get=get_stats,
                       solo_draft_observed=traffic.solo_draft, drained=drained,
                       drained_s=ended, workload_drain_s=ended - start, finished_unix_ns=time.time_ns())
         result["load_workload_drain_s"] = before["startup_s"] + result["workload_drain_s"]
+        if log_watch:
+            result["observed_lender_log"] = log_watch.text
     return result
 
 
@@ -493,6 +539,8 @@ def check_receipt(r):
              g.get("both_research_locks") is True and type(g.get("lock_holder_pid")) is int and
              g["lock_holder_pid"] > 1, "missing start/end guarded-window receipt")
     need(guard == end_guard, "window attestation changed during probe")
+    if r["role"] == "lend":
+        validate_markers(r.get("observed_lender_log", ""), r)
     need(r.get("workload_sha256") == digest(r["workload"]), "workload digest mismatch")
     need(all(type(r.get(k)) in (float, int) and math.isfinite(r[k]) for k in
              ("started_s", "drained_s", "workload_drain_s", "load_workload_drain_s")), "invalid wall-clock metrics")
@@ -546,6 +594,9 @@ def validate(receipts, logs):
                  role + " reply/count differs: " + a["name"])
     need(not marker_rows(logs["no-bank"]) and not marker_rows(logs["static"]),
          "lender markers present in a lender-off reference")
+    observed = marker_rows(receipts["lend"]["observed_lender_log"])
+    need(observed == marker_rows(logs["lend"])[:len(observed)],
+         "live restored receipt does not belong to the complete server log")
     activity = validate_markers(logs["lend"], receipts["lend"])
     return {"schema": SCHEMA, "valid": True, "byte_identical": 4, "lender_activity": activity,
             "metrics": {role: {"workload_drain_s": r["workload_drain_s"],
@@ -568,6 +619,7 @@ def main():
     run.add_argument("url"); run.add_argument("workload"); run.add_argument("output")
     run.add_argument("--role", choices=("no-bank", "static", "lend"), required=True)
     run.add_argument("--window-guard", required=True)
+    run.add_argument("--server-log", help="required live research-server log for lend role")
     run.add_argument("--timeout", type=float, default=240); run.add_argument("--poll-s", type=float, default=.1)
     val = sub.add_parser("validate")
     for role in ("no-bank", "static", "lend"):
@@ -582,7 +634,8 @@ def main():
         save(args.output, workload)
     elif args.command == "run":
         guard = check_window(args.window_guard)
-        result = run_probe(args.url, load(args.workload), args.role, args.timeout, args.poll_s)
+        result = run_probe(args.url, load(args.workload), args.role, args.timeout, args.poll_s,
+                           log_watch=BankLogWatch(args.server_log) if args.server_log else None)
         result["window_guard"] = guard
         try:
             result["window_guard_end"] = check_window(args.window_guard)

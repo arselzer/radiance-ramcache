@@ -405,4 +405,45 @@ TEST(ds41_packed_full_pages_leave_raw_f32_and_window_snapshot_bytes_unchanged) {
     f.kv.free_checkpoint(ck);
 }
 
+TEST(ds41_packed_native_window_uses_physical_floor_and_checkpoint_fragments) {
+    if(!device_is_host())SKIP("native packed WINDOW fixture requires host device backend");
+    auto gs=groups(true,true);
+    auto& wg=gs[Window];wg.name="native_fp8_window";wg.block_size=16;wg.decl.window=32;
+    wg.decl.head_dim=256;wg.decl.storage_format=RAD_KV_STORAGE_DS41_FP8_WINDOW_G32;
+    wg.decl.storage_block_bytes=8448;
+    Fixture f;REQUIRE_EQ(f.build(gs),RAD_OK);
+    const auto* win=f.kv.plan(Window);const auto* tail=f.kv.plan(Tail);REQUIRE(win&&tail);
+    CHECK_EQ(win->layer_bytes_per_block(),8448ll);CHECK_EQ(win->bytes_per_block,16896ll);
+    CHECK_EQ(win->pool_bytes,win->n_blocks*16896ll);
+    CHECK_EQ(f.kv.checkpoint_bytes(),tail->bytes_per_state+win->window_blocks*16896ll);
+    Program program;program.kv_groups=gs;std::vector<KVPoolBinding> binding;
+    bind_kv_pools(program,[&](int32_t g){return f.kv.plan(g);},&binding);
+    CHECK_EQ(binding[Window].dtype,uint32_t(RAD_U8));CHECK_EQ(binding[Window].rank,2u);
+    CHECK_EQ(binding[Window].shape[1],8448ll);
+    HostArena store;REQUIRE_EQ(store.open(f.kv.checkpoint_bytes(),2*f.kv.checkpoint_bytes()),RAD_OK);
+    f.kv.set_checkpoint_store(&store,0);REQUIRE_EQ(f.kv.add_sequence(1),RAD_OK);REQUIRE_EQ(f.kv.add_sequence(2),RAD_OK);
+    REQUIRE_EQ(f.kv.ensure(1,23),RAD_OK);
+    std::vector<int32_t> source((size_t)f.kv.n_groups(),-1),target=source;
+    source[Tail]=f.kv.state_slot(1,Tail);target[Tail]=f.kv.state_slot(2,Tail);
+    std::vector<int32_t> rows;REQUIRE(f.kv.window_rows(1,23,&rows));
+    for(int64_t l=0;l<win->n_layers;++l)for(size_t j=0;j<rows.size();++j)if(rows[j]>=0){
+        auto*dst=page(*win,l,rows[j]);
+        for(int r=0;r<16;++r)for(int g=0;g<16;++g){auto*p=dst+r*528+g*32;
+            std::memset(p,0,32);const uint16_t a=uint16_t(0x7fc1+l+j+r),b=0x8000;
+            p[0]=uint8_t(a);p[1]=uint8_t(a>>8);p[2]=uint8_t(b);p[3]=uint8_t(b>>8);
+            p[4]=0xa5;p[5]=0x5a;p[6]=0x66;p[7]=0x99;}
+        for(int r=0;r<16;++r)std::memset(dst+r*528+512,0,16);
+    }
+    int32_t ck=-1;REQUIRE_EQ(f.kv.alloc_checkpoint(&ck),RAD_OK);RadStream stream=nullptr;
+    REQUIRE_EQ(rad_stream_create(&stream,0),RAD_OK);
+    CHECK_OK(f.kv.checkpoint_save(source.data(),source.size(),ck,stream,&rows));
+    CHECK_OK(f.kv.seed_window(2,23));std::vector<int32_t> restored;REQUIRE(f.kv.window_rows(2,23,&restored));
+    CHECK_OK(f.kv.checkpoint_restore(target.data(),target.size(),ck,stream,&restored));CHECK_OK(rad_stream_sync(stream));
+    REQUIRE_EQ(rows.size(),restored.size());
+    for(int64_t l=0;l<win->n_layers;++l)for(size_t j=0;j<rows.size();++j)if(rows[j]>=0){
+        REQUIRE(restored[j]>=0);CHECK_EQ(std::memcmp(page(*win,l,rows[j]),page(*win,l,restored[j]),8448),0);}
+    rad_stream_destroy(stream);f.kv.free_checkpoint(ck);
+    f.kv.free_sequence(1);f.kv.free_sequence(2);
+}
+
 RAD_TEST_MAIN()

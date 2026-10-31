@@ -34,6 +34,7 @@
 #include "r4d_emit.h"
 #include "r4d_plugin.h"
 #include "../arch/common/rad_ds41_kv_codec.h"
+#include "../arch/common/rad_ds41_window_codec.h"
 #include "../arch/common/rad_ds41_kv_fast.h"
 
 #include <climits>
@@ -2039,6 +2040,7 @@ int attn_body(const RadArgs* a, RadStream stream, int oracle_form = -1) {
 }
 
 #include "r4d_ds41_index_b16.inc"
+#include "r4d_ds41_window_sparse.inc"
 
 }  // namespace
 
@@ -2076,6 +2078,31 @@ extern "C" int r4d_rad_ds41_attn_sparse_sink_kvpack(const RadArgs* a, RadStream 
             std::fprintf(stderr, "[r4d] ds41 KV_PACKED active rank=%d role=attention format=1 row_bytes=%lld dispatch=original decoder=%s M=%lld\n",
                          a->rank, (long long)a->t[4].shape[1], ds_kv_fast_mode() == 1 ? "integer-fast" : "reference",
                          (long long)a->t[0].shape[0]); std::fflush(stderr);
+        }
+    }
+    return rc;
+}
+extern "C" int r4d_rad_ds41_attn_sparse_sink_windowpack_check(const RadArgs* a, RadStream s, int form) {
+    return form >= 0 && form <= 14 ? windowpack::attn_body(a, s, form) : RAD_E_INVAL;
+}
+extern "C" int r4d_rad_ds41_attn_sparse_sink_windowpack(const RadArgs* a, RadStream stream) {
+    if (!a || r4d_geti_or(a, "window_format", 0) != 3 ||
+        r4d_geti_or(a, "kv_format", 0) != (r4d_geti_or(a, "ratio", 0) > 0 ? 1 : 0))
+        return R4D_NO(RAD_E_UNSUPPORTED);
+    const int rc = windowpack::attn_body(a, stream);
+    if (rc == RAD_OK && a->rank >= 0 && a->rank < a->world_size && a->rank < 64) {
+        static std::atomic<uint64_t> reported{0}; const uint64_t bit = uint64_t(1) << (unsigned)a->rank;
+        if (!(reported.fetch_or(bit, std::memory_order_relaxed) & bit)) {
+            std::fprintf(stderr, "[r4d] ds41 WINDOW_PACKED active rank=%d role=attention format=3 row_bytes=528 page_bytes=8448 decoder=reference M=%lld\n",
+                a->rank, (long long)a->t[0].shape[0]); std::fflush(stderr);
+        }
+    }
+    if (rc == RAD_OK && r4d_geti_or(a,"ratio",0)>0 && a->rank >= 0 && a->rank < a->world_size && a->rank < 64) {
+        static std::atomic<uint64_t> compressed_reported{0}; const uint64_t bit=uint64_t(1)<<(unsigned)a->rank;
+        if (!(compressed_reported.fetch_or(bit,std::memory_order_relaxed)&bit)) {
+            std::fprintf(stderr,"[r4d] ds41 KV_PACKED active rank=%d role=attention format=1 row_bytes=%lld dispatch=original decoder=%s M=%lld\n",
+                a->rank,(long long)a->t[4].shape[1],ds_kv_fast_mode()==1?"integer-fast":"reference",(long long)a->t[0].shape[0]);
+            std::fflush(stderr);
         }
     }
     return rc;

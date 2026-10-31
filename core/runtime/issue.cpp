@@ -820,15 +820,18 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
             const KVPoolBinding& b = kv_[g];
             if (b.storage_format != RAD_KV_STORAGE_PLAIN) {
                 long long declared_format = -1;
-                if (p.info) (void)p.info->base.get_i("kv_format", &declared_format);
+                const char*format_key=b.storage_format==RAD_KV_STORAGE_DS41_FP8_WINDOW_G32&&p.info&&
+                    p.info->op=="attn_sparse_sink_windowpack"?"window_format":"kv_format";
+                if (p.info) (void)p.info->base.get_i(format_key, &declared_format);
                 const char* why = kv_storage_operand_error(b.storage_format,
                     p.info ? p.info->op.c_str() : nullptr,
                     ip.row && ip.row->info ? ip.row->info->name : nullptr,
                     ip.row && ip.row->info ? ip.row->info->op : nullptr, i, declared_format,
-                    rad_args_geti(&ip.args, "kv_format", -1));
+                    rad_args_geti(&ip.args, format_key, -1));
                 if (why) return abort_step_msg(h, RAD_E_SHAPE,
                     fmt("operand %d names packed KV group %u: %s", i, g, why));
-                const int64_t pitch = b.storage_format == RAD_KV_STORAGE_DS41_FP4_E4M3_G16 ? 288 : 68;
+                const int64_t pitch = b.storage_format==RAD_KV_STORAGE_DS41_FP8_WINDOW_G32?16*528:
+                    b.storage_format == RAD_KV_STORAGE_DS41_FP4_E4M3_G16 ? 288 : 68;
                 if (b.dtype != RAD_U8 || b.rank != 2 || b.shape[0] <= 0 || b.shape[1] != pitch ||
                     b.layer_stride / pitch != b.shape[0] || b.layer_stride % pitch ||
                     o.rows != 0 || o.cols != 0)

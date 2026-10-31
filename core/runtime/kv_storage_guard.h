@@ -10,9 +10,14 @@ inline const char* kv_storage_operand_error(uint32_t format, const char* op, con
                                            int64_t declared_format, int64_t resolved_format) {
     if (format == RAD_KV_STORAGE_PLAIN) return nullptr;
     if (declared_format != format || resolved_format != format)
-        return "packed KV requires matching explicit declared and resolved kv_format";
+        return "packed KV requires matching explicit declared and resolved storage format";
     if (!op || !kernel || !kernel_op || std::strcmp(op, kernel_op))
         return "packed KV requires a dedicated matching packed kernel op";
+    if(!std::strcmp(op,"kv_store_windowpack")&&!std::strcmp(kernel,"ds41_kv_store_windowpack")&&
+       operand==3&&format==RAD_KV_STORAGE_DS41_FP8_WINDOW_G32)return nullptr;
+    if(!std::strcmp(op,"attn_sparse_sink_windowpack")&&!std::strcmp(kernel,"ds41_attn_sparse_sink_d512_windowpack")&&
+       ((operand==1&&format==RAD_KV_STORAGE_DS41_FP8_WINDOW_G32)||
+        (operand==4&&format==RAD_KV_STORAGE_DS41_FP4_E4M3_G16)))return nullptr;
     if (!std::strcmp(op, "entry_store_kvpack") && !std::strcmp(kernel, "ds41_entry_store_kvpack") &&
         operand == 3 && (format == RAD_KV_STORAGE_DS41_FP4_E4M3_G16 ||
                          format == RAD_KV_STORAGE_DS41_FP4_POW2_G32)) return nullptr;

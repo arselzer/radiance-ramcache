@@ -209,6 +209,15 @@ static const RadConstraint cDs41PostCollapseNorm[] = {
 
 #elif defined(R4D_DS41_SCHEMAS)
 
+SCHEMA("quant_roundtrip_windowpack", pDs41QuantKvPack, oDs41QuantKvPack,
+       "Original native FP8 window quantization plus original codes/scales; unchanged BF16 output."),
+SCHEMA("rmsnorm_rope_roundtrip_windowpack", pDs41NormRopeKvPack, oDs41NormRopeKvPack,
+       "Original native FP8 window fused producer plus transient original codes/scales."),
+SCHEMA("rope_rows_roundtrip_windowpack", pDs41RopeKvPack, oDs41RopeKvPack,
+       "Original native FP8 window rope producer plus transient original codes/scales."),
+SCHEMA("kv_store_windowpack", pDs41EntryKvPack, oDs41EntryKvPack,
+       "Native sixteen-slot FP8-code window pages; store checks actual raw BF16 bits without rerounding."),
+
 SCHEMA("quant_roundtrip_kvpack", pDs41QuantKvPack, oDs41QuantKvPack,
        "Unchanged BF16 FP4 roundtrip plus ORIGINAL code/scale capture for DS41 packed entries; no reencoding."),
 SCHEMA("rmsnorm_rope_roundtrip_kvpack", pDs41NormRopeKvPack, oDs41NormRopeKvPack,
@@ -274,6 +283,23 @@ SCHEMA("entry_store_kvpack", pDs41EntryKvPack, oDs41EntryKvPack,
            "step reads it. out must not alias h."),
 
 #elif defined(R4D_DS41_ROWS)
+
+{ "quant_roundtrip_fp8_windowpack", "quant_roundtrip_windowpack", "quant", "original FP8 capture; same BF16 output",
+  "native512/group32/pow2 format3", "bf16 x, u8 original capture", RAD_DOMAIN_DEVICE,
+  R4D_PRIO_ONLY, ROW(cDs41QuantFp8), NOTUNE, nullptr, nullptr, r4d_rad_quant_roundtrip_windowpack,
+  nullptr, nullptr, nullptr, r4d_shape_quant_roundtrip_kvpack },
+{ "rmsnorm_rope_roundtrip_fp8_windowpack", "rmsnorm_rope_roundtrip_windowpack", "norm", "same norm/rope/FP8 with original capture",
+  "native512/group32/pow2 format3", "bf16 x/y, f32 gain/cos_sin, i32 position, u8 capture", RAD_DOMAIN_DEVICE,
+  R4D_PRIO_ONLY, ROW(cDs41NormRopeRtFp8), NOTUNE, nullptr, nullptr, r4d_rad_rmsnorm_rope_roundtrip_windowpack,
+  nullptr, nullptr, nullptr, r4d_shape_rmsnorm_rope_roundtrip_kvpack },
+{ "rope_rows_roundtrip_fp8_windowpack", "rope_rows_roundtrip_windowpack", "attn", "same rope/FP8 with original capture",
+  "native512/group32/pow2 format3", "bf16 x, f32 cos_sin, i32 position, u8 capture", RAD_DOMAIN_DEVICE,
+  R4D_PRIO_ONLY, ROW(cDs41RopeRtFp8), NOTUNE, nullptr, nullptr, r4d_rad_rope_rows_roundtrip_windowpack,
+  nullptr, nullptr, nullptr, r4d_shape_rope_rows_roundtrip_kvpack },
+{ "ds41_kv_store_windowpack", "kv_store_windowpack", "attn", "raw-BF16-exact native FP8 WINDOW store",
+  "native512/group32, sixteen slots per page", "bf16 actual, u8 capture/cache, i32 slots", RAD_DOMAIN_DEVICE,
+  R4D_PRIO_ONLY, ROW(cDs41EntryStore), NOTUNE, nullptr, nullptr, r4d_rad_kv_store_windowpack,
+  nullptr, nullptr, nullptr, r4d_shape_kv_store_windowpack },
 
 { "quant_roundtrip_fp4_kvpack", "quant_roundtrip_kvpack", "quant", "original FP4 capture with BF16 output retained",
   "DS41 n512/group16/E4M3 or n128/group32/pow2", "bf16 x, u8 original capture", RAD_DOMAIN_DEVICE,

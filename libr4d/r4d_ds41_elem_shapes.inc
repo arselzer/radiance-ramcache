@@ -5,9 +5,11 @@
  * index ranges, with the same declines, since rad-kbench fills both kernels from one description. */
 
 #include "../arch/common/rad_ds41_kv_codec.h"
+#include "../arch/common/rad_ds41_window_codec.h"
 
 static int64_t ds41_pack_bytes(const RadParam* p, int n_p, int64_t width) {
     const uint32_t kind = (uint32_t)pi(p, n_p, "kv_format");
+    if (kind == 3 && width == 512) return rad_ds41_window_codec::row_bytes(width);
     if (!((kind == 1 && width == 512) || (kind == 2 && width == 128))) return 0;
     return rad_ds41_kv_codec::row_bytes(kind, width);
 }
@@ -115,6 +117,15 @@ extern "C" int r4d_shape_entry_store_kvpack(const RadParam* p, int n_p, int oper
         opd((uint32_t)RAD_BF16, M, n), opd((uint32_t)RAD_U8, M, bytes),
         opd_idx(M, 0, M, -1, RAD_OPD_F_IDX_UNIQUE), opd((uint32_t)RAD_U8, M, bytes),
     };
+    R4D_PICK(l);
+}
+
+extern "C" int r4d_shape_kv_store_windowpack(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M");
+    if (M < 1 || pi(p,n_p,"n") != 512 || pi(p,n_p,"block_size") != 16 || pi(p,n_p,"kv_format") != 3)
+        return RAD_E_UNSUPPORTED;
+    const RadOpdDesc l[] = {opd((uint32_t)RAD_BF16,M,512), opd((uint32_t)RAD_U8,M,528),
+        opd_idx(M,0,M,-1,RAD_OPD_F_IDX_UNIQUE), opd((uint32_t)RAD_U8,(M+15)/16+1,8448)};
     R4D_PICK(l);
 }
 

@@ -39,6 +39,9 @@ namespace {
 constexpr int kWorld = 4;
 
 const char* const kVars[] = { "RADIANCE_EXPERIMENTAL_DS41_P1",
+                              "RADIANCE_EXPERIMENTAL_DS41_KV_PACKED",
+                              "RADIANCE_EXPERIMENTAL_DS41_KV_PACKED_FAST",
+                              "RADIANCE_EXPERIMENTAL_DS41_WINDOW_PACKED",
                               deepseek41::kIndexCompactEnv,
                               deepseek41::kIndexB16Env,
                               "RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA",
@@ -565,6 +568,46 @@ TEST(lcp4096_keeps_the_small_arena_level_and_full_step_bounds) {
                          (long long)(room / ds41p1::kSlotBytes), ds41p1::kMaxLend);
         }
     }
+}
+
+TEST(native_packed_window_capture_tracks_actual_consumer_cuts_and_sizing_rows) {
+    Env e{WINDOW_SWITCHES};
+    setenv("RADIANCE_EXPERIMENTAL_DS41_KV_PACKED","1",1);
+    setenv("RADIANCE_EXPERIMENTAL_DS41_WINDOW_PACKED","1",1);
+    setenv("RADIANCE_EXPERIMENTAL_DS41_LCP","2048",1);
+    for(int rank=0;rank<kWorld;++rank){
+        auto real=declare(rank,2048,false);REQUIRE_EQ(real->rc,RAD_OK);REQUIRE(real->m);
+        const auto* m=real->m;CHECK(m->window_packed);CHECK(m->win_pack!=0);
+        const auto& win=real->b.kv_groups[(size_t)m->win-1];
+        CHECK_EQ(win.d.kind,RAD_KV_WINDOW);CHECK_EQ(win.d.storage_format,uint32_t(3));
+        CHECK_EQ(win.d.storage_block_bytes,8448ll);CHECK_EQ(win.d.head_dim,256ll);
+        auto probe=declare(rank,256,true);REQUIRE_EQ(probe->rc,RAD_OK);CHECK(differs(real->b,probe->b).empty());
+        auto batch=kit(real->b,{1},{37},1040);RadCtx c;c.b=&real->b;c.batch=&batch->b;c.rank=rank;c.world=kWorld;
+        deepseek41::step(&c,&batch->b);CHECK(c.step_fail.empty());
+        int producers=0,stores=0,readers=0;
+        for(const auto&is:c.issues){
+            const auto&op=real->b.ops[(size_t)is.op-1];
+            if(op.op=="rmsnorm_rope_roundtrip_windowpack"){
+                REQUIRE_EQ(is.opd.size(),size_t(6));const auto&actual=is.opd[2];const auto&cap=is.opd[5];
+                CHECK_EQ(actual.rows,cap.rows);CHECK_EQ(cap.handle,m->win_pack);
+                CHECK_EQ(cap.offset,(actual.offset/512)*528);++producers;
+            }
+            if(op.op=="kv_store_windowpack"){
+                REQUIRE_EQ(is.opd.size(),size_t(4));const auto&actual=is.opd[0];const auto&cap=is.opd[1];
+                CHECK_EQ(actual.rows,cap.rows);CHECK_EQ(cap.handle,m->win_pack);
+                CHECK_EQ(cap.offset,(actual.offset/512)*528);CHECK_EQ(is.opd[3].handle,m->win);++stores;
+            }
+            if(op.op=="attn_sparse_sink_windowpack"){
+                REQUIRE_EQ(is.opd.size(),size_t(11));CHECK_EQ(is.opd[1].handle,m->win);++readers;
+            }
+        }
+        CHECK_EQ(producers,m->c.n_layer);CHECK_EQ(stores,m->c.n_layer);CHECK_EQ(readers,m->c.n_layer);
+        CHECK(overruns(real->b,probe->b,batch->b,rank,nullptr).empty());
+    }
+    setenv("RADIANCE_EXPERIMENTAL_DS41_KV_PACKED","0",1);
+    CHECK_EQ(declare(0,2048,false)->rc,RAD_E_UNSUPPORTED);
+    setenv("RADIANCE_EXPERIMENTAL_DS41_WINDOW_PACKED","2",1);
+    CHECK_EQ(declare(0,2048,false)->rc,RAD_E_INVAL);
 }
 
 TEST(the_256_row_level_ends_far_below_the_full_plan) {

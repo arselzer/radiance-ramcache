@@ -30,6 +30,7 @@
 #include "place/dspark_draft_control_scope.h"
 #include "place/draft_vram_load.h"
 #include "place/ds41_index_b16.h"
+#include "place/ds41_window_packed.h"
 #include "kvstream/bringup.h"
 #include "kvstream/plan.h"
 #include "runtime/arena.h"
@@ -1078,6 +1079,11 @@ RadBuildCtx Engine::build_ctx(int rank, int64_t max_tok) const {
 }
 
 int Engine::declare() {
+    bool window_packed=false;
+    if(!ds41_window_packed_parse(std::getenv("RADIANCE_EXPERIMENTAL_DS41_WINDOW_PACKED"),&window_packed))return RAD_E_INVAL;
+    if(window_packed&&(!meta_.arch_id||std::strcmp(meta_.arch_id,"deepseek41"))) {
+        RAD_ERR("WINDOW_PACKED requires the native deepseek41 plugin/ABI");return RAD_E_UNSUPPORTED;
+    }
     /* An architecture that declares no streamed ops cannot stream, so with --kv-resident set on one
      * the flag is turned off here, with the decision named, before anything is planned for it. */
     (void)rad_tools_probe(plugins_, meta_, &arch_probe_, cfg_.image_gen_max_pixels, cfg_.image_gen_max_refs);
@@ -1549,6 +1555,22 @@ int Engine::declare() {
         }
         RAD_TRY(source_banks_->finish_coverage(consumed));
         RAD_INFO("DSpark draft bank: canonical metadata unchanged; %zu donor entries bound across %zu rank declarations",consumed.size(),ranks_.size());
+    }
+
+    /* BEFORE the placement plan, arena/pool allocation or Ctx creation. No shortened WINDOW
+     * can reach an old/unknown/fallback reader on any selected band. */
+    for(const auto& r:ranks_) {
+        bool physical=false;
+        for(const auto& g:r->program.kv_groups)physical|=g.decl.storage_format==RAD_KV_STORAGE_DS41_FP8_WINDOW_G32;
+        if(physical!=window_packed) {RAD_ERR("WINDOW_PACKED flag/declaration mismatch rank%d",r->index);return RAD_E_UNSUPPORTED;}
+        if(window_packed) {
+            Ds41WindowPackedProof proof;std::string why;
+            if(!ds41_window_packed_admit(r->program,&proof,&why)) {
+                RAD_ERR("WINDOW_PACKED refused rank%d before allocation: %s",r->index,why.c_str());return RAD_E_UNSUPPORTED;
+            }
+            RAD_INFO("ds41 WINDOW_PACKED admitted rank=%d format=3 row_bytes=528 page_bytes=8448 groups=%d layers=%d producers=%d stores=%d readers=%d",
+                r->index,proof.groups,proof.layers,proof.producers,proof.stores,proof.readers);
+        }
     }
 
     RAD_INFO("declare: %zu ops, %zu weights, %zu buffers, %zu KV groups",

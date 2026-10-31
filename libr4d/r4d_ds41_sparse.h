@@ -6,6 +6,8 @@
 /* r4d_ds41_sparse.hip */
 int     r4d_rad_ds41_index_score(const RadArgs*, RadStream);
 int     r4d_rad_ds41_index_score_kvpack(const RadArgs*, RadStream);
+int     r4d_rad_ds41_attn_sparse_sink_windowpack(const RadArgs*, RadStream);
+int     r4d_rad_ds41_attn_sparse_sink_windowpack_check(const RadArgs*, RadStream, int form);
 int     r4d_rad_ds41_attn_sparse_sink_kvpack(const RadArgs*, RadStream);
 /* Unregistered byte-oracle entry points; no architecture selects them. */
 int     r4d_rad_ds41_index_score_kvpack_check(const RadArgs*, RadStream, int form);

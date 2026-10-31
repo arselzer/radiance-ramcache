@@ -467,14 +467,15 @@ enum {
 };
 
 /* Physical page storage. Plain keeps the dtype/layout above. The DS41 forms store the ORIGINAL
- * FP4 producer codes/scales (and bounded inline BF16-bit escapes), never a new quantization.
+ * original FP4/FP8 producer codes/scales (and bounded inline BF16-bit escapes), never a new quantization.
  * Their logical dtype remains BF16, but RAD_KV operands are U8 [blocks, storage_block_bytes].
  * Only the matching packed producer/readers may use them; arbitrary BF16 writes are unsupported.
  * All plugins must be rebuilt together when this declaration changes (ABI layout fingerprint). */
 enum {
     RAD_KV_STORAGE_PLAIN = 0,
     RAD_KV_STORAGE_DS41_FP4_E4M3_G16 = 1,
-    RAD_KV_STORAGE_DS41_FP4_POW2_G32 = 2
+    RAD_KV_STORAGE_DS41_FP4_POW2_G32 = 2,
+    RAD_KV_STORAGE_DS41_FP8_WINDOW_G32 = 3
 };
 
 typedef struct RadKVGroupDecl {

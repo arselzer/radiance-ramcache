@@ -580,6 +580,7 @@ Engine::~Engine() {
      * since a pass reads them. Safe after a failed bring-up. */
     for (auto& r : ranks_) r->kv.free_stream(rad_device_allocator());
     step_state_fini();
+    kv_growth_.reset(); // Its callback and publishers refer to the still-live managers.
     ranks_.clear();
     for (TableCopy& c : table_copies_) table_copy_free(&c);
     table_copies_.clear();
@@ -1062,6 +1063,7 @@ int Engine::step_loop() {
      * pass issued ahead would overwrite them. */
     pipelining_ = draft_experiment_.target_pipelining(!cfg_.kld() && !cfg_.calib() && !embedding_,
                               serial_drafting(), block_drafting(), cfg_.n_spec);
+    if (kv_growth_) pipelining_ = false;
     early_ids_ = !cfg_.kld() && !embedding_;
     /* A tree's acceptance moves K and V on the card behind the step issued ahead. The KL mode
      * drafts nothing and an embedding model declares no drafter, so no server reaches this today;
@@ -1104,7 +1106,11 @@ int Engine::step_loop() {
         const RadBatch* b = ahead;
         ahead = nullptr;
         if (issued) sched_.promote_next();
-        else        b = sched_.step();
+        else if (kv_growth_) {
+            const int rc = kv_quiescent_plan([this] { return kv_growth_->begin_plan(); },
+                                            [this] { kv_growth_->finish_plan(); }, &b);
+            if (rc < 0) return fail_loop(rc);
+        } else b = sched_.step();
         if (!b) {
             /* Idle: back off in small steps instead of spinning; the first wait is short so a new
              * request into an empty engine is not delayed. */

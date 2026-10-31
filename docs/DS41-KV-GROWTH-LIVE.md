@@ -1,77 +1,108 @@
-# Growing physical KV: pre-admission engine seam
+# Bounded live physical KV growth
 
-Source only, default serving path unchanged. The earlier transaction and page-source commits are
-prerequisites. This branch adds an actual Engine/Scheduler quiescence hook and checked drains;
-it does **not** expose an enable flag, defer startup backing, or claim an active growing cache.
-The remaining publication and admission changes below are required before a safe public mode.
+Status: complete opt-in source cohort, not built or executed. This connects the backing policy,
+all-rank transaction, backing-aware allocator and actual Engine pre-admission hook. It is not a
+measured optimization or a token-exactness result. The ordinary serving path stays the default.
 
-`Scheduler::step_quiescent` holds the existing ownership mutex across a checked callback and all
-of `step_locked`: prefix lookup/adoption, state/window seeding, COW/page allocation and the final
-BatchBuilder upload. A failed callback returns its status and no batch before any of those
-actions. Ordinary `step()` acquires the same mutex and runs the same extracted body. The callback
-must never call a public Scheduler method because that would recursively acquire its mutex.
+The first cohort requires native DeepSeek4.1 Flash, TP4, max-num-seqs1, deterministic fixed expert
+placement and an explicit speculative depth0. It refuses P1/arena lending, TBO/second-lane
+declarations, a generic prefill stager, actual drafting, media/embedding/generator/LoRA, host-prefix
+tiers, streamed KV, general KV loans and backends without real elastic VMem. Retained VRAM prefix
+references and raw-state/window checkpoint snapshots remain supported. Plain BF16 and packed
+288/68-byte FULL pages use the same physical-growth machinery. No expert resident is added when
+KV backing is released: the expert pool remains fixed. Joint expert/KV funding is separate work.
 
-`Engine::kv_quiescent_plan` is a private, currently unused caller of that seam. Its initial scope
-is native DS41/TP4, one admitted sequence, fixed deterministic expert placement, no pipelining,
-speculation/drafter passes, generator/embedding/media encoder, host-prefix tiers, KV streaming,
-general KV loan, P1 or arena lending, or generic PrefillStager. Retained VRAM prefix refs and the
-raw state/window snapshot path are compatible with this seam; their physical holder publication
-still needs the controller below. The regular recommended configuration remains available with
-the growing mode off.
+## Explicit physical budgets
 
-The paired `RankBarrier` generation is checked before and under scheduler ownership. An even
-non-aborted generation is before the scheduler releases ranks or after every rank CPU issuer
-joined; because the sole step thread does not arrive at the next release during the hook,
-workers cannot issue another pass. This check proves CPU parking, not GPU completion. Every rank
-then checks that its FileStager CPU/miss pass ended, drains remaining RAM insert helpers, drains
-both Ctx compute lanes and its host row-prefetch helper, retires mapped-source copy leases,
-drains the mover transfer queue, and uses TierExec's new checked drain. Device selection returns
-to rank0 on both success and failure. The backing callback runs only after all ranks succeed.
+All six environment settings are required to opt in. Unset/0 enables the existing fixed-backing
+path; supplying growth tunables while the main switch is off is a refusal.
 
-No drain helper needs the scheduler mutex to finish: FileStager `end_pass`/`hx_drain` joined CPU
-expert/miss work before the CPU barrier; RAM insert workers use mover/RAM-cache locks; Ctx host
-read-ahead workers only advise weight pages; transfer events execute from already submitted GPU
-packets. Background immutable expert/RAM read-ahead never owns KV, and fixed expert residency plus
-the KV-loan refusal prevents it from aliasing a KV granule. New work is not released while the
-ownership lock is held. `prepare_release`, snapshot restore, `prefill_hash_stage`, media work and
-`tier_tick` stay outside this callback, preventing recursive scheduler calls.
+```
+RADIANCE_EXPERIMENTAL_DS41_KV_GROW=1
+RADIANCE_EXPERIMENTAL_DS41_KV_GROW_MIN_MIB=0
+RADIANCE_EXPERIMENTAL_DS41_KV_GROW_MAX_MIB=<actual rounded KV VA reservation>
+RADIANCE_EXPERIMENTAL_DS41_KV_GROW_WARM_MIB=0
+RADIANCE_EXPERIMENTAL_DS41_KV_GROW_HYSTERESIS_MIB=0
+RADIANCE_EXPERIMENTAL_DS41_KV_GROW_HEADROOM_MIB=<explicit runtime free-memory floor>
+```
 
-Prepared source cases verify paired CPU parking versus active/aborted phases, both Ctx lanes
-draining while the context remains reusable, and a pre-plan device-failure refusal preserving
-prefix refcounts/free lists with no lookup/adoption/allocation; the following successful plan
-then adopts that same prefix. No test was executed.
+Values are nonnegative decimal MiB; MAX is positive and MIN<=MAX. MAX must equal the entire
+granule-rounded stable KV reservation on every rank. Startup names the required value on a
+mismatch. For example,187MiB logical with a2MiB backend granule requires188MiB physical MAX.
+The first cohort deliberately funds every advertised logical page; a lower physical cap requires
+a separate admission/can-ever-fit proof and is refused here. No context or expert-RAM budget is
+hardcoded. MIN is a total minimum, not an extra allocation beside mandatory holders. The actual
+backend granule rounds MIN up, MAX down, and charges sparse mappings and the tail honestly.
 
-## Why an enable flag is still absent
+The full maximum is checked against fresh free memory after eager context/weight allocations,
+plus late step/queue allocations and the larger of configured startup GPU headroom and explicit
+runtime headroom. Only the minimum and all raw-state/window pool floors are physically mapped at
+startup. Thus free memory exceeds the eager-backing case, but is reserved funding for later KV,
+not unused expert-pool capacity. At runtime, each positive mapping peak must leave the explicit
+runtime floor plus remaining lazy-allocation allowance free. A pure release may heal pressure.
+External allocation races still return a fatal, safely unpublished transaction failure.
 
-The existing manager publishes every carved page in its free heap at startup. Its `live_` mark
-is a contiguous expert-loan boundary, not a physical backing mask. A correct growing controller
-must first stage distinct per-rank backed-ID masks/free heaps and make **all** block allocation,
-specific reservation, prefix adoption, COW, tier/follower restoration and free-count paths honor
-them. No unmap can run while an old heap still offers an affected ID. State/window floors remain
-fully backed, and every bound layer fragment of a candidate page must be mapped before that ID
-is eligible. Prefix refs and queued/issued copy lifetimes must keep their pages mandatory.
+## Admission, publication and lifetimes
 
-Growth must run synchronously before allocation inside admission. Source audit confirms all
-`ensure_from` calls in `Scheduler::step_locked` precede its final `BatchBuilder::build`, which is
-where copies/uploads are enqueued. This gives a usable pre-upload interval under the new lock
-seam. Its availability must be explicit in the controller so callbacks cannot be invoked later
-from a path already queueing GPU work. `can_grow`/admission accounting must consider fundable
-future backing, not just currently mapped free IDs, without handing out those IDs early.
+The Engine disables pipelining/ahead and calls `Scheduler::step_quiescent` for every ordinary
+plan. It holds the scheduler ownership mutex across the drain, shrink and complete planning
+phase, including prefix lookup/adoption, COW/page allocation and BatchBuilder upload. Its paired
+rank barrier must be in an even parked generation before and under this mutex; the sole step
+thread has not released the next generation, so CPU rank issuers cannot restart during mapping.
+Parking is distinct from GPU completion. The callback drains both Ctx compute lanes, host
+row-prefetch, FileStager CPU/miss work and RAM insert helpers, mover mapped-source leases and
+transfer queue, and the checked tier queue on every rank before changing backing.
 
-Current scheduler retry loops treat every negative `ensure_from` as a capacity shortfall and may
-evict prefixes or preempt. A failed physical mapping transaction needs a separate fatal/refusal
-status latch that is checked before publishing the built batch; an unrepaired mapping must call
-the engine error path after releasing scheduler ownership. It cannot be retried as ordinary
-memory pressure, and a pending poisoned heap must never be used during those retry loops.
+None of those drain helpers calls Scheduler: FileStager end_pass/hx_drain finished CPU expert
+work before the rank join, insert/read-ahead workers use only mover/RAM-cache locks, and already
+submitted transfer packets need no scheduler callback. `prepare_release`, hash staging, snapshot
+restore and tier_tick remain outside this callback. Cleanup ends the controller lease under the
+same scheduler lock on success, failure or exception, avoiding recursive locking or an unowned
+allocation interval.
 
-Startup must reserve the maximum fixed VA/strides while deferring full KV commit, publish no
-unbacked IDs, and map the configured physical minimum plus window/raw-state floors before any
-state clearing or scheduler request starts. The final physical maximum/headroom proof belongs
-after other eager allocations and includes later step/queue allowances. It must charge rounded
-tail granules honestly and retain the old funding until transaction commit. A smaller physical
-maximum than the logical capacity also needs a correct `can_ever_fit` refusal, not an admission
-livelock. Unsupported VMem, streaming and loan combinations require explicit refusal/fallback.
+The allocator publishes no unbacked ID. Before grab/COW/specific reservation/adoption/restoration
+it requests exact candidate IDs. The controller translates all bound layer fragments, including
+cross-granule pages, and performs a real all-rank transaction before any requested ID is handed
+out. Leader sequence and retained-prefix refs, pending COW source/destination refs and transient
+multi-group allocation intents pin their physical pages. Copies already removed from the pending
+inventory are covered by the preceding stream drains. Whole raw-state/window pools are fixed
+floors. Native sparse padding reads a separate zero key rather than a speculative cache block0,
+so it adds no unowned page0 floor.
 
-Only after those pieces are connected may `step_loop` disable ahead/pipelining and select this
-hook. The smallest initial mode can keep expert residents fixed; physical KV release alone does
-not expand the existing weights pool. A future joint expert/KV physical ledger remains separate.
+All ranks stage replacement backed-ID masks/heaps/counts before withdrawal. New backing becomes
+allocatable only after every rank succeeds. Commit failure removes every newly mapped extent,
+including a failed-access mapping recorded as physically present, then restores old backing
+where possible. Any failed cleanup/restoration poisons publication; even a successful rollback
+is fatal to this Engine cohort and withdraws every rank. Scheduler's separate allocation-error
+latch prevents eviction/retry or a page-table upload after a fatal mapping result. Stable VA,
+maximum layer strides and captured addresses never move.
+
+At the next drained pre-admission boundary, released sequence/prefix/COW holders permit physical
+shrink to the mandatory union plus configured warm/minimum room and hysteresis. Retained prefixes
+can keep fragmented granules pinned. There is no background relocation or live stride resize.
+Kh hashing copies only the referenced physical FULL-page runs, preserving the old logical BF16
+hash order/length while avoiding D2H reads through unmapped max-VA holes.
+
+## Receipts and pending validation
+
+Every real transaction logs one `DS41_KV_GROW rank=... epoch=... cause=startup|grow|shrink` row per
+rank, with logical/reserved/granule/old/actual/min/max bytes. A successful startup also logs
+`DS41_KV_GROW_READY` and per-rank `DS41_KV_GROW_BUDGET` free/actual/deferred/maximum bytes. No-op
+plans add no transaction marker. A model gate must require actual grow and shrink markers for
+all four ranks, stable VA/strides, and Kh/token identity, rather than treating READY as activity.
+
+Prepared new targets: `kv_live_budget_test` (three parser/tail/headroom/funding cases),
+`kv_live_controller_test` (three actual host Pool/VMem/all-rank-manager composition cases) and
+`kv_hash_runs_test` (two sparse plain/packed physical-fetch cases). Controller cases cover real
+minimum backing, multi-group growth, prefix-pinned shrink, final release, stable addresses/strides,
+all-rank fatal funding refusal before ID allocation and rejection outside the ownership lease.
+The allocator/transaction prerequisites add fault-injection, COW/cross-granule and scheduler fatal
+cleanup cases. CMake globs add these files automatically after regeneration. No builds, syntax
+checks, tests, emulators, simulations, GPU work or services were run in this source lane.
+
+Root must run serialized host gates, a coherent full-plugin rebuild (packed ABI requires it),
+then a locked QFN-stop/restore card window. Compare fixed versus growing plain storage first,
+then packed only after its own codec/producer/reader gates pass. Include prefix reuse/cancel,
+long/decode Kh, a small-budget/96GiB expert-cache path beside current192GiB, and forced growth.
+No recommended configuration changes until those gates pass. The earlier
+`DS41-KV-GROWTH.md` records the policy-only milestone; this file records the connected caller.

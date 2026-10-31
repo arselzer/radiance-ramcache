@@ -13,10 +13,12 @@
  * of the window group apart (the consumer skip's layers, where a difference would show), then one
  * line folding every rank's. Two runs with the same requests in the same order compare line by line
  * (tools/ds41-host-experts/prefill_hash_compare.py). Debug only: each rank synchronises its stream
- * and copies whole layer pools to the host, and steps are not issued ahead while it is on. */
+ * and copies layer pools to the host (only referenced physical runs with growing KV), and steps
+ * are not issued ahead while it is on. */
 #include "engine_priv.h"
 #include "device/device.h"
 #include "mem/kv_storage_decode.h"
+#include "mem/kv_hash_runs.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -119,7 +121,7 @@ void Engine::prefill_hash_rank(Rank& r, const RadBatch* b) {
     }
     const Program& p = r.program;
     /* One layer's pool at a time, through a pinned buffer as large as the largest. */
-    auto fetch = [&](const void* src, int64_t bytes) -> const uint8_t* {
+    auto fetch = [&](const void* src, int64_t bytes, const KVHashRuns* sparse = nullptr) -> const uint8_t* {
         if (bytes <= 0 || !src) return nullptr;
         if (bytes > r.hash_cap) {
             if (r.hash_host) rad_dev_free(r.hash_host, RAD_MEM_HOST_PINNED);
@@ -127,9 +129,19 @@ void Engine::prefill_hash_rank(Rank& r, const RadBatch* b) {
             r.hash_cap = r.hash_host ? bytes : 0;
             if (!r.hash_host) return nullptr;
         }
-        if (rad_memcpy_async(r.hash_host, src, bytes, r.ctx.stream()) < 0 ||
-            rad_stream_sync(r.ctx.stream()) < 0)
-            return nullptr;
+        int copied = RAD_OK;
+        if (sparse) {
+            for (const auto& run : *sparse)
+                if (run.first < 0 || run.second < 0 || run.first > bytes || run.second > bytes - run.first ||
+                    run.second == 0) return nullptr;
+            for (const auto& run : *sparse) {
+                copied = rad_memcpy_async(r.hash_host + run.first, (const char*)src + run.first,
+                                          run.second, r.ctx.stream());
+                if (copied < 0) break;
+            }
+        } else copied = rad_memcpy_async(r.hash_host, src, bytes, r.ctx.stream());
+        const int drained = rad_stream_sync(r.ctx.stream()); // retire earlier runs even if a later copy failed
+        if (copied < 0 || drained < 0) return nullptr;
         return r.hash_host;
     };
     for (const PrefillHashJob::Seq& sq : job.seqs) {
@@ -181,11 +193,24 @@ void Engine::prefill_hash_rank(Rank& r, const RadBatch* b) {
             int n_layers = 0;
             std::vector<uint16_t> decoded(kv_storage_packed(gi.decl)
                 ? (size_t)(2 * gp->block_size * gi.decl.head_dim) : 0);
+            KVHashRuns physical_runs;
+            const bool sparse = kv_growth_ && gp->kind == RAD_KV_FULL;
+            const bool valid_runs = !sparse ||
+                kv_hash_physical_runs(gi.decl, gp->block_size, kb->layer_stride, runs, &physical_runs);
             for (int32_t l : gi.layers) {
                 if (l < 0 || (size_t)l >= kb->layer_slot.size() || kb->layer_slot[(size_t)l] < 0) continue;
-                const uint8_t* host = fetch((const char*)kb->base + (int64_t)kb->layer_slot[(size_t)l] *
-                                                                      kb->layer_stride,
-                                            kb->layer_stride);
+                bool backed = valid_runs;
+                const int64_t layer_offset = (int64_t)kb->layer_slot[(size_t)l] * kb->layer_stride;
+                if (sparse)
+                    for (const auto& run : physical_runs)
+                        backed &= r.pools.kv().is_backed(gp->pool_offset + layer_offset + run.first, run.second);
+                if (!backed) {
+                    RAD_ERR("prefill hash: unbacked or invalid physical runs in group '%s', layer %d",
+                            name.c_str(), (int)l);
+                    line += " invalid-physical-hash-run";
+                }
+                const uint8_t* host = backed ? fetch((const char*)kb->base + layer_offset,
+                    kb->layer_stride, sparse ? &physical_runs : nullptr) : nullptr;
                 uint64_t h = kSeed;
                 if (!host) {
                     h = 0;

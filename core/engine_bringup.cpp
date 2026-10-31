@@ -3899,6 +3899,7 @@ int Engine::configure_kv() {
         const KVManager::StreamCost sc = r->kv.stream_cost();
         if (sc.groups > 0)
             RAD_TRY(r->kv.alloc_stream(rad_device_allocator(), r->pools.kv()));
+        if (kv_growth_options_.enabled) RAD_TRY(r->kv.enable_backing_mode());
         RAD_TRY(r->kv.carve(r->pools.kv()));
         if (sc.groups > 0) RAD_TRY(kvstream_fill(r->kv));   /* the maps, after the elastic pool */
         /* Without virtual memory management the cache cannot lend: everything still works, but
@@ -4193,6 +4194,9 @@ int Engine::configure_kv() {
 
 /* ================================================================== start */
 int Engine::start() {
+    // Clear the callback while its previous managers still exist on a repeated bring-up.
+    kv_growth_.reset();
+    RAD_TRY(kv_growth_parse());
     // Before device discovery, model open or generic draft-host automatic pool growth.
     if (draft_placement_modes_conflict(cfg_)) {
         RAD_ERR("draft placement: experimental bank and generic manual modes cannot be combined");
@@ -4233,8 +4237,14 @@ int Engine::start() {
     /* The machine before the model: a refusal here costs a second, after the load it costs the
      * load. */
     RAD_TRY(check_configuration(devs));
+    RAD_TRY(kv_growth_devices(devs));
 
     RAD_TRY(read_metadata());
+    if (kv_growth_options_.enabled &&
+        (!meta_.arch_id || std::strcmp(meta_.arch_id, "deepseek41"))) {
+        RAD_ERR("%s requires the native deepseek41 architecture", kKVLiveEnv);
+        return RAD_E_UNSUPPORTED;
+    }
     if (cfg_.max_ctx == 0)
         decide("--max-model-len", std::to_string(meta_.n_ctx_train),
                "the model's training context (--max-model-len 0)");
@@ -4376,6 +4386,7 @@ int Engine::start() {
     }
 
     RAD_TRY(plan());
+    RAD_TRY(kv_growth_layout());
     if (draft_experiment_.scope_required()) {
         if (ranks_.size() != 4) return RAD_E_UNSUPPORTED;
         /* The cap measures the full block's query unless the drafter declared a short block
@@ -4737,6 +4748,7 @@ int Engine::start() {
     }
 
     RAD_TRY(step_state_init());
+    RAD_TRY(kv_growth_start());
 
     /* ---- the budget, checked against the card --------------------------------------------
      *
@@ -4761,6 +4773,15 @@ int Engine::start() {
         LogRank lr(r->index);
         RadDeviceProps props{};
         if (rad_dev_props(r->device, &props) < 0 || props.vram_bytes <= 0) continue;
+
+        if (kv_growth_) {
+            const int64_t actual = r->pools.kv().committed();
+            RAD_INFO("DS41_KV_GROW_BUDGET rank=%d free=%lld actual=%lld deferred=%lld "
+                     "maximum=%lld fixed_experts=1", r->index, (long long)props.vram_free,
+                     (long long)actual, (long long)(kv_growth_options_.maximum_bytes - actual),
+                     (long long)kv_growth_options_.maximum_bytes);
+            continue; // Deferred backing is funded KV capacity, not unused expert-pool slack.
+        }
 
         /* Both the headroom and the later allocations are still free here: serve() allocates
          * the step staging; the KV tiers' staging and a second lane are built on first use. */

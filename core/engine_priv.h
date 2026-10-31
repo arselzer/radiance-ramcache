@@ -13,6 +13,7 @@
 
 #include "mem/pools.h"
 #include "mem/kv.h"
+#include "mem/kv_live_controller.h"
 #include "mem/prefix.h"
 #include "mem/kvtier.h"
 #include "runtime/tierexec.h"

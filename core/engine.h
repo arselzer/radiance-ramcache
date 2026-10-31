@@ -27,6 +27,7 @@
 #include "engine_hostmem.h"
 #include "diag/diag.h"
 #include "mem/hostarena.h"
+#include "mem/kv_live_budget.h"
 #include "runtime/ctx.h"   /* KVStageRun */
 #include "sched/mem_iface.h"
 #include "sched/scheduler.h"
@@ -53,6 +54,7 @@
 #include <thread>
 
 namespace rad {
+class KVLiveController;
 
 class Kld;
 class StallWatch;
@@ -536,9 +538,18 @@ private:
     void eors_report();
     /* The arena level and the followers' pools, before any release that runs a forward pass. */
     int  prepare_release(const RadBatch* b);
-    /* UNUSED physical-KV prerequisite. The callback changes backing under scheduler ownership
-     * after all issuers/readers drain, before admission. No runtime flag/caller enables it yet. */
-    int kv_quiescent_plan(const std::function<int()>& change, const RadBatch** out);
+    /* Bounded physical KV mode: callbacks run inside scheduler ownership, before allocation;
+     * after_plan clears the lease before that ownership unlocks. */
+    int kv_quiescent_plan(const std::function<int()>& change, const std::function<void()>& after_plan,
+                           const RadBatch** out);
+    int kv_growth_parse();
+    int kv_growth_devices(const std::vector<int>& devices);
+    int kv_growth_layout();
+    int kv_growth_start();
+    int kv_growth_scope(bool runtime) const;
+    int kv_growth_drain();
+    KVLiveOptions kv_growth_options_;
+    std::unique_ptr<KVLiveController> kv_growth_;
     /* Whether a step may be issued ahead: requires that the drafter, if any, runs on the card (the
      * prompt-lookup drafter reads the committed sequence). */
     bool pipelining_ = false;

@@ -121,7 +121,7 @@ bool producer_oracle(const char* path) {
     if (!plain_rt || !packed_rt || !plain_store || !packed_store) {
         std::fprintf(stderr, "FAIL producer/store export missing (no silent standalone fallback)\n"); dlclose(lib); return false;
     }
-    size_t bad = 0;
+    size_t bad = 0, cases = 0;
     for (uint32_t kind : { 1u, 2u }) for (int M : { 1, 7, 33, 257, 512 }) for (int bs : { 1, 2 }) {
         const int n = kind == 1 ? 512 : 128, G = kc::group_size(kind), pitch = n + 16, blocks = M + 3;
         const int64_t rb = kc::row_bytes(kind, n);
@@ -172,10 +172,13 @@ bool producer_oracle(const char* path) {
             for (int c = 0; c < n; ++c) bad += decoded[(size_t)c] != got_cache[(size_t)(guard + p * n + c)];
         }
         for (void* p : { a, b, cap, old_cache, new_cache, pg }) HC(hipFree(p));
+        ++cases;
     }
     dlclose(lib);
     std::printf("%s producer+packed-store: %zu uint16/guard differences\n", bad ? "FAIL" : "PASS", bad);
-    return bad == 0;
+    if (bad == 0 && cases == 20)
+        std::printf("PASS producer+packed-store coverage: cases=%zu kinds=1,2 blocks=1,2 M=1,7,33,257,512 exhaustive_bf16=65536\n", cases);
+    return bad == 0 && cases == 20;
 }
 }
 int main(int argc, char** argv) {

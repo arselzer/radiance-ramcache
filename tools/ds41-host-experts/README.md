@@ -53,10 +53,11 @@ RADIANCE_EXPERIMENTAL_DS41_EARLY_ISSUE=1                    # routed card ops qu
 RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP=1                 # prefill: layers 21-39 only on rows that reach the output
 RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP_CKPT=512          # with the prefix cache: the snapshots within 512 tokens below a cut prompt's target whole (the default when unset; all: every one, N: those within N tokens, 0: none -- see the table)
 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MAX_ROWS=32          # prefill: CPU jobs of up to 32 rows of one expert, many-row kernel
-RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MISSES=1024         # misses computed on the CPU in passes of up to 1024 tokens
-RADIANCE_EXPERIMENTAL_DS41_LCP=1024                         # large-chunk prefill: chunks of 1024 tokens (with --max-num-batched-tokens 1024)
+RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MISSES=2048         # misses computed on the CPU in passes of up to 2048 tokens (>= the chunk with a lent arena)
+RADIANCE_EXPERIMENTAL_DS41_LCP=2048                         # large-chunk prefill: chunks of 2048 tokens (with --max-num-batched-tokens 2048)
 RADIANCE_EXPERIMENTAL_DS41_MOE_BALANCE=1                    # routed gemv: work split by row passes, all-dropped passes skipped (exact)
 RADIANCE_EXPERIMENTAL_DS41_P1=1                             # prefill Phase 1: layer passes of >= 320 rows (..._P1_MIN_ROWS) compute every routed expert on the cards (needs the libr4d whose P1 card check passed)
+RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA=64                 # the activation arena's idle top holds ~42 decode residents a card between long prefills (needs the deepseek41 plugin from this tree and ..._EARLY_ISSUE=1)
 RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP=1                # no pass after a reply's end-of-generation token
 RADIANCE_EXPERIMENTAL_DS41_PREFETCH_URGENT=1               # a partly read read-ahead unit's rest read whole in its layer's own read
 RADIANCE_EXPERIMENTAL_DS41_INSERT_SLICE_KIB=256            # background inserts in 256 KiB pieces, waiting for an idle pool
@@ -66,10 +67,20 @@ RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_FUTEX=1            # pool workers sleep 
 
 radiance ... --tp 4 --placement expert_tiered --weights-disk-tier \
   --expert-ram-cache-total-mib 196608 --host-pool-mib 256 --embedding-placement ram \   # 192 GiB on a 256 GB box (98304 on 128 GB)
-  --max-num-batched-tokens 1024 --expert-profile <decode profile> \
+  --max-num-batched-tokens 2048 --expert-profile <decode profile> \
   --expert-plane-mirror <dir of the checkpoint's model-*.safetensors> \
   --expert-plane-mirror-decode-share 0.13                              # the mirror is optional, see below
 ```
+
+**2,048-token chunks with the lent arena** (the block above; ab-20261031T011849Z, T022949Z, T030023Z: prefill hashes
+and every reply identical): time to first token 5.0 / 7.2 / 17.2 s for prompts of 1,890 / 3,086 / 6,817 tokens,
+against 7.5 / 8.6 / 26.7 s at 1,024-token chunks (shorter prompts unchanged); held-out decode 29.45 against 29.91
+tok/s (−1.5%); 4 and 8 streams 37.2 / 41.5 against 38.0 / 41.2 tok/s in total; short replies right after a long
+prompt decode ~6% slower until the lent residents are reloaded (~1-1.5 s). For decode-heaviest use keep
+`..._LCP=1024`, `--max-num-batched-tokens 1024`, `..._MISSES=1024` and no lent arena. Both chunk sizes include the
+compressor tail sized to the step (+0.6% decode at 1,024). The LCP/P1 configurations cannot use packed VRAM
+residents, so under concurrency they stay 2-4% below the decode-only M16 setup with `..._VRAM_PACKED` (38.7 / 42.9
+at 4 / 8 streams) while prefilling 3-10x faster.
 
 **Phase 1 prefill** (`..._P1=1` with the 6-unit file buffers; ab-20261030T231526Z, every reply and prefill hash
 identical to the large-chunk path): time to first token 1.9 / 3.7 / 4.2 / 7.4 / 8.7 s for prompts of 82 / 272 / 933 /

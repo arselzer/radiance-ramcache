@@ -149,6 +149,9 @@ DRAFT_BANK=${DRAFT_BANK:-}   # a DSpark draft bank (draft.rad) bound to $MODEL, 
 # held-out capture's hot set for the chat prompts and DRAFT_HOTSET_heldout the chat capture's, so neither
 # set is scored on its own capture; DRAFT_HOTSET_db2 one taken with the short block the Db2 arms route).
 DRAFT_HOTSET=${DRAFT_HOTSET:-}
+# Dc arms: DSpark's confidence head as tools/ds41-host-experts/dspark_conf_extract.py writes it
+# (RADIANCE_EXPERIMENTAL_DS41_DSPARK_CONF_HEAD); no default.
+DRAFT_CONF_HEAD=${DRAFT_CONF_HEAD:-}
 hotset_for() {   # an arm's name: its hot-set file (above), or empty
   local a=$1 u k v
   u=$(tr '-' '\n' <<< "$a" | grep -m1 -E '^U.+'); u=${u#U}; u=${u:-heldout}
@@ -671,6 +674,25 @@ EOF2
     stop_server; return 1
   fi
   [[ -n "${ARM_DG:-}" ]] && grep -m1 'DSpark acceptance gate: on' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
+  # Dc / Dl / Dx / Dm (draft_conf.h, planner.h): each says so at startup (Dc also its head, Dm a
+  # placement line for each codebook); an arm with the part and without its line, or the other way
+  # round, is not measured.
+  local want got pat
+  for pat in "Dc:DSpark confidence head: " "Dl:DSpark load-aware drafting: on" "Dx:DSpark context pass deferred (" \
+             "Dm:placement: 'dspark.markov_w" "Ds with NK:DSpark draft bank with up to "; do
+    want=${pat%%:*}; got=$(grep -cF "${pat#*:}" "$OUT/$name.server.log")
+    local flag; case $want in Dc) flag=${ARM_DC:-};; Dl) flag=${ARM_DL:-};; Dx) flag=${ARM_DX:-};; Dm) flag=${ARM_DM:-};;
+                              "Ds with NK") flag=${ARM_SOLO:-};; esac
+    if [[ -n "$flag" && "$got" == 0 ]]; then
+      log "arm $name: $want, but the server log has no '${pat#*:}' line (a radiance or plugin without the switch?); not measured"
+      stop_server; return 1
+    fi
+    if [[ -z "$flag" && "$got" != 0 ]]; then
+      log "arm $name: no $want part, but the server log has '${pat#*:}' (the switch set for the window?); not measured"
+      stop_server; return 1
+    fi
+  done
+  grep -E "DSpark (confidence controller|confidence head|load-aware drafting|context pass deferred) \(|DSpark confidence head: |placement: 'dspark.markov_w|DSpark draft bank with up to " "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   # Df (RADIANCE_EXPERIMENTAL_DS41_DSPARK_FP8): the plugin names, on each rank, the drafter's dense
   # weights it reads from E4M3 codes. A Df arm without such a line with N above 0, or another arm
   # with one, is not measured.
@@ -872,6 +894,9 @@ EOF2
   grep -E 'host expert pool: |host experts, pre-wake: |host experts, one-token passes: ' "$OUT/$name.server.log" | tee -a "$OUT/window.log"   # Fw/WpN: the wake-up, decode's gather waits
   # Dg: the gate's totals, the decode steps by kind (the measured break-even), each sequence's line.
   grep -E 'DSpark acceptance gate: ' "$OUT/$name.server.log" | grep -v 'DSpark acceptance gate: on' | tee -a "$OUT/window.log"
+  # Dc / Dl / Dx / a Ds part with NK: their shutdown report (totals, calibration, context passes, steps by
+  # kind and of two or more sequences, each request).
+  grep -E 'DSpark (confidence controller|load-aware drafting|context pass deferred|controls|draft bank with several sequences): ' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   grep -E 'end-of-request snapshots: [0-9]+ reserved' "$OUT/$name.server.log" | tail -1 | tee -a "$OUT/window.log"   # Pce/Pcl: stored, hits, store
 }
 
@@ -1244,7 +1269,11 @@ for a in $ARMS; do
 # / Xi miss reads on threads started per call / on 4 KiB pages / relaid via scratch (the old ways,
 # as A/B switches); Ds / DsN / Dsa DSpark speculation from $DRAFT_BANK at depth 5 / capped at N
 # drafts a step (Ds0: the bank loaded, drafting off) / with the adaptive window (the bank pins its
-# experts in the host pool: give the arm pN of ~2048); Dk the draft bank's grouped GEMMs take the
+# experts in the host pool: give the arm pN of ~2048); a Ds part goes with NK / CK / Pf like any
+# other: with K above 1 a sequence drafts only in a step that carries it alone while no other decodes,
+# and a step of two or more decoding sequences verifies no draft (the plain batch); a drafting Ds arm
+# with K above 1 is measured only with the scheduler's "DSpark draft bank with up to K sequences" line
+# (a radiance that has it), and every other arm must not have it; Dk the draft bank's grouped GEMMs take the
 # live tail and one pass over each expert's weights (RADIANCE_EXPERIMENTAL_DS41_DRAFT_GEMV=1: no
 # slot routed to another rank runs against the rank's last expert, and an expert's rows share one
 # read of its pinned host weights; exact; a libr4d that has it, and a Ds part), Dkt the live tail
@@ -1276,7 +1305,19 @@ for a in $ARMS; do
 # (RADIANCE_EXPERIMENTAL_DS41_DSPARK_FP8; needs F8, a Ds part and a deepseek41 plugin that has it;
 # measured only with its "DSpark drafter: N dense weights read by gemm_nt_bf16f8" lines, every other
 # arm runs with it 0 and must not have them; at the end each Df arm's draft_n/draft_n_accepted must
-# equal the same arm's without Df); H3 the third run home (RADIANCE_HOME_DIR3); Es
+# equal the same arm's without Df); Dc / DcTT[rR] DSpark's confidence controller
+# (RADIANCE_EXPERIMENTAL_DS41_DSPARK_CONF=1 or 0.TT[,R], with ..._CONF_HEAD=$DRAFT_CONF_HEAD: a sequence
+# drafts while the confidence head's p for its newest draft is at least 0.TT, 0.55 by default, and below
+# it only one step in R, 8, as a probe), Dl / DlN load-aware drafting (..._DSPARK_LOAD=1 or N: no
+# drafts while 2, or N, sequences decode), Dx the drafter's context pass deferred while nothing drafts
+# (..._DSPARK_CTX_DEFER=1: the trunk keeps every sequence's taps in the drafter cache's slots, and a
+# pass runs only for a drafting sequence, over what it owes: from its cache's end, or the window below
+# its anchor, in passes of 16; with NK, steps of several sequences run none and the one left alone
+# drafts at once), Dm the drafter's
+# Markov codebooks pinned in host memory with the embedding (..._DSPARK_CODEBOOK_RAM=1; needs Er): each
+# needs a Ds part (Dc / Dl / Dx not Ds0, Dc not with Dg) and a radiance (Dc, Dx: and a deepseek41
+# plugin) that has it; measured only with its startup line, and every other arm runs with it 0 and must
+# not have it; their shutdown report goes to window.log; H3 the third run home (RADIANCE_HOME_DIR3); Es
 # engram_kv's rows split over the ranks (needs a deepseek41 plugin that has it); Pa the next layer's
 # attention weights read into the card's on-die cache during the CPU-row wait (same); PmN those reads
 # from the use-order list up to N MiB an issue point, the read that crosses it cut
@@ -1404,7 +1445,7 @@ for a in $ARMS; do
 # offline in bf16, int8 and int4 against the container's routers); needs a predictor part.
   IFS=- read -r -a parts <<< "$a"
   xt="" bt="" kld="" dk="" db="" pu="" ins_nt="" ins_kib="" ins_wait="" lean="" lc="" ad="" dv="" xd="" hs="" dg="" df="" pmr="" tb=""
-  mb="" lf=""
+  mb="" lf="" dc="" dl="" dx="" dm="" ds="" nseq=""
   p1="" q1=() qm="" ql="" qg=""
   pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 HOST_POOL_MIB=4096 EXTRA_ARGS="" ARM_HOME="$RHOME" ARM_CONC=
   ARM_PROMPTS= ARM_N= ARM_LQ= rt=
@@ -1473,6 +1514,7 @@ for a in $ARMS; do
       Xh)      env+=(RADIANCE_EXPERIMENTAL_DS41_PLANE_HUGEPAGES=0) ;;  # miss buffers on 4 KiB pages
       Xi)      env+=(RADIANCE_EXPERIMENTAL_DS41_INSERT_DIRECT=0) ;;    # missed units relaid via scratch
       Ds|Ds[0-9]|Dsa)
+               ds=$p
                if [[ -z "$DRAFT_BANK" ]]; then log "arm $a: $p needs DRAFT_BANK=<draft.rad>"; skip=1; fi
                env+=(RADIANCE_EXPERIMENTAL_DS41_DSPARK_RAD_BANK=1)
                # host: the bank's 96 expert pairs pinned in the host pool and read in place by the card,
@@ -1500,6 +1542,19 @@ for a in $ARMS; do
                  (( 10#${BASH_REMATCH[5]:-8} >= 2 )) || { log "arm $a: $p: a probe one step in R needs R >= 2; the arm is skipped"; skip=1; }
                else log "arm $a: $p: the gate is Dg or DgTT[wW][rR] (threshold 0.TT or T.TT, W verifies, a probe one step in R); the arm is skipped"; skip=1; fi ;;
       Df)      df=1 ;;                     # the drafter's dense linears from E4M3 codes (DSPARK_FP8; needs F8)
+      Dc|Dc[0-9]*)                         # DSpark's confidence controller (DSPARK_CONF): defaults, or DcTT[rR]
+               if [[ $p == Dc ]]; then dc=1
+               elif [[ $p =~ ^Dc([0-9]{2})(r([0-9]+))?$ ]]; then
+                 dc="0.${BASH_REMATCH[1]}${BASH_REMATCH[3]:+,${BASH_REMATCH[3]}}"
+                 (( 10#${BASH_REMATCH[3]:-8} >= 2 )) || { log "arm $a: $p: a probe one step in R needs R >= 2; the arm is skipped"; skip=1; }
+               else log "arm $a: $p: the controller is Dc or DcTT[rR] (threshold 0.TT, a probe one step in R); the arm is skipped"; skip=1; fi
+               [[ -f "$DRAFT_CONF_HEAD" ]] || { log "arm $a: $p needs DRAFT_CONF_HEAD=<dspark_conf_extract.py's file>; the arm is skipped"; skip=1; } ;;
+      Dl|Dl[0-9]*) dl=${p#Dl}; dl=${dl:-1}  # load-aware drafting (DSPARK_LOAD): none from 2 (Dl) or N decoding sequences
+               if ! [[ $dl =~ ^[0-9]+$ ]] || ! { [[ $dl == 1 ]] || (( 10#$dl >= 2 && 10#$dl <= 64 )); }; then
+                 log "arm $a: $p: DlN takes 2-64; the arm is skipped"; skip=1
+               fi ;;
+      Dx)      dx=1 ;;                     # the drafter's context pass deferred while nothing drafts (DSPARK_CTX_DEFER)
+      Dm)      dm=1 ;;                     # the drafter's Markov codebooks pinned with the embedding (DSPARK_CODEBOOK_RAM; needs Er)
       K)       env+=(RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE=1) ;;     # the RAM cache packed for the CPU only
       Vp)      env+=(RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED=1) ;;      # VRAM residents in the packed-scale form (vpack_gate)
       Lm[0-9]*) ARGS+=(--max-model-len "${p#Lm}") ;;   # a longer context (default 512), e.g. for long-prompt TTFT
@@ -1516,7 +1571,7 @@ for a in $ARMS; do
       Pcr)     pcopt+=" $p"; hpr=1; env+=(RADIANCE_EXPERIMENTAL_DS41_KV_REPLICATED=1) ;;       # index/compressed caches replicated
       Pf)      env+=(RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE=1) ;;   # a prefill chunk alone in its step; decode rows batched
       Tb)      tb=1 ;;                                                 # two-batch overlap of concurrent decode steps
-      N[0-9]*) ARGS+=(--max-num-seqs "${p#N}") ;;                     # this arm's --max-num-seqs (MAX_SEQS for every arm)
+      N[0-9]*) ARGS+=(--max-num-seqs "${p#N}"); nseq=${p#N} ;;        # this arm's --max-num-seqs (MAX_SEQS for every arm)
       C[0-9]*) ARM_CONC=${p#C} ;;                                     # this arm's requests sent K at a time (AB_CONCURRENCY)
       L[0-9]*) ARGS+=(--max-model-len "${p#L}") ;;                    # this arm's --max-model-len (KV for N sequences)
       Ov)      env+=(RADIANCE_EXPERIMENTAL_DS41_CHAIN_OVERLAP=1) ;;    # independent dispatches overlap, decode passes
@@ -1749,6 +1804,25 @@ for a in $ARMS; do
   if [[ -n "$df" && -z "$f8" ]]; then
     log "arm $a: Df needs F8 (the drafter's FP8 extends the trunk's); the arm is skipped"; skip=1
   fi
+  # Dc / Dl / Dx / Dm (core/sched/draft_conf.h, place/planner.h) act on the DSpark drafter only; the
+  # first three decide about drafts, so not with Ds0, and Dc not with Dg (both decide the query pass;
+  # the engine refuses the pair); Dm moves the codebooks where the embedding goes, so it needs Er.
+  if [[ -n "$dc$dl$dx$dm" && " ${env[*]} " != *" RADIANCE_EXPERIMENTAL_DS41_DSPARK_RAD_BANK=1 "* ]]; then
+    log "arm $a: Dc / Dl / Dx / Dm need a Ds part (the DSpark draft bank); the arm is skipped"; skip=1
+  fi
+  if [[ -n "$dc$dl$dx" && " ${env[*]} " == *" RADIANCE_EXPERIMENTAL_DS41_DSPARK_VERIFY_CAP=0 "* ]]; then
+    log "arm $a: Dc / Dl / Dx with Ds0 (nothing drafts); the arm is skipped"; skip=1
+  fi
+  if [[ -n "$dc" && -n "$dg" ]]; then log "arm $a: Dc and Dg both decide the query pass; the arm is skipped"; skip=1; fi
+  if [[ -n "$dm" && "-$a-" != *-Er-* ]]; then log "arm $a: Dm needs Er (the codebooks go where the embedding goes); the arm is skipped"; skip=1; fi
+  env+=(RADIANCE_EXPERIMENTAL_DS41_DSPARK_CONF=${dc:-0} "RADIANCE_EXPERIMENTAL_DS41_DSPARK_CONF_HEAD=${dc:+$DRAFT_CONF_HEAD}"
+        RADIANCE_EXPERIMENTAL_DS41_DSPARK_LOAD=${dl:-0} RADIANCE_EXPERIMENTAL_DS41_DSPARK_CTX_DEFER=${dx:-0}
+        RADIANCE_EXPERIMENTAL_DS41_DSPARK_CODEBOOK_RAM=${dm:-0})
+  ARM_DC=$dc ARM_DL=$dl ARM_DX=$dx ARM_DM=$dm
+  # A drafting Ds part under --max-num-seqs above 1 (an NK part, or MAX_SEQS for the window): the
+  # scheduler drafts for a sequence alone and says so at startup (arm() checks the line both ways).
+  ARM_SOLO=
+  if [[ -n "$ds" && "$ds" != Ds0 ]] && (( 10#${nseq:-${MAX_SEQS:-1}} > 1 )); then ARM_SOLO=1; fi
   # Every arm states these switches (0 is off for each), so a window's VAR=val cannot turn them on;
   # arm() checks the logs both ways. A Dk arm runs only on the libr4d.so the draft check passed on.
   env+=(RADIANCE_EXPERIMENTAL_DS41_DRAFT_GEMV=${dk:-0} RADIANCE_EXPERIMENTAL_DS41_DSPARK_SHORT_BLOCK=${db:-0}

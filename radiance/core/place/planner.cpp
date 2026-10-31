@@ -1085,6 +1085,11 @@ void Planner::finish(const Program& prog, Plan* p) {
 }
 
 /* ------------------------------------------------------------------ the lookup tables */
+bool draft_codebook_ram() {
+    const char* v = std::getenv(kDraftCodebookRamEnv);
+    return v && *v && std::strcmp(v, "0") != 0;
+}
+
 bool read_only_by(const Program& prog, rad_weight w, const char* op) {
     bool read = false;
     for (const OpInfo& o : prog.ops)

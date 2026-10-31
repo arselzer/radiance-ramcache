@@ -7,6 +7,7 @@
 #include "sched/mtp_couple_bind.h"
 #include "place/ep_route_counts.h"
 #include "sched/scheduler.h"
+#include "sched/draft_conf_head.h"
 #include "sched/advance_impl.h"
 #include "sched/derive.h"
 #include "sched/tbo.h"
@@ -16,7 +17,9 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <new>
+#include <set>
 #include <string>
 
 #include <unistd.h>
@@ -9045,5 +9048,589 @@ TEST(eors_with_the_consumer_skip_and_the_default_band_drops_nothing) {
         CHECK_EQ(f.sch.metrics().consumer_ckpt_dropped, 0ll);
         CHECK_EQ(f.sch.metrics().consumer_ckpt_whole, n == 1000 ? 0ll : 1ll);
         CHECK_EQ(f.sch.consumer_stats().ckpt_insured, (uint64_t)0);
+    }
+}
+
+/* ===== draft_conf.h: the confidence controller, load-aware drafting, the deferred context pass ===== */
+TEST(dspark_conf_parses_and_decides) {
+    DraftConfCfg c;
+    CHECK(DraftConfCfg::parse(nullptr, &c)); CHECK(!c.on);
+    CHECK(DraftConfCfg::parse("", &c)); CHECK(!c.on);
+    CHECK(DraftConfCfg::parse("0", &c)); CHECK(!c.on);
+    CHECK(DraftConfCfg::parse("1", &c)); CHECK(c.on);
+    CHECK_NEAR(c.threshold, DraftConfCfg::kThreshold, 1e-12); CHECK_EQ(c.probe, DraftConfCfg::kProbe);
+    CHECK(DraftConfCfg::parse("0.6", &c)); CHECK(c.on); CHECK_NEAR(c.threshold, 0.6, 1e-12);
+    CHECK_EQ(c.probe, DraftConfCfg::kProbe);
+    CHECK(DraftConfCfg::parse("0.4,3", &c)); CHECK_NEAR(c.threshold, 0.4, 1e-12); CHECK_EQ(c.probe, 3);
+    for (const char* bad : { "1.0", "1.5", "-0.2", "abc", "0.5,1", "0.5,", "0.5,4,0.9", "0.5x", "nan" })
+        CHECK(!DraftConfCfg::parse(bad, &c));
+    /* The controller over a scripted run: T 0.5, a probe every 3rd step of a closed run. */
+    REQUIRE(DraftConfCfg::parse("0.5,3", &c));
+    DraftConfSeq g;
+    CHECK_EQ(draft_conf_ask(c, g), (int)kDraftConfWarm);      /* no estimate yet */
+    draft_conf_scored(g, 0.9f, 0.5f);
+    CHECK_EQ(draft_conf_ask(c, g), (int)kDraftConfOpen);
+    draft_conf_scored(g, 0.2f, 0.1f);
+    CHECK_EQ(draft_conf_ask(c, g), (int)kDraftConfGated);
+    CHECK_EQ(draft_conf_ask(c, g), (int)kDraftConfGated);
+    CHECK_EQ(draft_conf_ask(c, g), (int)kDraftConfProbe);
+    draft_conf_scored(g, 0.7f, -1.0f);
+    CHECK_EQ(draft_conf_ask(c, g), (int)kDraftConfOpen);      /* reopened */
+    CHECK_EQ(g.asks, 6); CHECK_EQ(g.warm, 1); CHECK_EQ(g.open, 2); CHECK_EQ(g.gated, 2);
+    CHECK_EQ(g.probes, 1); CHECK_EQ(g.closes, 1); CHECK_EQ(g.reopens, 1); CHECK_EQ(g.scored, 3);
+    draft_conf_unask(g, kDraftConfOpen);
+    CHECK_EQ(g.asks, 5); CHECK_EQ(g.open, 1);
+    draft_conf_unask(g, kDraftConfGated);                       /* nothing to take back */
+    CHECK_EQ(g.asks, 5);
+    /* Calibration: the verify takes the newest estimate (own), the one before (deciding) and its
+     * second-proposal p, once per estimate. */
+    draft_conf_verified(g, 1, 1, false);
+    CHECK_EQ(g.own[7][0], 1); CHECK_EQ(g.own[7][1], 1);
+    CHECK_EQ(g.dec[2][0], 1); CHECK_EQ(g.dec[2][1], 1);
+    CHECK_EQ(g.dec1[1][0], 1); CHECK_EQ(g.dec1[1][1], 1);
+    draft_conf_verified(g, 2, 5, true);                         /* clamped; no fresh estimate */
+    CHECK_EQ(g.verifies, 2); CHECK_EQ(g.verified, 3); CHECK_EQ(g.accepted, 3);
+    CHECK_EQ(g.probe_verified, 2); CHECK_EQ(g.probe_accepted, 2);
+    CHECK_EQ(g.own[7][0], 1);
+    draft_conf_verified(g, 0, 0, false);                        /* nothing verified: no entry */
+    CHECK_EQ(g.verifies, 2);
+    CHECK_EQ(draft_conf_bin(-1.0), 0); CHECK_EQ(draft_conf_bin(0.0), 0); CHECK_EQ(draft_conf_bin(0.95), 9);
+    CHECK_EQ(draft_conf_bin(1.0), 9);
+    CHECK_NEAR(draft_conf_sigmoid(0.0), 0.5, 1e-7); CHECK_EQ(draft_conf_sigmoid(100.0), 1.0f);
+    CHECK_EQ(draft_conf_sigmoid(-100.0), 0.0f);
+}
+
+TEST(dspark_load_and_defer_parse_and_the_experiment_refuses_conflicts) {
+    int n = -1;
+    CHECK(draft_load_parse(nullptr, &n)); CHECK_EQ(n, 0);
+    CHECK(draft_load_parse("0", &n)); CHECK_EQ(n, 0);
+    CHECK(draft_load_parse("1", &n)); CHECK_EQ(n, 2);
+    CHECK(draft_load_parse("3", &n)); CHECK_EQ(n, 3);
+    for (const char* bad : { "65", "-2", "x", "2x" }) CHECK(!draft_load_parse(bad, &n));
+    bool on = true;
+    CHECK(draft_ctx_defer_parse(nullptr, &on)); CHECK(!on);
+    CHECK(draft_ctx_defer_parse("1", &on)); CHECK(on);
+    CHECK(!draft_ctx_defer_parse("2", &on));
+    /* The experiment: each readable, none with compute OFF, the controller not with the gate. */
+    CHECK(DraftExperiment::capture("0", "0", "1", nullptr, "0.6,4", "1", "1").valid());
+    CHECK(DraftExperiment::capture("0", "0", "1", nullptr, "0", "0", "0").valid());
+    CHECK(!DraftExperiment::capture("0", "0", "1", "1", "0.6").valid());
+    CHECK(!DraftExperiment::capture("0", "1", nullptr, nullptr, "0.6").valid());
+    CHECK(!DraftExperiment::capture("0", "1", nullptr, nullptr, nullptr, "1").valid());
+    CHECK(!DraftExperiment::capture("0", "1", nullptr, nullptr, nullptr, nullptr, "1").valid());
+    CHECK(!DraftExperiment::capture("0", "0", "1", nullptr, "bad").valid());
+    CHECK(!DraftExperiment::capture("0", "0", "1", nullptr, nullptr, "70").valid());
+    CHECK(!DraftExperiment::capture("0", "0", "1", nullptr, nullptr, nullptr, "yes").valid());
+    const auto x = DraftExperiment::capture("0", "0", "1", nullptr, "0.6,4", "1", "1");
+    CHECK(x.conf().on); CHECK_EQ(x.conf().probe, 4); CHECK_EQ(x.load_from(), 2); CHECK(x.ctx_defer());
+}
+
+TEST(dspark_conf_head_file_loads_and_scores) {
+    const std::string path = std::string(std::getenv("RAD_TEST_TMPDIR") ? std::getenv("RAD_TEST_TMPDIR")
+                                                                         : "/tmp") +
+                             "/dsconf_test_" + std::to_string((long long)getpid()) + ".bin";
+    const auto write = [&](int32_t dim, int32_t vocab, int extra) {
+        FILE* f = std::fopen(path.c_str(), "wb");
+        REQUIRE(f);
+        std::fwrite("DSCONF1\0", 1, 8, f);
+        const int32_t h[4] = { dim, 8, vocab, 0 };
+        std::fwrite(h, 4, 4, f);
+        for (int i = 0; i < dim; ++i) { const float v = 0.5f * (float)(i + 1); std::fwrite(&v, 4, 1, f); }
+        for (int i = 0; i < vocab + extra; ++i) { const float v = (float)i - 1.0f; std::fwrite(&v, 4, 1, f); }
+        std::fclose(f);
+    };
+    write(4, 3, 0);
+    DconfHead h;
+    std::string why;
+    REQUIRE_EQ(dconf_head_load(path.c_str(), 4, &h, &why), (int)RAD_OK);
+    CHECK_EQ(h.dim, 4); CHECK_EQ(h.vocab, 3);
+    /* x = [1, -1, 2, 0] in bf16: w . x = 0.5 - 1 + 3 + 0 = 2.5; token 2's score 1: z = 3.5. */
+    const uint16_t x[4] = { 0x3F80, 0xBF80, 0x4000, 0x0000 };
+    CHECK_NEAR(dconf_score(h, x, 2), 1.0 / (1.0 + std::exp(-3.5)), 1e-6);
+    CHECK_NEAR(dconf_score(h, x, 0), 1.0 / (1.0 + std::exp(-1.5)), 1e-6);
+    CHECK_EQ(dconf_score(h, x, 3), -1.0f);
+    CHECK_EQ(dconf_score(h, x, -1), -1.0f);
+    CHECK_EQ(dconf_head_load(path.c_str(), 5, &h, &why), (int)RAD_E_FORMAT);   /* wrong width */
+    write(4, 3, 1);
+    CHECK_EQ(dconf_head_load(path.c_str(), 4, &h, &why), (int)RAD_E_FORMAT);   /* trailing bytes */
+    write(4, 3, -1);
+    CHECK_EQ(dconf_head_load(path.c_str(), 4, &h, &why), (int)RAD_E_FORMAT);   /* truncated */
+    CHECK_EQ(h.dim, 0);
+    std::remove(path.c_str());
+    CHECK_EQ(dconf_head_load(path.c_str(), 4, &h, &why), (int)RAD_E_NOTFOUND);
+    CHECK_EQ(dconf_head_load(nullptr, 4, &h, &why), (int)RAD_E_INVAL);
+}
+
+namespace {
+/* The DSpark drafter's shape for the scheduler, after Fixture::build: a block drafter of depth 5 and
+ * window 129 with its own windowed group, block 16, unbound and not prefix-cached (kv_dspark:
+ * KVGroupInfo::drafter), `blocks` blocks a paged group. With `hist` the plugin's tap history for
+ * RADIANCE_EXPERIMENTAL_DS41_DSPARK_CTX_DEFER (arch/deepseek41 Dsp::hist), a row for each of that
+ * group's slots, `short_by` fewer; with `bank` --draft-bank is set, which at --max-num-seqs above 1
+ * puts the scheduler's one-sequence rule on (draft_conf.h). Returns the drafter's group. */
+int32_t dspark_group(Fixture& f, int64_t blocks, bool hist, bool bank, int64_t short_by = 0) {
+    f.cfg.n_spec = 5;
+    if (bank) f.cfg.draft_bank = "draft.rad";
+    f.prog.drafter.kind = RAD_DRAFT_BLOCK; f.prog.drafter.depth = 5; f.prog.drafter.window = 129;
+    KVGroupInfo w;
+    w.name = "kv_dspark";
+    w.decl.kind = RAD_KV_WINDOW;
+    w.decl.window = 139;
+    w.block_size = 16;
+    w.drafter = true;
+    f.prog.kv_groups.push_back(w);
+    f.kv.setup(f.prog.kv_groups, f.cfg.max_ctx, blocks, 64);   /* pc.groups keeps build()'s */
+    if (hist) {
+        BufferInfo b;
+        b.name = "dspark_hist";
+        b.decl.dtype = RAD_BF16; b.decl.rank = 2;
+        b.decl.shape[0] = blocks * 16 - short_by; b.decl.shape[1] = 8;
+        b.decl.kind = RAD_BUF_PERSIST;
+        f.prog.buffers.push_back(b);
+    }
+    return (int32_t)f.prog.kv_groups.size() - 1;
+}
+
+/* The issue-ahead pipeline of dspark_gate_closes_probes_and_reopens_on_the_issue_ahead_pipeline,
+ * for the controls of draft_conf.h: cap 1, the full block of 5, one sequence. Step t's draft gets
+ * p[t] (the engine's confidence head, here scripted) and is accepted when p[t] >= 0.5. Records
+ * what each step's block_begin let draft, how many drafts each step verified, and each step's
+ * context passes: their rows together and the first position (-1 when none ran), and how many. */
+struct ConfRun {
+    std::vector<int> drafted, verified, ctx_rows, ctx_passes;
+    std::vector<int32_t> ctx_pos, output;
+    DraftConfStats stats;
+};
+ConfRun conf_pipeline(const DraftExperiment& x, const std::vector<float>& p, bool with_hist,
+                      int64_t short_by = 0) {
+    ConfRun out;
+    Fixture f; f.build(); f.cfg.max_seqs = 1;
+    dspark_group(f, 4096, with_hist, false, short_by);
+    if (f.start(&x) != RAD_OK) { out.drafted.push_back(-1); return out; }
+    auto r = f.request(40, 0); r->speculation_fixed = true;
+    const auto id = f.add(std::move(r));
+    const RadBatch* b = f.sch.step();
+    if (!b) return out;
+    std::vector<StepSlot> slots((size_t)f.cfg.max_seqs);
+    for (int t = 0; t < (int)p.size(); ++t) {
+        const StepEntry entry = f.sch.plan().e[0];
+        out.verified.push_back(entry.n_spec);
+        const int accepted = entry.n_spec > 0 && p[(size_t)t - 1] >= 0.5f ? 1 : 0;
+        std::vector<int32_t> sampled((size_t)b->n_out + 1, -1);
+        for (int j = 0; j <= entry.n_spec; ++j)
+            sampled[(size_t)(entry.dev_out + j)] = j < accepted ? ahead_draft(id, t, j) : ahead_tok(id, t);
+        AdvanceArgs accept = f.sch.advance_args(0); accept.mode = ADV_ACCEPT;
+        accept.st = slots.data(); accept.src = sampled.data(); adv_row(accept, 0);
+        Scheduler::BlockRow row[1];
+        const int n = f.sch.block_begin(5, 5, 129, 128799, row, 1, true);
+        out.drafted.push_back(n);
+        int rows = 0, passes = 0;
+        int32_t pos = -1;
+        while (const RadBatch* context = f.sch.block_context(t + 1)) {
+            if (passes++ == 0) pos = context->positions[0];
+            rows += (int)context->n_tok;
+        }
+        out.ctx_rows.push_back(passes ? rows : -1);
+        out.ctx_pos.push_back(pos);
+        out.ctx_passes.push_back(passes);
+        const RadBatch* query = f.sch.block_query(t + 1);
+        CHECK_EQ(query != nullptr, n == 1);
+        int32_t generated[5];
+        for (int j = 0; j < 5; ++j) generated[j] = ahead_draft(id, t + 1, j);
+        if (n == 1) {
+            AdvanceArgs q = f.sch.advance_args(0); q.mode = ADV_BLOCK; q.st = slots.data(); adv_row(q, 0);
+            AdvanceArgs take = f.sch.advance_args(0); take.mode = ADV_BTAKE; take.round = 5;
+            take.src = generated; take.src_pitch = 5; take.st = slots.data(); adv_row(take, 0);
+            f.sch.expect_draft(id, 5);
+        }
+        const RadBatch* next = f.sch.step_next();
+        CHECK(next != nullptr);
+        if (!next) return out;
+        CHECK_EQ(next->n_spec, n);
+        AdvanceArgs tr = f.sch.advance_args(0); tr.mode = ADV_TRUNK; tr.st = slots.data(); adv_row(tr, 0);
+        CHECK_OK(f.commit(ahead_tok(id, t), 0, [accepted](const StepEntry&) { return accepted; }));
+        f.sch.block_end();
+        if (n == 1) {
+            CHECK_OK(f.sch.set_draft(id, generated, 5));
+            f.sch.draft_conf_scored(id, p[(size_t)t], -1.0f);   /* finish_block_drafter's */
+        }
+        f.sch.step_finished();
+        f.sch.promote_next();
+        b = next;
+    }
+    out.output = f.sch.find(id)->output;
+    out.stats = f.sch.metrics().draft_conf;
+    f.sch.draft_conf_report();
+    return out;
+}
+}  // namespace
+
+/* The controller on the pipeline: T 0.5, a probe every 3rd step of a closed run. */
+TEST(dspark_conf_closes_probes_and_reopens_on_the_issue_ahead_pipeline) {
+    const auto x = DraftExperiment::capture("0", "0", "1", nullptr, "0.5,3");
+    REQUIRE(x.valid());
+    const std::vector<float> p = { 0.9f, 0.2f, 0.f, 0.f, 0.8f, 0.7f, 0.1f, 0.f, 0.f, 0.3f, 0.f, 0.f,
+                                   0.95f, 0.95f };
+    const ConfRun r = conf_pipeline(x, p, false);
+    const std::vector<int> want = { 1, 1, 0, 0, 1, 1, 1, 0, 0, 1, 0, 0, 1, 1 };
+    CHECK(r.drafted == want);
+    for (size_t t = 1; t < want.size(); ++t) CHECK_EQ(r.verified[t], want[t - 1]);
+    /* The context pass ran every step (no deferral), once. */
+    for (int c : r.ctx_rows) CHECK(c > 0);
+    for (int c : r.ctx_passes) CHECK_EQ(c, 1);
+    const DraftConfStats& g = r.stats;
+    CHECK(g.on); CHECK_EQ(g.probe, 3); CHECK_NEAR(g.threshold, 0.5, 1e-12);
+    CHECK_EQ(g.asks, 14); CHECK_EQ(g.warm, 1); CHECK_EQ(g.open, 4); CHECK_EQ(g.probes, 3);
+    CHECK_EQ(g.gated, 6); CHECK_EQ(g.closes, 2); CHECK_EQ(g.reopens, 2); CHECK_EQ(g.scored, 8);
+    CHECK_EQ(g.verifies, 7); CHECK_EQ(g.verified, 7); CHECK_EQ(g.accepted, 4);
+    CHECK_EQ(g.probe_verified, 3); CHECK_EQ(g.probe_accepted, 2);
+    /* Own p: .9 (taken), .2, .8 (taken), .7 (taken), .1, .3, .95 (taken). */
+    CHECK_EQ(g.own[9][0], 2); CHECK_EQ(g.own[9][1], 2); CHECK_EQ(g.own[2][0], 1); CHECK_EQ(g.own[2][1], 0);
+    CHECK_EQ(g.own[8][1], 1); CHECK_EQ(g.own[7][1], 1); CHECK_EQ(g.own[1][1], 0); CHECK_EQ(g.own[3][1], 0);
+    /* Deciding p (the draft before's): .9 -> rejected, .2 -> taken (the probe), .8 -> taken, .7 ->
+     * rejected, .1 -> rejected, .3 -> taken. */
+    CHECK_EQ(g.dec[9][0], 1); CHECK_EQ(g.dec[9][1], 0); CHECK_EQ(g.dec[2][1], 1); CHECK_EQ(g.dec[8][1], 1);
+    CHECK_EQ(g.dec[7][1], 0); CHECK_EQ(g.dec[1][1], 0); CHECK_EQ(g.dec[3][1], 1);
+    /* Single-sequence decode steps by kind. */
+    CHECK(g.step_n[1][1] + g.step_n[0][0] + g.step_n[0][1] + g.step_n[1][0] > 0);
+    /* The replies are the scripted target's, as with the controller off. */
+    const ConfRun off = conf_pipeline(DraftExperiment::capture("0", "0", "1"),
+                                      std::vector<float>(14, 0.9f), false);
+    CHECK_EQ(r.output.size() > 0, true);
+    CHECK(off.drafted == std::vector<int>(14, 1));
+}
+
+/* With all three controls off (unset or "0"), every decision, pass and token is the branch's, the
+ * plugin's tap history declared or not. */
+TEST(dspark_controls_off_change_nothing) {
+    const std::vector<float> p(16, 0.3f);   /* would gate everything under a controller */
+    const ConfRun a = conf_pipeline(DraftExperiment::capture("0", "0", "1"), p, false);
+    const ConfRun b = conf_pipeline(DraftExperiment::capture("0", "0", "1", nullptr, "0", "0", "0"), p, true);
+    CHECK(a.drafted == b.drafted);
+    CHECK(a.verified == b.verified);
+    CHECK(a.ctx_rows == b.ctx_rows);
+    CHECK(a.ctx_pos == b.ctx_pos);
+    CHECK(a.ctx_passes == b.ctx_passes);
+    CHECK(a.output == b.output);
+    CHECK(!a.stats.on); CHECK(!b.stats.on); CHECK(!b.stats.deferred); CHECK(!b.stats.solo);
+    CHECK_EQ(b.stats.load_from, 0);
+    CHECK_EQ(b.stats.ctx_skip, 0);
+}
+
+/* The deferred context pass under the controller (T 0.5, a probe every 5th step), on the issue-ahead
+ * pipeline: a context pass runs only behind a step that drafts. Step 0 drafts after the prompt and
+ * covers it whole [0, 40); steps 1, 7, 8 cover their own rows (from where the commit before left the
+ * cache); steps 2..5 draft nothing and run none, step 2 although it verifies step 1's draft; the
+ * probe at step 6 catches up from the cache's end, the position after step 1's commit (42: step 1
+ * accepted its draft), through its own row: 4 positions below it and its own. */
+TEST(dspark_ctx_defer_runs_a_pass_only_behind_a_draft_and_catches_up_from_the_caches_end) {
+    const auto x = DraftExperiment::capture("0", "0", "1", nullptr, "0.5,5", nullptr, "1");
+    REQUIRE(x.valid());
+    const std::vector<float> p = { 0.9f, 0.2f, 0.f, 0.f, 0.f, 0.f, 0.9f, 0.9f, 0.9f };
+    const ConfRun r = conf_pipeline(x, p, true);
+    REQUIRE(r.drafted.size() == p.size());
+    const std::vector<int> want = { 1, 1, 0, 0, 0, 0, 1, 1, 1 };
+    CHECK(r.drafted == want);
+    const std::vector<int> rows = { 40, 2, -1, -1, -1, -1, 5, 2, 2 };
+    CHECK(r.ctx_rows == rows);
+    CHECK_EQ(r.ctx_pos[0], 0);
+    CHECK_EQ(r.ctx_pos[1], 40);
+    CHECK_EQ(r.ctx_pos[6], 42);
+    CHECK_EQ(r.ctx_pos[7], 47);
+    for (int c : r.ctx_passes) CHECK(c <= 1);   /* 512 rows a step: every pass fits */
+    const DraftConfStats& g = r.stats;
+    CHECK(g.deferred);
+    CHECK_EQ(g.ctx_run, 5); CHECK_EQ(g.ctx_skip, 4);
+    CHECK_EQ(g.ctx_catch, 1); CHECK_EQ(g.ctx_catch_rows, 4);
+    CHECK_EQ(g.ctx_restart, 1);   /* step 0: the cache starts at the prompt's first position */
+    /* The same run without deferral: identical decisions and tokens. */
+    const ConfRun plain = conf_pipeline(DraftExperiment::capture("0", "0", "1", nullptr, "0.5,5"), p, false);
+    CHECK(plain.drafted == r.drafted);
+    CHECK(plain.verified == r.verified);
+    CHECK(plain.output == r.output);
+}
+
+/* Deferral is refused where the plugin declares no tap history, or one short of the drafter's own
+ * cache by a single slot (its trunk steps scatter into it by slot: one past it would write past the
+ * buffer). */
+TEST(dspark_ctx_defer_needs_the_plugins_tap_history_over_every_slot) {
+    const auto x = DraftExperiment::capture("0", "0", "1", nullptr, nullptr, nullptr, "1");
+    const ConfRun none = conf_pipeline(x, std::vector<float>(2, 0.9f), false);
+    REQUIRE_EQ(none.drafted.size(), (size_t)1);
+    CHECK_EQ(none.drafted[0], -1);
+    const ConfRun shy = conf_pipeline(x, std::vector<float>(2, 0.9f), true, /*short_by=*/1);
+    REQUIRE_EQ(shy.drafted.size(), (size_t)1);
+    CHECK_EQ(shy.drafted[0], -1);
+    const ConfRun whole = conf_pipeline(x, std::vector<float>(2, 0.9f), true);
+    CHECK_EQ(whole.drafted.size(), (size_t)2);
+    /* And the three need a block drafter. */
+    Fixture f; f.build(); f.cfg.n_spec = 4;   /* prompt lookup alone */
+    const auto l = DraftExperiment::capture("0", "0", nullptr, nullptr, nullptr, "1");
+    CHECK_EQ(f.start(&l), RAD_E_UNSUPPORTED);
+}
+
+namespace {
+/* The reference driver (block_begin after the commit, scheduler.h) over the DSpark bank's shape at a
+ * 16-token step: each step every sequence takes token 500 + t and no draft is accepted, and a
+ * drafting sequence proposes 1..5. Records the slot every trunk step gave each (sequence, position)
+ * in the drafter's group, where the plugin's trunk step puts that position's taps (Dsp::hist), and
+ * for each step what its trunk step carried, what drafted and every context pass's rows. */
+struct BankRun {
+    Fixture f;
+    int32_t g = -1;
+    std::map<std::pair<uint64_t, int32_t>, int32_t> slot;
+    int t = 0;
+    struct Step {
+        size_t entries = 0;
+        int max_spec = 0, drafted = 0, passes = 0;
+        uint64_t drafter = 0;
+        std::vector<int32_t> pos, slots;      /* each context row's position and drafter-group slot */
+    };
+    /* `alone`: RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE, as the ab_window concurrency arms run (at a
+     * 16-token step a chunk beside a decode row is under the quantum, so without it a request waits
+     * until the sequences ahead of it finish). */
+    void start(int seqs, bool defer, bool alone, int64_t max_tok = 16, int64_t blocks = 512,
+               int64_t max_ctx = 4096) {
+        f.build(blocks, /*states=*/64, max_tok, max_ctx);
+        f.prog.ops.resize(1);   /* as ds41_fixture: no gdn_chunk_scan, so no 64-row state chunk */
+        g = dspark_group(f, blocks, defer, /*bank=*/true);
+        f.cfg.max_seqs = seqs;
+        const auto x = DraftExperiment::capture("0", "0", nullptr, nullptr, nullptr, nullptr,
+                                                defer ? "1" : "0");
+        if (alone) setenv("RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE", "1", 1);
+        const int rc = f.start(&x);
+        unsetenv("RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE");
+        REQUIRE_EQ(rc, (int)RAD_OK);
+    }
+    Step step() {
+        Step s;
+        const RadBatch* b = f.sch.step();
+        CHECK(b != nullptr);
+        if (!b) return s;
+        const StepPlan& p = f.sch.plan();
+        s.entries = p.e.size();
+        for (size_t i = 0; i < p.e.size(); ++i) {
+            s.max_spec = std::max(s.max_spec, (int)p.e[i].n_spec);
+            for (int32_t r = b->cu_seqlens[i]; r < b->cu_seqlens[i + 1]; ++r)
+                slot[{ p.e[i].seq, b->positions[r] }] = b->kv[g].slot_mapping[r];
+        }
+        CHECK_OK(f.commit(500 + t));
+        Scheduler::BlockRow rows[8];
+        s.drafted = f.sch.block_begin(5, 5, 129, 128799, rows, 8);
+        if (s.drafted > 0) s.drafter = rows[0].seq;
+        while (const RadBatch* c = f.sch.block_context(100 + t)) {
+            ++s.passes;
+            CHECK(c->n_tok <= f.cfg.max_tok);
+            for (int64_t i = 0; i < c->n_seq; ++i)
+                for (int32_t r = c->cu_seqlens[i]; r < c->cu_seqlens[i + 1]; ++r) {
+                    s.pos.push_back(c->positions[r]);
+                    s.slots.push_back(c->kv[g].slot_mapping[r]);
+                }
+        }
+        f.sch.block_query(100 + t);
+        f.sch.block_end();
+        for (int i = 0; i < s.drafted; ++i) {
+            const int32_t d[5] = { 1, 2, 3, 4, 5 };
+            CHECK_OK(f.sch.set_draft(rows[i].seq, d, 5));
+        }
+        f.sch.step_finished();
+        ++t;
+        return s;
+    }
+    /* A context pass's rows are `id`'s positions [from, to) in order, each at the slot the trunk step
+     * that computed it gave it (so the plugin gathers exactly the taps that step scattered). */
+    void covers(const Step& s, uint64_t id, int32_t from, int32_t to) {
+        REQUIRE_EQ(s.pos.size(), (size_t)(to - from));
+        for (int32_t i = 0; i < to - from; ++i) {
+            CHECK_EQ(s.pos[(size_t)i], from + i);
+            const auto it = slot.find({ id, from + i });
+            REQUIRE(it != slot.end());
+            CHECK_EQ(s.slots[(size_t)i], it->second);
+        }
+        CHECK_EQ(s.passes, (int)((to - from + f.cfg.max_tok - 1) / f.cfg.max_tok));
+    }
+};
+}  // namespace
+
+/* The bank at --max-num-seqs 4, with and without the deferral, at a 32-token step (room for a chunk
+ * beside a verify). a drafts alone; b's arrival puts its prefill chunks in a's steps, where nothing
+ * drafts (a's draft made alone is still verified, since only a decodes); with both decoding every
+ * step is a plain batch (no draft verified, none made); once b leaves, a drafts again at once.
+ * Without the deferral the context pass ran behind every step over all its rows, so a's cache is
+ * whole; with it no pass ran behind a step that drafted nothing, and a's first pass alone again is a
+ * catch-up from where its cache stopped (41, the commit after its last draft's verify), every row
+ * from the slot its trunk step used. */
+TEST(dspark_bank_drafts_for_a_sequence_alone_and_catches_it_up_when_alone_again) {
+    for (int defer = 0; defer < 2; ++defer) {
+        BankRun r;
+        r.start(4, defer == 1, /*alone=*/false, /*max_tok=*/32);
+        CHECK(r.f.sch.draft_solo());
+        CHECK_EQ(r.f.sch.ctx_deferred(), defer == 1);
+        const uint64_t a = r.f.submit(40, 400);
+        BankRun::Step s;
+        int skipped = 0, two = 0;
+        s = r.step();                   /* a's first chunk [0, 32): no token, no draft */
+        CHECK_EQ(s.drafted, 0);
+        CHECK_EQ(s.passes, defer ? 0 : 1);
+        skipped += s.passes == 0;
+        s = r.step();                   /* its last chunk [32, 40), alone: it drafts */
+        CHECK_EQ(s.drafted, 1); CHECK_EQ(s.drafter, a);
+        if (defer) r.covers(s, a, 0, 40);   /* the whole prompt, from the slots its two steps used */
+        else       r.covers(s, a, 32, 40);
+        s = r.step();                   /* alone: verifies five, drafts; its own rows [40, 46) */
+        CHECK_EQ(s.max_spec, 5); CHECK_EQ(s.drafted, 1);
+        r.covers(s, a, 40, 46);
+        /* b arrives: a's verify and b's chunks share steps (no prefill-alone), a mixed step. */
+        const uint64_t b = r.f.submit(60, 400);
+        bool first = true;
+        while (r.f.sch.find(b)->output.empty()) {
+            s = r.step();
+            ++two;
+            CHECK_EQ(s.entries, (size_t)2);
+            CHECK_EQ(s.max_spec, first ? 5 : 0);   /* a's draft made alone: only a decodes */
+            CHECK_EQ(s.drafted, 0);
+            CHECK_EQ(s.passes, defer ? 0 : 1);
+            skipped += s.passes == 0;
+            first = false;
+        }
+        CHECK(two >= 2);
+        for (int i = 0; i < 10; ++i) {  /* both decode: the plain engine's batches */
+            s = r.step();
+            ++two;
+            CHECK_EQ(s.entries, (size_t)2); CHECK_EQ(s.max_spec, 0); CHECK_EQ(s.drafted, 0);
+            CHECK_EQ(s.passes, defer ? 0 : 1);
+            skipped += s.passes == 0;
+            if (!defer) CHECK_EQ(s.pos.size(), (size_t)2);   /* both rows, mirrored */
+        }
+        CHECK_OK(r.f.sch.cancel(b));
+        s = r.step();                   /* a alone: it drafts at once */
+        CHECK_EQ(s.entries, (size_t)1); CHECK_EQ(s.drafted, 1); CHECK_EQ(s.drafter, a);
+        const int32_t n = (int32_t)r.f.sch.find(a)->n_computed;
+        if (defer) r.covers(s, a, 41, n);
+        else       r.covers(s, a, n - 1, n);
+        s = r.step();                   /* and on: its own rows, a pass a step */
+        CHECK_EQ(s.max_spec, 5); CHECK_EQ(s.drafted, 1);
+        r.covers(s, a, n, n + 6);
+        const DraftConfStats g = r.f.sch.metrics().draft_conf;
+        CHECK(g.solo);
+        CHECK_EQ(g.solo_steps, (int64_t)two);
+        CHECK(g.solo_held >= (int64_t)two);   /* a in every one, b from its first token */
+        CHECK_EQ(g.solo_dropped, 0);
+        if (defer) {
+            CHECK_EQ(g.ctx_skip, (int64_t)skipped);   /* every step in which nothing drafted */
+            CHECK_EQ(g.ctx_catch, 2);   /* the prompt below its last chunk, and a alone again */
+            CHECK_EQ(g.ctx_catch_rows, 32 + (n - 1 - 41));
+            CHECK_EQ(g.ctx_restart, 1);
+        }
+        r.f.sch.draft_conf_report();
+    }
+}
+
+/* Past the window: after 140 steps of two sequences, the survivor's owed positions reach below the
+ * lowest key its query reads, so its cache starts over there (129 - 1 positions below its anchor) in
+ * 8 passes of 16, from the slots its trunk steps used; the step after covers its own rows. */
+TEST(dspark_bank_a_survivor_owing_more_than_its_window_starts_its_cache_at_the_window) {
+    BankRun r;
+    r.start(4, true, /*alone=*/true);
+    const uint64_t a = r.f.submit(40, 400);
+    const uint64_t b = r.f.submit(40, 400);
+    BankRun::Step s;
+    while (r.f.sch.find(a)->output.empty() || r.f.sch.find(b)->output.empty()) s = r.step();
+    for (int i = 0; i < 140; ++i) {
+        s = r.step();
+        CHECK_EQ(s.entries, (size_t)2); CHECK_EQ(s.drafted, 0); CHECK_EQ(s.max_spec, 0);
+        CHECK_EQ(s.passes, 0);
+    }
+    const DraftConfStats g0 = r.f.sch.metrics().draft_conf;
+    CHECK_OK(r.f.sch.cancel(b));
+    s = r.step();
+    const int32_t n = (int32_t)r.f.sch.find(a)->n_computed;
+    CHECK_EQ(s.drafted, 1);
+    r.covers(s, a, n - 128, n);
+    CHECK_EQ(s.passes, 8);
+    s = r.step();
+    CHECK_EQ(s.drafted, 1);
+    r.covers(s, a, n, n + 6);
+    const DraftConfStats g = r.f.sch.metrics().draft_conf;
+    CHECK_EQ(g.ctx_restart - g0.ctx_restart, 1);
+    CHECK_EQ(g.ctx_catch - g0.ctx_catch, 1);
+    CHECK_EQ(g.ctx_catch_rows - g0.ctx_catch_rows, 127);
+}
+
+/* Per-sequence drafter state: a drafts alone, b joins (its chunks alone, then both decode), a leaves.
+ * b never drafted, so its first pass alone starts its cache at its tap history's start (its first
+ * position: 0), over its own positions, including those its trunk computed beside a, and in b's
+ * blocks of the drafter's group, none of a's. */
+TEST(dspark_bank_each_sequence_keeps_its_own_drafter_cache_and_tap_history) {
+    BankRun r;
+    r.start(4, true, /*alone=*/true);
+    const uint64_t a = r.f.submit(20, 400);
+    BankRun::Step s;
+    for (int i = 0; i < 2; ++i) s = r.step();
+    CHECK_EQ(s.drafted, 1);
+    const uint64_t b = r.f.submit(24, 400);
+    for (int i = 0; i < 12; ++i) { s = r.step(); CHECK_EQ(s.drafted, 0); CHECK_EQ(s.passes, 0); }
+    CHECK_OK(r.f.sch.cancel(a));
+    s = r.step();
+    CHECK_EQ(s.drafted, 1); CHECK_EQ(s.drafter, b);
+    const int32_t n = (int32_t)r.f.sch.find(b)->n_computed;
+    r.covers(s, b, 0, n);
+    std::set<int32_t> mine;
+    for (const auto& [k, v] : r.slot) if (k.first == a) mine.insert(v);
+    for (int32_t v : s.slots) CHECK(mine.count(v) == 0);
+}
+
+/* A step that verifies a proposal made alone is a plain batch once a second sequence decodes: with
+ * prefill alone (RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE) b's chunks run in steps of their own, a's
+ * proposal waits, and the first step with both decoding drops it (and verifies nothing). */
+TEST(dspark_bank_a_proposal_made_alone_is_dropped_once_two_decode) {
+    BankRun r;
+    r.start(4, true, /*alone=*/true);
+    const uint64_t a = r.f.submit(16, 400);
+    BankRun::Step s = r.step();
+    CHECK_EQ(s.drafted, 1);
+    const uint64_t b = r.f.submit(32, 400);
+    s = r.step();                       /* b's first chunk alone; a decodes, so b may not draft */
+    CHECK_EQ(s.entries, (size_t)1); CHECK_EQ(s.drafted, 0);
+    s = r.step();                       /* b's last chunk alone: it decodes from here, beside a */
+    CHECK_EQ(s.entries, (size_t)1); CHECK_EQ(s.drafted, 0);
+    CHECK_EQ(r.f.sch.plan().e[0].seq, b);
+    s = r.step();                       /* both decode: a's proposal is dropped */
+    CHECK_EQ(s.entries, (size_t)2); CHECK_EQ(s.max_spec, 0); CHECK_EQ(s.drafted, 0);
+    CHECK_EQ(r.f.sch.metrics().draft_conf.solo_dropped, 1);
+    CHECK_EQ(r.f.sch.find(a)->n_draft, 0);
+}
+
+/* A prefix-cache hit: the trunk restores the positions below it without computing them, so the
+ * drafter has no taps there. The draft refill ends the hit one window before the prompt's end where
+ * a checkpoint allows (256 under 400 - 129): the first catch-up covers the window above the hit,
+ * [272, 400). Where none does (no checkpoint below 384) the hit stands whole, and the sequence drafts
+ * only once the window lies past it (its committed end at 384 + 128), its first catch-up from the
+ * hit. Neither reads a slot below the hit. The second hit is flagged as an end-of-request
+ * snapshot's: a restore is the same whatever snapshot it resumes from (a server that drafts takes no
+ * end-of-request snapshots itself: the switch is refused with speculation). */
+TEST(dspark_bank_a_restored_prefix_leaves_the_drafter_to_catch_up_from_the_restored_position) {
+    for (int whole = 0; whole < 2; ++whole) {
+        BankRun r;
+        r.start(4, true, /*alone=*/true, /*max_tok=*/16, /*blocks=*/1024, /*max_ctx=*/8192);
+        if (whole) { r.f.pc.ckpt_lo = 384; r.f.pc.eors_hit = true; }
+        r.f.pc.seed(384); r.f.pc.lin = 384; r.f.pc.src = 3;
+        const uint64_t a = r.f.submit(400, 300);
+        BankRun::Step s = r.step();
+        CHECK_EQ(r.f.sch.plan().e[0].ctx_len, whole ? 384 : 256);
+        while (r.f.sch.find(a)->output.empty()) {
+            CHECK_EQ(s.drafted, 0);
+            s = r.step();
+        }
+        if (!whole) {
+            CHECK_EQ(s.drafted, 1);
+            r.covers(s, a, 272, 400);
+            continue;
+        }
+        CHECK_EQ(s.drafted, 0);
+        int steps = 0;
+        while (s.drafted == 0 && steps++ < 200) s = r.step();
+        CHECK_EQ(r.f.sch.find(a)->n_computed, 384 + 128);
+        r.covers(s, a, 384, 512);
     }
 }

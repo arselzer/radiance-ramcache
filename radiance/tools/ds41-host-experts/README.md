@@ -96,9 +96,15 @@ every window). On 256 GB with the 192 GiB cache, against the configuration above
 residents on both sides (ab-20261030T205440Z): code prompts **+12.5%** (29.79 vs 26.48 tok/s, 16 coding
 tasks), held-out prompts **+9.3%** (34.15 vs 31.24), chat +1.2% (26.92 vs 26.60). On 128 GB it won only
 on code (+9.2%; held-out a tie, chat -1.3%): there the experts the drafter displaces from VRAM fell to the
-drive, while the bigger cache keeps them in RAM. The draft bank needs a single sequence (the server
-refuses it beside concurrent requests), so leave it off where several requests decode at once: plain
-decode gives 38.7 tok/s in total at 4 streams and 42.2 at 8 (ab-20261030T205440Z). Verifying two
+drive, while the bigger cache keeps them in RAM. The bank also serves beside concurrent requests
+(--max-num-seqs above 1, with RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE=1): a sequence drafts only while it
+decodes alone, and every step of two or more decoding sequences is a plain batch (with
+RADIANCE_EXPERIMENTAL_DS41_DSPARK_CTX_DEFER=1 those steps run no drafter pass; the one left alone catches its
+drafter up from a per-sequence tap history). Measured in ab-20261030T234957Z, replies identical: one stream
+unchanged (code 29.80 / 29.74 with the deferred pass, against 26.54 tok/s plain), four streams 37.1 / 36.9
+against 38.8 tok/s in total (-4.5%: the bank's VRAM, nothing drafts while several decode). So the bank pays
+where one request decodes alone more than about a quarter of the time; otherwise plain decode gives 38.8 tok/s
+at 4 streams and 42.2-42.9 at 8. Verifying two
 drafted tokens a step (`RADIANCE_EXPERIMENTAL_DS41_DSPARK_VERIFY_CAP=2`) adds 3.3% on code (30.73 vs
 29.75 tok/s, 80% of second drafts accepted) but loses 12% on chat (43%); three lose on both
 (ab-20261030T213623Z). Each verified row costs ~21 ms a step, the RAM reads of its experts, so keep 1

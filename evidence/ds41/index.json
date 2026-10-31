@@ -13,7 +13,8 @@
     "ab-20261030T201710Z": "Phase 1 prefill exactness and speed",
     "ab-20261030T205440Z": "DSpark and 8 streams at 192 GiB",
     "ab-20261030T213623Z": "DSpark verify depth",
-    "ab-20261030T231526Z": "Phase 1 adoption, prefill hashes and two-batch overlap at 256 GB"
+    "ab-20261030T231526Z": "Phase 1 adoption, prefill hashes and two-batch overlap at 256 GB",
+    "ab-20261030T234957Z": "DSpark beside concurrent requests"
   },
   "windows": {
     "ab-20261028T220036Z": {
@@ -3536,6 +3537,17 @@
       "server_log_xz_bytes": 183776,
       "started_utc": "2026-10-30T23:15:26Z",
       "arms_started": 11,
+      "qfn_restored": true,
+      "left_out": []
+    },
+    "ab-20261030T234957Z": {
+      "files": 18,
+      "bytes": 549666,
+      "server_logs": 6,
+      "server_log_bytes": 578949,
+      "server_log_xz_bytes": 99900,
+      "started_utc": "2026-10-30T23:49:57Z",
+      "arms_started": 6,
       "qfn_restored": true,
       "left_out": []
     }

@@ -1172,7 +1172,7 @@ EOF2
     log "arm $name: Dme${ARM_DME}, but startup reports another fixed prefix; not measured"
     stop_server; return 1
   fi
-  if ! python3 -I "$HERE/dspark_policy_gate.py" --config "${ARM_DPP:-off}" --log "$OUT/$name.server.log" >>"$OUT/window.log" 2>&1; then
+  if ! python3 -I "$HERE/dspark_policy_gate.py" --config "${ARM_DPP:-off}" --nseq "${ARM_POLICY_NSEQ:-1}" --log "$OUT/$name.server.log" >>"$OUT/window.log" 2>&1; then
     log "arm $name: DSpark policy startup/config guard failed; not measured"
     stop_server; return 1
   fi
@@ -1217,7 +1217,7 @@ EOF2
     log "arm $name: teacher-forced along $lpref: exit $?"
   fi
   stop_server
-  if ! python3 -I "$HERE/dspark_policy_gate.py" --config "${ARM_DPP:-off}" --log "$OUT/$name.server.log" --complete >>"$OUT/window.log" 2>&1; then
+  if ! python3 -I "$HERE/dspark_policy_gate.py" --config "${ARM_DPP:-off}" --nseq "${ARM_POLICY_NSEQ:-1}" --log "$OUT/$name.server.log" --complete >>"$OUT/window.log" 2>&1; then
     log "arm $name: DSpark policy action/cycle/config guard failed; not measured"
     [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
     return 1
@@ -2150,7 +2150,9 @@ for a in $ARMS; do
 # observer and step_end wait before issue_ahead; only the verified/published prefix changes. Quiet
 # by default; Dpc adds proposal/cycle JSON. All arms explicitly set off unless a Dme part is present.
 # Dpp is a separate default-off prefix policy, supplied ONLY by DSPARK_POLICY_CONFIG=v1:T1:T2
-# after TRAIN fitting. It requires bare Ds, Db2/from1, one sequence and no Dme/Dc/Dl/Dg. Every
+# after TRAIN fitting. It requires bare Ds, Db2/from1 and no Dme/Dc/Dl/Dg. Multiple sequences
+# additionally require explicit Dx and the native bank's actual sole-drafter proof, no TBO.
+# Concurrent costs include only consecutive frames in a solo span; busy/idle gaps pause it. Every
 # query/observer/early wait stays identical to Dme0/1/2; invalid numeric signals use prefix2.
 # Its mandatory action/cycle logs are on-policy evidence and are refused by the quiet cost extractor.
 # H3 the third run home (RADIANCE_HOME_DIR3); Es
@@ -2762,7 +2764,8 @@ for a in $ARMS; do
   fi
   if [[ -n "$dpp" ]]; then
     policy_conflicts=0; [[ -n "$dme$dc$dl$dg" ]] && policy_conflicts=1
-    if ! python3 -I "$HERE/dspark_policy_gate.py" --config "$dpp" --arm "${ds:-none}" "${db:-none}" "${nseq:-${MAX_SEQS:-1}}" "$policy_conflicts" >>"$OUT/window.log" 2>&1; then
+    if ! python3 -I "$HERE/dspark_policy_gate.py" --config "$dpp" --arm "${ds:-none}" "${db:-none}" "${nseq:-${MAX_SEQS:-1}}" "$policy_conflicts" \
+        --ctx-defer "${dx:-0}" --native-bank 1 --tbo "${tb:-0}" >>"$OUT/window.log" 2>&1; then
       log "arm $a: Dpp configuration/scope guard failed; the arm is skipped"; skip=1
     fi
   fi
@@ -2773,6 +2776,7 @@ for a in $ARMS; do
         RADIANCE_EXPERIMENTAL_DS41_DSPARK_EARLY_VERIFY=${dme:-off}
         "RADIANCE_EXPERIMENTAL_DS41_DSPARK_PREFIX_POLICY=${dpp:-off}")
   ARM_DC=$dc ARM_DL=$dl ARM_DX=$dx ARM_DM=$dm ARM_DPC=$dpc ARM_DME=$dme ARM_DPP=$dpp
+  ARM_POLICY_NSEQ=${nseq:-${MAX_SEQS:-1}}
   # A drafting Ds part under --max-num-seqs above 1 (an NK part, or MAX_SEQS for the window): the
   # scheduler drafts for a sequence alone and says so at startup (arm() checks the line both ways).
   ARM_SOLO=

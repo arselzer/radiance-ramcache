@@ -311,11 +311,11 @@ class Traffic:
                            "started_at": s.get("started_at"), "requests": list(rows.values())})
         return ready
 
-    def verify(self, role):
+    def verify(self, role, policy_query=False):
         need(self.initial_solo and self.concurrent and self.peak == 4 and self.solo_tail,
              "actual N1->N4->N1 with a 32-token solo tail was not observed")
         need(set(self.ids) == set(NAMES), "not all four names have actual sequence bindings")
-        if role != "no-bank":
+        if role != "no-bank" and not policy_query:
             need(self.solo_draft, "no actual outstanding draft observed after the burst")
 
 
@@ -325,13 +325,23 @@ def get_stats(url):
         return json.load(response)
 
 
+def policy_resume_floor(receipt):
+    """Actual /stats four-running anchor progress, not wall-time or an HTTP cmpl-ID."""
+    anchor = receipt['seq_by_name']['anchor']
+    observed = [q['output'] for s in receipt['stats_trace'] if s['running'] == 4
+                for q in s['requests'] if q['id'] == anchor and q['state'] == 'decode']
+    need(observed, 'policy resume has no observed concurrent anchor progress')
+    return len(receipt['workload']['requests'][0]['body']['prompt']) + max(observed) - 1
+
+
 class BankLogWatch:
     """Incremental, bounded proof: /stats idle alone can precede an idle bank restore."""
-    def __init__(self, path):
+    def __init__(self, path, policy=False):
         self.path = Path(path)
         self.offset = 0
         self.partial = b""
         self.lines = []
+        self.policy = policy
 
     @property
     def text(self):
@@ -346,7 +356,8 @@ class BankLogWatch:
         need(self.offset <= 64 * 1024 * 1024, "live server log exceeds bounded64MiB probe scan")
         lines = (self.partial + data).split(b"\n")
         self.partial = lines.pop()
-        self.lines.extend(line.decode("utf-8") for line in lines if b"DSBANKLEND " in line)
+        self.lines.extend(line.decode("utf-8") for line in lines if b"DSBANKLEND " in line or
+                          self.policy and b"DSpark prefix policy" in line)
 
     def settled(self):
         opened, seen = set(), False
@@ -362,10 +373,14 @@ class BankLogWatch:
 
 
 def run_probe(url, workload, role, timeout=240, interval=.1, get=get_stats,
-              stream_factory=Stream, clock=time.monotonic, sleep=time.sleep, log_watch=None):
+              stream_factory=Stream, clock=time.monotonic, sleep=time.sleep, log_watch=None, policy_config=None):
     need(role in {"no-bank", "static", "lend"}, "invalid probe role")
     need(1 <= timeout <= 900 and .05 <= interval <= 1, "unbounded polling parameters")
     need(role != "lend" or log_watch is not None, "lend role requires a live server-log restoration proof")
+    if policy_config is not None:
+        import dspark_policy_gate as policy_gate
+        need(role != 'no-bank' and log_watch is not None and policy_gate.parse_config(policy_config) is not None,
+             'explicit policy bank role requires a live log and parsed config')
     before = get(url)
     fresh(before)
     traffic = Traffic(workload)
@@ -373,6 +388,7 @@ def run_probe(url, workload, role, timeout=240, interval=.1, get=get_stats,
     start, wall_start = clock(), time.time_ns()
     result = {"schema": SCHEMA, "role": role, "workload": workload, "workload_sha256": digest(workload),
               "initial_stats": before, "started_s": start, "started_unix_ns": wall_start, "valid": False}
+    if policy_config is not None: result['policy_config'] = policy_config
     streams[0].start()
     launched, drained = False, False
     try:
@@ -411,7 +427,11 @@ def run_probe(url, workload, role, timeout=240, interval=.1, get=get_stats,
                     break
             sleep(interval)
         need(drained, "workload/drain deadline exceeded")
-        traffic.verify(role)
+        traffic.verify(role, policy_query=policy_config is not None)
+        if policy_config is not None:
+            policy_gate.check_log(log_watch.text, policy_config, nseq=4)
+            binding = dict(workload=workload, seq_by_name=traffic.ids, stats_trace=traffic.trace)
+            result['policy_resume'] = policy_gate.check_mixed_resume(log_watch.text, traffic.ids['anchor'], policy_resume_floor(binding))
         result["valid"] = True
     except Exception as e:
         result["invalid_reason"] = type(e).__name__ + ": " + str(e)
@@ -570,7 +590,14 @@ def check_receipt(r):
         if r["bursts_started_s"] is not None and sample["at_s"] > r["bursts_started_s"]:
             traffic.bursts_started_s = r["bursts_started_s"]
         traffic.observe(sample, sample["at_s"])
-    traffic.verify(r["role"])
+    policy = r.get('policy_config')
+    traffic.verify(r["role"], policy_query=policy is not None)
+    if policy is not None:
+        import dspark_policy_gate as policy_gate
+        need(r['role'] != 'no-bank' and policy_gate.parse_config(policy) is not None, 'invalid policy probe role/config')
+        policy_gate.check_log(r.get('observed_lender_log', ''), policy, nseq=4)
+        actual = policy_gate.check_mixed_resume(r.get('observed_lender_log', ''), traffic.ids['anchor'], policy_resume_floor(r))
+        need(r.get('policy_resume') == actual, 'stored policy query resume proof differs')
     last = r["stats_trace"][-1]
     need(last["running"] == 0 and last["waiting"] == 0 and last["in_flight"] == 0 and
          last["total_requests"] == 4 and not any(q.get("state") in ACTIVE for q in last["requests"]),
@@ -636,6 +663,7 @@ def main():
     run.add_argument("--role", choices=("no-bank", "static", "lend"), required=True)
     run.add_argument("--window-guard", required=True)
     run.add_argument("--server-log", help="required live research-server log for lend role")
+    run.add_argument("--policy-config", help="explicit adaptive-policy mixed proof; permits resumed k0 only with bound live query/action/outcome")
     run.add_argument("--timeout", type=float, default=240); run.add_argument("--poll-s", type=float, default=.1)
     val = sub.add_parser("validate")
     for role in ("no-bank", "static", "lend"):
@@ -651,7 +679,8 @@ def main():
     elif args.command == "run":
         guard = check_window(args.window_guard)
         result = run_probe(args.url, load(args.workload), args.role, args.timeout, args.poll_s,
-                           log_watch=BankLogWatch(args.server_log) if args.server_log else None)
+                           log_watch=BankLogWatch(args.server_log, policy=args.policy_config is not None) if args.server_log else None,
+                           policy_config=args.policy_config)
         result["window_guard"] = guard
         try:
             result["window_guard_end"] = check_window(args.window_guard)

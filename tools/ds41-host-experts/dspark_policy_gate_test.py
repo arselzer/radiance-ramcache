@@ -38,6 +38,44 @@ def log(actions=None, cycles=None):
                      [mod.TOTALS + "queries=3 query_rows=6 observers=3 waits=3 costs=[1,1,0]"])
 
 
+def concurrent_fixture():
+    a, c = fixture()
+    for action, cycle in zip(a, c):
+        action.update(frame=action['epoch'], solo_span=1, owner_slot=2)
+        cycle.update(frame=action['frame'], solo_span=1, previous_span=1 if cycle['epoch'] else 0)
+    first = copy.deepcopy(a)
+    for i, original in enumerate(first):
+        epoch = i + 4
+        action = dict(original, epoch=epoch, step=10+i, frame=10+i, solo_span=2, ctx=(100, 101, 103)[i])
+        a.append(action)
+        c.append(dict(seq=7, epoch=0 if i == 0 else epoch-1, verify_step=10+i, next_epoch=epoch,
+                      k=-1 if i == 0 else i-1, next_k=action['k'], cycle_ns=0 if i == 0 else 100,
+                      wait_ns=10, cost_valid=i > 0, live=True, published=True, accepted=1 if i == 2 else 0,
+                      output=(10, 11, 13)[i], proposal_invalid_depths=0, next_invalid_depths=action['invalid_depths'],
+                      frame=10+i, solo_span=2, previous_span=0 if i == 0 else 2))
+    scope = {'max_seqs': 4, 'tp': 4, 'dsolo': True, 'deferred': True, 'query_rows': 2,
+             'full_rows': 5, 'depth': 5, 'from': 1, 'tbo': False, 'native_bank': True, 'bank_hot_n': 24}
+    pause = dict(seq=7, epoch=3, step=4, frame=4, previous_span=1, next_span=2, reason='no_query', query_rows=0)
+    resume = dict(seq=7, epoch=4, step=10, frame=10, solo_span=2, card=0, owner_slot=2, ctx=100,
+                  previous_seq=7, previous_epoch=3, query_rows=2, ready=True)
+    return a, c, scope, pause, resume
+
+
+def concurrent_log(a=None, c=None, scope=None, pause=None, resume=None):
+    defaults = concurrent_fixture()
+    a = defaults[0] if a is None else a
+    c = defaults[1] if c is None else c
+    scope = defaults[2] if scope is None else scope
+    pause = defaults[3] if pause is None else pause
+    resume = defaults[4] if resume is None else resume
+    rows = [mod.START + CONFIG + mod.SUFFIX, mod.CONCURRENT + json.dumps(scope)]
+    rows += [mod.ACTION + json.dumps(x) for x in a]
+    rows += [mod.CYCLE + json.dumps(x) for x in c]
+    rows += [mod.PAUSE + json.dumps(pause), mod.RESUME + json.dumps(resume)]
+    rows += [mod.TOTALS + 'queries=6 query_rows=12 observers=6 waits=6 costs=[2,2,0]']
+    return '\n'.join(rows)
+
+
 class PolicyGateTest(unittest.TestCase):
     def test_explicit_config_off_and_arm_scope(self):
         for off in (None, "off", "0"):
@@ -90,6 +128,51 @@ class PolicyGateTest(unittest.TestCase):
         with self.assertRaises(mod.Invalid): mod.check_log(log(actions=actions[:2]), CONFIG, True)
         with self.assertRaises(mod.Invalid): mod.check_log(log(cycles=cycles+cycles[:1]), CONFIG, True)
         with self.assertRaises(mod.Invalid): mod.check_log(log().replace("queries=3", "queries=4"), CONFIG, True)
+
+    def test_concurrent_requires_explicit_native_dx_and_scheduler_scope(self):
+        mod.check_arm(CONFIG, 'Ds', '2', '4', defer=True, native_bank=True)
+        for kwargs in ({'defer': False, 'native_bank': True}, {'defer': True, 'native_bank': False},
+                       {'defer': True, 'native_bank': True, 'tbo': True}):
+            with self.assertRaises(mod.Invalid): mod.check_arm(CONFIG, 'Ds', '2', '4', **kwargs)
+        text = concurrent_log()
+        mod.check_log(text, CONFIG, True, 4)
+        with self.assertRaises(mod.Invalid): mod.check_log(text, CONFIG, True, 1)
+        with self.assertRaises(mod.Invalid): mod.check_log(log(), CONFIG, True, 4)
+        for key, value in [('dsolo', False), ('deferred', False), ('tp', 2), ('query_rows', 1),
+                           ('tbo', True), ('native_bank', False), ('bank_hot_n', 33)]:
+            scope = concurrent_fixture()[2]; scope[key] = value
+            with self.subTest(key=key), self.assertRaises(mod.Invalid):
+                mod.check_log(concurrent_log(scope=scope), CONFIG, True, 4)
+
+    def test_concurrent_pause_resume_never_counts_busy_gap_or_stale_owner(self):
+        a, c, _, pause, resume = concurrent_fixture()
+        for marker in (mod.PAUSE, mod.RESUME):
+            text = '\n'.join(x for x in concurrent_log().splitlines() if marker not in x)
+            with self.assertRaises(mod.Invalid): mod.check_log(text, CONFIG, True, 4)
+        for key, value in [('previous_epoch', 2), ('previous_seq', 8), ('ctx', 99), ('owner_slot', 3), ('ready', False)]:
+            bad = dict(resume); bad[key] = value
+            with self.subTest(key=key), self.assertRaises(mod.Invalid):
+                mod.check_log(concurrent_log(resume=bad), CONFIG, True, 4)
+        for key, value in [('frame', 10), ('step', 10), ('solo_span', 1), ('owner_slot', 3)]:
+            bad = copy.deepcopy(a); bad[4][key] = value
+            with self.subTest(key=key), self.assertRaises(mod.Invalid):
+                mod.check_log(concurrent_log(a=bad), CONFIG, True, 4)
+        bad = copy.deepcopy(c)
+        bad[3].update(epoch=3, k=2, cycle_ns=1000000000, cost_valid=True, previous_span=1)
+        with self.assertRaises(mod.Invalid): mod.check_log(concurrent_log(c=bad), CONFIG, True, 4)
+        bad_pause = dict(pause, epoch=2)
+        with self.assertRaises(mod.Invalid): mod.check_log(concurrent_log(pause=bad_pause), CONFIG, True, 4)
+
+    def test_actual_mixed_resume_accepts_k0_without_a_verified_draft(self):
+        text = concurrent_log()
+        proof = mod.check_mixed_resume(text, 7)
+        self.assertEqual(proof[0]['k'], 0)
+        self.assertEqual(proof[0]['epoch'], 4)
+        with self.assertRaises(mod.Invalid): mod.check_mixed_resume(text, 8)
+        with self.assertRaises(mod.Invalid): mod.check_mixed_resume(text, 7, minimum_ctx=100)
+        a, c, _, _, _ = concurrent_fixture()
+        bad = copy.deepcopy(c); bad[3]['published'] = False
+        with self.assertRaises(mod.Invalid): mod.check_mixed_resume(concurrent_log(c=bad), 7)
 
 
 if __name__ == "__main__":

@@ -168,6 +168,33 @@ class BankProbeTest(unittest.TestCase):
             with self.subTest(edit=edit), self.assertRaises(m.Invalid):
                 m.check_receipt(r)
 
+    def test_policy_k0_tail_requires_bound_actual_query_instead_of_outstanding_draft(self):
+        policy_spec = importlib.util.spec_from_file_location('policy_fixture', Path(__file__).with_name('dspark_policy_gate_test.py'))
+        helpers = importlib.util.module_from_spec(policy_spec); policy_spec.loader.exec_module(helpers)
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder)/'server.log'
+            policy_line = helpers.mod.START + helpers.CONFIG + helpers.mod.SUFFIX
+            path.write_text('ordinary startup\n' + policy_line[:20])
+            original, adaptive = m.BankLogWatch(path), m.BankLogWatch(path, policy=True)
+            original.poll(); adaptive.poll()
+            self.assertEqual(original.text, ''); self.assertEqual(adaptive.text, '')
+            with path.open('a') as f: f.write(policy_line[20:] + '\n')
+            original.poll(); adaptive.poll()
+            self.assertEqual(original.text, '')
+            self.assertEqual(adaptive.text, policy_line)
+        r, _ = receipt('static')
+        for sample in r['stats_trace']:
+            for q in sample['requests']: q['draft'] = 0
+        r['solo_draft_observed'] = False
+        with self.assertRaises(m.Invalid): m.check_receipt(r) # original fixed-bank contract unchanged
+        r['policy_config'] = helpers.CONFIG
+        text = helpers.concurrent_log().replace('"seq": 7', '"seq": 101').replace('"previous_seq": 7', '"previous_seq": 101')
+        r['observed_lender_log'] = text
+        r['policy_resume'] = helpers.mod.check_mixed_resume(text, 101)
+        m.check_receipt(r)
+        r['policy_resume'][0]['epoch'] += 1
+        with self.assertRaises(m.Invalid): m.check_receipt(r)
+
     def test_bindings_reject_foreign_duplicate_changed_and_regressing_sequences(self):
         for change in ("foreign", "duplicate", "id", "regress"):
             t = m.Traffic(workload())

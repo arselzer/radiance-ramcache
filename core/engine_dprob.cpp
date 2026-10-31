@@ -8,6 +8,33 @@
 #include <cstring>
 
 namespace rad {
+int Engine::dpolicy_concurrent_open() {
+    if (!dpolicy_concurrent_) return RAD_OK;
+    if (!draft_experiment_.prefix_policy().on || cfg_.max_seqs <= 1 || cfg_.tp != 4 ||
+        ranks_.size() != 4 || !sched_.draft_solo() || !sched_.ctx_deferred() || tree_ ||
+        !block_drafting() || !draft_experiment_.ctx_defer()) return RAD_E_UNSUPPORTED;
+    RAD_INFO("DSpark prefix policy concurrent: {\"max_seqs\":%lld,\"tp\":4,\"dsolo\":true,"
+             "\"deferred\":true,\"query_rows\":2,\"full_rows\":5,\"depth\":5,\"from\":1,"
+             "\"tbo\":false,\"native_bank\":true,\"bank_hot_n\":%d}",
+             (long long)cfg_.max_seqs, draft_vram_n_);
+    return RAD_OK;
+}
+
+void Engine::dpolicy_pause(int step, const char* reason) {
+    if (!dpolicy_concurrent_) return;
+    const DraftMeasureFrame previous = dmeasure_.pending;
+    dmeasure_.no_query(); // clears a pending cost even if this is an idle rather than model frame
+    if (!previous.epoch) return;
+    dpolicy_pause_seq_ = previous.seq; dpolicy_pause_epoch_ = previous.epoch;
+    dpolicy_paused_ = true;
+    ++dpolicy_span_;
+    RAD_INFO("DSpark prefix policy pause: {\"seq\":%llu,\"epoch\":%llu,\"step\":%d,"
+             "\"frame\":%llu,\"previous_span\":%llu,\"next_span\":%llu,\"reason\":\"%s\",\"query_rows\":0}",
+             (unsigned long long)previous.seq, (unsigned long long)previous.epoch, step,
+             (unsigned long long)(step < 0 ? 0 : dpolicy_frame_),
+             (unsigned long long)previous.solo_span, (unsigned long long)dpolicy_span_, reason);
+}
+
 int Engine::dprob_init() {
     if (!draft_experiment_.prob_capture() && !draft_experiment_.early_boundary()) return RAD_OK;
     const bool policy = draft_experiment_.prefix_policy().on;
@@ -55,6 +82,10 @@ int Engine::dprob_init() {
                  rad_dflash_observe::kEnv);
     if (draft_experiment_.early_boundary()) {
         dmeasure_ = {};
+        dpolicy_concurrent_ = policy && cfg_.max_seqs > 1;
+        dpolicy_paused_ = false;
+        dpolicy_frame_ = 0; dpolicy_span_ = 1;
+        dpolicy_pause_seq_ = dpolicy_pause_epoch_ = 0;
         dmeasure_query_rows_ = (int)(short_from_ == 1 && drafter_short_ > 0 ? drafter_short_ : drafter_.block);
         if (dmeasure_query_rows_ < 2 || dmeasure_query_rows_ > 5) return RAD_E_UNSUPPORTED;
         if (policy)
@@ -99,8 +130,17 @@ void Engine::dprob_finish(int row, const int32_t* tokens, int n, bool published)
  * and complete StepSlot copies. No new event, stream synchronization, or host wait on the off path.
  * Later collect/so.early waits are deliberately retained (already complete in this branch). */
 int Engine::dmeasure_ready(const RadBatch* batch) {
-    if (block_rows_ == 0) { dmeasure_.no_query(); return RAD_OK; }
+    if (block_rows_ == 0) {
+        if (dpolicy_concurrent_) dpolicy_pause(batch->step, "no_query");
+        else dmeasure_.no_query();
+        return RAD_OK;
+    }
     if (block_rows_ != 1 || block_steps_ != dmeasure_query_rows_ || !dprob_host_) return RAD_E_STATE;
+    if (dpolicy_concurrent_) {
+        uint64_t observed = 0;
+        if (!sched_.policy_block_owner(batch->step, block_row_.data(), block_rows_, &observed) ||
+            observed != dpolicy_frame_ || !dpolicy_span_) return RAD_E_STATE;
+    }
     const uint64_t begin = rad_mono_ns();
     RAD_TRY(rad_event_sync(step_end_));
     const uint64_t ready = rad_mono_ns();
@@ -127,6 +167,9 @@ int Engine::dmeasure_ready(const RadBatch* batch) {
     frame.seq = row.seq; frame.card = row.card; frame.step = batch->step;
     frame.epoch = sched_.draft_prob_reserve_epoch();
     frame.ctx = slot.ctx; frame.anchor = slot.tok[0];
+    if (dpolicy_concurrent_) {
+        frame.query_frame = dpolicy_frame_; frame.solo_span = dpolicy_span_; frame.owner_slot = row.slot;
+    }
     frame.k = draft_experiment_.early_verify(); frame.query_rows = dmeasure_query_rows_;
     bool fallback = false;
     const float p1 = dprob_host_[rad_dflash_observe::kCandidateP];
@@ -138,20 +181,32 @@ int Engine::dmeasure_ready(const RadBatch* batch) {
     const StepPlan& plan = sched_.plan();
     frame.pure_decode = plan.phase == RAD_PHASE_DECODE && plan.e.size() == 1 &&
                         !plan.e[0].is_prefill && !plan.e[0].ngram && plan.e[0].produces_token;
-    dmeasure_.ready(frame, previous_matches, policy);
+    dmeasure_.ready(frame, previous_matches, policy, dpolicy_concurrent_);
     if (policy) {
         /* JSON stays valid for nonfinite observations; invalid_depths identifies the fallback.
          * This action belongs to the complete Db2 query, not to a subsequently reused slot. */
         const std::string p1_json = std::isfinite(p1) ? fmt("%.17g", (double)p1) : "null";
         const std::string p2_json = std::isfinite(p2) ? fmt("%.17g", (double)p2) : "null";
+        const std::string concurrent = dpolicy_concurrent_ ? fmt(",\"frame\":%llu,\"solo_span\":%llu,\"owner_slot\":%d",
+            (unsigned long long)frame.query_frame, (unsigned long long)frame.solo_span, frame.owner_slot) : "";
         RAD_INFO("DSpark prefix policy action: {\"seq\":%llu,\"epoch\":%llu,\"step\":%d,\"card\":%d,"
                  "\"ctx\":%d,\"anchor\":%d,\"query_rows\":%d,\"ids\":[%d,%d],\"k\":%d,"
                  "\"candidate_p\":[%s,%s],\"invalid_depths\":%u,\"fallback\":%s,\"wait_ns\":%llu,"
-                 "\"pure_decode\":%s}",
+                 "\"pure_decode\":%s%s}",
                  (unsigned long long)frame.seq, (unsigned long long)frame.epoch, frame.step, frame.card,
                  frame.ctx, frame.anchor, frame.query_rows, frame.ids[0], frame.ids[1], frame.k,
                  p1_json.c_str(), p2_json.c_str(), (unsigned)invalid_depths, fallback ? "true" : "false",
-                 (unsigned long long)frame.wait_ns, frame.pure_decode ? "true" : "false");
+                 (unsigned long long)frame.wait_ns, frame.pure_decode ? "true" : "false", concurrent.c_str());
+        if (dpolicy_concurrent_ && dpolicy_paused_) {
+            RAD_INFO("DSpark prefix policy resume: {\"seq\":%llu,\"epoch\":%llu,\"step\":%d,"
+                     "\"frame\":%llu,\"solo_span\":%llu,\"card\":%d,\"owner_slot\":%d,\"ctx\":%d,"
+                     "\"previous_seq\":%llu,\"previous_epoch\":%llu,\"query_rows\":2,\"ready\":true}",
+                     (unsigned long long)frame.seq, (unsigned long long)frame.epoch, frame.step,
+                     (unsigned long long)frame.query_frame, (unsigned long long)frame.solo_span,
+                     frame.card, frame.owner_slot, frame.ctx, (unsigned long long)dpolicy_pause_seq_,
+                     (unsigned long long)dpolicy_pause_epoch_);
+            dpolicy_paused_ = false;
+        }
     }
     return RAD_OK;
 }
@@ -161,6 +216,8 @@ int Engine::dmeasure_check(int row, const int32_t* tokens, int n) const {
     const DraftMeasureFrame& frame = dmeasure_.current;
     const Scheduler::BlockRow& b = block_row_[(size_t)row];
     const StepSlot& s = slots_host_[b.card];
+    if (dpolicy_concurrent_ && (row != 0 || frame.owner_slot != b.slot ||
+        frame.query_frame != dpolicy_frame_ || frame.solo_span != dpolicy_span_)) return RAD_E_STATE;
     if (!draft_measure_frame_matches(frame, b.seq, b.card, s.ctx, s.tok[0], tokens, n)) return RAD_E_STATE;
     return RAD_OK;
 }
@@ -175,18 +232,32 @@ void Engine::dmeasure_finish(const StepOut& so) {
     bool live = false;
     const bool committed = sched_.committed_seq(current.seq, &output, &live);
     const bool published = sched_.measure_published(current, &output);
-    const int accepted = so.accepted.empty() ? -1 : so.accepted[0];
+    int accepted = so.accepted.empty() ? -1 : so.accepted[0];
+    if (dpolicy_concurrent_) {
+        accepted = -1;
+        const auto& entries = sched_.plan().e;
+        for (size_t i = 0; i < entries.size(); ++i) {
+            const auto& e = entries[i];
+            if (e.seq == current.seq && e.card == current.card && e.slot == current.owner_slot &&
+                i < so.accepted.size()) accepted = so.accepted[i];
+        }
+    }
     const bool counted = dmeasure_.committed(committed && live, published, output, accepted, policy);
-    if (policy)
+    if (policy) {
+        const std::string concurrent = dpolicy_concurrent_ ? fmt(",\"frame\":%llu,\"solo_span\":%llu,\"previous_span\":%llu",
+            (unsigned long long)current.query_frame, (unsigned long long)current.solo_span,
+            (unsigned long long)(closing ? previous.solo_span : 0)) : "";
         RAD_INFO("DSpark prefix policy cycle: {\"seq\":%llu,\"epoch\":%llu,\"verify_step\":%d,"
                  "\"next_epoch\":%llu,\"k\":%d,\"next_k\":%d,\"cycle_ns\":%llu,\"wait_ns\":%llu,"
                  "\"cost_valid\":%s,\"live\":%s,\"published\":%s,\"accepted\":%d,\"output\":%llu,"
-                 "\"proposal_invalid_depths\":%u,\"next_invalid_depths\":%u}",
+                 "\"proposal_invalid_depths\":%u,\"next_invalid_depths\":%u%s}",
                  (unsigned long long)current.seq, (unsigned long long)(closing ? previous.epoch : 0), current.step,
                  (unsigned long long)current.epoch, closing ? previous.k : -1, current.k,
                  (unsigned long long)(closing ? cycle_ns : 0), (unsigned long long)current.wait_ns,
                  counted ? "true" : "false", committed && live ? "true" : "false", published ? "true" : "false",
-                 accepted, (unsigned long long)output, (unsigned)previous.invalid_depths, (unsigned)current.invalid_depths);
+                 accepted, (unsigned long long)output, (unsigned)previous.invalid_depths, (unsigned)current.invalid_depths,
+                 concurrent.c_str());
+    }
     else if (draft_experiment_.prob_capture() && closing)
         RAD_INFO("DSpark matched early cycle: {\"seq\":%llu,\"epoch\":%llu,\"verify_step\":%d,"
                  "\"next_epoch\":%llu,\"k\":%d,\"cycle_ns\":%llu,\"wait_ns\":%llu,"

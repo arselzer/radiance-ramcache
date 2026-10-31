@@ -10784,6 +10784,102 @@ TEST(dspark_prefix_policy_context_limit_keeps_the_full_db2_query_requirement) {
     CHECK(f.sch.block_query(3) == nullptr); CHECK(f.sch.find(id) != nullptr);
 }
 
+TEST(dspark_prefix_policy_concurrent_requires_existing_solo_and_explicit_defer) {
+    for (int missing = 0; missing < 2; ++missing) {
+        Fixture f; f.build(); f.cfg.max_seqs = 4; f.cfg.draft_short_from = 1;
+        dspark_group(f, 4096, missing != 0, missing == 0);
+        const auto x = DraftExperiment::capture(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+            missing ? "1" : "0", nullptr, nullptr, "v1:0.25:0.75");
+        CHECK_EQ(f.start(&x), RAD_E_UNSUPPORTED);
+    }
+}
+
+/* Same before-commit block_begin seam as Engine, with actual4→1 scheduling and no bank lender.
+ * No query is invented for the busy frame; cancellation holds the old immutable snapshot. */
+TEST(dspark_prefix_policy_concurrent_frame_has_one_owner_and_survives_pause_cancel_reuse) {
+    Fixture f; f.build(4096, 64, 32, 4096); f.prog.ops.resize(1);
+    dspark_group(f, 4096, true, true);
+    f.cfg.max_seqs = 4; f.cfg.draft_short_from = 1;
+    const auto x = DraftExperiment::capture(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+        "1", nullptr, nullptr, "v1:0.25:0.75");
+    REQUIRE_EQ(f.start(&x), RAD_OK); CHECK(f.sch.draft_solo()); CHECK(f.sch.ctx_deferred());
+    const auto add = [&](int prompt) {
+        auto r = f.request(prompt, 400); r->speculation_fixed = true;
+        return f.add(std::move(r));
+    };
+    uint64_t frame = 0;
+    Scheduler::BlockRow last{};
+    int tick = 0, peak_entries = 0;
+    const auto step = [&](bool expect_query) {
+        const RadBatch* batch = f.sch.step(); REQUIRE(batch);
+        peak_entries = std::max(peak_entries, (int)f.sch.plan().e.size());
+        Scheduler::BlockRow rows[4];
+        const int n = f.sch.block_begin(2, 2, 129, 128799, rows, 4, true);
+        CHECK_EQ(n, expect_query ? 1 : 0);
+        uint64_t actual = 0;
+        REQUIRE(f.sch.policy_block_owner(batch->step, rows, n, &actual));
+        CHECK(actual > frame); frame = actual;
+        CHECK(!f.sch.policy_block_owner(batch->step + 1, rows, n, &actual));
+        if (n == 1) {
+            last = rows[0];
+            auto wrong = rows[0]; ++wrong.seq;
+            CHECK(!f.sch.policy_block_owner(batch->step, &wrong, 1, &actual));
+            wrong = rows[0]; ++wrong.slot;
+            CHECK(!f.sch.policy_block_owner(batch->step, &wrong, 1, &actual));
+            CHECK(!f.sch.policy_block_owner(batch->step, rows, 2, &actual));
+        }
+        int contexts = 0;
+        while (f.sch.block_context(batch->step)) ++contexts;
+        const RadBatch* q = f.sch.block_query(batch->step);
+        if (expect_query) { REQUIRE(q); CHECK_EQ(q->n_tok, 2); CHECK_EQ(q->n_seq, 1); }
+        else { CHECK(q == nullptr); CHECK_EQ(contexts, 0); }
+        CHECK_OK(f.commit(500 + tick++));
+        CHECK(!f.sch.policy_block_owner(batch->step, rows, n, &actual)); // commit closed source frame
+        f.sch.block_end();
+        if (n == 1) { const int32_t ids[2] = {71, 72}; CHECK_OK(f.sch.set_draft(rows[0].seq, ids, 0)); }
+        f.sch.step_finished();
+    };
+    const uint64_t anchor = add(40);
+    step(false); step(true); step(true);
+    CHECK_EQ(last.seq, anchor);
+    const uint64_t before_busy = frame;
+    std::vector<uint64_t> bursts;
+    for (int i = 0; i < 3; ++i) bursts.push_back(add(60 + i));
+    int busy = 0;
+    while (busy < 32) {
+        step(false); ++busy;
+        bool decoding = true;
+        for (uint64_t id : bursts) decoding &= f.sch.find(id) && !f.sch.find(id)->output.empty();
+        if (decoding) break;
+    }
+    CHECK(busy < 32); CHECK_EQ(peak_entries, 4);
+    step(false); step(false);
+    for (uint64_t id : bursts) CHECK_OK(f.sch.cancel(id));
+    step(true);
+    CHECK_EQ(last.seq, anchor); CHECK(frame > before_busy + 1);
+
+    const RadBatch* batch = f.sch.step(); REQUIRE(batch);
+    Scheduler::BlockRow rows[4];
+    REQUIRE_EQ(f.sch.block_begin(2, 2, 129, 128799, rows, 4, true), 1);
+    const auto cancelled = rows[0];
+    uint64_t captured = 0;
+    REQUIRE(f.sch.policy_block_owner(batch->step, rows, 1, &captured));
+    CHECK_OK(f.sch.cancel(anchor)); CHECK_OK(f.sch.reap(anchor));
+    uint64_t after_cancel = 0;
+    CHECK(f.sch.policy_block_owner(batch->step, rows, 1, &after_cancel));
+    CHECK_EQ(after_cancel, captured); // captured request held; cannot become a new query owner
+    while (f.sch.block_context(batch->step)) {}
+    (void)f.sch.block_query(batch->step);
+    CHECK_OK(f.commit(700)); f.sch.block_end(); f.sch.step_finished();
+    const int32_t ids[2] = {71, 72}; CHECK(f.sch.set_draft(anchor, ids, 0) < 0);
+    CHECK(!f.sch.policy_block_owner(batch->step, rows, 1, &after_cancel));
+    const uint64_t next = add(40); CHECK(next != anchor);
+    step(false); step(true);
+    CHECK_EQ(last.seq, next);
+    // The stale numeric slot/card alone never rebinds the old seq, whether reused immediately or later.
+    CHECK(cancelled.seq != last.seq);
+}
+
 /* The controller on the pipeline: T 0.5, a probe every 3rd step of a closed run. */
 TEST(dspark_conf_closes_probes_and_reopens_on_the_issue_ahead_pipeline) {
     const auto x = DraftExperiment::capture("0", "0", "1", nullptr, "0.5,3");

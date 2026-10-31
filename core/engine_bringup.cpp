@@ -4431,11 +4431,26 @@ int Engine::start() {
                     rad_dflash_observe::kEarlyEnv);
             return RAD_E_UNSUPPORTED;
         }
+        bool concurrent_policy = false;
+        if (policy && cfg_.max_seqs > 1) {
+            bool native = bool(source_banks_) && !cfg_.lora.enabled() && !cfg_.media_flags_set();
+            for (const auto& r : ranks_)
+                native &= dspark_draft_control_scope(r->program, r->plan, cfg_, bool(source_banks_), draft_vram_n_) &&
+                          !r->program.two_batch && !r->plan.dynamic;
+            const char* tbo = std::getenv("RADIANCE_EXPERIMENTAL_SCHED_TBO");
+            concurrent_policy = draft_prefix_policy_concurrent_profile(cfg_.max_seqs, tree_, short_from_,
+                drafter_.block, drafter_.depth, drafter_short_, draft_experiment_.ctx_defer(),
+                native, cfg_.deterministic, !tbo || !std::strcmp(tbo, "0"));
+        }
         if (policy && !draft_prefix_policy_profile(cfg_.max_seqs, tree_, short_from_,
-                                                   drafter_.block, drafter_.depth, drafter_short_)) {
-            RAD_ERR("%s requires max-num-seqs1, the native chain5 drafter and Db2 with "
-                    "draft-short-from1; query, observer and early wait remain identical for all actions",
-                    rad_dflash_observe::kPolicyEnv);
+                                                   drafter_.block, drafter_.depth, drafter_short_) && !concurrent_policy) {
+            if (cfg_.max_seqs == 1)
+                RAD_ERR("%s requires max-num-seqs1, the native chain5 drafter and Db2 with "
+                        "draft-short-from1; query, observer and early wait remain identical for all actions",
+                        rad_dflash_observe::kPolicyEnv);
+            else RAD_ERR("%s concurrency requires the native TP4 fixed bank, deterministic placement, "
+                         "Db2/from1/depth5, explicit Dx and existing sole-drafter rule, no TBO/tree",
+                         rad_dflash_observe::kPolicyEnv);
             return RAD_E_UNSUPPORTED;
         }
         for (const auto& r : ranks_) {

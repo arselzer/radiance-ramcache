@@ -571,9 +571,15 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
      * sequence the rule decides nothing, so it is not on there. */
     bank_observe_ = false; bank_frame_open_ = false;
     bank_frame_step_ = -1; bank_frame_epoch_ = 0; bank_frame_solo_ = false;
+    policy_frame_open_ = policy_frame_solo_ = false;
+    policy_frame_step_ = -1; policy_frame_epoch_ = 0;
     dsolo_ = !cfg.draft_bank.empty() && cfg.max_seqs > 1 && cfg.n_spec > 0 &&
              prog.drafter.kind == RAD_DRAFT_BLOCK && prog.drafter.depth > 0 &&
              !draft_experiment_.compute_off();
+    if (draft_experiment_.prefix_policy().on && cfg.max_seqs > 1 && (!dsolo_ || !dctx_.on)) {
+        RAD_ERR("concurrent DSpark prefix policy requires the existing sole-drafter rule and explicit deferred context");
+        return RAD_E_UNSUPPORTED;
+    }
     dconf_tot_ = DraftConfStats{};
     dconf_recs_.clear();
     dconf_recs_n_ = 0;
@@ -4215,6 +4221,12 @@ int Scheduler::block_begin(int block, int depth, int window, int32_t mask, Block
     block_ctx_at_ = 0;
     block_len_ = 0;
     block_depth_ = 0;
+    if (draft_experiment_.prefix_policy().on && cfg_.max_seqs > 1) {
+        policy_frame_step_ = step_ - 1;
+        ++policy_frame_epoch_;
+        policy_frame_open_ = true;
+        policy_frame_solo_ = false;
+    }
     if (bank_observe_) {
         bank_frame_step_ = step_ - 1;
         ++bank_frame_epoch_;
@@ -4303,6 +4315,7 @@ int Scheduler::block_begin(int block, int depth, int window, int32_t mask, Block
         if (solo_held) ++dconf_tot_.solo_steps;
     }
     if (bank_observe_) bank_frame_solo_ = solo_held;
+    if (policy_frame_open_) policy_frame_solo_ = solo_held;
 
     int n_draft_rows = 0;
     for (size_t i = 0; i < plan_.e.size(); ++i) {
@@ -4663,6 +4676,7 @@ int Scheduler::with_draft_bank_idle(const std::function<int()>& fn) {
 void Scheduler::block_end() {
     std::lock_guard<std::mutex> lk(mu_);
     if (bank_observe_) bank_frame_open_ = false;
+    policy_frame_open_ = false;
     for (const BlockSeq& d : block_) {
         if (d.mirror) continue;                /* finished; it has no draft cache to track */
         if (d.slot < 0 || (size_t)d.slot >= reqs_.size() || !reqs_[(size_t)d.slot]) continue;

@@ -1112,6 +1112,7 @@ int Engine::step_loop() {
             if (rc < 0) return fail_loop(rc);
         } else b = sched_.step();
         if (!b) {
+            if (dpolicy_concurrent_) dpolicy_pause(-1, "idle");
             /* Idle: back off in small steps instead of spinning; the first wait is short so a new
              * request into an empty engine is not delayed. */
             step_batch_.store(nullptr, std::memory_order_release);
@@ -2705,6 +2706,7 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
                                 ? 8 * std::max<int64_t>(geo_.checkpoint_interval, 0) : 0);
     }
 
+    if (dpolicy_concurrent_) RAD_TRY(dpolicy_concurrent_open());
     if (draft_bank_config_.on) RAD_TRY(draft_bank_lend_open());
     for (auto& r : ranks_) r->sampler.attach_vocab(vocab_view_.get());
 

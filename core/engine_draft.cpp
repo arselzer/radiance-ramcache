@@ -602,6 +602,9 @@ int Engine::issue_block_drafter(int step, StepOut& so) {
     const int head = tree_ ? block - 1 : steps;
     const int n = sched_.block_begin(block, head, (int)drafter_.window, drafter_.mask_token,
                                      block_row_.data(), (int)block_row_.size(), /*on_card=*/true);
+    if (dpolicy_concurrent_ && (!dpolicy_span_ ||
+        !sched_.policy_block_owner(step, block_row_.data(), n, &dpolicy_frame_)))
+        return RAD_E_STATE; // before any context/query or bank-residency mutation
     /* Same frame, under Scheduler ownership, before ANY bank context/query and issue-ahead.
      * Restoring at this seam is mandatory even when the depth/head later declines a query. */
     if (draft_bank_loan_) RAD_TRY(draft_bank_lend_step(step));

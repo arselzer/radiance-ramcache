@@ -499,6 +499,10 @@ public:
     bool measure_block_binding(const BlockRow& row, int32_t ctx, int accepted,
                                 const DraftMeasureFrame& previous, bool* previous_matches) const;
     bool measure_published(const DraftMeasureFrame& row, uint64_t* output) const;
+    /* Concurrent prefix policy only: immutable block_begin frame, existing sole-drafter
+     * decision and exact0/1 query owner, checked before issue and before observation readback.
+     * Cancelled snapshots retain their old identity until block_end; no new slot is adopted. */
+    bool policy_block_owner(int step, const BlockRow* rows, int n, uint64_t* frame) const;
     /* How many running sequences the step just run decoded (produced a token for), the load a
      * block drafter's block length is chosen by. Read before block_begin(). */
     int decoded_seqs() const;
@@ -943,6 +947,9 @@ private:
     int                bank_frame_step_ = -1;
     uint64_t           bank_frame_epoch_ = 0;
     bool               bank_frame_solo_ = false;
+    bool               policy_frame_open_ = false, policy_frame_solo_ = false;
+    int                policy_frame_step_ = -1;
+    uint64_t           policy_frame_epoch_ = 0;
     bool               bank_observe_ = false;
     bool               bank_frame_open_ = false;
     /* `block` - 1 copies of the drafter's mask token, which a query entry's `draft` points at:

@@ -11,6 +11,15 @@ inline bool draft_prefix_policy_profile(int max_seqs, bool tree, int64_t short_f
                                          int64_t full_rows, int64_t depth, int64_t short_rows) noexcept {
     return max_seqs == 1 && !tree && short_from == 1 && full_rows == 5 && depth == 5 && short_rows == 2;
 }
+/* Separate admission: the original single-sequence profile is unchanged. The caller must
+ * validate the existing native bank scope on EVERY TP rank and later prove actual dsolo/Dx
+ * Scheduler state before serving. This does not enable either feature for the caller. */
+inline bool draft_prefix_policy_concurrent_profile(int64_t max_seqs, bool tree,
+        int64_t short_from, int64_t full_rows, int64_t depth, int64_t short_rows,
+        bool deferred, bool native_tp4_bank, bool deterministic, bool tbo_off) noexcept {
+    return max_seqs > 1 && !tree && short_from == 1 && full_rows == 5 && depth == 5 &&
+           short_rows == 2 && deferred && native_tp4_bank && deterministic && tbo_off;
+}
 struct DraftPrefixPolicy {
     bool on = false;
     double p1_min = 0, p2_min = 0;

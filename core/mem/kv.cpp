@@ -720,6 +720,64 @@ const KVGroupPlan* KVManager::plan(int32_t g) const {
     return (g >= 0 && g < (int32_t)plans_.size()) ? &plans_[(size_t)g] : nullptr;
 }
 
+int KVManager::backing_required_ranges(const KVManager& owners,
+                                      std::vector<KVBackingRange>* out) const {
+    if (!out || !configured_ || !owners.configured_ || !pool_ ||
+        plans_.size() != owners.plans_.size()) return RAD_E_STATE;
+    if (loan_ != 0 || owners.loan_ != 0) return RAD_E_UNSUPPORTED;
+    std::vector<KVBackingRange> ranges;
+    const auto add = [&](int64_t off, int64_t bytes) {
+        if (off < 0 || bytes < 0 || off > pool_->bytes() || bytes > pool_->bytes() - off)
+            return false;
+        if (bytes > 0) ranges.push_back({ off, bytes });
+        return true;
+    };
+    for (size_t g = 1; g < plans_.size(); ++g) {
+        const auto& p = plans_[g];
+        const auto& logical = owners.plans_[g];
+        if (p.streamed() || logical.streamed()) return RAD_E_UNSUPPORTED;
+        if (p.kind != logical.kind || p.block_size != logical.block_size ||
+            p.n_blocks != logical.n_blocks) return RAD_E_SHAPE;
+        if (p.zero) continue;
+        if (!p.base || p.n_layers <= 0) return RAD_E_STATE;
+        if (p.kind != RAD_KV_FULL) {
+            if (!add(p.pool_offset, p.pool_bytes)) return RAD_E_STATE;
+            continue;
+        }
+        if (p.bytes_per_block <= 0 || p.bytes_per_block % p.n_layers ||
+            owners.refcount_[g].size() != (size_t)p.n_blocks) return RAD_E_STATE;
+        const int64_t frag = p.layer_bytes_per_block();
+        for (int64_t layer = 0; layer < p.n_layers; ++layer) {
+            int64_t begin = 0;
+            while (begin < p.n_blocks) {
+                if (owners.refcount_[g][(size_t)begin] <= 0) { ++begin; continue; }
+                int64_t end = begin + 1;
+                while (end < p.n_blocks && owners.refcount_[g][(size_t)end] > 0) ++end;
+                if (!add(p.pool_offset + layer * p.layer_stride() + begin * frag,
+                         (end - begin) * frag)) return RAD_E_STATE;
+                begin = end;
+            }
+        }
+    }
+    /* A COW source may have lost its last logical owner after the copy was queued. It remains a
+     * reader until copied; destinations remain writers. Copies already taken from pending_ need
+     * the caller's drain/external-holder contract above. */
+    for (const auto& copy : owners.pending_) {
+        if (copy.group <= 0 || (size_t)copy.group >= plans_.size()) return RAD_E_STATE;
+        const auto& p = plans_[(size_t)copy.group];
+        if (p.zero) continue;
+        if (!p.paged() || copy.src_block < 0 || copy.dst_block < 0 ||
+            copy.src_block >= p.n_blocks || copy.dst_block >= p.n_blocks) return RAD_E_STATE;
+        const int64_t frag = p.layer_bytes_per_block();
+        for (int64_t l = 0; l < p.n_layers; ++l)
+            for (int32_t b : { copy.src_block, copy.dst_block })
+                if (!add(p.pool_offset + l * p.layer_stride() + int64_t(b) * frag, frag))
+                    return RAD_E_STATE;
+    }
+    *out = std::move(ranges);
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------------ free lists */
 
 /* Pops the lowest free block (min-heap; see the loan block in kv.h). Entries whose block is no

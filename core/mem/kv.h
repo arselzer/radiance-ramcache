@@ -24,6 +24,7 @@
 #include "mem/hostarena.h"
 #include "mem/pools.h"
 #include "rad_core.h"
+#include "mem/kv_growth.h"
 
 #include <functional>
 #include <string>
@@ -291,6 +292,13 @@ public:
     const KVGroupPlan* plan(int32_t group) const;
     int32_t n_groups() const { return (int32_t)plans_.size(); }
     std::string report() const;
+    /* Read-only physical holder inventory for a quiescent backing transaction. `owners` is the
+     * scheduler's rank-0 manager: followers do not duplicate its block refcounts. Translate its
+     * sequence/prefix/COW IDs through THIS rank's fixed physical layout. Includes all state/window
+     * pages as a conservative floor. Active KV loans and streaming are unsupported. The caller
+     * must hold scheduler/prefix ownership and drain copies already taken from pending_. Add any
+     * external holder/next-step write ranges separately; no free-list/backing mutation occurs. */
+    int backing_required_ranges(const KVManager& owners, std::vector<KVBackingRange>* out) const;
 
     /* ---------------- sequences ---------------- */
     int  add_sequence(uint64_t seq);

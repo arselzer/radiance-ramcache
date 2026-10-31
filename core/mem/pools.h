@@ -96,6 +96,20 @@ public:
      * unchanged against a fixed pool that holds its maximum (allowed by spec §6). */
     bool    elastic()   const { return elastic_; }
     int64_t committed() const { return elastic_ ? vm_.committed() : bytes_; }
+    /* Actual backing metadata for a quiescent physical-memory transaction. These are NOT a
+     * publication/admission API. A failed access grant can leave a physically mapped granule
+     * inaccessible until rollback unmaps it; is_backed alone never proves successful access. */
+    int64_t backing_reserved_bytes() const { return elastic_ ? vm_.size() : bytes_; }
+    int64_t backing_granule_bytes() const { return elastic_ ? VMem::granularity() : 0; }
+    bool is_backed(int64_t off, int64_t bytes) const {
+        return elastic_ ? vm_.is_committed(off, bytes)
+                        : off >= 0 && bytes >= 0 && off <= bytes_ && bytes <= bytes_ - off;
+    }
+    /* Transaction-only physical granules, bounded by the rounded VA reservation. The final
+     * granule can extend beyond the logical pool budget; charge its WHOLE physical size. This
+     * explicit seam avoids passing a range beyond bytes() to the ordinary logical pool API. */
+    int commit_backing_granule(int64_t off);
+    int release_backing_granule(int64_t off);
 
     /* Back [off, off+bytes) so a kernel may touch it. Rounds outward to the commit granule and is
      * idempotent: a pool growing to n may commit [0, n) each time and pays only for the new part. */

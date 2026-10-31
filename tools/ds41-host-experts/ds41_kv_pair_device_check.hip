@@ -2,6 +2,7 @@
 #include <hip/hip_runtime.h>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include "ds41_kv_pair_oracle.h"
 #define HC(x) do{const hipError_t e=(x);if(e!=hipSuccess){std::fprintf(stderr,"FAIL %s: %s\n",#x,hipGetErrorString(e));std::exit(2);}}while(0)
 namespace o=ds41_kv_pair_oracle;
@@ -26,7 +27,16 @@ __global__ void cases(Report* r) {
         atomicAdd(&r->metadata,1);
     }
 }
-int main() {
+int main(int argc,char** argv) {
+    if(argc>2||(argc==2&&std::strcmp(argv[1],"--one-card-proof")))return 2;
+    if(argc==2) {
+        int count=0,device=-1,inverse=-1;char bdf[32]={};
+        HC(hipGetDeviceCount(&count));HC(hipGetDevice(&device));
+        if(count!=1||device!=0){std::fprintf(stderr,"FAIL one-card proof needs exactly one API-visible device\n");return 2;}
+        HC(hipDeviceGetPCIBusId(bdf,sizeof(bdf),device));HC(hipDeviceGetByPCIBusId(&inverse,bdf));
+        if(inverse!=device)return 2;
+        std::printf("DS41_PAIR_CARD_ID visible=1 device=0 inverse=0 bdf=%s\n",bdf);std::fflush(stdout);
+    }
     Report *d=nullptr,r;HC(hipMalloc((void**)&d,sizeof(Report)));HC(hipMemset(d,0,sizeof(Report)));
     cases<<<1024,128>>>(d);HC(hipGetLastError());HC(hipDeviceSynchronize());
     HC(hipMemcpy(&r,d,sizeof(r),hipMemcpyDeviceToHost));HC(hipFree(d));

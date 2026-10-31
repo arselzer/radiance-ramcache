@@ -41,6 +41,18 @@ gate passed. Completion and actual selected compressed data are checked by the o
 receipts. The checker-only forced export does not print this marker; a model gate must find it
 in that model server's own log for each active rank, not copy an oracle's receipt.
 
+PAIR1-only fixed, cache-line-separated host counters also record successful normal enqueues,
+classifying the actual new kernel, old M>1 fallback and other old fallback. Clean plugin teardown
+prints one `KV_PACKED_PAIR totals` row per touched rank with `pair_calls`,
+`multirow_fallback_calls`, `other_fallback_calls`, `max_M`,
+`scope=all_normal_dispatch_phases` and `host_successful_enqueues=1`. These can include prefill
+and warmup; they are not decode-only GPU completion or performance counters. The first successful
+M>1 old dispatch logs `KV_PACKED_PAIR fallback ... reason=multirow dispatch=original`.
+PAIR0 does not construct or update this counter metadata. N4/N8 gates additionally require actual
+`rows_unspec>steps_decode>0`, zero mixed steps and observed parallel owners; neither the requested
+N nor a prefill fallback counter alone proves concurrent decode. M16 KLD is fallback/mixed-tail
+coverage and may legitimately include M1 tail work.
+
 There is no new registered alias/ABI capability. As with FAST, a stale old plugin can ignore an
 environment variable. Therefore the new unregistered export
 `r4d_rad_ds41_attn_sparse_sink_kvpair_check`, coherent core/all-five-plugin/source hashes and
@@ -70,6 +82,12 @@ stopped/restored-QFN window with both research locks and the persistent physical
 ds41_kv_pair_device_check
 RADIANCE_EXPERIMENTAL_DS41_KV_PACKED_FAST=1 RADIANCE_EXPERIMENTAL_DS41_KV_PACKED_PAIR=1 ds41_kv_pair_paths_check /absolute/coherent/libr4d.so
 ```
+
+The guarded all-four-card runner uses `HIP_VISIBLE_DEVICES=<one selected backend ordinal>` and
+calls `ds41_kv_pair_device_check --one-card-proof` in a fresh process for each selection. That mode
+requires one API-visible device, validates inverse PCI lookup and prints its actual
+`DS41_PAIR_CARD_ID ... bdf=...`. Four unique actual BDFs must equal the explicitly frozen TP4 map;
+the same isolated environment is retained for that card's existing/new oracle subprocesses.
 
 Expected byte-only codec line has exact counts plus positive actual successful even/odd calls,
 positive checked refusals and zero bad values:

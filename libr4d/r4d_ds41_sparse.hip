@@ -66,6 +66,41 @@ int ds_kv_pair_mode() {
         std::getenv("RADIANCE_EXPERIMENTAL_DS41_KV_PACKED_PAIR"));
     return mode;
 }
+/* Host successful-enqueue counts across ALL normal dispatch phases (prefill/warmup included),
+ * not decode-only samples. Only PAIR1 constructs/touches this fixed metadata. No device work. */
+struct DsKvPairStats {
+    struct alignas(64) Rank {
+        std::atomic<uint64_t> paired{0}, multirow{0}, other{0}, max_m{0};
+    } rank[64];
+    ~DsKvPairStats() {
+        for (int r = 0; r < 64; ++r) {
+            const auto p = rank[r].paired.load(std::memory_order_relaxed);
+            const auto m = rank[r].multirow.load(std::memory_order_relaxed);
+            const auto o = rank[r].other.load(std::memory_order_relaxed);
+            if (p || m || o)
+                std::fprintf(stderr, "[r4d] ds41 KV_PACKED_PAIR totals rank=%d scope=all_normal_dispatch_phases pair_calls=%llu multirow_fallback_calls=%llu other_fallback_calls=%llu max_M=%llu host_successful_enqueues=1\n",
+                    r, (unsigned long long)p, (unsigned long long)m, (unsigned long long)o,
+                    (unsigned long long)rank[r].max_m.load(std::memory_order_relaxed));
+        }
+        std::fflush(stderr);
+    }
+};
+void ds_kv_pair_note(const RadArgs* a, bool paired) {
+    if (ds_kv_pair_mode() != 1 || !a || a->rank < 0 || a->rank >= a->world_size || a->rank >= 64) return;
+    static DsKvPairStats stats;
+    auto& rank = stats.rank[a->rank];
+    const uint64_t m = (uint64_t)a->t[0].shape[0];
+    uint64_t previous = rank.max_m.load(std::memory_order_relaxed);
+    while (previous < m && !rank.max_m.compare_exchange_weak(previous, m, std::memory_order_relaxed)) {}
+    if (paired) {
+        if (!rank.paired.fetch_add(1, std::memory_order_relaxed))
+            std::fprintf(stderr, "[r4d] ds41 KV_PACKED_PAIR active rank=%d normal=1 M=1 H=16 HG=1 NT=1024 DPT=2 PVD=1 row_bytes=288 decoder=integer-pair\n", a->rank);
+    } else if (m > 1) {
+        if (!rank.multirow.fetch_add(1, std::memory_order_relaxed))
+            std::fprintf(stderr, "[r4d] ds41 KV_PACKED_PAIR fallback rank=%d M=%llu calls=1 reason=multirow dispatch=original scope=all_normal_dispatch_phases\n",
+                a->rank, (unsigned long long)m);
+    } else rank.other.fetch_add(1, std::memory_order_relaxed);
+}
 
 /* ================================================================== scalar helpers */
 
@@ -1905,7 +1940,8 @@ int attn_dec_emit(RadStream stream, const DsAttnArgs& s) {
     return RAD_E_UNSUPPORTED;
 }
 
-int attn_body(const RadArgs* a, RadStream stream, int oracle_form = -1) {
+int attn_body(const RadArgs* a, RadStream stream, int oracle_form = -1, bool* pair_used = nullptr) {
+    if (pair_used) *pair_used = false;
     /* Operands 4-6 are optional (null without a compressed source), as in libref. */
     if (!a || a->n_t < 11 || !a->t) return RAD_E_INVAL;
     const RadTensor &q = a->t[0], &wc = a->t[1], &wbt = a->t[2], &wused = a->t[3];
@@ -2045,15 +2081,7 @@ int attn_body(const RadArgs* a, RadStream stream, int oracle_form = -1) {
     if (oracle_form < 0 && rad_ds41_kv_pair::normal_candidate(ds_kv_pair_mode(), kind, s.kv_fast, s.M, s.H)) {
         const int rc = attn_dec_go<1, 1024, 2, true, true>(stream, s);
         if (rc != RAD_E_UNSUPPORTED) {
-            if (rc == RAD_OK && a->rank >= 0 && a->rank < a->world_size && a->rank < 64) {
-                static std::atomic<uint64_t> reported{0};
-                const uint64_t bit = uint64_t(1) << (unsigned)a->rank;
-                if (!(reported.load(std::memory_order_relaxed) & bit) &&
-                    !(reported.fetch_or(bit, std::memory_order_relaxed) & bit)) {
-                    std::fprintf(stderr, "[r4d] ds41 KV_PACKED_PAIR active rank=%d normal=1 M=1 H=16 HG=1 NT=1024 DPT=2 PVD=1 row_bytes=288 decoder=integer-pair\n", a->rank);
-                    std::fflush(stderr);
-                }
-            }
+            if (rc == RAD_OK && pair_used) *pair_used = true;
             return rc;
         }
     }
@@ -2116,7 +2144,10 @@ extern "C" int r4d_rad_ds41_index_score_kvpack(const RadArgs* a, RadStream strea
 }
 extern "C" int r4d_rad_ds41_attn_sparse_sink_kvpack(const RadArgs* a, RadStream stream) {
     if (!a || r4d_geti_or(a, "kv_format", 0) != 1) return R4D_NO(RAD_E_UNSUPPORTED);
-    const int rc = attn_body(a, stream);
+    bool pair_used = false;
+    const bool audit_pair = ds_kv_pair_mode() == 1;
+    const int rc = audit_pair ? attn_body(a, stream, -1, &pair_used) : attn_body(a, stream);
+    if (rc == RAD_OK && audit_pair) ds_kv_pair_note(a, pair_used);
     if (rc == RAD_OK && a->rank >= 0 && a->rank < a->world_size && a->rank < 64) {
         static std::atomic<uint64_t> reported{0}; const uint64_t bit = uint64_t(1) << (unsigned)a->rank;
         if (!(reported.load(std::memory_order_relaxed) & bit) && !(reported.fetch_or(bit, std::memory_order_relaxed) & bit)) {

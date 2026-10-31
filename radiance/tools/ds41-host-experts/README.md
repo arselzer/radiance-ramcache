@@ -72,6 +72,16 @@ radiance ... --tp 4 --placement expert_tiered --weights-disk-tier \
   --expert-plane-mirror-decode-share 0.13                              # the mirror is optional, see below
 ```
 
+**For agent harnesses (multi-turn sessions)** add the prefix cache with end-of-request snapshots on a 16-token grid:
+`--prefix-resume exact` (the default), `RADIANCE_EXPERIMENTAL_PREFIX_EORS=1` and
+`RADIANCE_EXPERIMENTAL_DS41_RESUME_GRID=16`. A turn then resumes within 15 tokens of the previous reply's end
+instead of at the last multiple of the 2,048-token chunk; ds41 prefill is partition-invariant under the switches
+above for passes on the 16-token quantum, and the switch refuses configurations where that is not established (a
+tuned kernel point per M band, no large-chunk prefill). Measured on 13 harness turns of up to 9.7K tokens
+(ab-20261031T090154Z): prefill hashes identical to the cold run on 13 of 13 turns, every reply identical; summed
+time to first token 72.7 s, against 82.5 s on the chunk grid and 135.1 s cold; short follow-ups 0.3-0.6 s instead
+of 3.3-3.7 s; decode unchanged.
+
 **For concurrent requests** (agent harnesses) add `RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE=1` and `--max-num-seqs N`
 (with `--max-model-len` sized so N sequences' KV fit, e.g. 1024 at N = 4-8): large-chunk prefill refuses steps that
 mix a prompt's chunk with other sequences' decode rows, and the window arms at 4 and 8 streams below ran that way.

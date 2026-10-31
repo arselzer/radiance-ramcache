@@ -1,0 +1,26 @@
+PASS: row table: moe_gemm_ggml_mxfp4_gemv_tall, priority 57 (the gemv's 58), 11 constraints, M up to 2048 (LCP: at least 2048)
+sweep: RADIANCE_EXPERIMENTAL_DS41_LCP=2048; heights up to 2048 must give every row its bytes launched alone and in launches of 16; 4 trials
+     trial 0 rmsnorm n=5120                               launches of 16 vs alone: ok; 1:ok 16:ok 17:ok 32:ok 33:ok 48:ok 49:ok 64:ok 65:ok 100:ok 128:ok 170:ok 171:ok 255:ok 256:ok 257:ok 512:ok 1000:ok 1024:ok 2048:ok
+     trial 0 rmsnorm n=1280                               launches of 16 vs alone: ok; 1:ok 16:ok 17:ok 32:ok 33:ok 48:ok 49:ok 64:ok 65:ok 100:ok 128:ok 170:ok 171:ok 255:ok 256:ok 257:ok 512:ok 1000:ok 1024:ok 2048:ok
+     trial 0 rmsnorm n=512                                launches of 16 vs alone: ok; 1:ok 16:ok 17:ok 32:ok 33:ok 48:ok 49:ok 64:ok 65:ok 100:ok 128:ok 170:ok 171:ok 255:ok 256:ok 257:ok 512:ok 1000:ok 1024:ok 2048:ok
+     trial 0 rmsnorm n=128                                launches of 16 vs alone: ok; 1:ok 16:ok 17:ok 32:ok 33:ok 48:ok 49:ok 64:ok 65:ok 100:ok 128:ok 170:ok 171:ok 255:ok 256:ok 257:ok 512:ok 1000:ok 1024:ok 2048:ok
+     trial 0 mhc_collapse_rmsnorm n=5120 hc=4             launches of 16 vs alone: ok; 1:ok 16:ok 17:ok 32:ok 33:ok 48:ok 49:ok 64:ok 65:ok 100:ok 128:ok 170:ok 171:ok 255:ok 256:ok 257:ok 512:ok 1000:ok 1024:ok 2048:ok
+     trial 0 mhc_post_collapse_rmsnorm n=5120 hc=4        launches of 16 vs alone: ok; 1:ok 16:ok 17:ok 32:ok 33:ok 48:ok 49:ok 64:ok 65:ok 100:ok 128:ok 170:ok 171:ok 255:ok 256:ok 257:ok 512:ok 1000:ok 1024:ok 2048:ok
+     trial 0 rmsnorm_rope_roundtrip n=512 fp8_e4m3        launches of 16 vs alone: ok; 1:ok 16:ok 17:ok 32:ok 33:ok 48:ok 49:ok 64:ok 65:ok 100:ok 128:ok 170:ok 171:ok 255:ok 256:ok 257:ok 512:ok 1000:ok 1024:ok 2048:ok
+     trial 0 rmsnorm_rope_roundtrip n=128 fp4_e2m1        launches of 16 vs alone: ok; 1:ok 16:ok 17:ok 32:ok 33:ok 48:ok 49:ok 64:ok 65:ok 100:ok 128:ok 170:ok 171:ok 255:ok 256:ok 257:ok 512:ok 1000:ok 1024:ok 2048:ok
+     trial 0 mhc_mix n=5120 hc=4 (split, scratch)         launches of 16 vs alone: ok; 1:ok 16:ok 17:ok 32:ok 33:ok 48:ok 49:ok 64:ok 65:ok 100:ok 128:ok 170:ok 171:ok 255:ok 256:ok 257:ok 512:ok 1000:ok 1024:ok 2048:ok
+     trial 0 mhc_mix n=5120 hc=4 (fused)                  launches of 16 vs alone: ok; 1:ok 16:ok 17:ok 32:ok 33:ok 48:ok 49:ok 64:ok 65:ok 100:ok 128:ok 170:ok 171:ok 255:ok 256:ok 257:ok 512:ok 1000:ok 1024:ok 2048:ok
+     trial 0 gemm_bf16_nt_m64 N=1280 K=5120               launches of 16 vs alone: ok; 1:ok 16:ok 17:ok 32:ok 33:ok 48:ok 49:ok 64:ok 65:ok 100:ok 128:ok 170:ok 171:ok 255:ok 256:ok 257:ok 512:ok 1000:ok 1024:ok 2048:ok
+     trial 0 gemm_bf16_nt_m64 N=512 K=5120                launches of 16 vs alone: ok; 1:ok 16:ok 17:ok 32:ok 33:ok 48:ok 49:ok 64:ok 65:ok 100:ok 128:ok 170:ok 171:ok 255:ok 256:ok 257:ok 512:ok 1000:ok 1024:ok 2048:ok
+     trial 0 logits_gemm n_embd=5120                      launches of 16 vs alone: ok; 1:ok 16:ok 17:ok 32:ok 33:ok 48:ok 49:ok 64:ok 65:ok 100:ok 128:ok 170:ok 171:ok 255:ok 256:ok 257:ok 512:ok 1000:ok 1024:ok 2048:ok
+     trial 0 gemm_nt (m16/m64/tiled) N=64 K=5120          launches of 16 vs alone: ok; 1:ok 16:ok 17:ok 32:ok 33:ok 48:ok 49:ok 64:ok 65:ok 100:ok 128:ok 170:ok 171:ok 255:ok 256:ok 257:ok 512:ok 1000:ok 1024:ok 2048:ok
+     trial 0 gemm_nt (m16/m64/tiled) N=128 K=512          launches of 16 vs alone: ok; 1:ok 16:ok 17:ok 32:ok 33:ok 48:ok 49:ok 64:ok 65:ok 100:ok 128:ok 170:ok 171:ok 255:ok 256:ok 257:ok 512:ok 1000:ok 1024:ok 2048:ok
+     trial 0 gemm_nt (m16/m64/tiled) N=512 K=5120         launches of 16 vs alone: ok; 1:ok 16:ok 17:ok 32:ok 33:ok 48:ok 49:ok 64:ok 65:ok 100:ok 128:ok 170:ok 171:ok 255:ok 256:ok 257:ok 512:ok 1000:ok 1024:ok 2048:ok
+     trial 0 gemm_nt_f32 N=384 K=5120                     launches of 16 vs alone: ok; 1:ok 16:ok 17:ok 32:ok 33:ok 48:ok 49:ok 64:ok 65:ok 100:ok 128:ok 170:ok 171:ok 255:ok 256:ok 257:ok 512:ok 1000:ok 1024:ok 2048:ok
+     trial 0 gemm_nt_f32 N=384 K=5120 in 4 column slices  launches of 16 vs alone: ok; 1:Warning: Resource leak detected by SharedSignalPool, 942 Signals leaked.
+ok 16:ok 17:ok 32:ok 33:ok 48:ok 49:ok 64:ok 65:ok 100:ok 128:ok 170:ok 171:ok 255:ok 256:ok 257:ok 512:ok 1000:ok 1024:ok 2048:ok
+     trial 0 gemm_nt_f32 N=1024 K=5120                    launches of 16 vs alone: ok; 1:ok 16:ok 17:ok 32:ok 33:ok 48:ok 49:ok 64:ok 65:ok 100:ok 128:ok 170:ok 171:ok 255:ok 256:ok 257:ok 512:ok 1000:ok 1024:ok 2048:ok
+     trial 0 gemm_nt_bf16f8 N=1280 K=5120                 launches of 16 vs alone: ok; 1:ok 16:ok 17:ok 32:ok 33:ok 48:ok 49:ok 64:ok 65:ok 100:ok 128:ok 170:ok 171:ok 255:ok 256:ok 257:ok 512:ok 1000:ok 1024:ok 2048:ok
+     trial 0 gemm_nt_bf16f8 N=4096 K=1024                 launches of 16 vs alone: ok; 1:ok 16:ok 17:ok 32:ok 33:ok 48:ok 49:ok 64:ok 65:ok 100:ok 128:ok 170:ok 171:ok 255:ok 256:ok 257:ok 512:ok 1000:ok 1024:ok 2048:ok
+PASS: sweep: every height up to the reach gives each row its bytes launched alone and in launches of 16 (rows above it, if any differ, only in a norm)
+sweep exit 0

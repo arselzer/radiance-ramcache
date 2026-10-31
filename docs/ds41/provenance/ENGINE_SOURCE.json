@@ -1,15 +1,15 @@
 {
-  "commit": "9b395fc8d77989a9de24af4891ab72eb08a329b6",
-  "tree": "77b82be55eb0bd2f8bb1de3f22acc6e877a48eb7",
+  "commit": "fa856f3e1bc6659f494d097df7fd1e89b5df6521",
+  "tree": "3582b43010a258dd389f8ca02188deb85121a45b",
   "branch": "claude/ds41-decode-impl",
-  "subject": "ab_window.sh: Pcn part (prefix cache with --prefix-resume nearest), to check against a cold arm's prefill hashes",
-  "committed_utc": "2026-10-31T04:13:20Z",
+  "subject": "README: harness sessions with end-of-request snapshots on a 16-token grid (72.7 s vs 82.5 s over 13 turns; exact)",
+  "committed_utc": "2026-10-31T09:43:30Z",
   "files": 1462,
-  "bytes": 57439471,
+  "bytes": 57464685,
   "executable_files": 59,
   "pins": "docs/ds41/provenance/ENGINE_SOURCE_PINS.json",
-  "pins_sha256": "4588c34281ea15ba1ba96b2f657a650817ca871dbde21525bfbb0ba679e82318",
-  "export": "git archive --format=tar 9b395fc8d77989a9de24af4891ab72eb08a329b6 (tracked files only, modes kept)",
+  "pins_sha256": "655c7f11ab1a27af73618d9eb4ab9855344bdaa97e1606a5b70443a952494778",
+  "export": "git archive --format=tar fa856f3e1bc6659f494d097df7fd1e89b5df6521 (tracked files only, modes kept)",
   "upstream": {
     "repository": "https://codeberg.org/StillDeadcode/radiance",
     "note": "Radiance upstream plus the deepseek41 architecture work of its pull request 266; the commits after them are this work (ds41 RAM cache and CPU experts)",
@@ -17,17 +17,17 @@
       "upstream main as fetched (origin/main)": {
         "commit": "6c33ee4e1267fc0a016fc0a4a333b0221326a1be",
         "contained": true,
-        "commits_after": 373
+        "commits_after": 377
       },
       "newest upstream commit contained (review-upstream/main)": {
         "commit": "4374bea1c4bca1c00c59890d10b799a274d5e8b4",
         "contained": true,
-        "commits_after": 340
+        "commits_after": 344
       },
       "pull request 266, deepseek41 (origin/pr-266)": {
         "commit": "bd65d4e58f7c4233de09ad5245a82c9510eb8962",
         "contained": true,
-        "commits_after": 459
+        "commits_after": 463
       }
     }
   }

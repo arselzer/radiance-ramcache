@@ -28,7 +28,9 @@ Flag0/unset keeps the old graph, kernels and logging. Malformed values refuse.
 Before loading weights, Ctx init or warmup, core proves every selected band has
 the exact named B16 op/kernel identity, no tuning, no host fallback, and one
 actual loaded libr4d DSO/plugin order. A missing/old/unknown writer or reader
-refuses. The plane must be a unique positive BF16 rank2 `index_score` buffer.
+refuses. Every launch pointer must additionally name its exact exported B16
+function at its symbol's start; a miswired function in the same DSO refuses.
+The plane must be a unique positive BF16 rank2 `index_score` buffer.
 Existing LCP/compact-index admission remains in force.
 
 Future KV_PACKED composition explicitly refuses until it has a separately

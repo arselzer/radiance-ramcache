@@ -5,8 +5,10 @@ using namespace rad;
 namespace {
 int launch(const RadArgs*,RadStream){return RAD_OK;}
 int alien(const RadArgs*,RadStream){return RAD_E_UNSUPPORTED;}
+int miswired_same_module(const RadArgs*,RadStream){return RAD_OK;}
 const int one=0,two=0;
 const void* origin(RadLaunchFn f){return !f?nullptr:f==alien?&two:&one;}
+bool identity(RadLaunchFn f,const char*s){return f==launch&&s&&std::strstr(s,"r4d_rad_ds41_index_")==s;}
 struct Fixture {
     Program p;RadKernelInfo info[3]{};KernelRow row[3]{};
     Fixture(){
@@ -28,9 +30,9 @@ TEST(index_b16_all_score_bit_patterns_expand_without_rounding_or_payload_changes
 }
 TEST(index_b16_admission_requires_the_complete_known_same_module_chain_in_every_band){
     Fixture f;Ds41IndexB16Proof p;std::string why;
-    CHECK(ds41_index_b16_admit(f.p,&p,&why,origin));CHECK(why.empty());
+    CHECK(ds41_index_b16_admit(f.p,&p,&why,origin,identity));CHECK(why.empty());
     CHECK_EQ(p.rows,2047);CHECK_EQ(p.columns,32769);CHECK_EQ(p.writers,1);CHECK_EQ(p.candidates,1);CHECK_EQ(p.topk,1);
-    f.p.ops[0].bands.push_back(f.p.ops[0].bands[0]);CHECK(ds41_index_b16_admit(f.p,&p,&why,origin));
+    f.p.ops[0].bands.push_back(f.p.ops[0].bands[0]);CHECK(ds41_index_b16_admit(f.p,&p,&why,origin,identity));
     CHECK_EQ(p.rows*p.columns*2,134156286ll); // same original run graph, exactly half bytes
 }
 TEST(index_b16_admission_refuses_old_packed_unknown_tuned_or_cross_library_paths){
@@ -43,6 +45,7 @@ TEST(index_b16_admission_refuses_old_packed_unknown_tuned_or_cross_library_paths
         [](Fixture&f){f.info[1].name="index_candidates";},
         [](Fixture&f){f.info[2].op="index_topk";},
         [](Fixture&f){f.info[1].launch=alien;},
+        [](Fixture&f){f.info[1].launch=miswired_same_module;},
         [](Fixture&f){f.info[0].launch=nullptr;},
         [](Fixture&f){f.row[1].plugin="override";},
         [](Fixture&f){f.row[1].plugin_order=1;},
@@ -55,6 +58,6 @@ TEST(index_b16_admission_refuses_old_packed_unknown_tuned_or_cross_library_paths
         [](Fixture&f){f.p.ops.pop_back();},
     };
     for(const auto&mutate:bad){Fixture f;mutate(f);Ds41IndexB16Proof p;std::string why;
-        CHECK(!ds41_index_b16_admit(f.p,&p,&why,origin));CHECK(!why.empty());}
+        CHECK(!ds41_index_b16_admit(f.p,&p,&why,origin,identity));CHECK(!why.empty());}
 }
 RAD_TEST_MAIN()

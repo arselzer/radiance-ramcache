@@ -36,6 +36,7 @@ struct DraftBankBackupBudget {
     // Count it even if its fixed storage already exists at capture time.
     int64_t controller_metadata_bytes = 0;
     bool timings = false; // explicit caller opt-in; no helper getenv/steady-ready clock
+    bool complement_words = false; // exact uint64 stores; literal byte loop remains the default
 };
 
 struct DraftBankBackupStats {
@@ -47,6 +48,7 @@ struct DraftBankBackupStats {
     int64_t capture_copy_bytes = 0, restore_copy_bytes = 0, verify_copy_bytes = 0;
     uint64_t image_hash = 0; // diagnostic only; strict memcmp decides readiness
     uint64_t completed_restores = 0;
+    bool complement_words = false;
     DraftBankTimings timings{}; // included in sizeof(Image)/Loan accounting, even when off
 };
 

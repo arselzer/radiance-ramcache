@@ -12,10 +12,12 @@ inline constexpr char kGraceEnv[]="RADIANCE_EXPERIMENTAL_DS41_DSPARK_BANK_LEND_G
 inline constexpr char kCooldownEnv[]="RADIANCE_EXPERIMENTAL_DS41_DSPARK_BANK_LEND_COOLDOWN_MS";
 inline constexpr char kPackedFillEnv[]="RADIANCE_EXPERIMENTAL_DS41_DSPARK_BANK_LEND_PACKED_FILL";
 inline constexpr char kTimingsEnv[]="RADIANCE_EXPERIMENTAL_DS41_DSPARK_BANK_LEND_TIMINGS";
+inline constexpr char kComplementWordsEnv[]="RADIANCE_EXPERIMENTAL_DS41_DSPARK_BANK_LEND_COMPLEMENT_WORDS";
 struct Config {
     bool on=false;
     bool packed_fill=false;
     bool timings=false;
+    bool complement_words=false;
     int64_t backup_cap=0,grace_ms=1000,cooldown_ms=1000;
     static bool number(const char* s,int64_t fallback,int64_t maximum,int64_t* out) {
         *out=fallback;if(!s)return true;if(!*s)return false;
@@ -23,7 +25,7 @@ struct Config {
         *out=v;return true;
     }
     static int parse(const char* flag,const char* budget,const char* grace,const char* cooldown,Config* out,
-                     const char* packed_fill=nullptr,const char* timings=nullptr){
+                     const char* packed_fill=nullptr,const char* timings=nullptr,const char* complement_words=nullptr){
         if(!out)return RAD_E_INVAL;*out=Config{};
         if(packed_fill&&std::strcmp(packed_fill,"0")){
             if(std::strcmp(packed_fill,"1")||!flag||std::strcmp(flag,"1"))return RAD_E_INVAL;
@@ -32,6 +34,10 @@ struct Config {
         if(timings&&std::strcmp(timings,"0")){
             if(std::strcmp(timings,"1")||!flag||std::strcmp(flag,"1"))return RAD_E_INVAL;
             out->timings=true;
+        }
+        if(complement_words&&std::strcmp(complement_words,"0")){
+            if(std::strcmp(complement_words,"1")||!flag||std::strcmp(flag,"1"))return RAD_E_INVAL;
+            out->complement_words=true;
         }
         if(!flag||!std::strcmp(flag,"0"))return RAD_OK;
         if(std::strcmp(flag,"1"))return RAD_E_INVAL;

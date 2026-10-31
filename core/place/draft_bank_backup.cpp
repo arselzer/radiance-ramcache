@@ -1,4 +1,5 @@
 #include "draft_bank_backup.h"
+#include "draft_bank_complement.h"
 #include "draft_vram_load.h"
 #include "dspark_native_scope.h"
 #include "mover.h"
@@ -269,6 +270,7 @@ int Image::capture(const std::array<ImageRank, kDraftRanks>& ranks, const DraftB
     if (attempted_) return poison("bank image capture is one-shot", why);
     attempted_ = true;
     stats_.timings.enabled = b.timings;
+    stats_.complement_words = b.complement_words;
     auto fail = [&](const char* message) { release(); return poison(message, why); };
     auto measure = [&](DraftBankTimingPart p,int64_t start,int64_t bytes,bool ok) -> int {
         const int rc=timing_end(p,start,bytes,ok,why);if(rc<0)release();return rc;
@@ -285,6 +287,8 @@ int Image::capture(const std::array<ImageRank, kDraftRanks>& ranks, const DraftB
         return fail("bank metadata accounting overflow");
     if (b.timings && !add(stats_.metadata_bytes,kDraftBankTimingWorkspaceBytes,&stats_.metadata_bytes))
         return fail("bank timing workspace accounting overflow");
+    if (b.complement_words && !add(stats_.metadata_bytes,kComplementWordWorkspaceBytes,&stats_.metadata_bytes))
+        return fail("bank complement workspace accounting overflow");
     stats_.controller_metadata_bytes = b.controller_metadata_bytes;
     stats_.total_charge_bytes = stats_.metadata_bytes;
     stats_.future_cache_bytes = std::max<int64_t>(0, b.expert_cache_budget_bytes - b.expert_cache_backed_bytes);
@@ -372,7 +376,11 @@ int Image::verify(int rank, int span, std::string* why, VerifyPhase phase) {
     // Every not-copied byte MUST disagree with its reference, including zero
     // tails. Ordinary constant poison cannot guarantee this for arbitrary data.
     int64_t timed=timing_begin();
-    for (int64_t j = 0; j < s.bytes; ++j) back[j] = uint8_t(~saved[j]);
+    if (stats_.complement_words) {
+        if (!complement_words(back, saved, s.bytes)) return poison("invalid bank complement range", why);
+    } else {
+        for (int64_t j = 0; j < s.bytes; ++j) back[j] = uint8_t(~saved[j]);
+    }
     RAD_TRY(timing_end(complement,timed,s.bytes,true,why));
     timed=timing_begin();
     const int rc = io_->copy_sync(rank, back, s.base, s.bytes);

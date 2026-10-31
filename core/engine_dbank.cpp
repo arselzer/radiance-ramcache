@@ -5,6 +5,7 @@
 #include "engine_priv.h"
 #include "device/device.h"
 #include "engine_hostmem.h"
+#include "place/draft_bank_complement.h"
 #include <algorithm>
 #include <chrono>
 #include <cstring>
@@ -114,6 +115,7 @@ int Engine::draft_bank_lend_open() {
     DraftBankBackupBudget budget{};
     budget.backup_mib = draft_bank_config_.backup_cap / (1ll<<20);
     budget.timings = draft_bank_config_.timings;
+    budget.complement_words = draft_bank_config_.complement_words;
     budget.controller_metadata_bytes = sizeof(DraftBankLoan) + DraftBankLoan::kSourceBound;
     if (draft_bank_config_.packed_fill)
         budget.controller_metadata_bytes += draft_bank_packed_fill::kCallMetadataBound;
@@ -160,6 +162,10 @@ int Engine::draft_bank_lend_open() {
         RAD_INFO("DSBANKPACK startup enabled=1 native_gu=4608x5120 native_dn=5120x2304 pair_bytes=%lld "
                  "relay=backup_shared_pair extra_payload_bytes=0 call_metadata_bound=%lld leases=through_sync_copy",
                  (long long)kDraftPairBytes, (long long)draft_bank_packed_fill::kCallMetadataBound);
+    if (draft_bank_config_.complement_words)
+        RAD_INFO("DSBANKCOMPLEMENT startup enabled=1 word_bytes=8 workspace=%lld alignment=unaligned "
+                 "overlap=legacy_byte tail=legacy_byte readback=full_memcmp hash=unchanged copies=unchanged",
+                 (long long)draft_bank_backup_detail::kComplementWordWorkspaceBytes);
     return RAD_OK;
 }
 

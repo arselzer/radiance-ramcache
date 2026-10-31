@@ -4,6 +4,7 @@
 #include "rad_test.h"
 #include "dspark_bank_plan_fixture.h"
 #include "place/draft_bank_backup.h"
+#include "place/draft_bank_complement.h"
 #include "place/planner.h"
 
 #include <array>
@@ -473,6 +474,113 @@ TEST(draft_bank_backup_timings_image_counter_overflow_poison_survives_retry) {
     CHECK(image.capture(t.image,b,sizeof(image),&io,&why)<0);CHECK(image.stats().timings.overflow);
     d::Image fresh;CHECK(!fresh.stats().timings.enabled);CHECK(!fresh.stats().timings.overflow);
     CHECK_EQ(fresh.stats().timings.part[0].attempts,uint64_t{0});
+}
+
+TEST(draft_bank_complement_words_matches_every_byte_unaligned_tail_and_guards) {
+    for (int pattern = 0; pattern < 4; ++pattern) {
+        std::array<uint8_t, 320> source{};
+        for (size_t i = 0; i < source.size(); ++i)
+            source[i] = pattern == 0 ? uint8_t(i) : pattern == 1 ? uint8_t(255-i) : pattern == 2 ? 0 : 255;
+        const auto immutable = source;
+        for (int so = 0; so < 16; ++so) for (int offset = 0; offset < 16; ++offset)
+            for (int bytes : {0,1,2,7,8,9,15,16,17,31,32,33,63,64,65,127,128,129,256}) {
+                std::array<uint8_t, 320> expected, actual;
+                expected.fill(0x5a); actual = expected;
+                for (int j = 0; j < bytes; ++j) expected[size_t(offset+j)] = uint8_t(~source[size_t(so+j)]);
+                CHECK(d::complement_words(actual.data()+offset,source.data()+so,bytes));
+                CHECK(actual == expected); // includes every untouched prefix/tail guard
+                CHECK(source == immutable);
+            }
+    }
+}
+
+TEST(draft_bank_complement_words_preserves_forward_overlap_and_empty_range_semantics) {
+    CHECK(d::complement_words(nullptr,nullptr,0));
+    CHECK(!d::complement_words(nullptr,nullptr,1));
+    CHECK(!d::complement_words(nullptr,nullptr,-1));
+    CHECK(!d::complement_words(at(UINTPTR_MAX-3),at(16),8));
+    CHECK(!d::complement_words(at(16),at(UINTPTR_MAX-3),8));
+    for (int delta = -17; delta <= 17; ++delta) for (int bytes : {0,1,7,8,9,16,17,63,127}) {
+        std::array<uint8_t, 256> expected{}, actual{};
+        for (size_t i = 0; i < actual.size(); ++i) actual[i] = uint8_t(37*i+11);
+        expected = actual;
+        for (int j = 0; j < bytes; ++j) expected[size_t(64+delta+j)] = uint8_t(~expected[size_t(64+j)]);
+        CHECK(d::complement_words(actual.data()+64+delta,actual.data()+64,bytes));
+        CHECK(actual == expected); // especially output one byte after the source
+    }
+}
+
+TEST(draft_bank_complement_words_image_preserves_hash_copy_order_bytes_and_fixed_workspace) {
+    struct TraceIO : IO {
+        Tiny* source = nullptr;
+        std::vector<uint64_t> trace;
+        int copy_sync(int rank,void* dst,const void* src,int64_t bytes) override {
+            const uintptr_t first=uintptr_t(source->data.data()),last=first+sizeof(source->data);
+            const bool write=uintptr_t(dst)>=first&&uintptr_t(dst)<last;
+            const uintptr_t device=write?uintptr_t(dst):uintptr_t(src);
+            trace.push_back((uint64_t(rank)<<48)|(uint64_t(bytes)<<16)|((device-first)<<1)|uint64_t(write));
+            return IO::copy_sync(rank,dst,src,bytes);
+        }
+    };
+    Tiny a,b;TraceIO off,on;off.source=&a;on.source=&b;d::Image ia,ib;std::string why;
+    auto ba=budget(),bb=budget();ba.timings=bb.timings=true;bb.complement_words=true;
+    REQUIRE_EQ(ia.capture(a.image,ba,sizeof(ia),&off,&why),RAD_OK);
+    REQUIRE_EQ(ib.capture(b.image,bb,sizeof(ib),&on,&why),RAD_OK);
+    CHECK(!ia.stats().complement_words);CHECK(ib.stats().complement_words);
+    CHECK_EQ(ia.stats().image_hash,ib.stats().image_hash);CHECK(off.trace==on.trace);
+    CHECK_EQ(ib.stats().metadata_bytes-ia.stats().metadata_bytes,d::kComplementWordWorkspaceBytes);
+    CHECK_EQ(ib.stats().total_charge_bytes-ia.stats().total_charge_bytes,d::kComplementWordWorkspaceBytes);
+    CHECK_EQ(off.allocs,on.allocs);CHECK_EQ(off.need+d::kComplementWordWorkspaceBytes,on.need);
+    for(int pass=0;pass<3;++pass){
+        ia.mark_borrowed();ib.mark_borrowed();a.lend();b.lend();
+        REQUIRE_EQ(ia.restore_verify_all(&why),RAD_OK);
+        REQUIRE_EQ(ib.restore_verify_all(&why),RAD_OK);
+        CHECK(off.trace==on.trace);CHECK_EQ(std::memcmp(a.data.data(),b.data.data(),sizeof(a.data)),0);
+    }
+    CHECK_EQ(ia.stats().capture_copy_bytes,ib.stats().capture_copy_bytes);
+    CHECK_EQ(ia.stats().restore_copy_bytes,ib.stats().restore_copy_bytes);
+    CHECK_EQ(ia.stats().verify_copy_bytes,ib.stats().verify_copy_bytes);
+    for(size_t i=0;i<ia.stats().timings.part.size();++i){
+        const auto& x=ia.stats().timings.part[i];const auto& y=ib.stats().timings.part[i];
+        CHECK_EQ(x.attempts,y.attempts);CHECK_EQ(x.ok,y.ok);
+        CHECK_EQ(x.requested_bytes,y.requested_bytes);CHECK_EQ(x.ok_bytes,y.ok_bytes);
+    }
+}
+
+TEST(draft_bank_complement_words_short_capture_and_restore_readbacks_stay_fatal) {
+    for (bool words : {false,true}) for (int rank=0;rank<4;++rank) {
+        std::string why;auto b=budget();b.complement_words=words;
+        { Tiny t;IO io;d::Image image;io.short_copy=6*rank+2; // first capture readback on this rank
+          CHECK(image.capture(t.image,b,sizeof(image),&io,&why)<0);
+          CHECK(image.failed());CHECK(!image.ready());CHECK(why.find("strict byte")!=std::string::npos); }
+        for(int direction=0;direction<2;++direction){
+            Tiny t;IO io;d::Image image;
+            REQUIRE_EQ(image.capture(t.image,b,sizeof(image),&io,&why),RAD_OK);
+            image.mark_borrowed();t.lend();
+            io.short_copy=io.copies+4+4*rank+1+direction; // H2D or D2H after four invariant reads
+            CHECK(image.restore_verify_all(&why)<0);CHECK(image.failed());CHECK(!image.ready());
+            CHECK(why.find("strict byte")!=std::string::npos);
+            const int calls=io.copies;CHECK(image.restore_verify_all(&why)<0);CHECK_EQ(io.copies,calls);
+        }
+    }
+}
+
+TEST(draft_bank_complement_words_workspace_cap_refuses_before_any_allocation) {
+    Tiny t;IO old_io;d::Image old;auto b=budget();std::string why;
+    int64_t pinned=0;
+    for(const auto& rank:t.image){
+        int64_t requested=rank.scratch_bytes;
+        for(int i=0;i<rank.nspans;++i)requested+=rank.spans[i].bytes;
+        pinned+=old_io.allocation_charge(requested);
+    }
+    const int64_t metadata=(b.backup_mib<<20)-pinned-b.controller_metadata_bytes;
+    REQUIRE_EQ(old.capture(t.image,b,metadata,&old_io,&why),RAD_OK);
+    CHECK_EQ(old.stats().total_charge_bytes,old.stats().cap_bytes);
+    IO word_io;d::Image words;b.complement_words=true;
+    CHECK(words.capture(t.image,b,metadata,&word_io,&why)<0);
+    CHECK_EQ(word_io.rooms,0);CHECK_EQ(word_io.allocs,0);CHECK_EQ(word_io.copies,0);
+    CHECK(words.failed());CHECK(!words.ready());
+    CHECK_EQ(words.stats().total_charge_bytes,old.stats().cap_bytes+d::kComplementWordWorkspaceBytes);
 }
 
 RAD_TEST_MAIN()

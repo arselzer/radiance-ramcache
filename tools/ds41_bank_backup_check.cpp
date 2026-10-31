@@ -3,6 +3,7 @@
  * fixture and actual model startup, separately from this raw-copy proof.
  * Run ONLY inside the two-lock stop/restore window, before model lending. */
 #include "place/draft_bank_backup.h"
+#include "place/draft_bank_complement.h"
 #include "rad_device.h"
 
 #include <array>
@@ -128,7 +129,87 @@ void timing_proof(const d::Image& image, int n, const DraftBankTimingCounter& or
          c(DraftBankTimingPart::InvariantD2H).ok_bytes==uint64_t(s.verify_copy_bytes)&&
          c(DraftBankTimingPart::RestoreH2D).ok_bytes==uint64_t(s.restore_copy_bytes),"timed full-copy totals disagree");
 }
-void run(int n, int backup_mib, bool timings) {
+struct CopyCall { int rank=0, direction=0; int64_t offset=0, bytes=0; };
+struct CopyOrder {
+    // One capture (two copies/span) plus one restore (two copies/raw span
+    // and two mask observations). N32 is the largest supported native bank.
+    std::array<CopyCall, 4*kDraftRanks*d::kSpans> calls{};
+    size_t size=0;
+};
+struct OrderedIO final : DraftBankBackupIO {
+    FaultIO& io; const Cohort& cards; CopyOrder& order;
+    bool compare=false, tracking=true; size_t cursor=0;
+    OrderedIO(FaultIO& f,const Cohort& c,CopyOrder& o,bool old_new):io(f),cards(c),order(o),compare(old_new){}
+    int64_t allocation_charge(int64_t n)const noexcept override{return io.allocation_charge(n);}
+    bool room(int64_t n,int64_t still,int64_t margin,std::string* why)override{return io.room(n,still,margin,why);}
+    void* alloc_pinned(int64_t n)override{return io.alloc_pinned(n);}
+    void free_pinned(void* p)noexcept override{io.free_pinned(p);}
+    int copy_sync(int rank,void* dst,const void* src,int64_t bytes)override{
+        if(tracking){
+            need(rank>=0&&rank<kDraftRanks,"invalid copy-order rank");
+            const uintptr_t base=uintptr_t(cards.memory[rank]);
+            const uint64_t extent=uint64_t(cards.raw_bytes+3*512);
+            const bool write=uintptr_t(dst)>=base&&uint64_t(uintptr_t(dst)-base)<extent;
+            const uintptr_t ptr=write?uintptr_t(dst):uintptr_t(src);
+            need(ptr>=base&&uint64_t(ptr-base)<extent,"copy-order endpoint is not a native card span");
+            CopyCall current{rank,int(write),int64_t(ptr-base),bytes};
+            if(compare){
+                need(cursor<order.size,"new complement submitted extra copies");
+                const auto& old=order.calls[cursor];
+                need(old.rank==current.rank&&old.direction==current.direction&&old.offset==current.offset&&old.bytes==current.bytes,
+                     "new complement changed rank/span/direction/byte copy order");
+            }else{
+                need(cursor<order.calls.size(),"bounded native copy-order ledger exhausted");
+                order.calls[cursor]=current;order.size=cursor+1;
+            }
+            ++cursor;
+        }
+        return io.copy_sync(rank,dst,src,bytes);
+    }
+};
+void complement_proof(Cohort& cards,DraftBankBackupDeviceIO& real,DraftBankBackupBudget budget){
+    CopyOrder order;
+    // All fixed oracle-only trace/call locals are charged alongside the original
+    // initializer. No second snapshot or second pair relay is retained.
+    constexpr int64_t workspace=sizeof(CopyOrder)+sizeof(OrderedIO)+sizeof(FaultIO)+
+        2*sizeof(d::Image)+sizeof(DraftBankBackupBudget)+256;
+    need(budget.controller_metadata_bytes>=0&&budget.controller_metadata_bytes<=INT64_MAX-workspace,
+         "complement oracle metadata charge overflow");
+    budget.controller_metadata_bytes+=workspace;
+    std::string why;uint64_t hash=0;
+    int64_t capture_bytes=0,restore_bytes=0,verify_bytes=0;
+    cards.fill_original(real);
+    {
+        FaultIO fault(real);OrderedIO io(fault,cards,order,false);d::Image old;
+        budget.complement_words=false;
+        checked(old.capture(cards.images,budget,sizeof(old),&io,&why),why);
+        old.mark_borrowed();cards.overwrite_all();checked(old.restore_verify_all(&why),why);
+        need(old.ready()&&!old.failed(),"old complement full-byte baseline is incomplete");
+        hash=old.stats().image_hash;capture_bytes=old.stats().capture_copy_bytes;
+        restore_bytes=old.stats().restore_copy_bytes;verify_bytes=old.stats().verify_copy_bytes;
+    }
+    {
+        FaultIO fault(real);OrderedIO io(fault,cards,order,true);d::Image words;
+        budget.complement_words=true;
+        checked(words.capture(cards.images,budget,sizeof(words),&io,&why),why);
+        words.mark_borrowed();cards.overwrite_all();checked(words.restore_verify_all(&why),why);
+        need(words.ready()&&!words.failed()&&words.stats().complement_words&&words.stats().image_hash==hash,
+             "word complement changed the immutable full-bank hash or readiness");
+        need(io.cursor==order.size&&words.stats().capture_copy_bytes==capture_bytes&&
+             words.stats().restore_copy_bytes==restore_bytes&&words.stats().verify_copy_bytes==verify_bytes,
+             "old/new native copy coverage differs");
+        // Real successful-but-short final-byte D2H on the last card. The source
+        // device bytes are correct, so the complement itself must make the
+        // missing readback byte disagree (including the seeded zero tail).
+        io.tracking=false;words.mark_borrowed();cards.overwrite_all();
+        fault.short_destination=words.scratch(3);fault.armed=true;
+        need(words.restore_verify_all(&why)<0&&fault.fired&&words.failed()&&!words.ready()&&
+             why.find("strict byte")!=std::string::npos,"word complement did not catch a short real readback");
+        need(words.restore_verify_all(&why)<0&&!words.ready(),"failed word complement became query-ready");
+    }
+    std::printf("PASS: DSBANK_COMPLEMENT_CARD ranks=4 hot_n=%d word_bytes=8 old_new_hash=1 full_memcmp=1 copy_order=exact copy_bytes=exact short_readback_fatal=1\n",cards.hot_n);
+}
+void run(int n, int backup_mib, bool timings, bool complement_words) {
     Cohort cards;
     cards.init(n);
     DraftBankBackupDeviceIO real(cards.ranks);
@@ -142,6 +223,7 @@ void run(int n, int backup_mib, bool timings) {
     DraftBankBackupBudget budget;
     budget.backup_mib = backup_mib;
     budget.timings = timings;
+    budget.complement_words = complement_words;
     budget.system_headroom_bytes = headroom;
     // Explicitly charge oracle-only initializer/metadata alongside image storage.
     budget.controller_metadata_bytes = seed_charge + sizeof(cards) + sizeof(real) + sizeof(FaultIO);
@@ -175,6 +257,7 @@ void run(int n, int backup_mib, bool timings) {
         need(image.restore_verify_all(&why) < 0 && io.fired && image.failed() && !image.ready(), "short restore escaped strict readback");
         need(image.restore_verify_all(&why) < 0 && !image.ready(), "poisoned cohort became query-ready");
     }
+    if(complement_words)complement_proof(cards,real,budget);
     // The correction planes are checked, never silently repaired. Keep their
     // original stable pointers and test a real final-byte corruption separately.
     {
@@ -187,6 +270,7 @@ void run(int n, int backup_mib, bool timings) {
         DraftBankBackupBudget small;
         small.backup_mib = 32; small.system_headroom_bytes = headroom;
         small.timings = timings;
+        small.complement_words = complement_words;
         d::Image image;
         checked(image.capture(masks, small, sizeof(image), &real, &why), why);
         void* changed = static_cast<char*>(masks[2].spans[1].base) + 511;
@@ -201,17 +285,18 @@ void run(int n, int backup_mib, bool timings) {
 } // namespace
 int main(int argc, char** argv) {
     try {
-        bool inside = false, timings = false;
+        bool inside = false, timings = false, complement_words = false;
         int n = 0, cap = 0;
         for (int i = 1; i < argc; ++i) {
             if (!std::strcmp(argv[i], "--inside-guarded-window") && !inside) inside = true;
             else if (!std::strcmp(argv[i], "--timings") && !timings) timings = true;
+            else if (!std::strcmp(argv[i], "--complement-words") && !complement_words) complement_words = true;
             else if (!std::strcmp(argv[i], "--hot-n") && !n && i + 1 < argc) n = number(argv[++i]);
             else if (!std::strcmp(argv[i], "--backup-mib") && !cap && i + 1 < argc) cap = number(argv[++i]);
             else throw std::runtime_error("unknown/duplicate/incomplete argument");
         }
         need(inside && n >= 1 && n <= 32 && cap > 0, "requires --inside-guarded-window --hot-n 1..32 --backup-mib N before any device access");
-        run(n, cap, timings);
+        run(n, cap, timings, complement_words);
         return 0;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FAIL DSBANK_BACKUP_CARD: %s\n", e.what());

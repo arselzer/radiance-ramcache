@@ -85,7 +85,39 @@ TEST(kv_backing_allocator_bootstrap_hides_ids_and_requires_fixed_floor) {
     CHECK(f.grow_calls >= 1);
     for (int g : {1, 2, 4}) for (int32_t b : f.kv.block_table(1, g)) CHECK(f.kv.block_backed(g, b));
     CHECK_EQ(f.kv.held_blocks(1), int64_t(1));
-    CHECK(f.kv.free_blocks(1) < f.kv.available_blocks(1)); // future capacity is not prematurely published
+    // Granule rounding can back an entire small group while mapping just its requested pages.
+    // Count physical publication independently from the map, rather than require a gap in that
+    // particular group. Logical availability includes unbacked IDs; the free heap must not.
+    int64_t hidden_full = 0;
+    for (int g : {1, 2, 4}) {
+        const auto* p = f.kv.plan(g);
+        const int64_t frag = p->layer_bytes_per_block();
+        int64_t backed_free = 0, logical_free = 0, unbacked_free = 0;
+        for (int32_t b = 0; b < p->n_blocks; ++b) {
+            bool mapped = true;
+            for (int64_t l = 0; l < p->n_layers; ++l) {
+                const int64_t off = p->pool_offset + l * p->layer_stride() + b * frag;
+                const int64_t first = off / f.map.granule_bytes;
+                const int64_t last = (off + frag - 1) / f.map.granule_bytes;
+                for (int64_t i = first; i <= last; ++i)
+                    mapped &= f.map.backed[(size_t)i] != 0;
+            }
+            CHECK_EQ(f.kv.block_backed(g, b), mapped);
+            if (f.kv.block_refcount(g, b) == 0) {
+                ++logical_free;
+                if (mapped) ++backed_free;
+                else ++unbacked_free;
+            }
+        }
+        CHECK_EQ(f.kv.free_blocks(g), backed_free);
+        CHECK_EQ(f.kv.available_blocks(g), logical_free);
+        CHECK_EQ(logical_free - backed_free, unbacked_free);
+        if (p->kind == RAD_KV_FULL && unbacked_free > 0) {
+            CHECK(f.kv.free_blocks(g) < f.kv.available_blocks(g));
+            hidden_full += unbacked_free;
+        }
+    }
+    CHECK(hidden_full > 0); // actual future FULL capacity remains unpublished
 }
 
 TEST(kv_backing_allocator_cow_prefix_and_inflight_demand_survive_later_group_transactions) {

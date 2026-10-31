@@ -4,6 +4,7 @@
 #include "mm/processor.h"
 #include "place/ep_route_counts.h"
 #include "sched/p1_chunk.h"
+#include "mem/kv_layout_receipt.h"
 
 #include "server/sink.h"
 
@@ -1524,7 +1525,16 @@ int Scheduler::cancel(uint64_t id) {
     /* Blocks go back now (spec §14), unless a step in flight or a drafter snapshot still names
      * the request; then commit or sweep_deferred releases them (SchedReq::pending_free). */
     const bool in_flight = in_step(s) || block_holds(id);
+    const bool audit = kv_layout_flag(std::getenv(kKVLayoutEnv)) == 1;
+    const int before = audit ? (int)s.req->state : -1;
     close_request(s, ReqState::Cancelled, "cancelled", in_flight);
+    /* The HTTP disconnect counter also counts a late close whose generations already ended.
+     * This audit-only row proves the real scheduler accepted cancellation while nonterminal,
+     * under the same ownership lock, after close_request completed. No endpoint/ABI change. */
+    if (audit && (before == (int)ReqState::Waiting || before == (int)ReqState::Running ||
+                  before == (int)ReqState::Preempted) && s.req->state == ReqState::Cancelled)
+        RAD_INFO("DS41_KV_CANCEL seq=%llu step=%lld before=%d active=1 accepted=1 cancelled=1 deferred=%d",
+                 (unsigned long long)id, (long long)step_, before, (int)in_flight);
     return RAD_OK;
 }
 

@@ -46,6 +46,15 @@ layer and local logits row from the actual layout, all successful. This closes a
 diagnostic gap: two failed huge captures must not pass merely because they folded the same
 zero hashes. No additional copy or numerical operation is introduced by the receipt.
 
+The same audit flag adds `DS41_KV_CANCEL` only after the scheduler actually closes a previously
+Waiting/Running/Preempted request as Cancelled, under its ownership lock. It records the exact
+sequence, step, prior state and deferred-cleanup flag. Finished, already cancelled, failed and
+not-found requests emit no accepted receipt. A stream-disconnect model gate requires prior
+Running (state1), active/accepted/cancelled1 for its observed sequence, a strict partial text
+prefix and remaining generation budget; the HTTP disconnect counter alone is insufficient
+because it also increments for a late close whose sinks already completed. No new endpoint,
+state transition or numerical work is added. Flag-off cancellation emits its original log lines.
+
 The first large-capacity matrix keeps M16, F32 scores and all independent memory switches off:
 INDEX_SCORE_COMPACT0, INDEX_SCORE_BF160, packed main/index/window0 and packed-fast0. Actual
 `index_plane_rows=min(max_tok,max(legacy256,256MiB/4/columns))` gives irows16/one run at M16.

@@ -40,9 +40,9 @@ struct DraftBankTimings {
      * counters and the overflow latch. Only destroying it starts a new lifetime. */
 };
 /* Each of14 fixed names is <=32 bytes; five u64 columns need <=20 digits each.
- * Header allowance256 includes status/hash/fixed schema. Charge all formatting
+ * Header allowance320 includes status/hash scope/fixed schema. Charge all formatting
  * storage and scalar clock/record locals through the existing explicit budget. */
-inline constexpr size_t kDraftBankTimingLogBytes = 256 + size_t(DraftBankTimingPart::Count)*(32+1+5*20+4+1);
+inline constexpr size_t kDraftBankTimingLogBytes = 320 + size_t(DraftBankTimingPart::Count)*(32+1+5*20+4+1);
 // log_emit uses its existing4096-byte stack buffer simultaneously. Our bounded
 // line fits it, so its long-line std::string allocation is never needed. Charge
 // both buffers plus scalar/varargs reserve, rounded to an explicit8KiB bound.

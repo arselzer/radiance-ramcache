@@ -248,7 +248,8 @@ void Image::timing_log(const char* operation, int status) const noexcept {
     char line[kDraftBankTimingLogBytes];
     int used = std::snprintf(line,sizeof(line),
         "DSBANKTIME operation=%s enabled=1 cumulative=1 clock=steady_ns status=%d overflow=%d ready=%d failed=%d "
-        "workspace=%lld stats_bytes=%zu restores=%llu hash=%016llx columns=ns/attempts/ok/requested/okbytes",
+        "workspace=%lld stats_bytes=%zu restores=%llu hash=%016llx hash_scope=cohort hash_algorithm=fnv1a64 diagnostic=1 "
+        "columns=ns/attempts/ok/requested/okbytes",
         operation,status,stats_.timings.overflow,ready_,failed_,(long long)kDraftBankTimingWorkspaceBytes,
         sizeof(stats_.timings),(unsigned long long)stats_.completed_restores,(unsigned long long)stats_.image_hash);
     bool complete = used > 0 && size_t(used) < sizeof(line);

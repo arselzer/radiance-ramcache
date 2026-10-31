@@ -48,7 +48,8 @@ enqueues, synchronizes even after enqueue failure and returns to rank0.
 After it enters image capture, the native wrapper emits ONE bounded `DSBANKTIME` line after capture (including
 post-capture invariant validation) and after each complete or failed restore
 attempt. Lines identify operation/status/ready/failed/overflow, successful
-restore generation, unchanged hash, actual retained timing `stats_bytes`, extra
+restore generation, unchanged explicitly cohort-scoped diagnostic FNV1a64 hash,
+actual retained timing `stats_bytes`, extra
 workspace charge, clock and column schema. They contain all14 cumulative
 buckets. Per-transition differences come from successive cumulative snapshots;
 do not add repeated snapshots or label them exclusive interval totals. A
@@ -74,7 +75,7 @@ all-zero. Successful retry of a failed/overflowed image remains forbidden.
 Memory accounting grows by the actual retained `sizeof(DraftBankTimings)` in
 Stats/Image/Loan, automatically included in their existing cap/host preflights.
 Enabled timing additionally charges8192B fixed call workspace. The formatted
-line bound is2188B: fixed header plus14 names≤32B and five20-digit columns each.
+line bound is2252B: fixed header plus14 names≤32B and five20-digit columns each.
 The existing logger simultaneously uses a4096B stack buffer. Both plus1024B
 scalar/varargs reserve fit8192B. The line is shorter than that logger buffer,
 so its long-line heap allocation path is not used. There is no new payload
@@ -91,6 +92,24 @@ Tests intentionally assert no positive duration threshold: zero nanoseconds at
 clock resolution is not proof of missing work. Existing full backup/native
 scope/failure cases remain required. Root alone builds and runs exact host tests
 under build.lock, nice19 and `-LE gpu`, then a guarded model byte gate before use.
+
+The existing `ds41-bank-backup-check` adds an OPTIONAL `--timings` argument.
+Its old default CLI and final backup PASS remain unchanged. When enabled it
+passes the explicit timing budget flag through the SAME real four-card Image
+copy/readback/fault path. After three successful complete restores, it checks
+all native capture/restore call and requested-byte counts against geometry and
+the existing copy ledger, and proves the capture FNV tuple never changed during
+restore. It still exercises the real partial-fill rollback, short-restore fatal
+readback and mask-fault paths. Only then it adds:
+
+```text
+PASS: DSBANK_TIMING_CARD ranks=4 hot_n=24 restores=3 copy_counts=exact copy_bytes=exact repeated_fnv=0 strict_readback=1
+```
+
+This proves the timed generic Image path on real cards. It does not prove native
+Program/Plan admission, Engine event/log/epoch binding, per-rank nanoseconds or
+model replies. Those remain explicit model/parser gates. The model timing logs
+are COHORT nanoseconds; all four rank byte/hash receipts bind that cohort scope.
 
 The first measured N24 capture took22.365s, while fill/restore took1.983/2.678s.
 The FNV loop and pinned allocation are source-identified suspects, not separately

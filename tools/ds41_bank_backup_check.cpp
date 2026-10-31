@@ -103,7 +103,32 @@ struct FaultIO final : DraftBankBackupIO {
         return real.copy_sync(rank, dst, src, bytes);
     }
 };
-void run(int n, int backup_mib) {
+void timing_proof(const d::Image& image, int n, const DraftBankTimingCounter& original_fnv) {
+    const auto& s=image.stats();const auto& t=s.timings;
+    need(t.enabled&&!t.overflow&&image.ready(),"timing branch is not a complete valid image");
+    const uint64_t raw=uint64_t(4)*uint64_t(3*n)*uint64_t(kDraftPairBytes), masks=4*3*512;
+    const uint64_t spans=uint64_t(4)*uint64_t(3*n+3), native_spans=uint64_t(4)*uint64_t(3*n);
+    auto c=[&](DraftBankTimingPart p)->const DraftBankTimingCounter&{return t.part[size_t(p)];};
+    need(c(DraftBankTimingPart::Allocation).attempts==4&&c(DraftBankTimingPart::Allocation).ok==4&&
+         c(DraftBankTimingPart::Allocation).ok_bytes==uint64_t(s.pinned_requested_bytes),"timed allocation accounting differs");
+    for(auto p:{DraftBankTimingPart::Zero,DraftBankTimingPart::CaptureD2H,DraftBankTimingPart::CaptureFNV,
+                DraftBankTimingPart::CaptureComplement,DraftBankTimingPart::CaptureVerifyD2H,DraftBankTimingPart::CaptureMemcmp}) {
+        const auto& q=c(p);need(q.attempts==spans&&q.ok==spans&&q.requested_bytes==raw+masks&&q.ok_bytes==raw+masks,
+                              "timed capture count/bytes differ from full native image");
+    }
+    for(auto p:{DraftBankTimingPart::RestoreH2D,DraftBankTimingPart::RestoreComplement,DraftBankTimingPart::RestoreD2H,DraftBankTimingPart::RestoreMemcmp}) {
+        const auto& q=c(p);need(q.attempts==3*native_spans&&q.ok==3*native_spans&&q.requested_bytes==3*raw&&q.ok_bytes==3*raw,
+                              "timed restore count/bytes differ from all three full restores");
+    }
+    const auto& hash=c(DraftBankTimingPart::CaptureFNV);
+    need(hash.ns==original_fnv.ns&&hash.attempts==original_fnv.attempts&&hash.ok==original_fnv.ok&&
+         hash.requested_bytes==original_fnv.requested_bytes&&hash.ok_bytes==original_fnv.ok_bytes,
+         "restore repeated the original capture hash");
+    need(c(DraftBankTimingPart::CaptureVerifyD2H).ok_bytes+c(DraftBankTimingPart::RestoreD2H).ok_bytes+
+         c(DraftBankTimingPart::InvariantD2H).ok_bytes==uint64_t(s.verify_copy_bytes)&&
+         c(DraftBankTimingPart::RestoreH2D).ok_bytes==uint64_t(s.restore_copy_bytes),"timed full-copy totals disagree");
+}
+void run(int n, int backup_mib, bool timings) {
     Cohort cards;
     cards.init(n);
     DraftBankBackupDeviceIO real(cards.ranks);
@@ -116,6 +141,7 @@ void run(int n, int backup_mib) {
     cards.fill_original(real);
     DraftBankBackupBudget budget;
     budget.backup_mib = backup_mib;
+    budget.timings = timings;
     budget.system_headroom_bytes = headroom;
     // Explicitly charge oracle-only initializer/metadata alongside image storage.
     budget.controller_metadata_bytes = seed_charge + sizeof(cards) + sizeof(real) + sizeof(FaultIO);
@@ -127,6 +153,7 @@ void run(int n, int backup_mib) {
         std::printf("bank-card captured ranks=4 hot_n=%d raw_bytes=%lld charged=%lld hash=%016llx\n", n,
                     (long long)image.stats().raw_bytes, (long long)image.stats().total_charge_bytes,
                     (unsigned long long)image.stats().image_hash);
+        const auto capture_fnv=image.stats().timings.part[size_t(DraftBankTimingPart::CaptureFNV)];
         for (int pass = 0; pass < 2; ++pass) {
             image.mark_borrowed();
             need(!image.ready(), "borrowed image remained ready");
@@ -140,6 +167,7 @@ void run(int n, int backup_mib) {
         cards.overwrite(3, cards.memory[3], kDraftPairBytes / 2 + 31);
         checked(image.restore_verify_all(&why), why);
         need(image.ready() && image.stats().completed_restores == 3, "partial-fill rollback incomplete");
+        if(timings)timing_proof(image,n,capture_fnv);
         // A successful-but-short later-rank restore must poison the whole cohort.
         image.mark_borrowed();
         cards.overwrite_all();
@@ -158,6 +186,7 @@ void run(int n, int backup_mib) {
         }
         DraftBankBackupBudget small;
         small.backup_mib = 32; small.system_headroom_bytes = headroom;
+        small.timings = timings;
         d::Image image;
         checked(image.capture(masks, small, sizeof(image), &real, &why), why);
         void* changed = static_cast<char*>(masks[2].spans[1].base) + 511;
@@ -167,20 +196,22 @@ void run(int n, int backup_mib) {
         need(*static_cast<unsigned char*>(cards.seed) == 0xa5, "failed mask invariant was silently repaired");
     }
     std::printf("PASS: DSBANK_BACKUP_CARD ranks=4 hot_n=%d restores=3 partial_fill_rollback=1 short_restore_fatal=1 masks=1\n", n);
+    if(timings)std::printf("PASS: DSBANK_TIMING_CARD ranks=4 hot_n=%d restores=3 copy_counts=exact copy_bytes=exact repeated_fnv=0 strict_readback=1\n",n);
 }
 } // namespace
 int main(int argc, char** argv) {
     try {
-        bool inside = false;
+        bool inside = false, timings = false;
         int n = 0, cap = 0;
         for (int i = 1; i < argc; ++i) {
             if (!std::strcmp(argv[i], "--inside-guarded-window") && !inside) inside = true;
+            else if (!std::strcmp(argv[i], "--timings") && !timings) timings = true;
             else if (!std::strcmp(argv[i], "--hot-n") && !n && i + 1 < argc) n = number(argv[++i]);
             else if (!std::strcmp(argv[i], "--backup-mib") && !cap && i + 1 < argc) cap = number(argv[++i]);
             else throw std::runtime_error("unknown/duplicate/incomplete argument");
         }
         need(inside && n >= 1 && n <= 32 && cap > 0, "requires --inside-guarded-window --hot-n 1..32 --backup-mib N before any device access");
-        run(n, cap);
+        run(n, cap, timings);
         return 0;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FAIL DSBANK_BACKUP_CARD: %s\n", e.what());

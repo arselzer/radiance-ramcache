@@ -93,6 +93,11 @@ int Engine::dprob_init() {
                      "observer=1, wait=step_end before issue_ahead; candidate_p=candidate-set-share, "
                      "invalid_numeric=full-prefix2; action/cycle logging=on, fixed_measurement=off",
                      draft_experiment_.prefix_policy().spec, rad_dflash_observe::kPolicyEnv);
+        else if (draft_experiment_.query_free())
+            RAD_INFO("DSpark query-free control: on (%s); matched_fixed=0 declared_query_rows=2 "
+                     "actual_query_rows=0 observer=0 query_readback=0; context/reservations/Db2 bank retained, "
+                     "Dx=1, wait=step_end before issue_ahead; greedy request guard, no predictor or policy",
+                     kDraftQueryFreeEnv);
         else RAD_INFO("DSpark matched early verify: on k=%d (%s); query_rows=%d unchanged at every action, "
                  "observer=1, wait=step_end before issue_ahead, logging=%s; fixed measurement, no probability policy",
                  draft_experiment_.early_verify(), rad_dflash_observe::kEarlyEnv, dmeasure_query_rows_,
@@ -107,6 +112,7 @@ void Engine::dprob_fini() {
 }
 
 int Engine::dprob_issue(int n) {
+    if (draft_experiment_.query_free() && n > 0) return RAD_E_STATE;
     if (!dprob_host_ || n <= 0) return RAD_OK;
     if (n > dprob_rows_) return RAD_E_SHAPE;
     Rank& r0 = *ranks_[0];
@@ -272,6 +278,7 @@ void Engine::dmeasure_finish(const StepOut& so) {
 
 void Engine::dmeasure_report() const {
     if (!draft_experiment_.early_boundary()) return;
+    if (draft_experiment_.query_free()) { dnq_report(); return; }
     const DraftMeasureStats& s = dmeasure_.stats;
     if (draft_experiment_.prefix_policy().on) {
         RAD_INFO("DSpark prefix policy totals: queries=%llu query_rows=%llu observers=%llu waits=%llu "

@@ -527,6 +527,7 @@ int Engine::stage_couple_draws(const Row* rows, int n) {
 /* One drafter pass through the barrier. Neither pass samples (no logits in the context pass; the
  * query pass has its own selector), so the sampler chain is zero rows. */
 int Engine::block_pass(const RadBatch* db, const char* what, int step) {
+    if (draft_experiment_.query_free() && db->draft_pass == 1) return RAD_E_STATE;
     for (auto& rk : ranks_) {
         int s = rk->sampler.build_greedy(0);
         if (s < 0) {
@@ -581,6 +582,7 @@ void Engine::block_shape(int* block, int* steps) {
 
 int Engine::issue_block_drafter(int step, StepOut& so) {
     block_rows_ = 0;
+    if (draft_experiment_.query_free()) dnq_candidate_ = {};
     if (!block_drafting()) return RAD_OK;
 
     RAD_TRY(advance_all(ADV_ACCEPT, 0, false));
@@ -625,6 +627,14 @@ int Engine::issue_block_drafter(int step, StepOut& so) {
     /* A snapshot carrying the drafter's window is saved now, with the step's context rows stored
      * and before the query pass and the step issued ahead (save_checkpoints). */
     if (drafter_snap_) RAD_TRY(save_checkpoints());
+    if (draft_experiment_.query_free()) {
+        /* Preserve block_begin's normal reservations and EVERY owed context pass. No query
+         * batch, ADV_BLOCK/BTAKE, observation/readback or proposal epoch is created. A real
+         * context pass must have run: it already performs the same build_greedy(0) reset as
+         * the omitted query; no sampler state/reset or target RNG work is silently dropped. */
+        RAD_TRY(sched_.query_free_opportunity(step, block_row_.data(), n, &dnq_candidate_));
+        return RAD_OK;
+    }
     if (n <= 0) return RAD_OK;
     const RadBatch* qb = sched_.block_query(step);
     if (!qb) return RAD_OK;
@@ -673,7 +683,7 @@ int Engine::finish_block_drafter(const StepOut& so) {
         }
     }
     sched_.block_end();
-    if (block_rows_ <= 0) return RAD_OK;
+    if (block_rows_ <= 0) return draft_experiment_.query_free() ? dnq_finish(so) : RAD_OK;
 
     Rank& r0 = *ranks_[0];
     const int steps = block_steps_;

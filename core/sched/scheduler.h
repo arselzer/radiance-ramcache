@@ -15,6 +15,7 @@
 #include "batch.h"
 #include "draft.h"
 #include "draft_measure.h"
+#include "draft_query_free.h"
 #include "lookup.h"
 #include "metrics.h"
 #include "ngram.h"
@@ -499,6 +500,9 @@ public:
     bool measure_block_binding(const BlockRow& row, int32_t ctx, int accepted,
                                 const DraftMeasureFrame& previous, bool* previous_matches) const;
     bool measure_published(const DraftMeasureFrame& row, uint64_t* output) const;
+    /* Matched fixed0 NQ control: actual eligible row after all context passes, no query epoch. */
+    int query_free_opportunity(int step, const BlockRow* rows, int n, DraftQueryFreeFrame* out) const;
+    bool query_free_committed(const DraftQueryFreeFrame& row, uint64_t* output) const;
     /* Concurrent prefix policy only: immutable block_begin frame, existing sole-drafter
      * decision and exact0/1 query owner, checked before issue and before observation readback.
      * Cancelled snapshots retain their old identity until block_end; no new slot is adopted. */

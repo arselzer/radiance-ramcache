@@ -674,6 +674,12 @@ private:
     int64_t dprob_rows_ = 0;
     int dprob_candidates_ = 0;
     int dmeasure_ready(const RadBatch* batch);
+    int dnq_ready(const RadBatch* batch, const StepOut& so);
+    int dnq_finish(const StepOut& so);
+    void dnq_report() const;
+    DraftQueryFreeFrame dnq_candidate_{};
+    DraftQueryFreeMeter dnq_{};
+    uint64_t dnq_boundary_ = 0;
     int dpolicy_concurrent_open();
     void dpolicy_pause(int step, const char* reason);
     int dmeasure_check(int row, const int32_t* tokens, int n) const;

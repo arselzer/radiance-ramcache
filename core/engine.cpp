@@ -61,7 +61,8 @@ Engine::Engine(Config cfg)
                                                   std::getenv(kDraftCtxDeferEnv),
                                                   std::getenv(rad_dflash_observe::kEnv),
                                                   std::getenv(rad_dflash_observe::kEarlyEnv),
-                                                  std::getenv(rad_dflash_observe::kPolicyEnv))), env_set_(diag::env_names(environ, "RADIANCE_")) {}
+                                                  std::getenv(rad_dflash_observe::kPolicyEnv),
+                                                  std::getenv(kDraftQueryFreeEnv))), env_set_(diag::env_names(environ, "RADIANCE_")) {}
 
 int32_t* Engine::Readback::reserve(int64_t count) {
     if (count <= n) return p;
@@ -1382,10 +1383,10 @@ int Engine::step_loop() {
         if (st < 0) return fail_loop(st);
         st = mark_step_end(b, so);
         if (st < 0) return fail_loop(st);
-        /* Default-off fixed measurement or prefix policy: the identical query/observer/slot
-         * readback completes before the next verify is planned, including k0 (still queries). */
+        /* Fixed/policy Q paths retain the complete query/observer wait (including k0). The
+         * separate NQ measurement waits on this same event after its retained context work. */
         if (draft_experiment_.early_boundary()) {
-            st = dmeasure_ready(b);
+            st = draft_experiment_.query_free() ? dnq_ready(b, so) : dmeasure_ready(b);
             if (st < 0) return fail_loop(st);
         }
         /* Then the next step's forward pass, before this step is read back. Its rows continue from

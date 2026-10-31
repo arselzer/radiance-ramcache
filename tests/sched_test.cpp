@@ -10461,6 +10461,121 @@ TEST(dspark_matched_early_controls_parse_and_preserve_configured_query_depth) {
     CHECK(!draft_measure_profile(0, 5, 4, 0));
 }
 
+TEST(dspark_query_free_retains_fixed0_dx_context_reservations_and_target_ahead) {
+    struct Run { std::vector<int32_t> output, ctx_pos, ctx_rows; int opportunities = 0; };
+    const auto run = [](bool no_query, Run& out) {
+        const auto x = DraftExperiment::capture("1", nullptr, nullptr, nullptr, nullptr, nullptr,
+                                                "1", nullptr, "0", nullptr, no_query ? "1" : "0");
+        Fixture f; f.build(); f.cfg.max_seqs = 1; f.cfg.draft_short_from = 1;
+        dspark_group(f, 4096, true, false); REQUIRE_EQ(f.start(&x), (int)RAD_OK);
+        auto r = f.request(40, 30); r->sp.temp = 0; r->speculation_fixed = true;
+        const auto id = f.add(std::move(r)); REQUIRE(id);
+        const RadBatch* b = f.sch.step(); REQUIRE(b);
+        std::vector<StepSlot> slots(1);
+        for (int t = 0; t < 5; ++t) {
+            const StepEntry entry = f.sch.plan().e[0]; CHECK_EQ(entry.n_spec, 0);
+            std::vector<int32_t> sampled((size_t)b->n_out + 1, -1);
+            sampled[(size_t)entry.dev_out] = 700 + t;
+            AdvanceArgs accept = f.sch.advance_args(0); accept.mode = ADV_ACCEPT;
+            accept.st = slots.data(); accept.src = sampled.data(); adv_row(accept, 0);
+            Scheduler::BlockRow row[1];
+            REQUIRE_EQ(f.sch.block_begin(2, 2, 129, 128799, row, 1, true), 1);
+            int rows = 0, first = -1;
+            while (const RadBatch* cb = f.sch.block_context(b->step)) {
+                if (first < 0) first = cb->positions[0];
+                rows += (int)cb->n_tok;
+            }
+            out.ctx_rows.push_back(rows); out.ctx_pos.push_back(first);
+            DraftQueryFreeFrame frame;
+            if (no_query) {
+                CHECK_OK(f.sch.query_free_opportunity(b->step, row, 1, &frame));
+                CHECK_EQ(frame.seq, id); CHECK_EQ(frame.context_rows, rows);
+                frame.boundary = t + 1; frame.token = 700 + t; ++out.opportunities;
+            } else {
+                REQUIRE(f.sch.block_query(b->step));
+                AdvanceArgs q = f.sch.advance_args(0); q.mode = ADV_BLOCK; q.st = slots.data(); adv_row(q, 0);
+                int32_t generated[5] = { 800 + t, 900 + t, -7, -7, -7 };
+                AdvanceArgs take = f.sch.advance_args(0); take.mode = ADV_BTAKE; take.round = 2;
+                take.src = generated; take.src_pitch = 5; take.st = slots.data(); adv_row(take, 0);
+                f.sch.expect_draft(id, 2); // fixed0 clips the real query's expected proposal to0
+            }
+            const RadBatch* next = f.sch.step_next(); REQUIRE(next); CHECK_EQ(next->n_spec, 0);
+            AdvanceArgs trunk = f.sch.advance_args(0); trunk.mode = ADV_TRUNK;
+            trunk.st = slots.data(); adv_row(trunk, 0);
+            CHECK_EQ(next->token_ids[0], 700 + t); // stale proposal slots are never target input
+            CHECK_OK(f.commit(700 + t)); f.sch.block_end();
+            if (no_query) {
+                uint64_t n = 0; CHECK(f.sch.query_free_committed(frame, &n)); CHECK_EQ(n, (uint64_t)t + 1);
+                CHECK_EQ(f.sch.draft_prob_stats().proposed, (uint64_t)0);
+            } else { const int32_t ids[2] = { 800 + t, 900 + t }; CHECK_OK(f.sch.set_draft(id, ids, 2)); }
+            f.sch.step_finished(); f.sch.promote_next(); b = next;
+        }
+        out.output = f.sch.find(id)->output;
+    };
+    Run q, nq; run(false, q); run(true, nq);
+    CHECK(q.output == nq.output); CHECK(q.ctx_pos == nq.ctx_pos); CHECK(q.ctx_rows == nq.ctx_rows);
+    CHECK_EQ(nq.opportunities, 5);
+}
+
+TEST(dspark_query_free_refuses_request_before_slot_allocation_and_stale_query_epochs) {
+    const auto x = DraftExperiment::capture(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                                            "1", nullptr, "0", nullptr, "1");
+    Fixture f; f.build(); f.cfg.max_seqs = 1; dspark_group(f, 4096, true, false);
+    CHECK_OK(f.start(&x));
+    auto bad = f.request(4, 30); const uint64_t bad_id = bad->id;
+    CHECK_EQ(f.sch.add(std::move(bad)), (int)RAD_E_UNSUPPORTED); CHECK(!f.sch.find(bad_id));
+    auto r = f.request(4, 30); r->sp.temp = 0; r->speculation_fixed = true;
+    const auto id = f.add(std::move(r)); REQUIRE(id); const RadBatch* b = f.sch.step(); REQUIRE(b);
+    Scheduler::BlockRow row[1]; REQUIRE_EQ(f.sch.block_begin(2, 2, 129, 128799, row, 1, true), 1);
+    DraftQueryFreeFrame frame;
+    CHECK_EQ(f.sch.query_free_opportunity(b->step, row, 1, &frame), (int)RAD_E_STATE); // context not done
+    while (f.sch.block_context(b->step)) {}
+    CHECK_OK(f.sch.query_free_opportunity(b->step, row, 1, &frame)); CHECK_EQ(frame.seq, id);
+    CHECK_EQ(f.sch.query_free_opportunity(b->step + 1, row, 1, &frame), (int)RAD_E_STATE);
+    const uint64_t epoch = f.sch.draft_prob_reserve_epoch(); CHECK(epoch);
+    CHECK_EQ(f.sch.query_free_opportunity(b->step, row, 1, &frame), (int)RAD_E_STATE);
+}
+
+TEST(dspark_query_free_cancelled_owner_cannot_become_a_reused_slot_commit) {
+    const auto x = DraftExperiment::capture(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                                            "1", nullptr, "0", nullptr, "1");
+    Fixture f; f.build(); f.cfg.max_seqs = 1; dspark_group(f, 4096, true, false); CHECK_OK(f.start(&x));
+    auto r = f.request(4, 30); r->sp.temp = 0; r->speculation_fixed = true;
+    const auto id = f.add(std::move(r)); REQUIRE(id); const RadBatch* b = f.sch.step(); REQUIRE(b);
+    Scheduler::BlockRow row[1]; REQUIRE_EQ(f.sch.block_begin(2, 2, 129, 128799, row, 1, true), 1);
+    while (f.sch.block_context(b->step)) {}
+    DraftQueryFreeFrame frame; CHECK_OK(f.sch.query_free_opportunity(b->step, row, 1, &frame));
+    frame.boundary = 1; frame.token = 77;
+    CHECK_OK(f.sch.cancel(id)); uint64_t output = 0; CHECK(!f.sch.query_free_committed(frame, &output));
+    DraftQueryFreeFrame cancelled; CHECK_OK(f.sch.query_free_opportunity(b->step, row, 1, &cancelled));
+    CHECK_EQ(cancelled.seq, (uint64_t)0);
+    CHECK_OK(f.commit(77)); f.sch.block_end(); f.sch.step_finished();
+    auto replacement = f.request(4, 30); replacement->sp.temp = 0; replacement->speculation_fixed = true;
+    const auto other = f.add(std::move(replacement)); REQUIRE(other); CHECK(other != id);
+    CHECK(!f.sch.query_free_committed(frame, &output));
+}
+
+TEST(dspark_query_free_no_opportunity_and_cancel_before_context_do_not_make_boundaries) {
+    const auto x = DraftExperiment::capture(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                                            "1", nullptr, "0", nullptr, "1");
+    for (bool cancel : { false, true }) {
+        Fixture f; f.build(4096, 64, 512, cancel ? 512 : 42); f.cfg.max_seqs = 1;
+        dspark_group(f, 4096, true, false); CHECK_OK(f.start(&x));
+        auto r = f.request(40, 0); r->sp.temp = 0; r->speculation_fixed = true;
+        const auto id = f.add(std::move(r)); REQUIRE(id);
+        const RadBatch* b = f.sch.step(); REQUIRE(b);
+        if (!cancel) { f.commit_plain(77); b = f.sch.step(); }
+        REQUIRE(b);
+        Scheduler::BlockRow row[1];
+        const int n = f.sch.block_begin(2, 2, 129, 128799, row, 1, true);
+        CHECK_EQ(n, cancel ? 1 : 0);
+        if (cancel) CHECK_OK(f.sch.cancel(id));
+        DraftQueryFreeFrame frame;
+        CHECK_OK(f.sch.query_free_opportunity(b->step, row, n, &frame)); CHECK_EQ(frame.seq, (uint64_t)0);
+        f.sch.block_end();
+    }
+}
+
 TEST(dspark_matched_early_meter_excludes_transitions_caps_end_and_cancel) {
     for (int k = 0; k <= 2; ++k) {
         DraftMeasure m;

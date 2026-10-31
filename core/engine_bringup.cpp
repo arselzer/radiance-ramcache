@@ -4432,6 +4432,23 @@ int Engine::start() {
             return RAD_E_UNSUPPORTED;
         }
         bool concurrent_policy = false;
+        if (draft_experiment_.query_free()) {
+            bool native = bool(source_banks_) && !cfg_.lora.enabled() && !cfg_.media_flags_set();
+            for (const auto& r : ranks_)
+                native &= dspark_draft_control_scope(r->program, r->plan, cfg_, bool(source_banks_), draft_vram_n_) &&
+                          !r->program.two_batch && !r->plan.dynamic;
+            const char* tbo = std::getenv("RADIANCE_EXPERIMENTAL_SCHED_TBO");
+            const char* lend = std::getenv("RADIANCE_EXPERIMENTAL_DS41_DSPARK_BANK_LEND");
+            if (!draft_query_free_profile(cfg_.max_seqs, tree_, short_from_, drafter_.block,
+                    drafter_.depth, drafter_short_, draft_experiment_.ctx_defer(), native,
+                    cfg_.deterministic, !tbo || !std::strcmp(tbo, "0")) ||
+                (lend && std::strcmp(lend, "0"))) {
+                RAD_ERR("%s requires native deterministic TP4 fixed bank, max-num-seqs1, "
+                        "Db2/from1/depth5, fixed early0 and explicit Dx1; no TBO/tree/media/LoRA/lender",
+                        kDraftQueryFreeEnv);
+                return RAD_E_UNSUPPORTED;
+            }
+        }
         if (policy && cfg_.max_seqs > 1) {
             bool native = bool(source_banks_) && !cfg_.lora.enabled() && !cfg_.media_flags_set();
             for (const auto& r : ranks_)

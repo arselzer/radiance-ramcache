@@ -996,6 +996,11 @@ void Scheduler::add_all(std::unique_ptr<Request>* rs, size_t n, int* rc) {
 
 int Scheduler::add_locked(std::unique_ptr<Request> r) {
     if (!r) return RAD_E_INVAL;
+    if (draft_experiment_.query_free() && !draft_query_free_request(*r)) {
+        RAD_WARN("request %llu refused: %s requires a plain greedy text request",
+                 (unsigned long long)r->id, kDraftQueryFreeEnv);
+        return RAD_E_UNSUPPORTED;
+    }
     if (r->prompt.empty()) return RAD_E_INVAL;
     if (by_id_.count(r->id)) return RAD_E_DUPLICATE;
     /* An embedding input runs in one step or not at all (Request::embed); one longer than a step

@@ -1,15 +1,15 @@
 {
-  "commit": "4e51254c0af068d91b3155a1899989e4ff3e0ba9",
-  "tree": "dc9476895679bad80d6236a0efd0a948a4c323ac",
+  "commit": "0a6167eba5d53517c2c971db486cb4486aaa151c",
+  "tree": "dbc0a185a563313ae9362b040f52e36cd72b8da7",
   "branch": "claude/ds41-decode-impl",
-  "subject": "Merge claude/ds41-dsconc: the DSpark bank beside concurrent requests (drafts only for a sequence decoding alone)",
-  "committed_utc": "2026-10-31T00:11:17Z",
-  "files": 1460,
-  "bytes": 57331933,
+  "subject": "README: the settings a concurrent server needs beside large-chunk prefill (PREFILL_ALONE, max-num-seqs)",
+  "committed_utc": "2026-10-31T03:39:17Z",
+  "files": 1462,
+  "bytes": 57439191,
   "executable_files": 59,
   "pins": "docs/ds41/provenance/ENGINE_SOURCE_PINS.json",
-  "pins_sha256": "a9de077de080c2a75b1abcd0ee1e35e3d4eeac3bdf995a5179fac987f6bcf7b4",
-  "export": "git archive --format=tar 4e51254c0af068d91b3155a1899989e4ff3e0ba9 (tracked files only, modes kept)",
+  "pins_sha256": "08f3e546dbc30e47ddbd3d195db7522fb198c1341d8c66f2e6ef3b6e4e18b489",
+  "export": "git archive --format=tar 0a6167eba5d53517c2c971db486cb4486aaa151c (tracked files only, modes kept)",
   "upstream": {
     "repository": "https://codeberg.org/StillDeadcode/radiance",
     "note": "Radiance upstream plus the deepseek41 architecture work of its pull request 266; the commits after them are this work (ds41 RAM cache and CPU experts)",
@@ -17,17 +17,17 @@
       "upstream main as fetched (origin/main)": {
         "commit": "6c33ee4e1267fc0a016fc0a4a333b0221326a1be",
         "contained": true,
-        "commits_after": 363
+        "commits_after": 372
       },
       "newest upstream commit contained (review-upstream/main)": {
         "commit": "4374bea1c4bca1c00c59890d10b799a274d5e8b4",
         "contained": true,
-        "commits_after": 330
+        "commits_after": 339
       },
       "pull request 266, deepseek41 (origin/pr-266)": {
         "commit": "bd65d4e58f7c4233de09ad5245a82c9510eb8962",
         "contained": true,
-        "commits_after": 449
+        "commits_after": 458
       }
     }
   }

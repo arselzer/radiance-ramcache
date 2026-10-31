@@ -38,6 +38,7 @@ bool parse_tunables(const std::function<const char*(const char*)>& get, Tunables
         { ds41p1::kVerifyEnv, 0, 4096, &r.verify },
         { ds41p1::kMinRowsEnv, ds41p1::kMinArmRows, ds41p1::kTwinMaxRows, &r.min_rows },
         { ds41p1::kLendEnv, 0, ds41p1::kMaxLend, &r.lend },
+        { ds41p1::kLendArenaEnv, 0, ds41p1::kMaxLend, &r.lend_arena },
         { ds41p1::kGraceEnv, 0, 60000, &r.grace_ms },
     };
     for (const K& k : ks) {
@@ -366,7 +367,7 @@ int CardExpertStager::slot_of(const void* entry) const {
 
 /* ---- the lent ring ------------------------------------------------------------------------------------- */
 int RingLender::init(LendHost* host, int n, int64_t grace_ms) {
-    if (!host || n < 1 || n > ds41p1::kMaxLend || grace_ms < 0) return -1;
+    if (!host || n < 1 || n > 2 * ds41p1::kMaxLend || grace_ms < 0) return -1;
     host_ = host;
     slot_.assign((size_t)n, Slot{});
     grace_ = grace_ms;
@@ -476,8 +477,11 @@ int RingLender::begin_pass(bool p1, int64_t now_ms) {
                 ++st_.cancelled;
                 s.st = St::Idle;
                 break;
-            case St::Reading:
             case St::Copying:
+                host_->fence(k);   /* the pass's writes into the slot wait for the copy */
+                s.cancel = true;
+                break;
+            case St::Reading:
                 s.cancel = true;
                 break;
             default:
@@ -945,22 +949,38 @@ int CardExpertPath::end_pass(RadStream s, RadEvent end) {
 
 /* ---- the lent ring's host ---------------------------------------------------------------------------- */
 int CardExpertPath::lend_init(const std::vector<LendUnit>& units, const std::vector<int>& ring_slots,
-                              int64_t grace_ms, std::string* why) {
+                              const std::vector<char*>& arena_slots, int64_t grace_ms, std::string* why) {
     auto no = [&](const std::string& w) { if (why) *why = w; return RAD_E_INVAL; };
     if (!on_ || lending()) return no("the card path is not on, or lends already");
-    const int n = (int)units.size();
-    if (n < 1 || n > ds41p1::kMaxLend || (int)ring_slots.size() != n)
-        return no("a lent ring of " + std::to_string(n) + " slots");
+    const int n = (int)units.size(), nr = (int)ring_slots.size();
+    if (n < 1 || nr > ds41p1::kMaxLend || (int)arena_slots.size() > ds41p1::kMaxLend ||
+        nr + (int)arena_slots.size() != n)
+        return no("a lent ring of " + std::to_string(nr) + " slots and " + std::to_string(arena_slots.size()) +
+                  " arena slots for " + std::to_string(n) + " units");
     std::vector<uint8_t> used((size_t)st_.n_slots(), 0);
+    std::vector<char*> at((size_t)n, nullptr);
     for (int k = 0; k < n; ++k) {
-        const int r = ring_slots[(size_t)k];
-        if (r < 0 || r >= st_.n_slots() || used[(size_t)r]++) return no("lent ring slot " + std::to_string(r));
+        if (k < nr) {
+            const int r = ring_slots[(size_t)k];
+            if (r < 0 || r >= st_.n_slots() || used[(size_t)r]++) return no("lent ring slot " + std::to_string(r));
+            at[(size_t)k] = ring_ + (int64_t)r * ds41p1::kSlotBytes;
+        } else {
+            /* An arena slot: aligned, and clear of the ring and of every other lent slot. */
+            char* const a = arena_slots[(size_t)(k - nr)];
+            const char* const ring_end = ring_ + (int64_t)st_.n_slots() * ds41p1::kSlotBytes;
+            bool clear = a && ((uintptr_t)a & 4095) == 0 && (a + ds41p1::kSlotBytes <= ring_ || a >= ring_end);
+            for (int j = nr; clear && j < k; ++j)
+                clear = a + ds41p1::kSlotBytes <= at[(size_t)j] || at[(size_t)j] + ds41p1::kSlotBytes <= a;
+            if (!clear) return no("lent arena slot " + std::to_string(k - nr) + " overlaps the ring or another slot");
+            at[(size_t)k] = a;
+        }
         const LendUnit& u = units[(size_t)k];
         for (int i = 0; i < 2; ++i)
             if (u.off[i] < 0 || u.bytes[i] <= 0 || u.off[i] + u.bytes[i] > ds41p1::kSlotBytes)
                 return no("lent unit " + std::to_string(u.unit) + " does not fit a ring slot");
     }
     lu_ = units;
+    lat_ = std::move(at);
     lring_ = ring_slots;
     lev_.assign((size_t)n, -1);
     lsrc_.assign((size_t)n, -2);
@@ -1072,7 +1092,7 @@ int CardExpertPath::landed(bool* ok) {
 
 int CardExpertPath::copy(int k) {
     if (k < 0 || k >= (int)lu_.size()) return RAD_E_INVAL;
-    char* const at = ring_ + (int64_t)lring_[(size_t)k] * ds41p1::kSlotBytes;
+    char* const at = lat_[(size_t)k];
     const LendUnit& u = lu_[(size_t)k];
     RadCopySeg segs[2];
     int n = 0;
@@ -1106,7 +1126,32 @@ void CardExpertPath::drop(int k) {
 
 void CardExpertPath::publish(int k, bool on) {
     if (k < 0 || k >= (int)lu_.size()) return;
-    mover_->set_ring_resident(lu_[(size_t)k].unit, on ? ring_ + (int64_t)lring_[(size_t)k] * ds41p1::kSlotBytes : nullptr);
+    mover_->set_ring_resident(lu_[(size_t)k].unit, on ? lat_[(size_t)k] : nullptr);
+}
+
+/* A ring slot's next writer is the card path's own copy, behind this one on the DMA lane; an arena
+ * slot's is the pass's ops, on the compute stream, which wait for the copy here (or, if the stream
+ * cannot take the wait, the host waits for it before the pass issues anything). */
+void CardExpertPath::fence(int k) {
+    if (k < (int)lring_.size() || k >= (int)lu_.size()) return;
+    const int e = lev_[(size_t)k];
+    if (e < 0 || (size_t)e >= ev_.size()) return;
+    const RadStream cs = mover_->compute_stream();
+    if ((cs && rad_event_wait(cs, ev_[(size_t)e]) >= 0) || rad_event_sync(ev_[(size_t)e]) >= 0) return;
+    RAD_ERR("ds41 p1: rank %d: neither the compute stream nor the host could wait on lent arena slot %d's reload copy",
+            rank_, k);
+}
+
+std::vector<char*> arena_slots(char* lo, int64_t bytes, int max) {
+    std::vector<char*> out;
+    if (!lo || bytes <= 0 || max <= 0) return out;
+    const uintptr_t b = ((uintptr_t)lo + 4095) & ~(uintptr_t)4095;
+    uintptr_t top = ((uintptr_t)lo + (uintptr_t)bytes) & ~(uintptr_t)4095;
+    while ((int)out.size() < max && top >= b + (uintptr_t)ds41p1::kSlotBytes) {
+        top -= (uintptr_t)ds41p1::kSlotBytes;
+        out.push_back((char*)top);
+    }
+    return out;
 }
 
 /* ---- the drive's pipeline ---------------------------------------------------------------------------- */
@@ -1288,10 +1333,10 @@ std::string CardExpertPath::stats_line(int rank) const {
     if (lending()) {
         const RingLender::Stats& l = lend_.stats();
         std::snprintf(buf, sizeof buf,
-                      "; lent ring: %d slots, %d residents now; %" PRIu64 " card-path bursts took them back (%" PRIu64
+                      "; lent ring: %d slots (%d in the activation arena), %d residents now; %" PRIu64 " bursts took them back (%" PRIu64
                       " residents withdrawn), %" PRIu64 " returns, %" PRIu64 " reloaded (RAM cache %" PRIu64 ", drive %" PRIu64
                       " at %.1f ms a unit), %" PRIu64 " failed, %" PRIu64 " overtaken, %" PRIu64 " passes held back by the grace",
-                      lend_.n(), lend_.residents(), l.lends, l.withdrawn, l.returns, l.reloaded, c_.lend_ram, c_.lend_drive,
+                      lend_.n(), lend_arena_slots(), lend_.residents(), l.lends, l.withdrawn, l.returns, l.reloaded, c_.lend_ram, c_.lend_drive,
                       c_.lend_drive ? (double)c_.lend_drive_ns * 1e-6 / (double)c_.lend_drive : 0.0, l.failed, l.cancelled,
                       l.held_back);
         line += buf;

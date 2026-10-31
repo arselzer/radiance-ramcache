@@ -53,10 +53,11 @@ RADIANCE_EXPERIMENTAL_DS41_EARLY_ISSUE=1                    # routed card ops qu
 RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP=1                 # prefill: layers 21-39 only on rows that reach the output
 RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP_CKPT=512          # with the prefix cache: the snapshots within 512 tokens below a cut prompt's target whole (the default when unset; all: every one, N: those within N tokens, 0: none -- see the table)
 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MAX_ROWS=32          # prefill: CPU jobs of up to 32 rows of one expert, many-row kernel
-RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MISSES=1024         # misses computed on the CPU in passes of up to 1024 tokens
-RADIANCE_EXPERIMENTAL_DS41_LCP=1024                         # large-chunk prefill: chunks of 1024 tokens (with --max-num-batched-tokens 1024)
+RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MISSES=2048         # misses computed on the CPU in passes of up to 2048 tokens (>= the chunk with a lent arena)
+RADIANCE_EXPERIMENTAL_DS41_LCP=2048                         # large-chunk prefill: chunks of 2048 tokens (with --max-num-batched-tokens 2048)
 RADIANCE_EXPERIMENTAL_DS41_MOE_BALANCE=1                    # routed gemv: work split by row passes, all-dropped passes skipped (exact)
 RADIANCE_EXPERIMENTAL_DS41_P1=1                             # prefill Phase 1: layer passes of >= 320 rows (..._P1_MIN_ROWS) compute every routed expert on the cards (needs the libr4d whose P1 card check passed)
+RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA=64                 # the activation arena's idle top holds ~42 decode residents a card between long prefills (needs the deepseek41 plugin from this tree and ..._EARLY_ISSUE=1)
 RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP=1                # no pass after a reply's end-of-generation token
 RADIANCE_EXPERIMENTAL_DS41_PREFETCH_URGENT=1               # a partly read read-ahead unit's rest read whole in its layer's own read
 RADIANCE_EXPERIMENTAL_DS41_INSERT_SLICE_KIB=256            # background inserts in 256 KiB pieces, waiting for an idle pool
@@ -66,10 +67,24 @@ RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_FUTEX=1            # pool workers sleep 
 
 radiance ... --tp 4 --placement expert_tiered --weights-disk-tier \
   --expert-ram-cache-total-mib 196608 --host-pool-mib 256 --embedding-placement ram \   # 192 GiB on a 256 GB box (98304 on 128 GB)
-  --max-num-batched-tokens 1024 --expert-profile <decode profile> \
+  --max-num-batched-tokens 2048 --expert-profile <decode profile> \
   --expert-plane-mirror <dir of the checkpoint's model-*.safetensors> \
   --expert-plane-mirror-decode-share 0.13                              # the mirror is optional, see below
 ```
+
+**For concurrent requests** (agent harnesses) add `RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE=1` and `--max-num-seqs N`
+(with `--max-model-len` sized so N sequences' KV fit, e.g. 1024 at N = 4-8): large-chunk prefill refuses steps that
+mix a prompt's chunk with other sequences' decode rows, and the window arms at 4 and 8 streams below ran that way.
+
+**2,048-token chunks with the lent arena** (the block above; ab-20261031T011849Z, T022949Z, T030023Z: prefill hashes
+and every reply identical): time to first token 5.0 / 7.2 / 17.2 s for prompts of 1,890 / 3,086 / 6,817 tokens,
+against 7.5 / 8.6 / 26.7 s at 1,024-token chunks (shorter prompts unchanged); held-out decode 29.45 against 29.91
+tok/s (−1.5%); 4 and 8 streams 37.2 / 41.5 against 38.0 / 41.2 tok/s in total; short replies right after a long
+prompt decode ~6% slower until the lent residents are reloaded (~1-1.5 s). For decode-heaviest use keep
+`..._LCP=1024`, `--max-num-batched-tokens 1024`, `..._MISSES=1024` and no lent arena. Both chunk sizes include the
+compressor tail sized to the step (+0.6% decode at 1,024). The LCP/P1 configurations cannot use packed VRAM
+residents, so under concurrency they stay 2-4% below the decode-only M16 setup with `..._VRAM_PACKED` (38.7 / 42.9
+at 4 / 8 streams) while prefilling 3-10x faster.
 
 **Phase 1 prefill** (`..._P1=1` with the 6-unit file buffers; ab-20261030T231526Z, every reply and prefill hash
 identical to the large-chunk path): time to first token 1.9 / 3.7 / 4.2 / 7.4 / 8.7 s for prompts of 82 / 272 / 933 /
@@ -1031,6 +1046,23 @@ its rows, which does not pay below ~300 rows):
   has seen the copy pass; until then, or after a failed reload, they take the CPU path. Residency changes
   only at a pass's start, before the weight tables are brought up to date, and a copy a card-path pass
   overtakes is never published. Off by default.
+- **The lent arena** (`..._P1_LEND_ARENA=K`, for chunks of 2,048). The activation arena is sized for the
+  chunk and its buffers are live across the whole graph, so it is about the sum of its buffers: 935 MiB a
+  card at 2,048 rows, 468 at 1,024 (`expert_down` 60 KiB a row, `expert_gate_up` 54, `engram_kv` 50, the
+  two hyper-connection streams 40 each, `expert_ff` 27, ...; all but ~22 MiB of persistent buffers scale
+  with the rows). A step of at most 256 rows uses ~13% of it. Under the switch the deepseek41 plugin
+  declares again at smaller steps (`RadArchProbe::shape_probe_ok`, said only beside it; the sizing
+  declare writes scratch and keeps the real declare's op list), the core binds the 256-row arena level
+  (`Engine::probe_arena_levels`, `plan_level`) and hands each rank's file stager the arena's top above
+  that level's buffers and the 1 MiB guard; up to K whole slots there hold the next hottest file-tier
+  units after the lent ring's, exactly as the lent ring's slots do. A step at the full plan (above 256
+  rows: every card-path pass, and the CPU path's passes of 257-319 rows) takes them all back at its
+  begin_pass, before its first op; the compute stream first waits on any reload copy still queued
+  (`LendHost::fence`), and at its end the mover's stream waits on an event behind it, so a later reload
+  lands behind its last reader. The grace runs from the last such step. Residency moves, bytes do not:
+  replies stay byte-identical. At Lc2048 ~42 slots fit a card (the 39 residents Lc2048 costs against
+  Lc1024), at Lc1024 ~18. The plugin must come from a tree with the change (arch/deepseek41). Off by
+  default.
 - **Unchanged.** Decode, every pass of up to 16 tokens and every layer pass below the threshold run the
   CPU path as before.
 
@@ -1043,7 +1075,8 @@ arms only; drive units are not sampled, their pinned slot being reused by then; 
 compared and differing, and samples skipped because the unit was evicted since its copy),
 `..._P1_ALIGN` (`end` or `start`), `..._P1_MIN_ROWS` (the threshold, 320; 17-4096: 17 is the card path
 for every pass above 16 tokens, as before the threshold), `..._P1_LEND` (lent ring slots, 0 off; up to
-64, at most the ring's slots less two), `..._P1_GRACE_MS` (1000; 0-60000).
+64, at most the ring's slots less two), `..._P1_LEND_ARENA` (lent arena slots, 0 off; up to 64, as many
+as fit), `..._P1_GRACE_MS` (1000; 0-60000).
 
 Refused at startup, with the reason: an invalid switch value; P1 without an admitted LCP chunk, or above
 2048; a routed band of 17 rows or more not on the P1 row (a libr4d with LCP's twin is named as such); a
@@ -1053,12 +1086,16 @@ slots); the CPU path not taking the layer passes below the threshold (host exper
 bank serves beside P1 or its lent ring); `..._FETCH_LIST`; the route trace; the DSpark head tail; a routed
 layer whose gate_up, single `swiglu_clamped` and down cannot be named; a routed unit off the card neither on
 the file tier nor pinned in the host pool of a static plan (`--deterministic`) as a block_mxfp4 gate_up and
-down pair; `..._P1_LEND` with no slot or unit to lend; a checkpoint interval below C. Under P1, LCP admits
+down pair; `..._P1_LEND` with no slot or unit to lend; `..._P1_LEND_ARENA` with no arena level (a plugin
+without the change), a dynamic plan, or no slot or unit to lend; with either the CPU path not taking every
+pass that does not arm P1 (`..._MISSES` below C); a checkpoint interval below C. Under P1, LCP admits
 `..._VRAM_PACKED=1` (the P1 row decodes the packed form; gemv_vp serves 16 rows or fewer).
 
 Log lines: rank 0's `ds41 p1: card experts on: every routed expert row of a pure prefill pass's layer of
 N to C rows ...` at startup (the threshold, the CPU path's bound, ring, tunables, pooled units), with a
-lent ring `ds41 p1: lent ring: K of the ring's S slots ...`; the scheduler's
+lent ring `ds41 p1: lent ring: K of the ring's S slots ...`, with a lent arena `activation arena: steps of up
+to 256 tokens take E of A; the L above them and a 1 MiB guard go to prefill Phase 1's lent arena` and
+`ds41 p1: lent arena: N slots (..._P1_LEND_ARENA=K; F fit) ...`; the scheduler's
 `ds41 p1: a lone prompt's chunks are aligned to ...`; rank 0's `ds41 p1 chunk: rows R, layers L, wall S s
 (issue), rank 0 drive units D, G GB/s, MemAvailable M MiB` after each card-path chunk; each rank's
 `ds41 p1 stats, rank R: ...` at shutdown (chunks, layers, units RAM / drive, read-ahead posted / used /
@@ -1070,8 +1107,10 @@ CPU path's bound, and each chunk line the layers left below the threshold.
 
 Window parts (`ab_window.sh`): `P1` (needs `LcN`, `B2`..`B8` and an `M` part of min(N, threshold - 1)
 or more; the arm's `Mr` part serves the CPU path's passes), `QwN`, `QiN`, `QrN`, `QaN`, `QvN`, `Qs`,
-`QmN` (the threshold), `QlK` (the lent ring, K at most 2B - 2), `QhMS` (its grace, the hold; needs `Ql`); a P1 arm
-is measured only if the startup line states its threshold and chunk, a `Ql` arm only with its lent-ring
+`QmN` (the threshold), `QlK` (the lent ring, K at most 2B - 2), `QeK` (the lent arena, 1-64), `QhMS` (their
+grace, the hold; needs `Ql` or `Qe`; with either the `M` part is N or more); a P1 arm
+is measured only if the startup line states its threshold and chunk, a `Qe` arm only with its lent-arena
+line, a `Ql` arm only with its lent-ring
 line; `DEVICE_CHECKS` gains `p1` (`P1_CHECK_M`, 4096, and `P1_ROUTES`),
 and a P1 arm runs only on the libr4d.so its `p1: PASS` was on; `LCP_CHECK_C=2048` for Lc2048 arms. The
 prompt receipts `Up1len` (five documents of ~1K, ~2K, ~5K, ~8K and ~16K tokens, `max_tokens` 16, from
@@ -1090,7 +1129,11 @@ from the threshold, a layer is the card path's exactly at its own rows, every ot
 path's bound, decode, mixed, draft and speculative passes never); the lent ring's state machine on a
 simulated host (lend, return after the grace, back-to-back prompts, failed loads and copies left on the
 CPU path, loads and copies a card-path pass overtakes never published, decode between chunks, 200 random
-runs) and the mover's ring residents (published at their slots, never aliased or borrowed, file-tier
+runs, every copy still queued fenced when a pass takes the slots back), the lent arena (its slots whole,
+aligned and inside the arena's top; a simulated card's two streams in random order, where no reload copy
+ever lands inside a full step's activations and every resident read finds its unit, 300 runs, while the
+same runs without the fence or the end's hand-over find the race) and the mover's ring residents
+(published at their slots, never aliased or borrowed, file-tier
 again once taken back); the tunables; the end-aligned chunks for every length to 20,000; the admission
 against the sorted order.
 `p1_chunk_test` runs `Scheduler::plan_chunk`'s end alignment on the scheduler fakes, with and without a

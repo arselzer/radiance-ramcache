@@ -14,7 +14,9 @@
     "ab-20261030T205440Z": "DSpark and 8 streams at 192 GiB",
     "ab-20261030T213623Z": "DSpark verify depth",
     "ab-20261030T231526Z": "Phase 1 adoption, prefill hashes and two-batch overlap at 256 GB",
-    "ab-20261030T234957Z": "DSpark beside concurrent requests"
+    "ab-20261030T234957Z": "DSpark beside concurrent requests",
+    "ab-20261031T022949Z": "the compressor tail sized to the step, lent arena gate",
+    "ab-20261031T030023Z": "the prefill configurations under concurrency"
   },
   "windows": {
     "ab-20261028T220036Z": {
@@ -3548,6 +3550,70 @@
       "server_log_xz_bytes": 99900,
       "started_utc": "2026-10-30T23:49:57Z",
       "arms_started": 6,
+      "qfn_restored": true,
+      "left_out": []
+    },
+    "ab-20261031T011849Z": {
+      "files": 18,
+      "bytes": 487925,
+      "server_logs": 0,
+      "server_log_bytes": 0,
+      "server_log_xz_bytes": 0,
+      "started_utc": "2026-10-31T01:18:50Z",
+      "arms_started": 6,
+      "qfn_restored": true,
+      "left_out": [
+        {
+          "path": "all-t40-f-M1024-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc1024-P1-Cs-Mb1-Kh-Lm4096-Ulong.server.log",
+          "bytes": 116603,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        },
+        {
+          "path": "all-t40-f-M1024-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc1024-P1-Cs-Mb1-Lm4096.server.log",
+          "bytes": 100132,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        },
+        {
+          "path": "all-t40-f-M1024-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc1024-P1-Qe64-Cs-Mb1-Lm4096.server.log",
+          "bytes": 102765,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Cs-Mb1-Kh-Lm4096-Ulong.server.log",
+          "bytes": 118968,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Cs-Mb1-Lm4096.server.log",
+          "bytes": 103198,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        },
+        {
+          "path": "all-t40-f-M2048-H-p256-m196608-G-R-B6-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Mr32-Lc2048-P1-Qe64-Cs-Mb1-Lm8448-Ulong8k.server.log",
+          "bytes": 100628,
+          "reason": "server log; kept (xz) only for the windows the README's headline numbers come from"
+        }
+      ]
+    },
+    "ab-20261031T022949Z": {
+      "files": 20,
+      "bytes": 538609,
+      "server_logs": 7,
+      "server_log_bytes": 736227,
+      "server_log_xz_bytes": 121796,
+      "started_utc": "2026-10-31T02:29:49Z",
+      "arms_started": 7,
+      "qfn_restored": true,
+      "left_out": []
+    },
+    "ab-20261031T030023Z": {
+      "files": 20,
+      "bytes": 561014,
+      "server_logs": 7,
+      "server_log_bytes": 676676,
+      "server_log_xz_bytes": 116524,
+      "started_utc": "2026-10-31T03:00:24Z",
+      "arms_started": 7,
       "qfn_restored": true,
       "left_out": []
     }

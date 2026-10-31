@@ -969,14 +969,16 @@ TEST(p1_threshold_arms_long_layer_passes_and_leaves_the_rest_to_the_cpu_path) {
  * The host keeps, by slot, the card path generation of the last copy that passed into the slot (a copy queued
  * before a pass that armed the card path runs before the card path's own copies on the DMA lane, which then
  * overwrite the slot): a unit may be published only from a copy queued in the current generation, never while
- * a card-path pass runs, and every source is let go once, after its read and its copy. */
+ * a card-path pass runs, and every source is let go once, after its read and its copy. A pass that takes the
+ * slots back fences every copy still queued (the lent arena's slots are written by the pass's own ops), and
+ * fences nothing else. */
 namespace {
 struct FakeLend final : LendHost {
     struct S {
         int  src = 0;                  /* 0 none, 1 a reload buffer, 2 a RAM-cache lease */
         bool reading = false, copying = false, copy_done = false, published = false;
-        uint64_t copy_gen = 0, content_gen = ~0ull;
-        int  loads = 0, copies = 0;
+        uint64_t copy_gen = 0, content_gen = ~0ull, fenced_gen = ~0ull;
+        int  loads = 0, copies = 0, fences = 0;
     };
     std::mt19937 rng;
     std::vector<S> s;
@@ -1076,6 +1078,12 @@ struct FakeLend final : LendHost {
             x.content_gen = ~0ull;   /* the card path takes the slot */
         }
     }
+    void fence(int k) override {
+        S& x = s[(size_t)k];
+        if (!x.copying) bad("slot " + std::to_string(k) + " fenced with no copy queued");
+        x.fenced_gen = gen;
+        ++x.fences;
+    }
     int published() const {
         int n = 0;
         for (const S& x : s) n += x.published;
@@ -1086,9 +1094,18 @@ struct FakeLend final : LendHost {
 /* A pass of either kind through the lender, the host's checks around it. */
 int lend_pass(RingLender& l, FakeLend& h, bool p1, int64_t now) {
     if (p1) ++h.gen;
+    std::vector<int> queued;
+    for (size_t k = 0; k < h.s.size(); ++k)
+        if (h.s[k].copying) queued.push_back((int)k);
+    std::vector<int> fences0;
+    for (const auto& x : h.s) fences0.push_back(x.fences);
     const int r = l.begin_pass(p1, now);
     if (p1 && h.published()) h.bad("a unit published while a card-path pass runs");
     if (l.residents() != h.published()) h.bad("the lender's residents and the host's published units differ");
+    for (int k : queued)
+        if (p1 && h.s[(size_t)k].fenced_gen != h.gen) h.bad("slot " + std::to_string(k) + "'s queued copy not fenced");
+    for (size_t k = 0; k < h.s.size(); ++k)
+        if (!p1 && h.s[k].fences != fences0[k]) h.bad("slot " + std::to_string(k) + " fenced by a pass that keeps the slots");
     return r;
 }
 }  // namespace
@@ -1166,7 +1183,8 @@ TEST(p1_lend_returns_after_the_grace_and_takes_back_for_the_card_path) {
     RingLender bad;
     CHECK(bad.init(nullptr, 2, 0) < 0);
     CHECK(bad.init(&h0, 0, 0) < 0);
-    CHECK(bad.init(&h0, ds41p1::kMaxLend + 1, 0) < 0);
+    CHECK(bad.init(&h0, 2 * ds41p1::kMaxLend + 1, 0) < 0);
+    CHECK_EQ(bad.init(&h0, 2 * ds41p1::kMaxLend, 0), 0);   /* the ring's and the arena's */
     CHECK(bad.init(&h0, 2, -1) < 0);
 }
 
@@ -1215,6 +1233,8 @@ TEST(p1_lend_loads_and_copies_a_card_path_pass_overtakes_are_never_published) {
     CHECK_EQ(l.residents(), 0);
     CHECK_EQ(h.bufs_used, 1);     /* slot 0's buffer given back at once; slot 1's read still runs */
     CHECK(h.s[2].copying);        /* its source stays until its copy passes */
+    CHECK_EQ(h.s[2].fences, 1);   /* and the pass's writes wait for it */
+    CHECK_EQ(h.s[0].fences + h.s[1].fences, 0);
     l.end_p1(3);
     h.settle_all();
     lend_pass(l, h, false, 10);   /* inside the grace: the overtaken ones only let go */
@@ -1327,6 +1347,265 @@ TEST(p1_lend_stress_random_passes_landings_and_failures) {
         ++runs;
     }
     CHECK_EQ(runs, 200);
+}
+
+/* ---- the lent arena ----------------------------------------------------------------------------------------
+ *
+ * The slots carved from the arena's top (p1::arena_slots): whole slots from the top down, each on a 4 KiB
+ * boundary, inside the region and apart; as many as fit up to the count. */
+TEST(p1_lend_arena_slots_are_whole_aligned_and_inside_the_region_from_the_top) {
+    const int64_t S = ds41p1::kSlotBytes;
+    char* const base = (char*)(uintptr_t)0x7e0000000000ull;
+    struct Case { int64_t lo_off, bytes; int max, want; } cases[] = {
+        { 0, 10 * S, 64, 10 }, { 0, 10 * S, 4, 4 }, { 0, 10 * S - 1, 64, 9 }, { 100, 10 * S, 64, 9 },
+        { 4096, 10 * S, 64, 10 }, { 0, S, 1, 1 }, { 0, S - 4096, 8, 0 }, { 0, 0, 8, 0 }, { 0, 5 * S, 0, 0 },
+        { 0, 760ll << 20, 64, 42 }, { 0, (760ll << 20) + 5000, 64, 42 },
+    };
+    for (const Case& c : cases) {
+        char* const lo = base + c.lo_off;
+        const std::vector<char*> v = arena_slots(lo, c.bytes, c.max);
+        CHECK_EQ((int)v.size(), c.want);
+        for (size_t i = 0; i < v.size(); ++i) {
+            CHECK_EQ(((uintptr_t)v[i] & 4095), (uintptr_t)0);
+            CHECK(v[i] >= lo && v[i] + S <= lo + c.bytes);
+            if (i) CHECK(v[i] + S <= v[i - 1]);   /* from the top down, apart */
+        }
+        if (!v.empty()) CHECK(v[0] + S + 4096 > lo + c.bytes);   /* the first at the top */
+    }
+    CHECK(arena_slots(nullptr, 10 * S, 4).empty());
+}
+
+/* The lent arena on a simulated card: RingLender with a host whose slots are arena memory, the compute stream
+ * and the DMA lane as queues run in random order wherever their waits allow (events with record generations, as
+ * HIP's). A step at the full plan writes its activations over the arena's top and reads them back later in the
+ * stream; a step below it reads every published resident from its slot. FileStager's part is the driver's: a
+ * full step takes the slots back (RingLender fences each copy still queued: the compute stream waits on it), and
+ * at its end the DMA lane waits on an event behind it. Checks: no reload copy lands inside a full step's
+ * activations (between its write and its read), and a resident's read always finds its unit. Without the fence,
+ * or without the end's hand-over, the same runs find the race. */
+namespace {
+struct ArenaHost final : LendHost {
+    enum T { Wait, Rec, CopyBeg, CopyEnd, FullWrite, FullRead, ResRead };
+    struct Cmd { T t = Wait; int ev = -1; uint64_t gen = 0; int k = -1, unit = -1, step = -1; };
+    std::deque<Cmd> q[2];          /* 0 the compute stream, 1 the DMA lane */
+    std::vector<uint64_t> rec, done;
+    std::vector<int> content, ev, src;   /* by slot: the unit its bytes are (-1 garbage), copy event, source */
+    std::vector<uint8_t> reading;
+    std::deque<std::pair<int, bool>> landings;
+    std::mt19937 rng;
+    int  full_owner = -1, bufs = 2, bufs_used = 0, lag = 4, end_ev = -1, fences = 0;
+    bool do_fence = true;
+    int  violations = 0;
+    std::string first;
+
+    ArenaHost(unsigned seed, int n) : rng(seed) {
+        content.assign((size_t)n, -1);
+        src.assign((size_t)n, 0);
+        reading.assign((size_t)n, 0);
+        for (int k = 0; k < n; ++k) ev.push_back(event());
+        end_ev = event();
+    }
+    static int unit(int k) { return 100 + k; }
+    int event() {
+        rec.push_back(0);
+        done.push_back(0);
+        return (int)rec.size() - 1;
+    }
+    void bad(const std::string& w) {
+        if (!violations++) first = w;
+    }
+    void push(int s, Cmd c) { q[s].push_back(c); }
+    void wait(int s, int e) {
+        Cmd c;
+        c.t = Wait;
+        c.ev = e;
+        c.gen = rec[(size_t)e];
+        push(s, c);
+    }
+    void record(int s, int e) {
+        Cmd c;
+        c.t = Rec;
+        c.ev = e;
+        c.gen = ++rec[(size_t)e];
+        push(s, c);
+    }
+    bool runnable(int s) const {
+        if (q[s].empty()) return false;
+        const Cmd& c = q[s].front();
+        return c.t != Wait || done[(size_t)c.ev] >= c.gen;
+    }
+    void exec(int s) {
+        const Cmd c = q[s].front();
+        q[s].pop_front();
+        switch (c.t) {
+        case Wait: break;
+        case Rec: done[(size_t)c.ev] = std::max(done[(size_t)c.ev], c.gen); break;
+        case CopyBeg:
+        case CopyEnd:
+            if (full_owner >= 0)
+                bad("slot " + std::to_string(c.k) + "'s reload copy landed inside full step " + std::to_string(full_owner) +
+                    "'s activations");
+            content[(size_t)c.k] = c.t == CopyEnd ? c.unit : -2;
+            break;
+        case FullWrite:
+            full_owner = c.step;
+            for (int& x : content) x = -1;
+            break;
+        case FullRead:
+            if (full_owner != c.step) bad("full step " + std::to_string(c.step) + "'s activations were overwritten");
+            full_owner = -1;
+            break;
+        case ResRead:
+            if (content[(size_t)c.k] != c.unit)
+                bad("a resident read slot " + std::to_string(c.k) + " holding " + std::to_string(content[(size_t)c.k]));
+            break;
+        }
+    }
+    bool step() {
+        const bool a = runnable(0), b = runnable(1);
+        if (!a && !b) return false;
+        exec(a && b ? (int)(rng() & 1) : a ? 0 : 1);
+        return true;
+    }
+    void progress() {
+        const int n = (int)(rng() % (unsigned)(lag + 1));
+        for (int i = 0; i < n && step(); ++i) {}
+    }
+    void drain() {
+        while (step()) {}
+        if (!q[0].empty() || !q[1].empty()) bad("the streams deadlocked");
+    }
+    /* LendHost: a RAM-cache lease lands at once, a drive read after a few host calls, two buffers. */
+    int load(int k) override {
+        if (src[(size_t)k]) bad("a load of slot " + std::to_string(k) + " that holds a source");
+        if (rng() % 3 == 0) {
+            src[(size_t)k] = 2;
+            landings.push_back({ k, true });
+            return 1;
+        }
+        if (bufs_used >= bufs) return 0;
+        ++bufs_used;
+        src[(size_t)k] = 1;
+        reading[(size_t)k] = 1;
+        return 1;
+    }
+    int landed(bool* ok) override {
+        progress();
+        for (size_t k = 0; k < reading.size(); ++k)
+            if (reading[k] && rng() % 2) {
+                reading[k] = 0;
+                landings.push_back({ (int)k, true });
+            }
+        if (landings.empty()) return -1;
+        const auto d = landings.front();
+        landings.pop_front();
+        *ok = d.second;
+        return d.first;
+    }
+    int copy(int k) override {
+        Cmd c;
+        c.t = CopyBeg;
+        c.k = k;
+        push(1, c);
+        c.t = CopyEnd;
+        c.unit = unit(k);
+        push(1, c);
+        record(1, ev[(size_t)k]);
+        return 0;
+    }
+    int copied(int k) override {
+        progress();
+        return done[(size_t)ev[(size_t)k]] >= rec[(size_t)ev[(size_t)k]] ? 1 : 0;
+    }
+    void drop(int k) override {
+        if (reading[(size_t)k]) bad("slot " + std::to_string(k) + "'s buffer let go while its read runs");
+        if (src[(size_t)k] == 1) --bufs_used;
+        src[(size_t)k] = 0;
+    }
+    void publish(int, bool) override {}
+    void fence(int k) override {
+        ++fences;
+        if (do_fence) wait(0, ev[(size_t)k]);
+    }
+};
+
+/* `steps` passes, about one in `full_in` at the full plan; each step's host calls let the card run a little.
+ * Then a long run of steps below it: every slot resident again. Returns the host's violations. */
+int arena_run(unsigned seed, bool fence, bool hand, int steps, int full_in, std::string* why) {
+    std::mt19937 rng(seed);
+    const int n = 1 + (int)(rng() % 8);
+    ArenaHost h(seed * 31u + 7u, n);
+    h.do_fence = fence;
+    h.bufs = 1 + (int)(rng() % 3);
+    RingLender l;
+    if (l.init(&h, n, (int64_t)(rng() % 3) * 20) < 0) return -1;
+    int64_t t = 0;
+    auto pass = [&](int s, bool full) {
+        l.begin_pass(full, t);
+        if (full) {
+            ArenaHost::Cmd c;
+            c.t = ArenaHost::FullWrite;
+            c.step = s;
+            h.push(0, c);
+            h.progress();
+            c.t = ArenaHost::FullRead;
+            h.push(0, c);
+        } else {
+            for (int k = 0; k < n; ++k)
+                if (l.resident(k)) {
+                    ArenaHost::Cmd c;
+                    c.t = ArenaHost::ResRead;
+                    c.k = k;
+                    c.unit = ArenaHost::unit(k);
+                    h.push(0, c);
+                }
+        }
+        h.progress();
+        if (full) {
+            l.end_p1(t);
+            if (hand) {   /* FileStager::end_pass: the DMA lane behind the step's end */
+                h.record(0, h.end_ev);
+                h.wait(1, h.end_ev);
+            }
+        }
+        t += 1 + (int64_t)(rng() % 30);
+    };
+    for (int s = 0; s < steps; ++s) pass(s, rng() % (unsigned)full_in == 0);
+    for (int s = 0; s < 6 * n + 20; ++s) {
+        pass(steps + s, false);
+        h.drain();
+        t += 100;
+    }
+    h.drain();
+    if (l.residents() != n) h.bad("only " + std::to_string(l.residents()) + " of " + std::to_string(n) + " slots resident at the end");
+    if (why && h.violations) *why = h.first;
+    return h.violations;
+}
+}  // namespace
+
+TEST(p1_lend_arena_full_steps_and_reloads_never_overlap_on_the_two_streams) {
+    int runs = 0;
+    for (unsigned seed = 1; seed <= 300; ++seed) {
+        std::string why;
+        const int v = arena_run(seed, true, true, 120, 3 + (int)(seed % 4), &why);
+        if (v) {
+            CHECK_EQ(v, 0);
+            std::fprintf(stderr, "seed %u: %s\n", seed, why.c_str());
+            return;
+        }
+        ++runs;
+    }
+    CHECK_EQ(runs, 300);
+    /* The controls: without the fence, or without the hand-over at a full step's end, some run lands a reload copy
+     * inside a full step's activations. */
+    int no_fence = 0, no_hand = 0;
+    for (unsigned seed = 1; seed <= 300; ++seed) {
+        no_fence += arena_run(seed, false, true, 120, 3 + (int)(seed % 4), nullptr) > 0;
+        no_hand += arena_run(seed, true, false, 120, 3 + (int)(seed % 4), nullptr) > 0;
+    }
+    CHECK(no_fence > 0);
+    CHECK(no_hand > 0);
+    std::fprintf(stderr, "  runs that race: %d of 300 without the fence, %d of 300 without the hand-over\n", no_fence, no_hand);
 }
 
 /* The mover's side: a lent-ring resident is published at its ring slot (weight i at its offset), never aliased,

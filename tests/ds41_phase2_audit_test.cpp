@@ -146,3 +146,5 @@ TEST(phase2_audit_copy_observer_sees_only_successful_unchanged_source_enqueues){
         CHECK_EQ(d.copies,1);
     }
 }
+
+RAD_TEST_MAIN()

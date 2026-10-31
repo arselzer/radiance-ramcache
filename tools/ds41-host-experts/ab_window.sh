@@ -143,6 +143,10 @@
 # "ds41 p1 stats, rank" and "ds41 p1 chunk:" lines; a P1 arm whose stats lines count a lease held at a pass
 # end, or (Qv) a host-verified expert-row that differs from the card's, is not measured.
 #
+# AgN: independent exact Engram all_gather row slices (AG_ROWS=N; all other arms state 0).
+# Needs the existing Es split plus SELFTEST_AG_ROWS=<this build's r4d_selftest>; before any arm,
+# a fresh all-four-card ds41_ag_rows_exact receipt is bound to the full served libr4d SHA256.
+# Serving and KLD require actual cap/row/output-pitch proof. No Ag arm can be a KLD reference.
 # ArN: exact all_reduce row slices (RADIANCE_EXPERIMENTAL_DS41_AR_ROWS=N; every other arm states 0).
 # SELFTEST_AR_ROWS names this build's r4d_selftest. Before any arm, after QFN stops, every Ar home's
 # libr4d.so gets a fresh four-card --case ds41_ar_rows_exact check; all four cap/ts_min cases must
@@ -293,6 +297,7 @@ xt_check() {   # name
   [[ -n "${ARM_XT:-}" ]] && grep -m1 -E 'exact tall passes: ' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   [[ -n "${ARM_BT:-}" ]] && grep -m1 -E 'chunk geometry: ' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   ar_rows_server_check "$name" || return 1
+  ag_rows_server_check "$name" || return 1
   lcp_check "$name"
 }
 
@@ -309,7 +314,7 @@ ar_rows_server_gate() {   # server log, requested rows (empty/0 off), actual exp
     echo 'no Ar part, but the server enabled exact AR row slices'; return 1
   fi
   [[ $cap =~ ^[1-9][0-9]*$ ]] || { echo 'Ar has no positive expected actual cap'; return 1; }
-  if [[ $lines != 1 ]] || ! grep -Fq "exact AR row slices: at most $cap rows (RADIANCE_EXPERIMENTAL_DS41_AR_ROWS); all_reduce bounds and launches sliced, Engram all_gather unchanged" "$f"; then
+  if [[ $lines != 1 ]] || ! grep -Fq "exact AR row slices: at most $cap rows (RADIANCE_EXPERIMENTAL_DS41_AR_ROWS); all_reduce bounds and launches sliced, Engram all_gather independently controlled" "$f"; then
     echo "Ar$requested needs one startup line proving actual cap $cap, found $lines matching lines"; return 1
   fi
   return 0
@@ -321,6 +326,41 @@ ar_rows_server_check() {   # name; called on both serving and KLD startup paths 
   fi
   if [[ -n ${ARM_AR_ROWS:-} ]]; then
     grep -m1 'exact AR row slices:' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
+  fi
+  return 0
+}
+
+ag_rows_parse() {   # AgN; an independent Engram-gather cap, never an AR flag
+  [[ $1 =~ ^Ag([0-9]{1,9})$ ]] || return 1
+  (( 10#${BASH_REMATCH[1]} > 0 )) || return 1
+  echo "$((10#${BASH_REMATCH[1]}))"
+}
+ag_rows_server_gate() {   # server log, requested rows, actual expected clamped cap
+  local f=$1 requested=${2:-0} cap=${3:-0} lines line re row pitch
+  lines=$(grep -c 'exact Engram gather row slices:' "$f")
+  if [[ $requested == 0 ]]; then
+    [[ $lines == 0 ]] && return 0
+    echo 'no Ag part, but the server enabled exact Engram gather row slices'; return 1
+  fi
+  [[ $cap =~ ^[1-9][0-9]*$ ]] || { echo 'Ag has no positive expected actual cap'; return 1; }
+  line=$(grep 'exact Engram gather row slices:' "$f")
+  re="^radiance: deepseek41: exact Engram gather row slices: at most $cap rows \(RADIANCE_EXPERIMENTAL_DS41_AG_ROWS\); row ([1-9][0-9]{0,8}), output pitch ([1-9][0-9]{0,8}), all_reduce unchanged by AG_ROWS$"
+  if [[ $lines != 1 || ! $line =~ $re ]]; then
+    echo "Ag$requested needs one startup line proving actual cap $cap and row pitches"; return 1
+  fi
+  row=${BASH_REMATCH[1]} pitch=${BASH_REMATCH[2]}
+  if (( row % 8 != 0 || pitch != 4 * row )); then
+    echo 'Ag needs whole-16-byte bf16 rows and the full four-rank output pitch'; return 1
+  fi
+  return 0
+}
+ag_rows_server_check() {
+  local name=$1 why
+  if ! why=$(ag_rows_server_gate "$OUT/$name.server.log" "${ARM_AG_ROWS:-0}" "${ARM_AG_CAP:-0}"); then
+    log "arm $name: $why; not measured"; return 1
+  fi
+  if [[ -n ${ARM_AG_ROWS:-} ]]; then
+    grep -m1 'exact Engram gather row slices:' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   fi
   return 0
 }
@@ -454,8 +494,8 @@ kld_finish() {   # name; the run is SERVER_PID
   if [[ -z "$KLD_REF" ]]; then
     # The reference must be a plain 16-token arm's bits: a feature arm first (the plain one failed
     # or is missing) would let a later feature arm be compared with another one.
-    if [[ -n "${ARM_XT:-}${ARM_LC:-}${ARM_N128:-}${ARM_AR_ROWS:-}" ]]; then
-      log "arm $name: an Xt, Lc, Fn128 or Ar arm cannot be the window's kld reference (no plain Kld arm finished before it); not compared"
+    if [[ -n "${ARM_XT:-}${ARM_LC:-}${ARM_N128:-}${ARM_AR_ROWS:-}${ARM_AG_ROWS:-}" ]]; then
+      log "arm $name: an Xt, Lc, Fn128, Ar or Ag arm cannot be the window's kld reference (no plain Kld arm finished before it); not compared"
       return 1
     fi
     KLD_REF=$OUT/kld-$name
@@ -1089,6 +1129,7 @@ echo $$ > /home/as/ds41-claude-build/work/qfn_stopped_by   # the QFN watchdog le
 log "stopping $NAME"
 "${DOCKER[@]}" stop -t 60 "$NAME" >>"$OUT/window.log" 2>&1
 sleep 5
+AG_ROWS_WINDOW_ACTIVE=1
 AR_ROWS_WINDOW_ACTIVE=1   # the AR checker also verifies QFN's actual exited state
 
 if [[ "${DEVICE_CHECKS:-1}" == ptime && -x "$HERE/build/ds41_mxfp4_device_check" ]]; then
@@ -1517,6 +1558,73 @@ if [[ -x ${SELFTEST_AR_ROWS:-} ]]; then
   done
 fi
 
+
+declare -A AG_ROWS_PASSED=() AG_ROWS_RECEIPT=()
+ag_rows_receipt_ok() {   # fresh log, full library SHA256; four exact cap/layout case lines, no skips/failures
+  local f=$1 sum=$2 cap layout
+  [[ $sum =~ ^[0-9a-f]{64}$ && -f $f ]] || return 1
+  [[ $(grep -Fxc "ag_rows sha256 $sum" "$f") == 1 ]] || return 1
+  [[ $(grep -Fxc "ag_rows finished sha256 $sum" "$f") == 1 ]] || return 1
+  [[ $(grep -xc 'ag_rows exit 0' "$f") == 1 ]] || return 1
+  ! grep -Eq 'FAIL|[[:space:]]skip[[:space:]]|ag_rows exit [1-9]' "$f" || return 1
+  for cap in 1024 64; do for layout in tight pitched; do
+    [[ $(grep -Fxc "  ok    ds41_ag_rows_exact cap $cap, $layout" "$f") == 1 ]] || return 1
+  done; done
+  return 0
+}
+ag_rows_check() {   # library; GPU work only in the stopped-QFN portion of this window
+  local lib=$1 sum after f
+  [[ -f $lib && -x ${SELFTEST_AG_ROWS:-} ]] || return 1
+  sum=$(sha256sum "$lib" | cut -d' ' -f1)
+  [[ $sum =~ ^[0-9a-f]{64}$ ]] || return 1
+  if [[ -n ${AG_ROWS_PASSED[$sum]+present} ]]; then [[ ${AG_ROWS_PASSED[$sum]} == 1 ]]; return; fi
+  if [[ ${AG_ROWS_WINDOW_ACTIVE:-} != 1 ]] ||
+     [[ $("${DOCKER[@]}" inspect "$NAME" --format '{{.State.Status}}' 2>/dev/null) != exited ]]; then
+    log 'Engram gather row check refused: no active stopped-QFN window'; return 1
+  fi
+  f=$OUT/ag-rows-$sum.log
+  log "exact Engram gather row check on all four cards with $lib, sha256 $sum"
+  ( unset HIP_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES R4D_SELFTEST_ONE_CARD
+    echo "ag_rows sha256 $sum"
+    timeout 1800 "$SELFTEST_AG_ROWS" "$lib" --case ds41_ag_rows_exact
+    echo "ag_rows exit $?"
+    echo "ag_rows finished sha256 $(sha256sum "$lib" | cut -d' ' -f1)"
+  ) >"$f" 2>&1
+  after=$(sha256sum "$lib" | cut -d' ' -f1)
+  AG_ROWS_PASSED[$sum]=0
+  AG_ROWS_RECEIPT[$sum]=$f
+  if [[ $after == "$sum" ]] && ag_rows_receipt_ok "$f" "$sum"; then AG_ROWS_PASSED[$sum]=1; fi
+  tail -8 "$f" | tee -a "$OUT/window.log"
+  [[ ${AG_ROWS_PASSED[$sum]} == 1 ]]
+}
+ag_rows_gate() {   # arm, library; never starts a checker after the reference arms have run
+  local a=$1 lib=$2 sum
+  [[ -f $lib ]] || { log "arm $a: Ag has no served libr4d.so; skipped"; return 1; }
+  sum=$(sha256sum "$lib" | cut -d' ' -f1)
+  [[ $sum =~ ^[0-9a-f]{64}$ ]] || { log "arm $a: Ag cannot hash its served library; skipped"; return 1; }
+  if [[ ${AG_ROWS_PASSED[$sum]:-} != 1 ]] ||
+     ! ag_rows_receipt_ok "${AG_ROWS_RECEIPT[$sum]:-}" "$sum"; then
+    log "arm $a: Ag needs a fresh successful SELFTEST_AG_ROWS receipt for served SHA256 $sum; skipped"; return 1
+  fi
+  return 0
+}
+if [[ -x ${SELFTEST_AG_ROWS:-} ]]; then
+  for a in $ARMS; do
+    h=$RHOME ag_parts=0 ag_bad=0
+    IFS=- read -r -a preflight_parts <<< "$a"
+    for p in "${preflight_parts[@]}"; do
+      case $p in
+        Ag*) ag_parts=$((ag_parts + 1)); ag_rows_parse "$p" >/dev/null || ag_bad=1 ;;
+        H) h=${RADIANCE_HOME_DIR2:-$RHOME} ;;
+        H3) h=${RADIANCE_HOME_DIR3:-$RHOME} ;;
+      esac
+    done
+    [[ $ag_parts == 1 && $ag_bad == 0 ]] || continue
+    IFS=: read -r -a homes <<< "$h"
+    for hh in "${homes[@]}"; do [[ -f "$hh/kernels/libr4d.so" ]] && { ag_rows_check "$hh/kernels/libr4d.so"; break; }; done
+  done
+fi
+
 HX=(RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=$HX_THREADS RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU=$SILU)
 CANCEL=${CANCEL_FILE:-/home/as/ds41-claude-build/work/cancel_window}
 for a in $ARMS; do
@@ -1745,7 +1853,7 @@ for a in $ARMS; do
   IFS=- read -r -a parts <<< "$a"
   xt="" bt="" kld="" dk="" db="" pu="" ins_nt="" ins_kib="" ins_wait="" lean="" lc="" ad="" dv="" xd="" hs="" dg="" df="" pmr="" tb=""
   mb="" lf="" dc="" dl="" dx="" dm="" dpc="" dme="" ds="" nseq=""
-  p1="" q1=() qm="" ql="" qg="" qe="" qsp="" ar_rows=""
+  p1="" q1=() qm="" ql="" qg="" qe="" qsp="" ar_rows="" ag_rows=""
   pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 HOST_POOL_MIB=4096 EXTRA_ARGS="" ARM_HOME="$RHOME" ARM_CONC=
   ARM_PROMPTS= ARM_N= ARM_LQ= rt=
   power="" skip="" ARGS=() f8="" f8x="" rb="" rbf=0 pred="" cs="" ck="" kh="" pc="" pcopt="" fw="" wp="" wl=""
@@ -1897,6 +2005,9 @@ for a in $ARMS; do
       Ar*)     if [[ -n "$ar_rows" ]] || ! ar_value=$(ar_rows_parse "$p"); then
                  log "arm $a: $p: use one positive whole ArN row cap; the arm is skipped"; skip=1
                else ar_rows=$ar_value; fi ;;
+      Ag*)     if [[ -n "$ag_rows" ]] || ! ag_value=$(ag_rows_parse "$p"); then
+                 log "arm $a: $p: use one positive whole AgN row cap; the arm is skipped"; skip=1
+               else ag_rows=$ag_value; fi ;;
       BT[0-9]*) bt=${p#BT}; ARGS+=(--max-num-batched-tokens "$bt") ;;  # this arm's step: prefill chunks of N
       Kld)     kld=1 ;;                                                # --kld-record over the corpus instead of serving
       Lc[0-9]*) lc=${p#Lc}                                             # large-chunk prefill: chunks of N (RADIANCE_EXPERIMENTAL_DS41_LCP)
@@ -2375,6 +2486,21 @@ for a in $ARMS; do
       IFS=: read -r -a homes <<< "$ARM_HOME"
       for h in "${homes[@]}"; do [[ -f "$h/kernels/libr4d.so" ]] && { arlib=$h/kernels/libr4d.so; break; }; done
       ar_rows_gate "$a" "$arlib" || skip=1
+    fi
+  fi
+  env+=(RADIANCE_EXPERIMENTAL_DS41_AG_ROWS=${ag_rows:-0})
+  ARM_AG_ROWS=$ag_rows ARM_AG_CAP=0
+  if [[ -n "$ag_rows" ]]; then
+    ARM_AG_CAP=${lc:-${bt:-16}}
+    if [[ $ARM_AG_CAP =~ ^[0-9]{1,9}$ ]] && (( 10#$ARM_AG_CAP > 0 )); then
+      ARM_AG_CAP=$((10#$ARM_AG_CAP))
+      (( ag_rows < ARM_AG_CAP )) && ARM_AG_CAP=$ag_rows
+    else log "arm $a: Ag needs a valid BT/Lc step for its actual cap; skipped"; skip=1; fi
+    if [[ -z "$skip" ]]; then
+      aglib=""
+      IFS=: read -r -a homes <<< "$ARM_HOME"
+      for h in "${homes[@]}"; do [[ -f "$h/kernels/libr4d.so" ]] && { aglib=$h/kernels/libr4d.so; break; }; done
+      ag_rows_gate "$a" "$aglib" || skip=1
     fi
   fi
   ARM_XT=$xt ARM_BT=$bt ARM_KLD=$kld ARM_LC=$lc ARM_P1=$p1 ARM_QM=${qm:-320} ARM_QL=$ql ARM_QE=$qe ARM_QSP=$qsp

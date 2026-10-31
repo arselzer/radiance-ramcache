@@ -23,7 +23,7 @@ for p in Ar Ar0 Ar000 Ar-1 Ar1x Ar9999999999; do
   if ar_rows_parse "$p" >/dev/null; then bad "accepted $p"; else ok "refuse $p"; fi
 done
 
-line() { echo "radiance: deepseek41: exact AR row slices: at most $1 rows (RADIANCE_EXPERIMENTAL_DS41_AR_ROWS); all_reduce bounds and launches sliced, Engram all_gather unchanged"; }
+line() { echo "radiance: deepseek41: exact AR row slices: at most $1 rows (RADIANCE_EXPERIMENTAL_DS41_AR_ROWS); all_reduce bounds and launches sliced, Engram all_gather independently controlled"; }
 line 1024 >"$OUT/on.server.log"
 line 16 >"$OUT/clamped.server.log"
 echo plain >"$OUT/off.server.log"
@@ -49,6 +49,7 @@ n128_server_gate() { return 0; }
 vp_server_gate() { return 0; }
 qsp_gate() { return 0; }
 ARGS=()
+ag_rows_server_check() { return 0; }
 kill() { return 1; }
 wait() { return 0; }
 python3() { echo compared >>"$T/compares"; return 0; }

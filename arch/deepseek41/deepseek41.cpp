@@ -556,7 +556,8 @@ struct Model {
     Cfg c{};
     std::vector<Layer> layers;
     int64_t work = 0, cmax = 0;
-    int64_t ar_rows = 0;   /* default-off exact collective row bound; Engram all_gather stays whole */
+    int64_t ar_rows = 0;   /* default-off exact all_reduce row bound, independent of ag_rows */
+    int64_t ag_rows = 0;   /* independent, default-off Engram gather row bound */
     /* The compressor tail's work rows a step issues (work_rows()): fitted to the step where libr4d
      * gives every op on them a row's bits at any height (norms_pinned()), else `work` whatever the
      * step, as before. */
@@ -1035,6 +1036,34 @@ static void issue_ar_rows(RadCtx* x, rad_op ar, rad_buf buffer, int64_t r0, int6
     }
 }
 
+static constexpr const char* kAgRowsEnv = "RADIANCE_EXPERIMENTAL_DS41_AG_ROWS";
+/* Called after buffers established the existing Engram split. No fixed model or cache size:
+ * only the four-rank, whole-16-byte bf16 rows of that split are admitted. */
+static int ag_rows_config(Model& m, const char* value) {
+    m.ag_rows = 0;
+    if (!value || !*value) return RAD_OK;
+    int64_t rows = 0;
+    for (const char* p = value; *p; ++p) {
+        if (*p < '0' || *p > '9' || rows > (INT64_MAX - (*p - '0')) / 10) return RAD_E_INVAL;
+        rows = rows * 10 + (*p - '0');
+    }
+    if (rows > 0 && m.g.world == 4 && m.esplit > 0 && m.esplit % 8 == 0)
+        m.ag_rows = std::min(rows, m.g.max_tok);
+    return RAD_OK;
+}
+/* Each complete gather still copies bytes into [token][ascending rank][columns]. Rebase both
+ * row views by the same token index, keeping their distinct full row pitches. Each slice takes
+ * its ordinary handshake/parity step and link hold; no in-place or reduction substitution. */
+static void issue_ag_rows(RadCtx* x, rad_op ag, rad_buf input, rad_buf output, int64_t r0,
+                          int64_t rows, int64_t width, int64_t world, int64_t cap) {
+    for (int64_t at = 0; at < rows;) {
+        const int64_t n = cap > 0 ? std::min(cap, rows - at) : rows - at;
+        RAD_ISSUE_N(x, ag, n * width, brow_slice(input, r0 + at, n, width),
+                    brow_slice(output, r0 + at, n, world * width));
+        at += n;
+    }
+}
+
 static int geometry(Model& m, const RadBuildCtx* ctx) {
     auto& g = m.g;
     const auto& c = m.c;
@@ -1485,7 +1514,8 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
         if (m.esplit) {
             L.e_gemm = linear(b, m, T, L.e_kv, m.esplit, H * c.ple_dim, m.embd, m.ekv_part);
             L.e_gather = op(b, "all_gather",
-                            { RAD_INT("world_size", g.world), RAD_RANGE("numel", m.esplit, T * m.esplit),
+                            { RAD_INT("world_size", g.world),
+                              RAD_RANGE("numel", m.esplit, (m.ag_rows > 0 ? m.ag_rows : T) * m.esplit),
                               RAD_STR("dtype", "bf16"), RAD_INT("row", m.esplit) },
                             {}, { m.ekv_part }, { m.ekv });
             if (!L.e_gather) return RAD_E_INVAL;
@@ -2712,7 +2742,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     }
     if (m.ar_rows > 0 && ctx->rank == 0 && !m.probe)
         fprintf(stderr, "radiance: deepseek41: exact AR row slices: at most %lld rows (%s); all_reduce "
-                        "bounds and launches sliced, Engram all_gather unchanged\n", (long long)m.ar_rows, kArRowsEnv);
+                        "bounds and launches sliced, Engram all_gather independently controlled\n", (long long)m.ar_rows, kArRowsEnv);
     m.f8_on = dense_f8_gate(b, meta, m);
     DS_TRY(dsp_config(b, m, meta, ctx));
     m.dsp_f8 = dsp_f8_gate(m);
@@ -2747,6 +2777,15 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.cmax = g.max_ctx / std::max<int64_t>(rmin, 1) + 1;
     index_runs(m, real);
     DS_TRY(buffers(b, m));
+    if (ag_rows_config(m, std::getenv(kAgRowsEnv)) != RAD_OK) {
+        fprintf(stderr, "radiance: deepseek41: %s must be a nonnegative whole row count (0/unset off)\n", kAgRowsEnv);
+        return RAD_E_INVAL;
+    }
+    if (m.ag_rows > 0 && ctx->rank == 0 && !m.probe)
+        fprintf(stderr, "radiance: deepseek41: exact Engram gather row slices: at most %lld rows (%s); "
+                        "row %lld, output pitch %lld, all_reduce unchanged by AG_ROWS\n",
+                        (long long)m.ag_rows, kAgRowsEnv, (long long)m.esplit,
+                        (long long)(g.world * m.esplit));
     /* The drafter's source rows, one hc-mean row a target layer, written by the trunk step. With
      * ..._DSPARK_CTX_DEFER, beside them the persistent history of every sequence's (Dsp::ctx_defer). */
     if (m.dsp.on && !m.zero) {
@@ -3357,7 +3396,9 @@ static void step(RadCtx* x, const RadBatch* batch) {
             if (L.e_gather) {
                 RAD_ISSUE_N(x, L.e_gemm, nv, VR(m.embd, H * c.ple_dim), RAD_W(L.e_kv), VR(m.ekv_part, m.esplit));
                 if (pf_live) pf_issue(x, L.pf_post, m.pfs, true);
-                RAD_ISSUE_N(x, L.e_gather, nv * m.esplit, VR(m.ekv_part, m.esplit), VR(m.ekv, (c.hc + 1) * D));
+                if (m.ag_rows > 0)
+                    issue_ag_rows(x, L.e_gather, m.ekv_part, m.ekv, V.rb, nv, m.esplit, g.world, m.ag_rows);
+                else RAD_ISSUE_N(x, L.e_gather, nv * m.esplit, VR(m.ekv_part, m.esplit), VR(m.ekv, (c.hc + 1) * D));
             } else {
                 RAD_ISSUE_N(x, L.e_gemm, nv, VR(m.embd, H * c.ple_dim), RAD_W(L.e_kv), VR(m.ekv, (c.hc + 1) * D));
                 if (pf_live) pf_issue(x, L.pf_post, m.pfs, true);

@@ -29,7 +29,7 @@
 set(RAD_TESTS_NO_CORE arch_test glm5next_test nemotron35_test mapped_slab_pregrow_test ds41_prefetch_arch_test
                       ds41_prefetch_plan_test ds41_consumer_skip_arch_test consumer_skip_test
                       ds41_dspark_fp8_arch_test ds41_tbo_arch_test ds41_dspark_defer_arch_test
-                      ds41_shape_probe_arch_test ds41_work_rows_arch_test ds41_ar_rows_arch_test)
+                      ds41_shape_probe_arch_test ds41_work_rows_arch_test ds41_ar_rows_arch_test ds41_ag_rows_arch_test)
 
 # fixture_test tests tools/kfixture.cpp and tools/opshapes.cpp (the seeded draw, the reduction and
 # the on-disk recording) directly, kbench_test tools/kbench_core.cpp (rad-kbench's rules), and
@@ -534,6 +534,10 @@ set_tests_properties(ab_window_p1_test PROPERTIES LABELS "unit;fast" TIMEOUT ${R
                      ENVIRONMENT "ROCR_VISIBLE_DEVICES=99")
 add_test(NAME ab_window_ar_test COMMAND bash ${CMAKE_SOURCE_DIR}/tools/ds41-host-experts/ab_window_ar_test.sh)
 set_tests_properties(ab_window_ar_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT}
+                     ENVIRONMENT "ROCR_VISIBLE_DEVICES=99")
+
+add_test(NAME ab_window_ag_test COMMAND bash ${CMAKE_SOURCE_DIR}/tools/ds41-host-experts/ab_window_ag_test.sh)
+set_tests_properties(ab_window_ag_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT}
                      ENVIRONMENT "ROCR_VISIBLE_DEVICES=99")
 
 # ================================================================== libr4d's kernels, on the host

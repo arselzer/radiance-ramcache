@@ -807,7 +807,7 @@ TEST(index_score_runs_are_the_unsplit_rows) {
  * This proves host composition, not the card's scalar pin or long-context serving. */
 TEST(index_score_compact_runs_preserve_causal_candidates_and_topk_composition) {
     constexpr int64_t H = 2, D = 128, C = 71, block = 8, K = 9;
-    const int64_t KW = ref_keep_words(C, block), pitch = C + 5;
+    const int64_t KW = ((C + block - 1) / block + 31) / 32, pitch = C + 5;
     for (int64_t M : { int64_t(49), int64_t(65), int64_t(127), int64_t(129), int64_t(259) })
     for (int64_t ratio : { int64_t(1), int64_t(2) }) {
         const int64_t split = M / 2, nblk = (C + 3) / 4, cbs = 4 * ratio;

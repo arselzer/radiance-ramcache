@@ -405,7 +405,7 @@ TEST(p1_tunables_take_whole_numbers_in_range_and_end_or_start) {
     env[ds41p1::kMinRowsEnv] = "";
     CHECK(parse_tunables(get, &t, &why));
     CHECK_EQ(t.min_rows, 320);
-    for (const char* ok : { "17", "320", "1024", "4096" }) {
+    for (const char* ok : { "17", "128", "320", "512", "1024", "4096" }) {
         env[ds41p1::kMinRowsEnv] = ok;
         CHECK(parse_tunables(get, &t, &why));
         CHECK_EQ(t.min_rows, std::atoi(ok));
@@ -1149,7 +1149,7 @@ TEST(p1_threshold_arms_long_layer_passes_and_leaves_the_rest_to_the_cpu_path) {
     CHECK_EQ(ds41p1::cpu_rows(2048, 1024), (int64_t)1023);
     CHECK_EQ(ds41p1::cpu_rows(4096, 4096), (int64_t)4095);
     for (int64_t r = 0; r <= 5000; ++r)
-        for (int64_t m : { 17, 64, 320, 1024, 4096 }) {
+        for (int64_t m : { 17, 64, 128, 320, 512, 1024, 4096 }) {
             CHECK_EQ(ds41p1::card_layer(r, m), r >= 17 && r >= m);
             if (r >= 17 && r < m) CHECK(r <= ds41p1::cpu_rows(4096, m));
         }
@@ -1180,7 +1180,7 @@ TEST(p1_threshold_arms_long_layer_passes_and_leaves_the_rest_to_the_cpu_path) {
     std::vector<int64_t> f((size_t)c16.n_layer);
     std::vector<int32_t> row0((size_t)c16.n_layer);
     for (int64_t C : { 1024, 2048, 4096 })
-        for (int64_t thr : { 17, 64, 320, 1024, 2048, 4096 }) {
+        for (int64_t thr : { 17, 64, 128, 320, 512, 1024, 2048, 4096 }) {
             int64_t card = 0, cpu = 0, armed_passes = 0, cpu_in_armed = 0, passes = 0;
             int64_t short_prompt_armed = 0;
             for (int64_t P = 1; P <= 6000; P += (P < 400 ? 1 : 13)) {

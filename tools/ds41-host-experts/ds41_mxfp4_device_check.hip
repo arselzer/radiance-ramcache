@@ -61,6 +61,12 @@
  *                                                      SwiGLU waves equal to one launch; pitched slices
  *                                                      preserve guards and NaN payloads; then "p1 time:" lines. Last line
  *                                                      "p1: PASS ..." or "p1: FAIL ...".
+ *   ds41_mxfp4_device_check LIBR4D.so p1-threshold 2048 ROUTES
+ *                                                      OPTIONAL boundary-only numerical proof for
+ *                                                      existing P1_MIN_ROWS=128/320/512 admission.
+ *                                                      GPU comparisons are literal uint16 including
+ *                                                      NaN payloads; host NaN payloads diagnostic.
+ *                                                      Boundary heights, waves1-4, no timing loops.
  *   ds41_mxfp4_device_check LIBR4D.so sweep [trials]   the height sweep under EXACT_TALL, or under
  *                                                      RADIANCE_EXPERIMENTAL_DS41_LCP when that is in
  *                                                      the environment (its heights); sweep0 without
@@ -2326,7 +2332,20 @@ struct P1Ctx {
     const void* noread = nullptr;
     size_t bad = 0, rows = 0, host_rows = 0, nan_pairs = 0;
     int cases = 0;
+    bool threshold_proof = false;
+    size_t device_nan_payload_differences = 0;
+    size_t live_wave4 = 0;
 };
+
+size_t p1_device_diff(P1Ctx& c,const uint16_t* a,const uint16_t* b,size_t n) {
+    if(!c.threshold_proof)return p1_diff(a,b,n,&c.nan_pairs);
+    size_t different=0;
+    for(size_t i=0;i<n;++i)if(a[i]!=b[i]){
+        ++different;
+        c.device_nan_payload_differences+=p1_nan(a[i])&&p1_nan(b[i]);
+    }
+    return different;
+}
 
 /* One moe_gemm_ggml launch over device buffers. */
 int p1_launch(P1Ctx& c, Launch f, const int* split, void* x, int AR, int K, void* tab, int N, void* so, void* of,
@@ -2441,7 +2460,7 @@ void p1_rows(P1Ctx& c, const P1Routing& r, int M, std::mt19937_64& rng, bool spl
                     for (int q = 0; q < N; ++q) untouched += got[q] != 0xAAAAu;
                     continue;
                 }
-                const size_t d = p1_diff(got, &yc[(size_t)i * N], (size_t)N, &c.nan_pairs);
+                const size_t d = p1_device_diff(c,got,&yc[(size_t)i*N],size_t(N));
                 if (d && differ < 4)
                     std::printf("  %s %s: token %d slot %d (expert %d, %s) differs in %zu of %d values from its "
                                 "16-token pass\n", label, g ? "gate_up" : "down", f / kTop, f % kTop, e,
@@ -2480,7 +2499,7 @@ void p1_rows(P1Ctx& c, const P1Routing& r, int M, std::mt19937_64& rng, bool spl
                 HC(hipStreamSynchronize(c.s));
                 std::vector<uint16_t> y2((size_t)T * N);
                 d_y.get(y2.data());
-                sdiff += p1_diff(y.data(), y2.data(), y.size(), &c.nan_pairs);
+                sdiff += p1_device_diff(c,y.data(),y2.data(),y.size());
                 ++nsplit;
             }
         }
@@ -2595,7 +2614,8 @@ void p1_waves(P1Ctx& c, const P1Routing& r, int M, std::mt19937_64& rng, bool sm
         for (Dev* d : { &G2, &S2, &D2 }) HC(hipMemset(d->p, 0xAA, d->n));
         int rc = ref_rc | chain(main_forms, G2, S2, D2, 0, T);
         int waves = 0;
-        for (size_t w0 = 0, sz = 1; w0 < sub.size(); w0 += sz, sz = sz % 3 + 1, ++waves) {
+        const size_t max_wave=c.threshold_proof?4:3;
+        for (size_t w0 = 0, sz = 1; w0 < sub.size(); w0 += sz, sz = sz % max_wave + 1, ++waves) {
             std::vector<int> wf(kNe, 2);
             int lo = T, hi = 0;
             for (size_t j = w0; j < std::min(sub.size(), w0 + sz); ++j) {
@@ -2607,6 +2627,7 @@ void p1_waves(P1Ctx& c, const P1Routing& r, int M, std::mt19937_64& rng, bool sm
                 }
             }
             if (hi <= lo) lo = hi = 0;
+            if(c.threshold_proof&&hi>lo&&std::min(sub.size(),w0+sz)-w0==4)++c.live_wave4;
             rc |= chain(wf, G2, S2, D2, spans ? lo : 0, spans ? hi : T);
         }
         size_t d[3] = { 0, 0, 0 };
@@ -2618,9 +2639,9 @@ void p1_waves(P1Ctx& c, const P1Routing& r, int M, std::mt19937_64& rng, bool sm
             b[i]->get(hb.data());
             d[i] = count_diff(ha.data(), hb.data(), ha.size());
         }
-        std::printf("p1 waves M=%d %s rank %d, SwiGLU %s: %d local slots, %zu experts in %d waves of 1-3: "
+        std::printf("p1 waves M=%d %s rank %d, SwiGLU %s: %d local slots, %zu experts in %d waves of 1-%zu: "
                     "%zu gate_up, %zu swiglu, %zu down values differ from one launch%s\n", M, r.name.c_str(), r.rank,
-                    spans ? "spans" : "full", p.local, sub.size(), waves,
+                    spans ? "spans" : "full", p.local, sub.size(), waves,max_wave,
                     d[0], d[1], d[2], rc ? " (a launch was refused)" : "");
         std::fflush(stdout);
         c.bad += d[0] + d[1] + d[2] + (rc ? 1 : 0);
@@ -2693,9 +2714,10 @@ double p1_pass_time(P1Ctx& c, const P1Pass& p, int M, int kind, int form, const 
     return tg_us + td_us;
 }
 
-int p1_check(const Lib& L, int mmax, const char* routes_path) {
+int p1_check(const Lib& L, int mmax, const char* routes_path,bool threshold_proof=false) {
     P1Ctx c;
     c.L = &L;
+    c.threshold_proof=threshold_proof;
     int rc = 0;
     /* The row table: the P1 twin in place of the LCP twin, reaching MMAX, one priority below the gemv. */
     {
@@ -2736,16 +2758,22 @@ int p1_check(const Lib& L, int mmax, const char* routes_path) {
     if (routes_path) {
         FILE* f = std::fopen(routes_path, "rb");
         int32_t h[3];
-        if (f && std::fread(h, 4, 3, f) == 3 && h[2] == kTop && h[0] > 0 && h[1] > 0) {
+        if (f && std::fread(h, 4, 3, f) == 3 && h[2] == kTop && h[0] > 0 && h[1] > 0 &&
+            (!threshold_proof||(h[0]<=43&&h[1]<=65536&&uint64_t(h[0])*uint64_t(h[1])*kTop*2<=64*1024*1024))) {
             g_p1_layers = h[0];
             g_p1_rows = h[1];
             g_p1_routes.resize((size_t)h[0] * h[1] * kTop);
             if (std::fread(g_p1_routes.data(), 2, g_p1_routes.size(), f) != g_p1_routes.size()) g_p1_routes.clear();
+            if(threshold_proof&&std::fgetc(f)!=EOF)g_p1_routes.clear();
         }
         if (f) std::fclose(f);
         if (g_p1_routes.empty()) std::printf("note: cannot read the routes %s; synthetic routings only\n", routes_path);
     }
     const bool real = !g_p1_routes.empty();
+    if(threshold_proof&&!real){
+        std::printf("p1-threshold: FAIL: an explicitly bound real route file is required\n");
+        HC(hipStreamDestroy(c.s));return 1;
+    }
     const auto t0 = std::chrono::steady_clock::now();
     std::mt19937_64 rng(1717);
     p1_bank(&c.gu, 2 * kFf, kEmbd, rng);
@@ -2755,6 +2783,7 @@ int p1_check(const Lib& L, int mmax, const char* routes_path) {
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     std::fflush(stdout);
     std::vector<int> Ms = { 17, 33, 48, 64, 100, 256, 1024, 2048 };
+    if(threshold_proof)Ms={17,33,48,64,100,127,128,129,256,319,320,321,511,512,513,1024,2048};
     if (mmax > 2048) Ms.push_back(mmax);
     for (int M : Ms) {
         if (M > mmax) continue;
@@ -2763,7 +2792,7 @@ int p1_check(const Lib& L, int mmax, const char* routes_path) {
             p1_rows(c, p1_routing("real", M, 2, 25, rng), M, rng, false);
         }
         p1_rows(c, p1_routing("skewed", M, 1, 0, rng), M, rng, !real && (M == 256 || M == 1024));
-        if (M <= 256) {
+        if (M <= 256 || threshold_proof) {
             p1_rows(c, p1_routing("uniform", M, 3, 0, rng), M, rng, false);
             p1_rows(c, p1_routing("hot", M, 0, 0, rng), M, rng, M == 64);
         }
@@ -2772,6 +2801,9 @@ int p1_check(const Lib& L, int mmax, const char* routes_path) {
         if (M > mmax) continue;
         p1_waves(c, real ? p1_routing("real", M, 0, 12, rng) : p1_routing("skewed", M, 0, 0, rng), M, rng);
         if (M == 256) p1_waves(c, p1_routing("hot", M, 3, 0, rng), M, rng);
+    }
+    if(threshold_proof)for(int M:{127,128,129,319,320,321,511,512,513}){
+        p1_waves(c,p1_routing("real",M,0,12,rng),M,rng);
     }
     /* An explicit one-resident case: expert 0's ready rows lie before two distant streamed runs,
      * the last local expert included. The second routing has only other ranks' slots, so every
@@ -2786,10 +2818,20 @@ int p1_check(const Lib& L, int mmax, const char* routes_path) {
             for (int k = 0; k < kTop; ++k) edge.p[(size_t)t * kTop + k] = no_local ? 96 + k : ids[k];
         p1_waves(c, edge, 17, rng, true);
     }
-    std::printf("p1: %d cases, %zu (token, slot) rows against 16-token passes, %zu against the host kernels, %zu NaN "
+    if(!threshold_proof)std::printf("p1: %d cases, %zu (token, slot) rows against 16-token passes, %zu against the host kernels, %zu NaN "
                 "pairs (any NaN equal), %zu bad values, %.0f s\n", c.cases, c.rows, c.host_rows, c.nan_pairs, c.bad,
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    else std::printf("p1-threshold: GPU rows=%zu uint16_exact=1 host_rows=%zu host_nan_payload_diagnostic=%zu bad=%zu\n",
+                     c.rows,c.host_rows,c.nan_pairs,c.bad);
     std::fflush(stdout);
+    if(threshold_proof){
+        (void)hipStreamDestroy(c.s);rc|=(c.bad||!c.live_wave4)?1:0;
+        std::printf("p1-threshold: coverage C=2048 heights=17,33,48,64,100,127,128,129,256,319,320,321,511,512,513,1024,2048 "
+                    "wave_max=4 gpu_compare=uint16_exact host_nan_payload=diagnostic device_nan_payload_differences=%zu live_wave4=%zu cases=%d rows=%zu bad=%zu\n",
+                    c.device_nan_payload_differences,c.live_wave4,c.cases,c.rows,c.bad);
+        std::printf(rc?"p1-threshold: FAIL\n":"PASS: P1_THRESHOLD_BYTE C=2048 min_rows=128,320,512 boundary_heights=9 gpu_uint16=exact skipped=untouched tail=zeros waves=1-4 pitched=guards real_routes=1\n");
+        return rc;
+    }
     /* Timing. */
     std::printf("p1 time: gate_up + down a pass (hipEvent, median), us a local expert-row and a token row-layer\n");
     const char* fname[3] = { "block", "packed", "mix 1/6 skip" };
@@ -2859,8 +2901,9 @@ int main(int argc, char** argv) {
     /* `lcp [C]`: RADIANCE_EXPERIMENTAL_DS41_LCP=C and EXACT_TALL unset, as an Lc arm's server has them;
      * `sweep` keeps an LCP already in the environment (its heights) instead of setting EXACT_TALL. */
     /* Every mode but `p1` runs without prefill Phase 1's switch (its twin replaces the LCP twin `lcp` checks). */
-    if (std::strcmp(argv[2], ds41p1::kCheckMode)) unsetenv(ds41p1::kEnv);
-    if (!std::strcmp(argv[2], ds41p1::kCheckMode)) {
+    const bool threshold_proof=!std::strcmp(argv[2],"p1-threshold");
+    if (std::strcmp(argv[2], ds41p1::kCheckMode)&&!threshold_proof) unsetenv(ds41p1::kEnv);
+    if (!std::strcmp(argv[2], ds41p1::kCheckMode)||threshold_proof) {
         /* `p1 [MMAX] [ROUTES]`: LCP=2048 and the switch, as a P1 arm's server has them. */
         setenv("RADIANCE_EXPERIMENTAL_DS41_LCP", "2048", 1);
         setenv(ds41p1::kEnv, "1", 1);
@@ -2928,13 +2971,16 @@ int main(int argc, char** argv) {
         return rc;
     }
     if (!std::strcmp(argv[2], "bal")) return bal_check(lib, argc > 4 ? argv[4] : nullptr);
-    if (!std::strcmp(argv[2], ds41p1::kCheckMode)) {
+    if (!std::strcmp(argv[2], ds41p1::kCheckMode)||threshold_proof) {
         const int mmax = argc > 3 ? std::atoi(argv[3]) : ds41p1::kTwinMaxRows;
         if (mmax < 17 || mmax > ds41p1::kTwinMaxRows) {
             std::fprintf(stderr, "p1 MMAX: 17 .. %d\n", ds41p1::kTwinMaxRows);
             return 2;
         }
-        return p1_check(lib, mmax, argc > 4 ? argv[4] : nullptr);
+        if(threshold_proof&&(mmax!=2048||argc!=5)){
+            std::fprintf(stderr,"p1-threshold requires exact arguments: 2048 ROUTES\n");return 2;
+        }
+        return p1_check(lib, mmax, argc > 4 ? argv[4] : nullptr,threshold_proof);
     }
     if (!std::strcmp(argv[2], "tall")) {
         std::vector<int> Ts;

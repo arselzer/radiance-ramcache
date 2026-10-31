@@ -27688,6 +27688,7 @@ static void ds41_ar_rows_exact(const Plugin& pl, const std::vector<int>& devs) {
 }
 
 #include "r4d_ds41_ag_rows_check.h"
+#include "r4d_ds41_ar_ag_shared_check.h"
 
 static void ar_wide_pattern(const Plugin& pl, const std::vector<int>& devs, const char* name,
                             int world) {
@@ -33048,6 +33049,7 @@ static void device_phase(const Plugin& pl) {
 
     if (sel("ds41_ar_rows_exact")) ds41_ar_rows_exact(pl, devs);
     if (sel("ds41_ag_rows_exact")) ds41_ag_rows_exact(pl, devs);
+    if (sel("ds41_ar_ag_shared_exact")) ds41_ar_ag_shared_exact(pl, devs);
 
     /* Every collective has a host twin (r4d_rows.cpp): the same kernel with its mailbox in pinned
      * host memory. A case is the pair's, so the twin is held to exactly the original's checks. */

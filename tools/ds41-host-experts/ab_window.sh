@@ -144,6 +144,9 @@
 # "ds41 p1 stats, rank" and "ds41 p1 chunk:" lines; a P1 arm whose stats lines count a lease held at a pass
 # end, or (Qv) a host-verified expert-row that differs from the card's, is not measured.
 #
+# Coordinated actual Ar1280+Ag1024 caps additionally need SELFTEST_AR_AG_SHARED=<r4d_selftest>:
+# fresh all-four-card ds41_ar_ag_shared_exact pointer/lifetime/mixed replay receipt. It supplements
+# both independent receipts and never enables caps or changes any other arm's requirements.
 # AgN: independent exact Engram all_gather row slices (AG_ROWS=N; all other arms state 0).
 # Needs the existing Es split plus SELFTEST_AG_ROWS=<this build's r4d_selftest>; before any arm,
 # a fresh all-four-card ds41_ag_rows_exact receipt is bound to the full served libr4d SHA256.
@@ -1151,6 +1154,7 @@ echo $$ > /home/as/ds41-claude-build/work/qfn_stopped_by   # the QFN watchdog le
 log "stopping $NAME"
 "${DOCKER[@]}" stop -t 60 "$NAME" >>"$OUT/window.log" 2>&1
 sleep 5
+AR_AG_SHARED_WINDOW_ACTIVE=1
 AG_ROWS_WINDOW_ACTIVE=1
 AR_ROWS_WINDOW_ACTIVE=1   # the AR checker also verifies QFN's actual exited state
 
@@ -1646,6 +1650,92 @@ if [[ -x ${SELFTEST_AG_ROWS:-} ]]; then
     [[ $ag_parts == 1 && $ag_bad == 0 ]] || continue
     IFS=: read -r -a homes <<< "$h"
     for hh in "${homes[@]}"; do [[ -f "$hh/kernels/libr4d.so" ]] && { ag_rows_check "$hh/kernels/libr4d.so"; break; }; done
+  done
+fi
+
+
+# The optional mixed oracle supplements both independent gates only for the coordinated actual
+# caps Ar1280+Ag1024 covered by its real D5120/esplit6400 geometry. It selects no configuration.
+ar_ag_shared_arm() {   # arm spelling; match the same BT/Lc cap clamp as the main arm loop
+  local a=$1 p ar= ag= bt=16 lc= step
+  local -a fields
+  IFS=- read -r -a fields <<< "$a"
+  for p in "${fields[@]:1}"; do
+    case $p in
+      Ar*) [[ -z $ar ]] && ar=$(ar_rows_parse "$p") || return 1 ;;
+      Ag*) [[ -z $ag ]] && ag=$(ag_rows_parse "$p") || return 1 ;;
+      BT*) bt=${p#BT} ;;
+      Lc*) lc=${p#Lc} ;;
+    esac
+  done
+  step=${lc:-$bt}
+  [[ $step =~ ^[0-9]{1,9}$ ]] && (( 10#$step > 0 )) || return 1
+  step=$((10#$step))
+  [[ -n $ar && -n $ag ]] || return 1
+  (( ar > step )) && ar=$step
+  (( ag > step )) && ag=$step
+  [[ $ar == 1280 && $ag == 1024 ]]
+}
+declare -A AR_AG_SHARED_PASSED=() AR_AG_SHARED_RECEIPT=()
+ar_ag_shared_receipt_ok() {   # fresh log, full library SHA256; four exact init-order/seed case lines, no skips/failures
+  local f=$1 sum=$2 order seed
+  [[ $sum =~ ^[0-9a-f]{64}$ && -f $f ]] || return 1
+  [[ $(grep -Fxc "ar_ag_shared sha256 $sum" "$f") == 1 ]] || return 1
+  [[ $(grep -Fxc "ar_ag_shared finished sha256 $sum" "$f") == 1 ]] || return 1
+  [[ $(grep -xc 'ar_ag_shared exit 0' "$f") == 1 ]] || return 1
+  ! grep -Eq 'FAIL|[[:space:]]skip[[:space:]]|ar_ag_shared exit [1-9]' "$f" || return 1
+  for order in ar-first ag-first; do for seed in 0 1; do
+    [[ $(grep -Fxc "  ok    ds41_ar_ag_shared_exact order $order, seed $seed" "$f") == 1 ]] || return 1
+  done; done
+  return 0
+}
+ar_ag_shared_check() {   # library; GPU work only in the stopped-QFN portion of this window
+  local lib=$1 sum after f
+  [[ -f $lib && -x ${SELFTEST_AR_AG_SHARED:-} ]] || return 1
+  sum=$(sha256sum "$lib" | cut -d' ' -f1)
+  [[ $sum =~ ^[0-9a-f]{64}$ ]] || return 1
+  if [[ -n ${AR_AG_SHARED_PASSED[$sum]+present} ]]; then [[ ${AR_AG_SHARED_PASSED[$sum]} == 1 ]]; return; fi
+  if [[ ${AR_AG_SHARED_WINDOW_ACTIVE:-} != 1 ]] ||
+     [[ $("${DOCKER[@]}" inspect "$NAME" --format '{{.State.Status}}' 2>/dev/null) != exited ]]; then
+    log 'mixed shared AR/AG check refused: no active stopped-QFN window'; return 1
+  fi
+  f=$OUT/ar-ag-shared-$sum.log
+  log "mixed shared AR/AG check on all four cards with $lib, sha256 $sum"
+  ( unset HIP_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES R4D_SELFTEST_ONE_CARD
+    echo "ar_ag_shared sha256 $sum"
+    timeout 1800 "$SELFTEST_AR_AG_SHARED" "$lib" --case ds41_ar_ag_shared_exact
+    echo "ar_ag_shared exit $?"
+    echo "ar_ag_shared finished sha256 $(sha256sum "$lib" | cut -d' ' -f1)"
+  ) >"$f" 2>&1
+  after=$(sha256sum "$lib" | cut -d' ' -f1)
+  AR_AG_SHARED_PASSED[$sum]=0
+  AR_AG_SHARED_RECEIPT[$sum]=$f
+  if [[ $after == "$sum" ]] && ar_ag_shared_receipt_ok "$f" "$sum"; then AR_AG_SHARED_PASSED[$sum]=1; fi
+  tail -8 "$f" | tee -a "$OUT/window.log"
+  [[ ${AR_AG_SHARED_PASSED[$sum]} == 1 ]]
+}
+ar_ag_shared_gate() {   # arm, library; never starts a checker after the reference arms have run
+  local a=$1 lib=$2 sum
+  [[ -f $lib ]] || { log "arm $a: shared AR/AG has no served libr4d.so; skipped"; return 1; }
+  sum=$(sha256sum "$lib" | cut -d' ' -f1)
+  [[ $sum =~ ^[0-9a-f]{64}$ ]] || { log "arm $a: shared AR/AG cannot hash its served library; skipped"; return 1; }
+  if [[ ${AR_AG_SHARED_PASSED[$sum]:-} != 1 ]] ||
+     ! ar_ag_shared_receipt_ok "${AR_AG_SHARED_RECEIPT[$sum]:-}" "$sum"; then
+    log "arm $a: shared AR/AG needs a fresh successful SELFTEST_AR_AG_SHARED receipt for served SHA256 $sum; skipped"; return 1
+  fi
+  return 0
+}
+
+if [[ -x ${SELFTEST_AR_AG_SHARED:-} ]]; then
+  for a in $ARMS; do
+    ar_ag_shared_arm "$a" || continue
+    h=$RHOME
+    IFS=- read -r -a preflight_parts <<< "$a"
+    for p in "${preflight_parts[@]}"; do
+      case $p in H) h=${RADIANCE_HOME_DIR2:-$RHOME} ;; H3) h=${RADIANCE_HOME_DIR3:-$RHOME} ;; esac
+    done
+    IFS=: read -r -a homes <<< "$h"
+    for hh in "${homes[@]}"; do [[ -f "$hh/kernels/libr4d.so" ]] && { ar_ag_shared_check "$hh/kernels/libr4d.so"; break; }; done
   done
 fi
 
@@ -2528,6 +2618,10 @@ for a in $ARMS; do
       for h in "${homes[@]}"; do [[ -f "$h/kernels/libr4d.so" ]] && { aglib=$h/kernels/libr4d.so; break; }; done
       ag_rows_gate "$a" "$aglib" || skip=1
     fi
+  fi
+  # A coordinated arm must pass BOTH independent receipts above plus this mixed-family oracle.
+  if [[ -z "$skip" && $ARM_AR_CAP == 1280 && $ARM_AG_CAP == 1024 ]]; then
+    ar_ag_shared_gate "$a" "$aglib" || skip=1
   fi
   ARM_XT=$xt ARM_BT=$bt ARM_KLD=$kld ARM_LC=$lc ARM_P1=$p1 ARM_QM=${qm:-320} ARM_QL=$ql ARM_QE=$qe ARM_QSP=$qsp
   [[ -n "$skip" ]] && continue

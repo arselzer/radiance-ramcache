@@ -359,6 +359,12 @@ kld_finish() {   # name; the run is SERVER_PID
   grep -E 'kld:|error|ERR' "$OUT/$name.server.log" | tail -6 | tee -a "$OUT/window.log"
   (( rc == 0 )) || return 1
   xt_check "$name" || return 1
+  lcp_check "$name" || return 1
+  local extra_why
+  if ! extra_why=$(vp_server_gate "$OUT/$name.server.log" "${ARM_VP:-}" "$([[ " ${ARGS[*]} " == *" --draft-bank "* ]] && echo 1)") ||
+     ! extra_why=$(qsp_gate "$OUT/$name.server.log" "${ARM_QSP:-}" exit); then
+    log "arm $name: $extra_why; Kld not measured"; return 1
+  fi
   if [[ -z "$KLD_REF" ]]; then
     # The reference must be a 16-token arm's bits: an Xt or Lc arm first (the plain one failed or is
     # missing) would let a later Xt or Lc arm be compared with another one.
@@ -373,7 +379,28 @@ kld_finish() {   # name; the run is SERVER_PID
   python3 -I "$HERE/ab_requests.py" --kld-compare "$KLD_REF" "$OUT/kld-$name" 2>&1 | tee -a "$OUT/window.log"
 }
 
-# RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED (the Vp part), from a server log: the engine names the switch at
+# Qsp must be active on every rank and reduce actual wave work, rather than only enable a switch.
+qsp_gate() {   # log, requested switch, start/exit
+  local f=$1 on=$2 stage=${3:-start} rank count line spans rows full fallbacks
+  if [[ -z "$on" ]]; then
+    if grep -q 'wave SwiGLU spans' "$f"; then echo 'no Qsp part, but SwiGLU spans are active'; return 1; fi
+    return 0
+  fi
+  for rank in 0 1 2 3; do
+    count=$(grep -cE "ds41 p1: rank $rank's wave SwiGLU spans on" "$f")
+    if [[ $count != 1 ]]; then echo "Qsp, but rank $rank lacks one startup marker"; return 1; fi
+    [[ "$stage" == exit ]] || continue
+    count=$(grep -cE "ds41 p1 stats, rank $rank: .*; wave SwiGLU spans " "$f")
+    line=$(sed -nE "s/.*ds41 p1 stats, rank $rank: .*; wave SwiGLU spans ([0-9]+), rows ([0-9]+) of ([0-9]+), full-replay fallbacks ([0-9]+).*/\\1 \\2 \\3 \\4/p" "$f")
+    read -r spans rows full fallbacks <<< "$line"
+    if [[ $count != 1 || -z "$full" ]] || (( spans == 0 || rows >= full )); then
+      echo "Qsp, but rank $rank has no demonstrated work reduction (${line:-no counters})"; return 1
+    fi
+  done
+  return 0
+}
+
+# Vp names the switch and actual packed static residents on every rank.
 # startup and each rank how many static residents it holds packed. A Vp arm without the switch's line or
 # with no rank holding any packed (a radiance without the switch, a dynamic plan), or a plain arm with
 # either line (the switch taken from the window's environment), is not measured. With a DSpark bank (a Ds
@@ -575,6 +602,10 @@ EOF2
     grep -m1 -E 'consumer skip: complete checkpoints' "$OUT/$name.server.log" | tee -a "$OUT/window.log"
   fi
   xt_check "$name" || { stop_server; return 1; }
+  local qsp_why
+  if ! qsp_why=$(qsp_gate "$OUT/$name.server.log" "${ARM_QSP:-}" start); then
+    log "arm $name: $qsp_why; not measured"; stop_server; return 1
+  fi
   # In / Is (RADIANCE_EXPERIMENTAL_DS41_INSERT_NT / _SLICE_KIB) and Ph (_HOST_EXPERTS_LEAN_TILES):
   # rank 0 names what it took at startup. An arm whose line is missing or says otherwise (a radiance
   # without the switch, a cache that is not packed), or a plain arm with one, is not measured.
@@ -783,6 +814,11 @@ EOF2
   fi
   if [[ -n "$dk_bad" ]]; then
     log "arm $name: $dk_bad; not measured (results kept as $name.unmeasured.json)"
+    [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
+  fi
+  local qsp_exit_why
+  if ! qsp_exit_why=$(qsp_gate "$OUT/$name.server.log" "${ARM_QSP:-}" exit); then
+    log "arm $name: $qsp_exit_why; not measured (results kept as $name.unmeasured.json)"
     [[ -f "$OUT/$name.json" ]] && mv "$OUT/$name.json" "$OUT/$name.unmeasured.json"
   fi
   # P1 at exit: each rank's "ds41 p1 stats, rank" line counts the leases its passes still held at their
@@ -1492,7 +1528,7 @@ for a in $ARMS; do
   IFS=- read -r -a parts <<< "$a"
   xt="" bt="" kld="" dk="" db="" pu="" ins_nt="" ins_kib="" ins_wait="" lean="" lc="" ad="" dv="" xd="" hs="" dg="" df="" pmr="" tb=""
   mb="" lf="" dc="" dl="" dx="" dm="" dpc="" ds="" nseq=""
-  p1="" q1=() qm="" ql="" qg="" qe=""
+  p1="" q1=() qm="" ql="" qg="" qe="" qsp=""
   pol=${parts[0]} threads=$HX_THREADS env=() CACHE_MIB=81920 HOST_POOL_MIB=4096 EXTRA_ARGS="" ARM_HOME="$RHOME" ARM_CONC=
   ARM_PROMPTS= ARM_N= ARM_LQ= rt=
   power="" skip="" ARGS=() f8="" f8x="" rb="" rbf=0 pred="" cs="" ck="" kh="" pc="" pcopt="" fw="" wp="" wl=""
@@ -1642,6 +1678,7 @@ for a in $ARMS; do
                  lc=$((10#$lc)); ARGS+=(--max-num-batched-tokens "$lc"); env+=(RADIANCE_EXPERIMENTAL_DS41_LCP=$lc)
                else log "arm $a: $p: a chunk is a multiple of 16 in 64..2048; the arm is skipped"; skip=1; fi ;;
       P1)      p1=1 ;;                                                  # prefill Phase 1: card experts in large chunks (needs Lc)
+      Qsp)     qsp=1 ;;                                                 # each P1 wave's covering sorted-slot SwiGLU span
       Qw[0-9]*|Qi[0-9]*|Qr[0-9]*|Qa[0-9]*|Qv[0-9]*|Qm[0-9]*|Ql[0-9]*|Qh[0-9]*|Qe[0-9]*)   # ...wave / in flight / ready / read-ahead / verify / threshold / lent slots / its hold / lent arena slots
                qn=${p:2}
                case ${p:0:2} in
@@ -1988,6 +2025,14 @@ for a in $ARMS; do
   elif [[ -n "$xt" ]]; then env+=(RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=1 RADIANCE_EXPERIMENTAL_DS41_LCP=0)
   else env+=(RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=0 RADIANCE_EXPERIMENTAL_DS41_LCP=0); fi
   if [[ -n "$ad" && -z "$lc" ]]; then log "arm $a: Ad$ad needs Lc (it acts on large chunks only); the arm is skipped"; skip=1; fi
+  # Qsp is default-off; its oracle must include the new full/span wave comparisons.
+  env+=(RADIANCE_EXPERIMENTAL_DS41_P1_SWIGLU_SPAN=${qsp:-0})
+  if [[ -n "$qsp" ]]; then
+    [[ -n "$p1" ]] || { log "arm $a: Qsp needs P1; the arm is skipped"; skip=1; }
+    if ! grep -qE '^p1: PASS: .*full/span SwiGLU waves' "$OUT/devcheck-p1.log" 2>/dev/null; then
+      log "arm $a: Qsp needs the full/span SwiGLU card oracle; the arm is skipped"; skip=1
+    fi
+  fi
   # P1 (RADIANCE_EXPERIMENTAL_DS41_P1): with Lc, on the libr4d.so the `p1` device check passed on; every
   # other arm states the switch 0 and the Q knobs empty, so a window's VAR=val cannot turn them on.
   if [[ -n "$p1" ]]; then
@@ -2052,7 +2097,7 @@ for a in $ARMS; do
     rm -rf "$OUT/kld-$a"
     ARGS=(--max-model-len "${KLD_LEN:-2048}" "${ARGS[@]}" --kld-record "$OUT/kld-$a" --kld-corpus "$OUT/kld-corpus.jsonl")
   fi
-  ARM_XT=$xt ARM_BT=$bt ARM_KLD=$kld ARM_LC=$lc ARM_P1=$p1 ARM_QM=${qm:-320} ARM_QL=$ql ARM_QE=$qe
+  ARM_XT=$xt ARM_BT=$bt ARM_KLD=$kld ARM_LC=$lc ARM_P1=$p1 ARM_QM=${qm:-320} ARM_QL=$ql ARM_QE=$qe ARM_QSP=$qsp
   [[ -n "$skip" ]] && continue
   [[ -n "$power" ]] && power_set "$power"
   case $pol in

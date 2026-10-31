@@ -57,6 +57,31 @@ expect 1 "P1 without Qe on a server that lends the arena"             p1arena 10
 expect 0 "P1 with Ql10 and Qe64, both lines"                          p1both 1024 1 320 10 64
 expect 1 "P1 with Qe64 alone on a server that lends the ring too"     p1both 1024 1 320 "" 64
 
+# Qsp's startup and useful-work gates, independent of ordinary P1 startup admission.
+eval "$(sed -n '/^qsp_gate() {/,/^}/p' "$W")"
+declare -F qsp_gate >/dev/null || { echo "FAIL no qsp_gate in $W"; exit 1; }
+: > "$T/qsp-good.log"
+for rank in 0 1 2 3; do
+  echo "ds41 p1: rank $rank's wave SwiGLU spans on (test)" >> "$T/qsp-good.log"
+  echo "ds41 p1 stats, rank $rank: test; wave SwiGLU spans 12, rows 20 of 200, full-replay fallbacks 0" >> "$T/qsp-good.log"
+done
+sed '/rank 3/d' "$T/qsp-good.log" > "$T/qsp-missing.log"
+sed 's/spans 12/spans 0/' "$T/qsp-good.log" > "$T/qsp-idle.log"
+sed 's/rows 20 of 200/rows 200 of 200/' "$T/qsp-good.log" > "$T/qsp-full.log"
+: > "$T/qsp-off.log"
+qexpect() {
+  local want=$1 label=$2 rc; shift 2
+  qsp_gate "$@" >/dev/null 2>&1; rc=$?
+  if [[ $rc == "$want" ]]; then ok "$label"; else bad "$label: exit $rc, want $want"; fi
+}
+qexpect 0 'Qsp every-rank startup' "$T/qsp-good.log" 1 start
+qexpect 0 'Qsp every-rank work reduction' "$T/qsp-good.log" 1 exit
+qexpect 1 'Qsp missing rank' "$T/qsp-missing.log" 1 start
+qexpect 1 'Qsp enabled without actual waves' "$T/qsp-idle.log" 1 exit
+qexpect 1 'Qsp no reduced work' "$T/qsp-full.log" 1 exit
+qexpect 1 'Qsp unrequested activation' "$T/qsp-good.log" '' start
+qexpect 0 'Qsp explicitly off' "$T/qsp-off.log" '' exit
+
 # ---- 2. the arm loop, stubbed
 H=$T/home
 mkdir -p "$H/kernels"

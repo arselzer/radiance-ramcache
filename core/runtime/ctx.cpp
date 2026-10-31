@@ -676,7 +676,8 @@ void Ctx::note_ep_route_producer(const OpInfo& op, const RadTensor* t, int n_t,
         if ((at - lo) % stride != 0 || spec.role != RAD_OPD_OUT || !spec.name ||
             std::strcmp(spec.name, "expert_count") != 0 ||
             (op.op != "moe_scatter" && op.op != "moe_scatter_inv" &&
-             op.op != "router_topk_scatter" && op.op != "router_gemm_topk_scatter")) continue;
+             op.op != "router_topk_scatter" && op.op != "router_gemm_topk_scatter" &&
+             op.op != "ds41_scored_topk_scatter")) continue;
         if (lane_ != 0 || issued_stream != stream_ || rows <= 0 || rows > ep_route_max_rows() ||
             !ep_rows_ok(batch_, program_, (int64_t)layer, rows) || t[i].dtype != RAD_I32 ||
             !((t[i].rank == 1 && t[i].shape[0] == 96 && t[i].stride[0] == 1) ||

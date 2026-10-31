@@ -22,6 +22,7 @@
 #include "r4d_emit.h"
 #include "r4d_launch.h"
 #include "r4d_plugin.h"
+#include "r4d_moe_sort.h"
 #include "../arch/common/rad_ds41_kv_codec.h"
 #include "../arch/common/rad_ds41_window_codec.h"
 
@@ -1567,6 +1568,8 @@ int router_scored_body(const RadArgs* a, RadStream stream) {
     }
 }
 
+#include "r4d_ds41_scored_scatter.inc"
+
 /* ==================================================================== embed_lookup_planes
  * One thread an element of a gathered row, rows over grid.y. The code rows are read in place, at
  * id * rb bytes as libref reads them; only the gathered rows are touched. */
@@ -2415,6 +2418,12 @@ extern "C" int r4d_rad_kv_store_windowpack(const RadArgs* a, RadStream s) {
 }
 extern "C" int r4d_rad_router_scored_topk(const RadArgs* a, RadStream s) {
     return router_scored_body(a, s);
+}
+extern "C" int r4d_rad_ds41_scored_topk_scatter(const RadArgs* a, RadStream s) {
+    return ds41_scored_scatter_body(a,s);
+}
+extern "C" uint32_t r4d_rad_ds41_scored_scatter_paths() {
+    return ds41_scored_scatter_paths.load();
 }
 extern "C" int r4d_rad_embed_lookup_planes(const RadArgs* a, RadStream s) {
     return embed_planes_body(a, s);

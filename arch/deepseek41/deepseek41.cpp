@@ -30,6 +30,7 @@
 #include <arch/rad_ds41_window_codec.h>
 #include "ds41_prefetch_plan.h"
 #include "ds41_index_memory.h"
+#include "../common/rad_ds41_scored_scatter.h"
 #include "ista_dialect.h"
 #include "../../core/sched/tbo.h"
 #include "../../tools/ds41-host-experts/ds41_p1.h"   /* the lent arena's switch (probe) */
@@ -602,6 +603,7 @@ struct Model {
      * projections declared over gemm_nt_f32bf16; those held at two bytes an element (bf16_held())
      * counted, with the bytes that saves. */
     bool router_bf16 = false;
+    bool scored_scatter = false;
     int n_router_bf16 = 0, n_comp_bf16 = 0;
     int64_t bf16_saved = 0;
     rad_buf final_hidden = 0, logit_input = 0, logits = 0;
@@ -1960,6 +1962,7 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
     s.cfg.sigmoid_router = 1;
     s.cfg.router_score = "sqrtsoftplus";
     s.cfg.router_bf16 = m.router_bf16 ? 1 : 0;
+    s.cfg.ds41_scored_scatter = m.scored_scatter ? 1 : 0;
     s.cfg.route_scale = c.route_scale;
     s.cfg.swiglu_limit = c.swiglu_limit;
     s.cfg.shared_ungated = 1;
@@ -2877,6 +2880,16 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     }
     const auto& c = m.c;
     auto& g = m.g;
+    if(!rad_ds41_scored_scatter::parse(std::getenv(rad_ds41_scored_scatter::kEnv),&m.scored_scatter))return RAD_E_INVAL;
+    if(m.scored_scatter) {
+        if(!rad_ds41_scored_scatter::scope(g.world,g.rank,g.max_tok,c.n_expert,c.n_expert/g.world,
+              c.top_k,g.rank*(c.n_expert/g.world),true,c.n_shared==1)||
+           c.n_layer!=40||c.n_embd!=5120||c.n_head!=64||c.head_dim!=512||c.n_ff!=2304||c.hc!=4||g.max_spec||m.tbo||
+           !rad_op_declared(b,rad_ds41_scored_scatter::kOp))return RAD_E_UNSUPPORTED;
+        for(const char*name:{"RADIANCE_EXPERIMENTAL_DS41_ROUTE_TRACE","RADIANCE_EXPERIMENTAL_DS41_P2_AUDIT"}) {
+            const char*v=std::getenv(name);if(v&&*v&&std::strcmp(v,"0"))return RAD_E_UNSUPPORTED;
+        }
+    }
     if (const char* e = std::getenv("RADIANCE_EXPERIMENTAL_DS41_KV_PACKED")) {
         if (std::strcmp(e, "0") && std::strcmp(e, "1")) return RAD_E_INVAL;
         m.kv_packed = !std::strcmp(e, "1");

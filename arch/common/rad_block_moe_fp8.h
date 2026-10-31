@@ -185,6 +185,8 @@ struct MoeFP8 {
          * one launch (`router_sigmoid_topk_scatter`) wherever the pass fits the sort's one
          * workgroup; the separate ops otherwise. Byte-identical either way. */
         int     router_fuse = 0;
+        /* ds41's separately proven M1 sqrtsoftplus selector+scatter. Never the sigmoid fusion. */
+        int     ds41_scored_scatter = 0;
         /* Block-fp8 experts whose scale plane is f32 (format 9, dtype fp8a8f32). */
         int     expert_f32_scale = 0;
         double  route_scale = 1.0;
@@ -378,6 +380,7 @@ struct MoeFP8 {
     rad_op  op_sigmoid_scatter = 0;
     int64_t sigmoid_scatter_rows = 0;
     bool    sigmoid_scatter_gate = false;
+    rad_op  op_ds41_scored_scatter = 0;
     /* The rotated re-quantisation of the block input, declared only when `expert_rot` is set and
      * the caller does not already write `w.hr`. */
     rad_op op_hq = 0;
@@ -916,6 +919,21 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         op_topk_scatter = rw(b, rad_decl_op(b, "router_topk_scatter", ps, 7 + n_prot,
                                             RAD_NOWEIGHTS),
                              {w.logits}, {w.ids, w.ew, w.sorted, w.eoff, w.ecnt});
+    }
+
+    if(c.ds41_scored_scatter) {
+        if(g.world!=4||g.rank<0||g.rank>=4||c.n_expert_all!=384||c.n_expert!=96||c.top_k!=6||
+           c.expert_base!=g.rank*96||!c.sigmoid_router||!c.shared_ungated||!c.router_score||
+           std::strcmp(c.router_score,"sqrtsoftplus")||prot_list||c.router_fuse||
+           !rad_op_declared(b,"ds41_scored_topk_scatter"))return RAD_E_UNSUPPORTED;
+        const RadParam ps[]={RAD_RANGE("M",1,1),RAD_INT("n_expert",384),RAD_INT("n_local",96),
+            RAD_INT("top_k",6),RAD_INT("norm",c.norm_topk),RAD_F64("route_scale",c.route_scale),
+            RAD_STR("score","sqrtsoftplus"),RAD_STR("dtype","f32"),RAD_INT("expert_base",c.expert_base)};
+        op_ds41_scored_scatter=rad_decl_op(b,"ds41_scored_topk_scatter",ps,9,&glm_router.correction,1);
+        if(!op_ds41_scored_scatter||!rad_op_resolved(b,op_ds41_scored_scatter))return RAD_E_UNSUPPORTED;
+        const rad_buf rd[]={w.logits};rad_op_reads(b,op_ds41_scored_scatter,rd,1);
+        const rad_buf wr[]={w.ids,w.ew,w.sorted,w.eoff,w.ecnt,w.inv};
+        rad_op_writes(b,op_ds41_scored_scatter,wr,scatter_inv?6:5);
     }
 
     /* Exactly one of a per-expert prefix, fused stacked gate_up, or separate stacked gate/up. */
@@ -1764,6 +1782,13 @@ inline void MoeFP8::pass_head(RadCtx* c_, int64_t T, int64_t r0, int64_t rows,
      * `router_fused_gate`) the shared gate in one launch. Otherwise the separate ops. */
     const bool rfused = op_router_fused && rows <= router_fused_rows;
     const bool sfused = op_sigmoid_scatter && rows <= sigmoid_scatter_rows;
+    if(op_ds41_scored_scatter&&rows==1) {
+        glm_router.project(c_,r0,rows,r0);
+        RAD_ISSUE_N(c_,op_ds41_scored_scatter,rows,brow_slice(w.logits,r0,rows,ne_all),
+                    RAD_W(glm_router.correction),brow_slice(w.ids,r0,rows,k),brow_slice(w.ew,r0,rows,k),
+                    brows(w.sorted,rows*k),brows(w.eoff,ne+1),ecnt,
+                    scatter_inv?brows(w.inv,rows*k):RAD_NONE);
+    } else {
     if (sfused) {
         glm_router.project(c_, r0, rows, r0);
         RAD_ISSUE_N(c_, op_sigmoid_scatter, rows, brow_slice(w.logits, r0, rows, ne_all),
@@ -1804,6 +1829,7 @@ inline void MoeFP8::pass_head(RadCtx* c_, int64_t T, int64_t r0, int64_t rows,
                         brows(w.sorted, rows * k), brows(w.eoff, ne + 1), ecnt);
     }
 
+    }
     /* The rotated quantisation of the input, when the experts are rotated and the caller did not
      * write it. Unrotated, the GEMM reads `h`'s pair. */
     const bool rot = c.expert_rot != 0;

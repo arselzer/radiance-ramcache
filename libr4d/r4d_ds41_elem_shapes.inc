@@ -146,6 +146,14 @@ extern "C" int r4d_shape_router_scored_topk(const RadParam* p, int n_p, int oper
                              opd(D, M, k) };
     R4D_PICK(l);
 }
+extern "C" int r4d_shape_ds41_scored_topk_scatter(const RadParam*p,int n_p,int operand,RadOpdDesc*out) {
+    if(pi(p,n_p,"M")!=1||pi(p,n_p,"n_expert")!=384||pi(p,n_p,"n_local")!=96||pi(p,n_p,"top_k")!=6)
+        return RAD_E_UNSUPPORTED;
+    const RadOpdDesc l[]={opd((uint32_t)RAD_F32,1,384),opd((uint32_t)RAD_F32,384),opd_idx(1,6,384),
+        opd((uint32_t)RAD_F32,1,6),opd((uint32_t)RAD_I32,6),opd((uint32_t)RAD_I32,97),
+        opd((uint32_t)RAD_I32,96),opd((uint32_t)RAD_I32,6)};
+    R4D_PICK(l);
+}
 
 /* The planes as a host tool draws them: i8 codes (no table), a scale per `group` of a row. */
 extern "C" int r4d_shape_embed_lookup_planes(const RadParam* p, int n_p, int operand,

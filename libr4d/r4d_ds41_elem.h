@@ -23,6 +23,8 @@ int r4d_rad_mhc_collapse(const RadArgs* a, RadStream stream);
 int r4d_rad_softmax_pool(const RadArgs* a, RadStream stream);
 int r4d_rad_entry_store(const RadArgs* a, RadStream stream);
 int r4d_rad_router_scored_topk(const RadArgs* a, RadStream stream);
+int r4d_rad_ds41_scored_topk_scatter(const RadArgs* a, RadStream stream);
+int r4d_shape_ds41_scored_topk_scatter(const RadParam*, int, int, RadOpdDesc*);
 int r4d_rad_embed_lookup_planes(const RadArgs* a, RadStream stream);
 /* The fused chains (one launch each, byte-identical to the chain r4d_fuse.cpp declares). */
 int r4d_rad_rmsnorm_rope_roundtrip(const RadArgs* a, RadStream stream);

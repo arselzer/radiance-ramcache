@@ -29,7 +29,8 @@
 set(RAD_TESTS_NO_CORE vmem_undo_test kv_storage_guard_test ds41_kv_codec_test kv_growth_test arch_test glm5next_test nemotron35_test mapped_slab_pregrow_test draft_policy_test ds41_prefetch_arch_test
                       ds41_prefetch_plan_test ds41_consumer_skip_arch_test consumer_skip_test
                       ds41_dspark_fp8_arch_test ds41_tbo_arch_test ds41_dspark_defer_arch_test
-                      ds41_shape_probe_arch_test ds41_work_rows_arch_test ds41_ar_rows_arch_test ds41_ag_rows_arch_test)
+                      ds41_shape_probe_arch_test ds41_work_rows_arch_test ds41_ar_rows_arch_test ds41_ag_rows_arch_test
+                      ds41_scored_scatter_arch_test)
 
 # fixture_test tests tools/kfixture.cpp and tools/opshapes.cpp (the seeded draw, the reduction and
 # the on-disk recording) directly, kbench_test tools/kbench_core.cpp (rad-kbench's rules), and

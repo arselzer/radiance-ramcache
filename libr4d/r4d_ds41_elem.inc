@@ -114,6 +114,21 @@ static const RadConstraint cDs41RouterScored[] = {
     C_GE("top_k", 1), C_LE("top_k", 32),   C_IN("score", "sigmoid sqrtsoftplus softmax"),
     C_IN("dtype", "f32"),
 };
+static const RadParamSpec pDs41ScoredScatter[] = {
+    P_INT("M"),P_INT("n_expert"),P_INT("n_local"),P_INT("top_k"),P_INT("norm"),
+    P_F64("route_scale"),P_STR("score"),P_STR("dtype"),P_INT("expert_base")
+};
+static const RadOperandSpec oDs41ScoredScatter[] = {
+    {"logits",RAD_OPD_IN,0},{"bias",RAD_OPD_WEIGHT,0},
+    {"expert_ids",RAD_OPD_OUT,0},{"weights",RAD_OPD_OUT,0},
+    {"sorted_tok",RAD_OPD_OUT,0},{"expert_offset",RAD_OPD_OUT,0},
+    {"expert_count",RAD_OPD_OUT,0},{"token2slot",RAD_OPD_OUT,1}
+};
+static const RadConstraint cDs41ScoredScatter[] = {
+    C_GE("M",1),C_LE("M",1),C_GE("n_expert",384),C_LE("n_expert",384),
+    C_GE("n_local",96),C_LE("n_local",96),C_GE("top_k",6),C_LE("top_k",6),
+    C_IN("score","sqrtsoftplus"),C_IN("dtype","f32")
+};
 
 static const RadParamSpec pDs41EmbedPlanes[] = { P_INT("M"),     P_INT("n_embd"),
                                                  P_INT("n_vocab"), P_INT("group"),
@@ -262,6 +277,9 @@ SCHEMA("entry_store_kvpack", pDs41EntryKvPack, oDs41EntryKvPack,
     SCHEMA("router_scored_topk", pDs41RouterScored, oDs41RouterScored,
            "router_sigmoid_topk with the score function a required name: sigmoid, sqrtsoftplus "
            "(sqrt(softplus(logit)), softplus linear above 20) or softmax over all n_expert logits."),
+    SCHEMA("ds41_scored_topk_scatter",pDs41ScoredScatter,oDs41ScoredScatter,
+           "Native TP4 M1 sqrtsoftplus router selection followed by the identical stable small "
+           "scatter; projection unchanged, F32 selected weights, optional inverse slot map."),
     SCHEMA("embed_lookup_planes", pDs41EmbedPlanes, oDs41EmbedPlanes,
            "A gather from a table stored as single-level affine planes, read in place: x[m, i] = v * "
            "scale[id, i / group] * mult, v = table[code] when a table is given, else the code. Codes are i8, "
@@ -374,6 +392,13 @@ SCHEMA("entry_store_kvpack", pDs41EntryKvPack, oDs41EntryKvPack,
   "f32 logits, bias and weights; i32 ids", RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cDs41RouterScored), NOTUNE, nullptr, nullptr, r4d_rad_router_scored_topk, nullptr, nullptr,
   nullptr, r4d_shape_router_scored_topk },
+{ "ds41_scored_topk_scatter_m1","ds41_scored_topk_scatter","moe",
+  "native M1 sqrtsoftplus top6 plus stable local expert scatter",
+  "M1, TP4, 384 experts/96 local/top6; one 256-thread workgroup; unchanged projection",
+  "f32 logits/bias/weights, i32 IDs/sort/offsets/counts/optional inverse",
+  RAD_DOMAIN_DEVICE,R4D_PRIO_ONLY,ROW(cDs41ScoredScatter),NOTUNE,
+  nullptr,nullptr,r4d_rad_ds41_scored_topk_scatter,nullptr,nullptr,nullptr,
+  r4d_shape_ds41_scored_topk_scatter },
 { "embed_lookup_planes_bf16", "embed_lookup_planes", "vocab",
   "embedding gather from a table's affine planes, read in place (no layout hook)",
   "any M, n_embd a multiple of group; one thread an element of a gathered row",

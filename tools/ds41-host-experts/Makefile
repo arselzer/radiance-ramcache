@@ -39,6 +39,10 @@ device-check: $(O)/ds41_bf16f8_device_check
 $(O)/ds41_index_b16_device_check: ds41_index_b16_device_check.hip $(TREE)/arch/common/rad_ds41_score_b16.h
 	$(HIPCC) $(HIPFLAGS) -I$(TREE)/abi -o $@ ds41_index_b16_device_check.hip -ldl
 index-b16-check: $(O)/ds41_index_b16_device_check
+$(O)/ds41_scored_scatter_device_check: ds41_scored_scatter_device_check.hip
+	$(HIPCC) $(HIPFLAGS) -I$(TREE)/abi -o $@ $< -ldl
+scored-scatter-check: $(O)/ds41_scored_scatter_device_check
+.PHONY: scored-scatter-check
 
 # The card check of the host experts against libr4d's decode kernels (check, swiglu, time, ptime)
 # and of RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL (`tall`: the routed GEMM's twin row, the sparse

@@ -30,6 +30,7 @@
 #include "place/dspark_draft_control_scope.h"
 #include "place/draft_vram_load.h"
 #include "place/ds41_index_b16.h"
+#include "place/ds41_scored_scatter.h"
 #include "place/ds41_window_packed.h"
 #include "kvstream/bringup.h"
 #include "kvstream/plan.h"
@@ -4514,6 +4515,16 @@ int Engine::start() {
             RAD_INFO("ds41 index b16 admitted: rank=%d rows=%lld columns=%lld bytes=%lld legacy_bytes=%lld same_runs=1 writers=%d candidates=%d topk=%d",
                 r->index,(long long)proof.rows,(long long)proof.columns,(long long)(2*proof.rows*proof.columns),
                 (long long)(4*proof.rows*proof.columns),proof.writers,proof.candidates,proof.topk);
+        }
+    }
+    const char*scored_requested=std::getenv(rad_ds41_scored_scatter::kEnv);
+    if(scored_requested&&*scored_requested&&std::strcmp(scored_requested,"0")) {
+        if(std::strcmp(scored_requested,"1")||!meta_.arch_id||std::strcmp(meta_.arch_id,"deepseek41")||ranks_.size()!=4)
+            return RAD_E_UNSUPPORTED;
+        for(const auto&r:ranks_){int n=0;std::string why;
+            if(!ds41_scored_scatter_admit(r->program,r->index,&n,&why)){
+                RAD_ERR("%s=1 refused rank%d: %s",rad_ds41_scored_scatter::kEnv,r->index,why.c_str());return RAD_E_UNSUPPORTED;}
+            RAD_INFO("ds41 scored scatter admitted: rank=%d ops=%d M=1 experts=384 local=96 topk=6 projection=unchanged",r->index,n);
         }
     }
     RAD_TRY(load_weights());

@@ -1,0 +1,39 @@
+{
+  "chat": {
+    "identical_replies": 16,
+    "identical_prompt_token_counts": 16,
+    "identical_prompt_ids": 0,
+    "identical_generated_counts": 16
+  },
+  "harness": {
+    "identical_replies": 13,
+    "identical_prompt_token_counts": 13,
+    "identical_prompt_ids": 13,
+    "identical_generated_counts": 13,
+    "identical_prefill_hashes": 13
+  },
+  "base": {
+    "identical_to_merged_base_reference": 8
+  },
+  "endpoint": {
+    "passed": true,
+    "case": "average-speed",
+    "identical_generated_token_ids": 116,
+    "prompt_tokens": 351,
+    "parsed_tool": "calculator",
+    "parsed_arguments": {
+      "expression": "24 / (12/8 + 12/24)"
+    },
+    "nonempty_reasoning": true
+  },
+  "endpoint_requests_checked": 2,
+  "qfn_restored_and_answered": true,
+  "plugin_sha256": {
+    "base": "b7b9225ee78eceaaeba1dd8f8173ee520e5b7d452c777eb262cd6d8252c69272",
+    "dsml": "4633fa540c4bade862a0c5edcaf52d6bc0b13e049d3f7746b7a4175487ee1360"
+  },
+  "engine_commit": "367b0e23",
+  "window": "ab-20261031T115207Z",
+  "baseline_window": "ab-20261031T111018Z",
+  "explicit_template_matches_official_encoder": true
+}

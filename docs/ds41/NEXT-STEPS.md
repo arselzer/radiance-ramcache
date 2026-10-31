@@ -1,4 +1,12 @@
-# DS41 decode: next steps after the night of 28–29 Oct
+# DS41 optimization plan and historical next steps
+
+Current execution plan (31 Oct, engine `5120c835`): see
+[Realization plan: parallel source work, serialized validation](#realization-plan-parallel-source-work-serialized-validation-2026-10-31).
+Its three source lanes share one build/test and GPU-window queue. The preceding audit covers all31
+reports and the full night log; it distinguishes prior losses, invalid configurations and unmeasured work.
+
+The opening sections below preserve the 28–29 Oct plan and its historical128GB measurements.
+Use HANDOFF and the dated realization plan for the current256GB configuration and merged base.
 
 Where things stand: the final configuration (branch `claude/ds41-decode-impl`, HEAD `bbf48615`, settings in
 `tools/ds41-host-experts/README.md`) decodes the eight held-out prompts at about 12.0 tok/s (base 5.03). TTFT summed
@@ -176,3 +184,142 @@ from the decode residents for the duration of a long prefill, which is the plan'
 - Cache policies other than LRU (replayed on a captured trace): none better.
 - Pinning the CPU pool to cores: 3.5% slower than letting it float.
 - Fewer or lower-priority insert threads: no measurable effect.
+
+## Additional optimization research (2026-10-31, source only)
+
+Coverage: all 31 Markdown files in this report archive, full NIGHT-LOG and the current engine
+README, reconciled against current source. No new performance measurements. Raw captures, every
+historical window artifact and every commit patch were not independently re-read. Earlier 128 GB /
+DDR4-2133 and pre-sync numbers are not forecasts for the current 256 GB / DDR4-2666 base.
+
+The audit keeps the prior outcomes explicit: exact CPU/miss kernels, async misses, multi-row
+decode-once, packed RAM/Sc2, dense FP8, decode-only Rb/Vp/Ss, piecewise read-ahead/Pu/Pi8/Ns7/Fw,
+consumer cuts, LCP live-tail/balance, P1/arena lending and Pc/EORS/grid16 are already adopted.
+Whole-unit read-ahead, L3 staging, pinning/long spin/MWAITX, extra overlap/fetch lists, Ms3/Mp,
+TBO, the old CONF controller, ring lending and shorter reload grace were already tried without
+useful gains (TBO lost again on 256 GB). More cache (208 vs192 GiB) did not help long prefill.
+Sharing-aware batching is weak: 97.7% of file-tier units were single-row at N4. Cache policies
+such as TinyLFU/SLRU/2Q/LFU and causal tail placement were already replayed; proposals/replays
+must not be described as measured engine wins. Early P0 microbenchmarks contaminated by a QFN
+watchdog restart are not clean evidence. Lossy target changes and new reduction partitions remain
+ineligible; fused ds41 norms cannot simply switch to upstream's 256-lane partition.
+
+Ranked extra leads, after the queued DSpark work (all gains unmeasured):
+
+1. **RETRY with a concrete new fix: P1 + static Vp.** Old P1Vp arms had zero actual packed
+   residents, so they were invalid configurations, not measured losses. `core/place/vram_packed.cpp:55`
+   requires every reader band to be gemv_vp, while LCP admission accepts low gemv_vp plus the high
+   packed-aware P1 twin. Whitelist only that exact reader combination, retaining unknown-reader,
+   ordinary-LCP and draft-bank refusals. About half to one day plus a window. Gate planner positives
+   and negatives, nonzero actual packed residents, mixed packed/block P1, long KLD/Kh and N4/N8.
+2. **NEW combination: Rb with recommended P1.** Removed previously because unmeasured, not
+   incompatible. It frees about180 MiB/card; current gain is unknown. Extend f32bf16 card checks
+   beyond their current M130 to M256/1024/2048 and router/compressor N96/384/1024. Then one eight-arm
+   window: reference/+Rb pairs on long KLD, Uharness+Kh, N4 and N8. Little engine implementation.
+3. **Previously proposed, NEW implementation: bounded exact collective row slices.** Full
+   C2048 collective scratch costs about196 MiB/card; this was explicitly skipped, not tried.
+   Split independent rows while retaining ascending-rank fp32 folds, one bf16 store, alignment,
+   in-place safety and sequence/parity ordering. About2–3 days; gate bytes across band boundaries,
+   long KLD/Kh and N4/N8, then price extra launches against recovered residents.
+4. **NEW implementation: n128 fused norm fast path with identical sums.** The usual index-key
+   path is fused norm/rope/FP4 roundtrip, so merely selecting rmsnorm_rows misses it. Preserve the
+   existing32-lane chunk sums, chunk addition order, bf16 rounding, rope and quantization groups;
+   use a wave-per-row implementation. About1–2 days; exceptional/boundary byte oracle + long KLD/Kh.
+5. **NEW implementation: P1 wave SwiGLU span.** `CardExpertPath::wave` still replays the full
+   captured SwiGLU per wave. Restrict to the covering sorted-slot span while preserving untouched
+   rows and wave composition. About half to one day; long KLD/Kh and TTFT. The old ~2% overhead
+   estimate is not a current gain measurement. Qa/Qi/Qr/Qw/Ad defaults also lack a clean independent
+   sweep; Qw1's verification run was confounded.
+
+Suggested parallel source work is the narrow P1/Vp eligibility change; the first extra measurement
+is Rb+P1. The existing HANDOFF order remains in force. No such implementation or extra optimization
+window was started during this research.
+
+
+## Realization plan: parallel source work, serialized validation (2026-10-31)
+
+Objective: increase total concurrent decode throughput first, then prefill and harness-turn latency,
+while preserving the current base engine's replies. This plan follows the history audit above;
+the listed gains are opportunities to measure, not forecasts. DSML is the prerequisite integration.
+
+### Work lanes
+
+Use three feature agents plus one integration owner. Each feature gets a branch/worktree off the
+new decode-impl head, a narrow file scope and its own build directory. Feature agents prepare source
+and host cases in parallel. The integration owner alone reconciles branches, builds the combined
+candidate, runs windows and publishes; do not add an agent review to integration batches or pushes.
+
+| Lane | First task | Deliverable and dependency | Next task when free |
+|---|---|---|---|
+| A: resident capacity | P1 + static Vp eligibility (roughly half–one day) | Narrow reader whitelist in vram_packed.cpp; planner positive/negative cases. Accept only low gemv_vp plus high packed-aware P1; keep ordinary-LCP, unknown-reader and draft-bank refusals. No kernel arithmetic change. | P1 wave SwiGLU span (half–one day), after the Vp branch is ready for integration. |
+| B: existing configuration coverage | Rb + P1 (roughly half day) | Extend device coverage to M256/1024/2048 and N96/384/1024, including strict nonzero-low-half rejection. Prepare paired arms; no controller or planner changes. | Exact n128 fused norm fast path (one–two days), with a byte oracle for the existing reduction/rounding sequence. |
+| C: speculation | Short review of the DSpark-concurrency commits, then probability/outcome capture (roughly one day) | Default-off, read-only per-proposal trace; preserve selected IDs, draft depth and verification. Pair probability with the actual proposal epoch/position and mark an unreached second proposal separately from a rejection. | Offline calibration, then default-off 0/1/2-depth policy. Once that source work is ready, begin bounded collective slicing (two–three days). |
+| Integration owner | DSML publication, then build/test/window queue | Keep one coherent plugin set; preserve the merged base reference. Merge one independently gated feature at a time. | Diagnose the host-only side-store fixture while a device window is not holding build.lock. |
+
+The existing 4,096-token chunk task remains the next prefill track after DSpark. It can be prepared
+once lane B's Rb cases are ready: extend LCP admission, norm pins and checkpoint limits together;
+P1's twin already supports 4,096 rows. Keep that branch separate from collective slicing and the
+n128 optimization so a numerical failure has one new cause. Layer-major Phase 2 follows only if
+the smaller chunk/capacity changes do not meet the prefill target.
+
+### Shared resource rules
+
+Source editing and small file inspection can overlap. Builds and host tests cannot: every compile
+uses build.lock, nice19 and at most j8, after the WINDOW_PENDING/ab_window wait. Host ctest runs use
+exact names and -LE gpu. No feature agent starts a server, emulator, benchmark or device check.
+
+GPU validation is a single queue. Hold both research locks for a testing series, wait for production
+idleness, stop the same QFN container, and restore it with an answering completion after every
+window. Use the watchdog. Each window has one reference and about5–11 arms; do not start a build or
+host test while it measures. Kernel receipts may be reused only for the identical library checksum,
+with their original window and reuse recorded explicitly. Every plugin in a home comes from one
+build; integration uses aql-sync/home-sync and both home variables point there.
+
+### Proposed window queue and gates
+
+1. **DSpark capture first (HANDOFF step2A).** Run code and chat with logging off/on plus a reference.
+   Require identical replies, generated IDs where captured, draft selections and acceptance counts.
+   Calibrate probabilities offline against reached verification positions and measured per-depth
+   costs. The old0.49/0.70 break-even values are starting estimates, not fixed thresholds.
+2. **Rb/P1 while DSpark analysis runs.** One eight-arm window: reference/+Rb pairs on long KLD,
+   Uharness+Kh, N4 and N8. First run the extended f32bf16 device cases. This tests an unmeasured
+   combination; it is not a re-run of the old decode-only result.
+3. **P1/Vp independently.** Gate planner cases first; on cards require actual packed residents above
+   zero and the mixed packed/block P1 byte test. Then reference/+Vp pairs on long KLD, harness Kh,
+   N4 and N8. A flag with zero packed residents is invalid evidence. Price recovered residents
+   against packing and prefill costs.
+4. **Cost-aware DSpark (step2B), once calibrated.** Compare fixed depth1, depth2 and the candidate
+   0/1/2 policy on code and chat, with a reference/repeat. Keep the target verifier unchanged and
+   preserve the existing solo-drafting rule. Require exact replies and evaluate both single-stream
+   gains and the bank's known cost beside concurrency. Keep this opt-in unless evidence supports it.
+5. **Combine only independently passing settings.** If both Rb and P1/Vp pass, compare each alone
+   with their combination at N4/N8 and on harness/long prompts. Do not stack unverified switches.
+   This becomes the reference configuration for subsequent prefill work.
+6. **4,096 chunks and later kernel changes.** One new mechanism per gate: chunks first, then
+   collective slices, n128 norm and wave-span changes as their branches are ready. Use a small
+   device oracle before an expensive model run. Long KLD always sets KLD_MAX_CHARS=14000 and
+   KLD_LEN=4096; also use Ulong/Uharness Kh, held-out replies and N4/N8 where residents change.
+
+Collective slicing must preserve each element's ascending-rank fp32 fold and single bf16 store,
+including message-size thresholds, alignment, in-place buffers and sequence/parity ordering.
+The n128 path must preserve the existing32-lane chunk sums, addition order, bf16 rounding, rope
+and quantization groups. SwiGLU span work must preserve every retained/skipped row and wave
+composition. These are exact implementation contracts, not permissions for new numerics.
+
+### Adoption and stopping rules
+
+Any reply, logit/KV record or required byte-oracle difference stops adoption; keep the off path and
+diagnose on the feature branch. A numerical partition change does not get a new base under this
+plan. Invalid configurations and refused/unmeasured arms are not performance results.
+
+For performance, use total N4/N8 decode rate first, then long-prompt and summed harness TTFT.
+Repeat reference/candidate arms when a result is close to noise. Adopt only repeatable improvements
+with understood memory and startup costs; park neutral/losing variants without another sweep unless
+a concrete new mechanism justifies it. Record every outcome in NIGHT-LOG/HANDOFF and the README.
+Publish only GitHub ds41 after the inline secrets/size scan and manifest check, then release locks.
+
+Planning range: roughly3–5 working days for the critical source path with three lanes, plus the
+serialized window queue; discoveries can extend it. The first useful decisions (Rb and P1/Vp)
+should arrive well before the collective/norm work completes. No implementation of these new
+optimization branches has been started by this planning step. Divergence cleanup and system/BIOS
+changes remain outside this plan.

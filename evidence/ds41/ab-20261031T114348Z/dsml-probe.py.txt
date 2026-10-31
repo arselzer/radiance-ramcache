@@ -1,0 +1,70 @@
+"""Live endpoint gate; called only by the guarded A/B window on its active server."""
+from pathlib import Path
+import json, sys, urllib.error, urllib.request
+
+url, output = sys.argv[1:]
+def post(path, body):
+    req = urllib.request.Request(url+path, json.dumps(body).encode(), {'Content-Type':'application/json'})
+    try:
+        with urllib.request.urlopen(req, timeout=300) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f'{path}: {e.code}: {e.read().decode()}') from e
+
+body = {
+    'model':'ds41-native-smoke', 'temperature':0, 'max_tokens':256,
+    'enable_thinking':True, 'logprobs':True, 'top_logprobs':0,
+    'messages':[
+        {'role':'system','content':'Think briefly in one short sentence, then call the weather tool. Do not answer from memory.'},
+        {'role':'user','content':'What is the current temperature in Paris? Call get_weather with location Paris and unit celsius.'}
+    ],
+    'tools':[{'type':'function','function':{
+        'name':'get_weather','description':'Get the current weather for a location.',
+        'parameters':{'type':'object','properties':{
+            'location':{'type':'string'},'unit':{'type':'string','enum':['celsius','fahrenheit']}},
+            'required':['location','unit'], 'additionalProperties':False}}}],
+    'tool_choice':'auto'
+}
+evidence = {'request':body}
+p = Path(output)
+def save():
+    p.write_text(json.dumps(evidence, ensure_ascii=False, indent=2)+'\n')
+try:
+    rendered = post('/apply-template', body)['prompt']
+    evidence['rendered_prompt'] = rendered
+    save()
+    chat = post('/v1/chat/completions', body)
+    evidence['chat'] = chat
+    save()
+    choice = chat['choices'][0]
+    msg = choice['message']
+    assert msg.get('reasoning_content'), msg
+    assert choice['finish_reason'] == 'tool_calls', choice
+    assert len(msg.get('tool_calls',[])) == 1, msg
+    call = msg['tool_calls'][0]
+    assert call['function']['name'] == 'get_weather', call
+    args = json.loads(call['function']['arguments'])
+    assert args == {'location':'Paris','unit':'celsius'}, args
+    chat_ids = [t['id'] for t in choice['logprobs']['content']]
+    raw_body = {
+        'prompt':rendered, 'temperature':0, 'n_predict':256, 'return_tokens':True,
+        'preserved_tokens':['<think>','</think>','<｜DSML｜ calls>','</｜DSML｜ calls>',
+                            '<｜DSML｜ invoke','</｜DSML｜ invoke>','<｜DSML｜ parameter','</｜DSML｜ parameter>']
+    }
+    evidence['raw_request'] = raw_body
+    raw = post('/completion', raw_body)
+    evidence['raw'] = raw
+    save()
+    assert chat['usage']['prompt_tokens'] == raw['tokens_evaluated'], (chat['usage'],raw['tokens_evaluated'])
+    assert chat_ids == raw['tokens'], (chat_ids,raw['tokens'])
+    assert msg['reasoning_content'] in raw['content'], raw['content']
+    assert '<｜DSML｜ calls>' in raw['content'], raw['content']
+    evidence['gate'] = {'passed':True, 'identical_generated_token_ids':len(chat_ids),
+                        'prompt_tokens':raw['tokens_evaluated'], 'parsed_tool':call['function']['name'],
+                        'parsed_arguments':args, 'nonempty_reasoning':True}
+    save()
+    print('DSML endpoint gate PASS: '+json.dumps(evidence['gate']), flush=True)
+except Exception as e:
+    evidence['error'] = str(e)
+    save()
+    raise

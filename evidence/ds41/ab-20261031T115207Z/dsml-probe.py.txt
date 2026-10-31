@@ -1,0 +1,50 @@
+"""Live endpoint gates; run only by the guarded window, using ordinary and continuation requests."""
+from pathlib import Path
+import json, sys, urllib.error, urllib.request
+
+url, output = sys.argv[1:]
+def post(path, body):
+    req=urllib.request.Request(url+path,json.dumps(body).encode(),{'Content-Type':'application/json'})
+    try:
+        with urllib.request.urlopen(req,timeout=300) as r: return json.load(r)
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f'{path}: {e.code}: {e.read().decode()}') from e
+cases=json.loads(Path('/home/as/ds41-claude-build/work/dsml/probe-cases.json').read_text())
+p=Path(output);evidence={'cases':[]}
+def save():p.write_text(json.dumps(evidence,ensure_ascii=False,indent=2)+'\n')
+for case in cases:
+    row={'name':case['name'],'request':case['request']};evidence['cases'].append(row);save()
+    try:
+        body=row['request']; rendered=post('/apply-template',body)['prompt'];row['rendered_prompt']=rendered;save()
+        chat=post('/v1/chat/completions',body);row['chat']=chat;save()
+        choice=chat['choices'][0];msg=choice['message']
+        ids=[t['id'] for t in choice['logprobs']['content']]
+        raw_body={'prompt':rendered,'temperature':0,'n_predict':body['max_tokens'],'return_tokens':True,
+                  'preserved_tokens':['<think>','</think>','<｜DSML｜ calls>','</｜DSML｜ calls>',
+                  '<｜DSML｜ invoke','</｜DSML｜ invoke>','<｜DSML｜ parameter','</｜DSML｜ parameter>']}
+        row['raw_request']=raw_body;raw=post('/completion',raw_body);row['raw']=raw;save()
+        assert chat['usage']['prompt_tokens']==raw['tokens_evaluated'], 'prompt token count differs'
+        assert ids==raw['tokens'], ('generated token IDs differ',ids,raw['tokens'])
+        assert choice['finish_reason']=='tool_calls', choice
+        assert len(msg.get('tool_calls',[]))==1, msg
+        call=msg['tool_calls'][0];args=json.loads(call['function']['arguments'])
+        assert call['function']['name']==body['tools'][0]['function']['name'], call
+        if call['function']['name']=='get_weather': assert args=={'location':'Paris','unit':'celsius'},args
+        else: assert isinstance(args.get('expression'),str) and args['expression'],args
+        assert '<｜DSML｜ calls>' in raw['content'], raw['content']
+        reasoning=msg.get('reasoning_content','')
+        if reasoning: assert reasoning in raw['content'], (reasoning,raw['content'])
+        row['gate']={'token_ids_match':True,'identical_generated_token_ids':len(ids),'nonempty_reasoning':bool(reasoning)}
+        print('DSML case '+case['name']+': '+json.dumps(row['gate']),flush=True)
+        if reasoning:
+            evidence.update({k:row[k] for k in ('request','rendered_prompt','chat','raw_request','raw')})
+            evidence['gate']={'passed':True,'case':case['name'],'identical_generated_token_ids':len(ids),
+                              'prompt_tokens':raw['tokens_evaluated'],'parsed_tool':call['function']['name'],
+                              'parsed_arguments':args,'nonempty_reasoning':True}
+            save();print('DSML endpoint gate PASS: '+json.dumps(evidence['gate']),flush=True);break
+        save()
+    except Exception as e:
+        row['error']=str(e);save();print('DSML case '+case['name']+' failed: '+str(e),flush=True)
+if not evidence.get('gate',{}).get('passed'):
+    evidence['error']='No case supplied both parsed tool calls and nonempty generated reasoning with identical raw token IDs.'
+    save();raise SystemExit(5)

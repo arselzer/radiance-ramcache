@@ -1,0 +1,98 @@
+{# Text-only verification adapter for the official V4.1 encoder. No model/container modification. #}
+{%- set thinking = enable_thinking if enable_thinking is defined else true -%}
+{{- bos_token -}}
+{%- if thinking -%}
+{{- '<｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)
+
+' -}}
+{%- elif messages and messages[0].role == 'system' -%}{{- '<｜System｜>' -}}{%- endif -%}
+{%- if tools and (not messages or messages[0].role != 'system') -%}
+{%- if not thinking -%}{{- '<｜System｜>' -}}{%- endif -%}
+## Tools
+
+You have access to a set of tools to help answer the user's question. You can invoke tools by writing a "<｜DSML｜ calls>" block like the following:
+
+<｜DSML｜ calls>
+<｜DSML｜ invoke name="$TOOL_NAME">
+<｜DSML｜ parameter name="$PARAMETER_NAME" string="true|false">$PARAMETER_VALUE</｜DSML｜ parameter>
+...
+</｜DSML｜ invoke>
+<｜DSML｜ invoke name="$TOOL_NAME2">
+...
+</｜DSML｜ invoke>
+</｜DSML｜ calls>
+
+String parameters should be specified as is and set `string="true"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string="false"`.
+
+If thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.
+
+Otherwise, output directly after </think> with tool calls or final response.
+
+### Available Tool Schemas
+
+{% for tool in tools %}{{ tool.function | tojson }}{% if not loop.last %}{{ "\n" }}{% endif %}{% endfor %}{{ "" }}
+
+You MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.{{- '\n' -}}
+{%- endif -%}
+{%- for message in messages -%}
+{%- if message.role == 'system' -%}
+{%- if not loop.first -%}{{- '<｜System｜>' -}}{%- endif -%}
+{{- message.content -}}
+{%- if loop.first and tools -%}{{- '
+
+' -}}
+## Tools
+
+You have access to a set of tools to help answer the user's question. You can invoke tools by writing a "<｜DSML｜ calls>" block like the following:
+
+<｜DSML｜ calls>
+<｜DSML｜ invoke name="$TOOL_NAME">
+<｜DSML｜ parameter name="$PARAMETER_NAME" string="true|false">$PARAMETER_VALUE</｜DSML｜ parameter>
+...
+</｜DSML｜ invoke>
+<｜DSML｜ invoke name="$TOOL_NAME2">
+...
+</｜DSML｜ invoke>
+</｜DSML｜ calls>
+
+String parameters should be specified as is and set `string="true"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string="false"`.
+
+If thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.
+
+Otherwise, output directly after </think> with tool calls or final response.
+
+### Available Tool Schemas
+
+{% for tool in tools %}{{ tool.function | tojson }}{% if not loop.last %}{{ "\n" }}{% endif %}{% endfor %}{{ "" }}
+
+You MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.{{- '\n' -}}
+{%- endif -%}
+{%- elif message.role == 'user' -%}{{- '<｜User｜>' + message.content -}}
+{%- elif message.role == 'assistant' -%}
+{{- '<｜Assistant｜>' -}}
+{%- if thinking -%}{{- '<think>' + (message.reasoning_content | default('')) + '</think>' -}}
+{%- else -%}{{- '</think>' -}}{%- endif -%}
+{{- message.content | default('', true) -}}
+{%- if message.tool_calls -%}{{- '
+
+<｜DSML｜ calls>
+' -}}
+{%- for call in message.tool_calls -%}
+{{- '<｜DSML｜ invoke name="' + call.function.name + '">
+' -}}
+{%- for key,value in call.function.arguments.items() -%}
+{{- '<｜DSML｜ parameter name="' + key + '" string="' -}}
+{%- if value is string -%}{{- 'true">' + value -}}{%- else -%}{{- 'false">' + (value | tojson) -}}{%- endif -%}
+{{- '</｜DSML｜ parameter>
+' -}}
+{%- endfor -%}{{- '</｜DSML｜ invoke>
+' -}}{%- endfor -%}
+{{- '</｜DSML｜ calls>' -}}{%- endif -%}
+{{- eos_token -}}
+{%- elif message.role == 'tool' -%}{{- '<｜User｜><tool_result>' + message.content + '</tool_result>' -}}
+{%- else -%}{{- raise_exception('Unsupported role in text-only verification adapter') -}}
+{%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+{{- '<｜Assistant｜>' -}}{%- if thinking -%}{{- '<think>' -}}{%- else -%}{{- '</think>' -}}{%- endif -%}
+{%- endif -%}

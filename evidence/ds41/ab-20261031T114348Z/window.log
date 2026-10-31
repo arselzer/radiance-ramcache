@@ -1,0 +1,46 @@
+[2026-10-31T11:43:48Z] waiting for 30 s of QFN idleness
+before: 608764c1d1989c714d8aad7b8a79f8057c3e73473b9f9d55b49d02e82defd2b8 running 2026-10-31T11:33:05.320370251Z sha256:e82764045e46ebae07e33961f17dedba981c0d07336dfcddd67e4b3b042b8600
+[2026-10-31T11:44:16Z] stopping radiance-flashnext
+radiance-flashnext
+[2026-10-31T11:44:25Z] Reusing lcp2048/bal/p1 gates from ab-20261031T111018Z; unchanged libr4d SHA256 38db93da1298e3d0367ceb721af382206f643d0c22848ef6df60ad47d81aa1d2. No device checks rerun.
+[2026-10-31T11:44:25Z] arm all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Lm4096-Uchat-t40: RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=40 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SILU=/home/as/radiance-ds41-claude/tools/ds41-host-experts/build/window-20261028T203510Z/silu_table_gfx1201.bin RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_POLICY=all RADIANCE_EXPERIMENTAL_NATIVE_CACHE_DIRECT_FILL=1 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MISSES=16 RADIANCE_EXPERIMENTAL_NATIVE_CACHE_PREGROW=1 RADIANCE_EXPERIMENTAL_DS41_FILE_BUFFER_UNITS=1 RADIANCE_EXPERIMENTAL_DS41_CACHE_WARM=1 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_ASYNC_MISSES=2 RADIANCE_EXPERIMENTAL_DS41_ENGRAM_SPLIT=1 RADIANCE_EXPERIMENTAL_DS41_PREFETCH_ATTN=1 RADIANCE_EXPERIMENTAL_DS41_PACKED_CACHE=1 RADIANCE_EXPERIMENTAL_DS41_CACHE_SECOND_CHANCE=2 RADIANCE_EXPERIMENTAL_DS41_PREFETCH=pieces RADIANCE_EXPERIMENTAL_DS41_PREFETCH_K=4 RADIANCE_EXPERIMENTAL_DS41_EARLY_ISSUE=1 RADIANCE_EXPERIMENTAL_DS41_PREFETCH_ATTN=1 RADIANCE_EXPERIMENTAL_DS41_PREFETCH_MIB=56 RADIANCE_EXPERIMENTAL_DS41_PREFETCH_ATTN=1 RADIANCE_EXPERIMENTAL_DS41_PREFETCH_ENGRAM=1 RADIANCE_EXPERIMENTAL_DS41_SKIP_POST_STOP=1 RADIANCE_EXPERIMENTAL_DS41_PREFETCH_URGENT=1 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_FUTEX=1 RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8=1 RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8_EXCLUDE= RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED=0 RADIANCE_EXPERIMENTAL_DS41_ROUTER_BF16=0 RADIANCE_EXPERIMENTAL_DS41_ROUTER_BF16_FORM=0 RADIANCE_EXPERIMENTAL_DS41_PREFETCH_MULTIROW=0 RADIANCE_EXPERIMENTAL_SCHED_TBO=0 RADIANCE_EXPERIMENTAL_DS41_PREFETCH_SCORE=int8 RADIANCE_EXPERIMENTAL_DS41_PREFETCH_RESCORE=12 RADIANCE_EXPERIMENTAL_DS41_PREFETCH_SCORE_CHECK=0 RADIANCE_EXPERIMENTAL_DS41_PREFETCH_POST_LATE=0 RADIANCE_EXPERIMENTAL_DS41_SIDE_STORE=7 RADIANCE_EXPERIMENTAL_DS41_PREFETCH_RECORD= RADIANCE_EXPERIMENTAL_DS41_ROUTE_TRACE= RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP=0 RADIANCE_EXPERIMENTAL_DS41_CONSUMER_SKIP_CKPT=512 RADIANCE_EXPERIMENTAL_DS41_PREFILL_HASH=0 RADIANCE_EXPERIMENTAL_CACHE_HEADROOM_BACKED=0 RADIANCE_EXPERIMENTAL_PREFIX_EXACT_PUBLISH=0 RADIANCE_EXPERIMENTAL_PREFIX_EORS=0 RADIANCE_EXPERIMENTAL_DS41_RESUME_GRID=0 RADIANCE_EXPERIMENTAL_PREFIX_SESSION_LRU=0 RADIANCE_EXPERIMENTAL_CHECKPOINT_STORE_MIB= RADIANCE_EXPERIMENTAL_DS41_KV_REPLICATED=0 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MAX_ROWS=4 RADIANCE_EXPERIMENTAL_DS41_DSPARK_CONF=0 RADIANCE_EXPERIMENTAL_DS41_DSPARK_CONF_HEAD= RADIANCE_EXPERIMENTAL_DS41_DSPARK_LOAD=0 RADIANCE_EXPERIMENTAL_DS41_DSPARK_CTX_DEFER=0 RADIANCE_EXPERIMENTAL_DS41_DSPARK_CODEBOOK_RAM=0 RADIANCE_EXPERIMENTAL_DS41_DRAFT_GEMV=0 RADIANCE_EXPERIMENTAL_DS41_DSPARK_SHORT_BLOCK=0 RADIANCE_EXPERIMENTAL_DS41_DSPARK_GATE=0 RADIANCE_EXPERIMENTAL_DS41_DSPARK_FP8=0 RADIANCE_EXPERIMENTAL_DS41_DRAFT_VRAM=0 RADIANCE_EXPERIMENTAL_DS41_DRAFT_HOTSET= RADIANCE_EXPERIMENTAL_DS41_MOE_BALANCE=0 RADIANCE_EXPERIMENTAL_DS41_LCP_PROFILE=0 RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=0 RADIANCE_EXPERIMENTAL_DS41_LCP=0 RADIANCE_EXPERIMENTAL_DS41_P1=0 RADIANCE_EXPERIMENTAL_DS41_P1_WAVE= RADIANCE_EXPERIMENTAL_DS41_P1_INFLIGHT= RADIANCE_EXPERIMENTAL_DS41_P1_READY= RADIANCE_EXPERIMENTAL_DS41_P1_AHEAD= RADIANCE_EXPERIMENTAL_DS41_P1_VERIFY= RADIANCE_EXPERIMENTAL_DS41_P1_ALIGN= RADIANCE_EXPERIMENTAL_DS41_P1_MIN_ROWS= RADIANCE_EXPERIMENTAL_DS41_P1_LEND=0 RADIANCE_EXPERIMENTAL_DS41_P1_GRACE_MS= RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA=0 RADIANCE_EXPERIMENTAL_DS41_LCP_ADMIT= RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_PREWAKE=0 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_PREWAKE_LEAD_US=60 RADIANCE_EXPERIMENTAL_DS41_INSERT_NT=0 RADIANCE_EXPERIMENTAL_DS41_INSERT_SLICE_KIB=256 RADIANCE_EXPERIMENTAL_DS41_INSERT_WAIT_US= RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_LEAN_TILES=0
+[2026-10-31T11:44:25Z] DSML plugin for all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Lm4096-Uchat-t40: 4633fa540c4bade862a0c5edcaf52d6bc0b13e049d3f7746b7a4175487ee1360  /home/as/ds41-claude-build/work/dsml/deepseek41-dsml.so
+[2026-10-31T11:45:39Z] arm all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Lm4096-Uchat-t40: serving after 74s
+radiance: deepseek41: rank 3: 330 dense weights read by gemm_nt_bf16f8 (RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8): 1885.0 MiB of E4M3 codes where bf16 held 3770.0 MiB; 0 left on gemm_nt
+radiance: deepseek41: rank 2: 330 dense weights read by gemm_nt_bf16f8 (RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8): 1885.0 MiB of E4M3 codes where bf16 held 3770.0 MiB; 0 left on gemm_nt
+radiance: deepseek41: rank 0: 330 dense weights read by gemm_nt_bf16f8 (RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8): 2035.0 MiB of E4M3 codes where bf16 held 4070.0 MiB; 0 left on gemm_nt
+radiance: deepseek41: rank 1: 330 dense weights read by gemm_nt_bf16f8 (RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8): 1885.0 MiB of E4M3 codes where bf16 held 3770.0 MiB; 0 left on gemm_nt
+I[0] router predictor: 40 routers loaded (bf16, 157 MB); scored in int8 (one scale an expert, 79 MB, quantized in 0.22 s), the best 12 scored again in bf16; layer L's router input predicts layer L+2's top 4, read ahead in pieces
+I[0] host experts: side store: the planes of up to 7 units a rank whose inserts the packed RAM cache refuses are kept and handed to their later misses, which read nothing (~18 MiB a unit; RADIANCE_EXPERIMENTAL_DS41_SIDE_STORE)
+I[0] host experts: background inserts write a missed unit's codes by non-temporal stores in pieces of 256 KiB; a one-token pass's insert sleeps before each piece while the pool has submitted jobs unfinished (not for a miss's reservation alone), at most 4000 us an insert (RADIANCE_EXPERIMENTAL_DS41_INSERT_SLICE_KIB)
+I[0] host experts: idle workers sleep on a futex and a submit wakes them without a lock (RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_FUTEX)
+I[0] read-ahead: rank 0 reads the rest of a partly read unit its layer needs in the layer's own call on the kept readers (RADIANCE_EXPERIMENTAL_DS41_PREFETCH_URGENT=1), from the container alone
+I[1] read-ahead: rank 1 reads the rest of a partly read unit its layer needs in the layer's own call on the kept readers (RADIANCE_EXPERIMENTAL_DS41_PREFETCH_URGENT=1), from the container alone
+I[2] read-ahead: rank 2 reads the rest of a partly read unit its layer needs in the layer's own call on the kept readers (RADIANCE_EXPERIMENTAL_DS41_PREFETCH_URGENT=1), from the container alone
+I[3] read-ahead: rank 3 reads the rest of a partly read unit its layer needs in the layer's own call on the kept readers (RADIANCE_EXPERIMENTAL_DS41_PREFETCH_URGENT=1), from the container alone
+chat-01: 3.5 s, decode 26.51 tok/s, prefill 1094 ms
+chat-02: 3.4 s, decode 21.31 tok/s, prefill 469 ms
+chat-03: 1.6 s, decode 29.51 tok/s, prefill 750 ms
+chat-04: 3.0 s, decode 25.95 tok/s, prefill 583 ms
+chat-05: 1.3 s, decode 21.45 tok/s, prefill 428 ms
+chat-06: 2.9 s, decode 27.34 tok/s, prefill 584 ms
+chat-07: 3.0 s, decode 26.80 tok/s, prefill 670 ms
+chat-08: 3.4 s, decode 21.34 tok/s, prefill 481 ms
+chat-09: 2.8 s, decode 29.58 tok/s, prefill 638 ms
+chat-10: 3.3 s, decode 22.70 tok/s, prefill 504 ms
+chat-11: 2.9 s, decode 25.56 tok/s, prefill 400 ms
+chat-12: 2.9 s, decode 28.34 tok/s, prefill 658 ms
+chat-13: 3.3 s, decode 23.09 tok/s, prefill 612 ms
+chat-14: 3.3 s, decode 22.60 tok/s, prefill 546 ms
+chat-15: 2.5 s, decode 32.02 tok/s, prefill 544 ms
+chat-16: 2.7 s, decode 28.25 tok/s, prefill 450 ms
+[2026-10-31T11:46:25Z] arm all-t40-f-M16-H-p256-m196608-G-R-B1-W-A2-Rd13-Er-Es-Pa-K-Sc2-F8-Pp4-Ei-Pm56-Pe-Ss-Pu-Is-Pi8-Ns7-Fw-Lm4096-Uchat-t40: requests exit 0
+Traceback (most recent call last):
+  File "/home/as/ds41-claude-build/work/dsml/probe.py", line 41, in <module>
+    assert msg.get('reasoning_content'), msg
+           ~~~~~~~^^^^^^^^^^^^^^^^^^^^^
+AssertionError: {'role': 'assistant', 'content': "I'll check the current weather in Paris for you.", 'tool_calls': [{'id': 'call_988a3e5195bdadcad3964f24', 'type': 'function', 'function': {'name': 'get_weather', 'arguments': '{"location":"Paris","unit":"celsius"}'}}]}
+[2026-10-31T11:46:41Z] restoring radiance-flashnext
+radiance-flashnext
+[2026-10-31T11:47:32Z] QFN up after 50s; completion: {"id":"cmpl-26b51ed092153c560acc2b62","object":"text_completion","created":1793447252,"model":"qwen-vllm","system_fingerprint":"radiance-1.12.0","choices":[{"text":" Paris. The capital","index":0,"logprobs":null,"finish_reason":"length"}],"usage":{"prompt_tokens":5,"completion_tokens":4,"total_token
+608764c1d1989c714d8aad7b8a79f8057c3e73473b9f9d55b49d02e82defd2b8 running 2026-10-31T11:46:42.055802848Z sha256:e82764045e46ebae07e33961f17dedba981c0d07336dfcddd67e4b3b042b8600

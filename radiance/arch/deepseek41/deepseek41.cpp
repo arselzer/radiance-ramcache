@@ -24,6 +24,7 @@
  * The checkpoint's DSpark drafter (mtp.0 .. mtp.{n-1}, when the container carries its stages as
  * blk.{n_layer}.. with `nextn_predict_layers`) runs on the block-drafter protocol: see struct Dsp. */
 #include <arch/rad_block_moe_fp8.h>
+#include <arch/rad_deepseek41_chat.h>
 #include "ds41_prefetch_plan.h"
 #include "ista_dialect.h"
 #include "../../core/sched/tbo.h"
@@ -3765,10 +3766,13 @@ static void cut_report() {
                          (unsigned long long)s.rows_key, (unsigned long long)s.rows_skipped);
     }
 }
+/* DSML tool calls with typed argument tags, which the template analysis cannot state. */
+static const RadChatFormat* chat_format(const RadModelMeta*) { return rad::arch::deepseek41_chat_format(); }
 }  // namespace deepseek41
 
 #ifndef RAD_ARCH_NO_EXPORTS
 RAD_ARCH_PROBE(deepseek41)
+RAD_ARCH_CHAT_FORMAT(deepseek41)
 RAD_ARCH_PLUGIN(deepseek41, "deepseek41", "", "0.1.0",
                 "DeepSeek-V4.1: hyper-connection streams, window + sparse compressed latent "
                 "attention, sqrt(softplus) MoE, Engram")

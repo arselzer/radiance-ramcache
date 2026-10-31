@@ -1,0 +1,153 @@
+[
+  {
+    "name": "weather",
+    "request": {
+      "model": "ds41-native-smoke",
+      "temperature": 0,
+      "max_tokens": 256,
+      "enable_thinking": true,
+      "logprobs": true,
+      "top_logprobs": 0,
+      "messages": [
+        {
+          "role": "system",
+          "content": "Think briefly in one short sentence, then call the weather tool. Do not answer from memory."
+        },
+        {
+          "role": "user",
+          "content": "What is the current temperature in Paris? Call get_weather with location Paris and unit celsius."
+        }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "description": "Get the current weather for a location.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "location": {
+                  "type": "string"
+                },
+                "unit": {
+                  "type": "string",
+                  "enum": [
+                    "celsius",
+                    "fahrenheit"
+                  ]
+                }
+              },
+              "required": [
+                "location",
+                "unit"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "tool_choice": "auto"
+    }
+  },
+  {
+    "name": "average-speed",
+    "request": {
+      "model": "ds41-native-smoke",
+      "temperature": 0,
+      "max_tokens": 256,
+      "enable_thinking": true,
+      "logprobs": true,
+      "top_logprobs": 0,
+      "messages": [
+        {
+          "role": "system",
+          "content": "Think through total distance and time before calling the calculator. Keep your reasoning brief."
+        },
+        {
+          "role": "user",
+          "content": "A cyclist rides 12 km uphill at 8 km/h and returns the same 12 km at 24 km/h. Use the calculator to compute the overall average speed. Work out the correct expression before calling it."
+        }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "calculator",
+            "description": "Evaluate a mathematical expression.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "expression": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "expression"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "tool_choice": "auto"
+    }
+  },
+  {
+    "name": "weather-reasoning-continuation",
+    "request": {
+      "model": "ds41-native-smoke",
+      "temperature": 0,
+      "max_tokens": 256,
+      "enable_thinking": true,
+      "logprobs": true,
+      "top_logprobs": 0,
+      "messages": [
+        {
+          "role": "system",
+          "content": "Think briefly in one short sentence, then call the weather tool. Do not answer from memory."
+        },
+        {
+          "role": "user",
+          "content": "What is the current temperature in Paris? Call get_weather with location Paris and unit celsius."
+        },
+        {
+          "role": "assistant",
+          "content": "",
+          "reasoning_content": "The user needs current weather, so the tool arguments should be"
+        }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "description": "Get the current weather for a location.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "location": {
+                  "type": "string"
+                },
+                "unit": {
+                  "type": "string",
+                  "enum": [
+                    "celsius",
+                    "fahrenheit"
+                  ]
+                }
+              },
+              "required": [
+                "location",
+                "unit"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "tool_choice": "auto",
+      "continue_final_message": "reasoning_content"
+    }
+  }
+]

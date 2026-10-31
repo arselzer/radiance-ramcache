@@ -25,7 +25,7 @@ step was measured as an A/B window; the log is `/home/as/ds41-decode-review-2026
 
 ## Configuration
 
-Everything is opt-in and off by default. The measured best configuration:
+Host-expert optimizations are opt-in and off by default. The measured best configuration:
 
 ```
 RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS=40                 # pool threads (SMT siblings help)
@@ -81,6 +81,22 @@ tuned kernel point per M band, no large-chunk prefill). Measured on 13 harness t
 (ab-20261031T090154Z): prefill hashes identical to the cold run on 13 of 13 turns, every reply identical; summed
 time to first token 72.7 s, against 82.5 s on the chunk grid and 135.1 s cold; short follow-ups 0.3-0.6 s instead
 of 3.3-3.7 s; decode unchanged.
+
+**DSML chat replies**: the ds41 plugin declares upstream PR 266's reply format, so
+`/v1/chat/completions` returns typed DSML calls as `message.tool_calls` and thinking as
+`message.reasoning_content`. The format header was already present from the upstream-main sync;
+only its registration in the ds41 plugin changed. It applies by default to chat reply parsing.
+The benchmark chat and harness sets frame their own prompts and use raw completions. Across
+`ab-20261031T111018Z` and `ab-20261031T115207Z`, registration left all 16 chat and 13 harness replies byte-identical,
+with identical prompt IDs, generated token counts and harness prefill hashes; the base arm matched
+the merged base on 8/8 held-out replies. A thinking-on tool request parsed both fields,
+and all 116 generated token IDs matched the same rendered prompt through raw `/completion`.
+The research container carries no chat template: pass `--override-chat-template <DS41 template>`
+to serve chat. The window used `work/dsml/ds41-chat.jinja`, a text-only verification adapter whose
+tool-request prompt equals the local official V4.1 encoder byte for byte. The template and offline
+check are saved with the window evidence. The first window stopped at a 501 before the live request;
+the follow-up supplied this explicit template and reused the unchanged libr4d's passed card gates
+by SHA256. No model/container metadata was modified.
 
 **For concurrent requests** (agent harnesses) add `RADIANCE_EXPERIMENTAL_SCHED_PREFILL_ALONE=1` and `--max-num-seqs N`
 (with `--max-model-len` sized so N sequences' KV fit, e.g. 1024 at N = 4-8): large-chunk prefill refuses steps that

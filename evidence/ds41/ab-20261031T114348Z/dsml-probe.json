@@ -1,0 +1,958 @@
+{
+  "request": {
+    "model": "ds41-native-smoke",
+    "temperature": 0,
+    "max_tokens": 256,
+    "enable_thinking": true,
+    "logprobs": true,
+    "top_logprobs": 0,
+    "messages": [
+      {
+        "role": "system",
+        "content": "Think briefly in one short sentence, then call the weather tool. Do not answer from memory."
+      },
+      {
+        "role": "user",
+        "content": "What is the current temperature in Paris? Call get_weather with location Paris and unit celsius."
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "description": "Get the current weather for a location.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "location": {
+                "type": "string"
+              },
+              "unit": {
+                "type": "string",
+                "enum": [
+                  "celsius",
+                  "fahrenheit"
+                ]
+              }
+            },
+            "required": [
+              "location",
+              "unit"
+            ],
+            "additionalProperties": false
+          }
+        }
+      }
+    ],
+    "tool_choice": "auto"
+  },
+  "rendered_prompt": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\nThink briefly in one short sentence, then call the weather tool. Do not answer from memory.\n\n## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜ calls>\" block like the following:\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"$TOOL_NAME\">\n<｜DSML｜ parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜ parameter>\n...\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"$TOOL_NAME2\">\n...\n</｜DSML｜ invoke>\n</｜DSML｜ calls>\n\nString parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n{\"name\": \"get_weather\", \"description\": \"Get the current weather for a location.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"location\": {\"type\": \"string\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"location\", \"unit\"], \"additionalProperties\": false}}\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n<｜User｜>What is the current temperature in Paris? Call get_weather with location Paris and unit celsius.<｜Assistant｜><think>",
+  "chat": {
+    "id": "chatcmpl-2d78ad59743c70ae44d04750",
+    "object": "chat.completion",
+    "created": 1793447185,
+    "model": "ds41-native-smoke",
+    "system_fingerprint": "radiance-1.15.0",
+    "choices": [
+      {
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "I'll check the current weather in Paris for you.",
+          "tool_calls": [
+            {
+              "id": "call_988a3e5195bdadcad3964f24",
+              "type": "function",
+              "function": {
+                "name": "get_weather",
+                "arguments": "{\"location\":\"Paris\",\"unit\":\"celsius\"}"
+              }
+            }
+          ]
+        },
+        "logprobs": {
+          "content": [
+            {
+              "id": 128822,
+              "token": "</think>",
+              "bytes": [
+                60,
+                47,
+                116,
+                104,
+                105,
+                110,
+                107,
+                62
+              ],
+              "logprob": -0.023237649351358414,
+              "top_logprobs": []
+            },
+            {
+              "id": 43,
+              "token": "I",
+              "bytes": [
+                73
+              ],
+              "logprob": -0.00954420305788517,
+              "top_logprobs": []
+            },
+            {
+              "id": 5922,
+              "token": "'ll",
+              "bytes": [
+                39,
+                108,
+                108
+              ],
+              "logprob": -0.00015911822265479714,
+              "top_logprobs": []
+            },
+            {
+              "id": 4085,
+              "token": " check",
+              "bytes": [
+                32,
+                99,
+                104,
+                101,
+                99,
+                107
+              ],
+              "logprob": -0.048807594925165176,
+              "top_logprobs": []
+            },
+            {
+              "id": 270,
+              "token": " the",
+              "bytes": [
+                32,
+                116,
+                104,
+                101
+              ],
+              "logprob": -0.0556909553706646,
+              "top_logprobs": []
+            },
+            {
+              "id": 2573,
+              "token": " current",
+              "bytes": [
+                32,
+                99,
+                117,
+                114,
+                114,
+                101,
+                110,
+                116
+              ],
+              "logprob": -0.10347140580415726,
+              "top_logprobs": []
+            },
+            {
+              "id": 9670,
+              "token": " weather",
+              "bytes": [
+                32,
+                119,
+                101,
+                97,
+                116,
+                104,
+                101,
+                114
+              ],
+              "logprob": -0.15082059800624847,
+              "top_logprobs": []
+            },
+            {
+              "id": 295,
+              "token": " in",
+              "bytes": [
+                32,
+                105,
+                110
+              ],
+              "logprob": -2.2649795937468298e-05,
+              "top_logprobs": []
+            },
+            {
+              "id": 11111,
+              "token": " Paris",
+              "bytes": [
+                32,
+                80,
+                97,
+                114,
+                105,
+                115
+              ],
+              "logprob": -7.53625840843597e-07,
+              "top_logprobs": []
+            },
+            {
+              "id": 362,
+              "token": " for",
+              "bytes": [
+                32,
+                102,
+                111,
+                114
+              ],
+              "logprob": -0.007175363600254059,
+              "top_logprobs": []
+            },
+            {
+              "id": 440,
+              "token": " you",
+              "bytes": [
+                32,
+                121,
+                111,
+                117
+              ],
+              "logprob": -3.058561048874253e-07,
+              "top_logprobs": []
+            },
+            {
+              "id": 339,
+              "token": ".\n\n",
+              "bytes": [
+                46,
+                10,
+                10
+              ],
+              "logprob": -0.00013119130744598806,
+              "top_logprobs": []
+            },
+            {
+              "id": 30,
+              "token": "<",
+              "bytes": [
+                60
+              ],
+              "logprob": -4.064034442308184e-09,
+              "top_logprobs": []
+            },
+            {
+              "id": 128825,
+              "token": "｜DSML｜",
+              "bytes": [
+                239,
+                189,
+                156,
+                68,
+                83,
+                77,
+                76,
+                239,
+                189,
+                156
+              ],
+              "logprob": -2.125013054410374e-09,
+              "top_logprobs": []
+            },
+            {
+              "id": 10699,
+              "token": " calls",
+              "bytes": [
+                32,
+                99,
+                97,
+                108,
+                108,
+                115
+              ],
+              "logprob": -9.917258125824446e-10,
+              "top_logprobs": []
+            },
+            {
+              "id": 1018,
+              "token": ">\n",
+              "bytes": [
+                62,
+                10
+              ],
+              "logprob": 0.0,
+              "top_logprobs": []
+            },
+            {
+              "id": 30,
+              "token": "<",
+              "bytes": [
+                60
+              ],
+              "logprob": -3.552713678800501e-13,
+              "top_logprobs": []
+            },
+            {
+              "id": 128825,
+              "token": "｜DSML｜",
+              "bytes": [
+                239,
+                189,
+                156,
+                68,
+                83,
+                77,
+                76,
+                239,
+                189,
+                156
+              ],
+              "logprob": -1.1731344784493558e-09,
+              "top_logprobs": []
+            },
+            {
+              "id": 34756,
+              "token": " invoke",
+              "bytes": [
+                32,
+                105,
+                110,
+                118,
+                111,
+                107,
+                101
+              ],
+              "logprob": -3.367972567502875e-12,
+              "top_logprobs": []
+            },
+            {
+              "id": 2329,
+              "token": " name",
+              "bytes": [
+                32,
+                110,
+                97,
+                109,
+                101
+              ],
+              "logprob": -2.5792701308091637e-12,
+              "top_logprobs": []
+            },
+            {
+              "id": 1281,
+              "token": "=\"",
+              "bytes": [
+                61,
+                34
+              ],
+              "logprob": -1.617124212316412e-10,
+              "top_logprobs": []
+            },
+            {
+              "id": 1133,
+              "token": "get",
+              "bytes": [
+                103,
+                101,
+                116
+              ],
+              "logprob": -6.195524520080653e-07,
+              "top_logprobs": []
+            },
+            {
+              "id": 65,
+              "token": "_",
+              "bytes": [
+                95
+              ],
+              "logprob": -7.246107713854144e-09,
+              "top_logprobs": []
+            },
+            {
+              "id": 50219,
+              "token": "weather",
+              "bytes": [
+                119,
+                101,
+                97,
+                116,
+                104,
+                101,
+                114
+              ],
+              "logprob": -1.984755471085009e-08,
+              "top_logprobs": []
+            },
+            {
+              "id": 3816,
+              "token": "\">\n",
+              "bytes": [
+                34,
+                62,
+                10
+              ],
+              "logprob": -3.161565231835084e-08,
+              "top_logprobs": []
+            },
+            {
+              "id": 30,
+              "token": "<",
+              "bytes": [
+                60
+              ],
+              "logprob": -4.263256414560601e-14,
+              "top_logprobs": []
+            },
+            {
+              "id": 128825,
+              "token": "｜DSML｜",
+              "bytes": [
+                239,
+                189,
+                156,
+                68,
+                83,
+                77,
+                76,
+                239,
+                189,
+                156
+              ],
+              "logprob": -1.4921397450962104e-13,
+              "top_logprobs": []
+            },
+            {
+              "id": 10767,
+              "token": " parameter",
+              "bytes": [
+                32,
+                112,
+                97,
+                114,
+                97,
+                109,
+                101,
+                116,
+                101,
+                114
+              ],
+              "logprob": -1.1018386203431874e-10,
+              "top_logprobs": []
+            },
+            {
+              "id": 2329,
+              "token": " name",
+              "bytes": [
+                32,
+                110,
+                97,
+                109,
+                101
+              ],
+              "logprob": -1.7195134205394424e-12,
+              "top_logprobs": []
+            },
+            {
+              "id": 1281,
+              "token": "=\"",
+              "bytes": [
+                61,
+                34
+              ],
+              "logprob": -1.3198047099649557e-09,
+              "top_logprobs": []
+            },
+            {
+              "id": 33182,
+              "token": "location",
+              "bytes": [
+                108,
+                111,
+                99,
+                97,
+                116,
+                105,
+                111,
+                110
+              ],
+              "logprob": -1.4234291256798315e-06,
+              "top_logprobs": []
+            },
+            {
+              "id": 4,
+              "token": "\"",
+              "bytes": [
+                34
+              ],
+              "logprob": -7.37898631086864e-11,
+              "top_logprobs": []
+            },
+            {
+              "id": 3418,
+              "token": " string",
+              "bytes": [
+                32,
+                115,
+                116,
+                114,
+                105,
+                110,
+                103
+              ],
+              "logprob": -1.0658141036401503e-13,
+              "top_logprobs": []
+            },
+            {
+              "id": 1281,
+              "token": "=\"",
+              "bytes": [
+                61,
+                34
+              ],
+              "logprob": -1.2789769243681803e-13,
+              "top_logprobs": []
+            },
+            {
+              "id": 11476,
+              "token": "true",
+              "bytes": [
+                116,
+                114,
+                117,
+                101
+              ],
+              "logprob": -7.105427357601002e-15,
+              "top_logprobs": []
+            },
+            {
+              "id": 3320,
+              "token": "\">",
+              "bytes": [
+                34,
+                62
+              ],
+              "logprob": -3.96399713054052e-09,
+              "top_logprobs": []
+            },
+            {
+              "id": 51119,
+              "token": "Paris",
+              "bytes": [
+                80,
+                97,
+                114,
+                105,
+                115
+              ],
+              "logprob": -4.698369195921259e-07,
+              "top_logprobs": []
+            },
+            {
+              "id": 1718,
+              "token": "</",
+              "bytes": [
+                60,
+                47
+              ],
+              "logprob": -2.8349401759442117e-07,
+              "top_logprobs": []
+            },
+            {
+              "id": 128825,
+              "token": "｜DSML｜",
+              "bytes": [
+                239,
+                189,
+                156,
+                68,
+                83,
+                77,
+                76,
+                239,
+                189,
+                156
+              ],
+              "logprob": -1.595168441781425e-10,
+              "top_logprobs": []
+            },
+            {
+              "id": 10767,
+              "token": " parameter",
+              "bytes": [
+                32,
+                112,
+                97,
+                114,
+                97,
+                109,
+                101,
+                116,
+                101,
+                114
+              ],
+              "logprob": -1.319975240221538e-10,
+              "top_logprobs": []
+            },
+            {
+              "id": 1018,
+              "token": ">\n",
+              "bytes": [
+                62,
+                10
+              ],
+              "logprob": -1.6129320101754274e-12,
+              "top_logprobs": []
+            },
+            {
+              "id": 30,
+              "token": "<",
+              "bytes": [
+                60
+              ],
+              "logprob": -2.4916650431805465e-07,
+              "top_logprobs": []
+            },
+            {
+              "id": 128825,
+              "token": "｜DSML｜",
+              "bytes": [
+                239,
+                189,
+                156,
+                68,
+                83,
+                77,
+                76,
+                239,
+                189,
+                156
+              ],
+              "logprob": -1.1566214652702911e-10,
+              "top_logprobs": []
+            },
+            {
+              "id": 10767,
+              "token": " parameter",
+              "bytes": [
+                32,
+                112,
+                97,
+                114,
+                97,
+                109,
+                101,
+                116,
+                101,
+                114
+              ],
+              "logprob": -2.9771740628348198e-12,
+              "top_logprobs": []
+            },
+            {
+              "id": 2329,
+              "token": " name",
+              "bytes": [
+                32,
+                110,
+                97,
+                109,
+                101
+              ],
+              "logprob": -5.044853423896711e-12,
+              "top_logprobs": []
+            },
+            {
+              "id": 1281,
+              "token": "=\"",
+              "bytes": [
+                61,
+                34
+              ],
+              "logprob": -5.8832938520936295e-12,
+              "top_logprobs": []
+            },
+            {
+              "id": 15165,
+              "token": "unit",
+              "bytes": [
+                117,
+                110,
+                105,
+                116
+              ],
+              "logprob": -4.20689616476011e-09,
+              "top_logprobs": []
+            },
+            {
+              "id": 4,
+              "token": "\"",
+              "bytes": [
+                34
+              ],
+              "logprob": -4.192202140984591e-13,
+              "top_logprobs": []
+            },
+            {
+              "id": 3418,
+              "token": " string",
+              "bytes": [
+                32,
+                115,
+                116,
+                114,
+                105,
+                110,
+                103
+              ],
+              "logprob": -2.913225216616411e-13,
+              "top_logprobs": []
+            },
+            {
+              "id": 1281,
+              "token": "=\"",
+              "bytes": [
+                61,
+                34
+              ],
+              "logprob": -1.4210854715202004e-14,
+              "top_logprobs": []
+            },
+            {
+              "id": 11476,
+              "token": "true",
+              "bytes": [
+                116,
+                114,
+                117,
+                101
+              ],
+              "logprob": 0.0,
+              "top_logprobs": []
+            },
+            {
+              "id": 3320,
+              "token": "\">",
+              "bytes": [
+                34,
+                62
+              ],
+              "logprob": -1.2789769243681803e-13,
+              "top_logprobs": []
+            },
+            {
+              "id": 69,
+              "token": "c",
+              "bytes": [
+                99
+              ],
+              "logprob": -8.38624714560865e-07,
+              "top_logprobs": []
+            },
+            {
+              "id": 33030,
+              "token": "elsius",
+              "bytes": [
+                101,
+                108,
+                115,
+                105,
+                117,
+                115
+              ],
+              "logprob": -5.903117994421336e-10,
+              "top_logprobs": []
+            },
+            {
+              "id": 1718,
+              "token": "</",
+              "bytes": [
+                60,
+                47
+              ],
+              "logprob": -1.801421234404188e-09,
+              "top_logprobs": []
+            },
+            {
+              "id": 128825,
+              "token": "｜DSML｜",
+              "bytes": [
+                239,
+                189,
+                156,
+                68,
+                83,
+                77,
+                76,
+                239,
+                189,
+                156
+              ],
+              "logprob": -1.481481604059809e-11,
+              "top_logprobs": []
+            },
+            {
+              "id": 10767,
+              "token": " parameter",
+              "bytes": [
+                32,
+                112,
+                97,
+                114,
+                97,
+                109,
+                101,
+                116,
+                101,
+                114
+              ],
+              "logprob": -2.2072299543651752e-10,
+              "top_logprobs": []
+            },
+            {
+              "id": 1018,
+              "token": ">\n",
+              "bytes": [
+                62,
+                10
+              ],
+              "logprob": -3.126388037344441e-13,
+              "top_logprobs": []
+            },
+            {
+              "id": 1718,
+              "token": "</",
+              "bytes": [
+                60,
+                47
+              ],
+              "logprob": -6.494360604847316e-11,
+              "top_logprobs": []
+            },
+            {
+              "id": 128825,
+              "token": "｜DSML｜",
+              "bytes": [
+                239,
+                189,
+                156,
+                68,
+                83,
+                77,
+                76,
+                239,
+                189,
+                156
+              ],
+              "logprob": -3.529976311256178e-11,
+              "top_logprobs": []
+            },
+            {
+              "id": 34756,
+              "token": " invoke",
+              "bytes": [
+                32,
+                105,
+                110,
+                118,
+                111,
+                107,
+                101
+              ],
+              "logprob": -7.105427357601002e-13,
+              "top_logprobs": []
+            },
+            {
+              "id": 1018,
+              "token": ">\n",
+              "bytes": [
+                62,
+                10
+              ],
+              "logprob": -1.4985346297180513e-11,
+              "top_logprobs": []
+            },
+            {
+              "id": 1718,
+              "token": "</",
+              "bytes": [
+                60,
+                47
+              ],
+              "logprob": -4.67108793600346e-06,
+              "top_logprobs": []
+            },
+            {
+              "id": 128825,
+              "token": "｜DSML｜",
+              "bytes": [
+                239,
+                189,
+                156,
+                68,
+                83,
+                77,
+                76,
+                239,
+                189,
+                156
+              ],
+              "logprob": -6.799254492761975e-10,
+              "top_logprobs": []
+            },
+            {
+              "id": 10699,
+              "token": " calls",
+              "bytes": [
+                32,
+                99,
+                97,
+                108,
+                108,
+                115
+              ],
+              "logprob": -1.5980106127244653e-11,
+              "top_logprobs": []
+            },
+            {
+              "id": 32,
+              "token": ">",
+              "bytes": [
+                62
+              ],
+              "logprob": -4.476419235288631e-13,
+              "top_logprobs": []
+            },
+            {
+              "id": 1,
+              "token": "",
+              "bytes": [],
+              "logprob": 0.0,
+              "top_logprobs": []
+            }
+          ]
+        },
+        "finish_reason": "tool_calls"
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 356,
+      "completion_tokens": 67,
+      "total_tokens": 423,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      },
+      "completion_tokens_details": {
+        "reasoning_tokens": 1
+      }
+    },
+    "timings": {
+      "cache_n": 0,
+      "prompt_n": 356,
+      "prompt_ms": 9522.336929,
+      "prompt_per_token_ms": 26.748137441011234,
+      "prompt_per_second": 37.38578068119102,
+      "predicted_n": 67,
+      "predicted_ms": 2463.5895649999998,
+      "predicted_per_token_ms": 37.32711462121212,
+      "predicted_per_second": 26.79017679635285,
+      "ttft_ms": 9524.039211,
+      "total_ms": 11987.628776
+    }
+  },
+  "error": "{'role': 'assistant', 'content': \"I'll check the current weather in Paris for you.\", 'tool_calls': [{'id': 'call_988a3e5195bdadcad3964f24', 'type': 'function', 'function': {'name': 'get_weather', 'arguments': '{\"location\":\"Paris\",\"unit\":\"celsius\"}'}}]}"
+}

@@ -5,6 +5,7 @@
 #include "place/readahead.h"
 
 #include <algorithm>
+#include <climits>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
@@ -57,7 +58,85 @@ bool parse_tunables(const std::function<const char*(const char*)>& get, Tunables
             return false;
         }
     }
+    const char* span = get(kSwigluSpanEnv);
+    const int ss = ds41p1::env_state(span);
+    if (ss < 0) {
+        if (why) *why = std::string(kSwigluSpanEnv) + "=" + span + ": 1 is on, 0 / unset / empty off";
+        return false;
+    }
+    r.swiglu_span = ss == 1;
     *t = r;
+    return true;
+}
+
+bool swiglu_span_launch_ok(const RadKernelInfo* row, RadLaunchFn launch) {
+    return row && row->name && row->op && row->domain == RAD_DOMAIN_DEVICE && launch &&
+           !std::strcmp(row->name, "swiglu_clamped_bf16") && !std::strcmp(row->op, "swiglu_clamped") &&
+           row->launch == launch && !row->init && !row->scratch;
+}
+
+bool wave_swiglu_span(const int32_t* counts, int n, const void* const* gu, const void* const* dn,
+                     int64_t rows, SwigluSpan* out) {
+    if (!counts || n < 1 || n > 96 || !gu || !dn || rows < 0 || !out) return false;
+    int64_t off = 0;
+    SwigluSpan s{ rows, 0 };
+    for (int e = 0; e < n; ++e) {
+        if (counts[e] < 0 || counts[e] > rows - off || ds41p1::is_skip(gu[e]) != ds41p1::is_skip(dn[e]))
+            return false;
+        const int64_t hi = off + counts[e];
+        if (!ds41p1::is_skip(gu[e]) && hi > off) {
+            s.lo = std::min(s.lo, off);
+            s.hi = hi;
+        }
+        off = hi;
+    }
+    *out = s.hi > s.lo ? s : SwigluSpan{};
+    return true;
+}
+
+bool swiglu_span_view(const RadArgs* full, SwigluSpan span, std::vector<RadTensor>* tensors,
+                      std::vector<RadParam>* params, RadArgs* out) {
+    if (!full || !tensors || !params || !out || full->n_t != 2 || !full->t || full->n_p < 0 ||
+        (full->n_p && !full->p) || full->instance || full->scratch_bytes != 0)
+        return false;
+    long long n = 0;
+    if (!rad_args_geti(full, "n", &n) || n < 1 || n > INT_MAX / 2) return false;
+    const RadTensor& gu = full->t[0];
+    const RadTensor& y = full->t[1];
+    const int64_t rows = y.shape[0];
+    if (gu.dtype != RAD_BF16 || y.dtype != RAD_BF16 || gu.rank != 2 || y.rank != 2 ||
+        rows < 1 || rows > 65535 || gu.shape[0] != rows || gu.shape[1] != 2 * n || y.shape[1] != n ||
+        gu.stride[1] != 1 || y.stride[1] != 1 || gu.stride[0] < 2 * n || y.stride[0] < n ||
+        !gu.data || !y.data || ((uintptr_t)gu.data & 1) || ((uintptr_t)y.data & 1) ||
+        span.lo < 0 || span.hi < span.lo || span.hi > rows)
+        return false;
+    /* Bound byte arithmetic before rebasing the opaque device pointers. Disjoint operands are the
+     * served graph's form; an overlapping view has no proven cross-row replay contract. */
+    uintptr_t end[2];
+    for (int k = 0; k < 2; ++k) {
+        const RadTensor& t = full->t[k];
+        if (t.stride[0] > INT64_MAX / 2 / rows) return false;
+        const uint64_t bytes = (uint64_t)((rows - 1) * t.stride[0] + t.shape[1]) * 2;
+        if (bytes > UINTPTR_MAX - (uintptr_t)t.data) return false;
+        if ((uint64_t)span.lo * t.stride[0] * 2 > UINTPTR_MAX - (uintptr_t)t.data) return false;
+        end[k] = (uintptr_t)t.data + bytes;
+    }
+    if ((uintptr_t)gu.data < end[1] && (uintptr_t)y.data < end[0]) return false;
+    std::vector<RadTensor> ts(full->t, full->t + 2);
+    std::vector<RadParam> ps;
+    if (full->n_p) ps.assign(full->p, full->p + full->n_p);
+    for (RadTensor& t : ts) {
+        t.data = (void*)((uintptr_t)t.data + (uint64_t)span.lo * t.stride[0] * 2);
+        t.shape[0] = span.hi - span.lo;
+    }
+    for (RadParam& p : ps)
+        if (p.kind == RAD_P_INT && p.key && !std::strcmp(p.key, "M")) p.ival = span.hi - span.lo;
+    RadArgs a = *full;
+    *tensors = std::move(ts);
+    *params = std::move(ps);
+    a.t = tensors->data();
+    a.p = params->empty() ? nullptr : params->data();
+    *out = a;
     return true;
 }
 
@@ -587,6 +666,9 @@ int CardExpertPath::init(Mover* mover, const Tunables& t, int rank, PlanesGet pl
     reader_ = std::thread(&CardExpertPath::reader_loop, this);
     packer_ = std::thread(&CardExpertPath::packer_loop, this);
     on_ = true;
+    if (t_.swiglu_span)
+        RAD_INFO("ds41 p1: rank %d's wave SwiGLU spans on (%s=1; known stateless row and synchronized counts, "
+                 "full replay otherwise)", rank_, kSwigluSpanEnv);
     return RAD_OK;
 }
 
@@ -633,7 +715,9 @@ int CardExpertPath::wave(int parity, int w, const void* const* gu_tab, const voi
     std::memcpy(pin + 96, dn_tab, 96 * sizeof(void*));
     rad_dev_host_wrote();
     RAD_TRY(rad_memcpy_async(dev, pin, 2 * 96 * (int64_t)sizeof(void*), s_));
-    /* gate_up and down with the wave's table in their weight operand, the SwiGLU as captured. */
+    /* gate_up and down with the wave's table in their weight operand. With the span switch, only the
+     * known stateless SwiGLU row may narrow: every gap is idempotent and the tail was done by the
+     * original launch. The gate_up/down keep their full sorted operands and global offsets. */
     for (int k = 0; k < 3; ++k) {
         Cap& c = cap_[k];
         RadArgs a = c.a;
@@ -641,6 +725,20 @@ int CardExpertPath::wave(int parity, int w, const void* const* gu_tab, const voi
         if (k != 1) t[1].data = (void*)(k == 0 ? dev : dev + 96);
         a.t = t.data();
         a.p = c.p.empty() ? nullptr : c.p.data();
+        std::vector<RadParam> p;
+        if (k == 1 && t_.swiglu_span) {
+            SwigluSpan span;
+            if (c.t.size() >= 2 && c.t[1].shape[0] > 0) c_.swiglu_full_rows += (uint64_t)c.t[1].shape[0];
+            if (c.swiglu_span_ok && layer_counts_ok_ && c.t.size() == 2 &&
+                wave_swiglu_span(layer_counts_.data(), n, gu_tab, dn_tab, c.t[1].shape[0], &span) &&
+                swiglu_span_view(&a, span, &t, &p, &a)) {
+                ++c_.swiglu_spans;
+                c_.swiglu_rows += (uint64_t)(span.hi - span.lo);
+                if (span.hi == span.lo) continue;   /* the wave has no local rows */
+            } else {
+                ++c_.swiglu_fallbacks;
+            }
+        }
         const int rc = c.fn(&a, s_);
         if (rc < 0) {
             RAD_ERR("ds41 p1: rank %d's wave %d of routed layer %d: relaunching %s failed (%d)", rank_, w, li_,
@@ -666,7 +764,7 @@ void CardExpertPath::release(Kind k, int32_t handle) {
     cv_pack_.notify_all();
 }
 
-int CardExpertPath::capture(int which, const RadArgs* a, LaunchFn fn) {
+int CardExpertPath::capture(int which, const RadArgs* a, LaunchFn fn, bool swiglu_span_ok) {
     if (which < 0 || which > 2 || !a || !fn || !pass_) return RAD_E_STATE;
     Cap& c = cap_[which];
     if (c.ok) {
@@ -686,6 +784,7 @@ int CardExpertPath::capture(int which, const RadArgs* a, LaunchFn fn) {
         return RAD_E_STATE;
     }
     c.fn = fn;
+    c.swiglu_span_ok = which == 1 && swiglu_span_ok && !a->instance;
     c.a = *a;
     c.t.assign(a->t, a->t + a->n_t);
     c.p.assign(a->p, a->p + a->n_p);
@@ -712,13 +811,15 @@ int CardExpertPath::begin_pass(int64_t rows, const RadEvent* hand_over, int n_ha
     return RAD_OK;
 }
 
-int CardExpertPath::begin_layer(int32_t li, int parity) {
+int CardExpertPath::begin_layer(int32_t li, int parity, const int32_t* counts, int n_counts) {
     if (!pass_) return RAD_E_STATE;
     if (st_.layer_open()) {
         RAD_ERR("ds41 p1: routed layer %d began before layer %d's waves ran", li, li_);
         return RAD_E_STATE;
     }
     li_ = li;
+    layer_counts_ok_ = t_.swiglu_span && counts && n_counts >= (int)layer_counts_.size();
+    if (layer_counts_ok_) std::copy_n(counts, layer_counts_.size(), layer_counts_.begin());
     for (Cap& c : cap_) c.ok = false;
     {
         std::lock_guard<std::mutex> lk(mu_);
@@ -1330,6 +1431,12 @@ std::string CardExpertPath::stats_line(int rank) const {
                   c_.packed_units, c_.block_units, (double)c_.ready_wait_ns * 1e-9, c_.admitted, c_.leases_at_end,
                   c_.verified, c_.differ, c_.verify_skipped);
     std::string line = buf;
+    if (t_.swiglu_span) {
+        std::snprintf(buf, sizeof buf, "; wave SwiGLU spans %" PRIu64 ", rows %" PRIu64 " of %" PRIu64
+                      ", full-replay fallbacks %" PRIu64, c_.swiglu_spans, c_.swiglu_rows,
+                      c_.swiglu_full_rows, c_.swiglu_fallbacks);
+        line += buf;
+    }
     if (lending()) {
         const RingLender::Stats& l = lend_.stats();
         std::snprintf(buf, sizeof buf,

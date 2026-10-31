@@ -21,8 +21,10 @@
  *     again, in waves of a few ring units, each with its own expert table: the wave's units name
  *     their ring slots (kMarkPacked where packed) and every other entry carries kMarkSkip. The same
  *     kernels and arguments as the plugin's launch, so the rows are the decode band's bits (T1).
- * The SwiGLU relaunch runs over all of the layer's slots each wave: the rows already computed come
- * out the same from their unchanged gate_up rows, so it is idempotent.
+ * The SwiGLU relaunch normally runs over all of the layer's slots each wave: the rows already
+ * computed come out the same from their unchanged gate_up rows. The default-off SWIGLU_SPAN
+ * switch narrows the known row-elementwise, stateless SwiGLU to the covering sorted-slot span of
+ * the wave's experts. Gaps still recompute from unchanged gate_up rows; rows outside stay untouched.
  *
  * ---- why after the down projection, not at the gather ------------------------------------------
  *
@@ -72,6 +74,7 @@ namespace rad {
 namespace p1 {
 
 /* ---- tunables ----------------------------------------------------------------------------------- */
+inline constexpr const char* kSwigluSpanEnv = "RADIANCE_EXPERIMENTAL_DS41_P1_SWIGLU_SPAN";
 struct Tunables {
     int  wave = ds41p1::kDefWave;
     int  inflight = ds41p1::kDefInflight;
@@ -83,11 +86,26 @@ struct Tunables {
     int  lend_arena = 0;
     int  grace_ms = ds41p1::kDefGraceMs;
     bool align_end = true;
+    bool swiglu_span = false;
 };
 /* The tunables from `get` (getenv for the engine): each a whole number in its range (wave 1-16,
  * inflight 1-64, ready 1-32, ahead 0-64, verify 0-4096, min_rows 17-4096, lend 0-64, lend_arena 0-64,
- * grace_ms 0-60000), align "end" or "start". False with the reason on anything else. */
+ * grace_ms 0-60000), align "end" or "start", swiglu_span 0/off or 1/on (default off).
+ * False with the reason on anything else. */
 bool parse_tunables(const std::function<const char*(const char*)>& get, Tunables* t, std::string* why);
+
+/* The wave's live sorted slots, from ALL local experts' synchronized counts (their exclusive
+ * prefix is scatter's expert_offset). Empty live waves return [0,0); invalid counts or mismatched
+ * skip marks refuse the slice. No resident/cache-size assumption is involved. */
+struct SwigluSpan { int64_t lo = 0, hi = 0; };
+bool swiglu_span_launch_ok(const RadKernelInfo* row, RadLaunchFn launch);
+bool wave_swiglu_span(const int32_t* counts, int n, const void* const* gu, const void* const* dn,
+                     int64_t rows, SwigluSpan* out);
+/* A view for the known stateless swiglu_clamped_bf16 row: retain pitches, columns, n and limit;
+ * rebase both bf16 pointers by lo rows and reduce shape[0] and M. The caller skips an empty view.
+ * Unsupported layouts leave the outputs alone and take the original full replay instead. */
+bool swiglu_span_view(const RadArgs* full, SwigluSpan span, std::vector<RadTensor>* tensors,
+                      std::vector<RadParam>* params, RadArgs* out);
 
 /* ---- the scheduling -------------------------------------------------------------------------------- */
 
@@ -347,7 +365,7 @@ public:
 
     /* A routed layer: its units, then start (RAM copies, demand reads posted), then the launches of
      * its three ops captured, then run (the waves) behind the down projection on `s`. */
-    int  begin_layer(int32_t li, int parity);
+    int  begin_layer(int32_t li, int parity, const int32_t* counts = nullptr, int n_counts = 0);
     /* A cached unit, borrowed (touch: with the LRU touch an admitted unit gets): false when the RAM
      * cache does not hold it (the caller adds it as a drive miss then). */
     int  add_ram(int e, int32_t unit, int rows, bool touch, bool* hit);
@@ -358,7 +376,7 @@ public:
     int  start();
     /* Layer li + 1's likely misses, read after this layer's demand reads (up to `ahead`). */
     int  read_ahead(int32_t next_li, const std::vector<int32_t>& units);
-    int  capture(int which, const RadArgs* a, LaunchFn fn);   /* 0 gate_up, 1 SwiGLU, 2 down */
+    int  capture(int which, const RadArgs* a, LaunchFn fn, bool swiglu_span_ok = false);   /* 0 gate_up, 1 SwiGLU, 2 down */
     bool captured() const { return cap_[0].ok && cap_[1].ok && cap_[2].ok; }
     /* A captured launch's operands (0 gate_up, 2 down), for the host verify; null when not captured. */
     const RadTensor* captured_operands(int which, int* n) const {
@@ -412,6 +430,7 @@ public:
         uint64_t wait_drive_ns = 0, pack_ns = 0, packed_units = 0, block_units = 0, ready_wait_ns = 0;
         uint64_t admitted = 0, leases_at_end = 0;
         uint64_t verified = 0, differ = 0, verify_skipped = 0;   /* FileStager::p1_verify's */
+        uint64_t swiglu_spans = 0, swiglu_rows = 0, swiglu_full_rows = 0, swiglu_fallbacks = 0;
         /* The lent ring's reloads: from the RAM cache, read from the drive (and the reload thread's
          * time in them), failed reads. */
         uint64_t lend_ram = 0, lend_drive = 0, lend_drive_ns = 0, lend_read_failed = 0;
@@ -432,6 +451,7 @@ private:
     };
     struct Cap {
         bool ok = false;
+        bool swiglu_span_ok = false;
         LaunchFn fn = nullptr;
         RadArgs a{};
         std::vector<RadTensor> t;
@@ -452,6 +472,8 @@ private:
     void**     tab_pin_ = nullptr;   /* [2][96 waves][2][96] */
     void**     tab_dev_ = nullptr;
     Cap        cap_[3];
+    std::array<int32_t, 96> layer_counts_{};
+    bool       layer_counts_ok_ = false;
     int64_t    rows_ = 0;
     int32_t    li_ = -1;
     std::chrono::steady_clock::time_point t_pass_{};

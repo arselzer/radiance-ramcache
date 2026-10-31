@@ -380,6 +380,7 @@ TEST(p1_tunables_take_whole_numbers_in_range_and_end_or_start) {
     CHECK_EQ(t.ahead, ds41p1::kDefAhead);
     CHECK_EQ(t.verify, 0);
     CHECK(t.align_end);
+    CHECK(!t.swiglu_span);
     env[ds41p1::kWaveEnv] = "4";
     env[ds41p1::kAheadEnv] = "0";
     env[ds41p1::kAlignEnv] = "start";
@@ -414,6 +415,188 @@ TEST(p1_tunables_take_whole_numbers_in_range_and_end_or_start) {
         CHECK(!parse_tunables(get, &t, &why));
         CHECK(why.find(ds41p1::kMinRowsEnv) != std::string::npos);
         CHECK(why.find("17 to 4096") != std::string::npos);
+    }
+}
+
+TEST(p1_swiglu_span_switch_is_default_off_and_accepts_only_zero_or_one) {
+    std::string value;
+    bool set = false;
+    auto get = [&](const char* k) -> const char* {
+        return set && !std::strcmp(k, kSwigluSpanEnv) ? value.c_str() : nullptr;
+    };
+    Tunables t;
+    std::string why;
+    REQUIRE(parse_tunables(get, &t, &why));
+    CHECK(!t.swiglu_span);
+    set = true;
+    for (const char* v : { "", "0", "1" }) {
+        value = v;
+        REQUIRE(parse_tunables(get, &t, &why));
+        CHECK_EQ(t.swiglu_span, value == "1");
+    }
+    for (const char* v : { "2", "01", "yes", "-1", "1 " }) {
+        value = v;
+        CHECK(!parse_tunables(get, &t, &why));
+        CHECK(why.find(kSwigluSpanEnv) != std::string::npos);
+    }
+}
+
+TEST(p1_swiglu_span_launch_guard_keeps_unknown_stateful_and_scratch_rows_full) {
+    RadKernelInfo row{};
+    row.name = "swiglu_clamped_bf16"; row.op = "swiglu_clamped"; row.domain = RAD_DOMAIN_DEVICE;
+    const RadLaunchFn launch = +[](const RadArgs*, RadStream) -> int { return RAD_OK; };
+    row.launch = launch;
+    CHECK(swiglu_span_launch_ok(&row, launch));
+    CHECK(!swiglu_span_launch_ok(nullptr, launch));
+    CHECK(!swiglu_span_launch_ok(&row, nullptr));
+    CHECK(!swiglu_span_launch_ok(&row, +[](const RadArgs*, RadStream) -> int { return RAD_E_INVAL; }));
+    RadKernelInfo bad = row;
+    bad.name = "another_swiglu";
+    CHECK(!swiglu_span_launch_ok(&bad, launch));
+    bad = row; bad.op = "silu_mul";
+    CHECK(!swiglu_span_launch_ok(&bad, launch));
+    bad = row; bad.domain = RAD_DOMAIN_HOST;
+    CHECK(!swiglu_span_launch_ok(&bad, launch));
+    bad = row;
+    bad.init = +[](const RadParam*, int, int, int, void**) -> int { return RAD_OK; };
+    CHECK(!swiglu_span_launch_ok(&bad, launch));
+    bad = row;
+    bad.scratch = +[](const RadArgs*) -> int64_t { return 0; };
+    CHECK(!swiglu_span_launch_ok(&bad, launch));
+}
+
+TEST(p1_swiglu_wave_span_includes_resident_gaps_last_expert_and_excludes_tail) {
+    const int32_t counts[6] = { 2, 0, 3, 4, 0, 2 };
+    const void* skip = ds41p1::mark(g_alias, ds41p1::kMarkSkip);
+    std::vector<const void*> gu(6, skip), dn(6, skip);
+    auto live = [&](int e) { gu[(size_t)e] = dn[(size_t)e] = ds41p1::mark(g_alias, ds41p1::kMarkPacked); };
+    SwigluSpan span;
+    live(2);
+    live(5);
+    REQUIRE(wave_swiglu_span(counts, 6, gu.data(), dn.data(), 14, &span));
+    CHECK_EQ(span.lo, int64_t(2));
+    CHECK_EQ(span.hi, int64_t(11));   /* resident expert 3's gap included; three tail rows excluded */
+    gu[2] = dn[2] = skip;
+    REQUIRE(wave_swiglu_span(counts, 6, gu.data(), dn.data(), 14, &span));
+    CHECK_EQ(span.lo, int64_t(9));
+    CHECK_EQ(span.hi, int64_t(11));
+    gu[5] = dn[5] = skip;
+    live(1);   /* an unskipped expert with no rows is still an empty wave */
+    REQUIRE(wave_swiglu_span(counts, 6, gu.data(), dn.data(), 14, &span));
+    CHECK_EQ(span.lo, int64_t(0));
+    CHECK_EQ(span.hi, int64_t(0));
+    dn[1] = skip;
+    CHECK(!wave_swiglu_span(counts, 6, gu.data(), dn.data(), 14, &span));
+    gu[1] = skip;
+    CHECK(!wave_swiglu_span(counts, 6, gu.data(), dn.data(), 10, &span));
+    int32_t bad[6] = { 2, 0, -1, 4, 0, 2 };
+    CHECK(!wave_swiglu_span(bad, 6, gu.data(), dn.data(), 14, &span));
+}
+
+TEST(p1_swiglu_span_views_keep_pitches_parameters_and_full_replay_fallbacks) {
+    std::vector<uint16_t> g(17 * 10), y(17 * 7);
+    RadTensor ts[2]{};
+    for (int k = 0; k < 2; ++k) {
+        ts[k].rank = 2;
+        ts[k].dtype = RAD_BF16;
+        ts[k].shape[0] = 17;
+        ts[k].shape[1] = k ? 4 : 8;
+        ts[k].stride[0] = k ? 7 : 10;
+        ts[k].stride[1] = 1;
+        ts[k].data = k ? (void*)y.data() : (void*)g.data();
+    }
+    RadParam ps[] = { RAD_INT("M", 17), RAD_INT("n", 4), RAD_F64("limit", 10), RAD_STR("dtype", "bf16") };
+    RadArgs full{};
+    full.t = ts; full.n_t = 2; full.p = ps; full.n_p = 4; full.rank = 2; full.world_size = 4;
+    std::vector<RadTensor> view;
+    std::vector<RadParam> p;
+    RadArgs a{};
+    REQUIRE(swiglu_span_view(&full, { 3, 16 }, &view, &p, &a));
+    CHECK(view[0].data == g.data() + 3 * 10);
+    CHECK(view[1].data == y.data() + 3 * 7);
+    CHECK_EQ(view[0].stride[0], int64_t(10));
+    CHECK_EQ(view[1].stride[0], int64_t(7));
+    CHECK_EQ(view[0].shape[0], int64_t(13));
+    CHECK_EQ(view[1].shape[1], int64_t(4));
+    CHECK_EQ(p[0].ival, 13);
+    CHECK_EQ(p[1].ival, 4);
+    CHECK_EQ(p[2].dval, 10.0);
+    CHECK(!std::strcmp(p[3].sval, "bf16"));
+    CHECK_EQ(a.rank, 2); CHECK_EQ(a.world_size, 4);
+    CHECK_EQ(ts[0].shape[0], int64_t(17));
+    CHECK_EQ(ps[0].ival, 17);
+    REQUIRE(swiglu_span_view(&full, { 0, 0 }, &view, &p, &a));
+    CHECK_EQ(view[0].shape[0], int64_t(0));   /* caller skips, never launches M=0 */
+    for (int bad = 0; bad < 9; ++bad) {
+        RadTensor tbad[2] = { ts[0], ts[1] };
+        RadArgs b = full;
+        b.t = tbad;
+        if (bad == 0) tbad[0].stride[1] = 2;
+        if (bad == 1) tbad[1].stride[0] = 3;
+        if (bad == 2) tbad[1].shape[0] = 16;
+        if (bad == 3) tbad[0].dtype = RAD_F16;
+        if (bad == 4) b.instance = (void*)(uintptr_t)1;
+        if (bad == 5) b.scratch_bytes = 4;
+        if (bad == 6) tbad[1].data = g.data();   /* overlapping operands */
+        if (bad == 7) tbad[0].stride[0] = INT64_MAX;
+        if (bad == 8) tbad[0].data = (char*)g.data() + 1;
+        const void* before = view[0].data;
+        CHECK(!swiglu_span_view(&b, { 3, 16 }, &view, &p, &a));
+        CHECK(view[0].data == before);   /* failed view cannot alter the full replay */
+    }
+    CHECK(!swiglu_span_view(&full, { -1, 1 }, &view, &p, &a));
+    CHECK(!swiglu_span_view(&full, { 16, 18 }, &view, &p, &a));
+}
+
+TEST(p1_swiglu_span_composition_preserves_ready_skipped_padding_and_tail_rows_in_many_waves) {
+    std::array<int32_t, 96> counts;
+    int rows = 5;   /* other ranks' tail */
+    for (int e = 0; e < 96; ++e) { counts[(size_t)e] = e % 4; rows += e % 4; }
+    constexpr int n = 4, gp = 12, yp = 7, guard = 8;
+    std::vector<uint16_t> g((size_t)rows * gp + 2 * guard, 0x7777),
+                          y((size_t)rows * yp + 2 * guard, 0xA55A), ref = y;
+    RadTensor ts[2]{};
+    for (int k = 0; k < 2; ++k) {
+        ts[k].data = k ? (void*)(y.data() + guard) : (void*)(g.data() + guard);
+        ts[k].dtype = RAD_BF16; ts[k].rank = 2;
+        ts[k].shape[0] = rows; ts[k].shape[1] = k ? n : 2 * n;
+        ts[k].stride[0] = k ? yp : gp; ts[k].stride[1] = 1;
+    }
+    RadParam ps[] = { RAD_INT("M", rows), RAD_INT("n", n), RAD_F64("limit", 10) };
+    RadArgs full{};
+    full.t = ts; full.n_t = 2; full.p = ps; full.n_p = 3;
+    /* An integer row-local stand-in checks the actual view's byte addresses and untouched regions;
+     * the device wave test separately holds SwiGLU's floating-point expression to its full launch. */
+    auto transform = [&](const RadTensor& in, const RadTensor& out) {
+        for (int64_t r = 0; r < out.shape[0]; ++r)
+            for (int c = 0; c < n; ++c)
+                ((uint16_t*)out.data)[r * out.stride[0] + c] =
+                    (uint16_t)(((const uint16_t*)in.data)[r * in.stride[0] + c] ^ (uint16_t)(c * 37));
+    };
+    transform(ts[0], ts[1]);   /* initial resident launch also wrote skipped rows from their old G */
+    const void* skip = ds41p1::mark(g_alias, ds41p1::kMarkSkip);
+    for (int wave = 0; wave < 32; ++wave) {   /* only a few residents: every other expert is streamed */
+        std::vector<const void*> gu(96, skip), dn(96, skip);
+        int off = 0;
+        for (int e = 0; e < 96; ++e) {
+            if (e % 32 == wave) {
+                gu[(size_t)e] = dn[(size_t)e] = ds41p1::mark(g_alias, e % 2 ? ds41p1::kMarkPacked : 0);
+                for (int r = off; r < off + counts[(size_t)e]; ++r)
+                    for (int c = 0; c < 2 * n; ++c) g[(size_t)guard + (size_t)r * gp + c] = (uint16_t)(1000 + e + c);
+            }
+            off += counts[(size_t)e];
+        }
+        ref = y;
+        RadTensor expected = ts[1]; expected.data = ref.data() + guard;
+        transform(ts[0], expected);
+        SwigluSpan span;
+        REQUIRE(wave_swiglu_span(counts.data(), 96, gu.data(), dn.data(), rows, &span));
+        std::vector<RadTensor> view;
+        std::vector<RadParam> p;
+        RadArgs a{};
+        REQUIRE(swiglu_span_view(&full, span, &view, &p, &a));
+        if (span.hi > span.lo) transform(view[0], view[1]);
+        CHECK(y == ref);   /* exact ready/skipped rows, padding and both guards after every wave */
     }
 }
 

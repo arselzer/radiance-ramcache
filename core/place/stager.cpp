@@ -4923,7 +4923,9 @@ int FileStager::p1_layer(int32_t li, RadStream s) {
         return RAD_E_STATE;
     }
     for (int e = 0; e < 96 && e < counts_cap_; ++e) p1_touched_ += counts_host_[e] > 0;
-    RAD_TRY(p1_->begin_layer(li, b));
+    /* Scatter's offsets are the exclusive prefix of these same synchronized ALL-expert counts,
+     * including the residents. The optional wave SwiGLU view needs no extra device readback. */
+    RAD_TRY(p1_->begin_layer(li, b, counts_host_, counts_cap_));
     /* The admission: none in a pass whose rows stop short of the admission row; every unit when the row
      * is 0 (a prompt within the last N tokens, or ..._LCP_ADMIT=all); else by the sorted order
      * fetched with the counts (none without it). */
@@ -5016,7 +5018,18 @@ int FileStager::launched(rad_op h, RadStream, const RadArgs* a, int (*launch)(co
     const int32_t op = (int32_t)h;
     const int which = op == hx_ops_[li].gu ? 0 : op == p1_ops_[li].sw ? 1 : op == p1_ops_[li].dn ? 2 : -1;
     if (which < 0) return RAD_OK;
-    return p1_->capture(which, a, launch);
+    bool span_ok = false;
+    if (which == 1 && p1_->tunables().swiglu_span && ep_program_ && (size_t)h < ep_program_->ops.size() &&
+        a && a->n_t == 2 && a->t && ep_program_->ops[(size_t)h].ranged_key == "M") {
+        for (const Band& b : ep_program_->ops[(size_t)h].bands) {
+            if (a->t[1].shape[0] > b.hi) continue;
+            const Resolved& r = b.dom[RAD_DOMAIN_DEVICE];
+            const RadKernelInfo* ki = r && r.row ? r.row->info : nullptr;
+            span_ok = p1::swiglu_span_launch_ok(ki, launch);
+            break;
+        }
+    }
+    return p1_->capture(which, a, launch, span_ok);
 }
 
 int FileStager::after_op(rad_op h, RadStream s) {

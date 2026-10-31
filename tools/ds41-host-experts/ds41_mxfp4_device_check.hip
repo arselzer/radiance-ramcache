@@ -57,8 +57,9 @@
  *                                                      tokens over tables mixing block_mxfp4, packed and
  *                                                      skipped entries against the gemv in passes of 16 and
  *                                                      the host kernels, skipped rows untouched, the tail
- *                                                      zeros, other work splits and the stager's waves equal
- *                                                      to one launch; then "p1 time:" lines. Last line
+ *                                                      zeros, other work splits and the stager's full/span
+ *                                                      SwiGLU waves equal to one launch; pitched slices
+ *                                                      preserve guards and NaN payloads; then "p1 time:" lines. Last line
  *                                                      "p1: PASS ..." or "p1: FAIL ...".
  *   ds41_mxfp4_device_check LIBR4D.so sweep [trials]   the height sweep under EXACT_TALL, or under
  *                                                      RADIANCE_EXPERIMENTAL_DS41_LCP when that is in
@@ -2348,8 +2349,66 @@ void p1_rows(P1Ctx& c, const P1Routing& r, int M, std::mt19937_64& rng, bool spl
     }
 }
 
-/* The stager's wave composition at ds41's shapes against one launch over every expert. */
-void p1_waves(P1Ctx& c, const P1Routing& r, int M, std::mt19937_64& rng) {
+/* The same stateless SwiGLU launch on a row view; pitches stay in elements. Empty live waves
+ * enqueue no SwiGLU, as the stager's optional covering-span path does. */
+int p1_swiglu_slice(Launch f, hipStream_t s, void* gu, void* y, int rows, int n, int gp, int yp, int lo, int hi) {
+    if (lo < 0 || hi < lo || hi > rows) return RAD_E_SHAPE;
+    if (lo == hi) return RAD_OK;
+    RadTensor t[2] = { tensor((uint16_t*)gu + (int64_t)lo * gp, RAD_BF16, { hi - lo, 2 * n }),
+                       tensor((uint16_t*)y + (int64_t)lo * yp, RAD_BF16, { hi - lo, n }) };
+    t[0].stride[0] = gp; t[1].stride[0] = yp;
+    RadParam p[3] = { pi("M", hi - lo), pi("n", n), pf("limit", kLimit) };
+    RadArgs a{};
+    a.t = t; a.n_t = 2; a.p = p; a.n_p = 3;
+    return f(&a, (RadStream)s);
+}
+
+/* Pitch, guard and exact exceptional-value checks, including NaN payloads. This is small beside
+ * the full expert banks and checks every intermediate view, rather than only the final chain. */
+void p1_swiglu_views(P1Ctx& c) {
+    ++c.cases;
+    if (!c.L->swiglu) { ++c.bad; return; }
+    constexpr int rows = 19, n = 259, gp = 528, yp = 272, guard = 16;
+    std::vector<uint16_t> g((size_t)rows * gp + 2 * guard, 0x5AA5),
+                          initial((size_t)rows * yp + 2 * guard, 0xA55A), gold = initial;
+    const uint16_t edge[] = { 0x0000, 0x8000, 0x0001, 0x007F, 0x3F80, 0x7F80, 0xFF80, 0x7F81, 0x7FC1, 0xFFFF };
+    for (int r = 0; r < rows; ++r)
+        for (int j = 0; j < 2 * n; ++j)
+            g[(size_t)guard + (size_t)r * gp + j] = j < 20 ? edge[(r + j) % 10]
+                : (uint16_t)(r * 997 + j * 97);
+    Dev dg(g.size() * 2), dy(initial.size() * 2);
+    dg.put(g.data()); dy.put(initial.data());
+    auto run = [&](int lo, int hi) {
+        return p1_swiglu_slice(c.L->swiglu, c.s, (uint16_t*)dg.p + guard,
+                               (uint16_t*)dy.p + guard, rows, n, gp, yp, lo, hi);
+    };
+    int rc = run(0, rows);
+    HC(hipStreamSynchronize(c.s));
+    dy.get(gold.data());
+    dy.put(initial.data());
+    std::vector<uint16_t> expected = initial, got = initial;
+    size_t bad = 0;
+    const int spans[][2] = { { 3, 6 }, { 12, 19 }, { 0, 3 }, { 6, 12 }, { 9, 9 }, { 2, 14 } };
+    for (const auto& span : spans) {
+        rc |= run(span[0], span[1]);
+        HC(hipStreamSynchronize(c.s));
+        for (int r = span[0]; r < span[1]; ++r)
+            std::copy_n(gold.data() + guard + (size_t)r * yp, n,
+                         expected.data() + guard + (size_t)r * yp);
+        dy.get(got.data());
+        bad += count_diff(got.data(), expected.data(), got.size());
+    }
+    std::vector<uint16_t> g_after(g.size());
+    dg.get(g_after.data());
+    bad += count_diff(g.data(), g_after.data(), g.size());
+    std::printf("p1 SwiGLU views: pitched rows, gaps, empty/last/overlapping spans, NaN payloads and guards: "
+                "%zu values differ%s\n", bad, rc ? " (a launch was refused)" : "");
+    c.bad += bad + (rc ? 1 : 0);
+}
+
+/* The stager's full and covering-span wave composition at ds41's shapes against one launch over
+ * every expert. Most live units are streamed, so this also covers a small resident set. */
+void p1_waves(P1Ctx& c, const P1Routing& r, int M, std::mt19937_64& rng, bool small_cache = false) {
     ++c.cases;
     if (!c.L->swiglu) { std::printf("FAIL: the plugin has no r4d_rad_swiglu_clamped\n"); ++c.bad; return; }
     const P1Pass p = p1_pass(r, 0, M);
@@ -2368,46 +2427,60 @@ void p1_waves(P1Ctx& c, const P1Routing& r, int M, std::mt19937_64& rng) {
     std::vector<int> sub;
     for (int e = 0; e < kNe; ++e) {
         const bool live = p.off[(size_t)e + 1] > p.off[(size_t)e];
-        if ((live && rng() % 4 != 0) || (!live && rng() % 8 == 0)) sub.push_back(e);
+        if (small_cache ? e != 0 : (live && rng() % 4 != 0) || (!live && rng() % 8 == 0)) sub.push_back(e);
     }
     std::shuffle(sub.begin(), sub.end(), rng);
     Dev G((size_t)T * 2 * kFf * 2), S((size_t)T * kFf * 2), D((size_t)T * kEmbd * 2);
     Dev G2(G.n), S2(S.n), D2(D.n), tg(kNe * sizeof(void*)), td(kNe * sizeof(void*));
     for (Dev* d : { &G, &S, &D, &G2, &S2, &D2 }) HC(hipMemset(d->p, 0xAA, d->n));
-    auto chain = [&](const std::vector<int>& forms, Dev& g, Dev& sw, Dev& dn) {
+    auto chain = [&](const std::vector<int>& forms, Dev& g, Dev& sw, Dev& dn, int lo, int hi) {
         std::vector<void*> a = p1_table(c.gu, forms, c.noread), b = p1_table(c.dn, forms, c.noread);
         tg.put(a.data());
         td.put(b.data());
         int rc = p1_launch(c, c.p1, nullptr, d_x.p, M, kEmbd, tg.p, 2 * kFf, d_so.p, d_of.p, T, g.p, false);
-        rc |= run_swiglu(c.L->swiglu, c.s, g.p, sw.p, T, kFf);
+        rc |= p1_swiglu_slice(c.L->swiglu, c.s, g.p, sw.p, T, kFf, 2 * kFf, kFf, lo, hi);
         rc |= p1_launch(c, c.p1, nullptr, sw.p, T, kFf, td.p, kEmbd, d_so.p, d_of.p, T, dn.p, true);
         HC(hipStreamSynchronize(c.s));   /* the tables are rewritten next */
         return rc;
     };
-    int rc = chain(full_forms, G, S, D);
+    const int ref_rc = chain(full_forms, G, S, D, 0, T);
     std::vector<int> main_forms = full_forms;
     for (int e : sub) main_forms[(size_t)e] = 2;
-    rc |= chain(main_forms, G2, S2, D2);
-    int waves = 0;
-    for (size_t w0 = 0, sz = 1; w0 < sub.size(); w0 += sz, sz = sz % 3 + 1, ++waves) {
-        std::vector<int> wf(kNe, 2);
-        for (size_t j = w0; j < std::min(sub.size(), w0 + sz); ++j) wf[(size_t)sub[j]] = full_forms[(size_t)sub[j]];
-        rc |= chain(wf, G2, S2, D2);
+    for (bool spans : { false, true }) {
+        if (spans) ++c.cases;
+        for (Dev* d : { &G2, &S2, &D2 }) HC(hipMemset(d->p, 0xAA, d->n));
+        int rc = ref_rc | chain(main_forms, G2, S2, D2, 0, T);
+        int waves = 0;
+        for (size_t w0 = 0, sz = 1; w0 < sub.size(); w0 += sz, sz = sz % 3 + 1, ++waves) {
+            std::vector<int> wf(kNe, 2);
+            int lo = T, hi = 0;
+            for (size_t j = w0; j < std::min(sub.size(), w0 + sz); ++j) {
+                const int e = sub[j];
+                wf[(size_t)e] = full_forms[(size_t)e];
+                if (p.off[(size_t)e + 1] > p.off[(size_t)e]) {
+                    lo = std::min(lo, p.off[(size_t)e]);
+                    hi = std::max(hi, p.off[(size_t)e + 1]);
+                }
+            }
+            if (hi <= lo) lo = hi = 0;
+            rc |= chain(wf, G2, S2, D2, spans ? lo : 0, spans ? hi : T);
+        }
+        size_t d[3] = { 0, 0, 0 };
+        const Dev* a[3] = { &G, &S, &D };
+        const Dev* b[3] = { &G2, &S2, &D2 };
+        for (int i = 0; i < 3; ++i) {
+            std::vector<uint16_t> ha(a[i]->n / 2), hb(b[i]->n / 2);
+            a[i]->get(ha.data());
+            b[i]->get(hb.data());
+            d[i] = count_diff(ha.data(), hb.data(), ha.size());
+        }
+        std::printf("p1 waves M=%d %s rank %d, SwiGLU %s: %d local slots, %zu experts in %d waves of 1-3: "
+                    "%zu gate_up, %zu swiglu, %zu down values differ from one launch%s\n", M, r.name.c_str(), r.rank,
+                    spans ? "spans" : "full", p.local, sub.size(), waves,
+                    d[0], d[1], d[2], rc ? " (a launch was refused)" : "");
+        std::fflush(stdout);
+        c.bad += d[0] + d[1] + d[2] + (rc ? 1 : 0);
     }
-    size_t d[3] = { 0, 0, 0 };
-    const Dev* a[3] = { &G, &S, &D };
-    const Dev* b[3] = { &G2, &S2, &D2 };
-    for (int i = 0; i < 3; ++i) {
-        std::vector<uint16_t> ha(a[i]->n / 2), hb(b[i]->n / 2);
-        a[i]->get(ha.data());
-        b[i]->get(hb.data());
-        d[i] = count_diff(ha.data(), hb.data(), ha.size());
-    }
-    std::printf("p1 waves M=%d %s rank %d: %d local slots, %zu experts in %d waves of 1-3: %zu gate_up, %zu swiglu, "
-                "%zu down values differ from one launch%s\n", M, r.name.c_str(), r.rank, p.local, sub.size(), waves,
-                d[0], d[1], d[2], rc ? " (a launch was refused)" : "");
-    std::fflush(stdout);
-    c.bad += d[0] + d[1] + d[2] + (rc ? 1 : 0);
 }
 
 /* hipEvent time of `launch`, median of `reps` after a warm-up (us), or -1 when refused. */
@@ -2512,6 +2585,7 @@ int p1_check(const Lib& L, int mmax, const char* routes_path) {
     c.p1 = L.moe_p1;
     c.opts = L.moe_p1_opts;
     HC(hipStreamCreate(&c.s));
+    p1_swiglu_views(c);
     /* The weight under every skip mark: an address in the never-mapped first 64 KiB, so a read of it faults (T3:
      * the pointer under the mark need not be readable). */
     c.noread = (const void*)(uintptr_t)0x1000;
@@ -2554,6 +2628,19 @@ int p1_check(const Lib& L, int mmax, const char* routes_path) {
         if (M > mmax) continue;
         p1_waves(c, real ? p1_routing("real", M, 0, 12, rng) : p1_routing("skewed", M, 0, 0, rng), M, rng);
         if (M == 256) p1_waves(c, p1_routing("hot", M, 3, 0, rng), M, rng);
+    }
+    /* An explicit one-resident case: expert 0's ready rows lie before two distant streamed runs,
+     * the last local expert included. The second routing has only other ranks' slots, so every
+     * streamed wave is empty locally and the original tail zeros must survive unchanged. */
+    for (bool no_local : { false, true }) {
+        P1Routing edge;
+        edge.rank = 0;
+        edge.name = no_local ? "empty-local small-cache" : "last-expert small-cache";
+        edge.p.resize(17 * kTop);
+        const int ids[6] = { 0, 47, 95, 96, 192, 288 };
+        for (int t = 0; t < 17; ++t)
+            for (int k = 0; k < kTop; ++k) edge.p[(size_t)t * kTop + k] = no_local ? 96 + k : ids[k];
+        p1_waves(c, edge, 17, rng, true);
     }
     std::printf("p1: %d cases, %zu (token, slot) rows against 16-token passes, %zu against the host kernels, %zu NaN "
                 "pairs (any NaN equal), %zu bad values, %.0f s\n", c.cases, c.rows, c.host_rows, c.nan_pairs, c.bad,
@@ -2613,7 +2700,7 @@ int p1_check(const Lib& L, int mmax, const char* routes_path) {
                     c.bad, c.cases, c.bad ? "" : ", or the row table");
     else
         std::printf("p1: PASS: %s at M 17..%d: %zu rows equal to 16-token passes, skipped rows untouched, tail zeros, "
-                    "splits and waves of 1-3 equal to one launch (%d cases)\n", ds41p1::kTwinRow, Ms.back(), c.rows,
+                    "splits and full/span SwiGLU waves of 1-3 equal to one launch (%d cases)\n", ds41p1::kTwinRow, Ms.back(), c.rows,
                     c.cases);
     return rc;
 }

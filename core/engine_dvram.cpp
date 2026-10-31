@@ -33,7 +33,11 @@ namespace rad {
 int Engine::draft_vram_open() {
     if (draft_bank::Config::parse(std::getenv(draft_bank::kLendEnv),
             std::getenv(draft_bank::kBackupEnv), std::getenv(draft_bank::kGraceEnv),
-            std::getenv(draft_bank::kCooldownEnv), &draft_bank_config_) < 0) {
+            std::getenv(draft_bank::kCooldownEnv), &draft_bank_config_,
+            std::getenv(draft_bank::kPackedFillEnv)) < 0) {
+        const char* packed = std::getenv(draft_bank::kPackedFillEnv);
+        if (packed && std::strcmp(packed,"0"))
+            RAD_ERR("DSBANKPACK requires PACKED_FILL=1 together with BANK_LEND=1 and its valid explicit budget");
         RAD_ERR("DSBANKLEND invalid flag/budget/hysteresis: explicit flag=1 and positive BACKUP_MIB required");
         return RAD_E_INVAL;
     }

@@ -114,6 +114,8 @@ int Engine::draft_bank_lend_open() {
     DraftBankBackupBudget budget{};
     budget.backup_mib = draft_bank_config_.backup_cap / (1ll<<20);
     budget.controller_metadata_bytes = sizeof(DraftBankLoan) + DraftBankLoan::kSourceBound;
+    if (draft_bank_config_.packed_fill)
+        budget.controller_metadata_bytes += draft_bank_packed_fill::kCallMetadataBound;
     budget.system_headroom_bytes = std::max<int64_t>(cfg_.host_headroom_mib, 0) * (1ll<<20);
     for (int ri = 0; ri < kDraftRanks; ++ri) {
         Rank& r = *ranks_[(size_t)ri];
@@ -153,6 +155,10 @@ int Engine::draft_bank_lend_open() {
         (long long)s.cap_bytes, (long long)s.future_cache_bytes, (long long)s.system_headroom_bytes,
         (long long)draft_bank_config_.grace_ms, (long long)draft_bank_config_.cooldown_ms,
         (long long)DraftBankLoan::kSourceBound,(unsigned long long)l.startup_ns);
+    if (draft_bank_config_.packed_fill)
+        RAD_INFO("DSBANKPACK startup enabled=1 native_gu=4608x5120 native_dn=5120x2304 pair_bytes=%lld "
+                 "relay=backup_shared_pair extra_payload_bytes=0 call_metadata_bound=%lld leases=through_sync_copy",
+                 (long long)kDraftPairBytes, (long long)draft_bank_packed_fill::kCallMetadataBound);
     return RAD_OK;
 }
 
@@ -199,6 +205,8 @@ int Engine::draft_bank_lend_transition(const draft_bank::Work& w, draft_bank::Ac
          * arrivals cannot race this cohort because the scheduler lock is held. */
         for (int ri = 0; ri < kDraftRanks && rc >= 0; ++ri) {
             Rank& r = *ranks_[(size_t)ri];
+            const uint64_t hits_before=l.packed_hits, refusals_before=l.packed_refusals, misses_before=l.packed_misses;
+            const uint64_t ram_before=l.source_ram_bytes, file_before=l.source_drive_bytes, fill_before=l.fill_bytes;
             for (int i = 0; i < l.count[(size_t)ri] && rc >= 0; ++i) {
                 const int32_t u = l.target[(size_t)ri][(size_t)i];
                 const MoveUnit& m = r.plan.units[(size_t)u];
@@ -207,13 +215,34 @@ int Engine::draft_bank_lend_transition(const draft_bank::Work& w, draft_bank::Ac
                 std::memset(scratch, 0, (size_t)kDraftPairBytes);
                 Mover::HostUnit hu;
                 const bool borrowed = r.mover.borrow_host_unit(u, &hu, /*touch=*/false);
-                if (borrowed && !hu.packed && hu.n == 2) {
+                bool packed_ready = false;
+                if (draft_bank_config_.packed_fill && borrowed && hu.packed) {
+                    const int64_t inverse_t = bank_now_ns();
+                    const int prepared = draft_bank_packed_fill::prepare(r.program, r.plan, u, hu,
+                        scratch, (size_t)kDraftPairBytes, &l.packed_fill,
+                        [](void* p) noexcept { return static_cast<Mover*>(p)->source_epochs_current(); }, &r.mover);
+                    l.packed_inverse_ns += (uint64_t)(bank_now_ns() - inverse_t);
+                    if (prepared >= 0) {
+                        packed_ready = true;
+                        ++l.packed_hits;
+                        l.packed_source_bytes += l.packed_fill.source_bytes;
+                        l.packed_raw_bytes += l.packed_fill.raw_bytes;
+                    } else {
+                        ++l.packed_refusals;
+                        // The first inverse may have completed before the second refused.
+                        // Never copy a partial pair; the existing file relay fills a clean pair.
+                        std::memset(scratch, 0, (size_t)kDraftPairBytes);
+                        if (l.packed_fill.refusal == draft_bank_packed_fill::Refusal::Epoch ||
+                            !r.mover.source_epochs_current()) rc = RAD_E_STATE;
+                    }
+                } else if (draft_bank_config_.packed_fill && !borrowed) ++l.packed_misses;
+                if (!packed_ready && rc >= 0 && borrowed && !hu.packed && hu.n == 2) {
                     for (int k = 0; k < 2; ++k) {
                         if (!hu.host[k] || hu.bytes[k] != r.program.weights[m.weights[(size_t)k]].stored_bytes) { rc=RAD_E_STATE; break; }
                         std::memcpy(scratch + m.offset[(size_t)k], hu.host[k], (size_t)hu.bytes[k]);
                         l.source_ram_bytes += (uint64_t)hu.bytes[k];
                     }
-                } else {
+                } else if (!packed_ready && rc >= 0) {
                     // Packed CPU cache is never read as BLOCK: original source + exact relay.
                     l.source.unit = u;
                     PlaneExtent ext[2];
@@ -227,11 +256,26 @@ int Engine::draft_bank_lend_transition(const draft_bank::Work& w, draft_bank::Ac
                     if (rc >= 0) rc=r.mover.relay_unit_block(l.source,scratch,kDraftPairBytes);
                     if (rc >= 0) l.relay_bytes += (uint64_t)kDraftPairBytes;
                 }
-                if (borrowed) r.mover.release_host_unit(&hu);
+                // Preserve the flag0 path. Enabled packed fill retains BOTH leases even
+                // through file fallback and any synchronously failing H2D copy.
+                if (borrowed && !draft_bank_config_.packed_fill) r.mover.release_host_unit(&hu);
+                if (rc >= 0 && draft_bank_config_.packed_fill && !r.mover.source_epochs_current()) rc=RAD_E_STATE;
                 if (rc >= 0) rc=l.backup.device_io().copy_sync(ri,l.backup.slot(ri,i).base,scratch,kDraftPairBytes);
+                if (borrowed && draft_bank_config_.packed_fill) r.mover.release_host_unit(&hu);
+                if (rc >= 0 && draft_bank_config_.packed_fill && !r.mover.source_epochs_current()) rc=RAD_E_STATE;
                 if (rc >= 0) l.fill_bytes += (uint64_t)kDraftPairBytes;
             }
+            if (draft_bank_config_.packed_fill)
+                RAD_INFO("DSBANKPACK rank=%d epoch=%llu stage=fill packed_hits=%llu packed_refusals=%llu packed_misses=%llu "
+                    "raw_ram_bytes=%llu source_file_bytes=%llu whole_pair_fill_bytes=%llu status=%d",
+                    ri,(unsigned long long)epoch,(unsigned long long)(l.packed_hits-hits_before),
+                    (unsigned long long)(l.packed_refusals-refusals_before),(unsigned long long)(l.packed_misses-misses_before),
+                    (unsigned long long)(l.source_ram_bytes-ram_before),(unsigned long long)(l.source_drive_bytes-file_before),
+                    (unsigned long long)(l.fill_bytes-fill_before),rc);
         }
+        if (rc >= 0 && draft_bank_config_.packed_fill)
+            for (const auto& rank : ranks_)
+                if (!rank->mover.source_epochs_current()) { rc=RAD_E_STATE; break; }
         if (rc >= 0) {
             // Fixed metadata/atomic publications cannot fail. Validate every actual pointer.
             rc=publish_all(true);
@@ -325,6 +369,15 @@ int Engine::draft_bank_lend_close() {
         (unsigned long long)l.source_ram_bytes,(unsigned long long)l.relay_bytes,(long long)s.restore_copy_bytes,
         (long long)s.verify_copy_bytes,(unsigned long long)l.startup_ns,(unsigned long long)l.drain_ns,(unsigned long long)l.fill_ns,
         (unsigned long long)l.restore_ns,l.backup.ready(),l.published);
+    if (draft_bank_config_.packed_fill)
+        RAD_INFO("DSBANKPACK totals enabled=1 packed_hits=%llu packed_refusals=%llu packed_misses=%llu "
+            "packed_source_bytes=%llu packed_raw_bytes=%llu raw_ram_bytes=%llu source_file_bytes=%llu "
+            "inverse_ns=%llu whole_pair_fill_bytes=%llu",
+            (unsigned long long)l.packed_hits, (unsigned long long)l.packed_refusals,
+            (unsigned long long)l.packed_misses, (unsigned long long)l.packed_source_bytes,
+            (unsigned long long)l.packed_raw_bytes, (unsigned long long)l.source_ram_bytes,
+            (unsigned long long)l.source_drive_bytes, (unsigned long long)l.packed_inverse_ns,
+            (unsigned long long)l.fill_bytes);
     draft_bank_loan_.reset();return rc;
 }
 } // namespace rad

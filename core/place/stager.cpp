@@ -492,6 +492,12 @@ int FileStager::shutdown_head_cache() {
 FileStager::~FileStager() {
     /* The card path's threads use this stager's planes and insert queue: they stop first. */
     p1_.reset();
+    /* Same ownership as counts_host_: each successful wait consumes the copies before reuse;
+     * on abort, Rank's Ctx shuts down and drains its streams BEFORE this FileStager is destroyed.
+     * Do not retain/use the Ctx stream here: it has already been destroyed. */
+    p2_audit_.reset();
+    if(p2_readback_)rad_dev_free(p2_readback_,RAD_MEM_HOST_PINNED);
+    if(p2_file_)std::fclose(p2_file_);
     if (p1_end_) rad_event_destroy(p1_end_);
     if (p1_lend_ev_) rad_event_destroy(p1_lend_ev_);
     if (p1_vev_) rad_event_destroy(p1_vev_);
@@ -570,6 +576,7 @@ FileStager::~FileStager() {
 int FileStager::init(const Program& prog, const Plan& plan, Mover* mover,
                      RouteCounts routes, void* routes_ud, CountsRow counts,
                      EpCountsRow ep_counts) {
+    if(p2_audit_)return RAD_E_STATE; // audit identity/output belongs to one immutable Program/Plan
     //No owner/program switch while temporary addresses or old copy generations survive.
     RAD_TRY(shutdown_head_cache());
     if (head_.configured()) return RAD_E_STATE; //a head-cache FileStager is single-initialization
@@ -687,6 +694,7 @@ int FileStager::init(const Program& prog, const Plan& plan, Mover* mover,
     RAD_TRY(init_head_cache(prog, plan));
     RAD_TRY(hx_init(prog));
     RAD_TRY(p1_init(prog));
+    RAD_TRY(p2_init(prog));
     return rt_init(prog);
 }
 
@@ -748,6 +756,8 @@ bool FileStager::begin_pass(const RadBatch* b) {
             p1_cpu_layers_ = 0;
         }
     }
+    if(p2_audit_)p2_audit_->begin(b->step,(int32_t)b->n_tok,p1_armed_,
+        pass_row0_.empty()?nullptr:pass_row0_.data(),pass_full_==INT32_MAX?40:pass_full_);
     ++trace_pass_;
     if (rt_) rt_pass(b);
     /* Under LCP every routed unit is the CPU's (hx_capped_), so a chunk of up to C tokens reads only
@@ -891,6 +901,7 @@ int FileStager::start_ep_routed(int32_t li, RadStream s, bool* read) {
             p1_order_ = true;
         }
     }
+    if(p2_audit_)p2_queue(v,p1_order_||hx,li,s);
     RAD_TRY(rad_event_record(counts_ev_, s));
     /* ..._ROUTE_TRACE: rank 0's copies of the router's outputs, behind the counts' event (the
      * choice does not wait for them) and under their own, which rt_layer waits for. Best-effort:
@@ -949,6 +960,7 @@ int FileStager::start_ep_routed(int32_t li, RadStream s, bool* read) {
         RAD_TRY(head_revoke());
         return RAD_E_STATE;
     }
+    if(p2_audit_)p2_freeze(v,p1,li,sync_ns);
     want_.clear(); skip_.clear();
     for (int32_t u : L.units) {
         if (mover_->ring_resident(u)) {
@@ -4639,6 +4651,7 @@ int FileStager::end_pass(RadStream s) {
         }
     cur_ = -1;
     if (rc >= 0 && p1_rc < 0) rc = p1_rc;
+    if(p2_audit_)p2_audit_->end(rc>=0&&head_status_>=0);
     return rc<0 ? rc : head_status_;
 }
 
@@ -5091,6 +5104,7 @@ int FileStager::after_op(rad_op h, RadStream s) {
     p1_li_ = -1;
     /* Behind the down projection, before any later op: the waves (card_expert_stager.h). */
     const int rc = p1_->run(s);
+    if(p2_audit_)p2_audit_->layer_done(layers_[(size_t)li].layer,rc>=0);
     if (rc < 0) return rc;
     if (p1_->tunables().verify > 0) return p1_verify(li, s);
     return RAD_OK;

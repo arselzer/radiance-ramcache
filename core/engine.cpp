@@ -927,6 +927,7 @@ void Engine::rank_loop(int index) {
             if (xstats_ && what != kIssueSampler && b->enc == 0)
                 if (XsTally* xs = xstats_->tally(index)) xs->issued(*b);
             int s = what == kIssueSampler ? RAD_OK : r.ctx.run_step(b);
+            if(r.fstager.phase2_audit())r.fstager.phase2_audit_step_status(s>=0);
             /* RADIANCE_EXPERIMENTAL_DS41_PREFILL_HASH: the state a prompt's last prefill step left,
              * before its sampler (engine_hash.cpp). */
             if (s >= 0 && prefill_hash_ && what != kIssueSampler) prefill_hash_rank(r, b);
@@ -964,6 +965,14 @@ void Engine::rank_loop(int index) {
 
 /* ------------------------------------------------------------------ the scheduler thread */
 int Engine::prepare_release(const RadBatch* b) {
+    /* P2 audit only. Ahead plans are decode-only; refuse a mismatched/non-host entry rather
+     * than borrowing the scheduler's current request for an unrelated issued batch. Every
+     * rank is parked, and the identity is copied by value before release. */
+    if(ds41_phase2::audit::requested()) {
+        const StepPlan&p=sched_.plan();const auto*seqs=sched_.step_seqs(b);
+        const auto id=ds41_phase2::audit::make_identity(b,p.e.data(),p.e.size(),seqs?seqs->data():nullptr,seqs?seqs->size():0,bool(gen_));
+        for(auto&rk:ranks_)if(rk->fstager.phase2_audit())rk->fstager.phase2_audit_bind(id);
+    }
     /* The arena level, recalling lent arena memory if this step needs it. Every rank thread is
      * parked, so the level can change and a recall can drain both streams. */
     if (const int as = arena_step(b); as < 0) return as;

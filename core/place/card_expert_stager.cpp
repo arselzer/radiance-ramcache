@@ -308,6 +308,7 @@ int CardExpertStager::queue_one(int i) {
     queued_.push_back(i);
     ++st_.copies;
     st_.copy_bytes += (uint64_t)(u.src.gu_bytes + u.src.dn_bytes);
+    if(copy_observer_)copy_observer_(copy_observer_ud_,u.e,u.unit,u.rows,s,u.kind,u.src);
     return 0;
 }
 

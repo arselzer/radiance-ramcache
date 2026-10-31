@@ -86,6 +86,7 @@
 #include "mover.h"
 #include "planner.h"
 #include "ep_route_counts.h"
+#include "ds41_phase2_audit.h"
 #include "dspark_head_tail.h"
 #include "host_expert_pool.h"
 #include "card_expert_stager.h"
@@ -277,6 +278,9 @@ inline bool ra_pass_reads_ahead(bool decode, int32_t draft_pass, int64_t n_tok, 
 class FileStager final : public OpStager {
 public:
     ~FileStager() override;
+    bool phase2_audit()const{return bool(p2_audit_);}
+    void phase2_audit_bind(const ds41_phase2::audit::Identity&i){if(p2_audit_)p2_audit_->bind(i);}
+    void phase2_audit_step_status(bool ok){if(p2_audit_&&!ok)p2_audit_->incomplete("engine_step_failed");}
 
     /* Routing-aware reads: the engine binds a source of the layer's per-expert routing
      * counts for the current pass (the router reports them to the Ctx before the layer's
@@ -557,6 +561,15 @@ public:
     int shutdown_head_cache();
 
 private:
+    std::unique_ptr<ds41_phase2::audit::Trace> p2_audit_;
+    FILE* p2_file_=nullptr;
+    int32_t* p2_readback_=nullptr;
+    const Program* p2_program_=nullptr;
+    bool p2_queued_=false,p2_reused_order_=false;
+    uint64_t p2_extra_bytes_=0;
+    int p2_init(const Program&);
+    void p2_queue(const EpRouteCounts&,bool order_queued,int32_t li,RadStream);
+    void p2_freeze(const EpRouteCounts&,bool p1,int32_t li,uint64_t counts_wait_ns);
     friend struct EpCountsHostProbe;
     using Layer = StagedLayer;
     std::vector<Layer>   layers_;      /* the routed layers with file-tier units, in first-op order */

@@ -147,6 +147,10 @@ public:
 
 class CardExpertStager {
 public:
+    /* Read-only audit notification AFTER copy() accepted the unchanged source/slot. Issuing
+     * thread only; no retained Source pointers and no scheduling decision may depend on it. */
+    using CopyObserver=void(*)(void*,int expert,int32_t unit,int rows,int slot,Kind,const Source&);
+    void set_copy_observer(CopyObserver fn,void*ud){copy_observer_=fn;copy_observer_ud_=ud;}
     struct Stats {
         uint64_t layers = 0, ram = 0, drive = 0, pool = 0, waves = 0, copies = 0, copy_bytes = 0;
         uint64_t drive_waits = 0, ring_full_waits = 0, release_syncs = 0, max_waves = 0;
@@ -217,6 +221,7 @@ private:
     bool  open_ = false, started_ = false;
     std::vector<const void*> tab_gu_, tab_dn_;
     Stats st_;
+    CopyObserver copy_observer_=nullptr;void*copy_observer_ud_=nullptr;
 
     int  queue_one(int i);
     int  pump();
@@ -340,6 +345,7 @@ private:
  * layer's choice. */
 class CardExpertPath final : public Device, public LendHost {
 public:
+    void set_copy_observer(CardExpertStager::CopyObserver fn,void*ud){st_.set_copy_observer(fn,ud);}
     using PlanesGet = std::function<std::shared_ptr<Mover::HostPlanes>(int32_t unit)>;
     using Insert = std::function<void(std::shared_ptr<Mover::HostPlanes> p, int rows)>;
     using LaunchFn = int (*)(const RadArgs*, RadStream);

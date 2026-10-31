@@ -4564,6 +4564,10 @@ int Engine::start() {
                                 [rctx](int32_t layer, EpRouteCounts* out) {
                                     return rctx->ep_route_counts_live(layer, out);
                                 }));
+        if(ds41_phase2::audit::requested()&&!r->fstager.phase2_audit()) {
+            RAD_ERR("DSP2AUDIT refused rank=%d reason=native_4K_P1_stager_unavailable",r->index);
+            return RAD_E_INVAL;
+        }
         if (r->fstager.enabled() && r->index == 0)
             RAD_INFO("file stager: %zu routed layers hold experts read from the container; each "
                      "pass reads a layer's (up to %s) into one of two VRAM buffers before its "

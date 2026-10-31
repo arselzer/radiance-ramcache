@@ -248,3 +248,5 @@ TEST(ds41_ar_rows_rebases_suffixes_and_the_common_moe_path_without_changing_pitc
     CHECK_EQ(x.issues[1].opd[0].offset, 1037 * D);
     CHECK_EQ(x.issues[1].n, D);
 }
+
+RAD_TEST_MAIN()

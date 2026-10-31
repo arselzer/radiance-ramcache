@@ -927,17 +927,32 @@ TEST(kv_packed_is_off_by_default_and_zero_has_identical_graph_and_issues) {
 }
 
 TEST(kv_packed_keeps_logical_bf16_geometry_and_pairs_each_capture_with_its_store) {
-    Env e{ WINDOW_SWITCHES, { "RADIANCE_EXPERIMENTAL_DS41_LCP", "256" },
-           { "RADIANCE_EXPERIMENTAL_DS41_KV_PACKED", "1" } };
+    Env e{ WINDOW_SWITCHES, { "RADIANCE_EXPERIMENTAL_DS41_LCP", "256" } };
+    auto plain=declare(0,256,8);REQUIRE_EQ(plain->rc,RAD_OK);
+    /* Save values before redeclaring rank 0 replaces models[0]; the plain Model* then expires. */
+    const auto logical=plain->b.kv_groups;
+    setenv("RADIANCE_EXPERIMENTAL_DS41_KV_PACKED","1",1);
     auto d=declare(0,256,8);
     REQUIRE_EQ(d->rc,RAD_OK); REQUIRE(d->m->kv_packed); CHECK(!d->m->kv_packed_fast);
     REQUIRE(d->m->lat_pack); REQUIRE(d->m->ik_pack);
-    for(const auto& kv:d->b.kv_groups) {
-        CHECK(kv.d.dtype==RAD_BF16||kv.d.dtype==RAD_F32);
+    REQUIRE_EQ(d->b.kv_groups.size(),logical.size());size_t engram=0,packed=0;
+    for(size_t g=0;g<logical.size();++g) {
+        const auto&kv=d->b.kv_groups[g];const auto&base=logical[g];
+        CHECK_EQ(kv.name,base.name);CHECK_EQ(kv.d.kind,base.d.kind);CHECK_EQ(kv.d.dtype,base.d.dtype);
+        CHECK_EQ(kv.d.window,base.d.window);CHECK_EQ(kv.d.n_head_kv,base.d.n_head_kv);
+        CHECK_EQ(kv.d.head_dim,base.d.head_dim);CHECK_EQ(kv.d.conv_width,base.d.conv_width);
+        for(int dim=0;dim<2;++dim)CHECK_EQ(kv.d.state_dim[dim],base.d.state_dim[dim]);
+        CHECK_EQ(kv.zero,base.zero);CHECK_EQ(kv.replicated,base.replicated);CHECK_EQ(kv.dense,base.dense);
+        CHECK_EQ(base.d.storage_format,uint32_t(0));CHECK_EQ(base.d.storage_block_bytes,int64_t(0));
         const bool lat=kv.name.rfind("kv_compressed_r",0)==0,idx=kv.name.rfind("kv_index_r",0)==0;
+        if(lat||idx){CHECK_EQ(kv.d.dtype,uint32_t(RAD_BF16));CHECK_EQ(kv.d.kind,int(RAD_KV_FULL));++packed;}
+        if(kv.name=="kv_engram_tokens"){
+            CHECK_EQ(kv.d.dtype,uint32_t(RAD_I32));CHECK_EQ(kv.d.kind,int(RAD_KV_CONV));++engram;
+        }
         CHECK_EQ(kv.d.storage_format,uint32_t(lat?1:idx?2:0));
         CHECK_EQ(kv.d.storage_block_bytes,int64_t(lat?288:idx?68:0));
     }
+    CHECK_EQ(packed,size_t(4));CHECK_EQ(engram,size_t(1));
     for (const auto& seqs : { std::vector<Seq>{{1,41}}, std::vector<Seq>{{3,43},{1,48}} }) {
         auto k=step_of(d->b,seqs,{}); auto v=run_passes(d->b,deepseek41::step,{k.get()},0,4);
         REQUIRE(steps_ok(v));

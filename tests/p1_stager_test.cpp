@@ -418,6 +418,25 @@ TEST(p1_tunables_take_whole_numbers_in_range_and_end_or_start) {
     }
 }
 
+TEST(p1_arena_caps_above64_keep_the_original_ring_bound_and_strict_parser) {
+    std::map<std::string,std::string> env;
+    auto get=[&](const char* k)->const char* { auto it=env.find(k); return it==env.end()?nullptr:it->second.c_str(); };
+    Tunables t; std::string why;
+    for(const char* ok:{"64","65","88","128"}) {
+        env[ds41p1::kLendArenaEnv]=ok;
+        CHECK(parse_tunables(get,&t,&why)); CHECK_EQ(t.lend_arena,std::atoi(ok));
+        CHECK(ds41p1::lend_arena_asked("1",ok));
+        CHECK(!ds41p1::lend_arena_asked("0",ok));
+    }
+    for(const char* bad:{"129","-1","88x","999999999999999999999999"}) {
+        env[ds41p1::kLendArenaEnv]=bad;
+        CHECK(!parse_tunables(get,&t,&why)); CHECK(!ds41p1::lend_arena_asked("1",bad));
+    }
+    env[ds41p1::kLendArenaEnv]="128";
+    env[ds41p1::kLendEnv]="64"; CHECK(parse_tunables(get,&t,&why)); CHECK_EQ(t.lend,64);
+    env[ds41p1::kLendEnv]="65"; CHECK(!parse_tunables(get,&t,&why));
+}
+
 TEST(p1_swiglu_span_switch_is_default_off_and_accepts_only_zero_or_one) {
     std::string value;
     bool set = false;
@@ -1377,9 +1396,28 @@ TEST(p1_lend_returns_after_the_grace_and_takes_back_for_the_card_path) {
     RingLender bad;
     CHECK(bad.init(nullptr, 2, 0) < 0);
     CHECK(bad.init(&h0, 0, 0) < 0);
-    CHECK(bad.init(&h0, 2 * ds41p1::kMaxLend + 1, 0) < 0);
-    CHECK_EQ(bad.init(&h0, 2 * ds41p1::kMaxLend, 0), 0);   /* the ring's and the arena's */
+    CHECK(bad.init(&h0, ds41p1::kMaxCombinedLend + 1, 0) < 0);
+    CHECK_EQ(bad.init(&h0, ds41p1::kMaxCombinedLend, 0), 0);   /* the ring's and the arena's */
     CHECK(bad.init(&h0, 2, -1) < 0);
+}
+
+TEST(p1_extended_arena_slots_reload_withdraw_and_fence_above64) {
+    for(int n:{65,88,128,ds41p1::kMaxCombinedLend}) {
+        FakeLend h(37,n); h.land_pct=h.copy_pct=100;
+        RingLender l; REQUIRE_EQ(l.init(&h,n,0),0);
+        int64_t tick=0;
+        for(int i=0;i<6*n && l.residents()<n;++i) lend_pass(l,h,false,++tick);
+        CHECK_EQ(l.residents(),n); CHECK_EQ(h.violations,0);
+        lend_pass(l,h,true,++tick); CHECK_EQ(l.residents(),0);
+        l.end_p1(++tick);
+        h.copy_pct=0;
+        for(int i=0;i<4;++i) lend_pass(l,h,false,++tick);
+        /* Reclaim a high-slot reload while copies are pending; no stale publication. */
+        lend_pass(l,h,true,++tick); CHECK_EQ(l.residents(),0); CHECK_EQ(h.violations,0);
+        l.end_p1(++tick); h.copy_pct=100;
+        for(int i=0;i<6*n && l.residents()<n;++i) lend_pass(l,h,false,++tick);
+        CHECK_EQ(l.residents(),n); CHECK_EQ(h.violations,0);
+    }
 }
 
 TEST(p1_lend_failed_reloads_leave_their_units_on_the_cpu_path_until_the_next_return) {
@@ -1553,6 +1591,7 @@ TEST(p1_lend_arena_slots_are_whole_aligned_and_inside_the_region_from_the_top) {
     struct Case { int64_t lo_off, bytes; int max, want; } cases[] = {
         { 0, 10 * S, 64, 10 }, { 0, 10 * S, 4, 4 }, { 0, 10 * S - 1, 64, 9 }, { 100, 10 * S, 64, 9 },
         { 4096, 10 * S, 64, 10 }, { 0, S, 1, 1 }, { 0, S - 4096, 8, 0 }, { 0, 0, 8, 0 }, { 0, 5 * S, 0, 0 },
+        { 0, 88 * S, 128, 88 }, { 0, 128 * S, 128, 128 }, { 0, 88 * S, 64, 64 },
         { 0, 760ll << 20, 64, 42 }, { 0, (760ll << 20) + 5000, 64, 42 },
     };
     for (const Case& c : cases) {

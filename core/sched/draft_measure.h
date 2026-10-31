@@ -31,6 +31,8 @@ inline bool draft_measure_profile(int64_t short_from, int64_t full_rows, int64_t
 }
 struct DraftMeasureFrame {
     uint64_t seq = 0, epoch = 0, ready_ns = 0, wait_ns = 0, output = 0;
+    uint64_t query_frame = 0, solo_span = 0; // concurrent policy only;0 preserves legacy meter
+    int owner_slot = -1;
     int step = -1, card = -1, k = -1, query_rows = 0;
     int32_t ctx = -1, anchor = -1, ids[5] = {};
     uint32_t invalid_depths = 0; // fixed controls keep k; policy falls back to the full Db2 prefix
@@ -57,7 +59,8 @@ struct DraftMeasure {
         if (pending.epoch) ++stats.no_query;
         pending = {}; current = {}; closing = {}; close = false;
     }
-    void ready(const DraftMeasureFrame& frame, bool previous_matches, bool allow_action_change = false) {
+    void ready(const DraftMeasureFrame& frame, bool previous_matches, bool allow_action_change = false,
+               bool consecutive_solo = false) {
         current = frame;
         ++stats.queries; stats.query_rows += frame.query_rows;
         ++stats.waits; stats.wait_all_ns += frame.wait_ns;
@@ -68,7 +71,10 @@ struct DraftMeasure {
                 pending.seq != frame.seq || pending.card != frame.card ||
                 (!allow_action_change && pending.k != frame.k) ||
                 frame.epoch <= pending.epoch || pending.query_rows != frame.query_rows ||
-                frame.ready_ns <= pending.ready_ns) ++stats.transition;
+                frame.ready_ns <= pending.ready_ns ||
+                (consecutive_solo && (!frame.solo_span || frame.solo_span != pending.solo_span ||
+                    !pending.query_frame || frame.query_frame != pending.query_frame + 1 ||
+                    int64_t(frame.step) != int64_t(pending.step) + 1 || frame.owner_slot != pending.owner_slot))) ++stats.transition;
             else { closing = pending; closing_ns = frame.ready_ns - pending.ready_ns; close = true; }
         }
         pending = {};

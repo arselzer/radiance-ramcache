@@ -1,5 +1,6 @@
 /* kv.cpp -- see kv.h. */
 #include "mem/kv.h"
+#include "mem/kv_storage.h"
 
 #include "kvstream/carve.h"
 #include "kvstream/plan.h"
@@ -128,6 +129,10 @@ int KVManager::plan_groups(const std::vector<KVGroupInfo>& groups, const Config&
             continue;
         }
         const KVGroupInfo& g = groups[i];
+        if (const char* why = kv_storage_decl_error(g.decl)) {
+            RAD_ERR("KV group '%s': %s", g.name.c_str(), why);
+            return RAD_E_INVAL;
+        }
         KVGroupPlan p;
         p.index    = (int32_t)i;
         p.name     = g.name.empty() ? fmt("kv%zu", i) : g.name;
@@ -136,6 +141,7 @@ int KVManager::plan_groups(const std::vector<KVGroupInfo>& groups, const Config&
          * other plan-path code has to know the kind. */
         p.kind     = g.decl.kind == RAD_KV_RING ? RAD_KV_WINDOW : g.decl.kind;
         p.n_layers = (int64_t)g.layers.size();
+        p.storage_format = g.decl.storage_format;
         p.dense_read = g.dense_read;
 
         if (p.n_layers <= 0) {
@@ -160,8 +166,19 @@ int KVManager::plan_groups(const std::vector<KVGroupInfo>& groups, const Config&
                 return RAD_E_NOKERNEL;
             }
             /* One page covers every layer bound to the group. */
+            if (const char* why = kv_storage_page_error(g.decl, p.block_size)) {
+                RAD_ERR("KV group '%s': %s", p.name.c_str(), why);
+                return RAD_E_SHAPE;
+            }
+            if (kv_storage_packed(g.decl) && g.bytes_per_block > 0 &&
+                g.bytes_per_block != g.decl.storage_block_bytes * p.n_layers) {
+                RAD_ERR("KV group '%s': packed bytes_per_block disagrees with physical storage",
+                        p.name.c_str());
+                return RAD_E_SHAPE;
+            }
             p.bytes_per_block = g.bytes_per_block > 0
                 ? g.bytes_per_block
+                : kv_storage_packed(g.decl) ? g.decl.storage_block_bytes * p.n_layers
                 : p.block_size * g.decl.n_head_kv * g.decl.head_dim * elt * 2 * p.n_layers;
             if (p.bytes_per_block <= 0) {
                 RAD_ERR("KV group '%s': page size computes to 0 (n_head_kv=%lld head_dim=%lld)",
@@ -415,6 +432,11 @@ void KVManager::forget() {
     clears_.clear();
     seqs_.clear(); pending_.clear();
     configured_ = false;
+    backing_enabled_ = backing_withdrawn_ = backing_staged_ = backing_fixed_ready_ = false;
+    backing_error_ = RAD_OK;
+    backed_ids_.clear(); backing_held_.clear(); backing_old_ = {}; backing_target_ = {};
+    backing_grow_ = {}; backing_capacity_ = {};
+    backing_intent_.clear(); backing_collect_intent_ = false;
     report_.clear();
 }
 
@@ -528,6 +550,13 @@ int KVManager::carve_into(Pool& kv_pool) {
     }
 
     /* ---- the resident windows, before anything is split (kvstream/carve.h) ---- */
+    for (const auto& p : plans_) {
+        if (p.storage_format != RAD_KV_STORAGE_PLAIN && stream_.windowed(p.index)) {
+            RAD_ERR("KV group '%s': packed physical storage has no streamed-cache contract",
+                    p.name.c_str());
+            return RAD_E_UNSUPPORTED;
+        }
+    }
     RAD_TRY(kvstream_window_fit(plans_, stream_, fixed, budget_bytes, max_ctx_, max_seqs_));
 
     /* ---- the paged split; under a cap, the least rank's ---- */
@@ -537,6 +566,8 @@ int KVManager::carve_into(Pool& kv_pool) {
 
     /* How much of that the pool backs, and the refusal of an unbacked streamed plan. */
     RAD_TRY(kvstream_apply(plans_, stream_, max_ctx_, max_seqs_));
+    if (backing_enabled_)
+        for (const auto& p : plans_) if (p.streamed()) return RAD_E_UNSUPPORTED;
 
     /* A streamed group's `n_blocks` is its context, so this asks whether it can address anything,
      * not whether its window is large enough. */
@@ -600,8 +631,9 @@ int KVManager::carve_into(Pool& kv_pool) {
             refcount_[i].assign((size_t)p.n_blocks, 0);
             cached_[i].assign((size_t)p.n_blocks, 0);
             /* Ascending order is already a valid min-heap (see the loan block in kv.h). */
-            free_blocks_[i].resize((size_t)p.n_blocks);
-            for (int64_t b = 0; b < p.n_blocks; ++b) free_blocks_[i][(size_t)b] = (int32_t)b;
+            free_blocks_[i].resize(backing_enabled_ ? 0 : (size_t)p.n_blocks);
+            if (!backing_enabled_)
+                for (int64_t b = 0; b < p.n_blocks; ++b) free_blocks_[i][(size_t)b] = (int32_t)b;
         } else {
             /* Only logical slots are allocatable; copy k of slot s (s + k * n_seq_states) belongs
              * to whoever holds s. */
@@ -618,7 +650,7 @@ int KVManager::carve_into(Pool& kv_pool) {
      * process, so an elastic pool behaves exactly like a fixed one. The loan never changes what
      * is mapped, so every id the free list names has memory behind it. The fixed part (state and
      * conv slots) is sized per sequence and has no idle fraction to release. */
-    if (pool_ && pool_->elastic()) {
+    if (!backing_enabled_ && pool_ && pool_->elastic()) {
         const int64_t used = pool_->used();
         const int rc = pool_->commit(0, used);
         if (rc < 0) {
@@ -633,11 +665,14 @@ int KVManager::carve_into(Pool& kv_pool) {
     chunk_blocks_.assign(plans_.size(), 0);
     short_peak_.assign(plans_.size(), 0);
     held_hist_.assign(plans_.size(), {});
+    backed_ids_.assign(plans_.size(), {});
+    backing_held_.assign(plans_.size(), 0);
     for (size_t i = 0; i < plans_.size(); ++i) {
         const auto& p = plans_[i];
         if (!p.paged()) continue;
         live_[i]        = p.n_blocks;
-        free_usable_[i] = p.n_blocks;
+        free_usable_[i] = backing_enabled_ ? 0 : p.n_blocks;
+        if (backing_enabled_) backed_ids_[i].assign((size_t)p.n_blocks, 0);
         /* Buffer floor: one step (max_tok tokens) of this group, so a prefill recalls at most
          * once a chunk and a decode step almost never. Clamped to the carve. */
         const int64_t chunk = blocks_for(p.index, max_tok_);
@@ -662,6 +697,10 @@ int KVManager::carve_into(Pool& kv_pool) {
                            (long long)p.block_size, humanb(p.bytes_per_block).c_str(),
                            (long long)p.n_blocks, humanb(p.pool_bytes).c_str(),
                            (long long)(p.n_blocks * p.block_size));
+            if (p.storage_format != RAD_KV_STORAGE_PLAIN)
+                report_ += fmt("      physical storage format %u, %lld bytes per layer page; "
+                               "logical BF16, no full BF16 shadow\n", p.storage_format,
+                               (long long)p.layer_bytes_per_block());
             if (p.streamed())
                 report_ += kvstream_report_line(p);
         } else
@@ -692,17 +731,82 @@ const KVGroupPlan* KVManager::plan(int32_t g) const {
     return (g >= 0 && g < (int32_t)plans_.size()) ? &plans_[(size_t)g] : nullptr;
 }
 
+int KVManager::backing_required_ranges(const KVManager& owners,
+                                      std::vector<KVBackingRange>* out) const {
+    if (!out || !configured_ || !owners.configured_ || !pool_ ||
+        plans_.size() != owners.plans_.size()) return RAD_E_STATE;
+    if (loan_ != 0 || owners.loan_ != 0) return RAD_E_UNSUPPORTED;
+    std::vector<KVBackingRange> ranges;
+    const auto add = [&](int64_t off, int64_t bytes) {
+        if (off < 0 || bytes < 0 || off > pool_->bytes() || bytes > pool_->bytes() - off)
+            return false;
+        if (bytes > 0) ranges.push_back({ off, bytes });
+        return true;
+    };
+    for (size_t g = 1; g < plans_.size(); ++g) {
+        const auto& p = plans_[g];
+        const auto& logical = owners.plans_[g];
+        if (p.streamed() || logical.streamed()) return RAD_E_UNSUPPORTED;
+        if (p.kind != logical.kind || p.block_size != logical.block_size ||
+            p.n_blocks != logical.n_blocks) return RAD_E_SHAPE;
+        if (p.zero) continue;
+        if (!p.base || p.n_layers <= 0) return RAD_E_STATE;
+        if (p.kind != RAD_KV_FULL) {
+            if (!add(p.pool_offset, p.pool_bytes)) return RAD_E_STATE;
+            continue;
+        }
+        if (p.bytes_per_block <= 0 || p.bytes_per_block % p.n_layers ||
+            owners.refcount_[g].size() != (size_t)p.n_blocks) return RAD_E_STATE;
+        const int64_t frag = p.layer_bytes_per_block();
+        for (int64_t layer = 0; layer < p.n_layers; ++layer) {
+            int64_t begin = 0;
+            while (begin < p.n_blocks) {
+                if (owners.refcount_[g][(size_t)begin] <= 0) { ++begin; continue; }
+                int64_t end = begin + 1;
+                while (end < p.n_blocks && owners.refcount_[g][(size_t)end] > 0) ++end;
+                if (!add(p.pool_offset + layer * p.layer_stride() + begin * frag,
+                         (end - begin) * frag)) return RAD_E_STATE;
+                begin = end;
+            }
+        }
+    }
+    /* A COW source may have lost its last logical owner after the copy was queued. It remains a
+     * reader until copied; destinations remain writers. Copies already taken from pending_ need
+     * the caller's drain/external-holder contract above. */
+    for (const auto& copy : owners.pending_) {
+        if (copy.group <= 0 || (size_t)copy.group >= plans_.size()) return RAD_E_STATE;
+        const auto& p = plans_[(size_t)copy.group];
+        if (p.zero) continue;
+        if (!p.paged() || copy.src_block < 0 || copy.dst_block < 0 ||
+            copy.src_block >= p.n_blocks || copy.dst_block >= p.n_blocks) return RAD_E_STATE;
+        const int64_t frag = p.layer_bytes_per_block();
+        for (int64_t l = 0; l < p.n_layers; ++l)
+            for (int32_t b : { copy.src_block, copy.dst_block })
+                if (!add(p.pool_offset + l * p.layer_stride() + int64_t(b) * frag, frag))
+                    return RAD_E_STATE;
+    }
+    std::vector<KVBackingRange> intended;
+    RAD_TRY(backing_block_ranges(owners.backing_intent_, &intended));
+    ranges.insert(ranges.end(), intended.begin(), intended.end());
+    *out = std::move(ranges);
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------------ free lists */
 
 /* Pops the lowest free block (min-heap; see the loan block in kv.h). Entries whose block is no
  * longer free are skipped: reserve_specific_block leaves its heap entry behind, since erasing
  * from a heap needs a rebuild. */
 int KVManager::grab_block(int32_t g, int32_t* out) {
+    if (backing_enabled_) RAD_TRY(backing_need(g, 1));
     auto& fl = free_blocks_[(size_t)g];
     /* No usable block: recall the loan here. ensure() recalls once for a whole request; this
      * covers callers that take one block at a time, and grow_for takes back a buffer's worth so
      * they do not recall per block. */
-    if (free_usable_[(size_t)g] <= 0) (void)grow_for(g, 1);
+    if (free_usable_[(size_t)g] <= 0) {
+        const int rc = grow_for(g, 1);
+        if (backing_enabled_ && rc < 0) return rc;
+    }
     if (free_usable_[(size_t)g] <= 0) return RAD_E_FULL;
     while (!fl.empty()) {
         std::pop_heap(fl.begin(), fl.end(), std::greater<int32_t>());
@@ -711,11 +815,12 @@ int KVManager::grab_block(int32_t g, int32_t* out) {
         if (refcount_[(size_t)g][(size_t)b] != 0) continue;    /* stale: taken out of the middle */
         /* Never past the live mark: blocks above it are lent to the expert slab. A hit here
          * means free_usable_ and the heap disagree. */
-        if (b >= live_[(size_t)g]) {
+        if (b >= live_[(size_t)g] || (backing_enabled_ && !block_backed(g, b))) {
             RAD_ERR("KV group '%s': the free list offered block %d with the live mark at %lld and "
                     "%lld usable -- the count and the heap have gone out of step",
                     plans_[(size_t)g].name.c_str(), (int)b, (long long)live_[(size_t)g],
                     (long long)free_usable_[(size_t)g]);
+            if (backing_enabled_) backing_poison(RAD_E_STATE);
             return RAD_E_STATE;
         }
         refcount_[(size_t)g][(size_t)b] = 1;
@@ -723,6 +828,9 @@ int KVManager::grab_block(int32_t g, int32_t* out) {
         note_held(g, b, +1);
         *out = b;
         return RAD_OK;
+    }
+    if (backing_enabled_ && free_usable_[(size_t)g] > 0) {
+        backing_poison(RAD_E_STATE); return backing_error_;
     }
     return RAD_E_FULL;
 }
@@ -735,6 +843,9 @@ void KVManager::drop_block(int32_t g, int32_t b) {
         else if (rc == 1) { --cache_only_[(size_t)g]; cached_[(size_t)g][(size_t)b] = 0; }
     }
     if (--rc != 0) return;
+    if (backing_enabled_ && (backing_withdrawn_ || !block_backed(g, b))) {
+        note_held(g, b, -1); return;
+    }
     auto& fl = free_blocks_[(size_t)g];
     fl.push_back(b);
     std::push_heap(fl.begin(), fl.end(), std::greater<int32_t>());
@@ -750,6 +861,7 @@ void KVManager::add_ref(size_t g, int32_t b) {
 
 /* Maintains held_hist_ (see kv.h). */
 void KVManager::note_held(int32_t g, int32_t b, int delta) {
+    if (backing_enabled_) backing_held_[(size_t)g] += delta;
     auto& h = held_hist_[(size_t)g];
     if (h.empty()) return;
     const int64_t bucket = (int64_t)b / bucket_blocks_[(size_t)g];
@@ -757,6 +869,7 @@ void KVManager::note_held(int32_t g, int32_t b, int delta) {
 }
 
 int KVManager::grab_state(int32_t g, int32_t* out) {
+    if (backing_enabled_) RAD_TRY(backing_ready());
     auto& fl = free_states_[(size_t)g];
     if (fl.empty()) return RAD_E_FULL;
     *out = fl.back(); fl.pop_back();
@@ -777,9 +890,12 @@ void KVManager::drop_state(int32_t g, int32_t s) {
 /* Blocks that can be handed out now. Not the free list's length, which also holds lent ids and
  * stale entries left by reserve_specific_block. */
 int64_t KVManager::free_blocks(int32_t g) const {
+    if (backing_enabled_ && (backing_withdrawn_ || backing_error_ < 0)) return 0;
     return (g >= 0 && g < (int32_t)free_usable_.size()) ? free_usable_[(size_t)g] : 0;
 }
 int64_t KVManager::held_blocks(int32_t g) const {
+    if (backing_enabled_)
+        return g >= 0 && (size_t)g < backing_held_.size() ? backing_held_[(size_t)g] : 0;
     if (g < 0 || g >= (int32_t)live_.size()) return 0;
     const int64_t held = live_[(size_t)g] - free_usable_[(size_t)g];
     return held > 0 ? held : 0;
@@ -815,11 +931,13 @@ int64_t KVManager::buffer_bytes() const {
 int64_t KVManager::available_blocks(int32_t g) const {
     const KVGroupPlan* p = plan(g);
     if (!p || !p->paged()) return 0;
+    if (backing_enabled_) return backing_error_ < 0 ? 0 : p->n_blocks - held_blocks(g);
     const int64_t lent = p->n_blocks - live_blocks(g);
     return free_blocks(g) + (lent > 0 ? lent : 0);
 }
 
 bool KVManager::lendable(int32_t g) const {
+    if (backing_enabled_) return false;
     const KVGroupPlan* p = plan(g);
     /* A streamed group never lends: its pool is the ring, and a lent block would leave fewer
      * slots than one launch's selection needs. */
@@ -848,6 +966,7 @@ int KVManager::grow_for(int32_t g, int64_t blocks) {
     if (g < 0 || g >= (int32_t)plans_.size()) return RAD_E_INVAL;
     const KVGroupPlan& p = plans_[(size_t)g];
     if (!p.paged()) return RAD_OK;
+    if (backing_enabled_) return backing_need(g, blocks);
     const int64_t short_by = blocks - free_usable_[(size_t)g];
     if (short_by <= 0) return RAD_OK;
 
@@ -892,6 +1011,7 @@ int64_t KVManager::spare_tokens() {
 }
 
 int KVManager::set_loan(int64_t tokens) {
+    if (backing_enabled_ && tokens != 0) return RAD_E_UNSUPPORTED;
     if (tokens < 0) tokens = 0;
     /* Check every group before moving any, so a refused loan changes nothing. */
     for (size_t i = 0; i < plans_.size(); ++i) {
@@ -921,10 +1041,17 @@ void KVManager::apply_loan(int64_t tokens) {
 }
 
 int KVManager::follow(const KVManager& leader) {
+    if (backing_enabled_ || leader.backing_enabled_) {
+        if (!backing_enabled_ || !leader.backing_enabled_ || backing_error_ < 0 || leader.backing_error_ < 0 ||
+            backing_withdrawn_ || leader.backing_withdrawn_ || backed_ids_ != leader.backed_ids_ ||
+            !backing_fixed_ready_ || !leader.backing_fixed_ready_) return RAD_E_STATE;
+        return RAD_OK;
+    }
     if (leader.loan_ != loan_) apply_loan(leader.loan_);
     return RAD_OK;
 }
 int64_t KVManager::free_states(int32_t g) const {
+    if (backing_enabled_ && (backing_error_ < 0 || backing_withdrawn_ || !backing_fixed_ready_)) return 0;
     return (g >= 0 && g < (int32_t)free_states_.size()) ? (int64_t)free_states_[(size_t)g].size() : 0;
 }
 
@@ -979,6 +1106,7 @@ int64_t KVManager::blocks_for(int32_t g, int64_t n_tokens) const {
 }
 
 bool KVManager::can_ever_fit(int64_t n_tokens) const {
+    if (backing_enabled_ && (backing_error_ < 0 || (backing_capacity_ && !backing_capacity_(n_tokens)))) return false;
     for (const auto& p : plans_) {
         /* Both kinds are tested explicitly: the null group at handle 0 is neither and holds no
          * states, so a bare `else` would refuse every sequence. */
@@ -992,6 +1120,7 @@ bool KVManager::can_ever_fit(int64_t n_tokens) const {
  * another sequence? Used by the scheduler's preempted-prefill admission gate, which must not
  * reserve anything or it would perturb the very pool it is trying to protect. */
 bool KVManager::can_grow(uint64_t id, int64_t n_tokens) const {
+    if (backing_enabled_ && backing_error_ < 0) return false;
     const Seq* s = find(id);
     if (!s) return false;
     if (n_tokens <= s->n_tokens) return true;
@@ -1239,6 +1368,7 @@ int KVManager::reserve_block(int32_t g, int32_t* out) {
     *out = -1;
     if (g < 0 || g >= (int32_t)plans_.size()) return RAD_E_INVAL;
     if (!plans_[(size_t)g].paged()) return RAD_E_INVAL;
+    if (backing_enabled_) return grab_block(g, out);
     if (free_usable_[(size_t)g] <= 0) return RAD_E_FULL;
     return grab_block(g, out) == RAD_OK && *out >= 0 ? RAD_OK : RAD_E_FULL;
 }
@@ -1246,11 +1376,17 @@ int KVManager::reserve_block(int32_t g, int32_t* out) {
 int64_t KVManager::reserve_blocks(int32_t g, int64_t n, std::vector<int32_t>* out) {
     if (!out || n <= 0) return 0;
     if (g < 0 || g >= (int32_t)plans_.size() || !plans_[(size_t)g].paged()) return 0;
+    if (backing_enabled_) {
+        const int rc = backing_need(g, n);
+        if (rc < 0) return backing_error_ < 0 ? backing_error_ : 0;
+    }
     if (free_usable_[(size_t)g] < n) (void)grow_for(g, n);
     int64_t got = 0;
     while (got < n && free_usable_[(size_t)g] > 0) {
         int32_t b = -1;
-        if (grab_block(g, &b) != RAD_OK || b < 0) break;
+        const int rc = grab_block(g, &b);
+        if (backing_enabled_ && backing_error_ < 0) return backing_error_;
+        if (rc != RAD_OK || b < 0) break;
         out->push_back(b);
         ++got;
     }
@@ -1260,6 +1396,7 @@ int64_t KVManager::reserve_blocks(int32_t g, int64_t n, std::vector<int32_t>* ou
 int KVManager::reserve_specific_block(int32_t g, int32_t b) {
     if (g < 0 || g >= (int32_t)plans_.size() || !plans_[(size_t)g].paged()) return RAD_E_INVAL;
     if (b < 0 || b >= plans_[(size_t)g].n_blocks) return RAD_E_INVAL;
+    if (backing_enabled_) RAD_TRY(backing_need_ids({{g, b}}));
     /* A block above live_ is lent; restoring into it would overwrite expert weights in use. Rank
      * 0 picks below its own mark, so a refusal here means this rank's loan is deeper. */
     if (b >= live_[(size_t)g]) return RAD_E_STATE;
@@ -1272,6 +1409,7 @@ int KVManager::reserve_specific_block(int32_t g, int32_t b) {
 }
 
 int KVManager::retain_block(int32_t g, int32_t b) {
+    if (backing_enabled_) RAD_TRY(backing_ready());
     if (g < 0 || g >= (int32_t)refcount_.size()) return RAD_E_INVAL;
     if (b < 0 || b >= (int32_t)refcount_[(size_t)g].size()) return RAD_E_INVAL;
     if (refcount_[(size_t)g][(size_t)b] <= 0) {
@@ -1285,6 +1423,7 @@ int KVManager::retain_block(int32_t g, int32_t b) {
 }
 
 void KVManager::cache_reserved_block(int32_t g, int32_t b) {
+    if (backing_enabled_ && (backing_withdrawn_ || backing_error_ < 0)) return;
     if (g < 0 || g >= (int32_t)refcount_.size()) return;
     if (b < 0 || b >= (int32_t)refcount_[(size_t)g].size()) return;
     if (refcount_[(size_t)g][(size_t)b] <= 0) return;
@@ -1367,6 +1506,8 @@ void KVManager::trim_window(uint64_t id, int64_t keep_from) {
 }
 
 int KVManager::ensure(uint64_t id, int64_t n_tokens, int64_t keep_from) {
+    BackingIntentScope intent(this);
+    if (backing_enabled_) RAD_TRY(backing_ready());
     Seq* s = find(id);
     if (!s) return RAD_E_NOTFOUND;
     if (n_tokens <= s->n_tokens) return RAD_OK;
@@ -1402,7 +1543,8 @@ int KVManager::ensure(uint64_t id, int64_t n_tokens, int64_t keep_from) {
         }
     }
 
-    /* Pass 2: commit. Nothing below can fail. */
+    backing_collect_intent_ = false;
+    /* Pass 2: every group's candidates are pinned through all earlier mapping transactions. */
     for (size_t g = 0; g < plans_.size(); ++g) {
         const auto& p = plans_[g];
         if (p.paged()) {
@@ -1413,7 +1555,10 @@ int KVManager::ensure(uint64_t id, int64_t n_tokens, int64_t keep_from) {
                     int32_t old = s->blocks[g][(size_t)bi];
                     if (refcount_[g][(size_t)old] > 1) {
                         int32_t fresh = -1;
-                        grab_block((int32_t)g, &fresh);
+                        const int rc = grab_block((int32_t)g, &fresh);
+                        if (backing_enabled_ && (rc < 0 || fresh < 0)) {
+                            backing_poison(rc < 0 ? rc : int(RAD_E_STATE)); return backing_error_;
+                        }
                         s->blocks[g][(size_t)bi] = fresh;
                         s->dirty_from[g] = std::min<int64_t>(s->dirty_from[g], bi);
                         drop_block((int32_t)g, old);
@@ -1429,7 +1574,10 @@ int KVManager::ensure(uint64_t id, int64_t n_tokens, int64_t keep_from) {
                                                      (int64_t)s->blocks[g].size());
             while ((int64_t)s->blocks[g].size() < want) {
                 int32_t b = -1;
-                grab_block((int32_t)g, &b);
+                const int rc = grab_block((int32_t)g, &b);
+                if (backing_enabled_ && (rc < 0 || b < 0)) {
+                    backing_poison(rc < 0 ? rc : int(RAD_E_STATE)); return backing_error_;
+                }
                 s->blocks[g].push_back(b);
             }
         } else if (p.stateful() && s->state[g] < 0) {
@@ -1443,6 +1591,7 @@ int KVManager::ensure(uint64_t id, int64_t n_tokens, int64_t keep_from) {
 /* ------------------------------------------------------------------ adopt / fork */
 
 int KVManager::adopt(uint64_t id, int32_t g, const std::vector<int32_t>& blocks, int64_t n_tokens) {
+    if (backing_enabled_) RAD_TRY(backing_ready());
     Seq* s = find(id);
     if (!s) return RAD_E_NOTFOUND;
     const KVGroupPlan* p = plan(g);
@@ -1457,6 +1606,14 @@ int KVManager::adopt(uint64_t id, int32_t g, const std::vector<int32_t>& blocks,
     if (!s->blocks[(size_t)g].empty()) return RAD_E_STATE;
     if (s->n_tokens != 0 && s->n_tokens != n_tokens) return RAD_E_INVAL;
 
+    if (backing_enabled_) {
+        std::vector<KVBackingBlock> needed;
+        for (int32_t b : blocks) {
+            if (b < 0 || b >= p->n_blocks || refcount_[(size_t)g][(size_t)b] <= 0) return RAD_E_STATE;
+            needed.push_back({g, b});
+        }
+        RAD_TRY(backing_need_ids(needed));
+    }
     for (int32_t b : blocks) {
         if (b < 0 || b >= p->n_blocks) return RAD_E_INVAL;
         add_ref((size_t)g, b);
@@ -1468,6 +1625,7 @@ int KVManager::adopt(uint64_t id, int32_t g, const std::vector<int32_t>& blocks,
 }
 
 int KVManager::fork(uint64_t parent, uint64_t child) {
+    if (backing_enabled_) RAD_TRY(backing_ready());
     Seq* pa = find(parent);
     if (!pa) return RAD_E_NOTFOUND;
     if (seqs_.count(child)) return RAD_E_DUPLICATE;
@@ -1507,6 +1665,7 @@ int KVManager::fork(uint64_t parent, uint64_t child) {
 int KVManager::make_room(uint64_t id, int64_t n_tokens,
                          const std::vector<uint64_t>& victims,
                          std::vector<uint64_t>* preempted) {
+    if (backing_enabled_ && backing_error_ < 0) return backing_error_;
     /* Fail before preempting anyone if even an empty pool cannot hold it (spec §17). */
     if (!can_ever_fit(n_tokens)) {
         RAD_WARN("request %llu wants %lld tokens, which exceeds the whole KV pool. Failing it "
@@ -1728,6 +1887,8 @@ bool KVManager::window_rows(uint64_t id, int64_t pos, std::vector<int32_t>* out)
 }
 
 int KVManager::seed_window(uint64_t id, int64_t pos) {
+    BackingIntentScope intent(this);
+    if (backing_enabled_) RAD_TRY(backing_ready());
     Seq* s = find(id);
     if (!s) return RAD_E_NOTFOUND;
     /* A sequence with a runtime window is never resumed from a window snapshot (set_window). */
@@ -1742,6 +1903,7 @@ int KVManager::seed_window(uint64_t id, int64_t pos) {
         if (need > available_blocks((int32_t)g)) return RAD_E_FULL;
         RAD_TRY(grow_for((int32_t)g, need));
     }
+    backing_collect_intent_ = false;
     for (size_t g = 0; g < plans_.size(); ++g) {
         const KVGroupPlan& p = plans_[g];
         if (!p.win_snap) continue;
@@ -1749,7 +1911,10 @@ int KVManager::seed_window(uint64_t id, int64_t pos) {
         s->first_block_pos[g] = lo * p.block_size;
         for (int64_t j = lo; j < hi; ++j) {
             int32_t b = -1;
-            grab_block((int32_t)g, &b);
+            const int rc = grab_block((int32_t)g, &b);
+            if (backing_enabled_ && (rc < 0 || b < 0)) {
+                backing_poison(rc < 0 ? rc : int(RAD_E_STATE)); return backing_error_;
+            }
             s->blocks[g].push_back(b);
         }
         s->dirty_from[g] = 0;

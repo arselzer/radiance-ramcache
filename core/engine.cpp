@@ -580,6 +580,7 @@ Engine::~Engine() {
      * since a pass reads them. Safe after a failed bring-up. */
     for (auto& r : ranks_) r->kv.free_stream(rad_device_allocator());
     step_state_fini();
+    kv_growth_.reset(); // Its callback and publishers refer to the still-live managers.
     ranks_.clear();
     for (TableCopy& c : table_copies_) table_copy_free(&c);
     table_copies_.clear();
@@ -926,6 +927,7 @@ void Engine::rank_loop(int index) {
             if (xstats_ && what != kIssueSampler && b->enc == 0)
                 if (XsTally* xs = xstats_->tally(index)) xs->issued(*b);
             int s = what == kIssueSampler ? RAD_OK : r.ctx.run_step(b);
+            if(r.fstager.phase2_audit())r.fstager.phase2_audit_step_status(s>=0);
             /* RADIANCE_EXPERIMENTAL_DS41_PREFILL_HASH: the state a prompt's last prefill step left,
              * before its sampler (engine_hash.cpp). */
             if (s >= 0 && prefill_hash_ && what != kIssueSampler) prefill_hash_rank(r, b);
@@ -963,6 +965,14 @@ void Engine::rank_loop(int index) {
 
 /* ------------------------------------------------------------------ the scheduler thread */
 int Engine::prepare_release(const RadBatch* b) {
+    /* P2 audit only. Ahead plans are decode-only; refuse a mismatched/non-host entry rather
+     * than borrowing the scheduler's current request for an unrelated issued batch. Every
+     * rank is parked, and the identity is copied by value before release. */
+    if(ds41_phase2::audit::requested()) {
+        const StepPlan&p=sched_.plan();const auto*seqs=sched_.step_seqs(b);
+        const auto id=ds41_phase2::audit::make_identity(b,p.e.data(),p.e.size(),seqs?seqs->data():nullptr,seqs?seqs->size():0,bool(gen_));
+        for(auto&rk:ranks_)if(rk->fstager.phase2_audit())rk->fstager.phase2_audit_bind(id);
+    }
     /* The arena level, recalling lent arena memory if this step needs it. Every rank thread is
      * parked, so the level can change and a recall can drain both streams. */
     if (const int as = arena_step(b); as < 0) return as;
@@ -1062,6 +1072,7 @@ int Engine::step_loop() {
      * pass issued ahead would overwrite them. */
     pipelining_ = draft_experiment_.target_pipelining(!cfg_.kld() && !cfg_.calib() && !embedding_,
                               serial_drafting(), block_drafting(), cfg_.n_spec);
+    if (kv_growth_) pipelining_ = false;
     early_ids_ = !cfg_.kld() && !embedding_;
     /* A tree's acceptance moves K and V on the card behind the step issued ahead. The KL mode
      * drafts nothing and an embedding model declares no drafter, so no server reaches this today;
@@ -1104,8 +1115,13 @@ int Engine::step_loop() {
         const RadBatch* b = ahead;
         ahead = nullptr;
         if (issued) sched_.promote_next();
-        else        b = sched_.step();
+        else if (kv_growth_) {
+            const int rc = kv_quiescent_plan([this] { return kv_growth_->begin_plan(); },
+                                            [this] { kv_growth_->finish_plan(); }, &b);
+            if (rc < 0) return fail_loop(rc);
+        } else b = sched_.step();
         if (!b) {
+            if (dpolicy_concurrent_) dpolicy_pause(-1, "idle");
             /* Idle: back off in small steps instead of spinning; the first wait is short so a new
              * request into an empty engine is not delayed. */
             step_batch_.store(nullptr, std::memory_order_release);
@@ -2699,6 +2715,7 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
                                 ? 8 * std::max<int64_t>(geo_.checkpoint_interval, 0) : 0);
     }
 
+    if (dpolicy_concurrent_) RAD_TRY(dpolicy_concurrent_open());
     if (draft_bank_config_.on) RAD_TRY(draft_bank_lend_open());
     for (auto& r : ranks_) r->sampler.attach_vocab(vocab_view_.get());
 

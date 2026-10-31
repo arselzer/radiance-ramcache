@@ -4,6 +4,7 @@
 #include "mm/processor.h"
 #include "place/ep_route_counts.h"
 #include "sched/p1_chunk.h"
+#include "mem/kv_layout_receipt.h"
 
 #include "server/sink.h"
 
@@ -15,6 +16,7 @@
 #include <cstring>
 #include <string>
 #include <numeric>
+#include <new>
 #include <string>
 
 namespace rad {
@@ -570,9 +572,15 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
      * sequence the rule decides nothing, so it is not on there. */
     bank_observe_ = false; bank_frame_open_ = false;
     bank_frame_step_ = -1; bank_frame_epoch_ = 0; bank_frame_solo_ = false;
+    policy_frame_open_ = policy_frame_solo_ = false;
+    policy_frame_step_ = -1; policy_frame_epoch_ = 0;
     dsolo_ = !cfg.draft_bank.empty() && cfg.max_seqs > 1 && cfg.n_spec > 0 &&
              prog.drafter.kind == RAD_DRAFT_BLOCK && prog.drafter.depth > 0 &&
              !draft_experiment_.compute_off();
+    if (draft_experiment_.prefix_policy().on && cfg.max_seqs > 1 && (!dsolo_ || !dctx_.on)) {
+        RAD_ERR("concurrent DSpark prefix policy requires the existing sole-drafter rule and explicit deferred context");
+        return RAD_E_UNSUPPORTED;
+    }
     dconf_tot_ = DraftConfStats{};
     dconf_recs_.clear();
     dconf_recs_n_ = 0;
@@ -1517,7 +1525,16 @@ int Scheduler::cancel(uint64_t id) {
     /* Blocks go back now (spec §14), unless a step in flight or a drafter snapshot still names
      * the request; then commit or sweep_deferred releases them (SchedReq::pending_free). */
     const bool in_flight = in_step(s) || block_holds(id);
+    const bool audit = kv_layout_flag(std::getenv(kKVLayoutEnv)) == 1;
+    const int before = audit ? (int)s.req->state : -1;
     close_request(s, ReqState::Cancelled, "cancelled", in_flight);
+    /* The HTTP disconnect counter also counts a late close whose generations already ended.
+     * This audit-only row proves the real scheduler accepted cancellation while nonterminal,
+     * under the same ownership lock, after close_request completed. No endpoint/ABI change. */
+    if (audit && (before == (int)ReqState::Waiting || before == (int)ReqState::Running ||
+                  before == (int)ReqState::Preempted) && s.req->state == ReqState::Cancelled)
+        RAD_INFO("DS41_KV_CANCEL seq=%llu step=%lld before=%d active=1 accepted=1 cancelled=1 deferred=%d",
+                 (unsigned long long)id, (long long)step_, before, (int)in_flight);
     return RAD_OK;
 }
 
@@ -2322,6 +2339,7 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
          * running, no other path would reclaim from it and the request would wait forever. */
         int rounds = 0;
         while (kv_->ensure_from(r.id, r.n_computed + want, r.n_computed) < 0) {
+            if (kv_->allocation_error() < 0) return kv_->allocation_error();
             if (++rounds > kEvictRounds || !cfg_.prefix_cache || pc_->evict(kEvictBlocks) <= 0) {
                 rc = RAD_E_NOMEM;
                 break;
@@ -2514,18 +2532,29 @@ const RadBatch* Scheduler::step() {
     return step_locked();
 }
 
-int Scheduler::step_quiescent(const std::function<int()>& before_plan, const RadBatch** out) {
+int Scheduler::step_quiescent(const std::function<int()>& before_plan, const RadBatch** out,
+                              const std::function<void()>& after_plan) {
     if (!out) return RAD_E_INVAL;
     *out = nullptr;
     if (!before_plan) return RAD_E_INVAL;
     std::lock_guard<std::mutex> lk(mu_);
-    const int rc = before_plan();
-    if (rc < 0) return rc;
-    *out = step_locked();
-    return RAD_OK;
+    if (kv_->allocation_error() < 0) return kv_->allocation_error();
+    struct Finish {
+        const std::function<void()>& f;
+        ~Finish() noexcept { if (f) f(); }
+    } finish{after_plan};
+    try {
+        const int rc = before_plan();
+        if (rc < 0) return rc;
+        *out = step_locked();
+        if (kv_->allocation_error() < 0) { *out = nullptr; return kv_->allocation_error(); }
+        return RAD_OK;
+    } catch (const std::bad_alloc&) { *out = nullptr; return RAD_E_NOMEM; }
+      catch (...) { *out = nullptr; return RAD_E_STATE; }
 }
 
 const RadBatch* Scheduler::step_locked() {
+    if (kv_->allocation_error() < 0) return nullptr;
     /* A cycle opens here, so its head depth is chosen here (scheduler.h, draft_cycle). */
     draft_cycle();
 
@@ -2878,6 +2907,7 @@ replan:
         int evict_rounds = 0;
         bool failed = false, yielded = false;
         while (kv_->ensure_from(r.id, r.n_computed + want, r.n_computed) < 0) {
+            if (kv_->allocation_error() < 0) return nullptr;
             /* The cache gives blocks back before a running request does: a cached prefix saves
              * work done once, a running request is work in flight. Nothing else releases the
              * cache's references, so this also keeps publishing from leaking. */
@@ -3006,6 +3036,7 @@ replan:
                     ? share_tok : 0;
             admit_full_ = 0;
             const int as = admit_one(s, budget, areserve);
+            if (kv_->allocation_error() < 0) return nullptr;
             if (as == kAdmitWait) { ++at; continue; }
             /* An overdue preempted prefill on an idle engine that still cannot be admitted will
              * not become admissible by waiting: nothing is running to finish and free the pool.
@@ -3195,6 +3226,9 @@ replan:
         lost_restore = true;
     }
 
+    /* No page table upload or queued copy may follow a fatal physical mapping error, including
+     * one encountered by prefix restore/adopt or an opportunistic chunk enlargement. */
+    if (kv_->allocation_error() < 0) return nullptr;
     step_start_ = std::chrono::steady_clock::now();
     const RadBatch* b = lost_restore ? nullptr : builder_.build(plan_, *kv_, step_);
     if (!b) {
@@ -4197,6 +4231,12 @@ int Scheduler::block_begin(int block, int depth, int window, int32_t mask, Block
     block_ctx_at_ = 0;
     block_len_ = 0;
     block_depth_ = 0;
+    if (draft_experiment_.prefix_policy().on && cfg_.max_seqs > 1) {
+        policy_frame_step_ = step_ - 1;
+        ++policy_frame_epoch_;
+        policy_frame_open_ = true;
+        policy_frame_solo_ = false;
+    }
     if (bank_observe_) {
         bank_frame_step_ = step_ - 1;
         ++bank_frame_epoch_;
@@ -4285,6 +4325,7 @@ int Scheduler::block_begin(int block, int depth, int window, int32_t mask, Block
         if (solo_held) ++dconf_tot_.solo_steps;
     }
     if (bank_observe_) bank_frame_solo_ = solo_held;
+    if (policy_frame_open_) policy_frame_solo_ = solo_held;
 
     int n_draft_rows = 0;
     for (size_t i = 0; i < plan_.e.size(); ++i) {
@@ -4645,6 +4686,7 @@ int Scheduler::with_draft_bank_idle(const std::function<int()>& fn) {
 void Scheduler::block_end() {
     std::lock_guard<std::mutex> lk(mu_);
     if (bank_observe_) bank_frame_open_ = false;
+    policy_frame_open_ = false;
     for (const BlockSeq& d : block_) {
         if (d.mirror) continue;                /* finished; it has no draft cache to track */
         if (d.slot < 0 || (size_t)d.slot >= reqs_.size() || !reqs_[(size_t)d.slot]) continue;

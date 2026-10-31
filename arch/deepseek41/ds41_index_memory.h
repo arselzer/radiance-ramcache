@@ -5,6 +5,7 @@
 #include <cstring>
 namespace deepseek41 {
 constexpr const char* kIndexCompactEnv = "RADIANCE_EXPERIMENTAL_DS41_INDEX_SCORE_COMPACT";
+constexpr const char* kIndexB16Env = "RADIANCE_EXPERIMENTAL_DS41_INDEX_SCORE_BF16";
 constexpr int64_t kScorePlane = 256ll << 20;
 constexpr int64_t kScoreRunMin = 256;
 constexpr int64_t kScoreCompactMin = 64;

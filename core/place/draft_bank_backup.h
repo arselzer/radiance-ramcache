@@ -3,6 +3,7 @@
  * work drained. No allocation/copy occurs on a steady-ready query. */
 #pragma once
 #include "draft_vram.h"
+#include "draft_bank_timing.h"
 #include "rad_device.h"
 
 #include <array>
@@ -14,6 +15,7 @@ namespace rad {
 struct Program;
 struct Plan;
 class Mover;
+class DraftBankBackup;
 
 struct DraftBankBackupRank {
     int rank = -1, device = -1;
@@ -33,6 +35,7 @@ struct DraftBankBackupBudget {
     // Retained lender metadata outside this helper, e.g. sizeof(Engine::Loan).
     // Count it even if its fixed storage already exists at capture time.
     int64_t controller_metadata_bytes = 0;
+    bool timings = false; // explicit caller opt-in; no helper getenv/steady-ready clock
 };
 
 struct DraftBankBackupStats {
@@ -44,6 +47,7 @@ struct DraftBankBackupStats {
     int64_t capture_copy_bytes = 0, restore_copy_bytes = 0, verify_copy_bytes = 0;
     uint64_t image_hash = 0; // diagnostic only; strict memcmp decides readiness
     uint64_t completed_restores = 0;
+    DraftBankTimings timings{}; // included in sizeof(Image)/Loan accounting, even when off
 };
 
 /* The injected adapter must outlive the backup. All copies are synchronous and
@@ -117,6 +121,7 @@ struct ImageRank {
  * Runtime must use DraftBankBackup::capture, which first proves native scope.
  * No public environment switch or engine bypass calls this generic mechanism. */
 class Image {
+    friend class ::rad::DraftBankBackup;
 public:
     Image() = default;
     ~Image();
@@ -134,7 +139,11 @@ public:
     int64_t scratch_bytes(int rank) const noexcept;
     const DraftBankBackupStats& stats() const noexcept { return stats_; }
 private:
-    int verify(int rank, int span, std::string* why);
+    enum class VerifyPhase : uint8_t { Capture, Restore, Invariant };
+    int verify(int rank, int span, std::string* why, VerifyPhase phase);
+    int64_t timing_begin() const noexcept;
+    int timing_end(DraftBankTimingPart, int64_t start, int64_t bytes, bool success, std::string* why);
+    void timing_log(const char* operation, int status) const noexcept;
     void release() noexcept;
     std::array<ImageRank, kDraftRanks> ranks_{};
     std::array<void*, kDraftRanks> allocation_{};

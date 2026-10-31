@@ -13,9 +13,13 @@
  * of the window group apart (the consumer skip's layers, where a difference would show), then one
  * line folding every rank's. Two runs with the same requests in the same order compare line by line
  * (tools/ds41-host-experts/prefill_hash_compare.py). Debug only: each rank synchronises its stream
- * and copies whole layer pools to the host, and steps are not issued ahead while it is on. */
+ * and copies layer pools to the host (only referenced physical runs with growing KV), and steps
+ * are not issued ahead while it is on. */
 #include "engine_priv.h"
+#include "mem/kv_layout_receipt.h"
 #include "device/device.h"
+#include "mem/kv_storage_decode.h"
+#include "mem/kv_hash_runs.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -117,21 +121,45 @@ void Engine::prefill_hash_rank(Rank& r, const RadBatch* b) {
         return;
     }
     const Program& p = r.program;
+    const bool receipt = kv_layout_flag(std::getenv(kKVLayoutEnv)) == 1;
+    uint64_t receipt_seq = 0;
+    int receipt_group = 0, receipt_layer = -1;
     /* One layer's pool at a time, through a pinned buffer as large as the largest. */
-    auto fetch = [&](const void* src, int64_t bytes) -> const uint8_t* {
+    auto fetch = [&](const void* src, int64_t bytes, const KVHashRuns* sparse = nullptr) -> const uint8_t* {
+        const auto record = [&](int64_t copied, bool ok) {
+            if (receipt) r.hash_lines.push_back(fmt("DS41_KV_HASH_COPY rank=%d seq=%llu group=%d layer=%d requested=%lld capacity=%lld "
+                "copied=%lld sparse=%d runs=%zu ok=%d", r.index, (unsigned long long)receipt_seq,
+                receipt_group, receipt_layer, (long long)bytes, (long long)r.hash_cap, (long long)copied, (int)bool(sparse),
+                sparse ? sparse->size() : size_t(1), (int)ok));
+        };
         if (bytes <= 0 || !src) return nullptr;
         if (bytes > r.hash_cap) {
             if (r.hash_host) rad_dev_free(r.hash_host, RAD_MEM_HOST_PINNED);
             r.hash_host = static_cast<uint8_t*>(rad_dev_alloc(bytes, RAD_MEM_HOST_PINNED));
             r.hash_cap = r.hash_host ? bytes : 0;
-            if (!r.hash_host) return nullptr;
+            if (!r.hash_host) { record(0, false); return nullptr; }
         }
-        if (rad_memcpy_async(r.hash_host, src, bytes, r.ctx.stream()) < 0 ||
-            rad_stream_sync(r.ctx.stream()) < 0)
-            return nullptr;
+        int copied = RAD_OK;
+        int64_t copy_bytes = sparse ? 0 : bytes;
+        if (sparse) {
+            for (const auto& run : *sparse)
+                if (run.first < 0 || run.second < 0 || run.first > bytes || run.second > bytes - run.first ||
+                    run.second == 0 || (receipt && !kv_layout_add(copy_bytes, run.second, &copy_bytes))) {
+                    record(0, false); return nullptr;
+                }
+            for (const auto& run : *sparse) {
+                copied = rad_memcpy_async(r.hash_host + run.first, (const char*)src + run.first,
+                                          run.second, r.ctx.stream());
+                if (copied < 0) break;
+            }
+        } else copied = rad_memcpy_async(r.hash_host, src, bytes, r.ctx.stream());
+        const int drained = rad_stream_sync(r.ctx.stream()); // retire earlier runs even if a later copy failed
+        if (copied < 0 || drained < 0) { record(0, false); return nullptr; }
+        record(copy_bytes, true);
         return r.hash_host;
     };
     for (const PrefillHashJob::Seq& sq : job.seqs) {
+        receipt_seq = sq.seq;
         std::string line = fmt("prefill hash: seq %llu, %lld tokens (%s), rank %d:",
                                (unsigned long long)sq.seq, (long long)sq.n,
                                sq.cut > 0 ? fmt("cut for %lld", (long long)sq.cut).c_str() : "not cut",
@@ -139,7 +167,8 @@ void Engine::prefill_hash_rank(Rank& r, const RadBatch* b) {
         std::string per_layer;
         uint64_t all = kSeed;
         for (const PrefillHashJob::Group& gr : sq.groups) {
-            const std::string& name = p.kv_groups[(size_t)gr.g].name;
+            const KVGroupInfo& gi = p.kv_groups[(size_t)gr.g];
+            const std::string& name = gi.name;
             const KVPoolBinding* kb = r.ctx.kv_binding((rad_kvgroup)gr.g);
             const KVGroupPlan* gp = r.kv.plan(gr.g);
             if (!kb || !kb->base || !gp || gp->zero || gp->streamed() || gr.kind == RAD_KV_RING) {
@@ -150,7 +179,12 @@ void Engine::prefill_hash_rank(Rank& r, const RadBatch* b) {
             /* The byte runs this prompt left in one layer's pool. */
             std::vector<std::pair<int64_t, int64_t>> runs;
             if (gp->paged()) {
-                const int64_t nh = kb->shape[1], bs = kb->shape[2], row = kb->shape[3] * esz;
+                /* The binding can be physical U8 rank 2. Hash the original logical BF16 layout
+                 * and the same per-position runs regardless of storage, including ratio-2 halves. */
+                const bool packed = kv_storage_packed(gi.decl);
+                const int64_t nh = packed ? gi.decl.n_head_kv : kb->shape[1];
+                const int64_t bs = packed ? gp->block_size : kb->shape[2];
+                const int64_t row = packed ? 2 * gi.decl.head_dim * 2 : kb->shape[3] * esz;
                 int64_t lo = 0, hi = 0;
                 if (gr.kind == RAD_KV_FULL) {
                     hi = bs > 0 ? sq.n / bs * bs : 0;
@@ -172,18 +206,48 @@ void Engine::prefill_hash_rank(Rank& r, const RadBatch* b) {
             uint64_t gh = kSeed;
             std::string lh;
             int n_layers = 0;
-            for (int32_t l : p.kv_groups[(size_t)gr.g].layers) {
+            std::vector<uint16_t> decoded(kv_storage_packed(gi.decl)
+                ? (size_t)(2 * gp->block_size * gi.decl.head_dim) : 0);
+            KVHashRuns physical_runs;
+            const bool sparse = kv_growth_ && gp->kind == RAD_KV_FULL;
+            const bool valid_runs = !sparse ||
+                kv_hash_physical_runs(gi.decl, gp->block_size, kb->layer_stride, runs, &physical_runs);
+            for (int32_t l : gi.layers) {
                 if (l < 0 || (size_t)l >= kb->layer_slot.size() || kb->layer_slot[(size_t)l] < 0) continue;
-                const uint8_t* host = fetch((const char*)kb->base + (int64_t)kb->layer_slot[(size_t)l] *
-                                                                      kb->layer_stride,
-                                            kb->layer_stride);
+                bool backed = valid_runs;
+                const int64_t layer_offset = (int64_t)kb->layer_slot[(size_t)l] * kb->layer_stride;
+                if (sparse)
+                    for (const auto& run : physical_runs)
+                        backed &= r.pools.kv().is_backed(gp->pool_offset + layer_offset + run.first, run.second);
+                receipt_group = gr.g; receipt_layer = l;
+                if (!backed) {
+                    RAD_ERR("prefill hash: unbacked or invalid physical runs in group '%s', layer %d",
+                            name.c_str(), (int)l);
+                    line += " invalid-physical-hash-run";
+                }
+                const uint8_t* host = backed ? fetch((const char*)kb->base + layer_offset,
+                    kb->layer_stride, sparse ? &physical_runs : nullptr) : nullptr;
                 uint64_t h = kSeed;
                 if (!host) {
                     h = 0;
                 } else {
-                    for (const auto& run : runs)
-                        if (run.first >= 0 && run.first + run.second <= kb->layer_stride)
+                    for (const auto& run : runs) {
+                        if (kv_storage_packed(gi.decl)) {
+                            const uint8_t* logical = nullptr;
+                            if (!kv_storage_decode_run(gi.decl, gp->block_size, host,
+                                    kb->layer_stride, run.first, run.second, decoded.data(),
+                                    (int64_t)decoded.size(), &logical)) {
+                                RAD_ERR("prefill hash: invalid packed page in group '%s', layer %d",
+                                        name.c_str(), (int)l);
+                                line += " invalid-packed-page";
+                                h = 0;
+                                break;
+                            }
+                            h = hash_bytes(h, logical, run.second);
+                        } else if (run.first >= 0 && run.first + run.second <= kb->layer_stride) {
                             h = hash_bytes(h, host + run.first, run.second);
+                        }
+                    }
                 }
                 gh = fold(gh, h);
                 ++n_layers;
@@ -197,6 +261,7 @@ void Engine::prefill_hash_rank(Rank& r, const RadBatch* b) {
         }
         /* The last row's logits, this rank's shard, as the head wrote them. */
         const int64_t width = r.sampler.config().n_vocab_local;
+        receipt_group = 0; receipt_layer = -1;
         const char* lg = static_cast<const char*>(r.ctx.buf_ptr(p.logits_buf));
         const uint8_t* row = lg && width > 0 && sq.row >= 0
                                  ? fetch(lg + (int64_t)sq.row * width * 4, width * 4) : nullptr;

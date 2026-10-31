@@ -148,6 +148,7 @@ struct RouteSlot {
  * Layouts, as libref/ref_ops.h defines them:
  *
  *     FULL / WINDOW  [n_blocks, n_head_kv, block_size, 2 * head_dim]   K then V inside a slot
+ *     packed FULL    U8 [n_blocks, storage_block_bytes]              matching reader only
  *     LINEAR         [n_states, n_head_kv, state_dim[0], state_dim[1]]
  *     CONV           [n_states, n_head_kv * head_dim, conv_slots]      channel-major, then time
  */
@@ -173,6 +174,7 @@ struct KVPoolBinding {
     int64_t  layer_stride = 0;      /* bytes between one layer's cache and the next */
     int64_t  bytes = 0;             /* the whole group's pool, for the bounds check */
     uint32_t dtype = RAD_DT_INVALID;
+    uint32_t storage_format = RAD_KV_STORAGE_PLAIN; /* checked on EVERY actual RAD_KV operand */
     /* Absolute model layer -> cache slot in this group. A lookup, not a subtraction, because a
      * group's layers need not be contiguous. -1: the group does not hold that layer (a caller
      * bug). */

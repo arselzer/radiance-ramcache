@@ -153,7 +153,7 @@ constexpr const char* kMinRowsEnv  = "RADIANCE_EXPERIMENTAL_DS41_P1_MIN_ROWS";
 constexpr const char* kLendEnv     = "RADIANCE_EXPERIMENTAL_DS41_P1_LEND";
 constexpr const char* kGraceEnv    = "RADIANCE_EXPERIMENTAL_DS41_P1_GRACE_MS";
 /* The lent arena: up to this many slots of the activation arena's top hold the next hottest file-tier
- * units as decode residents the same way (0 off, the default; 1-64). The arena is sized for the chunk
+ * units as decode residents the same way (0 off, the default; 1-128). The arena is sized for the chunk
  * (935 MiB a card at 2048 rows, 468 at 1024), and a step of at most its smallest level's rows (256)
  * leaves everything above that level's buffers and its guard untouched; a step at the full plan (any
  * step above those rows, a card-path pass among them) takes the slots back first, as a card-path pass
@@ -161,8 +161,10 @@ constexpr const char* kGraceEnv    = "RADIANCE_EXPERIMENTAL_DS41_P1_GRACE_MS";
  * only beside this switch and kEnv (lend_arena_asked), so without them nothing changes. */
 constexpr const char* kLendArenaEnv = "RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA";
 constexpr int kDefWave = 2, kDefInflight = 16, kDefReady = 6, kDefAhead = 8, kDefMinRows = 320;
-/* kMaxLend bounds each of kLendEnv and kLendArenaEnv; the lender holds both (2 x kMaxLend). */
-constexpr int kDefGraceMs = 1000, kMaxLend = 64;
+/* Keep the ring's original bound. Larger chunk arenas can hold more independent slots;
+ * their requested cap never enlarges the planned arena or changes its protected small level. */
+constexpr int kDefGraceMs = 1000, kMaxLend = 64, kMaxArenaLend = 128;
+constexpr int kMaxCombinedLend = kMaxLend + kMaxArenaLend;
 constexpr int kMinRingSlots = 4;
 
 /* The tallest layer pass the CPU path takes under the threshold, at chunk C: every pass or layer
@@ -191,17 +193,17 @@ constexpr const char* kLogChunk = "ds41 p1 chunk:";             /* rank 0, after
 constexpr const char* kLogLend  = "ds41 p1: lent ring";         /* rank 0, at startup, with kLendEnv */
 constexpr const char* kLogLendArena = "ds41 p1: lent arena";    /* rank 0, at startup, with kLendArenaEnv */
 
-/* Whether the lent arena is asked for (kEnv `p1` on, kLendArenaEnv `lend` a count from 1 to kMaxLend):
+/* Whether the lent arena is asked for (kEnv `p1` on, kLendArenaEnv `lend` a count from 1 to kMaxArenaLend):
  * the deepseek41 plugin then declares at a smaller step too. A value the core refuses counts as not
  * asked here; the core's tunables say why. */
 inline bool lend_arena_asked(const char* p1, const char* lend) {
     if (env_state(p1) != 1 || !lend || !*lend) return false;
     long n = 0;
     for (const char* p = lend; *p; ++p) {
-        if (*p < '0' || *p > '9' || n > kMaxLend) return false;
+        if (*p < '0' || *p > '9' || n > kMaxArenaLend) return false;
         n = n * 10 + (*p - '0');
     }
-    return n >= 1 && n <= kMaxLend;
+    return n >= 1 && n <= kMaxArenaLend;
 }
 /* The same from the environment, kEnv read once (state()). */
 inline bool lend_arena_asked() { return state() == 1 && lend_arena_asked("1", std::getenv(kLendArenaEnv)); }

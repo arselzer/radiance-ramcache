@@ -13,6 +13,7 @@
 
 #include "mem/pools.h"
 #include "mem/kv.h"
+#include "mem/kv_live_controller.h"
 #include "mem/prefix.h"
 #include "mem/kvtier.h"
 #include "runtime/tierexec.h"
@@ -22,6 +23,7 @@
 #include "place/planner.h"
 #include "place/mover.h"
 #include "place/draft_bank_backup.h"
+#include "place/draft_bank_packed_fill.h"
 #include "place/stager.h"
 #include "place/xstats.h"
 #include "runtime/ctx.h"
@@ -52,6 +54,9 @@ struct Engine::DraftBankLoan {
     uint64_t lends = 0, restores = 0, rollbacks = 0, fill_bytes = 0;
     uint64_t source_drive_bytes = 0, source_ram_bytes = 0, relay_bytes = 0;
     uint64_t startup_ns = 0, drain_ns = 0, fill_ns = 0, restore_ns = 0;
+    draft_bank_packed_fill::Workspace packed_fill;
+    uint64_t packed_hits = 0, packed_refusals = 0, packed_misses = 0;
+    uint64_t packed_source_bytes = 0, packed_raw_bytes = 0, packed_inverse_ns = 0;
 };
 
 /* ================================================================== per-rank state */

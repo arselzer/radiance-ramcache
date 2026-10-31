@@ -7,6 +7,7 @@
  * with ROCm headers and no /dev/kfd); the chosen backend is logged at Info.
  */
 #include "device.h"
+#include "vmem_undo.h"
 #include "../rad_internal.h"
 
 #include <algorithm>
@@ -328,10 +329,15 @@ int VMem::commit(int64_t off, int64_t bytes) {
     if (prc < 0) {
         /* Mapped but inaccessible memory faults the first kernel that touches it. Undo exactly
          * what this call mapped; earlier extents were already accessible. */
-        for (size_t i = 0; i < took; ++i) {
-            if (dev()->vmem_decommit) (void)dev()->vmem_decommit((char*)base_ + want[i], g);
-            drop_extent(want[i], g);
-        }
+        const int urc = vmem_undo_new(want, took, g,
+            [&](int64_t o, int64_t n) {
+                return dev()->vmem_decommit ? dev()->vmem_decommit((char*)base_ + o, n)
+                                             : RAD_E_UNSUPPORTED;
+            }, [&](int64_t o, int64_t n) { drop_extent(o, n); });
+        if (urc < 0)
+            device_set_error("elastic memory: access grant failed and rollback could not unmap "
+                             "every new granule (%s); retained mappings remain recorded",
+                             rad_strerror(urc));
         return prc;
     }
     return rc;

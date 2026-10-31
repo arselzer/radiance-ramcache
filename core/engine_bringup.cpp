@@ -29,6 +29,8 @@
 #include "place/dspark_native_scope.h"
 #include "place/dspark_draft_control_scope.h"
 #include "place/draft_vram_load.h"
+#include "place/ds41_index_b16.h"
+#include "place/ds41_window_packed.h"
 #include "kvstream/bringup.h"
 #include "kvstream/plan.h"
 #include "runtime/arena.h"
@@ -1077,6 +1079,11 @@ RadBuildCtx Engine::build_ctx(int rank, int64_t max_tok) const {
 }
 
 int Engine::declare() {
+    bool window_packed=false;
+    if(!ds41_window_packed_parse(std::getenv("RADIANCE_EXPERIMENTAL_DS41_WINDOW_PACKED"),&window_packed))return RAD_E_INVAL;
+    if(window_packed&&(!meta_.arch_id||std::strcmp(meta_.arch_id,"deepseek41"))) {
+        RAD_ERR("WINDOW_PACKED requires the native deepseek41 plugin/ABI");return RAD_E_UNSUPPORTED;
+    }
     /* An architecture that declares no streamed ops cannot stream, so with --kv-resident set on one
      * the flag is turned off here, with the decision named, before anything is planned for it. */
     (void)rad_tools_probe(plugins_, meta_, &arch_probe_, cfg_.image_gen_max_pixels, cfg_.image_gen_max_refs);
@@ -1548,6 +1555,22 @@ int Engine::declare() {
         }
         RAD_TRY(source_banks_->finish_coverage(consumed));
         RAD_INFO("DSpark draft bank: canonical metadata unchanged; %zu donor entries bound across %zu rank declarations",consumed.size(),ranks_.size());
+    }
+
+    /* BEFORE the placement plan, arena/pool allocation or Ctx creation. No shortened WINDOW
+     * can reach an old/unknown/fallback reader on any selected band. */
+    for(const auto& r:ranks_) {
+        bool physical=false;
+        for(const auto& g:r->program.kv_groups)physical|=g.decl.storage_format==RAD_KV_STORAGE_DS41_FP8_WINDOW_G32;
+        if(physical!=window_packed) {RAD_ERR("WINDOW_PACKED flag/declaration mismatch rank%d",r->index);return RAD_E_UNSUPPORTED;}
+        if(window_packed) {
+            Ds41WindowPackedProof proof;std::string why;
+            if(!ds41_window_packed_admit(r->program,&proof,&why)) {
+                RAD_ERR("WINDOW_PACKED refused rank%d before allocation: %s",r->index,why.c_str());return RAD_E_UNSUPPORTED;
+            }
+            RAD_INFO("ds41 WINDOW_PACKED admitted rank=%d format=3 row_bytes=528 page_bytes=8448 groups=%d layers=%d producers=%d stores=%d readers=%d",
+                r->index,proof.groups,proof.layers,proof.producers,proof.stores,proof.readers);
+        }
     }
 
     RAD_INFO("declare: %zu ops, %zu weights, %zu buffers, %zu KV groups",
@@ -3899,6 +3922,7 @@ int Engine::configure_kv() {
         const KVManager::StreamCost sc = r->kv.stream_cost();
         if (sc.groups > 0)
             RAD_TRY(r->kv.alloc_stream(rad_device_allocator(), r->pools.kv()));
+        if (kv_growth_options_.enabled) RAD_TRY(r->kv.enable_backing_mode());
         RAD_TRY(r->kv.carve(r->pools.kv()));
         if (sc.groups > 0) RAD_TRY(kvstream_fill(r->kv));   /* the maps, after the elastic pool */
         /* Without virtual memory management the cache cannot lend: everything still works, but
@@ -4193,6 +4217,9 @@ int Engine::configure_kv() {
 
 /* ================================================================== start */
 int Engine::start() {
+    // Clear the callback while its previous managers still exist on a repeated bring-up.
+    kv_growth_.reset();
+    RAD_TRY(kv_growth_parse());
     // Before device discovery, model open or generic draft-host automatic pool growth.
     if (draft_placement_modes_conflict(cfg_)) {
         RAD_ERR("draft placement: experimental bank and generic manual modes cannot be combined");
@@ -4233,8 +4260,14 @@ int Engine::start() {
     /* The machine before the model: a refusal here costs a second, after the load it costs the
      * load. */
     RAD_TRY(check_configuration(devs));
+    RAD_TRY(kv_growth_devices(devs));
 
     RAD_TRY(read_metadata());
+    if (kv_growth_options_.enabled &&
+        (!meta_.arch_id || std::strcmp(meta_.arch_id, "deepseek41"))) {
+        RAD_ERR("%s requires the native deepseek41 architecture", kKVLiveEnv);
+        return RAD_E_UNSUPPORTED;
+    }
     if (cfg_.max_ctx == 0)
         decide("--max-model-len", std::to_string(meta_.n_ctx_train),
                "the model's training context (--max-model-len 0)");
@@ -4376,6 +4409,7 @@ int Engine::start() {
     }
 
     RAD_TRY(plan());
+    RAD_TRY(kv_growth_layout());
     if (draft_experiment_.scope_required()) {
         if (ranks_.size() != 4) return RAD_E_UNSUPPORTED;
         /* The cap measures the full block's query unless the drafter declared a short block
@@ -4397,11 +4431,26 @@ int Engine::start() {
                     rad_dflash_observe::kEarlyEnv);
             return RAD_E_UNSUPPORTED;
         }
+        bool concurrent_policy = false;
+        if (policy && cfg_.max_seqs > 1) {
+            bool native = bool(source_banks_) && !cfg_.lora.enabled() && !cfg_.media_flags_set();
+            for (const auto& r : ranks_)
+                native &= dspark_draft_control_scope(r->program, r->plan, cfg_, bool(source_banks_), draft_vram_n_) &&
+                          !r->program.two_batch && !r->plan.dynamic;
+            const char* tbo = std::getenv("RADIANCE_EXPERIMENTAL_SCHED_TBO");
+            concurrent_policy = draft_prefix_policy_concurrent_profile(cfg_.max_seqs, tree_, short_from_,
+                drafter_.block, drafter_.depth, drafter_short_, draft_experiment_.ctx_defer(),
+                native, cfg_.deterministic, !tbo || !std::strcmp(tbo, "0"));
+        }
         if (policy && !draft_prefix_policy_profile(cfg_.max_seqs, tree_, short_from_,
-                                                   drafter_.block, drafter_.depth, drafter_short_)) {
-            RAD_ERR("%s requires max-num-seqs1, the native chain5 drafter and Db2 with "
-                    "draft-short-from1; query, observer and early wait remain identical for all actions",
-                    rad_dflash_observe::kPolicyEnv);
+                                                   drafter_.block, drafter_.depth, drafter_short_) && !concurrent_policy) {
+            if (cfg_.max_seqs == 1)
+                RAD_ERR("%s requires max-num-seqs1, the native chain5 drafter and Db2 with "
+                        "draft-short-from1; query, observer and early wait remain identical for all actions",
+                        rad_dflash_observe::kPolicyEnv);
+            else RAD_ERR("%s concurrency requires the native TP4 fixed bank, deterministic placement, "
+                         "Db2/from1/depth5, explicit Dx and existing sole-drafter rule, no TBO/tree",
+                         rad_dflash_observe::kPolicyEnv);
             return RAD_E_UNSUPPORTED;
         }
         for (const auto& r : ranks_) {
@@ -4429,6 +4478,26 @@ int Engine::start() {
             RAD_INFO("experimental draft verify cap: k=%d; configured depth5, full5 query/proposal, "
                      "Program, banks and pools retained; only the verified prefix is capped",
                      draft_experiment_.verify_cap());
+    }
+    /* Storage opt-in must be proven before Ctx init or ANY warmup/recorded launch. */
+    bool score_b16=false;
+    if(!deepseek41::index_compact_parse(std::getenv(deepseek41::kIndexB16Env),&score_b16))return RAD_E_INVAL;
+    if(score_b16) {
+        if(!meta_.arch_id||std::strcmp(meta_.arch_id,"deepseek41"))return RAD_E_UNSUPPORTED;
+        for(const auto&r:ranks_) {
+            Ds41IndexB16Proof proof;std::string why;
+            if(!ds41_index_b16_admit(r->program,&proof,&why)) {
+                RAD_ERR("%s=1 refused rank%d: %s",deepseek41::kIndexB16Env,r->index,why.c_str());return RAD_E_UNSUPPORTED;
+            }
+            const char*lc=std::getenv("RADIANCE_EXPERIMENTAL_DS41_LCP");
+            if(lc&&*lc&&std::strcmp(lc,"0")&&!ds41_index_memory_admit(r->program,&why)) {
+                RAD_ERR("%s=1 refuses unproven LCP pin origin rank%d: %s",deepseek41::kIndexB16Env,r->index,why.c_str());return RAD_E_UNSUPPORTED;
+            }
+            if(proof.rows>INT64_MAX/proof.columns/4)return RAD_E_INVAL;
+            RAD_INFO("ds41 index b16 admitted: rank=%d rows=%lld columns=%lld bytes=%lld legacy_bytes=%lld same_runs=1 writers=%d candidates=%d topk=%d",
+                r->index,(long long)proof.rows,(long long)proof.columns,(long long)(2*proof.rows*proof.columns),
+                (long long)(4*proof.rows*proof.columns),proof.writers,proof.candidates,proof.topk);
+        }
     }
     RAD_TRY(load_weights());
     RAD_TRY(configure_kv());
@@ -4495,6 +4564,10 @@ int Engine::start() {
                                 [rctx](int32_t layer, EpRouteCounts* out) {
                                     return rctx->ep_route_counts_live(layer, out);
                                 }));
+        if(ds41_phase2::audit::requested()&&!r->fstager.phase2_audit()) {
+            RAD_ERR("DSP2AUDIT refused rank=%d reason=native_4K_P1_stager_unavailable",r->index);
+            return RAD_E_INVAL;
+        }
         if (r->fstager.enabled() && r->index == 0)
             RAD_INFO("file stager: %zu routed layers hold experts read from the container; each "
                      "pass reads a layer's (up to %s) into one of two VRAM buffers before its "
@@ -4737,6 +4810,8 @@ int Engine::start() {
     }
 
     RAD_TRY(step_state_init());
+    RAD_TRY(kv_growth_start());
+    RAD_TRY(kv_layout_receipt());
 
     /* ---- the budget, checked against the card --------------------------------------------
      *
@@ -4761,6 +4836,15 @@ int Engine::start() {
         LogRank lr(r->index);
         RadDeviceProps props{};
         if (rad_dev_props(r->device, &props) < 0 || props.vram_bytes <= 0) continue;
+
+        if (kv_growth_) {
+            const int64_t actual = r->pools.kv().committed();
+            RAD_INFO("DS41_KV_GROW_BUDGET rank=%d free=%lld actual=%lld deferred=%lld "
+                     "maximum=%lld fixed_experts=1", r->index, (long long)props.vram_free,
+                     (long long)actual, (long long)(kv_growth_options_.maximum_bytes - actual),
+                     (long long)kv_growth_options_.maximum_bytes);
+            continue; // Deferred backing is funded KV capacity, not unused expert-pool slack.
+        }
 
         /* Both the headroom and the later allocations are still free here: serve() allocates
          * the step staging; the KV tiers' staging and a second lane are built on first use. */

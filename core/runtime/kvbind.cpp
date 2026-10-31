@@ -18,6 +18,7 @@ void bind_kv_pools(const Program& p, const std::function<const KVGroupPlan*(int3
         b.layer_stride = gp->layer_stride();
         b.bytes        = gp->pool_bytes;
         b.dtype        = p.kv_groups[g].decl.dtype;
+        b.storage_format = p.kv_groups[g].decl.storage_format;
 
         /* The position of every bound layer, indexed by its absolute number. */
         const std::vector<int32_t>& ls = p.kv_groups[g].layers;
@@ -35,7 +36,16 @@ void bind_kv_pools(const Program& p, const std::function<const KVGroupPlan*(int3
         case RAD_KV_FULL:
         case RAD_KV_WINDOW:
         case RAD_KV_RING:
-            b.rank = 4;
+            /* Packed storage is an honest physical byte tensor. Presenting a smaller allocation
+             * as logical BF16 rank 4 would let an ordinary reader walk beyond its page. */
+            b.rank = d.storage_format == RAD_KV_STORAGE_PLAIN ? 4 : 2;
+            if (d.storage_format != RAD_KV_STORAGE_PLAIN) {
+                b.dtype = RAD_U8;
+                b.shape[0] = gp->pool_blocks();
+                b.shape[1] = d.storage_block_bytes;
+                kv_bind_views(*gp, &b);
+                break;
+            }
             /* Set again per view by kv_bind_views. */
             b.shape[0] = gp->pool_blocks();
             b.shape[1] = d.n_head_kv;

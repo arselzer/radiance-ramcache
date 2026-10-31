@@ -1,6 +1,22 @@
 #include "scheduler.h"
 
 namespace rad {
+bool Scheduler::policy_block_owner(int step, const BlockRow* rows, int n, uint64_t* frame) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (!frame || !draft_experiment_.prefix_policy().on || cfg_.max_seqs <= 1 || !dsolo_ ||
+        !dctx_.on || !step_open_ || next_open_ || !policy_frame_open_ ||
+        policy_frame_step_ != step || !policy_frame_epoch_ || n < 0 || n > 1 || (n && !rows)) return false;
+    int owners = 0;
+    for (const BlockSeq& b : block_) {
+        if (!b.can_draft) continue;
+        if (++owners > 1 || n != 1 || policy_frame_solo_ || block_len_ != 2 || block_depth_ != 2 ||
+            b.mirror || !block_req(b) || b.seq != rows[0].seq || b.slot != rows[0].slot ||
+            b.card != rows[0].card) return false;
+    }
+    if (owners != n) return false;
+    *frame = policy_frame_epoch_;
+    return true;
+}
 /* The block snapshot keeps the Request alive; identity/card/position are nevertheless checked
  * under mu_ so cancellation/reuse cannot validate another sequence's StepSlot. */
 bool Scheduler::measure_block_binding(const BlockRow& row, int32_t ctx, int accepted,

@@ -147,6 +147,22 @@ int Pool::decommit(int64_t off, int64_t bytes) {
     return vm_.decommit(off, bytes);
 }
 
+int Pool::commit_backing_granule(int64_t off) {
+    if (!elastic_) return RAD_E_UNSUPPORTED;
+    const int64_t G = VMem::granularity();
+    if (G <= 0 || off < 0 || off % G || vm_.size() < G || off > vm_.size() - G)
+        return RAD_E_INVAL;
+    return vm_.commit(off, G);
+}
+
+int Pool::release_backing_granule(int64_t off) {
+    if (!elastic_) return RAD_E_UNSUPPORTED;
+    const int64_t G = VMem::granularity();
+    if (G <= 0 || off < 0 || off % G || vm_.size() < G || off > vm_.size() - G)
+        return RAD_E_INVAL;
+    return vm_.decommit(off, G);
+}
+
 std::string Pool::report() const {
     std::string s = fmt("%-14s %10s budget, %10s used, %10s free\n",
                         name_.c_str(), humanb(bytes_).c_str(), humanb(used_).c_str(),

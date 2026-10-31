@@ -39,7 +39,11 @@ namespace {
 constexpr int kWorld = 4;
 
 const char* const kVars[] = { "RADIANCE_EXPERIMENTAL_DS41_P1",
+                              "RADIANCE_EXPERIMENTAL_DS41_KV_PACKED",
+                              "RADIANCE_EXPERIMENTAL_DS41_KV_PACKED_FAST",
+                              "RADIANCE_EXPERIMENTAL_DS41_WINDOW_PACKED",
                               deepseek41::kIndexCompactEnv,
+                              deepseek41::kIndexB16Env,
                               "RADIANCE_EXPERIMENTAL_DS41_P1_LEND_ARENA",
                               "RADIANCE_EXPERIMENTAL_DS41_LCP",
                               "RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL",
@@ -371,6 +375,34 @@ TEST(compact_index_score_metadata_keeps_32k_and_bounds_512k_1m_without_allocatin
     }
 }
 
+TEST(index_b16_score_plane_halves_only_storage_preserving_rows_runs_graph_and_sizing) {
+    Env e{ WINDOW_SWITCHES };
+    for(int rank=0;rank<4;++rank)for(int compact=0;compact<2;++compact) {
+        setenv("RADIANCE_EXPERIMENTAL_DS41_LCP","2048",1);
+        setenv(deepseek41::kIndexCompactEnv,compact?"1":"0",1);
+        unsetenv(deepseek41::kIndexB16Env);
+        auto old=declare(rank,2048,false,32768);REQUIRE_EQ(old->rc,RAD_OK);
+        setenv(deepseek41::kIndexB16Env,"1",1);
+        auto b16=declare(rank,2048,false,32768);REQUIRE_EQ(b16->rc,RAD_OK);
+        CHECK_EQ(old->m->irows,b16->m->irows);CHECK_EQ(old->m->iparts,b16->m->iparts);
+        const RecBuf* a=find_b(old->b,"index_score"),*b=find_b(b16->b,"index_score");REQUIRE(a&&b);
+        CHECK_EQ(a->d.dtype,RAD_F32);CHECK_EQ(b->d.dtype,RAD_BF16);
+        CHECK_EQ(a->d.shape[0],b->d.shape[0]);CHECK_EQ(a->d.shape[1],b->d.shape[1]);
+        CHECK_EQ(old->b.ops.size(),b16->b.ops.size());
+        for(size_t i=1;i<old->b.ops.size();++i) {
+            const std::string before=old->b.ops[i].op,after=b16->b.ops[i].op;
+            CHECK(after==(before=="index_score"?"index_score_b16":before=="index_candidates"?"index_candidates_b16":
+                before=="index_topk"?"index_topk_b16":before));
+        }
+        auto probe=declare(rank,64,true,32768);REQUIRE_EQ(probe->rc,RAD_OK);
+        CHECK(probe->m->index_b16);CHECK_EQ(probe->m->iparts,b16->m->iparts);
+        CHECK(differs(b16->b,probe->b).empty());
+    }
+    setenv(deepseek41::kIndexB16Env,"bad",1);CHECK_EQ(declare(0,2048,false)->rc,RAD_E_INVAL);
+    setenv(deepseek41::kIndexB16Env,"1",1);setenv("RADIANCE_EXPERIMENTAL_DS41_KV_PACKED","1",1);
+    CHECK_EQ(declare(0,2048,false)->rc,RAD_E_UNSUPPORTED);unsetenv("RADIANCE_EXPERIMENTAL_DS41_KV_PACKED");
+}
+
 TEST(compact_index_score_requires_lcp_and_sizing_levels_keep_the_real_run_graph) {
     Env e{ WINDOW_SWITCHES };
     setenv(deepseek41::kIndexCompactEnv, "1", 1);
@@ -532,10 +564,50 @@ TEST(lcp4096_keeps_the_small_arena_level_and_full_step_bounds) {
             const int64_t room = full - level - (1 << 20);
             CHECK(room / ds41p1::kSlotBytes >= ds41p1::kMaxLend);
             std::fprintf(stderr, "  LCP4096 arena %.1f MiB, level256 %.1f MiB, %lld physical slots; "
-                                 "lending cap remains %d\n", full / 1048576.0, level / 1048576.0,
-                         (long long)(room / ds41p1::kSlotBytes), ds41p1::kMaxLend);
+                                 "arena lending cap %d (actual room still bounds slots)\n", full / 1048576.0, level / 1048576.0,
+                         (long long)(room / ds41p1::kSlotBytes), ds41p1::kMaxArenaLend);
         }
     }
+}
+
+TEST(native_packed_window_capture_tracks_actual_consumer_cuts_and_sizing_rows) {
+    Env e{WINDOW_SWITCHES};
+    setenv("RADIANCE_EXPERIMENTAL_DS41_KV_PACKED","1",1);
+    setenv("RADIANCE_EXPERIMENTAL_DS41_WINDOW_PACKED","1",1);
+    setenv("RADIANCE_EXPERIMENTAL_DS41_LCP","2048",1);
+    for(int rank=0;rank<kWorld;++rank){
+        auto real=declare(rank,2048,false);REQUIRE_EQ(real->rc,RAD_OK);REQUIRE(real->m);
+        const auto* m=real->m;CHECK(m->window_packed);CHECK(m->win_pack!=0);
+        const auto& win=real->b.kv_groups[(size_t)m->win-1];
+        CHECK_EQ(win.d.kind,RAD_KV_WINDOW);CHECK_EQ(win.d.storage_format,uint32_t(3));
+        CHECK_EQ(win.d.storage_block_bytes,8448ll);CHECK_EQ(win.d.head_dim,256ll);
+        auto probe=declare(rank,256,true);REQUIRE_EQ(probe->rc,RAD_OK);CHECK(differs(real->b,probe->b).empty());
+        auto batch=kit(real->b,{1},{37},1040);RadCtx c;c.b=&real->b;c.batch=&batch->b;c.rank=rank;c.world=kWorld;
+        deepseek41::step(&c,&batch->b);CHECK(c.step_fail.empty());
+        int producers=0,stores=0,readers=0;
+        for(const auto&is:c.issues){
+            const auto&op=real->b.ops[(size_t)is.op-1];
+            if(op.op=="rmsnorm_rope_roundtrip_windowpack"){
+                REQUIRE_EQ(is.opd.size(),size_t(6));const auto&actual=is.opd[2];const auto&cap=is.opd[5];
+                CHECK_EQ(actual.rows,cap.rows);CHECK_EQ(cap.handle,m->win_pack);
+                CHECK_EQ(cap.offset,(actual.offset/512)*528);++producers;
+            }
+            if(op.op=="kv_store_windowpack"){
+                REQUIRE_EQ(is.opd.size(),size_t(4));const auto&actual=is.opd[0];const auto&cap=is.opd[1];
+                CHECK_EQ(actual.rows,cap.rows);CHECK_EQ(cap.handle,m->win_pack);
+                CHECK_EQ(cap.offset,(actual.offset/512)*528);CHECK_EQ(is.opd[3].handle,m->win);++stores;
+            }
+            if(op.op=="attn_sparse_sink_windowpack"){
+                REQUIRE_EQ(is.opd.size(),size_t(11));CHECK_EQ(is.opd[1].handle,m->win);++readers;
+            }
+        }
+        CHECK_EQ(producers,m->c.n_layer);CHECK_EQ(stores,m->c.n_layer);CHECK_EQ(readers,m->c.n_layer);
+        CHECK(overruns(real->b,probe->b,batch->b,rank,nullptr).empty());
+    }
+    setenv("RADIANCE_EXPERIMENTAL_DS41_KV_PACKED","0",1);
+    CHECK_EQ(declare(0,2048,false)->rc,RAD_E_UNSUPPORTED);
+    setenv("RADIANCE_EXPERIMENTAL_DS41_WINDOW_PACKED","2",1);
+    CHECK_EQ(declare(0,2048,false)->rc,RAD_E_INVAL);
 }
 
 TEST(the_256_row_level_ends_far_below_the_full_plan) {

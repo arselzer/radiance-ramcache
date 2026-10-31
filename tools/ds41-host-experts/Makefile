@@ -34,6 +34,12 @@ $(O)/ds41_bf16f8_device_check: ds41_bf16f8_device_check.hip $(TREE)/libr4d/r4d_b
 	$(HIPCC) $(HIPFLAGS) -I$(TREE)/abi -I$(TREE)/libr4d -o $@ ds41_bf16f8_device_check.hip -ldl
 device-check: $(O)/ds41_bf16f8_device_check
 
+# Original f32 score kernels remain the independent reference. Run only in a
+# guarded GPU window, in fresh unpinned/exact/lcp4096 processes on all4cards.
+$(O)/ds41_index_b16_device_check: ds41_index_b16_device_check.hip $(TREE)/arch/common/rad_ds41_score_b16.h
+	$(HIPCC) $(HIPFLAGS) -I$(TREE)/abi -o $@ ds41_index_b16_device_check.hip -ldl
+index-b16-check: $(O)/ds41_index_b16_device_check
+
 # The card check of the host experts against libr4d's decode kernels (check, swiglu, time, ptime)
 # and of RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL (`tall`: the routed GEMM's twin row, the sparse
 # attention and the indexer score at passes taller than 16 tokens against the same rows in smaller
@@ -57,6 +63,22 @@ $(O)/ds41_n128_device_check: $(TREE)/tests/r4d_emu/test_ds41n128.cpp $(TREE)/lib
 	$(HIPCC) $(HIPFLAGS) -DDS41_N128_DEVICE -I$(TREE)/abi -I$(TREE)/libr4d -o $@ $< -ldl
 n128-check: $(O)/ds41_n128_device_check
 
+# Exact packed-KV codec arithmetic; optional libr4d argument also checks producer/store capture.
+# This target only builds. Run the resulting binary only in a stopped-QFN GPU window.
+$(O)/ds41_kv_codec_device_check: ds41_kv_codec_device_check.hip $(TREE)/arch/common/rad_ds41_kv_codec.h
+	$(HIPCC) $(HIPFLAGS) -I$(TREE)/abi -o $@ $< -ldl
+kv-codec-check: $(O)/ds41_kv_codec_device_check
+
+# Strict packed-cache code/scale + fused producer + all reader paths. GPU window only.
+$(O)/ds41_kv_packed_paths_check: ds41_kv_packed_paths_check.hip ds41_kv_codec_device_check.hip $(TREE)/arch/common/rad_ds41_kv_codec.h
+	$(HIPCC) $(HIPFLAGS) -I$(TREE)/abi -I$(TREE)/libr4d -o $@ ds41_kv_packed_paths_check.hip -ldl
+kv-packed-paths-check: $(O)/ds41_kv_packed_paths_check
+
+# Independent reference-vs-optional-fast codec BYTE oracle. No performance measurement.
+$(O)/ds41_kv_fast_device_check: ds41_kv_fast_device_check.hip ds41_kv_fast_oracle.h $(TREE)/arch/common/rad_ds41_kv_codec.h $(TREE)/arch/common/rad_ds41_kv_fast.h
+	$(HIPCC) $(HIPFLAGS) -I$(TREE)/abi -o $@ $<
+kv-fast-check: $(O)/ds41_kv_fast_device_check
+
 # Strict standalone FP8-window bytes against the actual current producer; GPU window only.
 $(O)/ds41_window_codec_device_check: ds41_window_codec_device_check.hip $(TREE)/arch/common/rad_ds41_window_codec.h
 	$(HIPCC) $(HIPFLAGS) -I$(TREE)/abi -o $@ $< -ldl
@@ -66,4 +88,10 @@ window-codec-check: $(O)/ds41_window_codec_device_check
 clean:
 	rm -f ds41_host_experts_test ds41_dense_fp8_scan ds41_bf16f8_device_check
 
-.PHONY: clean scan device-check mxfp4-check n128-check router-eval
+.PHONY: clean scan device-check mxfp4-check n128-check kv-codec-check kv-packed-paths-check kv-fast-check router-eval
+
+# Requires the independent original-producer codec gate first; all arithmetic flags stay identical.
+$(O)/ds41_window_packed_paths_check: ds41_window_packed_paths_check.hip ds41_window_codec_device_check.hip $(TREE)/arch/common/rad_ds41_window_codec.h
+	$(HIPCC) $(HIPFLAGS) -I$(TREE)/abi -I$(TREE)/libr4d -o $@ ds41_window_packed_paths_check.hip -ldl
+window-packed-paths-check: $(O)/ds41_window_packed_paths_check
+.PHONY: window-packed-paths-check

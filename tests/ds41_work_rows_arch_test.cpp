@@ -54,6 +54,8 @@ const char* const kVars[] = { "RADIANCE_EXPERIMENTAL_DS41_LCP",
                               "RADIANCE_EXPERIMENTAL_DS41_ENGRAM_SPLIT",
                               "RADIANCE_EXPERIMENTAL_DS41_DENSE_FP8",
                               "RADIANCE_EXPERIMENTAL_DS41_ROUTER_BF16",
+                              "RADIANCE_EXPERIMENTAL_DS41_KV_PACKED",
+                              "RADIANCE_EXPERIMENTAL_DS41_KV_PACKED_FAST",
                               "RADIANCE_EXPERIMENTAL_DS41_KV_REPLICATED",
                               "RADIANCE_EXPERIMENTAL_SCHED_TBO" };
 struct Env {
@@ -900,6 +902,114 @@ TEST(a_split_step_issues_each_micro_batchs_work_rows_at_its_sequences) {
     }
     REQUIRE_EQ(per.size(), (size_t)3);
     for (const auto& [l, v] : per) CHECK(v == std::vector<int64_t>({ 4, 3 }) || v == std::vector<int64_t>({ 3, 4 }));
+}
+
+TEST(kv_packed_is_off_by_default_and_zero_has_identical_graph_and_issues) {
+    uint64_t graph = 0, issues = 0;
+    for (int on = 0; on < 2; ++on) {
+        Env e{ WINDOW_SWITCHES, { "RADIANCE_EXPERIMENTAL_DS41_LCP", "256" } };
+        if (on) setenv("RADIANCE_EXPERIMENTAL_DS41_KV_PACKED", "0", 1);
+        auto d = declare(0, 256, 8);
+        REQUIRE_EQ(d->rc, RAD_OK);
+        CHECK(!d->m->kv_packed);
+        CHECK_EQ(d->m->lat_pack, rad_buf(0)); CHECK_EQ(d->m->ik_pack, rad_buf(0));
+        for (const auto& kv : d->b.kv_groups) {
+            CHECK_EQ(kv.d.storage_format, uint32_t(0)); CHECK_EQ(kv.d.storage_block_bytes, int64_t(0));
+        }
+        auto k = step_of(d->b, { {1,41}, {3,43} }, {});
+        auto v = run_passes(d->b, deepseek41::step, { k.get() }, 0, 4);
+        REQUIRE(steps_ok(v));
+        if (!on) { graph=graph_hash(d->b); issues=issue_hash(d->b,v,{k.get()}); }
+        else { CHECK_EQ(graph_hash(d->b),graph); CHECK_EQ(issue_hash(d->b,v,{k.get()}),issues); }
+    }
+}
+
+TEST(kv_packed_keeps_logical_bf16_geometry_and_pairs_each_capture_with_its_store) {
+    Env e{ WINDOW_SWITCHES, { "RADIANCE_EXPERIMENTAL_DS41_LCP", "256" },
+           { "RADIANCE_EXPERIMENTAL_DS41_KV_PACKED", "1" } };
+    auto d=declare(0,256,8);
+    REQUIRE_EQ(d->rc,RAD_OK); REQUIRE(d->m->kv_packed); CHECK(!d->m->kv_packed_fast);
+    REQUIRE(d->m->lat_pack); REQUIRE(d->m->ik_pack);
+    for(const auto& kv:d->b.kv_groups) {
+        CHECK(kv.d.dtype==RAD_BF16||kv.d.dtype==RAD_F32);
+        const bool lat=kv.name.rfind("kv_compressed_r",0)==0,idx=kv.name.rfind("kv_index_r",0)==0;
+        CHECK_EQ(kv.d.storage_format,uint32_t(lat?1:idx?2:0));
+        CHECK_EQ(kv.d.storage_block_bytes,int64_t(lat?288:idx?68:0));
+    }
+    for (const auto& seqs : { std::vector<Seq>{{1,41}}, std::vector<Seq>{{3,43},{1,48}} }) {
+        auto k=step_of(d->b,seqs,{}); auto v=run_passes(d->b,deepseek41::step,{k.get()},0,4);
+        REQUIRE(steps_ok(v));
+        std::map<rad_buf,size_t> capture;
+        size_t at=0,stores=0;
+        for(const auto& launch:v)for(const auto& is:launch->issues) {
+            const auto* op=d->b.op_of(is.op); REQUIRE(op); ++at;
+            if(op->op=="rmsnorm_rope_roundtrip_kvpack"||op->op=="rope_rows_roundtrip_kvpack"||op->op=="quant_roundtrip_kvpack") {
+                REQUIRE(!is.opd.empty()); capture[is.opd.back().handle]=at;
+            }
+            if(op->op=="entry_store_kvpack") {
+                REQUIRE_EQ(is.opd.size(),size_t(4)); REQUIRE(capture.count(is.opd[1].handle));
+                CHECK(capture[is.opd[1].handle]<at); CHECK_EQ(is.opd[0].rows,is.opd[1].rows);
+                CHECK_EQ(pint(op,"kv_format"),is.opd[1].handle==d->m->lat_pack?1:2); ++stores;
+            }
+            if(op->op=="index_score_kvpack") CHECK_EQ(pint(op,"kv_format"),int64_t(2));
+            if(op->op=="attn_sparse_sink_kvpack") CHECK_EQ(pint(op,"kv_format"),int64_t(1));
+        }
+        CHECK_EQ(stores,size_t(8));
+    }
+}
+
+TEST(kv_packed_refuses_invalid_flag_and_missing_required_kernel) {
+    for(const char* flag:{"yes","2",""}) {
+        Env e{{"RADIANCE_EXPERIMENTAL_DS41_KV_PACKED",flag}};
+        auto d=declare(0,16,1); CHECK_EQ(d->rc,RAD_E_INVAL);
+    }
+    for(const char* missing:{"quant_roundtrip_kvpack","entry_store_kvpack","index_score_kvpack","attn_sparse_sink_kvpack"}) {
+        Env e{{"RADIANCE_EXPERIMENTAL_DS41_KV_PACKED","1"}};
+        RadBuilder b; b.undeclared.insert(missing); auto meta=flash_meta(); auto ctx=build_ctx(0,4);
+        CHECK_EQ(deepseek41::declare(&b,meta.meta(),&ctx),RAD_E_UNSUPPORTED);
+    }
+}
+
+TEST(kv_packed_fused_refusal_keeps_original_chain_and_requires_captured_roundtrip) {
+    Env e{{"RADIANCE_EXPERIMENTAL_DS41_KV_PACKED","1"}};
+    RadBuilder b; b.kv_block_of=block_of;
+    b.refuse.insert("rmsnorm_rope_roundtrip_kvpack");
+    b.refuse.insert("rope_rows_roundtrip_kvpack");
+    auto meta=flash_meta(); auto ctx=build_ctx(0,4);
+    REQUIRE_EQ(deepseek41::declare(&b,meta.meta(),&ctx),RAD_OK);
+    const auto& m=*deepseek41::models[0];
+    for(const auto& L:m.layers)if(L.src) {
+        CHECK_EQ(L.k_f,rad_op(0)); CHECK_EQ(L.l_f,rad_op(0));
+        REQUIRE(L.k_norm); REQUIRE(L.k_rope); REQUIRE(L.l_rope);
+        REQUIRE(L.k_q); REQUIRE(L.l_q);
+        CHECK_EQ(b.op_of(L.k_q)->op,std::string("quant_roundtrip_kvpack"));
+        CHECK_EQ(b.op_of(L.l_q)->op,std::string("quant_roundtrip_kvpack"));
+        CHECK_EQ(b.op_of(L.k_q)->writes.back(),m.ik_pack);
+        CHECK_EQ(b.op_of(L.l_q)->writes.back(),m.lat_pack);
+    }
+}
+
+TEST(kv_packed_fast_is_independent_default_off_and_keeps_the_same_graph_and_issues) {
+    uint64_t graph = 0, issues = 0;
+    for (const char* flag : { "0", "1" }) {
+        Env e{ WINDOW_SWITCHES, { "RADIANCE_EXPERIMENTAL_DS41_LCP", "256" },
+               { "RADIANCE_EXPERIMENTAL_DS41_KV_PACKED", "1" },
+               { "RADIANCE_EXPERIMENTAL_DS41_KV_PACKED_FAST", flag } };
+        auto d=declare(0,256,8); REQUIRE_EQ(d->rc,RAD_OK);
+        CHECK_EQ(d->m->kv_packed_fast, flag[0]=='1');
+        auto k=step_of(d->b,{{1,41},{3,43}},{});
+        auto v=run_passes(d->b,deepseek41::step,{k.get()},0,4); REQUIRE(steps_ok(v));
+        if(flag[0]=='0'){graph=graph_hash(d->b);issues=issue_hash(d->b,v,{k.get()});}
+        else {CHECK_EQ(graph_hash(d->b),graph);CHECK_EQ(issue_hash(d->b,v,{k.get()}),issues);}
+    }
+    for (const char* flag : { "", "yes", "2" }) {
+        Env e{{"RADIANCE_EXPERIMENTAL_DS41_KV_PACKED","1"},
+              {"RADIANCE_EXPERIMENTAL_DS41_KV_PACKED_FAST",flag}};
+        auto d=declare(0,16,1); CHECK_EQ(d->rc,RAD_E_INVAL);
+    }
+    Env e{{"RADIANCE_EXPERIMENTAL_DS41_KV_PACKED","0"},
+          {"RADIANCE_EXPERIMENTAL_DS41_KV_PACKED_FAST","1"}};
+    auto d=declare(0,16,1); CHECK_EQ(d->rc,RAD_E_INVAL);
 }
 
 RAD_TEST_MAIN()

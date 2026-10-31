@@ -26,6 +26,8 @@
 #include <arch/rad_block_moe_fp8.h>
 #include <arch/rad_deepseek41_chat.h>
 #include <arch/rad_dflash_observe.h>
+#include <arch/rad_ds41_kv_codec.h>
+#include <arch/rad_ds41_window_codec.h>
 #include "ds41_prefetch_plan.h"
 #include "ds41_index_memory.h"
 #include "ista_dialect.h"
@@ -563,11 +565,17 @@ struct Model {
      * gives every op on them a row's bits at any height (norms_pinned()), else `work` whatever the
      * step, as before. */
     bool work_fit = false;
+    /* Physical FP4-code/scale pages; the logical cache and every reader's arithmetic stay BF16.
+     * Only native compressed/index producers are admitted. Window and F32 tails stay plain. */
+    bool kv_packed = false;
+    bool window_packed = false; // native FP8 WINDOW only; requires packed compressed/index pages
+    bool kv_packed_fast = false; // independent default-off reader arithmetic implementation
     /* The indexer scores a step's rows in runs of at most `irows` rows into one [irows, cmax] score
      * plane (index_runs()), at most `iparts` runs a step; `kwords` is index_candidates' keep, a bit
      * a block of the candidate layer's width, i32 words a row (0: the model has no candidates). */
     int64_t irows = 0, iparts = 0, kwords = 0;
     bool index_compact = false;  /* requested + valid LCP; actual library admitted by core before serving */
+    bool index_b16 = false; // same irows/runs/math; lossless high16-bit score storage only
     /* A sizing declare (RadBuildCtx::shape_probe; probe()): declared into scratch, never stepped, and
      * silent (the server log's lines and the window's counts of them are the real declare's). */
     bool probe = false;
@@ -584,6 +592,8 @@ struct Model {
     rad_buf qr = 0, qrn = 0, q = 0, kv = 0, kvn = 0, o = 0, oa = 0, attn_out = 0;
     rad_buf kvs = 0, stage = 0, page = 0, bpos = 0, nc = 0, pooled = 0, lat = 0, latn = 0,
             ik = 0, ikn = 0;
+    rad_buf win_pack = 0; // pass-local original FP8 window capture
+    rad_buf lat_pack = 0, ik_pack = 0; // transient original-code captures, never full-history shadows
     rad_buf iq = 0, iw = 0, score = 0, keep = 0, sel = 0, cs_a = 0, cs_b = 0;
     rad_buf ctok = 0, emb = 0, embd = 0, ekv = 0, ekv_part = 0;
     /* engram_kv's rows a rank computes when they are split over the ranks (0: replicated). */
@@ -916,14 +926,24 @@ static rad_op rope_rows(RadBuilder* b, const Model& m, int64_t rows, int64_t hea
               {}, { x, cs }, { x });
 }
 static rad_op roundtrip(RadBuilder* b, int64_t rows, int64_t n, int64_t block, const char* fmt,
-                        const char* scale, rad_buf x) {
+                        const char* scale, rad_buf x, rad_buf packed = 0, int kind = 0) {
+    if (packed)
+        return op(b, kind == 3 ? "quant_roundtrip_windowpack" : "quant_roundtrip_kvpack",
+                  { RAD_RANGE("M", 1, rows), RAD_INT("n", n), RAD_INT("block", block),
+                    RAD_STR("format", fmt), RAD_STR("scale", scale), RAD_STR("dtype", "bf16"),
+                    RAD_INT("kv_format", kind) }, {}, { x }, { x, packed });
     return op(b, "quant_roundtrip",
               { RAD_RANGE("M", 1, rows), RAD_INT("n", n), RAD_INT("block", block),
                 RAD_STR("format", fmt), RAD_STR("scale", scale), RAD_STR("dtype", "bf16") },
               {}, { x }, { x });
 }
 static rad_op entry_store(RadBuilder* b, int64_t rows, int64_t n, int64_t bs, rad_buf x,
-                          rad_buf page) {
+                          rad_buf page, rad_buf packed = 0, int kind = 0) {
+    if (packed)
+        return op(b, "entry_store_kvpack",
+                  { RAD_RANGE("M", 1, rows), RAD_INT("n", n), RAD_INT("block_size", bs),
+                    RAD_STR("dtype", "bf16"), RAD_INT("kv_format", kind) },
+                  {}, { x, packed, page }, {});
     return op(b, "entry_store",
               { RAD_RANGE("M", 1, rows), RAD_INT("n", n), RAD_INT("block_size", bs),
                 RAD_STR("dtype", "bf16") },
@@ -948,7 +968,15 @@ static rad_op fused(RadBuilder* b, const char* name, std::vector<RadParam> ps,
 /* rmsnorm (x, w -> y) then rope_rows and roundtrip over y, as one op: one head of n columns. */
 static rad_op norm_rope_rt(RadBuilder* b, const Model& m, int64_t rows, rad_weight w, int64_t n,
                            int64_t block, const char* fmt, const char* scale, rad_buf x, rad_buf y,
-                           rad_buf cs) {
+                           rad_buf cs, rad_buf packed = 0, int kind = 0) {
+    if (packed)
+        return fused(b, kind == 3 ? "rmsnorm_rope_roundtrip_windowpack" : "rmsnorm_rope_roundtrip_kvpack",
+                     { RAD_RANGE("M", 1, rows), RAD_INT("n", n), RAD_F64("eps", m.c.eps),
+                       RAD_INT("n_head", 1), RAD_INT("head_dim", n), RAD_INT("rot", m.c.rope),
+                       RAD_INT("off", n - m.c.rope), RAD_STR("mode", "gptj"), RAD_INT("inverse", 0),
+                       RAD_INT("block", block), RAD_STR("format", fmt), RAD_STR("scale", scale),
+                       RAD_STR("dtype", "bf16"), RAD_INT("kv_format", kind) },
+                     { w }, { x, cs }, { y, packed });
     return fused(b, "rmsnorm_rope_roundtrip",
                  { RAD_RANGE("M", 1, rows), RAD_INT("n", n), RAD_F64("eps", m.c.eps),
                    RAD_INT("n_head", 1), RAD_INT("head_dim", n), RAD_INT("rot", m.c.rope),
@@ -960,7 +988,14 @@ static rad_op norm_rope_rt(RadBuilder* b, const Model& m, int64_t rows, rad_weig
 /* rope_rows then roundtrip over all heads * hd columns of x, in place, as one op. */
 static rad_op rope_rt(RadBuilder* b, const Model& m, int64_t rows, int64_t heads, int64_t hd,
                       int inverse, int64_t block, const char* fmt, const char* scale, rad_buf x,
-                      rad_buf cs) {
+                      rad_buf cs, rad_buf packed = 0, int kind = 0) {
+    if (packed)
+        return fused(b, kind == 3 ? "rope_rows_roundtrip_windowpack" : "rope_rows_roundtrip_kvpack",
+                     { RAD_RANGE("M", 1, rows), RAD_INT("n_head", heads), RAD_INT("head_dim", hd),
+                       RAD_INT("rot", m.c.rope), RAD_INT("off", hd - m.c.rope), RAD_STR("mode", "gptj"),
+                       RAD_INT("inverse", inverse), RAD_INT("block", block), RAD_STR("format", fmt),
+                       RAD_STR("scale", scale), RAD_STR("dtype", "bf16"), RAD_INT("kv_format", kind) },
+                     {}, { x, cs }, { x, packed });
     return fused(b, "rope_rows_roundtrip",
                  { RAD_RANGE("M", 1, rows), RAD_INT("n_head", heads), RAD_INT("head_dim", hd),
                    RAD_INT("rot", m.c.rope), RAD_INT("off", hd - m.c.rope), RAD_STR("mode", "gptj"),
@@ -1153,6 +1188,18 @@ static int64_t keep_words(int64_t width, int64_t block) {
 static int index_runs(Model& m, const Model* real) {
     const auto& g = m.g;
     const auto& c = m.c;
+    if(!index_compact_parse(std::getenv(kIndexB16Env),&m.index_b16)) {
+        fprintf(stderr,"radiance: deepseek41: %s must be0/unset or1\n",kIndexB16Env);return RAD_E_INVAL;
+    }
+    /* A future packed-cache writer needs its OWN proven b16-store alias. Never
+     * fall through to the old f32 packed writer on a shortened score allocation. */
+    if(m.index_b16) {
+        const char* packed=std::getenv("RADIANCE_EXPERIMENTAL_DS41_KV_PACKED");
+        if(packed&&std::strcmp(packed,"0")&&*packed) {
+            fprintf(stderr,"radiance: deepseek41: %s requires a separately proven packed-cache score writer\n",kIndexB16Env);
+            return RAD_E_UNSUPPORTED;
+        }
+    }
     bool requested = false;
     if (!index_compact_parse(std::getenv(kIndexCompactEnv), &requested)) {
         fprintf(stderr, "radiance: deepseek41: %s must be0/unset or1\n", kIndexCompactEnv);
@@ -1174,6 +1221,7 @@ static int index_runs(Model& m, const Model* real) {
         m.iparts = real->iparts;
         m.irows = std::min(g.max_tok, real->irows);
         m.index_compact = real->index_compact;
+        m.index_b16 = real->index_b16;
     }
     m.kwords = 0;
     if (c.cand >= 0 && c.cand < c.n_layer && c.cand_block > 0 && c.ratio[(size_t)c.cand] > 0)
@@ -1182,7 +1230,7 @@ static int index_runs(Model& m, const Model* real) {
         fprintf(stderr, "radiance: deepseek41: compact index score: %s rows=%lld parts=%lld width=%lld "
                         "plane_bytes=%lld target_bytes=%lld floor=%lld (%s); %s; RoPE unchanged\n",
                 m.index_compact ? "requested" : "legacy fallback", (long long)m.irows,
-                (long long)m.iparts, (long long)m.cmax, (long long)(4 * m.irows * m.cmax),
+                (long long)m.iparts, (long long)m.cmax, (long long)((m.index_b16 ? 2 : 4) * m.irows * m.cmax),
                 (long long)kScorePlane, (long long)(m.index_compact ? kScoreCompactMin : kScoreRunMin),
                 kIndexCompactEnv, m.index_compact ? "requires actual scalar/LCP core admission" : "valid LCP absent");
     return RAD_OK;
@@ -1225,6 +1273,10 @@ static int buffers(RadBuilder* b, Model& m) {
     m.q = bf("q", { T, HD });
     m.kv = bf("window_kv", { T, c.head_dim });
     m.kvn = bf("window_kv_normed", { T, c.head_dim });
+    if (m.window_packed) {
+        m.win_pack = decl_b(b, nm.f("window_original_fp8"), RAD_U8, {T,528});
+        if (!m.win_pack) return RAD_E_INVAL;
+    }
     m.o = bf("attn_o", { T, HD });
     m.oa = bf("attn_o_lora", { T, m.gr * c.o_rank });
     m.attn_out = bf("attn_out", { T, D });
@@ -1239,9 +1291,16 @@ static int buffers(RadBuilder* b, Model& m) {
     m.latn = bf("comp_latent_normed", { LR, c.head_dim });
     m.ik = bf("index_k", { LR, c.idim });
     m.ikn = bf("index_k_normed", { LR, c.idim });
+    if (m.kv_packed) {
+        m.lat_pack = decl_b(b, nm.f("comp_original_fp4"), RAD_U8,
+                           { LR, rad_ds41_kv_codec::row_bytes(1u, c.head_dim) });
+        m.ik_pack = decl_b(b, nm.f("index_original_fp4"), RAD_U8,
+                          { LR, rad_ds41_kv_codec::row_bytes(2u, c.idim) });
+        if (!m.lat_pack || !m.ik_pack) return RAD_E_INVAL;
+    }
     m.iq = bf("index_q", { T, c.ih * c.idim });
     m.iw = bf("index_w", { T, c.ih });
-    m.score = decl_b(b, nm.f("index_score"), RAD_F32, { m.irows, m.cmax });
+    m.score = decl_b(b, nm.f("index_score"), m.index_b16 ? RAD_BF16 : RAD_F32, { m.irows, m.cmax });
     if (m.kwords > 0) m.keep = decl_b(b, nm.f("index_keep"), RAD_I32, { T, m.kwords });
     m.sel = decl_b(b, nm.f("index_sel"), RAD_I32, { T, c.itopk });
     m.cs_a = decl_b(b, nm.f("rope_window"), RAD_F32, { g.max_ctx, c.rope }, RAD_BUF_PERSIST);
@@ -1310,6 +1369,10 @@ static rad_kvgroup win_group(RadBuilder* b, Model& m) {
     d.window = m.c.window + m.g.max_spec;
     d.n_head_kv = 1;
     d.head_dim = m.c.head_dim / 2;
+    if (m.window_packed) {
+        d.storage_format = RAD_KV_STORAGE_DS41_FP8_WINDOW_G32;
+        d.storage_block_bytes = 16 * 528;
+    }
     return rad_decl_kv_group(b, m.nm.f("kv_window"), &d);
 }
 static rad_kvgroup tail_group(RadBuilder* b, Model& m, int64_t r) {
@@ -1327,6 +1390,11 @@ static rad_kvgroup full_group(RadBuilder* b, Model& m, const char* fmt, int64_t 
     d.dtype = RAD_BF16;
     d.n_head_kv = 1;
     d.head_dim = n / r / 2;
+    if (m.kv_packed) {
+        d.storage_format = n == 512 ? RAD_KV_STORAGE_DS41_FP4_E4M3_G16
+                                    : RAD_KV_STORAGE_DS41_FP4_POW2_G32;
+        d.storage_block_bytes = rad_ds41_kv_codec::row_bytes(d.storage_format, n);
+    }
     return rad_decl_kv_group(b, m.nm.f(fmt, (long long)r), &d);
 }
 
@@ -1595,6 +1663,11 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
          * but never issued, then zeroed (rad_kv_group_zero); the block's output is a fill of zeros
          * the all-reduce adds. */
         if (!m.win && !(m.win = win_group(b, m))) return RAD_E_INVAL;
+        if (m.window_packed)
+            L.kv_st = op(b, "kv_store_windowpack",
+                {RAD_RANGE("M",1,T),RAD_INT("n",512),RAD_INT("block_size",16),
+                 RAD_INT("kv_format",3),RAD_STR("dtype","bf16")}, {}, {m.kvn,m.win_pack}, {});
+        else
         L.kv_st = op(b, "kv_store",
                      { RAD_RANGE("M", 1, T), RAD_INT("head_dim", hd / 2), RAD_INT("n_head_kv", 1),
                        RAD_INT("block_size", 16), RAD_STR("kv_dtype", "bf16") },
@@ -1612,12 +1685,12 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
                 DS_TRY(rad_bind_layer_kv(b, l, m.tail[r]));
             }
             if (!m.index.count(r) && !(m.index[r] = full_group(b, m, "kv_index_r%lld", c.idim, r))) return RAD_E_INVAL;
-            L.k_st = entry_store(b, rows, c.idim, r, m.ikn, m.page);
+            L.k_st = entry_store(b, rows, c.idim, r, m.ikn, m.page, m.ik_pack, 2);
             if (rad_kv_block_size(b, m.index[r]) != r) return RAD_E_INVAL;
             DS_TRY(rad_bind_layer_kv(b, l, m.index[r]));
             DS_TRY(rad_kv_group_zero(b, m.index[r]));
             if (!m.comp.count(r) && !(m.comp[r] = full_group(b, m, "kv_compressed_r%lld", hd, r))) return RAD_E_INVAL;
-            L.l_st = entry_store(b, rows, hd, r, m.lat, m.page);
+            L.l_st = entry_store(b, rows, hd, r, m.lat, m.page, m.lat_pack, 1);
             if (rad_kv_block_size(b, m.comp[r]) != r) return RAD_E_INVAL;
             DS_TRY(rad_bind_layer_kv(b, l, m.comp[r]));
             DS_TRY(rad_kv_group_zero(b, m.comp[r]));
@@ -1641,13 +1714,23 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
         L.wkv = lw8(b, m, nm.f("blk.%d.attn_kv.weight", l), hd, D, grp);
         L.kv_norm = w("blk.%d.attn_kv_a_norm.weight", RAD_F32, { hd });
         L.kv_g = linear(b, m, T, L.wkv, hd, D, m.xn, m.kv);
-        L.kv_f = norm_rope_rt(b, m, T, L.kv_norm, hd, 32, "fp8_e4m3", "ue8m0", m.kv, m.kvn, cs);
+        L.kv_f = norm_rope_rt(b, m, T, L.kv_norm, hd, 32, "fp8_e4m3", "ue8m0", m.kv, m.kvn, cs,
+                                    m.window_packed ? m.win_pack : 0, m.window_packed ? 3 : 0);
+        /* First runtime gate requires the actual fused native producer. A missing alias must
+         * not silently inherit an unproved norm/rope fallback from another library. */
+        if (m.window_packed && !L.kv_f) return RAD_E_UNSUPPORTED;
         if (!L.kv_f) {
             L.kv_n = rmsnorm(b, m, T, L.kv_norm, hd, m.kv, m.kvn);
             L.kv_rope = rope_rows(b, m, T, 1, hd, 0, m.kvn, cs);
-            L.kv_q = roundtrip(b, T, hd, 32, "fp8_e4m3", "ue8m0", m.kvn);
+            L.kv_q = roundtrip(b, T, hd, 32, "fp8_e4m3", "ue8m0", m.kvn,
+                                  m.window_packed ? m.win_pack : 0, m.window_packed ? 3 : 0);
         }
         if (!m.win && !(m.win = win_group(b, m))) return RAD_E_INVAL;
+        if (m.window_packed)
+            L.kv_st = op(b, "kv_store_windowpack",
+                {RAD_RANGE("M",1,T),RAD_INT("n",512),RAD_INT("block_size",16),
+                 RAD_INT("kv_format",3),RAD_STR("dtype","bf16")}, {}, {m.kvn,m.win_pack}, {});
+        else
         L.kv_st = op(b, "kv_store",
                      { RAD_RANGE("M", 1, T), RAD_INT("head_dim", hd / 2), RAD_INT("n_head_kv", 1),
                        RAD_INT("block_size", 16), RAD_STR("kv_dtype", "bf16") },
@@ -1717,23 +1800,23 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
             L.ik_norm = w("blk.%d.indexer.k_norm.weight", RAD_F32, { c.idim });
             L.k_gemm = linear(b, m, rows, L.ik_w, c.idim, hd, m.lat, m.ik);
             L.k_f = norm_rope_rt(b, m, rows, L.ik_norm, c.idim, 32, "fp4_e2m1", "ue8m0", m.ik, m.ikn,
-                                 m.cs_b);
+                                 m.cs_b, m.ik_pack, 2);
             if (!L.k_f) {
                 L.k_norm = rmsnorm(b, m, rows, L.ik_norm, c.idim, m.ik, m.ikn);
                 L.k_rope = rope_rows(b, m, rows, 1, c.idim, 0, m.ikn, m.cs_b);
-                L.k_q = roundtrip(b, rows, c.idim, 32, "fp4_e2m1", "ue8m0", m.ikn);
+                L.k_q = roundtrip(b, rows, c.idim, 32, "fp4_e2m1", "ue8m0", m.ikn, m.ik_pack, 2);
             }
             if (!m.index.count(r) && !(m.index[r] = full_group(b, m, "kv_index_r%lld", c.idim, r))) return RAD_E_INVAL;
-            L.k_st = entry_store(b, rows, c.idim, r, m.ikn, m.page);
+            L.k_st = entry_store(b, rows, c.idim, r, m.ikn, m.page, m.ik_pack, 2);
             if (rad_kv_block_size(b, m.index[r]) != r) return RAD_E_INVAL;
             DS_TRY(rad_bind_layer_kv(b, l, m.index[r]));
-            L.l_f = rope_rt(b, m, rows, 1, hd, 0, 16, "fp4_e2m1", "e4m3", m.lat, m.cs_b);
+            L.l_f = rope_rt(b, m, rows, 1, hd, 0, 16, "fp4_e2m1", "e4m3", m.lat, m.cs_b, m.lat_pack, 1);
             if (!L.l_f) {
                 L.l_rope = rope_rows(b, m, rows, 1, hd, 0, m.lat, m.cs_b);
-                L.l_q = roundtrip(b, rows, hd, 16, "fp4_e2m1", "e4m3", m.lat);
+                L.l_q = roundtrip(b, rows, hd, 16, "fp4_e2m1", "e4m3", m.lat, m.lat_pack, 1);
             }
             if (!m.comp.count(r) && !(m.comp[r] = full_group(b, m, "kv_compressed_r%lld", hd, r))) return RAD_E_INVAL;
-            L.l_st = entry_store(b, rows, hd, r, m.lat, m.page);
+            L.l_st = entry_store(b, rows, hd, r, m.lat, m.page, m.lat_pack, 1);
             if (rad_kv_block_size(b, m.comp[r]) != r) return RAD_E_INVAL;
             DS_TRY(rad_bind_layer_kv(b, l, m.comp[r]));
             if (r > 1)
@@ -1759,11 +1842,13 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
             /* One index_score a run of rows (index_runs()): run p scores step rows [p R, p R + R)
              * into the score plane's first R rows. */
             for (int64_t p = 0; p < m.iparts; ++p) {
-                const rad_op h = op(b, "index_score",
-                                    { RAD_RANGE("M", 1, IR), RAD_INT("heads", c.ih), RAD_INT("dim", c.idim),
+                std::vector<RadParam> isp = { RAD_RANGE("M", 1, IR), RAD_INT("heads", c.ih), RAD_INT("dim", c.idim),
                                       RAD_INT("ratio", r), RAD_INT("width", width),
                                       RAD_F64("wscale", 1.0 / std::sqrt((double)c.idim * (double)c.ih)),
-                                      RAD_STR("dtype", "bf16"), RAD_INT("row_part", p) },
+                                      RAD_STR("dtype", "bf16"), RAD_INT("row_part", p) };
+                if (m.kv_packed) isp.push_back(RAD_INT("kv_format", 2));
+                const rad_op h = op(b, m.kv_packed ? "index_score_kvpack" :
+                                    (m.index_b16 ? "index_score_b16" : "index_score"), isp,
                                     {}, { m.iq, m.iw }, { m.score });
                 if (!h) return RAD_E_INVAL;
                 L.i_runs.push_back(h);
@@ -1771,7 +1856,7 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
             L.i_score = L.i_runs[0];
             if (l == c.cand) {
                 if (!m.keep) return RAD_E_INVAL;
-                L.i_cand = op(b, "index_candidates",
+                L.i_cand = op(b, m.index_b16 ? "index_candidates_b16" : "index_candidates",
                               { RAD_RANGE("M", 1, IR), RAD_INT("width", width),
                                 RAD_INT("block", c.cand_block), RAD_INT("topk_blocks", c.cand_blocks),
                                 RAD_INT("ratio", r) },
@@ -1787,7 +1872,7 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
             std::vector<RadParam> tp = { RAD_RANGE("M", 1, IR), RAD_INT("width", width),
                                          RAD_INT("topk", c.itopk), RAD_INT("ratio", r) };
             if (uses) tp.push_back(RAD_INT("block", c.cand_block));
-            L.i_topk = op(b, "index_topk", tp, {},
+            L.i_topk = op(b, m.index_b16 ? "index_topk_b16" : "index_topk", tp, {},
                           uses ? std::initializer_list<rad_buf>{ m.score, m.keep }
                                : std::initializer_list<rad_buf>{ m.score },
                           { m.sel });
@@ -1797,11 +1882,16 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
         /* ---- the sparse attention and the output projection */
         L.sinks = wts(b, g, nm.f("blk.%d.attn_sinks.weight", l), RAD_F32, { g.n_head }, grp, RAD_SHARD_ROW,
                       m.ar * g.n_head, (m.ar + 1) * g.n_head);
-        L.attn = op(b, "attn_sparse_sink",
-                    { RAD_RANGE("M", 1, T), RAD_INT("heads", g.n_head), RAD_INT("dim", hd),
+        std::vector<RadParam> ap = { RAD_RANGE("M", 1, T), RAD_INT("heads", g.n_head), RAD_INT("dim", hd),
                       RAD_INT("window", c.window), RAD_INT("ratio", r),
                       RAD_INT("topk", r > 0 ? c.itopk : 0),
-                      RAD_F64("scale", 1.0 / std::sqrt((double)hd)), RAD_STR("dtype", "bf16") },
+                      RAD_F64("scale", 1.0 / std::sqrt((double)hd)), RAD_STR("dtype", "bf16") };
+        if (m.window_packed) {
+            ap.push_back(RAD_INT("window_format",3));
+            ap.push_back(RAD_INT("kv_format",r > 0 ? 1 : 0));
+        } else if (m.kv_packed && r > 0) ap.push_back(RAD_INT("kv_format", 1));
+        L.attn = op(b, m.window_packed ? "attn_sparse_sink_windowpack" :
+                    m.kv_packed && r > 0 ? "attn_sparse_sink_kvpack" : "attn_sparse_sink", ap,
                     { L.sinks },
                     r > 0 ? std::initializer_list<rad_buf>{ m.q, m.sel }
                           : std::initializer_list<rad_buf>{ m.q },
@@ -2787,6 +2877,42 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     }
     const auto& c = m.c;
     auto& g = m.g;
+    if (const char* e = std::getenv("RADIANCE_EXPERIMENTAL_DS41_KV_PACKED")) {
+        if (std::strcmp(e, "0") && std::strcmp(e, "1")) return RAD_E_INVAL;
+        m.kv_packed = !std::strcmp(e, "1");
+    }
+    if (const char* e = std::getenv("RADIANCE_EXPERIMENTAL_DS41_KV_PACKED_FAST")) {
+        if (std::strcmp(e, "0") && std::strcmp(e, "1")) return RAD_E_INVAL;
+        m.kv_packed_fast = !std::strcmp(e, "1");
+    }
+    if (const char* e = std::getenv("RADIANCE_EXPERIMENTAL_DS41_WINDOW_PACKED")) {
+        if (std::strcmp(e,"0") && std::strcmp(e,"1")) return RAD_E_INVAL;
+        m.window_packed = !std::strcmp(e,"1");
+    }
+    if (m.window_packed) {
+        if (!m.kv_packed || c.head_dim != 512) {
+            fprintf(stderr,"radiance: deepseek41: WINDOW_PACKED requires KV_PACKED=1 and native512 window\n");
+            return RAD_E_UNSUPPORTED;
+        }
+        for (const char* name : {"quant_roundtrip_windowpack","rmsnorm_rope_roundtrip_windowpack","kv_store_windowpack","attn_sparse_sink_windowpack"})
+            if (!rad_op_declared(b,name)) return RAD_E_UNSUPPORTED;
+    }
+    if (m.kv_packed_fast && !m.kv_packed) {
+        fprintf(stderr, "radiance: deepseek41: KV_PACKED_FAST=1 requires KV_PACKED=1\n");
+        return RAD_E_INVAL;
+    }
+    if (m.kv_packed) {
+        if (c.head_dim != 512 || c.idim != 128) return RAD_E_UNSUPPORTED;
+        for (const auto r : c.ratio) if (r < 0 || r > 2) return RAD_E_UNSUPPORTED;
+        /* Never bind a shorter page to a plain cache reader, even if one packed implementation
+         * is absent. Fused producers may decline to the same old chain plus captured roundtrip. */
+        for (const char* name : { "quant_roundtrip_kvpack", "entry_store_kvpack",
+                                 "index_score_kvpack", "attn_sparse_sink_kvpack" })
+            if (!rad_op_declared(b, name)) {
+                fprintf(stderr, "radiance: deepseek41: KV_PACKED needs %s\n", name);
+                return RAD_E_UNSUPPORTED;
+            }
+    }
     int64_t rmin = 0;
     for (int l = 0; l < c.n_layer; ++l)
         if (c.ratio[(size_t)l] > 0 && (rmin == 0 || c.ratio[(size_t)l] < rmin)) rmin = c.ratio[(size_t)l];
@@ -2945,6 +3071,12 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     }
     m.layers.resize((size_t)c.n_layer);
     for (int l = 0; l < c.n_layer; ++l) DS_TRY(layer(b, m, m.layers[(size_t)l], l));
+    if (m.kv_packed && !m.probe)
+        fprintf(stderr, "radiance: deepseek41: KV_PACKED rank=%d zero=%d fast=%d latent_format=1 row_bytes=288 "
+                        "groups=%zu index_format=2 row_bytes=68 groups=%zu; BF16 reader math, %s window/F32 tail\n",
+                        g.rank, (int)m.zero, (int)m.kv_packed_fast, m.comp.size(), m.index.size(),m.window_packed?"packed FP8":"plain");
+    if (m.window_packed && !m.probe)
+        fprintf(stderr,"radiance: deepseek41: WINDOW_PACKED rank=%d zero=%d format=3 row_bytes=528 page_bytes=8448 block_size=16 groups=1; BF16 reader math, plain index-window/F32 tail\n",g.rank,(int)m.zero);
     DS_TRY(kv_replicate(b, m));
     if (m.router_bf16 && g.rank == 0 && !m.probe)
         fprintf(stderr, "radiance: deepseek41: RADIANCE_EXPERIMENTAL_DS41_ROUTER_BF16: %d routers "
@@ -3508,7 +3640,10 @@ static void step(RadCtx* x, const RadBatch* batch) {
             /* The window key's norm, rope and round trip: one op (kv_f) where declared, else
              * kv_n here and kv_rope / kv_q at the next two points. */
             const auto kv_n = [&] {
-                if (L.kv_f)
+                if (L.kv_f && m.window_packed)
+                    RAD_ISSUE_N(x,L.kv_f,nk,KR(m.kv,hd),RAD_W(L.kv_norm),KR(m.kvn,hd),
+                                brows(cs,g.max_ctx),kpos,KR(m.win_pack,528));
+                else if (L.kv_f)
                     RAD_ISSUE_N(x, L.kv_f, nk, KR(m.kv, hd), RAD_W(L.kv_norm), KR(m.kvn, hd),
                                 brows(cs, g.max_ctx), kpos);
                 else
@@ -3518,10 +3653,14 @@ static void step(RadCtx* x, const RadBatch* batch) {
                 if (!L.kv_f) RAD_ISSUE_N(x, L.kv_rope, nk, KR(m.kvn, hd), brows(cs, g.max_ctx), kpos);
             };
             const auto kv_q = [&] {
-                if (L.kv_q) RAD_ISSUE_N(x, L.kv_q, nk, KR(m.kvn, hd));
+                if (L.kv_q && m.window_packed) RAD_ISSUE_N(x,L.kv_q,nk,KR(m.kvn,hd),KR(m.win_pack,528));
+                else if (L.kv_q) RAD_ISSUE_N(x, L.kv_q, nk, KR(m.kvn, hd));
             };
             const auto kv_st = [&] {
-                RAD_ISSUE_N(x, L.kv_st, nk, bcol_at(m.kvn, rk, hd, 0, hd / 2, nk),
+                if (m.window_packed)
+                    RAD_ISSUE_N(x,L.kv_st,nk,KR(m.kvn,hd),KR(m.win_pack,528),
+                                praw(wb->slot_mapping+rk,RAD_I32,nk),kv_cache(m.win,l));
+                else RAD_ISSUE_N(x, L.kv_st, nk, bcol_at(m.kvn, rk, hd, 0, hd / 2, nk),
                             bcol_at(m.kvn, rk, hd, hd / 2, hd / 2, nk),
                             praw(wb->slot_mapping + rk, RAD_I32, nk), kv_cache(m.win, l));
             };
@@ -3558,7 +3697,10 @@ static void step(RadCtx* x, const RadBatch* batch) {
              * function issues the fused op at the chain's first point and nothing at the others. */
             const auto k_norm = [&] {
                 if (!L.src) return;
-                if (L.k_f)
+                if (L.k_f && m.kv_packed)
+                    RAD_ISSUE_N(x, L.k_f, rows, brows(m.ik, rows), RAD_W(L.ik_norm), brows(m.ikn, rows),
+                                brows(m.cs_b, g.max_ctx), bpos, brows(m.ik_pack, rows));
+                else if (L.k_f)
                     RAD_ISSUE_N(x, L.k_f, rows, brows(m.ik, rows), RAD_W(L.ik_norm), brows(m.ikn, rows),
                                 brows(m.cs_b, g.max_ctx), bpos);
                 else
@@ -3568,23 +3710,38 @@ static void step(RadCtx* x, const RadBatch* batch) {
                 if (L.src && !L.k_f) RAD_ISSUE_N(x, L.k_rope, rows, brows(m.ikn, rows), brows(m.cs_b, g.max_ctx), bpos);
             };
             const auto k_q = [&] {
-                if (L.src && L.k_q) RAD_ISSUE_N(x, L.k_q, rows, brows(m.ikn, rows));
+                if (L.src && L.k_q) {
+                    if (m.kv_packed) RAD_ISSUE_N(x, L.k_q, rows, brows(m.ikn, rows), brows(m.ik_pack, rows));
+                    else RAD_ISSUE_N(x, L.k_q, rows, brows(m.ikn, rows));
+                }
             };
             const auto k_st = [&] {
-                if (L.src) RAD_ISSUE_N(x, L.k_st, rows, brows(m.ikn, rows), page, kv_cache(m.index[r], l));
+                if (L.src) {
+                    if (m.kv_packed) RAD_ISSUE_N(x, L.k_st, rows, brows(m.ikn, rows), brows(m.ik_pack, rows), page, kv_cache(m.index[r], l));
+                    else RAD_ISSUE_N(x, L.k_st, rows, brows(m.ikn, rows), page, kv_cache(m.index[r], l));
+                }
             };
             const auto l_rope = [&] {
                 if (!L.src) return;
-                if (L.l_f)
+                if (L.l_f && m.kv_packed)
+                    RAD_ISSUE_N(x, L.l_f, rows, brows(m.lat, rows), brows(m.cs_b, g.max_ctx), bpos,
+                                brows(m.lat_pack, rows));
+                else if (L.l_f)
                     RAD_ISSUE_N(x, L.l_f, rows, brows(m.lat, rows), brows(m.cs_b, g.max_ctx), bpos);
                 else
                     RAD_ISSUE_N(x, L.l_rope, rows, brows(m.lat, rows), brows(m.cs_b, g.max_ctx), bpos);
             };
             const auto l_q = [&] {
-                if (L.src && L.l_q) RAD_ISSUE_N(x, L.l_q, rows, brows(m.lat, rows));
+                if (L.src && L.l_q) {
+                    if (m.kv_packed) RAD_ISSUE_N(x, L.l_q, rows, brows(m.lat, rows), brows(m.lat_pack, rows));
+                    else RAD_ISSUE_N(x, L.l_q, rows, brows(m.lat, rows));
+                }
             };
             const auto l_st = [&] {
-                if (L.src) RAD_ISSUE_N(x, L.l_st, rows, brows(m.lat, rows), page, kv_cache(m.comp[r], l));
+                if (L.src) {
+                    if (m.kv_packed) RAD_ISSUE_N(x, L.l_st, rows, brows(m.lat, rows), brows(m.lat_pack, rows), page, kv_cache(m.comp[r], l));
+                    else RAD_ISSUE_N(x, L.l_st, rows, brows(m.lat, rows), page, kv_cache(m.comp[r], l));
+                }
             };
             const auto c_tail = [&] {
                 if (ctail && L.c_tail)

@@ -101,4 +101,58 @@ TEST(dspark_prefix_policy_epoch_binding_and_mixed_action_costs) {
     meter.committed(false, false, 0, 0, true); CHECK_EQ(meter.pending.epoch, (uint64_t)0);
 }
 
+TEST(dspark_prefix_policy_concurrent_scope_requires_all_explicit_native_proofs) {
+    const auto profile = [](int64_t n, bool tree, int from, int full, int depth, int short_rows,
+                            bool dx, bool native, bool deterministic, bool tbo_off) {
+        return draft_prefix_policy_concurrent_profile(n, tree, from, full, depth, short_rows,
+                                                       dx, native, deterministic, tbo_off);
+    };
+    for (int n : {2, 4, 8}) CHECK(profile(n, false, 1, 5, 5, 2, true, true, true, true));
+    CHECK(!profile(1, false, 1, 5, 5, 2, true, true, true, true));
+    CHECK(!profile(4, true, 1, 5, 5, 2, true, true, true, true));
+    CHECK(!profile(4, false, 2, 5, 5, 2, true, true, true, true));
+    CHECK(!profile(4, false, 1, 4, 5, 2, true, true, true, true));
+    CHECK(!profile(4, false, 1, 5, 4, 2, true, true, true, true));
+    CHECK(!profile(4, false, 1, 5, 5, 3, true, true, true, true));
+    CHECK(!profile(4, false, 1, 5, 5, 2, false, true, true, true));
+    CHECK(!profile(4, false, 1, 5, 5, 2, true, false, true, true));
+    CHECK(!profile(4, false, 1, 5, 5, 2, true, true, false, true));
+    CHECK(!profile(4, false, 1, 5, 5, 2, true, true, true, false));
+    CHECK(draft_prefix_policy_profile(1, false, 1, 5, 5, 2)); // unchanged original admission
+    CHECK(!draft_prefix_policy_profile(4, false, 1, 5, 5, 2));
+}
+
+TEST(dspark_prefix_policy_concurrent_meter_never_prices_busy_idle_or_reused_frames) {
+    for (int gap : {0, 1, 2, 3, 4}) {
+        DraftMeasure m;
+        DraftMeasureFrame f;
+        f.seq = 7; f.card = 0; f.owner_slot = 3; f.k = 0; f.query_rows = 2;
+        f.epoch = 1; f.query_frame = 10; f.solo_span = 1; f.step = 20;
+        f.ready_ns = 100; f.pure_decode = true;
+        m.ready(f, false, true, true); CHECK(!m.committed(true, true, 1, 0, true));
+        ++f.epoch; ++f.query_frame; ++f.step; f.ready_ns += 100;
+        m.ready(f, true, true, true); CHECK(m.committed(true, true, 2, 0, true));
+        CHECK_EQ(m.stats.ns[0], uint64_t(100));
+        ++f.epoch; ++f.query_frame; ++f.step; f.ready_ns += 1000000000;
+        if (gap == 0) { m.no_query(); ++f.solo_span; } // actual busy/idle pause hook
+        if (gap == 1) f.step += 3;                    // missed pause cannot price a frame gap
+        if (gap == 2) f.query_frame += 3;
+        if (gap == 3) ++f.solo_span;
+        if (gap == 4) ++f.owner_slot;                 // slot/owner reuse invalidates a cycle
+        m.ready(f, true, true, true);
+        CHECK(!m.committed(true, true, 3, 0, true));
+        CHECK_EQ(m.stats.n[0], uint64_t(1));
+        CHECK_EQ(m.stats.ns[0], uint64_t(100));
+        ++f.epoch; ++f.query_frame; ++f.step; f.ready_ns += 100;
+        m.ready(f, true, true, true); CHECK(m.committed(true, true, 4, 0, true));
+        CHECK_EQ(m.stats.n[0], uint64_t(2)); CHECK_EQ(m.stats.ns[0], uint64_t(200));
+        ++f.epoch; ++f.query_frame; ++f.step; f.ready_ns += 100;
+        m.ready(f, true, true, true); CHECK(!m.committed(false, false, 4, 0, true));
+        CHECK_EQ(m.pending.epoch, uint64_t(0));
+        ++f.epoch; ++f.query_frame; ++f.step; ++f.seq; f.ready_ns += 100;
+        m.ready(f, false, true, true); CHECK(!m.committed(true, false, 1, 0, true));
+        CHECK_EQ(m.pending.epoch, uint64_t(0)); CHECK_EQ(m.stats.ns[0], uint64_t(200));
+    }
+}
+
 RAD_TEST_MAIN()

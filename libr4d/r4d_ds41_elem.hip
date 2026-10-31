@@ -22,6 +22,8 @@
 #include "r4d_emit.h"
 #include "r4d_launch.h"
 #include "r4d_plugin.h"
+#include "../arch/common/rad_ds41_kv_codec.h"
+#include "../arch/common/rad_ds41_window_codec.h"
 
 #include <atomic>
 #include <climits>
@@ -628,9 +630,42 @@ __device__ __forceinline__ float roundtrip(float v, float scale, int fmt) {
     return ds_e2m1_rt(ds_clamp(v / scale, -6.0f, 6.0f)) * scale;
 }
 
+/* Optional ORIGINAL quantizer-output capture. The BF16 arithmetic below is unchanged; this
+ * records the same pre-narrowing code/scale, never requantizes a dequantized BF16 value. Scale255
+ * is transient +Inf here; packed entry_store captures its actual BF16 payload as a literal pair. */
+struct KvCapture { uint8_t* p = nullptr; long pitch = 0; };
+int kv_capture_arg(const RadArgs* a, const RadTensor& t, long rows, long n, long block,
+                    int fmt, int sc, KvCapture* out) {
+    const long kind = (long)r4d_geti_or(a, "kv_format", 0);
+    const bool shape = (kind == 1 && fmt == kFp4 && block == 16 && sc == kE4m3 && n == 512) ||
+                       (kind == 2 && fmt == kFp4 && block == 32 && sc == kUe8m0 && n == 128) ||
+                       (kind == 3 && fmt == kFp8 && block == 32 && sc == kUe8m0 && n == 512);
+    const long bytes = kind == 3 ? rad_ds41_window_codec::row_bytes(n)
+                                 : rad_ds41_kv_codec::row_bytes((uint32_t)kind, n);
+    if (!shape || !mat(t, RAD_U8, rows, bytes)) return R4D_NO(RAD_E_SHAPE);
+    out->p = (uint8_t*)t.data; out->pitch = (long)t.stride[0];
+    return RAD_OK;
+}
 template <int B>
+__device__ __forceinline__ void kv_capture_group(float v, float scale, uint8_t* row,
+                                                 int col, int n, int sc, int fmt) {
+    if (fmt == kFp8) {
+        row[col] = ds_to_e4m3(ds_clamp(v / scale, -448.0f, 448.0f));
+        if (!(col % B)) row[n + col / B] = (uint8_t)(__float_as_uint(scale) >> 23);
+        return;
+    }
+    uint8_t code = 0;
+    const float q = ds_e2m1_rt(ds_clamp(v / scale, -6.0f, 6.0f));
+    (void)rad_ds41_kv_codec::code_from_fp32_bits(__float_as_uint(q), &code);
+    const uint32_t partner = __shfl_xor((uint32_t)code, 1, 32);
+    if (!(col & 1)) row[col / 2] = (uint8_t)(code | (partner << 4));
+    if (!(col % B)) row[n / 2 + col / B] = sc == kE4m3 ? (uint8_t)ds_to_e4m3(scale)
+                                                                    : (uint8_t)(__float_as_uint(scale) >> 23);
+}
+
+template <int B, bool Capture = false>
 __global__ __launch_bounds__(256) void quant_group_kernel(uint16_t* x, long xp, int n, long rows,
-                                                          int fmt, int sc) {
+                                                          int fmt, int sc, KvCapture capture) {
     const int col = blockIdx.x * 256 + threadIdx.x;
     const bool in = col < n;
     for (long r = blockIdx.y; r < rows; r += gridDim.y) {
@@ -639,7 +674,11 @@ __global__ __launch_bounds__(256) void quant_group_kernel(uint16_t* x, long xp, 
         float a = fabsf(v);
         a = a == a ? a : 0.0f;  // std::max(amax, NaN) keeps amax: a NaN never wins
         const float amax = r4d_xor_max<B>(a);
-        if (in) row[col] = ds_bf16(roundtrip(v, block_scale(amax, fmt, sc), fmt));
+        if (in) {
+            const float scale = block_scale(amax, fmt, sc);
+            row[col] = ds_bf16(roundtrip(v, scale, fmt));
+            if constexpr (Capture) kv_capture_group<B>(v, scale, capture.p + r * capture.pitch, col, n, sc, fmt);
+        }
     }
 }
 
@@ -656,7 +695,7 @@ __global__ __launch_bounds__(256) void quant_serial_kernel(uint16_t* x, long xp,
     }
 }
 
-int quant_rt_body(const RadArgs* a, RadStream stream) {
+int quant_rt_body(const RadArgs* a, RadStream stream, bool capture_on = false) {
     if (!a || a->n_t < 1 || !a->t[0].data) return RAD_E_INVAL;
     const RadTensor& x = a->t[0];
     const long n = (long)r4d_geti_or(a, "n", 0), block = (long)r4d_geti_or(a, "block", 0);
@@ -680,10 +719,20 @@ int quant_rt_body(const RadArgs* a, RadStream stream) {
     uint16_t* xd = (uint16_t*)x.data;
     const long xp = (long)x.stride[0];
     const dim3 grid((unsigned)((n + 255) / 256), grid_rows(rows));
+    KvCapture capture;
+    if (capture_on) {
+        if (a->n_t < 2) return R4D_NO(RAD_E_INVAL);
+        const int rc = kv_capture_arg(a, a->t[1], rows, n, block, fmt, sc, &capture);
+        if (rc < 0) return rc;
+        if (block == 16) return R4D_EMIT(stream, (quant_group_kernel<16, true>), grid, dim3(256), 0,
+                                        xd, xp, (int)n, rows, fmt, sc, capture);
+        return R4D_EMIT(stream, (quant_group_kernel<32, true>), grid, dim3(256), 0,
+                         xd, xp, (int)n, rows, fmt, sc, capture);
+    }
 #define QRT_GROUP(B)                                                                               \
     case B:                                                                                        \
         return R4D_EMIT(stream, quant_group_kernel<B>, grid, dim3(256), 0, xd, xp, (int)n, rows,   \
-                        fmt, sc)
+                        fmt, sc, capture)
     switch (block) {
         QRT_GROUP(1);
         QRT_GROUP(2);
@@ -1273,6 +1322,87 @@ int entry_store_body(const RadArgs* a, RadStream stream) {
                     (int)n, W);
 }
 
+/* Finalize one ORIGINAL captured group against the unchanged BF16 producer's actual bits.
+ * No BF16 reencoding, external escape pool or partial-sequence retry. The admitted producer
+ * domain is closed (finite original grid, optional min-scale FTZ, or <=2 Inf-product patterns).
+ * Raw here is a violated implementation invariant, not an exceptional-input fallback. */
+__global__ __launch_bounds__(128) void entry_store_kvpack_kernel(
+    const uint16_t* actual, long ap, const uint8_t* capture, long cp,
+    const int32_t* pages, long ps, uint8_t* cache, long kp, long blocks,
+    long rows, int n, uint32_t kind) {
+    const int G = rad_ds41_kv_codec::group_size(kind);
+    const int g = blockIdx.x * 128 + threadIdx.x;
+    if (g >= n / G) return;
+    for (long row = blockIdx.y; row < rows; row += gridDim.y) {
+        const long page = pages[row * ps];
+        if (page < 0 || page >= blocks) continue;
+        const uint8_t* src = capture + row * cp;
+        uint8_t codes[32]; uint16_t bits[32];
+        for (int i = 0; i < G; ++i) {
+            codes[i] = rad_ds41_kv_codec::nibble(src + g * (G / 2), i);
+            bits[i] = ds_bf16(ds_bf(actual[row * ap + g * G + i])); // old entry_store rounding
+        }
+        uint8_t* dst = cache + page * kp;
+        const auto result = rad_ds41_kv_codec::pack_captured_group(
+            kind, src[n / 2 + g], codes, bits, dst + g * (G / 2), dst + n / 2 + g);
+        if (result != rad_ds41_kv_codec::PackResult::Exact) __builtin_trap();
+    }
+}
+int entry_store_kvpack_body(const RadArgs* a, RadStream stream) {
+    if (!a || a->n_t < 4) return RAD_E_INVAL;
+    const auto &x = a->t[0], &capture = a->t[1], &page = a->t[2], &cache = a->t[3];
+    const long n = (long)r4d_geti_or(a, "n", 0), bs = (long)r4d_geti_or(a, "block_size", 0);
+    const uint32_t kind = (uint32_t)r4d_geti_or(a, "kv_format", 0);
+    const bool geometry = (kind == 1 && n == 512) || (kind == 2 && n == 128);
+    const long bytes = rad_ds41_kv_codec::row_bytes(kind, n), rows = (long)x.shape[0];
+    long ps;
+    if (!geometry || (bs != 1 && bs != 2) || n % bs || rows < 1 ||
+        !mat(x, RAD_BF16, rows, n) || !mat(capture, RAD_U8, rows, bytes) ||
+        !lin_step(page, &ps) || page.dtype != RAD_I32 || rad_tensor_numel(&page) < rows ||
+        cache.rank != 2 || cache.shape[0] < 1 || !mat(cache, RAD_U8, cache.shape[0], bytes) ||
+        x.data == cache.data || capture.data == cache.data) return R4D_NO(RAD_E_SHAPE);
+    return R4D_EMIT(stream, entry_store_kvpack_kernel,
+                     dim3((unsigned)((n / rad_ds41_kv_codec::group_size(kind) + 127) / 128), grid_rows(rows)),
+                     dim3(128), 0, (const uint16_t*)x.data, (long)x.stride[0],
+                     (const uint8_t*)capture.data, (long)capture.stride[0], (const int32_t*)page.data,
+                     ps, (uint8_t*)cache.data, (long)cache.stride[0], (long)cache.shape[0], rows, (int)n, kind);
+}
+
+/* Native WINDOW, sixteen 512-BF16 logical rows per page. Capture is pass-local; only
+ * self-contained original FP8 bytes/scales (or actual-bit pair escapes) survive the store.
+ * Raw is never a lossy fallback: activation requires the full actual-producer zero-Raw oracle. */
+__global__ __launch_bounds__(128) void kv_store_windowpack_kernel(
+    const uint16_t* actual, long ap, const uint8_t* capture, long cp,
+    const int32_t* slots, long sp, uint8_t* cache, long kp, long blocks, long rows) {
+    const int g = threadIdx.x + blockIdx.x * 128;
+    if (g >= 16) return;
+    for (long r = blockIdx.y; r < rows; r += gridDim.y) {
+        const long slot = slots[r * sp];
+        if (slot < 0 || slot / 16 >= blocks) continue;
+        const uint8_t* src = capture + r * cp;
+        uint8_t* dst = cache + (slot / 16) * kp + (slot % 16) * 528;
+        uint16_t actual_bits[32];
+        for (int i = 0; i < 32; ++i) actual_bits[i] = actual[r * ap + g * 32 + i];
+        if (rad_ds41_window_codec::pack_captured_group(src[512 + g], src + g * 32,
+                actual_bits, dst + g * 32, dst + 512 + g) != rad_ds41_window_codec::PackResult::Exact)
+            __builtin_trap();
+    }
+}
+int kv_store_windowpack_body(const RadArgs* a, RadStream stream) {
+    if (!a || a->n_t < 4 || r4d_geti_or(a, "kv_format", 0) != 3 ||
+        r4d_geti_or(a, "n", 0) != 512 || r4d_geti_or(a, "block_size", 0) != 16)
+        return R4D_NO(RAD_E_UNSUPPORTED);
+    const auto &x = a->t[0], &capture = a->t[1], &slot = a->t[2], &cache = a->t[3];
+    const long rows = (long)x.shape[0]; long sp;
+    if (rows < 1 || !mat(x, RAD_BF16, rows, 512) || !mat(capture, RAD_U8, rows, 528) ||
+        slot.dtype != RAD_I32 || !lin_step(slot, &sp) || rad_tensor_numel(&slot) < rows ||
+        cache.rank != 2 || cache.shape[0] < 1 || !mat(cache, RAD_U8, cache.shape[0], 16 * 528) ||
+        x.data == cache.data || capture.data == cache.data) return R4D_NO(RAD_E_SHAPE);
+    return R4D_EMIT(stream, kv_store_windowpack_kernel, dim3(1, grid_rows(rows)), dim3(128), 0,
+        (const uint16_t*)x.data, (long)x.stride[0], (const uint8_t*)capture.data, (long)capture.stride[0],
+        (const int32_t*)slot.data, sp, (uint8_t*)cache.data, (long)cache.stride[0], (long)cache.shape[0], rows);
+}
+
 /* ==================================================================== router_scored_topk
  * One wave a row, as r4d_glm.hip's router_sigmoid_topk: lane l holds experts l, l+32, ...; the
  * score is libref's (sigmoid, sqrt(softplus) or the softmax with its sum in expert order), round j
@@ -1559,9 +1689,9 @@ struct FzRope {
 };
 
 // quant_group_kernel's step over a row held in `buf`: lane groups of B columns, `width` threads.
-template <int B>
+template <int B, bool Capture = false>
 __device__ __forceinline__ void fz_quant_group(const uint16_t* buf, uint16_t* yr, int n,
-                                               uint32_t width, int fmt, int sc) {
+                                               uint32_t width, int fmt, int sc, uint8_t* packed = nullptr) {
     for (int base = 0; base < n; base += (int)width) {
         const int col = base + (int)threadIdx.x;
         const bool in = col < n;
@@ -1569,7 +1699,11 @@ __device__ __forceinline__ void fz_quant_group(const uint16_t* buf, uint16_t* yr
         float a = fabsf(v);
         a = a == a ? a : 0.0f;
         const float amax = r4d_xor_max<B>(a);
-        if (in) yr[col] = ds_bf16(roundtrip(v, block_scale(amax, fmt, sc), fmt));
+        if (in) {
+            const float scale = block_scale(amax, fmt, sc);
+            yr[col] = ds_bf16(roundtrip(v, scale, fmt));
+            if constexpr (Capture) kv_capture_group<B>(v, scale, packed, col, n, sc, fmt);
+        }
     }
 }
 
@@ -1587,11 +1721,11 @@ __device__ __forceinline__ void fz_quant_serial(const uint16_t* buf, uint16_t* y
 
 /* rmsnorm_rope_roundtrip: one workgroup a row (rmsnorm's grid and width); the row passes between
  * the steps through LDS as the bf16 each step stores. */
-template <bool WF32, uint32_t THR>
+template <bool WF32, uint32_t THR, bool Capture = false>
 __global__ __launch_bounds__(THR) void norm_rope_rt_kernel(
     const uint16_t* __restrict__ x, uint32_t x_ld, const void* __restrict__ w,
     uint16_t* __restrict__ y, uint32_t y_ld, uint32_t n, float eps, float wadd, float mult,
-    uint32_t M, FzRope r, int block, int fmt, int sc) {
+    uint32_t M, FzRope r, int block, int fmt, int sc, KvCapture capture) {
     R4D_DYN_LDS(uint16_t, fz_row);   /* extern __shared__ on the card (r4d_launch.h) */
     __shared__ float lds[THR / kFzWave];
     const uint32_t m = blockIdx.x;
@@ -1654,8 +1788,10 @@ __global__ __launch_bounds__(THR) void norm_rope_rt_kernel(
         case 2: fz_quant_group<2>(fz_row, yr, (int)n, THR, fmt, sc); break;
         case 4: fz_quant_group<4>(fz_row, yr, (int)n, THR, fmt, sc); break;
         case 8: fz_quant_group<8>(fz_row, yr, (int)n, THR, fmt, sc); break;
-        case 16: fz_quant_group<16>(fz_row, yr, (int)n, THR, fmt, sc); break;
-        case 32: fz_quant_group<32>(fz_row, yr, (int)n, THR, fmt, sc); break;
+        case 16: fz_quant_group<16, Capture>(fz_row, yr, (int)n, THR, fmt, sc,
+                                           Capture ? capture.p + (long)m * capture.pitch : nullptr); break;
+        case 32: fz_quant_group<32, Capture>(fz_row, yr, (int)n, THR, fmt, sc,
+                                           Capture ? capture.p + (long)m * capture.pitch : nullptr); break;
         default: fz_quant_serial(fz_row, yr, (int)n, block, THR, fmt, sc); break;
     }
 }
@@ -1668,10 +1804,11 @@ __global__ __launch_bounds__(THR) void norm_rope_rt_kernel(
  * different payloads need not. Also retain the old width's trailing zero-wave additions.
  * Each norm narrows with f32_to_bf16, each rope pair with ds_bf16, and each 32-column quantization
  * group uses the existing helpers. The dispatcher below is default off and checks every premise. */
+template <bool Capture = false>
 __global__ __launch_bounds__(256) void norm_rope_rt_n128_kernel(
     const uint16_t* __restrict__ x, uint32_t x_ld, const float* __restrict__ w,
     uint16_t* __restrict__ y, uint32_t y_ld, float eps, float wadd, float mult,
-    uint32_t M, FzRope r, uint32_t sum_waves) {
+    uint32_t M, FzRope r, uint32_t sum_waves, KvCapture capture) {
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t m = blockIdx.x * 8u + threadIdx.x / kFzWave;
     if (m >= M) return;
@@ -1715,16 +1852,19 @@ __global__ __launch_bounds__(256) void norm_rope_rt_n128_kernel(
         float a = fabsf(z);
         a = a == a ? a : 0.0f;
         const float amax = r4d_xor_max<32>(a);
-        yr[lane + c * kFzWave] = ds_bf16(roundtrip(z, block_scale(amax, kFp4, kUe8m0), kFp4));
+        const float scale = block_scale(amax, kFp4, kUe8m0);
+        yr[lane + c * kFzWave] = ds_bf16(roundtrip(z, scale, kFp4));
+        if constexpr (Capture) kv_capture_group<32>(z, scale, capture.p + (long)m * capture.pitch,
+                                                     (int)(lane + c * kFzWave), 128, kUe8m0, kFp4);
     }
 }
 
 /* rope_rows_roundtrip, in place: quant_group_kernel's grid (a thread a column, rows over grid.y);
  * a rotated column takes its gptj partner (the other lane of its even/odd pair, the same wave)
  * by a shuffle, forms its half of rope_rows' pair and rounds it as rope_rows stores it. */
-template <int B>
+template <int B, bool Capture = false>
 __global__ __launch_bounds__(256) void rope_rt_kernel(uint16_t* x, long xp, int n, long rows,
-                                                      FzRope r, int fmt, int sc) {
+                                                      FzRope r, int fmt, int sc, KvCapture capture) {
     const int col = blockIdx.x * 256 + threadIdx.x;
     const bool in = col < n;
     const int hh = col / r.hd, d = col - hh * r.hd - r.off;
@@ -1746,7 +1886,11 @@ __global__ __launch_bounds__(256) void rope_rt_kernel(uint16_t* x, long xp, int 
         float a = fabsf(v);
         a = a == a ? a : 0.0f;
         const float amax = r4d_xor_max<B>(a);
-        if (in) row[col] = ds_bf16(roundtrip(v, block_scale(amax, fmt, sc), fmt));
+        if (in) {
+            const float scale = block_scale(amax, fmt, sc);
+            row[col] = ds_bf16(roundtrip(v, scale, fmt));
+            if constexpr (Capture) kv_capture_group<B>(v, scale, capture.p + m * capture.pitch, col, n, sc, fmt);
+        }
     }
 }
 
@@ -1973,7 +2117,7 @@ int fz_rope_args(const RadArgs* a, const RadTensor& x, const RadTensor& cs, cons
 constexpr long kFzMaxN = 16384;
 
 /* x [M, n] (rows as rmsnorm reads them), w, y [M, n], cos_sin, positions. */
-int norm_rope_rt_body(const RadArgs* a, RadStream stream, int n128 = -1) {
+int norm_rope_rt_body(const RadArgs* a, RadStream stream, int n128 = -1, bool capture_on = false) {
     if (!a || a->n_t < 5) return RAD_E_INVAL;
     const RadTensor &x = a->t[0], &w = a->t[1], &y = a->t[2], &cs = a->t[3], &pos = a->t[4];
     if (!x.data || !w.data || !y.data || !cs.data || !pos.data) return R4D_NO(RAD_E_INVAL);
@@ -1994,6 +2138,12 @@ int norm_rope_rt_body(const RadArgs* a, RadStream stream, int n128 = -1) {
     int fmt, sc;
     if (!fz_quant_fmt(a, &fmt, &sc)) return R4D_NO(RAD_E_UNSUPPORTED);
     if (block < 1 || n % block) return R4D_NO(RAD_E_SHAPE);
+    KvCapture capture;
+    if (capture_on) {
+        if (a->n_t < 6) return R4D_NO(RAD_E_INVAL);
+        const int pr = kv_capture_arg(a, a->t[5], (long)M, (long)n, (long)block, fmt, sc, &capture);
+        if (pr < 0) return pr;
+    }
     const float eps = (float)r4d_getf(a, "eps", 1e-6), wadd = (float)r4d_getf(a, "wadd", 0.0);
     const float mult = (float)r4d_getf(a, "mult", 1.0);
     const int thr = r4d_act_threads((int)M, (int)n);
@@ -2008,11 +2158,13 @@ int norm_rope_rt_body(const RadArgs* a, RadStream stream, int n128 = -1) {
     }();
     if (n128 == 1 && !short_key) return R4D_NO(RAD_E_UNSUPPORTED);
     if (short_key && (n128 == 1 || (n128 < 0 && short_key_on))) {
-        const int launch = R4D_EMIT(stream, norm_rope_rt_n128_kernel,
-                         dim3(r4d_cliff_rows(((uint32_t)M + 7u) / 8u, 1, 8)), dim3(256), 0,
-                         (const uint16_t*)x.data, (uint32_t)x_ld, (const float*)w.data,
-                         (uint16_t*)y.data, (uint32_t)y.stride[0], eps, wadd, mult, (uint32_t)M,
-                         r, (uint32_t)thr / kFzWave);
+#define FZ_N128(PK) R4D_EMIT(stream, (norm_rope_rt_n128_kernel<PK>),                    \
+                         dim3(r4d_cliff_rows(((uint32_t)M + 7u) / 8u, 1, 8)), dim3(256), 0, \
+                         (const uint16_t*)x.data, (uint32_t)x_ld, (const float*)w.data, \
+                         (uint16_t*)y.data, (uint32_t)y.stride[0], eps, wadd, mult, (uint32_t)M, \
+                         r, (uint32_t)thr / kFzWave, capture)
+        const int launch = capture_on ? FZ_N128(true) : FZ_N128(false);
+#undef FZ_N128
         /* Proof for a model arm, only after its normal dispatcher queued the fast kernel.
          * Forced checker calls cannot produce it. After each rank's first use only a relaxed load
          * remains; disabled, ineligible and failed launches never touch this state or perform I/O. */
@@ -2029,15 +2181,19 @@ int norm_rope_rt_body(const RadArgs* a, RadStream stream, int n128 = -1) {
         return launch;
     }
     const uint32_t lds = (uint32_t)(n * sizeof(uint16_t));
-#define FZ_NRQ(WF, T)                                                                             \
-    R4D_EMIT(stream, (norm_rope_rt_kernel<WF, T>), dim3(r4d_cliff_rows((uint32_t)M, 1, T / kFzWave)), \
+#define FZ_NRQ(WF, T, PK)                                                                         \
+    R4D_EMIT(stream, (norm_rope_rt_kernel<WF, T, PK>), dim3(r4d_cliff_rows((uint32_t)M, 1, T / kFzWave)), \
              dim3(T), lds, (const uint16_t*)x.data, (uint32_t)x_ld, (const void*)w.data,          \
              (uint16_t*)y.data, (uint32_t)y.stride[0], (uint32_t)n, eps, wadd, mult, (uint32_t)M, \
-             r, (int)block, fmt, sc)
-#define FZ_NRQ_W(WF)                                                                              \
-    return thr == 1024 ? FZ_NRQ(WF, 1024) : thr == 512 ? FZ_NRQ(WF, 512) : FZ_NRQ(WF, 256)
-    if (w.dtype == RAD_F32) FZ_NRQ_W(true);
-    FZ_NRQ_W(false);
+             r, (int)block, fmt, sc, capture)
+#define FZ_NRQ_W(WF, PK)                                                                          \
+    return thr == 1024 ? FZ_NRQ(WF, 1024, PK) : thr == 512 ? FZ_NRQ(WF, 512, PK) : FZ_NRQ(WF, 256, PK)
+    if (capture_on) {
+        if (w.dtype == RAD_F32) FZ_NRQ_W(true, true);
+        FZ_NRQ_W(false, true);
+    }
+    if (w.dtype == RAD_F32) FZ_NRQ_W(true, false);
+    FZ_NRQ_W(false, false);
 #undef FZ_NRQ_W
 #undef FZ_NRQ
 }
@@ -2045,7 +2201,7 @@ int norm_rope_rt_body(const RadArgs* a, RadStream stream, int n128 = -1) {
 /* x [M, n_head*head_dim] in place, cos_sin, positions. The lane-group form needs a gptj pair on
  * one wave's even/odd lanes (head_dim and off even, the row's constraints) and a power-of-two block
  * up to 32; any other geometry runs rope_rows then quant_roundtrip as two launches, the same bits. */
-int rope_rt_body(const RadArgs* a, RadStream stream) {
+int rope_rt_body(const RadArgs* a, RadStream stream, bool capture_on = false) {
     if (!a || a->n_t < 3 || !a->t[0].data || !a->t[1].data || !a->t[2].data) return RAD_E_INVAL;
     const RadTensor &x = a->t[0], &cs = a->t[1], &pos = a->t[2];
     if (x.rank != 2 || x.shape[0] < 1) return R4D_NO(RAD_E_SHAPE);
@@ -2058,10 +2214,17 @@ int rope_rt_body(const RadArgs* a, RadStream stream) {
     int fmt, sc;
     if (!fz_quant_fmt(a, &fmt, &sc)) return R4D_NO(RAD_E_UNSUPPORTED);
     if (block < 1 || n % block) return R4D_NO(RAD_E_SHAPE);
+    KvCapture capture;
+    if (capture_on) {
+        if (a->n_t < 4) return R4D_NO(RAD_E_INVAL);
+        const int pr = kv_capture_arg(a, a->t[3], M, n, block, fmt, sc, &capture);
+        if (pr < 0) return pr;
+    }
     const bool lanes = r.gptj && !(r.hd & 1) && !(r.off & 1) &&
                        (block == 1 || block == 2 || block == 4 || block == 8 || block == 16 ||
                         block == 32);
     if (!lanes) {
+        if (capture_on) return R4D_NO(RAD_E_UNSUPPORTED);
         const int rr = rope_rows_body(a, stream);
         if (rr != RAD_OK) return rr;
         RadParam pp[24];
@@ -2080,9 +2243,15 @@ int rope_rt_body(const RadArgs* a, RadStream stream) {
     const dim3 grid((unsigned)((n + 255) / 256), grid_rows(M));
     uint16_t* xd = (uint16_t*)x.data;
     const long xp = (long)x.stride[0];
+    if (capture_on) {
+        if (block == 16) return R4D_EMIT(stream, (rope_rt_kernel<16, true>), grid, dim3(256), 0,
+                                         xd, xp, (int)n, M, r, fmt, sc, capture);
+        return R4D_EMIT(stream, (rope_rt_kernel<32, true>), grid, dim3(256), 0,
+                         xd, xp, (int)n, M, r, fmt, sc, capture);
+    }
 #define FZ_RRT(B)                                                                                  \
     case B:                                                                                        \
-        return R4D_EMIT(stream, rope_rt_kernel<B>, grid, dim3(256), 0, xd, xp, (int)n, M, r, fmt, sc)
+        return R4D_EMIT(stream, rope_rt_kernel<B>, grid, dim3(256), 0, xd, xp, (int)n, M, r, fmt, sc, capture)
     switch (block) {
         FZ_RRT(1);
         FZ_RRT(2);
@@ -2195,6 +2364,14 @@ extern "C" int r4d_rad_stream_gate_add(const RadArgs* a, RadStream s) {
 }
 extern "C" int r4d_rad_ds41_rope_rows(const RadArgs* a, RadStream s) { return rope_rows_body(a, s); }
 extern "C" int r4d_rad_quant_roundtrip(const RadArgs* a, RadStream s) { return quant_rt_body(a, s); }
+extern "C" int r4d_rad_quant_roundtrip_kvpack(const RadArgs* a, RadStream s) {
+    if (!a || r4d_geti_or(a, "kv_format", 0) == 3) return RAD_E_UNSUPPORTED;
+    return quant_rt_body(a, s, true);
+}
+extern "C" int r4d_rad_quant_roundtrip_windowpack(const RadArgs* a, RadStream s) {
+    if (!a || r4d_geti_or(a, "kv_format", 0) != 3) return RAD_E_UNSUPPORTED;
+    return quant_rt_body(a, s, true);
+}
 extern "C" int r4d_rad_mhc_mix(const RadArgs* a, RadStream s) { return mhc_mix_body(a, s); }
 /* Partials of every chunk of every row of the band, so the projection spreads over workgroups. */
 extern "C" int64_t r4d_rad_mhc_mix_scratch(const RadArgs* a) {
@@ -2210,6 +2387,32 @@ extern "C" int r4d_rad_softmax_pool(const RadArgs* a, RadStream s) {
     return softmax_pool_body(a, s);
 }
 extern "C" int r4d_rad_entry_store(const RadArgs* a, RadStream s) { return entry_store_body(a, s); }
+extern "C" int r4d_rad_entry_store_kvpack(const RadArgs* a, RadStream s) {
+    const int rc = entry_store_kvpack_body(a, s);
+    if (rc == RAD_OK && a->rank >= 0 && a->rank < a->world_size && a->rank < 64) {
+        static std::atomic<uint64_t> reported[2]{};
+        const int kind = (int)r4d_geti_or(a, "kv_format", 0);
+        const uint64_t bit = uint64_t(1) << (unsigned)a->rank;
+        if (kind >= 1 && kind <= 2 && !(reported[kind-1].load(std::memory_order_relaxed) & bit) &&
+            !(reported[kind-1].fetch_or(bit, std::memory_order_relaxed) & bit)) {
+            std::fprintf(stderr, "[r4d] ds41 KV_PACKED active rank=%d role=entry_store format=%d row_bytes=%lld\n",
+                         a->rank, kind, (long long)a->t[3].shape[1]);
+            std::fflush(stderr);
+        }
+    }
+    return rc;
+}
+extern "C" int r4d_rad_kv_store_windowpack(const RadArgs* a, RadStream s) {
+    const int rc = kv_store_windowpack_body(a, s);
+    if (rc == RAD_OK && a->rank >= 0 && a->rank < a->world_size && a->rank < 64) {
+        static std::atomic<uint64_t> reported{0}; const uint64_t bit = uint64_t(1) << (unsigned)a->rank;
+        if (!(reported.fetch_or(bit, std::memory_order_relaxed) & bit)) {
+            std::fprintf(stderr, "[r4d] ds41 WINDOW_PACKED active rank=%d role=store format=3 row_bytes=528 page_bytes=8448\n", a->rank);
+            std::fflush(stderr);
+        }
+    }
+    return rc;
+}
 extern "C" int r4d_rad_router_scored_topk(const RadArgs* a, RadStream s) {
     return router_scored_body(a, s);
 }
@@ -2219,14 +2422,35 @@ extern "C" int r4d_rad_embed_lookup_planes(const RadArgs* a, RadStream s) {
 extern "C" int r4d_rad_rmsnorm_rope_roundtrip(const RadArgs* a, RadStream s) {
     return norm_rope_rt_body(a, s);
 }
+extern "C" int r4d_rad_rmsnorm_rope_roundtrip_kvpack(const RadArgs* a, RadStream s) {
+    if (!a || r4d_geti_or(a, "kv_format", 0) == 3) return RAD_E_UNSUPPORTED;
+    return norm_rope_rt_body(a, s, -1, true);
+}
+extern "C" int r4d_rad_rmsnorm_rope_roundtrip_windowpack(const RadArgs* a, RadStream s) {
+    if (!a || r4d_geti_or(a, "kv_format", 0) != 3) return RAD_E_UNSUPPORTED;
+    return norm_rope_rt_body(a, s, -1, true);
+}
 /* Oracle: 0 the unchanged workgroup kernel, 1 the narrow wave form (unsupported elsewhere).
  * No row registers this entry, and it never changes the process-wide default. */
 extern "C" int r4d_rad_rmsnorm_rope_roundtrip_n128_check(const RadArgs* a, RadStream s, int form) {
     if (form != 0 && form != 1) return RAD_E_INVAL;
     return norm_rope_rt_body(a, s, form);
 }
+extern "C" int r4d_rad_rmsnorm_rope_roundtrip_kvpack_n128_check(const RadArgs* a, RadStream s, int form) {
+    if (!a || r4d_geti_or(a,"kv_format",0)==3) return RAD_E_UNSUPPORTED;
+    if (form != 0 && form != 1) return RAD_E_INVAL;
+    return norm_rope_rt_body(a, s, form, true);
+}
 extern "C" int r4d_rad_rope_rows_roundtrip(const RadArgs* a, RadStream s) {
     return rope_rt_body(a, s);
+}
+extern "C" int r4d_rad_rope_rows_roundtrip_kvpack(const RadArgs* a, RadStream s) {
+    if (!a || r4d_geti_or(a, "kv_format", 0) == 3) return RAD_E_UNSUPPORTED;
+    return rope_rt_body(a, s, true);
+}
+extern "C" int r4d_rad_rope_rows_roundtrip_windowpack(const RadArgs* a, RadStream s) {
+    if (!a || r4d_geti_or(a, "kv_format", 0) != 3) return RAD_E_UNSUPPORTED;
+    return rope_rt_body(a, s, true);
 }
 extern "C" int r4d_rad_mhc_collapse_rmsnorm(const RadArgs* a, RadStream s) {
     return collapse_norm_body(a, s);

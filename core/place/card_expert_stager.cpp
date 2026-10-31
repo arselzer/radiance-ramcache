@@ -39,7 +39,7 @@ bool parse_tunables(const std::function<const char*(const char*)>& get, Tunables
         { ds41p1::kVerifyEnv, 0, 4096, &r.verify },
         { ds41p1::kMinRowsEnv, ds41p1::kMinArmRows, ds41p1::kTwinMaxRows, &r.min_rows },
         { ds41p1::kLendEnv, 0, ds41p1::kMaxLend, &r.lend },
-        { ds41p1::kLendArenaEnv, 0, ds41p1::kMaxLend, &r.lend_arena },
+        { ds41p1::kLendArenaEnv, 0, ds41p1::kMaxArenaLend, &r.lend_arena },
         { ds41p1::kGraceEnv, 0, 60000, &r.grace_ms },
     };
     for (const K& k : ks) {
@@ -308,6 +308,7 @@ int CardExpertStager::queue_one(int i) {
     queued_.push_back(i);
     ++st_.copies;
     st_.copy_bytes += (uint64_t)(u.src.gu_bytes + u.src.dn_bytes);
+    if(copy_observer_)copy_observer_(copy_observer_ud_,u.e,u.unit,u.rows,s,u.kind,u.src);
     return 0;
 }
 
@@ -446,7 +447,7 @@ int CardExpertStager::slot_of(const void* entry) const {
 
 /* ---- the lent ring ------------------------------------------------------------------------------------- */
 int RingLender::init(LendHost* host, int n, int64_t grace_ms) {
-    if (!host || n < 1 || n > 2 * ds41p1::kMaxLend || grace_ms < 0) return -1;
+    if (!host || n < 1 || n > ds41p1::kMaxCombinedLend || grace_ms < 0) return -1;
     host_ = host;
     slot_.assign((size_t)n, Slot{});
     grace_ = grace_ms;
@@ -1065,7 +1066,7 @@ int CardExpertPath::lend_init(const std::vector<LendUnit>& units, const std::vec
     auto no = [&](const std::string& w) { if (why) *why = w; return RAD_E_INVAL; };
     if (!on_ || lending()) return no("the card path is not on, or lends already");
     const int n = (int)units.size(), nr = (int)ring_slots.size();
-    if (n < 1 || nr > ds41p1::kMaxLend || (int)arena_slots.size() > ds41p1::kMaxLend ||
+    if (n < 1 || nr > ds41p1::kMaxLend || (int)arena_slots.size() > ds41p1::kMaxArenaLend ||
         nr + (int)arena_slots.size() != n)
         return no("a lent ring of " + std::to_string(nr) + " slots and " + std::to_string(arena_slots.size()) +
                   " arena slots for " + std::to_string(n) + " units");

@@ -3,6 +3,7 @@
  */
 #include <vector>
 #include "ctx.h"
+#include "place/ds41_phase2_audit.h"
 #include "kvstream/bind.h"
 #include "kvstream/stage.h"
 #include "xp_state.h"
@@ -695,6 +696,22 @@ void Ctx::note_ep_route_producer(const OpInfo& op, const RadTensor* t, int n_t,
         v.layer = (int64_t)layer; v.rank = rank_; v.world = world_size_;
         v.global_experts = 384; v.local_experts = 96; v.expert_base = base;
         v.top_k = topk; v.rows = rows; v.successfully_issued = true;
+        if (ds41_phase2::audit::requested()) {
+            const RadTensor *ids=nullptr,*sorted=nullptr,*offsets=nullptr;
+            for(int j=0;j<n_t;++j) {
+                const auto& sp=op.schema->operands[j];if(!sp.name)continue;
+                if(!std::strcmp(sp.name,"expert_ids"))ids=&t[j];
+                if(!std::strcmp(sp.name,"sorted_tok")&&sp.role==RAD_OPD_OUT)sorted=&t[j];
+                if(!std::strcmp(sp.name,"expert_offset")&&sp.role==RAD_OPD_OUT)offsets=&t[j];
+            }
+            const auto dense_i32=[](const RadTensor*x,int64_t n){return x&&x->data&&x->dtype==RAD_I32&&
+                x->rank==1&&x->shape[0]==n&&x->stride[0]==1;};
+            if(ids&&ids->data&&ids->dtype==RAD_I32&&ids->rank==2&&ids->shape[0]==rows&&ids->shape[1]==6&&
+                ids->stride[0]==6&&ids->stride[1]==1&&dense_i32(sorted,rows*6)&&dense_i32(offsets,97)) {
+                v.audit_ids=(const int32_t*)ids->data;v.audit_sorted=(const int32_t*)sorted->data;
+                v.audit_offsets=(const int32_t*)offsets->data;
+            }
+        }
     }
 }
 

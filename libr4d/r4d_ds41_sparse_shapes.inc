@@ -15,14 +15,19 @@ extern "C" int r4d_shape_attn_sparse_sink(const RadParam* p, int n_p, int operan
     if (M <= 0 || H < 1 || Dm < 2 || win < 1 || ratio < 0 || (ratio > 0 && (topk < 1 || Dm % ratio)))
         return RAD_E_UNSUPPORTED;
     const uint32_t D = dt_act(p, n_p, "dtype");
-    const int64_t bs = 4, nb = (M + bs - 1) / bs + 1, ncb = M + 1;
+    const uint32_t window_kind = (uint32_t)pi(p,n_p,"window_format");
+    if (window_kind && (window_kind != 3 || Dm != 512)) return RAD_E_UNSUPPORTED;
+    const int64_t bs = window_kind ? 16 : 4, nb = (M + bs - 1) / bs + 1, ncb = M + 1;
     const bool comp = ratio > 0;
+    const uint32_t kind = (uint32_t)pi(p, n_p, "kv_format");
+    if (kind && (kind != 1 || !comp || Dm != 512)) return RAD_E_UNSUPPORTED;
     const RadOpdDesc l[] = {
         opd(D, M, H * Dm),                                  /* q */
-        opd(D, nb, 1, bs, Dm),                              /* window cache */
+        window_kind ? opd((uint32_t)RAD_U8,nb,8448) : opd(D, nb, 1, bs, Dm), /* window cache */
         opd_idx(1, nb, nb),                                 /* window block table */
         opd_idx(1, 0, M + 1),                               /* window tokens held from the table's start */
-        comp ? opd(D, ncb, 1, ratio, Dm / ratio) : opd_none(),  /* compressed cache: an entry a block */
+        comp ? (kind ? opd((uint32_t)RAD_U8, ncb, rad_ds41_kv_codec::row_bytes(kind, Dm))
+                     : opd(D, ncb, 1, ratio, Dm / ratio)) : opd_none(),
         comp ? opd_idx(1, ncb, ncb) : opd_none(),           /* compressed block table */
         comp ? opd_idx(M, topk, ncb) : opd_none(),          /* selected compressed positions */
         opd_idx(M, 0, M),                                   /* positions */
@@ -38,13 +43,16 @@ extern "C" int r4d_shape_index_score(const RadParam* p, int n_p, int operand, Ra
     const int64_t ratio = pi(p, n_p, "ratio"), C = pi(p, n_p, "width");
     if (M <= 0 || H < 1 || Dm < 1 || ratio < 1 || Dm % ratio || C < 1) return RAD_E_UNSUPPORTED;
     const uint32_t D = dt_act(p, n_p, "dtype");
+    const uint32_t kind = (uint32_t)pi(p, n_p, "kv_format");
+    if (kind && (kind != 2 || Dm != 128)) return RAD_E_UNSUPPORTED;
     const int64_t ncb = C + 1;
     /* A run (row_part p) scores rows [p M, p M + M) of a step that holds them. */
     const int64_t part = pi(p, n_p, "row_part"), Mq = part > 0 ? (part + 1) * M : M;
     const RadOpdDesc l[] = {
         opd(D, Mq, H * Dm),                                 /* q */
         opd(D, Mq, H),                                      /* head weights */
-        opd(D, ncb, 1, ratio, Dm / ratio),                  /* index cache: an entry a block */
+        kind ? opd((uint32_t)RAD_U8, ncb, rad_ds41_kv_codec::row_bytes(kind, Dm))
+             : opd(D, ncb, 1, ratio, Dm / ratio),
         opd_idx(1, ncb, ncb),                               /* block table */
         opd_idx(Mq, 0, Mq),                                 /* positions */
         opd_idx(2, 0, Mq, -1, (uint32_t)RAD_OPD_F_IDX_CU),  /* cu_seqlens */
@@ -77,4 +85,21 @@ extern "C" int r4d_shape_index_topk(const RadParam* p, int n_p, int operand, Rad
         opd((uint32_t)RAD_I32, M, k),                       /* sel */
     };
     R4D_PICK(l);
+}
+
+/* Score storage only; all logical dimensions, index fill contracts and row parts are unchanged. */
+extern "C" int r4d_shape_index_score_b16(const RadParam* p,int n,int operand,RadOpdDesc* out) {
+    const int rc=r4d_shape_index_score(p,n,operand,out);
+    if(rc==RAD_OK&&operand==6)out->dtype=RAD_BF16;
+    return rc;
+}
+extern "C" int r4d_shape_index_candidates_b16(const RadParam* p,int n,int operand,RadOpdDesc* out) {
+    const int rc=r4d_shape_index_candidates(p,n,operand,out);
+    if(rc==RAD_OK&&operand==0)out->dtype=RAD_BF16;
+    return rc;
+}
+extern "C" int r4d_shape_index_topk_b16(const RadParam* p,int n,int operand,RadOpdDesc* out) {
+    const int rc=r4d_shape_index_topk(p,n,operand,out);
+    if(rc==RAD_OK&&operand==0)out->dtype=RAD_BF16;
+    return rc;
 }

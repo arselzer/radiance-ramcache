@@ -4,6 +4,16 @@
  * Each is libref's ref_<op>_shape (libref/ref_shapes.cpp) operand for operand, extents, dtypes and
  * index ranges, with the same declines, since rad-kbench fills both kernels from one description. */
 
+#include "../arch/common/rad_ds41_kv_codec.h"
+#include "../arch/common/rad_ds41_window_codec.h"
+
+static int64_t ds41_pack_bytes(const RadParam* p, int n_p, int64_t width) {
+    const uint32_t kind = (uint32_t)pi(p, n_p, "kv_format");
+    if (kind == 3 && width == 512) return rad_ds41_window_codec::row_bytes(width);
+    if (!((kind == 1 && width == 512) || (kind == 2 && width == 128))) return 0;
+    return rad_ds41_kv_codec::row_bytes(kind, width);
+}
+
 extern "C" int r4d_shape_token_map(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = pi(p, n_p, "M"), nv = pi(p, n_p, "n_vocab");
     if (M <= 0 || nv < 1) return RAD_E_UNSUPPORTED;
@@ -99,6 +109,34 @@ extern "C" int r4d_shape_entry_store(const RadParam* p, int n_p, int operand, Ra
     R4D_PICK(l);
 }
 
+extern "C" int r4d_shape_entry_store_kvpack(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n"), bs = pi(p, n_p, "block_size");
+    const int64_t bytes = ds41_pack_bytes(p, n_p, n);
+    if (M < 1 || bytes < 1 || (bs != 1 && bs != 2)) return RAD_E_UNSUPPORTED;
+    const RadOpdDesc l[] = {
+        opd((uint32_t)RAD_BF16, M, n), opd((uint32_t)RAD_U8, M, bytes),
+        opd_idx(M, 0, M, -1, RAD_OPD_F_IDX_UNIQUE), opd((uint32_t)RAD_U8, M, bytes),
+    };
+    R4D_PICK(l);
+}
+
+extern "C" int r4d_shape_kv_store_windowpack(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M");
+    if (M < 1 || pi(p,n_p,"n") != 512 || pi(p,n_p,"block_size") != 16 || pi(p,n_p,"kv_format") != 3)
+        return RAD_E_UNSUPPORTED;
+    const RadOpdDesc l[] = {opd((uint32_t)RAD_BF16,M,512), opd((uint32_t)RAD_U8,M,528),
+        opd_idx(M,0,M,-1,RAD_OPD_F_IDX_UNIQUE), opd((uint32_t)RAD_U8,(M+15)/16+1,8448)};
+    R4D_PICK(l);
+}
+
+extern "C" int r4d_shape_quant_roundtrip_kvpack(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t bytes = ds41_pack_bytes(p, n_p, pi(p, n_p, "n")), M = pi(p, n_p, "M");
+    if (bytes < 1 || M < 1) return RAD_E_UNSUPPORTED;
+    if (operand == 0) return r4d_shape_quant_roundtrip(p, n_p, operand, out);
+    if (operand != 1) return RAD_E_UNSUPPORTED;
+    *out = opd((uint32_t)RAD_U8, M, bytes); return RAD_OK;
+}
+
 extern "C" int r4d_shape_router_scored_topk(const RadParam* p, int n_p, int operand,
                                             RadOpdDesc* out) {
     const int64_t M = pi(p, n_p, "M"), ne = pi(p, n_p, "n_expert"), k = pi(p, n_p, "top_k");
@@ -161,6 +199,22 @@ extern "C" int r4d_shape_rope_rows_roundtrip(const RadParam* p, int n_p, int ope
         opd_idx(M, 0, M),                  /* positions */
     };
     R4D_PICK(l);
+}
+
+extern "C" int r4d_shape_rmsnorm_rope_roundtrip_kvpack(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t bytes = ds41_pack_bytes(p, n_p, pi(p, n_p, "n")), M = pi(p, n_p, "M");
+    if (bytes < 1 || M < 1) return RAD_E_UNSUPPORTED;
+    if (operand < 5) return r4d_shape_rmsnorm_rope_roundtrip(p, n_p, operand, out);
+    if (operand != 5) return RAD_E_UNSUPPORTED;
+    *out = opd((uint32_t)RAD_U8, M, bytes); return RAD_OK;
+}
+extern "C" int r4d_shape_rope_rows_roundtrip_kvpack(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t width = pi(p, n_p, "n_head") * pi(p, n_p, "head_dim");
+    const int64_t bytes = ds41_pack_bytes(p, n_p, width), M = pi(p, n_p, "M");
+    if (bytes < 1 || M < 1) return RAD_E_UNSUPPORTED;
+    if (operand < 3) return r4d_shape_rope_rows_roundtrip(p, n_p, operand, out);
+    if (operand != 3) return RAD_E_UNSUPPORTED;
+    *out = opd((uint32_t)RAD_U8, M, bytes); return RAD_OK;
 }
 
 extern "C" int r4d_shape_mhc_collapse_rmsnorm(const RadParam* p, int n_p, int operand,

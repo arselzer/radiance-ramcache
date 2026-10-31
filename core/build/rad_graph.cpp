@@ -722,6 +722,11 @@ std::string dump_graph_json(const Program& p) {
         j["block_size"]      = g.block_size;
         j["bytes_per_block"] = g.bytes_per_block;
         j["bytes_per_state"] = g.bytes_per_state;
+        if (g.decl.storage_format != RAD_KV_STORAGE_PLAIN) {
+            j["storage_format"] = g.decl.storage_format;
+            j["storage_block_bytes"] = g.decl.storage_block_bytes;
+            j["logical_dtype"] = g.decl.dtype;
+        }
         kvs.push_back(std::move(j));
     }
     root["kv_groups"] = std::move(kvs);

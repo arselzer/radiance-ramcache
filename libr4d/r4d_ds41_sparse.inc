@@ -19,6 +19,13 @@ static const RadOperandSpec oDs41IndexScore[] = {
     { "bt", RAD_OPD_IN, 0 }, { "positions", RAD_OPD_IN, 0 }, { "cu_seqlens", RAD_OPD_IN, 0 },
     { "score", RAD_OPD_OUT, 0 },
 };
+static const RadParamSpec pDs41IndexScoreKvPack[] = { P_INT("M"), P_INT("heads"), P_INT("dim"),
+    P_INT("ratio"), P_INT("width"), P_F64("wscale"), P_STR("dtype"), P_INTO("row_part"), P_INT("kv_format") };
+static const RadParamSpec pDs41AttnKvPack[] = { P_INT("M"), P_INT("heads"), P_INT("dim"),
+    P_INT("window"), P_INT("ratio"), P_INT("topk"), P_F64("scale"), P_STR("dtype"), P_INT("kv_format") };
+static const RadParamSpec pDs41AttnWindowPack[] = { P_INT("M"), P_INT("heads"), P_INT("dim"),
+    P_INT("window"), P_INT("ratio"), P_INT("topk"), P_F64("scale"), P_STR("dtype"),
+    P_INT("kv_format"), P_INT("window_format") };
 static const RadParamSpec pDs41IndexCand[] = { P_INT("M"), P_INT("width"), P_INT("block"),
     P_INT("topk_blocks"), P_INT("ratio") };
 static const RadOperandSpec oDs41IndexCand[] = {
@@ -55,6 +62,19 @@ static const RadConstraint cDs41IndexTopk[] = {
 
 #elif defined(R4D_DS41_SCHEMAS)
 
+SCHEMA("index_score_kvpack", pDs41IndexScoreKvPack, oDs41IndexScore,
+       "Original index score arithmetic and dispatcher; reconstructed BF16 from packed original producer output."),
+SCHEMA("attn_sparse_sink_windowpack", pDs41AttnWindowPack, oDs41AttnSparseSink,
+       "Original attention arithmetic/dispatch; reconstruct native FP8 window BF16 and optional packed compressed keys."),
+SCHEMA("attn_sparse_sink_kvpack", pDs41AttnKvPack, oDs41AttnSparseSink,
+       "Original attention arithmetic and dispatcher; BF16 windows plus reconstructed BF16 compressed packed entries."),
+SCHEMA("index_score_b16",pDs41IndexScore,oDs41IndexScore,
+       "index_score's unchanged scalar/WMMA arithmetic and row parts; store only the high16 bits of its already-BF16-rounded f32 result, without rounding again."),
+SCHEMA("index_candidates_b16",pDs41IndexCand,oDs41IndexCand,
+       "index_candidates over lossless16-bit scores expanded by integer shift; unchanged maxima, newest-block pin and stable selection."),
+SCHEMA("index_topk_b16",pDs41IndexTopk,oDs41IndexTopk,
+       "index_topk over lossless16-bit scores expanded by integer shift; unchanged ties, keep mask, split merge, ordering and padding."),
+
 SCHEMA("attn_sparse_sink", pDs41AttnSparseSink, oDs41AttnSparseSink,
        "Latent attention (key = value, dim wide) with a per-head sink over the window cache's keys "
        "at [pos-window+1, pos] (the window table rebased at first = pos(last row of s) + 1 - "
@@ -78,6 +98,31 @@ SCHEMA("index_topk", pDs41IndexTopk, oDs41IndexTopk,
        "ascending order, then -1."),
 
 #elif defined(R4D_DS41_ROWS)
+
+{ "ds41_index_score_d128_kvpack", "index_score_kvpack", "attn", "BF16 reconstruction before original scalar/WMMA index score",
+  "dim128, kv_format2, selfcontained one-entry pages", "bf16 q/w, u8 cache, original other operands",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cDs41IndexScore), NOTUNE, nullptr, nullptr,
+  r4d_rad_ds41_index_score_kvpack, nullptr, nullptr, nullptr, r4d_shape_index_score },
+{ "ds41_attn_sparse_sink_d512_windowpack", "attn_sparse_sink_windowpack", "attn", "BF16 reconstruction before original attention",
+  "native512 WINDOW format3; compressed format1 or absent", "u8 window/cache, original other operands",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cDs41AttnSparseSink), NOTUNE, nullptr, nullptr,
+  r4d_rad_ds41_attn_sparse_sink_windowpack, nullptr, nullptr, nullptr, r4d_shape_attn_sparse_sink },
+{ "ds41_attn_sparse_sink_d512_kvpack", "attn_sparse_sink_kvpack", "attn", "BF16 reconstruction before original scalar/WMMA attention",
+  "dim512, kv_format1, ordinary BF16 window", "u8 compressed cache, original other operands",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cDs41AttnSparseSink), NOTUNE, nullptr, nullptr,
+  r4d_rad_ds41_attn_sparse_sink_kvpack, nullptr, nullptr, nullptr, r4d_shape_attn_sparse_sink },
+{ "ds41_index_score_d128_b16", "index_score_b16", "attn", "lossless16-bit score-plane store after unchanged score arithmetic",
+  "same scalar/WMMA dispatch as index_score", "bf16 q/weights/cache/score; i32 metadata",
+  RAD_DOMAIN_DEVICE,R4D_PRIO_ONLY,ROW(cDs41IndexScore),NOTUNE,nullptr,nullptr,
+  r4d_rad_ds41_index_score_b16,nullptr,nullptr,nullptr,r4d_shape_index_score_b16 },
+{ "ds41_index_candidates_b16", "index_candidates_b16", "select", "bitwise expand then unchanged candidate selection",
+  "same block maxima/newest pin", "bf16 score; i32 positions/keep",
+  RAD_DOMAIN_DEVICE,R4D_PRIO_ONLY,ROW(cDs41IndexCand),NOTUNE,nullptr,nullptr,
+  r4d_rad_ds41_index_candidates_b16,nullptr,nullptr,nullptr,r4d_shape_index_candidates_b16 },
+{ "ds41_index_topk_b16", "index_topk_b16", "select", "bitwise expand then unchanged stable exact top-k",
+  "same one-block/split/merge dispatch", "bf16 score; i32 keep/positions/sel",
+  RAD_DOMAIN_DEVICE,R4D_PRIO_ONLY,ROW(cDs41IndexTopk),NOTUNE,nullptr,nullptr,
+  r4d_rad_ds41_index_topk_b16,r4d_rad_ds41_index_topk_scratch,nullptr,nullptr,r4d_shape_index_topk_b16 },
 
 { "ds41_attn_sparse_sink_d512_bf16", "attn_sparse_sink", "attn",
   "latent attention (key = value) over the window keys and the selected compressed entries, "

@@ -113,6 +113,9 @@ struct EpRouteCounts {
     int64_t global_experts = 0, local_experts = 0, expert_base = -1;
     int64_t top_k = 0, rows = 0;
     bool successfully_issued = false;
+    /* Optional P2 audit only: actual operands of THIS successfully issued scatter, never the
+     * previous pass's GU address. Null off; same compute-stream lifetime as row. */
+    const int32_t *audit_ids = nullptr, *audit_sorted = nullptr, *audit_offsets = nullptr;
 };
 
 inline bool ep_route_current(const EpRouteCounts& v, const void* program, void* stream,

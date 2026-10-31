@@ -460,6 +460,75 @@ TEST(p1_swiglu_span_switch_is_default_off_and_accepts_only_zero_or_one) {
     }
 }
 
+TEST(p1_arena_audit_is_explicit_default_off_and_refuses_ring_or_missing_arena) {
+    bool on = true;
+    for (const char* text : {static_cast<const char*>(nullptr), "", "0"}) {
+        CHECK(arena_audit_config(text, 0, 64, &on)); CHECK(!on);
+    }
+    for (int cap : {64, 65, 88, 128}) {
+        CHECK(arena_audit_config("1", cap, 0, &on)); CHECK(on);
+    }
+    for (const char* text : {"01", "2", "true", "-1", "1 "})
+        CHECK(!arena_audit_config(text, 88, 0, &on));
+    CHECK(!arena_audit_config("1", 0, 0, &on));
+    CHECK(!arena_audit_config("1", 129, 0, &on));
+    CHECK(!arena_audit_config("1", 88, 1, &on));
+}
+
+TEST(p1_arena_audit_disabled_path_has_no_observations) {
+    ArenaUseAudit a; a.init(false, 128, ds41p1::kSlotBytes);
+    a.bind(64, 7, 4096); a.publish(64, true); a.select(64, 7, 4096, 1, 3, true);
+    CHECK(!a.enabled()); CHECK_EQ(a.granted(), 0); CHECK_EQ(a.granted_bytes(), 0);
+    CHECK_EQ(a.published(), 0); CHECK_EQ(a.selected(), 0); CHECK_EQ(a.selections(), 0u);
+}
+
+TEST(p1_arena_audit_requires_real_upper_publication_and_deduplicates_selections) {
+    ArenaUseAudit a; a.init(true, 88, ds41p1::kSlotBytes);
+    for (int k = 0; k < 88; ++k) a.bind(k, 100 + k, uintptr_t(4096) + uint64_t(k) * ds41p1::kSlotBytes);
+    for (int k = 0; k < 65; ++k) a.publish(k, true);
+    for (int k = 0; k < 65; ++k)
+        a.select(k, 100 + k, uintptr_t(4096) + uint64_t(k) * ds41p1::kSlotBytes, a.epoch(k), 1, true);
+    a.select(64, 164, uintptr_t(4096) + uint64_t(64) * ds41p1::kSlotBytes, a.epoch(64), 2, true);
+    CHECK(a.valid()); CHECK_EQ(a.granted(), 88); CHECK_EQ(a.granted_bytes(), 88 * ds41p1::kSlotBytes);
+    CHECK_EQ(a.published(), 65); CHECK_EQ(a.published_upper(), 1);
+    CHECK_EQ(a.selected(), 65); CHECK_EQ(a.selected_upper(), 1); CHECK_EQ(a.selections(), 66u);
+}
+
+TEST(p1_arena_audit_withdrawal_and_republication_change_the_ownership_epoch) {
+    for (bool republish : {false, true}) {
+        ArenaUseAudit a; a.init(true, 65, ds41p1::kSlotBytes); a.bind(64, 7, 4096);
+        a.publish(64, true); const uint64_t old = a.epoch(64); a.publish(64, false);
+        if (republish) a.publish(64, true);
+        a.select(64, 7, 4096, old, 1, republish);
+        CHECK(!a.valid()); CHECK_EQ(a.selected(), 0); CHECK_EQ(a.selections(), 0u);
+    }
+}
+
+TEST(p1_arena_audit_refuses_wrong_owner_address_count_and_unpublished_selection) {
+    for (int fault = 0; fault < 6; ++fault) {
+        ArenaUseAudit a; a.init(true, 65, ds41p1::kSlotBytes); a.bind(64, 7, 4096);
+        if (fault != 0) a.publish(64, true);
+        a.select(fault == 1 ? 65 : 64, fault == 2 ? 8 : 7, fault == 3 ? 8192 : 4096,
+                 a.epoch(64), fault == 4 ? -1 : 1, fault != 5);
+        CHECK(!a.valid()); CHECK_EQ(a.selected(), 0); CHECK_EQ(a.selected_upper(), 0);
+    }
+    ArenaUseAudit a; a.init(true, 65, ds41p1::kSlotBytes); a.bind(64, 7, 4096);
+    a.select(64, 7, 4096, 0, 0, false); // no synchronized selected row, so no use claim
+    CHECK(a.valid()); CHECK_EQ(a.selected(), 0);
+}
+
+TEST(p1_arena_audit_geometry_and_alias_checks_do_not_assume_a_cache_budget) {
+    for (int n : {1, 64, 65, 88, 128}) {
+        ArenaUseAudit a; a.init(true, n, 4096); CHECK(a.valid()); CHECK_EQ(a.granted_bytes(), int64_t(n) * 4096);
+    }
+    for (int n : {0, 129}) { ArenaUseAudit a; a.init(true, n, 4096); CHECK(!a.valid()); }
+    ArenaUseAudit overflow; overflow.init(true, 128, INT64_MAX); CHECK(!overflow.valid());
+    for (bool address : {false, true}) {
+        ArenaUseAudit a; a.init(true, 2, 4096); a.bind(0, 7, 4096);
+        a.bind(1, address ? 8 : 7, address ? 4096 : 8192); CHECK(!a.valid());
+    }
+}
+
 TEST(p1_swiglu_span_launch_guard_keeps_unknown_stateful_and_scratch_rows_full) {
     RadKernelInfo row{};
     row.name = "swiglu_clamped_bf16"; row.op = "swiglu_clamped"; row.domain = RAD_DOMAIN_DEVICE;

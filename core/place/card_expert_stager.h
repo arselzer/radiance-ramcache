@@ -54,6 +54,7 @@
 #pragma once
 #include "../../tools/ds41-host-experts/ds41_p1.h"   /* the P1 contract (also on rad_core's include path) */
 #include "mover.h"
+#include "p1_arena_audit.h"
 #include "../sched/p1_chunk.h"
 
 #include <array>
@@ -75,6 +76,8 @@ namespace p1 {
 
 /* ---- tunables ----------------------------------------------------------------------------------- */
 inline constexpr const char* kSwigluSpanEnv = "RADIANCE_EXPERIMENTAL_DS41_P1_SWIGLU_SPAN";
+inline constexpr const char* kArenaAuditEnv = "RADIANCE_EXPERIMENTAL_DS41_P1_LEND_AUDIT";
+inline constexpr const char* kArenaAuditVersion = "P1_ARENA_USE_AUDIT_V1";
 struct Tunables {
     int  wave = ds41p1::kDefWave;
     int  inflight = ds41p1::kDefInflight;
@@ -87,10 +90,12 @@ struct Tunables {
     int  grace_ms = ds41p1::kDefGraceMs;
     bool align_end = true;
     bool swiglu_span = false;
+    bool lend_audit = false;
 };
 /* The tunables from `get` (getenv for the engine): each a whole number in its range (wave 1-16,
- * inflight 1-64, ready 1-32, ahead 0-64, verify 0-4096, min_rows 17-4096, lend 0-64, lend_arena 0-64,
+ * inflight 1-64, ready 1-32, ahead 0-64, verify 0-4096, min_rows 17-4096, lend 0-64, lend_arena 0-128,
  * grace_ms 0-60000), align "end" or "start", swiglu_span 0/off or 1/on (default off).
+ * lend_audit is admitted separately once by FileStager::p1_init, default off.
  * False with the reason on anything else. */
 bool parse_tunables(const std::function<const char*(const char*)>& get, Tunables* t, std::string* why);
 
@@ -411,6 +416,8 @@ public:
     int  lend_ring_slot(int k) const { return k >= 0 && k < (int)lring_.size() ? lring_[(size_t)k] : -1; }
     char* lend_slot(int k) const { return k >= 0 && k < (int)lat_.size() ? lat_[(size_t)k] : nullptr; }
     int  lend_arena_slots() const { return (int)(lat_.size() - lring_.size()); }
+    bool lend_audit_enabled() const { return arena_audit_.enabled(); }
+    void audit_selected_lent_unit(int32_t unit, int64_t selected_rows);
     int32_t lend_unit(int k) const { return k >= 0 && k < (int)lu_.size() ? lu_[(size_t)k].unit : -1; }
     /* LendHost */
     int  load(int k) override;
@@ -517,6 +524,7 @@ private:
      * ring slot; the two pinned reload buffers, each with planes for the drive's read; the reload
      * thread's queue (lent slot, buffer) and what it landed. lmu_ guards lbuf_free_, lq_ and ldone_. */
     RingLender lend_;
+    ArenaUseAudit arena_audit_;
     std::vector<LendUnit> lu_;
     std::vector<char*> lat_;
     std::vector<int> lring_, lev_, lsrc_;

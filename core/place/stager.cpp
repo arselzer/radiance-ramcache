@@ -964,6 +964,10 @@ int FileStager::start_ep_routed(int32_t li, RadStream s, bool* read) {
     want_.clear(); skip_.clear();
     for (int32_t u : L.units) {
         if (mover_->ring_resident(u)) {
+            if (p1_ && p1_->lend_audit_enabled()) {
+                const int e = plan_->units[(size_t)u].expert;
+                p1_->audit_selected_lent_unit(u, e >= 0 && e < counts_cap_ ? counts_host_[e] : -1);
+            }
             if (bank_track_) {
                 bool selected=false;
                 if (!ep_route_unit_selected(counts_host_,plan_->units[(size_t)u].expert,&selected)) return RAD_E_STATE;
@@ -2739,6 +2743,10 @@ int FileStager::hx_early_decide() {
     skip_.clear();
     for (int32_t u : L.units) {
         if (mover_->ring_resident(u)) {
+            if (p1_ && p1_->lend_audit_enabled()) {
+                const int e = plan_->units[(size_t)u].expert;
+                p1_->audit_selected_lent_unit(u, e >= 0 && e < counts_cap_ ? counts_host_[e] : -1);
+            }
             if (bank_track_) {
                 bool selected=false;
                 if (!ep_route_unit_selected(counts_host_,plan_->units[(size_t)u].expert,&selected)) return RAD_E_STATE;
@@ -4696,6 +4704,9 @@ int FileStager::p1_init(const Program& prog) {
     p1::Tunables t;
     std::string why;
     if (!p1::parse_tunables([](const char* k) { return std::getenv(k); }, &t, &why)) return refuse(why);
+    // Read once at startup, after the ordinary tunables; never inspect env on the step path.
+    if (!p1::arena_audit_config(std::getenv(p1::kArenaAuditEnv), t.lend_arena, t.lend, &t.lend_audit))
+        return refuse(fmt("%s needs exact 0/off or 1 with arena lending and no ring lending", p1::kArenaAuditEnv));
     if (const char* fl = std::getenv("RADIANCE_EXPERIMENTAL_DS41_FETCH_LIST"); fl && !std::strcmp(fl, "1"))
         return refuse("RADIANCE_EXPERIMENTAL_DS41_FETCH_LIST=1 is not covered");
     if (prog.ctx.max_spec > 0) return refuse("speculation is on");

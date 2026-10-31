@@ -1111,6 +1111,10 @@ int CardExpertPath::lend_init(const std::vector<LendUnit>& units, const std::vec
         lbuf_free_.push_back(b);
     }
     if (lend_.init(this, n, grace_ms) < 0) return no("the lent ring's state");
+    static_assert(ArenaUseAudit::kSlots == ds41p1::kMaxArenaLend);
+    arena_audit_.init(t_.lend_audit, n - nr, ds41p1::kSlotBytes);
+    for (int k = nr; arena_audit_.enabled() && k < n; ++k)
+        arena_audit_.bind(k - nr, lu_[(size_t)k].unit, uintptr_t(lat_[(size_t)k]));
     lstop_ = false;
     lth_ = std::thread(&CardExpertPath::lend_loop, this);
     return RAD_OK;
@@ -1240,6 +1244,27 @@ void CardExpertPath::drop(int k) {
 void CardExpertPath::publish(int k, bool on) {
     if (k < 0 || k >= (int)lu_.size()) return;
     mover_->set_ring_resident(lu_[(size_t)k].unit, on ? lat_[(size_t)k] : nullptr);
+    if (arena_audit_.enabled() && k >= (int)lring_.size()) {
+        const int32_t u = lu_[(size_t)k].unit;
+        if (mover_->ring_resident(u) != on || (on && mover_->unit_base(u) != lat_[(size_t)k]))
+            arena_audit_.refuse();
+        else arena_audit_.publish(k - (int)lring_.size(), on);
+    }
+}
+
+void CardExpertPath::audit_selected_lent_unit(int32_t unit, int64_t selected_rows) {
+    if (!arena_audit_.enabled() || selected_rows == 0) return;
+    const int nr = (int)lring_.size();
+    for (int k = nr; k < (int)lu_.size(); ++k) {
+        if (lu_[(size_t)k].unit != unit) continue;
+        const int a = k - nr;
+        const void* base = mover_->unit_base(unit);
+        const bool owner = !lend_.lent() && lend_.resident(k) && mover_->ring_resident(unit) &&
+                           base == lat_[(size_t)k];
+        arena_audit_.select(a, unit, uintptr_t(base), arena_audit_.epoch(a), selected_rows, owner);
+        return;
+    }
+    arena_audit_.refuse();
 }
 
 /* A ring slot's next writer is the card path's own copy, behind this one on the DMA lane; an arena
@@ -1458,6 +1483,15 @@ std::string CardExpertPath::stats_line(int rank) const {
                       lend_.n(), lend_arena_slots(), lend_.residents(), l.lends, l.withdrawn, l.returns, l.reloaded, c_.lend_ram, c_.lend_drive,
                       c_.lend_drive ? (double)c_.lend_drive_ns * 1e-6 / (double)c_.lend_drive : 0.0, l.failed, l.cancelled,
                       l.held_back);
+        line += buf;
+    }
+    if (arena_audit_.enabled()) {
+        std::snprintf(buf, sizeof buf,
+                      "; %s enabled=1 valid=%d granted_slots=%d granted_bytes=%lld published_distinct=%d "
+                      "published_upper=%d selected_distinct=%d selected_upper=%d selections=%" PRIu64 " metadata_bytes=%zu",
+                      kArenaAuditVersion, arena_audit_.valid(), arena_audit_.granted(),
+                      (long long)arena_audit_.granted_bytes(), arena_audit_.published(), arena_audit_.published_upper(),
+                      arena_audit_.selected(), arena_audit_.selected_upper(), arena_audit_.selections(), sizeof(arena_audit_));
         line += buf;
     }
     return line;

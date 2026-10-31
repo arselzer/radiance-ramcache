@@ -491,11 +491,14 @@ def validate_markers(text, receipt):
                          row.get("copied") == "1", "no actual bank copy/lending")
                     borrowed.append(n)
                 else:
+                    original_bytes = int(next(x for x in rr if x.get("stage") == "lent")["bank_bytes"])
                     need(int(row["bytes"]) > 0 and row.get("verified") == "1" and
                          row.get("aliases_ok") == "1" and row.get("masks_ok") == "1" and
                          row.get("hash_scope") == "cohort" and row.get("strict_memcmp") == "1" and
                          re.fullmatch(r"[0-9a-fA-F]+", row.get("hash", "")) and
                          row["hash"] == row.get("expected_hash"), "unproven bank restoration")
+                    need(int(row["restored_bytes"]) == original_bytes and int(row["invariant_bytes"]) == 1536 and
+                         int(row["bytes"]) == original_bytes + 1536, "restore coverage omits hot slots or mask planes")
                     selected_units.append(int(row["selected_units"]))
                     hashes.append(row["hash"])
             for action in ("lend", "restore"):
@@ -531,7 +534,7 @@ def validate_markers(text, receipt):
         need(all(n >= 0 for n in selected_units) and len(set(hashes)) == 1,
              "inconsistent cohort restoration receipt")
         if selected:
-            need(sum(selected_units) > 0, "lent residents were never actually selected")
+            need(all(n > 0 for n in selected_units), "not every rank actually selected lent residents")
         summaries.append({"epoch": epoch, "borrowed_bytes": borrowed, "selected_units": selected_units,
                           "anchor": int(anchor) if selected else 0})
     need(any(row["anchor"] for row in summaries), "only idle restoration observed; anchor never resumed")

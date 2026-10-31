@@ -47,6 +47,10 @@ struct StepEntry {
     int32_t ckpt_restore = -1;
     const int32_t* draft = nullptr;   /* the drafter's proposal, appended after the committed tail */
     int32_t n_draft = 0;
+    /* A tree drafter's proposal (rad_drafter_tree): draft_parent[j] is the parent of draft[j] as a
+     * node index (0 the anchor, j + 1 draft[j]). Null for a chain. Read only on a tree step
+     * (StepPlan::spec_is_tree), where a null one is staged as the chain. */
+    const int32_t* draft_parent = nullptr;
     /* First logits row, written into `out_ids`, that this entry reads, or -1 for the default
      * rule. The MTP history pass uses it to gather the 1 + n_spec trunk rows of a verifying
      * sequence; the DFlash2 query pass uses it to name the mask rows of its own block. Which
@@ -152,6 +156,11 @@ public:
     /* The last build's slab and offsets on one rank, for the advance. The caller supplies mode,
      * round, slot state and inputs (advance.h). */
     AdvanceArgs advance_args(int rank) const;
+
+    /* The sequences of `b`, a batch build() returned that is still valid (any rank's), in row
+     * order; null for another batch (an encoder pass). What a streamed group's prefill stage
+     * copies is read from their tables (kvstream/stage.h, "Volume"). */
+    const std::vector<uint64_t>* step_seqs(const RadBatch* b) const;
 
     /* Longest sequence a batch can describe, in tokens, as sized into the block-table rows at
      * init. A position at or past it cannot be addressed. */
@@ -280,6 +289,10 @@ private:
         /* [n_tok] each row's runtime LoRA adapter slot (RadBatch::lora_slot): carved only when the
          * engine serves adapters, empty otherwise. */
         int32_t   *h_lora = nullptr, *d_lora = nullptr;
+        /* [max_seqs * plugin_words] and [max_seqs + 1]: each sequence's words for the plugin
+         * (RadBatch::plugin_words), carved only when the program declared a bound. */
+        int32_t   *h_pw = nullptr, *d_pw = nullptr;
+        int32_t   *h_pwcu = nullptr, *d_pwcu = nullptr;
         /* [n_kv_groups][max_seqs]: every conv group's state slot per sequence (see init()). */
         int32_t*   h_convslot = nullptr;
 
@@ -312,6 +325,9 @@ private:
         /* Per rank and group, the RadKVStream a batch names: each rank's own copy, outside the slab. */
         std::vector<std::vector<RadKVStream>>     stream;
         std::vector<RadBatch>                     batch;
+        /* The build's sequences in row order (step_seqs); none for an encoder pass. */
+        std::vector<uint64_t>                     seqs;
+        bool                                      has_seqs = false;
         std::vector<int32_t>                      row0;   /* RadBatch::consumer_row0 (per-row cut) */
     };
 
@@ -389,6 +405,7 @@ private:
     int64_t pay_words_ = 0;   /* payload build_groups wrote, in int32 words */
     void forget_tables();
     int64_t last_n_seq_ = 0;
+    bool    last_tree_  = false;   /* the last build staged spec_parent (advance_args' parent_off) */
 
     int64_t               derived_bytes_ = 0;
     std::vector<Derived>  derived_;
@@ -403,6 +420,8 @@ private:
     bool                   mm_on_ = false;
     /* The engine serves runtime LoRA adapters (Config::lora): the batch carries each row's slot. */
     bool                   lora_on_ = false;
+    /* Program::plugin_words: the words a sequence may carry, 0 for none. */
+    int64_t                pw_cap_ = 0;
     int64_t                n_embd_ = 0;
     std::vector<void*>     mm_dev_;
     uint16_t*              mm_host_ = nullptr;

@@ -510,6 +510,40 @@ TEST(schema_mismatches_are_named) {
     CHECK_EQ(b.status(), RAD_E_SCHEMA);
 }
 
+/* declare_scores binds the scored readout: bf16 hidden rows and a bf16 head table of the same
+ * width, and the table must COVER the vocabulary — the readout indexes it by token id, and the
+ * scheduler's admission bound is meta.n_vocab, so a short table is a device fault waiting in the
+ * last block of the vocabulary, not a refusal. Rows past the vocabulary are padding and read
+ * fine. */
+TEST(declare_scores_wants_a_table_that_covers_the_vocabulary) {
+    NEED_PLUGIN(reg)
+    RadModelMeta m = make_meta();
+    m.n_vocab = 8192;
+    Builder b(reg, m, make_ctx());
+
+    RadBufDecl hd{};
+    hd.dtype = RAD_BF16;
+    hd.rank  = 2;
+    hd.shape[0] = 512;
+    hd.shape[1] = 4096;
+    hd.kind = RAD_BUF_TRANSIENT;
+    hd.domain = RAD_DOMAIN_DEVICE;
+    const rad_buf hidden = b.decl_buffer("hout", &hd);
+    REQUIRE(hidden > 0);
+
+    const rad_weight short_t = decl_w(b, "tok.short", 4096, 4096);    /* rows < n_vocab */
+    CHECK_EQ(b.declare_scores(hidden, short_t), RAD_E_INVAL);
+    CHECK(has(b.errors().back(), "under the 8192-token vocabulary"));
+
+    const rad_weight narrow = decl_w(b, "tok.narrow", 8192, 2048);    /* width != hidden's */
+    CHECK_EQ(b.declare_scores(hidden, narrow), RAD_E_INVAL);
+
+    const rad_weight full   = decl_w(b, "tok.full", 8192, 4096);
+    CHECK_OK(b.declare_scores(hidden, full));
+    const rad_weight padded = decl_w(b, "tok.padded", 9216, 4096);    /* rows > n_vocab: fine */
+    CHECK_OK(b.declare_scores(hidden, padded));
+}
+
 TEST(no_schema_names_the_near_miss) {
     NEED_PLUGIN(reg)
     Builder b(reg, make_meta(), make_ctx());
@@ -1182,6 +1216,37 @@ TEST(a_block_drafters_short_block_is_shorter_and_still_proposes) {
         CHECK_OK(rad_drafter_short_block(&b, 3));
         CHECK_EQ(b.program().drafter_short_block, 3);
     }
+}
+
+/* A tree drafter (rad_drafter_tree) takes a short block too: a block-16 tree of 15 nodes declares
+ * one of 8 rows, over which the drafter grows a tree of its own of up to 7 nodes; and a tree of 7
+ * nodes over the same block, where a chain's rule (rows past the 9 that propose nothing) would refuse
+ * it. */
+TEST(a_tree_drafter_takes_a_short_block) {
+    Registry reg;
+    Builder b(reg, make_meta(), make_ctx());
+    RadBufDecl bd{};
+    bd.dtype = RAD_I32; bd.rank = 2; bd.shape[0] = 256; bd.shape[1] = 15;
+    const rad_buf prop = rad_decl_buffer(&b, "prop", &bd);
+    const rad_buf par = rad_decl_buffer(&b, "par", &bd);
+    RadDrafterDecl d{};
+    d.kind = RAD_DRAFT_BLOCK; d.name = "df"; d.depth = 15; d.block = 16; d.mask_token = 5;
+    d.proposal = prop; d.proposal_pitch = 15;
+    CHECK_OK(rad_declare_drafter(&b, &d));
+    CHECK_OK(rad_drafter_tree(&b, par));
+    CHECK_EQ(rad_drafter_short_block(&b, 16), RAD_E_INVAL);   /* not shorter */
+    CHECK_EQ(rad_drafter_short_block(&b, 1), RAD_E_INVAL);    /* no row to propose */
+    CHECK_OK(rad_drafter_short_block(&b, 8));
+    CHECK_EQ(b.program().drafter_short_block, 8);
+    Builder b7(reg, make_meta(), make_ctx());
+    const rad_buf prop7 = rad_decl_buffer(&b7, "prop", &bd);
+    const rad_buf par7 = rad_decl_buffer(&b7, "par", &bd);
+    RadDrafterDecl d7 = d;
+    d7.depth = 7; d7.proposal = prop7;
+    CHECK_OK(rad_declare_drafter(&b7, &d7));
+    CHECK_OK(rad_drafter_tree(&b7, par7));
+    CHECK_OK(rad_drafter_short_block(&b7, 8));
+    CHECK_EQ(b7.program().drafter_short_block, 8);
 }
 
 /* A block drafter's proposal pitch is its row pitch, which the engine reads row s at: left at 0 it
@@ -1905,8 +1970,22 @@ TEST(a_widened_weight_cannot_also_be_relayouted) {
     CHECK(any_error(b, "a widening and a relayout"));
 }
 
-/* The other direction, the d3 readout: an f32 checkpoint tensor declared bf16 (what the device
- * logits kernel reads) is narrowed by the loader, and the stored form is one plain bf16 plane. */
+/* The words a request may hand the plugin are a bound the program records; a negative or absurd
+ * bound is refused, and declaring none leaves it at zero. */
+TEST(the_plugin_words_bound_is_recorded_and_checked) {
+    NEED_EXTRA(reg)
+    Builder b(reg, make_meta(), make_ctx());
+    CHECK_EQ(b.program().plugin_words, (int64_t)0);
+    CHECK_OK(b.declare_plugin_words(4096));
+    CHECK_EQ(b.program().plugin_words, (int64_t)4096);
+    CHECK(b.declare_plugin_words(-1) < 0);
+    CHECK(b.declare_plugin_words((int64_t)1 << 21) < 0);
+    CHECK_EQ(b.program().plugin_words, (int64_t)4096);
+}
+
+/* The other direction: an f32 checkpoint tensor declared bf16 (a readout head, which the device
+ * logits kernel reads as bf16) is narrowed by the loader, and the stored form is one plain bf16
+ * plane. */
 TEST(an_f32_source_declared_bf16_is_narrowed_at_load) {
     NEED_EXTRA(reg)
     Builder b(reg, make_meta(), make_ctx());
@@ -2287,7 +2366,9 @@ TEST(the_home_search_path_splits_on_colons_and_the_first_home_with_a_file_wins) 
  * weight by weight names its producing tool, which no plugin claims: the family's one quantised
  * plugin serves it (or its only plugin), and two quantised plugins are refused by name rather than
  * chosen between. A plugin that declines imports (rad_arch_serves_imports, radtest_archq_w8) is
- * still selected by its own descriptor, but is neither counted nor picked for an import. */
+ * still selected by its own descriptor, but is neither counted nor picked for an import. Block fp8
+ * (`fp8_e4m3`) reads stock, so a family that claims no plugin for it is served the same way
+ * without the import flag. */
 TEST(the_architecture_plugin_is_picked_by_id_and_quantisation) {
     const std::string archq = home() + "/testarchq";
     NEED_ARTIFACT(archq + "/radtest_archq_fp8.so");
@@ -2345,6 +2426,14 @@ TEST(the_architecture_plugin_is_picked_by_id_and_quantisation) {
     CHECK_OK(pick(bare, "quark-mxfp4", true, &lp, &log));
     CHECK_EQ(lp.arch_plugin, std::string("radtest_archq_plain"));
     CHECK_EQ(pick(all, "fp8", false, &lp, &log), RAD_OK);
+    CHECK_OK(pick(bare, "fp8_e4m3", false, &lp, &log));
+    CHECK_EQ(lp.arch_plugin, std::string("radtest_archq_plain"));
+    CHECK_EQ(lp.arch_quant, std::string());
+    CHECK_OK(pick(one, "fp8_e4m3", false, &lp, &log));
+    CHECK_EQ(lp.arch_plugin, std::string("radtest_archq_fp8"));
+    CHECK_EQ(pick(all, "fp8_e4m3", false, &lp, &log), RAD_E_NOTFOUND);
+    CHECK_EQ(pick(bare, "w4", false, &lp, &log), RAD_E_NOTFOUND);
+    CHECK(has(log, "is served at"));
 
     /* A second quantised plugin that declines imports leaves them to the first. */
     CHECK_OK(pick(w8, "quark-mxfp4", true, &lp, &log));

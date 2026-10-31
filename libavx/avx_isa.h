@@ -98,9 +98,13 @@ int         avx_par_force(int threads);
     X(scatter_rows)         X(ngram_ids)                                                          \
     X(ple_gate)             X(ple_conv)             X(cast)                 X(softmax)            \
     X(scale_rows)           X(scale)                X(fill)                 X(act_mul)            \
+    X(seg_mean_bf16_sum) \
     X(seg_mean)             X(mul_weight)           X(pool_rows)            X(pool_cols)          \
+    X(seg_softmax_pool)                                                                           \
     X(relu)                 X(clamp)                X(conv2d)               X(conv1d_dw)          \
     X(rel_sinusoid)         X(seg_sinusoid)         X(conv2d_unfold)                              \
+    X(position_scale)                                                                            \
+    X(embed_attn)           X(ministral_rope)        X(pixtral_rope)         X(pixtral_merge)      \
     /* ---- quantisation and rotation */                                                          \
     X(quant_act_i8)         X(quant_act_i8g)        X(had_quant_act_i8)     X(quant_act_fp8)      \
     X(had_quant_act_fp8)    X(gram_accum)           X(rmsnorm_had_quant_i8) X(gated_had_quant_i8) \
@@ -155,7 +159,8 @@ int         avx_par_force(int threads);
     X(sample_penalties)     X(sample_dry)           X(sample_temp)          X(sample_topk)        \
     X(sample_topp)          X(sample_minp)          X(sample_typical)       X(sample_xtc)         \
     X(sample_merge_topk)    X(sample_mask)          X(sample_pick)          X(sample_argmax)      \
-    X(sample_ngram_ban)     X(sample_logprobs)      X(dflash_select)        X(dflash_conv)
+    X(sample_ngram_ban)     X(sample_logprobs)      X(dflash_select)        X(dflash_conv)          \
+    X(dflash_tree)          X(attn_paged_tree)
 
 /* One ISA level's table: one member per op, in AVX_OP_LIST order. A missing definition is a link
  * error from that level's avx_table.cpp object. */

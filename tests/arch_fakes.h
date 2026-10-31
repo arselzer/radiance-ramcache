@@ -86,6 +86,8 @@ struct RecJoin  { size_t at = 0; int from = 0, to = 0; };
 using namespace rad_fake;
 
 struct RadBuilder {
+    rad_buf    score_hidden = 0;   /* rad_declare_scores */
+    rad_weight score_table = 0;
     std::vector<RecWeight> weights;
     std::vector<RecBuf>    bufs;
     std::vector<RecOp>     ops;
@@ -115,6 +117,8 @@ struct RadBuilder {
      * output (rad_declare_pooled). */
     rad_buf logits = 0;
     rad_buf pooled = 0;
+    /* The words a request may hand the plugin (rad_declare_plugin_words). */
+    int64_t plugin_words = 0;
 
     /* The draft head's declaration (rad_declare_drafter), and whether it keeps no cache of its
      * own (rad_drafter_shared_kv) and at which rotary offset. */
@@ -123,6 +127,8 @@ struct RadBuilder {
     bool           drafter_shared = false;
     int            drafter_pos = -1;
     int64_t        drafter_short = 0;     /* rad_drafter_short_block */
+    /* A tree drafter's parents buffer (rad_drafter_tree), 0 for a chain. */
+    rad_buf        drafter_parents = 0;
     /* The consumer suffix (rad_declare_consumer_suffix), n_layer 0 when none, and the calls. */
     RadConsumerSuffix consumer{};
     int               consumer_calls = 0;
@@ -302,10 +308,25 @@ extern "C" int rad_declare_logits(RadBuilder* b, rad_buf logits) {
     return RAD_OK;
 }
 
+/* Scored steps' hidden rows and head table, recorded for the tests. */
+extern "C" int rad_declare_scores(RadBuilder* b, rad_buf hidden, rad_weight table) {
+    if (!b || !hidden || !table) return RAD_E_INVAL;
+    b->score_hidden = hidden;
+    b->score_table = table;
+    return RAD_OK;
+}
+
 /* An embedding program names its pooled output instead of logits; a program declares one. */
 extern "C" int rad_declare_pooled(RadBuilder* b, rad_buf pooled) {
     if (!b || !pooled || b->logits) return RAD_E_INVAL;
     b->pooled = pooled;
+    return RAD_OK;
+}
+
+/* The words a request may hand the plugin, recorded as the core records them. */
+extern "C" int rad_declare_plugin_words(RadBuilder* b, int64_t max_words) {
+    if (!b || max_words < 0) return RAD_E_INVAL;
+    b->plugin_words = max_words;
     return RAD_OK;
 }
 
@@ -414,6 +435,11 @@ extern "C" int rad_drafter_shared_kv(RadBuilder* b, int pos_offset) {
     b->drafter_pos = pos_offset;
     return RAD_OK;
 }
+extern "C" int rad_drafter_tree(RadBuilder* b, rad_buf parents) {
+    if (!b || b->drafter.kind != RAD_DRAFT_BLOCK || parents == 0) return RAD_E_STATE;
+    b->drafter_parents = parents;
+    return RAD_OK;
+}
 /* The core's chaining decision as the recorder answers it (it has no chaining backend): 0 unless a
  * test holds a ChainOn, to see where a plugin places work when launches chain. */
 static int g_chain_on = 0;
@@ -426,7 +452,9 @@ struct ChainOn {
 extern "C" int rad_drafter_short_block(RadBuilder* b, int64_t block) {
     const int64_t full = b ? (b->drafter.block > 0 ? b->drafter.block : b->drafter.depth + 1) : 0;
     if (!b || b->drafter.kind != RAD_DRAFT_BLOCK) return RAD_E_STATE;
-    if (block >= full || block - (full - b->drafter.depth) < 1) return RAD_E_INVAL;
+    if (b->drafter_parents ? (block < 2 || block >= full)
+                           : (block >= full || block - (full - b->drafter.depth) < 1))
+        return RAD_E_INVAL;
     b->drafter_short = block;
     return RAD_OK;
 }
@@ -602,6 +630,11 @@ extern "C" int rad_memset_async(void* dst, int value, int64_t bytes, RadStream s
     (void)dst; (void)value; (void)bytes; (void)s;
     return RAD_OK;
 }
+/* Events complete at once: the fake stream runs nothing. The calibration tap waits on one. */
+extern "C" int  rad_event_create(RadEvent* out) { if (out) *out = (RadEvent)out; return RAD_OK; }
+extern "C" void rad_event_destroy(RadEvent e)   { (void)e; }
+extern "C" int  rad_event_record(RadEvent e, RadStream s) { (void)e; (void)s; return RAD_OK; }
+extern "C" int  rad_event_sync(RadEvent e)      { (void)e; return RAD_OK; }
 
 /* ==================================================================== fixtures and helpers */
 namespace rad_fake {

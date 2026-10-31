@@ -83,7 +83,9 @@ struct OpPlan {
      * leave out. */
     int32_t       n_opd_schema   = -1;
     int32_t       n_opd_required = -1;
-    bool          issued   = false;  /* did the run phase ever issue it (spec §16's graph dump) */
+    bool          issued   = false;  /* did the run phase ever issue it (spec §16's graph dump);
+                                        the step path and the HTTP graph dump meet on it through
+                                        std::atomic_ref (Ctx::flush_issued, rad_graph.cpp) */
     /* Whether issuing it puts bytes on the interconnect. Set at bind from the resolved rows
      * (rad_kernel_collective) and the conventional all_reduce. The weight stager's copies share
      * the link and give way to it while it runs (Ctx::issue_body). */
@@ -159,6 +161,13 @@ struct KVViewState {
     int64_t shape0 = 0;            /* the operand's [blocks] extent for this view */
 };
 
+/* A byte range of one layer's row in a streamed group's mirror and stage (kvstream/stage.h,
+ * "Volume"): both are laid out by block id, so one range is the same offsets in either. */
+struct KVStageRun {
+    int64_t off   = 0;
+    int64_t bytes = 0;
+};
+
 struct KVPoolBinding {
     void*    base = nullptr;
     int64_t  layer_stride = 0;      /* bytes between one layer's cache and the next */
@@ -177,9 +186,9 @@ struct KVPoolBinding {
     KVViewState ring;
     KVViewState stage;
     bool        has_stage = false;
-    /* Bytes of a layer's mirror row a staged pass copies, from the held bound (kvstream/stage.h,
-     * "Volume"), set each step. 0 copies the whole row. */
-    int64_t     stage_live_bytes = 0;
+    /* The ranges of a layer's mirror row a staged pass copies (kvstream/stage.h, "Volume"), set
+     * each step. Empty copies the whole row. */
+    std::vector<KVStageRun> stage_runs;
 };
 
 /* The KV stage's driver (kvstream/stage.cpp), declared here for Ctx::tape_kv_stage. */
@@ -355,6 +364,11 @@ public:
     /* Called by the drain, so the ring knows which banks are still unread. */
     void              mark_credited(int layer, int bank);
     const RadRouting* last_routing(int layer) const;
+    /* The device pointer of `layer`'s expert counts for the current step, with `n_expert` set,
+     * or null when the layer has not reported this step (a routing-aware file stager then
+     * reads the layer whole). The pointer is stream-ordered behind the router: a copy on the
+     * compute stream at the stager's trigger sees this pass's counts. */
+    const int32_t*    route_counts_device(int layer, int64_t* n_expert) const;
 
     /* ---------------------------------------------------------- the placement seam */
     /* Change an op's execution site. Refuses with RAD_E_NOKERNEL, naming op and band, if the

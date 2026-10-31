@@ -25,6 +25,9 @@ struct SchedMetrics {
     int64_t failed = 0;
     int64_t cancelled = 0;
     int64_t preemptions = 0;
+    /* --preempt-wait-ms fallback: waits that ended by evicting cache blocks and forcing a running
+     * victim, not just by the pool freeing itself. */
+    int64_t preempt_forced = 0;
     int64_t steps = 0;
 
     /* Steps by shape. `steps_mixed` counts steps carrying both a prefill chunk and decode rows.

@@ -26,6 +26,7 @@
 #include "ref_common.h"
 #include "ref_ops.h"
 #include "ref_planes.h"
+#include "rad_abi_layout.h"
 
 /* ================================================================== parameter specs */
 #define P_INT(k)   { k, RAD_P_INT, RAD_REQUIRED }
@@ -199,6 +200,8 @@ static const RadParamSpec pActMul[] = { P_INT("M"), P_INT("n"), P_STR("act"), P_
 /* `M` is the step's token count and bands the op; the segment count is cu_seqlens' length. */
 static const RadParamSpec pSegMean[] = { P_INT("M"), P_INT("n"), P_STR("dtype") };
 static const RadOperandSpec oSegMean[] = { OPD("x"), OPD("cu_seqlens"), OUT("y") };
+static const RadParamSpec pSegPool[] = { P_INT("M"), P_INT("n"), P_STR("dtype") };
+static const RadOperandSpec oSegPool[] = { OPD("score"), OPD("v"), OPD("cu_seqlens"), OUT("y") };
 /* `M` is the input row count, a multiple of `k`; y has M / k rows. */
 static const RadParamSpec pPoolRows[] = { P_INT("M"), P_INT("n"), P_INT("k"), P_F64O("mult"),
                                           P_STR("dtype") };
@@ -248,6 +251,8 @@ static const RadParamSpec pCast[] = { P_INT("M"), P_INT("n"), P_STR("from"), P_S
 
 /* ---- quantisation and rotation ------------------------------------------------------------ */
 static const RadParamSpec pQuant[] = { P_INT("M"), P_INT("n"), P_INT("group"), P_STR("dtype") };
+/* gram_accum's: `upper` 1 accumulates only k2 >= k1, the half a reader of a symmetric H needs. */
+static const RadParamSpec pGram[]  = { P_INT("M"), P_INT("n"), P_INT("group"), P_STR("dtype"), P_INTO("upper") };
 /* `asum`, quant_act_i8's optional third output: group-major per-row code sums an asymmetric
  * weight grid subtracts to remove the stored zero point. */
 static const RadOperandSpec oQuant[]    = { OPD("x"), OUT("q"), OUT("scale"), OUT_O("asum") };
@@ -292,6 +297,13 @@ static const RadParamSpec pDflashSelect[] = { P_INT("M"), P_INT("steps"), P_INT(
 static const RadOperandSpec oDflashSelect[] = { OPD("cand"), OPD("unary"), OPD_O("hp"),
                                                 OPD("anchor"), WGT("pred"), WGT("succ"),
                                                 OUT("tokens") };
+static const RadParamSpec pDflashTree[] = { P_INT("M"), P_INT("steps"), P_INT("top_k"),
+                                            P_INT("rank"), P_INT("n_vocab"),
+                                            P_INTO("anchor_stride"), P_INT("nodes"),
+                                            P_F64O("temp"), P_STR("dtype") };
+static const RadOperandSpec oDflashTree[] = { OPD("cand"), OPD("unary"), OPD_O("hp"),
+                                              OPD("anchor"), WGT("pred"), WGT("succ"),
+                                              OUT("tokens"), OUT("parents") };
 
 static const RadParamSpec pRmsHadQuant[] = { P_INT("M"), P_INT("n"), P_F64("eps"), P_INT("group"),
                                              P_STR("dtype"), P_F64O("wadd") };
@@ -322,10 +334,11 @@ static const RadParamSpec pGemmBias[] = { P_INT("M"), P_INT("N"), P_INT("K"), P_
 static const RadOperandSpec oGemmBias[] = { OPD("a"), WGT("b"), WGT("bias"), OPD_O("res"),
                                             OUT("y") };
 
-/* `split_n` is libr4d's (docs/OPS.md): ref never splits K, so it accepts and ignores it. */
+/* `split_n` and `w_rb` are libr4d's (docs/OPS.md): ref never splits K and reads the per-row
+ * scale plane as it is, so it accepts and ignores both. */
 static const RadParamSpec pGemmQ[] = { P_INT("M"), P_INT("N"), P_INT("K"), P_INT("group"),
                                        P_STR("dtype"), P_INTO("pb1"), P_INTO("pb2"),
-                                       P_INTO("split_n") };
+                                       P_INTO("split_n"), P_INTO("w_rb") };
 /* The bias form has no parts (`pb1`/`pb2`); only the plain product supports them. */
 static const RadParamSpec pGemmQBias[] = { P_INT("M"), P_INT("N"), P_INT("K"), P_INT("group"),
                                            P_STR("dtype") };
@@ -370,6 +383,11 @@ static const RadParamSpec pAttnPaged[] = {
 static const RadOperandSpec oAttnPaged[] = {
     OPD("q"), OPD("kv_cache"), OPD("block_table"), OPD("seqused"),
     OPD_O("k_descale"), OPD_O("v_descale"), OPD_O("cu_seqlens"), OUT("out")
+};
+/* attn_paged with the verify block's tree (RadBatch::spec_parent, rad_drafter_tree). */
+static const RadOperandSpec oAttnPagedTree[] = {
+    OPD("q"), OPD("kv_cache"), OPD("block_table"), OPD("seqused"),
+    OPD_O("k_descale"), OPD_O("v_descale"), OPD_O("cu_seqlens"), OUT("out"), OPD("spec_parent")
 };
 /* Effective on kv_store, where `block_size` is RAD_REQUIRED: admits every value and refuses only a
  * query that omits it. On attn_paged the key is RAD_DERIVED and the constraint is skipped
@@ -427,6 +445,23 @@ static const RadParamSpec pRope[] = { P_INT("M"), P_INT("head_dim"), P_INT("n_he
                                       P_F64O("llama3_low"), P_F64O("llama3_high"),
                                       P_F64O("llama3_orig") };
 static const RadOperandSpec oRope[] = { INOUT("qkv"), OPD("positions") };
+
+static const RadParamSpec pPositionScale[] = { P_INT("M"), P_INT("n"), P_INT("original"),
+                                              P_F64("beta"), P_STR("dtype") };
+static const RadOperandSpec oPositionScale[] = { INOUT("x"), OPD("positions") };
+
+static const RadParamSpec pEmbedAttn[] = { P_INT("M"), P_INT("head_dim"), P_INT("gqa"),
+    P_INT("causal"), P_INTO("max_seqlen"), P_STR("dtype"), P_F64O("scale") };
+static const RadOperandSpec oEmbedAttn[] = { OPD("q"), OPD("k"), OPD("v"), OPD("cu_seqlens"), OUT("out") };
+static const RadParamSpec pMinistralRope[] = { P_INT("M"), P_INT("head_dim"), P_INT("n_head"),
+    P_INT("n_head_kv"), P_F64("theta"), P_STR("dtype"), P_F64O("yarn_factor"),
+    P_F64O("yarn_low"), P_F64O("yarn_high"), P_F64O("yarn_magnitude") };
+static const RadOperandSpec oMinistralRope[] = { INOUT("qkv"), OPD("pos") };
+static const RadParamSpec pPixtralRope[] = { P_INT("M"), P_INT("head_dim"), P_INT("n_head"),
+                                            P_F64("theta"), P_STR("dtype") };
+static const RadOperandSpec oPixtralRope[] = { INOUT("qkv"), OPD("coord") };
+static const RadParamSpec pPixtralMerge[] = { P_INT("M"), P_INT("n"), P_INT("merge"), P_STR("dtype") };
+static const RadOperandSpec oPixtralMerge[] = { OPD("x"), OPD("coord"), OUT("y") };
 
 /* The cos/sin plane a fused prologue reads instead of theta, at each position's own row of a
  * [max_ctx, rot] table. `rot`, `theta` and `scale` are spelled as on `rope`, which must compute the
@@ -1212,9 +1247,15 @@ static const RadOpSchema kSchemas[] = {
   "y = act(a) * b, `act` \"silu\", \"gelu\" (exact erf), \"gelu_tanh\" or \"sigmoid\". The activation is "
   "rounded to y's dtype before the product, which is the unfused pair. `a` and `b` may be column "
   "slices of one fused row." },
+{ "seg_mean_bf16_sum", ARR(pSegMean), ARR(oSegMean),
+  "BF16 masked mean: f32 segment sum rounded to BF16 before division, then BF16 output." },
 { "seg_mean", ARR(pSegMean), ARR(oSegMean),
   "y[s] = mean of x's rows [cu[s], cu[s+1]): one row a segment, summed in double and rounded "
   "once to y's dtype. An empty segment is a zero row." },
+{ "seg_softmax_pool", ARR(pSegPool), ARR(oSegPool),
+  "y[s] = v's rows [cu[s], cu[s+1]) summed with the softmax of their scores (one a row, f32, the "
+  "maximum subtracted) as weights, in f32 and rounded once to y's dtype. An empty segment is a "
+  "zero row." },
 { "pool_rows", ARR(pPoolRows), ARR(oUnary),
   "Row r of y is the mean of x's rows [r*k, r*k + k), summed in f32 and rounded to y's dtype, then "
   "times `mult` (default 1) and rounded again. M, the input rows, is a multiple of k." },
@@ -1378,6 +1419,12 @@ static const RadOpSchema kSchemas[] = {
   "previous pick. `hp` absent is a plane of ones, which drops the form to a plain low-rank "
   "bigram. Serial in l by construction -- the predecessor is not known until the previous step "
   "has been decided." },
+{ "dflash_tree", ARR(pDflashTree), ARR(oDflashTree),
+  "dflash_select's lattice and edge scores grown best-first into a tree of `nodes` nodes: node 0 "
+  "is the anchor, each selected node's children are the valid candidates at the next position "
+  "with log probability parent + log_softmax(score / temp) over them, and each round selects the "
+  "unselected child with the largest (ties to the first pushed). tokens[j-1] and parents[j-1] are "
+  "the j-th selected node and its parent's index (0 the anchor)." },
 { "givens_dense_quant", ARR(pGivensDense), ARR(oGivensDense),
   "ParoQuant's activation quantiser with the rotation as a dense per-group matrix: y = T (x / "
   "rscale) for each of `parts` rotated copies, T the [128, 128] f16 matrix a (part, 128-column "
@@ -1406,7 +1453,7 @@ static const RadOpSchema kSchemas[] = {
 /* The calibration op, the only one no forward pass issues: it runs under a calibration flag and
  * its output is read at convert time, in another process, through a file. `dtype` is the input's:
  * fp8a8 where the tap is a quantiser's output, bf16 without `a_scale` for a plain activation. */
-{ "gram_accum", ARR(pQuant), ARR(oGram),
+{ "gram_accum", ARR(pGram), ARR(oGram),
   "h[k1][k2] += sum over rows m of dequant(a)[m][k1] * dequant(a)[m][k2], in f32. The second "
   "moment of a layer's real input over a calibration corpus -- the Hessian a GPTQ packer needs. "
   "dequant(a) is a * a_scale for fp8a8 and `a` itself for bf16, which passes no a_scale. "
@@ -1463,6 +1510,11 @@ static const RadOpSchema kSchemas[] = {
   "one kernel serves decode, speculative verify and prefill. seqused is the TOTAL key count "
   "including this step's query rows. k_descale / v_descale are optional and apply to an fp8 "
   "cache. `scale` is not in docs/OPS.md and defaults to 1/sqrt(head_dim)." },
+{ "attn_paged_tree", ARR(pAttnPaged), ARR(oAttnPagedTree),
+  "attn_paged over a tree verify (rad_drafter_tree): spec_parent[row] is -2 for an ordinary "
+  "causal row, else the row's parent's index within its sequence's rows (-1 for the block's "
+  "first row). Inside the block such a row sees itself and its ancestors only, and its window is "
+  "measured from the block's first position plus its depth." },
 { "attn_dense", ARR(pAttnDense), ARR(oAttnDense),
   "Dense varlen attention over cu_seqlens segments (rows cu/cu_div). Nothing paged. `window` is "
   "attn_paged's rule over a segment's positions: causal, i - j < window; non-causal, |i - j| < "
@@ -1550,7 +1602,7 @@ static const RadOpSchema kSchemas[] = {
   "Per row and stream s: dot = sum h w k * rsqrt(mean h^2 + eps) rsqrt(mean k^2 + eps) / sqrt(n), "
   "gate = sigmoid(copysign(sqrt(max(|dot|, gate_eps)), dot)), out = h + gate v; f32, rounded "
   "once. v is one [n] row a token shared by the hc streams; w is f32 [hc*n]." },
-{ "rope_rows", ARR(pRopeRows), ARR(oRopeRows),
+{ "ds41_rope_rows", ARR(pRopeRows), ARR(oRopeRows),
   "rope from a rope_table plane over columns [off, off+rot) of each head_dim-wide head of x, in "
   "place: gptj pairs adjacent columns, neox i with i+rot/2; (a,b)(c+is) in f32, rounded once; "
   "inverse 1 conjugates the rotation. A negative or out-of-table position leaves its row." },
@@ -1558,6 +1610,17 @@ static const RadOpSchema kSchemas[] = {
   "cos/sin for the positions a step names, at each position's own row of a [max_ctx, rot] plane: "
   "rot values a row, cos for the first half and sin for the second. The angles are `rope`'s "
   "exactly. A row no position names is not written; a negative position writes nothing." },
+{ "embed_attn", ARR(pEmbedAttn), ARR(oEmbedAttn),
+  "Whole noncausal segments with QK, scaled scores and probabilities rounded to activation dtype." },
+{ "ministral_rope", ARR(pMinistralRope), ARR(oMinistralRope),
+  "Ministral NeoX rotary with BF16 cos/sin and separately rounded products; V is unchanged." },
+{ "pixtral_rope", ARR(pPixtralRope), ARR(oPixtralRope),
+  "Pixtral axial rotary with interleaved height/width frequencies and BF16 product rounding." },
+{ "pixtral_merge", ARR(pPixtralMerge), ARR(oPixtralMerge),
+  "Pack full raster patch grids into channel-major spatial merge blocks, without mixing images." },
+{ "position_scale", ARR(pPositionScale), ARR(oPositionScale),
+  "Scale query row p by 1 + beta * log(1 + floor(position[p] / original)), rounding the scale "
+  "to x's dtype before multiplication. Positions are nonnegative i32." },
 { "qsa_block_key", ARR(pQsaBlockKey), ARR(oQsaBlockKey),
   "QSA's compressed key, one vector per `ratio` rows of k: the block's mean accumulated in f32 and "
   "rounded to k's dtype, RMS-normed with gain (wadd + w), then NeoX-rotated over `rotary_dim` at "
@@ -2127,6 +2190,16 @@ static const RadOpSchema kSchemas[] = {
   "bounds derived from a pass's device geometry." },
 { "sub_i32", ARR(pSubI32), ARR(oSubI32),
   "y[i] = x[i] - s[0], int32: a device length less a device offset." },
+/* Row forms libr4d declares under names of their own, so a model can ask for the form: the same op, the same
+ * arithmetic and the same schema as the op named in each string. */
+{ "rmsnorm_rows", ARR(pRmsnorm), ARR(oRmsnorm),
+  "rmsnorm, for rows a model declares in thousands (the head norms over head_dim)." },
+{ "rope_rows", ARR(pRope), ARR(oRope),
+  "rope, for a model that wants the per-(token, pair) angles form at prefill row counts." },
+{ "gemm_nt_q_short", ARR(pGemmQ), ARR(oGemmQ),
+  "gemm_nt_q, for the short-prompt split rule's rows." },
+{ "gemm_nt_q_gated_wide", ARR(pGemmQGated), ARR(oGemmQGated),
+  "gemm_nt_q_gated at any M." },
 };
 
 /* ================================================================== the kernel table */
@@ -2364,8 +2437,13 @@ SIMPLE("ref_mix_rows", "mix_rows", "elem", "a weighted sum of k consecutive rows
        ref_mix_rows),
 SIMPLE("ref_chan_stats", "chan_stats", "elem", "per-channel statistics held as weights",
        DT_FLOAT, ref_chan_stats),
+SIMPLE("ref_seg_mean_bf16_sum", "seg_mean_bf16_sum", "elem", "BF16 sum/division mean pooling",
+       "bf16 in and out; f32 sum, BF16 sum and quotient", ref_seg_mean_bf16_sum),
 SIMPLE("ref_seg_mean", "seg_mean", "elem", "mean of each cu_seqlens segment's rows", DT_FLOAT,
        ref_seg_mean),
+SIMPLE("ref_seg_softmax_pool", "seg_softmax_pool", "elem",
+       "each cu_seqlens segment's rows summed with the softmax of their scores", DT_FLOAT,
+       ref_seg_softmax_pool),
 SIMPLE("ref_pool_rows", "pool_rows", "elem", "mean of every k consecutive rows, then a multiplier",
        DT_FLOAT, ref_pool_rows),
 SIMPLE("ref_pool_cols", "pool_cols", "elem", "mean of every k consecutive columns, then a "
@@ -2434,6 +2512,9 @@ SIMPLE("ref_gemm_nt_q_gated", "gemm_nt_q_gated", "gemm",
 SIMPLE("ref_dflash_select", "dflash_select", "draft",
        "DFlash2's greedy walk over the candidate lattice",
        "i32 candidates, bf16 codebooks, i32 tokens out", ref_dflash_select),
+SIMPLE("ref_dflash_tree", "dflash_tree", "draft",
+       "DFlash2's candidate lattice grown best-first into a tree",
+       "i32 candidates, bf16 codebooks, i32 tokens and parents out", ref_dflash_tree),
 SIMPLE("ref_givens_rotate", "givens_rotate", "quant",
        "channel scale and Givens rotations per part, in the output's dtype",
        "float in, float out; int32 pairs, f32 angles and channel scales", ref_givens_rotate),
@@ -2491,6 +2572,11 @@ ROW("ref_attn_paged", "attn_paged", "attn",
     "any q and out dtype; bf16 or fp8 kv cache with optional per-(seq,head) descales",
     cPagedBlock, (int)(sizeof(cPagedBlock) / sizeof(cPagedBlock[0])),
     nullptr, nullptr, ref_attn_paged, nullptr),
+ROW("ref_attn_paged_tree", "attn_paged_tree", "attn",
+    "paged causal / sliding-window attention with a tree verify block (spec_parent)",
+    "any q and out dtype; bf16 or fp8 kv cache with optional per-(seq,head) descales; i32 parents",
+    cPagedBlock, (int)(sizeof(cPagedBlock) / sizeof(cPagedBlock[0])),
+    nullptr, nullptr, ref_attn_paged_tree, nullptr),
 SIMPLE("ref_attn_dense", "attn_dense", "attn", "dense varlen attention over cu_seqlens", DT_FLOAT,
        ref_attn_dense),
 SIMPLE("ref_attn_cross", "attn_cross", "attn",
@@ -2508,6 +2594,11 @@ ROW("ref_kv_store_streamed", "kv_store_streamed", "attn",
     "scatter k and v into the host mirror always and into the resident ring slot", DT_ANY,
     nullptr, 0, nullptr, nullptr, ref_kv_store_streamed, nullptr),
 SIMPLE("ref_rope", "rope", "attn", "rotary embedding in place", DT_FLOAT, ref_rope),
+SIMPLE("ref_embed_attn", "embed_attn", "attn", "BF16 materialized encoder attention", "bf16/f32, i32 cu", ref_embed_attn),
+SIMPLE("ref_ministral_rope", "ministral_rope", "attn", "Ministral BF16 rotary", "bf16/f32 inout, i32 positions", ref_ministral_rope),
+SIMPLE("ref_pixtral_rope", "pixtral_rope", "attn", "Pixtral interleaved axial rotary", "bf16/f32 inout, i32 coordinates", ref_pixtral_rope),
+SIMPLE("ref_pixtral_merge", "pixtral_merge", "vision", "channel-major patch merger packing", "bf16/f32, i32 coordinates", ref_pixtral_merge),
+SIMPLE("ref_position_scale", "position_scale", "attn", "Ministral position-dependent query scale", "bf16/f32 inout, i32 positions", ref_position_scale),
 SIMPLE("ref_qk_norm_rope", "qk_norm_rope", "attn", "per-head QK norm then rotary embedding",
        DT_FLOAT, ref_qk_norm_rope),
 
@@ -2538,7 +2629,7 @@ ROW_CB("ref_moe_gemm_q_mod4", "moe_gemm_q_mod4", "moe",
 SIMPLE("ref_moe_gather", "moe_gather", "moe", "weighted scatter back to token order", DT_FLOAT,
        ref_moe_gather),
 SIMPLE("ref_rope_table", "rope_table", "attn", "cos/sin at each position's own row", DT_FLOAT, ref_rope_table),
-SIMPLE("ref_rope_rows", "rope_rows", "attn", "rope from a cos/sin plane over a window of each head", DT_FLOAT, ref_rope_rows),
+SIMPLE("ref_ds41_rope_rows", "ds41_rope_rows", "attn", "rope from a cos/sin plane over a window of each head", DT_FLOAT, ref_rope_rows),
 SIMPLE("ref_quant_roundtrip", "quant_roundtrip", "quant", "block-scaled fp8/fp4 quantise-dequantise in place", DT_FLOAT, ref_quant_roundtrip),
 SIMPLE("ref_softmax_pool", "softmax_pool", "attn", "channel-wise softmax pooling of ratio rows", DT_FLOAT, ref_softmax_pool),
 SIMPLE("ref_token_map", "token_map", "embed", "ids through an id table", DT_ANY, ref_token_map),
@@ -2788,6 +2879,16 @@ SIMPLE("ref_int_affine", "int_affine", "elem", "integers derived from device geo
        ref_int_affine),
 SIMPLE("ref_sub_i32", "sub_i32", "elem", "a device int32 vector less a device scalar", DT_ANY,
        ref_sub_i32),
+/* The row-form names (see the schema table): each the base op's reference row. */
+SIMPLE("ref_rmsnorm_rows", "rmsnorm_rows", "norm", "rmsnorm under its row-form name", DT_FLOAT,
+       ref_rmsnorm),
+SIMPLE("ref_rope_rows", "rope_rows", "attn", "rope under its row-form name", DT_FLOAT, ref_rope),
+ROWL_GQ("ref_gemm_nt_q_short", "gemm_nt_q_short", "gemm", "gemm_nt_q under its row-form name",
+     "as ref_gemm_nt_q", ref_check_gemm_q, ref_gemm_nt_q_m2, ref_layout_gemm_q_m2,
+     ref_relayout_gemm_q_m2, ref_unrelayout_gemm_q_m2),
+SIMPLE("ref_gemm_nt_q_gated_wide", "gemm_nt_q_gated_wide", "gemm",
+       "gemm_nt_q_gated under its row-form name", "fp8_e4m3 operands, fp8_e4m3 out, f32 scale",
+       ref_gemm_nt_q_gated),
 };
 
 /* ================================================================== plugin exports */
@@ -2802,6 +2903,7 @@ static const RadPluginInfo kInfo = {
 };
 
 extern "C" uint32_t rad_plugin_abi_version(void) { return RAD_ABI_VERSION; }
+RAD_PLUGIN_ABI_LAYOUT_EXPORT
 extern "C" const RadPluginInfo* rad_plugin_info(void) { return &kInfo; }
 /* Declares this plugin the reference through the ABI (RadPluginReferenceFn); the engine knows no
  * library by name. */

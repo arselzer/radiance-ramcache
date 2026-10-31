@@ -327,7 +327,7 @@ struct Case {
                NativeFileCacheReadPolicy policy=NativeFileCacheReadPolicy::Normal){
         std::vector<int32_t> staged;
         need(transport.mover->stage_file_units(selected,transport.mover->file_buffer(buffer),
-            transport.mover->file_buffer_bytes(),nullptr,transport.done,&staged,policy),"actual mapped-source routed stage");
+            transport.mover->file_buffer_bytes(),nullptr,transport.done,&staged,nullptr,nullptr,0,nullptr,policy),"actual mapped-source routed stage");
         REQUIRE(staged==selected);
     }
     void check(const std::vector<int32_t>& selected){
@@ -445,7 +445,7 @@ TEST(mapped_source_actual_mover_epoch_change_refuses_cached_source_before_copy){
     CHECK_EQ(c.transport.mover->stats().h2d_bytes,before.h2d_bytes);
     for(auto h:c.plan.units[size_t(a[0])].weights)CHECK(c.transport.mover->residency()->lookup(h)->ptr==nullptr);
     CHECK_EQ(c.transport.mover->stage_file_units(a,c.transport.mover->file_buffer(0),
-        c.transport.mover->file_buffer_bytes(),nullptr,c.transport.done,&staged,NativeFileCacheReadPolicy::ReadOnly),RAD_E_STATE);
+        c.transport.mover->file_buffer_bytes(),nullptr,c.transport.done,&staged,nullptr,nullptr,0,nullptr,NativeFileCacheReadPolicy::ReadOnly),RAD_E_STATE);
     CHECK_EQ(c.driver.copy_attempts,attempts);CHECK_EQ(c.driver.pending(),size_t(0));
     CHECK_EQ(c.transport.mover->stats().h2d_bytes,before.h2d_bytes);
 }
@@ -856,13 +856,13 @@ TEST(mapped_slab_ReadOnly_warm_copy_record_failure_retains_until_checked_drain){
     const auto RO=NativeFileCacheReadPolicy::ReadOnly;const auto before=Access::stats(*c.transport.mover);
     c.driver.fail_record=true;std::vector<int32_t>staged;
     CHECK_EQ(c.transport.mover->stage_file_units(a,c.transport.mover->file_buffer(0),
-        c.transport.mover->file_buffer_bytes(),nullptr,c.transport.done,&staged,RO),RAD_E_STATE);
+        c.transport.mover->file_buffer_bytes(),nullptr,c.transport.done,&staged,nullptr,nullptr,0,nullptr,RO),RAD_E_STATE);
     CHECK_EQ(c.driver.pending(),size_t(2));CHECK_EQ(Access::stats(*c.transport.mover).cache.lease_refs,size_t(2));
     const int window=Access::last_window(*c.transport.mover);const auto attempts=c.driver.copy_attempts;
     c.driver.fail_drain=true;CHECK_EQ(Access::retire(*c.transport.mover,window),RAD_E_STATE);
     Access::next_window(*c.transport.mover,window);const auto io0=Io::capture();
     CHECK_EQ(c.transport.mover->stage_file_units(a,c.transport.mover->file_buffer(0),
-        c.transport.mover->file_buffer_bytes(),nullptr,c.transport.done,&staged,RO),RAD_E_STATE);
+        c.transport.mover->file_buffer_bytes(),nullptr,c.transport.done,&staged,nullptr,nullptr,0,nullptr,RO),RAD_E_STATE);
     const auto io1=Io::capture();CHECK_EQ(delta(io0,io1).calls,uint64_t(0));
     CHECK_EQ(c.driver.copy_attempts,attempts);CHECK_EQ(Access::stats(*c.transport.mover).cache.lease_refs,size_t(2));
     CHECK_EQ(Access::clear(*c.transport.mover),RAD_E_STATE);
@@ -880,7 +880,7 @@ TEST(mapped_slab_ReadOnly_changed_file_epoch_refuses_before_borrow_IO_copy_or_pu
     const auto before=Access::stats(*c.transport.mover);const auto attempts=c.driver.copy_attempts;
     const auto h2d=c.transport.mover->stats().h2d_bytes;std::vector<int32_t>staged;const auto io0=Io::capture();
     CHECK_EQ(c.transport.mover->stage_file_units(a,c.transport.mover->file_buffer(0),
-        c.transport.mover->file_buffer_bytes(),nullptr,c.transport.done,&staged,NativeFileCacheReadPolicy::ReadOnly),RAD_E_STATE);
+        c.transport.mover->file_buffer_bytes(),nullptr,c.transport.done,&staged,nullptr,nullptr,0,nullptr,NativeFileCacheReadPolicy::ReadOnly),RAD_E_STATE);
     const auto io1=Io::capture();const auto after=Access::stats(*c.transport.mover);
     CHECK_EQ(delta(io0,io1).calls,uint64_t(0));CHECK_EQ(c.driver.copy_attempts,attempts);CHECK_EQ(c.driver.pending(),size_t(0));
     CHECK_EQ(after.cache.hits,before.cache.hits);CHECK_EQ(after.cache.misses,before.cache.misses);

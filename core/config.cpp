@@ -4,9 +4,11 @@
  * (spec §6).
  */
 #include "rad_core.h"
+#include "kld.h"
 #include "format/rope_override.h"
 #include "sample/host_ref.h"
 #include "server/oai.h"
+#include "server/http.h"
 #include "diag/diag.h"
 #include "util/kernel_list.h"
 #include "place/planner.h"
@@ -18,6 +20,7 @@
 #include <cerrno>
 #include <climits>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -47,6 +50,8 @@ static const Flag g_flags[] = {
                                         "Hugging Face repo id (owner/name), fetched before startup" },
     { "--download-dir",       "DIR",    "where a repo id is fetched to; default\n"
                                         "$XDG_CACHE_HOME/radiance/hf, else ~/.cache/radiance/hf" },
+    { "--model-revision",     "REV",    "the hub revision -- a branch, tag, full commit sha or refs/pr/N --\n"
+                                        "a repo id is fetched at; default the repo's moving main branch" },
     { "--radiance-home",      "DIRS",   "where kernels/, architectures/ and quantizers/ live; several\n"
                                         "homes separated by ':' are searched in order, the first winning" },
     { "--kernels",            "LIST",   "the kernel libraries to use, separated by ',' or ':', first wins; unnamed ones are not loaded. Default: every library found" },
@@ -73,6 +78,10 @@ static const Flag g_flags[] = {
     { "--prefill-interleave", "N",      "decode-only steps after each prefill chunk while other\n"
                                         "sequences decode, at most 64; 0 (default) lets every step\n"
                                         "carry a chunk" },
+    { "--preempt-wait-ms",    "N",      "how long a preempted prefill may wait for the whole-\n"
+                                        "recompute gate before reclaiming cache blocks and\n"
+                                        "preempting the lowest-priority running request; 0\n"
+                                        "(default 5000) falls back on the next step" },
     { "--max-num-seqs",       "N",      "the largest number of sequences one step may carry" },
     { "--max-model-len",      "N",      "context bound; 0 takes the model's training context" },
     { "--rope-scaling",       "SPEC",   "yarn:FACTOR[:ORIG]: static YaRN over the container's own rotary\n"
@@ -110,10 +119,14 @@ static const Flag g_flags[] = {
     "                                    host memory at load, pinned for the cards to read\n"
     "                                    (locked, where only a host kernel reads it); disk reads\n"
     "                                    its rows from the container on the host. auto takes the\n"
-    "                                    first of the three that holds it" },
+    "                                    first of the three that holds it. ram=DIR makes the\n"
+    "                                    pinned copy a file in DIR (a tmpfs) mapped shared, so\n"
+    "                                    two engines on separate cards hold one table: the\n"
+    "                                    first fills it, the last to exit deletes it" },
     { "--weights-disk-tier",  nullptr,  "read weights that fit neither VRAM nor the host pool from the\n"
-    "                                    container on disk (O_DIRECT); a routed expert is read a layer\n"
-    "                                    at a time, so a step is paced by the drive" },
+    "                                    container on disk (O_DIRECT) -- the file tier, units on\n"
+    "                                    Tier::SSD; a routed expert is read a layer at\n"
+    "                                    a time, so a step is paced by the drive" },
     { "--expert-ram-cache-total-mib", "MIB", "native expert RAM cache across all ranks (default 0, off);\n"
     "                                    includes cache metadata, separate from the fixed host pool;\n"
     "                                    requires --weights-disk-tier" },
@@ -214,8 +227,9 @@ static const Flag g_flags[] = {
                                         "(default 4, at most 15)" },
     { "--draft-window",       "MODE",   g_draft_window_help.c_str() },
     { "--draft-short-from",   "N",      "a block drafter that also serves a shorter block runs it\n"
-                                        "from N decoding sequences on (0 never, the default): the\n"
-                                        "long block pays at one sequence, the short one at many" },
+                                        "from N decoding sequences on (0 never): the long block pays\n"
+                                        "at one sequence, the short one at many. auto (the default):\n"
+                                        "never for a chain, from 2 for a tree drafter" },
     { "--draft-coupling",     "MODE",   "off (default) | on -- a linear MTP drafter or DFlash2's walk\n"
     "                                    samples each proposal from its own shortlist and the sampler\n"
     "                                    couples the target's draw to it: more accepted drafts on sampled\n"
@@ -229,10 +243,23 @@ static const Flag g_flags[] = {
     { "--port",               "N",      "listen port" },
     { "--api-key",            "KEY",    "require `Authorization: Bearer KEY` or `X-Api-Key: KEY` on every request but /health,\n"
     "                                    /v1/health, /ping and the dashboard page" },
+    { "--api-key-env",        "NAME",   "read the API key from the named environment variable; keeps it off the\n"
+    "                                    command line, where every process on the machine can read it" },
+    { "--allow-host",         "NAME",   "a Host name the keyless loopback-only routes (/diagnostics,\n"
+    "                                    /admin/control-vector, the LoRA and session admin) accept besides\n"
+    "                                    localhost; repeatable" },
+    { "--trusted-proxy",      "CIDR",   "a network whose sockets may name the client behind them via\n"
+    "                                    X-Forwarded-For, for the log; vouching changes attribution,\n"
+    "                                    never access; repeatable" },
     { "--served-model-name",  "NAME",   "the model id /v1/models lists and responses carry; default the container's name" },
     { "--mm-max-patches",     "N",      "patches one encoder pass carries, and so the largest image (a patch is 16x16\n"
                                         "pixels). Default `auto`: 16384 when the container carries a vision tower. 0\n"
                                         "serves text only and keeps the tower off the card" },
+    { "--image-gen-max-pixels", "N",    "an image generator's largest image, in pixels (1048576: 1024 x 1024).\n"
+      "                              Default: the model's. Its per-image buffers, and the activation\n"
+      "                              arena with them, are sized for it; larger requests are refused" },
+    { "--image-gen-max-refs", "N",      "the reference pictures an image generator takes a request. Default: the\n"
+      "                              model's; its conditioning buffers are sized for them" },
     { "--generation-config",  "PATH",   "a generation_config.json whose sampler settings become the default\n"
     "                                    for requests that send none. Without it a <model>.generation.json\n"
     "                                    beside the container is used, then the container's own\n"
@@ -322,6 +349,16 @@ static const Flag g_flags[] = {
     "                                    mean, median, 99/99.9/99.99th percentile KL divergence and top-1\n"
     "                                    agreement, over the positions and tokens DIR was recorded at" },
     { "--kld-corpus",         "FILE",   "JSONL, one {\"prompt\", \"score_from\"?, \"source\"?} a line; --kld-record only" },
+    { "--calib-corpus",       "FILE",   "instead of serving, run a JSONL corpus ({\"prompt\"} a line) through\n"
+    "                                    prefill once, every token, and record the calibration statistics\n"
+    "                                    the model keeps (each linear's input Gram, GPTQ's Hessian)" },
+    { "--calib-dir",          "DIR",    "where --calib-corpus writes the statistics; beside --kld-record, the\n"
+    "                                    reference's run records them over the KL corpus too" },
+    { "--calib-layers",       "RANGE",  "LO:HI, record layers LO..HI-1 only (default every layer), for a model\n"
+    "                                    whose statistics do not fit in memory in one run" },
+    { "--kld-top",            "N",      "--kld-record keeps each position's N most likely tokens exactly and the\n"
+    "                                    mass of the rest, not the whole vocabulary (a corpus too large for\n"
+    "                                    full rows); 0 (default) keeps the whole vocabulary" },
     { "--kld-out",            "FILE",   "the --kld-ref report as JSON, and every position's numbers in FILE.rows" },
     { "--kld-lora",           "NAME",   "run --kld-record / --kld-ref through the --lora adapter NAME" },
     { "--kld-lora-sources",   "PREFIX", "--kld-lora only for documents whose source starts with PREFIX; the\n"
@@ -341,6 +378,10 @@ static const Flag g_flags[] = {
       "serve even when ops resolve only to a reference library. NOT a production configuration: the reference\n"
       "                              implementation is an oracle and a last resort, and falling back\n"
       "                              to it is orders of magnitude of speed with nothing to say so." },
+    { "--proceed-with-incompatible-configuration", nullptr,
+      "start on a machine configuration radiance refuses (amdgpu CWSR off where cards serve).\n"
+      "                              UNSUPPORTED: all guarantees are off, and the log and the startup\n"
+      "                              report say so." },
     { "--profile-ops",        nullptr,  "per-op device timing (see the caveat it prints)" },
     { "--expert-stats",       "FILE",   "count the routed experts every layer selects, apart for prefill, decode,\n"
     "                                    mixed steps and draft-head passes, and write the counts to FILE as\n"
@@ -522,6 +563,7 @@ int config_parse(int argc, char** argv, Config* c) {
         else if (S("-vv"))                     log_set_level(Log::Trace);
         else if (S("--model"))                 { if (!(v = need(i))) return RAD_E_INVAL; c->model = v; }
         else if (S("--download-dir"))          { if (!(v = need(i))) return RAD_E_INVAL; c->download_dir = v; }
+        else if (S("--model-revision"))        { if (!(v = need(i))) return RAD_E_INVAL; c->model_revision = v; }
         else if (S("--radiance-home"))         { if (!(v = need(i))) return RAD_E_INVAL; c->radiance_home = v; }
         else if (S("--kernels"))               { if (!(v = need(i))) return RAD_E_INVAL; c->kernel_hierarchy = rad_split_kernel_list(v); }
         else if (S("--tp"))                    { if (!num(1, INT32_MAX, &c->tp)) return RAD_E_INVAL; }
@@ -559,6 +601,7 @@ int config_parse(int argc, char** argv, Config* c) {
             else if (!parse_int(a.c_str(), v, 1, INT64_MAX, &c->busy_prefill_chunk)) return RAD_E_INVAL;
         }
         else if (S("--prefill-interleave"))    { if (!num(0, 64, &c->prefill_interleave)) return RAD_E_INVAL; }
+        else if (S("--preempt-wait-ms"))       { if (!num(0, INT64_MAX, &c->preempt_wait_ms)) return RAD_E_INVAL; }
         else if (S("--max-num-seqs"))          { if (!num(1, INT64_MAX, &c->max_seqs)) return RAD_E_INVAL; }
         else if (S("--max-model-len"))         { if (!num(0, INT64_MAX, &c->max_ctx)) return RAD_E_INVAL; }
         else if (S("--rope-scaling")) {
@@ -630,10 +673,20 @@ int config_parse(int argc, char** argv, Config* c) {
                     RAD_ERR("--embedding-placement takes ram or vram, not '%s'", v);
                 return RAD_E_INVAL;
             }
-            if (!emb && !parse_table_placement(v, &p)) {
-                RAD_ERR("%s takes auto, vram, ram or disk, not '%s'", a.c_str(), v);
+            std::string share_dir;
+            if (!emb && !std::strncmp(v, "ram=", 4)) {
+                share_dir = v + 4;
+                if (share_dir.empty()) {
+                    RAD_ERR("--ngram-placement ram= needs a directory: ram=DIR, the tmpfs that "
+                            "holds the shared table");
+                    return RAD_E_INVAL;
+                }
+                p = TablePlacement::Ram;
+            } else if (!emb && !parse_table_placement(v, &p)) {
+                RAD_ERR("%s takes auto, vram, ram, ram=DIR or disk, not '%s'", a.c_str(), v);
                 return RAD_E_INVAL;
             }
+            if (!emb) c->ngram_share_dir = share_dir;
             (emb ? c->embedding_placement : c->ngram_placement) = p;
             if (emb) c->embedding_placement_given = true;
         }
@@ -811,7 +864,11 @@ int config_parse(int argc, char** argv, Config* c) {
                 return RAD_E_INVAL;
             }
         }
-        else if (S("--draft-short-from"))      { if (!num(0, INT32_MAX, &c->draft_short_from)) return RAD_E_INVAL; }
+        else if (S("--draft-short-from")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if (!std::strcmp(v, "auto")) c->draft_short_from = -1;
+            else if (!parse_int(a.c_str(), v, 0, INT32_MAX, &c->draft_short_from)) return RAD_E_INVAL;
+        }
         else if (S("--draft-coupling")) {
             if (!(v = need(i))) return RAD_E_INVAL;
             if      (!std::strcmp(v, "off")) c->draft_coupling = false;
@@ -854,11 +911,57 @@ int config_parse(int argc, char** argv, Config* c) {
         }
         else if (S("--host"))                  { if (!(v = need(i))) return RAD_E_INVAL; c->host = v; }
         else if (S("--port"))                  { if (!num(0, 65535, &c->port)) return RAD_E_INVAL; }
-        else if (S("--api-key"))               { if (!(v = need(i))) return RAD_E_INVAL; c->api_key = v; }
+        else if (S("--api-key")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            /* An empty key is no key: --api-key "" or --api-key "$UNSET_VAR" must not start a
+             * server that looks guarded and answers everything keyless. */
+            if (!*v) { RAD_ERR("--api-key takes a non-empty key; an empty value guards nothing");
+                       return RAD_E_INVAL; }
+            c->api_key = v;
+        }
+        else if (S("--api-key-env")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if (!*v) { RAD_ERR("--api-key-env takes the name of an environment variable");
+                       return RAD_E_INVAL; }
+            const char* k = std::getenv(v);
+            /* The empty --api-key refusal's sibling: a unit or compose file whose variable was
+             * never set must not start a server that looks guarded and answers everything
+             * keyless. The name is recorded so the config report can say where the key came
+             * from without showing it. */
+            if (!k || !*k) {
+                RAD_ERR("--api-key-env: %s is unset or empty; refusing to serve keyless under a "
+                        "guarded-looking command line", v);
+                return RAD_E_INVAL;
+            }
+            c->api_key = k;
+            c->api_key_env = v;
+        }
+        else if (S("--allow-host")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if (!*v) { RAD_ERR("--allow-host takes a non-empty name"); return RAD_E_INVAL; }
+            c->allow_hosts.emplace_back(v);
+        }
+        else if (S("--trusted-proxy")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if (!server::cidr_valid(v)) {
+                RAD_ERR("--trusted-proxy takes a numeric network with a prefix length, like "
+                        "127.0.0.0/8 or ::1/128 (no brackets, no bare address), got '%s'", v);
+                return RAD_E_INVAL;
+            }
+            c->trusted_proxies.emplace_back(v);
+        }
         else if (S("--served-model-name")) {
             if (!(v = need(i))) return RAD_E_INVAL;
             if (!*v) { RAD_ERR("--served-model-name takes a non-empty name"); return RAD_E_INVAL; }
             c->served_model_name = v;
+        }
+        else if (S("--image-gen-max-pixels")) {
+            if (!(v = need(i)) || !parse_int(a.c_str(), v, 256, INT64_MAX, &c->image_gen_max_pixels))
+                return RAD_E_INVAL;
+        }
+        else if (S("--image-gen-max-refs")) {
+            if (!(v = need(i)) || !parse_int(a.c_str(), v, 1, INT64_MAX, &c->image_gen_max_refs))
+                return RAD_E_INVAL;
         }
         else if (S("--mm-max-patches")) {
             if (!(v = need(i))) return RAD_E_INVAL;
@@ -1034,6 +1137,19 @@ int config_parse(int argc, char** argv, Config* c) {
         else if (S("--kld-record"))            { if (!(v = need(i))) return RAD_E_INVAL; c->kld_record = v; }
         else if (S("--kld-ref"))               { if (!(v = need(i))) return RAD_E_INVAL; c->kld_ref = v; }
         else if (S("--kld-corpus"))            { if (!(v = need(i))) return RAD_E_INVAL; c->kld_corpus = v; }
+        else if (S("--kld-top"))               { if (!num(0, kKldTopMax, &c->kld_top)) return RAD_E_INVAL; }
+        else if (S("--calib-corpus"))          { if (!(v = need(i))) return RAD_E_INVAL; c->calib_corpus = v; }
+        else if (S("--calib-dir"))             { if (!(v = need(i))) return RAD_E_INVAL; c->calib_dir = v; }
+        else if (S("--calib-layers")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            int lo = -1, hi = -1, used = 0;
+            if (std::sscanf(v, "%d:%d%n", &lo, &hi, &used) != 2 || v[used] != '\0' || lo < 0 || hi <= lo) {
+                RAD_ERR("--calib-layers takes LO:HI with 0 <= LO < HI, not '%s'", v);
+                return RAD_E_INVAL;
+            }
+            c->calib_layer_lo = lo;
+            c->calib_layer_hi = hi;
+        }
         else if (S("--kld-out"))               { if (!(v = need(i))) return RAD_E_INVAL; c->kld_out = v; }
         else if (S("--kld-lora"))              { if (!(v = need(i))) return RAD_E_INVAL; c->kld_lora = v; }
         else if (S("--kld-lora-sources"))      { if (!(v = need(i))) return RAD_E_INVAL; c->kld_lora_sources = v; }
@@ -1043,6 +1159,7 @@ int config_parse(int argc, char** argv, Config* c) {
         else if (S("--debug-tape-dump"))       c->debug_tape_dump = true;
         else if (S("--debug-draft-oracle"))    { if (!(v = need(i))) return RAD_E_INVAL; c->debug_draft_oracle = v; }
         else if (S("--debug-accept-reference-kernels")) c->accept_reference_kernels = true;
+        else if (S("--proceed-with-incompatible-configuration")) c->proceed_incompatible = true;
         else if (S("--profile-ops"))           c->profile_ops = true;
         else if (S("--expert-stats"))          { if (!(v = need(i))) return RAD_E_INVAL; c->expert_stats = v; }
         else if (S("--expert-profile"))        { if (!(v = need(i))) return RAD_E_INVAL; c->expert_profile = v; c->expert_profile_given = true; }
@@ -1134,6 +1251,26 @@ int config_parse(int argc, char** argv, Config* c) {
     if (!c->kld_ref.empty() && !c->kld_corpus.empty()) {
         RAD_ERR("--kld-ref reads its tokens from the reference, which recorded them; drop "
                 "--kld-corpus");
+        return RAD_E_INVAL;
+    }
+    if (c->calib() && c->calib_dir.empty()) {
+        RAD_ERR("--calib-corpus records into --calib-dir; give one");
+        return RAD_E_INVAL;
+    }
+    if ((!c->calib_dir.empty() || c->calib_layer_hi) && !c->calib() && c->kld_record.empty()) {
+        RAD_ERR("--calib-dir and --calib-layers belong to a --calib-corpus or --kld-record run");
+        return RAD_E_INVAL;
+    }
+    if (c->calib_layer_hi && c->calib_dir.empty()) {
+        RAD_ERR("--calib-layers chooses what --calib-dir records; give one");
+        return RAD_E_INVAL;
+    }
+    if (c->calib() && c->kld()) {
+        RAD_ERR("--calib-corpus and the KL mode each replace the server; give one");
+        return RAD_E_INVAL;
+    }
+    if (c->kld_top && c->kld_record.empty()) {
+        RAD_ERR("--kld-top is how --kld-record stores a reference; --kld-ref reads the form from it");
         return RAD_E_INVAL;
     }
     if (!c->kld_out.empty() && c->kld_ref.empty()) {
@@ -1268,6 +1405,7 @@ struct ShowRow { const char* flag; Show show; };
 const ShowRow kShow[] = {
     { "--model",              [](const Config& c) { return c.model; } },
     { "--download-dir",       [](const Config& c) { return or_none(c.download_dir, "the XDG cache (~/.cache/radiance/hf)"); } },
+    { "--model-revision",     [](const Config& c) { return or_none(c.model_revision, "the repo's main branch"); } },
     { "--radiance-home",      [](const Config& c) { return c.radiance_home; } },
     { "--kernels",            [](const Config& c) {
           std::string s;
@@ -1286,6 +1424,7 @@ const ShowRow kShow[] = {
                : c.busy_prefill_chunk == 0 ? std::string("off") : num(c.busy_prefill_chunk); } },
     { "--prefill-interleave", [](const Config& c) {
           return c.prefill_interleave > 0 ? num(c.prefill_interleave) : std::string("off"); } },
+    { "--preempt-wait-ms",    [](const Config& c) { return num(c.preempt_wait_ms); } },
     { "--max-num-seqs",       [](const Config& c) { return num(c.max_seqs); } },
     { "--max-model-len",      [](const Config& c) {
           return c.max_ctx ? num(c.max_ctx) : std::string("0 (the model's training context)"); } },
@@ -1300,7 +1439,9 @@ const ShowRow kShow[] = {
     { "--host-pool-mib",      [](const Config& c) { return num(c.host_pool_mib); } },
     { "--host-headroom-mib",  [](const Config& c) { return num(c.host_headroom_mib); } },
     { "--embedding-placement", [](const Config& c) { return std::string(table_placement_name(c.embedding_placement)); } },
-    { "--ngram-placement",    [](const Config& c) { return std::string(table_placement_name(c.ngram_placement)); } },
+    { "--ngram-placement",    [](const Config& c) {
+          std::string v = table_placement_name(c.ngram_placement);
+          return c.ngram_share_dir.empty() ? v : v + "=" + c.ngram_share_dir; } },
     { "--vision-tower-placement", [](const Config& c) { return std::string(table_placement_name(c.tower_placement)); } },
     { "--weights-disk-tier",  [](const Config& c) { return onoff(c.weights_disk_tier); } },
     { "--expert-ram-cache-total-mib", [](const Config& c) { return num(c.expert_ram_cache_total_mib); } },
@@ -1347,7 +1488,8 @@ const ShowRow kShow[] = {
     { "--spec-ngram-max",     [](const Config& c) { return num(c.spec_ngram_max); } },
     { "--draft-window",       [](const Config& c) { return std::string(draft_window_name(c.draft_window)); } },
     { "--draft-short-from",   [](const Config& c) {
-          return c.draft_short_from > 0 ? num(c.draft_short_from) : std::string("0 (never)"); } },
+          return c.draft_short_from < 0 ? std::string("auto")
+               : c.draft_short_from > 0 ? num(c.draft_short_from) : std::string("0 (never)"); } },
     { "--draft-coupling",     [](const Config& c) { return onoff(c.draft_coupling); } },
     { "--draft-model",        [](const Config&) { return std::string("not implemented (the container's own drafter)"); } },
     { "--draft-bank",         [](const Config& c) { return or_none(c.draft_bank,"off"); } },
@@ -1356,8 +1498,19 @@ const ShowRow kShow[] = {
     { "--port",               [](const Config& c) { return num(c.port); } },
     /* Never print the secret, only whether it is set. */
     { "--api-key",            [](const Config& c) { return std::string(c.api_key.empty() ? "not set" : "set"); } },
+    { "--api-key-env",        [](const Config& c) { return or_none(c.api_key_env, "not used"); } },
+    { "--allow-host",         [](const Config& c) {
+          std::string o;
+          for (const std::string& h : c.allow_hosts) o += (o.empty() ? "" : ",") + h;
+          return o.empty() ? std::string("the loopback names only") : o; } },
+    { "--trusted-proxy",      [](const Config& c) {
+          std::string o;
+          for (const std::string& p : c.trusted_proxies) o += (o.empty() ? "" : ",") + p;
+          return o.empty() ? std::string("no socket vouches for a caller") : o; } },
     { "--served-model-name",  [](const Config& c) { return or_none(c.served_model_name, "the container's name"); } },
     { "--mm-max-patches",     [](const Config& c) { return c.mm_max_patches < 0 ? std::string("auto") : num(c.mm_max_patches); } },
+    { "--image-gen-max-pixels", [](const Config& c) { return c.image_gen_max_pixels > 0 ? num(c.image_gen_max_pixels) : std::string("the model's"); } },
+    { "--image-gen-max-refs", [](const Config& c) { return c.image_gen_max_refs > 0 ? num(c.image_gen_max_refs) : std::string("the model's"); } },
     { "--generation-config",  [](const Config& c) { return or_none(c.generation_config, "none"); } },
     { "--override-chat-template", [](const Config& c) { return or_none(c.override_chat_template, "none (the container's)"); } },
     { "--temp",               [](const Config& c) { return c.sample_temp < 0 ? std::string("unset") : fnum(c.sample_temp); } },
@@ -1422,6 +1575,10 @@ const ShowRow kShow[] = {
     { "--kld-record",         [](const Config& c) { return or_none(c.kld_record, "none"); } },
     { "--kld-ref",            [](const Config& c) { return or_none(c.kld_ref, "none"); } },
     { "--kld-corpus",         [](const Config& c) { return or_none(c.kld_corpus, "none"); } },
+    { "--kld-top",            [](const Config& c) { return c.kld_top ? num(c.kld_top) : std::string("0 (the whole vocabulary)"); } },
+    { "--calib-corpus",       [](const Config& c) { return or_none(c.calib_corpus, "none"); } },
+    { "--calib-dir",          [](const Config& c) { return or_none(c.calib_dir, "none"); } },
+    { "--calib-layers",       [](const Config& c) { return c.calib_layer_hi ? num(c.calib_layer_lo) + ":" + num(c.calib_layer_hi) : std::string("every layer"); } },
     { "--kld-out",            [](const Config& c) { return or_none(c.kld_out, "none"); } },
     { "--kld-lora",           [](const Config& c) { return or_none(c.kld_lora, "none (the base)"); } },
     { "--kld-lora-sources",   [](const Config& c) { return or_none(c.kld_lora_sources, "every document"); } },
@@ -1431,6 +1588,7 @@ const ShowRow kShow[] = {
     { "--debug-tape-dump",    [](const Config& c) { return onoff(c.debug_tape_dump); } },
     { "--debug-draft-oracle", [](const Config& c) { return or_none(c.debug_draft_oracle, "none"); } },
     { "--debug-accept-reference-kernels", [](const Config& c) { return onoff(c.accept_reference_kernels); } },
+    { "--proceed-with-incompatible-configuration", [](const Config& c) { return onoff(c.proceed_incompatible); } },
     { "--profile-ops",        [](const Config& c) { return onoff(c.profile_ops); } },
     { "--expert-stats",       [](const Config& c) { return or_none(c.expert_stats, "off"); } },
     { "--expert-profile",     [](const Config& c) { return or_none(c.expert_profile, "off"); } },

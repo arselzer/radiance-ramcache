@@ -6,7 +6,7 @@
 /* Launches (r4d_ds41_elem.hip). */
 int r4d_rad_token_map(const RadArgs* a, RadStream stream);
 int r4d_rad_stream_gate_add(const RadArgs* a, RadStream stream);
-int r4d_rad_rope_rows(const RadArgs* a, RadStream stream);
+int r4d_rad_ds41_rope_rows(const RadArgs* a, RadStream stream);
 int r4d_rad_quant_roundtrip(const RadArgs* a, RadStream stream);
 int r4d_rad_mhc_mix(const RadArgs* a, RadStream stream);
 int64_t r4d_rad_mhc_mix_scratch(const RadArgs* a);

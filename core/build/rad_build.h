@@ -123,13 +123,16 @@ public:
     int         op_declared  (const char* op) const;
     int         decl_name_map(const RadNameMap* m);
     int         declare_logits(rad_buf b);
+    int         declare_scores(rad_buf hidden, rad_weight table);
     int         declare_pooled(rad_buf b);
+    int         declare_plugin_words(int64_t max_words);
     int         declare_drafter(const RadDrafterDecl* d);
     int         drafter_shared_kv(int pos_offset);
     int         lora_root(const char* native, const char* spellings);
     int         lora_alias(const char* native, const char* from, const char* to, int64_t from_lo,
                            int64_t from_hi, int64_t to_lo);
     int         drafter_short_block(int64_t block);
+    int         drafter_tree(rad_buf parents);
     int         declare_consumer_suffix(const RadConsumerSuffix* d);
     int         consumer_row_grain() const;
     int         declare_two_batch();

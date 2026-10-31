@@ -27,6 +27,7 @@
  */
 #include "server.h"
 #include "server_priv.h"
+#include "oai.h"
 #include "text_split.h"
 
 #include "gen/audio.h"
@@ -180,9 +181,11 @@ void Server::speech_stream_run(SpeechSession& s, WsConn& ws) {
     try {
         speech_stream_loop(s, ws);
     } catch (const std::exception& e) {
-        RAD_ERR("speech stream %s failed: %s", s.id.c_str(), e.what());
+        /* e.what() is server-internal text that may quote client frames: sanitized to the log,
+         * and the socket's client gets the generic sentence, not the reason. */
+        RAD_ERR("speech stream %s failed: %s", s.id.c_str(), log_sanitize(e.what()).c_str());
         ojson o = event("error");
-        o["message"] = std::string("the session failed: ") + e.what();
+        o["message"] = "the session failed; the reason is in the server log";
         ws.send(json_dump(o));
         ws.close(1011, "internal error");
     }
@@ -279,8 +282,12 @@ bool Server::speech_stream_loop(SpeechSession& s, WsConn& ws) {
                   "session.close");
             return false;
         }
-        const json j = json::parse(msg, nullptr, /*allow_exceptions=*/false);
-        if (j.is_discarded() || !j.is_object() || !j.contains("type") || !j["type"].is_string()) {
+        /* Bounded like a request body: a deep bracket nest is a legal frame, and tearing its
+         * tree down recurses once per level. */
+        bool over = false, deep = false;
+        const json j = parse_json_bounded(msg, 0, &over, &deep);
+        if (j.is_discarded() || over || deep || !j.is_object() || !j.contains("type") ||
+            !j["type"].is_string()) {
             error("a client message is a JSON object with a string `type`");
             return false;
         }

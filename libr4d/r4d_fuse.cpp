@@ -52,8 +52,8 @@
  *
  *   qk_norm_rope_gate
  *       Not byte-identical to the four kernels it replaces (docs/OPS.md): it folds a sum of
- *       squares over one wave per head where `rmsnorm` folds over r4d_act_threads(M, n) threads,
- *       so the two differ by a ULP.
+ *       squares over one wave per head where `rmsnorm` folds over kR4dSumLanes' 256 lanes, so
+ *       the two differ by a ULP.
  *
  *   sample_chain
  *       Stands beside the decomposed sampling stages rather than replacing them: one workgroup
@@ -218,9 +218,9 @@ bool fp8_geometry_ok(const RadParam* p, int n_p, int64_t M, int64_t n) {
  * All three steps are libr4d rows (add_bf16, rmsnorm_bf16, quant_act_fp8), so the check stays
  * within libr4d; `rmsnorm_add` has no libr4d row.
  *
- * Byte identity depends on the workgroup width agreeing: both kernels take their thread count from
- * `r4d_act_threads(M, n)`, which decides the columns each thread folds into the sum of squares
- * (see the launcher in r4d_model_bf16.hip). `M` is mirrored verbatim for that reason.
+ * Both kernels fold the sum of squares in kR4dSumLanes' partition at whatever width
+ * `r4d_act_threads(M, n)` gives them (r4d_common.h), so the width does not decide the bytes; `M`
+ * is mirrored verbatim so both launch the same shape.
  *
  * Step 0 writes the sum into the fused residual operand, both its own `b` and the fused kernel's
  * in-place residual, so both sides leave the same buffers behind. `add_bf16` is safe in place:
@@ -413,6 +413,9 @@ extern "C" int r4d_fuse_router_sigmoid_topk_scatter(const RadParam* p, int n_p, 
  * The gated attention's gate is a sigmoid, so nothing issues this row with silu and the shim's
  * `mode` defaults to 1.
  *
+ * `act` none is the plain product: the chain is `mul` then `quant_act_fp8`, and the kernel rounds
+ * the bf16 product once, exactly as mul_bf16 does. The product is TMP(0) or `out_bf16`.
+ *
  * TMP(0) is act(gate), an [M, n] bf16 plane the fusion never writes. `out_bf16` is an operand: the
  * kernel stores the product there when asked and takes the codes over those bytes.
  */
@@ -423,7 +426,28 @@ extern "C" int r4d_fuse_gate_quant_fp8(const RadParam* p, int n_p, uint64_t pres
     const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n");
     if (!fp8_geometry_ok(p, n_p, M, n)) return RAD_E_UNSUPPORTED;
     /* The shim (r4d_fused_quant_fp8.hip) defaults this row's `mode` to 1 (sigmoid). */
-    if (!act_is(p, n_p, "sigmoid", "sigmoid")) return RAD_E_UNSUPPORTED;
+    const bool none = act_is(p, n_p, "sigmoid", "none");
+    if (!none && !act_is(p, n_p, "sigmoid", "sigmoid")) return RAD_E_UNSUPPORTED;
+    const int16_t mid = RAD_FUSE_HAS(present, 4) ? (int16_t)4 : RAD_FUSE_TMP(0);
+
+    if (none) {
+        switch (step) {
+        case 0: {
+            /* gate * x, rounded to bf16 once: mul_bf16's store. */
+            Step s(out, "mul");
+            s.mirror(p, n_p, "M").mirror(p, n_p, "n").mirror(p, n_p, "dtype");
+            return s.wire({ 0, 1, mid });           /* a, b, y */
+        }
+        case 1: {
+            Step s(out, "quant_act_fp8");
+            s.mirror(p, n_p, "M").mirror(p, n_p, "n").mirror(p, n_p, "group")
+             .mirror(p, n_p, "dtype");
+            return s.wire({ mid, 2, 3 });           /* x, q, scale */
+        }
+        default:
+            return RAD_E_NOTFOUND;
+        }
+    }
 
     switch (step) {
     case 0: {
@@ -927,7 +951,7 @@ extern "C" int r4d_fuse_rmsnorm_rope_roundtrip(const RadParam* p, int n_p, uint6
         return RAD_E_UNSUPPORTED;
     switch (step) {
     case 0: { Step s(out, "rmsnorm"); mirror_norm(s, p, n_p); return s.wire({ 0, 1, 2 }); }
-    case 1: { Step s(out, "rope_rows"); mirror_rope(s, p, n_p); return s.wire({ 2, 3, 4 }); }
+    case 1: { Step s(out, "ds41_rope_rows"); mirror_rope(s, p, n_p); return s.wire({ 2, 3, 4 }); }
     case 2: { Step s(out, "quant_roundtrip"); mirror_quant(s, p, n_p, n); return s.wire({ 2 }); }
     default: return RAD_E_NOTFOUND;
     }
@@ -939,7 +963,7 @@ extern "C" int r4d_fuse_rope_rows_roundtrip(const RadParam* p, int n_p, uint64_t
     const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n_head") * pi(p, n_p, "head_dim");
     if (M <= 0 || n <= 0) return RAD_E_UNSUPPORTED;
     switch (step) {
-    case 0: { Step s(out, "rope_rows"); mirror_rope(s, p, n_p); return s.wire({ 0, 1, 2 }); }
+    case 0: { Step s(out, "ds41_rope_rows"); mirror_rope(s, p, n_p); return s.wire({ 0, 1, 2 }); }
     case 1: { Step s(out, "quant_roundtrip"); mirror_quant(s, p, n_p, n); return s.wire({ 0 }); }
     default: return RAD_E_NOTFOUND;
     }

@@ -278,6 +278,13 @@ class FileStager final : public OpStager {
 public:
     ~FileStager() override;
 
+    /* Routing-aware reads: the engine binds a source of the layer's per-expert routing
+     * counts for the current pass (the router reports them to the Ctx before the layer's
+     * first expert op, which is the stager's trigger). Returns the device pointer of
+     * `n_expert` i32 counts, or null when the layer has not reported this pass — the
+     * caller then reads the whole layer. Null `routes` reads whole layers. */
+    using RouteCounts = const int32_t* (*)(void* ud, int32_t layer, int64_t* n_expert);
+
     /* A routed layer's card-side counts row for the pass being issued, as Ctx::route_counts_live
      * gives it: the row, the layer's expert count and its top_k, or null when the layer has no
      * row its router writes in stream order. */
@@ -488,12 +495,11 @@ public:
     const RtStats& rt_stats() const { return rt_stats_; }
     bool route_trace() const { return rt_ != nullptr; }
 
-    /* The routed layers of `plan` that hold a unit on the file tier and the ops that read them,
-     * over the mover's two file buffers. Leaves it disabled -- enabled() false -- when the plan
-     * puts no routed unit there; refuses a plan whose routed layers are read by interleaved ops,
-     * because a file-tier unit has no other address to fall back on.
-     *
-     * With `counts`, a pass of at most kRoutedRows tokens reads only the experts it routes to:
+    /* Binds the routed layers with file-tier units and the ops that read them, over the mover's
+     * two file buffers. Leaves enabled() false when no routed unit is on the file tier. Refuses a
+     * plan whose routed layers are read by interleaved ops, since a file-tier unit has no other
+     * address to fall back on. */
+    /* With `counts`, a pass of at most kRoutedRows tokens reads only the experts it routes to:
      * at a layer's first expert op the stager copies the layer's counts row to the host behind
      * the router (same stream), waits for it, reads the routed units and aliases the rest
      * (Mover::alias_file_units). A counts row that does not add up to the pass's tokens times
@@ -503,8 +509,9 @@ public:
      * layers with M<=kEpRouteMaxRows (M<=kEpRouteTallRows under RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL,
      * tall_init). A missing current witness reads the full layer
      * directly; an old global report cannot authorize that EP read. Other layers retain CountsRow verbatim. */
-    int init(const Program& prog, const Plan& plan, Mover* mover, CountsRow counts = nullptr,
-              EpCountsRow ep_counts = nullptr);
+    int init(const Program& prog, const Plan& plan, Mover* mover,
+             RouteCounts routes = nullptr, void* routes_ud = nullptr,
+             CountsRow counts = nullptr, EpCountsRow ep_counts = nullptr);
 
     bool    enabled() const { return !layers_.empty(); }
     size_t  n_layers() const { return layers_.size(); }
@@ -554,10 +561,20 @@ private:
     Mover*   mover_ = nullptr;
     char*    buf_[2] = { nullptr, nullptr };
     int64_t  cap_ = 0;
+    RouteCounts routes_ = nullptr;     /* routing-aware reads; null reads whole layers */
+    void*    routes_ud_ = nullptr;
+    int32_t* scratch_ = nullptr;        /* pinned, for the trigger's blocking counts copy */
+    int64_t  scratch_n_ = 0;
+    std::vector<int32_t> skipped_[2];   /* per buffer: units not read, nulled at release */
+    /* Per buffer: units the stager read into hot-cache slots. Unlike the
+     * staged ones they keep their publications when the buffer is released — the slot is
+     * their address from here on, until heat evicts one. */
+    std::vector<int32_t> promoted_[2];
     RadEvent done_[2] = { nullptr, nullptr };   /* behind a buffer's copies, on the mover stream */
     RadEvent free_[2] = { nullptr, nullptr };   /* behind the ops that read a buffer's layer */
     bool     free_rec_[2] = { false, false };
     std::vector<int32_t> staged_[2];
+    int  start(int32_t li, RadStream s);
     int32_t  holds_[2] = { -1, -1 };             /* the layer a buffer holds, or -1 */
     bool     partial_[2] = { false, false };     /* its routed experts only, the rest aliased */
     bool     pending_[2] = { false, false };     /* `done_` was recorded for its read */

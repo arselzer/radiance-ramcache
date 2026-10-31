@@ -562,10 +562,12 @@ FileStager::~FileStager() {
     if (hx_fl_dev_) rad_dev_free(hx_fl_dev_, RAD_MEM_DEVICE);
     if (hx_fl_pin_) rad_dev_free(hx_fl_pin_, RAD_MEM_HOST_PINNED);
     if (hx_wake_ev_) rad_event_destroy(hx_wake_ev_);
+    if (scratch_) rad_dev_free(scratch_, RAD_MEM_HOST_PINNED);
 }
 
-int FileStager::init(const Program& prog, const Plan& plan, Mover* mover, CountsRow counts,
-                      EpCountsRow ep_counts) {
+int FileStager::init(const Program& prog, const Plan& plan, Mover* mover,
+                     RouteCounts routes, void* routes_ud, CountsRow counts,
+                     EpCountsRow ep_counts) {
     //No owner/program switch while temporary addresses or old copy generations survive.
     RAD_TRY(shutdown_head_cache());
     if (head_.configured()) return RAD_E_STATE; //a head-cache FileStager is single-initialization
@@ -577,6 +579,19 @@ int FileStager::init(const Program& prog, const Plan& plan, Mover* mover, Counts
     ep_program_ = &prog;
     ep_stats_ = {};
     if (!mover) return RAD_OK;
+
+    /* Routing-aware reads. The source may still decline per layer (a layer that has not
+     * reported this pass is read whole). */
+    routes_ = routes;
+    routes_ud_ = routes_ud;
+    scratch_ = nullptr;
+    scratch_n_ = 0;
+    if (routes_ && prog.meta.n_expert > 0) {
+        scratch_n_ = prog.meta.n_expert;
+        scratch_ = (int32_t*)rad_dev_alloc((size_t)scratch_n_ * sizeof(int32_t),
+                                           RAD_MEM_HOST_PINNED);
+        if (!scratch_) { scratch_n_ = 0; routes_ = nullptr; }
+    }
 
     /* A unit declared and never read has no op span and is left out. */
     size_t c = 0;
@@ -758,7 +773,7 @@ bool FileStager::will_issue(int32_t li) const {
     return it == pass_last_.end() || layers_[(size_t)li].first_op <= it->second;
 }
 
-int FileStager::start(int32_t li) {
+int FileStager::start(int32_t li, RadStream s) {
     //EVERY full-layer/read-ahead/repeated-slice path acquires the complete buffer here.
     RAD_TRY(head_revoke());
     if (hx_capped_) {
@@ -772,13 +787,30 @@ int FileStager::start(int32_t li) {
     const int32_t layer = layers_[(size_t)li].layer;
     const auto cache_policy = layer >= 0 && layer < 40 && (size_t)li < ep_layer_eligible_.size() &&
         ep_layer_eligible_[(size_t)li] ? pass_cache_policy_ : NativeFileCacheReadPolicy::Normal;
+    /* Routing-aware reads: the trigger (this call) runs at the layer's first expert op,
+     * after the layer's router on the same stream, so this pass's counts are ordered
+     * before the copy. The stream sync costs far less than a gigabyte-scale layer read;
+     * a source that declines (no report yet this pass) reads the whole layer. */
+    const int32_t* ecnt = nullptr;
+    int32_t n_expert = 0;
+    if (routes_) {
+        int64_t n = 0;
+        const int32_t* dev = routes_(routes_ud_, layers_[(size_t)li].layer, &n);
+        if (dev && n > 0 && n <= scratch_n_ &&
+            rad_memcpy_async(scratch_, dev, (size_t)n * sizeof(int32_t), s) >= 0 &&
+            rad_stream_sync(s) >= 0) {
+            ecnt = scratch_;
+            n_expert = (int32_t)n;
+        }
+    }
     const int rc = mover_->stage_file_units(layers_[(size_t)li].units, buf_[b], cap_,
                                             free_rec_[b] ? free_[b] : nullptr, done_[b],
-                                            &staged_[b], cache_policy);
+                                            &staged_[b], &skipped_[b], ecnt, n_expert,
+                                            &promoted_[b], cache_policy);
     if (rc < 0) return rc;
     partial_[b] = false;
-    pending_[b] = !staged_[b].empty();
-    if (!staged_[b].empty()) holds_[b] = li;
+    pending_[b] = !staged_[b].empty() || !promoted_[b].empty();
+    if (!staged_[b].empty() || !promoted_[b].empty()) holds_[b] = li;
     return RAD_OK;
 }
 
@@ -1019,7 +1051,8 @@ int FileStager::start_ep_routed(int32_t li, RadStream s, bool* read) {
         return RAD_E_STATE;
     }
     const int stage_status = mover_->stage_file_units(want_, buf_[b], available,
-        free_rec_[b] ? free_[b] : nullptr, done_[b], &staged_[b], NativeFileCacheReadPolicy::Normal,trace);
+        free_rec_[b] ? free_[b] : nullptr, done_[b], &staged_[b], nullptr, nullptr, 0, nullptr,
+        NativeFileCacheReadPolicy::Normal,trace);
     mover_->prefetch_trace_stage_done(trace,stage_status);
     if(stage_status<0)return stage_status;
     {
@@ -4351,6 +4384,13 @@ int FileStager::finish(int32_t b, RadStream s) {
     free_rec_[b] = true;
     mover_->unstage_units(staged_[b]);
     staged_[b].clear();
+    if (!skipped_[b].empty()) {
+        mover_->unstage_units(skipped_[b]);        /* the dummy publications go to null too */
+        skipped_[b].clear();
+    }
+    /* Hot-cache units are NOT unstaged: their publications name their slots, which outlive
+     * the buffer. The layer's copies into them landed before its ops ran (the done_ wait). */
+    promoted_[b].clear();
     holds_[b] = -1;
     partial_[b] = false;
     pending_[b] = false;
@@ -4384,7 +4424,7 @@ int FileStager::before_op(rad_op h, RadStream s, bool* resync) {
         if (!routed_ && it != layers_.end()) {
             const int32_t li = (int32_t)(it - layers_.begin());
             if (will_issue(li)) {
-                RAD_TRY(start(li));
+                RAD_TRY(start(li, s));
                 *resync = true;
             }
         }
@@ -4415,7 +4455,7 @@ int FileStager::before_op(rad_op h, RadStream s, bool* resync) {
         }
         hx_drain();
         RAD_TRY(finish(b, s));
-        RAD_TRY(start(li));
+        RAD_TRY(start(li, s));
         if (holds_[b] == li && pending_[b]) RAD_TRY(rad_event_wait(s, done_[b]));
         *resync = true;
         return RAD_OK;
@@ -4433,7 +4473,7 @@ int FileStager::before_op(rad_op h, RadStream s, bool* resync) {
                         ep_layer_eligible_[(size_t)li];
         if (routed_ && ep) RAD_TRY(start_ep_routed(li, s, &read));
         if (routed_ && !ep) RAD_TRY(start_routed(li, s, &read));
-        if (!read) RAD_TRY(start(li));
+        if (!read) RAD_TRY(start(li, s));
         *resync = true;
     }
     if (holds_[li & 1] == li && pending_[li & 1]) RAD_TRY(rad_event_wait(s, done_[li & 1]));
@@ -4441,7 +4481,7 @@ int FileStager::before_op(rad_op h, RadStream s, bool* resync) {
 
     const int32_t next = li + 1;
     if (!routed_ && (size_t)next < layers_.size() && will_issue(next)) {
-        RAD_TRY(start(next));
+        RAD_TRY(start(next, s));
         *resync = true;
     }
     return RAD_OK;
@@ -4481,7 +4521,7 @@ int FileStager::tbo_second(int32_t li, RadStream s) {
                     (size_t)li < ep_layer_eligible_.size() && ep_layer_eligible_[(size_t)li];
     if (routed_ && ep) RAD_TRY(start_ep_routed(li, s, &read));
     if (routed_ && !ep) RAD_TRY(start_routed(li, s, &read));
-    if (!read) RAD_TRY(start(li));
+    if (!read) RAD_TRY(start(li, s));
     if (holds_[b] == li && pending_[b]) RAD_TRY(rad_event_wait(s, done_[b]));
     ++tbo_slices_;
     return RAD_OK;

@@ -109,7 +109,7 @@ struct PleLayer {
     /* The read-ahead queue's depth in steps: batch.cpp's k_ahead_chunks steps of the following
      * prompt, whose rows the gather's reader thread prefetches. Clamped to what `b_ids` holds, so
      * a larger offer only shortens the queue. */
-    static constexpr int64_t kAheadChunks = 8;
+    static constexpr int64_t kAheadChunks = 2;
     /* The prompt that follows the step, bounded by what `b_ids` holds after the step's rows. */
     int64_t ahead_rows(const RadBatch* batch) const {
         const int64_t a = batch->n_ahead;
@@ -178,7 +178,8 @@ inline int PleLayer::declare(RadBuilder* b, Names& nm, const Geom& geom, const C
     /* E4M3 with one scale for all 320 million rows (Qwen3.8-Flash-Next-FP8's choice; E4M3 has its
      * own exponent, a row's dynamic range is 2.3x, and the scale sits on a three-octave plateau).
      * One stored weight, `fp8_e4m3*bf16[*x*]`: codes plus a one-element scale plane, made by the
-     * recipe (data/recipes/qwen4exp-w4.recipe); the gather takes them as two operands. The name map
+     * recipe (data/recipes/qwen4exp-w4.recipe) or read as that release ships it (its shards under
+     * one `weight_scale`); the gather takes them as two operands. The name map
      * joins the shards along rows and is declared first, since the encoding is looked up through
      * it. RAD_ACCESS_VOCAB: it is a vocabulary table, just not the token one. */
     const char* tn = nm.f("blk.%d.ple_ngram.weight", layer);

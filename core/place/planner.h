@@ -115,6 +115,11 @@ struct MoveUnit {
      * goes to the file tier. */
     bool    file_direct = true;
 
+    /* The drafter's own weights (the "mtp." namespace). They run on every draft pass of every
+     * decode step -- up to depth passes plus the verify pass, each re-staging them from the drive
+     * if they land in the file tier -- so the expert fill pins them in the host pool ahead of
+     * everything ranked. One layer's experts, a fraction of the pool. */
+    bool    draft_head = false;
     /* RADIANCE_EXPERIMENTAL_DS41_VRAM_PACKED (place/vram_packed.h): a static VRAM resident some of whose
      * weights the card holds in the packed-scale form (Placement::vram_bytes). `vram_bytes` is the unit as
      * the card holds it and `vram_offset[i]` where weights[i] sits in it, laid out as `offset` is, at
@@ -259,9 +264,8 @@ public:
      * bytes, which no tier total counts. */
     int64_t draft_vram_units = 0, draft_vram_bytes = 0;
     int64_t draft_parked_units = 0, draft_parked_bytes = 0;
-    /* --expert-profile and --expert-pin-top: the profile's units the planner pinned resident and the
-     * share threshold it derived from the fraction. Reported so the window can see what the decode
-     * set costs the card. */
+    /* --expert-profile and --expert-pin-top: the units the planner pinned resident, the profiled
+     * units, and the share threshold it derived from the fraction (Plan::report). */
     int64_t pinned_units = 0;
     int64_t profile_units = 0;
     float   pin_threshold = 0.0f;

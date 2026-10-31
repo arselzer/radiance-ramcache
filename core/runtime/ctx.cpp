@@ -867,6 +867,21 @@ const RadRouting* Ctx::last_routing(int layer) const {
     return route_[(size_t)layer].reported >= 0 ? &route_[(size_t)layer].routing : nullptr;
 }
 
+const int32_t* Ctx::route_counts_device(int layer, int64_t* n_expert) const {
+    if (n_expert) *n_expert = 0;
+    if (layer < 0 || (size_t)layer >= route_.size()) return nullptr;
+    const RouteSlot& s = route_[(size_t)layer];
+    /* No step gate: route_report lands at the END of the block's passes (heat consumes it a
+     * step later), but the reported buffer is the block's own ecnt, whose CONTENT the router
+     * kernel rewrote this pass -- and the file stager's trigger runs after that router on the
+     * same stream, so a stream-ordered copy reads this pass's counts. The counts are indexed
+     * by the rank's local expert slot (the kernel subtracts expert_base), which is also what
+     * the mover's units carry. */
+    if (!s.routing.expert_count || s.reported < 0) return nullptr;
+    if (n_expert) *n_expert = s.routing.n_expert ? s.routing.n_expert : route_n_expert_;
+    return s.routing.expert_count;
+}
+
 /* ================================================================== profiling (spec §16) */
 
 int Ctx::bind_profiling() {
@@ -1028,7 +1043,7 @@ int Ctx::lane_join(int from, int to) {
  * field added to RadBatch changes its size: decide whether the key must read it, then update the
  * size here. `agen_b` and `vgen_b` are set only on generator passes, which are never recorded
  * (below). */
-static_assert(sizeof(void*) != 8 || sizeof(RadBatch) == 392,
+static_assert(sizeof(void*) != 8 || sizeof(RadBatch) == 440,
               "RadBatch changed: check that Ctx::pass_key reads every new field a pass depends on");
 static_assert(sizeof(void*) != 8 || sizeof(RadKVGroupBatch) == 80,
               "RadKVGroupBatch changed: check that Ctx::pass_key reads every new field");
@@ -1037,6 +1052,10 @@ uint64_t Ctx::pass_key(const RadBatch* b) const {
     /* Not recordable: encoder passes are shaped by their media, and passes carrying encoder rows
      * issue the scatter only when they have some. */
     if (b->enc || b->n_mm_rows > 0) return 0;
+    /* A pass carrying a request's words for the plugin is shaped by them (a head issues per
+     * sequence from their counts), and such a step samples a prompt's first token, which is not
+     * the repeating decode pass. */
+    if (b->n_plugin_words > 0) return 0;
     /* A generator pass is shaped by what RadBatch::gen_b, agen_b or vgen_b carries, which no key
      * below reads. */
     if (b->gen) return 0;
@@ -1052,7 +1071,7 @@ uint64_t Ctx::pass_key(const RadBatch* b) const {
     mix((uint64_t)b->n_checkpoints);   mix((uint64_t)b->n_seq_decode);
     mix((uint64_t)b->n_tok_decode);    mix((uint64_t)b->max_q_len_decode);
     mix((uint64_t)b->max_q_len_prefill); mix((uint64_t)b->n_draft_out); mix((uint64_t)b->n_ahead);
-    mix((uint64_t)b->rope_mixed);      ptr(b->rope_pos);
+    mix((uint64_t)b->rope_mixed);      ptr(b->rope_pos);  mix((uint64_t)b->score_only);
     ptr(b->token_ids);  ptr(b->positions);  ptr(b->cu_seqlens);    ptr(b->seq_ids);
     ptr(b->out_ids);    ptr(b->q_lens);     ptr(b->ctx_lens);      ptr(b->num_accepted);
     ptr(b->spec_parent); ptr(b->checkpoint_tok); ptr(b->checkpoint_slot); ptr(b->draft_out_ids);
@@ -1549,7 +1568,9 @@ void Ctx::flush_issued() {
     for (size_t r = 0; r < unflushed_.size(); ++r) {
         const uint32_t i = unflushed_[r];
         if (i < plans_.size() && i < program_->ops.size() && plans_[i].issued)
-            program_->ops[i].issued = true;
+            /* /graph reads this same bool from the HTTP thread: an atomic_ref store keeps that
+             * pair a relaxed exchange rather than a data race (ctx.h OpInfo::issued). */
+            std::atomic_ref<bool>(program_->ops[i].issued).store(true, std::memory_order_relaxed);
         else
             unflushed_[w++] = i;
     }

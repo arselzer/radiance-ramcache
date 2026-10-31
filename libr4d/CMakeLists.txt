@@ -75,6 +75,7 @@ set(R4D_UNITS
   # Unlimited-OCR's SAM tower: windowed attention with decomposed relative position.
   "r4d_sam_attn_bf16|"
   "r4d_encoder_bf16|"
+  "r4d_nemotron_bf16|"
   # The image generator: attention over a paged prefix plus the pass's own rows, the causal
   # head_dim-128 dense form and the 1152-wide decoder head; plus the sampler, adaptive norm,
   # implicit-GEMM convolution and pixel ops.
@@ -160,6 +161,8 @@ set(R4D_UNITS
   # checkpoint, and the entry points reject a mismatch.
   "r4d_gemm_fp8a16_nt_m1|"
   "r4d_gemm_fp8a8|"
+  "r4d_gemm_iqr|"
+  "r4d_iqr_embed|"
   "r4d_quant_act_fp8|"
   "r4d_givens_rotate|"
   "r4d_fused_quant_fp8|"
@@ -201,6 +204,7 @@ set(R4D_UNITS
   "r4d_lora_bf16|"
   "r4d_dflash_conv_t2_g16_bf16|"
   "r4d_dflash_select_bf16|"
+  "r4d_dflash_tree_bf16|"
   # Routed MoE: router, scatter, the grouped block-scaled fp8 GEMM and gather, in one unit because
   # the other three only feed the GEMM.
   "r4d_moe|"
@@ -235,7 +239,8 @@ endforeach()
 # The host sources are declaration only: the row table, weight layouts and relayouts, operand
 # descriptions and fusion claims. They are pure host C++ that includes neither r4d.h nor
 # hip_runtime.h, so these tables compile and can be inspected without ROCm.
-set(R4D_DECLARATION r4d_rows.cpp r4d_layout.cpp r4d_fp8_layout.cpp r4d_shapes.cpp r4d_fuse.cpp)
+set(R4D_DECLARATION r4d_rows.cpp r4d_layout.cpp r4d_fp8_layout.cpp r4d_iqr_layout.cpp r4d_shapes.cpp
+                    r4d_fuse.cpp)
 # The native-block GEMMs' layout (planes -> llama.cpp's blocks) uses libquant's one definition of the
 # blocks, compiled in when libquant's sources are beside libr4d (in radiance's tree).
 set(R4D_GGML_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../libquant)

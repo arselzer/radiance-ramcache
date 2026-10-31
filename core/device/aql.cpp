@@ -64,6 +64,7 @@
 #include <vector>
 
 #include "aql.h"
+#include "directio.h"
 #include "rad_format.h"
 #include "../rad_internal.h"
 
@@ -649,11 +650,25 @@ inline Stream* ours(const void* s) {
     return p->magic == kStreamMagic ? const_cast<Stream*>(p) : nullptr;
 }
 
+/* The device's stuck state, for dev_stuck_ms, in steady-clock ns (0: none). `g_stuck_at` is the
+ * last moment anything advanced, set by the stall verdict (Stall::check) with the read-progress sum
+ * it saw in `g_stuck_progress`; `g_fault_at` is when the first queue faulted. */
+std::atomic<uint64_t> g_stuck_at{0};
+std::atomic<uint64_t> g_stuck_progress{0};
+std::atomic<uint64_t> g_fault_at{0};
+
+inline uint64_t steady_ns() {
+    return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 void on_queue_error(hsa_status_t st, hsa_queue_t*, void* data) {
     Stream* s = static_cast<Stream*>(data);
     const char* m = nullptr;
     hsa_status_string(st, &m);
     s->fault.store((int)st, std::memory_order_release);
+    uint64_t none = 0;
+    g_fault_at.compare_exchange_strong(none, steady_ns(), std::memory_order_acq_rel);
     G().faulted.store(true, std::memory_order_release);
     hsa_signal_store_screlease(G().fault, 1);
     RAD_ERR("device %d: the AQL queue faulted: %s", s->ord, m ? m : "?");
@@ -664,12 +679,19 @@ void on_queue_error(hsa_status_t st, hsa_queue_t*, void* data) {
  * nothing will decrement, or a kernel that faulted silently); the packet at the read index says
  * which. */
 /* Sum of every queue's read index. It only grows, so an unchanged sum means no queue moved. */
-/* How long a host wait may see no queue advance before it reports the queues; see dump_queues. */
+/* How long a host wait may see no progress before it reports the queues; see dump_queues. The
+ * watchdog is progress-aware -- read_progress counts the drive reader's bytes beside the queues'
+ * read indices -- so a period that moves nothing anywhere is a hang however slow the model's
+ * drives are, and the threshold needs no tuning per deployment. */
 constexpr uint32_t kStallMs = 5000;
 
 uint64_t read_progress() {
+    /* Queue read indices plus the drive reader's byte count: the file tier's reads legitimately
+     * park every queue for seconds at a time (one rank spins at the all-reduce while the other is
+     * still reading its layer off the drive), and the bytes coming back are the progress that
+     * makes such a wait not a stall. */
+    uint64_t n = rad::dio_progress.load(std::memory_order_relaxed);
     std::lock_guard<std::mutex> lk(G().streams_mu);
-    uint64_t n = 0;
     for (Stream* s : G().streams) n += hsa_queue_load_read_index_scacquire(s->q);
     return n;
 }
@@ -885,7 +907,8 @@ hsa_status_t on_system_event(const hsa_amd_event_t* e, void*) {
  * video generator's denoising pass for tens of them. So the queues' read indices are sampled once
  * every stall period and only a period in which none advanced reports, with the packet each queue
  * is on: a hung kernel, or a queue the driver evicted and could not restore. A wait that keeps
- * moving says nothing. */
+ * moving says nothing. The drive reader's byte count is progress too (read_progress), so a wait
+ * parked on the file tier's drive reads never reports. */
 struct Stall {
     const char* where;
     uint32_t n = 0;
@@ -908,8 +931,11 @@ struct Stall {
         const uint64_t p = read_progress();
         if (sampled && p == progress) {
             told = true;
+            /* Nothing has advanced since the previous sample, a stall period ago. */
+            g_stuck_progress.store(p, std::memory_order_relaxed);
+            g_stuck_at.store(steady_ns() - (uint64_t)kStallMs * 1000000u, std::memory_order_release);
             dump_queues(where);
-            RAD_ERR("device: no queue has advanced in the %u s since: the GPU is not running the "
+            RAD_ERR("device: nothing has advanced in the %u s since: the GPU is not running the "
                     "packet named above -- a hung kernel, or a queue the driver evicted and could "
                     "not restore (amdgpu cwsr_enable=0 is one cause)", kStallMs / 1000);
             return;
@@ -918,6 +944,22 @@ struct Stall {
         progress = p;
     }
 };
+
+/* dev_stuck_ms. A standing verdict is dropped as soon as the read progress moves again. */
+int64_t stuck_ms() {
+    const uint64_t now = steady_ns();
+    if (G().faulted.load(std::memory_order_acquire)) {
+        const uint64_t f = g_fault_at.load(std::memory_order_acquire);
+        return f && now > f ? (int64_t)((now - f) / 1000000u) : 0;
+    }
+    uint64_t at = g_stuck_at.load(std::memory_order_acquire);
+    if (!at) return 0;
+    if (read_progress() != g_stuck_progress.load(std::memory_order_relaxed)) {
+        g_stuck_at.compare_exchange_strong(at, 0, std::memory_order_acq_rel);
+        return 0;
+    }
+    return now > at ? (int64_t)((now - at) / 1000000u) : 0;
+}
 
 /* Reserves packet `idx` once the packet processor has consumed far enough that its slot is free.
  * A launched barrier-bit packet means every packet before it has completed, which a kernel
@@ -1714,6 +1756,11 @@ struct Sig {
     hsa_agent_t  agent{};                                  /* where it was recorded */
     std::vector<std::pair<uint32_t, uint64_t>> waiters;    /* queue id, packet index */
     bool         stamped = false;                          /* its times not read yet (stamp_hold) */
+    /* A prefetch DMA queue's list polls it (a_xp_list): the card whose queue, -1 for none, and the
+     * list number the queue writes to its finish word once the engine is past the poll. A DMA
+     * poll is no queue packet, so `waiters` cannot hold it. */
+    std::atomic<int32_t>  xp_dev{-1};
+    std::atomic<uint32_t> xp_list{0};
 };
 
 struct SigPool {
@@ -1728,13 +1775,27 @@ SigPool& pool() {
     return *p;
 }
 
+bool xp_list_finished(int ord, uint32_t k);
+
+/* A signal at 0 can still be awaited: by a queue packet not yet consumed (`waiters`), or by a
+ * prefetch DMA list that has not yet read it (`xp_dev`). Reused then, its next user's 1 would be
+ * what that wait sees, and the wait would hang behind work that waits for it. */
 bool reusable(const Sig* g) {
     if (g->stamped || hsa_signal_load_relaxed(g->h) != 0) return false;
     for (const auto& w : g->waiters) {
         hsa_queue_t* q = g_queue_by_id[w.first].load(std::memory_order_acquire);
         if (q && hsa_queue_load_read_index_relaxed(q) <= w.second) return false;
     }
+    const int32_t xd = g->xp_dev.load(std::memory_order_acquire);
+    if (xd >= 0 && !xp_list_finished(xd, g->xp_list.load(std::memory_order_relaxed))) return false;
     return true;
+}
+
+/* Back to the free list: what held it is over. */
+void sig_free(SigPool& p, Sig* g) {
+    g->waiters.clear();
+    g->xp_dev.store(-1, std::memory_order_relaxed);
+    p.free[g->irq].push_back(g);
 }
 
 /* A signal for one record: an interrupt signal if the host waits on the event, else GPU_ONLY.
@@ -1751,8 +1812,7 @@ Sig* sig_get(bool irq) {
     while (p.free[irq].empty() && !p.retiring.empty() && reusable(p.retiring.front())) {
         Sig* g = p.retiring.front();
         p.retiring.pop_front();
-        g->waiters.clear();
-        p.free[g->irq].push_back(g);
+        sig_free(p, g);
     }
     if (p.free[irq].empty()) {
         /* In place and in order, so the front stays the oldest. */
@@ -1760,8 +1820,7 @@ Sig* sig_get(bool irq) {
         for (size_t i = 0; i < p.retiring.size(); ++i) {
             Sig* g = p.retiring[i];
             if (reusable(g)) {
-                g->waiters.clear();
-                p.free[g->irq].push_back(g);
+                sig_free(p, g);
             } else {
                 p.retiring[kept++] = g;
             }
@@ -2771,10 +2830,10 @@ struct DmaQueue {
     bool                ever_held = false;       /* a stream has held this card's link at least once */
     std::atomic<bool>   tried{false};            /* dma_open has run, for the startup report */
     std::string         why;                     /* why it failed */
-    /* For a queue whose lists each end by writing their number to `fin` (the expert prefetch's),
-     * the room check uses the end of the last finished list as a lower bound on what the engine
-     * has read. The engine's written-back read pointer can stop moving on such a queue while the
-     * engine runs on, and a ring the host thinks full would wait forever. */
+    /* For a queue whose lists each end by writing their number to `fin` (the lane's and the
+     * expert prefetch's), the room check uses the end of the last finished list as a lower bound
+     * on what the engine has read. The engine's written-back read pointer can stop moving on such
+     * a queue while the engine runs on, and a ring the host thinks full would wait forever. */
     volatile uint32_t*  fin = nullptr;
     uint32_t            lists = 0;               /* lists handed over; list k ends at ends[k % kDmaEnds] */
     std::unique_ptr<uint64_t[]> ends;
@@ -2961,8 +3020,9 @@ void dump_dma_lanes() {
     for (int c = 0; c < kMaxDevices; ++c) {
         DmaQueue& q = g_dma[c];
         if (!q.tried.load(std::memory_order_acquire) || !q.ok) continue;
-        RAD_ERR("  device %d DMA lane: ring written %" PRIu64 " B, read %" PRIu64 " B; link gate %"
-                PRId64 " (%s), last hold issued %s", c, (uint64_t)q.w, (uint64_t)*q.rptr,
+        RAD_ERR("  device %d DMA lane: ring written %" PRIu64 " B, read %" PRIu64 " B; %u lists handed "
+                "over, %" PRIu32 " finished; link gate %" PRId64 " (%s), last hold issued %s",
+                c, (uint64_t)q.w, dma_read(&q), q.lists, q.fin ? *q.fin : 0u,
                 (int64_t)hsa_signal_load_relaxed(q.gate),
                 (hsa_signal_load_relaxed(q.gate) & 1) ? "held" : "free", q.held ? "on" : "off");
     }
@@ -2972,6 +3032,11 @@ void dump_dma_lanes() {
         RAD_ERR("  device %d prefetch DMA queue: ring written %" PRIu64 " B, read %" PRIu64 " B; %u lists "
                 "handed over, %u finished", c, (uint64_t)q.w, dma_read(&q), q.lists, q.fin ? *q.fin : 0u);
     }
+}
+
+/* Where the engine reads and writes a signal's value: the 64-bit word the CP decrements and polls. */
+inline uint64_t sig_value_addr(const Sig* g) {
+    return (uint64_t)g->h.handle + offsetof(amd_signal_t, value);
 }
 
 /* The card's queue, opened on first use; null (after one warning) if the driver refuses. */
@@ -2985,6 +3050,18 @@ DmaQueue* dma_queue(int ord) {
         q.why = why;
         q.tried.store(true, std::memory_order_release);
         if (q.ok) aql::g_dump_lanes = dump_dma_lanes;
+        if (q.ok) {
+            /* The engine's written-back read pointer can stop moving while the engine runs on (the
+             * expert prefetch's queue has the same quirk), and a ring the host thinks full would
+             * wait forever -- a large pool's load fill wedged exactly there. So every list ends by
+             * writing its number to a word the engine keeps advancing, which bounds the engine's
+             * progress from below without trusting the read pointer (dma_read). */
+            if (Sig* f = sig_get(false)) {
+                hsa_signal_silent_store_relaxed(f->h, 0);
+                q.ends.reset(new uint64_t[kDmaEnds]());
+                q.fin = (volatile uint32_t*)(uintptr_t)sig_value_addr(f);
+            }
+        }
         if (q.ok)
             RAD_INFO("device: card %d copy lists go to DMA engine 0 on a queue of this process's own "
                      "(%.1f ms to open)", ord,
@@ -3042,11 +3119,6 @@ void dma_kick(DmaQueue* q) {
     *q->db = q->w;
 }
 
-/* Where the engine reads and writes a signal's value: the 64-bit word the CP decrements and polls. */
-inline uint64_t sig_value_addr(const Sig* g) {
-    return (uint64_t)g->h.handle + offsetof(amd_signal_t, value);
-}
-
 /* ------------------------------------------------- the expert prefetch's device half (rad_xp_*) */
 
 /* The card's prefetch queue on its second DMA engine (the lane has the first), opened on first
@@ -3073,6 +3145,15 @@ DmaQueue* xp_queue(int ord) {
                      "prefetch (%s)", ord, why.c_str());
     });
     return q.ok ? &q : nullptr;
+}
+
+/* Whether card `ord`'s prefetch queue has finished list `k`, or a later one: its lists finish in
+ * order, so the engine is then past every packet list `k` holds. */
+bool xp_list_finished(int ord, uint32_t k) {
+    if (ord < 0 || ord >= kMaxDevices) return true;
+    const DmaQueue& q = g_dma_xp[ord];
+    if (!q.fin) return true;
+    return (int32_t)(*q.fin - k) >= 0;
 }
 
 int a_xp_supported(int device) { return xp_queue(device) != nullptr; }
@@ -3211,6 +3292,15 @@ int a_xp_list(int ord, void* mark, int n, const uint64_t* src, const uint64_t* d
                                    (uint32_t)ia, (uint32_t)(ia >> 32), 0u, 0xffffffffu,
                                    10u /* interval */ | (0xfffu << 16) /* retry forever */ };
         rc = dma_put(dq, poll, 6);
+        /* The mark stays out of the pool until the engine is past this poll: the finish word
+         * reaches lists + 1 only behind it, whether this list's own fence writes it or, if the
+         * list below fails, the next list's. Returned earlier, a mark at 0 can be handed out and
+         * set to 1 before the engine reads it, and the list then waits for whatever completes
+         * the next use, which can sit behind the stream's wait for this list. */
+        if (rc == RAD_OK) {
+            in->xp_list.store(dq->lists + 1, std::memory_order_relaxed);
+            in->xp_dev.store(ord, std::memory_order_release);
+        }
     }
     if (rc == RAD_OK && n > 0 && lane && lane->ever_held && lane->gate.handle &&
         !(flags & RAD_XP_NO_YIELD)) {
@@ -3386,6 +3476,19 @@ int a_memcpy_list_async(const RadCopySeg* segs, int n, unsigned flags, RadStream
                 const uint32_t fence[4] = { kSdmaFence | (3u << 16) /* uncached */,
                                             (uint32_t)oa, (uint32_t)(oa >> 32), 0u };
                 rc = dma_put(dq, fence, 4);
+            }
+            if (rc == RAD_OK && dq->fin) {
+                /* Name the list: the engine writes the number when everything before it is done,
+                 * which the room check trusts over the read pointer (see dma_read). */
+                const uint32_t k = dq->lists + 1;
+                const uint64_t fa = (uint64_t)(uintptr_t)dq->fin;
+                const uint32_t finf[4] = { kSdmaFence | (3u << 16) /* uncached */,
+                                           (uint32_t)fa, (uint32_t)(fa >> 32), k };
+                rc = dma_put(dq, finf, 4);
+                if (rc == RAD_OK) {
+                    dq->ends[k % kDmaEnds] = dq->w;
+                    dq->lists = k;
+                }
             }
             dma_kick(dq);
         }
@@ -3906,6 +4009,43 @@ void* pin_whole(int64_t bytes, const std::vector<hsa_agent_t>& cards) {
     return p;
 }
 
+/* Locks [p, p + len) in pieces of at most kPinPiece for every card, each mapped on the cards at
+ * its host address. On failure sets the device error for `who` (asked for `bytes`), unlocks what
+ * was locked and returns false; the mapping stays the caller's to unmap. */
+bool lock_pieces(char* p, int64_t len, int64_t bytes, std::vector<hsa_agent_t>& cards,
+                 const char* who) {
+    const int pieces = (int)((len + kPinPiece - 1) / kPinPiece);
+    int done = 0;
+    for (; done < pieces; ++done) {
+        const int64_t off = (int64_t)done * kPinPiece;
+        const int64_t n = std::min(kPinPiece, len - off);
+        void* on_card = nullptr;
+        const hsa_status_t st = hsa_amd_memory_lock_to_pool(p + off, (size_t)n, cards.data(),
+                                                            (int)cards.size(), G().host_fine, 0,
+                                                            &on_card);
+        if (st != HSA_STATUS_SUCCESS) {
+            device_set_error("%s(%s): locking piece %d of %d (%s at +%s): %s", who,
+                             humanb(bytes).c_str(), done + 1, pieces, humanb(n).c_str(),
+                             humanb(off).c_str(), hsa_why(st));
+            break;
+        }
+        if (on_card != p + off) {
+            ++done;
+            device_set_error("%s(%s): piece %d of %d is mapped on the cards at %p, not "
+                             "at its host address %p, so the pieces are not one range there, "
+                             "although the kernel driver reports the SVM API that maps a lock in "
+                             "place",
+                             who, humanb(bytes).c_str(), done, pieces, on_card, (void*)(p + off));
+            break;
+        }
+    }
+    if (done < pieces) {
+        for (int i = 0; i < done; ++i) (void)hsa_amd_memory_unlock(p + (int64_t)i * kPinPiece);
+        return false;
+    }
+    return true;
+}
+
 void* pin_pieces(int64_t bytes) {
     std::vector<hsa_agent_t> cards;
     for (const Dev& d : G().dev) cards.push_back(d.agent);
@@ -3934,33 +4074,61 @@ void* pin_pieces(int64_t bytes) {
     }
     (void)::madvise(p, (size_t)len, MADV_DONTFORK);
 
-    const int pieces = (int)((len + kPinPiece - 1) / kPinPiece);
-    int done = 0;
-    for (; done < pieces; ++done) {
-        const int64_t off = (int64_t)done * kPinPiece;
-        const int64_t n = std::min(kPinPiece, len - off);
-        void* on_card = nullptr;
-        const hsa_status_t st = hsa_amd_memory_lock_to_pool(p + off, (size_t)n, cards.data(),
-                                                            (int)cards.size(), G().host_fine, 0,
-                                                            &on_card);
-        if (st != HSA_STATUS_SUCCESS) {
-            device_set_error("rad_dev_alloc(%s): locking piece %d of %d (%s at +%s): %s",
-                             humanb(bytes).c_str(), done + 1, pieces, humanb(n).c_str(),
-                             humanb(off).c_str(), hsa_why(st));
-            break;
-        }
-        if (on_card != p + off) {
-            ++done;
-            device_set_error("rad_dev_alloc(%s): piece %d of %d is mapped on the cards at %p, not "
-                             "at its host address %p, so the pieces are not one range there, "
-                             "although the kernel driver reports the SVM API that maps a lock in "
-                             "place",
-                             humanb(bytes).c_str(), done, pieces, on_card, (void*)(p + off));
-            break;
-        }
+    if (!lock_pieces(p, len, bytes, cards, "rad_dev_alloc")) {
+        ::munmap(p, (size_t)len);
+        return nullptr;
     }
-    if (done < pieces) {
-        for (int i = 0; i < done; ++i) (void)hsa_amd_memory_unlock(p + (int64_t)i * kPinPiece);
+    std::lock_guard<std::mutex> lk(g_pinned_mu);
+    g_pinned.emplace((uintptr_t)p, Pinned{len, nullptr});
+    return p;
+}
+
+/* pin_pieces over a shared file mapping instead of private anonymous memory: the pages are the
+ * file's (a tmpfs file other processes map too) and the lock takes them in place. The file maps
+ * onto a 2 MiB boundary inside a reservation made with one alignment extra, then the ends are
+ * trimmed. MADV_HUGEPAGE is advised but shmem follows shmem_enabled, not it. A tmpfs page is
+ * swappable until the lock pins it, so MLOCK_ONFAULT keeps the pages in memory meanwhile; a
+ * refusal (the memlock limit) costs only that. */
+void* pin_pieces_file(int64_t bytes, int fd, int64_t foff) {
+    std::vector<hsa_agent_t> cards;
+    for (const Dev& d : G().dev) cards.push_back(d.agent);
+    if (!svm_in_place()) {
+        device_set_error("rad_dev_map_file(%s): a file range is pinned in place only through the "
+                         "kernel driver's SVM API, which this host lacks, so ram=DIR needs it",
+                         humanb(bytes).c_str());
+        return nullptr;
+    }
+
+    const int64_t align = RAD_ALIGN_POOL;
+    const int64_t len = align_up(bytes, 4096);
+    void* m = ::mmap(nullptr, (size_t)(len + align), PROT_NONE,
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (m == MAP_FAILED) {
+        device_set_error("rad_dev_map_file(%s): mmap: %s", humanb(bytes).c_str(),
+                         std::strerror(errno));
+        return nullptr;
+    }
+    const uintptr_t lo = (uintptr_t)m;
+    const uintptr_t at = (lo + (uintptr_t)align - 1) & ~((uintptr_t)align - 1);
+    if (::mmap((void*)at, (size_t)len, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd,
+               (off_t)foff) == MAP_FAILED) {
+        device_set_error("rad_dev_map_file(%s): mmap of the file at +%s: %s", humanb(bytes).c_str(),
+                         humanb(foff).c_str(), std::strerror(errno));
+        ::munmap(m, (size_t)(len + align));
+        return nullptr;
+    }
+    if (at > lo) ::munmap(m, at - lo);
+    if (lo + (uintptr_t)align > at) ::munmap((void*)(at + (uintptr_t)len), lo + (uintptr_t)align - at);
+    char* const p = (char*)at;
+
+    if (len >= ((int64_t)2 << 20)) (void)::madvise(p, (size_t)len, MADV_HUGEPAGE);
+    (void)::madvise(p, (size_t)len, MADV_DONTFORK);
+    if (::mlock2(p, (size_t)len, MLOCK_ONFAULT) != 0)
+        RAD_WARN("device: the shared file range %p (%s) could not be locked against swap (mlock2: "
+                 "%s)", (void*)p, humanb(len).c_str(), std::strerror(errno));
+    prefer_numa_node(p, len, current_card_numa_node());
+
+    if (!lock_pieces(p, len, bytes, cards, "rad_dev_map_file")) {
         ::munmap(p, (size_t)len);
         return nullptr;
     }
@@ -4024,6 +4192,17 @@ void* a_alloc(int64_t bytes, int kind) {
     return p;
 }
 
+void* a_map_file(int fd, int64_t foff, int64_t bytes) {
+    if (fd < 0 || foff < 0 || bytes <= 0) {
+        device_set_error("rad_dev_map_file(%d, %lld, %lld): a file, a non-negative offset and a "
+                         "positive size are needed", fd, (long long)foff, (long long)bytes);
+        return nullptr;
+    }
+    void* p = pin_pieces_file(bytes, fd, foff);
+    note_alloc(p, bytes, RAD_MEM_HOST_MAPPED);
+    return p;
+}
+
 /* Every free invalidates locate()'s cache first. */
 void (*g_hip_free)(void*, int) = nullptr;
 void a_free(void* p, int kind) {
@@ -4076,6 +4255,15 @@ DeviceBackend g_aql;
 
 }  // namespace
 
+namespace aql {
+bool ride_reusable(void* token) {
+    Sig* g = static_cast<Sig*>(token);
+    if (!g) return false;
+    std::lock_guard<std::mutex> lk(pool().mu);
+    return reusable(g);
+}
+}  // namespace aql
+
 size_t aql_code_registered(void) { return a_code_mark(); }
 
 const DeviceBackend* aql_backend_if_present(void) {
@@ -4104,6 +4292,7 @@ const DeviceBackend* aql_backend_if_present(void) {
         g_hip_host_ptr = hip->host_ptr;
         g_hip_device_ptr = hip->device_ptr;
         g_aql.alloc = a_alloc;
+        g_aql.map_file = a_map_file;
         g_aql.free = a_free;
         g_aql.host_ptr = a_host_ptr;
         g_aql.device_ptr = a_device_ptr;
@@ -4135,6 +4324,7 @@ const DeviceBackend* aql_backend_if_present(void) {
         g_aql.alloc_uncached = a_alloc_uncached;
         g_aql.free_uncached = a_free_uncached;
         g_aql.dma_lane = a_dma_lane;
+        g_aql.stuck_ms = stuck_ms;
         g_aql.vmem_granularity = a_vmem_granularity;
         g_aql.vmem_reserve = a_vmem_reserve;
         g_aql.vmem_release = a_vmem_release;
@@ -4361,5 +4551,16 @@ hipError_t hipPeekAtLastError(void) {
 }
 
 }  // extern "C"
+
+#else
+
+#include "aql.h"
+
+namespace rad {
+namespace aql {
+/* A build without the AQL backend hands out no ride. */
+bool ride_reusable(void*) { return false; }
+}  // namespace aql
+}  // namespace rad
 
 #endif /* RAD_HAVE_HIP */

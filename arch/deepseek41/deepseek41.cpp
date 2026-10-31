@@ -86,6 +86,26 @@ static bool router_bf16_on() {
     return s && !std::strcmp(s, "1");
 }
 
+/* Whether libr4d gives a row of every op on the compressor tail's work rows (qsa_work, softmax_pool,
+ * the latent's rmsnorm and rope table, the index-key gemm_nt, the fused norm and rope round trips, the
+ * entry stores) the same bits at any launch height: RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL=1, or
+ * RADIANCE_EXPERIMENTAL_DS41_LCP at a chunk (a multiple of 16 in 64 .. 2048), pins every norm to the
+ * width rows up to 32 get (libr4d/r4d_ds41_tall.h, read here as libr4d reads them); gemm_nt's m16,
+ * m64 and tiled rows give a row the same bytes by contract (the core's LCP admission relies on it),
+ * and the rest compute a row in a thread or a workgroup of its own whatever the height. Without the
+ * pins rmsnorm takes its width from the height (r4d_act_threads: 256 threads above 72 rows of 512
+ * columns, which sum a row's squares in another order), so a step keeps m.work's rows and their bits.
+ * Read once a declare (Model::work_fit). */
+static bool norms_pinned() {
+    const char* t = std::getenv("RADIANCE_EXPERIMENTAL_DS41_EXACT_TALL");
+    if (t && !std::strcmp(t, "1")) return true;
+    const char* s = std::getenv("RADIANCE_EXPERIMENTAL_DS41_LCP");
+    if (!s || !*s) return false;
+    char* end = nullptr;
+    const long c = std::strtol(s, &end, 10);
+    return !*end && c >= 64 && c <= 2048 && c % 16 == 0;
+}
+
 /* RAD_ARCH_TRY that names the call that failed: a refused declaration otherwise surfaces only as
  * the plugin's return code. */
 #define DS_TRY(e)                                                                                \
@@ -530,6 +550,10 @@ struct Model {
     Cfg c{};
     std::vector<Layer> layers;
     int64_t work = 0, cmax = 0;
+    /* The compressor tail's work rows a step issues (work_rows()): fitted to the step where libr4d
+     * gives every op on them a row's bits at any height (norms_pinned()), else `work` whatever the
+     * step, as before. */
+    bool work_fit = false;
     /* The indexer scores a step's rows in runs of at most `irows` rows into one [irows, cmax] score
      * plane (index_runs()), at most `iparts` runs a step; `kwords` is index_candidates' keep, a bit
      * a block of the candidate layer's width, i32 words a row (0: the model has no candidates). */
@@ -1073,6 +1097,21 @@ static void index_runs(Model& m, const Model* real) {
     m.kwords = 0;
     if (c.cand >= 0 && c.cand < c.n_layer && c.cand_block > 0 && c.ratio[(size_t)c.cand] > 0)
         m.kwords = keep_words(g.max_ctx / c.ratio[(size_t)c.cand] + 1, c.cand_block);
+}
+
+/* The rows a step issues the compressor tail's work at, at a source of ratio r over a step (or a
+ * micro-batch) of T rows and S sequences: qsa_work's launch (its page, bpos and stage), and the pooled,
+ * latent and index-key rows after it. A block completes when its last position is one of the step's,
+ * and a sequence's rows are consecutive positions (qsa_work gathers a block's keys so), so n rows
+ * complete at most (n - 1) / r + 1 blocks and the step at most S + (T - S) / r: one a sequence, and one
+ * more for every further r rows of any of them. A decode step (a row a sequence) takes S rows where
+ * m.work, the bound of any step (max_tok + max_seqs), took 2,049 a layer at 2,048-row chunks. The
+ * bound reads the step's counts alone, which the recorded passes' key holds (Ctx::pass_key), and is
+ * never below S (qsa_work's first S workgroups write nc) nor above m.work (the buffers' rows); rows
+ * past a step's count are padding either way (page -1: pooled and stored nowhere). */
+static int64_t work_rows(const Model& m, int64_t r, int64_t T, int64_t S) {
+    if (!m.work_fit) return m.work;
+    return std::min(m.work, S + std::max<int64_t>(T - S, 0) / r);
 }
 
 static int buffers(RadBuilder* b, Model& m) {
@@ -2621,8 +2660,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     for (int l = 0; l < c.n_layer; ++l)
         if (c.ratio[(size_t)l] > 0 && (rmin == 0 || c.ratio[(size_t)l] < rmin)) rmin = c.ratio[(size_t)l];
     m.work = g.max_tok + g.max_seqs;
+    m.work_fit = norms_pinned();
     /* A sizing declare keeps the real bound: step() issues the compressor tail's page, bpos and stage,
-     * and the pooled, latent and index-key rows after them, at m.work rows whatever the step's size, so
+     * and the pooled, latent and index-key rows after them, at up to m.work rows (work_rows()), so
      * those buffers (~20 MiB at 2,048 rows) keep their real rows at every level. */
     if (m.probe && real) m.work = real->work;
     m.cmax = g.max_ctx / std::max<int64_t>(rmin, 1) + 1;
@@ -3293,7 +3333,7 @@ static void step(RadCtx* x, const RadBatch* batch) {
                         return -1;
                     }
                     tpitch = tb->state_index_pitch > 0 ? tb->state_index_pitch : 1;
-                    rows = m.work;
+                    rows = work_rows(m, r, nv, SV);
                     page = brows(m.page, rows);
                     bpos = brows(m.bpos, rows);
                 }

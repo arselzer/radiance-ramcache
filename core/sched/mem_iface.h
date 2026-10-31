@@ -41,6 +41,9 @@ struct IKVManager {
         (void)keep_from;
         return ensure(seq, n_tokens);
     }
+    /* A physical-map/lease failure is never a capacity miss. The optional backing manager
+     * latches it until shutdown; legacy/fake managers preserve their existing retry behavior. */
+    virtual int allocation_error() const { return RAD_OK; }
     /* After a committed step, a window group frees what no later query can read
      * (KVManager::trim_window). */
     virtual void trim_window(uint64_t seq, int64_t keep_from) { (void)seq; (void)keep_from; }
@@ -358,6 +361,7 @@ struct KVBinding final : IKVManager {
     void free_sequence(uint64_t s) override         { m->free_sequence(s); }
     int  ensure(uint64_t s, int64_t n) override     { return m->ensure(s, n); }
     int  ensure_from(uint64_t s, int64_t n, int64_t k) override { return m->ensure(s, n, k); }
+    int allocation_error() const override { return m->backing_error(); }
     void trim_window(uint64_t s, int64_t k) override { m->trim_window(s, k); }
     int64_t runtime_window_tokens(int32_t g) const override { return m->runtime_window_tokens(g); }
     int  set_window(uint64_t s, int64_t lo, int64_t w) override { return m->set_window(s, lo, w); }

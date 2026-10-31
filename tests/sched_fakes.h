@@ -81,6 +81,8 @@ using namespace rad;
  * prefix-cache block stays out of the pool while the cache names it), and per-sequence state slots
  * for the linear and conv groups. Shaped like core/mem/kv.h (sequence-keyed, owns the tables). */
 struct FakeKV : IKVManager {
+    int allocation_fault = RAD_OK, fail_next_ensure = RAD_OK, ensure_calls = 0;
+    int allocation_error() const override { return allocation_fault; }
     std::vector<KVGroupInfo> gs;
     KVGeom geom;
     int64_t max_ctx = 0;
@@ -185,6 +187,10 @@ struct FakeKV : IKVManager {
     }
 
     int ensure(uint64_t id, int64_t n) override {
+        ++ensure_calls;
+        if (fail_next_ensure < 0) {
+            allocation_fault = fail_next_ensure; fail_next_ensure = RAD_OK; return allocation_fault;
+        }
         auto it = seqs.find(id);
         if (it == seqs.end()) return RAD_E_NOTFOUND;
         Seq& q = it->second;

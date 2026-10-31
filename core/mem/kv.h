@@ -25,10 +25,12 @@
 #include "mem/pools.h"
 #include "rad_core.h"
 #include "mem/kv_growth.h"
+#include "mem/kv_backing_allocator.h"
 
 #include <functional>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace rad {
@@ -297,8 +299,24 @@ public:
      * sequence/prefix/COW IDs through THIS rank's fixed physical layout. Includes all state/window
      * pages as a conservative floor. Active KV loans and streaming are unsupported. The caller
      * must hold scheduler/prefix ownership and drain copies already taken from pending_. Add any
-     * external holder/next-step write ranges separately; no free-list/backing mutation occurs. */
+     * external holder/next-step write ranges separately. Includes in-progress allocation preflight
+     * demands, whose pages are not refcounted yet; no free-list/backing mutation occurs. */
     int backing_required_ranges(const KVManager& owners, std::vector<KVBackingRange>* out) const;
+    /* Explicit integration API only. Call AFTER plan_groups, BEFORE carve. No eager backing or
+     * allocatable IDs until an all-rank publisher transaction commits the initial floor. Loans
+     * and streaming are unsupported. Grow callbacks run synchronously under the engine's already
+     * held pre-plan quiescence lease; they must never lock Scheduler recursively. */
+    int enable_backing_mode();
+    bool backing_mode() const { return backing_enabled_; }
+    int backing_error() const { return backing_error_; } // fatal latch, not ordinary capacity refusal
+    void set_backing_grow(std::function<KVBackingGrowResult(const std::vector<KVBackingBlock>&)> f) {
+        backing_grow_ = std::move(f);
+    }
+    void set_backing_capacity(std::function<bool(int64_t)> f) { backing_capacity_ = std::move(f); }
+    int backing_block_ranges(const std::vector<KVBackingBlock>&, std::vector<KVBackingRange>*) const;
+    /* Published whole-page eligibility; false during withdrawal/poison. The backend snapshot,
+     * not this publication mask, reports physical mappings during a transaction. */
+    bool block_backed(int32_t group, int32_t block) const;
 
     /* ---------------- sequences ---------------- */
     int  add_sequence(uint64_t seq);
@@ -394,7 +412,8 @@ public:
      * recall the loan; it stops at what the cache keeps in hand. */
     int  reserve_block(int32_t group, int32_t* out);
     /* Up to `n` blocks appended to `out`; returns how many. Recalls the loan for all of them up
-     * front, since a block-at-a-time recall would drain the slab one buffer at a time. */
+     * front, since a block-at-a-time recall would drain the slab one buffer at a time. In backing
+     * mode a fatal mapping error is negative (also latched), never a successful partial restore. */
     int64_t reserve_blocks(int32_t group, int64_t n, std::vector<int32_t>* out);
     /* Takes one particular block another rank already chose. Block ids are shared across ranks
      * (RadBatch carries one table), so under tensor parallelism rank 0 picks and the others take
@@ -631,6 +650,37 @@ public:
     void*   state_ptr(int32_t group, int32_t layer, int32_t slot) const;
 
 private:
+    friend class KVManagerBackingPublisher;
+    struct BackingPublication {
+        std::vector<std::vector<uint8_t>> mask;
+        std::vector<std::vector<int32_t>> heap;
+        std::vector<int64_t> usable;
+        bool fixed_ready = false;
+    };
+    int backing_stage(const KVBackingSnapshot&, const KVBackingSnapshot&);
+    void backing_discard() noexcept;
+    void backing_publish(BackingPublication&) noexcept;
+    void backing_poison(int status) noexcept;
+    int backing_need(int32_t group, int64_t free_blocks);
+    int backing_need_ids(const std::vector<KVBackingBlock>&);
+    int backing_ready();
+    bool backing_enabled_ = false, backing_withdrawn_ = false, backing_staged_ = false;
+    bool backing_fixed_ready_ = false;
+    int backing_error_ = RAD_OK;
+    std::vector<std::vector<uint8_t>> backed_ids_;
+    std::vector<int64_t> backing_held_;
+    BackingPublication backing_old_, backing_target_;
+    std::function<KVBackingGrowResult(const std::vector<KVBackingBlock>&)> backing_grow_;
+    std::function<bool(int64_t)> backing_capacity_;
+    std::vector<KVBackingBlock> backing_intent_; // preflight writers not yet represented by refcounts
+    bool backing_collect_intent_ = false;
+    struct BackingIntentScope {
+        KVManager* m;
+        explicit BackingIntentScope(KVManager* owner) : m(owner->backing_enabled_ ? owner : nullptr) {
+            if (m) { m->backing_intent_.clear(); m->backing_collect_intent_ = true; }
+        }
+        ~BackingIntentScope() { if (m) { m->backing_collect_intent_ = false; m->backing_intent_.clear(); } }
+    };
     /* carve() wraps carve_into() and calls forget() on failure, so a carve that stops part way
      * cannot leave plans_ passing guards for block state that was never sized. plan_groups() also
      * starts from forget(). */
@@ -715,11 +765,13 @@ private:
 
     /* ---- the loan (see the public block) ----
      *
-     * `live_` is the carve less the loan. Every carved id stays in `free_blocks_`; ids at or
+     * `live_` is the carve less the loan. In the legacy mode every carved id stays in `free_blocks_`; ids at or
      * above live_ are just not handed out. The free list is a min-heap so the lowest free id goes
      * out first: held blocks pack at the bottom and the top, the only part a loan reaches, drains.
      * A stack would hand out the most recently freed id, often a high one. The heap also makes the
      * gate a single check: if any free id is below live_, the smallest one is.
+     * Explicit backing mode keeps separate physical page masks and filters the heap instead;
+     * unbacked IDs are future capacity, never allocatable free IDs. It cannot coexist with loans.
      *
      * `held_hist_` counts held blocks per bucket, so finding the highest held block is a walk of
      * a few thousand counters, not a refcount scan. It bounds how far a loan may reach, so it is

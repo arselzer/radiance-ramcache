@@ -368,7 +368,10 @@ public:
      * callback and ALL admission/prefix/COW planning. Failure runs no planning or batch uploads.
      * Callback must not call any public Scheduler method (the mutex is not recursive). No engine
      * mode installs this yet; ordinary step() remains unchanged. */
-    int step_quiescent(const std::function<int()>& before_plan, const RadBatch** out);
+    /* after_plan is allocation-free/noexcept and MUST NOT call Scheduler; it clears the lease
+     * under this same lock on every exit after before_plan starts, including errors/throws. */
+    int step_quiescent(const std::function<int()>& before_plan, const RadBatch** out,
+                       const std::function<void()>& after_plan = {});
 
     /* ---------------------------------------------------- the next step, before this one commits
      *

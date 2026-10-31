@@ -303,6 +303,42 @@ TEST(the_device_fakes_are_the_ones_linked) {
     rad_dev_free(p, RAD_MEM_DEVICE);
 }
 
+TEST(quiescent_mapping_failure_stops_admission_and_running_retry_before_eviction_or_upload) {
+    for (bool running : {false, true}) {
+        Fixture f; f.build(); REQUIRE_EQ(f.start(), RAD_OK);
+        const auto id = f.submit(128, 0);
+        if (running) { REQUIRE(f.sch.step()); f.commit_plain(); }
+        f.pc.evict_grant = 1 << 20;
+        f.kv.fail_next_ensure = RAD_E_DEVICE;
+        const int before = f.kv.ensure_calls, evictions = f.pc.evict_calls;
+        const RadBatch* batch = nullptr;
+        CHECK_EQ(f.sch.step_quiescent([] { return int(RAD_OK); }, &batch), RAD_E_DEVICE);
+        CHECK(batch == nullptr); CHECK_EQ(f.pc.evict_calls, evictions);
+        CHECK_EQ(f.kv.ensure_calls, before + 1);
+        bool drained = false;
+        CHECK_EQ(f.sch.step_quiescent([&] { drained = true; return int(RAD_OK); }, &batch), RAD_E_DEVICE);
+        CHECK(!drained); CHECK(batch == nullptr); CHECK(f.sch.find(id) != nullptr);
+    }
+}
+
+TEST(quiescent_plan_lease_cleanup_runs_on_success_failure_throw_and_mapping_failure) {
+    for (int outcome : {0, 1, 2, 3}) {
+        Fixture f; f.build(); REQUIRE_EQ(f.start(), RAD_OK); f.submit(128, 0);
+        const RadBatch* batch = nullptr;
+        bool lease = false, finished = false;
+        const int rc = f.sch.step_quiescent([&] {
+            lease = true;
+            if (outcome == 1) return int(RAD_E_DEVICE);
+            if (outcome == 2) throw 42;
+            if (outcome == 3) f.kv.fail_next_ensure = RAD_E_DEVICE;
+            return int(RAD_OK);
+        }, &batch, [&] { CHECK(lease); lease = false; finished = true; });
+        CHECK(finished); CHECK(!lease);
+        CHECK_EQ(rc, outcome == 0 ? RAD_OK : outcome == 2 ? RAD_E_STATE : RAD_E_DEVICE);
+        CHECK_EQ(batch != nullptr, outcome == 0);
+    }
+}
+
 TEST(quiescent_planning_runs_before_prefix_adoption_or_page_allocation_and_refuses_without_mutation) {
     Fixture f;
     f.build(64, 8, 64, 4096, false, false);

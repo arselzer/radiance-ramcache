@@ -15,6 +15,7 @@
 #include <cstring>
 #include <string>
 #include <numeric>
+#include <new>
 #include <string>
 
 namespace rad {
@@ -2322,6 +2323,7 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
          * running, no other path would reclaim from it and the request would wait forever. */
         int rounds = 0;
         while (kv_->ensure_from(r.id, r.n_computed + want, r.n_computed) < 0) {
+            if (kv_->allocation_error() < 0) return kv_->allocation_error();
             if (++rounds > kEvictRounds || !cfg_.prefix_cache || pc_->evict(kEvictBlocks) <= 0) {
                 rc = RAD_E_NOMEM;
                 break;
@@ -2514,18 +2516,29 @@ const RadBatch* Scheduler::step() {
     return step_locked();
 }
 
-int Scheduler::step_quiescent(const std::function<int()>& before_plan, const RadBatch** out) {
+int Scheduler::step_quiescent(const std::function<int()>& before_plan, const RadBatch** out,
+                              const std::function<void()>& after_plan) {
     if (!out) return RAD_E_INVAL;
     *out = nullptr;
     if (!before_plan) return RAD_E_INVAL;
     std::lock_guard<std::mutex> lk(mu_);
-    const int rc = before_plan();
-    if (rc < 0) return rc;
-    *out = step_locked();
-    return RAD_OK;
+    if (kv_->allocation_error() < 0) return kv_->allocation_error();
+    struct Finish {
+        const std::function<void()>& f;
+        ~Finish() noexcept { if (f) f(); }
+    } finish{after_plan};
+    try {
+        const int rc = before_plan();
+        if (rc < 0) return rc;
+        *out = step_locked();
+        if (kv_->allocation_error() < 0) { *out = nullptr; return kv_->allocation_error(); }
+        return RAD_OK;
+    } catch (const std::bad_alloc&) { *out = nullptr; return RAD_E_NOMEM; }
+      catch (...) { *out = nullptr; return RAD_E_STATE; }
 }
 
 const RadBatch* Scheduler::step_locked() {
+    if (kv_->allocation_error() < 0) return nullptr;
     /* A cycle opens here, so its head depth is chosen here (scheduler.h, draft_cycle). */
     draft_cycle();
 
@@ -2878,6 +2891,7 @@ replan:
         int evict_rounds = 0;
         bool failed = false, yielded = false;
         while (kv_->ensure_from(r.id, r.n_computed + want, r.n_computed) < 0) {
+            if (kv_->allocation_error() < 0) return nullptr;
             /* The cache gives blocks back before a running request does: a cached prefix saves
              * work done once, a running request is work in flight. Nothing else releases the
              * cache's references, so this also keeps publishing from leaking. */
@@ -3006,6 +3020,7 @@ replan:
                     ? share_tok : 0;
             admit_full_ = 0;
             const int as = admit_one(s, budget, areserve);
+            if (kv_->allocation_error() < 0) return nullptr;
             if (as == kAdmitWait) { ++at; continue; }
             /* An overdue preempted prefill on an idle engine that still cannot be admitted will
              * not become admissible by waiting: nothing is running to finish and free the pool.
@@ -3195,6 +3210,9 @@ replan:
         lost_restore = true;
     }
 
+    /* No page table upload or queued copy may follow a fatal physical mapping error, including
+     * one encountered by prefix restore/adopt or an opportunistic chunk enlargement. */
+    if (kv_->allocation_error() < 0) return nullptr;
     step_start_ = std::chrono::steady_clock::now();
     const RadBatch* b = lost_restore ? nullptr : builder_.build(plan_, *kv_, step_);
     if (!b) {

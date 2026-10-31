@@ -322,6 +322,11 @@ TEST(host_expert_pool_packed_jobs_match) {
     for (int r = 0; r < 3; ++r) CHECK(got[(size_t)r + 1] == want[(size_t)r]);
     CHECK(got[4] == want[2]);
     CHECK_EQ(p->backlog(), (int64_t)0);
+    const char* stream = std::getenv("RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_STREAM_DECODE");
+    const bool requested_stream = stream && !std::strcmp(stream, "1");
+    CHECK_EQ(p->stream_decode(), requested_stream);
+    // Includes a native packed single-row job with full fast rounds; the flag must not be a no-op.
+    CHECK_EQ(p->stream_decode_used(), requested_stream);
     /* Refused: a slot a byte short, the weights' slots swapped (another shape), scales beside a packed
      * slot, and block bytes called packed. */
     HostExpertPool::Ticket t2;

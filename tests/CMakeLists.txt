@@ -294,16 +294,32 @@ endforeach()
 # bitmap), whose rows must be the reference's as well. The plain entry states the switch off.
 rad_unit_test(host_expert_pool_test_lean host_expert_pool_test)
 set_property(TEST host_expert_pool_test APPEND PROPERTY ENVIRONMENT
-             "RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_LEAN_TILES=0")
+             "RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_LEAN_TILES=0"
+             "RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_STREAM_DECODE=0")
 set_property(TEST host_expert_pool_test_lean APPEND PROPERTY ENVIRONMENT
-             "RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_LEAN_TILES=1")
+             "RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_LEAN_TILES=1"
+             "RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_STREAM_DECODE=0")
 # ...and once with the wake-up's switches off: the binary sets ..._PREWAKE=2 for its pre-wake case,
 # so the plain entries would otherwise never run the reference cases on the pool as it runs by default.
 rad_unit_test(host_expert_pool_test_wake_off host_expert_pool_test)
 set_property(TEST host_expert_pool_test_wake_off APPEND PROPERTY ENVIRONMENT
              "RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_LEAN_TILES=0"
+             "RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_STREAM_DECODE=0"
              "RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_PREWAKE=0"
              "RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_FUTEX=0")
+
+# The stream prototype changes ONLY native single-row full fast rounds. These focused aliases
+# retain packed/ggml/multirow comparisons and require proof of an actual direct-consumer use.
+rad_unit_test(host_expert_pool_test_stream host_expert_pool_test
+              host_expert_pool_packed_jobs_match host_expert_pool_many_row_jobs_match)
+set_property(TEST host_expert_pool_test_stream APPEND PROPERTY ENVIRONMENT
+             "RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_LEAN_TILES=0"
+             "RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_STREAM_DECODE=1")
+rad_unit_test(host_expert_pool_test_stream_lean host_expert_pool_test
+              host_expert_pool_packed_jobs_match host_expert_pool_many_row_jobs_match)
+set_property(TEST host_expert_pool_test_stream_lean APPEND PROPERTY ENVIRONMENT
+             "RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_LEAN_TILES=1"
+             "RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_STREAM_DECODE=1")
 
 # ================================================================== perf_ cases
 #

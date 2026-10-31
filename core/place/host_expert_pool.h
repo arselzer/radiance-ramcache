@@ -165,6 +165,10 @@ public:
      * clears, instead of all 128 slot headers. Counted per worker (lean_stats): tiles claimed, the
      * slots the scans that claimed them looked at, and the tiles that laid x out or reused it. */
     bool    lean() const { return lean_; }
+    /* Captured once at pool construction. One-row native full fast rounds only; no new layouts
+     * or per-job storage, and the first actual use is logged once per pool. */
+    bool    stream_decode() const { return stream_decode_; }
+    bool    stream_decode_used() const { return stream_seen_.load(std::memory_order_relaxed); }
     struct LeanStats { uint64_t claims = 0, scanned = 0, lanes_built = 0, lanes_reused = 0; };
     LeanStats lean_stats() const;
     double  cpu_bytes_per_ns() const { return cpu_bpns_; }
@@ -270,6 +274,7 @@ private:
      * it, laid out again only when its last tile was of another job or projection. */
     void lanes_gemv(const Slot& s, bool down, const ds41hx::Mx& m, const uint16_t* const* xs,
                     uint16_t* const* ys, int rows, int n0, int n1);
+    void stream_used(bool used);
 
     std::unique_ptr<Slot[]> slots_;
     std::unique_ptr<uint16_t, void (*)(void*)> rows_{ nullptr, nullptr };   /* the slots' row buffers */
@@ -325,6 +330,8 @@ private:
      * its own: every claim reads it, every submit and job end writes it); and each worker's
      * counts, written by that worker alone. */
     bool lean_ = false;
+    bool stream_decode_ = false;
+    std::atomic<bool> stream_seen_{ false };
     alignas(64) std::atomic<uint64_t> active_[kSlots / 64] = {};
     struct alignas(64) WorkerCounts {
         std::atomic<uint64_t> claims{ 0 }, scanned{ 0 }, built{ 0 }, reused{ 0 };

@@ -456,6 +456,48 @@ inline float wave_sum4(__m256 (&acc)[4]) {
     return _mm_cvtss_f32(_mm_add_ss(_mm256_castps256_ps128(s), _mm256_extractf128_ps(s, 1)));   /* 0+1 */
 }
 
+/* Native planar codes only: callback j contains values4j..4j+3. Decode the exact same fp16
+ * bit patterns as kv_pair16, then consume in INCREASING value order. The old producer stores
+ * 4j,4j+2,4j+1,4j+3; that store order cannot be used as an accumulation order.
+ * Each pair's groups have independent sums; the original fold joins all four afterwards.
+ * No FMA, extra partial sum, new eligibility or numeric domain. */
+HX_INLINE void kv_pair16_consume(const uint8_t* ca, const uint8_t* cb, __m256i s8,
+                                 const float* xr, int group, __m256& acc_a, __m256& acc_b) {
+    const __m256i lut = _mm256_setr_epi8(-128, 0x3C, 0x40, 0x42, 0x44, 0x46, 0x48, 0x4A,
+                                         -128, -68, -64, -62, -60, -58, -56, -54,
+                                         -128, 0x3C, 0x40, 0x42, 0x44, 0x46, 0x48, 0x4A,
+                                         -128, -68, -64, -62, -60, -58, -56, -54);
+    const __m256i lo4 = _mm256_set1_epi8(15), zero = _mm256_setzero_si256();
+    transpose_pair<false>(ca, cb, [&](int j, __m256i r) __attribute__((always_inline)) {
+        const __m256i lo = _mm256_adds_epi8(_mm256_shuffle_epi8(lut, _mm256_and_si256(r, lo4)), s8);
+        const __m256i hi = _mm256_adds_epi8(_mm256_shuffle_epi8(lut, _mm256_and_si256(_mm256_srli_epi16(r, 4), lo4)), s8);
+        auto consume = [&](int v, __m256i h) __attribute__((always_inline)) {
+            const __m256 wa = _mm256_cvtph_ps(_mm256_castsi256_si128(h));
+            const __m256 wb = _mm256_cvtph_ps(_mm256_extracti128_si256(h, 1));
+            const float* xv = xr + (size_t)v * 32 + group * 8;
+            acc_a = _mm256_add_ps(acc_a, _mm256_mul_ps(_mm256_load_ps(xv), wa));
+            acc_b = _mm256_add_ps(acc_b, _mm256_mul_ps(_mm256_load_ps(xv + 8), wb));
+        };
+        consume(4 * j,     _mm256_unpacklo_epi8(zero, lo));
+        consume(4 * j + 1, _mm256_unpacklo_epi8(zero, hi));
+        consume(4 * j + 2, _mm256_unpackhi_epi8(zero, lo));
+        consume(4 * j + 3, _mm256_unpackhi_epi8(zero, hi));
+    });
+}
+
+/* A full native round only. Reuse the old predicate and exact old general-round fallback. */
+HX_INLINE bool add_stream_round(__m256 (&acc)[4], const uint8_t* const (&gc)[4],
+                                const uint8_t* const (&gs)[4], const float* xr) {
+    const __m256i e01 = e_pair<false>(gs[0], gs[1]), e23 = e_pair<false>(gs[2], gs[3]);
+    if (!fast_round(e01, e23)) {
+        general_round<false>(acc, gc, gs, 4, xr);
+        return false;
+    }
+    kv_pair16_consume(gc[0], gc[1], s8_of(e01), xr, 0, acc[0], acc[1]);
+    kv_pair16_consume(gc[2], gc[3], s8_of(e23), xr, 2, acc[2], acc[3]);
+    return true;
+}
+
 /* gemv_avx2_t on x's lanes as x_lanes lays them out (R * 1024 floats at xt). */
 template <bool kGgml>
 void gemv_xt_t(const Mx& w, const float* xt, uint16_t* y, int n0, int n1) {
@@ -476,15 +518,20 @@ void gemv_xt_t(const Mx& w, const float* xt, uint16_t* y, int n0, int n1) {
     }
 }
 
+bool gemv_stream_xt(const Mx& w, const float* xt, uint16_t* y, int n0, int n1);
+
 template <bool kGgml>
-void gemv_avx2_t(const Mx& w, const uint16_t* x, uint16_t* y, int n0, int n1) {
+bool gemv_avx2_t(const Mx& w, const uint16_t* x, uint16_t* y, int n0, int n1, bool stream = false) {
     const int UK = w.K / 32, R = (UK + 31) / 32;
     struct alignas(32) X8 { float f[8]; };
     thread_local std::vector<X8> xbuf;
     xbuf.resize((size_t)R * 128);
     float* const xt = xbuf.data()->f;
     x_lanes(x, UK, xt);
+    // Share the existing native one-row storage; the prototype adds no retained TLS buffer.
+    if (!kGgml && stream) return gemv_stream_xt(w, xt, y, n0, n1);
     gemv_xt_t<kGgml>(w, xt, y, n0, n1);
+    return false;
 }
 
 /* ---- several token rows of one matrix ---- */
@@ -615,14 +662,51 @@ void gemv_pk_xt(const Mx& w, const float* xt, uint16_t* y, int n0, int n1) {
     }
 }
 
-void gemv_avx2_pk(const Mx& w, const uint16_t* x, uint16_t* y, int n0, int n1) {
+bool gemv_avx2_pk(const Mx& w, const uint16_t* x, uint16_t* y, int n0, int n1, bool stream = false) {
     const int UK = w.K / 32, R = (UK + 31) / 32;
     struct alignas(32) X8 { float f[8]; };
     thread_local std::vector<X8> xbuf;
     xbuf.resize((size_t)R * 128);
     float* const xt = xbuf.data()->f;
     x_lanes(x, UK, xt);
+    if (stream) return gemv_stream_xt(w, xt, y, n0, n1);
     gemv_pk_xt(w, xt, y, n0, n1);
+    return false;
+}
+
+/* Same row/round loop as gemv_pk_xt/gemv_xt_t<false>. Only full native fast rounds choose the
+ * direct consumer. Raw packed scales are still selected by the old cursor; any general scale
+ * uses general_round and EVERY partial round uses the original add_tail unchanged. */
+bool gemv_stream_xt(const Mx& w, const float* xt, uint16_t* y, int n0, int n1) {
+    const int UK = w.K / 32, R = (UK + 31) / 32, RF = UK / 32, tail = UK % 32;
+    const size_t PB = (size_t)(8 * RF + (tail + 3) / 4);
+    PkRounds ex = w.pk ? pk_rounds_from(w, (uint32_t)n0 * (uint32_t)R) : PkRounds{};
+    alignas(32) uint8_t sb[32];
+    bool used = false;
+    for (int n = n0; n < n1; ++n) {
+        const uint8_t* const codes = w.codes + (size_t)n * (size_t)(w.K / 2);
+        __m256 acc[4] = { _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps() };
+        for (int r = 0; r < RF; ++r) {
+            const uint8_t* const s = w.pk
+                ? pk_round(ex, (uint32_t)n * (uint32_t)R + (uint32_t)r, w.pk + (size_t)n * PB + (size_t)8 * r, 32, w.e0, sb)
+                : w.scales + (size_t)n * UK + (size_t)r * 32;
+            const size_t u0 = (size_t)r * 32;
+            const uint8_t* const gc[4] = { codes + u0 * 16, codes + (u0 + 8) * 16,
+                                          codes + (u0 + 16) * 16, codes + (u0 + 24) * 16 };
+            const uint8_t* const gs[4] = { s, s + 8, s + 16, s + 24 };
+            // Do not short-circuit: every later round still executes when used is already true.
+            const bool direct = add_stream_round(acc, gc, gs, xt + (size_t)r * 1024);
+            used = direct || used;
+        }
+        if (RF < R) {
+            const uint8_t* const s = w.pk
+                ? pk_round(ex, (uint32_t)n * (uint32_t)R + (uint32_t)RF, w.pk + (size_t)n * PB + (size_t)8 * RF, tail, w.e0, sb)
+                : w.scales + (size_t)n * UK + (size_t)RF * 32;
+            add_tail<false>(acc, codes + (size_t)RF * 32 * 16, s, 0, tail, xt + (size_t)RF * 1024);
+        }
+        y[n] = bf16_rne_nan(wave_sum4(acc));
+    }
+    return used;
 }
 
 /* gemv_avx2_rows_pk on the rows' lanes (gemv_rows_xt_t's). */
@@ -1120,6 +1204,23 @@ void gemv_avx2(const Mx& w, const uint16_t* x, uint16_t* y, int n0, int n1) {
     if (w.blocks) gemv_avx2_t<true>(w, x, y, n0, n1);
     else if (w.pk) gemv_avx2_pk(w, x, y, n0, n1);
     else gemv_avx2_t<false>(w, x, y, n0, n1);
+}
+
+bool gemv_avx2_stream_lanes(const Mx& w, const float* xt, uint16_t* y, int n0, int n1) {
+    if (w.blocks) {
+        gemv_xt_t<true>(w, xt, y, n0, n1);
+        return false;
+    }
+    return gemv_stream_xt(w, xt, y, n0, n1);
+}
+
+bool gemv_avx2_stream(const Mx& w, const uint16_t* x, uint16_t* y, int n0, int n1) {
+    if (w.blocks) {
+        gemv_avx2(w, x, y, n0, n1);
+        return false;
+    }
+    if (w.pk) return gemv_avx2_pk(w, x, y, n0, n1, true);
+    return gemv_avx2_t<false>(w, x, y, n0, n1, true);
 }
 
 void gemv_avx2_few(const Mx& w, const uint16_t* const* x, uint16_t* const* y, int rows, int n0, int n1) {

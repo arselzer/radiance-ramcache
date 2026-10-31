@@ -37,6 +37,7 @@ constexpr const char* kEnvSpin    = "RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_SPI
 constexpr const char* kEnvNice    = "RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_NICE";
 constexpr const char* kEnvMaxRows = "RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_MAX_ROWS";
 constexpr const char* kEnvLean    = "RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_LEAN_TILES";
+constexpr const char* kEnvStream  = "RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_STREAM_DECODE";
 constexpr const char* kEnvFutex   = "RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_FUTEX";
 constexpr const char* kEnvPrewake = "RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_PREWAKE";
 constexpr const char* kEnvPreSpin = "RADIANCE_EXPERIMENTAL_DS41_HOST_EXPERTS_PREWAKE_SPIN_US";
@@ -172,7 +173,13 @@ HostExpertPool* HostExpertPool::get() {
                     kEnvPreSpin, kEnvPreLead);
             return nullptr;
         }
+        long stream = 0;
+        if (!env_num(kEnvStream, 0, 0, 1, &stream)) {
+            RAD_ERR("host experts: %s takes 0 or 1; host experts off", kEnvStream);
+            return nullptr;
+        }
         auto* p = new HostExpertPool();
+        p->stream_decode_ = stream == 1;
         p->futex_ = fx == 1;
         p->prewake_n_ = (int)std::min<long>(pw, threads);
         p->prewake_spin_ns_ = (int64_t)ps * 1000;
@@ -224,6 +231,9 @@ HostExpertPool* HostExpertPool::get() {
         if (p->lean_)
             RAD_INFO("host experts: lean tiles: a worker reuses the x lanes of its last tile on a tile of the "
                      "same job and projection, and claims look only at the slots holding a job (%s)", kEnvLean);
+        if (p->stream_decode_)
+            RAD_INFO("host experts: native one-row full fast rounds decode directly to the original MACs (%s)",
+                     kEnvStream);
         g_running.store(p, std::memory_order_release);
         return p;
     }();
@@ -502,7 +512,16 @@ void HostExpertPool::lanes_gemv(const Slot& s, bool down, const ds41hx::Mx& m, c
     } else if (t_counts_) {
         bump(t_counts_->reused);
     }
-    ds41hx::gemv_avx2_few_lanes(m, l.buf.data()->f, ys, rows, n0, n1);
+    if (stream_decode_ && rows == 1 && !m.blocks)
+        stream_used(ds41hx::gemv_avx2_stream_lanes(m, l.buf.data()->f, ys[0], n0, n1));
+    else
+        ds41hx::gemv_avx2_few_lanes(m, l.buf.data()->f, ys, rows, n0, n1);
+}
+
+void HostExpertPool::stream_used(bool used) {
+    if (used && !stream_seen_.load(std::memory_order_relaxed) &&
+        !stream_seen_.exchange(true, std::memory_order_relaxed))
+        RAD_INFO("DS41HX_STREAM first_use rows=1 native_fast_round=1 arithmetic=mul_add fallback=unchanged");
 }
 
 HostExpertPool::LeanStats HostExpertPool::lean_stats() const {
@@ -541,6 +560,8 @@ void HostExpertPool::tile(Slot& s, uint32_t gen, int k) {
         for (int r = 0; r <= s.job.more; ++r) { xs[r] = r ? s.job.xs[r - 1] : s.job.x; ys[r] = s.gate_up + (size_t)r * 2 * kFf; }
         if (lanes)
             lanes_gemv(s, false, m, xs, ys, 1 + s.job.more, k * kTile, (k + 1) * kTile);
+        else if (stream_decode_ && s.job.more == 0 && !m.blocks)
+            stream_used(ds41hx::gemv_avx2_stream(m, xs[0], ys[0], k * kTile, (k + 1) * kTile));
         else
             (1 + s.job.more >= many_from() ? ds41hx::gemv_avx2_many : ds41hx::gemv_avx2_few)(m, xs, ys, 1 + s.job.more,
                                                                                              k * kTile, (k + 1) * kTile);
@@ -570,6 +591,8 @@ void HostExpertPool::tile(Slot& s, uint32_t gen, int k) {
     for (int r = 0; r <= s.job.more; ++r) { xs[r] = s.act + (size_t)r * kFf; ys[r] = r ? s.job.ys[r - 1] : s.job.y; }
     if (lanes)
         lanes_gemv(s, true, m, xs, ys, 1 + s.job.more, d * kTile, (d + 1) * kTile);
+    else if (stream_decode_ && s.job.more == 0 && !m.blocks)
+        stream_used(ds41hx::gemv_avx2_stream(m, xs[0], ys[0], d * kTile, (d + 1) * kTile));
     else
         (1 + s.job.more >= many_from() ? ds41hx::gemv_avx2_many : ds41hx::gemv_avx2_few)(m, xs, ys, 1 + s.job.more,
                                                                                          d * kTile, (d + 1) * kTile);

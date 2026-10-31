@@ -116,6 +116,12 @@ void gemv_ref(const Mx& w, const uint16_t* x, uint16_t* y, int n0, int n1);
 /* The same bits, AVX2: eight rows at once, one row a vector lane. n0 and n1 multiples of 8.
  * Every layout, the packed one included. */
 void gemv_avx2(const Mx& w, const uint16_t* x, uint16_t* y, int n0, int n1);
+/* Default-off prototype, selected explicitly by the pool only for one token row. Planar/packed
+ * full fast rounds decode directly into the SAME ordered MACs; general rounds, tails and ggml
+ * use their original path. Return true iff a full round actually used the direct consumer.
+ * No environment access. The lanes form takes few_lanes' aligned, halved/transposed x. */
+bool gemv_avx2_stream(const Mx& w, const uint16_t* x, uint16_t* y, int n0, int n1);
+bool gemv_avx2_stream_lanes(const Mx& w, const float* xt, uint16_t* y, int n0, int n1);
 /* gemv_avx2 for `rows` token rows of one matrix, x[r] -> y[r], each with gemv_avx2's bits: up to
  * kFewRows rows through gemv_avx2_few, more through gemv_avx2_many. */
 void gemv_avx2_rows(const Mx& w, const uint16_t* const* x, uint16_t* const* y, int rows, int n0, int n1);

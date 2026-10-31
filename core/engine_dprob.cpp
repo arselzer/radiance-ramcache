@@ -102,23 +102,22 @@ int Engine::dmeasure_ready(const RadBatch* batch) {
                 (unsigned long long)row.seq);
         return RAD_E_STATE;
     }
+    uint32_t invalid_depths = 0;
     for (int j = 0; j < rad_dflash_observe::kDepths; ++j) {
         const float* obs = dprob_host_ + j * rad_dflash_observe::kFields;
-        if (!std::isfinite(obs[rad_dflash_observe::kCandidateP]) ||
-            obs[rad_dflash_observe::kCandidateP] < 0 || obs[rad_dflash_observe::kCandidateP] > 1 ||
-            !std::isfinite(obs[rad_dflash_observe::kScore]) ||
-            std::isnan(obs[rad_dflash_observe::kMargin]) || obs[rad_dflash_observe::kMargin] < 0 ||
-            obs[rad_dflash_observe::kToken] != (float)slot.tok[j + 1] ||
-            obs[rad_dflash_observe::kPredecessor] != (float)slot.tok[j]) {
-            RAD_ERR("DSpark matched early verify: observation/path binding failed at depth %d", j + 1);
+        const DraftMeasureSignal signal = draft_measure_signal(obs, slot.tok[j + 1], slot.tok[j]);
+        if (signal == DraftMeasureSignal::PathMismatch) {
+            RAD_ERR("DSpark matched early verify: echoed observation/path IDs differ at depth %d", j + 1);
             return RAD_E_STATE;
         }
+        if (signal == DraftMeasureSignal::InvalidNumeric) invalid_depths |= 1u << j;
     }
     DraftMeasureFrame frame;
     frame.seq = row.seq; frame.card = row.card; frame.step = batch->step;
     frame.epoch = sched_.draft_prob_reserve_epoch();
     frame.ctx = slot.ctx; frame.anchor = slot.tok[0];
     frame.k = draft_experiment_.early_verify(); frame.query_rows = dmeasure_query_rows_;
+    frame.invalid_depths = invalid_depths;
     frame.ready_ns = ready; frame.wait_ns = ready - begin;
     std::copy(slot.tok + 1, slot.tok + 1 + block_steps_, frame.ids);
     const StepPlan& plan = sched_.plan();
@@ -153,21 +152,25 @@ void Engine::dmeasure_finish(const StepOut& so) {
     if (draft_experiment_.prob_capture() && closing)
         RAD_INFO("DSpark matched early cycle: {\"seq\":%llu,\"epoch\":%llu,\"verify_step\":%d,"
                  "\"next_epoch\":%llu,\"k\":%d,\"cycle_ns\":%llu,\"wait_ns\":%llu,"
-                 "\"steady\":%s,\"live\":%s,\"published\":%s,\"accepted\":%d}",
+                 "\"steady\":%s,\"live\":%s,\"published\":%s,\"accepted\":%d,"
+                 "\"proposal_invalid_depths\":%u,\"next_invalid_depths\":%u}",
                  (unsigned long long)previous.seq, (unsigned long long)previous.epoch, current.step,
                  (unsigned long long)current.epoch, previous.k, (unsigned long long)cycle_ns,
                  (unsigned long long)current.wait_ns, counted ? "true" : "false",
-                 committed && live ? "true" : "false", published ? "true" : "false", accepted);
+                 committed && live ? "true" : "false", published ? "true" : "false", accepted,
+                 (unsigned)previous.invalid_depths, (unsigned)current.invalid_depths);
 }
 
 void Engine::dmeasure_report() const {
     if (draft_experiment_.early_verify() < 0) return;
     const DraftMeasureStats& s = dmeasure_.stats;
     RAD_INFO("DSpark matched early totals: queries=%llu query_rows=%llu observers=%llu waits=%llu "
-             "wait_ns=%llu transition=%llu no_query=%llu end_cancel=%llu unpublished=%llu unclosed_epoch=%llu",
+             "wait_ns=%llu transition=%llu no_query=%llu end_cancel=%llu unpublished=%llu "
+             "invalid_queries=%llu invalid_cycles=%llu unclosed_epoch=%llu",
              (unsigned long long)s.queries, (unsigned long long)s.query_rows, (unsigned long long)s.queries,
              (unsigned long long)s.waits, (unsigned long long)s.wait_all_ns, (unsigned long long)s.transition,
              (unsigned long long)s.no_query, (unsigned long long)s.end_cancel, (unsigned long long)s.unpublished,
+             (unsigned long long)s.invalid_queries, (unsigned long long)s.invalid_cycles,
              (unsigned long long)dmeasure_.pending.epoch);
     for (int k = 0; k < 3; ++k)
         RAD_INFO("DSpark matched early costs: k=%d n=%llu cycle_ns=%llu wait_ns=%llu accepted=%llu emitted=%llu "

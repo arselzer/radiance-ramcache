@@ -3,8 +3,22 @@
  * earlier frame's seq/epoch/k and covers that verify plus the following query/observer/wait.
  */
 #pragma once
+#include "../../arch/common/rad_dflash_observe.h"
+#include <cmath>
 #include <cstdint>
 namespace rad {
+enum class DraftMeasureSignal { Valid, InvalidNumeric, PathMismatch };
+/* Present depths ALWAYS echo the selected IDs, even when scores are invalid; only missing
+ * depths keep -1 IDs. Controls require at least2 query rows, so a missing-depth sentinel here
+ * is a binding failure, not the observer's numerical-invalid contract. Never use scores for k. */
+inline DraftMeasureSignal draft_measure_signal(const float* x, int32_t token, int32_t predecessor) {
+    using namespace rad_dflash_observe;
+    if (x[kToken] != (float)token || x[kPredecessor] != (float)predecessor)
+        return DraftMeasureSignal::PathMismatch;
+    return std::isfinite(x[kCandidateP]) && x[kCandidateP] >= 0 && x[kCandidateP] <= 1 &&
+           std::isfinite(x[kScore]) && !std::isnan(x[kMargin]) && x[kMargin] >= 0
+         ? DraftMeasureSignal::Valid : DraftMeasureSignal::InvalidNumeric;
+}
 /* The native DSpark chain's full5 or fixed-from1 shorter query, never a cap-sized query. */
 inline bool draft_measure_profile(int64_t short_from, int64_t full_rows, int64_t depth,
                                   int64_t short_rows) noexcept {
@@ -15,12 +29,14 @@ struct DraftMeasureFrame {
     uint64_t seq = 0, epoch = 0, ready_ns = 0, wait_ns = 0, output = 0;
     int step = -1, card = -1, k = -1, query_rows = 0;
     int32_t ctx = -1, anchor = -1, ids[5] = {};
+    uint32_t invalid_depths = 0; // numeric-invalid observer depth bits; never changes k/publication
     bool pure_decode = false;
 };
 struct DraftMeasureStats {
     uint64_t n[3] = {}, ns[3] = {}, wait_ns[3] = {}, accepted[3] = {}, emitted[3] = {};
     uint64_t queries = 0, query_rows = 0, waits = 0, wait_all_ns = 0;
     uint64_t transition = 0, no_query = 0, end_cancel = 0, unpublished = 0;
+    uint64_t invalid_queries = 0, invalid_cycles = 0;
 };
 struct DraftMeasure {
     DraftMeasureFrame pending{}, current{}, closing{};
@@ -35,6 +51,7 @@ struct DraftMeasure {
         current = frame;
         ++stats.queries; stats.query_rows += frame.query_rows;
         ++stats.waits; stats.wait_all_ns += frame.wait_ns;
+        if (frame.invalid_depths) ++stats.invalid_queries;
         close = false;
         if (pending.epoch) {
             if (!previous_matches || !pending.pure_decode || !frame.pure_decode ||
@@ -52,6 +69,7 @@ struct DraftMeasure {
         if (close) {
             if (!live) ++stats.end_cancel;
             else if (!published) ++stats.unpublished;
+            else if (closing.invalid_depths || current.invalid_depths) ++stats.invalid_cycles;
             else if (closing.k < 0 || closing.k > 2 || accepted < 0 || accepted > closing.k ||
                      output < closing.output || output - closing.output != (uint64_t)(1 + accepted))
                 ++stats.transition;

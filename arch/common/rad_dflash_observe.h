@@ -10,7 +10,9 @@
  * exactly in F32 (the observer refuses vocabularies above 2^24). Score/margin/p are NaN when the
  * selected ID is not the selector's argmax, any score is nonfinite, candidates repeat, or IDs
  * are out of range. The output must not alias any input.
- * Missing depths have NaN signals and ID -1. margin is selected score minus the largest OTHER
+ * Present depths always echo the selected/predecessor IDs, even when signals are invalid;
+ * numerical invalidity alone is not evidence of a stale proposal. Missing depths have NaN
+ * signals and both IDs -1. margin is selected score minus the largest OTHER
  * candidate score (positive infinity for a singleton set). No value feeds a model or policy.
  */
 #pragma once

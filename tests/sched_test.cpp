@@ -10389,6 +10389,63 @@ TEST(dspark_matched_early_meter_excludes_transitions_caps_end_and_cancel) {
     CHECK_EQ(m.stats.transition, (uint64_t)1); CHECK_EQ(m.stats.n[1], (uint64_t)0);
 }
 
+TEST(dspark_matched_early_invalid_numeric_signals_preserve_ids_and_fixed_prefixes) {
+    const float good[5] = { .8f, 2, 1, 7, 6 };
+    CHECK(draft_measure_signal(good, 7, 6) == DraftMeasureSignal::Valid);
+    for (int field = 0; field < 3; ++field) {
+        float bad[5]; std::copy(good, good + 5, bad); bad[field] = NAN;
+        CHECK(draft_measure_signal(bad, 7, 6) == DraftMeasureSignal::InvalidNumeric);
+        /* Numerical invalidity does not excuse a stale/missing echo. Present depths always
+         * write both IDs; the -1/-1 sentinel belongs only to an absent depth. */
+        CHECK(draft_measure_signal(bad, 8, 6) == DraftMeasureSignal::PathMismatch);
+        bad[3] = bad[4] = -1;
+        CHECK(draft_measure_signal(bad, 7, 6) == DraftMeasureSignal::PathMismatch);
+    }
+    for (float p : { -1.f, 2.f, INFINITY, -INFINITY }) {
+        float bad[5]; std::copy(good, good + 5, bad); bad[0] = p;
+        CHECK(draft_measure_signal(bad, 7, 6) == DraftMeasureSignal::InvalidNumeric);
+    }
+    float edge[5]; std::copy(good, good + 5, edge); edge[2] = INFINITY;
+    CHECK(draft_measure_signal(edge, 7, 6) == DraftMeasureSignal::Valid); // singleton margin
+    edge[2] = -1;
+    CHECK(draft_measure_signal(edge, 7, 6) == DraftMeasureSignal::InvalidNumeric);
+    edge[2] = 1; edge[1] = INFINITY;
+    CHECK(draft_measure_signal(edge, 7, 6) == DraftMeasureSignal::InvalidNumeric);
+    for (int k = 0; k <= 2; ++k) {
+        const std::string value = std::to_string(k);
+        const auto x = DraftExperiment::capture(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                                                nullptr, "1", value.c_str());
+        Fixture f; f.build(); f.cfg.max_seqs = 1;
+        dspark_group(f, 4096, false, false);
+        CHECK_OK(f.start(&x));
+        const auto id = f.submit(4, 30);
+        REQUIRE(f.sch.step()); f.commit_plain(6);
+        const int32_t tokens[] = { 7, 8 };
+        const float invalid[10] = { NAN, NAN, NAN, 7, 6, NAN, NAN, NAN, 8, 7 };
+        CHECK_OK(f.sch.set_draft(id, tokens, 2));
+        f.sch.draft_prob_publish(id, f.sch.find(id)->n_computed, 6, tokens, 2, invalid, true, 16);
+        REQUIRE(f.sch.step()); CHECK_EQ(f.sch.plan().e[0].n_spec, k);
+        CHECK_OK(f.commit(9));
+        CHECK(f.sch.find(id)->output == std::vector<int32_t>({ 6, 9 }));
+        CHECK_EQ(f.sch.draft_prob_stats().verified, (uint64_t)k);
+        CHECK_EQ(x.runtime_depth(2), k); CHECK(!x.compute_off());
+        DraftMeasure m;
+        DraftMeasureFrame frame; frame.seq = id; frame.card = 0; frame.k = k;
+        frame.query_rows = 2; frame.pure_decode = true; frame.epoch = 1; frame.ready_ns = 100;
+        m.ready(frame, false); CHECK(!m.committed(true, true, 0, 0));
+        frame.epoch++; frame.ready_ns += 100; frame.invalid_depths = 3;
+        m.ready(frame, true); CHECK(!m.committed(true, true, (uint64_t)(1 + k), k));
+        CHECK_EQ(m.pending.epoch, (uint64_t)2); // invalid scores do not suppress publication
+        frame.epoch++; frame.ready_ns += 100; frame.invalid_depths = 0;
+        m.ready(frame, true); CHECK(!m.committed(true, true, (uint64_t)(2 * (1 + k)), k));
+        frame.epoch++; frame.ready_ns += 100;
+        m.ready(frame, true); CHECK(m.committed(true, true, (uint64_t)(3 * (1 + k)), k));
+        CHECK_EQ(m.stats.queries, (uint64_t)4); CHECK_EQ(m.stats.waits, (uint64_t)4);
+        CHECK_EQ(m.stats.invalid_queries, (uint64_t)1); CHECK_EQ(m.stats.invalid_cycles, (uint64_t)2);
+        CHECK_EQ(m.stats.n[k], (uint64_t)1); CHECK_EQ(m.stats.ns[k], (uint64_t)100);
+    }
+}
+
 TEST(dspark_matched_early_normal_planning_keeps_the_cap_and_drops_context_end_queries) {
     for (int k = 0; k <= 2; ++k) {
         const std::string value = std::to_string(k);

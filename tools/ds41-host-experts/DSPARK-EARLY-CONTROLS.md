@@ -64,6 +64,15 @@ truncation, cancellation and unpublished cycles are excluded. An unclosed tail e
 separately. Queries, observer copies and waits count even when the corresponding cycle is excluded.
 End effects still belong in end-to-end arm timings; steady Ck alone does not forecast short replies.
 
+Invalid NUMERICAL observer signals do not change fixed k, query execution, publication or replies.
+The observer echoes IDs for every present depth before numerical validation; NaN/nonfinite scores,
+invalid candidate sets or an inconsistent argmax leave p/score/margin invalid while preserving
+those echoes. Such queries count as `invalid_queries`; cycles with either endpoint invalid are
+excluded from Ck as `invalid_cycles`. Both depth bits are retained (bit0=depth1, bit1=depth2).
+Ordinary Dpc records keep `signal_valid:false` and the actual verification outcome. A mismatched
+echo is still a binding failure: only MISSING depths have the -1/-1 sentinel, and these controls
+always query at least2 rows. Actual request/card/ctx/full-ID checks remain fail-fast.
+
 ## Logging and measurements
 
 Startup: `DSpark matched early verify: on k=K ... query_rows=2 ... logging=quiet|capture`.
@@ -76,6 +85,8 @@ JSON; use ordinary info logging for quiet cost arms. Existing `-v` / `RADIANCE_L
 adds proposal-ID lines and costs time. `Dpc` can accompany ALL three controls for a matched verbose
 audit: it adds ordinary proposal/outcome events plus `DSpark matched early cycle:` JSON containing
 the earlier seq/epoch/k, verifying target step, next epoch, costs, steady flag and commit status.
+It also labels `proposal_invalid_depths` and `next_invalid_depths`; quiet totals count invalid
+queries/cycles without introducing per-step log writes.
 Join that key to the ordinary capture record for IDs/position/signals. All output is in
 `<window>/<arm>.server.log`; no new trace file or service endpoint is introduced.
 
@@ -90,6 +101,7 @@ reference and compare the SAME-profile k2 early/late pair for instrumentation im
 
 Source cases added to `sched_test`: `dspark_matched_early_controls_parse_and_preserve_configured_query_depth`,
 `dspark_matched_early_meter_excludes_transitions_caps_end_and_cancel`,
+`dspark_matched_early_invalid_numeric_signals_preserve_ids_and_fixed_prefixes`,
 `dspark_matched_early_normal_planning_keeps_the_cap_and_drops_context_end_queries`, and
 `dspark_matched_early_db2_keeps_query_and_ahead_publication_prefix_consistent`.
 `ds41_dspark_defer_arch_test` adds

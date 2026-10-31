@@ -118,7 +118,9 @@ void gemv_ref(const Mx& w, const uint16_t* x, uint16_t* y, int n0, int n1);
 void gemv_avx2(const Mx& w, const uint16_t* x, uint16_t* y, int n0, int n1);
 /* Default-off prototype, selected explicitly by the pool only for one token row. Planar/packed
  * full fast rounds decode directly into the SAME ordered MACs; general rounds, tails and ggml
- * use their original path. Return true iff a full round actually used the direct consumer.
+ * use their original path. Nonfinite outputs replay the entire requested range through the
+ * original entry to preserve literal NaN payloads. Return true iff a full round actually
+ * used the direct consumer, even if an exceptional result subsequently required replay.
  * No environment access. The lanes form takes few_lanes' aligned, halved/transposed x. */
 bool gemv_avx2_stream(const Mx& w, const uint16_t* x, uint16_t* y, int n0, int n1);
 bool gemv_avx2_stream_lanes(const Mx& w, const float* xt, uint16_t* y, int n0, int n1);

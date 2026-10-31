@@ -107,6 +107,15 @@ void compare(const Matrix& m, const ds41hx::Mx& w, const std::vector<uint16_t>& 
     const auto before_x = x;
     ds41hx::gemv_avx2(w, x.data(), old.data() + 8, n0, n1);
     CHECK_EQ(ds41hx::gemv_avx2_stream(w, x.data(), now.data() + 8, n0, n1), expected_used);
+    if (now != old) {
+        static unsigned diagnostics = 0;
+        if (diagnostics++ < 12) {
+            int first = 0; while (first < (int)old.size() && now[(size_t)first] == old[(size_t)first]) ++first;
+            std::fprintf(stderr, "STREAM_BYTE_DIAGNOSTIC K=%d packed=%d e_first=%u x_first=%04x row=%d old=%04x stream=%04x csr=%08x\n",
+                         m.K, (int)(w.pk != nullptr), (unsigned)m.scales[0], (unsigned)x[0], first - 8,
+                         (unsigned)old[(size_t)first], (unsigned)now[(size_t)first], _mm_getcsr());
+        }
+    }
     CHECK(now == old);
     std::vector<Eight> xt(ds41hx::few_lanes_floats(m.K) / 8);
     const uint16_t* xs[1] = { x.data() };

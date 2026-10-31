@@ -1,6 +1,9 @@
 # Native one-row decode-to-MAC prototype
 
-Source prepared off `389bf676`. Default off, unbuilt, untested and unmeasured. This is the narrow
+Source prepared off `389bf676`. Default off; no card/model pass or performance measurement.
+Root host gate on Oct31 found literal NaN payload differences in the initial implementation;
+all six strict cases passed after the exceptional-result replay described below. Full coherent
+rebuild and remaining host/card/model gates are still required. This is the narrow
 first experiment from `/home/as/ds41-decode-review-20261028/CPU-KERNEL-NEXT.md`, not an FMA
 experiment or an adopted configuration. Root owns all serialized builds, assembly checks,
 host/card gates and model windows. Query-free work is separate.
@@ -31,6 +34,16 @@ assume raw rounds are rare, or add FMA/new partial sums. Exceptional values outs
 domain keep the exact old general path. Exceptional activations inside it retain the old half,
 FP16 decode, multiply/add and NaN behavior; correctness means bytes equal the old path, including
 that behavior, rather than a claim about a different algorithm on arbitrary NaNs/subnormals.
+
+Arithmetic order alone does not fix x86 NaN payload selection: different register allocation
+can exchange the operands selected by a commutative instruction. The initial strict scale-byte
+test exposed this (for example old0xffe5 versus stream0xffc0), with original logs preserved.
+The stream wrappers therefore inspect the resulting BF16 values without floating arithmetic.
+If any result is nonfinite, they replay the entire requested range through the original direct
+or cached-lanes public entry. This includes NaNs formed from finite inputs and large general
+scales. The original decoder selects the output bits; no NaN canonicalization or comparator
+exception is allowed. The return value still reports whether a direct full round actually ran,
+including work discarded by exceptional replay. The scan/replay cost is part of measured work.
 
 No new TLS buffer is retained: the old planar and packed single-row wrappers select the new
 consumer after building activations in their existing TLS storage. Its maximum at servedGU

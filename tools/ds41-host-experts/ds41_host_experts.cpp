@@ -1206,12 +1206,29 @@ void gemv_avx2(const Mx& w, const uint16_t* x, uint16_t* y, int n0, int n1) {
     else gemv_avx2_t<false>(w, x, y, n0, n1);
 }
 
+/* AVX add/multiply instructions may choose different source registers after a
+ * transpose/consume rewrite. IEEE NaN payload selection is then observable even
+ * with identical arithmetic order. Preserve the original entry's literal bits
+ * by replaying the whole requested range whenever a result is nonfinite. This
+ * also covers NaNs created by finite inputs and large general-path scales.
+ * No NaN canonicalization or relaxed comparison is permitted. */
+static bool stream_outputs_finite(const uint16_t* y, int n0, int n1) {
+    for (int n = n0; n < n1; ++n)
+        if ((y[n] & 0x7F80u) == 0x7F80u) return false;
+    return true;
+}
+
 bool gemv_avx2_stream_lanes(const Mx& w, const float* xt, uint16_t* y, int n0, int n1) {
     if (w.blocks) {
         gemv_xt_t<true>(w, xt, y, n0, n1);
         return false;
     }
-    return gemv_stream_xt(w, xt, y, n0, n1);
+    const bool used = gemv_stream_xt(w, xt, y, n0, n1);
+    if (!stream_outputs_finite(y, n0, n1)) {
+        uint16_t* ys[1] = { y };
+        gemv_avx2_few_lanes(w, xt, ys, 1, n0, n1);
+    }
+    return used;
 }
 
 bool gemv_avx2_stream(const Mx& w, const uint16_t* x, uint16_t* y, int n0, int n1) {
@@ -1219,8 +1236,10 @@ bool gemv_avx2_stream(const Mx& w, const uint16_t* x, uint16_t* y, int n0, int n
         gemv_avx2(w, x, y, n0, n1);
         return false;
     }
-    if (w.pk) return gemv_avx2_pk(w, x, y, n0, n1, true);
-    return gemv_avx2_t<false>(w, x, y, n0, n1, true);
+    const bool used = w.pk ? gemv_avx2_pk(w, x, y, n0, n1, true)
+                          : gemv_avx2_t<false>(w, x, y, n0, n1, true);
+    if (!stream_outputs_finite(y, n0, n1)) gemv_avx2(w, x, y, n0, n1);
+    return used;
 }
 
 void gemv_avx2_few(const Mx& w, const uint16_t* const* x, uint16_t* const* y, int rows, int n0, int n1) {

@@ -10072,7 +10072,7 @@ TEST(dspark_probability_capture_resolves_caps_supersession_and_closed_sequences)
     CHECK_EQ(f.sch.draft_prob_stats().resolved, (uint64_t)6);
     /* Recycled slot and an unrelated ID never inherit pending observations. */
     const uint64_t next = f.submit(4, 30);
-    CHECK_NE(next, id); REQUIRE(f.sch.step()); f.commit_plain();
+    CHECK(next != id); REQUIRE(f.sch.step()); f.commit_plain();
     CHECK_EQ(f.sch.draft_prob_stats().verified, (uint64_t)0);
 }
 

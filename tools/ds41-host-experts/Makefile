@@ -73,6 +73,12 @@ $(O)/ds41_kv_fast_device_check: ds41_kv_fast_device_check.hip ds41_kv_fast_oracl
 	$(HIPCC) $(HIPFLAGS) -I$(TREE)/abi -o $@ $<
 kv-fast-check: $(O)/ds41_kv_fast_device_check
 
+# Strict standalone FP8-window bytes against the actual current producer; GPU window only.
+$(O)/ds41_window_codec_device_check: ds41_window_codec_device_check.hip $(TREE)/arch/common/rad_ds41_window_codec.h
+	$(HIPCC) $(HIPFLAGS) -I$(TREE)/abi -o $@ $< -ldl
+window-codec-check: $(O)/ds41_window_codec_device_check
+.PHONY: window-codec-check
+
 clean:
 	rm -f ds41_host_experts_test ds41_dense_fp8_scan ds41_bf16f8_device_check
 

@@ -57,6 +57,11 @@ inside the stopped/restored-QFN two-lock window:
    pages, guards, ratios1/2 and mixed window/packed transpose boundaries.
    Checker exports have no registered schema/row and cannot be selected by the
    architecture. Unsupported checker calls fail the gate; no silent fallback.
+   Fused capture now covers actual heights1,7,33,49,257,2048,4096:28 completed
+   cases, normal/old/N128 norm forms plus ordinary fused rope. The PASS coverage
+   marker reports the actual count, maximum and enumerated heights; it appears
+   only after zero byte/guard differences. A pinned4096-row arm fits this bound;
+   an unpinned4096+sequence work bound does not and must remain refused.
 3. Only after those pass: one plain/packed model window on the current192GiB
    configuration: long KLD and harness Kh/replies/counts, prefix resume/COW,
    DSpark off/on, N4/N8; confirm startup and actual-path markers on every

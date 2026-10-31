@@ -135,8 +135,9 @@ bool fused_producers(void* lib) {
     const auto rope1=(Launch)dlsym(lib,"r4d_rad_rope_rows_roundtrip_kvpack");
     const auto st=(Launch)dlsym(lib,"r4d_rad_entry_store_kvpack");
     if(!norm0||!norm1||!normal0||!normal1||!rope0||!rope1||!st)return false;
-    size_t bad=0,cases=0;
-    for(int kind:{1,2}) for(int M:{1,7,33,49,257,2048}) for(int form:{-1,0,1}) {
+    size_t bad=0,cases=0; int max_m=0; unsigned norm_forms=0,rope_forms=0;
+    std::vector<int> heights;
+    for(int kind:{1,2}) for(int M:{1,7,33,49,257,2048,4096}) for(int form:{-1,0,1}) {
         if(kind==1&&form!=-1)continue;
         const int n=kind==1?512:128,G=kc::group_size((uint32_t)kind),pitch=n+16,blocks=M+2;
         const int64_t rb=kc::row_bytes((uint32_t)kind,n);
@@ -159,6 +160,9 @@ bool fused_producers(void* lib) {
         void* actual=kind==2?y1.p:dx1.p;
         std::vector<RadTensor> store={xt(actual),tensor(dc.p,RAD_U8,{M,rb}),tensor(dg.p,RAD_I32,{M}),tensor(dk.p,RAD_U8,{blocks,rb})};
         if(rc>=0)rc=call(st,store,p);HC(hipDeviceSynchronize());++cases;
+        max_m=std::max(max_m,M);
+        if(std::find(heights.begin(),heights.end(),M)==heights.end())heights.push_back(M);
+        if(kind==2)norm_forms|=1u<<(form+1);else rope_forms|=1u<<(form+1);
         const auto oldbits=kind==2?y0.get<uint16_t>(init.size()):dx0.get<uint16_t>(init.size());
         const auto newbits=kind==2?y1.get<uint16_t>(init.size()):dx1.get<uint16_t>(init.size());
         bad+=rc<0||oldbits!=newbits;const auto packed=dk.get<uint8_t>(cache.size());std::vector<uint16_t>decoded(n);
@@ -166,8 +170,15 @@ bool fused_producers(void* lib) {
             for(int c=0;c<n;++c){uint16_t v=oldbits[r*pitch+c];if((v&0x7fff)>0x7f80)v|=0x40;bad+=decoded[c]!=v;}}
         const auto captured=dc.get<uint8_t>(cap.size());for(size_t i=(size_t)M*rb;i<cap.size();++i)bad+=captured[i]!=0xa5;
     }
-    std::printf("%s packed fused rope/norm old+n128: %zu cases %zu byte failures\n",bad?"FAIL":"PASS",cases,bad);
-    return bad==0;
+    const bool pass=bad==0&&cases==28&&max_m==4096&&heights.size()==7&&norm_forms==7&&rope_forms==1;
+    std::printf("%s packed fused rope/norm old+n128: %zu cases %zu byte failures\n",pass?"PASS":"FAIL",cases,bad);
+    if(pass){
+        std::sort(heights.begin(),heights.end());
+        std::printf("PASS packed fused coverage: cases=%zu max_M=%d heights=",cases,max_m);
+        for(size_t i=0;i<heights.size();++i)std::printf("%s%d",i?",":"",heights[i]);
+        std::printf(" norm_forms=normal,old,n128 rope=normal\n");
+    }
+    return pass;
 }
 }
 int main(int argc,char**argv){

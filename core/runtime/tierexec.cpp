@@ -143,6 +143,9 @@ int TierExec::slot_layout(const std::vector<const KVManager*>& ranks,
                               : !p->replicated         ? "does not declare it replicated"
                               : p->bytes_per_block != p0->bytes_per_block
                                                        ? "holds it at another width"
+                              : p->storage_format != p0->storage_format ||
+                                p->block_size != p0->block_size || p->n_layers != p0->n_layers
+                                                       ? "holds another physical page format"
                                                        : nullptr;
             if (!why) continue;
             RAD_ERR("kv tiers: KV group '%s' is declared replicated (rad_kv_group_replicated) on "

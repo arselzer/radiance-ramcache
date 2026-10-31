@@ -466,6 +466,17 @@ enum {
     RAD_KV_RING    = 4
 };
 
+/* Physical page storage. Plain keeps the dtype/layout above. The DS41 forms store the ORIGINAL
+ * FP4 producer codes/scales (and bounded inline BF16-bit escapes), never a new quantization.
+ * Their logical dtype remains BF16, but RAD_KV operands are U8 [blocks, storage_block_bytes].
+ * Only the matching packed producer/readers may use them; arbitrary BF16 writes are unsupported.
+ * All plugins must be rebuilt together when this declaration changes (ABI layout fingerprint). */
+enum {
+    RAD_KV_STORAGE_PLAIN = 0,
+    RAD_KV_STORAGE_DS41_FP4_E4M3_G16 = 1,
+    RAD_KV_STORAGE_DS41_FP4_POW2_G32 = 2
+};
+
 typedef struct RadKVGroupDecl {
     int      kind;            /* RAD_KV_* */
     uint32_t dtype;
@@ -477,6 +488,8 @@ typedef struct RadKVGroupDecl {
     /* Block size is not declared. It is taken from the resolved attention kernel's constraints at
      * declare, so the core needs no edit when a kernel changes (spec §7.2). Read it back with
      * rad_kv_block_size() after declaring the attention op that consumes this group. */
+    uint32_t storage_format;     /* RAD_KV_STORAGE_*; 0 keeps the existing dtype/layout */
+    int64_t  storage_block_bytes; /* one packed page of ONE bound layer; plain requires 0 */
 } RadKVGroupDecl;
 
 /* `rad_kvgroup` is in rad_types.h with the other handles -- RadBufDecl above carries one. */

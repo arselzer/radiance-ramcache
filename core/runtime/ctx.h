@@ -148,6 +148,7 @@ struct RouteSlot {
  * Layouts, as libref/ref_ops.h defines them:
  *
  *     FULL / WINDOW  [n_blocks, n_head_kv, block_size, 2 * head_dim]   K then V inside a slot
+ *     packed FULL    U8 [n_blocks, storage_block_bytes]              matching reader only
  *     LINEAR         [n_states, n_head_kv, state_dim[0], state_dim[1]]
  *     CONV           [n_states, n_head_kv * head_dim, conv_slots]      channel-major, then time
  */

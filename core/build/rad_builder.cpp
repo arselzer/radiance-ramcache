@@ -13,6 +13,7 @@
 #include "lora/lora.h"
 #include "../device/device.h"
 #include "ds41_p1.h"
+#include "mem/kv_storage.h"
 
 #include <algorithm>
 #include <climits>
@@ -346,6 +347,8 @@ rad_kvgroup Builder::decl_kv_group(const char* name, const RadKVGroupDecl* d) {
     if (!name || !*name || !d) return err(RAD_E_INVAL, "decl_kv_group: null name or declaration");
     if (d->kind < RAD_KV_FULL || d->kind > RAD_KV_RING)
         return err(RAD_E_INVAL, "kv group '%s': unknown kind %d", name, d->kind);
+    if (const char* why = kv_storage_decl_error(*d))
+        return err(RAD_E_INVAL, "kv group '%s': %s", name, why);
 
     std::string n = scoped(name);
     for (size_t i = 1; i < prog_.kv_groups.size(); ++i)
@@ -435,6 +438,14 @@ int64_t Builder::kv_block_size(rad_kvgroup g) {
     }
 
     const OpInfo& o = prog_.ops[consumer];
+    if (kv_storage_packed(gi.decl)) {
+        long long format = 0;
+        if (!o.base.get_i("kv_format", &format) || format != gi.decl.storage_format) {
+            err(RAD_E_SHAPE, "kv group '%s': packed storage requires its consumer '%s' to "
+                             "declare the matching kv_format", gi.name.c_str(), o.op.c_str());
+            return 0;
+        }
+    }
 
     /* The resolved kernel's block_size constraint is the answer, read with core/plugin/'s
      * accessor; the core never picks a block size (spec §7.2). */
@@ -481,6 +492,11 @@ int64_t Builder::kv_layer_bytes(rad_kvgroup g) {
     if (gi.decl.kind != RAD_KV_FULL && gi.decl.kind != RAD_KV_WINDOW) return 0;
     const int64_t bs = kv_block_size(g);
     if (bs <= 0) return 0;
+    if (const char* why = kv_storage_page_error(gi.decl, bs)) {
+        err(RAD_E_SHAPE, "kv group '%s': %s", gi.name.c_str(), why);
+        return 0;
+    }
+    if (kv_storage_packed(gi.decl)) return gi.decl.storage_block_bytes;
     const int64_t nh = gi.decl.n_head_kv > 0 ? gi.decl.n_head_kv : 1;
     return rad_dtype_bytes(gi.decl.dtype, 2 * bs * nh * gi.decl.head_dim);
 }
@@ -2459,8 +2475,14 @@ void Builder::finish_kv_groups() {
             case RAD_KV_WINDOW:
             case RAD_KV_RING:
                 /* One block holds K and V for block_size tokens, the block manager's unit. */
+                if (const char* why = kv_storage_page_error(d, gi.block_size)) {
+                    err(RAD_E_SHAPE, "kv group '%s': %s", gi.name.c_str(), why);
+                    break;
+                }
                 gi.bytes_per_block =
-                    rad_dtype_bytes(d.dtype, 2 * gi.block_size * elem_n_head * d.head_dim) * n_bound;
+                    (kv_storage_packed(d) ? d.storage_block_bytes
+                        : rad_dtype_bytes(d.dtype, 2 * gi.block_size * elem_n_head * d.head_dim)) *
+                    n_bound;
                 gi.bytes_per_state = 0;
                 break;
             case RAD_KV_LINEAR:

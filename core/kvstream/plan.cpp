@@ -49,6 +49,7 @@ int32_t kv_stream_group(const KVManager& kv, const Program* prog) {
     const std::vector<KVGroupPlan>& ps = kv.plans();
     return kv_stream_widest(ps.size(), [&](size_t g, int64_t* bytes) {
         const KVGroupPlan& p = ps[g];
+        if (p.storage_format != RAD_KV_STORAGE_PLAIN) return false;
         if (!kv_stream_candidate(p.kind, p.zero, p.dense_read, p.bytes_per_block)) return false;
         const KVGroupInfo* gi = g < prog->kv_groups.size() ? &prog->kv_groups[g] : nullptr;
         if (!kvstream_ops(*prog, gi).streams()) return false;
@@ -60,6 +61,7 @@ int32_t kv_stream_group(const KVManager& kv, const Program* prog) {
 int32_t kv_stream_group(const std::vector<KVGroupInfo>& gs, const Program* prog) {
     return kv_stream_widest(gs.size(), [&](size_t g, int64_t* bytes) {
         const KVGroupInfo& gi = gs[g];
+        if (gi.decl.storage_format != RAD_KV_STORAGE_PLAIN) return false;
         if (!kv_stream_candidate(gi.decl.kind, gi.zero, gi.dense_read, gi.bytes_per_block))
             return false;
         if (prog && !kvstream_ops(*prog, &gi).streams()) return false;
@@ -77,6 +79,7 @@ int64_t kvstream_ceiling_blocks(const Config& cfg, int64_t sel_pitch) {
 
 KVStreamOps kvstream_ops(const Program& prog, const KVGroupInfo* group) {
     KVStreamOps ops;
+    if (group && group->decl.storage_format != RAD_KV_STORAGE_PLAIN) return ops;
     /* Whether a declaration has a kernel in some domain: an op no row matched keeps a placeholder band
      * with both domains null (Builder::op_resolved asks the same). */
     const auto resolved = [](const OpInfo& o) {

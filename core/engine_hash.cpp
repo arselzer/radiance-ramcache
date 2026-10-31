@@ -16,6 +16,7 @@
  * and copies whole layer pools to the host, and steps are not issued ahead while it is on. */
 #include "engine_priv.h"
 #include "device/device.h"
+#include "mem/kv_storage_decode.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -139,7 +140,8 @@ void Engine::prefill_hash_rank(Rank& r, const RadBatch* b) {
         std::string per_layer;
         uint64_t all = kSeed;
         for (const PrefillHashJob::Group& gr : sq.groups) {
-            const std::string& name = p.kv_groups[(size_t)gr.g].name;
+            const KVGroupInfo& gi = p.kv_groups[(size_t)gr.g];
+            const std::string& name = gi.name;
             const KVPoolBinding* kb = r.ctx.kv_binding((rad_kvgroup)gr.g);
             const KVGroupPlan* gp = r.kv.plan(gr.g);
             if (!kb || !kb->base || !gp || gp->zero || gp->streamed() || gr.kind == RAD_KV_RING) {
@@ -150,7 +152,12 @@ void Engine::prefill_hash_rank(Rank& r, const RadBatch* b) {
             /* The byte runs this prompt left in one layer's pool. */
             std::vector<std::pair<int64_t, int64_t>> runs;
             if (gp->paged()) {
-                const int64_t nh = kb->shape[1], bs = kb->shape[2], row = kb->shape[3] * esz;
+                /* The binding can be physical U8 rank 2. Hash the original logical BF16 layout
+                 * and the same per-position runs regardless of storage, including ratio-2 halves. */
+                const bool packed = kv_storage_packed(gi.decl);
+                const int64_t nh = packed ? gi.decl.n_head_kv : kb->shape[1];
+                const int64_t bs = packed ? gp->block_size : kb->shape[2];
+                const int64_t row = packed ? 2 * gi.decl.head_dim * 2 : kb->shape[3] * esz;
                 int64_t lo = 0, hi = 0;
                 if (gr.kind == RAD_KV_FULL) {
                     hi = bs > 0 ? sq.n / bs * bs : 0;
@@ -172,7 +179,9 @@ void Engine::prefill_hash_rank(Rank& r, const RadBatch* b) {
             uint64_t gh = kSeed;
             std::string lh;
             int n_layers = 0;
-            for (int32_t l : p.kv_groups[(size_t)gr.g].layers) {
+            std::vector<uint16_t> decoded(kv_storage_packed(gi.decl)
+                ? (size_t)(2 * gp->block_size * gi.decl.head_dim) : 0);
+            for (int32_t l : gi.layers) {
                 if (l < 0 || (size_t)l >= kb->layer_slot.size() || kb->layer_slot[(size_t)l] < 0) continue;
                 const uint8_t* host = fetch((const char*)kb->base + (int64_t)kb->layer_slot[(size_t)l] *
                                                                       kb->layer_stride,
@@ -181,9 +190,23 @@ void Engine::prefill_hash_rank(Rank& r, const RadBatch* b) {
                 if (!host) {
                     h = 0;
                 } else {
-                    for (const auto& run : runs)
-                        if (run.first >= 0 && run.first + run.second <= kb->layer_stride)
+                    for (const auto& run : runs) {
+                        if (kv_storage_packed(gi.decl)) {
+                            const uint8_t* logical = nullptr;
+                            if (!kv_storage_decode_run(gi.decl, gp->block_size, host,
+                                    kb->layer_stride, run.first, run.second, decoded.data(),
+                                    (int64_t)decoded.size(), &logical)) {
+                                RAD_ERR("prefill hash: invalid packed page in group '%s', layer %d",
+                                        name.c_str(), (int)l);
+                                line += " invalid-packed-page";
+                                h = 0;
+                                break;
+                            }
+                            h = hash_bytes(h, logical, run.second);
+                        } else if (run.first >= 0 && run.first + run.second <= kb->layer_stride) {
                             h = hash_bytes(h, host + run.first, run.second);
+                        }
+                    }
                 }
                 gh = fold(gh, h);
                 ++n_layers;

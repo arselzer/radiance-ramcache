@@ -1,5 +1,6 @@
 /* kv.cpp -- see kv.h. */
 #include "mem/kv.h"
+#include "mem/kv_storage.h"
 
 #include "kvstream/carve.h"
 #include "kvstream/plan.h"
@@ -128,6 +129,10 @@ int KVManager::plan_groups(const std::vector<KVGroupInfo>& groups, const Config&
             continue;
         }
         const KVGroupInfo& g = groups[i];
+        if (const char* why = kv_storage_decl_error(g.decl)) {
+            RAD_ERR("KV group '%s': %s", g.name.c_str(), why);
+            return RAD_E_INVAL;
+        }
         KVGroupPlan p;
         p.index    = (int32_t)i;
         p.name     = g.name.empty() ? fmt("kv%zu", i) : g.name;
@@ -136,6 +141,7 @@ int KVManager::plan_groups(const std::vector<KVGroupInfo>& groups, const Config&
          * other plan-path code has to know the kind. */
         p.kind     = g.decl.kind == RAD_KV_RING ? RAD_KV_WINDOW : g.decl.kind;
         p.n_layers = (int64_t)g.layers.size();
+        p.storage_format = g.decl.storage_format;
         p.dense_read = g.dense_read;
 
         if (p.n_layers <= 0) {
@@ -160,8 +166,19 @@ int KVManager::plan_groups(const std::vector<KVGroupInfo>& groups, const Config&
                 return RAD_E_NOKERNEL;
             }
             /* One page covers every layer bound to the group. */
+            if (const char* why = kv_storage_page_error(g.decl, p.block_size)) {
+                RAD_ERR("KV group '%s': %s", p.name.c_str(), why);
+                return RAD_E_SHAPE;
+            }
+            if (kv_storage_packed(g.decl) && g.bytes_per_block > 0 &&
+                g.bytes_per_block != g.decl.storage_block_bytes * p.n_layers) {
+                RAD_ERR("KV group '%s': packed bytes_per_block disagrees with physical storage",
+                        p.name.c_str());
+                return RAD_E_SHAPE;
+            }
             p.bytes_per_block = g.bytes_per_block > 0
                 ? g.bytes_per_block
+                : kv_storage_packed(g.decl) ? g.decl.storage_block_bytes * p.n_layers
                 : p.block_size * g.decl.n_head_kv * g.decl.head_dim * elt * 2 * p.n_layers;
             if (p.bytes_per_block <= 0) {
                 RAD_ERR("KV group '%s': page size computes to 0 (n_head_kv=%lld head_dim=%lld)",
@@ -528,6 +545,13 @@ int KVManager::carve_into(Pool& kv_pool) {
     }
 
     /* ---- the resident windows, before anything is split (kvstream/carve.h) ---- */
+    for (const auto& p : plans_) {
+        if (p.storage_format != RAD_KV_STORAGE_PLAIN && stream_.windowed(p.index)) {
+            RAD_ERR("KV group '%s': packed physical storage has no streamed-cache contract",
+                    p.name.c_str());
+            return RAD_E_UNSUPPORTED;
+        }
+    }
     RAD_TRY(kvstream_window_fit(plans_, stream_, fixed, budget_bytes, max_ctx_, max_seqs_));
 
     /* ---- the paged split; under a cap, the least rank's ---- */
@@ -662,6 +686,10 @@ int KVManager::carve_into(Pool& kv_pool) {
                            (long long)p.block_size, humanb(p.bytes_per_block).c_str(),
                            (long long)p.n_blocks, humanb(p.pool_bytes).c_str(),
                            (long long)(p.n_blocks * p.block_size));
+            if (p.storage_format != RAD_KV_STORAGE_PLAIN)
+                report_ += fmt("      physical storage format %u, %lld bytes per layer page; "
+                               "logical BF16, no full BF16 shadow\n", p.storage_format,
+                               (long long)p.layer_bytes_per_block());
             if (p.streamed())
                 report_ += kvstream_report_line(p);
         } else

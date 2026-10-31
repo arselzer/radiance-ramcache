@@ -609,11 +609,17 @@ public:
     /* RADIANCE_EXPERIMENTAL_PREFIX_EORS (eors_): whether init turned end-of-request snapshots on,
      * and the position the next snapshot of a sequence decoding at `n_computed` with a
      * `n_prompt`-token prompt lands on: the state after the row at `n_computed`, when that is on
-     * the resume grid past the prompt (-1 otherwise). */
+     * the snapshots' grid past the prompt (-1 otherwise). */
     bool    eors_on() const { return eors_; }
     int64_t eors_position(int64_t n_computed, int64_t n_prompt) const {
         const int64_t p = n_computed + 1;
-        return eors_ && p > n_prompt && geo_.on_grid(p) ? p : -1;
+        return eors_ && p > n_prompt && eors_on_grid(p) ? p : -1;
+    }
+    /* The grid end-of-request snapshots are taken on: the resume grid (ChunkGeometry::grid), or
+     * RADIANCE_EXPERIMENTAL_DS41_RESUME_GRID's finer one once init took it (eors_grid_). */
+    int64_t eors_grid() const { return eors_grid_ > 0 ? eors_grid_ : geo_.grid; }
+    bool    eors_on_grid(int64_t pos) const {
+        return eors_grid_ > 0 ? pos > 0 && pos % eors_grid_ == 0 : geo_.on_grid(pos);
     }
 
 private:
@@ -973,6 +979,19 @@ private:
      * --max-num-batched-tokens rows: see the exactness argument in scheduler.cpp ("end-of-request
      * snapshots", at init). */
     bool    eors_ = false;
+    /* RADIANCE_EXPERIMENTAL_DS41_RESUME_GRID=N (read at init, after large-chunk prefill; refused,
+     * with the reason, without end-of-request snapshots or large-chunk prefill, for an N that is not
+     * a multiple of the quantum finer than the resume grid and dividing it, and beside a kernel
+     * point a tune cache or RADIANCE_TUNE chose): end-of-request snapshots on an N-token grid
+     * instead of the resume grid, which under large-chunk prefill is the chunk (2,048 tokens). A
+     * decode step whose row completes a multiple of N past its prompt snapshots the state there and
+     * a prompt ending on one snapshots its end, so the next turn of a conversation resumes at most
+     * N - 1 tokens below the reply's last computed position (the snapshot it resumes from is off
+     * the cold run's chunk grid, which a checkpoint hit takes as it is: admit_one) and cuts its own
+     * first chunk from there, to the next interval boundary or tail, then the cold run's. Exact by
+     * DeepSeek-V4.1's partition invariance under large-chunk prefill: a row's bits do not depend on
+     * the pass that computes it (the argument in scheduler.cpp, at init). 0: the resume grid. */
+    int64_t eors_grid_ = 0;
     /* The throughput window (step_finished): each kind's tokens and the wall time the steps
      * covered, both decayed with the same time constant, so their ratio is tokens over time. */
     double  tps_win_prefill_ = 0.0, tps_win_decode_ = 0.0, tps_win_time_ = 0.0;

@@ -235,19 +235,22 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
      *
      * RADIANCE_EXPERIMENTAL_PREFIX_EORS=1 (eors_ in scheduler.h). Which positions it makes
      * resumable, under --prefix-resume exact with resume grid G (ChunkGeometry::grid: 16 at
-     * --max-num-batched-tokens 16, the chunk an idle prefill cuts): for a request R1 with prompt P1
-     * that ends having computed n1 positions (its prompt and every output token but the last), the
-     * grid positions g with |P1| < g <= n1 (a decode step's, reserved on the step whose row is
-     * g - 1), |P1| itself when it is on the grid, and the start of P1's last chunk (its tail) -- on
-     * top of the prompt ladder (interval boundaries, a shared head). Under the consumer skip a
-     * prefill writes none below its prompt's cut target (consumer_target: the deepest snapshot its
-     * idle prefill writes, |P1| when on the grid, else the tail), whose last layers' windows would
-     * be incomplete (reserve_ckpt drops them, SchedMetrics::consumer_ckpt_dropped); there the
-     * resumable positions are that target and the decode ones, not the ladder below the target nor
-     * the tail of a prompt ending on the grid. The deepest, grid_floor(n1) once the reply crossed
-     * a grid position, is what the next turn of the conversation reaches: its prompt P2 begins with
-     * P1 ++ R1's reply (the client sends the reply back), so the prefix cache's chain over P1 ++
-     * output runs through it, and the hit resumes there.
+     * --max-num-batched-tokens 16, the chunk an idle prefill cuts; under large-chunk prefill
+     * RADIANCE_EXPERIMENTAL_DS41_RESUME_GRID may give the decode and prompt-end snapshots a finer
+     * grid, below the consumer skip's switch, the tail staying a chunk start): for a request R1
+     * with prompt P1 that ends having computed n1 positions (its prompt and every output token but
+     * the last), the grid positions g with |P1| < g <= n1 (a decode step's, reserved on the step
+     * whose row is g - 1), |P1| itself when it is on the grid, and the start of P1's last chunk
+     * (its tail) -- on top of the prompt ladder (interval boundaries, a shared head). Under the
+     * consumer skip a prefill writes none below its prompt's cut target (consumer_target: the
+     * deepest snapshot its idle prefill writes, |P1| when on the grid, else the tail), whose last
+     * layers' windows would be incomplete (reserve_ckpt drops them,
+     * SchedMetrics::consumer_ckpt_dropped); there the resumable positions are that target and the
+     * decode ones, not the ladder below the target nor the tail of a prompt ending on the grid. The
+     * deepest, grid_floor(n1) once the reply crossed a grid position, is what the next turn of the
+     * conversation reaches: its prompt P2 begins with P1 ++ R1's reply (the client sends the reply
+     * back), so the prefix cache's chain over P1 ++ output runs through it, and the hit resumes
+     * there.
      *
      * Why the resumed turn R2 computes what a cold run of P2 computes, bit for bit (its KV in every
      * group, its last row's logits, so its reply), on an idle server:
@@ -807,6 +810,104 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
             } else {
                 RAD_WARN("consumer skip: refused -- %s; every layer runs on every row", why.c_str());
             }
+        }
+    }
+
+    /* ---------------------------------------------------------- end-of-request snapshots off the
+     *                                                            chunk grid
+     *
+     * RADIANCE_EXPERIMENTAL_DS41_RESUME_GRID=N (eors_grid_ in scheduler.h). Under large-chunk
+     * prefill the resume grid is the chunk C, so end-of-request snapshots land every C tokens and
+     * the next turn of a conversation prefills up to C - 1 tokens of the reply again. With the
+     * switch they land every N tokens past the prompt (and at a prompt's end on that grid), and a
+     * hit resumes at one as at any snapshot (admit_one), off the cold run's chunk grid: the turn R2
+     * cuts its own first chunk, from the snapshot g to the next interval boundary or its tail
+     * (plan_chunk), and the cold run's chunks after it. The argument above ("end-of-request
+     * snapshots") carries over with one change: R2's rows from g no longer run in the cold run's
+     * pass shapes, so they need (A) too, a row's bits whatever pass computes it (its height, its
+     * other rows, where it starts). DeepSeek-V4.1's prefill has it under large-chunk prefill, piece
+     * by piece (and as measured: Kld identical at C = 256 / 512 / 1,024 against 16-row passes,
+     * prefill hashes identical for 32- against 16-row passes, Phase 1 against LCP alone, 1,024-
+     * against 2,048-token chunks):
+     *   kernels     LCP is admitted only where every rank's file stager found each op on one kernel
+     *               at every height of [1, C] or on a pair known to agree (FileStager::lcp_init), the
+     *               routed GEMM on the gemv or its twin (the P1 row and the CPU path give its bits),
+     *               with libr4d's height-following forms pinned (the sparse attention and the
+     *               indexer score scalar, every norm at one width: libr4d/r4d_ds41_tall.h); and
+     *               ds41_mxfp4_device_check `lcp` holds each op's rows launched alone, 16 at a time
+     *               and whole, up to C. A kernel's split comes from its tuned point, the same in
+     *               every band only at the axis defaults those checks ran at: refused otherwise.
+     *   compressor  a ratio-2 block straddling a pass start takes its earlier row from the tail
+     *               ring (qsa_work copies the f32 bits, and the ring holds the last `ring` positions
+     *               whatever the passes), and each entry is pooled from its own block's rows alone.
+     *   indexer     each run a step is scored in (deepseek41's index_runs) is the unsplit op's rows;
+     *               a row's scores, kept blocks and selection read only the positions it has passed,
+     *               ties to the lower index, in position order, and the step's live width adds only
+     *               -inf columns.
+     *   window      keys are stored before the attention in every pass and read by position; a
+     *               snapshot at P carries the window's blocks below P / 16, whole only on the
+     *               16-token block grid, so N is a multiple of the quantum.
+     *   Engram      a row's ids are its tokens' alone; the history across a pass start is the CONV
+     *               state a snapshot carries.
+     *   the cut     the consumer skip computes only base-engine rows, and every row and key a later
+     *               step or snapshot reads, for passes starting on the quantum (consumer_skip.h): R2's
+     *               start at a snapshot or on the interval grid. Its target may lie past the cold
+     *               run's (a resume past the cold run's tail), which moves only rows nothing reads.
+     *   alignment   --prefix-resume exact keeps Phase 1's chunks start-aligned (lcp_init), so every
+     *               chunk end of R2 past its first is one the cold run cuts.
+     * Refused, with the reason (the snapshots stay on the resume grid): without end-of-request
+     * snapshots; without large-chunk prefill, whose admission is that evidence (at 16-token passes
+     * the resume grid is the quantum already); for an N that is not a multiple of the quantum
+     * finer than the resume grid and dividing it (every cold chunk start stays a snapshot point);
+     * and where a tune cache or RADIANCE_TUNE chose a kernel's point. A decode step that snapshots
+     * is not issued ahead (step_next_locked): a sequence pays one host turnaround every N tokens. */
+    eors_grid_ = 0;
+    if (const char* rg = std::getenv("RADIANCE_EXPERIMENTAL_DS41_RESUME_GRID");
+        rg && *rg && std::strcmp(rg, "0") != 0) {
+        char* end = nullptr;
+        const long long n = std::strtoll(rg, &end, 10);
+        const int64_t Q = std::max<int64_t>(geo_.quantum, 1), G = geo_.grid;
+        std::string why;
+        if (end == rg || *end || n <= 0)
+            why = "it takes a token count (0 or unset: the resume grid)";
+        else if (!eors_)
+            why = "end-of-request snapshots are off (RADIANCE_EXPERIMENTAL_PREFIX_EORS=1, or its line "
+                  "above says why not)";
+        else if (lcp_ <= 0)
+            why = "it needs large-chunk prefill (RADIANCE_EXPERIMENTAL_DS41_LCP), whose admission holds "
+                  "every op to one kernel form at every pass height: the partition invariance a resume "
+                  "off the chunk grid stands on";
+        else if (n % Q != 0)
+            why = fmt("%lld is not a multiple of the %lld-token quantum (a snapshot carries the window's "
+                      "whole blocks)", n, (long long)Q);
+        else if (n >= G || G % n != 0 || geo_.grid_origin % n != 0)
+            why = fmt("%lld is not finer than the %lld-token resume grid and a divisor of it", n,
+                      (long long)G);
+        for (size_t i = 1; i < prog.ops.size() && why.empty(); ++i)
+            for (const Band& b : prog.ops[i].bands)
+                for (int d = 0; d < RAD_N_DOMAINS && why.empty(); ++d)
+                    if (b.dom[d] && !b.dom[d].tune_source.empty() &&
+                        b.dom[d].tune_source != "axis defaults")
+                        why = fmt("op %zu (%s) runs %s at a point from %s, which may split a row's sums "
+                                  "otherwise in another band (the large-chunk checks ran at the axis "
+                                  "defaults)", i, prog.ops[i].op.c_str(),
+                                  b.dom[d].row->info && b.dom[d].row->info->name
+                                      ? b.dom[d].row->info->name : "a kernel",
+                                  b.dom[d].tune_source.c_str());
+        if (why.empty()) {
+            eors_grid_ = n;
+            RAD_INFO("end-of-request snapshots: on a %lld-token grid "
+                     "(RADIANCE_EXPERIMENTAL_DS41_RESUME_GRID) -- a decode step whose row completes a "
+                     "multiple of %lld past its prompt snapshots the state there, and a prompt ending "
+                     "on one its end, so the next turn resumes at "
+                     "most %lld tokens below the reply's last computed position, off the %lld-token "
+                     "chunk grid, and prefills from there in chunks of its own up to the next interval "
+                     "boundary or tail and the cold run's after; exact by DeepSeek-V4.1's partition "
+                     "invariance under large-chunk prefill (a row's bits do not depend on the pass that "
+                     "computes it); such a step is not issued ahead", n, n, n - 1, (long long)G);
+        } else {
+            RAD_WARN("end-of-request snapshots: RADIANCE_EXPERIMENTAL_DS41_RESUME_GRID=%s refused -- %s; "
+                     "they stay on the %lld-token resume grid", rg, why.c_str(), (long long)G);
         }
     }
     /* The builder's bound, not a second derivation: the block tables were sized for it. */
@@ -1701,9 +1802,10 @@ int64_t Scheduler::plan_chunk(int64_t n_computed, int64_t n_target, int64_t budg
             if (checkpoint_pos) *checkpoint_pos = tail;
         } else if (periodic && (n_computed + want) % I == 0 && geo_.on_grid(n_computed + want)) {
             if (checkpoint_pos) *checkpoint_pos = n_computed + want;
-        } else if (eors_ && n_computed + want == n_target && geo_.on_grid(n_target)) {
-            /* End-of-request snapshots: a prompt ending on the grid snapshots its end, where its
-             * last chunk ends, for a reply too short to reach the next grid position. */
+        } else if (eors_ && n_computed + want == n_target && eors_on_grid(n_target)) {
+            /* End-of-request snapshots: a prompt ending on their grid (the resume grid, or
+             * RADIANCE_EXPERIMENTAL_DS41_RESUME_GRID's) snapshots its end, where its last chunk
+             * ends, for a reply too short to reach the next grid position. */
             if (checkpoint_pos) *checkpoint_pos = n_target;
         }
         /* A request's own checkpoint (Request::checkpoint_at), wherever it falls, as nearest
@@ -2060,7 +2162,10 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
         /* --prefix-resume exact: resume only on the grid an idle cold prefill chunks this prompt
          * on (ChunkGeometry::grid), so the tokens recomputed below are cut into the cold run's own
          * chunks. A snapshot is already on it (plan_chunk writes none off it, but for a request's
-         * own Request::checkpoint_at); a hit at a block (no snapshot needed) steps back to it. */
+         * own Request::checkpoint_at, and the end-of-request ones on
+         * RADIANCE_EXPERIMENTAL_DS41_RESUME_GRID's finer grid, eors_grid_, exact by the partition
+         * invariance that switch stands on), and a hit at one resumes there; a hit at a block (no
+         * snapshot needed) steps back to the grid. */
         if (geo_.exact && reuse > 0 &&
             !(geo_.checkpoints() && h.checkpoint_slot >= 0 && reuse == h.n_linear_tokens)) {
             const int32_t g = (int32_t)geo_.grid_floor(reuse);

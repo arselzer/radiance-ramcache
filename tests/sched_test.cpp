@@ -9745,6 +9745,282 @@ TEST(eors_with_the_consumer_skip_and_the_default_band_drops_nothing) {
     }
 }
 
+/* ============================================== end-of-request snapshots off the chunk grid */
+/* RADIANCE_EXPERIMENTAL_DS41_RESUME_GRID (Scheduler::eors_grid_): under large-chunk prefill the
+ * resume grid is the chunk, and the switch puts end-of-request snapshots on a finer grid; a hit at
+ * one resumes there and cuts its own first chunk, then the cold run's. */
+namespace {
+/* init reads the switch, beside RADIANCE_EXPERIMENTAL_PREFIX_EORS (eors_start); `grid` null leaves
+ * it unset. */
+int resume_grid_start(Fixture& f, const char* grid, bool eors = true) {
+    if (grid) setenv("RADIANCE_EXPERIMENTAL_DS41_RESUME_GRID", grid, 1);
+    else unsetenv("RADIANCE_EXPERIMENTAL_DS41_RESUME_GRID");
+    const int rc = eors_start(f, eors);
+    unsetenv("RADIANCE_EXPERIMENTAL_DS41_RESUME_GRID");
+    return rc;
+}
+
+/* lcp_fixture's shape at the recommended chunk (2,048, the interval too) with the prefix cache on,
+ * as the harness arms serve it (Pc). */
+void resume_fixture(Fixture& f) {
+    lcp_fixture(f, 2048, 2048);
+    f.cfg.prefix_cache = true;
+}
+
+/* What a prefill issues for each row, by position: its token and, layer by layer, 2 in full, 1 its
+ * key ops alone, 0 skipped (consumer_row_starts: a layer L past the boundary in full from row0[L]
+ * and its keys from row0[L - 1], the boundary's keys on every row; no row0, every layer in full).
+ * Steps the request up to and including the chunk that samples its first token. */
+struct RowWork {
+    int32_t tok = -1;
+    std::vector<uint8_t> layer;
+    bool operator==(const RowWork& o) const { return tok == o.tok && layer == o.layer; }
+};
+std::map<int64_t, RowWork> prefill_rows(Fixture& f, uint64_t id, int n_layer, int boundary) {
+    std::map<int64_t, RowWork> rows;
+    for (int k = 0; k < 64; ++k) {
+        const RadBatch* b = f.sch.step();
+        if (!b) break;
+        const StepPlan& p = f.sch.plan();
+        CHECK_EQ(p.e.size(), (size_t)1);
+        if (p.e.size() != 1 || p.e[0].seq != id) break;
+        const StepEntry& e = p.e[0];
+        if (!e.is_prefill) break;
+        for (int64_t t = 0; t < b->n_tok; ++t) {
+            RowWork w;
+            w.tok = b->token_ids[t];
+            w.layer.assign((size_t)n_layer, 2);
+            if (b->consumer_row0)
+                for (int L = boundary; L < n_layer; ++L) {
+                    const int64_t full = b->consumer_row0[L];
+                    const int64_t key = L == boundary ? 0 : b->consumer_row0[L - 1];
+                    w.layer[(size_t)L] = t >= full ? 2 : t >= key ? 1 : 0;
+                }
+            rows[(int64_t)b->positions[t]] = w;
+        }
+        const bool last = e.produces_token;
+        f.commit_plain();
+        if (last) break;
+    }
+    return rows;
+}
+}  /* namespace */
+
+/* A 3,000-token prompt and 40 tokens out (3,039 positions computed) at chunks of 2,048: on the resume
+ * grid alone it snapshots its tail (2,048, the interval too) and nothing past it; on a 16-token grid
+ * the reply snapshots at 3,008 and 3,024, and a 3,008-token prompt, ending on that grid, its end as
+ * well (3,008, then 3,024 and 3,040). Issued ahead or not, the same snapshots, and the decode steps
+ * that carry one are the steps not issued ahead for it. */
+TEST(resume_grid_snapshots_the_reply_on_its_grid) {
+    for (const bool ahead : { false, true }) {
+        for (const char* grid : { (const char*)nullptr, "16" }) {
+            for (const int n : { 3000, 3008 }) {
+                LcpOn on(2048, 1);
+                Fixture f;
+                resume_fixture(f);
+                REQUIRE_EQ(resume_grid_start(f, grid), RAD_OK);
+                REQUIRE(f.sch.eors_on());
+                REQUIRE_EQ(f.sch.lcp_rows(), (int64_t)2048);
+                REQUIRE_EQ(f.sch.geometry().grid, (int64_t)2048);
+                CHECK_EQ(f.sch.eors_grid(), grid ? (int64_t)16 : (int64_t)2048);
+                const uint64_t id = f.submit(n, 40, 0, true);
+                REQUIRE(id != 0);
+                const EorsRun r = eors_run(f, id, ahead);
+                CHECK_EQ(r.n_computed, (int64_t)n + 39);
+                std::vector<int64_t> eors, decode;
+                if (grid) {
+                    eors = n == 3000 ? std::vector<int64_t>{ 3008, 3024 }
+                                     : std::vector<int64_t>{ 3008, 3024, 3040 };
+                    decode = n == 3000 ? std::vector<int64_t>{ 3008, 3024 }
+                                       : std::vector<int64_t>{ 3024, 3040 };
+                }
+                std::vector<int64_t> all = { 2048 };
+                all.insert(all.end(), eors.begin(), eors.end());
+                CHECK(r.eors == eors);
+                CHECK(r.ckpts == all);
+                CHECK(f.pc.reserved_eors == eors);
+                CHECK(f.pc.committed == all);
+                /* A decode snapshot is the state after its step's only row. */
+                REQUIRE_EQ(r.ckpt_rows.size(), decode.size());
+                for (size_t i = 0; i < decode.size(); ++i) CHECK_EQ(r.ckpt_rows[i] + 1, decode[i]);
+                const SchedMetrics m = f.sch.metrics();
+                CHECK_EQ(m.eors_reserved, (int64_t)eors.size());
+                CHECK_EQ(m.eors_ahead_withheld, ahead ? (int64_t)decode.size() : 0ll);
+                if (ahead) CHECK(r.ahead > 30);
+            }
+        }
+    }
+}
+
+/* A hit at a reply's snapshot off the chunk grid (3,024, on the 16-token grid) resumes there, restores
+ * that snapshot and cuts its own first chunk up to the 5,000-token prompt's tail (4,096, an interval
+ * boundary too), then the cold run's last chunk: every chunk end past its first is one the cold run
+ * cuts, and so is every snapshot it writes. */
+TEST(resume_grid_hit_resumes_at_the_snapshot_then_cuts_the_cold_chunks) {
+    LcpOn on(2048, 1);
+    Fixture f;
+    resume_fixture(f);
+    REQUIRE_EQ(resume_grid_start(f, "16"), RAD_OK);
+    REQUIRE_EQ(f.sch.eors_grid(), (int64_t)16);
+    f.pc.seed(3040);
+    f.pc.lin = 3024;
+    f.pc.src = 5;
+    f.pc.eors_hit = true;
+    const uint64_t id = f.submit(5000, 4);
+    REQUIRE(id != 0);
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.find(id)->n_computed, 3024);
+    const StepEntry& e = f.sch.plan().e[0];
+    CHECK_EQ(e.ckpt_restore, 5);
+    CHECK_EQ(e.ctx_len, 3024);
+    CHECK_EQ(e.n_tokens, 1072);                 /* [3024, 4096) */
+    CHECK_EQ((int64_t)e.ctx_len + e.ckpt_tok + 1, 4096ll);   /* the tail's snapshot, as cold */
+    const SchedMetrics m = f.sch.metrics();
+    CHECK_EQ(m.eors_hits, 1ll);
+    CHECK_EQ(m.eors_hit_tokens, 3024ll);
+    const Cut cold = cut_from(f.sch, 0, 5000, 2048), warm = cut_from(f.sch, 3024, 5000, 2048);
+    CHECK((cold.ends == std::vector<int64_t>{ 2048, 4096, 5000 }));
+    CHECK(warm.ends == ends_after(cold, 3024));
+    CHECK((warm.ckpts == std::vector<int64_t>{ 4096 }));
+    CHECK((cold.ckpts == std::vector<int64_t>{ 2048, 4096 }));
+}
+
+/* What a resumed prefill issues for each row past its snapshot is what the cold run issues for it,
+ * under the consumer skip's per-row cut: the same token at the same position and the same layers in
+ * full, keys alone and skipped. A 5,000-token prompt (its tail 4,096, the cut's target in both runs)
+ * resumed at 3,024 computes rows 3,024 .. 4,095 in a pass of 1,072 rows where the cold run's holds
+ * 2,048, and its last chunk as the cold run does. Resumed past the cold run's tail (4,224), its target
+ * is its end: it then runs nothing the cold run does not, skips work on rows nothing reads, and stores
+ * every layer's keys on the window the next step reads, with every layer on the sampled row. */
+TEST(resume_grid_resumed_rows_issue_the_cold_runs_work) {
+    const int n_layer = 16, boundary = 4, window = 64;
+    auto start = [&](Fixture& f) {
+        resume_fixture(f);
+        f.prog.consumer = RadConsumerSuffix{ (uint32_t)sizeof(RadConsumerSuffix), n_layer, boundary,
+                                             window, 16 };
+        f.cfg.consumer_skip = 1;
+        f.cfg.consumer_skip_ckpt = Scheduler::kConsumerSkipCkptDefault;
+        REQUIRE_EQ(resume_grid_start(f, "16"), RAD_OK);
+        REQUIRE(f.sch.consumer_on());
+        REQUIRE_EQ(f.sch.eors_grid(), (int64_t)16);
+    };
+    const int n = 5000;
+    std::map<int64_t, RowWork> cold;
+    {
+        LcpOn on(2048, 1);
+        Fixture f;
+        start(f);
+        const uint64_t id = f.submit(n, 4);
+        cold = prefill_rows(f, id, n_layer, boundary);
+    }
+    REQUIRE_EQ(cold.size(), (size_t)n);
+    for (const int64_t g : { 3024, 4224 }) {
+        LcpOn on(2048, 1);
+        Fixture f;
+        start(f);
+        f.pc.seed((int32_t)g + 16);
+        f.pc.lin = (int32_t)g;
+        f.pc.src = 5;
+        f.pc.eors_hit = true;
+        const uint64_t id = f.submit(n, 4);
+        const std::map<int64_t, RowWork> warm = prefill_rows(f, id, n_layer, boundary);
+        REQUIRE_EQ(warm.size(), (size_t)(n - g));
+        REQUIRE_EQ(warm.begin()->first, g);
+        int differ = 0, more = 0, skipped = 0, window_short = 0;
+        for (const auto& [pos, w] : warm) {
+            const RowWork& c = cold.at(pos);
+            CHECK_EQ(w.tok, c.tok);
+            differ += !(w == c);
+            for (int L = 0; L < n_layer; ++L) {
+                more += w.layer[(size_t)L] > c.layer[(size_t)L];
+                skipped += w.layer[(size_t)L] < 2;
+                window_short += pos >= n - window && w.layer[(size_t)L] == 0;
+            }
+        }
+        CHECK_EQ(more, 0);
+        CHECK_EQ(window_short, 0);
+        for (int L = 0; L < n_layer; ++L) CHECK_EQ((int)warm.rbegin()->second.layer[(size_t)L], 2);
+        if (g == 3024) {
+            CHECK_EQ(differ, 0);
+            CHECK(skipped > 0);                 /* the cut acts on rows below the target */
+        } else {
+            CHECK(differ > 0);                  /* its own target, the prompt's end */
+            CHECK(skipped > 0);
+        }
+    }
+}
+
+/* Refused, with the reason, where the partition invariance is not shown, and the snapshots stay on
+ * the resume grid: without large-chunk prefill (16-token passes, where the grid is the quantum
+ * already), without end-of-request snapshots, for a grid off the quantum, not dividing the resume
+ * grid or not finer than it, for a value that is no token count, and where a tune cache chose a
+ * kernel's point; a point at the axis defaults is taken. */
+TEST(resume_grid_is_refused_where_partition_invariance_is_not_shown) {
+    {
+        Fixture f;
+        ds41_fixture(f, 2048);
+        REQUIRE_EQ(resume_grid_start(f, "16"), RAD_OK);
+        REQUIRE(f.sch.eors_on());
+        CHECK_EQ(f.sch.lcp_rows(), 0ll);
+        CHECK_EQ(f.sch.eors_grid(), 16ll);
+        CHECK(f.sch.eors_position(1007, 1000) == 1008);
+    }
+    {
+        LcpOn on(2048, 1);
+        Fixture f;
+        resume_fixture(f);
+        REQUIRE_EQ(resume_grid_start(f, "16", /*eors=*/false), RAD_OK);
+        CHECK(!f.sch.eors_on());
+        CHECK_EQ(f.sch.eors_grid(), 2048ll);
+    }
+    for (const char* bad : { "24", "48", "2048", "4096", "-16", "16x", "x" }) {
+        LcpOn on(2048, 1);
+        Fixture f;
+        resume_fixture(f);
+        REQUIRE_EQ(resume_grid_start(f, bad), RAD_OK);
+        REQUIRE(f.sch.eors_on());
+        CHECK_EQ(f.sch.eors_grid(), 2048ll);
+        CHECK_EQ(f.sch.eors_position(3007, 3000), -1ll);
+    }
+    for (const char* ok : { "16", "64", "1024" }) {
+        LcpOn on(2048, 1);
+        Fixture f;
+        resume_fixture(f);
+        REQUIRE_EQ(resume_grid_start(f, ok), RAD_OK);
+        const int64_t g = std::atoll(ok);
+        CHECK_EQ(f.sch.eors_grid(), g);
+        CHECK_EQ(f.sch.eors_position(3071, 3000), 3072ll);
+        CHECK_EQ(f.sch.eors_position(3071, 3072), -1ll);      /* not past the prompt */
+        CHECK_EQ(f.sch.eors_position(3009, 3000), -1ll);
+    }
+    /* Unset or 0: the resume grid, without a word. */
+    for (const char* off : { (const char*)nullptr, "0", "" }) {
+        LcpOn on(2048, 1);
+        Fixture f;
+        resume_fixture(f);
+        REQUIRE_EQ(resume_grid_start(f, off), RAD_OK);
+        CHECK_EQ(f.sch.eors_grid(), 2048ll);
+    }
+    /* A kernel at a tune cache's point (or RADIANCE_TUNE's) refuses it; at the axis defaults, taken. */
+    for (const char* src : { "tuned 2026-10-01T00:00:00Z", "RADIANCE_TUNE", "axis defaults" }) {
+        static KernelRow row;
+        row.plugin = "libr4d";
+        LcpOn on(2048, 1);
+        Fixture f;
+        resume_fixture(f);
+        OpInfo gemm;
+        gemm.op = "gemm_nt";
+        Band band;
+        band.dom[RAD_DOMAIN_HOST].row = &row;
+        band.dom[RAD_DOMAIN_HOST].tune_source = src;
+        gemm.bands.push_back(band);
+        f.prog.ops.push_back(gemm);
+        REQUIRE_EQ(resume_grid_start(f, "16"), RAD_OK);
+        REQUIRE(f.sch.eors_on());
+        CHECK_EQ(f.sch.eors_grid(), std::string(src) == "axis defaults" ? 16ll : 2048ll);
+    }
+}
+
 /* ===== draft_conf.h: the confidence controller, load-aware drafting, the deferred context pass ===== */
 TEST(dspark_conf_parses_and_decides) {
     DraftConfCfg c;

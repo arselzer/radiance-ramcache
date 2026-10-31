@@ -89,3 +89,9 @@ clean:
 	rm -f ds41_host_experts_test ds41_dense_fp8_scan ds41_bf16f8_device_check
 
 .PHONY: clean scan device-check mxfp4-check n128-check kv-codec-check kv-packed-paths-check kv-fast-check router-eval
+
+# Requires the independent original-producer codec gate first; all arithmetic flags stay identical.
+$(O)/ds41_window_packed_paths_check: ds41_window_packed_paths_check.hip ds41_window_codec_device_check.hip $(TREE)/arch/common/rad_ds41_window_codec.h
+	$(HIPCC) $(HIPFLAGS) -I$(TREE)/abi -I$(TREE)/libr4d -o $@ ds41_window_packed_paths_check.hip -ldl
+window-packed-paths-check: $(O)/ds41_window_packed_paths_check
+.PHONY: window-packed-paths-check

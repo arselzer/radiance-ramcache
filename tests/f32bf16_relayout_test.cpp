@@ -230,7 +230,8 @@ TEST(f32bf16_tall_served_geometries_check_the_whole_source_plane_before_slicing)
     const int sel = 0;
     constexpr int64_t K = 5120;
     struct Shape { int64_t m, n, whole_n; };
-    const Shape shapes[] = { { 256, 96, 384 }, { 1024, 384, 384 }, { 2048, 1024, 1024 } };
+    const Shape shapes[] = { { 256, 96, 384 }, { 1024, 384, 384 }, { 2048, 1024, 1024 },
+                             { 4096, 96, 384 }, { 4096, 384, 384 }, { 4096, 1024, 1024 } };
     for (const Shape& s : shapes) {
         Geo g(s.n, K, s.m);
         std::vector<uint32_t> w((size_t)(s.whole_n * K), widen(0x3f80));
@@ -255,12 +256,14 @@ TEST(f32bf16_tall_served_geometries_check_the_whole_source_plane_before_slicing)
             w[(size_t)where[i]] = widen(0x3f80);
         }
     }
-    Geo compressor(1024, K, 2048);
     const RadEncoding direct = rad_enc_plain(RAD_BF16);
     const RadTensor source = plane(RAD_BF16, 1024, K);
-    RadLayout L{};
-    CHECK_EQ(r4d_rad_layout_f32bf16(compressor.p, 4, kW, &direct, &sel, &source, 1, &L),
-             RAD_E_UNSUPPORTED);
+    for (int64_t M : { 2048, 4096 }) {
+        Geo compressor(1024, K, M);
+        RadLayout L{};
+        CHECK_EQ(r4d_rad_layout_f32bf16(compressor.p, 4, kW, &direct, &sel, &source, 1, &L),
+                 RAD_E_UNSUPPORTED);
+    }
 }
 
 TEST(f32bf16_relayout_and_inverse_check_the_stored_size) {

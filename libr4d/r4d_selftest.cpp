@@ -20487,19 +20487,20 @@ static void ds41_f32bf16_tall_case(const Plugin& pl, int64_t M, int64_t N) {
         ok("ds41 f32bf16 tall", false, fmt("whole-plane relayout rc=%d", rc));
         return;
     }
-    if (M == 2048) {
+    if (M == 2048 || M == 4096) {
         /* Exercise this loaded plugin's rejection, not just the separately linked host test.
-         * For N=96 the bad element is outside the TP slice, in the whole weight's last row. */
+         * For N=96 corrupt the first source row, outside rank 3's final 96-row TP slice. */
+        const size_t bad_at = N == 96 ? (size_t)K - 1 : w.size() - 1;
         uint32_t original;
-        std::memcpy(&original, &w.back(), 4);
+        std::memcpy(&original, &w[bad_at], 4);
         const uint32_t bad = original | (N == 96 ? 0x0001u : N == 384 ? 0x8000u : 0xffffu);
-        std::memcpy(&w.back(), &bad, 4);
+        std::memcpy(&w[bad_at], &bad, 4);
         std::vector<uint16_t> rejected(stored.size());
         const int reject = rh->relayout(ps.data(), (int)ps.size(), 1, &enc, &selected, &source, 1,
                                          rejected.data(), (int64_t)rejected.size() * 2);
-        std::memcpy(&w.back(), &original, 4);
-        ok(fmt("ds41 f32bf16 tall N=%lld: nonzero low half in last source element refused",
-               (long long)N).c_str(), reject == RAD_E_DTYPE, fmt("rc=%d", reject));
+        std::memcpy(&w[bad_at], &original, 4);
+        ok(fmt("ds41 f32bf16 tall N=%lld M=%lld source[%zu]: whole-plane nonzero low half refused",
+               (long long)N, (long long)M, bad_at).c_str(), reject == RAD_E_DTYPE, fmt("rc=%d", reject));
         if (reject != RAD_E_DTYPE) return;
     }
     void* dx = dalloc(x.size() * 2);
@@ -20573,15 +20574,15 @@ static void ds41_f32bf16_tall_case(const Plugin& pl, int64_t M, int64_t N) {
 
 static void ds41_f32bf16_tall(const Plugin& pl) {
     const int before = g_fail;
-    for (int64_t M : { 256, 1024, 2048 })
+    for (int64_t M : { 256, 1024, 2048, 4096 })
         for (int64_t N : { 96, 384, 1024 }) {
             dfree_all();
             ds41_f32bf16_tall_case(pl, M, N);
         }
     dfree_all();
     if (g_fail == before)
-        std::printf("PASS: ds41 f32bf16 tall: 9 served shapes, every output byte equals f32; "
-                    "sampled host rows and guards match; 3 nonzero-low-half loads refused\n");
+        std::printf("PASS: ds41 f32bf16 tall: 12 served shapes through M4096, every output byte equals f32; "
+                    "sampled host rows and guards match; 6 nonzero-low-half loads refused\n");
 }
 
 /* gemm_fp8a8_f32scale's dense form at the shape (a decode form or a row tile, by the rule)
@@ -33080,8 +33081,8 @@ static void usage(void) {
                 "       r4d_selftest <plugin.so> --real <file> <woff> <soff> <N> <K>\n"
                 "  no --case: the catalogue, the static checks, then one child process per row\n"
                 "  --case:    that row's smoke test alone, in this process -- the reproducer\n"
-                "             ds41_f32bf16_tall runs only the nine tall router/compressor byte\n"
-                "             comparisons and three load refusals, without a timing/form sweep.\n"
+                "             ds41_f32bf16_tall runs only the twelve tall router/compressor byte\n"
+                "             comparisons and six load refusals, without a timing/form sweep.\n"
                 "  --real:    the block-scaled fp8 matvec against a REAL checkpoint weight, at the\n"
                 "             given byte offsets in a safetensors file, compared with a host\n"
                 "             reference over the same bytes. An offset is 8 + <header length, a\n"
